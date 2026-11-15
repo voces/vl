@@ -61,7 +61,7 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
 | monomorphic | yes. An `IrFn` belongs to one instance (`InstId`, Q §2.1), and no `Var` has an open `TyId` | the verifier refuses an open type (§2) |
 | node encoding | distinct record types in one union, matched by `match` on the record type, with no `_` arm | VL has no payload variants yet (L4). This is the `Ty` arena's and lane E's `RepNode` pattern. Each variant needs its own field-name prefix (the `ast.vl:6` convention). |
 | storage | one arena per `IrFn`: `nodes: IrNode[]` and `vars: IrVar[]`. Ids are `i32`, newtyped as `IrNodeId`/`IrVarId` | an IR function can be built, verified and lowered in isolation. Q's `Lowered` holds one per `InstId`. |
-| operand ids | `TyId` (H), `RepId` (E), `Coercion` (M3), callee (an `fnStmts` position until Q step 6, then `InstId`) | session ids, so IR can outlive the program that built it (Q §2.1) |
+| operand ids | `TyId` = `tyCanonSet` (H), `RepId` = H's arm-aware layout id over E's arena (E), `Coercion` (M3), callee (an `fnStmts` position until Q step 6, then `InstId`) | session ids, so IR can outlive the program that built it (Q §2.1) |
 | spans | each node keeps a `NodeId` back into `Parsed`, for spans and the source map only | lowering never reads the AST |
 
 ### 1.2 Nodes
@@ -164,17 +164,40 @@ I8 in §5).
 
 ### 1.5 The coercion node is M3's `Coercion`
 
-`RCoerce{coC: Coercion, coV}` carries the value `relate(src, dst)` returns, unchanged. The IR adds
-nothing to it. The verifier needs three things of it: `src(c)` and `dst(c)` as `RepId`s, and a
-total lowering for each variant. Lowering a recursive coercion (a list copy whose elements are
-coerced, or a record copy that coerces a field) emits a loop or a field walk that calls the
-element's lowering. That is how lane E's `coerce` rule (rep-adt §4: D2196, D12466) gets one home.
+`RCoerce{coC: Coercion, coV}` carries the `Coercion` the relate recorder recorded at the node,
+unchanged. The shape is the one in `refactor-notes/2026-11-15-relate-recorder-design.md` §2
+(PR #8276): `Coercion{conv, at, steps, kids}`. `conv` is a flat code, `at` is the arm actually
+built, and `kids` holds the per-field and per-element coercions in source order.
 
-Until M3 lands, the payload is an adapter, `CoerceRec{kind: CoerceKind, …}`. It packages today's
-ten kinds (`wasmEmit.vl:30278`) with the record each one reads: `boxRecordTyAt`,
-`armRecordHeapAt`, `numRecordAt`, `listCopyAtNode`, `fnCloCoerceAtNode`, `mapUnboxTyOf`,
-`deliveryRetagHas` and `recCopyRowAt`. The adapter is replaced by M3's type in one PR, and no node
-changes shape. **The ask to M3 is in §9.**
+How the IR reads it:
+- **Endpoints.** The keys are `TyId` pairs (src, dst, `at`). The verifier takes the endpoint reps as
+  `repOf(src)` and `repOf(dst)`, and checks them against the operand's and the destination's reps.
+- **`steps` are not read.** They are the recorder's ordered side effects (ctx stamp, literal
+  re-typing, rep stamp, …), and they apply when checking. An IR node carries no effect of the
+  checker's.
+- **Recursion.** `lowerCoerce` matches `conv` exhaustively. A coercion with `kids` (a list copy
+  whose elements are coerced, a record copy that coerces a field) emits a loop or a field walk that
+  lowers each kid. That is how lane E's `coerce` rule (rep-adt §4: D2196, D12466) gets one home.
+- **Read, don't call.** Until relate's stage C, `relate` pins holes unless `inferQuiet` is set. So
+  the builder reads the recorded `Coercion` at the node and never calls `relate`. After stage C,
+  phase B (§3.2) may call it as a pure function over a frozen `Checked`.
+
+**The gap: four of today's ten `CoerceKind`s are not in `CV_*`.** `box`, `unbox`, `numeric` and
+`atomstr` are emitter-side seat decisions today. Each needs its own `conv` code before the adapter
+can retire:
+- `CV_BOX` with `at` as the arm;
+- `CV_UNBOX` with `at` and nullability;
+- `CV_NUM_WIDEN` with prim to prim, which the emitter currently derives from the two types;
+- `CV_ATOM_STR`.
+
+The `conv` set also needs to be a string-literal union type, not `i32` constants, so that
+`lowerCoerce` is an exhaustive `match`. Lane M3 has offered to shape `conv` before its
+conversions PR (A3).
+
+Until then, the payload is an adapter, `CoerceRec{kind: CoerceKind, …}`. It packages today's ten
+kinds (`wasmEmit.vl:30278`) with the record each one reads: `boxRecordTyAt`, `armRecordHeapAt`,
+`numRecordAt`, `listCopyAtNode`, `fnCloCoerceAtNode`, `mapUnboxTyOf`, `deliveryRetagHas` and
+`recCopyRowAt`. M3's type replaces the adapter in one PR, and no node changes shape.
 
 ### 1.6 The emitter is a total function
 
@@ -568,18 +591,32 @@ float operations.
 
 ## 9. Questions to the prerequisite lanes
 
-These were sent to each lane before this PR. **Two items are pending: `RCoerce`'s payload (M3)
-and `IrCallee` (Q step 6).** They do not block this design: each is a single-type substitution
+These were sent to each lane before this PR. **Two items are pending: the `conv` codes in
+`RCoerce`'s payload (M3, §1.5) and `IrCallee` (Q step 6).** They do not block this design: each is a single-type substitution
 (§1.5, §1.1). The replies received so far are recorded below.
 
-- **M3.** Is `Coercion` a recursive sum (identity, widen, box(arm), unbox, null-wrap,
-  list-copy(element coercion), record-copy(field coercions), closure adapt, …)? Is it keyed by
-  `RepId` pairs? Can mono and the IR builder call `relate` after checking as a pure function?
-- **E.** Is the 13-kind `RepNode` set still the plan? How are containers of records keyed after
-  H's 4a arm-bit finding? Is `repOf` total on a closed instance type?
-- **H.** Do instance types come from the same intern table, so that an instance key is an id
-  vector? Which stage ends `tyMutEpoch`? Should the IR key on `tyCanon` or `tyCanonLayout`? (This
-  note's answer: on neither. It stores `RepId`, §1.3.)
+- **M3, answered** (`refactor-notes/2026-11-15-relate-recorder-design.md`).
+  - The shape is `Coercion{conv, at, steps, kids}`. `conv` is a flat code, and the value is
+    recursive through `kids`.
+  - It is keyed by `TyId` pairs.
+  - `relate` is pure post-check only after its stage C, which waits on H stages 1 and 2.
+  - §1.5 records what the IR reads, and the four `conv` codes it still needs. **The `conv` codes
+    are pending.**
+- **E.** Is the 13-kind `RepNode` set still the plan? Is `repOf` total on a closed instance type?
+  No answer yet. H's answer below settles the keying of containers of records.
+- **H, answered.**
+  - There is one persistent intern table (`emit_ty_seal.vl`). An id names content, so a closed
+    instance type gets its id from the same table.
+  - Instance keys become id vectors at H stage 5. Mono keys on `tyCanonKey` strings until then.
+  - Emit-side `tyMutEpoch` reads end in the stage-4 slices. The checker's end only with the
+    checker-side seal, after L2. Pins still happen during mono's instance re-checks, so an id is
+    final only after `arenaFinal`, or after its instance's seal. Phase A's builder runs inside
+    `emitFuncCode`, after `arenaFinal`, so it holds only final ids. Phase B must build an instance
+    only after that instance's seal.
+  - `TyId` is `tyCanonSet`, the type identity, used for diagnostics, the verifier and instance
+    keys. `RepId` is the arm-aware layout id that H is building on `tyCanonLayout`, with each
+    record's arm bit fixed after `repVariantShapesPrime`. Nothing keys instances on
+    `tyCanonLayout`.
 - **Q, answered.**
   - `Lowered` is its own product, keyed per `InstId`. `Elaborated` owns the instances and is the
     builder's input, not its container.
