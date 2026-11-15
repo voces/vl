@@ -174,7 +174,7 @@ const show = (xs: string[]): string => `[${xs.join(", ")}]`;
 
 Deno.test("ast: `nodeValueChildren` delegates its default to `nodeChildren`", () => {
   assert(
-    VALUES.tail === "nodeKidsOf(n)",
+    VALUES.tail.replace(/^return /, "") === "nodeKidsOf(n)",
     `nodeValueChildren's default must be \`nodeKidsOf(n)\`, nodeChildren's arm table — the delegation is what ` +
       `makes 32 kinds inherit one arm table; got \`${VALUES.tail}\``,
   );

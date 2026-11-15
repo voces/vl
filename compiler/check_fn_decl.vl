@@ -1,6 +1,10 @@
 // A function declaration: its parameters and their defaults, the solve for un-annotated
 // parameters, its body and its return.
 
+import { isBlockBody, stmtStartTok } from "./block_body"
+import { CODE_MISSING_RETURN } from "./check_messages"
+import { parenPeelIx } from "./check_places"
+import { nodeStartTok } from "./fmt_util"
 import { tySame } from "./check_types"
 import { ivSeedMovedWidth } from "./check_intrinsic_values"
 import {
@@ -9,14 +13,28 @@ import {
   elabNestNote,
 } from "./check_elab_cap"
 import {
+  ArrayLit,
+  BinExpr,
   Block,
+  BoolLit,
+  CharLit,
   FuncDecl,
   Ident,
   IfStmt,
+  Index,
+  MatchExpr,
+  Member,
   Node,
+  NullLit,
+  NumLit,
+  ObjLit,
+  P,
   Param,
   RetStmt,
+  StrLit,
   TypeRef,
+  Unary,
+  WhileStmt,
   annTsOf,
   arenaSetNode,
   blockTailIsDead,
@@ -40,6 +58,7 @@ import {
   collapsedTy,
   fsbCallIx,
   isStmtNode,
+  loopCarriesValue,
   markCollapsedBinding,
   markCollapsedRet,
 } from "./check_bind_rows"
@@ -109,6 +128,7 @@ import {
   cbExpectedFor,
   cbExpectedRetFor,
   cbExpectedRetHeld,
+  cbWantsValue,
   seedExpected,
 } from "./check_expected"
 import {
@@ -216,6 +236,7 @@ import {
   assignable,
   braceNameNote,
   tErr,
+  tErrPushTok,
   tErrWant,
   unknownTyErr,
 } from "./check_relate_core"
@@ -231,6 +252,7 @@ import {
   isValBindLambda,
   noteRetBareLambda,
   noteVoidCtxLambda,
+  recordTestWarning,
 } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
@@ -374,7 +396,7 @@ export function solveUnannotParams(fnIx: i32) {
       }
     }
   }
-  0
+  return 0
 }
 
 // True when hole `name` flows from `from` on into a function type other than `dst`: the
@@ -392,7 +414,7 @@ function holeFlowsToTwoFns(from: i32, name: string, dst: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // True when hole `name` is called directly, in a row past `from`, with an argument the function
@@ -422,7 +444,7 @@ function holeCalledOtherwise(from: i32, name: string, dst: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Declaration-side validation of parameter defaults (`paramTys` aligns 1:1 with `params`).
@@ -506,13 +528,13 @@ function checkParamDefaults(n: FuncDecl, params: i32[], paramTys: i32[]) {
     }
     pi = pi + 1
   }
-  0
+  return 0
 }
 
 // Checks each value a tail `if`/`else` (or the chain a `match` desugared to) yields against
 // the declared return `ret`, at the arm that yields it — the check the bare tail expression
 // gets. An arm that exits, yields no value or already failed is left to its own rule (D2234).
-function checkTailArmsAgainst(ix: i32, ret: i32) {
+export function checkTailArmsAgainst(ix: i32, ret: i32) {
   const leaves: i32[] = []
   tailValueLeaves(ix, leaves)
   let i = 0
@@ -541,7 +563,7 @@ function checkTailArmsAgainst(ix: i32, ret: i32) {
       }
     }
   }
-  0
+  return 0
 }
 
 // A function declaration: resolves param/return annotations, binds the signature, and checks
@@ -568,7 +590,7 @@ export function checkFuncDeclNode(n: FuncDecl, fnIx: i32) {
     lamCheckDepth = lamCheckDepth - 1
   }
   lpBaseSet(lpSaved)
-  r
+  return r
 }
 
 function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
@@ -681,7 +703,8 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if n.fnRet >= 0 && lamRetWrittenAt(fnIx) { cbSeedUsedSet(cbSeedUsed + 1) }
   refuseVoidRetsFrom(saved.voidRetLen, ret)
   inferRetLogTruncate(saved.retLogLen)
-  fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet)
+  // A refused value tail already says what the fall-off sentence would.
+  if !fnTailRefused(n) { fnDeclRefuseFallOff(n, fnIx, ret, bodyTotalForRet) }
   fnDeclNoteRedundantRet(
     n,
     fnIx,
@@ -695,7 +718,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   fnDeclRegisterGuard(n, params)
   // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
   // named function referenced as a value) evaluates to it.
-  mkFuncTy(paramTys, ret)
+  return mkFuncTy(paramTys, ret)
 }
 
 // The enclosing check's inference accumulators and return state, saved before a declaration's
@@ -737,14 +760,14 @@ function fnDeclSaveInference(): FnDeclSaved {
     pinnedReads: lbiPinnedReads,
     dstBinds: dstOpenBinds,
   }
-  s
+  return s
 }
 
 // The infer-stack key of declaration `n` at node `fnIx`: its name, so self-recursion is
 // detected, or `#L<fnIx>` for an anonymous lambda, so two nested lambdas never share one.
 function fnDeclInferKey(n: FuncDecl, fnIx: i32): string {
   if n.fnName == "" { return "#L" + i32ToStr(fnIx) }
-  n.fnName
+  return n.fnName
 }
 
 // A named `self`-first declaration is checked as reachable from its receiver type.
@@ -762,7 +785,7 @@ function fnDeclCheckSelfParam(
       }
     }
   }
-  0
+  return 0
 }
 
 // Registers `n` with its enclosing declaration when it is a generic nested in another function,
@@ -772,7 +795,7 @@ function fnDeclMarkNested(n: FuncDecl, fnIx: i32) {
     && n.fnTyParams.length > 0
     && (fnDeclIx[n.fnName] ?? -1) != fnIx
   if nested { nestParentOfPut(fnIx, curFnDeclIx) }
-  0
+  return 0
 }
 
 // Starts this body's return accumulators empty; an inferring body is pushed on the infer stack under `inferKey`.
@@ -786,7 +809,7 @@ function fnDeclResetInference(inferring: boolean, inferKey: string) {
     inferSawErrSet(false)
     fnSawValueRetSet(false)
   }
-  0
+  return 0
 }
 
 // Closes the body of declaration `n` at node `fnIx`: the frames, type parameters, scope and
@@ -824,7 +847,7 @@ function fnDeclLeaveBody(
       bodyChecked[n.fnName] = true
     }
   }
-  0
+  return 0
 }
 
 // The return type inferred for declaration `n` once its body is checked; `saved` holds the
@@ -853,7 +876,7 @@ function fnDeclInferredRet(
   if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
     clearTailVerdict(blockLastStmt(n.fnBody))
   }
-  ret
+  return ret
 }
 
 // Drops the return witnesses logged past `len`: they belong to the body just checked, not to an enclosing `if`'s replay.
@@ -863,7 +886,7 @@ function inferRetLogTruncate(len: i32) {
     inferRetLogSeed.pop()
     inferRetLogLit.pop()
   }
-  0
+  return 0
 }
 
 // How `checkFuncDeclNodeReal` treats a declaration's return: `inferring` when it is solved from
@@ -896,7 +919,7 @@ function fnDeclRetMode(n: FuncDecl, fnIx: i32): FnRetMode {
   // ...and for a result no caller reads, which the hoist already bound as `: void` (D2631).
   const ucVoided = inferring && fnResultUnconsumed(fnIx)
   if ucVoided { inferring = false }
-  { inferring: inferring, bareRetVoid: bareRetVoid, ucVoided: ucVoided }
+  return { inferring: inferring, bareRetVoid: bareRetVoid, ucVoided: ucVoided }
 }
 
 // The enclosing function's narrowing-clobber ledger, held while a nested body keeps its own.
@@ -922,7 +945,7 @@ function fnDeclEnterClobLedger(): NarClobLedger {
   narClobPrevSet([])
   narClobDepthsSet([])
   narClobRetiredSet([])
-  saved
+  return saved
 }
 
 // Puts back the ledger `fnDeclEnterClobLedger` saved.
@@ -932,7 +955,7 @@ function fnDeclLeaveClobLedger(saved: NarClobLedger) {
   narClobPrevSet(saved.prev)
   narClobDepthsSet(saved.depths)
   narClobRetiredSet(saved.retired)
-  0
+  return 0
 }
 
 // The enclosing body's per-function checker state, held while a nested body is checked.
@@ -981,7 +1004,7 @@ function fnDeclEnterBodyFrame(
   // Why this body's return type is void, for the return that disagrees with it: nobody wrote
   // `: void`, so the mismatch has to name the bare `return` that decided it.
   curFnBareRetVoidSet(bareRetVoid)
-  saved
+  return saved
 }
 
 // Puts back the state `fnDeclEnterBodyFrame` saved.
@@ -993,7 +1016,7 @@ function fnDeclLeaveBodyFrame(saved: FnBodyFrame) {
   curFnDeclIx = saved.declIx
   njFnIxSet(saved.njFn)
   curFnBareRetVoidSet(saved.bareRetVoid)
-  0
+  return 0
 }
 
 // What a skipped re-check of declaration `fnIx` answers: in the real pass, the function type
@@ -1003,7 +1026,7 @@ function fnDeclSkippedTy(fnIx: i32, inferKey: string): i32 {
   if inferQuiet || onInferStack(inferKey) { return TY_VOID }
   const own = nodeTyOf(fnIx)
   if own >= 0 && tyAt(own) is TyFunc { return own }
-  TY_VOID
+  return TY_VOID
 }
 
 // Whether an inferring check of declaration `fnIx` is skipped and answers `void` (its caller
@@ -1044,7 +1067,7 @@ function fnDeclAlreadyInferred(
       if bodyChecked[n.fnName] ?? false { return true }
     }
   }
-  false
+  return false
 }
 
 // Resolves each parameter's type of declaration `fnIx` into `paramTys`, and whether its
@@ -1143,7 +1166,7 @@ function fnDeclResolveParams(
     paramCollapsed.push(ptCollapsed)
     pi = pi + 1
   }
-  paramUninferable
+  return paramUninferable
 }
 
 // The return type of declaration `fnIx`: `-2` (pending) while inferring, else its resolved
@@ -1195,7 +1218,7 @@ function fnDeclResolveRet(
     // hoist does, so a self-call resolves and `finishInferredReturn` patches this binding.
     declareDecl(fnIx, n.fnName, mkFuncTy(paramTys, -2))
   }
-  ret
+  return ret
 }
 
 // Enters the body of declaration `fnIx`: its closure-capture frame, a fresh scope sharing the
@@ -1220,7 +1243,7 @@ function fnDeclPushCstrOwner(n: FuncDecl, fnIx: i32): boolean {
       cstrOwnerPushed = true
     }
   }
-  cstrOwnerPushed
+  return cstrOwnerPushed
 }
 
 // Keeps the type parameters of `fnIx` in scope for its whole body, each as an opaque `TyVar`
@@ -1329,7 +1352,7 @@ function fnTailGradeAgainstRet(tail: i32, stTy: i32, ret: i32) {
       checkTailArmsAgainst(tail, ret)
     }
   }
-  0
+  return 0
 }
 
 // Records the trailing statement `tail` (of type `stTy`) of an inferring body as a return
@@ -1357,7 +1380,7 @@ function fnTailInferWitness(tail: i32, stTy: i32) {
   // own type is void for an all-returning chain — so the accumulated join is what the
   // fall-through is checked against, refused the same as an annotation would (D1902).
   checkTrailingChainTotal(tail, inferObserved)
-  0
+  return 0
 }
 
 // Witnesses the NATURAL type `stTy` of the trailing statement `tail` of an annotated body for
@@ -1374,7 +1397,7 @@ function fnTailNaturalRet(tail: i32, stTy: i32, ret: i32) {
   // that does not cover every variant lets a value fall off the end, refused for a
   // non-void declared return (D1902).
   checkTrailingChainTotal(tail, ret)
-  0
+  return 0
 }
 
 // Hover over an un-annotated param: the body has now recorded everything it demands of the
@@ -1394,7 +1417,7 @@ function fnRetainParamDemands(params: i32[], paramTys: i32[]) {
     }
     hp = hp + 1
   }
-  0
+  return 0
 }
 
 // Checks the statements of the body of declaration `fnIx` under its scope, the last as the
@@ -1426,6 +1449,11 @@ function fnDeclCheckBody(
         // `inferObserved` before a recursive sibling branch is checked.
         const savedRTPbody = retTailPos
         let tailIsReturn = s == stmts.length - 1
+        // A block body's last statement is a statement; a last `return` keeps the tail position.
+        const ruleTail = tailIsReturn
+          && isBlockBody(n.fnBody)
+          && !(nodeAt(stmts[s]) is RetStmt)
+        if ruleTail { tailIsReturn = false }
         if tailIsReturn && blockTailIsDead(stmts) {
           tailIsReturn = false
           noteDeadTailBlk(n.fnBody)
@@ -1453,6 +1481,8 @@ function fnDeclCheckBody(
         const savedSpine = spineAt
         spineAtSet(-1)
         if s == stmts.length - 1 { spineAtSet(stmts[s]) }
+        // A `return` is written at the statement as written, before its check rewrites it.
+        const ruleTok = if ruleTail { nodeStartTok(stmts[s]) } else { -1 }
         const stTy = checkNodeHook(stmts[s])
         spineAtSet(savedSpine)
         crStmtLeave()
@@ -1461,10 +1491,24 @@ function fnDeclCheckBody(
         if ucVoided && tailIsReturn {
           ucShowRet = discardedTailTy(stmts[s], stTy)
         }
-        // The trailing expression is the implicit return; under inference it is a
-        // return-type witness. With a CONCRETE annotated return, a trailing empty
-        // collection (`mk(): i32[] { … inner }`) pins its element from the return
-        // type here — before the body scope is popped (and `inner`'s floor checked).
+        // A value tail with no `return` is refused where a value is wanted and warned when
+        // pure; a tail no path reaches is neither (`blockTailIsDead`).
+        if ruleTail && !blockTailIsDead(stmts) {
+          blockTailRefuse(
+            fnIx,
+            stmts[s],
+            stTy,
+            if inferring { -1 } else { ret },
+            ruleTok,
+          )
+        }
+        // A last `is`-chain falls off the end under either rule (D1902).
+        if ruleTail {
+          checkTrailingChainTotal(
+            stmts[s],
+            if inferring { inferObserved } else { ret },
+          )
+        }
         if tailIsReturn {
           if !inferring { fnTailGradeAgainstRet(stmts[s], stTy, ret) }
           if inferring {
@@ -1488,7 +1532,7 @@ function fnDeclCheckBody(
   if ucVoided && symEnabled != 0 && ucShowRet >= 0 && ucShowRet != TY_ERR {
     symRetainType(fnIx, mkFuncTy(paramTys, ucShowRet), 2)
   }
-  bodyTotalForRet
+  return bodyTotalForRet
 }
 
 // Joins the return witnesses an inferring body dropped since `savedDroppedLen` into the
@@ -1659,7 +1703,7 @@ function fnDeclIsGeneric(n: FuncDecl): boolean {
     const pn = nodeAt(p)
     if pn is Param && pn.parType < 0 { return true }
   }
-  false
+  return false
 }
 
 // ── a lambda's return taken from its context (D3087, D16310) ──────────────────────────────────
@@ -1671,13 +1715,15 @@ let lamRetQTy: i32[] = []
 // The lambdas whose return-annotation node a pin wrote, which no source token spells.
 let lamRetWritten: {[i32]: boolean} = Map()
 
-export function lamRetWrittenAt(ix: i32): boolean { lamRetWritten[ix] ?? false }
+export function lamRetWrittenAt(ix: i32): boolean {
+  return lamRetWritten[ix] ?? false
+}
 
 export function lamRetReset() {
   lamRetQNode = []
   lamRetQTy = []
   lamRetWritten = Map()
-  0
+  return 0
 }
 
 // Queues lambda `n` at `fnIx`, whose inferred return is `ret`, when it is held to a closed
@@ -1696,7 +1742,7 @@ function lamRetQueue(n: FuncDecl, fnIx: i32, ret: i32) {
   if !differs || i32ListHas(lamRetQNode, fnIx) { return 0 }
   lamRetQNode.push(fnIx)
   lamRetQTy.push(er)
-  0
+  return 0
 }
 
 // Writes each queued lambda's contextual return as its return-annotation node, so the next check
@@ -1728,14 +1774,14 @@ export function lamRetApply(): i32 {
   }
   lamRetQNode = []
   lamRetQTy = []
-  k
+  return k
 }
 
 // Whether `t`, a lambda's contextual return, is a closed type that can stand in for its annotation:
 // not void or never, not an error, naming no hole or type variable, and not a literal result. A
 // literal result is adopted by its own rule, which judges each returned value against it (D9520).
 function lamCtxRetClosed(t: i32): boolean {
-  t >= 0
+  return t >= 0
     && t < T.tys.length
     && !isVoidTy(t)
     && !isNeverTy(t)
@@ -1773,4 +1819,95 @@ function lamLitResult(t: i32, depth: i32): boolean {
       return lamLitResult(n.fnRet, depth - 1)
     }
   }
+}
+
+// A block body's last statement: a value expression where the function returns a value is
+// refused, `null`-admitting included, since falling off would return `null` in its place; so is
+// a lambda's where its expected type wants a value. A pure one where none is wanted warns. Both
+// take a `--fix` that writes `return` before it.
+function blockTailRefuse(fnIx: i32, tl: i32, stTy: i32, ret: i32, tok: i32) {
+  if !blockTailIsValue(tl) || stmtAlwaysExits(tl) { return 0 }
+  const at = stmtStartTok(tok)
+  let msg = ""
+  if valueRet(ret) {
+    msg = fnWhoOf(fnIx, "`")
+      + " returns "
+      + tyToStr(ret)
+      + ", but a block body returns a value only through `return`: write `return` before its last expression"
+  } else if (
+    ret < 0
+    && stTy >= 0
+    && !isVoidTy(stTy)
+    && (valueRet(cbExpectedRetFor(fnIx)) || cbWantsValue(fnIx))
+  ) {
+    msg = "this lambda is expected to return a value, but a block body returns one only through `return`: write `return` before its last expression"
+  }
+  if msg != "" {
+    if at >= 0 && at < P.toks.length {
+      tErrPushTok(msg, tl, at, CODE_MISSING_RETURN, "")
+    } else {
+      tErr(msg, tl)
+    }
+  } else if tailIsPure(tl) {
+    recordTestWarning(
+      tl,
+      "discarded-tail-value",
+      "this value is discarded; did you mean `return …`?",
+    )
+  }
+  return 0
+}
+
+// Whether `t` is a result type that returns a value.
+function valueRet(t: i32): boolean {
+  return t >= 0 && !isVoidTy(t) && t != TY_NEVER && t != TY_ERR
+}
+
+// Whether function `n`'s last statement is refused as a value tail with no `return`.
+function fnTailRefused(n: FuncDecl): boolean {
+  const b = if n.fnBody >= 0 && n.fnBody < P.nodes.length { nodeAt(n.fnBody) } else { null }
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  const tl = b.blkStmts[b.blkStmts.length - 1]
+  for d in T.diags {
+    if d.tat == tl && d.tcode == CODE_MISSING_RETURN { return true }
+  }
+  return false
+}
+
+// Whether discarded tail `t` is pure: a name, a literal, an operator that stores nothing, a field
+// or element read, or a record or list literal.
+function tailIsPure(t: i32): boolean {
+  const n = nodeAt(parenPeelIx(t))
+  return n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+    || n is Member
+    || n is Index
+    || n is ObjLit
+    || n is ArrayLit
+    || n is Unary
+    || n is BinExpr && n.binOp != "="
+}
+
+// Whether some arm of `if` `tl` ends in a value it yields, rather than every arm exiting.
+function blockTailLeafYields(tl: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(tl, leaves)
+  for lf in leaves {
+    if !isStmtNode(lf) && !stmtAlwaysExits(lf) { return true }
+  }
+  return false
+}
+
+// Whether statement `tl`, ending a block body, is that body's value under today's rule; the
+// statement kinds `isStmtNode` names are values only as a value `if`, `match` or loop.
+function blockTailIsValue(tl: i32): boolean {
+  const t = nodeAt(tl)
+  if t is IfStmt { return !ifYieldsNoValue(tl) && blockTailLeafYields(tl) }
+  if t is WhileStmt { return t.whileBlk == 1 || loopCarriesValue(tl) }
+  if t is MatchExpr { return !stmtAlwaysExits(tl) }
+  return !isStmtNode(tl)
 }

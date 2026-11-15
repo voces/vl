@@ -411,7 +411,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
-  const src = `function t() { 1 == 1 }
+  const src = `function t() { return 1 == 1 }
 function mk() { return [] }
 function f() {
   const x = if t() { [] } else { null }

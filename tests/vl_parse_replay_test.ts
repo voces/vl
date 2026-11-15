@@ -83,7 +83,7 @@ type Square = { s: f64 }
 export type Shape = Circle | Square
 
 export function area(s: Shape): f64 {
-  match s {
+  return match s {
     Circle => 3.0 * s.r * s.r
     Square => s.s * s.s
   }
@@ -106,7 +106,7 @@ const FLAG = `export function flagged(n: i32): i32 {
     if f(n) > 0 { break @B 7 }
     0
   }
-  v + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + n
+  return v + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + n
 }
 `;
 
@@ -184,7 +184,7 @@ const EDITED = `${ROOT}/compiler/listutil.vl`;
 const EDIT: [string, string] = [
   EDITED,
   Deno.readTextFileSync(EDITED) +
-  "\nexport function pbReplayEdit(n: i32): i32 { n + 1 }\n",
+  "\nexport function pbReplayEdit(n: i32): i32 { return n + 1 }\n",
 ];
 
 const push = (fn: (cp: number) => number, text: string) => {
@@ -375,7 +375,7 @@ Deno.test({
     const [A, B, C, D] = GRAPHS;
     // lib.vl edited under its own key, then restored: the slot is replaced, never served stale.
     const A2 = fixed("A, lib.vl edited", A.entry, {
-      [LIB_KEY]: LIB + "export function more(n: i32): i32 { n * 2 }\n",
+      [LIB_KEY]: LIB + "export function more(n: i32): i32 { return n * 2 }\n",
     });
     // A clean parse that fails the CHECK: its diagnostics' spans are read off replayed tokens.
     const E = fixed(

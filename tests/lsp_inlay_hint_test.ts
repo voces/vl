@@ -37,7 +37,7 @@ Deno.test({
   const checker = loadWasmChecker(SEED, () => {})!;
   // `x` inferred (hint), `add` return inferred (hint after `)`), `a`/`b` params
   // annotated (suppressed), `s` inferred (hint).
-  const src = "let x = 1 + 2\nfunction add(a: i32, b: i32) {\n  a + b\n}\nlet s = \"hi\"\n";
+  const src = "let x = 1 + 2\nfunction add(a: i32, b: i32) {\n  return a + b\n}\nlet s = \"hi\"\n";
   const candidates = await checker.inlayHintsAt(src, "/tmp/x.vl", noSiblings);
   const hints = inlayHintsFromWasm(candidates, undefined, src);
   const labels = hints.map((h) => h.label).sort();
@@ -113,7 +113,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
-  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const src = 'function greet(n: string) {\n  print(n)\n  return "hi " + n\n}\ngreet("a")\n';
   const candidates = await checker.inlayHintsAt(src, "/tmp/x.vl", noSiblings);
   const hints = inlayHintsFromWasm(candidates, undefined, src);
   assertEquals(hints.map((h) => h.label), [": string"], "statement-only function's return inlay");

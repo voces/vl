@@ -207,7 +207,7 @@ Deno.test({
   ignore,
   fn: () => {
     // End-to-end: the emitted module must not depend on how the source arrived.
-    const src = "function f(a: i32, b: i32) { a * b + 1 }\nprint(f(6, 7))\n";
+    const src = "function f(a: i32, b: i32) { return a * b + 1 }\nprint(f(6, 7))\n";
     const compile = (mode: "push" | "load"): Uint8Array => {
       const exp = instantiate();
       exp.modReset();
