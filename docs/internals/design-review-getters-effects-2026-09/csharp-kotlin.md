@@ -48,7 +48,7 @@ other getters**. p2 is the everyday C# expression-bodied property that calls a h
 
 ```vl
 function chan(v: i32, s: i32): i32 { return (v >> s) & 255 }
-get r(self: Color): i32 { chan(self as! i32, 16) }
+get r(self: Color): i32 { return chan(self as! i32, 16) }
 // the getter `r` on Color calls `chan`, which is neither a pure intrinsic nor a getter
 ```
 

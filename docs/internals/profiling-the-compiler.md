@@ -63,6 +63,23 @@ Notes, each of which cost something to learn:
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 
+## Comparing CPU between two seeds: interleave, and read the ranges
+
+* **Interleave the builds.** A round builds every configuration once (base seed, candidate
+  seed, and any untriggered control), and the rounds repeat; never run all of one seed's builds
+  before the other's. On D16553 a sequential median of 10 read 39.00 s against 38.88 s, and the
+  same comparison interleaved read 35.51 s against 31.72 s: the box's load drifted between the
+  two blocks and hid a 3.8 s win.
+* **Report user plus sys, the median, and the min and max.** A win is outside noise when the
+  candidate's max is under the base's min, or the medians differ by several times the spread.
+* **Name the heap.** The self-compile runs at `VL_COMPILE_GC_HEAP=2G`, a user build at the
+  default first heap, and the two can disagree: D16553 measured both.
+* **Fuel is not CPU.** Guest fuel counts instructions and leaves out collection, so a change
+  that adds a copying collection or grows the live set costs more CPU than its fuel says, and a
+  cut of cheap loops saves less. `VL_GC_STATS=1` prints the collection count and peak live set.
+* **A guest profile is not a timer at this size.** Two profiles of the same L2 build differed
+  by about 6% in sample count; use it to say where time goes, not how much a change saved.
+
 ## The instruments under `scripts/perf/`
 
 One line per file, taken from its own header, plus the PR it names (blank where the header
