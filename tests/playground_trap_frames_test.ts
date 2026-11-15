@@ -51,7 +51,7 @@ const TRAP_SRC = [
   "  // line 4",
   "  const xs = [1, 2]",
   "  // line 6",
-  "  xs[n]",
+  "  return xs[n]",
   "}",
   "// line 9",
   "print(boom(0))",

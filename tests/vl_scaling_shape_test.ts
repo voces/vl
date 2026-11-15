@@ -72,7 +72,7 @@ const genFunctions = (nf: number, ns: number): string => {
   for (let i = 0; i < nf; i++) {
     o.push(`function f${i}(k: i32): i32 {`, "  let t = k");
     for (let j = 0; j < ns; j++) o.push(`  t = t + ${j % 13} * k - ${j % 7}`);
-    o.push("  t", "}");
+    o.push("  return t", "}");
   }
   o.push("let acc = 0");
   for (let i = 0; i < 40; i++) o.push(`acc = acc + f${i}(${i % 5})`);
@@ -97,7 +97,7 @@ const genFamilyFunctions = (nf: number, ns: number): string =>
 // scans every call in the arena for them is functions x calls.
 const genParamFieldCalls = (n: number): string => {
   const o: string[] = ["type Box = { get: () => i32 }"];
-  for (let i = 0; i < n; i++) o.push(`function f${i}(b: Box): i32 { b.get() + ${i % 13} }`);
+  for (let i = 0; i < n; i++) o.push(`function f${i}(b: Box): i32 { return b.get() + ${i % 13} }`);
   o.push("const bx: Box = { get: () => 3 }", "let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + f${i}(bx)`);
   o.push("print(acc)");
@@ -109,13 +109,13 @@ const genParamFieldCalls = (n: number): string => {
 // answer walks the whole frame, so an unmemoised capture set is calls x body.
 const genClosureArgCalls = (n: number): string => {
   const o: string[] = [
-    "function apply(x: i32, f: (v: i32) => i32): i32 { f(x) }",
+    "function apply(x: i32, f: (v: i32) => i32): i32 { return f(x) }",
     "function run(k: i32): i32 {",
     "  let acc = 0",
     "  const g = (v: i32): i32 => v + k",
   ];
   for (let i = 0; i < n; i++) o.push(`  acc = acc + apply(${i % 7}, g)`);
-  o.push("  acc", "}", "print(run(3))");
+  o.push("  return acc", "}", "print(run(3))");
   return o.join("\n") + "\n";
 };
 
@@ -125,14 +125,14 @@ const genClosureArgCalls = (n: number): string => {
 // another (D4942), `list` hands a list literal of its parameter on (D4942).
 type HofShape = "copy" | "rewrite" | "global" | "list";
 const genHofBodies = (n: number, shape: HofShape): string => {
-  const o: string[] = ["let H = 4", "let G = H", "function sink(v: i32): i32 { v + 1 }"];
-  o.push("function sinkL(v: i32[]): i32 { v.length }", "function hook(f: (ix: i32) => i32): i32 { f(1) }");
+  const o: string[] = ["let H = 4", "let G = H", "function sink(v: i32): i32 { return v + 1 }"];
+  o.push("function sinkL(v: i32[]): i32 { return v.length }", "function hook(f: (ix: i32) => i32): i32 { return f(1) }");
   for (let i = 0; i < n; i++) {
     o.push(`function f${i}(x: i32): i32 {`);
     if (shape === "copy") o.push("  let y = G", "  sink(y)");
     if (shape === "rewrite") o.push("  let y = G", `  if x > ${i} { y = H }`, "  sink(y)");
     if (shape === "global") o.push(`  if x > ${i} { G = H }`, "  sink(G)");
-    if (shape === "list") o.push(`  sinkL([x, x + 1, x + ${i}])`);
+    if (shape === "list") o.push(`  return sinkL([x, x + 1, x + ${i}])`);
     o.push("}");
   }
   o.push("let t = 0");
@@ -148,8 +148,8 @@ const genSigWidthCalls = (n: number, w: number, wide: boolean): string => {
   const o: string[] = [
     "type Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: f64`).join(", ") + " }",
     "type Narrow = { f0: f64 }",
-    'function f(p: Wide): string { "a" }',
-    'function g(p: Narrow): string { "a" }',
+    'function f(p: Wide): string { return "a" }',
+    'function g(p: Narrow): string { return "a" }',
     "const qw: Wide = { " + Array.from({ length: w }, (_, i) => `f${i}: ${i}.5`).join(", ") + " }",
     "const qn: Narrow = { f0: 1.5 }",
     'let acc = ""',
@@ -201,8 +201,8 @@ const genLitSets = (n: number, k: number): string => {
   for (let i = 0; i < n; i++) {
     const t = i % m;
     o.push(
-      `function f${i}(k: "a${t}" | "b${t}" | "c"): i32 { if k == "c" { return 1 } if k == "a${t}" { return 2 } 3 }`,
-      `function g${i}(b: boolean): "a${t}" | "b${t}" | "c" { if b { return "c" } "b${t}" }`,
+      `function f${i}(k: "a${t}" | "b${t}" | "c"): i32 { if k == "c" { return 1 } if k == "a${t}" { return 2 } return 3 }`,
+      `function g${i}(b: boolean): "a${t}" | "b${t}" | "c" { if b { return "c" } return "b${t}" }`,
     );
   }
   o.push("let acc = 0");
@@ -216,7 +216,7 @@ const genLitSets = (n: number, k: number): string => {
 // `n` value-position writes to a wider name, each a binding of its own, at module scope or in
 // one function. D2398 moves each ahead of its binding and keys the start function's order.
 const genValueWrites = (n: number, inFn: boolean): string => {
-  const o: string[] = ["function h(i: i32): i32 { i }", "let a: f64 = 0"];
+  const o: string[] = ["function h(i: i32): i32 { return i }", "let a: f64 = 0"];
   if (inFn) o.push("function main() {");
   const pad = inFn ? "  " : "";
   for (let i = 0; i < n; i++) o.push(`${pad}const y${i} = (a = h(${i}))`);
@@ -240,7 +240,7 @@ const genArmBodies = (n: number): string => {
 const genCallSites = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
-  for (let i = 0; i < n; i++) o.push(`function g${i}(x: i32): i32 { x + ${i % 13} }`);
+  for (let i = 0; i < n; i++) o.push(`function g${i}(x: i32): i32 { return x + ${i % 13} }`);
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     o.push(`acc = acc + g${i % m}(${i % 5})`);
@@ -256,7 +256,7 @@ const genExports = (n: number, k: number): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
     const ex = i % k === 0 ? "export " : "";
-    o.push(`${ex}function f${i}(x: i32): i32 { if x > ${i} { x * ${i} + f${i > 0 ? i - 1 : 0}(x - 1) } else { x + ${i} } }`);
+    o.push(`${ex}function f${i}(x: i32): i32 { return if x > ${i} { x * ${i} + f${i > 0 ? i - 1 : 0}(x - 1) } else { x + ${i} } }`);
   }
   return o.join("\n") + "\n";
 };
@@ -268,9 +268,9 @@ const genExports = (n: number, k: number): string => {
 const genCallbacks = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = [];
-  for (let i = 0; i < n; i++) o.push(`function cb${i}(x: i32): i32 { x + ${i % 13} }`);
+  for (let i = 0; i < n; i++) o.push(`function cb${i}(x: i32): i32 { return x + ${i % 13} }`);
   for (let i = 0; i < m; i++) {
-    o.push(`function hof${i}(fn${i}: (i32) => i32, x: i32): i32 { fn${i}(x) + ${i % 7} }`);
+    o.push(`function hof${i}(fn${i}: (i32) => i32, x: i32): i32 { return fn${i}(x) + ${i % 7} }`);
   }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
@@ -289,10 +289,10 @@ const genGetterCallees = (n: number, k: number): string => {
   const m = Math.max(1, Math.floor(n / k));
   const o: string[] = ["type V = new { n: i32 }"];
   for (let i = 0; i < n; i++) {
-    o.push(`function k${i}(x: i32): i32 { x * ${(i % 5) + 2} }`);
-    o.push(`function h${i}(x: i32): i32 { if x > ${i % 11} { k${i}(x) } else { x + 1 } }`);
+    o.push(`function k${i}(x: i32): i32 { return x * ${(i % 5) + 2} }`);
+    o.push(`function h${i}(x: i32): i32 { return if x > ${i % 11} { k${i}(x) } else { x + 1 } }`);
   }
-  for (let i = 0; i < n; i++) o.push(`get g${i}(self: V): i32 { h${i % m}(self.n) }`);
+  for (let i = 0; i < n; i++) o.push(`get g${i}(self: V): i32 { return h${i % m}(self.n) }`);
   o.push("const v: V = { n: 3 }", "let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + v.g${i}`);
   // Keeps every helper reached, so neither arm drops declarations the other emits.
@@ -338,7 +338,7 @@ const genPins = (n: number, many: boolean): string => {
 const genFirstInsts = (n: number, many: boolean): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
-    o.push(many ? `function g${i}<T>(x: T): T { x }` : `function g${i}(x: i32): i32 { x }`);
+    o.push(many ? `function g${i}<T>(x: T): T { return x }` : `function g${i}(x: i32): i32 { return x }`);
   }
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) o.push(`acc = acc + g${i}(${i % 97})`);
@@ -355,10 +355,10 @@ const genInstsBesideInferred = (n: number, u: number, many: boolean): string => 
   for (let i = 0; i < u; i++) {
     o.push(`function plain${i}(r: Row, k: i32) {`, "  let acc = k");
     for (let j = 0; j < 6; j++) o.push(`  acc = acc + ${(i + j) % 13} * ${j % 7} - ${j % 5}`);
-    o.push(`  if acc > ${i % 50} { r.name + "${i}" } else { r.name }`, "}");
+    o.push(`  return if acc > ${i % 50} { r.name + "${i}" } else { r.name }`, "}");
   }
   for (let i = 0; i < n; i++) {
-    o.push(many ? `function g${i}<T>(x: T, r: Row) { [x] }` : `function g${i}(x: i32, r: Row) { [x] }`);
+    o.push(many ? `function g${i}<T>(x: T, r: Row) { return [x] }` : `function g${i}(x: i32, r: Row) { return [x] }`);
   }
   o.push(`const row: Row = { id: 1, name: "r", w: 0.5 }`, "let tot = 0");
   for (let i = 0; i < u; i++) o.push(`tot = tot + plain${i}(row, ${i}).length`);
@@ -413,7 +413,7 @@ const writeModules = (dir: string, mods: number, per: number, body: number): str
       const i = j * per + t;
       o.push(`export function h${i}(x: i32): i32 {`, "  let v = x");
       for (let s = 0; s < body; s++) o.push(`  v = v + ${(i + s) % 13} * x - ${s % 7}`);
-      o.push("  v", "}");
+      o.push("  return v", "}");
     }
     Deno.writeTextFileSync(`${dir}/mod${j}.vl`, o.join("\n") + "\n");
   }
@@ -451,7 +451,7 @@ const genAdoptedListsFn = (nf: number): string => {
   const o = ["const i: { f: i32 } = { f: 4 }", "type I = { f: i64 | null }"];
   for (let k = 0; k < nf; k++) {
     o.push(`function h${k}(): i32 {`, `  const il = [{ f: ${k % 13} }]`, "  const ic: I[] = il");
-    o.push("  if (il[0].f ?? 0) > 5 { ic.length + 1 } else { ic.length }", "}");
+    o.push("  return if (il[0].f ?? 0) > 5 { ic.length + 1 } else { ic.length }", "}");
   }
   o.push("let acc = 0");
   for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
@@ -462,9 +462,9 @@ const genAdoptedListsFn = (nf: number): string => {
 // D2933's same-name twin: `nf` functions, each binding its own record literal `r` and handing an
 // alias of it to a declared record of the same field names, so each literal is re-seated.
 const genReseatedRecordsFn = (nf: number): string => {
-  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "function use(j: J): i32 { j.f ?? 0 }"];
+  const o = ["type J = { f: i32 | null }", "type I = { f: i32 }", "function use(j: J): i32 { return j.f ?? 0 }"];
   for (let k = 0; k < nf; k++) {
-    o.push(`function h${k}(): i32 {`, `  const r = { f: ${k % 13} }`, "  const q = r", "  use(q) + r.f", "}");
+    o.push(`function h${k}(): i32 {`, `  const r = { f: ${k % 13} }`, "  const q = r", "  return use(q) + r.f", "}");
   }
   o.push("let acc = 0");
   for (let k = 0; k < nf; k++) o.push(`acc = acc + h${k}()`);
@@ -764,9 +764,9 @@ hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking th
 const genHofGate = (o: string[]) =>
   o.push(
     "let h: (i32) => i32 = (t: i32) => -9",
-    "function hof(f: (i32) => i32): i32 { f(1) }",
+    "function hof(f: (i32) => i32): i32 { return f(1) }",
     "print(hof(h))",
-    "function inc(t: i32): i32 { t + 1 }",
+    "function inc(t: i32): i32 { return t + 1 }",
   );
 const genWalkerCalls = (k: number, rec: boolean): string => {
   const o: string[] = [];
@@ -946,7 +946,7 @@ axis(
 const genRecordChainPin = (depth: number, pinned: boolean): string => {
   const o = ["type L0 = {a: i32}"];
   for (let i = 1; i <= depth; i++) o.push(`type L${i} = {x: L${i - 1}}`);
-  o.push("function id<T>(x: T | string): T | string { x }");
+  o.push("function id<T>(x: T | string): T | string { return x }");
   o.push(`const v: L${depth} = ${"{x: ".repeat(depth)}{a: 1}${"}".repeat(depth)}`);
   o.push(pinned ? `const r = id<L${depth}>(v) as! L${depth}` : "const r = v");
   o.push(`print(r${".x".repeat(depth)}.a)`);
@@ -971,8 +971,8 @@ const genDiamond = (n: number, diamond: boolean): string => {
   o.push("const a0: A0 = {x: 1}");
   for (let i = 1; i <= n; i++) o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
   const fn = `((x: A${n}) => i32) | null`;
-  o.push(`function g(m: {[string]: ${fn}}): i32 { 1 }`, `const m: {[string]: ${fn}} = Map()`);
-  o.push(`function h(ys: (${fn})[]): i32 { ys.length }`);
+  o.push(`function g(m: {[string]: ${fn}}): i32 { return 1 }`, `const m: {[string]: ${fn}} = Map()`);
+  o.push(`function h(ys: (${fn})[]): i32 { return ys.length }`);
   o.push(`const ys: (${fn})[] = [null, (x: A${n}): i32 => 20]`);
   o.push(`function mk(x: i32): A${n} {`, "  const b0 = {x: x}");
   for (let i = 1; i < n; i++) o.push(`  const b${i} = {l: b${i - 1}, r: ${r(`b${i - 1}`, "x")}}`);
@@ -1177,12 +1177,12 @@ axis(
 const genWriteCycle = (k: number, cycle: boolean): string => {
   const o = ["type R = {v: i32 | null}", "const o: R = {v: 1}"];
   for (let i = 0; i < k - 1; i++) {
-    o.push(`function f${i}(n: i32): i32 {`, "  if n <= 0 { return 0 }", `  f${i + 1}(n - 1) + f${i + 1}(n - 2)`, "}");
+    o.push(`function f${i}(n: i32): i32 {`, "  if n <= 0 { return 0 }", `  return f${i + 1}(n - 1) + f${i + 1}(n - 2)`, "}");
   }
   o.push(`function f${k - 1}(n: i32): i32 {`, "  o.v = 2", "  if n <= 0 { return 0 }");
-  o.push(`  f${cycle ? 0 : k - 1}(n - 1)`, "}");
+  o.push(`  return f${cycle ? 0 : k - 1}(n - 1)`, "}");
   o.push("function main(): i32 {", "  if o.v != null {", "    const r = f0(3)");
-  o.push("    if o.v != null { return o.v + r }", "  }", "  0", "}", "print(main())");
+  o.push("    if o.v != null { return o.v + r }", "  }", "  return 0", "}", "print(main())");
   return o.join("\n") + "\n";
 };
 
@@ -1199,12 +1199,12 @@ const genParamWriteCycle = (k: number, cycle: boolean): string => {
   const o = ["type R = {v: i32 | null}"];
   for (let i = 0; i < k - 1; i++) {
     o.push(`function f${i}(p: R, n: i32): i32 {`, "  if n <= 0 { return 0 }");
-    o.push(`  f${i + 1}(p, n - 1) + f${i + 1}(p, n - 2)`, "}");
+    o.push(`  return f${i + 1}(p, n - 1) + f${i + 1}(p, n - 2)`, "}");
   }
   o.push(`function f${k - 1}(p: R, n: i32): i32 {`, "  p.v = 2", "  if n <= 0 { return 0 }");
-  o.push(`  f${cycle ? 0 : k - 1}(p, n - 1)`, "}");
+  o.push(`  return f${cycle ? 0 : k - 1}(p, n - 1)`, "}");
   o.push("function main(): i32 {", "  const o: R = {v: 1}", "  if o.v != null {", "    const r = f0(o, 3)");
-  o.push("    if o.v != null { return o.v + r }", "  }", "  0", "}", "print(main())");
+  o.push("    if o.v != null { return o.v + r }", "  }", "  return 0", "}", "print(main())");
   return o.join("\n") + "\n";
 };
 
@@ -1224,8 +1224,8 @@ const genCallbackLambdas = (n: number, oneFn: boolean): string => {
     "type Circle = { r: i32 }",
     "type Sq = { s: i32 }",
     "type Shape = Circle | Sq",
-    "function sum(xs: Shape[]): i32 { xs.length * 3 }",
-    "function lenC(xs: Circle[]): i32 { xs.length * 5 }",
+    "function sum(xs: Shape[]): i32 { return xs.length * 3 }",
+    "function lenC(xs: Circle[]): i32 { return xs.length * 5 }",
     "function main() {",
     "  const sh: Shape[] = [{ r: 1 }]",
     "  print(sum(sh))",
@@ -1316,7 +1316,7 @@ const genRecordCovar = (n: number, wide: boolean): string => {
   const o = [`type P = { x: ${wide ? "i32 | string" : "i32"}, n: i32 }`, "function g(p: P, k: i32): i32 {", "  let s = 0"];
   for (let i = 0; i < n; i++) o.push("  s = s + p.n");
   o.push("  if k > 0 { s = s + g(p, k - 1) }");
-  o.push("  s", "}", "let acc = 0", "function main() {", "  const q = { x: 1, n: 1 }", "  let t = 0");
+  o.push("  return s", "}", "let acc = 0", "function main() {", "  const q = { x: 1, n: 1 }", "  let t = 0");
   for (let i = 0; i < n; i++) o.push("  t = t + g(q, 1)");
   o.push("  print(t)", "}", "main()", "print(acc)");
   return o.join("\n") + "\n";
@@ -1354,7 +1354,7 @@ const genSiblingBlocks = (n: number, temps: "same" | "unique" | "hoisted"): stri
         `${d}r${s} = y${s} ^ m${s}; acc = acc + r${s}; ${d}${v} = ${i % 2 ? "1.5" : i}; print(${v}) }`,
     );
   }
-  o.push("  acc", "}", "print(f(7))");
+  o.push("  return acc", "}", "print(f(7))");
   return o.join("\n") + "\n";
 };
 
@@ -1401,7 +1401,7 @@ const genSiblingReps = (n: number, temps: "same" | "hoisted"): string => {
     }
     o.push(`  { ${parts.join("; ")} }`);
   }
-  o.push("  acc", "}", "print(f(7))");
+  o.push("  return acc", "}", "print(f(7))");
   return o.join("\n") + "\n";
 };
 
@@ -1435,7 +1435,7 @@ const genTopStmtsUnionMiss = (n: number, many: boolean): string => {
   for (let i = 0; i < n; i++) {
     o.push(`  const f${i} = g`, `  const r${i} = f${i}(${i})`, `  if r${i} is i32 { t = t + r${i} }`);
   }
-  o.push("  t", "}", "print(h())");
+  o.push("  return t", "}", "print(h())");
   return o.join("\n") + "\n";
 };
 
@@ -1462,7 +1462,7 @@ const genManyClosedSiblingReads = (n: number, many: boolean): string => {
   const shadows = many ? n : 1;
   for (let i = 0; i < shadows; i++) o.push(`  { const v = ${i}`, `    t = t + v }`);
   for (let i = 0; i < n; i++) o.push("  t = t + v");
-  o.push("  t", "}", "print(h())");
+  o.push("  return t", "}", "print(h())");
   return o.join("\n") + "\n";
 };
 
@@ -1536,10 +1536,10 @@ axis(
 // emitter's cell captures instead, which is not this axis.
 const genCapturedNarrowings = (n: number, writer: boolean): string => {
   const o = ['let g: string | null = "ab"'];
-  if (writer) o.push("function setG() { g = null }");
+  if (writer) o.push("function setG() { return g = null }");
   o.push("function f(): i32 {", "  let t = 0", "  if g != null {");
   for (let i = 0; i < n; i++) o.push(`    const c${i} = (): i32 => g.length`, `    t = t + c${i}()`);
-  o.push("  }", "  t", "}", "print(f())");
+  o.push("  }", "  return t", "}", "print(f())");
   return o.join("\n") + "\n";
 };
 
@@ -1558,7 +1558,7 @@ axis(
 // arm clears `FLOOR` and the reading stays a ratio.
 const genLongBody = (n: number, closure: boolean): string => {
   const o = ["const k = 1000"];
-  o.push(closure ? "const g = (y: i32) => match y {" : "function g(y: i32): i32 {\n  match y {");
+  o.push(closure ? "const g = (y: i32) => match y {" : "function g(y: i32): i32 {\n  return match y {");
   for (let i = 0; i < n; i++) o.push(`  ${i} => k + ${i % 97}`);
   o.push("  _ => -1", "}");
   if (!closure) o.push("}");
@@ -1585,11 +1585,11 @@ axis(
 // the capture memo), and each call asks whether its callee is a captured loop variable.
 const genCallBlocks = (n: number, fns: number): string => {
   const per = Math.floor(n / fns);
-  const o = ["let g = 3", "function h(x: i32): i32 { x * 2 + g }"];
+  const o = ["let g = 3", "function h(x: i32): i32 { return x * 2 + g }"];
   for (let f = 0; f < fns; f++) {
     o.push(`function f${f}(a: i32): i32 {`, "  let acc = 0");
     for (let i = 0; i < per; i++) o.push(`  { const m = h(a + ${i}) + g; acc = acc + m }`);
-    o.push("  acc", "}");
+    o.push("  return acc", "}");
   }
   o.push("let acc = 0");
   for (let i = 0; i < 600; i++) fill(o, i, 6);
@@ -1616,7 +1616,7 @@ const genFrameLocals = (n: number, fns: number): string => {
   for (let f = 0; f < fns; f++) {
     o.push(`function f${f}(a: i32): i32 {`, "  let acc = 0");
     for (let i = 0; i < per; i++) o.push(`  const m${i} = a + ${i}`, `  acc = acc + m${i} * g`);
-    o.push("  acc", "}");
+    o.push("  return acc", "}");
   }
   o.push("let acc = 0");
   for (let i = 0; i < 600; i++) fill(o, i, 6);
@@ -1653,7 +1653,7 @@ const genNesting = (n: number, nested: boolean): string => {
   const body = nested
     ? open.join("") + [...close].reverse().join("")
     : open.map((o, k) => o + close[k]).join("");
-  return `function f(a: i32): i32 {\n  let acc = 0\n  ${body}\n  acc\n}\nprint(f(1))\n`;
+  return `function f(a: i32): i32 {\n  let acc = 0\n  ${body}\n  return acc\n}\nprint(f(1))\n`;
 };
 
 // A pass that re-walked a level's whole subtree once per level was quadratic in the depth:
@@ -1670,14 +1670,14 @@ axis(
 // `stmts` bindings of a `depth`-deep nest of if-expressions in the THEN arm, against
 // `stmts * depth` one-level ones: the same `if` nodes either way, only how deep they sit.
 const genIfNest = (stmts: number, depth: number, nested: boolean): string => {
-  const o = ["function t(): boolean { 1 == 1 }", "function f(a: i32): i32 {", "  let acc = 0"];
+  const o = ["function t(): boolean { return 1 == 1 }", "function f(a: i32): i32 {", "  let acc = 0"];
   const n = nested ? stmts : stmts * depth;
   for (let i = 0; i < n; i++) {
     let s = `a + ${i % 13}`;
     for (let k = 0; k < (nested ? depth : 1); k++) s = `if t() { ${s} } else { 2 }`;
     o.push(`  const v${i} = ${s}`, `  acc = acc + v${i}`);
   }
-  o.push("  acc", "}", "print(f(1))");
+  o.push("  return acc", "}", "print(f(1))");
   return o.join("\n") + "\n";
 };
 
@@ -1706,7 +1706,7 @@ const genConcatChains = (chains: number, len: number): string => {
       o.push(`  const ${v}${i} = ${Array(len).fill(v).join(" + ")}`, `  acc = acc + ${v}${i}.length`);
     }
   }
-  o.push("  acc", "}", "print(f())");
+  o.push("  return acc", "}", "print(f())");
   return o.join("\n") + "\n";
 };
 
@@ -1728,22 +1728,22 @@ axis(
 const genOperatorChains = (n: number): string => {
   const o: string[] = [];
   for (const [f, ty, arg] of [["i", "i32", "1"], ["g", "f32", "0.25"], ["d", "f64", "0.5"], ["l", "i64", "3"], ["s", "string", '"ab"']]) {
-    o.push(`function ${f}(a: ${ty}): ${ty} {`, `  ${Array(n).fill("a").join(" + ")}`, "}");
+    o.push(`function ${f}(a: ${ty}): ${ty} {`, `  return ${Array(n).fill("a").join(" + ")}`, "}");
     o.push(f === "s" ? `print(${f}(${arg}).length)` : `print(${f}(${arg}))`);
   }
   // The same chains as the operand of a comparison, a condition and a `&&`, where the parser's
   // mark has to land on the chain's own root rather than on the operator that wraps it.
   const c = Array(n).fill("a").join(" + ");
   o.push(
-    `function ceq(a: i32) { ${c} == 0 }`,
+    `function ceq(a: i32) { return ${c} == 0 }`,
     "print(ceq(1))",
-    `function cif(a: i32, limit: i32) { if ${c} > limit { return 1 } 0 }`,
+    `function cif(a: i32, limit: i32) { if ${c} > limit { return 1 } return 0 }`,
     "print(cif(1, 3))",
-    `function cand(b: boolean, a: i32) { b && ${c} > 3 }`,
+    `function cand(b: boolean, a: i32) { return b && ${c} > 3 }`,
     "print(cand(true, 1))",
-    `function clt(a: f64) { ${c} < 0.5 }`,
+    `function clt(a: f64) { return ${c} < 0.5 }`,
     "print(clt(0.5))",
-    `function cseq(a: string) { ${c} == \"x\" }`,
+    `function cseq(a: string) { return ${c} == \"x\" }`,
     "print(cseq(\"x\"))",
   );
   return o.join("\n") + "\n";
@@ -1839,7 +1839,7 @@ axis(
 // the one before it, so the solve must carry the answer down the whole chain. Fuel reads 3.97,
 // so the bar is 1.25x that.
 const genLiteralChain = (n: number): string => {
-  const o = ["function big() { 3000000000 }", "let a0 = 0", "a0 = big()"];
+  const o = ["function big() { return 3000000000 }", "let a0 = 0", "a0 = big()"];
   for (let i = 1; i < n; i++) o.push(`let a${i} = 0`, `a${i} = a${i - 1}`);
   o.push(`print(a${n - 1} + a0)`);
   return o.join("\n") + "\n";
@@ -1866,7 +1866,7 @@ const genSeqJoins = (n: number): string => {
   for (let i = 0; i < n; i++) {
     o.push(`  x = nn(k - ${i % 3})`, `  if x == null { x = ${i % 7} } else { x = x + 1 }`, "  acc = acc + x");
   }
-  o.push("  acc", "}", "print(f(1))");
+  o.push("  return acc", "}", "print(f(1))");
   return o.join("\n") + "\n";
 };
 
@@ -1885,7 +1885,7 @@ const genNestedJoins = (n: number): string => {
     o.push(`${pad}x = nn(k - ${i % 3})`, `${pad}if x == null { x = ${i % 7} }`, `${pad}acc = acc + x`, `${pad}if c {`);
   }
   for (let i = n - 1; i >= 0; i--) o.push(`${"  ".repeat(i + 1)}}`);
-  o.push("  acc", "}", "print(f(1, true))");
+  o.push("  return acc", "}", "print(f(1, true))");
   return o.join("\n") + "\n";
 };
 
@@ -1924,7 +1924,7 @@ const genElseIfChains = (shape: "return" | "value", nf: number, n: number): stri
       arms.push(shape === "return" ? `if x == ${i} { return ${i + f} }` : `if x == ${i} { ${i + f} }`);
     }
     const last = shape === "return" ? "{ return -1 }" : "{ -1 }";
-    o.push(shape === "return" ? `  ${arms.join(" else ")} else ${last}` : `  const r = ${arms.join(" else ")} else ${last}`);
+    o.push(shape === "return" ? `  return ${arms.join(" else ")} else ${last}` : `  const r = ${arms.join(" else ")} else ${last}`);
     if (shape === "value") o.push("  r");
     o.push("}");
   }
@@ -1954,7 +1954,7 @@ axis(
 const genGenericPlusChains = (nf: number, n: number): string => {
   const o: string[] = [];
   for (let f = 0; f < nf; f++) {
-    o.push(`function g${f}<T>(a: T): T {`, `  ${Array(n / nf).fill("a").join(" + ")}`, "}");
+    o.push(`function g${f}<T>(a: T): T {`, `  return ${Array(n / nf).fill("a").join(" + ")}`, "}");
   }
   for (let f = 0; f < nf; f++) o.push(`print(g${f}(${f}))`);
   return o.join("\n") + "\n";
@@ -2172,7 +2172,7 @@ const genShadowedCallee = (n: number, shadow: boolean): string => {
   o.push(`  if acc > 5 {\n    const ${b} = 3\n    acc = acc + ${b}\n  }`);
   o.push(`  for ${b} in [1, 2] { acc = acc + ${b} }`);
   for (let i = 0; i < n; i++) o.push(`  acc = acc + w() * ${i % 97}`);
-  o.push("  acc", "}", "print(g())");
+  o.push("  return acc", "}", "print(g())");
   return o.join("\n") + "\n";
 };
 
@@ -2197,7 +2197,7 @@ const genListLits = (fns: number, arms: number, annotated: boolean): string => {
     for (let a = 0; a < arms; a++) {
       o.push(`  if n == ${a} {`, `    const out${f}${t} = [n, n + ${a}]`, `    return out${f}`, "  }");
     }
-    o.push(`  const out${f}${t} = [n]`, `  out${f}`, "}");
+    o.push(`  const out${f}${t} = [n]`, `  return out${f}`, "}");
   }
   o.push("let acc = 0");
   for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f}).length`);
@@ -2220,7 +2220,7 @@ const genInferredCallees = (n: number, annotated: boolean): string => {
   const t = annotated ? ": i32[]" : "";
   const o = ["type U = i32 | string"];
   for (let f = 0; f < n; f++) {
-    o.push(`function f${f}(n: i32)${t} {`, `  const out: i32[] = [n, ${f % 13}]`, "  out", "}");
+    o.push(`function f${f}(n: i32)${t} {`, `  const out: i32[] = [n, ${f % 13}]`, "  return out", "}");
   }
   o.push("function main() {", "  let acc = 0");
   for (let f = 0; f < n; f++) o.push(`  acc = acc + f${f}(${f % 5}).length`);
@@ -2250,14 +2250,14 @@ const genSharedListName = (fns: number, shared: boolean): string => {
       "    return out",
       "  }",
       "  const out = [n]",
-      "  out",
+      "  return out",
       "}",
     );
   }
   const s = shared ? "out" : "sink";
   o.push("function h(k: i32): i32 {", `  let ${s} = k`);
   for (let j = 0; j < 8 * fns; j++) o.push(`  ${s} = ${s} + ${j % 7}`);
-  o.push(`  ${s}`, "}", "let acc = h(1)");
+  o.push(`  return ${s}`, "}", "let acc = h(1)");
   for (let f = 0; f < fns; f += 50) o.push(`acc = acc + g${f}(${f}).length`);
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -2277,14 +2277,14 @@ axis(
 const genGenericCycle = (n: number, cycle: boolean): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
-    o.push(`function h${i}(n: i32): boolean { n > 0 }`);
+    o.push(`function h${i}(n: i32): boolean { return n > 0 }`);
     o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
     for (let j = 0; j < n; j++) {
       if (j === i) continue;
       const call = cycle || j > i ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
       o.push(`  if n % ${n} == ${j} { return ${call} }`);
     }
-    o.push("  false", "}");
+    o.push("  return false", "}");
   }
   o.push("let acc = 0");
   for (let i = 0; i < 600; i++) fill(o, i, 6);
@@ -2307,14 +2307,14 @@ axis(
 const genGenericClique = (n: number, clique: boolean): string => {
   const o: string[] = [];
   for (let i = 0; i < n; i++) {
-    o.push(`function h${i}(n: i32): boolean { n > 0 }`);
+    o.push(`function h${i}(n: i32): boolean { return n > 0 }`);
     o.push(`function f${i}<T>(u: T | null, n: i32): boolean {`, "  if n <= 0 { return u == null }");
     for (let j = 0; j < n; j++) {
       if (j === i) continue;
       const call = clique ? `f${j}<T>(u, n - 1)` : `h${j}(n - 1)`;
       o.push(`  if n % ${n} == ${j} { return ${call} }`);
     }
-    o.push("  false", "}");
+    o.push("  return false", "}");
   }
   o.push("let acc = 0");
   for (let i = 0; i < 600; i++) fill(o, i, 6);
@@ -2429,7 +2429,7 @@ const fuelAllocAxis = (fuel: Bar, alloc: Bar, mk: (d: string) => [string, string
 // symbol-id space grows with `n` as well.
 const genPerFunction = (n: number, unit: (u: number) => string[]): string => {
   const o: string[] = [];
-  for (let f = 0; f < n; f++) o.push(`function f${f}(n: i32): i32 {`, "  let t = n", ...unit(f), "  t", "}");
+  for (let f = 0; f < n; f++) o.push(`function f${f}(n: i32): i32 {`, "  let t = n", ...unit(f), "  return t", "}");
   o.push("let acc = 0");
   for (let f = 0; f < Math.min(n, 40); f++) o.push(`acc = acc + f${f}(${f % 5})`);
   o.push("print(acc)");
@@ -2494,7 +2494,7 @@ fuelAllocAxis(
 const genTopFreshConsts = (n: number): string => {
   const o: string[] = [];
   for (let f = 0; f < n; f++) {
-    o.push(`function f${f}(n: i32): i32 {`, "  const p = { v: n }", "  p.v + 1", "}");
+    o.push(`function f${f}(n: i32): i32 {`, "  const p = { v: n }", "  return p.v + 1", "}");
     o.push("if true {", `  const a = { v: f${f}(1) }`, "  print(a.v)", "}");
   }
   return o.join("\n") + "\n";
@@ -2518,7 +2518,7 @@ const growUnit = (u: number) => [
   "  if had != null { t = t + had }",
 ];
 const genArenaGrowth = (n: number): string =>
-  "type A = { x: i32, y: i32 }\ntype B = { x: f64, y: f64 }\nfunction keep(a: A): i32 { a.x + a.y }\n" +
+  "type A = { x: i32, y: i32 }\ntype B = { x: f64, y: f64 }\nfunction keep(a: A): i32 { return a.x + a.y }\n" +
   genPerFunction(n, growUnit);
 allocAxis(
   "allocation: map reads beside object literals across functions",
@@ -2534,17 +2534,17 @@ allocAxis(
 // compile fuel reads 1.49. A table keyed by call path instead of by instance walks the chain
 // exponentially.
 const genFnFlowChain = (n: number): string => {
-  const o = ["let g = (x: i32): i32 => x", "function h0(f, x: i32): i32 { f(x) }"];
-  for (let i = 1; i < n; i++) o.push(`function h${i}(f, x: i32): i32 { h${i - 1}(f, x) + h${i - 1}(f, x + 1) }`);
+  const o = ["let g = (x: i32): i32 => x", "function h0(f, x: i32): i32 { return f(x) }"];
+  for (let i = 1; i < n; i++) o.push(`function h${i}(f, x: i32): i32 { return h${i - 1}(f, x) + h${i - 1}(f, x + 1) }`);
   o.push(
     "function pa(f, n: i32): i32 {",
     "  if n <= 0 {",
     "    g = f",
     "    return 0",
     "  }",
-    "  pb(f, n - 1)",
+    "  return pb(f, n - 1)",
     "}",
-    "function pb(f, n: i32): i32 { pa(f, n - 1) }",
+    "function pb(f, n: i32): i32 { return pa(f, n - 1) }",
     `print(h${n - 1}((x: i32): i32 => x + 1, 3))`,
     "print(pa((x: i32): i32 => x + 2, 4))",
     "print(g(1))",
@@ -2554,12 +2554,12 @@ const genFnFlowChain = (n: number): string => {
 const genFnFlowOne = (n: number): string => {
   const o = [
     "let g = (x: i32): i32 => x",
-    "function h0(f, x: i32): i32 { f(x) }",
+    "function h0(f, x: i32): i32 { return f(x) }",
     "function run(f, n: i32): i32 {",
     "  let acc = 0",
   ];
   for (let i = 1; i < n; i++) o.push(`  acc = acc + h0(f, ${i}) + h0(f, ${i + 1})`);
-  o.push("  g = f", "  acc", "}", "print(run((x: i32): i32 => x + 1, 3))", "print(g(1))");
+  o.push("  g = f", "  return acc", "}", "print(run((x: i32): i32 => x + 1, 3))", "print(g(1))");
   return o.join("\n") + "\n";
 };
 
@@ -2636,10 +2636,10 @@ shardTest({
 // list, pushes a local one and writes a module `let`, is a site for the flow table's class
 // merge and for the walk's frame questions. 1,600 functions against 400, so linear reads 4.
 const genGenericProgram = (n: number): string => {
-  const o = ["let G: i32[] = [1, 2, 3]", "let T = 0", "function id<V>(v: V): V { v }"];
+  const o = ["let G: i32[] = [1, 2, 3]", "let T = 0", "function id<V>(v: V): V { return v }"];
   for (let i = 0; i < n; i++) {
     o.push(`function f${i}(): i32 {`, "  const a = G[0]", "  const xs: i32[] = []", "  xs.push(a)");
-    o.push("  T = T + 1", `  xs[0] + ${i}`, "}");
+    o.push("  T = T + 1", `  return xs[0] + ${i}`, "}");
   }
   o.push("let s = 0");
   for (let i = 0; i < n; i++) o.push(`s = s + f${i}()`);

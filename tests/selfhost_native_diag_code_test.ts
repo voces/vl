@@ -584,7 +584,7 @@ Deno.test({
       "print(cur.skipTags())",
       "",
     ].join("\n"),
-    { "/w/lib2.vl": "export function bump(a: i32): i32 { a + 1 }\n" },
+    { "/w/lib2.vl": "export function bump(a: i32): i32 { return a + 1 }\n" },
   );
   if (rc !== 2) throw new Error(`expected rc 2 (type stage), got ${rc}`);
   if (diags.length !== 1) {
@@ -884,7 +884,7 @@ Deno.test({
       src: [
         "function f(): f64 {",
         "  let v: boolean | f64 = 1.5",
-        "  const k = () => { v = true }",
+        "  const k = () => { return v = true }",
         "  if v is f64 {",
         "    k()",
         "    return v * 2.0",
@@ -946,11 +946,11 @@ Deno.test({
   const exp = instantiate();
   const cases: { src: string; want: VLDiagnosticData }[] = [
     {
-      src: "function get(self: {[i32]: i32}, k: i32): i32 { k }\n",
+      src: "function get(self: {[i32]: i32}, k: i32): i32 { return k }\n",
       want: { member: ["get"], recv: ["{[i32]: i32}"], rung: ["method"] },
     },
     {
-      src: "type P = {x: i32}\nfunction x(self: P): i32 { self.x }\n",
+      src: "type P = {x: i32}\nfunction x(self: P): i32 { return self.x }\n",
       want: { member: ["x"], recv: ["P"], rung: ["field"] },
     },
   ];

@@ -167,7 +167,7 @@ Deno.test({
         "  // line 4",
         "  const xs = [1, 2]",
         "  // line 6",
-        "  xs[n]",
+        "  return xs[n]",
         "}",
         "// line 9",
         "print(boom(0))",
@@ -197,7 +197,7 @@ Deno.test({
         "  }",
         // Not a tail call: `f` is lambda-lifted (D3663), and a direct call in tail position
         // is a `return_call`, which leaves `outer` off the backtrace as for any function.
-        "  f(9) + 0",
+        "  return f(9) + 0",
         "}",
         "",
         "print(outer())",
@@ -223,7 +223,7 @@ Deno.test({
         "export function boom(n: i32): i32 {",
         "  const xs = [1, 2]",
         "  // line 5",
-        "  xs[n]",
+        "  return xs[n]",
         "}",
         "",
       ].join("\n"),

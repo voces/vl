@@ -291,8 +291,8 @@ export function go(): void {
 export function head(xs: i32[]): i32 {
   return xs[0]
 }
-export function half(n: i32) { n / 2 }
-export function twice(x) { x * 2 }
+export function half(n: i32) { return n / 2 }
+export function twice(x) { return x * 2 }
 export function pick<T>(a: T, b: T): T { return a }
 export function size(sh: Shape): i32 { return sh.w * sh.h }
 `;
@@ -392,13 +392,13 @@ const INF_LIB = `export let s = 0
 let hidden = { x: 1, y: 2 }
 type Box = { w: i32 }
 export function u(b: boolean) { if b { return 1 } return "x" }
-export function k() { 1 }
+export function k() { return 1 }
 export function mk() { return [] }
-export function rec() { { x: 1 } }
-export function md() { "a" }
+export function rec() { return { x: 1 } }
+export function md() { return "a" }
 export function nul(b: boolean) { if b { return null } return 1 }
-export function gs() { s }
-export function hid() { hidden }
+export function gs() { return s }
+export function hid() { return hidden }
 export function bx() {
   const b: Box = { w: 1 }
   return b
@@ -472,7 +472,7 @@ const CASES: Case[] = [
   one(
     "rep: nullable list elements",
     "hit",
-    `export function f() { [1, null] }\n`,
+    `export function f() { return [1, null] }\n`,
     "const v = f()\nconst e = v[0]\nif e != null { print(e + 1) }",
     "{ [1, null] }",
     "{\n  const a: (i32 | null)[] = [1, null]\n  a\n}",
@@ -505,7 +505,7 @@ const CASES: Case[] = [
   one(
     "rep: lambda with an untyped parameter",
     "miss",
-    `export function f() { (x) => x + 1 }\n`,
+    `export function f() { return (x) => x + 1 }\n`,
     "print(f()(2))",
     "(x) => x + 1",
     "(x) => x",
@@ -513,7 +513,7 @@ const CASES: Case[] = [
   one(
     "rep: lambda with an untyped parameter, string",
     "miss",
-    `export function f() { (x) => x }\n`,
+    `export function f() { return (x) => x }\n`,
     'print(f()("s"))',
     "(x) => x",
     "(x) => x + x",
@@ -521,7 +521,7 @@ const CASES: Case[] = [
   one(
     "rep: lambda body refused at the dependent's argument",
     "miss",
-    `export function f() { (x) => x }\n`,
+    `export function f() { return (x) => x }\n`,
     'print(f()("s"))',
     "(x) => x",
     "(x) => x * 2",
@@ -529,7 +529,7 @@ const CASES: Case[] = [
   one(
     "rep: lambda body member at the dependent's argument",
     "miss",
-    `export function f() { (x) => x }\n`,
+    `export function f() { return (x) => x }\n`,
     "print(f()(1))",
     "(x) => x",
     "(x) => x.length",
@@ -537,7 +537,7 @@ const CASES: Case[] = [
   one(
     "rep: lambda result type from the dependent's argument",
     "miss",
-    `export function f() { (x) => x }\n`,
+    `export function f() { return (x) => x }\n`,
     "const r = f()(1.5)\nprint(r / 2.0)",
     "(x) => x",
     "(x) => 1",
@@ -545,7 +545,7 @@ const CASES: Case[] = [
   one(
     "rep: an empty map",
     "hit",
-    `export function f() { Map() }\n`,
+    `export function f() { return Map() }\n`,
     'const m = f()\nm["a"] = 1\nprint(m["a"] ?? 0)',
     "{ Map() }",
     "{\n  const a = Map()\n  a\n}",
@@ -553,7 +553,7 @@ const CASES: Case[] = [
   one(
     "rep: f64 from a literal",
     "hit",
-    `export function f() { 1 }\n`,
+    `export function f() { return 1 }\n`,
     "const y: f64 = f()\nprint(y / 2.0)",
     "{ 1 }",
     "{ 1 + 1 - 1 }",
@@ -561,7 +561,7 @@ const CASES: Case[] = [
   one(
     "rep: i64 from a literal",
     "hit",
-    `export function f() { 1 }\n`,
+    `export function f() { return 1 }\n`,
     "const y: i64 = f()\nprint(y)",
     "{ 1 }",
     "{\n  const a = 1\n  a\n}",

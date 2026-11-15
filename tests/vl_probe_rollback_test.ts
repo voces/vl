@@ -38,7 +38,7 @@ const ERR_IN_INFERRED = `function f(x: i32) {
   if x > 0 { return g(x - 1) }
   return 1
 }
-function g(x: i32) { f(x) }
+function g(x: i32) { return f(x) }
 print(f(1))
 `;
 

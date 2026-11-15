@@ -196,7 +196,7 @@ const bigPrint = (): Exports => {
   for (let i = 0; i < PRINT_LINES; i++) {
     body += `// line ${String(i).padStart(6, "0")} 🚀漢字 ${"x".repeat(8)}\n`;
   }
-  body += "function f(): i32 { 1 }\n";
+  body += "function f(): i32 { return 1 }\n";
   for (let guard = 0; guard < 64; guard++) {
     const cmd = exp.cliNext();
     if (cmd === 1) { // CMD_LIST_DIR — the target is a file, not a directory

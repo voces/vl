@@ -113,7 +113,7 @@ const LIFTED: [string, string, string[]][] = [
       "    const f = (k: i32): i32 => o + k * 4",
       "    s += f(0) + f(1) + f(3)",
       "  }",
-      "  s",
+      "  return s",
       "}",
     ].join("\n"),
     ["sum"],
@@ -123,8 +123,8 @@ const LIFTED: [string, string, string[]][] = [
     [
       "export function host(p: i32): i32 {",
       "  const base = p * 2",
-      "  function g(n: i32): i32 { if n <= 0 { base } else { 1 + g(n - 1) } }",
-      "  g(3)",
+      "  function g(n: i32): i32 { return if n <= 0 { base } else { 1 + g(n - 1) } }",
+      "  return g(3)",
       "}",
     ].join("\n"),
     ["host", "g"],
@@ -138,7 +138,7 @@ const LIFTED: [string, string, string[]][] = [
       "    const inner = (y: i32): i32 => y + x + c",
       "    inner(1) + inner(2)",
       "  }",
-      "  outer(1) + outer(2)",
+      "  return outer(1) + outer(2)",
       "}",
     ].join("\n"),
     ["host", "outer"],
@@ -150,7 +150,7 @@ const LIFTED: [string, string, string[]][] = [
       "  let k = 0",
       "  const bump = (d: i32) => { k += d }",
       "  for i in 0 until n { bump(i) }",
-      "  k",
+      "  return k",
       "}",
     ].join("\n"),
     ["count", "bump"],
@@ -166,7 +166,7 @@ const LIFTED: [string, string, string[]][] = [
       "    b = b * 2.0",
       "    a",
       "  }",
-      "  go(p) + a + go(1) + (b as! i32)",
+      "  return go(p) + a + go(1) + (b as! i32)",
       "}",
     ].join("\n"),
     ["host", "go"],
@@ -181,7 +181,7 @@ const LIFTED: [string, string, string[]][] = [
       "    k += 1",
       "    return go(m - 1)",
       "  }",
-      "  go(n)",
+      "  return go(n)",
       "}",
     ].join("\n"),
     ["host", "go"],
@@ -214,11 +214,11 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const all = await disassemble([
-      "function apply(g: (i32) => i32, v: i32): i32 { g(v) }",
+      "function apply(g: (i32) => i32, v: i32): i32 { return g(v) }",
       "export function host(p: i32): i32 {",
       "  const c = p * 2",
       "  const f = (x: i32): i32 => x + c",
-      "  apply(f, 1) + f(2)",
+      "  return apply(f, 1) + f(2)",
       "}",
     ].join("\n"));
     const host = bodyOf(all, "host");
@@ -247,7 +247,7 @@ Deno.test({
       "    k += 1",
       "    return go(m - 1)",
       "  }",
-      "  go(n)",
+      "  return go(n)",
       "}",
     ].join("\n"));
     const go = bodyOf(all, "go");
@@ -263,13 +263,13 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     const all = await disassemble([
-      "function apply(g: () => i32): i32 { g() }",
+      "function apply(g: () => i32): i32 { return g() }",
       "export function host(): i32 {",
       "  let k = 0",
       "  const bump = () => { k += 1 }",
       "  const get = (): i32 => k",
       "  bump()",
-      "  apply(get)",
+      "  return apply(get)",
       "}",
     ].join("\n"));
     const host = bodyOf(all, "host");
@@ -359,15 +359,15 @@ const SPECIALISED: [string, string, Record<string, string>][] = [
       "    s = s + f(k)",
       "    k = k + 1",
       "  }",
-      "  s",
+      "  return s",
       "}",
-      "function twice(n: i32) { n * 2 }",
+      "function twice(n: i32) { return n * 2 }",
       "export function plain(p: i32): i32 {",
       "  const c = p * 2",
       "  const g = (x: i32): i32 => x + c",
-      "  g(1) + g(2)",
+      "  return g(1) + g(2)",
       "}",
-      "export function run(): i32 { host(twice, 3) + host((n: i32) => n + 1, 2) }",
+      "export function run(): i32 { return host(twice, 3) + host((n: i32) => n + 1, 2) }",
     ].join("\n"),
     {},
   ],
@@ -375,13 +375,13 @@ const SPECIALISED: [string, string, Record<string, string>][] = [
     "the host in an imported module",
     [
       'import { host } from "./lib"',
-      "function twice(n: i32) { n * 2 }",
+      "function twice(n: i32) { return n * 2 }",
       "export function plain(p: i32): i32 {",
       "  const c = p * 2",
       "  const g = (x: i32): i32 => x + c",
-      "  g(1) + g(2)",
+      "  return g(1) + g(2)",
       "}",
-      "export function run(): i32 { host(twice, 3) + host((n: i32) => n + 1, 2) }",
+      "export function run(): i32 { return host(twice, 3) + host((n: i32) => n + 1, 2) }",
     ].join("\n"),
     {
       "lib.vl": [
@@ -393,7 +393,7 @@ const SPECIALISED: [string, string, Record<string, string>][] = [
         "    s = s + f(k)",
         "    k = k + 1",
         "  }",
-        "  s",
+        "  return s",
         "}",
       ].join("\n"),
     },
@@ -425,7 +425,7 @@ for (const [name, src, libs] of SPECIALISED) {
 // un-exported twin is the control: its read is renamed to `id` and the record is never read.
 const READS_PARAM = (exported: boolean) =>
   [
-    "function id<T>(x: T): T { x }",
+    "function id<T>(x: T): T { return x }",
     `${exported ? "export " : ""}function run(f) {`,
     "  const o = { g: f }",
     "  return o.g(1)",
