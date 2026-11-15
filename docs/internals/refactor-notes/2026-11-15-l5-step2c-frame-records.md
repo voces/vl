@@ -37,7 +37,13 @@ Every read of the map fields is a `?? default` read, so the sentinel-index lint 
 
 ## Gate
 
-GATE_PLACEHOLDER
+- **Seeds:** A is a fixpoint built from `git archive 314123b83`; D is a fixpoint built from this branch.
+- **Identity:** `probe-rollback-census.ts --fingerprint` over `tests/cases`, `distilled/cells` and
+  `distilled/named` gives **20,316 programs, 0 different**.
+- **L2:** byte-identical. Guest fuel is 89,583,968,903 for A and 89,584,073,434 for D (+0.0001%).
+- **Gates:** `regress.vl` reports no runs lost and `lint-self.sh` is clean. The probe-rollback,
+  emitter-state audit, phase-state, memo-generation and pin-helper tests pass.
+  `phase-state-census --write-baseline` records the two falls.
 
 ## Lines
 
