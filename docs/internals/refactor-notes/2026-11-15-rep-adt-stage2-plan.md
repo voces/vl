@@ -138,4 +138,30 @@ without asking. All four are equivalent by construction.
 | `tyRepsAsNulAtom` | `wasmEmit.vl` | `false` |
 | `mvValKindOfTy` | `emit_shape_rows.vl` | `MVK_MONO`, after its three earlier tests, which is what the uncovered descriptor's kind `i32` gave |
 
-The measurements are below.
+**Measured.** Both seeds are fixpoints of master `d9b67813`, which already has batch 1, one with
+batch 2 and one without.
+
+| | master (batch 1) | + batch 2 |
+|---|---|---|
+| corpus exit codes / module bytes changed (12,037 cells) | — | **0 / 0** |
+| L2 self-compile fuel | 87,654,998,241 | 87,642,562,754 (−0.014%) |
+
+Open-type queries, both batches together (corpus):
+
+| reason | stage-2 start | after batches 1 and 2 |
+|---|---|---|
+| `leaf:unnarrowable` | 10,173 | **258** |
+| `union:open` | 143 | 54 |
+| `noFlatKind` (`never`) | 469 | 559 |
+| `nul:unclassified` | 16 | 5 |
+| `list:hole` / `map:val-hole` | 16 / 14 | 16 / 0 |
+| **total** | **10,831 in 3,015 programs** | **892 in 217 programs** |
+
+The `noFlatKind` count rose from 469 in 14 programs to 559 in 49. These are `never` results:
+cells added to the corpus since stage 0 that reach `std:test`. They are 2b's, not a regression of
+2a.
+
+Net compiler lines: +7. Pin-helper delta: 0.
+
+**What 2a has left.** 258 bare open queries in 157 programs, a fraction of the start. 2b handles
+`never` (559), `nul:unclassified` (5) and the one list hole, after which 2c's deletions can begin.
