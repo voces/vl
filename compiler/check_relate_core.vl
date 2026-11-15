@@ -20,6 +20,7 @@ import {
   elabFnSlotWidened,
   elabHolePinNote,
   elabPinBindingIs,
+  elabTyClosed,
   fnChoiceVetoed,
   fnChoiceWideNote,
   fnLetIsWide,
@@ -84,6 +85,7 @@ import {
   i32ToStr,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   stmtAlwaysExits,
   tsKidCount,
   tsKidStart,
@@ -8570,14 +8572,18 @@ function holeDeclCallInst(
   while j < n.callArgs.length {
     let at = -1
     if holeArgIsLam(n.callArgs[j]) {
-      const pts = holeParamCalledAt(f, j)
-      if pts.length == 0 && !holeParamCalledNullary(f, j) { return -1 }
-      const r = holeLamRetAt(
-        parenPeelIx(n.callArgs[j]),
-        mkFuncTy(pts, TY_I32),
-        vNames,
-        vTys,
-      )
+      const lx = parenPeelIx(n.callArgs[j])
+      const lam = nodeAt(lx)
+      const raw: i32[] = []
+      if (
+        !(lam is FuncDecl)
+        || !ftParamOnlyCalledAt(f.fnBody, f.fnParams[j], lam.fnParams.length, raw)
+      ) {
+        return -1
+      }
+      const pts: i32[] = []
+      for t in raw { pts.push(widenLitTy(t)) }
+      const r = holeLamRetAt(lx, mkFuncTy(pts, TY_I32), vNames, vTys)
       if r < 0 { return -1 }
       at = mkFuncTy(pts, r)
     } else {
@@ -8594,72 +8600,53 @@ function holeDeclCallInst(
   mkFuncTy(ats, r)
 }
 
-// The closed argument types every call of parameter `j` of `f` in its body passes, when each call
-// passes the same ones; [] when there is none, they disagree, or one stays open.
-function holeParamCalledAt(f: FuncDecl, j: i32): i32[] {
-  const calls = holeParamCalls(f, j)
-  if calls.length == 0 { return [] }
-  const out: i32[] = []
-  let first = true
-  for c in calls {
-    const cn = nodeAt(c)
-    if !(cn is Call) { return [] }
-    const ts: i32[] = []
-    for a in cn.callArgs {
-      const t = widenLitTy(nodeTyOf(a))
-      if t < 0 || tyHasTyVar(t) { return [] }
-      ts.push(t)
-    }
-    if first {
-      for t in ts { out.push(t) }
-      first = false
-    } else {
-      if ts.length != out.length { return [] }
-      let i = 0
-      while i < ts.length {
-        if !tySame(ts[i], out[i]) { return [] }
-        i = i + 1
-      }
-    }
-  }
-  out
-}
-
-// Whether `f`'s body calls parameter `j` and every such call passes nothing.
-function holeParamCalledNullary(f: FuncDecl, j: i32): boolean {
-  const calls = holeParamCalls(f, j)
-  if calls.length == 0 { return false }
-  for c in calls {
-    const cn = nodeAt(c)
-    if !(cn is Call) || cn.callArgs.length > 0 { return false }
-  }
-  true
-}
-
-// The calls in `f`'s body, outside nested functions, whose callee is a read of parameter `j`.
-function holeParamCalls(f: FuncDecl, j: i32): i32[] {
-  const out: i32[] = []
-  if j < 0 || j >= f.fnParams.length { return out }
-  const p = nodeAt(f.fnParams[j])
-  if !(p is Param) { return out }
-  const todo: i32[] = [f.fnBody]
+// Whether parameter `q` is read under `body`, and only as the callee of positional calls of `n`
+// arguments whose types are closed and match `at`'s, which the first such call fills.
+export function ftParamOnlyCalledAt(
+  body: i32,
+  q: i32,
+  n: i32,
+  at: i32[],
+): boolean {
+  let reads = 0
+  let calls = 0
+  const todo: i32[] = [body]
   while todo.length > 0 {
-    const ix = todo.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const n = nodeAt(ix)
-      if n is Call {
-        const cf = parenPeelIx(n.callFn)
-        if cf >= 0 && cf < P.nodes.length {
-          const cn = nodeAt(cf)
-          if cn is Ident && cn.identName == p.parName { out.push(ix) }
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if yn is Ident && identDeclOf(y) == q { reads = reads + 1 }
+      if yn is Call && identDeclOf(parenPeelIx(yn.callFn)) == q {
+        calls = calls + 1
+        if yn.callArgs.length != n || !ftArgIsParam(yn, n - 1) && n > 0 {
+          return false
+        }
+        let k = 0
+        while k < n {
+          const t = nodeTyIxOf(yn.callArgs[k])
+          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return false }
+          if at.length < n { at.push(t) }
+          else if !tySame(at[k], t) { return false }
+          k = k + 1
         }
       }
-      if !(n is FuncDecl) {
-        for ch in nodeChildren(ix) { todo.push(ch) }
-      }
+      nodeChildrenPush(y, todo)
     }
   }
-  out
+  calls > 0 && reads == calls
+}
+
+// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
+// before it.
+export function ftArgIsParam(c: Call, i: i32): boolean {
+  if i < 0 || i >= c.callArgs.length { return false }
+  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+  let j = 0
+  while j <= i {
+    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
+    j = j + 1
+  }
+  true
 }
 
 // Whether hole call argument `a` is a lambda literal whose type is still open.
