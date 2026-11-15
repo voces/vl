@@ -1980,7 +1980,7 @@ stronger than its measurement.
 
 ```vl
 type ZzUniqueSpelling = { zzFieldAlpha: i32, zzFieldBeta: string }
-function zzNamedFunction(p: ZzUniqueSpelling): i32 { p.zzFieldAlpha }
+function zzNamedFunction(p: ZzUniqueSpelling): i32 { return p.zzFieldAlpha }
 const v: ZzUniqueSpelling = { zzFieldAlpha: 1, zzFieldBeta: "zzLiteralString" }
 print(zzNamedFunction(v))
 ```

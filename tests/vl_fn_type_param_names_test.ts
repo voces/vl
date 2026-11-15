@@ -21,21 +21,21 @@ type S = { f: (@x: i32) => i32, g: Bin }
 type Box<T> = { v: T }
 type NF = Un | null
 type Pair<A, B> = { a: A, b: B }
-function dbl(x: i32) { x * 2 }
-function ex(s: string) { s + "!" }
-function add(a: i32, b: i32) { a + b }
-function apply(f: (@x: i32) => i32, v: i32) { f(v) }
-function mk(k: i32): (@x: i32) => i32 { (v: i32) => v * k }
-function id<T>(x: T): T { x }
-function callG<T>(f: (@x: T) => T, v: T): T { f(v) }
-function twice(f: (@cb: (@x: i32) => i32, @v: i32) => i32) { f(dbl, 5) }
+function dbl(x: i32) { return x * 2 }
+function ex(s: string) { return s + "!" }
+function add(a: i32, b: i32) { return a + b }
+function apply(f: (@x: i32) => i32, v: i32) { return f(v) }
+function mk(k: i32): (@x: i32) => i32 { return (v: i32) => v * k }
+function id<T>(x: T): T { return x }
+function callG<T>(f: (@x: T) => T, v: T): T { return f(v) }
+function twice(f: (@cb: (@x: i32) => i32, @v: i32) => i32) { return f(dbl, 5) }
 function run(v: ((@x: i32) => i32) | string) {
   if v is string { return v }
-  "fn \\{v(4)}"
+  return "fn \\{v(4)}"
 }
 function orNull(c: boolean): ((@x: i32) => i32) | null {
   if c { return dbl }
-  null
+  return null
 }
 const u: Un = dbl
 const u2: (@y: i32) => i32 = u

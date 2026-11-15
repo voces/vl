@@ -11,13 +11,13 @@ const KIND = `function kind<T>(v: T): string {
   if v is i64 { return "i64" }
   if v is f32 { return "f32" }
   if v is f64 { return "f64" }
-  "other"
+  return "other"
 }
 `;
-const SEL = `function gid<A>(x: A): A { x }
-function sel<A>(f: (x: A) => A): (x: A) => A { f }
+const SEL = `function gid<A>(x: A): A { return x }
+function sel<A>(f: (x: A) => A): (x: A) => A { return f }
 `;
-const MK = "function mk<T>(): T[] { [] }\n";
+const MK = "function mk<T>(): T[] { return [] }\n";
 
 export type Case = { name: string; ruling: string; src: string; want: string };
 
@@ -42,12 +42,12 @@ export function grid(): Case[] {
     dest("string", SEL + 'const k: (x: string) => string = sel(gid)\nprint(k("ab"))\n', "ab"),
     dest("i64", SEL + "const k: (x: i64) => i64 = sel(gid)\nprint(k(3000000000))\n", "3000000000"),
     dest("argument", SEL + "function use(k: (x: f64) => f64) { print(k(2.5)) }\nuse(sel(gid))\n", "2.5"),
-    dest("return", SEL + "function mk2(): (x: f64) => f64 { sel(gid) }\nprint(mk2()(0.25))\n", "0.25"),
+    dest("return", SEL + "function mk2(): (x: f64) => f64 { return sel(gid) }\nprint(mk2()(0.25))\n", "0.25"),
     // the un-annotated spelling of the witness: a hole function, bound by the destination too
-    dest("hole_fn", SEL + "function hdbl(x) { x + x }\nfunction use4(k: (x: i32) => i32) { print(k(4)) }\nuse4(sel(hdbl))\n", "8"),
-    dest("hole_fn_const", SEL + "function hdbl(x) { x + x }\nconst k: (x: f64) => f64 = sel(hdbl)\nprint(k(1.25))\n", "2.5"),
+    dest("hole_fn", SEL + "function hdbl(x) { return x + x }\nfunction use4(k: (x: i32) => i32) { print(k(4)) }\nuse4(sel(hdbl))\n", "8"),
+    dest("hole_fn_const", SEL + "function hdbl(x) { return x + x }\nconst k: (x: f64) => f64 = sel(hdbl)\nprint(k(1.25))\n", "2.5"),
     dest("return_only", MK + "const xs: string[] = mk()\nprint(xs.length)\n", "0"),
-    dest("nullable", "function z<T>(): T | null { null }\nconst v: string | null = z()\nprint(v == null)\n", "true"),
+    dest("nullable", "function z<T>(): T | null { return null }\nconst v: string | null = z()\nprint(v == null)\n", "true"),
     dest("none_binding", MK + "const xs = mk()\nprint(xs.length)\n", "refused"),
     dest("none_operand", MK + "print(mk().length)\n", "refused"),
   ];
