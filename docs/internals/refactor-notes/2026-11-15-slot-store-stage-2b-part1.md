@@ -5,7 +5,7 @@ place-class engine behind the values cascade. This PR deletes the cascade: `elab
 `elabSlotInstFacts` and `elabSlotBundleFacts` take every function-holding slot fact from the
 classes. Part 2 switches the delivery walk's readers and deletes the walk.
 
-- **Net:** +34 compiler lines against master `83a90988d` (486 added, 452 deleted). The record and the engine rules cost about what the cascade, its dead helpers and a write-only check table it freed save. The pair turns negative with part 2, which deletes the walk (about −1,000 to −1,300).
+- **Net:** +36 compiler lines against master `f211a3f9a` (488 added, 452 deleted). The record and the engine rules cost about what the cascade, its dead helpers and a write-only check table it freed save. The pair turns negative with part 2, which deletes the walk (about −1,000 to −1,300).
 - **Pin helpers:** `emit_mono` functions 908 → 908; part 1 touches no mono reader.
 
 ## What changed
@@ -37,16 +37,16 @@ classes. Part 2 switches the delivery walk's readers and deletes the walk.
 
 ## Readings
 
-Fixpoint seeds: master `83a90988d` and this branch, each byte-identical on a second refresh.
+Fixpoint seeds: master `f211a3f9a` and this branch, each byte-identical on a second refresh.
 
 | check | reading |
 |---|---|
 | distilled corpus, per cell (class and message) | 12,036 of 12,037 identical to master. The one mover is `dord011`: `trap_loads` → loud emit reject (`a function value is called at two signatures, and the closure it holds was built for one`). That is a trap now refused, not a lost `runs` |
 | filed witnesses, `--strict`, both inventories | ok (the gate's row) |
-| `decl-order-ab.vl` | 314 of 5,136 cases move, 38 to a clause-1 outcome. Master has 39; one case not in the baseline appears on both |
+| `decl-order-ab.vl` | 299 of 5,141 cases move, 31 to a clause-1 outcome. Master has 32; one case not in the baseline appears on both |
 | late demands | 2 in 2 files of 6,885 built, against master's 4 in 4: no file rises, and two fall (`error-record-field-of-generic-called-under-shadowing-name`, `error-written-record-field-of-generic-called-and-read-under-is`). The baseline is lowered for the falls only, written from this branch's fixpoint seed |
-| L2 self-compile guest fuel (`VL_FUEL=1`, each seed building its own tree) | 86.291e9 against master's 86.303e9: −0.01% |
-| seed size | 6,888,449 bytes: +3,866 (+0.06%) over master's fixpoint (gate: ok) |
+| L2 self-compile guest fuel (`VL_FUEL=1`, each seed building its own tree) | 86.876e9 against master's 86.896e9: −0.02% |
+| seed size | 6,894,177 bytes: +3,920 (+0.06%) over master's fixpoint (gate: ok) |
 | `scripts/gate.sh` | every row ok but `ci-native`. Its 5 failures are the seed-cache and sidecar tests, which fail on master's seed too in this container (`~/.cache/vl/seed` is gone, and the container runs as root) |
 
 ## Declaration order: what part 1 can and cannot move
