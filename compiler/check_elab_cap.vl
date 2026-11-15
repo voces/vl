@@ -72,10 +72,14 @@ import {
   mkNullableTy,
   mkObjTy,
   tyArrayElemIx,
+  tyElemOf,
+  tyElemOpen,
   tyFieldTyOf,
   tyHasHole,
-  tyOpen,
+  tyKeyOf,
   tySame,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { declTyOf } from "./check_nar_store"
 import {
@@ -847,14 +851,14 @@ function elabTyClosedWalk(t: i32, depth: i32, own: i32[]): boolean {
       return elabOwnedBy(own, elabHoleRootName(t))
     }
     TyArray => {
-      return elabTyClosedOwn(x.aElem, depth + 1, own)
+      return elabTyClosedOwn(tyElemOf(x), depth + 1, own)
     }
     TyNullable => {
       return elabTyClosedOwn(x.nInner, depth + 1, own)
     }
     TyMap => {
-      return elabTyClosedOwn(x.mKey, depth + 1, own)
-        && elabTyClosedOwn(x.mVal, depth + 1, own)
+      return elabTyClosedOwn(tyKeyOf(x), depth + 1, own)
+        && elabTyClosedOwn(tyValOf(x), depth + 1, own)
     }
     TyObj => {
       for ft in x.objFieldTypes {
@@ -1194,10 +1198,10 @@ export function elabFnJoinListTy(j: i32, a: i32, b: i32): i32 {
   const al = T.tys[a]
   const bl = T.tys[b]
   if !(jl is TyArray) || !(al is TyArray) || !(bl is TyArray) { return j }
-  const je = jl.aElem
+  const je = tyElemOf(jl)
   if je < 0 || je >= T.tys.length { return j }
   const jt = T.tys[je]
-  const ne = if jt is TyArray { elabFnJoinListTy(je, al.aElem, bl.aElem) } else { elabFnJoinTy(je, al.aElem, bl.aElem) }
+  const ne = if jt is TyArray { elabFnJoinListTy(je, tyElemOf(al), tyElemOf(bl)) } else { elabFnJoinTy(je, tyElemOf(al), tyElemOf(bl)) }
   if ne == je { return j }
   mkArrayTy(ne)
 }
@@ -1210,8 +1214,8 @@ export function elabFnJoinMapTy(j: i32, a: i32, b: i32): i32 {
   const am = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
   const bm = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
   if !(jm is TyMap) || !(am is TyMap) || !(bm is TyMap) { return j }
-  const nv = elabFnJoinTy(jm.mVal, am.mVal, bm.mVal)
-  if nv == jm.mVal { j } else { mkMapTy(jm.mKey, nv, jm.mSet) }
+  const nv = elabFnJoinTy(tyValOf(jm), tyValOf(am), tyValOf(bm))
+  if nv == tyValOf(jm) { j } else { mkMapTy(tyKeyOf(jm), nv, jm.mSet) }
 }
 
 // `elabFnJoinTy` through lists and records, for a function's returned values: join `j` of `a`
@@ -1246,7 +1250,7 @@ function elabFnLeavesNamed(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return elabFnLeavesNamed(tt.aElem, depth + 1)
+      return elabFnLeavesNamed(tyElemOf(tt), depth + 1)
     }
     TyObj => {
       for f in tt.objFieldTypes {
@@ -1389,16 +1393,22 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
       ) {
         return 0
       }
-      const inner = !tyOpen(jt.aElem)
-        && jt.aElem < T.tys.length
-        && T.tys[jt.aElem] is TyFunc
+      const inner = !tyElemOpen(jt)
+        && tyElemOf(jt) < T.tys.length
+        && T.tys[tyElemOf(jt)] is TyFunc
       const listRec = !elabListLeafIsFn(j, 6)
       // A generic's instance builds from the template's tagged leaves, which a note would split.
       if listRec && elabCurFnGeneric() { return 0 }
       const wasUnder = elabFnJoinUnderListRec
       elabFnJoinListRec = listRec
       if listRec { elabFnJoinUnderListRec = true }
-      elabFnArmJoinAt(jt.aElem, at.aElem, bt.aElem, depth + 1, inner)
+      elabFnArmJoinAt(
+        tyElemOf(jt),
+        tyElemOf(at),
+        tyElemOf(bt),
+        depth + 1,
+        inner,
+      )
       elabFnJoinListRec = false
       elabFnJoinUnderListRec = wasUnder
       return 0
@@ -1418,10 +1428,10 @@ function elabCurFnGeneric(): boolean {
 // Whether list type `t`'s elements are records.
 function elabListLeafIsObj(t: i32): boolean {
   const tt = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
-  if !(tt is TyArray) || tyOpen(tt.aElem) || tt.aElem >= T.tys.length {
+  if !(tt is TyArray) || tyElemOpen(tt) || tyElemOf(tt) >= T.tys.length {
     return false
   }
-  T.tys[tt.aElem] is TyObj
+  T.tys[tyElemOf(tt)] is TyObj
 }
 
 // Whether list type `t`'s elements, through at most `depth` nested lists, are functions.
@@ -1429,7 +1439,7 @@ function elabListLeafIsFn(t: i32, depth: i32): boolean {
   if depth <= 0 || t < 0 || t >= T.tys.length { return false }
   const tt = T.tys[t]
   if !(tt is TyArray) { return false }
-  const e = tt.aElem
+  const e = tyElemOf(tt)
   if e < 0 || e >= T.tys.length { return false }
   if T.tys[e] is TyFunc { return true }
   elabListLeafIsFn(e, depth - 1)
@@ -1459,13 +1469,13 @@ function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
     TyArray => {
       if !(at is TyArray) || !(bt is TyArray) || shape == 3 { return j }
       const ne = elabFnJoinDeepAt(
-        jt.aElem,
-        at.aElem,
-        bt.aElem,
+        tyElemOf(jt),
+        tyElemOf(at),
+        tyElemOf(bt),
         depth + 1,
         if shape == 2 { 3 } else { 1 },
       )
-      return if ne == jt.aElem { j } else { mkArrayTy(ne) }
+      return if ne == tyElemOf(jt) { j } else { mkArrayTy(ne) }
     }
     TyObj => {
       if !(at is TyObj) || !(bt is TyObj) || shape == 3 { return j }
@@ -1524,7 +1534,8 @@ export function elabFnSetsWiden(own: i32, dst: i32, depth: i32): boolean {
         && (elabFnSetTy[dst] ?? -1) != (elabFnSetTy[own] ?? -1)
     }
     TyArray => {
-      return ot is TyArray && elabFnSetsWiden(ot.aElem, dt.aElem, depth + 1)
+      return ot is TyArray
+        && elabFnSetsWiden(tyElemOf(ot), tyElemOf(dt), depth + 1)
     }
     TyObj => {
       if !(ot is TyObj) || ot.objFieldNames.length != dt.objFieldNames.length {
@@ -1680,10 +1691,10 @@ export function elabFnMapLetTy(bd: i32, t: i32): i32 {
     return t
   }
   const tm = T.tys[t]
-  if !(tm is TyMap) || tyOpen(tm.mVal) || tm.mVal >= T.tys.length { return t }
-  const tf = T.tys[tm.mVal]
+  if !(tm is TyMap) || tyValOpen(tm) || tyValOf(tm) >= T.tys.length { return t }
+  const tf = T.tys[tyValOf(tm)]
   if !(tf is TyFunc) { return t }
-  const s = elabFnSetTy[tm.mVal] ?? -1
+  const s = elabFnSetTy[tyValOf(tm)] ?? -1
   const w = fnSlotSetOf(bd)
   if s < 0 || w < 0 || w == s { return t }
   const u = fnSetIntern(fnSetUnion(s, w))
@@ -1698,7 +1709,7 @@ export function elabFnMapLetTy(bd: i32, t: i32): i32 {
   const fresh = T.tys.length - 1
   elabFnSetTy[fresh] = u
   if !i32ListHas(fnSlotWidened, bd) { fnSlotWidened.push(bd) }
-  const mt = mkMapTy(tm.mKey, fresh, tm.mSet)
+  const mt = mkMapTy(tyKeyOf(tm), fresh, tm.mSet)
   fnJoinMemo[key] = mt
   mt
 }
@@ -1828,7 +1839,7 @@ export function elabFnFieldTy(
   const ta = T.tys[t]
   const listed = ta is TyArray
   const mapped = ta is TyMap && ta.mSet == 0
-  const e = if ta is TyArray { ta.aElem } else if ta is TyMap { ta.mVal } else { t }
+  const e = if ta is TyArray { tyElemOf(ta) } else if ta is TyMap { tyValOf(ta) } else { t }
   if e < 0 || e >= T.tys.length { return t }
   const tf = T.tys[e]
   if !(tf is TyFunc) { return t }
@@ -1919,7 +1930,7 @@ export function elabFnFieldTy(
   fnFieldWidenedName.push(name)
   fnFieldWidenedPath.push(path)
   fnFieldWidenedElem.push(fresh)
-  const lt = if ta is TyMap { mkMapTy(ta.mKey, fresh, 0) } else if listed { mkArrayTy(fresh) } else { fresh }
+  const lt = if ta is TyMap { mkMapTy(tyKeyOf(ta), fresh, 0) } else if listed { mkArrayTy(fresh) } else { fresh }
   fnJoinMemo[key] = lt
   lt
 }
@@ -1929,7 +1940,7 @@ function fnMapValSetOf(v: i32): i32 {
   const d = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identDeclOf(v) } else { v }
   const t = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
   const m = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
-  if m is TyMap { elabFnSetTy[m.mVal] ?? -1 } else { -1 }
+  if m is TyMap { elabFnSetTy[tyValOf(m)] ?? -1 } else { -1 }
 }
 
 // Adds to `vals` what each other binding a call of `bd`'s own callee initialises stores at
@@ -2128,7 +2139,7 @@ export function elabFnListLetTy(bd: i32, t: i32, closedAt: i32): i32 {
   if closedAt < 0 && i32ListHas(fnLetVeto, bd) { return t }
   const ta = T.tys[t]
   if !(ta is TyArray) { return t }
-  const e = ta.aElem
+  const e = tyElemOf(ta)
   if e < 0 || e >= T.tys.length { return t }
   const tf = T.tys[e]
   if !(tf is TyFunc) { return t }
@@ -2243,7 +2254,7 @@ function fnMapBindValTy(hb: i32): i32 {
   if !(n is LetDecl) { return -1 }
   const t = if n.letInit >= 0 { nodeTyIxOf(n.letInit) } else { nodeTyIxOf(hb) }
   const m = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
-  if m is TyMap { m.mVal } else { -1 }
+  if m is TyMap { tyValOf(m) } else { -1 }
 }
 
 // The set the assignment storing write value `v` yields as its own value carries, where that
@@ -2343,7 +2354,7 @@ export function elabFnListOpenWideMembers(bd: i32, t: i32): i32[] {
   if bd < 0 || t < 0 || t >= T.tys.length { return none }
   const ta = T.tys[t]
   if !(ta is TyArray) { return none }
-  const e = ta.aElem
+  const e = tyElemOf(ta)
   if e < 0 || e >= T.tys.length || !(T.tys[e] is TyFunc) || !tyHasTyVar(e) {
     return none
   }
@@ -2422,8 +2433,8 @@ export function fnWidenedSourceSets(s: i32): i32[] {
       const ia = if it >= 0 && it < T.tys.length { T.tys[it] } else { null }
       const bt = nodeTyIxOf(bd)
       const ba = if bt >= 0 && bt < T.tys.length { T.tys[bt] } else { null }
-      if ia is TyArray && ba is TyArray && fnTagSetOfTy(ba.aElem) == s {
-        const o = fnTagSetOfTy(ia.aElem)
+      if ia is TyArray && ba is TyArray && fnTagSetOfTy(tyElemOf(ba)) == s {
+        const o = fnTagSetOfTy(tyElemOf(ia))
         if o >= 0 && o != s && !i32ListHas(out, o) { out.push(o) }
       }
     }
@@ -2448,7 +2459,7 @@ export function fnSetGroupRep(s: i32): i32 {
   for bd in fnListWidened {
     const bt = if bd >= 0 && bd < P.nodes.length { nodeTyIxOf(bd) } else { -1 }
     const ba = if bt >= 0 && bt < T.tys.length { T.tys[bt] } else { null }
-    const t = if ba is TyArray { fnTagSetOfTy(ba.aElem) } else { -1 }
+    const t = if ba is TyArray { fnTagSetOfTy(tyElemOf(ba)) } else { -1 }
     if t >= 0 && !i32ListHas(tos, t) { tos.push(t) }
   }
   const seen: i32[] = [s]
@@ -2478,7 +2489,7 @@ export function elabFnListWideSet(bd: i32, t: i32): i32 {
   if bd < 0 || t < 0 || t >= T.tys.length { return -1 }
   const ta = T.tys[t]
   if !(ta is TyArray) { return -1 }
-  const s = elabFnSetTy[ta.aElem] ?? -1
+  const s = elabFnSetTy[tyElemOf(ta)] ?? -1
   const w = fnSlotSetOf(bd)
   if s < 0 || w < 0 || w == s { return -1 }
   fnSetIntern(fnSetUnion(s, w))
@@ -3143,9 +3154,9 @@ export function fnTagSlotMembers(t: i32, path: string[]): i32[] {
     if c < 0 || c >= T.tys.length { return [] }
     const ct = T.tys[c]
     if (k == "e" || k == "v") && ct is TyArray {
-      c = ct.aElem
+      c = tyElemOf(ct)
     } else if (k == "e" || k == "v") && ct is TyMap {
-      c = ct.mVal
+      c = tyValOf(ct)
     } else if k == "r" && ct is TyFunc {
       c = ct.fnRet
     } else if ct is TyObj && k.length > 2 && k.slice(0, 2) == "f." {
@@ -3712,7 +3723,9 @@ export function fnTagMembers(s: i32): i32[] {
 export function fnTagListTy(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const a = T.tys[t]
-  if a is TyArray { return fnTagTyIsTagged(a.aElem) || fnTagListTy(a.aElem) }
+  if a is TyArray {
+    return fnTagTyIsTagged(tyElemOf(a)) || fnTagListTy(tyElemOf(a))
+  }
   false
 }
 
@@ -3723,7 +3736,8 @@ export function fnTagHoldsTy(t: i32, depth: i32): boolean {
   const o = T.tys[t]
   match o {
     TyArray => {
-      return fnTagTyIsTagged(o.aElem) || fnTagHoldsTy(o.aElem, depth - 1)
+      return fnTagTyIsTagged(tyElemOf(o))
+        || fnTagHoldsTy(tyElemOf(o), depth - 1)
     }
     TyObj => {
       for f in o.objFieldTypes {
@@ -3732,7 +3746,7 @@ export function fnTagHoldsTy(t: i32, depth: i32): boolean {
       return false
     }
     TyMap => {
-      return fnTagTyIsTagged(o.mVal)
+      return fnTagTyIsTagged(tyValOf(o))
     }
     // No other kind holds ids as a container.
     TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
@@ -3781,7 +3795,7 @@ function fnTagHeldRecLits(v: i32, r: i32) {
   const vn = nodeAt(parenPeelIx(v))
   const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
   if !(vn is ArrayLit) || !(ro is TyArray) { return 0 }
-  for el in vn.arrElems { fnTagHeldRecLit(parenPeelIx(el), ro.aElem, 8) }
+  for el in vn.arrElems { fnTagHeldRecLit(parenPeelIx(el), tyElemOf(ro), 8) }
   0
 }
 
@@ -3832,7 +3846,7 @@ function fnTagRecLitsOnly(v: i32, t: i32, depth: i32): boolean {
   if !(vn is ArrayLit) || !(o is TyArray) || vn.arrElems.length == 0 {
     return false
   }
-  if !fnTagHasSplitFieldIn(o.aElem, depth) { return false }
+  if !fnTagHasSplitFieldIn(tyElemOf(o), depth) { return false }
   for el in vn.arrElems {
     const ex = parenPeelIx(el)
     if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is ObjLit) {
@@ -3884,11 +3898,11 @@ function fnTagPlaceRep(v: i32): i32 {
     const isMap = tn >= 0 && tn < T.tys.length && T.tys[tn] is TyMap
     if steps[k] == "?" {
       const mt = if tn >= 0 && tn < T.tys.length { T.tys[tn] } else { null }
-      t = if mt is TyMap { mt.mVal } else { tyArrayElemIx(tn) }
+      t = if mt is TyMap { tyValOf(mt) } else { tyArrayElemIx(tn) }
       if t >= 0 { t = mkNullableTy(t) }
     } else if steps[k] == "" && isMap {
       const mt = T.tys[tn]
-      t = if mt is TyMap { mt.mVal } else { -1 }
+      t = if mt is TyMap { tyValOf(mt) } else { -1 }
       if k == 0 && t >= 0 { t = mkNullableTy(t) }
     } else {
       t = if steps[k] == "" { tyArrayElemIx(tn) } else { tyFieldTyOf(tn, steps[k]) }
@@ -3926,7 +3940,7 @@ export function fnTagHeldWrittenInner(v: i32, r: i32, depth: i32) {
   if depth > 8 { return 0 }
   if vn is ArrayLit && ro is TyArray {
     if r != nodeTyIxOf(vx) { fnTagHeldRep[vx] = r }
-    for el in vn.arrElems { fnTagHeldWrittenInner(el, ro.aElem, depth + 1) }
+    for el in vn.arrElems { fnTagHeldWrittenInner(el, tyElemOf(ro), depth + 1) }
   } else {
     fnTagHeldWrittenRec(vx, r)
   }
@@ -3952,7 +3966,7 @@ export let fnTagHeldRecs: i32[] = []
 // Whether `t` is a list whose element is a list.
 function fnTagListOfLists(t: i32): boolean {
   const o = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
-  const e = if o is TyArray && !tyOpen(o.aElem) && o.aElem < T.tys.length { T.tys[o.aElem] } else { null }
+  const e = if o is TyArray && !tyElemOpen(o) && tyElemOf(o) < T.tys.length { T.tys[tyElemOf(o)] } else { null }
   e is TyArray
 }
 
@@ -3965,7 +3979,7 @@ function fnTagInnerLitsOnly(v: i32, t: i32, depth: i32): boolean {
   if !(vn is ArrayLit) || !(o is TyArray) || depth > 8 { return false }
   if !fnTagListOfLists(t) { return true }
   for el in vn.arrElems {
-    if !fnTagInnerLitsOnly(el, o.aElem, depth + 1) { return false }
+    if !fnTagInnerLitsOnly(el, tyElemOf(o), depth + 1) { return false }
   }
   true
 }
@@ -3976,12 +3990,12 @@ function fnTagHeldInner(v: i32, r: i32, depth: i32) {
   const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
   const ro = if r >= 0 && r < T.tys.length { T.tys[r] } else { null }
   if !(vn is ArrayLit) || !(ro is TyArray) || depth > 8 { return 0 }
-  const eo = if !tyOpen(ro.aElem) && ro.aElem < T.tys.length { T.tys[ro.aElem] } else { null }
+  const eo = if !tyElemOpen(ro) && tyElemOf(ro) < T.tys.length { T.tys[tyElemOf(ro)] } else { null }
   for el in vn.arrElems {
     const ex = parenPeelIx(el)
     if ex >= 0 && ex < P.nodes.length && nodeAt(ex) is ArrayLit {
-      if ro.aElem != nodeTyIxOf(ex) { fnTagHeldRep[ex] = ro.aElem }
-      fnTagHeldInner(ex, ro.aElem, depth + 1)
+      if tyElemOf(ro) != nodeTyIxOf(ex) { fnTagHeldRep[ex] = tyElemOf(ro) }
+      fnTagHeldInner(ex, tyElemOf(ro), depth + 1)
     }
     // A record literal whose function field the rep holds as its id is built at the rep's
     // record, so it shares that record's row.
@@ -3993,7 +4007,7 @@ function fnTagHeldInner(v: i32, r: i32, depth: i32) {
       && fnTagHasTaggedField(nodeTyIxOf(ex))
     ) {
       fnTagHeldRecs.push(ex)
-      fnTagHeldRecs.push(ro.aElem)
+      fnTagHeldRecs.push(tyElemOf(ro))
     }
   }
   0
@@ -4011,9 +4025,9 @@ function fnTagRepTyIn(t: i32, depth: i32, deep: boolean): i32 {
   const o = T.tys[t]
   match o {
     TyArray => {
-      if fnTagTyIsTagged(o.aElem) { return mkArrayTy(TY_I32) }
-      const e = fnTagRepTyIn(o.aElem, depth - 1, deep)
-      return if e == o.aElem { t } else { mkArrayTy(e) }
+      if fnTagTyIsTagged(tyElemOf(o)) { return mkArrayTy(TY_I32) }
+      const e = fnTagRepTyIn(tyElemOf(o), depth - 1, deep)
+      return if e == tyElemOf(o) { t } else { mkArrayTy(e) }
     }
     TyObj => {
       const tys: i32[] = []
@@ -4035,8 +4049,8 @@ function fnTagRepTyIn(t: i32, depth: i32, deep: boolean): i32 {
     // A map's value record is minted by no literal of the map's own, so its tagged function
     // fields are their `i32` ids, as inside a list's element list.
     TyMap => {
-      const r = fnTagRepTyIn(o.mVal, depth - 1, true)
-      return if r == o.mVal { t } else { mkMapTy(o.mKey, r, o.mSet) }
+      const r = fnTagRepTyIn(tyValOf(o), depth - 1, true)
+      return if r == tyValOf(o) { t } else { mkMapTy(tyKeyOf(o), r, o.mSet) }
     }
     // No other kind holds a set's ids as a container.
     TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
@@ -4617,7 +4631,7 @@ function fnTagListJoinSetOf(
   const ldn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   const lt = if ldn is LetDecl { nodeTyIxOf(parenPeelIx(ldn.letInit)) } else { -1 }
   const la = if lt >= 0 && lt < T.tys.length { T.tys[lt] } else { null }
-  const ws = if la is TyArray { fnTagSetOfTy(la.aElem) } else { -1 }
+  const ws = if la is TyArray { fnTagSetOfTy(tyElemOf(la)) } else { -1 }
   if ws >= 0 && ws != js && fnTagMembersWithin(js, ws) { return ws }
   if !diff { return -1 }
   js
@@ -4956,7 +4970,7 @@ export function elabRetRecTy(x: i32, t: i32): i32 {
   }
   const tl = T.tys[t]
   const listRec = tl is TyArray
-  const rt = if tl is TyArray { tl.aElem } else { t }
+  const rt = if tl is TyArray { tyElemOf(tl) } else { t }
   const to = if rt >= 0 && rt < T.tys.length { T.tys[rt] } else { null }
   if !(to is TyObj) || !elabRecHoldsFnList(to) { return t }
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
@@ -4978,7 +4992,7 @@ export function elabRetRecTy(x: i32, t: i32): i32 {
     const nm = to.objFieldNames[i]
     const ft = to.objFieldTypes[i]
     const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { null }
-    const lt = if fa is TyArray { fa.aElem } else { -1 }
+    const lt = if fa is TyArray { tyElemOf(fa) } else { -1 }
     const la = if lt >= 0 && lt < T.tys.length { T.tys[lt] } else { null }
     const s = if la is TyFunc { elabFnSetTy[lt] ?? -1 } else { -1 }
     let nt = ft
@@ -5040,7 +5054,7 @@ function elabFnIsNamedPlain(m: i32): boolean {
 function elabRecHoldsFnList(to: TyObj): boolean {
   for ft in to.objFieldTypes {
     const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { null }
-    const lt = if fa is TyArray { fa.aElem } else { -1 }
+    const lt = if fa is TyArray { tyElemOf(fa) } else { -1 }
     if lt >= 0 && lt < T.tys.length && T.tys[lt] is TyFunc { return true }
   }
   false
@@ -5138,7 +5152,7 @@ export function elabRetRecLitGrow(lit: i32, t: i32) {
   const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
   const tt = if t >= 0 && t < T.tys.length { T.tys[t] } else { null }
   if ln is ArrayLit && tt is TyArray {
-    for e in ln.arrElems { elabRetRecLitGrow(e, tt.aElem) }
+    for e in ln.arrElems { elabRetRecLitGrow(e, tyElemOf(tt)) }
     nodeTySetGrow(lx, t)
     return 0
   }

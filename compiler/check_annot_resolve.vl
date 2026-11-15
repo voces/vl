@@ -6,6 +6,7 @@
 import { rowParamBind } from "./check_row_param"
 import { identTyOf } from "./check_nar_store"
 import { strListIndexOf } from "./listutil"
+import { mkUnionTy } from "./check_union_mint"
 import {
   FieldDef,
   ForIn,
@@ -124,6 +125,7 @@ import {
   tErr,
   tErrUnsupported,
   tsToTy,
+  tyTestMayFit,
   tyTestMemberFit,
   tyTestMembers,
   voidStoreCheck,
@@ -153,12 +155,16 @@ import {
   mkMapTy,
   mkNullableTy,
   tyAt,
+  tyElemOf,
   tyEq,
-  tyOpen,
+  tyKeyOf,
+  tyKeyOpen,
   tySame,
   tyToStr,
   tyToStrUser,
   tyToTs,
+  tyValOf,
+  tyValOpen,
   tyVarOwner,
 } from "./check_types"
 import { identDeclOf, sidNoteNodeName } from "./symbols"
@@ -654,7 +660,7 @@ export function luElemTy(ms: i32[]): i32 {
   while i < ms.length {
     const a = tyAt(ms[i])
     if a is TyArray {
-      const v = arrElemValueTy(a.aElem)
+      const v = arrElemValueTy(tyElemOf(a))
       if v < 0 { return -1 }
       if e < 0 { e = v } else { e = joinVariantTys(e, v) }
     }
@@ -674,7 +680,7 @@ export function lmValTy(ms: i32[]): i32 {
   for m in ms {
     const a = tyAt(m)
     if a is TyMap {
-      if e < 0 { e = a.mVal } else { e = joinVariantTys(e, a.mVal) }
+      if e < 0 { e = tyValOf(a) } else { e = joinVariantTys(e, tyValOf(a)) }
     }
   }
   if e == TY_ERR {
@@ -691,7 +697,7 @@ function lmValsTs(ms: i32[]): i32 {
   for m in ms {
     const a = tyAt(m)
     if !(a is TyMap) { return -1 }
-    const k = luTs(mkArrayTy(a.mVal))
+    const k = luTs(mkArrayTy(tyValOf(a)))
     if k < 0 { return -1 }
     kids.push(k)
   }
@@ -712,7 +718,7 @@ export function lmValsTy(ms: i32[]): i32 {
   for m in ms {
     const a = tyAt(m)
     if a is TyMap {
-      const l = mkArrayTy(a.mVal)
+      const l = mkArrayTy(tyValOf(a))
       if e < 0 { e = l } else { e = joinVariantTys(e, l) }
     }
   }
@@ -753,7 +759,7 @@ function lmArm(
   }
   const mt = tyAt(mem)
   if mt is TyMap && (kind == 1 || prop == "get") {
-    const own = mkNullableTy(mt.mVal)
+    const own = mkNullableTy(tyValOf(mt))
     if luTs(own) >= 0 {
       const otmp = "$lo" + i32ToStr(site)
       const od = luDecl("const", otmp, own, rd, site, pos)
@@ -956,7 +962,7 @@ export function recFieldFitBuild(
     if at < 0 { return -1 }
     const fb = ct.objFieldTypes[i]
     if !recFieldCovered(ot.objFieldTypes[at], fb) {
-      if luTs(fb) < 0 || litSetMixesBases(fb) { return -1 }
+      if luTs(fb) < 0 { return -1 }
       names.push(ct.objFieldNames[i])
       tys.push(fb)
     }
@@ -979,17 +985,71 @@ export function recFieldFitBuild(
   luValueNode(site, stmts, pos)
 }
 
-// Whether `t` is a literal set over two bases, `null` among them (`1 | "a"`, `1 | null`),
-// whose test over a scalar union is answered for one base (D16326) or refused (D16327).
+// The minted check for `x is chk` where `chk` is a literal set over two kinds (`1 | "a"`):
+// `{ const $ls = x; $ls is <one kind's members> || ... }`, each part a set of one kind, which
+// the test's lowering answers whole. -1 for any other test.
+export function litSetSplitBuild(
+  isObj: i32,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  pos: i32,
+): i32 {
+  if objTy < 0 || chkTy < 0 || !litSetMixesBases(chkTy) { return -1 }
+  if !tyTestMayFit(objTy, chkTy) { return -1 }
+  // An open operand is bound as it reads, and each part re-asked at its pins.
+  const ann = if tyHasTyVar(objTy) { -1 } else { objTy }
+  if ann >= 0 && luTs(ann) < 0 { return -1 }
+  const kinds: string[] = []
+  const parts: i32[][] = []
+  for m in tyTestMembers(chkTy) {
+    let at = strListIndexOf(kinds, litSetKindOf(m))
+    if at < 0 {
+      kinds.push(litSetKindOf(m))
+      parts.push([])
+      at = kinds.length - 1
+    }
+    parts[at].push(m)
+  }
+  const tys: i32[] = []
+  for ms in parts {
+    const t = if ms.length == 1 { ms[0] } else { mkUnionTy(ms) }
+    if luTs(t) < 0 { return -1 }
+    tys.push(t)
+  }
+  const site = ix
+  const recv = luDecl("const", "$ls" + i32ToStr(ix), ann, isObj, site, pos)
+  let test = -1
+  let k = tys.length - 1
+  while k >= 0 {
+    const t = luTyTest(luRef(recv, site, pos), tys[k], site, pos)
+    test = if test < 0 { t } else { luAt(mkBinary("||", t, test, pos), site) }
+    k = k - 1
+  }
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(test)
+  luValueNode(site, stmts, pos)
+}
+
+// Whether `t` is a literal set over two kinds, `null` among them (`1 | "a"`, `1 | null`); two
+// integer widths are one kind, which the test's lowering answers whole.
 function litSetMixesBases(t: i32): boolean {
-  let base = -1
+  let kind = ""
   for m in tyTestMembers(t) {
-    if m != TY_NULL && !(tyAt(m) is TyLit) { return false }
-    const b = if m == TY_NULL { m } else { litPeekBaseTy(m) }
-    if base >= 0 && !tySame(b, base) { return true }
-    base = b
+    const k = litSetKindOf(m)
+    if k == "" { return false }
+    if kind != "" && k != kind { return true }
+    kind = k
   }
   false
+}
+
+// The kind of literal-set member `m` (its literal kind, or `null`), or "" for no literal.
+function litSetKindOf(m: i32): string {
+  if m == TY_NULL { return "null" }
+  const t = tyAt(m)
+  if t is TyLit { t.litKind } else { "" }
 }
 
 // Whether every value of field type `fa` fits `fb`: each member covered.
@@ -1166,21 +1226,21 @@ export function mapFitBuild(
   if (
     o.mSet == 1
     || c.mSet == 1
-    || tyOpen(o.mKey)
-    || tyOpen(o.mVal)
-    || tyOpen(c.mVal)
+    || tyKeyOpen(o)
+    || tyValOpen(o)
+    || tyValOpen(c)
   ) {
     return -1
   }
   if (
-    !tyEq(o.mKey, c.mKey)
-    || tyEq(o.mVal, c.mVal)
-    || !assignable(c.mVal, o.mVal)
+    !tyEq(tyKeyOf(o), tyKeyOf(c))
+    || tyEq(tyValOf(o), tyValOf(c))
+    || !assignable(tyValOf(c), tyValOf(o))
   ) {
     return -1
   }
-  const vroot = tyToTs(c.mVal)
-  if vroot < 0 || luTs(c.mVal) < 0 || luTs(objTy) < 0 { return -1 }
+  const vroot = tyToTs(tyValOf(c))
+  if vroot < 0 || luTs(tyValOf(c)) < 0 || luTs(objTy) < 0 { return -1 }
   const site = ix
   const recv = luDecl("const", "$mf" + i32ToStr(ix), objTy, isObj, site, pos)
   const ok = luDecl(
@@ -1202,7 +1262,7 @@ export function mapFitBuild(
     site,
   )
   setAnnTs(isV, vroot)
-  luIsTyPut(isV, c.mVal)
+  luIsTyPut(isV, tyValOf(c))
   const test = luAt(mkUnary("!", isV, pos), site)
   const clear = luAt(
     mkBinary("=", luRef(ok, site, pos), mkBool(0, pos), pos),

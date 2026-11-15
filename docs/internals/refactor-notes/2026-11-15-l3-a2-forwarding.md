@@ -7,8 +7,9 @@ width phase could make `show`'s parameter a row slot, because the pin knew neith
 the parameter it fills.
 - The pin now records the parameter as (declaration, position): `rcwPinDecl` and `rcwPinPi`
   in `check_covar_pins.vl`.
-- `callFtyArgAssign` sets them while it checks the argument (`rcwArgDecl` / `rcwArgPi`),
-  and a pin that moves out to a caller's pin keeps them (`rcwPinNoteAt`).
+- `callFtyArgAssign` marks the pin table before it checks the argument and fills the pair onto
+  the rows that check appended (`rcwPinsFill`); a pin that moves out to a caller's pin keeps it
+  (`rcwPinNoteAt`). No module-level state carries it.
 - At the re-ask, a wider row into a declared record parameter is noted as a width candidate
   (`rcwPinWidthNote`), as at a direct call, instead of refused.
 
@@ -32,4 +33,4 @@ from its loud check reject to runs in both declaration orders; its pinning fixtu
 fixture (`width-record-through-generic-chain-runs.vl`). Seed +785 bytes; L2 self-compile guest fuel
 86,305,913,308 → 86,361,111,398 (+0.06%).
 
-**Size.** Net +53 compiler lines; pin-helper delta 0.
+**Size.** Net +58 compiler lines; pin-helper delta 0.
