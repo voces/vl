@@ -20,7 +20,8 @@ base, with the native host built from the branch.
   - The lowering writes into its own buffer, and the current target is restored.
   - `dfeCallee` is cut back to its length on entry.
   - Every frame a builder opens is closed, so only the function's own `end` moves `ctrlDepth`. That one level is given back.
-  - The lowering banks its span rows in its own table, and the reloc table is untouched (rows exist only under `RELOC_ARMED`).
+  - The lowering banks its span rows in its own table, and the reloc table is untouched.
+  - Reloc rows are not compared: `RELOC_ARMED` is a compile-time `false`, so no build writes any. If it is ever flipped, the dual emit must compare them too.
   - The mechanism is proved by the armed self-build, which is byte-identical to the seed.
 - **The dual emit** compares the whole code entry (size prefix, locals vector and body) byte for byte,
   then legacy's kind-5 statement rows against the lowering's. A difference is classed by its
@@ -75,6 +76,21 @@ base, with the native host built from the branch.
 - **`SDrop`** goes with every use once bytes may move.
 - **`irBodyLeaves` is conservative.** A tail `SSwitch` whose arms all exit, or an `SBlock` whose body leaves, counts as
   not leaving. Widen it when I4 builds switches.
+
+## Before I1b claims
+
+Each fact the lowering reproduces must become one decision that legacy and the IR both read. Two copies can drift, and a claimed function is no longer compared. The pairs:
+
+| legacy | the lowering's copy |
+|---|---|
+| `emitUserGlobalGet` / `emitUserGlobalSet`'s chain | `userGlobalPlain`; to become one `userGlobalAccess(gi, write)` value that both match with no `_` |
+| `emitVoidTailCall`'s test | `voidTailCallee` |
+| `emitFallThroughPad` / `bodyEndsInReturn` | `endsInReturn` |
+| the unary-minus ladder (`0 - x`, literal fold) | `primOp`'s `neg` arm |
+| `emitUnionRetSink` / `emitTailCallRet` (`return_call` for a direct call) | `ret` |
+| `emitWhileLoop`'s `condLitTrue` and `emitIfLinkStmt`'s inline `if true` | `ifNode`'s `isTrue` |
+
+Also before claiming: zero mismatches over the whole distilled `cells/` and `named/`, through `regress.vl`'s harness. `localsVec`'s search is quadratic in locals; sort it before large functions arrive.
 
 ## Net lines
 
