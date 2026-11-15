@@ -35,6 +35,9 @@ itself declares are now the fields of one `crRows: CrRows` record, and the reset
   branch.
 - **Identity:** `probe-rollback-census.ts --fingerprint` over `tests/cases`, `distilled/cells` and
   `distilled/named` gives **20,283 programs, 0 different**.
+- **L2:** the base tree's `compiler/entry.vl` built with A and with D is byte-identical (guest fuel
+  88,186,956,977 and 88,241,305,206).
+- **regress.vl:** no cell changed class; no runs lost. `lint-self.sh` is clean.
 - **Lint and tests:** `vl check` warnings are unchanged at 301, the emitter-state audit test passes,
   and the probe-rollback test passes.
 
