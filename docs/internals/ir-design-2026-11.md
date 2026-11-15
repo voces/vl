@@ -40,7 +40,7 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
   `lower(op × rep)` in place of its own ladder, and that site is byte-identical. At the
   **function seam**, `emitFuncCode` hands a function to the IR path only when a dual emit of that
   function has produced identical bytes. Legacy code deletes per construct, when its last claimant
-  goes.
+  goes. After I1b, cutover proceeds family by family at both seams (§10).
 - **Refusals (§6).** Two refusal literals are live (`live-sites.json`), and 4 of 247 capability
   probes still refuse. The IR closes both live literals and all four probes. The fourth is D16396,
   a checker refusal of a program the field-pair rule makes legal (§6.1). Of the 850 sites, 443 are by message a table miss or a kind
@@ -693,6 +693,45 @@ These were sent to each lane before this PR. **One item is pending: `IrCallee` (
   - What the builder still has to absorb from mono's globals: the key-staging tables
     (`monoKeyExtra*`, `monoExplicitBN`/`BT`, which wait on S's pin-walk deletion) and
     `monoBakeSpecK`.
+
+## 10. Addendum: incremental cutover after I1b
+
+After I1b, cutover goes by construct family, one slice at a time. It does not wait for the
+whole-function claim at I8. A slice switches one family, such as scalar arithmetic or list
+element reads, to the IR's bytes, and deletes that family's legacy path in the same PR.
+
+**A family is cut over at both seams at once.** Unclaimed functions keep calling the legacy
+emitter, so a family's legacy code can only be deleted once every legacy caller reaches the IR's
+lowering through the op seam (§5.2) instead of its own ladder. A slice therefore:
+- routes every legacy site of the family to the shared `lower*` arm;
+- deletes the ladder those sites used;
+- lets claimed functions take the same arm through the function seam.
+
+**"Fully matched" is counted per occurrence, not per function.**
+- Before a slice, the shadow's dual emit counts every node of the family, in every function,
+  covered or not: on the self-compile and the full distilled `cells/` and `named/`.
+- The count must show zero byte or span mismatches and zero context mismatches.
+- A per-function match count is not enough, because the deletion reaches functions the builder
+  does not yet cover.
+- Every legacy decision the family reproduces must be one shared pure function, with any context
+  passed explicitly (§5.2, and the I1b claim rule).
+
+**Bars for each slice:**
+- output byte-identical for the corpus identity diff and the self-build;
+- the seed reaches a fixpoint;
+- L2 self-compile fuel within +1% (`self-compile-time.sh`);
+- net-negative compiler lines;
+- pin helpers in `emit_mono.vl` at 908 or fewer;
+- the shadow's dual emit stays armed in the gate, as the check for the families not yet cut
+  over.
+
+**Order.** Take families in order of legacy lines deleted per IR line added, with the measured
+occurrence counts quoted. Families still behind an unshared decision wait for that decision to
+become shared, and they do not count as "fully matched" before then.
+
+**What it does not change.** Phase B (I9) still waits for every function to be on the IR.
+Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
+own named PRs.
 
 ## A. Commands
 
