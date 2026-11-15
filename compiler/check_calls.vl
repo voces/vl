@@ -498,6 +498,8 @@ import {
   objFieldType,
   tyArrayElemIx,
   tyAt,
+  tyElemOf,
+  tyElemOpen,
   tyEqSameHoles,
   tyHasHole,
   tyHasInferHole,
@@ -505,13 +507,14 @@ import {
   tyIsHole,
   tyIsParamHole,
   tyIxIsView,
+  tyKeyOf,
   tyMentionsTyVarNamed,
-  tyOpen,
   tyPrintsAsRef,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
   tySame,
   tyToStr,
+  tyValOf,
   tyWideUnionMinted,
 } from "./check_types"
 import {
@@ -1080,7 +1083,7 @@ function checkFromCodePointsCall(n: Call, ix: i32): i32 {
       const p0t = tyAt(p0)
       if p0t is TyArray {
         // An empty `[]` literal's element hole (-1) pins to i32 here.
-        if tyOpen(p0t.aElem) || assignable(p0t.aElem, TY_I32) { pOk = true }
+        if tyElemOpen(p0t) || assignable(tyElemOf(p0t), TY_I32) { pOk = true }
       }
       if p0t is TyErr { pOk = true }
     }
@@ -1504,11 +1507,15 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   }
   // After the arguments, so a mismatched argument gets the more specific diagnostic first;
   // the answer itself is the callee's declaration, not this site's bindings.
+  let rtpRefused = false
   if cfn is Ident {
     let rtpDecl = fnDeclIx[cfn.identName] ?? CSTR_NODECL
     if rtpDecl == CSTR_NODECL { rtpDecl = identFnAliasOf(n.callFn) }
-    if !explicitTa {
-      checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
+    if (
+      !explicitTa
+      && checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
+    ) {
+      rtpRefused = true
     }
   }
   // Substitutes the binding into a generic return type — deep, so a structural return
@@ -1639,6 +1646,8 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       noteEscJoin(retTy, ix, ejWho)
     }
   }
+  // A refused call's result is an error, so nothing downstream judges the unbound parameter.
+  if rtpRefused { return TY_ERR }
   return cRetTy
 }
 
@@ -3289,15 +3298,15 @@ function holeSlotTyWith(t: i32, path: string[], i: i32, rt: i32): i32 {
   }
   if path[i] == "[]" {
     if ty is TyArray {
-      const e = holeSlotTyWith(ty.aElem, path, i + 1, rt)
+      const e = holeSlotTyWith(tyElemOf(ty), path, i + 1, rt)
       if e < 0 { return -1 }
       if ty.aRead == 1 { return mkArrayViewTy(e) }
       return mkArrayTy(e)
     }
     if ty is TyMap {
-      const mv = holeSlotTyWith(ty.mVal, path, i + 1, rt)
+      const mv = holeSlotTyWith(tyValOf(ty), path, i + 1, rt)
       if mv < 0 { return -1 }
-      return mkMapTy(ty.mKey, mv, ty.mSet)
+      return mkMapTy(tyKeyOf(ty), mv, ty.mSet)
     }
     return -1
   }
@@ -3491,7 +3500,7 @@ function holeFieldRecOf(a: i32): i32 {
   let t = nonNullTy(nodeTyOf(a))
   if t < 0 || t >= T.tys.length { return -1 }
   const tl = tyAt(t)
-  if tl is TyArray { t = nonNullTy(tl.aElem) }
+  if tl is TyArray { t = nonNullTy(tyElemOf(tl)) }
   if t < 0 || t >= T.tys.length { return -1 }
   const ro = tyAt(t)
   if !(ro is TyObj) { return -1 }
@@ -3674,7 +3683,7 @@ function holeFieldCloNote(a: i32, callee: i32, hole: string) {
   let t = nonNullTy(nodeTyOf(a))
   if t < 0 || t >= T.tys.length { return 0 }
   const tl = tyAt(t)
-  if tl is TyArray { t = nonNullTy(tl.aElem) }
+  if tl is TyArray { t = nonNullTy(tyElemOf(tl)) }
   if t < 0 || t >= T.tys.length { return 0 }
   const ro = tyAt(t)
   if !(ro is TyObj) { return 0 }
@@ -4423,11 +4432,11 @@ function noteSlotArgsAnn(args: i32[], ct: i32) {
       const a = T.tys[pt]
       if (
         a is TyArray
-        && !tyOpen(a.aElem)
-        && a.aElem < T.tys.length
-        && T.tys[a.aElem] is TyFunc
+        && !tyElemOpen(a)
+        && tyElemOf(a) < T.tys.length
+        && T.tys[tyElemOf(a)] is TyFunc
       ) {
-        noteHandedOpenIn(args[i], a.aElem, 0)
+        noteHandedOpenIn(args[i], tyElemOf(a), 0)
       }
     }
     i = i + 1
