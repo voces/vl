@@ -172,7 +172,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
       ["argument 1: expected f32, got f64", conflict("u", 4, "f64", 5, "f32")],
     ],
     // A literal `const` is its literal at the read, so the mismatch is the literal's own.
-    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it"]],
+    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it — round it first: `floor(…) as! i32`, `round(…) as! i32` or `trunc(…) as! i32`"]],
   ];
   for (const [src, want] of scalars) {
     const got = await msgs(src);
@@ -225,8 +225,8 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
       throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
     }
   }
-  // No note: an annotated declaration, an integer `let` a float is stored into, a float `let` an
-  // integer is stored into (each keeps its kind, D3246), and a store to a `const`.
+  // No note: an annotated declaration, an integer `let` an `i64` and a float are stored into, a
+  // float `let` an integer is stored into (each keeps its kind, D3246), and a store to a `const`.
   const g = "function big(): i64 { 5 }\nfunction fl(): f32 { 1.5 }\n";
   const misses: [string, string[]][] = [
     [g + "let a: i32 = 0\na = big()\nprint(a)\n", ["cannot assign i64 to i32"]],
@@ -286,9 +286,10 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
   if (JSON.stringify(v) !== JSON.stringify(wantV)) {
     throw new Error(`want the bare mismatch, got ${JSON.stringify(v)}`);
   }
-  // D2981: a float literal stored into an integer `let` is refused; the `let` keeps its kind.
+  // D2981: a float literal stored into an integer `let` delivered to an `i32` is refused; the
+  // destination vetoes the float the store would join it to (D16293), so the `let` keeps its kind.
   const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
-  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it"];
+  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it — round it first: `floor(…) as! i32`, `round(…) as! i32` or `trunc(…) as! i32`"];
   if (JSON.stringify(store) !== JSON.stringify(wantStore)) {
     throw new Error(`want ${JSON.stringify(wantStore)}, got ${JSON.stringify(store)}`);
   }
