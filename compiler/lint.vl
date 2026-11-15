@@ -238,6 +238,7 @@ export function lint(progRoot: i32) {
     kindLadderLint()
     sentinelIndexLint()
     literalByteWriteLint()
+    arenaWriteLint()
     lintSetImportedMaps(Map())
     lintSetImportedFns(Map())
     lintSetImportedReaders(Map(), -1)
@@ -7549,6 +7550,123 @@ function sentinelIndexLint() {
   while f < klFnName.length {
     siGradeFn(s, f)
     f = f + 1
+  }
+  0
+}
+
+// ── arena-write-after-lower ──────────────────────────────────────────────────
+
+// A write into a node that already exists: an `arenaSetNode` or `arenaReplaceNode` call, or a store
+// into a node field. Once the resolve-time lowering has run, only appends should grow the arena, so
+// the parsed tree stays the parser's (medium 6, step 6.3). Ratcheted per file by
+// `vl check --budget scripts/arena-write-budget-baseline.json`, whose count may only fall.
+
+// The fields of `ast.vl`'s `Node` variants, minus the names another record type also declares.
+// `tests/vl_arena_write_fields_test.ts` re-derives the list from `ast.vl`.
+const awFields = [
+  "arrElems", "asMode", "asObj", "asTy", "binCompound", "binIdent", "binLeft",
+  "binOp", "binRegion", "binRight", "binTpl", "blkStmts", "boolVal",
+  "brkHasVal", "brkKw", "brkLabel", "callArgNames", "callArgs", "callFn",
+  "charText", "contKw", "contLabel", "errAt", "errWhat", "fdName", "fdType",
+  "fiBody", "fiDecl1", "fiDecl2", "fiIter", "fiLabel", "fiName", "fiValue",
+  "fiVar", "fiVar2", "fnBody", "fnName", "fnParams", "fnTyParams", "frBody",
+  "frExcl", "frFrom", "frLabel", "frStep", "frTo", "frVar", "identName",
+  "idxArr", "idxIndex", "ifCond", "ifElse", "ifThen", "impLocals",
+  "impNameToks", "impNames", "impPath", "isFit", "isNeg", "isObj", "isVariant",
+  "letInit", "letKw", "letName", "letType", "lvLoop", "lvSlot", "matchArmCount",
+  "matchArmStart", "matchBinds", "matchBodies", "matchPats", "matchScrut",
+  "memObj", "memProp", "nullKw", "numText", "objFields", "omDot", "omObj",
+  "omProp", "parDefault", "parInner", "parName", "parOpt", "parRest", "parType",
+  "progStmts", "retArg", "spdArg", "strText", "tdFields", "tdFlat", "tdName",
+  "tdNew", "tyName", "udName", "udNew", "udVariants", "unArg", "unOp",
+  "whileBlk", "whileBody", "whileCond", "whileLabel", "whileLv",
+]
+
+// The resolve-time lowering's own rewrites, which run before any table is keyed on a node.
+const awLowering = [
+  "annotateLambdaFrom", "hmsBindMatch", "hmsBindMatchInPlace",
+  "hmsBindOptCallInPlace", "hmsBindOptInPlace", "hmsBindOptRecv", "hmsCopyRead",
+  "hmsInsertBefore", "hmsPointArms", "hmsRedirectRoot", "hmsWrapArm", "ivHoist",
+  "ivSpelledRef", "ivWrap", "parenNamesCollapse", "tpbDropLetAnn",
+  "tpbDropParamAnn", "tpbSplitOne",
+]
+
+// The end of a node write starting at `i`, or -1: a slot-writer call, or `.f = `, `.f[…] = ` or
+// `.f.push(` (also `pop`, `splice`, `unshift`) for a node field `f`.
+function awWriteEnd(s: string, i: i32, b: i32) {
+  if !txWordAt(s, i - 1, b) {
+    if txAt(s, i, b, "arenaSetNode(") { return i + 13 }
+    if txAt(s, i, b, "arenaReplaceNode(") { return i + 17 }
+  }
+  if s[i] != '.' { return -1 }
+  const f = txIdentAt(s, i + 1, b)
+  if f.length == 0 || !strListHas(awFields, f) { return -1 }
+  let p = i + 1 + f.length
+  if txCharOr(s, p, b) == '[' {
+    while p < b && s[p] != ']' { p = p + 1 }
+    p = p + 1
+  }
+  if txAt(s, p, b, ".push(") || txAt(s, p, b, ".pop(") { return p }
+  if txAt(s, p, b, ".splice(") || txAt(s, p, b, ".unshift(") { return p }
+  const q = txSpacesEnd(s, p, b)
+  if txCharOr(s, q, b) == '=' && txCharOr(s, q + 1, b) != '=' { return p }
+  -1
+}
+
+function arenaWriteLint() {
+  if !scaIsCompiler(scaRunPath) { return 0 }
+  if scaRunPath == "compiler/ast.vl" || scaRunPath == "compiler/parser.vl" {
+    return 0
+  }
+  const s = txSource
+  klEnsureIndex(s)
+  let fnName = ""
+  let ln = 0
+  while ln < klLnStart.length {
+    const k = klIndentEnd(s, klLnStart[ln], klLnEnd[ln])
+    const fn = txFnNameOf(s, k, klLnEnd[ln])
+    if fn.length > 0 { fnName = fn }
+    if !strListHas(awLowering, fnName) { awScanLine(s, ln) }
+    ln = ln + 1
+  }
+  0
+}
+
+// One line of `arenaWriteLint`; a string, a char literal and a `//` tail are skipped.
+function awScanLine(s: string, ln: i32) {
+  const a = klLnStart[ln]
+  const b = klLnEnd[ln]
+  let i = a
+  let inStr = false
+  while i < b {
+    const c = s[i]
+    if inStr {
+      if c == '\\' { i = i + 1 }
+      else if c == '"' { inStr = false }
+      i = i + 1
+    } else if c == '"' {
+      inStr = true
+      i = i + 1
+    } else if c == '\'' {
+      if txCharOr(s, i + 1, b) == '\\' { i = i + 4 } else { i = i + 3 }
+    } else if c == '/' && txCharOr(s, i + 1, b) == '/' {
+      i = b
+    } else {
+      const e = awWriteEnd(s, i, b)
+      if e > 0 {
+        lintEmitAtSpan(
+          "arena-write-after-lower",
+          "this writes into an existing node; after the resolve-time lowering only appends grow the arena",
+          "warning",
+          ln + 1,
+          i - a,
+          e - a,
+        )
+        i = e
+      } else {
+        i = i + 1
+      }
+    }
   }
   0
 }
