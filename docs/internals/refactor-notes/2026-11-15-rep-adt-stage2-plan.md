@@ -85,3 +85,83 @@ What the top two ask:
 `emit_union_atoms.vl` (`forceCloListOfTy`), `emit_classify.vl` (`readMayBeString`),
 `emit_shape_rows.vl` (`mvValKindOfTy`), `wasmEmit.vl` (`tyRepsAsNulAtom`). Each batch is
 byte-identical over the corpus, or names its movers, and re-runs this tally.
+
+## 2a, batch 1: three sites stop asking a template's open type
+
+These are the first conversions. Each one makes a site decline a template's open type itself,
+instead of asking the tree and taking the uncovered answer.
+
+| site | change | equivalence |
+|---|---|---|
+| `annRepKindOf` (`emit_shape_rows.vl`), and so `vtKindOfType`'s 27 callers | an annotation that is a bare type parameter answers `null` without a tree query | by construction: a bare `TyVar`'s tree is the `leaf:unnarrowable` leaf, which answered `null` |
+| `repSigKindOfTy` (`emit_rep.vl`), and so `sigKeyOfTy` | a bare type parameter crosses no signature, so it answers `null` | by construction, as above |
+| `buildFnMapRowOfRetAnn` (`emit_collect.vl`) | a declared generic's result annotation that is still open banks the default `i32` row without a tree query, since the instance's row replaces it | **not** by construction: a covered open type such as `() => T` could have answered otherwise. Graded on the corpus. |
+
+**Measured.** Both seeds are fixpoints of master `7de76595`, one with this batch and one without.
+
+| | before | after |
+|---|---|---|
+| open-type `repOfTy` queries during emit (corpus) | 10,831 in 3,015 programs | **4,259** in 1,113 programs (−61%) |
+| — `leaf:unnarrowable` | 10,173 | 3,697 |
+| — `union:open` | 143 | 58 |
+| corpus exit codes / module bytes changed (12,037 cells) | — | **0 / 0** |
+| self-build | — | fixpoint |
+| L2 self-compile fuel | 87,265,518,896 | 87,324,478,167 (+0.068%) |
+| plumb-shape fuel, main / tail | 9,099,863,950 / 6,592,754,323 | 9,106,737,320 / 6,597,369,261 (+0.076% / +0.070%) |
+
+**About the fuel.** The first version cost +0.14% (L2). The annotation check repeated the
+node-type lookup `repOfNode` makes. The self-build asks the tree only 2 open queries, so there the
+check is pure overhead. Reusing the one lookup, and walking for open types only in a declared
+generic, halved it. On the self-build the batch is a small cost; on the corpus it is the removal
+of 6,572 queries the rule forbids.
+
+`self-compile time` (+1% per-PR tier) currently fails on master's own drift: a master fixpoint
+reads +0.98% over its baseline before this batch. Lane P owns the re-baseline, per the coordinator.
+
+**Next sites**, from the re-run trap tally:
+- `buildFnMapRowOfRetAnn`'s remaining nested opens, now reached only through non-generic paths;
+- `forceCloListOfTy` (236 programs);
+- `readMayBeString` (187);
+- `tyRepsAsNulAtom` (73);
+- `mvValKindOfTy` (51);
+- `markInferredJoinAtoms` (17).
+
+## 2a, batch 2: four more sites
+
+Each site answers a template's own bare type parameter as the uncovered tree answered it,
+without asking. All four are equivalent by construction.
+
+| site | file | answer for a bare `TyVar` |
+|---|---|---|
+| `forceCloListOfTy` | `emit_union_atoms.vl` | forces nothing; `forceCloFnPositions` was a no-op on a non-function |
+| `readMayBeString` | `emit_classify.vl` | `false`; the node's type is read once and reused for the literal-union test |
+| `tyRepsAsNulAtom` | `wasmEmit.vl` | `false` |
+| `mvValKindOfTy` | `emit_shape_rows.vl` | `MVK_MONO`, after its three earlier tests, which is what the uncovered descriptor's kind `i32` gave |
+
+**Measured.** Both seeds are fixpoints of master `d9b67813`, which already has batch 1, one with
+batch 2 and one without.
+
+| | master (batch 1) | + batch 2 |
+|---|---|---|
+| corpus exit codes / module bytes changed (12,037 cells) | — | **0 / 0** |
+| L2 self-compile fuel | 87,654,998,241 | 87,642,562,754 (−0.014%) |
+
+Open-type queries, both batches together (corpus):
+
+| reason | stage-2 start | after batches 1 and 2 |
+|---|---|---|
+| `leaf:unnarrowable` | 10,173 | **258** |
+| `union:open` | 143 | 54 |
+| `noFlatKind` (`never`) | 469 | 559 |
+| `nul:unclassified` | 16 | 5 |
+| `list:hole` / `map:val-hole` | 16 / 14 | 16 / 0 |
+| **total** | **10,831 in 3,015 programs** | **892 in 217 programs** |
+
+The `noFlatKind` count rose from 469 in 14 programs to 559 in 49. These are `never` results:
+cells added to the corpus since stage 0 that reach `std:test`. They are 2b's, not a regression of
+2a.
+
+Net compiler lines: +7. Pin-helper delta: 0.
+
+**What 2a has left.** 258 bare open queries in 157 programs, a fraction of the start. 2b handles
+`never` (559), `nul:unclassified` (5) and the one list hole, after which 2c's deletions can begin.
