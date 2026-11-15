@@ -413,7 +413,6 @@ import {
   objFieldVal,
   objLitDropsField,
   objLitNeedsOrderStash,
-  placeNarrowKeyOf,
   quoteLex,
   retF32Flag,
   retF64Flag,
@@ -6462,9 +6461,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   const chkLeaf = listLeafTyOf(chk)
   const tags: i32[] = []
   const fits: i32[] = []
-  const wraps: i32[] = []
   const slotsAt: i32[][] = []
-  let own = false
   let other = false
   for a in arms {
     if tyArrayElemIx(a) >= 0 {
@@ -6473,22 +6470,18 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
       let k = if tySame(a, chk) { LIST_ARM_OWN } else { listArmFitAcrossReps(a, chk) }
       const slots: i32[] = []
       if k == 0 {
-        if t != chkTag {
-          // An arm whose element type is fixed apart from the test's never fits, empty or not.
-          if tyFitKind(a, chk) == 0 { continue }
-          k = LIST_ARM_EMPTY
-        } else {
-          k = listArmSharedTagFit(a, chk, slots)
-          if k == 0 { return 0 }
-        }
+        // An arm with another tag holds a list whose element type is fixed apart from the
+        // test's: it never fits, empty or not (the D16047 refinement).
+        if t != chkTag { continue }
+        k = listArmSharedTagFit(a, chk, slots)
+        if k == 0 { return 0 }
       }
-      if tySame(a, chk) { own = true } else { other = true }
+      if !tySame(a, chk) { other = true }
       let j = tags.length - 1
       while j >= 0 && tags[j] != t { j = j - 1 }
       if j < 0 {
         tags.push(t)
         fits.push(k)
-        wraps.push(listArmWrapOfTy(a))
         slotsAt.push(slots)
       } else if fits[j] != k {
         // Only `L` itself and an arm whose elements may fit `L` share a tag, and the element
@@ -6509,15 +6502,6 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     }
   }
   if !other { return 0 }
-  let empties = false
-  let i = 0
-  while i < fits.length {
-    if fits[i] == LIST_ARM_EMPTY {
-      if !own || chkTag < 0 || wraps[i] < 0 { return 0 }
-      empties = true
-    }
-    i = i + 1
-  }
   const slot = sharedFieldRecvSlot()
   if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
   fbLocalSet(slot)
@@ -6532,7 +6516,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   const lexes = tyLitMemberTexts(chkLeaf)
   fbI32Const(0)
-  i = 0
+  let i = 0
   while i < tags.length {
     fbLocalGet(slot)
     fbRefAsNonNull()
@@ -6545,11 +6529,7 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
       fbLocalGet(slot)
       fbRefAsNonNull()
       fbStructGet(uBoxIdx, 1)
-      if k == LIST_ARM_EMPTY {
-        fbRefCast(wraps[i])
-        fbStructGet(wraps[i], 1) // len
-        fbI32Eqz()
-      } else if k == LIST_ARM_NULLS {
+      if k == LIST_ARM_NULLS {
         if emitUnionPayloadUnbox(body, 7) < 0 { return -1 }
         const nulls = ["2"]
         if (
@@ -6606,19 +6586,15 @@ function emitListIsAcrossReps(body: u8[], isIx: i32, fnIx: i32): i32 {
     i = i + 1
   }
   if nullable { fbEnd() }
-  if empties {
-    return emitListIsRebox(body, nd.isObj, slot, chk, chkTag, tags, fits, fnIx)
-  }
   1
 }
 
 // How `emitListIsAcrossReps` tests one tag: by the tag alone (`L`, or an arm every element of
-// which fits), a `string[]` arm's strings, an empty disjoint-rep arm, an atom arm's atoms, a
+// which fits), a `string[]` arm's strings, an atom arm's atoms, a
 // `(boolean | null)[]` arm tested as `null[]` (every element the null sentinel 2), or a
 // `(string | null)[]` arm tested as `string[]` (no element null).
 const LIST_ARM_OWN = 1
 const LIST_ARM_STRS = 2
-const LIST_ARM_EMPTY = 3
 const LIST_ARM_ATOMS = 4
 const LIST_ARM_NULLS = 5
 const LIST_ARM_NONNULL = 6
@@ -6681,130 +6657,6 @@ function atomArmSlots(a: i32, depth: i32, slots: i32[]): boolean {
     k = k + 1
   }
   true
-}
-
-// The wrapper heap type list arm `a` rides a box's payload in, or -1.
-function listArmWrapOfTy(a: i32): i32 {
-  const lw = listWrapHeapOfKind(boxTagOfTy(a))
-  if lw >= 0 { return lw }
-  if !unMemIsRefElemArray(a) { return -1 }
-  const sl = unMemRefArrArmSlot(a)
-  if sl < 0 || sl >= rlWrapIdx.length { return -1 }
-  rlWrapIdx[sl]
-}
-
-// With an `is L` answer on the stack, re-boxes receiver `recv` (staged in `slot`) as an empty
-// `L` when it fitted as an empty list of another arm, and stores the box back into `recv`, so
-// the narrowed branch reads and writes an `L` (D4949). The place takes a new list rather than
-// the old one changing rep: a reference typed as the other arm must never hold an `L` element.
-function emitListIsRebox(
-  body: u8[],
-  recv: i32,
-  slot: i32,
-  chk: i32,
-  chkTag: i32,
-  tags: i32[],
-  fits: i32[],
-  fnIx: i32,
-): i32 {
-  const chkWrap = listArmWrapOfTy(chk)
-  const chkBack = if chkWrap < 0 { -1 } else { listBackOfWrap(chkWrap) }
-  const st = listIsStoreBackOf(recv, fnIx)
-  // A place with no store-back reads an empty `L` stand-in, and a push into it traps (D4939).
-  if chkBack < 0 || st.kind == LIS_NONE { return 1 }
-  const res = listFitSlot("list", 0, 4)
-  fbLocalTee(res)
-  fbIf(64)
-  fbI32Const(0)
-  let i = 0
-  while i < tags.length {
-    if fits[i] == LIST_ARM_EMPTY {
-      fbLocalGet(slot)
-      fbRefAsNonNull()
-      fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, tags[i])
-      fbI32Bin(70) // 0x46 i32.eq
-      fbI32Bin(114) // 0x72 i32.or
-    }
-    i = i + 1
-  }
-  fbIf(64)
-  if st.obj >= 0 && emitExpr(body, st.obj, fnIx) < 0 { return -1 }
-  if st.kind == LIS_ELEM {
-    fbStructGet(rlWrapIdx[st.at], 0) // the backing; the read just made proved the index
-    if emitExpr(body, st.idx, fnIx) < 0 { return -1 }
-  }
-  fbI32Rel(RS_TAG, chkTag)
-  fbBacking(chkBack, 0)
-  fbI32Const(0)
-  fbI32Const(0)
-  fbStructNew(chkWrap)
-  fbStructNew(uBoxIdx)
-  if st.kind == LIS_LOCAL {
-    fbLocalSet(st.at)
-  } else if st.kind == LIS_GLOBAL {
-    if emitUserGlobalSet(st.at) < 0 { return -1 }
-  } else if st.kind == LIS_FIELD {
-    fbStructSet(sHeapIdx[st.at], st.field)
-  } else {
-    fbArraySet(rlBackIdx[st.at])
-  }
-  fbEnd()
-  fbEnd()
-  fbLocalGet(res)
-  1
-}
-
-// Where `emitListIsRebox` stores its box: nowhere, a local, a mutable global, a field of a
-// record row, or an element of a list of boxes.
-const LIS_NONE = 0
-const LIS_LOCAL = 1
-const LIS_GLOBAL = 2
-const LIS_FIELD = 3
-const LIS_ELEM = 4
-type ListIsStore = { kind: i32, at: i32, field: i32, obj: i32, idx: i32 }
-
-function listIsStore(
-  kind: i32,
-  at: i32,
-  field: i32,
-  obj: i32,
-  idx: i32,
-): ListIsStore {
-  { kind: kind, at: at, field: field, obj: obj, idx: idx }
-}
-
-// The store-back `emitListIsRebox` can make into `recv`: `at` is the local, global, struct row
-// or ref-list slot, `field` the struct field, `obj` and `idx` the container and index to
-// re-evaluate. A capture `captureBoxRewrite` turned into a cell arrives as that cell's element.
-function listIsStoreBackOf(recv: i32, fnIx: i32): ListIsStore {
-  const rn = nodeAt(unwrapParen(recv))
-  if rn is Ident {
-    const li = localIndexOf(fnIx, unwrapParen(recv))
-    if li >= 0 && identSlotIsUnionBox(fnIx, unwrapParen(recv)) {
-      return listIsStore(LIS_LOCAL, li, -1, -1, -1)
-    }
-    const g = if li >= 0 || capturedIsUnionBox(fnIx, rn.identName) { -1 } else { globalIndexOf(rn.identName) }
-    if g >= 0 && !globalCellIsImmutable(g) {
-      return listIsStore(LIS_GLOBAL, g, -1, -1, -1)
-    }
-  } else if placeNarrowKeyOf(recv) != "" {
-    // Only a place the narrowing names is re-read, so re-evaluating its path has no effect.
-    if rn is Member {
-      const si = structIndexOfExpr(rn.memObj, fnIx)
-      const fi = if si < 0 || si >= sHeapIdx.length { -1 } else { sFieldIndex(si, rn.memProp) }
-      if fi >= 0 && sFieldIsUnionBox(si, fi) {
-        return listIsStore(LIS_FIELD, si, fi, rn.memObj, -1)
-      }
-    } else if rn is Index {
-      const rs = if exprMap(rn.idxArr, fnIx) || !exprRefArray(rn.idxArr, fnIx) { -1 } else { refListSlotOfExpr(rn.idxArr, fnIx) }
-      if rs >= 0 && rs < rlWrapIdx.length && rlElemKindAt(rs) == RLK_UNION {
-        return listIsStore(LIS_ELEM, rs, -1, rn.idxArr, rn.idxIndex)
-      }
-    }
-  }
-  // Any other operand, or a place whose storage is not a union box, keeps no store.
-  listIsStore(LIS_NONE, -1, -1, -1, -1)
 }
 
 // The scalar and literal rungs of `emitIsTest`, in order: a scalar map read, a nullable niche,
