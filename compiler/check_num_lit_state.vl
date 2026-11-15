@@ -48,6 +48,19 @@ import {
 } from "./check_intrinsics"
 import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
+  HD_ELEM,
+  HD_ELEMV,
+  HD_FLD,
+  HD_ITER1,
+  HD_ITER2,
+  HD_OFLD,
+  HD_RET,
+  hdBase,
+  hdField,
+  hdKind,
+  hdRowOf,
+} from "./check_hole_pins"
+import {
   LBI_CONST_DEPTH,
   LBI_EDGE,
   LBI_EDGE_FWD,
@@ -57,6 +70,7 @@ import {
   LBI_FIT_I64,
   LBI_FIT_SAME,
   LBI_FLOAT,
+  LBI_HOLE,
   LBI_INT,
   LBI_KEYS,
   LBI_LIT,
@@ -117,10 +131,13 @@ import {
   TY_I64,
   TyArray,
   TyFunc,
+  TyVar,
   tyAt,
   tyElemOf,
+  tyIsHole,
   tyToStr,
   tyToTs,
+  tyVarOwnerOf,
 } from "./check_types"
 import {
   tailPushBlockTail,
@@ -280,6 +297,11 @@ export let lbiPinTy: i32[] = []
 export let lbiEdges = 0
 // The annotations the solve wrote, by annotation node: the declaration each belongs to.
 let lbiSynth: {[i32]: i32} = Map()
+// A hole the solve wrote, by annotation node, as the re-check mints it again: the root hole's
+// name and owner, then each derivation off it, innermost last (`lbiHolePinTy`).
+export let lbiHoleRoot: {[i32]: string[]} = Map()
+export let lbiHoleKinds: {[i32]: i32[]} = Map()
+export let lbiHoleFields: {[i32]: string[]} = Map()
 // The reads that hold a literal `const`'s literal, which a check about a literal the author wrote
 // (a shift count, a constant range, a newtype's brand) does not treat as one.
 export let lbiInlined: {[i32]: boolean} = Map()
@@ -306,10 +328,14 @@ export let lbiKeptPlain: {[i32]: boolean} = Map()
 // Drop this compile's node-keyed tables; the driver calls it wherever the arena resets.
 export function lbiArenaReset() {
   lbiSynth = Map()
+  lbiHoleRoot = Map()
+  lbiHoleKinds = Map()
+  lbiHoleFields = Map()
   lbiInlined = Map()
   lbiInlinedName = Map()
   lbiInlinedDecl = Map()
   cexFolded = Map()
+  cexFoldedText = Map()
   cexNotTree = Map()
   lbiKeptPlain = Map()
   0
@@ -486,6 +512,8 @@ export function lbiPopTo(depth: i32) {
 
 // The roots a fold rewrote into their value's literal.
 export let cexFolded: {[i32]: boolean} = Map()
+// Each rewritten root's source spelling, rebuilt from its nodes, for a refusal to name.
+let cexFoldedText: {[i32]: string} = Map()
 // The operators a walk below another found to be no constant tree, so their own check pays none.
 export let cexNotTree: {[i32]: boolean} = Map()
 // Set while a module initializer is folded before any scope exists: a name is read only as the
@@ -762,8 +790,17 @@ export function lbiSolveOne(
   const ats: i32[] = []
   const vks: i32[] = []
   const vus: i32[] = []
-  const def = lbiDef[c]
-  const intKind = def == TY_I32 || def == TY_I64
+  let def = lbiDef[c]
+  let intKind = def == TY_I32 || def == TY_I64
+  if intKind {
+    const ht = lbiHoleStoreTy(rs)
+    if ht >= 0 { return ht }
+  }
+  const fdef = lbiFloatStoreDef(c, rs, chosen)
+  if intKind && fdef >= 0 {
+    def = fdef
+    intKind = false
+  }
   for r0 in rs {
     let r = r0
     let k = -1
@@ -780,7 +817,14 @@ export function lbiSolveOne(
       k = LBI_UP
       u = i32ListAt(chosen, lbiRowCand[r])
     }
-    if k == LBI_FLOAT || k == LBI_INT || k == LBI_NOT_F32 || k == LBI_TREE {
+    if k == LBI_HOLE {
+      // Only `lbiHoleStoreTy` reads a hole store.
+    } else if (
+      k == LBI_FLOAT
+      || k == LBI_INT
+      || k == LBI_NOT_F32
+      || k == LBI_TREE
+    ) {
       vks.push(k)
       vus.push(u)
     } else if k == LBI_LIT {
@@ -809,10 +853,59 @@ export function lbiSolveOne(
   if t < 0 && report { lbiRefuse(d, def, ks, us, ats) }
   let v = 0
   while v < vks.length {
-    if t >= 0 && !lbiRowTakes(vks[v], vus[v], t) { return def }
+    if t >= 0 && !lbiRowTakes(vks[v], vus[v], t) { return lbiDef[c] }
     v = v + 1
   }
   t
+}
+
+// The hole an integer literal candidate joins to when every typed store `rs` holds is one hole,
+// as a literal joins a typed value it fits (ruling 4.3); each instance then types it at its pin,
+// where its literal is checked again. -1 when any other use bounds it.
+function lbiHoleStoreTy(rs: i32[]): i32 {
+  let hole = -1
+  for r in rs {
+    if r < 0 { return -1 }
+    const k = lbiKind[r]
+    if k == LBI_HOLE {
+      if hole >= 0 && tyToStr(hole) != tyToStr(lbiTy[r]) { return -1 }
+      hole = lbiTy[r]
+    } else if !(k == LBI_LIT && (lbiTy[r] & LBI_FIT_I64) != 0) {
+      return -1
+    }
+  }
+  hole
+}
+
+// The float an integer literal candidate `c` joins to when one of its stores `rs` is a float, as
+// any literal joins a typed value it fits (ruling 4.3): `f32` when every stored float is one and
+// nothing else is stored, `f64` beside an `i32` or `f64` store. -1 when there is no float store,
+// an `i64` store, which joins no float, or a float that does not hold the literal exactly.
+function lbiFloatStoreDef(c: i32, rs: i32[], chosen: i32[]): i32 {
+  if c < 0 || c >= lbiCands.length || !lbiIntTy(lbiDef[c]) { return -1 }
+  let any = false
+  let wide = false
+  for r in rs {
+    if r >= 0 {
+      const k = lbiKind[r]
+      let u = lbiTy[r]
+      if lbiEdgeKind(k) { u = i32ListAt(chosen, u) }
+      if k == LBI_LO || lbiEdgeKind(k) {
+        if u == TY_I64 { return -1 }
+        if u == TY_F32 || u == TY_F64 { any = true }
+        if u == TY_F64 || u == TY_I32 { wide = true }
+      }
+      if k == LBI_LIT && (u & LBI_FIT_I64) == 0 {
+        any = true
+        wide = true
+      }
+    }
+  }
+  if !any { return -1 }
+  const fits = lbiLitFits(lbiLitOf(c))
+  if !wide && (fits & LBI_FIT_F32) != 0 { return TY_F32 }
+  if wide && (fits & LBI_FIT_F64) != 0 { return TY_F64 }
+  -1
 }
 
 // The refusal for literal binding `d` whose uses no type satisfies: the first use no type the
@@ -917,9 +1010,18 @@ export function lbiDropUnobservable() {
   let r = 0
   while r < lbiRowCand.length {
     const k = lbiKind[r]
-    if k == LBI_LO || k == LBI_EDGE || k == LBI_EDGE_FWD || k == LBI_FLOAT {
+    if (
+      k == LBI_LO
+      || k == LBI_EDGE
+      || k == LBI_EDGE_FWD
+      || k == LBI_FLOAT
+      || k == LBI_HOLE
+    ) {
       loud[lbiRowCand[r]] = true
-    } else if k == LBI_LIT && (lbiTy[r] & LBI_FIT_SAME) == 0 {
+    } else if (
+      k == LBI_LIT
+      && (lbiTy[r] & (LBI_FIT_SAME | LBI_FIT_I64)) != (LBI_FIT_SAME | LBI_FIT_I64)
+    ) {
       loud[lbiRowCand[r]] = true
     }
     r = r + 1
@@ -972,7 +1074,9 @@ export function lbiApplyPins() {
     const d = lbiCands[lbiPinCand[i]]
     const n = nodeAt(d)
     const root = tyToTs(lbiPinTy[i])
-    if n is LetDecl && root >= 0 {
+    if n is LetDecl && tyIsHole(lbiPinTy[i]) {
+      lbiApplyHolePin(n, d, lbiPinTy[i])
+    } else if n is LetDecl && root >= 0 {
       const ann = mkTypeRef(tsToName(root), n.pos)
       setAnnTs(ann, root)
       lbiSynth[ann] = d
@@ -990,6 +1094,57 @@ export function lbiApplyPins() {
   }
   0
 }
+
+// Write hole `h` as `n`'s annotation by its recipe, which the re-check mints again since its arena
+// is new: the root hole and the derivations off it a name alone spells. None for any other.
+function lbiApplyHolePin(n: LetDecl, d: i32, h: i32) {
+  const kinds: i32[] = []
+  const fields: string[] = []
+  let t = h
+  let row = hdRowOf(t)
+  while row >= 0 {
+    if !lbiHoleKindSpelled(hdKind[row]) { return 0 }
+    kinds.push(hdKind[row])
+    fields.push(hdField[row])
+    t = hdBase[row]
+    row = hdRowOf(t)
+  }
+  const rt = tyAt(t)
+  if !(rt is TyVar) { return 0 }
+  const ann = mkTypeRef(tyToStr(h), n.pos)
+  lbiHoleRoot[ann] = [rt.tvName, tyVarOwnerOf(t)]
+  lbiHoleKinds[ann] = kinds
+  lbiHoleFields[ann] = fields
+  lbiSynth[ann] = d
+  markLetRetyped(d)
+  const nn: Node = {
+    letKw: n.letKw,
+    letName: n.letName,
+    letType: ann,
+    letInit: n.letInit,
+    pos: n.pos,
+  }
+  arenaSetNode(d, nn)
+}
+
+// Is derivation `k` named by its field alone? The rest carry an arena type in their name.
+function lbiHoleKindSpelled(k: i32): boolean {
+  if (
+    k == HD_FLD
+    || k == HD_RET
+    || k == HD_ELEM
+    || k == HD_ELEMV
+    || k == HD_OFLD
+  ) {
+    return true
+  }
+  if k == HD_ITER1 || k == HD_ITER2 { return true }
+  lbiHoleKindTyped(k)
+}
+
+// `HD_BINOP`, `HD_GALT`, `HD_GNOT`, `HD_COAL`, `HD_COALD`, `HD_PARAM`, `HD_TVW` and `HD_HWR` name
+// an arena type or a parameter slot, which the re-check's arena does not keep.
+function lbiHoleKindTyped(_k: i32): boolean { false }
 
 // Queue a read's note: the diagnostic, its raw message, the note, the declaration it names, the
 // name the value read, and the annotation it suggests.
@@ -1319,6 +1474,9 @@ function lbiLeaf(ix: i32, cands: i32[], tys: i32[], froms: i32[]) {
   if lbiNumTy(t) {
     tys.push(t)
     froms.push(-1)
+  } else if tyIsHole(t) {
+    tys.push(t)
+    froms.push(-3)
   }
   0
 }
@@ -1662,11 +1820,12 @@ export function lbiNoteStore(tc: i32, src: i32) {
   const leaves: i32[] = []
   lbiTreeLeaves(src, leaves, 0)
   for l in leaves {
-    if intLitLexemeOf(l) != "" { lbiPush(tc, LBI_LIT, lbiLitFits(l), l) }
+    if nodeAt(l) is NumLit { lbiPush(tc, LBI_LIT, lbiLitFits(l), l) }
   }
   let i = 0
   while i < tys.length {
     if froms[i] == -2 { lbiPush(tc, LBI_FLOAT, TY_F64, src) }
+    else if froms[i] == -3 { lbiPush(tc, LBI_HOLE, tys[i], src) }
     else if froms[i] != tc { lbiPush(tc, LBI_LO, tys[i], src) }
     i = i + 1
   }
@@ -2030,18 +2189,48 @@ export function lbiSymRead(ix: i32) {
 // names the tree read stay references for the editor.
 export function cexRewrite(ix: i32, v: Cex) {
   if symEnabled != 0 { cexNoteNames(ix, 0) }
+  const text = cexTreeText(ix, 0)
   const pos = nodePosOf(ix)
   const lex = cexLexeme(v)
   if v.cxNeg {
     const inner = mkNum(lex, pos)
     while nodeTyIx.length <= inner { nodeTyIx.push(-1) }
     cexFolded[inner] = true
+    cexFoldedText[inner] = text
     arenaSetNode(ix, { unOp: "-", unArg: inner, pos: pos })
   } else {
     arenaSetNode(ix, { numText: lex, pos: pos })
   }
   cexFolded[ix] = true
+  cexFoldedText[ix] = text
   0
+}
+
+// The source spelling of the constant tree at `ix`, rebuilt from its nodes (a tree holds only
+// these), so a refusal can name the expression a folded value came from.
+function cexTreeText(ix: i32, depth: i32): string {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return "…" }
+  const e = nodeAt(ix)
+  if e is NumLit { return e.numText }
+  if e is Ident { return e.identName }
+  if e is Paren { return "(" + cexTreeText(e.parInner, depth + 1) + ")" }
+  if e is Unary { return e.unOp + cexTreeText(e.unArg, depth + 1) }
+  if e is BinExpr {
+    return cexTreeText(e.binLeft, depth + 1)
+      + " "
+      + e.binOp
+      + " "
+      + cexTreeText(e.binRight, depth + 1)
+  }
+  "(no constant here)"
+}
+
+// The tree a fold rewrote into the literal at `ix` (under parentheses), or "" for a literal the
+// author wrote.
+export function cexFoldedFrom(ix: i32): string {
+  const p = parenPeelIx(ix)
+  if p < 0 || cexFoldedText.length == 0 { return "" }
+  cexFoldedText[p] ?? ""
 }
 
 // Record every name the tree at `ix` reads as an editor occurrence of the `const` it names.
