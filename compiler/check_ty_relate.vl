@@ -34,6 +34,7 @@ import {
   tyAdmitsNull,
   tyEqNoneIsMap,
   tyHasNullMember,
+  tyHasTyVar,
   tyHasV128Member,
   tyReachesHole,
   tyStepElem,
@@ -82,7 +83,7 @@ import {
   intLexemeIsExactF64,
   numLexFitsI32,
 } from "./emit_bignum"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 
 // The comparability vocabulary — which lowering a `==`/`!=` operand's rep takes. `""` and
 // `"none"` are different answers and both are load-bearing: the checker rejects `"none"`
@@ -713,7 +714,9 @@ export function eqRefusals(
     unsup.push(0)
     return 0
   }
-  if structural && lt >= 0 {
+  // A pair compared field by field is judged per field pair, a union field against a member
+  // field included, as the bare compare is (D16399).
+  if structural && lt >= 0 && !recEqFieldWise(lt, rt) {
     const lT = tyAt(lt)
     let isStruct = false
     if lT is TyObj { isStruct = true }
@@ -1040,6 +1043,42 @@ export function listJoinStorageDiffers(
 
 // How deep a field's storage is compared before the rule stops asking.
 export const REC_STORE_DEPTH = 8
+
+// The record a `==` operand of type `ty` compares as: `ty` itself, or a nullable's inner record;
+// -1 for anything else.
+export function recEqSide(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const inner = nonNullTy(ty)
+  if inner >= 0 && inner < T.tys.length && tyAt(inner) is TyObj {
+    inner
+  } else {
+    -1
+  }
+}
+
+// Whether `==` over `lt` and `rt` compares field by field: two records (or nullable records) of
+// one field set, stored apart. Each field pair then meets its own `==` (D16394, D16399).
+export function recEqFieldWise(lt: i32, rt: i32): boolean {
+  const lr = recEqSide(lt)
+  const rr = recEqSide(rt)
+  if lr < 0 || rr < 0 || fieldStorageEq(lr, rr, REC_STORE_DEPTH) {
+    return false
+  }
+  if tyHasTyVar(lt) || tyHasTyVar(rt) { return false }
+  const lo = tyAt(lr)
+  const ro = tyAt(rr)
+  if !(lo is TyObj) || !(ro is TyObj) { return false }
+  if (
+    lo.objFieldNames.length == 0
+    || lo.objFieldNames.length != ro.objFieldNames.length
+  ) {
+    return false
+  }
+  for f in lo.objFieldNames {
+    if strListIndexOf(ro.objFieldNames, f) < 0 { return false }
+  }
+  true
+}
 
 // The first field of `d` that `s` stores differently, or "".
 export function recStorageField(s: TyObj, d: TyObj): string {
