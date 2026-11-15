@@ -213,6 +213,17 @@ table row. At the end the bounds are closed:
 The last rule is what instance-local generalization means. D16423's inner `[]` is a list of `β`, and
 `β` is quantified, so each call gets its own `β`.
 
+**When a scheme closes.** A scheme is built once, when the body's loud check ends (`bodyChecked`).
+- The quiet return-inference pre-pass does not close it. A pre-pass read sees a partial body, and
+  its answer is the pre-pass's own (`refactor-notes/2026-11-15-l2-close-and-storage.md`).
+- A lambda or nested function closes with its enclosing top-level declaration. Its bounds belong to
+  that declaration's scheme.
+- A function value bound at module level, with no enclosing declaration, closes at the statement
+  that binds it.
+
+M3's census found that a body walk asked after the close gives one answer in every frame, instance
+re-checks included. So S2 reads each walk once, at the close.
+
 ### 3.3 Literals
 
 `let t = 0; t = t + x` makes `t` a variable bounded below by the literal `0` and by the type of
