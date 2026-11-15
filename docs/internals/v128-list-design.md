@@ -1,6 +1,8 @@
 # A list of vectors (`F32x4[]`), and a map of them
 
-Status: design, for review before any code. It closes D1981's array and map faces, the last
+Status: the flat list landed 2026-11-15 (`v128list`), after the element-kind refactor; the map
+value, the nullable twin and a list of vector lists are still to come. Measured outcome in
+`refactor-notes/2026-11-15-lane-l-v128list.md`. It closes D1981's array and map faces, the last
 of its four (the struct field closed with `FC_V128`, the nullable and union members with D2633).
 
 ## What the tree does

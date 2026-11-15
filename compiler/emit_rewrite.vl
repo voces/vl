@@ -1843,12 +1843,7 @@ function drwWalk(ix: i32, ctx: i32) {
   const atStmt = drwAtStmt
   drwAtStmt = false
   if !atStmt && drwCompoundValueRunsTwice(ix, ctx) {
-    const sp = drwCompoundValueSpill(ix, ctx)
-    if sp >= 0 { return drwWalk(sp, ctx) }
-    emitFail(
-      "emitProgram: a compound write (`++p`, `p++`, `p op= v`) used as a value reads and writes a place whose receiver or index has an effect, which would run twice; write it as its own statement",
-    )
-    return ix
+    return drwWalk(drwCompoundValueSpill(ix, ctx), ctx)
   }
   const n = nodeAt(ix)
   match n {
@@ -2722,14 +2717,26 @@ function drwCompoundValueRunsTwice(ix: i32, ctx: i32): boolean {
   const w = nodeAt(ix)
   const a0 = if w is Unary && (w.unOp == "p+" || w.unOp == "p-") { w.unArg } else { ix }
   const a = nodeAt(a0)
-  if !(a is BinExpr) || a.binCompound == "" || a.binOp != "=" { return false }
+  if !(a is BinExpr) || !spillsItsPlace(a) { return false }
   const t = unwrapParen(a.binLeft)
   if t < 0 { return false }
   const tn = nodeAt(t)
   if tn is Index {
     return !cpReReadable(tn.idxArr, ctx) || !cpReReadable(tn.idxIndex, ctx)
   }
-  return drwCompoundRecvRunsTwice(t, ctx)
+  return a.binOp == "=" && drwCompoundRecvRunsTwice(t, ctx)
+}
+
+// Whether `a` reads its left place before it writes or tests it: a compound write, or a `??` over
+// a list cell, whose null test reads the cell twice (D16484). A map read's fused get reads once.
+function spillsItsPlace(a: BinExpr): boolean {
+  if a.binOp == "=" { return a.binCompound != "" }
+  if a.binOp != "??" { return false }
+  const t = unwrapParen(a.binLeft)
+  const tn = if t >= 0 { nodeAt(t) } else { null }
+  if !(tn is Index) { return false }
+  const rt = nodeTyIxOf(tn.idxArr)
+  return rt >= 0 && tyAt(rt) is TyArray
 }
 
 // `drwCompoundValueRunsTwice` for every target that is not an element, as `spillCompoundRecv`
@@ -2740,21 +2747,21 @@ function drwCompoundRecvRunsTwice(t: i32, ctx: i32): boolean {
   return false
 }
 
-// The compound write `ix` in a value position, as `if true { <spills> ix } else { <zero> }`: its
-// receiver and index run once before the write, as at a statement. -1 for a write whose type has
-// no literal to stand in the arm that never runs.
+// The compound write or list-cell `??` `ix` in a value position, as `if true { <spills> ix } else
+// { <zero> }`: its receiver and index run once before it, as at a statement.
 function drwCompoundValueSpill(ix: i32, ctx: i32): i32 {
   const ty = nodeTyIxOf(ix)
   const prim = tyPrimNameOf(ty)
   const wn = nodeAt(ix)
   const pos = if wn is Unary { wn.pos } else if wn is BinExpr { wn.pos } else { -1 }
-  let z = -1
+  // The else arm never runs, and the emitter lowers a literal-`true` value `if`'s else as dead,
+  // so a type with no zero to spell takes `null` there, typed as the write.
+  let z = mkNull("null", pos)
   if ty == TY_STR {
     z = mkStr("", pos)
   } else if prim == "i32" || prim == "i64" || prim == "f32" || prim == "f64" {
     z = nssZero(ty, pos)
   }
-  if z < 0 { return -1 }
   nodeTyRecord(z, ty)
   const st: i32[] = []
   spillCompoundPlace(ix, st, ctx)
@@ -2781,7 +2788,7 @@ function spillCompoundPlace(asgIx0: i32, out: i32[], ctx: i32): boolean {
   const asgIx = if w is Unary && (w.unOp == "p+" || w.unOp == "p-") { w.unArg } else { asgIx0 }
   const a = nodeAt(asgIx)
   if a is BinExpr {
-    if a.binCompound == "" || a.binOp != "=" { return false }
+    if !spillsItsPlace(a) { return false }
     const t = unwrapParen(a.binLeft)
     if t < 0 { return false }
     const tn = nodeAt(t)
