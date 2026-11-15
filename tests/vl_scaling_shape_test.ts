@@ -87,7 +87,7 @@ const genFunctions = (nf: number, ns: number): string => {
 const genFamilyFunctions = (nf: number, ns: number): string =>
   [
     "type Pt = { x: i32 }",
-    "function src(k: i32): Pt | null { if k > 0 { return null } { x: k } }",
+    "function src(k: i32): Pt | null { if k > 0 { return null } return { x: k } }",
     "const fam = src(1) ?? { x: 2 }",
     genFunctions(nf, ns).replace("let acc = 0", "let acc = fam.x"),
   ].join("\n");
@@ -129,9 +129,9 @@ const genHofBodies = (n: number, shape: HofShape): string => {
   o.push("function sinkL(v: i32[]): i32 { return v.length }", "function hook(f: (ix: i32) => i32): i32 { return f(1) }");
   for (let i = 0; i < n; i++) {
     o.push(`function f${i}(x: i32): i32 {`);
-    if (shape === "copy") o.push("  let y = G", "  sink(y)");
-    if (shape === "rewrite") o.push("  let y = G", `  if x > ${i} { y = H }`, "  sink(y)");
-    if (shape === "global") o.push(`  if x > ${i} { G = H }`, "  sink(G)");
+    if (shape === "copy") o.push("  let y = G", "  return sink(y)");
+    if (shape === "rewrite") o.push("  let y = G", `  if x > ${i} { y = H }`, "  return sink(y)");
+    if (shape === "global") o.push(`  if x > ${i} { G = H }`, "  return sink(G)");
     if (shape === "list") o.push(`  return sinkL([x, x + 1, x + ${i}])`);
     o.push("}");
   }
@@ -1423,7 +1423,7 @@ axis(
 // `parentLetOfAt`'s whole per-function plan once per top-level statement, on every such
 // miss, instead of gating the search on the cheap memoized "bound nowhere" answer first.
 const genTopStmtsUnionMiss = (n: number, many: boolean): string => {
-  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
+  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  return "s"', "}"];
   if (many) {
     for (let i = 0; i < n; i++) o.push(`print(${i})`);
   } else {
@@ -1482,7 +1482,7 @@ axis(
 // compile, and a ratio against it is a budget. Linear reads 4 and quadratic 16; at 1,500 blocks
 // against 375 it reads 5.35, and with `startBlockLetRowOfSid`'s memo disabled 14.71.
 const genManyCapturedSiblingBlocks = (n: number, many: boolean): string => {
-  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  "s"', "}"];
+  const o = ["type U = i32 | string", "function g(x: i32): U {", "  if x % 2 == 0 { return x }", '  return "s"', "}"];
   const blocks = many ? n : 1;
   for (let i = 0; i < blocks; i++) {
     o.push(
@@ -1924,8 +1924,8 @@ const genElseIfChains = (shape: "return" | "value", nf: number, n: number): stri
       arms.push(shape === "return" ? `if x == ${i} { return ${i + f} }` : `if x == ${i} { ${i + f} }`);
     }
     const last = shape === "return" ? "{ return -1 }" : "{ -1 }";
-    o.push(shape === "return" ? `  return ${arms.join(" else ")} else ${last}` : `  const r = ${arms.join(" else ")} else ${last}`);
-    if (shape === "value") o.push("  r");
+    o.push(shape === "return" ? `  ${arms.join(" else ")} else ${last}` : `  const r = ${arms.join(" else ")} else ${last}`);
+    if (shape === "value") o.push("  return r");
     o.push("}");
   }
   o.push("let acc = 0");

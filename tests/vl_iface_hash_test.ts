@@ -629,7 +629,7 @@ const CASES: Case[] = [
   one(
     "inferred: a type elided past its render depth",
     "miss",
-    `export function f() { ${"{ a: ".repeat(DEEP)}1${" }".repeat(DEEP)} }\n`,
+    `export function f() { return ${"{ a: ".repeat(DEEP)}1${" }".repeat(DEEP)} }\n`,
     `const r = f()\nprint(r${".a".repeat(DEEP)} / 2)`,
     "{ a: 1 }",
     "{ a: 1.5 }",
@@ -716,14 +716,14 @@ const CASES: Case[] = [
     "area(n: i32): i32",
     "area(n: i32): i64",
   ),
-  lib("inferred-return body edit", "miss", "{ n / 2 }", "{ n / 2.0 }"),
+  lib("inferred-return body edit", "miss", "{ return n / 2 }", "{ return n / 2.0 }"),
   lib(
     "generic body edit",
     "miss",
     "b: T): T { return a }",
     "b: T): T { return b }",
   ),
-  lib("untyped-param body edit", "miss", "{ x * 2 }", "{ x * 2 + 1 }"),
+  lib("untyped-param body edit", "miss", "{ return x * 2 }", "{ return x * 2 + 1 }"),
   lib("type decl edit", "miss", "h: i32 }", "h: i32, d: i32 }"),
   lib("global initialiser edit", "miss", "let counter = 0", "let counter = 5"),
   lib(

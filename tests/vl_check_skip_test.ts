@@ -1022,8 +1022,8 @@ const CASES: Case[] = [
     name: "lib's builder leaf becomes an element read",
     want: "decline",
     why: "fresh",
-    from: "{ { f: 4 } }",
-    to: "{ const t = [{ f: 4 }]; const u = t; u[0] }",
+    from: "{ return { f: 4 } }",
+    to: "{ const t = [{ f: 4 }]; const u = t; return u[0] }",
     libUses: "export function mk() { return { f: 4 } }\n",
     uses:
       'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',

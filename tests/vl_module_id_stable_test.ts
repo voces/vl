@@ -77,7 +77,7 @@ const LIB = [
   "export type Pt = { x: i32, y: i32 }",
   "export let count = 3",
   "export function hello(n: i32): i32 { return n + count }",
-  "export function mk(): Pt { { x: hello(1), y: 2 } }",
+  "export function mk(): Pt { return { x: hello(1), y: 2 } }",
 ].join("\n");
 const OTHER = "export function other(): i32 { return 7 }";
 const VIA =

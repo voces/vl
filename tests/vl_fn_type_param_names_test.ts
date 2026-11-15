@@ -26,7 +26,7 @@ function ex(s: string) { s + "!" }
 function add(a: i32, b: i32) { a + b }
 function apply(f: (@x: i32) => i32, v: i32) { f(v) }
 function mk(k: i32): (@x: i32) => i32 { (v: i32) => v * k }
-function id<T>(x: T): T { x }
+function id<T>(x: T): T { return x }
 function callG<T>(f: (@x: T) => T, v: T): T { f(v) }
 function twice(f: (@cb: (@x: i32) => i32, @v: i32) => i32) { f(dbl, 5) }
 function run(v: ((@x: i32) => i32) | string) {

@@ -239,7 +239,7 @@ const LOOSE_ARGS = 65536, LOOSE_GETTER = 131072, LOOSE_SETTLED = 262144, LOOSE_C
 
 // G builds a `J` from an inferred builder; main declares a record of the literal's own storage.
 const BUILT_LIB = (body: string) =>
-  `type J = { f: i32 | null }\nfunction id<T>(v: T): T { v }\nfunction mk() { ${body} }\n` +
+  `type J = { f: i32 | null }\nfunction id<T>(v: T): T { return v }\nfunction mk() { return ${body} }\n` +
   "export function jj(): void {\n  const xj: J = mk()\n  const kk = mk()\n" +
   "  print(xj.f ?? 0)\n  print([kk][0].f)\n}\n";
 const BUILT_MAIN = 'import { jj } from "./lib"\ntype II = { f: i32 }\njj()\n';

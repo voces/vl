@@ -71,13 +71,13 @@ const PROGRAMS: Record<string, string[]> = {
   laneGetter: [...LANE_PRE, `get y(self: F4): f32 { return ${LANE_BODY} }`, ...LANE_POST, "print(v.y)"],
   laneCall: [
     ...LANE_PRE,
-    `function y(self: F4): f32 { ${LANE_BODY} }`,
+    `function y(self: F4): f32 { return ${LANE_BODY} }`,
     ...LANE_POST,
     "print(y(v))",
   ],
   laneUfcs: [
     ...LANE_PRE,
-    `function y(self: F4): f32 { ${LANE_BODY} }`,
+    `function y(self: F4): f32 { return ${LANE_BODY} }`,
     ...LANE_POST,
     "print(v.y())",
   ],
