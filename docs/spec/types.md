@@ -336,9 +336,37 @@ type N = !string   // refused: `!string` is a NEGATION, which says what a value 
 > "Type negation is `!A`, not `not A`".
 
 **T3.6** Two numeric values of different types that meet at a join (`if` arms, `match`
-arms, `??`, list literal elements) have the union of their types. Literal operands adapt
-instead (T2.4). A numeric union is delivered to one numeric type only when the conversion
-is exact for every member. Arithmetic on a numeric union is specified in expressions.md.
+arms, `??`, list literal elements) have the union of their types. A numeric literal joined
+with a typed numeric value adopts that value's type when it fits: an integer literal when
+the type holds it exactly, a float literal at `f32` or `f64` (at `f32` it rounds, as
+`let x: f32 = 0.1` does). A literal that does not fit keeps its default type (T2.1, T2.2)
+and joins as a member. The rule is the same in every join form. A numeric union is
+delivered to one numeric type only when the conversion is exact for every member.
+Arithmetic on a numeric union is specified in expressions.md.
+
+```vl
+function f(c: boolean, x: f32): f32 {
+  const v = if c { 5 } else { x }   // f32: 5 fits f32 exactly
+  v
+}
+print(f(true, 1.5))   // prints 5
+```
+
+```vl
+function g(x: f32): f32 {
+  const v = [0.1, x]   // f32[]: a float literal adopts f32
+  v[1]
+}
+print(g(2.5))   // prints 2.5
+```
+
+```vl
+function h(c: boolean, x: f32) {
+  const v = if c { 9000000000 } else { x }   // i64 | f32: f32 does not hold 9000000000 exactly
+  print(v)
+}
+h(true, 1.5)   // prints 9000000000
+```
 
 ```vl
 function f(c: boolean, a: i32, b: f64): f64 {
@@ -357,7 +385,13 @@ function f(c: boolean, a: i64, b: f64): f64 {
 ```
 
 > Ruling: owner 2026-09-30, DECISIONS.md §"Runtime numbers of different types join as a
-> union, and operators dispatch per member" (D3345, D3363).
+> union, and operators dispatch per member" (D3345, D3363). Owner 2026-11-15 (lane O's spec
+> question 3): one literal-adoption rule for every join form.
+
+> Status: the compiler differs by form today, so the first two examples are refused. `if`
+> and list joins keep an integer literal beside `f32` at `i32`, a list keeps a float literal
+> beside `f32` at `f64`, and `if` and lists keep `9000000000` beside `f64` at `i64`. The
+> acceptance grid is `scripts/oracle/join-grid.ts` (4 literals × 4 types × 4 join forms).
 
 ## T4. Records
 

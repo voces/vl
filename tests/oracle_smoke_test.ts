@@ -4,6 +4,7 @@
 // cannot run yet are listed in SPEC_SKIPS by their first line, so the count can only grow.
 
 import { distilledExpectations, interpret, judge, judgeRecording } from "../scripts/oracle/oracle.ts";
+import { grid } from "../scripts/oracle/join-grid.ts";
 
 type Example = { where: string; src: string; want: string[] };
 
@@ -78,6 +79,14 @@ Deno.test("oracle: pinned regressions", () => {
   for (const [src, want] of pins) {
     const o = interpret(src + "\n");
     if (o.kind !== "ok" || o.out.join("\n") !== want) throw new Error(`${src}: want ${want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
+  }
+});
+
+// Spec T3.6 (ruling 4.3): the oracle gives every cell of the join grid the type the rule gives.
+Deno.test("oracle: the T3.6 join grid", () => {
+  for (const c of grid()) {
+    const o = interpret(c.src);
+    if (o.kind !== "ok" || o.out.join("\n") !== c.want) throw new Error(`${c.name}: want ${c.want}, got ${o.kind} ${JSON.stringify(o.out)} ${o.msg}`);
   }
 });
 
