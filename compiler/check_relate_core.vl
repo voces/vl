@@ -20,6 +20,7 @@ import {
   elabFnSlotWidened,
   elabHolePinNote,
   elabPinBindingIs,
+  elabTyClosed,
   fnChoiceVetoed,
   fnChoiceWideNote,
   fnLetIsWide,
@@ -56,6 +57,7 @@ import {
   Param,
   Paren,
   RetStmt,
+  Spread,
   StrLit,
   TS_APP,
   TS_ARR,
@@ -84,6 +86,7 @@ import {
   i32ToStr,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   stmtAlwaysExits,
   tsKidCount,
   tsKidStart,
@@ -385,6 +388,7 @@ import {
 import { nullableFlatInner, substUnionNullFolded } from "./check_subst_fold"
 import { demangleName, isBuiltinTyName } from "./check_suggest"
 import {
+  holeNameIsParamOf,
   joinTyParamNull,
   markTpJoinApart,
   noteHoleTpJoin,
@@ -410,6 +414,7 @@ import {
   eqRefusals,
   fvaSlotMayDiffer,
   holeArgScalarRefused,
+  isWidenNotVariant,
   joinWidensMap,
   listJoinStorageDiffers,
   litNumUnionConverts,
@@ -503,6 +508,7 @@ import {
   tyMentionsTyVarNamed,
   tyMutEpoch,
   tyNulInnerTy,
+  tyOpen,
   tyPinElem,
   tyPinKey,
   tyPinVal,
@@ -636,7 +642,6 @@ import {
   tyReachesHole,
   tyStoresVoid,
   unionArmSubsumedBy,
-  unionCoversTy,
   unionDropSubsumedArms,
 } from "./tyquery"
 
@@ -750,7 +755,7 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
         TyUnion => {
           // An open `[]` delivered to a union is built as its first list member, the arm
           // `recordRepTyAdopt` records for a literal, so a call returning one pins the same way.
-          if s.aElem < 0 {
+          if tyOpen(s.aElem) {
             const vs: i32[] = []
             flattenVariantsInto(dstTy, vs)
             for v in vs {
@@ -761,11 +766,11 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
           }
         }
         TyArray => {
-          if s.aElem < 0 {
+          if tyOpen(s.aElem) {
             // Both sides open is not a pin but a link — `s.aElem = d.aElem` would write the `-1`
             // back and lose the fact that these two rows must agree, which `arrDefHoleToI32` needs
             // once an unpinned hole acquires a default. D1470.
-            if d.aElem < 0 {
+            if tyOpen(d.aElem) {
               noteHoleLink(srcTy, dstTy)
             } else {
               tyPinElem(s, d.aElem)
@@ -784,11 +789,14 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
         TyMap => {
           // Both open is a link, as two open lists are (D1470): a later use pins one side, and
           // `resolveHoleLinks` hands it to the other.
-          if (s.mKey < 0 && d.mKey < 0) || (s.mVal < 0 && d.mVal < 0) {
+          if (
+            (tyOpen(s.mKey) && tyOpen(d.mKey))
+            || (tyOpen(s.mVal) && tyOpen(d.mVal))
+          ) {
             noteHoleLink(srcTy, dstTy)
           }
-          if s.mKey < 0 { tyPinKey(s, d.mKey) }
-          if s.mVal < 0 {
+          if tyOpen(s.mKey) { tyPinKey(s, d.mKey) }
+          if tyOpen(s.mVal) {
             tyPinVal(s, d.mVal)
           } else {
             constrainEmptyD(s.mVal, d.mVal, depth - 1)
@@ -797,7 +805,7 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
         // An open map or set delivered to a union is built as its first member of the same kind,
         // the arm a fresh `Map()` is pinned to at a binding (D2649).
         TyUnion => {
-          if s.mKey < 0 || s.mVal < 0 {
+          if tyOpen(s.mKey) || tyOpen(s.mVal) {
             const arm = unionMapArmOf(dstTy, s.mSet)
             if arm >= 0 { return constrainEmptyD(srcTy, arm, depth - 1) }
           }
@@ -1733,13 +1741,16 @@ function tyVarMemberOf(v: i32, u: i32): boolean {
 function asPinHolds(from: i32, to: i32): boolean {
   if from < 0 || to < 0 || from >= T.tys.length { return true }
   const f = tyAt(from)
-  if f is TyUnion { return unionCoversTy(f, to) }
-  // A nullable operand is a union operand, as `checkCastNode` reads it.
-  if f is TyNullable {
-    if f.nInner < 0 { return true }
-    const nu = tyAt(mkUnionTy([f.nInner, TY_NULL]))
-    if nu is TyUnion { return unionCoversTy(nu, to) }
-    return true
+  // A union or nullable operand casts to the members the type test names (`tyTestMemberFit`),
+  // as `checkCastUnionArm` asks it.
+  if f is TyUnion || f is TyNullable {
+    if f is TyNullable && f.nInner < 0 { return true }
+    const ms: i32[] = []
+    flattenVariantsInto(from, ms)
+    for m in ms {
+      if tyTestMemberFit(m, to) != TT_NONE { return true }
+    }
+    return false
   }
   if from == to || assignable(from, to) { return true }
   isNumeric(from) && isNumeric(to) && primNameOf(from) != "boolean"
@@ -3455,6 +3466,100 @@ export function sameTypeTestNote(obj: i32, name: string, ix: i32) {
     i = i + 2
   }
   0
+}
+
+// `tyTestMemberFit`'s three answers.
+export const TT_NONE = 0
+export const TT_PARTLY = 1
+export const TT_COVERED = 2
+
+// What a type test of `chk` answers for a value of one operand member `m`, the one rule `is`,
+// `as` and `match` share: covered where every value of `m` fits `chk` (`m` is `chk`, the type
+// parameter it names, or a record it contains), partly where some may (`chk` fits `m`, or `m` is
+// a parameter a pin may bind to `chk`), else none. A union `chk` answers its best member.
+export function tyTestMemberFit(m: i32, chk: i32): i32 {
+  if m < 0 || chk < 0 || m >= T.tys.length || chk >= T.tys.length {
+    return TT_NONE
+  }
+  const ct = tyAt(chk)
+  if ct is TyUnion || ct is TyNullable {
+    let best = TT_NONE
+    for c in tyTestMembers(chk) {
+      const f = if c == chk { TT_NONE } else { tyTestMemberFit(m, c) }
+      if f > best { best = f }
+    }
+    return best
+  }
+  if tyTestIsMember(m, chk) || recContainedIn(m, chk) { return TT_COVERED }
+  if tyAt(m) is TyVar { return TT_PARTLY }
+  if (
+    assignable(chk, m)
+    && !isWidenNotVariant(chk, m)
+    && !fnSlotRetWidens(chk, m)
+  ) {
+    return TT_PARTLY
+  }
+  TT_NONE
+}
+
+// Whether operand member `m` is the tested type `c` itself: the same variant, or the type
+// parameter `c` names.
+export function tyTestIsMember(m: i32, c: i32): boolean {
+  if m < 0 || c < 0 { return false }
+  const mt = tyAt(m)
+  const ct = tyAt(c)
+  if mt is TyVar { return ct is TyVar && ct.tvName == mt.tvName }
+  m == c || sameVariantTy(m, c)
+}
+
+// The members of `t`, a union or nullable flattened, `null` among them.
+export function tyTestMembers(t: i32): i32[] {
+  const ms: i32[] = []
+  if t >= 0 { flattenVariantsInto(t, ms) }
+  ms
+}
+
+// Whether a test of `chk` over `obj` can be true: each member of `chk` may fit some member of
+// `obj`, or `obj`, one type, is covered by `chk`.
+export function tyTestMayFit(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 || ms.length == 0 { return false }
+  if ms.length == 1 && tyTestMemberFit(ms[0], chk) == TT_COVERED { return true }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestMemberFit(m, c) != TT_NONE }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every member of `chk` is a member of `obj` (`tyTestIsMember`): a cast to `chk` picks
+// those arms.
+export function tyTestNamesMembers(obj: i32, chk: i32): boolean {
+  const ms = tyTestMembers(obj)
+  const cs = tyTestMembers(chk)
+  if cs.length == 0 { return false }
+  for c in cs {
+    let hit = false
+    for m in ms { hit = hit || tyTestIsMember(m, c) }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether every value of record `a` fits record `b` and not the reverse, the two declaring the
+// same field names. A record with fields the other lacks is no containment D3885 settles.
+export function recContainedIn(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const at = tyAt(a)
+  const bt = tyAt(b)
+  if !(at is TyObj) || !(bt is TyObj) { return false }
+  if at.objFieldNames.length != bt.objFieldNames.length { return false }
+  for f in at.objFieldNames {
+    if strListIndexOf(bt.objFieldNames, f) < 0 { return false }
+  }
+  assignable(a, b) && !assignable(b, a)
 }
 
 // —— the annotation union's member list, shared by both annotation routes ——
@@ -7195,7 +7300,7 @@ export function holeSlotDeliveryJudge(v: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   const da = tyAt(dt)
-  if !(da is TyArray) || da.aElem < 0 || da.aElem >= T.tys.length {
+  if !(da is TyArray) || tyOpen(da.aElem) || da.aElem >= T.tys.length {
     return false
   }
   const ef = tyAt(da.aElem)
@@ -8515,6 +8620,12 @@ function holeCallInstOf(
     const r = holeSetCallRetOf(c, fnTagSetOfTy(vt), ats, false)
     return if r >= 0 { mkFuncTy(ats, r) } else { -1 }
   }
+  // A declared hole function bound here is called as a direct call of it is: each lambda argument
+  // at the types its body calls that parameter at, then its body at the closed arguments (D16335).
+  const d = holeDeclOfFnTy(vt)
+  if d >= 0 && lams.length > 0 {
+    return holeDeclCallInst(d, n, vNames, vTys, calleeFn, depth)
+  }
   for lj in lams {
     const p = vf.fnParamTypes[lj]
     if !holeLamBind(p, n.callArgs[lj], vNames, vTys, oNames, oTys) { return -1 }
@@ -8522,6 +8633,221 @@ function holeCallInstOf(
   const inst = substTyDeep(vt, oNames, oTys)
   if inst < 0 || tyHasTyVar(inst) { return -1 }
   inst
+}
+
+// The un-annotated declared function whose own open signature `vt` is: the lone member of its
+// function set, else the function whose own hole its first parameter names; -1 when neither.
+function holeDeclOfFnTy(vt: i32): i32 {
+  if vt < 0 || vt >= T.tys.length { return -1 }
+  const vf = tyAt(vt)
+  if !(vf is TyFunc) { return -1 }
+  const ms = fnTagMembers(fnTagSetOfTy(vt))
+  if ms.length == 1 { return holeDeclChecked(ms[0], vf) }
+  if vf.fnParamTypes.length == 0 { return -1 }
+  const p0 = vf.fnParamTypes[0]
+  if p0 < 0 || p0 >= T.tys.length { return -1 }
+  const pv = tyAt(p0)
+  if !(pv is TyVar) { return -1 }
+  const nm = pv.tvName
+  if nm.length < 2 || nm[0] != '?' { return -1 }
+  let e = 1
+  while e < nm.length && nm[e] != '.' && nm[e] != '@' { e = e + 1 }
+  const d = holeDeclChecked(fnDeclIx[nm.slice(1, e)] ?? -1, vf)
+  if d < 0 { return -1 }
+  const f = nodeAt(d)
+  if (
+    !(f is FuncDecl)
+    || !holeNameIsParamOf(nm, f.fnName, d, f.fnParams.length)
+  ) {
+    return -1
+  }
+  d
+}
+
+// Declared function `d` when it is an un-annotated, non-generic function of `vf`'s arity; -1 else.
+function holeDeclChecked(d: i32, vf: TyFunc): i32 {
+  if d < 0 || d >= P.nodes.length || !directHoleDecl(d) { return -1 }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  if f.fnParams.length != vf.fnParamTypes.length { return -1 }
+  d
+}
+
+// Call `n` of declared hole function `d` through a parameter bound to it, typed as the direct call
+// of `d` at `n`'s arguments: a lambda argument at the closed types `d`'s body calls its parameter
+// at, every argument closed, then `d`'s body at them; -1 when one stays open.
+function holeDeclCallInst(
+  d: i32,
+  n: Call,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  const f = nodeAt(d)
+  if !(f is FuncDecl) || f.fnParams.length != n.callArgs.length { return -1 }
+  const ats: i32[] = []
+  let j = 0
+  while j < n.callArgs.length {
+    let at = -1
+    if holeArgIsLam(n.callArgs[j]) {
+      const lx = parenPeelIx(n.callArgs[j])
+      if lx < 0 || lx >= P.nodes.length { return -1 }
+      const lam = nodeAt(lx)
+      const raw: i32[] = []
+      if (
+        !(lam is FuncDecl)
+        || holeParamCallsAt(f.fnBody, f.fnParams[j], lam.fnParams.length, raw) <= 0
+      ) {
+        return -1
+      }
+      const pts: i32[] = []
+      for t in raw { pts.push(widenLitTy(t)) }
+      const r = holeLamRetAt(lx, mkFuncTy(pts, TY_I32), vNames, vTys)
+      if r < 0 { return -1 }
+      at = mkFuncTy(pts, r)
+    } else {
+      at = holeCallNodeTy(n.callArgs[j], vNames, vTys, calleeFn, depth + 1)
+    }
+    if at < 0 || tyHasTyVar(at) { return -1 }
+    ats.push(at)
+    j = j + 1
+  }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(d, mkFuncTy(ats, TY_I32), noN, noT)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  mkFuncTy(ats, r)
+}
+
+// Whether parameter `q` is read under `body`, and only as the callee of positional calls of `n`
+// arguments whose types are closed and match `at`'s, which the first such call fills.
+export function ftParamOnlyCalledAt(
+  body: i32,
+  q: i32,
+  n: i32,
+  at: i32[],
+): boolean {
+  const calls = ftParamCallsAt(body, q, n, at)
+  calls > 0 && ftParamReads(body, q) == calls
+}
+
+// How many calls under `body`, nested functions included, have parameter `q` as their callee,
+// each positional with `n` closed arguments whose types match `at`'s (the first fills it); -1
+// when one does not.
+function ftParamCallsAt(body: i32, q: i32, n: i32, at: i32[]): i32 {
+  let calls = 0
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if yn is Call && identDeclOf(parenPeelIx(yn.callFn)) == q {
+        calls = calls + 1
+        if yn.callArgs.length != n || !ftArgIsParam(yn, n - 1) && n > 0 {
+          return -1
+        }
+        let k = 0
+        while k < n {
+          const t = nodeTyIxOf(yn.callArgs[k])
+          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return -1 }
+          if at.length < n { at.push(t) }
+          else if !tySame(at[k], t) { return -1 }
+          k = k + 1
+        }
+      }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  calls
+}
+
+// `ftParamCallsAt` over parameter `q` and every binding under `body` initialised to `q` or to
+// another such binding and never stored to, the calls agreeing on `at`; -1 when one does not.
+function holeParamCallsAt(body: i32, q: i32, n: i32, at: i32[]): i32 {
+  const names: i32[] = [q]
+  let i = 0
+  while i < names.length {
+    const todo: i32[] = [body]
+    while todo.length > 0 {
+      const y = todo.pop() ?? -1
+      if y >= 0 && y < P.nodes.length {
+        const yn = nodeAt(y)
+        if (
+          yn is LetDecl
+          && yn.letInit >= 0
+          && (yn.letKw == "const" || !holeLetStored(body, y))
+        ) {
+          const v = parenPeelIx(yn.letInit)
+          if (
+            v >= 0
+            && v < P.nodes.length
+            && nodeAt(v) is Ident
+            && identDeclOf(v) == names[i]
+            && !i32ListHas(names, y)
+          ) {
+            names.push(y)
+          }
+        }
+        nodeChildrenPush(y, todo)
+      }
+    }
+    i = i + 1
+  }
+  let calls = 0
+  for d in names {
+    const c = ftParamCallsAt(body, d, n, at)
+    if c < 0 { return -1 }
+    calls = calls + c
+  }
+  calls
+}
+
+// Whether a plain or compound store under `body` writes binding `d`.
+function holeLetStored(body: i32, d: i32): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      const yn = nodeAt(y)
+      if (
+        yn is BinExpr
+        && yn.binOp == "="
+        && identDeclOf(parenPeelIx(yn.binLeft)) == d
+      ) {
+        return true
+      }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  false
+}
+
+// How many reads of parameter `q` lie under `body`.
+function ftParamReads(body: i32, q: i32): i32 {
+  let reads = 0
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const y = todo.pop() ?? -1
+    if y >= 0 && y < P.nodes.length {
+      if nodeAt(y) is Ident && identDeclOf(y) == q { reads = reads + 1 }
+      nodeChildrenPush(y, todo)
+    }
+  }
+  reads
+}
+
+// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
+// before it.
+export function ftArgIsParam(c: Call, i: i32): boolean {
+  if i < 0 || i >= c.callArgs.length { return false }
+  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+  let j = 0
+  while j <= i {
+    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
+    j = j + 1
+  }
+  true
 }
 
 // Whether hole call argument `a` is a lambda literal whose type is still open.
@@ -8682,17 +9008,18 @@ function holeCallOfArg(calleeFn: i32, a: i32, pj: i32): i32 {
 }
 
 // The index in `vNames` of the hole parameter of declared function `calleeFn` that call `n`
-// calls by name, or -1.
+// calls, matched by declaration so a shadowing binding is not it; -1 when none.
 function holeParamIndexOfCall(n: Call, vNames: string[], calleeFn: i32): i32 {
   if calleeFn < 0 || calleeFn >= P.nodes.length || n.callFn < 0 { return -1 }
   if n.callFn >= P.nodes.length { return -1 }
   const f = nodeAt(calleeFn)
-  const cf = nodeAt(n.callFn)
+  const cf = nodeAt(parenPeelIx(n.callFn))
   if !(f is FuncDecl) || !(cf is Ident) { return -1 }
+  const q = identDeclOf(parenPeelIx(n.callFn))
   let pi = 0
   while pi < f.fnParams.length {
     const p = nodeAt(f.fnParams[pi])
-    if p is Param && p.parName == cf.identName && p.parType < 0 {
+    if p is Param && f.fnParams[pi] == q && p.parType < 0 {
       let i = 0
       const hn = paramHoleName(f.fnName, calleeFn, pi)
       while i < vNames.length {
@@ -9827,7 +10154,7 @@ function bindFnRetUnionDefault(
 function bindFnRetOpenDefault(open: i32, uNames: string[], uTys: i32[]) {
   if open < 0 || open >= T.tys.length { return 0 }
   let ov = tyAt(open)
-  if ov is TyArray && ov.aElem >= 0 { ov = tyAt(ov.aElem) }
+  if ov is TyArray && !tyOpen(ov.aElem) { ov = tyAt(ov.aElem) }
   if !(ov is TyVar) || bindOf(uNames, uTys, ov.tvName) >= 0 { return 0 }
   uNames.push(ov.tvName)
   uTys.push(TY_I32)

@@ -6,7 +6,7 @@
 #   branching — --branching, report-only (--experimental)
 #   multiobs  — --branching --multiobs, report-only
 #   declared  — --branching --multiobs --declared, report-only
-#   oracle    — scripts/oracle/fuzz.sh: arithmetic and rep programs run compiled and in the
+#   oracle    — scripts/oracle/fuzz.sh --gen all: arithmetic, data and rep programs run compiled and in the
 #               independent oracle; GATES on a disagreement scripts/oracle/known.txt does not list
 # Legs run sequentially (each already saturates the cores); per-leg out-dirs land under ONE
 # sweep dir with the same layout the workflow artifacted (seed_*.tsv / keep_* / summary.md).
@@ -78,7 +78,7 @@ for leg in $LEGS; do
     oracle)
       echo; echo "==== leg: oracle ===="
       mkdir -p "$OUT/oracle"
-      if ! ./scripts/oracle/fuzz.sh --seeds "$SEEDS" --count "$COUNT" --keep "$OUT/oracle" | tee "$OUT/oracle/summary.md"; then
+      if ! ./scripts/oracle/fuzz.sh --seeds "$SEEDS" --count "$COUNT" --gen all --keep "$OUT/oracle" | tee "$OUT/oracle/summary.md"; then
         fail=1
       fi ;;
     *) echo "unknown leg: $leg"; exit 2 ;;

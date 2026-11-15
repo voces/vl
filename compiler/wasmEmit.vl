@@ -223,6 +223,7 @@ import {
   tyMayHoldFn,
   tyNulLitUnionInner,
   tyNulNumScalarValKind,
+  tyOpen,
   tyPrimNameIs,
   tyPrimNameOf,
   tySame,
@@ -4671,6 +4672,14 @@ function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
 function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
   // An exact instance knows the member the niche holds: its twin shares the pattern's row (D2753).
   if exactUnionLacksTwin(recvIx, ity, fnIx) { return true }
+  // A record niche holds the instance's own record, so a tested record the `is` relation says
+  // it never is cannot be the value, and the test is not the null check (D16370).
+  if tyIsRecord(ity) {
+    const inner = nullableInnerOrNone(instanceReadTyOf(recvIx, fnIx))
+    if inner >= 0 && tyIsRecord(inner) && isTestAnswer(inner, ity) == 0 {
+      return true
+    }
+  }
   // A map niche holds one map type: a pattern naming another map is never it (D2493).
   if unMemIsMap(ity) && !exprUnion(recvIx, fnIx) {
     // An instance parameter's pin names the niche's map exactly; a spelling needs the lenient
@@ -6369,6 +6378,21 @@ function isTestedEveryMember(op: i32, t: i32): boolean {
   true
 }
 
+// Whether every operand arm (`opTags`/`opVis`) holding tag `tag` is among the tested `isVis`.
+function isTagWhollyTested(
+  tag: i32,
+  opTags: i32[],
+  opVis: i32[],
+  isVis: i32[],
+): boolean {
+  let i = 0
+  while i < opTags.length && i < opVis.length {
+    if opTags[i] == tag && !i32ListHas(isVis, opVis[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Whether closed record or list type `op` is the tested type `t` itself.
 function isPinOwn(op: i32, t: i32): boolean {
   if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
@@ -7180,9 +7204,24 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
       let chainOk = isTags.length > 1
         && exprUnion(nd.isObj, fnIx)
         && unionEqOperandOk(nd.isObj)
+      // A variant told apart by a field's value shares its tag; the tag alone answers where
+      // every operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
+      const opTags: i32[] = []
+      const opVis: i32[] = []
+      const opArms = unionArmTagsOfTy(
+        nodeTyAt(nd.isObj, fnIx),
+        -1,
+        opTags,
+        opVis,
+      )
       let ci = 0
       while ci < isVis.length {
-        if variantHasDiscrimField(isVis[ci]) { chainOk = false }
+        if (
+          variantHasDiscrimField(isVis[ci])
+          && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
+        ) {
+          chainOk = false
+        }
         ci = ci + 1
       }
       if chainOk {
@@ -38255,7 +38294,7 @@ function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   }
   // A list element is the null of the element its list literal is built at (D16311), whatever
   // the element's own stamp names: a null-only literal is built at its destinations'
-  // (D16316; unfiled: D16316).
+  // (D16316).
   const lo = ctxElemOwnerOf(parenPeelIx(exprIx))
   if lo >= 0 {
     const lt = listLitBuiltTy(lo, fnIx)
@@ -38283,7 +38322,7 @@ function listLitBuiltTy(lo: i32, fnIx: i32): i32 {
       const n = tyAt(t)
       if (
         n is TyArray
-        && n.aElem >= 0
+        && !tyOpen(n.aElem)
         && !isNullTy(n.aElem)
         && tyAdmitsNull(n.aElem)
       ) {

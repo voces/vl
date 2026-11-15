@@ -6,9 +6,10 @@
 // Per compiler module it counts three things. `hidden`: the module's `let`s some function saves
 // (`const L = G`) and then writes, so that the global carries an argument or a dynamic scope.
 // `cross`: the module's state written in one phase and read in another, or written by two phases.
-// `surface`: for a non-checker module, the distinct checker symbols it imports. `--check` exits 1
-// when any count is above `scripts/phase-state-baseline.txt`, or a module it does not list has
-// one; a count that fell prints and passes. `--write-baseline` records the current counts.
+// `surface`: for a non-checker module, the checker symbols it imports, less the type-arena accessors
+// (`TY_ARENA_API`), which print as `arena`. `--check` exits 1 when any count is above
+// `scripts/phase-state-baseline.txt`, or a module it does not list has one; a count that fell
+// prints and passes. `--write-baseline` records the current counts.
 // Phases are assigned by file name (`phaseOf`). Run it from the checkout root.
 
 import { IoError, writeTextFile } from "std:fs"
@@ -32,6 +33,15 @@ import {
 const TOOL = "phase-state-census"
 const BASELINE = "scripts/phase-state-baseline.txt"
 const METRICS = ["hidden", "cross", "surface"]
+
+// The type arena's structural accessors: a child, its openness or its pin, read by type id. They
+// are the session's type interner (design note §2.1), not checker facts, so `surface` leaves them
+// out and reports them as `arena`. Each must be an export of `check_types.vl` until the arena has
+// its own module, and an accessor added there is listed here in the same PR.
+const TY_ARENA_API = [
+  "declKeyOf", "tyOpen", "tyPinElem", "tyPinKey", "tyPinVal",
+]
+const TY_ARENA_MOD = "check_types.vl"
 
 // One compiler module: its name (`ast.vl`), phase, comment-cut lines, top-level functions, and
 // its imports from sibling modules, local name to `[module, exported name]`.
@@ -328,7 +338,12 @@ function isLiteralReset(rhs: string): boolean {
 }
 
 // The counts, per metric then per module.
-type Counts = { by: {[string]: {[string]: i32}}, list: string[], distinct: i32 }
+type Counts = {
+  by: {[string]: {[string]: i32}},
+  list: string[],
+  distinct: i32,
+  arena: i32,
+}
 
 function census(root: string): Counts {
   const mods: Mod[] = []
@@ -349,6 +364,7 @@ function census(root: string): Counts {
     )
     raws.push(raw)
   }
+  arenaListed(mods, raws)
   const ixs: {[string]: i32[][]}[] = []
   for m in mods { ixs.push(wordIndex(m.lines)) }
   const modIx: {[string]: i32} = Map()
@@ -545,13 +561,16 @@ function census(root: string): Counts {
   // The checker's surface: distinct checker symbols each non-checker module imports.
   const surface = by["surface"] ?? Map()
   const syms: {[string]: boolean} = Map()
+  let arena = 0
   for md in mods {
     if md.phase != "check" {
       let c = 0
       for local in md.imp.keys() {
         const im = md.imp[local] ?? []
         const src = modIx[im[0]] ?? -1
-        if src >= 0 && mods[src].phase == "check" {
+        if src >= 0 && im[0] == TY_ARENA_MOD && has(TY_ARENA_API, im[1]) {
+          arena = arena + 1
+        } else if src >= 0 && mods[src].phase == "check" {
           c = c + 1
           syms[im[0] + "#" + im[1]] = true
         }
@@ -561,7 +580,30 @@ function census(root: string): Counts {
   }
   let distinct = 0
   for _ in syms.keys() { distinct = distinct + 1 }
-  { by: by, list: list, distinct: distinct }
+  { by: by, list: list, distinct: distinct, arena: arena }
+}
+
+// Every `TY_ARENA_API` name is an export of `TY_ARENA_MOD`, when that module is in the tree, so
+// the list cannot outlive an accessor.
+function arenaListed(mods: readonly Mod[], raws: readonly string[][]) {
+  let m = 0
+  while m < mods.length {
+    if mods[m].file == TY_ARENA_MOD {
+      for name in TY_ARENA_API {
+        let found = false
+        for l in raws[m] {
+          if startsWith(l, "export function " + name + "(") { found = true }
+        }
+        if !found {
+          die(
+            "\{TOOL}: TY_ARENA_API lists \{name}, which \{TY_ARENA_MOD} does not export",
+            2,
+          )
+        }
+      }
+    }
+    m = m + 1
+  }
 }
 
 function df2(mods: readonly Mod[], d: Decl): string {
@@ -669,7 +711,7 @@ function main() {
   print("hidden \{totalOf(c.by["hidden"] ?? Map())} globals")
   print("cross \{totalOf(c.by["cross"] ?? Map())} tables")
   print(
-    "surface \{totalOf(c.by["surface"] ?? Map())} imports of \{c.distinct} distinct checker symbols",
+    "surface \{totalOf(c.by["surface"] ?? Map())} imports of \{c.distinct} distinct checker symbols, beside \{c.arena} imports of the type-arena accessors",
   )
   if mode == "--list" {
     for l in c.list { print(l) }

@@ -166,6 +166,7 @@ import {
   tyIsNullableLitUnion,
   tyIxIsVariantMember,
   tyMutEpoch,
+  tyOpen,
   tyPrimNameIs,
   tySame,
   tyToStrUser,
@@ -3308,7 +3309,7 @@ function repTreeAtomOf(ix: i32): i32 {
     RAtom => 1
     // The atom sentinel discipline is the nullable atom.
     RNullable => if n.rnDisc == 3 { 1 } else { 0 }
-    RPrim | RList | RMap | RBox | RClosure | RRecord | RUnsup => 0
+    RPrim | RList | RMap | RBox | RClosure | RRecord | RUnsup | RNoValue => 0
   }
 }
 
@@ -3843,13 +3844,27 @@ function repNulObjKind(objTy: i32): VKind {
   if repVariantShapeRowOf(objTy) >= 0 { "nulvariant" } else { "nulstruct" }
 }
 
-// Whether record type `ty` is a union arm: the checker registered a member of its shape, or a
-// variant row has its shape. Records are structural (D3870), so an instance, inferred or
-// twin spelling of an arm is that arm. A `new` record, and a declared struct with its own row,
-// match by index alone. Every variant-or-struct reader in the rep layer asks this.
+// Whether record type `ty` is a union arm, by the checker's members or elaboration's union-arm
+// types (bits 1 and 4), never the emitter's own variant rows, so its rep is a fact of its type.
+// Records are structural (D3870), so any spelling of an arm is that arm; a `new` record, and a
+// declared struct with its own row, match by index alone.
 export function repTyIsVariant(ty: i32): boolean {
   if tyIxIsVariantMember(ty) { return true }
-  repVariantShapeHas(ty, 7)
+  const v = repVariantShapeHas(ty, 5)
+  if repShadowOn { repArmSourceNote(ty, v) }
+  v
+}
+
+// The arm-source probe, armed with the shadow: each record type the emitter's variant rows hold
+// as an arm (bit 2) that no checker or elaboration fact does.
+let repArmNoted: {[i32]: boolean} = Map()
+
+function repArmSourceNote(ty: i32, v: boolean) {
+  if repArmNoted[ty] ?? false { return 0 }
+  repArmNoted[ty] = true
+  if v { return rtCountAdd("arm/checker", 1) }
+  if repVariantShapeHas(ty, 2) { rtCountAdd("arm/emitOnly", 1) }
+  0
 }
 
 // Whether record type `ty` has the shape of an arm the variant table holds, and no declared
@@ -3930,6 +3945,10 @@ export function repDeclRowsPending(tys: i32[]) {
 // generation moves.
 let rvsBits: {[i32]: i32} = Map()
 
+// Canonical shape id → the tree's input bits (1 and 4) any build of this program has met. A whole
+// reset re-adds the same bits, so only a bit new to this map drops the tree.
+let rvsTreeBits: {[i32]: i32} = Map()
+
 // Canonical shape id → the first variant row carrying it.
 let rvsRow: {[i32]: i32} = Map()
 
@@ -3956,18 +3975,19 @@ const rvsKey = memoKeyNew(4)
 function rvsSync() {
   let moved = memoMoved3(rvsKey, tyMutEpoch, cUserTypesVer, uVarTyIxResets)
   moved = memoPassMoved(rvsKey, 3) || moved
-  if (
-    moved
-    || cVariantMemberTyIxs.length < rvsChkUpTo
-    || uVarTyIx.length < rvsRowUpTo
-  ) {
+  const memberShrank = cVariantMemberTyIxs.length < rvsChkUpTo
+  if (moved || memberShrank || uVarTyIx.length < rvsRowUpTo) {
     rvsBits = Map()
     rvsRow = Map()
     rvsChkUpTo = 0
     rvsPreUpTo = 0
     rvsRowUpTo = 0
     rvsBuilds = rvsBuilds + 1
-    repTreeDrop("variants")
+    // The tree reads bits 1 and 4 alone; only the checker's member list shrinking removes one.
+    if memberShrank {
+      rvsTreeBits = Map()
+      repTreeDrop("variants")
+    }
   }
   while rvsChkUpTo < cVariantMemberTyIxs.length {
     rvsAdd(cVariantMemberTyIxs[rvsChkUpTo], 1)
@@ -3993,9 +4013,14 @@ function rvsAdd(ty: i32, bit: i32): i32 {
   let b = 0
   const hit = rvsBits[c]
   if hit != null { b = hit }
-  if (b | bit) != b {
-    rvsBits[c] = b | bit
-    repTreeDrop("variantBit")
+  if (b | bit) != b { rvsBits[c] = b | bit }
+  // Bit 2 is no tree input (`repTyIsVariant`), so only a checker or elaboration bit drops it.
+  if (bit & 5) != 0 {
+    const tb = rvsTreeBits[c] ?? 0
+    if (tb | bit) != tb {
+      rvsTreeBits[c] = tb | bit
+      repTreeDrop("variantBit" + i32ToStr(bit))
+    }
   }
   c
 }
@@ -4152,12 +4177,12 @@ function repOfTyAtNode(nodeIx: i32, ty: i32): RepDesc {
   if h < 0 || ty != nodeTyIxOf(nodeIx) { return repOfTy(ty) }
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem < 0 { return repOfListOf(h, false) }
+    if tyOpen(t.aElem) { return repOfListOf(h, false) }
   }
   if t is TyNullable && t.nInner >= 0 {
     const it = tyAt(t.nInner)
     if it is TyArray {
-      if it.aElem < 0 { return repOfListOf(h, true) }
+      if tyOpen(it.aElem) { return repOfListOf(h, true) }
     }
   }
   repOfTy(ty)
@@ -4260,6 +4285,7 @@ let repGen = 0
 
 export function repReset() {
   rtCountReset()
+  rvsTreeBits = Map()
   rvsPreTys = []
   rvsPreUpTo = 0
   rvsAnswered = Map()
@@ -4421,6 +4447,8 @@ type RClosure = { rcParams: i32[], rcRet: i32, rcVoid: boolean }
 type RRecord = { rrFields: i32[], rrVariant: boolean }
 type RNullable = { rnInner: i32, rnDisc: i32 }
 type RUnsup = { ruReason: string }
+// `never`: a type no value has. A result of it returns nothing; elsewhere it has no flat kind.
+type RNoValue = { nvNever: boolean }
 type RepNode = RPrim
   | RAtom
   | RList
@@ -4430,6 +4458,7 @@ type RepNode = RPrim
   | RRecord
   | RNullable
   | RUnsup
+  | RNoValue
 
 let rtNode: RepNode[] = []
 // The arena index that built each node: provenance a reader may consult, never identity (a
@@ -4506,6 +4535,7 @@ function rtRebuildNote() {
 
 // Forgets the previous build, at the start of each program's emit.
 function rtCountReset() {
+  repArmNoted = Map()
   rtDropCause = "first"
   rtBuiltAny = false
   rtBuiltEpoch = -1
@@ -4634,6 +4664,9 @@ function rtKeyOf(n: RepNode, ty: i32): i32 {
       args.push(rtStrId(n.ruReason))
       return internIdIn(rtKeys, 8, args, 0)
     }
+    RNoValue => {
+      return internIdIn(rtKeys, 9, args, 0)
+    }
   }
 }
 
@@ -4691,7 +4724,7 @@ function rtComplete(ix: i32, ty: i32): i32 {
 function rtKidsOf(ix: i32): i32[] {
   const n = rtNode[ix]
   match n {
-    RPrim | RAtom | RUnsup => []
+    RPrim | RAtom | RUnsup | RNoValue => []
     RList => [n.rlsElem]
     RMap => [n.rmVal]
     RNullable => [n.rnInner]
@@ -4743,7 +4776,7 @@ function rtGo(ty0: i32): i32 {
       return rtOfNullable(ty, t.nInner)
     }
     TyArray => {
-      if t.aElem < 0 { return rtUnsup("list:hole", ty) }
+      if tyOpen(t.aElem) { return rtUnsup("list:hole", ty) }
       const ln: RList = { rlsElem: -1 }
       const ix = rtAlloc(ln, ty)
       rtByTyPut(ty, ix)
@@ -4793,7 +4826,8 @@ function rtOfPrim(pn: PrimName, ty: i32): i32 {
   if pn == "void" { return rtPrimLeaf("i32", ty) }
   if pn == "null" { return rtPrimLeaf("null", ty) }
   if pn == "v128" { return rtPrimLeaf("v128", ty) }
-  // `never` (and any future prim) — no standalone rep policy.
+  if pn == "never" { return rtLeafOf({ nvNever: true }, ty) }
+  // Any future prim has no standalone rep policy.
   rtUnsup("prim:" + primNameStr(pn), ty)
 }
 
@@ -5010,7 +5044,7 @@ function repTreeVKind(ix: i32): VKind | null {
     RRecord => if n.rrVariant { "variant" } else { "struct" }
     RList => rtListVKind(n.rlsElem)
     RNullable => rtNulVKind(ix)
-    RUnsup => null
+    RUnsup | RNoValue => null
   }
 }
 
@@ -5033,7 +5067,7 @@ function rtListVKind(elem: i32): VKind | null {
   // A list element is never a raw value box unless a registry row makes it a reference, so a
   // new element kind decides its list vocabulary here.
   match n {
-    RUnsup => null
+    RUnsup | RNoValue => null
     // Atom elements share the i32-list backing (interned i32 ids).
     RAtom => "list"
     RPrim => rtPrimListVKind(n.rpK)
@@ -5123,7 +5157,7 @@ function rtNulNicheElemName(elem: i32): string {
     RMap => "map"
     RList => "list"
     // A box inner takes a box, never a niche.
-    RAtom | RBox | RNullable | RUnsup => ""
+    RAtom | RBox | RNullable | RUnsup | RNoValue => ""
   }
 }
 
@@ -5176,8 +5210,14 @@ function rtNulVKind(ix: i32): VKind | null {
     RMap => "nulmap"
     RList => rtNulListOf(rtListVKind(n.rlsElem))
     // A box, nested nullable or unsup inner has no nullable kind of its own.
-    RAtom | RBox | RNullable | RUnsup => null
+    RAtom | RBox | RNullable | RUnsup | RNoValue => null
   }
+}
+
+// Whether the tree has type `ty` as a type no value has, so a result of it returns nothing.
+export function repTyHasNoValue(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  rtNode[repTreeOfTy(ty)] is RNoValue
 }
 
 // The tree's `rdNul` projection: the null discipline of the TOP node.
@@ -5188,7 +5228,7 @@ function repTreeNulOf(ix: i32): i32 {
     RNullable => n.rnDisc
     // `null` itself is the null of the niche discipline.
     RPrim => if n.rpK == "null" { 1 } else { 0 }
-    RAtom | RList | RMap | RBox | RClosure | RRecord | RUnsup => 0
+    RAtom | RList | RMap | RBox | RClosure | RRecord | RUnsup | RNoValue => 0
   }
 }
 
@@ -5218,7 +5258,7 @@ function rtElemName(elem: i32): string {
     RList => "list"
     RNullable => rtNulElemName(elem)
     RBox => if rtIsRecordJoin(elem) { "struct" } else { "union" }
-    RUnsup => ""
+    RUnsup | RNoValue => ""
   }
 }
 
