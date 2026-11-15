@@ -31,15 +31,18 @@ export function interpret(src: string, fuel = 2_000_000): Outcome {
 }
 
 // One cell's verdict, from the oracle's outcome and the compiled side's.
-//   AGREE        both ran and printed the same thing, or both refused/trapped alike
+//   AGREE        both ran and printed the same thing, both trapped, or the checker refused and
+//                the oracle faulted
 //   DISAGREE     the compiled program ran and printed something else, or trapped where the oracle ran
 //   UNSOUND      the checker accepted a program the oracle caught putting a value where its type forbids
 //   COMPILED-BAD the compiled side failed (invalid wasm, trap, wrong value) and the oracle ran it
 //   ORACLE-RUNS-REJECTED  `vl check` refused it, the oracle ran it to the expected output (clause-2 evidence)
+//   REFUSED      `vl check` refused it and the oracle ran it (no expectation to compare): counted,
+//                never agreement; fuzz.sh bounds a generator's share of these
 //   REFUSED-FILED the compile failed with a refusal a known.txt row names (`diff` only): loud, filed,
 //                 counted per row, not a miscompile
 //   SKIP         outside the oracle subset
-export type Verdict = "AGREE" | "DISAGREE" | "UNSOUND" | "COMPILED-BAD" | "REFUSED-FILED" | "ORACLE-RUNS-REJECTED" | "SKIP";
+export type Verdict = "AGREE" | "DISAGREE" | "UNSOUND" | "COMPILED-BAD" | "REFUSED-FILED" | "REFUSED" | "ORACLE-RUNS-REJECTED" | "SKIP";
 
 export type Compiled = { cls: "runs" | "rejected" | "trap" | "invalid" | "wrong"; out: string[] | null };
 
@@ -51,9 +54,11 @@ export function judge(o: Outcome, c: Compiled, expect: string[] | null): { v: Ve
     if (c.cls === "rejected") return { v: "AGREE", why: "checker refused; oracle faulted: " + o.msg };
     return { v: "UNSOUND", why: o.msg };
   }
+  // A refusal agrees only with an oracle that refuses too; one the oracle runs (to output or a
+  // trap) is REFUSED, its own count, so a refused population can never read as agreement.
   if (c.cls === "rejected") {
     if (o.kind === "ok" && expect && same(o.out, expect)) return { v: "ORACLE-RUNS-REJECTED", why: "" };
-    return { v: "AGREE", why: "checker refused" };
+    return { v: "REFUSED", why: o.kind === "trap" ? `checker refused; oracle traps (${o.msg})` : "checker refused; oracle ran" };
   }
   if (o.kind === "trap") {
     if (c.cls === "trap") return { v: "AGREE", why: "both trap" };

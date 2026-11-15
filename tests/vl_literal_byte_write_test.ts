@@ -11,8 +11,8 @@ import { COMPILER, exists } from "./support/tree.ts";
 
 const CODE = "literal-byte-write";
 
-const SRC = `function wU8(b: i32) { b }
-function fb(n: i32) { n }
+const SRC = `function wU8(b: i32) { return b }
+function fb(n: i32) { return n }
 function go(n: i32) {
   wU8(127)
   wU8(0x7f)
@@ -21,9 +21,9 @@ function go(n: i32) {
   // wU8(9) in a comment
   const s = "wU8(10) in a string"
   myWU8(3)
-  s.length
+  return s.length
 }
-function myWU8(b: i32) { b }
+function myWU8(b: i32) { return b }
 go(1)
 `;
 

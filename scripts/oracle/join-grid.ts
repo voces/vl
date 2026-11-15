@@ -10,7 +10,7 @@ const KIND = `function kind<T>(v: T): string {
   if v is i64 { return "i64" }
   if v is f32 { return "f32" }
   if v is f64 { return "f64" }
-  "other"
+  return "other"
 }`;
 const ARG: Record<string, string> = { i32: "3", i64: "3000000000", f32: "1.5", f64: "1.5" };
 
