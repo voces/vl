@@ -10,7 +10,7 @@ record meets a type variable, not the first record. Each `{ ys: [] }` keeps its 
 The first is pinned `f64` by `a[0].ys.push(0.5)`, the second defaults to `i32`, and the instance
 builds two record rows.
 
-## Change (net compiler lines +49; pin-helper delta 0)
+## Change (net compiler lines +51; pin-helper delta 0)
 
 - `holeElemRecLink` (`check_hole_rows`) records the first record written to a derived `HD_ELEM`
   hole. It is keyed by the base's `arrayDemandKey` in the map rows, under a key no hole name
