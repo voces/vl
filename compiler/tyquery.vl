@@ -471,10 +471,10 @@ export function unionFuncArmForArity(u: TyUnion, arity: i32) {
   }
   -1
 }
-// True if the union object arm `tyIx` can be both boxed into the union's `{tag, value}` rep and
-// have its narrowed fields read back with valid wasm — the safety gate for seeding a struct
-// literal into this arm. A scalar, nested struct or closure field has a sound variant-struct rep;
-// an array, union or nullable field has none, so an arm carrying one stays an un-seeded reject.
+// True if the union object arm `tyIx` can be seeded into: every field's type is resolved, so the
+// arm boxes into the union's `{tag, value}` rep and its narrowed fields read back at that type.
+// A field the arena has not resolved (a type variable, an error, a list of an unknown element)
+// declines the arm.
 function unionArmSeedSafe(tyIx: i32) {
   const safe: {[i32]: boolean} = Map()
   unionArmSeedSafeGo(tyIx, safe)
@@ -491,23 +491,14 @@ function unionArmSeedSafeGo(tyIx: i32, safe: {[i32]: boolean}): boolean {
   while i < ftys.length {
     const ft = tyAt(ftys[i])
     match ft {
-      // A scalar / string / boolean field boxes and reads cleanly; a closure field boxes into
-      // the variant struct, and a narrowed call is a loud reject.
-      TyPrim | TyFunc => {}
+      TyPrim | TyFunc | TyUnion | TyNullable | TyMap | TyNeg | TyLit => {}
       TyObj => {
         if !unionArmSeedSafeGo(ftys[i], safe) { return false }
       }
       TyArray => {
-        // A closure-array field (`f: ((i32) => K0)[]`): the reflist field boxes into the variant
-        // struct and a narrowed indexed call reads back the closure element, and the seed is what
-        // lets the element lambdas infer their params and result from the arm. Every other element
-        // rep keeps the un-seeded clean reject.
         if ft.aElem < 0 { return false }
-        const aet = tyAt(ft.aElem)
-        if !(aet is TyFunc) { return false }
       }
-      // A union / nullable / map field, or an unresolved one — no sound narrowed-read rep yet.
-      TyUnion | TyNullable | TyMap | TyNeg | TyVar | TyLit | TyErr => {
+      TyVar | TyErr => {
         return false
       }
     }
@@ -597,14 +588,65 @@ export function unionArrayArmForLit(u: TyUnion, arrIx: i32) {
               if ok { return m }
             }
           }
+          // A list of lists whose innermost element is a closure or a seed-safe record, met by a
+          // literal of list literals, is seeded level by level as the outer list is.
+          TyArray => {
+            if unionNestedArmSeeds(aeIx) && unionLitElemsAreLists(an) {
+              return m
+            }
+          }
           // No other element shape has a sound narrowed read; the scan moves to the next member.
-          TyPrim | TyUnion | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => {}
+          TyPrim | TyUnion | TyNullable | TyMap | TyNeg | TyVar | TyLit | TyErr => {}
         }
       }
       i = i + 1
     }
   }
   -1
+}
+
+// Whether the list type `t`'s innermost element, through every list level, is a closure or a
+// seed-safe record.
+function unionNestedArmSeeds(t: i32): boolean {
+  let cur = t
+  let depth = 0
+  while depth < 8 {
+    const e = tyArrayElemIx(cur)
+    if e < 0 { return false }
+    const et = tyAt(e)
+    match et {
+      TyFunc => {
+        return true
+      }
+      TyObj => {
+        return unionArmSeedSafe(e)
+      }
+      TyArray => {
+        cur = e
+      }
+      // No other innermost element has a sound narrowed read.
+      TyPrim | TyUnion | TyNullable | TyMap | TyNeg | TyVar | TyLit | TyErr => {
+        return false
+      }
+    }
+    depth = depth + 1
+  }
+  false
+}
+
+// Whether every element of the list literal `an` is, through parentheses, a list literal.
+function unionLitElemsAreLists(an: ArrayLit): boolean {
+  if an.arrElems.length == 0 { return false }
+  for e in an.arrElems {
+    let ei = e
+    let peeled = false
+    while !peeled {
+      const ep = nodeAt(ei)
+      if ep is Paren { ei = ep.parInner } else { peeled = true }
+    }
+    if !(nodeAt(ei) is ArrayLit) { return false }
+  }
+  true
 }
 
 // Whether `ty` is the `void` primitive, compared structurally — like `null`, `void` may be
