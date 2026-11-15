@@ -30,7 +30,7 @@ if (GATED && !ENABLED) {
 /** A `match` over `x` with one arm per value in `vals`, arm `k` yielding `k`, `_` yielding -1. */
 function matchFn(vals: number[], scrutTy = "i32"): string {
   const arms = vals.map((v, k) => `    ${v} => ${k}`).join("\n");
-  return `function f(x: ${scrutTy}) {\n  match x {\n${arms}\n    _ => -1\n  }\n}\n`;
+  return `function f(x: ${scrutTy}) {\n  return match x {\n${arms}\n    _ => -1\n  }\n}\n`;
 }
 
 const THOUSAND = Array.from({ length: 1000 }, (_, i) => i);
@@ -82,7 +82,7 @@ print("done")
   // over the temp is table-eligible like any other.
   computed_scrutinee: {
     src: `function g(x: i32) {
-  match x % 7 {
+  return match x % 7 {
     0 => 10
     1 => 11
     2 => 12
@@ -100,7 +100,7 @@ print(g(6))
     src: `let n = 5
 function next() {
   n = n + 1
-  n
+  return n
 }
 const r = match next() {
   5 => "five"
@@ -121,7 +121,7 @@ const B = 2
 const C = -3
 function dense(k: i32) {
   const D = 4
-  match k {
+  return match k {
     A => 10
     B => 20
     C => 30

@@ -720,9 +720,9 @@ print(b.v)                                  // 5
 // (p5) NON-generic alias over a function type + null union — RUNS
 type DecI = (Lex) => i32 | null
 const digit: DecI = (lx: Lex) => {
-  if lx.pos < lx.src.length { const c = lx.src[lx.pos]; lx.pos = lx.pos + 1; c - 48 } else { null }
+  return if lx.pos < lx.src.length { const c = lx.src[lx.pos]; lx.pos = lx.pos + 1; c - 48 } else { null }
 }
-function runI(d: DecI, lx: Lex): i32 | null { d(lx) }
+function runI(d: DecI, lx: Lex): i32 | null { return d(lx) }
 const lx: Lex = { src: "7", pos: 0 }
 const r = runI(digit, lx)
 if r == null { print("null") } else { print(r) }        // 7
@@ -733,13 +733,13 @@ if r == null { print("null") } else { print(r) }        // 7
 // This is the measurement behind F10: combinator decoding needs neither field
 // enumeration nor a bound, and it is not blocked — only its named alias is.
 type Lex = { src: string, pos: i32 }
-function runDec<T>(d: (Lex) => T, lx: Lex): T { d(lx) }
+function runDec<T>(d: (Lex) => T, lx: Lex): T { return d(lx) }
 function map2<A, B, C>(a: (Lex) => A, b: (Lex) => B, f: (A, B) => C, lx: Lex): C {
   const x = a(lx)
   const y = b(lx)
-  f(x, y)
+  return f(x, y)
 }
-const digit = (lx: Lex) => { const c = lx.src[lx.pos]; lx.pos = lx.pos + 1; c - 48 }
+const digit = (lx: Lex) => { const c = lx.src[lx.pos]; lx.pos = lx.pos + 1; return c - 48 }
 const lx: Lex = { src: "74", pos: 0 }
 print(map2(digit, digit, (p: i32, q: i32) => p * 10 + q, lx))    // 74
 ```
@@ -762,7 +762,7 @@ print(toString(i))                                                   // 90071992
 type A = { x: i32 }
 type B = { x: i32, y: i32 }
 type U1 = A | B
-function which(u: U1): string { if u is B { return "B" } "A" }
+function which(u: U1): string { if u is B { return "B" } return "A" }
 const wide: U1 = { x: 1, y: 2 }
 const narrow: U1 = { x: 1 }
 print(which(wide))                          // B
@@ -772,7 +772,7 @@ print(which(narrow))                        // A
 ```vl
 // p7 — F4: JSON's single number type merges VL's widths. This union runs today.
 type N = i32 | f64
-function kind(v: N): string { if v is i32 { return "i32" } "f64" }
+function kind(v: N): string { if v is i32 { return "i32" } return "f64" }
 const a: N = 1
 const b: N = 1.5
 print(kind(a))                              // i32
