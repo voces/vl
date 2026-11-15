@@ -35,7 +35,13 @@ import {
   fnTagCalls,
   fnTagHoldsTy,
 } from "./check_elab_cap"
-import { Ty, tyArrayElemIx, tyChildrenOf, tyHoldsObj } from "./check_types"
+import {
+  Ty,
+  tyArrayElemIx,
+  tyChildrenOf,
+  tyHoldsObj,
+  tyReachesEmptyHole,
+} from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { valueTailLeaves } from "./check_num_adopt"
 import { paramHoleName } from "./check_tp_join"
@@ -308,6 +314,7 @@ import {
   nodeTyIxOf,
 } from "./check_node_tys"
 import {
+  ctxElemOwnerOf,
   fvaBuilt,
   nodeCtxTyIxOf,
   nodeRepStamped,
@@ -18669,10 +18676,34 @@ function elabObjHoldsMap(t: i32, seen: i32[]): boolean {
   false
 }
 
-// Whether node `ix` is a list literal with no items.
+// Whether node `ix` is a list literal no item of which fixes its type: empty, or holding only
+// lists that are (`[[]]`).
 function litIsEmptyList(ix: i32): boolean {
   const n = nodeAt(ix)
-  if n is ArrayLit { n.arrElems.length == 0 } else { false }
+  if !(n is ArrayLit) { return false }
+  for e in n.arrElems {
+    if !litIsEmptyList(e) { return false }
+  }
+  true
+}
+
+// The closed type such a list has in `fnIx`'s instance: its own there, else the element of the
+// list literal holding it; -1 where neither closes.
+function litOpenListTyAt(ix: i32, fnIx: i32, depth: i32): i32 {
+  const ie = elabNodeTyAt(ix, fnIx)
+  if (
+    ie >= 0
+    && !tyHasTyVar(ie)
+    && !tyHasInferHole(ie, 0)
+    && !tyReachesEmptyHole(ie, 8)
+  ) {
+    return ie
+  }
+  const o = ctxElemOwnerOf(ix)
+  if depth > 8 || o < 0 || !litIsEmptyList(o) { return -1 }
+  const ot = litOpenListTyAt(o, fnIx, depth + 1)
+  const oa = if ot >= 0 { tyAt(ot) } else { null }
+  if oa is TyArray { tyElemOf(oa) } else { -1 }
 }
 
 // The type literal `ix` (or its copy source) is built at in emitted function `fnIx`'s instance:
@@ -18684,11 +18715,11 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const k = elabKeyAt(fnIx)
   const r = elabPairIn(elabNodeReps, ix, k)
   if r >= 0 { return r }
-  // An empty list has no item to fix its type, so an instance's own reading of it is where it
-  // is built, ahead of any stamp the instances share (D16510).
+  // A list no item of which fixes its type takes it from where it is delivered, so an
+  // instance's own reading of it is where it is built, ahead of any shared stamp (D16510).
   if k >= 0 && litIsEmptyList(ix) {
-    const ie = elabNodeTyAt(ix, fnIx)
-    if ie >= 0 && !tyHasTyVar(ie) && !tyHasInferHole(ie, 0) { return ie }
+    const ie = litOpenListTyAt(ix, fnIx, 0)
+    if ie >= 0 { return ie }
   }
   // The record solve's closed stamp is where the literal is built; the parameter its call
   // closes is only where it is delivered (D15288).
