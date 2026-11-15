@@ -13287,7 +13287,7 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
         "emitProgram: a spread's source is not a list this rep knows",
       )
     }
-    const ownRow = spreadDestRow(elems, fnIx)
+    const ownRow = spreadOwnRow(elems, fnIx)
     const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx, lb)
     const wrap = spreadWrapIdx(kk, row)
     const back = spreadBackIdx(kk, row)
@@ -13359,13 +13359,36 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
   emitFail("emitProgram: expected an array literal")
 }
 
+// The ref-list row spread source `src` is read at: the row of the list its delivery copies it
+// into (`recSpreadCallCopy`, D16444), else its own.
+function spreadSrcRow(src: i32, fnIx: i32): i32 {
+  const ct = listCopyAtNode(src)
+  const r = if ct >= 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
+  if r >= 0 { r } else { refListSlotOfExpr(src, fnIx) }
+}
+
+// `spreadDestRow`, its first source read at the row its delivery copies it into.
+function spreadOwnRow(elems: i32[], fnIx: i32): i32 {
+  const r = spreadDestRow(elems, fnIx)
+  for el in elems {
+    const src = spreadArgOf(el)
+    if src >= 0 {
+      const ct = listCopyAtNode(src)
+      const rl = ct >= 0 && mfRecvKindOf(src, fnIx) == "reflist"
+      const c = if rl { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
+      return if c >= 0 { c } else { r }
+    }
+  }
+  r
+}
+
 // The row spread group `grp` of a literal built at ref-list row `row` is read at: the group's
 // own row where it is an existing list whose element is a subtype of the row's, else `row`.
 function spreadGroupSubRow(grp: i32, kk: ListKind, row: i32, fnIx: i32): i32 {
   if kk != "reflist" { return row }
   const lit = unwrapParen(grp)
   if lit < 0 || nodeAt(lit) is ArrayLit { return row }
-  const s = refListSlotOfExpr(grp, fnIx)
+  const s = spreadSrcRow(grp, fnIx)
   if rlRowElemSubOf(s, row) { return s }
   row
 }
@@ -13399,7 +13422,7 @@ function spreadFreshDestRow(
       const lit = unwrapParen(src)
       const isLit = lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ArrayLit
       if !isLit {
-        const ss = refListSlotOfExpr(src, fnIx)
+        const ss = spreadSrcRow(src, fnIx)
         if ss != want && !rlRowElemSubOf(ss, want) { return own }
       }
     }
@@ -16963,16 +16986,7 @@ function emitListIdxGuard(wrapSlot: i32, lTy: i32) {
     fbStructGet(lTy, 1) // field 1: len
     fbI32Bin(79) // 0x4f i32.ge_u
     fbIf(64)
-    fbLocalGet(wrapSlot)
-    fbStructGet(lTy, 0)
-    if listBackIsRecord(back) {
-      fbLocalGet(wrapSlot)
-      fbStructGet(lTy, 0)
-      fbArrayLen()
-      fbLocalGet(wrapSlot)
-      fbStructGet(lTy, 0)
-    }
-    emitListIdxTrap(back)
+    emitListIdxTrapOf(back, wrapSlot, lTy, -1)
     fbEnd()
     fbLocalGet(wrapSlot)
     fbStructGet(lTy, 0) // field 0: backing
@@ -17020,6 +17034,38 @@ function listBackIsRecord(back: i32): boolean {
   false
 }
 
+// A guard's failing arm over backing `back` (local `backSlot`, else wrapper `wrapSlot`'s field 0).
+// A plain build reads index 0 of the module's one empty array of the backing's type, the same
+// bounds trap at the access without reloading the backing; `-O` keeps `emitListIdxTrap`, whose
+// trap binaryen shares between checks of one index.
+function emitListIdxTrapOf(back: i32, wrapSlot: i32, lTy: i32, backSlot: i32) {
+  const g = if gOptimized == 0 { synthGlobalIdx(SYNTH_EMPTY_BACKING, back) } else { -1 }
+  if g >= 0 {
+    fbGlobalGet(g)
+    fbI32Const(0)
+    fbArrayGet(back)
+    fbUnreachable()
+    return 0
+  }
+  emitListIdxBackRef(wrapSlot, lTy, backSlot)
+  if listBackIsRecord(back) {
+    emitListIdxBackRef(wrapSlot, lTy, backSlot)
+    fbArrayLen()
+    emitListIdxBackRef(wrapSlot, lTy, backSlot)
+  }
+  emitListIdxTrap(back)
+}
+
+// The backing ref `emitListIdxTrapOf` names: local `backSlot`, or field 0 of the wrapper.
+function emitListIdxBackRef(wrapSlot: i32, lTy: i32, backSlot: i32) {
+  if backSlot >= 0 {
+    fbLocalGet(backSlot)
+    return 0
+  }
+  fbLocalGet(wrapSlot)
+  fbStructGet(lTy, 0)
+}
+
 // Traps with the engine's own bounds trap from the guard's untaken branch: a read at -1 of the
 // backing, or for a record list (`listBackIsRecord`) a one-element copy to index `len` from
 // `[backing, len, backing]`. The closing `unreachable` lets `-O` drop a later check of the same
@@ -17050,13 +17096,7 @@ function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
     fbLocalGet(lhLen[row])
     fbI32Bin(79) // 0x4f i32.ge_u
     fbIf(64)
-    fbLocalGet(lhBack[row])
-    if listBackIsRecord(back) {
-      fbLocalGet(lhBack[row])
-      fbArrayLen()
-      fbLocalGet(lhBack[row])
-    }
-    emitListIdxTrap(back)
+    emitListIdxTrapOf(back, -1, -1, lhBack[row])
     fbEnd()
     fbLocalGet(lhBack[row])
     fbLocalGet(listIdxScratchBase)
@@ -29779,16 +29819,7 @@ function emitMapFilter(callIx: i32, fnIx: i32) {
       fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
       if isMap {
         fbIf(64)
-        fbLocalGet(srcL)
-        fbStructGet(srcWrap, 0)
-        if listBackIsRecord(srcBack) {
-          fbLocalGet(srcL)
-          fbStructGet(srcWrap, 0)
-          fbArrayLen()
-          fbLocalGet(srcL)
-          fbStructGet(srcWrap, 0)
-        }
-        emitListIdxTrap(srcBack)
+        emitListIdxTrapOf(srcBack, srcL, srcWrap, -1)
         fbEnd()
       } else {
         fbI32Eqz()
