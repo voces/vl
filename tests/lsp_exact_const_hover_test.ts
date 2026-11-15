@@ -32,7 +32,7 @@ const SRC = [
   /*  5 */ "const T = 1.0 / 3.0",
   /*  6 */ "const X: i64 = 5",
   /*  7 */ "let y = 3",
-  /*  8 */ "function f(): i32 { 7 }",
+  /*  8 */ "function f(): i32 { return 7 }",
   /*  9 */ "const N = f()",
   /* 10 */ "const a: i64 = SIZE",
   /* 11 */ "const b: i32 = SIZE",
@@ -218,7 +218,7 @@ Deno.test({ name: "exact-const hover: an exported const used from another module
 // column as `main`'s import specifier `BIG`; the hover there must not answer with util's value,
 // and references must not list util's occurrences as main's.
 Deno.test({ name: "exact-const hover: another module's occurrence at the same position is not this one", ignore }, async () => {
-  const util = "export const SIZE = 192\nexport const BIG = 5000000000\nexport function lf(x: i64): i64 { x + BIG }\n";
+  const util = "export const SIZE = 192\nexport const BIG = 5000000000\nexport function lf(x: i64): i64 { return x + BIG }\n";
   const main = 'import { SIZE, BIG, lf } from "./util"\nconst a: i64 = BIG\nprint(lf(a) + SIZE)\n';
   const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
   const got = await hoverAt(main, 0, 15, read);
@@ -236,7 +236,7 @@ Deno.test({ name: "exact-const hover: another module's occurrence at the same po
 // D3324's own witness: references to the imported `L` from the entry list the entry's read
 // only, never `lib.vl`'s declaration or its read inside `lf` as ranges of the entry.
 Deno.test({ name: "references: an imported name lists no other module's ranges (D3324)", ignore }, async () => {
-  const lib = "export const L = 0xFFFFFFFF\nexport function lf(x: i64): i64 { x + L }\n";
+  const lib = "export const L = 0xFFFFFFFF\nexport function lf(x: i64): i64 { return x + L }\n";
   const entry = 'import { L, lf } from "./lib"\nprint(lf(L))\n';
   const read = (key: string) => (key.endsWith("lib.vl") ? lib : undefined);
   const checker = loadWasmChecker(SEED, () => {})!;
@@ -250,7 +250,7 @@ Deno.test({ name: "references: an imported name lists no other module's ranges (
 // The member-access lookup had the same hole: `util`'s `p.s` sits at the line and column of
 // the entry's `rr.longname`, with a narrower span, and member hover answered `string`.
 Deno.test({ name: "member hover: another module's access at the same position is not this one", ignore }, async () => {
-  const util = "export type P = { ab: i32, s: string }\n\n\nexport function g(p: P): string { p.s }\n";
+  const util = "export type P = { ab: i32, s: string }\n\n\nexport function g(p: P): string { return p.s }\n";
   const col = util.split("\n")[3].indexOf("p.s") + 2;
   const entry = 'import { g } from "./util"\nconst rr = { longname: 5 }\nprint(g({ ab: 1, s: "x" }))\n' +
     `const zz${" ".repeat(col - 15)} = rr.longname\nprint(zz)\n`;

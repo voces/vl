@@ -1817,6 +1817,8 @@ export function elabWalkNarrowedTy(ix: i32): i32 {
 // The instances of nested declaration `d` under instance `k`: those under the parent key
 // `elabParentFor` names, narrowed to the ones `k`'s body reaches when that key holds several.
 function elabKidsAt(d: i32, k: i32): i32[] {
+  // Every instance is noted under its declaration, so one with none has none under any parent.
+  if (ekByDecl[d] ?? []).length == 0 { return [] }
   const parent = elabParentFor(d, k)
   if parent < -1 { return [] }
   const ks = ekKids[i32ToStr(parent) + "^" + i32ToStr(d)] ?? []
@@ -18681,10 +18683,43 @@ function elabObjHoldsMap(t: i32, seen: i32[]): boolean {
   return false
 }
 
-// Whether node `ix` is a list literal with no items.
+// Whether node `ix` is a list literal no item of which fixes its type: empty, or holding only
+// lists that are (`[[]]`).
 function litIsEmptyList(ix: i32): boolean {
   const n = nodeAt(ix)
-  return if n is ArrayLit { n.arrElems.length == 0 } else { false }
+  if !(n is ArrayLit) { return false }
+  for e in n.arrElems {
+    if !litIsEmptyList(e) { return false }
+  }
+  return true
+}
+
+// Whether list type `t` has a closed element at every depth.
+function litListTyClosed(t: i32, depth: i32): boolean {
+  if t < 0 || depth > 8 { return false }
+  const a = tyAt(t)
+  if !(a is TyArray) { return true }
+  if tyElemOpen(a) { return false }
+  return litListTyClosed(tyElemOf(a), depth + 1)
+}
+
+// The closed type such a list has in `fnIx`'s instance: its own there, else the element of the
+// list literal holding it (`elabArgInner`, noted as the holder resolves); -1 where neither closes.
+function litOpenListTyAt(ix: i32, fnIx: i32, depth: i32): i32 {
+  const ie = elabNodeTyAt(ix, fnIx)
+  if (
+    ie >= 0
+    && !tyHasTyVar(ie)
+    && !tyHasInferHole(ie, 0)
+    && litListTyClosed(ie, 0)
+  ) {
+    return ie
+  }
+  const o = elabArgInner[ix] ?? -1
+  if depth > 8 || o < 0 || !litIsEmptyList(o) { return -1 }
+  const ot = litOpenListTyAt(o, fnIx, depth + 1)
+  const oa = if ot >= 0 { tyAt(ot) } else { null }
+  return if oa is TyArray { tyElemOf(oa) } else { -1 }
 }
 
 // The type literal `ix` (or its copy source) is built at in emitted function `fnIx`'s instance:
@@ -18696,11 +18731,12 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const k = elabKeyAt(fnIx)
   const r = elabPairIn(elabNodeReps, ix, k)
   if r >= 0 { return r }
-  // An empty list has no item to fix its type, so an instance's own reading of it is where it
-  // is built, ahead of any stamp the instances share (D16510).
+  // A list no item of which fixes its type takes it from where it is delivered, so an
+  // instance's own reading of it is where it is built, ahead of any shared stamp (D16510).
   if k >= 0 && litIsEmptyList(ix) {
-    const ie = elabNodeTyAt(ix, fnIx)
-    if ie >= 0 && !tyHasTyVar(ie) && !tyHasInferHole(ie, 0) { return ie }
+    elabArgInnerNote(ix)
+    const ie = litOpenListTyAt(ix, fnIx, 0)
+    if ie >= 0 { return ie }
   }
   // The record solve's closed stamp is where the literal is built; the parameter its call
   // closes is only where it is delivered (D15288).

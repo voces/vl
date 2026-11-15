@@ -99,7 +99,7 @@ assuming they own offset 0:
 
 ```vl
 function counterInit() { __store_i32__(0, 100) }
-function counterBump() { __store_i32__(0, __load_i32__(0) + 1); 0 }
+function counterBump() { __store_i32__(0, __load_i32__(0) + 1); return 0 }
 function loggerStage(v: i32) { __store_i32__(0, 0); __store_i32__(4, v); __log__(0, 8) }
 counterInit(); counterBump(); loggerStage(7); counterBump()
 print(__load_i32__(0))      // → 1, not 102
