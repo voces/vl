@@ -110,7 +110,7 @@ Deno.test({ name: "utf16 columns: cursor queries reach the seed as bytes", ignor
   const checker = loadWasmChecker(SEED, log)!;
   for (const p of PREFIXES) {
     const line = `const s = "${p}"; const n: i32 = 1; print(f(n, n))`;
-    const src = `function f(a: i32, b: i32): i32 { a + b }\n${line}\nprint(s)\n`;
+    const src = `function f(a: i32, b: i32): i32 { return a + b }\n${line}\nprint(s)\n`;
     const use = line.lastIndexOf("n");
     const decl = line.indexOf("n:");
     eq(`[${p}] hover`, await checker.hoverTypeAt(src, KEY, noSiblings, 1, use), "i32");
@@ -158,7 +158,7 @@ Deno.test({ name: "utf16 columns: inlay hints, lint and extents", ignore }, asyn
 Deno.test({ name: "utf16 columns: cross-file positions use the SIBLING's text", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   for (const p of PREFIXES) {
-    const utilLine = `const pad = "${p}"; export function add(a: i32, b: i32): i32 { a + b }`;
+    const utilLine = `const pad = "${p}"; export function add(a: i32, b: i32): i32 { return a + b }`;
     const util = `${utilLine}\nprint(pad)\n`;
     const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
     const entryLine = `const z = "${p}${p}"; print(add(1, 2))`;

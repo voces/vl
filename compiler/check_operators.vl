@@ -186,7 +186,11 @@ import {
   inStrFix,
 } from "./check_diag_text"
 import { seedExpected } from "./check_expected"
-import { checkIdentityBinNode, fnEqRefused } from "./check_identity"
+import {
+  checkIdentityBinNode,
+  fnEqRefused,
+  uncomparableArmEqRefused,
+} from "./check_identity"
 import {
   adoptLitAt,
   atomHitStamp,
@@ -321,8 +325,9 @@ import {
   litTreeAdoptDst,
   litTreeTyOf,
   numCmpOp,
+  numLitAdoptCastDst,
+  numLitAdoptCastTails,
   numLitAdoptDeep,
-  numLitAdoptDst,
   numLitAdoptTails,
   radixTreeF64Pair,
   shiftKeepsLeft,
@@ -340,10 +345,11 @@ import {
   nlCmpdInner,
   nlCmpdTgt,
 } from "./check_num_lit_state"
-import { cexOk } from "./const_exact"
+import { cexLexeme, cexOk } from "./const_exact"
 import {
   binFloatOperandPair,
   binIntOnlyOp,
+  cexFitsAt,
   cexLitPeel,
   cmpF32LitAdopts,
   intLitLexemeOf,
@@ -432,6 +438,7 @@ import {
   TDiag,
   TY_BOOL,
   TY_ERR,
+  TY_F32,
   TY_F64,
   TY_I32,
   TY_I64,
@@ -1228,8 +1235,17 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       return joinArmLit(innerFull, false, rt, armLit(rt, n.binRight))
     }
     // When the default fits the non-null LHS type (with contextual coercion), the `??` result
-    // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`.
-    if assignableExpr(n.binRight, rt, innerFull) { return innerFull }
+    // IS that LHS type, not `joinTys`' LUB — which would widen a litunion field to `string`. An
+    // integer constant that side's number type cannot hold does not fit it: the join widens, as
+    // the `if` it spells does (ruling 4.3), rather than refusing the constant there.
+    const dcv = cexEvalAt(n.binRight, 0)
+    const dMisfit = cexOk(dcv)
+      && !dcv.cxFloat
+      && isNumericPrimTy(innerFull)
+      && !cexFitsAt(dcv, cexLexeme(dcv), innerFull)
+    if !dMisfit && assignableExpr(n.binRight, rt, innerFull) {
+      return innerFull
+    }
     // An existing record on either side is never widened in place: the join keeps it as a
     // member (record covariance A).
     njFixSet(recJoinFixed(n.binLeft), recJoinFixed(n.binRight))
@@ -1304,6 +1320,9 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   }
   // An identity compare is `===` spelled on this node, which the refusal does not govern.
   if n.binIdent == 0 && fnEqRefused(ix, op, lt, rt) { return TY_BOOL }
+  if n.binIdent == 0 && uncomparableArmEqRefused(ix, op, lt, rt) {
+    return TY_BOOL
+  }
   // Each operand is the other's destination: an empty `[]` inside one takes the element the
   // other side has, so both are built at one shape and compare (D5344).
   if !isNullTy(lt) && !isNullTy(rt) {
@@ -2354,18 +2373,18 @@ export function checkCastNode(n: AsExpr, ix: i32) {
     && (n.asMode != "wrap" || target != TY_I32)
     && !isFloatLitExpr(n.asObj)
   ) {
-    numLitAdoptDst(n.asObj, target)
+    numLitAdoptCastDst(n.asObj, target)
   }
-  // A value join is delivered to the cast's target as to a typed destination: literal tails
-  // adopt it, and a radix tail or tree reads at its width (ruling 4.3). A wrap cast keeps the
-  // 32-bit reading it names, and a float-literal tail its f64 value.
+  // A value join is delivered to a widening cast's target as to a typed destination: literal
+  // tails adopt it, and a radix tail or tree reads at its width (ruling 4.3). A narrowing cast is
+  // no destination for its operand, a wrap cast keeps its 32-bit reading, a float tail its f64.
   if (
-    isNumericPrimTy(target)
+    (target == TY_I64 || target == TY_F32 || target == TY_F64)
     && n.asMode != "wrap"
     && valueJoinAt(n.asObj) >= 0
     && !castTailFloatLit(n.asObj)
   ) {
-    numLitAdoptTails(n.asObj, target)
+    numLitAdoptCastTails(n.asObj, target)
     radixLitAdoptDst(n.asObj, target)
   }
   // The operand is staged at the kind the lowering converts from (`numCastStamp`).

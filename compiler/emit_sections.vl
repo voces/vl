@@ -17,6 +17,7 @@ import {
   mapCtorRowsMint,
   markInferredIfJoins,
   markTagCallJoins,
+  mvMapFieldWraps,
 } from "./emit_collect"
 import { elabStubArgsPrime } from "./elab_stub"
 import { mfrLitsRun } from "./mfr_shadow"
@@ -27,7 +28,7 @@ import { mfrLitsRun } from "./mfr_shadow"
 // model, per-function code emission, the opt-in name section). Sits above `wasmEmit.vl`, calling down into it for every statement/expression body.
 
 import { idShadowInstRow, idShadowSnap } from "./emit_id_shadow"
-import { canonRepFinal, canonShadowReport } from "./emit_ty_seal"
+import { canonRepFinal, canonShadowReport, sealEpoch } from "./emit_ty_seal"
 import { elabFnIdReset, elabSpecGroupRow, elabSpecReset } from "./elab_fn_id"
 import { idShadowModeOf } from "./id_shadow_state"
 import { lamChainSnap } from "./check_lam_chain"
@@ -35,6 +36,7 @@ import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowBegin } from "./box_dst_shadow"
 import { irShadowArmed, irShadowBegin, irShadowFn } from "./ir_build"
+import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
   nodeTyCarry,
@@ -102,7 +104,6 @@ import {
   hcReset,
   mapShapeKeyKind,
   msPoolReset,
-  mvSlotKeyKind,
   nullBoxTag,
   repKindOfSigTok,
   repNodeScalarMask,
@@ -674,6 +675,7 @@ import {
   mapTypeIdxOf,
   mvValElemHeapOf,
   mvValsBackOf,
+  mvValsWrapOf,
   packedStorageOf,
   pkBackAt,
   pkWrapAt,
@@ -950,7 +952,6 @@ import {
   maFoldCandidateCount,
   mapSetFnBody,
   mapSetFuncType,
-  mvValsWrapOf,
   sFieldStorageSlot,
   strAccScanStart,
   stubWriteRhsReset,
@@ -7494,6 +7495,7 @@ function emitProgramReset(rootIx: i32) {
   memoCompileReset()
   // Every module's per-compile scalars back to their declared values (lane L7).
   emitStateReset()
+  emitEpochAt = sealEpoch()
   rlMvTablesReset()
   localRegistryReset()
   wasmEmitStateReset()
@@ -7768,6 +7770,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   callBindShadowBegin()
   boxDstShadowBegin()
   irShadowBegin()
+  irRefInstall()
   tyHasFnMemoReset()
   identAuditBegin()
   const passDone: EmitPass[] = []
@@ -7820,8 +7823,17 @@ export function emitProgram(rootIx: i32) {
   const rc = emitProgramRun(rootIx)
   while T.diags.length > d0 { T.diags.pop() }
   canonShadowReport()
+  if rc >= 0 && sealEpoch() != emitEpochAt {
+    return emitFail(
+      "internal: an emit-phase write changed a type an emit memo may hold",
+    )
+  }
   return rc
 }
+
+// `tyEmitEpoch` at the per-program reset, where the window from `elabPrepare` (or an unprepared
+// `emitProgram`) to the end of emit opens: an emit memo may hold what a write that moves it changed.
+let emitEpochAt = 0
 
 // The root the elaboration last ran for at the end of check (`elabPrepare`), so emit reuses it;
 // -1 when emit has to run it itself.
@@ -8832,18 +8844,15 @@ function tsMvMap(mvs: i32) {
   // Field 0's type IS the second half of this slot's identity (`repMapValSlotsTwin`
   // refuses to twin across it), so it is read from the same column the resolvers key
   // on rather than assumed to be the string-ref list.
-  let mvKeysWrap = -1
-  if mvSlotKeyKind(mvs) == MAP_KEY_I32 { mvKeysWrap = lTy() }
-  else if mvSlotKeyKind(mvs) == MAP_KEY_I64 { mvKeysWrap = il64TypeIdx }
-  else { mvKeysWrap = mkListTy() }
+  const fw = mvMapFieldWraps(mvs)
   tsEntryAt(mvMapTypeIdx[mvs], "ref-valued map")
   wU8(95)              // 0x5f struct (ref-valued map)
   wU8(mapFieldCount()) // 7 fields (host-aligned open-addressing hash map), 9 with seqs
   wU8(100)             // field 0 keys: 0x64 (ref <this slot's keys wrapper>) — non-null
-  wSLEB(mvKeysWrap)
+  wSLEB(fw[0])
   wU8(1)               // mutable
   wU8(100)             // field 1 vals: 0x64 (ref <this slot's wrapper>)
-  wSLEB(mvValsWrapOf(mvs))
+  wSLEB(fw[1])
   wU8(1)               // mutable
   wU8(100)             // field 2 live: 0x64 (ref $aTypeIdx) — non-null i32 array
   wSLEB(aTy())

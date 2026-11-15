@@ -9765,6 +9765,7 @@ fn pump_session(
     stage_vl_root_and_cwd(&mut store, &inst)?;
     let keep_dir = keep_modules_dir(&mut store, &inst)?;
     arm_cls_census(&inst, &mut store);
+    arm_ir_shadow(&inst, &mut store);
     arm_opaque_snames(&inst, &mut store);
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
@@ -10119,6 +10120,10 @@ fn pump_session(
                 if cls_census_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_cls_census(&inst, &mut store, &p);
+                }
+                if ir_shadow_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_ir_shadow(&inst, &mut store, &p);
                 }
                 let mut bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
                 // THE SEAM. Between the emitter's bytes and the engine's verdict,

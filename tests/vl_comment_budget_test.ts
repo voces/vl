@@ -50,10 +50,10 @@ const FIXTURES: Fixture[] = [
     name: "clean.vl",
     src: `// The adder's invariant: both operands are already range-checked by
 // the caller, so this never traps.
-export function add(a: i32, b: i32): i32 { a + b }
+export function add(a: i32, b: i32): i32 { return a + b }
 
 // Scale by a constant; see DECISIONS.md for why the factor is not a parameter.
-export function scale(a: i32): i32 { a * 10 }
+export function scale(a: i32): i32 { return a * 10 }
 `,
     want: {},
   },
@@ -118,27 +118,27 @@ export function a(): i32 { dep() }
     src: `// A quiet first line, so the hit cannot just be the block's start.
 // It lands on THE SECOND LINE, where the capitals are.
 // A quiet third line, to pin that one block reports once.
-export function a(): i32 { 1 }
+export function a(): i32 { return 1 }
 
 // The pair WASM ABI is on the allow-list; \`ALPHA BETA\` sits in backticks.
 // Neither fires, and one shouted word alone is not a run: ONLY this.
-export function b(): i32 { 2 }
+export function b(): i32 { return 2 }
 
 // This line used to say something else.
 // A second line that was history too, to pin one report per block.
-export function c(): i32 { 3 }
+export function c(): i32 { return 3 }
 
 // The word \`was\` in backticks names a field, so this line is quiet.
-export function d(): i32 { 4 }
+export function d(): i32 { return 4 }
 
 // A date is history with no verb: 2026-09-02.
-export function e(): i32 { 5 }
+export function e(): i32 { return 5 }
 `,
     want: { [UNCITED]: [17], [SHOUTING]: [2], [HISTORY]: [10, 17] },
   },
 ];
 
-const DEP = `export function dep(): i32 { 7 }\n`;
+const DEP = `export function dep(): i32 { return 7 }\n`;
 
 type Hits = { lines: Record<string, number[]>; msgs: string[] };
 

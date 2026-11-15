@@ -40,7 +40,7 @@ const CHECKER = `export let seat = -1
 export function take(): i32 {
   const s = seat
   seat = -1
-  s
+  return s
 }
 `;
 const EMITTER = `import { seat, take } from "./check_seat"
@@ -58,7 +58,7 @@ export function walk(n: i32): i32 {
   depth = n
   const r = depth + 1
   depth = was
-  r
+  return r
 }
 `;
 
@@ -147,23 +147,23 @@ Deno.test({
 // The type-arena accessors are the session's interner, not checker facts: an import of one is
 // counted as `arena`, not `surface`, and a listed accessor the module does not export stops the
 // census.
-const ARENA = `export function tyPinElem(t: i32, v: i32): i32 { t + v }
-export function tyPinKey(t: i32, v: i32): i32 { t + v }
-export function tyPinVal(t: i32, v: i32): i32 { t + v }
-export function tyAt(t: i32): i32 { t }
-export function tyLinkElem(a: i32, b: i32): boolean { a == b }
-export function tyLinkKey(a: i32, b: i32): boolean { a == b }
-export function tyLinkVal(a: i32, b: i32): boolean { a == b }
-export function tyOpen(t: i32): boolean { t < 0 }
-export function declKeyOf(t: i32): i32 { t }
-export function holeReset(): i32 { 0 }
-export function tyElemOf(t: i32): i32 { t }
-export function tyKeyOf(t: i32): i32 { t }
-export function tyValOf(t: i32): i32 { t }
-export function tyElemOpen(t: i32): boolean { t < 0 }
-export function tyKeyOpen(t: i32): boolean { t < 0 }
-export function tyValOpen(t: i32): boolean { t < 0 }
-export function judge(t: i32): i32 { t }
+const ARENA = `export function tyPinElem(t: i32, v: i32): i32 { return t + v }
+export function tyPinKey(t: i32, v: i32): i32 { return t + v }
+export function tyPinVal(t: i32, v: i32): i32 { return t + v }
+export function tyAt(t: i32): i32 { return t }
+export function tyLinkElem(a: i32, b: i32): boolean { return a == b }
+export function tyLinkKey(a: i32, b: i32): boolean { return a == b }
+export function tyLinkVal(a: i32, b: i32): boolean { return a == b }
+export function tyOpen(t: i32): boolean { return t < 0 }
+export function declKeyOf(t: i32): i32 { return t }
+export function holeReset(): i32 { return 0 }
+export function tyElemOf(t: i32): i32 { return t }
+export function tyKeyOf(t: i32): i32 { return t }
+export function tyValOf(t: i32): i32 { return t }
+export function tyElemOpen(t: i32): boolean { return t < 0 }
+export function tyKeyOpen(t: i32): boolean { return t < 0 }
+export function tyValOpen(t: i32): boolean { return t < 0 }
+export function judge(t: i32): i32 { return t }
 `;
 const ARENA_USER = `import { judge, tyPinElem } from "./check_types"
 
