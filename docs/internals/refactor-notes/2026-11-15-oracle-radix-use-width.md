@@ -33,6 +33,7 @@ gives three families, all oracle-side:
 
 `known.txt` loses its whole D2617-class block (9 cells, which all agree now, `ar_s36_0129`,
 `ar_s40_0048` and `ar_s48_0169` checked from their seeds) and the stale `ar_s9_0102` line.
-`ar_s5_0107` stays: it is spec question 2 (D2617's fixture against ruling 4.3), which lane N left open.
+`ar_s5_0107` stays until the compiler follows ruling 4.3 there: the radix arm adopts the typed
+`i32` arm, so the oracle's `-1` is the answer (coordinator, 2026-11-15; lane N fixes the compiler).
 
 No compiler change.
