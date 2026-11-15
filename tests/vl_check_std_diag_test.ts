@@ -37,13 +37,13 @@ if (GATED && !ENABLED) {
 // pinned is the SCOPING, not any one comment rule.
 const STD_WARN = `export function twice(n: i32): i32 {
   let leftover = 1
-  n * 2
+  return n * 2
 }
 `;
 // The same module with a type error in it: the toolchain-is-broken case.
 const STD_ERR = `export function twice(n: i32): i32 {
   const broken: i32 = "not an i32"
-  n * 2
+  return n * 2
 }
 `;
 const MAIN = `import { twice } from "std:probe"
