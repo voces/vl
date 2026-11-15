@@ -405,6 +405,7 @@ import {
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
+  tyOpen,
   tySame,
   tyToStr,
   tyToStructStr,
@@ -2697,7 +2698,7 @@ function elabListArgAtRep(ix: i32, decl: i32): boolean {
     const pn = nodeAt(f.fnParams[a])
     const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
     const pa = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { null }
-    const pe = if pa is TyArray && pa.aElem >= 0 && pa.aElem < T.tys.length { tyAt(pa.aElem) } else { null }
+    const pe = if pa is TyArray && !tyOpen(pa.aElem) && pa.aElem < T.tys.length { tyAt(pa.aElem) } else { null }
     if pe is TyVar {
       if strListHas(f.fnTyParams, pe.tvName) {
         const et = elabCallParamTy(ix, a)
@@ -11256,7 +11257,7 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
   j = 0
   while j < ps.length {
     const pa = tyAt(vf.fnParamTypes[j])
-    if pa is TyArray && elabEmptyListHole(ps[j]) && pa.aElem >= 0 {
+    if pa is TyArray && elabEmptyListHole(ps[j]) && !tyOpen(pa.aElem) {
       const pe = tyAt(pa.aElem)
       if pe is TyVar && bindOf(gN, gT, pe.tvName) < 0 {
         gN.push(pe.tvName)
@@ -11289,7 +11290,7 @@ export function elabHoleGenFlowTy(argIx: i32, holder: i32): i32 {
 // Whether `t` is an empty list's type, its element a hole.
 function elabEmptyListHole(t: i32): boolean {
   const a = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if a is TyArray { a.aElem < 0 || tyIsParamHole(a.aElem) } else { false }
+  if a is TyArray { tyOpen(a.aElem) || tyIsParamHole(a.aElem) } else { false }
 }
 
 // Binds, into `gN`/`gT`, each un-annotated lambda argument of call `cx` at the result its body
@@ -13090,7 +13091,7 @@ function elabEmptyElemsAtI32(t: i32): i32 {
       return mkNullableTy(elabEmptyElemsAtI32(x.nInner))
     }
     TyArray => {
-      if x.aElem < 0 { return mkArrayTy(TY_I32) }
+      if tyOpen(x.aElem) { return mkArrayTy(TY_I32) }
       if x.aElem < T.tys.length {
         const e = tyAt(x.aElem)
         if e is TyVar && (e.tvName.length == 0 || e.tvName[0] == "?"[0]) {
@@ -13182,8 +13183,10 @@ export function elabHoleMapClosed(t: i32): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   const m = tyAt(t)
   if !(m is TyMap) || m.mSet == 1 { return -1 }
-  const kh = m.mKey < 0 || (tyAt(m.mKey) is TyVar && tyHasInferHole(m.mKey, 0))
-  const vh = m.mVal < 0 || (tyAt(m.mVal) is TyVar && tyHasInferHole(m.mVal, 0))
+  const kh = tyOpen(m.mKey)
+    || (tyAt(m.mKey) is TyVar && tyHasInferHole(m.mKey, 0))
+  const vh = tyOpen(m.mVal)
+    || (tyAt(m.mVal) is TyVar && tyHasInferHole(m.mVal, 0))
   if !kh && !vh { return -1 }
   if (!kh && tyHasTyVar(m.mKey)) || (!vh && tyHasTyVar(m.mVal)) { return -1 }
   const k = if kh { TY_STR } else { m.mKey }
@@ -15831,7 +15834,9 @@ function elabCbAtBuild(c: i32, from: i32) {
   if !(p is Param) || p.parType >= 0 { return 0 }
   const lt = nodeTyIxOf(m.memObj)
   const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-  if !(la is TyArray) || la.aElem < 0 || !elabTyClosed(la.aElem, 0) { return 0 }
+  if !(la is TyArray) || tyOpen(la.aElem) || !elabTyClosed(la.aElem, 0) {
+    return 0
+  }
   const bt = elabListElemBuild(m.memObj, 0)
   if (
     bt < 0
@@ -15899,7 +15904,9 @@ function elabSameSlotsAtBuild(c: i32) {
   }
   const lt = nodeTyIxOf(c)
   const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-  if !(la is TyArray) || la.aElem < 0 || !elabTyClosed(la.aElem, 0) { return 0 }
+  if !(la is TyArray) || tyOpen(la.aElem) || !elabTyClosed(la.aElem, 0) {
+    return 0
+  }
   const bt = elabListElemBuild(m.memObj, 0)
   if (
     bt < 0
@@ -18283,10 +18290,20 @@ export function elabInstUnionArmTys(): i32[] {
   }
   // A checked union only counts where it boxes two distinct records, the union a row is minted
   // for: a same-shape union collapses to its struct and mints none.
+  const walked: {[i32]: boolean} = Map()
+  const walkedWide: {[i32]: boolean} = Map()
   let n = 0
   while n < P.nodes.length {
-    const nt = nodeTyIxOf(n)
-    if elabBoxesTwoRecords(nt) { elabUnionArmsInto(nt, out, seen, 1) }
+    // A written annotation names the box it stores at; an inferred type only where two records join.
+    const wide = nodeAt(n) is TypeRef
+    elabBoxedUnionsInto(
+      nodeTyIxOf(n),
+      wide,
+      out,
+      seen,
+      if wide { walkedWide } else { walked },
+      4,
+    )
     n = n + 1
   }
   let k = 0
@@ -18303,6 +18320,70 @@ export function elabInstUnionArmTys(): i32[] {
     k = k + 1
   }
   out
+}
+
+// The arms of every union `ty` holds, at any depth to `depth`, that boxes two distinct records,
+// or with `wide` any record beside another member: a list's element, a map's key or value, a
+// field, a nullable's inner, a member, a signature's parts. `walked` marks the types searched.
+function elabBoxedUnionsInto(
+  ty: i32,
+  wide: boolean,
+  out: i32[],
+  seen: {[i32]: boolean},
+  walked: {[i32]: boolean},
+  depth: i32,
+) {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 || (walked.get(ty) ?? false) {
+    return 0
+  }
+  walked[ty] = true
+  const boxes = if wide { elabBoxesARecord(ty) } else { elabBoxesTwoRecords(ty) }
+  if boxes { elabUnionArmsInto(ty, out, seen, 1) }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => {
+      for m in t.uMembers {
+        elabBoxedUnionsInto(m, wide, out, seen, walked, depth - 1)
+      }
+    }
+    TyNullable => elabBoxedUnionsInto(t.nInner, wide, out, seen, walked, depth - 1)
+    TyArray => elabBoxedUnionsInto(t.aElem, wide, out, seen, walked, depth - 1)
+    TyMap => {
+      elabBoxedUnionsInto(t.mKey, wide, out, seen, walked, depth - 1)
+      elabBoxedUnionsInto(t.mVal, wide, out, seen, walked, depth - 1)
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        elabBoxedUnionsInto(f, wide, out, seen, walked, depth - 1)
+      }
+    }
+    TyFunc => {
+      for p in t.fnParamTypes {
+        elabBoxedUnionsInto(p, wide, out, seen, walked, depth - 1)
+      }
+      elabBoxedUnionsInto(t.fnRet, wide, out, seen, walked, depth - 1)
+    }
+    TyPrim | TyVar | TyLit | TyNeg | TyErr => 0
+  }
+}
+
+// Whether `u` is a value-union box holding a record arm: one beside a non-record member, or two
+// records of different types. A union of one record shape collapses to its struct.
+function elabBoxesARecord(u: i32): boolean {
+  if u < 0 || u >= T.tys.length || !tyIsValueUnionBox(u) { return false }
+  const t = tyAt(u)
+  if !(t is TyUnion) { return false }
+  let rec = false
+  let other = false
+  for m in t.uMembers {
+    if m >= 0 && m < T.tys.length && tyAt(m) is TyObj {
+      rec = true
+    } else {
+      other = true
+    }
+  }
+  if rec && other { return true }
+  elabBoxesTwoRecords(u)
 }
 
 // Whether `u` is a value-union box with two record members of different types.
@@ -18835,7 +18916,7 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   const ht = if sp >= 0 { litRepTyAt(sp >> 1, fnIx) } else { -1 }
   if (sp & 1) == 1 && ht >= 0 { return ht }
   const he = if ht >= 0 && ht < T.tys.length { T.tys[ht] } else { null }
-  if he is TyArray && he.aElem >= 0 { return he.aElem }
+  if he is TyArray && !tyOpen(he.aElem) { return he.aElem }
   let s = if ix < nodeRepTyIx.length { nodeRepTyIx[ix] } else { -1 }
   const src = if s < 0 { nodeSrc[ix] ?? -1 } else { -1 }
   if src >= 0 && src < nodeRepTyIx.length { s = nodeRepTyIx[src] }

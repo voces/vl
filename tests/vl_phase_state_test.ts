@@ -150,6 +150,8 @@ Deno.test({
 const ARENA = `export function tyPinElem(t: i32, v: i32): i32 { t + v }
 export function tyPinKey(t: i32, v: i32): i32 { t + v }
 export function tyPinVal(t: i32, v: i32): i32 { t + v }
+export function tyOpen(t: i32): boolean { t < 0 }
+export function declKeyOf(t: i32): i32 { t }
 export function judge(t: i32): i32 { t }
 `;
 const ARENA_USER = `import { judge, tyPinElem } from "./check_types"

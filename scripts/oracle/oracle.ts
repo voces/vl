@@ -158,9 +158,13 @@ function diff(args: string[]): number {
     const o = interpret(src);
     let out: string[] = [];
     let err = "";
-    try { out = Deno.readTextFileSync(`${outDir}/${ent}.out`).split("\n"); } catch { /* none */ }
+    // Each printed line ends in a newline; only that last terminator goes, so a final `print("")`
+    // stays one empty line.
+    try {
+      const raw = Deno.readTextFileSync(`${outDir}/${ent}.out`);
+      out = raw === "" ? [] : (raw.endsWith("\n") ? raw.slice(0, -1) : raw).split("\n");
+    } catch { /* none */ }
     try { err = Deno.readTextFileSync(`${outDir}/${ent}.err`); } catch { /* none */ }
-    while (out.length && out[out.length - 1] === "") out.pop();
     let cls: Compiled["cls"] = "runs";
     if (err) {
       // fuzz-vl.sh's classes: a check or parse refusal, then a module that does not build

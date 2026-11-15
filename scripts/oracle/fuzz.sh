@@ -2,10 +2,13 @@
 # Differential fuzz: generate programs, run them compiled (`vl run --batch`) and in the oracle,
 # and report every disagreement (docs/internals/refactor-notes/2026-11-14-oracle-design.md).
 #
-#   scripts/oracle/fuzz.sh [--seeds N] [--count M] [--gen arith|rep|both] [--keep DIR]
+#   scripts/oracle/fuzz.sh [--seeds N] [--count M] [--gen arith|data|hof|rep|both|all] [--keep DIR]
 #
-# `arith` is scripts/oracle/gen.ts (arithmetic, widths, casts, evaluation order); `rep` is
-# scripts/fuzzgen.vl's batch (the rep-composition programs fuzz-vl.sh runs). Exit 1 on a new
+# `arith` is scripts/oracle/gen.ts (arithmetic, widths, casts, evaluation order); `data` is
+# scripts/oracle/gen_data.ts (records, lists, maps, closures, loops, strings, evaluation order);
+# `hof` is scripts/oracle/gen_hof.ts (generics, hole functions, function values, declaration
+# order); `rep` is scripts/fuzzgen.vl's batch (the rep-composition programs fuzz-vl.sh runs); `both` is
+# arith and rep, `all` all four. Exit 1 on a new
 # DISAGREE or UNSOUND verdict (scripts/oracle/known.txt lists the filed ones), 2 on setup failure.
 # Requires a fresh seed (scripts/refresh-compiler.sh) and deno.
 set -uo pipefail
@@ -36,10 +39,16 @@ WORK="${KEEP:-$(mktemp -d)}"
 mkdir -p "$WORK/cases" "$WORK/out"
 
 for s in $(seq 1 "$SEEDS"); do
-  if [ "$GEN" = arith ] || [ "$GEN" = both ]; then
+  if [ "$GEN" = arith ] || [ "$GEN" = both ] || [ "$GEN" = all ]; then
     deno run -A scripts/oracle/gen.ts "$WORK/cases" --seed "$s" --count "$COUNT" || exit 2
   fi
-  if [ "$GEN" = rep ] || [ "$GEN" = both ]; then
+  if [ "$GEN" = data ] || [ "$GEN" = all ]; then
+    deno run -A scripts/oracle/gen_data.ts "$WORK/cases" --seed "$s" --count "$COUNT" || exit 2
+  fi
+  if [ "$GEN" = hof ] || [ "$GEN" = all ]; then
+    deno run -A scripts/oracle/gen_hof.ts "$WORK/cases" --seed "$s" --count "$COUNT" || exit 2
+  fi
+  if [ "$GEN" = rep ] || [ "$GEN" = both ] || [ "$GEN" = all ]; then
     sed -e "s/^let SEED = .*/let SEED = $s/" -e "s/^let COUNT = .*/let COUNT = $COUNT/" \
       -e "s/^let BRANCHING = .*/let BRANCHING = 1/" -e "s/^let MULTIOBS = .*/let MULTIOBS = 1/" \
       scripts/fuzzgen.vl > "$WORK/gen.vl"
