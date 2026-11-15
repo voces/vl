@@ -113,7 +113,7 @@ Deno.test("ufcs completions: a name already imported gets NO edit", () => {
 });
 
 Deno.test("ufcs completions: a method declared in THIS file gets no edit and no module label", () => {
-  const src = "type Box = { n: i32 }\n\nfunction twice(self: Box): i32 { self.n * 2 }\n";
+  const src = "type Box = { n: i32 }\n\nfunction twice(self: Box): i32 { return self.n * 2 }\n";
   // The entry's own decls come back with the entry key, or "" in a single-file check.
   for (const key of ["/proj/main.vl", ""]) {
     const items = ufcsCompletions(src, "/proj/main.vl", [cand("twice", key)], () => false);
@@ -454,8 +454,8 @@ Deno.test({
   ignore,
 }, async () => {
   const shapes = "export type Circle = { r: f64 }\n\n" +
-    "export function area(self: Circle): f64 { self.r * self.r * 3.14 }\n\n" +
-    "function secret(self: Circle): f64 { 1.0 }\n";
+    "export function area(self: Circle): f64 { return self.r * self.r * 3.14 }\n\n" +
+    "function secret(self: Circle): f64 { return 1.0 }\n";
   const { checker, read } = checkerAndReader((key) => key.endsWith("shapes.vl") ? shapes : undefined);
   const src = 'import { Circle } from "./shapes"\n\nconst c: Circle = { r: 2.0 }\nc.\n';
   const cursor = { line: 3, character: 2 };
