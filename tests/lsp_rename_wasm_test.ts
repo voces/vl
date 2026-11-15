@@ -297,7 +297,7 @@ Deno.test("rename: edit assembly dedupes by (uri, range)", async () => {
 
 // ---- seed-backed fixtures ----------------------------------------------------
 
-const util = "export function add(a: i32, b: i32): i32 {\n  a + b\n}\n";
+const util = "export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n";
 const mainPlain = 'import { add } from "./util"\n\nprint(add(2, 3))\nprint(add(4, 5))\n';
 const mainAlias = 'import { add as plus } from "./util"\n\nprint(plus(2, 3))\nprint(plus(4, 5))\n';
 
@@ -365,7 +365,7 @@ Deno.test({
   const gotMain = applyEdits(mainPlain, changes[pathToUri("/proj/main.vl")] ?? []);
   const gotUtil = applyEdits(util, changes[pathToUri("/proj/util.vl")] ?? []);
   const wantMain = 'import { total } from "./util"\n\nprint(total(2, 3))\nprint(total(4, 5))\n';
-  const wantUtil = "export function total(a: i32, b: i32): i32 {\n  a + b\n}\n";
+  const wantUtil = "export function total(a: i32, b: i32): i32 {\n  return a + b\n}\n";
   assert(gotMain === wantMain, `main.vl:\nwant: ${JSON.stringify(wantMain)}\ngot:  ${JSON.stringify(gotMain)}`);
   assert(gotUtil === wantUtil, `util.vl:\nwant: ${JSON.stringify(wantUtil)}\ngot:  ${JSON.stringify(gotUtil)}`);
 });
@@ -396,7 +396,7 @@ Deno.test({
   const gotUtil = applyEdits(util, changes[pathToUri("/proj/util.vl")] ?? []);
   const gotMain = applyEdits(mainPlain, changes[pathToUri("/proj/main.vl")] ?? []);
   assert(
-    gotUtil === "export function total(a: i32, b: i32): i32 {\n  a + b\n}\n",
+    gotUtil === "export function total(a: i32, b: i32): i32 {\n  return a + b\n}\n",
     `util.vl decl renamed; got ${JSON.stringify(gotUtil)}`,
   );
   assert(
@@ -469,7 +469,7 @@ Deno.test({
   const gotUtil = applyEdits(util, changes[pathToUri("/proj/util.vl")] ?? []);
   const gotAlias = applyEdits(mainAlias, changes[pathToUri("/proj/alias.vl")] ?? []);
   assert(
-    gotUtil === "export function total(a: i32, b: i32): i32 {\n  a + b\n}\n",
+    gotUtil === "export function total(a: i32, b: i32): i32 {\n  return a + b\n}\n",
     `util.vl decl renamed; got ${JSON.stringify(gotUtil)}`,
   );
   // Only the SOURCE side of the alias specifier moves; `plus` and its uses stay.

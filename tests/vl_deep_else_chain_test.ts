@@ -67,7 +67,7 @@ const PROGRAMS: [string, (n: number) => string, number, number][] = [
 
 // The same `if` nested rather than chained: the compiler recurses once per level.
 const genNest = (n: number): string =>
-  `function f(a: i32): i32 {\n  let acc = 0\n  ${"if a > 0 { acc = acc + 1; ".repeat(n)}${"} ".repeat(n)}\n  acc\n}\nprint(f(1))\n`;
+  `function f(a: i32): i32 {\n  let acc = 0\n  ${"if a > 0 { acc = acc + 1; ".repeat(n)}${"} ".repeat(n)}\n  return acc\n}\nprint(f(1))\n`;
 
 const SMALL_STACK = { VL_SEED_STACK: "default" };
 

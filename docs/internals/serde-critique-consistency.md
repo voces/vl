@@ -255,7 +255,7 @@ the refusal is excellent:
 ```vl
 function readNum(s: string): f64 | JsonError {
   const v = parseF64(s) as f64      // parseF64: f64 | null
-  v
+  return v
 }
 ```
 → ``[ERROR]: `as f64` propagates null, which the enclosing function cannot return (it returns f64 | JsonError)``
@@ -518,7 +518,7 @@ The spelling the plan actually delivers works cleanly and is good:
 ```vl
 function load(s: string): Config | JsonError {
   const c = fromJson(s) as Config      // propagates JsonError
-  c
+  return c
 }
 // check rc 0, RUNS
 ```
