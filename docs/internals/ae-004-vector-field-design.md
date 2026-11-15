@@ -1,6 +1,7 @@
 # AE-004: a vector stored in a record field
 
-Status: design, for review before any code. Rows: [D16480](inventory/D16480.md) (perf),
+Status: the struct-field proposal landed 2026-11-15 (`FC_V128`). Measured outcome in
+`refactor-notes/2026-11-15-lane-l-fc-v128.md`. Rows: [D16480](inventory/D16480.md) (perf),
 [D16481](inventory/D16481.md) (clause 2), [D1981](inventory/D1981.md) (clause 2, the
 struct-field face).
 
