@@ -320,10 +320,12 @@ import {
   numLitAdoptDeep,
   numLitAdoptDst,
   numLitAdoptTails,
+  radixTreeF64Pair,
   valueJoinAt,
   valueTailLeaves,
 } from "./check_num_adopt"
 import {
+  cexEvalAt,
   cexFloatUse,
   lbiWriteTgt,
   nlAsgGot,
@@ -331,6 +333,7 @@ import {
   nlCmpdInner,
   nlCmpdTgt,
 } from "./check_num_lit_state"
+import { cexOk } from "./const_exact"
 import {
   binFloatOperandPair,
   binIntOnlyOp,
@@ -1331,6 +1334,7 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     || assignable(rt, lt)
     || nomEqLit
     || eqNonNullMutual(lt, rt)
+    || radixTreeF64Pair(n, lt, rt)
   const eqMsg = "cannot compare " + tyToStr(lt) + " with " + tyToStr(rt)
   if !eqMutual && !eqDeadByFlow(n, ix, -1, -1, eqMsg) { tErr(eqMsg, ix) }
   // Both `==` gates share one home (`eqRefusals`): structural soundness (field-by-field
@@ -1572,6 +1576,7 @@ function checkBinCmpTail(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       !sameNumeric(olt, ort)
       && !mixesNumeric(olt, ort)
       && !cmpF32LitAdopts(n, olt, ort)
+      && !radixTreeF64Pair(n, olt, ort)
     ) {
       // Mixed numerics may be compared when one side widens to the other; the f32-with-a-literal
       // pair is admitted separately (`cmpF32LitAdopts`) so comparison agrees with arithmetic's `+`.
@@ -1670,6 +1675,8 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
     cexFloatUse(n.binLeft)
     return rt
   }
+  // A radix tree computed at 64 bits beside an `f64` converts to it (D16390).
+  if radixTreeF64Pair(n, lt, rt) { return TY_F64 }
   // A mixed-numeric op widens the narrower operand to the wider one (`i32 op i64` -> i64, ...),
   // done before the same-type check so a compatible mixed pair is accepted (B2).
   if mixesNumeric(lt, rt) { return widerNumeric(lt, rt) }
@@ -1940,6 +1947,15 @@ function binRadixAdoptSides(n: BinExpr, op: string, sides: i32[]) {
     const rpa = litTreeAdoptDst(n.binRight, lt)
     if rpa >= 0 { rt = rpa }
   }
+  // Beside an `f64` a radix tree computes at 64 bits, as at an `f64` destination (D16390).
+  if lt == TY_I32 && primNameOf(rt) == "f64" && op != "??" {
+    const lpf = litTreeAdoptDst(n.binLeft, rt)
+    if lpf >= 0 { lt = lpf }
+  }
+  if rt == TY_I32 && primNameOf(lt) == "f64" {
+    const rpf = litTreeAdoptDst(n.binRight, lt)
+    if rpf >= 0 { rt = rpf }
+  }
   sides[0] = lt
   sides[1] = rt
   0
@@ -2049,7 +2065,10 @@ function binTyOfSides(n: BinExpr, ix: i32, lt0: i32, rt0: i32, ltOut: i32[]) {
     rt = sides[1]
   }
   // A re-check pushes the node again; `checkShiftCounts` grades each once.
-  if binShiftOp(op) && intLitLexemeOf(n.binRight) != "" {
+  if (
+    binShiftOp(op)
+    && (intLitLexemeOf(n.binRight) != "" || cexOk(cexEvalAt(n.binRight, 0)))
+  ) {
     shiftCountNodes.push(ix)
   }
   // A binary op with a hole operand can't decide its form until the hole is bound at the call —
