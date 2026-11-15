@@ -9786,12 +9786,10 @@ tree read stays an editor reference.
   computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
   An `f32` use and no context keep their 32 bits (D16390).
 * **In a float context a radix literal is the value its digits spell (owner, 2026-11-15, ruling
-  4.1).** At an `f32` or `f64` destination, beside a float, or under `as f32` / `as f64`, a radix
-  literal of up to 64 bits is its unsigned value rounded to the float: `0xFFFFFFFF as f32` is
-  4294967296 (it was -1.0, the pattern's signed value) and `const b: f32 = 0x7FFFFFFF` is
-  2147483648, which was refused as lossy. A decimal literal still has to be exact there
-  (`const q: f32 = 16777217` is refused), and an integer context keeps the bit pattern. This
-  retires the reading "unsigned when the float holds it exactly, else the signed pattern".
+  4.1, as clarified).** At an `f32` or `f64` destination, or beside a float, the float must hold
+  that value exactly, as it must a decimal integer literal (`const b: f32 = 0x7FFFFFFF` is
+  refused); `as f32` / `as f64` rounds it, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0,
+  the pattern's signed value. An integer context keeps the bit pattern.
 * **A float division by zero, and a float constant past the largest double, are not folded.**
   VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
   computation they were; Go refuses both.
