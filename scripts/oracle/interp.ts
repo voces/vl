@@ -160,6 +160,8 @@ function litTo(l: Lit, k: string): Val {
       case "i32":
         // T2.3/E9.1: a radix tree is a bit pattern at the use's width; a ring operator commutes
         // with wrapping, so wrapping the exact value is the same as computing at the width.
+        // T2.3: a pattern wider than 32 bits is i64, which an i32 does not hold.
+        if (l.radix === 64) throw new LitFault(`literal typed from uses: a pattern wider than 32 bits at i32`);
         if (l.radix) return wrap32(x);
         if (x < BigInt(I32_MIN) || x > BigInt(I32_MAX)) throw new LitFault(`literal typed from uses: constant ${x} overflows i32`);
         return Number(x);
@@ -335,6 +337,8 @@ function radixAtWidth(op: string, a: Lit, b: Lit, expK: string | null): Lit {
   const shift = op === "<<" || op === ">>" || op === ">>>";
   const cnt = (): bigint => b.radix === 64 || b.wideDec ? v64(b) : b.i!;
   const q64 = (): bigint => shift ? cnt() : v64(b);
+  // T2.3: a leaf wider than 32 bits is i64, so an i32 use cannot hold the tree.
+  if (expK === "i32" && (a.radix === 64 || (!shift && b.radix === 64))) throw new LitFault("literal typed from uses: a pattern wider than 32 bits at i32");
   const l = new Lit(w === 64 ? at(64, v64(a), q64()) : at(32, a.i!, b.i!), null, w);
   l.derived = true;
   // No use has fixed the width: keep the 64-bit reading for a use that turns out to be i64.
@@ -412,6 +416,11 @@ function arith(op: string, a: Val, b: Val, expK: string | null = null): Val {
   }
   if (a instanceof Lit && b instanceof Lit) return litArith(op, a, b, expK);
   let ka = a instanceof Lit ? null : numKind(a), kb = b instanceof Lit ? null : numKind(b);
+  // D3043: with no destination, an integer constant that does not fit its `i32` peer is `i64`.
+  if (!expK && (ka === null) !== (kb === null)) {
+    const lit = (a instanceof Lit ? a : b) as Lit;
+    if ((ka ?? kb) === "i32" && lit.i !== null && !litHolds(lit, "i32") && !["<<", ">>", ">>>"].includes(op)) expK = "i64";
+  }
   if (expK && (ka === null) !== (kb === null)) {
     const peer = (ka ?? kb)!, lit = (a instanceof Lit ? a : b) as Lit;
     if (peer !== expK && WIDENS[peer]?.includes(expK) && !litHolds(lit, peer)) {
@@ -739,7 +748,13 @@ export class Interp {
     const prog = parse(src);
     const env = new Env(null);
     installBuiltins(env);
-    this.execBlock(prog, env);
+    try {
+      this.execBlock(prog, env);
+    } catch (x) {
+      // E8.2: a bare `as` propagates null, which the module's top level has no function to return.
+      if (x instanceof NullOut) throw new TypeFault("a bare `as` failed at the top level, where nothing returns its null");
+      throw x;
+    }
     return this.out;
   }
 
@@ -926,8 +941,14 @@ export class Interp {
       let r: Val;
       try {
         // the body's last expression is delivered to the return type, so it is its context
-        r = Array.isArray(d.body) ? this.execBlock(d.body, env, d.ret) : this.eval(d.body, env, d.ret);
-        // E13.1: a body's value is its last expression; a void function discards it.
+        // A block body returns a value only through `return`; an expression body is its value
+        // (DECISIONS, "A function's block body returns a value only through `return`").
+        if (Array.isArray(d.body)) {
+          this.execBlock(d.body, env, d.ret);
+          r = VOID;
+        } else {
+          r = this.eval(d.body, env, d.ret);
+        }
         if (d.ret && d.ret.k === "name" && d.ret.name === "void") r = VOID;
         // spec gap (owner question): S8.1 says every path returns; the compiler lets a body whose
         // return type admits null fall off its end, and the result is null.
@@ -1115,7 +1136,8 @@ export class Interp {
       case "if": {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
-        const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : VOID;
+        // An else-less `if` in value position is `T | null`: a false condition yields `null`.
+        const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : null;
         // T3.6 at an `if` join: a constant arm adapts to the other arm's type, read from its
         // declaration since that arm did not run; one that cannot widens the join.
         const other = c ? e.f : e.t;
@@ -1346,19 +1368,26 @@ export class Interp {
       const v = this.eval(c, env, null);
       return v instanceof Lit && litHolds(v, k);
     };
+    // D3043: a constant takes its typed peer's type only if it fits; one that does not fit an
+    // `i32` peer is read with no context, and `arith` widens the peer to i64.
+    const peerCtx = (x: Expr, kTy: Ty | null): Ty | null => {
+      if (!kTy || kTy.k !== "name" || kTy.name !== "i32" || !isConstTree(x)) return kTy;
+      const v = this.eval(x, env, null);
+      return v instanceof Lit && v.i !== null && !litHolds(v, "i32") ? null : kTy;
+    };
     let l: Val, r: Val;
     const rExp = arithOp && !["<<", ">>", ">>>"].includes(op) ? exp : null;
     if (arithOp && peerTyped(e.l) && !peerTyped(e.r) && (!exp || (intExp && !["<<", ">>", ">>>"].includes(op)))) {
       r = this.eval(e.r, env, rExp);
       const k = numKind(r);
       const kTy: Ty | null = k ? { k: "name", name: k, args: [] } : null;
-      l = this.eval(e.l, env, !exp ? kTy : atPeer(e.l, k) ? kTy : exp);
+      l = this.eval(e.l, env, !exp ? peerCtx(e.l, kTy) : atPeer(e.l, k) ? kTy : exp);
     } else {
       l = this.eval(e.l, env, arithOp ? exp : null);
       const k = numKind(l);
       const kTy: Ty | null = k ? { k: "name", name: k, args: [] } : null;
       const shiftOp = ["<<", ">>", ">>>"].includes(op);
-      r = this.eval(e.r, env, arithOp && !shiftOp && !(l instanceof Lit) && atPeer(e.r, k) ? kTy : rExp ?? (arithOp && !exp && k && peerTyped(e.r) && !shiftOp ? kTy : null));
+      r = this.eval(e.r, env, arithOp && !shiftOp && !(l instanceof Lit) && atPeer(e.r, k) ? kTy : rExp ?? (arithOp && !exp && k && peerTyped(e.r) && !shiftOp ? peerCtx(e.r, kTy) : null));
     }
     // E9.1: a float constant tree that adopts an `f32` peer folds in f32 arithmetic, whatever
     // destination is outside the operator. A tree is pure, so it is evaluated again.
@@ -1512,10 +1541,13 @@ export class Interp {
   // field's type), so an empty container written there is built at it (ruling 4.4).
   atElem(o: Val, v: Val, field?: string): Val {
     const b = builtAt.get(o as object);
-    if (!b || v instanceof Lit) return v;
+    if (!b) return v;
     const t = b.t;
     const el = t.k === "list" ? t.el : t.k === "map" ? t.val : t.k === "rec" ? t.fields.find((f) => f.name === field)?.ty : undefined;
-    return el ? this.convert(v, el, b.env) : v;
+    // A constant stored there is typed at the element (T2.4). A value is converted only: an alias
+    // may hold the container at another declared type, so the built type is no fit check.
+    if (!el) return v;
+    return v instanceof Lit ? this.deliver(v, el, b.env, "store") : this.convert(v, el, b.env);
   }
   settleOne(m: VMap, v: Val): Val {
     if (!(v instanceof Lit)) return v;
@@ -1680,6 +1712,10 @@ export class Interp {
       return this.castFail(e, "not a member");
     }
     const k = t.name;
+    // E8.4: `as%` wraps between integer widths; a float on either side is refused.
+    if (e.mode === "as%" && (k === "f64" || k === "f32")) throw new TypeFault("as% to a float");
+    // T1.1/T1.3: `u8` is the one narrow width with a value domain; the others are storage only.
+    if (k === "u16" || k === "u32" || k === "i8" || k === "i16") throw new TypeFault(`\`${k}\` is not a value type`);
     if (typeof v === "boolean") v = v ? 1 : 0; // E8.5
     // T2.4: a constant operand takes the cast's target as its context, so `0xFFFFFFFF as i64`
     // is 4294967295; one the target cannot hold is a failed cast.
@@ -1691,7 +1727,17 @@ export class Interp {
     // 4.1 / D1890: `as f32` / `as f64` rounds an integer constant to the nearest float, once.
     if (v instanceof Lit && v.i !== null && !v.radix && (k === "f32" || k === "f64")) return k === "f64" ? new Flt(Number(v.i), 64) : new Flt(bigToF32(v.i), 32);
     if (v instanceof Lit && e.mode !== "as%") {
-      try { return litTo(v, k === "u8" || k === "u16" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return this.castFail(e, "not exact"); }
+      let r: Val;
+      // E8.2: a cast of a constant that can never succeed is refused.
+      // A join of constants is no constant: its miss is the cast's own failure.
+      const never = (why: string): Val => {
+        if ((v as Lit).join) return this.castFail(e, "not exact");
+        throw new TypeFault(`a constant cast that never succeeds: ${why}`);
+      };
+      try { r = litTo(v, k === "u8" ? "i32" : k); } catch (x) { if (!(x instanceof LitFault)) throw x; return never(x.message); }
+      // E8.3: `as u8` checks the 0..255 domain; a radix constant is its 32-bit pattern there.
+      if (k === "u8" && ((r as number) < 0 || (r as number) > 255)) return never(`${r} as u8`);
+      return r;
     }
     // D3053 ruling (A): under `as% i64` a radix literal, or a chain of negations over one, is the
     // constant its digits spell; another radix tree there has no ruling (D16494).

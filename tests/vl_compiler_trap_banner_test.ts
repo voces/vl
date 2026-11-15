@@ -56,14 +56,14 @@ const BANNER = "the compiler itself trapped";
 // than a literal `0` so the index is not a constant the emitter could fold away.
 const SEED_TRAPS_IN_COMPILE = `const empty: i32[] = []
 
-export function hostAbi(): i32 { 2 }
-export function srcReset(): i32 { 0 }
-export function srcPush(c: i32): i32 { c }
-export function rbyteLen(): i32 { 0 }
-export function rbyteAt(i: i32): i32 { i }
+export function hostAbi(): i32 { return 2 }
+export function srcReset(): i32 { return 0 }
+export function srcPush(c: i32): i32 { return c }
+export function rbyteLen(): i32 { return 0 }
+export function rbyteAt(i: i32): i32 { return i }
 
 export function compileSrc(): i32 {
-  empty[rbyteLen()]
+  return empty[rbyteLen()]
 }
 `;
 
@@ -71,7 +71,7 @@ export function compileSrc(): i32 {
 // No `print` — the compiler linker defines none of the program imports, and an
 // unknown-import failure is a link error rather than the trap under test.
 const SEED_TRAPS_AT_START = `const empty: i32[] = []
-export function hostAbi(): i32 { 2 }
+export function hostAbi(): i32 { return 2 }
 const boom: i32 = empty[hostAbi() - 2]
 `;
 

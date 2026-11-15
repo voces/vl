@@ -64,7 +64,7 @@ const gen = (ls: Level[]): string => {
     "function f(a: i32): i32 {",
     "  let acc = 0",
     `  ${open.join("")}${inner}${close.reverse().join("")}`,
-    "  acc",
+    "  return acc",
     "}",
     "print(f(1))",
     "print(f(0))",

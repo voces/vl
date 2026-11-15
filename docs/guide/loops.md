@@ -33,7 +33,7 @@ Because a label is its own token, `{ name: â€¦ }` is always an object literal â€
 body, a lambda body, an `if` or `else` branch, or a `match` arm:
 
 ```vl
-function origin() { x: 0, y: 0 }
+function origin() { return { x: 0, y: 0 } }
 const p = if flip { x: 1, y: 0 } else { x: 0, y: 1 }
 ```
 
