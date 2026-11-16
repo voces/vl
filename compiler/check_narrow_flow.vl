@@ -534,6 +534,8 @@ import {
   pendAtsSet,
   pendDepths,
   pendDepthsSet,
+  pendLitTys,
+  pendLitTysSet,
   pendNames,
   pendNamesSet,
   pendNulListDepths,
@@ -650,7 +652,10 @@ import {
   litSetBaseTy,
   nonNullTy,
   tyAdmitsNull,
+  tyFloatIntLitTest,
   tyHasTyVar,
+  tyIsFloatPrim,
+  tyIsIntPrim,
   tyMapValOf,
   tyStepElem,
   tyUnionCovers,
@@ -1606,6 +1611,14 @@ export function flushUninferred(depth: i32) {
   pendTysSet(keepT)
   pendAtsSet(keepA)
   pendDepthsSet(keepD)
+  // A list literal read in place takes the default only at the program's end, after every
+  // write, a callee's included, has had its turn (D16879).
+  if depth == 0 {
+    for lt in pendLitTys {
+      if holdsDefaultableHole(lt) { defaultUnfixed(lt) }
+    }
+    pendLitTysSet([])
+  }
   return 0
 }
 
@@ -4832,6 +4845,11 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
           pushNarrowFact(isPl, partArm, places, tys)
           return 0
         }
+        const fh = floatIntLitHolders(isCur, tIdx)
+        if fh >= 0 {
+          if !tySame(fh, isCur) { pushNarrowFact(isPl, fh, places, tys) }
+          return 0
+        }
         let meet = litSetMeetTy(isCur, tIdx)
         if meet < 0 { meet = tyTestMeet(isCur, tIdx) }
         if meet >= 0 { tIdx = meet }
@@ -4973,6 +4991,31 @@ function isTestKindOf(ty: i32): i32 {
   }
 }
 
+// Whether operand `obj`, which has a float member, is tested against integer literals `chk`
+// (`tyFloatIntLitTest`, D3689).
+export function isFloatIntLitTest(obj: i32, chk: i32): boolean {
+  return tyFloatIntLitTest(obj, chk)
+}
+
+// The float members of `obj`, which hold a member of integer literal set `chk` by value where
+// `tyFloatIntLitTest` holds; -1 where it fails.
+export function floatIntLitHolders(obj: i32, chk: i32): i32 {
+  if !tyFloatIntLitTest(obj, chk) { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(obj, ms)
+  const keep: i32[] = []
+  for m in ms {
+    if tyIsFloatPrim(m) { keep.push(m) }
+  }
+  if keep.length == 1 { return keep[0] }
+  return mkUnionTy(keep)
+}
+
+// Whether `f` is a float and `n` an integer primitive.
+function isFloatIntPair(f: i32, n: i32): boolean {
+  return tyIsFloatPrim(f) && tyIsIntPrim(n)
+}
+
 // `isTestAnswer` for one member `m` of the operand against `t`.
 function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
   if depth <= 0 || m < 0 || t < 0 || m >= T.tys.length || t >= T.tys.length {
@@ -5007,6 +5050,8 @@ function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
     if meet >= 0 { return -1 }
     const bm = if lbm >= 0 { lbm } else { m }
     const bt = if lbt >= 0 { lbt } else { t }
+    // A float holds an integer literal by value, the literal converted to it (D3689).
+    if isFloatIntPair(bm, bt) || isFloatIntPair(bt, bm) { return -1 }
     return if tySame(bm, bt) { -1 } else { 0 }
   }
   if mt is TyPrim && tt is TyPrim {
