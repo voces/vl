@@ -303,7 +303,7 @@ No program of the 3,223 fires these. Counted per file; the full list regenerates
 The census pattern is mechanical, so a `walk-limit` rule (`compiler/lint.vl`) is proposed:
 - **Flags:** in an `if` or `while` condition, a comparison of a counter named `depth*`, `budget*`, `hops`,
   `guard`, `steps`, `rounds`, `tries` or `<walk>.length` with a numeric literal of 3 or more, or a `CAPS` constant.
-- **Ratchet:** `vl check --budget scripts/walk-limit-budget-baseline.json`, as `arena-scan-outside-pass`. The
+- **Ratchet:** a new budget baseline beside `scripts/scan-budget-baseline.json`, which `arena-scan-outside-pass` uses. The
   count may only fall, and a PR converting a limit lowers the baseline in the same change.
 - **False hits seen in the census:** mode flags (8 sites, a bound over 1000) and sentinel exits (20 sites, the
   counter assigned its own bound). The rule can skip both shapes mechanically; what remains is a limit.
