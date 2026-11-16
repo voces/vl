@@ -4619,8 +4619,15 @@ function elabElemCallAlias(d: i32, decl: i32): i32 {
   const fn = nodeAt(decl)
   if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
   if !(fn is FuncDecl) { return -1 }
-  const init = parenPeelIx(ln.letInit)
-  if init < 0 || init >= P.nodes.length || !(nodeAt(init) is Index) {
+  const init0 = parenPeelIx(ln.letInit)
+  // A copy of a `for` loop's element is an element read of the list it walks.
+  const walked = if init0 >= 0 && init0 < P.nodes.length && nodeAt(init0) is Ident { elabLoopCallAlias(identDeclOf(init0), decl) } else { -1 }
+  const init = if walked >= 0 { walked } else { init0 }
+  if (
+    init < 0
+    || init >= P.nodes.length
+    || !(nodeAt(init) is Index) && walked < 0
+  ) {
     return -1
   }
   const root = elabSlotRoot(init)
@@ -4629,7 +4636,12 @@ function elabElemCallAlias(d: i32, decl: i32): i32 {
   }
   const pd = identDeclOf(root)
   if !i32ListHas(fn.fnParams, pd) { return -1 }
-  const todo: i32[] = [fn.fnBody]
+  return if elabOnlyCalled(d, fn.fnBody) { pd } else { -1 }
+}
+
+// Whether every read of binding `d` in `body` is a call's callee.
+function elabOnlyCalled(d: i32, body: i32): boolean {
+  const todo: i32[] = [body]
   const par: i32[] = [-1]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
@@ -4637,7 +4649,7 @@ function elabElemCallAlias(d: i32, decl: i32): i32 {
     if x >= 0 && x < P.nodes.length {
       if nodeAt(x) is Ident && identDeclOf(x) == d {
         const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
-        if !(pn is Call && parenPeelIx(pn.callFn) == x) { return -1 }
+        if !(pn is Call && parenPeelIx(pn.callFn) == x) { return false }
       }
       for c in nodeChildren(x) {
         todo.push(c)
@@ -4645,19 +4657,108 @@ function elabElemCallAlias(d: i32, decl: i32): i32 {
       }
     }
   }
-  return pd
+  return true
 }
 
-// Callee `cf`, or the element read it aliases when it names such a binding of `decl`.
+// The list a `for` loop of `decl`'s body walks, where `d` is that loop's element binding and the
+// list is a parameter of `decl` or an element chain off one, through the elements of enclosing
+// such loops, and every read of `d` is a call's callee: the element is read as `xs[i]` would be;
+// the outermost such list, whose root is the parameter, or -1.
+function elabLoopCallAlias(d: i32, decl: i32): i32 {
+  if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
+    return -1
+  }
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return -1 }
+  const l = elabLoopOf(d)
+  if !(l is ForIn) || !elabOnlyCalledOrCopied(d, l.fiBody) { return -1 }
+  // Each step moves to an enclosing loop, so the walk ends.
+  let it = parenPeelIx(l.fiIter)
+  let root = elabSlotRoot(it)
+  while root >= 0 && root < P.nodes.length && nodeAt(root) is Ident {
+    if i32ListHas(fn.fnParams, identDeclOf(root)) { return it }
+    const ol = elabLoopOf(identDeclOf(root))
+    if !(ol is ForIn) { return -1 }
+    it = parenPeelIx(ol.fiIter)
+    root = elabSlotRoot(it)
+  }
+  return -1
+}
+
+// The `for` loop whose single element binding is `d`, or null.
+function elabLoopOf(d: i32): ForIn | null {
+  if d < 0 || d >= P.nodes.length { return null }
+  const lp = loopVarLoop(d)
+  const l = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+  if !(l is ForIn) || l.fiDecl1 != d || l.fiDecl2 >= 0 { return null }
+  return l
+}
+
+// `elabOnlyCalled`, where a read may also initialise an un-annotated `const` (or a `let` nothing
+// re-points) that is itself only ever called in `body`, or be the list an inner `for` loop walks
+// whose element is so read.
+function elabOnlyCalledOrCopied(d: i32, body: i32): boolean {
+  // The roots of the element chains a call's callee reads (`d(…)`, `d[i](…)`).
+  const roots: i32[] = []
+  const scan: i32[] = [body]
+  while scan.length > 0 {
+    const x = scan.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Call { roots.push(elabSlotRoot(parenPeelIx(xn.callFn))) }
+      for c in nodeChildren(x) { scan.push(c) }
+    }
+  }
+  const todo: i32[] = [body]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        const called = i32ListHas(roots, x)
+        const copied = pn is LetDecl
+          && (pn.letKw == "const" || cwLetUnwritten(p))
+          && pn.letType < 0
+          && parenPeelIx(pn.letInit) == x
+          && elabOnlyCalled(p, body)
+        const walked = pn is ForIn
+          && parenPeelIx(pn.fiIter) == x
+          && pn.fiDecl2 < 0
+          && elabOnlyCalledOrCopied(pn.fiDecl1, pn.fiBody)
+        if !called && !copied && !walked { return false }
+      }
+      for c in nodeChildren(x) {
+        todo.push(c)
+        par.push(x)
+      }
+    }
+  }
+  return true
+}
+
+// Callee `cf`, or the element read it aliases when it names such a binding of `decl`, or the list
+// a `for` loop's element binding walks.
 function elabElemAliasInit(cf: i32, decl: i32): i32 {
+  // An element chain off a `for` loop's element reads the list that loop walks.
+  const cr = elabSlotRoot(cf)
+  if cr != cf && cr >= 0 && cr < P.nodes.length && nodeAt(cr) is Ident {
+    const via = elabLoopCallAlias(identDeclOf(cr), decl)
+    if via >= 0 { return via }
+  }
   if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return cf }
   const d = identDeclOf(cf)
+  const walked = elabLoopCallAlias(d, decl)
+  if walked >= 0 { return walked }
   if d < 0 || d >= P.nodes.length || elabElemCallAlias(d, decl) < 0 {
     return cf
   }
   const ln = nodeAt(d)
-  if ln is LetDecl { return parenPeelIx(ln.letInit) }
-  return cf
+  if !(ln is LetDecl) { return cf }
+  const init = parenPeelIx(ln.letInit)
+  const via = if init >= 0 && init < P.nodes.length && nodeAt(init) is Ident { elabLoopCallAlias(identDeclOf(init), decl) } else { -1 }
+  return if via >= 0 { via } else { init }
 }
 
 // `elabMintFacts` over the subtree at `ix` of declaration `decl`'s body, nested functions aside.
@@ -4681,6 +4782,13 @@ function elabMintFactsIn(ix: i32, decl: i32, k: i32, sc: i32): i32 {
     for kid in nodeSpineChildren(cur) {
       if cn is Call && kid == cn.callFn {
         if cb <= 0 { n = n + elabMintCalleeIn(kid, decl, k, sc) }
+      } else if (
+        cn is ForIn
+        && kid == cn.fiIter
+        && elabLoopCallAlias(cn.fiDecl1, decl) >= 0
+      ) {
+        // A loop whose element is only ever called reads its list's slot, as a callee chain does.
+        n = n + elabMintCalleeIn(kid, decl, k, sc)
       } else if (
         cn is LetDecl
         && kid == cn.letInit
@@ -10122,6 +10230,8 @@ export function elabRun() {
   elabHoleLamsAt = -1
   elabTpDefaultsPrime()
   elabLateNames = []
+  elabPathIds = Map()
+  elabPathTexts = []
   elabSlotCallAlso = -1
   elabSlotCallAlsoStep = ""
   // A compiler instance reused for another program keeps no classes of the last one.
@@ -15056,17 +15166,14 @@ function elabSlotReadDeliveries(
   out: i32[],
   seen: i32[],
 ) {
-  const key = b * 8 + path.length
-  if (
-    b < 0
-    || b >= P.nodes.length
-    || path.length >= 8
-    || i32ListHas(seen, key)
-    || seen.length > 32
-  ) {
-    return 0
+  if b < 0 || b >= P.nodes.length || seen.length > 32 { return 0 }
+  if path.length >= 8 {
+    if elabSeenDeep(seen, ELAB_SEEN_READ, b, path) { return 0 }
+  } else {
+    const key = b * 8 + path.length
+    if i32ListHas(seen, key) { return 0 }
+    seen.push(key)
   }
-  seen.push(key)
   cwIxWant()
   const ow = cwOccWalk(b)
   while cwOccNext(ow) {
@@ -15230,8 +15337,10 @@ function elabPlaceUp(x: i32): i32 {
 function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
   // Each value and path is climbed once per query: the alias edges reach one from several sides.
   // A name's occurrence is climbed once already, by its binding's walk.
-  if u < 0 || u >= P.nodes.length || path.length >= 8 { return 0 }
-  if !(nodeAt(u) is Ident) {
+  if u < 0 || u >= P.nodes.length { return 0 }
+  if path.length >= 8 {
+    if elabSeenDeep(seen, ELAB_SEEN_CLIMB, u, path) { return 0 }
+  } else if !(nodeAt(u) is Ident) {
     const key = elabClimbKey - u * 8 - path.length
     if i32ListHas(seen, key) { return 0 }
     seen.push(key)
@@ -15563,6 +15672,59 @@ function elabSameSlotsMethod(m: string): boolean {
 
 // Keys the climb's `seen` entries apart from the bindings' (`b * 8 + n`) and returns' (`-2 - ...`).
 const elabClimbKey = 0 - 1073741824
+
+// Markers of a deep-path `seen` entry (`elabSeenDeep`): the marker, the node, the path's id.
+const ELAB_SEEN_CLIMB = 0 - 1073741823
+const ELAB_SEEN_READ = 0 - 1073741822
+const ELAB_SEEN_RET = 0 - 1073741821
+
+// Each slot path a deep walk reached, by its text (`/` before each step and after the last).
+let elabPathIds: {[string]: i32} = Map()
+let elabPathTexts: string[] = []
+
+// The text of slot path `path`: `/` before each step and after the last.
+function elabPathText(path: string[]): string {
+  let t = "/"
+  for st in path { t = t + st + "/" }
+  return t
+}
+
+// The id of path text `t`, interned.
+function elabPathIdOf(t: string): i32 {
+  const have = elabPathIds.get(t) ?? -1
+  if have >= 0 { return have }
+  elabPathIds.set(t, elabPathTexts.length)
+  elabPathTexts.push(t)
+  return elabPathTexts.length - 1
+}
+
+// Whether walk `tag` already reached node `x` at `path`, or at a path `path` ends with: the walk
+// came round a cycle that only lengthened the path, which delivers nothing new. Notes `x` at `path`
+// otherwise. A walk ends at a cycle, not at a depth.
+function elabSeenDeep(seen: i32[], tag: i32, x: i32, path: string[]): boolean {
+  const t = elabPathText(path)
+  let i = 0
+  while i + 2 < seen.length {
+    const pi = seen[i + 2]
+    if (
+      seen[i] == tag
+      && seen[i + 1] == x
+      && pi >= 0
+      && pi < elabPathTexts.length
+    ) {
+      const prev = elabPathTexts[pi]
+      const n = prev.length
+      if n <= t.length && t.slice(t.length - n, t.length) == prev {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  seen.push(tag)
+  seen.push(x)
+  seen.push(elabPathIdOf(t))
+  return false
+}
 
 // Whether list or map method `m` hands back one of the receiver's elements.
 function elabElemMethod(m: string): boolean {
@@ -16597,11 +16759,14 @@ function elabLoopVarDeliveries(
 // Adds to `out` where slot `path` of the value function `f` returns is delivered: read at each call
 // of `f`, or handed on from it.
 function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
-  const key = 0 - 2 - (f * 8 + path.length)
-  if f < 0 || f >= P.nodes.length || i32ListHas(seen, key) || seen.length > 32 {
-    return 0
+  if f < 0 || f >= P.nodes.length || seen.length > 32 { return 0 }
+  if path.length >= 8 {
+    if elabSeenDeep(seen, ELAB_SEEN_RET, f, path) { return 0 }
+  } else {
+    const key = 0 - 2 - (f * 8 + path.length)
+    if i32ListHas(seen, key) { return 0 }
+    seen.push(key)
   }
-  seen.push(key)
   const calls: i32[] = []
   elabRetCalls(f, calls)
   // A lambda is called through the binding it initialises.
@@ -22909,7 +23074,9 @@ function eplSrcHolder(h0: i32): i32 {
   // what the loop's value is.
   const lc = lvCarrierLoopOf(h0)
   const lx = if h0 >= cwIxCoveredLen() { lvExitLoops[h0] ?? -1 } else { -1 }
-  let h = if lc >= 0 { lc } else if lx >= 0 { lx } else { elabCellLitBinding(h0) }
+  // A temp the capture rewrite minted for a closure's write holds its cell's binding.
+  const wc = if h0 >= cwIxCoveredLen() { cboxWriteCells[h0] ?? -1 } else { -1 }
+  let h = if lc >= 0 { lc } else if lx >= 0 { lx } else if wc >= 0 { wc } else { elabCellLitBinding(h0) }
   if h >= cwIxCoveredLen() {
     const o = declOrigOf(h)
     h = if o >= 0 { o } else { nodeSrc[h] ?? -1 }
@@ -22934,7 +23101,16 @@ function eplSlotPlace(holder0: i32, path: string[], k: i32): i32 {
     && ekDecl[k] == holder
   EPL.k = if own && k < ekParent.length { ekParent[k] } else { k }
   let p = if holder < P.nodes.length && nodeAt(holder) is FuncDecl { eplPlaceOf(holder, 0) } else { eplRoot(holder) }
-  for step in path { p = eplChild(p, step) }
+  // A binding the capture rewrite made a shared cell holds its value at the cell's one element, and
+  // the classes place the binding as written.
+  const cell = path.length > 0
+    && path[0] == "e"
+    && (cboxCellDecls[cboxDeclKey(holder)] ?? 0) == 1
+  let i = if cell { 1 } else { 0 }
+  while i < path.length {
+    p = eplChild(p, path[i])
+    i = i + 1
+  }
   return p
 }
 
