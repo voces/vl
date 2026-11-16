@@ -247,6 +247,8 @@ let sbAliasTo: i32[] = []
 // Notes the binding name `x` reads as escaped unless its parent reads it as a holder.
 function sbEscapeNote(x: i32) {
   const b = identDeclOf(x)
+  const fd = identFnDeclOf(x)
+  if fd >= 0 && !sbIsCallee(x) { sbValueFn[fd] = true }
   if b >= 0 && b < P.nodes.length && nodeAt(b) is Param {
     sbParamStoreNote(x, b)
   }
@@ -305,13 +307,13 @@ function sbPushesOwn(b: i32, n: Call): boolean {
   return n.callArgs.length > 0
 }
 
-// Notes each set in `ss`, every set one place is reached by, as partial when the place is also
-// reached by another set or, when `lack`, by a value of no set: an instance binds it otherwise.
-function sbPartialNote(ss: i32[], lack: boolean) {
+// Notes each set in `ss`, every set one place is reached by, as partial when, with `others`, the
+// place is also reached by another set or, when `lack`, by a value of no set.
+function sbPartialNote(ss: i32[], lack: boolean, others: boolean) {
   for s in ss {
     let other = lack
     for o in ss {
-      if o != s && !fnTagMembersWithin(o, s) { other = true }
+      if others && o != s && !fnTagMembersWithin(o, s) { other = true }
     }
     if other { sbPartial[s] = true }
   }
@@ -369,6 +371,21 @@ function sbParamStoreNote(x: i32, b: i32) {
     sbStoredParams[b] = true
   }
   return 0
+}
+
+// Each declared function read other than as a callee: a value, whose instances share its calls.
+let sbValueFn: {[i32]: boolean} = Map()
+
+// Whether name `x` is the callee of the call it stands in.
+function sbIsCallee(x: i32): boolean {
+  let c = x
+  let p = if x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  while p >= 0 && p < P.nodes.length && nodeAt(p) is Paren {
+    c = p
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { nodeAt(x) }
+  return pn is Call && pn.callFn == c
 }
 
 // Whether local binding `b` holds no more than its initialiser says: never re-pointed and never
@@ -726,6 +743,7 @@ export function setBindTrySets(end: i32): i32[] {
   for hs in sbHandedCalls { sbCalledSets.push(hs) }
   const out: i32[] = []
   for s in sbCalledSets {
+    if sbFollowsJoin(s) || (sbCloDelivered[s] ?? false) { continue }
     const sure = !sbSetHasGeneric(s)
       && !(sbStoredSets[s] ?? false)
       && !(sbViaMember[s] ?? false)
@@ -762,6 +780,8 @@ export function setBindBuild() {
   const ck = sbEnd
   const end = if ck >= 0 && ck < P.nodes.length { ck } else { P.nodes.length }
   sbEscaped = Map()
+  sbValueFn = Map()
+  sbCloDelivered = Map()
   sbParamEscaped = Map()
   sbStoredParams = Map()
   sbPartial = Map()
@@ -827,6 +847,7 @@ export function setBindBuild() {
       sbElemCallRows(d, dn)
       sbThroughNote(d, dn)
       sbConstLambdaCallRows(d, dn)
+      sbCloDeliveryNote(dn)
       sbCallbackNote(d, dn)
     }
     d = d + 1
@@ -934,7 +955,11 @@ function setBindCallsIn(d: i32, out: string[]) {
         if q >= 0 {
           const esc = dn is FuncDecl
             && (sbParamEscaped[dn.fnParams[q]] ?? false)
-          sbPartialNote(setBindSetsOf(d, q), sbRowsLackSet(d, q) || esc)
+          // An instance is keyed by the set its parameter holds, so another set at another call
+          // is another instance, unless the function is a value (aliased, held, a lambda),
+          // whose instances share the call.
+          const valued = (sbValueFn[d] ?? false) || fnNameIsLambda(dn.fnName)
+          sbPartialNote(setBindSetsOf(d, q), sbRowsLackSet(d, q) || esc, valued)
           for s in setBindSetsOf(d, q) {
             if s >= 0 {
               out.push("P" + sbKey(d, q) + "|" + i32ToStr(s))
@@ -1082,7 +1107,7 @@ function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
           if s0 < 0 { lack = true }
           else if !i32ListHas(seen, s0) { seen.push(s0) }
         }
-        sbPartialNote(seen, lack || sbRowsLackSet(d, q))
+        sbPartialNote(seen, lack || sbRowsLackSet(d, q), true)
         for t in sbTysOf[sbKey(d, q)] ?? [] {
           const s = fnTagSetOfTy(sbTyAtPath(t, steps))
           if s >= 0 {
@@ -1117,6 +1142,40 @@ function sbTyAtPath(t: i32, steps: string[]): i32 {
     k = k - 1
   }
   return cur
+}
+
+// Each set a call hands to a parameter annotated by a closed function type: a closure is built
+// there, so the set's tag is decided after the elaboration notes that delivery.
+let sbCloDelivered: {[i32]: boolean} = Map()
+
+// Notes the sets call `n` hands to closed-function-typed parameters of a declared function.
+function sbCloDeliveryNote(n: Call) {
+  const fd = identFnDeclOf(parenPeelIx(n.callFn))
+  const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { n }
+  if !(fdn is FuncDecl) { return 0 }
+  let i = 0
+  while i < n.callArgs.length && i < fdn.fnParams.length {
+    const pn = nodeAt(fdn.fnParams[i])
+    if pn is Param && pn.parType >= 0 && sbBareTyParamOf(fdn, i) == "" {
+      const st = fnTagSetOfTy(nodeTyIxOf(parenPeelIx(n.callArgs[i])))
+      if st >= 0 { sbCloDelivered[st] = true }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether one-member set `s` has its member inside a larger set the rows reach: the tag decision
+// decides it with that join (`fnTagDecide`'s two passes), so the check leaves it to the decision
+// that decides the join.
+function sbFollowsJoin(s: i32): boolean {
+  if fnTagMembers(s).length != 1 { return false }
+  for t in sbCalledSets {
+    if t != s && fnTagMembers(t).length > 1 && fnTagMembersWithin(s, t) {
+      return true
+    }
+  }
+  return false
 }
 
 // Whether set `s` has a generic member: an instance types a call through it at the member's
