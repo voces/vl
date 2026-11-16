@@ -370,6 +370,7 @@ const BASELINES = [
   "scripts/sentinel-budget-baseline.json",
   "scripts/byte-budget-baseline.json",
   "scripts/arena-write-budget-baseline.json",
+  "scripts/walk-limit-budget-baseline.json",
   "scripts/unused-budget-baseline.json",
   "scripts/scan-budget-baseline.json",
   "scripts/comment-budget-baseline.json",
