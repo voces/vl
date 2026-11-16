@@ -30,13 +30,13 @@ ftlate probe, all `@run` programs, fixpoint seeds:
 
 | | before | after |
 |---|---|---|
-| programs whose decision the late pass changes | 331 | 288 |
-| T sets / programs | 150 / 95 | 81 / 50 |
+| programs whose decision the late pass changes | 334 | 288 |
+| T sets / programs | 153 / 98 | 81 / 50 |
 | late drops | 2 | 2 (the same pair) |
 
 Before this step, a scratch probe of `ftPlan`'s refusals on the T programs put the innermost
 refusal of 98 T sets at `ftCtxOk`, for an argument to a call through a held set (21 sets) or
-through an element, field or choice (77). This step moves 69 sets; which of the 98 they are was
+through an element, field or choice (77). This step moves 72 sets; which of the 98 they are was
 not split out.
 
 What T still holds:
@@ -53,6 +53,37 @@ differ, so they belong to the slice that covers that population (N).
 - A/B, fixpoint against master's fixpoint:
   - all `@run` programs: wasm and output byte-identical;
   - the 1,789 other cases: `vl check` output byte-identical.
-- The late pass still runs for every class. No `fnTagRedecide` branch is deleted here, because
-  the same late paths still decide T's remaining 81 sets. The deletion lands with the PR that moves
-  the last of them.
+- No `fnTagRedecide` branch is deleted here, because the same late paths still decide T's
+  remaining 81 sets. The deletion lands with the PR that moves the last of them.
+
+## One decider per set: the late branch is narrowed to the named exclusions
+
+This follows the coordinator's amendment of 2026-11-16 to the staging. The late T branch may admit
+only a set the facts exclude:
+- open argument types;
+- a lambda or generic body;
+- a lambda member;
+- split results;
+- or no complete facts at all.
+
+The last of these covers two cases: an argument-takes test on a parameter no arrow row reaches,
+and a parameter the set-binding rows never bring the set to.
+
+The mechanism:
+- The check records each set its retry refused through a test that reads the facts (an
+  argument-takes test on a reached parameter, a fact call's arguments, completeness), with no open
+  or split row.
+- `fnTagLateOutsideExclusions` names such a set the late decision went on to tag, and
+  `elabPrepare`'s caller fails on it (`emitFail`).
+
+| build | programs the probe fires on |
+|---|---|
+| a control that counts open sets as refused by the facts | 10 |
+| this build | 0 |
+
+Two earlier drafts of the classification fired on the corpus. In both, the facts were missing, not
+refusing:
+- first, late-only gates unrelated to the facts (hand-backs, holder contexts);
+- then, members no solve reaches, and producer gaps.
+
+The final classification counts only refusals that read the facts.
