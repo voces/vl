@@ -293,8 +293,6 @@ print("done")   // prints done
 > Ruling: DECISIONS.md §"A CONSTANT range that cannot run is refused; a computed one still
 > runs zero times" (D1588, 2026-09-04).
 
-> Status: `step 0` is reported twice (D4057).
-
 Open question (Q9): should a constant `a until a`, which never runs, be refused like
 `3 to 0`?
 
