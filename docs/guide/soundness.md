@@ -12,13 +12,28 @@ fails to compile; it never defers a type decision to runtime.
 This document states the contract. The executable form of the contract lives in
 [`tests/cases/soundness/`](../../tests/cases/soundness/): a curated, growing corpus
 of small "must-error" and "must-not-error" programs. The test runner is **strict
-by default** — a case fails on any diagnostic (error, warning, or info) it did
-not declare, and `@run` cases compare the entire log output — so a "must-not-error"
-case is simply one with no `@error` directive: clean compile is the default
-assertion, no `@ok` needed. Deep changes to inference, flow narrowing, union
+by default**: every error a case produces must match one of its `@error` directives
+and every directive an error, a single-file case with no error directive is also
+held to its `@warning`/`@info`/`@hint` directives in both directions, and `@run`
+cases compare the entire log output. So a "must-not-error" case is simply one with
+no `@error` directive: clean compile is the default assertion, no `@ok` needed. Deep changes to inference, flow narrowing, union
 representation, or codegen must keep that corpus green (`deno task test`); a
 soundness regression either makes a clean case start erroring, or removes the
 error from a `@error` case, and breaks the suite.
+
+## The two clauses
+
+The standing bar has two halves, and this guide is about the first:
+
+1. **Soundness.** If `vl check` accepts a program, it builds and runs correctly: no wrong
+   value, no trap the program did not ask for, no invalid wasm. A check-clean program that
+   misbehaves is a clause-1 defect, the most urgent kind.
+2. **No capability refusals.** The checker rejects only what the language design forbids. A
+   refusal that admits the program was legal ("not yet supported by codegen") keeps clause 1
+   intact, since nothing wrong runs, but it is still an open defect against clause 2.
+
+A loud refusal is therefore never a soundness bug, and making a silent failure loud closes a
+clause-1 defect while leaving a clause-2 one open until the program runs.
 
 ## What the contract guarantees
 
@@ -31,8 +46,8 @@ error from a `@error` case, and breaks the suite.
   every value and defers checking. Where a value can be one of several types, it
   has an explicit **union** type and must be narrowed before use.
   The *diagnostics* say the same thing: an unresolved hole renders as the blank
-  `_` — "comparison expects numeric operands, got `_` and boolean", "cannot
-  assign `(_, _) -> _` to 'c' of type `(i32, i32) -> string`". `_` is not a type
+  `_` — "cannot assign `(_) => _` to 'g' of type `(i32) => string`", "print expects
+  one scalar or string value …, got `_[]`". `_` is not a type
   name; it is an unfilled slot, and there is nothing to write in it because the
   fix is to constrain the hole (pass a different argument, add an annotation),
   never to name a top type.
@@ -119,8 +134,8 @@ Float VALUES are unaffected: `const X = 2.5` is an `f64`. An integer literal typ
 from a float of the same value — over `1 | 2 | f64`, `is 2` holds for the integer `2` and not
 for the float `2.0`.
 
-- rejected: `float-literal-type-refused.vl`
-- sound: `float-literal-type-suggested-fix-runs.vl`, `is-int-literal-set-dispatch.vl`
+- rejected: `literal-unions/float-literal-type-refused.vl`
+- sound: `literal-unions/float-literal-type-suggested-fix-runs.vl`, `literal-unions/is-int-literal-set-dispatch.vl`
 
 ### A `const` bound to a string literal has that literal's type
 `const MODE = "debug"` has the type `"debug"`, not `string`. It reads as a plain `string`
@@ -144,8 +159,8 @@ declared literal type on the other side, and `MODE is "release"`. It never touch
   ordinary test, still checked against that set;
 - **declare it `string`** — `const MODE: string = "debug"` — and it compares with anything.
 
-- rejected: `const-literal-impossible-compare.vl`
-- sound: `const-literal-compare-allowed.vl`, `const-literal-widening.vl`
+- rejected: `literal-unions/const-literal-impossible-compare.vl`
+- sound: `literal-unions/const-literal-compare-allowed.vl`, `literal-unions/const-literal-widening.vl`
 
 ### Equality is typed
 `==`/`!=` require comparable operand types — there is no JS-style cross-type
@@ -258,7 +273,20 @@ like a known failure while pinning correct behavior is a documentation defect �
 six such files here left ROADMAP A13 reading OPEN long after its defect was fixed.
 A must-error pin is named `*-reject.vl`, whatever it took to get it there.
 
-There are currently **no** `xfail-unsound-*` files. Container element variance is
-the live unsound corner and is **not** pinned here at all: a `Cat[]` flowing into
-an `Animal[]` parameter is silently accepted and emits invalid wasm
-(`docs/internals/open-rulings.md`).
+There are currently **no** `xfail-unsound-*` files. Container element variance, once
+the live unsound corner, is now graded both ways: a `Cat[]` read through an
+`Animal[]` parameter runs (the parameter is instantiated per concrete record, as width
+subtyping does at any depth, DECISIONS "Width subtyping reaches nested fields"), and
+a write that would store an `Animal` into that `Cat[]` is refused loudly:
+
+```
+function add(xs: Animal[]) { xs.push({ legs: 3 }) }
+const cs: Cat[] = [{ legs: 4, purr: true }]
+add(cs)
+// error: an object value of shape Cat flowing into Animal (reached through Cat[] into
+// Animal[]) drops the field `purr`: type-valid (structural width subtyping) but not yet
+// supported by codegen — …
+```
+
+That refusal keeps clause 1 and is a clause-2 gap, the container half of width
+subtyping (ROADMAP, Track A).

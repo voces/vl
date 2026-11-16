@@ -3,6 +3,17 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
+import {
+  BND_ARRDEF,
+  BND_BM,
+  BND_IS,
+  BND_LET,
+  BND_NEST,
+  BND_PRINT,
+  bndAt,
+  bndCount,
+  bndNextRow,
+} from "./check_iface"
 import { rowParamIsSlot } from "./check_row_param"
 import { identityCstrOffender, identityCstrRefusal } from "./check_identity"
 import { cwIxCovers, cwIxParent } from "./check_write_scan"
@@ -177,17 +188,12 @@ import {
   CV_UFCS,
   MC_LAYOUT_MARK,
   argCstr,
-  arrDefCstr,
   binCstr,
-  bmCstr,
   cstrOwnerTop,
   cvNow,
   cvPick,
-  isCstr,
-  letCstr,
   memCalleeIs,
   memCstr,
-  nestCstr,
   noteArgCstr,
   noteArrDefCstr,
   noteBinCstrAt,
@@ -195,7 +201,6 @@ import {
   noteMemCstr,
   noteNestCstr,
   notePrintCstr,
-  printCstr,
   ufcsCstr,
 } from "./check_cstr_rows"
 import { curFnDeclIx, inferQuiet, njFnStack } from "./check_cursor"
@@ -433,6 +438,7 @@ import {
 } from "./check_subst"
 import {
   demangleName,
+  fieldNearNote,
   listMethodNames,
   listMethodSpellFrom,
   listMethodSpellTo,
@@ -1633,7 +1639,11 @@ function memberFloorMsg(objTy: i32, prop: string) {
   const ot = tyAt(objTy)
   if ot is TyObj {
     if objFieldType(ot, prop) >= 0 { return "" }
-    return "no field '" + prop + "' on " + tyToStr(objTy)
+    return "no field '"
+      + prop
+      + "' on "
+      + tyToStr(objTy)
+      + fieldNearNote(ot.objFieldNames, prop)
   }
   if ot is TyErr { return "" }
   if ot is TyUnion {
@@ -1926,24 +1936,25 @@ export function validatePrintCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrigP = printCstr.ty.length
   const cvWas = cvNow
-  let ci = 0
-  while ci < nOrigP {
+  const n = bndCount(BND_PRINT)
+  let ci = bndNextRow(BND_PRINT, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_PRINT, ci)
     if (
-      cstrOwnedBy(printCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(printCstr.ix[ci])
-      && !gnotDeadAtPin(printCstr.ty[ci], bNames, bTys)
+      cstrOwnedBy(row.fn, calleeFn)
+      && !nestCstrOutside(row.site)
+      && !gnotDeadAtPin(row.on, bNames, bTys)
     ) {
       cvNow = cvPick(CV_PRINT, ci, cvWas)
-      const cpt = substTyDeep(printCstr.ty[ci], bNames, bTys)
+      const cpt = substTyDeep(row.on, bNames, bTys)
       if (
         calleeFn >= 0
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if cpt != printCstr.ty[ci] {
-          if tyHasHole(cpt) { notePrintCstr(cpt, printCstr.ix[ci]) }
+        if cpt != row.on {
+          if tyHasHole(cpt) { notePrintCstr(cpt, row.site) }
         }
       }
       if !tyHasHole(cpt) {
@@ -1970,7 +1981,7 @@ export function validatePrintCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_PRINT, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -1986,21 +1997,19 @@ export function validateArrDefCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const n0 = arrDefCstr.ty.length
-  let ci = 0
-  while ci < n0 {
-    if (
-      cstrOwnedBy(arrDefCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(arrDefCstr.ix[ci])
-    ) {
-      const lt = arrDefCstr.ty[ci]
+  const n = bndCount(BND_ARRDEF)
+  let ci = bndNextRow(BND_ARRDEF, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_ARRDEF, ci)
+    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+      const lt = row.on
       const l = tyAt(lt)
       if l is TyArray {
         if !tyElemOpen(l) && tyHasHole(tyElemOf(l)) {
           const el = substTyDeep(tyElemOf(l), bNames, bTys)
           if tyHasHole(el) {
             if el != tyElemOf(l) && calleeFn >= 0 {
-              noteArrDefCstr(mkArrayTy(el), arrDefCstr.ix[ci])
+              noteArrDefCstr(mkArrayTy(el), row.site)
             }
           } else if (
             el >= 0
@@ -2023,7 +2032,7 @@ export function validateArrDefCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_ARRDEF, calleeFn, ci, n)
   }
   return 0
 }
@@ -2245,19 +2254,25 @@ export function pinBmCstrElems(
   // A body's own lists are pinned in place only once pass 2 has checked it; a call above the
   // declaration of a body that writes its parameter is checked after it (D16426).
   const grow = calleeFn >= 0 && nodeTyOf(calleeFn) >= 0
-  const nb = bmCstr.got.length
-  const nl = letCstr.got.length
+  const nb = bndCount(BND_BM)
+  const nl = bndCount(BND_LET)
   let ci = 0
   let li = 0
   while ci < nb || li < nl {
-    while ci < nb && !cstrOwnedBy(bmCstr.fn[ci], calleeFn) { ci = ci + 1 }
-    while li < nl && !cstrOwnedBy(letCstr.fn[li], calleeFn) { li = li + 1 }
+    while ci < nb && !cstrOwnedBy(bndAt(BND_BM, ci).fn, calleeFn) {
+      ci = ci + 1
+    }
+    while li < nl && !cstrOwnedBy(bndAt(BND_LET, li).fn, calleeFn) {
+      li = li + 1
+    }
     let takeBm = ci < nb
-    if ci < nb && li < nl { takeBm = bmCstr.seq[ci] <= letCstr.seq[li] }
+    if ci < nb && li < nl {
+      takeBm = bndAt(BND_BM, ci).seq <= bndAt(BND_LET, li).seq
+    }
     if takeBm && ci < nb {
       pinOpenElemFrom(
-        bmCstr.got[ci],
-        bmCstr.want[ci],
+        bndAt(BND_BM, ci).on,
+        bndAt(BND_BM, ci).a,
         bNames,
         bTys,
         ix,
@@ -2267,8 +2282,8 @@ export function pinBmCstrElems(
       ci = ci + 1
     } else if li < nl {
       pinOpenElemFrom(
-        letCstr.got[li],
-        letCstr.want[li],
+        bndAt(BND_LET, li).on,
+        bndAt(BND_LET, li).a,
         bNames,
         bTys,
         ix,
@@ -3936,21 +3951,22 @@ export function validateIsCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrig = isCstr.ty.length
-  let ci = 0
-  while ci < nOrig {
-    if cstrOwnedBy(isCstr.fn[ci], calleeFn) && !nestCstrOutside(isCstr.ix[ci]) {
-      const ct = substTyDeep(isCstr.ty[ci], bNames, bTys)
+  const n = bndCount(BND_IS)
+  let ci = bndNextRow(BND_IS, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_IS, ci)
+    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+      const ct = substTyDeep(row.on, bNames, bTys)
       if tyHasHole(ct) {
-        if calleeFn >= 0 && ct != isCstr.ty[ci] {
-          noteIsCstr(ct, isCstr.chk[ci], isCstr.name[ci], isCstr.ix[ci])
+        if calleeFn >= 0 && ct != row.on {
+          noteIsCstr(ct, row.a, row.s, row.site)
         }
       } else if ct >= 0 {
         const t = tyAt(ct)
         let base = -1
         if t is TyUnion { base = ct }
         if t is TyNullable { base = t.nInner }
-        const chk = isCstr.chk[ci]
+        const chk = row.a
         const bad = base >= 0
           && (!assignable(chk, base) || isWidenNotVariant(chk, base))
         if bad && t is TyNullable && tyHasObjMember(base) {
@@ -3959,7 +3975,7 @@ export function validateIsCstrs(
           tErr(
             pWho
               + "`is` check type '"
-              + isCstr.name[ci]
+              + row.s
               + "' is not a variant of "
               + tyToStr(ct),
             ix,
@@ -3968,7 +3984,7 @@ export function validateIsCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_IS, calleeFn, ci, n)
   }
   return 0
 }
@@ -3989,18 +4005,14 @@ export function validateNestCstrs(
     bi = bi + 1
   }
   if !anyVec { return 0 }
-  const nOrig = nestCstr.ty.length
-  let ci = 0
-  while ci < nOrig {
-    if (
-      cstrOwnedBy(nestCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(nestCstr.ix[ci])
-    ) {
-      const ct = substTyDeep(nestCstr.ty[ci], bNames, bTys)
+  const n = bndCount(BND_NEST)
+  let ci = bndNextRow(BND_NEST, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_NEST, ci)
+    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+      const ct = substTyDeep(row.on, bNames, bTys)
       if tyHasHole(ct) {
-        if calleeFn >= 0 && ct != nestCstr.ty[ci] {
-          noteNestCstr(ct, nestCstr.ix[ci])
-        }
+        if calleeFn >= 0 && ct != row.on { noteNestCstr(ct, row.site) }
       } else if tyNestsV128(ct, 8) {
         let pWho = "a type parameter is stored in a container here: "
         if who != "" {
@@ -4022,7 +4034,7 @@ export function validateNestCstrs(
         return 0
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_NEST, calleeFn, ci, n)
   }
   return 0
 }

@@ -1,0 +1,136 @@
+// The touch set of each top-level function: every module global it, or anything it calls, reads
+// or writes, closed over the effect summary's call edges and the functions it names as values
+// (init-order-design-2026-11.md §2.1). An instrument only; no pass reads it, and nothing computes
+// it unless the host asks: `touchDumpBuild`, then `touchDumpAt`.
+import { FuncDecl, P, nodeAt } from "./ast"
+import { esRows } from "./check_effect_rows"
+import { esDeclRow } from "./check_program"
+import { fnDeclIx } from "./check_write_scan"
+
+let touchText = ""
+
+// The rows reachable from row `r` through call edges and function-value names, `r` included.
+// `succ` lists each row's successors; a value-named declaration's row is computed on first use.
+function touchReach(r: i32, succ: Map<i32, i32[]>): i32[] {
+  const seen: Map<i32, boolean> = Map()
+  const out: i32[] = []
+  const work: i32[] = [r]
+  while work.length > 0 {
+    const x = work.pop() ?? -1
+    if x >= 0 && !seen.has(x) {
+      seen[x] = true
+      out.push(x)
+      for y in succ[x] ?? [] { work.push(y) }
+    }
+  }
+  return out
+}
+
+// Each row's successors: the callee rows its body calls and the rows of the functions it names as
+// values. Naming one computes its row, which may add rows and edges, so it runs to a fixpoint.
+function touchSuccessors(): Map<i32, i32[]> {
+  const succ: Map<i32, i32[]> = Map()
+  let e = 0
+  let v = 0
+  while e < esRows.edgeFrom.length || v < esRows.fnValRow.length {
+    if e < esRows.edgeFrom.length {
+      const from = esRows.edgeFrom[e]
+      const list = succ[from] ?? []
+      list.push(esRows.edgeTo[e])
+      succ[from] = list
+      e = e + 1
+    } else {
+      const d = esRows.fnValDecl[v]
+      if d >= 0 {
+        const from = esRows.fnValRow[v]
+        const to = esDeclRow(d)
+        const list = succ[from] ?? []
+        list.push(to)
+        succ[from] = list
+      }
+      v = v + 1
+    }
+  }
+  return succ
+}
+
+// One line for function `name` at row `r`: its name, its sorted touch set, and `lambda` when a
+// reachable row builds a lambda whose body the summary does not enter, or `unknown` when one
+// calls a function it cannot name; either way the set may be short.
+function touchLine(
+  name: string,
+  r: i32,
+  succ: Map<i32, i32[]>,
+  own: Map<i32, string[]>,
+): string {
+  const rows = touchReach(r, succ)
+  let lambda = false
+  let unknown = false
+  const names: Map<string, boolean> = Map()
+  for x in rows {
+    if x < esRows.makesLambda.length && esRows.makesLambda[x] { lambda = true }
+    if x < esRows.unknown.length && esRows.unknown[x] != "" { unknown = true }
+    for nm in own[x] ?? [] { names[nm] = true }
+  }
+  // Insertion order of a map is first-touch order, so the names are sorted for a stable line.
+  const sorted: string[] = []
+  for k in names.keys() {
+    sorted.push(k)
+    let j = sorted.length - 1
+    while j > 0 && sorted[j - 1] > k {
+      sorted[j] = sorted[j - 1]
+      j = j - 1
+    }
+    sorted[j] = k
+  }
+  let line = name + "\t"
+  let i = 0
+  while i < sorted.length {
+    if i > 0 { line = line + "," }
+    line = line + sorted[i]
+    i = i + 1
+  }
+  if lambda { line = line + "\tlambda" }
+  if unknown { line = line + "\tunknown" }
+  return line
+}
+
+// Builds the dump, one line per top-level function, and returns its length.
+export function touchDumpBuild(): i32 {
+  const fnNames: string[] = []
+  const fnRows: i32[] = []
+  for name in fnDeclIx.keys() {
+    const ix = fnDeclIx[name] ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = nodeAt(ix)
+      if n is FuncDecl {
+        fnNames.push(name)
+        fnRows.push(esDeclRow(ix))
+      }
+    }
+  }
+  const succ = touchSuccessors()
+  // Each row's own touches, indexed once rather than rescanned per line.
+  const own: Map<i32, string[]> = Map()
+  let t = 0
+  while t < esRows.touchRow.length {
+    const list = own[esRows.touchRow[t]] ?? []
+    list.push(esRows.touchName[t])
+    own[esRows.touchRow[t]] = list
+    t = t + 1
+  }
+  let out = ""
+  let i = 0
+  while i < fnNames.length {
+    out = out + touchLine(fnNames[i], fnRows[i], succ, own) + "\n"
+    i = i + 1
+  }
+  touchText = out
+  return out.length
+}
+
+// Code point `i` of the dump, 0 past its end.
+export function touchDumpAt(i: i32): i32 {
+  if i < 0 || i >= touchText.length { return 0 }
+  return touchText[i]
+}

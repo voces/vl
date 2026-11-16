@@ -9,6 +9,20 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-width-param-misfit-d16707](2026-11-16-width-param-misfit-d16707.md): The layout sentence for a misfitting write through a rewritten parameter (D16707), 2026-11-16
+- [2026-11-16-width-nested-nullable-d16705](2026-11-16-width-nested-nullable-d16705.md): Nested width behind `| null` (D16705), 2026-11-16
+- [2026-11-16-type-hashcons-s6b1-literal-tree-caps](2026-11-16-type-hashcons-s6b1-literal-tree-caps.md): Type hash-cons stage 6b, batch 1: six literal-tree walkers lose their depth caps (lane H), 2026-11-16
+- [2026-11-16-slot-store-stage-2b-part3b](2026-11-16-slot-store-stage-2b-part3b.md): Slot store, stage 2b part 2b(iii) B: a returned function reaches the caller's call (lane SLOT, 2026-11-16)
+- [2026-11-16-l2-s2-let-bm-bounds](2026-11-16-l2-s2-let-bm-bounds.md): L2 S2, third tables: write and builtin-method rows become `Iface` bounds, 2026-11-16
+- [2026-11-16-l2-s2-is-ret-bounds](2026-11-16-l2-s2-is-ret-bounds.md): L2 S2, second tables: `is` and return rows become `Iface` bounds, 2026-11-16
+- [2026-11-16-width-nested-d3431](2026-11-16-width-nested-d3431.md): Width subtyping at nested depth (D3431, owner ruling (b)), 2026-11-16
+- [2026-11-16-wasmtime-gc-array-gap](2026-11-16-wasmtime-gc-array-gap.md): 2026-11-16 — lane AE4: the same module runs up to 2.8× slower under wasmtime than under V8
+- [2026-11-16-type-hashcons-s6a-cap-census](2026-11-16-type-hashcons-s6a-cap-census.md): Type hash-cons stage 6a: which depth caps fire, and whether their answers depend on the depth (lane H), 2026-11-16
+- [2026-11-16-type-hashcons-s5a-key-structure](2026-11-16-type-hashcons-s5a-key-structure.md): Type hash-cons stage 5a: mono's instance key stops parsing itself (lane H), 2026-11-16
+- [2026-11-16-type-hashcons-s4i-measured](2026-11-16-type-hashcons-s4i-measured.md): Type hash-cons stage 4i, measured and not taken: the emitter's comparers stay structural (lane H), 2026-11-16
+- [2026-11-16-slot-store-stage-2b-part3a](2026-11-16-slot-store-stage-2b-part3a.md): Slot store, stage 2b part 2b(iii) A: two more elab readers read the classes (lane SLOT, 2026-11-16)
+- [2026-11-16-rep-adt-stage3c-read-shadow](2026-11-16-rep-adt-stage3c-read-shadow.md): Rep ADT stage 3c-i: the read-time field-code shadow, 2026-11-16 (lane REP)
+- [2026-11-16-l2-s2-tyix-bounds](2026-11-16-l2-s2-tyix-bounds.md): L2 S2, first tables: `print`, `__array_new_default__` and nest rows become `Iface` bounds, 2026-11-16
 - [2026-11-16-type-hashcons-s4h-same-shadow](2026-11-16-type-hashcons-s4h-same-shadow.md): Type hash-cons stage 4h: the emitter's `tySame` and `tyEq` graded against ids (lane H), 2026-11-16
 - [2026-11-16-store-fntag-redecide-step1](2026-11-16-store-fntag-redecide-step1.md): One storage decider, step 1: the check-readable late branches, 2026-11-16
 - [2026-11-16-l2-s2-g5-close](2026-11-16-l2-s2-g5-close.md): L2 S2 group 5 closed: hole links and the remainder judge need no stored row, 2026-11-16
