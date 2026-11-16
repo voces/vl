@@ -20,6 +20,8 @@ sink. Everything after that reads those call nodes.
   call through `r.f` still names the callee whose open type the family records. Without this,
   `closures/record-of-named-fn-in-generic-field-written-with-named-fn` and its named twin
   `d16221_lit_in_hole_fn_written` built invalid wasm.
+- **The walk's call sink is deleted** (`elabCallSink`, `elabCallSinkOn`). No reader turns it on
+  any more.
 
 ## Parity
 
@@ -45,7 +47,18 @@ and part B's 9 calls compared were totals across a batch.
 
 ## Readings
 
-READINGS
+Fixpoint seeds: master `350eab14` with part A merged, part B (#8522), and this branch, each
+byte-identical on a second refresh.
+
+| check | reading |
+|---|---|
+| distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 runs → not-runs, 0 → silent |
+| seed size | 6,372,129 bytes: +35 over part B, +1,956 over master |
+| L2 self-compile fuel | 90.765e9, the same as part B to 0.01%, and +0.05% over master |
+| `emit_mono` pin helpers | 908: untouched |
+| `scripts/gate.sh` | every row ok but `ir shadow`. As in part B, its one mismatch (`named/hash4h_rolled_alias_map`) is the same on master's seed |
+
+Net against part B: +19 compiler lines (64 added, 45 deleted).
 
 ## Next
 
