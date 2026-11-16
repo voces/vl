@@ -25,18 +25,21 @@ bars are unchanged.
 
 ## Readings
 
-All against master `2a0b71c1a` (D2 merged); both seeds reach their fixpoint on the second refresh.
+Against master `04d2d22d2` (D2 and #8798 merged); both seeds reach their fixpoint on the second
+refresh.
 
 - `tests/cases`, 8,137 programs with the module entries, built by both seeds (exit code, refusal
   text, wasm bytes): no difference.
 - Distilled regress: 0 runs → not-runs, 0 → silent (of 260,747 census cells); per-cell output
   identical to master's.
-- Capability matrix A/B over the 153 templates matching `maker|hole-fn|list-of|fn-record|closure|
-  captured|generic-relay`: 0 runs → not-runs in every template, no REGRESS line. The one non-zero
-  exit is `maker-calls-handed-on-at-two-signatures`, whose `one_instance` cells are invalid wasm on
-  both seeds ([D16851](../inventory/D16851.md)).
-- L2 self-compile fuel 96,383,880,667 against master's 97,687,913,071: −1.30 G, −1.33%. The flip
-  (#8731) cost +2.34 G on its own parent; with D2's +0.16 G, the walk's replacement nets about +1.2 G.
-- The seed is 2,050 bytes smaller: the build already left out most of the walk, which no export
+- Capability matrix A/B (against `2a0b71c1a`, before the last master merge) over the 153 templates
+  matching `maker|hole-fn|list-of|fn-record|closure|captured|generic-relay`: 0 runs → not-runs in
+  every template, no REGRESS line. The one non-zero exit is
+  `maker-calls-handed-on-at-two-signatures`, whose `one_instance` cells are invalid wasm on both
+  seeds ([D16851](../inventory/D16851.md)).
+- L2 self-compile fuel 94,520,912,887 against master's 95,809,052,991: −1.29 G, −1.34% (−1.20% on
+  the 95.67 G baseline). The flip (#8731) cost +2.34 G and D2 +0.16 G; the walk's replacement
+  nets about +1.2 G.
+- The seed is about 2 KB smaller: the build already left out most of the walk, which no export
   reached; the fuel is the cost of checking and elaborating its source.
-- Walk-limit: `emit_elab.vl` falls from 94 to 82.
+- Walk-limit: `emit_elab.vl` falls from 100 to 82.
