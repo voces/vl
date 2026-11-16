@@ -12332,7 +12332,7 @@ two calls; the refusal lifts with L2.
 `as% T` then applies to that exact value. At `i64` a value that fits is unchanged, so
 `(0xFFFFFFFF * 2) as% i64` is `8589934590` and `(0xFFFFFFFF + 1) as% i64` is `4294967296`, the
 same as `as i64`. A value that does not fit the target wraps, as `as%` always does. The narrower
-targets wrap that exact value: `(0xFFFFFFFF / 2) as% i32` is `2147483647`, not `-1`, and
+targets wrap that exact value: `(0xFFFFFFFF / 2) as% i32` is `2147483647`, not `0`, and
 `(0xFFFFFFFF / 256) as% u8` is `255`.
 
 **Why.** The owner asked for the choice that is consistent and meets what a human or an LLM

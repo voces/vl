@@ -9,6 +9,17 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-width-param-return-d16401](2026-11-16-width-param-return-d16401.md): A declared return of a rewritten record parameter is the instance's record (D16401), 2026-11-16
+- [2026-11-16-width-fresh-nullable-drop-d16750](2026-11-16-width-fresh-nullable-drop-d16750.md): A literal binding's nested drop into nullable storage goes to the drop adoption (D16750), 2026-11-16
+- [2026-11-16-width-callback-field-built-list-d16210](2026-11-16-width-callback-field-built-list-d16210.md): A callback over a field read of a built list takes the list's build (D16210), 2026-11-16
+- [2026-11-16-type-hashcons-s6b2-termination-caps](2026-11-16-type-hashcons-s6b2-termination-caps.md): Type hash-cons stage 6b, batch 2: three termination caps become visited sets (lane H), 2026-11-16
+- [2026-11-16-store-set-bind-shadow](2026-11-16-store-set-bind-shadow.md): One storage decider: the check-time set-binding shadow, 2026-11-16
+- [2026-11-16-slot-store-stage-2b-part3c](2026-11-16-slot-store-stage-2b-part3c.md): Slot store, stage 2b part 2b(iii) C: the uncalled family reads the classes (lane SLOT, 2026-11-16)
+- [2026-11-16-slot-store-stage-2b-part3b2](2026-11-16-slot-store-stage-2b-part3b2.md): Slot store, stage 2b part 2b(iii) B2: the literal-callee family reads the classes (lane SLOT, 2026-11-16)
+- [2026-11-16-rep-adt-stage3c-derived](2026-11-16-rep-adt-stage3c-derived.md): Rep ADT stage 3c-ii: the field code is derived, 2026-11-16 (lane REP)
+- [2026-11-16-l2-s3-plan](2026-11-16-l2-s3-plan.md): L2 S3 plan: one solver at the call, 2026-11-16
+- [2026-11-16-l2-s2-mem-ufcs-bounds](2026-11-16-l2-s2-mem-ufcs-bounds.md): L2 S2, fourth tables: member and UFCS rows become `Iface` bounds, 2026-11-16
+- [2026-11-16-l2-s2-bin-arg-bounds](2026-11-16-l2-s2-bin-arg-bounds.md): L2 S2, last tables: binary-operator and argument rows become `Iface` bounds, 2026-11-16
 - [2026-11-16-width-param-misfit-d16707](2026-11-16-width-param-misfit-d16707.md): The layout sentence for a misfitting write through a rewritten parameter (D16707), 2026-11-16
 - [2026-11-16-width-nested-nullable-d16705](2026-11-16-width-nested-nullable-d16705.md): Nested width behind `| null` (D16705), 2026-11-16
 - [2026-11-16-type-hashcons-s6b1-literal-tree-caps](2026-11-16-type-hashcons-s6b1-literal-tree-caps.md): Type hash-cons stage 6b, batch 1: six literal-tree walkers lose their depth caps (lane H), 2026-11-16
