@@ -239,6 +239,7 @@ export function lint(progRoot: i32) {
     sentinelIndexLint()
     literalByteWriteLint()
     arenaWriteLint()
+    walkLimitLint()
     lintSetImportedMaps(Map())
     lintSetImportedFns(Map())
     lintSetImportedReaders(Map(), -1)
@@ -4368,8 +4369,8 @@ function txAt(s: string, i: i32, b: i32, w: string) {
   return true
 }
 
-// `txAt` folding the SOURCE side's case (`w` is given lower). Only `measured`,
-// which starts a sentence as often as not, needs it.
+// `txAt` folding the SOURCE side's case (`w` is given lower): `measured`, which starts a
+// sentence as often as not, and walk-limit's counter words inside a camel-case name.
 function txAtI(s: string, i: i32, b: i32, w: string) {
   if i < 0 || i + w.length > b { return false }
   let k = 0
@@ -7627,6 +7628,200 @@ function arenaWriteLint() {
     }
     ln = ln + 1
   }
+  return 0
+}
+
+// ── walk-limit ───────────────────────────────────────────────────────────────
+
+// A walk that stops at a fixed depth, hop or step count gives the exhausted answer on a program
+// one level deeper. The termination rule is a revisit (a path or visited set). Ratcheted per file
+// by `vl check --budget scripts/walk-limit-budget-baseline.json`, whose count may only fall.
+
+// The counter spellings: a name holding one of these, or the `.length` of a walk list below.
+const wlCounterWords = [
+  "depth", "budget", "hop", "guard", "step", "round", "fuel",
+]
+const wlListWords = ["path", "seen", "rev", "chain", "trail", "visited"]
+
+// A bound over this selects a code path rather than ending a walk.
+const WL_MODE_FLAG_MIN = 1000
+
+// Whether the identifier `v` holds one of `words`, ignoring case.
+function wlNameHas(v: string, words: string[]) {
+  let j = 0
+  while j < v.length {
+    let w = 0
+    while w < words.length {
+      if txAtI(v, j, v.length, words[w]) { return true }
+      w = w + 1
+    }
+    j = j + 1
+  }
+  return false
+}
+
+// A constant's spelling: upper-case letters, digits and `_`, with a letter.
+function wlIsCaps(v: string) {
+  if v.length < 2 { return false }
+  let letter = false
+  let i = 0
+  while i < v.length {
+    const c = v[i]
+    if c >= 'A' && c <= 'Z' { letter = true }
+    else if !(isDigit(c) || c == '_') { return false }
+    i = i + 1
+  }
+  return letter
+}
+
+// The bound spelling the last `wlLimitEnd` accepted, for the sentinel test.
+let wlBound = ""
+// The counter name the last `wlLimitEnd` accepted; "" for a list length.
+let wlCounter = ""
+
+// The end of a limit test starting at the identifier `v` at `i`, or -1: `<counter> <op> <bound>`
+// with a bound of 3 to 1000 or a constant, or a countdown `<= 0`, `< 1`, `< 0`.
+function wlLimitEnd(s: string, i: i32, b: i32, v: string) {
+  let e = i + v.length
+  let isLen = false
+  if txAt(s, e, b, ".length") && !txWordAt(s, e + 7, b) {
+    if !wlNameHas(v, wlListWords) && !wlNameHas(v, wlCounterWords) { return -1 }
+    isLen = true
+    e = e + 7
+  } else if !wlNameHas(v, wlCounterWords) {
+    return -1
+  }
+  let p = txSpacesEnd(s, e, b)
+  if p == e || p >= b { return -1 }
+  const c = s[p]
+  if c != '<' && c != '>' { return -1 }
+  const opLen = if txCharOr(s, p + 1, b) == '=' { 2 } else { 1 }
+  if txCharOr(s, p + 1, b) == c { return -1 }
+  const op = s.slice(p, p + opLen)
+  p = txSpacesEnd(s, p + op.length, b)
+  if p == e + op.length || p >= b { return -1 }
+  if isDigit(s[p]) {
+    let q = p
+    let n = 0
+    while q < b && isDigit(s[q]) {
+      if n <= WL_MODE_FLAG_MIN { n = n * 10 + (s[q] - '0') }
+      q = q + 1
+    }
+    if txWordAt(s, q, b) || txCharOr(s, q, b) == '.' { return -1 }
+    const countdown = !isLen
+      && ((op == "<=" && n == 0) || (op == "<" && n <= 1))
+    if !countdown && (n < 3 || n > WL_MODE_FLAG_MIN) { return -1 }
+    wlBound = s.slice(p, q)
+    wlCounter = if isLen { "" } else { v }
+    return q
+  }
+  const k = txIdentAt(s, p, b)
+  if !wlIsCaps(k) || txCharOr(s, p + k.length, b) == '(' { return -1 }
+  wlBound = k
+  wlCounter = if isLen { "" } else { v }
+  return p + k.length
+}
+
+// The `<name> = <bound>` assignment at `k`, as "name=bound", or "": the bound is one word,
+// ending the line or a `{ … }` arm.
+function wlAssignOf(s: string, k: i32, b: i32) {
+  const v = txIdentAt(s, k, b)
+  if v.length == 0 { return "" }
+  let p = txSpacesEnd(s, k + v.length, b)
+  if txCharOr(s, p, b) != '=' || txCharOr(s, p + 1, b) == '=' { return "" }
+  p = txSpacesEnd(s, p + 1, b)
+  let q = p
+  while txWordAt(s, q, b) { q = q + 1 }
+  const t = txSpacesEnd(s, q, b)
+  if q == p || (t != b && s[t] != '}') { return "" }
+  return v + "=" + s.slice(p, q)
+}
+
+// The open function's findings, held until its end so a sentinel loop can be dropped.
+let wlLines: i32[] = []
+let wlCols: i32[] = []
+let wlEnds: i32[] = []
+let wlKeys: string[] = []
+let wlAssigns: string[] = []
+
+// Emit the open function's findings, except a `while` limit whose counter the function sets
+// to the bound itself: that hit is the loop's normal exit.
+function wlFlush() {
+  let i = 0
+  while i < wlLines.length {
+    if wlKeys[i].length == 0 || !strListHas(wlAssigns, wlKeys[i]) {
+      lintEmitAtSpan(
+        "walk-limit",
+        "this ends a walk at a fixed depth, hop or step count, so a deeper program gets the exhausted answer: end it on a revisit (a path or visited set) instead",
+        "warning",
+        wlLines[i],
+        wlCols[i],
+        wlEnds[i],
+      )
+    }
+    i = i + 1
+  }
+  wlLines = []
+  wlCols = []
+  wlEnds = []
+  wlKeys = []
+  wlAssigns = []
+  return 0
+}
+
+// A numeric depth, hop or step limit in the compiler's own source; code only, as `codeScanLine`.
+function walkLimitLint() {
+  if !scaIsCompiler(scaRunPath) { return 0 }
+  const s = txSource
+  klEnsureIndex(s)
+  wlFlush()
+  let ln = 0
+  while ln < klLnStart.length {
+    const a = klLnStart[ln]
+    const b = klLnEnd[ln]
+    const k = klIndentEnd(s, a, b)
+    if txFnNameOf(s, k, b).length > 0 { wlFlush() }
+    const head = txAt(s, k, b, "while ")
+    let i = k
+    let inStr = false
+    while i < b {
+      const c = s[i]
+      if inStr {
+        if c == '\\' { i = i + 1 }
+        else if c == '"' { inStr = false }
+        i = i + 1
+      } else if c == '"' {
+        inStr = true
+        i = i + 1
+      } else if c == '\'' {
+        if txCharOr(s, i + 1, b) == '\\' { i = i + 4 } else { i = i + 3 }
+      } else if c == '/' && txCharOr(s, i + 1, b) == '/' {
+        i = b
+      } else if txWordAt(s, i - 1, b) || isDigit(c) {
+        i = i + 1
+      } else {
+        const v = txIdentAt(s, i, b)
+        const asg = if v.length > 0 { wlAssignOf(s, i, b) } else { "" }
+        if asg.length > 0 { wlAssigns.push(asg) }
+        const e = if v.length > 0 { wlLimitEnd(s, i, b, v) } else { -1 }
+        if e > 0 {
+          wlLines.push(ln + 1)
+          wlCols.push(i - a)
+          wlEnds.push(e - a)
+          wlKeys.push(
+            if head && wlCounter.length > 0 { wlCounter + "=" + wlBound } else { "" },
+          )
+          i = e
+        } else if v.length > 0 {
+          i = i + v.length
+        } else {
+          i = i + 1
+        }
+      }
+    }
+    ln = ln + 1
+  }
+  wlFlush()
   return 0
 }
 

@@ -93,6 +93,7 @@ lint_graded() { # <target> <json path>
     $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/byte-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/arena-write-budget-baseline.json --exempt-codes) \
+    $("$VL" check --budget scripts/walk-limit-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/unused-budget-baseline.json --exempt-codes)
 }
 
@@ -222,7 +223,7 @@ wait "$SCRIPTS_PID" || SCRIPTS_RC=$?
 [ "$SCRIPTS_RC" = 0 ] || exit "$SCRIPTS_RC"
 # The ratchets count the findings these runs already produced (`--findings`, the same
 # whole-graph reports), rather than each walking its targets again. The comment,
-# kind-ladder, sentinel-index and literal-byte baselines target `compiler/entry.vl`, whose import closure
+# kind-ladder, sentinel-index, literal-byte, arena-write and walk-limit baselines target `compiler/entry.vl`, whose import closure
 # is every compiler/*.vl; arena-scan's and unused-state's add `std`, interp's `std` and `scripts`
 # (tests/budget_targets_test.ts holds both facts). `--findings` takes one report, so the
 # runs' arrays are joined; a position two reports share counts once.
@@ -249,7 +250,7 @@ budget_over() { # <budget> <report>
   return "$rc"
 }
 BUDGET_RC=0
-for budget in comment ladder sentinel byte arena-write; do
+for budget in comment ladder sentinel byte arena-write walk-limit; do
   budget_over "$budget" "$WORK/graph.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
 done
 budget_over scan "$WORK/scan.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
