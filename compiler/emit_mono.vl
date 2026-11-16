@@ -72,6 +72,7 @@ import {
   elabIsPatTyIn,
   elabIsTyIn,
   elabKeySig,
+  elabLamDeliveredNumRet,
   elabLamDeliveredParams,
   elabLamInstParamTy,
   elabLamParamTy,
@@ -1793,7 +1794,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
       }
       // An open element type (a hole function, a type parameter) has no spelling: its element
       // name, a row handle or a function's, is the pin until the callee instance types it (D16022).
-      if !tyHasTyVar(lt) && !tyHasInferHole(lt, 0) {
+      if !tyHasTyVar(lt) && !tyHasInferHole(lt) {
         emitFail(
           "emitProgram: monomorphize: a closed record-list literal argument has no pin spelling (D16022)",
         )
@@ -2200,7 +2201,7 @@ export function monoArgTyName(ix: i32, fnIx: i32, tyOut: i32[]) {
     // A value union nothing spells gets its row here, which the instance's boxes read tags from.
     if (
       !rec
-      && !tyMayHoldFn(t, 0)
+      && !tyMayHoldFn(t)
       && !(tyAt(t) is TyUnion && numLitUnionBaseName(t) != "")
       && tyIsUnionish(t)
       && unRowOfCanonFolded(t) < 0
@@ -2333,7 +2334,7 @@ function monoTyHasFieldRecord(t: i32, depth: i32): boolean {
 // `monoClosedTyPin`; "" where the key has no token for a part.
 function monoPinOfClosedTy(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
-  if tyMayHoldFn(ty, 0) { return monoFnTyPin(ty) }
+  if tyMayHoldFn(ty) { return monoFnTyPin(ty) }
   if tyAt(ty) is TyUnion {
     const nb = numLitUnionBaseName(ty)
     if nb != "" { return nb }
@@ -2516,7 +2517,7 @@ function monoBindCols(
       if pp.parType < 0 {
         if (
           at >= 0
-          && (!tyMayHoldFn(at, 0) || tyHasLitDeep(at, 8) || tyHasTyVar(at))
+          && (!tyMayHoldFn(at) || tyHasLitDeep(at, 8) || tyHasTyVar(at))
         ) {
           at = -1
         }
@@ -3380,7 +3381,7 @@ function monoRetBoundLitCopy(x: i32): i32 {
   const l = nodeAt(lx)
   if !(l is ArrayLit) || l.arrElems.length == 0 { return x }
   const t = nodeTyIxOf(lx)
-  if !monoTyOpen(t) || !tyMayHoldFn(t, 0) { return x }
+  if !monoTyOpen(t) || !tyMayHoldFn(t) { return x }
   for e in l.arrElems {
     const ex = unwrapParen(e)
     if ex < 0 || !(nodeAt(ex) is Ident) { return x }
@@ -3981,6 +3982,8 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32) {
     if rs >= 0 && rs != rty {
       const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin && er < 0
       if !tyHasTyVar(rs) && !litGate {
+        const dr = elabLamDeliveredNumRet(fnIx, rs, -1)
+        if dr >= 0 { return synthTypeRefOfTy(dr, -1) }
         const rnm = monoPinAnnSpelling(rs)
         // The box a kept-apart join returns is registered here, as an instance return's is.
         if (
@@ -8475,7 +8478,7 @@ function monoKeyPinSeg(
 // (`exact` false) and `t` holds no function, whose field functions are instances of their own
 // (D988), so a Set and its boolean map, which share a rep, build one instance (D15171).
 function monoPinExactFree(exact: boolean, t: i32): boolean {
-  return !exact && t >= 0 && t < T.tys.length && !tyMayHoldFn(t, 0)
+  return !exact && t >= 0 && t < T.tys.length && !tyMayHoldFn(t)
 }
 
 // Per parameter of `fn`, whether its annotation is a union that names one of its type
@@ -10125,8 +10128,14 @@ function monoMakeInstanceGo(
       monoOpenLamOwner = -1
       monoOpenLamFlush(monoOpenLamMark)
     }
-    const nret = monoInstanceRet(fn, ek, k.tps, retRep)
-    if nret < -1 { return monoBuildPop() - 1 }
+    const nret0 = monoInstanceRet(fn, ek, k.tps, retRep)
+    if nret0 < -1 { return monoBuildPop() - 1 }
+    // A lambda instance whose body gives one numeric type, called at another from its own
+    // parameters, returns the type it is called at (D16711).
+    const ownSig = if fn.fnRet < 0 && monoCadIsLam(monoOrigNode[origFe]) { elabKeySig(ek) } else { -1 }
+    const bodyRet = if nret0 >= 0 { nodeTyIxOf(nret0) } else { elabRetOf(ek) }
+    const dret = if ownSig >= 0 { elabLamDeliveredNumRet(monoOrigNode[origFe], bodyRet, ownSig) } else { -1 }
+    const nret = if dret >= 0 { synthTypeRefOfTy(dret, -1) } else { nret0 }
     // A widened delivery's result is the one the elaboration records for this instance.
     if retWiden && !tySameSealed(elabRetOf(ek), req.retWidenTy) {
       monoBuildPop()
@@ -10611,9 +10620,26 @@ function monoCoerceFnValueTys(
         const sl = if sa >= 0 { unwrapParen(sa) } else { -1 }
         const sn = if sl >= 0 { nodeAt(sl) } else { nodeAt(exprIx) }
         const ys = if sl >= 0 && sn is ArrayLit { sn.arrElems } else { [x] }
+        // A name the flow rewrite minted in place of a spread has, in an instance, no stamp or pin
+        // of its own; it is delivered at the destination's element, which the instance closes.
+        const det = if tnameTy >= 0 && tnameTy < T.tys.length { tyArrayElemIx(tnameTy) } else { -1 }
         for y in ys {
           const path: string[] = ["e"]
-          if monoCoerceLitPart(y, exprIx, path, ctx) < 0 { return -1 }
+          const ptys: i32[] = []
+          const pft: i32[] = []
+          if (
+            monoTyClosedFn(det)
+            && monoFrameIsGenericInstance(ctx)
+            && (i32ListHas(mfrMinted, unwrapParen(y))
+              || i32ListHas(mfrMinted, nodeSrc[unwrapParen(y)] ?? -1))
+            && !monoTyClosedFn(elabStampAt(unwrapParen(y), ctx))
+            && monoSlotPinNameTys(exprIx, path, ctx, ptys, pft) == ""
+          ) {
+            const dts: i32[] = []
+            if monoCoerceFnValueTys(y, ctx, det, dts, det) < 0 { return -1 }
+          } else if monoCoerceLitPart(y, exprIx, path, ctx) < 0 {
+            return -1
+          }
         }
       }
       return 0
@@ -11382,7 +11408,7 @@ function monoListInitHoldsCellAlias(v: i32, ctx: i32): boolean {
 // names one. A list of a closed non-function type holds no binding a call could follow.
 function monoListMayHoldFn(v: i32): boolean {
   const t = nodeTyIxOf(v)
-  return t < 0 || tyHasTyVar(t) || tyMayHoldFn(t, 0)
+  return t < 0 || tyHasTyVar(t) || tyMayHoldFn(t)
 }
 
 // The element a literal index spelled `text` names in a list of `len` elements, by value in any
@@ -11569,6 +11595,8 @@ let mfrTiedCopy: {[i32]: boolean} = Map()
 // Bindings every read of which names their one generic and every spread of which is expanded, so
 // no call reaches their element slot (D9595).
 let mfrSpreadDone: i32[] = []
+// The name reads `monoFlowSpreadSet` minted in place of a spread.
+let mfrMinted: i32[] = []
 // Bindings a planned read slices, whose literal the slice's calls then reach through its slot.
 let mfrSliced: i32[] = []
 // The calls whose callee read `monoFlowReadSet` rewrote to name a generic.
@@ -11603,6 +11631,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrTied = []
   mfrTiedCopy = Map()
   mfrSpreadDone = []
+  mfrMinted = []
   mfrSliced = []
   mfrSetCalls = []
   mfrRepointed = []
@@ -13920,6 +13949,7 @@ function monoFlowSpreadSet(sp: i32, v: i32): i32 {
             sidNoteNodeName(nx, g)
             nodeTyRecord(nx, nodeTyIxOf(x))
             sidArrPut(mfrParent, nx, hx)
+            mfrMinted.push(nx)
             out.push(nx)
           }
         }
@@ -15932,8 +15962,8 @@ function monoStoredSlotDecline(r: i32): i32 {
 function monoTyOpen(t: i32): boolean {
   if t < 0 { return true }
   if !tyHasTyVar(t) && !tyReachesHole(t, 16) { return false }
-  if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t, 4) { return true }
-  return monoTyOpenUntagged(t, 4)
+  if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t, 16) { return true }
+  return monoTyOpenUntagged(t, 16)
 }
 
 // `monoTyOpen` within a type holding a tagged set: a list or record is open when a part other
@@ -17715,7 +17745,7 @@ function monoRecordPinnedRecv(recv: i32, t: i32, wf: i32, depth: i32) {
 // closed type at the instance (`elabHeldValTy`), so the container holding it has a shape (D9504).
 function monoCloseRetFnTy(ix: i32, ctx: i32) {
   const t0 = nodeTyIxOf(ix)
-  if !monoTyOpen(t0) || !tyMayHoldFn(t0, 0) { return 0 }
+  if !monoTyOpen(t0) || !tyMayHoldFn(t0) { return 0 }
   if !(nodeAt(ix) is Call) || monoRetSlotsSplit(ix) { return 0 }
   const t = elabHeldValTy(ix, ctx)
   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
@@ -19169,7 +19199,7 @@ function monoElabPin(
   if !monoTyOpen(nodeTyIxOf(x)) {
     const cn = monoClosedTyName(t)
     if cn != "" { return cn }
-    if tyMayHoldFn(t, 0) || tyHoldsObj(t, 8) || tyIsUnionish(t) { return "" }
+    if tyMayHoldFn(t) || tyHoldsObj(t, 8) || tyIsUnionish(t) { return "" }
     return monoI32AtomPinName(t)
   }
   if !monoElabDeliver(x, t, ctx, false, false) {
@@ -20903,10 +20933,10 @@ function monoPinHoleParam(
         && ox >= 0
         && !(nodeAt(ox) is FuncDecl)
         && monoTyOpen(oxTy)
-        && !tyMayHoldFn(oxTy, 0)
+        && !tyMayHoldFn(oxTy)
       ) {
         const ct = monoArgClosedTyIn(args[i], ctx, -1)
-        if ct >= 0 && !tyMayHoldFn(ct, 0) {
+        if ct >= 0 && !tyMayHoldFn(ct) {
           return emitFailAt(
             "emitProgram: internal: parameter `"
               + p.parName
@@ -21613,7 +21643,7 @@ function monoElabCompositeTy(
     !monoAnnHasTyParam(p.parType, -1, fn.fnTyParams)
     || nodeTyIsFunc(p.parType)
     || monoAnnIsFnSlot(p.parType)
-    || tyMayHoldFn(at, 0)
+    || tyMayHoldFn(at)
     || elabTestsTyVar(decl)
   ) {
     return -1
@@ -21622,7 +21652,7 @@ function monoElabCompositeTy(
     if gaeParamShadowed(tp) || structIndexByName(tp) >= 0 { return -1 }
   }
   const ept = elabCallParamTy(monoCallTplOf(callIx), i)
-  if ept < 0 || tyHasTyVar(ept) || tyMayHoldFn(ept, 0) { return -1 }
+  if ept < 0 || tyHasTyVar(ept) || tyMayHoldFn(ept) { return -1 }
   // A body reading a type parameter's layout (`T.size`) or testing it reads the parameter's pin
   // by its spelling (`Rows<TValue>`), which the composite path keeps and this type's may not.
   for tp in fn.fnTyParams {
@@ -21756,7 +21786,7 @@ function monoPinTyParamComposite(
     && !annIsFn
     && atTy >= 0
     && !tyHasTyVar(atTy)
-    && !tyHasInferHole(atTy, 0)
+    && !tyHasInferHole(atTy)
   ) {
     anC = true
   }
@@ -22735,7 +22765,7 @@ function monoCoerceListLitElems(ix: i32, es: i32[], ctx: i32): i32 {
     && et < T.tys.length
     && !monoTyOpen(et)
     && !(tyAt(et) is TyFunc)
-    && tyMayHoldFn(et, 0)
+    && tyMayHoldFn(et)
   ) {
     for e in es {
       const en = nodeAt(unwrapParen(e))
@@ -22783,7 +22813,7 @@ function monoCoerceIfArms(n: IfStmt, ix: i32, ctx: i32): i32 {
     && t0 < T.tys.length
     && !monoTyOpen(t0)
     && !(tyAt(t0) is TyFunc)
-    && tyMayHoldFn(t0, 0)
+    && tyMayHoldFn(t0)
   ) {
     for a in [tv, ev] {
       const an = nodeAt(unwrapParen(a))
@@ -25023,7 +25053,7 @@ function monoBoundFnListElemsTy(lits: i32[], ctx: i32): i32 {
         || bt >= T.tys.length
         || !(tyAt(bt) is TyArray)
         || monoTyOpen(bt)
-        || !tyMayHoldFn(bt, 0)
+        || !tyMayHoldFn(bt)
         || (t >= 0 && !tyEqSealed(t, bt))
       ) {
         return -1

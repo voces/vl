@@ -9,6 +9,12 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-width-param-misfit-d16707](2026-11-16-width-param-misfit-d16707.md): The layout sentence for a misfitting write through a rewritten parameter (D16707), 2026-11-16
+- [2026-11-16-width-nested-nullable-d16705](2026-11-16-width-nested-nullable-d16705.md): Nested width behind `| null` (D16705), 2026-11-16
+- [2026-11-16-type-hashcons-s6b1-literal-tree-caps](2026-11-16-type-hashcons-s6b1-literal-tree-caps.md): Type hash-cons stage 6b, batch 1: six literal-tree walkers lose their depth caps (lane H), 2026-11-16
+- [2026-11-16-slot-store-stage-2b-part3b](2026-11-16-slot-store-stage-2b-part3b.md): Slot store, stage 2b part 2b(iii) B: a returned function reaches the caller's call (lane SLOT, 2026-11-16)
+- [2026-11-16-l2-s2-let-bm-bounds](2026-11-16-l2-s2-let-bm-bounds.md): L2 S2, third tables: write and builtin-method rows become `Iface` bounds, 2026-11-16
+- [2026-11-16-l2-s2-is-ret-bounds](2026-11-16-l2-s2-is-ret-bounds.md): L2 S2, second tables: `is` and return rows become `Iface` bounds, 2026-11-16
 - [2026-11-16-width-nested-d3431](2026-11-16-width-nested-d3431.md): Width subtyping at nested depth (D3431, owner ruling (b)), 2026-11-16
 - [2026-11-16-wasmtime-gc-array-gap](2026-11-16-wasmtime-gc-array-gap.md): 2026-11-16 — lane AE4: the same module runs up to 2.8× slower under wasmtime than under V8
 - [2026-11-16-type-hashcons-s6a-cap-census](2026-11-16-type-hashcons-s6a-cap-census.md): Type hash-cons stage 6a: which depth caps fire, and whether their answers depend on the depth (lane H), 2026-11-16
