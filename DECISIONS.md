@@ -5938,15 +5938,18 @@ not garbage — a first cut that gave a miss `len + 2*added + 16` made one appen
 its lowering has no test — so a proven local keeps its bytes.
 
 A site outside any loop, reached from a caller's loop, keeps `SB` and `SE` in two module
-globals instead (D2669, 2026-11-16): a frame-local pair would start empty on every call. The
+globals instead (D2669, 2026-11-16), when its place outlives the call (a module binding, or a
+field or element reached from a parameter or one). A frame-local pair would start empty on
+every call. A fresh local's site would miss every call anyway, so it keeps no globals. The
 pair is minted while the body is emitted, as the body-minted synthetic globals are, so no site
 count is needed before the global section. The invariant is unchanged, since it never depended
 on frame lifetime, only on one site owning its buffer: a recursive or re-entrant call that
 extends the buffer moves `SE`, so the outer call's value misses and copies. RETENTION: a
 global pair holds its site's last buffer for the life of the module, where a local pair dies
 with the frame. A miss replaces it, so the bound is one buffer per such site, at most twice
-the longest string that site built (a hit doubles). The compiler has 127 such sites, the corpus
-166 over 61 programs.
+the longest string that site built (a hit doubles). Of the compiler's 127 sites outside a loop,
+1 has a place that outlives the call; the corpus has 166 such sites over 61 programs before
+that filter.
 
 One shape stays quadratic, filed rather than guessed at: one site cycling over several strings
 (D2670 — one cached buffer per site). Ropes stay the owner's held option.
