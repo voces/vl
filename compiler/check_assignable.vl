@@ -447,6 +447,7 @@ import {
   tpIfFn,
   tpIfFnHasRow,
   tpIfJoin,
+  tpIfNode,
   tpIfReCount,
   tpIfReFn,
   tpIfReNames,
@@ -457,6 +458,7 @@ import {
   tyIsDeferredJoin,
   tyParamsApartIn,
 } from "./check_tp_join"
+import { atCallWhere, atCallWhereAs } from "./check_at_call"
 import {
   fvaFnMayDiffer,
   fvaNestedFnDiffers,
@@ -915,17 +917,23 @@ function tpIfPinCheck(
   ix: i32,
 ) {
   let apartJ = -1
+  let apartK = -1
   let unbuilt = -1
+  let unbuiltK = -1
   let k = 0
   while k < tpIfFn.length {
     if tpIfFn[k] == fn {
       const sj = substTyDeep(tpIfJoin[k], bNames, bTys)
-      if sj >= 0 && !tyHasTyVar(sj) && tyReachesUnion(sj, 6) {
+      if sj >= 0 && !tyHasTyVar(sj) && tyReachesUnion(sj) {
         // The widest names the whole chain of an `else if`, whose links are rows too.
         if apartJ < 0 || unionMemberCountOf(sj) > unionMemberCountOf(apartJ) {
           apartJ = sj
+          apartK = k
         }
-        if unbuilt < 0 && !tpIfRowBuilt(k) { unbuilt = sj }
+        if unbuilt < 0 && !tpIfRowBuilt(k) {
+          unbuilt = sj
+          unbuiltK = k
+        }
       }
     }
     k = k + 1
@@ -934,22 +942,21 @@ function tpIfPinCheck(
   let msg = ""
   if unbuilt >= 0 {
     apartJ = unbuilt
+    apartK = unbuiltK
     msg = "no one list holds it where its value goes — bind it to a `const`, or deliver it where its union is declared"
   } else {
     msg = tpIfRecheck(fn, pTys, bNames, bTys, retTy)
   }
   if msg == "" { return 0 }
-  let fWho = "the callee's body"
+  let fName = ""
   const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    if fd.fnName != "" { fWho = "the body of `" + fd.fnName + "`" }
-  }
+  if fd is FuncDecl { fName = fd.fnName }
   tErr(
-    "at the call's argument types, the branches of an `if`, `match` or `??` in "
-      + fWho
-      + " join "
+    "the branches of an `if`, `match` or `??` join "
       + tpMembersListText(apartJ)
-      + ": "
+      + " ("
+      + atCallWhere(fn, fName, tpIfJoin[apartK], tpIfNode[apartK], ix)
+      + "): "
       + msg,
     ix,
   )
@@ -2093,8 +2100,8 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // stays at its own type. Writes only `nodeRepTyIx`.
   const rtStamp = stampsStand()
     && srcExpr >= 0
-    && (tyReachesEmptyHole(srcTy, 8)
-    || tyReachesUnion(dstTy, 8)
+    && (tyReachesEmptyHole(srcTy)
+    || tyReachesUnion(dstTy)
     || litAtDstStorage(srcExpr, dstTy)
     || deliversNullLit(srcExpr))
   if rtStamp && (repStampableLit(srcExpr) || deliversNullLit(srcExpr)) {
@@ -2523,7 +2530,7 @@ function argCstrFitsAt(
     // parameter through `call_ref` unconverted (D5790).
     if tyHasHole(rat) || tyHasHole(rexp) { return argCstrFits(rat, rexp, form) }
     // An argument whose type is already an earlier diagnostic's error is not refused again.
-    if tyMentionsErr(rat, 8) { return true }
+    if tyMentionsErr(rat) { return true }
     // A literal already retyped for another of the hole's demands is that type now; it is not
     // rebuilt a second time for this one.
     // A forwarder's literal some caller copied at this type fits it (D5880).
@@ -2926,7 +2933,7 @@ export function validateArgCstrs(
       } else if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         // An argument still open here (a lambda's `Map()` result) is built at the parameter it
         // reaches, as the direct spelling's delivery pins it.
-        if tyReachesEmptyHole(rat, 8) { constrainEmpty(rat, rexp) }
+        if tyReachesEmptyHole(rat) { constrainEmpty(rat, rexp) }
         if (
           !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode)
           && !argCstrFixedErr(rat, rexp, ci, ix, calleeFn, bNames, bTys)
@@ -3054,7 +3061,7 @@ function adoptHoleLitArg(
 // its own type is not already the same rep (a wider record literal fits by width as it is).
 function holeLitAdopts(org: i32, rat: i32, rexp: i32): boolean {
   if rat == rexp || tyHasHole(rexp) { return false }
-  const empty = tyReachesEmptyHole(rat, 8)
+  const empty = tyReachesEmptyHole(rat)
   if tyHasHole(rat) && !empty { return false }
   if scalarPrimPair(rat, rexp) { return false }
   if !empty && assignable(rat, rexp) && assignable(rexp, rat) { return false }
@@ -3408,8 +3415,6 @@ export function retRule(
           || !litPinAssignable(row.site, rgc, rw, bNames, bTys, false)
             && !bundleMemberFits(row.on, rw, bNames, bTys, ix)
         ) {
-          let rWho = "the callee's return"
-          if who != "" { rWho = "the return of `" + who + "`" }
           tErr(
             "return type mismatch: expected "
               + tyToStr(rw)
@@ -3417,8 +3422,16 @@ export function retRule(
               + tyToStr(rgc)
               + boolForNumberNote(rgc, rw)
               + " ("
-              + rWho
-              + " at the call's argument types"
+              + atCallWhereAs(
+              row.fn,
+              who,
+              row.on,
+              -1,
+              row.site,
+              ix,
+              "returned",
+              "return",
+            )
               + unboundParamsNote(bNames, bTys)
               + ")",
             ix,
@@ -3573,14 +3586,21 @@ export function letRule(
         // A destination one member of a value called at several signatures fits (D15146).
         const member = !clash && bundleMemberFits(row.on, lw, bNames, bTys, ix)
         if !member {
-          let lWho = "the callee's body"
-          if who != "" { lWho = "the body of `" + who + "`" }
           tErr(
             letAssignMsg(row.site, lg, lw, row.s, -1)
               + litLetStoreNote(row.site, lg, lw)
               + " ("
-              + lWho
-              + " at the call's argument types)",
+              + atCallWhereAs(
+              row.fn,
+              who,
+              row.on,
+              row.a,
+              row.site,
+              ix,
+              "used",
+              "body",
+            )
+              + ")",
             ix,
           )
         }
@@ -3634,13 +3654,20 @@ export function bmRule(
         const fits = bmArgPred(row.c, bg, bw, row.site)
         stampsHeldSet(held)
         if !fits {
-          let bWho = "the callee's body"
-          if who != "" { bWho = "the body of `" + who + "`" }
           tErr(
             bmArgMsg(row.c, row.s, bg, bw, bc)
               + " ("
-              + bWho
-              + " at the call's argument types)",
+              + atCallWhereAs(
+              row.fn,
+              who,
+              row.a,
+              row.on,
+              row.site,
+              ix,
+              "used",
+              "body",
+            )
+              + ")",
             ix,
           )
         }
