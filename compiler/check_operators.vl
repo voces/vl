@@ -114,7 +114,7 @@ import {
   oerIsPending,
   oerNodes,
 } from "./check_asg_rows"
-import { assignableExpr, fitsExpr } from "./check_assignable"
+import { assignableExpr, eqAtomListCopy, fitsExpr } from "./check_assignable"
 import { recOriginExpr } from "./check_rec_fresh"
 import { recPend } from "./check_rec_rows"
 import { strLitRecvTy } from "./check_builtin_methods"
@@ -497,6 +497,7 @@ import {
   tyIsParamHole,
   tyKeyOf,
   tyKeyOpen,
+  tyLitMemberTexts,
   tyMentionsTyVarNamed,
   tyPinElem,
   tyPinKey,
@@ -1334,6 +1335,42 @@ function eqLitDeliver(lit: i32, own: i32, other: i32): i32 {
   return 0
 }
 
+// Which side of `lt` against `rt` is a list of string literals beside a list of `string`, whose
+// element admits `null` where the literals' does: -1 the left, 1 the right, 0 neither.
+function eqAtomListSide(lt: i32, rt: i32): i32 {
+  if eqStrLitList(lt) && eqStrList(rt, eqListElemNullable(lt)) { return 0 - 1 }
+  if eqStrLitList(rt) && eqStrList(lt, eqListElemNullable(rt)) { return 1 }
+  return 0
+}
+
+// The element of closed list `t`, or -1.
+function eqListElem(t: i32): i32 {
+  const a = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  return if a is TyArray && !tyElemOpen(a) { tyElemOf(a) } else { -1 }
+}
+
+// Whether list `t`'s element admits `null`.
+function eqListElemNullable(t: i32): boolean {
+  const e = eqListElem(t)
+  return e >= 0 && tyAdmitsNull(e)
+}
+
+// Whether `t` is a list whose element is a string literal or a union of them, `| null` allowed.
+function eqStrLitList(t: i32): boolean {
+  const e = eqListElem(t)
+  if e < 0 { return false }
+  const en = nonNullTy(e)
+  return en >= 0 && tyLitMemberTexts(en).length > 0 && assignable(en, TY_STR)
+}
+
+// Whether `t` is a list of `string` or `string | null`, the second where `nul`.
+function eqStrList(t: i32, nul: boolean): boolean {
+  const e = eqListElem(t)
+  if e < 0 || nul && !tyAdmitsNull(e) { return false }
+  const en = nonNullTy(e)
+  return en >= 0 && tySame(en, TY_STR)
+}
+
 // Whether records `lt` and `rt` (nullable or not) name one field set whose every pair is
 // mutually assignable or such records in turn: structural `==` compares field by field, so a
 // pair widening each way still compares (D16396).
@@ -1448,6 +1485,17 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
         tErr(eqLMsg, ix)
       }
       return TY_BOOL
+    }
+  }
+  // A list of string literals beside a `string[]` compares as two string lists (D16393).
+  const atomCopy = eqAtomListSide(lt, rt)
+  if atomCopy != 0 {
+    const side = if atomCopy < 0 { n.binLeft } else { n.binRight }
+    const other = if atomCopy < 0 { rt } else { lt }
+    if eqAtomListCopy(side, eqListElem(other)) {
+      const nlt = if atomCopy < 0 { nodeTyIxOf(n.binLeft) } else { lt }
+      const nrt = if atomCopy > 0 { nodeTyIxOf(n.binRight) } else { rt }
+      return checkEqualityBinNode(n, ix, nlt, nrt)
     }
   }
   // A nominal newtype compared with a literal is compatible (`id == 0`) — the literal adopts
