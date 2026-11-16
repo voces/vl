@@ -66,9 +66,11 @@ import {
   hasSpreadItem,
   i32ToStr,
   loopVarLoop,
+  mkCallN,
   mkIdent,
   mkIndex,
   mkNull,
+  mkOptMember,
   nodeAt,
   nodeChildren,
   nodeIsTplHole,
@@ -76,8 +78,8 @@ import {
   tsMentionsAnyName,
   ufcsAliasInScope,
 } from "./ast"
-import { collCtorTyArgsTy } from "./check_annot_resolve"
-import { luGrow } from "./check_list_union"
+import { collCtorTyArgsTy, luDecl } from "./check_annot_resolve"
+import { luAt, luGrow, luRef, luValueAt } from "./check_list_union"
 import {
   SS_ALL,
   SS_ARG,
@@ -440,6 +442,7 @@ import {
 import { pgrNoteCall } from "./check_poly_growth"
 import {
   calleeDeclParams,
+  calleeFnOfDecl,
   identBindsNonFn,
   identConstDeclOf,
   identDepthOf,
@@ -4270,7 +4273,10 @@ function makerCallLamRet(n: Call, cfn: Node, retTy: i32): i32 {
   collectRetValues(mn.fnBody, rets)
   let lam = -1
   for r in rets {
-    const x = parenPeelIx(r)
+    // A lambda returned through the un-annotated `const` that binds it is that lambda (D16818).
+    const x0 = parenPeelIx(r)
+    const x0n = if x0 >= 0 && x0 < P.nodes.length { nodeAt(x0) } else { null }
+    const x = if x0n is Ident { calleeFnOfDecl(identDeclOf(x0)) } else { x0 }
     const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
     if !(xn is FuncDecl) || (lam >= 0 && lam != x) { return retTy }
     lam = x
@@ -4569,6 +4575,31 @@ function holeLambdaBinds(lam: i32, inst: i32, nm: string[], ty: i32[]) {
 // return re-wrapped nullable. `-1` when no arm claimed the callee, leaving the caller's
 // "called value is not a function" to speak (D1814).
 function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
+  // A call whose receiver is itself a `?.` read, `b?.r.f(…)`, checked as written, is then
+  // checked again as `{ const $oc = b?.r; $oc?.f(…) }`: the guard tests a name it can read twice,
+  // and the binding carries the checker's facts (D16809). Checking it first as written keeps
+  // every refusal the place's judges owe it.
+  if !(nodeAt(parenPeelIx(cfn.omObj)) is OptMember) {
+    return checkOptCallNodeGo(n, ix, cfn)
+  }
+  const rt = checkOptCallNodeGo(n, ix, cfn)
+  if rt < 0 || tyAt(rt) is TyErr { return rt }
+  const pos = n.pos
+  const d = luDecl("const", "$oc" + i32ToStr(ix), -1, cfn.omObj, ix, pos)
+  const callee = luAt(
+    mkOptMember(luRef(d, ix, pos), cfn.omProp, false, pos),
+    ix,
+  )
+  const call = luAt(mkCallN(callee, n.callArgs, n.callArgNames, pos), ix)
+  const stmts: i32[] = []
+  stmts.push(d)
+  stmts.push(call)
+  luValueAt(ix, stmts, pos)
+  return checkNodeHook(ix)
+}
+
+// `checkOptCallNode` for the call as written.
+function checkOptCallNodeGo(n: Call, ix: i32, cfn: OptMember): i32 {
   omGuardSet(-1, -1)
   const recv = checkNodeHook(cfn.omObj)
   if recv < 0 { return TY_ERR }

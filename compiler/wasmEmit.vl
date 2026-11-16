@@ -21136,9 +21136,25 @@ function binEqNulNiche(binIx: i32, fnIx: i32): EqCmpKind {
       if eqKindIsNulNiche(lk) { return lk }
       const rk = eqCmpKindOfOperand(e.binRight, fnIx)
       if eqKindIsNulNiche(rk) { return rk }
+      // A nullable literal-union atom reads as a nullable string (`emitEqOperandRaw`), its null
+      // niche the null ref, so it compares as `string | null` does (D16822).
+      if (
+        (lk == "str" || rk == "str")
+        && (binOperandNulAtom(e.binLeft, fnIx)
+          || binOperandNulAtom(e.binRight, fnIx))
+      ) {
+        return "nulstr"
+      }
     }
   }
   return ""
+}
+
+// Whether `==` operand `ix` is a literal-union atom whose type admits `null`.
+function binOperandNulAtom(ix: i32, fnIx: i32): boolean {
+  const t = nodeTyAt(ix, fnIx)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyNullable) { return false }
+  return nulAtomWidenTexts(ix, fnIx).length > 0 && exprIsLitAtom(ix, fnIx)
 }
 
 // The emitter's half of the ONE comparability answer: true when a `==`/`!=` operand's rep has
@@ -21756,47 +21772,53 @@ function emitStrSlice(callIx: i32, fnIx: i32) {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
-      setStrScrI(1)                  // raw end → I1
-      setStrScrI(0)                  // raw start → I0
-      fbLocalSet(strScratchBase + 0) // local.set strScrA (receiver)
-      // I2 = len(s) — the HEADER's `len` (field 2). `array.len` here would be the BACKING's
-      // physical length, so a slice of a slice would clamp against its parent's extent.
-      pushStrScrRef(0)
-      fbStrLen()
-      setStrScrI(2)
-      // I0 = clamp(rawStart, len)
-      if emitClampIdx(0, 2) < 0 { return -1 }
-      setStrScrI(0)
-      // I1 = clamp(rawEnd, len)
-      if emitClampIdx(1, 2) < 0 { return -1 }
-      setStrScrI(1)
-      // I3 = out length = max(end - start, 0) = select( end-start, 0, end > start )
-      pushStrScrI(1)
-      pushStrScrI(0)
-      fbI32Bin(107) // 0x6b i32.sub → end - start   [a]
-      fbI32Const(0) // i32.const 0                  [b]
-      pushStrScrI(1)
-      pushStrScrI(0)
-      fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
-      fbSelect()
-      setStrScrI(3)
-      // The VIEW: same backing, start biased by the receiver's own start, len = I3. This is
-      // the whole lowering now — no allocation of elements, no copy.
-      pushStrScrRef(0)
-      fbStrBack()    // field 0: the SHARED backing
-      pushStrScrRef(0)
-      fbStrStart()   // field 1: the receiver's own start …
-      pushStrScrI(0)
-      fbI32Bin(106)  // 0x6a i32.add — … plus the clamped slice start
-      pushStrScrI(3) // field 2: len = max(end - start, 0)
-      fbStrNew()     // 0xfb 0x00 <string header>
-      return 0
+      return strSliceTail()
     }
     return emitFail(
       "emitProgram: string .slice receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string slice call")
+}
+
+// `s.slice(start, end)` over its receiver, start and end on the stack: a view of the receiver's
+// backing over the clamped range, with no copy.
+export function strSliceTail() {
+  setStrScrI(1)                  // raw end → I1
+  setStrScrI(0)                  // raw start → I0
+  fbLocalSet(strScratchBase + 0) // local.set strScrA (receiver)
+  // I2 = len(s) — the HEADER's `len` (field 2). `array.len` here would be the BACKING's
+  // physical length, so a slice of a slice would clamp against its parent's extent.
+  pushStrScrRef(0)
+  fbStrLen()
+  setStrScrI(2)
+  // I0 = clamp(rawStart, len)
+  if emitClampIdx(0, 2) < 0 { return -1 }
+  setStrScrI(0)
+  // I1 = clamp(rawEnd, len)
+  if emitClampIdx(1, 2) < 0 { return -1 }
+  setStrScrI(1)
+  // I3 = out length = max(end - start, 0) = select( end-start, 0, end > start )
+  pushStrScrI(1)
+  pushStrScrI(0)
+  fbI32Bin(107) // 0x6b i32.sub → end - start   [a]
+  fbI32Const(0) // i32.const 0                  [b]
+  pushStrScrI(1)
+  pushStrScrI(0)
+  fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
+  fbSelect()
+  setStrScrI(3)
+  // The VIEW: same backing, start biased by the receiver's own start, len = I3. This is
+  // the whole lowering now — no allocation of elements, no copy.
+  pushStrScrRef(0)
+  fbStrBack()    // field 0: the SHARED backing
+  pushStrScrRef(0)
+  fbStrStart()   // field 1: the receiver's own start …
+  pushStrScrI(0)
+  fbI32Bin(106)  // 0x6a i32.add — … plus the clamped slice start
+  pushStrScrI(3) // field 2: len = max(end - start, 0)
+  fbStrNew()     // 0xfb 0x00 <string header>
+  return 0
 }
 
 // Lower `s.indexOf(sub)` (or `s.includes(sub)`), leaving an i32: the first index of `sub`
@@ -22062,14 +22084,19 @@ function emitStrCpLen(callIx: i32, fnIx: i32) {
     const callee = nodeAt(c.callFn)
     if callee is Member {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      fbCall(helpUtf8CpLenFn())
-      return 0
+      return strCpLenTail()
     }
     return emitFail(
       "emitProgram: string .cpLen receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string cpLen call")
+}
+
+// `s.cpLen()` over its receiver on the stack: the shared UTF-8 code point count helper.
+export function strCpLenTail() {
+  fbCall(helpUtf8CpLenFn())
+  return 0
 }
 
 // Lower `s.isCharBoundary(i)` (Rust's primitive, O(1)): does byte `i` begin a UTF-8
@@ -22586,14 +22613,7 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
   if e is IsExpr { return emitIs(exprIx, fnIx) }
   if e is NullLit { return emitNullLitNode(e, exprIx, fnIx) }
   if e is ObjLit { return emitObjLitNode(e, exprIx, fnIx, -1) }
-  if e is StrLit {
-    // A literal delivered to a destination whose type reps as the atom lowers as its interned id.
-    if strLitTakesAtom(exprIx, fnIx) {
-      fbI32Rel(RS_ATOM, internAtom(e.strText))
-      return 0
-    }
-    return emitStr(exprIx, fnIx)
-  }
+  if e is StrLit { return emitStrLitAt(exprIx, fnIx) }
   if e is ArrayLit { return emitArr(exprIx, fnIx) }
   if e is Index {
     // G8: a map GET `m[k]` (no `??`) — scan, value or 0. A `??` get is fused in the
@@ -37894,6 +37914,17 @@ function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
   const st = nodeRepTyAt(unwrapParen(ix), fnIx)
   if st < 0 { return false }
   return tyRepsAsNulAtom(st)
+}
+
+// String literal `ix`: delivered to a destination whose type reps as the atom, its interned id;
+// else the string.
+export function emitStrLitAt(ix: i32, fnIx: i32) {
+  const e = nodeAt(ix)
+  if e is StrLit && strLitTakesAtom(ix, fnIx) {
+    fbI32Rel(RS_ATOM, internAtom(e.strText))
+    return 0
+  }
+  return emitStr(ix, fnIx)
 }
 
 // Whether string literal `ix` lowers as its atom: the row its field value is built at, else its

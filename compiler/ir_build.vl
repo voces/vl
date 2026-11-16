@@ -40,6 +40,7 @@ import {
   PrimOp,
   Rhs,
   SLet,
+  StrOp,
   binPrimOp,
   irBodyLeaves,
   irFnNew,
@@ -66,11 +67,12 @@ import {
   globalReadRecovers,
   strLitTakesAtom,
 } from "./wasmEmit"
-import { repNodeGen, repNodeOfTy } from "./emit_rep"
-import { nodeTyAt, scopeTyAt } from "./emit_capture_frames"
+import { RAtom, repNodeAt, repNodeGen, repNodeOfTy } from "./emit_rep"
+import { ctxTyAt, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import {
   declaredIndexAt,
   envSlotShift,
+  exprIsStrMethod,
   fnIndexOfNode,
   localIndexOf,
 } from "./emit_classify"
@@ -227,7 +229,7 @@ let ibNoValue = -1
 // Whether a value of rep `r` and type `ty` can be a variable, a parameter, a result or an
 // expression here: a scalar, or a reference rep the list builder admits.
 function valueRep(r: i32, ty: i32): boolean {
-  return repIsScalar(r) || irVarRepOkHook(r, ty)
+  return repIsScalar(r) || repNodeAt(r) is RAtom || irVarRepOkHook(r, ty)
 }
 
 function refRepNone(_r: i32, _ty: i32): boolean { return false }
@@ -304,7 +306,7 @@ export function irBOpRep(o: Opnd): i32 {
   return match o {
     OVar => if o.ov >= 0 && o.ov < ib.irVars.length { ib.irVars[o.ov].vRep } else { -1 }
     OImm => o.oiRep
-    OStr => primRepOf(o.osAt)
+    OStr => o.osRep
   }
 }
 
@@ -505,7 +507,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callFn < 0 || hasNamedArgs(c.callArgNames) {
     return missRhs("named call")
   }
-  if !(nodeAt(c.callFn) is Ident) { return missRhs("indirect call") }
+  const cf = nodeAt(c.callFn)
+  if cf is Member { return methodRhs(b, c, cf, ix) }
+  if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
   if d < 0 || !(nodeAt(d) is FuncDecl) {
     return missRhs("call of a non-declaration")
@@ -536,6 +540,31 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
+// A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
+// arguments, then legacy's own tail. Any other method is a miss that names it.
+function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  let op: StrOp = "slice"
+  if exprIsStrMethod(ix, ibFnIx, "cpLen") {
+    op = "cplen"
+  } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
+    return missRhs("method " + m.memProp)
+  }
+  const args: Opnd[] = [irBExpr(b, m.memObj)]
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("method operand") }
+  // The receiver is a string and every argument an i32.
+  let i = 0
+  while i < args.length {
+    const p = repPrim(irBOpRep(args[i]))
+    if p == null || (if i == 0 { p != "str" } else { p != "i32" }) {
+      return missRhs("method operand coercion")
+    }
+    i = i + 1
+  }
+  const r: Rhs = { soOp: op, soArgs: args, soAt: ix }
+  return r
+}
+
 // Why operand `ix` is outside the set, or "": it must be typed at a numeric primitive or
 // `boolean`, whose signedness picks the op (`opUnsigned`).
 function operandWhy(ix: i32): string {
@@ -547,6 +576,11 @@ function operandWhy(ix: i32): string {
 }
 
 const STR_OPERAND = "operand at string"
+
+// Whether operand `ix` is typed at a literal union delivered as an interned atom.
+function atomOperand(ix: i32): boolean {
+  return repNodeAt(repNodeOfTy(nodeTyAt(ix, ibFnIx))) is RAtom
+}
 
 function isNumericPrim(p: string): boolean {
   return p == "i32"
@@ -595,6 +629,11 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     if n.binOp == "=" && !ASSIGN_AS_VALUE {
       return irBMiss("assignment as a value")
     }
+    // Legacy's atom compares fold or widen a literal operand (`emitBinLitEq`), a decision the IR
+    // does not share yet.
+    if atomOperand(n.binLeft) || atomOperand(n.binRight) {
+      return irBMiss("atom compare")
+    }
     if (
       operandWhy(n.binLeft) == STR_OPERAND
       || operandWhy(n.binRight) == STR_OPERAND
@@ -630,13 +669,16 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   return irBMiss("expression " + irAstKind(ix))
 }
 
-// A string literal at the `str` rep, built by legacy's `emitStr` at its use; one delivered as an
-// interned atom is a miss.
+// A string literal at the `str` rep, or delivered as its destination's interned atom.
 function strLit(ix: i32, rep: i32): Opnd {
-  if repPrim(rep) != "str" || strLitTakesAtom(ix, ibFnIx) {
-    return irBMiss("string atom")
+  if strLitTakesAtom(ix, ibFnIx) {
+    const ar = repNodeOfTy(ctxTyAt(ix, ibFnIx))
+    if !(repNodeAt(ar) is RAtom) { return irBMiss("string atom") }
+    const a: Opnd = { osAt: ix, osRep: ar }
+    return a
   }
-  const o: Opnd = { osAt: ix }
+  if repPrim(rep) != "str" { return irBMiss("string literal rep") }
+  const o: Opnd = { osAt: ix, osRep: rep }
   return o
 }
 
