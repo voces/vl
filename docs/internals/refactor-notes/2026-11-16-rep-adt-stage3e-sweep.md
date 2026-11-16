@@ -8,6 +8,20 @@ outside the named classes. The per-row sweep, its minter labels and its template
 therefore measure nothing the read-time shadow does not. They are deleted (−97 lines).
 `fcShadowSweep` now only reports the read-time counts.
 
+## The guard still fires
+
+As a control, a scratch seed (never seeded into `build/`) stores `FC_STR` for any struct field
+named `zz9`, a deliberately wrong code. It ran on `type T = { zz9: i32, b: i32 }`,
+`const t: T = { zz9: 4, b: 5 }`, `print(t.zz9 + t.b)`.
+
+| | |
+|---|---|
+| armed (`$VL_REP_SHADOW=1`) | `emit error`: "emitProgram: a field's stored code is not the one its storage type derives" |
+| unarmed | prints `9`: the reader derives the code, so the wrong stored code never reaches emit |
+| the pristine seed, armed | builds (178 bytes) |
+
+The read-time guard catches what the deleted sweep caught.
+
 ## The rest of 3e is deferred
 
 The rest of 3e makes the code consumers (`pushFieldStorage`, `fieldCodeKind`, `fieldCodeVKind`,
