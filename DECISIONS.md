@@ -12408,3 +12408,28 @@ dispatch keyed on the closure; until then `#8640`'s refusal stands.
 most remaining late decisions need the solve's per-call results to move. Staging keeps the invariant
 it protected (storage has one decider at every commit) without the cycle, and one dispatch mechanism
 serves every set.
+
+## The slot store's flip lands at its measured price; the old walk goes in two follow-ups (2026-11-16, chosen under the owner's delegation) — SLOT part D/E
+
+**The rule.** Mono reads the place classes, which are built at the end of elaboration only when the
+program takes a function as a value (a lambda, or a named function read other than as a callee);
+otherwise they are built lazily. The flip lands at its measured net price (L2 about +2.0%, plumb-shape
+about +0.5%) with one ledger line, under the bar set for it (within +1% lands as is, up to about +3%
+with a ledger line and coordinator approval). The three mono readers still on the delivery walk move
+next (D2, graded by identity); the 32-function walk is deleted last (E), only once a call-graph pass
+shows nothing reaches it, and E's fuel return revises the flip's ledger line rather than adding one.
+
+**Why.** Holding the flip for further cuts would keep two deciders for the same fact alive for no
+correctness gain; each cut is graded on fuel on its own. The eager build is needed only where a
+function value can be delivered, so programs without one pay nothing.
+
+## A refusal is parked with its findings, not lifted, when lifting it ships invalid wasm (2026-11-16, chosen under the owner's delegation) — D16786
+
+**The rule.** D16786 (annotated callback parameters handed back through `map`) stays open as clause 2.
+Lifting its refusal produced invalid wasm for a lambda written at the call (the closure signature is
+recorded but the function's own result row is not derived from it), and a named or held function
+needs a per-caller instance clone at the build (D3992's declaration rewrite), not a write onto the
+annotation node, which would leak to every caller.
+
+**Why.** A loud refusal of a legal program is clause-2 debt; an invalid module is clause 1. Trading the
+first for the second is never a fix.
