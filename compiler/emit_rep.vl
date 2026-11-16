@@ -2834,7 +2834,7 @@ function repStructRowByTy(ty: i32): i32 {
 export function sFieldElemTyIxAt(si: i32, fi: i32): i32 {
   const ix = sFieldStart[si] + fi
   if ix >= sFieldElemTyIx.length { return -1 }
-  return fieldElemTyIn(sFieldElemTyIx, sFieldStoreTy, ix, "emit_rep:2859")
+  return fieldElemTyIn(sFieldElemTyIx, sFieldStoreTy, ix)
 }
 
 // In-progress (elemA, elemB) pairs of the code-15 referenced-layer descent below —
@@ -3183,23 +3183,74 @@ export function fieldLitTyIn(
   return v
 }
 
-// Row `r` of element-type column `col` (-1 past its end), storage types `tys`; `site` names the
-// reader for the shadow.
-export function fieldElemTyIn(
-  col: i32[],
-  tys: i32[],
-  r: i32,
-  site: string,
-): i32 {
-  const v = if r >= 0 && r < col.length { col[r] } else { -1 }
-  if repShadowOn {
-    const st = fcStoreTyAt(tys, r)
-    if st >= 0 {
-      const d = repOfTy(st)
-      fcSideNote(site, v, fcProjElemTy(st, d), d.rdKind ?? "none")
+// Per type: 0 unknown, 1 being walked, 2 holds no function, 3 may hold one.
+let fcHoldFnMemo: i32[] = []
+
+// Forgets the memo, at the start of each module's emit (the arena is per program).
+export function fcHoldFnReset() {
+  fcHoldFnMemo = []
+  return 0
+}
+
+// Whether `ty` may hold a function. Memoized per type, so a record shared by many paths is walked
+// once; a type met while it is being walked answers yes, which keeps a stored element.
+function fcMayHoldFn(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  while fcHoldFnMemo.length <= ty { fcHoldFnMemo.push(0) }
+  const m = fcHoldFnMemo[ty]
+  if m != 0 { return m != 2 }
+  fcHoldFnMemo[ty] = 1
+  const r = fcMayHoldFnGo(ty)
+  fcHoldFnMemo[ty] = if r { 3 } else { 2 }
+  return r
+}
+
+function fcMayHoldFnGo(ty: i32): boolean {
+  const t = tyAt(ty)
+  match t {
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return fcMayHoldFn(tyElemOf(t))
+    }
+    TyNullable => {
+      return fcMayHoldFn(t.nInner)
+    }
+    TyMap => {
+      return fcMayHoldFn(tyMapValOf(ty))
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if fcMayHoldFn(f) { return true }
+      }
+      return false
+    }
+    TyUnion => {
+      for mb in t.uMembers {
+        if fcMayHoldFn(mb) { return true }
+      }
+      return false
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
     }
   }
-  return v
+}
+
+// The element type of row `r` of a field table whose storage types are `tys`: what its storage
+// type projects (`fcProjElemTy`). A projection that may hold a function keeps the stored `col[r]`,
+// since a held function set is stored as its id, which the type does not say (D16721).
+export function fieldElemTyIn(col: i32[], tys: i32[], r: i32): i32 {
+  const v = if r >= 0 && r < col.length { col[r] } else { -1 }
+  const st = fcStoreTyAt(tys, r)
+  if st < 0 { return v }
+  const pj = fcProjElemTy(st, repOfTy(st))
+  if pj >= 0 && fcMayHoldFn(pj) { return v }
+  if repShadowOn && v != pj && !(v >= 0 && pj >= 0 && tySameSealed(v, pj)) {
+    fcReadNote("elemTy", "moved")
+  }
+  return pj
 }
 
 // Notes a read that keeps its stored code by its named class; one in no class fails loudly.
