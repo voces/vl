@@ -26,6 +26,14 @@ guard.
   descent declines), where the candidate is silent.
 - Seed fixpoint.
 
+## The map-value table's 32 merges
+
+The heap shadow counted 32 map-value merges in 32 files (one value type, two map heap types). All
+32 are a string-keyed and an i32-keyed map of one value type, measured by splitting each merge on
+`mvSlotKeyKind`. A map's keys list is part of its struct, so the two stay apart, rightly. The
+shadow now keys a map-value row by its key kind as well as its value's rep id, and those 32 read
+as distinct rows.
+
 ## Cost
 
 None measurable: the struct twin pass was about 0% of the self-compile before
