@@ -16774,7 +16774,8 @@ function elabSlotCallTysOpenFns(
   elabSlotCallRet = -1
   // The calls the value reaches, each once.
   const hits: i32[] = []
-  for ci in eplSlotCallRecs(d, path, -1) {
+  const noOmit: i32[] = []
+  for ci in eplSlotCallRecs(d, path, -1, noOmit) {
     const c = EPL.callNode[ci]
     if !i32ListHas(hits, c) { hits.push(c) }
   }
@@ -16784,7 +16785,7 @@ function elabSlotCallTysOpenFns(
   elabSlotCallAlso = -1
   if also >= 0 {
     const st: string[] = [elabSlotCallAlsoStep]
-    for ci in eplSlotCallRecs(also, st, -1) {
+    for ci in eplSlotCallRecs(also, st, -1, noOmit) {
       const c = EPL.callNode[ci]
       if !i32ListHas(hits, c) { hits.push(c) }
     }
@@ -17422,7 +17423,8 @@ export function elabSlotUncalled(d: i32, path: string[]): boolean {
   for c in elabSlotSetCalls(d, path) {
     if !elabCallNamesOne(c) { return false }
   }
-  if elabSlotDeliveries(d, path, -1).length > 0 { return false }
+  const none: i32[] = []
+  if eplSlotDelivered(d, path, none) { return false }
   for f in elabSlotHeldFns(d, path) {
     if fnEscapes(f) { return false }
   }
@@ -17445,7 +17447,7 @@ export function elabSlotUncalledOmitting(
   for c in elabSlotSetCalls(d, path) {
     if !i32ListHas(omit, c) && !elabCallNamesOne(c) { return false }
   }
-  return elabSlotDeliveriesOmitting(d, path, -1, omit).length == 0
+  return !eplSlotDelivered(d, path, omit)
 }
 
 // The slot of binding `elabValueSlotAt[x]` at path `elabValueSlotPath[x]` the monomorphizer built
@@ -21061,6 +21063,10 @@ type EplTables = {
   // Function-value copies as flow edges, and their adjacency by class root as of `adjN` edges.
   flowSrc: i32[],
   flowDst: i32[],
+  // Per flow edge, the read it was drawn from (-1 for none), and per forward adjacency entry its
+  // edge's read, for a reach that leaves reads out.
+  flowVal: i32[],
+  fwdVal: {[i32]: i32[]},
   fwd: {[i32]: i32[]},
   bwd: {[i32]: i32[]},
   adjN: i32,
@@ -21101,6 +21107,8 @@ function eplFresh(): EplTables {
     insts: Map(),
     flowSrc: [],
     flowDst: [],
+    flowVal: [],
+    fwdVal: Map(),
     fwd: Map(),
     bwd: Map(),
     adjN: -1,
@@ -21565,15 +21573,21 @@ function eplRepointsFile() {
 // A value edge from `src` to `dst`: a function value is copied (its members flow forward, the
 // calls through the copy flow back); any other value is shared, so the two places unify.
 function eplEdge(src: i32, dst: i32, val: i32) {
-  eplEdgeTy(src, dst, if val >= 0 { nodeTyIxOf(val) } else { -1 })
+  eplEdgeTyAt(src, dst, if val >= 0 { nodeTyIxOf(val) } else { -1 }, val)
 }
 
 function eplEdgeTy(src: i32, dst: i32, t0: i32) {
+  eplEdgeTyAt(src, dst, t0, -1)
+}
+
+// `eplEdgeTy` for an edge drawn from read `val` (-1 for none).
+function eplEdgeTyAt(src: i32, dst: i32, t0: i32, val: i32) {
   if src < 0 || dst < 0 { return 0 }
   const t = if t0 >= 0 && t0 < T.tys.length { nonNullTy(t0) } else { -1 }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
     EPL.flowSrc.push(src)
     EPL.flowDst.push(dst)
+    EPL.flowVal.push(val)
     return 0
   }
   return eplUnion(src, dst)
@@ -21582,6 +21596,7 @@ function eplEdgeTy(src: i32, dst: i32, t0: i32) {
 function eplAdj() {
   if EPL.adjN == EPL.flowSrc.length { return 0 }
   EPL.fwd = Map()
+  EPL.fwdVal = Map()
   EPL.bwd = Map()
   let i = 0
   while i < EPL.flowSrc.length {
@@ -21591,6 +21606,9 @@ function eplAdj() {
       const f = EPL.fwd.get(a) ?? []
       f.push(b)
       EPL.fwd.set(a, f)
+      const fv = EPL.fwdVal.get(a) ?? []
+      fv.push(if i < EPL.flowVal.length { EPL.flowVal[i] } else { -1 })
+      EPL.fwdVal.set(a, fv)
       const g = EPL.bwd.get(b) ?? []
       g.push(a)
       EPL.bwd.set(b, g)
@@ -21626,6 +21644,37 @@ function eplReach(p: i32, fwd: boolean): i32[] {
 function eplCallsStar(p: i32): i32[] {
   const out: i32[] = []
   for c in eplReach(p, true) {
+    for ci in EPL.calls[c] { out.push(ci) }
+  }
+  return out
+}
+
+// `eplReach` forward along only the edges not drawn from a read in `omit`.
+function eplReachOmit(p: i32, omit: i32[]): i32[] {
+  if omit.length == 0 { return eplReach(p, true) }
+  eplAdj()
+  const seen: i32[] = [eplFind(p)]
+  let i = 0
+  while i < seen.length && seen.length < 256 {
+    const nx = EPL.fwd[seen[i]] ?? []
+    const vs = EPL.fwdVal[seen[i]] ?? []
+    let j = 0
+    while j < nx.length {
+      const n = eplFind(nx[j])
+      const v = if j < vs.length { vs[j] } else { -1 }
+      if !i32ListHas(omit, v) && !i32ListHas(seen, n) { seen.push(n) }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  return seen
+}
+
+// `eplCallsStar` along only the edges not drawn from a read in `omit`.
+function eplCallsStarOmit(p: i32, omit: i32[]): i32[] {
+  if omit.length == 0 { return eplCallsStar(p) }
+  const out: i32[] = []
+  for c in eplReachOmit(p, omit) {
     for ci in EPL.calls[c] { out.push(ci) }
   }
   return out
@@ -22394,6 +22443,7 @@ function eplCallResultFlow(
       if src >= 0 && dst >= 0 {
         EPL.flowSrc.push(src)
         EPL.flowDst.push(dst)
+        EPL.flowVal.push(-1)
         EPL.reachMemo = Map()
         EPL.oneMemo = Map()
         drew = true
@@ -22594,7 +22644,12 @@ function eplSlotPerInstance(holder: i32, path: string[]): boolean {
 
 // The call records through slot `path` of `holder` or a copy in instance `k`, and through each
 // binding a call hands a parameter `holder`.
-function eplSlotCallRecs(holder: i32, path: string[], k: i32): i32[] {
+function eplSlotCallRecs(
+  holder: i32,
+  path: string[],
+  k: i32,
+  omit: i32[],
+): i32[] {
   const k0 = EPL.k
   // A slot in an instanced function, read for every instance, gathers the calls of all of them.
   const ks0 = if k < 0 { eplFrameKeysOf(holder) } else { [] }
@@ -22602,7 +22657,7 @@ function eplSlotCallRecs(holder: i32, path: string[], k: i32): i32[] {
   const cis: i32[] = []
   for kk in ks {
     const p = eplSlotPlaceOwn(holder, path, kk)
-    for ci in if p >= 0 { eplCallsStar(p) } else { [] } {
+    for ci in if p >= 0 { eplCallsStarOmit(p, omit) } else { [] } {
       if !i32ListHas(cis, ci) { cis.push(ci) }
     }
   }
@@ -22619,7 +22674,7 @@ function eplSlotCallRecs(holder: i32, path: string[], k: i32): i32[] {
     const a = if cn is Call && pi < cn.callArgs.length { parenPeelIx(cn.callArgs[pi]) } else { -1 }
     const ad = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
     const pa = if ad >= 0 { eplSlotPlace(ad, [], -1) } else { -1 }
-    for ci in if pa >= 0 { eplCallsStar(pa) } else { [] } {
+    for ci in if pa >= 0 { eplCallsStarOmit(pa, omit) } else { [] } {
       if !i32ListHas(cis, ci) { cis.push(ci) }
     }
   }
@@ -22641,6 +22696,34 @@ function eplSlotPlaceOwn(holder: i32, path: string[], k: i32): i32 {
   return eplSlotPlace(holder, path, k)
 }
 
+// Whether slot `path` of `holder` is delivered at a closed function type: a bound, or a call
+// through it or a copy that `omit` does not list, reached along no edge drawn from a read in
+// `omit`.
+function eplSlotDelivered(holder: i32, path: string[], omit: i32[]): boolean {
+  const k0 = EPL.k
+  const p = eplSlotPlace(holder, path, -1)
+  for c in if p >= 0 { eplReachOmit(p, omit) } else { [] } {
+    if eplBoundOf(c) >= 0 {
+      EPL.k = k0
+      return true
+    }
+  }
+  EPL.k = k0
+  // A call made through another fresh `const` holder unified with this one is not this slot's.
+  const h = eplSrcHolder(holder)
+  const hn = if h >= 0 { nodeAt(h) } else { null }
+  const hc = hn is LetDecl && hn.letKw == "const"
+  for ci in eplSlotCallRecs(holder, path, -1, omit) {
+    const r = EPL.callRoot[ci]
+    const other = hc
+      && r >= 0
+      && r != h
+      && eplFind(eplRoot(r)) == eplFind(eplRoot(h))
+    if !other && !i32ListHas(omit, EPL.callNode[ci]) { return true }
+  }
+  return false
+}
+
 // Pushes onto `tys` the checked argument types, each widened from its literal, that every call
 // through slot `path` of `holder` or a copy agrees on in instance `k`, leaving out calls made in a
 // function in `skip`; false when none calls it, an argument is open, or two calls differ.
@@ -22652,7 +22735,8 @@ function eplSlotAgreedCalls(
   tys: i32[],
 ): boolean {
   const k0 = EPL.k
-  const cis = eplSlotCallRecs(holder, path, k)
+  const none: i32[] = []
+  const cis = eplSlotCallRecs(holder, path, k, none)
   let one: i32[] = []
   let have = false
   let ok = true
