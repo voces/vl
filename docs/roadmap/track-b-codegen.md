@@ -13,8 +13,10 @@ pathfinding search to VL (`voces/emoji-sheep-tag` PR 3) and reported three rough
 - **Verified: a module that never calls `print` imports the host print functions.**
   `shared/pathing/vl/search.vl` has no print call. Built with master's `vl`, it imports seven
   `imports.__print_*__` functions without `-O`, and two with `-O` (`__print_char__` and
-  `__print_str_flush__`). A trivial module imports none, so some lowering pulls them in, probably a
-  runtime-error or trap-message path. Forward: emit a host print import only when it is reachable.
+  `__print_str_flush__`). At `-O` the two left are a reachable trap reason, so `-O` is done. A
+  plain build links every function of an imported module, and a trap reason in an unused one
+  reserves the four-import family; the three wide-scalar imports now need a `print` call, so
+  that is 4, not 7. The rest is ROADMAP's backlogged dead-code elimination in a plain build.
 - **The first use builds the toolchain, and `-O` needs a separate binaryen install.** The consumer
   measured about 5 minutes for the first build. This bears on the L10 ruling (the optimizer becomes a VL compiler
   phase) and on distribution (C5, H-M2).
@@ -30,10 +32,13 @@ non-search work dominate. Read it as a data point on generated-code performance.
 
 - **B-range** (D4000, DV-1000). Induction ranges for `for … until`, propagated through inlined
   helpers. They fold the compares and list bounds tests that the range decides. Keep the trap messages
-  that cannot fold, and grade against a node/JS control.
-- **B-hint.** Emit `metadata.code.branch_hint` for trap arms and `??` fallbacks. wasmtime must opt in.
-- **L10, the optimizer as a VL phase** (optimizer-in-VL ruling). `-O` becomes a VL compiler phase, so
-  the rung is chosen by the cost of the whole compile.
+  that cannot fold, and grade against a node/JS control. Waits for the IR's BCE pass (step I10,
+  [ir-design-2026-11.md §4.2](../internals/ir-design-2026-11.md)): it needs range facts after
+  inlining, and the byte-level `opt_*` passes that could carry them today retire at that step.
+- **B-hint, parked** (measured 2026-11-16). Hand-hinting all five trap guards of an `-O3` kernel
+  moved neither engine: node 22 with `--experimental-wasm-branch-hinting` and wasmtime 49 with
+  `wasm_branch_hinting` stayed within noise. Both default the proposal off. Re-measure when one
+  enables it by default.
 - **P1.3, optimization defaults.** Add the `-O` column to `bench/results/summary.md`, and name
   `sort-heap` in cli-design.md as the case where `-O3` is worse. The per-program rung cannot be
   selected (see the emoji-sheep-tag item).

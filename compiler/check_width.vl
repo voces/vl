@@ -9,6 +9,8 @@ import {
   Ident,
   Node,
   Param,
+  Paren,
+  RetStmt,
   TS_NAME,
   TS_NULL,
   TS_OBJ,
@@ -18,6 +20,7 @@ import {
   arenaSetNode,
   mkTypeRef,
   nodeAt,
+  nodeChildren,
   setAnnTs,
   tsKidCount,
   tsKidStart,
@@ -53,6 +56,7 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 import { i32ListHas } from "./listutil"
+import { identDeclOf } from "./symbols"
 import { rowParamName } from "./check_row_param"
 
 // D3992 — a wider record to a declared record parameter is legal (no field changes type) and is
@@ -62,6 +66,8 @@ import { rowParamName } from "./check_row_param"
 export let wsDecl: i32[] = []
 let wsParam: i32[] = []
 export let wsOrigAnn: i32[] = []
+// Beside `wsDecl`: the return annotation each rewrite respelled at its row slot, -2 where it left it.
+let wsOrigRet: i32[] = []
 // The type parameter each rewrite row added, the row slot `rowParamName` spells.
 let wsTpName: string[] = []
 // Beside `wsTpName`: the inline record each row's slot is bound by, as spelled, or "" for a
@@ -87,6 +93,12 @@ export let wsSlotAt: i32[] = []
 // Each noted record's own type and the declared record that refused it, beside `wsSlotAt`.
 export let wsSlotSrc: i32[] = []
 export let wsSlotDst: i32[] = []
+// Per pass: each argument a declared record parameter refused, beside the callee, the parameter
+// and the argument's type, for the reword of a misfitting write through the parameter (D16707).
+export let wsArgAt: i32[] = []
+export let wsArgDecl: i32[] = []
+export let wsArgParam: i32[] = []
+export let wsArgTy: i32[] = []
 // The argument being delivered to its parameter, parens peeled, or -1: a literal there that sets
 // a field a record parameter does not declare is passed wider, its extra initializer evaluated.
 // A union parameter has no wider arm to pass, so the literal is refused there (D4070).
@@ -103,6 +115,7 @@ export function wsReset() {
   wsDecl = []
   wsParam = []
   wsOrigAnn = []
+  wsOrigRet = []
   wsTpName = []
   wsTpSpell = []
   wsNoDecl = []
@@ -120,6 +133,10 @@ export function wsPassReset() {
   wsSuppress = false
   wsInstErr = []
   wsSlotAt = []
+  wsArgAt = []
+  wsArgDecl = []
+  wsArgParam = []
+  wsArgTy = []
   wsSlotSrc = []
   wsSlotDst = []
   return 0
@@ -133,6 +150,17 @@ export function wsNoteSlotAt(at: i32, src: i32, dst: i32) {
     wsSlotSrc.push(src)
     wsSlotDst.push(dst)
   }
+  return 0
+}
+
+// Note argument `at`, of type `ty`, refused at parameter `i` of declaration `d`, one the rewrite
+// declined.
+export function wsNoteArgRefusal(d: i32, i: i32, at: i32, ty: i32) {
+  if d < 0 || at < 0 || !i32ListHas(wsNoDecl, d) { return 0 }
+  wsArgAt.push(at)
+  wsArgDecl.push(d)
+  wsArgParam.push(i)
+  wsArgTy.push(ty)
   return 0
 }
 
@@ -196,7 +224,7 @@ function wsUndoInstErr(): i32 {
             fnName: cur.fnName,
             fnTyParams: tps,
             fnParams: cur.fnParams,
-            fnRet: cur.fnRet,
+            fnRet: if wsOrigRet[k] != -2 { wsOrigRet[k] } else { cur.fnRet },
             fnBody: cur.fnBody,
             pos: cur.pos,
           }
@@ -214,6 +242,7 @@ function wsUndoInstErr(): i32 {
     const kd: i32[] = []
     const kp: i32[] = []
     const ka: i32[] = []
+    const kr: i32[] = []
     const kn: string[] = []
     const ksp: string[] = []
     let r = 0
@@ -222,6 +251,7 @@ function wsUndoInstErr(): i32 {
         kd.push(wsDecl[r])
         kp.push(wsParam[r])
         ka.push(wsOrigAnn[r])
+        kr.push(wsOrigRet[r])
         kn.push(wsTpName[r])
         ksp.push(wsTpSpell[r])
       }
@@ -230,6 +260,7 @@ function wsUndoInstErr(): i32 {
     wsDecl = kd
     wsParam = kp
     wsOrigAnn = ka
+    wsOrigRet = kr
     wsTpName = kn
     wsTpSpell = ksp
   }
@@ -336,11 +367,21 @@ function wsApplyPending(): i32 {
             pos: pn.pos,
           }
           arenaSetNode(pi, np)
+          // A declared return whose only source is this parameter is its instance's record (D16401).
+          const rr = if wsRetOnlyParam(fd.fnBody, pi, 0) { annTsOf(fd.fnRet) } else { -1 }
+          const nret = if rr >= 0 { wsTsRename(rr, wsPendName[k], nm) } else { -1 }
+          const respell = nret >= 0 && tsToName(nret) != tsToName(rr)
+          wsOrigRet.push(if respell { fd.fnRet } else { -2 })
+          let ret = fd.fnRet
+          if respell {
+            ret = mkTypeRef(tsToName(nret), pn.pos)
+            setAnnTs(ret, nret)
+          }
           const nf: Node = {
             fnName: fd.fnName,
             fnTyParams: tps,
             fnParams: fd.fnParams,
-            fnRet: fd.fnRet,
+            fnRet: ret,
             fnBody: fd.fnBody,
             pos: fd.pos,
           }
@@ -443,4 +484,32 @@ export function wsNotePendingAt(d: i32, i: i32, name: string, pty: i32) {
   wsPendName.push(name)
   wsPendTy.push(pty)
   return 0
+}
+
+// Whether every `return` under `x`, outside nested functions, returns parameter `pi` itself, and
+// one does; 0 is the depth walked so far.
+function wsRetOnlyParam(x: i32, pi: i32, depth: i32): boolean {
+  return wsRetsOf(x, pi, depth) == 1
+}
+
+// How the returns under `x` read parameter `pi`: 0 none, 1 each returns it, 2 one returns another value.
+function wsRetsOf(x: i32, pi: i32, depth: i32): i32 {
+  if x < 0 || depth > 256 { return 0 }
+  const n = nodeAt(x)
+  if n is FuncDecl { return 0 }
+  if n is RetStmt {
+    let v = n.retArg
+    while v >= 0 && nodeAt(v) is Paren {
+      const pv = nodeAt(v)
+      v = if pv is Paren { pv.parInner } else { -1 }
+    }
+    return if v >= 0 && nodeAt(v) is Ident && identDeclOf(v) == pi { 1 } else { 2 }
+  }
+  let out = 0
+  for k in nodeChildren(x) {
+    const r = wsRetsOf(k, pi, depth + 1)
+    if r == 2 { return 2 }
+    if r == 1 { out = 1 }
+  }
+  return out
 }

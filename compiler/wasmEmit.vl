@@ -1,5 +1,6 @@
 import { asgNameWiderRow, cloRetValSlot, sTwinRepOf } from "./emit_classify"
 import { isBlockBody } from "./block_body"
+import { lexOpcode, primOpcode } from "./ir"
 import { identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
@@ -392,10 +393,6 @@ import {
   ALLOC_LIT_CHUNK,
   LIT_PART,
   NEW_FIXED_MAX,
-  binOpcode,
-  binOpcodeF32,
-  binOpcodeF64,
-  binOpcodeI64,
   cpsToUtf8,
   decodeStr,
   directArgsBad,
@@ -1645,7 +1642,7 @@ import {
 } from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
-  atomEqOpcodeOfKind,
+  RpPrim,
   boxAtomKindOfMemberTy,
   boxTagOfPrim,
   boxTagOfTy,
@@ -4590,6 +4587,18 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
   if tyIsRecord(ity) {
     const inner = nullableInnerOrNone(instanceReadTyOf(recvIx, fnIx))
     if inner >= 0 && tyIsRecord(inner) && isTestAnswer(inner, ity) == 0 {
+      return true
+    }
+  }
+  // So does a list niche: its list's annotation fixes its elements, so a list the relation
+  // says it never is cannot be the value, even empty (D16713).
+  if tyArrayElemIx(ity) >= 0 {
+    const inner = nullableInnerOrNone(instanceReadTyOf(recvIx, fnIx))
+    if (
+      inner >= 0
+      && tyArrayElemIx(inner) >= 0
+      && isTestAnswer(inner, ity) == 0
+    ) {
       return true
     }
   }
@@ -11336,21 +11345,27 @@ function emitUnionNumCrossArm(sl: i32, sr: i32, ka: i32, kb: i32): boolean {
   return true
 }
 
-// The `eq` opcode of number kind `k` (`i32`, `i64`, `f32` or `f64`), or -1.
+// The scalar of number kind `k` (`i32`, `i64`, `f64` or `f32`), or null for any other kind.
+function numPrimOfKind(k: i32): RpPrim | null {
+  if k == 0 { return "i32" }
+  if k == 3 { return "i64" }
+  if k == 4 { return "f64" }
+  if k == 5 { return "f32" }
+  return null
+}
+
+// The `eq` opcode of number kind `k`, or -1.
 function numEqOpOfKind(k: i32): i32 {
-  if k == 0 {
-    return 70 // 0x46 i32.eq
-  }
-  if k == 3 {
-    return 81 // 0x51 i64.eq
-  }
-  if k == 4 {
-    return 97 // 0x61 f64.eq
-  }
-  if k == 5 {
-    return 91 // 0x5b f32.eq
-  }
-  return -1
+  const p = numPrimOfKind(k)
+  if p == null { return -1 }
+  return primOpcode("eq", p)
+}
+
+// The value-eq opcode of value atom kind `k`: a number kind's, i32's for a boolean, and -1 for
+// every other kind (a string compares by its loop, a null by its tag alone).
+function atomEqOpcodeOfKind(k: i32): i32 {
+  if k == 1 { return primOpcode("eq", "bool") }
+  return numEqOpOfKind(k)
 }
 
 // How many of a union's arms are function values (atom kind 11).
@@ -15451,13 +15466,7 @@ export function emitMapGetUnionBox(recvIx: i32, keyIx: i32, fnIx: i32) {
 // the four widths `mapReadScalarBoxKind` can answer with. Only those four: this is a
 // membership query against a union's rendered atoms, and every other code either has a
 // niche of its own (so it never reaches here) or is not a scalar at all.
-function scalarAtomNameOfKind(k: i32): string {
-  if k == 0 { return "i32" }
-  if k == 3 { return "i64" }
-  if k == 4 { return "f64" }
-  if k == 5 { return "f32" }
-  return ""
-}
+function scalarAtomNameOfKind(k: i32): string { return numPrimOfKind(k) ?? "" }
 
 // Lower a bare scalar-valued map read `m[k]` directly into the union box: the tag and
 // the payload are each chosen by their own conditional (two allocation sites, so
@@ -32105,7 +32114,7 @@ function retStorageMismatch(retArg: i32, fnIx: i32): boolean {
   const rt = nodeTyIxOf(unwrapParen(retArg))
   // Only a value whose type still holds a hole, built at its bindings' own storage, can miss the
   // result's; a closed one is built at the result's type.
-  if rt < 0 || rt >= T.tys.length || !tyMayHoldFn(rt, 0) || !tyHasTyVar(rt) {
+  if rt < 0 || rt >= T.tys.length || !tyMayHoldFn(rt) || !tyHasTyVar(rt) {
     return false
   }
   const rd = repOfFnSlot(fe)
@@ -38212,10 +38221,7 @@ function njPair(a: i32, b: i32) {
     fbCall(gHelpF64Rem)
     if p == 5 { fbF32DemoteF64() }
   } else {
-    let opc = binOpcode(njOp)
-    if p == 3 { opc = binOpcodeI64(njOp) }
-    if p == 4 { opc = binOpcodeF64(njOp) }
-    if p == 5 { opc = binOpcodeF32(njOp) }
+    const opc = lexOpcode(njOp, numPrimOfKind(p) ?? "i32")
     if opc < 0 {
       return emitFail(
         "emitProgram: operator '"
@@ -38740,8 +38746,7 @@ function srConst(v: i64, w: i32) {
 
 // The opcode of `op` at width `w`.
 function srOpcode(op: string, w: i32): i32 {
-  if w == 64 { return binOpcodeI64(op) }
-  return binOpcode(op)
+  return lexOpcode(op, if w == 64 { "i64" } else { "i32" })
 }
 
 // Pushes source `src` ([x, k, narrow]) exactly as the unreduced chain would have evaluated x: at
@@ -39047,20 +39052,26 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
   // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`.
   if e.binOp == "&&" || e.binOp == "||" {
+    const scStart = wLen()
     if emitExpr(e.binLeft, fnIx) < 0 {
       return -1 // condition `a`
     }
+    // An `is` this instance decides can leave `b` dead, and `b` reads its operand at the
+    // narrowed type, which the value is not here: `b` lowers as a dead arm (D16713).
+    const scK = staticIsGuard(e.binLeft, scStart)
     fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
     if e.binOp == "&&" {
       // then = b, else = 0
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      if scK == 0 { emitDeadValueArm(e.binRight) }
+      else if emitExpr(e.binRight, fnIx) < 0 { return -1 }
       fbElse() // 0x05 else
       fbI32Const(0)
     } else {
       // then = 1, else = b
       fbI32Const(1)
       fbElse() // 0x05 else
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      if scK == 1 { emitDeadValueArm(e.binRight) }
+      else if emitExpr(e.binRight, fnIx) < 0 { return -1 }
     }
     fbEnd() // 0x0b end
     return 0
@@ -39246,7 +39257,7 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   // G6 string operators (a string is a `(array i32)` of code points): `+` is a new
   // concatenated array; `==`/`!=` are element-wise value-equality, not ref identity — so they
-  // take their own inline lowering before the i32 `binOpcode` path, which would emit `i32.eq`
+  // take their own inline lowering before the i32 `lexOpcode` path, which would emit `i32.eq`
   // (ref identity) for strings. Only string-typed operands route here.
   if exprIsStrConcat(exprIx, fnIx) { return emitStrConcat(exprIx, fnIx) }
   if exprIsStrEq(exprIx, fnIx) { return emitStrEq(exprIx, fnIx) }
@@ -39424,7 +39435,7 @@ function emitBinNumeric(e: BinExpr, exprIx: i32, fnIx: i32) {
       if emitF64RemCall(e.binLeft, e.binRight, fnIx, true) < 0 { return -1 }
       return 0
     }
-    const opcF32 = binOpcodeF32(e.binOp)
+    const opcF32 = lexOpcode(e.binOp, "f32")
     // No f32 form ⇒ fail, never fall through. Ops with no float form (`%`, bitwise, shift) are
     // integer-only in the checker, so this is unreachable from accepted source — it exists
     // because falling through reaches the i32 tail below, emitting an i32 opcode over a float
@@ -39444,7 +39455,7 @@ function emitBinNumeric(e: BinExpr, exprIx: i32, fnIx: i32) {
       if emitF64RemCall(e.binLeft, e.binRight, fnIx, false) < 0 { return -1 }
       return 0
     }
-    const opcF = binOpcodeF64(e.binOp)
+    const opcF = lexOpcode(e.binOp, "f64")
     // NO f64 form ⇒ fail, never fall through — the f32 slice's reasoning, one width up.
     if opcF < 0 {
       return emitFail("emitProgram: operator '" + e.binOp + "' has no f64 form")
@@ -39457,7 +39468,7 @@ function emitBinNumeric(e: BinExpr, exprIx: i32, fnIx: i32) {
   if w == "i64" {
     const sr64 = emitShiftMaskFold(e, exprIx, 64, fnIx)
     if sr64 <= 0 { return sr64 }
-    const opc64 = binOpcodeI64(e.binOp)
+    const opc64 = lexOpcode(e.binOp, "i64")
     if opc64 >= 0 {
       if emitBinOperandAs(e.binLeft, "i64", fnIx) < 0 { return -1 }
       if emitBinOperandAs(e.binRight, "i64", fnIx) < 0 { return -1 }
@@ -39467,7 +39478,7 @@ function emitBinNumeric(e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   const sr32 = emitShiftMaskFold(e, exprIx, 32, fnIx)
   if sr32 <= 0 { return sr32 }
-  const opcode = binOpcode(e.binOp)
+  const opcode = lexOpcode(e.binOp, "i32")
   if opcode < 0 { return emitFail("emitProgram: unsupported binary operator") }
   // Operands first (left then right), then the operator — wasm's stack order. An `i64` shift
   // count wraps to the `i32` operand's width, which masks it as wasm does.

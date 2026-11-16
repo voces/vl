@@ -50,9 +50,12 @@ import {
 import { identSlotOf } from "./check_scopes"
 import { rcoal } from "./check_state"
 import {
+  T,
   TY_ERR,
   TyNullable,
+  TyUnion,
   TyVar,
+  primNameStr,
   tyAt,
   tyHasHole,
   tyIsHole,
@@ -60,7 +63,8 @@ import {
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { crUnParen, nePopKeyOf } from "./check_narrow_ends"
-import { isNullTy, tyHasTyVar } from "./tyquery"
+import { numCastCanFail } from "./check_num_lits"
+import { isNullTy, primNameOf, tyHasTyVar } from "./tyquery"
 import {
   HD_BINOP,
   HD_COAL,
@@ -233,9 +237,41 @@ export function rcoalReset() {
   return 0
 }
 
+// Whether `??` node `ix`'s left operand is a cast already refused at its own node, whose
+// refusal names the `??` (`castCoalNote`); a dead-default finding would repeat it.
+function coalCastRefused(ix: i32): boolean {
+  const n = nodeAt(ix)
+  if !(n is BinExpr) { return false }
+  const c = parenPeelIx(n.binLeft)
+  if c < 0 || !(nodeAt(c) is AsExpr) { return false }
+  for d in T.diags {
+    if d.tat == c { return true }
+  }
+  return false
+}
+
+// The dead-default message when `??` node `ix`'s left operand is a bare `as`: its miss leaves
+// the function rather than reaching the default, so dropping the `??` is the wrong advice.
+function coalBareCastMsg(ix: i32): string {
+  const n = nodeAt(ix)
+  if !(n is BinExpr) { return "" }
+  const c = nodeAt(parenPeelIx(n.binLeft))
+  if !(c is AsExpr) || c.asMode != "prop" { return "" }
+  const ot = nodeTyIxOf(c.asObj)
+  if ot < 0 { return "" }
+  const canMiss = tyAt(ot) is TyUnion
+    || numCastCanFail(primNameStr(primNameOf(ot)), c.asTy)
+  if !canMiss { return "" }
+  return "this `??` default is never used: a bare `as` returns its miss from the function"
+    + " instead of handing it to `??` — write `(x as? "
+    + c.asTy
+    + ") ?? …` to default it here"
+}
+
 // Record `x ?? d` whose left operand's type admits no `null`: the default is dead.
 // Spans the `??` NODE, exactly where every other diagnostic on that node lands.
 export function recordDeadCoalesce(ix: i32, lt: i32) {
+  if coalCastRefused(ix) { return 0 }
   const tk = findingStartTok(ix)
   if tk < 0 { return 0 }
   if jwTokIsGenerated(tk) { return 0 }
@@ -253,7 +289,7 @@ export function recordDeadCoalesce(ix: i32, lt: i32) {
   rcoal.tok.push(tk)
   // User-facing (the finding's message quotes it) — the user render, not the raw one.
   rcoal.ty.push(tyToStrUser(lt))
-  rcoal.msg.push("")
+  rcoal.msg.push(coalBareCastMsg(ix))
   rcoal.why.push(coalNonNullWhy(ix))
   rcoal.code.push("dead-coalesce-default")
   return 0
