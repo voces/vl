@@ -44,4 +44,5 @@ Against master `7e8b71ff6`; both seeds reach their fixpoint on the second refres
   6,860,558,773; peak live heap equal.
 - Gate: all pass.
 
-MATRIX
+- Capability matrix A/B over the 154 templates matching `maker|hole-fn|list-of|fn-record|closure|
+  captured|generic-relay`: 0 runs → not-runs and 0 → silent in every template, no REGRESS line.
