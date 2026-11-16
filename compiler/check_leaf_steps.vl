@@ -209,6 +209,7 @@ import {
 } from "./check_ty_rep"
 import {
   isNullTy,
+  isNumeric,
   isStringTy,
   isVoidTy,
   nonNullTy,
@@ -2392,19 +2393,22 @@ export function intIntrWidth(argTys: i32[]) {
   return TY_I32
 }
 
-// Is this `min` / `max` / `abs` over integers only? Then it computes at the integer width
-// (`intIntrWidth`) rather than the float one, so `min(i, j)` is an i32 and not an f64.
-// An operand that is not a concrete integer primitive (a literal type counts as its base) keeps
-// the float rule.
+// Whether `min` / `max` / `abs` computes at the integer width (`intIntrWidth`): some operand is
+// an integer primitive (a literal type counts as its base), and no other is a float, a
+// non-primitive or a hole. A non-numeric primitive decides nothing; the caller refuses it at the
+// width the other operands give.
 export function intMinMaxOperands(name: string, argTys: i32[]): boolean {
   if name != "min" && name != "max" && name != "abs" { return false }
+  let sawInt = false
   let i = 0
   while i < argTys.length {
-    const p = primNameOf(softenLitTy(argTys[i]))
-    if p != "i32" && p != "i64" && p != "u8" { return false }
+    const t = softenLitTy(argTys[i])
+    const p = primNameOf(t)
+    if p == "i32" || p == "i64" || p == "u8" { sawInt = true }
+    else if t < 0 || !(tyAt(t) is TyPrim) || isNumeric(t) { return false }
     i = i + 1
   }
-  return true
+  return sawInt
 }
 
 // The hole a `min` / `max` / `abs` over an un-annotated operand defers to, or -1. Its width is
@@ -3099,6 +3103,13 @@ export function castConstSettle(
   if !numCastCanFail(primNameStr(primNameOf(arg)), dom) { return 0 }
   let iv = cexOfLexeme(cexDecText(v))
   if v.cxNeg { iv = cexNeg(iv) }
+  // An `i32` cast stays a cast, the typed `i32` it names and no literal a wider destination
+  // adopts, so a tree over it is no constant (E9.1, D16670). A narrower one becomes its literal,
+  // since its range test has no lowering once the value is known to fit.
+  if dom == "i32" {
+    cexRewrite(parenPeelIx(n.asObj), iv)
+    return cexRetype(n.asObj, TY_I32)
+  }
   if dom != "i64" {
     cexRewrite(ix, iv)
     return cexRetype(ix, TY_I32)
