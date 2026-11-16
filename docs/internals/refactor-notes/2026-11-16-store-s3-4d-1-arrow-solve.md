@@ -18,6 +18,8 @@ This is step 1.
 - When the hole callee is a parameter of the callee, the row keeps the outer call's argument node
   (`arrowFromAt`), because that node's own type names the set, which the bindings' closed signature
   loses.
+- A quiet probe's solve is rolled back, so the rule records nothing under `inferQuiet`, as
+  `fsbNoteCall` does.
 - `SS_ARG` still judges every `BND_ARG` row (`validateArgCstrs`), so no diagnostic moves. ARG moves
   onto the rule in the first class PR that consumes the solve, with its moved-diagnostic list.
 
@@ -40,14 +42,14 @@ All 6,564 `@run` programs, fixpoint seed:
 
 | key | both | solve only | mint only |
 |---|---|---|---|
-| (hole call, set) | 2,252 | 132 | 352 |
-| (hole call, set, results) | 2,237 | 220 | 466 |
+| (hole call, set) | 2,171 | 97 | 433 |
+| (hole call, set, results) | 2,138 | 182 | 565 |
 
-633 more rows have a set but open argument types: their callee forwards a hole into the call.
+526 more rows have a set but open argument types: their callee forwards a hole into the call.
 
-- The solve already gives 2,252 of the elaboration's 2,604 per-call facts (86%).
-- Results agree on 2,237 of those.
-- 444 programs are fully covered.
+- The solve already gives 2,171 of the elaboration's 2,604 per-call facts (83%).
+- Results agree on 2,138 of those.
+- 421 programs are fully covered.
 
 The class T witness (`closures/hole-fn-if-join-result-handed-hole-fn.vl`) reads 2/0/0: both of
 its calls through `{add}`, with the members' results. Before this step, only the late pass's mint
