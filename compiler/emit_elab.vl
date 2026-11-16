@@ -15922,21 +15922,16 @@ function elabLamParamTyAt(lam: i32, pi: i32, n: i32, depth: i32): i32 {
   if pi < 0 || pi >= n || lam < 0 || lam >= cwIxCoveredLen() || depth > 4 {
     return -1
   }
-  const was = elabDlvKey
-  const wasAdmit = elabDlvAdmit
-  elabDlvKey = elabWalkTop()
-  elabDlvAdmit = elabReachClosure(elabDlvKey)
-  elabCallRec = true
-  elabCallsSeen = []
-  const reached: i32[] = []
-  const seen: i32[] = []
-  elabSlotClimb(lam, [], reached, seen)
-  elabCallRec = false
-  const calls = elabCallsSeen
+  const kt = elabWalkTop()
+  const none: i32[] = []
+  const calls: i32[] = []
+  for ci in eplSlotCallRecs(lam, [], kt, none) {
+    const ck = EPL.callKey[ci]
+    const c = EPL.callNode[ci]
+    if (kt < 0 || ck < 0 || eplKeyAdmits(kt, ck)) && !i32ListHas(calls, c) { calls.push(c) }
+  }
   const out: i32[] = []
-  for c in calls { elabCallDeliveryAdd(c, out) }
-  elabDlvKey = was
-  elabDlvAdmit = wasAdmit
+  eplSlotCallTysInto(lam, [], kt, none, out)
   for c in calls {
     const fd = recEnclosingFn(c)
     if fd != lam && !elabLamParamsClose(fd, depth + 1) { return -1 }
@@ -23433,42 +23428,7 @@ export function eplSlotDeliveredTys(
     }
   }
   EPL.k = k0
-  if !annOnly {
-    const none: i32[] = []
-    for ci in eplSlotCallRecs(holder, path, k, none) {
-      const cn = nodeAt(EPL.callNode[ci])
-      const ck = EPL.callKey[ci]
-      const admitted = k < 0 || ck < 0 || eplKeyAdmits(k, ck)
-      // Read for every instance, a call is typed where all its instances agree, as the check left
-      // its holes open.
-      const agreed = if k < 0 && cn is Call { elabCallArgTysAgreed(EPL.callNode[ci]) } else { [] }
-      const ar = if k < 0 && cn is Call { elabNodeTyAgreed(EPL.callNode[ci]) } else { -1 }
-      if cn is Call && admitted && !i32ListHas(omit, EPL.callNode[ci]) && agreed.length == cn.callArgs.length && ar >= 0 {
-        const ft = mkFuncTy(agreed, ar)
-        if !i32ListHas(out, ft) { out.push(ft) }
-      } else if cn is Call && admitted && !i32ListHas(omit, EPL.callNode[ci]) {
-        const tys: i32[] = []
-        for a in cn.callArgs {
-          const t = eplArgTy(ci, a)
-          if t >= 0 && t < T.tys.length && !tyHasTyVar(t) && !tyHoldsHole(t) {
-            tys.push(widenLitTy(t))
-          }
-        }
-        const rt0 = if ck >= 0 { elabNodeTy(EPL.callNode[ci], ck) } else { -1 }
-        const rt = if rt0 >= 0 { rt0 } else { nodeTyIxOf(EPL.callNode[ci]) }
-        // A call is a delivery only where its arguments and its result are closed.
-        if (
-          tys.length == cn.callArgs.length
-          && rt >= 0
-          && !tyHasTyVar(rt)
-          && !tyHoldsHole(rt)
-        ) {
-          const ft = mkFuncTy(tys, rt)
-          if !i32ListHas(out, ft) { out.push(ft) }
-        }
-      }
-    }
-  }
+  if !annOnly { eplSlotCallTysInto(holder, path, k, omit, out) }
   // A function value is delivered only at its own arity; a binding's slot whose checked type is a
   // closed function type is also delivered at it.
   const sh = eplSrcHolder(holder)
@@ -23493,6 +23453,47 @@ export function eplSlotDeliveredTys(
     }
   }
   return kept
+}
+
+// Pushes onto `out` the closed function type of each call through slot `path` of `holder` or a copy
+// that `omit` does not list, in instance `k` (every instance at -1), at its arguments' and result's
+// types in the instance it ran; each type once.
+function eplSlotCallTysInto(holder: i32, path: string[], k: i32, omit: i32[], out: i32[]) {
+  const none: i32[] = []
+  for ci in eplSlotCallRecs(holder, path, k, none) {
+    const cn = nodeAt(EPL.callNode[ci])
+    const ck = EPL.callKey[ci]
+    const admitted = k < 0 || ck < 0 || eplKeyAdmits(k, ck)
+    // Read for every instance, a call is typed where all its instances agree, as the check left
+    // its holes open.
+    const agreed = if k < 0 && cn is Call { elabCallArgTysAgreed(EPL.callNode[ci]) } else { [] }
+    const ar = if k < 0 && cn is Call { elabNodeTyAgreed(EPL.callNode[ci]) } else { -1 }
+    if cn is Call && admitted && !i32ListHas(omit, EPL.callNode[ci]) && agreed.length == cn.callArgs.length && ar >= 0 {
+      const ft = mkFuncTy(agreed, ar)
+      if !i32ListHas(out, ft) { out.push(ft) }
+    } else if cn is Call && admitted && !i32ListHas(omit, EPL.callNode[ci]) {
+      const tys: i32[] = []
+      for a in cn.callArgs {
+        const t = eplArgTy(ci, a)
+        if t >= 0 && t < T.tys.length && !tyHasTyVar(t) && !tyHoldsHole(t) {
+          tys.push(widenLitTy(t))
+        }
+      }
+      const rt0 = if ck >= 0 { elabNodeTy(EPL.callNode[ci], ck) } else { -1 }
+      const rt = if rt0 >= 0 { rt0 } else { nodeTyIxOf(EPL.callNode[ci]) }
+      // A call is a delivery only where its arguments and its result are closed.
+      if (
+        tys.length == cn.callArgs.length
+        && rt >= 0
+        && !tyHasTyVar(rt)
+        && !tyHoldsHole(rt)
+      ) {
+        const ft = mkFuncTy(tys, rt)
+        if !i32ListHas(out, ft) { out.push(ft) }
+      }
+    }
+  }
+  return 0
 }
 
 // The closed results of the bounds slot `path` of `holder` is delivered at in instance `k`, each
