@@ -54,7 +54,7 @@ import {
   identFnDeclOf,
   tyParamIsBareOnly,
 } from "./check_scopes"
-import { fvaIsMaker, fvaIsTwinRead } from "./check_assignable"
+import { fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftWithinInstancedFn } from "./check_fn_tag"
 import {
@@ -3147,25 +3147,6 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
   return ix
 }
 
-// A copy of the maker call `x` that the relay twin being built returns, its callee read copied
-// too, noted at the twin's result; -1 outside a relay twin or for any other value (D16755).
-function monoTwinRetCall(x: i32): i32 {
-  if monoBuild.twinRet < 0 { return -1 }
-  const c = unwrapParen(x)
-  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
-  if !(cn is Call) || cn.callFn < 0 { return -1 }
-  const r = unwrapParen(cn.callFn)
-  const rn = nodeAt(r)
-  if !(rn is Ident) || !fvaIsTwinRead(r) { return -1 }
-  const nr = monoCopyOf(r, mkIdent(rn.identName, rn.pos))
-  nodeTyRecord(nr, nodeTyIxOf(r))
-  const nc = monoCopyOf(c, mkCall(nr, cn.callArgs, cn.pos))
-  nodeTyRecord(nc, nodeTyIxOf(c))
-  monoNoteCallTpl(c, nc)
-  monoBuild.twinCalls[nc] = monoBuild.twinRet
-  return nc
-}
-
 // Clone a monomorphized instance's body, substituting every `LetDecl` type-param
 // annotation through the binding. Only the statement spine is rebuilt; every leaf
 // expression, a nested lambda included, is shared, so no new function node is created.
@@ -3375,9 +3356,23 @@ function monoCloneBodyRaw(
       return mkForInCopy(n, n.fiIter, cb)
     }
     RetStmt => {
-      // A relay twin returns its own copy of the maker call, built at the twin's result.
-      const tc = monoTwinRetCall(n.retArg)
-      if tc >= 0 { return mkReturn(tc, n.pos) }
+      // A relay twin returns its own copy of a maker call noted per twin (a result below -1), callee
+      // read copied too, built at the twin's result: the shared node points every twin at one (D16755).
+      const tcx = if monoBuild.twinRet >= 0 && n.retArg >= 0 { unwrapParen(n.retArg) } else { -1 }
+      const tcn = if tcx >= 0 && tcx < P.nodes.length { nodeAt(tcx) } else { null }
+      if tcn is Call && elabMakerCallSig(tcx) < -1 {
+        const tr = unwrapParen(tcn.callFn)
+        const trn = if tr >= 0 && tr < P.nodes.length { nodeAt(tr) } else { null }
+        if trn is Ident {
+          const nr = monoCopyOf(tr, mkIdent(trn.identName, trn.pos))
+          nodeTyRecord(nr, nodeTyIxOf(tr))
+          const nc = monoCopyOf(tcx, mkCall(nr, tcn.callArgs, tcn.pos))
+          nodeTyRecord(nc, nodeTyIxOf(tcx))
+          monoNoteCallTpl(tcx, nc)
+          if nc >= 0 { monoBuild.twinCalls.set(nc, monoBuild.twinRet) }
+          return mkReturn(nc, n.pos)
+        }
+      }
       // The return value may be a block or `if` expression carrying its own `LetDecl`s.
       const ca = monoCloneBody(n.retArg, typarams, tvN, tvV, bN, bT)
       const cl = if ca == n.retArg { monoRetBoundLitCopy(ca) } else { ca }
