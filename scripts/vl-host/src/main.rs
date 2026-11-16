@@ -9801,6 +9801,13 @@ fn pump_session(
     arm_cls_census(&inst, &mut store);
     arm_ir_shadow(&inst, &mut store);
     arm_opaque_snames(&inst, &mut store);
+    // $VL_REP_SHADOW under the pump arms the shadow's check-time half (the read query's saved
+    // answers, which `$VL_IFACES` prints); the disagreement report stays a build's.
+    if std::env::var_os("VL_REP_SHADOW").is_some() {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setRepShadow") {
+            set.call(&mut store, 1)?;
+        }
+    }
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
     if compile_pool_allowed() {
