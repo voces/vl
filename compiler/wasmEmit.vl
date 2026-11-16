@@ -22,7 +22,7 @@ import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
 import { recKeptFnDstOf } from "./check_rec_rows"
-import { isTestAnswer } from "./check_narrow_flow"
+import { isFloatIntLitTest, isTestAnswer } from "./check_narrow_flow"
 import { constRangeParts, constRangeTrips } from "./check_range_var"
 import { esGetterReach } from "./check_effect_rows"
 import { primTyIxOfName } from "./check_decl_scan"
@@ -4168,8 +4168,8 @@ function narrowedArmTyOf(ix: i32, fnIx: i32): i32 {
 
 // `recv == <numeric literal>` onto `body`, leaving a 0/1 i32 — the scalar value test shared
 // by the bare-literal `is` spelling and the numeric-litunion membership ladder. The compare's
-// width is the receiver's own; a float receiver waits on D3689's ruling, and a receiver of any
-// other type, or an `i32` the value does not fit, never holds the literal.
+// width is the receiver's own; a float receiver compares by value, the literal converted to its
+// type (D3689), and a receiver of any other type, or an `i32` it does not fit, never holds it.
 function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
   if emitExpr(recvIx, fnIx) < 0 { return -1 }
   const w = exprScalarWidth(recvIx, fnIx)
@@ -4184,10 +4184,15 @@ function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
     fbI32Bin(70)
     return 0
   }
-  if w == "f64" || w == "f32" {
-    return emitFail(
-      "emitProgram: an integer literal `is` test over a float has no settled answer (D3689)",
-    )
+  if w == "f64" {
+    fbF64Const(lv)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  if w == "f32" {
+    fbF32Const(lv)
+    fbI32Bin(91) // 0x5b f32.eq
+    return 0
   }
   fbDrop()
   fbI32Const(0)
@@ -4195,8 +4200,9 @@ function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
 }
 
 // Whether a receiver of base `base` can be read once and compared with every one of `texts`:
-// each is an integer, and fits `i32` where the base is `i32`; any other base declines.
+// a float holds any of them; otherwise each is an integer, fitting `i32` where the base is.
 function numLitOnceReadOk(base: string, texts: string[]): boolean {
+  if base == "f64" || base == "f32" { return true }
   const narrow = base == "i32"
   for t in texts {
     if numLexIsFloat(t) || narrow && !numLexFitsI32(t) { return false }
@@ -4204,14 +4210,26 @@ function numLitOnceReadOk(base: string, texts: string[]): boolean {
   return narrow || base == "i64"
 }
 
-// A fresh lazy-frame slot holding a receiver of base `base`, `i32` or `i64`.
+// A fresh lazy-frame slot holding a receiver of base `base`, an integer or a float.
 function numLitOnceSlot(base: string): i32 {
   if base == "i64" { return listElemStashSlot("i64list", 0) }
+  if base == "f64" { return listElemStashSlot("f64list", 0) }
+  if base == "f32" { return listElemStashSlot("f32list", 0) }
   return strI32Slot()
 }
 
-// Compares the `base` value on the stack, `i32` or `i64`, with the literal `lv`.
+// Compares the `base` value on the stack, an integer or a float, with the literal `lv`.
 function emitNumLitConstEq(base: string, lv: string) {
+  if base == "f64" {
+    fbF64Const(lv)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  if base == "f32" {
+    fbF32Const(lv)
+    fbI32Bin(91) // 0x5b f32.eq
+    return 0
+  }
   if base == "i64" {
     const pr = parseI64Pair(lv)
     fbI64Const(pr[0], pr[1])
@@ -4230,6 +4248,7 @@ function emitNumLitConstEq(base: string, lv: string) {
 function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   const nb = nodeNumScalarBaseName(recvIx)
   if nb != "" { return nb }
+  if tyIsPrimNamed(nodeTyIxOf(unwrapParen(recvIx)), "f32") { return "f32" }
   if nodeTyIsNullable(recvIx) { return "" }
   const t = monoArgClosedPinTy(recvIx, fnIx)[0]
   if t < 0 || t >= T.tys.length { return "" }
@@ -4440,7 +4459,24 @@ function emitNulStrLitEq(recvIx: i32, lex: string, fnIx: i32) {
 // over a `string | null` niche, plain string equality over a string ref, else the numeric
 // compare. One home because the bare-literal `is` and the litunion ladder must agree.
 function emitLitMemberEq(recvIx: i32, lex: string, fnIx: i32) {
-  if exprUnion(recvIx, fnIx) { return emitUnionLitIs(recvIx, lex, fnIx) }
+  if exprUnion(recvIx, fnIx) {
+    // A box with an integer and an `f64` arm holds an integer literal in either (D3689).
+    const usid = msSetOfUnionBox(recvIx, fnIx)
+    if (
+      usid >= 0
+      && !nameIsQuotedLeaf(lex)
+      && !numLexIsFloat(lex)
+      && unionHasAtomK(usid, "f64", 4)
+      && !unionNumIsF64Only(usid)
+      && unionEqOperandOk(recvIx)
+    ) {
+      if emitUnionLitIs(recvIx, lex, fnIx) < 0 { return -1 }
+      if emitUnionLitIs(recvIx, lex + ".0", fnIx) < 0 { return -1 }
+      fbI32Bin(114) // 0x72 i32.or
+      return 0
+    }
+    return emitUnionLitIs(recvIx, lex, fnIx)
+  }
 
   if nameIsQuotedLeaf(lex) {
     if litMemberRecvIsNulString(recvIx, fnIx) {
@@ -6315,6 +6351,10 @@ function emitIs(isIx: i32, fnIx: i32) {
     const opPrim = tyPrimNameOf(covOp)
     const tsPrim = tyPrimNameOf(isVarTyIxOf(isIx))
     const same = opPrim == tsPrim
+    // A float tested against integer literals compares by value, below (D3689).
+    if isFloatIntLitTest(covOp, isVarTyIxOf(isIx)) {
+      return emitIsTest(isIx, fnIx)
+    }
     if opPrim != null && tsPrim != null && !exprUnion(nd0.isObj, fnIx) {
       if same || !exprEffectFree(nd0.isObj) {
         if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
@@ -6948,6 +6988,18 @@ function emitIsTestNumLit(isIx: i32, nd0: IsExpr, fnIx: i32) {
       }
       if nlBase == "i32" { nlBase = "i64" }
     }
+    // A float receiver compares each integer member by value, converted to its width (D3689).
+    const fb = isNumRecvBaseName(nd0.isObj, fnIx)
+    if fb == "f64" || fb == "f32" {
+      if nlBase == "" { nlTexts = tyIntLitWideTexts(isVarTyIxOf(isIx)) }
+      if (
+        nlBase == "" && nlTexts.length > 0
+        || nlBase == "i32"
+        || nlBase == "i64"
+      ) {
+        nlBase = fb
+      }
+    }
     if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
       let nlOk = nlTexts.length == 1
       if unionEqOperandOk(nd0.isObj) { nlOk = true }
@@ -7245,6 +7297,26 @@ function emitIsTestRungs(isIx: i32, fnIx: i32) {
     }
     fbI32Const(0)
     return 0
+  }
+  // A box with a float arm tested against integer literals compares each by value (D3689).
+  if nd0 is IsExpr {
+    const ft = nodeTyAt(unwrapParen(nd0.isObj), fnIx)
+    const fx = tyNumLitMemberTexts(isVarTyIxOf(isIx))
+    if (
+      exprUnion(nd0.isObj, fnIx)
+      && isFloatIntLitTest(ft, isVarTyIxOf(isIx))
+      && (fx.length == 1 || fx.length > 1 && unionEqOperandOk(nd0.isObj))
+    ) {
+      let fi = 0
+      while fi < fx.length {
+        if emitLitMemberEq(nd0.isObj, fx[fi], fnIx) < 0 { return -1 }
+        if fi > 0 {
+          fbI32Bin(114) // 0x72 i32.or
+        }
+        fi = fi + 1
+      }
+      return 0
+    }
   }
   const rfit = emitRecordFitIs(isIx, fnIx)
   if rfit != 0 { return if rfit < 0 { -1 } else { 0 } }
@@ -12110,6 +12182,22 @@ function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
   return 0
 }
 
+// Whether union set `usid`'s only number arm is `f64`.
+function unionNumIsF64Only(usid: i32): boolean {
+  return unionHasAtomK(usid, "f64", 4) && unionHasNoIntArm(usid)
+}
+
+// Whether union set `usid`'s only number arm is `f32`.
+function unionNumIsF32Only(usid: i32): boolean {
+  return unionHasAtomK(usid, "f32", 5)
+    && !unionHasAtomK(usid, "f64", 4)
+    && unionHasNoIntArm(usid)
+}
+
+function unionHasNoIntArm(usid: i32): boolean {
+  return !unionHasAtomK(usid, "i32", 0) && !unionHasAtomK(usid, "i64", 3)
+}
+
 // `v is <literal>` over a still-boxed mixed-rep union (`"a" | "b" | 1` boxes as `string | i32`,
 // same-rep literals sharing a tag): the tag selects the literal's rep arm, then the unboxed
 // payload value-compares the literal. A literal whose rep has no arm is statically false,
@@ -12147,7 +12235,11 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   if nameIsQuotedLeaf(lit) {
     atom = "string"
     lak = 2
-  } else if numLexIsFloat(lit) {
+  } else if !numLexIsFloat(lit) && unionNumIsF32Only(usid) {
+    // A box whose only number is a float holds an integer by value there (D3689).
+    atom = "f32"
+    lak = 5
+  } else if numLexIsFloat(lit) || unionNumIsF64Only(usid) {
     atom = "f64"
     lak = 4
   } else if !numLexFitsI32(lit) {
@@ -12205,6 +12297,9 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   } else if lak == 4 {
     fbF64Const(lit)
     fbI32Bin(97) // 0x61 f64.eq
+  } else if lak == 5 {
+    fbF32Const(lit)
+    fbI32Bin(91) // 0x5b f32.eq
   } else if lak == 3 {
     const pr = parseI64Pair(lit)
     fbI64Const(pr[0], pr[1])
