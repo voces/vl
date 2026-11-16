@@ -22,7 +22,7 @@ import { unRowOfTyKey } from "./emit_union_tykey"
 import { unionArmRowOfTy } from "./emit_local_slots"
 import { unionTyOfRecv } from "./emit_obj_lit_fits"
 import { recKeptFnDstOf } from "./check_rec_rows"
-import { isFloatIntLitTest, isTestAnswer } from "./check_narrow_flow"
+import { isTestAnswer } from "./check_narrow_flow"
 import { constRangeParts, constRangeTrips } from "./check_range_var"
 import { esGetterReach } from "./check_effect_rows"
 import { primTyIxOfName } from "./check_decl_scan"
@@ -4459,24 +4459,7 @@ function emitNulStrLitEq(recvIx: i32, lex: string, fnIx: i32) {
 // over a `string | null` niche, plain string equality over a string ref, else the numeric
 // compare. One home because the bare-literal `is` and the litunion ladder must agree.
 function emitLitMemberEq(recvIx: i32, lex: string, fnIx: i32) {
-  if exprUnion(recvIx, fnIx) {
-    // A box with an integer and an `f64` arm holds an integer literal in either (D3689).
-    const usid = msSetOfUnionBox(recvIx, fnIx)
-    if (
-      usid >= 0
-      && !nameIsQuotedLeaf(lex)
-      && !numLexIsFloat(lex)
-      && unionHasAtomK(usid, "f64", 4)
-      && !unionNumIsF64Only(usid)
-      && unionEqOperandOk(recvIx)
-    ) {
-      if emitUnionLitIs(recvIx, lex, fnIx) < 0 { return -1 }
-      if emitUnionLitIs(recvIx, lex + ".0", fnIx) < 0 { return -1 }
-      fbI32Bin(114) // 0x72 i32.or
-      return 0
-    }
-    return emitUnionLitIs(recvIx, lex, fnIx)
-  }
+  if exprUnion(recvIx, fnIx) { return emitUnionLitIs(recvIx, lex, fnIx) }
 
   if nameIsQuotedLeaf(lex) {
     if litMemberRecvIsNulString(recvIx, fnIx) {
@@ -6352,7 +6335,7 @@ function emitIs(isIx: i32, fnIx: i32) {
     const tsPrim = tyPrimNameOf(isVarTyIxOf(isIx))
     const same = opPrim == tsPrim
     // A float tested against integer literals compares by value, below (D3689).
-    if isFloatIntLitTest(covOp, isVarTyIxOf(isIx)) {
+    if emFloatIntLitTest(covOp, isVarTyIxOf(isIx)) {
       return emitIsTest(isIx, fnIx)
     }
     if opPrim != null && tsPrim != null && !exprUnion(nd0.isObj, fnIx) {
@@ -7254,6 +7237,13 @@ function isRecvStageRep(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) || unionEqOperandOk(nd.isObj) { return -1 }
   const ity = isVarTyIxOf(isIx)
+  // A box tested against integers by value reads it twice (D3689).
+  if (
+    exprUnion(nd.isObj, fnIx)
+    && emFloatIntLitTest(nodeTyAt(unwrapParen(nd.isObj), fnIx), ity)
+  ) {
+    return 0
+  }
   if tyLitMemberTexts(ity).length < 2 && tyNumLitMemberTexts(ity).length < 2 {
     return -1
   }
@@ -7302,14 +7292,25 @@ function emitIsTestRungs(isIx: i32, fnIx: i32) {
   if nd0 is IsExpr {
     const ft = nodeTyAt(unwrapParen(nd0.isObj), fnIx)
     const fx = tyNumLitMemberTexts(isVarTyIxOf(isIx))
+    const reread = unionEqOperandOk(nd0.isObj)
+      || isRecvStagedIx == unwrapParen(nd0.isObj)
     if (
       exprUnion(nd0.isObj, fnIx)
-      && isFloatIntLitTest(ft, isVarTyIxOf(isIx))
-      && (fx.length == 1 || fx.length > 1 && unionEqOperandOk(nd0.isObj))
+      && emFloatIntLitTest(ft, isVarTyIxOf(isIx))
+      && reread
     ) {
+      // A box with an integer and an `f64` arm holds an integer in either.
+      const usid = msSetOfUnionBox(nd0.isObj, fnIx)
+      const both = usid >= 0
+        && unionHasAtomK(usid, "f64", 4)
+        && !unionHasNoIntArm(usid)
       let fi = 0
       while fi < fx.length {
-        if emitLitMemberEq(nd0.isObj, fx[fi], fnIx) < 0 { return -1 }
+        if emitUnionLitIs(nd0.isObj, fx[fi], fnIx) < 0 { return -1 }
+        if both {
+          if emitUnionLitIs(nd0.isObj, fx[fi] + ".0", fnIx) < 0 { return -1 }
+          fbI32Bin(114) // 0x72 i32.or
+        }
         if fi > 0 {
           fbI32Bin(114) // 0x72 i32.or
         }
@@ -12180,6 +12181,22 @@ function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
     fbI32Eqz() // 0x45 i32.eqz
   }
   return 0
+}
+
+// Whether `obj` has a float member and `chk` is a set of integer literals: the test compares by
+// value, the literal converted to the float (`tyFloatIntLitTest`, D3689).
+function emFloatIntLitTest(obj: i32, chk: i32): boolean {
+  const tx = tyNumLitMemberTexts(chk)
+  if tx.length == 0 || obj < 0 { return false }
+  for t in tx {
+    if numLexIsFloat(t) { return false }
+  }
+  const ms: i32[] = []
+  flattenVariantsInto(obj, ms)
+  for m in ms {
+    if tyIsPrimNamed(m, "f64") || tyIsPrimNamed(m, "f32") { return true }
+  }
+  return false
 }
 
 // Whether union set `usid`'s only number arm is `f64`.
