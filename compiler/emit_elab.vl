@@ -1946,6 +1946,30 @@ export function elabMakerTwinHeld(decl: i32, ret: i32): boolean {
   return false
 }
 
+// Whether declaration `d` has an un-annotated parameter.
+export function elabDeclHasHoleParam(d: i32): boolean {
+  const fn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(fn is FuncDecl) { return false }
+  for p in fn.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
+}
+
+// The type maker `d`'s wide twin at closed result `ret` binds its parameter `i` at, the pin the
+// call that banked the twin handed it; -1 for no twin, or two at `ret`.
+export function elabMakerTwinParamTy(d: i32, ret: i32, i: i32): i32 {
+  const k = elabMakerTwinKey(elabSrcDecl(d), ret)
+  return if k >= 0 { elabKeyParamTy(k, i) } else { -1 }
+}
+
+// The wide twin of instance `k` the elaboration built returning `w`, or -1.
+export function elabWideTwinOf(k: i32, w: i32): i32 {
+  if k < 0 || w < 0 || w >= T.tys.length { return -1 }
+  return ekIndex[i32ToStr(k) + "=>" + elabCanonStr(w, ELAB_CANON_DEPTH)] ?? -1
+}
+
 // Instance `k` built returning the wider `w`: the same binding under its own key, its body
 // checked once more there; `k` itself when no key is left.
 function elabWideTwin(k: i32, w: i32, from: i32): i32 {
@@ -10337,6 +10361,7 @@ export function elabRun() {
   const annDelivs: i32[] = []
   elabCalls = []
   elabCbOpenCalls = Map()
+  elabCbAnnKeyed = false
   mintLamsClosedReset()
   elabResultScanReset()
   while g < P.nodes.length {
@@ -15390,6 +15415,21 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
       cur = c
       i = i + 1
     } else if (
+      k == "v"
+      && pn is Member
+      && parenPeelIx(pn.memObj) == cur
+      && called
+      && pn.memProp == "values"
+    ) {
+      // A map's `.values()` hands its values out as the elements of the list it builds.
+      const vrest: string[] = ["e"]
+      let vj = i + 1
+      while vj < path.length {
+        vrest.push(path[vj])
+        vj = vj + 1
+      }
+      return elabSlotClimb(c, vrest, out, seen)
+    } else if (
       k == "e"
       && pn is Member
       && parenPeelIx(pn.memObj) == cur
@@ -15524,10 +15564,17 @@ function elabCbAtBuild(c: i32, from: i32) {
   }
   if an is FuncDecl && f.fnName != "" { return 0 }
   const p = nodeAt(f.fnParams[0])
-  if !(p is Param) || p.parType >= 0 { return 0 }
+  if !(p is Param) { return 0 }
   const lt = nodeTyIxOf(m.memObj)
   const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
   if (!(la is TyArray) || tyElemOpen(la) || !elabTyClosed(tyElemOf(la), 0)) {
+    return 0
+  }
+  // A lambda's parameter annotated at the element type takes the build too (D16764).
+  if (
+    p.parType >= 0
+    && (!(an is FuncDecl) || !tySameSealed(nodeTyIxOf(p.parType), tyElemOf(la)))
+  ) {
     return 0
   }
   const bt = elabListElemBuild(m.memObj, 0)
@@ -15562,11 +15609,19 @@ function elabCbAtBuild(c: i32, from: i32) {
   tys.push(bt)
   const k = elabEnqueue(fd, names, tys, from)
   if k < 0 { return 0 }
+  if p.parType >= 0 { elabCbAnnKeyed = true }
   elabValueKeyNote(ax, from, k)
   if ax != x { elabValueKeyNote(x, from, k) }
   elabReachNote(from, k, -1)
   return 0
 }
+
+// Whether `elabCbAtBuild` keyed a lambda whose parameter is annotated, which only the mono pass
+// retypes at the build.
+let elabCbAnnKeyed = false
+
+// `elabCbAnnKeyed`, for the mono pass's gate.
+export function elabCbAnnKeyedAny(): boolean { return elabCbAnnKeyed }
 
 // The `map` and `filter` calls `elabCbAtBuild` defers to each instance of their lambda's open
 // enclosing declaration: declaration → calls.
@@ -15581,13 +15636,33 @@ function elabListElemBuild(x0: i32, depth: i32): i32 {
   const n = nodeAt(x)
   if n is Ident {
     const d = recHeldDecl(x)
-    if d >= 0 { return recBuildTyIn(recBuildTable(), d, true) }
-    return -1
+    if d < 0 { return -1 }
+    const bt = recBuildTyIn(recBuildTable(), d, true)
+    if bt >= 0 { return bt }
+    // A binding holding an element of a list of lists holds what that element does (D16784).
+    const dn = nodeAt(d)
+    const init = if dn is LetDecl { parenPeelIx(dn.letInit) } else { -1 }
+    return if init >= 0 && nodeAt(init) is Index { elabListElemBuild(init, depth + 1) } else { -1 }
   }
   // A field of a record literal no write reaches holds what its initializer holds (D16210).
   if n is Member {
     const fv = elabHeldFieldInit(n.memObj, n.memProp)
     return if fv >= 0 { elabListElemBuild(fv, depth + 1) } else { -1 }
+  }
+  // An element of a list literal binding of lists holds what its parts hold (D16784).
+  if n is Index {
+    const b = parenPeelIx(n.idxArr)
+    const d = if b >= 0 && b < P.nodes.length && nodeAt(b) is Ident { recHeldDecl(b) } else { -1 }
+    const dn = if d >= 0 { nodeAt(d) } else { null }
+    const l = if dn is LetDecl { nodeAt(parenPeelIx(dn.letInit)) } else { null }
+    if !(l is ArrayLit) || l.arrElems.length == 0 { return -1 }
+    let r = -1
+    for el in l.arrElems {
+      const e = elabListElemBuild(el, depth + 1)
+      if e < 0 || (r >= 0 && !tySameSealed(r, e)) { return -1 }
+      r = e
+    }
+    return r
   }
   const lb = if n is Call && nodeRepStamped(x) { nodeRepTyIxOf(x) } else { recArgBuiltTyIn(x, nodeTyIxOf(x), recBuildTable()) }
   const lbt = if lb >= 0 && lb < T.tys.length { tyAt(lb) } else { null }
@@ -16050,20 +16125,25 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       const cd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
       if cd >= 0 && (cboxCellDecls[cboxDeclKey(cd)] ?? 0) == 1 {
         elabSlotReadDeliveries(cd, ["e"], out, seen)
-      } else if cd >= 0 && elabCallRec {
-        // A call search follows a value written into a named list's element or map's value to
-        // that slot's reads.
-        const ct = nodeTyIxOf(a)
-        const isMap = ct >= 0
-          && ct < T.tys.length
-          && tyAt(nonNullTy(ct)) is TyMap
-        elabSlotReadDeliveries(cd, [if isMap { "v" } else { "e" }], out, seen)
+      } else if elabCallRec {
+        // A call search follows a value written into an element or map value of a named binding,
+        // or of a field or element of one, to that slot's reads.
+        const steps: string[] = []
+        const rd = elabRecvPath(a, steps)
+        if rd >= 0 {
+          steps.push(elabSlotStepOf(a))
+          elabHolderReads(rd, steps, out, seen, 0)
+        }
       }
     } else if ln is Member && elabCallRec {
-      // A call search follows a value written into a named binding's field to that field's reads.
-      const o = parenPeelIx(ln.memObj)
-      const od = if o >= 0 && o < P.nodes.length && nodeAt(o) is Ident { identDeclOf(o) } else { -1 }
-      if od >= 0 { elabSlotReadDeliveries(od, ["f." + ln.memProp], out, seen) }
+      // A call search follows a value written into a field of a named binding, or of a field or
+      // element of one, to that field's reads.
+      const steps: string[] = []
+      const od = elabRecvPath(parenPeelIx(ln.memObj), steps)
+      if od >= 0 {
+        steps.push("f." + ln.memProp)
+        elabHolderReads(od, steps, out, seen, 0)
+      }
     }
   } else if (
     (k == CW_UP_COAL || k == CW_UP_ARM)
@@ -16086,7 +16166,16 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       elabRetCalls(f, calls)
       elabValueCalls(f, calls, 0)
       for c in calls {
-        if c >= 0 && c < P.nodes.length && elabCallRanAdmitted(c) {
+        // The call a search entered the function through is the one its result returns to.
+        const entered = elabCallRec && i32ListHas(elabEntryCalls, c)
+        // ... and a call whose instance reaches the one being searched is a caller of it, which
+        // the search climbs out to through an instanced function's return (D16780).
+        const caller = elabCallRec && !entered && elabCallReachesDlv(c)
+        if (
+          c >= 0
+          && c < P.nodes.length
+          && (entered || caller || elabCallRanAdmitted(c))
+        ) {
           elabReadDeliveries(c, out, seen)
         }
       }
@@ -16112,10 +16201,14 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     const ai = cwIxUpAux[r]
     // A call search follows a value pushed onto a named list to that list's element reads.
     const pd = if elabCallRec && cn is Call { elabPushRecvDecl(cn) } else { -1 }
-    if pd >= 0 { elabSlotReadDeliveries(pd, ["e"], out, seen) }
+    if pd >= 0 { elabHolderReads(pd, ["e"], out, seen, 0) }
     // ... and a value set into a named map to that map's value reads.
     const sd = if elabCallRec && ai == 1 && cn is Call { elabSetRecvAny(cn) } else { -1 }
-    if sd >= 0 { elabSlotReadDeliveries(sd, ["v"], out, seen) }
+    if sd >= 0 { elabHolderReads(sd, ["v"], out, seen, 0) }
+    // ... and either into a field or element of a named binding, to that slot's reads.
+    if elabCallRec && pd < 0 && sd < 0 && cn is Call {
+      elabHeldRecvReads(cn, ai, out, seen)
+    }
     const fds = if cn is Call && cn.callFn >= 0 { elabCalleeFns(cn) } else { [] }
     for fd in fds {
       const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
@@ -16175,6 +16268,102 @@ function elabPushRecvDecl(c: Call): i32 {
     return -1
   }
   return d
+}
+
+// The named binding `x` is a field or element of, as a chain of member and index reads from it,
+// with each step appended to `steps` in order from the binding; -1 where `x` is no such chain or
+// its binding is a capture cell.
+function elabRecvPath(x0: i32, steps: string[]): i32 {
+  const rev: string[] = []
+  let x = parenPeelIx(x0)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 8 {
+    const n = nodeAt(x)
+    if n is Ident {
+      const d = identDeclOf(x)
+      if (
+        d < 0
+        || d >= cwIxCoveredLen()
+        || (cboxCellDecls[cboxDeclKey(d)] ?? 0) == 1
+      ) {
+        return -1
+      }
+      let j = rev.length - 1
+      while j >= 0 {
+        steps.push(rev[j])
+        j = j - 1
+      }
+      return d
+    } else if n is Member {
+      rev.push("f." + n.memProp)
+      x = parenPeelIx(n.memObj)
+    } else if n is Index {
+      rev.push(elabSlotStepOf(parenPeelIx(n.idxArr)))
+      x = parenPeelIx(n.idxArr)
+    } else {
+      return -1
+    }
+    hops = hops + 1
+  }
+  return -1
+}
+
+// The step a read of an element of container `x` takes: `v` for a map, `e` otherwise.
+function elabSlotStepOf(x: i32): string {
+  const t = if x >= 0 && x < P.nodes.length { nodeTyIxOf(x) } else { -1 }
+  return if t >= 0 && t < T.tys.length && tyAt(nonNullTy(t)) is TyMap { "v" } else { "e" }
+}
+
+// A value pushed (argument 0) or set (argument 1) by call `c` into a holder that is a field or
+// element of a named binding: the call search follows it to that slot's reads.
+function elabHeldRecvReads(c: Call, ai: i32, out: i32[], seen: i32[]) {
+  const fm = nodeAt(parenPeelIx(c.callFn))
+  if !(fm is Member) { return 0 }
+  const isPush = (fm.memProp == "push" || fm.memProp == "unshift") && ai == 0
+  const isSet = fm.memProp == "set" && ai == 1 && c.callArgs.length == 2
+  if !isPush && !isSet { return 0 }
+  const o = parenPeelIx(fm.memObj)
+  if o < 0 || o >= P.nodes.length || nodeAt(o) is Ident { return 0 }
+  const steps: string[] = []
+  const rd = elabRecvPath(o, steps)
+  if rd < 0 { return 0 }
+  steps.push(if isPush { "e" } else { "v" })
+  elabHolderReads(rd, steps, out, seen, 0)
+  return 0
+}
+
+// The reads of slot `steps` of holder binding `d`, for the call search: where `d` is a function's
+// parameter, the holder is also each call's argument, so that argument's binding's slot is read
+// too, at the argument's own path.
+function elabHolderReads(
+  d: i32,
+  steps: string[],
+  out: i32[],
+  seen: i32[],
+  depth: i32,
+) {
+  elabSlotReadDeliveries(d, steps, out, seen)
+  const pn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(pn is Param) || depth >= 4 { return 0 }
+  const f = cwFrameOfDecl(d)
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  if !(fn is FuncDecl) { return 0 }
+  const pi = i32ListIndexOf(fn.fnParams, d)
+  if pi < 0 { return 0 }
+  const calls: i32[] = []
+  elabRetCalls(f, calls)
+  for c in calls {
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if cn is Call && cn.callArgs.length == fn.fnParams.length {
+      const at: string[] = []
+      const ad = elabRecvPath(cn.callArgs[pi], at)
+      if ad >= 0 {
+        for st in steps { at.push(st) }
+        elabHolderReads(ad, at, out, seen, depth + 1)
+      }
+    }
+  }
+  return 0
 }
 
 // The map binding call `c` sets a value into as `m.set(k, v)`, written type or not, that is no
@@ -16637,7 +16826,9 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
         elabDlvEnterCall(up)
         elabEntryFns.push(fd)
         elabEntryCalls.push(up)
-        const inSeen = if elabDlvKey != wasKey && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
+        // Another instance, or for a call search another call, reads the parameter afresh.
+        const fresh = elabDlvKey != wasKey || elabCallRec
+        const inSeen = if fresh && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
         elabSlotReadDeliveries(fn.fnParams[ai], path, out, inSeen)
         elabEntryFns.pop()
         elabEntryCalls.pop()
@@ -16790,6 +16981,25 @@ function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
 
 // Whether call `c` ran an instance the walk admits: every call does under no instance key, and so
 // does one with no instance row.
+// Whether call `c` is a caller of the instance the delivery search is under: one it ran there
+// reaches it, or `c` is made at the root, which every search's scope holds.
+function elabCallReachesDlv(c: i32): boolean {
+  if elabDlvKey < 0 { return false }
+  const row = elabCallKeys[c] ?? []
+  let i = 0
+  while i + 1 < row.length {
+    const to = row[i + 1]
+    if (
+      row[i] < 0
+      || to >= 0 && (to == elabDlvKey || elabReaches(to, elabDlvKey))
+    ) {
+      return true
+    }
+    i = i + 2
+  }
+  return false
+}
+
 function elabCallRanAdmitted(c: i32): boolean {
   if elabDlvKey < 0 { return true }
   const row = elabCallKeys[c] ?? []
@@ -21793,7 +22003,13 @@ function eplEdgeTy(src: i32, dst: i32, t0: i32) {
 // `eplEdgeTy` for an edge drawn from read `val` (-1 for none).
 function eplEdgeTyAt(src: i32, dst: i32, t0: i32, val: i32) {
   if src < 0 || dst < 0 { return 0 }
-  const t = if t0 >= 0 && t0 < T.tys.length { nonNullTy(t0) } else { -1 }
+  const t1 = if t0 >= 0 && t0 < T.tys.length { nonNullTy(t0) } else { -1 }
+  // A value the check left open takes its type in the instance being drawn.
+  const open = t1 >= 0
+    && t1 < T.tys.length
+    && (tyAt(t1) is TyVar || tyReachesHole(t1, 8))
+  const ti = if open && val >= 0 && EPL.k >= 0 { elabNodeTy(val, EPL.k) } else { -1 }
+  const t = if ti >= 0 && ti < T.tys.length { nonNullTy(ti) } else { t1 }
   if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
     EPL.flowSrc.push(src)
     EPL.flowDst.push(dst)
@@ -23074,8 +23290,11 @@ function eplSrcHolder(h0: i32): i32 {
   // what the loop's value is.
   const lc = lvCarrierLoopOf(h0)
   const lx = if h0 >= cwIxCoveredLen() { lvExitLoops[h0] ?? -1 } else { -1 }
-  // A temp the capture rewrite minted for a closure's write holds its cell's binding.
-  const wc = if h0 >= cwIxCoveredLen() { cboxWriteCells[h0] ?? -1 } else { -1 }
+  // A temp the capture rewrite minted for a closure's write holds its cell's binding, and so does
+  // an instance's clone of that temp.
+  const o0 = if h0 >= cwIxCoveredLen() { declOrigOf(h0) } else { -1 }
+  const wo = if o0 >= 0 { cboxWriteCells[o0] ?? -1 } else { -1 }
+  const wc = if h0 >= cwIxCoveredLen() { cboxWriteCells[h0] ?? wo } else { -1 }
   let h = if lc >= 0 { lc } else if lx >= 0 { lx } else if wc >= 0 { wc } else { elabCellLitBinding(h0) }
   if h >= cwIxCoveredLen() {
     const o = declOrigOf(h)
