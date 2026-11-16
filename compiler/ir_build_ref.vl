@@ -29,6 +29,7 @@ import {
   irLowerRefList,
   irLowerRefLoopClose,
   irLowerRefLoopOpen,
+  irScalarListRep,
   listIdxPlainWhy,
 } from "./ir_lower_ref"
 import { irBoundsRule } from "./ir_verify_bounds"
@@ -45,15 +46,12 @@ export function irRefCorrupt(k: i32) {
   return 0
 }
 
-// Whether rep `r` is a reference value this slice admits: a string, or a list of unpacked
-// primitives (a packed `u8` element is no primitive here).
+// Whether rep `r` is a reference value this slice admits: a string, a list of unpacked
+// primitives (a packed `u8` element is no primitive here), or a list of those lists.
 function refRepOk(r: i32, _ty: i32): boolean {
   if repPrim(r) == "str" { return true }
   const n = repNodeAt(r)
-  if n is RList {
-    const e = repPrim(n.rlsElem)
-    return e == "i32" || e == "i64" || e == "f64" || e == "f32" || e == "bool"
-  }
+  if n is RList { return irScalarListRep(r) || irScalarListRep(n.rlsElem) }
   return false
 }
 
@@ -79,14 +77,16 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
 
 // A member read, routed by its receiver's rep: a record's own `length` field never reaches a
 // list or string arm.
-function buildMember(_b: i32[], ix: i32, _rep: i32): Opnd {
+function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   const n = nodeAt(ix)
   if !(n is Member) { return irBMiss("expression") }
   const r = repNodeOfTy(nodeTyAt(n.memObj, irBFnIx()))
   if repNodeAt(r) is RList {
-    return irBMiss(
-      if n.memProp == "length" { "list length" } else { "list member" },
-    )
+    if n.memProp != "length" { return irBMiss("list member") }
+    if !refRepOk(r, -1) { return irBMiss("list length rep") }
+    const v = irBExpr(b, n.memObj)
+    if missed(v) || !(v is OVar) { return irBMiss("list length receiver") }
+    return irBLetTemp(b, { llV: v, llAt: ix }, ix, rep)
   }
   if repPrim(r) == "str" { return irBMiss("string member") }
   return irBMiss("member " + repWhat(r))
