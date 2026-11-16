@@ -46,13 +46,15 @@ its own. On C2g's tree, string classes alone held 357 corpus and 604 self-compil
 
 ## Coverage
 
-| reading | C2g | this step | gained |
+Both columns are read from fixpoint seeds of master, with C2g merged, and of this branch.
+
+| reading | master | this step | gained |
 |---|---:|---:|---:|
 | corpus covered = matched | 15,030 | 15,422 | +392 |
-| self-compile covered | 2,888 | 4,385 | +1,497 |
-| self-compile matched | 2,884 | 4,380 | +1,496 |
+| self-compile covered | 2,897 | 4,384 | +1,487 |
+| self-compile matched | 2,893 | 4,379 | +1,486 |
 
-Compiler lines are +320 / −119 over nine files, 201 net. That is about 2 covered corpus functions per
+Compiler lines are +319 / −119 over nine files, 200 net. That is about 2 covered corpus functions per
 net line and 7.4 on the self-compile.
 
 On the self-compile, the five unlowered functions are the four named before this step, plus one
@@ -69,8 +71,8 @@ call`, which is 2,410 alone. The self-compile singles are `indirect call` 727, `
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the C2g seed, 12,213 cells | IDENTITY |
-| shadow | corpus 15,422 of 15,422 matched; self-compile 4,380 of 4,385, five named unlowered |
-| mode 3 with `list` admitted (throwaway build) | self-compile 4,379 claimed and byte-identical; corpus MODE3 |
-| L2 self-compile fuel | FUEL |
-| seed size | SEED |
+| corpus identity against the C2g seed, 12,213 cells | 8,934 identical, 3,279 fail under both, 0 differ |
+| shadow | corpus 15,422 of 15,422 matched; self-compile 4,379 of 4,384, five named unlowered |
+| mode 3 with `list` admitted (throwaway build) | self-compile 4,379 claimed and byte-identical; corpus 8,934 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel against a master fixpoint seed | 94,422,807,182 to 94,473,594,030 (+0.054%) |
+| seed size | 6,450,324 to 6,453,516 (+3,192) |
