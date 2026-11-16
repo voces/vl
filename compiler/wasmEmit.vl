@@ -28362,7 +28362,7 @@ function emitAssignIdent(binIx: i32, fnIx: i32, a: BinExpr, lhsIx: i32) {
 // frame kind and ref-list table slot, and the element seeds the value emits under (a struct
 // row, a variant, a box union's name, a ref-list slot whose element needs the value's context;
 // -1 or "" when unset).
-type IdxStore = {
+export type IdxStore = {
   isRef: boolean,
   isStr: boolean,
   // A non-i32 scalar element's kind, read off the list's rep; null for every other list.
@@ -28517,6 +28517,39 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
     mapSetDidPark = false
     return msRc
   }
+  const st = idxStorePlanOf(target, fnIx)
+  if st == null { return -1 }
+  // source order — receiver, index, value — with the wrapper + index parked on the
+  // stack while the value's user code runs. The backing and len resolve only after
+  // the value, since an RHS that pushes onto the target list reallocates it; a live
+  // hoist row skips the receiver and guards the cached header, safe in a call-free loop.
+  const stHz = idxStoreHoistOf(target, st)
+  if stHz < 0 {
+    if emitExpr(target.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(target.idxIndex, fnIx) < 0 { return -1 }
+  // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
+  // twin one container over: the element's own variant or struct row is where the arm
+  // lands, and those two seeds are what the value emits under (D1685).
+  const iaOwed = narrowedArmNeedsUnbox(a.binRight, fnIx)
+  let iaHeap = -1
+  if st.variantIdx >= 0 { iaHeap = armDestHeapOf("variant", st.variantIdx) }
+  else if st.structIdx >= 0 { iaHeap = armDestHeapOf("struct", st.structIdx) }
+  const iaSeat = armOpen(iaOwed, iaHeap, a.binRight, fnIx)
+  if emitIdxStoreValue(fnIx, a, target.idxArr, st) < 0 { return -1 }
+  // the read-only covariant copy at the indexed-store boundary (D2163)
+  if st.mfKind == "reflist" {}
+  armClose(iaSeat, iaOwed, iaHeap, a.binRight, fnIx)
+  // The guard and backing resolve after the value ran.
+  asgParkedSlot = idxStoreTail(target, st, stHz)
+  asgParkedRef = st.isRef || st.isStr
+  asgParkedOwner = a.binLeft
+  return 0
+}
+
+// The store plan of indexed assignment target `target`: the list family, wrapper and backing,
+// and the element seeds. Null after recording the refusal.
+export function idxStorePlanOf(target: Index, fnIx: i32): IdxStore | null {
   // indexed store `a[i] = v`: evaluate the wrapper + index, guard `i u< len` and
   // unwrap to the backing, then the value, then `array.set`. A ref list stores a
   // struct ref/union box over the ref list/backing indices; an i32 list stores an i32.
@@ -28543,36 +28576,39 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
     unionTy: -1,
     nestSlot: -1,
   }
-  const crc = idxStoreClassify(target.idxArr, fnIx, st)
-  if crc != 0 { return crc }
-  // source order — receiver, index, value — with the wrapper + index parked on the
-  // stack while the value's user code runs. The backing and len resolve only after
-  // the value, since an RHS that pushes onto the target list reallocates it; a live
-  // hoist row skips the receiver and guards the cached header, safe in a call-free loop.
-  const stHz = liveHoistRow(target.idxArr, st.mfKind, st.slot)
-  if stHz < 0 {
-    if emitExpr(target.idxArr, fnIx) < 0 { return -1 }
+  if idxStoreClassify(target.idxArr, fnIx, st) != 0 { return null }
+  return st
+}
+
+// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32
+// or string list whose value builds as itself, with no arm unbox.
+export function idxStorePlainWhy(st: IdxStore, arrIx: i32, rhs: i32, fnIx: i32): string {
+  if st.isRef || st.isU8 || st.sk != null || st.nestSlot >= 0 || st.unionNm != "" {
+    return "store element"
   }
-  if emitExpr(target.idxIndex, fnIx) < 0 { return -1 }
-  // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
-  // twin one container over: the element's own variant or struct row is where the arm
-  // lands, and those two seeds are what the value emits under (D1685).
-  const iaOwed = narrowedArmNeedsUnbox(a.binRight, fnIx)
-  let iaHeap = -1
-  if st.variantIdx >= 0 { iaHeap = armDestHeapOf("variant", st.variantIdx) }
-  else if st.structIdx >= 0 { iaHeap = armDestHeapOf("struct", st.structIdx) }
-  const iaSeat = armOpen(iaOwed, iaHeap, a.binRight, fnIx)
-  if emitIdxStoreValue(fnIx, a, target.idxArr, st) < 0 { return -1 }
-  // the read-only covariant copy at the indexed-store boundary (D2163)
-  if st.mfKind == "reflist" {}
-  armClose(iaSeat, iaOwed, iaHeap, a.binRight, fnIx)
+  if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
+    return "store element seed"
+  }
+  if arrElemIsNulBoolAt(arrIx, fnIx) || arrElemIsNullUnitAt(arrIx, fnIx) {
+    return "store element seed"
+  }
+  if nodeArrayElemIsNulStr(arrIx) { return "store element seed" }
+  if exprIsLitAtom(rhs, fnIx) { return "store atom" }
+  if narrowedArmNeedsUnbox(rhs, fnIx) { return "store arm" }
+  return ""
+}
+
+// The live loop hoist holding element store `target`'s receiver, or -1; under one the receiver
+// is not written.
+export function idxStoreHoistOf(target: Index, st: IdxStore): i32 {
+  return liveHoistRow(target.idxArr, st.mfKind, st.slot)
+}
+
+// After a store's receiver, index and value: the value parked, the guard over the hoisted
+// header or the wrapper, then the backing's `array.set`. Returns the park slot.
+export function idxStoreTail(target: Index, st: IdxStore, stHz: i32): i32 {
   const storeValSlot = listIdxValSlot(st.mfKind, st.slot)
   fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
-  asgParkedSlot = storeValSlot
-  asgParkedRef = st.isRef || st.isStr
-  asgParkedOwner = a.binLeft
-  // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
-  // [backing, safeIndex] resolved AFTER the value ran.
   if stHz >= 0 {
     emitListIdxGuardHoisted(stHz, target.idxIndex)
   } else {
@@ -28580,7 +28616,7 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   }
   fbLocalGet(storeValSlot) // 0x20 — the parked value
   fbArraySet(st.aTy)       // 0xfb 0x0e <backing array type index>
-  return 0
+  return storeValSlot
 }
 
 // A variant field write's tail once its receiver struct ref is on the stack: seeds an ARRAY
