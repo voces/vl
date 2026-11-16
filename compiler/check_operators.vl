@@ -1,7 +1,7 @@
 // The type of an operator expression: binary and assignment operators (with a declared
 // operator function), `in`, unary operators, `as` casts and `is` tests.
 
-import { nodeLastTok, nodeStartTok } from "./fmt_util"
+import { rowSettledByDefault } from "./check_hole_links"
 import { nodeLineOf } from "./check_capture_loss"
 import { isOpenMemberOf, openMemberRows } from "./check_leaf_steps"
 import { arrDefRowServed, noteVacuousIs } from "./check_hole_links"
@@ -15,7 +15,7 @@ import {
   recPartFitArm,
   recPartFitBuild,
 } from "./check_annot_resolve"
-import { i32ListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, i32ListIndexOf, strListIndexOf } from "./listutil"
 import { callBindNote, recordCollapsedIsAt } from "./check_bind_rows"
 import {
   ArrayLit,
@@ -150,6 +150,14 @@ import {
   shiftCountNodes,
 } from "./check_core_state"
 import {
+  listCallArg,
+  listCallDecl,
+  listIsApartCall,
+  listIsApartIx,
+  listIsApartRow,
+  listIsOwnDecl,
+  listIsOwnNode,
+  listIsOwnerNote,
   listIsPinAt,
   listIsPinFixed,
   listIsPinIx,
@@ -164,7 +172,7 @@ import {
   noteLetCstr,
   noteMemCstr,
 } from "./check_cstr_rows"
-import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
+import { curFnDeclIx, inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
 import { ctnBindingDeclOf, ctnWrRecvPut, wrDstDeclPut } from "./check_decl_scan"
 import {
   daIsUnassignedSid,
@@ -2991,6 +2999,59 @@ function settleIsNever(ix: i32) {
   return 0
 }
 
+// Whether read `ix` holds at each instance the type its parameter or annotation spells with the
+// instance's binding: a parameter, a field of one, or an annotated `let`, never a join or call.
+function isPinnedRead(ix: i32): boolean {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  return match n {
+    Member => isPinnedRead(n.memObj)
+    Ident => isPinnedDecl(identDeclOf(x))
+    // Any other operand is computed, so its instance type is not one a binding spells.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar | Paren => false
+  }
+}
+
+// Whether declaration `d` is a parameter or an annotated `let`.
+function isPinnedDecl(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  return match dn {
+    Param => true
+    LetDecl => dn.letType >= 0
+    // A loop variable, a function or any other binder holds no annotated list.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | Ident | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar | Paren => false
+  }
+}
+
+// Whether some call of the function enclosing `is` test `ix` hands it a list nothing fixed: an
+// empty literal, or one whose element the unbound default settled. Such a call may share an
+// instance with a disjoint one, so the test keeps the emptiness answer there.
+function listTestOwnerHasOpenCall(ix: i32): boolean {
+  const o = i32ListIndexOf(listIsOwnNode, ix)
+  if o < 0 { return false }
+  const d = listIsOwnDecl[o]
+  if d < 0 { return false }
+  let c = 0
+  while c < listCallDecl.length {
+    if listCallDecl[c] == d {
+      const a = listCallArg[c]
+      const an = nodeAt(parenPeelIx(a))
+      if an is ArrayLit && an.arrElems.length == 0 { return true }
+      const at = nodeTyIxOf(a)
+      if at >= 0 && at < T.tys.length && tyAt(at) is TyArray {
+        // A type parameter's list is re-pinned at its own callers, which count there.
+        if !tyHasTyVar(at) && (tyHasHole(at) || rowSettledByDefault(at)) {
+          return true
+        }
+      }
+    }
+    c = c + 1
+  }
+  return false
+}
+
 // Whether the program's end settled the list-test pins; until then a pin may still come.
 let listIsPinDone = false
 
@@ -3000,15 +3061,46 @@ let listIsPinDone = false
 // open one; one a fixed meeting list also reaches keeps the emptiness answer for now (D16689).
 export function settleListIsPins() {
   listIsPinDone = true
+  // A disjoint pin whose list the unbound default settled is an open list after all.
+  let q = 0
+  while q < listIsApartIx.length {
+    if rowSettledByDefault(listIsApartRow[q]) {
+      let k = 0
+      while k < listIsPinIx.length && listIsPinIx[k] != listIsApartIx[q] {
+        k = k + 1
+      }
+      if k < listIsPinIx.length {
+        listIsPinFixed[k] = listIsPinFixed[k] - 1
+        listIsPinOther[k] = listIsPinOther[k] + 1
+        if listIsPinOtherAt[k] < 0 { listIsPinOtherAt[k] = listIsApartCall[q] }
+        if listIsPinAt[k] == listIsApartCall[q] { listIsPinAt[k] = -1 }
+      }
+    }
+    q = q + 1
+  }
+  // The refusal names a disjoint pin that stayed one.
+  q = 0
+  while q < listIsApartIx.length {
+    if !rowSettledByDefault(listIsApartRow[q]) {
+      let k = 0
+      while k < listIsPinIx.length && listIsPinIx[k] != listIsApartIx[q] {
+        k = k + 1
+      }
+      if k < listIsPinIx.length && listIsPinAt[k] < 0 {
+        listIsPinAt[k] = listIsApartCall[q]
+      }
+    }
+    q = q + 1
+  }
   let k = 0
   while k < listIsPinIx.length {
     const ix = listIsPinIx[k]
     const allApart = listIsPinFixed[k] > 0
       && listIsPinOther[k] == 0
       && listIsPinMeet[k] == 0
-    if allApart && !isArmsHoldFnLit(ix) && ix < isVarTyIxCap {
-      while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
-      isVarTyIxSetAt(ix, TY_NEVER)
+    if allApart && !listTestOwnerHasOpenCall(ix) {
+      listIsNeverSet.push(ix)
+      settleIsNever(ix)
     } else if listIsPinFixed[k] > 0 && listIsPinOther[k] > 0 {
       tErr(
         "this call hands a list whose element type is fixed, which the `is` test at line "
@@ -3024,49 +3116,19 @@ export function settleListIsPins() {
   return 0
 }
 
-// Whether an arm test `ix` guards holds a function literal: its lifted function would be built
-// at the narrowed element no instance makes, so such a test keeps the emptiness answer (D16689).
-function isArmsHoldFnLit(ix: i32): boolean {
-  let a = 0
-  while a < neverIsArm.length {
-    if neverIsArmTest[a] == ix {
-      const lo = nodeStartTok(neverIsArm[a])
-      const hi = nodeLastTok(neverIsArm[a])
-      let k = 0
-      while lo >= 0 && k < P.nodes.length {
-        const kn = nodeAt(k)
-        if kn is FuncDecl {
-          const t = nodeStartTok(k)
-          if t >= lo && t <= hi { return true }
-        }
-        k = k + 1
-      }
-    }
-    a = a + 1
-  }
-  return false
-}
+// The list tests `settleListIsPins` settled as `never`.
+let listIsNeverSet: i32[] = []
 
 // Whether `settleListIsPins` settled list test `ix` as `never`.
 function listIsPinNever(ix: i32): boolean {
-  let k = 0
-  while k < listIsPinIx.length {
-    if listIsPinIx[k] == ix {
-      return listIsPinFixed[k] > 0
-        && listIsPinOther[k] == 0
-        && listIsPinMeet[k] == 0
-        && listIsPinDone
-        && !isArmsHoldFnLit(ix)
-    }
-    k = k + 1
-  }
-  return false
+  return listIsPinDone && i32ListHas(listIsNeverSet, ix)
 }
 
 // Clears the never-matching tests for a new program.
 export function neverIsReset() {
   flowDeadIs = []
   listIsPinReset()
+  listIsNeverSet = []
   listIsPinDone = false
   neverIsNode.clear()
   neverIsMsg.clear()
@@ -3288,9 +3350,10 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
         const settledNow = om >= 0 && omRows.length == 0
         const rt = if settledNow { om } else { isRecvMemberOf(objTy, tested) }
         // A list test every pin settled as `never` stays so through an instance's recheck.
-        if !listIsPinNever(ix) { isVarTyIxSetAt(ix, rt) }
+        const pinNever = listIsPinNever(ix)
+        if !pinNever { isVarTyIxSetAt(ix, rt) }
         isPatTyIxPut(ix, chkTy)
-        elabCapIsNote(ix, rt, chkTy)
+        elabCapIsNote(ix, if pinNever { TY_NEVER } else { rt }, chkTy)
         if om >= 0 && !settledNow { noteVacuousIs(ix, om, omRows) }
       }
     }
@@ -3309,11 +3372,18 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
     if tyIsParamHole(objTy) {
       noteIsCstr(objTy, chkTy, n.isVariant, ix)
     }
-    // A list test over a bare type parameter is settled from its pins too (D16342).
-    else if tyAt(objTy) is TyVar && tyAt(chkTy) is TyArray {
+    // A list test over a type parameter, or a list of one, is settled from its pins too (D16342).
+    else if (
+      (tyAt(objTy) is TyVar
+        || tyAt(objTy) is TyArray && tyHasTyVar(objTy) && isPinnedRead(n.isObj))
+      && tyAt(chkTy) is TyArray
+    ) {
       noteIsCstr(objTy, chkTy, n.isVariant, ix)
     }
-    if tyAt(chkTy) is TyArray && !elabCapLive() { neverIsWatchNote(ix) }
+    if tyAt(chkTy) is TyArray && !elabCapLive() {
+      neverIsWatchNote(ix)
+      listIsOwnerNote(ix, curFnDeclIx)
+    }
     // Soundness: `x is T` is meaningful only when `T` is assignable to `x`'s type, since the
     // then branch narrows verbatim — an ungated test would launder invalid wasm through a newtype.
     const ot = tyAt(objTy)
