@@ -236,6 +236,27 @@ print(k(2, true, false))
   },
 });
 
+// A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
+// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
+// the result's `null`.
+Deno.test({
+  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  ignore,
+  fn: () => {
+    const src = `function put(x: i32) { return x * 2 }
+function f(b: i32) {
+  if b >= 0 { return 0 }
+  put(9)
+}
+print(f(-1) ?? 5)
+`;
+    const { rows } = run(src, true);
+    const want = "uncovered block body falls off";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // An unannotated parameter's type stays open until a call instances it: the builder leaves that
 // function uncovered rather than handing the verifier an open-typed variable (rule 1).
 Deno.test({
