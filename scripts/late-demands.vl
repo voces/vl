@@ -8,6 +8,9 @@
 // file, the keys minted late. `--check` exits 1 when any file's count is above the committed
 // `scripts/late-demands-baseline.txt` or a file the baseline does not list has one;
 // `--write-baseline` records the current counts. A count that FELL prints and passes.
+// The same run holds the function sets the tag decision after the elaboration changed, one
+// `tag|untag <class> {members}` row each, against `scripts/late-tags-baseline.txt`: a row the
+// baseline does not hold fails `--check`, so that residue only shrinks (`setBindTryClass`).
 //
 // Paths resolve against the working directory; run it from the checkout root. The seed measured
 // is `--seed`, else the checkout's `build/vl-compiler.wasm`; the host's embedded seed only when
@@ -32,10 +35,11 @@ function vlBin(): string {
 const VL = vlBin()
 const CHECKOUT_SEED = "build/vl-compiler.wasm"
 const BASELINE = "scripts/late-demands-baseline.txt"
+const TAG_BASELINE = "scripts/late-tags-baseline.txt"
 const PREFIX = "[late] "
 
-// One file's late count and the declarations it minted late.
-type Row = { path: string, n: i32, names: string[] }
+// One file's late count, the declarations it minted late and its late tag rows.
+type Row = { path: string, n: i32, names: string[], tags: string[] }
 
 function die(msg: string, code: i32) {
   print(msg)
@@ -65,14 +69,22 @@ function measure(paths: string[], seed: string): Row[] {
     const path = rest.slice(0, c)
     const tail = rest.slice(c + 2, rest.length)
     if startsWith(tail, "demand ") {
+      const name = tail.slice(7, tail.length)
       for row in rows {
-        if row.path == path { row.names.push(tail.slice(7, tail.length)) }
+        if row.path != path { continue }
+        // A declaration name has no space; a tag row does, and is not a demand.
+        if startsWith(name, "tag ") || startsWith(name, "untag ") {
+          row.tags.push(name)
+          row.n = row.n - 1
+        } else {
+          row.names.push(name)
+        }
       }
       continue
     }
     const n = parseI32(trim(tail))
     if n == null { continue }
-    rows.push({ path: path, n: n, names: [] })
+    rows.push({ path: path, n: n, names: [], tags: [] })
   }
   if rows.length == 0 {
     die(
@@ -100,7 +112,7 @@ function loadBaseline(): Row[] {
     if t < 0 { die("late-demands: \{BASELINE}: no tab in `\{line}`", 1) }
     const n = parseI32(line.slice(0, t))
     if n == null { die("late-demands: \{BASELINE}: no count in `\{line}`", 1) }
-    rows.push({ path: line.slice(t + 1, line.length), n: n ?? 0, names: [] })
+    rows.push({ path: line.slice(t + 1, line.length), n: n ?? 0, names: [], tags: [] })
   }
   return rows
 }
@@ -133,12 +145,53 @@ function summary(rows: Row[]): string {
   return "late demands: \{total(l)} in \{l.length} files, of \{rows.length} built"
 }
 
+// Each late tag row as `<path>\t<row>`, sorted.
+function tagLines(rows: Row[]): string[] {
+  const out: string[] = []
+  for r in rows {
+    for t in r.tags { out.push("\{r.path}\t\{t}") }
+  }
+  sort(out, (a: string, b: string) => a < b)
+  return out
+}
+
+// The committed tag rows; [] when there is no file yet.
+function loadTagBaseline(): string[] {
+  const text = readTextFile(TAG_BASELINE)
+  if text is IoError {
+    die(
+      "late-demands: cannot read \{TAG_BASELINE} (\{text.msg}). Write one with\n  vl run scripts/late-demands.vl -- --write-baseline",
+      1,
+    )
+    return []
+  }
+  const out: string[] = []
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    out.push(line)
+  }
+  return out
+}
+
+function has(xs: string[], x: string): boolean {
+  for y in xs {
+    if y == x { return true }
+  }
+  return false
+}
+
 function writeBaseline(rows: Row[]) {
   let text = "# late demands per file: vl run scripts/late-demands.vl -- --write-baseline\n"
   for r in late(rows) { text = text + "\{r.n}\t\{r.path}\n" }
   const w = writeTextFile(BASELINE, text)
   if w != null { die("late-demands: cannot write \{BASELINE} (\{w.msg})", 1) }
   print("wrote \{BASELINE}: \{summary(rows)}")
+  const tags = tagLines(rows)
+  let tt = "# late tag rows per file: vl run scripts/late-demands.vl -- --write-baseline\n"
+  for l in tags { tt = tt + l + "\n" }
+  const wt = writeTextFile(TAG_BASELINE, tt)
+  if wt != null { die("late-demands: cannot write \{TAG_BASELINE} (\{wt.msg})", 1) }
+  print("wrote \{TAG_BASELINE}: \{tags.length} late tag rows")
   return 0
 }
 
@@ -159,11 +212,34 @@ function check(rows: Row[]) {
     if n < b.n { fell = fell + 1; print("  fell \{b.path}: \{b.n} -> \{n}") }
   }
   print("\{summary(rows)}; baseline \{total(base)}")
+  const tags = tagLines(rows)
+  const tagBase = loadTagBaseline()
+  let tagNew = 0
+  for l in tags {
+    if !has(tagBase, l) {
+      tagNew = tagNew + 1
+      print("  NEW late tag \{l}")
+    }
+  }
+  let tagGone = 0
+  for l in tagBase {
+    if !has(tags, l) { tagGone = tagGone + 1 }
+  }
+  print("late tag rows: \{tags.length}; baseline \{tagBase.length}; \{tagGone} gone")
   if fell > 0 {
     print(
       "\{fell} file(s) fell below the baseline; lower it in the PR that earned the fall:\n  vl run scripts/late-demands.vl -- --write-baseline",
     )
   }
+  if tagNew > 0 {
+    print(
+      "\{tagNew} late tag row(s) the baseline does not hold: the check must decide these sets, or the\nresidue is named with  vl run scripts/late-demands.vl -- --write-baseline",
+    )
+  }
+  if tagGone > 0 && tagNew == 0 {
+    print("lower \{TAG_BASELINE} in the PR that earned the fall: -- --write-baseline")
+  }
+  if tagNew > 0 && rose == 0 { die("late tag rows ROSE", 1) }
   if rose > 0 {
     die(
       "late demands ROSE in \{rose} file(s). Make the run foresee them, or record the price with\n  vl run scripts/late-demands.vl -- --write-baseline",
@@ -213,6 +289,7 @@ function main() {
     print("\{r.n}\t\{r.path}")
     for name in r.names { print("    demand \{name}") }
   }
+  for l in tagLines(rows) { print("tag\t\{l}") }
   print(summary(rows))
   return 0
 }
