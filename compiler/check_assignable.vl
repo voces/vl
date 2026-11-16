@@ -7,15 +7,18 @@ import {
   BND_ARG,
   BND_ARRDEF,
   BND_BM,
+  BND_IS,
   BND_LET,
   BND_MEM,
   BND_RET,
   BND_UFCS,
+  Bound,
   bndAt,
   bndCount,
   bndNextRow,
 } from "./check_iface"
 import { rangeVarFits } from "./check_range_var"
+import { arrowNote } from "./check_arrow"
 import { cwIxCovers, cwPeelValue } from "./check_write_scan"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
@@ -232,13 +235,13 @@ import {
   arrDefRule,
   bareBraceDeliver,
   holeFnDeliveryDemands,
+  isRule,
   memRule,
   monoRecheckEnd,
   omitFieldNullDeliver,
   pinBmCstrElems,
   ufcsRule,
   validateBinCstrs,
-  validateIsCstrs,
   validateNestCstrs,
   validatePrintCstrs,
 } from "./check_demands"
@@ -1367,9 +1370,8 @@ export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
   let walked = false
   while st <= to {
     if (at.kinds & (1 << st)) != 0 {
-      if ruleKindOfStep(st) < 0 {
-        solveStep(at, st)
-      } else if !walked {
+      if ruleKindOfStep(st) < 0 { solveStep(at, st) }
+      if walkKindsOfStep(st).length > 0 && !walked {
         solveRules(at, from, to)
         walked = true
       }
@@ -1399,8 +1401,6 @@ function solveStep(at: SolveAt, st: i32) {
     validatePrintCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
   } else if st == SS_NEST {
     validateNestCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-  } else if st == SS_IS {
-    validateIsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
   } else if st == SS_ARG {
     if at.toggles { substSelfOwnerSet(at.argOwner) }
     validateArgCstrs(
@@ -1428,9 +1428,19 @@ function solveStep(at: SolveAt, st: i32) {
 // still runs its validator (`solveStep`). A kind joins when its rule replaces its validator (S3.4).
 function ruleKindOfStep(st: i32): i32 {
   if st == SS_RULES { return BND_ARRDEF }
+  if st == SS_IS { return BND_IS }
   if st == SS_MEM { return BND_MEM }
   if st == SS_UFCS { return BND_UFCS }
   return -1
+}
+
+// The bound kinds the walk visits at solve step `st`: its rule kind, and `BND_ARG` beside the
+// `SS_ARG` validator, whose arrow rule only records (`check_arrow.vl`) and judges nothing.
+function walkKindsOfStep(st: i32): i32[] {
+  const k = ruleKindOfStep(st)
+  if k >= 0 { return [k] }
+  if st == SS_ARG { return [BND_ARG] }
+  return []
 }
 
 // Applies the per-row rule of every bound of `at.callee` whose kind's home step lies in `from` to
@@ -1439,8 +1449,9 @@ function solveRules(at: SolveAt, from: i32, to: i32) {
   const ks: i32[] = []
   let st = from
   while st <= to {
-    const k = ruleKindOfStep(st)
-    if k >= 0 && (at.kinds & (1 << st)) != 0 { ks.push(k) }
+    if (at.kinds & (1 << st)) != 0 {
+      for k in walkKindsOfStep(st) { ks.push(k) }
+    }
     st = st + 1
   }
   const ns: i32[] = []
@@ -1466,8 +1477,9 @@ function solveRules(at: SolveAt, from: i32, to: i32) {
     }
     if pick < 0 {
       more = false
+    } else if solveRule(at, ks[pick], cur[pick], told0) != 0 {
+      cur[pick] = ns[pick]
     } else {
-      solveRule(at, ks[pick], cur[pick], told0)
       cur[pick] = bndNextRow(ks[pick], at.callee, cur[pick], ns[pick])
     }
   }
@@ -1475,11 +1487,16 @@ function solveRules(at: SolveAt, from: i32, to: i32) {
 }
 
 // The rule of row `ci` of kind `k`; `told0` is the solve's empty-list arguments already refused.
-function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]) {
+// Returns 1 when the rule ends its kind's rows for this solve.
+function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]): i32 {
   const row = bndAt(k, ci)
+  if k == BND_IS {
+    return isRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
+  }
   if k == BND_ARRDEF {
     return arrDefRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
   }
+  if k == BND_ARG { return arrowRule(at, row) }
   if k == BND_MEM {
     return memRule(
       at.bNames,
@@ -1501,6 +1518,45 @@ function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]) {
     if at.toggles { substSelfOwnerSet(at.ownerWas) }
   }
   return 0
+}
+
+// The arrow rule at call `at` for an argument row: an argument of a call through a hole callee
+// is recorded at the types the call's bindings close it to. `SS_ARG` still judges the row.
+function arrowRule(at: SolveAt, row: Bound) {
+  // A quiet probe's solve is rolled back, so only the pass that stands records.
+  if inferQuiet || row.c < 1 || row.b < 0 || row.b >= P.nodes.length {
+    return 0
+  }
+  const hc = nodeAt(row.b)
+  if !(hc is Call) { return 0 }
+  const f = parenPeelIx(hc.callFn)
+  const from = arrowFromAt(at, f)
+  const callee = if from >= 0 { nodeTyIxOf(from) } else { substTyDeep(nodeTyIxOf(f), at.bNames, at.bTys) }
+  arrowNote(
+    at.ix,
+    row.b,
+    callee,
+    from,
+    row.c,
+    substTyDeep(row.on, at.bNames, at.bTys),
+  )
+  return 0
+}
+
+// The argument node call `at` hands hole callee `f` by, when `f` is a parameter of the callee: its
+// own type keeps a set's identity, which the bindings' closed signature loses. -1 otherwise.
+function arrowFromAt(at: SolveAt, f: i32): i32 {
+  const d = if f >= 0 && f < P.nodes.length && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
+  const fd = if at.callee >= 0 && at.callee < P.nodes.length { nodeAt(at.callee) } else { null }
+  const oc = if at.ix >= 0 && at.ix < P.nodes.length { nodeAt(at.ix) } else { null }
+  if d >= 0 && fd is FuncDecl && oc is Call {
+    let i = 0
+    while i < fd.fnParams.length && i < oc.callArgs.length {
+      if fd.fnParams[i] == d { return parenPeelIx(oc.callArgs[i]) }
+      i = i + 1
+    }
+  }
+  return -1
 }
 
 // A solve of every step for a call with no hole arguments and no owner toggles.
@@ -3421,6 +3477,27 @@ function letLamJudgedAtCall(ci: i32, c: i32): boolean {
   return ms.length > 1 && i32ListHas(ms, lx)
 }
 
+// Whether top-level row `ci` writes a function value into a binding typed at another function's
+// open signature, and call `c` calls a named function or another binding: that call's bindings
+// type its own callee, not the values this binding holds, whose calls through it join them (D16813).
+function letFnRowOutsideCall(ci: i32, c: i32): boolean {
+  if bndAt(BND_LET, ci).fn >= 0 || c < 0 || c >= P.nodes.length { return false }
+  const on = bndAt(BND_LET, ci).on
+  const a = bndAt(BND_LET, ci).a
+  if on < 0 || on >= T.tys.length || a < 0 || a >= T.tys.length { return false }
+  if !(tyAt(on) is TyFunc) || !(tyAt(a) is TyFunc) || !tyHasHole(a) {
+    return false
+  }
+  const cn = nodeAt(c)
+  if !(cn is Call) { return false }
+  const f = parenPeelIx(cn.callFn)
+  const d = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
+  if d < 0 || d >= P.nodes.length { return false }
+  if nodeAt(d) is FuncDecl { return true }
+  const own = wrDstDecl.get(bndAt(BND_LET, ci).site) ?? -1
+  return own >= 0 && d != own && nodeAt(d) is LetDecl
+}
+
 // `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
 // need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
 // with the attribution appended since the reader wrote no assignment.
@@ -3439,6 +3516,7 @@ export function validateLetCstrs(
       cstrOwnedBy(bndAt(BND_LET, ci).fn, calleeFn)
       && !lambdaCopyOnly(bndAt(BND_LET, ci).on, bndAt(BND_LET, ci).a)
       && !nestCstrOutside(bndAt(BND_LET, ci).site)
+      && !letFnRowOutsideCall(ci, ix)
       && !wrUnreachedBy(ci, ix, calleeFn)
       && !ctnWrUnreachedBy(
         bndAt(BND_LET, ci).site,
