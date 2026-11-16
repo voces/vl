@@ -4291,7 +4291,7 @@ function cellReadProvesNonNull(ix: i32): boolean {
   return tyProvesNonNull(cboxReadTy[ix] ?? -1)
 }
 
-function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
+export function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
   const l = unwrapParen(e.binLeft)
   const r = unwrapParen(e.binRight)
   if l < 0 || r < 0 || l >= P.nodes.length || r >= P.nodes.length { return -1 }
@@ -4329,6 +4329,60 @@ function emitDeadNullTest(opIx: i32, isNe: boolean, fnIx: i32) {
   return 0
 }
 
+// The arm of the null test of `refIx` (`emitNulIsNullTest`) up to the literal-union atom's:
+// `nnfold`/`nulfold`, a read the checker narrowed to a type with no null or to `null` itself;
+// `nullty`, a value typed `null`; `bool`, `boolean | null`'s niche; `atom`, a `K | null`'s
+// sentinel; `rest`, an arm after these.
+export type NulTestArm = "nnfold"
+  | "nulfold"
+  | "nullty"
+  | "bool"
+  | "atom"
+  | "rest"
+
+// The null-test arm of `refIx` in function `fnIx`, as `emitNulIsNullTest` takes it.
+export function nulTestArmOf(
+  refIx: i32,
+  fnIx: i32,
+  invert: boolean,
+  nicheOnly: boolean,
+): NulTestArm {
+  if !nicheOnly || !invert {
+    // Claimed first: every arm below reads the declared nullable rep, while a narrowed read is at
+    // its arm's rep, so without these the assignment spelling gets no arm.
+    const narrowed = readNarrowedStoreAt(refIx, fnIx) >= 0
+    const ty = nodeTyAt(unwrapParen(refIx), fnIx)
+    if narrowed && tyProvesNonNull(ty) { return "nnfold" }
+    if narrowed && isNullTy(ty) { return "nulfold" }
+    // A row-less record's `null` field read through the row of the place that stores it.
+    if isNullTy(ty) { return "nullty" }
+  }
+  if exprNulBool(refIx, fnIx) { return "bool" }
+  if exprNulLitUnion(refIx, fnIx) { return "atom" }
+  return "rest"
+}
+
+// After a `K | null` value: its compare with the sentinel below every atom id, `i32.ne` for
+// `invert`. Returns 1, the ladder's "claimed".
+export function nulTestAtomTail(invert: boolean): i32 {
+  fbI32Const(-1)
+  if invert { fbI32Bin(71) } else { fbI32Bin(70) }
+  return 1
+}
+
+// The operand and direction of `==`/`!=` node `e` against a `null` literal, as the binary
+// dispatch hands them to the null test (`!=` is `invert`), or null for any other compare.
+export type BinNulTest = { bnRef: i32, bnInvert: boolean }
+export function binNulTestOf(e: BinExpr): BinNulTest | null {
+  if e.binOp != "==" && e.binOp != "!=" { return null }
+  let ref = -1
+  if nodeAt(e.binRight) is NullLit { ref = e.binLeft }
+  if nodeAt(e.binLeft) is NullLit { ref = e.binRight }
+  if ref < 0 { return null }
+  const t: BinNulTest = { bnRef: ref, bnInvert: e.binOp == "!=" }
+  return t
+}
+
 // The null test for a nullable value — `x == null`/`x != null` and the `x is null`/`x is
 // <member>` guard ask the same question of the same rep. Leaves a 0/1 i32 (1 = null unless
 // `invert`); 0 means no arm claims the rep. `nicheOnly` restricts to single-non-null-member
@@ -4339,42 +4393,28 @@ function emitNulIsNullTest(
   invert: boolean,
   nicheOnly: boolean,
 ) {
-  if !nicheOnly || !invert {
-    // claimed first: every arm below reads the declared nullable rep while a narrowed
-    // read is at its arm's rep, so without this the assignment spelling gets no arm. A read the
-    // checker narrowed to a type that holds no null folds.
-    const nnFold = readNarrowedStoreAt(refIx, fnIx) >= 0
-      && tyProvesNonNull(nodeTyAt(unwrapParen(refIx), fnIx))
-    if nnFold {
-      if invert { fbI32Const(1) } else { fbI32Const(0) }
-      return 1
-    }
-    // …and one narrowed to `null` itself (a `let x = null` read before its fill) is null.
-    const nulFold = readNarrowedStoreAt(refIx, fnIx) >= 0
-      && isNullTy(nodeTyAt(unwrapParen(refIx), fnIx))
-    if nulFold {
-      if invert { fbI32Const(0) } else { fbI32Const(1) }
-      return 1
-    }
-    // A value the checker types `null` is null whatever rep its storage has: a row-less
-    // record's `null` field read through the row of the place that stores it.
-    if isNullTy(nodeTyAt(unwrapParen(refIx), fnIx)) {
-      if emitDeadNullTest(refIx, !invert, fnIx) < 0 { return -1 }
-      return 1
-    }
+  const arm = nulTestArmOf(refIx, fnIx, invert, nicheOnly)
+  if arm == "nnfold" {
+    if invert { fbI32Const(1) } else { fbI32Const(0) }
+    return 1
   }
-
-  if exprNulBool(refIx, fnIx) {
+  if arm == "nulfold" {
+    if invert { fbI32Const(0) } else { fbI32Const(1) }
+    return 1
+  }
+  if arm == "nullty" {
+    if emitDeadNullTest(refIx, !invert, fnIx) < 0 { return -1 }
+    return 1
+  }
+  if arm == "bool" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
     fbI32Const(2)
     if invert { fbI32Bin(71) } else { fbI32Bin(70) }
     return 1
   }
-  if exprNulLitUnion(refIx, fnIx) {
+  if arm == "atom" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
-    fbI32Const(-1)
-    if invert { fbI32Bin(71) } else { fbI32Bin(70) }
-    return 1
+    return nulTestAtomTail(invert)
   }
   if !nicheOnly {
     const ncN = nodeAt(unwrapParen(refIx))
@@ -9831,7 +9871,7 @@ function plainCoalesceAt(exprIx: i32): BinExpr | null {
 // one operand is a `null`-typed value (`exprIsNulNone`) and both sides are either that or a bare
 // `null` literal, so both denote the one value `null` and the compare folds to a constant. A
 // genuinely nullable operand is excluded: there the answer is that operand's null-ness.
-function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
+export function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
   if !exprIsNulNone(leftIx, fnIx) && !exprIsNulNone(rightIx, fnIx) {
     return false
   }
@@ -40085,17 +40125,13 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
   // i32 compare. Checked before the structural string / struct / closure equality below,
   // each of which would compare a value against the `null` literal.
   if e.binOp == "==" || e.binOp == "!=" {
-    const nlhs = nodeAt(e.binLeft)
-    const nrhs = nodeAt(e.binRight)
-    let nref = -1
-    if nrhs is NullLit { nref = e.binLeft }
-    if nlhs is NullLit { nref = e.binRight }
-    if nref >= 0 {
+    const bt = binNulTestOf(e)
+    if bt != null {
       // The ladder is shared with the `is null` guard — the two spellings ask the same
       // question of the same rep, and `emitNulIsNullTest`'s header carries why they must
       // not be answered in only one place. `!=` is the INVERTED direction, which the ladder
       // emits directly (`i32.ne`) rather than leaving a caller to negate an `i32.eq`.
-      const bnt = emitNulIsNullTest(nref, fnIx, e.binOp == "!=", false)
+      const bnt = emitNulIsNullTest(bt.bnRef, fnIx, bt.bnInvert, false)
       if bnt < 0 { return -1 }
       if bnt > 0 { return 0 }
     }
