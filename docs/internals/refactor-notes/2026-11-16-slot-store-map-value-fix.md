@@ -18,4 +18,14 @@ pre-flip seed (`69032f02`). Row [D16768](../inventory/D16768.md); pin [D16864](.
 
 ## Readings
 
-READINGS
+Fixpoint seeds: master `9648a5f2a` and this branch.
+
+| check | reading |
+|---|---|
+| `tests/cases` built, byte for byte | 0 of 7,921 differ |
+| distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 `runs -> not-runs` |
+| capability matrices, `--before` master `--after` this branch | 75 templates (maker, hole-fn, list-of, fn-record, closure, captured, relay): 0 `runs -> not-runs`, 0 to silent, 0 to a program trap; 9 cells gained (`map_value`, `map_set`, `map_value_place` un-annotated) |
+| named cells (block `slot-flip-map-value`) | 4 run on this branch; master's seed fails all 4 (1 emit reject, 3 traps) |
+| L2 self-compile fuel | 97.551e9 against the 97.110e9 baseline: +0.5% |
+| `lint-self` | clean |
+| `scripts/gate.sh` | every row ok but `generics/hole-fn-value-unresolved-read.vl`, master's #8741 regression |
