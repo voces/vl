@@ -7136,7 +7136,8 @@ function holeSlotPlainRead(a: i32): boolean {
 // Whether `path` reads a field of a record nested in a list's element: `[]` first, then two or
 // more field steps.
 function holeSlotElemNestedField(path: string[]): boolean {
-  return holeSlotLeadElems(path) == 1 && path.length >= 3
+  return holeSlotLeadElems(path) >= 1
+    && path.length >= holeSlotLeadElems(path) + 2
 }
 
 // How many element steps `path` opens with, where no element step follows its first field; -1
@@ -7152,18 +7153,33 @@ function holeSlotLeadElems(path: string[]): i32 {
   return k
 }
 
-// Whether each element in `els` builds every record along `path` (after its `[]` step, before
-// its last field) as a record literal.
+// Whether each element in `els` builds every record along `path` (after its leading element
+// steps, before its last field) as a record literal, through a list literal at each further
+// element step.
 function holeSlotElemLitsOnly(els: i32[], path: string[]): boolean {
+  return holeSlotElemLitsFrom(els, path, 1)
+}
+
+// `holeSlotElemLitsOnly` for `els`, the values at step `k` of `path`.
+function holeSlotElemLitsFrom(els: i32[], path: string[], k: i32): boolean {
   for el in els {
     let x = parenPeelIx(el)
-    let k = 1
-    while k < path.length - 1 {
+    if k < path.length && path[k] == "[]" {
+      const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+      if !(xn is ArrayLit) || !holeSlotElemLitsFrom(xn.arrElems, path, k + 1) {
+        return false
+      }
+    } else {
+      let j = k
+      while j < path.length - 1 {
+        if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) {
+          return false
+        }
+        x = parenPeelIx(objLitFieldExpr(x, path[j]))
+        j = j + 1
+      }
       if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return false }
-      x = parenPeelIx(objLitFieldExpr(x, path[k]))
-      k = k + 1
     }
-    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) { return false }
   }
   return true
 }
@@ -7208,13 +7224,35 @@ function holeSlotFieldLift(a: i32, init: i32, path: string[], b: i32): boolean {
   // (D15805), in the list's initialiser or a later push; not one bound before it is placed. A
   // returned list's is built at its function's result.
   if nestedElem {
-    if n is Call { return true }
+    const k = holeSlotLeadElems(path)
+    if n is Call { return k == 1 }
     if !(n is ArrayLit) || n.arrElems.length == 0 || b < 0 { return false }
-    const pushed: i32[] = []
-    const ats: i32[] = []
-    if !cwSlotWrittenAfter(b, ["[]"], pushed, ats) { return false }
-    return holeSlotElemLitsOnly(n.arrElems, path)
-      && holeSlotElemLitsOnly(pushed, path)
+    if !holeSlotElemLitsOnly(n.arrElems, path) { return false }
+    // Every write at each element step builds the same literals below it.
+    const steps: string[] = []
+    let d = 1
+    while d <= k {
+      steps.push("[]")
+      const vals: i32[] = []
+      const ats: i32[] = []
+      if (
+        !cwSlotWrittenAfter(b, steps, vals, ats)
+        || !holeSlotElemLitsFrom(vals, path, d)
+      ) {
+        return false
+      }
+      // A list of lists' nested record stored by assignment rather than a push is not built at
+      // the rep (D16849).
+      if k >= 2 {
+        for at in ats {
+          if at >= 0 && at < P.nodes.length && nodeAt(at) is BinExpr {
+            return false
+          }
+        }
+      }
+      d = d + 1
+    }
+    return true
   }
   // A list of lists is lifted only where list literals build every level down to its record
   // literals, in its initialiser and every write at each level (D16824).
