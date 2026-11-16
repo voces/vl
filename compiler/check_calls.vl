@@ -111,9 +111,11 @@ import {
   validateTpIfJoins,
 } from "./check_assignable"
 import {
+  callBindAdd,
   callBindNamesAt,
   callBindNote,
   callBindRowOf,
+  callBindTyOf,
   callBindTysAt,
   callNumJoinNote,
   callNumJoined,
@@ -282,6 +284,7 @@ import {
   declParamNameAt,
   holeCastParamName,
   holeCastReachedDecls,
+  linkedRowElem,
 } from "./check_hole_links"
 import {
   HD_ELEM,
@@ -384,6 +387,11 @@ import {
   bindGenWalk,
   bindParamUnionOwn,
   bindParamUnionsLate,
+  ceHeldCall,
+  ceHeldName,
+  ceHeldReset,
+  ceHeldRow,
+  constrainEmptyHold,
   directHoleBodyRet,
   genericDeclRetMisfit,
   holeBindCalled,
@@ -531,6 +539,7 @@ import {
   tyRefusesArrayWrite,
   tySame,
   tyToStr,
+  tyToStrUser,
   tyValOf,
   tyWideUnionMinted,
 } from "./check_types"
@@ -2126,9 +2135,60 @@ function callFtyCheckArg(
   // Passing an empty-collection argument into a concrete `T[]` / map param pins
   // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
   // clearing its uninferred floor — pure downstream-usage inference, no push.
+  constrainEmptyHold(calleeOpenTyParams(calleeDecl, adopted, bNames), ix)
   constrainEmptyExpr(args[i], at, expected)
+  constrainEmptyHold([], -1)
   callFtyArgAssign(n, params, args, i, at, expected)
   return -1
+}
+
+// Binds at each call the type parameters `constrainEmpty` held open there to the element its row
+// settled at. The instance is built at the unbound default, so a row a later write fixed at
+// another element is refused at the call (D16759).
+export function settleHeldPins() {
+  let k = 0
+  while k < ceHeldCall.length {
+    const row = ceHeldRow[k]
+    const t = tyAt(row)
+    let el = -1
+    if t is TyArray {
+      el = if tyElemOpen(t) { linkedRowElem(row) } else { tyElemOf(t) }
+    }
+    const call = ceHeldCall[k]
+    if el >= 0 && !tyHasInferHole(el) && call >= 0 {
+      const bound = callBindTyOf(call, ceHeldName[k])
+      const fits = if bound >= 0 { tySame(bound, el) } else { tySame(el, unboundDefaultTy()) || tyHasTyVar(el) }
+      if !fits {
+        tErr(
+          "this call hands an empty list whose element a later write fixes as "
+            + tyToStrUser(el)
+            + ", after the call's instance is built; annotate the list's element type",
+          call,
+        )
+      } else if bound < 0 {
+        callBindAdd(call, ceHeldName[k], el)
+      }
+    }
+    k = k + 1
+  }
+  return ceHeldReset()
+}
+
+// The type parameters of callee `decl` no binding in `bNames` has set, when the call is not from
+// inside the callee: they name no type at the caller, so no open list there is pinned to one.
+function calleeOpenTyParams(
+  decl: i32,
+  adopted: boolean,
+  bNames: string[],
+): string[] {
+  const out: string[] = []
+  if !adopted || decl < 0 || decl >= P.nodes.length { return out }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) { return out }
+  for tp in dn.fnTyParams {
+    if strListIndexOf(bNames, tp) < 0 { out.push(tp) }
+  }
+  return out
 }
 
 // Whether `t` is a nullable with no inner type: a binding initialized by `null` alone.
