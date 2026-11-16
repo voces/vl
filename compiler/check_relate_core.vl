@@ -1979,6 +1979,8 @@ function joinWidensRec(s: i32, d: i32): boolean {
 // mutually-assignable types collapse to the wider; otherwise a two-member union. An operand
 // marked existing (`njFixSet`) is never widened: its record members stay members of the join.
 export function joinTys(a: i32, b: i32) {
+  const acc = jaNext
+  jaNext = jaNone
   const apart = njApart
   njApartSet(false)
   const fixA = njFixA
@@ -2110,11 +2112,72 @@ export function joinTys(a: i32, b: i32) {
   ) {
     return b
   }
-  if !fixA && !fixB { return joinVariantTys(a, b) }
+  if !fixA && !fixB { return joinVariantGo(acc, a, b) }
   njNoFieldwise = true
-  const kept = joinVariantTys(a, b)
+  const kept = joinVariantGo(acc, a, b)
   njNoFieldwise = false
   return kept
+}
+
+// A caller's running join: the type its last plain variant join built (`ty`), whether that join
+// replaced no member by a fieldwise record join (`clean`), and the state the dedupe read then.
+// While `ty` is the next join's left side under the same state, its members are pairwise apart
+// already, as each was compared with every earlier one when it was kept.
+export type JoinAcc = {
+  live: boolean,
+  ty: i32,
+  clean: boolean,
+  epoch: i32,
+  ver: i32,
+  relax: i32,
+  noFw: boolean,
+}
+
+export function joinAccNew(): JoinAcc {
+  return {
+    live: true,
+    ty: -1,
+    clean: false,
+    epoch: -1,
+    ver: -1,
+    relax: -1,
+    noFw: false,
+  }
+}
+
+// `joinTys(a, b)` for a caller that joins into one running type, which it passes back as `a` each
+// time: the plain variant join at the end of `joinTys`'s ladder then dedupes only `b`'s members.
+export function joinTysInto(acc: JoinAcc, a: i32, b: i32): i32 {
+  jaNext = acc
+  const r = joinTys(a, b)
+  jaNext = jaNone
+  return r
+}
+
+// The accumulator the next `joinTys` call takes, consumed at its entry so a nested join never
+// sees it; `jaNone` is the one no caller owns.
+const jaNone: JoinAcc = {
+  live: false,
+  ty: -1,
+  clean: false,
+  epoch: -1,
+  ver: -1,
+  relax: -1,
+  noFw: false,
+}
+let jaNext = jaNone
+
+// Whether `acc` vouches that `a`'s members are pairwise apart under the current state.
+function joinAccFits(acc: JoinAcc, a: i32): boolean {
+  return acc.live
+    && acc.clean
+    && acc.ty == a
+    && a >= 0
+    && acc.epoch == tyMutEpoch
+    && acc.ver == cUserTypesVer
+    && acc.relax == nomLitRelax
+    && acc.noFw == njNoFieldwise
+    && asgSrcStack.length == 0
 }
 
 // The join of a written union of declared parameters and a concrete type, kept apart; -1 for
@@ -2412,11 +2475,27 @@ export function tyParamArmAbsorbs(u: i32, o: i32): boolean {
 // The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
 // folding back into a `?` wrapper.
 export function joinVariantTys(a: i32, b: i32) {
+  return joinVariantGo(jaNone, a, b)
+}
+
+// `joinVariantTys`, where `acc` may vouch for `a`'s members (`joinAccFits`): those are kept as
+// they are and only `b`'s are compared. A caller's `acc` records the join it built.
+function joinVariantGo(acc: JoinAcc, a: i32, b: i32): i32 {
+  const fits = joinAccFits(acc, a)
   const vars: i32[] = []
-  flattenVariantsInto(a, vars)
-  flattenVariantsInto(b, vars)
   const kept: i32[] = []
   let hasNull = false
+  if fits {
+    const own: i32[] = []
+    flattenVariantsInto(a, own)
+    for v in own {
+      if isNullTy(v) { hasNull = true } else { kept.push(v) }
+    }
+  } else {
+    flattenVariantsInto(a, vars)
+  }
+  flattenVariantsInto(b, vars)
+  let clean = true
   let i = 0
   while i < vars.length {
     const v = vars[i]
@@ -2433,6 +2512,7 @@ export function joinVariantTys(a: i32, b: i32) {
           if fw >= 0 {
             kept[j] = fw
             dup = true
+            clean = false
           }
         }
         j = j + 1
@@ -2442,6 +2522,20 @@ export function joinVariantTys(a: i32, b: i32) {
     i = i + 1
   }
   dropLitsBesideBase(kept)
+  const res = joinVariantRes(kept, hasNull)
+  if acc.live {
+    acc.ty = res
+    acc.clean = clean
+    acc.epoch = tyMutEpoch
+    acc.ver = cUserTypesVer
+    acc.relax = nomLitRelax
+    acc.noFw = njNoFieldwise
+  }
+  return res
+}
+
+// The type `kept`'s members and a null make: one member as itself, more as a union.
+function joinVariantRes(kept: i32[], hasNull: boolean): i32 {
   if kept.length == 0 { return TY_NULL }
   // A set joined with a map it shares a rep with has no union to become (D2673); the node whose
   // check made the join reports it (`checkNodeDone`).
