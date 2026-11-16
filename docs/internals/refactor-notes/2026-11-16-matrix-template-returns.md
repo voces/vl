@@ -25,5 +25,6 @@ The grades were compared cell by cell.
 | new SILENT | | 4: D16708 (`coalesce-hole-call-litunion-join`, `argument`); D16709 (`same-rep-maps-{i32,i64,string}-i32-bool-neg`, `early_return_guard`) |
 | new program traps | | 0 |
 
-`record-literal-widened-alias-read-back` still runs no cell (D16751, clause 2 under D3339). Its rot is a different one: the
-alias of a literal the map store re-seats at `{ v: f64 }` now reads as `f64`.
+`record-literal-widened-alias-read-back` had a different rot: it read the alias of a literal the
+map store re-seats at `{ v: f64 }` at `i32`, where D3339 (A) types it `f64`. Its `TYPE` and
+`WANT` now take the `f64` reading, and it runs 64 of 64 (D16751).
