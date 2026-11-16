@@ -1974,6 +1974,12 @@ produces the `i32`.
   follow the same rule, chosen under the same delegation: `as% i32`/`u8` wrap the exact value
   (#8553). DECISIONS "A radix literal tree under `as%` is its exact value" carries it.
 
+- **D16801, D16747, slot-store precision and partial split sets.** DECIDED 2026-11-16 under the
+  owner's delegation: the slot store stays context-insensitive (a non-generic function's returned
+  container is unioned across callers; D16801 pins the one same-output mover), and a partial set
+  whose members split at a call is tagged by STORE class 2 rather than re-keyed after settle; #8640's
+  refusal covers it until then. DECISIONS "The slot store is context-insensitive…" carries it.
+
 - **D16689, an empty list literal under an explicit type argument.** DECIDED 2026-11-16 (a), under
   the owner's delegation, following D16342: `g<i32>([])` fixes the literal's element at `i32`, so
   `v is f64[]` is false. (b), emptiness because the literal itself carries no annotation, was not
