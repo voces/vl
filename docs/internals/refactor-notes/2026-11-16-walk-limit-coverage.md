@@ -10,7 +10,6 @@ Follows #8767 (`walk-limit`, baseline 558). Graded against the s6b21 census's 12
   1 it is a nesting test (`monoRecheckDepth <= 0`), not a countdown, and stays silent.
 - **Baseline.** 558 on master → 586: 26 from the two additions, and 2 that master gained after
   #8767 merged (`check_arrow_facts.vl` 0 → 1 from #8773, `check_leaf_steps.vl` 6 → 7 from #8776).
-  Lane HASH's parameter-only countdown floor, landed with this change, takes it to 583.
 - **Census.** Every reached non-sentinel site still present on master fires; the four in
   `check_types.vl` it does not are already converted to a `seen` walk on master.
 - **Test.** `tests/vl_walk_limit_test.ts`: run on master's rule it fails on exactly the two new
