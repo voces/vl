@@ -79,6 +79,7 @@ and two records that share a field-name set.
 |---|---|
 | L2 fuel, master bc6546163 (fixed seed, measured alike) | 94,969,644,303 |
 | with the change | 94,681,947,231 (−0.29G, −0.30%) |
-| `self-compile-time.sh --write-baseline`, fixpoint seed | 94,681,947,231 |
+| after merging #8832: master 4800c1d2d against this change, measured alike | 94,163,663,447 → 93,884,502,523 (−0.28G, −0.30%) |
+| `self-compile-time.sh --write-baseline`, fixpoint seed, after the merge | 93,884,502,523 |
 | corpus identity (`corpuscmp` against master's fixpoint seed) | 8,462 modules, 0 DIFFER, 0 LOST |
 | scaling axis `record union arms returned` (64 against 16) | 10.39 (master 14.96), bar 13.0 |
