@@ -5,9 +5,11 @@
 
 import {
   BND_ARG,
+  BND_ARRDEF,
   BND_BM,
   BND_LET,
   BND_RET,
+  Bound,
   bndAt,
   bndCount,
   bndNextRow,
@@ -171,6 +173,8 @@ import {
   elabMakerCallReset,
   elabMakerReadCalled,
   elabMakerRowNote,
+  elabRelayPerResult,
+  elabRelayPerResultNote,
   elabSlotSetHolds,
   elabValueRowNote,
   elabWideRowNote,
@@ -223,12 +227,12 @@ import {
 import {
   argCstrErr,
   argFlowErr,
+  arrDefRule,
   bareBraceDeliver,
   holeFnDeliveryDemands,
   monoRecheckEnd,
   omitFieldNullDeliver,
   pinBmCstrElems,
-  validateArrDefCstrs,
   validateBinCstrs,
   validateIsCstrs,
   validateMemCstrs,
@@ -1317,9 +1321,10 @@ function ctnDeliveredDeclOf(ix: i32): i32 {
 }
 
 // The steps of a call's solve, in the order every caller asks them; a mask bit per step.
+// `SS_RULES` is the body-order walk of every kind that has a rule (`solveRules`).
 export const SS_BIN = 0
 export const SS_PRINT = 1
-export const SS_ARRDEF = 2
+export const SS_RULES = 2
 export const SS_NEST = 3
 export const SS_IS = 4
 export const SS_ARG = 5
@@ -1381,8 +1386,8 @@ function solveStep(at: SolveAt, st: i32) {
     if at.toggles { substSelfOwnerSet(at.ownerWas) }
   } else if st == SS_PRINT {
     validatePrintCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-  } else if st == SS_ARRDEF {
-    validateArrDefCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_RULES {
+    solveRules(at)
   } else if st == SS_NEST {
     validateNestCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
   } else if st == SS_IS {
@@ -1421,6 +1426,51 @@ function solveStep(at: SolveAt, st: i32) {
     if at.toggles { substSelfOwnerSet(at.selfOwner) }
     validateUfcsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
     if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  }
+  return 0
+}
+
+// The bound kinds the solver answers by a per-row rule, walked together in body order (`seq`).
+// A kind joins when its rule replaces its validator (S3.4).
+function ruleKinds(): i32[] { return [BND_ARRDEF] }
+
+// Applies the per-row rule of every `ruleKinds` bound of `at.callee`, in body order.
+function solveRules(at: SolveAt) {
+  const ks = ruleKinds()
+  const ns: i32[] = []
+  const cur: i32[] = []
+  for k in ks {
+    const n = bndCount(k)
+    ns.push(n)
+    cur.push(bndNextRow(k, at.callee, -1, n))
+  }
+  let more = true
+  while more {
+    let pick = -1
+    let i = 0
+    while i < ks.length {
+      if (
+        cur[i] < ns[i]
+        && (pick < 0 || bndAt(ks[i], cur[i]).seq < bndAt(ks[pick], cur[pick]).seq)
+      ) {
+        pick = i
+      }
+      i = i + 1
+    }
+    if pick < 0 {
+      more = false
+    } else {
+      solveRule(at, ks[pick], bndAt(ks[pick], cur[pick]))
+      cur[pick] = bndNextRow(ks[pick], at.callee, cur[pick], ns[pick])
+    }
+  }
+  return 0
+}
+
+// The rule of bound `row` of kind `k`, one of `ruleKinds`.
+function solveRule(at: SolveAt, k: i32, row: Bound) {
+  if k == BND_ARRDEF {
+    return arrDefRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
   }
   return 0
 }
@@ -3961,6 +4011,59 @@ function fvaListHoldsLetAlias(site: i32): boolean {
   return false
 }
 
+// Rewrites list `site` in place to `site.map(lam)`, the site's own value moved under the call, and
+// checks it: the one home of a list site's converting copy.
+function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
+  const siteNode = nodeAt(site)
+  const moved = addNode(siteNode)
+  if siteNode is Ident { identFrom(moved, site) }
+  adoptNodeTok(moved, site)
+  const mem = luAt(mkMember(moved, "map", pos), site)
+  adoptNodeTok(mem, site)
+  const cargs: i32[] = []
+  cargs.push(lam)
+  const names: string[] = []
+  const c: Node = {
+    callFn: mem,
+    callArgs: cargs,
+    callArgNames: names,
+    pos: pos,
+  }
+  arenaSetNode(site, c)
+  fvaListCopyNote(site)
+  fvaListCopyNote(mem)
+  luGrow()
+  checkNodeHook(site)
+  return true
+}
+
+// A list `site` of string literal atoms compared with a `string[]`: `site` becomes
+// `site.map(($e): string => $e)`, so both lists are read through one string core (D16393). The
+// copy is read once and never written, so no handle loses a write. False when it is no such site.
+export function eqAtomListCopy(site: i32, de: i32): boolean {
+  if (
+    site < 0
+    || de < 0
+    || inferQuiet
+    || monoRecheckDepth > 0
+    || fvaListCopyAt(site)
+  ) {
+    return false
+  }
+  if nodeAt(parenPeelIx(site)) is ArrayLit { return false }
+  const pos = nodePos(site)
+  const rt = fvaAnnot(de, site, pos)
+  if rt < 0 { return false }
+  const pd = luAt(mkParam("$e" + i32ToStr(site), -1, -1, 0, 0, pos), site)
+  const ps: i32[] = []
+  ps.push(pd)
+  const lam = luAt(
+    addNode(fvaLambda(ps, rt, luRef(pd, site, pos), site, pos)),
+    site,
+  )
+  return listSiteMapCopy(site, lam, pos)
+}
+
 // A list `site` of type `srcTy` whose elements are a function set, copied into slots of the closed
 // function type `de`: `site` becomes `site.map(($e): de => $e)`, whose return delivers each
 // element through its adapter, at the source's own position. False when it is no such copy.
@@ -4019,27 +4122,7 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
     body = luAt(addNode(fvaLambda(eps, ert, call, site, pos)), site)
   }
   const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
-  const siteNode = nodeAt(site)
-  const moved = addNode(siteNode)
-  if siteNode is Ident { identFrom(moved, site) }
-  adoptNodeTok(moved, site)
-  const mem = luAt(mkMember(moved, "map", pos), site)
-  adoptNodeTok(mem, site)
-  const cargs: i32[] = []
-  cargs.push(lam)
-  const names: string[] = []
-  const c: Node = {
-    callFn: mem,
-    callArgs: cargs,
-    callArgNames: names,
-    pos: pos,
-  }
-  arenaSetNode(site, c)
-  fvaListCopyNote(site)
-  fvaListCopyNote(mem)
-  luGrow()
-  checkNodeHook(site)
-  return true
+  return listSiteMapCopy(site, lam, pos)
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
@@ -4253,6 +4336,14 @@ export function fvaIsMaker(decl: i32): boolean {
   }
   // A function with an un-annotated parameter is a maker only where it returns lambdas it writes.
   if fvaHasHoleParam(decl) && !fvaHoleMaker(decl) { return false }
+  return fvaOpenFnResult(decl)
+}
+
+// Whether function `decl`'s result is an open function value, and it reads no binding of an
+// enclosing function: a twin checked at the root has no such frame.
+function fvaOpenFnResult(decl: i32): boolean {
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return false }
   const st = nodeTyIxOf(decl)
   if st < 0 || st >= T.tys.length { return false }
   const f = tyAt(st)
@@ -4433,10 +4524,12 @@ export function fvaMakerCallRows() {
   return fvaMakerCoverCheck()
 }
 
-// Whether `d` relays a maker: a maker by signature (`fvaIsMaker`) every returned value of which is
-// a call of another such function, so its result is that call's, handed on whole.
+// Whether `d` relays a maker: a function with an open function result (`fvaOpenFnResult`), generic
+// or not, every returned value of which is a maker's call, so its result is that call's, whole.
 function fvaIsRelay(d: i32): boolean {
-  if !fvaIsMaker(d) || fvaRetsNamed(d) { return false }
+  if d < 0 || d >= P.nodes.length || !fvaOpenFnResult(d) || fvaRetsNamed(d) {
+    return false
+  }
   const fn = nodeAt(d)
   if !(fn is FuncDecl) { return false }
   const calls = fvaRelayCalls(d)
@@ -4723,7 +4816,12 @@ function fvaRelayTwinRows(
   if !fvaRelayTwinInner(rl, d, sigs, innerOf, inner, 0) || inner.length == 0 {
     return 0
   }
-  for c in calls { sigAt[c] = callSig.get(c) ?? -1 }
+  // An instanced relay's calls are instanced at their own results; a maker relay's are noted.
+  if fvaIsMaker(d) {
+    for c in calls { sigAt[c] = callSig.get(c) ?? -1 }
+  } else {
+    elabRelayPerResultNote(d)
+  }
   for x in inner {
     const xn = nodeAt(x)
     if xn is Call {
@@ -4792,6 +4890,17 @@ function fvaCalledOutside(
     }
   }
   return false
+}
+
+// The closed function type call `call` of instanced relay `d` delivers its instance at, where
+// the relay twin rows noted `d` (`elabRelayPerResultNote`); -1 otherwise.
+export function elabRelayResultAt(d: i32, call: i32): i32 {
+  if call < 0 || !elabRelayPerResult(d) { return -1 }
+  const t = nodeCtxTyIxOf(call)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasTyVar(t) {
+    return -1
+  }
+  return t
 }
 
 // Notes in `fvaDeadReads` the maker reads of each relay nothing can run: not exported, not read as
