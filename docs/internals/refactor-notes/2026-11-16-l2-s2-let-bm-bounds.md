@@ -31,7 +31,12 @@ Four tables remain: `binCstr`, `argCstr`, `memCstr` and `ufcsCstr`.
 
 ## Gates
 
-On master `32ee97e5`, with #8518's step under this one:
+Re-proved after merging master `5b42a89c`, into which #8518 merged squashed:
+- two refreshes from that master's fixpoint seed are cmp-identical;
+- 20,574 programs fingerprint identically, both seeds run from one worktree;
+- `lint-self.sh` is clean.
+
+Before that merge, on master `32ee97e5` with #8518's step under this one:
 - **Identical.** Two refreshes from master's fixpoint seed are cmp-identical, and 20,568 programs
   fingerprint identically, both seeds run from one worktree.
 - `regress.vl`: 0 runs → not-runs.
