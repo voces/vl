@@ -1147,8 +1147,8 @@ export function elabFnValWanted(t: i32): boolean {
 
 // Record type `held`, the value an un-annotated container's first store filled, joined with the
 // record `stored` a later store writes: each function field's set takes the stored field's
-// members too, so a call through it dispatches on every function written (D15929, D15806).
-// `held` where no field's set grows.
+// members too, so a call through it dispatches on every function written (D15929, D15806), at
+// any depth of nested records. `held` where no field's set grows.
 export function elabFnRecJoin(held: i32, stored: i32): i32 {
   const h = if held >= 0 && held < T.tys.length { tyAt(held) } else { null }
   const w = if stored >= 0 && stored < T.tys.length { tyAt(stored) } else { null }
@@ -1162,6 +1162,14 @@ export function elabFnRecJoin(held: i32, stored: i32): i32 {
     const hf = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
     const sa = elabFnSetTy[ft] ?? -1
     const sb = if j >= 0 { elabFnSetTy[w.objFieldTypes[j]] ?? -1 } else { -1 }
+    // A nested record's function fields join as the record's own do (D16829).
+    if hf is TyObj && j >= 0 {
+      const nj = elabFnRecJoin(ft, w.objFieldTypes[j])
+      if nj != ft {
+        ft = nj
+        changed = true
+      }
+    }
     if hf is TyFunc && sa >= 0 && sb >= 0 && sa != sb {
       const u = fnSetIntern(fnSetUnion(sa, sb))
       if u != sa {
@@ -1908,15 +1916,22 @@ function fnSetAllNamedGenerics(s: i32): boolean {
 }
 
 // Grows record literal `v`, written into a map slot of joined record `slot`, to that record: each
-// function field whose set the slot's widens takes the slot's, a parameter read excepted (D15455).
+// function field whose set the slot's widens takes the slot's, a parameter read excepted (D15455),
+// and each nested record literal its nested record (D16829).
 export function elabSlotRecLitGrow(v: i32, slot: i32) {
+  elabRecLitGrowAt(v, slot)
+  return 0
+}
+
+// `elabSlotRecLitGrow`; whether the literal grew.
+function elabRecLitGrowAt(v: i32, slot: i32): boolean {
   const lx = parenPeelIx(v)
   if lx < 0 || lx >= P.nodes.length || slot < 0 || slot >= T.tys.length {
-    return 0
+    return false
   }
   const ln = nodeAt(lx)
   const so = tyAt(slot)
-  if !(ln is ObjLit) || !(so is TyObj) { return 0 }
+  if !(ln is ObjLit) || !(so is TyObj) { return false }
   let grew = false
   for fx in ln.objFields {
     const f = nodeAt(fx)
@@ -1933,9 +1948,18 @@ export function elabSlotRecLitGrow(v: i32, slot: i32) {
       nodeTySetGrow(fv, st)
       grew = true
     }
+    const so2 = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
+    if (
+      fv >= 0
+      && nodeAt(fv) is ObjLit
+      && so2 is TyObj
+      && elabRecLitGrowAt(fv, st)
+    ) {
+      grew = true
+    }
   }
   if grew { nodeTySetGrow(lx, slot) }
-  return 0
+  return grew
 }
 
 // Record `t` pinned into map binding `bd`'s slots, each function field's set joined with every
@@ -1943,8 +1967,24 @@ export function elabSlotRecLitGrow(v: i32, slot: i32) {
 // (D15493). Each record literal written into a slot is re-typed at the joined record; `t` when no
 // field widens.
 function elabSlotRecJoinTy(bd: i32, t: i32): i32 {
-  const to = tyAt(t)
-  if !(to is TyObj) || i32ListHas(fnLetVeto, bd) { return t }
+  if i32ListHas(fnLetVeto, bd) { return t }
+  const lits: i32[] = []
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), ["[]"], vals, ats) >= 0 {
+    for v in vals {
+      if v >= 0 && v < P.nodes.length && nodeAt(v) is ObjLit { lits.push(v) }
+    }
+  }
+  return elabSlotRecJoinAt(bd, t, ["[]"], lits)
+}
+
+// `elabSlotRecJoinTy` for record `t` at `path` under the binding's slots, `lits` the record
+// literals written there: a nested record's function fields join as the slot's own do, and its
+// literals are re-typed at the joined record (D16829).
+function elabSlotRecJoinAt(bd: i32, t: i32, path: string[], lits: i32[]): i32 {
+  const to = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(to is TyObj) { return t }
   const names: string[] = []
   const tys: i32[] = []
   let changed = false
@@ -1952,12 +1992,17 @@ function elabSlotRecJoinTy(bd: i32, t: i32): i32 {
   while i < to.objFieldNames.length {
     const nm = to.objFieldNames[i]
     let ft = to.objFieldTypes[i]
+    const fp: string[] = []
+    for st in path { fp.push(st) }
+    fp.push(nm)
     const fa = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
     const fs = if fa is TyFunc { elabFnSetTy[ft] ?? -1 } else { -1 }
-    const w = if fs >= 0 { fnPathSetOf(bd, ["[]", nm]) } else { -1 }
+    const w = if fs >= 0 { fnPathSetOf(bd, fp) } else { -1 }
     const u = if w >= 0 { fnSetIntern(fnSetUnion(fs, w)) } else { fs }
     if fa is TyFunc && u != fs && fnSetAllNamedGenerics(u) {
-      const key = "slotrec:" + i32ToStr(bd) + "/" + nm + "," + i32ToStr(ft)
+      let key = "slotrec:" + i32ToStr(bd)
+      for st in fp { key = key + "/" + st }
+      key = key + "," + i32ToStr(ft)
       let fresh = fnJoinMemo[key] ?? -1
       if fresh < 0 || fresh >= T.tys.length {
         const ps: i32[] = []
@@ -1971,6 +2016,18 @@ function elabSlotRecJoinTy(bd: i32, t: i32): i32 {
       ft = fresh
       changed = true
     }
+    if fa is TyObj {
+      const inner: i32[] = []
+      for l in lits {
+        const v = elabLitFieldValue(l, nm)
+        if v >= 0 && nodeAt(v) is ObjLit { inner.push(v) }
+      }
+      const nt2 = elabSlotRecJoinAt(bd, ft, fp, inner)
+      if nt2 != ft {
+        ft = nt2
+        changed = true
+      }
+    }
     names.push(nm)
     tys.push(ft)
     i = i + 1
@@ -1978,29 +2035,35 @@ function elabSlotRecJoinTy(bd: i32, t: i32): i32 {
   if !changed { return t }
   const nt = mkObjTy(names, tys)
   // Each literal written into a slot holds the joined field, its named functions' leaves included.
-  const vals: i32[] = []
-  const ats: i32[] = []
-  if cwSlotWrittenValues(cwKeyOfDecl(bd), ["[]"], vals, ats) >= 0 {
-    for v in vals {
-      const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
-      if vn is ObjLit {
-        for fx in vn.objFields {
-          const f = nodeAt(fx)
-          const j = if f is FieldInit { strListIndexOf(names, f.fiName) } else { -1 }
-          const fv = if f is FieldInit { parenPeelIx(f.fiValue) } else { -1 }
-          const fd = if fv >= 0 && nodeAt(fv) is Ident { identDeclOf(fv) } else { -1 }
-          const paramRead = fd >= 0
-            && fd < P.nodes.length
-            && nodeAt(fd) is Param
-          if j >= 0 && fv >= 0 && !paramRead && tys[j] != to.objFieldTypes[j] {
-            nodeTySetGrow(fv, tys[j])
-          }
+  for v in lits {
+    const vn = nodeAt(v)
+    if vn is ObjLit {
+      for fx in vn.objFields {
+        const f = nodeAt(fx)
+        const j = if f is FieldInit { strListIndexOf(names, f.fiName) } else { -1 }
+        const fv = if f is FieldInit { parenPeelIx(f.fiValue) } else { -1 }
+        const fd = if fv >= 0 && nodeAt(fv) is Ident { identDeclOf(fv) } else { -1 }
+        const paramRead = fd >= 0 && fd < P.nodes.length && nodeAt(fd) is Param
+        const fnField = j >= 0 && tyAt(to.objFieldTypes[j]) is TyFunc
+        if fnField && fv >= 0 && !paramRead && tys[j] != to.objFieldTypes[j] {
+          nodeTySetGrow(fv, tys[j])
         }
-        nodeTySetGrow(v, nt)
       }
+      nodeTySetGrow(v, nt)
     }
   }
   return nt
+}
+
+// The value record literal `l` gives field `name`, parentheses peeled, or -1.
+function elabLitFieldValue(l: i32, name: string): i32 {
+  const n = nodeAt(l)
+  if !(n is ObjLit) { return -1 }
+  for fx in n.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit && f.fiName == name { return parenPeelIx(f.fiValue) }
+  }
+  return -1
 }
 
 // The type the field at `steps` (outermost first) of binding `bd`, inferred `t`, gives its reads,
