@@ -97,6 +97,14 @@ let potKeys: i32[] = []
 let isParent: boolean[] = []
 let isRecord: boolean[] = []
 let constMade: boolean[] = []
+// Per type whether a constant expression makes it where it cannot be taken apart; per field
+// operand of a global initializer's `struct.new`, its key, the type of the `struct.new` that
+// made it (-1 for anything else) and that op's bytes.
+let constOpaque: boolean[] = []
+let ceKey: i32[] = []
+let ceTy: i32[] = []
+let ceAt: i32[] = []
+let ceEnd: i32[] = []
 // The list-flattening step's candidates: per type the record a candidate array's elements
 // hold or -1, the candidates ascending, and why each is refused outright (`arrBadF` -2 when
 // it is not, -1 when no function is to blame); the array types constant expressions make.
@@ -316,8 +324,16 @@ function readModule(b: u8[]): boolean {
   bndH = []
   bndW = []
   constMade = []
+  constOpaque = []
+  ceKey = []
+  ceTy = []
+  ceAt = []
+  ceEnd = []
   constArr = []
-  for _ in M.types { constMade.push(false) }
+  for _ in M.types {
+    constMade.push(false)
+    constOpaque.push(false)
+  }
   let structGroups = 0
   let t = 0
   for size in M.groupSize {
@@ -439,7 +455,7 @@ function readTables(c: WasmCursor) {
     }
     tables.push(rdVal(c))
     readLimits(c)
-    if init { constScan(c) }
+    if init { constScan(c, false) }
     i = i + 1
   }
 }
@@ -450,7 +466,7 @@ function readGlobals(c: WasmCursor) {
   while i < n && !c.failed {
     globals.push(rdVal(c))
     wcByte(c)
-    constScan(c)
+    constScan(c, true)
     i = i + 1
   }
 }
@@ -488,7 +504,7 @@ function readElements(c: WasmCursor) {
     const m = wcU32(c)
     let k = 0
     while k < m && !c.failed {
-      if (flags & 4) != 0 { constScan(c) } else { wcU32(c) }
+      if (flags & 4) != 0 { constScan(c, false) } else { wcU32(c) }
       k = k + 1
     }
     i = i + 1
@@ -505,24 +521,101 @@ function readTags(c: WasmCursor) {
   }
 }
 
-// Skips a constant expression, marking every struct type it makes and every array type it
-// makes other than as an empty `array.new_fixed`.
-function constScan(c: WasmCursor) {
+// Skips a constant expression, marking every struct and non-empty array type it makes. Under
+// `global` it records each `struct.new` field operand (`ceKey`, `ceTy`, its bytes) so the
+// initializer can be taken apart; elsewhere, or past an op it does not model, every struct
+// type the expression makes is opaque.
+function constScan(c: WasmCursor, global: boolean) {
+  const stTy: i32[] = []
+  const stAt: i32[] = []
+  const stEnd: i32[] = []
+  const made: i32[] = []
+  let opaque = !global
   while !c.failed {
     const at = c.pos
     const op = wcOp(c)
-    if op == 0xfb0000 || op == 0xfb0001 {
-      if c.imm >= 0 && c.imm < nTypes { constMade[c.imm] = true }
+    if op == 0x0b {
+      if opaque {
+        for t in made { constOpaque[t] = true }
+      }
+      return
     }
-    if op == 0xfb0006 || op == 0xfb0007 || op == 0xfb0008 {
+    let pops = 0
+    let ty = -1
+    if op == 0xfb0000 || op == 0xfb0001 {
+      if c.imm >= 0 && c.imm < nTypes {
+        constMade[c.imm] = true
+        made.push(c.imm)
+      }
+      if op == 0xfb0000 {
+        pops = fieldCount(c.imm)
+        ty = c.imm
+      }
+    } else if op == 0xfb0006 || op == 0xfb0007 || op == 0xfb0008 {
       const d = wcNew(c.b, at, c.pos)
       wcByte(d)
       wcU32(d)
       const t = wcU32(d)
-      if op != 0xfb0008 || wcU32(d) != 0 { constArr.push(t) }
+      const n = if op == 0xfb0008 { wcU32(d) } else { 0 }
+      if op != 0xfb0008 || n != 0 { constArr.push(t) }
+      pops = if op == 0xfb0006 { 2 } else if op == 0xfb0007 { 1 } else { n }
+    } else if (
+      op == 0x6a
+      || op == 0x6b
+      || op == 0x6c
+      || op == 0x7c
+      || op == 0x7d
+      || op == 0x7e
+    ) {
+      pops = 2
+    } else if op == 0xfb001a || op == 0xfb001b || op == 0xfb001c {
+      pops = 1
+    } else if (
+      !(op >= 0x41 && op <= 0x44
+        || op == 0x23
+        || op == 0xd0
+        || op == 0xd2
+        || op == 0xfd000c)
+    ) {
+      opaque = true
     }
-    if op == 0x0b { return }
+    if pops > stTy.length { opaque = true }
+    if !opaque {
+      const base = stTy.length - pops
+      if op == 0xfb0000 {
+        let j = 0
+        while j < pops {
+          ceKey.push(ty * PAIR + j)
+          ceTy.push(stTy[base + j])
+          ceAt.push(stAt[base + j])
+          ceEnd.push(stEnd[base + j])
+          j = j + 1
+        }
+      }
+      while stTy.length > base {
+        stTy.pop()
+        stAt.pop()
+        stEnd.pop()
+      }
+      stTy.push(ty)
+      stAt.push(at)
+      stEnd.push(c.pos)
+    }
   }
+}
+
+// Whether field `key` of a type a constant expression makes cannot hold record `v` inline:
+// the type is made where it cannot be taken apart, or an operand is not a `struct.new v`.
+function constRefused(key: i32, v: i32): boolean {
+  const p = key / PAIR
+  if !constMade[p] { return false }
+  if constOpaque[p] { return true }
+  let i = 0
+  while i < ceKey.length {
+    if ceKey[i] == key && ceTy[i] != v { return true }
+    i = i + 1
+  }
+  return false
 }
 
 // Skips an offset expression.
@@ -2671,7 +2764,7 @@ function decideFields(rebox: boolean, fault: boolean) {
       putText(why, " can cross the module boundary (")
       putBytes(why, what)
       putText(why, "), so its layout is not ours to change")
-    } else if constMade[p] {
+    } else if constRefused(key, v) {
       putText(why, "type ")
       putDec(why, p)
       putText(why, " is made in a constant expression (a global's initializer)")
@@ -3006,7 +3099,7 @@ function rewrite(spill: boolean, fault: boolean): u8[] {
   }
   const types = typeSection()
   if rwErr.length > 0 { return none }
-  return assemble(types, bodies, moves, hdr)
+  return assemble(types, bodies, moves, hdr, true)
 }
 
 // The type section, every type re-encoded by `encodeSub`, its rec groups kept; sets `rwErr`
@@ -3551,6 +3644,7 @@ function assemble(
   bodies: u8[][],
   moves: i32[][],
   hdr: i32[],
+  fields: boolean,
 ): u8[] {
   const none: u8[] = []
   const out: u8[] = []
@@ -3597,6 +3691,8 @@ function assemble(
       }
       putBytes(out, head)
       putBytes(out, sec)
+    } else if id == 6 && fields {
+      globalSection(out, s)
     } else {
       copyBytes(out, B, M.secStart[s], M.secEnd[s] - M.secStart[s])
     }
@@ -3607,6 +3703,45 @@ function assemble(
     return none
   }
   return out
+}
+
+// Section `s`, the global section, with the `struct.new` of each record an initializer
+// stores into an inlined field dropped, so its fields land in the parent's `struct.new`.
+function globalSection(out: u8[], s: i32) {
+  const drop: i32[] = []
+  let i = 0
+  while i < potKeys.length {
+    if decInl[i] >= 0 {
+      let k = 0
+      while k < ceKey.length {
+        if ceKey[k] == potKeys[i] && ceTy[k] == decInl[i] { drop.push(k) }
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  if drop.length == 0 {
+    copyBytes(out, B, M.secStart[s], M.secEnd[s] - M.secStart[s])
+    return
+  }
+  const c = wcNew(B, M.secStart[s], M.secEnd[s])
+  wcByte(c)
+  wcU32(c)
+  const from: i32[] = []
+  for k in drop { from.push(ceAt[k]) }
+  sortAsc(from)
+  const upTo: {[i32]: i32} = Map()
+  for k in drop { upTo[ceAt[k]] = ceEnd[k] }
+  const sec: u8[] = []
+  let at = c.pos
+  for f in from {
+    copyBytes(sec, B, at, f - at)
+    at = upTo[f] ?? f
+  }
+  copyBytes(sec, B, at, M.secEnd[s] - at)
+  out.push(6)
+  wnPutLeb(out, sec.length)
+  putBytes(out, sec)
 }
 
 function putSleb(out: u8[], v: i32) {
@@ -4060,7 +4195,7 @@ function flatRewrite(spill: boolean, fault: boolean): u8[] {
   }
   const types = typeSection()
   if rwErr.length > 0 { return none }
-  return assemble(types, bodies, moves, hdr)
+  return assemble(types, bodies, moves, hdr, false)
 }
 
 // Plans each store site's value local in `hTv`, and in `hAt` where it is set: 0 right after

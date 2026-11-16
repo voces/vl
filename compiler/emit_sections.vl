@@ -6837,30 +6837,36 @@ function passNeedsMet(needs: EmitPass[], done: EmitPass[]): boolean {
 // empty wasm module is valid and every section here is already gated on having something to write, so this pass enforces nothing — it stays as a table row for the ordering edge `collectFns` declares.
 function passCheckTopLevel() { return 0 }
 
-// Records `name` as mentioned at top-level position `ord`; `seen[name]` ORs `bits`: 1 once an
-// identifier names it, 2 once one is an assignment's target, 0 for a member name. The first mention reaches every
-// `fnStmts` slot declared under that name and queues it for its own walk (`initGuardScan`),
-// except a nested one: its body is walked inside its enclosing function, in that scope.
-function igMention(
-  name: string,
-  bits: i32,
-  ord: i32,
+// The walk's shared tables: `seen[name]` ORs 1 once an identifier reads `name` and 2 once one is
+// an assignment's target; `head`/`next` chain the `fnStmts` slots by name and `work` queues the
+// reached ones; `lamOf` maps a module binding to the minted name of the lambda it is initialised
+// with, which is reached when the binding is first mentioned rather than at its declaration.
+type IgCtx = {
   seen: Map<string, i32>,
   head: Map<string, i32>,
   next: i32[],
   work: i32[],
-) {
-  const had = seen.has(name)
-  seen[name] = (seen[name] ?? 0) | bits
+  lamOf: Map<string, string>,
+}
+
+// Records `name` as mentioned at top-level position `ord`, ORing `bits` into `seen`. The first
+// mention reaches every `fnStmts` slot declared under that name and queues it for its own walk
+// (`initGuardScan`), except a nested one: its body is walked inside its enclosing function, in
+// that scope. It also reaches the lambda a module binding of that name holds.
+function igMention(name: string, bits: i32, ord: i32, cx: IgCtx) {
+  const had = cx.seen.has(name)
+  cx.seen[name] = (cx.seen[name] ?? 0) | bits
   if had { return 0 }
-  let p = head[name] ?? -1
-  while p >= 0 && p < gInitFnReach.length && p < next.length {
+  let p = cx.head[name] ?? -1
+  while p >= 0 && p < gInitFnReach.length && p < cx.next.length {
     if gInitFnReach[p] == INIT_REACH_NEVER {
       gInitFnReach[p] = ord
-      if p >= fnParent.length || fnParent[p] < 0 { work.push(p) }
+      if p >= fnParent.length || fnParent[p] < 0 { cx.work.push(p) }
     }
-    p = next[p]
+    p = cx.next[p]
   }
+  const lam = cx.lamOf[name] ?? ""
+  if lam != "" { igMention(lam, 0, ord, cx) }
   return 0
 }
 
@@ -6887,33 +6893,36 @@ function igShadowPop(s: IgShadow, mark: i32) {
   return 0
 }
 
-// Mentions every identifier, member name and nested function name under `ix` at `ord`,
-// except an identifier a parameter or local in scope binds (`shadow`, restored on return).
-// A `let` binds for the statements after it in its block; a loop variable, for its body.
-function igWalk(
-  ix: i32,
-  ord: i32,
-  shadow: IgShadow,
-  seen: Map<string, i32>,
-  head: Map<string, i32>,
-  next: i32[],
-  work: i32[],
-) {
+// The name `collectFns` minted for the lambda module declaration `node` is initialised with, or
+// "" when its initializer is not a lambda.
+function igModuleLambda(node: i32): string {
+  const d = nodeAt(node)
+  if d is LetDecl {
+    if d.letInit < 0 { return "" }
+    const f = nodeAt(unwrapParen(d.letInit))
+    if f is FuncDecl { return f.fnName }
+  }
+  return ""
+}
+
+// Mentions every identifier and nested function name under `ix` at `ord`, except an identifier
+// a parameter or local in scope binds (`shadow`, restored on return). A `let` binds for the
+// statements after it in its block; a loop variable, for its body. A member name is not a
+// mention: a call through one reaches its function by an identifier the UFCS rewrite minted.
+function igWalk(ix: i32, ord: i32, shadow: IgShadow, cx: IgCtx) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = nodeAt(ix)
   const mark = shadow.names.length
   if n is Ident {
-    if !igShadowHas(shadow, n.identName) {
-      igMention(n.identName, 1, ord, seen, head, next, work)
-    }
+    if !igShadowHas(shadow, n.identName) { igMention(n.identName, 1, ord, cx) }
     return 0
   }
   if n is FuncDecl {
-    igMention(n.fnName, 0, ord, seen, head, next, work)
+    igMention(n.fnName, 0, ord, cx)
     // A default is substituted at the call site, so it reads the caller's scope.
     let pi = 0
     while pi < n.fnParams.length {
-      igWalk(n.fnParams[pi], ord, shadow, seen, head, next, work)
+      igWalk(n.fnParams[pi], ord, shadow, cx)
       pi = pi + 1
     }
     pi = 0
@@ -6922,48 +6931,59 @@ function igWalk(
       if pn is Param { igShadowPush(shadow, pn.parName) }
       pi = pi + 1
     }
-    igWalk(n.fnBody, ord, shadow, seen, head, next, work)
+    igWalk(n.fnBody, ord, shadow, cx)
   } else if n is Block {
     let si = 0
     while si < n.blkStmts.length {
-      igWalk(n.blkStmts[si], ord, shadow, seen, head, next, work)
+      igWalk(n.blkStmts[si], ord, shadow, cx)
       const sn = nodeAt(n.blkStmts[si])
       if sn is LetDecl { igShadowPush(shadow, sn.letName) }
       si = si + 1
     }
   } else if n is ForRange {
-    igWalk(n.frFrom, ord, shadow, seen, head, next, work)
-    igWalk(n.frTo, ord, shadow, seen, head, next, work)
-    igWalk(n.frStep, ord, shadow, seen, head, next, work)
+    igWalk(n.frFrom, ord, shadow, cx)
+    igWalk(n.frTo, ord, shadow, cx)
+    igWalk(n.frStep, ord, shadow, cx)
     igShadowPush(shadow, n.frVar)
-    igWalk(n.frBody, ord, shadow, seen, head, next, work)
+    igWalk(n.frBody, ord, shadow, cx)
   } else if n is ForIn {
-    igWalk(n.fiIter, ord, shadow, seen, head, next, work)
+    igWalk(n.fiIter, ord, shadow, cx)
     igShadowPush(shadow, n.fiVar)
     if n.fiVar2 != "" { igShadowPush(shadow, n.fiVar2) }
-    igWalk(n.fiBody, ord, shadow, seen, head, next, work)
-  } else {
-    if n is Member { igMention(n.memProp, 0, ord, seen, head, next, work) }
-    if n is OptMember { igMention(n.omProp, 0, ord, seen, head, next, work) }
+    igWalk(n.fiBody, ord, shadow, cx)
+  } else if igPlainAssign(ix) {
+    // A plain assignment's target is written, not read: only its value is walked.
     if n is BinExpr {
-      if n.binOp == "=" {
-        const lhs = nodeAt(n.binLeft)
-        if lhs is Ident {
-          if !igShadowHas(shadow, lhs.identName) {
-            igMention(lhs.identName, 2, ord, seen, head, next, work)
-          }
+      const lhs = nodeAt(n.binLeft)
+      if lhs is Ident {
+        if !igShadowHas(shadow, lhs.identName) {
+          igMention(lhs.identName, 2, ord, cx)
         }
       }
+      igWalk(n.binRight, ord, shadow, cx)
     }
+  } else {
     const kids = nodeChildren(ix)
     let k = 0
     while k < kids.length {
-      igWalk(kids[k], ord, shadow, seen, head, next, work)
+      igWalk(kids[k], ord, shadow, cx)
       k = k + 1
     }
   }
   igShadowPop(shadow, mark)
   return 0
+}
+
+// Whether `ix` is `name = value` with a bare identifier on the left.
+function igPlainAssign(ix: i32): boolean {
+  const n = nodeAt(ix)
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const lhs = nodeAt(n.binLeft)
+      if lhs is Ident { return true }
+    }
+  }
+  return false
 }
 
 // Whether global `gi`'s value arrives only at run time, or its initializer builds a record or
@@ -7032,6 +7052,21 @@ function initGuardScan(): i32 {
   if !anyCand { return 0 }
   const seen: Map<string, i32> = Map()
   const work: i32[] = []
+  const lamOf: Map<string, string> = Map()
+  gi = 0
+  while gi < globalStmts.length {
+    const lam = igModuleLambda(globalStmts[gi])
+    const ld = nodeAt(globalStmts[gi])
+    if lam != "" && ld is LetDecl { lamOf[ld.letName] = lam }
+    gi = gi + 1
+  }
+  const cx: IgCtx = {
+    seen: seen,
+    head: head,
+    next: next,
+    work: work,
+    lamOf: lamOf,
+  }
   const shadowLive: Map<string, i32> = Map()
   const shadow: IgShadow = { names: [], live: shadowLive }
   gi = 0
@@ -7051,12 +7086,13 @@ function initGuardScan(): i32 {
       node = startStmts[si]
       ord = startStmtOrd[si]
     }
-    igWalk(node, ord, shadow, seen, head, next, work)
+    // A module lambda's body runs only through its binding, which reaches it (`igMention`).
+    if !takeGlobal || igModuleLambda(node) == "" {
+      igWalk(node, ord, shadow, cx)
+    }
     while work.length > 0 {
       const wp = work.pop() ?? -1
-      if wp >= 0 && wp < fnStmts.length {
-        igWalk(fnStmts[wp], ord, shadow, seen, head, next, work)
-      }
+      if wp >= 0 && wp < fnStmts.length { igWalk(fnStmts[wp], ord, shadow, cx) }
     }
     while oc < gInitOrder.length && gInitAt[gInitOrder[oc]] <= ord {
       igSettle(gInitOrder[oc], seen)
@@ -7190,9 +7226,9 @@ function scanPrintAssignImports(saw: PrintScanSaw) {
     if exwR == "f32" { saw.sawF32 = true }
     exw = exw + 1
   }
-  // When the program both prints (`gImports == 4`, the print family) and names
-  // an i64 type, add the 5th `__print_i64__` import.
-  if gImports == 4 {
+  // When the program calls `print` and names an i64 type, add the 5th `__print_i64__`
+  // import. Only `print` calls a wide import: a trap reason streams through 2 and 3 alone.
+  if gImports == 4 && scanSawPrint {
     if saw.sawI64Ann {
       gImports = gImports + 1
       gNeedsI64Print = true
@@ -7239,9 +7275,13 @@ function scanPrintAssignImports(saw: PrintScanSaw) {
   return 0
 }
 
+// Whether the scan met a `print` call, the only caller of the wide-scalar print imports.
+let scanSawPrint = false
+
 // `scanPrintUse`'s first step: every flag and table the scan writes, back to its empty state.
 function scanPrintReset() {
   gImports = 0
+  scanSawPrint = false
   mapDeleteReset()
   gNeedsI64Print = false
   gNeedsF64Print = false
@@ -7391,7 +7431,10 @@ function scanPrintUse() {
 // imports, memory and helpers the intrinsic it names needs. The width of a scalar it yields is
 // its call node's recorded type, which the scan reads for every node.
 function scanPrintCallIntrinsic(name: string, nArgs: i32) {
-  if name == "print" { gImports = 4 }
+  if name == "print" {
+    gImports = 4
+    scanSawPrint = true
+  }
   // The linear-memory intrinsics: any store/load forces the module-defined
   // memory; `__log__` additionally forces the synthetic decoder function,
   // which prints through `__print_i32__` — so it pulls in the print-import

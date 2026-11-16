@@ -2273,8 +2273,8 @@ export const createWasmChecker = (
   // Lint codes whose span is DEAD (unused / unreachable / always-the-same) and so
   // carries the `unnecessary` tag — editors grey/fade it. Mirrors the set the TS
   // lint (`compiler/lint.ts`) tagged; the driver's lint store has no tag field, so
-  // the host reconstructs it from the code. (`prefer-const`/`empty-intersection`/
-  // `for-step-zero` are advisories, not dead code — not tagged.)
+  // the host reconstructs it from the code. (`prefer-const`/`empty-intersection`
+  // are advisories, not dead code — not tagged.)
   const UNNECESSARY_CODES = new Set([
     "unused-import",
     // A repeated specifier binds nothing new — dead in the same sense.
