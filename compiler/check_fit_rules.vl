@@ -4982,8 +4982,9 @@ function recAnnArgRepBy(x: i32, rep: i32, held: boolean): boolean {
   }
   const par = f.fnParams[i]
   const pn = nodeAt(par)
-  if !(pn is Param) || pn.parType < 0 { return false }
-  const pt = nodeTyIxOf(par)
+  if !(pn is Param) { return false }
+  // An un-annotated parameter is typed at the argument's own row (D16772).
+  const pt = if pn.parType < 0 { nodeTyIxOf(x) } else { nodeTyIxOf(par) }
   const list = !held && recListRepWider(pt, rep)
   const ownRow = held
     && pt >= 0
@@ -4992,6 +4993,14 @@ function recAnnArgRepBy(x: i32, rep: i32, held: boolean): boolean {
     && tyAt(pt) is TyObj
     && objFieldNameSetsEq(pt, rep)
   if !list && !ownRow && !recRepWider(pt, rep) { return false }
+  // An un-annotated parameter's instance is keyed by the build, so it may also be copied into a
+  // local; nothing the function hands back may hold it (D16772).
+  if pn.parType < 0 {
+    const sig = nodeTyIxOf(fd)
+    const sf = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { null }
+    if !(sf is TyFunc) || tyHoldsObjDeep(sf.fnRet) { return false }
+    return recHoleParamReadsOnly(par, fd, list, 0)
+  }
   cwIxBuild()
   let used = false
   const ow = cwOccWalk(par)
@@ -5003,6 +5012,43 @@ function recAnnArgRepBy(x: i32, rep: i32, held: boolean): boolean {
       if !ok || recEnclosingFn(u) != fd { return false }
       used = true
     } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != par {
+      return false
+    }
+  }
+  return used
+}
+
+// Whether every use of binder `b` in function `fd` reads a field of it (an element's, for a
+// `list`) or its length, or initialises a local whose own uses do.
+function recHoleParamReadsOnly(
+  b: i32,
+  fd: i32,
+  list: boolean,
+  depth: i32,
+): boolean {
+  if depth > 4 { return false }
+  cwIxBuild()
+  let used = false
+  const ow = cwOccWalk(b)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if recEnclosingFn(u) != fd { return false }
+      const read = if list { recElemFieldRead(u) } else { recFieldRead(u) }
+      if !read {
+        const up = if cwIxCovers(u) && cwIxUpKind[u] == CW_UP_LETINIT { cwIxUp[u] } else { -1 }
+        const ln = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+        if (
+          !(ln is LetDecl)
+          || ln.letType >= 0
+          || !recHoleParamReadsOnly(up, fd, list, depth + 1)
+        ) {
+          return false
+        }
+      }
+      used = true
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != b {
       return false
     }
   }
