@@ -1168,6 +1168,7 @@ import {
   refListElemIsUnion,
   refListSlotOfExpr,
   rlUnionRowCovers,
+  rlUnionRowRetags,
   sFieldIsPlainI32,
   sFieldIsRecordRef,
   sFieldIsUnionBox,
@@ -4191,8 +4192,8 @@ function narrowedArmTyOf(ix: i32, fnIx: i32): i32 {
 
 // `recv == <numeric literal>` onto `body`, leaving a 0/1 i32 — the scalar value test shared
 // by the bare-literal `is` spelling and the numeric-litunion membership ladder. The compare's
-// width is the receiver's own; a float receiver waits on D3689's ruling, and a receiver of any
-// other type, or an `i32` the value does not fit, never holds the literal.
+// width is the receiver's own; a float receiver compares by value, the literal converted to its
+// type (D3689), and a receiver of any other type, or an `i32` it does not fit, never holds it.
 function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
   if emitExpr(recvIx, fnIx) < 0 { return -1 }
   const w = exprScalarWidth(recvIx, fnIx)
@@ -4207,10 +4208,15 @@ function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
     fbI32Bin(70)
     return 0
   }
-  if w == "f64" || w == "f32" {
-    return emitFail(
-      "emitProgram: an integer literal `is` test over a float has no settled answer (D3689)",
-    )
+  if w == "f64" {
+    fbF64Const(lv)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  if w == "f32" {
+    fbF32Const(lv)
+    fbI32Bin(91) // 0x5b f32.eq
+    return 0
   }
   fbDrop()
   fbI32Const(0)
@@ -4218,8 +4224,9 @@ function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
 }
 
 // Whether a receiver of base `base` can be read once and compared with every one of `texts`:
-// each is an integer, and fits `i32` where the base is `i32`; any other base declines.
+// a float holds any of them; otherwise each is an integer, fitting `i32` where the base is.
 function numLitOnceReadOk(base: string, texts: string[]): boolean {
+  if base == "f64" || base == "f32" { return true }
   const narrow = base == "i32"
   for t in texts {
     if numLexIsFloat(t) || narrow && !numLexFitsI32(t) { return false }
@@ -4227,14 +4234,26 @@ function numLitOnceReadOk(base: string, texts: string[]): boolean {
   return narrow || base == "i64"
 }
 
-// A fresh lazy-frame slot holding a receiver of base `base`, `i32` or `i64`.
+// A fresh lazy-frame slot holding a receiver of base `base`, an integer or a float.
 function numLitOnceSlot(base: string): i32 {
   if base == "i64" { return listElemStashSlot("i64list", 0) }
+  if base == "f64" { return listElemStashSlot("f64list", 0) }
+  if base == "f32" { return listElemStashSlot("f32list", 0) }
   return strI32Slot()
 }
 
-// Compares the `base` value on the stack, `i32` or `i64`, with the literal `lv`.
+// Compares the `base` value on the stack, an integer or a float, with the literal `lv`.
 function emitNumLitConstEq(base: string, lv: string) {
+  if base == "f64" {
+    fbF64Const(lv)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  if base == "f32" {
+    fbF32Const(lv)
+    fbI32Bin(91) // 0x5b f32.eq
+    return 0
+  }
   if base == "i64" {
     const pr = parseI64Pair(lv)
     fbI64Const(pr[0], pr[1])
@@ -4253,6 +4272,7 @@ function emitNumLitConstEq(base: string, lv: string) {
 function isNumRecvBaseName(recvIx: i32, fnIx: i32) {
   const nb = nodeNumScalarBaseName(recvIx)
   if nb != "" { return nb }
+  if tyIsPrimNamed(nodeTyIxOf(unwrapParen(recvIx)), "f32") { return "f32" }
   if nodeTyIsNullable(recvIx) { return "" }
   const t = monoArgClosedPinTy(recvIx, fnIx)[0]
   if t < 0 || t >= T.tys.length { return "" }
@@ -6338,6 +6358,10 @@ function emitIs(isIx: i32, fnIx: i32) {
     const opPrim = tyPrimNameOf(covOp)
     const tsPrim = tyPrimNameOf(isVarTyIxOf(isIx))
     const same = opPrim == tsPrim
+    // A float tested against integer literals compares by value, below (D3689).
+    if emFloatIntLitTest(covOp, isVarTyIxOf(isIx)) {
+      return emitIsTest(isIx, fnIx)
+    }
     if opPrim != null && tsPrim != null && !exprUnion(nd0.isObj, fnIx) {
       if same || !exprEffectFree(nd0.isObj) {
         if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
@@ -6474,8 +6498,9 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
       const slots: i32[] = []
       if k == 0 {
         // An arm with another tag holds a list whose element type is fixed apart from the
-        // test's: it never fits, empty or not (the D16047 refinement).
-        if t != chkTag { continue }
+        // test's: it never fits, empty or not (the D16047 refinement). A list of `i32` literals
+        // is the exception: an `i32` list arm as deep fits it by its elements (D4778).
+        if t != chkTag && listArmNumsDepth(a, chk) < 0 { continue }
         k = listArmSharedTagFit(a, chk, slots)
         if k == 0 { return 0 }
       }
@@ -6492,9 +6517,11 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
         const elemK = k == LIST_ARM_ATOMS
           || k == LIST_ARM_NULLS
           || k == LIST_ARM_NONNULL
+          || k == LIST_ARM_NUMS
         const elemJ = (fits[j] == LIST_ARM_ATOMS
           || fits[j] == LIST_ARM_NULLS
-          || fits[j] == LIST_ARM_NONNULL)
+          || fits[j] == LIST_ARM_NONNULL
+          || fits[j] == LIST_ARM_NUMS)
         if elemK && fits[j] == LIST_ARM_OWN {
           fits[j] = k
           slotsAt[j] = slots
@@ -6537,6 +6564,17 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
         const nulls = ["2"]
         if (
           emitListFitLoop([], 0, false, "list", "i32", "i32", nulls, fnIx)
+          < 0
+        ) {
+          return -1
+        }
+      } else if k == LIST_ARM_NUMS {
+        const nslots = slotsAt[i]
+        if nslots.length > 0 { fbRefCast(rlWrapIdx[nslots[0]]) }
+        else if emitUnionPayloadUnbox(7) < 0 { return -1 }
+        const nums = tyNumLitMemberTexts(chkLeaf)
+        if (
+          emitListFitLoop(nslots, 0, false, "list", "i32", "i32", nums, fnIx)
           < 0
         ) {
           return -1
@@ -6587,6 +6625,7 @@ const LIST_ARM_STRS = 2
 const LIST_ARM_ATOMS = 4
 const LIST_ARM_NULLS = 5
 const LIST_ARM_NONNULL = 6
+const LIST_ARM_NUMS = 7
 
 // How `emitListIsAcrossReps` tests list arm `a` against `chk` when the two share one tag and
 // rep: by `a`'s atoms (filling `slots`), by null elements, by no null element, or 0 when no
@@ -6601,8 +6640,27 @@ function listArmSharedTagFit(a: i32, chk: i32, slots: i32[]): i32 {
   if isNullTy(tyArrayElemIx(chk)) && !isNullTy(tyArrayElemIx(a)) {
     return LIST_ARM_NULLS
   }
+  const nd = listArmNumsDepth(a, chk)
+  if nd >= 0 && atomArmSlots(a, nd, slots) { return LIST_ARM_NUMS }
   if listArmIsNullableStrs(a, chk) { return LIST_ARM_NONNULL }
   return 0
+}
+
+// The list layers below the outermost when list arm `a` is `i32[]…[]` and `chk` a list of `i32`
+// literals as deep, which a value of `a` fits exactly when every leaf is a member (D4778); -1
+// otherwise.
+function listArmNumsDepth(a: i32, chk: i32): i32 {
+  let ae = tyArrayElemIx(a)
+  let ce = tyArrayElemIx(chk)
+  let d = 0
+  while ae >= 0 && ce >= 0 && tyArrayElemIx(ae) >= 0 && tyArrayElemIx(ce) >= 0 {
+    ae = tyArrayElemIx(ae)
+    ce = tyArrayElemIx(ce)
+    d = d + 1
+  }
+  if ae < 0 || ce < 0 || tyPrimNameOf(ae) != "i32" { return -1 }
+  if tyArrayElemIx(ae) >= 0 || tyArrayElemIx(ce) >= 0 { return -1 }
+  return if numLitUnionBaseName(ce) == "i32" { d } else { -1 }
 }
 
 // Whether list arm `a` is `(string | null)[]` and `chk` is `string[]`, so the two share the
@@ -6971,6 +7029,18 @@ function emitIsTestNumLit(isIx: i32, nd0: IsExpr, fnIx: i32) {
       }
       if nlBase == "i32" { nlBase = "i64" }
     }
+    // A float receiver compares each integer member by value, converted to its width (D3689).
+    const fb = isNumRecvBaseName(nd0.isObj, fnIx)
+    if fb == "f64" || fb == "f32" {
+      if nlBase == "" { nlTexts = tyIntLitWideTexts(isVarTyIxOf(isIx)) }
+      if (
+        nlBase == "" && nlTexts.length > 0
+        || nlBase == "i32"
+        || nlBase == "i64"
+      ) {
+        nlBase = fb
+      }
+    }
     if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
       let nlOk = nlTexts.length == 1
       if unionEqOperandOk(nd0.isObj) { nlOk = true }
@@ -7225,6 +7295,13 @@ function isRecvStageRep(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) || unionEqOperandOk(nd.isObj) { return -1 }
   const ity = isVarTyIxOf(isIx)
+  // A box tested against integers by value reads it twice (D3689).
+  if (
+    exprUnion(nd.isObj, fnIx)
+    && emFloatIntLitTest(nodeTyAt(unwrapParen(nd.isObj), fnIx), ity)
+  ) {
+    return 0
+  }
   if tyLitMemberTexts(ity).length < 2 && tyNumLitMemberTexts(ity).length < 2 {
     return -1
   }
@@ -7268,6 +7345,28 @@ function emitIsTestRungs(isIx: i32, fnIx: i32) {
     }
     fbI32Const(0)
     return 0
+  }
+  // A box with a float arm tested against integer literals compares each by value (D3689).
+  if nd0 is IsExpr {
+    const ft = nodeTyAt(unwrapParen(nd0.isObj), fnIx)
+    const fx = tyNumLitMemberTexts(isVarTyIxOf(isIx))
+    const reread = unionEqOperandOk(nd0.isObj)
+      || isRecvStagedIx == unwrapParen(nd0.isObj)
+    if (
+      exprUnion(nd0.isObj, fnIx)
+      && emFloatIntLitTest(ft, isVarTyIxOf(isIx))
+      && reread
+    ) {
+      let fi = 0
+      while fi < fx.length {
+        if emitUnionLitIs(nd0.isObj, fx[fi], fnIx) < 0 { return -1 }
+        if fi > 0 {
+          fbI32Bin(114) // 0x72 i32.or
+        }
+        fi = fi + 1
+      }
+      return 0
+    }
   }
   const rfit = emitRecordFitIs(isIx, fnIx)
   if rfit != 0 { return if rfit < 0 { -1 } else { 0 } }
@@ -12133,6 +12232,41 @@ function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
   return 0
 }
 
+// Whether `obj` has a float member and no integer arm and `chk` is a set of integer literals:
+// the test compares by value, the literal converted to the float (`tyFloatIntLitTest`, D3689).
+function emFloatIntLitTest(obj: i32, chk: i32): boolean {
+  const tx = tyNumLitMemberTexts(chk)
+  if tx.length == 0 || obj < 0 { return false }
+  for t in tx {
+    if numLexIsFloat(t) { return false }
+  }
+  const ms: i32[] = []
+  flattenVariantsInto(obj, ms)
+  let float = false
+  for m in ms {
+    if tyIsPrimNamed(m, "i32") || tyIsPrimNamed(m, "i64") { return false }
+    if tyNumLitMemberTexts(m).length > 0 { return false }
+    if tyIsPrimNamed(m, "f64") || tyIsPrimNamed(m, "f32") { float = true }
+  }
+  return float
+}
+
+// Whether union set `usid`'s only number arm is `f64`.
+function unionNumIsF64Only(usid: i32): boolean {
+  return unionHasAtomK(usid, "f64", 4) && unionHasNoIntArm(usid)
+}
+
+// Whether union set `usid`'s only number arm is `f32`.
+function unionNumIsF32Only(usid: i32): boolean {
+  return unionHasAtomK(usid, "f32", 5)
+    && !unionHasAtomK(usid, "f64", 4)
+    && unionHasNoIntArm(usid)
+}
+
+function unionHasNoIntArm(usid: i32): boolean {
+  return !unionHasAtomK(usid, "i32", 0) && !unionHasAtomK(usid, "i64", 3)
+}
+
 // `v is <literal>` over a still-boxed mixed-rep union (`"a" | "b" | 1` boxes as `string | i32`,
 // same-rep literals sharing a tag): the tag selects the literal's rep arm, then the unboxed
 // payload value-compares the literal. A literal whose rep has no arm is statically false,
@@ -12170,7 +12304,11 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   if nameIsQuotedLeaf(lit) {
     atom = "string"
     lak = 2
-  } else if numLexIsFloat(lit) {
+  } else if !numLexIsFloat(lit) && unionNumIsF32Only(usid) {
+    // A box whose only number is a float holds an integer by value there (D3689).
+    atom = "f32"
+    lak = 5
+  } else if numLexIsFloat(lit) || unionNumIsF64Only(usid) {
     atom = "f64"
     lak = 4
   } else if !numLexFitsI32(lit) {
@@ -12228,6 +12366,9 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   } else if lak == 4 {
     fbF64Const(lit)
     fbI32Bin(97) // 0x61 f64.eq
+  } else if lak == 5 {
+    fbF32Const(lit)
+    fbI32Bin(91) // 0x5b f32.eq
   } else if lak == 3 {
     const pr = parseI64Pair(lit)
     fbI64Const(pr[0], pr[1])
@@ -13833,6 +13974,7 @@ function emitSpreadGroupBoxed(
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(grp, fnIx, LBK_REF, s) < 0 { return -1 }
     if s == row || rlUnionRowCovers(s, row) { return 0 }
+    if rlUnionRowRetags(s, row) { return emitUnionListRetagTop(s, row, grp) }
     if rlWidenTagOf(s, row) < 0 {
       return emitFailAt(
         "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
@@ -30754,6 +30896,52 @@ function emitRefListWidenTop(srcSlot: i32, dstSlot: i32) {
   return 0
 }
 
+// Consume a list at union-box row `srcSlot` on the stack and leave a fresh list at union-box row
+// `dstSlot` holding each box rebuilt under `dstSlot`'s members, a member it lacks widened
+// (`rlUnionRowRetags` admitted the pair, D16880).
+function emitUnionListRetagTop(srcSlot: i32, dstSlot: i32, at: i32) {
+  if (
+    srcSlot >= rlWrapIdx.length
+    || dstSlot >= rlWrapIdx.length
+    || srcSlot >= rlBackIdx.length
+    || dstSlot >= rlBackIdx.length
+  ) {
+    return emitFailAt(
+      "emitProgram: a union list retag has no interned list type",
+      at,
+    )
+  }
+  const ft: i32[] = []
+  const tt: i32[] = []
+  if (
+    !canonUnionMemberTysOf(rlElemTyIx[srcSlot], ft)
+    || !canonUnionMemberTysOf(rlElemTyIx[dstSlot], tt)
+  ) {
+    return emitFailAt("emitProgram: a union list retag has no member set", at)
+  }
+  const srcWrap = rlWrapIdx[srcSlot]
+  const srcBack = rlBackIdx[srcSlot]
+  const dstWrap = rlWrapIdx[dstSlot]
+  const dstBack = rlBackIdx[dstSlot]
+  const sL = widenSrcWrapSlot(srcSlot)
+  const dL = widenDstBackSlot(dstSlot)
+  const iL = widenTmpSlot(0)
+  const nL = widenTmpSlot(1)
+  emitCopyLoopOpen(sL, srcWrap, nL, dstBack, dL, iL)
+  fbLocalGet(dL)
+  fbLocalGet(iL)
+  fbLocalGet(sL)
+  fbStructGet(srcWrap, 0)
+  fbLocalGet(iL)
+  fbArrayGet(srcBack)
+  // Below `len` every element is a box: a `null` member is boxed under its own tag.
+  fbRefAsNonNull()
+  if emitBoxAtomRetagMembers(ft, tt, at) < 0 { return -1 }
+  fbArraySet(dstBack)
+  emitCopyLoopClose(iL, dL, nL, dstWrap)
+  return 0
+}
+
 // the scalar sibling of `emitRefListWidenTop` (D965): same loop, a numeric convert where
 // the ref version boxes. Exactly the three lossless widenings VL's scalar assignability
 // admits (i32→i64, i32→f64, f32→f64) over the full source/destination grid — every other
@@ -37524,7 +37712,7 @@ function strHasBackslash(s: string): boolean {
 
 // Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its
 // id outright, anything else is evaluated for its effects and dropped first.
-function emitStaticLitAtom(ix: i32, lex: string, fnIx: i32) {
+export function emitStaticLitAtom(ix: i32, lex: string, fnIx: i32) {
   if !(nodeAt(unwrapParen(ix)) is StrLit) {
     const rc = emitExprRaw(ix, fnIx)
     if rc < 0 { return -1 }
@@ -39586,6 +39774,83 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
   return emitBinLitEq(e, exprIx, fnIx)
 }
 
+// Which arm legacy's `==`/`!=` over an atom takes. `fold`: both operands are typed as one string
+// literal (`aqLex`, `aqLexR`), so the compare is a constant. `static`: one side is such a literal
+// beside an atom (`aqStaticLeft` names it), spelled as the member `aqLex` it equals, since an atom
+// is interned by its member's lexeme. `ids`: two atom values. `none`: another compare.
+export type AtomEqArm = "fold" | "static" | "ids" | "none"
+export type AtomEqPlan = {
+  aqArm: AtomEqArm,
+  aqStaticLeft: boolean,
+  aqLex: string,
+  aqLexR: string,
+}
+
+// The atom compare arm of `==`/`!=` node `e` (D2156); see `AtomEqPlan`.
+export function atomEqPlanOf(e: BinExpr, fnIx: i32): AtomEqPlan {
+  const none: AtomEqPlan = {
+    aqArm: "none",
+    aqStaticLeft: false,
+    aqLex: "",
+    aqLexR: "",
+  }
+  if e.binOp != "==" && e.binOp != "!=" { return none }
+  const slL = staticStrLitLex(e.binLeft, fnIx)
+  const slR = staticStrLitLex(e.binRight, fnIx)
+  if slL != "" && slR != "" {
+    const f: AtomEqPlan = {
+      aqArm: "fold",
+      aqStaticLeft: false,
+      aqLex: slL,
+      aqLexR: slR,
+    }
+    return f
+  }
+  const slAtomL = slL != "" && exprIsLitAtom(e.binRight, fnIx)
+  const slAtomR = slR != "" && exprIsLitAtom(e.binLeft, fnIx)
+  if slAtomL || slAtomR {
+    // A value no member equals keeps its own lexeme, whose id no atom carries, so `==` is false.
+    const atomIx = if slAtomL { e.binRight } else { e.binLeft }
+    const lex = if slAtomL { slL } else { slR }
+    const st: AtomEqPlan = {
+      aqArm: "static",
+      aqStaticLeft: slAtomL,
+      aqLex: memberLexOfValue(
+        litAtomWidenTexts(atomIx, fnIx),
+        lex,
+      ),
+      aqLexR: "",
+    }
+    return st
+  }
+  // A `null` operand is the nullable-struct compare's: a litunion atom never equals it, and
+  // lowering that `null` as an atom would mis-route it to a bare-null struct context.
+  if nodeAt(unwrapParen(e.binLeft)) is NullLit { return none }
+  if nodeAt(unwrapParen(e.binRight)) is NullLit { return none }
+  if !exprIsLitAtom(e.binLeft, fnIx) && !exprIsLitAtom(e.binRight, fnIx) {
+    return none
+  }
+  // A mixed pair is the string compare's, which widens the atom to its member string.
+  if !eqAtomOperandOk(e.binLeft, fnIx) || !eqAtomOperandOk(e.binRight, fnIx) {
+    return none
+  }
+  const ids: AtomEqPlan = {
+    aqArm: "ids",
+    aqStaticLeft: false,
+    aqLex: "",
+    aqLexR: "",
+  }
+  return ids
+}
+
+// The compare after an atom `==`/`!=`'s two ids: `i32.eq`, and `i32.eqz` for `!=` (never
+// `i32.ne`, so every writer of the compare emits one byte form). 0.
+export function atomEqTail(ne: boolean): i32 {
+  fbI32Bin(70) // 0x46 i32.eq
+  if ne { fbI32Eqz() }
+  return 0
+}
+
 // `emitBinExprNode` past its union compares: the string-literal and atom compares, and the
 // `==` floors and nullable niches every later compare would misread.
 function emitBinLitEq(e: BinExpr, exprIx: i32, fnIx: i32) {
@@ -39593,70 +39858,33 @@ function emitBinLitEq(e: BinExpr, exprIx: i32, fnIx: i32) {
   // literal whatever it reads, so beside another such operand the compare folds, and beside an
   // atom it is its interned id. Both operands still evaluate, for their effects (D2156).
   if e.binOp == "==" || e.binOp == "!=" {
-    const slL = staticStrLitLex(e.binLeft, fnIx)
-    const slR = staticStrLitLex(e.binRight, fnIx)
-    if slL != "" && slR != "" {
-      if emitStaticLitAtom(e.binLeft, slL, fnIx) < 0 { return -1 }
+    const aq = atomEqPlanOf(e, fnIx)
+    if aq.aqArm == "fold" {
+      if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
       fbDrop()
-      if emitStaticLitAtom(e.binRight, slR, fnIx) < 0 { return -1 }
+      if emitStaticLitAtom(e.binRight, aq.aqLexR, fnIx) < 0 { return -1 }
       fbDrop()
-      if strLexSameValue(slL, slR) == (e.binOp == "==") {
+      if strLexSameValue(aq.aqLex, aq.aqLexR) == (e.binOp == "==") {
         fbI32Const(1)
       } else {
         fbI32Const(0)
       }
       return 0
     }
-    const slAtomL = slL != "" && exprIsLitAtom(e.binRight, fnIx)
-    const slAtomR = slR != "" && exprIsLitAtom(e.binLeft, fnIx)
-    if slAtomL || slAtomR {
-      // The static side is spelled as the member it equals, since an atom is interned by its
-      // member's lexeme; a value no member equals leaves an id no atom carries, so `==` is false.
-      let slLex = slR
-      let slAtomIx = e.binLeft
-      if slAtomL {
-        slLex = slL
-        slAtomIx = e.binRight
-      }
-      const slMem = memberLexOfValue(litAtomWidenTexts(slAtomIx, fnIx), slLex)
-      if slAtomL {
-        if emitStaticLitAtom(e.binLeft, slMem, fnIx) < 0 { return -1 }
+    if aq.aqArm == "static" {
+      if aq.aqStaticLeft {
+        if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
         if emitExpr(e.binRight, fnIx) < 0 { return -1 }
       } else {
         if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-        if emitStaticLitAtom(e.binRight, slMem, fnIx) < 0 { return -1 }
+        if emitStaticLitAtom(e.binRight, aq.aqLex, fnIx) < 0 { return -1 }
       }
-      fbI32Bin(70) // 0x46 i32.eq
-      if e.binOp == "!=" { fbI32Eqz() }
-      return 0
+      return atomEqTail(e.binOp == "!=")
     }
-  }
-  // A literal-union atom compare (`k == "a"`, `k1 == k2`) emits both operands as i32 ids (a
-  // member `StrLit` as its id, a litunion var as its i32 value) and i32-compares, before the
-  // string-eq path. Both operands must be atom-lowerable (`eqAtomOperandOk`); a mixed pair
-  // falls through to string-eq instead, which widens the atom to its member string.
-  if e.binOp == "==" || e.binOp == "!=" {
-    // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
-    // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
-    // lowering that `null` as an atom would mis-route it to a bare-null struct context.
-    let atomNull = false
-    if nodeAt(unwrapParen(e.binLeft)) is NullLit { atomNull = true }
-    if nodeAt(unwrapParen(e.binRight)) is NullLit { atomNull = true }
-    if !atomNull {
-      if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-        if (
-          eqAtomOperandOk(e.binLeft, fnIx)
-          && eqAtomOperandOk(e.binRight, fnIx)
-        ) {
-          if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-          if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-          fbI32Bin(70) // 0x46 i32.eq
-          if e.binOp == "!=" {
-            fbI32Eqz() // 0x45 i32.eqz -> `!=`
-          }
-          return 0
-        }
-      }
+    if aq.aqArm == "ids" {
+      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      return atomEqTail(e.binOp == "!=")
     }
   }
   // A `==`/`!=` over a nullable ref niche, plus the emitter-capability floor for a rep with no
@@ -40640,39 +40868,32 @@ function emitArrayCopyIntr(callIx: i32, fnIx: i32) {
           "emitProgram: internal: __array_copy__ reached with the wrong argument count — the checker's arity rule refuses it",
         )
       }
-      const acDstF64 = exprF64Array(c.callArgs[0], fnIx)
-      const acSrcF64 = exprF64Array(c.callArgs[2], fnIx)
-      if acDstF64 != acSrcF64 {
+      // Each list kind copies its backing with the same `array.copy` `.slice` uses (D3549).
+      const acKind = mfRecvKindOf(c.callArgs[0], fnIx)
+      const acSrcKind = mfRecvKindOf(c.callArgs[2], fnIx)
+      if acKind == null || acSrcKind == null {
+        return emitFail(
+          "emitProgram: __array_copy__ expects list (T[]) operands",
+        )
+      }
+      let acRow = 0
+      let acSrcRow = 0
+      if acKind == "reflist" {
+        acRow = refListSlotOfExpr(c.callArgs[0], fnIx)
+        acSrcRow = refListSlotOfExpr(c.callArgs[2], fnIx)
+      } else if acKind == "u8list" {
+        acRow = exprPackedRow(c.callArgs[0], fnIx)
+        acSrcRow = exprPackedRow(c.callArgs[2], fnIx)
+      }
+      if acKind != acSrcKind || acRow != acSrcRow {
         return emitFail(
           "emitProgram: __array_copy__ dst and src must share one element type",
         )
       }
-      let acBack = -1
-      let acWrap = -1
-      if acDstF64 {
-        acBack = fa64Ty()
-        acWrap = fl64Ty()
-      } else {
-        if (
-          exprRefArray(c.callArgs[0], fnIx)
-          || exprStringArray(c.callArgs[0], fnIx)
-          || exprRefArray(c.callArgs[2], fnIx)
-          || exprStringArray(c.callArgs[2], fnIx)
-        ) {
-          return emitFail(
-            "emitProgram: __array_copy__ supports i32/boolean/f64 lists natively",
-          )
-        }
-        if (
-          !exprArray(c.callArgs[0], fnIx)
-          || !exprArray(c.callArgs[2], fnIx)
-        ) {
-          return emitFail(
-            "emitProgram: __array_copy__ expects list (T[]) operands",
-          )
-        }
-        acWrap = lTy()
-        acBack = aTy()
+      const acWrap = spreadWrapIdx(acKind, acRow)
+      const acBack = spreadBackIdx(acKind, acRow)
+      if acWrap < 0 || acBack < 0 {
+        return emitFail("emitProgram: __array_copy__ list type not collected")
       }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
       fbStructGet(acWrap, 0)
