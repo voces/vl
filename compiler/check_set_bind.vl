@@ -46,6 +46,7 @@ import {
   WhileStmt,
   fnNameIsLambda,
   i32ToStr,
+  loopVarLoop,
   nodeAt,
   nodeChildren,
 } from "./ast"
@@ -122,7 +123,8 @@ function sbCallOf(a: i32): i32 {
 
 // The declaration whose parameter argument `a` reads: `fr`, the declaration the call is in, or
 // the enclosing declaration a nested function captures the parameter from.
-function sbArgOwner(fr: i32, a: i32): i32 {
+function sbArgOwner(fr: i32, a0: i32): i32 {
+  const a = sbCopyRoot(a0)
   if (
     sbParamIndexIn(fr, a) >= 0
     || a < 0
@@ -140,7 +142,8 @@ function sbArgOwner(fr: i32, a: i32): i32 {
 // The position of the parameter of `d` that argument `a` reads, -1 when it reads none. A `$`
 // parameter is none: the check minted it for an adapter it built (`fvaAdapt`, a list copy's
 // element map), which holds the source's closure, not a set.
-function sbParamIndexIn(d: i32, a: i32): i32 {
+function sbParamIndexIn(d: i32, a0: i32): i32 {
+  const a = sbCopyRoot(a0)
   if d < 0 || d >= P.nodes.length || a < 0 || a >= P.nodes.length { return -1 }
   const dn = nodeAt(d)
   if !(dn is FuncDecl) || !(nodeAt(a) is Ident) { return -1 }
@@ -155,6 +158,24 @@ function sbParamIndexIn(d: i32, a: i32): i32 {
     i = i + 1
   }
   return -1
+}
+
+// The name a `const` copy `a` (`const hh = h`) reads, copy by copy; `a` otherwise. A revisit is a
+// cycle and ends the chain.
+function sbCopyRoot(a: i32): i32 {
+  const seen: i32[] = []
+  let y = a
+  while y >= 0 && y < P.nodes.length && nodeAt(y) is Ident {
+    const d = identDeclOf(y)
+    if i32ListHas(seen, d) { return y }
+    seen.push(d)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return y }
+    const i = parenPeelIx(dn.letInit)
+    if i < 0 || i >= P.nodes.length || !(nodeAt(i) is Ident) { return y }
+    y = i
+  }
+  return y
 }
 
 // Adds the sets of `from` to `into`; true when it gained one.
@@ -524,7 +545,15 @@ function sbThroughNote(c: i32, n: Call) {
     if hs >= 0 && !i32ListHas(sbHandedCalls, hs) { sbHandedCalls.push(hs) }
     return 0
   }
-  if !(pdn is Param) { return 0 }
+  if !(pdn is Param) {
+    // Any other name the check types at a set, a `for` loop's element included, calls each
+    // member with the call's arguments, as a `const` of one does.
+    const lt = fnTagSetOfTy(nodeTyIxOf(f))
+    if lt >= 0 {
+      for m in fnTagMembers(lt) { sbArgRows(c, n, m, sbEnclosingFn(c)) }
+    }
+    return 0
+  }
   const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
   const q = sbParamIndexIn(owner, f)
   if q < 0 { return 0 }
@@ -1065,9 +1094,18 @@ function sbFactKey(r: i32): string {
   return "C" + i32ToStr(c) + "|" + set
 }
 
+// The list a `for` loop walks when name `x` reads that loop's element; -1 otherwise.
+function sbForElemIter(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const lp = loopVarLoop(d)
+  const l = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+  return if l is ForIn && l.fiDecl1 == d { parenPeelIx(l.fiIter) } else { -1 }
+}
+
 // The callee of call `n` at `x` in `d`'s body read through a path from a parameter of `d`: a
-// local `const` alias, an element `[i]` or a field `.f`, any number deep. Pushes `C<call>|<set>`
-// for each set the path reaches in each argument type handed to that parameter.
+// local `const` alias, an element `[i]` (a `for` loop's element too) or a field `.f`, any number
+// deep. Pushes `C<call>|<set>` for each set the path reaches in each argument type handed there.
 function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
   const steps: string[] = []
   let v = parenPeelIx(n.callFn)
@@ -1092,7 +1130,9 @@ function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
           if s0 < 0 { lack = true }
           else if !i32ListHas(seen, s0) { seen.push(s0) }
         }
-        sbPartialNote(seen, lack || sbRowsLackSet(d, q), false)
+        // The path's own type is what holds the set: an argument holding no set whole (a list, a
+        // record) lacks nothing here unless its type at the path does (`lack`).
+        sbPartialNote(seen, lack, false)
         for t in sbTysOf[sbKey(d, q)] ?? [] {
           const s = fnTagSetOfTy(sbTyAtPath(t, steps))
           if s >= 0 {
@@ -1101,6 +1141,13 @@ function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
           }
         }
         return 0
+      }
+      // A `for` loop's element is an element of the list it walks.
+      const it = sbForElemIter(v)
+      if it >= 0 {
+        steps.push("[]")
+        v = it
+        continue
       }
       const ld = identDeclOf(v)
       const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { vn }
