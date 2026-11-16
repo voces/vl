@@ -159,6 +159,7 @@ import { rcwPinProbe } from "./check_covar_pins"
 import { covarWriteThrough } from "./check_covar_write"
 import { cstrCandAny } from "./check_cstr_probe"
 import {
+  ELAB_MAKER_PER_TWIN,
   elabDeadRestClose,
   elabDeadRestOpen,
   elabEncl,
@@ -4482,6 +4483,10 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
       heldAt[rc] = list
     }
   }
+  // Each relay's calls at closed results, and the relays one of whose calls is at none.
+  const closedCalls: {[i32]: i32[]} = Map()
+  const callSig: {[i32]: i32} = Map()
+  const notClosed: {[i32]: boolean} = Map()
   for c in rl.calls {
     const cn = nodeAt(c)
     if cn is Call && !innerOf.has(c) {
@@ -4492,6 +4497,15 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
         && !tyHasTyVar(dt)
         && tyAt(dt) is TyFunc
       const held = heldAt.get(c) ?? []
+      const hs = fvaOneSig(held)
+      if closed || hs >= 0 {
+        const cl = closedCalls[d] ?? []
+        cl.push(c)
+        closedCalls[d] = cl
+        callSig[c] = if closed { dt } else { hs }
+      } else {
+        notClosed[d] = true
+      }
       if closed || held.length == 0 {
         fvaReachSig(relaySig, d, if closed { dt } else { -1 })
       } else {
@@ -4519,6 +4533,68 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
     if s >= 0 && fvaOpenMakerCall(c) >= 0 {
       const at = fvaMakerResultAt(c, s)
       fvaReachSig(sigAt, c, if at >= 0 && assignable(at, s) { s } else { -1 })
+    }
+  }
+  for d in relays {
+    if (relaySig.get(d) ?? -2) == -1 && !(notClosed.get(d) ?? false) {
+      fvaRelayTwinRows(sigAt, rl, d, closedCalls.get(d) ?? [], callSig, innerOf)
+    }
+  }
+  return 0
+}
+
+// The one closed result every entry of `sigs` names, or -1 for none, an open one, or two.
+function fvaOneSig(sigs: i32[]): i32 {
+  let r = -1
+  for t in sigs {
+    if t < 0 || (r >= 0 && !tySame(r, t)) { return -1 }
+    r = t
+  }
+  return r
+}
+
+// Twins relay `d` per delivered result, as a maker is, where its calls (`callSig`, a held one at
+// its binding's one result) differ: each is noted at its own, and each maker call `d` returns is
+// banked at every one and noted at `ELAB_MAKER_PER_TWIN`, built per twin (D16755). Declines unless
+// `d` is read only as their callee and every value it returns is a maker call.
+function fvaRelayTwinRows(
+  sigAt: {[i32]: i32},
+  rl: FvaRelayScan,
+  d: i32,
+  calls: i32[],
+  callSig: {[i32]: i32},
+  innerOf: {[i32]: i32},
+) {
+  if calls.length < 2 || (rl.handedOn.get(d) ?? false) { return 0 }
+  const sigs: i32[] = []
+  for c in calls {
+    const dt = callSig.get(c) ?? -1
+    let seen = false
+    for t in sigs {
+      if tySame(t, dt) { seen = true }
+    }
+    if !seen { sigs.push(dt) }
+  }
+  const inner: i32[] = []
+  for c in innerOf.keys() {
+    if (innerOf.get(c) ?? -1) == d {
+      if fvaOpenMakerCall(c) < 0 { return 0 }
+      for s in sigs {
+        const at = fvaMakerResultAt(c, s)
+        if at < 0 || !assignable(at, s) { return 0 }
+      }
+      inner.push(c)
+    }
+  }
+  if inner.length == 0 { return 0 }
+  for c in calls { sigAt[c] = callSig.get(c) ?? -1 }
+  for x in inner {
+    const xn = nodeAt(x)
+    if xn is Call {
+      const r = parenPeelIx(xn.callFn)
+      const m = fvaMakerOfBinding(identDeclOf(r))
+      for s in sigs { elabMakerRowNote(m, s) }
+      elabMakerCallNote(x, ELAB_MAKER_PER_TWIN)
     }
   }
   return 0
