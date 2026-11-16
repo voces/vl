@@ -1956,3 +1956,8 @@ produces the `i32`.
   Refined 2026-11-14: a write through a narrowing follows direct-write rules (a second type is
   refused); an `is` that can never match is a **warning** whose branch reads the operand as `never`.
   DECISIONS "An `is` that can never match is a warning…" carries it.
+
+- **D3431, a nested record that drops a field.** RULED (owner) 2026-11-16 (b): D4054 extends to
+  depth; an existing record is taken at its own type at any depth, no copy, and a write through the
+  annotated name must fit the real layout. (a), keeping depth under D2996 as a refusal, was not taken.
+  DECISIONS "Width subtyping reaches nested fields…" carries it.

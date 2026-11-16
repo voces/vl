@@ -12272,3 +12272,30 @@ export function half() { return origin.x / 2 }   // () => i32, from lib.vl alone
 
 Why: a module then has a meaning on its own, the precondition for separate compilation, a
 query-based LSP and a specifiable inference algorithm (engineering-review-2026-11.md §6, L2).
+
+## Width subtyping reaches nested fields: an existing record is taken at its own type at any depth (owner ruling (b), 2026-11-16) — D3431, extends D4054
+
+**The rule.** An existing record whose nested record carries fields the destination's nested record
+does not name is delivered as D4054 delivers a wider record at the top level: the destination takes
+the record's own type, nested fields included, and no copy is made. The annotation is checked as a
+bound the record must fit; the binding's type is the record's.
+
+```vl
+const sv = { pet: { legs: 4, purr: true } }
+const u: { pet: { legs: i32 } } = sv   // runs: `u` is `sv`, typed { pet: { legs, purr } }
+print(sv.pet.purr)                     // true
+u.pet = { legs: 3 }                    // refused: `u.pet` stores { legs, purr }
+```
+
+**The contract.** D4054's: one storage has one layout. A slot fed two layouts, a join, a re-pointed
+`let`, an existing narrow container, a map value, a global or a closure capture of such a slot is
+refused; a declared parameter is instantiated per concrete record. D2996 still governs a field whose
+STORAGE differs (`i32` into `i32 | null`); this ruling covers only fields a nested record adds.
+
+**Why.** It is D4054's specialise-don't-copy rule one level down, sound for the same reason: every
+name for the record has the record's own type, so no narrow handle can write what the storage
+cannot hold. The cost is predictability: a write through the annotated name must fit the real
+layout, and its refusal says so ("`u` is `sv` itself, whose `pet` also stores `purr`").
+
+**Order.** Build the depth specialisation and wire every position (graded by a position-matrix
+template, annotated and un-annotated faces) before the refusal is lifted (CLAUDE.md, capability gap).
