@@ -429,6 +429,7 @@ import {
 } from "./check_subst"
 import {
   noteTpIfRe,
+  paramHoleName,
   tpIfFn,
   tpIfFnHasRow,
   tpIfJoin,
@@ -4237,25 +4238,93 @@ function fvaMakerRowAt(decl: i32, st: i32, d: TyFunc) {
   return elabMakerRowNote(decl, d.fnRet)
 }
 
-// Whether `decl` is a maker: a non-generic function, every parameter annotated, whose result is an
-// open function value.
+// Whether `decl` is a maker: a non-generic function whose result is an open function value, every
+// parameter annotated, or un-annotated where its call pins the parameter (`fvaHoleMaker`).
 export function fvaIsMaker(decl: i32): boolean {
   if decl < 0 || decl >= P.nodes.length { return false }
   const fn = nodeAt(decl)
   if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return false }
   for p in fn.fnParams {
     const pn = nodeAt(p)
-    if !(pn is Param) || pn.parType < 0 { return false }
+    if !(pn is Param) { return false }
   }
+  // A function with an un-annotated parameter is a maker only where it returns lambdas it writes.
+  if fvaHasHoleParam(decl) && !fvaHoleMaker(decl) { return false }
   const st = nodeTyIxOf(decl)
   if st < 0 || st >= T.tys.length { return false }
   const f = tyAt(st)
   if !(f is TyFunc) || f.fnRet < 0 || f.fnRet >= T.tys.length { return false }
-  if !tyHasTyVar(f.fnRet) || !(tyAt(f.fnRet) is TyFunc) { return false }
+  const open = tyHasTyVar(f.fnRet) || fvaHoleMaker(decl) && tyHasHole(f.fnRet)
+  if !open || !(tyAt(f.fnRet) is TyFunc) { return false }
   // A nested maker reading its encloser's bindings is built with that frame, which a twin
   // checked at the root does not have.
   const e = elabEncl.get(decl) ?? -1
   return !(e >= 0 && fvaReadsWithin(decl, fn.fnBody, e))
+}
+
+// Banks hole maker `m`'s row at closed result `ret`: each un-annotated parameter bound to the type
+// call `c` hands it, which pins the instance the call builds.
+function fvaHoleMakerRow(m: i32, c: Call, ret: i32) {
+  const fn = nodeAt(m)
+  if !(fn is FuncDecl) || c.callArgs.length != fn.fnParams.length { return 0 }
+  const names: string[] = []
+  const tys: i32[] = []
+  let i = 0
+  while i < fn.fnParams.length {
+    const pn = nodeAt(fn.fnParams[i])
+    if pn is Param && pn.parType < 0 {
+      const at = nodeTyIxOf(parenPeelIx(c.callArgs[i]))
+      if at < 0 || at >= T.tys.length { return 0 }
+      names.push(paramHoleName(fn.fnName, m, i))
+      tys.push(widenLitTy(at))
+    }
+    i = i + 1
+  }
+  return elabWideRowNote(m, names, tys, ret)
+}
+
+// Whether hole maker call `mc`, of an open function type, takes as many parameters as closed
+// function type `dt`, the delivery the check accepted it at.
+function fvaHoleCallFits(mc: i32, dt: i32): boolean {
+  const c = nodeAt(mc)
+  if (
+    !(c is Call)
+    || !fvaHoleMaker(fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn))))
+  ) {
+    return false
+  }
+  const t = nodeTyIxOf(mc)
+  const f = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  const d = tyAt(dt)
+  return f is TyFunc
+    && d is TyFunc
+    && f.fnParamTypes.length == d.fnParamTypes.length
+}
+
+// Whether maker candidate `decl` has an un-annotated parameter and returns only lambdas it writes:
+// each call pins the parameter, so the elaboration twins that call's instance (D16778).
+function fvaHoleMaker(decl: i32): boolean {
+  if !fvaHasHoleParam(decl) { return false }
+  const fn = nodeAt(decl)
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  for r in rets {
+    const x = parenPeelIx(r)
+    if x < 0 || x >= P.nodes.length || !(nodeAt(x) is FuncDecl) { return false }
+  }
+  return rets.length > 0
+}
+
+// Whether `decl` has an un-annotated parameter.
+function fvaHasHoleParam(decl: i32): boolean {
+  const fn = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  if !(fn is FuncDecl) { return false }
+  for p in fn.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
 }
 
 // Whether a read in the subtree at `ix` names a binding declared inside `e` but outside `d`.
@@ -4297,7 +4366,14 @@ export function fvaMakerCallRows() {
         }
       }
       if mc >= 0 {
-        fvaReachSig(sigAt, mc, fvaMakerResultAt(mc, fvaCallSig(n, ix)))
+        const cs = fvaCallSig(n, ix)
+        const rs = fvaMakerResultAt(mc, cs)
+        // A hole maker's call result closes at the signature its binding is called at.
+        fvaReachSig(
+          sigAt,
+          mc,
+          if rs < 0 && cs >= 0 && fvaHoleCallFits(mc, cs) { cs } else { rs },
+        )
       }
       const dt = nodeCtxTyIxOf(ix)
       if (
@@ -4308,10 +4384,13 @@ export function fvaMakerCallRows() {
         && tyAt(dt) is TyFunc
       ) {
         const at = fvaMakerResultAt(ix, dt)
+        // A maker with an un-annotated parameter is built at its delivery's closed type: its
+        // result's holes are the call's, which the check accepted against `dt`.
+        const holed = fvaHoleCallFits(ix, dt)
         fvaReachSig(
           sigAt,
           ix,
-          if at >= 0 && assignable(at, dt) { dt } else { -1 },
+          if holed || at >= 0 && assignable(at, dt) { dt } else { -1 },
         )
       }
     }
@@ -4337,10 +4416,14 @@ export function fvaMakerCallRows() {
     const sig = sigAt.get(mc) ?? -1
     const c = nodeAt(mc)
     if sig >= 0 && c is Call {
-      elabMakerRowNote(
-        fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn))),
-        sig,
-      )
+      const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
+      // A maker with an un-annotated parameter is built at the binding its call pins, so its row
+      // names that binding: the elaboration twins that instance at `sig` (D16778).
+      if fvaHoleMaker(m) {
+        fvaHoleMakerRow(m, c, sig)
+      } else {
+        elabMakerRowNote(m, sig)
+      }
       elabMakerCallNote(mc, sig)
     }
   }
@@ -4870,7 +4953,8 @@ function fvaOpenMakerCall(mc: i32): i32 {
   const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
   if !fvaIsMaker(m) || !fvaRetsNamed(m) { return -1 }
   const t = nodeTyIxOf(mc)
-  if t < 0 || t >= T.tys.length || !tyHasTyVar(t) { return -1 }
+  if t < 0 || t >= T.tys.length { return -1 }
+  if !tyHasTyVar(t) && !(fvaHoleMaker(m) && tyAt(t) is TyFunc) { return -1 }
   return mc
 }
 
