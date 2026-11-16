@@ -12299,3 +12299,28 @@ layout, and its refusal says so ("`u` is `sv` itself, whose `pet` also stores `p
 
 **Order.** Build the depth specialisation and wire every position (graded by a position-matrix
 template, annotated and un-annotated faces) before the refusal is lifted (CLAUDE.md, capability gap).
+
+## An annotation fixes an empty list's element type wherever the value goes (owner ruling (a), 2026-11-16) — D16342, D16447, follows D16047
+
+**The rule.** An empty list whose element type an annotation or a write fixed keeps that element
+type through a parameter, a type parameter and a container read, so `is` answers by the element
+type, not by emptiness. A list nothing fixed still fits every `is T[]` (D4910), wherever it goes.
+
+```vl
+const e: i32[] = []
+function take(v) { return v is f64[] }
+print(take(e))        // false: e's element is fixed at i32
+print(take([]))       // true: nothing fixed this list's element
+const m: {[string]: i32[]} = Map()
+m["k"] = e
+const r = m["k"]
+if r != null { print(r is f64[]) }   // false
+```
+
+**Why.** Moving `x is f64[]` into a helper must not change a program's output; the element type is
+a fact of the value, as every other fixed type is. A function reached by both a fixed and an open
+empty list answers per call.
+
+**Interim.** Until inferred interfaces record the per-call binding fact (L2 S3), a function reached
+by both a fixed and an open empty list at one un-annotated parameter is refused loudly, naming the
+two calls; the refusal lifts with L2.
