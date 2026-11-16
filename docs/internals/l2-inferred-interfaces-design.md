@@ -262,6 +262,22 @@ signature. For example: "`sum` needs `xs` to be a list of numbers; got `string[]
 body of `f` at the call's argument types" (review §3.1, §9, choice 1). The solved instantiation is a vector
 of `TyId`s, which is H stage 5's instance key and lane Q's `InstReq` type part (§10).
 
+### 4.3 Function sets at a call, and hand-backs (settled 2026-11-16)
+
+These are the two facts the single storage decider reads (§10), built at check time by
+`check_set_bind.vl` (`refactor-notes/2026-11-16-store-set-bind-sources-1.md`).
+- **A set reaching a parameter at a call is solver output, keyed by the call, never in an `Iface`.**
+  - It is the call's instantiation of the parameter's `BK_ARROW` bounds. One row per (call,
+    parameter, set): `on` the parameter's type, `a` its position, `b` the set, `c` the caller's
+    parameter it is handed on from (-1 direct), `site` the call, `fn` the callee.
+  - It uses `Bound`'s field names but lives beside `InstReq`, because an `Iface` must not depend on
+    its callers.
+- **A hand-back is a bound of the body: `BND_HANDBACK`**, appended to the owner's `Iface` when the
+  body closes.
+  - Every value the body returns reads parameter `a` (of type `on`), which nothing else reads. The
+    `site` is the body.
+  - The test is `check_hand_back.vl`, the one the elaboration reads.
+
 ## 5. Exports
 
 The ruling: "an export's types and layouts are inferred from its own module alone". Under L2:

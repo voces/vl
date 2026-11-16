@@ -57,6 +57,7 @@ const COVERED = `let total = 0
 function sq(x: i32): i32 { return x * x }
 function wide(a: i64, b: i64): i64 { return a * b + 7 }
 function pos(x: f64): boolean { return x > 0.0 }
+function above(x: f64): boolean { return x > -1.5 }
 function sum(n: i32): i32 {
   let s = 0
   let i = 0
@@ -78,6 +79,7 @@ print(sum(10))
 print(pick(3, 2))
 print(wide(3, 4))
 print(pos(1.5))
+print(above(-2.0))
 print(total)
 `;
 
@@ -93,9 +95,9 @@ Deno.test({
     const verified = armed.rows.get("verified") ?? 0;
     const fns = armed.rows.get("fns") ?? 0;
     console.log(`[ir-shadow] covered ${covered} of ${fns}; rows ${JSON.stringify([...armed.rows])}`);
-    // sq, wide, pos, sum, pick and bump are each inside the set.
-    if (covered < 6 || verified !== covered) {
-      throw new Error(`want at least 6 covered, all verified; got covered ${covered}, verified ${verified}`);
+    // sq, wide, pos, above, sum, pick and bump are each inside the set.
+    if (covered < 7 || verified !== covered) {
+      throw new Error(`want at least 7 covered, all verified; got covered ${covered}, verified ${verified}`);
     }
     const matched = armed.rows.get("matched") ?? 0;
     if (matched !== covered) {

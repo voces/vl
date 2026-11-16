@@ -1,10 +1,10 @@
 // `check_cstr_rows.vl` — the deferred constraints a generic body records for its call sites.
 // A body that cannot yet decide an operation over a hole (a binary operator, an argument, a
-// return, a `print`, an `is`, a member read, ...) records a row in the matching table, stamped
-// with the owning declaration (`cstrOwnerTop`) and the delivery it arrived through (`cvMark`);
-// each call site re-asks its callee's rows under its substitution. The `note*Cstr` recorders
-// keep one row per structurally equal constraint of a body, and `tpGradualRecv` records the
-// member read a gradual receiver defers to its pin.
+// return, a `print`, an `is`, a member read, ...) records a bound of the matching kind on its
+// owner's `Iface` (`check_iface.vl`), with the delivery it arrived through (`cvMark`); each call
+// site re-asks its callee's bounds under its substitution. The `note*Cstr` recorders keep one
+// bound per structurally equal constraint of a body, and `tpGradualRecv` records the member read
+// a gradual receiver defers to its pin.
 
 import { cstrOwnerStack, tpEnvNames } from "./check_cursor"
 import { tpGradualView, tyIsDeferredJoin } from "./check_tp_join"
@@ -36,7 +36,9 @@ import { i32ListHas } from "./listutil"
 import { identFnDeclOf } from "./check_scopes"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
 import {
+  BND_ARG,
   BND_ARRDEF,
+  BND_BIN,
   BND_BM,
   BND_IS,
   BND_LET,
@@ -52,95 +54,6 @@ import {
   bndPush,
   bndSiteHas,
 } from "./check_iface"
-
-// Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
-// `s + "!"` / `n < 2` cannot be decided in the body, a hole being permissively assignable to
-// both string and numeric. Record `(lt, op, rt)` as arena type indices; the generic call site
-// re-validates each under the substituted argument types via `binOpDefinedFor`.
-type BinCstrCols = {
-  lt: i32[],
-  op: string[],
-  rt: i32[],
-  // The `FuncDecl` node that owns each constraint — the body recording it, or -1 at module
-  // scope. Without it the list is keyed on the TyVar name alone and every generic in the program
-  // shares one namespace, so an unrelated generic's refusal fires at a call that never adds or
-  // compares. `validateBinCstrs` / `binCstrsHold` filter on it, falling back to the whole list at -1.
-  fn: i32[],
-  // The `BinExpr` that wrote the constraint, or -1: the pin asks that node the direct
-  // spelling's numeric pair rule, whose literal operands adapt (`numBinPairRefusal`).
-  node: i32[],
-  // `node`'s `binLitShape`, or -1: rows of one body alike but for a node of the same shape
-  // are one row, as the rule answers both alike.
-  shape: i32[],
-}
-
-export const binCstr: BinCstrCols = {
-  lt: [],
-  op: [],
-  rt: [],
-  fn: [],
-  node: [],
-  shape: [],
-}
-
-// Drops every `binCstr` row from `n` on, all columns together.
-export function binCstrTruncate(n: i32) {
-  while binCstr.op.length > n {
-    binCstr.lt.pop()
-    binCstr.op.pop()
-    binCstr.rt.pop()
-    binCstr.fn.pop()
-    binCstr.node.pop()
-    binCstr.shape.pop()
-  }
-  return 0
-}
-
-// Deferred call-argument constraints over un-annotated-param holes: inside a generic body a
-// hole flowed as an argument into a concrete parameter (`function f(x) { g(x) }` with
-// `g(n: i32)`). The body cannot judge it, so the demand is recorded (hole type, expected param
-// type, callee name) and the generic call site re-validates it under the substituted types.
-type ArgCstrCols = {
-  at: i32[],
-  exp: i32[],
-  who: string[],
-  // The owning declaration, for the by-name `TyVar` reason `noteBinCstr` stamps one (D2424).
-  fn: i32[],
-  // What the demand is: `ACF_PLAIN`, `ACF_TPL` (a template hole meeting its renderer, which also
-  // delivers a `string` without the call, D2241), or N >= 1 for argument N of a call through a hole
-  // callee, which the pin holds only to the scalar rule `holeArgScalarRefused` names (D3225).
-  form: i32[],
-  // A hole callee's argument node inside the body, or -1: what the pin asks the direct call's
-  // question of when no argument of the pinning call binds it.
-  node: i32[],
-  // The hole call making an argument demand (form N >= 1), kept as the demand moves out to a
-  // caller's hole, so a pin reads that call's arguments together; -1 otherwise (D13201).
-  call: i32[],
-}
-
-export const argCstr: ArgCstrCols = {
-  at: [],
-  exp: [],
-  who: [],
-  fn: [],
-  form: [],
-  node: [],
-  call: [],
-}
-
-// Drops every `argCstr` row from `n` on, all columns together.
-export function argCstrTruncate(n: i32) {
-  while argCstr.at.length > n {
-    argCstr.at.pop()
-    argCstr.exp.pop()
-    argCstr.who.pop()
-    argCstr.fn.pop()
-    argCstr.node.pop()
-    argCstr.form.pop()
-    argCstr.call.pop()
-  }
-  return 0
-}
 
 // Each `__array_new_default__` list type whose element is a hole, with the call and its owner:
 // the pin asks the substituted element for a default, as the direct spelling does (D2578).
@@ -168,6 +81,44 @@ export const listIsPinOtherAt: i32[] = []
 export const LIP_APART = 0
 export const LIP_MEET = 1
 export const LIP_OPEN = 2
+
+// Each disjoint pin's list row and call, by test node: a row the unbound default settles after
+// the pin is an open list, and is re-counted as one at the program's end.
+export const listIsApartIx: i32[] = []
+export const listIsApartRow: i32[] = []
+export const listIsApartCall: i32[] = []
+
+// Counts disjoint pin `call` of list test `ix`, handing list row `row`.
+export function listIsApartNote(ix: i32, row: i32, call: i32) {
+  listIsApartIx.push(ix)
+  listIsApartRow.push(row)
+  listIsApartCall.push(call)
+  return listIsPinNote(ix, LIP_APART, call)
+}
+
+// Each argument a direct call hands a declared function, and that function; and each watched
+// list test with the function its body belongs to. Read at the program's end, when the unbound
+// default has settled every open list.
+export const listCallDecl: i32[] = []
+export const listCallArg: i32[] = []
+export const listIsOwnNode: i32[] = []
+export const listIsOwnDecl: i32[] = []
+
+// Notes that a direct call hands function `decl` argument `arg`.
+export function listCallNote(decl: i32, arg: i32) {
+  listCallDecl.push(decl)
+  listCallArg.push(arg)
+  return 0
+}
+
+// Notes that list test `ix` sits in the body of function `decl`.
+export function listIsOwnerNote(ix: i32, decl: i32) {
+  if !i32ListHas(listIsOwnNode, ix) {
+    listIsOwnNode.push(ix)
+    listIsOwnDecl.push(decl)
+  }
+  return 0
+}
 
 // Counts pin `call` of list test `ix` as one of the `LIP_*` kinds.
 export function listIsPinNote(ix: i32, kind: i32, call: i32) {
@@ -201,6 +152,13 @@ export function listIsPinReset() {
   listIsPinMeet.clear()
   listIsPinOther.clear()
   listIsPinOtherAt.clear()
+  listIsApartIx.clear()
+  listIsApartRow.clear()
+  listIsApartCall.clear()
+  listCallDecl.clear()
+  listCallArg.clear()
+  listIsOwnNode.clear()
+  listIsOwnDecl.clear()
   return 0
 }
 
@@ -218,10 +176,6 @@ function tyIxBound(ty: i32, ix: i32, fn: i32): Bound {
     more: bndNoMore,
   }
 }
-
-// The next check-order stamp for a `BND_LET` or `BND_BM` bound: one counter, so the pin pass
-// applies a body's writes in check order wherever each is deferred (D2218).
-export let cstrSeqNext = 0
 
 // The body whose constraints are being recorded — the innermost top-level declaration on
 // the checking stack, or -1 at module scope.
@@ -288,30 +242,30 @@ export function noteBinCstrAt(
     // A structurally equal constraint of the same body is the same constraint: a call's
     // substitution mints fresh arena copies, and keying on the index alone let each copy of a
     // callee's constraints re-record in every caller, exponential over a cycle of generics (D2757).
-    let k = 0
-    while k < binCstr.op.length {
+    for k in bndOwnRows(BND_BIN, owner) {
+      const b = bndAt(BND_BIN, k)
       if (
-        binCstr.op[k] == op
-        && binCstr.fn[k] == owner
-        && binCstr.shape[k] == shape
-        && (op != "as" || binCstr.node[k] == node)
+        b.s == op
+        && b.b == shape
+        && (op != "as" || b.site == node)
+        && tyEqSameHoles(b.on, lt)
+        && tyEqSameHoles(b.a, rt)
       ) {
-        if (
-          tyEqSameHoles(binCstr.lt[k], lt)
-          && tyEqSameHoles(binCstr.rt[k], rt)
-        ) {
-          return 0
-        }
+        return 0
       }
-      k = k + 1
     }
-    binCstr.lt.push(lt)
-    binCstr.op.push(op)
-    binCstr.rt.push(rt)
-    binCstr.fn.push(owner)
-    binCstr.node.push(node)
-    binCstr.shape.push(shape)
-    cvMark(CV_BIN, binCstr.fn.length - 1)
+    const row: Bound = {
+      on: lt,
+      a: rt,
+      b: shape,
+      c: -1,
+      site: node,
+      fn: owner,
+      s: op,
+      seq: -1,
+      more: bndNoMore,
+    }
+    cvMark(CV_BIN, bndPush(BND_BIN, row))
   }
   return 0
 }
@@ -330,7 +284,7 @@ export function noteArgCstr(
   return noteArgCstrAt(at, exp, who, form, node, -1)
 }
 
-// `noteArgCstr` for an argument of hole call `call`, which the row keeps (`argCstr.call`).
+// `noteArgCstr` for an argument of hole call `call`, which the bound keeps (`b`).
 export function noteArgCstrAt(
   at: i32,
   exp: i32,
@@ -341,31 +295,30 @@ export function noteArgCstrAt(
 ) {
   if tyIsDeferredJoin(exp) { return 0 }
   const owner = cstrOwnerTop()
-  let k = 0
-  while k < argCstr.at.length {
+  for k in bndOwnRows(BND_ARG, owner) {
+    const b = bndAt(BND_ARG, k)
     if (
-      argCstr.fn[k] == owner
-      && argCstr.form[k] == form
-      && argCstr.node[k] == node
-      && argCstr.call[k] == call
+      b.c == form
+      && b.site == node
+      && b.b == call
+      && tyEqSameHoles(b.on, at)
+      && tyEqSameHoles(b.a, exp)
     ) {
-      if (
-        tyEqSameHoles(argCstr.at[k], at)
-        && tyEqSameHoles(argCstr.exp[k], exp)
-      ) {
-        return 0
-      }
+      return 0
     }
-    k = k + 1
   }
-  argCstr.at.push(at)
-  argCstr.exp.push(exp)
-  argCstr.who.push(who)
-  argCstr.fn.push(owner)
-  argCstr.node.push(node)
-  argCstr.form.push(form)
-  argCstr.call.push(call)
-  cvMark(CV_ARG, argCstr.fn.length - 1)
+  const row: Bound = {
+    on: at,
+    a: exp,
+    b: call,
+    c: form,
+    site: node,
+    fn: owner,
+    s: who,
+    seq: -1,
+    more: bndNoMore,
+  }
+  cvMark(CV_ARG, bndPush(BND_ARG, row))
   return 0
 }
 
@@ -473,10 +426,9 @@ export function noteBmCstr(
       site: argIx,
       fn: owner,
       s: label,
-      seq: cstrSeqNext,
+      seq: -1,
       more: bndNoMore,
     }
-    cstrSeqNext = cstrSeqNext + 1
     cvMark(CV_BM, bndPush(BND_BM, row))
   }
   return 0
@@ -632,10 +584,9 @@ function letCstrPush(got: i32, want: i32, ix: i32, name: string, owner: i32) {
     site: ix,
     fn: owner,
     s: name,
-    seq: cstrSeqNext,
+    seq: -1,
     more: bndNoMore,
   }
-  cstrSeqNext = cstrSeqNext + 1
   cvMark(CV_LET, bndPush(BND_LET, row))
   return 0
 }
