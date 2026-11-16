@@ -1167,6 +1167,7 @@ import {
   recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
+  rlUnionRowCovers,
   sFieldIsPlainI32,
   sFieldIsRecordRef,
   sFieldIsUnionBox,
@@ -13809,7 +13810,7 @@ function emitSpreadGroupBoxed(
   if k == "reflist" {
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(grp, fnIx, LBK_REF, s) < 0 { return -1 }
-    if s == row { return 0 }
+    if s == row || rlUnionRowCovers(s, row) { return 0 }
     if rlWidenTagOf(s, row) < 0 {
       return emitFailAt(
         "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
@@ -24950,6 +24951,22 @@ function emitAsCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
       if amRef is Index { return emitAsMapProbeTrap(amRef, fnIx) }
     }
   }
+  // `m[k] as? V` over a scalar map's `V | null` read is the read itself, boxed as a consumed
+  // read is (D2467).
+  const aok = if e.asMode == "null" { mapReadScalarBoxKindIn(obj, fnIx) } else { -1 }
+  const aoRef = nodeAt(unwrapParen(obj))
+  if (
+    e.asMode == "null"
+    && aoRef is Index
+    && exprMap(aoRef.idxArr, fnIx)
+    && tySame(nodeTyAt(_exprIx, fnIx), nodeTyAt(obj, fnIx))
+  ) {
+    if aok >= 0 {
+      return emitMapGetScalarBox(aoRef.idxArr, aoRef.idxIndex, aok, fnIx)
+    }
+    // A niche-bearing value's read already carries its `null`.
+    return emitExpr(obj, fnIx)
+  }
   // A type-parameter operand fails as the direct spelling does at this instance's pin (D2791).
   if asExprHoleNumSad(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
     const hps = asExprHolePinSrc(_exprIx, fnIx)
@@ -32764,7 +32781,7 @@ export function emitUnionRetSink(fnIx: i32) {
 // written the box's own `struct.new $uBox`, with its two operands still on the wasm stack
 // in field order? Both conditions are load-bearing: the cursor alone admits nothing-written-
 // since, the byte pattern alone admits a false match (an operand can spell any opcode).
-function uBoxNewIsLast() {
+export function uBoxNewIsLast() {
   if uBoxNewEnd != wLen() { return false }
   const pat = unionBoxNewBytes()
   const np = pat.length
@@ -32780,7 +32797,7 @@ function uBoxNewIsLast() {
 // Unwrite the matched `struct.new $uBox` and pop its two operands into the sink pair,
 // restoring the wasm stack to before the box's operands pushed. Valid only immediately
 // after `uBoxNewIsLast()` answers true.
-function uBoxSinkToPair() {
+export function uBoxSinkToPair() {
   wDropBack(unionBoxNewBytes().length)
   fbLocalSet(unionSinkBase + 1) // the anyref payload — top of stack
   fbLocalSet(unionSinkBase) // the i32 tag — beneath it

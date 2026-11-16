@@ -1,4 +1,5 @@
 import { nameToTy } from "./check_relate_core"
+import { aliasRootParam } from "./check_call_resolve"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { voidCtxLambdaCarry } from "./check_side_rows"
@@ -6939,9 +6940,11 @@ function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
   const e = nodeAt(ix)
   if e is Ident {
     if !tyHasTyVar(nodeTyIxOf(ix)) { return -1 }
+    let name = e.identName
+    if !strListHas(pNames, name) { name = aliasRootParam(ix) }
     let i = 0
     while i < pNames.length {
-      if pNames[i] == e.identName {
+      if pNames[i] == name {
         const top = elabWalkTop()
         const et = if top >= 0 { elabNodeTy(ix, top) } else { -1 }
         if (
@@ -21147,7 +21150,46 @@ function monoPinHoleParam(
       if tagged { nested = false }
     }
     if an == "" && nested {
-      const vt = eplValueTy(ax, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+      let vt = eplValueTy(ax, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+      // A record or list whose part holds functions of several results takes that part at its
+      // own pin (D16859).
+      if vt < 0 && axn is ObjLit {
+        const fnm: string[] = []
+        const fty: i32[] = []
+        for fx in axn.objFields {
+          const fi = nodeAt(fx)
+          if fi is FieldInit && vt != -2 {
+            const fv = unwrapParen(fi.fiValue)
+            let ft = eplValueTy(fv, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+            if ft < 0 {
+              const fo = [0 - 1]
+              const fname = monoArgPinName(fv, ctx, fo)
+              ft = if fname != "" { fo[0] } else { -1 }
+            }
+            if ft < 0 {
+              vt = -2
+            } else {
+              fnm.push(fi.fiName)
+              fty.push(ft)
+            }
+          }
+        }
+        vt = if vt == -2 || fnm.length == 0 { -1 } else { mkObjTy(fnm, fty) }
+      } else if vt < 0 && axn is ArrayLit && axn.arrElems.length > 0 {
+        // A list of such lists takes its elements' pin where every element pins alike; one
+        // narrower than another has no one element type.
+        let lt0 = -1
+        for e in axn.arrElems {
+          const ev = unwrapParen(e)
+          let pt = eplValueTy(ev, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+          if pt < 0 {
+            const eo = [0 - 1]
+            pt = if monoArgPinName(ev, ctx, eo) != "" { eo[0] } else { -1 }
+          }
+          lt0 = if pt < 0 || lt0 == -2 || lt0 >= 0 && pt != lt0 { -2 } else { pt }
+        }
+        vt = if lt0 >= 0 { mkArrayTy(lt0) } else { -1 }
+      }
       if vt >= 0 && vt < T.tys.length && !tyHasTyVar(vt) && !tyHoldsHole(vt) {
         an = if tyHoldsObj(vt, 8) { monoRecordRowPin(vt) } else { monoPinOfClosedTy(vt) }
         if an != "" {
