@@ -45,6 +45,8 @@ wasm; every one prints the same output.
   to an un-annotated parameter, refused at emit on master, run (`5` `2.75`); fixture
   `functions/maker-calls-at-two-pins-one-called-one-handed-on.vl`. The ingredient is not isolated:
   disabling the maker-returned rule in `elabLamParamTyAt` leaves it running.
+  The fixture pays one late demand (`half` at the `f64` closure type, minted after `elabRun`):
+  the price [D16853](../inventory/D16853.md) names for `take`; `late-demands-baseline.txt` takes it.
 
 ## Readings
 
