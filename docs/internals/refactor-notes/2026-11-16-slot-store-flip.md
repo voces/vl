@@ -45,7 +45,22 @@ The eager build first measured L2 self-compile fuel +49% and ran L2 out of GC he
   function's returned record between its call sites (ruled a graded mover; pin D16801).
 - `closures/generic-returned-fn-param` closes with the eager build: a timing artefact of building at
   mono's first question.
+- `functions/error-generic-handed-to-bare-param-comes-back-in-returned-closure`: loud to loud, the
+  refusal moves from mono to emit (row D16843, a call-result edge the classes miss).
 
 ## Readings
 
-READINGS
+Fixpoint seeds: master `30a6da134` and this branch.
+
+| check | reading |
+|---|---|
+| `tests/cases` built, byte for byte, error text diffed | 1 of 7,903 differs (`fn-record-returned-to-two-bindings-one-written`, D16801); `typaram-let-copy-closure-written-in-record` timed out on master's seed (D16844, 420G guest fuel) and builds here |
+| refusal moved | `functions/error-generic-handed-to-bare-param-comes-back-in-returned-closure` now refuses at emit ("a generic function taken as a value reaches no call that fixes its type"); `eplCallResultFlow` misses the closure `wrap`'s instance makes (D16843) |
+| distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 `runs -> not-runs` |
+| L2 self-compile fuel | 97.110e9 against the 94.769e9 baseline: +2.5%, rebaselined with a ledger line |
+| L2 peak live set | 1,116 MiB, 54% of a 2 GiB copying heap |
+| plumb-shape main / tail fuel | 9.499e9 / 6.883e9 against 9.442e9 / 6.842e9: +0.6% each; peak live 129,732 / 96,976 KiB, master's own |
+| late demands | 3, baseline 3 |
+| seed size | 6,479,516 against 6,476,535 |
+| `lint-self` | clean |
+| `scripts/gate.sh` | every row ok but the self-compile tier, rebaselined here |
