@@ -49,6 +49,7 @@ import {
   annTsWrittenOf,
   arenaSetNode,
   fnDeclNameAt,
+  i32ToStr,
   letAnnAt,
   nodeAt,
   nodeChildren,
@@ -60,6 +61,7 @@ import {
 } from "./ast"
 import { declTyOf } from "./check_nar_store"
 import { objDroppedFieldList } from "./check_leaf_steps"
+import { nodeLineOf } from "./check_capture_loss"
 import { nodeTyOf } from "./check_node_tys"
 import {
   T,
@@ -72,7 +74,16 @@ import {
   tyToStrUser,
 } from "./check_types"
 import { CODE_UNSUPPORTED_LOWERING } from "./check_messages"
-import { wsAnnMentions, wsSlotAt, wsSlotDst, wsSlotSrc } from "./check_width"
+import {
+  wsAnnMentions,
+  wsArgAt,
+  wsArgDecl,
+  wsArgParam,
+  wsArgTy,
+  wsSlotAt,
+  wsSlotDst,
+  wsSlotSrc,
+} from "./check_width"
 import { i32ListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { identDeclOf } from "./symbols"
@@ -780,6 +791,7 @@ function slotListShareMsg(at: i32, s: i32, dst: i32) {
 // contract, with the fresh literal that stores it.
 export function slotContractWords(root: i32) {
   slotWriteWords(root)
+  slotParamWrites()
   if T.diags.length == 0 || wsSlotAt.length == 0 { return 0 }
   const par = slotWalk(root)
   let i = 0
@@ -832,6 +844,11 @@ export function slotContractWords(root: i32) {
 function slotWriteRoot(at: i32, par: {[i32]: i32}) {
   const lhs = slotWriteLhs(at, par)
   if lhs < 0 { return -1 }
+  return slotPlaceDecl(lhs)
+}
+
+// The binding a field place `lhs` (`u.pet.legs`) is rooted at, or -1.
+function slotPlaceDecl(lhs: i32) {
   let x = lhs
   let guard = 0
   while guard < 64 {
@@ -922,6 +939,93 @@ function slotWriteWords(root: i32) {
       }
     }
     i = i + 1
+  }
+  return 0
+}
+
+// Rewords the field-dropping refusal of each argument `wsNoteArgRefusal` noted where the callee's
+// body writes through that parameter a record the argument's real layout cannot hold.
+function slotParamWrites() {
+  let k = 0
+  while k < wsArgAt.length {
+    slotParamWriteWords(wsArgDecl[k], wsArgParam[k], wsArgAt[k], wsArgTy[k])
+    k = k + 1
+  }
+  return 0
+}
+
+// `slotParamWrites` for argument `arg`, a record of type `at`, to parameter `i` of declaration `d`:
+// the parameter is the argument itself, so the write is what is refused.
+function slotParamWriteWords(d: i32, i: i32, arg: i32, at: i32) {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) || i >= fd.fnParams.length || fd.fnBody < 0 { return 0 }
+  const pn = nodeAt(fd.fnParams[i])
+  if !(pn is Param) { return 0 }
+  const par = slotWalk(fd.fnBody)
+  for x in par.keys() {
+    const n = nodeAt(x)
+    if n is BinExpr && n.binOp == "=" && nodeAt(n.binLeft) is Member {
+      const into = slotPathTy(at, n.binLeft)
+      const rt = nodeTyOf(n.binRight)
+      const miss = if slotPlaceDecl(n.binLeft) == fd.fnParams[i] && into >= 0 { objDroppedFieldList(into, rt) } else { "" }
+      if miss != "" {
+        return slotParamWriteSet(
+          arg,
+          "`"
+            + fd.fnName
+            + "` writes `"
+            + pn.parName
+            + "."
+            + slotFieldPath(n.binLeft)
+            + "` a "
+            + tyToStrUser(rt)
+            + " on line "
+            + i32ToStr(nodeLineOf(n.binRight))
+            + ", and its parameter `"
+            + pn.parName
+            + "` is this "
+            + tyToStrUser(at)
+            + " itself (an existing record keeps its own layout where it is delivered, and no copy is "
+            + "made), whose `"
+            + slotFieldPath(n.binLeft)
+            + "` also stores "
+            + miss
+            + "; give that write every field of "
+            + tyToStrUser(into),
+        )
+      }
+    }
+  }
+  return 0
+}
+
+// The type field place `x` names when its root holds a record of type `t`, or -1.
+function slotPathTy(t: i32, x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Member) { return t }
+  const up = slotPathTy(t, n.memObj)
+  if up < 0 || up >= T.tys.length { return -1 }
+  const u = tyAt(up)
+  return if u is TyObj { objFieldType(u, n.memProp) } else { -1 }
+}
+
+// Replaces the capability refusal at `arg` with `msg`.
+function slotParamWriteSet(arg: i32, msg: string) {
+  let k = 0
+  while k < T.diags.length {
+    const d = T.diags[k]
+    if d.tat == arg && d.tcode == CODE_UNSUPPORTED_LOWERING {
+      T.diags[k] = {
+        tmsg: msg,
+        tat: d.tat,
+        tline: d.tline,
+        tcol: d.tcol,
+        tendTok: d.tendTok,
+        tcode: "",
+        tdata: d.tdata,
+      }
+    }
+    k = k + 1
   }
   return 0
 }

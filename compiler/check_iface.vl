@@ -4,10 +4,21 @@
 // owner's `Iface` lists its own rows per kind in recording order, so a call reads its callee's rows
 // and module scope's instead of scanning every owner's. Depends on nothing.
 
-// One deferred demand: the type it is over (`on`), up to two operands (`a`, `b`, -1 when unused)
-// and a spelling (`s`), the node that recorded it, and the owner (-1 at module scope). Each kind's
-// constant says what its operands mean.
-export type Bound = { on: i32, a: i32, b: i32, site: i32, fn: i32, s: string }
+// One deferred demand: the type it is over (`on`), up to three operands (`a`, `b`, `c`, -1 when
+// unused), a spelling (`s`), the node that recorded it, the owner (-1 at module scope), a
+// check-order stamp (`seq`, -1 when unkept) and other nodes it stands for (`more`, `bndNoMore`
+// when none). Each kind's constant says what its operands mean.
+export type Bound = {
+  on: i32,
+  a: i32,
+  b: i32,
+  c: i32,
+  site: i32,
+  fn: i32,
+  s: string,
+  seq: i32,
+  more: i32[],
+}
 
 // One owner's rows per kind, each list ascending.
 export type Iface = {
@@ -17,6 +28,10 @@ export type Iface = {
   nest: i32[],
   isTest: i32[],
   ret: i32[],
+  write: i32[],
+  method: i32[],
+  member: i32[],
+  ufcs: i32[],
 }
 
 // A `print` of a type touching a hole, re-asked at the pin against the print floors.
@@ -31,6 +46,23 @@ export const BND_IS = 3
 // `a` does: a hole on the declared side alone has no cast to write, so it is exempt from the
 // newtype rule. `site` is the returned expression.
 export const BND_RET = 4
+// A write of `on` into a binding or place of type `a` in a generic body, where `assignable` is
+// vacuous and a return's bound cannot see it (D572). `s` names the binding ("" for a place) and
+// picks the sentence; `seq` orders it with `BND_BM`. Owner `CSTR_DELIVERY_ONLY` is judged only by
+// a delivery of the binding.
+export const BND_LET = 5
+// A builtin method argument `on` delivered where `a` is expected: a builtin has no declaration for
+// an argument bound to name (D582). `b` is the other type its sentence names (-1 when none), `c`
+// the method's form, `s` its label and `seq` its order with `BND_LET`.
+export const BND_BM = 6
+// A member read, index or layout constant `s` on a receiver of type `on` touching a hole (D1431):
+// `a` is 1 when it asks a demand, refused in the inference hole's words, and 0 when it asks a
+// classification that keeps the direct spelling's sentence.
+export const BND_MEM = 7
+// A `self`-function call `s` whose receiver `on` touches a hole, selected by name alone in the
+// body (D1005). `a` is the selected function's parameter-0 type (-1 for an overloaded call);
+// `more` lists the other call nodes the row stands for.
+export const BND_UFCS = 8
 
 // One flat log per kind: a nested list of records is far costlier for the compiler to compile.
 let printLog: Bound[] = []
@@ -38,9 +70,16 @@ let arrDefLog: Bound[] = []
 let nestLog: Bound[] = []
 let isLog: Bound[] = []
 let retLog: Bound[] = []
+let letLog: Bound[] = []
+let bmLog: Bound[] = []
+let memLog: Bound[] = []
+let ufcsLog: Bound[] = []
 let ifaces: Iface[] = []
 let ifaceSlot: {[i32]: i32} = Map()
 const bndNone: i32[] = []
+
+// The `more` of a bound that stands for no other node; never pushed onto.
+export const bndNoMore: i32[] = []
 
 // Clears every log and record (called from `initChecker`).
 export function ifaceReset() {
@@ -49,6 +88,10 @@ export function ifaceReset() {
   nestLog = []
   isLog = []
   retLog = []
+  letLog = []
+  bmLog = []
+  memLog = []
+  ufcsLog = []
   ifaces = []
   ifaceSlot = Map()
   return 0
@@ -65,6 +108,10 @@ function ifaceAt(fn: i32): Iface {
     nest: [],
     isTest: [],
     ret: [],
+    write: [],
+    method: [],
+    member: [],
+    ufcs: [],
   }
   ifaceSlot[fn] = ifaces.length
   ifaces.push(f)
@@ -78,6 +125,10 @@ function bndLog(k: i32): Bound[] {
   if k == BND_NEST { return nestLog }
   if k == BND_IS { return isLog }
   if k == BND_RET { return retLog }
+  if k == BND_LET { return letLog }
+  if k == BND_BM { return bmLog }
+  if k == BND_MEM { return memLog }
+  if k == BND_UFCS { return ufcsLog }
   return []
 }
 
@@ -88,6 +139,10 @@ function ifaceRows(f: Iface, k: i32): i32[] {
   if k == BND_NEST { return f.nest }
   if k == BND_IS { return f.isTest }
   if k == BND_RET { return f.ret }
+  if k == BND_LET { return f.write }
+  if k == BND_BM { return f.method }
+  if k == BND_MEM { return f.member }
+  if k == BND_UFCS { return f.ufcs }
   return []
 }
 
@@ -114,6 +169,14 @@ export function bndTruncate(k: i32, n: i32) {
     if b != null { ifaceRows(ifaceAt(b.fn), k).pop() }
   }
   return 0
+}
+
+// Whether any bound of kind `k`, of any owner, sits at node `site`.
+export function bndSiteHas(k: i32, site: i32): boolean {
+  for b in bndLog(k) {
+    if b.site == site { return true }
+  }
+  return false
 }
 
 // Owner `fn`'s rows of kind `k`, ascending; a caller must not change the list.

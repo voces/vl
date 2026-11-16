@@ -3,7 +3,14 @@
 // call's argument, return, binding and method constraints, and the `if` joins a type
 // parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
 
-import { BND_RET, bndAt, bndCount, bndNextRow } from "./check_iface"
+import {
+  BND_BM,
+  BND_LET,
+  BND_RET,
+  bndAt,
+  bndCount,
+  bndNextRow,
+} from "./check_iface"
 import { rangeVarFits } from "./check_range_var"
 import { cwIxCovers, cwPeelValue } from "./check_write_scan"
 import { recFreshDeclOf } from "./check_rec_fresh"
@@ -183,11 +190,9 @@ import {
   CV_LET,
   CV_RET,
   argCstr,
-  bmCstr,
   cstrOwnerTop,
   cvNow,
   cvPick,
-  letCstr,
   noteArgCstrAt,
   noteBmCstr,
   noteLetCstr,
@@ -1031,7 +1036,7 @@ export function genFnValueCstrs(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // With no generic or hole-typed lambda declared, or no function type at the destination, there
   // is nothing to bind.
   const anyCand = cstrCandAny || valBindLambda.length > 0
-  if genFnCstrBusy || !anyCand || !tyMayHoldFn(dstTy, 0) { return 0 }
+  if genFnCstrBusy || !anyCand || !tyMayHoldFn(dstTy) { return 0 }
   genFnCstrBusySet(true)
   genFnValueCstrsAt(srcExpr, srcTy, dstTy, 0)
   genFnCstrBusySet(false)
@@ -1194,15 +1199,24 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
     + tyToStr(dstTy)
     + ")"
   let ci = 0
-  while ci < bmCstr.got.length {
-    if ctnWrDeclOf(bmCstr.ix[ci]) == d && !ctnCutKills(bmCstr.ix[ci]) {
-      const bg = substTyDeep(bmCstr.got[ci], bNames, bTys)
-      const bw = substTyDeep(bmCstr.want[ci], bNames, bTys)
-      let bc = bmCstr.ctx[ci]
+  while ci < bndCount(BND_BM) {
+    if (
+      ctnWrDeclOf(bndAt(BND_BM, ci).site) == d
+      && !ctnCutKills(bndAt(BND_BM, ci).site)
+    ) {
+      const bg = substTyDeep(bndAt(BND_BM, ci).on, bNames, bTys)
+      const bw = substTyDeep(bndAt(BND_BM, ci).a, bNames, bTys)
+      let bc = bndAt(BND_BM, ci).b
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
       if !tyHasHole(bg) && !tyHasHole(bw) {
-        if !bmArgPred(bmCstr.form[ci], bg, bw, bmCstr.ix[ci]) {
-          const m = bmArgMsg(bmCstr.form[ci], bmCstr.label[ci], bg, bw, bc)
+        if !bmArgPred(bndAt(BND_BM, ci).c, bg, bw, bndAt(BND_BM, ci).site) {
+          const m = bmArgMsg(
+            bndAt(BND_BM, ci).c,
+            bndAt(BND_BM, ci).s,
+            bg,
+            bw,
+            bc,
+          )
           tErr(m + at, srcExpr)
           return 0
         }
@@ -1211,13 +1225,22 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
     ci = ci + 1
   }
   ci = 0
-  while ci < letCstr.got.length {
-    if ctnWrDeclOf(letCstr.ix[ci]) == d && !ctnCutKills(letCstr.ix[ci]) {
-      const lg = substTyDeep(letCstr.got[ci], bNames, bTys)
-      const lw = substTyDeep(letCstr.want[ci], bNames, bTys)
+  while ci < bndCount(BND_LET) {
+    if (
+      ctnWrDeclOf(bndAt(BND_LET, ci).site) == d
+      && !ctnCutKills(bndAt(BND_LET, ci).site)
+    ) {
+      const lg = substTyDeep(bndAt(BND_LET, ci).on, bNames, bTys)
+      const lw = substTyDeep(bndAt(BND_LET, ci).a, bNames, bTys)
       if !tyHasHole(lg) && !tyHasHole(lw) {
-        if !assignableExpr(letCstr.ix[ci], lg, lw) {
-          const m = letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
+        if !assignableExpr(bndAt(BND_LET, ci).site, lg, lw) {
+          const m = letAssignMsg(
+            bndAt(BND_LET, ci).site,
+            lg,
+            lw,
+            bndAt(BND_LET, ci).s,
+            -1,
+          )
           tErr(m + at, srcExpr)
           return 0
         }
@@ -3148,7 +3171,8 @@ function lambdaCopyOnly(got: i32, want: i32): boolean {
 // on the function the binding holds and types the members' join, so it does not ask this row.
 // One typed ahead of the lambda's check cannot, and a binding handed on is judged by the row.
 function letLamJudgedAtCall(ci: i32, c: i32): boolean {
-  const lx = letCstr.ix[ci]
+  const lx = bndAt(BND_LET, ci).site
+  if lx < 0 || lx >= P.nodes.length { return false }
   const ln = nodeAt(lx)
   if !(ln is FuncDecl) || ln.fnName != "" || holeSetEarlyLamHas(lx) {
     return false
@@ -3173,20 +3197,25 @@ export function validateLetCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrigL = letCstr.got.length
   const cvWas = cvNow
-  let ci = 0
-  while ci < nOrigL {
+  const n = bndCount(BND_LET)
+  let ci = bndNextRow(BND_LET, calleeFn, -1, n)
+  while ci < n {
     if (
-      cstrOwnedBy(letCstr.fn[ci], calleeFn)
-      && !lambdaCopyOnly(letCstr.got[ci], letCstr.want[ci])
-      && !nestCstrOutside(letCstr.ix[ci])
+      cstrOwnedBy(bndAt(BND_LET, ci).fn, calleeFn)
+      && !lambdaCopyOnly(bndAt(BND_LET, ci).on, bndAt(BND_LET, ci).a)
+      && !nestCstrOutside(bndAt(BND_LET, ci).site)
       && !wrUnreachedBy(ci, ix, calleeFn)
-      && !ctnWrUnreachedBy(letCstr.ix[ci], letCstr.got[ci], letCstr.fn[ci], ix)
+      && !ctnWrUnreachedBy(
+        bndAt(BND_LET, ci).site,
+        bndAt(BND_LET, ci).on,
+        bndAt(BND_LET, ci).fn,
+        ix,
+      )
     ) {
       cvNow = cvPick(CV_LET, ci, cvWas)
-      const lg = substTyDeep(letCstr.got[ci], bNames, bTys)
-      const lw = substTyDeep(letCstr.want[ci], bNames, bTys)
+      const lg = substTyDeep(bndAt(BND_LET, ci).on, bNames, bTys)
+      const lw = substTyDeep(bndAt(BND_LET, ci).a, bNames, bTys)
       // Re-records only when the callee is named, for the same ownership reason
       // `validateRetCstrs` gates on; also gated on either side holding a hole.
       if (
@@ -3194,9 +3223,9 @@ export function validateLetCstrs(
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if lg != letCstr.got[ci] || lw != letCstr.want[ci] {
+        if lg != bndAt(BND_LET, ci).on || lw != bndAt(BND_LET, ci).a {
           if tyHasHole(lg) || tyHasHole(lw) {
-            noteLetCstr(lg, lw, letCstr.ix[ci], letCstr.name[ci])
+            noteLetCstr(lg, lw, bndAt(BND_LET, ci).site, bndAt(BND_LET, ci).s)
           }
         }
       }
@@ -3209,17 +3238,29 @@ export function validateLetCstrs(
       ) {
         if (
           clash
-          || !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys, false)
+          || !litPinAssignable(bndAt(BND_LET, ci).site, lg, lw, bNames, bTys, false)
         ) {
           // A destination one member of a value called at several signatures fits (D15146).
           const member = !clash
-            && bundleMemberFits(letCstr.got[ci], lw, bNames, bTys, ix)
+            && bundleMemberFits(
+            bndAt(BND_LET, ci).on,
+            lw,
+            bNames,
+            bTys,
+            ix,
+          )
           if !member {
             let lWho = "the callee's body"
             if who != "" { lWho = "the body of `" + who + "`" }
             tErr(
-              letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
-                + litLetStoreNote(letCstr.ix[ci], lg, lw)
+              letAssignMsg(
+                bndAt(BND_LET, ci).site,
+                lg,
+                lw,
+                bndAt(BND_LET, ci).s,
+                -1,
+              )
+                + litLetStoreNote(bndAt(BND_LET, ci).site, lg, lw)
                 + " ("
                 + lWho
                 + " at the call's argument types)",
@@ -3229,7 +3270,7 @@ export function validateLetCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_LET, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -3246,19 +3287,24 @@ export function validateBmCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrigB = bmCstr.got.length
   const cvWas = cvNow
-  let ci = 0
-  while ci < nOrigB {
+  const n = bndCount(BND_BM)
+  let ci = bndNextRow(BND_BM, calleeFn, -1, n)
+  while ci < n {
     if (
-      cstrOwnedBy(bmCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(bmCstr.ix[ci])
-      && !ctnWrUnreachedBy(bmCstr.ix[ci], bmCstr.got[ci], bmCstr.fn[ci], ix)
+      cstrOwnedBy(bndAt(BND_BM, ci).fn, calleeFn)
+      && !nestCstrOutside(bndAt(BND_BM, ci).site)
+      && !ctnWrUnreachedBy(
+        bndAt(BND_BM, ci).site,
+        bndAt(BND_BM, ci).on,
+        bndAt(BND_BM, ci).fn,
+        ix,
+      )
     ) {
       cvNow = cvPick(CV_BM, ci, cvWas)
-      const bg = substTyDeep(bmCstr.got[ci], bNames, bTys)
-      const bw = substTyDeep(bmCstr.want[ci], bNames, bTys)
-      let bc = bmCstr.ctx[ci]
+      const bg = substTyDeep(bndAt(BND_BM, ci).on, bNames, bTys)
+      const bw = substTyDeep(bndAt(BND_BM, ci).a, bNames, bTys)
+      let bc = bndAt(BND_BM, ci).b
       if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
       // Re-records only when the callee is named — an unnamed call cannot reassign
       // ownership of the constraint.
@@ -3267,30 +3313,38 @@ export function validateBmCstrs(
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if bg != bmCstr.got[ci] || bw != bmCstr.want[ci] {
+        if bg != bndAt(BND_BM, ci).on || bw != bndAt(BND_BM, ci).a {
           if tyHasHole(bg) || tyHasHole(bw) {
             noteBmCstr(
-              bmCstr.form[ci],
-              bmCstr.label[ci],
+              bndAt(BND_BM, ci).c,
+              bndAt(BND_BM, ci).s,
               bg,
               bw,
               bc,
-              bmCstr.ix[ci],
+              bndAt(BND_BM, ci).site,
             )
           }
         }
       }
-      if !tyHasHole(bg) && !elabSlotSetHolds(bmCstr.want[ci], bmCstr.ix[ci]) {
+      if (
+        !tyHasHole(bg)
+        && !elabSlotSetHolds(bndAt(BND_BM, ci).a, bndAt(BND_BM, ci).site)
+      ) {
         if !tyHasHole(bw) {
           const held = stampsHeld
           stampsHeldSet(true)
-          const fits = bmArgPred(bmCstr.form[ci], bg, bw, bmCstr.ix[ci])
+          const fits = bmArgPred(
+            bndAt(BND_BM, ci).c,
+            bg,
+            bw,
+            bndAt(BND_BM, ci).site,
+          )
           stampsHeldSet(held)
           if !fits {
             let bWho = "the callee's body"
             if who != "" { bWho = "the body of `" + who + "`" }
             tErr(
-              bmArgMsg(bmCstr.form[ci], bmCstr.label[ci], bg, bw, bc)
+              bmArgMsg(bndAt(BND_BM, ci).c, bndAt(BND_BM, ci).s, bg, bw, bc)
                 + " ("
                 + bWho
                 + " at the call's argument types)",
@@ -3300,7 +3354,7 @@ export function validateBmCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_BM, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -3718,7 +3772,7 @@ export function fvaAdaptListLit(ix: i32, listTy: i32): boolean {
   const lit = nodeAt(lix)
   if !(lit is ArrayLit) { return false }
   const la = tyAt(nonNullTy(listTy))
-  if !(la is TyArray) || !tyMayHoldFn(tyElemOf(la), 0) { return false }
+  if !(la is TyArray) || !tyMayHoldFn(tyElemOf(la)) { return false }
   for el in lit.arrElems {
     if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), tyElemOf(la)) }
   }
@@ -3777,7 +3831,7 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
   // A set's elements, or a hole parameter's, which an instance binds to one.
   const held = fnTagSetValueOfTy(tyElemOf(sa))
     || fnTagSetOfTy(tyElemOf(sa)) >= 0
-    || tyHasHole(tyElemOf(sa)) && tyMayHoldFn(tyElemOf(sa), 0)
+    || tyHasHole(tyElemOf(sa)) && tyMayHoldFn(tyElemOf(sa))
     || tyIsHole(tyElemOf(sa))
   if !held { return false }
   const pos = nodePos(site)
@@ -4354,7 +4408,7 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
   // A join typed at the destination still carries each tail's own function value.
   if fvaAdaptJoin(srcExpr, dstTy) { return srcTy != dstTy }
-  if srcTy == dstTy || !tyMayHoldFn(dstTy, 0) { return false }
+  if srcTy == dstTy || !tyMayHoldFn(dstTy) { return false }
   // A list of a function set at a readonly list of a closed function type is copied through
   // adapters, as at `assignableExpr`, for a field, element or assignment delivered here.
   const fdn = nonNullTy(dstTy)
