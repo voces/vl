@@ -295,6 +295,22 @@ function constLike(e: Expr): boolean {
   return false;
 }
 
+// A float tree that is no constant only because it holds a join of float constants
+// (`0.1 % (if c { 3.0 } else { 0.5 })`): typed toward its use as a constant is (4.3).
+function floatJoinTree(e: Expr): boolean {
+  const leaf = (x: Expr): boolean => {
+    if (isConstTree(x)) return treeHas(x, "float");
+    if (x.k === "un") return x.op === "-" && leaf(x.e);
+    if (x.k === "bin") return ["+", "-", "*", "/", "%"].includes(x.op) && (leaf(x.l) || isConstTree(x.l)) && (leaf(x.r) || isConstTree(x.r)) && (leaf(x.l) || leaf(x.r));
+    if (x.k === "if") {
+      const tail = (b: Stmt[] | null) => { const t = b && b.length ? b[b.length - 1] : null; return !!t && t.k === "expr" && leaf(t.e); };
+      return tail(x.t) && tail(x.f);
+    }
+    return false;
+  };
+  return !isConstTree(e) && leaf(e);
+}
+
 function isConstTree(e: Expr): boolean {
   if (isNumLit(e)) return true;
   if (e.k === "un") return (e.op === "-" || e.op === "~") && isConstTree(e.e);
@@ -304,6 +320,14 @@ function isConstTree(e: Expr): boolean {
 function negatedRadix(e: Expr): boolean {
   if (e.k === "un" && e.op === "-") return negatedRadix(e.e);
   return e.k === "int" && !!e.radix;
+}
+
+// Whether an arithmetic tree, constant or not, has a radix literal among its operands.
+function radixShaped(e: Expr): boolean {
+  if (e.k === "int") return !!e.radix;
+  if (e.k === "un") return (e.op === "-" || e.op === "~") && radixShaped(e.e);
+  return e.k === "bin" && ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"].includes(e.op) &&
+    (radixShaped(e.l) || radixShaped(e.r));
 }
 
 // Whether a constant tree holds a radix literal, or a float literal.
@@ -1204,10 +1228,10 @@ export class Interp {
         const c = this.asBool(this.eval(e.c, env, null), "if-condition");
         // E9.1 does not list `if`, so with no context its value is typed, not a constant.
         // An else-less `if` in value position is `T | null`: a false condition yields `null`.
-        const v = c ? this.blockValue(e.t, env, exp) : e.f ? this.blockValue(e.f, env, exp) : null;
         const other = c ? e.f : e.t;
         const ok = other && other.length ? other[other.length - 1] : null;
         const taken = c ? e.t : e.f, tk = taken && taken.length ? taken[taken.length - 1] : null;
+        const v = taken ? this.blockValue(taken, env, this.radixArmCtx(tk, ok, env, exp)) : null;
         return this.litJoin(v, tk, ok, env, exp);
       }
       case "block": return this.execBlock(e.body, new Env(env));
@@ -1713,8 +1737,14 @@ export class Interp {
       const shifted = (x: Expr) => !isConstTree(x) && x.k !== "if" && constLike(x);
       const pk = e.args.map((a) => shifted(a.e) || isConstTree(a.e) ? null : this.staticKind(a.e, env)).find((k) => k === "i32" || k === "i64")
         ?? (e.args.some((a) => { if (!isConstTree(a.e)) return false; const v = this.eval(a.e, env, null); return v instanceof Lit && v.i !== null && numKind(litDefault(v)) === "i64"; }) ? "i64" : null);
-      const args = pk && e.args.some((a) => shifted(a.e)) && !e.args.some((a) => a.name || a.e.k === "spread")
+      // 4.3: a float join, or a tree over one, beside a typed `f32` argument adopts f32 as a
+      // constant does.
+      const f32Peer = e.args.some((a) => !floatJoinTree(a.e) && !isConstTree(a.e) && this.staticKind(a.e, env) === "f32");
+      const plain = !e.args.some((a) => a.name || a.e.k === "spread");
+      const args = pk && e.args.some((a) => shifted(a.e)) && plain
         ? e.args.map((a) => this.eval(a.e, env, shifted(a.e) ? { k: "name", name: pk, args: [] } : null))
+        : f32Peer && plain && e.args.some((a) => floatJoinTree(a.e))
+        ? e.args.map((a) => this.eval(a.e, env, floatJoinTree(a.e) ? { k: "name", name: "f32", args: [] } : null))
         : this.evalArgs(e.args, env);
       const typed = args.some((a) => !(a instanceof Lit) && numKind(a) !== null);
       // D3043: a constant argument that does not fit the typed `i32` beside it makes the call i64.
@@ -1901,6 +1931,14 @@ export class Interp {
   // T3.6 at a value join (`if` or `match`): the taken arm's value `v` beside the other arm's
   // tail `ok`; `tk` is the taken tail. A constant arm adapts to the other arm's type, read from
   // its declaration since that arm did not run; one that cannot widens the join.
+  // 4.3: a join decides a radix tree's context before its destination does, so a tree that is not
+  // constant, beside a typed integer arm, runs at that arm's width (a constant one is re-run in
+  // `litJoin`). Otherwise the arm takes the join's own context `exp`.
+  radixArmCtx(tk: Stmt | null, ok: Stmt | null, env: Env, exp: Ty | null): Ty | null {
+    if (!tk || tk.k !== "expr" || isConstTree(tk.e) || !radixShaped(tk.e)) return exp;
+    const k = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
+    return k === "i32" || k === "i64" ? { k: "name", name: k, args: [] } : exp;
+  }
   litJoin(v: Val, tk: Stmt | null, ok: Stmt | null, env: Env, exp: Ty | null): Val {
     const kOther = ok && ok.k === "expr" ? this.staticKind(ok.e, env) : null;
     // 4.3 with Q9: a float constant arm that adopts an `f32` arm folds in f32 arithmetic, as
@@ -1916,7 +1954,9 @@ export class Interp {
     // pattern), and only then is the join widened. A constant tree is pure, so it runs again.
     if (
       exp && (kOther === "i32" || kOther === "i64") && tk && tk.k === "expr" && isConstTree(tk.e) &&
-      treeHas(tk.e, "radix")
+      treeHas(tk.e, "radix") &&
+      // D3043: a tree holding a decimal outside i32 is i64-wide, so an i32 arm widens to it instead
+      !(kOther === "i32" && v instanceof Lit && v.wideDec)
     ) {
       let r: Val;
       try { r = this.eval(tk.e, env, { k: "name", name: kOther, args: [] }); } catch (x) { if (x instanceof Trap) throw x; r = v; }
@@ -1990,10 +2030,12 @@ export class Interp {
         return this.isTest(v, p as Ty, env);
       });
       if (!hit) continue;
-      const r = Array.isArray(arm.body) ? this.execBlock(arm.body, new Env(env)) : this.eval(arm.body, env, exp);
       // 4.3: one join rule for every join form, so a `match` joins its arms as an `if` does.
-      const others = e.arms.filter((a) => a !== arm).map(armTail);
-      return this.litJoin(r, armTail(arm), this.joinPeer(others, env), env, exp);
+      const others = e.arms.filter((a) => a !== arm).map(armTail), peer = this.joinPeer(others, env);
+      const r = Array.isArray(arm.body)
+        ? this.execBlock(arm.body, new Env(env))
+        : this.eval(arm.body, env, this.radixArmCtx(armTail(arm), peer, env, exp));
+      return this.litJoin(r, armTail(arm), peer, env, exp);
     }
     throw new TypeFault("no match arm fits " + show(v));
   }

@@ -220,10 +220,12 @@ function mfrIndexedFns(x: i32): i32[] {
   let g = -1
   const leaves: i32[] = []
   for sd in seeds {
-    if !mfrDescendSteps(sd, steps, 0, 0, leaves) { return none }
+    const dpath: i32[] = []
+    if !mfrDescendSteps(sd, steps, 0, dpath, leaves) { return none }
   }
   for leaf in leaves {
-    const f = mfrLeafHeldFn(leaf, 0)
+    const lpath: i32[] = []
+    const f = mfrLeafHeldFn(leaf, lpath)
     if f < 0 || (g >= 0 && f != g) { return none }
     g = f
   }
@@ -287,21 +289,29 @@ function mfrCalledFnDecl(e: i32): i32 {
 
 // The function leaf `v` names, through `const` aliases and a parameter's argument at each call
 // (all of which must agree); -1 otherwise.
-function mfrLeafHeldFn(v: i32, hops: i32): i32 {
+function mfrLeafHeldFn(v: i32, path: i32[]): i32 {
   const f = cwHeldFnOf(v)
-  if f >= 0 || hops > 8 { return f }
+  if f >= 0 { return f }
   const x = parenPeelIx(v)
-  if x < 0 || !(nodeAt(x) is Ident) { return -1 }
+  if x < 0 || !(nodeAt(x) is Ident) || i32ListHas(path, x) { return -1 }
   const d = identDeclOf(x)
   const args: i32[] = []
   if d < 0 || !cwParamArgs(d, args) || args.length == 0 { return -1 }
   let g = -1
   for a in args {
-    const af = mfrLeafHeldFn(a, hops + 1)
+    const af = mfrLeafHeldFn(a, mfrPathWith(x, path))
     if af < 0 || (g >= 0 && af != g) { return -1 }
     g = af
   }
   return g
+}
+
+// Walk `path` extended by node `x`: a copy, so a sibling branch never sees it.
+function mfrPathWith(x: i32, path: i32[]): i32[] {
+  const out: i32[] = []
+  for p in path { out.push(p) }
+  out.push(x)
+  return out
 }
 
 // The nodes value `v` holds after `steps[i..]`, onto `out`: through `const` aliases, a parameter's
@@ -310,11 +320,11 @@ function mfrDescendSteps(
   v: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: i32[],
   out: i32[],
 ): boolean {
   const x = parenPeelIx(v)
-  if x < 0 || x >= P.nodes.length || hops > 16 { return false }
+  if x < 0 || x >= P.nodes.length || i32ListHas(path, x) { return false }
   if i >= steps.length {
     out.push(x)
     return true
@@ -336,12 +346,14 @@ function mfrDescendSteps(
         r = r + 1
       }
       if cwSlotWriteCount(cwBindingOf(x), rest) != 0 { return false }
-      return mfrDescendSteps(dn.letInit, steps, i, hops + 1, out)
+      return mfrDescendSteps(dn.letInit, steps, i, mfrPathWith(x, path), out)
     }
     const args: i32[] = []
     if !cwParamArgs(d, args) || args.length == 0 { return false }
     for a in args {
-      if !mfrDescendSteps(a, steps, i, hops + 1, out) { return false }
+      if !mfrDescendSteps(a, steps, i, mfrPathWith(x, path), out) {
+        return false
+      }
     }
     return true
   }
@@ -353,11 +365,13 @@ function mfrDescendSteps(
     collectRetValues(cfn.fnBody, rets)
     if rets.length == 0 { return false }
     for rv in rets {
-      if !mfrDescendSteps(rv, steps, i, hops + 1, out) { return false }
+      if !mfrDescendSteps(rv, steps, i, mfrPathWith(x, path), out) {
+        return false
+      }
     }
     return true
   }
-  return mfrDescendLit(x, steps, i, hops, out)
+  return mfrDescendLit(x, steps, i, path, out)
 }
 
 // One step of `mfrDescendSteps` into the list or record literal `x`.
@@ -365,7 +379,7 @@ function mfrDescendLit(
   x: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: i32[],
   out: i32[],
 ): boolean {
   const n = nodeAt(x)
@@ -378,20 +392,26 @@ function mfrDescendLit(
     let j = 0
     while j < n.arrElems.length {
       if "#" + i32ToStr(j) == st {
-        return mfrDescendSteps(n.arrElems[j], steps, i + 1, hops + 1, out)
+        return mfrDescendSteps(
+          n.arrElems[j],
+          steps,
+          i + 1,
+          mfrPathWith(x, path),
+          out,
+        )
       }
       j = j + 1
     }
     return false
   }
-  return mfrDescendObj(x, steps, i, hops, out)
+  return mfrDescendObj(x, steps, i, path, out)
 }
 
 function mfrDescendObj(
   x: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: i32[],
   out: i32[],
 ): boolean {
   const n = nodeAt(x)
@@ -400,11 +420,66 @@ function mfrDescendObj(
     const fi = nodeAt(f)
     if fi is FieldInit {
       if "f." + fi.fiName == steps[i] {
-        return mfrDescendSteps(fi.fiValue, steps, i + 1, hops + 1, out)
+        return mfrDescendSteps(
+          fi.fiValue,
+          steps,
+          i + 1,
+          mfrPathWith(x, path),
+          out,
+        )
       }
     }
   }
   return false
+}
+
+// Whether node `x` with steps `suffix` (`left` of them) closes a loop on walk `path`: the same
+// steps at a visit on the path is a cycle, and more steps than a visit there is a loop that
+// lengthens them. Other steps, at most as many as each visit's, go on, so a route stays finite.
+function mfrChainCycles(
+  x: i32,
+  left: i32,
+  suffix: string,
+  path: string[],
+): boolean {
+  const head = i32ToStr(x) + "|"
+  for e in path {
+    if e.length >= head.length && e.slice(0, head.length) == head {
+      const rest = e.slice(head.length, e.length)
+      if rest == suffix || mfrStepCount(rest) < left { return true }
+    }
+  }
+  return false
+}
+
+// How many steps a joined suffix holds: each step opens with `/`, which no step contains.
+function mfrStepCount(suffix: string): i32 {
+  let n = 0
+  let k = 0
+  while k < suffix.length {
+    if suffix[k] == "/"[0] { n = n + 1 }
+    k = k + 1
+  }
+  return n
+}
+
+// Walk `path` extended by node `x` with steps `suffix`: a copy, so a sibling branch never sees it.
+function mfrChainPathWith(x: i32, suffix: string, path: string[]): string[] {
+  const out: string[] = []
+  for e in path { out.push(e) }
+  out.push(i32ToStr(x) + "|" + suffix)
+  return out
+}
+
+// The steps from `i` on, joined.
+function mfrChainSuffix(steps: string[], i: i32): string {
+  let s = ""
+  let r = i
+  while r < steps.length {
+    s = s + "/" + steps[r]
+    r = r + 1
+  }
+  return s
 }
 
 // The one function read `x` holds along every link of its value chain: a written binding holds
@@ -427,7 +502,8 @@ export function mfrChainFns(x: i32): i32[] {
   if rd < 0 || rd >= P.nodes.length || !(nodeAt(rd) is LetDecl) { return none }
   const leaves: i32[] = []
   const steps: string[] = []
-  if !mfrChainDescend(x, steps, 0, 0, leaves) { return none }
+  const cpath: string[] = []
+  if !mfrChainDescend(x, steps, 0, cpath, leaves) { return none }
   let g = -1
   for f in leaves {
     if g >= 0 && f != g { return none }
@@ -471,11 +547,17 @@ function mfrChainDescend(
   v: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: string[],
   out: i32[],
 ): boolean {
   const x = parenPeelIx(v)
-  if x < 0 || x >= cwIxCoveredLen() || hops > 24 { return false }
+  if (
+    x < 0
+    || x >= cwIxCoveredLen()
+    || mfrChainCycles(x, steps.length - i, mfrChainSuffix(steps, i), path)
+  ) {
+    return false
+  }
   // A parenthesised name taken as a value is not instanced where it is built (D4120).
   if x != v && i >= steps.length && nodeAt(x) is Ident { return false }
   const st = mfrChainStep(x)
@@ -487,25 +569,43 @@ function mfrChainDescend(
       more.push(steps[r])
       r = r + 1
     }
-    return mfrChainDescend(mfrChainStepObj(x), more, 0, hops + 1, out)
+    return mfrChainDescend(
+      mfrChainStepObj(x),
+      more,
+      0,
+      mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+      out,
+    )
   }
   const n = nodeAt(x)
-  if n is Ident { return mfrChainIdent(x, steps, i, hops, out) }
+  if n is Ident { return mfrChainIdent(x, steps, i, path, out) }
   if n is BinExpr {
     if n.binOp != "??" { return false }
-    return mfrChainDescend(n.binLeft, steps, i, hops + 1, out)
-      && mfrChainDescend(n.binRight, steps, i, hops + 1, out)
+    return mfrChainDescend(
+      n.binLeft,
+      steps,
+      i,
+      mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+      out,
+    )
+      && mfrChainDescend(
+      n.binRight,
+      steps,
+      i,
+      mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+      out,
+    )
   }
-  if n is Call { return mfrChainCall(x, steps, i, hops, out) }
+  if n is Call { return mfrChainCall(x, steps, i, path, out) }
   if i >= steps.length { return false }
-  return mfrChainLit(x, steps, i, hops, out)
+  return mfrChainLit(x, steps, i, path, out)
 }
 
 function mfrChainIdent(
   x: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: string[],
   out: i32[],
 ): boolean {
   const d = identDeclOf(x)
@@ -564,7 +664,15 @@ function mfrChainIdent(
       if nw < 0 || (idx && nw != 0) { return false }
       if !idx {
         for w in sv {
-          if !mfrChainDescend(w, steps, steps.length, hops + 1, out) {
+          if (
+            !mfrChainDescend(
+              w,
+              steps,
+              steps.length,
+              mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+              out,
+            )
+          ) {
             return false
           }
         }
@@ -572,7 +680,17 @@ function mfrChainIdent(
     }
   }
   for w in vals {
-    if !mfrChainDescend(w, steps, i, hops + 1, out) { return false }
+    if (
+      !mfrChainDescend(
+        w,
+        steps,
+        i,
+        mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+        out,
+      )
+    ) {
+      return false
+    }
   }
   return true
 }
@@ -582,7 +700,7 @@ function mfrChainCall(
   x: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: string[],
   out: i32[],
 ): boolean {
   const n = nodeAt(x)
@@ -604,7 +722,17 @@ function mfrChainCall(
   collectRetValues(fn.fnBody, rets)
   if rets.length == 0 { return false }
   for rv in rets {
-    if !mfrChainDescend(rv, steps, i, hops + 1, out) { return false }
+    if (
+      !mfrChainDescend(
+        rv,
+        steps,
+        i,
+        mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+        out,
+      )
+    ) {
+      return false
+    }
   }
   return true
 }
@@ -614,7 +742,7 @@ function mfrChainLit(
   x: i32,
   steps: string[],
   i: i32,
-  hops: i32,
+  path: string[],
   out: i32[],
 ): boolean {
   const n = nodeAt(x)
@@ -627,7 +755,13 @@ function mfrChainLit(
     let j = 0
     while j < n.arrElems.length {
       if "#" + i32ToStr(j) == st {
-        return mfrChainDescend(n.arrElems[j], steps, i + 1, hops + 1, out)
+        return mfrChainDescend(
+          n.arrElems[j],
+          steps,
+          i + 1,
+          mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+          out,
+        )
       }
       j = j + 1
     }
@@ -638,7 +772,13 @@ function mfrChainLit(
     const fi = nodeAt(f)
     if !(fi is FieldInit) { return false }
     if "f." + fi.fiName == st {
-      return mfrChainDescend(fi.fiValue, steps, i + 1, hops + 1, out)
+      return mfrChainDescend(
+        fi.fiValue,
+        steps,
+        i + 1,
+        mfrChainPathWith(x, mfrChainSuffix(steps, i), path),
+        out,
+      )
     }
   }
   return false
