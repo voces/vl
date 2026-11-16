@@ -21329,8 +21329,11 @@ function eplFind(a: i32): i32 {
 function eplRoot(n: i32): i32 { return eplRootK(n, eplKeyFor(n)) }
 
 // The instance a declaration's place is keyed at while edges of instance `EPL.k` are drawn.
-function eplKeyFor(d: i32): i32 {
-  const fd = if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl { d } else { recEnclosingFn(d) }
+function eplKeyFor(d0: i32): i32 {
+  // A declaration minted after the write index (by a mono rewrite) is keyed as its source.
+  const d = if d0 >= cwIxCoveredLen() { eplSrcHolder(d0) } else { d0 }
+  if d < 0 { return -1 }
+  const fd = if d < P.nodes.length && nodeAt(d) is FuncDecl { d } else { recEnclosingFn(d) }
   return eplKeyOfFn(fd)
 }
 
@@ -21362,11 +21365,10 @@ function eplKeyOfFn(fd0: i32): i32 {
 // Whether a reader built the classes during this compile's elaboration.
 let eplAsked = false
 
-// Rebuilds stale classes the elaboration asked for, so that a later reader (mono) sees them as
-// the elaboration left the program, before any rewrite folds a read away. A program whose
-// elaboration never asked is not built for the whole program here.
+// Rebuilds stale classes before mono, so that mono's readers see them as the elaboration left the
+// program, before any rewrite folds a read away.
 function eplEnsure() {
-  if EPL.stale && eplAsked {
+  if EPL.stale {
     eplBuild()
     EPL.stale = false
   }
@@ -22838,20 +22840,26 @@ function eplSlotDelivered(holder: i32, path: string[], omit: i32[]): boolean {
 
 // The closed function types slot `path` of `holder` is delivered at in instance `k` (every
 // instance at -1): each bound its value reaches, then, unless `annOnly`, each closed call through
-// it or a copy at its arguments' and result's types in the instance it ran. Each type once; a
-// type of another arity than the slot's own is left out.
+// it or a copy that `omit` does not list, at its arguments' and result's types in the instance it
+// ran. Each type once; a type of another arity than the slot's own is left out.
 export function eplSlotDeliveredTys(
   holder: i32,
   path: string[],
   k: i32,
   annOnly: boolean,
+  omit: i32[],
 ): i32[] {
   const out: i32[] = []
   const k0 = EPL.k
-  const p = eplSlotPlace(holder, path, k)
-  for c in if p >= 0 { eplReach(p, true) } else { [] } {
-    const b = eplBoundOf(c)
-    if b >= 0 && tyAt(b) is TyFunc && !i32ListHas(out, b) { out.push(b) }
+  // A slot in an instanced function, read for every instance, gathers each instance's bounds.
+  const ks0 = if k < 0 { eplFrameKeysOf(holder) } else { [] }
+  const ks: i32[] = if ks0.length > 0 { ks0 } else { [k] }
+  for kk in ks {
+    const p = eplSlotPlace(holder, path, kk)
+    for c in if p >= 0 { eplReach(p, true) } else { [] } {
+      const b = eplBoundOf(c)
+      if b >= 0 && tyAt(b) is TyFunc && !i32ListHas(out, b) { out.push(b) }
+    }
   }
   EPL.k = k0
   if !annOnly {
@@ -22859,17 +22867,31 @@ export function eplSlotDeliveredTys(
     for ci in eplSlotCallRecs(holder, path, k, none) {
       const cn = nodeAt(EPL.callNode[ci])
       const ck = EPL.callKey[ci]
-      if cn is Call && (k < 0 || ck < 0 || eplKeyAdmits(k, ck)) {
+      const admitted = k < 0 || ck < 0 || eplKeyAdmits(k, ck)
+      // Read for every instance, a call is typed where all its instances agree, as the check left
+      // its holes open.
+      const agreed = if k < 0 && cn is Call { elabCallArgTysAgreed(EPL.callNode[ci]) } else { [] }
+      const ar = if k < 0 && cn is Call { elabNodeTyAgreed(EPL.callNode[ci]) } else { -1 }
+      if cn is Call && admitted && !i32ListHas(omit, EPL.callNode[ci]) && agreed.length == cn.callArgs.length && ar >= 0 {
+        const ft = mkFuncTy(agreed, ar)
+        if !i32ListHas(out, ft) { out.push(ft) }
+      } else if cn is Call && admitted && !i32ListHas(omit, EPL.callNode[ci]) {
         const tys: i32[] = []
         for a in cn.callArgs {
           const t = eplArgTy(ci, a)
-          if t >= 0 && t < T.tys.length && !tyHasTyVar(t) {
+          if t >= 0 && t < T.tys.length && !tyHasTyVar(t) && !tyReachesHole(t, 16) {
             tys.push(widenLitTy(t))
           }
         }
         const rt0 = if ck >= 0 { elabNodeTy(EPL.callNode[ci], ck) } else { -1 }
         const rt = if rt0 >= 0 { rt0 } else { nodeTyIxOf(EPL.callNode[ci]) }
-        if tys.length == cn.callArgs.length && rt >= 0 && !tyHasTyVar(rt) {
+        // A call is a delivery only where its arguments and its result are closed.
+        if (
+          tys.length == cn.callArgs.length
+          && rt >= 0
+          && !tyHasTyVar(rt)
+          && !tyReachesHole(rt, 16)
+        ) {
           const ft = mkFuncTy(tys, rt)
           if !i32ListHas(out, ft) { out.push(ft) }
         }
@@ -22894,7 +22916,8 @@ export function eplSlotDeliveredTys(
 // once; an open result answers nothing.
 export function eplSlotAnnRets(holder: i32, path: string[], k: i32): i32[] {
   const out: i32[] = []
-  for t in eplSlotDeliveredTys(holder, path, k, true) {
+  const none: i32[] = []
+  for t in eplSlotDeliveredTys(holder, path, k, true, none) {
     const ft = tyAt(t)
     const r = if ft is TyFunc { ft.fnRet } else { -1 }
     if r >= 0 && !tyHasTyVar(r) && !tyReachesHole(r, 8) && !i32ListHas(out, r) {
