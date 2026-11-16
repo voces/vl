@@ -13831,7 +13831,11 @@ function elabSlotFacts() {
   let ix = 0
   while ix < P.nodes.length {
     const n = nodeAt(ix)
-    if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
+    // A call argument holding an open function is a holder, as a binding of it is (D16816).
+    const argCall = eplArgHoldsCallFn(ix)
+      && cwIxCovers(ix)
+      && cwIxUpKind[ix] == CW_UP_ARG
+    if argCall || n is LetDecl && n.letType < 0 && n.letInit >= 0 {
       const t = nodeTyIxOf(ix)
       if elabSlotOpenFn(t) || elabSlotWholeFn(t) {
         // A binding in an instanced function's body is closed per instance only: a program-level
@@ -18422,17 +18426,25 @@ export function elabNodeTyOrChecked(ix: i32, fnIx: i32): i32 {
     && e < T.tys.length
     && nodeAt(x) is Call
     && tyAt(e) is TyFunc
-    && (tyHoldsHole(e) || tyHasTyVar(e) || !elabTyClosed(e, 0))
+    && tyHoldsHole(e)
   if e >= 0 && !eOpen { return e }
   const ck = nodeTyIxOf(x)
-  if !eOpen && ck >= 0 && ck < T.tys.length && elabTyClosed(ck, 0) && !tyHasTyVar(ck) {
+  if (
+    !eOpen
+    && ck >= 0
+    && ck < T.tys.length
+    && elabTyClosed(ck, 0)
+    && !tyHasTyVar(ck)
+  ) {
     return ck
   }
   const r = if fnIx < 0 || elabKeyAt(fnIx) == -1 { elabRootArgParamTy(x, ck) } else { 0 - 1 }
   if r >= 0 { return r }
   if tyHoldsObj(tyArrayElemIx(ck), 8) { return if eOpen { e } else { -1 } }
   const h = elabHeldValTy(x, fnIx)
-  if h >= 0 && h < T.tys.length && elabTyClosed(h, 0) && !tyHasTyVar(h) { return h }
+  if h >= 0 && h < T.tys.length && elabTyClosed(h, 0) && !tyHasTyVar(h) {
+    return h
+  }
   return if eOpen { e } else { -1 }
 }
 
@@ -18672,8 +18684,7 @@ export function elabHeldValTy(x0: i32, fnIx: i32): i32 {
     const cd = if cf >= 0 && cf < P.nodes.length && nodeAt(cf) is Ident { identFnDeclOf(cf) } else { -1 }
     const ct = if cd >= 0 { elabSlotTyAt(cd, [], -1) } else { -1 }
     if ct >= 0 { return ct }
-    const eh = if fnIx < 0 { eplHolderTy(x, -1) } else { 0 - 1 }
-    return if eh >= 0 && elabTyClosed(eh, 0) && !tyHasTyVar(eh) { eh } else { -1 }
+    return elabSlotTyAt(x, [], fnIx)
   }
   const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { -1 }
   if k < -1 { return -1 }
@@ -22500,11 +22511,18 @@ function eplEdgeAt(u: i32) {
             if cn.memProp == "filter" { eplUnion(eplRoot(up), rp) }
           }
         } else {
+          // A call's function value handed on is held at the argument, as a binding holds it, so
+          // each call's value keeps its own class (D16816).
+          let src = eplPlaceOf(u, 0)
+          if eplArgHoldsCallFn(u) {
+            eplEdge(src, eplRoot(u), u)
+            src = eplRoot(u)
+          }
           for fd in elabCalleeFns(un) {
             const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
             if fn is FuncDecl && ai >= 0 && ai < fn.fnParams.length {
               for ck in eplCallTargets(up, fd, EPL.k) {
-                eplEdge(eplPlaceOf(u, 0), eplRootK(fn.fnParams[ai], ck), u)
+                eplEdge(src, eplRootK(fn.fnParams[ai], ck), u)
               }
             }
           }
@@ -22523,6 +22541,19 @@ function eplEdgeAt(u: i32) {
     }
   }
   return 0
+}
+
+// Whether argument `u` is a call, pinned by its own arguments (`elabDeclPinnedByCall`), whose value
+// is a function with a hole the check left open: a maker's lambda, closed where it is called.
+function eplArgHoldsCallFn(u: i32): boolean {
+  const x = parenPeelIx(u)
+  const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(c is Call) || c.callFn < 0 { return false }
+  const f = parenPeelIx(c.callFn)
+  const d = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
+  if !elabDeclPinnedByCall(d) { return false }
+  const t = nodeTyIxOf(x)
+  return t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && tyHoldsHole(t)
 }
 
 // The argument type of call record `ci`'s argument `a`, at the instance it ran in.
@@ -22853,12 +22884,12 @@ function eplPathPlus(path: string[], step: string): string[] {
 
 // The instance of member `d` at `ps` under the instance of `d`'s enclosing function that the
 // holder's value, one call of that function, runs: each such call builds its own closure, so a
-// sibling call's instance is not this holder's (D16815). -1 when the holder holds no such call.
+// sibling call's instance is not this holder's (D16815). The holder is a binding of the call or the
+// call itself, an argument. -1 when the holder holds no such call.
 function eplHolderCallMember(d: i32, ps: i32[]): i32 {
   const h = EPL.holder
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
-  if !(hn is LetDecl) || hn.letInit < 0 { return -1 }
-  const c = parenPeelIx(hn.letInit)
+  const c = if hn is LetDecl { parenPeelIx(hn.letInit) } else if hn is Call { h } else { -1 }
   const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
   if !(cn is Call) || cn.callFn < 0 { return -1 }
   const f = parenPeelIx(cn.callFn)
@@ -23425,9 +23456,7 @@ function eplHolderTy(ix: i32, k: i32): i32 {
   EPL.k = k
   const te = if k >= 0 { elabNodeTy(ix, k) } else { -1 }
   const t = if te >= 0 && tyHasTyVar(te) { te } else { nodeTyIxOf(ix) }
-  // A call's value is the place its callee's result is: `eplCallPlace`.
-  const cn = nodeAt(ix)
-  const root = if cn is Call { eplCallPlace(cn, ix, parenPeelIx(cn.callFn)) } else { eplRoot(ix) }
+  const root = eplRoot(ix)
   const none: string[] = []
   EPL.holder = ix
   const r = if root >= 0 { eplRebuild(root, t, 0, none) } else { -1 }
