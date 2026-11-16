@@ -61,6 +61,18 @@ At -O3 (`VL_WASM_OPT=node_modules/.bin/wasm-opt`), `struct.new` counted with `wa
 | old value held in a binding, read after | — | 0 | same |
 | old value captured, or stored in another record | — | 1 | same |
 
+Corpus, at -O3 against master `e1f7f37c`. The population is the 1,846 programs under
+`tests/cases`, distilled `cells/` and `named/`, and `bench/` that initialise a top-level record
+(of the 4,571 that match the shape, the 700 with a nested literal plus 1,430 scanned before the
+filter was narrowed; the narrower filter caught 83 of the 84 refusals the wide scan had found):
+
+- 125 programs met the constant-expression refusal on master. 71 now inline more fields and
+  print the same output at -O3 as unoptimised (71 of 71). One is still refused: its operand is
+  not a `struct.new`. The other 53 now refuse those fields for a different reason, such as a
+  whole read, so their inline count is unchanged.
+- Of a 300-program control sample, 246 built on both sides, with 246 byte-identical modules and
+  no exit-code change. The other 54 are programs that refuse to compile on both seeds.
+
 ## Precision limits
 
 - A record type with a `struct.set` anywhere in its subtyping component is never inlined, even
