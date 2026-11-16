@@ -1,12 +1,19 @@
 // The heap-identity shadow (rep ADT stage 4a): groups each heap table's rows by the rep id of their
 // arena types and counts the merges a rep-keyed `heapOf` would make, split by whether the merged
-// struct rows store the same layout, a field's element compared by its type's rep id. A different
-// layout is named by class: a function field's storage, or a hole or generic instance. Armed with
-// the rep shadow (`$VL_REP_SHADOW`); unarmed it is one boolean test, and it moves no emitted byte.
+// struct rows share a heap today: one layout, elements compared by rep id, under today's heap key.
+// A different one is named by class: a discriminating arm row, a function field's storage, or a
+// hole or generic instance. Armed with the rep shadow (`$VL_REP_SHADOW`); unarmed it is one
+// boolean test, and it moves no emitted byte.
 
 import { i32ToStr } from "./ast"
 import { repABNote } from "./emit_nullable_rets"
-import { repRowAtTyVar, repShadowOn } from "./emit_rep"
+import {
+  repRowAtTyVar,
+  repRowHoldsFn,
+  repShadowOn,
+  slotHeapId,
+  structFieldCodesEq,
+} from "./emit_rep"
 import { tyRepId } from "./emit_ty_seal"
 import {
   FC_CLOSURE,
@@ -22,6 +29,7 @@ import {
   sFieldElemTyIx,
   sFieldStart,
   sFieldTypes,
+  sIsRefRow,
   sNames,
   sTyIx,
   unTyIx,
@@ -66,11 +74,23 @@ function hsClosureCode(c: i32): boolean {
   return c == FC_CLOSURE || c == FC_NUL_CLOSURE
 }
 
-// The class a different-layout merge of struct rows `a` and `b` falls in, else "unnamed".
+// Whether struct rows `a` and `b`, of one rep id and layout, share a heap type under today's key:
+// neither is an arm's ref row, and their heap ids and field codes agree.
+function hsSameHeap(a: i32, b: i32): boolean {
+  if sIsRefRow(a) || sIsRefRow(b) { return false }
+  return slotHeapId(a) == slotHeapId(b) && structFieldCodesEq(a, b) == 1
+}
+
+// The class a different-layout merge of struct rows `a` and `b` falls in, else "unnamed". An arm's
+// ref row keeps its own heap: its union tests the arm by struct identity.
 function hsDiffClass(a: i32, b: i32): string {
+  if sIsRefRow(a) || sIsRefRow(b) { return "discriminating arm row" }
   if hsFnFieldDiffers(a, b) { return "function field" }
   if repRowAtTyVar(sTyIx[a]) || repRowAtTyVar(sTyIx[b]) {
     return "hole or generic instance"
+  }
+  if repRowHoldsFn(sTyIx[a]) || repRowHoldsFn(sTyIx[b]) {
+    return "function field"
   }
   return "unnamed"
 }
@@ -89,7 +109,10 @@ function hsGroup(table: string, tys: i32[], n: i32, layouts: string[]) {
       const first = byId.get(id) ?? -1
       if first < 0 {
         byId.set(id, i)
-      } else if layouts.length == 0 || layouts[first] == layouts[i] {
+      } else if (
+        layouts.length == 0
+        || (layouts[first] == layouts[i] && hsSameHeap(first, i))
+      ) {
         repABNote("heap", table, "merge same-layout")
       } else {
         const cls = if table == "struct" { hsDiffClass(first, i) } else { "unnamed" }
