@@ -377,8 +377,11 @@ roadmap and are worth naming as the real program:
   loses its `{backing, len, cap}` wrapper allocation entirely.
 - **Union-arm boxing** — `{tag, value}` is one allocation per union value that VL
   fully controls; every niche/sentinel encoding removes one.
-- **`Set` dropping its always-`true` `vals` array** (ROADMAP B6a-opt) — ~17% of a
-  Set's memory and an allocation-plus-`array.copy` on every resize.
+- **`Set` dropping its always-`true` `vals` array** (B6a-opt) — landed: a Set's store and
+  compaction run on helper rows of their own that never write or grow `vals`, so it stays
+  the empty list `Set()` built. The copy it saves is the `vals` list's own grow on insert
+  (the index resize never touched `vals`); a 3M-entry `Set<i32>` beside a 100k string Set
+  peaks about 10% lower (refactor note `2026-11-16-set-drops-vals.md`).
 
 ## 5. Both object models behind a flag — could we? should we?
 
