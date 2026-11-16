@@ -27,24 +27,39 @@ D16898's pin is the first row: a probe build that fails at each write names `mon
 both spellings. The type it writes, `elabSlotTyAt`, is settled before mono; what mono adds is the
 write, and the class readers asked after it see the holder's type through it.
 
-## 2. The proposal
+## 2. The proposal: one writer at a time, under its own gate
 
-**S3a. A closed slot fact bounds its class.** At class build, an un-annotated holder whose
-elaboration slot fact is closed bounds its class at that fact, as an annotation would, read from
-the slot facts, not from an annotation written early. The facts are computed from the classes, so
-this is a rebuild after the facts settle or a step of their fixpoint. Mono's
-pin then writes what the class already answers. Prediction, to measure first: with S3a, the
-freeze-time reads of B′-1 (`slot-bprime-1`) keep D16898 running.
+Each of mono's pin writers moves its decision into the elaboration, one writer per PR. Its gate
+moves verbatim, as a moved function, and its type goes into a side table keyed by holder and
+instance. Only a holder with a table entry bounds its class at that type. Mono's writer then reads
+the table instead of deciding, and writes `letType` / `parType` where it does today (§3). Each PR's
+gate: the writer's witness runs under freeze-time reads (B′-1, `slot-bprime-1`), and every other
+program is byte-identical, over `tests/cases`, distilled, the capability probes and the matrix. Once
+every writer has moved, the class readers read as of the freeze (B′-1 lands), and D16768 closes on
+that measurement.
 
-**S3b. Mono's own pins move into the elaboration.** The rows whose type mono computes (the flow
-table, held record lists, a map's stored values, the uncalled set, the representative pin) are
-decided in the elaboration's fixpoint (design §3.4), held in a side table, and written onto the
-program by one `monoApplyPlaceStore` in mono, per
-the design's stage-3 row (G1, G2, G6, X4: D16202, D16280; G9 with stage 5). One writer per PR, each
-graded byte-identical or as a named mover.
+**Why per writer.** A prototype that bounded every un-annotated holder with a closed slot fact
+(branch `slot-s3a`) ran D16898 under freeze-time reads but lost 13 `tests/cases` programs
+(`closures/hole-fn-in-unannotated-map`: "a function slot pinned at one signature has no one closed
+type"; `closures/uncalled-hole-fn-value`: "call to unknown function";
+`closures/maker-result-called-in-place`: "cannot take the generic function `other` as a value"), and
+changed the output of 4 more (`closures/uncalled-hole-lambda-stored-runs`,
+`closures/list-of-uncalled-hole-fn`, `closures/hole-lambda-uncalled-in-list`,
+`closures/generic-bound-unread-in-instanced-function`). A fact bounds a class only where mono's own
+gate applies it.
 
-**S3c. The readers read as of the freeze.** B′-1 lands last: with every pin decided before mono,
-reading types and bounds as of the freeze is identical, and D16768 closes on that measurement.
+**The sequence**, each gate as its writer states it:
+
+| # | writer | gate | type |
+| --- | --- | --- | --- |
+| 1 | `monoPinMapValues` (D16898) | a `const` (or closed-written) map whose value the checker left open; the stored functions close at the slot fact | `elabSlotTyAt` |
+| 2 | `monoPinMapSlot` | a map initializer or a binding's field map; refused where a value is an unpinned call | the stored values' type |
+| 3 | `monoPinSlotRecordList`, `monoPinSlotRecordMap` | a list literal or fresh `Map()` whose slot holds one record at two or more signatures, emit-representable | from `elabSlotFieldRecord` |
+| 4 | `monoPinListElems` | an un-annotated list literal the flow table pins at one function type; no capture cell, no re-point but to a list literal | `elabSlotTyAt` or `monoFlowSlotPins` |
+| 5 | `monoPinListRecords` | a list of record literals left open at a record of functions | `monoHeldRecordListAt` |
+| 6 | `monoPinNestedListElems` | a list of list literals of functions written nowhere, owned by its instance | the inner element pin |
+| 7 | `monoUncalledListElems` | a list whose element slot nothing calls, one write | `monoUncalledSlotFnTy` |
+| 8 | `monoMakeInstanceHit` (`parType`) | a registry hit filling a value use's hole annotations | `monoPinRepTyOf` |
 
 ## 3. Boundaries
 
