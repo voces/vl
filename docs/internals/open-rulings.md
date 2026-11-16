@@ -1970,5 +1970,6 @@ produces the `i32`.
 
 - **D16494, a radix literal tree under `as% i64`.** DECIDED 2026-11-16 (a), under the owner's
   delegation ("pick something sensible, aiming for consistency"): the tree folds exactly and `as%`
-  applies to the exact value. The 32-bit-pattern reading (b) was not taken. DECISIONS "A radix
-  literal tree under `as%` is its exact value" carries it.
+  applies to the exact value. The 32-bit-pattern reading (b) was not taken. The narrower targets
+  follow the same rule, chosen under the same delegation: `as% i32`/`u8` wrap the exact value
+  (#8553). DECISIONS "A radix literal tree under `as%` is its exact value" carries it.
