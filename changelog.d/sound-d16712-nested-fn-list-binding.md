@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **D16712 closed:** a `const` list of lists of two un-annotated functions returned from a function with an un-annotated parameter (`const w = [[inc], [dbl]]; return w`) passed the check and built an invalid module; it now runs. The instance's copy of the literals is built at the rep the checker stamped on the literals it copies (`fnTagHeldRepOf` reads through to the source node), so the inner lists of the set's ids are `i32` lists. 17 of the 29 invalid-wasm cells of D9662's template run; filed D16700 for the other 12 (a hole function instanced at `f64` beside an `i32` instance of its holder builds an `i32` operand into its body).
