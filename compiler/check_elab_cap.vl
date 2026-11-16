@@ -80,6 +80,8 @@ import {
   tyHasHole,
   tyKeyOf,
   tyMutEpoch,
+  tyPathCycles,
+  tyPathWith,
   tySame,
   tyValOf,
   tyValOpen,
@@ -1291,8 +1293,8 @@ export function elabFnJoinMapTy(j: i32, a: i32, b: i32): i32 {
 // and `b` takes the union of the function sets at every leaf the three share, `j` when none
 // widens (D15209). A list under a record under a list is not joined: no row is built for it.
 export function elabFnJoinDeepTy(j: i32, a: i32, b: i32): i32 {
-  const open: i32[] = []
-  return elabFnJoinDeepAt(j, a, b, open, 0)
+  const path: i32[] = []
+  return elabFnJoinDeepAt(j, a, b, path, 0)
 }
 
 // `elabFnJoinDeepTy` for two record elements of one list literal: each field joins its sets, as
@@ -1303,8 +1305,8 @@ export function elabFnJoinElemTy(j: i32, a: i32, b: i32): i32 {
   const sa: i32[] = []
   const sb: i32[] = []
   if !elabFnLeavesNamed(a, sa) || !elabFnLeavesNamed(b, sb) { return j }
-  const open: i32[] = []
-  return elabFnJoinDeepAt(j, a, b, open, 1)
+  const path: i32[] = []
+  return elabFnJoinDeepAt(j, a, b, path, 1)
 }
 
 // Whether every function leaf of type `t` (through records and lists) carries a set, and each set
@@ -1343,8 +1345,8 @@ function elabFnLeavesNamed(t: i32, seen: i32[]): boolean {
 // set in a record field of `j` (not in a list) beside the arm's own set there: the choice holds each arm's
 // ids, so each arm's set is decided with the join's (D15290).
 export function elabFnArmJoinNote(j: i32, a: i32, b: i32) {
-  const open: i32[] = []
-  return elabFnArmJoinAt(j, a, b, open, false)
+  const path: i32[] = []
+  return elabFnArmJoinAt(j, a, b, path, false)
 }
 
 // `elabFnArmJoinNote` for a function's returned values, `a` and `b` joined to `j`. Each returned
@@ -1352,8 +1354,8 @@ export function elabFnArmJoinNote(j: i32, a: i32, b: i32) {
 // too (D15366).
 export function elabFnRetJoinNote(j: i32, a: i32, b: i32) {
   elabFnJoinRecLists = true
-  const open: i32[] = []
-  elabFnArmJoinAt(j, a, b, open, false)
+  const path: i32[] = []
+  elabFnArmJoinAt(j, a, b, path, false)
   return elabFnJoinRecLists = false
 }
 
@@ -1374,11 +1376,11 @@ let elabFnJoinUnderListRec = false
 // Whether the join note is a returned list's record's function field of different results.
 let elabFnJoinApart = false
 
-// The walk of `elabFnArmJoinNote`; `open` holds the join types it is inside, so a recursive
+// The walk of `elabFnArmJoinNote`; `path` holds the join types it is inside, so a recursive
 // type is not entered twice.
-function elabFnArmJoinAt(j: i32, a: i32, b: i32, open: i32[], inRec: boolean) {
+function elabFnArmJoinAt(j: i32, a: i32, b: i32, path: i32[], inRec: boolean) {
   if (
-    i32ListHas(open, j)
+    tyPathCycles(j, path)
     || j < 0
     || j >= T.tys.length
     || a < 0
@@ -1446,15 +1448,13 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, open: i32[], inRec: boolean) {
           const was = elabFnJoinApart
           elabFnJoinApart = apart
           if recF { elabFnJoinListRec = true }
-          open.push(j)
           elabFnArmJoinAt(
             jt.objFieldTypes[i],
             at.objFieldTypes[ia],
             bt.objFieldTypes[ib],
-            open,
+            tyPathWith(j, path),
             true,
           )
-          open.pop()
           elabFnJoinApart = was
         }
         i = i + 1
@@ -1482,9 +1482,13 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, open: i32[], inRec: boolean) {
       const wasUnder = elabFnJoinUnderListRec
       elabFnJoinListRec = listRec
       if listRec { elabFnJoinUnderListRec = true }
-      open.push(j)
-      elabFnArmJoinAt(tyElemOf(jt), tyElemOf(at), tyElemOf(bt), open, inner)
-      open.pop()
+      elabFnArmJoinAt(
+        tyElemOf(jt),
+        tyElemOf(at),
+        tyElemOf(bt),
+        tyPathWith(j, path),
+        inner,
+      )
       elabFnJoinListRec = false
       elabFnJoinUnderListRec = wasUnder
       return 0
@@ -1522,16 +1526,16 @@ function elabListLeafIsFn(t: i32): boolean {
 }
 
 // `elabFnJoinDeepTy` at `j`, `shape` saying what holds it: 0 nothing, 1 a list, 2 a record in
-// a list, 3 a list in a record in a list. `open` holds the join types it is inside.
+// a list, 3 a list in a record in a list. `path` holds the join types it is inside.
 function elabFnJoinDeepAt(
   j: i32,
   a: i32,
   b: i32,
-  open: i32[],
+  path: i32[],
   shape: i32,
 ): i32 {
   if (
-    i32ListHas(open, j)
+    tyPathCycles(j, path)
     || j < 0
     || j >= T.tys.length
     || a < 0
@@ -1550,15 +1554,13 @@ function elabFnJoinDeepAt(
     }
     TyArray => {
       if !(at is TyArray) || !(bt is TyArray) || shape == 3 { return j }
-      open.push(j)
       const ne = elabFnJoinDeepAt(
         tyElemOf(jt),
         tyElemOf(at),
         tyElemOf(bt),
-        open,
+        tyPathWith(j, path),
         if shape == 2 { 3 } else { 1 },
       )
-      open.pop()
       return if ne == tyElemOf(jt) { j } else { mkArrayTy(ne) }
     }
     TyObj => {
@@ -1575,15 +1577,13 @@ function elabFnJoinDeepAt(
         const nm = jt.objFieldNames[i]
         if at.objFieldNames[i] != nm || bt.objFieldNames[i] != nm { return j }
         const f = jt.objFieldTypes[i]
-        open.push(j)
         const w = elabFnJoinDeepAt(
           f,
           at.objFieldTypes[i],
           bt.objFieldTypes[i],
-          open,
+          tyPathWith(j, path),
           fs,
         )
-        open.pop()
         if w != f { changed = true }
         tys.push(w)
         i = i + 1
@@ -1603,21 +1603,18 @@ function elabFnJoinDeepAt(
 // Whether `dst` holds, at some place `own` shares through lists and records, a function set
 // other than `own`'s there, so a value of `own` delivered to `dst` takes `dst`'s sets (D15209).
 export function elabFnSetsWiden(own: i32, dst: i32): boolean {
-  const open: i32[] = []
-  return elabFnSetsWidenIn(own, dst, open)
+  const path: i32[] = []
+  return elabFnSetsWidenIn(own, dst, path)
 }
 
-// `elabFnSetsWiden` under the `dst` types in `open`; false where `dst` is one, on a cycle.
-function elabFnSetsWidenIn(own: i32, dst: i32, open: i32[]): boolean {
-  if i32ListHas(open, dst) { return false }
-  open.push(dst)
-  const r = elabFnSetsWidenAt(own, dst, open)
-  open.pop()
-  return r
+// `elabFnSetsWiden` under the `dst` types on `path`; false where `dst` is one, on a cycle.
+function elabFnSetsWidenIn(own: i32, dst: i32, path: i32[]): boolean {
+  if tyPathCycles(dst, path) { return false }
+  return elabFnSetsWidenAt(own, dst, tyPathWith(dst, path))
 }
 
 // One step of `elabFnSetsWidenIn`.
-function elabFnSetsWidenAt(own: i32, dst: i32, open: i32[]): boolean {
+function elabFnSetsWidenAt(own: i32, dst: i32, path: i32[]): boolean {
   if (own < 0 || own >= T.tys.length || dst < 0 || dst >= T.tys.length) {
     return false
   }
@@ -1630,7 +1627,7 @@ function elabFnSetsWidenAt(own: i32, dst: i32, open: i32[]): boolean {
     }
     TyArray => {
       return ot is TyArray
-        && elabFnSetsWidenIn(tyElemOf(ot), tyElemOf(dt), open)
+        && elabFnSetsWidenIn(tyElemOf(ot), tyElemOf(dt), path)
     }
     TyObj => {
       if !(ot is TyObj) || ot.objFieldNames.length != dt.objFieldNames.length {
@@ -1640,7 +1637,7 @@ function elabFnSetsWidenAt(own: i32, dst: i32, open: i32[]): boolean {
       while i < dt.objFieldNames.length {
         if (
           ot.objFieldNames[i] == dt.objFieldNames[i]
-          && elabFnSetsWidenIn(ot.objFieldTypes[i], dt.objFieldTypes[i], open)
+          && elabFnSetsWidenIn(ot.objFieldTypes[i], dt.objFieldTypes[i], path)
         ) {
           return true
         }
@@ -4196,33 +4193,30 @@ export function fnTagRepTyOf(t: i32): i32 { return fnTagRepTyOfIn(t, false) }
 // list's element list, where a record's tagged function field is its `i32` id, since no literal of
 // the outer list mints that record's row (D15350).
 function fnTagRepTyOfIn(t: i32, deep: boolean): i32 {
-  const open: i32[] = []
-  return fnTagRepTyIn(t, deep, open)
+  const path: i32[] = []
+  return fnTagRepTyIn(t, deep, path)
 }
 
-// `fnTagRepTyOfIn` under the types in `open`; a recursive type met again is left as it is.
-function fnTagRepTyIn(t: i32, deep: boolean, open: i32[]): i32 {
-  if t < 0 || t >= T.tys.length || i32ListHas(open, t) { return t }
-  open.push(t)
-  const r = fnTagRepTyStep(t, deep, open)
-  open.pop()
-  return r
+// `fnTagRepTyOfIn` under the types on `path`; a recursive type met again is left as it is.
+function fnTagRepTyIn(t: i32, deep: boolean, path: i32[]): i32 {
+  if t < 0 || t >= T.tys.length || tyPathCycles(t, path) { return t }
+  return fnTagRepTyStep(t, deep, tyPathWith(t, path))
 }
 
 // One step of `fnTagRepTyIn`.
-function fnTagRepTyStep(t: i32, deep: boolean, open: i32[]): i32 {
+function fnTagRepTyStep(t: i32, deep: boolean, path: i32[]): i32 {
   const o = tyAt(t)
   match o {
     TyArray => {
       if fnTagTyIsTagged(tyElemOf(o)) { return mkArrayTy(TY_I32) }
-      const e = fnTagRepTyIn(tyElemOf(o), deep, open)
+      const e = fnTagRepTyIn(tyElemOf(o), deep, path)
       return if e == tyElemOf(o) { t } else { mkArrayTy(e) }
     }
     TyObj => {
       const tys: i32[] = []
       let changed = false
       for f in o.objFieldTypes {
-        const r = if deep && fnTagTyIsTagged(f) { TY_I32 } else { fnTagRepTyIn(f, deep, open) }
+        const r = if deep && fnTagTyIsTagged(f) { TY_I32 } else { fnTagRepTyIn(f, deep, path) }
         if r != f { changed = true }
         tys.push(r)
       }
@@ -4232,13 +4226,13 @@ function fnTagRepTyStep(t: i32, deep: boolean, open: i32[]): i32 {
       return mkObjTy(names, tys)
     }
     TyNullable => {
-      const r = fnTagRepTyIn(o.nInner, deep, open)
+      const r = fnTagRepTyIn(o.nInner, deep, path)
       return if r == o.nInner { t } else { mkNullableTy(r) }
     }
     // A map's value record is minted by no literal of the map's own, so its tagged function
     // fields are their `i32` ids, as inside a list's element list.
     TyMap => {
-      const r = fnTagRepTyIn(tyValOf(o), true, open)
+      const r = fnTagRepTyIn(tyValOf(o), true, path)
       return if r == tyValOf(o) { t } else { mkMapTy(tyKeyOf(o), r, o.mSet) }
     }
     // No other kind holds a set's ids as a container.
