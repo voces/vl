@@ -35,8 +35,9 @@ check's tag count and the late pass's adds and drops.
 | master | 415 | 2 (`*-fn-list-written-then-called`, pre-existing) |
 | this PR | **353** | **2** (the same two) |
 
-- **A/B:** wasm and output byte-identical on all 6,513 programs, fixpoint seed against master's own
-  fixpoint seed. So the final decision is unchanged in every program. 62 programs now reach it in
+- **A/B:** wasm and output byte-identical on all 6,528 `@run` programs, fixpoint seed against
+  master's own fixpoint seed. The only exceptions are the two fixtures this PR converts from
+  `@error`, which master refuses and this PR runs. So the final decision is unchanged in every program. 62 programs now reach it in
   the check rather than after the elaboration.
 - **Prototype history:** the generic-member exclusion alone gave 295 and 7 runs→not-runs. Each row
   of the table above came from closing one of those regressions.
@@ -45,10 +46,35 @@ check's tag count and the late pass's adds and drops.
 
 `setBindBuild` now runs on every compile, once, inside the check's tag decision.
 - It scans the arena once for escapes and once for rows.
-- The fixpoint over rows is bounded by the row count.
-- The per-parameter "lacks a set" and per-set "stored" tables are built in one pass after it.
+- It visits only parameters that can have hand rows, and walks only bodies with a bound parameter.
+- It skips the hand-back walk, which only the diff reads.
 
-Self-compile fuel and the scaling-shape test are below.
+Self-compile fuel, fixpoint seeds, after the merge with master:
+
+| | fuel | against the committed baseline (92,875,944,764) |
+|---|---|---|
+| master | 93,364,848,391 | +0.5% |
+| this PR | 93,567,621,472 | +0.7%, i.e. +0.22% over master |
+
+The producer call alone measured 0.18% before the merge. No baseline is written.
+
+Other gates: phase-state ok; late demands 2, equal to the baseline; seed size +1.3% (under +3%);
+lint-self clean.
+
+## Language-visible: refusals that named a mechanism now run
+
+Two programs the check refused now run correctly. Their refusal, "every function a call through
+'f' may run must return one type", is the closure representation's mechanism, and their sets are
+now tagged, so each call dispatches to the member chosen. Ruling 5: list each and show its
+output.
+
+| fixture (renamed from `error-*`) | prints |
+|---|---|
+| `closures/choice-of-hole-fns-handed-and-escaped-results-differ.vl` | `s`, `s`, `4`, `5` |
+| `closures/hole-fn-return-let-handed-results-differ.vl` | `s`, `4` |
+
+This closes [D16094](../inventory/D16094.md), whose `Want: s` now holds, and the residue of
+[D13966](../inventory/D13966.md). All 5,270 filed witnesses grade as filed.
 
 ## What is left
 
