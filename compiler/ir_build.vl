@@ -64,10 +64,12 @@ import {
 } from "./ir_lower"
 import {
   GlobalCtx,
+  binNumWidth,
   callEndsNever,
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  numLitAsApplies,
   pushPlainWhy,
   pushPlanOf,
   strLitTakesAtom,
@@ -617,12 +619,39 @@ function operandWhy(ix: i32): string {
 
 const STR_OPERAND = "operand at string"
 
+// The rep of binary `n`'s operator width (`binNumWidth`) where an operand has it and the two
+// differ, else -1.
+function binWidthRep(n: BinExpr): i32 {
+  const lr = primRepOf(n.binLeft)
+  const rr = primRepOf(n.binRight)
+  if lr == rr || lr < 0 || rr < 0 { return -1 }
+  const w = binNumWidth(n, ibFnIx)
+  // Each primitive is narrowed to a plain string before the compare (D16822).
+  const lp = repPrim(lr)
+  const rp = repPrim(rr)
+  if lp != null {
+    const ls: string = lp
+    if ls == w { return lr }
+  }
+  if rp != null {
+    const rs: string = rp
+    if rs == w { return rr }
+  }
+  return -1
+}
+
+function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
+
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
-  const v = irBExpr(b, ix)
-  if ibMiss != "" || irBOpRep(v) == dst { return v }
+  return widenTo(b, irBExpr(b, ix), ix, dst)
+}
+
+// Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
+function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  if ibMiss != "" || dst < 0 || irBOpRep(v) == dst { return v }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
   if sk < 0 || dk < 3 { return v }
@@ -712,8 +741,25 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     if lw != "" { return irBMiss(lw) }
     const rw = operandWhy(n.binRight)
     if rw != "" { return irBMiss(rw) }
-    const l = irBExpr(b, n.binLeft)
-    const r = irBExpr(b, n.binRight)
+    // Mixed numeric widths meet at the operator's width, each operand widened before the next
+    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
+    const dst = binWidthRep(n)
+    if (
+      dst >= 0
+      && irRepOtherThan(n.binLeft, dst)
+      && numLitAsApplies(n.binLeft)
+    ) {
+      return irBMiss("widen literal")
+    }
+    if (
+      dst >= 0
+      && irRepOtherThan(n.binRight, dst)
+      && numLitAsApplies(n.binRight)
+    ) {
+      return irBMiss("widen literal")
+    }
+    const l = widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst)
+    const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst)
     if ibMiss != "" { return l }
     if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
