@@ -26,12 +26,23 @@ import {
 } from "./check_bind_rows"
 import { quietEnterFlat, quietLeaveFlat } from "./check_cursor"
 import { setBindDiffLine } from "./check_set_bind"
+import {
+  arrowArgsOf,
+  arrowCalleeOf,
+  arrowCount,
+  arrowHoleOf,
+} from "./check_arrow"
+import { mintFactCallOf, mintFactRows, mintFactRsOf, mintFactSetOf } from "./check_mint"
+import { fnTagMembers, fnTagSetOfTy } from "./check_elab_cap"
+import { setMemberRetAt } from "./check_relate_core"
+import { tyHasTyVar } from "./tyquery"
+import { nodeSrc } from "./symbols"
 import { fnTagCheckLen } from "./check_fn_tag"
 import { elabCallDeclOf } from "./check_elab_cap"
 import { hdBase, hdKind, hdRootTy } from "./check_hole_pins"
 import { nodeTyIxOf, nodeTyOf } from "./check_node_tys"
 import { substTyDeep } from "./check_relate_core"
-import { T, TyFunc, TyVar, tyAt, tyToStr } from "./check_types"
+import { T, TY_VOID, TyFunc, TyVar, mkFuncTy, tyAt, tyToStr } from "./check_types"
 
 let ifaceText = ""
 
@@ -162,8 +173,86 @@ export function ifaceDumpBuild(): i32 {
     }
   }
   const sb = setBindDiffLine(fnTagCheckLen())
-  ifaceText = if sb == "" { out } else { out + sb + "\n" }
+  if sb != "" { out = out + sb + "\n" }
+  const ar = arrowDiffLine()
+  ifaceText = if ar == "" { out } else { out + ar + "\n" }
   return ifaceText.length
+}
+
+// The arrow rule's rows against the elaboration's mint facts: per (hole call, set), and per
+// (hole call, set, member results). `open` counts rows of a set whose arguments stay open.
+function arrowDiffLine(): string {
+  const mine: string[] = []
+  const mineRs: string[] = []
+  let open = 0
+  let r = 0
+  while r < arrowCount() {
+    const st = fnTagSetOfTy(arrowCalleeOf(r))
+    if st >= 0 {
+      const k = i32ToStr(arrowSrcOf(arrowHoleOf(r))) + "|" + i32ToStr(st)
+      let closed = true
+      for a in arrowArgsOf(r) {
+        if a < 0 || tyHasTyVar(a) { closed = false }
+      }
+      if closed {
+        const ft = mkFuncTy(arrowArgsOf(r), TY_VOID)
+        let rs = ""
+        for m in fnTagMembers(st) { rs = rs + "," + i32ToStr(setMemberRetAt(m, ft)) }
+        mine.push(k)
+        mineRs.push(k + "=" + rs)
+      } else {
+        open = open + 1
+      }
+    }
+    r = r + 1
+  }
+  const theirs: string[] = []
+  const theirsRs: string[] = []
+  for f in mintFactRows() {
+    const k = i32ToStr(arrowSrcOf(mintFactCallOf(f))) + "|" + i32ToStr(mintFactSetOf(f))
+    let rs = ""
+    for t in mintFactRsOf(f) { rs = rs + "," + i32ToStr(t) }
+    theirs.push(k)
+    theirsRs.push(k + "=" + rs)
+  }
+  if mine.length + theirs.length + open == 0 { return "" }
+  return "arrow calls "
+    + arrowCmp(mine, theirs)
+    + " rs "
+    + arrowCmp(mineRs, theirsRs)
+    + " open "
+    + i32ToStr(open)
+}
+
+// The source node a copied node `x` was made from, `x` itself when it is one.
+function arrowSrcOf(x: i32): i32 {
+  let y = x
+  let n = 0
+  while n < 64 {
+    const s = nodeSrc[y] ?? -1
+    if s < 0 || s == y { return y }
+    y = s
+    n = n + 1
+  }
+  return y
+}
+
+// `both/onlyMine/onlyTheirs` over two lists of keys, each counted once.
+function arrowCmp(mine: string[], theirs: string[]): string {
+  const inMine: {[string]: boolean} = Map()
+  const inTheirs: {[string]: boolean} = Map()
+  for k in mine { inMine[k] = true }
+  for k in theirs { inTheirs[k] = true }
+  let both = 0
+  let om = 0
+  let ot = 0
+  for k in inMine.keys() {
+    if inTheirs[k] ?? false { both = both + 1 } else { om = om + 1 }
+  }
+  for k in inTheirs.keys() {
+    if !(inMine[k] ?? false) { ot = ot + 1 }
+  }
+  return i32ToStr(both) + "/" + i32ToStr(om) + "/" + i32ToStr(ot)
 }
 
 // Code point `i` of the dump, 0 past its end.
