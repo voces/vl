@@ -45,7 +45,12 @@ merged with module scope's, through `bndNextRow`. Rollback truncates each kind's
 
 ## Gates
 
-On master `2f28e2ae`, with #8538's step under this one:
+Re-proved after merging master `078e4116`, into which #8538 merged squashed:
+- two refreshes from that master's fixpoint seed are cmp-identical;
+- 20,586 programs fingerprint identically, both seeds run from one worktree;
+- `lint-self.sh` is clean.
+
+Before that merge, on master `2f28e2ae` with #8538's step under this one:
 - **Identical.** Two refreshes from master's fixpoint seed are cmp-identical, and 20,576 programs
   fingerprint identically, both seeds run from one worktree.
 - `regress.vl`: 0 runs → not-runs. Its 23 "other movement" `d551_*` cells are master's own (see
