@@ -54,7 +54,7 @@ import {
   identFnDeclOf,
   tyParamIsBareOnly,
 } from "./check_scopes"
-import { fvaIsMaker } from "./check_assignable"
+import { fvaCallArgTy, fvaHoleMaker, fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftWithinInstancedFn } from "./check_fn_tag"
 import {
@@ -99,6 +99,7 @@ import {
   elabValueSlotUncalled,
   elabWalkKeyOf,
   elabWalkTop,
+  elabWideTwinOf,
   elabWrittenValueTy,
   eplSlotSig,
 } from "./emit_elab"
@@ -162,6 +163,7 @@ import {
   substTyDeep,
   substTyDeepOf,
   tyProvesNonNull,
+  widenLitTy,
 } from "./check_relate_core"
 import { unionTyIxOfIdentAt } from "./emit_start_block"
 import {
@@ -9850,7 +9852,10 @@ function monoMakeInstanceGo(
     // A call's instance is keyed by the elaboration's key for that call plus the pinned reps, not
     // by the pins' spelling (architecture-target §3.4, the call half).
     const valueHalf = elabDeclIsValue(monoOrigNode[origFe])
-    const callKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
+    const baseKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
+    // A widened call of a maker the elaboration twinned is keyed by that twin (D16778).
+    const twinKey = if retWiden && baseKey >= 0 { elabWideTwinOf(baseKey, req.retWidenTy) } else { -1 }
+    const callKey = if twinKey >= 0 { twinKey } else { baseKey }
     const k = monoMakeInstanceKeyOf(
       fn,
       origFe,
@@ -10746,9 +10751,10 @@ function monoCoerceFnValueTys(
         if go < monoGen.length && monoGen[go] == 1 { gfe = go }
       }
       // A maker delivered at a closed function type is its instance at that type's result.
-      if monoIsMakerFe(gfe) {
+      // A maker with an un-annotated parameter is pinned by its calls, which this read is not.
+      if monoIsMakerFe(gfe) && !fvaHoleMaker(monoOrigNode[gfe]) {
         const dt = if expTy >= 0 { expTy } else { tnameTy }
-        return monoMakerTwin(gfe, exprIx, monoFnTyRet(dt), delTys, ctx)
+        return monoMakerTwin(gfe, exprIx, monoFnTyRet(dt), delTys, ctx, -1)
       }
       if gfe >= 0 && gfe < monoGen.length {
         if monoGen[gfe] == 1 {
@@ -10805,6 +10811,7 @@ function monoMakerTwin(
   ret: i32,
   delTys: i32[],
   ctx: i32,
+  call: i32,
 ): i32 {
   if (
     ret < 0
@@ -10831,9 +10838,12 @@ function monoMakerTwin(
   const holeRet = monoRetsReachHoleLam(monoOrigNode[fe], [])
   if mfn is FuncDecl && mfn.fnParams.length > 0 && !holeRet { return 0 }
   if mfn is FuncDecl && holeRet {
+    let pi = 0
     for p in mfn.fnParams {
       const pn = nodeAt(p)
-      const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
+      // An un-annotated parameter is pinned at the type the call hands it (D16778).
+      const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else if pn is Param { fvaCallArgTy(call, pi) } else { -1 }
+      pi = pi + 1
       const ps = if pt >= 0 { monoPinOfClosedTy(pt) } else { "" }
       if ps == "" { return 0 }
       pins.push(ps)
@@ -20237,6 +20247,13 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       monoBakeSpecK = elabSpecKeyOf(specAt)
       const req = instReqAt(frame)
       req.call = callIx
+      // A maker with an un-annotated parameter whose call is delivered at another result is its
+      // elaboration's wide twin there (D16778).
+      const mkd = monoOrigNode[origFe]
+      const mks = if fvaHoleMaker(mkd) { elabMakerCallSig(callIx) } else { -1 }
+      if mks >= 0 && elabMakerTwinHeld(mkd, mks) && elabMakerOpen(mkd) {
+        req.retWidenTy = mks
+      }
       req.specK = monoBakeSpecK
       req.argLit = argLit
       const made = monoMakeInstance(
@@ -23506,7 +23523,7 @@ function monoWalkIdentCall(
         && elabMakerTwinHeld(monoOrigNode[fe], ms)
         && elabMakerOpen(monoOrigNode[fe])
       ) {
-        if monoMakerTwin(fe, mc.callFn, ms, [], ctx) < 0 { return -1 }
+        if monoMakerTwin(fe, mc.callFn, ms, [], ctx, ix) < 0 { return -1 }
         nodeTyRecord(ix, ms)
         return 0
       }
