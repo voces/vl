@@ -7941,8 +7941,9 @@ or tag, through fields, elements and signatures; a reachable abstract `any`/`eq`
 refuses every record some op hands to such a place, as a union box's payload). Following
 fields is the conservative default the design review asked for: a JS host cannot read a
 struct's fields, and sunpa pays for it (below). The owner ruled it out as the default the
-same day (next paragraph). A parent must be made by `struct.new` in a function body (not `new_default`, not
-a constant expression, D3679), never atomically, must not cross the boundary itself, and must
+same day (next paragraph). A parent must be made by `struct.new` (not `new_default`), in a
+function body or in a global's initializer whose record operand is itself a `struct.new` (D3679).
+It is never made atomically, must not cross the boundary itself, and must
 lay the field out as its sub- and supertypes do. Every store must be non-null by type; a
 nullable record local that validates as non-null is declared so first.
 
