@@ -1973,3 +1973,9 @@ produces the `i32`.
   applies to the exact value. The 32-bit-pattern reading (b) was not taken. The narrower targets
   follow the same rule, chosen under the same delegation: `as% i32`/`u8` wrap the exact value
   (#8553). DECISIONS "A radix literal tree under `as%` is its exact value" carries it.
+
+- **D16689, an empty list literal under an explicit type argument.** DECIDED 2026-11-16 (a), under
+  the owner's delegation, following D16342: `g<i32>([])` fixes the literal's element at `i32`, so
+  `v is f64[]` is false. (b), emptiness because the literal itself carries no annotation, was not
+  taken. A literal whose element only another argument's binding settles keeps the emptiness
+  answer. DECISIONS "An explicit type argument fixes an empty list literal's element…" carries it.
