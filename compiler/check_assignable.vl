@@ -429,15 +429,16 @@ import {
   SUBST_ALL,
   SUBST_HOLES,
   SUBST_NESTED,
+  SubstCtx,
   cstrOwnedBy,
-  cstrOwnedStrict,
-  cstrOwnedStrictSet,
   nestCstrOutside,
-  substNestDecl,
-  substNestDeclSet,
+  substCtxEnter,
+  substCtxLeave,
+  substCtxNest,
+  substCtxNow,
+  substCtxSelf,
+  substCtxStrict,
   substNestMode,
-  substNestModeSet,
-  substSelfOwnerSet,
   tyVarsOfEnclosingGeneric,
 } from "./check_subst"
 import {
@@ -796,14 +797,13 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   if added == 0 || o == fsbCallUsed[c] { return 0 }
   if !fsbArgsFit(c, rt, nm, ty) { return 0 }
   fsbAdaptWrites(c, rt, nm, ty, rhs)
-  const modeWas = substNestMode
-  const declWas = substNestDecl
-  substNestModeSet(SUBST_ALL)
-  if o >= 0 { substNestModeSet(SUBST_DECLARED) }
   const ix = fsbCallIx[c]
   const who = fsbCallWho[c]
   const callee = fsbOwnerCallee(o)
-  cstrOwnedStrictSet(o >= 0)
+  const ctx0 = substCtxNow()
+  const mode = if o >= 0 { SUBST_DECLARED } else { SUBST_ALL }
+  const ctx = substCtxStrict(substCtxNest(ctx0, mode, ctx0.nestDecl), o >= 0)
+  const was = substCtxEnter(ctx)
   adoptHoleLitArgs(nm, ty, callee, fsbCallHNames[c], fsbCallHNode[c])
   const at = solvePlain(nm, ty, ix, callee, who)
   at.hNames = fsbCallHNames[c]
@@ -811,9 +811,7 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   at.hArgNode = fsbCallHNode[c]
   at.kinds = SS_ALL - (1 << SS_NEST) - (1 << SS_UFCS)
   ifaceSolveAt(at, SS_BIN, SS_UFCS)
-  cstrOwnedStrictSet(false)
-  substNestModeSet(modeWas)
-  substNestDeclSet(declWas)
+  substCtxLeave(was, ctx)
   return 0
 }
 
@@ -1152,30 +1150,25 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   if bNames.length == 0 { return 0 }
   const who = e.identName
   const noArgs: i32[] = []
-  const modeWas = substNestMode
-  const declWas = substNestDecl
-  const strictWas = cstrOwnedStrict
   const cvWas = cvNow
   let owner = decl
+  let ctx = substCtxNow()
   if nested {
     owner = CSTR_NODECL
-    substNestModeSet(SUBST_NESTED)
-    substNestDeclSet(decl)
+    ctx = substCtxNest(ctx, SUBST_NESTED, decl)
   } else if open {
     // A destination typed by the enclosing generic's parameters defers what it cannot decide to
     // that generic, as a direct call in its body does; only the delivered function's own
     // constraints are re-asked (D3923).
-    substNestModeSet(SUBST_DECLARED)
-    cstrOwnedStrictSet(true)
+    ctx = substCtxStrict(substCtxNest(ctx, SUBST_DECLARED, ctx.nestDecl), true)
     // What is deferred carries this delivery, which the refusal at the pin names.
     cvNow = srcExpr
   }
+  const was = substCtxEnter(ctx)
   pinBmCstrElems(bNames, bTys, srcExpr, owner, noArgs)
   declCstrsAtBinding(bNames, bTys, srcExpr, owner, who)
-  cstrOwnedStrictSet(strictWas)
+  substCtxLeave(was, ctx)
   cvNow = cvWas
-  substNestModeSet(modeWas)
-  substNestDeclSet(declWas)
   return 0
 }
 
@@ -1353,7 +1346,7 @@ export const SS_ALL = 2047
 // What one call's solve reads: the bindings (`rNames`/`rTys` for the declared return), the call,
 // the callee and its spelling, the hole arguments, the steps it takes (`kinds`, a mask over `SS_*`),
 // and, when `toggles`, the `substSelfOwner` its bin, let and ufcs steps (`selfOwner`) and its arg
-// step (`argOwner`) run under, restored to `ownerWas` after each.
+// step (`argOwner`) run under, each entered and left as a `SubstCtx`.
 export type SolveAt = {
   bNames: string[],
   bTys: i32[],
@@ -1369,7 +1362,6 @@ export type SolveAt = {
   toggles: boolean,
   selfOwner: string,
   argOwner: string,
-  ownerWas: string,
 }
 
 // Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order; the steps whose kind
@@ -1396,7 +1388,8 @@ export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
 // rule (S3.4d, lane STORE).
 function solveStep(at: SolveAt, st: i32) {
   if st == SS_ARG {
-    if at.toggles { substSelfOwnerSet(at.argOwner) }
+    const c = atSelfCtx(at, at.argOwner)
+    const w = substCtxEnter(c)
     validateArgCstrs(
       at.bNames,
       at.bTys,
@@ -1405,9 +1398,16 @@ function solveStep(at: SolveAt, st: i32) {
       at.hNames,
       at.hArgNode,
     )
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+    substCtxLeave(w, c)
   }
   return 0
+}
+
+// The modes a step of `at` runs under: `owner` as the self owner when `at` toggles it, else the
+// modes as they stand.
+function atSelfCtx(at: SolveAt, owner: string): SubstCtx {
+  if at.toggles { return substCtxSelf(substCtxNow(), owner) }
+  return substCtxNow()
 }
 
 // The bound kind answered by a per-row rule whose home is solve step `st`, or -1 for a step that
@@ -1495,7 +1495,8 @@ function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]): i32 {
     return bmRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
   }
   if k == BND_BIN {
-    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    const c = atSelfCtx(at, at.selfOwner)
+    const w = substCtxEnter(c)
     binRule(
       at.bNames,
       at.bTys,
@@ -1508,13 +1509,14 @@ function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]): i32 {
       ci,
       row,
     )
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+    substCtxLeave(w, c)
     return 0
   }
   if k == BND_LET {
-    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    const c = atSelfCtx(at, at.selfOwner)
+    const w = substCtxEnter(c)
     letRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+    substCtxLeave(w, c)
     return 0
   }
   if k == BND_IS {
@@ -1540,9 +1542,10 @@ function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]): i32 {
     )
   }
   if k == BND_UFCS {
-    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    const c = atSelfCtx(at, at.selfOwner)
+    const w = substCtxEnter(c)
     ufcsRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+    substCtxLeave(w, c)
   }
   return 0
 }
@@ -1612,7 +1615,6 @@ export function solvePlain(
     toggles: false,
     selfOwner: "",
     argOwner: "",
-    ownerWas: "",
   }
 }
 
@@ -1673,13 +1675,14 @@ export function holeDeclCstrsBind(
     i = i + 1
   }
   if bNames.length == 0 { return 0 }
-  const modeWas = substNestMode
-  const strictWas = cstrOwnedStrict
-  substNestModeSet(SUBST_DECLARED)
-  cstrOwnedStrictSet(true)
+  const ctx0 = substCtxNow()
+  const ctx = substCtxStrict(
+    substCtxNest(ctx0, SUBST_DECLARED, ctx0.nestDecl),
+    true,
+  )
+  const was = substCtxEnter(ctx)
   declCstrsAtBinding(bNames, bTys, srcExpr, decl, fd.fnName)
-  cstrOwnedStrictSet(strictWas)
-  substNestModeSet(modeWas)
+  substCtxLeave(was, ctx)
   return 0
 }
 
@@ -1741,13 +1744,10 @@ function holeDeclValueCstrsAt(
     i = i + 1
   }
   if bNames.length == 0 { return 0 }
-  const modeWas = substNestMode
-  const declWas = substNestDecl
-  substNestModeSet(SUBST_NESTED)
-  substNestDeclSet(decl)
+  const ctx = substCtxNest(substCtxNow(), SUBST_NESTED, decl)
+  const was = substCtxEnter(ctx)
   declCstrsAtBinding(bNames, bTys, srcExpr, CSTR_NODECL, who)
-  substNestModeSet(modeWas)
-  substNestDeclSet(declWas)
+  substCtxLeave(was, ctx)
   return 0
 }
 
