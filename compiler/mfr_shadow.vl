@@ -45,7 +45,7 @@ import {
   nodeAt,
 } from "./ast"
 import { identDeclOf, memberMethodOf } from "./symbols"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { optCallCalleeOf } from "./check_core_state"
 import {
   cwBindingOf,
@@ -661,8 +661,17 @@ function mfrChainIdent(
       const sv: i32[] = []
       const ats: i32[] = []
       const nw = cwSlotWrittenValues(b, cp, sv, ats)
-      if nw < 0 || (idx && nw != 0) { return false }
-      if !idx {
+      // A binding a call initialises, its slot never written after, holds there what the call
+      // returns, which the descent below follows (D16739).
+      const li = if dn is LetDecl { parenPeelIx(dn.letInit) } else { -1 }
+      const cn = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+      // A declared result delivers the value at its written type, not at the function returned.
+      const cf = if cn is Call && cn.callFn >= 0 { identFnDeclOf(parenPeelIx(cn.callFn)) } else { -1 }
+      const cfn = if cf >= 0 { nodeAt(cf) } else { null }
+      const ci = cfn is FuncDecl && cfn.fnRet < 0
+      const viaCall = nw < 0 && ci && cwSlotWriteCount(b, cp) == 0
+      if !viaCall && (nw < 0 || (idx && nw != 0)) { return false }
+      if !idx && !viaCall {
         for w in sv {
           if (
             !mfrChainDescend(
@@ -721,7 +730,15 @@ function mfrChainCall(
   const rets: i32[] = []
   collectRetValues(fn.fnBody, rets)
   if rets.length == 0 { return false }
-  for rv in rets {
+  for rv0 in rets {
+    // A returned parameter holds, at this call, this call's argument, not every call's (D16739).
+    const rp = parenPeelIx(rv0)
+    const rpd = if rp >= 0 && rp < P.nodes.length && nodeAt(rp) is Ident { identDeclOf(rp) } else { -1 }
+    const pi = if rpd >= 0 { i32ListIndexOf(fn.fnParams, rpd) } else { -1 }
+    const rv = if pi >= 0
+      && pi < n.callArgs.length
+      && fn.fnParams.length == n.callArgs.length
+      && mfrParamPassedThrough(rp, steps, i) { n.callArgs[pi] } else { rv0 }
     if (
       !mfrChainDescend(
         rv,
@@ -1206,4 +1223,21 @@ function mfrLitCallDecl(ix: i32): i32 {
   if d < 0 { d = opDeclAtNode(ix) }
   if d < 0 { d = memberMethodOf(ix) }
   return if d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl { d } else { -1 }
+}
+
+// Whether the parameter read `r` holds its argument untouched at the slot `steps[i..]` names: the
+// parameter is never reassigned and nothing writes that slot through it.
+function mfrParamPassedThrough(r: i32, steps: string[], i: i32): boolean {
+  const b = cwBindingOf(r)
+  if b < 0 || cwBindingWrittenValues(b).length > 0 { return false }
+  if i >= steps.length { return true }
+  const cp: string[] = []
+  let k = i
+  while k < steps.length {
+    cp.push(
+      if steps[k][0] == "f"[0] { steps[k].slice(2, steps[k].length) } else { "[]" },
+    )
+    k = k + 1
+  }
+  return cwSlotWriteCount(b, cp) == 0
 }
