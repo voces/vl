@@ -2366,6 +2366,17 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   // costly question, asked last.
   const bd = identDeclOf(u)
   if bd >= 0 && nodeAt(bd) is Param { return paramHeldTy(u, fnIx) }
+  // A loop variable over a list binding holds its element where that binding's build stores it,
+  // as the loop's own local does (D16787).
+  const lv = if bd >= 0 { nodeAt(bd) } else { null }
+  if lv is LoopVar {
+    const l = if lv.lvLoop >= 0 && lv.lvLoop < P.nodes.length { nodeAt(lv.lvLoop) } else { null }
+    const it = if l is ForIn && lv.lvSlot == 0 { unwrapParen(l.fiIter) } else { -1 }
+    if it < 0 || !(nodeAt(it) is Ident) { return -1 }
+    const et = recBuildElemTyOf(identDeclOf(it))
+    if et < 0 || tySameSealed(et, nodeTyAt(u, fnIx)) { return -1 }
+    return if tyAdmitsNull(nodeTyAt(u, fnIx)) { mkNullableTy(et) } else { et }
+  }
   if bd < 0 || bd == letIx || !(nodeAt(bd) is LetDecl) { return -1 }
   // A binding of a parameter stored at a wider record is stored there too.
   if letHoldsParamBuilt(bd, fnIx) { return letBindTy(bd, fnIx) }
@@ -2381,8 +2392,30 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   const tt = tyAt(t)
   const same = (ot is TyObj && tt is TyObj) || (ot is TyArray && tt is TyArray)
   if !same || tySameSealed(t, own) { return -1 }
-  if recFreshDeclOf(u) != bd && t == t0 && !letHoldsStoreHeld(bd) { return -1 }
+  if (
+    recFreshDeclOf(u) != bd
+    && t == t0
+    && !letHoldsStoreHeld(bd)
+    && !letAliasesLoopVar(bd, 8)
+  ) {
+    return -1
+  }
   return t
+}
+
+// Whether the un-annotated binding `d` holds a loop variable's read, directly or through such
+// bindings, so it holds what the loop's local does (D16787).
+function letAliasesLoopVar(d: i32, depth: i32): boolean {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 || depth <= 0 {
+    return false
+  }
+  const u = unwrapParen(dn.letInit)
+  if u < 0 || !(nodeAt(u) is Ident) { return false }
+  const bd = identDeclOf(u)
+  const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
+  if bn is LoopVar { return true }
+  return bn is LetDecl && letAliasesLoopVar(bd, depth - 1)
 }
 
 // The record, or list of records, the parameter read `u` is stored as in `fnIx`, its annotation,
@@ -5801,8 +5834,10 @@ export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
       const rs = listRowOfExpr(iterIx, fnIx)
       if rs >= 0 { return rlElemInnerSlot(rs) }
       const ie = if iterIx >= 0 && iterIx < P.nodes.length { nodeAt(iterIx) } else { null }
+      const ds = if ie is Ident { declaredRefArraySlot(iterIx) } else { -1 }
+      // A tagged set's list an instance walks is held at its rep, which its read's type is not.
       return rlElemInnerSlot(
-        if ie is Ident { declaredRefArraySlot(iterIx) } else { -1 },
+        if ds >= 0 { ds } else { refListSlotOfExpr(iterIx, fnIx) },
       )
     }
     // A map element or a nested-map value: the vals slot of a `.values()` walk, else the
