@@ -12527,3 +12527,48 @@ layout.
 
 **Why.** Each keeps one decider per fact at every commit while letting the migration land in measured
 steps.
+
+## A held type-parameter-like hole stays pin-generic through a write into a nullable place (2026-11-16, chosen under the owner's delegation) — D3299, D3436
+
+**The rule.** An un-annotated parameter written into a `T | null` place stays pin-generic, as `<T>` does,
+and each instance reads the place at its own pin: after `g("abc")`, `s = x; s.length` reads a
+`string`. The checker does not infer `string | null` for `x` from the place it is written into. It
+lands in two PRs (the `tvPlaceWrite` admission, identical alone; then the write-position flow skip,
+graded on a new matrix) after a census; a census showing a `runs` loss from reads of the hole itself
+takes the harder fallback instead.
+
+**Why.** It is assignment narrowing as TypeScript does it, and what a reader expects; inferring the
+parameter's type from a place it flows into inverts the direction of inference.
+
+## A bound's refusal names the parameter and the body site, with `line:col` in the text (2026-11-16, chosen under the owner's delegation) — L2 S3.5
+
+**The rule.** Each bound keeps its own sentence and hint; the parenthetical becomes the parameter and
+the body site that demanded the bound, written as `line:col` in the message. A structured related
+location (LSP, oracle) is filed as its own row. Per-kind phrasing (§4.2) is a possible later step,
+not planned.
+
+**Why.** The site is what a reader needs to act on the refusal, and text keeps every consumer working
+until the structured location exists.
+
+## A clause-1 defect may close to a check refusal first, and the row stays open (2026-11-16, chosen under the owner's delegation) — D16851, D16860
+
+**The rule.** When the real fix for a trap or invalid module is large, a PR may first make the program
+a check refusal (never an emit refusal), reusing an existing sentence. The row stays open as a loud
+clause-2 row and closes only when the program runs. The refusal is graded on the matrix A/B: it may
+not catch a cell that runs today.
+
+**Why.** Invalid wasm from plain code is the worse failure; a refusal at check is honest and
+reversible, and the open row keeps the capability owed.
+
+## A maker's returned lambda is built per signature, never widened (2026-11-16, chosen under the owner's delegation) — D16845, D16851, D16865
+
+**The rule.** A closure returned by a maker and delivered or called at two signatures is built once per
+signature, with its environment captured once, as a directly bound hole lambda already is
+(`f(3); f(3.0)` prints `1` then `1.5`). It is never built once at a widened join, and never as a
+single instance picked from two deliveries. A relay call written into a map or list element with no
+closed context takes the one closed signature its element is called at downstream, and stays
+not-closed when there are two or none. While a reader and the walk disagree on such a delivery, the
+reader matches the walk (parity) and the gap is a filed row.
+
+**Why.** Widening changes results; a single picked instance traps at the other signature. Per-signature
+instances are the one answer that matches the direct-binding semantics.
