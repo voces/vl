@@ -342,8 +342,9 @@ Deno.test({
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Case k breaks rule k for 1 to 7; case 8 falls off a valued function's end (rule 5) and
     // case 9 stores an i32 into a bool global (rule 2).
-    // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8];
+    // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
+    // case 11 a box whose immediate stands for a call (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
