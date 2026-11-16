@@ -4470,6 +4470,7 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
   }
   // Each relay's calls at closed results, and the relays one of whose calls is at none.
   const closedCalls: {[i32]: i32[]} = Map()
+  const callSig: {[i32]: i32} = Map()
   const notClosed: {[i32]: boolean} = Map()
   for c in rl.calls {
     const cn = nodeAt(c)
@@ -4480,14 +4481,16 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
         && dt < T.tys.length
         && !tyHasTyVar(dt)
         && tyAt(dt) is TyFunc
-      if closed {
+      const held = heldAt.get(c) ?? []
+      const hs = fvaOneSig(held)
+      if closed || hs >= 0 {
         const cl = closedCalls[d] ?? []
         cl.push(c)
         closedCalls[d] = cl
+        callSig[c] = if closed { dt } else { hs }
       } else {
         notClosed[d] = true
       }
-      const held = heldAt.get(c) ?? []
       if closed || held.length == 0 {
         fvaReachSig(relaySig, d, if closed { dt } else { -1 })
       } else {
@@ -4519,27 +4522,39 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
   }
   for d in relays {
     if (relaySig.get(d) ?? -2) == -1 && !(notClosed.get(d) ?? false) {
-      fvaRelayTwinRows(sigAt, rl, d, closedCalls.get(d) ?? [], innerOf)
+      fvaRelayTwinRows(sigAt, rl, d, closedCalls.get(d) ?? [], callSig, innerOf)
     }
   }
   return 0
 }
 
+// The one closed result every entry of `sigs` names, or -1 for none, an open one, or two.
+function fvaOneSig(sigs: i32[]): i32 {
+  let r = -1
+  for t in sigs {
+    if t < 0 || (r >= 0 && !tySame(r, t)) { return -1 }
+    r = t
+  }
+  return r
+}
+
 // Twins relay `d`, whose calls `calls` are each delivered at a closed result but not all at one,
 // per result, as a maker is: each call is noted at its own result, and each maker call `d` returns
-// is banked at every one of them, built per twin (D16755). Declines unless every call of `d` is at
-// a closed result, `d` is read only as their callee, and every value it returns is such a call.
+// is banked at every one of them, built per twin (D16755). A call held in an un-annotated `const`
+// takes the one result that binding's calls take. Declines unless every call has a result, `d` is
+// read only as their callee, and every value it returns is a maker call.
 function fvaRelayTwinRows(
   sigAt: {[i32]: i32},
   rl: FvaRelayScan,
   d: i32,
   calls: i32[],
+  callSig: {[i32]: i32},
   innerOf: {[i32]: i32},
 ) {
   if calls.length < 2 || (rl.handedOn.get(d) ?? false) { return 0 }
   const sigs: i32[] = []
   for c in calls {
-    const dt = nodeCtxTyIxOf(c)
+    const dt = callSig.get(c) ?? -1
     let seen = false
     for t in sigs {
       if tySame(t, dt) { seen = true }
@@ -4558,7 +4573,7 @@ function fvaRelayTwinRows(
     }
   }
   if inner.length == 0 { return 0 }
-  for c in calls { sigAt[c] = nodeCtxTyIxOf(c) }
+  for c in calls { sigAt[c] = callSig.get(c) ?? -1 }
   for x in inner {
     const xn = nodeAt(x)
     if xn is Call {
@@ -4566,43 +4581,6 @@ function fvaRelayTwinRows(
       const m = fvaMakerOfBinding(identDeclOf(r))
       for s in sigs { elabMakerRowNote(m, s) }
       fvaTwinReads[r] = true
-    }
-  }
-  return 0
-}
-
-// Notes in `fvaDeadReads` the maker reads of each relay nothing can run: not exported, not read as
-// a value, and called only from the returns of relays nothing can run.
-function fvaRelayDeadReads(
-  rl: FvaRelayScan,
-  relays: i32[],
-  innerOf: {[i32]: i32},
-) {
-  const live: {[i32]: boolean} = Map()
-  for d in relays {
-    if declIsExportedFn(d) || (rl.handedOn.get(d) ?? false) { live[d] = true }
-  }
-  // A call outside every relay's return makes its relay live; one inside a live relay's return
-  // does too. Each pass adds a relay or settles, so one pass per relay is enough.
-  let pass = 0
-  while pass <= relays.length {
-    for c in rl.calls {
-      const cn = nodeAt(c)
-      const from = innerOf.get(c) ?? -1
-      if cn is Call && (from < 0 || (live.get(from) ?? false)) {
-        live[calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))] = true
-      }
-    }
-    pass = pass + 1
-  }
-  for c in innerOf.keys() {
-    const cn = nodeAt(c)
-    if (
-      cn is Call
-      && !(live.get(innerOf.get(c) ?? -1) ?? false)
-      && fvaOpenMakerCall(c) >= 0
-    ) {
-      fvaDeadReads[parenPeelIx(cn.callFn)] = true
     }
   }
   return 0
