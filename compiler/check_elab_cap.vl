@@ -743,6 +743,10 @@ let elabMakerCallSigs: {[i32]: i32} = Map()
 // The callee read of each such call, and the makers one of whose reads takes no instance.
 let elabMakerCalleeReads: {[i32]: boolean} = Map()
 let elabMakersBlocked: {[i32]: boolean} = Map()
+// For a maker blocked only by reads no noted call covered, those reads; a maker blocked for any
+// other reason is not here.
+let elabMakerUncovered: {[i32]: i32[]} = Map()
+let elabMakersOtherBlocked: {[i32]: boolean} = Map()
 // The instanced relays whose returned maker calls are built per delivered result: each instance
 // takes the result its call delivers it at (D16780).
 let elabRelaysPerResult: {[i32]: boolean} = Map()
@@ -751,6 +755,8 @@ export function elabMakerCallReset() {
   elabMakerCallSigs = Map()
   elabMakerCalleeReads = Map()
   elabMakersBlocked = Map()
+  elabMakerUncovered = Map()
+  elabMakersOtherBlocked = Map()
   elabRelaysPerResult = Map()
   return 0
 }
@@ -773,6 +779,15 @@ export function elabMakerCallNote(call: i32, sig: i32) {
   return 0
 }
 
+// The call that initialises the un-annotated binding read `r` names, or -1.
+function elabMakerBindingCall(r: i32): i32 {
+  const d = if r >= 0 && r < P.nodes.length && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  const c = parenPeelIx(dn.letInit)
+  return if c >= 0 && c < P.nodes.length && nodeAt(c) is Call { c } else { -1 }
+}
+
 // Whether read `r` is the callee of a noted maker call.
 export function elabMakerReadCalled(r: i32): boolean {
   return elabMakerCalleeReads.get(r) ?? false
@@ -781,6 +796,43 @@ export function elabMakerReadCalled(r: i32): boolean {
 // Withdraws maker `m` from instancing: one of its reads reaches its root.
 export function elabMakerBlock(m: i32) {
   elabMakersBlocked[m] = true
+  elabMakersOtherBlocked[m] = true
+  return 0
+}
+
+// Withdraws maker `m` from instancing because reads `rs` of it are the callee of no noted call.
+export function elabMakerCoverBlock(m: i32, rs: i32[]) {
+  elabMakersBlocked[m] = true
+  elabMakerUncovered[m] = rs
+  return 0
+}
+
+// Notes maker call `c` at closed result `w` where no result is noted for it yet, and returns its
+// maker to instancing once every read a cover block named is covered; whether it noted (D16846).
+export function elabMakerTwinNote(c: i32, w: i32): boolean {
+  if elabMakerCallSigs.has(c) { return false }
+  elabMakerCallNote(c, w)
+  const cn = nodeAt(c)
+  const f = if cn is Call { parenPeelIx(cn.callFn) } else { -1 }
+  if f >= 0 && nodeAt(f) is Ident { elabMakerCoverLift(identDeclOf(f)) }
+  return true
+}
+
+// Returns maker `m` to instancing where a cover block withdrew it and every read it named is now
+// the callee of a noted call, or reads a binding whose maker call is noted.
+function elabMakerCoverLift(m: i32) {
+  const rs = elabMakerUncovered.get(m) ?? []
+  if rs.length == 0 || (elabMakersOtherBlocked.get(m) ?? false) { return 0 }
+  for r in rs {
+    if (
+      !elabMakerReadCalled(r)
+      && elabMakerCallSig(elabMakerBindingCall(r)) < 0
+    ) {
+      return 0
+    }
+  }
+  elabMakersBlocked[m] = false
+  elabMakerUncovered[m] = []
   return 0
 }
 
