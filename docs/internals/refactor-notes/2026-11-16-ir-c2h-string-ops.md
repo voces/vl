@@ -54,8 +54,8 @@ Both columns are read from fixpoint seeds of master, with C2g merged, and of thi
 | self-compile covered | 2,897 | 4,384 | +1,487 |
 | self-compile matched | 2,893 | 4,379 | +1,486 |
 
-Compiler lines are +319 / −119 over nine files, 200 net. That is about 2 covered corpus functions per
-net line and 7.4 on the self-compile.
+Compiler lines are +310 / −118 over nine files, 192 net. That is about 2 covered corpus functions per
+net line and 7.7 on the self-compile.
 
 On the self-compile, the five unlowered functions are the four named before this step, plus one
 more `folded global read`.
