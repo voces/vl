@@ -6516,25 +6516,72 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   // A list-union rewrite's test over closed arms asks which arm is stored: the tag alone.
   const luT = luIsTyOf(isIx)
   if luT >= 0 && !tyHasTyVar(luT) { return 0 }
-  if isTestsNull(isIx) || !exprUnion(nd.isObj, fnIx) { return 0 }
+  if isTestsNull(isIx) { return 0 }
   const chk = isVarTyIxOf(isIx)
-  if tyArrayElemIx(chk) < 0 { return 0 }
-  const arms: i32[] = []
-  if (!unionTyMemberTys(unionBoxTyOfRead(nd.isObj, fnIx), arms)) { return 0 }
-  const chkTag = isArmTagOfTy(chk)
-  const chkLeaf = listLeafTyOf(chk)
   const tags: i32[] = []
   const fits: i32[] = []
   const slotsAt: i32[][] = []
+  if !listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt) {
+    return 0
+  }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  fbLocalSet(slot)
+  // A nullable operand is false on null; the box is a null reference then (D4953).
+  const nullable = nodeTyIsNullable(nd.isObj)
+  if nullable {
+    fbLocalGet(slot)
+    fbRefIsNull()
+    fbIf(127)
+    fbI32Const(0)
+    fbElse()
+  }
+  if emitListIsAcrossRepsAt(slot, chk, tags, fits, slotsAt, fnIx) < 0 {
+    return -1
+  }
+  if nullable { fbEnd() }
+  return 1
+}
+
+// The box tag of list type `ty` for `emitListIsAcrossReps`: `isArmTagOfTy`'s, or for a list of
+// `i32` literals the `i32[]` tag it shares, which a tag test alone does not decide (D14041).
+function listIsArmTag(ty: i32): i32 {
+  const t = isArmTagOfTy(ty)
+  if t >= 0 { return t }
+  const e = tyArrayElemIx(ty)
+  if e < 0 || numLitUnionBaseName(e) != "i32" || boxTagOfTy(ty) != 7 {
+    return -1
+  }
+  return scalarTagOfKind(7)
+}
+
+// Plans `recv is chk` for list type `chk` over a box: one entry per tag in `tags`, with how
+// `fits` tests it and the reflist `slotsAt` its element loop walks. False when the operand is
+// not a box of list arms, when some arm has no test, or when the tag alone answers.
+function listIsAcrossRepsPlan(
+  recv: i32,
+  chk: i32,
+  fnIx: i32,
+  tags: i32[],
+  fits: i32[],
+  slotsAt: i32[][],
+): boolean {
+  if !exprUnion(recv, fnIx) { return false }
+  if tyArrayElemIx(chk) < 0 { return false }
+  const arms: i32[] = []
+  if (!unionTyMemberTys(unionBoxTyOfRead(recv, fnIx), arms)) { return false }
+  const chkTag = listIsArmTag(chk)
   let other = false
   for a in arms {
     if tyArrayElemIx(a) >= 0 {
-      const t = isArmTagOfTy(a)
-      if t < 0 { return 0 }
+      const t = listIsArmTag(a)
+      if t < 0 { return false }
       // A ref-element arm's list row is minted here, where the test is lowered: the branch the
       // test narrows reads that arm's elements through it.
       if unMemIsRefElemArray(a) { unMemRefArrArmSlot(a) }
-      let k = if tySame(a, chk) { LIST_ARM_OWN } else { listArmFitAcrossReps(a, chk) }
+      // A list of `i32` literals is read by its elements even as its own arm: the box it shares
+      // with `i32[]` may hold either.
+      let k = if !tySame(a, chk) { listArmFitAcrossReps(a, chk) } else if isArmTagOfTy(chk) >= 0 { LIST_ARM_OWN } else { 0 }
       const slots: i32[] = []
       if k == 0 {
         // An arm with another tag holds a list whose element type is fixed apart from the
@@ -6542,7 +6589,7 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
         // is the exception: an `i32` list arm as deep fits it by its elements (D4778).
         if t != chkTag && listArmNumsDepth(a, chk) < 0 { continue }
         k = listArmSharedTagFit(a, chk, slots)
-        if k == 0 { return 0 }
+        if k == 0 { return false }
       }
       if !tySame(a, chk) { other = true }
       let j = tags.length - 1
@@ -6566,24 +6613,25 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
           fits[j] = k
           slotsAt[j] = slots
         } else if !(k == LIST_ARM_OWN && elemJ) {
-          return 0
+          return false
         }
       }
     }
   }
-  if !other { return 0 }
-  const slot = sharedFieldRecvSlot()
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-  fbLocalSet(slot)
-  // A nullable operand is false on null; the box is a null reference then (D4953).
-  const nullable = nodeTyIsNullable(nd.isObj)
-  if nullable {
-    fbLocalGet(slot)
-    fbRefIsNull()
-    fbIf(127)
-    fbI32Const(0)
-    fbElse()
-  }
+  // `L` alone is tested by its tag in the later rungs, unless only this plan has its tag.
+  return other || isArmTagOfTy(chk) < 0
+}
+
+// The planned test over the non-null box in local `slot`, leaving a 0/1 i32. 0, or -1 on failure.
+function emitListIsAcrossRepsAt(
+  slot: i32,
+  chk: i32,
+  tags: i32[],
+  fits: i32[],
+  slotsAt: i32[][],
+  fnIx: i32,
+): i32 {
+  const chkLeaf = listLeafTyOf(chk)
   const lexes = tyLitMemberTexts(chkLeaf)
   fbI32Const(0)
   let i = 0
@@ -6652,8 +6700,7 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
     fbI32Bin(114) // 0x72 i32.or
     i = i + 1
   }
-  if nullable { fbEnd() }
-  return 1
+  return 0
 }
 
 // How `emitListIsAcrossReps` tests one tag: by the tag alone (`L`, or an arm every element of
@@ -6686,8 +6733,8 @@ function listArmSharedTagFit(a: i32, chk: i32, slots: i32[]): i32 {
   return 0
 }
 
-// The list layers below the outermost when list arm `a` is `i32[]…[]` and `chk` a list of `i32`
-// literals as deep, which a value of `a` fits exactly when every leaf is a member (D4778); -1
+// The list layers below the outermost when list arm `a` is `i32[]…[]` or a list of `i32` literals
+// and `chk` a list of `i32` literals as deep, which a value of `a` fits exactly when every leaf is a member (D4778); -1
 // otherwise.
 function listArmNumsDepth(a: i32, chk: i32): i32 {
   let ae = tyArrayElemIx(a)
@@ -6698,7 +6745,8 @@ function listArmNumsDepth(a: i32, chk: i32): i32 {
     ce = tyArrayElemIx(ce)
     d = d + 1
   }
-  if ae < 0 || ce < 0 || tyPrimNameOf(ae) != "i32" { return -1 }
+  if ae < 0 || ce < 0 { return -1 }
+  if tyPrimNameOf(ae) != "i32" && numLitUnionBaseName(ae) != "i32" { return -1 }
   if tyArrayElemIx(ae) >= 0 || tyArrayElemIx(ce) >= 0 { return -1 }
   return if numLitUnionBaseName(ce) == "i32" { d } else { -1 }
 }
@@ -24864,6 +24912,8 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
     const rl = emitAsBoxToLitUnion(e, _exprIx, tty, fnIx)
     return rl
   }
+  const lxr = emitAsListAcrossReps(e, tty, fnIx)
+  if lxr != 0 { return if lxr < 0 { -1 } else { 0 } }
   const wantTags: i32[] = []
   const wantVis: i32[] = []
   const recvUt = unionTyOfRecv(nodeTyInOf(unwrapParen(obj), fnIx))
@@ -24918,6 +24968,71 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
     }
     wi = wi + 1
   }
+  return emitAsUnionTail(e, subUnion, armVi, ak, mapHeap)
+}
+
+// The cast of `e` to list type `tty` over a box whose list arms `emitListIsAcrossReps` tests by
+// their elements: that test, then the unbox at `tty`'s wrapper, which every tested arm shares
+// (D14042). 0 when the cast is not that shape, 1 when emitted, -1 on failure.
+function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
+  if nodeTyIsNullable(e.asObj) { return 0 }
+  const tags: i32[] = []
+  const fits: i32[] = []
+  const slotsAt: i32[][] = []
+  if !listIsAcrossRepsPlan(e.asObj, tty, fnIx, tags, fits, slotsAt) { return 0 }
+  const heap = listArmHeapOf(tty)
+  if heap < 0 { return 0 }
+  const arms: i32[] = []
+  if !unionTyMemberTys(unionBoxTyOfRead(e.asObj, fnIx), arms) { return 0 }
+  for a in arms {
+    if (
+      tyArrayElemIx(a) >= 0
+      && listIsArmTag(a) >= 0
+      && listArmHeapOf(a) != heap
+    ) {
+      let i = 0
+      while i < tags.length && tags[i] != listIsArmTag(a) { i = i + 1 }
+      if i < tags.length { return 0 }
+    }
+  }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  fbLocalSet(unionAsBoxSlot())
+  const r = emitListIsAcrossRepsAt(
+    unionAsBoxSlot(),
+    tty,
+    tags,
+    fits,
+    slotsAt,
+    fnIx,
+  )
+  if r < 0 { return -1 }
+  if emitAsUnionTail(e, false, -1, -1, heap) < 0 { return -1 }
+  return 1
+}
+
+// The heap of list type `ty`'s wrapper in a union box, or -1 when it has none.
+function listArmHeapOf(ty: i32): i32 {
+  const k = boxTagOfTy(ty)
+  if k >= 0 {
+    const h = listWrapHeapOfKind(k)
+    return if h > 0 { h } else { -1 }
+  }
+  if !unMemIsRefElemArray(ty) { return -1 }
+  const rs = unMemRefArrArmSlot(ty)
+  return if rs >= 0 && rs < rlWrapIdx.length { rlWrapIdx[rs] } else { -1 }
+}
+
+// A union-operand cast after its arm test is on the stack: `as?`'s value or `null`, or `as`'s
+// propagated and `as!`'s trapping miss, then the unbox at the arm `subUnion`, `armVi`, `ak` and
+// `mapHeap` name. Returns 0 or -1.
+function emitAsUnionTail(
+  e: AsExpr,
+  subUnion: boolean,
+  armVi: i32,
+  ak: i32,
+  mapHeap: i32,
+) {
+  const tgt = e.asTy
   // `as?` yields a value on both paths (a value-producing `if`, not the early exit `as`/
   // `as!` take): `T` when the tag matches, `null` when it does not. Supported only where
   // `T | null` already has a rep — `Circle | null` over a union arm has none yet
@@ -40889,7 +41004,7 @@ function emitArrayNewIntr(callIx: i32, fnIx: i32) {
       }
       fbLocalSet(anLenL)
       if anIsNew {
-        const anFillRc = emitArrNewFill(c.callArgs[1], fnIx)
+        const anFillRc = emitArrNewFillAt(callIx, c.callArgs[1], fnIx)
         if anFillRc < 0 { return -1 }
         fbLocalGet(anLenL)
         fbArrayNew(anBack)
@@ -40955,6 +41070,22 @@ function emitArrNewFill(fill: i32, fnIx: i32): i32 {
   arrNewFillDepth = arrNewFillDepth - 1
   if anFillRc < 0 { return -1 }
   return 0
+}
+
+// `emitArrNewFill` for the `__array_new__` call `callIx`: a fill the checker built at a union
+// element of its destination is boxed into that element (D16887).
+function emitArrNewFillAt(callIx: i32, fill: i32, fnIx: i32): i32 {
+  const lt = nodeTyAt(callIx, fnIx)
+  const lty = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  const et = if lty is TyArray { tyElemOf(lty) } else { -1 }
+  const nm = if et >= 0 { boxTyName(et) } else { "" }
+  if nm == "" || exprUnion(fill, fnIx) || repOfTy(et).rdKind != "union" {
+    return emitArrNewFill(fill, fnIx)
+  }
+  arrNewFillDepth = arrNewFillDepth + 1
+  const rc = emitUnionBoxArg(nm, et, fill, fnIx)
+  arrNewFillDepth = arrNewFillDepth - 1
+  return if rc < 0 { -1 } else { 0 }
 }
 
 // The `__array_copy__(dst, dstAt, src, srcAt, count)` intrinsic lowering.

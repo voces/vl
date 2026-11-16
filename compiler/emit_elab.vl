@@ -2,6 +2,7 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import { emitFail } from "./emit_bytes"
 import {
   calleeNamesDecl,
   handBackCopySeedsNote,
@@ -58,7 +59,11 @@ import { constListFnElemDecl, elabNullOnlyTp, slotOfRead } from "./check_calls"
 
 import { litMembersBaseTy } from "./check_literals"
 import { nomErasedTyIx, tyIsValueUnionBox } from "./check_ty_rep"
-import { ftParamListCopied, ftWithinInstancedFn } from "./check_fn_tag"
+import {
+  fnTagLateRows,
+  ftParamListCopied,
+  ftWithinInstancedFn,
+} from "./check_fn_tag"
 import {
   ArrayLit,
   AsExpr,
@@ -662,27 +667,35 @@ function elabBindStr(t: i32, canon: boolean): string {
     for fd in fds { fk = fk + "#" + i32ToStr(fd) }
     return fk
   }
-  let r = if canon { elabCanonStr(t, ELAB_CANON_DEPTH) } else { tyToStructStr(t) }
+  let r = if canon { elabCanonStr(t, []) } else { tyToStructStr(t) }
   if tyHasTyVar(t) {
     const ds: i32[] = []
-    elabFnIdsIn(t, ds, 0)
+    elabFnIdsIn(t, ds, [])
     for d in ds { r = r + "#" + i32ToStr(d) }
   }
   return r
 }
 
-const ELAB_CANON_DEPTH = 16
-
 // Type `t` spelled structurally with every union's members sorted, so two orders of one union
 // spell alike; past `depth` levels, its plain structural spelling.
-function elabCanonStr(t: i32, depth: i32): string {
-  if t < 0 || t >= T.tys.length || depth <= 0 { return tyToStructStr(t) }
+function elabCanonStr(t: i32, tys: i32[]): string {
+  if t < 0 || t >= T.tys.length || i32ListHas(tys, t) {
+    return tyToStructStr(t)
+  }
+  tys.push(t)
+  const r = elabCanonGo(t, tys)
+  tys.pop()
+  return r
+}
+
+function elabCanonGo(t: i32, tys: i32[]): string {
+  if t < 0 || t >= T.tys.length { return tyToStructStr(t) }
   const ty = tyAt(t)
   return match ty {
     TyUnion => {
       const ms: string[] = []
       for m in ty.uMembers {
-        const s = elabCanonStr(m, depth - 1)
+        const s = elabCanonStr(m, tys)
         let j = ms.length
         ms.push(s)
         while j > 0 && ms[j - 1] > s {
@@ -702,16 +715,16 @@ function elabCanonStr(t: i32, depth: i32): string {
     }
     TyArray => {
       const ro = if ty.aRead != 0 { "readonly " } else { "" }
-      "(" + ro + elabCanonStr(tyElemOf(ty), depth - 1) + ")[]"
+      "(" + ro + elabCanonStr(tyElemOf(ty), tys) + ")[]"
     }
-    TyNullable => "(" + elabCanonStr(ty.nInner, depth - 1) + ")?"
+    TyNullable => "(" + elabCanonStr(ty.nInner, tys) + ")?"
     TyMap => {
       const kind = if ty.mSet != 0 { "set" } else { "map" }
       kind
         + "{"
-        + elabCanonStr(tyKeyOf(ty), depth - 1)
+        + elabCanonStr(tyKeyOf(ty), tys)
         + ":"
-        + elabCanonStr(tyValOf(ty), depth - 1)
+        + elabCanonStr(tyValOf(ty), tys)
         + "}"
     }
     TyObj => {
@@ -721,7 +734,7 @@ function elabCanonStr(t: i32, depth: i32): string {
         r = r
           + ty.objFieldNames[i]
           + ":"
-          + elabCanonStr(ty.objFieldTypes[i], depth - 1)
+          + elabCanonStr(ty.objFieldTypes[i], tys)
           + ","
         i = i + 1
       }
@@ -729,10 +742,10 @@ function elabCanonStr(t: i32, depth: i32): string {
     }
     TyFunc => {
       let r = "fn("
-      for p in ty.fnParamTypes { r = r + elabCanonStr(p, depth - 1) + "," }
-      r + ")=>" + elabCanonStr(ty.fnRet, depth - 1)
+      for p in ty.fnParamTypes { r = r + elabCanonStr(p, tys) + "," }
+      r + ")=>" + elabCanonStr(ty.fnRet, tys)
     }
-    TyNeg => "!(" + elabCanonStr(ty.negTy, depth - 1) + ")"
+    TyNeg => "!(" + elabCanonStr(ty.negTy, tys) + ")"
     TyPrim | TyErr | TyVar | TyLit => tyToStructStr(t)
   }
 }
@@ -830,7 +843,7 @@ function elabCapReads(d: i32, ix: i32, nm: string): boolean {
     if (
       dc >= 0
       && !nodeContains(d, dc)
-      && tyMentionsTyVarNamed(nodeTyIxOf(dc), nm, 16)
+      && tyMentionsTyVarNamed(nodeTyIxOf(dc), nm)
     ) {
       return true
     }
@@ -1424,9 +1437,9 @@ function elabSigReads(decl: i32, name: string): boolean {
   const n = nodeAt(decl)
   if !(n is FuncDecl) { return false }
   for p in n.fnParams {
-    if tyMentionsTyVarNamed(nodeTyIxOf(p), name, 16) { return true }
+    if tyMentionsTyVarNamed(nodeTyIxOf(p), name) { return true }
   }
-  return tyMentionsTyVarNamed(nodeTyIxOf(decl), name, 16)
+  return tyMentionsTyVarNamed(nodeTyIxOf(decl), name)
 }
 
 // The canonical binding of `decl` from `names0`/`tys0`: its own names and the ones its signature
@@ -1616,7 +1629,7 @@ function elabParamsClosed(decl: i32, names: string[], tys: i32[]): boolean {
     if f is TyFunc {
       const rt = substTyDeep(f.fnRet, names, marks)
       for tp in dn.fnTyParams {
-        if !open && tyMentionsTyVarNamed(rt, tp, 16) { open = true }
+        if !open && tyMentionsTyVarNamed(rt, tp) { open = true }
       }
     }
   }
@@ -1667,12 +1680,26 @@ let elabRunKeyEnd = -1
 // The declaration name of each key minted after `elabRun` returned (`$VL_LATE_DEMANDS`).
 let elabLateNames: string[] = []
 
-// How many keys the elaboration minted after `elabRun` returned, and the name of the `i`th.
-export function elabLateCount(): i32 { return elabLateNames.length }
+// The late list the host reads: `elabLateNames`, then the tag decision's late rows, which carry a
+// space where a declaration name cannot (`fnTagLateRows`). `elabLateCount` builds it.
+let elabLateList: string[] = []
 
-export function elabLateLen(i: i32): i32 { return elabLateNames[i].length }
+// How many keys the elaboration minted after `elabRun` returned, plus the late tag rows; the
+// `i`th's text is read through `elabLateLen` and `elabLateAt`.
+export function elabLateCount(): i32 {
+  elabLateList = []
+  for n in elabLateNames { elabLateList.push(n) }
+  for r in fnTagLateRows() { elabLateList.push(r) }
+  return elabLateList.length
+}
 
-export function elabLateAt(i: i32, j: i32): i32 { return elabLateNames[i][j] }
+export function elabLateLen(i: i32): i32 {
+  return if i >= 0 && i < elabLateList.length { elabLateList[i].length } else { 0 }
+}
+
+export function elabLateAt(i: i32, j: i32): i32 {
+  return if i >= 0 && i < elabLateList.length && j >= 0 && j < elabLateList[i].length { elabLateList[i][j] } else { 0 }
+}
 
 function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   if decl < 0 || !(nodeAt(decl) is FuncDecl) { return -1 }
@@ -1876,7 +1903,7 @@ export function elabLamInheritedOwn(
   let i = 0
   while i < names.length && i < tys.length {
     const foreign = lam
-      && tyMentionsTyVarNamed(sig, names[i], 16)
+      && tyMentionsTyVarNamed(sig, names[i])
       && !tyMentionsOwnVarNamed(sig, names[i], self, 16)
     if !foreign {
       outN.push(names[i])
@@ -1972,13 +1999,13 @@ export function elabMakerTwinParamTy(d: i32, ret: i32, i: i32): i32 {
 // The wide twin of instance `k` the elaboration built returning `w`, or -1.
 export function elabWideTwinOf(k: i32, w: i32): i32 {
   if k < 0 || w < 0 || w >= T.tys.length { return -1 }
-  return ekIndex[i32ToStr(k) + "=>" + elabCanonStr(w, ELAB_CANON_DEPTH)] ?? -1
+  return ekIndex[i32ToStr(k) + "=>" + elabCanonStr(w, [])] ?? -1
 }
 
 // Instance `k` built returning the wider `w`: the same binding under its own key, its body
 // checked once more there; `k` itself when no key is left.
 function elabWideTwin(k: i32, w: i32, from: i32): i32 {
-  const key = i32ToStr(k) + "=>" + elabCanonStr(w, ELAB_CANON_DEPTH)
+  const key = i32ToStr(k) + "=>" + elabCanonStr(w, [])
   const have = ekIndex[key] ?? -1
   if have >= 0 { return have }
   if ekDecl.length >= ELAB_MAX_KEYS { return k }
@@ -2247,7 +2274,7 @@ function elabDemandFrom(
       for pt in f.fnParamTypes {
         const bt = substTyDeep(pt, ekNames[ck], ekTys[ck])
         const ds: i32[] = []
-        if bt >= 0 && tyHasTyVar(bt) { elabFnIdsIn(bt, ds, 0) }
+        if bt >= 0 && tyHasTyVar(bt) { elabFnIdsIn(bt, ds, []) }
         let id = false
         for d in ds {
           if elabReachedOf(ck, d) < -1 { id = true }
@@ -2793,7 +2820,7 @@ function elabCkUsable(decl: i32, call: i32, from: i32): i32 {
       return -1
     }
     const ds: i32[] = []
-    elabFnIdsIn(t, ds, 0)
+    elabFnIdsIn(t, ds, [])
     if ds.length > 0 { return -1 }
   }
   return ck
@@ -3162,11 +3189,11 @@ function elabSubtreeReads(ix: i32, name: string): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   let cur = ix
   while cur >= 0 {
-    if tyMentionsTyVarNamed(nodeTyIxOf(cur), name, 16) { return true }
+    if tyMentionsTyVarNamed(nodeTyIxOf(cur), name) { return true }
     const row = callBindRowOf(cur)
     if row >= 0 {
       for t in callBindTysAt(row) {
-        if tyMentionsTyVarNamed(t, name, 16) { return true }
+        if tyMentionsTyVarNamed(t, name) { return true }
       }
     }
     for kid in nodeSpineChildren(cur) {
@@ -3870,53 +3897,52 @@ function elabAnnotatedDeliveryRows(g: i32) {
   if n is LetDecl {
     const t = nodeTyIxOf(g)
     if n.letType >= 0 {
-      if elabClosedFnTy(t) { elabDeliverAt(n.letInit, t, 0) }
+      if elabClosedFnTy(t) { elabDeliverAt(n.letInit, t) }
     } else {
       const args = elabBindingCallArgs(g)
-      if args.length > 0 { elabDeliverParams(n.letInit, args, 0) }
+      if args.length > 0 { elabDeliverParams(n.letInit, args, []) }
     }
   } else if n is BinExpr {
     const args = elabBindingCallArgs(elabWrittenLet(n.binLeft))
-    if args.length > 0 { elabDeliverParams(n.binRight, args, 0) }
+    if args.length > 0 { elabDeliverParams(n.binRight, args, []) }
   } else if n is FuncDecl {
     const s = nodeTyIxOf(g)
     const f = if s >= 0 && s < T.tys.length { tyAt(s) } else { tyAt(0) }
     if f is TyFunc && elabClosedFnTy(f.fnRet) {
       const rets: i32[] = []
       a20RetWalk(n.fnBody, true, rets)
-      for r in rets { elabDeliverAt(r, f.fnRet, 0) }
+      for r in rets { elabDeliverAt(r, f.fnRet) }
     }
   }
   return 0
 }
 
 // `elabArgValueRows` for value `v` delivered at closed type `t`, through the values a call of a
-// function with no type parameters returns, `depth` calls in.
-function elabDeliverAt(v: i32, t: i32, depth: i32) {
+// function with no type parameters returns.
+function elabDeliverAt(v: i32, t: i32) {
   const f = tyAt(t)
-  if f is TyFunc { elabDeliverParams(v, f.fnParamTypes, depth) } else { 0 }
+  if f is TyFunc { elabDeliverParams(v, f.fnParamTypes, []) } else { 0 }
 }
 
-// `elabDeliverAt` for a function value called at parameter types `pts`.
-function elabDeliverParams(v: i32, pts: i32[], depth: i32) {
+// `elabDeliverAt` for a function value called at parameter types `pts`; `seen` holds the
+// functions whose returned values are already followed, so a recursive one is followed once.
+function elabDeliverParams(v: i32, pts: i32[], seen: i32[]) {
   const p = parenPeelIx(v)
-  if p < 0 || p >= P.nodes.length || depth > ELAB_DELIVER_CALL_MAX { return 0 }
+  if p < 0 || p >= P.nodes.length { return 0 }
   const pn = nodeAt(p)
   if pn is Call {
     const d = identDeclOf(parenPeelIx(pn.callFn))
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { pn }
-    if dn is FuncDecl && dn.fnTyParams.length == 0 {
+    if dn is FuncDecl && dn.fnTyParams.length == 0 && !i32ListHas(seen, d) {
+      seen.push(d)
       const rets: i32[] = []
       a20RetWalk(dn.fnBody, true, rets)
-      for r in rets { elabDeliverParams(r, pts, depth + 1) }
+      for r in rets { elabDeliverParams(r, pts, seen) }
     }
     return 0
   }
   return elabValueRowsAtParams(p, pts, -1)
 }
-
-// How many calls `elabDeliverAt` follows into the values they return.
-const ELAB_DELIVER_CALL_MAX = 8
 
 // Whether `t` is a function type with no hole or type variable left.
 function elabClosedFnTy(t: i32) {
@@ -4168,10 +4194,10 @@ function elabKeyCallsHandSetValue(k: i32, c: i32, d: i32): boolean {
   const dn = nodeAt(d)
   if !(dn is FuncDecl) { return false }
   const pi = i32ListIndexOf(dn.fnParams, identDeclOf(parenPeelIx(cn.callFn)))
-  if elabReachHandsSet(k, d, pi, elabMintSets[c] ?? -1, 0) { return true }
+  if elabReachHandsSet(k, d, pi, elabMintSets[c] ?? -1, []) { return true }
   for a in elabMintCalls[c] ?? [] {
     const s = elabCallInstSets[i32ToStr(a) + "|" + i32ToStr(c)] ?? -1
-    if s != (elabMintSets[c] ?? -1) && elabReachHandsSet(k, d, pi, s, 0) {
+    if s != (elabMintSets[c] ?? -1) && elabReachHandsSet(k, d, pi, s, []) {
       return true
     }
   }
@@ -4186,14 +4212,33 @@ function elabReachHandsSet(
   d: i32,
   pi: i32,
   s: i32,
-  depth: i32,
+  path: i32[],
 ): boolean {
   const cs = elabKeyCalls[k] ?? []
   if cs.length == 0 || (elabRepRowCalls[k] ?? []).length > 0 { return false }
   const dn = nodeAt(d)
-  if !(dn is FuncDecl) || dn.fnName == "" || pi < 0 || s < 0 || depth > 8 {
-    return false
+  if !(dn is FuncDecl) || dn.fnName == "" || pi < 0 || s < 0 { return false }
+  let q = 0
+  while q + 1 < path.length {
+    if path[q] == k && path[q + 1] == pi { return false }
+    q = q + 2
   }
+  path.push(k)
+  path.push(pi)
+  const ok = elabReachHandsAll(k, d, pi, s, path, cs)
+  path.pop()
+  path.pop()
+  return ok
+}
+
+function elabReachHandsAll(
+  k: i32,
+  d: i32,
+  pi: i32,
+  s: i32,
+  path: i32[],
+  cs: i32[],
+): boolean {
   for x in cs {
     const xn = nodeAt(x)
     if !(xn is Call) || pi >= xn.callArgs.length { return false }
@@ -4208,7 +4253,7 @@ function elabReachHandsSet(
         const at = if ks[j] < 0 { nodeTyIxOf(ax) } else { elabNodeTy(ax, ks[j]) }
         if (
           fnTagSetOfTy(at) != s
-          && !elabReachParamHandsSet(ks[j], ax, s, depth)
+          && !elabReachParamHandsSet(ks[j], ax, s, path)
         ) {
           return false
         }
@@ -4225,7 +4270,7 @@ function elabReachParamHandsSet(
   from: i32,
   ax: i32,
   s: i32,
-  depth: i32,
+  path: i32[],
 ): boolean {
   if from < 0 { return false }
   const a = parenPeelIx(ax)
@@ -4234,7 +4279,7 @@ function elabReachParamHandsSet(
   const fn = nodeAt(fd)
   if !(fn is FuncDecl) { return false }
   const q = i32ListIndexOf(fn.fnParams, identDeclOf(a))
-  return q >= 0 && elabReachHandsSet(from, fd, q, s, depth + 1)
+  return q >= 0 && elabReachHandsSet(from, fd, q, s, path)
 }
 
 // Whether every call reaching instance `k` hands, at the parameter of `d` that call `c` calls
@@ -4532,7 +4577,7 @@ function elabAliasSetFwd(
         if (
           cn is Call
           && parenPeelIx(cn.callFn) == x
-          && elabAliasSource(d, fn, 8, k) >= 0
+          && elabAliasSource(d, fn, k) >= 0
         ) {
           continue
         }
@@ -5087,8 +5132,8 @@ function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
   const ap = elabCallOnlyAlias(d, dn, k)
   if ap >= 0 { return ap }
   // So does one also handed on, where each hand-on forwards the parameter (`elabAliasSetFwd`).
-  const hp = elabAliasSource(d, dn, 8, k)
-  if hp >= 0 && elabAliasReadsOk(d, dn, 8, k, true) { return hp }
+  const hp = elabAliasSource(d, dn, k)
+  if hp >= 0 && elabAliasReadsOk(d, dn, [], k, true) { return hp }
   const lp = elabHolderParamSource(d, dn)
   if lp >= 0 { return lp }
   const jp = elabListJoinAt(d, dn, k)
@@ -5697,15 +5742,20 @@ function elabWrittenAliasReadsOk(d: i32, fn: FuncDecl): boolean {
 // such bindings, where every read of `d` in `fn`'s body is a call's callee or the initialiser of
 // another such binding: the alias hands the set nowhere else and nothing re-points it; else -1.
 function elabCallOnlyAlias(d: i32, fn: FuncDecl, k: i32): i32 {
-  const pd = elabAliasSource(d, fn, 8, k)
-  if pd < 0 || !elabAliasReadsOk(d, fn, 8, k, false) { return -1 }
+  const pd = elabAliasSource(d, fn, k)
+  if pd < 0 || !elabAliasReadsOk(d, fn, [], k, false) { return -1 }
   return pd
 }
 
-// The parameter of `fn` the binding `d` is initialised with, through at most `depth` bindings
-// each initialised with the one before it; -1 when the chain reaches anything else.
-function elabAliasSource(d: i32, fn: FuncDecl, depth: i32, k: i32): i32 {
-  if depth <= 0 || d < 0 || d >= P.nodes.length { return -1 }
+// The parameter of `fn` the binding `d` is initialised with, through bindings each initialised
+// with the one before it; -1 when the chain reaches anything else or comes back to a binding.
+function elabAliasSource(d: i32, fn: FuncDecl, k: i32): i32 {
+  return elabAliasSourceGo(d, fn, k, [])
+}
+
+function elabAliasSourceGo(d: i32, fn: FuncDecl, k: i32, seen: i32[]): i32 {
+  if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return -1 }
+  seen.push(d)
   const ln = nodeAt(d)
   if !(ln is LetDecl) || ln.letInit < 0 { return -1 }
   // A binding annotated with `fn`'s own type parameter is a copy of a parameter annotated the same.
@@ -5714,7 +5764,7 @@ function elabAliasSource(d: i32, fn: FuncDecl, depth: i32, k: i32): i32 {
   const ix = parenPeelIx(ln.letInit)
   if ix < 0 || !(nodeAt(ix) is Ident) { return -1 }
   const src = identDeclOf(ix)
-  const r = if i32ListHas(fn.fnParams, src) { src } else { elabAliasSource(src, fn, depth - 1, k) }
+  const r = if i32ListHas(fn.fnParams, src) { src } else { elabAliasSourceGo(src, fn, k, seen) }
   if r >= 0 && own != "" && !elabOwnAgreesWith(fn, own, r, k) { return -1 }
   return r
 }
@@ -5749,7 +5799,7 @@ export function elabTyParamSeedParam(fn: FuncDecl, tp: string): i32 {
       if n is LetDecl && n.letType >= 0 && n.letType < P.nodes.length {
         const tn = nodeAt(n.letType)
         if tn is TypeRef && tn.tyName == tp {
-          const r = elabReadSeedParam(n.letInit, fn, 8)
+          const r = elabReadSeedParam(n.letInit, fn, [])
           if r < 0 { return -1 }
           if seed < 0 { seed = r }
         }
@@ -5766,16 +5816,17 @@ export function elabTyParamSeedParam(fn: FuncDecl, tp: string): i32 {
 }
 
 // The parameter of `fn` that `ix` reads, directly or through bindings each initialised by a read
-// of the one before, within `depth` bindings; else -1.
-function elabReadSeedParam(ix: i32, fn: FuncDecl, depth: i32): i32 {
+// of the one before; else -1, as where the chain comes back to a binding `seen` holds.
+function elabReadSeedParam(ix: i32, fn: FuncDecl, seen: i32[]): i32 {
   const v = parenPeelIx(ix)
-  if depth <= 0 || v < 0 || !(nodeAt(v) is Ident) { return -1 }
+  if v < 0 || !(nodeAt(v) is Ident) { return -1 }
   const d = identDeclOf(v)
   if i32ListHas(fn.fnParams, d) { return d }
-  if d < 0 || d >= P.nodes.length { return -1 }
+  if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return -1 }
   const ln = nodeAt(d)
   if !(ln is LetDecl) { return -1 }
-  return elabReadSeedParam(ln.letInit, fn, depth - 1)
+  seen.push(d)
+  return elabReadSeedParam(ln.letInit, fn, seen)
 }
 
 // Whether a binding of `fn` annotated bare with one of its type parameters other than `tp` is
@@ -5796,7 +5847,7 @@ export function elabParamSeedsOtherTyParam(
           tn is TypeRef
           && tn.tyName != tp
           && strListHas(fn.fnTyParams, tn.tyName)
-          && elabReadSeedParam(n.letInit, fn, 8) == p
+          && elabReadSeedParam(n.letInit, fn, []) == p
         ) {
           return true
         }
@@ -5863,7 +5914,7 @@ function elabSeedCalls(fn: FuncDecl, pd: i32): i32[] {
         if (
           cf >= 0
           && nodeAt(cf) is Ident
-          && elabReadSeedParam(cf, fn, 8) == pd
+          && elabReadSeedParam(cf, fn, []) == pd
         ) {
           out.push(ix)
         }
@@ -5914,16 +5965,17 @@ function elabTyParamsAgreeAt(a: string, b: string, k: i32): boolean {
 }
 
 // Whether every read of binding `d` in `fn`'s body is a call's callee, or the initialiser of a
-// binding (unannotated, or a copy `elabAliasSource` takes) whose own reads are so, within `depth`
-// bindings.
+// binding (unannotated, or a copy `elabAliasSource` takes) whose own reads are so. A binding
+// `seen` already holds is a cycle, and fails.
 function elabAliasReadsOk(
   d: i32,
   fn: FuncDecl,
-  depth: i32,
+  seen: i32[],
   k: i32,
   handOk: boolean,
 ): boolean {
-  if depth <= 0 { return false }
+  if i32ListHas(seen, d) { return false }
+  seen.push(d)
   const todo: i32[] = [fn.fnBody]
   const par: i32[] = [-1]
   while todo.length > 0 {
@@ -5936,8 +5988,8 @@ function elabAliasReadsOk(
           || elabClosedDestTy(x, p) >= 0
         const seeds = pn is LetDecl
           && parenPeelIx(pn.letInit) == x
-          && (pn.letType < 0 || elabAliasSource(p, fn, depth, k) >= 0)
-          && elabAliasReadsOk(p, fn, depth - 1, k, handOk)
+          && (pn.letType < 0 || elabAliasSource(p, fn, k) >= 0)
+          && elabAliasReadsOk(p, fn, seen, k, handOk)
         const handed = handOk && pn is Call && i32ListHas(pn.callArgs, x)
         if !callee && !seeds && !handed { return false }
       }
@@ -6925,11 +6977,12 @@ function elabResScanIdent(g: i32) {
 // Whether declaration `d` can hold a record: a binding initialised by a call that can return a
 // record, or an unannotated `const` (or never-assigned `let`) initialised with a read of a
 // parameter or of another such binding. The scan banks reads of such a binding alone, as nothing else can be a holder.
-function elabResMayHold(d: i32): boolean { return elabResMayHoldAt(d, 8) }
+function elabResMayHold(d: i32): boolean { return elabResMayHoldAt(d, []) }
 
-// `elabResMayHold` through at most `depth` copies of copies.
-function elabResMayHoldAt(d: i32, depth: i32): boolean {
-  if depth <= 0 || d < 0 || d >= P.nodes.length { return false }
+// `elabResMayHold` through copies of copies; a declaration `seen` already holds is a cycle.
+function elabResMayHoldAt(d: i32, seen: i32[]): boolean {
+  if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return false }
+  seen.push(d)
   const n = nodeAt(d)
   if !(n is LetDecl) || n.letInit < 0 { return false }
   const v = parenPeelIx(n.letInit)
@@ -6940,7 +6993,7 @@ function elabResMayHoldAt(d: i32, depth: i32): boolean {
   if pd < 0 || pd >= P.nodes.length { return false }
   const src = nodeAt(pd) is Param
     || elabResCallHolder(pd)
-    || elabResMayHoldAt(pd, depth - 1)
+    || elabResMayHoldAt(pd, seen)
   // A `let` copy never assigned is the record its source is, as a `const` copy is.
   return src && (n.letKw == "const" || !elabLetAssigned(d))
 }
@@ -6991,7 +7044,7 @@ function elabSlotStoreMemberNote(c: i32, d: i32, f: string) {
   const h = elabSlotHolderOf(c)
   if h < 0 || !elabInPlainCode(c) { return 0 }
   const call = elabSlotValueCall(c)
-  const rec = elabCallRecord(call, -1, 4)
+  const rec = elabCallRecord(call, -1)
   if rec.length < 2 { return 0 }
   const dt = nodeTyIxOf(d)
   const o = if dt >= 0 && dt < T.tys.length { tyAt(dt) } else { null }
@@ -7231,7 +7284,7 @@ function elabSlotRecordNote(c: i32) {
     if isList && !(ln is ArrayLit) || !isList && !(ln is ObjLit) { return 0 }
   }
   if elabSlotFieldRecord(d, f).length > 0 { return 0 }
-  const rec = elabCallRecord(elabSlotValueCall(c), -1, 4)
+  const rec = elabCallRecord(elabSlotValueCall(c), -1)
   if rec.length < 2 { return 0 }
   // Every value the slot is written is a call returning the same record.
   const vals: i32[] = []
@@ -7251,7 +7304,7 @@ function elabSlotRecordNote(c: i32) {
     ) {
       return 0
     }
-    if !elabTyListSame(elabCallRecord(v, -1, 4), rec) { return 0 }
+    if !elabTyListSame(elabCallRecord(v, -1), rec) { return 0 }
     const h = elabSlotHolderOf(v0)
     if h >= 0 {
       const li = i32ListIndexOf(linked, h)
@@ -8165,10 +8218,7 @@ function elabHolderLinkedHolds(
     || !elabResCallHolder(g)
     || !elabHolderWritesAgree(g, from, rec)
     || (elabResWrites.get(g) ?? []).length == 0
-    || !elabTyListSame(
-      elabCallRecord((elabResWrites.get(g) ?? [])[0], from, 4),
-      rec,
-    )
+    || !elabTyListSame(elabCallRecord((elabResWrites.get(g) ?? [])[0], from), rec)
   ) {
     return false
   }
@@ -8214,7 +8264,7 @@ function elabHolderWritesAgree(h: i32, from: i32, rec: i32[]): boolean {
   const fd = elabEnclosingFn(h)
   for w in ws {
     if elabEnclosingFn(w) != fd { return false }
-    if !elabTyListSame(elabCallRecord(w, from, 4), rec) { return false }
+    if !elabTyListSame(elabCallRecord(w, from), rec) { return false }
   }
   for t in elabResThrough.get(h) ?? [] {
     if elabEnclosingFn(t) != fd { return false }
@@ -8428,11 +8478,6 @@ export function elabThroughMemberAt(c: i32, k: i32): i32 {
 // The record signatures instance `k` returns a parameter holding, whole; none where it returns
 // no such parameter.
 function elabReturnedBundleSigs(k: i32): i32[] {
-  return elabReturnedSigsAt(k, 4)
-}
-
-// `elabReturnedBundleSigs` through at most `depth` functions returning another's call.
-function elabReturnedSigsAt(k: i32, depth: i32): i32[] {
   const dn = nodeAt(ekDecl[k])
   if !(dn is FuncDecl) || dn.fnRet >= 0 { return [] }
   let i = 0
@@ -8443,16 +8488,16 @@ function elabReturnedSigsAt(k: i32, depth: i32): i32[] {
     }
     i = i + 1
   }
-  return elabRetCallRecord(k, depth)
+  return elabRetCallRecord(k)
 }
 
 // The record call `c` from instance `from` returns: its callee instance's, or a plain callee's
 // (`elabPlainRetRecord`); none where it returns no record.
-function elabCallRecord(c: i32, from: i32, depth: i32): i32[] {
+function elabCallRecord(c: i32, from: i32): i32[] {
   const kc = elabCallInstFrom(c, from)
-  if kc >= 0 { return elabReturnedSigsAt(kc, depth) }
+  if kc >= 0 { return elabReturnedBundleSigs(kc) }
   const d = elabPlainCallee(c)
-  return if d >= 0 { elabPlainRetRecord(d, depth) } else { [] }
+  return if d >= 0 { elabPlainRetRecord(d) } else { [] }
 }
 
 // The plain function call `c` names: a declaration with no type parameter, every parameter
@@ -8489,7 +8534,7 @@ function elabRetRecordShape(d: i32): boolean {
 
 // The one record every value body `body` returns is, each a call from instance `from`; none
 // where any is another value or the records disagree.
-function elabRetValuesRecord(body: i32, from: i32, depth: i32): i32[] {
+function elabRetValuesRecord(body: i32, from: i32): i32[] {
   const none: i32[] = []
   const rets: i32[] = []
   if !elabRetValues(body, rets) || rets.length == 0 { return none }
@@ -8498,7 +8543,7 @@ function elabRetValuesRecord(body: i32, from: i32, depth: i32): i32[] {
     const hc = elabRetHolderCall(c)
     // A holder made in plain code holds its record under no instance.
     const hf = if hc >= 0 && elabInPlainCode(hc) { -1 } else { from }
-    const r = elabCallRecord(if hc >= 0 { hc } else { c }, hf, depth - 1)
+    const r = elabCallRecord(if hc >= 0 { hc } else { c }, hf)
     if r.length < 2 || rec.length > 0 && !elabTyListSame(r, rec) { return none }
     if hc >= 0 && !elabHolderCanHoldReturned(identDeclOf(c), hf, r) {
       return none
@@ -8509,31 +8554,30 @@ function elabRetValuesRecord(body: i32, from: i32, depth: i32): i32[] {
 }
 
 // The record instance `k` returns as a call's value (`elabRetRecordShape`); none otherwise.
-function elabRetCallRecord(k: i32, depth: i32): i32[] {
+function elabRetCallRecord(k: i32): i32[] {
   const none: i32[] = []
-  if depth <= 0 || k < 0 || k >= ekDecl.length { return none }
+  if k < 0 || k >= ekDecl.length { return none }
   const memo = elabRetRecMemo.get(k)
   if memo is i32[] { return memo }
   elabRetRecMemo[k] = none
   const d = ekDecl[k]
   const dn = nodeAt(d)
   if !(dn is FuncDecl) || !elabRetRecordShape(d) { return none }
-  const rec = elabRetValuesRecord(dn.fnBody, k, depth)
+  const rec = elabRetValuesRecord(dn.fnBody, k)
   elabRetRecMemo[k] = rec
   return rec
 }
 
 // The record plain function `d` returns as a call's value, its calls made outside every
 // instance; none otherwise.
-function elabPlainRetRecord(d: i32, depth: i32): i32[] {
+function elabPlainRetRecord(d: i32): i32[] {
   const none: i32[] = []
-  if depth <= 0 { return none }
   const memo = elabPlainRecMemo.get(d)
   if memo is i32[] { return memo }
   elabPlainRecMemo[d] = none
   const dn = nodeAt(d)
   if !(dn is FuncDecl) || !elabRetRecordShape(d) { return none }
-  const rec = elabRetValuesRecord(dn.fnBody, -1, depth)
+  const rec = elabRetValuesRecord(dn.fnBody, -1)
   elabPlainRecMemo[d] = rec
   // A maker handing back a record of members is built whole, never at the one member's result
   // a destination or a use names (D15243).
@@ -8562,23 +8606,23 @@ function elabRetKeptCall(r: i32): i32 {
   return elabRetHolderCall(r)
 }
 
-// The initialiser call of the holder returned read `a` names, through a `const` copy of a
+// The initialiser call of the holder returned read `a` names, through `const` copies of a
 // holder, or -1 where `a` is no such read.
-function elabRetHolderCall(a: i32): i32 { return elabRetHolderCallGo(a, 2) }
+function elabRetHolderCall(a: i32): i32 { return elabRetHolderCallGo(a, []) }
 
-function elabRetHolderCallGo(a: i32, depth: i32): i32 {
-  if depth <= 0 || a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) {
-    return -1
-  }
+// A declaration `seen` already holds is a cycle of copies.
+function elabRetHolderCallGo(a: i32, seen: i32[]): i32 {
+  if a < 0 || a >= P.nodes.length || !(nodeAt(a) is Ident) { return -1 }
   const d = identDeclOf(a)
-  if d < 0 || d >= P.nodes.length { return -1 }
+  if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return -1 }
+  seen.push(d)
   const dn = nodeAt(d)
   if !(dn is LetDecl) { return -1 }
   const v = parenPeelIx(dn.letInit)
   if v < 0 || v >= P.nodes.length { return -1 }
   if elabResMayHold(d) && nodeAt(v) is Call { return v }
   if dn.letKw == "const" && nodeAt(v) is Ident {
-    return elabRetHolderCallGo(v, depth - 1)
+    return elabRetHolderCallGo(v, seen)
   }
   return -1
 }
@@ -8613,7 +8657,7 @@ function elabStmtRetValues(x: i32, out: i32[]): boolean {
 function elabPlainCallsNote() {
   for c in elabResPlainCalls.keys() {
     const d = elabResPlainCalls[c] ?? -1
-    const rec = if d >= 0 { elabPlainRetRecord(d, 4) } else { [] }
+    const rec = if d >= 0 { elabPlainRetRecord(d) } else { [] }
     const froms = if rec.length >= 2 { elabCallerKeys(c) } else { [] }
     if froms.length > 0 {
       elabAnyRetRecord = true
@@ -8689,7 +8733,7 @@ function elabRetRecordKeepsNote() {
   while k < ekDecl.length {
     const dn = nodeAt(ekDecl[k])
     if dn is FuncDecl && dn.fnName != "" && dn.fnRet < 0 {
-      if elabRetCallRecord(k, 4).length >= 2 {
+      if elabRetCallRecord(k).length >= 2 {
         const rets: i32[] = []
         if elabRetValues(dn.fnBody, rets) {
           for c in rets {
@@ -10301,6 +10345,8 @@ export function elabRun() {
   // A compiler instance reused for another program keeps no classes of the last one.
   EPL = eplFresh()
   eplAsked = false
+  eplFrozen = false
+  eplTakesFn = -1
   elabPinsClosedSet(false)
   elabCbRepKeys = Map()
   elabSigAltKeys = Map()
@@ -10599,7 +10645,7 @@ export function elabRun() {
       )
       const ms: i32[] = []
       for t in tys {
-        if !(tyAt(t) is TyFunc) { elabFnIdsIn(t, ms, 0) }
+        if !(tyAt(t) is TyFunc) { elabFnIdsIn(t, ms, []) }
       }
       for m in ms {
         const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
@@ -10657,7 +10703,7 @@ export function elabRun() {
       let moved = false
       for t in elabCbRootT[cr] {
         elabRepStubbed = false
-        let rt = elabSetRepTy(t, 4, -1)
+        let rt = elabSetRepTy(t, [], -1)
         if (rt < 0 || elabRepStubbed) && tyAt(t) is TyFunc {
           rt = elabLamCallRep(d, 0, t)
         }
@@ -11509,7 +11555,7 @@ export function elabRetParamOf(decl: i32): i32 {
   if !(f is TyFunc) || f.fnRet == TY_VOID { return -1 }
   let p = -1
   for lf in recFnValueLeaves(decl) {
-    const q = elabLeafParamIx(lf, fn, 4)
+    const q = elabLeafParamIx(lf, fn, [])
     if q < 0 || (p >= 0 && q != p) { return -1 }
     p = q
   }
@@ -11518,11 +11564,12 @@ export function elabRetParamOf(decl: i32): i32 {
 
 // The index of the parameter of `fn` value `lf` reads, directly or through bindings typed by
 // their initializer, else -1.
-function elabLeafParamIx(lf: i32, fn: FuncDecl, depth: i32): i32 {
+function elabLeafParamIx(lf: i32, fn: FuncDecl, seen: i32[]): i32 {
   const u = parenPeelIx(lf)
-  if u < 0 || depth <= 0 || !(nodeAt(u) is Ident) { return -1 }
+  if u < 0 || !(nodeAt(u) is Ident) { return -1 }
   const d = identDeclOf(u)
-  if d < 0 { return -1 }
+  if d < 0 || i32ListHas(seen, d) { return -1 }
+  seen.push(d)
   let i = 0
   while i < fn.fnParams.length {
     if fn.fnParams[i] == d { return i }
@@ -11535,7 +11582,7 @@ function elabLeafParamIx(lf: i32, fn: FuncDecl, depth: i32): i32 {
       dn.letType < 0
       || (ann is TypeRef && strListHas(fn.fnTyParams, ann.tyName))
     ) {
-      return elabLeafParamIx(dn.letInit, fn, depth - 1)
+      return elabLeafParamIx(dn.letInit, fn, seen)
     }
   }
   return -1
@@ -11558,11 +11605,7 @@ function elabHeldListFacts() {
       const lt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
       const et = if lt is TyArray { tyElemOf(lt) } else { -1 }
       if (et >= 0 && et < T.tys.length && tyAt(et) is TyObj && tyHasTyVar(et)) {
-        const nv = elabHeldKeepSets(
-          elabHeldClosedTy(et, lit.arrElems, 0),
-          et,
-          0,
-        )
+        const nv = elabHeldKeepSets(elabHeldClosedTy(et, lit.arrElems), et, 0)
         if nv >= 0 && !tyHasTyVar(nv) {
           fills.push(ix)
           fills.push(ps[i])
@@ -12015,7 +12058,7 @@ function elabLamTakesSet(g: i32): boolean {
   if !(sf is TyFunc) { return false }
   for pt in sf.fnParamTypes {
     const ds: i32[] = []
-    elabFnIdsIn(pt, ds, 0)
+    elabFnIdsIn(pt, ds, [])
     if ds.length > 0 { return true }
   }
   return false
@@ -12031,7 +12074,7 @@ function elabLamRepInstance(lam: i32) {
   const tys: i32[] = []
   let pi = 0
   for pt in sf.fnParamTypes {
-    let rt = elabSetRepTy(pt, 4, -1)
+    let rt = elabSetRepTy(pt, [], -1)
     if rt < 0 { rt = elabLamCallRep(lam, pi, pt) }
     if rt < 0 || !elabTyClosed(rt, 0) { return 0 }
     bindGenWalk(pt, rt, names, tys)
@@ -12441,11 +12484,11 @@ function elabSetRepRow(ix: i32, names: string[], tys: i32[], ck: i32) {
     }
     // A set the callee writes functions into through the parameter runs at their signature.
     const held: i32[] = []
-    elabFnIdsIn(t, held, 0)
+    elabFnIdsIn(t, held, [])
     if rt < 0 && i0 < names.length && held.length > 0 {
       rt = elabWrittenRep(ix, names[i0], t)
     }
-    if rt < 0 { rt = elabSetRepTy(t, 4, ck) }
+    if rt < 0 { rt = elabSetRepTy(t, [], ck) }
     // A tagged set is keyed by itself, so it has no instance at its rep.
     if direct && fnTagSetIsTagged(fnTagSetOfTy(t)) { rt = t }
     elabRepStubbed = elabRepStubbed || stubbed0
@@ -12597,26 +12640,34 @@ function elabMemberSigs(m: i32): i32[] {
 // `t` with each set of functions in it replaced by its rep at instance `ck`: the one signature
 // of every member instance `ck` reaches (every root instance, for `ck` -1), or a no-argument stub
 // when there is none; -1 when two disagree or one member is reached at two instances.
-function elabSetRepTy(t: i32, depth: i32, ck: i32): i32 {
-  if t < 0 || t >= T.tys.length || depth <= 0 { return t }
+// `tys` holds the types being rebuilt; one reached again is a cycle and stays as it is.
+function elabSetRepTy(t: i32, tys: i32[], ck: i32): i32 {
+  if t < 0 || t >= T.tys.length || i32ListHas(tys, t) { return t }
+  tys.push(t)
+  const r = elabSetRepGo(t, tys, ck)
+  tys.pop()
+  return r
+}
+
+function elabSetRepGo(t: i32, tys: i32[], ck: i32): i32 {
   const ty = tyAt(t)
   if ty is TyArray {
-    const e = elabSetRepTy(tyElemOf(ty), depth - 1, ck)
+    const e = elabSetRepTy(tyElemOf(ty), tys, ck)
     return if e < 0 { -1 } else if e != tyElemOf(ty) { mkArrayTy(e) } else { t }
   }
   if ty is TyNullable {
-    const e = elabSetRepTy(ty.nInner, depth - 1, ck)
+    const e = elabSetRepTy(ty.nInner, tys, ck)
     return if e < 0 { -1 } else if e != ty.nInner { mkNullableTy(e) } else { t }
   }
   if ty is TyMap {
-    const e = elabSetRepTy(tyValOf(ty), depth - 1, ck)
+    const e = elabSetRepTy(tyValOf(ty), tys, ck)
     return if e < 0 { -1 } else if e != tyValOf(ty) { mkMapTy(tyKeyOf(ty), e, ty.mSet) } else { t }
   }
   if ty is TyObj {
     const fs: i32[] = []
     let moved = false
     for ft in ty.objFieldTypes {
-      const e = elabSetRepTy(ft, depth - 1, ck)
+      const e = elabSetRepTy(ft, tys, ck)
       if e < 0 { return -1 }
       if e != ft { moved = true }
       fs.push(e)
@@ -13530,9 +13581,9 @@ function elabModuleLam(d0: i32): boolean {
 // leaf at the signature `elabHeldFnTy` gives the functions its set and those values name, and
 // each open map at `elabHoleMapClosed`, through lists, records and maps (D15294). `t` where
 // nothing is open; -1 where a leaf cannot close or a stored value is not followed.
-function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
+function elabHeldClosedTy(t: i32, vals: i32[]): i32 {
   const none: string[] = []
-  return elabHeldClosedTyAt(t, vals, depth, -1, none, -1)
+  return elabHeldClosedTyAt(t, vals, [], -1, none, -1)
 }
 
 // `elabHeldClosedTy` at slot `path` of binding `holder` (-1 for none), whose calls decide a
@@ -13542,12 +13593,36 @@ function elabHeldClosedTy(t: i32, vals: i32[], depth: i32): i32 {
 function elabHeldClosedTyAt(
   t: i32,
   vals: i32[],
-  depth: i32,
+  seen: i32[],
   holder: i32,
   path: string[],
   k: i32,
 ): i32 {
-  if t < 0 || t >= T.tys.length || depth > 8 { return -1 }
+  if t < 0 || t >= T.tys.length { return -1 }
+  // `seen` holds the (type, first value) pairs being closed; one reached again is a cycle.
+  const v0 = if vals.length > 0 { vals[0] } else { -1 }
+  let q = 0
+  while q + 1 < seen.length {
+    if seen[q] == t && seen[q + 1] == v0 { return -1 }
+    q = q + 2
+  }
+  seen.push(t)
+  seen.push(v0)
+  const r = elabHeldClosedGo(t, vals, seen, holder, path, k)
+  seen.pop()
+  seen.pop()
+  return r
+}
+
+function elabHeldClosedGo(
+  t: i32,
+  vals: i32[],
+  seen: i32[],
+  holder: i32,
+  path: string[],
+  k: i32,
+): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
   if !tyHasTyVar(t) { return t }
   const bound = elabHeldBoundTy(vals)
   if bound >= 0 { return bound }
@@ -13579,7 +13654,7 @@ function elabHeldClosedTyAt(
       const e = elabHeldClosedTyAt(
         tyElemOf(o),
         ev,
-        depth + 1,
+        seen,
         holder,
         elabPathPlus(path, "e"),
         k,
@@ -13605,7 +13680,7 @@ function elabHeldClosedTyAt(
         const c = elabHeldClosedTyAt(
           o.objFieldTypes[i],
           fv,
-          depth + 1,
+          seen,
           holder,
           elabPathPlus(path, "f." + o.objFieldNames[i]),
           k,
@@ -13621,7 +13696,7 @@ function elabHeldClosedTyAt(
     TyMap => {
       // A fresh `Map()` here holds what the writes into this slot of the holder store (D16201).
       if vals.length > 0 && holder >= 0 && elabAllFreshMaps(vals) {
-        return elabFreshMapSlotTy(o, depth, holder, path, k)
+        return elabFreshMapSlotTy(o, seen, holder, path, k)
       }
       // A binding stored here is built at its own type, which a reader settles before asking.
       if vals.length > 0 { return -1 }
@@ -13631,7 +13706,7 @@ function elabHeldClosedTyAt(
       const v = elabHeldClosedTyAt(
         tyValOf(o),
         noVals,
-        depth + 1,
+        seen,
         holder,
         elabPathPlus(path, "v"),
         k,
@@ -13668,7 +13743,7 @@ function elabAllFreshMaps(vals: i32[]): boolean {
 // close.
 function elabFreshMapSlotTy(
   o: TyMap,
-  depth: i32,
+  seen: i32[],
   holder: i32,
   path: string[],
   k: i32,
@@ -13692,7 +13767,7 @@ function elabFreshMapSlotTy(
   const v = elabHeldClosedTyAt(
     tyValOf(o),
     mv,
-    depth + 1,
+    seen,
     holder,
     elabPathPlus(path, "v"),
     k,
@@ -14100,7 +14175,7 @@ function elabSlotCloseElems(d: i32, t: i32, ev: i32[], k: i32): i32 {
   const o = tyAt(t)
   if !(o is TyArray) || ev.length == 0 { return -1 }
   const path: string[] = ["e"]
-  const e = elabHeldClosedTyAt(tyElemOf(o), ev, 0, d, path, k)
+  const e = elabHeldClosedTyAt(tyElemOf(o), ev, [], d, path, k)
   return if e < 0 || tyHasTyVar(e) { -1 } else { mkArrayTy(e) }
 }
 
@@ -14110,7 +14185,7 @@ function elabSlotOpenFn(t: i32): boolean {
   const o = tyAt(t)
   if !(o is TyArray) && !(o is TyObj) && !(o is TyMap) { return false }
   const ds: i32[] = []
-  elabFnIdsIn(t, ds, 0)
+  elabFnIdsIn(t, ds, [])
   return ds.length > 0
 }
 
@@ -14124,7 +14199,7 @@ function elabSlotWholeFn(t: i32): boolean {
     return false
   }
   const ds: i32[] = []
-  elabFnIdsIn(t, ds, 0)
+  elabFnIdsIn(t, ds, [])
   return ds.length > 0
 }
 
@@ -16630,7 +16705,7 @@ export function elabInstUnionArmTys(): i32[] {
     const ps = elabNodeTys[ix] ?? []
     let i = 1
     while i < ps.length {
-      elabUnionArmsInto(ps[i], out, seen, 8)
+      elabUnionArmsInto(ps[i], out, seen)
       i = i + 2
     }
   }
@@ -16648,18 +16723,17 @@ export function elabInstUnionArmTys(): i32[] {
       out,
       seen,
       if wide { walkedWide } else { walked },
-      4,
     )
     n = n + 1
   }
   let k = 0
   while k < ekDecl.length {
-    elabUnionArmsInto(elabRetOf(k), out, seen, 8)
+    elabUnionArmsInto(elabRetOf(k), out, seen)
     const dn = nodeAt(ekDecl[k])
     if dn is FuncDecl {
       let p = 0
       while p < dn.fnParams.length {
-        elabUnionArmsInto(elabParamTyOf(k, p), out, seen, 8)
+        elabUnionArmsInto(elabParamTyOf(k, p), out, seen)
         p = p + 1
       }
     }
@@ -16668,8 +16742,8 @@ export function elabInstUnionArmTys(): i32[] {
   return out
 }
 
-// The arms of every union `ty` holds, at any depth to `depth`, that boxes two distinct records,
-// or with `wide` any record beside another member: a list's element, a map's key or value, a
+// The arms of every union `ty` holds that boxes two distinct records, or with `wide` any record
+// beside another member: a list's element, a map's key or value, a
 // field, a nullable's inner, a member, a signature's parts. `walked` marks the types searched.
 function elabBoxedUnionsInto(
   ty: i32,
@@ -16677,48 +16751,36 @@ function elabBoxedUnionsInto(
   out: i32[],
   seen: {[i32]: boolean},
   walked: {[i32]: boolean},
-  depth: i32,
 ) {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 || (walked.get(ty) ?? false) {
-    return 0
-  }
+  if ty < 0 || ty >= T.tys.length || (walked.get(ty) ?? false) { return 0 }
   walked[ty] = true
   const boxes = if wide { elabBoxesARecord(ty) } else { elabBoxesTwoRecords(ty) }
-  if boxes { elabUnionArmsInto(ty, out, seen, 1) }
+  if boxes { elabUnionDirectArmsInto(ty, out, seen) }
   const t = tyAt(ty)
   match t {
     TyUnion => {
-      for m in t.uMembers {
-        elabBoxedUnionsInto(m, wide, out, seen, walked, depth - 1)
-      }
+      for m in t.uMembers { elabBoxedUnionsInto(m, wide, out, seen, walked) }
     }
     TyNullable => {
-      return elabBoxedUnionsInto(t.nInner, wide, out, seen, walked, depth - 1)
+      return elabBoxedUnionsInto(t.nInner, wide, out, seen, walked)
     }
     TyArray => {
-      return elabBoxedUnionsInto(
-        tyElemOf(t),
-        wide,
-        out,
-        seen,
-        walked,
-        depth - 1,
-      )
+      return elabBoxedUnionsInto(tyElemOf(t), wide, out, seen, walked)
     }
     TyMap => {
-      elabBoxedUnionsInto(tyKeyOf(t), wide, out, seen, walked, depth - 1)
-      return elabBoxedUnionsInto(tyValOf(t), wide, out, seen, walked, depth - 1)
+      elabBoxedUnionsInto(tyKeyOf(t), wide, out, seen, walked)
+      return elabBoxedUnionsInto(tyValOf(t), wide, out, seen, walked)
     }
     TyObj => {
       for f in t.objFieldTypes {
-        elabBoxedUnionsInto(f, wide, out, seen, walked, depth - 1)
+        elabBoxedUnionsInto(f, wide, out, seen, walked)
       }
     }
     TyFunc => {
       for p in t.fnParamTypes {
-        elabBoxedUnionsInto(p, wide, out, seen, walked, depth - 1)
+        elabBoxedUnionsInto(p, wide, out, seen, walked)
       }
-      return elabBoxedUnionsInto(t.fnRet, wide, out, seen, walked, depth - 1)
+      return elabBoxedUnionsInto(t.fnRet, wide, out, seen, walked)
     }
     TyPrim | TyVar | TyLit | TyNeg | TyErr => {
       return 0
@@ -16760,38 +16822,45 @@ function elabBoxesTwoRecords(u: i32): boolean {
   return false
 }
 
-function elabUnionArmsInto(
-  ty: i32,
-  out: i32[],
-  seen: {[i32]: boolean},
-  depth: i32,
-) {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 || (seen.get(ty) ?? false) {
-    return 0
-  }
+// The record members of every union `ty` holds at any depth, each type searched once by `seen`.
+function elabUnionArmsInto(ty: i32, out: i32[], seen: {[i32]: boolean}) {
+  if ty < 0 || ty >= T.tys.length || (seen.get(ty) ?? false) { return 0 }
   seen[ty] = true
   const t = tyAt(ty)
   match t {
     TyUnion => {
       for m in t.uMembers {
         if m >= 0 && m < T.tys.length && tyAt(m) is TyObj { out.push(m) }
-        elabUnionArmsInto(m, out, seen, depth - 1)
+        elabUnionArmsInto(m, out, seen)
       }
     }
-    TyNullable => elabUnionArmsInto(t.nInner, out, seen, depth - 1)
-    TyArray => elabUnionArmsInto(tyElemOf(t), out, seen, depth - 1)
+    TyNullable => elabUnionArmsInto(t.nInner, out, seen)
+    TyArray => elabUnionArmsInto(tyElemOf(t), out, seen)
     TyMap => {
-      elabUnionArmsInto(tyKeyOf(t), out, seen, depth - 1)
-      elabUnionArmsInto(tyValOf(t), out, seen, depth - 1)
+      elabUnionArmsInto(tyKeyOf(t), out, seen)
+      elabUnionArmsInto(tyValOf(t), out, seen)
     }
     TyObj => {
-      for f in t.objFieldTypes { elabUnionArmsInto(f, out, seen, depth - 1) }
+      for f in t.objFieldTypes { elabUnionArmsInto(f, out, seen) }
     }
     TyFunc => {
-      for p in t.fnParamTypes { elabUnionArmsInto(p, out, seen, depth - 1) }
-      elabUnionArmsInto(t.fnRet, out, seen, depth - 1)
+      for p in t.fnParamTypes { elabUnionArmsInto(p, out, seen) }
+      elabUnionArmsInto(t.fnRet, out, seen)
     }
     TyPrim | TyVar | TyLit | TyNeg | TyErr => {}
+  }
+  return 0
+}
+
+// The record members of union `ty` itself, unless `seen` already holds it.
+function elabUnionDirectArmsInto(ty: i32, out: i32[], seen: {[i32]: boolean}) {
+  if ty < 0 || ty >= T.tys.length || (seen.get(ty) ?? false) { return 0 }
+  seen[ty] = true
+  const t = tyAt(ty)
+  if t is TyUnion {
+    for m in t.uMembers {
+      if m >= 0 && m < T.tys.length && tyAt(m) is TyObj { out.push(m) }
+    }
   }
   return 0
 }
@@ -16843,10 +16912,10 @@ export function elabHeldValTy(x0: i32, fnIx: i32): i32 {
     if dt >= 0 && elabTyClosed(dt, 0) && !tyHasTyVar(dt) { return dt }
   }
   const none: string[] = []
-  let t = elabHeldClosedTyAt(id, [x], 0, -1, none, k)
+  let t = elabHeldClosedTyAt(id, [x], [], -1, none, k)
   // An instance whose functions are instanced outside it reads them at the program's instances.
   if (t < 0 || tyHasTyVar(t)) && k >= 0 {
-    t = elabHeldClosedTyAt(id, [x], 0, -1, none, -1)
+    t = elabHeldClosedTyAt(id, [x], [], -1, none, -1)
   }
   if (t < 0 || tyHasTyVar(t)) && k >= 0 { t = elabHeldIdTy(x, fnIx, 0) }
   return if t < 0 || tyHasTyVar(t) { -1 } else { elabHeldKeepSets(t, id, 0) }
@@ -17208,7 +17277,7 @@ export function elabLitBindingFact(ix: i32): i32 {
   // A literal nested as a field of the initialiser is that field's slot of the binding.
   const steps: string[] = []
   let u = ix
-  while cwIxCovers(u) && cwIxUpKind[u] == CW_UP_FIELD && steps.length < 8 {
+  while cwIxCovers(u) && cwIxUpKind[u] == CW_UP_FIELD {
     const fi = nodeAt(cwIxUpAux[u])
     if !(fi is FieldInit) { return -1 }
     steps.push("f." + fi.fiName)
@@ -18186,9 +18255,6 @@ function elabValueInstViaNote(k: i32, from: i32, ix: i32) {
   return 0
 }
 
-// How many forwarded open parameters `elabValueInstUp` follows up.
-const ELAB_VALUE_INST_UP_MAX = 8
-
 function elabValueInstPush(x: i32, from: i32, k: i32) {
   if x < 0 || k < 0 { return 0 }
   const vs = elabValueInstKeys[x] ?? []
@@ -18204,11 +18270,17 @@ function elabValueInstPush(x: i32, from: i32, k: i32) {
 }
 
 // Notes `k` on each argument the calls reaching instance `from` hand the parameter read `x`
-// names, under the instance each call sits in, and up through a forwarded open parameter.
-function elabValueInstUp(x: i32, from: i32, k: i32, depth: i32) {
-  if depth > ELAB_VALUE_INST_UP_MAX || from < 0 || from >= ekDecl.length {
-    return 0
+// names, under the instance each call sits in, and up through a forwarded open parameter. `seen`
+// holds the (read, instance) pairs already followed, so a forwarding cycle ends.
+function elabValueInstUp(x: i32, from: i32, k: i32, seen: i32[]) {
+  if from < 0 || from >= ekDecl.length { return 0 }
+  let s = 0
+  while s + 1 < seen.length {
+    if seen[s] == x && seen[s + 1] == from { return 0 }
+    s = s + 2
   }
+  seen.push(x)
+  seen.push(from)
   const p = identDeclOf(parenPeelIx(x))
   const f = nodeAt(ekDecl[from])
   if p < 0 || !(f is FuncDecl) { return 0 }
@@ -18220,14 +18292,14 @@ function elabValueInstUp(x: i32, from: i32, k: i32, depth: i32) {
     const ks = elabCallKeys[c] ?? []
     let j = 0
     while j + 1 < ks.length {
-      if ks[j + 1] == from { elabValueInstHand(c, pi, ks[j], k, depth) }
+      if ks[j + 1] == from { elabValueInstHand(c, pi, ks[j], k, seen) }
       j = j + 2
     }
   }
   const via = elabValueInstVia[from] ?? []
   let v = 0
   while v + 1 < via.length {
-    elabValueInstHand(via[v + 1], pi, via[v], k, depth)
+    elabValueInstHand(via[v + 1], pi, via[v], k, seen)
     v = v + 2
   }
   return 0
@@ -18235,12 +18307,12 @@ function elabValueInstUp(x: i32, from: i32, k: i32, depth: i32) {
 
 // Notes `k` on the `pi`th argument of call `c`, which sits in instance `caller`, and up from it
 // when that argument reads an open parameter in turn.
-function elabValueInstHand(c: i32, pi: i32, caller: i32, k: i32, depth: i32) {
+function elabValueInstHand(c: i32, pi: i32, caller: i32, k: i32, seen: i32[]) {
   const cn = nodeAt(c)
   if !(cn is Call) || pi >= cn.callArgs.length { return 0 }
   const a = parenPeelIx(cn.callArgs[pi])
   elabValueInstPush(a, caller, k)
-  if elabOpenParamRead(a) { elabValueInstUp(a, caller, k, depth + 1) }
+  if elabOpenParamRead(a) { elabValueInstUp(a, caller, k, seen) }
   return 0
 }
 
@@ -18252,9 +18324,9 @@ function elabValueInstCall(from: i32, ix: i32, k: i32, openParam: boolean) {
   const x = parenPeelIx(cn.callFn)
   elabValueInstPush(x, from, k)
   elabValueInstJoin(x, from, k, 0)
-  if openParam { return elabValueInstUp(x, from, k, 0) }
+  if openParam { return elabValueInstUp(x, from, k, []) }
   const root = elabValueInstRoot(x)
-  if root != x && elabOpenParamRead(root) { elabValueInstUp(root, from, k, 0) }
+  if root != x && elabOpenParamRead(root) { elabValueInstUp(root, from, k, []) }
   return 0
 }
 
@@ -18294,13 +18366,11 @@ function elabValueInstJoin(x: i32, from: i32, k: i32, depth: i32) {
 // The read a field or element chain `x` (`p.f`, `xs[0]`, `p.fs[1]`) starts from, else `x`.
 function elabValueInstRoot(x: i32): i32 {
   let r = parenPeelIx(x)
-  let steps = 0
-  while r >= 0 && r < P.nodes.length && steps < 16 {
+  while r >= 0 && r < P.nodes.length {
     const n = nodeAt(r)
     if n is Member { r = parenPeelIx(n.memObj) }
     else if n is Index { r = parenPeelIx(n.idxArr) }
     else { return r }
-    steps = steps + 1
   }
   return -1
 }
@@ -18528,8 +18598,9 @@ function elabHandedAt(h: i32, a: i32, c: i32) {
 }
 
 // The function declarations a type carries as their singleton `Fn#d`, each once, into `ds`.
-function elabFnIdsIn(t: i32, ds: i32[], depth: i32) {
-  if t < 0 || t >= T.tys.length || depth > 16 { return 0 }
+function elabFnIdsIn(t: i32, ds: i32[], seen: i32[]) {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
   const x = tyAt(t)
   if x is TyFunc {
     const fs = elabFnSetOf(t)
@@ -18540,24 +18611,24 @@ function elabFnIdsIn(t: i32, ds: i32[], depth: i32) {
   }
   match x {
     TyArray => {
-      elabFnIdsIn(tyElemOf(x), ds, depth + 1)
+      elabFnIdsIn(tyElemOf(x), ds, seen)
     }
     TyNullable => {
-      elabFnIdsIn(x.nInner, ds, depth + 1)
+      elabFnIdsIn(x.nInner, ds, seen)
     }
     TyMap => {
-      elabFnIdsIn(tyKeyOf(x), ds, depth + 1)
-      elabFnIdsIn(tyValOf(x), ds, depth + 1)
+      elabFnIdsIn(tyKeyOf(x), ds, seen)
+      elabFnIdsIn(tyValOf(x), ds, seen)
     }
     TyObj => {
-      for ft in x.objFieldTypes { elabFnIdsIn(ft, ds, depth + 1) }
+      for ft in x.objFieldTypes { elabFnIdsIn(ft, ds, seen) }
     }
     TyFunc => {
-      for pt in x.fnParamTypes { elabFnIdsIn(pt, ds, depth + 1) }
-      elabFnIdsIn(x.fnRet, ds, depth + 1)
+      for pt in x.fnParamTypes { elabFnIdsIn(pt, ds, seen) }
+      elabFnIdsIn(x.fnRet, ds, seen)
     }
     TyUnion => {
-      for m in x.uMembers { elabFnIdsIn(m, ds, depth + 1) }
+      for m in x.uMembers { elabFnIdsIn(m, ds, seen) }
     }
     TyVar | TyPrim | TyErr | TyLit | TyNeg => {}
   }
@@ -18914,7 +18985,7 @@ function elabOutTyVia(t: i32, k: i32, via: i32): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   if !tyHasTyVar(t) { return t }
   const ds: i32[] = []
-  elabFnIdsIn(t, ds, 0)
+  elabFnIdsIn(t, ds, [])
   const names: string[] = []
   const tys: i32[] = []
   for d in ds {
@@ -19091,7 +19162,7 @@ function elabCallInstFrom(ix: i32, from: i32): i32 {
   }
   const ct = elabPairIn(elabNodeTys, c.callFn, r)
   const ds: i32[] = []
-  elabFnIdsIn(ct, ds, 0)
+  elabFnIdsIn(ct, ds, [])
   return if ds.length == 1 && elabSrcDecl(ds[0]) == ekDecl[k] { k } else { -1 }
 }
 
@@ -19107,7 +19178,7 @@ function elabPinsRefine(ck: i32, sig: i32, pTys: i32[]): boolean {
     const bt = substTyDeep(f.fnParamTypes[p], ekNames[ck], ekTys[ck])
     if bt < 0 { return false }
     const ds: i32[] = []
-    elabFnIdsIn(bt, ds, 0)
+    elabFnIdsIn(bt, ds, [])
     if ds.length == 0 && elabTyClosed(bt, 0) && !tySameSealed(bt, pTys[p]) {
       return false
     }
@@ -19134,7 +19205,7 @@ export function elabBindUnionArmsFromCall(
   bN: string[],
   bT: i32[],
 ): i32 {
-  return elabUnionArmBinds(call, decl, bN, bT, 0)
+  return elabUnionArmBinds(call, decl, bN, bT, [])
 }
 
 function elabUnionArmBinds(
@@ -19142,11 +19213,17 @@ function elabUnionArmBinds(
   decl: i32,
   bN: string[],
   bT: i32[],
-  depth: i32,
+  seen: i32[],
 ): i32 {
-  if decl < 0 || decl >= T.tys.length || depth > 16 || !tyHasTyVar(decl) {
+  if (
+    decl < 0
+    || decl >= T.tys.length
+    || !tyHasTyVar(decl)
+    || i32ListHas(seen, decl)
+  ) {
     return 0
   }
+  seen.push(decl)
   const d = tyAt(decl)
   match d {
     TyUnion => {
@@ -19156,7 +19233,7 @@ function elabUnionArmBinds(
           if mt is TyVar {
             elabBindOneFromCall(call, mt.tvName, bN, bT)
           } else {
-            elabUnionArmBinds(call, m, bN, bT, depth + 1)
+            elabUnionArmBinds(call, m, bN, bT, seen)
           }
         }
       }
@@ -19166,20 +19243,20 @@ function elabUnionArmBinds(
       if it is TyVar {
         elabBindOneFromCall(call, it.tvName, bN, bT)
       } else {
-        elabUnionArmBinds(call, d.nInner, bN, bT, depth + 1)
+        elabUnionArmBinds(call, d.nInner, bN, bT, seen)
       }
     }
     TyArray => {
-      elabUnionArmBinds(call, tyElemOf(d), bN, bT, depth + 1)
+      elabUnionArmBinds(call, tyElemOf(d), bN, bT, seen)
     }
     TyObj => {
-      for f in d.objFieldTypes { elabUnionArmBinds(call, f, bN, bT, depth + 1) }
+      for f in d.objFieldTypes { elabUnionArmBinds(call, f, bN, bT, seen) }
     }
     TyMap => {
-      elabUnionArmBinds(call, tyValOf(d), bN, bT, depth + 1)
+      elabUnionArmBinds(call, tyValOf(d), bN, bT, seen)
     }
     TyFunc => {
-      elabUnionArmBinds(call, d.fnRet, bN, bT, depth + 1)
+      elabUnionArmBinds(call, d.fnRet, bN, bT, seen)
     }
     TyPrim | TyErr | TyVar | TyLit | TyNeg => {}
   }
@@ -19556,7 +19633,7 @@ function elabKeyGenericFnPin(
       const dv = tyAt(dt)
       if dv is TyVar {
         if dv.tvName == nm { return pin }
-      } else if tyMentionsTyVarNamed(dt, nm, 16) {
+      } else if tyMentionsTyVarNamed(dt, nm) {
         // A declared `T[]` or `{ f: T }` binds `T` where the pin holds it.
         const mn: string[] = []
         const mt: i32[] = []
@@ -19633,10 +19710,7 @@ export function elabCallKeyBinding(
       while j < params.length && j < ft.fnParamTypes.length {
         const pp = nodeAt(params[j])
         if pp is Param {
-          if (
-            pp.parType < 0
-            && tyMentionsTyVarNamed(ft.fnParamTypes[j], nm, 16)
-          ) {
+          if (pp.parType < 0 && tyMentionsTyVarNamed(ft.fnParamTypes[j], nm)) {
             holed = true
           }
         }
@@ -19895,11 +19969,19 @@ let eplAsked = false
 // Builds the classes before any rewrite when the program takes a function as a value; a program
 // that takes none has nothing to deliver, and builds them only if a reader asks.
 function eplEnsure() {
-  if EPL.stale && (eplAsked || eplTakesFnValue()) {
+  if EPL.stale && (eplAsked || eplTakesFnOnce()) {
     eplBuild()
     EPL.stale = false
   }
   return 0
+}
+
+// `eplTakesFnValue`, scanned once per program: 1 yes, 0 no, -1 not yet.
+let eplTakesFn = -1
+
+function eplTakesFnOnce(): boolean {
+  if eplTakesFn < 0 { eplTakesFn = if eplTakesFnValue() { 1 } else { 0 } }
+  return eplTakesFn == 1
 }
 
 // Whether the checked program holds a lambda, or reads a named function anywhere but as a callee.
@@ -19940,6 +20022,7 @@ function eplNodeTakesFn(x: i32, callees: {[i32]: boolean}): boolean {
 function eplTakesNoFn(_x: i32): boolean { return false }
 
 function eplStaleAt() {
+  if eplFrozen { emitFail(EPL_FROZEN_MSG) }
   EPL.limit = ekDecl.length
   EPL.stale = true
   return 0
@@ -20962,8 +21045,17 @@ function eplFrameResult(m: i32, arity: i32): i32 {
 
 // Holder type `t` at place `p` with each open function leaf closed by its class; -1 where a leaf
 // has no single closed signature, or a member has no instance there.
-function eplRebuild(p: i32, t: i32, depth: i32, path: string[]): i32 {
-  if t < 0 || t >= T.tys.length || depth > 8 || p < 0 { return -1 }
+// `tys` holds the types being rebuilt; one reached again is a cycle, which closes nothing.
+function eplRebuild(p: i32, t: i32, tys: i32[], path: string[]): i32 {
+  if t < 0 || t >= T.tys.length || p < 0 || i32ListHas(tys, t) { return -1 }
+  tys.push(t)
+  const r = eplRebuildGo(p, t, tys, path)
+  tys.pop()
+  return r
+}
+
+function eplRebuildGo(p: i32, t: i32, tys: i32[], path: string[]): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
   const bd = eplBoundOf(eplFind(p))
   if bd >= 0 {
     eplDemandTy(p, bd, 0)
@@ -20974,7 +21066,7 @@ function eplRebuild(p: i32, t: i32, depth: i32, path: string[]): i32 {
   return match o {
     TyFunc => eplRebuildLeaf(p, t, path)
     TyNullable => {
-      const i = eplRebuild(p, o.nInner, depth + 1, path)
+      const i = eplRebuild(p, o.nInner, tys, path)
       if i < 0 { -1 } else { mkNullableTy(i) }
     }
     TyArray => {
@@ -20982,7 +21074,7 @@ function eplRebuild(p: i32, t: i32, depth: i32, path: string[]): i32 {
       const e = eplRebuild(
         eplChild(p, "e"),
         tyElemOf(o),
-        depth + 1,
+        tys,
         eplPathPlus(path, "e"),
       )
       if e < 0 { -1 } else { mkArrayTy(e) }
@@ -20992,7 +21084,7 @@ function eplRebuild(p: i32, t: i32, depth: i32, path: string[]): i32 {
       const v = eplRebuild(
         eplChild(p, "v"),
         tyValOf(o),
-        depth + 1,
+        tys,
         eplPathPlus(path, "v"),
       )
       if v < 0 { -1 } else { mkMapTy(tyKeyOf(o), v, o.mSet) }
@@ -21004,7 +21096,7 @@ function eplRebuild(p: i32, t: i32, depth: i32, path: string[]): i32 {
         const f = eplRebuild(
           eplChild(p, "f." + o.objFieldNames[i]),
           o.objFieldTypes[i],
-          depth + 1,
+          tys,
           eplPathPlus(path, "f." + o.objFieldNames[i]),
         )
         if f < 0 { return -1 }
@@ -21229,8 +21321,33 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
   return mkFuncTy(pin, ret)
 }
 
+// Set once mono begins: the classes are read-only from then on, so a build or a stale mark after it
+// is an internal error (D16768).
+let eplFrozen = false
+
+const EPL_FROZEN_MSG = "emitProgram: internal: the place classes were rebuilt after mono began"
+
+// Freezes the classes for mono, building them first where no reader has yet: a build or a stale
+// mark after this fails the emit. A program that takes no function as a value freezes them empty,
+// since nothing in it is delivered.
+export function eplFreeze() {
+  if EPL.stale {
+    if eplTakesFnOnce() {
+      eplBuild()
+    } else {
+      const limit = EPL.limit
+      EPL = eplFresh()
+      EPL.limit = limit
+    }
+    EPL.stale = false
+  }
+  eplFrozen = true
+  return 0
+}
+
 // Builds the place classes over the elaborated program as it stands: every instance settled so far.
 function eplBuild() {
+  if eplFrozen { emitFail(EPL_FROZEN_MSG) }
   eplAsked = true
   const limit = EPL.limit
   EPL = eplFresh()
@@ -22021,7 +22138,7 @@ export function eplValueTy(v: i32, k: i32): i32 {
   EPL.k = k
   EPL.holder = -1
   const none: string[] = []
-  const r = eplRebuild(root, nodeTyIxOf(v), 0, none)
+  const r = eplRebuild(root, nodeTyIxOf(v), [], none)
   EPL.holder = h0
   EPL.k = k0
   return r
@@ -22040,7 +22157,7 @@ function eplHolderTy(ix: i32, k: i32): i32 {
   const root = eplRoot(ix)
   const none: string[] = []
   EPL.holder = ix
-  const r = if root >= 0 { eplRebuild(root, t, 0, none) } else { -1 }
+  const r = if root >= 0 { eplRebuild(root, t, [], none) } else { -1 }
   EPL.holder = -1
   EPL.k = -1
   return r
