@@ -8,8 +8,9 @@ import {
   BND_ARRDEF,
   BND_BM,
   BND_LET,
+  BND_MEM,
   BND_RET,
-  Bound,
+  BND_UFCS,
   bndAt,
   bndCount,
   bndNextRow,
@@ -101,6 +102,7 @@ import {
   luDecl,
 } from "./check_annot_resolve"
 import {
+  callBindTyOf,
   fsbCallArgTys,
   fsbCallArgTysPush,
   fsbCallDecl,
@@ -230,15 +232,15 @@ import {
   arrDefRule,
   bareBraceDeliver,
   holeFnDeliveryDemands,
+  memRule,
   monoRecheckEnd,
   omitFieldNullDeliver,
   pinBmCstrElems,
+  ufcsRule,
   validateBinCstrs,
   validateIsCstrs,
-  validateMemCstrs,
   validateNestCstrs,
   validatePrintCstrs,
-  validateUfcsCstrs,
 } from "./check_demands"
 import { bmArgMsg, tpMembersListText } from "./check_diag_text"
 import { callDstTyForGeneric, setCallDstTy } from "./check_expected"
@@ -262,6 +264,7 @@ import {
   radixLitAdoptDst,
   rcwPend,
   recAdForce,
+  recPendHeldInit,
   recordCtxTy,
   recordListCopy,
   recordMapUnbox,
@@ -1356,12 +1359,21 @@ export type SolveAt = {
   ownerWas: string,
 }
 
-// Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order.
+// Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order; the steps whose kind
+// has a rule are walked together in body order at the first of them (`solveRules`).
 export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
   if pinGuardArmed { pinGuardSolveStep(1) }
   let st = from
+  let walked = false
   while st <= to {
-    if (at.kinds & (1 << st)) != 0 { solveStep(at, st) }
+    if (at.kinds & (1 << st)) != 0 {
+      if ruleKindOfStep(st) < 0 {
+        solveStep(at, st)
+      } else if !walked {
+        solveRules(at, from, to)
+        walked = true
+      }
+    }
     st = st + 1
   }
   if pinGuardArmed { pinGuardSolveStep(-1) }
@@ -1385,8 +1397,6 @@ function solveStep(at: SolveAt, st: i32) {
     if at.toggles { substSelfOwnerSet(at.ownerWas) }
   } else if st == SS_PRINT {
     validatePrintCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-  } else if st == SS_RULES {
-    solveRules(at)
   } else if st == SS_NEST {
     validateNestCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
   } else if st == SS_IS {
@@ -1410,32 +1420,29 @@ function solveStep(at: SolveAt, st: i32) {
     if at.toggles { substSelfOwnerSet(at.ownerWas) }
   } else if st == SS_BM {
     validateBmCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-  } else if st == SS_MEM {
-    validateMemCstrs(
-      at.bNames,
-      at.bTys,
-      at.ix,
-      at.callee,
-      at.who,
-      at.hNames,
-      at.hArgNo,
-      at.hArgNode,
-    )
-  } else if st == SS_UFCS {
-    if at.toggles { substSelfOwnerSet(at.selfOwner) }
-    validateUfcsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
   }
   return 0
 }
 
-// The bound kinds the solver answers by a per-row rule, walked together in body order (`seq`).
-// A kind joins when its rule replaces its validator (S3.4).
-function ruleKinds(): i32[] { return [BND_ARRDEF] }
+// The bound kind answered by a per-row rule whose home is solve step `st`, or -1 for a step that
+// still runs its validator (`solveStep`). A kind joins when its rule replaces its validator (S3.4).
+function ruleKindOfStep(st: i32): i32 {
+  if st == SS_RULES { return BND_ARRDEF }
+  if st == SS_MEM { return BND_MEM }
+  if st == SS_UFCS { return BND_UFCS }
+  return -1
+}
 
-// Applies the per-row rule of every `ruleKinds` bound of `at.callee`, in body order.
-function solveRules(at: SolveAt) {
-  const ks = ruleKinds()
+// Applies the per-row rule of every bound of `at.callee` whose kind's home step lies in `from` to
+// `to` and in `at.kinds`, in body order (`seq`).
+function solveRules(at: SolveAt, from: i32, to: i32) {
+  const ks: i32[] = []
+  let st = from
+  while st <= to {
+    const k = ruleKindOfStep(st)
+    if k >= 0 && (at.kinds & (1 << st)) != 0 { ks.push(k) }
+    st = st + 1
+  }
   const ns: i32[] = []
   const cur: i32[] = []
   for k in ks {
@@ -1443,6 +1450,7 @@ function solveRules(at: SolveAt) {
     ns.push(n)
     cur.push(bndNextRow(k, at.callee, -1, n))
   }
+  const told0: i32[] = []
   let more = true
   while more {
     let pick = -1
@@ -1459,17 +1467,38 @@ function solveRules(at: SolveAt) {
     if pick < 0 {
       more = false
     } else {
-      solveRule(at, ks[pick], bndAt(ks[pick], cur[pick]))
+      solveRule(at, ks[pick], cur[pick], told0)
       cur[pick] = bndNextRow(ks[pick], at.callee, cur[pick], ns[pick])
     }
   }
   return 0
 }
 
-// The rule of bound `row` of kind `k`, one of `ruleKinds`.
-function solveRule(at: SolveAt, k: i32, row: Bound) {
+// The rule of row `ci` of kind `k`; `told0` is the solve's empty-list arguments already refused.
+function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]) {
+  const row = bndAt(k, ci)
   if k == BND_ARRDEF {
     return arrDefRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
+  }
+  if k == BND_MEM {
+    return memRule(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.who,
+      at.hNames,
+      at.hArgNo,
+      at.hArgNode,
+      ci,
+      row,
+      told0,
+    )
+  }
+  if k == BND_UFCS {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    ufcsRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
   }
   return 0
 }
@@ -2060,9 +2089,11 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         }
       } else if srcTy != dstTy {
         recPend(srcExpr, srcTy, dstTy, srcExpr)
+        recPendHeldInit(srcExpr, dstTy)
         recordRecCopy(srcExpr, srcTy, dstTy)
       } else if tyAt(srcTy) is TyObj || tyAt(srcTy) is TyArray {
         recOwnPend(srcExpr, srcTy)
+        recPendHeldInit(srcExpr, srcTy)
       }
     }
     return true
@@ -4348,7 +4379,9 @@ function fvaMakerRowAt(decl: i32, st: i32, d: TyFunc) {
 export function fvaIsMaker(decl: i32): boolean {
   if decl < 0 || decl >= P.nodes.length { return false }
   const fn = nodeAt(decl)
-  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return false }
+  if !(fn is FuncDecl) { return false }
+  // A generic maker is one returning only lambdas it writes, each call's instance pinned (D16799).
+  if fn.fnTyParams.length > 0 && !fvaHoleMaker(decl) { return false }
   for p in fn.fnParams {
     const pn = nodeAt(p)
     if !(pn is Param) { return false }
@@ -4377,11 +4410,20 @@ function fvaOpenFnResult(decl: i32): boolean {
 
 // Banks hole maker `m`'s row at closed result `ret`: each un-annotated parameter bound to the type
 // call `c` hands it, which pins the instance the call builds.
-function fvaHoleMakerRow(m: i32, c: Call, ret: i32) {
+function fvaHoleMakerRow(m: i32, mc: i32, c: Call, ret: i32) {
   const fn = nodeAt(m)
   if !(fn is FuncDecl) || c.callArgs.length != fn.fnParams.length { return 0 }
   const names: string[] = []
   const tys: i32[] = []
+  // A generic maker's call binds its type parameters, which pin the instance as a hole's type does.
+  for tp in fn.fnTyParams {
+    const bt = callBindTyOf(mc, tp)
+    if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) || tyHasHole(bt) {
+      return 0
+    }
+    names.push(tp)
+    tys.push(bt)
+  }
   let i = 0
   while i < fn.fnParams.length {
     const pn = nodeAt(fn.fnParams[i])
@@ -4414,12 +4456,12 @@ function fvaHoleCallFits(mc: i32, dt: i32): boolean {
     && f.fnParamTypes.length == d.fnParamTypes.length
 }
 
-// Whether maker candidate `decl` has an un-annotated parameter and returns only lambdas it writes:
-// each call pins the parameter, so the elaboration twins that call's instance (D16778).
+// Whether maker candidate `decl` has an un-annotated parameter, or is generic, and returns only
+// lambdas it writes: each call pins its instance, which the elaboration twins (D16778, D16799).
 function fvaHoleMaker(decl: i32): boolean {
-  if !fvaHasHoleParam(decl) { return false }
-  const fn = nodeAt(decl)
+  const fn = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
   if !(fn is FuncDecl) { return false }
+  if !fvaHasHoleParam(decl) && fn.fnTyParams.length == 0 { return false }
   const rets: i32[] = []
   collectRetValues(fn.fnBody, rets)
   for r in rets {
@@ -4533,7 +4575,7 @@ export function fvaMakerCallRows() {
       // A maker with an un-annotated parameter is built at the binding its call pins, so its row
       // names that binding: the elaboration twins that instance at `sig` (D16778).
       if fvaHoleMaker(m) {
-        fvaHoleMakerRow(m, c, sig)
+        fvaHoleMakerRow(m, mc, c, sig)
       } else {
         elabMakerRowNote(m, sig)
       }

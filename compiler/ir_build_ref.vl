@@ -4,8 +4,8 @@
 // over the same operands; the lowering takes its scratch slots from the shared lazy list frame.
 // Every other element or member read is a named miss. `irRefInstall` sets the hooks.
 
-import { Index, Member, nodeAt } from "./ast"
-import { OVar, Opnd, repPrim, repWhat } from "./ir"
+import { BinExpr, Index, Member, nodeAt } from "./ast"
+import { OVar, Opnd, StrOp, repPrim, repWhat } from "./ir"
 import {
   irBExpr,
   irBFnIx,
@@ -13,8 +13,11 @@ import {
   irBMiss,
   irBNoValue,
   irBNode,
+  irBOpRep,
+  irInPlaceHook,
   irIndexHook,
   irMemberHook,
+  irStrBinHook,
   irVarRepOkHook,
 } from "./ir_build"
 import {
@@ -35,6 +38,15 @@ import {
 import { irBoundsRule } from "./ir_verify_bounds"
 import { RList, repNodeAt, repNodeOfTy } from "./emit_rep"
 import { nodeTyAt } from "./emit_capture_frames"
+import {
+  strAssignInPlace,
+  strCatPartsOf,
+  strEqFirstOf,
+  strEqLitOf,
+  strOrderSwaps,
+} from "./wasmEmit"
+import { exprIsStrConcat } from "./emit_classify"
+import { exprIsStrEq, exprIsStrOrder } from "./emit_fn_scans"
 
 // The corrupt mode that drops every bounds check, rule 8's failing control, and the mode armed.
 const CORRUPT_DROP_BOUNDS = 5
@@ -47,11 +59,16 @@ export function irRefCorrupt(k: i32) {
 }
 
 // Whether rep `r` is a reference value this slice admits: a string, a list of unpacked
-// primitives (a packed `u8` element is no primitive here), or a list of those lists.
+// primitives (a packed `u8` element is no primitive here) or of strings, or a list of those
+// scalar lists.
 function refRepOk(r: i32, _ty: i32): boolean {
   if repPrim(r) == "str" { return true }
   const n = repNodeAt(r)
-  if n is RList { return irScalarListRep(r) || irScalarListRep(n.rlsElem) }
+  if n is RList {
+    return irScalarListRep(r)
+      || irScalarListRep(n.rlsElem)
+      || repPrim(n.rlsElem) == "str"
+  }
   return false
 }
 
@@ -97,11 +114,47 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   return irBMiss("member " + repWhat(r))
 }
 
+// A string `+` chain, `==`/`!=` or ordering, its operands built in legacy's push order: an
+// equality's quoted literal is written by the operator, and an ordering may push right first.
+function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
+  const n = nodeAt(ix)
+  if !(n is BinExpr) { return irBMiss("expression") }
+  const fnIx = irBFnIx()
+  let op: StrOp = "concat"
+  let parts: i32[] = []
+  if exprIsStrConcat(ix, fnIx) {
+    parts = strCatPartsOf(ix, fnIx)
+  } else if exprIsStrEq(ix, fnIx) {
+    op = "eq"
+    const lit = strEqLitOf(ix, fnIx)
+    parts.push(strEqFirstOf(n, lit))
+    if lit < 0 { parts.push(n.binRight) }
+  } else if exprIsStrOrder(ix, fnIx) {
+    op = "lt"
+    const swap = strOrderSwaps(n)
+    parts = if swap { [n.binRight, n.binLeft] } else { [n.binLeft, n.binRight] }
+  } else {
+    return irBMiss("operand at string")
+  }
+  const args: Opnd[] = []
+  for p in parts {
+    const a = irBExpr(b, p)
+    if missed(a) { return a }
+    if repPrim(irBOpRep(a)) != "str" {
+      return irBMiss("string operand coercion")
+    }
+    args.push(a)
+  }
+  return irBLetTemp(b, { soOp: op, soArgs: args, soAt: ix }, ix, rep)
+}
+
 // Installs the list builder, lowering and rule 8; run once before emit.
 export function irRefInstall() {
   irVarRepOkHook = refRepOk
   irIndexHook = buildIndex
   irMemberHook = buildMember
+  irStrBinHook = buildStrBin
+  irInPlaceHook = strAssignInPlace
   irLowerListHook = irLowerRefList
   irLowerBoundsHook = irLowerRefBounds
   irLoopOpenHook = irLowerRefLoopOpen
