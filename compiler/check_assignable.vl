@@ -102,6 +102,7 @@ import {
   luDecl,
 } from "./check_annot_resolve"
 import {
+  callBindTyOf,
   fsbCallArgTys,
   fsbCallArgTysPush,
   fsbCallDecl,
@@ -263,6 +264,7 @@ import {
   radixLitAdoptDst,
   rcwPend,
   recAdForce,
+  recPendHeldInit,
   recordCtxTy,
   recordListCopy,
   recordMapUnbox,
@@ -2087,9 +2089,11 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         }
       } else if srcTy != dstTy {
         recPend(srcExpr, srcTy, dstTy, srcExpr)
+        recPendHeldInit(srcExpr, dstTy)
         recordRecCopy(srcExpr, srcTy, dstTy)
       } else if tyAt(srcTy) is TyObj || tyAt(srcTy) is TyArray {
         recOwnPend(srcExpr, srcTy)
+        recPendHeldInit(srcExpr, srcTy)
       }
     }
     return true
@@ -4353,7 +4357,9 @@ function fvaMakerRowAt(decl: i32, st: i32, d: TyFunc) {
 export function fvaIsMaker(decl: i32): boolean {
   if decl < 0 || decl >= P.nodes.length { return false }
   const fn = nodeAt(decl)
-  if !(fn is FuncDecl) || fn.fnTyParams.length > 0 { return false }
+  if !(fn is FuncDecl) { return false }
+  // A generic maker is one returning only lambdas it writes, each call's instance pinned (D16799).
+  if fn.fnTyParams.length > 0 && !fvaHoleMaker(decl) { return false }
   for p in fn.fnParams {
     const pn = nodeAt(p)
     if !(pn is Param) { return false }
@@ -4382,11 +4388,20 @@ function fvaOpenFnResult(decl: i32): boolean {
 
 // Banks hole maker `m`'s row at closed result `ret`: each un-annotated parameter bound to the type
 // call `c` hands it, which pins the instance the call builds.
-function fvaHoleMakerRow(m: i32, c: Call, ret: i32) {
+function fvaHoleMakerRow(m: i32, mc: i32, c: Call, ret: i32) {
   const fn = nodeAt(m)
   if !(fn is FuncDecl) || c.callArgs.length != fn.fnParams.length { return 0 }
   const names: string[] = []
   const tys: i32[] = []
+  // A generic maker's call binds its type parameters, which pin the instance as a hole's type does.
+  for tp in fn.fnTyParams {
+    const bt = callBindTyOf(mc, tp)
+    if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) || tyHasHole(bt) {
+      return 0
+    }
+    names.push(tp)
+    tys.push(bt)
+  }
   let i = 0
   while i < fn.fnParams.length {
     const pn = nodeAt(fn.fnParams[i])
@@ -4419,12 +4434,12 @@ function fvaHoleCallFits(mc: i32, dt: i32): boolean {
     && f.fnParamTypes.length == d.fnParamTypes.length
 }
 
-// Whether maker candidate `decl` has an un-annotated parameter and returns only lambdas it writes:
-// each call pins the parameter, so the elaboration twins that call's instance (D16778).
+// Whether maker candidate `decl` has an un-annotated parameter, or is generic, and returns only
+// lambdas it writes: each call pins its instance, which the elaboration twins (D16778, D16799).
 function fvaHoleMaker(decl: i32): boolean {
-  if !fvaHasHoleParam(decl) { return false }
-  const fn = nodeAt(decl)
+  const fn = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
   if !(fn is FuncDecl) { return false }
+  if !fvaHasHoleParam(decl) && fn.fnTyParams.length == 0 { return false }
   const rets: i32[] = []
   collectRetValues(fn.fnBody, rets)
   for r in rets {
@@ -4538,7 +4553,7 @@ export function fvaMakerCallRows() {
       // A maker with an un-annotated parameter is built at the binding its call pins, so its row
       // names that binding: the elaboration twins that instance at `sig` (D16778).
       if fvaHoleMaker(m) {
-        fvaHoleMakerRow(m, c, sig)
+        fvaHoleMakerRow(m, mc, c, sig)
       } else {
         elabMakerRowNote(m, sig)
       }
