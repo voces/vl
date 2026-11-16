@@ -3811,6 +3811,20 @@ export function recLitPlaceBuiltTy(p: i32): i32 {
   if init >= 0 {
     if !(pn is ArrayLit) { return -1 }
     const it = nodeTyIxOf(init)
+    // A list of lists its parts built elsewhere holds them at its stamp, as a reassigned
+    // literal must (D16792).
+    const ist = nodeRepTyIxOf(init)
+    const iso = if ist >= 0 && ist < T.tys.length { tyAt(ist) } else { null }
+    const ise = if iso is TyArray { tyElemOf(iso) } else { -1 }
+    if (
+      ise >= 0
+      && ise < T.tys.length
+      && tyAt(ise) is TyArray
+      && it >= 0
+      && !tySame(ist, it)
+    ) {
+      return ist
+    }
     const e = recHeldElemBuilt(init)
     return if e >= 0 && it >= 0 && it < T.tys.length && tyAt(it) is TyArray { mkArrayTy(e) } else { -1 }
   }
@@ -5176,8 +5190,9 @@ export function recBuiltCallbackRefuse(md: i32) {
 }
 
 // Whether call `c`'s one argument is a function the elaboration instances at its receiver's
-// build: a lambda, or a function named by its declaration, of one un-annotated parameter. A
-// `map` result holding a record is not: only the parameter is keyed by the build.
+// build: a lambda, or a function named by its declaration, of one un-annotated parameter, or a
+// lambda whose parameter is annotated at the element type. A `map` result holding a record is
+// not: only the parameter is keyed by the build.
 function recCbTakesBuild(c: i32, isMap: boolean): boolean {
   const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
   if !(cn is Call) || cn.callArgs.length != 1 { return false }
@@ -5200,7 +5215,15 @@ function recCbTakesBuild(c: i32, isMap: boolean): boolean {
     return false
   }
   const p = nodeAt(f.fnParams[0])
-  return p is Param && p.parType < 0
+  if !(p is Param) { return false }
+  if p.parType < 0 { return true }
+  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) { return false }
+  const m = nodeAt(parenPeelIx(cn.callFn))
+  const lt = if m is Member { nodeTyIxOf(m.memObj) } else { -1 }
+  const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  return an is FuncDecl
+    && la is TyArray
+    && tySame(nodeTyIxOf(p.parType), tyElemOf(la))
 }
 
 // Whether the result type `rt` of `map` call `cn` holds, at any depth, a record its receiver's
@@ -5283,6 +5306,50 @@ function recBuiltElemIn(x: i32, tbl: Map<i32, i32>): i32 {
   return if d < 0 { -1 } else { recBuildTyIn(tbl, d, true) }
 }
 
+// `recBuiltElemIn` for the list a loop or callback reads its elements from, which may also be an
+// element of a list literal binding of lists, read directly or through a binding holding it: that
+// element holds what the literal's list parts agree on (D16784).
+function recBuiltIterElemIn(x: i32, tbl: Map<i32, i32>, depth: i32): i32 {
+  const own = recBuiltElemIn(x, tbl)
+  if own >= 0 || depth <= 0 || x < 0 || x >= P.nodes.length { return own }
+  const xn = nodeAt(x)
+  if xn is Ident {
+    const init = recHeldLit(x)
+    const iv = if init >= 0 { cwPeelValue(init) } else { -1 }
+    const ivn = if iv >= 0 { nodeAt(iv) } else { null }
+    return if ivn is Index || ivn is ArrayLit { recBuiltIterElemIn(iv, tbl, depth - 1) } else { -1 }
+  }
+  if xn is ArrayLit { return recLitReadsElemIn(xn, tbl, depth - 1) }
+  if !(xn is Index) { return -1 }
+  const b = cwPeelValue(xn.idxArr)
+  const init = if b >= 0 && b < P.nodes.length { recHeldLit(b) } else { -1 }
+  const l = if init >= 0 { nodeAt(cwPeelValue(init)) } else { null }
+  if !(l is ArrayLit) || l.arrElems.length == 0 { return -1 }
+  let r = -1
+  for el in l.arrElems {
+    const e = recBuiltElemIn(cwPeelValue(el), tbl)
+    if e < 0 || (r >= 0 && !tySame(r, e)) { return -1 }
+    r = e
+  }
+  return r
+}
+
+// The record the built reads in list literal `l` agree on, a record literal beside them built
+// there too (D16788); -1 where one is no built read or they disagree.
+function recLitReadsElemIn(l: ArrayLit, tbl: Map<i32, i32>, depth: i32): i32 {
+  let r = -1
+  for el in l.arrElems {
+    const ev = cwPeelValue(el)
+    if !(ev >= 0 && ev < P.nodes.length && nodeAt(ev) is ObjLit) {
+      const e = recBuiltReadTyAt(ev, tbl, true, depth)
+      const en = if e >= 0 { nonNullTy(e) } else { -1 }
+      if en < 0 || (r >= 0 && !tySame(r, en)) { return -1 }
+      r = en
+    }
+  }
+  return r
+}
+
 // The record a container's build gives the read `x`: an element by index or `.get`, a field of
 // one, or a record binding's own build; else -1.
 export function recBuiltReadTy(x: i32): i32 {
@@ -5336,13 +5403,55 @@ function recBuiltReadTyAt(
   }
   // A loop variable or a list callback's parameter holds the list's elements (D16783).
   const el = recElemVarList(x)
-  if el >= 0 { return recBuiltElemIn(el, tbl) }
+  if el >= 0 { return recBuiltIterElemIn(el, tbl, 4) }
   const d = recHeldDecl(x)
-  if d < 0 { return -1 }
+  if d < 0 { return recReassignedBuiltTy(x, tbl, depth - 1) }
   const b = if fresh { recBuildTyIn(tbl, d, false) } else { -1 }
   const dn = nodeAt(d)
   if b >= 0 || !(dn is LetDecl) { return b }
   return recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// The record a reassigned un-annotated `let` the read `x` names holds, where its initialiser and
+// every value assigned to it whole are built reads agreeing on it, a record literal among them
+// built there too (D16800); else -1.
+function recReassignedBuiltTy(x: i32, tbl: Map<i32, i32>, depth: i32): i32 {
+  if depth <= 0 || !(nodeAt(x) is Ident) || !tyHoldsObjDeep(nodeTyIxOf(x)) {
+    return -1
+  }
+  const d = recBindDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "let"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  // Only an initialiser that is itself a built read can open the question.
+  const i0 = cwPeelValue(dn.letInit)
+  if recBuiltReadTyAt(i0, tbl, true, depth) < 0 { return -1 }
+  const vals: i32[] = [cwPeelValue(dn.letInit)]
+  cwIxBuild()
+  const ow = cwOccWalk(cwKeyOfRoot(x))
+  while cwOccNext(ow) {
+    if cwIxKind[ow.row] == CW_OCC_ASG {
+      const a = nodeAt(cwIxNode[ow.row])
+      if !(a is BinExpr) { return -1 }
+      vals.push(cwPeelValue(a.binRight))
+    }
+  }
+  let r = -1
+  for v in vals {
+    if !(v >= 0 && v < P.nodes.length && nodeAt(v) is ObjLit) {
+      const e = recBuiltReadTyAt(v, tbl, true, depth)
+      const en = if e >= 0 { nonNullTy(e) } else { -1 }
+      if en < 0 || (r >= 0 && !tySame(r, en)) { return -1 }
+      r = en
+    }
+  }
+  return r
 }
 
 // The list whose elements the read `x` names, parentheses peeled: the iterated list of the
@@ -5350,7 +5459,7 @@ function recBuiltReadTyAt(
 // whose callback's one parameter it is; else -1.
 function recElemVarList(x: i32): i32 {
   const n = nodeAt(x)
-  if !(n is Ident) { return -1 }
+  if !(n is Ident) || !tyHoldsObjDeep(nodeTyIxOf(x)) { return -1 }
   const d = identDeclOf(x)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if dn is LoopVar {

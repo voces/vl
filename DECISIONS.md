@@ -12381,3 +12381,17 @@ print(g<f64>([]))   // true
 **Why.** A type argument is an annotation of `V`; the parameter's type at the call is then `i32[]`,
 and answering by emptiness after the author wrote the type would surprise a human or an LLM reading
 the call. It follows "An annotation fixes an empty list's element type wherever the value goes".
+
+## The slot store is context-insensitive; a set is tagged rather than re-keyed (2026-11-16, chosen under the owner's delegation) — SLOT part D, STORE class 2, D16747
+
+**The rule.** The slot store's classes are one answer per program point, not per call site: a
+non-generic function's returned container is unioned across its callers, and a binding gets a
+superset of what it can hold. Where that union changes only the layout and not the output (D16801's
+returned record), it lands as a named mover with a refutation pin. A function set that is partial
+and whose members split at a call it reaches is *tagged* by the storage decider (STORE class 2), so
+the existing tagged dispatch serves it; no instance is re-keyed after the tag decision settles.
+
+**Why.** Per-call precision already exists where it matters, through generics and their instances; a
+second precision mechanism in the class engine, or a re-keying step after settle, would be a second
+place that decides storage, which the one-decider work removes. A union is the sound direction: it
+can cost size, never a wrong value, and the pin catches the day it costs a refusal.
