@@ -70,8 +70,8 @@ filter was narrowed; the narrower filter caught 83 of the 84 refusals the wide s
   print the same output at -O3 as unoptimised (71 of 71). One is still refused: its operand is
   not a `struct.new`. The other 53 now refuse those fields for a different reason, such as a
   whole read, so their inline count is unchanged.
-- Of a 300-program control sample, 246 built on both sides, with 246 byte-identical modules and
-  no exit-code change. The other 54 are programs that refuse to compile on both seeds.
+- A control sample of the programs the refusal did not touch held 246 distinct programs. All
+  246 build on both seeds to byte-identical modules, with no exit-code change.
 
 ## Precision limits
 
