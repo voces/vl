@@ -201,6 +201,7 @@ print(guard(2))
   `let gs: i32[] = []\nfunction add(x: i32): i32 {\n  gs.push(x)\n  return gs.push(x + 1)\n}\nprint(add(1))\n`,
   `let ns: string[] = ["a", "b"]\nfunction put(i: i32, s: string) { ns[i] = s + "!" }\nput(1, "z")\nprint(ns[1])\n`,
   `let fs: f64[] = [0.0, 0.0]\nfunction wid(i: i32, x: i32): f64 {\n  fs[i] = x\n  const y: f64 = x\n  return y\n}\nprint(wid(1, 3))\n`,
+  `function pick(c: boolean, x: i64): i64 | null {\n  if c { return x }\n  return x + 1\n}\nprint(pick(true, 3) ?? 0)\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
