@@ -75,16 +75,16 @@ Deno.test({ name: "playground-run: an EMIT-stage failure yields a POSITIONED err
   // Diagnostics pane — which the Run verdict points at — rendered nothing. Now the
   // diagnostic anchors at the failing function's declaration (`useIt`, line 4 →
   // LSP 0-based line 3), so the pane has a real location to show.
-  // The un-lowerable shape is D14041's: `is` over a literal-union list arm has no
-  // interned arm representation.
-  const src = "type K = 0 | 1\n" +
-    "// D14041\n" +
-    "const z = 9\n" +
-    "function useIt(x: K[] | string) {\n" +
-    "  if x is K[] { print(x[0]) } else { print(z) }\n" +
+  // The un-lowerable shape is D4265's: `is` across record arms whose shared field's box holds
+  // a member only some of whose values fit.
+  const src = 'type A = { v: "a" | "b" }\n' +
+    "// D4265\n" +
+    "type B = { v: i32 | string }\n" +
+    "function useIt(u: A | B) {\n" +
+    '  if u is A { print("A") } else { print("B") }\n' +
     "}\n" +
-    "useIt([1])\n" +
-    "useIt(\"s\")\n";
+    "const c: B = { v: 3 }\n" +
+    "useIt(c)\n";
   const { bytes, diagnostics } = await seedChecker().compile(src, "main.vl", noSiblings);
   if (bytes !== undefined) throw new Error("expected no bytes for an emit-stage failure");
   const errors = diagnostics.filter((d) => d.severity === "error");

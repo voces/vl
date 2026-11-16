@@ -46,7 +46,7 @@ coercion` now holds 108 functions alone. That compare is the next step, a shared
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the N2b-2a seed, 12,294 cells | CORPUS_ID |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,434 claimed and byte-identical, the same 2 fallbacks as before; corpus CORPUS_M3 |
+| corpus identity against the N2b-2a seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,434 claimed and byte-identical, the same 2 fallbacks as before; corpus 9,016 identical, 0 differ, 0 fell back |
 | L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 95,256,867,281 to 95,316,549,942 (+0.06%) |
 | seed size, N2b-2a seed to this one | 6,515,176 to 6,516,503 (+1,327); +2.7% on the baseline, under +3%, so no baseline write |
