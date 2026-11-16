@@ -23,11 +23,17 @@ walk. With this change nothing calls it, and part E deletes it.
 
 ## Movers (output identical)
 
-- `closures/captured-cell-shared-writer-hole-lambda-alias`, +10 bytes: the classes follow the
-  closure's write `k = h` into the captured cell, so `h`'s parameter is pinned at `boolean` in that
-  instance; the walk answered open (ruled a graded mover; the fixture's `@log` lines pin its output).
-- `closures/maker-lambda-delivered-inside-instanced-body`, −10 bytes: one lambda instance fewer
-  (master builds two identical `(i32) => f64` instances; this branch calls one from both sites).
+Against master `ee6e3a4d6`, 4 of the `tests/cases` programs (module entries included) build other
+wasm; every one prints the same output.
+
+- `closures/captured-cell-shared-writer-hole-lambda-alias`, 1363 to 1373 bytes, one function more:
+  the classes follow the closure's write `k = h` into the captured cell, so `h`'s parameter is
+  pinned at `boolean` in that instance; the walk answered open (ruled a graded mover; the fixture's
+  `@log` lines pin its output).
+- Three build a strictly smaller set of lambda instances (named functions a subset of master's):
+  `generics/generic-value-slot-written-in-generic-body-at-two-instances` (13 lambdas to 8, 35
+  functions to 27), `generics/call-through-generic-value-owns-only-its-constraints` (4 to 3) and
+  `functions/maker-lambda-set-into-map-at-f64-result` (2 to 1).
 
 ## Readings
 
