@@ -7883,11 +7883,24 @@ function emitOptMemberValue(exprIx: i32, fnIx: i32) {
   return omR
 }
 
+// After a `?.` ref leaf: a read typed without `null` here, its receiver present (an instance's
+// hole handed a record), is held in a non-null cell, so the nullable ref is recovered (D16857). 0.
+function optReadRecoverNonNull(exprIx: i32, fnIx: i32): i32 {
+  const t = nodeTyAt(exprIx, fnIx)
+  if t >= 0 && tyExcludesNull(t) { fbRefAsNonNull() }
+  return 0
+}
+
 // The standalone `?.` arms themselves, with the chain's base already staged when it needed
 // staging, so every arm below may read the receiver as often as its rep requires.
 function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
   const e = nodeAt(unwrapParen(exprIx))
   if e is OptMember {
+    // A read off the `null` unit is the `null` its destination seeded, after the receiver (D16841).
+    if exprIsNulNone(exprIx, fnIx) {
+      if emitNulNoneForEffect(e.omObj, fnIx) < 0 { return -1 }
+      return emitNullAt(exprIx, fnIx)
+    }
     const osi = optChainStructIdxOf(e.omObj, fnIx)
     if osi < 0 {
       return emitFailAt(
@@ -7926,7 +7939,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
 
     // A LIST leaf, the record arm one table over: `T[] | null` is the list wrapper's own
@@ -7940,7 +7953,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
     // A MAP leaf: `{[K]: V} | null` is the field's map struct's own nullable ref, the list
     // arm's shape over the struct `sFieldMapShape` names.
@@ -7960,7 +7973,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
     // A function-value leaf: `F | null` is the closure fat pointer's own nullable ref.
     if oKind == "closure" || oKind == "nulclosure" {
@@ -7971,7 +7984,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
     // The leaf reps this arm can build, in the order the arms below take them: a nullable
     // REF (a list, a map, a function value, a nested struct, a string), the scalar box
@@ -27451,6 +27464,10 @@ function emitCallCore(callIx: i32, fnIx: i32) {
     // An instance binding a type parameter to `never` reaches no call through it (D3178).
     if nodeTyAt(c.callFn, fnIx) == TY_NEVER { return emitNullCalleeCall() }
     if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NEVER {
+      return emitNullCalleeCall()
+    }
+    // A `?.` guard's arm over a receiver this instance types `null` is dead (D16841).
+    if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NULL {
       return emitNullCalleeCall()
     }
     return emitFail("emitProgram: callee is not a function name")
