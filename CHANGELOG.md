@@ -9,6 +9,72 @@ see **`DECISIONS.md`**. A PR never edits this file: it adds a `changelog.d/` ent
 
 ## Type system (Track A)
 
+- **D16393 closed:** `==` over a list of a string literal union and a list of `string` (`("a" | "b")[]` against `string[]`, nullable elements too) now compares by value instead of being refused at check: the literal list is read through a string copy for the compare, and the original keeps its own storage.
+- **D16470 closed:** `==` in a generic body over a call operand of two records of one field set stored apart (`id(a) == b` at `{f: i32}` and `{f: f64}`) now runs the call once into a fresh binding and compares field by field at the instance, instead of being refused at emit.
+- **D16799's generic spelling runs:** a generic maker returning a lambda over its parameter (`function adder<T>(n: T) { return (a) => a + n }`), called at an `i32` and an `f64` argument, now builds each binding's lambda at its own instance instead of being refused at emit. Two residues are filed: the wider pin called first, or the lambda bound to a local before it is returned (D16815), and a maker's result handed to an un-annotated parameter (D16816).
+- **D16470 narrowed, D16810 closed:** `==` in a generic body over field or element reads of two records of one field set stored apart (`a.v == b.v` at `{f: i32}` and `{f: f64}`) now compares field by field at the instance instead of being refused at emit; over nullable records it no longer builds invalid wasm. A call operand (`id(a) == b`) is still refused at emit.
+- **D16749, D16811 closed (clause 1):** maps, or a list and a map, of records whose un-annotated function fields hold a set within another's (`{inc0, half}` beside `{inc0, half, dbl}`) run in either order; a list beside the wider map no longer builds an invalid module.
+- **D16805 closed:** a list of lists of un-annotated functions whose results differ takes `push` of a list literal, an index store, `slice` and `pop`, and runs; each inner list holds the set's ids.
+- **D16737 closed:** a generic function taken as a value at the end of a long chain of aliases or of
+  functions returning their argument runs instead of being refused. The chain walk follows a path
+  and stops at a cycle, not after 24 links.
+- **D16738, D16739, D16824 filed** from the 6b function-set grid: one check-clean invalid module (clause 1), and an emit reject and a check reject (clause 2) whose plainer siblings run.
+- **D3851 closed** (clause 2): a lambda with an un-annotated parameter that nothing calls, stored in
+  a binding a nested function writes and nothing reads, is pruned as dead instead of refused; the
+  list face is filed as D16820.
+- **D3956 closed** (clause 2): a generic function handed from a closure to another closure's
+  parameter typed by the enclosing generic's type parameter is instanced at that parameter's type
+  in each instance, through a binding or a list element; it was a loud emit reject.
+- **L2 S3.4b, part 1: member and UFCS bounds answer by rule in body order**
+  (`refactor-notes/2026-11-16-l2-s3-4b-member-ufcs-walk.md`). `validateMemCstrs` and
+  `validateUfcsCstrs` become per-row rules on S3.4a's walk. 0 of 20,677 programs move.
+- **L2 S3 plan: the arrow rule is STORE's, staged with one storage decider throughout**
+  (`refactor-notes/2026-11-16-l2-s3-plan.md`). S3.4d lands as the solve alone (identical), then one
+  storage class per PR with its `fnTagRedecide` branch deleted, then `fnTagRedecide` itself.
+- **D16798, D16799 closed:** a call through a binding of an un-annotated maker's call (`const v = adder(2)`, `adder(n)` returning `(a) => a + n`) is typed at the binding the maker call pinned, so `v(3) / 8.0` widens and runs, a second binding at another pin (`adder(1.5)`) gets its own instance, and `const y: string = v(3)` is refused by `vl check`.
+- **D16803 closed:** a `let` initialised from an element a kept maker builds at a wider record and
+  reassigned an element stored at its own record now runs; it built a module that failed to
+  validate.
+- **D16396 closed:** `==` over two records of one field set whose field pairs widen in opposite directions (`{x: i32, y: i64}` against `{x: f64, y: i32}`) now compares field by field instead of being refused at check, as structural `==` permits; nested and nullable records too. A pair no field of which compares bare (`{x: i64}` against `{x: f64}`) is still refused.
+- **D16742 closed:** a list of lists of lists (or deeper) of un-annotated functions whose results differ runs, bound, walked, returned or handed to a parameter; each inner literal of a smaller set is built at the whole set's ids.
+- **D16748 closed (clause 1):** in a function with an un-annotated list parameter of function lists, a binding of an element (`const y = xs[1]`, `const y = x[0]` in a loop) called through (`y[0](3)`) dispatches on its member instead of trapping.
+- **D16743 closed:** a map written records whose function field holds un-annotated functions of different results, called through `?.` on an entry (`m.get("b")?.f0(3) ?? 0`, `m["b"]?.f(3)`), runs; each call runs the member the entry holds.
+- **D16804 closed (clause 1):** a list of lists of un-annotated functions beside a list of lists of a wider set that holds the same set's literal (`[[inc0], [half]]` before `[[dbl], [inc0, half]]`) runs; it no longer passes check and fails at emit when written first.
+- **D16736 closed:** two recursive records that store a field differently are refused at a shared
+  delivery whichever field comes first, instead of exhausting the compiler's call stack. The storage
+  comparison stops at a record pair it is already inside, not after eight levels per record.
+- **D16808 filed and closed** (clause 1): a generic or hole-parameter relay of a maker's hole
+  lambda, delivered at two function types whose results differ, builds each instance's maker call
+  at its own result; one `i32` closure served both and trapped.
+- **L2 S3.4a: a hole parameter that only reads its map is pinned by the argument**
+  (`refactor-notes/2026-11-16-l2-s3-4a-container.md`; D15161, D16714). The read-only map floor
+  refused it when the function came before the call and let it run when it came after. It now runs
+  in both orders, and an argument that is no map is refused as `expected a map, got T`. The solver's
+  body-order walk (`solveRules`) begins with the array-default bound.
+- **D16778 closed**: a maker with an un-annotated parameter (`function adder(n) { return (a) => a + n }`), delivered at `(a: i32) => i32` and `(a: i32) => f64`, built one `i32` closure for both and the second call trapped. Such a function is now a maker when it returns only lambdas it writes: its call banks a maker row naming the binding the call pins, and the elaboration and mono build that call's instance at each delivered result. Two neighbours found while grading are filed: D16798 (an un-annotated binding called at `f64`) and D16799 (one maker called at two parameter types).
+- **D16780 closed**: a maker's hole lambda relayed by a generic or hole-parameter function (`function wrap<T>(x: T) { return deliver() }`) and delivered once at `(a: i32) => f64` kept its `i32` result and trapped. The call search now climbs out through an instanced function's return to its calls, admitting a call made at the root or one whose instance reaches the instance searched; the one-delivery spelling prints `0.5`. The two-delivery face is lane INIT's, to be re-filed.
+- **One storage decider, partial sets:** the check no longer calls a function set partial because a different set reaches the same parameter at a different call (each is its own instance); only a lambda shares its calls. The late pass now changes the storage decision in 331 programs, down from 352. No program's output moves; two programs' wasm shrinks as a set that was a closure is now tagged.
+- **One storage decider, producer coverage:** the check's set-binding rows now follow a parameter a nested function captures, and a call through a local `const` the check types at a set (a choice of declared functions). This moves 6 programs' late-only sets onto the check's try-list; one is now decided by the check. No program's wasm or output moves.
+- **D16764 closed:** a `filter` or `map` lambda whose parameter is annotated at the element type,
+  over a list a kept maker builds at a wider record, now runs; it was refused.
+- **D16787 closed:** an un-annotated binding of a loop variable over a list a kept maker builds at
+  a wider record, handed to an annotated narrower parameter, now runs; it built a module that
+  failed to validate.
+- **D16788 closed:** a loop over a list literal holding elements a kept maker builds at a wider
+  record, its variable handed to an annotated narrower parameter, now runs; it built a module that
+  failed to validate.
+- **D16783 closed:** an element of a list a kept maker builds at a wider record, read through a
+  `for … in` loop variable or a `map`/`filter` callback's parameter and handed to an annotated
+  narrower parameter, now runs; it built a module that failed to validate.
+- **D16784 closed:** a callback or a loop over an element of a list of lists, one of which a kept
+  maker builds at a wider record, now runs; an annotated callback built a module that failed to
+  validate, and an un-annotated one was refused at emit.
+- **D16800 closed:** a reassigned `let` that only ever holds elements a kept maker builds at a
+  wider record, handed to an annotated narrower parameter, now runs; it built a module that
+  failed to validate.
+- **D16792 closed:** a `let` holding a list of lists one of which a kept maker builds at a wider
+  record, reassigned a list of lists of fresh records, now runs; it built a module that failed to
+  validate.
 - **D16760 closed:** an un-annotated `const e = []` handed to a generic `V[][]` parameter now runs instead of being refused at emit: the binding stays a list of lists, its inner element binds `V` once the program's writes settle it, and a later `e.push([2.5])` fixes that element.
 - **D16772 narrowed:** a list whose elements a kept maker's build stores at a wider record, handed to an un-annotated parameter (`function show(a) { print(a[0].f) }; show(src)`), now runs instead of being refused: the callee is instanced at the build, as an annotated parameter already was. Returning such a list from an un-annotated function, storing it as a map value, or handing it inside a record literal is still refused.
 - **D16773 closed:** a `map` callback building a record over a list whose elements a kept maker's build stores at a wider record (`src.map((y) => { return { g: y.f == null } })`) now runs instead of being refused: a result that holds no record the element could be cannot hold the element, so the callback is instanced at the build as one building a list is.
@@ -1987,6 +2053,23 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **E8 The checker's INTERNAL absence marker `<none>` reached users on the diagnostic channel — and the sibling `<error>` is a MEASURED non-change, not the other half of the same fix** — `tyToStrAt`'s no-arena-entry bail-out (`ix < 0`) wrote `<none>` into user-facing messages: `unknown property \`add\` on {[<none>]: <none>}` for a bare `Map()`, `argument 1: expected string, got <none>[]` for an empty `[]`. It now writes the blank `_` — E7's token, for E7's reason: an un-annotated param and an empty literal's element are ONE sentence to a reader ("no type was determined here; say it"), and the split between them is arena bookkeeping (an unsolved entry vs no entry at all) that made the second kind look like a different, internal condition. `holeDemandStr`'s "demands nothing" answer moves with it, because it lands in the `expected …` half of a message whose `got …` half comes from that renderer. **CORPUS, re-derived on the tip rather than inherited**: 4 marker occurrences in 4 of the **300 error-producing** files (of 1,137 diagnostic-producing, of 2,004 `.vl`; 13,510 diagnostic lines) — the board's "3 named files of 240 diagnostic-producing" is stale in both terms, and its shape→file table mis-assigns two of the four (`types/unknown-type-in-map-value.vl` is an `<error>` site; the `<none>[]` site is `soundness/hole-is-guard-return-join-reject.vl`). The corpus is not the population, so the render was reached from **74 CONSTRUCTED cells** (3 waves; 2 non-reproducing probes re-shaped after VL rejected `function(){}` for arrow syntax): **`<none>` 35 of 38 cells across 12 distinct message TEMPLATES** (`argument N`, `return type mismatch`, `cannot assign … to 'x'`, `cannot assign … to T`, `comparison expects numeric operands`, `operator '+' is not defined`, `unknown property`, `no method '.p' on array`, `print of …`, `set:`, `add:`, `push:`) and every shape of it (`_[]`, `_[][]`, `{[_]: _}`, `{[_]: boolean}` for `Set()`, `{a: _}`, `(_)[]`, `() => _[]`, `_ | null`). **`<error>` reaches the user through EXACTLY ONE template — 12 of 12 hits over 36 cells, plus 2 of 2 in the corpus, all the `print of …` codegen gate, and in all 14 the errored component sits inside a FUNCTION type**; the other 24 cells report only `unknown type '…'`, because an errored type is assignable both ways and every assignability-shaped check ABSORBS it. **Three answers for `<error>` were priced and all three refuted.** `_`: collapses a distinction `soundness/hole-renders-as-blank-reject.vl` pins, and misdirects — the reader has already been told `unknown type 'nosuchtype'` by name, and `() => _` sends them after a missing annotation instead of the one they wrote. SUPPRESS the second diagnostic: refuted by a CONTROL, not by the fixture comment that claims it — `function mk(): i32 { return 0 }  print(mk)` is rejected `print of () => i32 …` identically, so the gate is not a cascade and only its RENDER is polluted. RENDER THE OFFENDING NAME (`() => nosuchtype`, strictly the most useful): impossible without a rep change — `TY_ERR` is a SINGLETON arena entry (one `mkErrTy()` call, `errKind` a constant), and `emit_rep.vl` keys `TyErr` by arena INDEX, so minting one per failure multiplies rep keys. `<error>` therefore stays, and with `<none>` gone the angle brackets become a CLEAN one-meaning vocabulary: they mark a type the reader named and the checker rejected. **BYTE-IDENTITY, the primary oracle for a text-only change: 2,004 of 2,004 corpus files produce an identical `(rc, md5)` record, all 1,640 emitted modules byte-for-byte** — the `tyToStructStr` hazard (it shares `tyToStrAt`, and its output names shapes the emitter stores) did not fire, measured rather than assumed. The diagnostic channel moves **2 of 13,510 lines**, both `<none>` → `_`. **LSP**: `ABSENT_TYPE_MARKERS` drops `"<none>"` — no producer emits it, and the blank could not replace it, being a SUBSTRING of ordinary identifiers (`{foo_bar: i32}`) in a substring sentinel test. Both `KNOWN_CLEAN_DROPS` exceptions in the corpus sweep disappear (`: _ | null`, `: () => _[]` are displayable), so **no diagnostic-free file loses a hint any more** and the clean side is now an absolute zero, with `dropsOnErrored ≥ 1` carrying non-vacuity. A `TyNullable`-arm answer of `null` for the lone-`null` case was **refuted by measurement, not scope**: 4 of 12 constructed cells reach `_ | null` and only 2 are the lone null — `function mk() { return [] }` makes `mk().pop()` one too, where the blank is honest. **Pins retargeted (4) and predictions**: `sets/error-add-non-boolean-value.vl` (`{[<none>]: <none>}` → `{[_]: _}`), `soundness/hole-is-guard-return-join-reject.vl` (`got` → `got _[]`, a pin that stopped one token BEFORE the marker and so could not see it), plus header-only retargets on `soundness/hole-renders-as-blank-reject.vl`, `generics/type-arg-inline-object-field.vl`, `types/unknown-type-in-inline-object-field.vl` and the two `tail-assign-*` files whose blocked empty-`[]` rows named the display filter as blocker (it no longer is; the checker-side half at `fnAssignRetTargetName` is untouched). Predicted 1 fixture red before retargeting — measured 1. SABOTAGE with the SAVED pre-fix artefact (`md5sum -c`, never a rebuild): predicted 3 corpus fixtures red — measured exactly 3, and the LSP suite predicted GREEN and measured 8/8, because its corpus sweep observes the FILTER and not the producer. No log-mismatch fixture is available for a diagnostic-text slice; the new file is a PIN. (`compiler/typecheck.vl`, `lsp/src/typeFeatures.ts`, `tests/cases/soundness/absence-markers-render-reject.vl`, `tests/lsp_undisplayable_type_test.ts`)
 
 ## Codegen, memory & runtime (Track B)
+- **IR cutover C2h, string operators, char literals and the string list read:** string `==`/`!=`,
+  ordering and `+` chains, char literals and a `string[]` read now go through legacy's own arms in
+  the IR. The IR covers 392 more corpus functions and 1,487 more self-compile functions, every one
+  it lowers matched. The blocker census no longer reports `valued tail if`, which was its own
+  artifact. No emitted byte moves.
+- **Place classes keep linear memory:** a class merged into another drops its own member, call, up-link and child lists, which only the root is read through. Building the classes for every compile no longer runs the compiler's own self-compile out of GC heap; every `tests/cases` program builds byte-identical (D16768).
+- **IR blocker census:** `$VL_IR_SHADOW=4` builds each function past its missed statements, and
+  `ir-shadow.vl -- --blockers` reports which miss classes, alone or in pairs, keep functions
+  uncovered. Coverage steps are now chosen and graded by the functions they unblock. The builder's
+  catch-all miss names its node kind. No emitted byte moves.
+- **IR cutover C2g, string literals, length and reads:** a string literal, a string's `.length` and
+  a raw string read `s[i]` now go through legacy's own arms in the IR (`emitStr`, `arrLenTail`,
+  `rawStrHoistOf`/`rawStrGetTail`). The IR covers 2,034 more corpus functions and 93 more
+  self-compile functions, every one matched. No emitted byte moves.
+- **D16807 filed**: a local alias of a hole map parameter, read for a function value the inferred
+  map holds as a hole, is refused by the read-only map floor today. With the floor lifted (L2
+  S3.4a) the emitter refuses it, while the same read straight off the parameter runs.
 - **A parenthesised `??` over a hole parameter's map read is read at its instance's type**
   (D16794, D16795, D16797). `print((q.get("a") ?? 0.0))` built an invalid module,
   `(q.get("a") ?? 0) + 1` trapped the compiler and `(q.get("a") ?? []).length` refused at emit.
@@ -3601,6 +3684,38 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **playground: code-split binaryen off the initial load** — with codegen on the seed, binaryen (~13 MB) is reached ONLY via the lazy `import("binaryen")`/`import("./toWasm.ts")` behind `wasmToWat` (the WAT renderer). `build.ts` now enables esbuild `splitting` (`outdir` + object-form `entryPoints` → `playground.js`), so binaryen lands in its own `chunk-*.js` fetched on demand when the WAT pane is first shown — not on page load. The entry `playground.js` drops from ~22 MB to ~2 MB (the rest is lazy chunks: Monaco's on-demand features + the binaryen WAT chunk). `pages.yml` ships the chunks (`dist/*.js`); `index.html` still loads only `playground.js` + `playground.css`. WAT stays a feature (binaryen disassembling the seed's bytes), just off the critical path.
 
 ## Infrastructure (Track F)
+- **Plumb-shape cost baseline re-read from a fixpoint master seed:** main fuel 9.44G, tail 6.84G. Master had drifted +3.6% across merges, none of which crossed the +5% bar alone. Each PR is graded on its own delta again.
+- **Distilled baseline re-read for one cell:** `d16121_argument_unann` moves from a loud check reject to a loud emit reject, filed as D16807 (the read-only map floor lift, L2 S3.4a, let it past check; emit's union-rows sentence now refuses it). No runs lost.
+- **D16769 closed:** the elaboration's delivery walk no longer stops after 32 bindings or returns per
+  query; it ends when every reachable binding and path has been walked. No program's output changes.
+- **Rep ADT stage 4a:** a default-off heap-identity shadow (`$VL_REP_SHADOW`) counts the merges a
+  rep-keyed `heapOf` would make. Over the corpus, 1,061 merges keep their layout, and 151
+  struct-row merges in 31 files would fuse different layouts, all of them records holding function
+  sets. So stage 4 waits on function storages becoming reps:
+  `docs/internals/refactor-notes/2026-11-16-rep-adt-stage4a-heap-shadow.md`.
+- **The hof fuzz generator names `compose`'s type arguments when it calls `compose` at `i64` or `f64`.** Since D16562, `A` binds at `i32` when nothing binds it. On seeds 1-60, the hof refusal share falls from 13% to 4%, under its 7% ceiling.
+- **Three oracle gaps from a 60-seed fuzz are fixed, with smoke pins.** All three were oracle-side; the compiled output was right in each.
+  - 4.3: a radix tree that is not constant, beside a typed integer arm, runs at that arm's width.
+  - D3043: a radix tree holding a decimal outside i32 is i64-wide beside an i32 arm.
+  - A float join beside a typed `f32` argument of `min`, `max` or `abs` adopts f32.
+
+  The hof generator's refusal share rose from 5% to 13% at d7b8845e7 (D16562), because `compose`'s unbound `A` now takes `i32`. Most of the rest is D16813, filed: a `let` reassigned between two hole functions pins both at the first call's type.
+- **The inference-hole query has no depth budget** (type hash-cons stage 6b). Every caller asks
+  one walk that visits each union and record once, so a type nested past eight levels no longer
+  reads as holding a hole. Output is byte-identical, and the self-compile is slightly cheaper.
+- **Rep ADT stage 3d-ii:** a field's map key kind is read off its storage type. The key-kind
+  column, its arm twin and the key kinds every minter computed to store them are deleted
+  (−106 compiler lines). 0 module bytes change on either corpus:
+  `docs/internals/refactor-notes/2026-11-16-rep-adt-stage3d-ii-key-kind.md`.
+- **Rep ADT stage 3d-iii:** a field's element type is read off its storage type, except where it
+  may hold a function, which is stored as its id (D16721). Two variant-twin fixtures reorder
+  their type section at the same size and still run. Every other module is byte-identical. The
+  literal-set sidecar is measured not to be a type projection: it records a layout decision.
+  `docs/internals/refactor-notes/2026-11-16-rep-adt-stage3d-iii-elem-ty.md`.
+- **Rep ADT stage 3e, first piece:** 3a's end-of-emit field-code sweep is deleted (−97 lines). The
+  read-time shadow in `fieldCodeIn` checks every read and fails loudly on a moved code. The rest
+  of 3e waits on D16720, D16721 and D16722:
+  `docs/internals/refactor-notes/2026-11-16-rep-adt-stage3e-sweep.md`.
 - **The covariance walk behind record deliveries stops at a cycle, not at twelve levels** (type
   hash-cons stage 6b). It already kept the pairs it was inside; its union step now keeps a path of
   the unions it has entered. Output is byte-identical.
