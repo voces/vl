@@ -4,28 +4,40 @@
 // `idxArmOf`); a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
-import { Index, WhileStmt, nodeAt } from "./ast"
-import { RListGet, Rhs, SBoundsCheck } from "./ir"
+import { Index, Member, WhileStmt, nodeAt } from "./ast"
+import { RListGet, RListLen, Rhs, SBoundsCheck, repPrim } from "./ir"
 import { irLFn, irLMiss, irLOpnd, irLSkip } from "./ir_lower"
 import {
+  arrLenHoistOf,
+  arrLenTail,
+  emitArrLenHeld,
   idxArmOf,
   idxCellReadIsNull,
+  listElemStaysNullable,
   loopHoistClose,
   loopHoistOpen,
+  refListGetTail,
+  refListHoistOf,
   scalarListGetTail,
   scalarListHoistOf,
   scalarListUsed,
   svDstOfKind,
 } from "./wasmEmit"
 import { scalarListElemKind } from "./emit_value_sites"
+import { exprNullableRefArray, refListSlotOfExpr } from "./emit_classify"
+import { RList, repNodeAt, repNodeOfTy, rvMayView } from "./emit_rep"
+import { rlRowsMinted } from "./emit_state"
+import { nodeTyAt } from "./emit_capture_frames"
 
 // Why the IR does not lower list read `idxIx`, or "" when it does: legacy's own arm decision
-// (`idxArmOf`) took the scalar list, collected and not a view.
+// (`idxArmOf`) took a scalar list, collected and not a view, or a ref list of scalar lists whose
+// read keeps no nullable niche, reads no view and needs no element tail.
 export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const nd = nodeAt(idxIx)
   if !(nd is Index) { return "index node" }
   if idxCellReadIsNull(idxIx, fnIx) { return "index cell null" }
   const arm = idxArmOf(nd, fnIx)
+  if arm == "ref" { return refReadWhy(nd, idxIx, fnIx) }
   if arm != "scalar" { return "index " + arm }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null || !scalarListUsed(ek) { return "index uncollected list" }
@@ -33,19 +45,64 @@ export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   return ""
 }
 
-// `RListGet`: legacy's scalar read arm, its receiver and index the read's operands. A receiver a
-// live loop hoist holds is consumed without being written.
+function refReadWhy(nd: Index, idxIx: i32, fnIx: i32): string {
+  if !irScalarListRep(repNodeOfTy(nodeTyAt(idxIx, fnIx))) { return "index ref" }
+  if !rlRowsMinted() || exprNullableRefArray(nd.idxArr, fnIx) {
+    return "index ref receiver"
+  }
+  if listElemStaysNullable(nd.idxArr, fnIx) {
+    return "index ref nullable element"
+  }
+  const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
+  if rslot < 0 || rvMayView(rslot) { return "index ref view" }
+  return ""
+}
+
+// Whether rep `r` is a list of unpacked primitives.
+export function irScalarListRep(r: i32): boolean {
+  const n = repNodeAt(r)
+  if n is RList {
+    const e = repPrim(n.rlsElem)
+    return e == "i32" || e == "i64" || e == "f64" || e == "f32" || e == "bool"
+  }
+  return false
+}
+
+// `RListGet`: legacy's read arm, scalar or ref, its receiver and index the read's operands. A
+// receiver a live loop hoist holds is consumed without being written.
 function lowerList(r: Rhs): i32 {
-  if !(r is RListGet) { return irLMiss("list length") }
+  if r is RListLen { return lowerLen(r) }
+  if !(r is RListGet) { return irLMiss("list rhs") }
   const nd = nodeAt(r.lgAt)
   if !(nd is Index) { return irLMiss("list read node") }
   const fnIx = irLFn().irAt
+  if idxArmOf(nd, fnIx) == "ref" {
+    const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
+    const rz = refListHoistOf(nd, rslot)
+    if rz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
+    irLOpnd(r.lgIx)
+    return refListGetTail(nd, r.lgAt, fnIx, rslot, rz)
+  }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null { return irLMiss("list read element") }
   const hz = scalarListHoistOf(nd, ek, fnIx)
   if hz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
   irLOpnd(r.lgIx)
   return scalarListGetTail(nd, ek, fnIx, hz)
+}
+
+// `RListLen`: legacy's `.length` arm, its receiver the operand; a live loop hoist's cached `len`
+// answers it without the receiver.
+function lowerLen(r: RListLen): i32 {
+  const m = nodeAt(r.llAt)
+  if !(m is Member) { return irLMiss("list length node") }
+  const hz = arrLenHoistOf(m, irLFn().irAt)
+  if hz >= 0 {
+    irLSkip(r.llV)
+    return emitArrLenHeld(hz)
+  }
+  irLOpnd(r.llV)
+  return arrLenTail(m, irLFn().irAt)
 }
 
 // The list-header hoists of the loop statement at `at`, opened as legacy's loop opens them.

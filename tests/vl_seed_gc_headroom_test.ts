@@ -10,7 +10,7 @@
 // The workload is `vl check compiler/emit_collect.vl` at the default first heap (128 MiB a
 // semispace), whose live set crosses the 96 MiB the policy grows at: 9 collections, and 46 to
 // 48 with the policy off on two seeds on 2026-11-16. `emit_mono.vl` was the workload until its
-// policy-off count fell from 52 to 28 against its 11 (D16774's call-search change); `emit_elab.vl`,
+// policy-off count fell from 52 to 28–30 against its 11; `emit_elab.vl`,
 // `wasmEmit.vl`, `typecheck.vl`, `check_relate_core.vl` and `emit_base.vl` before it fell the
 // same way. A target whose live
 // set sits just under a semispace is a cliff, so each one is graded across seeds and sources,
@@ -43,7 +43,7 @@ const TARGET = "compiler/emit_collect.vl";
 
 // 9 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 46–48 / 9 at the time of writing, on a master seed and on D16774's.
+// 46–48 / 9 at the time of writing, on two seeds.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {

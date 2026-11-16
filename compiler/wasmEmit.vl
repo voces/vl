@@ -8,7 +8,7 @@ import {
   sharedFieldArmNulSet,
   sharedFieldArmSetTexts,
 } from "./emit_obj_lit_fits"
-import { armFieldElemTyIx } from "./emit_state"
+import { armFieldElemTyIx, armFieldStoreTy, sFieldStoreTy } from "./emit_state"
 import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import {
@@ -1647,6 +1647,8 @@ import {
   boxAtomKindOfMemberTy,
   boxTagOfPrim,
   boxTagOfTy,
+  fieldElemTyIn,
+  fieldLitTyIn,
   mapShapeKeyInt,
   mapShapeKeyKind,
   msHasPlainValKind,
@@ -11033,7 +11035,7 @@ function emitStructUnionEq(
 
 // The element type of field row `ufi` (`sFieldElemTyIx`), or -1 out of range.
 function sFieldElemTyIxOfRow(ufi: i32): i32 {
-  return if ufi >= 0 && ufi < sFieldElemTyIx.length { sFieldElemTyIx[ufi] } else { -1 }
+  return if ufi >= 0 && ufi < sFieldElemTyIx.length { fieldElemTyIn(sFieldElemTyIx, sFieldStoreTy, ufi, "wasmEmit:11036") } else { -1 }
 }
 
 // The arm columns of a box `==` over union type `uty`, index-parallel to its member types `tys`: a struct arm
@@ -11495,7 +11497,9 @@ function variantFieldCodeComparable(vi: i32, ufi: i32, c: VKind): boolean {
 function variantRefListFieldSlot(ufi: i32): i32 {
   if fieldRowSlotTable(ufi) != "reflist" { return 0 - 1 }
   if ufi >= sFieldElemTyIx.length { return 0 - 1 }
-  return rlSlotOfTyOrTwin(sFieldElemTyIx[ufi])
+  return rlSlotOfTyOrTwin(
+    fieldElemTyIn(sFieldElemTyIx, sFieldStoreTy, ufi, "wasmEmit:11498"),
+  )
 }
 
 // D1061 — the box tag of one arm of a mixed struct/scalar union, from whichever of the two
@@ -12254,10 +12258,9 @@ function sharedFieldPlanDispatchable(
 function armFieldsBoxAlike(a: i32, b: i32): boolean {
   const tys = armFieldElemTyIx()
   if a < 0 || b < 0 || a >= tys.length || b >= tys.length { return false }
-  return tys[a] >= 0
-    && tys[b] >= 0
-    && valueBoxOfTy(tys[a])
-    && valueBoxOfTy(tys[b])
+  const ta = fieldElemTyIn(tys, armFieldStoreTy(), a, "boxAlike")
+  const tb = fieldElemTyIn(tys, armFieldStoreTy(), b, "boxAlike")
+  return ta >= 0 && tb >= 0 && valueBoxOfTy(ta) && valueBoxOfTy(tb)
 }
 
 // Whether the plan `code` boxes member `vi0`'s field rather than reading it as stored: the
@@ -12692,7 +12695,10 @@ function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
       return false
     }
     if at0 < 0 || at0 >= sFieldNames.length { return false }
-    if !variantRowFieldTysSame(at, at0) || sFieldLitTyIx[at] >= 0 {
+    if (
+      !variantRowFieldTysSame(at, at0)
+      || fieldLitTyIn(sFieldLitTyIx, sFieldStoreTy, at, "wasmEmit:12695") >= 0
+    ) {
       return false
     }
     if variantFieldIsLitUnion(vis[i], fis[i]) { return false }
@@ -16302,6 +16308,8 @@ function emitMapSetV(
       }
     }
   }
+  // A Set's store leaves its never-read `vals` alone, on helper rows of its own.
+  const mset = mapShapeIsSet(mapShapeOfExpr(recvIx, fnIx))
   // Receiver + key onto the operand stack; `cmSlot` pinned to the shape.
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   const mslot = cmSlot
@@ -16317,8 +16325,8 @@ function emitMapSetV(
   cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
   // A set whose value the assignment yields keeps it in the value stash.
   const park = asgParkWanted && !valConst1 && !msHelp
-  // [mapRef, key, value] are the shape's store helper's params, in order.
-  const setFn = mapSetFnOf(mslot)
+  // [mapRef, key, value] are the shape's store helper's params, in order; a Set has its own.
+  const setFn = mapSetFnOf(if mset { mapShapeOfSet(mslot) } else { mslot })
   if setFn >= 0 {
     if park { fbLocalTee(mapSetValStashLocal(mslot)) }
     fbCall(setFn)
@@ -16328,7 +16336,7 @@ function emitMapSetV(
   if setMapSetValStash(mslot) < 0 { return -1 }
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef()              // mapRef
-  const stRc = emitMapSetStore(mslot)
+  const stRc = emitMapSetStore(mslot, mset)
   if park { mapSetParked(mslot) }
   return stRc
 }
@@ -16366,20 +16374,37 @@ function mapSetFnOf(sh: i32) {
 }
 
 // The row of map shape `sh` in the per-shape helper tables: 0 the string-keyed mono map, 1 the
-// i32-keyed one, `2 + s` mv slot `s`, the last the i64-keyed one; a Set rows as its key's map.
+// i32-keyed one, `2 + s` mv slot `s`, then the i64-keyed one, then the string-, i32- and
+// i64-keyed Set, whose helpers leave its `vals` alone.
 function mapShapeRow(sh: i32) {
-  if sh == -1 || sh == -2 { return 0 }
-  if sh == -4 || sh == -5 { return 1 }
-  if sh == -6 || sh == -7 { return mvMapTypeIdx.length + 2 }
+  if sh == -1 { return 0 }
+  if sh == -4 { return 1 }
+  if sh == -6 { return mvMapTypeIdx.length + 2 }
+  if sh == -2 { return mvMapTypeIdx.length + 3 }
+  if sh == -5 { return mvMapTypeIdx.length + 4 }
+  if sh == -7 { return mvMapTypeIdx.length + 5 }
   if sh < 0 { return -1 }
   return sh + 2
+}
+
+// Whether map shape `sh` is a Set's, string-, i32- or i64-keyed.
+function mapShapeIsSet(sh: i32): boolean {
+  return sh == -2 || sh == -5 || sh == -7
+}
+
+// The Set shape over the same key as mono map shape `sh`; `sh` itself for any other shape.
+function mapShapeOfSet(sh: i32) {
+  if sh == -1 { return -2 }
+  if sh == -4 { return -5 }
+  if sh == -6 { return -7 }
+  return sh
 }
 
 // `__map_set_<row>__(m, k, v)`'s functype for map shape `sh`: the map, its key rep and the value
 // in the type a set site's value expression leaves.
 export function mapSetFuncType(sh: i32) {
   const saved = cmSlot
-  cmSlot = sh
+  cmSlot = mapShapeFoldSet(sh)
   fbFuncTypeHead(3)
   fbRefValtype(cmMapTy())
   const k = cmKeyKind()
@@ -16409,7 +16434,7 @@ export function mapSetFnBody(sh: i32): u8[] {
   const prev = wTarget(body)
   const savedSlot = cmSlot
   const savedBase = mapScratchBase
-  cmSlot = sh
+  cmSlot = mapShapeFoldSet(sh)
   wULEB(6)
   wULEB(3)
   fbValtype("i32", -1) // 3 slot, 4 cap, 5 entry
@@ -16429,7 +16454,7 @@ export function mapSetFnBody(sh: i32): u8[] {
   fbRefValtype(aTy()) // 12 liveBk, 13 hashBk
   mapScratchBase = 0
   msHelp = true
-  emitMapSetStore(sh)
+  emitMapSetStore(cmSlot, mapShapeIsSet(sh))
   msHelp = false
   mapScratchBase = savedBase
   cmSlot = savedSlot
@@ -16439,23 +16464,30 @@ export function mapSetFnBody(sh: i32): u8[] {
 }
 
 // A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
-// appends, compacting first when the dead entries call for it, and maybe resizes.
-function emitMapSetStore(mslot: i32) {
+// appends, compacting first when the dead entries call for it, and maybe resizes. A Set's
+// (`isSet`) leaves its `vals` alone: a hit does nothing and a miss pushes only the key.
+function emitMapSetStore(mslot: i32, isSet: boolean) {
   emitMapProbe(true, true)
   pushMapScr(5) // entry
-  fbIf(64)      // if (entry != 0 → overwrite), void
-  // OVERWRITE: vals.backing[entry-1] = stash
-  pushMapVals()
-  fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
-  pushMapScr(5)                // entry
-  fbI32Const(1)
-  fbI32Bin(107)                // i32.sub (entry - 1)
-  pushMapSetValStash(mslot)
-  fbArraySet(cmValsBack())     // array.set
-  fbElse()                     // else
+  if isSet {
+    // A Set's present key has nothing to overwrite: only a miss appends.
+    fbI32Eqz()
+    fbIf(64) // if (entry == 0 → append), void
+  } else {
+    fbIf(64) // if (entry != 0 → overwrite), void
+    // OVERWRITE: vals.backing[entry-1] = stash
+    pushMapVals()
+    fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
+    pushMapScr(5)                // entry
+    fbI32Const(1)
+    fbI32Bin(107)                // i32.sub (entry - 1)
+    pushMapSetValStash(mslot)
+    fbArraySet(cmValsBack())     // array.set
+    fbElse()                     // else
+  }
   // APPEND. Reclaim the dead entries first once they outnumber the live ones by
   // `INITIAL_CAP`: compaction rebuilds the index, so the free slot is probed again (D2315).
-  const cmpFn = mapCompactFnOf(mslot)
+  const cmpFn = mapCompactFnOf(if isSet { mapShapeOfSet(mslot) } else { mslot })
   if cmpFn >= 0 {
     pushMapCount()
     pushMapSize()
@@ -16490,7 +16522,7 @@ function emitMapSetStore(mslot: i32) {
   fbArraySet(aTy()) // array.set
   // keys.push(keyRef) ; vals.push(stash)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey() < 0 { return -1 }
-  if emitMapPushVal() < 0 { return -1 }
+  if !isSet && emitMapPushVal() < 0 { return -1 }
   // count = count + 1
   pushMapRef()              // mapRef (struct.set receiver)
   pushMapCount()
@@ -18393,10 +18425,7 @@ function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
   }
   const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
   if rslot < 0 { return refListRowRefused(nd.idxArr) }
-  // A live hoist row serves this access's header from locals, so the
-  // RECEIVER is not emitted at all — the prologue before the loop read it
-  // once. Only the index goes on the stack.
-  const rlHz = liveHoistRow(nd.idxArr, "reflist", rslot)
+  const rlHz = refListHoistOf(nd, rslot)
   if rlHz < 0 {
     if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
     // A NULLABLE ref-array receiver (`t: i32[][] | null`, kind 18, narrowed) reads `(ref null …)` —
@@ -18404,8 +18433,26 @@ function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
     if exprNullableRefArray(nd.idxArr, fnIx) { fbRefAsNonNull() }
   }
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
-  // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read. A list that may be
-  // a view reads its element through the view's source (D3041).
+  return refListGetTail(nd, idxIx, fnIx, rslot, rlHz)
+}
+
+// The ref list read both emitters write, in two halves around its operands, as the scalar
+// read's are. This half: the live loop hoist holding receiver `nd` of ref-list row `rslot`, or
+// -1; under one the receiver is not written.
+export function refListHoistOf(nd: Index, rslot: i32): i32 {
+  return liveHoistRow(nd.idxArr, "reflist", rslot)
+}
+
+// The half after the receiver and index: the guard and the backing's `array.get` (or a view's
+// read through its source, D3041), then the element: kept nullable for a nullable niche, else
+// recovered non-null, retagged and unboxed where its place narrows.
+export function refListGetTail(
+  nd: Index,
+  idxIx: i32,
+  fnIx: i32,
+  rslot: i32,
+  rlHz: i32,
+): i32 {
   if rlHz >= 0 {
     emitListIdxGuardHoisted(rlHz, nd.idxIndex)
     fbArrayGet(rlBackIdx[rslot]) // 0xfb 0x0b <this slot's ref backing array>
@@ -18420,10 +18467,8 @@ function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
   // `listElemStaysNullable` is the shared answer — `.map`/`.filter`'s element step asks
   // it too, and answering it differently in the two places is a recover that traps in one.
   if listElemStaysNullable(nd.idxArr, fnIx) {
-    // …UNLESS the index PLACE itself is narrowed non-null (D451). The niche half of the
-    // channel: nothing to unbox, but the value must stop being `(ref null …)` or it
-    // reaches a `(ref …)` consumer as one. The guard is what makes the recovery safe,
-    // exactly as the kind-18 receiver recovery above is.
+    // …UNLESS the index PLACE itself is narrowed non-null (D451). The guard is what makes the
+    // recovery safe, exactly as the kind-18 receiver recovery above is.
     if nodeTyProvesNonNull(idxIx) { fbRefAsNonNull() }
     return 0
   }
@@ -18513,112 +18558,127 @@ export function scalarListGetTail(
 // Lower a `.length` onto `body`: a list's length is its wrapper's `len` field (not the
 // backing's physical length, which is `cap`) via `struct.get <wrap> 1`; a raw string's
 // `.length` is its header's `len` field (`fbStrLen()`), not `array.len` — which would
-// report the parent's length for a view. Each element kind is resolved below in its own arm.
+// report the parent's length for a view. Each element kind is resolved in its own arm.
 function emitArrLen(memIx: i32, fnIx: i32) {
   const m = nodeAt(memIx)
   if m is Member {
-    // A REF list's `.length` is its wrapper's `len` field (`struct.get $wrap 1`).
-    if exprRefArray(m.memObj, fnIx) {
-      const rslot = refListSlotOfExpr(m.memObj, fnIx)
-      if rslot < 0 || rslot >= rlWrapIdx.length {
-        return emitFailAt(
-          "emitProgram: `.length` receiver's ref-list element does not resolve",
-          m.memObj,
-        )
-      }
-      if rvMayView(rslot) {
-        // A loop's cached header is refreshed at its entry and holds for its body.
-        const rlenHz = liveHoistRow(m.memObj, "reflist", rslot)
-        if rlenHz >= 0 {
-          fbLocalGet(lhLen[rlenHz])
-          return 0
-        }
-      }
-      if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-      if rvMayView(rslot) {
-        const rwL = listIdxWrapSlot("reflist", rslot)
-        fbLocalSet(rwL)
-        rvTestView(rwL)
-        fbIf(127) // i32
-        fbLocalGet(rwL)
-        fbCall(gHelpRvLen)
-        fbElse()
-        fbLocalGet(rwL)
-        fbStructGet(rlWrapIdx[rslot], 1)
-        fbEnd()
-        return 0
-      }
-      fbStructGet(rlWrapIdx[rslot], 1) // 0xfb 0x02 <ref-list wrapper> field 1: len
-      return 0
-    }
-    // A STRING list's `.length` is its wrapper's `len` field (`struct.get $mkListIdx 1`).
-    if exprStringArray(m.memObj, fnIx) {
-      if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(mkListTy(), 1) // 0xfb 0x02 <string-list wrapper> field 1: len
-      return 0
-    }
-    // A SCALAR list's `.length` is its wrapper's `len` field (`struct.get <wrap> 1`) — an
-    // i32, the same shape for every element kind over that kind's wrapper. (f64/i64 before
-    // i32 since their elements are not i32.)
-    const lek = scalarListElemKind(m.memObj, fnIx)
-    if (
-      lek != null
-      && (lek == "f64"
-        || lek == "i64"
-        || lek == "f32"
-        || lek == "v128"
-        || lek == "u8list")
-    ) {
-      const lenSv = svDstOfKind(lek)
-      if lenSv >= 0 && lek != null {
-        // A loop's cached header is refreshed at its entry and holds for its body.
-        const lenHz = liveHoistRow(
-          m.memObj,
-          listIdxKindOf(lek),
-          exprPackedRow(m.memObj, fnIx),
-        )
-        if lenHz >= 0 {
-          fbLocalGet(lhLen[lenHz])
-          return 0
-        }
-      }
-      if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-      if lenSv >= 0 && lek != null {
-        const lwL = listIdxWrapSlot(
-          listIdxKindOf(lek),
-          exprPackedRow(m.memObj, fnIx),
-        )
-        fbLocalSet(lwL)
-        svTestView(lwL, lenSv)
-        fbIf(127) // i32
-        fbLocalGet(lwL)
-        fbCall(gHelpSvLen[lenSv])
-        fbElse()
-        fbLocalGet(lwL)
-        fbStructGet(scalarListWrap(lek, exprPackedRow(m.memObj, fnIx)), 1)
-        fbEnd()
-        return 0
-      }
-      fbStructGet(scalarListWrap(lek, exprPackedRow(m.memObj, fnIx)), 1) // field 1: len
-      return 0
-    }
-    if exprArray(m.memObj, fnIx) {
-      if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(lTy(), 1) // 0xfb 0x02 <list wrapper struct type index> field 1: len
-      return 0
-    }
-    // A raw string's `.length` is the header's `len` field (`fbStrLen()`), not `array.len`
-    // (the backing's physical length, which would report a parent string's length for a
-    // view of it). The arm is spelled out and the fallthrough fails loudly instead of
-    // defaulting, since a wrong fallthrough would be invalid wasm or a wrong integer.
-    if !exprString(m.memObj, fnIx) {
-      return emitFail("emitProgram: .length receiver is not an array or string")
-    }
+    const hz = arrLenHoistOf(m, fnIx)
+    if hz >= 0 { return emitArrLenHeld(hz) }
     if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-    fbStrLen() // 0xfb 0x02 <string header> field 2: len
-    return 0
+    return arrLenTail(m, fnIx)
   }
   return emitFail("emitProgram: expected a length access")
+}
+
+// The `.length` both emitters write, in two halves around its receiver. This half: the live
+// loop hoist whose cached `len` answers it, or -1. Only a list that may be a view keeps reading
+// its header here, since a view's `len` is not its wrapper's.
+export function arrLenHoistOf(m: Member, fnIx: i32): i32 {
+  // Outside a hoisting loop no row is live, which most `.length`s are.
+  if lhOpen.length == 0 { return -1 }
+  if exprRefArray(m.memObj, fnIx) {
+    const rslot = refListSlotOfExpr(m.memObj, fnIx)
+    if rslot < 0 || rslot >= rlWrapIdx.length || !rvMayView(rslot) { return -1 }
+    return liveHoistRow(m.memObj, "reflist", rslot)
+  }
+  if exprStringArray(m.memObj, fnIx) { return -1 }
+  const lek = arrLenWideKind(m, fnIx)
+  if lek == null || svDstOfKind(lek) < 0 { return -1 }
+  return liveHoistRow(
+    m.memObj,
+    listIdxKindOf(lek),
+    exprPackedRow(m.memObj, fnIx),
+  )
+}
+
+// A held `.length`: the hoist row's cached `len`.
+export function emitArrLenHeld(hz: i32) {
+  fbLocalGet(lhLen[hz])
+  return 0
+}
+
+// The element kind of a scalar list whose wrapper is not the i32 list's, or null.
+function arrLenWideKind(m: Member, fnIx: i32): VKind | null {
+  const lek = scalarListElemKind(m.memObj, fnIx)
+  if (
+    lek == "f64"
+    || lek == "i64"
+    || lek == "f32"
+    || lek == "v128"
+    || lek == "u8list"
+  ) {
+    return lek
+  }
+  return null
+}
+
+// The half after the receiver: its `len` field, through the view helper where it may be a view.
+export function arrLenTail(m: Member, fnIx: i32): i32 {
+  // A REF list's `.length` is its wrapper's `len` field (`struct.get $wrap 1`).
+  if exprRefArray(m.memObj, fnIx) {
+    const rslot = refListSlotOfExpr(m.memObj, fnIx)
+    if rslot < 0 || rslot >= rlWrapIdx.length {
+      return emitFailAt(
+        "emitProgram: `.length` receiver's ref-list element does not resolve",
+        m.memObj,
+      )
+    }
+    if rvMayView(rslot) {
+      const rwL = listIdxWrapSlot("reflist", rslot)
+      fbLocalSet(rwL)
+      rvTestView(rwL)
+      fbIf(127) // i32
+      fbLocalGet(rwL)
+      fbCall(gHelpRvLen)
+      fbElse()
+      fbLocalGet(rwL)
+      fbStructGet(rlWrapIdx[rslot], 1)
+      fbEnd()
+      return 0
+    }
+    fbStructGet(rlWrapIdx[rslot], 1) // 0xfb 0x02 <ref-list wrapper> field 1: len
+    return 0
+  }
+  // A STRING list's `.length` is its wrapper's `len` field (`struct.get $mkListIdx 1`).
+  if exprStringArray(m.memObj, fnIx) {
+    fbStructGet(mkListTy(), 1) // 0xfb 0x02 <string-list wrapper> field 1: len
+    return 0
+  }
+  // A SCALAR list's `.length` is its wrapper's `len` field — an i32, the same shape for every
+  // element kind over that kind's wrapper.
+  const lek = arrLenWideKind(m, fnIx)
+  if lek != null {
+    const lenSv = svDstOfKind(lek)
+    if lenSv >= 0 {
+      const lwL = listIdxWrapSlot(
+        listIdxKindOf(lek),
+        exprPackedRow(m.memObj, fnIx),
+      )
+      fbLocalSet(lwL)
+      svTestView(lwL, lenSv)
+      fbIf(127) // i32
+      fbLocalGet(lwL)
+      fbCall(gHelpSvLen[lenSv])
+      fbElse()
+      fbLocalGet(lwL)
+      fbStructGet(scalarListWrap(lek, exprPackedRow(m.memObj, fnIx)), 1)
+      fbEnd()
+      return 0
+    }
+    fbStructGet(scalarListWrap(lek, exprPackedRow(m.memObj, fnIx)), 1) // field 1: len
+    return 0
+  }
+  if exprArray(m.memObj, fnIx) {
+    fbStructGet(lTy(), 1) // 0xfb 0x02 <list wrapper struct type index> field 1: len
+    return 0
+  }
+  // A raw string's `.length` is the header's `len` field (`fbStrLen()`), not `array.len`. The
+  // fallthrough fails loudly instead of defaulting, since a wrong one would be invalid wasm.
+  if !exprString(m.memObj, fnIx) {
+    return emitFail("emitProgram: .length receiver is not an array or string")
+  }
+  fbStrLen() // 0xfb 0x02 <string header> field 2: len
+  return 0
 }
 
 // ── G6: string concatenation / value-equality / slice ────────────────────────
@@ -31276,7 +31336,7 @@ function nulRecvNeedsRecover(exprIx: i32, fnIx: i32) {
 // null, so the read must stay `(ref null $elem)` rather than take a trapping
 // `ref.as_non_null`. Asked by the indexed read and the `.map`/`.filter` element step, so a
 // callback's declared param valtype and the value handed to it agree.
-function listElemStaysNullable(exprIx: i32, fnIx: i32) {
+export function listElemStaysNullable(exprIx: i32, fnIx: i32) {
   if exprNulStrArray(exprIx, fnIx) { return true }
   if exprRefArray(exprIx, fnIx) {
     const s = refListSlotOfExpr(exprIx, fnIx)

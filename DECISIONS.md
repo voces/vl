@@ -12364,3 +12364,20 @@ function's other exported facts and is frozen with them at the module boundary. 
 fact about one call: putting it in the callee's `Iface` would make the interface depend on its
 callers, which the export freeze forbids. Design doc §4.3 records the table's shape.
 
+## An explicit type argument fixes an empty list literal's element, as an annotation does (2026-11-16, chosen under the owner's delegation) — D16689, follows D16342
+
+**The rule.** A call's explicit type argument fixes the element of an empty list literal handed at a
+parameter that spells it: `g<i32>([])` hands an `i32[]` whose element is fixed, so `is f64[]` there
+is false, as it is for `const e: i32[] = []`. A literal whose element only another argument's binding
+settles (`pair([], 1)` over `pair<V>(a: V[], b: V)`) is not fixed by this rule and still fits every
+`is T[]`.
+
+```vl
+function g<V>(v: V[]) { return v is f64[] }
+print(g<i32>([]))   // false: the type argument fixes the element at i32
+print(g<f64>([]))   // true
+```
+
+**Why.** A type argument is an annotation of `V`; the parameter's type at the call is then `i32[]`,
+and answering by emptiness after the author wrote the type would surprise a human or an LLM reading
+the call. It follows "An annotation fixes an empty list's element type wherever the value goes".
