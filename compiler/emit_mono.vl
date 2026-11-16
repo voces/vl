@@ -18571,6 +18571,47 @@ function monoGenArgAtOpenParam(n: Call, ctx: i32): boolean {
   return false
 }
 
+// Instances each declared generic call `n` hands a parameter its recorded type leaves open at
+// that parameter's type in the instance being walked (`ctx`): 1 when every such parameter closes
+// there, 0 when one does not, -1 on failure.
+function monoGenArgsAtInstanceParams(n: Call, ctx: i32): i32 {
+  const ct = nodeTyIxOf(n.callFn)
+  const it = elabNodeTyAt(unwrapParen(n.callFn), ctx)
+  if ct < 0 || ct >= T.tys.length || it < 0 || it >= T.tys.length { return 0 }
+  const f = tyAt(ct)
+  const g = tyAt(it)
+  if (
+    !(f is TyFunc)
+    || !(g is TyFunc)
+    || g.fnParamTypes.length != f.fnParamTypes.length
+  ) {
+    return 0
+  }
+  let i = 0
+  while i < n.callArgs.length && i < f.fnParamTypes.length {
+    const pt = f.fnParamTypes[i]
+    if (
+      pt >= 0
+      && pt < T.tys.length
+      && tyHasTyVar(pt)
+      && monoNamesDeclaredGeneric(n.callArgs[i], ctx)
+    ) {
+      const ip = g.fnParamTypes[i]
+      if (
+        ip < 0
+        || ip >= T.tys.length
+        || tyHasTyVar(ip)
+        || !(tyAt(ip) is TyFunc)
+      ) {
+        return 0
+      }
+      if monoCoerceFnValue(n.callArgs[i], ip, ctx) < 0 { return -1 }
+    }
+    i = i + 1
+  }
+  return 1
+}
+
 // Whether annotation node `annIx` is typed as a function or a nullable function: a slot a
 // function value is delivered to.
 function monoAnnIsFnSlot(annIx: i32): boolean {
@@ -22990,7 +23031,9 @@ function monoWalk(ix: i32, ctx: i32) {
         && (callee is Index || calleeIf)
         && monoGenArgAtOpenParam(n, ctx)
       ) {
-        return monoGenArgOpenFail(ix)
+        const atInst = monoGenArgsAtInstanceParams(n, ctx)
+        if atInst < 0 { return -1 }
+        if atInst == 0 { return monoGenArgOpenFail(ix) }
       }
       if callee is Ident {
         return monoWalkIdentCall(n, callee, ix, ctx, elemsTyped)
@@ -23401,7 +23444,11 @@ function monoWalkIdentCall(
     && monoAliasLetLamFe(ix, ctx) < 0
     && monoArmLamFe(n.callFn, callee) < 0
   ) {
-    return monoGenArgOpenFail(ix)
+    // The instance being walked may close the parameter type the template leaves open: the
+    // generic is instanced at that (D3956).
+    const atInst = monoGenArgsAtInstanceParams(n, ctx)
+    if atInst < 0 { return -1 }
+    if atInst == 0 { return monoGenArgOpenFail(ix) }
   }
   // A call through a written, un-annotated `let` holding generic functions instances each one
   // written at the call's type, which one binding holds one of (D3979).
