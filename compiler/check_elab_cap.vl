@@ -80,6 +80,8 @@ import {
   tyHasHole,
   tyKeyOf,
   tyMutEpoch,
+  tyPathCycles,
+  tyPathWith,
   tySame,
   tyValOf,
   tyValOpen,
@@ -1294,8 +1296,9 @@ export function elabFnJoinMapTy(j: i32, a: i32, b: i32): i32 {
 // `elabFnJoinTy` through lists and records, for a function's returned values: join `j` of `a`
 // and `b` takes the union of the function sets at every leaf the three share, `j` when none
 // widens (D15209). A list under a record under a list is not joined: no row is built for it.
-export function elabFnJoinDeepTy(j: i32, a: i32, b: i32, rowDepth: i32): i32 {
-  return elabFnJoinDeepAt(j, a, b, rowDepth, 0)
+export function elabFnJoinDeepTy(j: i32, a: i32, b: i32): i32 {
+  const path: i32[] = []
+  return elabFnJoinDeepAt(j, a, b, path, 0)
 }
 
 // `elabFnJoinDeepTy` for two record elements of one list literal: each field joins its sets, as
@@ -1303,14 +1306,18 @@ export function elabFnJoinDeepTy(j: i32, a: i32, b: i32, rowDepth: i32): i32 {
 // since a lambda beside a generic member would need that member's closure. A list under such a
 // record is not joined (no row is built for it).
 export function elabFnJoinElemTy(j: i32, a: i32, b: i32): i32 {
-  if !elabFnLeavesNamed(a, 0) || !elabFnLeavesNamed(b, 0) { return j }
-  return elabFnJoinDeepAt(j, a, b, 0, 1)
+  const sa: i32[] = []
+  const sb: i32[] = []
+  if !elabFnLeavesNamed(a, sa) || !elabFnLeavesNamed(b, sb) { return j }
+  const path: i32[] = []
+  return elabFnJoinDeepAt(j, a, b, path, 1)
 }
 
 // Whether every function leaf of type `t` (through records and lists) carries a set, and each set
-// holds only named functions.
-function elabFnLeavesNamed(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth > 6 { return true }
+// holds only named functions; a type in `seen` is taken as already found to.
+function elabFnLeavesNamed(t: i32, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return true }
+  seen.push(t)
   const tt = tyAt(t)
   match tt {
     TyFunc => {
@@ -1323,11 +1330,11 @@ function elabFnLeavesNamed(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return elabFnLeavesNamed(tyElemOf(tt), depth + 1)
+      return elabFnLeavesNamed(tyElemOf(tt), seen)
     }
     TyObj => {
       for f in tt.objFieldTypes {
-        if !elabFnLeavesNamed(f, depth + 1) { return false }
+        if !elabFnLeavesNamed(f, seen) { return false }
       }
       return true
     }
@@ -1342,7 +1349,8 @@ function elabFnLeavesNamed(t: i32, depth: i32): boolean {
 // set in a record field of `j` (not in a list) beside the arm's own set there: the choice holds each arm's
 // ids, so each arm's set is decided with the join's (D15290).
 export function elabFnArmJoinNote(j: i32, a: i32, b: i32) {
-  return elabFnArmJoinAt(j, a, b, 0, false)
+  const path: i32[] = []
+  return elabFnArmJoinAt(j, a, b, path, false)
 }
 
 // `elabFnArmJoinNote` for a function's returned values, `a` and `b` joined to `j`. Each returned
@@ -1350,7 +1358,8 @@ export function elabFnArmJoinNote(j: i32, a: i32, b: i32) {
 // too (D15366).
 export function elabFnRetJoinNote(j: i32, a: i32, b: i32) {
   elabFnJoinRecLists = true
-  elabFnArmJoinAt(j, a, b, 0, false)
+  const path: i32[] = []
+  elabFnArmJoinAt(j, a, b, path, false)
   return elabFnJoinRecLists = false
 }
 
@@ -1371,9 +1380,11 @@ let elabFnJoinUnderListRec = false
 // Whether the join note is a returned list's record's function field of different results.
 let elabFnJoinApart = false
 
-function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
+// The walk of `elabFnArmJoinNote`; `path` holds the join types it is inside, so a recursive
+// type is not entered twice.
+function elabFnArmJoinAt(j: i32, a: i32, b: i32, path: i32[], inRec: boolean) {
   if (
-    depth > 6
+    tyPathCycles(j, path)
     || j < 0
     || j >= T.tys.length
     || a < 0
@@ -1445,7 +1456,7 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
             jt.objFieldTypes[i],
             at.objFieldTypes[ia],
             bt.objFieldTypes[ib],
-            depth + 1,
+            tyPathWith(j, path),
             true,
           )
           elabFnJoinApart = was
@@ -1479,7 +1490,7 @@ function elabFnArmJoinAt(j: i32, a: i32, b: i32, depth: i32, inRec: boolean) {
         tyElemOf(jt),
         tyElemOf(at),
         tyElemOf(bt),
-        depth + 1,
+        tyPathWith(j, path),
         inner,
       )
       elabFnJoinListRec = false
@@ -1519,10 +1530,16 @@ function elabListLeafIsFn(t: i32): boolean {
 }
 
 // `elabFnJoinDeepTy` at `j`, `shape` saying what holds it: 0 nothing, 1 a list, 2 a record in
-// a list, 3 a list in a record in a list.
-function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
+// a list, 3 a list in a record in a list. `path` holds the join types it is inside.
+function elabFnJoinDeepAt(
+  j: i32,
+  a: i32,
+  b: i32,
+  path: i32[],
+  shape: i32,
+): i32 {
   if (
-    depth > 6
+    tyPathCycles(j, path)
     || j < 0
     || j >= T.tys.length
     || a < 0
@@ -1545,7 +1562,7 @@ function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
         tyElemOf(jt),
         tyElemOf(at),
         tyElemOf(bt),
-        depth + 1,
+        tyPathWith(j, path),
         if shape == 2 { 3 } else { 1 },
       )
       return if ne == tyElemOf(jt) { j } else { mkArrayTy(ne) }
@@ -1568,7 +1585,7 @@ function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
           f,
           at.objFieldTypes[i],
           bt.objFieldTypes[i],
-          depth + 1,
+          tyPathWith(j, path),
           fs,
         )
         if w != f { changed = true }
@@ -1589,14 +1606,20 @@ function elabFnJoinDeepAt(j: i32, a: i32, b: i32, depth: i32, shape: i32): i32 {
 
 // Whether `dst` holds, at some place `own` shares through lists and records, a function set
 // other than `own`'s there, so a value of `own` delivered to `dst` takes `dst`'s sets (D15209).
-export function elabFnSetsWiden(own: i32, dst: i32, depth: i32): boolean {
-  if (
-    depth > 6
-    || own < 0
-    || own >= T.tys.length
-    || dst < 0
-    || dst >= T.tys.length
-  ) {
+export function elabFnSetsWiden(own: i32, dst: i32): boolean {
+  const path: i32[] = []
+  return elabFnSetsWidenIn(own, dst, path)
+}
+
+// `elabFnSetsWiden` under the `dst` types on `path`; false where `dst` is one, on a cycle.
+function elabFnSetsWidenIn(own: i32, dst: i32, path: i32[]): boolean {
+  if tyPathCycles(dst, path) { return false }
+  return elabFnSetsWidenAt(own, dst, tyPathWith(dst, path))
+}
+
+// One step of `elabFnSetsWidenIn`.
+function elabFnSetsWidenAt(own: i32, dst: i32, path: i32[]): boolean {
+  if (own < 0 || own >= T.tys.length || dst < 0 || dst >= T.tys.length) {
     return false
   }
   const ot = tyAt(own)
@@ -1608,7 +1631,7 @@ export function elabFnSetsWiden(own: i32, dst: i32, depth: i32): boolean {
     }
     TyArray => {
       return ot is TyArray
-        && elabFnSetsWiden(tyElemOf(ot), tyElemOf(dt), depth + 1)
+        && elabFnSetsWidenIn(tyElemOf(ot), tyElemOf(dt), path)
     }
     TyObj => {
       if !(ot is TyObj) || ot.objFieldNames.length != dt.objFieldNames.length {
@@ -1618,7 +1641,7 @@ export function elabFnSetsWiden(own: i32, dst: i32, depth: i32): boolean {
       while i < dt.objFieldNames.length {
         if (
           ot.objFieldNames[i] == dt.objFieldNames[i]
-          && elabFnSetsWiden(ot.objFieldTypes[i], dt.objFieldTypes[i], depth + 1)
+          && elabFnSetsWidenIn(ot.objFieldTypes[i], dt.objFieldTypes[i], path)
         ) {
           return true
         }
@@ -3799,18 +3822,24 @@ export function fnTagListTy(t: i32): boolean {
 }
 
 // Whether type `t` holds a tagged set's ids: such a list or map, a list of such lists, or a record
-// with a field that is one or holds one, at most `depth` levels deep.
-export function fnTagHoldsTy(t: i32, depth: i32): boolean {
-  if depth <= 0 || t < 0 || t >= T.tys.length { return false }
+// with a field that is one or holds one, at any depth.
+export function fnTagHoldsTy(t: i32): boolean {
+  const seen: i32[] = []
+  return fnTagHoldsTyIn(t, seen)
+}
+
+// `fnTagHoldsTy`, false at a type in `seen`: walked already, or on a cycle.
+function fnTagHoldsTyIn(t: i32, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return false }
+  seen.push(t)
   const o = tyAt(t)
   match o {
     TyArray => {
-      return fnTagTyIsTagged(tyElemOf(o))
-        || fnTagHoldsTy(tyElemOf(o), depth - 1)
+      return fnTagTyIsTagged(tyElemOf(o)) || fnTagHoldsTyIn(tyElemOf(o), seen)
     }
     TyObj => {
       for f in o.objFieldTypes {
-        if fnTagTyIsTagged(f) || fnTagHoldsTy(f, depth - 1) { return true }
+        if fnTagTyIsTagged(f) || fnTagHoldsTyIn(f, seen) { return true }
       }
       return false
     }
@@ -3852,9 +3881,8 @@ export function fnTagHeldNote(x: i32) {
   // A list literal of record literals holding a tagged field mints their row as its element. A
   // bound one's nested record fields are searched too; a returned one is built at its function's
   // result, whose row holds them (D15805).
-  const recs = !deep
-    && fnTagRecLitsOnly(v0, t, if n is LetDecl { 8 } else { 1 })
-  const r = fnTagRepTyIn(t, 16, deep || recs)
+  const recs = !deep && fnTagRecLitsOnly(v0, t, n is LetDecl)
+  const r = fnTagRepTyOfIn(t, deep || recs)
   if r >= 0 && r != t { fnTagHeldRep[x] = r }
   // The inner literals of a list of lists are built at the same rep's elements (D15350).
   if deep { fnTagHeldInner(v0, r, 0) }
@@ -3868,17 +3896,17 @@ function fnTagHeldRecLits(v: i32, r: i32) {
   const vn = nodeAt(parenPeelIx(v))
   const ro = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
   if !(vn is ArrayLit) || !(ro is TyArray) { return 0 }
-  for el in vn.arrElems { fnTagHeldRecLit(parenPeelIx(el), tyElemOf(ro), 8) }
+  for el in vn.arrElems { fnTagHeldRecLit(parenPeelIx(el), tyElemOf(ro)) }
   return 0
 }
 
 // Queues record literal `x` to be built at record rep `r`, and the record literals its fields
-// hold at `r`'s fields, `depth` levels down.
-function fnTagHeldRecLit(x: i32, r: i32, depth: i32) {
+// hold at `r`'s fields, at any depth.
+function fnTagHeldRecLit(x: i32, r: i32) {
   fnTagHeldRecs.push(x)
   fnTagHeldRecs.push(r)
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
-  if depth <= 0 || !(xn is ObjLit) { return 0 }
+  if !(xn is ObjLit) { return 0 }
   for fx in xn.objFields {
     const f = nodeAt(fx)
     if f is FieldInit {
@@ -3891,7 +3919,7 @@ function fnTagHeldRecLit(x: i32, r: i32, depth: i32) {
         && nodeAt(vx) is ObjLit
         && rfo is TyObj
       ) {
-        fnTagHeldRecLit(vx, rf, depth - 1)
+        fnTagHeldRecLit(vx, rf)
       }
     }
   }
@@ -3899,27 +3927,29 @@ function fnTagHeldRecLit(x: i32, r: i32, depth: i32) {
 }
 
 // Whether record type `t` has a field of a tagged set a call through runs at differing results,
-// or, `depth` above 1, a record field that has one.
-function fnTagHasSplitFieldIn(t: i32, depth: i32): boolean {
+// or, `nested`, a record field at any depth that has one, skipping a type in `seen`.
+function fnTagHasSplitFieldIn(t: i32, nested: boolean, seen: i32[]): boolean {
   const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if depth <= 0 || !(o is TyObj) { return false }
+  if !(o is TyObj) || i32ListHas(seen, t) { return false }
+  seen.push(t)
   for f in o.objFieldTypes {
     if fnTagTyIsTagged(f) && fnTagSetSplits(fnTagSetOfTy(f)) { return true }
-    if fnTagHasSplitFieldIn(f, depth - 1) { return true }
+    if nested && fnTagHasSplitFieldIn(f, true, seen) { return true }
   }
   return false
 }
 
 // Whether `v`, of list type `t`, is a list literal of record literals only, whose record has a
-// field of a tagged set a call runs at differing results, in records `depth` levels deep.
-function fnTagRecLitsOnly(v: i32, t: i32, depth: i32): boolean {
+// field of a tagged set a call runs at differing results, or, `nested`, a record nested in it does.
+function fnTagRecLitsOnly(v: i32, t: i32, nested: boolean): boolean {
   const vx = if v >= 0 && v < P.nodes.length { parenPeelIx(v) } else { -1 }
   const vn = if vx >= 0 && vx < P.nodes.length { nodeAt(vx) } else { null }
   const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
   if !(vn is ArrayLit) || !(o is TyArray) || vn.arrElems.length == 0 {
     return false
   }
-  if !fnTagHasSplitFieldIn(tyElemOf(o), depth) { return false }
+  const seen: i32[] = []
+  if !fnTagHasSplitFieldIn(tyElemOf(o), nested, seen) { return false }
   for el in vn.arrElems {
     const ex = parenPeelIx(el)
     if ex < 0 || ex >= P.nodes.length || !(nodeAt(ex) is ObjLit) {
@@ -4045,8 +4075,8 @@ function fnTagLitRep(x: i32): i32 {
   const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   if !(n is ArrayLit) && !(n is ObjLit) { return -1 }
   const t = nodeTyIxOf(x)
-  if !fnTagHoldsTy(t, 16) { return -1 }
-  return fnTagRepTyIn(t, 16, fnTagRecLitsOnly(x, t, 1))
+  if !fnTagHoldsTy(t) { return -1 }
+  return fnTagRepTyOfIn(t, fnTagRecLitsOnly(x, t, false))
 }
 
 // The value record literal `o` gives field `name`, or -1.
@@ -4160,26 +4190,37 @@ function fnTagHeldInner(v: i32, r: i32, depth: i32) {
 }
 
 // The rep of type `t` once the sets now tagged hold ids: each tagged function leaf an `i32`.
-export function fnTagRepTyOf(t: i32): i32 { return fnTagRepTyIn(t, 16, false) }
+export function fnTagRepTyOf(t: i32): i32 { return fnTagRepTyOfIn(t, false) }
 
 // Type `t` with every list whose element is a tagged set an `i32` list, through lists, records,
 // nullables and map values; `t` itself where nothing is rewritten. With `deep`, `t` is inside a
 // list's element list, where a record's tagged function field is its `i32` id, since no literal of
 // the outer list mints that record's row (D15350).
-function fnTagRepTyIn(t: i32, depth: i32, deep: boolean): i32 {
-  if depth <= 0 || t < 0 || t >= T.tys.length { return t }
+function fnTagRepTyOfIn(t: i32, deep: boolean): i32 {
+  const path: i32[] = []
+  return fnTagRepTyIn(t, deep, path)
+}
+
+// `fnTagRepTyOfIn` under the types on `path`; a recursive type met again is left as it is.
+function fnTagRepTyIn(t: i32, deep: boolean, path: i32[]): i32 {
+  if t < 0 || t >= T.tys.length || tyPathCycles(t, path) { return t }
+  return fnTagRepTyStep(t, deep, tyPathWith(t, path))
+}
+
+// One step of `fnTagRepTyIn`.
+function fnTagRepTyStep(t: i32, deep: boolean, path: i32[]): i32 {
   const o = tyAt(t)
   match o {
     TyArray => {
       if fnTagTyIsTagged(tyElemOf(o)) { return mkArrayTy(TY_I32) }
-      const e = fnTagRepTyIn(tyElemOf(o), depth - 1, deep)
+      const e = fnTagRepTyIn(tyElemOf(o), deep, path)
       return if e == tyElemOf(o) { t } else { mkArrayTy(e) }
     }
     TyObj => {
       const tys: i32[] = []
       let changed = false
       for f in o.objFieldTypes {
-        const r = if deep && fnTagTyIsTagged(f) { TY_I32 } else { fnTagRepTyIn(f, depth - 1, deep) }
+        const r = if deep && fnTagTyIsTagged(f) { TY_I32 } else { fnTagRepTyIn(f, deep, path) }
         if r != f { changed = true }
         tys.push(r)
       }
@@ -4189,13 +4230,13 @@ function fnTagRepTyIn(t: i32, depth: i32, deep: boolean): i32 {
       return mkObjTy(names, tys)
     }
     TyNullable => {
-      const r = fnTagRepTyIn(o.nInner, depth - 1, deep)
+      const r = fnTagRepTyIn(o.nInner, deep, path)
       return if r == o.nInner { t } else { mkNullableTy(r) }
     }
     // A map's value record is minted by no literal of the map's own, so its tagged function
     // fields are their `i32` ids, as inside a list's element list.
     TyMap => {
-      const r = fnTagRepTyIn(tyValOf(o), depth - 1, true)
+      const r = fnTagRepTyIn(tyValOf(o), true, path)
       return if r == tyValOf(o) { t } else { mkMapTy(tyKeyOf(o), r, o.mSet) }
     }
     // No other kind holds a set's ids as a container.
