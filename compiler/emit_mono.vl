@@ -64,6 +64,7 @@ import {
   elabCallParamBoundTy,
   elabCbArgSig,
   elabDeclFnOf,
+  elabDeclHasHoleParam,
   elabDeclIsValue,
   elabFnDeclRetAt,
   elabFnDeclRetAtUnder,
@@ -76,6 +77,7 @@ import {
   elabLamDeliveredParams,
   elabLamInstParamTy,
   elabLamParamTy,
+  elabMakerTwinParamTy,
   elabNodeTy,
   elabOpenFnArgDecl,
   elabSlotAnnRets,
@@ -99,6 +101,7 @@ import {
   elabValueSlotUncalled,
   elabWalkKeyOf,
   elabWalkTop,
+  elabWideTwinOf,
   elabWrittenValueTy,
   eplSlotSig,
 } from "./emit_elab"
@@ -701,6 +704,7 @@ import {
   elabCallParamTyOwn,
   elabCallSeedBind,
   elabCallSetIn,
+  elabCbAnnKeyedAny,
   elabCbParamRowTy,
   elabClosedSigAtPins,
   elabCopyTyOwn,
@@ -9873,7 +9877,10 @@ function monoMakeInstanceGo(
     // A call's instance is keyed by the elaboration's key for that call plus the pinned reps, not
     // by the pins' spelling (architecture-target §3.4, the call half).
     const valueHalf = elabDeclIsValue(monoOrigNode[origFe])
-    const callKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
+    const baseKey = if tplCall >= 0 && !valueHalf { elabWalkKeyOf(tplCall, true, monoOrigNode[origFe]) } else { -1 }
+    // A widened call of a maker the elaboration twinned is keyed by that twin (D16778).
+    const twinKey = if retWiden && baseKey >= 0 { elabWideTwinOf(baseKey, req.retWidenTy) } else { -1 }
+    const callKey = if twinKey >= 0 { twinKey } else { baseKey }
     const k = monoMakeInstanceKeyOf(
       fn,
       origFe,
@@ -10771,7 +10778,8 @@ function monoCoerceFnValueTys(
         if go < monoGen.length && monoGen[go] == 1 { gfe = go }
       }
       // A maker delivered at a closed function type is its instance at that type's result.
-      if monoIsMakerFe(gfe) {
+      // A maker with an un-annotated parameter is pinned by its calls, which this read is not.
+      if monoIsMakerFe(gfe) && !elabDeclHasHoleParam(monoOrigNode[gfe]) {
         const dt = if expTy >= 0 { expTy } else { tnameTy }
         return monoMakerTwin(gfe, exprIx, monoFnTyRet(dt), delTys, ctx)
       }
@@ -10856,9 +10864,12 @@ function monoMakerTwin(
   const holeRet = monoRetsReachHoleLam(monoOrigNode[fe], [])
   if mfn is FuncDecl && mfn.fnParams.length > 0 && !holeRet { return 0 }
   if mfn is FuncDecl && holeRet {
+    let pi = 0
     for p in mfn.fnParams {
       const pn = nodeAt(p)
-      const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else { -1 }
+      // An un-annotated parameter is pinned at the type the call hands it (D16778).
+      const pt = if pn is Param && pn.parType >= 0 { nodeTyIxOf(pn.parType) } else if pn is Param { elabMakerTwinParamTy(monoOrigNode[fe], ret, pi) } else { -1 }
+      pi = pi + 1
       const ps = if pt >= 0 { monoPinOfClosedTy(pt) } else { "" }
       if ps == "" { return 0 }
       pins.push(ps)
@@ -17730,6 +17741,9 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const keep = rw >= 0 && m.memProp == "map" && fnOnlyReturnsParam(ax)
     if rw >= 0 && lf is FuncDecl && lf.fnParams.length == 1 && lsf is TyFunc {
       nodeTyRecord(lf.fnParams[0], rw)
+      // An annotation at the element type is a bound the build fits, so it reads as the build.
+      const lp = nodeAt(lf.fnParams[0])
+      if lp is Param && lp.parType >= 0 { nodeTyRecord(lp.parType, rw) }
       nodeTyRecord(ax, mkFuncTy([rw], if keep { rw } else { lsf.fnRet }))
       if keep { nodeTyRecord(ix, mkArrayTy(rw)) }
     }
@@ -20262,6 +20276,13 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       monoBakeSpecK = elabSpecKeyOf(specAt)
       const req = instReqAt(frame)
       req.call = callIx
+      // A maker with an un-annotated parameter whose call is delivered at another result is its
+      // elaboration's wide twin there (D16778).
+      const mkd = monoOrigNode[origFe]
+      const mks = if elabDeclHasHoleParam(mkd) { elabMakerCallSig(callIx) } else { -1 }
+      if mks >= 0 && elabMakerTwinHeld(mkd, mks) && elabMakerOpen(mkd) {
+        req.retWidenTy = mks
+      }
       req.specK = monoBakeSpecK
       req.argLit = argLit
       const made = monoMakeInstance(
@@ -26188,6 +26209,8 @@ export function monomorphize(stmts: i32[]) {
   // The pass also runs for callback specialization of a concrete higher-order function.
   // Gated on the program actually defining one, so a generic-free, HOF-free program (the
   // compiler itself) skips the pass entirely.
+  // A lambda the elaboration keyed at a list's build retypes its annotated parameter (D16764).
+  if elabCbAnnKeyedAny() { any = true }
   let hofOnly = false
   if !any {
     if monoHasConcreteHOFParam() {
