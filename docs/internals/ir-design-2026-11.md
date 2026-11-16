@@ -743,6 +743,18 @@ claim evidence on every merge. The first PR that makes CLAIMED non-empty adds a 
 unarmed row that asserts zero `claim fell back`, with a verifier fallback counted as a hard
 failure.
 
+**A coverage step is graded on coverage, not lines.** Some steps widen what the builder covers
+where legacy has no IR duplicate to delete, so they cannot be net-negative in lines. An example is
+taking a construct's legacy arm through the op seam for a rep the builder did not admit. Such a
+step is exempt from the net-negative bar and meets these bars instead:
+- byte identity;
+- the shadow all-matched;
+- mode-3 claiming byte-identical;
+- its PR body states the covered functions gained per compiler line added;
+- the first-miss histogram before and after, with the targeted row falling.
+
+C2e (list length) is the first.
+
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
