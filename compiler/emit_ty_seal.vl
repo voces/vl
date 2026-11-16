@@ -25,17 +25,19 @@ import {
   tyAt,
   tyElemOf,
   tyEmitEpoch,
+  tyEq,
+  tyFreshOpen,
   tyKeyOf,
   tyReachesSelf,
+  tySame,
   tyValOf,
   tyVarRenames,
   unionAliasDeclNameOfTy,
 } from "./check_types"
 import { i32ToStr } from "./ast"
-import { unMemPeelAliasWrapper } from "./emit_union_tykey_text"
 import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { Interner, internIdIn, internNew } from "./intern"
-import { flattenVariantsInto } from "./tyquery"
+import { flattenVariantsInto, unMemPeelAliasWrapper } from "./tyquery"
 import { fnTagTyIsTagged } from "./check_fn_tag_facts"
 import { emitFail } from "./emit_bytes"
 
@@ -60,14 +62,18 @@ const CK_PARAM = 16
 const CK_LIT = 17
 const CK_BRAND = 18
 const CK_ALIAS = 19
+const CK_ROW = 20
+const CK_BINDER = 21
 
-// The four equalities: union members as a set; as the spelling renders them, in order with a
-// Set spelled as its boolean map; `tyEq`'s, every child compared as `tyEq` compares it; and the
-// layout, the spelled one keeping a union alias, a nullable and a brand wherever one stands.
+// The five equalities: union members as a set; as the spelling renders them, in order with a
+// Set spelled as its boolean map; `tyEq`'s, every child compared as `tyEq` compares it; the
+// layout, the spelled one keeping a union alias, a nullable and a brand wherever one stands; and
+// `tySame`'s, with no brand and a literal, error or negation only its own row.
 const CF_SET = 0
 const CF_SPELLED = 1
 const CF_EQ = 2
 const CF_LAYOUT = 3
+const CF_SAME = 4
 
 // The ids, shared by both equalities and across compiles: an id names content, never a row.
 const canonTab: Interner = internNew()
@@ -75,7 +81,7 @@ const canonTab: Interner = internNew()
 const canonStrIds: {[string]: i32} = Map()
 
 // Each row's id per equality, valid while the arena's generations match the stamp.
-let canonMemo: i32[][] = [[], [], [], []]
+let canonMemo: i32[][] = [[], [], [], [], []]
 let canonEpoch = -1
 let canonRenames = -1
 // The rows being keyed, outermost first, with the equality each is keyed under, and per row the
@@ -163,7 +169,7 @@ function canonSync() {
   if canonEpoch == tyEmitEpoch && canonRenames == tyVarRenames { return 0 }
   canonEpoch = tyEmitEpoch
   canonRenames = tyVarRenames
-  canonMemo = [[], [], [], []]
+  canonMemo = [[], [], [], [], []]
   return 0
 }
 
@@ -213,6 +219,7 @@ function canonOf(ty: i32, fl: i32): i32 {
   let id = -1
   if fl == CF_EQ { id = canonEqGo(ty) }
   else if fl == CF_LAYOUT { id = canonLayoutGo(ty) }
+  else if fl == CF_SAME { id = canonSameGo(ty) }
   else { id = canonOfGo(ty, fl) }
   canonWalk.pop()
   canonWalkFl.pop()
@@ -414,6 +421,92 @@ function canonLayoutGo(x: i32): i32 {
   return internIdIn(canonTab, CK_BRAND, [canonStr(nom), base], 0)
 }
 
+// Row `x`'s id up to `tySame`: a union's members flattened and in order (one member stands for
+// itself), a record's fields as a name set, a type parameter by its binder slot, no brand, no list
+// view bit and no function tag; a literal, an error, a negation or a hole is only its own row.
+function canonSameGo(x: i32): i32 {
+  const t = tyAt(x)
+  match t {
+    TyUnion => {
+      const ms: i32[] = []
+      canonUnionMembersInto(x, ms)
+      if ms.length == 1 { return canonOf(ms[0], CF_SAME) }
+      const ids: i32[] = []
+      for m in ms { ids.push(canonOf(m, CF_SAME)) }
+      return internIdIn(canonTab, CK_SEQ, ids, 0)
+    }
+    TyNullable => {
+      return internIdIn(canonTab, CK_NULLABLE, [canonOf(t.nInner, CF_SAME)], 0)
+    }
+    TyArray => {
+      return internIdIn(canonTab, CK_LIST, [canonOf(tyElemOf(t), CF_SAME)], 0)
+    }
+    TyMap => {
+      return internIdIn(
+        canonTab,
+        CK_MAP,
+        [
+          t.mSet,
+          canonOf(tyKeyOf(t), CF_SAME),
+          canonOf(tyValOf(t), CF_SAME),
+        ],
+        0,
+      )
+    }
+    TyFunc => {
+      const ids: i32[] = [canonOf(t.fnRet, CF_SAME)]
+      for p in t.fnParamTypes { ids.push(canonOf(p, CF_SAME)) }
+      return internIdIn(canonTab, CK_FN, ids, 0)
+    }
+    TyObj => {
+      return canonSameObj(t)
+    }
+    TyPrim => {
+      return internIdIn(canonTab, CK_PRIM, [canonStr(t.primName)], 0)
+    }
+    TyVar => {
+      if t.tvKind == "param" && t.tvBinder >= 0 {
+        return internIdIn(canonTab, CK_BINDER, [t.tvBinder, t.tvIdx], 0)
+      }
+      return internIdIn(canonTab, CK_ROW, [x], 0)
+    }
+    TyErr | TyLit | TyNeg => {
+      return internIdIn(canonTab, CK_ROW, [x], 0)
+    }
+  }
+}
+
+// A record's id up to `tySame`: its fields' names and ids, ordered by the name's id, so two
+// spellings of one field set meet.
+function canonSameObj(t: TyObj): i32 {
+  const names: i32[] = []
+  const ids: i32[] = []
+  let f = 0
+  while f < t.objFieldNames.length {
+    const n = canonStr(t.objFieldNames[f])
+    const c = canonOf(t.objFieldTypes[f], CF_SAME)
+    let at = names.length
+    names.push(n)
+    ids.push(c)
+    while at > 0 && names[at - 1] > n {
+      names[at] = names[at - 1]
+      ids[at] = ids[at - 1]
+      at = at - 1
+    }
+    names[at] = n
+    ids[at] = c
+    f = f + 1
+  }
+  const args: i32[] = [names.length]
+  let i = 0
+  while i < names.length {
+    args.push(names[i])
+    args.push(ids[i])
+    i = i + 1
+  }
+  return internIdIn(canonTab, CK_OBJ, args, 0)
+}
+
 // Union member `ty` flattened into `out` as the layout sees it: a nested union is inlined unless
 // it is an alias row, which keeps its own id.
 function canonLayoutMembersInto(ty: i32, out: i32[]) {
@@ -474,6 +567,53 @@ let csRows: string[] = []
 
 // Whether the shadow records: the identity shadow's switch, read once per comparison.
 export function canonShadowOn(): boolean { return idShadowModeOf() > 0 }
+
+// `tySame` for an emit-side caller: its answer, which the shadow grades against the ids.
+export function tySameSealed(a: i32, b: i32): boolean {
+  const r = tySame(a, b)
+  if idShadowModeOf() > 0 { canonShadowCmp(0, a, b, r, CF_SAME) }
+  return r
+}
+
+// `tyEq` for an emit-side caller: its answer, which the shadow grades against the ids.
+export function tyEqSealed(a: i32, b: i32): boolean {
+  const r = tyEq(a, b)
+  if idShadowModeOf() > 0 { canonShadowCmp(1, a, b, r, CF_EQ) }
+  return r
+}
+
+// Per comparer (0 `tySame`, 1 `tyEq`) and per scope (0 outside a fresh scope, 1 inside): one row,
+// two rows both unequal, two rows both equal, comparer true with the ids apart, comparer false
+// with the ids met.
+let csCmp: i32[] = []
+
+function canonShadowCmp(c: i32, a: i32, b: i32, r: boolean, fl: i32) {
+  if canonWalk.length > 0 { return 0 }
+  const m = a == b || a >= 0 && b >= 0 && canonOf(a, fl) == canonOf(b, fl)
+  let k = 1
+  if a == b { k = 0 }
+  else if r && m { k = 2 }
+  else if r { k = 3 }
+  else if m { k = 4 }
+  const at = c * 10 + (if tyFreshOpen() { 5 } else { 0 }) + k
+  while csCmp.length <= at { csCmp.push(0) }
+  csCmp[at] = csCmp[at] + 1
+  if k >= 3 && csRows.length < 24 {
+    csRows.push(
+      "canon-ex "
+        + (if c == 0 { "same" } else { "eq" })
+        + (if k == 3 { " true-ne #" } else { " false-eq #" })
+        + i32ToStr(a)
+        + " "
+        + canonKindName(a)
+        + " ~ #"
+        + i32ToStr(b)
+        + " "
+        + canonKindName(b),
+    )
+  }
+  return 0
+}
 
 // The layout shadow: each layout id with the rep node it first met, and each node with its first
 // id, for the current rep tree; one id meeting two nodes is a merge, one node two ids a split.
@@ -558,6 +698,28 @@ export function canonShadowReport() {
       + " split "
       + i32ToStr(clSplit),
   )
+  while csCmp.length < 20 { csCmp.push(0) }
+  let c = 0
+  while c < 4 {
+    const o = c * 5
+    idShadowRow(
+      "canon "
+        + (if c < 2 { "same" } else { "eq" })
+        + (if c % 2 == 0 { "" } else { " fresh" })
+        + " one-row "
+        + i32ToStr(csCmp[o])
+        + " both-ne "
+        + i32ToStr(csCmp[o + 1])
+        + " both-eq "
+        + i32ToStr(csCmp[o + 2])
+        + " true-ne "
+        + i32ToStr(csCmp[o + 3])
+        + " false-eq "
+        + i32ToStr(csCmp[o + 4]),
+    )
+    c = c + 1
+  }
+  csCmp = []
   for r in csRows { idShadowRow(r) }
   clAgree = 0
   clMerge = 0
