@@ -86,3 +86,32 @@ its consumers. H and L1 adopt `KeyId` later. Not S4: S4 generalizes inside an in
 enumerates instances.
 
 Unblocks: G, P, S, N1, most of T in the late residue; D16881.
+
+## A0, first reading
+
+`$VL_INST_KEYS=1 vl check --codegen tests` (7,212 programs), master `6cd505a50` with #8836's call
+rows only (#8841's other paths not yet merged). Keys are compared without the elaboration's parent
+prefix.
+
+| | keys | programs |
+|---|---|---|
+| equal | 7,772 | 2,009 |
+| check-only | 81 | 54 |
+| elab-only | 11,573 | 1,908 |
+
+Open calls, per reason: function value 4,941 rows (1,084 programs), outer hole 2,355 (567), binding
+the elaboration's canonicalization refuses 26 (9). Capped at `MONO_NEST_MAX`: 0.
+
+Each elab-only key, by why the check has no key for it:
+
+| reason | keys | programs | what it is |
+|---|---|---|---|
+| unrecorded | 7,116 | 1,643 | no row calls the declaration: 5,155 named, 1,961 lambdas; function-value calls (S3.4d), member calls and hole lambdas (#8841) |
+| open | 2,852 | 537 | rows call it, none closed to a key |
+| arg-keyed | 807 | 258 | the elaboration's argument-keyed family (`decl|n|…`) |
+| differs | 798 | 353 | a check key of the same declaration binds otherwise |
+
+The component splitting a `differs` pair: function identity (`Fn#…`) 356 (132 programs), a type
+parameter 285 (190), a hole binding 71 (30), a delivered-row entry 6 (4), and mixes of these 76.
+Function identity is the storage-shaped component the design keeps out of the key: two calls
+handing different functions of one type share a check key and split in the elaboration.
