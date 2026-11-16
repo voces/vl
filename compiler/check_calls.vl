@@ -101,6 +101,7 @@ import {
   fvaAdaptEnclosing,
   genFnValueCstrs,
   holeChoiceArmCstrsAt,
+  holeChoiceArmCstrsIn,
   holeDeclCstrsAt,
   holeDeclCstrsBind,
   holeFnArgUnionRetTy,
@@ -322,6 +323,7 @@ import {
   ACF_TPL,
   NO_DST_NAMES,
   OP_CALL_GUARDED_PIN,
+  OP_CALL_OPT_PIN,
   OP_CALL_PIN,
   SUBST_DECLARED,
   argIsLitAggregate,
@@ -3049,7 +3051,18 @@ function callFtyPinCstrs(
     if sr >= 0 { retTy = sr }
     holeLetWritesDisagreeCall(ix, n.callFn, pts, fixed, sr >= 0)
     if T.diags.length == dBeforeC && T.diags.length == dw {
-      holeChoiceArmCstrsAt(n.callFn, pts)
+      // Inside an instance, a parameter holds only what the calls reaching it hand over: the
+      // members of its set there, and none of another call's choice when it holds no set (D16831).
+      const pd = if cfn is Ident { identDeclOf(parenPeelIx(n.callFn)) } else { -1 }
+      const viaParam = elabCapLive()
+        && pd >= 0
+        && pd < P.nodes.length
+        && nodeAt(pd) is Param
+      if !viaParam {
+        holeChoiceArmCstrsAt(n.callFn, pts)
+      } else if liveSet >= 0 {
+        holeChoiceArmCstrsIn(n.callFn, pts, fnTagMembers(liveSet))
+      }
       holeChoiceWaits(n.callFn, pts)
     }
     if cfn is Member && T.diags.length == dBeforeC {
@@ -5287,6 +5300,8 @@ function checkCallNodeGo(n: Call, ix: i32) {
       }
       if tyIsNonNullHoleRead(fnTy) {
         noteMemCstr(fnTy, OP_CALL_GUARDED_PIN, ix, false)
+      } else if cfn is OptMember {
+        noteMemCstr(fnTy, OP_CALL_OPT_PIN, ix, false)
       } else {
         noteMemCstr(fnTy, OP_CALL_PIN, ix, false)
       }
@@ -5306,6 +5321,12 @@ function checkCallNodeGo(n: Call, ix: i32) {
   // A `never` callee, a type parameter an instance binds to it (D3178) or a read no value
   // reaches, is called on no value.
   if fnTy == TY_NEVER { return TY_NEVER }
+  // A `?.` call off a receiver only ever `null` reads `null`; its arguments are still checked
+  // (D16841).
+  if cfn is OptMember && isNullTy(fnTy) {
+    for na in n.callArgs { checkNodeHook(na) }
+    return TY_NULL
+  }
   // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
   let calledGetter = getSiteFnOf(n.callFn)
   if calledGetter == "" && cfn is Member {

@@ -15147,13 +15147,12 @@ function elabSlotReadDeliveries(
   seen: i32[],
 ) {
   if b < 0 || b >= P.nodes.length { return 0 }
-  if path.length >= 8 {
-    if elabSeenDeep(seen, ELAB_SEEN_READ, b, path) { return 0 }
-  } else {
+  if path.length < 8 {
     const key = b * 8 + path.length
     if i32ListHas(seen, key) { return 0 }
     seen.push(key)
   }
+  if elabSeenDeep(seen, ELAB_SEEN_READ, b, path) { return 0 }
   cwIxWant()
   const ow = cwOccWalk(b)
   while cwOccNext(ow) {
@@ -15318,12 +15317,16 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
   // Each value and path is climbed once per query: the alias edges reach one from several sides.
   // A name's occurrence is climbed once already, by its binding's walk.
   if u < 0 || u >= P.nodes.length { return 0 }
-  if path.length >= 8 {
-    if elabSeenDeep(seen, ELAB_SEEN_CLIMB, u, path) { return 0 }
-  } else if !(nodeAt(u) is Ident) {
+  if path.length < 8 && !(nodeAt(u) is Ident) {
     const key = elabClimbKey - u * 8 - path.length
     if i32ListHas(seen, key) { return 0 }
     seen.push(key)
+  }
+  if (
+    (path.length >= 8 || !(nodeAt(u) is Ident))
+    && elabSeenDeep(seen, ELAB_SEEN_CLIMB, u, path)
+  ) {
+    return 0
   }
   // A value a replaced loop hands out is that loop's value.
   const lx = lvExitLoops[u] ?? -1
@@ -15703,6 +15706,9 @@ const elabClimbKey = 0 - 1073741824
 const ELAB_SEEN_CLIMB = 0 - 1073741823
 const ELAB_SEEN_READ = 0 - 1073741822
 const ELAB_SEEN_RET = 0 - 1073741821
+// The band a deep entry's node and path id are stored in, below every walker's key, so a
+// binding's, return's or climb's key never reads as one.
+const ELAB_SEEN_BAND = 0 - 2000000000
 
 // Each slot path a deep walk reached, by its text (`/` before each step and after the last).
 let elabPathIds: {[string]: i32} = Map()
@@ -15729,12 +15735,13 @@ function elabPathIdOf(t: string): i32 {
 // otherwise. A walk ends at a cycle, not at a depth.
 function elabSeenDeep(seen: i32[], tag: i32, x: i32, path: string[]): boolean {
   const t = elabPathText(path)
+  const xk = ELAB_SEEN_BAND + x
   let i = 0
   while i + 2 < seen.length {
-    const pi = seen[i + 2]
+    const pi = seen[i + 2] - ELAB_SEEN_BAND
     if (
       seen[i] == tag
-      && seen[i + 1] == x
+      && seen[i + 1] == xk
       && pi >= 0
       && pi < elabPathTexts.length
     ) {
@@ -15747,8 +15754,8 @@ function elabSeenDeep(seen: i32[], tag: i32, x: i32, path: string[]): boolean {
     i = i + 1
   }
   seen.push(tag)
-  seen.push(x)
-  seen.push(elabPathIdOf(t))
+  seen.push(xk)
+  seen.push(ELAB_SEEN_BAND + elabPathIdOf(t))
   return false
 }
 
@@ -21525,6 +21532,8 @@ type EplTables = {
   ownOnly: boolean,
   // The list copies whose element flow is drawn, as `node|instance`.
   copied: {[string]: boolean},
+  // The values an index write or `set` stores into a list or map element (`m[k] = v`).
+  idxWrites: i32[],
 }
 
 function eplFresh(): EplTables {
@@ -21560,6 +21569,7 @@ function eplFresh(): EplTables {
     oneMemo: Map(),
     omit: [],
     copied: Map(),
+    idxWrites: [],
     ownOnly: false,
   }
 }
@@ -22476,6 +22486,15 @@ function eplEdgeAt(u: i32) {
       if k == CW_UP_LETINIT {
         eplEdge(eplPlaceOf(u, 0), eplRoot(up), u)
       } else if k == CW_UP_ASG_RHS && un is BinExpr {
+        const lx = parenPeelIx(un.binLeft)
+        if (
+          lx >= 0
+          && lx < P.nodes.length
+          && nodeAt(lx) is Index
+          && !i32ListHas(EPL.idxWrites, u)
+        ) {
+          EPL.idxWrites.push(u)
+        }
         eplEdge(eplPlaceOf(u, 0), eplPlaceOf(un.binLeft, 0), u)
       } else if k == CW_UP_ELEM {
         eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "e"), u)
@@ -22531,6 +22550,7 @@ function eplEdgeAt(u: i32) {
         if cn is Member && (cn.memProp == "push" || cn.memProp == "unshift") {
           eplEdge(eplPlaceOf(u, 0), eplChild(eplPlaceOf(cn.memObj, 0), "e"), u)
         } else if cn is Member && cn.memProp == "set" && ai == 1 {
+          if !i32ListHas(EPL.idxWrites, u) { EPL.idxWrites.push(u) }
           eplEdge(eplPlaceOf(u, 0), eplChild(eplPlaceOf(cn.memObj, 0), "v"), u)
         } else if cn is Member && eplCbMethod(cn.memProp) && ai == 0 {
           const lam = eplFnOf(u)
@@ -23165,6 +23185,43 @@ export function eplSlotSig(
   return eplSlotSigAt(holder, path, k, omit)
 }
 
+// The closed function type value node `v` is delivered at in instance `k`: the one signature the
+// calls through the class of the place it yields agree on, as `eplSlotSig` answers for a holder
+// (D16842); negative as there.
+export function eplValueSig(v: i32, k: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const k0 = EPL.k
+  const h0 = EPL.holder
+  const p = eplSlotPlaceOwn(v, [], k)
+  if p < 0 {
+    EPL.k = k0
+    return -1
+  }
+  const t = nodeTyIxOf(v)
+  EPL.holder = -1
+  EPL.ownOnly = true
+  const one = eplOneCall(p)
+  // A call in a function with several instances is keyed per instance, so no one signature holds:
+  // that value needs a set of instances (D16240).
+  const cfd = if one >= 0 { recEnclosingFn(EPL.callNode[one]) } else { -1 }
+  const split = cfd >= 0
+    && eplInstanced(cfd)
+    && (EPL.insts.get(cfd) ?? []).length > 1
+  const r = if one < 0 {
+    if one == -2 { -1 } else { one }
+  } else if split {
+    -4
+  } else if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc {
+    eplRebuildLeaf(p, t, [])
+  } else {
+    -1
+  }
+  EPL.ownOnly = false
+  EPL.holder = h0
+  EPL.k = k0
+  return if one >= 0 && r < 0 { -5 } else { r }
+}
+
 // The instance keys of the instanced function `holder` sits in; empty where its frame is the
 // program.
 function eplFrameKeysOf(holder0: i32): i32[] {
@@ -23411,9 +23468,16 @@ function eplSlotCallRecs(
   }
   if ks.length == 0 { ks.push(k) }
   const cis: i32[] = []
+  // Read from a value, the calls leave out where an index write or `set` stores it into a list or
+  // map element; mono's pins do not take that write's calls (D16864).
+  const om: i32[] = []
+  for o in omit { om.push(o) }
+  if path.length == 0 {
+    for w in EPL.idxWrites { om.push(w) }
+  }
   for kk in ks {
     const p = eplSlotPlaceOwn(holder, path, kk)
-    for ci in if p >= 0 { eplCallsStarOmit(p, omit) } else { [] } {
+    for ci in if p >= 0 { eplCallsStarOmit(p, om) } else { [] } {
       if !i32ListHas(cis, ci) { cis.push(ci) }
     }
   }
@@ -23601,13 +23665,8 @@ function eplSlotCallTysInto(
       }
       const rt0 = if ck >= 0 { elabNodeTy(EPL.callNode[ci], ck) } else { -1 }
       const rt = if rt0 >= 0 { rt0 } else { nodeTyIxOf(EPL.callNode[ci]) }
-      // A call is a delivery only where its arguments and its result are closed.
-      if (
-        tys.length == cn.callArgs.length
-        && rt >= 0
-        && !tyHasTyVar(rt)
-        && !tyHoldsHole(rt)
-      ) {
+      // A call is a delivery where its arguments are closed, at the result the call is typed.
+      if tys.length == cn.callArgs.length && rt >= 0 {
         const ft = mkFuncTy(tys, rt)
         if !i32ListHas(out, ft) { out.push(ft) }
       }
