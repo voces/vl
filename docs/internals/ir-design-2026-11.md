@@ -766,8 +766,10 @@ blockers, not payoffs: a row that falls only helps the functions it was the last
 C2f, a string literal step left coverage unchanged. The census (`$VL_IR_SHADOW=4`, `ir-shadow.vl
 -- --blockers`) builds each function past its missed statements and reports the set of classes
 that keeps it uncovered. A step's payoff is the functions whose set it empties, an upper bound
-since a statement stops at its first miss. The coverage bar is functions unblocked per line, read
-off the census before the step and confirmed by the shadow after it.
+since a statement stops at its first miss. A check that reads a statement's whole build, as the
+valued tail `if` test does, runs only when that statement built without a miss; an arm left
+incomplete by a miss is not a class of its own. The coverage bar is functions unblocked per line,
+read off the census before the step and confirmed by the shadow after it.
 
 **The six coercion seats wait for claiming (I3).** These are `numSeat`, `coerceHeld`, `boxSeat`,
 `armSeat`, `armServed` and `atomSeat`. They are legacy-only ambient state: an outer site sets one

@@ -4,13 +4,14 @@
 // `idxArmOf`); a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
-import { Index, Member, WhileStmt, nodeAt } from "./ast"
-import { RListGet, RListLen, Rhs, SBoundsCheck, repPrim } from "./ir"
+import { BinExpr, Index, Member, WhileStmt, nodeAt } from "./ast"
+import { RListGet, RListLen, RStrOp, Rhs, SBoundsCheck, repPrim } from "./ir"
 import { irLFn, irLMiss, irLOpnd, irLSkip } from "./ir_lower"
 import {
   arrLenHoistOf,
   arrLenTail,
   emitArrLenHeld,
+  emitEqRecoverNarrowed,
   idxArmOf,
   idxCellReadIsNull,
   listElemStaysNullable,
@@ -23,6 +24,13 @@ import {
   scalarListGetTail,
   scalarListHoistOf,
   scalarListUsed,
+  strCatTail,
+  strEqFirstOf,
+  strEqLitOf,
+  strEqTail,
+  strListGetTail,
+  strListHoistOf,
+  strOrderTail,
   svDstOfKind,
 } from "./wasmEmit"
 import { scalarListElemKind } from "./emit_value_sites"
@@ -40,7 +48,7 @@ export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   if idxCellReadIsNull(idxIx, fnIx) { return "index cell null" }
   const arm = idxArmOf(nd, fnIx)
   if arm == "ref" { return refReadWhy(nd, idxIx, fnIx) }
-  if arm == "string" { return "" }
+  if arm == "string" || arm == "str" { return "" }
   if arm != "scalar" { return "index " + arm }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null || !scalarListUsed(ek) { return "index uncollected list" }
@@ -75,6 +83,7 @@ export function irScalarListRep(r: i32): boolean {
 // receiver a live loop hoist holds is consumed without being written.
 function lowerList(r: Rhs): i32 {
   if r is RListLen { return lowerLen(r) }
+  if r is RStrOp { return lowerStr(r) }
   if !(r is RListGet) { return irLMiss("list rhs") }
   const nd = nodeAt(r.lgAt)
   if !(nd is Index) { return irLMiss("list read node") }
@@ -85,6 +94,12 @@ function lowerList(r: Rhs): i32 {
     if sz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
     irLOpnd(r.lgIx)
     return rawStrGetTail(sz)
+  }
+  if arm == "str" {
+    const lz = strListHoistOf(nd)
+    if lz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
+    irLOpnd(r.lgIx)
+    return strListGetTail(nd, lz, true)
   }
   if arm == "ref" {
     const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
@@ -99,6 +114,33 @@ function lowerList(r: Rhs): i32 {
   if hz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
   irLOpnd(r.lgIx)
   return scalarListGetTail(nd, ek, fnIx, hz)
+}
+
+// `RStrOp`: its operands, then legacy's operator tail. An equality operand is recovered after
+// it is pushed, as legacy recovers a narrowed nullable read.
+function lowerStr(r: RStrOp): i32 {
+  const e = nodeAt(r.soAt)
+  if !(e is BinExpr) { return irLMiss("string operator node") }
+  const fnIx = irLFn().irAt
+  if r.soOp != "eq" {
+    for a in r.soArgs { irLOpnd(a) }
+  }
+  return match r.soOp {
+    "concat" => strCatTail(r.soArgs.length)
+    "lt" => strOrderTail(e)
+    "eq" => {
+      const lit = strEqLitOf(r.soAt, fnIx)
+      const asts = [strEqFirstOf(e, lit), e.binRight]
+      let i = 0
+      while i < r.soArgs.length {
+        irLOpnd(r.soArgs[i])
+        emitEqRecoverNarrowed(asts[i], fnIx)
+        i = i + 1
+      }
+      strEqTail(e, r.soAt, lit, fnIx)
+    }
+    "len" | "at" | "slice" => irLMiss("string operator " + r.soOp)
+  }
 }
 
 // `RListLen`: legacy's `.length` arm, its receiver the operand; a live loop hoist's cached `len`
