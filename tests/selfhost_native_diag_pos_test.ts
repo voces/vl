@@ -201,9 +201,9 @@ Deno.test({
     "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
   ignore: !ENABLED,
   fn: async () => {
-    // `is` over a literal-union list arm has no interned arm representation (D14041), so
-    // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
-    // enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
+    // `is` across record arms whose shared field's box holds a member only some of whose
+    // values fit (D4265), so `useIt` (line 4) fails at the EMIT stage. The diagnostic
+    // anchors at the enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
     // positionless (line 0) as before — so a build/playground/LSP consumer can
     // point the reader at the offending function instead of rendering the message
     // bare. (`declNameTokOf` anchoring, matching the lint/type-diag convention.)
@@ -212,14 +212,14 @@ Deno.test({
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "type K = 0 | 1\n" +
-          "// D14041\n" +
-          "const z = 9\n" +
-          "function useIt(x: K[] | string) {\n" +
-          "  if x is K[] { print(x[0]) } else { print(z) }\n" +
+        'type A = { v: "a" | "b" }\n' +
+          "// D4265\n" +
+          "type B = { v: i32 | string }\n" +
+          "function useIt(u: A | B) {\n" +
+          '  if u is A { print("A") } else { print("B") }\n' +
           "}\n" +
-          "useIt([1])\n" +
-          'useIt("s")\n',
+          "const c: B = { v: 3 }\n" +
+          "useIt(c)\n",
       );
       const r = await build(path);
       if (r.code === 0) {

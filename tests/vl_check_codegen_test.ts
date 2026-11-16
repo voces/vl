@@ -92,18 +92,18 @@ const check = async (
   }
 };
 
-// Type-checks cleanly, fails the emitter: `is` over a literal-union list arm has no
-// interned arm representation (D14041). Swap in another live emit refusal when that row
-// closes.
+// Type-checks cleanly, fails the emitter: `is` across record arms whose shared field's box
+// holds a member only some of whose values fit (D4265). Swap in another live emit refusal
+// when that row closes.
 const EMIT_ERROR_SRC =
-  `type K = 0 | 1\n` +
-  `// D14041\n` +
-  `const z = 9\n` +
-  `function useIt(x: K[] | string) {\n` +
-  `  if x is K[] { print(x[0]) } else { print(z) }\n` +
+  `type A = { v: "a" | "b" }\n` +
+  `// D4265\n` +
+  `type B = { v: i32 | string }\n` +
+  `function useIt(u: A | B) {\n` +
+  `  if u is A { print("A") } else { print("B") }\n` +
   `}\n` +
-  `useIt([1])\n` +
-  `useIt("s")\n`;
+  `const c: B = { v: 3 }\n` +
+  `useIt(c)\n`;
 
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
