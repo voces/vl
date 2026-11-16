@@ -8,6 +8,7 @@ import { mapStoredTyOf } from "./check_fn_tag_facts"
 import {
   TY_V128,
   cUserTypes,
+  tyHasHole,
   tyPathCycles,
   tyPathWith,
   tyPrimNameIs,
@@ -368,6 +369,7 @@ import {
   elabCallResultMember,
   elabCallResultTy,
   elabDeclFnOf,
+  elabDeclPinnedByCall,
   elabFnReturnsRecordAt,
   elabHasHolderMemberTy,
   elabHasResultFact,
@@ -385,6 +387,7 @@ import {
   elabPlainReturnsRecord,
   elabSlotFieldRecord,
   elabSlotTyAt,
+  elabSrcDecl,
   elabThroughMemberAt,
   elabUnboundTpTy,
   isStorageRead,
@@ -5380,6 +5383,8 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // The syntactic resolvers — fast (no type render): a function-typed binding/param Ident, a struct
     // field closure, an indexed closure-array element.
     if cre is Ident {
+      const mk = cloMakerBindingSigKey(c, callIx, cfx)
+      if mk != "" { return mk }
       const k = calleeCloSigKeyOfRead(cfx, fnIx)
       if k != "" {
         // A loop variable or binding read at the instance's type parameters (D7202).
@@ -15511,4 +15516,45 @@ function readMapValTyAt(e: Index, fnIx: i32): i32 {
   const rt = nodeTyInOf(e.idxArr, fnIx)
   if rt < 0 || !tyIsMap(rt) { return -1 }
   return tyMapValOf(rt)
+}
+
+// A call `c` through un-annotated `const` `cfx` holding a call of a maker each call pins (an
+// un-annotated or type parameter): the call is at the types the check gave it there, when the
+// lambda literal the maker call's instance returns is lifted at them (D16815); else "".
+function cloMakerBindingSigKey(c: Call, callIx: i32, cfx: i32): string {
+  const d = identDeclOf(cfx)
+  const ld = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(ld is LetDecl)
+    || ld.letKw != "const"
+    || ld.letType >= 0
+    || ld.letInit < 0
+  ) {
+    return ""
+  }
+  const mcx = unwrapParen(ld.letInit)
+  const mc = if mcx >= 0 && mcx < P.nodes.length { nodeAt(mcx) } else { null }
+  if !(mc is Call) || mc.callFn < 0 { return "" }
+  const mf = unwrapParen(mc.callFn)
+  const mfn = if mf >= 0 && mf < P.nodes.length { nodeAt(mf) } else { null }
+  const mi = if mfn is Ident { identDeclOf(mf) } else { -1 }
+  const mn = if mi >= 0 && mi < P.nodes.length { nodeAt(mi) } else { null }
+  if !(mn is FuncDecl) || !elabDeclPinnedByCall(elabSrcDecl(mi)) { return "" }
+  const rets: i32[] = []
+  collectRetValues(mn.fnBody, rets)
+  if rets.length != 1 { return "" }
+  const lam = unwrapParen(rets[0])
+  const ln = if lam >= 0 && lam < P.nodes.length { nodeAt(lam) } else { null }
+  if !(ln is FuncDecl) { return "" }
+  const ps: i32[] = []
+  for a in c.callArgs {
+    const at = nodeTyIxOf(a)
+    if at < 0 || tyHasTyVar(at) || tyHasHole(at) { return "" }
+    ps.push(widenLitTy(at))
+  }
+  const rt = nodeTyIxOf(callIx)
+  if rt < 0 || tyHasTyVar(rt) || tyHasHole(rt) { return "" }
+  const k = sigKeyOfTy(mkFuncTy(ps, widenLitTy(rt)))
+  const fe = fnStmtsPosOf(lam)
+  return if k != "" && fe >= 0 && cloSigKeyExt(fe) == k { k } else { "" }
 }
