@@ -43,7 +43,7 @@ import {
 import { parenPeelIx } from "./check_places"
 import { cexEvalAt, cexKeptF32Tree } from "./check_num_lit_state"
 import { cexDecText, cexOk } from "./const_exact"
-import { numLexFitsI32 } from "./emit_bignum"
+import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
 import { mixesNumeric, widerNumeric } from "./check_ty_relate"
 import {
   isNumericPrimTy,
@@ -303,10 +303,11 @@ function binOperandLitShape(ix: i32): i32 {
 }
 
 // An operand beside an `f32` peer `peerTy` that adopts f32 as a literal does: a bare literal,
-// or a value `if`, `match` or block whose every tail is one.
+// a value `if`, `match` or block whose every tail is one, or a float tree over such joins.
 export function f32AdoptingOperand(ix: i32, peerTy: i32): boolean {
   if isF32AdoptingLitExpr(ix) { return true }
-  return f32LitTailsAdopt(ix, peerTy)
+  if f32LitTailsAdopt(ix, peerTy) { return true }
+  return f32JoinTreeAt(ix) && floatTreeAdoptDst(ix, peerTy) >= 0
 }
 
 // Whether the `i64` join at `srcExpr` (a `??`, or a value `if`, `match` or block) holds only
@@ -443,11 +444,68 @@ export function litTreeAdoptDst(ix: i32, dstTy: i32): i32 {
 // speculative check answers without recording.
 export function floatTreeAdoptDst(ix: i32, dstTy: i32): i32 {
   if ix < 0 || dstTy < 0 || primNameOf(nonNullTy(dstTy)) != "f32" { return -1 }
-  if !cexKeptF32Tree(ix) { return -1 }
+  if !cexKeptF32Tree(ix) && !f32JoinTreeAt(ix) { return -1 }
   const ty = nonNullTy(dstTy)
   if inferQuiet { return ty }
   return litTreeAdopt(ix, ty)
 }
+
+// Whether `ix` is float arithmetic over literals an `f32` takes and value joins of them, holding
+// a float literal and a join, so no fold made it one constant: `0.5 * (if c { 0.1 } else { 0.5 })`
+// beside or into an `f32` computes there, as the join alone does (ruling 4.3).
+export function f32JoinTreeAt(ix: i32): boolean {
+  const top = nodeAt(parenPeelIx(ix))
+  if !(top is BinExpr || top is Unary) { return false }
+  return f32TreeBits(ix, 16) == 3
+}
+
+// Whether `ix` is a float literal, or a join or float tree of literals an `f32` takes, which
+// an `f32` operand of a float intrinsic adopts as an operator's does: `min(a, if c {…})`.
+export function f32LitOperandAt(ix: i32): boolean {
+  const k = f32TreeBits(ix, 16)
+  return k >= 0 && (k & 1) == 1
+}
+
+// `f32JoinTreeAt`'s walk: bit 1 a float literal, bit 2 a value join, or -1 for no such tree.
+function f32TreeBits(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth <= 0 { return -1 }
+  const e = nodeAt(ix)
+  if e is Paren { return f32TreeBits(e.parInner, depth - 1) }
+  if e is NumLit {
+    if !isF32AdoptingLitExpr(ix) { return -1 }
+    return if numLexIsFloat(e.numText) { 1 } else { 0 }
+  }
+  if e is Unary {
+    if e.unOp != "-" { return -1 }
+    return f32TreeBits(e.unArg, depth - 1)
+  }
+  if e is BinExpr {
+    const op = e.binOp
+    if op != "+" && op != "-" && op != "*" && op != "/" && op != "%" {
+      return -1
+    }
+    const l = f32TreeBits(e.binLeft, depth - 1)
+    if l < 0 { return -1 }
+    const r = f32TreeBits(e.binRight, depth - 1)
+    if r < 0 { return -1 }
+    return l | r
+  }
+  if e is IfStmt || e is MatchExpr || e is Block {
+    const tails = valueTailLeaves(ix)
+    if tails.length == 0 { return -1 }
+    let k = 2
+    for t in tails {
+      const tk = f32TreeBits(t, depth - 1)
+      if tk < 0 { return -1 }
+      k = k | tk
+    }
+    return k
+  }
+  return f32TreeNone()
+}
+
+// Every other node, a name or a call among them, is no literal tree.
+function f32TreeNone(): i32 { return -1 }
 
 export function litTreeTyOf(ix: i32): i32 {
   if ix >= 0 && ix < litTreeTy.length { return litTreeTy[ix] }
@@ -513,11 +571,21 @@ export function numLitAdoptJoin(ix: i32, t: i32): i32 {
   if nodeAt(ix) is ArrayLit { return numLitAdoptBody(ix, t, 6) }
   const held = numLitJoinHeldLeaves(ix, t)
   for lf in valueTailLeaves(ix) {
-    if !i32ArrHas(held, lf) { numLitAdoptPart(lf, t, 6) }
+    if !i32ArrHas(held, lf) {
+      numLitAdoptPart(lf, t, 6)
+      joinTreeTailAdopt(lf, t)
+    }
   }
   numLitJoinSpineSync(ix, t)
   tailParensSync(ix)
   return 0
+}
+
+// A join tail that is a tree of literals computes at the join's type `t`, as a bare literal
+// tail is built there, so `if c { 0xFFFFFFFF % 7 } else { 3000000000 }` is 3 (ruling 4.3).
+function joinTreeTailAdopt(lf: i32, t: i32) {
+  if nodeTyOf(lf) == t { return 0 }
+  return litTreeAdoptDst(lf, t)
 }
 
 // The tails of the joins nested in `ix` that keep their own type: one of their tails is typed
