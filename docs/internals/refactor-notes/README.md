@@ -9,6 +9,15 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-slot-store-pin-table-design](2026-11-16-slot-store-pin-table-design.md): Slot store: the pin table mono reads, design note (lane SLOT, 2026-11-16)
+- [2026-11-16-ir-c2b-list-hoist-shared](2026-11-16-ir-c2b-list-hoist-shared.md): IR cutover C2b: the list-header hoist is a shared decision, 2026-11-16
+- [2026-11-16-width-same-elems-built-d16763](2026-11-16-width-same-elems-built-d16763.md): A same-elements result of a built list is judged as its receiver is (D16763), 2026-11-16
+- [2026-11-16-l2-s3-0-body-order](2026-11-16-l2-s3-0-body-order.md): L2 S3.0: one body-order stamp on every bound, 2026-11-16
+- [2026-11-16-ir-c2a-list-frame-shared](2026-11-16-ir-c2a-list-frame-shared.md): IR cutover C2a: the list frame is a shared decision, 2026-11-16
+- [2026-11-16-store-set-bind-sources-1](2026-11-16-store-set-bind-sources-1.md): One storage decider: set-binding sources, round 1, 2026-11-16
+- [2026-11-16-type-hashcons-s6b4-acyclic-type-caps](2026-11-16-type-hashcons-s6b4-acyclic-type-caps.md): Type hash-cons stage 6b, batch 4: fifteen type walkers that cannot meet a cycle (lane H), 2026-11-16
+- [2026-11-16-type-hashcons-s6b3-tree-walk-caps](2026-11-16-type-hashcons-s6b3-tree-walk-caps.md): Type hash-cons stage 6b, batch 3: nine AST walkers lose their depth caps (lane H), 2026-11-16
+- [2026-11-16-matrix-template-returns](2026-11-16-matrix-template-returns.md): Position-matrix templates: tail-expression bodies take `return`, 2026-11-16
 - [2026-11-16-width-param-return-d16401](2026-11-16-width-param-return-d16401.md): A declared return of a rewritten record parameter is the instance's record (D16401), 2026-11-16
 - [2026-11-16-width-fresh-nullable-drop-d16750](2026-11-16-width-fresh-nullable-drop-d16750.md): A literal binding's nested drop into nullable storage goes to the drop adoption (D16750), 2026-11-16
 - [2026-11-16-width-callback-field-built-list-d16210](2026-11-16-width-callback-field-built-list-d16210.md): A callback over a field read of a built list takes the list's build (D16210), 2026-11-16
