@@ -6,6 +6,7 @@ import {
   Call,
   FuncDecl,
   Ident,
+  LetDecl,
   OP_INDEX_SET,
   P,
   Param,
@@ -24,12 +25,13 @@ import {
   tyHasHole,
   tyToStrUser,
 } from "./check_types"
-import { fnDeclIx } from "./check_write_scan"
+import { cwDeclAssigned, cwIxParent, fnDeclIx } from "./check_write_scan"
 import { tyHasTyVar } from "./tyquery"
+import { identDeclOf } from "./symbols"
 import { peelParenIx } from "./check_write_effects"
 import { ufcsRecvExpr } from "./check_overload"
 import { nodeTyIxOf } from "./check_node_tys"
-import { curFnDeclIx, inferQuiet } from "./check_cursor"
+import { inferQuiet } from "./check_cursor"
 import { opIdxDecls, opIdxFns, opIdxOps, opSiteDecl } from "./check_callee"
 
 // The member calls of those rows the emitter cannot re-dispatch per instance: inside a closure
@@ -114,32 +116,71 @@ export function ufcsWhyRow(memIx: i32) {
   return -1
 }
 
-// Whether the emitter can re-dispatch member call `ix` per instance of `owner`: the call sits
-// in `owner`'s own body, not a closure's, and its receiver is one of `owner`'s parameters.
+// Whether the emitter can re-dispatch member call `ix` per instance of `owner`: its receiver is
+// one of `owner`'s parameters or a local that only ever holds one (`aliasedParamName`), read in
+// `owner`'s body or a closure in it, whose clone re-dispatches the same way.
 export function ufcsSitePinnable(ix: i32, owner: i32): boolean {
-  if owner < 0 || owner != curFnDeclIx || ix < 0 || ix >= P.nodes.length {
-    return false
-  }
+  if owner < 0 || ix < 0 || ix >= P.nodes.length { return false }
   const c = nodeAt(ix)
-  const fd = nodeAt(owner)
   if c is Call {
-    if fd is FuncDecl {
-      const rx = peelParenIx(ufcsRecvExpr(c))
-      if rx < 0 { return false }
-      const r = nodeAt(rx)
-      if r is Ident {
-        let i = 0
-        while i < fd.fnParams.length {
-          const pp = nodeAt(fd.fnParams[i])
-          if pp is Param {
-            if pp.parName == r.identName { return true }
-          }
-          i = i + 1
-        }
-      }
-    }
+    const rx = peelParenIx(ufcsRecvExpr(c))
+    if rx < 0 { return false }
+    return aliasedParamName(rx, owner) != ""
   }
   return false
+}
+
+// The parameter of function `fn` that the name read `ix` holds, or "": the parameter itself, or a
+// local whose initializer is such a read and which no `=` writes, through any chain of them.
+export function aliasedParamName(ix: i32, fn: i32): string {
+  if fn < 0 || fn >= P.nodes.length { return "" }
+  const fd = nodeAt(fn)
+  if !(fd is FuncDecl) { return "" }
+  const d = aliasRootParamDecl(ix)
+  for p in fd.fnParams {
+    const pp = nodeAt(p)
+    if pp is Param && p == d { return pp.parName }
+  }
+  return ""
+}
+
+// The name of the parameter the name read `ix` holds (`aliasedParamName` of whichever function
+// declares it), or "".
+export function aliasRootParam(ix: i32): string {
+  const d = aliasRootParamDecl(ix)
+  if d < 0 { return "" }
+  const pp = nodeAt(d)
+  if pp is Param { return pp.parName }
+  return ""
+}
+
+// The function declaring the parameter the name read `ix` holds (`aliasRootParam`), or -1: the
+// owner a read inside one of its closures re-dispatches under.
+export function aliasRootParamOwner(ix: i32): i32 {
+  const d = aliasRootParamDecl(ix)
+  if d < 0 || d >= cwIxParent.length { return -1 }
+  const fd = cwIxParent[d]
+  if fd < 0 || fd >= P.nodes.length || !(nodeAt(fd) is FuncDecl) { return -1 }
+  return fd
+}
+
+// The `Param` declaration the name read `ix` holds, through unwritten locals, or -1.
+function aliasRootParamDecl(ix: i32): i32 {
+  const seen: i32[] = []
+  let at = ix
+  while at >= 0 && at < P.nodes.length {
+    const r = nodeAt(peelParenIx(at))
+    if !(r is Ident) { return -1 }
+    const d = identDeclOf(peelParenIx(at))
+    if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return -1 }
+    seen.push(d)
+    const ld = nodeAt(d)
+    if ld is Param { return d }
+    if !(ld is LetDecl) || ld.letInit < 0 { return -1 }
+    if ld.letKw != "const" && cwDeclAssigned(d) { return -1 }
+    at = ld.letInit
+  }
+  return -1
 }
 
 // The tail of the parameter list an index operator wants, for the arity error.

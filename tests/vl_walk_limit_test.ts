@@ -1,10 +1,11 @@
 // `walk-limit` names a walk counter compared with a fixed bound in a compiler module, so the
 // residue can be ratcheted down per file (`scripts/walk-limit-budget-baseline.json`). It fires on
-// a literal bound of 3 to 1000, a constant bound, a depth countdown's `<= 0`, `< 0` or `< 1`, a
-// camel-case `…Depth` counter at a real bound and a walk list's length. A camel-case counter's
-// `<= 0` (a nesting test), a mode flag (a bound over 1000), a bound arithmetic continues, a
-// `while` whose counter the function sets to the bound (a sentinel exit), a name that is no
-// counter, a comment, a string and any file outside `compiler/` are silent.
+// a literal bound of 3 to 1000, a constant bound, a depth countdown's `<= 0`, `< 0` or `< 1` on a
+// parameter of the enclosing function, a camel-case `…Depth` counter at a real bound and a walk
+// list's length. A camel-case counter's `<= 0` (a nesting test), a local holding a computed depth
+// at its floor, a mode flag (a bound over 1000), a bound arithmetic continues, a `while` whose
+// counter the function sets to the bound (a sentinel exit), a name that is no counter, a comment,
+// a string and any file outside `compiler/` are silent.
 //
 // Needs only the seed: it lints through `wasmChecker.lint` with the path staged.
 
@@ -50,7 +51,12 @@ function d(x: i32): i32 {
   if walkDepth <= 0 { return 1 }
   return x + guard
 }
-print(a(0, 1) + b([], 0) + c(3) + d(1))
+function e(r: i32): i32 {
+  const depth = r * 2
+  if depth < 1 { return 0 }
+  return depth
+}
+print(a(0, 1) + b([], 0) + c(3) + d(1) + e(2))
 `;
 
 /** 1-based lines carrying the code, for `src` linted at `path`. */
@@ -66,7 +72,7 @@ const SEED = exists(COMPILER);
 
 Deno.test({
   name:
-    "walk-limit: fires on literal, constant, countdown, camel-case and walk-length limits, not on a mode flag, an arithmetic bound, a sentinel exit or a non-counter",
+    "walk-limit: fires on literal, constant, countdown, camel-case and walk-length limits, not on a mode flag, an arithmetic bound, a sentinel exit, a computed local depth or a non-counter",
   ignore: !SEED,
   fn: () => {
     const got = linesAt("compiler/x.vl");

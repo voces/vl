@@ -9,6 +9,17 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-ir-i8b-box](2026-11-16-ir-i8b-box.md): IR I8b+N1 part 1: boxed nullables, the box through legacy's writer, 2026-11-16
+- [2026-11-16-ir-i8b2-sink](2026-11-16-ir-i8b2-sink.md): IR I8b part 2: the union return sink, shared, 2026-11-16
+- [2026-11-16-l2-alias-receiver](2026-11-16-l2-alias-receiver.md): L2: a local alias of a parameter is dispatched per instance, 2026-11-16
+- [2026-11-16-l2-s3-6-one-walk](2026-11-16-l2-s3-6-one-walk.md): L2 S3.6a: two walks at the call, 2026-11-16
+- [2026-11-16-l2-s3-6-subst-ctx](2026-11-16-l2-s3-6-subst-ctx.md): L2 S3.6b: the substitution modes are one scoped context, 2026-11-16
+- [2026-11-16-rep-adt-stage4b-heapkey](2026-11-16-rep-adt-stage4b-heapkey.md): Rep ADT 4b, part 2: the struct heap key as one bucketed pass, 2026-11-16 (lane REP)
+- [2026-11-16-same-variant-and-rep-of-ty-memos](2026-11-16-same-variant-and-rep-of-ty-memos.md): Two memos for self-compile headroom, 2026-11-16 (lane REP)
+- [2026-11-16-slot-store-d2](2026-11-16-slot-store-d2.md): Slot store part D2: the walk's last readers move to the place classes (lane SLOT, 2026-11-16)
+- [2026-11-16-store-n2-hand-back](2026-11-16-store-n2-hand-back.md): Producer slice N2: a set a hand-back call hands to a `const` is decided at check, 2026-11-16
+- [2026-11-16-type-hashcons-s6b24-tyquery-walks](2026-11-16-type-hashcons-s6b24-tyquery-walks.md): Type hash-cons stage 6b: two `tyquery.vl` walks take a visited set (lane HASH), 2026-11-16
+- [2026-11-16-walk-limit-coverage](2026-11-16-walk-limit-coverage.md): walk-limit coverage: `depth < 0`, camel-case counters, and a test (lane WIDTH), 2026-11-16
 - [2026-11-16-ir-i8-coercion-ops](2026-11-16-ir-i8-coercion-ops.md): IR I8 design: coercions as ops, the seats retired from the IR's side, 2026-11-16
 - [2026-11-16-ir-i8a2-operands](2026-11-16-ir-i8a2-operands.md): IR I8a part 2: mixed-width operator operands (coverage step), 2026-11-16
 - [2026-11-16-l2-c-tvw-param-hole](2026-11-16-l2-c-tvw-param-hole.md): L2 (c) PR 1: the write narrowing admits a parameter hole, 2026-11-16

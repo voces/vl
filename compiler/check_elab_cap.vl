@@ -1150,6 +1150,16 @@ export function elabFnValWanted(t: i32): boolean {
 // members too, so a call through it dispatches on every function written (D15929, D15806).
 // `held` where no field's set grows.
 export function elabFnRecJoin(held: i32, stored: i32): i32 {
+  return elabFnRecJoinIn(held, stored, false)
+}
+
+// `elabFnRecJoin` through nested records too, for a map's `set`, whose literals the join regrows
+// (`elabSlotLitsRegrow`, D16829).
+export function elabFnRecJoinDeep(held: i32, stored: i32): i32 {
+  return elabFnRecJoinIn(held, stored, true)
+}
+
+function elabFnRecJoinIn(held: i32, stored: i32, deep: boolean): i32 {
   const h = if held >= 0 && held < T.tys.length { tyAt(held) } else { null }
   const w = if stored >= 0 && stored < T.tys.length { tyAt(stored) } else { null }
   if !(h is TyObj) || !(w is TyObj) { return held }
@@ -1162,6 +1172,14 @@ export function elabFnRecJoin(held: i32, stored: i32): i32 {
     const hf = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
     const sa = elabFnSetTy[ft] ?? -1
     const sb = if j >= 0 { elabFnSetTy[w.objFieldTypes[j]] ?? -1 } else { -1 }
+    // A nested record's function fields join as the record's own do (D16829).
+    if deep && hf is TyObj && j >= 0 {
+      const nj = elabFnRecJoinIn(ft, w.objFieldTypes[j], true)
+      if nj != ft {
+        ft = nj
+        changed = true
+      }
+    }
     if hf is TyFunc && sa >= 0 && sb >= 0 && sa != sb {
       const u = fnSetIntern(fnSetUnion(sa, sb))
       if u != sa {
@@ -1908,15 +1926,41 @@ function fnSetAllNamedGenerics(s: i32): boolean {
 }
 
 // Grows record literal `v`, written into a map slot of joined record `slot`, to that record: each
-// function field whose set the slot's widens takes the slot's, a parameter read excepted (D15455).
+// function field whose set the slot's widens takes the slot's, a parameter read excepted (D15455),
+// and each nested record literal its nested record (D16829).
 export function elabSlotRecLitGrow(v: i32, slot: i32) {
+  elabRecLitGrowAt(v, slot)
+  return 0
+}
+
+// Grows every record literal written into the slots of the map binding receiver `recv` names to
+// joined record `slot`: a later store's join reaches the literals stored before it (D16829).
+export function elabSlotLitsRegrow(recv: i32, slot: i32) {
+  const r = parenPeelIx(recv)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return 0 }
+  const bd = identDeclOf(r)
+  if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return 0 }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(bd), ["[]"], vals, ats) < 0 { return 0 }
+  for v in vals { elabRecLitGrowAt(v, slot) }
+  return 0
+}
+
+// Pairs of a record literal a map's `set` join regrows and the joined record type it takes:
+// the type denotes the row the literal is built at (D16829).
+let elabRegrowPairs: i32[] = []
+export function elabRegrownPairs(): i32[] { return elabRegrowPairs }
+
+// `elabSlotRecLitGrow`; whether the literal grew.
+function elabRecLitGrowAt(v: i32, slot: i32): boolean {
   const lx = parenPeelIx(v)
   if lx < 0 || lx >= P.nodes.length || slot < 0 || slot >= T.tys.length {
-    return 0
+    return false
   }
   const ln = nodeAt(lx)
   const so = tyAt(slot)
-  if !(ln is ObjLit) || !(so is TyObj) { return 0 }
+  if !(ln is ObjLit) || !(so is TyObj) { return false }
   let grew = false
   for fx in ln.objFields {
     const f = nodeAt(fx)
@@ -1933,9 +1977,22 @@ export function elabSlotRecLitGrow(v: i32, slot: i32) {
       nodeTySetGrow(fv, st)
       grew = true
     }
+    const so2 = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
+    if (
+      fv >= 0
+      && nodeAt(fv) is ObjLit
+      && so2 is TyObj
+      && elabRecLitGrowAt(fv, st)
+    ) {
+      grew = true
+    }
   }
-  if grew { nodeTySetGrow(lx, slot) }
-  return 0
+  if grew {
+    nodeTySetGrow(lx, slot)
+    elabRegrowPairs.push(lx)
+    elabRegrowPairs.push(slot)
+  }
+  return grew
 }
 
 // Record `t` pinned into map binding `bd`'s slots, each function field's set joined with every
@@ -3601,6 +3658,7 @@ export function fnTyFactsReset() {
   fnTagCallMsg = Map()
   fnTagCallMsgAt = Map()
   fnJoinMemo = Map()
+  elabRegrowPairs = []
   fnLetReadTy = Map()
   fnRetLeaves = Map()
   fnLetWide = []
@@ -3771,12 +3829,10 @@ export function fnParamHandNote(
   if decl < 0 || i < 0 { return 0 }
   const key = i32ToStr(decl) + "|" + i32ToStr(i)
   const have = fnParamHands[key] ?? []
-  const hs = elabHeldSetOrOwn(argTy)
   const kept = fnHandedSets[decl] ?? []
-  if hs >= 0 && !i32ListHas(kept, hs) {
-    kept.push(hs)
-    fnHandedSets[decl] = kept
-  }
+  const seen: i32[] = []
+  elabHeldSetsInto(argTy, kept, seen)
+  fnHandedSets[decl] = kept
   have.push(fnTagSetOfTy(argTy))
   fnParamHands[key] = have
   const fr = fnParamHandFroms[key] ?? []
@@ -3799,17 +3855,21 @@ export function fnSetsHandedToParams(decl: i32): i32[] {
   return fnHandedSets.get(decl) ?? none
 }
 
-// The set `t` carries, itself or as the elements of a list at any depth; -1 for none.
-function elabHeldSetOrOwn(t: i32): i32 {
-  let e = t
-  let depth = 0
-  while e >= 0 && e < T.tys.length && depth < 16 {
-    const a = tyAt(e)
-    if !(a is TyArray) { return fnTagSetOfTy(e) }
-    e = tyElemOf(a)
-    depth = depth + 1
+// Adds to `out` each set `t` carries, itself, as a list's elements or in a record's field, at any
+// depth (D16878); `seen` holds the types already walked.
+function elabHeldSetsInto(t: i32, out: i32[], seen: i32[]) {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
+  const a = tyAt(t)
+  if a is TyArray {
+    elabHeldSetsInto(tyElemOf(a), out, seen)
+  } else if a is TyObj {
+    for f in a.objFieldTypes { elabHeldSetsInto(f, out, seen) }
+  } else {
+    const s = fnTagSetOfTy(t)
+    if s >= 0 && !i32ListHas(out, s) { out.push(s) }
   }
-  return -1
+  return 0
 }
 
 // Beside `fnParamHandSets`, the argument each call hands.
@@ -4364,6 +4424,10 @@ function fnTagHeldInner(v: i32, r: i32, depth: i32) {
 // The rep of type `t` once the sets now tagged hold ids: each tagged function leaf an `i32`.
 export function fnTagRepTyOf(t: i32): i32 { return fnTagRepTyOfIn(t, false) }
 
+// `fnTagRepTyOf` of a map's value `t`: a record's tagged function field is its `i32` id at any
+// depth, as the map's own storage holds it.
+export function fnTagRepTyDeepOf(t: i32): i32 { return fnTagRepTyOfIn(t, true) }
+
 // Type `t` with every list whose element is a tagged set an `i32` list, through lists, records,
 // nullables and map values; `t` itself where nothing is rewritten. With `deep`, `t` is inside a
 // list's element list, where a record's tagged function field is its `i32` id, since no literal of
@@ -4693,6 +4757,7 @@ export function elabCapReset() {
   fnValGenerics = []
   fnSetByKey = Map()
   fnJoinMemo = Map()
+  elabRegrowPairs = []
   fnLetReadTy = Map()
   fnRetLeaves = Map()
   fnLetSet = Map()
