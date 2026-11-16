@@ -3849,10 +3849,23 @@ function monoCloneLambdaSubst(
     // Recursing here rather than teaching that walk a `FuncDecl` arm keeps the two facts a
     // clone owns together: the body substitution above and the frame its clones hang off.
     const mark = monoLamMintedSlots.length
+    const svPinN = monoLamPinN
+    const svPinT = monoLamPinT
+    const dN: string[] = []
+    const dT: i32[] = []
+    monoLamPinDropOwn(a, svPinN, svPinT, dN, dT)
+    monoLamPinN = dN
+    monoLamPinT = dT
     const nbodyL = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
+    monoLamPinN = svPinN
+    monoLamPinT = svPinT
     // A generic call in the body is instantiated by rewriting its callee in place, so each
     // clone takes its own copy, as an instance body does (D2553).
-    const nbody = monoLamCloneGenericCalls(nbodyL, typarams)
+    const nbody = monoLamPinBody(
+      monoLamCloneGenericCalls(nbodyL, typarams),
+      dN,
+      dT,
+    )
     // The lambda twin of the named clone's rule: a bare `return` in the body is void, so the
     // return-expression pin above must not give this instance a result (D1600).
     let cloneRet = nret
@@ -4051,6 +4064,42 @@ function monoLamElabRet(fnIx: i32): i32 {
 }
 // Whether `monoLamElabRet`'s last answer closed a result the instance's own signature kept open.
 let monoLamRetFromKids = false
+
+// `names`/`tys` without the parameters lambda `a` binds, into `outN`/`outT`.
+function monoLamPinDropOwn(
+  a: FuncDecl,
+  names: string[],
+  tys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let i = 0
+  while i < names.length {
+    let own = false
+    for p in a.fnParams {
+      const pp = nodeAt(p)
+      if pp is Param && pp.parName == names[i] { own = true }
+    }
+    if !own {
+      outN.push(names[i])
+      outT.push(if i < tys.length { tys[i] } else { -1 })
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// A lambda clone's body with its member calls on a captured parameter `names` (pinned `tys`)
+// re-dispatched for the instance being pinned, as the instance's own body is; `body` when no
+// instance is being pinned.
+function monoLamPinBody(body: i32, names: string[], tys: i32[]): i32 {
+  if monoLamPinCtx < 0 || names.length == 0 { return body }
+  const ctxWas = monoPinCtx
+  monoPinCtx = monoLamPinCtx
+  const r = monoPinBinOps(body, names, tys)
+  monoPinCtx = ctxWas
+  return r
+}
 
 // `monoCloneLambdaSubst`'s last step: lifts `clone`, the instance of the lambda template `a`
 // at `fnIx`, into its own `fnStmts` slot and re-parents the lambdas minted since `mark`.
@@ -4591,6 +4640,12 @@ let monoPinRetBox = false
 
 // The hole binding of the instance whose body `monoPinBodyLambdas` walks; empty outside it.
 let monoPinHoleN: string[] = []
+// While an instance's body is pinned, its parameter names, their pins and its template: a lambda
+// clone re-dispatches its body's member calls on a captured parameter under them (`monoPinBinOps`),
+// less the parameters it binds itself.
+let monoLamPinN: string[] = []
+let monoLamPinT: i32[] = []
+let monoLamPinCtx = -1
 let monoPinHoleT: i32[] = []
 
 // Records in `monoPinUnsafeNames` every name read under `ix` outside a sink.
@@ -10295,6 +10350,14 @@ function monoMakeInstanceGo(
     // An instanced relay's instance builds its maker calls at the closed result its call
     // delivers it at (D16780).
     monoBuild.twinRet = if retWiden { req.retWidenTy } else { elabRelayResultAt(monoOrigNode[origFe], tplCall) }
+    const lamPinN: string[] = []
+    for pp0 in params {
+      const pp = nodeAt(pp0)
+      lamPinN.push(if pp is Param { pp.parName } else { "" })
+    }
+    monoLamPinN = lamPinN
+    monoLamPinT = pinnedTyIx
+    monoLamPinCtx = monoOrigNode[origFe]
     const instBody0L = monoMakeInstanceBodyPinned(
       fn,
       origFe,
@@ -10308,6 +10371,9 @@ function monoMakeInstanceGo(
       holeN,
       holeT,
     )
+    monoLamPinN = []
+    monoLamPinT = []
+    monoLamPinCtx = -1
     monoBuild.twinRet = -1
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
