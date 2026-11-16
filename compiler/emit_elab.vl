@@ -15882,6 +15882,84 @@ export function elabLamDeliveredParams(lam: i32, n: i32): i32[] {
   return if count == 1 { hit } else { none }
 }
 
+// The result of the closed function type lambda `lam`, with `n` parameters, is called at, found as
+// `elabLamParamTy` finds its parameters, an open one skipped: -1 for none, or for two signatures
+// that differ in any parameter or the result. With `own` a closed function type, only calls at its
+// parameter types count: an instance's own calls, not its siblings'.
+function elabLamDeliveredRet(lam: i32, n: i32, own: i32): i32 {
+  if lam < 0 || lam >= cwIxCoveredLen() { return -1 }
+  const was = elabDlvKey
+  const wasAdmit = elabDlvAdmit
+  elabDlvKey = elabWalkTop()
+  elabDlvAdmit = elabReachClosure(elabDlvKey)
+  elabCallRec = true
+  elabCallsSeen = []
+  const reached: i32[] = []
+  const seen: i32[] = []
+  elabSlotClimb(lam, [], reached, seen)
+  elabCallRec = false
+  const calls = elabCallsSeen
+  const out: i32[] = []
+  for c in calls { elabCallDeliveryAdd(c, out) }
+  elabDlvKey = was
+  elabDlvAdmit = wasAdmit
+  const of = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  let r = -1
+  let first = -1
+  for t in out {
+    const f = tyAt(t)
+    if (
+      f is TyFunc
+      && f.fnParamTypes.length == n
+      && (!(of is TyFunc) || elabSameParams(f, of))
+    ) {
+      const q = f.fnRet
+      if q >= 0 && q < T.tys.length && !tyHasTyVar(q) {
+        if first >= 0 && !tySameSealed(first, t) { return -1 }
+        first = t
+        r = q
+      }
+    }
+  }
+  return r
+}
+
+// The numeric result lambda `lam` is called at (`elabLamDeliveredRet`, `own` as there), where its
+// body's closed result `body` is another numeric type: its instance returns the type it is called
+// at, as a lambda delivered there directly does (D16711); -1 otherwise.
+export function elabLamDeliveredNumRet(lam: i32, body: i32, own: i32): i32 {
+  if !elabIsNumPrim(body) || lam < 0 || lam >= P.nodes.length { return -1 }
+  const a = nodeAt(lam)
+  if !(a is FuncDecl) { return -1 }
+  const dr = elabLamDeliveredRet(lam, a.fnParams.length, own)
+  if dr < 0 || !elabIsNumPrim(dr) || tySameSealed(dr, body) { return -1 }
+  return dr
+}
+
+// Whether `t` is one of the four numeric primitives.
+function elabIsNumPrim(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const p = tyAt(t)
+  if p is TyPrim {
+    return p.primName == "i32"
+      || p.primName == "i64"
+      || p.primName == "f32"
+      || p.primName == "f64"
+  }
+  return false
+}
+
+// Whether function types `a` and `b` take the same parameter types.
+function elabSameParams(a: TyFunc, b: TyFunc): boolean {
+  if a.fnParamTypes.length != b.fnParamTypes.length { return false }
+  let i = 0
+  while i < a.fnParamTypes.length {
+    if !tySameSealed(a.fnParamTypes[i], b.fnParamTypes[i]) { return false }
+    i = i + 1
+  }
+  return true
+}
+
 // The one call the value bound at `d` (a binding, parameter or literal) reaches as its callee,
 // following it forward through arguments, aliases, joins, returns and slots; -1 for none, for two,
 // and for a value the write index does not cover.
