@@ -56,4 +56,23 @@ facts and is refuted the same way. Deciding pins before mono is slot-store desig
 
 ## B′-2: renames, rewrites and replaced calls
 
-B2COUNT
+Counted only, no snapshot, as input to stage 3. The probe narrowed to what the readers depend on: a
+call's callee and arguments, a member's, index's or paren's children, and every other node by kind
+only; name resolution in the three readers that call `identDeclOf` raw (`eplSlotCallRecs`,
+`eplHolderCallMember`, `eplArgHoldsCallFn`) checked against the freeze; type and bound checks off.
+Control: every snapshot entry corrupted fires (`eplSlotPlace read node 13`).
+
+| population | firings |
+| --- | --- |
+| `tests/cases`, 8,137 programs | 3 |
+| distilled cells, 260,818 | 0 |
+| capability probes, 263 | 0 |
+| matrix templates, 154 | 1 cell, `set-closure-split-results` `return_inferred/ann` |
+
+Every survivor is a node mono's flow rewrite replaced: a member read (`M35.f -> I`,
+`generics/fn-value-generic-container-read-listed-or-stored`), an index read (`X46[47 -> I`,
+`closures/generic-list-literal-of-generic-read-out-of-list-to-generic`; `X18[19 -> I` in the matrix
+cell) and a call (`closures/generic-list-sliced-called-at-two-types`). The 12 renames, the 3
+capture-box names and the raw `identDeclOf` reads fire nowhere once narrowed: renames keep the
+node's kind, and the declarations the readers resolve do not move.
+
