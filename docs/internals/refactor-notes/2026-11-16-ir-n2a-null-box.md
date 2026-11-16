@@ -42,4 +42,5 @@ The self-compile has no `rep null` sole blocker, so its coverage does not move.
 | corpus identity against the I8b part 2 seed, 12,223 cells | 8,944 identical, 3,279 fail under both, 0 differ |
 | mode 3 with `list` admitted (throwaway build) | self-compile byte-identical, the same 2 fallbacks as I8b (`cwRetBlockValues`, `lpJoinArm`); corpus 8,944 identical, 0 differ, 0 fell back |
 | shadow and verifier | corpus 22,529 covered, verified and matched; self-test case 11 fails rule 2, and reads rule 0 with the rule removed |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 97,526,068,491 to 97,539,057,629 (+0.013%) |
 | seed size, part 2 seed to this one | 6,528,447 to 6,529,046 (+599) |
