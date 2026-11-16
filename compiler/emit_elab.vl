@@ -7,6 +7,7 @@ import { primTyOfName, unboundDefaultTy } from "./check_decl_scan"
 import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
 import { i32ListEq } from "./listutil"
+import { loopValTailOf } from "./check_null_holes"
 import { recFieldTyOf } from "./emit_rec_field_codes"
 import {
   monoAnnHasTyParam,
@@ -21929,13 +21930,75 @@ function eplEdges() {
     eplTyParamShare(u)
     u = u + 1
   }
-  // A value a lowered loop or labelled block hands out flows to where the loop's value goes.
   EPL.k = -1
-  for v in lvExitLoops.keys() {
-    const lp = lvExitLoops[v] ?? -1
-    if v < cwIxCoveredLen() && lp >= 0 && lp < cwIxCoveredLen() {
-      eplEdge(eplPlaceOf(v, 0), eplPlaceOf(lp, 0), v)
+  return 0
+}
+
+// The label of loop `ix`, or null for a node that is no loop.
+function eplLoopLabel(ix: i32): string | null {
+  const n = nodeAt(ix)
+  if n is WhileStmt { return n.whileLabel }
+  if n is ForRange { return n.frLabel }
+  if n is ForIn { return n.fiLabel }
+  return null
+}
+
+// Pushes onto `out` each value a `break` under `ix` hands to the loop labelled `label`, `depth`
+// loops inside it; a nested loop of the same label shadows it, and a function body is its own.
+function eplLoopExitsIn(ix: i32, label: string, depth: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length || depth > 32 { return 0 }
+  const n = nodeAt(ix)
+  if n is Block {
+    let j = 1
+    while j < n.blkStmts.length {
+      const st = n.blkStmts[j]
+      const b = if st >= 0 && st < P.nodes.length { nodeAt(st) } else { null }
+      if (
+        b is BreakStmt
+        && b.brkHasVal == 1
+        && (b.brkLabel == "" && depth == 0 || b.brkLabel != "" && b.brkLabel == label)
+      ) {
+        out.push(n.blkStmts[j - 1])
+      }
+      j = j + 1
     }
+  }
+  for c in nodeChildren(ix) {
+    const cl = if c >= 0 && c < P.nodes.length { eplLoopLabel(c) } else { null }
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if cl != null {
+      if cl == "" || cl != label { eplLoopExitsIn(c, label, depth + 1, out) }
+    } else if !(cn is FuncDecl) {
+      eplLoopExitsIn(c, label, depth, out)
+    }
+  }
+  return 0
+}
+
+// A value a loop or labelled block hands out, by `break v` or a block's tail, flows to where the
+// loop's own value goes. Read from the checked tree, before any rewrite lowers the loop.
+function eplLoopExits() {
+  let x = 0
+  while x < cwIxCoveredLen() && x < P.nodes.length {
+    const label = eplLoopLabel(x)
+    if label != null && cwIxUpKind[x] != CW_UP_NONE {
+      const vals: i32[] = []
+      const n = nodeAt(x)
+      const body = if n is WhileStmt { n.whileBody } else if n is ForRange { n.frBody } else if n is ForIn { n.fiBody } else { -1 }
+      eplLoopExitsIn(body, label, 0, vals)
+      if n is WhileStmt && n.whileBlk == 1 && loopValTailOf(x) >= 0 { vals.push(loopValTailOf(x)) }
+      const fr = eplFrameOf(recEnclosingFn(x))
+      const ks = if eplInstanced(fr) { EPL.insts.get(fr) ?? [] } else { [] }
+      const kk: i32[] = if ks.length > 0 { ks } else { [-1] }
+      for k in kk {
+        EPL.k = k
+        for v0 in vals {
+          const v = parenPeelIx(v0)
+          if v >= 0 && v < cwIxCoveredLen() { eplEdge(eplPlaceOf(v, 0), eplPlaceOf(x, 0), v) }
+        }
+      }
+    }
+    x = x + 1
   }
   EPL.k = -1
   return 0
@@ -22493,6 +22556,7 @@ function eplBuild() {
   EPL.limit = limit
   eplInstsFile()
   eplEdges()
+  eplLoopExits()
   eplCallResults()
 }
 
