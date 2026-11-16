@@ -791,9 +791,14 @@ function tyMayHoldFnIn(ty: i32, seen: i32[]): boolean {
 // True when the type at `ti` carries a bare-`null` hole in a struct-field or array-element position
 // (`{f: null}`, `{f: {f: null}}`, `null[]` inside a field): such a render is a literal's own
 // structural inference, never a spellable annotation, so no registered shape row can match it and a
-// name-keyed consumer mis-keys. Walks `TyObj`/`TyArray` only; depth-capped against recursive types.
-export function tyHasNullHole(ti: i32, depth: i32): boolean {
-  if ti < 0 || depth <= 0 { return false }
+// name-keyed consumer mis-keys. Walks `TyObj`/`TyArray` only, each type once.
+export function tyHasNullHole(ti: i32): boolean {
+  const seen: i32[] = []
+  return tyHasNullHoleIn(ti, seen)
+}
+
+function tyHasNullHoleIn(ti: i32, seen: i32[]): boolean {
+  if ti < 0 || !tyWalkEnter(ti, seen) { return false }
   const t = tyAt(ti)
   return match t {
     TyPrim => t.primName == "null"
@@ -801,12 +806,12 @@ export function tyHasNullHole(ti: i32, depth: i32): boolean {
       const fts = t.objFieldTypes
       let i = 0
       while i < fts.length {
-        if tyHasNullHole(fts[i], depth - 1) { return true }
+        if tyHasNullHoleIn(fts[i], seen) { return true }
         i = i + 1
       }
       false
     }
-    TyArray => tyHasNullHole(tyElemOf(t), depth - 1)
+    TyArray => tyHasNullHoleIn(tyElemOf(t), seen)
     // Not walked: a `null` under one of these is spellable, or not a literal's own inference.
     TyFunc | TyUnion | TyNullable | TyMap | TyNeg | TyVar | TyLit | TyErr => false
   }
@@ -1213,17 +1218,28 @@ function tyToStrMap(t: TyMap, nominal: boolean): string {
 // one would. -1 when the render is no annotation: an error, a cycle, a map keyed by no name.
 export function tyToTs(ix: i32): i32 {
   tyTsBudget = 4096
-  return tyTsGo(ix, 0)
+  return tyTsGo(ix)
 }
+
+// The types `tyTsGo` is spelling, outermost first: one met again is a cycle, which has no tree.
+const tyTsPath: i32[] = []
 
 // The nodes `tyToTs` may still build, so a shared subtree cannot blow the render up.
 let tyTsBudget = 4096
 
-function tyTsGo(ix: i32, depth: i32): i32 {
+function tyTsGo(ix: i32): i32 {
   if ix < 0 { return tsLeaf(TS_NAME, "_") }
-  if depth > 64 || tyTsBudget <= 0 { return -1 }
+  if tyTsBudget <= 0 || i32ListHas(tyTsPath, ix) { return -1 }
   tyTsBudget = tyTsBudget - 1
-  const nn = tyTsNameOf(ix, depth)
+  tyTsPath.push(ix)
+  const r = tyTsBody(ix)
+  tyTsPath.pop()
+  return r
+}
+
+function tyTsBody(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const nn = tyTsNameOf(ix)
   if nn != -2 { return nn }
   const t = tyAt(ix)
   match t {
@@ -1235,16 +1251,16 @@ function tyTsGo(ix: i32, depth: i32): i32 {
       return -1
     }
     TyObj => {
-      return tyTsObj(t, depth)
+      return tyTsObj(t)
     }
     TyFunc => {
       const kids: i32[] = []
       for p in t.fnParamTypes {
-        const pk = tyTsGo(p, depth + 1)
+        const pk = tyTsGo(p)
         if pk < 0 { return -1 }
         kids.push(pk)
       }
-      const r = tyTsGroupFn(t.fnRet, tyTsGo(t.fnRet, depth + 1))
+      const r = tyTsGroupFn(t.fnRet, tyTsGo(t.fnRet))
       if r < 0 { return -1 }
       kids.push(r)
       return tsMkKids(TS_FUNC, "", kids)
@@ -1252,7 +1268,7 @@ function tyTsGo(ix: i32, depth: i32): i32 {
     TyUnion => {
       const kids: i32[] = []
       for m in t.uMembers {
-        const mk = tyTsGroupFn(m, tyTsGo(m, depth + 1))
+        const mk = tyTsGroupFn(m, tyTsGo(m))
         if mk < 0 { return -1 }
         tyTsJoin(kids, mk)
       }
@@ -1261,21 +1277,21 @@ function tyTsGo(ix: i32, depth: i32): i32 {
     }
     TyNullable => {
       const kids: i32[] = []
-      const ik = tyTsGroupFn(t.nInner, tyTsGo(t.nInner, depth + 1))
+      const ik = tyTsGroupFn(t.nInner, tyTsGo(t.nInner))
       if ik < 0 { return -1 }
       tyTsJoin(kids, ik)
       kids.push(tsLeaf(TS_NULL, "null"))
       return tsMkKids(TS_UNION, "", kids)
     }
     TyArray => {
-      return tyTsArray(t, depth)
+      return tyTsArray(t)
     }
     TyMap => {
-      const k = tyTsGo(tyKeyOf(t), depth + 1)
+      const k = tyTsGo(tyKeyOf(t))
       if k < 0 { return -1 }
       if t.mSet == 1 { return tsMkKids(TS_APP, "Set", [k]) }
       if tsKind[k] != TS_NAME { return -1 }
-      const v = tyTsGo(tyValOf(t), depth + 1)
+      const v = tyTsGo(tyValOf(t))
       if v < 0 { return -1 }
       return tsMkKids(TS_MAP, tsText[k], [v])
     }
@@ -1290,7 +1306,7 @@ function tyTsGo(ix: i32, depth: i32): i32 {
       return tsLeaf(TS_LITNUM, t.litText)
     }
     TyNeg => {
-      const n = tyTsGo(t.negTy, depth + 1)
+      const n = tyTsGo(t.negTy)
       if n < 0 { return -1 }
       return tsMkKids(TS_NEG, "", [n])
     }
@@ -1299,7 +1315,7 @@ function tyTsGo(ix: i32, depth: i32): i32 {
 
 // `tyToStrNameOf`'s tree: a name leaf, or a generic application over its arguments' trees; -2
 // when `ix` renders structurally, -1 when an argument has no tree.
-function tyTsNameOf(ix: i32, depth: i32): i32 {
+function tyTsNameOf(ix: i32): i32 {
   const nwn = nomNameOfTy(ix)
   if nwn != "" { return tsLeaf(TS_NAME, nwn) }
   const sdn = structNameOfTy(ix)
@@ -1310,7 +1326,7 @@ function tyTsNameOf(ix: i32, depth: i32): i32 {
     const kids: i32[] = []
     let a = 0
     while a < gaAppArgCount[row] {
-      const k = tyTsGo(gaAppArgFlat[gaAppArgStart[row] + a], depth + 1)
+      const k = tyTsGo(gaAppArgFlat[gaAppArgStart[row] + a])
       if k < 0 { return -1 }
       kids.push(k)
       a = a + 1
@@ -1323,13 +1339,13 @@ function tyTsNameOf(ix: i32, depth: i32): i32 {
 }
 
 // `tyToStrObj`'s tree: one field node per field; -1 when a field has no tree.
-function tyTsObj(t: TyObj, depth: i32): i32 {
+function tyTsObj(t: TyObj): i32 {
   const names = t.objFieldNames
   const ftys = t.objFieldTypes
   const kids: i32[] = []
   let i = 0
   while i < names.length {
-    const f = tyTsGo(ftys[i], depth + 1)
+    const f = tyTsGo(ftys[i])
     if f < 0 { return -1 }
     kids.push(tsMkKids(TS_FIELD, names[i], [f]))
     i = i + 1
@@ -1338,8 +1354,8 @@ function tyTsObj(t: TyObj, depth: i32): i32 {
 }
 
 // `tyToStrArray`'s tree: a function, union or view element grouped, a view marked `readonly`.
-function tyTsArray(t: TyArray, depth: i32): i32 {
-  let el = tyTsGo(tyElemOf(t), depth + 1)
+function tyTsArray(t: TyArray): i32 {
+  let el = tyTsGo(tyElemOf(t))
   if el < 0 { return -1 }
   if (
     tyIxIsFunc(tyElemOf(t))
@@ -3159,20 +3175,25 @@ function tyHoldsObjDeepIn(ty: i32, seen: i32[]): boolean {
 }
 
 // Does `ty` hold a list anywhere a store could reach one?
-export function tyContainsList(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+export function tyContainsList(ty: i32): boolean {
+  const seen: i32[] = []
+  return tyContainsListIn(ty, seen)
+}
+
+function tyContainsListIn(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || !tyWalkEnter(ty, seen) { return false }
   const t = tyAt(ty)
   match t {
     TyArray => {
       return true
     }
     TyNullable => {
-      return tyContainsList(t.nInner, depth - 1)
+      return tyContainsListIn(t.nInner, seen)
     }
     TyUnion => {
       let i = 0
       while i < t.uMembers.length {
-        if tyContainsList(t.uMembers[i], depth - 1) { return true }
+        if tyContainsListIn(t.uMembers[i], seen) { return true }
         i = i + 1
       }
       return false
@@ -3180,14 +3201,14 @@ export function tyContainsList(ty: i32, depth: i32): boolean {
     TyObj => {
       let i = 0
       while i < t.objFieldTypes.length {
-        if tyContainsList(t.objFieldTypes[i], depth - 1) { return true }
+        if tyContainsListIn(t.objFieldTypes[i], seen) { return true }
         i = i + 1
       }
       return false
     }
     TyMap => {
-      return tyContainsList(tyKeyOf(t), depth - 1)
-        || tyContainsList(tyValOf(t), depth - 1)
+      return tyContainsListIn(tyKeyOf(t), seen)
+        || tyContainsListIn(tyValOf(t), seen)
     }
     TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {
       return false
@@ -3219,8 +3240,8 @@ export function tyIsHole(tyIx: i32) {
 // —— "is a hole" vs "contains a hole", and the deferred-constraint machinery needs the second ——
 // `tyIsHole` answers about the type itself, so `function eqT<T>(a: T, b: T)` deferred the
 // constraint while the `T[]` spelling did not — a `TyArray` over a hole is not a hole (D35).
-// Depth-bounded rather than cycle-tracked, in the safe direction: a recursive named type returns false at the floor.
-export function tyHasHole(tyIx: i32) { return tyHasHoleAt(tyIx, 0) }
+// Each type is walked once per question; a type met again on the walk is a cycle and adds nothing.
+export function tyHasHole(tyIx: i32) { return tyHasHoleAt(tyIx) }
 
 // Whether `tyIx` holds an inference hole (a `?`-named variable), not only declared parameters,
 // however deep; a recursive type is walked once per row.
@@ -3272,77 +3293,66 @@ function tyHasInferHoleIn(tyIx: i32, seen: i32[]): boolean {
   }
 }
 
-// The answer only grows as `depth` falls, so each arena index keeps the deepest `depth` known
-// true and the shallowest known false, stamped with `tyMutEpoch`: a sub-type shared within one
-// walk or asked again by a later one is walked once per bound.
-const hhTrueAt: i32[] = []
-const hhFalseAt: i32[] = []
+// Each arena index keeps its answer, stamped with `tyMutEpoch`: a sub-type shared within one walk
+// or asked again by a later one is walked once. `HH_OPEN` marks a type the walk is inside; meeting
+// one answers `HH_CUT`, a false that is not kept, as the cycle's other members may answer true.
+const hhState: i32[] = []
 const hhStamp: i32[] = []
+const HH_NONE = 0
+const HH_OPEN = 1
+const HH_TRUE = 2
+const HH_FALSE = 3
+const HH_CUT = 4
 
-function tyHasHoleAt(tyIx: i32, depth: i32): boolean {
-  if tyIx < 0 { return false }
-  if depth > 8 { return false }
+function tyHasHoleAt(tyIx: i32): boolean { return tyHasHoleIx(tyIx) == HH_TRUE }
+
+function tyHasHoleIx(tyIx: i32): i32 {
+  if tyIx < 0 { return HH_FALSE }
   while hhStamp.length <= tyIx {
     hhStamp.push(-1)
-    hhTrueAt.push(-1)
-    hhFalseAt.push(9)
+    hhState.push(HH_NONE)
   }
   if hhStamp[tyIx] != tyMutEpoch {
     hhStamp[tyIx] = tyMutEpoch
-    hhTrueAt[tyIx] = -1
-    hhFalseAt[tyIx] = 9
-  } else {
-    if depth <= hhTrueAt[tyIx] { return true }
-    if depth >= hhFalseAt[tyIx] { return false }
+    hhState[tyIx] = HH_NONE
   }
-  const r = tyHasHoleWalk(tyIx, depth)
-  if r {
-    if depth > hhTrueAt[tyIx] { hhTrueAt[tyIx] = depth }
-  } else if depth < hhFalseAt[tyIx] {
-    hhFalseAt[tyIx] = depth
+  const st = hhState[tyIx]
+  if st == HH_TRUE || st == HH_FALSE { return st }
+  if st == HH_OPEN { return HH_CUT }
+  hhState[tyIx] = HH_OPEN
+  const r = tyHasHoleWalk(tyIx)
+  hhState[tyIx] = if r == HH_CUT { HH_NONE } else { r }
+  return r
+}
+
+// The answer for parts `ps`: true if one answers true, else cut if one met a cycle, else false.
+function tyHasHoleAny(ps: i32[]): i32 {
+  let r = HH_FALSE
+  for p in ps {
+    const a = tyHasHoleIx(p)
+    if a == HH_TRUE { return HH_TRUE }
+    if a == HH_CUT { r = HH_CUT }
   }
   return r
 }
 
-function tyHasHoleWalk(tyIx: i32, depth: i32): boolean {
+function tyHasHoleWalk(tyIx: i32): i32 {
   const t = tyAt(tyIx)
   return match t {
-    TyVar => true
-    TyArray => tyHasHoleAt(tyElemOf(t), depth + 1)
-    TyNullable => tyHasHoleAt(t.nInner, depth + 1)
-    TyMap => {
-      if tyHasHoleAt(tyKeyOf(t), depth + 1) { return true }
-      tyHasHoleAt(tyValOf(t), depth + 1)
-    }
-    TyObj => {
-      const ofts = t.objFieldTypes
-      let i = 0
-      while i < ofts.length {
-        if tyHasHoleAt(ofts[i], depth + 1) { return true }
-        i = i + 1
-      }
-      false
-    }
+    TyVar => HH_TRUE
+    TyArray => tyHasHoleIx(tyElemOf(t))
+    TyNullable => tyHasHoleIx(t.nInner)
+    TyMap => tyHasHoleAny([tyKeyOf(t), tyValOf(t)])
+    TyObj => tyHasHoleAny(t.objFieldTypes)
     TyFunc => {
-      const pts = t.fnParamTypes
-      let k = 0
-      while k < pts.length {
-        if tyHasHoleAt(pts[k], depth + 1) { return true }
-        k = k + 1
-      }
-      tyHasHoleAt(t.fnRet, depth + 1)
+      const r = tyHasHoleAny(t.fnParamTypes)
+      if r == HH_TRUE { return HH_TRUE }
+      const f = tyHasHoleIx(t.fnRet)
+      if f == HH_FALSE { r } else { f }
     }
-    TyUnion => {
-      const ums = t.uMembers
-      let u = 0
-      while u < ums.length {
-        if tyHasHoleAt(ums[u], depth + 1) { return true }
-        u = u + 1
-      }
-      false
-    }
+    TyUnion => tyHasHoleAny(t.uMembers)
     // Leaves with no type variable, and a negation the hole never stands under.
-    TyPrim | TyNeg | TyLit | TyErr => false
+    TyPrim | TyNeg | TyLit | TyErr => HH_FALSE
   }
 }
 
@@ -3424,36 +3434,36 @@ export function tyDenotesObj(ty: i32) {
 // Does arena type `ty` name the type variable `name` anywhere in its tree? The arena twin of
 // `tsMentionsAnyName`, for a return type inference settled rather than one an author wrote.
 // An inference hole (`?fn.N`) never matches: its name is the checker's, not a declaration's.
-// Depth-bounded, and out of depth answers false — declining to refuse is the safe direction.
-export function tyMentionsTyVarNamed(
-  ty: i32,
-  name: string,
-  depth: i32,
-): boolean {
-  if ty < 0 { return false }
-  if depth <= 0 { return false }
+// Each type is walked once, so a recursive type ends.
+export function tyMentionsTyVarNamed(ty: i32, name: string): boolean {
+  const seen: i32[] = []
+  return tyMentionsTyVarNamedIn(ty, name, seen)
+}
+
+function tyMentionsTyVarNamedIn(ty: i32, name: string, seen: i32[]): boolean {
+  if ty < 0 || !tyWalkEnter(ty, seen) { return false }
   const t = tyAt(ty)
   match t {
     TyVar => {
       return t.tvName == name
     }
     TyArray => {
-      return tyMentionsTyVarNamed(tyElemOf(t), name, depth - 1)
+      return tyMentionsTyVarNamedIn(tyElemOf(t), name, seen)
     }
     TyNullable => {
-      return tyMentionsTyVarNamed(t.nInner, name, depth - 1)
+      return tyMentionsTyVarNamedIn(t.nInner, name, seen)
     }
     TyNeg => {
-      return tyMentionsTyVarNamed(t.negTy, name, depth - 1)
+      return tyMentionsTyVarNamedIn(t.negTy, name, seen)
     }
     TyMap => {
-      if tyMentionsTyVarNamed(tyKeyOf(t), name, depth - 1) { return true }
-      return tyMentionsTyVarNamed(tyValOf(t), name, depth - 1)
+      if tyMentionsTyVarNamedIn(tyKeyOf(t), name, seen) { return true }
+      return tyMentionsTyVarNamedIn(tyValOf(t), name, seen)
     }
     TyObj => {
       let oi = 0
       while oi < t.objFieldTypes.length {
-        if tyMentionsTyVarNamed(t.objFieldTypes[oi], name, depth - 1) {
+        if tyMentionsTyVarNamedIn(t.objFieldTypes[oi], name, seen) {
           return true
         }
         oi = oi + 1
@@ -3462,19 +3472,19 @@ export function tyMentionsTyVarNamed(
     TyUnion => {
       let um = 0
       while um < t.uMembers.length {
-        if tyMentionsTyVarNamed(t.uMembers[um], name, depth - 1) { return true }
+        if tyMentionsTyVarNamedIn(t.uMembers[um], name, seen) { return true }
         um = um + 1
       }
     }
     TyFunc => {
       let fp = 0
       while fp < t.fnParamTypes.length {
-        if tyMentionsTyVarNamed(t.fnParamTypes[fp], name, depth - 1) {
+        if tyMentionsTyVarNamedIn(t.fnParamTypes[fp], name, seen) {
           return true
         }
         fp = fp + 1
       }
-      return tyMentionsTyVarNamed(t.fnRet, name, depth - 1)
+      return tyMentionsTyVarNamedIn(t.fnRet, name, seen)
     }
     TyPrim => {}
     TyErr => {}
