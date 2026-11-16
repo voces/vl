@@ -12433,3 +12433,57 @@ annotation node, which would leak to every caller.
 
 **Why.** A loud refusal of a legal program is clause-2 debt; an invalid module is clause 1. Trading the
 first for the second is never a fix.
+
+## `?.` over a value that can only be `null` reads `null` (2026-11-16, chosen under the owner's delegation) — D16338, D16828
+
+**The rule.** `x?.f` and `x?.f(…)` evaluate to `null` whenever `x` is null, including when `x`'s type
+is only `null`: a `const` or `let` bound to `null`, a bare `null?.f`, or a hole or generic parameter
+handed `null`. `??` then takes its fallback. The checker does not refuse it; in the non-generic
+spelling it emits an info-level hint that the expression is always null. The emitter lowers a
+null-only `?.` to `null`.
+
+**Why.** `?.` exists to absorb null, and a rule with no type-dependent exception is the one people and
+LLMs predict. Generic code written for `R | null` must compose when handed `null`; refusing at the
+`null` instance would make a check-clean generic body fail at one of its instances.
+
+## A storage class moves with its late branch deleted or narrowed to named exclusions (2026-11-16, chosen under the owner's delegation) — L2 S3.4d, STORE
+
+**The rule.** Amends the S3.4d staging rule above. Each class PR either deletes its `fnTagRedecide`
+branch or narrows the branch's admission to exactly the categories the check-time decision excludes,
+with an `emitFail` if the late branch decides a set outside them. One decider per set holds at every
+commit; the narrowed list is what the next step deletes.
+
+**Why.** Class T's remaining sets (lambda members, generic or open-type bodies) need per-instance keys
+the class step does not have; holding the step until then would hold the 69 sets it moves now (150 → 81) for no correctness gain.
+
+## Rep keys move by layout with two named kept classes (2026-11-16, chosen under the owner's delegation) — REP stage 4b
+
+**The rule.** The heap-identity instrument is fixed first so the shadow reports only true
+different-layout merges (10: five function-field rows, five hole or generic-instance rows; alias twins
+read 0). Every other struct row then keys by its rep id; a row holding a function field and a hole or
+generic-instance row keep their spelling key as two named kept classes, each with a row, and an
+unnamed different-layout merge fails under `$VL_REP_SHADOW`. The kept classes go when SLOT stage 3 and
+a hole-instance rep (REP's next stage) land.
+
+**Why.** Kept classes have closed the same shape twice (D16720–D16722); waiting for both dependencies
+would hold 1,056 same-layout merges behind 10.
+
+## The IR's coercion seats are modelled as conversion ops, not deferred (2026-11-16, chosen under the owner's delegation) — IR I8
+
+**The rule.** I8 is no longer deferred. A delivery's conversion (box, numeric width, atom to string) is
+an IR op whose lowering calls legacy's tail, with the decision half shared. It starts with a design
+note, then lands in parts: `numSeat` first, then `boxSeat`, then the nullable disciplines that depend on
+them. A step's census measurement that a seat caps it is the trigger.
+
+**Why.** Two consecutive coverage steps were capped by I8's seats: `numSeat` held 686 corpus stores
+and `boxSeat` held the boxed nullable discipline (690 functions); together they gate more than any
+other remaining class.
+
+## A same-output mover is accepted when the new answer is the more precise one (2026-11-16, chosen under the owner's delegation) — SLOT D2
+
+**The rule.** A parity mover that is not byte-identical and not a smaller instance set may still land
+when it is output-identical and the new answer is shown to be the correct one (the place classes see a
+call the walk missed). It is named in the PR with its mechanism and pinned by a fixture, as D16801 is.
+
+**Why.** Byte identity with the walk is a means, not the goal; matching a known-imprecise answer would
+move the slot store backwards.
