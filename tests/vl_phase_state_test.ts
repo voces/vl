@@ -163,6 +163,8 @@ export function tyValOf(t: i32): i32 { return t }
 export function tyElemOpen(t: i32): boolean { return t < 0 }
 export function tyKeyOpen(t: i32): boolean { return t < 0 }
 export function tyValOpen(t: i32): boolean { return t < 0 }
+export function tyPathCycles(t: i32, p: i32[]): boolean { return t < 0 }
+export function tyPathWith(t: i32, p: i32[]): i32[] { return p }
 export function judge(t: i32): i32 { return t }
 `;
 const ARENA_USER = `import { judge, tyPinElem } from "./check_types"

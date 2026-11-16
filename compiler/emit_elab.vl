@@ -43,7 +43,14 @@ import {
   fnTagCalls,
   fnTagHoldsTy,
 } from "./check_elab_cap"
-import { Ty, tyArrayElemIx, tyChildrenOf, tyHoldsObj } from "./check_types"
+import {
+  Ty,
+  tyArrayElemIx,
+  tyChildrenOf,
+  tyHoldsObj,
+  tyPathCycles,
+  tyPathWith,
+} from "./check_types"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { valueTailLeaves } from "./check_num_adopt"
 import { paramHoleName } from "./check_tp_join"
@@ -15881,6 +15888,14 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       const cd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
       if cd >= 0 && (cboxCellDecls[cboxDeclKey(cd)] ?? 0) == 1 {
         elabSlotReadDeliveries(cd, ["e"], out, seen)
+      } else if cd >= 0 && elabCallRec {
+        // A call search follows a value written into a named list's element or map's value to
+        // that slot's reads.
+        const ct = nodeTyIxOf(a)
+        const isMap = ct >= 0
+          && ct < T.tys.length
+          && tyAt(nonNullTy(ct)) is TyMap
+        elabSlotReadDeliveries(cd, [if isMap { "v" } else { "e" }], out, seen)
       }
     } else if ln is Member && elabCallRec {
       // A call search follows a value written into a named binding's field to that field's reads.
@@ -15936,6 +15951,9 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     // A call search follows a value pushed onto a named list to that list's element reads.
     const pd = if elabCallRec && cn is Call { elabPushRecvDecl(cn) } else { -1 }
     if pd >= 0 { elabSlotReadDeliveries(pd, ["e"], out, seen) }
+    // ... and a value set into a named map to that map's value reads.
+    const sd = if elabCallRec && ai == 1 && cn is Call { elabSetRecvAny(cn) } else { -1 }
+    if sd >= 0 { elabSlotReadDeliveries(sd, ["v"], out, seen) }
     const fds = if cn is Call && cn.callFn >= 0 { elabCalleeFns(cn) } else { [] }
     for fd in fds {
       const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
@@ -15994,6 +16012,28 @@ function elabPushRecvDecl(c: Call): i32 {
   ) {
     return -1
   }
+  return d
+}
+
+// The map binding call `c` sets a value into as `m.set(k, v)`, written type or not, that is no
+// capture cell; -1 for any other call.
+function elabSetRecvAny(c: Call): i32 {
+  const fm = nodeAt(parenPeelIx(c.callFn))
+  if !(fm is Member) || fm.memProp != "set" || c.callArgs.length != 2 {
+    return -1
+  }
+  const o = parenPeelIx(fm.memObj)
+  if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return -1 }
+  const d = identDeclOf(o)
+  if (
+    d < 0
+    || d >= cwIxCoveredLen()
+    || (cboxCellDecls[cboxDeclKey(d)] ?? 0) == 1
+  ) {
+    return -1
+  }
+  const t = nodeTyIxOf(o)
+  if t < 0 || t >= T.tys.length || !(tyAt(nonNullTy(t)) is TyMap) { return -1 }
   return d
 }
 
@@ -18288,7 +18328,7 @@ function elabRetTaggedJoinAt(fnIx: i32, path: string[]): i32 {
   const f = tyAt(ft)
   if !(f is TyFunc) { return -1 }
   const jt = elabTyAtPath(f.fnRet, path)
-  if jt < 0 || !(fnTagTyIsTagged(jt) || fnTagHoldsTy(jt, 6)) { return -1 }
+  if jt < 0 || !(fnTagTyIsTagged(jt) || fnTagHoldsTy(jt)) { return -1 }
   return jt
 }
 
@@ -18603,7 +18643,7 @@ export function elabLitBindingFact(ix: i32): i32 {
     || t >= T.tys.length
     || !(tyAt(t) is TyObj)
     || tyHasTyVar(t)
-    || fnTagHoldsTy(t, 4)
+    || fnTagHoldsTy(t)
     || !elabObjHoldsMap(t, [])
   ) {
     return -1
@@ -18827,12 +18867,12 @@ function litBuildStampLet(x: i32, bt: Map<i32, i32>): i32 {
   if v < 0 || v >= P.nodes.length { return 0 }
   const t = recBuildTyIn(bt, x, false)
   if t >= 0 {
-    return if nodeAt(v) is ObjLit { recordRepTyAdopt(v, t, 8) } else { 0 }
+    return if nodeAt(v) is ObjLit { recordRepTyAdopt(v, t) } else { 0 }
   }
   const et = recBuildTyIn(bt, x, true)
   const a = nodeAt(v)
   if et < 0 || !(a is ArrayLit) { return 0 }
-  return recordRepTyAdopt(v, mkArrayTy(et), 8)
+  return recordRepTyAdopt(v, mkArrayTy(et))
 }
 
 // Stamps a record stored by `m[k] = {...}` into a binding `litBuildStampLet` stamps with that
@@ -18846,7 +18886,7 @@ function litBuildStampStore(x: i32, bt: Map<i32, i32>): i32 {
   if b < 0 { return 0 }
   const et = recBuildTyIn(bt, identDeclOf(b), true)
   if et < 0 { return 0 }
-  return recordRepTyAdopt(d.binRight, et, 8)
+  return recordRepTyAdopt(d.binRight, et)
 }
 
 // The list an index place `x` reads, or -1 where `x` is not an index.
@@ -20872,12 +20912,19 @@ function elabKeyParamNodeTy(k: i32, p: i32, i: i32): i32 {
 function elabKeyGenericFnTy(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   if tyAt(t) is TyFunc { return true }
-  return (tyHasTyVar(t) || tyReachesHole(t, 16)) && elabKeyHeldGenericGo(t, 0)
+  return (tyHasTyVar(t) || tyReachesHole(t, 16)) && elabKeyHeldGenericGo(t)
 }
 
 // Whether every open part of `t` sits beneath a function type, to depth 16.
-function elabKeyHeldGenericGo(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+function elabKeyHeldGenericGo(t: i32): boolean {
+  const path: i32[] = []
+  return elabKeyHeldGenericGoIn(t, path)
+}
+
+function elabKeyHeldGenericGoIn(t: i32, path: i32[]): boolean {
+  if tyPathCycles(t, path) { return false }
+  const sub = tyPathWith(t, path)
+  if t < 0 || t >= T.tys.length { return false }
   const v = tyAt(t)
   if v is TyFunc { return true }
   if v is TyVar { return false }
@@ -20886,7 +20933,7 @@ function elabKeyHeldGenericGo(t: i32, depth: i32): boolean {
   tyChildrenOf(t, kids)
   if kids.length == 0 { return false }
   for k in kids {
-    if !elabKeyHeldGenericGo(k, depth + 1) { return false }
+    if !elabKeyHeldGenericGoIn(k, sub) { return false }
   }
   return true
 }
@@ -21817,6 +21864,81 @@ function eplEdges() {
   return 0
 }
 
+// The label of loop `ix`, or null for a node that is no loop.
+function eplLoopLabel(ix: i32): string | null {
+  const n = nodeAt(ix)
+  if n is WhileStmt { return n.whileLabel }
+  if n is ForRange { return n.frLabel }
+  if n is ForIn { return n.fiLabel }
+  return eplNotALoop(ix)
+}
+
+// Every other kind: an expression, a declaration or a statement no `break` leaves.
+function eplNotALoop(_ix: i32): string | null { return null }
+
+// Pushes onto `out` each value a `break` under `ix` hands to the loop labelled `label`, `depth`
+// loops inside it; a nested loop of the same label shadows it, and a function body is its own.
+function eplLoopExitsIn(ix: i32, label: string, depth: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length || depth > 32 { return 0 }
+  const n = nodeAt(ix)
+  if n is Block {
+    let j = 1
+    while j < n.blkStmts.length {
+      const st = n.blkStmts[j]
+      const b = if st >= 0 && st < P.nodes.length { nodeAt(st) } else { null }
+      if (
+        b is BreakStmt
+        && b.brkHasVal == 1
+        && (b.brkLabel == "" && depth == 0
+          || b.brkLabel != "" && b.brkLabel == label)
+      ) {
+        out.push(n.blkStmts[j - 1])
+      }
+      j = j + 1
+    }
+  }
+  for c in nodeChildren(ix) {
+    const cl = if c >= 0 && c < P.nodes.length { eplLoopLabel(c) } else { null }
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if cl != null {
+      if cl == "" || cl != label { eplLoopExitsIn(c, label, depth + 1, out) }
+    } else if !(cn is FuncDecl) {
+      eplLoopExitsIn(c, label, depth, out)
+    }
+  }
+  return 0
+}
+
+// A value a loop or labelled block hands out by `break v` flows to where the loop's own value goes.
+// Read from the checked tree, before any rewrite lowers the loop.
+function eplLoopExits() {
+  let x = 0
+  while x < cwIxCoveredLen() && x < P.nodes.length {
+    const label = eplLoopLabel(x)
+    if label != null && cwIxUpKind[x] != CW_UP_NONE {
+      const vals: i32[] = []
+      const n = nodeAt(x)
+      const body = if n is WhileStmt { n.whileBody } else if n is ForRange { n.frBody } else if n is ForIn { n.fiBody } else { -1 }
+      eplLoopExitsIn(body, label, 0, vals)
+      const fr = eplFrameOf(recEnclosingFn(x))
+      const ks = if eplInstanced(fr) { EPL.insts.get(fr) ?? [] } else { [] }
+      const kk: i32[] = if ks.length > 0 { ks } else { [-1] }
+      for k in kk {
+        EPL.k = k
+        for v0 in vals {
+          const v = parenPeelIx(v0)
+          if v >= 0 && v < cwIxCoveredLen() {
+            eplEdge(eplPlaceOf(v, 0), eplPlaceOf(x, 0), v)
+          }
+        }
+      }
+    }
+    x = x + 1
+  }
+  EPL.k = -1
+  return 0
+}
+
 // Parameters a generic types by one type parameter hold one storage in each of its instances: a
 // set or bundle that parameter binds is shared, so their places unify (architecture-target §2.4).
 function eplTyParamShare(fx: i32) {
@@ -22369,6 +22491,7 @@ function eplBuild() {
   EPL.limit = limit
   eplInstsFile()
   eplEdges()
+  eplLoopExits()
   eplCallResults()
 }
 
@@ -22782,7 +22905,11 @@ function eplSlotParams(holder: i32, path: string[], k: i32): i32[] {
 // The holder the write index knows for `h0`: a capture cell's binding, and a binding an instance
 // cloned after the index its source; -1 where none is covered.
 function eplSrcHolder(h0: i32): i32 {
-  let h = elabCellLitBinding(h0)
+  // A loop's value carrier the rewrite minted, or a value it minted for the loop to hand out, holds
+  // what the loop's value is.
+  const lc = lvCarrierLoopOf(h0)
+  const lx = if h0 >= cwIxCoveredLen() { lvExitLoops[h0] ?? -1 } else { -1 }
+  let h = if lc >= 0 { lc } else if lx >= 0 { lx } else { elabCellLitBinding(h0) }
   if h >= cwIxCoveredLen() {
     const o = declOrigOf(h)
     h = if o >= 0 { o } else { nodeSrc[h] ?? -1 }

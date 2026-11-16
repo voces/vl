@@ -12352,6 +12352,18 @@ reading the code expects. A literal tree means what the `const` holding it means
 D3053's negation chains); computing a hex tree at 32 bits first would make the answer depend on
 the operator, which is what the defect showed.
 
+## A hand-back is a bound kind in its owner's interface; a set binding is a call-keyed solver table (2026-11-16) — L2 S2/S3, storage decider
+
+**The rule.** A function's hand-back (a value it returns that the caller must store at the caller's
+rep) is recorded as a `BND_HANDBACK` bound in the owner's `Iface`, beside its other bounds. A set
+binding (which function set a type parameter binds at one call) is a flat solver-output table keyed
+by call, parameter and set, beside the instance requests, and never part of an `Iface`.
+
+**Why.** A hand-back is a fact about the function that every caller reads, so it belongs with the
+function's other exported facts and is frozen with them at the module boundary. A set binding is a
+fact about one call: putting it in the callee's `Iface` would make the interface depend on its
+callers, which the export freeze forbids. Design doc §4.3 records the table's shape.
+
 ## An explicit type argument fixes an empty list literal's element, as an annotation does (2026-11-16, chosen under the owner's delegation) — D16689, follows D16342
 
 **The rule.** A call's explicit type argument fixes the element of an empty list literal handed at a
