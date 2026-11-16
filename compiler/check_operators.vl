@@ -286,6 +286,7 @@ import {
   luRef,
   luTrap,
   luValueAt,
+  luValueNode,
   luWriteTgtPut,
   monoRecheckDepth,
 } from "./check_list_union"
@@ -1037,7 +1038,7 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       // The write's own deferred constraint, keyed to the ASSIGNMENT node so the pin can
       // BANK the `"[]="` operator there for the emitter — the read constraint the target
       // records only covers `"[]"`, and `p[4] = v` needs the setter (D1892). Vacuous when
-      // the hole pins to a real array or map, which `validateMemCstrs` skips.
+      // the hole pins to a real array or map, which `memRule` skips.
       if opIdxDeclared() { noteMemCstr(arrTy0, OP_INDEX_SET, ix, false) }
       const hmw = holeMapOf(arrH0.tvName)
       if hmw >= 0 { arrTy0 = hmw }
@@ -1656,22 +1657,61 @@ function recEqNullArm(
   return v
 }
 
-// `l == r` (or `!=` when `neg`) over two names holding records `lt` and `rt` of one field set
-// stored apart, built typed for an instance the checker sees only at its type parameters: one
-// `==` per field pair, a pair stored apart split in turn, a null side equal only to a null side
-// (D16397). -1 when an operand is not a name, since each is read once per field.
+// `l == r` (or `!=` when `neg`) over records `lt` and `rt` of one field set stored apart, built
+// typed for an instance the checker sees only at its type parameters: one `==` per field pair, a
+// null side equal only to a null side (D16397). An operand with a possible effect is bound once
+// to a fresh `const` at `site` and the compare reads that binding.
 export function recEqTypedChain(
   l: i32,
   r: i32,
   lt: i32,
   rt: i32,
   neg: boolean,
+  site: i32,
   pos: i32,
 ): i32 {
-  if l < 0 || r < 0 || !(nodeAt(l) is Ident) || !(nodeAt(r) is Ident) {
-    return -1
+  if !recEqFieldWise(lt, rt) { return -1 }
+  const stmts: i32[] = []
+  let lv = l
+  let rv = r
+  if !recEqPureRead(l, 8) {
+    const d = luDecl("const", "$el" + i32ToStr(site), -1, l, site, pos)
+    nodeTySetGrow(d, lt)
+    stmts.push(d)
+    lv = luRef(d, site, pos)
+    nodeTySetGrow(lv, lt)
   }
-  return recEqTyped(l, r, lt, rt, neg, pos)
+  if !recEqPureRead(r, 8) {
+    const d = luDecl("const", "$er" + i32ToStr(site), -1, r, site, pos)
+    nodeTySetGrow(d, rt)
+    stmts.push(d)
+    rv = luRef(d, site, pos)
+    nodeTySetGrow(rv, rt)
+  }
+  const eq = recEqTyped(lv, rv, lt, rt, neg, pos)
+  if eq < 0 || stmts.length == 0 { return eq }
+  stmts.push(eq)
+  const v = luValueNode(site, stmts, pos)
+  nodeTySetGrow(v, TY_BOOL)
+  return v
+}
+
+// Whether `x` is a read with no effect, so re-reading it once per field answers as reading it
+// once: a name, a field of one, or an element of one at a name or literal index (D16470).
+function recEqPureRead(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth <= 0 { return false }
+  const n = nodeAt(x)
+  return match n {
+    Ident => true
+    Paren => recEqPureRead(n.parInner, depth - 1)
+    Member => recEqPureRead(n.memObj, depth - 1)
+    Index => {
+      const ix = nodeAt(n.idxIndex)
+      recEqPureRead(n.idxArr, depth - 1) && (ix is NumLit || ix is Ident)
+    }
+    // Any other operand may have an effect, or reads a value no place holds.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => false
+  }
 }
 
 // `recEqTypedChain` over operand reads already known to be names or fields of names.
