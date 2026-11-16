@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **D16689 closed:** a list `is` test over a `V[] | null` or `V[] | string` operand now answers by the element an annotation or a write fixed, as a bare `V[]` does, so an empty `i32[]` handed there does not pass `is f64[]`. A function handed both a fixed list that may be empty and an empty literal or a defaulted list at the tested parameter is refused at the fixed call, as the DECISIONS interim says, instead of answering by emptiness at both; an open list at another parameter no longer turns off the element answer. Four corpus contracts and the D4912, D4937 and D15763 witnesses move to the ruling.
