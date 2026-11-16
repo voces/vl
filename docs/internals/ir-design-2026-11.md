@@ -766,8 +766,25 @@ blockers, not payoffs: a row that falls only helps the functions it was the last
 C2f, a string literal step left coverage unchanged. The census (`$VL_IR_SHADOW=4`, `ir-shadow.vl
 -- --blockers`) builds each function past its missed statements and reports the set of classes
 that keeps it uncovered. A step's payoff is the functions whose set it empties, an upper bound
-since a statement stops at its first miss. The coverage bar is functions unblocked per line, read
-off the census before the step and confirmed by the shadow after it.
+since a statement stops at its first miss. A check that reads a statement's whole build, as the
+valued tail `if` test does, runs only when that statement built without a miss; an arm left
+incomplete by a miss is not a class of its own. The coverage bar is functions unblocked per line,
+read off the census before the step and confirmed by the shadow after it.
+
+**A shared predicate must not read state legacy's body lowering writes (the claim hazard).** The
+shadow runs legacy first, so such a predicate answers correctly there and stale under a claim.
+`strAssignInPlace` read the accumulator scan that `emitFuncBody` runs, and now runs it itself for a
+function legacy has not lowered; mode 3 found it. An audit of every predicate the builder and
+lowering import (C2i) found no other: each reads pre-pass, checker or rep state, state it sets and
+restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes. One
+caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
+previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
+
+**A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
+plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held
+alone were string `.slice` (1,692) and `.cpLen` (674), and the self-compile's 731 were mostly list
+`.push` (428) and `.pop` (76); 6 were a real call through a value. A member callee now misses as
+`method <name>`, and `indirect call` means a call through a value.
 
 **The six coercion seats wait for claiming (I3).** These are `numSeat`, `coerceHeld`, `boxSeat`,
 `armSeat`, `armServed` and `atomSeat`. They are legacy-only ambient state: an outer site sets one

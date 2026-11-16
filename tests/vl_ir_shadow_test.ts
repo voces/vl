@@ -155,7 +155,7 @@ Deno.test({
   ignore,
   fn: () => {
     // A returned `if` that yields its arms' values is outside the set too.
-    const src = `function greet(s: string): string { return s + "!" }
+    const src = `function greet(s: string | null): string { return s ?? "!" }
 function fx(p: { x: i32 }): i32 { return p.x }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
 print(greet("a"))
@@ -178,7 +178,9 @@ print(sel(true))
 
 // The decisions legacy and the lowering share (I1b): a reference global's read and its
 // `ref.as_non_null`, a never-returning callee's `call; unreachable`, and an instance's parameter
-// read. Each witness is one covered function that must match legacy's bytes.
+// read; string operators, a char literal, a string list read and a void call's tail form (C2h);
+// an atom result and its literals (C2i); string `.slice` and `.cpLen` (C2j).
+// Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
   `function stop(code: i32): never { return __trap__() }
@@ -189,6 +191,13 @@ function guard(x: i32): i32 {
 print(guard(2))
 `,
   `function id<T>(v: T): T { return v }\nprint(id(3))\n`,
+  `function cmp(a: string, b: string): boolean { return a + "x" == b || a > b }\nprint(cmp("a", "b"))\n`,
+  `function dig(c: i32): boolean { return c >= '0' && c <= '9' }\nprint(dig(53))\n`,
+  `function at(xs: string[], i: i32): string { return xs[i] }\nprint(at(["a", "b"], 1))\n`,
+  `function note(s: string) { print(s) }\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
+  `type K = "p" | "q"\nfunction pick(c: boolean): K {\n  if c { return "p" }\n  return "q"\n}\nprint(pick(true) == "p")\n`,
+  `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
+  `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -300,9 +309,9 @@ Deno.test({
   ignore,
   fn: () => {
     const src = `function ok(x: i32): i32 { return x + 1 }
-function two(s: string, t: string): i32 {
+function two(s: string, t: string | null): i32 {
   const xs = [1, 2]
-  if s == t { return xs[0] }
+  if (t ?? s) == s { return xs[0] }
   return 0
 }
 print(ok(1))
@@ -310,7 +319,7 @@ print(two("a", "b"))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers expression array + operand at string";
+    const want = "blockers expression array + operand at string + parameter rep nullable";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
