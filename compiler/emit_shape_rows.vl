@@ -105,7 +105,6 @@ import {
   mkMapTy,
   nomNameOfTy,
   numLitUnionBaseName,
-  numLitUnionBaseTy,
   oneStrLitSpelling,
   softenLitTy,
   structNameOfTy,
@@ -128,6 +127,8 @@ import {
   tyMayHoldFn,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
+  tyPathCycles,
+  tyPathWith,
   tyPrimNameIs,
   tyToNominalName,
   tyToNominalNameAt,
@@ -197,7 +198,6 @@ import {
 import {
   boxTagOfTy,
   fieldCodeIn,
-  fieldCodeOfListRep,
   mvSlotKeyKind,
   mvSlotOfTyKArm,
   nodeMapValTyIx,
@@ -216,7 +216,6 @@ import {
   slotRowTyOf,
   tyDenotesFunc,
   tyMapKeyKind,
-  valueBoxOfTy,
 } from "./emit_rep"
 import {
   FC_CLOSURE,
@@ -1453,54 +1452,6 @@ export function forceScalarListRep(rep: string) {
   return 0
 }
 
-// The field code of a field of arena type `fty`, where the rep descriptor
-// (`fieldCodeOfTyCovered`) declines it, or -1. Every arm below is one a declined type reaches;
-// `nameFieldCodeTy` fails loudly on a declined type that no rung codes.
-export function fieldCodeOfDeclinedTy(fty: i32) {
-  if fty < 0 { return -1 }
-  // A list or nullable list field stores its rep's list wrapper: a nullable element (B171) is
-  // the ref list, a scalar element its own wrapper.
-  const k = repOfTy(fty).rdKind
-  if k != null && vkListClass(k) != 0 { return fieldCodeOfListRep(k) }
-  // A box-union field stores the union box ref, code 16: a value union, a nullable numeric
-  // literal set (a nullable number), or a member set keying a registered row (a
-  // self-referential arm's `Node | null` included, D4615).
-  if valueBoxOfTy(fty) || tyIsNulNumLitSet(fty) { return FC_UNION }
-  if isUNameAB(75, fty) { return FC_UNION }
-  return -1
-}
-
-// Whether `ty` is a numeric literal set or `null`, whose non-null part is a number.
-function tyIsNulNumLitSet(ty: i32): boolean {
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  if !(t is TyNullable) || t.nInner < 0 { return false }
-  const b = numLitUnionBaseTy(t.nInner)
-  if b < 0 || b == t.nInner { return false }
-  const bt = tyAt(b)
-  return bt is TyPrim && bt.primName != "string" && bt.primName != "boolean"
-}
-
-// The `S[] | null` FIELD code (28) the ARENA decides, or -1. Ref-ELEMENT lists only: that is
-// the one nullable-list code whose name test needs a table, and every other element kind is
-// already decided by a spelling that carries its own answer (D1293).
-export function nulRefListFieldCodeOfTy(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = tyAt(ty)
-  if t is TyNullable {
-    const inner = t.nInner
-    if inner < 0 { return -1 }
-    // A LITERAL-union element list is the i32 ATOM backing (code 18), never a ref list —
-    // the same subtraction `fieldCodeOfTy`'s array arm makes.
-    if tyIsLitUnionArray(inner) { return -1 }
-    const it = tyAt(inner)
-    if it is TyArray {
-      if tyElemIsRefListElem(tyElemOf(it)) { return FC_NUL_REF_LIST }
-    }
-  }
-  return -1
-}
-
 // Whether arena element `e` is one a ref list stores BY REFERENCE — a struct, a union, a
 // closure, a nested list or a map. The one home for that set, so a ref-list field code (5)
 // and its `| null` niche (28) cannot admit different elements (D1691).
@@ -2435,16 +2386,23 @@ export function annRefArrElemRow(annIx: i32) {
 // cannot stand in for it: a newtype brand, a declared record, or a record holding a tagged
 // function (its row is keyed by its set), at any list depth. A type it cannot see (-1) declines.
 export function elemTyIsNominal(ty: i32): boolean {
-  return elemTyIsNominalAt(ty, 0)
+  return elemTyIsNominalAt(ty)
 }
 
-function elemTyIsNominalAt(ty: i32, depth: i32): boolean {
-  if ty < 0 || depth > 8 { return true }
+function elemTyIsNominalAt(ty: i32): boolean {
+  const path: i32[] = []
+  return elemTyIsNominalAtIn(ty, path)
+}
+
+function elemTyIsNominalAtIn(ty: i32, path: i32[]): boolean {
+  if tyPathCycles(ty, path) { return true }
+  const sub = tyPathWith(ty, path)
+  if ty < 0 { return true }
   if nomNameOfTy(ty) != "" { return true }
   const t = tyAt(ty)
   match t {
     TyArray => {
-      return elemTyIsNominalAt(tyElemOf(t), depth + 1)
+      return elemTyIsNominalAtIn(tyElemOf(t), sub)
     }
     TyObj => {
       return structNameOfTy(ty) != "" || fnTagHoldsTy(ty)
@@ -2452,7 +2410,7 @@ function elemTyIsNominalAt(ty: i32, depth: i32): boolean {
     TyUnion => {
       // A one-member union is a declared alias's wrapper, and is its member.
       if t.uMembers.length == 1 {
-        return elemTyIsNominalAt(t.uMembers[0], depth + 1)
+        return elemTyIsNominalAtIn(t.uMembers[0], sub)
       }
       return false
     }

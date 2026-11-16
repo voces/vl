@@ -121,6 +121,7 @@ import {
   fbLocalSet,
   fbLoop,
   fbRefAsNonNull,
+  fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
   fbUnreachable,
@@ -149,10 +150,6 @@ import {
   gCellIdx,
   gHelpF64Rem,
   gImports,
-  liBack,
-  liFieldKind,
-  liKinds,
-  liSlots,
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
@@ -217,6 +214,18 @@ function takeUse(v: i32): boolean {
 
 function isTemp(v: i32): boolean {
   return v >= 0 && v < lw.irVars.length && lw.irVars[v].vKind == "temp"
+}
+
+// Consumes operand `o` without writing it, as legacy skips a receiver a live hoist already holds:
+// a temp's one use is taken in its order and its right-hand side never written; a variable
+// reads nothing.
+export function irLSkip(o: Opnd) {
+  if o is OVar && isTemp(o.ov) {
+    if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
+    if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
+    lwSeq.push(o.ov)
+  }
+  return 0
 }
 
 // Writes operand `o`: a variable's `local.get`, an immediate's constant, or a temp's own
@@ -505,11 +514,15 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     SBlock => {
       irLSettle(pending)
       if n.bkOut >= 0 { return irLMiss("valued block") }
+      // A loop's list-header hoists open before its block, as legacy's do.
+      const hoists = irLoopOpenHook(lw.irNodeAt[id])
+      if hoists < 0 { return irLMiss("loop hoist prologue") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
       body(n.bkBody, false, -1)
       lwFrames.pop()
       fbEnd()
+      irLoopCloseHook(hoists)
     }
     SLoop => {
       irLSettle(pending)
@@ -795,16 +808,11 @@ export function irLowerClaim(
   out: u8[],
 ): string {
   const callees0 = dfeCallee.length
-  const rows = liKinds.length
   const got = entry(f, ctx)
   if lwMiss != "" {
     while dfeCallee.length > callees0 { dfeCallee.pop() }
-    // Legacy lowers the function in its place, from the lazy frame as `fbBeginFunc` left it.
-    while liKinds.length > rows {
-      liKinds.pop()
-      liSlots.pop()
-      liBack.pop()
-    }
+    // Legacy lowers the function in its place, from the empty lazy frame `fbBeginFunc` left.
+    fbResetLazyFrame()
     return lwMiss
   }
   const at = out.length
@@ -839,10 +847,7 @@ export function irDualEmit(
   // grows a lazy list frame of its own from empty: legacy's is spent, its locals vector written,
   // and the next function's `fbBeginFunc` resets it.
   const callees0 = dfeCallee.length
-  liKinds = []
-  liSlots = []
-  liBack = []
-  liFieldKind = []
+  fbResetLazyFrame()
   const got = entry(f, ctx)
   while dfeCallee.length > callees0 { dfeCallee.pop() }
   lwGot = got
@@ -981,7 +986,15 @@ function boundsUnset(_n: SBoundsCheck, _p: i32[]): i32 {
   return irLMiss("bounds hook not installed")
 }
 
+function loopOpenNone(_at: i32): i32 { return 0 }
+
+function loopCloseNone(_n: i32): i32 { return 0 }
+
 // The list lowering's hooks (`ir_lower_ref.vl`), installed before emit; the defaults leave list
 // reads and bounds checks unlowered.
 export let irLowerListHook: (r: Rhs) => i32 = listUnset
 export let irLowerBoundsHook: (n: SBoundsCheck, pending: i32[]) => i32 = boundsUnset
+// Opens the list-header hoists of the loop statement at AST node `at` (how many, or -1 on a failed
+// prologue), and closes that many; the defaults open none.
+export let irLoopOpenHook: (at: i32) => i32 = loopOpenNone
+export let irLoopCloseHook: (n: i32) => i32 = loopCloseNone

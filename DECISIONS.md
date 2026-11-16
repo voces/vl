@@ -5937,10 +5937,22 @@ not garbage — a first cut that gave a miss `len + 2*added + 16` made one appen
 1M objects 148 -> 295 MB and 0.06 -> 0.17 s (review of #3192). The binding proof still wins where it applies —
 its lowering has no test — so a proven local keeps its bytes.
 
-Two shapes stay quadratic, filed rather than guessed at: a site outside any loop reached from
-a caller's loop (D2669 — the locals live one call, and module-lifetime storage needs the site
-count before the global section is written), and one site cycling over several strings (D2670
-— one cached buffer per site). Ropes stay the owner's held option.
+A site outside any loop, reached from a caller's loop, keeps `SB` and `SE` in two module
+globals instead (D2669, 2026-11-16), when its place outlives the call (a module binding, or a
+field or element reached from a parameter or one). A frame-local pair would start empty on
+every call. A fresh local's site would miss every call anyway, so it keeps no globals. The
+pair is minted while the body is emitted, as the body-minted synthetic globals are, so no site
+count is needed before the global section. The invariant is unchanged, since it never depended
+on frame lifetime, only on one site owning its buffer: a recursive or re-entrant call that
+extends the buffer moves `SE`, so the outer call's value misses and copies. RETENTION: a
+global pair holds its site's last buffer for the life of the module, where a local pair dies
+with the frame. A miss replaces it, so the bound is one buffer per such site, at most twice
+the longest string that site built (a hit doubles). Of the compiler's 127 sites outside a loop,
+1 has a place that outlives the call; the corpus has 166 such sites over 61 programs before
+that filter.
+
+One shape stays quadratic, filed rather than guessed at: one site cycling over several strings
+(D2670 — one cached buffer per site). Ropes stay the owner's held option.
 
 **Why not a separate buffer with a materialisation point** (Part D's option B as written).
 It needs two extra locals, a loop-entry hook, a materialisation at every loop EXIT including
@@ -12331,9 +12343,24 @@ two calls; the refusal lifts with L2.
 **The rule.** A tree of radix literals folds exactly, as every literal tree does under ruling A, and
 `as% T` then applies to that exact value. At `i64` a value that fits is unchanged, so
 `(0xFFFFFFFF * 2) as% i64` is `8589934590` and `(0xFFFFFFFF + 1) as% i64` is `4294967296`, the
-same as `as i64`. A value that does not fit the target wraps, as `as%` always does.
+same as `as i64`. A value that does not fit the target wraps, as `as%` always does. The narrower
+targets wrap that exact value: `(0xFFFFFFFF / 2) as% i32` is `2147483647`, not `0`, and
+`(0xFFFFFFFF / 256) as% u8` is `255`.
 
 **Why.** The owner asked for the choice that is consistent and meets what a human or an LLM
 reading the code expects. A literal tree means what the `const` holding it means (ruling A, and
 D3053's negation chains); computing a hex tree at 32 bits first would make the answer depend on
 the operator, which is what the defect showed.
+
+## A hand-back is a bound kind in its owner's interface; a set binding is a call-keyed solver table (2026-11-16) — L2 S2/S3, storage decider
+
+**The rule.** A function's hand-back (a value it returns that the caller must store at the caller's
+rep) is recorded as a `BND_HANDBACK` bound in the owner's `Iface`, beside its other bounds. A set
+binding (which function set a type parameter binds at one call) is a flat solver-output table keyed
+by call, parameter and set, beside the instance requests, and never part of an `Iface`.
+
+**Why.** A hand-back is a fact about the function that every caller reads, so it belongs with the
+function's other exported facts and is frozen with them at the module boundary. A set binding is a
+fact about one call: putting it in the callee's `Iface` would make the interface depend on its
+callers, which the export freeze forbids. Design doc §4.3 records the table's shape.
+

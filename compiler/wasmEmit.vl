@@ -750,6 +750,7 @@ import {
   svViewTy,
   synthConstListIdx,
   synthGlobalIdx,
+  synthSitePairIdx,
   tailCallEnd,
   tailCallIdx,
   tailCallTable,
@@ -17280,7 +17281,7 @@ function emitListIdxTrap(back: i32) {
 // with a live cached header: the backing ref and `len` are already in locals, so the
 // receiver is never (re-)emitted and the stack holds only the index. Leaves the same
 // [backing, safeIndex] pair; an index `idxIx` that `rangeProvenIndex` proves in bounds skips the select.
-function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
+export function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   const back = listBackOfWrap(hoistWrapTyOfRow(row))
   if back >= 0 && !rangeProvenIndex(row, idxIx) {
@@ -18074,7 +18075,7 @@ function hoistWrapTyOfRow(row: i32) {
 // the soundness conditions, read its header into the row's two locals. Returns the count
 // of rows opened (the `loopHoistClose` argument), or -1 on prologue failure. `condIx`, the
 // loop's per-iteration condition, is held to the body's own hoist-safety standard — a `while f()` re-runs `f` every iteration.
-function loopHoistOpen(
+export function loopHoistOpen(
   condIx: i32,
   bodyIx: i32,
   fnIx: i32,
@@ -18259,7 +18260,7 @@ function rangeProvenIndex(row: i32, idxIx: i32) {
 }
 
 // Close the `n` rows this loop opened, innermost first.
-function loopHoistClose(n: i32) {
+export function loopHoistClose(n: i32) {
   let i = 0
   while i < n {
     const row = lhOpen[lhOpen.length - 1]
@@ -18275,6 +18276,29 @@ export function idxCellReadIsNull(idxIx: i32, fnIx: i32): boolean {
   return cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx))
 }
 
+// The arm `emitIndex` lowers read `nd` by, from its receiver's rep, in the order the reps must be
+// asked: the nullable and string-element lists before the plain scalar list, which does not see
+// through either. A shared cell's null read is asked before this.
+export type IdxArm = "twolists"
+  | "nulscalar"
+  | "ref"
+  | "nulstr"
+  | "str"
+  | "scalar"
+  | "string"
+  | "none"
+
+export function idxArmOf(nd: Index, fnIx: i32): IdxArm {
+  if twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx) != "" { return "twolists" }
+  if exprNulScalarListKind(nd.idxArr, fnIx) != null { return "nulscalar" }
+  if exprRefArray(nd.idxArr, fnIx) { return "ref" }
+  if exprNulStrArray(nd.idxArr, fnIx) { return "nulstr" }
+  if exprStringArray(nd.idxArr, fnIx) { return "str" }
+  if scalarListElemKind(nd.idxArr, fnIx) != null { return "scalar" }
+  if exprString(nd.idxArr, fnIx) { return "string" }
+  return "none"
+}
+
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
   if nd is Index {
@@ -18283,62 +18307,46 @@ function emitIndex(idxIx: i32, fnIx: i32) {
     if idxCellReadIsNull(idxIx, fnIx) {
       if emitNullReadAtDst(idxIx, fnIx) { return 0 }
     }
-    const tlm = twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx)
-    if tlm != "" { return emitFailAt(tlm, idxIx) }
-    // A DISTINCT-backing nullable scalar list `t[i]` (narrowed inside `if t != null`): the slot is
-    // `(ref null $wrapper)`, so recover non-null (the guard proved it present) then read as the leaf
-    // list. Checked FIRST — the plain classifiers below do not see through the `| null`.
-    const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
-    if nsk != null { return emitIndexNulScalarList(nd, nsk, fnIx) }
-    // A REF list `xs[i]`.
-    if exprRefArray(nd.idxArr, fnIx) {
-      return emitIndexRefList(nd, idxIx, fnIx)
+    return match idxArmOf(nd, fnIx) {
+      "twolists" => emitFailAt(twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx), idxIx)
+      "nulscalar" => emitIndexNulScalarList(nd, fnIx)
+      "ref" => emitIndexRefList(nd, idxIx, fnIx)
+      // A `(string | null)[]` element stays nullable unless the checker types it non-null.
+      "nulstr" => emitIndexStrList(nd, fnIx, nodeTyProvesNonNull(idxIx))
+      "str" => emitIndexStrList(nd, fnIx, true)
+      "scalar" => emitIndexScalarList(nd, fnIx)
+      "string" => emitIndexRawString(nd, fnIx)
+      "none" => emitFail("emitProgram: index receiver is not an array or string")
     }
-    // A `(string | null)[]` `xs[i]` → the SAME string backing, but the element legitimately holds
-    // `null` (it is a `(ref null $aTypeIdx)`), so the read STAYS nullable — NO `ref.as_non_null`. The
-    // bound value is a `nulstr` the caller narrows with `!= null` (`nodeTyIsNulString` classifies it).
-    // Checked BEFORE `exprStringArray` (whose non-null recovery would trap on a null element).
-    if exprNulStrArray(nd.idxArr, fnIx) {
-      if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
-      // A read the checker types non-null recovers here for the same reason the ref-list arm
-      // does — this is the `(new string | null)[]` rep, eight of D451's 56 cells, and
-      // the one the row's "box rather than a niche" mechanism mis-classified.
-      if nodeTyProvesNonNull(idxIx) { fbRefAsNonNull() }
-      return 0
-    }
-    // A STRING list `xs[i]` → the string backing's element, then `ref.as_non_null` to
-    // surface the non-null string ref. (Checked before the i32 path: a string element is not an i32.)
-    if exprStringArray(nd.idxArr, fnIx) {
-      if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
-      fbRefAsNonNull() // (recover the non-null string)
-      return 0
-    }
-    // A SCALAR list `xs[i]` (f64/i64 checked before i32 since their elements are not i32).
-    const ek = scalarListElemKind(nd.idxArr, fnIx)
-    if ek != null { return emitIndexScalarList(nd, ek, fnIx) }
-    if !exprString(nd.idxArr, fnIx) {
-      return emitFail("emitProgram: index receiver is not an array or string")
-    }
-    // A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]`
-    // behind the `i u< len` guard that keeps an out-of-range index trapping instead of
-    // reading past the view into the rest of the backing. A binding with a live
-    // loop-hoisted header skips the receiver entirely and reads three locals.
-    const shz = liveHoistRow(nd.idxArr, "list", 0 - 1)
-    if shz < 0 {
-      if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
-    }
-    if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
-    if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
-    fbArrayGet(sBackTy()) // 0xfb 0x0b <string backing array type index>
-    return 0
   }
   return emitFail("emitProgram: expected an index access")
 }
 
-// A DISTINCT-backing nullable scalar list `t[i]` of kind `nsk`, narrowed inside `if t != null`:
-// the slot is `(ref null $wrapper)`, so it recovers non-null (the guard proved it present) and
-// reads as the leaf list. Returns 0, or -1 when an operand fails.
-function emitIndexNulScalarList(nd: Index, nsk: VKind, fnIx: i32): i32 {
+// A string list's element, recovered non-null when `nonNull`.
+function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
+  if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
+  if nonNull { fbRefAsNonNull() }
+  return 0
+}
+
+// A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]` behind the
+// `i u< len` guard. A binding with a live loop-hoisted header skips the receiver entirely.
+function emitIndexRawString(nd: Index, fnIx: i32): i32 {
+  const shz = liveHoistRow(nd.idxArr, "list", 0 - 1)
+  if shz < 0 {
+    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
+  fbArrayGet(sBackTy()) // 0xfb 0x0b <string backing array type index>
+  return 0
+}
+
+// A DISTINCT-backing nullable scalar list `t[i]`, narrowed inside `if t != null`: the slot is
+// `(ref null $wrapper)`, so it recovers non-null (the guard proved it present) and reads as the
+// leaf list. Returns 0, or -1 when an operand fails.
+function emitIndexNulScalarList(nd: Index, fnIx: i32): i32 {
+  const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
   if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
@@ -18356,7 +18364,7 @@ function emitIndexNulScalarList(nd: Index, nsk: VKind, fnIx: i32): i32 {
   // `nek` names the leaf element kind whose wrapper / backing / index-scratch pool this
   // read uses; `u8list` is the packed-byte leaf's spelling (the element is a plain i32,
   // so the kind names the list, not a scalar).
-  const nek = scalarListElemOfListKind(nulListBase(nsk) ?? "i32")
+  const nek = if nsk == null { null } else { scalarListElemOfListKind(nulListBase(nsk) ?? "i32") }
   if nek == null {
     return emitFail(
       "emitProgram: a nullable scalar list read has no element kind",
@@ -18452,35 +18460,53 @@ function emitIndexStrListRead(nd: Index, fnIx: i32): i32 {
   return 0
 }
 
-// A SCALAR list `xs[i]` of element kind `ek`: unwrap to its backing and `array.get <back>`,
+// A SCALAR list `xs[i]`: unwrap to its backing and `array.get <back>`,
 // yielding the element in its valtype rep. Returns 0, or -1 on a refusal or a failed operand.
-function emitIndexScalarList(nd: Index, ek: VKind, fnIx: i32): i32 {
-  if !scalarListUsed(ek) {
+function emitIndexScalarList(nd: Index, fnIx: i32): i32 {
+  const ek = scalarListElemKind(nd.idxArr, fnIx)
+  if ek == null || !scalarListUsed(ek) {
     return emitFail("emitProgram: index access but list type not collected")
   }
-  const skHz = liveHoistRow(
+  const hz = scalarListHoistOf(nd, ek, fnIx)
+  if hz < 0 {
+    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  return scalarListGetTail(nd, ek, fnIx, hz)
+}
+
+// The scalar list read both emitters write, in two halves around its operands. This half: the
+// live loop hoist holding the receiver, or -1; under one the receiver is not written.
+export function scalarListHoistOf(nd: Index, ek: VKind, fnIx: i32): i32 {
+  return liveHoistRow(
     nd.idxArr,
     listIdxKindOf(ek),
     exprPackedRow(nd.idxArr, fnIx),
   )
-  if skHz < 0 {
-    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
-  }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+}
+
+// The half after the receiver and index (`hz` from `scalarListHoistOf`): the guard, over the
+// hoisted header or the wrapper, then the backing's `array.get`; a possible view reads through its
+// source.
+export function scalarListGetTail(
+  nd: Index,
+  ek: VKind,
+  fnIx: i32,
+  hz: i32,
+): i32 {
+  const row = exprPackedRow(nd.idxArr, fnIx)
   // A list that may be a view reads its element through the view's source (D3028).
   const ixSv = svDstOfKind(ek)
-  if ixSv >= 0 && skHz < 0 { return emitSvIndexRead(ek, ixSv) }
-  // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
-  if skHz >= 0 {
-    emitListIdxGuardHoisted(skHz, nd.idxIndex)
+  if ixSv >= 0 && hz < 0 { return emitSvIndexRead(ek, ixSv) }
+  if hz >= 0 {
+    emitListIdxGuardHoisted(hz, nd.idxIndex)
   } else {
-    const irow = exprPackedRow(nd.idxArr, fnIx)
     emitListIdxGuard(
-      listIdxWrapSlot(listIdxKindOf(ek), irow),
-      scalarListWrap(ek, irow),
+      listIdxWrapSlot(listIdxKindOf(ek), row),
+      scalarListWrap(ek, row),
     )
   }
-  fbArrayGet(scalarListBack(ek, exprPackedRow(nd.idxArr, fnIx))) // yields the element in its rep
+  fbArrayGet(scalarListBack(ek, row)) // yields the element in its rep
   return 0
 }
 
@@ -18829,6 +18855,7 @@ function saResetRows() {
   saApps = []
   saBads = []
   saSites = []
+  saGlobal = Map()
   return 0
 }
 
@@ -19013,6 +19040,9 @@ function strAccScan(blockIx: i32, fnIx: i32) {
 // site's `SB` is the buffer it allocated last and `SE` that buffer's frontier; nothing else writes
 // `SB`, so a view ending at `SE` extends in place and any other copies (DECISIONS.md "String building is a lowering").
 let saSites: i32[] = []
+// The sites among `saSites` outside any loop, whose buffer and frontier are module globals: a
+// function called from a caller's loop starts each call with a fresh frame (D2669).
+let saGlobal: {[i32]: boolean} = Map()
 
 // True if `a` and `b` spell the same place: one node, or equal non-empty `strPlaceKey`s.
 function strSamePlace(a: i32, b: i32): boolean {
@@ -19087,14 +19117,43 @@ function strSiteMode(binIx: i32, fnIx: i32): i32 {
   return 0
 }
 
-// Note every site inside a loop of this body. A nested function is its own body.
+// Whether the place at `ix` outlives a call of `fnIx`: a name that is no local or parameter of
+// it, or a field or element chain rooted at a parameter or such a name. A site outside a loop
+// whose place dies with the frame (a fresh local) misses on every call, so it keeps no globals.
+function strSiteOutlives(ix: i32, fnIx: i32): boolean {
+  let u = unwrapParen(ix)
+  let chained = false
+  while u >= 0 {
+    const n = nodeAt(u)
+    if n is Member {
+      u = unwrapParen(n.memObj)
+      chained = true
+    } else if n is Index {
+      u = unwrapParen(n.idxArr)
+      chained = true
+    } else {
+      if !(n is Ident) { return false }
+      if chained && paramPosOfRead(fnIx, u) >= 0 { return true }
+      return localIndexOf(fnIx, u) < 0
+    }
+  }
+  return false
+}
+
+// Note every site inside a loop of this body, and every site outside one whose place outlives
+// the call. A nested function is its own body.
 function ssWalk(ix: i32, fnIx: i32, depth: i32) {
   if ix < 0 { return 0 }
   const n = nodeAt(ix)
   if n is FuncDecl { return 0 }
   if n is BinExpr {
-    if depth > 0 && n.binOp == "=" {
-      if strSiteMode(ix, fnIx) > 0 { saSites.push(ix) }
+    if n.binOp == "=" && strSiteMode(ix, fnIx) > 0 {
+      if depth > 0 {
+        saSites.push(ix)
+      } else if strSiteOutlives(n.binLeft, fnIx) {
+        saSites.push(ix)
+        saGlobal[ix] = true
+      }
     }
   }
   if n is WhileStmt {
@@ -19147,6 +19206,7 @@ function strSiteArm(binIx: i32, fnIx: i32) {
   ssArmRhs = -1
   const mode = strSiteModeAt(binIx, fnIx)
   if mode == 0 { return 0 }
+  if saGlobal.has(binIx) && synthSitePairIdx(binIx) < 0 { return 0 }
   const a = nodeAt(binIx)
   if a is BinExpr {
     ssArmRhs = a.binRight
@@ -19175,6 +19235,16 @@ function strSiteSlot(binIx: i32): i32 {
   return listIdxScratchBase + liKinds.length - 1
 }
 
+// A site's buffer or frontier read and write: a local, or the module global of a site outside a loop.
+function siteGet(i: i32, glob: boolean) {
+  if glob { fbGlobalGet(i) } else { fbLocalGet(i) }
+  return 0
+}
+function siteSet(i: i32, glob: boolean) {
+  if glob { fbGlobalSet(i) } else { fbLocalSet(i) }
+  return 0
+}
+
 // Lower an armed site's chain, parts evaluated in the copying lowering's order. `mode` 1
 // extends what part 0 read, 2 what the last part read. A miss allocates exact-fit, so a one-off
 // append keeps no slack; a full hit doubles, so a loop pays one extra copy and stays linear.
@@ -19190,7 +19260,8 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
     fbLocalSet(strCatSlot(j))
     j = j - 1
   }
-  const sb = strSiteSlot(binIx)
+  const glob = saGlobal.has(binIx)
+  const sb = if glob { synthSitePairIdx(binIx) } else { strSiteSlot(binIx) }
   const se = sb + 1
   let acc = 0
   if mode == 2 { acc = n - 1 }
@@ -19217,14 +19288,14 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
   fbLocalSet(strScratchBase + 2) // OUT = its backing
   // I2 = ours: this site's buffer, and a view whose edge is the frontier.
   fbLocalGet(strScratchBase + 2)
-  fbLocalGet(sb)
+  siteGet(sb, glob)
   fbRefEq()
   fbLocalGet(strScratchBase + 6)
   if mode == 1 {
     fbLocalGet(strScratchBase + 4)
     fbI32Bin(106)
   }
-  fbLocalGet(se)
+  siteGet(se, glob)
   fbI32Bin(70)  // i32.eq
   fbI32Bin(113) // i32.and
   fbLocalSet(strScratchBase + 5)
@@ -19263,7 +19334,7 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
   fbSelect()
   fbArrayNewDefault(sBackTy())
   fbLocalTee(strScratchBase + 2)
-  fbLocalSet(sb)
+  siteSet(sb, glob)
   if mode == 2 {
     // A prepend buffer keeps its value at the END, its slack in front.
     fbLocalGet(strScratchBase + 2)
@@ -19292,14 +19363,14 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
     fbLocalTee(strScratchBase + 5)
     fbLocalGet(strScratchBase + 3)
     fbI32Bin(106)
-    fbLocalSet(se)
+    siteSet(se, glob)
   } else {
     fbLocalGet(strScratchBase + 6)
     fbLocalGet(strScratchBase + 3)
     fbI32Bin(107)
     fbLocalTee(strScratchBase + 6)
     fbLocalTee(strScratchBase + 5)
-    fbLocalSet(se)
+    siteSet(se, glob)
   }
   let m = 0
   let left = n - 1

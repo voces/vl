@@ -761,6 +761,54 @@ export function constrainEmpty(srcTy: i32, dstTy: i32) {
   return constrainEmptyD(srcTy, dstTy, 12)
 }
 
+// The callee type parameters a call argument's open element must not be pinned to: ones no
+// argument has bound, which are the callee's and name no type at the caller (D16758). The call
+// binds each from the row once every row has settled (`settleHeldPins`).
+let ceHeldNames: string[] = []
+let ceHeldAt = -1
+
+// Each held pin: the call, the type parameter, and the open row whose element stands for it.
+export const ceHeldCall: i32[] = []
+export const ceHeldName: string[] = []
+export const ceHeldRow: i32[] = []
+
+// Holds type parameters `names` of call `call` open until the next call; `[]` releases them.
+export function constrainEmptyHold(names: string[], call: i32) {
+  ceHeldNames = names
+  ceHeldAt = call
+  return 0
+}
+
+export function ceHeldReset() {
+  ceHeldCall.clear()
+  ceHeldName.clear()
+  ceHeldRow.clear()
+  return 0
+}
+
+// Whether element `el` names a type parameter `constrainEmptyHold` holds.
+function ceHeldIn(el: i32): boolean {
+  for nm in ceHeldNames {
+    if tyMentionsTyVarNamed(el, nm, 8) { return true }
+  }
+  return false
+}
+
+// Records open list `row`, whose element is held type parameter `el`, for the call; an element
+// holding the parameter inside another shape is pinned to that shape.
+function ceHeldPin(row: i32, el: i32) {
+  const r = tyAt(row)
+  if !(r is TyArray) || el < 0 { return 0 }
+  const e = tyAt(el)
+  if e is TyVar {
+    ceHeldCall.push(ceHeldAt)
+    ceHeldName.push(e.tvName)
+    ceHeldRow.push(row)
+    return 0
+  }
+  return tyPinElem(r, el)
+}
+
 function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   if srcTy < 0 || dstTy < 0 || depth <= 0 { return 0 }
   const s = tyAt(srcTy)
@@ -806,6 +854,8 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
             if tyElemOpen(d) {
               tyLinkElem(s, d)
               noteHoleLink(srcTy, dstTy)
+            } else if ceHeldIn(tyElemOf(d)) {
+              ceHeldPin(srcTy, tyElemOf(d))
             } else {
               tyPinElem(s, tyElemOf(d))
             }
@@ -2577,6 +2627,20 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
         if !fnParamSlotAssignable(dp[i], sp[i]) { return false }
         i = i + 1
       }
+      // A set's other un-annotated members are delivered at the same parameters, so their holes
+      // bind there as the value's own do: each member's constraints hold, and pin, at `dstTy`.
+      for m in elabFnSetOf(srcTy) {
+        const mf = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
+        const mi0 = if mf is FuncDecl && mf.fnTyParams.length == 0 { nodeTyIxOf(m) } else { -1 }
+        const mt = if mi0 >= 0 && mi0 < T.tys.length { tyAt(mi0) } else { tyAt(0) }
+        if mt is TyFunc && mt.fnParamTypes.length == dp.length && mi0 != srcTy {
+          let mi = 0
+          while mi < dp.length {
+            bindGenWalk(mt.fnParamTypes[mi], dp[mi], bNames, bTys)
+            mi = mi + 1
+          }
+        }
+      }
       // A value of a set of declared generics holds each member's own constraints; any other
       // names no declaration, so every constraint is consulted (`cstrOwnedBy`'s fallback).
       const gms = genericSetMembers(srcTy)
@@ -4336,7 +4400,7 @@ function fnRetUnionWidens(src: i32, dst: i32): boolean {
   }
   return !tyHasTyVar(src)
     && !tyHasTyVar(dst)
-    && !tyIsLitUnionLike(dst, 8)
+    && !tyIsLitUnionLike(dst)
     && assignable(src, dst)
 }
 
@@ -10552,7 +10616,7 @@ export function memberStorageDiffers(t: i32, j: i32): boolean {
   }
   for m in ms {
     if js.length == 0 {
-      if listJoinStorageDiffers(m, j, 8) { return true }
+      if listJoinStorageDiffers(m, j) { return true }
     } else if listLandsApart(m, js) {
       return true
     }
@@ -10566,7 +10630,7 @@ function listLandsApart(m: i32, js: i32[]): boolean {
   for n in js {
     if n == m || sameVariantTy(n, m) { return false }
     if assignable(m, n) {
-      if !listJoinStorageDiffers(m, n, 8) { return false }
+      if !listJoinStorageDiffers(m, n) { return false }
       fits = true
     }
   }
@@ -11714,23 +11778,23 @@ function nulFoldTieReach(f: i32): i32 {
 
 // Field type `f` with a null-fold wrapper in it replaced by the wrapper's nullable: the field
 // itself, or one held in lists and `| null`s at any depth; a `| null` of the wrapper folds into it.
-function nulFoldTiedTy(f: i32): i32 { return nulFoldTiedTyAt(f, 8) }
+function nulFoldTiedTy(f: i32): i32 { return nulFoldTiedTyAt(f) }
 
-function nulFoldTiedTyAt(f: i32, depth: i32): i32 {
+function nulFoldTiedTyAt(f: i32): i32 {
   const fm = nulFoldMemberTy(f)
   if fm >= 0 { return fm }
-  if f < 0 || depth <= 0 { return f }
+  if f < 0 { return f }
   const ft = tyAt(f)
   match ft {
     TyNullable => {
-      const im = nulFoldTiedTyAt(ft.nInner, depth - 1)
+      const im = nulFoldTiedTyAt(ft.nInner)
       if im != ft.nInner {
         if im >= 0 && tyAt(im) is TyNullable { return im }
         ft.nInner = im
       }
     }
     TyArray => {
-      ft.aElem = nulFoldTiedTyAt(tyElemOf(ft), depth - 1)
+      ft.aElem = nulFoldTiedTyAt(tyElemOf(ft))
     }
     // Any other field type holds no wrapper this tie reaches.
     TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {}
