@@ -37,7 +37,8 @@ with the check only in those two arms:
 | shared stack, check in the record and union arms only | 91,442,628,764 | **+0.68%** |
 
 After master 5b42a89c2 is merged in, the rise is **+0.53%** with the per-call list (91,031,904,770 →
-91,514,422,158 against that master's fixpoint). The remaining rise is the walks now reaching the bottom of large
+91,514,422,158 against that master's fixpoint), and **+0.53%** again after master 97ed6de12 (91,053,071,931 →
+91,535,622,626). The remaining rise is the walks now reaching the bottom of large
 types the cap used to stop at eight levels. `self-compile-time.sh` reads +0.3% on its committed baseline, which passes.
 
 ## Found on the way
@@ -51,5 +52,5 @@ too, so this change does not cause it.
 | reading | value |
 |---|---|
 | seed | fixpoint, branch and base |
-| identity | 2,133 of 2,133 byte-identical against master 32ee97e56 (the 146 files where these caps fired, the 2,000-file random sample and `compiler/entry.vl`), on the final code. After master 5b42a89c2 is merged in, 147 of 147 (the 146 plus `compiler/entry.vl`) against that master's fixpoint. That merge brought one new call site still passing a depth (`emit_elab.vl`), and refreshes failed until it was fixed. Readings taken before the fix are void, and these are from after it |
+| identity | 2,133 of 2,133 byte-identical against master 32ee97e56 (the 146 files where these caps fired, the 2,000-file random sample and `compiler/entry.vl`), on the final code. After master 5b42a89c2 is merged in, 147 of 147 (the 146 plus `compiler/entry.vl`) against that master's fixpoint, and again after master 97ed6de12. That merge brought one new call site still passing a depth (`emit_elab.vl`), and refreshes failed until it was fixed. Readings taken before the fix are void, and these are from after it |
 | net compiler lines | +20 over 24 files: the three walks gain a wrapper each, the shared stack and `tyWalkEnter`; every caller loses its depth argument |
