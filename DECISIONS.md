@@ -12593,3 +12593,58 @@ together are an open clause-1 row (filed with D16866's fix) until they get the s
 
 **Why.** The checker already accepts the un-annotated spelling, so building it changes no verdict; refusing
 it would newly reject a program `vl check` passes.
+
+## A numeric literal pattern is a type test first (2026-11-16, chosen under the owner's delegation) — D3689, D3703, D2221
+
+**The rule.** `x is 2` (an integer literal pattern) is an arm test when `x`'s type has any integer arm
+(an integer width or an integer literal member): it holds only for an integer-arm value equal to 2. Only
+when the subject has no integer arm (`f64`, `f32`, `f64 | string`, `f64 | null`, …) does it compare by
+value, the literal converted to the subject's float type: `const x: f64 = 2.0; x is 2` is true,
+`-0.0 is 0` is true, and an inexact literal compares after conversion as `==` does. The float-literal
+pattern is symmetric. So `1 | 2 | f64` or `i32 | f64` holding `2.0` gives `is 2` false (D2221 stands),
+and after a true `x is 2` on a float subject, `x` stays `f64`.
+
+**Why.** Narrowing must stay sound: a pattern that matched a float value and narrowed it to an integer
+arm builds an invalid module. "The pattern selects the arm of its own kind when one exists" is the one
+statement consistent with distinct int and float arms; an earlier broader wording (compare by value
+everywhere) is superseded.
+
+## A hole set element and a hole map key close to `string` (2026-11-16, chosen under the owner's delegation) — D15040, D16207, D1887
+
+**The rule.** An empty `Set()` or `Map()` whose element or key type nothing binds closes its key to
+`string`; values and list elements keep the `i32` default (D16412/D16562). The default is unobservable as
+a value: a bound result is pinned by its later reads and writes, and an unbound one is empty. It decides
+only which inline read spelling compiles; a filed row (with the D15040 fix) owns letting the read's argument type the element.
+
+**Why.** A set's element is its key, and keys already default to `string`; one rule per role.
+
+## A clause-1 defect may land at an existing emit guard when the check cannot yet see the fact (2026-11-16) — D16878, D16881
+
+**The rule.** The check-refusal-first rule (D16851/D16860) has one exception: when an emit-time guard for
+the mechanism already exists and the fact it reads is decided only after check (here the instance's
+closed callee signature, which mono computes), a trap may close to that emit refusal. The row records
+"loud emit reject; `vl check` passes (contract breach)", and a separate open row owns moving the refusal
+to check, blocked on the stage that makes the fact available (D16881, on S3.4d).
+
+**Why.** A trap from plain code is worse than an honest build refusal; the breach stays named and owned.
+
+## The late tag decider stays for a named residue until the per-instance key lands (2026-11-16, chosen under the owner's delegation) — STORE, L2 S3
+
+**The rule.** `fnTagRedecide` remains the decider only for a closed list of classes (G, the N residue, T
+residue, P, S, V, J, C: 248 programs at the holder rule), guarded by a probe that fails if any other set is
+decided late. Its removal moves from "before L2 S3" to STORE's next stage, which consumes the arrow
+solve's per-call instantiation vector (InstReq's type part, set components included) at check; that
+stage starts from a design note agreed with L2. A second, check-only instance key (option b) is refused
+as a duplicate producer of instance identity.
+
+**Why.** Every remaining late decision needs "which instance does this call create"; only the
+instantiation vector answers that once, for all classes.
+
+## Two smaller calls (2026-11-16)
+
+- **D16872 is fixed destination-side.** A `let` whose slot is laid out wider than its initialiser widens
+  the init to the slot; every other destination of a resolved direct call already converted. Conversion
+  at the call would need every width classifier taught the same fact.
+- **L2 S3.6 takes option B.** The five ambient substitution modes become one scoped `SubstCtx` with
+  enter/leave pairs and a restore guard; threading them as arguments (option A) is deferred until after
+  S3.4d, on the setter and reader counts in the S3.6b note.
