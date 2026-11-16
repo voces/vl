@@ -30,7 +30,16 @@ list; the walk keeps them apart. With the class-reading part D readers the progr
 
 ## Readings
 
-READINGS
+Fixpoint seeds: master `a9ae9324` and this branch.
+
+| check | reading |
+|---|---|
+| `tests/cases` built, byte for byte | 0 of 7,853 differ |
+| distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 `runs -> not-runs` |
+| L2 self-compile fuel | 93.770e9 against the 93.782e9 baseline: -0.0% |
+| seed size | 6,436,728 against 6,436,572: +156 |
+| `lint-self` | clean after `vl fmt -w` (seed byte-identical across the reformat) |
+| `scripts/gate.sh` | every other row ok |
 
 ## Gap list
 
