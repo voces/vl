@@ -12,6 +12,7 @@ const BASELINES = [
   "scripts/sentinel-budget-baseline.json",
   "scripts/byte-budget-baseline.json",
   "scripts/arena-write-budget-baseline.json",
+  "scripts/walk-limit-budget-baseline.json",
 ];
 
 /** Every compiler module reachable from `start` through relative `from "./x"` imports. */
