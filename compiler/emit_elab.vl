@@ -1977,6 +1977,9 @@ export function elabWideTwinOf(k: i32, w: i32): i32 {
   return ekIndex[i32ToStr(k) + "=>" + elabCanonStr(w, ELAB_CANON_DEPTH)] ?? -1
 }
 
+// Each wide twin's base instance (`elabWideTwin`).
+let ekTwinBase: {[i32]: i32} = Map()
+
 // Instance `k` built returning the wider `w`: the same binding under its own key, its body
 // checked once more there; `k` itself when no key is left.
 function elabWideTwin(k: i32, w: i32, from: i32): i32 {
@@ -2000,6 +2003,7 @@ function elabWideTwin(k: i32, w: i32, from: i32): i32 {
   ekDone.push(false)
   ekReach.push([])
   ekRetWide[k2] = w
+  ekTwinBase[k2] = k
   const n0 = ekDecl.length
   elabReachNote(from, k2, -1)
   elabOne(k2)
@@ -10324,6 +10328,7 @@ export function elabRun() {
   elabFnHoldingMemo = Map()
   ekIndex = Map()
   ekRetWide = Map()
+  ekTwinBase = Map()
   elabExactMemo = Map()
   elabExactOnStack = Map()
   elabExactDepth = 0
@@ -16068,14 +16073,15 @@ function elabTwinLamRet(lam: i32, n: i32, own: i32): i32 {
 }
 
 // The numeric result lambda `lam` is called at (`elabLamDeliveredRet`, `own` as there), where its
-// body's closed result `body` is another numeric type: its instance returns the type it is called
-// at, as a lambda delivered there directly does (D16711); -1 otherwise.
+// body's closed result `body` widens to it: its instance returns the type it is called at, as a
+// lambda delivered there directly does (D16711). A narrower one is a sibling instance's (D16817).
 export function elabLamDeliveredNumRet(lam: i32, body: i32, own: i32): i32 {
   if !elabIsNumPrim(body) || lam < 0 || lam >= P.nodes.length { return -1 }
   const a = nodeAt(lam)
   if !(a is FuncDecl) { return -1 }
   const dr = elabLamDeliveredRet(lam, a.fnParams.length, own)
   if dr < 0 || !elabIsNumPrim(dr) || tySameSealed(dr, body) { return -1 }
+  if !assignable(body, dr) { return -1 }
   return dr
 }
 
@@ -17005,6 +17011,15 @@ function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
   return 0
 }
 
+// Whether instance `k` is, or reaches, the instance the delivery search is under, or the base a
+// wide twin of it is built from (a twin runs where its base does).
+function elabKeyRunsDlv(k: i32): boolean {
+  if elabDlvKey < 0 || k < 0 { return false }
+  if k == elabDlvKey || elabReaches(k, elabDlvKey) { return true }
+  const b = ekTwinBase.get(elabDlvKey) ?? -1
+  return b >= 0 && (k == b || elabReaches(k, b))
+}
+
 // Whether call `c` is a caller of the instance the delivery search is under: one it ran there
 // reaches it, or `c` is made at the root, which every search's scope holds.
 function elabCallReachesDlv(c: i32): boolean {
@@ -17778,7 +17793,9 @@ function elabCallDeliveryAdd(c: i32, out: i32[]) {
   let i = 0
   while i + 1 < ks.length {
     const k = ks[i]
-    if !elabDlvKeyOk(k) {
+    // A call search also reads a call typed in an instance that runs the one it is under: the
+    // call is made in that caller's body, which the search climbed out to (D16791).
+    if !elabDlvKeyOk(k) && !elabKeyRunsDlv(k) {
       i = i + 2
       continue
     }
@@ -22834,6 +22851,27 @@ function eplPathPlus(path: string[], step: string): string[] {
   return out
 }
 
+// The instance of member `d` at `ps` under the instance of `d`'s enclosing function that the
+// holder's value, one call of that function, runs: each such call builds its own closure, so a
+// sibling call's instance is not this holder's (D16815). -1 when the holder holds no such call.
+function eplHolderCallMember(d: i32, ps: i32[]): i32 {
+  const h = EPL.holder
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is LetDecl) || hn.letInit < 0 { return -1 }
+  const c = parenPeelIx(hn.letInit)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || cn.callFn < 0 { return -1 }
+  const f = parenPeelIx(cn.callFn)
+  const fnode = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  const md = if fnode is Ident { identDeclOf(f) } else { -1 }
+  if md < 0 || recEnclosingFn(d) != md || !eplInstanced(md) { return -1 }
+  const ct = eplCallTarget(c, md, EPL.k)
+  if ct < 0 { return -1 }
+  const noNames: string[] = []
+  const noTys: i32[] = []
+  return elabKeyAtPins(d, noNames, noTys, ps, ct)
+}
+
 // Function leaf type `t` at place `p`, slot `path` of the holder, closed by its class; -1 where it
 // stays open.
 function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
@@ -22878,7 +22916,9 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
     // A member copied in from an upstream class may answer by its instance under the frame.
     const own = i32ListHas(EPL.members[eplFind(p)], m)
     // A slot's own-calls reading takes a nested member's instance under the frame at any path.
-    const mu = if own || (path.length == 0 && !eplReadsContainer(p) && !EPL.ownOnly) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
+    // A holder of one call of the member's instanced frame holds that call's instance (D16815).
+    const hm = eplHolderCallMember(elabSrcDecl(m), ps)
+    const mu = if hm >= 0 { hm } else if own || (path.length == 0 && !eplReadsContainer(p) && !EPL.ownOnly) { -1 } else { eplFrameMember(elabSrcDecl(m), ps) }
     const mk = if mu >= 0 { mu } else { elabKeyAtPins(elabSrcDecl(m), noNames, noTys, ps, -1) }
     // A member whose own signature is closed at `ps` answers by it.
     const so0 = eplOwnSigAt(elabSrcDecl(m), ps)
