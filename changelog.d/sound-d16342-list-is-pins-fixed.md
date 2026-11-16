@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D16342 closed** (owner ruling (a): an annotation fixes an empty list's element type wherever the value goes): a list `is` test over an un-annotated or a type parameter (`function take(v) { return v is f64[] }`) handed an annotated empty `i32[]` answered `true` by emptiness; it answers `false`, as `e is f64[]` does. A list nothing fixed (`take([])`) still fits every list type, an instance whose own fixed list meets the test still passes it, and a parameter handed both a fixed and an open empty list is refused at both calls until inferred interfaces record the per-call fact. Filed D16701 (a `V[]`, `V[][]` or record-field operand still answers by emptiness).
