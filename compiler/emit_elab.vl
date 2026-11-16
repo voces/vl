@@ -10304,6 +10304,8 @@ export function elabRun() {
   eplAsked = false
   eplFrozen = false
   eplTakesFn = -1
+  eplFrozenTys = []
+  eplFrozenAnn = []
   elabPinsClosedSet(false)
   elabCbRepKeys = Map()
   elabSigAltKeys = Map()
@@ -15194,7 +15196,7 @@ function eplCallbackLamTy(lam: i32, k: i32): i32 {
   if !(cf is Member) || !eplCbMethod(cf.memProp) || cwIxUpAux[lam] != 0 {
     return -1
   }
-  const t = if k >= 0 { elabNodeTy(lam, k) } else { nodeTyIxOf(lam) }
+  const t = if k >= 0 { elabNodeTy(lam, k) } else { eplNodeTy(lam) }
   if (
     t < 0
     || t >= T.tys.length
@@ -19820,7 +19822,7 @@ function eplUncalled(p: i32, t: i32): i32 {
     const ks = EPL.insts.get(d) ?? []
     if ks.length == 0 { bare = bare + 1 }
     for k in ks {
-      const st = elabSubstClosed(nodeTyIxOf(d), k)
+      const st = elabSubstClosed(eplNodeTy(d), k)
       if st < 0 || (sig >= 0 && !tySameSealed(sig, st)) { return -1 }
       sig = st
     }
@@ -19997,7 +19999,7 @@ function eplCallTarget(c: i32, fd: i32, k: i32): i32 {
   if !(cn is Call) { return -2 }
   const ps: i32[] = []
   for a in cn.callArgs {
-    const t = if k >= 0 { elabNodeTy(a, k) } else { nodeTyIxOf(a) }
+    const t = if k >= 0 { elabNodeTy(a, k) } else { eplNodeTy(a) }
     if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -2 }
     ps.push(t)
   }
@@ -20098,6 +20100,7 @@ function eplRootK(n: i32, kk: i32): i32 {
 
 // Whether holder `n` is written with an annotation, which bounds its whole class.
 function eplAnnotated(n: i32): boolean {
+  if eplFrozen && n >= 0 && n < eplFrozenAnn.length { return eplFrozenAnn[n] }
   const nd = if n >= 0 && n < P.nodes.length { nodeAt(n) } else { null }
   return (nd is LetDecl && nd.letType >= 0)
     || (nd is Param && nd.parType >= 0)
@@ -20114,7 +20117,7 @@ function eplBoundOf(r: i32): i32 {
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   // A call result, or a holder written in a generic, is typed at the place's instance.
   const te = if xn is Call || EPL.boundK[r] >= 0 { elabNodeTy(x, EPL.boundK[r]) } else { -1 }
-  const t = if te >= 0 { te } else if x >= 0 { nodeTyIxOf(x) } else { -1 }
+  const t = if te >= 0 { te } else if x >= 0 { eplNodeTy(x) } else { -1 }
   if t >= 0 && t < T.tys.length && !tyHasTyVar(t) && !tyHoldsHole(t) {
     EPL.bound[r] = t
     return t
@@ -20396,7 +20399,7 @@ function eplMembersStar(p: i32): i32[] {
 
 // The element type of list `x`'s checked type; -1 where it is no list.
 function eplElemTyOf(x: i32): i32 {
-  const t = nodeTyIxOf(x)
+  const t = eplNodeTy(x)
   const nt = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
   const o = if nt >= 0 && nt < T.tys.length { tyAt(nt) } else { null }
   return if o is TyArray { tyElemOf(o) } else { -1 }
@@ -20405,7 +20408,7 @@ function eplElemTyOf(x: i32): i32 {
 function eplStepOfRecv(recv: i32): string {
   // A receiver an instance types its own way (a list at one call, a map at another) steps by it.
   const te = if EPL.k >= 0 { elabNodeTy(recv, EPL.k) } else { -1 }
-  const t = if te >= 0 { te } else { nodeTyIxOf(recv) }
+  const t = if te >= 0 { te } else { eplNodeTy(recv) }
   const nt = if t >= 0 && t < T.tys.length { nonNullTy(t) } else { -1 }
   if nt >= 0 && nt < T.tys.length && tyAt(nt) is TyMap { return "v" }
   return "e"
@@ -20816,7 +20819,7 @@ function eplArgHoldsCallFn(u: i32): boolean {
   const f = parenPeelIx(c.callFn)
   const d = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
   if !elabDeclPinnedByCall(d) { return false }
-  const t = nodeTyIxOf(x)
+  const t = eplNodeTy(x)
   return t >= 0 && t < T.tys.length && tyAt(t) is TyFunc && tyHoldsHole(t)
 }
 
@@ -20824,7 +20827,7 @@ function eplArgHoldsCallFn(u: i32): boolean {
 function eplArgTy(ci: i32, a: i32): i32 {
   const k = EPL.callKey[ci]
   const t = if k >= 0 { elabNodeTy(a, k) } else { -1 }
-  return if t >= 0 { t } else { nodeTyIxOf(a) }
+  return if t >= 0 { t } else { eplNodeTy(a) }
 }
 
 // The call record whose closed argument types every call through class `c` agrees on; -1 when
@@ -21072,7 +21075,7 @@ function eplFrameMember(d: i32, ps: i32[]): i32 {
   if k0 >= 0 { return k0 }
   // An instance under another parent whose own parameters are `ps` answers too.
   for k in EPL.insts.get(d) ?? [] {
-    const st = elabSubstClosed(nodeTyIxOf(d), k)
+    const st = elabSubstClosed(eplNodeTy(d), k)
     const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
     if so is TyFunc && elabTysSame(so.fnParamTypes, ps) { return k }
   }
@@ -21098,7 +21101,7 @@ function eplFrameMember(d: i32, ps: i32[]): i32 {
 // -1 for none or two.
 // The result of `d`'s own signature where it is closed and takes exactly `ps`; -1 otherwise.
 function eplOwnSigAt(d: i32, ps: i32[]): i32 {
-  const ft = if d >= 0 && d < P.nodes.length { nodeTyIxOf(d) } else { -1 }
+  const ft = if d >= 0 && d < P.nodes.length { eplNodeTy(d) } else { -1 }
   const fo = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
   if !(fo is TyFunc) || tyHasTyVar(ft) || fo.fnParamTypes.length != ps.length {
     return -1
@@ -21222,7 +21225,7 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
     const rt = if mk >= 0 { elabResultOf(mk) } else if so0 >= 0 { so0 } else if eplInstanced(m) { -1 } else { eplFrameResult(m, ps.length) }
     if rt < 0 { return -1 }
     if mk >= 0 && mk != mu {
-      const st = elabSubstClosed(nodeTyIxOf(elabSrcDecl(m)), mk)
+      const st = elabSubstClosed(eplNodeTy(elabSrcDecl(m)), mk)
       const so = if st >= 0 && st < T.tys.length { tyAt(st) } else { null }
       if !(so is TyFunc) || so.fnParamTypes.length != ps.length { return -1 }
       if pinSet && !elabTysSame(pin, so.fnParamTypes) { return -1 }
@@ -21247,9 +21250,9 @@ let eplFrozen = false
 
 const EPL_FROZEN_MSG = "emitProgram: internal: the place classes were rebuilt after mono began"
 
-// Freezes the classes for mono, building them first where no reader has yet: a build or a stale
-// mark after this fails the emit. A program that takes no function as a value freezes them empty,
-// since nothing in it is delivered.
+// Freezes the classes for mono: builds them where no reader has yet (empty for a program that takes
+// no function as a value), settles every class's bound, and records each node's type and annotation.
+// A build or a stale mark after this fails the emit.
 export function eplFreeze() {
   if EPL.stale {
     if eplTakesFnOnce() {
@@ -21261,8 +21264,32 @@ export function eplFreeze() {
     }
     EPL.stale = false
   }
+  let r = 0
+  while r < EPL.bound.length {
+    eplBoundOf(r)
+    r = r + 1
+  }
+  eplFrozenTys = []
+  eplFrozenAnn = []
+  let x = 0
+  while x < P.nodes.length {
+    eplFrozenTys.push(nodeTyIxOf(x))
+    eplFrozenAnn.push(eplAnnotated(x))
+    x = x + 1
+  }
   eplFrozen = true
   return 0
+}
+
+// Each node's type and whether it is annotated as they stood at the freeze: the class readers asked
+// during mono read these, not the types and annotations mono pins (D16768).
+let eplFrozenTys: i32[] = []
+let eplFrozenAnn: boolean[] = []
+
+// Node `x`'s type for a class reader: as of the freeze once mono has begun.
+function eplNodeTy(x: i32): i32 {
+  if eplFrozen && x >= 0 && x < eplFrozenTys.length { return eplFrozenTys[x] }
+  return nodeTyIxOf(x)
 }
 
 // Builds the place classes over the elaborated program as it stands: every instance settled so far.
@@ -21420,7 +21447,7 @@ export function eplValueSig(v: i32, k: i32): i32 {
     EPL.k = k0
     return -1
   }
-  const t = nodeTyIxOf(v)
+  const t = eplNodeTy(v)
   EPL.holder = -1
   EPL.ownOnly = true
   const one = eplOneCall(p)
@@ -21474,7 +21501,7 @@ function eplSlotSigAt(holder: i32, path: string[], k: i32, omit: i32[]): i32 {
   }
   const h = eplSrcHolder(holder)
   // The classes see a captured binding at its written type; the capture rewrite types it a cell.
-  const t0 = elabSlotTyOf(nodeTyIxOf(h), path)
+  const t0 = elabSlotTyOf(eplNodeTy(h), path)
   const to = if t0 >= 0 && t0 < T.tys.length { tyAt(t0) } else { null }
   const cell = path.length == 0 && (cboxCellDecls[cboxDeclKey(h)] ?? 0) == 1
   const t = if cell && to is TyArray { tyElemOf(to) } else { t0 }
@@ -21831,7 +21858,7 @@ export function eplSlotDeliveredTys(
   // A function value is delivered only at its own arity; a binding's slot whose checked type is a
   // closed function type is also delivered at it.
   const sh = eplSrcHolder(holder)
-  const own = elabSlotTyOf(nodeTyIxOf(sh), path)
+  const own = elabSlotTyOf(eplNodeTy(sh), path)
   const of = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   if !(of is TyFunc) { return out }
   const shn = if sh >= 0 && sh < P.nodes.length { nodeAt(sh) } else { null }
@@ -21891,7 +21918,7 @@ function eplSlotCallTysInto(
         }
       }
       const rt0 = if ck >= 0 { elabNodeTy(EPL.callNode[ci], ck) } else { -1 }
-      const rt = if rt0 >= 0 { rt0 } else { nodeTyIxOf(EPL.callNode[ci]) }
+      const rt = if rt0 >= 0 { rt0 } else { eplNodeTy(EPL.callNode[ci]) }
       // A call is a delivery where its arguments are closed, at the result the call is typed.
       if tys.length == cn.callArgs.length && rt >= 0 {
         const ft = mkFuncTy(tys, rt)
@@ -21960,7 +21987,7 @@ function eplSlotAgreedCalls(
       const tup: i32[] = []
       // An argument is read at its checked type: one open in the body is open at every instance.
       for a in cn.callArgs {
-        const t = nodeTyIxOf(a)
+        const t = eplNodeTy(a)
         if t < 0 || t >= T.tys.length || tyHasTyVar(t) { ok = false }
         tup.push(if ok { widenLitTy(t) } else { -1 })
       }
@@ -22058,7 +22085,7 @@ export function eplValueTy(v: i32, k: i32): i32 {
   EPL.k = k
   EPL.holder = -1
   const none: string[] = []
-  const r = eplRebuild(root, nodeTyIxOf(v), 0, none)
+  const r = eplRebuild(root, eplNodeTy(v), 0, none)
   EPL.holder = h0
   EPL.k = k0
   return r
@@ -22073,7 +22100,7 @@ function eplHolderTy(ix: i32, k: i32): i32 {
   }
   EPL.k = k
   const te = if k >= 0 { elabNodeTy(ix, k) } else { -1 }
-  const t = if te >= 0 && tyHasTyVar(te) { te } else { nodeTyIxOf(ix) }
+  const t = if te >= 0 && tyHasTyVar(te) { te } else { eplNodeTy(ix) }
   const root = eplRoot(ix)
   const none: string[] = []
   EPL.holder = ix
