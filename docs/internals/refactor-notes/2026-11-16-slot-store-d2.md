@@ -34,6 +34,17 @@ wasm; every one prints the same output.
   `generics/generic-value-slot-written-in-generic-body-at-two-instances` (13 lambdas to 8, 35
   functions to 27), `generics/call-through-generic-value-owns-only-its-constraints` (4 to 3) and
   `functions/maker-lambda-set-into-map-at-f64-result` (2 to 1).
+- `tests/vl_fn_ret_shadow_test.ts`'s `COL_CALLEE` program builds one lambda fewer: master's
+  `__lambda_0` is an `unreachable` stub beside `__lambda_2` holding `x + x`; this branch builds one
+  `__lambda_0` with the body (output `2 s 2 s 14 8` on both). The test's expected rows drop
+  `__lambda_2`.
+
+## Closed
+
+- [D16852](../inventory/D16852.md): two maker calls at two pins, one called directly and one handed
+  to an un-annotated parameter, refused at emit on master, run (`5` `2.75`); fixture
+  `functions/maker-calls-at-two-pins-one-called-one-handed-on.vl`. The ingredient is not isolated:
+  disabling the maker-returned rule in `elabLamParamTyAt` leaves it running.
 
 ## Readings
 
