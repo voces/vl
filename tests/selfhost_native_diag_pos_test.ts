@@ -253,38 +253,56 @@ Deno.test({
     // that had nothing to do with the failure.
     //
     // Two things fix it and this pins both: the expression floors are NODE-anchored
-    // (`emitFailAt`, here the `is` node → its operator token, 0-based col 18 of line 11,
-    // printed 1-based as 11:19), and the start function arms a top-level STATEMENT cursor so
-    // any other failure it raises lands on the statement instead of on a stale function.
+    // (`emitFailAt`, here the call node → its `(` token, 0-based col 25 of line 11, printed
+    // 1-based as 11:26), and the start function arms a top-level STATEMENT cursor so any other
+    // failure it raises lands on the statement instead of on a stale function.
     //
-    // The witness is a top-level integer-literal `is` test over a float read through a generic
-    // identity's result, still a loud refusal anchored at its node (D3689). The earlier witnesses
-    // lower since D15314, D15882 (D4266), D16049, D16170, D16207 and D16725.
+    // The refusal is the harness's own (`--test-emit-refusal` refuses a call to
+    // `__vl_test_emit_refusal__`), so no capability fix can move it.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
-      const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
-        path,
-        "function take<B>(b: B): B {\n" +
+        `${dir}/case.vl`,
+        "function __vl_test_emit_refusal__() {}\n" +
+          "function take<B>(b: B): B {\n" +
           "  return b\n" +
           "}\n" +
-          "function pad(x: i32): i32 {\n" +
+          "function pad(x: i32) {\n" +
           "  return x + 1\n" +
           "}\n" +
           "print(pad(1))\n" +
           "const one = 1\n" +
-          "const d: f64 = 1.5\n" +
-          "print(one + d)\n" +
-          "print(take(d) is 1)\n",
+          "print(take(one))\n" +
+          "__vl_test_emit_refusal__()\n",
       );
-      const r = await build(path);
-      if (r.code === 0) {
-        throw new Error("expected emit-stage rejection, got exit 0");
-      }
-      const needle = `${path}:11:19:`;
-      if (!r.err.includes(needle)) {
+      const { code, stdout, stderr } = await new Deno.Command(VL, {
+        args: [
+          "check",
+          "--codegen",
+          "--test-emit-refusal",
+          "case.vl",
+          "--compiler",
+          COMPILER,
+        ],
+        cwd: dir,
+        stdout: "piped",
+        stderr: "piped",
+        env: nativeEnv(),
+      }).output();
+      const out = new TextDecoder().decode(stdout) +
+        new TextDecoder().decode(stderr);
+      if (code === 0 || !out.includes("test-only refusal")) {
         throw new Error(
-          `expected stderr to contain "${needle}", got:\n${r.err}`,
+          "`--test-emit-refusal` no longer refuses the hook call, so this guard is measuring " +
+            `nothing (exit ${code}):\n${out}`,
+        );
+      }
+      const blk = out.split(/\n(?=\[)/).find((b) => b.startsWith("[ERROR]")) ??
+        "";
+      const needle = "at case.vl:11:26";
+      if (!blk.includes(needle)) {
+        throw new Error(
+          `expected the [ERROR] block to contain "${needle}", got:\n${out}`,
         );
       }
     } finally {
