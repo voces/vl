@@ -64,8 +64,8 @@ import {
   elabCallParamBoundTy,
   elabCbArgSig,
   elabDeclFnOf,
-  elabDeclHasHoleParam,
   elabDeclIsValue,
+  elabDeclPinnedByCall,
   elabFnDeclRetAt,
   elabFnDeclRetAtUnder,
   elabFnTyRetAt,
@@ -7054,7 +7054,7 @@ function monoPinBin(ix: i32, n: BinExpr, pNames: string[], pTys: i32[]): i32 {
     }
     if tyHasTyVar(elt) || tyHasTyVar(ert) { elt = -1 }
     if elt >= 0 && ert >= 0 {
-      const fw = recEqTypedChain(bl, br, elt, ert, n.binOp == "!=", n.pos)
+      const fw = recEqTypedChain(bl, br, elt, ert, n.binOp == "!=", ix, n.pos)
       if fw >= 0 {
         nodeSrcNote(fw, ix)
         return fw
@@ -10808,7 +10808,7 @@ function monoCoerceFnValueTys(
       }
       // A maker delivered at a closed function type is its instance at that type's result.
       // A maker with an un-annotated parameter is pinned by its calls, which this read is not.
-      if monoIsMakerFe(gfe) && !elabDeclHasHoleParam(monoOrigNode[gfe]) {
+      if monoIsMakerFe(gfe) && !elabDeclPinnedByCall(monoOrigNode[gfe]) {
         const dt = if expTy >= 0 { expTy } else { tnameTy }
         return monoMakerTwin(gfe, exprIx, monoFnTyRet(dt), delTys, ctx)
       }
@@ -18568,17 +18568,6 @@ function monoIsHoleLamArg(a: i32): boolean {
     && elabOpenFnArgDecl(x) >= 0
 }
 
-// The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956, D7183).
-function monoGenArgOpenFail(ix: i32): i32 {
-  return emitFailAt(
-    "emitProgram: a generic function is passed to a function value whose parameter type "
-      + "names a type parameter this closure does not bind, so no instance of it can be "
-      + "chosen — call the function value from the generic function's own body, or pass "
-      + "a function of a concrete type",
-    ix,
-  )
-}
-
 // Whether call `n`, through a function value, hands a declared generic function to a parameter
 // whose recorded type names a type variable, which leaves the generic with no instance.
 function monoGenArgAtOpenParam(n: Call, ctx: i32): boolean {
@@ -18600,6 +18589,48 @@ function monoGenArgAtOpenParam(n: Call, ctx: i32): boolean {
     i = i + 1
   }
   return false
+}
+
+// Instances each declared generic call `n` (node `ix`) hands a parameter its recorded type leaves
+// open at that parameter's type in the instance being walked (`ctx`); refuses where one stays open
+// there, since no instance of the generic can be chosen (D3956). 0, or -1.
+function monoGenArgsAtInstanceParams(n: Call, ix: i32, ctx: i32): i32 {
+  const ct = nodeTyIxOf(n.callFn)
+  const it = elabNodeTyAt(unwrapParen(n.callFn), ctx)
+  const f = if ct >= 0 && ct < T.tys.length { tyAt(ct) } else { null }
+  const g = if it >= 0 && it < T.tys.length { tyAt(it) } else { null }
+  const closes = f is TyFunc
+    && g is TyFunc
+    && g.fnParamTypes.length == f.fnParamTypes.length
+  let i = 0
+  while f is TyFunc && i < n.callArgs.length && i < f.fnParamTypes.length {
+    const pt = f.fnParamTypes[i]
+    if (
+      pt >= 0
+      && pt < T.tys.length
+      && tyHasTyVar(pt)
+      && monoNamesDeclaredGeneric(n.callArgs[i], ctx)
+    ) {
+      const ip = if closes && g is TyFunc { g.fnParamTypes[i] } else { -1 }
+      if (
+        ip < 0
+        || ip >= T.tys.length
+        || tyHasTyVar(ip)
+        || !(tyAt(ip) is TyFunc)
+      ) {
+        return emitFailAt(
+          "emitProgram: a generic function is passed to a function value whose parameter type "
+            + "names a type parameter this closure does not bind, so no instance of it can be "
+            + "chosen — call the function value from the generic function's own body, or pass "
+            + "a function of a concrete type",
+          ix,
+        )
+      }
+      if monoCoerceFnValue(n.callArgs[i], ip, ctx) < 0 { return -1 }
+    }
+    i = i + 1
+  }
+  return 0
 }
 
 // Whether annotation node `annIx` is typed as a function or a nullable function: a slot a
@@ -20308,7 +20339,7 @@ function monoInstantiateCallIn(origFe: i32, callIx: i32, ctx: i32) {
       // A maker with an un-annotated parameter whose call is delivered at another result is its
       // elaboration's wide twin there (D16778).
       const mkd = monoOrigNode[origFe]
-      const mks = if elabDeclHasHoleParam(mkd) { elabMakerCallSig(callIx) } else { -1 }
+      const mks = if elabDeclPinnedByCall(mkd) { elabMakerCallSig(callIx) } else { -1 }
       if mks >= 0 && elabMakerTwinHeld(mkd, mks) && elabMakerOpen(mkd) {
         req.retWidenTy = mks
       }
@@ -23021,7 +23052,7 @@ function monoWalk(ix: i32, ctx: i32) {
         && (callee is Index || calleeIf)
         && monoGenArgAtOpenParam(n, ctx)
       ) {
-        return monoGenArgOpenFail(ix)
+        if monoGenArgsAtInstanceParams(n, ix, ctx) < 0 { return -1 }
       }
       if callee is Ident {
         return monoWalkIdentCall(n, callee, ix, ctx, elemsTyped)
@@ -23432,7 +23463,9 @@ function monoWalkIdentCall(
     && monoAliasLetLamFe(ix, ctx) < 0
     && monoArmLamFe(n.callFn, callee) < 0
   ) {
-    return monoGenArgOpenFail(ix)
+    // The instance being walked may close the parameter type the template leaves open: the
+    // generic is instanced at that (D3956).
+    if monoGenArgsAtInstanceParams(n, ix, ctx) < 0 { return -1 }
   }
   // A call through a written, un-annotated `let` holding generic functions instances each one
   // written at the call's type, which one binding holds one of (D3979).
@@ -23585,12 +23618,11 @@ function monoWalkIdentCall(
       const twinMs = monoBuild.twinCalls.get(ix) ?? -1
       const ms = if twinMs >= 0 { twinMs } else { elabMakerCallSig(ix) }
       const mc = nodeAt(ix)
-      // A call in an instanced body is one node for every instance; it keeps its path.
-      const shared = twinMs < 0 && ctx >= 0 && monoCadInstOf(ctx) >= 0
+      // A call in an instanced body is one node for every instance, and its result is one per
+      // node, so every instance builds the same twin there (D16791).
       if (
         ms >= 0
         && mc is Call
-        && !shared
         && elabMakerTwinHeld(monoOrigNode[fe], ms)
         && elabMakerOpen(monoOrigNode[fe])
       ) {
@@ -26468,7 +26500,7 @@ function monoPruneTemplates(nDecl: i32) {
   const deadLams = monoUnreadLamSlots(nDecl)
   // A capture cell an instantiated hole lambda seeds takes the instance's function type. One no
   // call or peer pinned, stored as a list element or in such a cell, has no type for the element
-  // but the hole's `i32` default, so it is refused rather than stored there (D3851).
+  // but the hole's `i32` default, so it is refused, unless it is dead (`deadLams`) (D3851).
   if monoBindingsAtPin(nDecl) < 0 { return -1 }
   let pass = 0
   while pass < 2 {
@@ -26490,7 +26522,7 @@ function monoPruneTemplates(nDecl: i32) {
     if monoGen[sl] == 1 && criFnIsAnonLambda(sl) {
       const unpinned = fnStmts[sl] == monoOrigNode[sl]
         && !monoInstantiatedAny(sl)
-      if unpinned && monoLamStoredAsElement(sl) {
+      if unpinned && !i32ListHas(deadLams, sl) && monoLamStoredAsElement(sl) {
         return emitFail(
           "emitProgram: a lambda with an un-annotated parameter is stored in a list, or in a variable a nested function writes, and no call fixes its parameter types — annotate its parameters",
         )
