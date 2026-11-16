@@ -7137,13 +7137,20 @@ function holeSlotPlainRead(a: i32): boolean {
 // Whether `path` reads a field of a record nested in a list's element: `[]` first, then two or
 // more field steps.
 function holeSlotElemNestedField(path: string[]): boolean {
-  if path.length < 3 || path[0] != "[]" { return false }
-  let k = 1
-  while k < path.length {
-    if path[k] == "[]" { return false }
-    k = k + 1
+  return holeSlotLeadElems(path) == 1 && path.length >= 3
+}
+
+// How many element steps `path` opens with, where no element step follows its first field; -1
+// for a path with an element step after a field.
+function holeSlotLeadElems(path: string[]): i32 {
+  let k = 0
+  while k < path.length && path[k] == "[]" { k = k + 1 }
+  let j = k
+  while j < path.length {
+    if path[j] == "[]" { return -1 }
+    j = j + 1
   }
-  return true
+  return k
 }
 
 // Whether each element in `els` builds every record along `path` (after its `[]` step, before
@@ -7174,6 +7181,13 @@ function holeSlotOneElemField(path: string[]): boolean {
   return n == 1
 }
 
+// Whether `path` reads a field of a list of lists' element record: two or more `[]` steps, then
+// that element's field, last.
+function holeSlotListListField(path: string[]): boolean {
+  const k = holeSlotLeadElems(path)
+  return k >= 2 && path.length == k + 1
+}
+
 // Whether the read `a` of a field at `path` is lifted as an element is: a plain read of a field of
 // a list's records or of a record, nested in records at any depth, at the place's root, the
 // binding `b`'s initialiser `init` or the values the call there returns. A record nested in a
@@ -7182,7 +7196,10 @@ function holeSlotFieldLift(a: i32, init: i32, path: string[], b: i32): boolean {
   const recField = path.length > 0 && !strListHas(path, "[]")
   const nestedElem = holeSlotElemNestedField(path)
   if (
-    !(recField || nestedElem || holeSlotOneElemField(path))
+    !(recField
+      || nestedElem
+      || holeSlotOneElemField(path)
+      || holeSlotListListField(path))
     || !holeSlotPlainRead(a)
   ) {
     return false
@@ -7200,9 +7217,50 @@ function holeSlotFieldLift(a: i32, init: i32, path: string[], b: i32): boolean {
     return holeSlotElemLitsOnly(n.arrElems, path)
       && holeSlotElemLitsOnly(pushed, path)
   }
+  // A list of lists is lifted only where list literals build every level down to its record
+  // literals, in its initialiser and every write at each level (D16824).
+  if holeSlotListListField(path) {
+    const k = path.length - 1
+    if !(n is ArrayLit) || b < 0 || !holeSlotListLitsFrom(n.arrElems, k, 1) {
+      return false
+    }
+    const steps: string[] = []
+    let d = 1
+    while d <= k {
+      steps.push("[]")
+      const vals: i32[] = []
+      const ats: i32[] = []
+      if (
+        !cwSlotWrittenAfter(b, steps, vals, ats)
+        || !holeSlotListLitsFrom(vals, k, d)
+      ) {
+        return false
+      }
+      d = d + 1
+    }
+    return true
+  }
   if !(n is Call) { return true }
   const rets: i32[] = []
   return holeSlotCallRetsDeep(n, rets, 0)
+}
+
+// Whether each of `els`, the values at element step `d` of a list `k` steps deep, is a list
+// literal holding the same below it, or at step `k` a record literal.
+function holeSlotListLitsFrom(els: i32[], k: i32, d: i32): boolean {
+  for el in els {
+    const x = parenPeelIx(el)
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if d >= k {
+      if !(xn is ObjLit) { return false }
+    } else if (
+      !(xn is ArrayLit)
+      || !holeSlotListLitsFrom(xn.arrElems, k, d + 1)
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 // `holeSlotJudge` for a slot read `a` rooted at a call, `mk()[1].f`: every function the call's
