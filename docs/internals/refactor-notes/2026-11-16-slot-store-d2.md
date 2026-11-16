@@ -50,4 +50,19 @@ wasm; every one prints the same output.
 
 ## Readings
 
-READINGS
+All against master `7de7196e2`; both seeds reach their fixpoint on the second refresh.
+
+- `tests/cases`, 8137 programs with the module entries, built by both seeds (exit code, refusal text,
+  wasm bytes): the 4 movers above, and the D16852 fixture going from refused to built. No other
+  difference.
+- Distilled regress: 0 runs → not-runs, 0 → silent (of 260,747 census cells); per-cell output
+  identical to master's.
+- Capability matrix A/B over the 153 templates matching `maker|hole-fn|list-of|fn-record|closure|
+  captured|generic-relay`: 0 runs → not-runs, no REGRESS line; 8 cells of
+  `maker-calls-handed-on-at-two-signatures` go from an emit refusal to runs. Its `one_instance`
+  cells are invalid wasm on both seeds ([D16851](../inventory/D16851.md)).
+- L2 self-compile fuel 97,742,324,383, +0.7% on the ledger's 97,109,760,489 (bar +1%).
+- Late demands 9 in 7 files: 8 on master, plus the D16852 fixture's `half`.
+- Call graph (`compiler/*.vl`, by name reference, comments excluded): 13 functions reach
+  `elabSlotDeliveries`, and every one is in its own callee closure; nothing outside the walk
+  refers to it.
