@@ -2,13 +2,16 @@
 // `$VL_IR_SHADOW=1` and the shadow's `[ir]` rows are summed.
 //
 //     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] [--write-baseline]
+//     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] --blockers [--top N]
 //
 // It prints covered and matched, and every mismatch class with its count. It exits 1 on a
 // verifier failure, or on a mismatch class whose count is above `ir-shadow-baseline.txt` (a
 // class the baseline does not list counts as 0 there). A count that fell prints and passes,
 // and `--write-baseline` records the current counts. Exit 2 is the harness failing: a chunk
 // trapped or timed out, or the host printed no rows. Run it from the checkout root; chunks
-// run `$JOBS` at a time (default 4).
+// run `$JOBS` at a time (default 4). `--blockers` runs the blocker census (`$VL_IR_SHADOW=4`) and
+// prints, per set of one or two miss classes, the functions that set alone keeps uncovered: the
+// functions a coverage step unblocks, an upper bound since a statement stops at its first miss.
 
 import { IoError, readTextFile, writeTextFile } from "std:fs"
 import { programArgs } from "std:args"
@@ -95,7 +98,12 @@ function addRows(m: Measured, text: string) {
 }
 
 // Builds every cell under the armed shadow, `jobs` chunks at a time.
-function measure(paths: string[], seed: string, jobs: string): Measured {
+function measure(
+  paths: string[],
+  seed: string,
+  jobs: string,
+  mode: string,
+): Measured {
   const vl = envOr("VL", "scripts/vl-host/target/release/vl")
   const root = makeTempDir()
   const chunks: string[] = []
@@ -109,7 +117,9 @@ function measure(paths: string[], seed: string, jobs: string): Measured {
   }
   writeText(root + "/chunks", join(chunks, "\n") + "\n")
   // `$0` is the host, `$1` the seed and `$2` the chunk; each chunk's exit code lands beside it.
-  const sh = "VL_IR_SHADOW=1 timeout 1200 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
+  const sh = "VL_IR_SHADOW="
+    + mode
+    + " timeout 1200 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
     + " > /dev/null 2> \"$2.err\"; echo $? > \"$2.rc\""
   const x = spawn(
     "sh",
@@ -162,6 +172,35 @@ function classes(rows: Row[], head: string): Row[] {
   return out
 }
 
+// The census rows, by how many classes block: the sole and the paired, most functions first.
+function printBlockers(rows: Row[], top: i32) {
+  const none = countOf(rows, "blockers none")
+  let fns = 0
+  const one: Row[] = []
+  const two: Row[] = []
+  for r in rows {
+    if !startsWith(r.key, "blockers ") { continue }
+    fns = fns + r.n
+    const set = r.key.slice(9, r.key.length)
+    if set == "none" { continue }
+    const parts = split(set, " + ")
+    if parts.length == 1 { one.push({ key: set, n: r.n }) }
+    if parts.length == 2 { two.push({ key: set, n: r.n }) }
+  }
+  sort(one, (a: Row, b: Row) => a.n > b.n)
+  sort(two, (a: Row, b: Row) => a.n > b.n)
+  print("blocker census: \{fns} functions, \{none} with no blocker")
+  print("one class alone:")
+  for r in one.slice(0, if top < one.length { top } else { one.length }) {
+    print("  \{r.n}\t\{r.key}")
+  }
+  print("two classes together:")
+  for r in two.slice(0, if top < two.length { top } else { two.length }) {
+    print("  \{r.n}\t\{r.key}")
+  }
+  return 0
+}
+
 function writeBaseline(mm: Row[]) {
   let text = "# IR shadow mismatches over the distilled corpus: vl run scripts/silent-sweep/distilled/ir-shadow.vl -- --write-baseline\n"
   for r in mm { text = text + "\{r.n}\t\{r.key}\n" }
@@ -175,13 +214,22 @@ function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
   const paths = corpus()
   if paths.length == 0 { die("ir-shadow: no cells under \{HERE}", 2) }
-  const m = measure(paths, seed, envOr("JOBS", "4"))
+  const census = hasFlag(args, "--blockers")
+  const m = measure(
+    paths,
+    seed,
+    envOr("JOBS", "4"),
+    if census { "4" } else { "1" },
+  )
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
   if m.cells == 0 {
     die(
       "ir-shadow: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW`",
       2,
     )
+  }
+  if census {
+    return printBlockers(m.rows, parseI32(argOr(args, "--top", "20")) ?? 20)
   }
   print(
     "ir shadow: \{m.cells} of \{paths.length} cells have functions; \{countOf(m.rows, "fns")} functions, \{countOf(m.rows, "covered")} covered, \{countOf(m.rows, "verified")} verified, \{countOf(m.rows, "matched")} matched",
