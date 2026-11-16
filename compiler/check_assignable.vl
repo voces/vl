@@ -4251,9 +4251,12 @@ export function fvaMakerCallRows() {
   const sigAt: {[i32]: i32} = Map()
   const callOfBind: {[i32]: i32} = Map()
   const calleeReads: {[i32]: boolean} = Map()
+  const rl = fvaRelayScanNew()
   let ix = 0
   while ix < P.nodes.length {
     const n = nodeAt(ix)
+    // Every relay is registered, called or not: a call one returns is no delivery of its own.
+    if n is FuncDecl && fvaRelayMemo(rl, ix) { rl.any = true }
     if n is Call && n.callFn >= 0 {
       const r = parenPeelIx(n.callFn)
       const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
@@ -4295,8 +4298,14 @@ export function fvaMakerCallRows() {
       const mc = callOfBind.get(d) ?? -1
       if d != ix && mc >= 0 { sigAt[mc] = -1 }
     }
+    if rl.any { fvaRelayNote(rl, ix) }
     ix = ix + 1
   }
+  // So does a relay read other than as a callee.
+  for r in rl.reads {
+    if !(rl.calleeOf.get(r) ?? false) { rl.handedOn[identDeclOf(r)] = true }
+  }
+  fvaRelayRows(sigAt, rl)
   for mc in sigAt.keys() {
     const sig = sigAt.get(mc) ?? -1
     const c = nodeAt(mc)
@@ -4309,6 +4318,136 @@ export function fvaMakerCallRows() {
     }
   }
   return fvaMakerCoverCheck()
+}
+
+// Whether `d` relays a maker: a maker by signature (`fvaIsMaker`) every returned value of which is
+// a call of another such function, so its result is that call's, handed on whole.
+function fvaIsRelay(d: i32): boolean {
+  if !fvaIsMaker(d) || fvaRetsNamed(d) { return false }
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length == 0 { return false }
+  for r in rets {
+    const x = parenPeelIx(r)
+    const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if !(c is Call) || c.callFn < 0 { return false }
+    const m = calleeFnOfDecl(identDeclOf(parenPeelIx(c.callFn)))
+    if m == d || !fvaIsMaker(m) { return false }
+  }
+  return true
+}
+
+// What `fvaMakerCallRows`'s node walks gather about relays: whether there is one, which
+// declarations are relays (memo), each call of one and its callee read, every read naming one,
+// and the relays read other than as a callee.
+type FvaRelayScan = {
+  any: boolean,
+  memo: {[i32]: boolean},
+  calls: i32[],
+  reads: i32[],
+  calleeOf: {[i32]: boolean},
+  handedOn: {[i32]: boolean},
+}
+
+function fvaRelayScanNew(): FvaRelayScan {
+  return {
+    any: false,
+    memo: Map(),
+    calls: [],
+    reads: [],
+    calleeOf: Map(),
+    handedOn: Map(),
+  }
+}
+
+// Whether `d` is a function declaration: a relay is read by its own name, and an alias of one
+// reads it as a value where the alias is bound.
+function fvaIsFnDecl(d: i32): boolean {
+  return d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
+}
+
+// Notes node `ix` for the relay rows: a call of a relay, with its callee read, or a read naming one.
+function fvaRelayNote(rl: FvaRelayScan, ix: i32) {
+  const n = nodeAt(ix)
+  if n is Call && n.callFn >= 0 {
+    const r = parenPeelIx(n.callFn)
+    const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+    if fvaIsFnDecl(d) && fvaRelayMemo(rl, d) {
+      rl.calls.push(ix)
+      rl.calleeOf[r] = true
+    }
+  } else if n is Ident {
+    const d = identDeclOf(ix)
+    if d != ix && fvaIsFnDecl(d) && fvaRelayMemo(rl, d) { rl.reads.push(ix) }
+  }
+  return 0
+}
+
+// Whether `d` is a relay, asked once per declaration.
+function fvaRelayMemo(rl: FvaRelayScan, d: i32): boolean {
+  if d < 0 { return false }
+  const had = rl.memo.get(d)
+  if had != null { return had }
+  const r = fvaIsRelay(d)
+  rl.memo[d] = r
+  return r
+}
+
+// Each maker call a relay returns is reached at the one closed result every call of the relay is
+// delivered at, through chains of relays; a relay read other than as such a call, or delivered at
+// two results, reaches none (D16710).
+function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
+  const innerOf: {[i32]: i32} = Map()
+  const relays: i32[] = []
+  for d in rl.memo.keys() {
+    const fn = nodeAt(d)
+    if (rl.memo.get(d) ?? false) && fn is FuncDecl {
+      relays.push(d)
+      const rets: i32[] = []
+      collectRetValues(fn.fnBody, rets)
+      for r in rets { innerOf[parenPeelIx(r)] = d }
+    }
+  }
+  if relays.length == 0 { return 0 }
+  // Each relay's result, from its calls outside every relay's returns.
+  const relaySig: {[i32]: i32} = Map()
+  for c in rl.calls {
+    const cn = nodeAt(c)
+    if cn is Call && !innerOf.has(c) {
+      const d = calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))
+      const dt = nodeCtxTyIxOf(c)
+      const closed = dt >= 0
+        && dt < T.tys.length
+        && !tyHasTyVar(dt)
+        && tyAt(dt) is TyFunc
+      fvaReachSig(relaySig, d, if closed { dt } else { -1 })
+    }
+  }
+  for d in rl.handedOn.keys() { relaySig[d] = -1 }
+  // A relay called from another relay's return takes that relay's result too. Each result only
+  // moves from none to one to conflicting, so one pass per relay settles every chain.
+  let pass = 0
+  while pass < relays.length {
+    for c in innerOf.keys() {
+      const cn = nodeAt(c)
+      const from = relaySig.get(innerOf.get(c) ?? -1) ?? -2
+      if cn is Call && from > -2 {
+        const d = calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))
+        if rl.memo.get(d) ?? false { fvaReachSig(relaySig, d, from) }
+      }
+    }
+    pass = pass + 1
+  }
+  for c in innerOf.keys() {
+    const s = relaySig.get(innerOf.get(c) ?? -1) ?? -1
+    if s >= 0 && fvaOpenMakerCall(c) >= 0 {
+      const at = fvaMakerResultAt(c, s)
+      fvaReachSig(sigAt, c, if at >= 0 && assignable(at, s) { s } else { -1 })
+    }
+  }
+  return 0
 }
 
 // Records closed result `sig` (-1 for none) as one maker call `mc`'s reach asks for; two that
