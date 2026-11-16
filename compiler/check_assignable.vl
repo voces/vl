@@ -238,6 +238,7 @@ import {
   arrDefRule,
   bareBraceDeliver,
   binRule,
+  cstrSiteOfOtherCall,
   holeFnDeliveryDemands,
   isRule,
   memRule,
@@ -531,15 +532,25 @@ import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
 import { argLitAt, wsSuppress } from "./check_width"
 import {
+  CW_OCC_BIND,
+  CW_OCC_CALL,
+  CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_ASG_LHS,
+  CW_UP_ASG_RHS,
   CW_UP_CALLEE,
+  CW_UP_CMP,
+  CW_UP_LETINIT,
+  CW_UP_OBJ,
   cwBindingOf,
   cwCalleeDeclOf,
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwIxBuild,
+  cwIxKind,
   cwIxNode,
   cwIxUp,
+  cwIxUpAux,
   cwIxUpKind,
   cwOccNext,
   cwOccWalk,
@@ -1482,6 +1493,9 @@ function solveRules(at: SolveAt, from: i32, to: i32) {
 // Returns 1 when the rule ends its kind's rows for this solve.
 function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]): i32 {
   const row = bndAt(k, ci)
+  if k == BND_BIN && row.fn < 0 && cstrSiteOfOtherCall(row.site, at.ix) {
+    return 0
+  }
   if k == BND_NEST {
     return nestRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
   }
@@ -4557,6 +4571,7 @@ function fvaReadsWithin(d: i32, ix: i32, e: i32): boolean {
 // call's maker there (`elabMakerCallSig`).
 export function fvaMakerCallRows() {
   elabMakerCallReset()
+  fvaRelayWrittenSig = Map()
   const sigAt: {[i32]: i32} = Map()
   const callOfBind: {[i32]: i32} = Map()
   const calleeReads: {[i32]: boolean} = Map()
@@ -4605,6 +4620,18 @@ export function fvaMakerCallRows() {
           ix,
           if holed || at >= 0 && assignable(at, dt) { dt } else { -1 },
         )
+      } else if fvaOpenMakerCall(ix) >= 0 {
+        // A maker call written into a container element is built at the one signature that
+        // element is called at (D16865).
+        const ws = fvaWrittenElemSig(ix)
+        const wa = if ws >= 0 { fvaMakerResultAt(ix, ws) } else { -1 }
+        if (
+          ws >= 0
+          && (fvaHoleCallFits(ix, ws) || wa >= 0 && assignable(wa, ws))
+        ) {
+          fvaRelayWrittenSig[ix] = ws
+          fvaReachSig(sigAt, ix, ws)
+        }
       }
     }
     ix = ix + 1
@@ -4853,7 +4880,11 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
         && !tyHasTyVar(dt)
         && tyAt(dt) is TyFunc
       const held = heldAt.get(c) ?? []
-      const hs = fvaOneSig(held)
+      // A call written into a container's element takes the one signature that element is
+      // called at (D16864).
+      const ws = if !closed && held.length == 0 { fvaWrittenElemSig(c) } else { -1 }
+      if ws >= 0 { fvaRelayWrittenSig[c] = ws }
+      const hs = if ws >= 0 { ws } else { fvaOneSig(held) }
       if closed || hs >= 0 {
         const cl = closedCalls[d] ?? []
         cl.push(c)
@@ -4862,7 +4893,9 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
       } else {
         notClosed[d] = true
       }
-      if closed || held.length == 0 {
+      if ws >= 0 {
+        fvaReachSig(relaySig, d, ws)
+      } else if closed || held.length == 0 {
         fvaReachSig(relaySig, d, if closed { dt } else { -1 })
       } else {
         for h in held { fvaReachSig(relaySig, d, h) }
@@ -4897,6 +4930,141 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
     }
   }
   return 0
+}
+
+// The closed signature a relay call written into a container element takes, keyed by the call.
+let fvaRelayWrittenSig: {[i32]: i32} = Map()
+
+// The closed signature relay call `c`, written into a container element, is twinned at
+// (`fvaWrittenElemSig`); -1 for any other node.
+export function elabRelayWrittenSigOf(c: i32): i32 {
+  return fvaRelayWrittenSig.get(c) ?? -1
+}
+
+// The one closed signature the element relay call `c` is written into is called at: `c` is the
+// value of `m[k] = c`, `m.set(k, c)` or `xs.push(c)`, and every read of the container's elements
+// is called, compared with `null` or bound by an un-annotated `const` that is; -1 where a read
+// escapes, nothing calls it, or two calls disagree.
+function fvaWrittenElemSig(c: i32): i32 {
+  cwIxBuild()
+  if c < 0 || !cwIxCovers(c) { return -1 }
+  const up = cwIxUp[c]
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  let box = -1
+  if cwIxUpKind[c] == CW_UP_ASG_RHS && un is BinExpr && un.binOp == "=" {
+    const l = nodeAt(parenPeelIx(un.binLeft))
+    if l is Index { box = parenPeelIx(l.idxArr) }
+  } else if cwIxUpKind[c] == CW_UP_ARG && un is Call && un.callFn >= 0 {
+    const f = nodeAt(parenPeelIx(un.callFn))
+    const ai = cwIxUpAux[c]
+    if (
+      f is Member
+      && (f.memProp == "set" && ai == 1 || f.memProp == "push" && ai == 0)
+    ) {
+      box = parenPeelIx(f.memObj)
+    }
+  }
+  const bd = if box >= 0 && nodeAt(box) is Ident { identDeclOf(box) } else { -1 }
+  if bd < 0 || !(nodeAt(bd) is LetDecl) { return -1 }
+  const sigs: i32[] = []
+  if !fvaElemReadSigs(bd, true, sigs, []) || sigs.length != 1 { return -1 }
+  return sigs[0]
+}
+
+// Adds to `sigs` the closed signatures the reads of binding `d` are called at: with `elems`, each
+// read of `d` is the container an element read (`m[k]`, `m.get(k)`) projects out of. False where
+// a read is anything else, a call's signature stays open, or `d` is in `seen` (a cycle).
+function fvaElemReadSigs(
+  d: i32,
+  elems: boolean,
+  sigs: i32[],
+  seen: i32[],
+): boolean {
+  if i32ListHas(seen, d) { return false }
+  seen.push(d)
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if cwIxKind[r] == CW_OCC_USE {
+      const k = if cwIxCovers(u) { cwIxUpKind[u] } else { -1 }
+      const p = if cwIxCovers(u) { cwIxUp[u] } else { -1 }
+      const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+      if elems {
+        // The container's own writes and reads of its size touch no element value.
+        if fvaIsIndexWriteTarget(u) {
+          // An index write stores an element; it reads none.
+        } else if k == CW_UP_OBJ && pn is Index {
+          if !fvaValueSigs(p, sigs, seen) { return false }
+        } else if k == CW_UP_OBJ && pn is Member && pn.memProp == "get" {
+          const gc = if cwIxCovers(p) && cwIxUpKind[p] == CW_UP_CALLEE { cwIxUp[p] } else { -1 }
+          if gc < 0 || !fvaValueSigs(gc, sigs, seen) { return false }
+        } else if (
+          !(k == CW_UP_OBJ
+            && pn is Member
+            && (pn.memProp == "set"
+            || pn.memProp == "push"
+            || pn.memProp == "length"))
+        ) {
+          return false
+        }
+      } else if !fvaValueSigs(u, sigs, seen) {
+        return false
+      }
+    } else if cwIxKind[r] == CW_OCC_CALL {
+      // A call through the binding by its name is called at its own signature.
+      const cn = if u >= 0 && u < P.nodes.length { nodeAt(u) } else { null }
+      if elems || !(cn is Call) || identDeclOf(parenPeelIx(cn.callFn)) != d {
+        return false
+      }
+      const sg = fvaCallSig(cn, u)
+      if sg < 0 { return false }
+      let dup = false
+      for t in sigs {
+        if tySame(t, sg) { dup = true }
+      }
+      if !dup { sigs.push(sg) }
+    } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether `u` is the container of an index write's target, `u[k] = v`.
+function fvaIsIndexWriteTarget(u: i32): boolean {
+  const p = if cwIxCovers(u) { cwIxUp[u] } else { -1 }
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(pn is Index) || !cwIxCovers(p) { return false }
+  return cwIxUpKind[p] == CW_UP_ASG_LHS
+}
+
+// Adds the closed signature value `v` is called at to `sigs`: `v` called directly, compared with
+// `null`, or bound by an un-annotated `const` whose reads are. False for any other use.
+function fvaValueSigs(v: i32, sigs: i32[], seen: i32[]): boolean {
+  if v < 0 || !cwIxCovers(v) { return false }
+  const k = cwIxUpKind[v]
+  const p = cwIxUp[v]
+  const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if k == CW_UP_CALLEE && pn is Call {
+    const sg = fvaCallSig(pn, p)
+    if sg < 0 { return false }
+    for t in sigs {
+      if tySame(t, sg) { return true }
+    }
+    sigs.push(sg)
+    return true
+  }
+  if k == CW_UP_CMP { return true }
+  if (
+    k == CW_UP_LETINIT
+    && pn is LetDecl
+    && pn.letType < 0
+    && pn.letKw == "const"
+  ) {
+    return fvaElemReadSigs(p, false, sigs, seen)
+  }
+  return false
 }
 
 // The one closed result every entry of `sigs` names, or -1 for none, an open one, or two.
@@ -5015,7 +5183,7 @@ function fvaCalledOutside(
 // the relay twin rows noted `d` (`elabRelayPerResultNote`); -1 otherwise.
 export function elabRelayResultAt(d: i32, call: i32): i32 {
   if call < 0 || !elabRelayPerResult(d) { return -1 }
-  const t = nodeCtxTyIxOf(call)
+  const t = fvaRelayWrittenSig.get(call) ?? nodeCtxTyIxOf(call)
   if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasTyVar(t) {
     return -1
   }

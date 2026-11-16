@@ -9,6 +9,18 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-ir-i8-coercion-ops](2026-11-16-ir-i8-coercion-ops.md): IR I8 design: coercions as ops, the seats retired from the IR's side, 2026-11-16
+- [2026-11-16-ir-i8a2-operands](2026-11-16-ir-i8a2-operands.md): IR I8a part 2: mixed-width operator operands (coverage step), 2026-11-16
+- [2026-11-16-l2-c-tvw-param-hole](2026-11-16-l2-c-tvw-param-hole.md): L2 (c) PR 1: the write narrowing admits a parameter hole, 2026-11-16
+- [2026-11-16-l2-c-write-flow-skip](2026-11-16-l2-c-write-flow-skip.md): L2 (c) PR 2: a parameter written into a nullable place stays pin-generic, 2026-11-16
+- [2026-11-16-l2-s3-5-at-call](2026-11-16-l2-s3-5-at-call.md): L2 S3.5: report a failed bound at the call, 2026-11-16
+- [2026-11-16-rep-hole-instance-step1](2026-11-16-rep-hole-instance-step1.md): Rep hole-instance, step 1: anonymous rows keyed at the literal's own type, 2026-11-16 (lane REP)
+- [2026-11-16-slot-store-map-value-fix](2026-11-16-slot-store-map-value-fix.md): Slot store: the flip's map-value regressions, fixed forward (lane SLOT, 2026-11-16)
+- [2026-11-16-store-n1-instance-keyed](2026-11-16-store-n1-instance-keyed.md): Producer slice N1 measured: a set forwarded through a literal is instance-keyed, 2026-11-16
+- [2026-11-16-store-s3-4d-2b-const-copy](2026-11-16-store-s3-4d-2b-const-copy.md): S3.4d step 2b: a `const` copy of a parameter reads the parameter's sets, 2026-11-16
+- [2026-11-16-type-hashcons-s6b21-limit-census](2026-11-16-type-hashcons-s6b21-limit-census.md): Type hash-cons stage 6b: census of numeric depth, hop and step limits (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b22-type-existence-walks](2026-11-16-type-hashcons-s6b22-type-existence-walks.md): Type hash-cons stage 6b: four type-existence walks in `check_types.vl` take a visited set (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b23-walk-limit-lint](2026-11-16-type-hashcons-s6b23-walk-limit-lint.md): Type hash-cons stage 6b: the `walk-limit` lint and its ratchet (lane HASH), 2026-11-16
 - [2026-11-16-ir-c2l-list-store](2026-11-16-ir-c2l-list-store.md): IR cutover C2l: a list element store (coverage step), 2026-11-16
 - [2026-11-16-l2-s3-4-walk-rest](2026-11-16-l2-s3-4-walk-rest.md): L2 S3.4: the remaining bound kinds join the body-order walk, 2026-11-16
 - [2026-11-16-rr-names-key-memo](2026-11-16-rr-names-key-memo.md): The record-row union scan keys each member once, 2026-11-16 (lane REP)
