@@ -21,7 +21,7 @@ import { callBindTyOf } from "./check_bind_rows"
 import { cwFieldNameOf } from "./check_write_scan"
 import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
-import { identDeclOf } from "./symbols"
+import { fnOnlyReturnsParam, identDeclOf } from "./symbols"
 import {
   ArrayLit,
   AsExpr,
@@ -5142,7 +5142,10 @@ function recCbTakesBuild(c: i32, isMap: boolean): boolean {
     return false
   }
   if an is FuncDecl && f.fnName != "" { return false }
-  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) { return false }
+  // A `map` handing each element back keeps them, and its result is stamped at the build (D16211).
+  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) && !fnOnlyReturnsParam(fd) {
+    return false
+  }
   const p = nodeAt(f.fnParams[0])
   return p is Param && p.parType < 0
 }
@@ -5155,12 +5158,25 @@ function recBuiltElemOf(x: i32): i32 {
 }
 
 // The receiver of `x` where `x` is a call of a method handing back a list of the receiver's own
-// elements (`filter`, `slice`, `values`), parentheses peeled; else -1.
+// elements (`filter`, `slice`, `values`, an identity `map`), parentheses peeled; else -1.
 function recSameElemsRecv(x: i32): i32 {
   const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   if !(n is Call) || n.callFn < 0 { return -1 }
   const f = nodeAt(n.callFn)
-  return if f is Member && rcwSameElems(f.memProp) { cwPeelValue(f.memObj) } else { -1 }
+  if !(f is Member) { return -1 }
+  // A `map` whose callback hands each element back keeps them too (D16211).
+  const keeps = rcwSameElems(f.memProp)
+    || (f.memProp == "map"
+    && n.callArgs.length == 1
+    && fnOnlyReturnsParam(recCbDeclOf(n.callArgs[0])))
+  return if keeps { cwPeelValue(f.memObj) } else { -1 }
+}
+
+// The function a callback argument `a` names or is (a lambda), else -1.
+function recCbDeclOf(a: i32): i32 {
+  const ax = parenPeelIx(a)
+  const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { null }
+  return if an is FuncDecl { ax } else if an is Ident { identFnDeclOf(ax) } else { -1 }
 }
 
 // `recBuiltElemOf` read from build table `tbl` (`recBuildPassTable` or `recBuildTable`).
