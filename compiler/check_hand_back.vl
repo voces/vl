@@ -1,0 +1,210 @@
+// `check_hand_back.vl` — which parameter a declared function hands back: every value it returns
+// reads that parameter, which nothing else reads. A property of the body, read by the elaboration
+// for each instance (`mintRetNote`) and by the check-time set-binding rows (`check_set_bind.vl`).
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  P,
+  Param,
+  TypeRef,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import { fnTagParamCopyOf } from "./check_elab_cap"
+import { collectRetValues } from "./check_nj_join"
+import { parenPeelIx } from "./check_places"
+import { identFnDeclOf } from "./check_scopes"
+import { i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
+import { identDeclOf } from "./symbols"
+
+// The declaration callee `f` names: directly, or through one `const` binding of its name; else -1.
+export function calleeNamesDecl(f: i32): i32 {
+  const x = parenPeelIx(f)
+  if x < 0 || !(nodeAt(x) is Ident) { return -1 }
+  const dx = identDeclOf(x)
+  if dx < 0 || dx >= P.nodes.length { return -1 }
+  const dn = nodeAt(dx)
+  if dn is FuncDecl { return dx }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const y = parenPeelIx(dn.letInit)
+  if y < 0 || !(nodeAt(y) is Ident) { return -1 }
+  const dy = identDeclOf(y)
+  return if dy >= 0 && dy < P.nodes.length && nodeAt(dy) is FuncDecl { dy } else { -1 }
+}
+
+// The parameters of `dn` (declared at `decl`) every value it returns reads, when there are two or
+// more, one bare type parameter annotates each, and each is read nowhere but as a returned value;
+// [] otherwise.
+export function handBackShared(decl: i32, dn: FuncDecl): i32[] {
+  const none: i32[] = []
+  if decl < 0 { return none }
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  const ats: i32[] = []
+  let tp = ""
+  for v in vs {
+    const x = parenPeelIx(v)
+    if x < 0 || !(nodeAt(x) is Ident) { return none }
+    const i = i32ListIndexOf(dn.fnParams, identDeclOf(x))
+    if i < 0 { return none }
+    const pn = nodeAt(dn.fnParams[i])
+    const tn = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
+    if !(tn is TypeRef) || !strListHas(dn.fnTyParams, tn.tyName) { return none }
+    if tp != "" && tn.tyName != tp { return none }
+    tp = tn.tyName
+    if !i32ListHas(ats, i) { ats.push(i) }
+  }
+  if ats.length < 2 { return none }
+  for i in ats {
+    if !hbParamOnlyReturned(dn, dn.fnParams[i], vs) { return none }
+  }
+  return ats
+}
+
+// The un-annotated parameter `dn` hands back: its own (`handBackIx`), or
+// the one every returned value reads through a call of a declared function handing back that
+// argument (`fw2(f) { return fw(f) }`); -1 otherwise.
+export function handBackHoleIx(dn: FuncDecl, depth: i32): i32 {
+  const own = handBackIx(dn)
+  if own >= 0 || depth > 8 { return own }
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  let at = -1
+  for v in vs {
+    const x = parenPeelIx(v)
+    const cn = if x >= 0 { nodeAt(x) } else { nodeAt(0) }
+    if !(cn is Call) { return -1 }
+    const g = identFnDeclOf(parenPeelIx(cn.callFn))
+    const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { nodeAt(0) }
+    if !(gn is FuncDecl) { return -1 }
+    const j = handBackHoleIx(gn, depth + 1)
+    if j < 0 || j >= cn.callArgs.length { return -1 }
+    if j < cn.callArgNames.length && cn.callArgNames[j] != "" { return -1 }
+    const ad = parenPeelIx(cn.callArgs[j])
+    const i = if ad >= 0 && nodeAt(ad) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(ad)) } else { -1 }
+    if i < 0 || at >= 0 && i != at { return -1 }
+    at = i
+  }
+  if at < 0 { return -1 }
+  const pn = nodeAt(dn.fnParams[at])
+  if (
+    !(pn is Param)
+    || pn.parType >= 0
+    || !hbParamOnlyReturned(dn, dn.fnParams[at], vs)
+  ) {
+    return -1
+  }
+  return at
+}
+
+// The parameter every value `dn` returns reads, which nothing else reads, else -1.
+export function handBackIx(dn: FuncDecl): i32 {
+  let at = -1
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  for v in vs {
+    const x = parenPeelIx(v)
+    let i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
+    // A returned `const` copy of a parameter hands that parameter back.
+    if i < 0 && x >= 0 && nodeAt(x) is Ident {
+      i = i32ListIndexOf(dn.fnParams, fnTagParamCopyOf(dn, identDeclOf(x)))
+    }
+    if i < 0 || at >= 0 && i != at { return -1 }
+    at = i
+  }
+  // A parameter read any other way (called, stored, handed on, captured) reaches a place that
+  // holds a closure, so only a parameter whose every read is a returned value is handed back.
+  if at >= 0 && !hbParamOnlyReturned(dn, dn.fnParams[at], vs) { at = -1 }
+  return at
+}
+
+// Whether every read of parameter `par` in `body`, nested functions included, is one of the
+// returned values `vs`.
+function hbParamOnlyReturned(fn: FuncDecl, par: i32, vs: i32[]): boolean {
+  const rets: i32[] = []
+  for v in vs { rets.push(parenPeelIx(v)) }
+  // The seed of a returned copy of `par` reads it as the returned value does.
+  for r in rets.slice(0) {
+    if r >= 0 && nodeAt(r) is Ident {
+      const cd = identDeclOf(r)
+      if (
+        cd >= 0
+        && fnTagParamCopyOf(fn, cd) == par
+        && hbCopyOnlyReturned(fn.fnBody, cd, rets)
+      ) {
+        handBackCopySeedsNote(cd, rets)
+      }
+    }
+  }
+  const todo: i32[] = [fn.fnBody]
+  const reads: i32[] = []
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Ident && identDeclOf(x) == par && !i32ListHas(rets, x) {
+        reads.push(x)
+      }
+      // A positional argument landing in an un-annotated parameter of a declared function is
+      // bound there to the argument's own function, so it reaches no closure holder.
+      if n is Call { hbHoleArgsNote(n, rets) }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  for r in reads {
+    if !i32ListHas(rets, r) { return false }
+  }
+  return true
+}
+
+// Whether every read of binding `d` in `body` is one of `rets`.
+function hbCopyOnlyReturned(body: i32, d: i32, rets: i32[]): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d && !i32ListHas(rets, x) {
+        return false
+      }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return true
+}
+
+// Pushes onto `out` the seed read of copy `d` and of each copy it is seeded from in turn.
+export function handBackCopySeedsNote(d: i32, out: i32[]) {
+  let x = d
+  let hops = 0
+  while hops < 8 && x >= 0 && x < P.nodes.length {
+    hops = hops + 1
+    const n = nodeAt(x)
+    if !(n is LetDecl) || n.letInit < 0 { return 0 }
+    const v = parenPeelIx(n.letInit)
+    if v < 0 || !(nodeAt(v) is Ident) { return 0 }
+    out.push(v)
+    x = identDeclOf(v)
+  }
+  return 0
+}
+
+// Pushes onto `out` each positional argument of call `c` to a declared function that lands in
+// one of its un-annotated parameters.
+function hbHoleArgsNote(c: Call, out: i32[]) {
+  const d = calleeNamesDecl(c.callFn)
+  if d < 0 { return 0 }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return 0 }
+  let i = 0
+  while i < c.callArgs.length && i < dn.fnParams.length {
+    const p = nodeAt(dn.fnParams[i])
+    const named = i < c.callArgNames.length && c.callArgNames[i] != ""
+    if !named && p is Param && p.parType < 0 {
+      out.push(parenPeelIx(c.callArgs[i]))
+    }
+    i = i + 1
+  }
+  return 0
+}
