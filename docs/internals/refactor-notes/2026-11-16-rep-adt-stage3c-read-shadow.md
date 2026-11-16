@@ -35,7 +35,26 @@ cells (`cells/` and `named/`) plus the self-build.
 | self-build | 326,894 | **0** |
 | distilled cells and named | 183,686 | **28**, all in `d681_refused_spelling_pin` |
 
-The end-of-emit sweep over the same population finds 13,647 rows: 13,644 agree, 0 have no storage
+| `tests/cases` and `std` (8,259 modules) | 411,687 | **1,016**, in 22 files |
+
+**The distilled corpus does not hold every class.** On `tests/cases` and `std` the end-of-emit
+sweep also disagrees: 13,314 rows agree, 46 are template rows, and **18 rows disagree, in 12
+files**, all of them `anon` rows. By read-time verdict:
+
+| class | stored | derived | reads | files | row |
+|---|---|---|---|---|---|
+| a row minted at an unpinned hole `_` or a type variable, with no rep | 0 | -2 | 610 | 16 | D16720 |
+| a function field whose rep is the set id it is emitted as, stored as a closure | 14 | 0 | 49 | 3 | D16721 |
+| an empty list joined with `null`, a list of a hole with no rep | 18 | -2 | 346 | 2 | D16722 |
+| the same hole class as D16720, on a list witness | 4 | -2 | 11 | 1 | D16720 |
+
+A scratch compiler whose reader returns the derived code (never seeded) loses 11 `tests/cases`
+modules and changes 2 more. The hole rows and the hole list are the 11 lost modules. The first
+class was at first read as "function-set fields", because its files hold function sets; the
+storage type of every one of its rows is a hole or a type variable, never a function type, so it
+is d681's template class at a larger population.
+
+The end-of-emit sweep over the distilled population finds 13,647 rows: 13,644 agree, 0 have no storage
 type, and 3 are `template -> not emitted`, all in `d681`.
 
 **Finding: the template rows are read.** All 28 disagreeing reads are `stored=0 derived=-2
@@ -44,7 +63,7 @@ are `fieldRowCode` (10), `storeAlike` (10), `sFieldTypeAt` (6) and `layoutId` (2
 assumption that no emitted code reads these rows is wrong. They are read, and the stored 0 is the
 answer those reads see today. The cell runs correctly.
 
-So 3c-ii cannot simply derive -2 for these rows. Before it merges, one of two things happens:
+So 3c-ii cannot simply derive -2 for these rows, nor for the classes above. Before it merges, one of two things happens:
 - the template stops minting the rows, if every read is a dedup or layout probe that an instance's
   own row answers; or
 - the derivation names the template's answer explicitly.
