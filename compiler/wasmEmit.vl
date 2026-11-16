@@ -4591,6 +4591,18 @@ function nulNicheIsTestImpossible(recvIx: i32, ity: i32, fnIx: i32) {
       return true
     }
   }
+  // So does a list niche: its list's annotation fixes its elements, so a list the relation
+  // says it never is cannot be the value, even empty (D16713).
+  if tyArrayElemIx(ity) >= 0 {
+    const inner = nullableInnerOrNone(instanceReadTyOf(recvIx, fnIx))
+    if (
+      inner >= 0
+      && tyArrayElemIx(inner) >= 0
+      && isTestAnswer(inner, ity) == 0
+    ) {
+      return true
+    }
+  }
   // A map niche holds one map type: a pattern naming another map is never it (D2493).
   if unMemIsMap(ity) && !exprUnion(recvIx, fnIx) {
     // An instance parameter's pin names the niche's map exactly; a spelling needs the lenient
@@ -39019,20 +39031,26 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
   // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`.
   if e.binOp == "&&" || e.binOp == "||" {
+    const scStart = wLen()
     if emitExpr(e.binLeft, fnIx) < 0 {
       return -1 // condition `a`
     }
+    // An `is` this instance decides can leave `b` dead, and `b` reads its operand at the
+    // narrowed type, which the value is not here: `b` lowers as a dead arm (D16713).
+    const scK = staticIsGuard(e.binLeft, scStart)
     fbIf(127) // 0x04 if, 0x7f i32 result-type blocktype (yields an i32)
     if e.binOp == "&&" {
       // then = b, else = 0
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      if scK == 0 { emitDeadValueArm(e.binRight) }
+      else if emitExpr(e.binRight, fnIx) < 0 { return -1 }
       fbElse() // 0x05 else
       fbI32Const(0)
     } else {
       // then = 1, else = b
       fbI32Const(1)
       fbElse() // 0x05 else
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      if scK == 1 { emitDeadValueArm(e.binRight) }
+      else if emitExpr(e.binRight, fnIx) < 0 { return -1 }
     }
     fbEnd() // 0x0b end
     return 0
