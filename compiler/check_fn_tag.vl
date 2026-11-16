@@ -1,5 +1,5 @@
 import { tailValueLeaves } from "./check_unconsumed"
-import { setBindTrySets } from "./check_set_bind"
+import { setBindSetsOf, setBindTrySets } from "./check_set_bind"
 import { demangleName } from "./check_suggest"
 // Which sets of functions a value holds as the i32 id of its member rather than as a closure
 // (D3975). A set is tagged when some call through it needs a member's own instance, and every
@@ -184,6 +184,7 @@ import {
   arrowFactSetOf,
   arrowFacts,
   arrowFactsBuild,
+  arrowParamSeen,
   arrowParamTakes,
   arrowParamTakesSets,
   arrowSetOpen,
@@ -377,6 +378,7 @@ export function fnTagDecide(rootIx: i32) {
   if !ftLate {
     ftCheckLen = P.nodes.length
     ftLateRefused = []
+    ftRetryRefused = []
   }
   ftDecideRoot = rootIx
   fnTagUndecide()
@@ -623,8 +625,20 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   // arrow rule's facts, which stand for the instances' calls the elaboration has not yet made.
   if !ftLate && !fnTagSetIsTagged(s) && (ftCheckFactSets[s] ?? false) {
     ftUseArrow = true
+    ftFactRefused = false
     ftTryWith(rootIx, s, calls, ftCheckFacts)
     ftUseArrow = false
+    // Refused by the facts themselves, with every call's in hand: the late decision must leave it
+    // too, or the two deciders disagree about the same set.
+    if (
+      ftFactRefused
+      && !fnTagSetIsTagged(s)
+      && !arrowSetOpen(s)
+      && !arrowSetSplit(s)
+      && !i32ListHas(ftRetryRefused, s)
+    ) {
+      ftRetryRefused.push(s)
+    }
   }
   return 0
 }
@@ -1158,11 +1172,11 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
       ftFactSetOf(r) == s
       && !ftPlainArgsIn(ftFactCallOf(r), once, false, s)
     ) {
-      return false
+      return ftFactRefusal()
     }
   }
   for r in mint {
-    if ftFactSetOf(r) == s && !ftMintComplete(r, s) { return false }
+    if ftFactSetOf(r) == s && !ftMintComplete(r, s) { return ftFactRefusal() }
   }
   // After the elaboration, a set the check left a closure is tagged only where every instance
   // of a function calling through it binds it there.
@@ -4190,7 +4204,18 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   if ds.length == 0 { return false }
   // A member that never reads the parameter takes any id, as `ftLateParamTakes` lets it (D15038).
   for d in ds {
-    if !ftParamTakes(d, i, s) && !ftParamUnread(d, i) { return false }
+    if !ftParamTakes(d, i, s) && !ftParamUnread(d, i) {
+      // A parameter the set-binding rows bring `s` to, which arrow rows reach yet none with `s`,
+      // is the facts refusing; otherwise the facts are missing, not refusing.
+      if (
+        ftUseArrow
+        && arrowParamSeen(d, i)
+        && i32ListHas(setBindSetsOf(d, i), s)
+      ) {
+        return ftFactRefusal()
+      }
+      return false
+    }
   }
   // A call through a closure of named functions takes the closure's one signature, which holds
   // `s`'s id only where no instance hands the members' parameter another set; else the callee's
@@ -5802,6 +5827,16 @@ function ftLocalAliasedFn(d: i32): i32 {
 // The check's facts (`check_arrow_facts.vl`), and whether the plan reads them in place of the
 // elaboration's mint facts: only on a retry of a set the check's own reading left undecided.
 let ftCheckFacts: i32[] = []
+// The sets the check's retry refused with complete facts (none open, none split).
+let ftRetryRefused: i32[] = []
+// Whether the retry in progress met a refusal that reads the facts.
+let ftFactRefused = false
+
+// Notes, during the retry, that a test reading the facts refused; false, for the caller to return.
+function ftFactRefusal(): boolean {
+  if ftUseArrow { ftFactRefused = true }
+  return false
+}
 let ftCheckFactSets: {[i32]: boolean} = Map()
 let ftUseArrow = false
 
@@ -5844,4 +5879,14 @@ function ftParamTakesSets(decl: i32, i: i32): i32[] {
 // The sets calls through parameter `i` of `decl` go through.
 function ftParamSetsOf(decl: i32, i: i32): i32[] {
   return if ftUseArrow { arrowParamTakesSets(decl, i) } else { mintParamSetsOf(decl, i) }
+}
+
+// A set the decision after the elaboration tagged though the check refused it with every call's
+// facts in hand, or -1. The late decision admits only the sets the facts exclude (open argument
+// types, a lambda or generic body, a lambda member, split results); any other is a second decider.
+export function fnTagLateOutsideExclusions(): i32 {
+  for s in ftRetryRefused {
+    if fnTagSetIsTagged(s) { return s }
+  }
+  return -1
 }
