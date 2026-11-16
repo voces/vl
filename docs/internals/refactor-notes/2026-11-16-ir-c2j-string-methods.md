@@ -44,8 +44,8 @@ about 49 covered corpus functions per net line.
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the C2i seed, 12,213 cells | IDENTITY |
+| corpus identity against the C2i seed, 12,213 cells | 8,934 identical, 3,279 fail under both, 0 differ |
 | shadow | corpus 18,809 of 18,809 matched; self-compile 4,626 of 4,631, the five named unlowered |
-| mode 3 with `list` admitted (throwaway build) | self-compile 4,626 claimed and byte-identical; corpus MODE3 |
+| mode 3 with `list` admitted (throwaway build) | self-compile 4,626 claimed and byte-identical; corpus 8,934 identical, 0 differ, 0 fell back |
 | L2 self-compile fuel, C2i tree to this tree from one seed | 94,483,815,726 to 94,504,268,146 (+0.022%) |
 | seed size | 6,453,828 to 6,454,656 (+828) |
