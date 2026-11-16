@@ -1,34 +1,98 @@
 // The heap-identity shadow (rep ADT stage 4a): groups each heap table's rows by the rep id of their
 // arena types and counts the merges a rep-keyed `heapOf` would make, split by whether the merged
-// struct rows store the same layout. Armed with the rep shadow (`$VL_REP_SHADOW`); unarmed it is
-// one boolean test, and it writes only its own buckets, so it moves no emitted byte.
+// struct rows share a heap today: one layout, elements compared by rep id, under today's heap key.
+// A different one is named by class: a discriminating arm row, a function field's storage, or a
+// hole or generic instance. Armed with the rep shadow (`$VL_REP_SHADOW`); unarmed it is one
+// boolean test, and it moves no emitted byte.
 
 import { i32ToStr } from "./ast"
 import { repABNote } from "./emit_nullable_rets"
-import { repShadowOn } from "./emit_rep"
+import {
+  repRowAtTyVar,
+  repRowHoldsFn,
+  repShadowOn,
+  slotHeapId,
+  structFieldCodesEq,
+} from "./emit_rep"
 import { tyRepId } from "./emit_ty_seal"
 import {
+  FC_CLOSURE,
+  FC_I32,
+  FC_I32_LIST,
+  FC_NUL_CLOSURE,
+  FC_NUL_LIT_UNION,
+  FC_STR,
   mvValTyIx,
   rlElemTyIx,
   sFieldCount,
   sFieldElemName,
+  sFieldElemTyIx,
   sFieldStart,
   sFieldTypes,
+  sIsRefRow,
   sNames,
   sTyIx,
   unTyIx,
 } from "./emit_state"
 
-// Struct row `si`'s layout spelling: each field's code and element name, in order.
+// Struct row `si`'s layout spelling: each field's code and element, in order. An element with a
+// recorded type is spelled by its rep id, so two rows naming twin elements spell alike; an atom
+// code's literal set is not spelled, since an atom's code is global to its text.
 function hsRowLayout(si: i32): string {
   let out = ""
   let fi = 0
   while fi < sFieldCount[si] {
     const r = sFieldStart[si] + fi
-    out = out + i32ToStr(sFieldTypes[r]) + ":" + sFieldElemName[r] + ";"
+    const c = sFieldTypes[r]
+    const et = if r < sFieldElemTyIx.length { sFieldElemTyIx[r] } else { -1 }
+    const atom = c == FC_I32
+      || c == FC_I32_LIST
+      || c == FC_NUL_LIT_UNION
+      || c == FC_STR
+    const rep = if et >= 0 { "#" + i32ToStr(tyRepId(et)) } else { sFieldElemName[r] }
+    const el = if atom { "" } else { rep }
+    out = out + i32ToStr(c) + ":" + el + ";"
     fi = fi + 1
   }
   return out
+}
+
+// Whether struct rows `a` and `b` differ at a field one stores as a closure.
+function hsFnFieldDiffers(a: i32, b: i32): boolean {
+  if sFieldCount[a] != sFieldCount[b] { return false }
+  let fi = 0
+  while fi < sFieldCount[a] {
+    const ca = sFieldTypes[sFieldStart[a] + fi]
+    const cb = sFieldTypes[sFieldStart[b] + fi]
+    if ca != cb && (hsClosureCode(ca) || hsClosureCode(cb)) { return true }
+    fi = fi + 1
+  }
+  return false
+}
+
+function hsClosureCode(c: i32): boolean {
+  return c == FC_CLOSURE || c == FC_NUL_CLOSURE
+}
+
+// Whether struct rows `a` and `b`, of one rep id and layout, share a heap type under today's key:
+// neither is an arm's ref row, and their heap ids and field codes agree.
+function hsSameHeap(a: i32, b: i32): boolean {
+  if sIsRefRow(a) || sIsRefRow(b) { return false }
+  return slotHeapId(a) == slotHeapId(b) && structFieldCodesEq(a, b) == 1
+}
+
+// The class a different-layout merge of struct rows `a` and `b` falls in, else "unnamed". An arm's
+// ref row keeps its own heap: its union tests the arm by struct identity.
+function hsDiffClass(a: i32, b: i32): string {
+  if sIsRefRow(a) || sIsRefRow(b) { return "discriminating arm row" }
+  if hsFnFieldDiffers(a, b) { return "function field" }
+  if repRowAtTyVar(sTyIx[a]) || repRowAtTyVar(sTyIx[b]) {
+    return "hole or generic instance"
+  }
+  if repRowHoldsFn(sTyIx[a]) || repRowHoldsFn(sTyIx[b]) {
+    return "function field"
+  }
+  return "unnamed"
 }
 
 // Notes, for heap table `table` of `n` rows typed by `tys`, each row a rep id has already met: a
@@ -45,10 +109,14 @@ function hsGroup(table: string, tys: i32[], n: i32, layouts: string[]) {
       const first = byId.get(id) ?? -1
       if first < 0 {
         byId.set(id, i)
-      } else if layouts.length == 0 || layouts[first] == layouts[i] {
+      } else if (
+        layouts.length == 0
+        || (layouts[first] == layouts[i] && hsSameHeap(first, i))
+      ) {
         repABNote("heap", table, "merge same-layout")
       } else {
-        repABNote("heap", table, "merge DIFFERENT-layout")
+        const cls = if table == "struct" { hsDiffClass(first, i) } else { "unnamed" }
+        repABNote("heap", table, "merge DIFFERENT-layout: " + cls)
       }
     }
     repABNote("heap", table, "rows")
