@@ -251,6 +251,7 @@ import {
   fnTagOwnTyParamJoins,
   fnTagParamCopyOf,
   fnTagParamWriteJoinsOf,
+  fnTagRepTyDeepOf,
   fnTagRepTyOf,
   fnTagRetMark,
   fnTagSetIsTagged,
@@ -735,6 +736,11 @@ function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     for hs in ftPlHeld {
       for h in hs { fnTagHeldNote(h) }
     }
+  }
+  // A record literal `set` into a held map nesting the set's records is built at the map's storage
+  // row, its nested records too (D16829).
+  for hs in ftPlHeld {
+    for h in hs { ftStampMapSetLits(h) }
   }
   // A record literal written into a map of the set's records is built at the map's record rep.
   let mr = 0
@@ -5511,6 +5517,54 @@ function ftRecIntoMap(x: i32, m: i32, s: i32, fd: i32): boolean {
   ftMapRecMap.push(m)
   ftMapRecFn.push(fd)
   return true
+}
+
+// Stamps each record literal nesting a record that `set` writes into map binding `h`'s slots at the
+// map's storage rep of its value (D16829).
+function ftStampMapSetLits(h: i32) {
+  const n = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(n is LetDecl) { return 0 }
+  const mt = nodeTyIxOf(h)
+  const m = if mt >= 0 && mt < T.tys.length { tyAt(mt) } else { null }
+  if !(m is TyMap) { return 0 }
+  const vt = tyValOf(m)
+  const vo = if vt >= 0 && vt < T.tys.length { tyAt(vt) } else { null }
+  if !(vo is TyObj) { return 0 }
+  let nested = false
+  for ft in vo.objFieldTypes {
+    if ft >= 0 && ft < T.tys.length && tyAt(ft) is TyObj { nested = true }
+  }
+  if !nested { return 0 }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if cwSlotWrittenValues(cwKeyOfDecl(h), ["[]"], vals, ats) < 0 { return 0 }
+  const rt = fnTagRepTyDeepOf(vt)
+  for v in vals {
+    const vx = parenPeelIx(v)
+    if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is ObjLit {
+      ftStampRecLitAt(vx, rt)
+    }
+  }
+  return 0
+}
+
+// Stamps record literal `x` at record rep `rt`, and each record literal in its fields at that
+// field's rep.
+function ftStampRecLitAt(x: i32, rt: i32) {
+  repStampHeldRead(x, rt)
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is ObjLit) { return 0 }
+  for fx in n.objFields {
+    const f = nodeAt(fx)
+    if f is FieldInit {
+      const v = parenPeelIx(f.fiValue)
+      const ft = tyFieldTyOf(rt, f.fiName)
+      if v >= 0 && v < P.nodes.length && nodeAt(v) is ObjLit && ft >= 0 {
+        ftStampRecLitAt(v, ft)
+      }
+    }
+  }
+  return 0
 }
 
 // Whether every field of record literal `n` that carries set `s` names a declared function: the

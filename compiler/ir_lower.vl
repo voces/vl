@@ -53,6 +53,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RAtomEq,
   RCall,
   RCallHost,
   RCallRef,
@@ -135,8 +136,11 @@ import {
 } from "./emit_bytes"
 import {
   GlobalCtx,
+  atomEqPlanOf,
+  atomEqTail,
   emitBoxAroundHole,
   emitFoldedConstRead,
+  emitStaticLitAtom,
   emitStrLitAt,
   initBitOf,
   numWidenTail,
@@ -408,8 +412,38 @@ function rhs(r: Rhs, tail: boolean) {
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
     }
     RToBox => boxOp(r)
+    RAtomEq => atomEq(r)
     RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RMapOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
   }
+}
+
+// `RAtomEq`: each side as itself, or a static side through legacy's own literal writer spelled as
+// the member the shared plan names, then the shared `i32.eq` (and `i32.eqz`) tail.
+function atomEq(r: RAtomEq) {
+  const n = nodeAt(r.aeAt)
+  if !(n is BinExpr) { return irLMiss("atom compare node") }
+  const p = atomEqPlanOf(n, lw.irAt)
+  const want = if r.aeStatic == 0 { "ids" } else { "static" }
+  if (
+    p.aqArm != want
+    || r.aeStatic == 1 && !p.aqStaticLeft
+    || r.aeStatic == 2 && p.aqStaticLeft
+  ) {
+    return irLMiss("atom compare plan")
+  }
+  if r.aeStatic == 1 {
+    leaf()
+    emitStaticLitAtom(n.binLeft, p.aqLex, lw.irAt)
+  } else {
+    irLOpnd(r.aeL)
+  }
+  if r.aeStatic == 2 {
+    leaf()
+    emitStaticLitAtom(n.binRight, p.aqLex, lw.irAt)
+  } else {
+    irLOpnd(r.aeR)
+  }
+  return atomEqTail(r.aeNe)
 }
 
 // The `RToBox` whose operand legacy's box writer asks for through the value hole, while one is
@@ -427,12 +461,16 @@ export function irLowerHoleWrite(): i32 {
 }
 
 // `RToBox`: legacy's own box writer, its value the operand, written where the writer asks for it.
-// A writer that asks other than once leaves the function unlowered.
+// The writer asks once; an immediate (a literal it writes itself, or `null`) it may leave unread.
+// Any other count leaves the function unlowered.
 function boxOp(r: RToBox) {
   lwHoleBox = [r]
   const uses = emitBoxAroundHole(r.bxAt, lw.irAt)
   lwHoleBox = []
-  if uses != 1 { irLMiss("box value written " + i32ToStr(uses) + " times") }
+  const unreadOk = uses == 0 && (r.bxV is OImm || r.bxV is OStr)
+  if uses != 1 && !unreadOk {
+    irLMiss("box value written " + i32ToStr(uses) + " times")
+  }
   return 0
 }
 

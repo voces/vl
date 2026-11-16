@@ -1,6 +1,7 @@
 // The type of a method call `recv.f(args)`: a built-in method, a struct field holding a
 // function, or a free function reached by UFCS, with overload and hole-typed callees.
 
+import { parenPeelIx } from "./check_places"
 import { rowSlotBound } from "./check_row_param"
 import { openKeyReadNote, openReadNote } from "./check_side_rows"
 import { nodeTyIxOf, nodeTySetGrow } from "./check_node_tys"
@@ -70,6 +71,8 @@ import {
   elabCapLive,
   elabCbNote,
   elabFnRecJoin,
+  elabFnRecJoinDeep,
+  elabSlotLitsRegrow,
   elabSlotRecLitGrow,
   elabTyClosed,
   fnTagChoiceOfTy,
@@ -178,6 +181,7 @@ import {
   listMethodMutates,
   noteUfcsCstr,
   pushHoleFnToConcrete,
+  unresolvedHole,
 } from "./check_leaf_steps"
 import {
   BM_ADDKEY,
@@ -198,6 +202,7 @@ import { nePopTakes } from "./check_narrow_ends"
 import {
   calleeWritePrePin,
   cbElemNarrowFor,
+  defaultReadOnlyContainer,
   pinIterKey,
   pinReadKey,
 } from "./check_narrow_flow"
@@ -1575,6 +1580,23 @@ function memberCallMapTy(
 ): i32 {
   const mp = prop
   const margs2 = n.callArgs
+  // A container a call builds and a read takes in place has no place a write could reach: it
+  // settles as a bound one only read does, so the read's key fixes it (D16726, D16886).
+  const rcx = parenPeelIx(recvIx)
+  if (
+    rcx >= 0
+    && nodeAt(rcx) is Call
+    && (mp == "get"
+      || mp == "has"
+      || mp == "delete"
+      || mp == "keys"
+      || mp == "values")
+    && unresolvedHole(recvTy)
+  ) {
+    defaultReadOnlyContainer(recvTy)
+    // No key reaches a listing: the key takes the default a bound one would at its scope's end.
+    if mp == "keys" || mp == "values" { pinIterKey(recvTy) }
+  }
   if mp == "set" && rt.mSet == 0 {
     if margs2.length != 2 {
       tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
@@ -1612,8 +1634,11 @@ function memberCallMapTy(
       } else {
         cnhFill(tyValOf(rt), nullReadHoleTy(margs2[1], v0))
         // A later store joins the first one's function sets (D15806).
-        const jm = elabFnRecJoin(tyValOf(rt), v0)
-        if jm != tyValOf(rt) { tyPinVal(rt, jm) }
+        const jm = elabFnRecJoinDeep(tyValOf(rt), v0)
+        if jm != tyValOf(rt) {
+          tyPinVal(rt, jm)
+          elabSlotLitsRegrow(recvIx, jm)
+        }
         // The value argument's own open holes pin from the slot, the third step
         // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
         // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
