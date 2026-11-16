@@ -33,7 +33,9 @@ program. Three kinds of row:
   own cost is graded at step 1.
 - **Storage is not decided here** (l2-inferred-interfaces-design §10). The table records
   deliveries; `fnTagDecide` and the storage readers stay lane STORE's. A storage switch that reads
-  pins reads this table.
+  pins reads this table. Lane STORE agreed the schema. Its switches read no pin today, and the table
+  keeps no held-set row per `(place, k)`: storage is decided once at check time, keyed by call and
+  owner with no instance, so such a row would be a second decider.
 
 ## Migration order
 
