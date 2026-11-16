@@ -10293,6 +10293,8 @@ export function elabRun() {
   elabHoleLamsAt = -1
   elabTpDefaultsPrime()
   elabLateNames = []
+  // A compiler instance reused for another program keeps no classes of the last one.
+  EPL = eplFresh()
   eplAsked = false
   elabPinsClosedSet(false)
   elabCbRepKeys = Map()
@@ -12870,29 +12872,15 @@ function elabLamGenResultTy(lam: i32): i32 {
   const gs = if g >= 0 && g < P.nodes.length { nodeTyIxOf(g) } else { -1 }
   const gf = if gs >= 0 && gs < T.tys.length { tyAt(gs) } else { fn }
   if !(gf is TyFunc) || elabTyClosed(gs, 0) { return -1 }
-  // Deliveries agreeing on their parameters pin one instance; two parameter lists are two.
-  const ds = elabSlotDeliveries(x, [], -1)
-  if ds.length == 0 { return -1 }
-  const dt = tyAt(ds[0])
-  for o in ds {
-    const of = tyAt(o)
-    if (
-      !(dt is TyFunc)
-      || !(of is TyFunc)
-      || !tyListSameAll(of.fnParamTypes, dt.fnParamTypes)
-    ) {
-      return -1
-    }
-  }
-  if !(dt is TyFunc) || dt.fnParamTypes.length != gf.fnParamTypes.length {
-    return -1
-  }
-  if !tysClosed(dt.fnParamTypes) { return -1 }
+  // A written destination's parameters, else the one tuple the read's calls agree on, pin one
+  // instance.
+  const ps = eplSlotParams(x, [], -1)
+  if ps.length != gf.fnParamTypes.length || !tysClosed(ps) { return -1 }
   const mn: string[] = []
   const mt: i32[] = []
   let i = 0
-  while i < dt.fnParamTypes.length {
-    bindGenWalk(gf.fnParamTypes[i], dt.fnParamTypes[i], mn, mt)
+  while i < ps.length {
+    bindGenWalk(gf.fnParamTypes[i], ps[i], mn, mt)
     i = i + 1
   }
   if mn.length == 0 { return -1 }
@@ -12902,7 +12890,7 @@ function elabLamGenResultTy(lam: i32): i32 {
   elabSettle(n0)
   const r = if k >= 0 { elabResultOf(k) } else { -1 }
   if r < 0 || !elabTyClosed(r, 0) { return -1 }
-  return mkFuncTy(dt.fnParamTypes, widenLitTy(r))
+  return mkFuncTy(ps, widenLitTy(r))
 }
 
 // Enqueues each generic or hole function the callee of call `ix` may hold, bound by its signature
@@ -22372,6 +22360,85 @@ function eplBuild() {
   EPL.limit = limit
   eplInstsFile()
   eplEdges()
+  eplCallResults()
+}
+
+// A call through a function value its callee does not name yields what that value's members
+// return: each member's result flows into the call's place when the call's type may hold a
+// function, repeated while a new member reaches a call.
+function eplCallResults() {
+  const done: {[string]: boolean} = Map()
+  let grew = true
+  let round = 0
+  while grew && round < 8 {
+    grew = false
+    let r = 0
+    while r < EPL.calls.length {
+      if eplFind(r) == r && EPL.calls[r].length > 0 {
+        for ci in EPL.calls[r] {
+          if eplCallResultFlow(r, ci, done) { grew = true }
+        }
+      }
+      r = r + 1
+    }
+    round = round + 1
+  }
+  // Reach answers taken while the pass grows the classes answer no reader.
+  EPL.reachMemo = Map()
+  EPL.oneMemo = Map()
+  EPL.k = -1
+  return 0
+}
+
+// `eplCallResults` for call record `ci` through class `r`; whether it drew a new edge.
+function eplCallResultFlow(
+  r: i32,
+  ci: i32,
+  done: {[string]: boolean},
+): boolean {
+  const c = EPL.callNode[ci]
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) { return false }
+  const ct = nodeTyIxOf(c)
+  const nt = if ct >= 0 && ct < T.tys.length { nonNullTy(ct) } else { -1 }
+  // A call typed open (a hole the check never closed) may still yield a function.
+  if (
+    nt < 0
+    || nt >= T.tys.length
+    || !(tyMayHoldFn(nt, 0) || tyHasTyVar(nt) || tyReachesHole(nt, 8))
+  ) {
+    return false
+  }
+  if (
+    elabCalleeFns(cn).length > 0
+    || eplMethodCallee(parenPeelIx(cn.callFn)).length > 0
+  ) {
+    return false
+  }
+  EPL.k = EPL.callKey[ci]
+  const dst = eplRoot(c)
+  let drew = false
+  for m in eplMembersStar(r) {
+    const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    const key = i32ToStr(m)
+      + "|"
+      + i32ToStr(c)
+      + "|"
+      + i32ToStr(EPL.callKey[ci])
+    // A function an instance minted after the write index has no frame the index files.
+    if mn is FuncDecl && m < cwIxCoveredLen() && !done.has(key) {
+      done.set(key, true)
+      const src = eplChild(eplRootK(m, eplKeyOfFn(m)), "r")
+      if src >= 0 && dst >= 0 {
+        EPL.flowSrc.push(src)
+        EPL.flowDst.push(dst)
+        EPL.reachMemo = Map()
+        EPL.oneMemo = Map()
+        drew = true
+      }
+    }
+  }
+  return drew
 }
 
 // The one closed type slot `path` of `holder` (steps `e`, `v`, `f.<name>`) is delivered at in
@@ -22624,6 +22691,25 @@ function eplSlotAgreedCalls(
   if !ok || !have { return false }
   for t in one { tys.push(t) }
   return true
+}
+
+// The parameters slot `path` of `holder` is delivered at in instance `k`: its bound's, else the
+// one checked tuple its calls agree on; empty for neither, two bounds, or calls that differ.
+function eplSlotParams(holder: i32, path: string[], k: i32): i32[] {
+  const out: i32[] = []
+  const b = eplSlotBound(holder, path, k)
+  const bt = if b >= 0 { tyAt(b) } else { null }
+  if bt is TyFunc {
+    for q in bt.fnParamTypes { out.push(q) }
+    return out
+  }
+  if b == -2 { return out }
+  const none: i32[] = []
+  const tys: i32[] = []
+  if eplSlotAgreedCalls(holder, path, k, none, tys) {
+    for q in tys { out.push(q) }
+  }
+  return out
 }
 
 // The holder the write index knows for `h0`: a capture cell's binding, and a binding an instance
