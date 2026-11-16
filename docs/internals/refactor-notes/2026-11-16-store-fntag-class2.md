@@ -11,7 +11,11 @@ place it reaches is also reached by another set (reason P in the progress note's
 - This holds for a function read as a value too (`const k = apply2`, `[apply2]`): a call through
   its set still mints an instance per argument set. Only a lambda, which has one instance, keeps
   the old rule.
-- A field or path read (`sbPathCallKeys`) keeps the old rule: one place, many writers.
+- A list element or record field reached through a parameter (`sbPathCallKeys`) is the same: the
+  parameter's type, set included, keys the instance.
+- What is left of P is the `lack` arm: the place is also reached by a value the check gives no
+  set, typically a forwarded hole parameter (`const hh = h; apply2(hh)`). Only the instance knows
+  that set, so this residue is an instance fact and waits for S3 with class 1.
 
 Two exclusions keep the late decision where the elaboration still owns it. Each was found as an A/B
 regression of the bare change:
@@ -26,23 +30,23 @@ This PR also carries one coverage slice: calls through a `const` bound to a hand
 ## Measurement
 
 ftlate probe, all 6,528 `@run` programs, fixpoint seeds:
-- programs whose decision the late pass changes: 352 → 332;
+- programs whose decision the late pass changes: 352 → 331;
 - late drops: 2, the same pre-existing pair;
-- P sets 268 → 124 (programs 141 → 71). 66 sets move from P to T: the check now tries them, and
+- P sets 268 → 120 (programs 141 → 68). 68 sets move from P to T: the check now tries them, and
   refuses them until S3 gives the member results.
 
 | reason | sets | programs |
 |---|---|---|
-| T, refused by the check (S3) | 151 | 96 |
+| T, refused by the check (S3) | 153 | 98 |
 | N, never found | 190 | 94 |
 | G, a generic member (S3) | 117 | 93 |
-| P, partial | 124 | 71 |
+| P, partial | 120 | 68 |
 | V, handed to or by members | 14 | 5 |
 | J, follows a join (new exclusion) | 12 | 9 |
 | C, delivered to a closed fn type (new exclusion) | 9 | 7 |
 | S, stored parameter (S3) | 7 | 7 |
 
-By blocker: T only 91, G only 70, N only 58, P only 47, N+P 14, N+G 12, C only 6, J only 5.
+By blocker: T only 92, G only 70, N only 58, P only 45, N+P 14, N+G 12, C only 6, J only 5.
 
 A/B, fixpoint seed against master's own fixpoint seed, all 6,540 `@run` programs: output
 byte-identical everywhere; two named wasm movers, both smaller:
