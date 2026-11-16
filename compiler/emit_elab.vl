@@ -15417,6 +15417,21 @@ function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
       cur = c
       i = i + 1
     } else if (
+      k == "v"
+      && pn is Member
+      && parenPeelIx(pn.memObj) == cur
+      && called
+      && pn.memProp == "values"
+    ) {
+      // A map's `.values()` hands its values out as the elements of the list it builds.
+      const vrest: string[] = ["e"]
+      let vj = i + 1
+      while vj < path.length {
+        vrest.push(path[vj])
+        vj = vj + 1
+      }
+      return elabSlotClimb(c, vrest, out, seen)
+    } else if (
       k == "e"
       && pn is Member
       && parenPeelIx(pn.memObj) == cur
@@ -16077,20 +16092,25 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       const cd = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
       if cd >= 0 && (cboxCellDecls[cboxDeclKey(cd)] ?? 0) == 1 {
         elabSlotReadDeliveries(cd, ["e"], out, seen)
-      } else if cd >= 0 && elabCallRec {
-        // A call search follows a value written into a named list's element or map's value to
-        // that slot's reads.
-        const ct = nodeTyIxOf(a)
-        const isMap = ct >= 0
-          && ct < T.tys.length
-          && tyAt(nonNullTy(ct)) is TyMap
-        elabSlotReadDeliveries(cd, [if isMap { "v" } else { "e" }], out, seen)
+      } else if elabCallRec {
+        // A call search follows a value written into an element or map value of a named binding,
+        // or of a field or element of one, to that slot's reads.
+        const steps: string[] = []
+        const rd = elabRecvPath(a, steps)
+        if rd >= 0 {
+          steps.push(elabSlotStepOf(a))
+          elabHolderReads(rd, steps, out, seen, 0)
+        }
       }
     } else if ln is Member && elabCallRec {
-      // A call search follows a value written into a named binding's field to that field's reads.
-      const o = parenPeelIx(ln.memObj)
-      const od = if o >= 0 && o < P.nodes.length && nodeAt(o) is Ident { identDeclOf(o) } else { -1 }
-      if od >= 0 { elabSlotReadDeliveries(od, ["f." + ln.memProp], out, seen) }
+      // A call search follows a value written into a field of a named binding, or of a field or
+      // element of one, to that field's reads.
+      const steps: string[] = []
+      const od = elabRecvPath(parenPeelIx(ln.memObj), steps)
+      if od >= 0 {
+        steps.push("f." + ln.memProp)
+        elabHolderReads(od, steps, out, seen, 0)
+      }
     }
   } else if (
     (k == CW_UP_COAL || k == CW_UP_ARM)
@@ -16113,7 +16133,9 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
       elabRetCalls(f, calls)
       elabValueCalls(f, calls, 0)
       for c in calls {
-        if c >= 0 && c < P.nodes.length && elabCallRanAdmitted(c) {
+        // The call a search entered the function through is the one its result returns to.
+        const entered = elabCallRec && i32ListHas(elabEntryCalls, c)
+        if c >= 0 && c < P.nodes.length && (entered || elabCallRanAdmitted(c)) {
           elabReadDeliveries(c, out, seen)
         }
       }
@@ -16139,10 +16161,14 @@ function elabReadOn(r: i32, out: i32[], seen: i32[]) {
     const ai = cwIxUpAux[r]
     // A call search follows a value pushed onto a named list to that list's element reads.
     const pd = if elabCallRec && cn is Call { elabPushRecvDecl(cn) } else { -1 }
-    if pd >= 0 { elabSlotReadDeliveries(pd, ["e"], out, seen) }
+    if pd >= 0 { elabHolderReads(pd, ["e"], out, seen, 0) }
     // ... and a value set into a named map to that map's value reads.
     const sd = if elabCallRec && ai == 1 && cn is Call { elabSetRecvAny(cn) } else { -1 }
-    if sd >= 0 { elabSlotReadDeliveries(sd, ["v"], out, seen) }
+    if sd >= 0 { elabHolderReads(sd, ["v"], out, seen, 0) }
+    // ... and either into a field or element of a named binding, to that slot's reads.
+    if elabCallRec && pd < 0 && sd < 0 && cn is Call {
+      elabHeldRecvReads(cn, ai, out, seen)
+    }
     const fds = if cn is Call && cn.callFn >= 0 { elabCalleeFns(cn) } else { [] }
     for fd in fds {
       const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
@@ -16202,6 +16228,102 @@ function elabPushRecvDecl(c: Call): i32 {
     return -1
   }
   return d
+}
+
+// The named binding `x` is a field or element of, as a chain of member and index reads from it,
+// with each step appended to `steps` in order from the binding; -1 where `x` is no such chain or
+// its binding is a capture cell.
+function elabRecvPath(x0: i32, steps: string[]): i32 {
+  const rev: string[] = []
+  let x = parenPeelIx(x0)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 8 {
+    const n = nodeAt(x)
+    if n is Ident {
+      const d = identDeclOf(x)
+      if (
+        d < 0
+        || d >= cwIxCoveredLen()
+        || (cboxCellDecls[cboxDeclKey(d)] ?? 0) == 1
+      ) {
+        return -1
+      }
+      let j = rev.length - 1
+      while j >= 0 {
+        steps.push(rev[j])
+        j = j - 1
+      }
+      return d
+    } else if n is Member {
+      rev.push("f." + n.memProp)
+      x = parenPeelIx(n.memObj)
+    } else if n is Index {
+      rev.push(elabSlotStepOf(parenPeelIx(n.idxArr)))
+      x = parenPeelIx(n.idxArr)
+    } else {
+      return -1
+    }
+    hops = hops + 1
+  }
+  return -1
+}
+
+// The step a read of an element of container `x` takes: `v` for a map, `e` otherwise.
+function elabSlotStepOf(x: i32): string {
+  const t = if x >= 0 && x < P.nodes.length { nodeTyIxOf(x) } else { -1 }
+  return if t >= 0 && t < T.tys.length && tyAt(nonNullTy(t)) is TyMap { "v" } else { "e" }
+}
+
+// A value pushed (argument 0) or set (argument 1) by call `c` into a holder that is a field or
+// element of a named binding: the call search follows it to that slot's reads.
+function elabHeldRecvReads(c: Call, ai: i32, out: i32[], seen: i32[]) {
+  const fm = nodeAt(parenPeelIx(c.callFn))
+  if !(fm is Member) { return 0 }
+  const isPush = (fm.memProp == "push" || fm.memProp == "unshift") && ai == 0
+  const isSet = fm.memProp == "set" && ai == 1 && c.callArgs.length == 2
+  if !isPush && !isSet { return 0 }
+  const o = parenPeelIx(fm.memObj)
+  if o < 0 || o >= P.nodes.length || nodeAt(o) is Ident { return 0 }
+  const steps: string[] = []
+  const rd = elabRecvPath(o, steps)
+  if rd < 0 { return 0 }
+  steps.push(if isPush { "e" } else { "v" })
+  elabHolderReads(rd, steps, out, seen, 0)
+  return 0
+}
+
+// The reads of slot `steps` of holder binding `d`, for the call search: where `d` is a function's
+// parameter, the holder is also each call's argument, so that argument's binding's slot is read
+// too, at the argument's own path.
+function elabHolderReads(
+  d: i32,
+  steps: string[],
+  out: i32[],
+  seen: i32[],
+  depth: i32,
+) {
+  elabSlotReadDeliveries(d, steps, out, seen)
+  const pn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(pn is Param) || depth >= 4 { return 0 }
+  const f = cwFrameOfDecl(d)
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  if !(fn is FuncDecl) { return 0 }
+  const pi = i32ListIndexOf(fn.fnParams, d)
+  if pi < 0 { return 0 }
+  const calls: i32[] = []
+  elabRetCalls(f, calls)
+  for c in calls {
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if cn is Call && cn.callArgs.length == fn.fnParams.length {
+      const at: string[] = []
+      const ad = elabRecvPath(cn.callArgs[pi], at)
+      if ad >= 0 {
+        for st in steps { at.push(st) }
+        elabHolderReads(ad, at, out, seen, depth + 1)
+      }
+    }
+  }
+  return 0
 }
 
 // The map binding call `c` sets a value into as `m.set(k, v)`, written type or not, that is no
@@ -16664,7 +16786,9 @@ function elabSlotAliasOn(u: i32, path: string[], out: i32[], seen: i32[]) {
         elabDlvEnterCall(up)
         elabEntryFns.push(fd)
         elabEntryCalls.push(up)
-        const inSeen = if elabDlvKey != wasKey && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
+        // Another instance, or for a call search another call, reads the parameter afresh.
+        const fresh = elabDlvKey != wasKey || elabCallRec
+        const inSeen = if fresh && elabEntryFns.length < 8 { elabSeenFresh() } else { seen }
         elabSlotReadDeliveries(fn.fnParams[ai], path, out, inSeen)
         elabEntryFns.pop()
         elabEntryCalls.pop()
@@ -23101,8 +23225,11 @@ function eplSrcHolder(h0: i32): i32 {
   // what the loop's value is.
   const lc = lvCarrierLoopOf(h0)
   const lx = if h0 >= cwIxCoveredLen() { lvExitLoops[h0] ?? -1 } else { -1 }
-  // A temp the capture rewrite minted for a closure's write holds its cell's binding.
-  const wc = if h0 >= cwIxCoveredLen() { cboxWriteCells[h0] ?? -1 } else { -1 }
+  // A temp the capture rewrite minted for a closure's write holds its cell's binding, and so does
+  // an instance's clone of that temp.
+  const o0 = if h0 >= cwIxCoveredLen() { declOrigOf(h0) } else { -1 }
+  const wo = if o0 >= 0 { cboxWriteCells[o0] ?? -1 } else { -1 }
+  const wc = if h0 >= cwIxCoveredLen() { cboxWriteCells[h0] ?? wo } else { -1 }
   let h = if lc >= 0 { lc } else if lx >= 0 { lx } else if wc >= 0 { wc } else { elabCellLitBinding(h0) }
   if h >= cwIxCoveredLen() {
     const o = declOrigOf(h)
