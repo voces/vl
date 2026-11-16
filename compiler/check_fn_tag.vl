@@ -1,5 +1,10 @@
 import { tailValueLeaves } from "./check_unconsumed"
-import { setBindSetsOf, setBindTrySets } from "./check_set_bind"
+import {
+  setBindHandedSets,
+  setBindSetsOf,
+  setBindTrySets,
+} from "./check_set_bind"
+import { handBackHoleIx } from "./check_hand_back"
 import { demangleName } from "./check_suggest"
 // Which sets of functions a value holds as the i32 id of its member rather than as a closure
 // (D3975). A set is tagged when some call through it needs a member's own instance, and every
@@ -626,7 +631,12 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftTryWith(rootIx, s, calls, mint)
   // Before the elaboration, a set its own reading leaves undecided is asked again with the
   // arrow rule's facts, which stand for the instances' calls the elaboration has not yet made.
-  if !ftLate && !fnTagSetIsTagged(s) && (ftCheckFactSets[s] ?? false) {
+  const handed = i32ListHas(setBindHandedSets(), s)
+  if (
+    !ftLate
+    && !fnTagSetIsTagged(s)
+    && ((ftCheckFactSets[s] ?? false) || handed)
+  ) {
     ftUseArrow = true
     ftFactRefused = false
     ftTryWith(rootIx, s, calls, ftCheckFacts)
@@ -1903,7 +1913,7 @@ export function ftOwnTyParamJoins(
           return false
         }
       }
-      if i32ListHas(mintRetParamsOf(d), k) { back = true }
+      if i32ListHas(ftRetParamsOf(d), k) { back = true }
     }
     k = k + 1
   }
@@ -1979,7 +1989,7 @@ function ftIdentChar(c: i32): boolean {
 // set is then decided with.
 function ftHandsBack(d: i32, c: Call, s: i32): boolean {
   const f = nodeAt(d)
-  for i in mintRetParamsOf(d) {
+  for i in ftRetParamsOf(d) {
     if ftArgIsParam(c, i) && ftIsS(c.callArgs[i], s) { return true }
     const j = if f is FuncDecl && ftArgIsParam(c, i) { fnTagSharedJoinSet(f, i, c.callArgs) } else { -1 }
     const o = if j == s { fnTagSetOfTy(nodeTyIxOf(c.callArgs[i])) } else { -1 }
@@ -2187,7 +2197,7 @@ function ftHandBackArg(x: i32): i32 {
   if !(c is Call) { return -1 }
   const d = ftNamedFn(c.callFn)
   if d < 0 { return -1 }
-  const rp = mintRetParamsOf(d)
+  const rp = ftRetParamsOf(d)
   if rp.length != 1 || !ftArgIsParam(c, rp[0]) { return -1 }
   const a = parenPeelIx(c.callArgs[rp[0]])
   return if a >= 0 && nodeAt(a) is Ident && identFnDeclOf(a) >= 0 { a } else { -1 }
@@ -2412,7 +2422,12 @@ function ftNodeOk(
       const nd = ftNamedFn(n.callFn)
       const d = if nd >= 0 { nd } else { ftNestedCalleeDecl(n.callFn) }
       // A function an instance found to hand back its parameter gives this call that argument.
-      if ftLate && d >= 0 && ftHandsBack(d, n, s) { return true }
+      if (ftLate || ftUseArrow) && d >= 0 && ftHandsBack(d, n, s) {
+        return true
+      }
+      // In the retry, a callee the check's facts say hands a parameter back, yet not this set's,
+      // is the facts refusing.
+      if ftUseArrow && d >= 0 && ftRetParamsOf(d).length > 0 { ftFactRefusal() }
       const ld = if d >= 0 { d } else { ftConstFnOf(n.callFn) }
       // A method call on a holder of the set, standing as a statement, hands its value nowhere.
       if ld < 0 && ftDiscardedAt(p, x) && ftMethodRecvHolds(x, s) {
@@ -4132,7 +4147,7 @@ function ftLateParamTakes(c: Call, d: i32, i: i32, s: i32): boolean {
     || ftParamUnread(d, i)
     || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
     || ftArgIsParam(c, i) && ftParamInert(d, i, 0)
-    || ftArgIsParam(c, i) && i32ListHas(mintRetParamsOf(d), i)
+    || ftArgIsParam(c, i) && i32ListHas(ftRetParamsOf(d), i)
     || ftListedHandsOne(d, i, s)
 }
 
@@ -5896,4 +5911,14 @@ function ftLateOutsideExclusions(): i32 {
     if fnTagSetIsTagged(s) { return s }
   }
   return -1
+}
+
+// The parameters declaration `d` hands back: the elaboration's after it, the check's own reading
+// of the body (`check_hand_back.vl`) during the check's retry.
+function ftRetParamsOf(d: i32): i32[] {
+  if !ftUseArrow { return mintRetParamsOf(d) }
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(f is FuncDecl) || f.fnBody < 0 { return [] }
+  const i = handBackHoleIx(f, 0)
+  return if i >= 0 { [i] } else { [] }
 }
