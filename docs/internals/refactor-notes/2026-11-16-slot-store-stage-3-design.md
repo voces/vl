@@ -58,8 +58,10 @@ reading types and bounds as of the freeze is identical, and D16768 closes on tha
 - **L2** (answered 2026-11-16). No overlap with schemes or the bounds alphabet: those are type
   bounds per function, and S3b's pins are value-flow facts. The overlap is the instance key: the
   solved instantiation recorded per call (#8836, #8841) and interned by STORE's A0 into a `KeyId`.
-  S3b's side table keys a per-instance pin by that `KeyId`, not by mono's instance names, so check
-  and mono agree on what an instance is (A0's timing: STORE).
+  S3b's side table keys a per-instance pin by the elaboration's instance key (`ekIndex`) for now.
+  It switches to that `KeyId` once A0, a shadow comparing the check's keys with the elaboration's,
+  reports them equal for the instances that hold written slots, or once an A stage makes the
+  check's key the one mono builds from (STORE, 2026-11-16).
 - **The node replacements of §5** are mono's flow rewrite (`mfrElabFns`), which only gates the
   rewrite: the answer is already the elaboration's. L2's population table (branch `l2-mfr-measure`,
   `$VL_REP_SHADOW=1`), with the four programs added by name, says which rung answers each; if
