@@ -21,5 +21,5 @@ Lane WIDTH, following D3431's close. This PR stacks on that change.
 
 ## Residue
 
-- D16714: a literal binding whose nested record lands in nullable, narrower storage and is then
+- D16750: a literal binding whose nested record lands in nullable, narrower storage and is then
   read for the dropped field is refused at emit. D2996 owes a check refusal there.
