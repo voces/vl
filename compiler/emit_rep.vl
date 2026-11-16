@@ -18,6 +18,7 @@ import {
   canonShadowOn,
   tyRepId,
   tyRepIdProvisional,
+  tySameSealed,
 } from "./emit_ty_seal"
 import {
   Interner,
@@ -41,9 +42,37 @@ import { i32ToStr } from "./ast"
 import { unRowOfTyKey } from "./emit_union_tykey_text"
 import { emitFail } from "./emit_bytes"
 import {
+  FC_CLOSURE,
+  FC_F32,
+  FC_F32_LIST,
+  FC_F64,
+  FC_F64_LIST,
+  FC_I32,
+  FC_I32_LIST,
+  FC_I64,
+  FC_I64_LIST,
+  FC_MAP,
+  FC_NUL_BOOL,
+  FC_NUL_CLOSURE,
+  FC_NUL_F32_LIST,
+  FC_NUL_F64_LIST,
+  FC_NUL_I32_LIST,
+  FC_NUL_I64_LIST,
+  FC_NUL_LIT_UNION,
+  FC_NUL_MAP,
+  FC_NUL_NONE,
   FC_NUL_REF_LIST,
+  FC_NUL_STR,
+  FC_NUL_STR_LIST,
+  FC_NUL_U8_LIST,
   FC_REF_LIST,
+  FC_STR,
   FC_STRUCT,
+  FC_STR_LIST,
+  FC_U8_LIST,
+  FC_UNION,
+  FC_V128,
+  FC_V128_LIST,
   PK_U8,
   RLK_CLOSURE,
   RLK_F32_LIST,
@@ -178,7 +207,6 @@ import {
   tyIxIsVariantMember,
   tyKeyOf,
   tyPrimNameIs,
-  tySame,
   tyToStrUser,
   tyValOf,
 } from "./check_types"
@@ -2218,7 +2246,7 @@ function msSliceMembersAlike(u: i32, i: i32, j: i32): boolean {
   const a = litArmBaseTy(msSliceTy(u, i))
   const b = litArmBaseTy(msSliceTy(u, j))
   if a < 0 || b < 0 { return a == b }
-  return a == b || tySame(a, b) && armDeclSame(a, b)
+  return a == b || tySameSealed(a, b) && armDeclSame(a, b)
 }
 
 // Member type `t` with a literal read as its base; `t` itself otherwise, -1 for `null`.
@@ -2612,26 +2640,6 @@ export function vbHeapIdxOfKind(k: i32): i32 {
   return -1
 }
 
-// The value-eq opcode (i32 result) for a value atom of kind `k`: i32/boolean share
-// `i32.eq`, i64/f64/f32 take their own; -1 for `string` (its eq loop), `null` (tag
-// equality alone decides it) and every list/closure kind. Lives here, beside
-// `scalarTagOfKind`/`vbHeapIdxOfKind`, since both call sites already hold the code and only needed a home free of re-deriving it from a spelling.
-export function atomEqOpcodeOfKind(k: i32): i32 {
-  if k == 0 || k == 1 {
-    return 70 // 0x46 i32.eq
-  }
-  if k == 3 {
-    return 81 // 0x51 i64.eq
-  }
-  if k == 4 {
-    return 97 // 0x61 f64.eq
-  }
-  if k == 5 {
-    return 91 // 0x5b f32.eq
-  }
-  return -1
-}
-
 // The wasm value blocktype byte a value atom of kind `k` carries — the result type a
 // value-producing `if` must declare when its arms yield the unboxed atom. i64/f64/f32
 // take their own; every other kind reads as the i32 blocktype. One home for a table
@@ -2930,6 +2938,183 @@ export function rowStoreRepIn(tys: i32[], r: i32): RepDesc | null {
   return d
 }
 
+// The struct/variant field code (`nameFieldCodeTy`'s vocabulary) of a field of list rep
+// `k`, or -1 for a rep that is not a list. Each nullable rep has its own code, since its slot
+// is a `(ref null …)` where the non-null code's is a `(ref …)`.
+export function fieldCodeOfListRep(k: VKind): i32 {
+  match k {
+    "list" => {
+      return FC_I32_LIST
+    }
+    "u8list" => {
+      return FC_U8_LIST
+    }
+    "i64list" => {
+      return FC_I64_LIST
+    }
+    "f32list" => {
+      return FC_F32_LIST
+    }
+    "v128list" => {
+      return FC_V128_LIST
+    }
+    "f64list" => {
+      return FC_F64_LIST
+    }
+    "strlist" => {
+      return FC_STR_LIST
+    }
+    "reflist" => {
+      return FC_REF_LIST
+    }
+    "nullist" => {
+      return FC_NUL_I32_LIST
+    }
+    "nulu8list" => {
+      return FC_NUL_U8_LIST
+    }
+    "nuli64list" => {
+      return FC_NUL_I64_LIST
+    }
+    "nulf32list" => {
+      return FC_NUL_F32_LIST
+    }
+    "nulf64list" => {
+      return FC_NUL_F64_LIST
+    }
+    "nulstrlist" => {
+      return FC_NUL_STR_LIST
+    }
+    "nulreflist" => {
+      return FC_NUL_REF_LIST
+    }
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
+}
+
+// The field code a storage rep derives, or -2 where it has none. A nullable record or variant
+// shares the struct code, which stores either nullable.
+export function fieldCodeOfRep(d: RepDesc): i32 {
+  const k = d.rdKind
+  match k {
+    null => {
+      return -2
+    }
+    "v128" => {
+      return if d.rdNul == 0 { FC_V128 } else { -2 }
+    }
+    "i32" => {
+      return if d.rdNul == 3 { FC_NUL_LIT_UNION } else { FC_I32 }
+    }
+    "str" => {
+      return FC_STR
+    }
+    "closure" => {
+      return FC_CLOSURE
+    }
+    "nulclosure" => {
+      return FC_NUL_CLOSURE
+    }
+    "union" => {
+      return FC_UNION
+    }
+    "i64" => {
+      return FC_I64
+    }
+    "f64" => {
+      return FC_F64
+    }
+    "f32" => {
+      return FC_F32
+    }
+    "struct" | "nulstruct" | "variant" | "nulvariant" => {
+      return FC_STRUCT
+    }
+    "map" => {
+      return FC_MAP
+    }
+    "nulmap" => {
+      return FC_NUL_MAP
+    }
+    "nulstr" => {
+      return FC_NUL_STR
+    }
+    "nulbool" => {
+      return FC_NUL_BOOL
+    }
+    "nulnone" => {
+      return FC_NUL_NONE
+    }
+    "list" | "reflist" | "strlist" | "f64list" | "i64list" | "f32list" | "v128list" | "u8list" | "nullist" | "nulreflist" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" => {
+      return if k == null { -2 } else { fieldCodeOfListRep(k) }
+    }
+  }
+}
+
+// Read-time field-code shadow: (site, verdict) counts of every code read while the rep shadow is
+// armed, flushed by the field-code sweep. A read whose stored code is not the one its storage
+// type derives is a window the end-of-emit sweep cannot see.
+let fcReadIx: {[string]: i32} = Map()
+export let fcReadKeys: string[] = []
+export let fcReadCnt: i32[] = []
+
+// Drops the read-time counts once the sweep has reported them.
+export function fcReadReset() {
+  fcReadIx = Map()
+  fcReadKeys = []
+  fcReadCnt = []
+  return 0
+}
+
+function fcReadNote(site: string, verdict: string) {
+  const k = site + " -> " + verdict
+  const i = fcReadIx[k] ?? -1
+  if i >= 0 {
+    fcReadCnt[i] = fcReadCnt[i] + 1
+    return 0
+  }
+  fcReadIx[k] = fcReadKeys.length
+  fcReadKeys.push(k)
+  fcReadCnt.push(1)
+  return 0
+}
+
+// The field code at row `r` of code column `codes`, whose storage types are column `tys`; `site`
+// names the reader for the shadow. The caller bounds `r` as it would index `codes`.
+export function fieldCodeIn(
+  codes: i32[],
+  tys: i32[],
+  r: i32,
+  site: string,
+): i32 {
+  const c = codes[r]
+  if repShadowOn {
+    const st = if r >= 0 && r < tys.length { tys[r] } else { -1 }
+    if st < 0 {
+      fcReadNote(site, "noStoreTy code=" + i32ToStr(c))
+    } else {
+      const d = repOfTy(st)
+      const dc = fieldCodeOfRep(d)
+      if dc == c {
+        fcReadNote(site, "agree")
+      } else {
+        fcReadNote(
+          site,
+          "stored="
+            + i32ToStr(c)
+            + " derived="
+            + i32ToStr(dc)
+            + " rep="
+            + (d.rdKind ?? "none"),
+        )
+      }
+    }
+  }
+  return c
+}
+
 // Whether `ty` is the `null` type.
 function tyIsNullUnit(ty: i32): boolean {
   const t = tyAt(ty)
@@ -2968,8 +3153,8 @@ export function rowsStoreAlikeIn(
   cb: i32[],
   b: i32,
 ): boolean {
-  const codeA = if a >= 0 && a < ca.length { ca[a] } else { -1 }
-  const codeB = if b >= 0 && b < cb.length { cb[b] } else { -1 }
+  const codeA = if a >= 0 && a < ca.length { fieldCodeIn(ca, ta, a, "storeAlike") } else { -1 }
+  const codeB = if b >= 0 && b < cb.length { fieldCodeIn(cb, tb, b, "storeAlike") } else { -1 }
   const da = rowStoreRepIn(ta, a)
   const db = rowStoreRepIn(tb, b)
   const ka = fieldStorageKindOf(da)
@@ -2994,7 +3179,7 @@ export function tyPackedRow(ty: i32): i32 {
 // Whether struct-table flat row `r` stores a ref whose heap is named rather than pinned by its
 // storage: a record ref or a ref list, nullable or not; by the field code where only it answers.
 function fieldRowRefsElemHeap(r: i32): boolean {
-  const code = if r >= 0 && r < sFieldTypes.length { sFieldTypes[r] } else { -1 }
+  const code = if r >= 0 && r < sFieldTypes.length { fieldCodeIn(sFieldTypes, sFieldStoreTy, r, "refsElemHeap") } else { -1 }
   const k = fieldStorageKindOf(rowStoreRepIn(sFieldStoreTy, r))
   if k == null { return fieldCodeRefsElemHeap(code) }
   return k == "struct"
@@ -3527,7 +3712,7 @@ function btSoftSame(a: i32, b: i32): boolean {
   }
   if tb is TyArray { return false }
   // A literal is its own value here: the canonical id would fold a string literal to `string`.
-  if btHoldsLit(a) || btHoldsLit(b) { return tySame(a, b) }
+  if btHoldsLit(a) || btHoldsLit(b) { return tySameSealed(a, b) }
   return repCanonId(a) == repCanonId(b)
 }
 
@@ -3840,7 +4025,7 @@ function unionArmsAllSame(ms: i32[]): boolean {
   if ms.length < 1 { return false }
   if ms.length == 1 { return true }
   for m in ms {
-    if !tySame(m, ms[0]) || !armDeclSame(m, ms[0]) { return false }
+    if !tySameSealed(m, ms[0]) || !armDeclSame(m, ms[0]) { return false }
   }
   return true
 }
