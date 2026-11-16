@@ -30025,6 +30025,77 @@ function refListRowRefused(exprIx: i32): i32 {
   )
 }
 
+// A `.pop()`/`.get` over an i32 or scalar list: its receiver, element kind (null for i32), and
+// the wrapper, backing and push scratch base `emitPopGo` writes it with.
+export type PopPlan = {
+  pqRecv: i32,
+  pqEk: VKind | null,
+  pqWrap: i32,
+  pqBack: i32,
+  pqBase: i32,
+}
+
+// The plan of `.pop()`/`.get` call `callIx` over an i32 or scalar list, or null for a ref or
+// string list, or for a scalar kind whose list type is not collected.
+export function popPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 { return null }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return null }
+  const o = callee.memObj
+  if exprRefArray(o, fnIx) || exprStringArray(o, fnIx) { return null }
+  if !popRecvIsList(o, fnIx) { return null }
+  const ek = scalarListElemKind(o, fnIx)
+  if ek == null || ek == "i32" {
+    const p: PopPlan = {
+      pqRecv: o,
+      pqEk: null,
+      pqWrap: lTy(),
+      pqBack: aTy(),
+      pqBase: pushScratchBase,
+    }
+    return p
+  }
+  const k: VKind = ek
+  if !scalarListUsedOf(k) { return null }
+  const row = exprPackedRow(o, fnIx)
+  const sp: PopPlan = {
+    pqRecv: o,
+    pqEk: k,
+    pqWrap: scalarListWrap(k, row),
+    pqBack: scalarListBack(k, row),
+    pqBase: scalarPushScratchBaseOf(k, row),
+  }
+  return sp
+}
+
+// Why the `.pop()` statement `callIx` (plan `pq`) is not the checked drop the IR writes, or "":
+// an i32, i64, f64 or f32 list that is not a boolean or atom niche, popped where it may be empty,
+// not a pop the checker types as the element under a length test (D3558).
+export function popStmtPlainWhy(pq: PopPlan, callIx: i32, fnIx: i32): string {
+  const ek = pq.pqEk
+  if ek != null && ek != "i64" && ek != "f64" && ek != "f32" {
+    return "pop element"
+  }
+  if listElemIsBool(pq.pqRecv, fnIx) || tyNulLitUnionInner(nodeTyIxOf(callIx)) {
+    return "pop niche"
+  }
+  if nodeTyExcludesNull(callIx) { return "pop typed element" }
+  return ""
+}
+
+// A numeric `.pop()` statement whose receiver is in local `lIdx`: under the length test, the
+// element taken and dropped, so an empty list is left as it is (D8360). Returns 1 (nothing left
+// on the stack), or -1.
+export function popDropTail(lIdx: i32, wrapTy: i32, popBack: i32, fnIx: i32) {
+  if pushTakeCond(lIdx, wrapTy, -1, fnIx) < 0 { return -1 }
+  fbIf(64) // 0x40 void
+  if pushTakeElem(lIdx, wrapTy, popBack, -1, fnIx) < 0 { return -1 }
+  fbDrop() // 0x1a drop
+  fbEnd()  // 0x0b end
+  return 1
+}
+
 // `xs.pop()` and `xs.get(i)` — the two checked list reads, typed identically (`T | null`),
 // differing only in the condition, index and length decrement (`pushTakeCond`/`pushTakeElem`);
 // one body keeps `.get` at every rep `.pop` reaches (D1281). `getIdx` is the `.get` index or
@@ -30088,28 +30159,22 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
         popBack = rlBackIdx[rslot]
         popRefSlot = rslot
         elemIsRef = true
-      } else if popEk != null {
-        // The scalar sibling of the i32 default below: same shape, a per-kind wrapper,
-        // backing and scratch base.
-        if !scalarListUsedOf(popEk) {
-          return emitFail(
-            "emitProgram: " + opNm + " but list type not collected",
-          )
-        }
-        wrapTy = scalarListWrap(popEk, exprPackedRow(callee.memObj, fnIx))
-        popBack = scalarListBack(popEk, exprPackedRow(callee.memObj, fnIx))
-        base = scalarPushScratchBaseOf(
-          popEk,
-          exprPackedRow(callee.memObj, fnIx),
-        )
-      } else if isStr {
+      } else if popEk == null && isStr {
         wrapTy = mkListTy()
         popBack = mkArrTy()
         base = strPushScratchBase
         elemIsRef = true
       } else {
-        wrapTy = lTy()
-        popBack = aTy()
+        // An i32 or scalar list: the wrapper, backing and scratch base `popPlanOf` lays out.
+        const pq = popPlanOf(callIx, fnIx)
+        if pq == null {
+          return emitFail(
+            "emitProgram: " + opNm + " but list type not collected",
+          )
+        }
+        wrapTy = pq.pqWrap
+        popBack = pq.pqBack
+        base = pq.pqBase
       }
       // Receiver resolution — `listOpRecvLocal`, shared with `.push`/`.clear`/`.pop() ?? d`.
       const lIdx = listOpRecvLocal(callee.memObj, fnIx, base, popRefSlot, opNm)
@@ -30167,12 +30232,7 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
       // A numeric `.pop` statement has no null cell to answer with, so it pops under the
       // length test and drops the element itself: an empty list is left as it is (D8360).
       if !nulBox && getIdx < 0 {
-        if pushTakeCond(lIdx, wrapTy, getIdx, fnIx) < 0 { return -1 }
-        fbIf(64) // 0x40 void
-        if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
-        fbDrop() // 0x1a drop
-        fbEnd()  // 0x0b end
-        return 1
+        return popDropTail(lIdx, wrapTy, popBack, fnIx)
       }
       // the unchecked tail: the reps with no `T | null` cell of their own.
       if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
@@ -40788,7 +40848,7 @@ function emitArrayNewIntr(callIx: i32, fnIx: i32) {
       }
       fbLocalSet(anLenL)
       if anIsNew {
-        const anFillRc = emitArrNewFill(c.callArgs[1], fnIx)
+        const anFillRc = emitArrNewFillAt(callIx, c.callArgs[1], fnIx)
         if anFillRc < 0 { return -1 }
         fbLocalGet(anLenL)
         fbArrayNew(anBack)
@@ -40854,6 +40914,22 @@ function emitArrNewFill(fill: i32, fnIx: i32): i32 {
   arrNewFillDepth = arrNewFillDepth - 1
   if anFillRc < 0 { return -1 }
   return 0
+}
+
+// `emitArrNewFill` for the `__array_new__` call `callIx`: a fill the checker built at a union
+// element of its destination is boxed into that element (D16887).
+function emitArrNewFillAt(callIx: i32, fill: i32, fnIx: i32): i32 {
+  const lt = nodeTyAt(callIx, fnIx)
+  const lty = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+  const et = if lty is TyArray { tyElemOf(lty) } else { -1 }
+  const nm = if et >= 0 { boxTyName(et) } else { "" }
+  if nm == "" || exprUnion(fill, fnIx) || repOfTy(et).rdKind != "union" {
+    return emitArrNewFill(fill, fnIx)
+  }
+  arrNewFillDepth = arrNewFillDepth + 1
+  const rc = emitUnionBoxArg(nm, et, fill, fnIx)
+  arrNewFillDepth = arrNewFillDepth - 1
+  return if rc < 0 { -1 } else { 0 }
 }
 
 // The `__array_copy__(dst, dstAt, src, srcAt, count)` intrinsic lowering.
