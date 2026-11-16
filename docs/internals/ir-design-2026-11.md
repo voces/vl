@@ -779,6 +779,9 @@ lowering import (C2i) found no other: each reads pre-pass, checker or rep state,
 restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes. One
 caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
 previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
+I8a's tail reads no seat: `numWidenTail` asks `numFloorWhy`, which compares the node with
+`coerceHeld`, set and restored around one legacy conversion and so -1 wherever the IR asks, and
+`exprReadsDeadNever`, which reads the tree and the checker's types.
 
 **A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
 plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held
