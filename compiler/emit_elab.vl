@@ -2,6 +2,7 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import { emitFail } from "./emit_bytes"
 import {
   calleeNamesDecl,
   handBackCopySeedsNote,
@@ -10301,6 +10302,8 @@ export function elabRun() {
   // A compiler instance reused for another program keeps no classes of the last one.
   EPL = eplFresh()
   eplAsked = false
+  eplFrozen = false
+  eplTakesFn = -1
   elabPinsClosedSet(false)
   elabCbRepKeys = Map()
   elabSigAltKeys = Map()
@@ -19895,11 +19898,19 @@ let eplAsked = false
 // Builds the classes before any rewrite when the program takes a function as a value; a program
 // that takes none has nothing to deliver, and builds them only if a reader asks.
 function eplEnsure() {
-  if EPL.stale && (eplAsked || eplTakesFnValue()) {
+  if EPL.stale && (eplAsked || eplTakesFnOnce()) {
     eplBuild()
     EPL.stale = false
   }
   return 0
+}
+
+// `eplTakesFnValue`, scanned once per program: 1 yes, 0 no, -1 not yet.
+let eplTakesFn = -1
+
+function eplTakesFnOnce(): boolean {
+  if eplTakesFn < 0 { eplTakesFn = if eplTakesFnValue() { 1 } else { 0 } }
+  return eplTakesFn == 1
 }
 
 // Whether the checked program holds a lambda, or reads a named function anywhere but as a callee.
@@ -19940,6 +19951,7 @@ function eplNodeTakesFn(x: i32, callees: {[i32]: boolean}): boolean {
 function eplTakesNoFn(_x: i32): boolean { return false }
 
 function eplStaleAt() {
+  if eplFrozen { emitFail(EPL_FROZEN_MSG) }
   EPL.limit = ekDecl.length
   EPL.stale = true
   return 0
@@ -21229,8 +21241,33 @@ function eplRebuildLeaf(p: i32, t: i32, path: string[]): i32 {
   return mkFuncTy(pin, ret)
 }
 
+// Set once mono begins: the classes are read-only from then on, so a build or a stale mark after it
+// is an internal error (D16768).
+let eplFrozen = false
+
+const EPL_FROZEN_MSG = "emitProgram: internal: the place classes were rebuilt after mono began"
+
+// Freezes the classes for mono, building them first where no reader has yet: a build or a stale
+// mark after this fails the emit. A program that takes no function as a value freezes them empty,
+// since nothing in it is delivered.
+export function eplFreeze() {
+  if EPL.stale {
+    if eplTakesFnOnce() {
+      eplBuild()
+    } else {
+      const limit = EPL.limit
+      EPL = eplFresh()
+      EPL.limit = limit
+    }
+    EPL.stale = false
+  }
+  eplFrozen = true
+  return 0
+}
+
 // Builds the place classes over the elaborated program as it stands: every instance settled so far.
 function eplBuild() {
+  if eplFrozen { emitFail(EPL_FROZEN_MSG) }
   eplAsked = true
   const limit = EPL.limit
   EPL = eplFresh()
