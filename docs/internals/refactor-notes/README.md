@@ -9,6 +9,12 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-width-same-elems-in-literal-d16765](2026-11-16-width-same-elems-in-literal-d16765.md): A literal's list part takes its elements' build (D16765), 2026-11-16
+- [2026-11-16-type-hashcons-s6b5-union-walk-caps](2026-11-16-type-hashcons-s6b5-union-walk-caps.md): Type hash-cons stage 6b, batch 5: six union-member walkers get visited sets (lane H), 2026-11-16
+- [2026-11-16-store-set-bind-sealed-holders](2026-11-16-store-set-bind-sealed-holders.md): One storage decider: sealed holders, and the set-grain diff, 2026-11-16
+- [2026-11-16-rep-adt-stage3c-iii-name-ladder](2026-11-16-rep-adt-stage3c-iii-name-ladder.md): Rep ADT stage 3c-iii: `nameFieldCodeTy` reads the storage rep, 2026-11-16 (lane REP)
+- [2026-11-16-width-map-built-callback-d16211](2026-11-16-width-map-built-callback-d16211.md): An identity `map` over a built list keeps its elements' build (D16211), 2026-11-16
+- [2026-11-16-l2-s3-1-solver-shell](2026-11-16-l2-s3-1-solver-shell.md): L2 S3.1: the solver shell, 2026-11-16
 - [2026-11-16-slot-store-pin-table-design](2026-11-16-slot-store-pin-table-design.md): Slot store: the pin table mono reads, design note (lane SLOT, 2026-11-16)
 - [2026-11-16-ir-c2b-list-hoist-shared](2026-11-16-ir-c2b-list-hoist-shared.md): IR cutover C2b: the list-header hoist is a shared decision, 2026-11-16
 - [2026-11-16-width-same-elems-built-d16763](2026-11-16-width-same-elems-built-d16763.md): A same-elements result of a built list is judged as its receiver is (D16763), 2026-11-16
