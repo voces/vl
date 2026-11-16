@@ -9,6 +9,10 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-ir-c2l-list-store](2026-11-16-ir-c2l-list-store.md): IR cutover C2l: a list element store (coverage step), 2026-11-16
+- [2026-11-16-l2-s3-4-walk-rest](2026-11-16-l2-s3-4-walk-rest.md): L2 S3.4: the remaining bound kinds join the body-order walk, 2026-11-16
+- [2026-11-16-rr-names-key-memo](2026-11-16-rr-names-key-memo.md): The record-row union scan keys each member once, 2026-11-16 (lane REP)
+- [2026-11-16-store-s3-4d-2-class-t](2026-11-16-store-s3-4d-2-class-t.md): S3.4d step 2: class T decided at check from the arrow rule's facts, 2026-11-16
 - [2026-11-16-slot-store-flip](2026-11-16-slot-store-flip.md): Slot store part D, the flip: mono's slot questions read the place classes (lane SLOT, 2026-11-16)
 - [2026-11-16-rep-adt-stage4b-shadow-classes](2026-11-16-rep-adt-stage4b-shadow-classes.md): Rep ADT stage 4b, part 1: the heap shadow reads its merges against today's heap key (lane REP)
 - [2026-11-16-l2-s3-4c-discriminant](2026-11-16-l2-s3-4c-discriminant.md): L2 S3.4c, part 2: a discriminant test on a hole's field narrows its parent at the pin, 2026-11-16
