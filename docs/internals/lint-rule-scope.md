@@ -55,7 +55,6 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `unused-field` | LANGUAGE | a record field no `.f` in the module reads; spared in a module with an export or a non-literal `==`, and for a type a union or `is` discriminates on | n/a (new) | everywhere |
 | `unreachable-code` | LANGUAGE | code after an exit | none | everywhere |
 | `constant-condition` | LANGUAGE | a literal-boolean `if`/`while` | none | everywhere |
-| `for-step-zero` | LANGUAGE | a `step 0` loop never ends | none | everywhere |
 | `divide-by-zero` | LANGUAGE | `/` or `%` by a literal zero | none | everywhere |
 | `range-inclusive-length` | LANGUAGE | `0 to xs.length`, a likely off-by-one | none | everywhere |
 | `unconditional-recursion` | LANGUAGE | a call with no exit before it | none | everywhere |

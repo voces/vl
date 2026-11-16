@@ -1,4 +1,5 @@
 import { tyHasNullMember } from "./tyquery"
+import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { sharedFieldArmNulSet } from "./emit_obj_lit_fits"
 import { unRowOfNullableKey } from "./emit_union_tykey_text"
 import { valueRowKind } from "./check_ty_rep"
@@ -220,7 +221,6 @@ import {
   tyElemOf,
   tyElemOpen,
   tyEmitEpoch,
-  tyEq,
   tyFieldTyOf,
   tyHasInferHole,
   tyHasLitLeaf,
@@ -237,7 +237,6 @@ import {
   tyLitUnionHashesI32,
   tyNumScalarBaseName,
   tyPrimNameOf,
-  tySame,
   tyScalarBaseIs,
   tyScalarBasePrim,
   tyValOf,
@@ -607,6 +606,7 @@ import {
   RepDesc,
   boxAtomKindOfMemberTy,
   boxTagOfTy,
+  fieldCodeIn,
   msSliceCount,
   msSliceTy,
   nodeMapValTyIx,
@@ -1164,7 +1164,7 @@ export function cloRetValSlot(fe: i32): i32 {
     if (
       ofd is FuncDecl
       && ofd.fnRet < 0
-      && (tyHasTyVar(t) || tyHasInferHole(t, 0))
+      && (tyHasTyVar(t) || tyHasInferHole(t))
     ) {
       return inferredRetMapSlot(fe)
     }
@@ -1256,7 +1256,7 @@ function fieldClosureFeOfWant(si: i32, prop: string, want: i32) {
       const fv = objFieldVal(ai, prop)
       const ffe = fieldValueFeOf(fv)
       if ffe >= 0 {
-        if want < 0 || tyEq(nodeTyIxOf(fnStmts[ffe]), want) { return ffe }
+        if want < 0 || tyEqSealed(nodeTyIxOf(fnStmts[ffe]), want) { return ffe }
         if open < 0 && fieldValueTakesFnTy(fv, want) { open = ffe }
       }
     }
@@ -1312,7 +1312,7 @@ function fieldValueTakesFnTy(fv: i32, want: i32): boolean {
   if hr >= 0 { return sigKeyOfTy(mkFuncTy(w.fnParamTypes, hr)) == wk }
   // A closed type is the field's own and compares exactly; only an open one is a guess.
   const ft = nodeTyIxOf(fv)
-  if ft < 0 || !(tyHasTyVar(ft) || tyHasInferHole(ft, 0)) { return false }
+  if ft < 0 || !(tyHasTyVar(ft) || tyHasInferHole(ft)) { return false }
   return sigKeyOfTy(ft) == wk
 }
 
@@ -1363,10 +1363,7 @@ function instRecvFieldFnTy(recvIx: i32, prop: string, fnIx: i32): i32 {
 // field's resolved closure can be another instance of the same function (D15114, D15115).
 export function callTyClosedIn(callIx: i32, fnIx: i32): boolean {
   const ct = nodeTyInOf(callIx, fnIx)
-  return ct >= 0
-    && ct < T.tys.length
-    && !tyHasTyVar(ct)
-    && !tyHasInferHole(ct, 0)
+  return ct >= 0 && ct < T.tys.length && !tyHasTyVar(ct) && !tyHasInferHole(ct)
 }
 
 // The lifted-function position of the closure a member call `recv.prop(...)` dispatches
@@ -1393,13 +1390,13 @@ export function fieldClosureFeOfRecv(recvIx: i32, prop: string, fnIx: i32) {
   // another closed type is never the answer.
   const want = instRecvFieldFnTy(recvIx, prop, fnIx)
   const fty = nodeTyIxOf(fnStmts[fe])
-  if want < 0 || tyEq(fty, want) { return fe }
+  if want < 0 || tyEqSealed(fty, want) { return fe }
   const tfe = fieldClosureFeOfWant(structIndexOfExpr(recvIx, fnIx), prop, want)
   if tfe >= 0 { return tfe }
   if (
     fty >= 0
     && !tyHasTyVar(fty)
-    && !tyHasInferHole(fty, 0)
+    && !tyHasInferHole(fty)
     && !tyHasTyVar(want)
   ) {
     return -1
@@ -2096,7 +2093,9 @@ function readTypeVerdictGo(rx: i32, fnIx: i32): i32 {
   const li = readBindingLetOf(rx, fnIx)
   if li < 0 { return k }
   const rt = nodeTyIxOf(rx)
-  if rt >= 0 && !tyHasTyVar(rt) && tySame(rt, nodeTyIxOf(li)) { return -1 }
+  if rt >= 0 && !tyHasTyVar(rt) && tySameSealed(rt, nodeTyIxOf(li)) {
+    return -1
+  }
   if readAtomKindOfTy(nodeTyAt(li, fnIx)) == k { return -1 }
   return k
 }
@@ -2375,7 +2374,7 @@ function letNamedHeldTy(letIx: i32, init: i32, fnIx: i32): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   const tt = tyAt(t)
   const same = (ot is TyObj && tt is TyObj) || (ot is TyArray && tt is TyArray)
-  if !same || tySame(t, own) { return -1 }
+  if !same || tySameSealed(t, own) { return -1 }
   if recFreshDeclOf(u) != bd && t == t0 && !letHoldsStoreHeld(bd) { return -1 }
   return t
 }
@@ -2429,7 +2428,7 @@ function letStoreHeldTy(init: i32): i32 {
   const own = nodeTyAt(u, emitCurFnIx)
   if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
   const r = storeLetBuiltOf(u)
-  if r < 0 || tySame(r, own) { return -1 }
+  if r < 0 || tySameSealed(r, own) { return -1 }
   return r
 }
 
@@ -2442,7 +2441,7 @@ function letJoinHeldTy(init: i32): i32 {
   if !(o is IfStmt) && !(o is MatchExpr) { return -1 }
   const r = nodeRepTyIxOf(u)
   const own = nodeTyIxOf(u)
-  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) || tySame(r, own) {
+  if r < 0 || r >= T.tys.length || !(tyAt(r) is TyObj) || tySameSealed(r, own) {
     return -1
   }
   return r
@@ -3000,7 +2999,7 @@ function inferredRetMapSlotCore(ti: i32) {
   if mrx < 0 { return -1 }
   const mt = nodeTyAt(mrx, fnStmts[ti])
   // A tail typed open is read at the shape it is built at.
-  if mt >= 0 && (tyHasTyVar(mt) || tyHasInferHole(mt, 0)) {
+  if mt >= 0 && (tyHasTyVar(mt) || tyHasInferHole(mt)) {
     return mapShapeOfExpr(mrx, fnStmts[ti])
   }
   const sh = mapShapeOfTyPeeled(mt)
@@ -3024,7 +3023,7 @@ export function asgReadNarrowTy(asgIx: i32, fnIx: i32): i32 {
   const at = nodeTyIxOf(asgIx)
   const rt = nodeTyIxOf(a.binRight)
   if at < 0 || rt < 0 { return -1 }
-  if !tySame(at, rt) { return -1 }
+  if !tySameSealed(at, rt) { return -1 }
   if tyIsLitUnion(at) { return -1 }
   // `null` has no rep apart from the box's null tag.
   if tyPrimNameOf(at) == "null" { return -1 }
@@ -3091,7 +3090,7 @@ export function asgReadUnwidenOp(asgIx: i32, fnIx: i32): i32 {
     const inner = asgReadNullInnerTy(asgIx, fnIx)
     if inner >= 0 { return asgUnwidenPrim(vt, inner) }
     // A ref written into its own nullable niche: the cell is `(ref null T)`, the value `(ref T)`.
-    if stT.nInner < 0 || !tySame(stT.nInner, vt) { return -1 }
+    if stT.nInner < 0 || !tySameSealed(stT.nInner, vt) { return -1 }
     const vT = tyAt(vt)
     if vT is TyObj || vT is TyArray || vT is TyMap || vT is TyFunc {
       return 212 // 0xd4 ref.as_non_null
@@ -3113,7 +3112,7 @@ function asgPlaceStoreTy(asgIx: i32): i32 {
   if !(tgt is Member || tgt is Index) { return -1 }
   const tt = nodeTyIxOf(a.binLeft)
   const vt = nodeTyIxOf(asgIx)
-  if tt < 0 || vt < 0 || tySame(tt, vt) { return -1 }
+  if tt < 0 || vt < 0 || tySameSealed(tt, vt) { return -1 }
   return tt
 }
 
@@ -3128,7 +3127,7 @@ export function asgReadNullInnerTy(asgIx: i32, fnIx: i32): i32 {
   const stT = tyAt(st)
   if !(stT is TyNullable) { return -1 }
   const inner = stT.nInner
-  if inner < 0 || tySame(inner, vt) { return -1 }
+  if inner < 0 || tySameSealed(inner, vt) { return -1 }
   if tyPrimNameOf(inner) == null { return -1 }
   if asgUnwidenPrim(vt, inner) < 0 { return -1 }
   const a = nodeAt(asgIx)
@@ -4340,7 +4339,7 @@ function structIndexOfObjCtxMemo(objIx: i32, fnIx: i32) {
   }
   const r = structIndexOfObjCtxGo(objIx, fnIx)
   // A miss over a type still holding a hole is not remembered: a pin fills the hole in place.
-  if r < 0 && tyHasInferHole(nodeTyIxOf(objIx), 0) { return r }
+  if r < 0 && tyHasInferHole(nodeTyIxOf(objIx)) { return r }
   sioMemoIx[objIx] = r
   sioMemoFn[objIx] = fnIx
   sioMemoVer[objIx] = sNames.length
@@ -4387,7 +4386,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // hole is no answer, so an instance reads its elaborated type instead.
     if nf > 0 {
       const nt = nodeRepTyIxOf(objIx)
-      if nt >= 0 && !tyHasTyVar(nt) && !tyHasInferHole(nt, 0) {
+      if nt >= 0 && !tyHasTyVar(nt) && !tyHasInferHole(nt) {
         const nr = repRowOfTyStruct(nt, sScanLim())
         if nr >= 0 { return nr }
       }
@@ -4792,7 +4791,7 @@ export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
     const src = spreadArgOf(a.arrElems[i])
     if src >= 0 {
       const se = tyStepElem(nodeTyAt(src, fnIx))
-      if se < 0 || !tySame(se, de) { return "" }
+      if se < 0 || !tySameSealed(se, de) { return "" }
     }
     i = i + 1
   }
@@ -4882,14 +4881,14 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
     const src = spreadArgOf(a.arrElems[i])
     if src >= 0 {
       const se = tyStepElem(nodeTyAt(src, fnIx))
-      if se >= 0 && !tySame(se, de) {
+      if se >= 0 && !tySameSealed(se, de) {
         if dT is TyUnion { return src }
         const sk = mfRecvKindOf(src, fnIx)
         // A nullable element whose null is a niche of the source's own storage (`boolean | null`
         // over `boolean[]`) is that list's rep, so the source copies as it is.
         const niche = dT is TyNullable
           && sk == mfRecvKindOf(arrIx, fnIx)
-          && tySame(dT.nInner, se)
+          && tySameSealed(dT.nInner, se)
         if sk != "reflist" && sk != "strlist" && !niche { return src }
         // A string list is a nullable string list's rep, and no other nullable's (D15045).
         if (
@@ -4908,10 +4907,10 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
 
 // Whether nullable inner `inner` is element `se`, or the type `se` makes nullable.
 function spreadNulInnerIsElem(inner: i32, se: i32): boolean {
-  if tySame(inner, se) { return true }
+  if tySameSealed(inner, se) { return true }
   if se < 0 || se >= T.tys.length { return false }
   const st = tyAt(se)
-  return st is TyNullable && tySame(inner, st.nInner)
+  return st is TyNullable && tySameSealed(inner, st.nInner)
 }
 
 // Whether every spread source among `elems` is a `de` list or one that widens to it.
@@ -6121,7 +6120,7 @@ function asgNameHoldsOtherRecord(asgIx: i32, fnIx: i32): boolean {
   const vt = nodeTyAt(asgIx, fnIx)
   if st < 0 || vt < 0 { return false }
   const pt = nonNullTy(st)
-  if pt < 0 || tySame(pt, vt) { return false }
+  if pt < 0 || tySameSealed(pt, vt) { return false }
   return tyAt(pt) is TyObj && tyAt(vt) is TyObj
 }
 
@@ -6155,7 +6154,7 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   if exprMap(recv, fnIx) { return false }
   const tt = nodeTyAt(a.binLeft, fnIx)
   if tt < 0 { return tgt is Index && nodeAt(tgt.idxArr) is Ident }
-  if tySame(tt, nodeTyAt(asgIx, fnIx)) { return true }
+  if tySameSealed(tt, nodeTyAt(asgIx, fnIx)) { return true }
   // A binding a closure shares is its cell's slot, and its re-read is taken back to the right
   // side's rep exactly as the binding's own would be (D2557).
   const rn = nodeAt(recv)
@@ -8590,7 +8589,7 @@ function coalesceMapJoinShape(e: BinExpr, ix: i32, fnIx: i32): i32 {
 function coalesceOfNulMapIsMap(e: BinExpr, ix: i32, fnIx: i32): boolean {
   if e.binOp != "??" || !exprNullableMap(e.binLeft, fnIx) { return false }
   const lm = mapTyPeel(nodeTyAt(e.binLeft, fnIx))
-  if lm >= 0 && !tyHasTyVar(lm) { return tySame(nodeTyAt(ix, fnIx), lm) }
+  if lm >= 0 && !tyHasTyVar(lm) { return tySameSealed(nodeTyAt(ix, fnIx), lm) }
   // An operand whose map type still holds a hole the instance pins answers by the default:
   // its own non-null map type is the result's (D12390).
   const dt = nodeTyIxOf(e.binRight)
@@ -9329,7 +9328,9 @@ function structIndexOfRep(exprIx: i32, fnIx: i32): i32 {
   // A record read whose value is built at a wider record is stored at that record's row.
   if (k == "struct" || k == "nulstruct") && (e is Ident || e is Call) {
     const bt = callBuiltTy(rx, 8)
-    if bt >= 0 && !tySame(bt, nonNullTy(ty)) { return repStructRowOfTy(bt) }
+    if bt >= 0 && !tySameSealed(bt, nonNullTy(ty)) {
+      return repStructRowOfTy(bt)
+    }
   }
   if k == "struct" || k == "nulstruct" {
     return repStructRowOfTy(nonNullTy(ty))
@@ -9950,7 +9951,7 @@ export function coalHoleNulNumTy(e: BinExpr, fnIx: i32): i32 {
     // An inner link that is no such read may drop the null, so only its own answer counts.
     if d.binOp == "??" {
       const it = coalHoleNulNumTy(d, fnIx)
-      if it < 0 || !tySame(it, vt) { return -1 }
+      if it < 0 || !tySameSealed(it, vt) { return -1 }
       return vt
     }
   }
@@ -9960,7 +9961,7 @@ export function coalHoleNulNumTy(e: BinExpr, fnIx: i32): i32 {
     if dm >= 0 { dt = mapPinReadTy(dm) }
   }
   if dt < 0 { dt = nodeTyIxOf(dix) }
-  if dt < 0 || !tySame(dt, vt) { return -1 }
+  if dt < 0 || !tySameSealed(dt, vt) { return -1 }
   return vt
 }
 
@@ -10012,7 +10013,7 @@ export function ifBuiltAtRecord(ix: i32): boolean {
     const lr = nodeRepTyIxOf(l)
     if lr < 0 || lr >= T.tys.length || !(tyAt(lr) is TyObj) { return false }
     if one < 0 { one = lr }
-    else if !tySame(one, lr) { return false }
+    else if !tySameSealed(one, lr) { return false }
   }
   return one >= 0
 }
@@ -10103,7 +10104,7 @@ function unionReadTyOf(atIx: i32, fnIx: i32): i32 {
   const u = unwrapParen(atIx)
   if u < 0 || !(nodeAt(u) is Ident) { return -1 }
   let t = readStoreTyAt(u, fnIx)
-  if t >= 0 && t < T.tys.length && tyHasInferHole(t, 0) {
+  if t >= 0 && t < T.tys.length && tyHasInferHole(t) {
     t = holeOperandTyOf(u, fnIx)
     if t < 0 { return UNION_READ_HOLE }
   }
@@ -11236,7 +11237,13 @@ function ovnStoredAlike(ty: i32, vi: i32): boolean {
     let fj = 0
     while fj < uFieldCount[vi] {
       if armFieldNames()[start + fj] == t.objFieldNames[i] {
-        if lc != armFieldTypes()[start + fj] && !isNullTy(ft) { return false }
+        const ac = fieldCodeIn(
+          armFieldTypes(),
+          armFieldStoreTy(),
+          start + fj,
+          "armObjFit",
+        )
+        if lc != ac && !isNullTy(ft) { return false }
       }
       fj = fj + 1
     }
@@ -11479,7 +11486,7 @@ function sharedFieldNarrowedArms(
   let i = 0
   while i < vis.length {
     const si = uFieldTgtStructIdx(vis[i], fis[i])
-    if si >= 0 && si < sTyIx.length && tySame(sTyIx[si], nt) {
+    if si >= 0 && si < sTyIx.length && tySameSealed(sTyIx[si], nt) {
       kv.push(vis[i])
       kf.push(fis[i])
     }
@@ -11718,7 +11725,7 @@ function listFitArmTestIn(ix: i32, name: string, kTy: i32, fnIx: i32): boolean {
     if (
       o is Ident
       && o.identName == name
-      && tySame(isVarTyIxOf(ix), kTy)
+      && tySameSealed(isVarTyIxOf(ix), kTy)
       && ot >= 0
       && ot < T.tys.length
       && tyAt(ot) is TyArray
@@ -11752,7 +11759,7 @@ export function listNarrowRecvTyOf(exprIx: i32, fnIx: i32): i32 {
   listIsRecvTysIn(fn.fnBody, r.identName, fnIx, found)
   if found.length == 0 { return -1 }
   for f in found {
-    if f < 0 || !tySame(f, found[0]) { return -1 }
+    if f < 0 || !tySameSealed(f, found[0]) { return -1 }
   }
   // A receiver whose elements can never be the read's is another list the read does not hold.
   if listDisjointDepth(found[0], t) >= 0 { return -1 }
@@ -11932,7 +11939,7 @@ function repNarrowedArm(r: i32, nt: i32): i32 {
     }
     TyUnion => {
       for m in rn.uMembers {
-        if tySame(m, nt) { return m }
+        if tySameSealed(m, nt) { return m }
       }
       r
     }
@@ -12018,7 +12025,7 @@ function fnRetRepTy(fe: i32, depth: i32): i32 {
   let r = -1
   for v in vals {
     const vr = exprRepTy(v, fnStmts[fe], depth - 1)
-    if vr < 0 || (r >= 0 && !tyEq(r, vr)) { return -1 }
+    if vr < 0 || (r >= 0 && !tyEqSealed(r, vr)) { return -1 }
     r = vr
   }
   return r
@@ -13137,8 +13144,10 @@ function armFieldPos(vi: i32, fi: i32): i32 {
 
 // The field code at a `memberFieldPos` row, or -1 for none.
 function fieldPosCode(p: i32): i32 {
-  if p >= 0 { return sFieldTypes[p] }
-  if p <= -3 { return armFieldTypes()[-3 - p] }
+  if p >= 0 { return fieldCodeIn(sFieldTypes, sFieldStoreTy, p, "fieldPos") }
+  if p <= -3 {
+    return fieldCodeIn(armFieldTypes(), armFieldStoreTy(), -3 - p, "fieldPos")
+  }
   return -1
 }
 
@@ -13197,7 +13206,7 @@ export function memberFieldStoreTy(memIx: i32, fnIx: i32): i32 {
   while k < uvis.length {
     const t = fieldPosStoreTy(armFieldPos(uvis[k], ufis[k]))
     if t < 0 { return -1 }
-    if st >= 0 && !tySame(st, t) { return -1 }
+    if st >= 0 && !tySameSealed(st, t) { return -1 }
     st = t
     k = k + 1
   }
@@ -13546,7 +13555,7 @@ export function identIsBoundClosure(readIx: i32, fnIx: i32): boolean {
   if !emitPhaseReached("monomorphized") {
     if identBindingOfRead(fnIx, readIx) < 0 { return false }
     const t = nodeTyInOf(readIx, fnIx)
-    return tyIsFuncOrNulFunc(t) && !tyHasInferHole(t, 0)
+    return tyIsFuncOrNulFunc(t) && !tyHasInferHole(t)
   }
   return identIsBoundClosureGo(readIx, fnIx)
 }
@@ -13623,7 +13632,7 @@ export function exprIsClosure(exprIx: i32, fnIx: i32) {
       // Before mono, the read's checked type, where no inference hole is left open.
       if !emitPhaseReached("monomorphized") {
         const mt = nodeTyInOf(exprIx, fnIx)
-        return tyIsFuncOrNulFunc(mt) && !tyHasInferHole(mt, 0)
+        return tyIsFuncOrNulFunc(mt) && !tyHasInferHole(mt)
       }
       // A field read the checker narrowed to a function arm at a receiver no narrowing key
       // reaches (`hs[0].f`), which the read site unboxes to the closure.
@@ -14093,7 +14102,7 @@ function sigArityIsElemOf(key: string, listTy: i32): boolean {
   if !(lt is TyArray) || tyElemOpen(lt) || tyElemOf(lt) >= T.tys.length {
     return true
   }
-  if !tyHasInferHole(tyElemOf(lt), 0) { return true }
+  if !tyHasInferHole(tyElemOf(lt)) { return true }
   const et = tyAt(tyElemOf(lt))
   if !(et is TyFunc) { return true }
   return sigTakesParams(key, et.fnParamTypes.length)
@@ -15297,7 +15306,7 @@ function callStoreIsLitAtom(e: Call, rx: i32, fnIx: i32): boolean {
     if fRetKind[fe] != "i32" { return false }
     if fe < fRecRetTy.length {
       const r = fRecRetTy[fe]
-      if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r, 0) {
+      if r >= 0 && r < T.tys.length && !tyHasTyVar(r) && !tyHasInferHole(r) {
         return tyIsLitUnion(nonNullTy(r)) || tyIsOneStrLit(r)
       }
     }

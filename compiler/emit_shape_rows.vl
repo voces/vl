@@ -1,4 +1,5 @@
 import { unRowOfTyKey } from "./emit_union_tykey_text"
+import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { tyIsVariantMember } from "./check_node_tys"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
@@ -115,7 +116,6 @@ import {
   tyElemOpen,
   tyEmitEpoch,
   tyEmitNameNonEmpty,
-  tyEq,
   tyFieldTyOf,
   tyIsFuncArena,
   tyIsLitUnion,
@@ -129,7 +129,6 @@ import {
   tyNestedArrLeafRenders,
   tyNomNameCycled,
   tyPrimNameIs,
-  tySame,
   tyToNominalName,
   tyToNominalNameAt,
   tyValOf,
@@ -169,7 +168,6 @@ import {
 } from "./emit_field_codes"
 import { jrFlatMembers } from "./emit_join_records"
 import {
-  fieldCodeOfListRep,
   listRepOfFieldCode,
   nulListBase,
   rlElemCodeIsList,
@@ -198,6 +196,8 @@ import {
 } from "./emit_mv_slots"
 import {
   boxTagOfTy,
+  fieldCodeIn,
+  fieldCodeOfListRep,
   mvSlotKeyKind,
   mvSlotOfTyKArm,
   nodeMapValTyIx,
@@ -265,6 +265,7 @@ import {
   armFieldElemName,
   armFieldElemSame,
   armFieldLitTyIx,
+  armFieldStoreTy,
   armFieldTypes,
   armStructRowMint,
   emitPhaseReached,
@@ -911,7 +912,7 @@ export function rlElemStructRow(slot: i32): i32 {
 // (D16040). Any other element has no struct row: -1, read as stored apart from the struct table.
 function rlElemStructRowOfName(nt: i32, nm: string): i32 {
   if nt < 0 { return rlElemAnonHandleRow(nm) }
-  if !(tyAt(nt) is TyObj) || !tyMayHoldFn(nt, 0) { return -1 }
+  if !(tyAt(nt) is TyObj) || !tyMayHoldFn(nt) { return -1 }
   return rowOfTyUpToFnSets(nt)
 }
 
@@ -920,7 +921,7 @@ function rlElemStructRowOfName(nt: i32, nm: string): i32 {
 function rowOfTyUpToFnSets(t: i32): i32 {
   let q = 0
   while q < sTyIx.length && q < sScanLim() {
-    if sTyIx[q] >= 0 && !sIsAnonRow(q) && tySame(sTyIx[q], t) { return q }
+    if sTyIx[q] >= 0 && !sIsAnonRow(q) && tySameSealed(sTyIx[q], t) { return q }
     q = q + 1
   }
   return -1
@@ -1234,7 +1235,7 @@ function rlUnionElemKindOfTy(ms: i32[]): i32 {
   let same = true
   let lists = true
   for m in ms {
-    if !tySame(m, ms[0]) { same = false }
+    if !tySameSealed(m, ms[0]) { same = false }
     if m < 0 || !(tyAt(m) is TyArray) { lists = false }
   }
   if same { return refListElemKindOfTy(ms[0]) }
@@ -1347,7 +1348,7 @@ function rlNulElemKindOfTy(n: i32): i32 {
     TyUnion => {
       let same = nt.uMembers.length > 0
       for m in nt.uMembers {
-        if !tySame(m, nt.uMembers[0]) { same = false }
+        if !tySameSealed(m, nt.uMembers[0]) { same = false }
       }
       if same { return rlNulElemKindOfTy(nt.uMembers[0]) }
       return RLK_UNION
@@ -2515,7 +2516,9 @@ export function rlSlotOfRowTy(et: i32): i32 {
   let i = 0
   while i < rlElemTyIx.length {
     const ri = rlElemTyIx[i]
-    if tySame(ri, et) || tyEq(ri, et) && fnTagRepAgree(ri, et, 8) { return i }
+    if tySameSealed(ri, et) || tyEqSealed(ri, et) && fnTagRepAgree(ri, et, 8) {
+      return i
+    }
     i = i + 1
   }
   // A mixed-width integer literal union is stored at the row of its members' bases (D6460).
@@ -3159,7 +3162,7 @@ export function variantLitPairKind(a: i32, b: i32): i32 {
   while fi < uFieldCount[a] {
     const ra = uFieldStart[a] + fi
     const rb = uFieldStart[b] + fi
-    const codeEq = armFieldTypes()[ra] == armFieldTypes()[rb]
+    const codeEq = armCodesEq(ra, rb, "litArms")
       && uFieldElemKeyKindAt(a, fi) == uFieldElemKeyKindAt(b, fi)
     const storageEq = codeEq && armFieldElemSame(ra, rb)
     // Either, not both: a literal set beside its own base is legal, and the base arm has
@@ -3203,6 +3206,13 @@ export function variantLitPairKind(a: i32, b: i32): i32 {
   return 1
 }
 
+// Whether arm-table flat rows `ra` and `rb` hold one field code.
+function armCodesEq(ra: i32, rb: i32, site: string): boolean {
+  const codes = armFieldTypes()
+  const tys = armFieldStoreTy()
+  return fieldCodeIn(codes, tys, ra, site) == fieldCodeIn(codes, tys, rb, site)
+}
+
 // Is variant field `fi` a string literal set in both arms whose storages differ only by the
 // litunion rep seam — a registered alias's interned atom (code 0) beside an inline set's
 // string ref (code 3)? Both sides must already be atom material, or the promotion would have
@@ -3213,7 +3223,7 @@ export function variantFieldLitRepMixed(a: i32, b: i32, fi: i32): boolean {
   if fi < 0 || fi >= uFieldCount[a] || fi >= uFieldCount[b] { return false }
   const ra = uFieldStart[a] + fi
   const rb = uFieldStart[b] + fi
-  if armFieldTypes()[ra] == armFieldTypes()[rb] { return false }
+  if armCodesEq(ra, rb, "litRepMixed") { return false }
   if !litFieldRowIsAtomisable(ra) { return false }
   return litFieldRowIsAtomisable(rb)
 }
@@ -3228,7 +3238,7 @@ export function variantFieldLitRepStrMixed(a: i32, b: i32, fi: i32): boolean {
   if fi < 0 || fi >= uFieldCount[a] || fi >= uFieldCount[b] { return false }
   const ra = uFieldStart[a] + fi
   const rb = uFieldStart[b] + fi
-  if armFieldTypes()[ra] == armFieldTypes()[rb] { return false }
+  if armCodesEq(ra, rb, "litRepStrMixed") { return false }
   if litFieldRowIsAtomisable(ra) {
     return litFieldRowIsStrSetBesideString(ra, rb)
   }
@@ -3350,7 +3360,7 @@ function repStructRowOfTyGo(ty: i32): i32 {
   if al >= 0 { return al }
   // A record narrower than one declared record is stored as it, as its literals are built.
   const nr = recNarrowRecordOf(ty)
-  return if nr >= 0 && !tySame(nr, ty) { repStructRowOfTy(nr) } else { -1 }
+  return if nr >= 0 && !tySameSealed(nr, ty) { repStructRowOfTy(nr) } else { -1 }
 }
 
 // Whether struct row `si` is the row record `ty` is stored under, or a layout twin of it (one
@@ -3430,7 +3440,7 @@ export function wholeShapeRowOf(ty: i32): i32 {
   }
   let r = wsrHead[wsrKeyOf(ty)] ?? -1
   while r >= 0 {
-    if tyEq(sTyIx[r], ty) { return r }
+    if tyEqSealed(sTyIx[r], ty) { return r }
     r = wsrNext[r]
   }
   return -1
@@ -3522,7 +3532,7 @@ function shapeNominalRowOf(ty: i32): i32 {
   if kr >= 0 { return kr }
   // A record narrower than one declared record is stored as it (`recNarrowRecordOf`).
   const nr = recNarrowRecordOf(ty)
-  if nr >= 0 && !tySame(nr, ty) { return shapeNominalRowOf(nr) }
+  if nr >= 0 && !tySameSealed(nr, ty) { return shapeNominalRowOf(nr) }
   return -1
 }
 
@@ -3717,7 +3727,10 @@ export function famRelayStructRow(si: i32) {
   while fi < sFieldCount[si] {
     const sr = sFieldStart[si] + fi
     const lty = famRelay.get(c + sFieldNames[sr])
-    if lty != null && sFieldTypes[sr] == FC_I32 {
+    if (
+      lty != null
+      && fieldCodeIn(sFieldTypes, sFieldStoreTy, sr, "famRelay") == FC_I32
+    ) {
       sFieldTypes[sr] = FC_STR
       sFieldElemName[sr] = litUnionInlineNameOfTy(lty)
       storeTyPut(sFieldStoreTy, sr, TY_STR)
@@ -3776,7 +3789,7 @@ function structRowOfRecordTyGo(ty: i32): i32 {
   const kr = repRowOfTyStruct(ty, sScanLim())
   if kr >= 0 { return kr }
   const nr = recNarrowRecordOf(ty)
-  if nr >= 0 && !tySame(nr, ty) { return structRowOfRecordTy(nr) }
+  if nr >= 0 && !tySameSealed(nr, ty) { return structRowOfRecordTy(nr) }
   return -1
 }
 
