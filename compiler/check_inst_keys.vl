@@ -3,7 +3,7 @@
 // minted. Built only when the host asks (`$VL_INST_KEYS`); nothing reads it.
 // Design: the STORE instance-key note in docs/internals/refactor-notes/.
 
-import { FuncDecl, P, i32ToStr, nodeAt } from "./ast"
+import { FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
 import {
   instVecCalleeAt,
   instVecCount,
@@ -13,6 +13,7 @@ import {
 } from "./check_bind_rows"
 import { cwIxBuild, cwIxParent } from "./check_write_scan"
 import { substTyDeepUnbanked } from "./check_relate_core"
+import { TY_NEVER } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 import { elabKeyStrFor, elabKeyStrs } from "./emit_elab"
 import { MONO_NEST_MAX } from "./emit_mono"
@@ -33,6 +34,7 @@ export function instKeysBuild(): i32 {
   let openFn = 0
   let openHole = 0
   let openCanon = 0
+  let openUnbound = 0
   let capped = 0
   // Roots: rows whose binding is closed as recorded.
   let r = 0
@@ -40,14 +42,18 @@ export function instKeysBuild(): i32 {
     const d = instVecCalleeAt(r)
     if d < 0 {
       openFn = openFn + 1
-    } else if ikClosed(instVecTysAt(r)) {
-      const k = elabKeyStrFor(d, instVecNamesAt(r), instVecTysAt(r))
+    } else if ikUnbound(r) {
+      openUnbound = openUnbound + 1
+    } else if !ikRelative(r) {
+      const ns: string[] = []
+      const ts: i32[] = []
+      const k = ikKeyFor(d, instVecNamesAt(r), instVecTysAt(r), [], [], ns, ts)
       if k == "" {
         openCanon = openCanon + 1
       } else if !(seen[k] ?? false) {
         seen[k] = true
         checkKeys.push(k)
-        ikKeyAdd(keyNames, keyTys, d, instVecNamesAt(r), instVecTysAt(r))
+        ikKeyAdd(keyNames, keyTys, d, ns, ts)
         work.push(d)
         workDepth.push(0)
       }
@@ -73,7 +79,8 @@ export function instKeysBuild(): i32 {
           const d = instVecCalleeAt(q)
           if (
             d >= 0
-            && !ikClosed(instVecTysAt(q))
+            && !ikUnbound(q)
+            && ikRelative(q)
             && ikEnclosingFn(instVecIxAt(q)) == e
           ) {
             const st: i32[] = []
@@ -85,13 +92,23 @@ export function instKeysBuild(): i32 {
             } else if depth + 1 >= MONO_NEST_MAX {
               capped = capped + 1
             } else {
-              const k = elabKeyStrFor(d, instVecNamesAt(q), st)
+              const ns: string[] = []
+              const ts: i32[] = []
+              const k = ikKeyFor(
+                d,
+                instVecNamesAt(q),
+                st,
+                ens[ki],
+                ets[ki],
+                ns,
+                ts,
+              )
               if k == "" {
                 openCanon = openCanon + 1
               } else if !(seen[k] ?? false) {
                 seen[k] = true
                 checkKeys.push(k)
-                ikKeyAdd(keyNames, keyTys, d, instVecNamesAt(q), st)
+                ikKeyAdd(keyNames, keyTys, d, ns, ts)
                 work.push(d)
                 workDepth.push(depth + 1)
               }
@@ -107,7 +124,7 @@ export function instKeysBuild(): i32 {
   let q = 0
   while q < instVecCount() {
     const d = instVecCalleeAt(q)
-    if d >= 0 && !ikClosed(instVecTysAt(q)) {
+    if d >= 0 && !ikUnbound(q) && ikRelative(q) {
       const e = ikEnclosingFn(instVecIxAt(q))
       if e < 0 || (keyNames[e] ?? []).length == 0 { openHole = openHole + 1 }
     }
@@ -140,6 +157,8 @@ export function instKeysBuild(): i32 {
       + i32ToStr(openFn)
       + " open.outer-hole="
       + i32ToStr(openHole)
+      + " open.unbound="
+      + i32ToStr(openUnbound)
       + " open.canon="
       + i32ToStr(openCanon)
       + " capped="
@@ -170,6 +189,62 @@ export function instKeysLen(i: i32): i32 {
 
 export function instKeysAt(i: i32, j: i32): i32 {
   return if i >= 0 && i < ikRows.length && j >= 0 && j < ikRows[i].length { ikRows[i][j] } else { 0 }
+}
+
+// The key callee `d` takes at binding `names`/`tys`, made inside an instance of the enclosing
+// declaration bound at `encNames`/`encTys`. A name the check padded with `never` takes the
+// enclosing binding of that name, else is left to the elaboration's default (`elabCanon`). The
+// binding used is left in `ns`/`ts`, which the key's own body calls substitute with.
+function ikKeyFor(
+  d: i32,
+  names: string[],
+  tys: i32[],
+  encNames: string[],
+  encTys: i32[],
+  ns: string[],
+  ts: i32[],
+): string {
+  let i = 0
+  while i < names.length && i < tys.length {
+    let t = tys[i]
+    if t == TY_NEVER {
+      let j = 0
+      while j < encNames.length && j < encTys.length {
+        if encNames[j] == names[i] { t = encTys[j] }
+        j = j + 1
+      }
+    }
+    if t != TY_NEVER {
+      ns.push(names[i])
+      ts.push(t)
+    }
+    i = i + 1
+  }
+  return elabKeyStrFor(d, ns, ts)
+}
+
+// Whether row `r` left one of its callee's names unbound: the check padded it with `never`.
+function ikUnbound(r: i32): boolean {
+  for t in instVecTysAt(r) {
+    if t == TY_NEVER { return true }
+  }
+  return false
+}
+
+// Whether row `r` is read under an instance of its enclosing declaration: its binding is open, or
+// its callee is nested in an un-annotated or generic declaration whose names it may read.
+function ikRelative(r: i32): boolean {
+  if !ikClosed(instVecTysAt(r)) { return true }
+  const d = instVecCalleeAt(r)
+  const e = ikEnclosingFn(d)
+  const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { null }
+  if !(en is FuncDecl) { return false }
+  if en.fnTyParams.length > 0 { return true }
+  for p in en.fnParams {
+    const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
 }
 
 // Whether every type in `tys` is closed.

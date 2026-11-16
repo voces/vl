@@ -95,23 +95,45 @@ prefix.
 
 | | keys | programs |
 |---|---|---|
-| equal | 7,772 | 2,009 |
-| check-only | 81 | 54 |
-| elab-only | 11,573 | 1,908 |
+| equal | 7,730 | 2,007 |
+| check-only | 62 | 38 |
+| elab-only | 11,615 | 1,921 |
 
-Open calls, per reason: function value 4,941 rows (1,084 programs), outer hole 2,355 (567), binding
-the elaboration's canonicalization refuses 26 (9). Capped at `MONO_NEST_MAX`: 0.
+Open calls, per reason: function value 4,941 rows (1,084 programs), outer hole 2,332 (565), a name
+the check left unbound (padded `never`) 94 (53), a binding the elaboration's canonicalization
+refuses 26 (9). Capped at `MONO_NEST_MAX`: 0.
 
-Each elab-only key, by why the check has no key for it:
+### Check-only: every key explained
+
+A key the check closes and the elaboration never mints. The first pass counted 81; 19 of them were
+A0's own over-binding, fixed before this reading: a name the check pads with `never` was read as a
+binding (now the `unbound` open reason), and a nested callee's self-call lost its enclosing binding.
+The 62 left, by family:
+
+| family | keys | programs | what it is |
+|---|---|---|---|
+| literal built at its delivery type | 45 | 27 | the check binds a literal's own type (`i32[]`, `{r: i32}`); the elaboration keys the instance at the type the literal is delivered at (a forwarder's callee parameter `f64[]`, a union member `{r: i32 \| null}`) |
+| function identity | 11 | 7 | the check binds a hole function parameter to its type; the elaboration keys it by the function (`Fn#…`) |
+| enclosing name (A0) | 4 | 3 | a nested declaration whose signature reads its enclosing type parameter: the elaboration's key carries it, A0's binding does not when the call names none |
+| same-named type variable (A0) | 1 | 1 | the callee's own `T` and its caller's `T` collide in A0's substitution by name |
+| instance types coincide | 1 | 1 | `nul<T \| null>` at `T=i32` binds `T=i32 \| null`; the instance is the same as `nul<i32>`, which the elaboration reuses |
+
+None is an instance a program needs that the elaboration misses: all 38 programs are fixtures that
+pass. Two findings for A1:
+
+- **Delivery is in today's key.** Design §10 plans for delivery to leave the key and become a
+  coercion on the call edge, but the elaboration keys these 45 instances at the delivered type. A1
+  either keys at the delivered type, which needs the delivery fact at check, or takes §10's
+  coercion, which changes those instances and is graded by the size stop rule.
+- **Function identity sits beside the key** (coordinator, 2026-11-16): A1 keys (KeyId, storage).
+
+### Elab-only, by why the check has no key
 
 | reason | keys | programs | what it is |
 |---|---|---|---|
-| unrecorded | 7,116 | 1,643 | no row calls the declaration: 5,155 named, 1,961 lambdas; function-value calls (S3.4d), member calls and hole lambdas (#8841) |
-| open | 2,852 | 537 | rows call it, none closed to a key |
+| unrecorded | 7,116 | 1,643 | no row calls the declaration (5,155 named, 1,961 lambdas): functions called through function values (S3.4d), member calls and hole lambdas (#8841) |
+| open | 2,917 | 565 | rows call it, none closed to a key |
 | arg-keyed | 807 | 258 | the elaboration's argument-keyed family (`decl|n|…`) |
-| differs | 798 | 353 | a check key of the same declaration binds otherwise |
+| differs | 775 | 344 | a check key of the same declaration binds otherwise: mostly function identity, then a type parameter |
 
-The component splitting a `differs` pair: function identity (`Fn#…`) 356 (132 programs), a type
-parameter 285 (190), a hole binding 71 (30), a delivered-row entry 6 (4), and mixes of these 76.
-Function identity is the storage-shaped component the design keeps out of the key: two calls
-handing different functions of one type share a check key and split in the elaboration.
+A second reading follows when #8841 lands.
