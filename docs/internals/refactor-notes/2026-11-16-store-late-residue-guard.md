@@ -64,7 +64,7 @@ All of `tests/`, fixpoint seed, holder rule on N3 on master.
 | total | 458 (456 tag, 2 untag) | 249 |
 
 Measured before the holder rule's hand-back exclusion and before #8805. With both, the baseline holds
-459 rows: #8805 added `generics/member-call-through-param-alias-map-fn.vl` (`tag N {half}`).
+460 rows in 251 programs: #8805 added `generics/member-call-through-param-alias-map-fn.vl` (`tag N {half}`), and the holder rule's own fixture `closures/hole-fn-record-list-handed-back-then-called-two-orders.vl` adds `tag T {inc,half}` (the late decision tags it through the hand-back).
 
 By letter, as sets / programs carrying it: G 113/91, P 99/69, N 138/69, T 120/73, S 24/19, J 13/10,
 V 14/5, C 9/7.
