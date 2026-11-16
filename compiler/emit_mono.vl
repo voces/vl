@@ -21199,43 +21199,83 @@ function monoPinHoleParam(
     if an == "" && nested {
       let vt = eplValueTy(ax, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
       // A record or list whose part holds functions of several results takes that part at its
-      // own pin (D16859).
-      if vt < 0 && axn is ObjLit {
-        const fnm: string[] = []
-        const fty: i32[] = []
-        for fx in axn.objFields {
-          const fi = nodeAt(fx)
-          if fi is FieldInit && vt != -2 {
-            const fv = unwrapParen(fi.fiValue)
-            let ft = eplValueTy(fv, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
-            if ft < 0 {
-              const fo = [0 - 1]
-              const fname = monoArgPinName(fv, ctx, fo)
-              ft = if fname != "" { fo[0] } else { -1 }
+      // own pin, built from the literal tree's leaves up (D16859, D16876): a list of non-literal
+      // elements at its rep, a record from its fields, a list where every element pins alike.
+      if vt < 0 && (axn is ObjLit || axn is ArrayLit) {
+        const ek = if ctx >= 0 { elabKeyAt(ctx) } else { -1 }
+        const bn: i32[] = [ax]
+        let bi = 0
+        while bi < bn.length && bi < 64 {
+          const bnode = nodeAt(bn[bi])
+          if bnode is ObjLit {
+            for fx in bnode.objFields {
+              const fi = nodeAt(fx)
+              if fi is FieldInit {
+                const fv = unwrapParen(fi.fiValue)
+                if fv >= 0 && (nodeAt(fv) is ObjLit || nodeAt(fv) is ArrayLit) {
+                  bn.push(fv)
+                }
+              }
             }
-            if ft < 0 {
-              vt = -2
+          } else if bnode is ArrayLit {
+            for e in bnode.arrElems {
+              const ev = unwrapParen(e)
+              if ev >= 0 && (nodeAt(ev) is ObjLit || nodeAt(ev) is ArrayLit) {
+                bn.push(ev)
+              }
+            }
+          }
+          bi = bi + 1
+        }
+        const bt: i32[] = []
+        for _b in bn { bt.push(-1) }
+        let bj = bn.length - 1
+        while bj >= 0 && bn.length < 64 {
+          const bnode = nodeAt(bn[bj])
+          let t = eplValueTy(bn[bj], ek)
+          if t < 0 && bnode is ObjLit {
+            const fnm: string[] = []
+            const fty: i32[] = []
+            for fx in bnode.objFields {
+              const fi = nodeAt(fx)
+              if fi is FieldInit && t != -2 {
+                const fv = unwrapParen(fi.fiValue)
+                const fk = i32ListIndexOf(bn, fv)
+                let ft = if fk >= 0 { bt[fk] } else { eplValueTy(fv, ek) }
+                if ft < 0 && fk < 0 {
+                  const fo = [0 - 1]
+                  ft = if monoArgPinName(fv, ctx, fo) != "" { fo[0] } else { -1 }
+                }
+                if ft < 0 {
+                  t = -2
+                } else {
+                  fnm.push(fi.fiName)
+                  fty.push(ft)
+                }
+              }
+            }
+            t = if t == -2 || fnm.length == 0 { -1 } else { mkObjTy(fnm, fty) }
+          } else if t < 0 && bnode is ArrayLit && bnode.arrElems.length > 0 {
+            let lt0 = -1
+            let litEl = false
+            for e in bnode.arrElems {
+              const ev = unwrapParen(e)
+              const ekx = i32ListIndexOf(bn, ev)
+              if ekx >= 0 { litEl = true }
+              const pt = if ekx >= 0 { bt[ekx] } else { eplValueTy(ev, ek) }
+              lt0 = if pt < 0 || lt0 == -2 || lt0 >= 0 && pt != lt0 { -2 } else { pt }
+            }
+            if litEl {
+              t = if lt0 >= 0 { mkArrayTy(lt0) } else { -1 }
             } else {
-              fnm.push(fi.fiName)
-              fty.push(ft)
+              const lo = [0 - 1]
+              t = if monoArgPinName(bn[bj], ctx, lo) != "" { lo[0] } else { -1 }
             }
           }
+          bt[bj] = t
+          bj = bj - 1
         }
-        vt = if vt == -2 || fnm.length == 0 { -1 } else { mkObjTy(fnm, fty) }
-      } else if vt < 0 && axn is ArrayLit && axn.arrElems.length > 0 {
-        // A list of such lists takes its elements' pin where every element pins alike; one
-        // narrower than another has no one element type.
-        let lt0 = -1
-        for e in axn.arrElems {
-          const ev = unwrapParen(e)
-          let pt = eplValueTy(ev, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
-          if pt < 0 {
-            const eo = [0 - 1]
-            pt = if monoArgPinName(ev, ctx, eo) != "" { eo[0] } else { -1 }
-          }
-          lt0 = if pt < 0 || lt0 == -2 || lt0 >= 0 && pt != lt0 { -2 } else { pt }
-        }
-        vt = if lt0 >= 0 { mkArrayTy(lt0) } else { -1 }
+        vt = bt[0]
       }
       if vt >= 0 && vt < T.tys.length && !tyHasTyVar(vt) && !tyHoldsHole(vt) {
         an = if tyHoldsObj(vt, 8) { monoRecordRowPin(vt) } else { monoPinOfClosedTy(vt) }
