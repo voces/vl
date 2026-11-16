@@ -5,6 +5,7 @@ import { emitFail } from "./emit_bytes"
 // dispatch rewriting (`dispatchRewrite`) and captured-mutation boxing
 // (`captureBoxRewrite`). Consults the classifiers (`emit_classify.vl`); writes no bytes.
 
+import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { monoPinSpellNoAnon } from "./pin_spell"
 import { cwDeclAssigned, cwFieldNameWritten } from "./check_write_scan"
 import { deliveryRetagMove } from "./check_retag_rows"
@@ -100,7 +101,6 @@ import {
   tyAt,
   tyBearsNull,
   tyElemOf,
-  tyEq,
   tyFieldTyOf,
   tyHasInferHole,
   tyIsHole,
@@ -111,7 +111,6 @@ import {
   tyIsRecord,
   tyMayHoldFn,
   tyPrimNameOf,
-  tySame,
   tyToEmitName,
   tyToStr,
 } from "./check_types"
@@ -1185,7 +1184,7 @@ function nssTry(blk: i32, letIx: i32) {
           let kids = true
           if n is Ident {
             if identDeclOf(ix) == letIx {
-              if fn || !tyEq(nodeTyIxOf(ix), s) { return 0 }
+              if fn || !tyEqSealed(nodeTyIxOf(ix), s) { return 0 }
               reads.push(ix)
             }
           } else if n is BinExpr {
@@ -1205,12 +1204,12 @@ function nssTry(blk: i32, letIx: i32) {
                 operand = n.binRight
               }
               if operand >= 0 {
-                if fn || !tyEq(nodeTyIxOf(operand), t) { return 0 }
+                if fn || !tyEqSealed(nodeTyIxOf(operand), t) { return 0 }
                 if op == "==" { abs.push(ix) } else { pres.push(ix) }
                 kids = false
               }
             } else if op == "??" && nssReadOf(n.binLeft, letIx) {
-              if fn || !tyEq(nodeTyIxOf(n.binLeft), t) { return 0 }
+              if fn || !tyEqSealed(nodeTyIxOf(n.binLeft), t) { return 0 }
               coals.push(ix)
               todo.push(n.binRight)
               inFn.push(fn)
@@ -1218,10 +1217,13 @@ function nssTry(blk: i32, letIx: i32) {
             }
           } else if n is IsExpr {
             if nssReadOf(n.isObj, letIx) {
-              if fn || !tyEq(nodeTyIxOf(n.isObj), t) { return 0 }
+              if fn || !tyEqSealed(nodeTyIxOf(n.isObj), t) { return 0 }
               if isTestsNull(ix) {
                 abs.push(ix)
-              } else if isPatTyIxOf(ix) >= 0 && tySame(isPatTyIxOf(ix), s) {
+              } else if (
+                isPatTyIxOf(ix) >= 0
+                && tySameSealed(isPatTyIxOf(ix), s)
+              ) {
                 pres.push(ix)
               } else {
                 return 0
@@ -2705,7 +2707,9 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     const rd = spillRead(val)
     // A literal built at the record the assignment yields is read as that record.
     const held = spillHeldTy(rv)
-    if held >= 0 && tySame(held, nodeTyIxOf(asgIx)) { nodeTyRecord(rd, held) }
+    if held >= 0 && tySameSealed(held, nodeTyIxOf(asgIx)) {
+      nodeTyRecord(rd, held)
+    }
     return cboxYieldAs(rd, nodeTyIxOf(rd), nodeTyIxOf(asgIx))
   }
   return -1
@@ -3062,7 +3066,7 @@ function asvTypeMoves(asgIx: i32): boolean {
   // the place is declared at, which every instance substitutes.
   if lt < 0 || tyHasInferHole(lt, 0) { lt = declaredPlaceTy(a.binLeft) }
   const vt = nodeTyIxOf(asgIx)
-  if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
+  if lt < 0 || vt < 0 || tySameSealed(lt, vt) { return false }
   if tyIsLitUnionOrLit(nonNullTy(lt)) || tyIsLitUnionOrLit(vt) { return false }
   if tyHasInferHole(lt, 0) || tyHasInferHole(vt, 0) { return false }
   if !tyHasTyVar(lt) && !tyHasTyVar(vt) { return true }
@@ -3082,7 +3086,12 @@ function asvPlaceRecordMoves(a: BinExpr, asgIx: i32): boolean {
   const lt = nodeTyIxOf(t)
   if vt < 0 || lt < 0 { return false }
   const pt = nonNullTy(lt)
-  if pt < 0 || !(tyAt(vt) is TyObj) || !(tyAt(pt) is TyObj) || tySame(vt, pt) {
+  if (
+    pt < 0
+    || !(tyAt(vt) is TyObj)
+    || !(tyAt(pt) is TyObj)
+    || tySameSealed(vt, pt)
+  ) {
     return false
   }
   if tyHasTyVar(vt) || tyHasTyVar(pt) { return false }
@@ -4003,7 +4012,12 @@ function cboxIsMayStore(isIx: i32, obj: i32): boolean {
   const u = tyAt(ot)
   if u is TyUnion {
     for m in u.uMembers {
-      if m >= 0 && m < T.tys.length && tyAt(m) is TyArray && !tySame(m, chk) {
+      if (
+        m >= 0
+        && m < T.tys.length
+        && tyAt(m) is TyArray
+        && !tySameSealed(m, chk)
+      ) {
         return true
       }
     }
@@ -4179,7 +4193,7 @@ function cboxYieldWrite(tx: i32, boxed: i32[]): i32[] {
   if nodeAt(unwrapParen(tn.binRight)) is NullLit { return [] }
   const elemTy = tyArrayElemIx(cboxCellTy[bd] ?? -1)
   const valTy = nodeTyIxOf(tx)
-  if elemTy < 0 || valTy < 0 || tySame(elemTy, valTy) { return [] }
+  if elemTy < 0 || valTy < 0 || tySameSealed(elemTy, valTy) { return [] }
   if tyIsLitUnionOrLit(elemTy) { return [] }
   const lit = cboxLitCopy(tn.binRight)
   if lit >= 0 {
@@ -4837,7 +4851,7 @@ function cboxUnsetInit(d: i32, letType: i32): i32 {
 function cboxReadNarrowed(rty: i32, cellTy: i32): boolean {
   if rty < 0 { return false }
   const t = nonNullTy(tyArrayElemIx(cellTy))
-  return t >= 0 && !tySame(rty, t)
+  return t >= 0 && !tySameSealed(rty, t)
 }
 
 // A read `rd` of the `T | null` cell of shared binding `name`, read at `ix` with type `rty`:

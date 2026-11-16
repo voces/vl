@@ -168,6 +168,7 @@ import {
   memSharedCalls,
   optReadPartOf,
   optReadParts,
+  pendRetCallNote,
   selfCallPendFn,
   selfCallPendIx,
 } from "./check_core_state"
@@ -487,7 +488,6 @@ import {
   T,
   TY_BOOL,
   TY_ERR,
-  TY_F64,
   TY_I32,
   TY_NEVER,
   TY_NULL,
@@ -852,35 +852,48 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
     let want = i32ToStr(arity) + " arguments"
     if arity == 1 { want = "1 argument" }
     tErr(name + " expects " + want + ", got " + i32ToStr(args.length), ix)
-    // Still yield a type so the call site does not cascade: the width is unknowable
-    // from a wrong-arity call, so take the family's default.
-    if isFloat { return TY_F64 }
-    if intIntrIsCompare(name) { return TY_BOOL }
-    return TY_I32
+    // The width is unknowable from a wrong-arity call: answer the absorbing error type so no
+    // later use reports against a guessed width. A comparison is boolean at any width.
+    if !isFloat && intIntrIsCompare(name) { return TY_BOOL }
+    return TY_ERR
   }
+  // An operand an earlier diagnostic typed `TY_ERR` takes no part in the width: the call
+  // computes at what its other operands give, or answers `TY_ERR` when none is left.
+  const liveIxs: i32[] = []
   const argTys: i32[] = []
   let i = 0
   while i < args.length {
-    argTys.push(checkNodeHook(args[i]))
+    const t = checkNodeHook(args[i])
+    if t != TY_ERR {
+      liveIxs.push(args[i])
+      argTys.push(t)
+    }
     i = i + 1
+  }
+  const isCmp = !isFloat && intIntrIsCompare(name)
+  if argTys.length == 0 {
+    if isCmp { return TY_BOOL }
+    return TY_ERR
   }
   const holeTy = minMaxHoleOperand(name, argTys)
   if holeTy >= 0 {
-    noteBinCstr(argTys[0], name, argTys[argTys.length - 1])
+    if argTys.length == args.length {
+      noteBinCstr(argTys[0], name, argTys[argTys.length - 1])
+    }
     return holeTy
   }
   let width = intIntrWidth(argTys)
   if isFloat && !intMinMaxOperands(name, argTys) {
     const litArgs: boolean[] = []
-    for a in args { litArgs.push(f32LitOperandAt(a)) }
+    for a in liveIxs { litArgs.push(f32LitOperandAt(a)) }
     width = floatIntrWidth(litArgs, argTys)
   }
   // An operand is no delivery: `ltU(a, b)` computes at the width `a` and `b` give it.
   const savedNoDest = lbiNoDest
   lbiNoDest = true
   let j = 0
-  while j < args.length {
-    if !assignableExpr(args[j], argTys[j], width) {
+  while j < liveIxs.length {
+    if !assignableExpr(liveIxs[j], argTys[j], width) {
       tErr(
         name + " expects " + tyToStr(width) + ", got " + tyToStr(argTys[j]),
         ix,
@@ -889,9 +902,7 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
     j = j + 1
   }
   lbiNoDest = savedNoDest
-  if !isFloat {
-    if intIntrIsCompare(name) { return TY_BOOL }
-  }
+  if isCmp { return TY_BOOL }
   return width
 }
 
@@ -1418,12 +1429,14 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     const ed = identFnDeclOf(n.callFn)
     const en = if ed >= 0 { nodeAt(ed) } else { cfn }
     if en is FuncDecl && en.fnRet < 0 {
+      pendRetCallNote()
       selfCallPendIx.push(ix)
       selfCallPendFn.push(ed)
     }
   }
   if retTy == -2 {
     retTy = TY_ERR
+    pendRetCallNote()
     // A direct self-recursive call resolves to the function's own provisional inferred
     // type (`inferObserved`, already holding the base case since it is checked first) —
     // without this, `TY_ERR` makes `assignable(TY_ERR, string)` vacuously true and a `+`

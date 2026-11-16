@@ -206,6 +206,7 @@ import {
 } from "./check_ty_rep"
 import {
   isNullTy,
+  isNumeric,
   isStringTy,
   isVoidTy,
   nonNullTy,
@@ -1728,8 +1729,15 @@ export function objLitFieldExpr(lit: i32, name: string): i32 {
   return -1
 }
 
-// The field names `src` carries that `dst` does not, rendered `` `a`, `b` ``.
+// The field names `src` carries that `dst` does not, rendered `` `a`, `b` ``, a nested record's by
+// its path (`` `pet.purr` ``).
 export function objDroppedFieldList(src: i32, dst: i32) {
+  return objDroppedFieldsAt(src, dst, "", 8)
+}
+
+// `objDroppedFieldList` for fields reached under the path `pre`, at most `depth` records down.
+function objDroppedFieldsAt(src: i32, dst: i32, pre: string, depth: i32) {
+  if depth <= 0 || src < 0 || dst < 0 { return "" }
   const s = tyAt(src)
   const d = tyAt(dst)
   let out = ""
@@ -1737,9 +1745,22 @@ export function objDroppedFieldList(src: i32, dst: i32) {
     if d is TyObj {
       let i = 0
       while i < s.objFieldNames.length {
-        if objFieldType(d, s.objFieldNames[i]) < 0 {
+        const nm = s.objFieldNames[i]
+        const df = objFieldType(d, nm)
+        let part = ""
+        if df < 0 {
+          part = "`" + pre + nm + "`"
+        } else if !tyEq(s.objFieldTypes[i], df) {
+          part = objDroppedFieldsAt(
+            s.objFieldTypes[i],
+            df,
+            pre + nm + ".",
+            depth - 1,
+          )
+        }
+        if part != "" {
           if out != "" { out = out + ", " }
-          out = out + "`" + s.objFieldNames[i] + "`"
+          out = out + part
         }
         i = i + 1
       }
@@ -1747,7 +1768,6 @@ export function objDroppedFieldList(src: i32, dst: i32) {
   }
   return out
 }
-
 // The growable list over the same element as `ty` (a `readonly T[]` gives `T[]`), so a hint
 // naming a source's declaration never proposes a view the source is then written through.
 export function listMutableTwin(ty: i32): i32 {
@@ -2389,19 +2409,22 @@ export function intIntrWidth(argTys: i32[]) {
   return TY_I32
 }
 
-// Is this `min` / `max` / `abs` over integers only? Then it computes at the integer width
-// (`intIntrWidth`) rather than the float one, so `min(i, j)` is an i32 and not an f64.
-// An operand that is not a concrete integer primitive (a literal type counts as its base) keeps
-// the float rule.
+// Whether `min` / `max` / `abs` computes at the integer width (`intIntrWidth`): some operand is
+// an integer primitive (a literal type counts as its base), and no other is a float, a
+// non-primitive or a hole. A non-numeric primitive decides nothing; the caller refuses it at the
+// width the other operands give.
 export function intMinMaxOperands(name: string, argTys: i32[]): boolean {
   if name != "min" && name != "max" && name != "abs" { return false }
+  let sawInt = false
   let i = 0
   while i < argTys.length {
-    const p = primNameOf(softenLitTy(argTys[i]))
-    if p != "i32" && p != "i64" && p != "u8" { return false }
+    const t = softenLitTy(argTys[i])
+    const p = primNameOf(t)
+    if p == "i32" || p == "i64" || p == "u8" { sawInt = true }
+    else if t < 0 || !(tyAt(t) is TyPrim) || isNumeric(t) { return false }
     i = i + 1
   }
-  return true
+  return sawInt
 }
 
 // The hole a `min` / `max` / `abs` over an un-annotated operand defers to, or -1. Its width is

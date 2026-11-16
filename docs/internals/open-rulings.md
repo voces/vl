@@ -1967,3 +1967,8 @@ produces the `i32`.
   type; an unfixed empty list still fits every `is T[]`. (b), emptiness once the value leaves its
   binding, was not taken. Interim: a parameter reached by both a fixed and an open empty list is
   refused until L2 S3. DECISIONS "An annotation fixes an empty list's element type…" carries it.
+
+- **D16494, a radix literal tree under `as% i64`.** DECIDED 2026-11-16 (a), under the owner's
+  delegation ("pick something sensible, aiming for consistency"): the tree folds exactly and `as%`
+  applies to the exact value. The 32-bit-pattern reading (b) was not taken. DECISIONS "A radix
+  literal tree under `as%` is its exact value" carries it.
