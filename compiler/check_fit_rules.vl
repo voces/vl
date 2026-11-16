@@ -378,6 +378,7 @@ import {
   rcwCallSites,
   rcwContainerRuleDomain,
   rcwPathOf,
+  rcwSameElems,
   rcwSlotFresh,
   rcwTyped,
 } from "./check_record_writes"
@@ -3738,6 +3739,9 @@ export function recBuiltReadRefuse(u: i32) {
     if oe >= 0 && ot is TyArray && recAnnArgTakesRep(p, mkArrayTy(et)) {
       return 0
     }
+    // Assigned into an un-annotated binding whose initialiser holds the same build (D16763).
+    const ai = recAsgBindInit(p)
+    if ot is TyArray && ai >= 0 && recHeldElemBuilt(ai) == et { return 0 }
     if oe >= 0 { recBuiltReadErr(p, own, nonNullTy(oe), et, true) }
     return 0
   }
@@ -3750,6 +3754,22 @@ export function recBuiltReadRefuse(u: i32) {
   if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
+  }
+  return 0
+}
+
+// Refuses each list an un-annotated function returns whose elements a build stores at another record:
+// the function's inferred result is the list's own type, a storage the build does not have (D16763).
+export function recBuiltRetListsRefuse() {
+  let i = 0
+  while i < storeFnCount() {
+    for lf in recFnValueLeaves(storeFnAt(i)) {
+      const t = nodeTyIxOf(cwPeelValue(lf))
+      if t >= 0 && t < T.tys.length && tyAt(t) is TyArray {
+        recBuiltReadRefuse(lf)
+      }
+    }
+    i = i + 1
   }
   return 0
 }
@@ -5134,8 +5154,20 @@ function recBuiltElemOf(x: i32): i32 {
   return recBuiltElemIn(x, recBuildPassTable())
 }
 
+// The receiver of `x` where `x` is a call of a method handing back a list of the receiver's own
+// elements (`filter`, `slice`, `values`), parentheses peeled; else -1.
+function recSameElemsRecv(x: i32): i32 {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is Call) || n.callFn < 0 { return -1 }
+  const f = nodeAt(n.callFn)
+  return if f is Member && rcwSameElems(f.memProp) { cwPeelValue(f.memObj) } else { -1 }
+}
+
 // `recBuiltElemOf` read from build table `tbl` (`recBuildPassTable` or `recBuildTable`).
 function recBuiltElemIn(x: i32, tbl: Map<i32, i32>): i32 {
+  // A list of the receiver's own elements holds them where the receiver does (D16763).
+  const sr = recSameElemsRecv(x)
+  if sr >= 0 { return recBuiltElemIn(sr, tbl) }
   const d = recHeldDecl(x)
   return if d < 0 { -1 } else { recBuildTyIn(tbl, d, true) }
 }
