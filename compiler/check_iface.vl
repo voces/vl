@@ -1,0 +1,146 @@
+// `check_iface.vl` — each body's scheme record: the bounds it deferred for its call sites, held by
+// the owning declaration (`l2-inferred-interfaces-design.md` §2.1). A bound is a row of its kind's
+// log, and its index there is its identity: delivery marks and rollback name rows by index. Each
+// owner's `Iface` lists its own rows per kind in recording order, so a call reads its callee's rows
+// and module scope's instead of scanning every owner's. Depends on nothing.
+
+// One deferred demand: the type it is over (`on`), up to two operands (`a`, `b`, -1 when unused)
+// and a spelling (`s`), the node that recorded it, and the owner (-1 at module scope). Each kind's
+// constant says what its operands mean.
+export type Bound = { on: i32, a: i32, b: i32, site: i32, fn: i32, s: string }
+
+// One owner's rows per kind, each list ascending.
+export type Iface = {
+  fn: i32,
+  print: i32[],
+  arrDef: i32[],
+  nest: i32[],
+  isTest: i32[],
+  ret: i32[],
+}
+
+// A `print` of a type touching a hole, re-asked at the pin against the print floors.
+export const BND_PRINT = 0
+// An `__array_new_default__` list whose element is a hole, re-asked for a default.
+export const BND_ARRDEF = 1
+// A composite holding a hole, re-asked against the vector-container refusals.
+export const BND_NEST = 2
+// An `is` test of record type `a` (spelled `s`) on an operand of type `on` touching a hole.
+export const BND_IS = 3
+// A return of `on` where `a` is expected, either side touching a hole (D551). `b` is 1 when only
+// `a` does: a hole on the declared side alone has no cast to write, so it is exempt from the
+// newtype rule. `site` is the returned expression.
+export const BND_RET = 4
+
+// One flat log per kind: a nested list of records is far costlier for the compiler to compile.
+let printLog: Bound[] = []
+let arrDefLog: Bound[] = []
+let nestLog: Bound[] = []
+let isLog: Bound[] = []
+let retLog: Bound[] = []
+let ifaces: Iface[] = []
+let ifaceSlot: {[i32]: i32} = Map()
+const bndNone: i32[] = []
+
+// Clears every log and record (called from `initChecker`).
+export function ifaceReset() {
+  printLog = []
+  arrDefLog = []
+  nestLog = []
+  isLog = []
+  retLog = []
+  ifaces = []
+  ifaceSlot = Map()
+  return 0
+}
+
+// The record of owner `fn`, made on first use.
+function ifaceAt(fn: i32): Iface {
+  const s = ifaceSlot[fn] ?? -1
+  if s >= 0 { return ifaces[s] }
+  const f: Iface = {
+    fn: fn,
+    print: [],
+    arrDef: [],
+    nest: [],
+    isTest: [],
+    ret: [],
+  }
+  ifaceSlot[fn] = ifaces.length
+  ifaces.push(f)
+  return f
+}
+
+// The log of kind `k`.
+function bndLog(k: i32): Bound[] {
+  if k == BND_PRINT { return printLog }
+  if k == BND_ARRDEF { return arrDefLog }
+  if k == BND_NEST { return nestLog }
+  if k == BND_IS { return isLog }
+  if k == BND_RET { return retLog }
+  return []
+}
+
+// Owner record `f`'s list of kind `k`.
+function ifaceRows(f: Iface, k: i32): i32[] {
+  if k == BND_PRINT { return f.print }
+  if k == BND_ARRDEF { return f.arrDef }
+  if k == BND_NEST { return f.nest }
+  if k == BND_IS { return f.isTest }
+  if k == BND_RET { return f.ret }
+  return []
+}
+
+// How many bounds of kind `k` are recorded.
+export function bndCount(k: i32): i32 { return bndLog(k).length }
+
+// Bound `i` of kind `k`; `i` is below `bndCount(k)`.
+export function bndAt(k: i32, i: i32): Bound { return bndLog(k)[i] }
+
+// Appends bound `b` of kind `k` and returns its index.
+export function bndPush(k: i32, b: Bound): i32 {
+  const log = bndLog(k)
+  const i = log.length
+  log.push(b)
+  ifaceRows(ifaceAt(b.fn), k).push(i)
+  return i
+}
+
+// Drops every bound of kind `k` from index `n` on, from the log and from each owner's list.
+export function bndTruncate(k: i32, n: i32) {
+  const log = bndLog(k)
+  while log.length > n {
+    const b = log.pop()
+    if b != null { ifaceRows(ifaceAt(b.fn), k).pop() }
+  }
+  return 0
+}
+
+// Owner `fn`'s rows of kind `k`, ascending; a caller must not change the list.
+export function bndOwnRows(k: i32, fn: i32): i32[] {
+  const s = ifaceSlot[fn] ?? -1
+  if s < 0 { return bndNone }
+  return ifaceRows(ifaces[s], k)
+}
+
+// The first row of kind `k` after `after` and below `n` that a call of `callee` may own, else `n`:
+// the next row for an undeclared callee (-1 or below), else the next of the callee's and module
+// scope's. The caller still filters each by ownership; this only skips rows no filter could take.
+export function bndNextRow(k: i32, callee: i32, after: i32, n: i32): i32 {
+  if callee < 0 { return if after + 1 < n { after + 1 } else { n } }
+  const x = bndFirstAbove(bndOwnRows(k, callee), after, n)
+  const y = bndFirstAbove(bndOwnRows(k, -1), after, n)
+  return if x < y { x } else { y }
+}
+
+// The least entry of ascending `rows` above `after`, if below `n`; else `n`.
+function bndFirstAbove(rows: i32[], after: i32, n: i32): i32 {
+  let lo = 0
+  let hi = rows.length
+  while lo < hi {
+    const mid = (lo + hi) / 2
+    if rows[mid] <= after { lo = mid + 1 } else { hi = mid }
+  }
+  if lo < rows.length && rows[lo] < n { return rows[lo] }
+  return n
+}

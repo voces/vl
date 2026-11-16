@@ -59,16 +59,20 @@ import {
   tsText,
 } from "./ast"
 import { declTyOf } from "./check_nar_store"
+import { objDroppedFieldList } from "./check_leaf_steps"
 import { nodeTyOf } from "./check_node_tys"
-import { T, TyObj, tyAt, tyToStr, tyToStrUser } from "./check_types"
-import { CODE_UNSUPPORTED_LOWERING } from "./check_messages"
 import {
-  wsAnnMentions,
-  wsPendDecl,
-  wsSlotAt,
-  wsSlotDst,
-  wsSlotSrc,
-} from "./check_width"
+  T,
+  TyObj,
+  objFieldType,
+  tyArrayElemIx,
+  tyAt,
+  tyEq,
+  tyToStr,
+  tyToStrUser,
+} from "./check_types"
+import { CODE_UNSUPPORTED_LOWERING } from "./check_messages"
+import { wsAnnMentions, wsSlotAt, wsSlotDst, wsSlotSrc } from "./check_width"
 import { i32ListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { identDeclOf } from "./symbols"
@@ -315,20 +319,27 @@ export function slotApply(root: i32) {
 
 // How parent `p` takes slot value `v`: 0 hands it on elsewhere, 1 ends it (a field or element read
 // of the same type as before, an assignment's target, or a delivery the checker judges: an annotated
-// binding, an assignment, a return), 2 carries it as a value of its own whose type changed, 3 binds
-// it to an un-annotated binding, which joins the slot, 4 joins it with other values.
+// binding, an assignment, a return, an argument), 2 carries it as a value of its own whose type
+// changed, 3 binds it to an un-annotated binding, which joins the slot, 4 joins it with others.
 function slotUse(v: i32, p: i32, changed: boolean, par: {[i32]: i32}) {
   const pn = nodeAt(p)
   match pn {
     Member => {
       return if pn.memObj != v { 0 } else if changed { 2 } else { 1 }
     }
+    OptMember => {
+      return if pn.omObj != v { 0 } else if changed { 2 } else { 1 }
+    }
     Index => {
       return if pn.idxArr != v { 0 } else if changed { 2 } else { 1 }
     }
     BinExpr => {
       if pn.binOp == "??" { return 4 }
-      return if pn.binOp == "=" && (pn.binLeft == v || pn.binRight == v) { 1 } else { 0 }
+      if pn.binOp == "=" {
+        return if pn.binLeft == v || pn.binRight == v { 1 } else { 0 }
+      }
+      // Any other operator, a `!= null` test among them, ends it where its result is typed as before.
+      return if changed { 0 } else { 1 }
     }
     LetDecl => {
       if pn.letInit != v { return 0 }
@@ -349,8 +360,12 @@ function slotUse(v: i32, p: i32, changed: boolean, par: {[i32]: i32}) {
     RetStmt => {
       return 1
     }
+    // An argument is a delivery the checker judges; a callee reads the value as a function.
+    Call => {
+      return if i32ListHas(pn.callArgs, v) { 1 } else { 0 }
+    }
     // Any other parent reads the value at a type other than the one the slot declared.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | OptMember | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
       return 0
     }
   }
@@ -422,6 +437,8 @@ function slotAsgTarget(x: i32) {
 function slotRefusalsWhy(par: {[i32]: i32}) {
   let mixed = false
   for d in T.diags {
+    // A write through a slot that misfits the record it now names is refused on its own merits.
+    if i32ListHas(slRound, slotWriteRoot(d.tat, par)) { continue }
     const path: i32[] = []
     const s = slotOf(d.tat, par, path)
     if (
@@ -457,17 +474,16 @@ function slotOtherContract(at: i32, par: {[i32]: i32}) {
   return k < wsSlotAt.length && slotContractClause(at, wsSlotDst[k], par) != ""
 }
 
-// Whether the re-check after a drop left the program the same outside the slots: no refusal, no
-// rewrite left pending, each slot's value read only by a field, an element, an assignment's target
-// or an un-annotated binding (which joins the slot), and every other node of the same type.
-// Answers SL_HELD, or why not: SL_MIXED, SL_JOINED or SL_GAP.
+// Whether the re-check after a drop left the program the same outside the slots: no refusal but a
+// write misfitting a slot's real layout, each slot's value read only by a field, an element, an
+// assignment, an argument or an un-annotated binding (which joins it), every other node typed as
+// before. Answers SL_HELD or why not (SL_MIXED, SL_JOINED, SL_GAP); a pending rewrite is width's.
 function slotHeld(root: i32) {
   const par = slotWalk(root)
   if T.diags.length > 0 {
     const w = slotRefusalsWhy(par)
     if w != SL_HELD { return w }
   }
-  if wsPendDecl.length > 0 { return SL_GAP }
   const now = slotSnapshot(root)
   const fam: i32[] = []
   for d in slRound { fam.push(d) }
@@ -696,23 +712,32 @@ function slotCallClause(c: Call, x: i32, dst: i32) {
   return ""
 }
 
-// The literal that builds a fresh `dst` from the value at `at`: `{ x: a.x, y: a.y }`.
-function slotFreshLit(at: i32, dst: i32) {
-  if at < 0 || at >= P.nodes.length { return slotFreshLitOf("v", dst) }
+// The literal that builds a fresh `dst` from the value at `at`, of type `src`: `{ x: a.x, y: a.y }`.
+function slotFreshLit(at: i32, dst: i32, src: i32) {
+  if at < 0 || at >= P.nodes.length { return slotFreshLitOf("v", dst, src) }
   const n = nodeAt(at)
-  return slotFreshLitOf(if n is Ident { n.identName } else { "v" }, dst)
+  return slotFreshLitOf(if n is Ident { n.identName } else { "v" }, dst, src)
 }
 
-// The literal that builds a fresh `dst` from a value named `src`.
-function slotFreshLitOf(src: string, dst: i32) {
+// The literal that builds a fresh `dst` from a value named `nm` of type `src` (-1 unknown): a
+// nested record `src` holds at another type is built fresh too, `{ pet: { legs: a.pet.legs } }`.
+function slotFreshLitOf(nm: string, dst: i32, src: i32) {
   let out = "{ "
   if dst >= 0 && dst < T.tys.length {
     const d = tyAt(dst)
+    const s = if src >= 0 && src < T.tys.length { tyAt(src) } else { null }
     if d is TyObj {
       let i = 0
       while i < d.objFieldNames.length {
         if i > 0 { out = out + ", " }
-        out = out + d.objFieldNames[i] + ": " + src + "." + d.objFieldNames[i]
+        const f = d.objFieldNames[i]
+        const sf = if s is TyObj { objFieldType(s, f) } else { -1 }
+        const df = d.objFieldTypes[i]
+        const deep = sf >= 0 && df >= 0 && !tyEq(sf, df) && tyAt(df) is TyObj
+        out = out
+          + f
+          + ": "
+          + if deep { slotFreshLitOf(nm + "." + f, df, sf) } else { nm + "." + f }
         i = i + 1
       }
     }
@@ -744,7 +769,7 @@ function slotListShareMsg(at: i32, s: i32, dst: i32) {
     + "; copy it into fresh "
     + d
     + " records with `.map((e) => ("
-    + slotFreshLitOf("e", dst)
+    + slotFreshLitOf("e", dst, tyArrayElemIx(nodeTyOf(at)))
     + "))`, or keep `"
     + slotName(s)
     + "` at the list's own type"
@@ -754,6 +779,7 @@ function slotListShareMsg(at: i32, s: i32, dst: i32) {
 // (DECISIONS "Width subtyping of an existing record") from the capability-gap sentence to that
 // contract, with the fresh literal that stores it.
 export function slotContractWords(root: i32) {
+  slotWriteWords(root)
   if T.diags.length == 0 || wsSlotAt.length == 0 { return 0 }
   const par = slotWalk(root)
   let i = 0
@@ -783,7 +809,7 @@ export function slotContractWords(root: i32) {
           + " cannot share it, so build a fresh "
           + tyToStrUser(wsSlotDst[k])
           + " here instead, as `"
-          + slotFreshLit(d.tat, wsSlotDst[k])
+          + slotFreshLit(d.tat, wsSlotDst[k], wsSlotSrc[k])
           + "`"
         T.diags[i] = {
           tmsg: msg,
@@ -794,6 +820,105 @@ export function slotContractWords(root: i32) {
           tcode: "",
           tdata: d.tdata,
         }
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The binding a write `root.f.g = x` stores through, for the refusal at `x`, or -1: the record a
+// dropped slot names is its own, so a misfitting write there is refused for that layout.
+function slotWriteRoot(at: i32, par: {[i32]: i32}) {
+  const lhs = slotWriteLhs(at, par)
+  if lhs < 0 { return -1 }
+  let x = lhs
+  let guard = 0
+  while guard < 64 {
+    const n = nodeAt(x)
+    if n is Member { x = n.memObj }
+    else if n is Ident { return identDeclOf(x) }
+    else { return -1 }
+    guard = guard + 1
+  }
+  return -1
+}
+
+// The field place `x` at `at` is assigned to, parentheses peeled, or -1.
+function slotWriteLhs(at: i32, par: {[i32]: i32}) {
+  let x = at
+  let p = par[x] ?? -1
+  let guard = 0
+  while p >= 0 && nodeAt(p) is Paren && guard < 64 {
+    x = p
+    p = par[x] ?? -1
+    guard = guard + 1
+  }
+  if p < 0 { return -1 }
+  const pn = nodeAt(p)
+  if (
+    pn is BinExpr
+    && pn.binOp == "="
+    && pn.binRight == x
+    && nodeAt(pn.binLeft) is Member
+  ) {
+    return pn.binLeft
+  }
+  return -1
+}
+
+// The field path a place `x` names below its root binding: `pet.toy` for `u.pet.toy`.
+function slotFieldPath(x: i32) {
+  const n = nodeAt(x)
+  if n is Member {
+    const up = slotFieldPath(n.memObj)
+    return if up == "" { n.memProp } else { up + "." + n.memProp }
+  }
+  return ""
+}
+
+// What a dropped slot `s` holds: the binding its initializer names, or the record it is given.
+function slotSourceWords(s: i32) {
+  const n = nodeAt(s)
+  if n is LetDecl && n.letInit >= 0 {
+    const v = nodeAt(n.letInit)
+    if v is Ident { return "`" + v.identName + "` itself" }
+  }
+  return "the record it is given"
+}
+
+// Rewords each refusal of a record written through a dropped slot that misfits the slot's real
+// layout, which its annotation only bounds, to name that layout.
+function slotWriteWords(root: i32) {
+  if slDecl.length == 0 || T.diags.length == 0 { return 0 }
+  const par = slotWalk(root)
+  let i = 0
+  while i < T.diags.length {
+    const d = T.diags[i]
+    const s = slotWriteRoot(d.tat, par)
+    const lhs = slotWriteLhs(d.tat, par)
+    const miss = if s >= 0 && i32ListHas(slDecl, s) { objDroppedFieldList(nodeTyOf(lhs), nodeTyOf(d.tat)) } else { "" }
+    if miss != "" {
+      T.diags[i] = {
+        tmsg: "`"
+          + slotName(s)
+          + "` is "
+          + slotSourceWords(s)
+          + ", whose `"
+          + slotFieldPath(lhs)
+          + "` also stores "
+          + miss
+          + ": an existing record keeps its own layout where it is delivered (no copy is made), "
+          + "so this "
+          + tyToStrUser(nodeTyOf(d.tat))
+          + " cannot be stored there; give it every field of "
+          + tyToStrUser(nodeTyOf(lhs)),
+        tat: d.tat,
+        tline: d.tline,
+        tcol: d.tcol,
+        tendTok: d.tendTok,
+        tcode: "",
+        tdata: d.tdata,
       }
     }
     i = i + 1
