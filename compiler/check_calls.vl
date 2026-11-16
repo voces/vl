@@ -121,6 +121,7 @@ import {
   callNumJoined,
   fsbDeclAtNode,
   fsbName,
+  instVecNote,
 } from "./check_bind_rows"
 import { crSubtreeMentions } from "./check_capture_walks"
 import {
@@ -250,6 +251,7 @@ import {
 } from "./check_diag_text"
 import {
   callDstTyForGeneric,
+  callDstTyOf,
   calleeIdentName,
   calleeRetDeclared,
   cbSeedGuessingAdd,
@@ -528,6 +530,7 @@ import {
   tyEqSameHoles,
   tyHasHole,
   tyHasInferHole,
+  tyHoldsObjDeep,
   tyIsDeclaredParam,
   tyIsHole,
   tyIsParamHole,
@@ -1036,6 +1039,10 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
       tErr("__array_new__ expects an i32 length, got " + tyToStr(anLen), ix)
     }
     const anFill = checkNodeHook(anArgs[1])
+    // A scalar, string or `null` fill is built at the union or nullable element its destination
+    // names, as a literal of the same value is (D16887).
+    const anElem = arrNewDstElem(ix, anFill)
+    if anElem >= 0 { return mkArrayTy(anElem) }
     // A `null` fill lands in each `null[]` cell (D14773).
     if isNullTy(anFill) { stampNullUnitCell(anArgs[1], anFill) }
     return mkArrayTy(anFill)
@@ -1073,6 +1080,21 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
     if niTy >= 0 { return niTy }
   }
   return -1
+}
+
+// The union or nullable element of the list `__array_new__` call `ix` is delivered to, when its
+// fill type `fill`, holding no record, is assignable to it; -1 otherwise.
+function arrNewDstElem(ix: i32, fill: i32): i32 {
+  const dst = callDstTyOf(ix)
+  if dst < 0 || fill < 0 || dst >= T.tys.length || tyHoldsObjDeep(fill) {
+    return -1
+  }
+  const d = tyAt(dst)
+  if !(d is TyArray) { return -1 }
+  const e = tyElemOf(d)
+  if e < 0 || e == fill || e >= T.tys.length { return -1 }
+  if !(tyAt(e) is TyUnion || tyAt(e) is TyNullable) { return -1 }
+  return if assignable(fill, e) { e } else { -1 }
 }
 
 // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
@@ -1293,7 +1315,7 @@ function bindTemplateRow(ix: i32, bNames: string[], bTys: i32[]) {
 // lambda's inferred result names the body's parameters without taking them.
 function ftParamsMentionTyVar(ft: TyFunc, nm: string): boolean {
   for p in ft.fnParamTypes {
-    if tyMentionsTyVarNamed(p, nm, 8) { return true }
+    if tyMentionsTyVarNamed(p, nm) { return true }
   }
   return false
 }
@@ -1863,9 +1885,9 @@ function tpOnlyArrowParam(cfn: Node, tp: string): boolean {
     const pf = if p >= 0 && p < T.tys.length { tyAt(p) } else { tyAt(TY_I32) }
     if pf is TyFunc {
       for q in pf.fnParamTypes {
-        if tyMentionsTyVarNamed(q, tp, 8) { seen = true }
+        if tyMentionsTyVarNamed(q, tp) { seen = true }
       }
-    } else if tyMentionsTyVarNamed(p, tp, 8) {
+    } else if tyMentionsTyVarNamed(p, tp) {
       return false
     }
   }
@@ -2675,7 +2697,7 @@ export function elabNullOnlyTp(f: FuncDecl, n: Call, tp: string): boolean {
   let i = 0
   while i < f.fnParams.length {
     const pt = nodeTyIxOf(f.fnParams[i])
-    if pt >= 0 && pt < T.tys.length && tyMentionsTyVarNamed(pt, tp, 8) {
+    if pt >= 0 && pt < T.tys.length && tyMentionsTyVarNamed(pt, tp) {
       if i >= n.callArgs.length { return false }
       const ax = parenPeelIx(n.callArgs[i])
       if ax < 0 || ax >= P.nodes.length || !(nodeAt(ax) is NullLit) {
@@ -2693,13 +2715,13 @@ export function elabNullOnlyTp(f: FuncDecl, n: Call, tp: string): boolean {
 // binds `tp` to no value (D3178, D15530).
 function tyNullOverTp(t: i32, tp: string): boolean {
   const u = tyAt(t)
-  if u is TyNullable { return tyMentionsTyVarNamed(u.nInner, tp, 8) }
+  if u is TyNullable { return tyMentionsTyVarNamed(u.nInner, tp) }
   if !(u is TyUnion) || u.uMembers.length != 2 { return false }
   let hasNull = false
   let hasTp = false
   for m in u.uMembers {
     if m == TY_NULL { hasNull = true }
-    if m != TY_NULL && tyMentionsTyVarNamed(m, tp, 8) { hasTp = true }
+    if m != TY_NULL && tyMentionsTyVarNamed(m, tp) { hasTp = true }
   }
   return hasNull && hasTp
 }
@@ -3007,6 +3029,7 @@ function callFtyPinCstrs(
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance.
   withUnboundAsNever(namedFn, cNames, cTys, rNames, rTys)
+  instVecNote(ix, namedFn, rNames, rTys)
   ifaceSolveAt(at, SS_RET, SS_UFCS)
   // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
   if !inferQuiet {
@@ -5545,7 +5568,7 @@ function litArgLast(params: i32[], args: i32[], i: i32): boolean {
     if (
       j != i
       && !numLitArg(args[j])
-      && tyMentionsTyVarNamed(params[j], v.tvName, 8)
+      && tyMentionsTyVarNamed(params[j], v.tvName)
     ) {
       const a = nodeAt(cwPeel(args[j]))
       if !(a is Ident) { return false }
