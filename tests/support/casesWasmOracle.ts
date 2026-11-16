@@ -563,7 +563,7 @@ const readRcoal = (exp: Exports): LintDiag[] => {
   for (let i = 0; i < n; i++) {
     if (exp.rcoalModuleAt(i) !== 0) continue;
     out.push({
-      sev: "warning",
+      sev: exp.rcoalIsInfo(i) === 1 ? "info" : "warning",
       line: exp.rcoalLineAt(i),
       col: exp.rcoalColAt(i),
       msg: readString(exp.rcoalMsgLen(i), (j) => exp.rcoalMsgByte(i, j)),
