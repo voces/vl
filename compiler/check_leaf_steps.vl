@@ -1,12 +1,20 @@
 import { rowSettledByDefault } from "./check_hole_links"
 import {
+  BND_ARG,
+  BND_BIN,
   BND_BM,
   BND_IS,
   BND_LET,
+  BND_MEM,
   BND_NEST,
   BND_PRINT,
   BND_RET,
+  BND_UFCS,
+  Bound,
+  bndAt,
   bndCount,
+  bndOwnRows,
+  bndPush,
 } from "./check_iface"
 import { isWideLitJoin } from "./check_wide_lits"
 import { nodeCtxTyIxOf } from "./check_core_state"
@@ -99,14 +107,10 @@ import { crRows } from "./check_capture_rows"
 import { coalPinTy, hdMint, mkBinOpHole, mkDerivedHole } from "./check_coal"
 import {
   CV_UFCS,
-  argCstr,
-  binCstr,
   cstrOwnerTop,
   cvMark,
-  memCstr,
   noteBinCstr,
   noteLetCstr,
-  ufcsCstr,
 } from "./check_cstr_rows"
 import { inferQuiet } from "./check_cursor"
 import { esRows } from "./check_effect_rows"
@@ -346,7 +350,7 @@ export const ACF_EXACT_RET = -5
 // as a call there does (D13782). Both sides are the call's function type, so it always fits.
 export const ACF_CHOICE = -6
 
-// The `memCstr.prop` a call through a hole records: not a field name, so no member row shares it.
+// The `BND_MEM` spelling a call through a hole records: not a field name, so no member row shares it.
 export const OP_CALL_PIN = "()"
 
 // A call under a null test of its callee: a pin of the `null` type leaves the branch dead, so
@@ -2038,7 +2042,7 @@ function callPinArityMsg(f: TyFunc, site: i32): string {
     + i32ToStr(got)
 }
 
-// The `memCstr.prop` of a built-in method call on a gradual union, before the method's name.
+// The `BND_MEM` spelling of a built-in method call on a gradual union, before the method's name.
 export const MC_METHOD_MARK = "()"
 
 export function noteKillSure(by: i32, key: string) {
@@ -2054,34 +2058,30 @@ export function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
   if recv < 0 { return 0 }
   if tyHasHole(recv) {
     const owner = cstrOwnerTop()
-    let k = 0
-    while k < ufcsCstr.ty.length {
-      if (
-        ufcsCstr.fn[k] == owner
-        && ufcsCstr.prop[k] == prop
-        && ufcsCstr.p0[k] == p0
-      ) {
-        if tyEqSameHoles(ufcsCstr.ty[k], recv) {
-          if ix != ufcsCstr.ix[k] && !i32ListHas(ufcsCstr.more[k], ix) {
-            ufcsCstr.more[k].push(ix)
-          }
-          return 0
-        }
+    for k in bndOwnRows(BND_UFCS, owner) {
+      const b = bndAt(BND_UFCS, k)
+      if b.s == prop && b.a == p0 && tyEqSameHoles(b.on, recv) {
+        if ix != b.site && !i32ListHas(b.more, ix) { b.more.push(ix) }
+        return 0
       }
-      k = k + 1
     }
     // An overloaded call's row (`p0` -1) makes its owner's instances pick per call.
     if p0 < 0 && owner >= 0 && !i32ListHas(ovDepFns, owner) {
       ovDepFnsPush(owner)
     }
-    ufcsCstr.ty.push(recv)
-    ufcsCstr.prop.push(prop)
-    ufcsCstr.ix.push(ix)
-    ufcsCstr.fn.push(owner)
-    ufcsCstr.p0.push(p0)
-    const noMore: i32[] = []
-    ufcsCstr.more.push(noMore)
-    cvMark(CV_UFCS, ufcsCstr.fn.length - 1)
+    const more: i32[] = []
+    const row: Bound = {
+      on: recv,
+      a: p0,
+      b: -1,
+      c: -1,
+      site: ix,
+      fn: owner,
+      s: prop,
+      seq: -1,
+      more: more,
+    }
+    cvMark(CV_UFCS, bndPush(BND_UFCS, row))
   }
   return 0
 }
@@ -2107,7 +2107,7 @@ export function holeArgOriginNode(
   hNames: string[],
   hArgNode: i32[],
 ): i32 {
-  const at = argCstr.at[ci]
+  const at = bndAt(BND_ARG, ci).on
   if at < 0 || at >= T.tys.length { return -1 }
   const t = tyAt(at)
   if t is TyVar {
@@ -2117,8 +2117,8 @@ export function holeArgOriginNode(
       k = k + 1
     }
   }
-  if ci < 0 || ci >= argCstr.node.length { return -1 }
-  return argCstr.node[ci]
+  if ci < 0 || ci >= bndCount(BND_ARG) { return -1 }
+  return bndAt(BND_ARG, ci).site
 }
 
 // Records a hole's flow into a concrete destination while the parameter-solve probe runs.
@@ -2566,16 +2566,16 @@ export function armTailUndecided(armIx: i32): boolean {
 // Every deferred-constraint row recorded so far, over all nine tables. A stable count
 // means no table moved.
 export function cstrRowCount(): i32 {
-  return binCstr.op.length
-    + argCstr.at.length
+  return bndCount(BND_BIN)
+    + bndCount(BND_ARG)
     + bndCount(BND_PRINT)
     + bndCount(BND_NEST)
     + bndCount(BND_IS)
     + bndCount(BND_RET)
     + bndCount(BND_LET)
     + bndCount(BND_BM)
-    + memCstr.ty.length
-    + ufcsCstr.ty.length
+    + bndCount(BND_MEM)
+    + bndCount(BND_UFCS)
 }
 
 // The top-level function declaration a module global's initializer names bare, or -1.
