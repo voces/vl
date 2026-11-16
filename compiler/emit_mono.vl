@@ -80,11 +80,7 @@ import {
   elabMakerTwinParamTy,
   elabNodeTy,
   elabOpenFnArgDecl,
-  elabSlotAnnRets,
-  elabSlotDeliveries,
-  elabSlotDeliveriesOmitting,
   elabSlotHeldFns,
-  elabSlotPerInstance,
   elabSlotSrcFns,
   elabSlotUncalled,
   elabSlotUncalledOmitting,
@@ -103,7 +99,11 @@ import {
   elabWalkTop,
   elabWideTwinOf,
   elabWrittenValueTy,
+  eplSlotAnnRets,
+  eplSlotDeliveredTys,
+  eplSlotPerInstance,
   eplSlotSig,
+  eplValueSig,
   eplValueTy,
 } from "./emit_elab"
 import {
@@ -9279,13 +9279,13 @@ function monoInstanceRet(
 }
 
 // The source node of argument `a`, peeled: an instance copy's argument maps to its template's,
-// the node the checker's tables key.
+// the node the checker's tables key. A copy chain back to a node it passed stops there.
 function monoArgSrcOf(a: i32): i32 {
   let x = unwrapParen(a)
-  let guard = 0
-  while x >= 0 && guard < 16 && (nodeSrc[x] ?? -1) >= 0 {
+  const seen: i32[] = []
+  while x >= 0 && (nodeSrc[x] ?? -1) >= 0 && !i32ListHas(seen, x) {
+    seen.push(x)
     x = nodeSrc[x] ?? -1
-    guard = guard + 1
   }
   return x
 }
@@ -13126,7 +13126,7 @@ function monoFlowAliasSrcElem(
 function monoFlowSlotPins(d: i32, path: string[], fts: i32[]): string[] {
   const out: string[] = []
   if mfrSetCalls.length == 0 { return out }
-  for t in elabSlotDeliveriesOmitting(d, path, -1, mfrSetCalls) {
+  for t in eplSlotDeliveredTys(d, path, -1, false, mfrSetCalls) {
     const ft = tyAt(t)
     if ft is TyFunc {
       const sg = pinSigOf(ft.fnParamTypes)
@@ -14686,7 +14686,7 @@ function monoTyClosedFn(t: i32): boolean {
 // leaving out the calls the flow rewrite repointed when `omit`; -1 for none, two, or an open one.
 function monoSlotDeliveryTy(lf: i32[], path: string[], omit: boolean): i32 {
   let k = -1
-  if !omit && elabSlotPerInstance(lf[1], path) {
+  if !omit && eplSlotPerInstance(lf[1], path) {
     const it = monoFrameInstTmpl(lf[0])
     k = if it[0] >= 0 { elabKeyAt(it[0]) } else { -1 }
     if k < 0 { return -1 }
@@ -17033,7 +17033,7 @@ function monoDeclPathPins(lf: i32[], path: string[]): string[] {
   return monoDeclPathKeys(lf, path, false, [])
 }
 
-// `monoDeclPathPins`, or the returns written destinations deliver the slot at (`elabSlotAnnRets`)
+// `monoDeclPathPins`, or the returns written destinations deliver the slot at (`eplSlotAnnRets`)
 // when `rets`. Pushes onto `fts` the delivery function type each pin is spelled from.
 function monoDeclPathKeys(
   lf: i32[],
@@ -17071,12 +17071,12 @@ function monoDeclPathKeysIn(
   // written destinations deliver it at, asked in instance `inst` where the instances deliver it
   // differently.
   const decline: string[] = [PIN_DECLINE]
-  if inst < 0 && elabSlotPerInstance(d, path) { return decline }
+  if inst < 0 && eplSlotPerInstance(d, path) { return decline }
   const k = if inst >= 0 { elabKeyAt(inst) } else { -1 }
   if inst >= 0 && k < 0 { return decline }
   const out: string[] = []
   if rets {
-    for t in elabSlotAnnRets(d, path, k) {
+    for t in eplSlotAnnRets(d, path, k) {
       const one: i32[] = [t]
       const sg = pinSigOf(one)
       const r = sg.slice(0, sg.length - 1)
@@ -17084,7 +17084,7 @@ function monoDeclPathKeysIn(
     }
     return out
   }
-  for t in elabSlotDeliveries(d, path, k) {
+  for t in eplSlotDeliveredTys(d, path, k, false, []) {
     const ft = tyAt(t)
     if ft is TyFunc {
       const sg = pinSigOf(ft.fnParamTypes)
@@ -21208,10 +21208,10 @@ function monoArgClosedTyIn(ax: i32, ctx: i32, pinTy: i32): i32 {
   const x = unwrapParen(ax)
   if pinTy >= 0 && pinTy < T.tys.length && !tyHasTyVar(pinTy) {
     let src = x
-    let guard = 0
-    while src >= cwIxCoveredLen() && guard < 64 {
+    const seen: i32[] = []
+    while src >= cwIxCoveredLen() && !i32ListHas(seen, src) {
+      seen.push(src)
       src = nodeSrc[src] ?? -1
-      guard = guard + 1
     }
     const from = if ctx >= 0 { elabKeyAt(ctx) } else { elabWalkTop() }
     const dt = if src >= 0 { elabArgDeliveredTy(src, from) } else { -1 }
@@ -23357,6 +23357,21 @@ function monoWalk(ix: i32, ctx: i32) {
           return monoCellAliasListFail(es[i3])
         }
         if monoWalk(es[i3], ctx) < 0 { return -1 }
+        // An element naming a generic no pin reached is delivered at the signature its place's
+        // calls agree on, read off the place class (D16842).
+        const ev = unwrapParen(es[i3])
+        const evn = if ev >= 0 && ev < P.nodes.length { nodeAt(ev) } else { null }
+        const efe = if evn is Ident && identFnDeclOf(ev) >= 0 { monoFnFeOfIdent(ev, evn.identName, ctx) } else { -1 }
+        if efe >= 0 && efe < monoGen.length && monoGen[efe] == 1 {
+          const vs = eplValueSig(ev, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+          const none: i32[] = []
+          if (
+            monoTyClosedFn(vs)
+            && monoCoerceFnValueTys(ev, ctx, vs, none, vs) < 0
+          ) {
+            return -1
+          }
+        }
         i3 = i3 + 1
       }
       if monoCoerceListLitElems(ix, es, ctx) < 0 { return -1 }
@@ -23369,6 +23384,24 @@ function monoWalk(ix: i32, ctx: i32) {
         const f = nodeAt(fs[i4])
         if f is FieldInit {
           if monoWalk(f.fiValue, ctx) < 0 { return -1 }
+          // A field naming a generic no pin reached is delivered at the signature its place's
+          // calls agree on, read off the place class (D16842).
+          const fv = unwrapParen(f.fiValue)
+          const fvn = if fv >= 0 && fv < P.nodes.length { nodeAt(fv) } else { null }
+          const ffe = if fvn is Ident && identFnDeclOf(fv) >= 0 { monoFnFeOfIdent(fv, fvn.identName, ctx) } else { -1 }
+          if ffe >= 0 && ffe < monoGen.length && monoGen[ffe] == 1 {
+            const vs = eplValueSig(
+              fv,
+              if ctx >= 0 { elabKeyAt(ctx) } else { -1 },
+            )
+            const none: i32[] = []
+            if (
+              monoTyClosedFn(vs)
+              && monoCoerceFnValueTys(fv, ctx, vs, none, vs) < 0
+            ) {
+              return -1
+            }
+          }
         }
         i4 = i4 + 1
       }
@@ -24707,7 +24740,7 @@ function monoSlotRetName(lf: i32[], path: string[]): string {
 function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
   const none: i32[] = []
   let tys: i32[] = none
-  for t in elabSlotDeliveries(d, path, -1) {
+  for t in eplSlotDeliveredTys(d, path, -1, false, none) {
     const ft = tyAt(t)
     if (ft is TyFunc && tys.length == 0 && pinSigOf(ft.fnParamTypes) == sig) {
       tys = ft.fnParamTypes
