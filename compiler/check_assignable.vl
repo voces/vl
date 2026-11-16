@@ -4131,14 +4131,10 @@ export function fvaMakerCallRows() {
   while ix < P.nodes.length {
     const n = nodeAt(ix)
     // Every relay is registered, called or not: a call one returns is no delivery of its own.
-    if n is FuncDecl { fvaRelayMemo(rl, ix) }
+    if n is FuncDecl && fvaRelayMemo(rl, ix) { rl.any = true }
     if n is Call && n.callFn >= 0 {
       const r = parenPeelIx(n.callFn)
       const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
-      if fvaRelayMemo(rl, calleeFnOfDecl(d)) {
-        rl.calls.push(ix)
-        rl.calleeOf[r] = true
-      }
       const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(ix) }
       let mc = fvaOpenMakerCall(r)
       if mc < 0 && dn is LetDecl && dn.letKw == "const" && dn.letType < 0 {
@@ -4177,12 +4173,12 @@ export function fvaMakerCallRows() {
       const mc = callOfBind.get(d) ?? -1
       if d != ix && mc >= 0 { sigAt[mc] = -1 }
     }
-    // So does a relay read other than as a callee.
-    if nodeAt(ix) is Ident && !(rl.calleeOf.get(ix) ?? false) {
-      const rd = calleeFnOfDecl(identDeclOf(ix))
-      if rd != ix && fvaRelayMemo(rl, rd) { rl.handedOn[rd] = true }
-    }
+    if rl.any { fvaRelayNote(rl, ix) }
     ix = ix + 1
+  }
+  // So does a relay read other than as a callee.
+  for r in rl.reads {
+    if !(rl.calleeOf.get(r) ?? false) { rl.handedOn[identDeclOf(r)] = true }
   }
   fvaRelayRows(sigAt, rl)
   for mc in sigAt.keys() {
@@ -4218,17 +4214,50 @@ function fvaIsRelay(d: i32): boolean {
   return true
 }
 
-// What `fvaMakerCallRows`'s node walks gather about relays: which declarations are relays (memo),
-// each call of one, the callee reads of those calls, and the relays read as a value.
+// What `fvaMakerCallRows`'s node walks gather about relays: whether there is one, which
+// declarations are relays (memo), each call of one and its callee read, every read naming one,
+// and the relays read other than as a callee.
 type FvaRelayScan = {
+  any: boolean,
   memo: {[i32]: boolean},
   calls: i32[],
+  reads: i32[],
   calleeOf: {[i32]: boolean},
   handedOn: {[i32]: boolean},
 }
 
 function fvaRelayScanNew(): FvaRelayScan {
-  return { memo: Map(), calls: [], calleeOf: Map(), handedOn: Map() }
+  return {
+    any: false,
+    memo: Map(),
+    calls: [],
+    reads: [],
+    calleeOf: Map(),
+    handedOn: Map(),
+  }
+}
+
+// Whether `d` is a function declaration: a relay is read by its own name, and an alias of one
+// reads it as a value where the alias is bound.
+function fvaIsFnDecl(d: i32): boolean {
+  return d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
+}
+
+// Notes node `ix` for the relay rows: a call of a relay, with its callee read, or a read naming one.
+function fvaRelayNote(rl: FvaRelayScan, ix: i32) {
+  const n = nodeAt(ix)
+  if n is Call && n.callFn >= 0 {
+    const r = parenPeelIx(n.callFn)
+    const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+    if fvaIsFnDecl(d) && fvaRelayMemo(rl, d) {
+      rl.calls.push(ix)
+      rl.calleeOf[r] = true
+    }
+  } else if n is Ident {
+    const d = identDeclOf(ix)
+    if d != ix && fvaIsFnDecl(d) && fvaRelayMemo(rl, d) { rl.reads.push(ix) }
+  }
+  return 0
 }
 
 // Whether `d` is a relay, asked once per declaration.
