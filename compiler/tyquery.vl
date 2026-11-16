@@ -1725,26 +1725,33 @@ export function tyPeelElems(ti: i32, depth: i32): i32 {
 
 // Whether `ti` is a union with an arm `tyObjFieldIsLitUnion` holds of: its arms are records read
 // through it, a shared field included (D5164).
-function tyUnionArmFieldIsLitUnion(ti: i32, depth: i32): boolean {
+function tyUnionArmFieldIsLitUnion(ti: i32, seen: i32[]): boolean {
   const t = tyAt(ti)
   if t is TyUnion {
     for m in t.uMembers {
-      if tyObjFieldIsLitUnion(m, depth - 1) { return true }
+      if tyObjFieldIsLitUnionIn(m, seen) { return true }
     }
   }
   return false
 }
 
 // Whether `ti` is a record, or a union with a record arm, with a literal-union field, bare or
-// nullable, at any record-nesting depth up to `depth`. The record-field usage arm of
-// `anyLitUnionUsed`.
-export function tyObjFieldIsLitUnion(ti: i32, depth: i32): boolean {
-  if ti < 0 || depth <= 0 { return false }
+// nullable, at any record-nesting depth. The record-field usage arm of `anyLitUnionUsed`.
+export function tyObjFieldIsLitUnion(ti: i32): boolean {
+  const seen: i32[] = []
+  return tyObjFieldIsLitUnionIn(ti, seen)
+}
+
+// `tyObjFieldIsLitUnion` over the types not in `seen`: one already walked held no such field, or
+// is on a cycle.
+function tyObjFieldIsLitUnionIn(ti: i32, seen: i32[]): boolean {
+  if ti < 0 || i32ListHas(seen, ti) { return false }
+  seen.push(ti)
   let o = ti
   const nt = tyAt(o)
   if nt is TyNullable { o = nt.nInner }
   if o < 0 { return false }
-  if tyUnionArmFieldIsLitUnion(o, depth) { return true }
+  if tyUnionArmFieldIsLitUnion(o, seen) { return true }
   const t = tyAt(o)
   if t is TyObj {
     let i = 0
@@ -1758,7 +1765,7 @@ export function tyObjFieldIsLitUnion(ti: i32, depth: i32): boolean {
         // A lone string literal field is its one-member set's atom (D7220).
         if tyIsLitUnion(f) || tyIsOneStrLit(f) { return true }
         if tyFnRetIsLitUnion(f) { return true }
-        if tyObjFieldIsLitUnion(f, depth - 1) { return true }
+        if tyObjFieldIsLitUnionIn(f, seen) { return true }
       }
       i = i + 1
     }
@@ -2027,30 +2034,39 @@ export function tysHoldVar(tys: i32[]): boolean {
   return false
 }
 
-// Whether every type variable `ty` names is one of `names`; a hole or the depth bound is.
-export function tyTvsAmong(ty: i32, names: string[], depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth > 8 { return true }
+// Whether every type variable `ty` names is one of `names`; a hole is.
+export function tyTvsAmong(ty: i32, names: string[]): boolean {
+  // A type naming no variable names none outside `names`, and `tyHasTyVar` answers from its memo.
+  if ty < 0 || ty >= T.tys.length || !tyHasTyVar(ty) { return true }
+  const seen: i32[] = []
+  return tyTvsAmongIn(ty, names, seen)
+}
+
+// `tyTvsAmong` over the types not in `seen`: one already walked named none outside `names`, or is
+// on a cycle.
+function tyTvsAmongIn(ty: i32, names: string[], seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return true }
+  seen.push(ty)
   const t = tyAt(ty)
   return match t {
     TyVar => strListHas(names, t.tvName)
-    TyArray => tyTvsAmong(tyElemOf(t), names, depth + 1)
-    TyNullable => tyTvsAmong(t.nInner, names, depth + 1)
-    TyNeg => tyTvsAmong(t.negTy, names, depth + 1)
-    TyMap => tyTvsAmong(tyKeyOf(t), names, depth + 1)
-      && tyTvsAmong(tyValOf(t), names, depth + 1)
-    TyObj => tyTvsAllAmong(t.objFieldTypes, names, depth)
-    TyUnion => tyTvsAllAmong(t.uMembers, names, depth)
+    TyArray => tyTvsAmongIn(tyElemOf(t), names, seen)
+    TyNullable => tyTvsAmongIn(t.nInner, names, seen)
+    TyNeg => tyTvsAmongIn(t.negTy, names, seen)
+    TyMap => tyTvsAmongIn(tyKeyOf(t), names, seen) && tyTvsAmongIn(tyValOf(t), names, seen)
+    TyObj => tyTvsAllAmong(t.objFieldTypes, names, seen)
+    TyUnion => tyTvsAllAmong(t.uMembers, names, seen)
     TyFunc => {
-      tyTvsAllAmong(t.fnParamTypes, names, depth)
-        && tyTvsAmong(t.fnRet, names, depth + 1)
+      tyTvsAllAmong(t.fnParamTypes, names, seen)
+        && tyTvsAmongIn(t.fnRet, names, seen)
     }
     TyPrim | TyErr | TyLit => true
   }
 }
 
-function tyTvsAllAmong(tys: i32[], names: string[], depth: i32): boolean {
+function tyTvsAllAmong(tys: i32[], names: string[], seen: i32[]): boolean {
   for x in tys {
-    if !tyTvsAmong(x, names, depth + 1) { return false }
+    if !tyTvsAmongIn(x, names, seen) { return false }
   }
   return true
 }
