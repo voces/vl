@@ -5146,12 +5146,60 @@ function recCbTakesBuild(c: i32, isMap: boolean): boolean {
     return false
   }
   if an is FuncDecl && f.fnName != "" { return false }
-  // A `map` handing each element back keeps them, and its result is stamped at the build (D16211).
-  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) && !fnOnlyReturnsParam(fd) {
+  // A `map` handing each element back keeps them, and its result is stamped at the build (D16211);
+  // a result holding no record the element could be holds no element either (D16773).
+  if (
+    isMap
+    && tyHoldsObjDeep(nodeTyIxOf(c))
+    && !fnOnlyReturnsParam(fd)
+    && recCbResultMayHoldElem(cn, nodeTyIxOf(c))
+  ) {
     return false
   }
   const p = nodeAt(f.fnParams[0])
   return p is Param && p.parType < 0
+}
+
+// Whether the result type `rt` of `map` call `cn` holds, at any depth, a record its receiver's
+// element could be; true where the receiver's element is not a closed list's.
+function recCbResultMayHoldElem(cn: Call, rt: i32): boolean {
+  const f = if cn.callFn >= 0 { nodeAt(cn.callFn) } else { null }
+  if !(f is Member) { return true }
+  const ot = nodeTyIxOf(f.memObj)
+  const o = if ot >= 0 && ot < T.tys.length { tyAt(ot) } else { null }
+  if !(o is TyArray) || tyElemOpen(o) { return true }
+  const seen: i32[] = []
+  return tyHoldsRecMeeting(rt, tyElemOf(o), seen)
+}
+
+// Whether `ty` holds, at any depth, a record that meets record `el` either way, or a function.
+function tyHoldsRecMeeting(ty: i32, el: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return false }
+  seen.push(ty)
+  const t = tyAt(ty)
+  return match t {
+    TyObj => {
+      if assignable(ty, el) || assignable(el, ty) { return true }
+      for ft in t.objFieldTypes {
+        if tyHoldsRecMeeting(ft, el, seen) { return true }
+      }
+      false
+    }
+    TyNullable => tyHoldsRecMeeting(t.nInner, el, seen)
+    TyArray => tyHoldsRecMeeting(tyElemOf(t), el, seen)
+    TyMap => tyHoldsRecMeeting(tyKeyOf(t), el, seen)
+      || tyHoldsRecMeeting(tyValOf(t), el, seen)
+    TyUnion => {
+      for m in t.uMembers {
+        if tyHoldsRecMeeting(m, el, seen) { return true }
+      }
+      false
+    }
+    // A function result may close over an element.
+    TyFunc => true
+    // A scalar, literal or open type holds no record.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => false
+  }
 }
 
 // The element record the stores into the list or map binding `x` names build, else -1. This
@@ -5243,12 +5291,50 @@ function recBuiltReadTyAt(
     const ot = tyAt(nonNullTy(o))
     return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
   }
+  // A loop variable or a list callback's parameter holds the list's elements (D16783).
+  const el = recElemVarList(x)
+  if el >= 0 { return recBuiltElemIn(el, tbl) }
   const d = recHeldDecl(x)
   if d < 0 { return -1 }
   const b = if fresh { recBuildTyIn(tbl, d, false) } else { -1 }
   const dn = nodeAt(d)
   if b >= 0 || !(dn is LetDecl) { return b }
   return recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// The list whose elements the read `x` names, parentheses peeled: the iterated list of the
+// `for … in` loop whose element variable it is, or the receiver of the `map` or `filter` call
+// whose callback's one parameter it is; else -1.
+function recElemVarList(x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is LoopVar {
+    if dn.lvLoop < 0 || dn.lvLoop >= P.nodes.length { return -1 }
+    const l = nodeAt(dn.lvLoop)
+    if !(l is ForIn) || dn.lvSlot != 0 { return -1 }
+    const it = cwPeelValue(l.fiIter)
+    return if it >= 0 && tyIsListTy(nonNulTyOf(nodeTyIxOf(it))) { it } else { -1 }
+  }
+  if !(dn is Param) { return -1 }
+  let fd = recEnclosingFn(x)
+  while fd >= 0 && !recFnHasParam(fd, d) { fd = recEnclosingFn(fd) }
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || !cwIxCovers(fd) { return -1 }
+  if cwIxUpKind[fd] != CW_UP_ARG { return -1 }
+  const c = nodeAt(cwIxUp[fd])
+  const m = if c is Call && c.callFn >= 0 { nodeAt(parenPeelIx(c.callFn)) } else { null }
+  if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
+    return -1
+  }
+  return cwPeelValue(m.memObj)
+}
+
+// Whether function `fd` declares parameter `d`.
+function recFnHasParam(fd: i32, d: i32): boolean {
+  const f = nodeAt(fd)
+  return f is FuncDecl && i32ListHas(f.fnParams, d)
 }
 
 // Whether `u` is a call handing back a record literal a pin built at another record (D15185).
