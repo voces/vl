@@ -1,0 +1,259 @@
+// `check_inst_keys.vl` — the instance-key shadow (STORE stage A0): the instances the check's
+// per-call bindings (`instVecAt` rows) close to by substitution, against the keys the elaboration
+// minted. Built only when the host asks (`$VL_INST_KEYS`); nothing reads it.
+// Design: the STORE instance-key note in docs/internals/refactor-notes/.
+
+import { FuncDecl, P, i32ToStr, nodeAt } from "./ast"
+import {
+  instVecCalleeAt,
+  instVecCount,
+  instVecIxAt,
+  instVecNamesAt,
+  instVecTysAt,
+} from "./check_bind_rows"
+import { cwIxBuild, cwIxParent } from "./check_write_scan"
+import { substTyDeepUnbanked } from "./check_relate_core"
+import { tyHasTyVar } from "./tyquery"
+import { elabKeyStrFor, elabKeyStrs } from "./emit_elab"
+import { MONO_NEST_MAX } from "./emit_mono"
+
+let ikRows: string[] = []
+
+// Builds the report rows; returns how many.
+export function instKeysBuild(): i32 {
+  ikRows = []
+  cwIxBuild()
+  // Per declaration, the bindings it is instanced at, as the check's rows close them.
+  const keyNames: {[i32]: string[][]} = Map()
+  const keyTys: {[i32]: i32[][]} = Map()
+  const seen: {[string]: boolean} = Map()
+  const checkKeys: string[] = []
+  const work: i32[] = []
+  const workDepth: i32[] = []
+  let openFn = 0
+  let openHole = 0
+  let openCanon = 0
+  let capped = 0
+  // Roots: rows whose binding is closed as recorded.
+  let r = 0
+  while r < instVecCount() {
+    const d = instVecCalleeAt(r)
+    if d < 0 {
+      openFn = openFn + 1
+    } else if ikClosed(instVecTysAt(r)) {
+      const k = elabKeyStrFor(d, instVecNamesAt(r), instVecTysAt(r))
+      if k == "" {
+        openCanon = openCanon + 1
+      } else if !(seen[k] ?? false) {
+        seen[k] = true
+        checkKeys.push(k)
+        ikKeyAdd(keyNames, keyTys, d, instVecNamesAt(r), instVecTysAt(r))
+        work.push(d)
+        workDepth.push(0)
+      }
+    }
+    r = r + 1
+  }
+  // Each new instance of a declaration closes the open rows its body makes, by substitution.
+  const done: {[string]: boolean} = Map()
+  let w = 0
+  while w < work.length {
+    const e = work[w]
+    const depth = workDepth[w]
+    w = w + 1
+    const ens = keyNames[e] ?? []
+    const ets = keyTys[e] ?? []
+    let ki = 0
+    while ki < ens.length {
+      const tag = i32ToStr(e) + "#" + i32ToStr(ki)
+      if !(done[tag] ?? false) {
+        done[tag] = true
+        let q = 0
+        while q < instVecCount() {
+          const d = instVecCalleeAt(q)
+          if (
+            d >= 0
+            && !ikClosed(instVecTysAt(q))
+            && ikEnclosingFn(instVecIxAt(q)) == e
+          ) {
+            const st: i32[] = []
+            for t in instVecTysAt(q) {
+              st.push(substTyDeepUnbanked(t, ens[ki], ets[ki]))
+            }
+            if !ikClosed(st) {
+              openHole = openHole + 1
+            } else if depth + 1 >= MONO_NEST_MAX {
+              capped = capped + 1
+            } else {
+              const k = elabKeyStrFor(d, instVecNamesAt(q), st)
+              if k == "" {
+                openCanon = openCanon + 1
+              } else if !(seen[k] ?? false) {
+                seen[k] = true
+                checkKeys.push(k)
+                ikKeyAdd(keyNames, keyTys, d, instVecNamesAt(q), st)
+                work.push(d)
+                workDepth.push(depth + 1)
+              }
+            }
+          }
+          q = q + 1
+        }
+      }
+      ki = ki + 1
+    }
+  }
+  // Rows whose binding stays open with no enclosing instance to close it.
+  let q = 0
+  while q < instVecCount() {
+    const d = instVecCalleeAt(q)
+    if d >= 0 && !ikClosed(instVecTysAt(q)) {
+      const e = ikEnclosingFn(instVecIxAt(q))
+      if e < 0 || (keyNames[e] ?? []).length == 0 { openHole = openHole + 1 }
+    }
+    q = q + 1
+  }
+  const elab = elabKeyStrs()
+  const inElab: {[string]: boolean} = Map()
+  for k in elab { inElab[k] = true }
+  let equal = 0
+  const checkOnly: string[] = []
+  for k in checkKeys {
+    if inElab[k] ?? false { equal = equal + 1 } else { checkOnly.push(k) }
+  }
+  const elabOnly: string[] = []
+  const elabSeen: {[string]: boolean} = Map()
+  for k in elab {
+    if !(seen[k] ?? false) && !(elabSeen[k] ?? false) {
+      elabSeen[k] = true
+      elabOnly.push(k)
+    }
+  }
+  ikRows.push(
+    "summary equal="
+      + i32ToStr(equal)
+      + " check-only="
+      + i32ToStr(checkOnly.length)
+      + " elab-only="
+      + i32ToStr(elabOnly.length)
+      + " open.fn-value="
+      + i32ToStr(openFn)
+      + " open.outer-hole="
+      + i32ToStr(openHole)
+      + " open.canon="
+      + i32ToStr(openCanon)
+      + " capped="
+      + i32ToStr(capped),
+  )
+  for k in checkOnly {
+    ikRows.push("check-only " + ikNamed(k) + ikNearest(k, elab))
+  }
+  for k in elabOnly {
+    ikRows.push("elab-only " + ikNamed(k) + ikNearest(k, checkKeys))
+  }
+  return ikRows.length
+}
+
+export function instKeysLen(i: i32): i32 {
+  return if i >= 0 && i < ikRows.length { ikRows[i].length } else { 0 }
+}
+
+export function instKeysAt(i: i32, j: i32): i32 {
+  return if i >= 0 && i < ikRows.length && j >= 0 && j < ikRows[i].length { ikRows[i][j] } else { 0 }
+}
+
+// Whether every type in `tys` is closed.
+function ikClosed(tys: i32[]): boolean {
+  for t in tys {
+    if t < 0 || tyHasTyVar(t) { return false }
+  }
+  return true
+}
+
+function ikKeyAdd(
+  keyNames: {[i32]: string[][]},
+  keyTys: {[i32]: i32[][]},
+  d: i32,
+  names: string[],
+  tys: i32[],
+) {
+  const ns = keyNames[d] ?? []
+  const ts = keyTys[d] ?? []
+  ns.push(names)
+  ts.push(tys)
+  keyNames[d] = ns
+  keyTys[d] = ts
+  return 0
+}
+
+// The declared function whose body holds node `x`, or -1.
+function ikEnclosingFn(x: i32): i32 {
+  let p = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  while p >= 0 && p < P.nodes.length {
+    if nodeAt(p) is FuncDecl { return p }
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  return -1
+}
+
+// Key `k` (`decl|bindings`) with its declaration's name in front.
+function ikNamed(k: string): string {
+  const c = k.indexOf("|")
+  if c < 0 { return k }
+  let d = 0
+  let i = 0
+  while i < c {
+    d = d * 10 + (k[i] - 48)
+    i = i + 1
+  }
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const nm = if n is FuncDecl { n.fnName } else { "?" }
+  return nm + " " + k
+}
+
+// The bindings in which key `k` differs from the nearest key of the same declaration in `others`.
+function ikNearest(k: string, others: string[]): string {
+  const c = k.indexOf("|")
+  if c < 0 { return "" }
+  const head = k.slice(0, c + 1)
+  const mine = ikParts(k.slice(c + 1, k.length))
+  let best = ""
+  let bestN = -1
+  for o in others {
+    if o.length > head.length && o.slice(0, head.length) == head {
+      const theirs = ikParts(o.slice(head.length, o.length))
+      let diff = ""
+      let n = 0
+      for p in mine {
+        let same = false
+        for t in theirs {
+          if t == p { same = true }
+        }
+        if !same {
+          n = n + 1
+          diff = diff + " " + p
+        }
+      }
+      if bestN < 0 || n < bestN {
+        bestN = n
+        best = diff
+      }
+    }
+  }
+  return if bestN < 0 { " (no peer)" } else { " (differs:" + best + ")" }
+}
+
+function ikParts(s: string): string[] {
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while j < s.length {
+    if s[j] == 59 {
+      out.push(s.slice(i, j))
+      i = j + 1
+    }
+    j = j + 1
+  }
+  if i < s.length { out.push(s.slice(i, s.length)) }
+  return out
+}
