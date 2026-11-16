@@ -66,6 +66,8 @@ import {
   GlobalCtx,
   callEndsNever,
   globalReadRecovers,
+  idxStorePlainWhy,
+  idxStorePlanOf,
   pushPlainWhy,
   pushPlanOf,
   strLitTakesAtom,
@@ -76,6 +78,7 @@ import {
   declaredIndexAt,
   envSlotShift,
   exprIsStrMethod,
+  exprMap,
   fnIndexOfNode,
   localIndexOf,
 } from "./emit_classify"
@@ -712,6 +715,7 @@ function strLit(ix: i32, rep: i32): Opnd {
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
+  if t is Index { return elemStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
   if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   const d = identDeclOf(n.binLeft)
@@ -729,6 +733,32 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
   if g < 0 || d < 0 { return skip("assignment target") }
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
+  return 0
+}
+
+// `xs[i] = v` that legacy writes as the plain store (`idxStorePlainWhy`): receiver, index and
+// value in source order, then the store, whose guard runs after the value.
+function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
+  // Legacy takes a map store before it plans an element store.
+  if exprMap(t.idxArr, ibFnIx) { return skip("map store") }
+  const st = idxStorePlanOf(t, ibFnIx)
+  if st == null { return skip("store plan") }
+  const why = idxStorePlainWhy(st, t.idxArr, n.binRight, ibFnIx)
+  if why != "" { return skip(why) }
+  const v = irBExpr(b, t.idxArr)
+  const i = irBExpr(b, t.idxIndex)
+  const x = irBExpr(b, n.binRight)
+  if ibMiss != "" { return 0 }
+  const ln = repNodeAt(irBOpRep(v))
+  if (
+    !(ln is RList)
+    || repPrim(irBOpRep(i)) != "i32"
+    || irBOpRep(x) != ln.rlsElem
+  ) {
+    return skip("store operand coercion")
+  }
+  irBNode(b, { bcV: v, bcIx: i }, -1, ibNoValue, ix)
+  irBNode(b, { lsV: v, lsIx: i, lsSrc: x }, -1, ibNoValue, ix)
   return 0
 }
 

@@ -12487,3 +12487,88 @@ call the walk missed). It is named in the PR with its mechanism and pinned by a 
 
 **Why.** Byte identity with the walk is a means, not the goal; matching a known-imprecise answer would
 move the slot store backwards.
+
+## An un-annotated function argument does not bind a type parameter (2026-11-16, chosen under the owner's delegation) — D16412, D16562
+
+**The rule.** In `sel<A>(f: (x: A) => A)` called as `sel(hinc)` with an un-annotated `hinc`, nothing at the
+call binds `A`, so D16562's default (`i32`) applies there, whether or not the call's result is called
+later. `sel(hinc)(1)` runs; `sel(hinc)(2.5)` is a check refusal naming the fix (`write sel<f64>(…)`). The
+checker records the defaulted binding at the call and mono reads that record.
+
+**Why.** It is D16562 applied uniformly (`compose(gid, …)` already behaves this way), and letting a later
+call of the result decide a generic's type would make the generic's typing depend on its caller's
+later use. It accepts nothing new and refuses only programs emit already refused. Binding `A` through
+the result remains possible later as a capability extension.
+
+## A union arm keeps its own heap identity (2026-11-16, chosen under the owner's delegation) — REP stage 4b
+
+**The rule.** A union arm's ref row is never fused with a same-shape plain record row: it is a third named
+kept class, "discriminating arm row", beside function-field rows and hole or generic-instance rows.
+Struct rows are keyed by `repHeapId` plus layout (today's twin key, made an O(1) cache), not by
+`tyRepId`, which would fuse rows that store different function-set groups or instances.
+
+**Why.** A union discriminates its arms by struct identity (`ref.test` on the arm's type); fusing an arm
+with a plain record of the same shape would let a plain value test as that arm. That is soundness, not
+layout.
+
+## Temporary seams and staged deletions in the IR and storage work (2026-11-16, chosen under the owner's delegation) — IR I8, L2 S3.4d
+
+**The rule.**
+- The IR's I8 "value hole" (legacy's union box ladder writes the value the IR supplies at one marked
+  node) is accepted as a temporary seam: one helper sets and clears it, an open hole at a function
+  boundary fails, and it is deleted when legacy body lowering retires. Every ladder predicate it runs
+  must be context-free; a predicate found reading context is fixed at its source, not special-cased.
+- I8b (box delivery) lands with the boxed nullable rep (N1) as one step, since the op has nothing to
+  deliver into without the rep; the atom discipline (N2) follows it.
+- S3.4d's late branch, when narrowed rather than deleted, names a fifth exclusion: a set without
+  complete check facts.
+- A late-demands rise is accepted only when it is an existing mechanism showing up in a new fixture,
+  named in the PR with the row that owns removing it.
+
+**Why.** Each keeps one decider per fact at every commit while letting the migration land in measured
+steps.
+
+## A held type-parameter-like hole stays pin-generic through a write into a nullable place (2026-11-16, chosen under the owner's delegation) — D3299, D3436
+
+**The rule.** An un-annotated parameter written into a `T | null` place stays pin-generic, as `<T>` does,
+and each instance reads the place at its own pin: after `g("abc")`, `s = x; s.length` reads a
+`string`. The checker does not infer `string | null` for `x` from the place it is written into. It
+lands in two PRs (the `tvPlaceWrite` admission, identical alone; then the write-position flow skip,
+graded on a new matrix) after a census; a census showing a `runs` loss from reads of the hole itself
+takes the harder fallback instead.
+
+**Why.** It is assignment narrowing as TypeScript does it, and what a reader expects; inferring the
+parameter's type from a place it flows into inverts the direction of inference.
+
+## A bound's refusal names the parameter and the body site, with `line:col` in the text (2026-11-16, chosen under the owner's delegation) — L2 S3.5
+
+**The rule.** Each bound keeps its own sentence and hint; the parenthetical becomes the parameter and
+the body site that demanded the bound, written as `line:col` in the message. A structured related
+location (LSP, oracle) is filed as its own row. Per-kind phrasing (§4.2) is a possible later step,
+not planned.
+
+**Why.** The site is what a reader needs to act on the refusal, and text keeps every consumer working
+until the structured location exists.
+
+## A clause-1 defect may close to a check refusal first, and the row stays open (2026-11-16, chosen under the owner's delegation) — D16851, D16860
+
+**The rule.** When the real fix for a trap or invalid module is large, a PR may first make the program
+a check refusal (never an emit refusal), reusing an existing sentence. The row stays open as a loud
+clause-2 row and closes only when the program runs. The refusal is graded on the matrix A/B: it may
+not catch a cell that runs today.
+
+**Why.** Invalid wasm from plain code is the worse failure; a refusal at check is honest and
+reversible, and the open row keeps the capability owed.
+
+## A maker's returned lambda is built per signature, never widened (2026-11-16, chosen under the owner's delegation) — D16845, D16851, D16865
+
+**The rule.** A closure returned by a maker and delivered or called at two signatures is built once per
+signature, with its environment captured once, as a directly bound hole lambda already is
+(`f(3); f(3.0)` prints `1` then `1.5`). It is never built once at a widened join, and never as a
+single instance picked from two deliveries. A relay call written into a map or list element with no
+closed context takes the one closed signature its element is called at downstream, and stays
+not-closed when there are two or none. While a reader and the walk disagree on such a delivery, the
+reader matches the walk (parity) and the gap is a filed row.
+
+**Why.** Widening changes results; a single picked instance traps at the other signature. Per-signature
+instances are the one answer that matches the direct-binding semantics.

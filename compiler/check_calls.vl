@@ -110,7 +110,6 @@ import {
   ifaceSolveAt,
   moveElemArgCstrs,
   solvePlain,
-  validateRetCstrs,
   validateTpIfJoins,
 } from "./check_assignable"
 import {
@@ -1729,7 +1728,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       const nTys: i32[] = []
       withUnboundAsNever(sd, vNames, vTys, nNames, nTys)
       if nNames.length > 0 {
-        validateRetCstrs(nNames, nTys, ix, sd, cfn.identName)
+        const rAt = solvePlain(nNames, nTys, ix, sd, cfn.identName)
+        rAt.kinds = 1 << SS_RET
+        ifaceSolveAt(rAt, SS_RET, SS_RET)
       }
     }
   }
@@ -1797,12 +1798,29 @@ function callDefaultArgTyParams(
   vTys: i32[],
 ): i32 {
   const own: string[] = []
+  const holeNames: string[] = []
+  let ownLam = false
   for a in args {
-    const d = identFnDeclOf(parenPeelIx(a))
+    const ax = parenPeelIx(a)
+    let d = identFnDeclOf(ax)
+    if d < 0 && ax >= 0 && ax < P.nodes.length && nodeAt(ax) is FuncDecl {
+      d = ax
+      ownLam = true
+    }
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
     if dn is FuncDecl {
       for tp in dn.fnTyParams {
         if !strListHas(tpEnvNames, tp) { own.push(tp) }
+      }
+      // An un-annotated function's parameter holes bind no type parameter either (D16412).
+      let pi = 0
+      while dn.fnTyParams.length == 0 && pi < dn.fnParams.length {
+        const pn = nodeAt(dn.fnParams[pi])
+        if pn is Param && pn.parType < 0 {
+          own.push(paramHoleName(dn.fnName, d, pi))
+          holeNames.push(paramHoleName(dn.fnName, d, pi))
+        }
+        pi = pi + 1
       }
     }
   }
@@ -1812,7 +1830,17 @@ function callDefaultArgTyParams(
     const t = vTys[i]
     const tv = if t >= 0 && t < T.tys.length { tyAt(t) } else { tyAt(TY_I32) }
     const mine = i < vNames.length && strListHas(calleeTps, vNames[i])
-    if mine && tv is TyVar && strListHas(own, tv.tvName) {
+    // A lambda handed over adopts the parameter itself, which stays bound only to its own name.
+    const selfBound = tv is TyVar
+      && tv.tvName == vNames[i]
+      && ownLam
+      && tpOnlyArrowParam(cfn, vNames[i])
+    if (
+      mine
+      && tv is TyVar
+      && (strListHas(own, tv.tvName) || selfBound)
+      && (!strListHas(holeNames, tv.tvName) || tpOnlyArrowParam(cfn, vNames[i]))
+    ) {
       vTys[i] = unboundDefaultTy()
       if !inferQuiet && cfn is Ident {
         noteUnboundDefaultCall(ix, cfn.identName, vNames[i])
@@ -1821,6 +1849,30 @@ function callDefaultArgTyParams(
     i = i + 1
   }
   return 0
+}
+
+// Whether callee `cfn`'s type parameter `tp` appears as a parameter type of one of its
+// function-typed parameters and in none of its plain ones: a function handed there binds it only
+// by its own parameter's hole, which binds nothing. One only in a result is bound through another
+// argument (`mapL(xs, hid)`'s `B`).
+function tpOnlyArrowParam(cfn: Node, tp: string): boolean {
+  if !(cfn is Ident) { return false }
+  const d = fnDeclIx[cfn.identName] ?? -1
+  const sig = if d >= 0 && d < P.nodes.length { nodeTyOf(d) } else { -1 }
+  const sf = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { tyAt(TY_I32) }
+  if !(sf is TyFunc) { return false }
+  let seen = false
+  for p in sf.fnParamTypes {
+    const pf = if p >= 0 && p < T.tys.length { tyAt(p) } else { tyAt(TY_I32) }
+    if pf is TyFunc {
+      for q in pf.fnParamTypes {
+        if tyMentionsTyVarNamed(q, tp, 8) { seen = true }
+      }
+    } else if tyMentionsTyVarNamed(p, tp, 8) {
+      return false
+    }
+  }
+  return seen
 }
 
 // The arguments of an ordinary call made index-parallel with `params`: a rest tail packed,
@@ -5321,6 +5373,12 @@ function checkCallNodeGo(n: Call, ix: i32) {
   // A `never` callee, a type parameter an instance binds to it (D3178) or a read no value
   // reaches, is called on no value.
   if fnTy == TY_NEVER { return TY_NEVER }
+  // A `?.` call off a receiver only ever `null` reads `null`; its arguments are still checked
+  // (D16841).
+  if cfn is OptMember && isNullTy(fnTy) {
+    for na in n.callArgs { checkNodeHook(na) }
+    return TY_NULL
+  }
   // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
   let calledGetter = getSiteFnOf(n.callFn)
   if calledGetter == "" && cfn is Member {

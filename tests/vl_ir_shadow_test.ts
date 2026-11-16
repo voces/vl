@@ -199,6 +199,7 @@ print(guard(2))
   `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
   `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
   `let gs: i32[] = []\nfunction add(x: i32): i32 {\n  gs.push(x)\n  return gs.push(x + 1)\n}\nprint(add(1))\n`,
+  `let ns: string[] = ["a", "b"]\nfunction put(i: i32, s: string) { ns[i] = s + "!" }\nput(1, "z")\nprint(ns[1])\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
