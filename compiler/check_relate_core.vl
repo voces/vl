@@ -223,6 +223,7 @@ import {
   HD_BINOP,
   HD_COAL,
   HD_COALD,
+  HD_DISC,
   HD_ELEM,
   HD_ELEMV,
   HD_FLD,
@@ -9645,6 +9646,35 @@ function sameFieldTyOf(ty: i32, prop: string): i32 {
   return one
 }
 
+// The members of struct union `u` a discriminant test on field `prop` keeps: those whose field
+// meets `ft`, or with `exclude` those whose field is not wholly `ft` (the arm the equality fails).
+// -1 when the test narrows nothing: a member that is no record or lacks `prop`, or zero or all kept.
+export function discrimKeepTy(
+  u: i32,
+  prop: string,
+  ft: i32,
+  exclude: boolean,
+): i32 {
+  if u < 0 || u >= T.tys.length || ft < 0 { return -1 }
+  const ut = tyAt(u)
+  if !(ut is TyUnion) { return -1 }
+  const kept: i32[] = []
+  for m in ut.uMembers {
+    if m < 0 || m >= T.tys.length { return -1 }
+    const mt = tyAt(m)
+    if !(mt is TyObj) { return -1 }
+    const mf = objFieldType(mt, prop)
+    if mf < 0 { return -1 }
+    if exclude {
+      if !assignable(mf, ft) { kept.push(m) }
+    } else if assignable(ft, mf) || assignable(mf, ft) {
+      kept.push(m)
+    }
+  }
+  if kept.length == 0 || kept.length == ut.uMembers.length { return -1 }
+  return if kept.length == 1 { kept[0] } else { mkUnionTy(kept) }
+}
+
 // The type of the `??` whose `HD_COAL` hole is `row`, its operand pinned at `cPin` and its
 // default typed `cDft` (-1 or a hole when unknown): the concrete `??`'s own typing.
 export function coalJoinAtPin(row: i32, cPin: i32, cDft: i32): i32 {
@@ -9708,6 +9738,20 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     const nRest = subtractTy(nPin, nAlt)
     if nRest >= 0 { return nRest }
     return nPin
+  }
+  // A discriminant fact on a hole: the pin's members the test keeps, or the pin where it keeps
+  // none or all, as the concrete test pushes no fact then.
+  if kind == HD_DISC {
+    const dPin = substHoleTy(hdBase[row], bNames, bTys)
+    if dPin < 0 { return -1 }
+    if tyIsHole(dPin) { return rebaseHoleUnder(row, dPin, bNames, bTys) }
+    const kept = discrimKeepTy(
+      dPin,
+      hdField[row],
+      hdInner[row],
+      hdAlt[row] == 1,
+    )
+    return if kept >= 0 { kept } else { dPin }
   }
   // The `??` result, deferred: the pin's non-null face when the default fits it, else the join
   // — `checkBinExprNodeReal`'s own coalesce tail, which needs both sides concrete to decide.
