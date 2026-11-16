@@ -6961,21 +6961,6 @@ function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
   return -1
 }
 
-// Whether `ix` is a chain of list-element and field reads ending at a pinned parameter, each
-// element read over a list; a map read can miss, so a read through a map is not one (D9915).
-function monoPinnedReadGate(ix: i32, pNames: string[], pTys: i32[]): boolean {
-  const u = unwrapParen(ix)
-  if u < 0 { return false }
-  const e = nodeAt(u)
-  if e is Index {
-    const at = elabNodeTy(e.idxArr, elabWalkTop())
-    if at < 0 || at >= T.tys.length || !(tyAt(at) is TyArray) { return false }
-    return monoPinnedReadGate(e.idxArr, pNames, pTys)
-  }
-  if e is Member { return monoPinnedReadGate(e.memObj, pNames, pTys) }
-  return monoPinnedOperandTy(u, pNames, pTys) >= 0
-}
-
 // `pNames`/`pTys` without `name` into `outN`/`outT`: a binding of that name shadows the parameter.
 function monoPinDrop(
   name: string,
@@ -7038,7 +7023,7 @@ function monoPinBin(ix: i32, n: BinExpr, pNames: string[], pTys: i32[]): i32 {
   }
   // The same fold over a list element or record field of a pinned parameter (D9915).
   if n.binOp == "??" && plt < 0 {
-    const prt = if monoPinnedReadGate(n.binLeft, pNames, pTys) { elabNodeTy(n.binLeft, elabWalkTop()) } else { -1 }
+    const prt = if monoPinnedReadTy(n.binLeft, pNames, pTys, 8) >= 0 { elabNodeTy(n.binLeft, elabWalkTop()) } else { -1 }
     if tyExcludesNull(prt) { return bl }
   }
   // D2802: the direct twin's dead null test. A pinned parameter read has no effect, so a
@@ -7056,13 +7041,20 @@ function monoPinBin(ix: i32, n: BinExpr, pNames: string[], pTys: i32[]): i32 {
     if elt < 0 {
       elt = if tyHasTyVar(lty) && top >= 0 { elabNodeTy(n.binLeft, top) } else { lty }
     }
+    // A field or element read of a pinned parameter is typed through the pin (D16470).
+    if elt < 0 || tyHasTyVar(elt) {
+      elt = monoPinnedReadTy(n.binLeft, pNames, pTys, 8)
+    }
     let ert = monoPinnedOperandTy(n.binRight, pNames, pTys)
     if ert < 0 {
       ert = if tyHasTyVar(rty) && top >= 0 { elabNodeTy(n.binRight, top) } else { rty }
     }
+    if ert < 0 || tyHasTyVar(ert) {
+      ert = monoPinnedReadTy(n.binRight, pNames, pTys, 8)
+    }
     if tyHasTyVar(elt) || tyHasTyVar(ert) { elt = -1 }
-    if (elt != lty || ert != rty) && elt >= 0 && ert >= 0 {
-      const fw = recEqTypedChain(bl, br, elt, ert, n.binOp == "!=", n.pos)
+    if elt >= 0 && ert >= 0 {
+      const fw = recEqTypedChain(bl, br, elt, ert, n.binOp == "!=", ix, n.pos)
       if fw >= 0 {
         nodeSrcNote(fw, ix)
         return fw
@@ -7094,6 +7086,45 @@ function monoPinBin(ix: i32, n: BinExpr, pNames: string[], pTys: i32[]): i32 {
   nodeSrcNote(nb, ix)
   nodeTyCarry(nb, ix)
   return nb
+}
+
+// The type read `x` has under the pins: a pinned parameter, a field of a record or an element of
+// a list such a read holds; -1 where a pin types none of it.
+function monoPinnedReadTy(
+  x: i32,
+  pNames: string[],
+  pTys: i32[],
+  depth: i32,
+): i32 {
+  if x < 0 || x >= P.nodes.length || depth <= 0 { return -1 }
+  const n = nodeAt(x)
+  return match n {
+    Paren => monoPinnedReadTy(n.parInner, pNames, pTys, depth - 1)
+    Ident => {
+      // A parameter whose annotation wraps a type parameter reads at the instance walk's type.
+      const pt = monoPinnedOperandTy(x, pNames, pTys)
+      const top = elabWalkTop()
+      const et = if pt < 0 && top >= 0 { elabNodeTy(x, top) } else { -1 }
+      const ok = et >= 0 && et < T.tys.length && elabTyClosed(et, 0)
+      if pt >= 0 { pt }
+      else if ok && !tyHasTyVar(et) && !tyHasHole(et) { et }
+      else { -1 }
+    }
+    Member => {
+      const ot = monoPinnedReadTy(n.memObj, pNames, pTys, depth - 1)
+      const o = if ot >= 0 && ot < T.tys.length { tyAt(ot) } else { null }
+      if !(o is TyObj) { return -1 }
+      const fi = strListIndexOf(o.objFieldNames, n.memProp)
+      if fi >= 0 { o.objFieldTypes[fi] } else { -1 }
+    }
+    Index => {
+      const at = monoPinnedReadTy(n.idxArr, pNames, pTys, depth - 1)
+      const a = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
+      if a is TyArray && !tyElemOpen(a) { tyElemOf(a) } else { -1 }
+    }
+    // Any other operand is no read of a pinned parameter.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => -1
+  }
 }
 
 // `monoPinBinOps`'s `Block` arm: each statement walked under the pins still in scope.
@@ -18537,17 +18568,6 @@ function monoIsHoleLamArg(a: i32): boolean {
     && elabOpenFnArgDecl(x) >= 0
 }
 
-// The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956, D7183).
-function monoGenArgOpenFail(ix: i32): i32 {
-  return emitFailAt(
-    "emitProgram: a generic function is passed to a function value whose parameter type "
-      + "names a type parameter this closure does not bind, so no instance of it can be "
-      + "chosen — call the function value from the generic function's own body, or pass "
-      + "a function of a concrete type",
-    ix,
-  )
-}
-
 // Whether call `n`, through a function value, hands a declared generic function to a parameter
 // whose recorded type names a type variable, which leaves the generic with no instance.
 function monoGenArgAtOpenParam(n: Call, ctx: i32): boolean {
@@ -18569,6 +18589,48 @@ function monoGenArgAtOpenParam(n: Call, ctx: i32): boolean {
     i = i + 1
   }
   return false
+}
+
+// Instances each declared generic call `n` (node `ix`) hands a parameter its recorded type leaves
+// open at that parameter's type in the instance being walked (`ctx`); refuses where one stays open
+// there, since no instance of the generic can be chosen (D3956). 0, or -1.
+function monoGenArgsAtInstanceParams(n: Call, ix: i32, ctx: i32): i32 {
+  const ct = nodeTyIxOf(n.callFn)
+  const it = elabNodeTyAt(unwrapParen(n.callFn), ctx)
+  const f = if ct >= 0 && ct < T.tys.length { tyAt(ct) } else { null }
+  const g = if it >= 0 && it < T.tys.length { tyAt(it) } else { null }
+  const closes = f is TyFunc
+    && g is TyFunc
+    && g.fnParamTypes.length == f.fnParamTypes.length
+  let i = 0
+  while f is TyFunc && i < n.callArgs.length && i < f.fnParamTypes.length {
+    const pt = f.fnParamTypes[i]
+    if (
+      pt >= 0
+      && pt < T.tys.length
+      && tyHasTyVar(pt)
+      && monoNamesDeclaredGeneric(n.callArgs[i], ctx)
+    ) {
+      const ip = if closes && g is TyFunc { g.fnParamTypes[i] } else { -1 }
+      if (
+        ip < 0
+        || ip >= T.tys.length
+        || tyHasTyVar(ip)
+        || !(tyAt(ip) is TyFunc)
+      ) {
+        return emitFailAt(
+          "emitProgram: a generic function is passed to a function value whose parameter type "
+            + "names a type parameter this closure does not bind, so no instance of it can be "
+            + "chosen — call the function value from the generic function's own body, or pass "
+            + "a function of a concrete type",
+          ix,
+        )
+      }
+      if monoCoerceFnValue(n.callArgs[i], ip, ctx) < 0 { return -1 }
+    }
+    i = i + 1
+  }
+  return 0
 }
 
 // Whether annotation node `annIx` is typed as a function or a nullable function: a slot a
@@ -22990,7 +23052,7 @@ function monoWalk(ix: i32, ctx: i32) {
         && (callee is Index || calleeIf)
         && monoGenArgAtOpenParam(n, ctx)
       ) {
-        return monoGenArgOpenFail(ix)
+        if monoGenArgsAtInstanceParams(n, ix, ctx) < 0 { return -1 }
       }
       if callee is Ident {
         return monoWalkIdentCall(n, callee, ix, ctx, elemsTyped)
@@ -23401,7 +23463,9 @@ function monoWalkIdentCall(
     && monoAliasLetLamFe(ix, ctx) < 0
     && monoArmLamFe(n.callFn, callee) < 0
   ) {
-    return monoGenArgOpenFail(ix)
+    // The instance being walked may close the parameter type the template leaves open: the
+    // generic is instanced at that (D3956).
+    if monoGenArgsAtInstanceParams(n, ix, ctx) < 0 { return -1 }
   }
   // A call through a written, un-annotated `let` holding generic functions instances each one
   // written at the call's type, which one binding holds one of (D3979).
@@ -26437,7 +26501,7 @@ function monoPruneTemplates(nDecl: i32) {
   const deadLams = monoUnreadLamSlots(nDecl)
   // A capture cell an instantiated hole lambda seeds takes the instance's function type. One no
   // call or peer pinned, stored as a list element or in such a cell, has no type for the element
-  // but the hole's `i32` default, so it is refused rather than stored there (D3851).
+  // but the hole's `i32` default, so it is refused, unless it is dead (`deadLams`) (D3851).
   if monoBindingsAtPin(nDecl) < 0 { return -1 }
   let pass = 0
   while pass < 2 {
@@ -26459,7 +26523,7 @@ function monoPruneTemplates(nDecl: i32) {
     if monoGen[sl] == 1 && criFnIsAnonLambda(sl) {
       const unpinned = fnStmts[sl] == monoOrigNode[sl]
         && !monoInstantiatedAny(sl)
-      if unpinned && monoLamStoredAsElement(sl) {
+      if unpinned && !i32ListHas(deadLams, sl) && monoLamStoredAsElement(sl) {
         return emitFail(
           "emitProgram: a lambda with an un-annotated parameter is stored in a list, or in a variable a nested function writes, and no call fixes its parameter types — annotate its parameters",
         )
