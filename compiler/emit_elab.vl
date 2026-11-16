@@ -10230,6 +10230,8 @@ export function elabRun() {
   elabHoleLamsAt = -1
   elabTpDefaultsPrime()
   elabLateNames = []
+  elabPathIds = Map()
+  elabPathTexts = []
   elabSlotCallAlso = -1
   elabSlotCallAlsoStep = ""
   // A compiler instance reused for another program keeps no classes of the last one.
@@ -15164,17 +15166,14 @@ function elabSlotReadDeliveries(
   out: i32[],
   seen: i32[],
 ) {
-  const key = b * 8 + path.length
-  if (
-    b < 0
-    || b >= P.nodes.length
-    || path.length >= 8
-    || i32ListHas(seen, key)
-    || seen.length > 32
-  ) {
-    return 0
+  if b < 0 || b >= P.nodes.length || seen.length > 32 { return 0 }
+  if path.length >= 8 {
+    if elabSeenDeep(seen, ELAB_SEEN_READ, b, path) { return 0 }
+  } else {
+    const key = b * 8 + path.length
+    if i32ListHas(seen, key) { return 0 }
+    seen.push(key)
   }
-  seen.push(key)
   cwIxWant()
   const ow = cwOccWalk(b)
   while cwOccNext(ow) {
@@ -15338,8 +15337,10 @@ function elabPlaceUp(x: i32): i32 {
 function elabSlotClimb(u: i32, path: string[], out: i32[], seen: i32[]) {
   // Each value and path is climbed once per query: the alias edges reach one from several sides.
   // A name's occurrence is climbed once already, by its binding's walk.
-  if u < 0 || u >= P.nodes.length || path.length >= 8 { return 0 }
-  if !(nodeAt(u) is Ident) {
+  if u < 0 || u >= P.nodes.length { return 0 }
+  if path.length >= 8 {
+    if elabSeenDeep(seen, ELAB_SEEN_CLIMB, u, path) { return 0 }
+  } else if !(nodeAt(u) is Ident) {
     const key = elabClimbKey - u * 8 - path.length
     if i32ListHas(seen, key) { return 0 }
     seen.push(key)
@@ -15671,6 +15672,59 @@ function elabSameSlotsMethod(m: string): boolean {
 
 // Keys the climb's `seen` entries apart from the bindings' (`b * 8 + n`) and returns' (`-2 - ...`).
 const elabClimbKey = 0 - 1073741824
+
+// Markers of a deep-path `seen` entry (`elabSeenDeep`): the marker, the node, the path's id.
+const ELAB_SEEN_CLIMB = 0 - 1073741823
+const ELAB_SEEN_READ = 0 - 1073741822
+const ELAB_SEEN_RET = 0 - 1073741821
+
+// Each slot path a deep walk reached, by its text (`/` before each step and after the last).
+let elabPathIds: {[string]: i32} = Map()
+let elabPathTexts: string[] = []
+
+// The text of slot path `path`: `/` before each step and after the last.
+function elabPathText(path: string[]): string {
+  let t = "/"
+  for st in path { t = t + st + "/" }
+  return t
+}
+
+// The id of path text `t`, interned.
+function elabPathIdOf(t: string): i32 {
+  const have = elabPathIds.get(t) ?? -1
+  if have >= 0 { return have }
+  elabPathIds.set(t, elabPathTexts.length)
+  elabPathTexts.push(t)
+  return elabPathTexts.length - 1
+}
+
+// Whether walk `tag` already reached node `x` at `path`, or at a path `path` ends with: the walk
+// came round a cycle that only lengthened the path, which delivers nothing new. Notes `x` at `path`
+// otherwise. A walk ends at a cycle, not at a depth.
+function elabSeenDeep(seen: i32[], tag: i32, x: i32, path: string[]): boolean {
+  const t = elabPathText(path)
+  let i = 0
+  while i + 2 < seen.length {
+    const pi = seen[i + 2]
+    if (
+      seen[i] == tag
+      && seen[i + 1] == x
+      && pi >= 0
+      && pi < elabPathTexts.length
+    ) {
+      const prev = elabPathTexts[pi]
+      const n = prev.length
+      if n <= t.length && t.slice(t.length - n, t.length) == prev {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  seen.push(tag)
+  seen.push(x)
+  seen.push(elabPathIdOf(t))
+  return false
+}
 
 // Whether list or map method `m` hands back one of the receiver's elements.
 function elabElemMethod(m: string): boolean {
@@ -16705,11 +16759,14 @@ function elabLoopVarDeliveries(
 // Adds to `out` where slot `path` of the value function `f` returns is delivered: read at each call
 // of `f`, or handed on from it.
 function elabRetSlotOn(f: i32, path: string[], out: i32[], seen: i32[]) {
-  const key = 0 - 2 - (f * 8 + path.length)
-  if f < 0 || f >= P.nodes.length || i32ListHas(seen, key) || seen.length > 32 {
-    return 0
+  if f < 0 || f >= P.nodes.length || seen.length > 32 { return 0 }
+  if path.length >= 8 {
+    if elabSeenDeep(seen, ELAB_SEEN_RET, f, path) { return 0 }
+  } else {
+    const key = 0 - 2 - (f * 8 + path.length)
+    if i32ListHas(seen, key) { return 0 }
+    seen.push(key)
   }
-  seen.push(key)
   const calls: i32[] = []
   elabRetCalls(f, calls)
   // A lambda is called through the binding it initialises.
@@ -23017,7 +23074,9 @@ function eplSrcHolder(h0: i32): i32 {
   // what the loop's value is.
   const lc = lvCarrierLoopOf(h0)
   const lx = if h0 >= cwIxCoveredLen() { lvExitLoops[h0] ?? -1 } else { -1 }
-  let h = if lc >= 0 { lc } else if lx >= 0 { lx } else { elabCellLitBinding(h0) }
+  // A temp the capture rewrite minted for a closure's write holds its cell's binding.
+  const wc = if h0 >= cwIxCoveredLen() { cboxWriteCells[h0] ?? -1 } else { -1 }
+  let h = if lc >= 0 { lc } else if lx >= 0 { lx } else if wc >= 0 { wc } else { elabCellLitBinding(h0) }
   if h >= cwIxCoveredLen() {
     const o = declOrigOf(h)
     h = if o >= 0 { o } else { nodeSrc[h] ?? -1 }
@@ -23042,7 +23101,16 @@ function eplSlotPlace(holder0: i32, path: string[], k: i32): i32 {
     && ekDecl[k] == holder
   EPL.k = if own && k < ekParent.length { ekParent[k] } else { k }
   let p = if holder < P.nodes.length && nodeAt(holder) is FuncDecl { eplPlaceOf(holder, 0) } else { eplRoot(holder) }
-  for step in path { p = eplChild(p, step) }
+  // A binding the capture rewrite made a shared cell holds its value at the cell's one element, and
+  // the classes place the binding as written.
+  const cell = path.length > 0
+    && path[0] == "e"
+    && (cboxCellDecls[cboxDeclKey(holder)] ?? 0) == 1
+  let i = if cell { 1 } else { 0 }
+  while i < path.length {
+    p = eplChild(p, path[i])
+    i = i + 1
+  }
   return p
 }
 
