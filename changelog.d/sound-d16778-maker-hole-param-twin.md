@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D16778 closed**: a maker with an un-annotated parameter (`function adder(n) { return (a) => a + n }`), delivered at `(a: i32) => i32` and `(a: i32) => f64`, built one `i32` closure for both and the second call trapped. Such a function is now a maker when it returns only lambdas it writes: its call banks a maker row naming the binding the call pins, and the elaboration and mono build that call's instance at each delivered result. Two neighbours found while grading are filed: D16798 (an un-annotated binding called at `f64`) and D16799 (one maker called at two parameter types).
