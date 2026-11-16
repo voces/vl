@@ -58,10 +58,11 @@ Fixpoint seeds: master `e1f7f37c` and this branch, each byte-identical on a seco
 | check | reading |
 |---|---|
 | distilled corpus, per cell | `regress.vl --json` byte-identical to master's |
-| late demands | READING |
-| seed size | READING |
-| L2 self-compile fuel | READING |
-| `scripts/gate.sh` | READING |
+| late demands | 2 in 2 files of 7,020 built: the baseline (the late-demands gate row) |
+| seed size | 6,349,556 bytes against master's 6,349,140: +416 (`seed-size.vl --check` ok, +0.1% on its baseline) |
+| L2 self-compile fuel (`self-compile-time.sh`, each seed building its own tree) | 89.820e9 against master's 89.769e9: +0.06% |
+| `emit_mono` pin helpers | 908: untouched |
+| `scripts/gate.sh` | all 25 rows ok |
 
 ## Next
 
