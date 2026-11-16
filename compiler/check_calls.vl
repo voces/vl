@@ -4,6 +4,7 @@ import { paramSolveProbe } from "./check_exp_obs"
 // optional call, or a call through a function type with its bounds, constraints and rest
 // parameter.
 
+import { BND_ARG, bndAt, bndCount } from "./check_iface"
 import { rowParamIsSlot, rowSlotBound } from "./check_row_param"
 import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { decDigitsOf } from "./strutil"
@@ -78,6 +79,15 @@ import {
 import { collCtorTyArgsTy } from "./check_annot_resolve"
 import { luGrow } from "./check_list_union"
 import {
+  SS_ALL,
+  SS_ARG,
+  SS_BIN,
+  SS_BM,
+  SS_MEM,
+  SS_NEST,
+  SS_RET,
+  SS_UFCS,
+  SolveAt,
   adoptHoleLitArgs,
   assignableExpr,
   ctnWrittenCstrsAtCall,
@@ -94,10 +104,9 @@ import {
   holeFnArgUnionRetTy,
   holeLambdaDefers,
   holeLambdaSeedTy,
+  ifaceSolveAt,
   moveElemArgCstrs,
-  validateArgCstrs,
-  validateBmCstrs,
-  validateLetCstrs,
+  solvePlain,
   validateRetCstrs,
   validateTpIfJoins,
 } from "./check_assignable"
@@ -182,8 +191,8 @@ import {
   rcwPinsFill,
 } from "./check_covar_pins"
 import {
-  argCstr,
   compArgCstrOk,
+  listCallNote,
   noteArgCstr,
   noteArgCstrAt,
   noteArrDefCstr,
@@ -225,15 +234,8 @@ import {
   refuseOpenNullHoleArg,
   restCallPack,
   tplHoleHandled,
-  validateArrDefCstrs,
-  validateBinCstrs,
   validateEscJoins,
-  validateIsCstrs,
-  validateMemCstrs,
-  validateNestCstrs,
-  validatePrintCstrs,
   validateRcwPins,
-  validateUfcsCstrs,
   wsCandidate,
   wsOrigTyOf,
 } from "./check_demands"
@@ -467,7 +469,6 @@ import {
   substNestMode,
   substNestModeSet,
   substSelfOwner,
-  substSelfOwnerSet,
   topFnOwnerOf,
   tyFirstVarOwner,
   tyIsForeignGenericSig,
@@ -1410,6 +1411,12 @@ function checkHandedFns(a: i32, depth: i32) {
 // Always answers; the caller's remaining arms cover an error or still-unsolved callee.
 function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   let args = n.callArgs
+  if !inferQuiet {
+    const lcd = identFnDeclOf(n.callFn)
+    if lcd >= 0 {
+      for a in args { listCallNote(lcd, a) }
+    }
+  }
   // A pending (-2) or pre-pass hole result (D16369) of an un-annotated callee is inferred now by
   // checking its FuncDecl, which patches this TyFunc in place, unless it is on the in-progress
   // stack: an in-cycle call contributes TY_ERR so the root can detect the cycle.
@@ -2759,40 +2766,31 @@ function callFtyPinCstrs(
   if cstrCallee == CSTR_NODECL {
     calleeOwner = tyFirstVarOwner(nodeTyOf(n.callFn), 64)
   }
-  substSelfOwnerSet(calleeOwner)
-  validateBinCstrs(
-    cNames,
-    cTys,
-    ix,
-    cstrCallee,
-    cstrWho,
-    dhNames,
-    dhArgNo,
-    dhArgNode,
-  )
-  substSelfOwnerSet(ownerWas)
-  validatePrintCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
-  validateArrDefCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
-  validateNestCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
-  validateIsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
-  substSelfOwnerSet(topFnOwnerOf(cstrCallee))
-  validateArgCstrs(cNames, cTys, ix, cstrCallee, dhNames, dhArgNode)
-  substSelfOwnerSet(ownerWas)
+  const rNames: string[] = []
+  const rTys: i32[] = []
+  const at: SolveAt = {
+    bNames: cNames,
+    bTys: cTys,
+    rNames: rNames,
+    rTys: rTys,
+    ix: ix,
+    callee: cstrCallee,
+    who: cstrWho,
+    hNames: dhNames,
+    hArgNo: dhArgNo,
+    hArgNode: dhArgNode,
+    kinds: SS_ALL,
+    toggles: true,
+    selfOwner: calleeOwner,
+    argOwner: topFnOwnerOf(cstrCallee),
+    ownerWas: ownerWas,
+  }
+  ifaceSolveAt(at, SS_BIN, SS_ARG)
   forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance (D551).
-  const rNames: string[] = []
-  const rTys: i32[] = []
   withUnboundAsNever(namedFn, cNames, cTys, rNames, rTys)
-  validateRetCstrs(rNames, rTys, ix, cstrCallee, cstrWho)
-  // The destination seam, for the same reason: a value landing in a hole-typed local /
-  // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
-  substSelfOwnerSet(calleeOwner)
-  validateLetCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
-  substSelfOwnerSet(ownerWas)
-  // A builtin collection method's argument inside the body, for the same reason at a
-  // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
-  validateBmCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
+  ifaceSolveAt(at, SS_RET, SS_BM)
   // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
   if !inferQuiet {
     let oa = 0
@@ -2801,22 +2799,7 @@ function callFtyPinCstrs(
       oa = oa + 1
     }
   }
-  // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
-  // the operation on a type variable correctly (a `T` pinned to a collection has it), and
-  // this is the first position that knows which rep `T` became (D651 / D691).
-  validateMemCstrs(
-    cNames,
-    cTys,
-    ix,
-    cstrCallee,
-    cstrWho,
-    dhNames,
-    dhArgNo,
-    dhArgNode,
-  )
-  substSelfOwnerSet(calleeOwner)
-  validateUfcsCstrs(cNames, cTys, ix, cstrCallee, cstrWho)
-  substSelfOwnerSet(ownerWas)
+  ifaceSolveAt(at, SS_MEM, SS_UFCS)
   noteHoleLambdaArgPins(vNames, vTys, cstrCallee)
   validateRcwPins(vNames, vTys, cstrCallee, ix)
   recPendBoundArgs(params, args, vNames, vTys)
@@ -2965,12 +2948,15 @@ function callFtyPinCstrs(
 // A lambda literal handed to a hole callee takes, where the call binds that callee, the
 // parameter types of the function type it is delivered at: the elaboration's instance of it.
 function noteHoleLambdaArgPins(vNames: string[], vTys: i32[], calleeFn: i32) {
-  const n0 = argCstr.at.length
+  const n0 = bndCount(BND_ARG)
   let ci = 0
   while ci < n0 {
-    if argCstr.form[ci] > 0 && cstrOwnedBy(argCstr.fn[ci], calleeFn) {
-      const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
-      const rexp = substTyDeep(argCstr.exp[ci], vNames, vTys)
+    if (
+      bndAt(BND_ARG, ci).c > 0
+      && cstrOwnedBy(bndAt(BND_ARG, ci).fn, calleeFn)
+    ) {
+      const rat = substTyDeep(bndAt(BND_ARG, ci).on, vNames, vTys)
+      const rexp = substTyDeep(bndAt(BND_ARG, ci).a, vNames, vTys)
       const lf = if rat >= 0 && rat < T.tys.length { tyAt(rat) } else { tyAt(TY_I32) }
       const df = if rexp >= 0 && rexp < T.tys.length { tyAt(rexp) } else { tyAt(TY_I32) }
       if (
@@ -3011,21 +2997,11 @@ function judgeHoleLambdaAt(
   const d0 = T.diags.length
   holeFnDeliveryDemands(lam, want, ix, "this lambda")
   if T.diags.length > d0 { return 0 }
-  const none: string[] = []
-  const noNo: i32[] = []
-  const noNode: i32[] = []
   const modeWas = substNestMode
   substNestModeSet(SUBST_ALL)
-  validateBinCstrs(nm, ty, ix, CSTR_NODECL, "", none, noNo, noNode)
-  validatePrintCstrs(nm, ty, ix, CSTR_NODECL, "")
-  validateArrDefCstrs(nm, ty, ix, CSTR_NODECL, "")
-  validateIsCstrs(nm, ty, ix, CSTR_NODECL, "")
-  validateArgCstrs(nm, ty, ix, CSTR_NODECL, none, noNode)
-  validateRetCstrs(nm, ty, ix, CSTR_NODECL, "")
-  validateLetCstrs(nm, ty, ix, CSTR_NODECL, "")
-  validateBmCstrs(nm, ty, ix, CSTR_NODECL, "")
-  validateMemCstrs(nm, ty, ix, CSTR_NODECL, "", none, noNo, noNode)
-  validateUfcsCstrs(nm, ty, ix, CSTR_NODECL, "")
+  const at = solvePlain(nm, ty, ix, CSTR_NODECL, "")
+  at.kinds = SS_ALL - (1 << SS_NEST)
+  ifaceSolveAt(at, SS_BIN, SS_UFCS)
   substNestModeSet(modeWas)
   return 0
 }

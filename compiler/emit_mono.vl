@@ -401,6 +401,7 @@ import {
 import {
   IDENT_DROP_MONO_CALLEE,
   declOrigOf,
+  fnOnlyReturnsParam,
   identAuditDrop,
   identDeclOf,
   identFrom,
@@ -7758,30 +7759,29 @@ function monoTagRecordPinKind(ty: i32): i32 {
 
 // Whether the subtree at `ix` mentions the identifier `name` anywhere: a read, an alias, a copy
 // or a capture of it. Deeper than `depth` 400 answers true, so a miss is never guessed.
-function monoSubtreeNamesIdent(ix: i32, name: string, depth: i32): boolean {
+function monoSubtreeNamesIdent(ix: i32, name: string): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
-  if depth > 400 { return true }
   const n = nodeAt(ix)
   if n is Ident { return n.identName == name }
   const kids = nodeChildren(ix)
   let i = 0
   while i < kids.length {
-    if monoSubtreeNamesIdent(kids[i], name, depth + 1) { return true }
+    if monoSubtreeNamesIdent(kids[i], name) { return true }
     i = i + 1
   }
   return false
 }
 
 // The `Ident` named `name` at source position `pos` in the subtree of `ix`, or -1.
-function monoIdentAtPosIn(ix: i32, name: string, pos: i32, depth: i32): i32 {
-  if ix < 0 || ix >= P.nodes.length || depth > 400 { return -1 }
+function monoIdentAtPosIn(ix: i32, name: string, pos: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
   if n is Ident {
     if n.identName == name && n.pos == pos { return ix }
     return -1
   }
   for k in nodeChildren(ix) {
-    const r = monoIdentAtPosIn(k, name, pos, depth + 1)
+    const r = monoIdentAtPosIn(k, name, pos)
     if r >= 0 { return r }
   }
   return -1
@@ -8826,7 +8826,7 @@ function monoMakeInstanceParams(
         anonTy >= 0
         && agree == 0
         && pinned[pj][0] != "#"[0]
-        && monoSubtreeNamesIdent(fn.fnBody, p3.parName, 0)
+        && monoSubtreeNamesIdent(fn.fnBody, p3.parName)
       ) {
         return emitFail(
           "emitProgram: a record argument's fields name a row that holds another field kind, and a record is shared rather than converted",
@@ -10999,7 +10999,7 @@ function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
     && gn is Ident
     && monoDeclPathPins([fr, key], noPath).length == 0
   ) {
-    const tr = monoIdentAtPosIn(it[1], gn.identName, gn.pos, 0)
+    const tr = monoIdentAtPosIn(it[1], gn.identName, gn.pos)
     if tr >= 0 { key = tr }
   }
   const cTys: i32[] = []
@@ -17662,9 +17662,12 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const rw = elabCbParamRowTy(ax, ax)
     const lf = nodeAt(ax)
     const lsf = if nodeTyIxOf(ax) >= 0 { tyAt(nodeTyIxOf(ax)) } else { null }
+    // A `map` whose lambda hands each element back returns them at the build too (D16211).
+    const keep = rw >= 0 && m.memProp == "map" && fnOnlyReturnsParam(ax)
     if rw >= 0 && lf is FuncDecl && lf.fnParams.length == 1 && lsf is TyFunc {
       nodeTyRecord(lf.fnParams[0], rw)
-      nodeTyRecord(ax, mkFuncTy([rw], lsf.fnRet))
+      nodeTyRecord(ax, mkFuncTy([rw], if keep { rw } else { lsf.fnRet }))
+      if keep { nodeTyRecord(ix, mkArrayTy(rw)) }
     }
     monoListCbLamAt(a, tyElemOf(lt), ctx)
     // A `.map` whose lambda returns a function gives a list of that function's type (D9171).
@@ -17696,7 +17699,9 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   // A hole function the elaboration instanced at the list's build takes its elements there.
   const nfd = if nodeAt(ax) is Ident { identFnDeclOf(ax) } else { -1 }
   const nrw = if nfd >= 0 { elabCbParamRowTy(a, nfd) } else { -1 }
-  if nrw >= 0 { ft = mkFuncTy([nrw], r) }
+  // A named function handing each element back returns it at the build, as the lambda does (D16211).
+  const nkeep = nrw >= 0 && m.memProp == "map" && fnOnlyReturnsParam(nfd)
+  if nrw >= 0 { ft = mkFuncTy([nrw], if nkeep { nrw } else { r }) }
   // A named generic handed a tagged set's elements takes its instance at the set itself, as a
   // direct call hands it on (`monoPinHoleParam`).
   if fnTagTyIsTagged(tyElemOf(lt)) {
@@ -17710,7 +17715,9 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     if monoCoerceFnValueName(a, ctx, ft) < 0 { return -1 }
   }
   // A `.map` the checker left open, its element a hole function's, gives a list of that result.
-  if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
+  if nkeep {
+    nodeTyRecord(ix, mkArrayTy(nrw))
+  } else if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
     nodeTyRecord(ix, mkArrayTy(r))
   }
   // The choice's own type is what its closure value is built and called at.
@@ -24857,7 +24864,7 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     // A read in an instance body is banked under the template's read, at the same position.
     const xn = nodeAt(x)
     if it[1] >= 0 && xn is Ident {
-      const tr = monoIdentAtPosIn(it[1], xn.identName, xn.pos, 0)
+      const tr = monoIdentAtPosIn(it[1], xn.identName, xn.pos)
       if tr >= 0 { d = tr }
     }
   }
@@ -25214,7 +25221,7 @@ function monoWriteFrameDead(wf: i32, top: i32): boolean {
     if pb < 0 { return false }
     if nm == "" || criFnIsAnonLambda(slot) { nm = monoConstNameOfInit(pb, fx) }
     if nm == "" { return false }
-    if !monoSubtreeNamesIdent(pb, nm, 0) { return true }
+    if !monoSubtreeNamesIdent(pb, nm) { return true }
     fx = parent
     guard = guard + 1
   }
@@ -25500,7 +25507,7 @@ function monoPinLamAtTys(fe: i32, tys: i32[], builtin: boolean): i32 {
       if !monoLamPinTyPlain(tys[i], 8) { return 0 }
       let nm = ""
       if builtin {
-        nm = monoLamPinName(tys[i], 8)
+        nm = monoLamPinName(tys[i])
       } else {
         nm = structNameOfTy(tys[i])
         if nm == "" { nm = monoPinSpellShaped(tys[i]) }
@@ -25554,11 +25561,11 @@ function monoIsBuiltinCallback(lam: i32): boolean {
 // The annotation spelling a `monoLamPinTyPlain` type pins a lambda parameter at: a declared
 // record by its name at any list depth, and a generic record's instance by its application,
 // so the element keeps the name its annotation would give it (D3834).
-function monoLamPinName(ty: i32, depth: i32): string {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
+function monoLamPinName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
   const t = tyAt(ty)
   if t is TyArray {
-    const en = monoLamPinName(tyElemOf(t), depth - 1)
+    const en = monoLamPinName(tyElemOf(t))
     if en == "" { return "" }
     return en + "[]"
   }
@@ -26484,7 +26491,7 @@ function monoNestedFnDead(gp: i32, memberProps: {[string]: i32}[]): boolean {
       if (memberProps[0][nm] ?? 0) == 1 { return false }
     }
     if nm == "" { return false }
-    if !monoSubtreeNamesIdent(pb, nm, 0) { return true }
+    if !monoSubtreeNamesIdent(pb, nm) { return true }
     slot = ps
     guard = guard + 1
   }

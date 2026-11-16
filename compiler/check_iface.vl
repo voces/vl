@@ -6,7 +6,7 @@
 
 // One deferred demand: the type it is over (`on`), up to three operands (`a`, `b`, `c`, -1 when
 // unused), a spelling (`s`), the node that recorded it, the owner (-1 at module scope), a
-// check-order stamp (`seq`, -1 when unkept) and other nodes it stands for (`more`, `bndNoMore`
+// body-order stamp (`seq`, set by `bndPush`) and other nodes it stands for (`more`, `bndNoMore`
 // when none). Each kind's constant says what its operands mean.
 export type Bound = {
   on: i32,
@@ -32,6 +32,8 @@ export type Iface = {
   method: i32[],
   member: i32[],
   ufcs: i32[],
+  binary: i32[],
+  arg: i32[],
 }
 
 // A `print` of a type touching a hole, re-asked at the pin against the print floors.
@@ -48,12 +50,12 @@ export const BND_IS = 3
 export const BND_RET = 4
 // A write of `on` into a binding or place of type `a` in a generic body, where `assignable` is
 // vacuous and a return's bound cannot see it (D572). `s` names the binding ("" for a place) and
-// picks the sentence; `seq` orders it with `BND_BM`. Owner `CSTR_DELIVERY_ONLY` is judged only by
+// picks the sentence. Owner `CSTR_DELIVERY_ONLY` is judged only by
 // a delivery of the binding.
 export const BND_LET = 5
 // A builtin method argument `on` delivered where `a` is expected: a builtin has no declaration for
 // an argument bound to name (D582). `b` is the other type its sentence names (-1 when none), `c`
-// the method's form, `s` its label and `seq` its order with `BND_LET`.
+// the method's form and `s` its label.
 export const BND_BM = 6
 // A member read, index or layout constant `s` on a receiver of type `on` touching a hole (D1431):
 // `a` is 1 when it asks a demand, refused in the inference hole's words, and 0 when it asks a
@@ -63,6 +65,14 @@ export const BND_MEM = 7
 // body (D1005). `a` is the selected function's parameter-0 type (-1 for an overloaded call);
 // `more` lists the other call nodes the row stands for.
 export const BND_UFCS = 8
+// A binary operator `s` over `on` and `a`, one touching a hole, which `binOpDefinedFor` re-asks at
+// the pin. `site` is the expression (the direct spelling's numeric pair rule asks it) and `b` its
+// literal shape (D2757): bounds of one body alike but for a node of the same shape are one bound.
+export const BND_BIN = 9
+// An argument `on` delivered to a parameter of type `a` of callee `s`, one touching a hole. `c` is
+// the form (`ACF_*`, or N >= 1 for argument N of a call through a hole callee), `site` that
+// argument's node or -1, and `b` the hole call itself, kept as the demand moves out (D13201).
+export const BND_ARG = 10
 
 // One flat log per kind: a nested list of records is far costlier for the compiler to compile.
 let printLog: Bound[] = []
@@ -74,9 +84,15 @@ let letLog: Bound[] = []
 let bmLog: Bound[] = []
 let memLog: Bound[] = []
 let ufcsLog: Bound[] = []
+let binLog: Bound[] = []
+let argLog: Bound[] = []
 let ifaces: Iface[] = []
 let ifaceSlot: {[i32]: i32} = Map()
 const bndNone: i32[] = []
+
+// The next body-order stamp: one counter over every kind, so the pin pass applies a body's writes
+// in check order wherever each is deferred (D2218), and a solver can walk bounds in body order.
+let bndSeq = 0
 
 // The `more` of a bound that stands for no other node; never pushed onto.
 export const bndNoMore: i32[] = []
@@ -92,8 +108,11 @@ export function ifaceReset() {
   bmLog = []
   memLog = []
   ufcsLog = []
+  binLog = []
+  argLog = []
   ifaces = []
   ifaceSlot = Map()
+  bndSeq = 0
   return 0
 }
 
@@ -112,6 +131,8 @@ function ifaceAt(fn: i32): Iface {
     method: [],
     member: [],
     ufcs: [],
+    binary: [],
+    arg: [],
   }
   ifaceSlot[fn] = ifaces.length
   ifaces.push(f)
@@ -129,6 +150,8 @@ function bndLog(k: i32): Bound[] {
   if k == BND_BM { return bmLog }
   if k == BND_MEM { return memLog }
   if k == BND_UFCS { return ufcsLog }
+  if k == BND_BIN { return binLog }
+  if k == BND_ARG { return argLog }
   return []
 }
 
@@ -143,6 +166,8 @@ function ifaceRows(f: Iface, k: i32): i32[] {
   if k == BND_BM { return f.method }
   if k == BND_MEM { return f.member }
   if k == BND_UFCS { return f.ufcs }
+  if k == BND_BIN { return f.binary }
+  if k == BND_ARG { return f.arg }
   return []
 }
 
@@ -152,8 +177,10 @@ export function bndCount(k: i32): i32 { return bndLog(k).length }
 // Bound `i` of kind `k`; `i` is below `bndCount(k)`.
 export function bndAt(k: i32, i: i32): Bound { return bndLog(k)[i] }
 
-// Appends bound `b` of kind `k` and returns its index.
+// Appends bound `b` of kind `k`, stamping its `seq`, and returns its index.
 export function bndPush(k: i32, b: Bound): i32 {
+  b.seq = bndSeq
+  bndSeq = bndSeq + 1
   const log = bndLog(k)
   const i = log.length
   log.push(b)

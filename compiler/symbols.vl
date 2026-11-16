@@ -11,6 +11,7 @@
 // modules into one arena and renames colliding top-level names; a renamed name is a
 // different string, so it interns to a different id and the merge needs no remap.
 import {
+  Block,
   Call,
   ForRange,
   FuncDecl,
@@ -20,6 +21,7 @@ import {
   P,
   Param,
   Paren,
+  RetStmt,
   arenaEditBumpCount,
   arenaEditBumps,
   arenaEditCount,
@@ -28,6 +30,7 @@ import {
   binderNameAt,
   loopVarName,
   nodeAt,
+  nodeChildren,
   ovSiteSetOf,
   ufcsAliasInScope,
   ufcsModOfNode,
@@ -542,4 +545,52 @@ export function sidArrPut(a: i32[], sid: i32, v: i32) {
   while a.length <= sid { a.push(-1) }
   a[sid] = v
   return 0
+}
+
+// Whether function `fd` has one parameter and hands back nothing but it: every `return` outside a
+// nested function returns the bare parameter, or an arrow's expression body is the parameter.
+export function fnOnlyReturnsParam(fd: i32): boolean {
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || f.fnBody < 0 { return false }
+  const b = nodeAt(f.fnBody)
+  if !(b is Block) { return fnReadsParam(f.fnBody, f.fnParams[0]) }
+  const r = fnRetsOfParam(f.fnBody, f.fnParams[0], 0)
+  // An arrow's expression body is a block whose one statement is its value.
+  if r == 0 && b.blkStmts.length == 1 {
+    return fnReadsParam(b.blkStmts[0], f.fnParams[0])
+  }
+  return r == 1
+}
+
+// Whether `x`, parentheses peeled, names parameter `pi`.
+function fnReadsParam(x: i32, pi: i32): boolean {
+  let v = x
+  let g = 0
+  while v >= 0 && g < 64 {
+    const n = nodeAt(v)
+    if n is Paren {
+      v = n.parInner
+    } else {
+      return n is Ident && identDeclOf(v) == pi
+    }
+    g = g + 1
+  }
+  return false
+}
+
+// How the returns under `x` read parameter `pi`: 0 none, 1 each returns it, 2 one returns another.
+function fnRetsOfParam(x: i32, pi: i32, depth: i32): i32 {
+  if x < 0 || depth > 256 { return 0 }
+  const n = nodeAt(x)
+  if n is FuncDecl { return 0 }
+  if n is RetStmt {
+    return if n.retArg >= 0 && fnReadsParam(n.retArg, pi) { 1 } else { 2 }
+  }
+  let out = 0
+  for k in nodeChildren(x) {
+    const r = fnRetsOfParam(k, pi, depth + 1)
+    if r == 2 { return 2 }
+    if r == 1 { out = 1 }
+  }
+  return out
 }

@@ -4,6 +4,7 @@
 // parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
 
 import {
+  BND_ARG,
   BND_BM,
   BND_LET,
   BND_RET,
@@ -189,7 +190,6 @@ import {
   CV_BM,
   CV_LET,
   CV_RET,
-  argCstr,
   cstrOwnerTop,
   cvNow,
   cvPick,
@@ -334,6 +334,7 @@ import { boolForNumberNote, letAssignMsg } from "./check_mismatch_notes"
 import { narConvListDelivery, narListDeliveryErr } from "./check_narrow_flow"
 import { crFnEnter, pushScope } from "./check_narrow_paths"
 import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
+import { declIsExportedFn } from "./check_exp_obs"
 import { fsbArgsFit, fsbBindParams } from "./check_node_rules"
 import {
   nodeTyIx,
@@ -422,6 +423,7 @@ import {
   substNestDeclSet,
   substNestMode,
   substNestModeSet,
+  substSelfOwnerSet,
   tyVarsOfEnclosingGeneric,
 } from "./check_subst"
 import {
@@ -779,33 +781,12 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   const callee = fsbOwnerCallee(o)
   cstrOwnedStrictSet(o >= 0)
   adoptHoleLitArgs(nm, ty, callee, fsbCallHNames[c], fsbCallHNode[c])
-  validateBinCstrs(
-    nm,
-    ty,
-    ix,
-    callee,
-    who,
-    fsbCallHNames[c],
-    fsbCallHNo[c],
-    fsbCallHNode[c],
-  )
-  validatePrintCstrs(nm, ty, ix, callee, who)
-  validateArrDefCstrs(nm, ty, ix, callee, who)
-  validateIsCstrs(nm, ty, ix, callee, who)
-  validateArgCstrs(nm, ty, ix, callee, fsbCallHNames[c], fsbCallHNode[c])
-  validateRetCstrs(nm, ty, ix, callee, who)
-  validateLetCstrs(nm, ty, ix, callee, who)
-  validateBmCstrs(nm, ty, ix, callee, who)
-  validateMemCstrs(
-    nm,
-    ty,
-    ix,
-    callee,
-    who,
-    fsbCallHNames[c],
-    fsbCallHNo[c],
-    fsbCallHNode[c],
-  )
+  const at = solvePlain(nm, ty, ix, callee, who)
+  at.hNames = fsbCallHNames[c]
+  at.hArgNo = fsbCallHNo[c]
+  at.hArgNode = fsbCallHNode[c]
+  at.kinds = SS_ALL - (1 << SS_NEST) - (1 << SS_UFCS)
+  ifaceSolveAt(at, SS_BIN, SS_UFCS)
   cstrOwnedStrictSet(false)
   substNestModeSet(modeWas)
   substNestDeclSet(declWas)
@@ -1325,6 +1306,143 @@ function ctnDeliveredDeclOf(ix: i32): i32 {
   return out
 }
 
+// The steps of a call's solve, in the order every caller asks them; a mask bit per step.
+export const SS_BIN = 0
+export const SS_PRINT = 1
+export const SS_ARRDEF = 2
+export const SS_NEST = 3
+export const SS_IS = 4
+export const SS_ARG = 5
+export const SS_RET = 6
+export const SS_LET = 7
+export const SS_BM = 8
+export const SS_MEM = 9
+export const SS_UFCS = 10
+export const SS_ALL = 2047
+
+// What one call's solve reads: the bindings (`rNames`/`rTys` for the declared return), the call,
+// the callee and its spelling, the hole arguments, the steps it takes (`kinds`, a mask over `SS_*`),
+// and, when `toggles`, the `substSelfOwner` its bin, let and ufcs steps (`selfOwner`) and its arg
+// step (`argOwner`) run under, restored to `ownerWas` after each.
+export type SolveAt = {
+  bNames: string[],
+  bTys: i32[],
+  rNames: string[],
+  rTys: i32[],
+  ix: i32,
+  callee: i32,
+  who: string,
+  hNames: string[],
+  hArgNo: i32[],
+  hArgNode: i32[],
+  kinds: i32,
+  toggles: boolean,
+  selfOwner: string,
+  argOwner: string,
+  ownerWas: string,
+}
+
+// Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order.
+export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
+  let st = from
+  while st <= to {
+    if (at.kinds & (1 << st)) != 0 { solveStep(at, st) }
+    st = st + 1
+  }
+  return 0
+}
+
+// One step of `ifaceSolveAt`.
+function solveStep(at: SolveAt, st: i32) {
+  if st == SS_BIN {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    validateBinCstrs(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.who,
+      at.hNames,
+      at.hArgNo,
+      at.hArgNode,
+    )
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  } else if st == SS_PRINT {
+    validatePrintCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_ARRDEF {
+    validateArrDefCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_NEST {
+    validateNestCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_IS {
+    validateIsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_ARG {
+    if at.toggles { substSelfOwnerSet(at.argOwner) }
+    validateArgCstrs(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.hNames,
+      at.hArgNode,
+    )
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  } else if st == SS_RET {
+    validateRetCstrs(at.rNames, at.rTys, at.ix, at.callee, at.who)
+  } else if st == SS_LET {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    validateLetCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  } else if st == SS_BM {
+    validateBmCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_MEM {
+    validateMemCstrs(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.who,
+      at.hNames,
+      at.hArgNo,
+      at.hArgNode,
+    )
+  } else if st == SS_UFCS {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    validateUfcsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  }
+  return 0
+}
+
+// A solve of every step for a call with no hole arguments and no owner toggles.
+export function solvePlain(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  callee: i32,
+  who: string,
+): SolveAt {
+  const noN: string[] = []
+  const noNo: i32[] = []
+  const noNode: i32[] = []
+  return {
+    bNames: bNames,
+    bTys: bTys,
+    rNames: bNames,
+    rTys: bTys,
+    ix: ix,
+    callee: callee,
+    who: who,
+    hNames: noN,
+    hArgNo: noNo,
+    hArgNode: noNode,
+    kinds: SS_ALL,
+    toggles: false,
+    selfOwner: "",
+    argOwner: "",
+    ownerWas: "",
+  }
+}
+
 // Every constraint `owner`'s body deferred, adjudicated at the bindings `bNames`/`bTys` and
 // reported at `srcExpr`, as a direct call of `who` reports them.
 function declCstrsAtBinding(
@@ -1334,20 +1452,9 @@ function declCstrsAtBinding(
   owner: i32,
   who: string,
 ) {
-  const noN: string[] = []
-  const noNo: i32[] = []
-  const noNode: i32[] = []
-  validateBinCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
-  validatePrintCstrs(bNames, bTys, srcExpr, owner, who)
-  validateArrDefCstrs(bNames, bTys, srcExpr, owner, who)
-  validateNestCstrs(bNames, bTys, srcExpr, owner, who)
-  validateArgCstrs(bNames, bTys, srcExpr, owner, noN, noNode)
-  validateRetCstrs(bNames, bTys, srcExpr, owner, who)
-  validateLetCstrs(bNames, bTys, srcExpr, owner, who)
-  validateBmCstrs(bNames, bTys, srcExpr, owner, who)
-  validateMemCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
-  validateUfcsCstrs(bNames, bTys, srcExpr, owner, who)
-  return 0
+  const at = solvePlain(bNames, bTys, srcExpr, owner, who)
+  at.kinds = SS_ALL - (1 << SS_IS)
+  return ifaceSolveAt(at, SS_BIN, SS_UFCS)
 }
 
 // A top-level function `decl` with un-annotated parameters, named at `srcExpr` and typed
@@ -2220,7 +2327,7 @@ function argCstrFitsAt(
   hNames: string[],
   hArgNode: i32[],
 ) {
-  const form = argCstr.form[ci]
+  const form = bndAt(BND_ARG, ci).c
   if form <= 0 { return argCstrFits(rat, rexp, form) }
   const org = holeArgOriginNode(ci, hNames, hArgNode)
   if org < 0 { return argCstrFits(rat, rexp, form) }
@@ -2284,10 +2391,14 @@ export function holeLambdaSeedTy(
   if !(hv is TyVar) { return -1 }
   let got = -1
   let ci = 0
-  while ci < argCstr.at.length {
-    const mine = calleeFn < 0 || argCstr.fn[ci] == calleeFn
-    if argCstr.form[ci] > 0 && mine && tyVarNamed(argCstr.at[ci], hv.tvName) {
-      const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+  while ci < bndCount(BND_ARG) {
+    const mine = calleeFn < 0 || bndAt(BND_ARG, ci).fn == calleeFn
+    if (
+      bndAt(BND_ARG, ci).c > 0
+      && mine
+      && tyVarNamed(bndAt(BND_ARG, ci).on, hv.tvName)
+    ) {
+      const rexp = substTyDeep(bndAt(BND_ARG, ci).a, bNames, bTys)
       if rexp >= 0 && !tyHasHole(rexp) && tyAt(rexp) is TyFunc {
         if got >= 0 && !tySame(got, rexp) { return -1 }
         got = rexp
@@ -2340,28 +2451,28 @@ function holeFnArgRetTy(
 ): i32 {
   let got = -1
   let ci = 0
-  while ci < argCstr.at.length {
+  while ci < bndCount(BND_ARG) {
     if (
-      argCstr.form[ci] == ACF_PLAIN
-      && argCstr.fn[ci] == calleeFn
-      && tyVarNamed(argCstr.at[ci], hole)
-      && fnRetIsUnion(argCstr.exp[ci])
-      && closed == !tyHasTyVar(argCstr.exp[ci])
+      bndAt(BND_ARG, ci).c == ACF_PLAIN
+      && bndAt(BND_ARG, ci).fn == calleeFn
+      && tyVarNamed(bndAt(BND_ARG, ci).on, hole)
+      && fnRetIsUnion(bndAt(BND_ARG, ci).a)
+      && closed == !tyHasTyVar(bndAt(BND_ARG, ci).a)
     ) {
       if closed {
-        if got >= 0 && !tySame(got, argCstr.exp[ci]) { return -2 }
-        got = argCstr.exp[ci]
+        if got >= 0 && !tySame(got, bndAt(BND_ARG, ci).a) { return -2 }
+        got = bndAt(BND_ARG, ci).a
         ci = ci + 1
         continue
       }
       const uNames: string[] = []
       const uTys: i32[] = []
-      bindGenFnRetUnionArm(argCstr.exp[ci], at, uNames, uTys, false)
+      bindGenFnRetUnionArm(bndAt(BND_ARG, ci).a, at, uNames, uTys, false)
       if uNames.length == 0 && !fnRetIsNull(at) {
-        bindGenWalk(argCstr.exp[ci], at, uNames, uTys)
+        bindGenWalk(bndAt(BND_ARG, ci).a, at, uNames, uTys)
       }
       if uNames.length > 0 {
-        const dst = substTyDeep(argCstr.exp[ci], uNames, uTys)
+        const dst = substTyDeep(bndAt(BND_ARG, ci).a, uNames, uTys)
         if dst >= 0 && !tyHasTyVar(dst) {
           if got >= 0 && !tySame(got, dst) { return -2 }
           got = dst
@@ -2385,14 +2496,16 @@ export function holeLambdaDefers(
   const hv = tyAt(holeTy)
   if !(hv is TyVar) { return false }
   let ci = 0
-  while ci < argCstr.at.length {
+  while ci < bndCount(BND_ARG) {
     if (
-      argCstr.form[ci] > 0
-      && argCstr.fn[ci] == calleeFn
-      && tyVarNamed(argCstr.at[ci], hv.tvName)
+      bndAt(BND_ARG, ci).c > 0
+      && bndAt(BND_ARG, ci).fn == calleeFn
+      && tyVarNamed(bndAt(BND_ARG, ci).on, hv.tvName)
     ) {
-      const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
-      if rexp != argCstr.exp[ci] && hdKindIs(rexp, HD_PARAM) { return true }
+      const rexp = substTyDeep(bndAt(BND_ARG, ci).a, bNames, bTys)
+      if rexp != bndAt(BND_ARG, ci).a && hdKindIs(rexp, HD_PARAM) {
+        return true
+      }
     }
     ci = ci + 1
   }
@@ -2418,12 +2531,19 @@ function validateCompArgCstr(
 ) {
   if tyHasHole(rexp) || tyHasHole(rat) { return 0 }
   if prbArmed { prbEnter() }
-  const ok = litPinAssignable(argCstr.node[ci], rat, rexp, bNames, bTys, true)
+  const ok = litPinAssignable(
+    bndAt(BND_ARG, ci).site,
+    rat,
+    rexp,
+    bNames,
+    bTys,
+    true,
+  )
   if prbArmed { prbLeave("validateCompArgCstr") }
   if !ok { return argFlowErr(rat, rexp, ci, ix) }
   // A held list read by name meets the container rule the direct spelling raises, which the quiet
   // re-check above skips; a fresh list (a call, a literal) converts as it does there (D3402).
-  const an = argCstr.node[ci]
+  const an = bndAt(BND_ARG, ci).site
   const held = an >= 0 && nodeAt(parenPeelIx(an)) is Ident
   if !inferQuiet && held && objShapeAdapterlessAt(an, rat, rexp) {
     objShapeAdapterlessErr(an, rat, rexp)
@@ -2435,23 +2555,23 @@ function validateCompArgCstr(
 // bindings: still open, it moves out to the caller's pin; closed, every function the call may
 // run is judged at those types (D13782).
 function validateChoiceCstr(ci: i32, rat: i32, calleeFn: i32) {
-  if ci < 0 || ci >= argCstr.at.length || rat < 0 { return 0 }
+  if ci < 0 || ci >= bndCount(BND_ARG) || rat < 0 { return 0 }
   if tyHasTyVar(rat) {
-    if calleeFn >= 0 && rat != argCstr.at[ci] {
+    if calleeFn >= 0 && rat != bndAt(BND_ARG, ci).on {
       noteArgCstrAt(
         rat,
         rat,
-        argCstr.who[ci],
+        bndAt(BND_ARG, ci).s,
         ACF_CHOICE,
-        argCstr.node[ci],
-        argCstr.call[ci],
+        bndAt(BND_ARG, ci).site,
+        bndAt(BND_ARG, ci).b,
       )
     }
     return 0
   }
   const ft = tyAt(rat)
   if !(ft is TyFunc) { return 0 }
-  holeLetWritesDisagreeAtCall(argCstr.node[ci], ft.fnParamTypes)
+  holeLetWritesDisagreeAtCall(bndAt(BND_ARG, ci).site, ft.fnParamTypes)
   return 0
 }
 
@@ -2467,8 +2587,8 @@ function argCstrFixedErr(
   bNames: string[],
   bTys: i32[],
 ): boolean {
-  const r = hdRowOf(argCstr.exp[ci])
-  const base = if r >= 0 && argCstr.form[ci] > 0 { hdBase[r] } else { -1 }
+  const r = hdRowOf(bndAt(BND_ARG, ci).a)
+  const base = if r >= 0 && bndAt(BND_ARG, ci).c > 0 { hdBase[r] } else { -1 }
   const bt = if base >= 0 && base < T.tys.length { tyAt(base) } else { null }
   // An un-annotated parameter's hole (`?f.0`) keeps the direct spelling's refusal at the call.
   if !(bt is TyVar) || bt.tvName.length == 0 || bt.tvName[0] == "?"[0] {
@@ -2498,7 +2618,7 @@ function argCstrFixedErr(
           + "` with `"
           + tyToStr(widenLitTy(rat))
           + "` (line "
-          + i32ToStr(nodeLineOf(argCstr.call[ci]))
+          + i32ToStr(nodeLineOf(bndAt(BND_ARG, ci).b))
           + "); "
           + who
           + " takes `"
@@ -2525,55 +2645,55 @@ export function validateArgCstrs(
   hNames: string[],
   hArgNode: i32[],
 ) {
-  const nOrig = argCstr.at.length
   const cvWas = cvNow
-  let ci = 0
-  while ci < nOrig {
+  const n = bndCount(BND_ARG)
+  let ci = bndNextRow(BND_ARG, calleeFn, -1, n)
+  while ci < n {
     if (
-      !cstrOwnedBy(argCstr.fn[ci], calleeFn)
-      || gnotDeadAtPin(argCstr.at[ci], bNames, bTys)
+      !cstrOwnedBy(bndAt(BND_ARG, ci).fn, calleeFn)
+      || gnotDeadAtPin(bndAt(BND_ARG, ci).on, bNames, bTys)
     ) {
-      ci = ci + 1
+      ci = bndNextRow(BND_ARG, calleeFn, ci, n)
       continue
     }
     cvNow = cvPick(CV_ARG, ci, cvWas)
-    const rat = substTyDeep(argCstr.at[ci], bNames, bTys)
-    const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+    const rat = substTyDeep(bndAt(BND_ARG, ci).on, bNames, bTys)
+    const rexp = substTyDeep(bndAt(BND_ARG, ci).a, bNames, bTys)
     // Two type parameters an outer generic's own parameters substitute to stay apart for its pin.
     if (
       calleeFn >= 0
-      && rat != argCstr.at[ci]
+      && rat != bndAt(BND_ARG, ci).on
       && tyParamsApartIn(rat, rexp, cstrOwnerTop())
     ) {
       noteArgCstrAt(
         rat,
         rexp,
-        argCstr.who[ci],
-        argCstr.form[ci],
-        argCstr.node[ci],
-        argCstr.call[ci],
+        bndAt(BND_ARG, ci).s,
+        bndAt(BND_ARG, ci).c,
+        bndAt(BND_ARG, ci).site,
+        bndAt(BND_ARG, ci).b,
       )
     }
-    if argCstr.form[ci] == ACF_COMP {
+    if bndAt(BND_ARG, ci).c == ACF_COMP {
       validateCompArgCstr(ci, rat, rexp, bNames, bTys, ix)
-      ci = ci + 1
+      ci = bndNextRow(BND_ARG, calleeFn, ci, n)
       continue
     }
-    if argCstr.form[ci] == ACF_CHOICE {
+    if bndAt(BND_ARG, ci).c == ACF_CHOICE {
       validateChoiceCstr(ci, rat, calleeFn)
-      ci = ci + 1
+      ci = bndNextRow(BND_ARG, calleeFn, ci, n)
       continue
     }
-    if rat != argCstr.at[ci] && calleeFn >= 0 {
+    if rat != bndAt(BND_ARG, ci).on && calleeFn >= 0 {
       if tyIsHole(rat) || tyIsDeferredJoin(rat) {
         if !tyIsHole(rexp) {
           noteArgCstrAt(
             rat,
             rexp,
-            argCstr.who[ci],
-            argCstr.form[ci],
+            bndAt(BND_ARG, ci).s,
+            bndAt(BND_ARG, ci).c,
             -1,
-            argCstr.call[ci],
+            bndAt(BND_ARG, ci).b,
           )
         }
       }
@@ -2582,20 +2702,20 @@ export function validateArgCstrs(
     // argument, whichever side this call resolved.
     if (
       (calleeFn >= 0 || calleeFn == CSTR_NODECL)
-      && argCstr.form[ci] > 0
+      && bndAt(BND_ARG, ci).c > 0
       && hdKindIs(rexp, HD_PARAM)
     ) {
-      if rat != argCstr.at[ci] || rexp != argCstr.exp[ci] {
+      if rat != bndAt(BND_ARG, ci).on || rexp != bndAt(BND_ARG, ci).a {
         let mvNode = -1
         if !tyIsHole(rat) { mvNode = holeArgOriginNode(ci, hNames, hArgNode) }
         if mvNode >= 0 && !inferQuiet { holeLitMovedSet(parenPeelIx(mvNode)) }
         noteArgCstrAt(
           rat,
           rexp,
-          argCstr.who[ci],
-          argCstr.form[ci],
+          bndAt(BND_ARG, ci).s,
+          bndAt(BND_ARG, ci).c,
           mvNode,
-          argCstr.call[ci],
+          bndAt(BND_ARG, ci).b,
         )
       }
     }
@@ -2605,9 +2725,9 @@ export function validateArgCstrs(
       // A declared generic's parameter, a bare variable among them, is asked at the argument as
       // its direct call asks it.
       const gWant = holeGenericParamAt(
-        argCstr.exp[ci],
+        bndAt(BND_ARG, ci).a,
         rat,
-        argCstr.node[ci],
+        bndAt(BND_ARG, ci).site,
         calleeFn,
         bNames,
         bTys,
@@ -2628,7 +2748,7 @@ export function validateArgCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_ARG, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -2638,23 +2758,26 @@ export function validateArgCstrs(
 // to the caller's hole it substitutes to: `validateArgCstrs`'s move for a list element other
 // than the one the call is typed at, judging nothing (D12701).
 export function moveElemArgCstrs(bNames: string[], bTys: i32[], calleeFn: i32) {
-  const nOrig = argCstr.at.length
+  const nOrig = bndCount(BND_ARG)
   let ci = 0
   while ci < nOrig {
-    if cstrOwnedBy(argCstr.fn[ci], calleeFn) && argCstr.form[ci] > 0 {
-      const rat = substTyDeep(argCstr.at[ci], bNames, bTys)
-      const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+    if (
+      cstrOwnedBy(bndAt(BND_ARG, ci).fn, calleeFn)
+      && bndAt(BND_ARG, ci).c > 0
+    ) {
+      const rat = substTyDeep(bndAt(BND_ARG, ci).on, bNames, bTys)
+      const rexp = substTyDeep(bndAt(BND_ARG, ci).a, bNames, bTys)
       if (
         hdKindIs(rexp, HD_PARAM)
-        && (rat != argCstr.at[ci] || rexp != argCstr.exp[ci])
+        && (rat != bndAt(BND_ARG, ci).on || rexp != bndAt(BND_ARG, ci).a)
       ) {
         noteArgCstrAt(
           rat,
           rexp,
-          argCstr.who[ci],
-          argCstr.form[ci],
+          bndAt(BND_ARG, ci).s,
+          bndAt(BND_ARG, ci).c,
           -1,
-          argCstr.call[ci],
+          bndAt(BND_ARG, ci).b,
         )
       }
     }
@@ -2676,8 +2799,11 @@ export function adoptHoleLitArgs(
   if calleeFn < 0 && calleeFn != CSTR_NODECL { return 0 }
   const done: string[] = []
   let ci = 0
-  while ci < argCstr.at.length {
-    if argCstr.form[ci] > 0 && cstrOwnedBy(argCstr.fn[ci], calleeFn) {
+  while ci < bndCount(BND_ARG) {
+    if (
+      bndAt(BND_ARG, ci).c > 0
+      && cstrOwnedBy(bndAt(BND_ARG, ci).fn, calleeFn)
+    ) {
       adoptHoleLitArg(ci, bNames, bTys, calleeFn, hNames, hArgNode, done)
     }
     ci = ci + 1
@@ -2697,13 +2823,13 @@ function adoptHoleLitArg(
   hArgNode: i32[],
   done: string[],
 ) {
-  const at = argCstr.at[ci]
+  const at = bndAt(BND_ARG, ci).on
   if at < 0 || at >= T.tys.length { return 0 }
   const hv = tyAt(at)
-  const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+  const rexp = substTyDeep(bndAt(BND_ARG, ci).a, bNames, bTys)
   if !(hv is TyVar) {
     if calleeFn < 0 { return 0 }
-    const mv = argCstr.node[ci]
+    const mv = bndAt(BND_ARG, ci).site
     if mv < 0 || !holeLitMovedHas(parenPeelIx(mv)) { return 0 }
     const mvLit = nodeAt(parenPeelIx(mv))
     if !(mvLit is ArrayLit || mvLit is ObjLit) { return 0 }
@@ -3278,7 +3404,7 @@ export function validateLetCstrs(
 
 // Whether the deferred builtin-method-argument constraints this binding resolves hold — the
 // twin of `validateLetCstrs` for a `.push`/`.set`/`.add` argument rather than an assignment
-// (D582 is why `argCstr*` cannot serve this position). Same re-deferral rule, gated on either
+// (D582 is why `BND_ARG` cannot serve this position). Same re-deferral rule, gated on either
 // side; the message is the arm's own (`bmArgMsg`), verbatim, with the attribution appended.
 export function validateBmCstrs(
   bNames: string[],
@@ -4126,9 +4252,12 @@ export function fvaMakerCallRows() {
   const sigAt: {[i32]: i32} = Map()
   const callOfBind: {[i32]: i32} = Map()
   const calleeReads: {[i32]: boolean} = Map()
+  const rl = fvaRelayScanNew()
   let ix = 0
   while ix < P.nodes.length {
     const n = nodeAt(ix)
+    // Every relay is registered, called or not: a call one returns is no delivery of its own.
+    if n is FuncDecl && fvaRelayMemo(rl, ix) { rl.any = true }
     if n is Call && n.callFn >= 0 {
       const r = parenPeelIx(n.callFn)
       const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
@@ -4170,8 +4299,14 @@ export function fvaMakerCallRows() {
       const mc = callOfBind.get(d) ?? -1
       if d != ix && mc >= 0 { sigAt[mc] = -1 }
     }
+    if rl.any { fvaRelayNote(rl, ix) }
     ix = ix + 1
   }
+  // So does a relay read other than as a callee.
+  for r in rl.reads {
+    if !(rl.calleeOf.get(r) ?? false) { rl.handedOn[identDeclOf(r)] = true }
+  }
+  fvaRelayRows(sigAt, rl)
   for mc in sigAt.keys() {
     const sig = sigAt.get(mc) ?? -1
     const c = nodeAt(mc)
@@ -4184,6 +4319,179 @@ export function fvaMakerCallRows() {
     }
   }
   return fvaMakerCoverCheck()
+}
+
+// Whether `d` relays a maker: a maker by signature (`fvaIsMaker`) every returned value of which is
+// a call of another such function, so its result is that call's, handed on whole.
+function fvaIsRelay(d: i32): boolean {
+  if !fvaIsMaker(d) || fvaRetsNamed(d) { return false }
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length == 0 { return false }
+  for r in rets {
+    const x = parenPeelIx(r)
+    const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if !(c is Call) || c.callFn < 0 { return false }
+    const m = calleeFnOfDecl(identDeclOf(parenPeelIx(c.callFn)))
+    if m == d || !fvaIsMaker(m) { return false }
+  }
+  return true
+}
+
+// The callee reads of the maker calls an unreachable relay returns: its body never runs, so they
+// ask for no instance (D16757). Rebuilt by each `fvaMakerCallRows`.
+let fvaDeadReads: {[i32]: boolean} = Map()
+
+// What `fvaMakerCallRows`'s node walks gather about relays: whether there is one, which
+// declarations are relays (memo), each call of one and its callee read, every read naming one,
+// and the relays read other than as a callee.
+type FvaRelayScan = {
+  any: boolean,
+  memo: {[i32]: boolean},
+  calls: i32[],
+  reads: i32[],
+  calleeOf: {[i32]: boolean},
+  handedOn: {[i32]: boolean},
+}
+
+function fvaRelayScanNew(): FvaRelayScan {
+  return {
+    any: false,
+    memo: Map(),
+    calls: [],
+    reads: [],
+    calleeOf: Map(),
+    handedOn: Map(),
+  }
+}
+
+// Whether `d` is a function declaration: a relay is read by its own name, and an alias of one
+// reads it as a value where the alias is bound.
+function fvaIsFnDecl(d: i32): boolean {
+  return d >= 0 && d < P.nodes.length && nodeAt(d) is FuncDecl
+}
+
+// Notes node `ix` for the relay rows: a call of a relay, with its callee read, or a read naming one.
+function fvaRelayNote(rl: FvaRelayScan, ix: i32) {
+  const n = nodeAt(ix)
+  if n is Call && n.callFn >= 0 {
+    const r = parenPeelIx(n.callFn)
+    const d = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+    if fvaIsFnDecl(d) && fvaRelayMemo(rl, d) {
+      rl.calls.push(ix)
+      rl.calleeOf[r] = true
+    }
+  } else if n is Ident {
+    const d = identDeclOf(ix)
+    if d != ix && fvaIsFnDecl(d) && fvaRelayMemo(rl, d) { rl.reads.push(ix) }
+  }
+  return 0
+}
+
+// Whether `d` is a relay, asked once per declaration.
+function fvaRelayMemo(rl: FvaRelayScan, d: i32): boolean {
+  if d < 0 { return false }
+  const had = rl.memo.get(d)
+  if had != null { return had }
+  const r = fvaIsRelay(d)
+  rl.memo[d] = r
+  return r
+}
+
+// Each maker call a relay returns is reached at the one closed result every call of the relay is
+// delivered at, through chains of relays; a relay read other than as such a call, or delivered at
+// two results, reaches none (D16710).
+function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
+  const innerOf: {[i32]: i32} = Map()
+  const relays: i32[] = []
+  for d in rl.memo.keys() {
+    const fn = nodeAt(d)
+    if (rl.memo.get(d) ?? false) && fn is FuncDecl {
+      relays.push(d)
+      const rets: i32[] = []
+      collectRetValues(fn.fnBody, rets)
+      for r in rets { innerOf[parenPeelIx(r)] = d }
+    }
+  }
+  fvaDeadReads = Map()
+  if relays.length == 0 { return 0 }
+  fvaRelayDeadReads(rl, relays, innerOf)
+  // Each relay's result, from its calls outside every relay's returns.
+  const relaySig: {[i32]: i32} = Map()
+  for c in rl.calls {
+    const cn = nodeAt(c)
+    if cn is Call && !innerOf.has(c) {
+      const d = calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))
+      const dt = nodeCtxTyIxOf(c)
+      const closed = dt >= 0
+        && dt < T.tys.length
+        && !tyHasTyVar(dt)
+        && tyAt(dt) is TyFunc
+      fvaReachSig(relaySig, d, if closed { dt } else { -1 })
+    }
+  }
+  for d in rl.handedOn.keys() { relaySig[d] = -1 }
+  // A relay called from another relay's return takes that relay's result too. Each result only
+  // moves from none to one to conflicting, so one pass per relay settles every chain.
+  let pass = 0
+  while pass < relays.length {
+    for c in innerOf.keys() {
+      const cn = nodeAt(c)
+      const from = relaySig.get(innerOf.get(c) ?? -1) ?? -2
+      if cn is Call && from > -2 {
+        const d = calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))
+        if rl.memo.get(d) ?? false { fvaReachSig(relaySig, d, from) }
+      }
+    }
+    pass = pass + 1
+  }
+  for c in innerOf.keys() {
+    const s = relaySig.get(innerOf.get(c) ?? -1) ?? -1
+    if s >= 0 && fvaOpenMakerCall(c) >= 0 {
+      const at = fvaMakerResultAt(c, s)
+      fvaReachSig(sigAt, c, if at >= 0 && assignable(at, s) { s } else { -1 })
+    }
+  }
+  return 0
+}
+
+// Notes in `fvaDeadReads` the maker reads of each relay nothing can run: not exported, not read as
+// a value, and called only from the returns of relays nothing can run.
+function fvaRelayDeadReads(
+  rl: FvaRelayScan,
+  relays: i32[],
+  innerOf: {[i32]: i32},
+) {
+  const live: {[i32]: boolean} = Map()
+  for d in relays {
+    if declIsExportedFn(d) || (rl.handedOn.get(d) ?? false) { live[d] = true }
+  }
+  // A call outside every relay's return makes its relay live; one inside a live relay's return
+  // does too. Each pass adds a relay or settles, so one pass per relay is enough.
+  let pass = 0
+  while pass <= relays.length {
+    for c in rl.calls {
+      const cn = nodeAt(c)
+      const from = innerOf.get(c) ?? -1
+      if cn is Call && (from < 0 || (live.get(from) ?? false)) {
+        live[calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))] = true
+      }
+    }
+    pass = pass + 1
+  }
+  for c in innerOf.keys() {
+    const cn = nodeAt(c)
+    if (
+      cn is Call
+      && !(live.get(innerOf.get(c) ?? -1) ?? false)
+      && fvaOpenMakerCall(c) >= 0
+    ) {
+      fvaDeadReads[parenPeelIx(cn.callFn)] = true
+    }
+  }
+  return 0
 }
 
 // Records closed result `sig` (-1 for none) as one maker call `mc`'s reach asks for; two that
@@ -4291,6 +4599,7 @@ function fvaMakerCoverCheck() {
 // Whether maker read `r` takes an instance: the callee of a call noted at a closed result, or a
 // value delivered at a closed function type.
 function fvaMakerReadCovered(r: i32): boolean {
+  if fvaDeadReads.get(r) ?? false { return true }
   const dt = nodeCtxTyIxOf(r)
   if dt >= 0 && dt < T.tys.length && !tyHasTyVar(dt) && tyAt(dt) is TyFunc {
     return true
