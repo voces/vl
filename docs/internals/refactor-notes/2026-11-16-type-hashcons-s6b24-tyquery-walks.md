@@ -20,3 +20,7 @@ caller, `fsbTvsInScope`'s included. Every caller passed the full budget.
 - `regress.vl`: 0 `runs → not-runs`, 0 → silent.
 - Capability matrix A/B over the 23 recursive, tree and self templates: 0 `runs → not-runs`.
 - `tests/vl_scaling_shape_test.ts`: 90 of 90.
+- Self-compile fuel: the first cut of `tyTvsAmong` cost +1.3% (variant bisection: `tyTvsAmong` alone
+  +1.2%, `tyObjFieldIsLitUnion` alone none). The limit had answered `true` early on deep types, and the
+  visited walk walks them all. `tyTvsAmong` now answers `true` at once for a type naming no variable,
+  which `tyHasTyVar` answers from its memo. Fuel −0.6% on the baseline, against master's −0.1%.
