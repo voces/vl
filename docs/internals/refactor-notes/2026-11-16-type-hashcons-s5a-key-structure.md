@@ -43,7 +43,7 @@ by one; inside `emit_mono.vl` it raises nothing.
 | guest fuel, fixed input (master's `compiler/entry.vl`) | 90,515,719,017 → 90,515,719,085 (+68 units). The registry scan was not hot in the self-compile |
 | render-parse budget | ok, unchanged |
 | phase-state census | ok, unchanged |
-| net compiler lines | +12 (`emit_mono.vl`): the map and its two helpers, the three new key fields and `exEnd`'s sum, less the two scanning loops |
+| net compiler lines | −1 (`emit_mono.vl`, +102 −103, most of it the registry lookup's body dedented): the map and `monoKeyPush`, the three new key fields and `exEnd`'s sum, less the two scanning loops; `monoKeyExactCanon` folds into its one caller, so `emit_mono.vl`'s function count stays 908 (pin-helper budget) |
 | pin helpers (`emit_mono.vl`) | 908 → 908 |
 
 ## What stage 5 still has
