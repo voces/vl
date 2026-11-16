@@ -36,6 +36,13 @@ instance's after the elaboration).
 | `return 0` | builds | builds | builds |
 | `return x.length` | builds | builds | builds |
 
+- The exclusion covers the retry's refusal too. A second draft excluded hand-backs from the reading
+  but still counted the holder refusal at that call as the facts refusing. The late decision then
+  tagged the set through the hand-back, and the probe failed a program master runs. The capability
+  matrix caught it (`hole-fn-list-of-two-results-below-generic-arg-top`, `handed_and_called`, both
+  faces). It is now pinned as `closures/hole-fn-record-list-handed-back-then-called-two-orders.vl`,
+  which prints `4` then `1.5`.
+
 ## Narrowing
 
 In the retry, a literal handed to a hole parameter that the holder test still refuses counts as the
