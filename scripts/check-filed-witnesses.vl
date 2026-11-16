@@ -129,6 +129,9 @@ const TRAP_MARKERS = [
 ]
 // The banner `vl run` prints before a trap inside the compiler itself.
 const COMPILER_TRAPPED = "the compiler itself trapped"
+// The native host's own refusal of an extern function it does not provide: the host, not this
+// grader, says which externs exist, so a program it CAN load still grades.
+const HOST_LACKS = "is declared but this host does not provide it"
 
 function anyIn(s: string, needles: string[]): boolean {
   for n in needles {
@@ -325,6 +328,13 @@ function classifyRun(dir: string, f: string): Ran {
   if contains(err, "emit error") {
     return { outcome: "emit_reject", detail: detail, stdout: "" }
   }
+  if contains(err, HOST_LACKS) {
+    return {
+      outcome: "host_lacks_extern",
+      detail: externNamed(err),
+      stdout: "",
+    }
+  }
   // Without the compiler-trap banner, a run error naming an invalid module or a trap
   // already decides the row; only the rest need `vl build` to say if a module was written.
   if !contains(err, COMPILER_TRAPPED) {
@@ -348,6 +358,14 @@ function classifyRun(dir: string, f: string): Ran {
     return { outcome: "trap_loads", detail: detail, stdout: "" }
   }
   return { outcome: "silent_invalid_wasm", detail: detail, stdout: "" }
+}
+
+// The extern the host's refusal `err` names (`extern function `exit` is declared ...`), or "?".
+function externNamed(err: string): string {
+  const parts = split(err, "extern function `")
+  if parts.length < 2 { return "?" }
+  const name = split(parts[1], "`")[0]
+  return if name != "" { name } else { "?" }
 }
 
 // Leave `r` for `dir` in three files beside its witness.
@@ -912,6 +930,10 @@ function normOutput(text: string): string {
 // The outcome to compare with `want`, or an empty outcome and the reason it is ungradeable.
 type Verdict = { got: string, why: string }
 
+// The prefix of a row's reason when the native host lacks one of its witness's externs. Such a
+// row is listed but does not fail `--strict`: no witness this host can load would grade it.
+const EXTERN_WHY = "extern: "
+
 function grade(
   status: string,
   repro: string,
@@ -921,6 +943,14 @@ function grade(
   ran: Ran,
 ): Verdict {
   if ran.outcome == "timed_out" { return { got: "", why: ran.detail } }
+  if ran.outcome == "host_lacks_extern" {
+    return {
+      got: "",
+      why: EXTERN_WHY
+        + ran.detail
+        + " — the native host does not provide it; grade it on a host that does",
+    }
+  }
   if ran.outcome == "witness_unparsed" {
     if !namesParseError(status) {
       return {
@@ -1235,11 +1265,15 @@ function mainReport(
       )
     }
   }
-  if ungradable.length > 0 && strict {
+  const blocking: Graded[] = []
+  for g in ungradable {
+    if !startsWith(g.why, EXTERN_WHY) { blocking.push(g) }
+  }
+  if blocking.length > 0 && strict {
     print(
       "\nRows this cannot grade - a filed row must carry a witness the checker RUNS:",
     )
-    for g in ungradable {
+    for g in blocking {
       print(
         "  \{g.row.doc}:\{toString(g.row.line)}  \{g.row.id} - \{g.row.title}",
       )
@@ -1255,7 +1289,7 @@ function mainReport(
       "      a defect reachable only under a change that was REFUSED is a refutation pin: file the program that must keep RUNNING, with the status `runs today and must keep running`.",
     )
     let stopped = false
-    for g in ungradable {
+    for g in blocking {
       if endsWith(g.why, "re-run the row alone") { stopped = true }
     }
     if stopped {
@@ -1285,7 +1319,7 @@ function mainReport(
   if (
     moved.length > 0
     || unparsed.length > 0
-    || (ungradable.length > 0 && strict)
+    || (blocking.length > 0 && strict)
   ) {
     return 1
   }
@@ -1302,6 +1336,7 @@ function selfTest(): i32 {
   )
   const wants = [
     "runs", "check_reject", "trap_loads", "runs", "runs", "witness_unparsed",
+    "host_lacks_extern",
   ]
   const srcs = [
     "print(6 * 7)\n", "const x: i32 = \"nope\"\nprint(x)\n",
@@ -1309,6 +1344,7 @@ function selfTest(): i32 {
     "// file: a.vl\nexport function six(): i32 { return 6 }\n// file: main.vl\nimport { six } from \"./a\"\nprint(six() * 7)\n",
     "const xs: i32[] = [1]\nconst s = \"@@repeat(40, \"ab\")@@\"\nprint(xs[s.length - 80])\n",
     "The classifier answers only for the distinct-backing kinds, and the caller's\nbinding stays non-null: strictly worse than the refusal it replaced.\n",
+    "extern function exit(code: i32): never\nprint(1)\n",
   ]
   // Want specimens: declared outcome, repro, Want block ("-" for none), predicted grade.
   const wd = [

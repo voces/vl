@@ -4345,6 +4345,7 @@ function tsMapStructBody(keysWrap: i32) {
 // helper. The keyed structs and the shared probes mint on first ask.
 function mapShapeCompactable(sh: i32): boolean {
   if sh == -1 || sh == -4 || sh == -6 { return true }
+  if sh == -2 || sh == -5 || sh == -7 { return true }
   if sh < 0 || sh >= mvMapTypeIdx.length { return false }
   const k = mvValClassOf(sh)
   if k == MVK_STR || k == MVK_I64 || k == MVK_F64 || k == MVK_F32 {
@@ -4354,12 +4355,16 @@ function mapShapeCompactable(sh: i32): boolean {
   return r >= 0 && r < rlBackIdx.length && r < rlWrapIdx.length
 }
 
-// The map shape the `k`th compaction helper row serves: row 0 the string-keyed mono map, row 1
-// the i32-keyed one, row `2 + s` mv slot `s`, and the last row the i64-keyed one.
+// The map shape the `k`th helper row serves: row 0 the string-keyed mono map, row 1 the
+// i32-keyed one, row `2 + s` mv slot `s`, then the i64-keyed one and the three keys' Sets.
 function mapCompactRowShape(k: i32) {
   if k == 0 { return -1 }
   if k == 1 { return -4 }
-  if k == mvMapTypeIdx.length + 2 { return -6 }
+  const n = mvMapTypeIdx.length
+  if k == n + 2 { return -6 }
+  if k == n + 3 { return -2 }
+  if k == n + 4 { return -5 }
+  if k == n + 5 { return -7 }
   return k - 2
 }
 
@@ -4441,6 +4446,8 @@ type MapCompactTys = {
   valsWrap: i32,
   valsBack: i32,
   valNull: i32,
+  // A Set's `vals` is never written, so its compaction leaves it alone.
+  isSet: boolean,
 }
 
 // `__map_compact__`'s type indices for map shape `sh`, as `MapCompactTys` names them.
@@ -4479,6 +4486,7 @@ function mapCompactTysOf(sh: i32): MapCompactTys {
     valsWrap: valsWrap,
     valsBack: valsBack,
     valNull: valNull,
+    isSet: sh == -2 || sh == -5 || sh == -7,
   }
   return t
 }
@@ -4499,7 +4507,7 @@ function mapCompactSlide(t: MapCompactTys) {
   fbArrayGet(aTy())
   fbIf(64)     // live[i] != 0
   mapCompactMove(mapTy, 0, t.keysWrap, t.keysBack)
-  mapCompactMove(mapTy, 1, t.valsWrap, t.valsBack)
+  if !t.isSet { mapCompactMove(mapTy, 1, t.valsWrap, t.valsBack) }
   mapCompactMove(mapTy, 2, -1, aTy())
   if t.keyK == MAP_KEY_STR { mapCompactMove(mapTy, 6, -1, aTy()) }
   mapCompactMove(mapTy, 7, -1, ia64TypeIdx)
@@ -4697,15 +4705,17 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalSet(3)
   mapCompactSlide(t)
   mapCompactClearTail(t)
-  // keys.len = vals.len = count = j
+  // keys.len = vals.len = count = j; a Set keeps its empty vals
   fbLocalGet(0)
   fbStructGet(mapTy, 0)
   fbLocalGet(2)
   fbStructSet(t.keysWrap, 1)
-  fbLocalGet(0)
-  fbStructGet(mapTy, 1)
-  fbLocalGet(2)
-  fbStructSet(t.valsWrap, 1)
+  if !t.isSet {
+    fbLocalGet(0)
+    fbStructGet(mapTy, 1)
+    fbLocalGet(2)
+    fbStructSet(t.valsWrap, 1)
+  }
   fbLocalGet(0)
   fbLocalGet(2)
   fbStructSet(mapTy, 4)
@@ -6682,7 +6692,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpMapCompact = []
   if gMapDeletes {
     let ck = 0
-    while ck < mvMapTypeIdx.length + 3 {
+    while ck < mvMapTypeIdx.length + 6 {
       if mapShapeCompactable(mapCompactRowShape(ck)) {
         gHelpMapCompact.push(-2)
       } else {
@@ -6764,7 +6774,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   gMapSetTyBase = 0
   gMapSetFnBase = 0
   let sr = 0
-  while sr < mvMapTypeIdx.length + 3 {
+  while sr < mvMapTypeIdx.length + 6 {
     if gOptimized == 0 && mapShapeCompactable(mapCompactRowShape(sr)) {
       gMapSetTy.push(-2)
     } else {

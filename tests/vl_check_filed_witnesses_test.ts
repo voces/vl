@@ -377,10 +377,10 @@ Deno.test({
       const st = await port(["--self-test"]);
       if (
         st.code !== 0 ||
-        !st.out.includes("14 specimens · 14 routed correctly · 0 wrong")
+        !st.out.includes("15 specimens · 15 routed correctly · 0 wrong")
       ) {
         throw new Error(
-          `--self-test: want exit 0 and 14 of 14 routed, got ${st.code}:\n${st.out}`,
+          `--self-test: want exit 0 and 15 of 15 routed, got ${st.code}:\n${st.out}`,
         );
       }
 

@@ -16308,6 +16308,8 @@ function emitMapSetV(
       }
     }
   }
+  // A Set's store leaves its never-read `vals` alone, on helper rows of its own.
+  const mset = mapShapeIsSet(mapShapeOfExpr(recvIx, fnIx))
   // Receiver + key onto the operand stack; `cmSlot` pinned to the shape.
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   const mslot = cmSlot
@@ -16323,8 +16325,8 @@ function emitMapSetV(
   cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
   // A set whose value the assignment yields keeps it in the value stash.
   const park = asgParkWanted && !valConst1 && !msHelp
-  // [mapRef, key, value] are the shape's store helper's params, in order.
-  const setFn = mapSetFnOf(mslot)
+  // [mapRef, key, value] are the shape's store helper's params, in order; a Set has its own.
+  const setFn = mapSetFnOf(if mset { mapShapeOfSet(mslot) } else { mslot })
   if setFn >= 0 {
     if park { fbLocalTee(mapSetValStashLocal(mslot)) }
     fbCall(setFn)
@@ -16334,7 +16336,7 @@ function emitMapSetV(
   if setMapSetValStash(mslot) < 0 { return -1 }
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef()              // mapRef
-  const stRc = emitMapSetStore(mslot)
+  const stRc = emitMapSetStore(mslot, mset)
   if park { mapSetParked(mslot) }
   return stRc
 }
@@ -16372,20 +16374,37 @@ function mapSetFnOf(sh: i32) {
 }
 
 // The row of map shape `sh` in the per-shape helper tables: 0 the string-keyed mono map, 1 the
-// i32-keyed one, `2 + s` mv slot `s`, the last the i64-keyed one; a Set rows as its key's map.
+// i32-keyed one, `2 + s` mv slot `s`, then the i64-keyed one, then the string-, i32- and
+// i64-keyed Set, whose helpers leave its `vals` alone.
 function mapShapeRow(sh: i32) {
-  if sh == -1 || sh == -2 { return 0 }
-  if sh == -4 || sh == -5 { return 1 }
-  if sh == -6 || sh == -7 { return mvMapTypeIdx.length + 2 }
+  if sh == -1 { return 0 }
+  if sh == -4 { return 1 }
+  if sh == -6 { return mvMapTypeIdx.length + 2 }
+  if sh == -2 { return mvMapTypeIdx.length + 3 }
+  if sh == -5 { return mvMapTypeIdx.length + 4 }
+  if sh == -7 { return mvMapTypeIdx.length + 5 }
   if sh < 0 { return -1 }
   return sh + 2
+}
+
+// Whether map shape `sh` is a Set's, string-, i32- or i64-keyed.
+function mapShapeIsSet(sh: i32): boolean {
+  return sh == -2 || sh == -5 || sh == -7
+}
+
+// The Set shape over the same key as mono map shape `sh`; `sh` itself for any other shape.
+function mapShapeOfSet(sh: i32) {
+  if sh == -1 { return -2 }
+  if sh == -4 { return -5 }
+  if sh == -6 { return -7 }
+  return sh
 }
 
 // `__map_set_<row>__(m, k, v)`'s functype for map shape `sh`: the map, its key rep and the value
 // in the type a set site's value expression leaves.
 export function mapSetFuncType(sh: i32) {
   const saved = cmSlot
-  cmSlot = sh
+  cmSlot = mapShapeFoldSet(sh)
   fbFuncTypeHead(3)
   fbRefValtype(cmMapTy())
   const k = cmKeyKind()
@@ -16415,7 +16434,7 @@ export function mapSetFnBody(sh: i32): u8[] {
   const prev = wTarget(body)
   const savedSlot = cmSlot
   const savedBase = mapScratchBase
-  cmSlot = sh
+  cmSlot = mapShapeFoldSet(sh)
   wULEB(6)
   wULEB(3)
   fbValtype("i32", -1) // 3 slot, 4 cap, 5 entry
@@ -16435,7 +16454,7 @@ export function mapSetFnBody(sh: i32): u8[] {
   fbRefValtype(aTy()) // 12 liveBk, 13 hashBk
   mapScratchBase = 0
   msHelp = true
-  emitMapSetStore(sh)
+  emitMapSetStore(cmSlot, mapShapeIsSet(sh))
   msHelp = false
   mapScratchBase = savedBase
   cmSlot = savedSlot
@@ -16445,23 +16464,30 @@ export function mapSetFnBody(sh: i32): u8[] {
 }
 
 // A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
-// appends, compacting first when the dead entries call for it, and maybe resizes.
-function emitMapSetStore(mslot: i32) {
+// appends, compacting first when the dead entries call for it, and maybe resizes. A Set's
+// (`isSet`) leaves its `vals` alone: a hit does nothing and a miss pushes only the key.
+function emitMapSetStore(mslot: i32, isSet: boolean) {
   emitMapProbe(true, true)
   pushMapScr(5) // entry
-  fbIf(64)      // if (entry != 0 → overwrite), void
-  // OVERWRITE: vals.backing[entry-1] = stash
-  pushMapVals()
-  fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
-  pushMapScr(5)                // entry
-  fbI32Const(1)
-  fbI32Bin(107)                // i32.sub (entry - 1)
-  pushMapSetValStash(mslot)
-  fbArraySet(cmValsBack())     // array.set
-  fbElse()                     // else
+  if isSet {
+    // A Set's present key has nothing to overwrite: only a miss appends.
+    fbI32Eqz()
+    fbIf(64) // if (entry == 0 → append), void
+  } else {
+    fbIf(64) // if (entry != 0 → overwrite), void
+    // OVERWRITE: vals.backing[entry-1] = stash
+    pushMapVals()
+    fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
+    pushMapScr(5)                // entry
+    fbI32Const(1)
+    fbI32Bin(107)                // i32.sub (entry - 1)
+    pushMapSetValStash(mslot)
+    fbArraySet(cmValsBack())     // array.set
+    fbElse()                     // else
+  }
   // APPEND. Reclaim the dead entries first once they outnumber the live ones by
   // `INITIAL_CAP`: compaction rebuilds the index, so the free slot is probed again (D2315).
-  const cmpFn = mapCompactFnOf(mslot)
+  const cmpFn = mapCompactFnOf(if isSet { mapShapeOfSet(mslot) } else { mslot })
   if cmpFn >= 0 {
     pushMapCount()
     pushMapSize()
@@ -16496,7 +16522,7 @@ function emitMapSetStore(mslot: i32) {
   fbArraySet(aTy()) // array.set
   // keys.push(keyRef) ; vals.push(stash)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey() < 0 { return -1 }
-  if emitMapPushVal() < 0 { return -1 }
+  if !isSet && emitMapPushVal() < 0 { return -1 }
   // count = count + 1
   pushMapRef()              // mapRef (struct.set receiver)
   pushMapCount()

@@ -2110,7 +2110,7 @@ function monoArgTyNameBound(
                 tt >= 0
                 && tt < T.tys.length
                 && tyAt(tt) is TyObj
-                && fnTagHoldsTy(tt, 8)
+                && fnTagHoldsTy(tt)
               ) {
                 let tsi = structRowRecordingTy(tt)
                 if tsi < 0 { tsi = repRowOfTyStruct(tt, sNames.length) }
@@ -3326,6 +3326,11 @@ function monoCloneBodyRaw(
       return mkBlock(ns, n.pos)
     }
     LetDecl => {
+      // A relay twin's binding of the maker call it returns takes its own copy (D16771).
+      const lc = if monoBuild.twinRet >= 0 && n.letInit >= 0 { monoCloneBody(n.letInit, typarams, tvN, tvV, bN, bT) } else { n.letInit }
+      if lc != n.letInit {
+        return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, lc, n.pos))
+      }
       return monoCloneLetDecl(n, ix, typarams, bN, bT)
     }
     WhileStmt => {
@@ -3356,23 +3361,6 @@ function monoCloneBodyRaw(
       return mkForInCopy(n, n.fiIter, cb)
     }
     RetStmt => {
-      // A relay twin returns its own copy of a maker call noted per twin (a result below -1), callee
-      // read copied too, built at the twin's result: the shared node points every twin at one (D16755).
-      const tcx = if monoBuild.twinRet >= 0 && n.retArg >= 0 { unwrapParen(n.retArg) } else { -1 }
-      const tcn = if tcx >= 0 && tcx < P.nodes.length { nodeAt(tcx) } else { null }
-      if tcn is Call && elabMakerCallSig(tcx) < -1 {
-        const tr = unwrapParen(tcn.callFn)
-        const trn = if tr >= 0 && tr < P.nodes.length { nodeAt(tr) } else { null }
-        if trn is Ident {
-          const nr = monoCopyOf(tr, mkIdent(trn.identName, trn.pos))
-          nodeTyRecord(nr, nodeTyIxOf(tr))
-          const nc = monoCopyOf(tcx, mkCall(nr, tcn.callArgs, tcn.pos))
-          nodeTyRecord(nc, nodeTyIxOf(tcx))
-          monoNoteCallTpl(tcx, nc)
-          if nc >= 0 { monoBuild.twinCalls.set(nc, monoBuild.twinRet) }
-          return mkReturn(nc, n.pos)
-        }
-      }
       // The return value may be a block or `if` expression carrying its own `LetDecl`s.
       const ca = monoCloneBody(n.retArg, typarams, tvN, tvV, bN, bT)
       const cl = if ca == n.retArg { monoRetBoundLitCopy(ca) } else { ca }
@@ -3384,8 +3372,24 @@ function monoCloneBodyRaw(
       if ci == n.parInner { return ix }
       return mkParen(ci, n.pos)
     }
+    // A relay twin returns its own copy of each maker call noted per twin, through the arms and
+    // block tails that reach it: the shared node points every twin at one instance (D16755).
+    // The copy's callee read is copied too, and the copy is noted at the twin's result.
+    Call => {
+      const r = if monoBuild.twinRet >= 0 && elabMakerCallSig(ix) < -1 { unwrapParen(n.callFn) } else { -1 }
+      const rn = if r >= 0 && r < P.nodes.length { nodeAt(r) } else { null }
+      if rn is Ident {
+        const nr = monoCopyOf(r, mkIdent(rn.identName, rn.pos))
+        nodeTyRecord(nr, nodeTyIxOf(r))
+        const nc = monoCopyOf(ix, mkCall(nr, n.callArgs, n.pos))
+        nodeTyRecord(nc, nodeTyIxOf(ix))
+        monoNoteCallTpl(ix, nc)
+        if nc >= 0 { monoBuild.twinCalls.set(nc, monoBuild.twinRet) }
+        return nc
+      }
+    }
     // a pure expression or other statement carries no `LetDecl` annotation to rewrite: share
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread | LoopVar => {}
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   return ix
 }
@@ -7930,7 +7934,7 @@ function monoSetPinDiscrim(tyIx: i32): string {
     }
   }
   // A record holding one keys by each field's sets; a record nested in it pins nowhere.
-  const ro = if depth == 0 && t >= 0 && t < T.tys.length && fnTagHoldsTy(t, 8) { tyAt(t) } else { null }
+  const ro = if depth == 0 && t >= 0 && t < T.tys.length && fnTagHoldsTy(t) { tyAt(t) } else { null }
   if ro is TyObj {
     let rk = "#set{"
     for f in ro.objFieldTypes {
@@ -7982,7 +7986,7 @@ export function monoTagMapRepTy(t: i32, codes: i32[], texts: string[]): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   const m = tyAt(t)
   if m is TyMap { return mapStoredTyOf(t) }
-  if !(m is TyObj) || !fnTagHoldsTy(t, 8) { return -1 }
+  if !(m is TyObj) || !fnTagHoldsTy(t) { return -1 }
   const sts: i32[] = []
   let i = 0
   while i < m.objFieldNames.length && i < m.objFieldTypes.length {
@@ -8004,7 +8008,7 @@ export function monoTagMapRepTy(t: i32, codes: i32[], texts: string[]): i32 {
       f >= 0
       && f < T.tys.length
       && tyAt(f) is TyObj
-      && fnTagHoldsTy(f, 8)
+      && fnTagHoldsTy(f)
     ) {
       sp = ""
     }
@@ -13319,7 +13323,7 @@ function monoFlowElemAt(v: i32, k: i32): i32 {
   const kn = nodeAt(k)
   if !(ln is ArrayLit) || !(kn is NumLit) { return -1 }
   // A holder of a tagged set's ids is read by its call's member arms, never resolved here.
-  if fnTagHoldsTy(nodeTyIxOf(v), 4) { return -1 }
+  if fnTagHoldsTy(nodeTyIxOf(v)) { return -1 }
   for e in ln.arrElems {
     if nodeAt(e) is Spread { return -1 }
   }
@@ -13333,7 +13337,7 @@ function monoFlowElemAt(v: i32, k: i32): i32 {
 function monoFlowFieldOf(v: i32, name: string): i32 {
   const on = nodeAt(v)
   if !(on is ObjLit) { return -1 }
-  if fnTagHoldsTy(nodeTyIxOf(v), 4) { return -1 }
+  if fnTagHoldsTy(nodeTyIxOf(v)) { return -1 }
   let out = -1
   for fi in on.objFields {
     const f = nodeAt(fi)
@@ -14717,7 +14721,7 @@ function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
       // A field holding a tagged set's member id needs no pin.
       if (
         fnTagTyIsTagged(nodeTyIxOf(f.fiValue))
-        || fnTagHoldsTy(nodeTyIxOf(f.fiValue), 4)
+        || fnTagHoldsTy(nodeTyIxOf(f.fiValue))
       ) {
         continue
       }
@@ -15997,7 +16001,7 @@ function monoStoredSlotDecline(r: i32): i32 {
 function monoTyOpen(t: i32): boolean {
   if t < 0 { return true }
   if !tyHasTyVar(t) && !tyReachesHole(t, 16) { return false }
-  if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t, 16) { return true }
+  if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t) { return true }
   return monoTyOpenUntagged(t, 16)
 }
 
@@ -23673,14 +23677,20 @@ function monoRetsReachHoleLam(fd: i32, seen: i32[]): boolean {
   const fn = nodeAt(fd)
   if !(fn is FuncDecl) { return false }
   seen.push(fd)
-  for r in monoFnRetArgs(fn) {
+  // Each arm of a returned `if` or `match`, and the call a returned `const` holds, counts too.
+  const leaves: i32[] = []
+  for r in monoFnRetArgs(fn) { tailValueLeaves(r, leaves) }
+  for r in leaves {
     const x = unwrapParen(r)
     const fe = monoLamValueFe(x, fd)
     if fe >= 0 && fe < monoGen.length && monoGen[fe] == 1 && monoLamIsHole(fe) {
       return true
     }
     if x >= 0 {
-      const cn = nodeAt(x)
+      const xd = if nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+      const xl = if xd >= 0 && xd < P.nodes.length { nodeAt(xd) } else { null }
+      const cx = if xl is LetDecl && xl.letInit >= 0 { unwrapParen(xl.letInit) } else { x }
+      const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
       if cn is Call {
         const cf = unwrapParen(cn.callFn)
         if (
