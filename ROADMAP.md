@@ -50,10 +50,9 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 4. **Generated-code performance:**
    - print imports only when reachable;
    - B-range (D4000);
-   - L10;
    - B-hint.
 
-   All four are in [Track B](docs/roadmap/track-b-codegen.md).
+   All three are in [Track B](docs/roadmap/track-b-codegen.md).
 5. **Reference identity and equality (A15)**, after the owner reconfirms the ruling. See
    [Track A](docs/roadmap/track-a-types.md).
 6. **Width subtyping, the container half**, in [Track A](docs/roadmap/track-a-types.md).
