@@ -54,7 +54,7 @@ import {
   irVarNew,
 } from "./ir"
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
-import { irTyOpen, irVerify } from "./ir_verify"
+import { irTyOpen, irVerify, numKindOf } from "./ir_verify"
 import {
   irAstKind,
   irDualEmit,
@@ -64,15 +64,25 @@ import {
 } from "./ir_lower"
 import {
   GlobalCtx,
+  binNumWidth,
   callEndsNever,
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  numLitAsApplies,
   pushPlainWhy,
   pushPlanOf,
   strLitTakesAtom,
+  widenPlanOf,
 } from "./wasmEmit"
-import { RAtom, RList, repNodeAt, repNodeGen, repNodeOfTy } from "./emit_rep"
+import {
+  RAtom,
+  RList,
+  repNodeAt,
+  repNodeGen,
+  repNodeOfTy,
+  repTyOf,
+} from "./emit_rep"
 import { ctxTyAt, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import {
   declaredIndexAt,
@@ -586,9 +596,10 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const why = pushPlainWhy(pp, ibFnIx)
   if why != "" { return missRhs(why) }
   const v = irBExpr(b, m.memObj)
-  const x = irBExpr(b, c.callArgs[0])
-  if ibMiss != "" { return missRhs("method operand") }
   const ln = repNodeAt(irBOpRep(v))
+  if ibMiss != "" || !(ln is RList) { return missRhs("push operand coercion") }
+  const x = deliver(b, c.callArgs[0], ln.rlsElem)
+  if ibMiss != "" { return missRhs("method operand") }
   if !(ln is RList) || irBOpRep(x) != ln.rlsElem {
     return missRhs("push operand coercion")
   }
@@ -607,6 +618,59 @@ function operandWhy(ix: i32): string {
 }
 
 const STR_OPERAND = "operand at string"
+
+// The rep of binary `n`'s operator width (`binNumWidth`) where an operand has it and the two
+// differ, else -1.
+function binWidthRep(n: BinExpr): i32 {
+  const lr = primRepOf(n.binLeft)
+  const rr = primRepOf(n.binRight)
+  if lr == rr || lr < 0 || rr < 0 { return -1 }
+  const w = binNumWidth(n, ibFnIx)
+  // Each primitive is narrowed to a plain string before the compare (D16822).
+  const lp = repPrim(lr)
+  const rp = repPrim(rr)
+  if lp != null {
+    const ls: string = lp
+    if ls == w { return lr }
+  }
+  if rp != null {
+    const rs: string = rp
+    if rs == w { return rr }
+  }
+  return -1
+}
+
+function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
+
+// The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
+// `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
+// legacy's own literal writers, which the IR does not share yet, so each is a named miss.
+function deliver(b: i32[], ix: i32, dst: i32): Opnd {
+  return widenTo(b, irBExpr(b, ix), ix, dst)
+}
+
+// Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
+function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  if ibMiss != "" || dst < 0 || irBOpRep(v) == dst { return v }
+  const sk = numKindOf(irBOpRep(v))
+  const dk = numKindOf(dst)
+  if sk < 0 || dk < 3 { return v }
+  const p = widenPlanOf(ix, dk, ibFnIx)
+  if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
+  if p.wpSrc != sk { return irBMiss("widen source") }
+  // The temp is typed at the destination, whose rep it holds.
+  const ty = repTyOf(dst)
+  const t = irVarNew(ib, dst, ty, "temp", -1)
+  irBNode(
+    b,
+    { lDst: t, lRhs: { nwV: v, nwSrc: sk, nwDst: dk, nwAt: ix } },
+    ty,
+    dst,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
 
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
 function atomOperand(ix: i32): boolean {
@@ -677,8 +741,25 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     if lw != "" { return irBMiss(lw) }
     const rw = operandWhy(n.binRight)
     if rw != "" { return irBMiss(rw) }
-    const l = irBExpr(b, n.binLeft)
-    const r = irBExpr(b, n.binRight)
+    // Mixed numeric widths meet at the operator's width, each operand widened before the next
+    // is built, as legacy builds them (`emitBinOperandAs`); a literal there is legacy's to write.
+    const dst = binWidthRep(n)
+    if (
+      dst >= 0
+      && irRepOtherThan(n.binLeft, dst)
+      && numLitAsApplies(n.binLeft)
+    ) {
+      return irBMiss("widen literal")
+    }
+    if (
+      dst >= 0
+      && irRepOtherThan(n.binRight, dst)
+      && numLitAsApplies(n.binRight)
+    ) {
+      return irBMiss("widen literal")
+    }
+    const l = widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst)
+    const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst)
     if ibMiss != "" { return l }
     if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
@@ -719,18 +800,19 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
   if !(t is Ident) { return skip("assignment target") }
   if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   const d = identDeclOf(n.binLeft)
-  const src = irBExpr(b, n.binRight)
-  if ibMiss != "" { return 0 }
   if d >= 0 && localIndexOf(ibFnIx, n.binLeft) >= 0 {
     const v = irBDeclVar(d)
-    if v < 0 || irBOpRep(src) != ib.irVars[v].vRep {
-      return skip("assignment coercion")
-    }
+    if v < 0 { return skip("assignment coercion") }
+    const src = deliver(b, n.binRight, ib.irVars[v].vRep)
+    if ibMiss != "" { return 0 }
+    if irBOpRep(src) != ib.irVars[v].vRep { return skip("assignment coercion") }
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
     return 0
   }
   const g = globalIndexOfSid(sidOfNode(n.binLeft))
   if g < 0 || d < 0 { return skip("assignment target") }
+  const src = deliver(b, n.binRight, globalRep(g, d))
+  if ibMiss != "" { return 0 }
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
@@ -747,9 +829,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   if why != "" { return skip(why) }
   const v = irBExpr(b, t.idxArr)
   const i = irBExpr(b, t.idxIndex)
-  const x = irBExpr(b, n.binRight)
-  if ibMiss != "" { return 0 }
   const ln = repNodeAt(irBOpRep(v))
+  if !(ln is RList) { return skip("store operand coercion") }
+  const x = deliver(b, n.binRight, ln.rlsElem)
+  if ibMiss != "" { return 0 }
   if (
     !(ln is RList)
     || repPrim(irBOpRep(i)) != "i32"
@@ -850,7 +933,7 @@ function stmtIn(b: i32[], ix: i32) {
   if n is LetDecl {
     const v = irBDeclVar(ix)
     if v < 0 || n.letInit < 0 { return skip("declaration") }
-    const src = irBExpr(b, n.letInit)
+    const src = deliver(b, n.letInit, ib.irVars[v].vRep)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep {
       return skip("declaration coercion")
@@ -913,7 +996,7 @@ function stmtIn(b: i32[], ix: i32) {
       return 0
     }
     if none { return skip("void return value") }
-    const v = irBExpr(b, n.retArg)
+    const v = deliver(b, n.retArg, ib.irRetRep)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
     }
@@ -969,7 +1052,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return 0
   }
   const n0 = b.length
-  const v = irBExpr(b, last)
+  const v = deliver(b, last, ib.irRetRep)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])

@@ -764,7 +764,7 @@ print(id<f64>(3))     // prints 3
 
 ```vl
 function f<T>(x: T | null): i32 { if x == null { return 0 } return x + 1 }
-print(f("s"))   // refused: operator '+' is not defined for string and i32 (the call's argument types)
+print(f("s"))   // refused: operator '+' is not defined for string and i32 (the body of `f`, used at 1:68)
 ```
 
 > Ruling: owner 2026-09-03, DECISIONS.md §"An unbounded `<T>` is an ENTIRELY OPEN HOLE";
