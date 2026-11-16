@@ -166,7 +166,7 @@ print(sel(true))
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["expression"]) {
+    for (const why of ["expression if"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
@@ -292,3 +292,34 @@ Deno.test({
   },
 });
 
+
+// The blocker census (mode 4): a function's build goes on past a missed statement, so its row names
+// every class it missed, sorted into one key; a covered function reads `blockers none`.
+Deno.test({
+  name: "ir shadow: the blocker census names every class a function missed, and moves no byte",
+  ignore,
+  fn: () => {
+    const src = `function ok(x: i32): i32 { return x + 1 }
+function two(s: string, t: string): i32 {
+  const xs = [1, 2]
+  if s == t { return xs[0] }
+  return 0
+}
+print(ok(1))
+print(two("a", "b"))
+`;
+    const census = run(src, 4);
+    if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
+    const want = "blockers expression array + operand at string";
+    if ((census.rows.get(want) ?? 0) !== 1) {
+      throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
+    }
+    if ((census.rows.get("blockers none") ?? 0) !== 1) {
+      throw new Error(`want one covered function, got ${JSON.stringify([...census.rows])}`);
+    }
+    const plain = run(src, false);
+    if (plain.out.length !== census.out.length || plain.out.some((b, i) => b !== census.out[i])) {
+      throw new Error(`want byte-identical output under the census (${plain.out.length} vs ${census.out.length} bytes)`);
+    }
+  },
+});
