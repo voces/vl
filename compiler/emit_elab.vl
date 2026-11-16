@@ -21522,6 +21522,8 @@ type EplTables = {
   ownOnly: boolean,
   // The list copies whose element flow is drawn, as `node|instance`.
   copied: {[string]: boolean},
+  // The values an index write or `set` stores into a list or map element (`m[k] = v`).
+  idxWrites: i32[],
 }
 
 function eplFresh(): EplTables {
@@ -21557,6 +21559,7 @@ function eplFresh(): EplTables {
     oneMemo: Map(),
     omit: [],
     copied: Map(),
+    idxWrites: [],
     ownOnly: false,
   }
 }
@@ -22455,6 +22458,15 @@ function eplEdgeAt(u: i32) {
       if k == CW_UP_LETINIT {
         eplEdge(eplPlaceOf(u, 0), eplRoot(up), u)
       } else if k == CW_UP_ASG_RHS && un is BinExpr {
+        const lx = parenPeelIx(un.binLeft)
+        if (
+          lx >= 0
+          && lx < P.nodes.length
+          && nodeAt(lx) is Index
+          && !i32ListHas(EPL.idxWrites, u)
+        ) {
+          EPL.idxWrites.push(u)
+        }
         eplEdge(eplPlaceOf(u, 0), eplPlaceOf(un.binLeft, 0), u)
       } else if k == CW_UP_ELEM {
         eplEdge(eplPlaceOf(u, 0), eplChild(eplRoot(up), "e"), u)
@@ -22510,6 +22522,7 @@ function eplEdgeAt(u: i32) {
         if cn is Member && (cn.memProp == "push" || cn.memProp == "unshift") {
           eplEdge(eplPlaceOf(u, 0), eplChild(eplPlaceOf(cn.memObj, 0), "e"), u)
         } else if cn is Member && cn.memProp == "set" && ai == 1 {
+          if !i32ListHas(EPL.idxWrites, u) { EPL.idxWrites.push(u) }
           eplEdge(eplPlaceOf(u, 0), eplChild(eplPlaceOf(cn.memObj, 0), "v"), u)
         } else if cn is Member && eplCbMethod(cn.memProp) && ai == 0 {
           const lam = eplFnOf(u)
@@ -23373,9 +23386,16 @@ function eplSlotCallRecs(
   const ks0 = if k < 0 { eplFrameKeysOf(holder) } else { [] }
   const ks: i32[] = if ks0.length > 0 { ks0 } else { [k] }
   const cis: i32[] = []
+  // Read from a value, the calls leave out where an index write or `set` stores it into a list or
+  // map element; mono's pins do not take that write's calls (D16864).
+  const om: i32[] = []
+  for o in omit { om.push(o) }
+  if path.length == 0 {
+    for w in EPL.idxWrites { om.push(w) }
+  }
   for kk in ks {
     const p = eplSlotPlaceOwn(holder, path, kk)
-    for ci in if p >= 0 { eplCallsStarOmit(p, omit) } else { [] } {
+    for ci in if p >= 0 { eplCallsStarOmit(p, om) } else { [] } {
       if !i32ListHas(cis, ci) { cis.push(ci) }
     }
   }
@@ -23515,13 +23535,8 @@ export function eplSlotDeliveredTys(
         }
         const rt0 = if ck >= 0 { elabNodeTy(EPL.callNode[ci], ck) } else { -1 }
         const rt = if rt0 >= 0 { rt0 } else { nodeTyIxOf(EPL.callNode[ci]) }
-        // A call is a delivery only where its arguments and its result are closed.
-        if (
-          tys.length == cn.callArgs.length
-          && rt >= 0
-          && !tyHasTyVar(rt)
-          && !tyHoldsHole(rt)
-        ) {
+        // A call is a delivery where its arguments are closed, at the result the call is typed.
+        if tys.length == cn.callArgs.length && rt >= 0 {
           const ft = mkFuncTy(tys, rt)
           if !i32ListHas(out, ft) { out.push(ft) }
         }
