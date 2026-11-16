@@ -147,11 +147,8 @@ function g(): i32 { return 2 }   // hint: redundant type annotation: `g` is infe
 print(f() + g())          // prints 3
 ```
 
-**D3.4** `for-step-zero` is a check rule, not a finding: a range with `step 0` is an
-error (statements.md §S5.3).
-
-> Status: `step 0` is reported twice, once by the checker and once as a finding with code
-> `for-step-zero` and severity error (D4057).
+**D3.4** A range with `step 0` is a check error, not a finding (statements.md §S5.3), and it
+is reported once, with code `range-never-runs`.
 
 ## D4. What `vl check` shows and when it fails
 

@@ -91,4 +91,3 @@ rules there apply here, and `tests/roadmap_honest_test.ts` gates this file too.
   "saturation is a std helper"). Confirm it exists or file it.
 - **B21.3, `match` over literal members.** Check which numeric-literal spelling (`n is 0`) still
   refuses. The const-pattern ruling answers part of it.
-- **Undeclared-identifier "did you mean".** Reuse `tyEditDist` over the in-scope names.
