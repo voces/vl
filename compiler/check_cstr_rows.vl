@@ -37,12 +37,18 @@ import { identFnDeclOf } from "./check_scopes"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
 import {
   BND_ARRDEF,
+  BND_BM,
+  BND_IS,
+  BND_LET,
   BND_NEST,
   BND_PRINT,
+  BND_RET,
+  Bound,
   bndAt,
   bndCount,
   bndOwnRows,
   bndPush,
+  bndSiteHas,
 } from "./check_iface"
 
 // Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
@@ -138,25 +144,13 @@ export function argCstrTruncate(n: i32) {
 // the pin asks the substituted element for a default, as the direct spelling does (D2578).
 export function noteArrDefCstr(listTy: i32, ix: i32) {
   if listTy < 0 { return 0 }
-  bndPush(BND_ARRDEF, listTy, ix, cstrOwnerTop())
+  bndPush(BND_ARRDEF, tyIxBound(listTy, ix, cstrOwnerTop()))
   return 0
 }
 
 // The row each type-and-owner key last matched among the `BND_NEST` bounds. A probe's rollback
 // can pop that row, so a hit counts only when the row is still there and still matches.
 export let nestCstrSeen: {[string]: i32} = Map()
-
-// An `is` test over a hole parameter, re-asked at the pin as the annotated spelling asks it:
-// the tested operand's type, the checked type, the test's spelling, the node, and the owner.
-type IsCstrCols = {
-  ty: i32[],
-  chk: i32[],
-  name: string[],
-  ix: i32[],
-  fn: i32[],
-}
-
-export const isCstr: IsCstrCols = { ty: [], chk: [], name: [], ix: [], fn: [] }
 
 // A list `is` test over a hole or type parameter, per test node: how many pins hand it a list
 // whose element is fixed and never meets the tested one (and the first such call), a fixed list
@@ -208,147 +202,14 @@ export function listIsPinReset() {
   return 0
 }
 
-// Drops every `isCstr` row from `n` on, all columns together.
-export function isCstrTruncate(n: i32) {
-  while isCstr.ty.length > n {
-    isCstr.ty.pop()
-    isCstr.chk.pop()
-    isCstr.name.pop()
-    isCstr.ix.pop()
-    isCstr.fn.pop()
-  }
-  return 0
+// A `print`, `__array_new_default__` or nest bound: the type, the node and the owner.
+function tyIxBound(ty: i32, ix: i32, fn: i32): Bound {
+  return { on: ty, a: -1, b: -1, c: -1, site: ix, fn: fn, s: "", seq: -1 }
 }
 
-// D551 — deferred return-type constraints, the declared return re-asked at the pin because
-// neither layer owns the question in the body: `assignable(T, V)` is vacuous over a hole, and
-// `substTyDeep` hands the declared return out without comparing it against the body type. The
-// answer is `assignableExpr` on the substituted pair — the same function the body asked.
-type RetCstrCols = {
-  got: i32[],
-  want: i32[],
-  // The returned expression's node — the handle `assignableExpr` needs at the pin, not a position
-  // for the diagnostic (that is the call, like every other pin report).
-  ix: i32[],
-  fn: i32[],
-  // D571 — which side carries the hole, 1 for the declared side alone. The two are not
-  // one constraint: a hole on the body side sits under a concrete declaration the author can
-  // name, so `return x as A1` is writable and the pin holds the author to it, while a hole on the
-  // declared side alone is a destination with no cast to write. Only that column is exempt below.
-  wOnly: i32[],
-}
-
-export const retCstr: RetCstrCols = {
-  got: [],
-  want: [],
-  ix: [],
-  fn: [],
-  wOnly: [],
-}
-
-// Drops every `retCstr` row from `n` on, all columns together.
-export function retCstrTruncate(n: i32) {
-  while retCstr.got.length > n {
-    retCstr.got.pop()
-    retCstr.want.pop()
-    retCstr.ix.pop()
-    retCstr.fn.pop()
-    retCstr.wOnly.pop()
-  }
-  return 0
-}
-
+// The next check-order stamp for a `BND_LET` or `BND_BM` bound: one counter, so the pin pass
+// applies a body's writes in check order wherever each is deferred (D2218).
 export let cstrSeqNext = 0
-
-// D572 — the mirror of `retCstr.got` one node over: every other place a value lands inside a
-// generic body (a local declaration, a re-assignment, a struct-field write, an element write).
-// A separate table because `validateRetCstrs` cannot see these — in `const r: T = n + 1` the
-// i32 enters at the `const`, where `assignable(i32, T)` is vacuous. No newtype exemption here.
-type LetCstrCols = {
-  got: i32[],
-  want: i32[],
-  // The source expression's node — the handle `assignableExpr` needs at the pin, not a position
-  // for the diagnostic (that is the call, like every other pin report).
-  ix: i32[],
-  fn: i32[],
-  // The binding's name, or "" for a destination that has none of its own. It selects which of the
-  // two direct spellings' sentences the pin repeats: a declaration says `cannot assign i32 to 'r'
-  // of type string` and can also say the object-literal-into-a-map and lossy-numeric forms; a
-  // write to an already-declared place says only `cannot assign i32 to string`. `letAssignMsg` forks.
-  name: string[],
-  // The check-order stamp of each `letCstr` and `bmCstr` row, from one counter, so the pin pass
-  // applies a body's writes in check order wherever each is deferred (D2218).
-  seq: i32[],
-}
-
-export const letCstr: LetCstrCols = {
-  got: [],
-  want: [],
-  ix: [],
-  fn: [],
-  name: [],
-  seq: [],
-}
-
-// Drops every `letCstr` row from `n` on, all columns together.
-export function letCstrTruncate(n: i32) {
-  while letCstr.got.length > n {
-    letCstr.got.pop()
-    letCstr.want.pop()
-    letCstr.ix.pop()
-    letCstr.fn.pop()
-    letCstr.name.pop()
-    letCstr.seq.pop()
-  }
-  return 0
-}
-
-// D582 — deferred builtin-method argument constraints, for the one reason `argCstr*` cannot
-// serve this position: that table is adjudicated against a callee it can name, and a builtin
-// method has no `FuncDecl` at all. Its argument check is the builtin's own arm, and inside a
-// generic body every one of those arms is vacuous. `bmArgMsg` and `bmArgPred` are its one home.
-type BmCstrCols = {
-  // The check-order stamp, shared with `letCstr.seq`'s counter.
-  seq: i32[],
-  got: i32[],
-  want: i32[],
-  // The type the sentence needs that is neither side of the comparison: the receiver array for
-  // `push` (`cannot add i32 to string[]`), the other bound for a string `slice`. -1 when the form
-  // does not use one. Substituted at the pin like the two real sides.
-  ctx: i32[],
-  // The argument expression's node — the handle `assignableExpr` / `nomSlotAccepts` need at the
-  // pin, not a position for the diagnostic (that is the call, like every other pin report).
-  ix: i32[],
-  fn: i32[],
-  form: i32[],
-  label: string[],
-}
-
-export const bmCstr: BmCstrCols = {
-  seq: [],
-  got: [],
-  want: [],
-  ctx: [],
-  ix: [],
-  fn: [],
-  form: [],
-  label: [],
-}
-
-// Drops every `bmCstr` row from `n` on, all columns together.
-export function bmCstrTruncate(n: i32) {
-  while bmCstr.got.length > n {
-    bmCstr.got.pop()
-    bmCstr.want.pop()
-    bmCstr.ctx.pop()
-    bmCstr.ix.pop()
-    bmCstr.fn.pop()
-    bmCstr.form.pop()
-    bmCstr.label.pop()
-    bmCstr.seq.pop()
-  }
-  return 0
-}
 
 // D1431 — `memCstr.dem` separates the two things a row can ask, because they refuse in different
 // words. A `.length` / `x[i]` row asks a classification (is this rep a collection at all) and
@@ -577,7 +438,7 @@ export function notePrintCstr(pt: i32, argIx: i32) {
       const b = bndAt(BND_PRINT, k)
       if b.site == argIx && tyEqSameHoles(b.on, pt) { return 0 }
     }
-    cvMark(CV_PRINT, bndPush(BND_PRINT, pt, argIx, owner))
+    cvMark(CV_PRINT, bndPush(BND_PRINT, tyIxBound(pt, argIx, owner)))
   }
   return 0
 }
@@ -587,22 +448,14 @@ export function notePrintCstr(pt: i32, argIx: i32) {
 export function noteIsCstr(ot: i32, chk: i32, name: string, ix: i32) {
   if chk < 0 || !(tyAt(chk) is TyObj || tyAt(chk) is TyArray) { return 0 }
   const owner = cstrOwnerTop()
-  let k = 0
-  while k < isCstr.ty.length {
-    if (
-      isCstr.fn[k] == owner
-      && isCstr.ix[k] == ix
-      && tyEqSameHoles(isCstr.ty[k], ot)
-    ) {
-      return 0
-    }
-    k = k + 1
+  for k in bndOwnRows(BND_IS, owner) {
+    const b = bndAt(BND_IS, k)
+    if b.site == ix && tyEqSameHoles(b.on, ot) { return 0 }
   }
-  isCstr.ty.push(ot)
-  isCstr.chk.push(chk)
-  isCstr.name.push(name)
-  isCstr.ix.push(ix)
-  isCstr.fn.push(owner)
+  bndPush(
+    BND_IS,
+    { on: ot, a: chk, b: -1, c: -1, site: ix, fn: owner, s: name, seq: -1 },
+  )
   return 0
 }
 
@@ -614,24 +467,22 @@ export function noteRetCstr(got: i32, want: i32, ix: i32) {
   const gotHole = tyHasHole(got)
   if gotHole || tyHasHole(want) {
     const owner = cstrOwnerTop()
-    let k = 0
-    while k < retCstr.got.length {
-      if retCstr.fn[k] == owner {
-        if (
-          tyEqSameHoles(retCstr.got[k], got)
-          && tyEqSameHoles(retCstr.want[k], want)
-        ) {
-          return 0
-        }
-      }
-      k = k + 1
+    for k in bndOwnRows(BND_RET, owner) {
+      const b = bndAt(BND_RET, k)
+      if tyEqSameHoles(b.on, got) && tyEqSameHoles(b.a, want) { return 0 }
     }
-    retCstr.got.push(got)
-    retCstr.want.push(want)
-    retCstr.ix.push(ix)
-    retCstr.fn.push(owner)
-    if gotHole { retCstr.wOnly.push(0) } else { retCstr.wOnly.push(1) }
-    cvMark(CV_RET, retCstr.fn.length - 1)
+    const wOnly = if gotHole { 0 } else { 1 }
+    const row: Bound = {
+      on: got,
+      a: want,
+      b: wOnly,
+      c: -1,
+      site: ix,
+      fn: owner,
+      s: "",
+      seq: -1,
+    }
+    cvMark(CV_RET, bndPush(BND_RET, row))
   }
   return 0
 }
@@ -649,32 +500,29 @@ export function noteBmCstr(
 ) {
   if tyHasHole(got) || tyHasHole(want) {
     const owner = cstrOwnerTop()
-    let k = 0
-    while k < bmCstr.got.length {
+    for k in bndOwnRows(BND_BM, owner) {
+      const b = bndAt(BND_BM, k)
       if (
-        bmCstr.fn[k] == owner
-        && bmCstr.form[k] == form
-        && bmCstr.label[k] == label
+        b.c == form
+        && b.s == label
+        && tyEqSameHoles(b.on, got)
+        && tyEqSameHoles(b.a, want)
       ) {
-        if (
-          tyEqSameHoles(bmCstr.got[k], got)
-          && tyEqSameHoles(bmCstr.want[k], want)
-        ) {
-          return 0
-        }
+        return 0
       }
-      k = k + 1
     }
-    bmCstr.got.push(got)
-    bmCstr.want.push(want)
-    bmCstr.ctx.push(ctx)
-    bmCstr.ix.push(argIx)
-    bmCstr.fn.push(owner)
-    bmCstr.form.push(form)
-    bmCstr.label.push(label)
-    bmCstr.seq.push(cstrSeqNext)
+    const row: Bound = {
+      on: got,
+      a: want,
+      b: ctx,
+      c: form,
+      site: argIx,
+      fn: owner,
+      s: label,
+      seq: cstrSeqNext,
+    }
     cstrSeqNext = cstrSeqNext + 1
-    cvMark(CV_BM, bmCstr.fn.length - 1)
+    cvMark(CV_BM, bndPush(BND_BM, row))
   }
   return 0
 }
@@ -761,7 +609,7 @@ export function noteNestCstr(t: i32, ix: i32) {
       return 0
     }
   }
-  nestCstrSeen.set(key, bndPush(BND_NEST, t, ix, owner))
+  nestCstrSeen.set(key, bndPush(BND_NEST, tyIxBound(t, ix, owner)))
   return 0
 }
 
@@ -799,40 +647,36 @@ export function noteElemLetCstr(got: i32, want: i32, ix: i32, name: string) {
     return noteLetCstr(got, want, ix, name)
   }
   if tyHasHole(got) || tyHasHole(want) {
-    if !i32ListHas(letCstr.ix, ix) {
+    if !bndSiteHas(BND_LET, ix) {
       letCstrPush(got, want, ix, name, CSTR_DELIVERY_ONLY)
     }
   }
   return 0
 }
 
-// Appends the `letCstr` row unless `owner` already holds the same one.
+// Appends the `BND_LET` bound unless `owner` already holds the same one.
 function letCstrRow(got: i32, want: i32, ix: i32, name: string, owner: i32) {
-  let k = 0
-  while k < letCstr.got.length {
-    if letCstr.fn[k] == owner {
-      if (
-        tyEqSameHoles(letCstr.got[k], got)
-        && tyEqSameHoles(letCstr.want[k], want)
-      ) {
-        return 0
-      }
-    }
-    k = k + 1
+  for k in bndOwnRows(BND_LET, owner) {
+    const b = bndAt(BND_LET, k)
+    if tyEqSameHoles(b.on, got) && tyEqSameHoles(b.a, want) { return 0 }
   }
   letCstrPush(got, want, ix, name, owner)
   return 0
 }
 
 function letCstrPush(got: i32, want: i32, ix: i32, name: string, owner: i32) {
-  letCstr.got.push(got)
-  letCstr.want.push(want)
-  letCstr.ix.push(ix)
-  letCstr.fn.push(owner)
-  letCstr.name.push(name)
-  letCstr.seq.push(cstrSeqNext)
+  const row: Bound = {
+    on: got,
+    a: want,
+    b: -1,
+    c: -1,
+    site: ix,
+    fn: owner,
+    s: name,
+    seq: cstrSeqNext,
+  }
   cstrSeqNext = cstrSeqNext + 1
-  cvMark(CV_LET, letCstr.fn.length - 1)
+  cvMark(CV_LET, bndPush(BND_LET, row))
   return 0
 }
 

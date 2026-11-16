@@ -3081,8 +3081,56 @@ function fcReadNote(site: string, verdict: string) {
   return 0
 }
 
-// The field code at row `r` of code column `codes`, whose storage types are column `tys`; `site`
-// names the reader for the shadow. The caller bounds `r` as it would index `codes`.
+// A function-typed storage, bare or nullable.
+function fcFuncTy(ty: i32): boolean {
+  const t = tyAt(ty)
+  if t is TyFunc { return true }
+  return t is TyNullable && t.nInner >= 0 && tyAt(t.nInner) is TyFunc
+}
+
+// A list-typed storage, bare or nullable.
+function fcListTy(ty: i32): boolean {
+  const t = tyAt(ty)
+  if t is TyArray { return true }
+  return t is TyNullable && t.nInner >= 0 && tyAt(t.nInner) is TyArray
+}
+
+// A row minted at an unpinned hole or a type variable, which has no rep (D16720).
+function fcKeptHoleRow(ty: i32, d: RepDesc): boolean {
+  return d.rdKind == null && tyHasTyVar(ty)
+}
+
+// A function field: its code is the function storage's, which the rep may not share (D16721).
+function fcKeptFnRep(ty: i32, d: RepDesc): boolean {
+  return d.rdKind != null && fcFuncTy(ty)
+}
+
+// An empty list joined with `null`: its element is a hole, and its uses chose the code (D16722).
+function fcKeptHoleList(ty: i32, d: RepDesc): boolean {
+  return d.rdKind == null && fcListTy(ty)
+}
+
+// Notes a read that keeps its stored code by its named class; one in no class fails loudly.
+function fcKeptNote(site: string, c: i32, st: i32, d: RepDesc) {
+  const cls = if fcKeptHoleRow(st, d) { "holeRow" } else if fcKeptFnRep(st, d) { "fnRep" } else if fcKeptHoleList(st, d) { "holeList" } else { "" }
+  if cls == "" {
+    fcReadNote(site, "kept UNNAMED code=" + i32ToStr(c))
+    emitFail(
+      "emitProgram: a field keeps its stored code outside every named class",
+    )
+    return 0
+  }
+  fcReadNote(
+    site,
+    "kept " + cls + (if fieldCodeOfRep(d) == c { " agree" } else { "" }),
+  )
+  return 0
+}
+
+// The field code at row `r` of code column `codes`, whose storage types are column `tys`: the
+// code the storage type's rep derives, or the stored code where the type is a function or has
+// no rep (the three classes above). `site` names the reader for the shadow, which fails loudly
+// on a moved code or a kept one in no class.
 export function fieldCodeIn(
   codes: i32[],
   tys: i32[],
@@ -3090,29 +3138,31 @@ export function fieldCodeIn(
   site: string,
 ): i32 {
   const c = codes[r]
+  const st = if r >= 0 && r < tys.length { tys[r] } else { -1 }
+  if st < 0 {
+    emitFail("emitProgram: a field row records no storage type")
+    return c
+  }
+  const d = repOfTy(st)
+  if fcFuncTy(st) || d.rdKind == null {
+    if repShadowOn { fcKeptNote(site, c, st, d) }
+    return c
+  }
+  const dc = fieldCodeOfRep(d)
   if repShadowOn {
-    const st = if r >= 0 && r < tys.length { tys[r] } else { -1 }
-    if st < 0 {
-      fcReadNote(site, "noStoreTy code=" + i32ToStr(c))
+    if dc == c {
+      fcReadNote(site, "agree")
     } else {
-      const d = repOfTy(st)
-      const dc = fieldCodeOfRep(d)
-      if dc == c {
-        fcReadNote(site, "agree")
-      } else {
-        fcReadNote(
-          site,
-          "stored="
-            + i32ToStr(c)
-            + " derived="
-            + i32ToStr(dc)
-            + " rep="
-            + (d.rdKind ?? "none"),
-        )
-      }
+      fcReadNote(
+        site,
+        "moved stored=" + i32ToStr(c) + " derived=" + i32ToStr(dc),
+      )
+      emitFail(
+        "emitProgram: a field's stored code is not the one its storage type derives",
+      )
     }
   }
-  return c
+  return dc
 }
 
 // Whether `ty` is the `null` type.
