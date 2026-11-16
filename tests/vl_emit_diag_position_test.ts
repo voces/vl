@@ -59,18 +59,18 @@ const errorBlock = (out: string): string => {
   return lines.slice(start, end).join("\n");
 };
 
-// A BODY-phase refusal: a literal binding delivered to a record whose nested record drops a field,
-// then that field read (D3431), anchored at the read on line 7.
+// A BODY-phase refusal: a function value joining records with record fields handed to a generic
+// (D12454), anchored at that call on line 7.
 const BODY_WITNESS = `function twice(n: i32) {
   return n * 2
 }
-function main() {
-  const sv = { pet: { legs: 4, purr: true } }
-  const u: { pet: { legs: i32 } } = sv
-  print(sv.pet.purr)
-  print(twice(u.pet.legs))
+function ap<T>(g: () => T): T { return g() }
+function main(sel: i32) {
+  print(twice(sel))
+  const r = ap(() => if sel == 0 { { o: { f: 1 } } } else { { o: { f: "s" } } })
+  print(r.o.f)
 }
-main()
+main(0)
 `;
 
 Deno.test({
@@ -95,10 +95,10 @@ Deno.test({
           `expected the emit refusal to carry body.vl:<line>:<col>, got:\n${blk}`,
         );
       }
-      // The anchor is the refused `let` on line 7, not the last statement in the file.
+      // The anchor is the refused call on line 7, not the last statement in the file.
       if (!/at \S*body\.vl:7:\d+/.test(blk)) {
         throw new Error(
-          `expected the anchor on line 7 (the refused let), got:\n${blk}`,
+          `expected the anchor on line 7 (the refused call), got:\n${blk}`,
         );
       }
     } finally {

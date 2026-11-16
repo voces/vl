@@ -4,6 +4,20 @@ Lane STORE. This builds on the shadow (`2026-11-16-store-set-bind-shadow.md`). T
 `check_set_bind.vl` gains the delivery shapes the shadow's diff named. It is still a shadow: no
 decision reads it, and no program's wasm moves.
 
+## The record, settled
+
+The coordinator decided this on 2026-11-16 (recorded in `l2-inferred-interfaces-design.md` §4.3).
+L2-S2 did not answer the shape question.
+- **HandBack is a `Bound` kind, `BND_HANDBACK`, in the owner's `Iface`.** `on` is the parameter's
+  type, `a` its position, `site` the body.
+- **SetBind is call-keyed solver output beside `InstReq`, never in an `Iface`.** It has one row per
+  set: `on`, `a` the position, `b` the set, `c` the forwarded-from parameter, `site` the call, `fn`
+  the callee.
+  - The shadow's `fromFn` is gone: it is the declaration enclosing `site`.
+  - An `Iface` must not depend on its callers.
+- The producer still holds private arrays. It moves to these records in the first PR that switches
+  a decision class.
+
 ## Sources added
 
 | source | what it adds |

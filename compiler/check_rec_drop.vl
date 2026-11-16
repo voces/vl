@@ -49,6 +49,7 @@ import { nodeLineOf } from "./check_capture_loss"
 import { tErr } from "./check_relate_core"
 import { parenPeelIx } from "./check_places"
 import { recFreshDeclOf } from "./check_rec_fresh"
+import { recNestedWidthPair } from "./check_obj_shape"
 import { recAdOpen, recAdPushDrop } from "./check_rec_rows"
 import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
 import {
@@ -107,7 +108,8 @@ function recDropPlans(src: i32, srcTy: i32, dstTy: i32, depth: i32) {
   if depth <= 0 { return false }
   const p = cwPeelValue(src)
   if p < 0 || p >= P.nodes.length { return false }
-  if recDropLeafDst(p, srcTy, dstTy) >= 0 { return true }
+  const leaf = recDropLeafDst(p, srcTy, dstTy)
+  if leaf >= 0 { return !recDropNestedOwn(p, srcTy, leaf) }
   let any = false
   const n = recDropKids(p, srcTy, dstTy)
   let i = 0
@@ -289,6 +291,10 @@ function recDropFitsAt(own: i32, d: i32, depth: i32) {
 }
 // Why a use of binding `decl` other than the delivery `p` needs `own`'s layout and not `dst`'s, as
 // a clause of the refusal; "" when every such use reads a field `dst` stores as `own` does.
+// The opening of `recDropUseBlocks`'s clause for a use that reads a field the destination drops or
+// stores differently, the only use a reader of the binding's own layout makes.
+const REC_DROP_READ = "is read for `"
+
 function recDropUseBlocks(decl: i32, p: i32, own: i32, dst: i32): string {
   cwIxBuild()
   const o = tyAt(own)
@@ -308,13 +314,13 @@ function recDropUseBlocks(decl: i32, p: i32, own: i32, dst: i32): string {
       const df = objFieldType(d, m.memProp)
       const of = objFieldType(o, m.memProp)
       if df < 0 {
-        return "is read for `"
+        return REC_DROP_READ
           + m.memProp
           + "` on line "
           + i32ToStr(nodeLineOf(n))
       }
       if of < 0 || !fieldStorageEq(of, df, REC_STORE_DEPTH) {
-        return "is read for `"
+        return REC_DROP_READ
           + m.memProp
           + "`, which "
           + tyToStr(dst)
@@ -324,4 +330,26 @@ function recDropUseBlocks(decl: i32, p: i32, own: i32, dst: i32): string {
     }
   }
   return ""
+}
+
+// Whether fresh binding read `p`, a record wider than `dst` only inside a nested record, has a use
+// that needs its own layout: it is then taken at its own type, as an existing record is (D3431).
+function recDropNestedOwn(p: i32, srcTy: i32, dst: i32) {
+  const own = nonNulTyOf(srcTy)
+  if !recNestedWidthPair(own, dst) { return false }
+  const decl = recFreshDeclOf(p)
+  if decl < 0 || decl >= P.nodes.length { return false }
+  return recDropUseBlocks(decl, p, own, dst) != ""
+}
+
+// Whether `src`, a fresh binding of a record literal delivered as `dstTy`, has no use but field reads
+// (D16750): the drop adoption then builds it at `dstTy` or refuses the read, and no other rule does.
+export function recDropOnlyReads(src: i32, srcTy: i32, dstTy: i32): boolean {
+  const p = cwPeelValue(src)
+  const dst = recDropLeafDst(p, srcTy, dstTy)
+  if dst < 0 { return false }
+  const decl = recFreshDeclOf(p)
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const why = recDropUseBlocks(decl, p, nonNulTyOf(srcTy), dst)
+  return why == "" || why.slice(0, REC_DROP_READ.length) == REC_DROP_READ
 }
