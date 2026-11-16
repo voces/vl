@@ -252,14 +252,14 @@ Deno.test({
     // reported line 3, inside an unrelated `g`, and a reader following it looked at code
     // that had nothing to do with the failure.
     //
-    // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 18 of line 11,
+    // Two things fix it and this pins both: the expression floors are NODE-anchored
+    // (`emitFailAt`, here the `is` node → its operator token, 0-based col 18 of line 11,
     // printed 1-based as 11:19), and the start function arms a top-level STATEMENT cursor so
     // any other failure it raises lands on the statement instead of on a stale function.
     //
-    // The witness is a top-level `.length` on a generic identity's result over an empty `Map()`,
-    // still a loud field-access reject (D16207). The earlier witnesses lower since D15314,
-    // D15882 (D4266), D16049 and D16170.
+    // The witness is a top-level integer-literal `is` test over a float read through a generic
+    // identity's result, still a loud refusal anchored at its node (D3689). The earlier witnesses
+    // lower since D15314, D15882 (D4266), D16049, D16170, D16207 and D16725.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
       const path = `${dir}/case.vl`;
@@ -273,9 +273,9 @@ Deno.test({
           "}\n" +
           "print(pad(1))\n" +
           "const one = 1\n" +
-          "const two = 2\n" +
-          "print(one + two)\n" +
-          "print(take(Map()).length)\n",
+          "const d: f64 = 1.5\n" +
+          "print(one + d)\n" +
+          "print(take(d) is 1)\n",
       );
       const r = await build(path);
       if (r.code === 0) {
