@@ -1,0 +1,249 @@
+// `check_arrow_facts.vl` — the arrow rule's rows (`check_arrow.vl`) read as the facts the storage
+// decision takes at check time: each call through a hole callee, per set the callee holds there,
+// with each member's result at the call's closed argument types. One fact per (call, set); a set
+// two rows give different results is split, so no fact stands for it.
+// Built on demand from the tables the last check left: `arrowFactsBuild`.
+
+import { Call, FuncDecl, Ident, P, Param, i32ToStr, nodeAt } from "./ast"
+import {
+  arrowArgsOf,
+  arrowCalleeOf,
+  arrowCount,
+  arrowFromOf,
+  arrowHoleOf,
+} from "./check_arrow"
+import { fnTagMembers, fnTagSetOfTy } from "./check_elab_cap"
+import { setBindSetsOf } from "./check_set_bind"
+import { setMemberRetAt } from "./check_relate_core"
+import { TY_VOID, mkFuncTy } from "./check_types"
+import { parenPeelIx } from "./check_places"
+import { cwIxParent } from "./check_write_scan"
+import { tyHasTyVar } from "./tyquery"
+import { identDeclOf, nodeSrc } from "./symbols"
+import { i32ListEq, i32ListHas } from "./listutil"
+
+let afCall: i32[] = []
+let afSet: i32[] = []
+let afRs: i32[][] = []
+let afSlot: {[string]: i32} = Map()
+let afSplit: i32[] = []
+let afOpen: i32[] = []
+// Per parameter key `decl|i`, the sets its calls go through, directly or handed on.
+let afTakes: {[string]: i32[]} = Map()
+
+// Builds the facts from the arrow rows; returns how many stand.
+export function arrowFactsBuild(): i32 {
+  afCall = []
+  afSet = []
+  afRs = []
+  afSlot = Map()
+  afSplit = []
+  afOpen = []
+  afTakes = Map()
+  let r = 0
+  while r < arrowCount() {
+    const sets = arrowSetsOf(r)
+    const hole = arrowSrcOf(arrowHoleOf(r))
+    // An instance is keyed by the set only in a named, non-generic body, and only a named member
+    // has an instance of its own per argument types.
+    const closed = arrowArgsClosed(arrowArgsOf(r))
+      && arrowPerSetBody(arrowEnclosingFn(hole))
+    for st in sets {
+      arrowTakesNote(hole, arrowFromOf(r), st)
+      if closed && arrowNamedMembers(st) {
+        arrowFactNote(hole, st, arrowRsAt(st, arrowArgsOf(r)))
+      } else if !i32ListHas(afOpen, st) {
+        afOpen.push(st)
+      }
+    }
+    r = r + 1
+  }
+  return afCall.length
+}
+
+// The fact ids, in the order built.
+export function arrowFacts(): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < afCall.length {
+    if !i32ListHas(afSplit, afSet[i]) { out.push(i) }
+    i = i + 1
+  }
+  return out
+}
+
+// Fact `f`'s call node; -1 for an id that names no fact.
+export function arrowFactCallOf(f: i32): i32 {
+  return if f >= 0 && f < afCall.length { afCall[f] } else { -1 }
+}
+
+// Fact `f`'s set; -1 for an id that names no fact.
+export function arrowFactSetOf(f: i32): i32 {
+  return if f >= 0 && f < afSet.length { afSet[f] } else { -1 }
+}
+
+// What each member of fact `f`'s set returns at its call, in set order.
+export function arrowFactRsOf(f: i32): i32[] {
+  return if f >= 0 && f < afRs.length { afRs[f] } else { [] }
+}
+
+// The declared function whose body makes fact `f`'s call, or -1.
+export function arrowFactFnOf(f: i32): i32 {
+  return arrowEnclosingFn(arrowFactCallOf(f))
+}
+
+// The fact for call `c` through set `s`, or -1 when none stands.
+export function arrowFactAt(c: i32, s: i32): i32 {
+  if i32ListHas(afSplit, s) { return -1 }
+  return afSlot[i32ToStr(arrowSrcOf(c)) + "|" + i32ToStr(s)] ?? -1
+}
+
+// Whether some call through parameter `i` of `decl`, or through a parameter it is handed on to,
+// goes through set `s`.
+export function arrowParamTakes(decl: i32, i: i32, s: i32): boolean {
+  return i32ListHas(afTakes[i32ToStr(decl) + "|" + i32ToStr(i)] ?? [], s)
+}
+
+// Every set `arrowParamTakes` finds parameter `i` of `decl` taking.
+export function arrowParamTakesSets(decl: i32, i: i32): i32[] {
+  return afTakes[i32ToStr(decl) + "|" + i32ToStr(i)] ?? []
+}
+
+// Whether some call reaches set `s` at argument types left open, so no fact stands for it.
+export function arrowSetOpen(s: i32): boolean { return i32ListHas(afOpen, s) }
+
+// Whether set `s` has two facts at one call whose member results differ.
+export function arrowSetSplit(s: i32): boolean { return i32ListHas(afSplit, s) }
+
+// The sets row `r`'s hole callee holds: its own set; else, when it is a parameter (of the caller,
+// handed by the outer argument, or of the callee), every set the set-binding rows bring there.
+export function arrowSetsOf(r: i32): i32[] {
+  const own = fnTagSetOfTy(arrowCalleeOf(r))
+  if own >= 0 { return [own] }
+  const x = arrowFromOf(r)
+  if x >= 0 { return arrowParamSets(x) }
+  const h = arrowHoleOf(r)
+  const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
+  if !(hn is Call) { return [] }
+  return arrowParamSets(parenPeelIx(hn.callFn))
+}
+
+// The source node a copied node `x` comes from; `x` itself when it is a source node.
+export function arrowSrcOf(x: i32): i32 {
+  let y = x
+  let n = 0
+  while n < 64 {
+    const s = nodeSrc[y] ?? -1
+    if s < 0 || s == y { return y }
+    y = s
+    n = n + 1
+  }
+  return y
+}
+
+// Whether declared function `fd` is named and has no type parameters.
+function arrowPerSetBody(fd: i32): boolean {
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  return f is FuncDecl && f.fnName != "" && f.fnTyParams.length == 0
+}
+
+// Whether every member of set `s` is a named function.
+function arrowNamedMembers(s: i32): boolean {
+  for d in fnTagMembers(s) {
+    const f = nodeAt(d)
+    if !(f is FuncDecl) || f.fnName == "" { return false }
+  }
+  return true
+}
+
+// Whether every argument type is named and closed.
+function arrowArgsClosed(args: i32[]): boolean {
+  for a in args {
+    if a < 0 || tyHasTyVar(a) { return false }
+  }
+  return true
+}
+
+// What each member of set `s` returns at argument types `args`.
+function arrowRsAt(s: i32, args: i32[]): i32[] {
+  const ft = mkFuncTy(args, TY_VOID)
+  const rs: i32[] = []
+  for m in fnTagMembers(s) { rs.push(setMemberRetAt(m, ft)) }
+  return rs
+}
+
+// Notes the fact (call `c`, set `s`, results `rs`); a second fact of other results splits `s`.
+function arrowFactNote(c: i32, s: i32, rs: i32[]) {
+  const k = i32ToStr(c) + "|" + i32ToStr(s)
+  const f = afSlot[k] ?? -1
+  if f >= 0 {
+    if !i32ListEq(afRs[f], rs) && !i32ListHas(afSplit, s) { afSplit.push(s) }
+    return 0
+  }
+  afSlot[k] = afCall.length
+  afCall.push(c)
+  afSet.push(s)
+  afRs.push(rs)
+  return 0
+}
+
+// Notes that set `s` reaches the parameter hole call `c` goes through, and the caller's parameter
+// the outer argument `from` reads, which hands it on.
+function arrowTakesNote(c: i32, from: i32, s: i32) {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if cn is Call { arrowTakesAdd(parenPeelIx(cn.callFn), s) }
+  if from >= 0 { arrowTakesAdd(from, s) }
+  return 0
+}
+
+// Adds set `s` to the takes of the parameter name `x` reads, when it reads one.
+function arrowTakesAdd(x: i32, s: i32) {
+  const k = arrowParamKey(x)
+  if k == "" { return 0 }
+  const was = afTakes[k] ?? []
+  if !i32ListHas(was, s) {
+    was.push(s)
+    afTakes[k] = was
+  }
+  return 0
+}
+
+// `decl|i` for the parameter name `x` reads, "" when it reads none.
+function arrowParamKey(x: i32): string {
+  const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  if d < 0 || !(nodeAt(d) is Param) { return "" }
+  const e = if d < cwIxParent.length { cwIxParent[d] } else { -1 }
+  const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { nodeAt(d) }
+  if !(en is FuncDecl) { return "" }
+  let i = 0
+  while i < en.fnParams.length {
+    if en.fnParams[i] == d { return i32ToStr(e) + "|" + i32ToStr(i) }
+    i = i + 1
+  }
+  return ""
+}
+
+// The sets the set-binding rows bring to the parameter name `x` reads, [] when it reads none.
+function arrowParamSets(x: i32): i32[] {
+  const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  if d < 0 || !(nodeAt(d) is Param) { return [] }
+  const e = if d < cwIxParent.length { cwIxParent[d] } else { -1 }
+  const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { nodeAt(d) }
+  if !(en is FuncDecl) { return [] }
+  let i = 0
+  while i < en.fnParams.length {
+    if en.fnParams[i] == d { return setBindSetsOf(e, i) }
+    i = i + 1
+  }
+  return []
+}
+
+// The declared function whose body holds node `x`, or -1.
+function arrowEnclosingFn(x: i32): i32 {
+  let p = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  while p >= 0 && p < P.nodes.length {
+    if nodeAt(p) is FuncDecl { return p }
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  return -1
+}

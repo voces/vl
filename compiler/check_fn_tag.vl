@@ -176,6 +176,19 @@ import {
   mintSetPartial,
   mintStoreSetOf,
 } from "./check_mint"
+import {
+  arrowFactAt,
+  arrowFactCallOf,
+  arrowFactFnOf,
+  arrowFactRsOf,
+  arrowFactSetOf,
+  arrowFacts,
+  arrowFactsBuild,
+  arrowParamTakes,
+  arrowParamTakesSets,
+  arrowSetOpen,
+  arrowSetSplit,
+} from "./check_arrow_facts"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
 import { identFnDeclOf } from "./check_scopes"
@@ -372,6 +385,12 @@ export function fnTagDecide(rootIx: i32) {
   const calls = fnTagCalls()
   const mint = mintFactRows()
   const sbTry = if ftLate { [] } else { setBindTrySets(P.nodes.length) }
+  // The arrow rule's facts read the set-binding rows `setBindTrySets` just built.
+  ftCheckFacts = []
+  if !ftLate {
+    arrowFactsBuild()
+    ftCheckFacts = arrowFacts()
+  }
   // The decision after the elaboration sees the deliveries the check's decision took.
   ftEscapes = if ftLate { ftEscLast } else { fnTagEscapesTake() }
   ftLateCloXs = []
@@ -597,6 +616,19 @@ let ftLateRefused: i32[] = []
 // member calls. A read of a smaller set stored where `s` is held is decided with it: both are
 // tagged or neither, since the store hands the smaller set's id on as one of `s`.
 function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
+  ftTryWith(rootIx, s, calls, mint)
+  // Before the elaboration, a set its own reading leaves undecided is asked again with the
+  // arrow rule's facts, which stand for the instances' calls the elaboration has not yet made.
+  if !ftLate && !fnTagSetIsTagged(s) && ftCheckFacts.length > 0 {
+    ftUseArrow = true
+    ftTryWith(rootIx, s, calls, ftCheckFacts)
+    ftUseArrow = false
+  }
+  return 0
+}
+
+// `ftTry` reading facts `mint`.
+function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   if fnTagSetIsTagged(s) { return 0 }
   if ftLate && i32ListHas(ftLateRefused, s) { return 0 }
   ftPlReset()
@@ -847,8 +879,8 @@ function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
     if fnTagCallSetOf(c) == s { ftBuildArms(c, s, ds, leafTy) }
   }
   for fr in mint {
-    if mintFactSetOf(fr) == s {
-      ftBuildArmsAt(mintFactCallOf(fr), s, ds, leafTy, mintFactRsOf(fr))
+    if ftFactSetOf(fr) == s {
+      ftBuildArmsAt(ftFactCallOf(fr), s, ds, leafTy, ftFactRsOf(fr))
     }
   }
   return 0
@@ -880,7 +912,7 @@ function ftMemberSeenAtArms(
     if fnTagCallSetOf(c) == s { sites.push(c) }
   }
   for r in mint {
-    if mintFactSetOf(r) == s { sites.push(mintFactCallOf(r)) }
+    if ftFactSetOf(r) == s { sites.push(ftFactCallOf(r)) }
   }
   const under: Map<i32, boolean> = Map()
   const todo: i32[] = [pn.fnBody]
@@ -973,6 +1005,9 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   ftWideSeen = false
   ftBindsCur = []
   ftHeldCur = []
+  // Before the elaboration, a set some call reaches at open argument types, or at results that
+  // differ by caller, has no fact to build that call's arms from.
+  if ftUseArrow && (arrowSetOpen(s) || arrowSetSplit(s)) { return false }
   if !ftScan(rootIx, s, ds, leaves, ids) { return false }
   // A function a member's tail returns into `s` returns each member it names as `s`'s id, though
   // nothing calls it (D15457).
@@ -1061,11 +1096,9 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   }
   // A parameter whose calls go through `s` holds what each parameter handed on to it is handed, so
   // the smaller sets those hands carry are decided with it (D15610).
-  if ftLate {
+  if ftLate || ftUseArrow {
     for r in mint {
-      if mintFactSetOf(r) == s {
-        ftFwdInSubsets(mintFactCallOf(r), s, leaves, ids)
-      }
+      if ftFactSetOf(r) == s { ftFwdInSubsets(ftFactCallOf(r), s, leaves, ids) }
     }
   }
   // A member call names the member as its leaves do, so each member needs one.
@@ -1120,14 +1153,14 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   }
   for r in mint {
     if (
-      mintFactSetOf(r) == s
-      && !ftPlainArgsIn(mintFactCallOf(r), once, false, s)
+      ftFactSetOf(r) == s
+      && !ftPlainArgsIn(ftFactCallOf(r), once, false, s)
     ) {
       return false
     }
   }
   for r in mint {
-    if mintFactSetOf(r) == s && !ftMintComplete(r, s) { return false }
+    if ftFactSetOf(r) == s && !ftMintComplete(r, s) { return false }
   }
   // After the elaboration, a set the check left a closure is tagged only where every instance
   // of a function calling through it binds it there.
@@ -1150,7 +1183,7 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
 // Whether every call through the parameter fact row `r`'s call names has a fact of set `s` in
 // `r`'s instance: a call the instance's typing never reached has no arms, so its set stays as is.
 function ftMintComplete(r: i32, s: i32): boolean {
-  const c = mintFactCallOf(r)
+  const c = ftFactCallOf(r)
   if c < 0 || c >= P.nodes.length { return false }
   const n = nodeAt(c)
   if !(n is Call) { return false }
@@ -1177,7 +1210,7 @@ function ftMintComplete(r: i32, s: i32): boolean {
       const at = cwIxNode[ow.row]
       const m = nodeAt(at)
       if m is Call && identDeclOf(m.callFn) == pd {
-        if mintFactSetOf(mintFactInScope(r, at)) != s { return false }
+        if ftFactSetOf(ftFactInScope(r, at)) != s { return false }
       }
     }
   }
@@ -1211,11 +1244,11 @@ function ftForInIterOf(x: i32): i32 {
 // `ftMintComplete` for a call through an element chain off parameter `pd`: every call
 // in fact row `r`'s function whose callee chain starts at `pd` has a fact of set `s` there.
 function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
-  const fn = mintFactFnOf(r)
+  const fn = ftFactFnOf(r)
   if fn < 0 || fn >= P.nodes.length { return false }
   const f = nodeAt(fn)
   if !(f is FuncDecl) { return false }
-  const c = mintFactCallOf(r)
+  const c = ftFactCallOf(r)
   const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
   const path = if cn is Call { ftChainFields(parenPeelIx(cn.callFn)) } else { "" }
   const todo: i32[] = [f.fnBody]
@@ -1230,7 +1263,7 @@ function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
           && !ftPushOntoParamList(m, pd, f)
           && ftChainFields(parenPeelIx(m.callFn)) == path
         ) {
-          if mintFactSetOf(mintFactInScope(r, x)) != s { return false }
+          if ftFactSetOf(ftFactInScope(r, x)) != s { return false }
         }
         nodeChildrenPush(x, todo)
       }
@@ -3776,7 +3809,7 @@ function ftParamForwardsSet(d: i32, i: i32, s: i32): boolean {
             return false
           }
           for m in ms {
-            if !mintParamTakes(m, at, s) { return false }
+            if !ftParamTakes(m, at, s) { return false }
           }
           seen = true
         }
@@ -3919,12 +3952,12 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
     // A parameter handed on to calls through a wider set decided with `s` holds `s`'s id as one of
     // that set's (D15610).
     for w in ftAssume {
-      if w != s && fnTagMembersWithin(s, w) && mintParamTakes(d, i, w) {
+      if w != s && fnTagMembersWithin(s, w) && ftParamTakes(d, i, w) {
         return true
       }
     }
     // So does one whose every wider set holds `s`, each decided with it.
-    const ws = mintParamTakesSets(d, i)
+    const ws = ftParamTakesSets(d, i)
     if ws.length == 0 { return false }
     for w in ws {
       if w == s || !fnTagMembersWithin(s, w) { return false }
@@ -4003,7 +4036,7 @@ function ftLateParamTakes(c: Call, d: i32, i: i32, s: i32): boolean {
   // since the binding holds the id the parameter is handed.
   const seeds = ftParamSeedsWider(d, i, s)
   return seeds
-    || mintParamTakes(d, i, s)
+    || ftParamTakes(d, i, s)
     || ftParamUnread(d, i)
     || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
     || ftArgIsParam(c, i) && ftParamInert(d, i, 0)
@@ -4061,7 +4094,8 @@ function ftWiderWith(ws: i32[], s: i32): boolean {
 // parameter every member's calls through take as set `s`, so the id is what each member reads.
 // Only a value read off a binding, element or field is such a callee.
 function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
-  if !ftLate || mintSetPartial(s) { return false }
+  if !ftLate && !ftUseArrow { return false }
+  if ftLate && mintSetPartial(s) { return false }
   const i = i32ListIndexOf(c.callArgs, x)
   if i < 0 || (i < c.callArgNames.length && c.callArgNames[i] != "") {
     return false
@@ -4085,7 +4119,7 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   if ds.length == 0 { return false }
   // A member that never reads the parameter takes any id, as `ftLateParamTakes` lets it (D15038).
   for d in ds {
-    if !mintParamTakes(d, i, s) && !ftParamUnread(d, i) { return false }
+    if !ftParamTakes(d, i, s) && !ftParamUnread(d, i) { return false }
   }
   // A call through a closure of named functions takes the closure's one signature, which holds
   // `s`'s id only where no instance hands the members' parameter another set; else the callee's
@@ -4114,7 +4148,7 @@ function ftAllNamed(ds: i32[]): boolean {
 // than `s`.
 function ftParamTakesOther(ds: i32[], i: i32, s: i32): boolean {
   for d in ds {
-    for o in mintParamSetsOf(d, i) {
+    for o in ftParamSetsOf(d, i) {
       if o != s { return true }
     }
   }
@@ -4130,14 +4164,14 @@ function ftParamSetsTake(par: i32, i: i32, s: i32): boolean {
   const f = nodeAt(fd)
   if !(f is FuncDecl) { return false }
   const j = i32ListIndexOf(f.fnParams, par)
-  const sets = mintParamSetsOf(fd, j)
+  const sets = ftParamSetsOf(fd, j)
   if j < 0 || sets.length == 0 { return false }
   for ss in sets {
     const ds = fnTagMembers(ss)
     if ds.length == 0 { return false }
     for d in ds {
       const m = nodeAt(d)
-      if !(m is FuncDecl) || m.fnName == "" || !mintParamTakes(d, i, s) {
+      if !(m is FuncDecl) || m.fnName == "" || !ftParamTakes(d, i, s) {
         return false
       }
     }
@@ -5682,4 +5716,50 @@ function ftLocalAliasedFn(d: i32): i32 {
   if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return d }
   const f = identDeclOf(v)
   return if f >= 0 && f < P.nodes.length && nodeAt(f) is FuncDecl { f } else { d }
+}
+
+// The check's facts (`check_arrow_facts.vl`), and whether the plan reads them in place of the
+// elaboration's mint facts: only on a retry of a set the check's own reading left undecided.
+let ftCheckFacts: i32[] = []
+let ftUseArrow = false
+
+// Fact `r`'s set.
+function ftFactSetOf(r: i32): i32 {
+  return if ftUseArrow { arrowFactSetOf(r) } else { mintFactSetOf(r) }
+}
+
+// Fact `r`'s call node.
+function ftFactCallOf(r: i32): i32 {
+  return if ftUseArrow { arrowFactCallOf(r) } else { mintFactCallOf(r) }
+}
+
+// What each member of fact `r`'s set returns at its call.
+function ftFactRsOf(r: i32): i32[] {
+  return if ftUseArrow { arrowFactRsOf(r) } else { mintFactRsOf(r) }
+}
+
+// The declared function of fact `r`'s call.
+function ftFactFnOf(r: i32): i32 {
+  return if ftUseArrow { arrowFactFnOf(r) } else { mintFactFnOf(r) }
+}
+
+// The fact standing for call `at` where fact `r` stands: in its instance after the elaboration,
+// through its set before it, since an instance is keyed by the set.
+function ftFactInScope(r: i32, at: i32): i32 {
+  return if ftUseArrow { arrowFactAt(at, arrowFactSetOf(r)) } else { mintFactInScope(r, at) }
+}
+
+// Whether some call through parameter `i` of `decl` goes through set `s`.
+function ftParamTakes(decl: i32, i: i32, s: i32): boolean {
+  return if ftUseArrow { arrowParamTakes(decl, i, s) } else { mintParamTakes(decl, i, s) }
+}
+
+// Every set `ftParamTakes` finds parameter `i` of `decl` taking.
+function ftParamTakesSets(decl: i32, i: i32): i32[] {
+  return if ftUseArrow { arrowParamTakesSets(decl, i) } else { mintParamTakesSets(decl, i) }
+}
+
+// The sets calls through parameter `i` of `decl` go through.
+function ftParamSetsOf(decl: i32, i: i32): i32[] {
+  return if ftUseArrow { arrowParamTakesSets(decl, i) } else { mintParamSetsOf(decl, i) }
 }
