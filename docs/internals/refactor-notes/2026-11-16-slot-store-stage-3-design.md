@@ -84,11 +84,12 @@ gate applies it.
   It switches to that `KeyId` once A0, a shadow comparing the check's keys with the elaboration's,
   reports them equal for the instances that hold written slots, or once an A stage makes the
   check's key the one mono builds from (STORE, 2026-11-16).
-- **The node replacements of §5** are mono's flow rewrite (`mfrElabFns`), which only gates the
-  rewrite: the answer is already the elaboration's. L2's population table (branch `l2-mfr-measure`,
-  `$VL_REP_SHADOW=1`), with the four programs added by name, says which rung answers each; if
-  L2's move of that rewrite to check lands, they leave stage 3's scope. Stage 3 designs nothing
-  for them until that table is in.
+- **The node replacements of §5** are mono's flow rewrite (`mfrElabFns` / `mfrElabNames`), which
+  only gates the rewrite: the answer is already the elaboration's. L2's population table (#8859,
+  refactor-notes/2026-11-16-l2-read-resolution.md) holds all four, and every ask on them gives the
+  same answer at the end of `elabPrepare` as at mono (1,790 of the 1,792 calls mono asks across the
+  corpus). L2 proposes the query move into the elaboration, asked by check; stage 3 then reads that
+  query where a class reader meets a replaced node, and designs nothing else for them.
 
 ## 4. Acceptance
 
