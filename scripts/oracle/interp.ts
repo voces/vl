@@ -1808,8 +1808,10 @@ export class Interp {
 
   cast(e: Extract<Expr, { k: "as" }>, env: Env): Val {
     // T2.4: a radix constant tree takes a 64-bit cast target as its width (ruling 4.2); an `i32`
-    // target reads a wide tree at i64 before its range check, below.
-    const wide = e.mode !== "as%" && e.ty.k === "name" && (e.ty.name === "i64" || e.ty.name === "f64");
+    // target reads a wide tree at i64 before its range check, below. `as% i64` reads it at its
+    // exact value too (D16494).
+    const to64 = e.ty.k === "name" && (e.ty.name === "i64" || e.ty.name === "f64");
+    const wide = to64 && (e.mode !== "as%" || (e.ty.k === "name" && e.ty.name === "i64"));
     let v = this.eval(e.e, env, wide && ((isConstTree(e.e) && treeHas(e.e, "radix")) || (!isConstTree(e.e) && constLike(e.e))) ? e.ty : null);
     const t = this.resolve(e.ty, env);
     if (t.k !== "name" || !NUMERIC.has(t.name) || (typeof v !== "boolean" && !(v instanceof Lit) && !numKind(v))) {
@@ -1849,10 +1851,10 @@ export class Interp {
       return r;
     }
     // D3053 ruling (A): under `as% i64` a radix literal, or a chain of negations over one, is the
-    // constant its digits spell; another radix tree there has no ruling (D16494).
+    // constant its digits spell, and a radix tree is its exact value (D16494).
     if (v instanceof Lit && v.radix && e.mode === "as%" && k === "i64") {
       if (v.lone || negatedRadix(e.e)) return wrap64(v.i!);
-      if (v.radix !== 64 && !v.wideDec) throw new Unsupported("spec gap: a radix constant tree under `as% i64` (D16494)");
+      return wrap64(v64(v));
     }
     if (v instanceof Lit) v = litDefault(v);
     const src = numKind(v);
