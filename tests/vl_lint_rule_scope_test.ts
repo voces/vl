@@ -38,6 +38,7 @@ const INTERNAL = [
   "kind-ladder-incomplete",
   "literal-byte-write",
   "sentinel-index-unguarded",
+  "walk-limit",
 ] as const;
 /** The LANGUAGE control: it fires wherever the file sits. */
 const LANGUAGE = "prefer-const";
@@ -84,8 +85,12 @@ function lower(t: { fnBody: i32 }) {
   t.fnBody = 1
   return 0
 }
+function deep(n: i32, depth: i32): i32 {
+  if depth > 8 { return n }
+  return deep(n + 1, depth + 1)
+}
 function label(x: i32): string { return "n=\\{x}" }
-let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f) + put({ nKid: 2 }) + lower({ fnBody: 0 })
+let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f) + put({ nKid: 2 }) + lower({ fnBody: 0 }) + deep(0, 0)
 print(label(total))
 `;
 
