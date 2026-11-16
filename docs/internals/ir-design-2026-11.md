@@ -743,6 +743,24 @@ claim evidence on every merge. The first PR that makes CLAIMED non-empty adds a 
 unarmed row that asserts zero `claim fell back`, with a verifier fallback counted as a hard
 failure.
 
+**A coverage step is graded on coverage, not lines.** Some steps widen what the builder covers
+where legacy has no IR duplicate to delete, so they cannot be net-negative in lines. An example is
+taking a construct's legacy arm through the op seam for a rep the builder did not admit. Such a
+step is exempt from the net-negative bar and meets these bars instead:
+- byte identity;
+- the shadow all-matched;
+- mode-3 claiming byte-identical;
+- its PR body states the covered functions gained per compiler line added;
+- the first-miss histogram before and after, with the targeted row falling.
+
+C2e (list length) is the first.
+
+**A shared arm takes no callbacks.** When legacy and the IR write the same arm around different
+operand writers, the arm splits into halves around the operands: a decision half before them,
+and a writer half after them (`scalarListHoistOf` and `scalarListGetTail`). It does not take
+closures. A capturing lambda version of the scalar list read cost +3.9% L2 fuel and 21 KB of
+seed (C2c).
+
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
