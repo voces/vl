@@ -1,7 +1,8 @@
 // `$VL_IFACES=1`, L2 S0's shadow interfaces (`compiler/check_iface_shadow.vl`): armed, a compile
 // prints one `[iface] <path>: fn …` row per un-annotated top-level function, then the instance
-// vector's `instvec` summary; unarmed, or for a program with no un-annotated function, none. The L2 grading reads these rows, so a host
-// or seed that stopped printing them, or changed their shape, would leave it reading nothing.
+// vector's `instvec` summary; unarmed, or for a program with no un-annotated function, none.
+// The L2 grading reads these rows, so a host or seed that stopped printing them, or changed their
+// shape, would leave it reading nothing.
 //
 // @test-timing native
 
