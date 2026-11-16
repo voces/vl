@@ -59,6 +59,7 @@ import {
   tyLitMemberTexts,
   tyMutEpoch,
   tySame,
+  tyUnionWalkEnter,
   tyValOf,
 } from "./check_types"
 import { i32ListHas, strListHas } from "./listutil"
@@ -1400,16 +1401,22 @@ export function tyIsV128Brand(ty: i32): boolean {
 
 // Whether the declared type `ty` names the newtype `nom` itself or as a union or nullable
 // member — the shapes a `self` of that newtype can take. Names only: no structural comparison.
-export function tyNamesNominal(ty: i32, nom: string, depth: i32): boolean {
-  if ty < 0 || depth <= 0 { return false }
+export function tyNamesNominal(ty: i32, nom: string): boolean {
+  const seen: i32[] = []
+  return tyNamesNominalIn(ty, nom, seen)
+}
+
+function tyNamesNominalIn(ty: i32, nom: string, seen: i32[]): boolean {
+  if ty < 0 { return false }
+  if !tyUnionWalkEnter(ty, seen) { return false }
   if nomNameOfTy(ty) == nom { return true }
   const inner = nonNullTy(ty)
-  if inner != ty { return tyNamesNominal(inner, nom, depth - 1) }
+  if inner != ty { return tyNamesNominalIn(inner, nom, seen) }
   const t = tyAt(ty)
   if t is TyUnion {
     let i = 0
     while i < t.uMembers.length {
-      if tyNamesNominal(t.uMembers[i], nom, depth - 1) { return true }
+      if tyNamesNominalIn(t.uMembers[i], nom, seen) { return true }
       i = i + 1
     }
   }
@@ -1417,21 +1424,31 @@ export function tyNamesNominal(ty: i32, nom: string, depth: i32): boolean {
 }
 
 // Whether `ty` is a literal type or a union of them, nullable or not, or a list of one.
-export function tyIsLitUnionLike(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+export function tyIsLitUnionLike(ty: i32): boolean {
+  const seen: i32[] = []
+  return tyIsLitUnionLikeIn(ty, seen)
+}
+
+function tyIsLitUnionLikeIn(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  if !tyUnionWalkEnter(ty, seen) { return false }
   const t = tyAt(ty)
   if t is TyLit { return true }
-  if t is TyNullable { return tyIsLitUnionLike(t.nInner, depth - 1) }
-  if t is TyArray { return tyIsLitUnionLike(tyElemOf(t), depth - 1) }
+  if t is TyNullable { return tyIsLitUnionLikeIn(t.nInner, seen) }
+  if t is TyArray { return tyIsLitUnionLikeIn(tyElemOf(t), seen) }
+  // `seen` is the path of unions entered, not every one visited: a union met again on another
+  // branch is answered afresh, and only a cycle back to an open one answers false.
   if t is TyUnion {
     let lits = 0
+    let all = true
     for m in t.uMembers {
-      if !isNullTy(m) {
-        if !tyIsLitUnionLike(m, depth - 1) { return false }
+      if all && !isNullTy(m) {
+        if !tyIsLitUnionLikeIn(m, seen) { all = false }
         lits = lits + 1
       }
     }
-    return lits > 0
+    seen.pop()
+    return all && lits > 0
   }
   return tyNotLitUnionLike()
 }
@@ -1587,20 +1604,26 @@ export function tyHoldsNonI32Num(ty: i32, depth: i32): boolean {
 
 // Whether a member of `ty`, through unions and `| null` only, is `i64` or `f64`: the check
 // ahead of `unionLeavesInto`, which allocates.
-export function unionLeafIsWide(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+export function unionLeafIsWide(ty: i32): boolean {
+  const seen: i32[] = []
+  return unionLeafIsWideIn(ty, seen)
+}
+
+function unionLeafIsWideIn(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  if !tyUnionWalkEnter(ty, seen) { return false }
   const t = tyAt(ty)
   match t {
     TyPrim => {
       return t.primName == "i64" || t.primName == "f64"
     }
     TyNullable => {
-      return unionLeafIsWide(t.nInner, depth - 1)
+      return unionLeafIsWideIn(t.nInner, seen)
     }
     TyUnion => {
       let i = 0
       while i < t.uMembers.length {
-        if unionLeafIsWide(t.uMembers[i], depth - 1) { return true }
+        if unionLeafIsWideIn(t.uMembers[i], seen) { return true }
         i = i + 1
       }
       return false
