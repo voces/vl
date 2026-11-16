@@ -41,9 +41,19 @@ solver no longer reads them.
 
 ## Gates
 
-On master `49648fba`, with S3.0 (#8560) under this step:
+Re-proved after merging master `0ba90ffd`, into which S3.0 (#8560) merged squashed:
+- two refreshes from that master's fixpoint seed are cmp-identical;
+- 20,601 programs fingerprint identically, both seeds run from one worktree;
+- `lint-self.sh` is clean.
+
+Before that, on master `49648fba` with S3.0 under this step:
 - Two refreshes from master's fixpoint seed are cmp-identical, and 20,590 programs fingerprint
   identically, both seeds run from one worktree.
+- `regress.vl`: 0 runs → not-runs. Its 23 `d551_*` movements are master's own.
+- `decl-order-ab.vl`: 16 of 5,268 cases move, 0 to a clause-1 outcome, 0 not in the baseline.
+- The 228 hole and inferred matrices: 0 runs → not-runs, 0 of 15,476 rows changed.
+- `GATE_IN_WORKTREE=1 scripts/gate.sh`: every row passes except `ir shadow`, whose 0 → 1 mismatch
+  master's own seed also reports.
 - `lint-self.sh`: clean.
 - L2 self-compile guest fuel, master seed compiling each source at one path length:
   92,137,608,129 against S3.0's 92,120,785,121 (+0.018%).
