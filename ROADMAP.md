@@ -61,7 +61,6 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 8. **`Buf` memory safety:** fix or accept (open-rulings §E,
    [Track B](docs/roadmap/track-b-codegen.md)).
 9. **Undeclared-identifier "did you mean"**, in [Track A](docs/roadmap/track-a-types.md).
-10. **`docs/guide/soundness.md` fixes**, in [Track A](docs/roadmap/track-a-types.md).
 
 ## Parked: ruled low priority, or built on ask
 
