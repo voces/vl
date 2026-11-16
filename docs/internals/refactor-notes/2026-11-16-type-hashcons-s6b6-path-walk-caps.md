@@ -12,15 +12,22 @@ walkers mix three kinds:
 - collectors that fill an `out` list (`riuFlatMembers`).
 
 A shared visited list is wrong for the last two whenever one union is reached by two branches. A
-**path** is right for all three. Each union or record row is pushed when the walk enters it and popped
-when it leaves (`tyPathEnter`). Only a cycle back to a row still open short-circuits, and it returns
-exactly what the old cap returned on exhaustion (`false` for 19, `true` for `elemTyIsNominalAt` and
-`ihBearsStrLit`). So no answer can change except on a recursive type deeper than the old cap.
+**path** is right for all three: the union and record rows on the way down to the current type. Only
+a cycle back to a row on the path short-circuits, and it returns exactly what the old cap returned on
+exhaustion (`false` for 19, `true` for `elemTyIsNominalAt` and `ihBearsStrLit`). So no answer can
+change except on a recursive type deeper than the old cap.
 
-Each walker `F(…, depth)` becomes three functions:
-- `F(…)`: the wrapper;
-- `FIn(…, path)`: enters the path, calls the body, pops;
-- `FBody(…, path)`: the old body, its recursive calls going to `FIn`.
+Each walker `F(…, depth)` becomes two functions:
+- `F(…)`: the wrapper, which owns an empty path;
+- `FIn(…, path)`: the old body, opening with a fixed two-line idiom, its recursive calls passing `sub`:
+
+```
+if tyPathCycles(t, path) { return false }
+const sub = tyPathWith(t, path)
+```
+
+`tyPathWith` (`check_types.vl`) returns a copy extended by `t` when `t` is a union or record row, and
+`path` itself otherwise, so a sibling branch never sees another's entries and nothing is popped.
 
 A scratch script made the change (in the session scratchpad, not committed). It reads each guard's
 return value as the cycle answer.
@@ -40,7 +47,7 @@ return value as the cycle answer.
 None of their cap sites fired in the 6a census.
 
 **Left out:**
-- `monoTyHasFieldRecord` and `monoTyHoldsGradual` (`emit_mono.vl`): the transform adds two functions
+- `monoTyHasFieldRecord` and `monoTyHoldsGradual` (`emit_mono.vl`): the transform adds a function
   each, and `emit_mono.vl`'s function count is the pin-helper budget.
 - The pair walks (`fnShapeClash`, `recCopyNarrowsAt`, `fvaHeldHoleFnDiffers`, `frsClosesHoles`).
 - `valueUnionFlatten`, which takes a list.
@@ -51,16 +58,16 @@ None of their cap sites fired in the 6a census.
 ## Census
 
 The phase-state census lists the type arena's structural accessors in `TY_ARENA_API`, outside each
-module's checker surface. `tyPathEnter` reads a row's kind by type id, so it joins that list, which is
-the route the census header gives for a new accessor. The nine emit files that call it then raise no
-surface.
+module's checker surface. `tyPathCycles` and `tyPathWith` read a row's kind by type id, so they join
+that list, which is the route the census header gives for a new accessor. The nine emit files that
+call them then raise no surface.
 
 ## Measurements
 
 | reading | value |
 |---|---|
-| seed | fixpoint, branch and base (master 0ba90ffdb); every refresh exits 0. The comment rewording afterwards leaves the seed byte-identical |
-| identity | 2,827 of 2,827 byte-identical: the 2,000-file sample with `compiler/entry.vl`, 800 union, literal and nullable cases, and every recursive or cyclic corpus file |
+| seed | fixpoint, branch and base (master 0ba90ffdb); every refresh exits 0; re-taken after the two-function rework |
+| identity | 2,827 of 2,827 byte-identical after the rework: the 2,000-file sample with `compiler/entry.vl`, 800 union, literal and nullable cases, and every recursive or cyclic corpus file |
 | probes | the eight recursive-type programs of 6b-4 and 6b-5 terminate and print the same |
-| guest fuel, fixed input | 92,402,820,201 → 92,407,331,564 (+0.005%) |
-| net compiler lines | +340 over 21 files: three functions where there was one, at about 15 lines each |
+| guest fuel, `compiler/entry.vl` of this tree | 92,438,697,581 → 92,444,581,530 (+0.006%) |
+| net compiler lines | +199 over 21 files: about nine a walker (the wrapper, the idiom, two import names) and 18 for the two helpers |
