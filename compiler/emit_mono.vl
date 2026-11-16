@@ -3356,6 +3356,23 @@ function monoCloneBodyRaw(
       return mkForInCopy(n, n.fiIter, cb)
     }
     RetStmt => {
+      // A relay twin returns its own copy of a maker call noted per twin (a result below -1), callee
+      // read copied too, built at the twin's result: the shared node points every twin at one (D16755).
+      const tcx = if monoBuild.twinRet >= 0 && n.retArg >= 0 { unwrapParen(n.retArg) } else { -1 }
+      const tcn = if tcx >= 0 && tcx < P.nodes.length { nodeAt(tcx) } else { null }
+      if tcn is Call && elabMakerCallSig(tcx) < -1 {
+        const tr = unwrapParen(tcn.callFn)
+        const trn = if tr >= 0 && tr < P.nodes.length { nodeAt(tr) } else { null }
+        if trn is Ident {
+          const nr = monoCopyOf(tr, mkIdent(trn.identName, trn.pos))
+          nodeTyRecord(nr, nodeTyIxOf(tr))
+          const nc = monoCopyOf(tcx, mkCall(nr, tcn.callArgs, tcn.pos))
+          nodeTyRecord(nc, nodeTyIxOf(tcx))
+          monoNoteCallTpl(tcx, nc)
+          if nc >= 0 { monoBuild.twinCalls.set(nc, monoBuild.twinRet) }
+          return mkReturn(nc, n.pos)
+        }
+      }
       // The return value may be a block or `if` expression carrying its own `LetDecl`s.
       const ca = monoCloneBody(n.retArg, typarams, tvN, tvV, bN, bT)
       const cl = if ca == n.retArg { monoRetBoundLitCopy(ca) } else { ca }
@@ -8275,7 +8292,15 @@ export function monoStateReset() {
 
 // Empties the instance-binding tables, which `monomorphize` fills and the classifiers read.
 export function monoSubTablesReset() {
-  monoBuild = { own: "", bindN: [], bindT: [], widenRet: false, baked: false }
+  monoBuild = {
+    own: "",
+    bindN: [],
+    bindT: [],
+    widenRet: false,
+    baked: false,
+    twinRet: -1,
+    twinCalls: Map(),
+  }
   monoArgInstFe = Map()
   monoRenamedFe = Map()
   monoOpenArgCall = 0 - 1
@@ -8374,6 +8399,8 @@ function monoMakeInstance(
     bindT: tvT,
     widenRet: false,
     baked: monoCadBaked(cbFnNames),
+    twinRet: -1,
+    twinCalls: Map(),
   }
   const rc = monoMakeInstanceGo(
     req,
@@ -8403,6 +8430,10 @@ type MonoBuild = {
   bindT: i32[],
   widenRet: boolean,
   baked: boolean,
+  // A relay twin's result while its body is built, and each maker call that body returns, copied
+  // for this twin and built at that result (D16755).
+  twinRet: i32,
+  twinCalls: {[i32]: i32},
 }
 
 let monoBuild: MonoBuild = {
@@ -8411,6 +8442,8 @@ let monoBuild: MonoBuild = {
   bindT: [],
   widenRet: false,
   baked: false,
+  twinRet: -1,
+  twinCalls: Map(),
 }
 
 // The owner key of template slot `origFe`'s type parameters: its name when it is the top-level
@@ -10159,6 +10192,7 @@ function monoMakeInstanceGo(
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
     monoMakeInstanceHoles(holeN, holeT)
+    monoBuild.twinRet = if retWiden { req.retWidenTy } else { -1 }
     const instBody0L = monoMakeInstanceBodyPinned(
       fn,
       origFe,
@@ -10172,6 +10206,7 @@ function monoMakeInstanceGo(
       holeN,
       holeT,
     )
+    monoBuild.twinRet = -1
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
     const instBody = monoMakeInstanceBodyRewrite(
@@ -23454,10 +23489,12 @@ function monoWalkIdentCall(
       && !fnTagTyIsTagged(nodeTyIxOf(ix))
       && !fnTagRetIsTagged(monoOrigNode[fe])
     ) {
-      const ms = elabMakerCallSig(ix)
+      // A relay twin's copy of its returned maker call is built at the twin's result (D16755).
+      const twinMs = monoBuild.twinCalls.get(ix) ?? -1
+      const ms = if twinMs >= 0 { twinMs } else { elabMakerCallSig(ix) }
       const mc = nodeAt(ix)
       // A call in an instanced body is one node for every instance; it keeps its path.
-      const shared = ctx >= 0 && monoCadInstOf(ctx) >= 0
+      const shared = twinMs < 0 && ctx >= 0 && monoCadInstOf(ctx) >= 0
       if (
         ms >= 0
         && mc is Call
@@ -23469,6 +23506,14 @@ function monoWalkIdentCall(
         nodeTyRecord(ix, ms)
         return 0
       }
+    }
+    // A relay twin's copy that reached no twin of its maker would call the maker's root at
+    // another result.
+    if monoBuild.twinCalls.has(ix) {
+      return emitFailAt(
+        "emitProgram: internal: a relay's twin returns a maker call the elaboration built no twin of at the twin's result",
+        ix,
+      )
     }
     // A CONCRETE callee: specialize it per non-capturing callback (no-op if none) — the
     // concrete analogue of `monoInstantiate`'s callback baking.
