@@ -2,7 +2,14 @@
 // refusals, `if`-tail and `break` checks, duplicate keys, map-key and bound checks, and the
 // function-slot bookkeeping (`fsb*`) a stored function value is checked against.
 
-import { identDepthOf, identFnAliasOf, identFnDeclOf } from "./check_scopes"
+import {
+  identDepthOf,
+  identFnAliasOf,
+  identFnDeclOf,
+  scopeVisibleNames,
+} from "./check_scopes"
+import { demangleName, tyEditDist, tySuggestBudget } from "./check_suggest"
+import { nameIsBareIdent } from "./tyname"
 import { strListHas } from "./listutil"
 import {
   ArrayLit,
@@ -142,6 +149,7 @@ import { noteInferJoin } from "./check_inline_lit_union"
 import {
   SIMD_SIG_SHUF16,
   SIMD_SIG_SHUF4,
+  builtinCallNames,
   intrinsicNameRefusal,
   nameIsUnimplementedIntrinsic,
   simdRow,
@@ -272,6 +280,7 @@ import { fnDeclIx } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
 import {
   mimpAnyProgramSpec,
+  mimpExportNames,
   mimpExportedByNote,
   mimpNoteMiss,
   mimpSpecsFor,
@@ -653,6 +662,51 @@ export function undeclaredImportRaise(name: string, ix: i32): boolean {
     data,
   )
   return true
+}
+
+// The undeclared-name note for `name` read at `ix`: that it names a type, else the nearest
+// value in scope (`; did you mean 'x'?`), else the nearest export with its import. A suggestion
+// only: the read stays an error, and no fix applies it. "" when nothing is near enough.
+export function undeclaredNearNote(name: string, ix: i32): string {
+  if name.length < 2 || !nameIsBareIdent(name) { return "" }
+  if (cUserTypes[name] ?? -1) >= 0 {
+    return " — `" + name + "` names a type, not a value"
+  }
+  const budget = tySuggestBudget(name.length)
+  let best = ""
+  let bestD = budget + 1
+  const cands = scopeVisibleNames()
+  for k in fnDeclIx.keys() { cands.push(k) }
+  for b in builtinCallNames() { cands.push(b) }
+  for c in cands {
+    const un = demangleName(c)
+    if (
+      un != name
+      && un.length >= 2
+      && nameIsBareIdent(un)
+      && !(un[0] == '_' && un[1] == '_')
+    ) {
+      const d = tyEditDist(name, un)
+      if d < bestD {
+        bestD = d
+        best = un
+      }
+    }
+  }
+  if best != "" { return "; did you mean '" + best + "'?" }
+  const from = ufcsModOfNode(ix)
+  let ex = ""
+  for c in mimpExportNames(from) {
+    const d = tyEditDist(name, c)
+    if d > 0 && d < bestD {
+      bestD = d
+      ex = c
+    }
+  }
+  if ex == "" { return "" }
+  const specs = mimpSpecsFor(ex, from, -1)
+  if specs.length == 0 { return "" }
+  return "; did you mean '" + ex + "'?" + mimpExportedByNote(ex, specs, from)
 }
 
 // Whether every non-null member of the join `inner` is a member of one of the values `tys`: a
