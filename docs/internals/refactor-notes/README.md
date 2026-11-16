@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-store-fntag-class2](2026-11-16-store-fntag-class2.md): One storage decider: class 2, partial sets, 2026-11-16
+- [2026-11-16-l2-s3-4a-container](2026-11-16-l2-s3-4a-container.md): L2 S3.4a: the read-only map floor lifts, and the array-default kind answers by rule, 2026-11-16
+- [2026-11-16-ir-c2g-string-reads](2026-11-16-ir-c2g-string-reads.md): IR cutover C2g: string literals, length and reads (coverage step), 2026-11-16
+- [2026-11-16-rep-adt-stage3e-sweep](2026-11-16-rep-adt-stage3e-sweep.md): Rep ADT stage 3e, first piece: 3a's end-of-emit sweep is deleted, 2026-11-16 (lane REP)
+- [2026-11-16-rep-adt-stage3d-iii-elem-ty](2026-11-16-rep-adt-stage3d-iii-elem-ty.md): Rep ADT stage 3d-iii: a field's element type is its storage type's, 2026-11-16 (lane REP)
+- [2026-11-16-rep-adt-stage3d-ii-key-kind](2026-11-16-rep-adt-stage3d-ii-key-kind.md): Rep ADT stage 3d-ii: a field's map key kind is its storage type's, 2026-11-16 (lane REP)
+- [2026-11-16-type-hashcons-s6b14-field-storage](2026-11-16-type-hashcons-s6b14-field-storage.md): Type hash-cons stage 6b: `fieldStorageEq` without a depth, and D16736 (lane H), 2026-11-16
+- [2026-11-16-type-hashcons-s6b12-reaches-hole](2026-11-16-type-hashcons-s6b12-reaches-hole.md): Type hash-cons stage 6b: `tyReachesHole`'s budget goes (lane H), 2026-11-16
 - [2026-11-16-slot-store-parity-open-edge-instance](2026-11-16-slot-store-parity-open-edge-instance.md): Slot store parity 4: an open value takes its instance's type at its edge (lane SLOT, 2026-11-16)
 - [2026-11-16-slot-store-parity-late-write-clone](2026-11-16-slot-store-parity-late-write-clone.md): Slot store parity 3: an instance's clone of a capture write temp (lane SLOT, 2026-11-16)
 - [2026-11-16-store-fntag-progress](2026-11-16-store-fntag-progress.md): One storage decider: why the remaining late flips are late, 2026-11-16
