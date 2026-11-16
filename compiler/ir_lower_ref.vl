@@ -1,17 +1,20 @@
 // `ir_lower_ref.vl` — the IR lowering of reference values and list reads (ir-design-2026-11.md
 // §5.3, I2's list half). A list read writes its operands, then legacy's own guard and
-// `array.get`; a bounds check lowers as nothing, fused into the read after it (rule 8). A
-// reference local's valtype is the run legacy's locals vector writes for that slot, read only.
-// Holds the copy of legacy's list-read decision that the shared predicate replaces.
+// `array.get`; a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
+// slots come from the shared lazy list frame, and a loop opens legacy's header hoists, which a
+// read asks `liveHoistRow` for. Holds the copy of legacy's list-read decision the shared
+// predicate replaces.
 
-import { Index, OP_INDEX_GET, nodeAt } from "./ast"
-import { OImm, OStr, OVar, Opnd, RListGet, Rhs, SBoundsCheck } from "./ir"
-import { irLFn, irLMiss, irLOpnd } from "./ir_lower"
+import { Index, OP_INDEX_GET, WhileStmt, nodeAt } from "./ast"
+import { RListGet, Rhs, SBoundsCheck } from "./ir"
+import { irLFn, irLMiss, irLOpnd, irLSkip } from "./ir_lower"
 import {
   emitListIdxGuard,
-  hoistPathDecl,
-  hoistPathProp,
+  emitListIdxGuardHoisted,
   idxCellReadIsNull,
+  liveHoistRow,
+  loopHoistClose,
+  loopHoistOpen,
   scalarListBack,
   scalarListUsed,
   scalarListWrap,
@@ -25,32 +28,9 @@ import {
   exprStringArray,
 } from "./emit_classify"
 import { scalarListElemKind } from "./emit_value_sites"
-import { listIdxKindOf } from "./emit_union_casts"
+import { listIdxKindOf, listIdxWrapSlot } from "./emit_union_casts"
 import { twoListUseMsg } from "./emit_fn_ret_kinds"
-import {
-  ListKind,
-  VKind,
-  fbFrameParams,
-  liBack,
-  liKinds,
-  liSlots,
-  listIdxScratchBase,
-  localIsRef,
-  localStructIdx,
-} from "./emit_state"
-import {
-  fbArrayGet,
-  fbLazyListSlotRun,
-  fbLocalIsUnsetRef,
-  fbLocalRun,
-  fbRun,
-  fbValtypeNullable,
-  lhKind,
-  lhProp,
-  lhRoot,
-  lhSlot,
-  wTarget,
-} from "./emit_bytes"
+import { fbArrayGet } from "./emit_bytes"
 
 // Why legacy does not lower list read `idxIx` on its plain guarded path, or "" when it does:
 // the decision `emitIndex` makes before `emitIndexScalarList`'s unhoisted, unviewed arm.
@@ -71,171 +51,47 @@ export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null { return "index string" }
   if !scalarListUsed(ek) { return "index uncollected list" }
-  const row = exprPackedRow(nd.idxArr, fnIx)
-  if hoistRowAny(nd.idxArr, listIdxKindOf(ek), row) {
-    return "index maybe hoisted"
-  }
   if svDstOfKind(ek) >= 0 { return "index view" }
   return ""
 }
 
-// Whether any loop-hoisted header of the function matches the receiver, live or not. Legacy asks
-// `liveHoistRow` while the row is live; after the body is lowered none is, so a read that may
-// have been hoisted is refused rather than guessed.
-function hoistRowAny(exprIx: i32, kind: ListKind, slot: i32): boolean {
-  const d = hoistPathDecl(exprIx)
-  if d < 0 { return false }
-  const p = hoistPathProp(exprIx)
-  let k = 0
-  while k < lhRoot.length {
-    if (
-      lhRoot[k] == d
-      && lhProp[k] == p
-      && lhKind[k] == kind
-      && lhSlot[k] == slot
-    ) {
-      return true
-    }
-    k = k + 1
-  }
-  return false
-}
-
-// The list reads the builder admitted, by the receiver variable: the element kind and packed
-// row its guard and `array.get` read. Reset by the builder per function.
-let rgRecv: i32[] = []
-let rgKind: VKind[] = []
-let rgRow: i32[] = []
-// The variables the builder bound to the lazy list frame's rows, and each one's row.
-let rsVar: i32[] = []
-let rsLix: i32[] = []
-
-// The function the notes belong to, by its node and name; another function reads none of them.
-let notesAt = -1
-let notesName = ""
-
-// Starts the notes of the function the builder has open, unless they are already its own.
-export function irRefNotesFor(at: i32, name: string) {
-  if at == notesAt && name == notesName { return 0 }
-  irRefNotesReset()
-  notesAt = at
-  notesName = name
-  return 0
-}
-
-// Forgets every note. Each compile starts here: two programs can hold a function of one name at
-// one node index, and a note of the first must not reach the second.
-export function irRefNotesReset() {
-  notesAt = -1
-  notesName = ""
-  rgRecv = []
-  rgKind = []
-  rgRow = []
-  rsVar = []
-  rsLix = []
-  return 0
-}
-
-export function irRefGetNote(v: i32, ek: VKind, row: i32) {
-  rgRecv.push(v)
-  rgKind.push(ek)
-  rgRow.push(row)
-  return 0
-}
-
-export function irRefScratchNote(v: i32, lix: i32) {
-  rsVar.push(v)
-  rsLix.push(lix)
-  return 0
-}
-
-function notesMine(): boolean {
-  const f = irLFn()
-  return f.irAt == notesAt && f.irName == notesName
-}
-
-function noteOf(v: i32): i32 {
-  if !notesMine() { return -1 }
-  let i = 0
-  while i < rgRecv.length {
-    if rgRecv[i] == v { return i }
-    i = i + 1
-  }
-  return -1
-}
-
-// The lazy-frame slot of bounds-check wrapper `kind`/`row`, without handing one out; -1 when
-// legacy reserved none, which a list read legacy lowered always did.
-function wrapSlotFound(kind: ListKind, row: i32): i32 {
-  let k = 0
-  while k < liKinds.length {
-    if liBack[k] == 0 && liSlots[k] == row && liKinds[k] == kind {
-      return listIdxScratchBase + 1 + k
-    }
-    k = k + 1
-  }
-  return -1
-}
-
-function opndVar(o: Opnd): i32 {
-  return match o {
-    OVar => o.ov
-    OImm | OStr => -1
-  }
-}
-
-// `RListGet`: the receiver, the index, legacy's guard, then the backing's `array.get`.
+// `RListGet`: the index, then legacy's guard over the loop's hoisted header when one is live (the
+// receiver is not read), else the receiver too and the wrapper's guard; then the backing's read.
 function lowerList(r: Rhs): i32 {
   if !(r is RListGet) { return irLMiss("list length") }
-  const k = noteOf(opndVar(r.lgV))
-  if k < 0 { return irLMiss("list read unnoted") }
-  const ek = rgKind[k]
-  const row = rgRow[k]
-  const ws = wrapSlotFound(listIdxKindOf(ek), row)
-  if ws < 0 { return irLMiss("list read wrapper slot") }
-  irLOpnd(r.lgV)
-  irLOpnd(r.lgIx)
-  emitListIdxGuard(ws, scalarListWrap(ek, row))
+  const nd = nodeAt(r.lgAt)
+  if !(nd is Index) { return irLMiss("list read node") }
+  const fnIx = irLFn().irAt
+  const ek = scalarListElemKind(nd.idxArr, fnIx)
+  if ek == null { return irLMiss("list read element") }
+  const row = exprPackedRow(nd.idxArr, fnIx)
+  const hz = liveHoistRow(nd.idxArr, listIdxKindOf(ek), row)
+  if hz >= 0 {
+    irLSkip(r.lgV)
+    irLOpnd(r.lgIx)
+    emitListIdxGuardHoisted(hz, nd.idxIndex)
+  } else {
+    irLOpnd(r.lgV)
+    irLOpnd(r.lgIx)
+    emitListIdxGuard(
+      listIdxWrapSlot(listIdxKindOf(ek), row),
+      scalarListWrap(ek, row),
+    )
+  }
   fbArrayGet(scalarListBack(ek, row))
   return 0
 }
 
+// The list-header hoists of the loop statement at `at`, opened as legacy's loop opens them.
+function loopOpen(at: i32): i32 {
+  if at < 0 { return 0 }
+  const s = nodeAt(at)
+  if !(s is WhileStmt) { return 0 }
+  return loopHoistOpen(s.whileCond, s.whileBody, irLFn().irAt, -1, -1)
+}
 // A bounds check is fused into the `RListGet` after it, which writes the guard; its operand
 // reads consume nothing, so the temps it names stay pending for that read.
 function lowerBounds(_n: SBoundsCheck, _pending: i32[]): i32 { return 0 }
-
-// The bytes after the run count of a local's run. The run counter it moves is `fbEmitLocalsVec`'s
-// own, reset there and read nowhere else.
-function runBytes(lix: i32, li: i32): u8[] {
-  const buf: u8[] = []
-  const prev = wTarget(buf)
-  if lix >= 0 {
-    fbLazyListSlotRun(lix)
-  } else if fbLocalIsUnsetRef(li) {
-    fbRun()
-    fbValtypeNullable(localIsRef[li], localStructIdx[li])
-  } else {
-    fbLocalRun(localIsRef[li], localStructIdx[li])
-  }
-  wTarget(prev)
-  if buf.length < 2 { return [] }
-  return buf.slice(1, buf.length)
-}
-
-// The valtype bytes of reference local `v`: a lazy-frame row's own run, or the declared
-// local's run legacy writes for its slot; empty when the slot is neither.
-function refValtype(v: i32, _ty: i32): u8[] {
-  let i = 0
-  while notesMine() && i < rsVar.length {
-    if rsVar[i] == v { return runBytes(rsLix[i], -1) }
-    i = i + 1
-  }
-  const f = irLFn()
-  if v < 0 || v >= f.irVars.length { return [] }
-  const li = f.irVars[v].vSlot - fbFrameParams
-  if li < 0 || li >= localIsRef.length { return [] }
-  return runBytes(-1, li)
-}
 
 export function irLowerRefList(r: Rhs): i32 { return lowerList(r) }
 
@@ -243,6 +99,6 @@ export function irLowerRefBounds(n: SBoundsCheck, pending: i32[]): i32 {
   return lowerBounds(n, pending)
 }
 
-export function irLowerRefValtype(v: i32, ty: i32): u8[] {
-  return refValtype(v, ty)
-}
+export function irLowerRefLoopOpen(at: i32): i32 { return loopOpen(at) }
+
+export function irLowerRefLoopClose(n: i32): i32 { return loopHoistClose(n) }

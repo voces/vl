@@ -4,7 +4,9 @@
 // reads what the core checker recorded and reports through the relation core.
 
 import {
+  BND_ARG,
   BND_ARRDEF,
+  BND_BIN,
   BND_BM,
   BND_IS,
   BND_LET,
@@ -192,11 +194,10 @@ import {
   LIP_MEET,
   LIP_OPEN,
   MC_LAYOUT_MARK,
-  argCstr,
-  binCstr,
   cstrOwnerTop,
   cvNow,
   cvPick,
+  listIsApartNote,
   listIsPinNote,
   memCalleeIs,
   noteArgCstr,
@@ -601,6 +602,7 @@ import {
   tyHasTyVar,
   tyHoldsOpenNullHole,
   tyIsOrNestsV128,
+  tyIsUnionShaped,
   tyNestsV128,
   tyPackedElem,
   tyReachesHole,
@@ -2085,12 +2087,12 @@ export function validateEscJoins(bNames: string[], bTys: i32[], calleeFn: i32) {
 // Raises demand `ci`'s refusal at call `ix`, in the direct spelling's words: a template
 // hole's is `tplHoleHandled`'s sentence, any other names the callee.
 export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
-  if argCstr.form[ci] > 0 {
+  if bndAt(BND_ARG, ci).c > 0 {
     let callee = "a function value"
-    if argCstr.who[ci] != "" { callee = "`" + argCstr.who[ci] + "`" }
+    if bndAt(BND_ARG, ci).s != "" { callee = "`" + bndAt(BND_ARG, ci).s + "`" }
     return tErr(
       "argument "
-        + i32ToStr(argCstr.form[ci])
+        + i32ToStr(bndAt(BND_ARG, ci).c)
         + ": expected "
         + tyToStr(rexp)
         + ", got "
@@ -2102,7 +2104,7 @@ export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
       ix,
     )
   }
-  if argCstr.form[ci] == ACF_INDEX {
+  if bndAt(BND_ARG, ci).c == ACF_INDEX {
     return tErr(
       "array index must be i32, got "
         + tyToStr(rat)
@@ -2110,10 +2112,10 @@ export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
       ix,
     )
   }
-  if argCstr.form[ci] == ACF_EXACT {
+  if bndAt(BND_ARG, ci).c == ACF_EXACT {
     return tErr(
       "a call through `"
-        + argCstr.who[ci]
+        + bndAt(BND_ARG, ci).s
         + "` passes "
         + tyToStr(widenLitTy(rat))
         + " to a function written there that takes `"
@@ -2122,10 +2124,10 @@ export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
       ix,
     )
   }
-  if argCstr.form[ci] == ACF_EXACT_RET {
+  if bndAt(BND_ARG, ci).c == ACF_EXACT_RET {
     return tErr(
       "a call through `"
-        + argCstr.who[ci]
+        + bndAt(BND_ARG, ci).s
         + "` returns "
         + tyToStr(widenLitTy(rat))
         + ", and a function written there returns `"
@@ -2134,7 +2136,7 @@ export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
       ix,
     )
   }
-  if argCstr.form[ci] == ACF_TPL {
+  if bndAt(BND_ARG, ci).c == ACF_TPL {
     return tErr(
       "an interpolation hole is `string` or "
         + tyToStr(rexp)
@@ -2149,7 +2151,7 @@ export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
 // The refusal of demand `ci`'s argument `rat` flowing into a parameter `rexp`, naming the
 // conversion when the direct spelling would.
 export function argFlowErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
-  let who = argCstr.who[ci]
+  let who = bndAt(BND_ARG, ci).s
   if who == "" { who = "a call" } else { who = "`" + who + "`" }
   return tErr(
     "argument of type "
@@ -2841,7 +2843,7 @@ function binCstrLitHolds(
   if !litHolds && eqLitNonMember(clt, crt) {
     litHolds = true
     tErr(
-      binCstrWho(binCstr.op[ci], who)
+      binCstrWho(bndAt(BND_BIN, ci).s, who)
         + "cannot compare "
         + tyToStr(clt)
         + " with "
@@ -2865,11 +2867,11 @@ function binCstrEqRefused(
 ): boolean {
   const pMsgs: string[] = []
   const pChan: i32[] = []
-  if binCstr.op[ci] == "==" || binCstr.op[ci] == "!=" {
-    eqRefusals(binCstr.op[ci], clt, crt, true, pMsgs, pChan)
+  if bndAt(BND_BIN, ci).s == "==" || bndAt(BND_BIN, ci).s == "!=" {
+    eqRefusals(bndAt(BND_BIN, ci).s, clt, crt, true, pMsgs, pChan)
   }
   if pMsgs.length == 0 { return false }
-  const pWho = binCstrWho(binCstr.op[ci], who)
+  const pWho = binCstrWho(bndAt(BND_BIN, ci).s, who)
   let pm = 0
   while pm < pMsgs.length {
     const pTxt = pWho + pMsgs[pm]
@@ -2883,8 +2885,8 @@ function binCstrEqRefused(
 // or `boolean` or the target: that instance misses, as a type parameter pinned at no number does
 // (D2791). A numeric member that may fail to convert keeps the refusal.
 function asPinMisses(ci: i32, clt: i32): boolean {
-  if binCstr.op[ci] != OP_AS { return false }
-  const c = binCstr.node[ci]
+  if bndAt(BND_BIN, ci).s != OP_AS { return false }
+  const c = bndAt(BND_BIN, ci).site
   if c < 0 || c >= P.nodes.length { return false }
   const n = nodeAt(c)
   if !(n is AsExpr) || n.asMode == "wrap" { return false }
@@ -2900,29 +2902,30 @@ function asPinMisses(ci: i32, clt: i32): boolean {
 // the substituted operands `clt`/`crt`.
 function binCstrRefusalText(ci: i32, clt: i32, crt: i32): string {
   let refusal = "operator '"
-    + binCstr.op[ci]
+    + bndAt(BND_BIN, ci).s
     + "' is not defined for "
     + tyToStr(clt)
     + " and "
     + tyToStr(crt)
-  if binCstr.op[ci] == OP_NEG {
+  if bndAt(BND_BIN, ci).s == OP_NEG {
     refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
   }
-  if binCstr.op[ci] == OP_BNOT {
+  if bndAt(BND_BIN, ci).s == OP_BNOT {
     refusal = "unary '~' expects a numeric type, got " + tyToStr(clt)
     if isNumeric(clt) {
       refusal = "operator '~' is integer-only, got " + tyToStr(clt)
     }
   }
-  if binCstr.op[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
-  if binCstr.op[ci] == OP_LITFIT {
+  if bndAt(BND_BIN, ci).s == OP_AS { refusal = asPinRefusal(clt, crt) }
+  if bndAt(BND_BIN, ci).s == OP_LITFIT {
     refusal = tyToStr(clt) + " cannot hold the 64-bit operand it meets"
   }
   // An ordering over a gradual union is refused in the direct spelling's words.
-  const cop = binCstr.op[ci]
+  const cop = bndAt(BND_BIN, ci).s
   if (
     (cop == "<" || cop == ">" || cop == "<=" || cop == ">=")
-    && (tyIsGradualUnion(binCstr.lt[ci]) || tyIsGradualUnion(binCstr.rt[ci]))
+    && (tyIsGradualUnion(bndAt(BND_BIN, ci).on)
+      || tyIsGradualUnion(bndAt(BND_BIN, ci).a))
   ) {
     refusal = "comparison expects numeric operands, got "
       + tyToStr(clt)
@@ -2973,10 +2976,10 @@ function binCstrOpRefusal(
   hArgNo: i32[],
   hArgNode: i32[],
 ) {
-  const lNo = cstrArgNoOf(binCstr.lt[ci], hNames, hArgNo)
-  const rNo = cstrArgNoOf(binCstr.rt[ci], hNames, hArgNo)
-  const lN = cstrArgCountOf(binCstr.lt[ci], hNames)
-  const rN = cstrArgCountOf(binCstr.rt[ci], hNames)
+  const lNo = cstrArgNoOf(bndAt(BND_BIN, ci).on, hNames, hArgNo)
+  const rNo = cstrArgNoOf(bndAt(BND_BIN, ci).a, hNames, hArgNo)
+  const lN = cstrArgCountOf(bndAt(BND_BIN, ci).on, hNames)
+  const rN = cstrArgCountOf(bndAt(BND_BIN, ci).a, hNames)
   let anchorNo = lNo
   if anchorNo == 0 { anchorNo = rNo }
   let msg = refusal + " (the call's argument types)"
@@ -2985,7 +2988,7 @@ function binCstrOpRefusal(
     // get no head (it would blame one) and the tail names both instead.
     let head = "argument " + i32ToStr(anchorNo) + ": "
     if lNo != 0 && rNo != 0 && lNo != rNo { head = "" }
-    msg = head + refusal + binCstrBodyTail(binCstr.op[ci], who, lNo, rNo)
+    msg = head + refusal + binCstrBodyTail(bndAt(BND_BIN, ci).s, who, lNo, rNo)
   }
   const aNode = cstrArgNodeOf(anchorNo, hArgNo, hArgNode)
   if aNode >= 0 { tErr(msg, aNode) } else { tErr(msg, ix) }
@@ -3069,16 +3072,16 @@ export function validateBinCstrs(
   hArgNo: i32[],
   hArgNode: i32[],
 ) {
-  const nOrigB = binCstr.op.length
+  const nOrigB = bndCount(BND_BIN)
   const cvWas = cvNow
   let ci = 0
   while ci < nOrigB {
-    const binDead = gnotDeadAtPin(binCstr.lt[ci], bNames, bTys)
-      || gnotDeadAtPin(binCstr.rt[ci], bNames, bTys)
-    if cstrOwnedBy(binCstr.fn[ci], calleeFn) && !binDead {
+    const binDead = gnotDeadAtPin(bndAt(BND_BIN, ci).on, bNames, bTys)
+      || gnotDeadAtPin(bndAt(BND_BIN, ci).a, bNames, bTys)
+    if cstrOwnedBy(bndAt(BND_BIN, ci).fn, calleeFn) && !binDead {
       cvNow = cvPick(CV_BIN, ci, cvWas)
-      let clt = substTyDeep(binCstr.lt[ci], bNames, bTys)
-      let crt = substTyDeep(binCstr.rt[ci], bNames, bTys)
+      let clt = substTyDeep(bndAt(BND_BIN, ci).on, bNames, bTys)
+      let crt = substTyDeep(bndAt(BND_BIN, ci).a, bNames, bTys)
       // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
       // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
       if (
@@ -3086,14 +3089,14 @@ export function validateBinCstrs(
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if clt != binCstr.lt[ci] || crt != binCstr.rt[ci] {
+        if clt != bndAt(BND_BIN, ci).on || crt != bndAt(BND_BIN, ci).a {
           if tyHasHole(clt) || tyHasHole(crt) {
             noteBinCstrAt(
               clt,
-              binCstr.op[ci],
+              bndAt(BND_BIN, ci).s,
               crt,
-              binCstr.node[ci],
-              binCstr.shape[ci],
+              bndAt(BND_BIN, ci).site,
+              bndAt(BND_BIN, ci).b,
             )
           }
         }
@@ -3105,16 +3108,16 @@ export function validateBinCstrs(
         crt = softenBareLitTy(crt)
       }
       if !tyHasHole(clt) && !litHolds && !tyHasHole(crt) {
-        if binCstr.op[ci] == "===" || binCstr.op[ci] == "!==" {
+        if bndAt(BND_BIN, ci).s == "===" || bndAt(BND_BIN, ci).s == "!==" {
           // Identity: no operator table answers it, the identity rule does (DECISIONS A15).
-          const idRefusal = identityCstrRefusal(binCstr.op[ci], clt, crt)
+          const idRefusal = identityCstrRefusal(bndAt(BND_BIN, ci).s, clt, crt)
           if idRefusal != "" {
             const off = identityCstrOffender(clt, crt)
             const k = identityArgOf(off, hArgNode)
             if k >= 0 {
               identityArgRefusal(
                 idRefusal,
-                binCstr.op[ci],
+                bndAt(BND_BIN, ci).s,
                 who,
                 hArgNo[k],
                 hArgNode[k],
@@ -3125,7 +3128,7 @@ export function validateBinCstrs(
               if cn is Call {
                 identityArgRefusal(
                   idRefusal,
-                  binCstr.op[ci],
+                  bndAt(BND_BIN, ci).s,
                   who,
                   ck + 1,
                   cn.callArgs[ck],
@@ -3158,7 +3161,7 @@ export function validateBinCstrs(
                   + " as a value and instantiated at `"
                   + tyToStr(widenLitTy(off))
                   + "`, where its body applies `"
-                  + binCstr.op[ci]
+                  + bndAt(BND_BIN, ci).s
                   + "`)",
                 at,
               )
@@ -3168,7 +3171,7 @@ export function validateBinCstrs(
           }
         } else if !binCstrEqRefused(ci, clt, crt, who, ix) {
           if (
-            !binOpDefinedFor(binCstr.op[ci], clt, crt)
+            !binOpDefinedFor(bndAt(BND_BIN, ci).s, clt, crt)
             && !asPinMisses(ci, clt)
           ) {
             const refusal = binCstrRefusalText(ci, clt, crt)
@@ -3998,13 +4001,18 @@ export function validateIsCstrs(
         const ca = tyAt(ct)
         let isList = false
         let open = false
-        if ca is TyArray {
+        // A list of a union element holds one of its members' lists, which the type cannot say.
+        if ca is TyArray && !tyIsUnionShaped(tyElemOf(ca)) {
           isList = true
           open = tyElemOpen(ca) || tyHasHole(ct)
         }
         const meets = !isList || assignable(row.a, ct)
         const kind = if open { LIP_OPEN } else if meets { LIP_MEET } else { LIP_APART }
-        listIsPinNote(row.site, kind, ix)
+        if kind == LIP_APART {
+          listIsApartNote(row.site, ct, ix)
+        } else {
+          listIsPinNote(row.site, kind, ix)
+        }
       } else if ct >= 0 {
         const t = tyAt(ct)
         let base = -1
