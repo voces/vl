@@ -63,9 +63,10 @@ index. Union-typed rows go in a list every arm also tries, and a union arm takes
 Each arm compares only its bucket's rows, in row order, so the first `tySame` row still wins.
 Unions of eight rows or fewer keep the scan.
 
-No state survives the call, so nothing needs a stamp. A first version keyed records by their
+No state survives the call, so nothing needs a stamp. The key is `tySameKey` (check_types.vl), a
+structural read by type id, listed with the arena accessors in `scripts/phase-state-census.vl`. A first version keyed records by their
 sorted, joined field names and read +0.09% on L2 (`sortedNames` alone was 0.39%); the integer
-key reads −0.29%.
+key reads −0.30%.
 
 The union-typed-row path is reached by nothing in `tests/cases` (an `emitFail` probe, checked
 against a control that fires on every match) nor by three hand-written nestings. Union rows hold
@@ -77,7 +78,7 @@ and two records that share a field-name set.
 | reading | value |
 |---|---|
 | L2 fuel, master bc6546163 (fixed seed, measured alike) | 94,969,644,303 |
-| with the change | 94,694,040,323 (−0.28G, −0.29%) |
-| `self-compile-time.sh --write-baseline`, fixpoint seed | 94,694,040,323 |
+| with the change | 94,681,947,231 (−0.29G, −0.30%) |
+| `self-compile-time.sh --write-baseline`, fixpoint seed | 94,681,947,231 |
 | corpus identity (`corpuscmp` against master's fixpoint seed) | 8,462 modules, 0 DIFFER, 0 LOST |
 | scaling axis `record union arms returned` (64 against 16) | 10.39 (master 14.96), bar 13.0 |
