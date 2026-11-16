@@ -37,5 +37,7 @@ element` and 2 `method pop` (a value pop).
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the N2b-1 seed, 12,294 cells | CORPUS_ID |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,383 claimed and byte-identical, the same 2 fallbacks as before; corpus CORPUS_M3 |
+| corpus identity against the N2b-1 seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the `emitPopGo` split moves no corpus byte) |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,383 claimed and byte-identical, the same 2 fallbacks as before; corpus 9,016 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 95,096,417,652 to 95,163,411,136 (+0.07%) |
+| seed size, N2b-1 seed to this one | 6,509,386 to 6,511,514 (+2,128) |
