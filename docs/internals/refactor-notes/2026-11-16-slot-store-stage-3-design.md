@@ -111,3 +111,27 @@ programs D16768 names; L2 fuel and plumb-shape cost reported.
 - The probe's firing table and B′-1's grading: the freeze-snapshot note.
 - B′-2's narrowed count: 3 `tests/cases` programs and 1 matrix cell, all nodes mono's flow rewrite
   replaced; renames, capture-box names and raw name resolution do not reach a class reader.
+
+## 6. Outcome: parked behind check-time types
+
+Writer 1 was built as far as its table: the moved gate, run before mono over plain frames, finds
+D16898's map binding at exactly the type mono pins. D16898 still refuses under freeze-time reads,
+and three attempts to close it say the same thing.
+
+| attempt | what it did | result |
+| --- | --- | --- |
+| B′-1 (`slot-bprime-1`) | class readers read types, annotations and bounds as of the freeze | D16898 refused; types alone and bounds alone each refuse |
+| S3a (`slot-s3a`) | any closed slot fact bounds its class | D16898 runs; 13 other programs lose `runs`, 4 change output |
+| A′ (`slot-pin-fill`, probe) | the table bounds the pinned holder, and the pin's read typing (`monoRetypeMapReads`) runs at the freeze | past the `inc0` refusal, then `unsupported map value type`: the stored records' types and interned shapes are missing |
+
+Writer 1's answer is the whole pin applied: the binding's type, its reads' types and its stored
+records' types, with instancing interleaved. It is not a decision that moves ahead of mono, and a
+table, a moved gate or a copy of the read typing does not reproduce it. A pre-pass running mono's
+writers before the freeze was declined: a large reorder for an order dependence that loses no
+`runs` today.
+
+D16898's annotated spelling runs because the checker types the map's reads at check time. That is
+the durable fix: L2's check-time interface types give the checker those types for the un-annotated
+spelling too. D16768 stays open, blocked on that work, with D16898 the witness that must run when it
+lands. The gate move (`slot-pin-gates`) and the table (`slot-pin-fill`) stay on their branches and
+re-land if a consumer appears.
