@@ -603,3 +603,20 @@ Deno.test({
     }
   },
 });
+
+// Each operand position of a `void` result names its callee and `--fix` writes that callee's
+// `return` (D16870): comparison, arithmetic, unary `-` and `!`, `??`, an `if` and a `while`
+// condition, string `+`, `&&`.
+fixCase(
+  "a void operand in each position gets its callee's return",
+  { "main.vl": `function prep(x: i32): i32 { return x - 1 }\nfunction ok(x: i32): boolean { return x > 0 }\nfunction maybe(x: i32): i32 | null { return if x > 0 { x } else { null } }\nfunction nm(x: i32): string { return if x > 0 { "p" } else { "n" } }\nfunction cmp(x: i32) { prep(x) }\nfunction ari(x: i32) { prep(x) }\nfunction neg(x: i32) { prep(x) }\nfunction not(x: i32) { ok(x) }\nfunction nco(x: i32) { maybe(x) }\nfunction cnd(x: i32) { ok(x) }\nfunction wcn(x: i32) { ok(x) }\nfunction cat(x: i32) { nm(x) }\nfunction lgc(x: i32) { ok(x) }\nprint(cmp(3) < 0)\nprint(ari(3) * 2)\nprint(-neg(3))\nprint(!not(1))\nprint(nco(1) ?? 0)\nif cnd(1) { print(1) }\nwhile wcn(0) { print(2) }\nprint("a" + cat(1))\nprint(lgc(1) && true)\n` },
+  `function prep(x: i32): i32 { return x - 1 }\nfunction ok(x: i32): boolean { return x > 0 }\nfunction maybe(x: i32): i32 | null { return if x > 0 { x } else { null } }\nfunction nm(x: i32): string { return if x > 0 { "p" } else { "n" } }\nfunction cmp(x: i32) { return prep(x) }\nfunction ari(x: i32) { return prep(x) }\nfunction neg(x: i32) { return prep(x) }\nfunction not(x: i32) { return ok(x) }\nfunction nco(x: i32) { return maybe(x) }\nfunction cnd(x: i32) { return ok(x) }\nfunction wcn(x: i32) { return ok(x) }\nfunction cat(x: i32) { return nm(x) }\nfunction lgc(x: i32) { return ok(x) }\nprint(cmp(3) < 0)\nprint(ari(3) * 2)\nprint(-neg(3))\nprint(!not(1))\nprint(nco(1) ?? 0)\nif cnd(1) { print(1) }\nwhile wcn(0) { print(2) }\nprint("a" + cat(1))\nprint(lgc(1) && true)\n`,
+);
+
+// A callee that is `void` by design (its last call returns nothing) gets no `return`: the errors
+// stand and nothing is applied.
+fixCase(
+  "a genuinely void callee used as an operand is not given a return",
+  { "main.vl": "function side(x: i32) { print(x) }\nprint(side(1) + 1)\nif side(2) < 0 { print(0) }\n" },
+  "function side(x: i32) { print(x) }\nprint(side(1) + 1)\nif side(2) < 0 { print(0) }\n",
+);
