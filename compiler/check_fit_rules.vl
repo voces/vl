@@ -648,6 +648,7 @@ import {
   tyAdmitsNull,
   tyHasNullMember,
   tyHasTyVar,
+  tyHoldsHole,
   tyHoldsNumericPrim,
   tyIsListTy,
   tyLitSetMemberLexes,
@@ -3203,6 +3204,9 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   if recSolePinArg(p) >= 0 {
     return recLandingIn(recSolePinArg(p), d, c, own, depth - 1)
   }
+  // A list of its receiver's own elements lands them where it lands (D16767).
+  const sr = recSameElemsRecv(p)
+  if sr >= 0 { return recLandingIn(sr, d, c, own, depth - 1) }
   // A generic handing back an element of its list literal argument lands each element there.
   const epl = recElemPinLit(p)
   const eln = if epl >= 0 { nodeAt(epl) } else { null }
@@ -5143,8 +5147,14 @@ function recCbTakesBuild(c: i32, isMap: boolean): boolean {
     return false
   }
   if an is FuncDecl && f.fnName != "" { return false }
-  // A `map` handing each element back keeps them, and its result is stamped at the build (D16211).
-  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) && !fnOnlyReturnsParam(fd) {
+  // A `map` handing each element back keeps them, and its result is stamped at the build (D16211);
+  // a result holding no record the element could be holds no element either (D16773).
+  if (
+    isMap
+    && tyHoldsObjDeep(nodeTyIxOf(c))
+    && !fnOnlyReturnsParam(fd)
+    && recCbResultMayHoldElem(cn, nodeTyIxOf(c))
+  ) {
     return false
   }
   const p = nodeAt(f.fnParams[0])
@@ -5157,6 +5167,48 @@ function recCbTakesBuild(c: i32, isMap: boolean): boolean {
   return an is FuncDecl
     && la is TyArray
     && tySame(nodeTyIxOf(p.parType), tyElemOf(la))
+}
+
+// Whether the result type `rt` of `map` call `cn` holds, at any depth, a record its receiver's
+// element could be; true where the receiver's element is not a closed list's.
+function recCbResultMayHoldElem(cn: Call, rt: i32): boolean {
+  const f = if cn.callFn >= 0 { nodeAt(cn.callFn) } else { null }
+  if !(f is Member) { return true }
+  const ot = nodeTyIxOf(f.memObj)
+  const o = if ot >= 0 && ot < T.tys.length { tyAt(ot) } else { null }
+  if !(o is TyArray) || tyElemOpen(o) { return true }
+  const seen: i32[] = []
+  return tyHoldsRecMeeting(rt, tyElemOf(o), seen)
+}
+
+// Whether `ty` holds, at any depth, a record that meets record `el` either way, or a function.
+function tyHoldsRecMeeting(ty: i32, el: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return false }
+  seen.push(ty)
+  const t = tyAt(ty)
+  return match t {
+    TyObj => {
+      if assignable(ty, el) || assignable(el, ty) { return true }
+      for ft in t.objFieldTypes {
+        if tyHoldsRecMeeting(ft, el, seen) { return true }
+      }
+      false
+    }
+    TyNullable => tyHoldsRecMeeting(t.nInner, el, seen)
+    TyArray => tyHoldsRecMeeting(tyElemOf(t), el, seen)
+    TyMap => tyHoldsRecMeeting(tyKeyOf(t), el, seen)
+      || tyHoldsRecMeeting(tyValOf(t), el, seen)
+    TyUnion => {
+      for m in t.uMembers {
+        if tyHoldsRecMeeting(m, el, seen) { return true }
+      }
+      false
+    }
+    // A function result may close over an element.
+    TyFunc => true
+    // A scalar, literal or open type holds no record.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => false
+  }
 }
 
 // The element record the stores into the list or map binding `x` names build, else -1. This
@@ -7251,9 +7303,7 @@ function objShapeAdapterless(
           // parameter used only as `o.x` demands `{x: _}`, which looks like a width-subtyped
           // destination beside a two-field argument and is not one — the solve pins it from the
           // argument and it lowers.
-          if objSrcReachesHoleFor(s, dst, 8) || tyReachesHole(dst, 8) {
-            return false
-          }
+          if objSrcReachesHoleFor(s, dst) || tyHoldsHole(dst) { return false }
           if cx >= 0 {
             const ce = nodeAt(cx)
             if ce is ObjLit {
@@ -7344,30 +7394,35 @@ function objShapeAdapterless(
 // Whether a field of record `s` reaches an inference hole, leaving out a function-typed field the
 // record `dst` does not declare, at any record depth: a generic function stored there is closed,
 // and does not move the width the pair is compared at (D6422).
-function objSrcReachesHoleFor(s: TyObj, dst: i32, depth: i32): boolean {
+function objSrcReachesHoleFor(s: TyObj, dst: i32): boolean {
+  const path: i32[] = []
+  return objSrcReachesHoleOn(s, dst, path)
+}
+
+function objSrcReachesHoleOn(s: TyObj, dst: i32, path: i32[]): boolean {
   const d = tyAt(dst)
   let i = 0
   while i < s.objFieldTypes.length {
     const ft = s.objFieldTypes[i]
     let df = -1
     if d is TyObj { df = objFieldType(d, s.objFieldNames[i]) }
-    if objFieldReachesHoleFor(ft, df, depth) { return true }
+    if objFieldReachesHoleFor(ft, df, path) { return true }
     i = i + 1
   }
   return false
 }
 
 // The field half of `objSrcReachesHoleFor`: source field type `ft` beside destination field `df`
-// (-1 when the destination does not declare it).
-function objFieldReachesHoleFor(ft: i32, df: i32, depth: i32): boolean {
+// (-1 when the destination does not declare it), on walk `path` of the source records entered.
+function objFieldReachesHoleFor(ft: i32, df: i32, path: i32[]): boolean {
   if ft < 0 || ft >= T.tys.length { return false }
-  if depth <= 0 { return tyReachesHole(ft, 7) }
+  if tyPathCycles(ft, path) { return tyHoldsHole(ft) }
   const f = tyAt(ft)
   if f is TyFunc && df < 0 { return false }
   if f is TyObj && df >= 0 && df < T.tys.length && tyAt(df) is TyObj {
-    return objSrcReachesHoleFor(f, df, depth - 1)
+    return objSrcReachesHoleOn(f, df, tyPathWith(ft, path))
   }
-  return tyReachesHole(ft, 7)
+  return tyHoldsHole(ft)
 }
 
 // Records the adapter pair `src` into `dst` (built at `cx`) for the refusal's wording, with
