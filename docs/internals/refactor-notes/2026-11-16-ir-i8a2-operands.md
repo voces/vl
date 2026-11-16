@@ -35,8 +35,8 @@ Compiler lines are +57 / −6, 51 net: about 17 covered corpus functions per net
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the I8a part 1 seed, 12,213 cells | IDENTITY |
+| corpus identity against the I8a part 1 seed, 12,213 cells | 8,934 identical, 3,279 fail under both, 0 differ |
 | shadow | corpus 21,460 of 21,460 matched; self-compile 5,217 of 5,219, two named unlowered |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,217 claimed and byte-identical; corpus MODE3 |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,217 claimed and byte-identical; corpus 8,934 identical, 0 differ, 0 fell back |
 | L2 self-compile fuel, part 1 tree to this tree from one seed | 94,860,858,157 to 94,870,968,904 (+0.011%) |
 | seed size | 6,467,969 to 6,468,669 (+700) |
