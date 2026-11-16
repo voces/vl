@@ -522,16 +522,17 @@ null
 // An emit refusal's reason is the refusal's own text. `vl check` prints a parenthesised note
 // when a program imports std (`(std: modules not linted …)`), and the reason column once quoted
 // that note for every emit refusal, since it is the first line the check phase leaves. The
-// control imports std through interpolation and is refused at emit by D16901's lambda result.
+// control imports std through interpolation and is refused at emit by D16832's `if` binding.
 const EMIT_REASON_TEMPLATE =
   `// An emit refusal past a clean check, with std imported.
 // @@PRELUDE@@
-type __P = {a: i32}
-function __get<T>(f: () => T | string | null) {
-  f()
-  return 7
-}
-print("\\{__get(() => ({a: 2}))}")
+function __app<A, B>(f: (x: A) => B, x: A): B { return f(x) }
+function __hinc(x) { return x + 1 }
+function __hid(x) { return x }
+const __c = 3 > 2
+const __h = if __c { __hinc } else { __hid }
+print("\\{__app(__h, 4)}")
+print("\\{__app(__h, 2.5)}")
 // @@VALUE@@
 1
 // @@TYPE@@
@@ -564,7 +565,7 @@ Deno.test({
             );
           }
           if (
-            !grade.includes("unsupported argument type") ||
+            !grade.includes("a binding of an `if` choosing") ||
             grade.includes("not linted")
           ) {
             throw new Error(
