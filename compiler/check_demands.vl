@@ -9,12 +9,9 @@ import {
   BND_BM,
   BND_LET,
   BND_MEM,
-  BND_NEST,
-  BND_PRINT,
   Bound,
   bndAt,
   bndCount,
-  bndNextRow,
 } from "./check_iface"
 import { rowParamIsSlot } from "./check_row_param"
 import { identityCstrOffender, identityCstrRefusal } from "./check_identity"
@@ -284,6 +281,7 @@ import {
   OP_AS,
   OP_BNOT,
   OP_CALL_GUARDED_PIN,
+  OP_CALL_OPT_PIN,
   OP_CALL_PIN,
   OP_LITFIT,
   OP_NEG,
@@ -1889,6 +1887,10 @@ export function memCstrMsg(recv: i32, prop: string, site: i32) {
     if isNullTy(recv) { return "" }
     return callFloorMsg(recv, site)
   }
+  if prop == OP_CALL_OPT_PIN {
+    if isNullTy(recv) { return "" }
+    return callFloorMsg(nonNullTy(recv), site)
+  }
   if keyHasPrefix(prop, MC_OPT_READ_MARK) {
     return optMemberPinMsg(
       recv,
@@ -1952,63 +1954,56 @@ function optMemberPinMsg(recv: i32, prop: string): string {
   return "member access '?." + prop + "' on non-object " + tyToStr(recv)
 }
 
-// Re-validates every deferred `print` constraint this call resolves, holding the substituted
-// type to the same two floors the direct spelling is held to. A type still touching an
-// unresolved hole is re-recorded under the caller's hole and defers. The diagnostic is the
-// direct spelling's, verbatim, reported at the call — the only position that knows the instance.
-export function validatePrintCstrs(
+// The print rule for one `BND_PRINT` bound `row` (row `ci` of its kind) of `calleeFn`: a printed
+// type the bindings close is held to the direct spelling's two floors and refused at the call;
+// one still open under the caller's hole is re-recorded there.
+export function printRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
+  ci: i32,
+  row: Bound,
 ) {
   const cvWas = cvNow
-  const n = bndCount(BND_PRINT)
-  let ci = bndNextRow(BND_PRINT, calleeFn, -1, n)
-  while ci < n {
-    const row = bndAt(BND_PRINT, ci)
+  if (
+    cstrOwnedBy(row.fn, calleeFn)
+    && !nestCstrOutside(row.site)
+    && !gnotDeadAtPin(row.on, bNames, bTys)
+  ) {
+    cvNow = cvPick(CV_PRINT, ci, cvWas)
+    const cpt = substTyDeep(row.on, bNames, bTys)
     if (
-      cstrOwnedBy(row.fn, calleeFn)
-      && !nestCstrOutside(row.site)
-      && !gnotDeadAtPin(row.on, bNames, bTys)
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
     ) {
-      cvNow = cvPick(CV_PRINT, ci, cvWas)
-      const cpt = substTyDeep(row.on, bNames, bTys)
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if cpt != row.on {
-          if tyHasHole(cpt) { notePrintCstr(cpt, row.site) }
-        }
+      if cpt != row.on {
+        if tyHasHole(cpt) { notePrintCstr(cpt, row.site) }
       }
-      if !tyHasHole(cpt) {
-        // The two floors use different channels: a domain rejection (`tErr`, checked first,
-        // as at the direct site) versus a capability reject for a union the emitter can't classify.
-        let pMsg = ""
-        let pUnsup = false
-        if tyPrintsAsRef(cpt, 24) {
-          pMsg = printRefRefusal(cpt)
+    }
+    if !tyHasHole(cpt) {
+      // The two floors use different channels: a domain rejection (`tErr`, checked first,
+      // as at the direct site) versus a capability reject for a union the emitter can't classify.
+      let pMsg = ""
+      let pUnsup = false
+      if tyPrintsAsRef(cpt, 24) {
+        pMsg = printRefRefusal(cpt)
+      } else {
+        pMsg = printUnionRefusal(cpt)
+        if pMsg != "" { pUnsup = true }
+      }
+      if pMsg != "" {
+        let pWho = "a type parameter is printed here: "
+        if who != "" { pWho = "`" + who + "` prints its type parameter here: " }
+        if pUnsup {
+          tErrUnsupported(pWho + pMsg, ix)
         } else {
-          pMsg = printUnionRefusal(cpt)
-          if pMsg != "" { pUnsup = true }
-        }
-        if pMsg != "" {
-          let pWho = "a type parameter is printed here: "
-          if who != "" {
-            pWho = "`" + who + "` prints its type parameter here: "
-          }
-          if pUnsup {
-            tErrUnsupported(pWho + pMsg, ix)
-          } else {
-            tErr(pWho + pMsg, ix)
-          }
+          tErr(pWho + pMsg, ix)
         }
       }
     }
-    ci = bndNextRow(BND_PRINT, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -2524,7 +2519,12 @@ function refuseEmptyListCalledArg(
   hArgNode: i32[],
   told: i32[],
 ) {
-  if inferQuiet || (prop != OP_CALL_PIN && prop != OP_CALL_GUARDED_PIN) {
+  if (
+    inferQuiet
+    || (prop != OP_CALL_PIN
+      && prop != OP_CALL_GUARDED_PIN
+      && prop != OP_CALL_OPT_PIN)
+  ) {
     return 0
   }
   if !tyHasHole(mr) { return 0 }
@@ -2551,7 +2551,13 @@ function refuseEmptyListCalledArg(
 // The arity refusal of call pin `prop` at `site` on a function type `recv` still holding a hole;
 // "" for any other constraint, which waits for its holes.
 function callPinOpenArityMsg(recv: i32, prop: string, site: i32): string {
-  if prop != OP_CALL_PIN && prop != OP_CALL_GUARDED_PIN { return "" }
+  if (
+    prop != OP_CALL_PIN
+    && prop != OP_CALL_GUARDED_PIN
+    && prop != OP_CALL_OPT_PIN
+  ) {
+    return ""
+  }
   if recv < 0 || recv >= T.tys.length || !(tyAt(recv) is TyFunc) { return "" }
   return callFloorMsg(recv, site)
 }
@@ -3009,11 +3015,10 @@ function identityArgRefusal(
   return 0
 }
 
-// Re-validates every deferred binary-op constraint this call resolves: substitutes the holes
-// to the call's concrete argument types and checks the operator is defined for them — the one
-// rule numeric, string and relational operators all reduce to. Re-defers when a hole
-// substitutes to another hole; scoped to the callee (`cstrOwnedBy`) for the same by-name reason `noteMemCstr` needs it.
-export function validateBinCstrs(
+// The operator rule for one `BND_BIN` bound `row` (row `ci` of its kind) of `calleeFn`: the
+// operator must be defined for its operands at the bindings, the one rule numeric, string and
+// relational operators reduce to; an operand still open re-defers under the caller's hole.
+export function binRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
@@ -3022,123 +3027,99 @@ export function validateBinCstrs(
   hNames: string[],
   hArgNo: i32[],
   hArgNode: i32[],
+  ci: i32,
+  row: Bound,
 ) {
   const cvWas = cvNow
-  const n = bndCount(BND_BIN)
-  let ci = bndNextRow(BND_BIN, calleeFn, -1, n)
-  while ci < n {
+  if (
+    cstrOwnedBy(row.fn, calleeFn)
+    && !gnotDeadAtPin(row.on, bNames, bTys)
+    && !gnotDeadAtPin(row.a, bNames, bTys)
+  ) {
+    cvNow = cvPick(CV_BIN, ci, cvWas)
+    let clt = substTyDeep(row.on, bNames, bTys)
+    let crt = substTyDeep(row.a, bNames, bTys)
+    // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
+    // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
     if (
-      cstrOwnedBy(bndAt(BND_BIN, ci).fn, calleeFn)
-      && !gnotDeadAtPin(bndAt(BND_BIN, ci).on, bNames, bTys)
-      && !gnotDeadAtPin(bndAt(BND_BIN, ci).a, bNames, bTys)
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
     ) {
-      cvNow = cvPick(CV_BIN, ci, cvWas)
-      let clt = substTyDeep(bndAt(BND_BIN, ci).on, bNames, bTys)
-      let crt = substTyDeep(bndAt(BND_BIN, ci).a, bNames, bTys)
-      // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
-      // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if clt != bndAt(BND_BIN, ci).on || crt != bndAt(BND_BIN, ci).a {
-          if tyHasHole(clt) || tyHasHole(crt) {
-            noteBinCstrAt(
-              clt,
-              bndAt(BND_BIN, ci).s,
-              crt,
-              bndAt(BND_BIN, ci).site,
-              bndAt(BND_BIN, ci).b,
-            )
-          }
+      if clt != row.on || crt != row.a {
+        if tyHasHole(clt) || tyHasHole(crt) {
+          noteBinCstrAt(clt, row.s, crt, row.site, row.b)
         }
       }
-      let litHolds = false
-      if !tyHasHole(clt) && !tyHasHole(crt) {
-        litHolds = binCstrLitHolds(ci, clt, crt, who, ix)
-        clt = softenBareLitTy(clt)
-        crt = softenBareLitTy(crt)
-      }
-      if !tyHasHole(clt) && !litHolds && !tyHasHole(crt) {
-        if bndAt(BND_BIN, ci).s == "===" || bndAt(BND_BIN, ci).s == "!==" {
-          // Identity: no operator table answers it, the identity rule does (DECISIONS A15).
-          const idRefusal = identityCstrRefusal(bndAt(BND_BIN, ci).s, clt, crt)
-          if idRefusal != "" {
-            const off = identityCstrOffender(clt, crt)
-            const k = identityArgOf(off, hArgNode)
-            if k >= 0 {
-              identityArgRefusal(
-                idRefusal,
-                bndAt(BND_BIN, ci).s,
-                who,
-                hArgNo[k],
-                hArgNode[k],
-              )
-            } else if identityCallArgOf(off, ix) >= 0 {
-              const ck = identityCallArgOf(off, ix)
-              const cn = nodeAt(ix)
-              if cn is Call {
-                identityArgRefusal(
-                  idRefusal,
-                  bndAt(BND_BIN, ci).s,
-                  who,
-                  ck + 1,
-                  cn.callArgs[ck],
-                )
-              }
-            } else if ix >= 0 && ix < P.nodes.length && !(nodeAt(ix) is Call) {
-              // A generic passed as a value is refused at the enclosing call's argument with no
-              // identity (D16110), else at the function, naming type and route.
-              let fnWho = "a generic function"
-              if who != "" { fnWho = "`" + who + "`" }
-              const pc = passingCallOf(ix)
-              const pk = identityCallArgOf(off, pc)
-              const pn = if pc >= 0 && pc < P.nodes.length { nodeAt(pc) } else { nodeAt(ix) }
-              const atArg = pn is Call && pk >= 0 && pk < pn.callArgs.length
-              let head = ""
-              let at = ix
-              let here = " here"
-              if pn is Call && atArg {
-                head = "argument " + i32ToStr(pk + 1) + ": "
-                at = pn.callArgs[pk]
-                here = ""
-              }
-              tErr(
-                head
-                  + idRefusal
-                  + " ("
-                  + fnWho
-                  + " is passed"
-                  + here
-                  + " as a value and instantiated at `"
-                  + tyToStr(widenLitTy(off))
-                  + "`, where its body applies `"
-                  + bndAt(BND_BIN, ci).s
-                  + "`)",
-                at,
-              )
-            } else {
-              binCstrOpRefusal(ci, idRefusal, who, ix, hNames, hArgNo, hArgNode)
+    }
+    let litHolds = false
+    if !tyHasHole(clt) && !tyHasHole(crt) {
+      litHolds = binCstrLitHolds(ci, clt, crt, who, ix)
+      clt = softenBareLitTy(clt)
+      crt = softenBareLitTy(crt)
+    }
+    if !tyHasHole(clt) && !litHolds && !tyHasHole(crt) {
+      if row.s == "===" || row.s == "!==" {
+        // Identity: no operator table answers it, the identity rule does (DECISIONS A15).
+        const idRefusal = identityCstrRefusal(row.s, clt, crt)
+        if idRefusal != "" {
+          const off = identityCstrOffender(clt, crt)
+          const k = identityArgOf(off, hArgNode)
+          if k >= 0 {
+            identityArgRefusal(idRefusal, row.s, who, hArgNo[k], hArgNode[k])
+          } else if identityCallArgOf(off, ix) >= 0 {
+            const ck = identityCallArgOf(off, ix)
+            const cn = nodeAt(ix)
+            if cn is Call {
+              identityArgRefusal(idRefusal, row.s, who, ck + 1, cn.callArgs[ck])
             }
-          }
-        } else if !binCstrEqRefused(ci, clt, crt, who, ix) {
-          if (
-            !binOpDefinedFor(bndAt(BND_BIN, ci).s, clt, crt)
-            && !asPinMisses(ci, clt)
-          ) {
-            const refusal = binCstrRefusalText(ci, clt, crt)
-            binCstrOpRefusal(ci, refusal, who, ix, hNames, hArgNo, hArgNode)
+          } else if ix >= 0 && ix < P.nodes.length && !(nodeAt(ix) is Call) {
+            // A generic passed as a value is refused at the enclosing call's argument with no
+            // identity (D16110), else at the function, naming type and route.
+            let fnWho = "a generic function"
+            if who != "" { fnWho = "`" + who + "`" }
+            const pc = passingCallOf(ix)
+            const pk = identityCallArgOf(off, pc)
+            const pn = if pc >= 0 && pc < P.nodes.length { nodeAt(pc) } else { nodeAt(ix) }
+            const atArg = pn is Call && pk >= 0 && pk < pn.callArgs.length
+            let head = ""
+            let at = ix
+            let here = " here"
+            if pn is Call && atArg {
+              head = "argument " + i32ToStr(pk + 1) + ": "
+              at = pn.callArgs[pk]
+              here = ""
+            }
+            tErr(
+              head
+                + idRefusal
+                + " ("
+                + fnWho
+                + " is passed"
+                + here
+                + " as a value and instantiated at `"
+                + tyToStr(widenLitTy(off))
+                + "`, where its body applies `"
+                + row.s
+                + "`)",
+              at,
+            )
           } else {
-            const pair = binCstrPairRefusal(ci, clt, crt)
-            if pair != "" {
-              binCstrOpRefusal(ci, pair, who, ix, hNames, hArgNo, hArgNode)
-            }
+            binCstrOpRefusal(ci, idRefusal, who, ix, hNames, hArgNo, hArgNode)
+          }
+        }
+      } else if !binCstrEqRefused(ci, clt, crt, who, ix) {
+        if (!binOpDefinedFor(row.s, clt, crt) && !asPinMisses(ci, clt)) {
+          const refusal = binCstrRefusalText(ci, clt, crt)
+          binCstrOpRefusal(ci, refusal, who, ix, hNames, hArgNo, hArgNode)
+        } else {
+          const pair = binCstrPairRefusal(ci, clt, crt)
+          if pair != "" {
+            binCstrOpRefusal(ci, pair, who, ix, hNames, hArgNo, hArgNode)
           }
         }
       }
     }
-    ci = bndNextRow(BND_BIN, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -3992,15 +3973,17 @@ export function isRule(
   return 0
 }
 
-// Re-asks every recorded container this call instantiates under its bindings. Skipped unless
-// a binding is (or holds) a vector, so a pin that binds no vector does no work.
-export function validateNestCstrs(
+// The container rule for one `BND_NEST` bound `row` of `calleeFn`, asked only when a binding is or
+// holds a vector: a container the instance would store a 128-bit vector in is refused at the
+// call. Returns 1 when it refused, which ends this kind's rows for the solve.
+export function nestRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
-) {
+  row: Bound,
+): i32 {
   let anyVec = false
   let bi = 0
   while bi < bTys.length {
@@ -4008,36 +3991,30 @@ export function validateNestCstrs(
     bi = bi + 1
   }
   if !anyVec { return 0 }
-  const n = bndCount(BND_NEST)
-  let ci = bndNextRow(BND_NEST, calleeFn, -1, n)
-  while ci < n {
-    const row = bndAt(BND_NEST, ci)
-    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
-      const ct = substTyDeep(row.on, bNames, bTys)
-      if tyHasHole(ct) {
-        if calleeFn >= 0 && ct != row.on { noteNestCstr(ct, row.site) }
-      } else if tyNestsV128(ct, 8) {
-        let pWho = "a type parameter is stored in a container here: "
-        if who != "" {
-          pWho = "`" + who + "` stores its type parameter in a container here: "
-        }
-        tErrUnsupported(pWho + v128NestMsg(ct), ix)
-        return 0
-      } else if tyBoxesV128(ct, 8) {
-        // A generic body's `T | null` or union has no instance at a vector yet (D2634).
-        let bWho = "a type parameter"
-        if who != "" { bWho = "`" + who + "`'s type parameter" }
-        tErrUnsupported(
-          tyToStr(ct)
-            + " boxes "
-            + bWho
-            + " bound to a 128-bit vector, which a generic body has no lowering for yet — write the `v128 | null` spelling outside the generic function",
-          ix,
-        )
-        return 0
+  if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+    const ct = substTyDeep(row.on, bNames, bTys)
+    if tyHasHole(ct) {
+      if calleeFn >= 0 && ct != row.on { noteNestCstr(ct, row.site) }
+    } else if tyNestsV128(ct, 8) {
+      let pWho = "a type parameter is stored in a container here: "
+      if who != "" {
+        pWho = "`" + who + "` stores its type parameter in a container here: "
       }
+      tErrUnsupported(pWho + v128NestMsg(ct), ix)
+      return 1
+    } else if tyBoxesV128(ct, 8) {
+      // A generic body's `T | null` or union has no instance at a vector yet (D2634).
+      let bWho = "a type parameter"
+      if who != "" { bWho = "`" + who + "`'s type parameter" }
+      tErrUnsupported(
+        tyToStr(ct)
+          + " boxes "
+          + bWho
+          + " bound to a 128-bit vector, which a generic body has no lowering for yet — write the `v128 | null` spelling outside the generic function",
+        ix,
+      )
+      return 1
     }
-    ci = bndNextRow(BND_NEST, calleeFn, ci, n)
   }
   return 0
 }
