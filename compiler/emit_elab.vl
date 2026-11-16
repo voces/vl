@@ -408,7 +408,6 @@ import {
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
-  tyToStr,
   tyToStructStr,
   tyValOf,
   tyValOpen,
@@ -14297,7 +14296,7 @@ export function elabRetFnListLitTy(lit: i32, k: i32): i32 {
       path.push("e")
     }
   }
-  const per = elabSlotPerInstance(lit, path)
+  const per = eplSlotPerInstance(lit, path)
   if per && k < 0 { return -1 }
   const none: i32[] = []
   const ft = eplSlotSig(lit, path, if per { k } else { -1 }, none)
@@ -16681,35 +16680,8 @@ export function elabValueAgreedCallTys(
   skip: i32[],
   tys: i32[],
 ): boolean {
-  elabCallSink = []
-  elabCallSinkOn = true
-  elabSlotDeliveries(d, [], -1)
-  elabCallSinkOn = false
-  const hits = elabCallSink
-  elabCallSink = []
-  let one: i32[] = []
-  let key = ""
-  let have = false
-  for c in hits {
-    const cn = nodeAt(c)
-    if cn is Call && !i32ListHas(skip, recEnclosingFn(c)) {
-      const tup: i32[] = []
-      let k = ""
-      for a in cn.callArgs {
-        const t = nodeTyIxOf(a)
-        if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return false }
-        const w = widenLitTy(t)
-        tup.push(w)
-        k = k + tyToStr(w) + ","
-      }
-      if have && k != key { return false }
-      one = tup
-      key = k
-      have = true
-    }
-  }
-  for t in one { tys.push(t) }
-  return have
+  const none: string[] = []
+  return eplSlotAgreedCalls(d, none, -1, skip, tys)
 }
 
 // The type parameters the generic frames enclosing the literal `elabLitSlotCallTys` asks about
@@ -22515,6 +22487,86 @@ export function eplSlotCallsAt(
   }
   EPL.k = k0
   return ok
+}
+
+// Whether the instances of the function `holder` sits in deliver slot `path` at different types.
+function eplSlotPerInstance(holder: i32, path: string[]): boolean {
+  const ks = eplFrameKeysOf(holder)
+  if ks.length < 2 { return false }
+  const none: i32[] = []
+  const first = eplSlotSigAt(holder, path, ks[0], none)
+  let i = 1
+  while i < ks.length {
+    const r = eplSlotSigAt(holder, path, ks[i], none)
+    if r != first && (r < 0 || first < 0 || !tySameSealed(r, first)) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Pushes onto `tys` the checked argument types, each widened from its literal, that every call
+// through slot `path` of `holder` or a copy agrees on in instance `k`, leaving out calls made in a
+// function in `skip`; false when none calls it, an argument is open, or two calls differ.
+function eplSlotAgreedCalls(
+  holder: i32,
+  path: string[],
+  k: i32,
+  skip: i32[],
+  tys: i32[],
+): boolean {
+  // A slot in an instanced function, read for every instance, gathers the calls of all of them.
+  const ks0 = if k < 0 { eplFrameKeysOf(holder) } else { [] }
+  const ks: i32[] = if ks0.length > 0 { ks0 } else { [k] }
+  const k0 = EPL.k
+  const cis: i32[] = []
+  for kk in ks {
+    const p = eplSlotPlace(holder, path, kk)
+    for ci in if p >= 0 { eplCallsStar(p) } else { [] } {
+      if !i32ListHas(cis, ci) { cis.push(ci) }
+    }
+  }
+  // A parameter's value is also called wherever a binding handed to it is: a binding handed to a
+  // list of functions reaches every member's parameter.
+  const hn = if path.length == 0 && holder >= 0 && holder < P.nodes.length { nodeAt(holder) } else { null }
+  const fd = if hn is Param { recEnclosingFn(holder) } else { -1 }
+  const fnn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  const pi = if fnn is FuncDecl { i32ListIndexOf(fnn.fnParams, holder) } else { -1 }
+  const calls: i32[] = []
+  if pi >= 0 && holder < cwIxCoveredLen() { cwFnCalls(fd, calls) }
+  for c in calls {
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    const a = if cn is Call && pi < cn.callArgs.length { parenPeelIx(cn.callArgs[pi]) } else { -1 }
+    const ad = if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+    const pa = if ad >= 0 { eplSlotPlace(ad, [], -1) } else { -1 }
+    for ci in if pa >= 0 { eplCallsStar(pa) } else { [] } {
+      if !i32ListHas(cis, ci) { cis.push(ci) }
+    }
+  }
+  let one: i32[] = []
+  let have = false
+  let ok = true
+  for ci in cis {
+    const c = EPL.callNode[ci]
+    const cn = nodeAt(c)
+    if ok && cn is Call && !i32ListHas(skip, recEnclosingFn(c)) {
+      const tup: i32[] = []
+      // An argument is read at its checked type: one open in the body is open at every instance.
+      for a in cn.callArgs {
+        const t = nodeTyIxOf(a)
+        if t < 0 || t >= T.tys.length || tyHasTyVar(t) { ok = false }
+        tup.push(if ok { widenLitTy(t) } else { -1 })
+      }
+      if ok && have && !tysSameList(one, tup) { ok = false }
+      one = tup
+      have = true
+    }
+  }
+  EPL.k = k0
+  if !ok || !have { return false }
+  for t in one { tys.push(t) }
+  return true
 }
 
 // The holder the write index knows for `h0`: a capture cell's binding, and a binding an instance
