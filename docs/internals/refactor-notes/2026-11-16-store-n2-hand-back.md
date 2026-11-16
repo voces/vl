@@ -25,13 +25,13 @@ Every decision the check made before is still made first and unchanged; the retr
 
 ## Measurement
 
-ftlate probe, all `@run` programs, fixpoint seeds, against class T's step (#8729) and 2b:
+ftlate probe, all `@run` programs, fixpoint seeds, against master with step 2b:
 
 | | before | after |
 |---|---|---|
-| programs whose decision the late pass changes | 288 | 275 |
-| N sets / programs | 191 / 95 | 162 / 81 |
-| T sets / programs | 81 / 50 | 96 / 54 |
+| programs whose decision the late pass changes | 290 | 276 |
+| N sets / programs | 194 / 96 | 165 / 82 |
+| T sets / programs | 82 / 51 | 96 / 54 |
 | late drops | 2 | 2 (the same pair) |
 
 Five of the six N2 programs are now decided wholly at check (`rounds=0`). Some sets the producer now
@@ -41,3 +41,14 @@ finds are refused by the check for other reasons, so they move from N to T.
 
 - A/B, fixpoint against master's fixpoint: wasm and output byte-identical on all `@run` programs.
 - The late-outside-exclusions probe fires on none.
+
+## The late branch is narrowed: hand-back refusals count as the facts refusing
+
+In the retry, a callee the check's own hand-back says hands a parameter back, yet not this set's,
+is a refusal by the facts (`ftFactRefusal`). So a set refused that way and then tagged by the
+late decision fails the probe, as a refusal by the arrow facts does (#8729).
+
+| build | programs the probe fires on |
+|---|---|
+| a control that counts a callee with no hand-back fact as a refusal by the facts | 1 |
+| this build | 0 |
