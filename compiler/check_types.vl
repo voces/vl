@@ -690,32 +690,39 @@ export function tyHoldsRecord(ty: i32, depth: i32): boolean {
   }
 }
 
-// Whether a value of type `ty` can hold a function, `depth` levels into it.
-export function tyMayHoldFn(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+// Whether a value of type `ty` can hold a function, however deep. A recursive type is walked once
+// per row: a row met again adds nothing its first visit did not.
+export function tyMayHoldFn(ty: i32): boolean {
+  const seen: i32[] = []
+  return tyMayHoldFnIn(ty, seen)
+}
+
+function tyMayHoldFnIn(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return false }
+  seen.push(ty)
   const t = tyAt(ty)
   match t {
     TyFunc => {
       return true
     }
     TyArray => {
-      return tyMayHoldFn(tyElemOf(t), depth + 1)
+      return tyMayHoldFnIn(tyElemOf(t), seen)
     }
     TyNullable => {
-      return tyMayHoldFn(t.nInner, depth + 1)
+      return tyMayHoldFnIn(t.nInner, seen)
     }
     TyMap => {
-      return tyMayHoldFn(tyValOf(t), depth + 1)
+      return tyMayHoldFnIn(tyValOf(t), seen)
     }
     TyObj => {
       for ft in t.objFieldTypes {
-        if tyMayHoldFn(ft, depth + 1) { return true }
+        if tyMayHoldFnIn(ft, seen) { return true }
       }
       return false
     }
     TyUnion => {
       for m in t.uMembers {
-        if tyMayHoldFn(m, depth + 1) { return true }
+        if tyMayHoldFnIn(m, seen) { return true }
       }
       return false
     }
@@ -3159,39 +3166,46 @@ export function tyIsHole(tyIx: i32) {
 // Depth-bounded rather than cycle-tracked, in the safe direction: a recursive named type returns false at the floor.
 export function tyHasHole(tyIx: i32) { return tyHasHoleAt(tyIx, 0) }
 
-// Whether `tyIx` holds an inference hole (a `?`-named variable), not only declared parameters.
-export function tyHasInferHole(tyIx: i32, depth: i32): boolean {
-  if tyIx < 0 || tyIx >= T.tys.length || depth > 8 { return false }
+// Whether `tyIx` holds an inference hole (a `?`-named variable), not only declared parameters,
+// however deep; a recursive type is walked once per row.
+export function tyHasInferHole(tyIx: i32): boolean {
+  const seen: i32[] = []
+  return tyHasInferHoleIn(tyIx, seen)
+}
+
+function tyHasInferHoleIn(tyIx: i32, seen: i32[]): boolean {
+  if tyIx < 0 || tyIx >= T.tys.length || i32ListHas(seen, tyIx) { return false }
+  seen.push(tyIx)
   const t = tyAt(tyIx)
   match t {
     TyVar => {
       return t.tvName.length == 0 || t.tvName[0] == "?"[0]
     }
     TyArray => {
-      return tyHasInferHole(tyElemOf(t), depth + 1)
+      return tyHasInferHoleIn(tyElemOf(t), seen)
     }
     TyNullable => {
-      return tyHasInferHole(t.nInner, depth + 1)
+      return tyHasInferHoleIn(t.nInner, seen)
     }
     TyMap => {
-      return tyHasInferHole(tyKeyOf(t), depth + 1)
-        || tyHasInferHole(tyValOf(t), depth + 1)
+      return tyHasInferHoleIn(tyKeyOf(t), seen)
+        || tyHasInferHoleIn(tyValOf(t), seen)
     }
     TyObj => {
       for ft in t.objFieldTypes {
-        if tyHasInferHole(ft, depth + 1) { return true }
+        if tyHasInferHoleIn(ft, seen) { return true }
       }
       return false
     }
     TyFunc => {
       for pt in t.fnParamTypes {
-        if tyHasInferHole(pt, depth + 1) { return true }
+        if tyHasInferHoleIn(pt, seen) { return true }
       }
-      return tyHasInferHole(t.fnRet, depth + 1)
+      return tyHasInferHoleIn(t.fnRet, seen)
     }
     TyUnion => {
       for m in t.uMembers {
-        if tyHasInferHole(m, depth + 1) { return true }
+        if tyHasInferHoleIn(m, seen) { return true }
       }
       return false
     }
@@ -3809,33 +3823,34 @@ export function cTyIxSetHas(flags: boolean[], v: i32) {
 }
 
 // Whether type `ty` reaches a closure — as itself, through a nullable wrapper, an array
-// element, an object field, a union arm, or a map value. The arena form of
-// `collectFnValUse`'s closure-field scan; wider than the name walk it replaced (itself
-// alias-blind), safely so because `fnValUsed` is monotone — an extra true changes nothing.
-export function tyReachesClosure(ty: i32, depth: i32): boolean {
-  if ty < 0 || depth <= 0 { return false }
+// element, an object field, a union arm, or a map value — however deep; a recursive type is walked
+// once per row. Wider than the name walk it replaced, safely so because `fnValUsed` is monotone.
+export function tyReachesClosure(ty: i32): boolean {
+  const seen: i32[] = []
+  return tyReachesClosureIn(ty, seen)
+}
+
+function tyReachesClosureIn(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || i32ListHas(seen, ty) { return false }
+  seen.push(ty)
   const t = tyAt(ty)
   return match t {
     TyFunc => true
-    TyNullable => tyReachesClosure(t.nInner, depth - 1)
-    TyArray => tyReachesClosure(tyElemOf(t), depth - 1)
+    TyNullable => tyReachesClosureIn(t.nInner, seen)
+    TyArray => tyReachesClosureIn(tyElemOf(t), seen)
     TyObj => {
-      let i = 0
-      while i < t.objFieldTypes.length {
-        if tyReachesClosure(t.objFieldTypes[i], depth - 1) { return true }
-        i = i + 1
+      for f in t.objFieldTypes {
+        if tyReachesClosureIn(f, seen) { return true }
       }
       false
     }
     TyUnion => {
-      let j = 0
-      while j < t.uMembers.length {
-        if tyReachesClosure(t.uMembers[j], depth - 1) { return true }
-        j = j + 1
+      for m in t.uMembers {
+        if tyReachesClosureIn(m, seen) { return true }
       }
       false
     }
-    TyMap => tyReachesClosure(tyValOf(t), depth - 1)
+    TyMap => tyReachesClosureIn(tyValOf(t), seen)
     // Leaves: no closure under any of these.
     TyPrim | TyNeg | TyVar | TyLit | TyErr => false
   }
