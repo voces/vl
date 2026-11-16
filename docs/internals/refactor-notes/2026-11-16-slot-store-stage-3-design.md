@@ -45,6 +45,15 @@ index, was declined: it could disagree with mono's. The residual risk is input, 
 elaboration runs the gate over the program before mono, and mono over the program its own rewrites
 have changed by then. Each behavioural PR's byte-identity is what measures that.
 
+**Frames.** Mono applies a writer from its walk over every `let` in every frame, and an instanced
+function's frame is a clone mono creates during that walk. Before mono, a writer's gate can run only
+over the program and over functions with no type parameters. Instanced frames stay mono-decided until
+STORE's A0 reports that the elaboration's keys and mono's agree; the side table then switches to that
+`KeyId` and covers them. Freeze-time reads land per class: a class whose holders all sit in
+non-instanced frames reads the table, and any other class keeps mono's live answer. A writer whose
+gate reads an earlier writer's annotation (`monoPinListElems`, `monoPinRecordFields` before
+`monoPinMapValues`) takes it in mono's walk order.
+
 **Why per writer.** A prototype that bounded every un-annotated holder with a closed slot fact
 (branch `slot-s3a`) ran D16898 under freeze-time reads but lost 13 `tests/cases` programs
 (`closures/hole-fn-in-unannotated-map`: "a function slot pinned at one signature has no one closed
