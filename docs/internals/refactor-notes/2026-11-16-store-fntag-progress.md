@@ -47,7 +47,8 @@ The same programs counted by what blocks them, overlapping:
   ruled on 2026-11-16 against a check-time join of a written binding, because it would be a second
   producer of that fact.
 
-**Class T needs per-call member results.**
+**Class T is a per-call-fact class and waits for S3** (coordinator ruling, 2026-11-16: a check-time
+member result would be a second, narrower producer of what `BK_ARROW`'s solve gives at the call).
 - Witness: `closures/hole-fn-if-join-result-handed-hole-fn.vl`. The producer now finds `{add}`,
   handed through `const f = if c { apply2 } else { apply3 }; f(add)`, and the check tries it.
 - The check refuses it even with `ftLate` forced on. The late pass accepts it from the mint rows,
