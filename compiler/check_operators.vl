@@ -1,6 +1,8 @@
 // The type of an operator expression: binary and assignment operators (with a declared
 // operator function), `in`, unary operators, `as` casts and `is` tests.
 
+import { nodeLastTok, nodeStartTok } from "./fmt_util"
+import { nodeLineOf } from "./check_capture_loss"
 import { isOpenMemberOf, openMemberRows } from "./check_leaf_steps"
 import { arrDefRowServed, noteVacuousIs } from "./check_hole_links"
 import {
@@ -13,7 +15,7 @@ import {
   recPartFitArm,
   recPartFitBuild,
 } from "./check_annot_resolve"
-import { strListIndexOf } from "./listutil"
+import { i32ListHas, strListIndexOf } from "./listutil"
 import { callBindNote, recordCollapsedIsAt } from "./check_bind_rows"
 import {
   ArrayLit,
@@ -148,6 +150,13 @@ import {
   shiftCountNodes,
 } from "./check_core_state"
 import {
+  listIsPinAt,
+  listIsPinFixed,
+  listIsPinIx,
+  listIsPinMeet,
+  listIsPinOther,
+  listIsPinOtherAt,
+  listIsPinReset,
   noteBinCstr,
   noteBinCstrAt,
   noteElemLetCstr,
@@ -410,6 +419,7 @@ import {
   neverIsNode,
   neverIsNote,
   neverIsSeenReset,
+  neverIsWatchNote,
   nhLink,
   recordDeadNullTest,
   recordDeadTest,
@@ -2934,6 +2944,7 @@ function isNeverWarn(
 // At the program's end, each never-matching test whose refusal survived is a warning instead,
 // tested as `never`, which the emitter answers false, and each arm it guards is dead (D16047).
 export function settleNeverIsTests() {
+  for fx in flowDeadIs { settleIsNever(fx) }
   let i = 0
   while i < neverIsNode.length {
     const ix = neverIsNode[i]
@@ -2966,8 +2977,97 @@ export function settleNeverIsTests() {
   return 0
 }
 
+// Tests `is` node `ix` as `never` and makes each arm it guards dead, with no further warning.
+function settleIsNever(ix: i32) {
+  if ix < isVarTyIxCap {
+    while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
+    isVarTyIxSetAt(ix, TY_NEVER)
+  }
+  let a = 0
+  while a < neverIsArm.length {
+    if neverIsArmTest[a] == ix { deadArmNote(neverIsArm[a]) }
+    a = a + 1
+  }
+  return 0
+}
+
+// Whether the program's end settled the list-test pins; until then a pin may still come.
+let listIsPinDone = false
+
+// At the program's end, a list test over a parameter that every pin hands a fixed list never
+// meeting the tested element is tested as `never`, as the annotated spelling is. One an open list
+// also reaches cannot be answered per instance yet and is refused at the fixed call, naming the
+// open one; one a fixed meeting list also reaches keeps the emptiness answer for now (D16689).
+export function settleListIsPins() {
+  listIsPinDone = true
+  let k = 0
+  while k < listIsPinIx.length {
+    const ix = listIsPinIx[k]
+    const allApart = listIsPinFixed[k] > 0
+      && listIsPinOther[k] == 0
+      && listIsPinMeet[k] == 0
+    if allApart && !isArmsHoldFnLit(ix) && ix < isVarTyIxCap {
+      while isVarTyIx.length <= ix { isVarTyIxPush(-1) }
+      isVarTyIxSetAt(ix, TY_NEVER)
+    } else if listIsPinFixed[k] > 0 && listIsPinOther[k] > 0 {
+      tErr(
+        "this call hands a list whose element type is fixed, which the `is` test at line "
+          + i32ToStr(nodeLineOf(ix))
+          + " can never match, while the call at line "
+          + i32ToStr(nodeLineOf(listIsPinOtherAt[k]))
+          + " hands one it can; one body cannot answer both yet — annotate the parameter",
+        listIsPinAt[k],
+      )
+    }
+    k = k + 1
+  }
+  return 0
+}
+
+// Whether an arm test `ix` guards holds a function literal: its lifted function would be built
+// at the narrowed element no instance makes, so such a test keeps the emptiness answer (D16689).
+function isArmsHoldFnLit(ix: i32): boolean {
+  let a = 0
+  while a < neverIsArm.length {
+    if neverIsArmTest[a] == ix {
+      const lo = nodeStartTok(neverIsArm[a])
+      const hi = nodeLastTok(neverIsArm[a])
+      let k = 0
+      while lo >= 0 && k < P.nodes.length {
+        const kn = nodeAt(k)
+        if kn is FuncDecl {
+          const t = nodeStartTok(k)
+          if t >= lo && t <= hi { return true }
+        }
+        k = k + 1
+      }
+    }
+    a = a + 1
+  }
+  return false
+}
+
+// Whether `settleListIsPins` settled list test `ix` as `never`.
+function listIsPinNever(ix: i32): boolean {
+  let k = 0
+  while k < listIsPinIx.length {
+    if listIsPinIx[k] == ix {
+      return listIsPinFixed[k] > 0
+        && listIsPinOther[k] == 0
+        && listIsPinMeet[k] == 0
+        && listIsPinDone
+        && !isArmsHoldFnLit(ix)
+    }
+    k = k + 1
+  }
+  return false
+}
+
 // Clears the never-matching tests for a new program.
 export function neverIsReset() {
+  flowDeadIs = []
+  listIsPinReset()
+  listIsPinDone = false
   neverIsNode.clear()
   neverIsMsg.clear()
   neverIsArm.clear()
@@ -3085,8 +3185,18 @@ function isDeadByFlowWarn(n: IsExpr, ix: i32, d0: i32) {
   const chk = isVarTyIxOf(ix)
   const st = operandDeclaredTy(n.isObj)
   if chk < 0 || st < 0 || !tyMembersMeet(st, chk) { return 0 }
-  return deadByFlowMove(ix, d0, ", so this test is always false here")
+  const moved = deadByFlowMove(ix, d0, ", so this test is always false here")
+  // Tested as `never` at the program's end, as a test refused by its declared types is, so a
+  // list test answers false rather than by emptiness (DECISIONS "An annotation fixes an empty
+  // list's element type").
+  if moved && !inferQuiet && !elabCapLive() && !i32ListHas(flowDeadIs, ix) {
+    flowDeadIs.push(ix)
+  }
+  return moved
 }
+
+// The `is` tests a narrowing made impossible, settled as `never` with the refused ones.
+let flowDeadIs: i32[] = []
 
 // Move the diagnostics raised at `ix` since `d0` to the dead-test warning, each with `tail`.
 export function deadByFlowMove(ix: i32, d0: i32, tail: string) {
@@ -3177,7 +3287,8 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
         if om >= 0 { openMemberRows(om, omRows) }
         const settledNow = om >= 0 && omRows.length == 0
         const rt = if settledNow { om } else { isRecvMemberOf(objTy, tested) }
-        isVarTyIxSetAt(ix, rt)
+        // A list test every pin settled as `never` stays so through an instance's recheck.
+        if !listIsPinNever(ix) { isVarTyIxSetAt(ix, rt) }
         isPatTyIxPut(ix, chkTy)
         elabCapIsNote(ix, rt, chkTy)
         if om >= 0 && !settledNow { noteVacuousIs(ix, om, omRows) }
@@ -3195,7 +3306,14 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
     // would trap the compiler (D1462); an unresolved operand is freely testable, same as `TyErr`.
   } else if n.isVariant != "null" && objTy >= 0 {
     // A record test over a hole is re-asked at each pin (D3109).
-    if tyIsParamHole(objTy) { noteIsCstr(objTy, chkTy, n.isVariant, ix) }
+    if tyIsParamHole(objTy) {
+      noteIsCstr(objTy, chkTy, n.isVariant, ix)
+    }
+    // A list test over a bare type parameter is settled from its pins too (D16342).
+    else if tyAt(objTy) is TyVar && tyAt(chkTy) is TyArray {
+      noteIsCstr(objTy, chkTy, n.isVariant, ix)
+    }
+    if tyAt(chkTy) is TyArray && !elabCapLive() { neverIsWatchNote(ix) }
     // Soundness: `x is T` is meaningful only when `T` is assignable to `x`'s type, since the
     // then branch narrows verbatim — an ungated test would launder invalid wasm through a newtype.
     const ot = tyAt(objTy)
