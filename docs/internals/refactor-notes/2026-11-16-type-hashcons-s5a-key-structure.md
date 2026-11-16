@@ -38,12 +38,12 @@ by one; inside `emit_mono.vl` it raises nothing.
 | reading | value |
 |---|---|
 | seed | fixpoint, branch and base (master 350eab14e, after #8483) |
-| identity | IDENT |
+| identity | 2,000 of 2,000 files of a random sample, plus all 2,756 cases under `generics`, `closures`, `callbacks` and higher-order: byte-identical (the merge queue runs the full diff) |
 | L2 output | `compiler/entry.vl` byte-identical under both seeds, from master's tree and from this branch's |
 | guest fuel, fixed input (master's `compiler/entry.vl`) | 90,515,719,017 → 90,515,719,085 (+68 units). The registry scan was not hot in the self-compile |
 | render-parse budget | ok, unchanged |
 | phase-state census | ok, unchanged |
-| net compiler lines | NETLINES |
+| net compiler lines | +12 (`emit_mono.vl`): the map and its two helpers, the three new key fields and `exEnd`'s sum, less the two scanning loops |
 | pin helpers (`emit_mono.vl`) | 908 → 908 |
 
 ## What stage 5 still has
