@@ -34,8 +34,10 @@ ftlate probe, all `@run` programs, fixpoint seeds:
 | T sets / programs | 150 / 95 | 81 / 50 |
 | late drops | 2 | 2 (the same pair) |
 
-The 69 T sets now decided at check were the ones refused at `ftCtxOk` for an argument to a call
-through a held set (21) or through an element, field or choice (48).
+Before this step, a scratch probe of `ftPlan`'s refusals on the T programs put the innermost
+refusal of 98 T sets at `ftCtxOk`, for an argument to a call through a held set (21 sets) or
+through an element, field or choice (77). This step moves 69 sets; which of the 98 they are was
+not split out.
 
 What T still holds:
 - lambda members (`ftNodeOk`'s lambda arm, 65 sets on the probe before this step);
