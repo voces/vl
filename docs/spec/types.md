@@ -66,7 +66,7 @@ be bound. A function value returning any type is assignable where a function ret
 there is no `void[]`, no `void | T`, no `void` field and no `void` map value.
 
 ```vl
-function call<T>(f: () => T): T { f() }
+function call<T>(f: () => T): T { return f() }
 call(() => print(5))   // prints 5
 ```
 
@@ -89,7 +89,7 @@ contribute to the type of an `if` or `match`.
 
 ```vl
 function fail(msg: string): never { __trap__(msg) }
-function f(c: boolean): i32 { if c { 1 } else { fail("no") } }
+function f(c: boolean): i32 { return if c { 1 } else { fail("no") } }
 print(f(true))   // prints 1
 ```
 
@@ -151,13 +151,26 @@ const x: f32 = 16777217   // refused: i32 doesn't fit in f32 — the conversion 
 
 **T2.3** A hex, binary or octal literal is a bit pattern. In an `i32` context, a pattern
 of 32 bits or fewer is the `i32` with those bits. In an `i64` context it is the
-zero-extended value. A wider pattern is `i64`.
+zero-extended value. A wider pattern is `i64`. A radix literal in a float context is the
+value its digits spell. At a float destination or beside a float the float must hold that
+value exactly, as it must a decimal integer literal; only `as f32` / `as f64` rounds it. A
+radix constant tree read at an `f64` computes at 64 bits, with integer division, and then
+converts.
 
 ```vl
 print(0xFFFFFFFF)                // prints -1
 const m: i64 = 0xFFFFFFFF
 print(m)                         // prints 4294967295
 print(0x1_0000_0000)             // prints 4294967296
+print(0xFF as f32)               // prints 255
+print(1.5 + 0xFFFFFFFF)          // prints 4294967296.5
+print(0xFFFFFFFF as f32)         // prints 4294967296
+const y: f64 = 0xFFFFFFFF / 2
+print(y)                         // prints 2147483647
+```
+
+```vl
+const b: f32 = 0xFFFFFFFF   // refused: constant 4294967295 is not exact at f32
 ```
 
 ```vl
@@ -165,7 +178,13 @@ const k: i32 = 3000000000   // refused: constant 3000000000 overflows i32 — wr
 ```
 
 > Ruling: owner 2026-09-04, DECISIONS.md §"Types & semantics" (first bullet, the hex
-> bit-pattern rule).
+> bit-pattern rule). Owner 2026-11-15 (lane O's spec questions 1 and 2): a float context reads
+> the digits' value, exactly except under `as`; a tree at `f64` computes at 64 bits, which
+> reverses D14990's `f64` clause.
+
+> Status: where the float does not hold the digits' value exactly, the compiler reads the
+> pattern at `as f32` and `as f64` (`0xFFFFFFFF as f32` prints -1). The acceptance grid is
+> `scripts/oracle/radix-float-grid.ts`.
 
 **T2.4** An unannotated `const` whose initialiser is a literal, or arithmetic over
 literals and such `const`s, is an exact constant with no single type. Every read of it is
@@ -201,7 +220,7 @@ refused.
 
 ```vl
 let n = 1
-function g(x: f64): f64 { x / 2 }
+function g(x: f64): f64 { return x / 2 }
 print(g(n))   // prints 0.5
 ```
 
@@ -254,7 +273,7 @@ literal. A union of literal types is VL's enumeration. There is no separate `enu
 
 ```vl
 type Dir = "n" | "s"
-function go(d: Dir): i32 { if d == "n" { 1 } else { 2 } }
+function go(d: Dir): i32 { return if d == "n" { 1 } else { 2 } }
 print(go("s"))   // prints 2
 ```
 
@@ -296,7 +315,7 @@ After a true test, `x` has the narrowed type (narrowing.md). `x !is T` is the ne
 ```vl
 function f(x: i32 | string): i32 {
   if x is i32 { return x + 1 }
-  x.length
+  return x.length
 }
 print(f(1))     // prints 2
 print(f("ab"))  // prints 2
@@ -336,14 +355,42 @@ type N = !string   // refused: `!string` is a NEGATION, which says what a value 
 > "Type negation is `!A`, not `not A`".
 
 **T3.6** Two numeric values of different types that meet at a join (`if` arms, `match`
-arms, `??`, list literal elements) have the union of their types. Literal operands adapt
-instead (T2.4). A numeric union is delivered to one numeric type only when the conversion
-is exact for every member. Arithmetic on a numeric union is specified in expressions.md.
+arms, `??`, list literal elements) have the union of their types. A numeric literal joined
+with a typed numeric value adopts that value's type when it fits: an integer literal when
+the type holds it exactly, a float literal at `f32` or `f64` (at `f32` it rounds, as
+`let x: f32 = 0.1` does). A literal that does not fit keeps its default type (T2.1, T2.2)
+and joins as a member. The rule is the same in every join form. A numeric union is
+delivered to one numeric type only when the conversion is exact for every member.
+Arithmetic on a numeric union is specified in expressions.md.
+
+```vl
+function f(c: boolean, x: f32): f32 {
+  const v = if c { 5 } else { x }   // f32: 5 fits f32 exactly
+  return v
+}
+print(f(true, 1.5))   // prints 5
+```
+
+```vl
+function g(x: f32): f32 {
+  const v = [0.1, x]   // f32[]: a float literal adopts f32
+  return v[1]
+}
+print(g(2.5))   // prints 2.5
+```
+
+```vl
+function h(c: boolean, x: f32) {
+  const v = if c { 9000000000 } else { x }   // i64 | f32: f32 does not hold 9000000000 exactly
+  print(v)
+}
+h(true, 1.5)   // prints 9000000000
+```
 
 ```vl
 function f(c: boolean, a: i32, b: f64): f64 {
   const v = if c { a } else { b }
-  v + 1
+  return v + 1
 }
 print(f(true, 1, 2.5))    // prints 2
 print(f(false, 1, 2.5))   // prints 3.5
@@ -352,12 +399,18 @@ print(f(false, 1, 2.5))   // prints 3.5
 ```vl
 function f(c: boolean, a: i64, b: f64): f64 {
   const v = if c { a } else { b }
-  v   // refused: expected f64, got i64 | f64 — a member does not convert to f64 exactly; write `x as f64`
+  return v   // refused: expected f64, got i64 | f64 — a member does not convert to f64 exactly; write `x as f64`
 }
 ```
 
 > Ruling: owner 2026-09-30, DECISIONS.md §"Runtime numbers of different types join as a
-> union, and operators dispatch per member" (D3345, D3363).
+> union, and operators dispatch per member" (D3345, D3363). Owner 2026-11-15 (lane O's spec
+> question 3): one literal-adoption rule for every join form.
+
+> Status: the compiler differs by form today, so the first two examples are refused. `if`
+> and list joins keep an integer literal beside `f32` at `i32`, a list keeps a float literal
+> beside `f32` at `f64`, and `if` and lists keep `9000000000` beside `f64` at `i64`. The
+> acceptance grid is `scripts/oracle/join-grid.ts` (4 literals × 4 types × 4 join forms).
 
 ## T4. Records
 
@@ -488,13 +541,13 @@ a value whose type admits `null` is refused until a test removes `null` (narrowi
 ```vl
 function len(s: string | null): i32 {
   if s == null { return 0 }
-  s.length
+  return s.length
 }
 print(len("abc"))   // prints 3
 ```
 
 ```vl
-function len(s: string | null): i32 { s.length }   // refused: member access '.length' on non-object string | null
+function len(s: string | null): i32 { return s.length }   // refused: member access '.length' on non-object string | null
 ```
 
 **T5.2** `a?.f` is `null` when `a` is `null` and `a.f` otherwise. `a ?? b` is `a` when `a`
@@ -502,13 +555,13 @@ is not `null` and `b` otherwise. `?.` guards `null` only, not other union member
 
 ```vl
 type P = { name: string }
-function n(p: P | null): string { p?.name ?? "none" }
+function n(p: P | null): string { return p?.name ?? "none" }
 print(n(null))   // prints none
 ```
 
 ```vl
 type P = { name: string }
-function n(p: P | i32): string { p?.name ?? "none" }   // refused: member access '?.name' on non-object P | i32
+function n(p: P | i32): string { return p?.name ?? "none" }   // refused: member access '?.name' on non-object P | i32
 ```
 
 > Ruling: DECISIONS.md §"Types & semantics", "`?.` is null-only".
@@ -558,7 +611,7 @@ be delivered where `readonly T[]` is expected when an `S` converts to a `T`. Con
 the list itself needs a copy, such as `.map`.
 
 ```vl
-function sum(xs: readonly f64[]): f64 { xs[0] + xs[1] }
+function sum(xs: readonly f64[]): f64 { return xs[0] + xs[1] }
 const ns: i32[] = [1, 2]
 print(sum(ns))   // prints 3
 ```
@@ -569,7 +622,7 @@ const fs: f64[] = ns   // refused: … a container never widens implicitly, and 
 ```
 
 ```vl
-function f(xs: readonly i32[]) { xs.push(1) }   // refused: `.push()` writes the list, and readonly i32[] is a read-only view
+function f(xs: readonly i32[]) { return xs.push(1) }   // refused: `.push()` writes the list, and readonly i32[] is a read-only view
 ```
 
 > Ruling: owner 2026-09-23, DECISIONS.md §"No implicit container widening";
@@ -629,6 +682,24 @@ value, as `==` does.
 > "A f64-keyed Map isn't supported yet" or the same sentence for its type (ROADMAP A15,
 > item 2).
 
+**T7.4** `.length` is an `i32`: a list's element count, a map's entry count, and a set's
+member count. Writing an existing key or adding an existing member does not change it.
+
+```vl
+const m = Map<string, i32>()
+m["a"] = 1
+m["b"] = 2
+m["a"] = 3
+print(m.length)   // prints 2
+const s = Set<i32>()
+s.add(4)
+s.add(4)
+print(s.length)   // prints 1
+```
+
+> Ruling: owner 2026-11-15 (lane O's spec question 6): a map's `.length` is its entry count,
+> and the one name covers lists, maps and sets.
+
 ## T8. Functions
 
 **T8.1** `(a: A, b: B) => R` is a function type. Parameter names in a function type are
@@ -637,7 +708,7 @@ same type. Named arguments work only in a call to a declared function, not throu
 function value.
 
 ```vl
-function twice(f: (n: i32) => i32, x: i32): i32 { f(f(x)) }
+function twice(f: (n: i32) => i32, x: i32): i32 { return f(f(x)) }
 print(twice((k: i32) => k + 1, 1))   // prints 3
 ```
 
@@ -655,10 +726,10 @@ the argument out. A last parameter `...xs: T[]` collects the remaining arguments
 `f(...list)` spreads a list into them.
 
 ```vl
-function add(a: i32, b: i32 = 10): i32 { a + b }
+function add(a: i32, b: i32 = 10): i32 { return a + b }
 print(add(1))      // prints 11
 print(add(1, b: 2))   // prints 3
-function sum(...xs: i32[]): i32 { xs.length }
+function sum(...xs: i32[]): i32 { return xs.length }
 print(sum(1, 2, 3))   // prints 3
 print(sum(...[4, 5]))   // prints 2
 ```
@@ -685,14 +756,14 @@ are inferred from the call or written `id<f64>(3)`. Each call is checked at its 
 arguments, and a body that is invalid at those arguments is refused at that call.
 
 ```vl
-function id<T>(x: T): T { x }
+function id<T>(x: T): T { return x }
 print(id(3))          // prints 3
 print(id("s"))        // prints s
 print(id<f64>(3))     // prints 3
 ```
 
 ```vl
-function f<T>(x: T | null): i32 { if x == null { return 0 } x + 1 }
+function f<T>(x: T | null): i32 { if x == null { return 0 } return x + 1 }
 print(f("s"))   // refused: operator '+' is not defined for string and i32 (the call's argument types)
 ```
 
@@ -702,12 +773,12 @@ print(f("s"))   // refused: operator '+' is not defined for string and i32 (the 
 **T9.2** A bound `<T: { n: i32 }>` admits only a type with a stored field `n: i32`.
 
 ```vl
-function get<T: { n: i32 }>(x: T): i32 { x.n }
+function get<T: { n: i32 }>(x: T): i32 { return x.n }
 print(get({ n: 4, m: 1 }))   // prints 4
 ```
 
 ```vl
-function sum<T: { n: i32 }>(xs: T[]): i32 { xs.length }
+function sum<T: { n: i32 }>(xs: T[]): i32 { return xs.length }
 print(sum([1, 2]))   // refused: i32 does not satisfy `{n:i32}`: no field `n: i32`
 ```
 
@@ -715,7 +786,7 @@ print(sum([1, 2]))   // refused: i32 does not satisfy `{n:i32}`: no field `n: i3
 generic function of a compatible type may be stored in it. A concrete function may not.
 
 ```vl
-function id<T>(x: T): T { x }
+function id<T>(x: T): T { return x }
 let g = id
 g = (x: i32) => x + 1   // refused: cannot assign (i32) => i32 to `g`: it keeps the generic type of its initializer
 ```

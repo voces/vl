@@ -16,7 +16,8 @@ import {
   cUserTypesVer,
   nomNameOfTy,
   tyAt,
-  tyMutEpoch,
+  tyElemOf,
+  tyEmitEpoch,
   tyToStructStr,
 } from "./check_types"
 import { numLexFitsI32 } from "./emit_bignum"
@@ -40,7 +41,7 @@ export function utkIdOf(s: string): i32 {
   const id = utkTexts.length
   utkTexts.push(s)
   utkIds[s] = id
-  id
+  return id
 }
 
 // One member's key text: `null` for -1; a union or a list keyed by its members' texts, sorted;
@@ -52,7 +53,7 @@ export function utkMemberText(ty: i32): string {
   const cyc = [0]
   const t = utkTyText(ty, path, cyc)
   if cyc[0] == 0 { return t }
-  utkCycText(ty)
+  return utkCycText(ty)
 }
 
 function utkTyText(ty: i32, path: i32[], cyc: i32[]): string {
@@ -81,11 +82,11 @@ function utkTyText(ty: i32, path: i32[], cyc: i32[]): string {
   const t = tyAt(ty)
   if t is TyArray {
     path.push(p)
-    const e = utkTyText(t.aElem, path, cyc)
+    const e = utkTyText(tyElemOf(t), path, cyc)
     path.pop()
     return "[" + e + "]"
   }
-  utkShapeText(ty)
+  return utkShapeText(ty)
 }
 
 // A walk node's kind, its children appended to `out`: 1 a union of two or more members, 2 a
@@ -100,15 +101,15 @@ function utkNodeKids(ty: i32, out: i32[]): i32 {
   }
   const t = tyAt(ty)
   if t is TyArray {
-    out.push(t.aElem)
+    out.push(tyElemOf(t))
     return 2
   }
-  0
+  return 0
 }
 
 function utkLeafText(ty: i32): string {
   if ty < 0 { return "null" }
-  utkShapeText(ty)
+  return utkShapeText(ty)
 }
 
 // A leaf's text: a record spelled by its field names and each field's member text id, a function
@@ -130,7 +131,7 @@ function utkShapeText(ty: i32): string {
     utkShapeStamp.push(-1)
     utkShapeVer.push(-1)
   }
-  if utkShapeStamp[ty] == tyMutEpoch && utkShapeVer[ty] == cUserTypesVer {
+  if utkShapeStamp[ty] == tyEmitEpoch && utkShapeVer[ty] == cUserTypesVer {
     return utkTexts[utkShapeId[ty]]
   }
   for o in utkShapeOpen {
@@ -161,10 +162,10 @@ function utkShapeText(ty: i32): string {
     out = out + ") => #" + i32ToStr(utkIdOf(utkMemberText(t.fnRet)))
   }
   utkShapeOpen.pop()
-  utkShapeStamp[ty] = tyMutEpoch
+  utkShapeStamp[ty] = tyEmitEpoch
   utkShapeVer[ty] = cUserTypesVer
   utkShapeId[ty] = utkIdOf(out)
-  out
+  return out
 }
 
 // `utkShapeText`'s memo, as `utkTyKeyText`'s, and the records and functions it is inside.
@@ -249,7 +250,16 @@ function utkCycText(root: i32): string {
     count = n
   }
   const path: i32[] = []
-  utkCycNodeText(0, path, kinds, kidStart, kidCount, kidNode, kidLeaf, cls)
+  return utkCycNodeText(
+    0,
+    path,
+    kinds,
+    kidStart,
+    kidCount,
+    kidNode,
+    kidLeaf,
+    cls,
+  )
 }
 
 function utkCycNodeText(
@@ -291,23 +301,12 @@ function utkCycNodeText(
   }
   path.pop()
   if kinds[i] == 2 { return "[" + texts[0] + "]" }
-  "(" + utkTextOf(texts) + ")"
+  return "(" + utkTextOf(texts) + ")"
 }
 
 // The key text of a member multiset: the member texts sorted, never deduped.
 export function utkTextOf(texts: string[]): string {
-  const ks: string[] = []
-  for t in texts {
-    let at = 0
-    while at < ks.length && !strLess(t, ks[at]) { at = at + 1 }
-    ks.push(t)
-    let m = ks.length - 1
-    while m > at {
-      ks[m] = ks[m - 1]
-      m = m - 1
-    }
-    ks[at] = t
-  }
+  const ks = utkSorted(texts)
   let out = ""
   let j = 0
   while j < ks.length {
@@ -315,11 +314,42 @@ export function utkTextOf(texts: string[]): string {
     out = out + ks[j]
     j = j + 1
   }
-  out
+  return out
+}
+
+// `xs` in ascending `strLess` order, by a stable bottom-up merge, so a wide union's key costs
+// its members' log, not their square.
+function utkSorted(xs: string[]): string[] {
+  let a: string[] = []
+  for x in xs { a.push(x) }
+  let w = 1
+  while w < a.length {
+    const b: string[] = []
+    let lo = 0
+    while lo < a.length {
+      const mid = if lo + w < a.length { lo + w } else { a.length }
+      const hi = if lo + w + w < a.length { lo + w + w } else { a.length }
+      let i = lo
+      let j = mid
+      while i < mid || j < hi {
+        if j >= hi || (i < mid && !strLess(a[j], a[i])) {
+          b.push(a[i])
+          i = i + 1
+        } else {
+          b.push(a[j])
+          j = j + 1
+        }
+      }
+      lo = hi
+    }
+    a = b
+    w = w + w
+  }
+  return a
 }
 
 // The key text of type `ty`'s canonical members, or "" when it has none. Memoised per arena index
-// and stamped with `tyMutEpoch` and `cUserTypesVer`, so a type many lookups share is keyed once: a record's text is
+// and stamped with `tyEmitEpoch` and `cUserTypesVer`, so a type many lookups share is keyed once: a record's text is
 // its render, which doubles with each level of a diamond.
 export function utkTyKeyText(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
@@ -331,15 +361,15 @@ export function utkTyKeyText(ty: i32): string {
     utkMemoStamp.push(-1)
     utkMemoVer.push(-1)
   }
-  if utkMemoStamp[ty] == tyMutEpoch && utkMemoVer[ty] == cUserTypesVer {
+  if utkMemoStamp[ty] == tyEmitEpoch && utkMemoVer[ty] == cUserTypesVer {
     const hit = utkMemoId[ty]
     return if hit >= 0 { utkTexts[hit] } else { "" }
   }
   const t = utkTyKeyTextGo(ty)
-  utkMemoStamp[ty] = tyMutEpoch
+  utkMemoStamp[ty] = tyEmitEpoch
   utkMemoVer[ty] = cUserTypesVer
   utkMemoId[ty] = if t == "" { -1 } else { utkIdOf(t) }
-  t
+  return t
 }
 
 // `utkTyKeyText`'s memo: the key text's id per arena index, -1 for none, and its two stamps.
@@ -355,14 +385,25 @@ function utkTyKeyTextGo(ty: i32): string {
   if !canonUnionMemberTysOf(ty, mems) { return "" }
   const texts: string[] = []
   const wide: string[] = []
+  const inWide: {[string]: boolean} = Map()
   let widened = false
   for m in mems {
     const mt = utkMemberText(m)
     texts.push(mt)
-    if mems.length > 1 && utkLitSetBasesInto(m, wide) { widened = true }
-    else if !strListHas(wide, mt) { wide.push(mt) }
+    const w0 = wide.length
+    if mems.length > 1 && utkLitSetBasesInto(m, wide) {
+      widened = true
+      let k = w0
+      while k < wide.length {
+        inWide[wide[k]] = true
+        k = k + 1
+      }
+    } else if !(inWide[mt] ?? false) {
+      inWide[mt] = true
+      wide.push(mt)
+    }
   }
-  utkTextOf(if widened { wide } else { texts })
+  return utkTextOf(if widened { wide } else { texts })
 }
 
 // Appends the bases of literal set `m` to `out`, each once, and says whether `m` is one with an
@@ -385,7 +426,7 @@ function utkLitSetBasesInto(m: i32, out: string[]): boolean {
       if !strListHas(out, b) { out.push(b) }
     }
   }
-  true
+  return true
 }
 
 // The first row whose type key is the key of type `ty`'s canonical members, or -1.
@@ -394,7 +435,7 @@ export function unRowOfTyKey(ty: i32): i32 {
   if t == "" { return -1 }
   const id = utkIds[t] ?? -1
   if id < 0 || id >= unTyKeyFirstRow.length { return -1 }
-  unTyKeyFirstRow[id]
+  return unTyKeyFirstRow[id]
 }
 
 // The first row the key of `inner | null` finds, or -1: the key that nullable type would carry,
@@ -403,7 +444,7 @@ export function unRowOfNullableKey(inner: i32): i32 {
   if inner < 0 { return -1 }
   const id = utkIds[utkTextOf([utkMemberText(inner), "null"])] ?? -1
   if id < 0 || id >= unTyKeyFirstRow.length { return -1 }
-  unTyKeyFirstRow[id]
+  return unTyKeyFirstRow[id]
 }
 
 // `m` with the one-member union wrapper an arrow-bodied alias carries peeled, else `m`.
@@ -413,5 +454,5 @@ export function unMemPeelAliasWrapper(m: i32): i32 {
   if t is TyUnion {
     if t.uMembers.length == 1 { return t.uMembers[0] }
   }
-  m
+  return m
 }

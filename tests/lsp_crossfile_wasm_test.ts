@@ -10,16 +10,10 @@ import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { crossFileUriOf, withStd } from "../lsp/src/moduleGraph.ts";
 import { STD_SOURCES } from "../std/embedded.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const logs: string[] = [];
 const log = (m: string) => logs.push(m);
@@ -28,7 +22,7 @@ const log = (m: string) => logs.push(m);
 // keyed by the resolved `util.vl` path — mirrors the symbol suite's import test
 // so the specifier resolves identically.
 const entry = 'import { add } from "./util"\nprint(add(1, 2))\n';
-const util = "export function add(a: i32, b: i32): i32 {\n  a + b\n}\n";
+const util = "export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n";
 const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
 
 Deno.test({

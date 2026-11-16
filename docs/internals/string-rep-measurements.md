@@ -1104,7 +1104,7 @@ a `u8[]` struct field is supported, and it should land in the SAME change. Secon
 NOT this one.** Binding a bare `T` to `u8[]` is check-clean invalid wasm:
 
 ```vl
-function id<T>(x: T) { x }
+function id<T>(x: T) { return x }
 const q: u8[] = [1, 2]
 print(id(q).length)
 ```

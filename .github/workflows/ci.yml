@@ -187,6 +187,11 @@ jobs:
       bin_key: ${{ steps.keys.outputs.bin }}
       rustc: ${{ steps.keys.outputs.rustc }}
     steps:
+      # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
+      # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       # Blobless full history: the docs-only diff needs the merge-base's TREES, not every
       # past blob, and the full-blob fetch was 18 s of this job's critical path.
       - uses: actions/checkout@v5
@@ -266,9 +271,9 @@ jobs:
       # The rolling seed cache: an exact hit is a seed proven from THIS compiler source (it
       # was saved only after the ladder below passed); a restore-keys hit hands
       # refresh-compiler.sh a healthy older seed to self-compile current source with; a cold
-      # cache fetches the release seed. The `.cwasm` sidecars (one per engine configuration)
-      # ride along, so no downstream `vl` re-JITs the seed. A stale sidecar costs time, never
-      # correctness: the host recompiles one whose key does not match.
+      # cache fetches the release seed. The seed cache (`$VL_SEED_CACHE_DIR`: one `.cwasm` per
+      # engine configuration, keyed by the seed's content) rides along, so no downstream `vl`
+      # re-JITs the seed. A stale entry costs time, never correctness: its key does not match.
       - name: Cache seed compiler wasm
         if: steps.verdict.outputs.heavy == 'true'
         id: seedcache
@@ -277,7 +282,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ steps.keys.outputs.seed }}
           restore-keys: |
             vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
@@ -326,6 +331,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WANT_FUEL: ${{ steps.fuelcache.outcome == 'success' && steps.fuelcache.outputs.cache-hit != 'true' }}
 
+      # Only the proven seed's compiled forms go into the seed cache entry, not every rung's.
+      - name: Trim the seed cache to the proven seed
+        if: steps.verdict.outputs.heavy == 'true'
+        run: ./scripts/seed-cache-trim.sh
+
       # The handoff to master's run of the same seed key (see "Reuse a seed" above). A fork's
       # run uploads nothing; the reader refuses one anyway.
       - name: Checksum the proven seed for master
@@ -362,6 +372,9 @@ jobs:
       matrix:
         shard: [1, 2, 3, 4, 5]
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - id: setup-deno-2
@@ -409,7 +422,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -465,6 +478,9 @@ jobs:
     if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.tree != 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - id: setup-deno-3
@@ -497,7 +513,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -534,6 +550,11 @@ jobs:
       # per file, against scripts/late-demands-baseline.txt. A file whose count rises fails.
       - name: Late demands (ratchet)
         run: scripts/vl-host/target/release/vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm
+
+      # The phase-state RATCHET (L5): hidden-argument globals, cross-phase tables and checker
+      # symbols imported by other phases, per module. A module whose count rises fails.
+      - name: Phase state (ratchet)
+        run: scripts/vl-host/target/release/vl run scripts/phase-state-census.vl --compiler build/vl-compiler.wasm -- --check
 
       # No Python: a tracked .py file or a python invocation in a script fails.
       - name: No Python
@@ -615,6 +636,9 @@ jobs:
       matrix:
         part: [editor, oracle]
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - id: setup-deno-4
@@ -647,7 +671,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -662,6 +686,9 @@ jobs:
       # scripts/gate.sh extracts this list by the step's NAME.
       - name: Editor features on the wasm compiler
         if: matrix.part == 'editor'
+        # A missing seed fails here instead of skipping (tests/support/tree.ts seedPresent).
+        env:
+          SELFHOST_NATIVE_ALIGN: "1"
         run: >-
           deno test -A --no-check --parallel
           tests/lsp_semantic_tokens_test.ts
@@ -737,6 +764,9 @@ jobs:
       matrix:
         shard: [1]
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - id: setup-deno-5
@@ -817,7 +847,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -886,6 +916,9 @@ jobs:
       matrix:
         part: ["1", "2"]
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - id: setup-deno-6
@@ -918,7 +951,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -954,7 +987,8 @@ jobs:
           VL_SCALING_SHARD: ${{ matrix.part }}/2
 
       # The L2 tripwire: the candidate compiling the compiler, in guest fuel, against
-      # scripts/self-compile-baseline.json (fails past 1.5x, and when the live set nears the
+      # scripts/self-compile-baseline.json (fails past the per-PR +1% tier, past 1.5x, on a
+      # baseline scripts/self-compile-ledger.txt does not name, and when the live set nears the
       # heap's cap). Its class is a pass that scales with the program, which shows only one
       # bootstrap step late (D1090); the seed job's fixpoint proves the bytes, not the cost.
       # One fueled self-compile, on the shard that carries no plumb build.
@@ -977,6 +1011,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - name: Restore vl-host binary
@@ -992,7 +1029,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -1033,6 +1070,9 @@ jobs:
       matrix:
         shard: [1, 2]
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       - name: Restore vl-host binary
@@ -1048,7 +1088,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
@@ -1104,6 +1144,9 @@ jobs:
       actions: read
       checks: read
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -1148,7 +1191,7 @@ jobs:
       # Also RESTORE-ONLY: any healthy seed will do here (see the job header), so
       # a restore-keys hit is a full hit and the fetch below covers a cold cache —
       # while `seed` stays the sole writer of the seed pair, which is what
-      # keeps the `.cwasm` sidecars riding along with the wasm they were built from.
+      # keeps the seed cache riding along with the wasm its entries were built from.
       - name: Restore seed compiler wasm
         if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         uses: actions/cache/restore@v5
@@ -1156,12 +1199,12 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
           restore-keys: |
             vl-seed4-${{ runner.os }}-
 
-      # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
+      # fetch-seed.sh keeps the restored seed (its `.src` marks a local build), else fetches one.
       - name: Ensure a seed to embed
         if: steps.verdict.outputs.heavy == 'true' && steps.verdict.outputs.tree != 'true'
         run: ./scripts/fetch-seed.sh
@@ -1266,6 +1309,9 @@ jobs:
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
     runs-on: ubuntu-latest
     steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - name: Every job this proof covers passed
         env:
           NEEDS: ${{ toJSON(needs) }}
@@ -1284,7 +1330,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 

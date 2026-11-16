@@ -10,6 +10,7 @@
 import { filePath } from "./support/filePath.ts";
 import { inlayHintsFromWasm } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -25,14 +26,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 // the TS path. Seed-gated; self-ignores when the seed is absent.
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const noSiblings = () => undefined;
 
@@ -43,7 +37,7 @@ Deno.test({
   const checker = loadWasmChecker(SEED, () => {})!;
   // `x` inferred (hint), `add` return inferred (hint after `)`), `a`/`b` params
   // annotated (suppressed), `s` inferred (hint).
-  const src = "let x = 1 + 2\nfunction add(a: i32, b: i32) {\n  a + b\n}\nlet s = \"hi\"\n";
+  const src = "let x = 1 + 2\nfunction add(a: i32, b: i32) {\n  return a + b\n}\nlet s = \"hi\"\n";
   const candidates = await checker.inlayHintsAt(src, "/tmp/x.vl", noSiblings);
   const hints = inlayHintsFromWasm(candidates, undefined, src);
   const labels = hints.map((h) => h.label).sort();
@@ -119,7 +113,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
-  const src = 'function greet(n: string) {\n  print(n)\n  "hi " + n\n}\ngreet("a")\n';
+  const src = 'function greet(n: string) {\n  print(n)\n  return "hi " + n\n}\ngreet("a")\n';
   const candidates = await checker.inlayHintsAt(src, "/tmp/x.vl", noSiblings);
   const hints = inlayHintsFromWasm(candidates, undefined, src);
   assertEquals(hints.map((h) => h.label), [": string"], "statement-only function's return inlay");

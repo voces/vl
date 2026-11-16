@@ -49,31 +49,35 @@ type Cfg = { port: i32, host: string | null }
 
 const PROGRAMS: Record<string, string> = {
   one: `${PRE}
-function a(r: Json): i32 { if r is Cfg { return r.port }  0 }
+function a(r: Json): i32 { if r is Cfg { return r.port }  return 0 }
 const m: { [string]: Json } = Map()
 print(a(m))
 `,
   two_same: `${PRE}
-function a(r: Json): i32 { if r is Cfg { return r.port }  0 }
-function b(r: Json): i32 { if r is Cfg { return r.port + 1 }  0 }
+function a(r: Json): i32 { if r is Cfg { return r.port }  return 0 }
+function b(r: Json): i32 { if r is Cfg { return r.port + 1 }  return 0 }
 const m: { [string]: Json } = Map()
 print(a(m) + b(m))
 `,
   two_diff: `${PRE}
-function a(r: Json): i32 { if r is Cfg { return r.port }  0 }
-function b(r: Json): i32 { if r is string[] { return r.length }  0 }
+function a(r: Json): i32 { if r is Cfg { return r.port }  return 0 }
+function b(r: Json): i32 { if r is string[] { return r.length }  return 0 }
 const m: { [string]: Json } = Map()
 print(a(m) + b(m))
 `,
 };
 
-/** Compile `src`, disassemble it, and count its `(func …)` definitions. */
+/**
+ * Compile `src`, disassemble it, and count its `(func …)` definitions, leaving out the
+ * `__grow_<row>__` helpers: one per list shape a push grows, shared by every site, so a walker
+ * that pushes a shape no other code does mints one without being a second pair.
+ */
 function funcCount(dir: string, name: string, src: string): number {
   const vl = `${dir}/${name}.vl`;
   const wasm = `${dir}/${name}.wasm`;
   Deno.writeTextFileSync(vl, src);
   const build = new Deno.Command(VL, {
-    args: ["build", vl, "-o", wasm, "--compiler", COMPILER],
+    args: ["build", vl, "--names", "-o", wasm, "--compiler", COMPILER],
     env: { VL_STD: `${ROOT}/std` },
     stdout: "piped",
     stderr: "piped",
@@ -94,7 +98,8 @@ function funcCount(dir: string, name: string, src: string): number {
     );
   }
   const wat = new TextDecoder().decode(dis.stdout);
-  return wat.split("\n").filter((l) => l.startsWith(" (func ")).length;
+  return wat.split("\n").filter((l) => l.startsWith(" (func ") && !l.startsWith(" (func $__grow_"))
+    .length;
 }
 
 Deno.test({

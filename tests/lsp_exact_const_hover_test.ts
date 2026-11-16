@@ -16,16 +16,10 @@ import {
   inlayHintsFromWasm,
   scopeCompletionsFromBindings,
 } from "../lsp/src/typeFeatures.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const noSiblings = () => undefined;
 
@@ -38,7 +32,7 @@ const SRC = [
   /*  5 */ "const T = 1.0 / 3.0",
   /*  6 */ "const X: i64 = 5",
   /*  7 */ "let y = 3",
-  /*  8 */ "function f(): i32 { 7 }",
+  /*  8 */ "function f(): i32 { return 7 }",
   /*  9 */ "const N = f()",
   /* 10 */ "const a: i64 = SIZE",
   /* 11 */ "const b: i32 = SIZE",
@@ -117,14 +111,8 @@ Deno.test({ name: "exact-const hover: a float constant", ignore }, async () => {
   const FLOAT = "float constant; typed at each use";
   await want(4, 6, "const F = 0.1", FLOAT, "F decl");
   await want(16, 6, "F = 0.1", FLOAT, "F use");
-  // 1/3 has no terminating decimal, so it shows at f64 precision and says so.
-  await want(
-    5,
-    6,
-    "const T = 0.3333333333333333",
-    "float constant (shown at f64 precision); typed at each use",
-    "T decl",
-  );
+  // A float constant folds in IEEE (E9.1): 1 / 3 is the double it shows, exactly.
+  await want(5, 6, "const T = 0.3333333333333333", FLOAT, "T decl");
 });
 
 // The type shown at a use is the one the read COMPILES at, or none. Each destination below
@@ -205,10 +193,12 @@ Deno.test({ name: "exact-const hover: beside an operand it does not fit, no type
 Deno.test({ name: "exact-const hover: a float at a typed use shows the value it computes with", ignore }, async () => {
   const FLOAT = "float constant; typed at each use";
   await want(8, 15, "F: f32 = 0.10000000149011612", "float constant (its f32 value here); typed at each use", "F at f32", OPEN);
-  await want(12, 15, "T: f64 = 0.3333333333333333", "float constant (its f64 value here); typed at each use", "T at f64", OPEN);
-  // A long exact decimal with a short exact spelling is shown by it, and is not rounded.
+  // E9.1: a float constant is the double it names, so at f64 it is not rounded.
+  await want(12, 15, "T: f64 = 0.3333333333333333", FLOAT, "T at f64", OPEN);
+  // A float constant is the double its tree folds to, shown by its shortest spelling.
   await want(9, 6, "const E = 1e30", FLOAT, "E decl", OPEN);
-  await want(10, 6, "const Z = 1e-400", FLOAT, "Z decl", OPEN);
+  // E9.1: 1e-400 is below the least double, so the constant is the double 0.0.
+  await want(10, 6, "const Z = 0.0", FLOAT, "Z decl", OPEN);
 });
 
 Deno.test({ name: "exact-const hover: other bindings keep their one type", ignore }, async () => {
@@ -228,7 +218,7 @@ Deno.test({ name: "exact-const hover: an exported const used from another module
 // column as `main`'s import specifier `BIG`; the hover there must not answer with util's value,
 // and references must not list util's occurrences as main's.
 Deno.test({ name: "exact-const hover: another module's occurrence at the same position is not this one", ignore }, async () => {
-  const util = "export const SIZE = 192\nexport const BIG = 5000000000\nexport function lf(x: i64): i64 { x + BIG }\n";
+  const util = "export const SIZE = 192\nexport const BIG = 5000000000\nexport function lf(x: i64): i64 { return x + BIG }\n";
   const main = 'import { SIZE, BIG, lf } from "./util"\nconst a: i64 = BIG\nprint(lf(a) + SIZE)\n';
   const read = (key: string) => (key.endsWith("util.vl") ? util : undefined);
   const got = await hoverAt(main, 0, 15, read);
@@ -246,7 +236,7 @@ Deno.test({ name: "exact-const hover: another module's occurrence at the same po
 // D3324's own witness: references to the imported `L` from the entry list the entry's read
 // only, never `lib.vl`'s declaration or its read inside `lf` as ranges of the entry.
 Deno.test({ name: "references: an imported name lists no other module's ranges (D3324)", ignore }, async () => {
-  const lib = "export const L = 0xFFFFFFFF\nexport function lf(x: i64): i64 { x + L }\n";
+  const lib = "export const L = 0xFFFFFFFF\nexport function lf(x: i64): i64 { return x + L }\n";
   const entry = 'import { L, lf } from "./lib"\nprint(lf(L))\n';
   const read = (key: string) => (key.endsWith("lib.vl") ? lib : undefined);
   const checker = loadWasmChecker(SEED, () => {})!;
@@ -260,7 +250,7 @@ Deno.test({ name: "references: an imported name lists no other module's ranges (
 // The member-access lookup had the same hole: `util`'s `p.s` sits at the line and column of
 // the entry's `rr.longname`, with a narrower span, and member hover answered `string`.
 Deno.test({ name: "member hover: another module's access at the same position is not this one", ignore }, async () => {
-  const util = "export type P = { ab: i32, s: string }\n\n\nexport function g(p: P): string { p.s }\n";
+  const util = "export type P = { ab: i32, s: string }\n\n\nexport function g(p: P): string { return p.s }\n";
   const col = util.split("\n")[3].indexOf("p.s") + 2;
   const entry = 'import { g } from "./util"\nconst rr = { longname: 5 }\nprint(g({ ab: 1, s: "x" }))\n' +
     `const zz${" ".repeat(col - 15)} = rr.longname\nprint(zz)\n`;

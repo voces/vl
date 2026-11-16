@@ -83,10 +83,9 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 
 - **Flow-sensitive reads of a `let`** (owner ruling B, 2026-11-02). A read of a `let` takes
   the type of the most recent write in scope, not the join of every write. DECISIONS.md §"A
-  read of a `let` takes its most recent write's type". The `let x = null` and annotated-union
-  faces shipped; left is the function-valued face: a call or delivery through a re-pointed
-  generic `let` re-asks every write and its function set, not the write that reaches it (D15956,
-  D15957).
+  read of a `let` takes its most recent write's type". The `let x = null`, annotated-union and
+  declared-generic faces shipped; left are a binding of lambdas, a member with a concrete
+  parameter, and a read handed to a call, which keep the binding's whole function set.
 - **An inferred result built at its destination** (owner ruling B, 2026-11-02). When one use
   delivers an un-annotated function's result into a wider record (or a list of them), the
   result is built at the destination and the function's other uses read it at that storage.
@@ -103,6 +102,16 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   names itself at a larger argument stay check errors. When this is built, the checker's
   growth test picks those generics out and they compile once with their type parameter boxed, beside
   the monomorphized ones. DECISIONS.md §"Polymorphic recursion is refused for now".
+- **Homebrew formula, once a release process exists** (owner ruling 2026-11-14). The draft
+  `Formula/vl.rb` was deleted; a formula is written against a real tag and its checksums.
+- **L2: exports frozen at the module boundary** (owner ruling 2026-11-15). An export's types and
+  layouts are inferred from its own module alone, and an importer's call is checked against that
+  signature; `vl` may print it, and no annotation is required. This is built with L2's inferred
+  interfaces (engineering-review-2026-11.md §6). DECISIONS.md §"Exports are frozen at the module
+  boundary".
+- **AE-004: an unaliased record field reassigned in place** (2026-11-15, not active work). When
+  nothing else holds `r.f`, the assignment `r.f = { … }` of a fresh record lowers to `struct.set`s
+  on the record already there, not a new allocation.
 
 ## Consumers
 
@@ -131,8 +140,8 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 
 ### Track C — CLI
 
-- **C5, distribution.** `release.yml` and `Formula/vl.rb` are drafts. The publish job, a release tag,
-  the brew tap and the sha256 bump remain, and they wait on the owner.
+- **C5, distribution.** `release.yml` is a draft that builds and checksums each target. The publish
+  job and a release tag remain, and they wait on the owner; the Homebrew formula is backlogged.
 - **C-test-cache.** It is built opt-in. Two things remain:
   - the owner's call on flipping the default once the trial ends (`VL_NO_COMPILE_CACHE`,
     `--no-cache`, `vl cache clean`);
@@ -195,6 +204,14 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 
 - **H3, merge-by-renaming**, is a bridge (native-modules-design.md, "Post-parity revisit"). The
   resolve phase (`identDeclIx`) likely supersedes it.
+- **H-P1, the return-inference pre-pass checks its bodies twice.** `inferReturnsPrePass` quietly
+  checks every un-annotated function on a recursion cycle, then rolls back to the returns, and the
+  real pass checks the same bodies again. On the self-compile that is 7.2% of CPU: 887 cycle
+  members of 5,919 un-annotated functions, 283 quiet roots, each pulling in its callees by demand
+  (lane P, 2026-11-15). A precise mention graph does not shrink the cycles. Keeping the quiet
+  pass's results for the bodies it checked, or making it the real check for cycle members, would
+  help every recursive program. Re-measure after the hybrid-return flag day, since `return`-only
+  block bodies change what inference does.
 - **H-M2, wasm-native distribution.** Retire the Rust host by emitting WASI p1, linear memory and
   GC-string copies, and run under a stock wasmtime. It is secondary to the refactor.
 

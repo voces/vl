@@ -58,8 +58,27 @@ Notes, each of which cost something to learn:
   immediate PARENT frame of every sample whose leaf is a given function, to find whose loop
   it is. `profile-callers.vl -- <profile.json>` charges every helper sample to its first
   non-helper ancestor instead, which is the caller a cut has to change.
+* **`-O` hides the compile from the sampler**: a profiled `-O` build records only the in-guest
+  optimizer's store, so profile a plumb unit without `-O`.
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
+
+## Comparing CPU between two seeds: interleave, and read the ranges
+
+* **Interleave the builds.** A round builds every configuration once (base seed, candidate
+  seed, and any untriggered control), and the rounds repeat; never run all of one seed's builds
+  before the other's. On D16553 a sequential median of 10 read 39.00 s against 38.88 s, and the
+  same comparison interleaved read 35.51 s against 31.72 s: the box's load drifted between the
+  two blocks and hid a 3.8 s win.
+* **Report user plus sys, the median, and the min and max.** A win is outside noise when the
+  candidate's max is under the base's min, or the medians differ by several times the spread.
+* **Name the heap.** The self-compile runs at `VL_COMPILE_GC_HEAP=2G`, a user build at the
+  default first heap, and the two can disagree: D16553 measured both.
+* **Fuel is not CPU.** Guest fuel counts instructions and leaves out collection, so a change
+  that adds a copying collection or grows the live set costs more CPU than its fuel says, and a
+  cut of cheap loops saves less. `VL_GC_STATS=1` prints the collection count and peak live set.
+* **A guest profile is not a timer at this size.** Two profiles of the same L2 build differed
+  by about 6% in sample count; use it to say where time goes, not how much a change saved.
 
 ## The instruments under `scripts/perf/`
 
@@ -667,7 +686,11 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   regression is caught by.
 * **`scripts/self-compile-time.sh`** — the candidate compiling the compiler, in guest FUEL
   against `scripts/self-compile-baseline.json`, tripping past 1.5×. Fires when the other two
-  missed it. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
+  missed it. Since 2026-11-15 it also reds on a rise past the baseline's per-PR **tier** (+1%).
+  A PR accepts such a rise by rewriting the baseline from a fixpoint seed and adding one line to
+  `scripts/self-compile-ledger.txt` (fuel, commit, PR, mechanism). A baseline that the ledger's
+  last line does not name also reds. The 1.5× line let +3.4% through in one afternoon (#8072,
+  #8080), and a 1% tier would have stopped it at the first of those PRs. It was CPU seconds against a 6.3 s idle baseline at 4×, half of the factor paying
   for contention, and it still flaked: docs-only PRs whose seed WAS master's fixpoint read
   26.8 s and 27.6 s at load 40–50 against a 25.2 s line. Fuel is identical run to run, so the
   factor now pays only for the compiler growing between re-baselines. The line is coarse: one

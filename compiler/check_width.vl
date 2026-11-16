@@ -3,7 +3,6 @@
 // declines them, restoring a parameter an instance refused. The checker decides candidates and
 // writes the per-pass rows; `check_pins.vl`'s width phase drives `wsStep`. Every answer is a
 // rewrite of the node arena or a read of the scope chain; nothing here reports a diagnostic.
-import { declTyOf } from "./check_nar_store"
 import {
   Call,
   FuncDecl,
@@ -11,10 +10,12 @@ import {
   Node,
   Param,
   TS_NAME,
+  TS_NULL,
+  TS_OBJ,
+  TS_UNION,
   TypeRef,
   annTsOf,
   arenaSetNode,
-  i32ToStr,
   mkTypeRef,
   nodeAt,
   setAnnTs,
@@ -23,28 +24,57 @@ import {
   tsKids,
   tsKind,
   tsLeaf,
+  tsListOf,
   tsMkKids,
   tsText,
   tsToName,
 } from "./ast"
 import { identDepthOf } from "./check_scopes"
-import { T, TyFunc, tyAt, tyIsPrimIx } from "./check_types"
-import { fnDeclIx } from "./check_write_scan"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+} from "./check_types"
+import {
+  cwBindingOf,
+  cwFramedNode,
+  cwKeyOfRoot,
+  cwLambdaDeclOf,
+  fnDeclIx,
+} from "./check_write_scan"
 import { i32ListHas } from "./listutil"
+import { rowParamName } from "./check_row_param"
 
-// D3992 — a record of a wider shape passed to a function's parameter of a declared record type
-// is legal (no field changes type, so the shared value keeps every invariant), and is lowered by
-// making that parameter generic: the function is re-checked as `f<__W0>(p: __W0)` and each
-// instance takes its argument's own layout. Every call is still held to the declared type.
+// D3992 — a wider record to a declared record parameter is legal (no field changes type) and is
+// lowered by re-checking the function with the parameter at its row slot (`check_row_param.vl`):
+// each instance takes its argument's layout, and every call, a receiver included, is still held
+// to the declared type.
 export let wsDecl: i32[] = []
 let wsParam: i32[] = []
 export let wsOrigAnn: i32[] = []
+// The type parameter each rewrite row added, the row slot `rowParamName` spells.
+let wsTpName: string[] = []
+// Beside `wsTpName`: the inline record each row's slot is bound by, as spelled, or "" for a
+// declared record, which the slot name carries itself.
+let wsTpSpell: string[] = []
 // Declarations declined a rewrite, whose calls keep the width refusal.
 export let wsNoDecl: i32[] = []
 export let wsPendDecl: i32[] = []
 export let wsPendParam: i32[] = []
 // The declared record name each pending parameter's annotation is rewritten at.
 export let wsPendName: string[] = []
+// The parameter type each pending row is noted at, which spells a hole parameter's annotation.
+let wsPendTy: i32[] = []
 // Per pass: declarations whose body refused something, and top-level functions read as values,
 // neither of which is rewritten.
 export let wsBodyErr: {[i32]: boolean} = Map()
@@ -73,8 +103,10 @@ export function wsReset() {
   wsDecl = []
   wsParam = []
   wsOrigAnn = []
+  wsTpName = []
+  wsTpSpell = []
   wsNoDecl = []
-  wsPassReset()
+  return wsPassReset()
 }
 
 export function wsPassReset() {
@@ -82,6 +114,7 @@ export function wsPassReset() {
   wsPendDecl = []
   wsPendParam = []
   wsPendName = []
+  wsPendTy = []
   wsBodyErr = Map()
   wsValueRead = Map()
   wsSuppress = false
@@ -89,7 +122,7 @@ export function wsPassReset() {
   wsSlotAt = []
   wsSlotSrc = []
   wsSlotDst = []
-  0
+  return 0
 }
 
 // Note the existing record at `at`, of type `src`, refused by the declared record `dst` for its
@@ -100,7 +133,7 @@ export function wsNoteSlotAt(at: i32, src: i32, dst: i32) {
     wsSlotSrc.push(src)
     wsSlotDst.push(dst)
   }
-  0
+  return 0
 }
 
 // Note an instance refusal at a call of declaration `d`, when a rewrite made it generic.
@@ -114,7 +147,7 @@ export function wsNoteInstErr(d: i32) {
     }
     k = k + 1
   }
-  0
+  return 0
 }
 
 // Declines every rewrite still pending, whose refusal nothing will now lift, and restores the
@@ -126,7 +159,7 @@ export function wsDecline(): boolean {
     if !i32ListHas(wsNoDecl, d) { wsNoDecl.push(d) }
   }
   wsUndoInstErr()
-  true
+  return true
 }
 
 // Restore the declared parameters of every declaration noted in `wsInstErr` and decline it.
@@ -152,7 +185,7 @@ function wsUndoInstErr(): i32 {
           }
           arenaSetNode(pi, nn)
         }
-        const nm = "__W" + i32ToStr(wsParam[k])
+        const nm = wsTpName[k]
         const tps: string[] = []
         const cur = nodeAt(d)
         if cur is FuncDecl {
@@ -181,20 +214,26 @@ function wsUndoInstErr(): i32 {
     const kd: i32[] = []
     const kp: i32[] = []
     const ka: i32[] = []
+    const kn: string[] = []
+    const ksp: string[] = []
     let r = 0
     while r < wsDecl.length {
       if wsDecl[r] >= 0 {
         kd.push(wsDecl[r])
         kp.push(wsParam[r])
         ka.push(wsOrigAnn[r])
+        kn.push(wsTpName[r])
+        ksp.push(wsTpSpell[r])
       }
       r = r + 1
     }
     wsDecl = kd
     wsParam = kp
     wsOrigAnn = ka
+    wsTpName = kn
+    wsTpSpell = ksp
   }
-  done
+  return done
 }
 
 // One rewrite step: apply the pending rewrites, or, when there are none, undo the ones an
@@ -205,7 +244,7 @@ export function wsStep(): i32 {
     wsInstErr = []
     return applied
   }
-  wsUndoInstErr()
+  return wsUndoInstErr()
 }
 
 // The rewrite row of parameter `i` of declaration `d`, or -1.
@@ -215,7 +254,7 @@ export function wsRowOf(d: i32, i: i32): i32 {
     if wsDecl[k] == d && wsParam[k] == i { return k }
     k = k + 1
   }
-  -1
+  return -1
 }
 
 // Whether `s` is a bare identifier, the spelling of a declared type's name.
@@ -228,7 +267,7 @@ export function wsIsIdent(s: string): boolean {
       || c == '_'
     if !ok { return false }
   }
-  true
+  return true
 }
 
 // Whether the annotation node `ix` spells the type name `nm`, or has no spelling to read.
@@ -247,7 +286,7 @@ export function wsAnnMentions(ix: i32, nm: string): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Make each pending parameter generic, unless its function's body refused something or it is read
@@ -269,16 +308,23 @@ function wsApplyPending(): i32 {
         const pi = fd.fnParams[i]
         const pn = nodeAt(pi)
         if pn is Param {
-          const nm = "__W" + i32ToStr(i)
           const tps: string[] = []
           for t in fd.fnTyParams { tps.push(t) }
+          const inline = wsPendName[k].length > 0 && wsPendName[k][0] == '{'
+          const nm = rowParamName(
+            d,
+            tps.length,
+            if inline { "" } else { wsPendName[k] },
+          )
           tps.push(nm)
+          wsTpName.push(nm)
+          wsTpSpell.push(if inline { wsPendName[k] } else { "" })
           wsDecl.push(d)
           wsParam.push(i)
           wsOrigAnn.push(pn.parType)
           // The declared record is replaced where it is written, inside `| null` or `[]` too.
           const root = annTsOf(pn.parType)
-          const nr = if root >= 0 { wsTsRename(root, wsPendName[k], nm) } else { tsLeaf(TS_NAME, nm) }
+          const nr = if root >= 0 { wsTsRename(root, wsPendName[k], nm) } else { wsHoleTs(wsPendTy[k], nm) }
           const wt = mkTypeRef(tsToName(nr), pn.pos)
           setAnnTs(wt, nr)
           const np: Node = {
@@ -312,21 +358,54 @@ function wsApplyPending(): i32 {
   wsPendDecl = []
   wsPendParam = []
   wsPendName = []
-  done
+  wsPendTy = []
+  return done
 }
 
-// A copy of spelling tree `ix` with each bare name `from` written `to`.
+// The spelling a hole parameter inferred at `pty` takes with its record written `nm`: the bare
+// slot, or the slot inside the `| null` or `[]` the inferred type holds it in.
+function wsHoleTs(pty: i32, nm: string) {
+  const leaf = tsLeaf(TS_NAME, nm)
+  if pty < 0 || pty >= T.tys.length { return leaf }
+  const t = tyAt(pty)
+  match t {
+    TyNullable => {
+      return tsMkKids(TS_UNION, "", [leaf, tsLeaf(TS_NULL, "null")])
+    }
+    TyArray => {
+      return tsListOf(leaf)
+    }
+    // `wsInnerRec` holds a record by value only bare, nullable or as a list's element.
+    TyObj | TyVar | TyPrim | TyErr | TyFunc | TyMap | TyLit | TyNeg | TyUnion => {
+      return leaf
+    }
+  }
+}
+
+// A copy of spelling tree `ix` with each record spelled `from`, a bare name or an inline record,
+// written `to`.
 function wsTsRename(ix: i32, from: string, to: string) {
   if tsKind[ix] == TS_NAME {
     return if tsText[ix] == from { tsLeaf(TS_NAME, to) } else { ix }
   }
+  if tsKind[ix] == TS_OBJ && tsToName(ix) == from { return tsLeaf(TS_NAME, to) }
   const kids: i32[] = []
   let j = 0
   while j < tsKidCount[ix] {
     kids.push(wsTsRename(tsKids[tsKidStart[ix] + j], from, to))
     j = j + 1
   }
-  tsMkKids(tsKind[ix], tsText[ix], kids)
+  return tsMkKids(tsKind[ix], tsText[ix], kids)
+}
+
+// The inline record a row slot named `nm` is bound by, as spelled, or "" for any other name.
+export function wsSlotSpelling(nm: string): string {
+  let k = 0
+  while k < wsTpName.length {
+    if wsTpName[k] == nm { return wsTpSpell[k] }
+    k = k + 1
+  }
+  return ""
 }
 
 // The top-level declaration a call's callee names, or -1.
@@ -334,26 +413,26 @@ export function wsCalleeDecl(n: Call): i32 {
   if n.callFn < 0 { return -1 }
   const c = nodeAt(n.callFn)
   if c is Ident {
-    if identDepthOf(n.callFn, c.identName) != 0 { return -1 }
-    return fnDeclIx[c.identName] ?? -1
+    if identDepthOf(n.callFn, c.identName) == 0 {
+      const d = fnDeclIx[c.identName] ?? -1
+      if d >= 0 { return d }
+    }
+    // A binding bound once to a lambda calls that lambda (D16400).
+    if cwFramedNode(n.callFn) && cwKeyOfRoot(n.callFn) >= 0 {
+      return cwLambdaDeclOf(cwBindingOf(n.callFn))
+    }
   }
-  -1
+  return -1
 }
 
-// Whether the un-annotated return of top-level function `name` is inferred as a primitive. Any
-// other return may carry the parameter's record out, which the rewrite would retype.
-export function wsInferredRetPrim(name: string): boolean {
-  if name == "" { return false }
-  const h = declTyOf(fnDeclIx[name] ?? -1)
-  if h < 0 || h >= T.tys.length { return false }
-  const ht = tyAt(h)
-  if ht is TyFunc { return tyIsPrimIx(ht.fnRet) }
-  false
+// Record parameter `i` of the declaration call `n` names, written `name` and typed `pty`, for a
+// rewrite.
+export function wsNotePending(n: Call, i: i32, name: string, pty: i32) {
+  return wsNotePendingAt(wsCalleeDecl(n), i, name, pty)
 }
 
-// Record parameter `i` of the declaration call `n` names, written `name`, for a rewrite.
-export function wsNotePending(n: Call, i: i32, name: string) {
-  const d = wsCalleeDecl(n)
+// `wsNotePending` for parameter `i` of the declaration `d`.
+export function wsNotePendingAt(d: i32, i: i32, name: string, pty: i32) {
   let k = 0
   while k < wsPendDecl.length {
     if wsPendDecl[k] == d && wsPendParam[k] == i { return 0 }
@@ -362,5 +441,6 @@ export function wsNotePending(n: Call, i: i32, name: string) {
   wsPendDecl.push(d)
   wsPendParam.push(i)
   wsPendName.push(name)
-  0
+  wsPendTy.push(pty)
+  return 0
 }

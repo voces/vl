@@ -17,7 +17,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, isaEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, seedEnv } from "./support/tree.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -64,7 +64,7 @@ const gen = (ls: Level[]): string => {
     "function f(a: i32): i32 {",
     "  let acc = 0",
     `  ${open.join("")}${inner}${close.reverse().join("")}`,
-    "  acc",
+    "  return acc",
     "}",
     "print(f(1))",
     "print(f(0))",
@@ -96,7 +96,7 @@ const vl = async (args: string[], extra: Record<string, string> = {}) => {
     stdout: "piped",
     stderr: "piped",
     cwd: ROOT,
-    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, PATH: Deno.env.get("PATH") ?? "", ...isaEnv(), ...extra },
+    env: { RUST_BACKTRACE: "0", NO_COLOR: "1", VL_STD: `${ROOT}/std`, PATH: Deno.env.get("PATH") ?? "", ...seedEnv(), ...extra },
     clearEnv: true,
   }).output();
   const dec = new TextDecoder();

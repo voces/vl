@@ -13,9 +13,9 @@
 
 import { isVlCheckoutRoot, lintPathFor, resetVlRootCache, vlRootFor } from "../lsp/src/vlRoot.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
-import { COMPILER, exists } from "./support/tree.ts";
+import { COMPILER, seedPresent } from "./support/tree.ts";
 
-const ENABLED = exists(COMPILER);
+const ENABLED = seedPresent(COMPILER);
 if (!ENABLED) {
   console.warn("[lsp-vl-root] end-to-end test skipped — no build/vl-compiler.wasm.");
 }
@@ -26,7 +26,7 @@ const makeVlCheckout = async (root: string): Promise<void> => {
   await Deno.mkdir(`${root}/compiler`, { recursive: true });
   await Deno.mkdir(`${root}/std`, { recursive: true });
   await Deno.writeTextFile(`${root}/compiler/entry.vl`, "export {}\n");
-  await Deno.writeTextFile(`${root}/std/fmt.vl`, "export function toStr(x: i32): string { \"\" }\n");
+  await Deno.writeTextFile(`${root}/std/fmt.vl`, "export function toStr(x: i32): string { return \"\" }\n");
 };
 
 Deno.test("vlRoot: a real checkout's own file resolves to its own root", async () => {
@@ -141,7 +141,7 @@ Deno.test({
     resetVlRootCache();
     await Deno.mkdir(`${dir}/src/compiler`, { recursive: true });
     const target = `${dir}/src/compiler/x.vl`;
-    const source = 'export function f(x: i32): string {\n  "n=\\{x}"\n}\n\n' +
+    const source = 'export function f(x: i32): string {\n  return "n=\\{x}"\n}\n\n' +
       'const chain = "a" + "b" + "c" + "d"\n';
     await Deno.writeTextFile(target, source);
 

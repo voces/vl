@@ -14,16 +14,10 @@ import {
   buildUnusedExportUseMap,
   unusedExportHints,
 } from "../lsp/src/moduleGraph.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const logs: string[] = [];
 const log = (m: string) => logs.push(m);
@@ -175,7 +169,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const src = "function f(): i32 {\n  1\n}\nprint(f())\n";
+  const src = "function f(): i32 {\n  return 1\n}\nprint(f())\n";
   const key = "/proj/noexport.vl";
   const readNone = (k: string): string | undefined => k === key ? src : undefined;
   const useMap = await buildUnusedExportUseMap([key], readNone, checker);

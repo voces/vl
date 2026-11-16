@@ -16,9 +16,13 @@ import {
   TyVar,
   nomNameOfTy,
   tyAt,
+  tyElemOf,
+  tyElemOpen,
+  tyKeyOf,
   tySame,
   tyToStr,
   tyToStructStr,
+  tyValOf,
 } from "./check_types"
 import { i32ListHas } from "./listutil"
 
@@ -32,17 +36,17 @@ function jsonArmElemOf(ix: i32, want: i32): i32 {
   while i < ms.length {
     const m = tyAt(ms[i])
     if m is TyArray {
-      if want == 0 { return m.aElem }
+      if want == 0 { return tyElemOf(m) }
     } else if m is TyMap {
       if want == 1 {
         if m.mSet == 0 {
-          if primNameOf(m.mKey) == "string" { return m.mVal }
+          if primNameOf(tyKeyOf(m)) == "string" { return tyValOf(m) }
         }
       }
     }
     i = i + 1
   }
-  -1
+  return -1
 }
 
 // The canonical `Json` a receiver type is a view of, or -1 when it is not a JSON tree at all.
@@ -61,7 +65,7 @@ function jsonUnionRootOf(ix: i32): i32 {
   const e2 = jsonArmElemOf(e, 0)
   if e2 < 0 { return -1 }
   if jsonSelfRef(e2, e) { return e }
-  -1
+  return -1
 }
 
 // `jsonUnionRootOf` with the wider receiver admitted: `Json | JsonError` holds no container
@@ -77,7 +81,7 @@ export function jsonUnionRootIn(ix: i32): i32 {
     if r >= 0 { return r }
     i = i + 1
   }
-  -1
+  return -1
 }
 
 // The member list of a union type, peeling a `TyNullable` wrapper. `type Json = null |
@@ -109,7 +113,7 @@ export function jsonUnionMembers(ix: i32): i32[] {
     }
     g = g + 1
   }
-  none
+  return none
 }
 
 // Does `m` denote the union `ix` itself — the recursion that makes `Json` a tree? The
@@ -136,7 +140,7 @@ export function jsonSelfRef(m: i32, ix: i32): boolean {
     }
     g = g + 1
   }
-  tySame(m, ix)
+  return tySame(m, ix)
 }
 
 // Whether `mt` is one of `ut`'s members by identity. The membership question `is` asks today
@@ -153,7 +157,28 @@ export function jsonExactMemberOf(ut: i32, mt: i32): boolean {
     if tySame(ms[i], mt) { return true }
     i = i + 1
   }
-  false
+  return false
+}
+
+// Whether the types `seen` holds from `ix`'s visit on include a list, a map or a nullable.
+function jsonCycleBounded(ix: i32, seen: i32[]): boolean {
+  let i = seen.length - 1
+  while i >= 0 && seen[i] != ix {
+    const t = tyAt(seen[i])
+    match t {
+      TyArray | TyMap | TyNullable => {
+        return true
+      }
+      // `jsonShapeBad` passes only a `T | null` union on to its members.
+      TyUnion => {
+        if t.uMembers.length == 2 { return true }
+      }
+      // a record carries the cycle on to its fields; no other kind is pushed with a member
+      TyObj | TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
+    }
+    i = i - 1
+  }
+  return false
 }
 
 // The target side. "" when `ix` is a JSON shape the walker can build; otherwise the offending
@@ -169,10 +194,13 @@ export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
   if nw != "" {
     return "`" + nw + "` is a newtype; a JSON shape carries no brand"
   }
+  // A recursive shape is walked by a call per level; a cycle reaching no list, map or `null`
+  // between its visits has no finite value.
   if i32ListHas(seen, ix) {
+    if jsonCycleBounded(ix, seen) { return "" }
     return "`"
       + tyToStr(ix)
-      + "` is recursive; a recursive JSON shape has no walker yet"
+      + "` is recursive with no list, map or `null` on its cycle, so it has no finite value"
   }
   const t = tyAt(ix)
   if t is TyPrim {
@@ -207,11 +235,11 @@ export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
     return r
   }
   if t is TyArray {
-    if t.aElem < 0 {
+    if tyElemOpen(t) {
       seen.pop()
       return "an array whose element type is unknown"
     }
-    const r = jsonShapeBad(t.aElem, recvTy, seen)
+    const r = jsonShapeBad(tyElemOf(t), recvTy, seen)
     seen.pop()
     return r
   }
@@ -220,13 +248,13 @@ export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
       seen.pop()
       return "`" + tyToStr(ix) + "` is a Set; a JSON object is a map"
     }
-    if primNameOf(t.mKey) != "string" {
+    if primNameOf(tyKeyOf(t)) != "string" {
       seen.pop()
       return "`"
         + tyToStr(ix)
         + "` has a non-string map key; a JSON object's keys are strings"
     }
-    const r = jsonShapeBad(t.mVal, recvTy, seen)
+    const r = jsonShapeBad(tyValOf(t), recvTy, seen)
     seen.pop()
     return r
   }
@@ -269,5 +297,5 @@ export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
       + "` is an ambiguous union of shapes; a JSON walker can only tell `T | null` apart"
   }
   seen.pop()
-  "`" + tyToStr(ix) + "` has no JSON shape"
+  return "`" + tyToStr(ix) + "` has no JSON shape"
 }

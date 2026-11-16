@@ -69,8 +69,8 @@
 //     tail-call enable that way, and the flag lists are read OUT OF `main.rs` so the
 //     test cannot drift from what ships.
 //
-// A missing `wasm-opt` stays a SOFT NO-OP for `-O3` exactly as for `-O`, which is
-// its own case below (exit 0, a note on stderr, the unoptimized module on disk).
+// A missing `wasm-opt` FAILS `-O3` exactly as `-O`: exit 1, no module on disk
+// (`selfhost_native_release_test.ts` pins it).
 //
 // GATING: env-gated (`SELFHOST_NATIVE_ALIGN=1`, shared with the alignment suite)
 // AND requires the vl binary + seed wasm + `wasm-opt` + `wasm-dis`; absent any,
@@ -134,8 +134,11 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // ROOT REACHES (DECISIONS.md, "A plain build drops the functions no root reaches"): the
   // two sites each of `__str_concat__` and `__utf8_enc__` are now `unreachable` stubs. Every
   // reached function disassembles identically, and `-O`/`-O3` are unmoved.
-  { fixture: "list-wrapper-literal", none: 2, O: 0, O3: 0 },
-  { fixture: "list-wrapper-call", none: 2, O: 0, O3: 0 },
+  // Unoptimised, a failing list-index guard reads the module's one empty array of the backing's
+  // type, so the two rows that had no empty backing gain its `array.new_fixed` (2 -> 3); `-O`
+  // keeps its own trap, so its counts are unmoved.
+  { fixture: "list-wrapper-literal", none: 3, O: 0, O3: 0 },
+  { fixture: "list-wrapper-call", none: 3, O: 0, O3: 0 },
   // Both union-box producers here are two-armed helpers, and the RETURN SINK gives such a
   // function ONE construction site: every `return` writes the tag/payload pair into two
   // reserved locals and branches to a single exit that performs the only `struct.new`. So
@@ -170,8 +173,11 @@ export const MELT_TABLE: Array<{ fixture: string; none: number; O: number; O3: n
   // D3623 split this row. Its unconditional pushes are now counted and the list is reserved,
   // which melts it outright (6/0/0, `list-wrapper-push-reserved`); the grown worst case keeps
   // its row, unchanged, by putting the pushes under an `if`.
-  { fixture: "list-wrapper-push", none: 5, O: 3, O3: 2 },
-  { fixture: "list-wrapper-push-reserved", none: 6, O: 0, O3: 0 },
+  // Unoptimised, a push's grow lives in one shared `__grow_<row>__`, so the per-site backing
+  // allocations are one site in the helper (5 -> 3, 6 -> 4). `-O` keeps the grow inline, so the
+  // optimised counts, which are what the melt is about, did not move.
+  { fixture: "list-wrapper-push", none: 3, O: 3, O3: 2 },
+  { fixture: "list-wrapper-push-reserved", none: 4, O: 0, O3: 0 },
   // `union-box-call` with its payload READ instead of discarded. The read still blocks the
   // melt at two sites — that is what `opt-profile-design.md` §3 item 0 measured — but the
   // producer now has one site, and the two survivors at `-O`/`-O3` are the PAYLOAD

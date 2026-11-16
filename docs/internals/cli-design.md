@@ -341,7 +341,8 @@ Fields:
   trailing `emitErr` the emitter's one refusal, with the module phase's findings a
   prefix of `P.diags`); the other four are `compiler/cli.vl`'s report. The
   checker's advisory streams — `redundant-type`, `dead-coalesce-default`,
-  `dead-null-test`, `deep-record-compare`, `collapsed-arm-value-test` — are `type`, since the phase is what `stage` names
+  `dead-null-test`, `deep-record-compare`, `collapsed-arm-value-test`, `same-type-members`,
+  `test-cannot-tell` — are `type`, since the phase is what `stage` names
   and `severity` is what says whether it refused.
 - `code` — the stable machine id: the lint rule id (`prefer-const`,
   `unused-variable`, …) or `redundant-type` for the annotation hint. **Omitted**
@@ -727,6 +728,17 @@ artifact, its length, the artifact — and every field is checked before
 temp-file + rename. `tests/vl_module_cache_test.ts` pins hit, each rejection, opt-out,
 pruning order and throttle; the safety argument is DECISIONS.md §"A user module's
 Cranelift compile is cached".
+
+### The seed cache (host)
+
+An on-disk seed (`build/vl-compiler.wasm`, `--compiler`, `$VL_COMPILER_WASM`) is Cranelift-compiled
+once per engine configuration and kept as `<seed cache>/seed-<content key>-<engine tag>.cwasm`,
+never beside the seed. The seed cache is `$VL_SEED_CACHE_DIR`, else `seed/` under the cache dir
+above; it is separate so a run that isolates `$VL_CACHE_DIR` does not recompile the seed. It passes
+the same `private_cache_dir` check or the seed runs uncached with a stderr note, and keeps the
+eight most recently used seeds. `vl seed --cache-dir` prints the directory and `vl seed
+--cache-files` this seed's entries. DECISIONS.md §"The seed sidecar lives only in the user's
+private cache"; `tests/vl_seed_sidecar_dir_test.ts`.
 
 ### The compile cache (host, opt-in)
 

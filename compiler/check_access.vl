@@ -1,7 +1,7 @@
 // The type of reading a member, an optional member or an element, including a literal
 // union's `length` and index.
 
-import { inDeadArm, openKeyReadNote, openReadNote } from "./check_side_rows"
+import { openKeyReadNote, openReadNote } from "./check_side_rows"
 import { fnDeclIx } from "./check_write_scan"
 import { callBindNote } from "./check_bind_rows"
 import { elabCallDeclNote, elabCapLive } from "./check_elab_cap"
@@ -17,6 +17,7 @@ import {
   mkMember,
   mkNull,
   nodeAt,
+  omDotStr,
   opDeclLabel,
 } from "./ast"
 import {
@@ -81,7 +82,6 @@ import { lbiNoteIndex } from "./check_lbi_notes"
 import {
   ACF_INDEX,
   BOUND_UNRESOLVED,
-  omDotStr,
   omGuardSet,
   omRecvTy,
 } from "./check_leaf_steps"
@@ -107,6 +107,7 @@ import {
 import {
   MC_NULL_READ_MARK,
   MC_OPT_READ_MARK,
+  crIsTestedPlace,
   crNoteLoopRead,
   holeRemainderEndedSure,
   narrowingEndedAt,
@@ -146,11 +147,17 @@ import {
   objFieldType,
   tyAt,
   tyBuiltinIndexable,
+  tyElemOf,
+  tyElemOpen,
   tyIsDeclaredParam,
   tyIsHole,
   tyIsLitUnion,
-  tyMutEpoch,
+  tyKeyOf,
+  tyKeyOpen,
+  tyPinKey,
   tyToStr,
+  tyValOf,
+  tyValOpen,
 } from "./check_types"
 import { IDENT_BUILTIN, identSet } from "./symbols"
 import { arrElemValueTy, nonNullTy, tyHasTyVar } from "./tyquery"
@@ -169,7 +176,7 @@ function luLengthAt(n: Member, ix: i32, objTy: i32): i32 {
   stmts.push(recv)
   stmts.push(luChain(ms, 0, recv, -1, -1, ix, n.pos))
   luValueAt(ix, stmts, n.pos)
-  checkNodeHook(ix)
+  return checkNodeHook(ix)
 }
 
 // `recv[i]` read over a union of lists: the element union, or -1 as `luLengthAt`. A write
@@ -190,7 +197,7 @@ function luIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
   stmts.push(idx)
   stmts.push(luChain(ms, 0, recv, idx, elem, ix, n.pos))
   luValueAt(ix, stmts, n.pos)
-  checkNodeHook(ix)
+  return checkNodeHook(ix)
 }
 
 // A read at `site` over a union of maps `recvTy` with members `ms`, rewritten in place to an
@@ -231,7 +238,7 @@ export function lmReadAt(
   }
   stmts.push(lmChain(ms, 0, recv, kind, prop, args, res, site, pos))
   luValueAt(site, stmts, pos)
-  checkNodeHook(site)
+  return checkNodeHook(site)
 }
 
 // `recv[k]` read over a union of maps whose keys agree: the values' union or null, or -1 when
@@ -259,7 +266,7 @@ function lmIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
       n.pos,
     )
   }
-  -1
+  return -1
 }
 
 // Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
@@ -286,7 +293,8 @@ export function checkMemberNode(n: Member, ix: i32) {
   // An instance that binds a type parameter to `never` reads no value through it: the read is
   // unreachable there, and so is its type (D3178).
   // So does a dead arm's operand, which reads as `never` (D16006).
-  if objTy0 == TY_NEVER && (elabCapLive() || inDeadArm(ix)) { return TY_NEVER }
+  // A `never` receiver, read only where no value reaches, has every member at `never`.
+  if objTy0 == TY_NEVER { return TY_NEVER }
   let objTy = objTy0
   if tyAt(objTy0) is TyUnion {
     const gObj = tpGradualRecv(objTy0, n.memProp, ix)
@@ -334,7 +342,8 @@ function checkMemberPathTy(n: Member, ix: i32, mKey: string): i32 {
   if mOv >= 0 {
     identNotePlace(n.memObj)
     crNoteLoopRead(mp, ix)
-    crNoteCaptureRead(mp)
+    // A re-test is not a narrowed read: it tests the storage (D2464).
+    if !crIsTestedPlace(ix) { crNoteCaptureRead(mp) }
     return symMem(ix, mOv)
   }
   crNoteLostRead(mp, ix)
@@ -347,7 +356,7 @@ function checkMemberPathTy(n: Member, ix: i32, mKey: string): i32 {
     return pathInvalidatedErr(mp, mInv, ix)
   }
   if mInv < 0 { crPathDropRead(mKey, ix) }
-  -1
+  return -1
 }
 
 // Shared-field access over a struct union — a field every member carries at the same type;
@@ -389,7 +398,7 @@ function checkMemberUnionTy(n: Member, ix: i32, ot: TyUnion, objTy: i32): i32 {
   // The field is on some but not all members — unsafe until narrowed to a member that
   // has it. Names the offending member so a reader need not diff a four-arm union by hand.
   memberFloorErr(objTy, n.memProp, ix)
-  TY_ERR
+  return TY_ERR
 }
 
 // A member of a list (`lenKind` 0), map (1) or string (2): `.length` is an i32, a write to it
@@ -407,7 +416,7 @@ function checkMemberLengthOnly(
     return symMem(ix, TY_I32)
   }
   memberFloorErr(objTy, n.memProp, ix)
-  TY_ERR
+  return TY_ERR
 }
 
 // Member access on an inference hole records the demanded field and yields its derived
@@ -481,7 +490,7 @@ function checkMemberHoleTy(n: Member, ix: i32, ot0: TyVar, objTy0: i32): i32 {
     const tpFld = mkDerivedHole(HD_FLD, n.memProp, -1, -1, objTy)
     if tpFld >= 0 { return symMem(ix, tpFld) }
   }
-  -1
+  return -1
 }
 // `?.prop` off an inference hole or an unbounded type parameter `baseTy`: the read is re-asked
 // at each pin (`HD_OFLD`), and the chain's guard is the field of the hole's non-null face, so a
@@ -506,7 +515,7 @@ function optMemberHoleTy(
   const g = mkDerivedHole(HD_FLD, n.omProp, -1, -1, nonNullNarrowTy(baseTy))
   omGuardSet(ix, g)
   if wasNullable && base == baseTy { return symMem(ix, mkNullableTy(h)) }
-  symMem(ix, h)
+  return symMem(ix, h)
 }
 
 // ── index `a[i]` ────────────────────────────────────────────────────────────
@@ -532,7 +541,7 @@ export function checkIndexNode(n: Index, ix: i32) {
     const xOv = narrowedPathTy(xp)
     if xOv >= 0 {
       crNoteLoopRead(xp, ix)
-      crNoteCaptureRead(xp)
+      if !crIsTestedPlace(ix) { crNoteCaptureRead(xp) }
       return xOv
     }
     crNoteLostRead(xp, ix)
@@ -549,10 +558,10 @@ export function checkIndexNode(n: Index, ix: i32) {
   const at = tyAt(arrTy)
   // A map index: the key must match the map's key type; a read yields the nullable value
   // (`V | null`), and an assignment target accepts a plain `V`.
-  if at is TyArray && at.aElem < 0 { openReadNote(arrTy) }
+  if at is TyArray && tyElemOpen(at) { openReadNote(arrTy) }
   if at is TyMap {
-    if at.mVal < 0 { openReadNote(arrTy) }
-    if at.mKey < 0 {
+    if tyValOpen(at) { openReadNote(arrTy) }
+    if tyKeyOpen(at) {
       openKeyReadNote(arrTy, widenLitTy(idxTy))
       pinReadKey(arrTy, widenLitTy(idxTy))
       checkInferredMapKey(widenLitTy(idxTy), at.mSet, n.idxIndex)
@@ -627,14 +636,16 @@ export function checkIndexNode(n: Index, ix: i32) {
     const ev = elemEveryReadTy(ix)
     if ev >= 0 { return ev }
     // A read of an open element answers -1 now and its pinned type after the last pin.
-    if at.aElem < 0 && !(luWriteTgt[ix] ?? false) {
+    if tyElemOpen(at) && !(luWriteTgt[ix] ?? false) {
       oerBank(ix, false, inferQuiet)
     }
     // The element's value type — a `u8[]` read is an `i32`, never a `u8`. Same shape as the
     // string arm below: `string` is `(array i32)` with no `char` type above it (DECISIONS A7).
-    return arrElemValueTy(at.aElem)
+    return arrElemValueTy(tyElemOf(at))
   }
   if at is TyErr { return TY_ERR }
+  // A `never` receiver, read only where no value reaches, reads no element.
+  if arrTy == TY_NEVER { return TY_NEVER }
   // Indexing a string yields the UTF-8 byte at that position, as an `i32`.
   if at is TyPrim {
     if at.primName == "string" { return TY_I32 }
@@ -657,13 +668,13 @@ function checkIndexMap(n: Index, at: TyMap, idxTy: i32, ix: i32) {
   // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
   // literal-union-keyed map is a member of that union, and `checkNode` types a string
   // literal as the widened `string` with no destination to narrow it against (D1748).
-  if !assignableExpr(n.idxIndex, idxTy, at.mKey) {
+  if !assignableExpr(n.idxIndex, idxTy, tyKeyOf(at)) {
     tErr(
-      "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
+      "map key must be " + tyToStr(tyKeyOf(at)) + ", got " + tyToStr(idxTy),
       n.idxIndex,
     )
   }
-  mkNullableTy(at.mVal)
+  return mkNullableTy(tyValOf(at))
 }
 
 // `checkIndexNode`'s hole receiver `at` (arena type `arrTy`): indexing constrains it to an
@@ -681,13 +692,12 @@ function checkIndexHole(n: Index, at: TyVar, arrTy: i32, idxTy: i32, ix: i32) {
       if hmi >= 0 && hmi < T.tys.length {
         const hmt = tyAt(hmi)
         if hmt is TyMap {
-          if hmt.mKey < 0 {
-            hmt.mKey = idxTy
-            tyMutEpoch = tyMutEpoch + 1 // hole index-read pinned the demanded key in place
-          }
+          if tyKeyOpen(hmt) { tyPinKey(hmt, idxTy) }
           // A value no write has typed yet is the pin's read, open until the call substitutes it.
-          if hmt.mVal < 0 { return mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy) }
-          return mkNullableTy(hmt.mVal)
+          if tyValOpen(hmt) {
+            return mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
+          }
+          return mkNullableTy(tyValOf(hmt))
         }
       }
     }
@@ -697,7 +707,7 @@ function checkIndexHole(n: Index, at: TyVar, arrTy: i32, idxTy: i32, ix: i32) {
   // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
   // receiver and refuses scalars/maps — a record/nullable/function/union pinned reaches the emitter unruled.
   noteMemCstr(arrTy, OP_INDEX_GET, ix, false)
-  mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
+  return mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
 }
 
 // `checkIndexNode`'s free index operator `rfn` (B14) over receiver `arrTy`: the index checks
@@ -727,7 +737,7 @@ function checkIndexOperator(
   noteCallInvalidations(ix)
   const rty = opIdxRetTy(rfn)
   if bNames.length > 0 { return substTyDeep(rty, bNames, bTys) }
-  rty
+  return rty
 }
 
 // `checkIndexNode`'s index trap (B13) on user object `at`: a `"[]"` method of one parameter
@@ -752,7 +762,7 @@ function checkIndexTrap(n: Index, at: TyObj, arrTy: i32, idxTy: i32, ix: i32) {
     }
   }
   tErr(indexFloorMsg(arrTy), ix)
-  TY_ERR
+  return TY_ERR
 }
 
 // Extracted from `checkNodeReal`'s `OptMember` arm (C3: thin the dispatcher). The nodes its
@@ -776,7 +786,7 @@ export function checkOptMemberNode(n: OptMember, ix: i32) {
     atomSrcStampAs(parts[1], nonNullTy(t))
     numBoxedStamp(parts[1], nonNullTy(t), t)
   }
-  t
+  return t
 }
 
 // `checkOptMemberNode`'s read: the type of `n` at `ix`.
@@ -790,7 +800,7 @@ function checkOptMemberRead(n: OptMember, ix: i32) {
       identNotePlace(n.omObj)
       omGuardSet(ix, nonNullTy(omOv))
       crNoteLoopRead(omp, ix)
-      crNoteCaptureRead(omp)
+      if !crIsTestedPlace(ix) { crNoteCaptureRead(omp) }
       return symMem(ix, omOv)
     }
     crNoteLostRead(omp, ix)

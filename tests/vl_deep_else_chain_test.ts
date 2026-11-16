@@ -20,7 +20,7 @@
 //
 // @test-timing native
 
-import { COMPILER, ROOT, VL, exists, binaryen, hostWasmDis, isaEnv } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, binaryen, hostWasmDis, seedEnv } from "./support/tree.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
 import { runProgram } from "../playground/src/playground.ts";
 
@@ -67,7 +67,7 @@ const PROGRAMS: [string, (n: number) => string, number, number][] = [
 
 // The same `if` nested rather than chained: the compiler recurses once per level.
 const genNest = (n: number): string =>
-  `function f(a: i32): i32 {\n  let acc = 0\n  ${"if a > 0 { acc = acc + 1; ".repeat(n)}${"} ".repeat(n)}\n  acc\n}\nprint(f(1))\n`;
+  `function f(a: i32): i32 {\n  let acc = 0\n  ${"if a > 0 { acc = acc + 1; ".repeat(n)}${"} ".repeat(n)}\n  return acc\n}\nprint(f(1))\n`;
 
 const SMALL_STACK = { VL_SEED_STACK: "default" };
 
@@ -84,7 +84,7 @@ const vl = async (args: string[], extra: Record<string, string> = {}) => {
       // binaryen's `wasm-dis` for `--wat`, which is a node script, hence PATH.
       VL_WASM_DIS: hostWasmDis(),
       PATH: Deno.env.get("PATH") ?? "",
-      ...isaEnv(),
+      ...seedEnv(),
       ...extra,
       // node cannot start on Windows without it.
       ...(Deno.build.os === "windows" ? { SYSTEMROOT: Deno.env.get("SYSTEMROOT") ?? "" } : {}),

@@ -19,16 +19,10 @@ import {
 } from "../lsp/src/typeFeatures.ts";
 import type { WasmExtent } from "../lsp/src/wasmChecker.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const log = (_m: string) => {};
 
@@ -322,7 +316,7 @@ Deno.test({
   // `undefinedFn` resolves to nothing: a `vl check` error, not a parse one. The
   // walk runs before the checker, so it answers anyway.
   const rows = checker.declExtentsAt(
-    'function broken(): i32 {\n  undefinedFn("s")\n}\n',
+    'function broken(): i32 {\n  return undefinedFn("s")\n}\n',
   );
   eq(rows.map((r) => `${r.kind}:${r.name}`), ["function:broken"], "one row");
 });

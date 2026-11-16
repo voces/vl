@@ -62,7 +62,7 @@ const errorBlock = (out: string): string => {
 // A BODY-phase refusal: a literal binding delivered to a record whose nested record drops a field,
 // then that field read (D3431), anchored at the read on line 7.
 const BODY_WITNESS = `function twice(n: i32) {
-  n * 2
+  return n * 2
 }
 function main() {
   const sv = { pet: { legs: 4, purr: true } }
@@ -119,7 +119,7 @@ Deno.test({
       // reporter bisected the wrong file for.
       await Deno.writeTextFile(
         `${dir}/lib.vl`,
-        BODY_WITNESS + "export function one(): i32 { 1 }\n",
+        BODY_WITNESS + "export function one(): i32 { return 1 }\n",
       );
       await Deno.writeTextFile(
         `${dir}/main.vl`,
@@ -178,7 +178,7 @@ Deno.test({
       {
         name: "a function after it",
         lib: INSTANCE_WITNESS +
-          "take(u)\nexport function one(): i32 { 1 }\n",
+          "take(u)\nexport function one(): i32 { return 1 }\n",
         main: null,
       },
       {
@@ -189,13 +189,13 @@ Deno.test({
       {
         name: "imported, at the module's top level",
         lib: INSTANCE_WITNESS +
-          "take(u)\nexport function one(): i32 { 1 }\n",
+          "take(u)\nexport function one(): i32 { return 1 }\n",
         main: 'import { one } from "./lib"\nprint(one())\n',
       },
       {
         name: "imported, a generic instance",
         lib: INSTANCE_WITNESS +
-          "function pass<T>(x: T): T { x }\nexport function run() { take(pass(u)) }\n",
+          "function pass<T>(x: T): T { return x }\nexport function run() { take(pass(u)) }\n",
         main: 'import { run } from "./lib"\nrun()\n',
       },
     ];
@@ -234,7 +234,7 @@ Deno.test({
 // refusal left (D15150, the last, now runs); add the next one found here, anchored at its
 // declaration. The instance case above is the restore's control: `take(u)` is instantiated before
 // `take`'s body refuses, and a cursor left armed would name the call instead of `take`.
-const MONO_WITNESS = `function same<T>(k: T): T { k }
+const MONO_WITNESS = `function same<T>(k: T): T { return k }
 function mid<F>(a: F, b: F, n: i32) {
   print(a("x"))
   print(b(n))
@@ -245,13 +245,25 @@ function mid<F>(a: F, b: F, n: i32) {
 mid(same, same, 1)
 `;
 
+// A refusal raised while the global section writes a cell (D15158): no body is lowered there, so
+// the anchor is the cell's declaration, `const p` on line 2 (D14082's witness, `P` reaching the
+// cell with no interned shape).
+const GLOBAL_CELL_WITNESS = `type P = {a: i32}
+const p: P = {a: 1}
+function len<T>(f: () => T | string) {
+  return 7
+}
+print(len(() => p))
+`;
+
 Deno.test({
   name:
-    "vl-emit-diag-position: a refusal raised before any body is lowered names the call",
+    "vl-emit-diag-position: a refusal raised before any body is lowered names its call or declaration",
   ignore: !ENABLED,
   fn: async () => {
     const cases: { name: string; src: string; line: number }[] = [
       { name: "monomorphize", src: MONO_WITNESS, line: 9 },
+      { name: "global cell", src: GLOBAL_CELL_WITNESS, line: 2 },
     ];
     for (const c of cases) {
       const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });

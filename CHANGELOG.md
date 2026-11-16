@@ -9,6 +9,499 @@ see **`DECISIONS.md`**. A PR never edits this file: it adds a `changelog.d/` ent
 
 ## Type system (Track A)
 
+- **D16274 closed:** a closure in a deep `is` arm that writes the tested place runs: the converted copy is read up to the call the checker ends the narrowing at (the writer's own call, an alias's, or a call handed the writer), and the writer's body reads the place itself. An assignment nested in an expression still refuses (D16474).
+- **D16474 closed:** an assignment to the tested place nested in an expression of a deep `is` arm runs (`print(id(r = null) == null)`, an operand, a `const` initializer, an `if` test): the reads evaluated before the write and its right-hand side read the converted copy, its target and the reads after read the place. A binding of the place's name in a nested block still refuses (D16475).
+- **D16475 closed:** a binding of the tested place's name in a block nested in a deep `is` arm (an expression's block, an `if` or `else` arm, a bare block, a `for r in …` loop) hides the place to the end of that block only, and the reads around it keep the converted copy. They were refused, by the deep-`is` rule or at the re-check. The arm substitution has no user-facing refusal left; a read in the right operand of the test's `&&` is filed as D16476.
+- **D16476 closed:** a read of a deep `is` receiver in the right operand of the test's `&&`, or of an `||` after its negation, runs (`g is string[] && g.length > 0` over a `Json`); it was refused at the re-check. A read after a guard that leaves when the test fails is filed as D16477.
+- **D16477 closed:** the statements after a guard whose failing arm exits (`if !(g is T) { return }`, `continue`, `break`, `|| …`, an `else` that returns, an `else if` link) read a deep `is` receiver narrowed, as they read a shallow one; they were refused at the re-check. Every narrowing form now agrees deep and shallow, and check-within's `(deep is)` guard, which no program can trip, is deleted.
+- **D16600 closed:** a narrowing cast over a value join whose every tail its domain holds, such as `(if c { 1 } else { 0xFF }) as u8` or a `k & 0xFF` tail, now cannot fail. It runs at module scope and in a function that returns no `null`, as a bounded bare operand does. Before, it was refused as propagating `null`.
+- **A narrowing cast over a join with a wide radix tail runs again:** `(if c { 0 } else { 0x1FFFFFFFF }) as? u8` (or `as i32`, `as! u8`) widens the join to `i64` and misses, as ruling 4.3 says, instead of refusing "does not fit a 32-bit destination". #8363 had given narrowing targets the destination's adoption step; only a widening cast (`i64`, `f32`, `f64`) takes it now.
+- **D16473 closed:** a value join of literals cast to a number (`(if c { 1 } else { 0xFFFFFFFF }) as f64`) now takes the cast's context through the same adoption steps a typed destination uses (ruling 4.3). This covers a radix tree tail (`0xFFFFFFFF << 4`), and `as%` still keeps the 32-bit reading. A radix arm is now the value its digits spell under `as f64`, `as f32` and `as i64`. Before, it was the 32-bit pattern (`-1`), and `… as f64 as! i32` did not trap. A join of literals at a typed destination inside a generic body also builds now; before, it built an invalid module.
+- **D16495 closed:** a radix constant whose 32-bit pattern is negative, cast from `i32` into `u8` (`0xFFFFFFFF as? u8`, `0x80000000 as? u8`, `(-0x1) as? u8`, `as! u8`), is now refused as never fitting, with the decimal spelling's words. The constant is judged as the `i32` it is (D3053). Before, it was accepted and left to the runtime. A float or `i64` target still reads the value the digits spell.
+- **D16604 closed:** an integer constant `??` default that the left side's number type cannot hold now widens the join, as the `if` it spells does (ruling 4.3), whether it is a shift (`n ?? (1 << 40)`, a `const k = 1 << 40` read) or a radix pattern past 32 bits. Before, a folded shift or a wide pattern beside an `i32` operand was refused as overflowing `i32`, while the decimal of the same value already widened.
+- **D16605 closed:** a radix literal that a float does not hold exactly now adopts that float only under `as`, where ruling 4.1 rounds it. As the default of a `??` beside a typed float it keeps its own type and the join widens: `n ?? 0x1000001` prints `16777217`, as the decimal does. As an `f32[]`/`f64[]` element it is refused, as a binding is. Before, both positions silently rounded it.
+- **L2 S0's shadow interfaces:** `$VL_IFACES=1` prints, after a build, run or `check --codegen`,
+  one `[iface]` row per un-annotated top-level function. It gives the function's parameters as
+  named scheme variables, the demand rows it owns, the derived-hole kinds rooted at its
+  parameters, and whether each call's recorded result agrees with its result substituted at the
+  call's bindings. On the population L2 S0 measured, 98.3% of the covered population's calls
+  agree, and every disagreement is function-valued.
+- **L2 S1, callee-first order:** a top-level statement checks every later-declared function it reaches before itself, un-annotated parameters included. The exception is a parameter its calls decide: one used as a map, or one written into a binding. 40 of the 56 `tests/cases` programs whose outcome moved with their declarations moved last no longer move, and none moves to a clause-1 outcome.
+- **D16620 closed:** a tail `if`/`match` whose arm values are pure warns `discarded-tail-value`
+  (its `--fix` writes `return if …`), and a caller using such a function's value is told which
+  function and given the cross-file fix, as a call tail already was.
+- **The hybrid return rule (flag day):** a function's block body returns a value only through
+  `return`; an expression body and an `if`/`match` arm in value position keep their last
+  expression (DECISIONS, "A function's block body returns a value only through `return`" and
+  its 2026-11-15 details). The tree is migrated. A value tail where a value is wanted is the
+  error `missing-return`, a discarded pure tail the warning `discarded-tail-value`, and a value
+  slot refusing a `void` call of a function that discards its last call names that function;
+  `vl check --fix` writes the `return` for all three, which is the migration of a repository
+  outside this one (AE-001).
+- **An else-less `return if` under a return type that admits `null`** is graded arm by arm, so
+  `return if c { "x" }` against `L | null` keeps its literal type (D2041's witness, which the
+  tail spelling ran and the explicit `return` spelling refused).
+- **D16350 closed:** a generic function's returned record literal with an un-annotated function
+  field, instanced at a list or record, now runs. Its anonymous row records the instance's closed
+  field types: `docs/internals/refactor-notes/2026-11-15-rep-adt-d16350.md`.
+- **D16350 filed:** a generic function's returned record literal, holding an un-annotated function
+  field called at two types, is emitted at the template's own row, and a reference-typed instance
+  has no shape for its field (loud emit reject; the scalar spellings run).
+- **D16510 filed:** an empty list handed to an un-annotated callback parameter, called with callbacks
+  of two list element types, builds an invalid module (check-clean, clause 1).
+- **D16511 filed:** the late-demand ratchet does not count an argument-keyed instance that mono
+  demands during emit (an instrument blind spot).
+- **D16446 parked** on Rep ADT stage 4 (rows keyed by `tyRepId`), with its measured mechanism: the binding-row channel exists, but an annotated destination's list type has no collected row.
+- **D16448 closed:** an un-annotated function whose inferred return joins an empty list literal with `null` (`return if c { [] } else { null }`), a list no caller writes, now runs. Before, it built an invalid module. Filed D16447; D16342 waits on a ruling.
+- **D16449 closed:** a spread of a fresh list `const` of nullable records beside a wider record part (`const s = [{ x: 1 }, null]; [...s, { x: 2.5 }]`) now runs. The `const` is built at the wider record, nulls kept, and its own reads (`s[0]`, `s[0] ?? d`) are typed there. The bare-record spelling's `s.pop() ?? { x: 0.0 }`, a check-clean `cast failure` trap before, runs too. A widening push onto `[...s, { x: 2.5 }]`, refused before, runs (D16614, filed and closed here). Filed D16613: the maker-call face `[...mk(), { x: 2.5 }]` stays loud.
+- **D16449 made loud:** a spread of a fresh list `const` of nullable records beside a wider record part (`const s = [{ x: 1 }, null]; [...s, { x: 2.5 }]`) is refused at check with the shared-record contract. Before, it passed the check and built an invalid module at every position of the new `spread-nullable-record-list-wider` grid. Filed D16610: an inline index read beside a wider part is refused at emit. Adds eleven discovery grids; the call-list face (`[...mk(), { x: 2.5 }]`) goes from invalid module to the same refusal.
+- **D16611 closed:** `==` between a union and a value that can both hold a map (`A | i32` against `A` where `A` holds a map field) is refused at check with the map-equality contract, as a bare map compare is. Before, it passed the check and was refused by the emitter. Filed D16612 (a union of two numeric map-list arms fails the type-section count).
+- **D16441, D16442 closed:** a call's fresh record, or a `const` of one, as a part of a list literal beside a part at a wider record (`[a, mk()]`, `const m = mk(); [a, m]`) is copied into that record and runs. Before, the call was refused at emit and the `const` at check, with a message naming one type twice. Filed D16444: a spread of a call's record list still refuses.
+- **D16444 closed:** a spread of a call's fresh record list beside a part at a wider record (`[{ x: 2.5 }, ...mk()]`) is copied element by element into that record and runs, at every position of `spread-literal-call-record-list-wider.matrix.vl`. Before, the check refused it. Filed D16445: a spread of a `const` of such a call still refuses.
+- **D16445 closed:** a spread of a `const` holding a maker's one call of a fresh record list, beside a part at a wider record (`const s = mk(); [{ x: 2.5 }, ...s]`), builds the maker at that record and runs. Before, the check refused it. Filed D16446: a maker called more than once still refuses.
+- **D16443 closed:** a list literal made only of a spread of a fresh list `const`, delivered where a wider record list is declared (`const t: { x: f64 }[] = [...s]`, `f([...s])`), builds the `const` at that record and runs, at every position of `spread-literal-fresh-const-record-list-wider.matrix.vl`. Before, the check refused it.
+- **D16493 closed (now a loud emit reject):** composing a generic with a hole function whose only instance is at another type no longer traps the compiler. `compose(gid, hid)(5)` after `hid("a")` is refused with D16412's sentence, as its neighbouring spellings are. The elaborator's readers no longer ask the write-scan index about a node minted after it was built, and a function argument that binds a type parameter an earlier argument bound to a different closed type refuses; before, that second binding was dropped and the module failed to validate.
+- **D9073 re-graded:** a type parameter only a generic's result names is bound by an annotated
+  destination, by the D16410 ruling. `const ys: string[] = cnst(3)`, `const xs: string[] = mk()`,
+  `const v: string | null = z()` and `const t: IdTable<Tex> = IdTable()` run. A callback face
+  (`[3].map(cnst)`) and a call with no destination stay refused.
+- **D16234, D16236 closed:** a generic body's bound list literal of records holding a generic function is built at each instance's own `T`: pushed, index-written or only read, by index or by a `for` straight over the call, instead of a trap or a missing-signature emit refusal at the second instance.
+- **D16237 closed:** a map walk's value variable (`for k, e in m`) reads the map's value slot, so its call pins a hole function written into a value's field through a narrowed read of the map, by name or as a lambda. Filed D16239: a walk over `.values()` still pins nothing.
+- **Function fields in containers, discovery:** eleven position matrices (`ffc-*`) over maps, lists and records holding function fields (written, read, called, per generic instance): 461 of 508 graded cells run, none silent; 2 trap. Filed: D16234 (a bound list literal of generic-function records, written in a generic body, traps at the second instance), D16235 (its annotated push refused at the first instance's type), D16236 (a `for` over a generic maker's bound list loses the first instance's signature), D16237 (a hole function written into a field through a narrowed map read is not pinned by the map walk's call) and D16238 (a hole lambda pushed onto a hole parameter's list gets no parameter type).
+- **The elaboration's pin notes are a rollback family** (L5 step 3b): `RB_ELAB_PIN` restores the
+  binding register, the hole-pin rows and the last row's appended pins to a `CheckMark`. No site
+  rolls it back yet; it is the mechanism lane relate's P3 needs to delete the two quiet gates.
+  Byte-identical over 20,312 corpus programs and the L2 build; +46 compiler lines.
+- **The pinned mono re-check is a `QuietRun`** (L5 step 3c): `monoRecheckBegin`/`End` open and
+  close it through `quietRunOpen`/`quietRunEnd`/`quietRunDrop`, and `MonoSave` is deleted.
+  Byte-identical over 20,310 corpus programs and the L2 build; net −24 compiler lines.
+- **The resolve-time lowering runs once per program** (medium 6 step 6.1): `intrinsicValuesWrap`,
+  `hoistMatchScrutinees` and `annotateTyArgLambdas` move from each checker walk to `checkProgram`,
+  so a re-walk starts from the lowered tree. Byte-identical over 20,329 corpus programs and the L2
+  build; net −2 compiler lines.
+- **D16562 closed:** a generic function handed to a generic's function-typed parameter that nothing else binds takes the unbound default at the call, in the checker: the call's row records that instance and the elaboration no longer picks its own. Every `i32` use keeps running, `apply(sel(gid), 1.5)` (was invalid wasm) and `d()(4)` now run, and a use at another type is refused at check with a note naming the remedy (`sel<f64>(…)`) instead of trapping. The run face is filed as D16640.
+- **Every quiet level goes through one API** (review medium 3): `quietEnterFlat`/`quietLeaveFlat`
+  carry the pin-note rollback for read-only asks that do not deepen `quietDepth`. The shadow
+  interface printer's quiet read no longer keeps its pin notes. `inferQuiet` hidden scopes go from 5
+  to 2. Byte-identical over 20,453 programs. The substitution design's P4 and P5 are dropped, and the
+  note records why.
+- **L2 S2 group 2 closed** (`refactor-notes/2026-11-15-relate-g2-close.md`): no flow-and-binding
+  judge needs a stored row. Each body part is pure syntax, an existing demand row, or a query that
+  is stable once the body closes (0 of 10,265 repeat asks differ). Docs only.
+- **L2 S2 group 2 measured** (`refactor-notes/2026-11-15-relate-g2-fit-census.md`): 41 of the 48
+  flow-and-binding judges are entered inside fit questions, 7 only at a binding, and none records a
+  product. Their writes are walk modes, scratch counters and one hidden-argument register. Docs only.
+- **holeBind walk owns its state** (`refactor-notes/2026-11-15-relate-g2a-hole-bind-walk.md`): the six
+  module registers of the hole-binding read become one `HoleBindWalk` per read, so a read nested in
+  a call's typing no longer resets an outer read's counts. `holeChoice` needs no row: its arm choice
+  is a pure syntax decode. Output unchanged on 20,478 programs.
+- **D16570 filed:** a generic alias's field annotation node is typed by whichever loud application
+  ran last, and stays untyped where only a quiet one did. Of the corpus programs, 22 end with a
+  different type than a skipped quiet application would write, and 3 never type the node. The
+  write affects no output on 20,415 programs, whether it is always made or never made.
+- **D16570 fixed (stays runs):** a generic alias no longer types its declaration's shared field
+  annotation node per application, so the node no longer depends on which instance ran last or on
+  whether only quiet applications ran. `anyLitUnionUsed` reads an untyped field by its spelling.
+  Byte-identical over 20,427 programs.
+- **The substitution's pin notes no longer depend on quiet mode** (review medium 3, relate P3). A
+  quiet level that turns pin notes from kept to dropped marks and rolls back lane Q's
+  `RB_ELAB_PIN` family. Six quiet brackets now go through `quietEnter`/`quietLeave`, so the
+  `inferQuiet` hidden scopes go from 10 to 4. Byte-identical over 20,434 programs; L2 fuel +0.016%;
+  net +29 compiler lines.
+- **Closure capture and mutation, discovery:** ten position matrices (`cc-*`) over closures capturing and writing a `let`, a list, a record field and a map, written from outside or a nested closure, seeded from a hole parameter, nullable, two closures sharing state, and per-iteration loop capture: 459 of 460 graded cells run, none silent, wrong or trapping. Filed: D16567 (a closure field named like a map method, called on an un-annotated parameter, forces it to a map).
+- **D16301 closed:** a top-level statement before the functions it reaches, declared after it, no longer reads a callee's provisional return. A later callee whose own facts stand is checked first, together with the functions it reaches; call cycles keep the fixpoint's order. The witness, a closure over a list of two un-annotated functions of different results, trapped and now prints `5.5`. No corpus case moves to a clause-1 outcome when its functions come last, and the loud movers fall from 57 to 56.
+- **D16562 filed:** a closure built by a generic call whose type parameter nothing binds, called at another type through a destination the call never sees (an inferred return, or a list element read), traps. These are the positions D16410's close does not cover; they trapped before #8309 as well. The row records why an emit guard, a build-site record and type-level checker provenance each fail. It is on lane S's slot-store acceptance list.
+- **D16563 closed:** a destination binds a type parameter its call leaves open when that parameter is in a parameter position of an open-function slot, even if another argument binds the slot's other type parameter. `bind1(first, 2.5)` delivered to `(b: string) => f64` trapped and now prints `2.5`; 29 of the `gfv-bind1` matrix's 30 traps run.
+- **D16565 closed:** a `for` over `.values()` or `.keys()` of an un-annotated map or set parameter binds its loop variable to the hole a key-value walk would, instead of reporting it as an undeclared identifier. A body that pins the map runs, the map written after the loop included; a read-only body meets only the map-parameter floor.
+- **D16566 closed:** an un-annotated `let` accumulated from a `!= null`-narrowed read of an un-annotated parameter settles: the literal solve can now write a hole less `null` as the `let`'s annotation. Before, the round wrote nothing yet counted as progress, so the fixpoint never converged and the program was refused after the re-check budget. A literal round that writes no annotation now counts as no progress, and a pin it cannot write is refused at once.
+- **Generic function values, discovery:** eight position matrices (`gfv-*`) over `compose`, `twice`, `mkId`, `bind1` and `konst` producers. Filed: D16563 (clause 1, a destination does not bind an open type parameter when its function type also names one another argument binds; 30 cells trap) and D16564 (clause 2, `mkId()` with no destination is refused in a sentence wider than the arm). The `compose`/`twice` `argument` cells join D16531.
+- **Maps and sets, discovery:** eight position matrices (`ms-*`) over maps of records, functions, lists, nullable values, nullable records, nullable functions and maps, and a set of strings: 360 of 368 graded cells run, none silent, wrong or trapping. Filed: D16565 (a `for` over `.values()`/`.keys()` of an un-annotated parameter reports its loop variable as undeclared) and D16566 (an accumulator over a null-guarded walk of an un-annotated map parameter does not settle). The read-only map-parameter cells join D15161.
+- **D16435 closed:** a fresh record literal joined beside a held record adapts to the held record's type where its fields fit, in a list literal, an `if` and a `match`, with or without a destination: `[ra, { k: "b" }]` with `ra: { k: "a" | "b" }` runs (it was refused as `RA is not {k: string}`).
+- **D16471 closed:** `>>` over a negated radix literal whose digits exceed `0x80000000` shifts the pattern at its use's width: `const a: i32 = (-0xFFFFFFFF) >> 3` is `0` (it printed `-536870912`), and at an `i64` use it stays `-536870912`.
+- **D16365 closed:** records written to an un-annotated list parameter, by a push or an index
+  store, share their empty list fields' element, so one push pins every record's field instead
+  of building the others at `i32`. Filed D16421 (an un-annotated binding of such a call's nested
+  element read) and D16422 (a record the argument holds beside one the body writes).
+- **D16421 closed:** a list a body pushes onto an un-annotated parameter's argument, bare or in a
+  record field, and then writes to, is pinned at the call. So an un-annotated binding of the
+  call's result reads the pinned element, and `const w: string = f([])` over an `f64` element is
+  refused instead of checking clean. Filed D16423 (one element type for every call) and D16424
+  (the record spelling refused when the call is above the declaration).
+- **D16422 closed:** a list literal written at a call of an un-annotated function, and the empty
+  lists inside it, take the pins the body's writes owe them. A record the body pushes beside the
+  literal's own records shares their empty list fields' element, or takes their concrete one, as
+  the direct spelling does. Filed D16425, the same program over a bound list, and D16426, the
+  call above the declaration.
+- D16423 and D16424 are bucketed (c), L2 inferred interfaces: each runs with its un-annotated
+  parameter annotated, concretely or generically, so neither is a lane spot-fix.
+- **D16425 no longer builds an invalid module:** a record an un-annotated function's body pushes
+  onto a bound list shares its empty list fields' element with the list's own records, so a
+  caller's later write types both. The body's own write into the bound list is now refused
+  loudly, which is D16427 (filed, bucket (f)). D16426 is marked a bucket (c) clause-1 acceptance
+  row.
+- **D16427 and D16425 closed:** the inner list of a bound list, written by an un-annotated
+  callee, takes the callee's element at scope close, as a record field's list already did. So
+  `t(a) { a[0].push(0.5) }` over `const l = [[]]` runs instead of being refused, and D16425's
+  bound list of records written in the body runs too.
+- **L2 design: inferred interfaces for un-annotated functions** (docs only,
+  `docs/internals/l2-inferred-interfaces-design.md`). Each un-annotated function gets one scheme
+  whose bounds are today's deferred demands (the 11 constraint tables and 15 derived-hole kinds),
+  inferred once in callee-first order and checked at each call by one solver, with exports frozen
+  at the module boundary. It maps the 34 bucket-(c) rows to the element that closes each, measures
+  what retires, gives an eight-step migration, and records the five language-visible choices as
+  settled from existing rulings.
+- **L2 design, coordination update** (docs only): lane M3 measured that `relate` pins no hole
+  dynamically (0 writes across 445,464 deliveries, #8323), though static paths to a pin exist. A
+  scheme's bounds come from the deferred demand rows, S3 no longer waits on relate's stage C, and
+  a pin inside a fit question is caught by S3's assertion and the seal.
+- **L2 S0, part 1 (docs only):** no corpus program depends on polymorphic recursion through an
+  un-annotated function (18 recursive candidates, one of which is a nullability join that HM with
+  subtyping keeps as one instance). Bounded polymorphic recursion runs today, and its witness is
+  filed as D16428, which must keep running until the owner rules on L2's choice 3.
+- **L2 S0, part 2 (docs only):** a scheme built from today's constraint rows covers 56.9% of the
+  1,464 runnable programs with an un-annotated function, and 78.2% of their 4,961 un-annotated
+  functions at body level. The rest carry demands that per-position `hole*` judges decide without a
+  row. The note lists the judge families in S2-prerequisite order, with each family's program count.
+- **D16377 closed (L3):** a record parameter `p: A | null` handed a wider row and `null` (`f(x)`, `f(null)`) runs, its `null` call taking the declared parameter's instance, where an `is` over it was refused at emit.
+- **D2836 closed:** a generic function returning a `match` of a type parameter's list and a concrete list (`match k { 0 => ys, _ => xs }`) gives its call their union, as the same `if` does, where the call was refused.
+- **D16463 closed:** a record literal written into a field, element or name storing one record yields that record, as the value stored is: `function put(n: Node, v: i32) { n.left = { v: v, left: null } }` runs beside a `{ v, left: null }` literal elsewhere, and a write through the yielded value checks.
+- **D16440 closed:** a fresh list `const` spread into a list literal beside a part at a wider record (`[a, ...s]`, `[{ x: 2.5 }, ...s]`) is built at that record, as a spread into a push is. Before, the program built an invalid module. A spread no build reaches, such as a call's result list, is now refused at check with the shared-record contract (D16441). Filed D16441, D16442, D16443.
+- **D16281 closed:** a call to an un-annotated function, handed an un-annotated function declared
+  below it (`const l = c4([dbl], 2.5)`), checks the handed function first, so the call's result is
+  the instance's rather than open. The check accepted `const y: string = c4([dbl], 2.5)` and the
+  build was an invalid module; it now prints `5`, and the wrong annotation is refused (D16301).
+- **D16426 closed:** a call above an un-annotated function that writes an element into its parameter (`push`, `unshift`, `add`, `set` or a cell store) now checks that function first, so the body's records share the call's list fields as they do below the declaration. Before, the program built an invalid module.
+- **D16424 closed:** by the same rule, `g([])` above an un-annotated `g` that pushes a record with an empty list field onto it runs. Before, the monomorphizer refused it.
+- **D16333 closed:** a record holding a generic function, handed to an un-annotated parameter and
+  called through `?.`, builds a valid module and runs.
+- **D16410 closed:** a call's annotated destination binds a callee type parameter that no
+  argument binds, when the arguments naming it are open functions: `const k: (x: f64) => f64 =
+  sel(gid)` runs at `f64`, `i64` and `string` instead of trapping, and D16412's destination faces
+  (`sel(hinc)` into an annotated `const`) run.
+- **D16530, D16531 filed:** two check-clean invalid-wasm cells from position matrices. One is a
+  hole parameter's narrowed literal-union copy read by `??`. The other is `sel(gid)` delivered
+  to a hole parameter or an open `Map` value and called at `f64`.
+- **D16184 closed:** an assignment to a `K | null` local used as a value (`return k = "ww"`, a tail write, `print(k = …)`) yields the member's string instead of building an invalid module or printing the atom's number. **D16343** files the record-field face.
+- **D16341 closed, D16432 closed:** an unwritten `Map()` or `Set()` stored whole as a value of an unwritten map (`m["k"] = Map()`) takes the default with its holder at the scope's end, so the program builds and runs instead of an invalid module or an emit refusal.
+- **D16343 closed:** an assignment to a `K | null` record field or list element used as a value (`return r.k = "zz"`, `print(r.k = "ww")`, `const v = xs[0] = "zz"`) yields the member's string instead of building an invalid module or refusing to emit.
+- **D16433 closed:** an open `Set()` or `Map()` re-pointed at another open one (`b = a`) matches `is` vacuously, as either does alone: a row holding one hole with a default-settled row is settled too.
+- **D16278, D15802, D16233 closed:** a list of records of un-annotated functions of different
+  results, read straight off a call (`take(mk().a)`), off a binding of one (`take(r.a)`) or as a
+  call's whole result, and handed to an un-annotated parameter, dispatches per member, including
+  through a `const` copy of the parameter walked by `for`.
+- **A constant refusal quotes a folded float as `print` would** (AE-005): every refusal that prints a float constant goes through one shortest-round-trip printer (`cexShortest`), so `0.1 * 3` reads `0.30000000000000004`, not its 54-digit exact expansion or a cut prefix; a float a fold made names the expression it came from (`from constant folding of \`0.1 * 3\``), and a fraction at an integer type names the fixes `floor(…) as! i32`, `round(…) as! i32` or `trunc(…) as! i32`.
+- **A literal `const` read beside a radix literal is typed by its value** (T2.4): `const x = 3000000000; 0xFFFFFFFF & x` is `3000000000` (was `-1294967296`), and an `i64`-spelled tree whose value fits `i32` reads at `i32`. The oracle follows T2.4, and D14990 for a radix-tree `const`, which it computes at each read's width.
+- **D16491, D16492 closed:** a radix tree cast `as f64` computes at 64 bits before it converts (`((-1) - 0xFFFFFFFF) as f64` is `-4294967296`, was `0`). A radix literal beside an operand spelled with an `i64` decimal is zero-extended there (`0xFFFFFFFF & 3000000000` is `3000000000`, was `-1294967296`). The oracle also models a typed `min`/`max`/`abs` over constants and a radix tree beside a typed peer. The 8 radix-width cells from the first fuzz nightly now agree.
+- **The checker's quiet re-check brackets are `QuietRun` values** (L5 step 3a): seven sites
+  (`solveUnannotParams`, `globalInitPrePass`, `cstrProbeBefore`, `inferReturnsPrePass`,
+  `bankGenAliasDeclTys`, `letFnLambdaParamTys`, `dstTyParamAdapts`'s nested ask) open and close
+  through `quietRunOpen`/`quietRunEnd`/`quietRunDrop` or `quietEnter`/`quietLeave` instead of
+  saving and restoring `inferQuiet`, `quietDepth` and `symEnabled` by hand. Byte-identical over 20,298 corpus programs and the L2
+  build; net −7 compiler lines.
+- **The record-adoption rows are two lifetime records** (L5 step 4a): the 34 tables
+  `check_rec_adopt_rows.vl` cleared by hand are `recAdPass` (one pass) and `recAdProg` (the whole
+  check), each reset by one assignment; byte-identical over 20,233 corpus programs and the L2
+  build, net −46 lines.
+- **The capture rows are one lifetime record** (L5 step 4b): the 66 tables `crReset` cleared by
+  hand in `check_capture_rows.vl` are `crRows`, reset by one assignment; byte-identical over
+  20,293 corpus programs, net −95 compiler lines.
+- **The effect-summary rows are one lifetime record** (L5 step 4c): the 34 tables `esReset`
+  cleared are fields of `EsRows`, reset by one assignment, and the four importers each import
+  `esRows` in place of their lists. Byte-identical over 20,298 corpus programs and
+  the L2 build; net −36 compiler lines.
+- **D16551 closed:** a read of a re-pointed generic `let` handed to `.push` or `.set` on a receiver annotated with a closed function type is the function its most recent write stored: `let k = plus; k = inner; fs.push(k)` runs, with `fs` declared before or after the write.
+- **D16182 closed:** a read of a re-pointed generic `let` handed to a closed function-typed parameter is the function its most recent write stored: `let k = plus; k = inner; apply(k)` runs. Its method-argument face (D16551) and un-annotated-parameter face (D16552) are filed open.
+- **D16181 closed:** a function whose parameter is a union or `T | null` is delivered where the parameter is one of its members, adapted as a record arm is: `function w(a: i32 | string)` runs as a `(a: i32) => void` at an argument, a list or record literal, a return and a map value. A number widened into the parameter (`(a: f64)` at `(a: i32)`) stays refused.
+- **One entry for a fit question** (review medium 3, step B0): `fitsExpr` owns the quiet bracket
+  that five "does it fit?" sites spelled out by hand. The `inferQuiet` hidden scopes go from 20 to
+  16. Byte-identical over 20,370 programs; net −17 compiler lines.
+- **Two more fit questions use `fitsExpr`** (review medium 3, step B1): `joinArmFits` and the
+  return-value probe. The `inferQuiet` hidden scopes go from 16 to 14. Byte-identical over 20,370
+  programs.
+- **The last fit-question quiet brackets are measured** (review medium 3, stage C). Each was switched
+  off and the result fingerprinted over 20,384 programs. Two are load-bearing: the rep-stamp re-ask
+  is a re-entry guard, and `validateCompArgCstr` hides a refusal. Four change nothing observed, but
+  `substTyDeep` statically reaches the hole and alias writers, so they stay. The type-level relation
+  pins no hole on any loud delivery in the corpus. Comment-only; byte-identical seed.
+- **`validateCompArgCstr` asks through `fitsExpr`** (review medium 3, stage C2). A path proof shows
+  `joinLitsFitAt` reaches only the arena and the relation's memo, so its quiet bracket goes. The
+  planned `Refused` variant is dropped: neither the IR nor L2 consumes refusals. `inferQuiet` hidden
+  scopes go from 14 to 13. Byte-identical over 20,410 programs.
+- **Design: a pure `relate` and one recorder** (engineering review medium 3,
+  `refactor-notes/2026-11-15-relate-recorder-design.md`). It is a census of `assignableExpr`: 82
+  call sites, of which 53 only ask whether a value fits, and 52 recorders in eight effect kinds
+  among the seam's 105 callees. It proposes the `Fit = Coercion | Mismatch | Refused` value and a
+  byte-identical migration of four effect-kind PRs and then five caller-family PRs. The migration
+  deletes 14 of the 20 `inferQuiet` quiet brackets. Docs only.
+- **Design: `substTyDeep` without a mode** (review medium 3, stage C,
+  `refactor-notes/2026-11-15-subst-pure-design.md`). A dynamic census found 82 writers that run
+  under a substitution, out of 176 reachable. No hole pin and no in-place fill runs there. Only
+  three products depend on `inferQuiet`: the elaboration's pin notes, field-annotation types and a
+  lint note. The design pre-banks the last two at the declaration and makes the pin notes a
+  `CheckRun` family, after which two quiet brackets and the substitution memo's mode key go. Docs
+  only.
+- **D16452 closed:** a returned `if` or `match` of records of un-annotated functions is judged arm
+  by arm, as its tail spelling is: the returned-value walk walks a `return`'s value as a tail, and
+  the join decline reads a last `return`.
+- **D16451 closed:** a generic function's `return Map()` grades the empty map before pinning it
+  from the declared result, as its tail does, so each instance takes its own value type.
+- **D16450 closed:** a value `if` or `match` seeds each arm's lambda with the type it is
+  delivered to wherever it stands, returned, bound to an annotated `const`, passed or assigned,
+  as a function's tail already did; `seedTailArms` is folded into `seedExpected`.
+- **D16550 closed:** a call whose result stores `void` is refused at the call, as a written `void[]` is: `[1, 2].map((x) => print(x))` and a generic's `U[]` at a void `U` no longer build an invalid module.
+- **D16550 follow-up:** a `.map` whose callback returns nothing is refused with the loop to write instead: `` to run the callback for its effect, loop: `for x in xs { f(x) }` ``.
+- **D16361, D16332 and D16363 closed:** a written generic `let` called directly holds its set's
+  id; listed beside another function at a closed type it is that member's closure there, and
+  handed to a generic in such a list it stays a closure. A copy of a binding called at two types,
+  written into an un-annotated binding or map, stores the id rather than one instance's closure.
+  `fn-value-generic-list-literal-arg-at-i32.matrix.vl` runs all 46 graded cells.
+- **D16414 narrowed:** a float constant tree folds in `f32` arithmetic at every `f32` use, not only
+  at a binding annotated `f32`: an argument, a return, a field, an element, a write, an operator
+  peer and an `f32 | null` binding print the `f32` IEEE result (E9.1, owner ruling Q9). The fold
+  keeps the tree's `f32` value beside its literal, and the emitter lowers an `f32` use from it. The
+  oracle folds at the use type too. A `const` with no annotation read at `f32` stays open.
+- **D16414 closed:** a `const` with no annotation of a float constant tree is a constant, so each
+  read folds at its own use type: read at `f32` it is the `f32` IEEE result, at `f64` the double.
+  A `const` annotated `f64` stays one double value. The oracle folds a `const`'s reads the same
+  way, and refuses an integer constant inexact at a float type and a finite constant past `f32`'s
+  largest value, as the checker does. D16540 and D16541 filed.
+- **D16540 closed:** a constant tree argument at a generic's bare type parameter adapts to the
+  call's destination as a lone literal does (D3539): `const y: f32 = g(0.1 + 0.2)` prints
+  `0.30000001192092896`, folded in `f32` arithmetic. The oracle binds a type parameter from the
+  destination for such arguments too.
+- **D16541 closed:** a float constant tree whose IEEE value is an infinity or NaN computes at an
+  `f32` use as it runs there: `const z: f32 = 1.0 / 0.0` prints `Infinity` at a binding, argument,
+  return, field, element and `f32 | null` binding. A finite constant past `f32`'s largest value
+  stays refused.
+- **D16279 closed (clause 1), D16278 narrowed:** a list of records of un-annotated functions whose results differ, built by a call and bound (`const L = mk().a`), now dispatches per member when an un-annotated parameter calls each element's field, by index and by `for`; the `for` spelling trapped (indirect call type mismatch) and the index spelling was refused at emit. A literal list walked by `for` through a parameter runs too. The list handed straight to the parameter is still refused at check (D16278).
+- **D16293 closed:** an integer literal `let` joins a float stored into it that holds the literal exactly (owner ruling 2026-11-15, ruling 4.3's join for a literal `let`'s stores): `let t = 0; t = t + 1.5` is `f64`, and the generic accumulator `function sum(xs) { let t = 0 … t = t + xs[i] … }` types `t` at each call's pin, so `sum([1.5, 2.5])` prints `4`; integer-only stores keep the integer widening and an inexact float keeps the refusal.
+- **D16490 closed (clause 1):** a literal `let` stored an `f32` and a float literal (`let t = 0; t = f; t = t - 0.1`, `t -= 0.1`, `t = 2.5`), or initialised by a float literal (`let t = 0.0; t = f`), was silently typed `f64`; the literal now adopts the typed `f32` store, as ruling 4.3 joins any literal beside a typed value, and stores of literals alone still give `f64`.
+- **D16278 closed (clause 1):** a list of records holding un-annotated functions that return different types, read straight off a call (`take(mk().a)`) into an un-annotated parameter that calls each field, checked clean and trapped (indirect call type mismatch); it is now judged through the call's returned values and refused as the same list read through a binding is (every function a call through the place may run must return one type).
+- **D3469 closed:** a `?.` method call on a nullable local a type-parameter value was written into runs at every pin, in the body and in a closure. The checker resolves the method on the declaration's non-null face and wraps `| null` at every instance where the template did. The guard reads the receiver at that face, so a map or set `has`/`get`, a string method, a self-function and a closure field all run. Before, these were emit rejects, check rejects, or (a non-null pin in a closure) a wasm trap.
+- **D16561 closed (clause 1):** a radix literal tail beside a typed `i32` arm of a value join (`(if c { 0xFFFFFFFF } else { v }) * k` with `k: i64`) was read at the 64-bit destination or peer; under ruling 4.3 the join is `i32`, so it is now the 32-bit pattern `-1`, as with the join bound first. Joins of literals alone, or with a 64-bit arm, keep D2617's destination width.
+- **D16395 closed:** `==` between records of different field sets is a check error, as the owner ruled: "`A` and `B` have different fields (`g`); compare the fields you mean". Before, it was refused at emit, or built an invalid module for nullable records. Filed D16397: the same compare in a generic body, which is still refused at emit.
+- **D16399 closed:** `==` over a record whose field is a union and a record whose field is one of its members runs in either order, testing the arm as a bare union-vs-member compare does. Before, it was refused at check when the union side was on the left.
+- **D16381 closed:** a call through a set of un-annotated functions declared after the call
+  checks each member it needs first, as a forward direct call does, so the set is tagged and
+  dispatched instead of trapping. Declaration-order clause-1 movers fall from 31 to 17 on top of
+  #8165. Filed D16369, D16209's map store with its functions declared last. D16281 re-graded to a
+  still-failing cell; filed D16420, a binding of a hole function called directly and then handed on.
+- **D16369 closed:** a call whose callee's result the module's quiet pre-pass left holding an
+  unsolved hole checks that callee's body first, as it does a pending result, so a map store of
+  a call through a set of hole relays declared after it keeps its value. Declaration-order
+  clause-1 movers fall from 6 to 2 on top of #8201; D16430 and D16431 close with it;
+  D16281 and D16301 re-graded to what is left.
+- **D16365 closed:** records written to an un-annotated list parameter, by a push or an index
+  store, share their empty list fields' element, so one push pins every record's field instead
+  of building the others at `i32`. Filed D16421 (an un-annotated binding of such a call's nested
+  element read) and D16422 (a record the argument holds beside one the body writes).
+- **D16290 closed:** a record wider than a parameter whose record type is written inline (`a: { name: string }`, also `| null`, `[]`, a UFCS receiver, a hole, generic or lambda forward) runs at its own row, where it was refused unless the dropped fields sorted last.
+- **D16403 closed:** a hole parameter its body infers at a declared record (bare, `| null` or a list's element) takes a wider row, as an annotated one does: `function fwd(t) { show(t) }` runs on `{ age, name }`.
+- **D16400 closed (L3, the parameter half):** a record wider than a lambda's declared record parameter runs at its own row: `const show = (p: P) => print(p.name)` with `show(v)` and `show(w)` at two wider rows prints both, where each call was refused with the field-dropping sentence. The lambda's parameter takes the same row slot a function's does, and hovers and messages still show `P`.
+- **D16219 closed (L3, the parameter half):** a record wider than a declared record parameter, forwarded to it through a generic function (`function fwd<T>(t: T) { show(t) }`, `fwd(v)`), runs at its own row, where the call was refused with the field-dropping sentence; **D4020** (the same through two generic levels, either declaration order) runs too. A hole forwarder that takes `P` from its body (D16403) and a lambda's parameter (D16400) are still refused; a declared `: P` return of the wider row (D16401) joins the storage positions (D16402) that wait for the accessor view.
+- **A test in a generic caller declared below its first call is decided per instance:**
+  `c2("q", true)` before `function c2<T>(…) { const v = w(t, b); if !(v is i32[]) { … } }`
+  trapped, because the quiet check that reached `c2` from the call marked the arm dead. A dead
+  arm is now recorded only by a check whose types stand. Four declaration-order cells stop
+  moving (D16301).
+- **A top-level statement checks the later-declared functions it reaches first:** as an early
+  function's body already did, except a function whose fact comes from that statement (an
+  un-annotated parameter, a module `let` it reads, a call cycle). `print(k(1.5, gid)[0])` with
+  `gid` declared after it built an invalid module and now prints `1.5` (D16413); the
+  declaration-order movers fall from 165 to 85, the clause-1 ones from 17 to 6 (D16301).
+- **A top-level call of a function whose callees take un-annotated parameters checks it first
+  when its result is pending:** as an early function's body does. `const h = frReturned()`
+  before a `frReturned` building closures over un-annotated `inc0` and `half` trapped and now
+  prints `11.5`; three more declaration-order movers stop moving (D16301).
+- **D16420 closed:** an un-annotated alias of an un-annotated function, called directly before it
+  is handed on as a value, calls the function's instance; the order no longer matters.
+- **D16047 refined (owner ruling 2026-11-15):** an empty list whose annotation fixes its element type, or an empty literal delivered straight into a union, is tested by its arm: an empty `i32[]` in `i32[] | f64[]` is not `f64[]`. Maps and sets already answered so. D4915, D4939, D4949, D4953, D4954 and D15711 re-graded to the new answers.
+- **The D16047 never-match ruling implemented:** an `is` whose type can never match its operand's declared type is a warning, not a check error; the test is `false`, and the arm it guards (`if`, `while`, the right of `&&`) reads the operand as `never`. **D221** and **D228** re-graded to runs.
+- **D16047 refinement, the rest:** an empty list in a union arm of another tag never fits `is` of a list type, even where their elements could share a value (`(i32 | string)[]`, `(i32 | null)[]`, a record list tested at a contained record's list); the D4949 store-back that served the old answer is deleted.
+- **`vl check` warns on a float `/` or `%` by a zero literal** (owner ruling 2026-11-15, lane O's spec question 9): `x / 0.0`, `x % -0.0`, `x / (0.0)` report `divide-by-zero` with "dividing by `0.0` gives Infinity or NaN"; a named or computed divisor never warns. `std:math` gains `INFINITY`, `INFINITY_F32`, `NAN` and `NAN_F32` so intentional code has a spelling, and the std-math graders use them.
+- **Float constants fold in IEEE-754, as at run time** (owner ruling 2026-11-15, lane O's spec question 9, reversing the float half of ruling A): each float literal is its nearest double and each float operation of a constant tree rounds to the nearest double, so `0.1 + 0.2` prints 0.30000000000000004 and `1.5 % 0.1` 0.09999999999999992; integer constants stay exact. Spec E9.1, DECISIONS "Exact constant arithmetic" and the oracle follow. Two fixtures move; `1.5 % 0.1` at an integer destination is now refused as not whole.
+- **A14 ruled, generic newtypes; D2031 closed:** each instance of a generic `new` type is its own compile-time brand, erased at run time (owner ruling (a)). `Handle<Texture>` and `Handle<Mesh>` do not mix and neither takes a bare `i32`, a structural variable is not a `Box<i32>`, a getter may take `Box<i32>`, and `is` between two instances is refused with the newtype sentence (it printed a wrong answer before).
+- **D16323 closed:** `u as? X` over a `T | null` parameter, pinned where no member can be `X` (`size<string>` with `u as? Set<i32>`), misses there, as a type parameter pinned at no number does (D2791), instead of being refused at the call: `as?` is `null`, `as!` traps, and a bare `as` propagates the operand; the direct spelling's refusal (E8.6) and D2906's numeric-member refusal stay.
+- **D4033, D16383 closed:** a member call at a type-parameter receiver (`x.grow(y)`, `xs[0].grow(xs[1])`, `p.a.grow(p.b)` in a generic body, or in a lambda or function nested in one) resolves type-bound at each instance, so two instances whose types live in two modules each reach their own module's `self`-function.
+- **`std:test` gains `toBeNear(expected, tolerance)`** (external feedback AE-002): an absolute, inclusive tolerance beside jest's `toBeCloseTo(expected, digits)`, named `toBeNear` since `toBeWithin` is a range in jest-extended and chai, whose failure prints the measured difference (`expected 1.004 to be near 1 within 0.001 (differs by 0.0040000000000000036)`). A fractional argument for an integer parameter now names the parameter it meets (`argument 2: expected i32, got f64 — it is the parameter `digits: i32`, which takes a whole number`).
+- **Ruling 4.1 (as clarified):** `as f32` / `as f64` reads a radix literal as the value its digits
+  spell, rounded, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0; a float destination or
+  peer still takes only a value it holds exactly.
+- **Ruling 4.1 wording:** an integer literal, radix or decimal, that a float destination,
+  argument or peer does not hold exactly is refused as `constant 4294967295 is not exact at f32`,
+  the sentence a constant tree already had, where it read `i32 doesn't fit in f32 — lossy…` or
+  `operator '+' mixes f32 and i32`.
+- **Ruling 4.3:** a numeric literal joined with a typed value adopts that value's type where it
+  fits, in `if`/`match` arms, `??` and list elements: `if c { 5 } else { f }` and `[5, f]` with
+  `f: f32` are `f32`, `[0.1, f]` is `f32[]`. Lane O's 64-cell join grid: 64 of 64.
+- **D2774 closed** (ruling 4.3): an un-annotated function's returns are a join too, so
+  `if c { return 5 } return fv` with `fv: f32` infers `f32`, as a return-tail `if`/`match` does.
+- **D16293 (the sentence):** a generic instance's refused store into an un-annotated literal `let`
+  names the binding and its fix (`` `t` on line 2 has no annotation… annotate it: `let t: f64 = …` ``),
+  as the same store outside a generic body does.
+- **D16318's radix spellings:** a constant count tree beside a radix operand the fold keeps whole
+  (`0xFFFFFFFF >> (40 + 1)`, `0xFFFFFFFF >> (32 + 32)` at i64) is refused past the width, as
+  E6.2 says, instead of being masked at run time.
+- **D2197 closed:** `for … in` over an un-annotated parameter runs, its variables typed at each
+  call as the typed loop binds them: an array's element and index, a map's key and value, a
+  string's code point.
+- **D16378 closed** (owner ruling Q8): a constant shift count decides an untyped literal
+  operand's width. A count of 32 to 63 makes it `i64` (`(-3) >>> (40 + 1)` prints 8388607), a
+  count of 64 or more is refused with E6.2's sentence, and a typed operand keeps its refusal.
+- **D16391 closed:** `[...bs, null]` over a `u8[]` is refused at check with the u8-mix sentence, as every other element mixed with a `u8[]` spread is; it used to pass check and stop at an emit refusal.
+- **D16366 closed:** a record field of a list of one integer literal (`{ f: 7[] }`, or
+  `9000000000[]` at `i64`) has a field code, instead of an emit reject.
+- **D16367 closed:** a `Map` or `Set` keyed by one string literal (`Set<"a">`, or an inferred key
+  of a `"a"`-typed value) hashes it as its one-member set, instead of refusing the key.
+- **D16364 closed:** a local copy of a module `[]` or `Map()`, read in a function declared above
+  the top-level writes that pin it, reads the pinned container, instead of building an invalid
+  module. Filed D16368, the same body's binding that takes its type from the element.
+- **L3, the parameter half (option A), first step:** a record wider than a declared record parameter, with its extra field anywhere in the layout, now runs when it is a member call's receiver (`w.f()` for `f(self: P)`) or comes back through an un-annotated return (`function f(p: P) { p }` hands back the wider row). The record-width rewrite gives the parameter a row slot bound by `P`, which every message and hover prints as `P`. **D16218 closed:** the editor hovered such a parameter as `__W0`. Still refused, each filed: forwarding through a generic or hole (D16219), a lambda's parameter (D16400), a declared `: P` return (D16401), a record field holding the row (D16402).
+- **A re-pointed `let` of generics declared below it narrows at each write:** `let f = gA`,
+  `f = gB`, `g = f`, then `f(2)` and `g(true)` printed `2` and `1` when `gA` and `gB` were
+  declared after the calls; it now prints `2` and `true`, as with them first (D16281).
+  Six of the 21 declaration-order cells with no slot fact, and seven clause-1 movers in all,
+  stop moving (D16301).
+- **D16334, D16335 closed:** a call through an un-annotated parameter bound to a declared
+  un-annotated function, handed a lambda only that function's body types, takes the direct call's
+  result: it reads back from a map, and a binding of another type is refused.
+- **D2539 closed:** a call refused for a type parameter only its return names is reported once;
+  an annotated binding written through no longer adds a message quoting the callee's own body.
+- **D3530 closed:** a two-width integer-literal union (`9000000000 | 1`) delivers into a
+  nullable float (`f64 | null`, `f32 | null`) when the float holds each member exactly.
+- **D16322, D16320 closed:** a field read straight off `as! B` of a partly fitting record (`(r as! B).x`) runs, as does a second cast of the same operand after one; a record cast to a record it is contained in or may be by its fields' values (`a as? B` over `a: A`, `b as! A` over `b: B`) tests that record where it was refused as "`as` supports numeric conversions only"; and `b is A` over `B | D | C`, where `B` and `D` share a tag told apart by a field's value, answers by the tag. The pin's re-ask of a cast now asks the same type-test predicate as the cast (D16323 stays open).
+- **D16326 closed:** `x is 1 | "a"` over `i32 | string` answered `false` for `1`; a literal set over two kinds now tests one kind at a time, through `is`, a negation, narrowing, an open parameter and a record field (**D4086 closed**). **D16327 closed:** a set holding `null` tests over a nullable scalar. **D16328 closed:** `as?`/`as!` to a literal set the operand may hold.
+- **D4082 closed:** a record `is` whose tested type narrows a field to a union member, a nullable's inner type, a contained record or a list element runs, through `is`, `match` and `as?`/`as!` and over a nullable or union operand: each narrowed field is tested at its own type. D16325 (a generic operand), D16326 (`x is 1 | "a"` over `i32 | string` answers for one base, clause 1) and D16327 filed.
+- **D16375 closed:** a constant tree under `>>>` whose left side is negative folds its exact operands, so `(-7 % (65536 * 65536)) >>> 1` prints `2147483644` instead of trapping on a divide by zero; the `>>>` computes at the operands' default i32, or at an i64 destination's width. The same fold closes **D16318**: a constant count tree beside a constant operand (`(-3) >>> (40 + 1)`) now meets E6.2's range check and is refused, as `(-3) >>> 41` is.
+- **Spec T3.6: one literal-adoption rule for every join form** (owner ruling 4.3): a numeric literal joined with a typed numeric value adopts its type when it fits (an integer exactly, a float literal at `f32` or `f64`), else keeps its default and joins as a member. The oracle follows it; `scripts/oracle/join-grid.ts` is the 64-cell acceptance grid, which today's compiler meets on 56 cells.
+- **Spec T7.4: `.length` is a list's element count, a map's entry count and a set's member count** (owner ruling 4.6). Writing an existing key or adding an existing member leaves it unchanged.
+- **D16380 closed:** a nested function that reads a narrowed field or list cell is checked at each of its calls, as one reading a bare name is: a write, or a writing call, after its last call runs, and a call after one is refused with the sentence that names the ended narrowing.
+- **D3396 closed:** an `else if` link whose every arm exits (`return`, `break`, `continue`) hands no value to the chain's join, as its `else { if … }` spelling does, so `let w = if c { null } else if d { return } else { return }` types `w` at the arm that completes.
+- **D16318's radix spellings:** a constant count tree beside a radix operand the fold keeps whole
+  (`0xFFFFFFFF >> (40 + 1)`, `0xFFFFFFFF >> (32 + 32)` at i64) is refused past the width, as
+  E6.2 says, instead of being masked at run time.
+- **D16390 closed** (owner ruling on spec question 4.2, reversing D14990's `f64` clause): a radix
+  constant tree at an `f64` destination or beside an `f64` peer computes at 64 bits, then
+  converts, so `let x: f64 = 0xFFFFFFFF + 1000` is 4294968295.
+- **D16297 closed:** writing a narrowed field or list cell's other member runs while a nested function only re-tests it, or does not read it; a nested function that reads the narrowed value still holds the write to the narrowing.
+- **D16364, its unaliased face:** a function declared above a module `[]`, `Map()` or `Set()`
+  reads the container that later top-level writes pin, instead of trapping the compiler
+  (`print(xs[0] + 1.0)`) or building an invalid module. A read through a local alias of it is
+  still open.
+- **D16209 closed:** a call through a value-`if` of hole-function relays, handed a hole
+  function, is typed through both function sets. It stores and prints the right value, and a
+  destination of the wrong type is refused at check instead of building an invalid module.
+- **D14420 closed:** an arithmetic, bitwise or comparison operator over a `never` operand outside a dead arm checks and runs: `if c { return 1 } 1 + fail()` prints `1`, where it was `operator '+' is not defined for i32 and never`. The operator is `never`, as D16006 already ruled in a dead arm; `&&`, `||`, `??` and string `+` keep their own typing.
+- **D4034 closed:** a receiver-overload call at a receiver each call supplies runs when the candidates return a type parameter an explicit argument binds: `function d<R, T>(r: R, v: T): T { r.tag(v) }` over `tag<T>(self: string, v: T): T` and `tag<T>(self: i32[], v: T): T` prints `S 1`, where it was refused with "a candidate's return type depends on its receiver". A set whose bound returns disagree is refused as "the candidates return different types".
+- **D4055 closed:** postfix `++`/`--` on a field or an element runs: `c.n++` and `xs[0]++` increment the place once, and `const o = c.n++` yields the old value, where the parser refused any target but a name. **D16216 closed** with it: `print(y++)` on an `f64` or `i64` name, check-clean invalid wasm, prints the old value. **D16217 closed:** a compound write used as a value whose index or receiver has an effect (`print(++xs[k()])`) runs the effect once, where it silently ran it twice.
+- **An assignment delivered at its target's own type hands over what it stored (D3785).**
+  `function s(): f32 { let x: f32 = 0; x = 255 }` returns `255` at `f32`. So does the same
+  store delivered to an `f32` binding, argument, field or element. Its value keeps its own type
+  everywhere else, so `const a = (x = 0xff)` stays `i32`.
+- **Two diagnostic helpers say what a missing type means:** `braceNameNote` gives no note for a
+  name with no type, and `witnessOf` asks nothing of a bound parameter whose annotation failed,
+  where both relied on `assignable` accepting a negative type. Behaviour unchanged.
+- **`assignable` refuses a negative type, and the corpus oracle counts it:** `TY_OPEN` is now
+  -3, apart from -1 (no type: a missing record, a poisoned annotation), so `assignableOrOpen`
+  accepts only a component minted open. `assignable` answers `false` for any other negative type
+  and bumps `asgNegCount`; the corpus oracle fails a case that compiles clean with a non-zero
+  count. Two mints that spelled open as -1 (the hole-map demand's value, `litElemSrcTy` on an
+  element with no record) now say what they mean. Behaviour unchanged on the corpus.
+- **`TY_OPEN` names an open component:** the element of an unpinned `[]`, the key or value of an
+  unpinned `Map()`, an open nullable's inner type. `assignableOrOpen` says "an open component
+  fits" at `assignable`'s descents and at `assignableExprIn`, where `assignable`'s negative-type
+  guard said it implicitly; behaviour unchanged (1,500 corpus programs build byte-identically).
+- **D3088 closed:** a list of a nullable record delivered as a readonly list of a nullable union
+  holding that record is the view its non-null twin is, including where a lambda returns it from a
+  capture.
+- **D3087, D16310 closed:** an un-annotated lambda delivered to a closed function type takes the
+  delivered result as its annotation where its body hands back a value of another type, so it is
+  checked and built as its annotated twin: a readonly view over a captured list, a record field
+  union, an `i64` result, a union of function types.
+- **D4087 closed:** a `match` arm, an `as? B` and an `as! B` naming a record one union member may be by its fields' values test as `is B` does, the member's tag and then its fields, so all three spellings agree: `match r { B => … }` over `r: A | C` prints `B` for `{ x: 1 }` and falls through for `{ x: 7 }`. A nullable operand (`A | C | null`) is tested the same way in all three. A field read straight off `as! B` is still refused (D16322).
+- **Two warnings for members one type (owner ruling, in place of nominal variants):** a union formed in a `type` declaration or an inline annotation warns where two members spelled apart are the same record type (`` `Denied` is the same type as `NotFound` ({msg: string}); this union has one member. help: add a discriminant field ``), and an `is` or `match` arm naming one of them warns that it cannot tell them apart (`` `is NotFound` also matches `Denied`; this test can't tell them apart ``). Lint codes `same-type-members` and `test-cannot-tell`.
+- **D16296, D16232 closed:** a record whose functions a union arm would call at another signature
+  is refused as at a plain record destination, where it trapped or tested `is` false.
+- **D2408, D2449, D2464, D3251 closed:** re-testing a place after a call that may write it now runs, for a bare name, a field or element path, and inside a nested function; a test after a call in the same `&&`/`||` condition keeps its narrowing.
+- **D1190 closed:** a deep `is` arm that writes or rebinds the tested place runs. The arm reads the
+  converted value up to that statement, through `if` arms and loops; a closure that writes the
+  place is still refused (D16274).
+- **D1198 closed:** a recursive JSON shape (`type Tree = { v: f64, kids: Tree[] }`) on the right of
+  a deep `is` is walked by a call per level instead of being refused; a cycle through no list,
+  map or `null` is refused as having no finite value.
+- **D16275 closed:** an empty `Map()` or `[]` delivered to a recursive union holding `null` and a
+  scalar, `const j: Json = Map()` among them, is built as its map or list arm instead of an
+  invalid module.
+- **D16276 closed:** an empty `Map()` delivered to a union with two map arms is built as the first,
+  as an empty `[]` is built as the first list arm, instead of an invalid module.
+- **D2299 closed:** a `.map` or `.filter` callback over a `u8`, `i8`, `u16` or `i16` list takes each
+  element as its `i32` value, and a `.map` result meeting a sub-word list is built at that storage,
+  as a literal of computed values is.
+- **D2508 closed:** a `for` over an empty list literal binds its loop variables at the read-only
+  default and runs its body zero times, instead of refusing a read of the loop variable.
+- **A read of a re-pointed generic `let` takes its most recent write (D15956, D15957).**
+  `let k = plus; k(1); k = inner; k(true)` runs. So does delivering `[k]` at
+  `((b: boolean) => void)[]` after `k = inner`. A write of a declared generic installs a
+  narrowing row, and a read the row reaches is that function's name.
+  - A write in a branch or a loop, a capture, or a value naming no single function leaves the read
+    holding the binding's whole set.
+  - Bindings with a member that has a concrete parameter (D16181), a read handed to a call
+    (D16182) or a lambda (D16180) keep their whole set.
+- **Two function-tag rules generalised.**
+  - A store into a place of a wider set decides that set with the stored one, as a join's tail
+    is.
+  - A list literal annotated at a closed function type holds no id when its elements are bare
+    members, as it already did for records holding them.
+
+  `const typed: ((x: i32) => i32)[] = [dbl]` beside a readonly copy of `[dbl]` no longer
+  instances the copy's adapter after the elaboration's plan.
+- **D16205 closed:** a number literal that an integer binding beside it cannot hold, such as
+  `pick(one, 0.5)` with `one: i32`, now widens the type variable as a typed value would, so the
+  order of the arguments no longer decides the call. Beside a float binding a literal still adapts.
+- **D16077 and D16133 closed:** a lambda returning a generic, handed to a hole parameter whose result is called, runs: `function run(f) { print(f()(5)) }; run(() => inc)` prints `6`, and with a second callee `run2(() => inc)` both run, where each was an emit reject. The elaboration closes the lambda at the generic's delivery, and the tag decision after it declines a set holding such a lambda, so the call site builds a closure. One parameter handed two lambdas (D16130), two parameter lists (D16079) and a `const` lambda or named maker (D16131) are still refused.
+- **D16134 closed:** a `map` or `filter` callback over a list a kept maker's build stores at a wider record runs: a lambda, a named hole function, a chain, a list literal receiver and a lambda in a generic body. `const xs = [mk2()]; xs.filter((y) => y.f == null)` prints `null`, where it was a check reject. The elaboration keys the callback's instance by the list's build. **D16212 closed** with it: a `slice` or `filter` of such a list beside a list of the element's own row, check-clean invalid wasm, runs. A parameter annotated at the element type and a `map` result holding the record are still refused (D16211); a field receiver is an emit reject (D16210).
+- **D16137 closed:** a joined record of un-annotated functions handed to an un-annotated parameter, bound to a `let` the callee re-points to its own record literal, runs: `let v = a; print(v.f(3)); v = { f: half }; print(v.f(4))` prints `4` `2`, where it was an emit reject. The elaboration notes the literal as stored at the parameter's set, and the late tag decision builds it there. Two callers with different sets (D16213) and a written function outside the set (D16214) are still refused at emit.
+- **D16215 closed:** a wider record handed to a lambda whose parameter is a declared record type, the lambda bound before the record, runs: `const show = (p: P) => print(p.name); const v = { age: 3, name: "a" }; show(v)` prints `a`, where `vl check` trapped the compiler. A check restart now clears the slot call and annotation types the previous pass noted.
+- **A pending function result is no fit:** `fnSlotAssignable` refuses a result still being
+  inferred (`RET_PENDING`) instead of reaching `assignable`'s negative-type accept, and a
+  `.filter` predicate still being inferred is left to the call's re-check. Shape C of the
+  negative-type sentinel census; corpus and distilled outcomes unchanged.
+- **D16300 closed:** a `??` whose default is a list literal of another storage (`xs ?? [1]` over
+  `boolean[]`) joins both lists when a binding of the call comes before the function's declaration;
+  the quiet return pre-pass no longer reads a missing element record as fitting anything. Filed
+  D16301: moving function declarations after top-level code changes 318 corpus programs' outcome.
+- **D16150 closed:** a generic whose parameter is a union of records over `T` (`{ leaf: T } | { kids: T[] }`)
+  binds `T` from a union-of-records argument, in either arm order, and an `is` or `match` naming
+  `T` narrows to that arm.
+- **D16151 closed:** a generic over a recursive generic union alias (`Tree<T>`) calls itself on each
+  element of its narrowed list arm.
+- **D16110 closed:** `===` in a generic passed as a value is refused at the enclosing call's argument
+  that has no identity, as a direct call is.
+- **D4155 closed:** `as? T[]` inside a generic body names the operand's written `T[]` arm.
+- **D15333, D15807, D15808, D15809 closed:** a value `if` or `match` of records holding
+  un-annotated functions runs handed inline to an un-annotated parameter, as it does bound to a
+  name first.
+- **D15274, D15302, D15308 closed:** every producer of a holder whose function field a write widens is built at the holder's row. A value `if` of record literals whose field is then written another function (`const r = if c { { f: id1 } } else { { f: id1 } }; r.f = id0`), a binding read only where it is written whole into a widened one (`const q = { f: id2 }; let r = { f: id1 }; r = q`, and the bare `const q = id2; let r = id1; r = q`), and a second maker's record holding a member of a widened field's set, called directly beside it, now run at two call types where they were emit rejects. A bare `const` source read again after the write (D16240), and a source declared in another function than its read (D16241), are still refused.
+- **D15357, D15392 closed:** a whole literal written into a held container is built at the holder's row. A list of records of an un-annotated function pushed whole onto a list of lists (`xs.push([{ f: id2 }])` onto `[[{ f: id1 }]]`), and a record written whole over a binding whose list field a list binding fills (`const xs = [id1]; let r = { f: xs }; r = { f: [id2] }`), now run at two call types where they were emit rejects. A list binding read again (D16242) and a field write of a list literal (D16243) are still refused.
+- **Partial record fit over a union runs:** `r is B` over `r: A | C`, where only some `A` values are `B`s by their fields' literal values and no `C` is, tests `A`'s tag and then the fields, where it was an emit reject. The `then` reads `r` as the `A` it is (D4089 is re-graded: narrowing to `B` itself is still open).
+- **D1118, D2677, D4085 closed:** `is`, `as` and `match` answer a type test by one rule. A `match` arm naming a type parameter covers that member (`match y { T => y, null => x }` over `T | null`), `as? S` over `R | S | null` picks `S`, and `b is A`, `b as? A` and a `match` arm `A` over `b: B | D` where every `B` and `D` is an `A` all run, testing `B | D`. A tested record whose contained members share a tag with a member it does not contain is still refused at emit (D16320).
+- **D15136, D15190 closed:** a function of another result written into an un-annotated list through
+  a parameter runs beside an uncalled function that hands that parameter on, and so does one
+  written into a record's list field through a parameter. D16230 (the write's value held) filed.
+- **D16230 closed:** a function written into an un-annotated list or record field through a
+  parameter, which is also the writer's result, runs when that result is held and never called.
+- **D16231 closed:** a function written into a list through a parameter runs beside a direct write
+  of the same function into another list. The map write leaves and the list ones are one walk now.
+- **D4160, D16171 closed: an inferred union or nullable return lowers as its annotated twin.** The inferred-return floor (`'f' infers the … return type … — type-valid, but an inferred return of this shape is not yet supported by codegen; annotate the return type`) is gone. A union or nullable inferred return that no recorder names for the emitter is now written as the function's return annotation (`inferRetAsAnnotation`), so `"a" | null`, `{[i32]: i32}[] | i32` and `{q: i32}[] | i32` run without the annotation the message asked for. On a 67-shape grid of inferred returns against their annotated twins, the inferred face goes 53 → 61 runs and now matches the annotated face cell for cell.
+- **A lambda literal a function returns infers its parameter (D16291's check edge):** `function mk() { return (x) => x + 1 }`, a tail lambda, and a lambda at the tail of each arm of a tail `if` are hole lambdas, as one bound to a `const` and returned already was, so `const k = mk(); k(5)` prints `6` where it was `cannot infer a type for parameter x`. Seven `returned-hole-lambda-*` matrix templates grade the family. The return-literal maker goes 0 → 52 of 56 positions, the tail maker 0 → 52, the tail-`if` maker 0 → 56, with 0 `runs → not-runs`. What remains is filed: D16292 (an inline `mk()(5)`), D16294 (one literal delivered at two function types), and D16295 (a maker capturing a hole function parameter, which also holds D16291's own `compose` witness).
+- **The 2026-11 engineering review's repros, filed:** D16290 (a wider record into an inline record-type parameter is refused unless the dropped fields sort last, clause 2), D16291 (a lambda literal returned from a function cannot infer its parameter, clause 2), D16292 (D14881's inline-call face, a loud emit reject, clause 2), D16293 (`let t = 0` refuses a float accumulator, by design under "Within kind", an owner question). The for-in-over-a-hole repro is already D2197, open.
+- **D16160 closed:** a bound list of records whose function field holds un-annotated functions with different results, handed to an un-annotated parameter that calls through an element's field, dispatches. `const l = [{ f: inc0 }, { f: half }]; take(l)` prints `1.5`, where it was an emit reject that `vl check` passed. Two such lists through one parameter run too. A splitting list and an agreeing list through the same parameter are still refused (D16144).
+- **An unwritten collection fits every `is` of its kind (D16047, owner ruling (a1)).** An empty
+  `[]`, `Map()` or `Set()` no write pins, in an inferred union return or a local join, answers
+  `is T[]` (`is {[K]: V}`, `is Set<T>`) true for every `T`; a write through such a narrowing pins
+  its element program-wide, as a direct write does. The inferred union returns D16047 floored lower.
+- **D1590 position:** `unknown type 'bool' within '{[i32]:bool}'` underlines `bool`, the component
+  it quotes, instead of the whole annotation; the missing-import form of the same refusal does too.
 - **D16099 closed:** a call's result holding an un-annotated function, handed straight to a generic `(x: T) => R` parameter, runs. `app(pick1(true), 3)` prints `4`, where `pick1` returns `inc`. The same holds for a returned choice of functions that agree. Before, it was refused at emit, and the call's result was left open, so `const q: boolean = app(pick1(true), 3)` passed check. It is now `i32` and refused there. On master a closed-parameter spelling (`apr<R>(g: (x: i32) => R)`) passed check that way and printed `true` for the `i32` `4`: clause 1, filed and closed as D16142. A call-result function whose `T` only the call fixes is still refused at emit (D16143).
 - **D16160 narrowed:** a bound list of records whose function field holds un-annotated functions with different results, called through in place and also handed to an un-annotated parameter, runs. Before, it was refused at emit (`field access receiver is not a struct`). The callee's instance now reads the row the binding stores. Handed on with no in-place call it is still refused (D16160).
 - **D16152 closed:** two recursive record aliases spelled with `| null` that name each other (`type A = { v: i32, b: B } | null` beside `type B = { w: i32, a: A } | null`), in either order and generic, build and run; a recursive annotation's canonical rewrite now banks its own type rather than a parse of its render, so each record has one struct row.
@@ -1325,6 +1818,169 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **E8 The checker's INTERNAL absence marker `<none>` reached users on the diagnostic channel — and the sibling `<error>` is a MEASURED non-change, not the other half of the same fix** — `tyToStrAt`'s no-arena-entry bail-out (`ix < 0`) wrote `<none>` into user-facing messages: `unknown property \`add\` on {[<none>]: <none>}` for a bare `Map()`, `argument 1: expected string, got <none>[]` for an empty `[]`. It now writes the blank `_` — E7's token, for E7's reason: an un-annotated param and an empty literal's element are ONE sentence to a reader ("no type was determined here; say it"), and the split between them is arena bookkeeping (an unsolved entry vs no entry at all) that made the second kind look like a different, internal condition. `holeDemandStr`'s "demands nothing" answer moves with it, because it lands in the `expected …` half of a message whose `got …` half comes from that renderer. **CORPUS, re-derived on the tip rather than inherited**: 4 marker occurrences in 4 of the **300 error-producing** files (of 1,137 diagnostic-producing, of 2,004 `.vl`; 13,510 diagnostic lines) — the board's "3 named files of 240 diagnostic-producing" is stale in both terms, and its shape→file table mis-assigns two of the four (`types/unknown-type-in-map-value.vl` is an `<error>` site; the `<none>[]` site is `soundness/hole-is-guard-return-join-reject.vl`). The corpus is not the population, so the render was reached from **74 CONSTRUCTED cells** (3 waves; 2 non-reproducing probes re-shaped after VL rejected `function(){}` for arrow syntax): **`<none>` 35 of 38 cells across 12 distinct message TEMPLATES** (`argument N`, `return type mismatch`, `cannot assign … to 'x'`, `cannot assign … to T`, `comparison expects numeric operands`, `operator '+' is not defined`, `unknown property`, `no method '.p' on array`, `print of …`, `set:`, `add:`, `push:`) and every shape of it (`_[]`, `_[][]`, `{[_]: _}`, `{[_]: boolean}` for `Set()`, `{a: _}`, `(_)[]`, `() => _[]`, `_ | null`). **`<error>` reaches the user through EXACTLY ONE template — 12 of 12 hits over 36 cells, plus 2 of 2 in the corpus, all the `print of …` codegen gate, and in all 14 the errored component sits inside a FUNCTION type**; the other 24 cells report only `unknown type '…'`, because an errored type is assignable both ways and every assignability-shaped check ABSORBS it. **Three answers for `<error>` were priced and all three refuted.** `_`: collapses a distinction `soundness/hole-renders-as-blank-reject.vl` pins, and misdirects — the reader has already been told `unknown type 'nosuchtype'` by name, and `() => _` sends them after a missing annotation instead of the one they wrote. SUPPRESS the second diagnostic: refuted by a CONTROL, not by the fixture comment that claims it — `function mk(): i32 { return 0 }  print(mk)` is rejected `print of () => i32 …` identically, so the gate is not a cascade and only its RENDER is polluted. RENDER THE OFFENDING NAME (`() => nosuchtype`, strictly the most useful): impossible without a rep change — `TY_ERR` is a SINGLETON arena entry (one `mkErrTy()` call, `errKind` a constant), and `emit_rep.vl` keys `TyErr` by arena INDEX, so minting one per failure multiplies rep keys. `<error>` therefore stays, and with `<none>` gone the angle brackets become a CLEAN one-meaning vocabulary: they mark a type the reader named and the checker rejected. **BYTE-IDENTITY, the primary oracle for a text-only change: 2,004 of 2,004 corpus files produce an identical `(rc, md5)` record, all 1,640 emitted modules byte-for-byte** — the `tyToStructStr` hazard (it shares `tyToStrAt`, and its output names shapes the emitter stores) did not fire, measured rather than assumed. The diagnostic channel moves **2 of 13,510 lines**, both `<none>` → `_`. **LSP**: `ABSENT_TYPE_MARKERS` drops `"<none>"` — no producer emits it, and the blank could not replace it, being a SUBSTRING of ordinary identifiers (`{foo_bar: i32}`) in a substring sentinel test. Both `KNOWN_CLEAN_DROPS` exceptions in the corpus sweep disappear (`: _ | null`, `: () => _[]` are displayable), so **no diagnostic-free file loses a hint any more** and the clean side is now an absolute zero, with `dropsOnErrored ≥ 1` carrying non-vacuity. A `TyNullable`-arm answer of `null` for the lone-`null` case was **refuted by measurement, not scope**: 4 of 12 constructed cells reach `_ | null` and only 2 are the lone null — `function mk() { return [] }` makes `mk().pop()` one too, where the blank is honest. **Pins retargeted (4) and predictions**: `sets/error-add-non-boolean-value.vl` (`{[<none>]: <none>}` → `{[_]: _}`), `soundness/hole-is-guard-return-join-reject.vl` (`got` → `got _[]`, a pin that stopped one token BEFORE the marker and so could not see it), plus header-only retargets on `soundness/hole-renders-as-blank-reject.vl`, `generics/type-arg-inline-object-field.vl`, `types/unknown-type-in-inline-object-field.vl` and the two `tail-assign-*` files whose blocked empty-`[]` rows named the display filter as blocker (it no longer is; the checker-side half at `fnAssignRetTargetName` is untouched). Predicted 1 fixture red before retargeting — measured 1. SABOTAGE with the SAVED pre-fix artefact (`md5sum -c`, never a rebuild): predicted 3 corpus fixtures red — measured exactly 3, and the LSP suite predicted GREEN and measured 8/8, because its corpus sweep observes the FILTER and not the producer. No log-mismatch fixture is available for a diagnostic-text slice; the new file is a PIN. (`compiler/typecheck.vl`, `lsp/src/typeFeatures.ts`, `tests/cases/soundness/absence-markers-render-reject.vl`, `tests/lsp_undisplayable_type_test.ts`)
 
 ## Codegen, memory & runtime (Track B)
+- **Three unreachable `??` refusals removed:** the `string|null` arms of the value-union `??` lowering (binding, call result, union field) were refused at emit, but no program can reach them. `string | null` is never boxed, and every string spelling, narrowed or not, lowers through the `nulstr` niche first. Emit refusal sites go from 850 to 847. D3172's ablation now records that a narrowed box with a numeric residual (`i32 | string | null` narrowed to `i32 | null`) refuses too.
+- **D16510 closed:** an empty list handed to an un-annotated callback (`function empty(h) { return h(3, []) }`, called with an `f64[]` and a `string[]` callback) is now built, in each instance, at the parameter type that instance's callback reads. This also covers a `{ ys: [] }` record argument and lambda callbacks. Before, the second instance built the first one's list and the module was invalid. Filed D16601 (`[[]]`), D16602 (`Map()`) and D16603 (a `const xs = []` argument).
+- **D16601 closed:** a list of empty lists handed to an un-annotated callback (`h(3, [[]])`, `[[], []]`, `[[[]]]`) is now built, in each instance, at that instance's callback parameter type, as an empty list already is (D16510). Before, the second instance built the first one's storage and the module was invalid.
+- **D16606 closed:** a `??` whose number union the destination is no member of (`noneF() ?? 16777217`, an `f32 | i32` join, into an `f64` binding, argument, return or `f64[]` element) now builds its default at the union and converts the whole. Before, the default literal was built at `f64` inside the `f32` box and the module was invalid. The same applies to `i32 | f32 | null ?? 9` into `f64[]`.
+- **IR: hooks for the list slice:** the IR builder, lowering and verifier take their list reads,
+  bounds checks and reference variables from installable hooks, so a second lane builds them in
+  its own files. The defaults change nothing.
+- **IR step I1a:** the IR lowers I1's constructs back to wasm, and under `VL_IR_SHADOW` each
+  covered function's lowering is compared with legacy's code entry and statement spans. 1,499 of
+  the self-compile's 1,501 covered functions match byte for byte. Nothing is claimed, so no
+  emitted byte moves.
+- **IR step I1b-1:** legacy's emitter and the IR lowering now share their decisions as pure functions.
+  These cover a module global's storage class, its read's `ref.as_non_null`, a never-returning call's
+  `unreachable`, and a void tail call's callee. The IR shadow now covers reference-global reads,
+  never-returning callees and generic instances' parameter reads. Nothing is claimed, so no emitted byte moves.
+- **AE-004 design filed:** an `F32x4` in a record field has only the boxed `F32x4 | null` spelling, which allocates twice per write at -O3 (D16480); a record literal holding a vector is refused before it widens (D16481). `docs/internals/ae-004-vector-field-design.md` proposes a `v128` struct field.
+- **D16482 closed:** a binding annotated as a container of vectors (`const xs: F32x4[] = []`, `const m: {[string]: F32x4} = Map()`, `F32x4[] | null`), when its initializer is empty and nothing reads it, is now refused at check like every other vector array or map (D1981). Before, it passed `vl check` and built an invalid module or was refused at emit.
+- **D16483 closed:** `xs[i] ?? d` read straight off a cell of a list whose element is a nullable box (`(F32x4 | null)[]`) now runs as the null test it spells, where it was refused at emit. A side-effecting index (`xs[f()] ?? d`) is filed as D16484.
+- **D16484 and D16485 closed:** `xs[f()] ?? d` over a list cell, and a compound write of a vector or record used as a value (`(rs[f()].v += u).x`), whose index has an effect, now run that index once rather than being refused at emit. A `??` over a list cell joins the compound writes' value-position spill, and that spill's never-run arm no longer needs a literal of the write's type, because the emitter lowers a literal-`true` value `if`'s else arm as dead. D16486 files an assignment to a vector field of a list element used as a value, which is still refused at emit.
+- **A vector in a record field** (`type Body = { p: F32x4, m: i32 }`) now compiles: the field is a `v128` struct slot, so a write is one store with no allocation. This closes D1981's struct-field face and D16481. On the AE-004 witness at -O3, versus the boxed `F32x4 | null` spelling that was the only option before: 4.8× less user CPU (0.233 s → 0.049 s), 390 B → 185 B, and 265 MB → 13 MB peak RSS. Arrays and maps of vectors still refuse. Record `==` over a vector field is refused at check as not value-comparable.
+- **Refactor (no behaviour change):** a scalar list's indexed store and `.push` read one element kind from the list's rep rather than three per-kind flags, and dispatch through the helpers that already take an element kind. Generated code is byte-identical on 347 list fixtures. This is the groundwork for a `v128` list kind.
+- **Design filed for a list of vectors** (`F32x4[]`): `docs/internals/v128-list-design.md` proposes a flat `v128list` kind, which closes D1981's array and map faces, and measures today's spellings (`{ v: F32x4 }[]` is within 30% of `Buf`; `(F32x4 | null)[]` costs 6× the CPU). D16483 files a `??` emit reject on a list of nullable vectors.
+- **A list of vectors** (`F32x4[]`, `Mask32x4[]`) now compiles as a flat `v128` list. It supports literals, `push`, `pop`, index reads and writes, compound writes, `.length`, `for … in`, `slice`, spread, a list in a record field, passed and returned lists, and the generic list methods (`map`, `filter`, `reduce`, `some`, `every`, `sort` with a comparator, `concat`, `reverse` and the rest) at a vector element. This closes D1981's flat-array face. A map of vectors, `F32x4[] | null` and `F32x4[][]` are still refused at check; `includes`, `indexOf` and `==` are refused because a vector has no single `==`.
+- **IR shadow: reference values and plain list reads** (L1 I2, list half): a `str` or a list of
+  unpacked primitives may be an IR variable, parameter or result, and an element read on legacy's
+  plain guarded path builds a fused `SBoundsCheck` + `RListGet` that lowers to legacy's own guard;
+  verifier rule 8 pairs them. Shadow only, nothing claimed. Self-compile coverage 1,508 → 1,824 functions
+  (1,822 matched, no new mismatch); output byte-identical.
+- **Two emitter frames are records** (L5 step 2c): the element-by-element record copy's nine
+  globals are one `RcElem`, and the shadow respelling's six per-frame tables are one `ShrFrame`,
+  each opened fresh and restored as one value. Byte-identical over 20,316 corpus programs and the L2 build;
+  net −5 compiler lines, 15 hidden globals become 2 records.
+- **IR shadow:** a compile no longer reads the list-read notes of the program compiled before it
+  on the same instance. In `vl check --codegen` over several files, a second `take` at the same
+  node read the first's element kind and showed a false `list read wrapper slot` mismatch.
+  `ir-shadow-baseline.txt` drops that class.
+- **D16531 closed to loud:** a function value called at a `$fnsig` with no interned type no longer takes the all-`i32` arity type with an argument pushed as `f64`, `i64` or `f32`; it gets D16411's refusal instead of an invalid module. Three SILENT matrix cells go loud, 0 `runs → not-runs`. The two run-time traps of the same family are D16562's.
+- **D16556 narrowed:** a closure nested D deep no longer works out a parent key, square in the depth, for an enclosing declaration that has no instance: 200 nested closures compile in 1.15G guest fuel, from 4.55G (CPU 0.30 s from 0.82 s), output byte-identical; L2 self-compile fuel −0.4%. The let-map plan cache's thrashing past three parked plans remains, filed in the row.
+- **D16557 closed:** an exhaustive `match` over a union of N string literals no longer decodes both lexemes per member per arm, builds the member list per arm to test it non-empty, or flattens every member once per member in the declaration's collapse: 800 members compile in 1.03G guest fuel, from 1.81G (CPU 0.30 s from 0.51 s), output byte-identical. D16558 (a record literal's by-name field lookups, F² in about six passes) is parked with its design written into the row.
+- **D16559 parked:** `if` blocks nested D deep restamp each inner join's tail spine at every level, D²/2 stamps (0.56G guest fuel at D = 800); the row records why skipping a stamped subtree is not exact and the two ways out.
+- **D16612:** a union of map-list arms whose map values are numbers of different widths (`{[string]: i32}[] | {[string]: f64}[]`) builds and runs; it failed with "the type section wrote 15 rec-group entries, `mAssignTypeIndices` allocated 13". A map struct minted after the type-index assignment now mints the keys and vals wrappers it names with it, from the same `mvMapFieldWraps` answer the type section writes.
+- **D16554 closed:** a call through a callback parameter holding many distinct functions dedupes its targets through a map: 800 callbacks handed to one annotated higher-order function compile in 2.29G guest fuel, from 7.98G (CPU 0.67 s from 1.26 s), output byte-identical.
+- **D16554 residual:** `elabTyClosed` keeps its memo across walks while `tyMutEpoch` holds, instead of clearing it per walk: 800 callbacks handed to one annotated higher-order function compile in 1.85G guest fuel, from 2.29G, output byte-identical (corpus 0 of 6,871 modules differ).
+- **D16553 narrowed:** a program with no generic and one annotated higher-order function no longer scans the whole arena per call through a function-valued name, and walks only the bodies that call such a function: the compiler's own source with one added reads 91.81G L2 fuel, from 97.62G (89.58G without it), output byte-identical.
+- **D16555 closed:** an `is` ladder over a union of N records keys each narrowed union in near-linear time, not square: the member dedupe buckets by declaration, the text dedupe is a map and the sort a stable merge. 400 arms compile in 2.30G guest fuel, from 12.29G (CPU 0.42 s from 1.52 s), output byte-identical; L2 self-compile fuel −0.7%. Four further super-linear compile shapes from the same scaling grids are filed as D16556–D16559.
+- **Slot store, stage 2b part 2b(ii):** a call keyed nowhere reaches its callee's instances in the
+  place classes, closing the last walk-only delivery at `monoSlotDeliveryTy`, and
+  `elabRetFnListLitTy` reads the classes.
+- **A map get or has probes through `__map_entry__` / `__map_entry_i32__`, which answer the slot's entry** in a plain build, so the site no longer reads the index after the probe. Set and delete keep the slot probe, and `-O` is unchanged. The self-hosted compiler's seed is 0.65% smaller, and self-compile CPU falls about 3%.
+- **A failing list-index guard traps by reading index 0 of the module's shared empty backing** in a plain build, in place of reloading the backing and reading it at `-1`. The trap and its position are unchanged, and `-O` keeps its own trap. The self-hosted compiler's seed is 1.6% smaller (6,401,304 → 6,299,277 bytes).
+- **D16530 closed:** a literal-union value copied off a hole parameter, narrowed by `==` to one member and read by `??`, builds and runs. The per-instance `??` fold now widens the atom to the `??`'s own rep: the member string, or the box of a join with another type. Before, it was check-clean invalid wasm. D16552 is filed as an L2 acceptance row, with its `map_set` open-destination face.
+- **D16397 closed:** `==` and `!=` in a generic body, at an instance comparing two records of one field set stored apart, compare per field pair at the instance. Before, they were refused at emit, or built an invalid module for nullable records. Filed D16470: operands that are field, call or element reads still refuse.
+- **D3463 closed:** a `u8[]` or `u16[]` literal past the 10,000-operand `array.new_fixed` cap now builds when one of its elements is computed. It builds chunk by chunk, as the other scalar lists do. Before, it was refused at emit as too long.
+- **D16261, D16260 closed:** a call that hands a `never` call's result (`f(fail())`) to an un-annotated lambda, an un-annotated function or a generic `id<T>(x: T)` runs, where emit refused the instance it had no pin spelling for.
+- **IR step I0:** the typed mid-level IR's node set, its verifier (rules 1–7) and a phase-A
+  shadow builder over I1's constructs. Under `VL_IR_SHADOW=1` every lowered function inside
+  the set is built, verified and discarded: 1,492 of the self-compile's 17,334 functions
+  build and verify. No function is claimed, so no emitted byte moves.
+- **The emitter's `body: u8[]` parameter is gone** (L5 step 2b, engineering review Small 8): 551
+  `wasmEmit.vl` functions passed the writer's own buffer from call to call; the parameter and its
+  2,066 call-site arguments are removed and the three length reads use `curBuf`. Byte-identical over
+  20,223 corpus programs and the L2 build; net −1,110 lines.
+- **D16460, D16461 closed:** a returned value `if` lowers and reserves its frames as the tail `if` does: `return if c { xs.pop() } else { xs.push(7) }`, a returned `x ?? 5` into `f64` and a nested arm widening an atom all run. D16463 (a field-write arm's result built at a minted literal row, tail spelling too) is filed open.
+- **Slot store, stage 2b part 2b(i):** a slot's delivered signature reads the place classes
+  (`eplSlotSig`, `eplSlotOneCall`, `eplSlotCallsAt`). `monoSlotDeliveryTy` and
+  `elabHoleGenFlowTy` read them in place of the delivery walk, and `elabSlotOnlyCall` is deleted.
+- **D16143 closed:** a call result's un-annotated function handed to a generic `(x: T) => i32`
+  parameter runs; a holder written in a generic is bounded at its instance.
+- **D16560 closed (clause 1):** a value `if` or `match` of literals nested as a tail of a join with an `i64` value (`if c { if c { 1 } else { 2 } } else { k }`) built an invalid module; the nested join now takes the width its literals adopt. Found by the arith fuzz (`ar_s11_0195`).
+- **D16314 closed:** an all-`null` list literal delivered to a union whose list member holds `string | null`, a nullable function or a nullable literal union (`const r: (string | null)[] | boolean = [null]`) builds at that member, where emit refused it; as a list element it printed nothing.
+- **D16183 closed:** `return v = e` into a captured binding of a wider type (`K | null` written with `"ww"`, an `i64 | null` cell with `7`), and a returned `if` whose arm writes a field, yield the write's right side, as their tail spellings already did.
+- **D16292 closed:** a maker call is built at the one closed result its reach asks for, whether
+  its result is called in place (`mk()(3)`), called through a `const`, or delivered at a closed
+  function type; a maker returning a labelled block of functions takes its own deliveries, so
+  `const q = pick(2)` over one runs as well.
+- **D16434 closed:** a hole lambda bound to a `const` and returned from a function whose inferred
+  result closes is built at that result, as an annotated result's is. `wrap(f: (n: i32) => i32)`
+  returning `const l = (x) => f(x)` trapped when its result was called, and now prints `6`.
+- **The emitter's per-function frame flags are one `fnUses` record** (L5 step 2a): the 24
+  `fnUses*` globals become fields built by `fnUsesNone()`, the start builder's four kept fields are
+  one named `fnUsesForStart`, and the emitter-state audit reads the record; byte-identical over
+  20,173 corpus programs and the L2 build, net −60 compiler lines.
+- **Slot store, stage 2b part 1:** a function-holding slot's storage is decided by the place-class
+  engine alone. The values cascade that ran ahead of it is deleted, and named engine rules replace
+  it. No corpus cell moves, and declaration-order movement is unchanged.
+- **Slot store, stage 2b part 2a:** the first reader of the delivery walk reads the place classes
+  instead (`eplSlotBound`, the type a slot is delivered at). No corpus cell moves.
+- **A list `push` grows out of line:** the grow path moves into one shared `__grow_<row>__` helper per list shape, and the capacity test and append stay inline. A push site goes from 129 to about 72 bytes, the seed shrinks 7.6% (6.89 MB → 6.37 MB), plumb CPU falls 5.8%, and a tight push loop runs 6% faster.
+- **D16398 closed:** a record literal delivered into a union arm whose fields hold one-function
+  records of different function types is boxed as that arm, where it built an invalid module.
+- **D16394 closed:** `==` and `!=` over two records of one field set whose fields are stored apart (a literal union beside `string`, two number widths, a nullable beside a plain field, lists of another element, nested records, nullable records) compare field by field. Before, these were refused at emit or, for a nullable record, built an invalid module. Filed D16395 (records of different field sets, still refused at emit) and D16396 (field pairs that widen in opposite directions, refused at check).
+- **D16370 closed:** `is C` over an `A | null` value, where `C` has a field `A` lacks, tests the record and not only the null: `const a: A | null = { v: 3 }; a is C` is false, a narrowed `a.s` read no longer refuses at emit, and a `C` handed to an `A | null` parameter still tests true. Filed beside it: D16377 (the same function called with a `C` and with `null` refuses at emit) and D16378 (`4294967296 >> 65535` passes the checker, which E6.2 refuses).
+- **D3633 closed:** a local function declared in a module-scope block that captures the block's bindings can be called from a lambda; its captures are folded into the lambda's, as for one declared in a function body.
+- **D16319 closed:** a radix pattern beside a value `if` or `match` of constants takes the
+  destination's width, as it does beside a literal, instead of computing at 32 bits.
+- **D16374, D16376 closed:** a parenthesised value `if` of constant arms runs at a wider
+  destination or beside a wider operator peer, and a join with a typed arm keeps that arm's width
+  at every position, a record field and a list element among them, whatever its literal arms'
+  spelling.
+- **D16392, D16277 closed:** a call's fresh record is copied where a record holding a nullable
+  reference is built (a `(() => i32) | null` field, a list of nullable records, lists, functions
+  or maps), where it was refused, or built an invalid module beside a `push` or as a list element.
+- **D16360 closed:** the first `.set` or `.push` of a one-literal value (`const a: "a"`) into an
+  un-annotated `Map()` or `[]` stores the atom its slot holds, instead of building an invalid module.
+- **D16362 closed:** a record field of a list of integer literals with a member past `i32`
+  (`(9000000000 | 1)[]`) is a list of union boxes, instead of an `i32` list that failed to load.
+- Filed D16361, D16363, D16364 and D16365, four open clause-1 families of check-clean invalid
+  wasm, with their 15 capability-matrix cells in the named set `d16360-matrix-silent-cells`.
+- **D10351 closed:** a `.map`/`.filter` call read straight off its result under an `is` test, an `as` conversion or in a `match` arm runs: `print([1].map((i) => f(0, 7, "s"))[0] is i32)` prints `true`, where it was `emitProgram: .map/.filter scratch frame not reserved`. The scratch-frame scan now descends into those three forms.
+- **D4192 closed:** a null-only list literal as the `??` default of a nullable list of nullable numbers or records runs: `const xs = g() ?? [null]` at `g(): (i32 | null)[] | null` prints `xs.length` as `1`, where it was "`??` over a list whose default is a list of another storage builds no single list". The emit guard now reads the storage the checker stamped on the literal, not its own `null[]` type.
+- **D16321 closed (clause 1):** a union of records every member of which a record contains, delivered where that record is declared (`function g(b: B | D): A { return b }`), is unboxed into the record's slot at every position, where 28 of 46 positions built an invalid module.
+- **D2719, D4031 closed:** `as?`/`as!` over a `T | null` parameter is lowered at the instance's own type, so `size<Set<i32>>(s)` with `const w = u as? Set<i32>` runs where it was an emit reject (`needs a BOXED union operand or a nullable-REF one`); so do a list and a record pin, and `x as! T` over `T | null` (D4031). A pin the target can never fit is still refused (D16323).
+- **Slot store, stage 2a:** a binding's function-holding slot is closed by one place-class engine
+  over the write index (containers unify, function values copy, one rule per class). It replaces
+  four delivery-led closers. No corpus cell moves, and the declaration-order A/B shows no new
+  clause-1 mover.
+- **D16316 closed:** a list of only `null` in one record of a list literal whose sibling holds a list there stores the null of the field's element type, instead of the `boolean | null` sentinel, so the module validates.
+- **D16317 closed:** a union's function member whose result is a list of closures or records, narrowed by `is` and called while no value of it is built, now calls at its own signature instead of building an invalid module.
+- **D16315 closed:** a map whose value is a nullable function returning a literal union stores the function, so building one, or reading one that arrives through a narrowed union parameter, runs instead of being refused at emit or building an invalid module.
+- **D16371, D16373 closed:** a value `if` whose arms are constants is built at the width its
+  literals take: a parenthesised constant arm is typed with the literal it wraps, and arms that all
+  adopt an `i64` or `f64` destination build the join there.
+- **D16124 closed:** an un-annotated function returning a map of a hole function, bound at an
+  annotated type beside a lambda of the same signature, runs instead of building an invalid module.
+- **D16221 closed:** a record of an un-annotated function returned by a call into an annotated
+  `const`, handed to a parameter that another instance also receives, runs instead of building an
+  invalid module.
+- **D16313 closed:** a parenthesised list literal delivered to a union with a literal-union list
+  member (`(["rj"])` at `K0[] | i32`) is boxed as that member, so `is K0[]` answers `true`.
+- **D15753, D15755 closed:** an un-annotated function returning a held list of un-annotated
+  functions, or a value `if` of two held maps of them, runs where its result is bound at an
+  annotated type, instead of being refused at the return.
+- **D16162 closed:** an un-annotated map whose value is a record nesting a record of an
+  un-annotated function nothing calls builds and runs, as do its list, deeper and two-function
+  spellings.
+- **D16201 closed:** a map held in a `const` record's field (nested ones included) can store an
+  un-annotated function nothing calls: bare, in a record or in a list.
+- **D16170 closed:** a field read over a union of records whose members store the field as
+  nullable records of different types builds and runs, boxed as the records or `null`.
+- **D16206 closed:** an un-annotated parameter handed beside a wider number to a generic whose
+  uses of one type parameter join over numeric widening is widened at the call, instead of building
+  an invalid module.
+- **D16311, D16312 closed (clause 1, from the 2026-11-14 fuzz census):** `{f: [null]}` at a record field of `(boolean | null)[]` (or any niche element) builds each `null` as the element's sentinel, the null of the list it is built at, where it was built as a null ref into an `i32` list. An element read of a `(string[] | i32 | null)[]` inside a function recovers its non-null union box, since that union's null is a tag, not a null ref. Both were check-clean invalid wasm. Five `matrix/` templates grade them: the niche field 31 invalid → RUNS, the boxed read 30 invalid → RUNS, 0 `runs → not-runs`.
+- **D16270, D16271, D16280 closed:** three clause-1 regressions of closed rows run again. A
+  binding holding a tagged set's id, listed in a list pinned at a closed function type, is its
+  member's closure there; a list a write closes keeps that signature only when every element
+  names a function; and the null test of a generic read out of a map through an alias reads the
+  map's value.
+- **D16124 closed:** an un-annotated function returning a map of a hole function, bound at an
+  annotated type beside a lambda of the same signature, runs instead of building an invalid module.
+- **D15940:** an un-annotated map of an un-annotated function can be pushed onto, or set into, an
+  annotated holder at one signature while another holder needs the function at another.
+- **D16121 (containment):** a function read back through an un-annotated map of maps, and called
+  only there, refuses at emit again instead of trapping at run time when another function of that
+  signature exists. Filed D16124.
+- **D16121 closed:** a function read back through an un-annotated map of maps runs when that read
+  is its only call, and the containment helpers that refused it are gone.
+- **D16200 closed:** a `for` loop over an un-annotated map of maps calls the inner maps' un-annotated
+  functions at the loop's own read-back signature.
+- **D16105 closed:** a record wider than a name's own, written into the name under `&&`, `||` or a `while` condition and used as a value, is the value. `const t = k < 5 && yOf(a = nb()) > 0` prints `true`, the call runs once, and a field read of the value works too. The name's re-read of the stored object is cast back to the wider record's row, which its `sub` chain extends.
+- **D15158 closed:** a refusal raised while the global section writes a module cell names that
+  cell's declaration (`file:2:7`) instead of the file alone. Of the lane's five position rows,
+  D15154, D15155, D15157 and D1519 had already closed and still hold.
 - **D15943:** a list literal of un-annotated maps of un-annotated functions can be pushed onto, or
   set into, an annotated list of lists of maps.
 - **D16161 closed:** a map whose value is a list of records holding un-annotated functions that nothing calls builds, taking each function's default instance as a map of the bare records does. `m["k"] = [{ f: inc0 }]; print(m.has("k"))` prints `true`; it was a check-clean `unsupported map value type`. D16162, a record nested in the map's value, is filed.
@@ -2487,6 +3143,14 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## CLI (Track C)
 
+- **D16472 closed:** the native host prints every f64 as JS `String(v)` does: the fewest digits
+  that round-trip, then the closest, then the even digit on a tie. 2^-24 prints
+  `5.960464477539063e-8`, not the 17-digit exact value, and so do the other powers of two whose
+  shortest form lies in the narrower gap below. `tests/vl_host_float_print_test.ts` compares the
+  host with V8 over 11,208 values.
+- `vl check`/`fmt`/`test` over a directory walk a user's `dist/` and `reference/`; only `node_modules` and `.git` are skipped (`--exclude` drops any other). The draft Homebrew formula is deleted and backlogged, and ci.yml's editor-suite step fails on a missing seed instead of skipping (`seedPresent`, tests/support/tree.ts).
+- **The seed's compiled form lives only in the private seed cache (owner ruling, option C):** `vl` reads and writes the on-disk seed's `.cwasm` only in `$VL_SEED_CACHE_DIR` (default `seed/` under the user cache), keyed by the seed's content, never beside the seed in a checkout, so a `.cwasm` committed to a cloned repository is never run. `vl seed --cache-dir` / `--cache-files` name the directory and a seed's entries; CI caches `$RUNNER_TEMP/vl-seed-cache`.
+- **The seed's `.cwasm` sidecar is read only from a private directory:** a seed whose directory another user owns, or that group or others can write, now runs uncached with one stderr line saying why. It used to deserialize any sidecar present there as native code. A sidecar committed to a checkout the user cloned is still trusted; the per-user HMAC seal that would close that is an open ruling.
 - **The native host answers `EPERM` for an operation the OS refuses as not permitted, and `EACCES` only for a permission the file's mode denies (owner ruling (a), 2026-10-15).** Rust reports both POSIX errnos as `PermissionDenied`, and the host folded both into `EACCES`, so `std:fs`'s exported `EPERM` was never returned. A write to `/proc/self/uid_map` now prints `EPERM (operation not permitted)`; a read of a mode-000 file still prints `EACCES (permission denied)`. Every Windows "access denied" stays `EACCES`. (`tests/vl_std_fs_permission_test.ts`)
 - **Two `hint` lints for the slips sunpa's agents make, and a guide page on writing binary files (lane LG, sunpa item b).** `float-list-as-vector` fires on a 2–4-element `f64[]`/`f32[]` literal that is returned from a non-exported module function whose literals agree in length and whose every caller reads the result only at fixed indexes, passed to a parameter its callee reads only as `p[0]`…, or bound to a local read only that way, and suggests a record, which a non-escaping use scalarises where the list allocates. `shift-mask-is-logical-shift` fires on `(x >> k) & mask` exactly when the mask keeps the low `w - k` bits of a visibly `i32`/`i64` `x`, and suggests `x >>> k`. On sunpa's tree they fire 81 and 2 times, every one a vector, colour or quaternion, and the two `clubmesh.vl` hashes; on `compiler/`, `std/` and `bench/`, 0. `operators.md` gains an "Unsigned shift / logical shift right" section, and `guide/writing-bytes.md` writes a PNG from `vl run` with `std:fs`.
 - **An opt-in whole-compile file cache: `VL_COMPILE_CACHE=1` serves an unchanged `vl build` or pooled `vl test` file from `<cache dir>/compile/` (lane CA, incremental-compilation-design.md S1).** The key is the seed's SHA-256, the host's build id, every keyed `VL_*`/`BINARYEN_*` variable, what the host stages, and a transcript of every module the compiler was handed, replayed against the filesystem without a guest. On a sunpa snapshot an unchanged `vl test src/` went from 28.2 s to 0.19 s and a `vl build src/game.vl` from 9.2 s to 0.01 s, byte-identical; `VL_COMPILE_CACHE_VERIFY=1` re-compiles every hit and exits 71 on a difference. Off by default.
@@ -2551,6 +3215,7 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## LSP / editor (Track D)
 
+- The LSP's workspace crawl walks a user's `dist/` and `reference/`, as `vl check` does; it skips `.git`, `node_modules` and `.claude`.
 - **The playground adapter gains the three import-editing behaviours a feature LABEL hid, closing ROADMAP row 32.** `SUB_GAPS` in `playground_lsp_parity_test.ts` tracked three helpers the Node LSP composed and the playground did not, each under a row the parity table graded as IN parity — so the label was green while the behaviour was missing. All three now land in `lspAdapter.ts`: **std auto-import completions** (`stdAutoImportCompletions` over a browser twin of `stdExportsForCompletion` — the embedded `STD_SOURCES` map read once per module surface, an unimported std name offered with its `import { … } from "std:…"` rewrite as `additionalTextEdits`); the **missing-UFCS-import quick-fix** (`ufcsImportFixes`, the candidate modules straight off the diagnostic's `data.modules` — no second query, the checker decided at the raise); and **organize imports** (`organizeImportEdits` behind a new `organizeImports` export, dropping every redundant specifier — unused AND duplicate alike — and reprinting the survivor through the seed's formatter, wired as a Monaco `source.organizeImports` action). Each `SUB_GAPS` row is PROMOTED to a positive `subBehaviours` assertion that both hosts compose the symbol, so the parity table now grades the behaviour rather than the gap. New suite `tests/playground_import_actions_test.ts` (6 cases, in ci.yml's editor-features list) drives the pure adapter exports against the real seed with the browser's own `std:`-resolving reader wrapper; no `compiler/*.vl` or seed change.
 - **A runtime trap in the playground names the trapping line, the same block `vl run` prints (ROADMAP row 22; row 27's error-surfacing residue).** The native and Deno hosts already join a trap frame's byte offset against the emitter's `vl-src` custom section to print `at <line>:<col>  in \`fn\``; the browser caught the trap and showed only `Runtime error: <message>`. **The row's own framing was stale and is corrected here: the section did NOT already exist for the browser.** `emitSrcSection` rides `gEmitNames`, and only the native host on `--names` calls `setEmitNames` — the browser's `compileSrc` runs with names OFF, so its module carried neither the `vl-src` section nor a name section (measured: a no-`--names` build has neither; `--names` has both, +239 B on a 1.8 KB module). The fix enables names ONLY around the run-path `compile` (a new `WasmChecker.setEmitNames`, off by default so editor-keystroke compiles stay lean and every golden emit is byte-identical), moves the host-agnostic reader from `tests/support/vlSrcSection.ts` to `compiler/vlSrcSection.ts` so the playground and the test hosts share ONE copy (a re-export shim keeps the old path), and joins `sourceFrames(wasm, err.stack)` in the Run path's catch. **The row's named risk — that Chrome formats the wasm frame differently from Deno's V8 — did not materialise: V8 is V8, and the existing `wasmFrames` regex resolves `at boom@3 (wasm://wasm/…:wasm-function[0]:0x118)` to the same `["at 7:3  in \`boom\`", "at 11:1  in \`__start__\`"]` block both other hosts print.** New suite `tests/playground_trap_frames_test.ts` (3 cases, in ci.yml's editor-features list) asserts the SAME expected block the Deno suite asserts, so the two readers cannot drift; no `compiler/*.vl` or seed change (the reader and the toggle are TS, `setEmitNames` was already an export).
 - **The playground offers UFCS methods, and the parity table can now see a behaviour a feature LABEL hides.** Its member path was `memberCompletionsFromWasm` alone: `x.f(…)` over a free `function f(self: T, …)` was offered by the Node LSP and by nothing in the browser, so there was no panel to carry the method's `///` either. It now runs `ufcsCandidatesAt` on the same repaired source and composes through `ufcsCompletions`, with the field scan's names as `taken` — a field of the same name wins at a real call. The doc rides `UfcsCandidate.doc`; no new query. **The instrument is the point**: `playground_lsp_parity_test.ts` graded ONE marker per feature, so "completion" read green on both sides for months while this half was missing. Rows now carry `subBehaviours`, and a new case asserts each named behaviour is composed by BOTH hosts — it reds against master's adapter and passes on this one. **Which other labels hide more than one behaviour, measured rather than guessed** (grepping both files for the composing symbol): "completion" also hides `stdAutoImportCompletions` (server 4 uses, adapter 0) and, once the type-name source lands, the type namespace; "code actions" hides `ufcsImportFixes` (server 2, adapter 0) beside the quick-fixes both have; "document formatting" hides `organizeImports` (server 1, adapter 0), though that row already declares its export missing. The two still-missing behaviours keep ROADMAP row 32. The pin in `tests/lsp_ufcs_docs_test.ts` becomes the feature assertion: the playground offers `twice` with its prose, `plain` with the bare fence, and both fields beside them.
@@ -2661,6 +3326,295 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **playground: code-split binaryen off the initial load** — with codegen on the seed, binaryen (~13 MB) is reached ONLY via the lazy `import("binaryen")`/`import("./toWasm.ts")` behind `wasmToWat` (the WAT renderer). `build.ts` now enables esbuild `splitting` (`outdir` + object-form `entryPoints` → `playground.js`), so binaryen lands in its own `chunk-*.js` fetched on demand when the WAT pane is first shown — not on page load. The entry `playground.js` drops from ~22 MB to ~2 MB (the rest is lazy chunks: Monaco's on-demand features + the binaryen WAT chunk). `pages.yml` ships the chunks (`dist/*.js`); `index.html` still loads only `playground.js` + `playground.css`. WAT stays a feature (binaryen disassembling the seed's bytes), just off the critical path.
 
 ## Infrastructure (Track F)
+- **`docs/guide/return-rule-migration.md`:** what `vl check --fix` writes for the hybrid return
+  rule, and the four shapes a repository outside this one fixes by hand.
+- **VL embedded outside `.vl` files speaks the hybrid return rule:** 32 test suites' VL literals,
+  6 lint, LSP and budget fixtures repinned for the 7-column shift, and 24 docs code blocks
+  (fences and filed repros) write `return` where the flag day's migration missed them.
+- **Which writers move `tyMutEpoch` during emit** (type hash-cons stage 4e, a census; docs only).
+  Over 19,779 files, three writers bump it during emit, in 194 programs: `applyGenAliasTys` (P6
+  removes it), `tyPinElem` and `inferRetPublish`. The emitter's epoch reads delete together once
+  those finish before emit.
+- **The emitter's memos stamp with an emit epoch** (type hash-cons stage 4f, the per-instance
+  seal): `tyMutBump(row, hole)` is now the only writer of `tyMutEpoch`, at all 13 sites. It also
+  advances `tyEmitEpoch`, except for a write to a row or hole minted inside the innermost open
+  mono re-check or acyclic alias application, which no emit memo can have read. Over the corpus
+  no emit-phase write moves `tyEmitEpoch`, and output is byte-identical.
+- **An emit-phase write the emitter's memos could have read is an internal error** (type hash-cons
+  stage 4f, step 3a): a `tyEmitEpoch` bump between `elabPrepare` and the end of `emitProgram`
+  fails the build loudly instead of leaving a stale memo. Over the corpus there are none; output is
+  byte-identical.
+- **Distilled baseline refreshed** from a fixpoint seed of master `fedd29c30`: `dord030` (check-clean invalid wasm, D16281's witness, fixed by #8311) and D16278's `d16278_indexed` and `d16278_witness` (loud check reject, fixed by #8338) now record `runs`; no other cell moved.
+- **Four destination-bound capability matrices:** a nested function result, a record of functions, a generic method's function parameter, and a list, nullable or map of functions, each with its type parameter bound only by the destination. On master every annotated delivery position runs except `return_inferred`, which traps (D16562's position). D16590 is filed for a generic function at a field of a record literal argument, which is refused where a list literal runs.
+- **The oracle agrees with the last five red arith fuzz cells and one trap**, in four families, all oracle-side:
+  - an `f32` join folds its float constant arm at `f32` (4.3, Q9);
+  - Q8's constant-count rule holds beside an `i32` peer;
+  - `as f32` rounds an integer constant (4.1);
+  - a radix `/` traps on `INT_MIN / -1`.
+
+  On a 6,000-cell arith fuzz, 96 cells move, all improvements, and only the known D16472 still differs.
+- **The arithmetic fuzz generator no longer emits what the design refuses.** Each subexpression
+  that reads no variable is run in the oracle, at its type, before it is kept.
+  - The share `vl check` refuses falls from 59% to 4%, and real tests from 771 to 1,793 per
+    2,000 cases. The ceiling falls from 62% to 6%.
+- **The oracle refuses what E6.2 and D2.3 refuse:**
+  - a constant shift count that is negative or out of range;
+  - a constant integer zero divisor.
+- **The oracle fixes nine width and join readings** that the new programs reached (refactor note).
+- **Three compiler rows**, all `vl check` rc 0:
+  - D16496: a nested literal join builds invalid wasm.
+  - D16497: a float join in `min` or in a constant tree does not adopt `f32`.
+  - D16498: a radix `/ % << >>` arm is computed at 32 bits in an `i64` join.
+- **The oracle follows four cast and adoption rules it skipped** (T's discovery list):
+  - A radix pattern wider than 32 bits is `i64` at an `i32` use (T2.3).
+  - A constant that does not fit its `i32` peer widens the peer (D3043).
+  - A constant stored into a declared container is typed at its element.
+  - `as%` to a float, and a constant cast that can never succeed, are refusals (E8.4, E8.2).
+- Distilled corpus: AGREE 11142 → 11149; arith fuzz subset 1593 → 1648, all AGREE.
+- **The oracle fuzz matches a filed wrong value by its row, not its cell id.** A known.txt line
+  `D<id>  (emulated)` names an open row whose compiled reading the oracle can reproduce
+  (`emulating`, interp.ts). A DISAGREE that exactly one such emulation explains is FILED-WRONG,
+  counted per row, on any seed. D16497 and D16498 are the first two, at 13 lines of interp.ts.
+  A smoke test fails once an emulated row closes, so the closing PR deletes its emulation.
+- **The oracle's VL inputs follow the return rule (#8383).** Three templates still ended a
+  block body in a bare value, so every program built from them was refused at check and agreed
+  vacuously:
+  - `gen_data.ts`'s `mk` (all 2,000 data cases);
+  - `gen.ts`'s `tr_<type>` helpers (all arith cases);
+  - `join-grid.ts`'s `kind` (all 64 cells), and the `argf64` position of `radix-float-grid.ts` (26 cells).
+
+  Each now writes `return`.
+- **The oracle never counts a checker refusal as agreement.** A program `vl check` refuses is
+  AGREE only when the oracle refuses it too. One the oracle runs is REFUSED, a column of its own.
+- **`fuzz.sh` fails a generator whose share of refused cases passes a ceiling.** The default
+  ceiling is 2%.
+  - The pre-#8430 data generator (100% refused) now fails the run.
+  - arith (59%) and hof (5%) carry named ceilings until they are triaged.
+- **The oracle fuzz separates a filed refusal from a miscompile.** A compile that fails with a refusal a
+  `scripts/oracle/known.txt` row names (`D<id>  <fragment>`, one line per row) is `REFUSED-FILED`,
+  counted per row. A trap or a wrong value is still `COMPILED-BAD`. A 1,000-case `hof` run:
+  627 AGREE, 371 REFUSED-FILED (D16412 357, D16411 14), and 2 COMPILED-BAD, both now filed as
+  D16493, a compiler trap.
+- **The oracle reads `0xFFFFFFFF as% i64` as `4294967295`**, per D3053's ruling (A) (a bare radix
+  literal or a negation chain over one). Another radix tree under `as% i64` is a SKIP: the compiler
+  reads those two ways depending on the operator, filed as D16494 for a ruling.
+- `known.txt` drops `ar_s26_0112` (D16472 closed by #8314; a host built from master agrees).
+- **The oracle checks `u8`'s domain on a constant cast.** `300 as? u8` is `null`, and a radix
+  constant is checked at its 32-bit pattern (E8.3). `u16`, `u32`, `i8` and `i16` are no cast
+  target (T1.1, T1.3). A bare `as` that fails at module scope is a refusal, not an oracle crash
+  (E8.2). The oracle now prints T's `cast-join-bounded-tails.vl` fixture as it expects.
+- **L5 step 3 re-measured** (docs): the generic rollback-family registry nets about −15 to +20
+  lines after `vl fmt`, not the design's −900 to −1,300, and is not scheduled; steps 3a–3c
+  delivered −31 net plus 3b's +46 mechanism for lane relate's P3.
+- **Medium 6 step 6.4 scheduled after L1's I8** (docs): the 13 between-pass pin functions overwrite
+  a declaration with a minted annotation; making them CheckRun facts would touch every annotation
+  read (`letType` 488, `parType` 440, about 70% in the legacy emitter), so it waits for I8.
+- **`arena-write-after-lower` ratchet** (medium 6 step 6.3): a lint counts every write into an
+  existing node outside the resolve-time lowering (slot writers and node-field stores), 259 in 32
+  files, against `scripts/arena-write-budget-baseline.json`, whose count may only fall; the node
+  field list is re-derived from `ast.vl` by `tests/vl_arena_write_fields_test.ts`.
+- **Review medium 6 designed** (docs): the checker's 276 arena writes are classified PRE (18
+  functions), MID (52) and POST (19); PRE becomes a resolve-time `lowerResolved` pass, POST retires
+  into L1's builder at I9, and L5 step 5's deletion is gated on I9. A redirect in `nodeAt` was
+  measured at +2.27% fuel and rejected.
+- **`arena-write-after-lower` shares `literal-byte-write`'s line scanner** (medium 6 step 6.3
+  follow-up): its node-field and lowering-function lists are packed strings, so the rule costs
+  +84 compiler lines rather than +118; the count is unchanged at 259.
+- **`scripts/silent-sweep/distilled/ir-shadow.vl`:** the IR shadow summed over every distilled
+  cell, in about 15 s. It exits 1 on a verifier failure or on a mismatch class above
+  `ir-shadow-baseline.txt`, and `--write-baseline` records the counts. It is not in `gate.sh`
+  yet. `vl check --codegen` now prints the `[ir]` rows `vl build` prints.
+- **The first fuzz-nightly run on GitHub, triaged:** the job works end to end. Of its 20 new oracle disagreements, 9 are the known D2617 radix-width class and three are new compiler rows: D16471 (`>>` over a negated radix literal computes at 64 bits), D16472 (the native host prints 2⁻²⁴ with 17 digits) and D16473 (`as f64` over a literal join reads a radix arm as its pattern). The other 8 go to lane O.
+- **Rep ADT 2a, batch 2:** `forceCloListOfTy`, `readMayBeString`, `tyRepsAsNulAtom` and
+  `mvValKindOfTy` stop asking the rep tree a template's own type parameter, with 0 module bytes
+  changed: `docs/internals/refactor-notes/2026-11-15-rep-adt-stage2-plan.md`.
+- **Rep ADT 2c, step 2:** the field-code fallback for a storage type with no rep is deleted, and
+  six readers of a rep's kind stop restating the `null` answer (−17 compiler lines, 0 module bytes
+  changed): `docs/internals/refactor-notes/2026-11-15-rep-adt-stage2-plan.md`.
+- **Rep ADT 2b and 2c, step 1:** a rep descriptor's kind is `VKind | null`, and `null` is the
+  answer for no value. The `rdCovered` protocol and its `i32` default are deleted, with 0 module
+  bytes changed: `docs/internals/refactor-notes/2026-11-15-rep-adt-stage2-plan.md`.
+- **Rep ADT stage 3a:** a default-off shadow (`$VL_REP_SHADOW`) compares each struct row field's
+  stored code with the code its storage type's rep derives. 14,694 of 14,698 corpus field rows
+  agree, and the 4 that do not are a generic template's open rows:
+  `docs/internals/refactor-notes/2026-11-15-rep-adt-stage3a-shadow.md`.
+- **Rep ADT stage 3 design:** field codes become a projection of each field row's storage type
+  through the rep tree, in five steps (shadow, total storage types, derived code, sidecar
+  projections, rep-matching consumers): `docs/internals/refactor-notes/2026-11-15-rep-adt-stage3-design.md`.
+- **A layout id, shadowed against the rep tree** (type hash-cons stage 4a): `tyCanonLayout` keeps a
+  union alias, a nullable, a one-member union, a tagged function and a brand apart where
+  `tyCanonSpelled` folds them. Under `$VL_ID_SHADOW` it is graded one-way against `repTreeOfTy`,
+  which may split an id but never merge two. Six new `@run` cases cover `tySameSpelled`'s equal
+  side and the literal-union alias. D16435 is filed.
+- **`tySameSet` and `tySameSpelled` compare canonical ids** (type hash-cons stage 4b): each is
+  one `==` on `tyCanonSet` or `tyCanonSpelled`. Their walks, pair stacks, walk budgets, depth
+  argument and pair memos are deleted (net −334 compiler lines). Output byte-identical.
+- **Mono instance keys spell a type by its set id** (type hash-cons stage 4c): `tyCanonKey(ty)` is
+  `"#" + tyCanonSet(ty)`, so a key part is one interned id. Its walk, memo, budget and depth
+  argument are deleted (net −156 compiler lines). One program loses a duplicate instance; every
+  other output is byte-identical.
+- **A type's rep id, `tyRepId`** (type hash-cons stage 4d): the layout id with a record's union-arm
+  status folded in at every depth, for lane E's `repOf`. It replaces `tyCanonLayout`. Graded
+  one-way against the rep tree, it leaves no merge in the corpus; the layout id left 20.
+- **D16490 filed, with three oracle cases:** the oracle found that a literal `let` stored an `f32` becomes `f64` when a float literal also joins its stores (`t = f; t = t - 0.1`) or when the literal is a float (`let t = 0.0; t = f`). The compiler prints `1.4` where ruling 4.3 at stores gives `1.399999976158142`. `scripts/oracle/ruling-grid.ts` gains the three cases.
+- **The oracle grades D16410 and D16293 (a):** a call refuses a type parameter that no argument's parameter names unless its destination type binds it (D16410), and `scripts/oracle/ruling-grid.ts` holds 20 cases across both rulings, with `write` and `check` modes to grade a compiler recording. On master, the compiler agrees with all 9 D16293 (a) cases and with D16410's 2 no-destination refusals. D16410's 9 destination-bound faces wait on its fix.
+- **The oracle computes a radix tree at its use's width (ruling A):** a width-dependent radix subtree keeps its 64-bit reading for an `i64` use that only becomes known later, a radix `if` arm beside a decimal arm outside `i32` is `i64`, and a shifted constant in `min`/`max` takes a typed argument's width. The 7 arith cells lane N named agree now, including the 2 traps. `known.txt` loses its D2617-class block. A 6,000-cell arith fuzz moves 10 cells, all improvements.
+- **`ls.vl --next` and `--reserve` see unmerged branches:** each also skips, or refuses, every id a
+  fetched `origin/*` branch adds a row or a reservation for beside `origin/master`, naming the
+  branch, so two lanes whose branches have not merged no longer take the same block. A claim whose
+  work has landed (an id in it is filed) is ignored. Fixture test in `vl_inventory_ls_test.ts`.
+- **`scripts/oracle/fuzz.sh` fails on COMPILED-BAD:** a cell whose compiled program traps, fails to load or prints a wrong value where the oracle runs now exits 1 unless `known.txt` lists it, as a new disagreement already did; `fuzz-sweep.sh`'s oracle leg keeps those cases in its artifact. The two oracle-side traps from the 2026-11-15 arith triage are listed.
+- **fuzz-nightly, proposed nightly:** one `fuzz-sweep.sh` over every leg at 50 seeds on a 4-vCPU runner, each leg gating, red only on an unsound finding no open row files (`fuzz-nightly.sh --filed`, `fuzz-sweep.sh --gate-all`); row drafts ship in the artifact.
+- **The capability matrix and probes compare a want with the whole output, each line exactly.** Before, a want could be any substring of the output, so `-2147483648` graded RUNS against `2147483648`; `X twice` accepted one `X`; and only the last of several `// want:` lines counted. A re-grade of all 1,344 templates (76,702 programs) and 247 probes flipped 321 cells. Each one printed a correct line its want had left out, and those wants now name the whole output.
+- The `l3-record-param-width` named set now holds both faces of the 16 record-width cells the rewrite carries; L3 PR B (folding D14532 into the row slot) is dropped as a soundness regression, and D14532 stays rep-keyed.
+- **Rep ADT 2a, batch 1:** annotation kinds, signature kinds and a generic's result row stop
+  asking the rep tree a template's open type parameter, which it can only answer as uncovered.
+  Open-type queries during emit fall from 10,831 to 4,259 over the corpus, with 0 module bytes
+  changed: `docs/internals/refactor-notes/2026-11-15-rep-adt-stage2-plan.md`.
+- **Rep ADT stage 2, re-planned from a measurement:** the flat kinds are mostly tree projections
+  already. 99% of the queries the tree answers uncovered during emit are a generic template's open
+  type, attributed to their call sites as the order of the conversions:
+  `docs/internals/refactor-notes/2026-11-15-rep-adt-stage2-plan.md`.
+- **Two open children that meet become one hole** (type hash-cons stage 2c-1): a pin of either
+  answers both. D16340 closes (a reassigned unwritten `Set()`), and three D16301 declaration-order traps run (`dord026`–`dord028`).
+- **Every type-arena row read goes through `tyAt`** (type hash-cons stage 3a): the 176 direct
+  `T.tys[x]` reads, so the arena has one reader. Output byte-identical. The hash-cons design note
+  records the revised stages 3–5: intern at seal, emit side first, checker side with L2.
+- **A type's canonical id** (type hash-cons stage 3b): `emit_ty_seal.vl` interns each type
+  bottom-up through `intern.vl`, as `tySameSet`'s equality (`tyCanonSet`) and as `tySameSpelled`'s
+  (`tyCanonSpelled`), with no render. A recursive declaration is cut at its name. Under
+  `$VL_ID_SHADOW` it shadows the three emit comparers and reports `canon` agreement rows. With the
+  shadow off, output is byte-identical.
+- **A position-matrix template can state its un-annotated face's answer:** `@@WANT_UNANNOTATED@@` (scripts/capability-probes/README.md) applies where that face leaves the value open, and the three empty-literal `is` templates use it for D16047's vacuous `0`, so their grades go from 36/36/36 of 64 to 64/63/62. Files D16432 (an inline `Set()` value of an open `Map()` is refused at emit) and D16433 (a re-pointed `let` of an open `Set()` tests as `Set<i32>`).
+- **The oracle follows rulings 4.1 (clarified) and 4.2:** a radix literal at a float destination or peer must be exact there (only `as f32`/`as f64` rounds), and a radix constant tree read at an `f64` computes at 64 bits with integer division; radix `/`, `%`, shifts and bitwise operators now run at their use's width instead of declining. Spec T2.3 says both; the arith fuzz subset grows from 1096 to 1234 of 1600, and six stale `known.txt` lines go.
+- **The oracle models shift typing (Q8) and `is` on an empty container (ruling 4.4, #8222):** a shift's count never types its left operand, and a constant count of 32 to 63 widens an untyped left to i64; a container remembers the type it was built at (its annotation, or the first union arm an empty literal reached, through elements, fields and map values), and `is` on an empty one reads it, a never-delivered one matching vacuously. #8222's empty-container matrices go from 0-36 of 64 in the subset to 61-64 agreeing.
+- **`scripts/fetch-seed.sh` no longer keeps a stale seed** (external report AE-003): a present
+  seed without a `refresh-compiler.sh` provenance sidecar is compared with the release's
+  `.sha256` (or `seed-v0`'s pinned hash) and refetched on a mismatch, printing which; one it
+  cannot check fails loudly unless `VL_SEED_OFFLINE=1`, and a local build is left alone.
+- **The checker's rollback site sets are named compositions** (engineering review Small 7): each
+  `RB_*` set in `check_rollback.vl` is the `|` of the families its comment names, over one
+  `RB_CSTR` for "every constraint family", instead of a bare sum such as `2799615`.
+- **Self-compile fuel ratchet tightened:** `scripts/self-compile-time.sh` now reds on an L2 rise past +1% of its baseline. A rise is accepted with `--write-baseline` and a line in `scripts/self-compile-ledger.txt`, and the baseline is rewritten at 86.42G with today's attribution (#8072 +2.72%, #8080 +0.98%).
+- **D16384 bucketed (c):** an un-annotated parameter's type-bound member call is an acceptance row of L2 inferred interfaces, not a spot fix (`2026-11-14-clause2-architecture-map.md`).
+- **D16336** is bucket (c)'s acceptance row (L2 inferred interfaces), re-ablated on master.
+- **Distilled re-baseline:** 74 named cells move loud check reject → runs, all from #8222 (an `is`
+  that can never match is a warning, D16047 ruling): the 72 `d228w_*` cells and the `nj2` pair
+  `nj2_li__lit5_rtf32_rt{f64,i64}__isi32__op`, whose expected output is now `false`.
+- **Oracle-fuzz triage, 2026-11-15:** a 50-seed oracle sweep's 17 UNSOUND and 34 DISAGREE verdicts, ablated: three compiler rows (D16318, D16319, D16390) and eight oracle-bug families passed to lane O.
+- **Unprobed `--sites` ZERO rows, probed:** five refusal sites graded with their plainest programs; three are live (D16391, D16392, D16393) and one more defect was found beside them (D16394). Four new capability probes and a `live-sites.json` row.
+- **D16365 traced:** the row names its mechanism (a hole parameter's list methods each deliver
+  into a type variable, so a second record's empty list field links to nothing) and its
+  acceptance owner, lane H's stage 2b. The new `hole-param-record-empty-list-field.matrix.vl`
+  is its acceptance grid.
+- **Rep ADT: declared rows no longer rebuild the rep tree.** A pending-row change drops the tree
+  only where an answer the tree consumed moved. The self-build builds the tree once, and corpus
+  rebuilds after the passes phase fall from 1,500 to 107, with 0 module bytes changed:
+  `docs/internals/refactor-notes/2026-11-15-rep-adt-declrows.md`.
+- **Rep ADT stage 1b:** a record is a union arm in the rep tree by the checker's member set or
+  elaboration's union-arm types alone, never by the emitter's own variant rows, so its rep is a
+  fact of its type. Elaboration's arm prime now walks nested types and counts a record boxed
+  beside any member. `never` is a node of its own. Byte-identical over all 12,013 corpus cells;
+  the self-build's tree rebuilds fall from 70 to 12.
+- **Rep ADT: the variant axis no longer rebuilds the rep tree during emit.** A whole reset of the
+  variant table re-adds the same checker and elaboration bits, so only a bit new to the program
+  drops the tree. Corpus rebuilds after the passes phase fall from 26,494 to 1,500, with 0 module
+  bytes changed: `docs/internals/refactor-notes/2026-11-15-rep-adt-stage2-gate.md`.
+- **One openness test for a type's children** (type hash-cons stage 2b API): every list-element,
+  map-key and map-value `< 0` / `>= 0` comparison calls `tyOpen(child)`, and `mkTyVarSlot` keys
+  its binder through `declKeyOf(node)`. Output byte-identical.
+- **An open collection child is a hole, and a pin solves it** (type hash-cons stage 2b): list
+  elements, map keys and values are read through `tyElemOf`/`tyKeyOf`/`tyValOf` and tested with
+  `tyOpen`, and the 33 empty-collection pins write a hole column instead of the row. Output
+  byte-identical.
+- **The oracle gains a data generator:** `scripts/oracle/gen_data.ts` (`fuzz.sh --gen data`, and `--gen all` in fuzz-sweep's `oracle` leg) generates records, lists, maps, closures, loops, strings and evaluation-order probes. 10,000 programs all build, run and agree with the oracle; the sweep fixed the oracle's own plain-assignment order (place before value, E10.1) and its trailing-empty-line reading.
+- **The oracle gains a higher-order generator:** `scripts/oracle/gen_hof.ts` (`fuzz.sh --gen hof`, and in `--gen all`) generates generic and un-annotated functions handed through higher-order generics, re-pointed lets, collections of closures, and random declaration order. 0 disagreements; its COMPILED-BAD cells reduce to four filed families, D16410 (a generic delivered through `sel<A>(f: (x: A) => A)` traps), D16411, D16412 and D16413.
+- **The oracle's literal model, fixed from lane B's 50-seed triage (O1–O8):** an `if` of constant arms adopts its use's type without joining an exact tree; integer division of constants by zero traps; a radix constant beside an i64-default constant reads at i64; a constant operand takes its typed peer's type; a block body's tail has the return type as its context. On the same 50-seed run, disagreements fall from 51 to 5, all the radix-in-join class held for spec question 2.
+- **A radix literal in a float context is the value its digits spell** (owner ruling 4.1, revised): spec T2.3 says so, the oracle models it, and `scripts/oracle/radix-float-grid.ts` writes the 182-cell acceptance grid, which today's compiler meets on 138 cells (lane N moves the rest). Radix constant trees at a float wait on ruling 4.2.
+- **The phase-state census leaves the type arena's accessors out of checker surface**: imports of
+  the `TY_ARENA_API` list (`tyPin*` today, lane H's child accessors with stage 2b) print as `arena`;
+  a listed name `check_types.vl` stops exporting fails the census.
+- **Capability probes:** `union-eq-closure-arm.vl` asserts the narrowed `===` spelling A15
+  leaves legal, not the `==` A15 refuses; D14082 is bucket (e)'s acceptance row for
+  `lambda-record-result-at-generic-union-return.vl`.
+- **Fuzz triage, 2026-11-14:** a 50-seed sweep's 16 unsound shapes, ablated: 12 are D16310, and four new rows file the rest (D16314 loud, D16315, D16316, D16317; D16315 and D16317 closed by #8125, D16316 by #8134). Named set `fuzz-2026-11-14b` (16 cells); `scripts/fuzz-filed.txt` lists each shape an open row files.
+- **`fuzz-sweep.sh` drafts its findings:** each unsound finding gets a ready-to-file inventory row,
+  `keep_<seed>/case_N.row.md`: minimised, de-duplicated, graded-as-filed, with its seed's repro and
+  a family guess (`scripts/fuzz-draft-rows.sh`; `--no-drafts` skips it).
+- **The distilled index refuses an ungraded cell:** `index.vl --check` and `regress.vl` exit 2 on
+  a `cells/` or `named/` cell whose `manifest.json` names no expected stdout, which the grader
+  used to skip without a word.
+- `index.vl --check` (and every distilled tool that audits the corpus) now refuses a `manifest.json` `expect` entry with no cell behind it, the reverse of the cell-with-no-expectation guard.
+- `scripts/oracle/fuzz.sh` runs its cases through `vl run --batch` in chunks of 2,000, so a 50-seed sweep (30,000 cases) no longer overflows the argument list.
+- **Rep ADT stage 1, the tree as records:** the rep tree's eight parallel columns become one arena
+  of nine `RepNode` record kinds, matched exhaustively and hash-consed through a second
+  `Interner` (now a record in `compiler/intern.vl`). Byte-identical; stage 0's 16 `VKind`
+  disagreements are triaged, none a miscompile: `docs/internals/refactor-notes/2026-11-14-rep-adt-stage1-arena.md`.
+- **Type parameters carry their declaration slot** (type hash-cons stage 1a–1d): `tySame` and the
+  nested-generic test read `(binder, idx)` off the row, so `tyVarDeclOwner`, `tvNestOf` and
+  `markNestRows` are deleted; `mkTyVarSlot` and a per-slot bound table serve L3's row variable.
+  Output byte-identical.
+- **Every empty-collection pin goes through one writer** (type hash-cons stage 2a): the 33 in-place
+  element, key and value pins call `tyPinElem`/`tyPinKey`/`tyPinVal`, so `tyMutEpoch` has 13 bump
+  sites instead of 43. Output byte-identical.
+- **The oracle's second arithmetic sweep files three rows:** D16374 (a parenthesised value `if` of constant arms at a wider destination or operator peer emits invalid wasm, the spelling D16373's grading list named), D16375 (`(-7 % (65536 * 65536)) >>> 1` is computed at i32 and traps on a divide by zero), and D16376 (a parenthesised `if` joining a radix constant with an i32 value, beside an i64 peer, emits invalid wasm).
+- **The sweep's oracle step stops failing every labelled PR:** `oracle.ts recording` now reads the distilled manifests, so a known `runs but wrong value` cell (the oracle prints the expectation, the compiled program does not) is COMPILED-BAD, not a new disagreement. With `--base` it also forgives a disagreement the base recording already has; `sweep.yml` passes `out/base.jsonl`.
+- **An independent oracle (review L6):** `scripts/oracle/` is a definitional interpreter for VL in TypeScript, with its own parser and plain dynamic values. It compares its output with the compiled program's: over a `sweep.vl` recording (the `sweep` label, 1.3 s for the distilled corpus, 96.0% of 11,929 cells in its subset), over `vl run --batch` output (`scripts/oracle/fuzz.sh`, the new `oracle` leg of `scripts/fuzz-sweep.sh`, with a new arithmetic/evaluation-order generator `gen.ts`), and over the spec's own `// prints` examples (`tests/oracle_smoke_test.ts`, 136 of 154). It ships in no binary. First findings: D16370 (`is C` over `A | null` passes a record missing C's fields), D16371 and D16373 (check-clean invalid wasm: a parenthesised constant `if` arm at a wide join, and `const y: i64 = if c { 7 } else { 9 }`); it also found the postfix `x++` bug #8094 fixes. Design and owner questions: `docs/internals/refactor-notes/2026-11-14-oracle-design.md`.
+- **The phase-state ratchet** (L5 step 0): `scripts/phase-state-census.vl -- --check` fails when a
+  compiler module gains a hidden-argument global (188 today), a cross-phase table (593) or a
+  checker import from another phase (1,166 distinct symbols), against
+  `scripts/phase-state-baseline.txt`; a gate row and a CI step, with a control test.
+- **Phase products and a session value, designed** (review L5): 544 of 4,876 module-scope tables
+  cross a phase, non-checker files import 1,166 checker symbols, and 188 globals are hidden
+  arguments (mono's instance builder has 15 beside its 11 parameters). `Session` owns the
+  interners and per-module `Parsed`/`Resolved`/`Checked`; an IR function is owned by its instance
+  in `Elaborated`. Eight byte-identical steps, starting with an explicit `InstReq` in mono and a
+  `FnCtx` in the emitter (about −6,000 to −8,000 lines):
+  `docs/internals/refactor-notes/2026-11-14-phase-products-design.md`.
+- **Native tests that clear their environment keep the seed cache:** `seedEnv()` carries `$VL_SEED_CACHE_DIR` with the ISA pin, so a `clearEnv` spawn no longer JIT-compiles the seed on every run (ci-native shard 4 took 263 s against 22 s).
+- **`check-filed-witnesses` refuses a stray `$VL_COMPILER_WASM`:** set to a seed other than
+  `build/vl-compiler.wasm`, it exits 2 instead of silently grading `build/`'s seed.
+- **D16209 traced:** the row names its mechanism (an open hole type on a call through a set of
+  hole relays) and its owner, the slot-store plan's stage 6. Two named corpus cells
+  (`d16209-hole-relay-set-call`) are its acceptance cells.
+- **`Rep` as an algebraic type, designed** (review medium 2): the existing rep tree promoted to a
+  13-kind hash-consed ADT that `VKind`, `FC_*`, `TSK_*` and eleven other encodings project from,
+  in nine byte-identical stages with lane J's 18 bucket-(e) rows as acceptance:
+  `docs/internals/refactor-notes/2026-11-14-rep-adt-design.md`.
+- **Rep ADT stage 0, the shadow and the rebuild counter:** `$VL_REP_SHADOW` now compares every
+  local, loop variable, parameter, result and global kind against the rep tree, and counts
+  whole-tree rebuilds by emit phase and cause. The readings are in
+  `docs/internals/refactor-notes/2026-11-14-rep-adt-stage0-shadow.md`. Unarmed, it moves no byte.
+- **The structural intern table is its own module** (`compiler/intern.vl`, type hash-cons stage
+  0): `hcIntern` moved out of `emit_rep.vl` unchanged, so the type arena and the rep ADT can share
+  one table. Output byte-identical; the seed is a fixpoint.
+- **Hash-consed types with binder identity, designed** (review medium 1): the 147,421-row
+  self-compile arena holds at most 15,979 distinct types; one intern table, holes as rows with a
+  solution column, a nominal key column for the 26 sidecars, and projections for the four
+  comparers, in six code-deleting stages (about −2,000 lines):
+  `docs/internals/refactor-notes/2026-11-14-type-hashcons-design.md`.
+- **The negative-type sentinel in `assignable`, counted:** 16 of 378 `assignable` / `assignableExpr`
+  call sites hand it a negative type on the corpus, in three shapes (an open type component, a
+  missing node record, a pending return); 211 corpus cases depend on the silent accept.
+  `docs/internals/refactor-notes/2026-11-14-assignable-negative-sentinel-census.md`.
+- **The 152 open clause-2 rows mapped onto the architecture items** (slot store, L3, L2, L1,
+  Rep-as-ADT / hash-consing, or a local fix) by ablated mechanism:
+  `docs/internals/refactor-notes/2026-11-14-clause2-architecture-map.md`. Filed D16300 (clause 1).
+- **`scripts/decl-order-ab.vl`:** runs every single-file `@run` case as written and with its
+  top-level functions moved last, and exits 1 when a case moves to a clause-1 outcome its
+  baseline (`scripts/decl-order-ab-baseline.txt`, 320 cases, 38 clause 1) does not record. The
+  38 clause-1 cells are the named distilled set `d16301-decl-order` (D16301).
+- **Three demand-spelling matrices:** `generic-body-arg-demand-spellings`, `hole-callee-scalar-arg-spellings`
+  and `covariant-write-generic-pin-spellings` grade D2425, D3225 and D1799 at every call spelling
+  (direct, method, through a hole, inside another generic, in a loop); all refuse. The three rows
+  lead with `closed <date> · `.
+- **The open queue reads true:** 32 rows that had closed (the witness gives the refusal the
+  design owes) but did not lead with `closed <date> · ` now do, and four open ones say `open`.
+  `tests/vl_inventory_rows_test.ts` refuses a status that records a moved outcome (`now …`) or a
+  design verdict (`by design`) and says neither. `ls.vl --status open`: 211 → 179 rows.
+- **`fetch-seed.sh` fails closed:** a release with no `.sha256`, an unparseable one, or a mismatch exits non-zero and installs nothing (a missing checksum used to warn and install). `seed-v0` is also held to the hash committed in `scripts/seed-v0.sha256`. `$VL_SEED_BASE` points the fetch at a mirror or a `file://` directory; `tests/fetch_seed_test.ts` covers each refusal offline.
+- **Hygiene from the 2026-11 review (Small 11, 12):** deleted the tracked 0-byte `a.out` and `reference/ts-interpreter` (it imported an `antlr/` directory that no longer exists, and nothing called it), with `deno.json`'s excludes for it; `AGENTS.md` no longer cites the missing `tests/run.ts`; `lsp/README.md` no longer describes a TypeScript checker or the retired `vital.checker` setting. A `SELFHOST_NATIVE_ALIGN=1` run with no `vl` binary or no seed now FAILS `tests/vl_seed_present_test.ts` instead of passing with every seed-backed suite skipped; without the variable it stays ignored, since the `ci` job runs `deno task test` seedless by design.
+- **Stale "soft no-op" comments corrected:** three test comments still said `-O3` without `wasm-opt` prints a note and exits 0; it fails with exit 1 and leaves no module (`selfhost_native_release_test.ts` pins it). `vl run -O` stays inert by design: it writes no artifact.
 - **`scripts/dup-struct-rows.vl` sees a copied type:** besides rows folded onto one type, it now reports pairs of struct rows that hold no function or set id and whose recorded types are `tySame` under two arena indices, and exits 1 when it finds one. D16152's witness fires it on a pre-#8004 compiler; self, fixtures and corpus read 0 today.
 - **The filed-witness grader tells a checker trap from a refusal.**
   `check-filed-witnesses.vl` graded every non-zero `vl check` as `check_reject`, including the
@@ -3036,6 +3990,14 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 
 ## Self-hosting & modules (Track H)
 
+- **35 groups of cloned function bodies folded to one definition each** (net −274 compiler lines, seed −4,525 bytes). Generic list and string helpers now live in `listutil`. The deduplicated compiler compiles master's compiler byte-identically. Clones in `emit_mono`, `emit_elab`, `emit_rep` and `check_types` are held for the lanes that own those files.
+- **Mono's instance builder takes an explicit request and one build frame** (L5 step 1): nine
+  globals a caller set for the builder to consume are one `InstReq` argument, five it saved and
+  restored are one `MonoBuild` frame, and two write-only globals are gone; byte-identical over
+  20,064 corpus programs and the L2 compiler build, net −15 lines, hidden-argument globals
+  188 → 175.
+- **Elab bank presence is a node column:** `scopeTyAt`'s per-read map probes of `elabNodeTys` and `nodeSrc` become one column read: plumb main −3.3%, L2 self-compile −2.1% guest fuel, byte-identical over 24,692 programs.
+- **Plumb-shape fuel drift attributed and cut:** four emit queries answer before their table reads (typed-holder gate, the const-argument pre-check, a cached emit-phase rank, one `nodeTyIxOf` read in `scopeTyAt`): plumb main −2.0%, tail −1.9%, L2 self-compile −0.7%, byte-identical over 24,584 programs.
 - **Step 7:** three union walks in the shape interner and the boolean-leaf arm test read the member types directly, without building the arm spellings.
 - **Step 7:** whether a union has a boolean-leaf list arm of a given depth is read from the arms' types, not their spellings.
 - **Step 7:** whether a union's list arm needs its element union registered is read from the arm's type, not its spelling.

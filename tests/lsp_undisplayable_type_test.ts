@@ -59,6 +59,7 @@ import {
   scopeCompletionsFromBindings,
 } from "../lsp/src/typeFeatures.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
   const a = JSON.stringify(actual);
@@ -69,14 +70,7 @@ const assertEquals = <T>(actual: T, expected: T, msg?: string): void => {
 };
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const noSiblings = () => undefined;
 
@@ -417,7 +411,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, () => {})!;
-  const src = `function t() { 1 == 1 }
+  const src = `function t() { return 1 == 1 }
 function mk() { return [] }
 function f() {
   const x = if t() { [] } else { null }

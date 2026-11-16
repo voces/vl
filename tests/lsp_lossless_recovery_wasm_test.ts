@@ -20,16 +20,10 @@
 
 import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const logs: string[] = [];
 const log = (m: string) => logs.push(m);
@@ -85,7 +79,7 @@ Deno.test({
 // parse diagnostic instead of blanking it. The phantom `expected 2, got 1` that
 // the old skip-to-the-closer recovery would have invented must not appear.
 const HALF_WRITTEN_CALL =
-  'function f(a: i32, b: i32) { a + b }\nprint(f(1 2))\nconst n: i32 = "hi"\n';
+  'function f(a: i32, b: i32) { return a + b }\nprint(f(1 2))\nconst n: i32 = "hi"\n';
 
 Deno.test({
   name: "lsp lossless: a half-written call keeps its type feedback",

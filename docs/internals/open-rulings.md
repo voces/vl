@@ -1633,8 +1633,11 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   `docs/internals/design-review-getters-effects-2026-09/`.
 - **A17, `never`.** Does `never` enter the surface vocabulary? What wasm result does a `never`
   function declare? Do `const x = loop(1)` and a diverging `while true` count as non-returning?
-- **A14, generic newtypes and opaque identity.** Giving a newtype a runtime tag reverses the
-  erasure design. Brief: `docs/internals/newtype-design.md`.
+- **A14, generic newtypes and opaque identity.** RULED (owner) 2026-11-15: (a), compile-time brands
+  erased at run time. Each instance of a generic `new` type is its own brand (`Handle<A>` is not
+  `Handle<B>`, a structural variable is not `Box<i32>`, a getter may take `Box<i32>`), and `is`
+  between two instances stays refused, since no runtime tag exists. Brief:
+  `docs/internals/newtype-design.md` §5.
 - **A10, const generics.** No grammar or semantics is recorded for a value type parameter.
 - **A13, a `"+"`-named struct field.** Is such a field spellable? Today it is a parse error.
 - **D12131 / D2721, polymorphic recursion.** RULED (owner) 2026-11-14: refused for now (a); a
@@ -1685,6 +1688,9 @@ a recommendation. The spec's own questions are in `docs/spec/OPEN-QUESTIONS.md`.
   Brief: `docs/internals/incremental-compilation-design.md`.
 - **J2.** Which runner hosts the surviving JS-side tests, Node or another?
 - **`--strip-locations` for release builds.** It was recommended on 2026-09-01 and never ruled.
+- **The seed sidecar's trust (engineering review 2026-11, Small 1) — RULED 2026-11-14, option
+  C.** The seed's `.cwasm` lives only in the private seed cache, never beside the seed in a
+  checkout. DECISIONS.md, "The seed sidecar lives only in the user's private cache".
 
 ## Dismissed — filed as owner rulings, verified NOT open
 

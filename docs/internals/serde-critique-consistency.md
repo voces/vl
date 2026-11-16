@@ -74,7 +74,7 @@ function render(v: Json): string {
     }
     return out + "}"
   }
-  "?"
+  return "?"
 }
 
 const doc: { [string]: Json } = Map()
@@ -233,7 +233,7 @@ type Base64Error = { at: i32, msg: string }
 type Err         = { msg: string }
 function report(r: i32 | IoError | Base64Error): string {
   if r is Err { return r.msg }        // <- the O3 spelling
-  "ok"
+  return "ok"
 }
 ```
 → `[ERROR]: `is` check type 'Err' is not a variant of i32 | IoError | Base64Error`
@@ -255,7 +255,7 @@ the refusal is excellent:
 ```vl
 function readNum(s: string): f64 | JsonError {
   const v = parseF64(s) as f64      // parseF64: f64 | null
-  v
+  return v
 }
 ```
 → ``[ERROR]: `as f64` propagates null, which the enclosing function cannot return (it returns f64 | JsonError)``
@@ -309,7 +309,7 @@ union."* Measured — they can:
 type A = { v: f64 }
 type B = { v: f64 }
 type U = A | B
-function pick(n: i32): U { if n == 0 { return { v: 1.0 } } { v: 3.28 } }
+function pick(n: i32): U { if n == 0 { return { v: 1.0 } } return { v: 3.28 } }
 const a = pick(0)
 if a is A { print("A") } else { print("B") }     // check rc 0, RUNS, prints A
 ```
@@ -518,7 +518,7 @@ The spelling the plan actually delivers works cleanly and is good:
 ```vl
 function load(s: string): Config | JsonError {
   const c = fromJson(s) as Config      // propagates JsonError
-  c
+  return c
 }
 // check rc 0, RUNS
 ```

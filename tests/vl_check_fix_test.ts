@@ -38,14 +38,14 @@ Deno.test({
       // The `: i64` return is NOT redundant (the i32 body widens to it), so the
       // redundant-return fix leaves it — keeping this case focused on prefer-const.
       const before =
-        "function f(a: i32, b: i32): i64 { b }\nlet unusedLocal = 1\nlet keep = 2\nprint(f(keep, keep))\n";
+        "function f(a: i32, b: i32): i64 { return b }\nlet unusedLocal = 1\nlet keep = 2\nprint(f(keep, keep))\n";
       await Deno.writeTextFile(f, before);
       const r = await fix(f);
       if (r.code !== 0) throw new Error(`--fix exited ${r.code}:\n${r.err}`);
       // Only `let keep` → `const keep`. The unused param `a` and unused local are
       // untouched.
       const want =
-        "function f(a: i32, b: i32): i64 { b }\nlet unusedLocal = 1\nconst keep = 2\nprint(f(keep, keep))\n";
+        "function f(a: i32, b: i32): i64 { return b }\nlet unusedLocal = 1\nconst keep = 2\nprint(f(keep, keep))\n";
       const after = await Deno.readTextFile(f);
       if (after !== want) throw new Error(`unexpected fixed source:\n${after}`);
       // The unused param + local are still reported, and nothing more is applied.
@@ -76,7 +76,7 @@ Deno.test({
       // Removing `: Buf` orphans the `Buf` import, which only the next round can see. The
       // exported function's return and the exported const's type are API and stay.
       const before = 'import { Buffer, Buf } from "std:buffer"\n' +
-        "export function f(x: i32): i32 { x + 1 }\n" +
+        "export function f(x: i32): i32 { return x + 1 }\n" +
         "export const m: i32 = 4\n" +
         "const b: Buf = Buffer(8)\n" +
         "print(f(m) + b.length)\n";
@@ -84,7 +84,7 @@ Deno.test({
       const r = await fix(f);
       if (r.code !== 0) throw new Error(`--fix exited ${r.code}:\n${r.err}`);
       const want = 'import { Buffer } from "std:buffer"\n' +
-        "export function f(x: i32): i32 { x + 1 }\n" +
+        "export function f(x: i32): i32 { return x + 1 }\n" +
         "export const m: i32 = 4\n" +
         "const b = Buffer(8)\n" +
         "print(f(m) + b.length)\n";
@@ -175,15 +175,15 @@ const fixCase = (name: string, files: Record<string, string>, want: string) =>
     },
   });
 
-const TERRAIN = "export function height(x: i32): i32 { x * 2 }\n" +
-  "export const SEA = 3\nexport function other(): i32 { 1 }\n";
+const TERRAIN = "export function height(x: i32): i32 { return x * 2 }\n" +
+  "export const SEA = 3\nexport function other(): i32 { return 1 }\n";
 
 fixCase(
   "an undeclared name joins its module's existing import, or a new one, local or std",
   {
     "terrain.vl": TERRAIN,
-    "sub/side.vl": "export function side(): i32 { 5 }\n",
-    "mid.vl": 'import { side } from "./sub/side"\nexport function mid(): i32 { side() }\n',
+    "sub/side.vl": "export function side(): i32 { return 5 }\n",
+    "mid.vl": 'import { side } from "./sub/side"\nexport function mid(): i32 { return side() }\n',
     "main.vl": 'import { mid } from "./mid"\nimport { other } from "./terrain"\n' +
       "print(mid() + height(2) + SEA + other() + side())\nprint(hypotF64(3.0, 4.0))\n" +
       "const xs = [1, 2, 3]\nprint(xs.includes(2))\n",
@@ -199,7 +199,7 @@ fixCase(
   "a name imported from a module that does not export it moves to the one that does",
   {
     "terrain.vl": TERRAIN,
-    "mid.vl": 'import { height } from "./terrain"\nexport function mid(): i32 { height(1) }\n',
+    "mid.vl": 'import { height } from "./terrain"\nexport function mid(): i32 { return height(1) }\n',
     "main.vl": 'import { height } from "./mid"\nimport { mid, SEA } from "./mid"\n' +
       "print(height(1) + mid() + SEA)\n",
   },
@@ -241,8 +241,8 @@ fixCase(
 fixCase(
   "two exporters: the message lists both and nothing is edited",
   {
-    "a.vl": "export function dup(): i32 { 1 }\n",
-    "b.vl": "export function dup(): i32 { 2 }\n",
+    "a.vl": "export function dup(): i32 { return 1 }\n",
+    "b.vl": "export function dup(): i32 { return 2 }\n",
     "main.vl": 'import { dup as one } from "./a"\nimport { dup as two } from "./b"\n' +
       "print(one() + two() + dup())\n",
   },
@@ -253,8 +253,8 @@ fixCase(
 fixCase(
   "a method the file already binds for another receiver kind is imported under its own name",
   {
-    "s.vl": 'export function d(self: string): string { "S" }\n',
-    "a.vl": 'export function d<T>(self: T[]): string { "A" }\nexport function other(): i32 { 1 }\n',
+    "s.vl": 'export function d(self: string): string { return "S" }\n',
+    "a.vl": 'export function d<T>(self: T[]): string { return "A" }\nexport function other(): i32 { return 1 }\n',
     "main.vl": 'import { d } from "./s"\nimport { other } from "./a"\n' +
       'print("x".d())\nprint([other()].d())\n',
   },
@@ -265,8 +265,8 @@ fixCase(
 fixCase(
   "an import that needs an alias is not applied (the call would need respelling too)",
   {
-    "ni.vl": 'export function d(self: i32): string { "I" }\n',
-    "nf.vl": 'export function d(self: f64): string { "F" }\nexport function of(): i32 { 1 }\n',
+    "ni.vl": 'export function d(self: i32): string { return "I" }\n',
+    "nf.vl": 'export function d(self: f64): string { return "F" }\nexport function of(): i32 { return 1 }\n',
     "main.vl": 'import { d } from "./ni"\nimport { of } from "./nf"\nconst b = 1.5\nprint(b.d())\nprint(of())\n',
   },
   'import { d } from "./ni"\nimport { of } from "./nf"\nconst b = 1.5\nprint(b.d())\nprint(of())\n',
@@ -390,23 +390,23 @@ fixCase(
 fixCase(
   "positional arguments after a misplaced name are named for the parameter they bind today",
   {
-    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
-      "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
-      "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+    "main.vl": "function box(w: i32, h: i32): i32 { return w * 10 + h }\n" +
+      "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { return a * 100 + b * 10 + c }\n" +
+      "function m(self: i32, c: i32, d: i32): i32 { return self * 100 + c * 10 + d }\n" +
       "print(box(h: 3, 2))\nprint(f(c: 5, 1, 7))\nprint((5).m(d: 1, 2))\n",
   },
-  "function box(w: i32, h: i32): i32 { w * 10 + h }\n" +
-    "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { a * 100 + b * 10 + c }\n" +
-    "function m(self: i32, c: i32, d: i32): i32 { self * 100 + c * 10 + d }\n" +
+  "function box(w: i32, h: i32): i32 { return w * 10 + h }\n" +
+    "function f(a: i32, b: i32 = 1, c: i32 = 2): i32 { return a * 100 + b * 10 + c }\n" +
+    "function m(self: i32, c: i32, d: i32): i32 { return self * 100 + c * 10 + d }\n" +
     "print(box(h: 3, w: 2))\nprint(f(c: 5, a: 1, b: 7))\nprint((5).m(d: 1, c: 2))\n",
 );
 
 fixCase(
   "a name given twice has no mechanical fix and is left alone",
   {
-    "main.vl": "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+    "main.vl": "function box(w: i32, h: i32): i32 { return w * 10 + h }\nprint(box(3, w: 2))\n",
   },
-  "function box(w: i32, h: i32): i32 { w * 10 + h }\nprint(box(3, w: 2))\n",
+  "function box(w: i32, h: i32): i32 { return w * 10 + h }\nprint(box(3, w: 2))\n",
 );
 
 fixCase(
@@ -424,7 +424,7 @@ fixCase(
 fixCase(
   "a name only a not-yet-imported file beside it exports gets a new import of that file",
   {
-    "ids.vl": "export const SPR_A: i32 = 1\nexport function idOf(n: i32): i32 { n }\n",
+    "ids.vl": "export const SPR_A: i32 = 1\nexport function idOf(n: i32): i32 { return n }\n",
     "nested/deeper.vl": "export const SPR_B: i32 = 2\n",
     "main.vl": "print(idOf(SPR_A))\n",
   },
@@ -471,7 +471,7 @@ Deno.test({
 fixCase(
   "a file beside it exporting a std name is listed with std, and two exporters edit nothing",
   {
-    "geo.vl": "export function hypotF64(a: f64, b: f64): f64 { a + b }\n",
+    "geo.vl": "export function hypotF64(a: f64, b: f64): f64 { return a + b }\n",
     "main.vl": "print(hypotF64(3.0, 4.0))\n",
   },
   "print(hypotF64(3.0, 4.0))\n",
@@ -543,3 +543,63 @@ fixCase(
   'import { mk, Level } from "./world"\nfunction depth(l: Level) { return l.n }\n' +
     "print(depth(mk()))\n",
 );
+
+// ---- the return rule: a block body returns a value only through `return` -------------------
+
+fixCase(
+  "a discarded pure tail, and one in parentheses, gets the `return` the warning names (A2)",
+  {
+    "main.vl": "function f(n: i32) {\n  const x = n + 1\n  x\n}\nfunction g(n: i32) {\n  (n * 2)\n}\n" +
+      "print(f(1) + g(2))\n",
+  },
+  "function f(n: i32) {\n  const x = n + 1\n  return x\n}\nfunction g(n: i32) {\n  return (n * 2)\n}\n" +
+    "print(f(1) + g(2))\n",
+);
+
+fixCase(
+  "a value tail where the result or a callback's context wants a value gets its `return` (A3)",
+  {
+    "main.vl": "function g(n: i32): i32 {\n  const y = n + 2\n  y * 3\n}\n" +
+      "const xs = [1, 2].map((x) => {\n  x * 10\n})\nprint(g(1) + xs[1])\n",
+  },
+  "function g(n: i32): i32 {\n  const y = n + 2\n  return y * 3\n}\n" +
+    "const xs = [1, 2].map((x) => {\n  return x * 10\n})\nprint(g(1) + xs[1])\n",
+);
+
+fixCase(
+  "a caller using a function that discards its last call writes that function's `return`, once",
+  {
+    "main.vl": "function compute(x: i32): i32 { return x * 2 }\nfunction get(x: i32) {\n  compute(x)\n}\n" +
+      "print(get(3))\nconst v = get(1) + 2\nprint(v)\n",
+  },
+  "function compute(x: i32): i32 { return x * 2 }\nfunction get(x: i32) {\n  return compute(x)\n}\n" +
+    "print(get(3))\nconst v = get(1) + 2\nprint(v)\n",
+);
+
+Deno.test({
+  name: "vl-check-fix: a callee in another file of the run gets its `return`, and the run is clean",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_fix_rr_" });
+    try {
+      const lib = "export function compute(x: i32): i32 { return x * 2 }\n" +
+        "export function get(x: i32) {\n  compute(x)\n}\n";
+      await Deno.writeTextFile(`${dir}/lib.vl`, lib);
+      await Deno.writeTextFile(`${dir}/main.vl`, 'import { get } from "./lib"\nprint(get(3))\n');
+      // Named alone, the caller's file reports the callee and leaves it be.
+      const one = await fix(`${dir}/main.vl`);
+      if (one.code === 0) throw new Error(`want the refusal, got a clean run:\n${one.err}`);
+      if ((await Deno.readTextFile(`${dir}/lib.vl`)) !== lib) {
+        throw new Error("a file outside the run was edited");
+      }
+      // Over the directory, the callee's file takes the edit and the caller re-checks clean.
+      const r = await fix(dir);
+      if (r.code !== 0) throw new Error(`--fix over the directory exited ${r.code}:\n${r.err}`);
+      const want = lib.replace("  compute(x)", "  return compute(x)");
+      const after = await Deno.readTextFile(`${dir}/lib.vl`);
+      if (after !== want) throw new Error(`lib.vl: want\n${want}\ngot\n${after}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

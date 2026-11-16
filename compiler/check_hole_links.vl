@@ -2,7 +2,22 @@
 // licence, and the callee a parked cast on a hole speaks for.
 // Does not import the checker.
 import { BinExpr, FuncDecl, Ident, LetDecl, P, Param, nodeAt } from "./ast"
-import { TyArray, tyAt } from "./check_types"
+import {
+  TyArray,
+  TyMap,
+  tyAt,
+  tyElemOf,
+  tyElemOpen,
+  tyEq,
+  tyKeyOf,
+  tyKeyOpen,
+  tyPinElem,
+  tyPinKey,
+  tyPinVal,
+  tyRowsShareHole,
+  tyValOf,
+  tyValOpen,
+} from "./check_types"
 import {
   CW_OCC_ASG,
   CW_OCC_BIND,
@@ -46,7 +61,7 @@ export function holeLinkSiteSet(at: i32, srcTy: i32, dstTy: i32) {
   linkSiteAt = at
   linkSiteSrc = srcTy
   linkSiteDst = dstTy
-  0
+  return 0
 }
 
 // Is `ty` the row an `__array_new_default__` call returned? That membership is the whole licence
@@ -60,7 +75,7 @@ export function arrDefRowIsCall(ty: i32) {
     if arrDefCallTy[j] == ty { return true }
     j = j + 1
   }
-  false
+  return false
 }
 
 // …or one hop from such a row through a recorded hole link, which is what `let b = a` between
@@ -79,7 +94,7 @@ export function arrDefRowServed(ty: i32) {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Row `ty` and every row a chain of recorded hole links joins to it.
@@ -100,7 +115,7 @@ export function holeLinkClosure(ty: i32): i32[] {
     }
     k = k + 1
   }
-  rows
+  return rows
 }
 
 // The element of the list row `ty` or of a row a hole link joins to it, or -1 while all are open.
@@ -110,11 +125,11 @@ export function linkedRowElem(ty: i32): i32 {
   while k < rows.length {
     const t = tyAt(rows[k])
     if t is TyArray {
-      if t.aElem >= 0 { return t.aElem }
+      if !tyElemOpen(t) { return tyElemOf(t) }
     }
     k = k + 1
   }
-  -1
+  return -1
 }
 
 // Record that the two array rows `a` and `b` must carry the same element. Deduped, because
@@ -132,7 +147,7 @@ export function noteHoleLink(a: i32, b: i32) {
   holeLinkAt.push(linkSiteAt)
   holeLinkSrcTop.push(linkSiteSrc)
   holeLinkDstTop.push(linkSiteDst)
-  0
+  return 0
 }
 
 // The declared name of parameter `i` in a `Param`-node list, or "" — the call site's half of
@@ -142,7 +157,7 @@ export function declParamNameAt(dParams: i32[], i: i32): string {
   if i < 0 || i >= dParams.length { return "" }
   const pn = nodeAt(dParams[i])
   if pn is Param { return pn.parName }
-  ""
+  return ""
 }
 
 // The name of parameter `i` of the callee a parked cast on hole `name` speaks for: the declared
@@ -165,7 +180,7 @@ export function holeCastParamName(
   if ld < 0 { return "" }
   const f = nodeAt(ld)
   if f is FuncDecl { return declParamNameAt(f.fnParams, i) }
-  ""
+  return ""
 }
 
 // The `FuncDecl` a callee reaches, through up to `depth` `const` aliases of a function or a
@@ -177,7 +192,7 @@ function holeCastCalleeDeclOf(callFnIx: i32, depth: i32): i32 {
   const init = cwBoundInitOf(b)
   if init < 0 { return holeCastWrittenDeclOf(b, depth) }
   if !(nodeAt(init) is Ident) { return -1 }
-  holeCastCalleeDeclOf(init, depth - 1)
+  return holeCastCalleeDeclOf(init, depth - 1)
 }
 
 // `holeCastWrittenDeclOf`'s answers within one callee lookup, by binding: a chain of bindings
@@ -194,7 +209,7 @@ function holeCastWrittenDeclOf(b: i32, depth: i32): i32 {
   hcWrittenMemo[b] = -1
   const r = holeCastWrittenDeclGo(b, depth)
   hcWrittenMemo[b] = r
-  r
+  return r
 }
 
 function holeCastWrittenDeclGo(b: i32, depth: i32): i32 {
@@ -221,7 +236,7 @@ function holeCastWrittenDeclGo(b: i32, depth: i32): i32 {
       one = d
     }
   }
-  one
+  return one
 }
 
 // Every `FuncDecl` a callee binding re-pointed at different functions reaches, through its
@@ -255,11 +270,122 @@ export function holeCastReachedDecls(callFnIx: i32): i32[] {
       if !i32ListHas(out, d) { out.push(d) }
     }
   }
-  out
+  return out
+}
+
+// D16047: the row an `is` test narrowed an unwritten collection to, and that collection's own
+// row, one pair per test. A write through the narrowed row pins the unwritten one to it.
+let narPinTgt: i32[] = []
+let narPinOpen: i32[] = []
+
+// Records that `is` target row `tgt` narrows unwritten collection row `open`.
+export function noteNarPin(tgt: i32, open: i32) {
+  narPinTgt.push(tgt)
+  narPinOpen.push(open)
+  return 0
+}
+
+// A write through row `recv`: pins every unwritten collection an `is` test narrowed to it to
+// that row's element. 0 when nothing applied or every pin agrees, else the row already pinned
+// to another element, which the caller refuses as a direct second write is refused.
+export function narPinWrite(recv: i32): i32 {
+  let i = 0
+  while i < narPinTgt.length {
+    if narPinTgt[i] == recv {
+      const r = narPinOne(recv, narPinOpen[i])
+      if r != 0 { return r }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+function narPinOne(tgt: i32, open: i32): i32 {
+  if tgt < 0 || open < 0 { return 0 }
+  const g = tyAt(tgt)
+  const o = tyAt(open)
+  if g is TyArray && o is TyArray {
+    if tyElemOpen(o) {
+      tyPinElem(o, tyElemOf(g))
+      return 0
+    }
+    if tyEq(tyElemOf(o), tyElemOf(g)) { return 0 }
+    return narPinInner(tyElemOf(g), tyElemOf(o), open)
+  }
+  if g is TyMap && o is TyMap {
+    if tyKeyOpen(o) { tyPinKey(o, tyKeyOf(g)) }
+    else if !tyEq(tyKeyOf(o), tyKeyOf(g)) { return open }
+    if tyValOpen(o) {
+      tyPinVal(o, tyValOf(g))
+      return 0
+    }
+    if tyEq(tyValOf(o), tyValOf(g)) { return 0 }
+    return narPinInner(tyValOf(g), tyValOf(o), open)
+  }
+  return if tyEq(tgt, open) { 0 } else { open }
+}
+
+// `narPinOne` one level in, where a mismatch names the outer row `outer`.
+function narPinInner(tgt: i32, open: i32, outer: i32): i32 {
+  const r = narPinOne(tgt, open)
+  return if r != 0 { outer } else { 0 }
+}
+
+// D16047: `is` nodes whose operand held an unwritten collection of the tested kind, with that
+// collection's row, and the unwritten rows union members are, settled at the program's end.
+export let vacIsNode: i32[] = []
+export let vacIsRow: i32[] = []
+// Per vacuous node, its unwritten rows at test time: `vacIsOpen[vacIsLo[i] .. vacIsLo[i + 1]]`.
+export let vacIsLo: i32[] = []
+export let vacIsOpen: i32[] = []
+export let openUnionRows: i32[] = []
+
+// Records that `is` node `ix` tests unwritten collection row `open`.
+export function noteVacuousIs(ix: i32, open: i32, rows: i32[]) {
+  vacIsNode.push(ix)
+  vacIsRow.push(open)
+  vacIsLo.push(vacIsOpen.length)
+  for r in rows { vacIsOpen.push(r) }
+  return 0
+}
+
+// Rows the unbound default settled rather than a write pinned: an `is` test of one stays vacuous.
+export let settledRows: i32[] = []
+
+// Whether the unbound default settled row `r`, or a row holding one hole with it, so no write
+// or annotation fixed it.
+export function rowSettledByDefault(r: i32): boolean {
+  if i32ListHas(settledRows, r) { return true }
+  for s in settledRows {
+    if tyRowsShareHole(s, r) { return true }
+  }
+  return false
+}
+
+// Records that the unbound default settled row `r`.
+export function noteSettledRow(r: i32) {
+  if !i32ListHas(settledRows, r) { settledRows.push(r) }
+  return 0
+}
+
+// Records the unwritten rows `rows` a union's members are.
+export function noteOpenUnionRows(rows: i32[]) {
+  for r in rows {
+    if !i32ListHas(openUnionRows, r) { openUnionRows.push(r) }
+  }
+  return 0
 }
 
 // Clears this module's tables (called from `initChecker`).
 export function holeLinksReset() {
+  vacIsNode = []
+  vacIsRow = []
+  vacIsLo = []
+  vacIsOpen = []
+  openUnionRows = []
+  settledRows = []
+  narPinTgt = []
+  narPinOpen = []
   holeCastNames = []
   arrDefCallTy = []
   holeLinkA = []
@@ -269,5 +395,5 @@ export function holeLinksReset() {
   holeLinkDstTop = []
   linkSiteAt = -1
   linkSiteSrc = -1
-  linkSiteDst = -1
+  return linkSiteDst = -1
 }

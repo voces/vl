@@ -58,6 +58,7 @@ import {
   annTsOf,
   callTyArgsOf,
   declHasExportKw,
+  loopVarLoop,
   mkCallN,
   mkIdent,
   nodeAt,
@@ -81,6 +82,7 @@ import {
   cwBindingWrittenValues,
   cwCalleeDeclOf,
   cwDeclWriteValues,
+  cwFnValueDeclOf,
   cwIxBuild,
   cwIxCovers,
   cwIxKind,
@@ -96,6 +98,7 @@ import {
   cwOccWalk,
   cwOccWalkSpelled,
   cwSlotWrittenValues,
+  cwSoleReadInit,
   cwUseCaptures,
   fnDeclIx,
 } from "./check_write_scan"
@@ -103,6 +106,8 @@ import { valueTailSplit } from "./check_num_adopt"
 import { collectRetValues } from "./check_nj_join"
 import { rcwInferredRetTy } from "./check_rcw"
 import {
+  ftArgIsParam,
+  ftParamOnlyCalledAt,
   holeSetFitsRetAt,
   holeSetSplitsAt,
   tErr,
@@ -125,9 +130,12 @@ import {
   TyVar,
   mkArrayTy,
   tyAt,
+  tyElemOf,
+  tyElemOpen,
   tyFieldTyOf,
-  tyHasHole,
+  tyKeyOf,
   tySame,
+  tyValOf,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { nonNullTy, tyHasTyVar, tyReachesHole } from "./tyquery"
@@ -152,6 +160,7 @@ import {
   mintFactRsOf,
   mintFactSetOf,
   mintFwdFieldSetsOf,
+  mintLamClosed,
   mintNestedPerEnclOf,
   mintParamFwdInsOf,
   mintParamHeldSets,
@@ -164,12 +173,17 @@ import {
   mintSeedWideOfBind,
   mintSeedWideOfParam,
   mintSetPartial,
+  mintStoreSetOf,
 } from "./check_mint"
 import { fnDeclParent } from "./check_decl_scan"
 import { identDeclOf, identFromDecl } from "./symbols"
 import { identFnDeclOf } from "./check_scopes"
 import { declIsExportedFn } from "./check_exp_obs"
-import { elabListParamSource, fnTagSetSplits } from "./check_elab_cap"
+import {
+  elabListParamSource,
+  fnTagMembersWithin,
+  fnTagSetSplits,
+} from "./check_elab_cap"
 import {
   coerceRecordOpen,
   elabCallDeclOf,
@@ -204,10 +218,11 @@ import {
   fnTagHeldNote,
   fnTagHeldRecs,
   fnTagHeldRepOf,
+  fnTagHeldWrittenInner,
   fnTagJoinFromOf,
   fnTagJoinsWith,
+  fnTagLeafSetOf,
   fnTagListJoinSet,
-  fnTagMapWriteLeavesOf,
   fnTagMark,
   fnTagMembers,
   fnTagOwnTyParamJoins,
@@ -243,21 +258,12 @@ function ftNestedJoinsFollow() {
       valueTailSplit(j, sp, ls)
       for n in sp {
         const s = if n != j { fnTagSetOfTy(nodeTyIxOf(n)) } else { -1 }
-        if s >= 0 && s != o && ftMembersWithin(s, o) { nodeTySetGrow(n, jt) }
+        if s >= 0 && s != o && fnTagMembersWithin(s, o) { nodeTySetGrow(n, jt) }
       }
     }
     j = j - 1
   }
-  0
-}
-
-// Whether every member of set `s` is a member of set `o`.
-function ftMembersWithin(s: i32, o: i32): boolean {
-  const om = fnTagMembers(o)
-  for m in fnTagMembers(s) {
-    if !i32ListHas(om, m) { return false }
-  }
-  true
+  return 0
 }
 
 // The lambda literals every call of which is an arm's: one whose one position is a list element,
@@ -286,7 +292,7 @@ function ftArmOnlyLamsNote(rootIx: i32) {
     const n = nodeAt(d)
     if n is LetDecl && (written[d] ?? false) { ftArmOnlyLamMark(n.letInit) }
   }
-  0
+  return 0
 }
 
 // Marks the lambdas call `x`, a list's `push`, appends.
@@ -299,7 +305,7 @@ function ftArmOnlyPushNote(x: i32) {
   if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
     for a in n.callArgs { ftArmOnlyLamMark(a) }
   }
-  0
+  return 0
 }
 
 // Marks the lambda store `x` writes into a list's slot.
@@ -314,7 +320,7 @@ function ftArmOnlyIndexStoreNote(x: i32) {
   if ht >= 0 && ht < T.tys.length && tyAt(ht) is TyArray {
     ftArmOnlyLamMark(n.binRight)
   }
-  0
+  return 0
 }
 
 // Marks the lambda store `x` writes to a `let`, and adds the `let` to `written`.
@@ -327,7 +333,7 @@ function ftArmOnlyLetStoreNote(x: i32, written: {[i32]: boolean}) {
   if d < 0 || d >= P.nodes.length || !(nodeAt(d) is LetDecl) { return 0 }
   written[d] = true
   ftArmOnlyLamMark(n.binRight)
-  0
+  return 0
 }
 
 // Marks `v` in `ftArmOnlyLams` when it is a lambda literal.
@@ -336,7 +342,7 @@ function ftArmOnlyLamMark(v: i32) {
   if x < 0 || x >= P.nodes.length { return 0 }
   const f = nodeAt(x)
   if f is FuncDecl && f.fnName == "" { ftArmOnlyLams[x] = true }
-  0
+  return 0
 }
 
 export function fnTagDecide(rootIx: i32) {
@@ -523,7 +529,7 @@ export function fnTagDecide(rootIx: i32) {
       tErr(msg, fnTagCallMsgAtOf(c))
     }
   }
-  0
+  return 0
 }
 
 // The deliveries and their types the last decision saw.
@@ -554,7 +560,22 @@ export function fnTagRedecide(rootIx: i32): i32 {
     }
   }
   if dropped { return 2 }
-  if now.length > ftWas.length { 1 } else { 0 }
+  return if now.length > ftWas.length { 1 } else { 0 }
+}
+
+// The record literals the plan in progress takes as written into a holder of its set
+// (`ftStoredAt`), beside the holder's type.
+let ftStoreLits: i32[] = []
+let ftStoreLitTys: i32[] = []
+
+// Whether, after the elaboration, record literal `v` is written into a binding an instance holds
+// set `s` in (`mintStoreNote`), or a set the plan decides `s` with, so its function fields are
+// leaves of that set (D16137).
+function ftStoredAt(v: i32, s: i32): boolean {
+  if !ftLate { return false }
+  const st = mintStoreSetOf(parenPeelIx(v))
+  return st == s
+    || st >= 0 && i32ListHas(ftAssume, st) && fnTagMembersWithin(s, st)
 }
 
 // The sets a decision after the elaboration left untagged once an earlier one had tagged them:
@@ -573,6 +594,8 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   ftMapRecLit = []
   ftMapRecMap = []
   ftMapRecFn = []
+  ftStoreLits = []
+  ftStoreLitTys = []
   ftSubNeed = []
   ftAssume = [s]
   ftNamedRecLits = []
@@ -612,6 +635,22 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     if rr >= 0 { repStampHeldRead(ftMapRecLit[mr], rr) }
     mr = mr + 1
   }
+  // A record literal an instance writes into a holder of the set is built at the holder's rep.
+  let sl = 0
+  while sl < ftStoreLits.length {
+    repStampHeldRead(ftStoreLits[sl], fnTagRepTyOf(ftStoreLitTys[sl]))
+    sl = sl + 1
+  }
+  // A list literal written whole into a held list of lists is built at the holder's element.
+  let ww = 0
+  while ww + 1 < ftWrittenWhole.length {
+    const hr = fnTagHeldRepOf(ftWrittenWhole[ww + 1])
+    const ho = if hr >= 0 && hr < T.tys.length { tyAt(hr) } else { null }
+    if ho is TyArray {
+      fnTagHeldWrittenInner(ftWrittenWhole[ww], tyElemOf(ho), 0)
+    }
+    ww = ww + 2
+  }
   // A record literal of an inner list is built at that list's record, so it shares its row.
   let q2 = 0
   while q2 + 1 < fnTagHeldRecs.length {
@@ -631,7 +670,7 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     if t >= 0 { recLitFnFieldsRestamp(ftWrittenInits[wi], t) }
     wi = wi + 2
   }
-  0
+  return 0
 }
 
 // Notes the record literal initialising `x`'s `let`, beside `wl` written whole over it.
@@ -647,15 +686,40 @@ function ftWrittenInitNote(x: i32, wl: i32) {
     ftWrittenInits.push(il)
     ftWrittenInits.push(wl)
   }
-  0
+  return 0
 }
+
+// Whether `x` is a list literal of record literals, or of such lists, written whole (D15357).
+function ftWholeRecListLit(x: i32, depth: i32): boolean {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is ArrayLit) || n.arrElems.length == 0 || depth > 8 { return false }
+  for el in n.arrElems {
+    const ex = parenPeelIx(el)
+    const en = if ex >= 0 && ex < P.nodes.length { nodeAt(ex) } else { null }
+    if !(en is ObjLit) && !ftWholeRecListLit(ex, depth + 1) { return false }
+  }
+  return true
+}
+
+// Notes list literal `l` as written whole into holder `h`, a read of a held `let`.
+function ftWrittenWholeNote(l: i32, h: i32) {
+  const d = if h >= 0 && h < P.nodes.length && nodeAt(h) is Ident { identDeclOf(h) } else { -1 }
+  if d >= 0 && !i32ListHas(ftWrittenWhole, l) {
+    ftWrittenWhole.push(l)
+    ftWrittenWhole.push(d)
+  }
+  return 0
+}
+
+// List literals written whole into a held list of lists, each beside the holder's declaration.
+let ftWrittenWhole: i32[] = []
 
 // Notes record literal `l` as written into a holder of the plan in progress.
 function ftWrittenNote(l: i32) {
   if recAsgFnWidenedTy(l) >= 0 && !i32ListHas(ftWrittenLits, l) {
     ftWrittenLits.push(l)
   }
-  0
+  return 0
 }
 
 // The sets the decision in progress takes as tagged, and the smaller sets its stores read.
@@ -686,6 +750,7 @@ let ftWrittenInits: i32[] = []
 function ftPlReset() {
   ftWrittenLits = []
   ftWrittenInits = []
+  ftWrittenWhole = []
   ftPlS = []
   ftPlLeaves = []
   ftPlIds = []
@@ -694,7 +759,7 @@ function ftPlReset() {
   ftPlRespTy = []
   ftPlBinds = []
   ftPlHeld = []
-  0
+  return 0
 }
 
 // Gives each planned member with no leaf of its own the type of its leaf in another row; false
@@ -728,7 +793,7 @@ function ftPlLeafTysFill(): boolean {
     }
     k = k + 1
   }
-  true
+  return true
 }
 
 // The leaf type of member `d` in some tagged set, or -1.
@@ -742,7 +807,7 @@ function ftTaggedLeafTy(d: i32): i32 {
       i = i + 1
     }
   }
-  -1
+  return -1
 }
 
 // Tags the set planned in row `k` and builds each call's member calls.
@@ -775,7 +840,7 @@ function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
       ftBuildArmsAt(mintFactCallOf(fr), s, ds, leafTy, mintFactRsOf(fr))
     }
   }
-  0
+  return 0
 }
 
 // Whether member `d`'s name is in scope at every call its set `s` builds arms at: a lambda or a
@@ -818,7 +883,7 @@ function ftMemberSeenAtArms(
   for c in sites {
     if !(under[c] ?? false) { return ftNestedCaptureFree(d) }
   }
-  true
+  return true
 }
 
 // Whether nested function `d` reads no binding of a function enclosing it, so an arm built where
@@ -842,7 +907,7 @@ function ftNestedCaptureFree(d: i32): boolean {
     }
     a = fnDeclParent[a] ?? -1
   }
-  a != -2
+  return a != -2
 }
 
 // The nodes under node `r`, `r` included.
@@ -856,7 +921,7 @@ function ftSubtree(r: i32): Map<i32, boolean> {
       nodeChildrenPush(y, todo)
     }
   }
-  under
+  return under
 }
 
 // The values written to seeded binding `b`, or for a record literal's binding, to each of its
@@ -878,12 +943,18 @@ function ftSeedBindValues(b: i32): i32[] {
       for v in vals { out.push(v) }
     }
   }
-  out
+  return out
 }
 
 // Whether set `s` may be tagged, planning it in a new row when so.
 function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   const ds = fnTagMembers(s)
+  // A member the elaboration closed at its delivery is built as a closure, so no id stands for it.
+  if ftLate {
+    for d in ds {
+      if mintLamClosed(d) { return false }
+    }
+  }
   const leaves: i32[] = []
   const ids: i32[] = []
   ftRespine = []
@@ -959,19 +1030,23 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
     }
   }
   for o in mintSeedHeldOf(s) {
-    if o != s && ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) {
+    if o != s && fnTagMembersWithin(o, s) && !i32ListHas(ftSubNeed, o) {
       ftSubNeed.push(o)
     }
   }
   // A union a shared type parameter is bound to holds each argument's id, so the arguments'
   // sets are decided with it.
   for o in fnTagJoinFromOf(s) {
-    if ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+    if fnTagMembersWithin(o, s) && !i32ListHas(ftSubNeed, o) {
+      ftSubNeed.push(o)
+    }
   }
   // A list or record widened to `s` from a copy of a smaller set's holds that set's ids, so the
   // two are decided together.
   for o in fnWidenedSourceSets(s) {
-    if ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+    if fnTagMembersWithin(o, s) && !i32ListHas(ftSubNeed, o) {
+      ftSubNeed.push(o)
+    }
   }
   // A parameter whose calls go through `s` holds what each parameter handed on to it is handed, so
   // the smaller sets those hands carry are decided with it (D15610).
@@ -991,34 +1066,26 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
       if ids[k] == d { t = nodeTyIxOf(leaves[k]) }
       k = k + 1
     }
-    // A member written only through a callee's parameter has the write the list's widening
-    // recorded as its leaf, typed as the list's element where the callee's hole types it (D14648).
-    if t < 0 {
-      const wvs: i32[] = []
-      const et = fnTagWriteLeavesOf(d, s, wvs)
-      if et >= 0 {
-        for wv in wvs {
+    // A member written into a container of the set, through a callee's parameter included, has
+    // each write as a leaf too, however else it is read (D14648, D15531), typed as the container's
+    // slot.
+    const wvs: i32[] = []
+    const wsets: i32[] = []
+    const et = fnTagWriteLeavesOf(d, s, ftHeldCur, wvs, wsets)
+    // The write's own value is the leaf's id too, so the set it carries is decided with `s`.
+    for o in wsets {
+      if fnTagMembersWithin(o, s) && !i32ListHas(ftSubNeed, o) {
+        ftSubNeed.push(o)
+      }
+    }
+    if et >= 0 {
+      for wv in wvs {
+        if !i32ListHas(leaves, wv) {
           leaves.push(wv)
           ids.push(d)
         }
-        t = nodeTyIxOf(wvs[0])
-        if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasHole(t) {
-          t = et
-        }
       }
-    }
-    // A member written through a callee's parameter into a held map of the set has that write as
-    // a leaf too, whose value carries only its own set, however else the member is read (D15531).
-    const mvs: i32[] = []
-    const mt = fnTagMapWriteLeavesOf(d, s, ftHeldCur, mvs)
-    if mt >= 0 {
-      for mv in mvs {
-        if !i32ListHas(leaves, mv) {
-          leaves.push(mv)
-          ids.push(d)
-        }
-      }
-      if t < 0 { t = mt }
+      if t < 0 { t = et }
     }
     // A member only a smaller set's read brings has its leaf in that set's plan.
     if t < 0 && ftSubNeed.length == 0 { return false }
@@ -1066,7 +1133,7 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   ftPlRespTy.push(rt)
   ftPlBinds.push(ftBindsCur.slice(0, ftBindsCur.length))
   ftPlHeld.push(ftHeldCur.slice(0, ftHeldCur.length))
-  true
+  return true
 }
 
 // Whether every call through the parameter fact row `r`'s call names has a fact of set `s` in
@@ -1103,7 +1170,7 @@ function ftMintComplete(r: i32, s: i32): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // The root an element chain (`r[i]`, `r[i][j]`) read `x` starts from.
@@ -1114,10 +1181,20 @@ function ftSlotRoot(x: i32): i32 {
     const n = nodeAt(r)
     if n is Index { r = parenPeelIx(n.idxArr) }
     else if n is Member { r = parenPeelIx(n.memObj) }
+    else if ftForInIterOf(r) >= 0 { r = ftForInIterOf(r) }
     else { return r }
     depth = depth + 1
   }
-  r
+  return r
+}
+
+// The list a `for` loop walks when `x` reads that loop's element, which is an element of it; -1
+// for any other read.
+function ftForInIterOf(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return -1 }
+  const lp = loopVarLoop(identDeclOf(x))
+  const l = if lp >= 0 && lp < P.nodes.length { nodeAt(lp) } else { null }
+  return if l is ForIn && l.fiDecl1 == identDeclOf(x) { parenPeelIx(l.fiIter) } else { -1 }
 }
 
 // `ftMintComplete` for a call through an element chain off parameter `pd`: every call
@@ -1148,7 +1225,7 @@ function ftChainCallsComplete(r: i32, s: i32, pd: i32): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // The field names element chain `x` reads, root first, each followed by `.`: a record's fields
@@ -1164,12 +1241,14 @@ function ftChainFields(x: i32): string {
     } else if n is Member {
       out = n.memProp + "." + out
       r = parenPeelIx(n.memObj)
+    } else if ftForInIterOf(r) >= 0 {
+      r = ftForInIterOf(r)
     } else {
       return out
     }
     depth = depth + 1
   }
-  out
+  return out
 }
 
 // Whether call `m` pushes onto list binding `pd`, which `elabListParamSource` takes as one of
@@ -1178,7 +1257,7 @@ function ftPushOntoParamList(m: Call, pd: i32, f: FuncDecl): boolean {
   const cf = parenPeelIx(m.callFn)
   const cm = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
   if !(cm is Member) || cm.memProp != "push" { return false }
-  parenPeelIx(cm.memObj) >= 0
+  return parenPeelIx(cm.memObj) >= 0
     && identDeclOf(parenPeelIx(cm.memObj)) == pd
     && elabListParamSource(pd, f) >= 0
 }
@@ -1219,7 +1298,7 @@ export function fnTagInstanceArms(ix: i32): i32[] {
   if leafTy.length != ds.length { return none }
   if fnTagCallSetOf(ix) < 0 { fnTagCallNote(ix, s, "", false, none) }
   ftBuildArms(ix, s, ds, leafTy)
-  fnTagArmsAt(ix, s)
+  return fnTagArmsAt(ix, s)
 }
 
 // Builds, or re-types, the direct call of each member of `ds`, set `s`, at call `c`'s arguments.
@@ -1271,13 +1350,13 @@ function ftBuildArmsAt(c: i32, s: i32, ds: i32[], leafTy: i32[], rs: i32[]) {
     recordBoxTy(arms[k], nodeTyIxOf(c))
     k = k + 1
   }
-  0
+  return 0
 }
 
 // Whether call `c`'s arguments are safe to emit in each member call, of which one runs: none holds
 // a function, a literal that allocates, an assignment, or a block.
 function ftPlainArgs(c: i32, s: i32): boolean {
-  ftPlainArgsIn(c, false, false, s)
+  return ftPlainArgsIn(c, false, false, s)
 }
 
 // Whether every member of set `s` takes each positional argument of call `c` at one rep: its
@@ -1307,7 +1386,7 @@ function ftLitArgsAgree(c: i32, s: i32): boolean {
       i = i + 1
     }
   }
-  true
+  return true
 }
 
 // Whether type `t` is a type variable, or a list of what this answers true for.
@@ -1319,7 +1398,7 @@ function ftTyVarShaped(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return ftTyVarShaped(n.aElem, depth + 1)
+      return ftTyVarShaped(tyElemOf(n), depth + 1)
     }
     // A closed kind, or one a type variable inside does not shape alone.
     TyNullable | TyNeg | TyMap | TyObj | TyUnion | TyFunc | TyPrim | TyErr | TyLit => {
@@ -1373,7 +1452,7 @@ function ftPlainArgsIn(c: i32, lits: boolean, recs: boolean, s: i32): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // Whether lambda `x`, a positional argument of call `ci` through set `s`, has one signature in every
@@ -1396,60 +1475,31 @@ function ftLamArgOk(ci: i32, x: i32, s: i32): boolean {
       return false
     }
   }
-  at.length > 0
-}
-
-// Whether parameter `q` is read under `body`, and only as the callee of positional calls of `n`
-// arguments whose types are closed and match `at`'s, which the first such call fills.
-function ftParamOnlyCalledAt(body: i32, q: i32, n: i32, at: i32[]): boolean {
-  let reads = 0
-  let calls = 0
-  const todo: i32[] = [body]
-  while todo.length > 0 {
-    const y = todo.pop() ?? -1
-    if y >= 0 && y < P.nodes.length {
-      const yn = nodeAt(y)
-      if yn is Ident && identDeclOf(y) == q { reads = reads + 1 }
-      if yn is Call && identDeclOf(parenPeelIx(yn.callFn)) == q {
-        calls = calls + 1
-        if yn.callArgs.length != n || !ftArgIsParam(yn, n - 1) && n > 0 {
-          return false
-        }
-        let k = 0
-        while k < n {
-          const t = nodeTyIxOf(yn.callArgs[k])
-          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return false }
-          if at.length < n { at.push(t) }
-          else if !tySame(at[k], t) { return false }
-          k = k + 1
-        }
-      }
-      nodeChildrenPush(y, todo)
-    }
-  }
-  calls > 0 && reads == calls
+  return at.length > 0
 }
 
 // Whether `b` is a plain `=`.
 function ftIsStore(b: BinExpr): boolean {
-  b.binOp == "=" && b.binCompound == ""
+  return b.binOp == "=" && b.binCompound == ""
 }
 
 // Whether the result type of function `f` carries set `s`.
 function ftRetCarries(f: i32, s: i32): boolean {
   if f < 0 { return false }
-  fnTagSetOfTy(rcwInferredRetTy(f)) == s
+  return fnTagSetOfTy(rcwInferredRetTy(f)) == s
 }
 
 // Whether binding `d` is a copy of a parameter of function `fn` (`fnTagParamCopyOf`).
 function ftParamCopyAt(d: i32, fn: i32): boolean {
   if fn < 0 || fn >= P.nodes.length { return false }
   const f = nodeAt(fn)
-  f is FuncDecl && fnTagParamCopyOf(f, d) >= 0
+  return f is FuncDecl && fnTagParamCopyOf(f, d) >= 0
 }
 
 // Whether the result type of function `f` is `void`.
-function ftRetVoid(f: i32): boolean { f >= 0 && rcwInferredRetTy(f) == TY_VOID }
+function ftRetVoid(f: i32): boolean {
+  return f >= 0 && rcwInferredRetTy(f) == TY_VOID
+}
 
 // The set of the slot that call `c` writes value `x` into: an element `xs.push(x)` appends, or the
 // entry `m.set(k, x)` stores; -1 for any other call.
@@ -1461,11 +1511,11 @@ function ftSlotWriteSet(c: Call, x: i32): i32 {
   const h = tyAt(ht)
   match h {
     TyArray => {
-      return if fn.memProp == "push" { fnTagSetOfTy(h.aElem) } else { -1 }
+      return if fn.memProp == "push" { fnTagSetOfTy(tyElemOf(h)) } else { -1 }
     }
     TyMap => {
       const isVal = c.callArgs.length == 2 && c.callArgs[1] == x
-      return if fn.memProp == "set" && isVal { fnTagSetOfTy(h.mVal) } else { -1 }
+      return if fn.memProp == "set" && isVal { fnTagSetOfTy(tyValOf(h)) } else { -1 }
     }
     // Only a list's `push` and a map's `set` write a slot.
     TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
@@ -1476,7 +1526,7 @@ function ftSlotWriteSet(c: Call, x: i32): i32 {
 
 // Whether node `x` carries set `s`.
 function ftIsS(x: i32, s: i32): boolean {
-  x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
+  return x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
 }
 
 // Per wider set a member's `return` joins, the functions returning it, whose returned members
@@ -1511,7 +1561,7 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
     if lt < 0 || lt >= T.tys.length { return -1 }
     const at = tyAt(lt)
     if !(at is TyArray) { return -1 }
-    const o = fnTagSetOfTy(at.aElem)
+    const o = fnTagSetOfTy(tyElemOf(at))
     if o == s { return -1 }
     return o
   }
@@ -1522,7 +1572,7 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
   if st.length == 0 || st[st.length - 1] != x { return -1 }
   const o = fnTagSetOfTy(nodeTyIxOf(g))
   if o == s { return -1 }
-  o
+  return o
 }
 
 // Whether no read, call or method call of function `fn`'s spelling may stand for it and it is not
@@ -1536,7 +1586,7 @@ function ftFnNeverNamed(fn: i32): boolean {
   while cwOccNext(w) {
     if cwIxNode[w.row] != fn { return false }
   }
-  true
+  return true
 }
 
 // Walks the program for every node carrying set `s`, pushing each member name it reaches to
@@ -1580,7 +1630,7 @@ function ftScan(
       // (D15036).
       const ot = if ftIsS(x, s) { ftOtherTail(x, p, g, fn, s, ds) } else { -1 }
       if ot >= 0 && !fnTagSetIsTagged(ot) && !i32ListHas(ftAssume, ot) {
-        if !ftSetWithin(s, ot) { return false }
+        if !fnTagMembersWithin(s, ot) { return false }
         if !i32ListHas(ftSubNeed, ot) { ftSubNeed.push(ot) }
       }
       // A function nothing names never returns, so a member it returns is no leaf (D15070).
@@ -1603,9 +1653,8 @@ function ftScan(
         }
         // A binding of the set written: what the write stores is an id of it.
         if pn is BinExpr && ftIsStore(pn) && pn.binLeft == x {
-          if !ftJoinAt(pn.binRight, nodeTyIxOf(x), s, ds, leaves, ids) {
-            return false
-          }
+          const wv = ftWrittenNamedSource(pn.binRight, nodeTyIxOf(x))
+          if !ftJoinAt(wv, nodeTyIxOf(x), s, ds, leaves, ids) { return false }
         }
       }
       // A record literal written whole into a binding the field widener widened, or a field or
@@ -1616,13 +1665,33 @@ function ftScan(
       if ftHolds(x, s) && rw is BinExpr && ftIsStore(rw) && rw.binLeft == x {
         const wls: i32[] = []
         tailValueLeaves(rw.binRight, wls)
+        // A read of a binding read nowhere else writes its initialiser's literals (D15308).
+        let wi = 0
+        while wi < wls.length && wi < 64 {
+          const bi = cwSoleReadInit(wls[wi])
+          const bl: i32[] = []
+          if bi >= 0 { tailValueLeaves(bi, bl) }
+          let fw = false
+          for b in bl {
+            if recAsgFnWidenedTy(parenPeelIx(b)) >= 0 { fw = true }
+          }
+          if fw {
+            ftWrittenSourceAt(wls[wi], nodeTyIxOf(x))
+            for b in bl { wls.push(b) }
+          }
+          wi = wi + 1
+        }
         for wl in wls {
           const wx = parenPeelIx(wl)
           if (
-            recAsgFnWidenedTy(wx) >= 0
+            (recAsgFnWidenedTy(wx) >= 0 || ftStoredAt(wx, s))
             && !ftRecWriteJoins(wx, nodeTyIxOf(x), s, ds, leaves, ids, 0)
           ) {
             return false
+          }
+          if ftStoredAt(wx, s) {
+            ftStoreLits.push(wx)
+            ftStoreLitTys.push(nodeTyIxOf(x))
           }
           ftWrittenNote(wx)
           if recAsgFnWidenedTy(wx) >= 0 { ftWrittenInitNote(x, wx) }
@@ -1666,7 +1735,7 @@ function ftScan(
         const hk = ftHoldKind(xti, s, FT_HOLD_DEPTH)
         const rec = hk == 6 && xt is TyArray || hk == 8 && xt is TyMap
         // A list's or a map's record slot takes the written record's fields as its own.
-        const recTy = if xt is TyArray { xt.aElem } else if xt is TyMap { xt.mVal } else { -1 }
+        const recTy = if xt is TyArray { tyElemOf(xt) } else if xt is TyMap { tyValOf(xt) } else { -1 }
         // A map's entry literal, a record or a list of records, is built at the map's value row.
         if (
           rec
@@ -1714,7 +1783,7 @@ function ftScan(
       }
     }
   }
-  true
+  return true
 }
 
 // Whether parameter `i` of `f` (declared at `d`) is annotated by an own type parameter `T` the
@@ -1776,7 +1845,7 @@ export function ftOwnTyParamJoins(
       }
     }
   }
-  true
+  return true
 }
 
 // Whether node `x` names a type mentioning one of `nm`: an annotation of a binding, parameter
@@ -1818,11 +1887,14 @@ function ftSpellingNames(t: string, nm: string[]): boolean {
     if j > i && strListHas(nm, t.slice(i, j)) { return true }
     i = if j > i { j } else { i + 1 }
   }
-  false
+  return false
 }
 
 function ftIdentChar(c: i32): boolean {
-  c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+  return c >= 48 && c <= 57
+    || c >= 65 && c <= 90
+    || c >= 97 && c <= 122
+    || c == 95
 }
 
 // Whether call `c` of declared function `d` hands a value of set `s` to a parameter `d` returns,
@@ -1834,32 +1906,19 @@ function ftHandsBack(d: i32, c: Call, s: i32): boolean {
     if ftArgIsParam(c, i) && ftIsS(c.callArgs[i], s) { return true }
     const j = if f is FuncDecl && ftArgIsParam(c, i) { fnTagSharedJoinSet(f, i, c.callArgs) } else { -1 }
     const o = if j == s { fnTagSetOfTy(nodeTyIxOf(c.callArgs[i])) } else { -1 }
-    if o >= 0 && ftSetWithin(o, s) {
+    if o >= 0 && fnTagMembersWithin(o, s) {
       if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
       return true
     }
   }
-  false
-}
-
-// Whether argument `i` of call `c` is parameter `i`: positional, unnamed, with no spread at or
-// before it.
-function ftArgIsParam(c: Call, i: i32): boolean {
-  if i < 0 || i >= c.callArgs.length { return false }
-  if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
-  let j = 0
-  while j <= i {
-    if nodeAt(parenPeelIx(c.callArgs[j])) is Spread { return false }
-    j = j + 1
-  }
-  true
+  return false
 }
 
 // Whether `x` is a function name or lambda whose type holds set `s` in a parameter or result.
 function ftSigValue(x: i32, s: i32): boolean {
   const n = nodeAt(x)
   if !(n is Ident) && !(n is FuncDecl && n.fnName == "") { return false }
-  ftSigCarries(nodeTyIxOf(x), s, FT_HOLD_DEPTH)
+  return ftSigCarries(nodeTyIxOf(x), s, FT_HOLD_DEPTH)
 }
 
 // Whether `x` names a maker delivered to a closed function type whose result a maker row banks:
@@ -1870,7 +1929,7 @@ function ftMakerTwinServes(x: i32): boolean {
   const t = nodeCtxTyIxOf(x)
   if d < 0 || t < 0 || t >= T.tys.length || !ftClosedFnTy(t) { return false }
   const ft = tyAt(t)
-  ft is TyFunc && elabMakerRowHas(d, ft.fnRet)
+  return ft is TyFunc && elabMakerRowHas(d, ft.fnRet)
 }
 
 // Whether `x`, with parent `p` and grandparent `g`, is the value function `fn` returns at
@@ -1886,7 +1945,7 @@ function ftRetAtOwn(x: i32, p: i32, g: i32, fn: i32): boolean {
   if !(pn is Block) || g != fn || !(f is FuncDecl) || f.fnBody != p {
     return false
   }
-  pn.blkStmts.length > 0 && pn.blkStmts[pn.blkStmts.length - 1] == x
+  return pn.blkStmts.length > 0 && pn.blkStmts[pn.blkStmts.length - 1] == x
 }
 
 // Whether function value `x` has one signature to be built at: a function with no type
@@ -1900,7 +1959,7 @@ function ftValueSigned(x: i32): boolean {
   for q in f.fnParams {
     if !ftParamClosed(q) { return false }
   }
-  true
+  return true
 }
 
 // Whether parameter `q` has one type where it is written: declared, or seeded closed by the
@@ -1908,7 +1967,7 @@ function ftValueSigned(x: i32): boolean {
 function ftParamClosed(q: i32): boolean {
   const pn = nodeAt(q)
   if !(pn is Param) { return false }
-  pn.parType >= 0 || elabTyClosed(nodeTyIxOf(q), 0)
+  return pn.parType >= 0 || elabTyClosed(nodeTyIxOf(q), 0)
 }
 
 // Whether `x`, the child of `p` in `g`, names a member of set `s` delivered to a closed function
@@ -1937,13 +1996,13 @@ function ftNamedAtClosed(x: i32, p: i32, g: i32, s: i32): boolean {
   const f = nodeAt(cd)
   if !(f is FuncDecl) || i >= f.fnParams.length { return false }
   const q = nodeAt(f.fnParams[i])
-  q is Param && q.parType >= 0 && ftClosedFnTy(nodeTyIxOf(f.fnParams[i]))
+  return q is Param && q.parType >= 0 && ftClosedFnTy(nodeTyIxOf(f.fnParams[i]))
 }
 
-// Whether list literal `x`, bound at an annotation, holds set `s` only as members named in fields
-// of record literals that annotation builds at a closed function type, so each is its member's
-// closure and the list holds no id.
-function ftLitRecsAtClosed(x: i32, s: i32): boolean {
+// Whether list literal `x`, bound at an annotation, holds set `s` only as members named as its
+// elements or in fields of its record literals, each built at a closed function type there: each
+// is its member's closure and the list holds no id.
+function ftLitAtClosed(x: i32, s: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   const n = nodeAt(x)
   if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
@@ -1958,6 +2017,14 @@ function ftLitRecsAtClosed(x: i32, s: i32): boolean {
   }
   for e in n.arrElems {
     const o = nodeAt(e)
+    // A member's name, or the adapter the check built over one, is a closure at a closed type.
+    if o is Ident || o is FuncDecl {
+      const m = if o is Ident { identDeclOf(e) } else { -1 }
+      if o is Ident && !i32ListHas(fnTagMembers(s), m) { return false }
+      if o is FuncDecl && i32ListHas(fnTagMembers(s), e) { return false }
+      if !ftClosedFnTy(ftLitAnnotAt(e)) { return false }
+      continue
+    }
     if !(o is ObjLit) { return false }
     for fx in o.objFields {
       const f = nodeAt(fx)
@@ -1974,7 +2041,7 @@ function ftLitRecsAtClosed(x: i32, s: i32): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // The record a record literal `x` is built at, bound by an annotated binding directly or as an
@@ -2003,7 +2070,7 @@ function ftLitAnnotAt(x: i32): i32 {
         if t < 0 || t >= T.tys.length { return -1 }
         const tt = tyAt(t)
         if !(tt is TyArray) { return -1 }
-        t = tt.aElem
+        t = tyElemOf(tt)
         k = k + 1
       }
       return t
@@ -2011,7 +2078,7 @@ function ftLitAnnotAt(x: i32): i32 {
       return -1
     }
   }
-  -1
+  return -1
 }
 
 // Whether `x` is a call handing back one of its arguments (`ftHandBackArg`), the initialiser of
@@ -2019,7 +2086,7 @@ function ftLitAnnotAt(x: i32): i32 {
 function ftHandBackAtClosed(x: i32, p: i32): boolean {
   if !ftLate || x < 0 || p < 0 || ftHandBackArg(x) < 0 { return false }
   const pn = nodeAt(p)
-  pn is LetDecl
+  return pn is LetDecl
     && pn.letInit == x
     && pn.letType >= 0
     && ftClosedFnTy(nodeTyIxOf(p))
@@ -2028,7 +2095,7 @@ function ftHandBackAtClosed(x: i32, p: i32): boolean {
 // Whether set `s` has one member, a generic declaration.
 function ftOneGenericMember(s: i32): boolean {
   const ms = fnTagMembers(s)
-  ms.length == 1 && ftNamedDecl(ms[0]) && !ftPlainDecl(ms[0])
+  return ms.length == 1 && ftNamedDecl(ms[0]) && !ftPlainDecl(ms[0])
 }
 
 // The deliveries the plan in progress builds as the closure of its one member, and their types.
@@ -2046,12 +2113,12 @@ function ftHandBackArg(x: i32): i32 {
   const rp = mintRetParamsOf(d)
   if rp.length != 1 || !ftArgIsParam(c, rp[0]) { return -1 }
   const a = parenPeelIx(c.callArgs[rp[0]])
-  if a >= 0 && nodeAt(a) is Ident && identFnDeclOf(a) >= 0 { a } else { -1 }
+  return if a >= 0 && nodeAt(a) is Ident && identFnDeclOf(a) >= 0 { a } else { -1 }
 }
 
 // Whether `t` is a function type with no type parameter or hole in it.
 function ftClosedFnTy(t: i32): boolean {
-  t >= 0
+  return t >= 0
     && t < T.tys.length
     && tyAt(t) is TyFunc
     && !tyHasTyVar(t)
@@ -2062,7 +2129,7 @@ function ftClosedFnTy(t: i32): boolean {
 function ftPlainDecl(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const f = nodeAt(d)
-  f is FuncDecl && f.fnName != "" && f.fnTyParams.length == 0
+  return f is FuncDecl && f.fnName != "" && f.fnTyParams.length == 0
 }
 
 // Whether a written binding of set `s` may be delivered through an adapter: each member is a named
@@ -2082,7 +2149,7 @@ function ftWideEscOk(s: i32): boolean {
       return false
     }
   }
-  gen
+  return gen
 }
 
 // Whether function `m` has a parameter with no annotation, so each call instances it anew.
@@ -2093,12 +2160,12 @@ function ftHoleLambda(m: i32): boolean {
     const p = nodeAt(pi)
     if p is Param && p.parType < 0 { return true }
   }
-  false
+  return false
 }
 
 // Whether `x` is a delivery of set `s` that the last check built as an adapter.
 function ftWideEtaAt(x: i32, s: i32): boolean {
-  fnTagEtaAt(x) && fnTagEtaSetOf(x) == s && ftWideEscOk(s)
+  return fnTagEtaAt(x) && fnTagEtaSetOf(x) == s && ftWideEscOk(s)
 }
 
 // Whether `m` is the one member of set `s` and a lambda with an open parameter that can stand as
@@ -2109,14 +2176,17 @@ function ftHoleLambdaAlone(s: i32, m: i32): boolean {
     return false
   }
   const f = nodeAt(m)
-  f is FuncDecl && f.fnName == "" && !ftClosedLambda(f) && ftLambdaIdOk(m)
+  return f is FuncDecl
+    && f.fnName == ""
+    && !ftClosedLambda(f)
+    && ftLambdaIdOk(m)
 }
 
 // Whether node `d` declares a named function, generic or not.
 function ftNamedDecl(d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
   const f = nodeAt(d)
-  f is FuncDecl && f.fnName != ""
+  return f is FuncDecl && f.fnName != ""
 }
 
 // The sets an escape of type `t` delivers: its own, or those of its parameters and result.
@@ -2136,7 +2206,7 @@ function ftEscSets(t: i32): i32[] {
     const s = fnTagSetOfTy(q)
     if s >= 0 { out.push(s) }
   }
-  out
+  return out
 }
 
 // Whether function type `t` takes or returns a tagged set.
@@ -2148,7 +2218,7 @@ function ftSigTagged(t: i32): boolean {
   for q in ft.fnParamTypes {
     if fnTagSetIsTagged(fnTagSetOfTy(q)) { return true }
   }
-  false
+  return false
 }
 
 // Whether function type `t` holds set `s` in a parameter or result, `depth` signatures deep.
@@ -2162,7 +2232,7 @@ function ftSigCarries(t: i32, s: i32, depth: i32): boolean {
   for q in ft.fnParamTypes {
     if fnTagSetOfTy(q) == s || ftSigCarries(q, s, depth - 1) { return true }
   }
-  false
+  return false
 }
 
 // Whether `f` is a lambda with every parameter annotated: one instance, typed where it is
@@ -2172,7 +2242,7 @@ function ftClosedLambda(f: FuncDecl): boolean {
   for p in f.fnParams {
     if !ftParamClosed(p) { return false }
   }
-  true
+  return true
 }
 
 // Whether a node of a tagged set may sit in function `fn`: the program's top level, or a named
@@ -2180,7 +2250,7 @@ function ftClosedLambda(f: FuncDecl): boolean {
 function ftFnOk(fn: i32): boolean {
   if fn < 0 { return true }
   const f = nodeAt(fn)
-  f is FuncDecl && f.fnName != ""
+  return f is FuncDecl && f.fnName != ""
 }
 
 // Whether lambda `x` can stand as an id: it reads only its own bindings and the module's, so a
@@ -2215,7 +2285,7 @@ function ftLambdaIdOk(x: i32): boolean {
       return false
     }
   }
-  true
+  return true
 }
 
 // Whether node `x`, carrying set `s`, is a kind an id can be, recording the member names whose
@@ -2351,42 +2421,42 @@ function ftSubsetRead(v: i32, s: i32): boolean {
     return false
   }
   const o = fnTagSetOfTy(nodeTyIxOf(v))
-  if o < 0 || o == s || !ftSetWithin(o, s) { return false }
+  if o < 0 || o == s || !fnTagMembersWithin(o, s) { return false }
   if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
-  true
+  return true
 }
 
-// Whether a place of type `t` holds a set other than `s` with every member of `s`, tagged or
-// being decided with `s`.
+// Whether a place of type `t` holds a set other than `s` with every member of `s`: tagged, or
+// decided with `s`, as a join's tail is.
 function ftHeldWider(t: i32, s: i32): boolean {
   const o = fnTagSetOfTy(t)
-  if o < 0 || o == s || !ftSetWithin(s, o) { return false }
-  fnTagSetIsTagged(o) || i32ListHas(ftAssume, o)
+  if o < 0 || o == s || !fnTagMembersWithin(s, o) { return false }
+  if fnTagSetIsTagged(o) || i32ListHas(ftAssume, o) { return true }
+  if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
+  return true
 }
 
-// Whether every member of set `a` is a member of set `b`.
-function ftSetWithin(a: i32, b: i32): boolean {
-  const bm = fnTagMembers(b)
-  for d in fnTagMembers(a) {
-    if !i32ListHas(bm, d) { return false }
+// Whether write value `x` is a leaf `fnTagWriteLeavesOf` takes for `s`, or took for a wider set
+// planned with it or tagged: the write stores that set's id, and its own value is the same id.
+function ftWriteLeafOf(x: i32, s: i32): boolean {
+  let k = 0
+  while k < ftPlS.length {
+    const o = ftPlS[k]
+    if o != s && fnTagMembersWithin(s, o) && i32ListHas(ftPlLeaves[k], x) {
+      return true
+    }
+    k = k + 1
   }
-  true
-}
-
-// Whether the list `arr` is written holds a tagged set other than `s` with every member of `s`:
-// the write stores an id of that set, which its own decision covers.
-function ftStoreInWider(arr: i32, s: i32): boolean {
-  const ht = nodeTyIxOf(arr)
-  if ht < 0 || ht >= T.tys.length { return false }
-  const a = tyAt(ht)
-  if !(a is TyArray) { return false }
-  const o = fnTagSetOfTy(a.aElem)
-  if o < 0 || o == s || !fnTagSetIsTagged(o) { return false }
-  const om = fnTagMembers(o)
-  for d in fnTagMembers(s) {
-    if !i32ListHas(om, d) { return false }
+  const t = fnTagLeafSetOf(x)
+  if t >= 0 && t != s && fnTagSetIsTagged(t) && fnTagMembersWithin(s, t) {
+    return true
   }
-  true
+  const d = cwFnValueDeclOf(x)
+  const out: i32[] = []
+  const with: i32[] = []
+  return d >= 0
+    && fnTagWriteLeavesOf(d, s, ftHeldCur, out, with) >= 0
+    && i32ListHas(out, x)
 }
 
 // Whether `x` is a list literal whose elements each carry set `s` or name one of its members
@@ -2402,7 +2472,7 @@ function ftInnerLeaves(
   if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length { return false }
   const n = nodeAt(x)
   const tt = tyAt(t)
-  if !(n is ArrayLit) || !(tt is TyArray) || fnTagSetOfTy(tt.aElem) != s {
+  if !(n is ArrayLit) || !(tt is TyArray) || fnTagSetOfTy(tyElemOf(tt)) != s {
     return false
   }
   if !ftValuesOk(n.arrElems, s, ds, leaves, ids) { return false }
@@ -2410,7 +2480,7 @@ function ftInnerLeaves(
     ftRespine.push(x)
     ftRespineTy.push(t)
   }
-  true
+  return true
 }
 
 // Whether `x` is a list literal, names a `const` bound to one, or calls a function returning one.
@@ -2445,7 +2515,7 @@ function ftInnerLit(x: i32): boolean {
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return false }
   const dn = nodeAt(d)
-  dn is LetDecl
+  return dn is LetDecl
     && dn.letKw == "const"
     && dn.letInit >= 0
     && nodeAt(parenPeelIx(dn.letInit)) is ArrayLit
@@ -2460,7 +2530,7 @@ function ftJoinOk(
   leaves: i32[],
   ids: i32[],
 ): boolean {
-  ftJoinAt(x, nodeTyIxOf(x), s, ds, leaves, ids)
+  return ftJoinAt(x, nodeTyIxOf(x), s, ds, leaves, ids)
 }
 
 // `ftJoinAt` over each field of the record literal `lit` stored as `dst`, a record holding set
@@ -2478,7 +2548,7 @@ function ftRecWriteJoins(
   const lx = parenPeelIx(lit)
   const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
   if (
-    !(ln is ObjLit)
+    !(ln is ObjLit || ln is ArrayLit)
     || depth > FT_HOLD_DEPTH
     || dst < 0
     || dst >= T.tys.length
@@ -2486,7 +2556,20 @@ function ftRecWriteJoins(
     return true
   }
   const dt = tyAt(dst)
-  if !(dt is TyObj) { return true }
+  // A list literal of records written whole stores each at the list's element (D15357).
+  if ln is ArrayLit && dt is TyArray {
+    if !i32ListHas(ftRespine, lx) {
+      ftRespine.push(lx)
+      ftRespineTy.push(dst)
+    }
+    for el in ln.arrElems {
+      if !ftRecWriteJoins(el, tyElemOf(dt), s, ds, leaves, ids, depth + 1) {
+        return false
+      }
+    }
+    return true
+  }
+  if !(dt is TyObj) || !(ln is ObjLit) { return true }
   for fx in ln.objFields {
     const f = nodeAt(fx)
     if f is FieldInit {
@@ -2515,7 +2598,7 @@ function ftRecWriteJoins(
       }
     }
   }
-  true
+  return true
 }
 
 // `ftRecWriteJoins` over the literal `v` a map entry of value type `vt` takes, a record or a list
@@ -2536,7 +2619,9 @@ function ftMapEntryLitJoins(
   const t = tyAt(vt)
   if n is ArrayLit && t is TyArray {
     for el in n.arrElems {
-      if !ftMapEntryLitJoins(el, t.aElem, s, ds, leaves, ids) { return false }
+      if !ftMapEntryLitJoins(el, tyElemOf(t), s, ds, leaves, ids) {
+        return false
+      }
     }
   } else if !ftRecWriteJoins(vx, vt, s, ds, leaves, ids, 0) {
     return false
@@ -2545,17 +2630,13 @@ function ftMapEntryLitJoins(
     ftRespine.push(vx)
     ftRespineTy.push(vt)
   }
-  true
+  return true
 }
 
 // The element of list type `t` where that element is a function of set `s`, else -1.
 function ftListElemOfSet(t: i32, s: i32): i32 {
   const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-  if o is TyArray && o.aElem >= 0 && fnTagSetOfTy(o.aElem) == s {
-    o.aElem
-  } else {
-    -1
-  }
+  return if o is TyArray && !tyElemOpen(o) && fnTagSetOfTy(tyElemOf(o)) == s { tyElemOf(o) } else { -1 }
 }
 
 // `ftJoinOk` over the value `x` a node of type `t` takes: each nested join not yet of set `s`
@@ -2577,7 +2658,62 @@ function ftJoinAt(
       ftRespineTy.push(t)
     }
   }
-  ftValuesOk(vs, s, ds, leaves, ids)
+  return ftValuesOk(vs, s, ds, leaves, ids)
+}
+
+// The value a write of `v` into a binding of type `t` stores: where `v` reads a binding read
+// nowhere else (`cwSoleReadInit`) that names a top-level function, that name, with the read and
+// the binding re-typed to `t` (D15308); else `v`. Only outside an instanced function, and where
+// the read and the binding are in one function, so no instance or capture sees the binding.
+function ftWrittenNamedSource(v: i32, t: i32): i32 {
+  let x = parenPeelIx(v)
+  const own = if x >= 0 && x < P.nodes.length { recEnclosingFn(x) } else { -2 }
+  if own < -1 || own >= 0 && ftInstancedFnOrIn(own) { return v }
+  let hops = 0
+  while hops < 8 {
+    const bi = cwSoleReadInit(x)
+    const xd = if bi >= 0 { identDeclOf(x) } else { -1 }
+    if bi < 0 || recEnclosingFn(xd) != own {
+      hops = 8
+    } else if ftNamedFn(bi) >= 0 {
+      ftWrittenSourceAt(v, t)
+      return bi
+    } else if bi < P.nodes.length && nodeAt(bi) is Ident {
+      x = bi
+    } else {
+      hops = 8
+    }
+    hops = hops + 1
+  }
+  return v
+}
+
+// Whether function `f` is generic or open, or declared inside one (`ftWithinInstancedFn`).
+function ftInstancedFnOrIn(f: i32): boolean {
+  const fd = nodeAt(f)
+  return fd is FuncDecl && fd.fnTyParams.length > 0
+    || ftOpenFn(f)
+    || ftWithinInstancedFn(f)
+}
+
+// Re-types the read `v` of a binding `cwSoleReadInit` answers, and that binding, to `t`, through
+// bindings of bindings. True.
+function ftWrittenSourceAt(v: i32, t: i32): boolean {
+  let x = parenPeelIx(v)
+  let hops = 0
+  while hops < 8 && x >= 0 && x < P.nodes.length && nodeAt(x) is Ident {
+    const bi = cwSoleReadInit(x)
+    if bi < 0 { return true }
+    for j in [x, identDeclOf(x)] {
+      if !i32ListHas(ftRespine, j) {
+        ftRespine.push(j)
+        ftRespineTy.push(t)
+      }
+    }
+    x = bi
+    hops = hops + 1
+  }
+  return true
 }
 
 // Splits join `x` into the joins it is made of, `sp`, and the values they hand on, `vs`: the arms
@@ -2599,7 +2735,7 @@ function ftJoinSplit(x: i32, sp: i32[], vs: i32[]) {
       }
     }
   }
-  0
+  return 0
 }
 
 // Whether `v` reads an un-annotated parameter of a function every call reaching which
@@ -2620,12 +2756,12 @@ function ftParamHandedWithin(v: i32, s: i32): boolean {
   const sets = ftReachHandSets(fd, i32ListIndexOf(f.fnParams, pd), 0)
   if sets.length == 0 { return false }
   for st in sets {
-    if st < 0 || st != s && !ftSetWithin(st, s) { return false }
+    if st < 0 || st != s && !fnTagMembersWithin(st, s) { return false }
   }
   for st in sets {
     if st != s && !i32ListHas(ftSubNeed, st) { ftSubNeed.push(st) }
   }
-  true
+  return true
 }
 
 // The set of the value each call reaching function `fd` hands its parameter `pi`, -1 for a value
@@ -2729,7 +2865,7 @@ function ftReachHandSets(fd: i32, pi: i32, depth: i32): i32[] {
     }
     k = k + 2
   }
-  out
+  return out
 }
 
 // The position of the un-annotated parameter of declaration `fr` that read `a` names, or -1.
@@ -2752,7 +2888,7 @@ function ftParamIndexIn(fr: i32, a: i32): i32 {
   ) {
     return -1
   }
-  i32ListIndexOf(f.fnParams, pd)
+  return i32ListIndexOf(f.fnParams, pd)
 }
 
 // Whether `fr` is a named function no name reads and that is not exported, so its body never
@@ -2762,7 +2898,7 @@ function ftNeverRuns(fr: i32): boolean {
   const f = nodeAt(fr)
   if !(f is FuncDecl) || f.fnName == "" { return false }
   ftDirectCountsGrow()
-  (ftDirectRefs[fr] ?? 0) == 0
+  return (ftDirectRefs[fr] ?? 0) == 0
 }
 
 // Per function, the names reading it, the calls naming it as their callee, and each call handing
@@ -2859,7 +2995,7 @@ function ftDirectCountsGrow() {
     x = x + 1
   }
   ftDirectLen = end
-  0
+  return 0
 }
 
 // Whether a function nested in the body at `body` reads declaration `pd`.
@@ -2884,7 +3020,7 @@ function ftReadInNestedFn(body: i32, pd: i32): boolean {
       }
     }
   }
-  false
+  return false
 }
 
 // Each parameter under the root → the function declaring it, built once per decision.
@@ -2909,7 +3045,7 @@ function ftParamOwner(rootIx: i32, pd: i32): i32 {
       }
     }
   }
-  ftParamOwners[pd] ?? -1
+  return ftParamOwners[pd] ?? -1
 }
 
 // Whether the set being decided is held by a written `let`, whose writes a call must agree on.
@@ -2941,14 +3077,14 @@ function ftValuesOk(
       }
     }
   }
-  true
+  return true
 }
 
 // Whether `v`, a value a write, a join or a return gives the set, is a lambda member whose id can
 // stand for it, each call's arm instanced by the elaboration. One written inside a generic or
 // hole function is a value per instance, which one id cannot name.
 function ftLambdaLeaf(v: i32, ds: i32[]): boolean {
-  i32ListHas(ds, v)
+  return i32ListHas(ds, v)
     && nodeAt(v) is FuncDecl
     && ftLambdaIdOk(v)
     && (!ftWithinInstancedFn(v) || ftInstLeafOk(v, -1))
@@ -3021,7 +3157,7 @@ function ftInstLeafOk(x: i32, p: i32): boolean {
   for t in into {
     if t != b && !(own[t] ?? false) { return false }
   }
-  true
+  return true
 }
 
 // Whether nested declaration `w`, declared directly in `f`'s body, is used only as a callee there:
@@ -3041,7 +3177,7 @@ function ftWriterStays(w: i32, f: i32): boolean {
       if !(qn is Call) || qn.callFn != u { return false }
     }
   }
-  true
+  return true
 }
 
 // The `let` lambda `x` is written into by `p`, or by the first write of it under `body` when `p`
@@ -3076,7 +3212,7 @@ function ftLeafBinding(x: i32, p: i32, body: i32): i32 {
       }
     }
   }
-  -1
+  return -1
 }
 
 // Whether read `r` of the binding, under parent `p`, keeps its id in the instance: a call through
@@ -3090,7 +3226,9 @@ function ftInstLeafReadOk(r: i32, p: i32, inFn: boolean): boolean {
   if pn.binLeft == r { return true }
   const l = parenPeelIx(pn.binLeft)
   if l < 0 || l >= P.nodes.length { return false }
-  pn.binRight == r && nodeAt(l) is Ident && identDeclOf(l) == identDeclOf(r)
+  return pn.binRight == r
+    && nodeAt(l) is Ident
+    && identDeclOf(l) == identDeclOf(r)
 }
 
 // Whether lambda `x` is the value its parent `p` writes into a binding: a `let`'s initialiser or
@@ -3119,7 +3257,7 @@ function ftDeclaredBeside(ds: i32[]): boolean {
   for d in ds {
     if ftNamedDecl(d) { return true }
   }
-  false
+  return false
 }
 
 // Whether `x` is declared inside a generic or hole function, whose body each instance re-checks.
@@ -3133,7 +3271,7 @@ export function ftWithinInstancedFn(x: i32): boolean {
     f = fnDeclParent[f] ?? -1
     hops = hops + 1
   }
-  false
+  return false
 }
 
 // The member of `ds` the name at `v` reads, or -1; a local `const` reads its initialiser, a
@@ -3147,7 +3285,7 @@ function ftLeafMember(v: i32, ds: i32[]): i32 {
   const r = if src >= 0 && nodeAt(src) is Ident { identDeclOf(src) } else { -1 }
   const f = if r >= 0 && i32ListHas(ds, r) { nodeAt(r) } else { null }
   if !(f is FuncDecl) || f.fnName == "" || !ftLambdaIdOk(r) { return -1 }
-  r
+  return r
 }
 
 // The node a name at `v` takes its value from: the initialiser of the local `const` it reads,
@@ -3161,14 +3299,14 @@ function ftConstSource(v: i32, depth: i32): i32 {
   const rn = nodeAt(r)
   if !(rn is LetDecl) || rn.letInit < 0 { return v }
   if rn.letKw != "const" && !cwLetUnwritten(r) { return v }
-  ftConstSource(parenPeelIx(rn.letInit), depth - 1)
+  return ftConstSource(parenPeelIx(rn.letInit), depth - 1)
 }
 
 // The node call `c`'s callee takes its value from: after the elaboration, through local `const`
 // aliases, since the instance an alias's call reaches is keyed as the named call's is.
 function ftCalleeSource(c: Call): i32 {
   const f = parenPeelIx(c.callFn)
-  if ftLate { ftConstSource(f, 8) } else { f }
+  return if ftLate { ftConstSource(f, 8) } else { f }
 }
 
 // The function callee `v` names: after the elaboration any declared one, since a nested
@@ -3178,7 +3316,7 @@ function ftCalleeFn(v: i32): i32 {
     const nd = identDeclOf(v)
     if nd >= 0 && nd < P.nodes.length && nodeAt(nd) is FuncDecl { return nd }
   }
-  ftNamedFn(v)
+  return ftNamedFn(v)
 }
 
 // The top-level function the name at `v` reads, or -1 when it is no name of one.
@@ -3203,7 +3341,7 @@ function ftNamedFn(v: i32): i32 {
   if d < 0 { return -1 }
   if r >= 0 && r != d { return -1 }
   if r < 0 && elabFnIdOf(nodeTyIxOf(v)) != d { return -1 }
-  d
+  return d
 }
 
 // The named function the callee read `v` declares, nested or not, capturing or not; -1 for any
@@ -3216,7 +3354,7 @@ function ftNestedCalleeDecl(v: i32): i32 {
   const r = identDeclOf(x)
   if r < 0 || r >= P.nodes.length { return -1 }
   const rn = nodeAt(r)
-  if rn is FuncDecl && rn.fnName == n.identName { r } else { -1 }
+  return if rn is FuncDecl && rn.fnName == n.identName { r } else { -1 }
 }
 
 // The lambda, or the named function an un-annotated `const` aliases, that a `const` read `v` is
@@ -3234,7 +3372,7 @@ function ftConstFnOf(v: i32): i32 {
   if f is FuncDecl && f.fnName == "" { return li }
   if !(f is Ident) || b.letType >= 0 { return -1 }
   const fd = identDeclOf(li)
-  if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl { fd } else { -1 }
+  return if fd >= 0 && fd < P.nodes.length && nodeAt(fd) is FuncDecl { fd } else { -1 }
 }
 
 // Whether function `x` (a lambda or a named function's read) initialises the un-annotated `const`
@@ -3268,7 +3406,7 @@ function ftConstFnOnlyCalled(x: i32, p: i32): boolean {
       return false
     }
   }
-  true
+  return true
 }
 
 // Whether argument `x` of call `c` binds a parameter of set `s` itself, of a lambda called in
@@ -3287,7 +3425,7 @@ function ftParamOfSet(c: Call, x: i32, s: i32): boolean {
     if c.callArgs[i] == x { return fnTagSetOfTy(ft.fnParamTypes[i]) == s }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Whether `x` is an argument of call `c` through an element of a `const` list literal of named
@@ -3333,10 +3471,10 @@ function ftListCallHoleArg(c: Call, x: i32, s: i32): boolean {
     const hs = ftReachHandSets(d, i, 0)
     if hs.length == 0 { return false }
     for st in hs {
-      if st < 0 || st != s && !ftSetWithin(st, s) { return false }
+      if st < 0 || st != s && !fnTagMembersWithin(st, s) { return false }
     }
   }
-  true
+  return true
 }
 
 // Whether argument `x` of call `c`, carrying set `s`, binds a positional, un-annotated parameter
@@ -3367,7 +3505,7 @@ function ftHoleParamOf(c: Call, x: i32, s: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Whether parameter `i` of `f` is annotated with a bare own type parameter `T` that another
@@ -3391,11 +3529,11 @@ function ftTyParamOfHeldList(
     if qt is TypeRef && qt.tyName == tn.tyName + "[]" {
       const t = nodeTyIxOf(args[k])
       const h = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-      if h is TyArray && fnTagSetOfTy(h.aElem) == s { return true }
+      if h is TyArray && fnTagSetOfTy(tyElemOf(h)) == s { return true }
     }
     k = k + 1
   }
-  false
+  return false
 }
 
 // The arguments of call `cx` in its declared callee's parameter order, a method call's receiver
@@ -3419,7 +3557,7 @@ function ftParamOrderArgs(cx: i32): i32[] {
   }
   const out: i32[] = [parenPeelIx(cf.memObj)]
   for a in c.callArgs { out.push(a) }
-  out
+  return out
 }
 
 // Whether `f`'s body writes a read of parameter `par`, or of a `const` copy of it, into a holder's
@@ -3490,7 +3628,7 @@ function ftParamStored(
       }
     }
   }
-  false
+  return false
 }
 
 // Whether slot write `cm` pushes onto a list of `f`'s that holds reads of parameter `par` alone
@@ -3499,7 +3637,7 @@ function ftPushIntoParamList(f: FuncDecl, cm: Member, par: i32): boolean {
   if cm.memProp != "push" { return false }
   const o = parenPeelIx(cm.memObj)
   if o < 0 || o >= P.nodes.length || !(nodeAt(o) is Ident) { return false }
-  elabListParamSource(identDeclOf(o), f) == par
+  return elabListParamSource(identDeclOf(o), f) == par
 }
 
 // Whether the receiver of slot write `cm` (`push` or `set`) in `f` is a parameter of `f` that call
@@ -3517,9 +3655,11 @@ function ftStoreIntoHandedSet(
   const t = nodeTyIxOf(c.callArgs[j])
   if t < 0 || t >= T.tys.length { return false }
   const h = tyAt(t)
-  if cm.memProp == "push" && h is TyArray { return fnTagSetOfTy(h.aElem) == s }
-  if cm.memProp == "set" && h is TyMap { return fnTagSetOfTy(h.mVal) == s }
-  false
+  if cm.memProp == "push" && h is TyArray {
+    return fnTagSetOfTy(tyElemOf(h)) == s
+  }
+  if cm.memProp == "set" && h is TyMap { return fnTagSetOfTy(tyValOf(h)) == s }
+  return false
 }
 
 // Whether `f`'s body copies a `const` list literal holding a read of parameter `par` element by
@@ -3550,7 +3690,7 @@ export function ftParamListCopied(f: FuncDecl, par: i32): boolean {
       nodeChildrenPush(y, ys)
     }
   }
-  false
+  return false
 }
 
 // Whether read `x` is a delivery every instance records as one set's closure (`mintCloDeliveryNote`).
@@ -3560,7 +3700,7 @@ function ftCloDelivered(x: i32): boolean {
     if mintCloAtOf(r) == x { return mintCloSetOf(r) >= 0 }
     r = r + 1
   }
-  false
+  return false
 }
 
 // Whether `init` is a list literal with an element reading parameter `par` of `f`, or a copy of it.
@@ -3576,7 +3716,7 @@ function ftLitHoldsParam(f: FuncDecl, init: i32, par: i32): boolean {
       if d == par || fnTagParamCopyOf(f, d) == par { return true }
     }
   }
-  false
+  return false
 }
 
 // Whether parameter `i` of `d` is read only as a positional argument of calls through a set of
@@ -3629,7 +3769,7 @@ function ftParamForwardsSet(d: i32, i: i32, s: i32): boolean {
       }
     }
   }
-  seen
+  return seen
 }
 
 // Whether direct call `c` to a named function takes set `s` at argument `at` where a list of the
@@ -3645,12 +3785,14 @@ function ftForwardsToListJoin(c: Call, at: i32, s: i32): boolean {
     )
   }
   const j = fnTagListJoinSet(g, gf, at, ats)
-  if j < 0 || j == s || !ftSetWithin(s, j) || ftFwdDepth > 8 { return false }
+  if j < 0 || j == s || !fnTagMembersWithin(s, j) || ftFwdDepth > 8 {
+    return false
+  }
   if !i32ListHas(ftSubNeed, j) { ftSubNeed.push(j) }
   ftFwdDepth = ftFwdDepth + 1
   const ok = ftLateParamTakes(c, g, at, j)
   ftFwdDepth = ftFwdDepth - 1
-  ok
+  return ok
 }
 
 // How many `ftForwardsToListJoin` frames are open, so a recursive forward ends.
@@ -3665,14 +3807,14 @@ function ftForwardsToFwd(c: Call, at: i32, s: i32): boolean {
   ftFwdDepth = ftFwdDepth + 1
   const ok = ftParamForwardsSet(g, at, s)
   ftFwdDepth = ftFwdDepth - 1
-  ok
+  return ok
 }
 
 // Whether parameter `i` of the function declared at `d` is read nowhere in its body but as a
 // direct argument handed to another such parameter of a named function, `depth` hops in.
 function ftParamInert(d: i32, i: i32, depth: i32): boolean {
   const seen: i32[] = []
-  ftParamInertIn(d, i, depth, seen)
+  return ftParamInertIn(d, i, depth, seen)
 }
 
 // `ftParamInert`, where `seen` holds the (declaration, index) pairs already being asked, two
@@ -3711,7 +3853,7 @@ function ftParamInertIn(d: i32, i: i32, depth: i32, seen: i32[]): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // Whether parameter `i` of the function declared at `d` is read nowhere in its body.
@@ -3726,14 +3868,14 @@ function ftParamUnread(d: i32, i: i32): boolean {
     const o = cwIxNode[w.row]
     if o != f.fnParams[i] && identDeclOf(o) == f.fnParams[i] { return false }
   }
-  true
+  return true
 }
 
 // Whether callee `x` names a member of set `s` by its declaration, or by a `const` of the bare
 // name: a direct call, whatever the set's rep, so it reads no id of the set (D15338, D15926).
 function ftMemberDirectCall(x: i32, s: i32): boolean {
   const d = ftLocalAliasedFn(identDeclOf(x))
-  d >= 0
+  return d >= 0
     && d < P.nodes.length
     && nodeAt(d) is FuncDecl
     && i32ListHas(fnTagMembers(s), d)
@@ -3759,22 +3901,24 @@ function ftLateParamOk(c: Call, x: i32, s: i32): boolean {
     // A parameter handed on to calls through a wider set decided with `s` holds `s`'s id as one of
     // that set's (D15610).
     for w in ftAssume {
-      if w != s && ftSetWithin(s, w) && mintParamTakes(d, i, w) { return true }
+      if w != s && fnTagMembersWithin(s, w) && mintParamTakes(d, i, w) {
+        return true
+      }
     }
     // So does one whose every wider set holds `s`, each decided with it.
     const ws = mintParamTakesSets(d, i)
     if ws.length == 0 { return false }
     for w in ws {
-      if w == s || !ftSetWithin(s, w) { return false }
+      if w == s || !fnTagMembersWithin(s, w) { return false }
     }
     for w in ws {
       if !fnTagSetIsTagged(w) && !i32ListHas(ftSubNeed, w) { ftSubNeed.push(w) }
     }
     return true
   }
-  if !ftSetWithin(s, j) { return false }
+  if !fnTagMembersWithin(s, j) { return false }
   if !i32ListHas(ftSubNeed, j) { ftSubNeed.push(j) }
-  ftLateParamTakes(c, d, i, j)
+  return ftLateParamTakes(c, d, i, j)
 }
 
 // Notes for the decision of `s` each smaller set handed to a parameter that is handed on to the
@@ -3817,7 +3961,12 @@ function ftFwdInSubsets(c: i32, s: i32, leaves: i32[], ids: i32[]) {
     let k = 0
     while k + 1 < ins.length {
       for o in fnParamHandSets(ins[k], ins[k + 1]) {
-        if o >= 0 && o != s && ftSetWithin(o, s) && !i32ListHas(ftSubNeed, o) {
+        if (
+          o >= 0
+          && o != s
+          && fnTagMembersWithin(o, s)
+          && !i32ListHas(ftSubNeed, o)
+        ) {
           ftSubNeed.push(o)
         }
       }
@@ -3827,7 +3976,7 @@ function ftFwdInSubsets(c: i32, s: i32, leaves: i32[], ids: i32[]) {
     }
     q = q + 2
   }
-  0
+  return 0
 }
 
 // Whether parameter `i` of `d`, handed `s` by call `c`, takes it as the elaboration's facts read.
@@ -3835,7 +3984,7 @@ function ftLateParamTakes(c: Call, d: i32, i: i32, s: i32): boolean {
   // A written binding the parameter initialises is decided with `s` however else it takes `s`,
   // since the binding holds the id the parameter is handed.
   const seeds = ftParamSeedsWider(d, i, s)
-  seeds
+  return seeds
     || mintParamTakes(d, i, s)
     || ftParamUnread(d, i)
     || ftArgIsParam(c, i) && ftParamForwardsSet(d, i, s)
@@ -3849,7 +3998,7 @@ function ftLateParamTakes(c: Call, d: i32, i: i32, s: i32): boolean {
 function ftListedHandsOne(d: i32, i: i32, s: i32): boolean {
   const f = nodeAt(d)
   if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
-  ftParamListCopied(f, f.fnParams[i]) && ftReachHandsOne(d, i) == s
+  return ftParamListCopied(f, f.fnParams[i]) && ftReachHandsOne(d, i) == s
 }
 
 // The one set every call reaching `fd` hands its parameter `pi` (`ftReachHandSets`); -1 where
@@ -3861,20 +4010,20 @@ function ftReachHandsOne(fd: i32, pi: i32): i32 {
   for h in hs {
     if h != hs[0] { return -1 }
   }
-  hs[0]
+  return hs[0]
 }
 
 // Whether `x` names a written binding a parameter initialises, which holds `s` or a wider set
 // in every instance, the wider one decided with `s`.
 function ftSeededHolds(x: i32, s: i32): boolean {
   if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
-  ftWiderWith(mintSeedWideOfBind(identDeclOf(x)), s)
+  return ftWiderWith(mintSeedWideOfBind(identDeclOf(x)), s)
 }
 
 // Whether parameter `i` of `d`, holding set `s`, initialises written bindings that hold `s` or a
 // wider set decided with it, so the id an argument hands is what they hold.
 function ftParamSeedsWider(d: i32, i: i32, s: i32): boolean {
-  ftWiderWith(mintSeedWideOfParam(d, i, s), s)
+  return ftWiderWith(mintSeedWideOfParam(d, i, s), s)
 }
 
 // Whether `ws` is not empty and each set in it is `s` or holds `s`, queueing each wider one to
@@ -3882,12 +4031,12 @@ function ftParamSeedsWider(d: i32, i: i32, s: i32): boolean {
 function ftWiderWith(ws: i32[], s: i32): boolean {
   if ws.length == 0 { return false }
   for w in ws {
-    if w != s && !ftSetWithin(s, w) { return false }
+    if w != s && !fnTagMembersWithin(s, w) { return false }
   }
   for w in ws {
     if w != s && !i32ListHas(ftSubNeed, w) { ftSubNeed.push(w) }
   }
-  true
+  return true
 }
 
 // Whether, after the elaboration, argument `x` of call `c` through a set of functions lands in a
@@ -3931,7 +4080,7 @@ function ftLateArgOfSet(c: Call, x: i32, s: i32): boolean {
   ) {
     if !i32ListHas(ftSubNeed, cs) { ftSubNeed.push(cs) }
   }
-  true
+  return true
 }
 
 // Whether every declaration in `ds` is a named function.
@@ -3940,7 +4089,7 @@ function ftAllNamed(ds: i32[]): boolean {
     const m = nodeAt(d)
     if !(m is FuncDecl) || m.fnName == "" { return false }
   }
-  true
+  return true
 }
 
 // Whether some instance's calls through parameter `i` of a member of `ds` go through a set other
@@ -3951,7 +4100,7 @@ function ftParamTakesOther(ds: i32[], i: i32, s: i32): boolean {
       if o != s { return true }
     }
   }
-  false
+  return false
 }
 
 // Whether every call through parameter `par` goes through sets of named functions each of which
@@ -3975,7 +4124,7 @@ function ftParamSetsTake(par: i32, i: i32, s: i32): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // The deliveries of a choice to a closed function type noted by this check.
@@ -3998,7 +4147,7 @@ function ftEscBuilt(x: i32, s: i32, p: i32): boolean {
     if mintCloAtOf(r) == x && mintCloSetOf(r) == s { return true }
     r = r + 1
   }
-  false
+  return false
 }
 
 // The deliveries `ftLateCloAt` admitted at a parent, by the decision after the elaboration.
@@ -4036,7 +4185,7 @@ function ftLateCloAt(s: i32, dt: i32, p: i32): boolean {
       return false
     }
   }
-  true
+  return true
 }
 
 // Whether node `x` of set `s`, the child of `p` (itself the child of `g`) inside function `fn`,
@@ -4057,7 +4206,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return (ftParamOfSet(pn, x, s) && ftLateParamOk(pn, x, s))
         || ftMethodTyParamArg(p, x, s)
         || ftListCallHoleArg(pn, x, s)
-        || ftSlotWriteArg(pn, x, s, fn)
+        || ftSlotWriteArg(pn, x, s)
         || ftLateArgOfSet(pn, x, s)
     }
     // A binding's annotation delivers the value to a declared function type, a closure.
@@ -4131,20 +4280,36 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       if ftIsS(pn.binLeft, s) { return true }
       if ftSeededHolds(pn.binLeft, s) { return true }
       if ftHeldWider(nodeTyIxOf(pn.binLeft), s) { return true }
+      if ftWriteLeafOf(x, s) { return true }
       const ln = nodeAt(pn.binLeft)
       // `h[k] = v` stores into the slot `h.set(k, v)` does, so the holder's type decides (D15116).
       if ln is Member { return ftSlotHoldsSet(ln.memObj, ln.memProp, s) }
       return ln is Index
         && (ftSlotHoldsSet(ln.idxArr, "", s)
-        || ftStoreInWider(ln.idxArr, s)
         || ftNamedFnValue(x) && ftParamHolderHolds(ln.idxArr, s, fn))
     }
     FuncDecl => {
       if i32ListHas(pn.fnParams, x) { return true }
       return pn.fnBody == x && ftRetCarries(p, s)
     }
-    // A list literal holds the id as its element.
+    // A list literal holds the id as its element, unless its elements join to a function type
+    // that carries no set: it then holds closures. A one-generic-member set's value is that
+    // member's closure at the closed type an annotation builds the literal at; no other id fits.
     ArrayLit => {
+      const lt = nodeTyIxOf(p)
+      const la = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
+      const e0 = if la is TyArray { tyElemOf(la) } else { -1 }
+      const en = nonNullTy(e0)
+      if en < 0 || fnTagSetOfTy(e0) >= 0 || fnTagSetOfTy(en) >= 0 {
+        return true
+      }
+      if !(tyAt(en) is TyFunc) { return true }
+      const et = ftLitAnnotAt(x)
+      if !ftClosedFnTy(et) || fnTagSetOfTy(et) >= 0 || !ftOneGenericMember(s) {
+        return false
+      }
+      ftCloAt.push(x)
+      ftCloTy.push(et)
       return true
     }
     // A record literal holds the id as the field's value.
@@ -4186,7 +4351,9 @@ function ftLitJoin(
       const ek = ftHoldKind(nodeTyIxOf(el), s, FT_HOLD_DEPTH)
       if ek == 1 || ek == 4 {
         if !ftInnerLit(parenPeelIx(el)) { return false }
-      } else if !ftInnerLeaves(parenPeelIx(el), at.aElem, s, ds, leaves, ids) {
+      } else if (
+        !ftInnerLeaves(parenPeelIx(el), tyElemOf(at), s, ds, leaves, ids)
+      ) {
         return false
       }
     }
@@ -4205,17 +4372,19 @@ function ftLitJoin(
   // signature runs every member.
   if ftHoldKind(lt, s, FT_HOLD_DEPTH) == 6 && fnTagSetSplits(s) {
     for el in n.arrElems {
-      if !ftRecWriteJoins(el, at.aElem, s, ds, leaves, ids, 0) { return false }
+      if !ftRecWriteJoins(el, tyElemOf(at), s, ds, leaves, ids, 0) {
+        return false
+      }
     }
     return true
   }
-  if fnTagSetOfTy(at.aElem) != s { return true }
+  if fnTagSetOfTy(tyElemOf(at)) != s { return true }
   for el in n.arrElems {
-    if !ftIsS(el, s) && !ftJoinAt(el, at.aElem, s, ds, leaves, ids) {
+    if !ftIsS(el, s) && !ftJoinAt(el, tyElemOf(at), s, ds, leaves, ids) {
       return false
     }
   }
-  true
+  return true
 }
 
 // Whether `el`, an element of a list of maps of set `s`, is a map of `s` itself, or of a smaller set
@@ -4225,10 +4394,10 @@ function ftMapElemOk(el: i32, s: i32): boolean {
   const ek = ftHoldKind(et, s, FT_HOLD_DEPTH)
   if ek == 3 || ek == 7 { return true }
   const em = if et >= 0 && et < T.tys.length { tyAt(et) } else { null }
-  const es = if em is TyMap { fnTagSetOfTy(em.mVal) } else { -1 }
-  if es < 0 || es == s || !ftSetWithin(es, s) { return false }
+  const es = if em is TyMap { fnTagSetOfTy(tyValOf(em)) } else { -1 }
+  if es < 0 || es == s || !fnTagMembersWithin(es, s) { return false }
   if !i32ListHas(ftSubNeed, es) { ftSubNeed.push(es) }
-  true
+  return true
 }
 
 // Whether literal `x` holds set `s` only through values whose deliveries into it the decision
@@ -4239,8 +4408,8 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
   // A copy `fvaListSetCopy` built is a fresh list of adapters, which holds no id (D15132).
   if fvaListCopyAt(x) { return true }
-  // A list literal of records an annotation builds at its closures holds none either (D15338).
-  if ftLitRecsAtClosed(x, s) { return true }
+  // A list literal an annotation builds at its closures holds none either (D15338).
+  if ftLitAtClosed(x, s) { return true }
   const n = nodeAt(x)
   // A record literal the record solve builds at a place holding no set decided with `s` holds
   // that place's closures.
@@ -4288,7 +4457,7 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
       any = true
     }
   }
-  any
+  return any
 }
 
 // Whether `v` is a delivery of one-member set `s` the late decision coerces to a closure.
@@ -4306,13 +4475,13 @@ function ftCoercedEscape(v: i32, s: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Whether node `x` is a list whose element carries set `s`, or a record with a field that holds
 // one.
 function ftHolds(x: i32, s: i32): boolean {
-  x >= 0 && ftHoldKind(nodeTyIxOf(x), s, FT_HOLD_DEPTH) > 0
+  return x >= 0 && ftHoldKind(nodeTyIxOf(x), s, FT_HOLD_DEPTH) > 0
 }
 
 // How many list, record and map levels `ftHoldKind` reads down to a set.
@@ -4322,7 +4491,7 @@ const FT_HOLD_DEPTH = 8
 // at (its adopted rep, else its own), which may hold a set decided with `s`: a field that carries
 // no such set there is a closure field, so its value cannot be an id (D15205).
 function ftRecHolds(x: i32, s: i32): boolean {
-  x >= 0 && ftTyHoldsDecided(nodeRepTyIxOf(x), s)
+  return x >= 0 && ftTyHoldsDecided(nodeRepTyIxOf(x), s)
 }
 
 // The record literals the plan in progress holds through a field naming a function.
@@ -4336,7 +4505,7 @@ function ftNamedFieldHolds(g: i32, x: i32, name: string, s: i32): boolean {
   if !ftLate || g < 0 || !ftNamedFnValue(x) { return false }
   if fnTagSetOfTy(tyFieldTyOf(nodeTyIxOf(g), name)) != s { return false }
   const rf = tyFieldTyOf(nodeRepTyIxOf(g), name)
-  rf >= 0
+  return rf >= 0
     && rf < T.tys.length
     && (!(tyAt(rf) is TyFunc) || fnTagSetOfTy(rf) == s)
 }
@@ -4372,7 +4541,7 @@ function ftOpenFieldHolds(x: i32, name: string, s: i32): boolean {
       }
     }
   }
-  true
+  return true
 }
 
 // 1: a list whose element carries set `s`; 2: a record with a field of any kind within `depth`
@@ -4384,8 +4553,8 @@ function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
   const a = tyAt(t)
   match a {
     TyArray => {
-      if fnTagSetOfTy(a.aElem) == s { return 1 }
-      const ek = ftHoldKind(a.aElem, s, depth - 1)
+      if fnTagSetOfTy(tyElemOf(a)) == s { return 1 }
+      const ek = ftHoldKind(tyElemOf(a), s, depth - 1)
       if ek == 1 || ek == 4 { return 4 }
       if ek == 2 || ek == 6 { return 6 }
       if ek == 3 || ek == 7 { return 7 }
@@ -4399,8 +4568,8 @@ function ftHoldKind(t: i32, s: i32, depth: i32): i32 {
       return 0
     }
     TyMap => {
-      if fnTagSetOfTy(a.mVal) == s { return 3 }
-      const vk = ftHoldKind(a.mVal, s, depth - 1)
+      if fnTagSetOfTy(tyValOf(a)) == s { return 3 }
+      const vk = ftHoldKind(tyValOf(a), s, depth - 1)
       if vk == 1 || vk == 4 { return 5 }
       if vk == 2 || vk == 6 || vk == 8 { return 8 }
       return 0
@@ -4427,15 +4596,15 @@ function ftMapEntryOf(x: i32, s: i32): i32 {
   const mk = if mt >= 0 && mt < T.tys.length { ftHoldKind(mt, s, FT_HOLD_DEPTH) } else { 0 }
   if mk != 5 && mk != 8 { return -1 }
   const m = tyAt(mt)
-  if m is TyMap { return m.mVal }
-  -1
+  if m is TyMap { return tyValOf(m) }
+  return -1
 }
 
 // Whether type `t` is `V | null` over a `V` of set `s`: what a map of the set's ids reads.
 function ftNulOfS(t: i32, s: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const a = tyAt(t)
-  a is TyNullable && fnTagSetOfTy(a.nInner) == s
+  return a is TyNullable && fnTagSetOfTy(a.nInner) == s
 }
 
 // The slot type of the holder `x` indexes when `x` is the target of store `p` and is not itself
@@ -4447,7 +4616,7 @@ function ftSlotStoreTy(x: i32, p: i32, s: i32): i32 {
   if !(pn is BinExpr && ftIsStore(pn) && pn.binLeft == x) { return -1 }
   const n = nodeAt(x)
   if !(n is Index) { return -1 }
-  ftSlotTyOf(nodeTyIxOf(n.idxArr), s)
+  return ftSlotTyOf(nodeTyIxOf(n.idxArr), s)
 }
 
 // The values call `g`, through field read `p` of holder `x` of set `s`, writes into the holder's
@@ -4482,7 +4651,7 @@ function ftSlotWrites(x: i32, p: i32, g: i32, s: i32): i32[] {
   if ftHoldKind(nodeTyIxOf(x), s, FT_HOLD_DEPTH) == 5 { return none }
   if pn.memProp == "push" { return gn.callArgs }
   if pn.memProp == "set" && gn.callArgs.length == 2 { return [gn.callArgs[1]] }
-  none
+  return none
 }
 
 // The slot type of `ht`, a list or map type whose slot carries set `s`; -1 for any other type.
@@ -4493,10 +4662,10 @@ function ftSlotTyOf(ht: i32, s: i32): i32 {
   const h = tyAt(ht)
   match h {
     TyArray => {
-      return h.aElem
+      return tyElemOf(h)
     }
     TyMap => {
-      return h.mVal
+      return tyValOf(h)
     }
     // ftHoldKind names a list or a map at kinds 1 and 3.
     TyObj | TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
@@ -4532,9 +4701,17 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
     const c = nodeAt(g)
     if !(c is Call) || c.callArgs.length == 0 { return false }
     for a in c.callArgs {
-      if recAsgFnWidenedTy(parenPeelIx(a)) < 0 { return false }
+      const ax = parenPeelIx(a)
+      if recAsgFnWidenedTy(ax) < 0 && !ftWholeRecListLit(ax, 0) { return false }
     }
-    for a in c.callArgs { ftWrittenNote(parenPeelIx(a)) }
+    for a in c.callArgs {
+      const ax = parenPeelIx(a)
+      if ftWholeRecListLit(ax, 0) {
+        ftWrittenWholeNote(ax, x)
+      } else {
+        ftWrittenNote(ax)
+      }
+    }
     return true
   }
   // A slice of such a list of records copies its records, built at the holder's record; a `get`
@@ -4549,8 +4726,12 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
     return op == "push" || op == "slice" || op == "pop" || op == "get"
   }
   // A map's `keys()` hands out no value, so it reads none of the set's ids.
-  (k == 3 || k == 5 || k == 8)
-    && (op == "get" || op == "set" || op == "has" || op == "delete" || op == "keys")
+  return (k == 3 || k == 5 || k == 8)
+    && (op == "get"
+    || op == "set"
+    || op == "has"
+    || op == "delete"
+    || op == "keys")
 }
 
 // Whether callback `v` names a top-level function whose first parameter is un-annotated: the
@@ -4561,21 +4742,19 @@ function ftHoleCallback(v: i32): boolean {
   const f = nodeAt(d)
   if !(f is FuncDecl) || f.fnParams.length == 0 { return false }
   const pn = nodeAt(f.fnParams[0])
-  pn is Param && pn.parType < 0
+  return pn is Param && pn.parType < 0
 }
 
 // Whether argument `x` of call `c` is a value `m.set(k, v)` or `xs.push(v)` stores into a
 // holder of set `s`.
-function ftSlotWriteArg(c: Call, x: i32, s: i32, encl: i32): boolean {
+function ftSlotWriteArg(c: Call, x: i32, s: i32): boolean {
   const f = parenPeelIx(c.callFn)
   if f < 0 { return false }
   const fn = nodeAt(f)
   if !(fn is Member) { return false }
   const k = ftHoldKind(nodeTyIxOf(fn.memObj), s, FT_HOLD_DEPTH)
   if k == 1 && fn.memProp == "push" { return i32ListHas(c.callArgs, x) }
-  (ftSlotHoldsSet(fn.memObj, "", s)
-    || k == 5
-    || ftNamedFnValue(x) && ftParamHolderHolds(fn.memObj, s, encl))
+  return (ftSlotHoldsSet(fn.memObj, "", s) || k == 5 || ftWriteLeafOf(x, s))
     && fn.memProp == "set"
     && c.callArgs.length == 2
     && c.callArgs[1] == x
@@ -4585,7 +4764,10 @@ function ftSlotWriteArg(c: Call, x: i32, s: i32, encl: i32): boolean {
 // function it is written in.
 function ftNamedFnValue(x: i32): boolean {
   const v = parenPeelIx(x)
-  v >= 0 && v < P.nodes.length && nodeAt(v) is Ident && identFnDeclOf(v) >= 0
+  return v >= 0
+    && v < P.nodes.length
+    && nodeAt(v) is Ident
+    && identFnDeclOf(v) >= 0
 }
 
 // Whether `h` reads an un-annotated parameter of `fd`, the function the read is in, that every call
@@ -4608,17 +4790,17 @@ function ftParamHolderHolds(h: i32, s: i32, fd: i32): boolean {
   for a in args {
     const t = nodeTyIxOf(a)
     const at = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-    const slot = if at is TyArray { at.aElem } else if at is TyMap { at.mVal } else { -1 }
+    const slot = if at is TyArray { tyElemOf(at) } else if at is TyMap { tyValOf(at) } else { -1 }
     // A slot of records holding `s` takes a record literal of the set's ids.
     const sk = ftHoldKind(slot, s, FT_HOLD_DEPTH)
     const o = if sk == 2 { s } else { fnTagSetOfTy(slot) }
-    if o < 0 || o != s && !ftSetWithin(s, o) { return false }
+    if o < 0 || o != s && !fnTagMembersWithin(s, o) { return false }
     if o != s && !i32ListHas(wider, o) { wider.push(o) }
   }
   for o in wider {
     if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
   }
-  true
+  return true
 }
 
 // Whether a slot of holder `h` holds set `s`'s ids itself: with `prop` "" a list's element or a
@@ -4642,7 +4824,7 @@ function ftSlotHoldsSet(h: i32, prop: string, s: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // The value type of the map `m.set(k, x)` writes `x` into, when that map's value holds set `s`
@@ -4657,8 +4839,8 @@ function ftMapSetValTy(c: Call, x: i32, s: i32): i32 {
   const mk = if mt >= 0 && mt < T.tys.length { ftHoldKind(mt, s, FT_HOLD_DEPTH) } else { 0 }
   if mk != 5 && mk != 8 { return -1 }
   const m = tyAt(mt)
-  if m is TyMap { return m.mVal }
-  -1
+  if m is TyMap { return tyValOf(m) }
+  return -1
 }
 
 // Whether holder `x` of set `s`, the child of `p` in function `fn`, is only read there or is
@@ -4747,7 +4929,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     Call => {
       // A binding, or a named function's result, handed to a hole parameter binds it to that
       // value's own type, and the callee's writes through it join this set (D14648, D15430).
-      return ftDstTakes(ftArgDstTy(pn, x), x, s)
+      const ok = ftDstTakes(ftArgDstTy(pn, x), x, s)
         || ftDstTakes(ftMapSetValTy(pn, x, s), x, s)
         || ftPushRecvOf(pn, x) >= 0
         && ftMapListOfWider(ftPushRecvOf(pn, x), x, s)
@@ -4755,25 +4937,30 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         && ftDstTakes(ftArrElemTy(ftPushRecvOf(pn, x)), x, s)
         || ftRecIntoMapSet(x, pn, s, fn)
         || ftTyParamListTakes(p, x, s)
-        || ftLate
-        && ftHoleArg(pn, x)
-        && (ftInnerLit(parenPeelIx(x)) || nodeAt(parenPeelIx(x)) is ObjLit)
-        && ftDeclsOnly(s)
-        && !mintSetPartial(s)
         || ftHoleArg(pn, x)
-        && (nodeAt(parenPeelIx(x)) is Ident || ftNamedCallOf(x))
+        && ftHandedHolder(x)
         && ftDeclsOnly(s)
         && !mintSetPartial(s)
+      // A field or element read, or a named call's result, handed on is held, so its place's
+      // rep is stamped on it.
+      const xp = parenPeelIx(x)
+      const xn = if xp >= 0 && xp < P.nodes.length { nodeAt(xp) } else { null }
+      const place = xn is Member
+        || xn is Index
+        || xn is Call && ftNamedCallOf(xp)
+      if ok && place && !i32ListHas(ftHeldCur, x) { ftHeldCur.push(x) }
+      return ok
     }
     BinExpr => {
       if ftIsStore(pn) && pn.binRight == x {
         // A record literal into a map of the set's records is noted first, for its row.
         return ftRecIntoMapSlot(x, pn.binLeft, s, fn)
           || ftDstTakes(nodeTyIxOf(pn.binLeft), x, s)
+          || ftStoredAt(x, s)
           || ftDstTakes(ftMapEntryOf(pn.binLeft, s), x, s)
       }
       if ftIsStore(pn) && pn.binLeft == x {
-        return ftDstTakes(tx, pn.binRight, s)
+        return ftDstTakes(tx, pn.binRight, s) || ftStoredAt(pn.binRight, s)
       }
       // A holder compared with `null` is read for presence alone.
       if pn.binOp == "==" || pn.binOp == "!=" {
@@ -4822,6 +5009,30 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   }
 }
 
+// Whether `x`, handed to a hole parameter, is a holder the parameter's instance binds as it binds
+// a name of it: a binding, a named call, after the elaboration a literal, or a value `if` or
+// `match` each of whose tails is one.
+function ftHandedHolder(x: i32): boolean {
+  const v = parenPeelIx(x)
+  if v < 0 || v >= P.nodes.length { return false }
+  const vn = nodeAt(v)
+  if vn is IfStmt || vn is MatchExpr {
+    const ts: i32[] = []
+    tailValueLeaves(v, ts)
+    if ts.length == 0 { return false }
+    for t in ts {
+      if t == v || !ftHandedHolder(t) { return false }
+    }
+    return true
+  }
+  // A field or element of a handed holder is the place it reads, rooted as that holder is.
+  if vn is Member { return ftHandedHolder(vn.memObj) }
+  if vn is Index { return ftHandedHolder(vn.idxArr) }
+  return vn is Ident
+    || ftNamedCallOf(v)
+    || ftLate && (ftInnerLit(v) || vn is ObjLit)
+}
+
 // The record the record solve builds literal `x` at where a write or push places it, or -1:
 // `recAsgFnWidenedTy`'s answer, or the stamp a pushed literal took at a list's element that
 // differs from its own record in function fields alone.
@@ -4834,17 +5045,13 @@ function ftLitBuiltAt(x: i32): i32 {
   const f = if c is Call && c.callFn >= 0 { nodeAt(parenPeelIx(c.callFn)) } else { null }
   if !(f is Member) || f.memProp != "push" { return -1 }
   const rt = nodeRepTyIxOf(x)
-  if rt != nodeTyIxOf(x) && recFnFieldsWiden(nodeTyIxOf(x), rt) {
-    rt
-  } else {
-    -1
-  }
+  return if rt != nodeTyIxOf(x) && recFnFieldsWiden(nodeTyIxOf(x), rt) { rt } else { -1 }
 }
 
 // Whether node `x` holds set `s`, or a set the decision in progress takes as tagged with every
 // member of `s`: a choice joining arms of smaller sets holds each arm's ids.
 function ftHoldsDecided(x: i32, s: i32): boolean {
-  x >= 0 && ftTyHoldsDecided(nodeTyIxOf(x), s)
+  return x >= 0 && ftTyHoldsDecided(nodeTyIxOf(x), s)
 }
 
 // Whether the value join `g` holds a set wider than `s` that is not yet decided, which is then
@@ -4853,14 +5060,14 @@ function ftJoinWiderNeed(g: i32, s: i32): boolean {
   const ws: i32[] = []
   ftTySetsHeld(nodeTyIxOf(g), ws, FT_HOLD_DEPTH)
   for w in ws {
-    if w != s && !fnTagSetIsTagged(w) && ftSetWithin(s, w) {
+    if w != s && !fnTagSetIsTagged(w) && fnTagMembersWithin(s, w) {
       if !i32ListHas(ftAssume, w) && !i32ListHas(ftSubNeed, w) {
         ftSubNeed.push(w)
       }
       return true
     }
   }
-  false
+  return false
 }
 
 // Appends to `out` each set a list, record or map type `t` holds, within `depth` levels.
@@ -4868,8 +5075,8 @@ function ftTySetsHeld(t: i32, out: i32[], depth: i32) {
   if depth <= 0 || t < 0 || t >= T.tys.length { return 0 }
   const a = tyAt(t)
   const parts: i32[] = []
-  if a is TyArray { parts.push(a.aElem) }
-  if a is TyMap { parts.push(a.mVal) }
+  if a is TyArray { parts.push(tyElemOf(a)) }
+  if a is TyMap { parts.push(tyValOf(a)) }
   if a is TyObj {
     for f in a.objFieldTypes { parts.push(f) }
   }
@@ -4878,18 +5085,22 @@ function ftTySetsHeld(t: i32, out: i32[], depth: i32) {
     if es >= 0 && !i32ListHas(out, es) { out.push(es) }
     ftTySetsHeld(e, out, depth - 1)
   }
-  0
+  return 0
 }
 
 // `ftHoldsDecided` for a type `t`.
 function ftTyHoldsDecided(t: i32, s: i32): boolean {
   if ftHoldKind(t, s, FT_HOLD_DEPTH) > 0 { return true }
   for o in ftAssume {
-    if o != s && ftSetWithin(s, o) && ftHoldKind(t, o, FT_HOLD_DEPTH) > 0 {
+    if (
+      o != s
+      && fnTagMembersWithin(s, o)
+      && ftHoldKind(t, o, FT_HOLD_DEPTH) > 0
+    ) {
       return true
     }
   }
-  false
+  return false
 }
 
 // The receiver of `xs.push(…)` call `c` where `x` is one of its arguments, else -1.
@@ -4899,7 +5110,7 @@ function ftPushRecvOf(c: Call, x: i32): i32 {
   if !(fn is Member) || fn.memProp != "push" || !i32ListHas(c.callArgs, x) {
     return -1
   }
-  fn.memObj
+  return fn.memObj
 }
 
 // Whether `p`, a list literal or a list a map is pushed onto, is a list of maps of a set decided
@@ -4907,13 +5118,13 @@ function ftPushRecvOf(c: Call, x: i32): i32 {
 // (D15234, D15395). A wider set not yet decided is noted to be decided with `s`, as a join's is,
 // so a smaller set two such lists share is decided with both (D15394).
 function ftMapListOfWider(p: i32, x: i32, s: i32): boolean {
-  ftHolderListOfWider(p, x, s, 3, 7)
+  return ftHolderListOfWider(p, x, s, 3, 7)
 }
 
 // `ftMapListOfWider` for a record `x` whose field carries `s`, in a list of records of a wider
 // set (D15924).
 function ftRecListOfWider(p: i32, x: i32, s: i32): boolean {
-  ftHolderListOfWider(p, x, s, 2, 6)
+  return ftHolderListOfWider(p, x, s, 2, 6)
 }
 
 // Whether `x`, a holder of hold kind `xk` of set `s`, sits in `p`, a list of hold kind `pk` of a
@@ -4935,7 +5146,7 @@ function ftHolderListOfWider(
   for o in ftAssume {
     if (
       o != s
-      && ftSetWithin(s, o)
+      && fnTagMembersWithin(s, o)
       && ftHoldKind(nodeTyIxOf(p), o, FT_HOLD_DEPTH) == pk
     ) {
       return true
@@ -4947,14 +5158,14 @@ function ftHolderListOfWider(
     if (
       w != s
       && !fnTagSetIsTagged(w)
-      && ftSetWithin(s, w)
+      && fnTagMembersWithin(s, w)
       && ftHoldKind(nodeTyIxOf(p), w, FT_HOLD_DEPTH) == pk
     ) {
       if !i32ListHas(ftSubNeed, w) { ftSubNeed.push(w) }
       return true
     }
   }
-  false
+  return false
 }
 
 // Whether holder `x`, a list whose element carries set `s`, is handed by call `cx` (a method
@@ -4985,18 +5196,18 @@ function ftTyParamListTakes(cx: i32, x: i32, s: i32): boolean {
       if k >= args.length { return false }
       const t = nodeTyIxOf(args[k])
       const h = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
-      const at = if qt.tyName == tp { t } else if h is TyArray { h.aElem } else { -1 }
+      const at = if qt.tyName == tp { t } else if h is TyArray { tyElemOf(h) } else { -1 }
       if fnTagSetOfTy(at) != s { return false }
     }
     k = k + 1
   }
-  true
+  return true
 }
 
 // Whether `x` is a statement of `p` whose value nothing reads: a module statement, or one before a
 // block's last.
 function ftDiscardedAt(p: i32, x: i32): boolean {
-  p >= 0
+  return p >= 0
     && p < P.nodes.length
     && (nodeAt(p) is Program || ftStmtDiscarded(p, x))
 }
@@ -5007,7 +5218,7 @@ function ftMethodRecvHolds(cx: i32, s: i32): boolean {
   const c = nodeAt(cx)
   if !(c is Call) { return false }
   const cf = nodeAt(parenPeelIx(c.callFn))
-  cf is Member && ftTyParamListTakes(cx, parenPeelIx(cf.memObj), s)
+  return cf is Member && ftTyParamListTakes(cx, parenPeelIx(cf.memObj), s)
 }
 
 // Whether argument `x` of method call `cx` binds a parameter its declared callee annotates with a
@@ -5020,7 +5231,7 @@ function ftMethodTyParamArg(cx: i32, x: i32, s: i32): boolean {
   const f = if args.length > 0 && d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(f is FuncDecl) { return false }
   const i = i32ListIndexOf(args, x)
-  i > 0 && ftTyParamOfHeldList(f, i, args, s)
+  return i > 0 && ftTyParamOfHeldList(f, i, args, s)
 }
 
 // The record literals the plan in progress writes into a map of its set's records, and the map
@@ -5032,14 +5243,14 @@ let ftMapRecFn: i32[] = []
 // `ftRecIntoMap` for record literal `x` stored by index into slot `slot`.
 function ftRecIntoMapSlot(x: i32, slot: i32, s: i32, fd: i32): boolean {
   const sn = if slot >= 0 && slot < P.nodes.length { nodeAt(slot) } else { null }
-  sn is Index && ftRecIntoMap(x, sn.idxArr, s, fd)
+  return sn is Index && ftRecIntoMap(x, sn.idxArr, s, fd)
 }
 
 // `ftRecIntoMapSlot` for `m.set(k, x)`, call `c` storing record literal `x` into `m`'s slot.
 function ftRecIntoMapSet(x: i32, c: Call, s: i32, fd: i32): boolean {
   const f = parenPeelIx(c.callFn)
   const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
-  fn is Member
+  return fn is Member
     && fn.memProp == "set"
     && c.callArgs.length == 2
     && c.callArgs[1] == x
@@ -5060,7 +5271,7 @@ function ftRecIntoMap(x: i32, m: i32, s: i32, fd: i32): boolean {
   ftMapRecLit.push(lx)
   ftMapRecMap.push(m)
   ftMapRecFn.push(fd)
-  true
+  return true
 }
 
 // Whether every field of record literal `n` that carries set `s` names a declared function: the
@@ -5076,7 +5287,7 @@ function ftRecFieldsNamed(n: ObjLit, s: i32): boolean {
       return false
     }
   }
-  true
+  return true
 }
 
 // The record rep of the map read `m` holds: its binding's stamped map rep's value, or, for a
@@ -5095,7 +5306,7 @@ function ftMapRecRep(m: i32, fd: i32): i32 {
   }
   const r = if d >= 0 { fnTagHeldRepOf(d) } else { -1 }
   const rm = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
-  if rm is TyMap { rm.mVal } else { -1 }
+  return if rm is TyMap { tyValOf(rm) } else { -1 }
 }
 // Whether a destination of type `dst` takes the holder `x` of set `s` as it is: its own type, or a
 // record of the storage `x` is built at that holds `s` or a set decided with it, so the holder's
@@ -5113,15 +5324,17 @@ function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
   if (
     dm is TyMap
     && xm is TyMap
-    && tySame(dm.mKey, xm.mKey)
-    && (fnTagSetOfTy(dm.mVal) == s
-      && (fnTagSetOfTy(xm.mVal) == s || ftSubsetNote(fnTagSetOfTy(xm.mVal), s))
-      || fnTagSetOfTy(xm.mVal) == s && ftSetDecidedWith(fnTagSetOfTy(dm.mVal), s))
+    && tySame(tyKeyOf(dm), tyKeyOf(xm))
+    && (fnTagSetOfTy(tyValOf(dm)) == s
+      && (fnTagSetOfTy(tyValOf(xm)) == s
+      || ftSubsetNote(fnTagSetOfTy(tyValOf(xm)), s))
+      || fnTagSetOfTy(tyValOf(xm)) == s
+      && ftSetDecidedWith(fnTagSetOfTy(tyValOf(dm)), s))
   ) {
     return true
   }
   const bt = nodeRepTyIxOf(x)
-  bt >= 0
+  return bt >= 0
     && bt < T.tys.length
     && dst < T.tys.length
     && tyAt(dst) is TyObj
@@ -5133,14 +5346,14 @@ function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
 // Whether set `o` is `s`, or a set the plan in progress decides with `s` that `s` is within.
 function ftSetDecidedWith(o: i32, s: i32): boolean {
   if o == s { return true }
-  o >= 0 && i32ListHas(ftAssume, o) && ftSetWithin(s, o)
+  return o >= 0 && i32ListHas(ftAssume, o) && fnTagMembersWithin(s, o)
 }
 
 // Whether set `o` is a set other than `s` within it, noting it for the decision in progress.
 function ftSubsetNote(o: i32, s: i32): boolean {
-  if o < 0 || o == s || !ftSetWithin(o, s) { return false }
+  if o < 0 || o == s || !fnTagMembersWithin(o, s) { return false }
   if !i32ListHas(ftSubNeed, o) { ftSubNeed.push(o) }
-  true
+  return true
 }
 
 // Notes, for function `fn` whose result is a map of set `s`, each returned map's set within `s`:
@@ -5154,9 +5367,9 @@ function ftRetMapSubsNote(fn: i32, s: i32) {
   for v in rv {
     const vt = nodeTyIxOf(v)
     const vm = if vt >= 0 && vt < T.tys.length { tyAt(vt) } else { null }
-    if vm is TyMap { ftSubsetNote(fnTagSetOfTy(vm.mVal), s) }
+    if vm is TyMap { ftSubsetNote(fnTagSetOfTy(tyValOf(vm)), s) }
   }
-  0
+  return 0
 }
 
 // Notes, for value `if` or `match` `x` holding maps of set `s`, each tail map's set within `s`.
@@ -5169,9 +5382,9 @@ function ftJoinMapTailsNote(x: i32, s: i32) {
   for l in ls {
     const lt = nodeTyIxOf(l)
     const lm = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
-    if lm is TyMap { ftSubsetNote(fnTagSetOfTy(lm.mVal), s) }
+    if lm is TyMap { ftSubsetNote(fnTagSetOfTy(tyValOf(lm)), s) }
   }
-  0
+  return 0
 }
 
 // Notes each set within `s` other than it that a function inside type `t` carries, as
@@ -5184,7 +5397,7 @@ function ftSubsetsNoteIn(t: i32, s: i32, depth: i32): boolean {
       ftSubsetNote(fnTagSetOfTy(t), s)
     }
     TyArray => {
-      ftSubsetsNoteIn(o.aElem, s, depth - 1)
+      ftSubsetsNoteIn(tyElemOf(o), s, depth - 1)
     }
     TyObj => {
       for f in o.objFieldTypes { ftSubsetsNoteIn(f, s, depth - 1) }
@@ -5192,37 +5405,37 @@ function ftSubsetsNoteIn(t: i32, s: i32, depth: i32): boolean {
     // A map's value is held as its own holder's (`ftDstTakes`'s map rule); no other kind holds a set.
     TyMap | TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
   }
-  true
+  return true
 }
 
 // Whether `a` and `b` are lists nested to one depth whose function leaves store alike: `b`'s
 // carrying set `s` and `a`'s that set or one decided with it, or `a`'s carrying `s` and `b`'s a
 // set within it, which is then decided with `s`; or whose records store alike and hold a decided set.
 function ftListLeavesOfSet(a: i32, b: i32, s: i32, depth: i32): boolean {
-  const ao = if a >= 0 && a < T.tys.length { T.tys[a] } else { null }
-  const bo = if b >= 0 && b < T.tys.length { T.tys[b] } else { null }
+  const ao = if a >= 0 && a < T.tys.length { tyAt(a) } else { null }
+  const bo = if b >= 0 && b < T.tys.length { tyAt(b) } else { null }
   if !(ao is TyArray) || !(bo is TyArray) || depth <= 0 { return false }
-  const ae = if ao.aElem >= 0 && ao.aElem < T.tys.length { T.tys[ao.aElem] } else { null }
-  const be = if bo.aElem >= 0 && bo.aElem < T.tys.length { T.tys[bo.aElem] } else { null }
+  const ae = if !tyElemOpen(ao) && tyElemOf(ao) < T.tys.length { tyAt(tyElemOf(ao)) } else { null }
+  const be = if !tyElemOpen(bo) && tyElemOf(bo) < T.tys.length { tyAt(tyElemOf(bo)) } else { null }
   // A flat list of functions is its own type's or a decided set's (`ftHoldsDecided`).
   if ae is TyFunc && be is TyFunc {
     if depth == FT_HOLD_DEPTH { return false }
-    const as = fnTagSetOfTy(ao.aElem)
-    const bs = fnTagSetOfTy(bo.aElem)
+    const as = fnTagSetOfTy(tyElemOf(ao))
+    const bs = fnTagSetOfTy(tyElemOf(bo))
     return bs == s && ftSetDecidedWith(as, s) || as == s && ftSubsetNote(bs, s)
   }
   if ae is TyObj && be is TyObj {
-    return fieldStorageEq(ao.aElem, bo.aElem, REC_STORE_DEPTH)
-      && ftTyHoldsDecided(ao.aElem, s)
-      && ftSubsetsNoteIn(bo.aElem, s, FT_HOLD_DEPTH)
+    return fieldStorageEq(tyElemOf(ao), tyElemOf(bo), REC_STORE_DEPTH)
+      && ftTyHoldsDecided(tyElemOf(ao), s)
+      && ftSubsetsNoteIn(tyElemOf(bo), s, FT_HOLD_DEPTH)
   }
-  ftListLeavesOfSet(ao.aElem, bo.aElem, s, depth - 1)
+  return ftListLeavesOfSet(tyElemOf(ao), tyElemOf(bo), s, depth - 1)
 }
 
 // Whether `x` is a statement of block `b` other than its last.
 function ftStmtDiscarded(b: i32, x: i32): boolean {
   const bn = nodeAt(b)
-  bn is Block
+  return bn is Block
     && bn.blkStmts.length > 0
     && bn.blkStmts[bn.blkStmts.length - 1] != x
     && i32ListHas(bn.blkStmts, x)
@@ -5232,7 +5445,7 @@ function ftStmtDiscarded(b: i32, x: i32): boolean {
 function ftLoopBodyStmt(b: i32, x: i32, g: i32): boolean {
   const bn = nodeAt(b)
   const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { null }
-  bn is Block
+  return bn is Block
     && i32ListHas(bn.blkStmts, x)
     && (gn is ForIn && gn.fiBody == b
     || gn is ForRange && gn.frBody == b
@@ -5243,7 +5456,7 @@ function ftLoopBodyStmt(b: i32, x: i32, g: i32): boolean {
 function ftStoreInNoElse(x: i32, g: i32): boolean {
   const xn = nodeAt(x)
   const gn = nodeAt(g)
-  xn is BinExpr && ftIsStore(xn) && gn is IfStmt && gn.ifElse < 0
+  return xn is BinExpr && ftIsStore(xn) && gn is IfStmt && gn.ifElse < 0
 }
 
 // Whether `x` is the last statement of block `b`, an arm of the `if` or `match` `g`.
@@ -5258,7 +5471,7 @@ function ftArmTail(b: i32, x: i32, g: i32): boolean {
     return false
   }
   const gn = nodeAt(g)
-  gn is IfStmt && (gn.ifThen == b || gn.ifElse == b)
+  return gn is IfStmt && (gn.ifThen == b || gn.ifElse == b)
     || gn is MatchExpr && i32ListHas(gn.matchBodies, b)
 }
 
@@ -5267,7 +5480,7 @@ function ftFnBodyTail(b: i32, x: i32, fn: i32): boolean {
   if fn < 0 || fn >= P.nodes.length { return false }
   const f = nodeAt(fn)
   const bn = nodeAt(b)
-  f is FuncDecl
+  return f is FuncDecl
     && f.fnBody == b
     && bn is Block
     && bn.blkStmts.length > 0
@@ -5291,7 +5504,7 @@ function ftArgDstTy(c: Call, x: i32): i32 {
     }
     i = i + 1
   }
-  -1
+  return -1
 }
 
 // The callback type a list's `map` or `filter` call `c` declares for argument `x`, or -1: the
@@ -5309,8 +5522,8 @@ function ftListCallbackDst(c: Call, x: i32): i32 {
   if !(l is TyArray) || !(xf is TyFunc) || xf.fnParamTypes.length != 1 {
     return -1
   }
-  if xf.fnParamTypes[0] == l.aElem { return xt }
-  -1
+  if xf.fnParamTypes[0] == tyElemOf(l) { return xt }
+  return -1
 }
 
 // The element type of list literal `p`, or -1.
@@ -5318,8 +5531,8 @@ function ftArrElemTy(p: i32): i32 {
   const t = nodeTyIxOf(p)
   if t < 0 || t >= T.tys.length { return -1 }
   const a = tyAt(t)
-  if a is TyArray { return a.aElem }
-  -1
+  if a is TyArray { return tyElemOf(a) }
+  return -1
 }
 
 // Whether `x` is an argument of call `c` to a declared function whose parameter there has no
@@ -5345,7 +5558,7 @@ function ftHoleArg(c: Call, x: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Whether every member of set `s` is a declared function. A flat list of one member is handed on
@@ -5354,7 +5567,7 @@ function ftDeclsOnly(s: i32): boolean {
   for m in fnTagMembers(s) {
     if m < 0 || m >= P.nodes.length || !(nodeAt(m) is FuncDecl) { return false }
   }
-  true
+  return true
 }
 
 // Whether function `f` takes a parameter with no annotation.
@@ -5368,7 +5581,7 @@ function ftOpenFn(f: i32): boolean {
       if pn is Param && pn.parType < 0 { return true }
     }
   }
-  false
+  return false
 }
 
 // Whether `x` is a call of a named top-level function with no type parameter and no
@@ -5378,14 +5591,14 @@ function ftNamedCallOf(x: i32): boolean {
   if !(c is Call) { return false }
   const d = ftNamedFn(parenPeelIx(c.callFn))
   const f = if d >= 0 { nodeAt(d) } else { null }
-  f is FuncDecl && f.fnTyParams.length == 0 && !ftOpenFn(d)
+  return f is FuncDecl && f.fnTyParams.length == 0 && !ftOpenFn(d)
 }
 
 // Whether read `r` under parent `q` is the initialiser of a `let` written from another function
 // than the one declaring it: a capture cell the read's lambda is a peer of (D15435).
 function ftSeedsCellAt(r: i32, q: i32): boolean {
   const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
-  qn is LetDecl
+  return qn is LetDecl
     && qn.letKw == "let"
     && parenPeelIx(qn.letInit) == r
     && cwLetWrittenInClosure(q)
@@ -5410,7 +5623,7 @@ function ftConstSeedsLets(c: i32): boolean {
       any = true
     }
   }
-  any
+  return any
 }
 
 // Whether some read of the `const` declared at `c` is the initialiser of a `let` written from
@@ -5423,7 +5636,7 @@ function ftConstSeedsCell(c: i32): boolean {
     const q = if cwIxKind[ow.row] == CW_OCC_USE && u >= 0 && u < cwIxParent.length { cwIxParent[u] } else { -1 }
     if ftSeedsCellAt(u, q) { return true }
   }
-  false
+  return false
 }
 
 // The function an un-annotated `const` declared at `d` names bare, which a call through it calls
@@ -5437,5 +5650,5 @@ function ftLocalAliasedFn(d: i32): i32 {
   const v = parenPeelIx(n.letInit)
   if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return d }
   const f = identDeclOf(v)
-  if f >= 0 && f < P.nodes.length && nodeAt(f) is FuncDecl { f } else { d }
+  return if f >= 0 && f < P.nodes.length && nodeAt(f) is FuncDecl { f } else { d }
 }

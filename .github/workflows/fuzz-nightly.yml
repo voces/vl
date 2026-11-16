@@ -1,37 +1,40 @@
 # Nightly randomized-seed rep-composition fuzz sweep (Phase 0 item 3,
 # docs/internals/codebase-audit-2026-07.md): scripts/rep-fuzz-check.sh (the `ci-native` gate) only
 # ever samples the same 16 FROZEN seeds — proven three times now to under-cover the shape space
-# (fresh seeds find unsound output at roughly 1 per ~200 programs even after the pinned net is
-# clean). This workflow runs scripts/fuzz-nightly.sh against a FRESH batch of random seeds every
+# (fresh seeds still find unsound output: 16 shapes in 80,000 programs over the four legs, measured
+# 2026-11-14). This workflow runs scripts/fuzz-sweep.sh against a FRESH batch of random seeds every
 # night, so coverage grows over time instead of staying pinned to the same net forever.
 #
 # Host + seed build mirrors the `ci-native` job in ci.yml (same steps, same cache keys) so this
 # workflow benefits from the same warm caches and never drifts from how the native toolchain is
 # normally built.
 #
-# Outcome:
-#   - any non-baselined INVALID-WASM / TRAP / MISMATCH -> job FAILS, prints the shape + the exact
-#     `scripts/fuzz-vl.sh --seed S --count C --depth D` repro, uploads the --keep dirs (failing
-#     .vl cases + .err files) as an artifact.
-#   - non-baselined REJECT only (or nothing new)       -> job SUCCEEDS, report-only: a shape-family
-#     summary lands in the job summary; artifacts are still uploaded for inspection.
+# Outcome (scripts/fuzz-sweep.sh --gate-all --filed scripts/fuzz-filed.txt):
+#   - an INVALID-WASM / TRAP / MISMATCH on any leg that no OPEN inventory row files -> job FAILS,
+#     with the shape and the exact `scripts/fuzz-vl.sh --seed S --count C --depth D` repro.
+#   - a finding scripts/fuzz-filed.txt lists under an open row, or a new REJECT -> reported in the
+#     job summary, job SUCCEEDS.
+#   Either way the artifact carries each leg's summary, shapes and keep dirs, and each unsound
+#   finding's row draft (`keep_<seed>/case_N.row.md`, scripts/fuzz-draft-rows.sh).
 #
 # The chosen seeds are printed early in the log (scripts/fuzz-nightly.sh), so any run — nightly or
 # a workflow_dispatch — is reproducible from the log alone.
 
 name: fuzz-nightly
 
-# CRON RETIRED (2026-07-22): the sweep now runs LOCALLY via scripts/fuzz-sweep.sh — a dev box
-# fans seeds across all cores (fuzz-nightly.sh --jobs), finishing in minutes what the single
-# 2-vCPU runner took ~30 min per leg to do. This workflow is kept for MANUAL dispatch only
-# (e.g. reproducing a sweep in a clean environment).
+# Nightly on GitHub (owner approved 2026-11-15): one `fuzz-sweep.sh` run over the four legs, every leg
+# gating, red only on an unsound finding no open inventory row files (scripts/fuzz-filed.txt).
+# The oracle leg's arith generator reports without gating (`--report-only arith`, fuzz-sweep.sh);
+# it gates again once gen.ts seeds 31-100 show 0 unexplained DISAGREE/UNSOUND cells.
 on:
+  schedule:
+    - cron: "17 4 * * *"
   workflow_dispatch:
     inputs:
       seeds:
-        description: "Number of fresh random seeds to sample"
+        description: "Number of fresh random seeds to sample, per leg"
         required: false
-        default: "10"
+        default: "50"
       count:
         description: "Programs generated per seed"
         required: false
@@ -51,7 +54,13 @@ env:
 jobs:
   fuzz-nightly:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
+      # The seed's compiled forms live in a private cache outside the checkout (DECISIONS.md,
+      # "The seed sidecar lives only in the user's private cache"); the seed cache steps save it.
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v5
 
       # deno serves only scripts/refresh-compiler.sh's own tooling needs (none directly here) —
@@ -111,7 +120,7 @@ jobs:
           path: |
             build/vl-compiler.wasm
             build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
+            ${{ runner.temp }}/vl-seed-cache
           key: vl-seed4-${{ runner.os }}-${{ hashFiles('compiler/*.vl') }}
           restore-keys: |
             vl-seed4-${{ runner.os }}-
@@ -121,71 +130,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
-      - name: Nightly fuzz sweep (fresh random seeds)
-        id: fuzz
-        run: |
-          ./scripts/fuzz-nightly.sh \
-            --seeds "${{ inputs.seeds || '10' }}" \
-            --count "${{ inputs.count || '200' }}" \
-            --depths "${{ inputs.depths || '4 5 6' }}" \
-            --baseline scripts/rep-fuzz-baseline.txt \
-            --out-dir /tmp/fuzz-nightly-out
+      # Only the proven seed's compiled forms go into the seed cache entry, not every rung's.
+      - name: Trim the seed cache to the proven seed
+        run: ./scripts/seed-cache-trim.sh
 
-      # EXPERIMENTAL branching-tree leg (Phase 1, docs/internals/codebase-audit-2026-07.md): the
-      # generalized generator (multi-element arrays/maps, structs with two recursive fields,
-      # arity-3 unions, multi-param closures) samples shapes the pinned net has NEVER covered, so
-      # it still surfaces many pre-existing rep holes. Report-only (--experimental exits 0) so it
-      # measures + artifacts the Phase-2 frontier WITHOUT gating; runs even if the pinned leg above
-      # failed. Graduate to a hard gate once the branching frontier is burned down.
-      - name: Experimental branching-tree fuzz sweep (report-only)
-        id: fuzz-branching
-        if: always()
+      # The four legs (plain, branching, multiobs, declared), each fanning its seeds over the
+      # runner's 4 vCPUs, then a row draft for each unsound finding (fuzz-draft-rows.sh). Every
+      # leg gates; a finding scripts/fuzz-filed.txt lists under an OPEN row is reported, not red.
+      - name: Fuzz sweep (fresh random seeds, four legs)
         run: |
-          ./scripts/fuzz-nightly.sh \
-            --branching --experimental \
-            --seeds "${{ inputs.seeds || '10' }}" \
+          ./scripts/fuzz-sweep.sh \
+            --seeds "${{ inputs.seeds || '50' }}" \
             --count "${{ inputs.count || '200' }}" \
             --depths "${{ inputs.depths || '4 5 6' }}" \
-            --baseline scripts/rep-fuzz-baseline.txt \
-            --out-dir /tmp/fuzz-nightly-branching-out
-
-      # EXPERIMENTAL oracle-widening leg (Phase 1, docs/internals/codebase-audit-2026-07.md item 3):
-      # the widened oracle also reads back the decoy siblings, the union decoy arm, and (composed
-      # with --branching) the map's second entry — surfacing miscompiles the single-carrier oracle
-      # MASKS (e.g. a union-of-composites `is`-narrowing hole where the mis-narrowed path and the
-      # inner arm coincidentally print the same sentinel). Report-only (--experimental exits 0) so it
-      # measures + artifacts the frontier WITHOUT gating; runs even if the legs above failed.
-      - name: Experimental oracle-widening fuzz sweep (report-only)
-        id: fuzz-multiobs
-        if: always()
-        run: |
-          ./scripts/fuzz-nightly.sh \
-            --branching --multiobs --experimental \
-            --seeds "${{ inputs.seeds || '10' }}" \
-            --count "${{ inputs.count || '200' }}" \
-            --depths "${{ inputs.depths || '4 5 6' }}" \
-            --baseline scripts/rep-fuzz-baseline.txt \
-            --out-dir /tmp/fuzz-nightly-multiobs-out
-
-      # EXPERIMENTAL declared-types leg (Phase 1, docs/internals/codebase-audit-2026-07.md): hoists
-      # struct-flavored shapes to `type Tn = {...}` declarations and spells them by name — declared
-      # spelling, structural twins, and the mixed declared/inline seam. This is the exact seam PR #911
-      # found two live INVALID-WASM/REJECT miscompiles at, which the inline-only vocabulary could not
-      # reach (they had to be pinned as corpus regressions). Composed with --branching --multiobs so
-      # the declared dimension is measured over the widest shape+oracle frontier. Report-only
-      # (--experimental exits 0) so it measures + artifacts WITHOUT gating; runs even if the legs
-      # above failed. Graduate to a hard gate once the declared frontier is burned down.
-      - name: Experimental declared-types fuzz sweep (report-only)
-        id: fuzz-declared
-        if: always()
-        run: |
-          ./scripts/fuzz-nightly.sh \
-            --branching --multiobs --declared --experimental \
-            --seeds "${{ inputs.seeds || '10' }}" \
-            --count "${{ inputs.count || '200' }}" \
-            --depths "${{ inputs.depths || '4 5 6' }}" \
-            --baseline scripts/rep-fuzz-baseline.txt \
-            --out-dir /tmp/fuzz-nightly-declared-out
+            --jobs 4 \
+            --gate-all \
+            --filed scripts/fuzz-filed.txt \
+            --out-dir /tmp/fuzz-sweep
 
       - name: Upload fuzz artifacts
         if: always()
@@ -193,17 +154,8 @@ jobs:
         with:
           name: fuzz-nightly-findings
           path: |
-            /tmp/fuzz-nightly-out/seed_*.tsv
-            /tmp/fuzz-nightly-out/keep_*/
-            /tmp/fuzz-nightly-out/summary.md
-            /tmp/fuzz-nightly-branching-out/seed_*.tsv
-            /tmp/fuzz-nightly-branching-out/keep_*/
-            /tmp/fuzz-nightly-branching-out/summary.md
-            /tmp/fuzz-nightly-multiobs-out/seed_*.tsv
-            /tmp/fuzz-nightly-multiobs-out/keep_*/
-            /tmp/fuzz-nightly-multiobs-out/summary.md
-            /tmp/fuzz-nightly-declared-out/seed_*.tsv
-            /tmp/fuzz-nightly-declared-out/keep_*/
-            /tmp/fuzz-nightly-declared-out/summary.md
+            /tmp/fuzz-sweep/*/seed_*.tsv
+            /tmp/fuzz-sweep/*/keep_*/
+            /tmp/fuzz-sweep/*/summary.md
           if-no-files-found: ignore
           retention-days: 14

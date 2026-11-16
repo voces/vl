@@ -99,7 +99,7 @@ assuming they own offset 0:
 
 ```vl
 function counterInit() { __store_i32__(0, 100) }
-function counterBump() { __store_i32__(0, __load_i32__(0) + 1); 0 }
+function counterBump() { __store_i32__(0, __load_i32__(0) + 1); return 0 }
 function loggerStage(v: i32) { __store_i32__(0, 0); __store_i32__(4, v); __log__(0, 8) }
 counterInit(); counterBump(); loggerStage(7); counterBump()
 print(__load_i32__(0))      // → 1, not 102
@@ -843,7 +843,7 @@ create such a local, and the exact hazard shape works correctly today:
 ```vl
 function go(__load_i32__: i32): i32 {
   const f = () => __load_i32__ + 1
-  f()
+  return f()
 }
 print(go(41))          // → 42, measured; an ordinary-parameter control also 42
 ```
@@ -1883,7 +1883,7 @@ touched by it — `std:buffer` uses no closure fields.
 
 1. **An f32-returning `"[]"` closure field emits an invalid module.**
    ```vl
-   function mkview(base: i32) { { "[]": (i: i32) => __load_f32__(base + (i << 2)) } }
+   function mkview(base: i32) { return { "[]": (i: i32) => __load_f32__(base + (i << 2)) } }
    const v = mkview(1024)
    const a = v[0]
    ```
@@ -1912,7 +1912,7 @@ touched by it — `std:buffer` uses no closure fields.
 2. **A `"[]="` closure field whose body is a memory-store intrinsic stores nothing.**
    ```vl
    function mkview(base: i32) {
-     { "[]": (i: i32) => __load_i32__(base + (i << 2)),
+     return { "[]": (i: i32) => __load_i32__(base + (i << 2)),
        "[]=": (i: i32, v: i32) => { __store_i32__(base + (i << 2), v) } }
    }
    const v = mkview(1024)

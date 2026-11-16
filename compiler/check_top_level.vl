@@ -2,13 +2,19 @@
 // any body is checked, the generic-constraint probe, then each declaration in order.
 
 import { declTyOf } from "./check_nar_store"
+import { i32ListHas, strListHas } from "./listutil"
 import { declFnAliasSet } from "./check_scopes"
 import { globalInitRecordsFnSetsSet } from "./check_elab_cap"
 import {
+  BinExpr,
   BoolLit,
+  Call,
   CharLit,
   FuncDecl,
+  Ident,
+  Index,
   LetDecl,
+  Member,
   NumLit,
   OP_INDEX_GET,
   OP_INDEX_SET,
@@ -29,6 +35,7 @@ import {
   isBinOpDecl,
   isBodyTyDecl,
   nodeAt,
+  nodeChildrenPush,
   opDeclLabel,
   opDeclLabelBin,
   opDeclOpOf,
@@ -79,7 +86,6 @@ import {
   cstrProbeWalk,
 } from "./check_cstr_probe"
 import { markCtnLitBinding } from "./check_ctn_lit_bind"
-import { inferQuiet, quietDepth } from "./check_cursor"
 import {
   cBoundDeclsSetAt,
   lbiScanModLits,
@@ -143,12 +149,10 @@ import {
   RB_GLOBAL_INIT,
   RB_LINT,
   RB_RETURNS,
-  checkMark,
-  checkRollback,
-  prbArmed,
-  prbEnter,
-  prbLeave,
   prbSkip,
+  quietRunDrop,
+  quietRunEnd,
+  quietRunOpen,
 } from "./check_rollback"
 import { declareDecl } from "./check_scopes"
 import {
@@ -209,22 +213,18 @@ function preInferOne(dIx: i32) {
     }
     if pending { checkFuncDeclNode(dn, dIx) }
   }
-  0
+  return 0
 }
 
 // The return-inference pre-pass: resolves every un-annotated return with diagnostics, symbol
 // recording and the redundant-type stream suppressed, so the real check pass runs against
-// final return types. Non-cycle functions resolve in the first demand sweep; cycle-poisoned
-// ones iterate to a fixpoint until the tentative set stops shrinking, and what remains is genuinely base-case-less.
-function inferReturnsPrePass() {
-  if topUnannotFns.length == 0 { return 0 }
-  if prbArmed { prbEnter() }
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  const m = checkMark()
-  const savedSym = symEnabled
-  symEnabled = 0
-  for f in inferCycleMembers(topUnannotFns) { preInferOne(f) }
+// final return types. Non-cycle functions resolve in the first sweep; cycle members, which it
+// returns, iterate to a fixpoint, and what remains is genuinely base-case-less.
+function inferReturnsPrePass(): i32[] {
+  if topUnannotFns.length == 0 { return [] }
+  const run = quietRunOpen()
+  const cyc = inferCycleMembers(topUnannotFns)
+  for f in cyc { preInferOne(f) }
   let shrinking = true
   let rounds = 0
   while shrinking && rounds < 2000 {
@@ -249,16 +249,10 @@ function inferReturnsPrePass() {
     unresolvedFns.push(inferTentative[u])
     u = u + 1
   }
-  symEnabled = savedSym
-  if prbSkip == 1 {
-    checkRollback(m, RB_LINT)
-  } else {
-    checkRollback(m, RB_RETURNS)
-  }
-  inferQuiet = false
-  quietDepth = quietDepth - 1
-  if prbArmed { prbLeave("inferReturnsPrePass") }
-  0
+  quietRunEnd(run)
+  const set = if prbSkip == 1 { RB_LINT } else { RB_RETURNS }
+  quietRunDrop(run, set, "inferReturnsPrePass")
+  return cyc
 }
 
 // Pass 1.65: types each un-annotated module global the hoist left a placeholder by quietly
@@ -267,13 +261,7 @@ function inferReturnsPrePass() {
 // `never` or a hole other than a function's, keeps the placeholder for pass 2.
 function globalInitPrePass(lets: i32[]) {
   if lets.length == 0 { return 0 }
-  if prbArmed { prbEnter() }
-  const savedQuiet = inferQuiet
-  const savedSym = symEnabled
-  const m = checkMark()
-  inferQuiet = true
-  quietDepth = quietDepth + 1
-  symEnabled = 0
+  const r = quietRunOpen()
   for li in lets {
     const ln = nodeAt(li)
     // A lambda with an un-annotated parameter is marked first, as pass 2 marks it, so its
@@ -314,12 +302,9 @@ function globalInitPrePass(lets: i32[]) {
       }
     }
   }
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
-  symEnabled = savedSym
-  checkRollback(m, RB_GLOBAL_INIT)
-  if prbArmed { prbLeave("globalInitPrePass") }
-  0
+  quietRunEnd(r)
+  quietRunDrop(r, RB_GLOBAL_INIT, "globalInitPrePass")
+  return 0
 }
 
 // Before pass 2 checks top-level statement `stmt`, quietly records the deferred constraints of
@@ -345,13 +330,7 @@ function cstrProbeBefore(stmt: i32) {
   // The statement itself is checked for real next, so outside a cycle it needs no probe.
   if !cyc && order.length > 0 && order[order.length - 1] == stmt { order.pop() }
   if order.length == 0 { return 0 }
-  if prbArmed { prbEnter() }
-  const m = checkMark()
-  const savedSym = symEnabled
-  const savedQuiet = inferQuiet
-  symEnabled = 0
-  inferQuiet = true
-  quietDepth = quietDepth + 1
+  const r = quietRunOpen()
   cstrProbeSet(true)
   let rounds = 0
   let growing = true
@@ -365,12 +344,9 @@ function cstrProbeBefore(stmt: i32) {
     growing = cyc && cstrRowCount() > before
   }
   cstrProbeSet(false)
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
-  symEnabled = savedSym
-  checkRollback(m, RB_CSTR_PROBE)
-  if prbArmed { prbLeave("cstrProbeBefore") }
-  0
+  quietRunEnd(r)
+  quietRunDrop(r, RB_CSTR_PROBE, "cstrProbeBefore")
+  return 0
 }
 
 // The program root: pass 0 registers `type` declarations (structs, then unions over
@@ -449,7 +425,7 @@ export function checkProgramNode(n: Program) {
   // Pass 1.7: return-inference pre-pass — resolve every un-annotated return (cycles
   // included, via the binding-group fixpoint) BEFORE checking bodies, so pass 2 sees
   // final return types and a recursive function needs no return annotation.
-  inferReturnsPrePass()
+  const cycFns = inferReturnsPrePass()
   // Pass 1.9: the generic bodies pass 2 walks for their constraints (`cstrProbeBefore`).
   cstrPrePass(stmts)
   // Pass 2: check every top-level statement (bodies included).
@@ -461,9 +437,18 @@ export function checkProgramNode(n: Program) {
   }
   const done: boolean[] = []
   for _ in stmts { done.push(false) }
+  // The functions on a return-inference cycle, which keep the fixpoint's order however a
+  // statement reaches them.
+  const onCycle: {[i32]: boolean} = Map()
+  for f in cycFns { onCycle[f] = true }
+  modLetNames = Map()
+  for st in stmts {
+    const sn = nodeAt(st)
+    if sn is LetDecl && sn.letKw == "let" { modLetNames[sn.letName] = true }
+  }
   let j = 0
   while j < stmts.length {
-    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, done) }
+    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, onCycle, done, false) }
     j = j + 1
   }
   // A function whose return never resolved (a genuinely base-case-less recursive
@@ -483,7 +468,7 @@ export function checkProgramNode(n: Program) {
   bareBraceUndelivered()
   // LAST, because both of its filters read state this pass fills — see its header.
   annCommitVariantMembers()
-  TY_VOID
+  return TY_VOID
 }
 
 // Pass 2 for top-level statement `j`, after any later-declared function its body reaches whose
@@ -494,18 +479,45 @@ function progCheckCalleeFirst(
   stmts: i32[],
   j: i32,
   stmtAt: {[i32]: i32},
+  onCycle: {[i32]: boolean},
   done: boolean[],
+  eagerIn: boolean,
 ) {
   done[j] = true
-  if nodeAt(stmts[j]) is FuncDecl {
-    for d in weFnRefs(stmts[j], opDeclAfter(j, stmtAt, done)) {
-      const k = stmtAt[d] ?? -1
-      crAskForSet(stmts[j])
-      const first = k > j
-        && !done[k]
-        && (retPending(d) || weSummaryUnsettled(d))
-      crAskForSet(-1)
-      if first { progCheckCalleeFirst(stmts, k, stmtAt, done) }
+  const eager = eagerIn || !(nodeAt(stmts[j]) is FuncDecl)
+  for d in weFnRefs(stmts[j], opDeclAfter(j, stmtAt, done)) {
+    const k = stmtAt[d] ?? -1
+    crAskForSet(stmts[j])
+    // A callee eager checking refuses still takes the source-order trigger, unless its own
+    // parameters or a module `let` it reads are the statement's to decide. Below top-level code
+    // it is checked first whatever its pre-pass return says, which a callee's holes may still move.
+    const all = eager && eagerCheckable(d, stmtAt, done, [])
+    const own = !all && k > j && (!eager || ownFactsStand(d))
+    // A function checked ahead of the code that names it takes its callees with it, as their
+    // declarations first would: their parameters are its calls' to solve, not the statement's.
+    // A function on a call cycle keeps the fixpoint's order.
+    const free = k >= 0 && !done[k] && !(onCycle[d] ?? false)
+    const lifted = free
+      && eagerIn
+      && nodeAt(stmts[j]) is FuncDecl
+      && !readsModuleLet(fnBodyOf(d))
+    const first = k >= 0
+      && !done[k]
+      && (all
+      || lifted
+      || (own
+      && ((eager && free) || retPending(d) || weSummaryUnsettled(d)))
+      || (k > j && fnWritesHoleParam(d)))
+    crAskForSet(-1)
+    if first {
+      progCheckCalleeFirst(
+        stmts,
+        k,
+        stmtAt,
+        onCycle,
+        done,
+        all || lifted || (eager && own),
+      )
     }
   }
   cstrProbeBefore(stmts[j])
@@ -521,7 +533,127 @@ function progCheckCalleeFirst(
     }
   }
   daTopSettle(stmts[j], uninit)
-  0
+  return 0
+}
+
+// Whether unchecked top-level function `d` may be checked ahead of the statement that names it:
+// no fact it needs comes from that statement. Not when an un-annotated parameter's calls decide
+// it (`callDecidesParam`), it reads a module `let` (a later write narrows it), it is on a call
+// cycle (the fixpoint orders it), or a function it reaches unchecked may not.
+function eagerCheckable(
+  d: i32,
+  stmtAt: {[i32]: i32},
+  done: boolean[],
+  path: i32[],
+): boolean {
+  if i32ListHas(path, d) || path.length > 16 { return false }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if (
+      pn is Param
+      && pn.parType < 0
+      && callDecidesParam(fd.fnBody, pn.parName)
+    ) {
+      return false
+    }
+  }
+  if readsModuleLet(fd.fnBody) { return false }
+  path.push(d)
+  for c in weFnRefs(d, false) {
+    const k = stmtAt[c] ?? -1
+    if (
+      c == d
+      || (k >= 0 && !done[k] && !eagerCheckable(c, stmtAt, done, path))
+    ) {
+      path.pop()
+      return false
+    }
+  }
+  path.pop()
+  return true
+}
+
+// The body of function declaration `d`, or -1.// The body of function declaration `d`, or -1.
+function fnBodyOf(d: i32): i32 {
+  const fd = nodeAt(d)
+  return if fd is FuncDecl { fd.fnBody } else { -1 }
+}
+
+// Whether top-level function `d` itself needs no fact from the statement that names it: no
+// un-annotated parameter its calls decide and no module `let` read. Unlike `eagerCheckable`, it asks
+// nothing of `d`'s callees.
+function ownFactsStand(d: i32): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if (
+      pn is Param
+      && pn.parType < 0
+      && callDecidesParam(fd.fnBody, pn.parName)
+    ) {
+      return false
+    }
+  }
+  return !readsModuleLet(fd.fnBody)
+}
+
+// Whether the body at `root` uses parameter `nm` where only its calls decide it: as a map (a
+// `get`, `set`, `has` or `delete` on it, a store at a string key; `holeDemandOk` cannot pin an
+// open demand after the body) or written into a binding (D15053 reads every call). S3 retires it.
+function callDecidesParam(root: i32, nm: string): boolean {
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Call && n.callFn >= 0 && n.callFn < P.nodes.length {
+      const f = nodeAt(n.callFn)
+      if f is Member {
+        const o = nodeAt(f.memObj)
+        if (
+          o is Ident
+          && o.identName == nm
+          && strListHas(["get", "set", "has", "delete"], f.memProp)
+        ) {
+          return true
+        }
+      }
+    }
+    if n is BinExpr && n.binOp == "=" {
+      const l = nodeAt(n.binLeft)
+      if l is Index {
+        const o = nodeAt(l.idxArr)
+        const k = nodeAt(l.idxIndex)
+        if o is Ident && o.identName == nm && k is StrLit { return true }
+      }
+      const r = nodeAt(n.binRight)
+      if l is Ident && r is Ident && r.identName == nm { return true }
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  return false
+}
+
+// The names of the module's `let` bindings, set before pass 2; `readsModuleLet` matches by name,
+// so a local of the same name only makes it answer true.
+let modLetNames: {[string]: boolean} = Map()
+
+// Whether the subtree at `root` names a module-scope `let` binding.
+function readsModuleLet(root: i32): boolean {
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Ident {
+      if modLetNames[n.identName] ?? false { return true }
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  return false
 }
 
 // Whether an operator declaration is a top-level statement after `j` not yet checked: only then can
@@ -533,7 +665,7 @@ function opDeclAfter(j: i32, stmtAt: {[i32]: i32}, done: boolean[]): boolean {
     if k > j && !done[k] { return true }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Whether top-level function declaration `d` still has its hoisted return pending (`-2`).
@@ -546,7 +678,7 @@ function retPending(d: i32): boolean {
       if ht is TyFunc { return ht.fnRet == -2 }
     }
   }
-  false
+  return false
 }
 
 // Pass 0a of `checkProgramNode`: every top-level `type` name registers before any body is
@@ -593,6 +725,7 @@ function progRegisterTypeNames(stmts: i32[]) {
         // column. Master re-split the joined string inside `applyGenAliasArgs`,
         // i.e. once per APPLICATION of the alias; the list is a property of the
         // DECLARATION and cannot change between applications.
+        if sd0.tdNew == 1 { nwDeclNames.push(gBase) }
         const gps = declGpParamsOf(stmts[t0])
         gaParamStart.push(gaParamNames.length)
         gaParamCount.push(gps.length)
@@ -630,6 +763,7 @@ function progRegisterTypeNames(stmts: i32[]) {
       // its own union under the parameter bindings (`applyGenAliasTys`).
       gaNames.push(declGpBaseOf(stmts[t0]))
       gaDeclIxs.push(stmts[t0])
+      if sd0.udNew == 1 { nwDeclNames.push(declGpBaseOf(stmts[t0])) }
       const ugps = declGpParamsOf(stmts[t0])
       gaParamStart.push(gaParamNames.length)
       gaParamCount.push(ugps.length)
@@ -709,6 +843,7 @@ function progHoistParamTys(s: FuncDecl, six: i32): i32[] {
             s.fnTyParams,
             hpn.parType,
             s.fnName,
+            six,
           )
           if r >= 0 { t = r }
         }
@@ -723,7 +858,7 @@ function progHoistParamTys(s: FuncDecl, six: i32): i32[] {
     hpt.push(t)
     k = k + 1
   }
-  hpt
+  return hpt
 }
 
 // The hoisted return type of top-level function `s` at `six`: its annotation, `void` when
@@ -736,7 +871,13 @@ function progHoistRetTy(s: FuncDecl, six: i32): i32 {
   if s.fnRet >= 0 {
     const hrtn = nodeAt(s.fnRet)
     if hrtn is TypeRef {
-      const r = resolveRetAnnotAt(hrtn.tyName, s.fnTyParams, s.fnRet, s.fnName)
+      const r = resolveRetAnnotAt(
+        hrtn.tyName,
+        s.fnTyParams,
+        s.fnRet,
+        s.fnName,
+        six,
+      )
       // D1048's second hint, recorded order-independently: this hoist is the only pass
       // that resolves every top-level return before any body runs, so a `const r = f(…)`
       // written above `function f(): R` still inherits the provenance.
@@ -748,7 +889,7 @@ function progHoistRetTy(s: FuncDecl, six: i32): i32 {
   // so it hoists as that, and a forward call reads it without checking the body (D7760).
   if hret == (-2) && blockHasBareReturn(s.fnBody) { hret = TY_VOID }
   if hret == (-2) && fnResultUnconsumed(six) { hret = TY_VOID }
-  hret
+  return hret
 }
 
 // A getter `s` at `six` registers under its receiver type `hpt[0]`, the only route by which a read finds it.
@@ -760,7 +901,7 @@ function progRegisterGetter(s: FuncDecl, six: i32, hpt: i32[]) {
     getDecls.push(six)
     getSelfTys.push(hpt[0])
   }
-  0
+  return 0
 }
 
 // An index or binary operator declaration `s` at `six`, with hoisted parameter types `hpt`,
@@ -816,7 +957,7 @@ function progRegisterOpDecl(s: FuncDecl, six: i32, hpt: i32[]) {
     opIdxFns.push(s.fnName)
     opIdxDecls.push(six)
   }
-  0
+  return 0
 }
 
 // A binary operator declaration `s` at `six` whose `self` can never be an object is refused;
@@ -871,7 +1012,7 @@ function progCheckBinOpSelf(s: FuncDecl, six: i32, hpt: i32[]) {
       }
     }
   }
-  0
+  return 0
 }
 
 // Pass 1.5 of `checkProgramNode`: every top-level value binding is declared with its
@@ -972,5 +1113,54 @@ function progHoistValues(stmts: i32[]): i32[] {
     }
     mi = mi + 1
   }
-  phLets
+  return phLets
+}
+
+// Whether top-level function `d` writes an element into an un-annotated parameter by name: a
+// `push`/`unshift`/`add`/`set` on it or a store into one of its cells, the first write that
+// decides the element (D2218), so a call's replay of it needs the body checked first.
+function fnWritesHoleParam(d: i32): boolean {
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) { return false }
+  const names: string[] = []
+  for p in fd.fnParams {
+    const pn = nodeAt(p)
+    if pn is Param && pn.parType < 0 { names.push(pn.parName) }
+  }
+  if names.length == 0 { return false }
+  const todo: i32[] = [fd.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix < 0 || ix >= P.nodes.length { continue }
+    const n = nodeAt(ix)
+    if n is Call && addsTo(n.callFn, names) { return true }
+    if n is BinExpr && n.binOp == "=" && storesInto(n.binLeft, names) {
+      return true
+    }
+    nodeChildrenPush(ix, todo)
+  }
+  return false
+}
+
+// Whether callee `ix` is a cell write on one of `names`: `p.push`, `unshift`, `add` or `set`.
+function addsTo(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const t = nodeAt(ix)
+  if !(t is Member) { return false }
+  const p = t.memProp
+  return (p == "push" || p == "unshift" || p == "add" || p == "set")
+    && identIn(t.memObj, names)
+}
+
+// Whether store target `ix` is a cell of one of `names`, `p[k]`.
+function storesInto(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const t = nodeAt(ix)
+  return t is Index && identIn(t.idxArr, names)
+}
+
+function identIn(ix: i32, names: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  return n is Ident && strListHas(names, n.identName)
 }

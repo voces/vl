@@ -104,6 +104,10 @@ The parts:
 * **Generated-code cost is gated:** `vl run scripts/plumb-shape-cost.vl -- --check` — guest FUEL
   **+5%**, peak RSS **+10%**; `-- --write-baseline` on a quiet box
   (profiling-the-compiler.md §Guards).
+* **Self-compile fuel is gated per PR:** `scripts/self-compile-time.sh` reds on an L2 rise past
+  **+1%** of `scripts/self-compile-baseline.json` (and past 1.5×). Accept a rise with
+  `--write-baseline` from a fixpoint seed plus one line in `scripts/self-compile-ledger.txt` (fuel,
+  commit, PR, mechanism); a baseline the ledger's last line does not name reds.
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second
@@ -303,6 +307,10 @@ Why: [evidence](docs/internals/working-rules-evidence.md#table-read).
   every `inventory/reserved/D<lo>-D<hi>.md`, one file per range); new rows start from
   `TEMPLATE.md`. A row needs a known-outcome status line and a `Repro:` label with a block under
   it (`tests/vl_inventory_rows_test.ts`); a parse-stage outcome says `parse error`.
+* **A reservation exists once it is pushed.** `--next` and `--reserve` also skip every row or
+  range a fetched `origin/*` branch adds (naming the branch) and every row filed, reservation or
+  not; an unpushed one is invisible. So `git fetch`, `--reserve`, then commit and push the file
+  before filing any id from it.
 * A defect reachable only under a REFUSED change is filed as a refutation pin, status `runs today
   and must keep running`.
 * Every cited `D<id>` must have a row (`tests/vl_inventory_refs_test.ts`); an id cited before its row

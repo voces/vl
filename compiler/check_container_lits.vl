@@ -24,7 +24,8 @@ import {
 } from "./check_core_state"
 import {
   adoptArmAt,
-  f32LitJoinOf,
+  floatLitJoinOf,
+  heldRecJoinOf,
   listJoinApart,
   markElemValue,
   markFieldValue,
@@ -33,7 +34,6 @@ import {
   objShapeAdapterlessErr,
   recordCtxTy,
 } from "./check_fit_rules"
-import { f32JoinRetypesRunning } from "./check_leaf_steps"
 import { valueIsFreshList } from "./check_nj_join"
 import { parenPeelIx } from "./check_places"
 import {
@@ -56,15 +56,18 @@ import {
   T,
   TY_ERR,
   TY_NULL,
+  TY_OPEN,
   TY_STR,
   TY_U8,
   TyArray,
   TyMap,
+  TyNullable,
   TyObj,
   TyUnion,
   mkArrayTy,
   mkObjTy,
   tyAt,
+  tyElemOf,
   tyHoldsObjDeep,
   tyToStr,
 } from "./check_types"
@@ -81,11 +84,11 @@ export function spreadElemTy(spdIx: i32) {
   const st = checkNodeHook(inner)
   if st < 0 { return TY_ERR }
   const t = tyAt(st)
-  if t is TyArray { return t.aElem }
+  if t is TyArray { return tyElemOf(t) }
   let note = ""
   if st == TY_STR { note = " — a string is not a list of characters in VL" }
   tErr("`...` spreads a list, and this is " + tyToStr(st) + note, inner)
-  TY_ERR
+  return TY_ERR
 }
 // ── array literal ───────────────────────────────────────────────────────────
 // `[e, e, ...]` types as `T[]` where `T` is the first element's type (the rest must be
@@ -95,7 +98,7 @@ export function spreadElemTy(spdIx: i32) {
 // Extracted from `checkNodeReal`'s `ArrayLit` arm (C3: thin the dispatcher).
 export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   const elems = n.arrElems
-  if elems.length < 1 { return mkArrayTy(-1) }
+  if elems.length < 1 { return mkArrayTy(TY_OPEN) }
   if hasSpreadItem(elems) { return checkSpreadArrayLit(elems, _ix) }
   // A `void` element has no value to store — poisoned to `TY_ERR` rather than joined, so an
   // annotated literal keeps one "cannot assign" message instead of a second one.
@@ -125,17 +128,19 @@ export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
   }
   const apart = listJoinApart(elems, ets)
   if apart >= 0 { elemTy = apart }
-  // An f32 element beside literal ones types the list `f32[]`, as it does an `if` join.
+  // An f32 element beside literal ones types the list `f32[]`, as it does an `if` join (owner
+  // ruling 4.3).
   if (
     apart < 0
     && elemTy >= 0
     && primNameOf(elemTy) != "f32"
     && elems.length > 1
-    && f32JoinRetypesRunning()
   ) {
-    const f32El = f32LitJoinOf(elems, ets)
+    const f32El = floatLitJoinOf(elems, ets)
     if f32El >= 0 { elemTy = f32El }
   }
+  const held = heldRecJoinOf(elemTy, elems, ets)
+  if held >= 0 { elemTy = held }
   if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
   adoptElemLits(elems, elemTy)
   // A returned list of records reads its function's joined sets (D15558).
@@ -145,7 +150,7 @@ export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
     const rt = if rr != lt && rr >= 0 && rr < T.tys.length { tyAt(rr) } else { null }
     if rt is TyArray {
       elabRetRecLitGrow(_ix, rr)
-      elemTy = rt.aElem
+      elemTy = tyElemOf(rt)
     }
   }
   // Each element is delivered to the element type the list joins to. An existing record of
@@ -174,7 +179,7 @@ export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
 }
 
 // Whether `el` is a record literal, which is built at the list's own element type.
-function listElemIsRecLit(el: i32) { nodeAt(parenPeelIx(el)) is ObjLit }
+function listElemIsRecLit(el: i32) { return nodeAt(parenPeelIx(el)) is ObjLit }
 
 // Whether list element `el`, an existing record of type `et`, is stored at the joined record
 // `elemTy` of another layout, which no element conversion reaches.
@@ -191,7 +196,7 @@ function listElemDropsLayout(el: i32, et: i32, elemTy: i32) {
   if !(tyAt(et) is TyObj) || !(tyAt(elemTy) is TyObj) || listElemIsRecLit(el) {
     return false
   }
-  objShapeAdapterlessAt(el, et, elemTy)
+  return objShapeAdapterlessAt(el, et, elemTy)
 }
 
 // `[...a, e, ...b]` — the element type joins every plain element's type with every spread
@@ -216,9 +221,11 @@ function checkSpreadArrayLit(elems: i32[], ix: i32) {
     }
     ei = ei + 1
   }
+  // A `u8` source joined with any other element, `null` included (D16391), names no list.
   if elemTy >= 0 {
     const u = tyAt(elemTy)
     if u is TyUnion && i32ListHas(u.uMembers, TY_U8) { u8MixLitsPush(ix) }
+    if u is TyNullable && u.nInner == TY_U8 { u8MixLitsPush(ix) }
   }
   adoptElemLits(elems, elemTy)
   // Each element beside the spreads is delivered to the element type the list joins to.
@@ -232,7 +239,7 @@ function checkSpreadArrayLit(elems: i32[], ix: i32) {
   if elemTy >= 0 && tyHoldsObjDeep(elemTy) && !elabCapLive() {
     recListLits.push(ix)
   }
-  mkArrayTy(elemTy)
+  return mkArrayTy(elemTy)
 }
 
 // Stamps each literal element of a list literal, and of a spread list literal, with the list's

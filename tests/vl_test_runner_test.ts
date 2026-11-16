@@ -374,7 +374,7 @@ Deno.test({
       "  expect(1).not().toEqual(2)",
       "})",
       "",
-      "function build(n: i32): i32 { n }",
+      "function build(n: i32): i32 { return n }",
     ];
     /** The 1-based line/col of `needle` in `src` — the runner's own coordinates. */
     const posOf = (src: string[], needle: string, token: string) => {
@@ -889,7 +889,7 @@ Deno.test({
         'import { expect, it, toEqual } from "std:test"\n' +
           "function f(): i32 {\n  let acc = 0\n  " +
           "{ acc = acc + 1 ".repeat(n) + "} ".repeat(n) +
-          `\n  acc\n}\nconst x = f() - ${n - 1}\n` +
+          `\n  return acc\n}\nconst x = f() - ${n - 1}\n` +
           'it("deep", () => { expect(x).toEqual(1) })\n',
       );
       await Deno.writeTextFile(
@@ -1011,6 +1011,18 @@ Deno.test({
     expectHas(r.err, "1 file · 8 passed · 2 failed");
     expectHas(r.err, "expected 1.001 to be close to 1 to 3 digits");
     expectHas(r.err, 'expected "1" to be close to 1 to 2 digits');
+  },
+});
+
+Deno.test({
+  name: "vl-test: toBeNear takes an absolute tolerance, inclusive at the bound",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await runTest(`${ROOT}/tests/fixtures/vl-test-near`);
+    if (r.code !== 1) throw new Error(`want the two failing cases red, got ${r.code}:\n${r.err}`);
+    expectHas(r.err, "1 file · 8 passed · 2 failed");
+    expectHas(r.err, "expected 1.004 to be near 1 within 0.001 (differs by 0.00");
+    expectHas(r.err, 'expected "1" to be near 1 within 0.5');
   },
 });
 

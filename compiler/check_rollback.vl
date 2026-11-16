@@ -31,10 +31,13 @@ import {
 import {
   cstrOwnerStack,
   njFnStack,
+  quietEnter,
+  quietLeave,
   tpEnvNames,
   tpEnvTruncate,
   tpEnvTys,
 } from "./check_cursor"
+import { ElabPinMark, elabPinMark, elabPinRollback } from "./check_elab_cap"
 import {
   calleeWriteAt,
   calleeWriteGot,
@@ -102,6 +105,7 @@ import {
   rcoalTruncate,
   redun,
   redunTruncate,
+  symEnabled,
 } from "./check_state"
 import {
   dJoinNode,
@@ -167,26 +171,57 @@ const RB_TP_ENV = 1048576
 // `inferLet*`: the un-annotated bindings' value-union and niche rows.
 const RB_INFER_LET = 2097152
 
-// The per-site sets, each the sum of its bits. "Every constraint family" is arg, nest, ret, let,
-// bm, mem, ufcs, is, bin and print.
+// Every constraint family.
+const RB_CSTR = RB_ARG
+  | RB_NEST
+  | RB_RET
+  | RB_LET
+  | RB_BM
+  | RB_MEM
+  | RB_UFCS
+  | RB_IS
+  | RB_BIN
+  | RB_PRINT
+
+// The per-site sets.
 // `cstrProbeBefore` keeps the constraint rows it exists to record (D3062): diagnostics, lint
 // notes, holes and dJoin.
-export const RB_CSTR_PROBE = 688129
+export const RB_CSTR_PROBE = RB_DIAGS | RB_LINT | RB_HOLES | RB_DJOIN
 
 // `inferReturnsPrePass` keeps the inferred returns, which are what it is for: diagnostics, lint
 // notes, every constraint family, holes, dJoin, coalHole, tpIf and inferLet.
-export const RB_RETURNS = 2799615
+export const RB_RETURNS = RB_DIAGS
+  | RB_LINT
+  | RB_CSTR
+  | RB_HOLES
+  | RB_DJOIN
+  | RB_COAL_HOLE
+  | RB_TP_IF
+  | RB_INFER_LET
 
 // `globalInitPrePass`: `RB_RETURNS` bar diagnostics, which it drops per initializer, and inferLet.
-export const RB_GLOBAL_INIT = 702462
+export const RB_GLOBAL_INIT = RB_RETURNS & ~(RB_DIAGS | RB_INFER_LET)
 
 // `solveUnannotParams` reads holeFlow before rolling back: diagnostics, lint notes, every
 // constraint family but nest, holes, holeFlow, dJoin and coalHole.
-export const RB_SOLVE = 759803
+export const RB_SOLVE = RB_DIAGS
+  | RB_LINT
+  | (RB_CSTR & ~RB_NEST)
+  | RB_HOLES
+  | RB_HOLE_FLOW
+  | RB_DJOIN
+  | RB_COAL_HOLE
 
 // `monoRecheckBegin`/`End`: diagnostics, lint notes, every constraint family but nest, holes,
 // infer, inferLet, tpEnv and calleeWrite.
-export const RB_MONO = 4081659
+export const RB_MONO = RB_DIAGS
+  | RB_LINT
+  | (RB_CSTR & ~RB_NEST)
+  | RB_HOLES
+  | RB_INFER
+  | RB_INFER_LET
+  | RB_TP_ENV
+  | RB_CALLEE_WRITE
 
 // The per-node banks a re-check overwrites and the emitter reads by node: `lpValTy`
 // and `holeTpJoinNames`. Only an elaboration puts them back.
@@ -194,14 +229,22 @@ const RB_NODE_BANKS = 4194304
 
 // A call re-checked at its joined numeric binding (`checkCallOnFuncTy`, D2459): diagnostics, lint
 // notes and every constraint family but escJoin onward, which its second pass records again.
-export const RB_CALL_REJOIN = 526335
+export const RB_CALL_REJOIN = RB_DIAGS | RB_LINT | RB_CSTR
 
-// Every family: an elaboration leaves no row behind (`elabOne`).
-export const RB_ALL = 8388607
+// Every family but the pin notes: an elaboration leaves no row behind (`elabOne`).
+export const RB_ALL = RB_NODE_BANKS * 2 - 1
+
+// The elaboration's pin notes (`elabPinMark`). No site set names it yet: a pin a live capture
+// notes under a quiet run is kept today.
+export const RB_ELAB_PIN = RB_NODE_BANKS * 2
 
 // `tpIfRecheck` around its re-check: every constraint family, escJoin, coalHole, tpIf and
 // calleeWrite.
-export const RB_PINNED = 32766
+export const RB_PINNED = RB_CSTR
+  | RB_ESC_JOIN
+  | RB_COAL_HOLE
+  | RB_TP_IF
+  | RB_CALLEE_WRITE
 
 // Every rollback-able table's length, by family; a family's mark is its keyed column's length, and
 // `undo` is the keyed maps' undo-log row (`check_map_undo`).
@@ -241,10 +284,11 @@ export type CheckMark = {
   holeTpJoin: i32,
   mintFact: i32,
   undo: i32,
+  elabPin: ElabPinMark,
 }
 
 export function checkMark(): CheckMark {
-  {
+  return {
     diags: T.diags.length,
     argC: argCstr.at.length,
     nestC: nestCstr.ty.length,
@@ -280,6 +324,7 @@ export function checkMark(): CheckMark {
     holeTpJoin: holeTpJoinLog.length,
     mintFact: mintFactCount(),
     undo: undoOpen(),
+    elabPin: elabPinMark(),
   }
 }
 
@@ -333,9 +378,10 @@ export function checkRollback(m: CheckMark, set: i32) {
     lpValTyUndo(m.undo)
     holeTpJoinTruncate(m.holeTpJoin)
   }
+  if (set & RB_ELAB_PIN) != 0 { elabPinRollback(m.elabPin) }
   tpIfOkAtUndo(m.undo)
   undoClose()
-  0
+  return 0
 }
 
 const PRB_TABLES: string[] = [
@@ -371,7 +417,7 @@ const PRB_TABLES: string[] = [
 
 // The current length of each `PRB_TABLES` entry, in that order.
 function prbLens(): i32[] {
-  [
+  return [
     T.diags.length,
     argCstr.at.length,
     argCstr.exp.length,
@@ -537,22 +583,22 @@ export function probeRollbackArm(on: i32) {
   prbMarks = []
   prbRowKey = []
   prbRowN = []
-  0
+  return 0
 }
 
 // Test-only: 1 skips one rollback (`prbSkip`), so a control can prove the assertion fires.
 export function probeRollbackSkipSet(k: i32) {
   prbSkip = k
-  0
+  return 0
 }
 
-export function probeRollbackRowCount() { prbRowKey.length }
+export function probeRollbackRowCount() { return prbRowKey.length }
 
-export function probeRollbackRowLen(i: i32) { prbRowKey[i].length }
+export function probeRollbackRowLen(i: i32) { return prbRowKey[i].length }
 
-export function probeRollbackRowAt(i: i32, j: i32) { prbRowKey[i][j] }
+export function probeRollbackRowAt(i: i32, j: i32) { return prbRowKey[i][j] }
 
-export function probeRollbackRowN(i: i32) { prbRowN[i] }
+export function probeRollbackRowN(i: i32) { return prbRowN[i] }
 
 function prbCount(key: string) {
   let i = 0
@@ -565,13 +611,38 @@ function prbCount(key: string) {
   }
   prbRowKey.push(key)
   prbRowN.push(1)
-  0
+  return 0
+}
+
+// A quiet re-check of a body or subtree: the tables' mark and the flags it turned off.
+export type QuietRun = { mark: CheckMark, sym: i32, quiet: boolean }
+
+// Opens a quiet run: marks every family, then stops symbol recording and reporting.
+export function quietRunOpen(): QuietRun {
+  if prbArmed { prbEnter() }
+  const r = { mark: checkMark(), sym: symEnabled, quiet: quietEnter() }
+  symEnabled = 0
+  return r
+}
+
+// Restores the flags run `r` turned off; the tables stay until `quietRunDrop`.
+export function quietRunEnd(r: QuietRun) {
+  quietLeave(r.quiet)
+  symEnabled = r.sym
+  return 0
+}
+
+// Rolls family set `set` back to `r`'s mark; the rollback assertion reports it as `site`.
+export function quietRunDrop(r: QuietRun, set: i32, site: string) {
+  checkRollback(r.mark, set)
+  if prbArmed { prbLeave(site) }
+  return 0
 }
 
 // A probe begins: mark every table's length. Callers test `prbArmed` first.
 export function prbEnter() {
   prbMarks.push(prbLens())
-  0
+  return 0
 }
 
 // Probe `site` has rolled back: one `site | ran` row, and one `site | table | +` (or `-`) row
@@ -586,9 +657,5 @@ export function prbLeave(site: string) {
     if cur[i] < m[i] { prbCount(site + " | " + PRB_TABLES[i] + " | -") }
     i = i + 1
   }
-  0
+  return 0
 }
-
-// What `monoRecheckBegin` saves and `monoRecheckEnd` restores: the two suppression flags and
-// the tables' lengths, of which it rolls back `RB_MONO`.
-export type MonoSave = { quiet: boolean, sym: i32, mark: CheckMark }

@@ -54,31 +54,31 @@ const FIXTURES: Fixture[] = [
     // Nothing fires. Four shapes that must not: a delegating default, a membership
     // test written as ONE `||` expression, a refusal default, and a single-arm guard.
     name: "clean.vl",
-    src: `function other(k: string): i32 { k.length }
+    src: `function other(k: string): i32 { return k.length }
 
 function delegating(k: string): i32 {
   if k == "nulbool" { return 1 }
   if k == "f64list" { return 2 }
   if k == "u8list" { return 3 }
-  other(k)
+  return other(k)
 }
 
 function member(k: string) {
-  k == "nulmap" || k == "nulvariant" || k == "strlist" || k == "reflist"
+  return k == "nulmap" || k == "nulvariant" || k == "strlist" || k == "reflist"
 }
 
-function emitFail(m: string): i32 { m.length }
+function emitFail(m: string): i32 { return m.length }
 
 function refusing(k: string): i32 {
   if k == "nulstrlist" { return 1 }
   if k == "nulf64list" { return 2 }
   emitFail("no lowering for " + k)
-  -1
+  return -1
 }
 
 function guard(k: string): boolean {
   if k == "nuli64list" { return true }
-  false
+  return false
 }
 `,
     incomplete: [],
@@ -91,12 +91,12 @@ function guard(k: string): boolean {
   if k == "nulbool" { return 1 }
   if k == "f64list" { return 2 }
   if k == "u8list" { return 3 }
-  -1
+  return -1
 }
 `,
     incomplete: [2],
     split: [],
-    says: { code: INCOMPLETE, text: "tests 3 of 32 VKind kinds and ends without naming the rest" },
+    says: { code: INCOMPLETE, text: "tests 3 of 33 VKind kinds and ends without naming the rest" },
   },
   {
     // D981's shape. `walkStmt`'s default hands the rest to `walkExpr`; `walkExpr`
@@ -110,14 +110,14 @@ function guard(k: string): boolean {
   if k == "nulbool" { return 1 }
   if k == "f64list" { return 2 }
   if k == "u8list" { return walkStmt("nulmap") }
-  0
+  return 0
 }
 
 function walkStmt(k: string): i32 {
   if k == "nulmap" { return 4 }
   if k == "nulvariant" { return 5 }
   if k == "strlist" { return 6 }
-  walkExpr(k)
+  return walkExpr(k)
 }
 `,
     incomplete: [2],
@@ -136,13 +136,13 @@ function walkStmt(k: string): i32 {
     src: `function ctrlA(k: string): i32 {
   if k == "i64list" { return 1 }
   if k == "f32list" { return 2 }
-  ctrlB(k)
+  return ctrlB(k)
 }
 
 function ctrlB(k: string): i32 {
   if k == "nulstrlist" { return 3 }
   if k == "nulf64list" { return 4 }
-  ctrlA(k)
+  return ctrlA(k)
 }
 `,
     incomplete: [],
@@ -236,7 +236,7 @@ function exhaustive(k: K): i32 {
     split: [],
     says: {
       code: INCOMPLETE,
-      text: "matches 2 of 32 VKind kinds and its `_` arm names none of the rest",
+      text: "matches 2 of 33 VKind kinds and its `_` arm names none of the rest",
     },
   },
   {
@@ -297,7 +297,7 @@ function namedBraced(t: Ty): i32 {
     // `}` are both on the header line, so the body must end there and not swallow
     // what follows.
     name: "tail-oneliner.vl",
-    src: `function oneLiner(k: string): i32 { k.length }
+    src: `function oneLiner(k: string): i32 { return k.length }
 
 function holed(k: string): i32 {
   if k == "nulbool" { return 1 }
@@ -341,7 +341,7 @@ print(fieldPrimLadder(c))
     name: "imported.vl",
     deps: [{
       name: "imported_owner.vl",
-      src: `export function owner(k: string): i32 { k.length }
+      src: `export function owner(k: string): i32 { return k.length }
 export const table: i32[] = [1]
 `,
     }],

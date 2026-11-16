@@ -88,10 +88,14 @@ export type TyPrim = { primName: PrimName }
 // field to be distinguishable; an `i32` carries that for no allocation.
 export type TyErr = { errKind: i32 }
 
-// A structural object: parallel arrays of field names and their type-arena
-// indices. (Constructed by the harness to seed object-typed bindings; the parser
-// subset has no object-type literal syntax yet, so it is not built from source.)
-export type TyObj = { objFieldNames: string[], objFieldTypes: i32[] }
+// A structural object: parallel arrays of field names and their type-arena indices. `objFieldIx`
+// is `objFieldIndexOf`'s cache, a name's first position over the first `objFieldIxLen` names.
+export type TyObj = {
+  objFieldNames: string[],
+  objFieldTypes: i32[],
+  objFieldIx: {[string]: i32},
+  objFieldIxLen: i32,
+}
 
 // A function: parameter type indices and a return type index.
 export type TyFunc = { fnParamTypes: i32[], fnRet: i32 }
@@ -114,10 +118,18 @@ export type TyArray = { aElem: i32, aRead: i32 }
 // but exposes only `.add`/`.has`/`.delete`/`.length`/`.values()`.
 export type TyMap = { mKey: i32, mVal: i32, mSet: i32 }
 
-// A generic type parameter (`T` in `function id<T>(x: T): T`): opaque inside the generic
-// body (assignable both ways, like the err hole); at a call site each TyVar param binds to
-// its argument's type and the return substitutes through.
-export type TyVar = { tvName: string }
+// A type parameter (`T` in `id<T>`) or an inference hole (`tvKind`): opaque inside its body, bound
+// per call to its argument's type. `(tvBinder, tvIdx)` is the declaration slot it names, -1 for a
+// row minted before its site passed one (`mkTyVar`); `tvName` is its spelling, for rendering.
+export type TyVar = {
+  tvName: string,
+  tvKind: TvKind,
+  tvBinder: i32,
+  tvIdx: i32,
+}
+
+// What a type variable stands for: a declared type parameter, or an inference hole.
+export type TvKind = "param" | "hole"
 
 // The literal-member vocabulary — a closed set, so every producer is a literal
 // `mkLitTy("str"/"int", …)` and a member outside it is a hard type error. There is no float
@@ -179,7 +191,7 @@ export let T: Checker = { tys: [], frames: [], diags: [], curRet: -1 }
 
 // The type arena row at `ix`; one body holds the bounds check that an inline `T.tys[ix]`
 // repeats at every read site.
-export function tyAt(ix: i32): Ty { T.tys[ix] }
+export function tyAt(ix: i32): Ty { return T.tys[ix] }
 
 // `cUserTypes` — declared struct/union types, `name → type-arena index`, built in a
 // pre-pass over the program's `type` declarations so a struct name in an annotation or in
@@ -198,12 +210,58 @@ export function nearNamesNote(): void { nearNamesRead = true }
 // bug; minting a new index needs none. `cUserTypesVer` does the same for `cUserTypes` writes.
 export let tyMutEpoch = 0
 
+// `tyEmitEpoch` advances with `tyMutEpoch` except for a write to a row or hole minted inside the
+// innermost open fresh scope (a mono re-check, an alias application), which no emit memo can have
+// read; the emitter's memos stamp with it. A write that names neither moves both.
+export let tyEmitEpoch = 0
+// Per open fresh scope, outermost first: the arena length and the hole count when it began.
+const tyFreshRowMark: i32[] = []
+const tyFreshHoleMark: i32[] = []
+
+// Advances the epochs for an in-place write to arena row `row` or hole `hole` (-1 for neither):
+// the one writer of `tyMutEpoch` and `tyEmitEpoch`.
+export function tyMutBump(row: i32, hole: i32) {
+  tyMutEpoch = tyMutEpoch + 1
+  const n = tyFreshRowMark.length
+  const fresh = n > 0
+    && (row >= 0 && row >= tyFreshRowMark[n - 1]
+    || row < 0 && hole >= 0 && hole >= tyFreshHoleMark[n - 1])
+  if fresh { return 0 }
+  tyEmitEpoch = tyEmitEpoch + 1
+  return 0
+}
+
+// Opens a fresh scope: rows and holes minted from here are fresh until `tyFreshEnd`. Only code
+// inside the scope can hold them, so a write to one invalidates no emit memo.
+export function tyFreshBegin() {
+  tyFreshRowMark.push(T.tys.length)
+  tyFreshHoleMark.push(holeSol.length)
+  return 0
+}
+
+export function tyFreshEnd() {
+  tyFreshRowMark.pop()
+  tyFreshHoleMark.pop()
+  return 0
+}
+
 export let cUserTypesVer = 0
 
-// The declaration node of each type-parameter row of a generic nested in another function.
-// Bindings are by name, so a substitution binds a nested row only at that generic's own calls
-// (`substTyDeep`, D3853).
-export let tvNestOf: {[i32]: i32} = Map()
+// Each generic nested in another function, by declaration node, to its enclosing declaration.
+export let nestParentOf: {[i32]: i32} = Map()
+export function nestParentOfPut(k: i32, v: i32) { nestParentOf.set(k, v) }
+export function nestParentOfReset() { return nestParentOf = Map() }
+
+// The nested generic whose parameter type-variable row `row` names, or -1: a substitution binds
+// such a row only at that generic's own calls (`substTyDeep`, D3853).
+export function tvNestDeclOf(row: i32): i32 {
+  if row < 0 || row >= T.tys.length { return -1 }
+  const t = tyAt(row)
+  if !(t is TyVar) || t.tvKind != "param" || !nestParentOf.has(t.tvBinder) {
+    return -1
+  }
+  return t.tvBinder
+}
 
 // Depth guard for `tyToStr` on recursive named types: a cyclic arena shape would otherwise
 // render forever, so past a fixed depth a type already being rendered prints `…`. An acyclic
@@ -228,14 +286,14 @@ let tyStrAtoms = 1
 export function tyReachesEmptyHole(ty: i32, depth: i32): boolean {
   if ty < 0 || depth <= 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyArray => {
-      if t.aElem < 0 { return true }
-      tyReachesEmptyHole(t.aElem, depth - 1)
+      if tyElemOpen(t) { return true }
+      tyReachesEmptyHole(tyElemOf(t), depth - 1)
     }
     TyMap => {
-      if t.mKey < 0 || t.mVal < 0 { return true }
-      tyReachesEmptyHole(t.mVal, depth - 1)
+      if tyKeyOpen(t) || tyValOpen(t) { return true }
+      tyReachesEmptyHole(tyValOf(t), depth - 1)
     }
     TyObj => {
       let i = 0
@@ -258,10 +316,10 @@ export function tyReachesEmptyHole(ty: i32, depth: i32): boolean {
 export function tyReachesUnion(ty: i32, depth: i32): boolean {
   if ty < 0 || depth <= 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyUnion => true
-    TyArray => tyReachesUnion(t.aElem, depth - 1)
-    TyMap => tyReachesUnion(t.mVal, depth - 1)
+    TyArray => tyReachesUnion(tyElemOf(t), depth - 1)
+    TyMap => tyReachesUnion(tyValOf(t), depth - 1)
     TyNullable => tyReachesUnion(t.nInner, depth - 1)
     TyObj => {
       let i = 0
@@ -282,7 +340,7 @@ export function tyPinsEmptyHoles(ty: i32, depth: i32): boolean {
   if ty < 0 || depth <= 0 { return false }
   const t = tyAt(ty)
   if t is TyNullable { return tyPinsEmptyHoles(t.nInner, depth - 1) }
-  t is TyArray || t is TyMap || t is TyObj
+  return t is TyArray || t is TyMap || t is TyObj
 }
 
 // Well-known primitive type-arena indices, pinned by `initChecker` so the hot
@@ -329,7 +387,7 @@ export let TY_V128 = -1
 
 // Whether `ty` is a record type.
 export function tyIsRecord(ty: i32): boolean {
-  ty >= 0 && ty < T.tys.length && tyAt(ty) is TyObj
+  return ty >= 0 && ty < T.tys.length && tyAt(ty) is TyObj
 }
 
 // Whether `ty` is the primitive `i64` or `f64`.
@@ -337,24 +395,31 @@ export function tyIsWidePrim(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if t is TyPrim { return t.primName == "i64" || t.primName == "f64" }
-  false
+  return false
 }
 
 // A literal union whose values rep as an i32, so the integer mix hashes them: a string one as
 // the interned atom, a numeric one as its base, and only where that base is i32 (D1748).
 export function tyLitUnionHashesI32(k: i32): boolean {
   if tyIsLitUnion(k) { return true }
-  numLitUnionBaseTy(k) == TY_I32
+  return numLitUnionBaseTy(k) == TY_I32
 }
 
 // Renames type variable row `ix` in place, keeping its owner; a no-op on any other row. The
 // emitter's way to tell apart two declared parameters one name spells.
 export function tyVarRenameRow(ix: i32, name: string) {
   if ix < 0 || ix >= T.tys.length || !(tyAt(ix) is TyVar) { return 0 }
-  const t: Ty = { tvName: name }
+  const old = tyAt(ix)
+  if !(old is TyVar) { return 0 }
+  const t: Ty = {
+    tvName: name,
+    tvKind: old.tvKind,
+    tvBinder: old.tvBinder,
+    tvIdx: old.tvIdx,
+  }
   T.tys[ix] = t
   tyVarRenames = tyVarRenames + 1
-  0
+  return 0
 }
 
 // How many `tyVarRenameRow` rewrites have run: an in-place arena write `tyMutEpoch` does not count.
@@ -388,7 +453,7 @@ export function cStructPush(ix: i32, name: string) {
     while cStructFirstPos.length <= ix { cStructFirstPos.push(-1) }
     if cStructFirstPos[ix] < 0 { cStructFirstPos[ix] = cStructTyIxs.length - 1 }
   }
-  0
+  return 0
 }
 
 export let cVariantMemberTyIxs: i32[] = []
@@ -461,7 +526,7 @@ export function tyMemberWithin(m: i32, cap: i32): boolean {
       i = i + 1
     }
   }
-  false
+  return false
 }
 
 // The base scalar a literal type softens to: a string literal to `string`, an integer to its
@@ -471,7 +536,7 @@ export function tyMemberWithin(m: i32, cap: i32): boolean {
 export function litBaseTy(t: TyLit) {
   if t.litKind == "str" { return TY_STR }
   if numLexFitsI32(t.litText) { return TY_I32 }
-  TY_I64
+  return TY_I64
 }
 
 // The emit name of that base scalar — `litBaseTy` rendered. One home for the four-way rule, so no
@@ -480,13 +545,13 @@ export function litBaseTy(t: TyLit) {
 function tyLitBasePrim(t: TyLit): PrimName | null {
   const bt = tyAt(litBaseTy(t))
   if bt is TyPrim { return bt.primName }
-  null
+  return null
 }
 
 // The same answer as text, for the renderers that spell it. Declaring the return `string` is what
 // widens the atom into a materialized string, so the atom form above is the one every deciding
 // caller should ask.
-function tyLitBaseName(t: TyLit) { primNameStr(tyLitBasePrim(t)) }
+function tyLitBaseName(t: TyLit) { return primNameStr(tyLitBasePrim(t)) }
 
 // Soften a literal or all-literal union operand to its base scalar: a numeric-literal union is its
 // base type for arithmetic and ordering, the union constraining what may be assigned rather than
@@ -494,7 +559,7 @@ function tyLitBaseName(t: TyLit) { primNameStr(tyLitBasePrim(t)) }
 export function softenLitTy(ty: i32) {
   if ty < 0 { return ty }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyLit => litBaseTy(t)
     TyUnion => {
       const members = t.uMembers
@@ -535,7 +600,7 @@ export function tyIsPlainScalar(ty: i32): boolean {
       }
     }
   }
-  false
+  return false
 }
 
 // Whether `ty` is or holds, through lists, a union, a nullable or a function: a value whose rep
@@ -543,9 +608,9 @@ export function tyIsPlainScalar(ty: i32): boolean {
 export function tyRepVaries(ty: i32, depth: i32): boolean {
   if ty < 0 || ty >= T.tys.length || depth <= 0 { return true }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyUnion | TyNullable | TyFunc => true
-    TyArray => tyRepVaries(t.aElem, depth - 1)
+    TyArray => tyRepVaries(tyElemOf(t), depth - 1)
     TyPrim | TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => false
   }
 }
@@ -555,7 +620,7 @@ export function tyRepVaries(ty: i32, depth: i32): boolean {
 // Absence renders empty, which is what those sites read.
 export function primNameStr(p: PrimName | null): string {
   if p == null { return "" }
-  p
+  return p
 }
 
 // Whether `t` is a declared type parameter, not an inference hole.
@@ -563,12 +628,12 @@ export function tyIsDeclaredParam(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const tt = tyAt(t)
   if tt is TyVar { return tt.tvName.length > 0 && tt.tvName[0] != "?"[0] }
-  false
+  return false
 }
 
 // Whether `t` is a primitive type, which no union box is.
 export function tyIsPrimIx(t: i32): boolean {
-  t >= 0 && t < T.tys.length && tyAt(t) is TyPrim
+  return t >= 0 && t < T.tys.length && tyAt(t) is TyPrim
 }
 
 // Whether `ty` is a union whose every member is a list.
@@ -585,7 +650,7 @@ export function tyUnionAllLists(ty: i32): boolean {
     }
     return t.uMembers.length >= 2
   }
-  false
+  return false
 }
 
 // Whether the declared type parameter `an` and the type `b` are two differently named ones.
@@ -596,7 +661,7 @@ export function tyParamNamesPart(an: string, b: i32): boolean {
     if an[0] == "?"[0] || tb.tvName[0] == "?"[0] { return false }
     return an != tb.tvName
   }
-  false
+  return false
 }
 
 // Whether `ty` is a record, or a union or nullable with a record member.
@@ -634,13 +699,13 @@ export function tyMayHoldFn(ty: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return tyMayHoldFn(t.aElem, depth + 1)
+      return tyMayHoldFn(tyElemOf(t), depth + 1)
     }
     TyNullable => {
       return tyMayHoldFn(t.nInner, depth + 1)
     }
     TyMap => {
-      return tyMayHoldFn(t.mVal, depth + 1)
+      return tyMayHoldFn(tyValOf(t), depth + 1)
     }
     TyObj => {
       for ft in t.objFieldTypes {
@@ -667,7 +732,7 @@ export function tyMayHoldFn(ty: i32, depth: i32): boolean {
 export function tyHasNullHole(ti: i32, depth: i32): boolean {
   if ti < 0 || depth <= 0 { return false }
   const t = tyAt(ti)
-  match t {
+  return match t {
     TyPrim => t.primName == "null"
     TyObj => {
       const fts = t.objFieldTypes
@@ -678,7 +743,7 @@ export function tyHasNullHole(ti: i32, depth: i32): boolean {
       }
       false
     }
-    TyArray => tyHasNullHole(t.aElem, depth - 1)
+    TyArray => tyHasNullHole(tyElemOf(t), depth - 1)
     // Not walked: a `null` under one of these is spellable, or not a literal's own inference.
     TyFunc | TyUnion | TyNullable | TyMap | TyNeg | TyVar | TyLit | TyErr => false
   }
@@ -691,7 +756,7 @@ export function tyHasNullHole(ti: i32, depth: i32): boolean {
 export function tyDeeperThan(ti: i32, budget: i32): boolean {
   if ti < 0 { return false }
   if budget <= 0 { return true }
-  tyWrapHeight(ti) >= budget
+  return tyWrapHeight(ti) >= budget
 }
 
 // The wrapper height `tyDeeperThan` compares, memoised per arena index and stamped with
@@ -725,7 +790,7 @@ function tyWrapHeight(ti: i32): i32 {
       }
     }
     TyArray => {
-      h = tyWrapStep(h, t.aElem)
+      h = tyWrapStep(h, tyElemOf(t))
     }
     TyNullable => {
       h = tyWrapStep(h, t.nInner)
@@ -743,7 +808,7 @@ function tyWrapHeight(ti: i32): i32 {
   }
   tdStamp[ti] = ep
   tdHeight[ti] = h
-  h
+  return h
 }
 
 // `h` raised to one more than child `c`'s height; a hole (`c < 0`) adds nothing.
@@ -752,7 +817,7 @@ function tyWrapStep(h: i32, c: i32): i32 {
   const ch = tyWrapHeight(c)
   if ch >= TD_UNBOUNDED { return TD_UNBOUNDED }
   if ch + 1 > h { return ch + 1 }
-  h
+  return h
 }
 
 // D-ARRGROUP — the one home of the array-element grouping rule, shared by all three renderers.
@@ -762,7 +827,7 @@ function tyWrapStep(h: i32, c: i32): i32 {
 function arrElemRender(el: string, elTy: i32, elAtoms: i32): string {
   if tyIxIsFunc(elTy) { return "(" + el + ")[]" }
   if elAtoms > 1 { return "(" + el + ")[]" }
-  el + "[]"
+  return el + "[]"
 }
 
 // Is arena index `ix` a `readonly T[]` view? Total in `ix`, like `tyIxIsFunc`.
@@ -770,7 +835,7 @@ export function tyIxIsView(ix: i32): boolean {
   if ix < 0 || ix >= T.tys.length { return false }
   const t = tyAt(ix)
   if t is TyArray { return t.aRead == 1 }
-  false
+  return false
 }
 
 // Is arena index `ix` a function type? Total in `ix`, and that is the whole reason it exists: `-1`
@@ -781,7 +846,7 @@ export function tyIxIsFunc(ix: i32): boolean {
   if ix < 0 || ix >= T.tys.length { return false }
   const t = tyAt(ix)
   if t is TyFunc { return true }
-  false
+  return false
 }
 
 // The suggestion for unresolved spelling `name`, or "" for none: first `tySpellFrom`/
@@ -825,7 +890,7 @@ function tySuggestFor(name: string) {
       }
     }
   }
-  best
+  return best
 }
 
 // The `; did you mean '<name>'?` clause, or "" when nothing is near enough. A suffix by
@@ -837,20 +902,20 @@ export function tyDidYouMean(name: string) {
   if g.length > 0 { return g }
   const s = tySuggestFor(name)
   if s.length == 0 { return "" }
-  "; did you mean '" + s + "'?"
+  return "; did you mean '" + s + "'?"
 }
 
 // —— type → string (for diagnostics) ——
 // Renders a type-arena index as a readable name. The `nominal` bit: true renders a
 // declared type by its name (`Cat`, `Box<i32>`); false is the structural spelling the
 // emitter's name-keyed tables need — both spell composites as VL source does (`=>`, `T | null`).
-export function tyToStr(ix: i32) { tyToStrAt(ix, true) }
+export function tyToStr(ix: i32) { return tyToStrAt(ix, true) }
 
 // The structural render — `tyToStr`'s recursion with the nominal legs off. Read by the
 // checker's emitter-facing name producers, whose result is a key into an emitter table
 // keyed by structural spelling (`structIndexOfTypeName` matches a `{…}` shape by field
 // set) — a nominal name there is a key those tables do not hold.
-export function tyToStructStr(ix: i32) { tyToStrAt(ix, false) }
+export function tyToStructStr(ix: i32) { return tyToStrAt(ix, false) }
 
 function tyToStrAt(ix: i32, nominal: boolean) {
   // Both bail-outs return single tokens — one atom, like every arm that writes no
@@ -879,7 +944,7 @@ function tyToStrAt(ix: i32, nominal: boolean) {
   const s = tyToStrGo(ix, nominal)
   tyToStrStack.pop()
   tyToStrDepth = tyToStrDepth - 1
-  s
+  return s
 }
 
 function tyToStrGo(ix: i32, nominal: boolean) {
@@ -919,6 +984,8 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       // must never join the LSP's absence filter (`ABSENT_TYPE_MARKERS`): as a substring of
       // ordinary identifiers it would delete hints from healthy code (`{foo_bar: i32}`).
       if t.tvName[0] == '?' { return "_" }
+      const shown = tvSlotShownAs(t.tvBinder, t.tvIdx)
+      if shown >= 0 { return tyToStrAt(shown, nominal) }
       return t.tvName
     }
     TyLit => {
@@ -959,7 +1026,7 @@ function tyToStrNameOf(ix: i32, nominal: boolean): string {
     const udn = unionAliasDeclNameOfTy(ix)
     if udn != "" { return udn }
   }
-  ""
+  return ""
 }
 
 // A record type's render, `{a: A, b: B}`, one atom.
@@ -978,7 +1045,7 @@ function tyToStrObj(t: TyObj, nominal: boolean): string {
   // Every field separator sits inside the braces — one atom. Set explicitly rather
   // than inherited, since a field's own render leaves its last width behind.
   tyStrAtoms = 1
-  s + "}"
+  return s + "}"
 }
 
 // A function type's render, `(params) => ret`, one atom; a function result keeps its parens.
@@ -1000,7 +1067,7 @@ function tyToStrFunc(t: TyFunc, nominal: boolean): string {
   // function keeps grouping parens — the same rule `arrElemRender` carries for array
   // elements.
   if tyIxIsFunc(t.fnRet) { rs = "(" + rs + ")" }
-  s + ") => " + rs
+  return s + ") => " + rs
 }
 
 // A union's render, its members joined by ` | `, with `tyStrAtoms` set to their summed width.
@@ -1028,7 +1095,7 @@ function tyToStrUnion(t: TyUnion, nominal: boolean): string {
     i = i + 1
   }
   tyStrAtoms = psum
-  s
+  return s
 }
 
 // A nullable's render, `T | null`, one atom wider than its inner's.
@@ -1046,36 +1113,36 @@ function tyToStrNullable(t: TyNullable, nominal: boolean): string {
   // A union inner keeps its own top-level `|`s (`A | B | null`), so the `null` arm
   // adds to the inner render's width rather than making the whole render two atoms.
   tyStrAtoms = innerAtoms + 1
-  inner + " | null"
+  return inner + " | null"
 }
 
 // A list's render, `T[]` or `readonly T[]`, one atom; a wide or view element is grouped.
 function tyToStrArray(t: TyArray, nominal: boolean): string {
-  const el = tyToStrAt(t.aElem, nominal)
+  const el = tyToStrAt(tyElemOf(t), nominal)
   const elw = tyStrAtoms
   // A list render is one atom in every form — a wide element is parenthesized so its
   // `|`s stop being top-level. Set explicitly, since the element render left its own width behind.
   tyStrAtoms = 1
   // A view element is grouped: `readonly T[][]` spells a view of `T[][]` (D2195).
-  let row = arrElemRender(el, t.aElem, elw)
-  if tyIxIsView(t.aElem) { row = "(" + el + ")[]" }
+  let row = arrElemRender(el, tyElemOf(t), elw)
+  if tyIxIsView(tyElemOf(t)) { row = "(" + el + ")[]" }
   if t.aRead == 1 { return "readonly " + row }
-  row
+  return row
 }
 
 // A map's render, `{[K]: V}`, or under `nominal` a set's `Set<K>`; one atom.
 function tyToStrMap(t: TyMap, nominal: boolean): string {
-  const mk = tyToStrAt(t.mKey, nominal)
+  const mk = tyToStrAt(tyKeyOf(t), nominal)
   // A set is its own type and reads as one; the structural render keeps the index
   // signature the emitter's name tables are keyed by.
   if t.mSet == 1 && nominal {
     tyStrAtoms = 1
     return "Set<" + mk + ">"
   }
-  const mv = tyToStrAt(t.mVal, nominal)
+  const mv = tyToStrAt(tyValOf(t), nominal)
   // The key/value separators sit inside the braces — one atom.
   tyStrAtoms = 1
-  "{[" + mk + "]: " + mv + "}"
+  return "{[" + mk + "]: " + mv + "}"
 }
 
 // The spelling tree of `tyToStr(ix)`: the tree `parseType` builds from that render, built from
@@ -1083,7 +1150,7 @@ function tyToStrMap(t: TyMap, nominal: boolean): string {
 // one would. -1 when the render is no annotation: an error, a cycle, a map keyed by no name.
 export function tyToTs(ix: i32): i32 {
   tyTsBudget = 4096
-  tyTsGo(ix, 0)
+  return tyTsGo(ix, 0)
 }
 
 // The nodes `tyToTs` may still build, so a shared subtree cannot blow the render up.
@@ -1141,11 +1208,11 @@ function tyTsGo(ix: i32, depth: i32): i32 {
       return tyTsArray(t, depth)
     }
     TyMap => {
-      const k = tyTsGo(t.mKey, depth + 1)
+      const k = tyTsGo(tyKeyOf(t), depth + 1)
       if k < 0 { return -1 }
       if t.mSet == 1 { return tsMkKids(TS_APP, "Set", [k]) }
       if tsKind[k] != TS_NAME { return -1 }
-      const v = tyTsGo(t.mVal, depth + 1)
+      const v = tyTsGo(tyValOf(t), depth + 1)
       if v < 0 { return -1 }
       return tsMkKids(TS_MAP, tsText[k], [v])
     }
@@ -1189,7 +1256,7 @@ function tyTsNameOf(ix: i32, depth: i32): i32 {
   }
   const udn = unionAliasDeclNameOfTy(ix)
   if udn != "" { return tsLeaf(TS_NAME, udn) }
-  -2
+  return -2
 }
 
 // `tyToStrObj`'s tree: one field node per field; -1 when a field has no tree.
@@ -1204,25 +1271,29 @@ function tyTsObj(t: TyObj, depth: i32): i32 {
     kids.push(tsMkKids(TS_FIELD, names[i], [f]))
     i = i + 1
   }
-  tsMkKids(TS_OBJ, "", kids)
+  return tsMkKids(TS_OBJ, "", kids)
 }
 
 // `tyToStrArray`'s tree: a function, union or view element grouped, a view marked `readonly`.
 function tyTsArray(t: TyArray, depth: i32): i32 {
-  let el = tyTsGo(t.aElem, depth + 1)
+  let el = tyTsGo(tyElemOf(t), depth + 1)
   if el < 0 { return -1 }
-  if tyIxIsFunc(t.aElem) || tyIxIsView(t.aElem) || tsKind[el] == TS_UNION {
+  if (
+    tyIxIsFunc(tyElemOf(t))
+    || tyIxIsView(tyElemOf(t))
+    || tsKind[el] == TS_UNION
+  ) {
     el = tsMkKids(TS_PAREN, "", [el])
   }
   const ro = if t.aRead == 1 { "readonly" } else { "" }
-  tsMkKids(TS_ARR, ro, [el])
+  return tsMkKids(TS_ARR, ro, [el])
 }
 
 // Tree `k` of type `ty`, grouped when `ty` is a function type, which a bare `|` or `[]` after
 // it would join; -1 stays -1.
 function tyTsGroupFn(ty: i32, k: i32): i32 {
   if k < 0 || !tyIxIsFunc(ty) { return k }
-  tsMkKids(TS_PAREN, "", [k])
+  return tsMkKids(TS_PAREN, "", [k])
 }
 
 // Append tree `k` to the union member list `kids`, its own members when it is a union.
@@ -1236,7 +1307,7 @@ function tyTsJoin(kids: i32[], k: i32) {
     kids.push(tsKids[tsKidStart[k] + i])
     i = i + 1
   }
-  0
+  return 0
 }
 
 // Is arena type `ix` a nullable value-union box — a `TyUnion` with a `null` member and two
@@ -1276,7 +1347,7 @@ export function tyIsNulValueUnionBox(ix: i32): boolean {
     }
     return hasNull && others >= 2
   }
-  false
+  return false
 }
 
 // The primitive name arena type `ix` renders as (`tyToStr`), or "" when it renders as
@@ -1286,7 +1357,7 @@ export function tyIsNulValueUnionBox(ix: i32): boolean {
 export function tyPrimNameOf(ix: i32): PrimName | null {
   if ix < 0 { return null }
   const t = tyAt(ix)
-  match t {
+  return match t {
     TyPrim => t.primName
     TyUnion => {
       if t.uMembers.length == 1 { return tyPrimNameOf(t.uMembers[0]) }
@@ -1301,7 +1372,7 @@ export function tyPrimNameOf(ix: i32): PrimName | null {
 // replacing `tyToStr(ix) == "i32"` at sites asking a structural question ("is the inner
 // the string primitive?") by rendering.
 export function tyIsPrimNamed(ix: i32, nm: PrimName): boolean {
-  tyPrimNameOf(ix) == nm
+  return tyPrimNameOf(ix) == nm
 }
 
 // —— the element row of an array type, empty-`[]` hole answered once ——
@@ -1312,10 +1383,10 @@ export function tyArrayElemIx(ix: i32): i32 {
   if ix < 0 || ix >= T.tys.length { return -1 }
   const t = tyAt(ix)
   if t is TyArray {
-    if t.aElem < 0 || t.aElem >= T.tys.length { return -1 }
-    return t.aElem
+    if tyElemOpen(t) || tyElemOf(t) >= T.tys.length { return -1 }
+    return tyElemOf(t)
   }
-  -1
+  return -1
 }
 
 // ── structural type equality ──
@@ -1337,7 +1408,7 @@ export function tyEqSameHoles(a: i32, b: i32): boolean {
   tyEqHolesExact = true
   const r = tyEq(a, b)
   tyEqHolesExact = was
-  r
+  return r
 }
 
 // Set only inside `tyEqSoftLits`: `tyEq` then compares a lone literal as its base scalar.
@@ -1352,7 +1423,7 @@ export function tyEqSoftLits(a: i32, b: i32): boolean {
   tyEqSoft = true
   const r = tyEq(a, b)
   tyEqSoft = was
-  r
+  return r
 }
 
 export function tyEq(a0: i32, b0: i32) {
@@ -1390,7 +1461,7 @@ export function tyEq(a0: i32, b0: i32) {
     pairMemoPut(tyEqMemo, a, b, tag, ok)
   }
   if tyEqAStack.length == 0 { pairMemoClear(tyEqMemo) }
-  ok
+  return ok
 }
 
 // The record pairs one outermost `tyEq` call decided without assuming a pair still being
@@ -1404,7 +1475,7 @@ function tyEqMemoTag(): i32 {
   let f = 0
   if tyEqSoft { f = f + 1 }
   if tyEqHolesExact { f = f + 2 }
-  f
+  return f
 }
 
 // Flattens nested union layers only — a nullable renders `T?` here, not `T | null`, so
@@ -1423,7 +1494,7 @@ function unionMembersInto(ty: i32, out: i32[]) {
     }
   }
   out.push(ty)
-  0
+  return 0
 }
 
 // Union render-equality: the flattened member sequences match pairwise.
@@ -1438,7 +1509,7 @@ function unionEq(a: i32, b: i32) {
     if !tyEq(av[i], bv[i]) { return false }
     i = i + 1
   }
-  true
+  return true
 }
 
 function tyEqGo(a: i32, b: i32) {
@@ -1473,10 +1544,7 @@ function tyEqGo(a: i32, b: i32) {
         // asking for the same holes (`tyEqSameHoles`).
         if ta.tvName[0] == '?' && !tyEqHolesExact { return tb.tvName[0] == '?' }
         // Two declarations' parameters of one name substitute apart.
-        if (
-          tyEqHolesExact
-          && (tvNestOf.get(a) ?? -1) != (tvNestOf.get(b) ?? -1)
-        ) {
+        if (tyEqHolesExact && tvNestDeclOf(a) != tvNestDeclOf(b)) {
           return false
         }
         return ta.tvName == tb.tvName
@@ -1498,14 +1566,14 @@ function tyEqGo(a: i32, b: i32) {
         // A view and its list render differently and accept different operations, so they
         // are not the same type — `readonly Shape[]` never keys a `Shape[]` registry row.
         if ta.aRead != tb.aRead { return false }
-        return tyEq(ta.aElem, tb.aElem)
+        return tyEq(tyElemOf(ta), tyElemOf(tb))
       }
       return false
     }
     TyMap => {
       if tb is TyMap {
         if ta.mSet != tb.mSet { return false }
-        return tyEq(ta.mKey, tb.mKey) && tyEq(ta.mVal, tb.mVal)
+        return tyEq(tyKeyOf(ta), tyKeyOf(tb)) && tyEq(tyValOf(ta), tyValOf(tb))
       }
       return false
     }
@@ -1556,32 +1624,40 @@ export function tyFieldTyOf(ty: i32, name: string): i32 {
   if ty < 0 { return -1 }
   const t = tyAt(ty)
   if t is TyObj { return objFieldType(t, name) }
-  -1
+  return -1
 }
 
 export function objFieldType(o: TyObj, name: string) {
-  const names = o.objFieldNames
-  const ftys = o.objFieldTypes
-  const n = name.length
-  let i = 0
-  while i < names.length {
-    // The length test is inline so a name of another length skips the string compare's call.
-    const fi = names[i]
-    if fi.length == n && fi == name { return ftys[i] }
-    i = i + 1
-  }
-  -1
+  const i = objFieldIndexOf(o, name)
+  return if i < 0 { -1 } else { o.objFieldTypes[i] }
 }
 
-// Per arena row, the field-name count `objRowNamesDistinct` last decided at (`-1` unasked)
-// and its answer. Stamped with the count because a hole shape gains fields in place; the
-// arena reset clears both.
-let objDistinctLen: i32[] = []
-let objDistinctAns: boolean[] = []
+// Up to this many fields a lookup scans; past it, it reads the row's name index.
+const OBJ_IX_MIN = 8
 
-export function objNamesDistinctReset() {
-  objDistinctLen = []
-  objDistinctAns = []
+// The first position of field `name` in `o`, or -1. Over `OBJ_IX_MIN` fields the index is built on
+// the first ask and extended past `objFieldIxLen` when the names grew, as a hole shape's do in place.
+export function objFieldIndexOf(o: TyObj, name: string): i32 {
+  const names = o.objFieldNames
+  if names.length <= OBJ_IX_MIN {
+    const n = name.length
+    let i = 0
+    while i < names.length {
+      // The length test is inline so a name of another length skips the string compare's call.
+      const fi = names[i]
+      if fi.length == n && fi == name { return i }
+      i = i + 1
+    }
+    return -1
+  }
+  const ix = o.objFieldIx
+  let i = o.objFieldIxLen
+  while i < names.length {
+    if !ix.has(names[i]) { ix[names[i]] = i }
+    i = i + 1
+  }
+  o.objFieldIxLen = names.length
+  return ix[name] ?? -1
 }
 
 // Whether arena row `ix` is an object whose field names are pairwise distinct. A refused
@@ -1591,27 +1667,12 @@ export function objRowNamesDistinct(ix: i32): boolean {
   if ix < 0 || ix >= T.tys.length { return false }
   const t = tyAt(ix)
   if !(t is TyObj) { return false }
-  const names = t.objFieldNames
-  while objDistinctLen.length <= ix {
-    objDistinctLen.push(-1)
-    objDistinctAns.push(false)
-  }
-  if objDistinctLen[ix] == names.length { return objDistinctAns[ix] }
-  let ok = true
-  let i = 1
-  while ok && i < names.length {
-    const ni = names[i]
-    let j = 0
-    while ok && j < i {
-      const nj = names[j]
-      if nj.length == ni.length && nj == ni { ok = false }
-      j = j + 1
-    }
+  let i = 0
+  while i < t.objFieldNames.length {
+    if objFieldIndexOf(t, t.objFieldNames[i]) != i { return false }
     i = i + 1
   }
-  objDistinctLen[ix] = names.length
-  objDistinctAns[ix] = ok
-  ok
+  return true
 }
 
 // Whether `ix` has an emitter-classifiable synthetic name (`tyToEmitName(ix) != ""`),
@@ -1656,11 +1717,11 @@ export function tyIsEmitRepresentable(ix: i32): boolean {
       return true
     }
     TyArray => {
-      return tyIsEmitRepresentable(t.aElem)
+      return tyIsEmitRepresentable(tyElemOf(t))
     }
     TyMap => {
-      if !tyIsEmitRepresentable(t.mKey) { return false }
-      return tyIsEmitRepresentable(t.mVal)
+      if !tyIsEmitRepresentable(tyKeyOf(t)) { return false }
+      return tyIsEmitRepresentable(tyValOf(t))
     }
     TyFunc => {
       const ps = t.fnParamTypes
@@ -1683,7 +1744,7 @@ export function tyIsEmitRepresentable(ix: i32): boolean {
   }
   // The type-parameter, negation and error arms land here: `tyToEmitName` spells "" for
   // each, so the capability answer is false.
-  false
+  return false
 }
 
 // Whether `tyToEmitName(ix)` is non-empty, decided once per arena node of the walk rather than
@@ -1691,7 +1752,7 @@ export function tyIsEmitRepresentable(ix: i32): boolean {
 // 0 empty, -1 when the walk meets a cycle, whose render depends on the ancestors it is asked under.
 export function tyEmitNameNonEmpty(ix: i32): i32 {
   const memo: {[i32]: i32} = Map()
-  tyEmitNameNonEmptyGo(ix, memo)
+  return tyEmitNameNonEmptyGo(ix, memo)
 }
 
 // The walk of `tyEmitNameNonEmpty`; `memo` holds each finished node's answer and 2 for one
@@ -1704,7 +1765,7 @@ function tyEmitNameNonEmptyGo(ix: i32, memo: {[i32]: i32}): i32 {
   memo[ix] = 2
   const r = tyEmitNameNonEmptyArm(ix, memo)
   memo[ix] = r
-  r
+  return r
 }
 
 // The answer for one node, its children asked through the memo: the conjunction of
@@ -1730,10 +1791,10 @@ function tyEmitNameNonEmptyArm(ix: i32, memo: {[i32]: i32}): i32 {
       return tyEmitNameAllNonEmpty(t.objFieldTypes, memo)
     }
     TyArray => {
-      return tyEmitNameNonEmptyGo(t.aElem, memo)
+      return tyEmitNameNonEmptyGo(tyElemOf(t), memo)
     }
     TyMap => {
-      return tyEmitNameAllNonEmpty([t.mKey, t.mVal], memo)
+      return tyEmitNameAllNonEmpty([tyKeyOf(t), tyValOf(t)], memo)
     }
     TyFunc => {
       const ps = tyEmitNameAllNonEmpty(t.fnParamTypes, memo)
@@ -1757,7 +1818,7 @@ function tyEmitNameAllNonEmpty(tys: i32[], memo: {[i32]: i32}): i32 {
     if r != 1 { return r }
     i = i + 1
   }
-  1
+  return 1
 }
 
 // The render-context vocabulary — the `ctx` half of the one agreed emit renderer
@@ -1814,7 +1875,7 @@ const emitNameMemoVal: {[i32]: string} = Map()
 function emitNameMemoOf(ix: i32): string {
   if emitNameObjVisits < EMIT_NAME_MEMO_AFTER { return "" }
   if (emitNameMemoGen[ix] ?? -1) != emitNameGen { return "" }
-  emitNameMemoVal[ix] ?? ""
+  return emitNameMemoVal[ix] ?? ""
 }
 
 // Records the render `r` of `ix` when it is a record whose walk met no cycle, so it is the
@@ -1831,7 +1892,7 @@ function emitNameMemoSet(ix: i32, r: string) {
 // has none (a `TyVar`, a residual negation, err/never, or a recursive type). Ask
 // `tyIsEmitRepresentable` for "does it have one at all", not this for "". The position-free
 // entry: every outside caller asks about a type standing on its own (`RC_ROOT` by definition).
-export function tyToEmitName(ix: i32) { tyToEmitNameAt(ix, RC_ROOT) }
+export function tyToEmitName(ix: i32) { return tyToEmitNameAt(ix, RC_ROOT) }
 
 // The same render, told the position it occupies in its parent — the cycle guard lives
 // here so the recursive calls, the only ones that can close a cycle, pass through it. On a
@@ -1841,7 +1902,7 @@ export function aliasNameOfTyIx(ix: i32): string {
   for k in cUserTypes.keys() {
     if (cUserTypes[k] ?? -1) == ix { return k }
   }
-  ""
+  return ""
 }
 
 export function tyToEmitNameAt(ix: i32, ctx: i32) {
@@ -1887,7 +1948,7 @@ export function tyToEmitNameAt(ix: i32, ctx: i32) {
     const fnm = nulFoldAliasNameOf(ix)
     if fnm != "" { return fnm }
   }
-  r
+  return r
 }
 
 // The declared name whose 0a placeholder holds `ix` as its single nullable member — the
@@ -1896,7 +1957,7 @@ export function tyToEmitNameAt(ix: i32, ctx: i32) {
 // transparent alias, and naming that member would re-spell an already-working render.
 function nulFoldAliasNameOf(ix: i32): string {
   if nulFoldWrapperTyIxOf(ix) >= 0 { return nulFoldWrapperNameOf(ix) }
-  ""
+  return ""
 }
 
 // The same lookup, returning the wrapper's arena index rather than its name — the mv layer
@@ -1917,7 +1978,7 @@ export function nulFoldWrapperTyIxOf(ix: i32): i32 {
       }
     }
   }
-  -1
+  return -1
 }
 
 function nulFoldWrapperNameOf(ix: i32): string {
@@ -1931,7 +1992,7 @@ function nulFoldWrapperNameOf(ix: i32): string {
       }
     }
   }
-  ""
+  return ""
 }
 
 // The position a composite's interior stands at, for the structural renderer — normally the
@@ -1940,13 +2001,13 @@ function nulFoldWrapperNameOf(ix: i32): string {
 // agree or the same argument gets two positions and two names — invalid wasm.
 function appKidCtx(ix: i32, ctx: i32): i32 {
   if tyIsGenAppInstance(ix) { return RC_ROOT }
-  ctx
+  return ctx
 }
 
 // Whether `ix` is a registered generic-application instance, whose interior the structural
 // renderer spells at the root position rather than at its own.
 export function tyIsGenAppInstance(ix: i32): boolean {
-  cTyIxSetHas(gaAppTyIxSet, ix)
+  return cTyIxSetHas(gaAppTyIxSet, ix)
 }
 
 // The kid position the two faces disagree about: the structural face re-roots a registered
@@ -1955,7 +2016,7 @@ export function tyIsGenAppInstance(ix: i32): boolean {
 // arm back, and re-rooting there would respell a member the union key already banked.
 function nameKidCtx(ix: i32, ctx: i32, nominal: boolean): i32 {
   if nominal { return ctx }
-  appKidCtx(ix, ctx)
+  return appKidCtx(ix, ctx)
 }
 
 // The recursive entry of the face being rendered. The two `At`s keep their own bodies: the
@@ -1963,7 +2024,7 @@ function nameKidCtx(ix: i32, ctx: i32, nominal: boolean): i32 {
 // one records the cut in `nomNameCycle`.
 function tyToNameAt(ix: i32, ctx: i32, nominal: boolean): string {
   if nominal { return tyToNominalNameAt(ix, ctx) }
-  tyToEmitNameAt(ix, ctx)
+  return tyToEmitNameAt(ix, ctx)
 }
 
 // The registered string-litunion alias whose literals are exactly the string-literal members
@@ -1987,7 +2048,7 @@ export function mixedLitRunAliasOf(members: i32[]): string {
     i = i + 1
   }
   if !nonLit || texts.length < 2 { return "" }
-  litUnionAliasOfLitTexts(texts)
+  return litUnionAliasOfLitTexts(texts)
 }
 
 // Whether a union's members are records and not all one type, as arms that differ only in a
@@ -1999,7 +2060,7 @@ export function tyMembersDistinctRecords(members: i32[]): boolean {
     if !(tyAt(m) is TyObj) { return false }
     if !tyEq(m, members[0]) { distinct = true }
   }
-  distinct
+  return distinct
 }
 
 // Whether `ty` is a union, bare or nullable, of distinct record arms that all render one shape,
@@ -2025,7 +2086,7 @@ export function tyIsTwinRecordUnion(ty: i32): boolean {
     if same && tyToNameAt(m, RC_UNION_MEM, false) != shape { same = false }
   }
   tyNameAtoms = keep
-  same
+  return same
 }
 
 // The render of a union whose record arms differ only in a lone literal, given its deduped
@@ -2059,7 +2120,7 @@ function twinRecordsRender(members: i32[], parts: string[]): string {
     tyNameAtoms = recs.length + 1
     return rep + "|null"
   }
-  rep
+  return rep
 }
 
 // `tyToNameGo`'s nominal-first prelude: the name a declared struct, generic application or
@@ -2088,7 +2149,7 @@ function tyNameNominal(ix: i32, ctx: i32): string {
     // …and an alias whose lists all spell one list denotes that list, rendered below.
     if oneListUnionRender(ix) == "" { return udn }
   }
-  ""
+  return ""
 }
 
 // `tyToNameGo`'s union arm: the members of `t` (arena index `ix`) rendered and joined with
@@ -2264,7 +2325,7 @@ function tyNameObjFieldPreserve(ft: i32): string {
   }
   const fbal = litUnionAliasNameOfTy(ft)
   if fbal != "" { return fbal }
-  oneStrLitSpelling(ft)
+  return oneStrLitSpelling(ft)
 }
 
 // Whether `ix` is a record, or a list or nullable whose peel down those wrappers is one.
@@ -2281,7 +2342,7 @@ export function tyWrapsRecord(ix: i32): boolean {
         k = t.nInner
       }
       TyArray => {
-        k = t.aElem
+        k = tyElemOf(t)
       }
       TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
         return false
@@ -2289,7 +2350,7 @@ export function tyWrapsRecord(ix: i32): boolean {
     }
     steps = steps + 1
   }
-  false
+  return false
 }
 
 // `tyToNameGo`'s function arm: the closure-annotation form `(p1,p2)=>ret` of `t` (arena
@@ -2380,14 +2441,14 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // A litunion-alias element (`K0[]`) keeps its alias name rather than softening to
       // `string[]` — the two spell different reps (the alias array is the interned-i32 atom
       // list; `string[]` is the string-ref list), so widening it would mint a twin mv slot.
-      let el = litUnionAliasNameOfTy(t.aElem)
+      let el = litUnionAliasNameOfTy(tyElemOf(t))
       // The element's own atom width, as its producer reported it — an alias identifier is
       // one atom, the render leg reports its own.
       let elw = 1
       // So does a lone string literal element, its one-member set's atom (D7340).
-      if el == "" { el = oneStrLitSpelling(t.aElem) }
+      if el == "" { el = oneStrLitSpelling(tyElemOf(t)) }
       if el == "" {
-        el = tyToNameAt(t.aElem, nameKidCtx(ix, RC_ELEM, nominal), nominal)
+        el = tyToNameAt(tyElemOf(t), nameKidCtx(ix, RC_ELEM, nominal), nominal)
         elw = tyNameAtoms
       }
       if el == "" { return "" }
@@ -2395,16 +2456,20 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // `|`s stop being top-level. Set explicitly, since the element render leaves its own
       // width behind; the grouping itself is `arrElemRender`'s.
       tyNameAtoms = 1
-      return arrElemRender(el, t.aElem, elw)
+      return arrElemRender(el, tyElemOf(t), elw)
     }
     TyMap => {
-      const mk = tyToNameAt(t.mKey, RC_MAP_KEY, nominal)
+      const mk = tyToNameAt(tyKeyOf(t), RC_MAP_KEY, nominal)
       // A litunion-alias map value (`{[string]: K0}`) keeps its alias name rather than
       // softening to `string` — an atom-valued map is the mono i32 map, and every
       // `$fnsig`/mv-slot key derived here must agree with the annotation side's spelling.
-      let mv = litUnionAliasNameOfTy(t.mVal)
+      let mv = litUnionAliasNameOfTy(tyValOf(t))
       if mv == "" {
-        mv = tyToNameAt(t.mVal, nameKidCtx(ix, RC_MAP_VAL, nominal), nominal)
+        mv = tyToNameAt(
+          tyValOf(t),
+          nameKidCtx(ix, RC_MAP_VAL, nominal),
+          nominal,
+        )
       }
       if mk == "" || mv == "" { return "" }
       // The key/value separators sit inside the braces — one atom.
@@ -2428,7 +2493,7 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
   }
   // The type-parameter, negation and error arms land here: "" is the renderer's own
   // signal, which `tyIsEmitRepresentable` predicts structurally arm-for-arm.
-  ""
+  return ""
 }
 
 // The declared name of declared-struct arena index `ty` (`type S = {…}` → "S"), or "" when
@@ -2439,7 +2504,7 @@ export function structNameOfTy(ty: i32): string {
   if ty < 0 || ty >= cStructFirstPos.length { return "" }
   const i = cStructFirstPos[ty]
   if i < 0 || i >= cStructNames.length { return "" }
-  cStructNames[i]
+  return cStructNames[i]
 }
 
 // The declared alias name of declared-union arena index `ty` (`type U = A | B` → "U"), or
@@ -2451,7 +2516,7 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
   if ty >= luPosByTy.length { return "" }
   const a = luPosByTy[ty]
   if a < 0 { return "" }
-  cUnionNames[a]
+  return cUnionNames[a]
 }
 
 // Does arena type `ix` reach itself — is its expansion cyclic? The guard the nominal
@@ -2461,7 +2526,16 @@ export function unionAliasDeclNameOfTy(ty: i32): string {
 export function tyReachesSelf(ix: i32): boolean {
   if ix < 0 { return false }
   const seen: i32[] = []
-  tyReachesGo(ix, ix, seen, 0)
+  return tyReachesGo(ix, ix, seen, 0)
+}
+
+// `tyReachesSelf`, except that a walk that gives up past its depth answers true: the caller
+// skips an invalidation only on a proven acyclic type.
+export function tyMayReachSelf(ix: i32): boolean {
+  if ix < 0 { return false }
+  const seen: i32[] = []
+  if tyReachesGo(ix, ix, seen, 0) { return true }
+  return i32ListHas(seen, -2)
 }
 
 // Does arena type `ix` reach a cycle — itself, or a type that reaches itself, as an arm a join
@@ -2470,7 +2544,7 @@ export function tyReachesCycle(ix: i32): boolean {
   if ix < 0 { return false }
   const stack: i32[] = []
   const done: i32[] = []
-  tyCycleGo(ix, stack, done)
+  return tyCycleGo(ix, stack, done)
 }
 
 function tyCycleGo(cur: i32, stack: i32[], done: i32[]): boolean {
@@ -2484,12 +2558,16 @@ function tyCycleGo(cur: i32, stack: i32[], done: i32[]): boolean {
   }
   stack.pop()
   done.push(cur)
-  false
+  return false
 }
 
 function tyReachesGo(cur: i32, target: i32, seen: i32[], depth: i32): boolean {
   if cur < 0 { return false }
-  if depth > 64 { return false }
+  if depth > 64 {
+    // Gave up: `tyMayReachSelf` reads the marker as a possible cycle.
+    seen.push(-2)
+    return false
+  }
   const kids: i32[] = []
   tyChildrenOf(cur, kids)
   let i = 0
@@ -2510,7 +2588,7 @@ function tyReachesGo(cur: i32, target: i32, seen: i32[], depth: i32): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // The direct child type indices of arena entry `ix`, appended to `out`. The leaf
@@ -2519,7 +2597,7 @@ export function tyChildrenOf(ix: i32, out: i32[]) {
   if ix < 0 { return 0 }
   const t = tyAt(ix)
   match t {
-    TyArray => out.push(t.aElem)
+    TyArray => out.push(tyElemOf(t))
     TyNullable => out.push(t.nInner)
     TyNeg => out.push(t.negTy)
     TyUnion => {
@@ -2548,13 +2626,13 @@ export function tyChildrenOf(ix: i32, out: i32[]) {
       out.push(t.fnRet)
     }
     TyMap => {
-      out.push(t.mKey)
-      out.push(t.mVal)
+      out.push(tyKeyOf(t))
+      out.push(tyValOf(t))
     }
     // The leaf constructors have no child.
     TyPrim | TyLit | TyVar | TyErr => {}
   }
-  0
+  return 0
 }
 
 // The generic application `ty` traces back to, rendered nominally (`Box<i32>`,
@@ -2568,7 +2646,7 @@ export function genAppNameOfTy(ty: i32): string {
   // did before this arm existed. Memoized per row (`-1` unknown / `0` cyclic / `1`
   // finite) — the answer cannot change once `applyGenAliasArgs` has filled the shape.
   if genAppRowCyclic(i) { return "" }
-  genAppRowRender(i)
+  return genAppRowRender(i)
 }
 
 // Whether application row `i` reaches itself, memoized per row (`-1` unknown / `0` cyclic /
@@ -2581,7 +2659,7 @@ export function genAppRowCyclic(i: i32): boolean {
       gaAppFinite[i] = 1
     }
   }
-  gaAppFinite[i] == 0
+  return gaAppFinite[i] == 0
 }
 
 // The application spelling of row `i` (`L<i32>`), finite or not, or "" when an argument has
@@ -2610,7 +2688,7 @@ function genAppRowRender(i: i32): string {
   }
   // The application is one top-level atom, whatever the recursion left in the bank.
   tyNameAtoms = 1
-  gaAppHeads[i] + "<" + s + ">"
+  return gaAppHeads[i] + "<" + s + ">"
 }
 
 // The application spelling of `ty`, a recursive instance included, or "" when `ty` is not a
@@ -2618,7 +2696,7 @@ function genAppRowRender(i: i32): string {
 export function genAppSpellOfTy(ty: i32): string {
   const i = genAppRowOf(ty)
   if i < 0 { return "" }
-  genAppRowRender(i)
+  return genAppRowRender(i)
 }
 
 // The `gaAppTyIxs` row recording `ty` as a generic application, or -1 when it is not one.
@@ -2629,7 +2707,7 @@ export function genAppRowOf(ty: i32): i32 {
     if gaAppTyIxs[i] == ty { return i }
     i = i + 1
   }
-  -1
+  return -1
 }
 
 // The ancestor stack of the nominal render in progress, `emitNameSeen`'s twin: nominal-first
@@ -2649,13 +2727,13 @@ export let nomNameCycle = false
 // structural sibling; the cycle bank is per top-level render, so it resets here.
 export function tyToNominalName(ix: i32): string {
   nomNameCycle = false
-  tyToNominalNameAt(ix, RC_ROOT)
+  return tyToNominalNameAt(ix, RC_ROOT)
 }
 
 // Did the last `tyToNominalName` hit a cycle — i.e. does that type have no finite nominal
 // name at all? Read by `emit_collect.vl`'s `guardFiniteUserTypes`, which rejects such a
 // program by name instead of letting any renderer trap on it.
-export function tyNomNameCycled(): boolean { nomNameCycle }
+export function tyNomNameCycled(): boolean { return nomNameCycle }
 
 export function tyToNominalNameAt(ix: i32, ctx: i32): string {
   tyNameAtoms = 1
@@ -2679,7 +2757,7 @@ export function tyToNominalNameAt(ix: i32, ctx: i32): string {
   nomNameSeen.push(ix)
   const r = tyToNameGo(ix, ctx, true)
   nomNameSeen.pop()
-  r
+  return r
 }
 
 // A recursive generic union instance met inside another render, spelled as its application: its
@@ -2688,7 +2766,7 @@ function nestedCyclicUnionApp(ix: i32): string {
   if ix < 0 || ix >= T.tys.length || !(tyAt(ix) is TyUnion) { return "" }
   const gi = genAppRowOf(ix)
   if gi < 0 || !genAppRowCyclic(gi) { return "" }
-  genAppRowRender(gi)
+  return genAppRowRender(gi)
 }
 
 // The brand arena index `ix` carries, or "" when it is an ordinary structural type. The
@@ -2700,7 +2778,7 @@ export function nomNameOfTy(ix: i32) {
     if nwTyIxs[i] == ix { return nwNames[i] }
     i = i + 1
   }
-  ""
+  return ""
 }
 
 // Does `dstTy` carry a nominal brand at or under its wrappers? The gate for the
@@ -2711,9 +2789,9 @@ export function tyReachesBrand(ty: i32, d: i32) {
   if d <= 0 { return false }
   if nomNameOfTy(ty) != "" { return true }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyNullable => tyReachesBrand(t.nInner, d - 1)
-    TyArray => tyReachesBrand(t.aElem, d - 1)
+    TyArray => tyReachesBrand(tyElemOf(t), d - 1)
     TyUnion => {
       const ms = t.uMembers
       let i = 0
@@ -2736,7 +2814,7 @@ export function tyIsNewtypeBrand(ty: i32): boolean {
     if nwTyIxs[i] == ty { return true }
     i = i + 1
   }
-  false
+  return false
 }
 
 // The base-scalar emit name of a numeric literal-union type (`0 | 1` → "i32"), or "" for
@@ -2769,7 +2847,7 @@ export function numLitUnionBaseTy(ty: i32): i32 {
     const pn = st.primName
     if pn == "i32" || pn == "i64" || pn == "f64" { return soft }
   }
-  -1
+  return -1
 }
 
 // The base as the atom: `PrimName` is a literal union, so this stays an interned atom and a
@@ -2779,13 +2857,13 @@ function numLitUnionBasePrim(ty: i32): PrimName | null {
   if b < 0 { return null }
   const bt = tyAt(b)
   if bt is TyPrim { return bt.primName }
-  null
+  return null
 }
 
 // The base as text — for the callers that genuinely propagate a name upward (the nominal
 // renderers), where the widening belongs at that boundary rather than on every ask.
 export function numLitUnionBaseName(ty: i32): string {
-  primNameStr(numLitUnionBasePrim(ty))
+  return primNameStr(numLitUnionBasePrim(ty))
 }
 
 // The single base numeric scalar every value of `ty` reps as at emit, or "" when not
@@ -2828,7 +2906,7 @@ export function tyNumScalarBaseName(ty: i32): string {
       else if base != nm { return "" }
     }
   }
-  base
+  return base
 }
 
 // The base scalar type `ty` reps as, or `null` for anything that isn't a scalar rep — the
@@ -2874,13 +2952,13 @@ export function tyScalarBasePrim(ty: i32): PrimName | null {
       }
     }
   }
-  null
+  return null
 }
 
 // The decision form — `tyIsPrimNamed`'s shape, over the peeling base. No string exists at
 // any point on this path.
 export function tyScalarBaseIs(ty: i32, nm: PrimName): boolean {
-  tyScalarBasePrim(ty) == nm
+  return tyScalarBasePrim(ty) == nm
 }
 
 // The value-atom kind of the non-null member of a `<numeric scalar> | null` arena type — `0`
@@ -2919,7 +2997,7 @@ export function tyNulNumScalarValKind(ty: i32): i32 {
       }
     }
   }
-  -1
+  return -1
 }
 
 // True when a nullable type's non-null member is a literal union (a singleton `TyLit`
@@ -2930,7 +3008,7 @@ export function tyNulLitUnionInner(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
   if t is TyNullable { return tyIsLitUnionOrLit(t.nInner) }
-  false
+  return false
 }
 
 // True at the render positions where a literal union keeps its members — the positive half
@@ -2941,7 +3019,7 @@ export function ctxKeepsLitUnion(ctx: i32) {
   if (ctx & RC_ELEM) != 0 { return true }
   if (ctx & RC_FIELD) != 0 { return true }
   if (ctx & RC_MAP_VAL) != 0 { return true }
-  false
+  return false
 }
 
 // Does `ty` hold a record anywhere: itself, a `| null`, a union member, a list element, a map
@@ -2957,10 +3035,11 @@ export function tyHoldsObj(ty: i32, depth: i32): boolean {
       return tyHoldsObj(t.nInner, depth - 1)
     }
     TyArray => {
-      return tyHoldsObj(t.aElem, depth - 1)
+      return tyHoldsObj(tyElemOf(t), depth - 1)
     }
     TyMap => {
-      return tyHoldsObj(t.mKey, depth - 1) || tyHoldsObj(t.mVal, depth - 1)
+      return tyHoldsObj(tyKeyOf(t), depth - 1)
+        || tyHoldsObj(tyValOf(t), depth - 1)
     }
     TyUnion => {
       for m in t.uMembers {
@@ -2986,18 +3065,18 @@ export function tyHoldsObj(ty: i32, depth: i32): boolean {
 // asked once, so a type that holds itself ends.
 export function tyHoldsObjDeep(ty: i32): boolean {
   const seen: i32[] = []
-  tyHoldsObjDeepIn(ty, seen)
+  return tyHoldsObjDeepIn(ty, seen)
 }
 
 function tyHoldsObjDeepIn(ty: i32, seen: i32[]): boolean {
   if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return false }
   seen.push(ty)
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyObj => true
     TyNullable => tyHoldsObjDeepIn(t.nInner, seen)
-    TyArray => tyHoldsObjDeepIn(t.aElem, seen)
-    TyMap => tyHoldsObjDeepIn(t.mKey, seen) || tyHoldsObjDeepIn(t.mVal, seen)
+    TyArray => tyHoldsObjDeepIn(tyElemOf(t), seen)
+    TyMap => tyHoldsObjDeepIn(tyKeyOf(t), seen) || tyHoldsObjDeepIn(tyValOf(t), seen)
     TyUnion => {
       for m in t.uMembers {
         if tyHoldsObjDeepIn(m, seen) { return true }
@@ -3044,8 +3123,8 @@ export function tyContainsList(ty: i32, depth: i32): boolean {
       return false
     }
     TyMap => {
-      return tyContainsList(t.mKey, depth - 1)
-        || tyContainsList(t.mVal, depth - 1)
+      return tyContainsList(tyKeyOf(t), depth - 1)
+        || tyContainsList(tyValOf(t), depth - 1)
     }
     TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {
       return false
@@ -3063,7 +3142,7 @@ export function tyArrHasEq(xs: i32[], v: i32) {
     if tyEq(xs[i], v) { return true }
     i = i + 1
   }
-  false
+  return false
 }
 
 // A type that is still an inference hole (`TyVar`): an un-annotated param, or a derived hole.
@@ -3071,14 +3150,14 @@ export function tyIsHole(tyIx: i32) {
   if tyIx < 0 { return false }
   const t = tyAt(tyIx)
   if t is TyVar { return true }
-  false
+  return false
 }
 
 // —— "is a hole" vs "contains a hole", and the deferred-constraint machinery needs the second ——
 // `tyIsHole` answers about the type itself, so `function eqT<T>(a: T, b: T)` deferred the
 // constraint while the `T[]` spelling did not — a `TyArray` over a hole is not a hole (D35).
 // Depth-bounded rather than cycle-tracked, in the safe direction: a recursive named type returns false at the floor.
-export function tyHasHole(tyIx: i32) { tyHasHoleAt(tyIx, 0) }
+export function tyHasHole(tyIx: i32) { return tyHasHoleAt(tyIx, 0) }
 
 // Whether `tyIx` holds an inference hole (a `?`-named variable), not only declared parameters.
 export function tyHasInferHole(tyIx: i32, depth: i32): boolean {
@@ -3089,14 +3168,14 @@ export function tyHasInferHole(tyIx: i32, depth: i32): boolean {
       return t.tvName.length == 0 || t.tvName[0] == "?"[0]
     }
     TyArray => {
-      return tyHasInferHole(t.aElem, depth + 1)
+      return tyHasInferHole(tyElemOf(t), depth + 1)
     }
     TyNullable => {
       return tyHasInferHole(t.nInner, depth + 1)
     }
     TyMap => {
-      return tyHasInferHole(t.mKey, depth + 1)
-        || tyHasInferHole(t.mVal, depth + 1)
+      return tyHasInferHole(tyKeyOf(t), depth + 1)
+        || tyHasInferHole(tyValOf(t), depth + 1)
     }
     TyObj => {
       for ft in t.objFieldTypes {
@@ -3151,18 +3230,18 @@ function tyHasHoleAt(tyIx: i32, depth: i32): boolean {
   } else if depth < hhFalseAt[tyIx] {
     hhFalseAt[tyIx] = depth
   }
-  r
+  return r
 }
 
 function tyHasHoleWalk(tyIx: i32, depth: i32): boolean {
   const t = tyAt(tyIx)
-  match t {
+  return match t {
     TyVar => true
-    TyArray => tyHasHoleAt(t.aElem, depth + 1)
+    TyArray => tyHasHoleAt(tyElemOf(t), depth + 1)
     TyNullable => tyHasHoleAt(t.nInner, depth + 1)
     TyMap => {
-      if tyHasHoleAt(t.mKey, depth + 1) { return true }
-      tyHasHoleAt(t.mVal, depth + 1)
+      if tyHasHoleAt(tyKeyOf(t), depth + 1) { return true }
+      tyHasHoleAt(tyValOf(t), depth + 1)
     }
     TyObj => {
       const ofts = t.objFieldTypes
@@ -3203,7 +3282,7 @@ export function tyIsNonIndexableScalar(tyIx: i32) {
   if tyIx < 0 { return false }
   const t = tyAt(tyIx)
   if t is TyPrim { return t.primName != "string" }
-  false
+  return false
 }
 
 // A type an indexed hole (`self[i]`, so the body demanded an array) cannot take. A
@@ -3214,7 +3293,7 @@ export function tyRefusesArrayDemand(tyIx: i32) {
   if tyIsNonIndexableScalar(tyIx) { return true }
   if tyIx < 0 { return false }
   const t = tyAt(tyIx)
-  t is TyMap
+  return t is TyMap
 }
 
 // Whether an argument cannot take a hole the body writes as a list (`a.push(x)`, `a[i] = x`): a
@@ -3223,7 +3302,7 @@ export function tyRefusesArrayWrite(tyIx: i32): boolean {
   const s = softenLitTy(tyIx)
   if s < 0 || s >= T.tys.length { return false }
   const t = tyAt(s)
-  t is TyPrim && t.primName == "string"
+  return t is TyPrim && t.primName == "string"
 }
 
 // A function-typed parameter, read off the arena. The demand this row parks is a FUNCTION
@@ -3232,7 +3311,7 @@ export function tyRefusesArrayWrite(tyIx: i32): boolean {
 export function tyIsFuncArena(tyIx: i32): boolean {
   if tyIx < 0 || tyIx >= T.tys.length { return false }
   const t = tyAt(tyIx)
-  t is TyFunc
+  return t is TyFunc
 }
 
 // A type whose indexing is the language's own, not a user operator's: arrays, maps, strings,
@@ -3242,7 +3321,7 @@ export function tyIsFuncArena(tyIx: i32): boolean {
 export function tyBuiltinIndexable(ty: i32) {
   if ty < 0 { return true }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyArray | TyMap | TyVar | TyErr => true
     TyPrim => t.primName == "string"
     // A user operator may index these.
@@ -3257,7 +3336,7 @@ export function tyBuiltinIndexable(ty: i32) {
 export function tyDenotesObj(ty: i32) {
   if ty < 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyObj => true
     TyUnion => {
       if t.uMembers.length == 1 {
@@ -3288,7 +3367,7 @@ export function tyMentionsTyVarNamed(
       return t.tvName == name
     }
     TyArray => {
-      return tyMentionsTyVarNamed(t.aElem, name, depth - 1)
+      return tyMentionsTyVarNamed(tyElemOf(t), name, depth - 1)
     }
     TyNullable => {
       return tyMentionsTyVarNamed(t.nInner, name, depth - 1)
@@ -3297,8 +3376,8 @@ export function tyMentionsTyVarNamed(
       return tyMentionsTyVarNamed(t.negTy, name, depth - 1)
     }
     TyMap => {
-      if tyMentionsTyVarNamed(t.mKey, name, depth - 1) { return true }
-      return tyMentionsTyVarNamed(t.mVal, name, depth - 1)
+      if tyMentionsTyVarNamed(tyKeyOf(t), name, depth - 1) { return true }
+      return tyMentionsTyVarNamed(tyValOf(t), name, depth - 1)
     }
     TyObj => {
       let oi = 0
@@ -3330,7 +3409,7 @@ export function tyMentionsTyVarNamed(
     TyErr => {}
     TyLit => {}
   }
-  false
+  return false
 }
 
 // Whether type `ty` is, or holds within `depth` levels, the error type an earlier
@@ -3344,7 +3423,7 @@ export function tyMentionsErr(ty: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return tyMentionsErr(t.aElem, depth - 1)
+      return tyMentionsErr(tyElemOf(t), depth - 1)
     }
     TyNullable => {
       return tyMentionsErr(t.nInner, depth - 1)
@@ -3353,8 +3432,8 @@ export function tyMentionsErr(ty: i32, depth: i32): boolean {
       return tyMentionsErr(t.negTy, depth - 1)
     }
     TyMap => {
-      if tyMentionsErr(t.mKey, depth - 1) { return true }
-      return tyMentionsErr(t.mVal, depth - 1)
+      if tyMentionsErr(tyKeyOf(t), depth - 1) { return true }
+      return tyMentionsErr(tyValOf(t), depth - 1)
     }
     TyObj => {
       for f in t.objFieldTypes {
@@ -3376,7 +3455,7 @@ export function tyMentionsErr(ty: i32, depth: i32): boolean {
     TyVar => {}
     TyLit => {}
   }
-  false
+  return false
 }
 
 // Whether `t` is an un-annotated parameter's hole (`paramHoleName`), not a declared type
@@ -3385,7 +3464,7 @@ export function tyIsParamHole(t: i32): boolean {
   if t < 0 { return false }
   const v = tyAt(t)
   if v is TyVar { return v.tvName.length > 0 && v.tvName[0] == '?' }
-  false
+  return false
 }
 
 // True if struct-arena entry `er` (a `TyObj`) carries a `TyMap` field directly or inside a
@@ -3409,7 +3488,7 @@ export function tyObjHasMapField(er: i32) {
       i = i + 1
     }
   }
-  false
+  return false
 }
 
 // Whether `x` is outside `print`'s domain by being a WasmGC reference: an array, a struct, a
@@ -3420,7 +3499,7 @@ export function tyPrintsAsRef(pt: i32, depth: i32) {
   if pt < 0 { return false }
   if depth <= 0 { return false }
   const t = tyAt(pt)
-  match t {
+  return match t {
     TyPrim => t.primName == "v128"
     TyArray | TyObj | TyMap | TyFunc => true
     TyNullable => tyPrintsAsRef(t.nInner, depth - 1)
@@ -3462,7 +3541,7 @@ export function tyIsStructBearingUnion(er: i32) {
     }
     i = i + 1
   }
-  nObj > 0
+  return nObj > 0
 }
 
 // Whether a leaf of the union or nullable `er` is a literal, within `depth` levels.
@@ -3487,7 +3566,7 @@ export function tyHasLitLeaf(er: i32, depth: i32): boolean {
       // A leaf that is no literal, or a container whose elements are not the union's leaves.
     }
   }
-  false
+  return false
 }
 
 // Whether union `er` has a litunion-array member (`K0[]`, `("a"|"b")[]`) — the arm
@@ -3501,12 +3580,12 @@ export function tyUnionHasLitUnionArrayMember(er: i32) {
     while i < t.uMembers.length {
       const m = tyAt(t.uMembers[i])
       if m is TyArray {
-        if tyIsLitUnion(m.aElem) { return true }
+        if tyIsLitUnion(tyElemOf(m)) { return true }
       }
       i = i + 1
     }
   }
-  false
+  return false
 }
 
 // Whether nullable-inner type `it` is an array of a plain `i32`/`boolean` element — the
@@ -3517,8 +3596,8 @@ export function tyIsNulI32BackedListInner(itIx: i32) {
   if itIx < 0 { return false }
   const it = tyAt(itIx)
   if it is TyArray {
-    if it.aElem < 0 { return false }
-    const el = tyAt(it.aElem)
+    if tyElemOpen(it) { return false }
+    const el = tyAt(tyElemOf(it))
     match el {
       TyPrim => {
         return el.primName == "i32" || el.primName == "boolean"
@@ -3534,7 +3613,7 @@ export function tyIsNulI32BackedListInner(itIx: i32) {
       TyFunc | TyObj | TyUnion | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => {}
     }
   }
-  false
+  return false
 }
 
 // Whether `er` is a union, or a nullable one, that a join of maps makes: two or more map types,
@@ -3572,7 +3651,7 @@ export function tyPrimNameIs(ty: i32, name: string): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if t is TyPrim { return t.primName == name }
-  false
+  return false
 }
 
 // Whether `ty` is a map or holds one through unions and `| null`: the cheap gate a retag
@@ -3609,7 +3688,7 @@ export function tyAmong(ty: i32, tys: i32[]): boolean {
     if tyEq(ty, tys[i]) { return true }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Whether `ty` is a union every member of which is a map.
@@ -3625,7 +3704,7 @@ export function tyAllMaps(ty: i32): boolean {
     }
     return true
   }
-  false
+  return false
 }
 
 // The inner type of arena type `ty` when it is a `TyNullable` whose inner is resolved, else -1:
@@ -3638,7 +3717,7 @@ export function tyNulInnerTy(ty: i32): i32 {
     if t.nInner < 0 || t.nInner >= T.tys.length { return -1 }
     return t.nInner
   }
-  -1
+  return -1
 }
 
 // Whether arena type `ty` is a `TyNullable` whose resolved inner is the primitive `p`.
@@ -3650,7 +3729,7 @@ export function tyNulInnerIsPrim(ty: i32, p: PrimName): boolean {
     const inner = tyAt(t.nInner)
     if inner is TyPrim { return inner.primName == p }
   }
-  false
+  return false
 }
 
 // The `primName` of `ty`'s array element, or "" unless `ty` is a `TyArray` whose element is a
@@ -3661,41 +3740,41 @@ export function tyArrayElemPrim(ty: i32): PrimName | null {
   if ty < 0 { return null }
   const t = tyAt(ty)
   if t is TyArray {
-    if t.aElem >= 0 {
-      const el = tyAt(t.aElem)
+    if !tyElemOpen(t) {
+      const el = tyAt(tyElemOf(t))
       if el is TyPrim { return el.primName }
     }
   }
-  null
+  return null
 }
 
 // The decision form — `tyIsPrimNamed`'s shape over the array element.
 export function tyArrayElemPrimIs(ty: i32, nm: PrimName): boolean {
-  tyArrayElemPrim(ty) == nm
+  return tyArrayElemPrim(ty) == nm
 }
 
 // The element prim as text, for the one consumer that carries it onward as a name.
 export function tyArrayElemPrimName(ty: i32): string {
-  primNameStr(tyArrayElemPrim(ty))
+  return primNameStr(tyArrayElemPrim(ty))
 }
 
 // Whether `ty` is `string | null`. A one-literal `"x" | null` is not: its inner is the
 // literal's one-member set, the atom niche (D7446).
 export function tyIsNulStringRep(ty: i32): boolean {
-  tyNulInnerIsPrim(ty, "string")
+  return tyNulInnerIsPrim(ty, "string")
 }
 
 export function tyHasRepHoleAt(tyIx: i32, depth: i32) {
   if tyIx < 0 { return false }
   if depth > 8 { return false }
   const t = tyAt(tyIx)
-  match t {
+  return match t {
     TyVar => true
-    TyArray => tyHasRepHoleAt(t.aElem, depth + 1)
+    TyArray => tyHasRepHoleAt(tyElemOf(t), depth + 1)
     TyNullable => tyHasRepHoleAt(t.nInner, depth + 1)
     TyMap => {
-      if tyHasRepHoleAt(t.mKey, depth + 1) { return true }
-      tyHasRepHoleAt(t.mVal, depth + 1)
+      if tyHasRepHoleAt(tyKeyOf(t), depth + 1) { return true }
+      tyHasRepHoleAt(tyValOf(t), depth + 1)
     }
     TyObj => {
       const ofts = t.objFieldTypes
@@ -3726,7 +3805,7 @@ export function tyHasRepHoleAt(tyIx: i32, depth: i32) {
 export function cTyIxSetHas(flags: boolean[], v: i32) {
   if v < 0 { return false }
   if v >= flags.length { return false }
-  flags[v]
+  return flags[v]
 }
 
 // Whether type `ty` reaches a closure — as itself, through a nullable wrapper, an array
@@ -3736,10 +3815,10 @@ export function cTyIxSetHas(flags: boolean[], v: i32) {
 export function tyReachesClosure(ty: i32, depth: i32): boolean {
   if ty < 0 || depth <= 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyFunc => true
     TyNullable => tyReachesClosure(t.nInner, depth - 1)
-    TyArray => tyReachesClosure(t.aElem, depth - 1)
+    TyArray => tyReachesClosure(tyElemOf(t), depth - 1)
     TyObj => {
       let i = 0
       while i < t.objFieldTypes.length {
@@ -3756,7 +3835,7 @@ export function tyReachesClosure(ty: i32, depth: i32): boolean {
       }
       false
     }
-    TyMap => tyReachesClosure(t.mVal, depth - 1)
+    TyMap => tyReachesClosure(tyValOf(t), depth - 1)
     // Leaves: no closure under any of these.
     TyPrim | TyNeg | TyVar | TyLit | TyErr => false
   }
@@ -3784,7 +3863,7 @@ export function litUnionAliasNameOfTy(ty: i32) {
     }
     return litUnionAliasOfLitTexts(texts)
   }
-  ""
+  return ""
 }
 
 // The registered litunion ALIAS whose member-literal set is EXACTLY `texts` (`["pd",
@@ -3793,14 +3872,14 @@ export function litUnionAliasNameOfTy(ty: i32) {
 export function litUnionAliasOfLitTexts(texts: string[]): string {
   const a = luPosOfTexts(texts)
   if a < 0 { return "" }
-  cUnionNames[a]
+  return cUnionNames[a]
 }
 
 // The same alias's arena type, or -1.
 export function litUnionAliasTyOfLitTexts(texts: string[]): i32 {
   const a = luPosOfTexts(texts)
   if a < 0 { return -1 }
-  cUnionTyIxs[a]
+  return cUnionTyIxs[a]
 }
 
 // —— the member-set index over registered unions ——
@@ -3846,7 +3925,7 @@ function luSetKey(texts: string[]): string {
     key = key + i32ToStr(sorted[q].length) + ":" + sorted[q]
     q = q + 1
   }
-  key
+  return key
 }
 
 // The first registered literal union whose member set is exactly `texts`, as a `cUnionTyIxs`
@@ -3854,7 +3933,7 @@ function luSetKey(texts: string[]): string {
 export function luPosOfTexts(texts: string[]): i32 {
   if texts.length == 0 { return -1 }
   luIndexSync()
-  luPosByKey[luSetKey(texts)] ?? -1
+  return luPosByKey[luSetKey(texts)] ?? -1
 }
 
 // Indexes position `a` under its member set when it is a filled literal union; true when it is
@@ -3870,7 +3949,7 @@ function luIndexPos(a: i32): boolean {
   const key = luSetKey(tyLitMemberTexts(ty))
   const cur = luPosByKey[key] ?? -1
   if cur < 0 || a < cur { luPosByKey[key] = a }
-  false
+  return false
 }
 
 function luIndexSync() {
@@ -3890,7 +3969,7 @@ function luIndexSync() {
     luIxCursor = luIxCursor + 1
   }
   luPending = still
-  0
+  return 0
 }
 
 // The atom width of the last `litUnionInlineNameOfTy` answer, and whether that union
@@ -3952,7 +4031,7 @@ export function litUnionInlineNameOfTy(ty: i32): string {
     luiAtoms = texts.length
     return out
   }
-  ""
+  return ""
 }
 
 // Whether `ty` is a REGISTERED literal union: a declared alias or an annotated inline set. Every
@@ -3962,14 +4041,36 @@ export function litUnionInlineNameOfTy(ty: i32): string {
 export function tyIsLitUnionAlias(ty: i32): boolean {
   if ty < 0 { return false }
   if !cTyIxSetHas(cUnionTyIxSet, ty) { return false }
-  tyIsLitUnion(ty)
+  return tyIsLitUnion(ty)
+}
+
+// The declaring function of each `TyVar` row. A pin is keyed on it, so two generics that both
+// call their variable `T` cannot poison each other's row.
+export let tyVarOwner: {[i32]: string} = Map()
+// The negative-type questions `assignable` has answered in the current check: a missing record,
+// a pending result or a poisoned annotation. A clean compile asks none.
+let asgNegHits = 0
+export function asgNegHit() { return asgNegHits = asgNegHits + 1 }
+export function asgNegCount(): i32 { return asgNegHits }
+
+export function tyVarOwnerReset() {
+  asgNegHits = 0
+  tyVarOwner = Map()
+  tvSlotBounds = Map()
+  return tvSlotShown = Map()
+}
+
+// The declaring function recorded for a `TyVar` row, or "" when unrecorded.
+export function tyVarOwnerOf(tyIx: i32): string {
+  if tyIx < 0 { return "" }
+  return tyVarOwner[tyIx] ?? ""
 }
 
 // Structural type equality over the arena, depth-bounded: two indices are the same type when
 // their rows have the same variant and their components are recursively the same, with union
 // layers flattened in order. Index equality is construction identity, not type identity, and
 // this is no replacement for it where identity is nominal (a declared union's declaration).
-export function tySame(a: i32, b: i32): boolean { tySameAt(a, b, 24) }
+export function tySame(a: i32, b: i32): boolean { return tySameAt(a, b, 24) }
 
 function tySameAt(a: i32, b: i32, depth: i32): boolean {
   if a == b { return true }
@@ -3992,7 +4093,7 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
     TyArray => {
       match y {
         TyArray => {
-          return tySameAt(x.aElem, y.aElem, depth - 1)
+          return tySameAt(tyElemOf(x), tyElemOf(y), depth - 1)
         }
         TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
           return false
@@ -4041,8 +4142,8 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
       match y {
         TyMap => {
           if x.mSet != y.mSet { return false }
-          if !tySameAt(x.mKey, y.mKey, depth - 1) { return false }
-          return tySameAt(x.mVal, y.mVal, depth - 1)
+          if !tySameAt(tyKeyOf(x), tyKeyOf(y), depth - 1) { return false }
+          return tySameAt(tyValOf(x), tyValOf(y), depth - 1)
         }
         TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyVar | TyLit | TyNeg => {
           return false
@@ -4069,10 +4170,22 @@ function tySameAt(a: i32, b: i32, depth: i32): boolean {
         }
       }
     }
-    // An error, a type variable, a literal or a negation is the same only as its own index.
-    TyErr | TyVar | TyLit | TyNeg => {}
+    // One declaration slot is one type, however many annotations minted a row for it (D16150). A
+    // hole, or a row minted without its slot, is only its own index.
+    TyVar => {
+      if y is TyVar {
+        return x.tvKind == "param"
+          && y.tvKind == "param"
+          && x.tvBinder >= 0
+          && x.tvBinder == y.tvBinder
+          && x.tvIdx == y.tvIdx
+      }
+      return false
+    }
+    // An error, a literal or a negation is the same only as its own index.
+    TyErr | TyLit | TyNeg => {}
   }
-  false
+  return false
 }
 
 // `tySame` of two types one of which is a union: their member sequences, nested union layers
@@ -4088,7 +4201,7 @@ function tySameMembers(a: i32, b: i32, depth: i32): boolean {
     if !tySameAt(xs[i], ys[i], depth - 1) { return false }
     i = i + 1
   }
-  true
+  return true
 }
 
 // Whether a type bears null — structurally, without rendering it and splitting on `|`. Two
@@ -4098,7 +4211,7 @@ function tySameMembers(a: i32, b: i32, depth: i32): boolean {
 export function tyBearsNull(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyNullable => true
     TyUnion => {
       let i = 0
@@ -4140,7 +4253,7 @@ export function unionSoleMember(ty: i32): i32 {
   for m in t.uMembers {
     if !tyEq(m, m0) { return -1 }
   }
-  m0
+  return m0
 }
 
 // The one list a union of 2+ lists renders as when every member spells it, nominally too
@@ -4173,7 +4286,7 @@ export function oneListUnionRender(ty: i32): string {
   }
   tyNameAtoms = atoms0
   nomNameCycle = cyc0
-  r
+  return r
 }
 
 // Whether the list `ty`'s innermost element, its `| null` aside, is a string literal set: an
@@ -4184,7 +4297,7 @@ function tyListLeafIsStrLitUnion(ty: i32): boolean {
   while cur >= 0 && cur < T.tys.length && d < 64 {
     const t = tyAt(cur)
     if !(t is TyArray) { break }
-    cur = t.aElem
+    cur = tyElemOf(t)
     d = d + 1
   }
   if cur < 0 || cur >= T.tys.length { return false }
@@ -4193,7 +4306,7 @@ function tyListLeafIsStrLitUnion(ty: i32): boolean {
   if cur < 0 { return false }
   const lt = tyAt(cur)
   if lt is TyLit { return lt.litKind == "str" }
-  tyIsLitUnion(cur)
+  return tyIsLitUnion(cur)
 }
 
 // How a value of list arm `a` fits the list type `chk` when the two keep their elements in
@@ -4205,7 +4318,7 @@ export function listArmFitAcrossReps(a: i32, chk: i32): i32 {
   if ae < 0 || ce < 0 { return 0 }
   if tyIsLitUnion(ae) && tyIsPrimNamed(ce, "string") { return 1 }
   if tyIsPrimNamed(ae, "string") && tyIsLitUnion(ce) { return 2 }
-  0
+  return 0
 }
 
 // —— arena-level (Ty-index-keyed) nominal queries ——————————————————————————
@@ -4214,7 +4327,7 @@ export function listArmFitAcrossReps(a: i32, chk: i32): i32 {
 // checker-private nominal-identity sidecar sets that a structural walk cannot re-derive.
 export function tyIxIsVariantMember(ty: i32) {
   if ty < 0 { return false }
-  cTyIxSetHas(cVariantMemberTyIxSet, ty)
+  return cTyIxSetHas(cVariantMemberTyIxSet, ty)
 }
 
 // The nested-array element gate: true when a nested-array element (the `i32[]` in `i32[][]`)
@@ -4225,22 +4338,24 @@ export function tyNestedArrLeafRenders(elemTy: i32): boolean {
   if elemTy < 0 { return false }
   const el = tyAt(elemTy)
   if el is TyArray {
-    if el.aElem < 0 { return false }
+    if tyElemOpen(el) { return false }
     return tyToEmitName(elemTy) != ""
   }
-  false
+  return false
 }
 
 // Whether `ty` carries a literal anywhere in its member tree, so its `RC_ROOT` emit render is
 // lossy: `ctxKeepsLitUnion` is false at `RC_ROOT`, so `"pp" | "qq"`, `1 | 2` and `K | string`
 // all render as the base scalar their members soften to. Two such types render alike without
 // denoting the same value set, so any equality test over `tyToEmitName` must decline them.
-export function tyRenderSoftensLits(ty: i32) { tyRenderSoftensLitsGo(ty, 8) }
+export function tyRenderSoftensLits(ty: i32) {
+  return tyRenderSoftensLitsGo(ty, 8)
+}
 
 function tyRenderSoftensLitsGo(ty: i32, depth: i32) {
   if ty < 0 || depth <= 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyLit => true
     TyUnion => {
       const ms = t.uMembers
@@ -4264,7 +4379,7 @@ export function tyIsLitUnionOrLit(ty: i32) {
   if ty < 0 { return false }
   const t = tyAt(ty)
   if t is TyLit { return t.litKind == "str" }
-  tyIsLitUnion(ty)
+  return tyIsLitUnion(ty)
 }
 
 // Whether `ty` is a union whose members are all string-literal types (`"a" | "b"`) — a
@@ -4286,7 +4401,7 @@ export function tyIsLitUnion(ty: i32) {
     }
     return true
   }
-  false
+  return false
 }
 
 // Whether type-arena entry `ty` is an array whose element is a literal union (`K[]`, an
@@ -4297,10 +4412,10 @@ export function tyIsLitUnionArray(ty: i32) {
   if ty < 0 { return false }
   const t = tyAt(ty)
   if t is TyArray {
-    const r = tyIsLitUnion(t.aElem)
+    const r = tyIsLitUnion(tyElemOf(t))
     return r
   }
-  false
+  return false
 }
 
 // Whether `ti` is a `TyMap` whose value — at any map-nesting depth, one nullable wrapper
@@ -4309,7 +4424,7 @@ export function tyMapValIsLitUnion(ti: i32, depth: i32): boolean {
   if ti < 0 || depth <= 0 { return false }
   const t = tyAt(ti)
   if t is TyMap {
-    let v = t.mVal
+    let v = tyValOf(t)
     if v < 0 { return false }
     const vt = tyAt(v)
     if vt is TyNullable { v = vt.nInner }
@@ -4317,7 +4432,7 @@ export function tyMapValIsLitUnion(ti: i32, depth: i32): boolean {
     if tyIsLitUnion(v) { return true }
     return tyMapValIsLitUnion(v, depth - 1)
   }
-  false
+  return false
 }
 
 // Whether type `ty` is a nullable literal union — either the two-part form `K | null` (a
@@ -4327,7 +4442,7 @@ export function tyMapValIsLitUnion(ti: i32, depth: i32): boolean {
 export function tyIsNullableLitUnion(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyNullable => tyIsLitUnion(t.nInner)
     TyUnion => {
       if t.uMembers.length < 2 { return false }
@@ -4365,7 +4480,7 @@ export function tyIsNullableLitUnion(ty: i32): boolean {
 // is a different wrapper and must NOT match, or `+` writes a module the engine refuses (D102).
 export function tyLitUnionIsI32Backed(ty: i32): boolean {
   if tyIsLitUnion(ty) { return true }
-  numLitUnionBaseName(ty) == "i32"
+  return numLitUnionBaseName(ty) == "i32"
 }
 
 // Whether array-element type `ty` is a niche-nullable scalar the emitter reps without a box —
@@ -4383,7 +4498,7 @@ export function tyIsNicheNulScalarElem(ty: i32): boolean {
       return inn.primName == "boolean" || inn.primName == "string"
     }
   }
-  false
+  return false
 }
 
 // The member literal texts (raw lexeme, no quotes) of atom-repped type `ty`, in source order:
@@ -4411,7 +4526,30 @@ export function tyLitMemberTexts(ty: i32) {
     // No member text: a nullable included, as the contract above says.
     TyPrim | TyFunc | TyObj | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyErr => {}
   }
-  out
+  return out
+}
+
+// Whether `tyLitMemberTexts(ty)` is non-empty, read without building the list.
+export function tyHasLitMemberText(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => {
+      for u in t.uMembers {
+        const m = tyAt(u)
+        if m is TyLit {
+          if m.litKind == "str" { return true }
+        }
+      }
+      return false
+    }
+    TyLit => {
+      return t.litKind == "str"
+    }
+    TyPrim | TyFunc | TyObj | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyErr => {
+      return false
+    }
+  }
 }
 
 // The string-literal member types `tyLitMemberTexts` reads the texts of, in the same order.
@@ -4433,13 +4571,13 @@ export function tyLitMemberTys(ty: i32): i32[] {
     }
     TyPrim | TyFunc | TyObj | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyErr => {}
   }
-  out
+  return out
 }
 
 export function tyReachesMap(ty: i32): boolean {
   if ty < 0 { return false }
   const t = tyAt(ty)
-  match t {
+  return match t {
     TyMap => true
     TyNullable => tyReachesMap(t.nInner)
     TyUnion => {
@@ -4459,7 +4597,7 @@ export function tyReachesMap(ty: i32): boolean {
 export function tyIsMap(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
-  t is TyMap
+  return t is TyMap
 }
 
 // Whether arm pattern type `pt` is a composite (a union or a nullable) rather than one
@@ -4468,7 +4606,7 @@ export function tyIsMap(ty: i32) {
 // that does work named.
 export function tyIsCompositePat(pt: i32) {
   const t = tyAt(pt)
-  match t {
+  return match t {
     TyUnion | TyNullable => true
     // One variant each, which a single `is` tests.
     TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => false
@@ -4479,13 +4617,13 @@ export function tyIsCompositePat(pt: i32) {
 // A value of it is known at compile time, so a compare against it needs no read.
 export function tyIsOneStrLit(ty: i32): boolean {
   if !tyIsLitUnionOrLit(ty) { return false }
-  tyLitMemberTexts(ty).length == 1
+  return tyLitMemberTexts(ty).length == 1
 }
 
 // The quoted spelling of `ty` when it is exactly one string literal, else "".
 export function oneStrLitSpelling(ty: i32): string {
   if !tyIsOneStrLit(ty) { return "" }
-  "\"" + tyLitMemberTexts(ty)[0] + "\""
+  return "\"" + tyLitMemberTexts(ty)[0] + "\""
 }
 
 // ── type-arena constructors ──────────────────────────────────────────────────
@@ -4494,27 +4632,41 @@ export function oneStrLitSpelling(ty: i32): string {
 
 export function addTy(t: Ty) {
   T.tys.push(t)
-  T.tys.length - 1
+  return T.tys.length - 1
 }
 
 export function mkPrim(name: PrimName) {
   const t: Ty = { primName: name }
-  addTy(t)
+  return addTy(t)
 }
 
 export function mkErrTy() {
   const t: Ty = { errKind: 0 }
-  addTy(t)
+  return addTy(t)
 }
 
 export function mkObjTy(names: string[], typeIxs: i32[]) {
-  const t: Ty = { objFieldNames: names, objFieldTypes: typeIxs }
-  addTy(t)
+  const t: Ty = {
+    objFieldNames: names,
+    objFieldTypes: typeIxs,
+    objFieldIx: Map(),
+    objFieldIxLen: 0,
+  }
+  return addTy(t)
 }
+
+// An open component: the element of an unpinned `[]`, the key or value of an unpinned `Map()`, the
+// inner type of an open nullable. Every type fits it until a write pins it. It is not -1, which
+// is no type at all (a missing record, a poisoned annotation) and fits nothing.
+export const TY_OPEN = -3
+
+// A function type's result while its un-annotated declaration is still being inferred: the
+// hoist mints it, and the inference patches the row in place once the body is checked.
+export const RET_PENDING = -2
 
 export function mkFuncTy(params: i32[], ret: i32) {
   const t: Ty = { fnParamTypes: params, fnRet: ret }
-  addTy(t)
+  return addTy(t)
 }
 
 export function mkNullableTy(inner: i32) {
@@ -4530,12 +4682,12 @@ export function mkNullableTy(inner: i32) {
   }
   if tyIsWidePrim(inner) { tyWideUnionMinted = true }
   const t: Ty = { nInner: strLitAsSet(inner) }
-  addTy(t)
+  return addTy(t)
 }
 
 export function mkArrayTy(elem: i32) {
-  const t: Ty = { aElem: strLitAsSet(elem), aRead: 0 }
-  addTy(t)
+  const t: Ty = { aElem: openChild(strLitAsSet(elem)), aRead: 0 }
+  return addTy(t)
 }
 
 // A list element, map value or nullable inner of one string literal is its one-member set, so
@@ -4549,23 +4701,27 @@ export function strLitAsSet(elem: i32): i32 {
       return addTy(u)
     }
   }
-  elem
+  return elem
 }
 
 // `ty | null`, for an emit-side rewrite that needs a box over a value with no niche (D2826).
-export function mkNullableTyOf(ty: i32) { mkNullableTy(ty) }
+export function mkNullableTyOf(ty: i32) { return mkNullableTy(ty) }
 
 // The read-only view over the same element (`readonly T[]`). A sibling constructor rather
 // than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
 export function mkArrayViewTy(elem: i32) {
-  const t: Ty = { aElem: strLitAsSet(elem), aRead: 1 }
-  addTy(t)
+  const t: Ty = { aElem: openChild(strLitAsSet(elem)), aRead: 1 }
+  return addTy(t)
 }
 
 export function mkMapTy(key: i32, val: i32, isSet: i32) {
   tyMapMinted = true
-  const t: Ty = { mKey: key, mVal: strLitAsSet(val), mSet: isSet }
-  addTy(t)
+  const t: Ty = {
+    mKey: openChild(strLitAsSet(key)),
+    mVal: openChild(strLitAsSet(val)),
+    mSet: isSet,
+  }
+  return addTy(t)
 }
 
 // Whether any map type has been minted in this instance. Only ever set, so a gate on it can
@@ -4605,14 +4761,14 @@ export function canonIntLexeme(t: string) {
     }
     i = i + 1
   }
-  i32ToStr(v)
+  return i32ToStr(v)
 }
 
 // The literal type of `kind` and `text`, interned, so one literal is one arena index (D14540).
 export function mkLitTy(kind: LitKind, text: string) {
   let canon = text
   if kind == "int" { canon = canonIntLexeme(text) }
-  internLitTy(kind, canon, false)
+  return internLitTy(kind, canon, false)
 }
 
 // The one producer of `TyLit` rows, keyed on kind, canonical text and the widening bit.
@@ -4625,7 +4781,7 @@ function internLitTy(kind: LitKind, canon: string, wide: boolean): i32 {
   const t: Ty = { litKind: kind, litText: canon, litWide: wide }
   const ix = addTy(t)
   litTyIntern.set(key, ix)
-  ix
+  return ix
 }
 
 // `ty` with its widening bit set to `wide` when it is a literal type, else `ty` itself.
@@ -4636,18 +4792,18 @@ export function litWithWide(ty: i32, wide: boolean): i32 {
     if t.litWide == wide { return ty }
     return internLitTy(t.litKind, t.litText, wide)
   }
-  ty
+  return ty
 }
 
 // The declared form of `ty`: a widening literal's twin without the bit; any other type itself.
-export function litRegularTy(ty: i32): i32 { litWithWide(ty, false) }
+export function litRegularTy(ty: i32): i32 { return litWithWide(ty, false) }
 
 // Whether `ty` is a widening literal: a `const` inferred it and nobody declared it.
 export function isWideLitTy(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if t is TyLit { return t.litWide }
-  false
+  return false
 }
 
 // The arena index of each literal type, by its `internLitTy` key; reset with the arena.
@@ -4672,12 +4828,12 @@ export function litMemberTy(name: string) {
     if numLexIsFloat(name) { return -1 }
     return mkLitTy("int", name)
   }
-  -1
+  return -1
 }
 
 export function mkNegTy(inner: i32) {
   const t: Ty = { negTy: inner }
-  addTy(t)
+  return addTy(t)
 }
 
 // Strip every `$m<digits>` module-merge and `$b<digits>` block-scope mangle suffix from a free-form
@@ -4685,7 +4841,7 @@ export function mkNegTy(inner: i32) {
 // body-scoped `type` (D1045), both internal names that must not surface. The two suffixes compose,
 // and the scan handles that by restarting after the digits. One home, in `tyname.demangleSpelling`.
 export function demangleMsg(s: string) {
-  inlineLitUnionUnhide(demangleSpelling(s))
+  return inlineLitUnionUnhide(demangleSpelling(s))
 }
 
 // Replaces each hidden inline-literal-union alias (`#lu3`) in a message with its member set,
@@ -4724,7 +4880,7 @@ function inlineLitUnionUnhide(s: string): string {
       i = i + 1
     }
   }
-  out
+  return out
 }
 
 export const inlineLitUnionPrefix = "#lu"
@@ -4733,16 +4889,18 @@ export const inlineLitUnionPrefix = "#lu"
 // Every type string a person reads is rendered here and nowhere else, since the module
 // merge renames every declaration `name` → `name$mN` and a raw render would leak it.
 // `tyToStr`/`tyToStructStr` stay raw, since those strings are spelling-dependent table keys.
-export function tyToStrUser(ix: i32) { demangleMsg(tyToStr(ix)) }
+export function tyToStrUser(ix: i32) { return demangleMsg(tyToStr(ix)) }
 
-export function tyToStructStrUser(ix: i32) { demangleMsg(tyToStructStr(ix)) }
+export function tyToStructStrUser(ix: i32) {
+  return demangleMsg(tyToStructStr(ix))
+}
 
 // Whether union members `a` and `b` are one member, as the member render spells members: the
 // same declaration, brand and generic application at each leaf (`tyEq` alone joins a record
 // with its declared twin), a list read-only or not, and a numeric literal inside a list, map or
 // nullable at its base scalar. `null` (-1) matches only `null`.
 export function memberTySame(a: i32, b: i32): boolean {
-  memberTySameAt(a, b, 8)
+  return memberTySameAt(a, b, 8)
 }
 
 // Whether member type `t` is one of `tys` by `memberTySame`, each side's numeric literal at its
@@ -4757,7 +4915,7 @@ export function memberTyIn(t: i32, tys: i32[]): boolean {
       return true
     }
   }
-  false
+  return false
 }
 
 function memberTySameAt(a: i32, b: i32, depth: i32): boolean {
@@ -4767,20 +4925,20 @@ function memberTySameAt(a: i32, b: i32, depth: i32): boolean {
   const tb = tyAt(b)
   if ta is TyArray && tb is TyArray {
     return memberTySameAt(
-      memberNumSoft(ta.aElem),
-      memberNumSoft(tb.aElem),
+      memberNumSoft(tyElemOf(ta)),
+      memberNumSoft(tyElemOf(tb)),
       depth - 1,
     )
   }
   if ta is TyMap && tb is TyMap {
     return (memberTySameAt(
-      memberNumSoft(ta.mKey),
-      memberNumSoft(tb.mKey),
+      memberNumSoft(tyKeyOf(ta)),
+      memberNumSoft(tyKeyOf(tb)),
       depth - 1,
     )
       && memberTySameAt(
-      memberNumSoft(ta.mVal),
-      memberNumSoft(tb.mVal),
+      memberNumSoft(tyValOf(ta)),
+      memberNumSoft(tyValOf(tb)),
       depth - 1,
     ))
   }
@@ -4791,16 +4949,24 @@ function memberTySameAt(a: i32, b: i32, depth: i32): boolean {
       depth - 1,
     )
   }
-  tyEq(a, b)
+  return tyEq(a, b)
     && memberDeclPos(a) == memberDeclPos(b)
     && nomNameOfTy(a) == nomNameOfTy(b)
     && (genAppRowOf(a) >= 0) == (genAppRowOf(b) >= 0)
 }
 
+// Whether `memberTySame` compares member `t` by its children: a list, map or nullable. Any other
+// pair it calls one shares `memberDeclPos`, so a member set buckets by that position.
+export function memberTyNests(t: i32): boolean {
+  if t < 0 { return false }
+  const k = tyAt(t)
+  return k is TyArray || k is TyMap || k is TyNullable
+}
+
 // The declared struct position arena type `m` records, or -1 for a type no declaration names.
-function memberDeclPos(m: i32): i32 {
+export function memberDeclPos(m: i32): i32 {
   if m < 0 || m >= cStructFirstPos.length { return -1 }
-  cStructFirstPos[m]
+  return cStructFirstPos[m]
 }
 
 // A numeric literal or literal union at its base scalar, as the member render spells it; a
@@ -4809,5 +4975,202 @@ function memberNumSoft(t: i32): i32 {
   if t < 0 { return t }
   const s = softenLitTy(t)
   if s == t || s == TY_STR { return t }
-  s
+  return s
 }
+
+// Per declaration slot `(binder, idx)`, keyed by the binder node: its bound as an arena type, and
+// whether a rendering shows the bound in the variable's place (a row variable reads as its record).
+// Emptied with the owner tables, since a restart re-mints the arena the bounds index.
+let tvSlotBounds: {[i32]: i32[]} = Map()
+let tvSlotShown: {[i32]: boolean[]} = Map()
+
+// Records `bound` as slot `(binder, idx)`'s bound, and whether the slot renders as it.
+export function tvSlotSet(
+  binder: i32,
+  idx: i32,
+  bound: i32,
+  printAsBound: boolean,
+) {
+  if binder < 0 || idx < 0 { return 0 }
+  const bs = tvSlotBounds.get(binder) ?? []
+  const ps = tvSlotShown.get(binder) ?? []
+  while bs.length <= idx {
+    bs.push(-1)
+    ps.push(false)
+  }
+  bs[idx] = bound
+  ps[idx] = printAsBound
+  tvSlotBounds[binder] = bs
+  tvSlotShown[binder] = ps
+  return 0
+}
+
+// The bound recorded for slot `(binder, idx)`, or -1 where none is.
+export function tvSlotBound(binder: i32, idx: i32): i32 {
+  const bs = tvSlotBounds.get(binder)
+  if bs == null || idx < 0 || idx >= bs.length { return -1 }
+  return bs[idx]
+}
+
+// Whether slot `(binder, idx)` renders as its bound.
+export function tvSlotPrintsAsBound(binder: i32, idx: i32): boolean {
+  const ps = tvSlotShown.get(binder)
+  if ps == null || idx < 0 || idx >= ps.length { return false }
+  return ps[idx]
+}
+
+// The type a rendering of slot `(binder, idx)` shows in its place, or -1 to show its name.
+function tvSlotShownAs(binder: i32, idx: i32): i32 {
+  if !tvSlotPrintsAsBound(binder, idx) { return -1 }
+  return tvSlotBound(binder, idx)
+}
+
+// Pins open element `v` into list row `t` in place, advancing `tyMutEpoch`: the one writer of a
+// list row's element after its mint, so every pin invalidates the epoch-stamped memos.
+export function tyPinElem(t: TyArray, v: i32) {
+  const h = holeIxOf(t.aElem)
+  if !holeSolve(t.aElem, v) { t.aElem = v }
+  tyMutBump(-1, h)
+  return 0
+}
+
+// `tyPinElem` for a map row's key; a lone string literal is stored as its one-member set, as
+// `mkMapTy` stores it (D16367).
+export function tyPinKey(t: TyMap, v: i32) {
+  const h = holeIxOf(t.mKey)
+  const s = strLitAsSet(v)
+  if !holeSolve(t.mKey, s) { t.mKey = s }
+  tyMutBump(-1, h)
+  return 0
+}
+
+// `tyPinElem` for a map row's value.
+export function tyPinVal(t: TyMap, v: i32) {
+  const h = holeIxOf(t.mVal)
+  if !holeSolve(t.mVal, v) { t.mVal = v }
+  tyMutBump(-1, h)
+  return 0
+}
+
+// Whether a list element, map key or map value `child` is an open position, one no pin has filled
+// yet. The one test of openness, so a reader never compares a child against a sentinel itself.
+export function tyOpen(child: i32): boolean { return child < 0 }
+
+// The key a declaration node is known by in the type arena: a type-parameter row's binder and,
+// later, a nominal row's identity. One function, so the key can move off node ids in one place.
+export function declKeyOf(node: i32): i32 { return node }
+
+// List row `t`'s element: its pinned type, or an open position (`tyOpen`). The one reader of the
+// field, so an open element's representation is this file's alone.
+export function tyElemOf(t: TyArray): i32 { return holeView(t.aElem) }
+
+// `tyElemOf` for a map row's key.
+export function tyKeyOf(t: TyMap): i32 { return holeView(t.mKey) }
+
+// `tyElemOf` for a map row's value.
+export function tyValOf(t: TyMap): i32 { return holeView(t.mVal) }
+
+// An open child (`TY_OPEN`) is a hole, stored in its field as `-4 - h`, below every sentinel: the row
+// never changes once minted, and a pin writes `holeSol[h]` instead, so every holder of the row reads
+// the pin. A hole reads as its solution, `TY_OPEN` while unsolved; any other child as itself.
+let holeSol: i32[] = []
+
+// Empties the hole column with the arena it belongs to.
+export function holeReset() {
+  tyFreshRowMark.clear()
+  tyFreshHoleMark.clear()
+  holeSol = []
+  return 0
+}
+
+// The field value for a freshly minted child `v`: a new hole when it is `TY_OPEN`, else `v`.
+function openChild(v: i32): i32 {
+  if v != TY_OPEN { return v }
+  holeSol.push(TY_OPEN)
+  return -3 - holeSol.length
+}
+
+// Whether child field value `c` names a hole.
+function isHoleCode(c: i32): boolean {
+  return c <= -4 && -4 - c < holeSol.length
+}
+
+// The hole a linked chain from hole code `c` ends at: a hole whose solution is another hole's code
+// is that hole, so one pin answers every hole linked to it.
+function holeRoot(c: i32): i32 {
+  let r = c
+  while isHoleCode(holeSol[-4 - r]) { r = holeSol[-4 - r] }
+  return r
+}
+
+// Whether rows `a` and `b` hold one hole as a list element, map key or map value: a pin of
+// either's child is a pin of the other's.
+export function tyRowsShareHole(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  const ta = tyAt(a)
+  const tb = tyAt(b)
+  return match ta {
+    TyArray => tb is TyArray && holeSame(ta.aElem, tb.aElem)
+    TyMap => tb is TyMap && (holeSame(ta.mKey, tb.mKey) || holeSame(ta.mVal, tb.mVal))
+    // No other row holds a list element, map key or map value of its own.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// Whether child field values `x` and `y` name holes linked into one.
+function holeSame(x: i32, y: i32): boolean {
+  return isHoleCode(x) && isHoleCode(y) && holeRoot(x) == holeRoot(y)
+}
+
+// Solves the hole field value `c` names to `v`; false when `c` names no hole.
+function holeSolve(c: i32, v: i32): boolean {
+  if !isHoleCode(c) { return false }
+  holeSol[-4 - holeRoot(c)] = v
+  return true
+}
+
+// What child field value `c` reads as.
+// The hole child code `c` names, root-resolved, or -1 when it names no hole.
+function holeIxOf(c: i32): i32 {
+  return if isHoleCode(c) { -4 - holeRoot(c) } else { -1 }
+}
+
+function holeView(c: i32): i32 {
+  if !isHoleCode(c) { return c }
+  return holeSol[-4 - holeRoot(c)]
+}
+
+// Makes open children `a` and `b` one hole, so a pin of either is a pin of both; false when either
+// is not an unsolved hole.
+function holeLink(a: i32, b: i32): boolean {
+  if !isHoleCode(a) || !isHoleCode(b) { return false }
+  const ra = holeRoot(a)
+  const rb = holeRoot(b)
+  if holeSol[-4 - ra] != TY_OPEN || holeSol[-4 - rb] != TY_OPEN { return false }
+  if ra != rb { holeSol[-4 - ra] = rb }
+  return true
+}
+
+// Links two open list elements into one hole (`holeLink`); false when either is not one.
+export function tyLinkElem(a: TyArray, b: TyArray): boolean {
+  return holeLink(a.aElem, b.aElem)
+}
+
+// `tyLinkElem` for two map keys.
+export function tyLinkKey(a: TyMap, b: TyMap): boolean {
+  return holeLink(a.mKey, b.mKey)
+}
+
+// `tyLinkElem` for two map values.
+export function tyLinkVal(a: TyMap, b: TyMap): boolean {
+  return holeLink(a.mVal, b.mVal)
+}
+
+// Whether list row `t`'s element is open: `tyElemOpen(t)`.
+export function tyElemOpen(t: TyArray): boolean { return tyOpen(tyElemOf(t)) }
+
+// Whether map row `t`'s key is open.
+export function tyKeyOpen(t: TyMap): boolean { return tyOpen(tyKeyOf(t)) }
+
+// Whether map row `t`'s value is open.
+export function tyValOpen(t: TyMap): boolean { return tyOpen(tyValOf(t)) }

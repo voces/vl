@@ -129,7 +129,7 @@ const PROGRAMS: Program[] = [
   { id: "u8-for-in", family: "ba8Used", path: "arrays/u8-for-in.vl" },
   {
     id: "u8-packed-list",
-    family: "fnUsesPackedPush (D1006)",
+    family: "fnUses.packedPush (D1006)",
     path: "arrays/u8-packed-list.vl",
   },
   {
@@ -203,12 +203,12 @@ const PROGRAMS: Program[] = [
     family: "uBoxIdx × gLitUnionUsed",
     path: "unions/variant-litunion-field.vl",
   },
-  // ── the union-box SINK frame: `fnUsesUnionSink` / `fnUsesUnionLetSink` ──
+  // ── the union-box SINK frame: `fnUses.unionSink` / `fnUses.unionLetSink` ──
   // Both are assigned per FUNCTION in `emitFuncCode` and never in `startFnDetectScratch`
   // (see the audit note). No witness — this pair is here so one would be caught.
   {
     id: "union-return-sink",
-    family: "fnUsesUnionSink",
+    family: "fnUses.unionSink",
     src:
       'function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return "s"\n}\n' +
       "const v = pick(true)\nif v is i32 { print(v) }\n",
@@ -234,7 +234,7 @@ const PROGRAMS: Program[] = [
   },
   {
     id: "map-values-forin",
-    family: "fnUsesMapVals (D1007)",
+    family: "fnUses.mapVals (D1007)",
     path: "maps/forin-list-valued-values.vl",
   },
   {
@@ -349,7 +349,7 @@ const PROGRAMS: Program[] = [
 //
 // Both are one mechanism: `startFnDetectScratch` (`emit_sections.vl`) is the start
 // function's analogue of `emitFuncCode`'s per-function frame detection, and it clears 20 of
-// the 24 `fnUses*` frame flags. `fnUsesPackedPush` and `fnUsesMapVals` are two of the four it
+// the 24 `fnUses` frame fields. `fnUses.packedPush` and `fnUses.mapVals` are two of the four it
 // misses — and each is written TWICE IN A ROW inside `emitFuncCode` (lines 872/873 and
 // 904/905), which is what the second copy was for. So a program that pushes to a `u8[]`, or
 // reads `m.values()`, leaves its flag set, and the NEXT program's start function reserves a
@@ -804,8 +804,8 @@ Deno.test({
 const IMPORTER_KEY = "/proj/main.vl";
 const IMPORTER =
   'import { pick } from "./util"\nconst r: i32 = pick()\nprint(r)\n';
-const DEP_I32 = "export function pick(): i32 {\n  1\n}\n";
-const DEP_F64 = "export function pick(): f64 {\n  1.5\n}\n";
+const DEP_I32 = "export function pick(): i32 {\n  return 1\n}\n";
+const DEP_F64 = "export function pick(): f64 {\n  return 1.5\n}\n";
 
 Deno.test({
   name:
@@ -930,7 +930,7 @@ const PI_ENTRY =
   'import { mk } from "./w"\nconst v = mk("x") + "a" + "bb" + "ccc"\nprint(v)\n' +
   'print("<" + "a" + "b" + "c" + ">")\n';
 const PI_ALIAS =
-  "export type Widget = string\nexport function mk(s: string): Widget { s }\n";
+  "export type Widget = string\nexport function mk(s: string): Widget { return s }\n";
 const PI_OWN_PLUS = "export type Widget = new { s: string }\n" +
   "export function mk(s: string): Widget {\n  const r: Widget = { s: s }\n  return r\n}\n" +
   'function "+"(self: Widget, other: string): Widget {\n  const r: Widget = { s: other }\n  return r\n}\n';

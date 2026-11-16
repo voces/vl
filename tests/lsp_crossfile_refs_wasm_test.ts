@@ -11,16 +11,10 @@ import { filePath } from "./support/filePath.ts";
 import type { ModuleReader } from "../compiler/coreTypes.ts";
 import { crossFileReferences, pathToUri } from "../lsp/src/moduleGraph.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const log = (_m: string) => {};
 
@@ -34,7 +28,7 @@ const assert = (cond: boolean, msg: string): void => {
 const memoryReader = (files: Record<string, string>): ModuleReader =>
   (key: string) => files[key];
 
-const util = "export function add(a: i32, b: i32): i32 {\n  a + b\n}\n";
+const util = "export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n";
 const main = 'import { add } from "./util"\n\nprint(add(2, 3))\nprint(add(4, 5))\n';
 
 Deno.test({

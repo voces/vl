@@ -9,8 +9,14 @@
 // module, so they recurse through `checkNodeHook`, which `checkProgramPass` installs.
 
 import { idShadowNote } from "./id_shadow_state"
-import { identTyOf, narTyAtDepth } from "./check_nar_store"
-import { identDepthOf, identFnDeclOf } from "./check_scopes"
+import { identReadFnOfWrite, identTyOf, narTyAtDepth } from "./check_nar_store"
+import { cwFrameReset } from "./check_write_scan"
+import {
+  identDepthOf,
+  identFnDeclOf,
+  rewroteReadIs,
+  rewroteReadSet,
+} from "./check_scopes"
 import {
   ArrayLit,
   AsExpr,
@@ -37,6 +43,7 @@ import {
   LoopVar,
   MatchExpr,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -53,6 +60,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  arenaSetNode,
   externLinkOf,
   isDefaultGlobalRef,
   nodeAt,
@@ -66,7 +74,7 @@ import {
 import { lpOn } from "./check_bind_rows"
 import { ovNoteFnValue } from "./check_call_resolve"
 import { checkCallNode } from "./check_calls"
-import { crCapLossAny } from "./check_capture_rows"
+import { crCapLossAny, crRows } from "./check_capture_rows"
 import { crIsNamedCall } from "./check_capture_walks"
 import { checkArrayLitNode, checkObjLitNode } from "./check_container_lits"
 import {
@@ -76,7 +84,6 @@ import {
   extFnTyMin,
   extValueSeen,
   extValueSeenSet,
-  matchTailNodeSet,
 } from "./check_core_state"
 import { curFnDeclIx } from "./check_cursor"
 import { lbiNoteRead } from "./check_decl_scan"
@@ -107,7 +114,7 @@ import { litWide64Of } from "./check_literals"
 import { checkMatchExprNode } from "./check_match"
 import { neAssigned, neKeys, neKill } from "./check_narrow_ends"
 import { crReadHook, daCheckRead, letWriteTargetTy } from "./check_narrow_flow"
-import { crNoteLostName } from "./check_narrow_paths"
+import { crIsTestedPlace, crNoteLostName } from "./check_narrow_paths"
 import {
   checkBreakNode,
   checkNodeDone,
@@ -128,7 +135,6 @@ import {
   lbiModLit,
   lbiSymRead,
 } from "./check_num_lit_state"
-import { cexOp } from "./check_num_lits"
 import {
   checkBinExprNode,
   checkCastNode,
@@ -136,7 +142,8 @@ import {
   checkUnaryNode,
 } from "./check_operators"
 import { tErr, widenLitTy } from "./check_relate_core"
-import { identConstDeclOf } from "./check_scopes"
+import { identConstDeclOf, identStoreTyOf } from "./check_scopes"
+import { strListHas } from "./listutil"
 import {
   elabCapLive,
   elabFnValNote,
@@ -158,7 +165,7 @@ import {
   letDeclBoundRecord,
 } from "./check_statements"
 import { symUse } from "./check_sym_occ"
-import { identDeclOf } from "./symbols"
+import { identDeclOf, sidNoteNodeName } from "./symbols"
 import { nodeTyIxOf } from "./check_node_tys"
 import { checkProgramNode } from "./check_top_level"
 import {
@@ -183,6 +190,7 @@ import {
   numLexIsFloat,
   numLexRadixBits,
 } from "./emit_bignum"
+import { lbiArithOp } from "./check_num_lits"
 
 // Thin recording wrapper around `checkNodeReal`: on the real (non-quiet) pass, stores each
 // node's resolved type-arena index into the typed-IR table. Recording the arena index, not a
@@ -190,16 +198,13 @@ import {
 export function checkNode(ix: i32) {
   const savedTail = retTailPos
   if retTailPos {
-    if !tailSpineNode(ix) {
-      if nodeAt(ix) is MatchExpr { matchTailNodeSet(ix) }
-      retTailPosSet(false)
-    }
+    if !tailSpineNode(ix) { retTailPosSet(false) }
   }
   const t = checkNodeReal(ix)
   if expObsFn >= 0 { expObsRead(ix, t) }
   checkNodeDone(ix, t, savedTail)
   letDeclBoundRecord(ix)
-  t
+  return t
 }
 
 // A list literal or value `if` or `match` at `ix`, checked at `t`: its literals take the width
@@ -207,7 +212,7 @@ export function checkNode(ix: i32) {
 // so one walk covers a whole chain. Answers `t`.
 function joinAdoptLits(ix: i32, t: i32): i32 {
   numLitAdoptJoin(ix, widenLitTy(t))
-  t
+  return t
 }
 
 // A value `if` or `match` at `ix`, checked at `t`: each arm's value is delivered to the join.
@@ -215,7 +220,7 @@ function joinAdoptLits(ix: i32, t: i32): i32 {
 function joinLeavesAt(ix: i32, t: i32): i32 {
   recordLeafCtxTy(ix, t)
   numInnerJoinsStamp(ix, t)
-  t
+  return t
 }
 
 // The undeclared-identifier floor for the read `n` at `ix`: names an intrinsic that has no
@@ -259,7 +264,7 @@ function checkIdentUndeclared(n: Ident, ix: i32): i32 {
       + arrayCtorCallNote(n.identName, ix),
     ix,
   )
-  TY_ERR
+  return TY_ERR
 }
 
 // A numeric literal's type: f64 for a float lexeme (refusing one past the largest finite
@@ -287,12 +292,13 @@ function checkNumLitNode(n: NumLit, ix: i32): i32 {
     return TY_I64
   }
   if numLexFitsI32(n.numText) { return TY_I32 }
-  TY_I64
+  return TY_I64
 }
 
 // A bare-name read's type: a parameter default's module-frame read, a literal `const`'s
 // literal, or the scope's binding with its use, capture and definite-assignment notes.
 // An unbound name is the undeclared-identifier floor.
+
 function checkIdentNode(n: Ident, ix: i32): i32 {
   // A marked parameter default resolves in the declaration's scope — for the one name form
   // v1 admits, the module frame. Checked once at the declaration and again at every call
@@ -339,6 +345,25 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
   }
   let ty = identTyOf(ix, n.identName)
   if ix == daWriteTarget { ty = letWriteTargetTy(ix, n.identName, ty) }
+  // A read of a re-pointed `let` that holds one declared function alone, the one its most recent
+  // write stored, is that function's name (D15956, D15957). An instance's re-check reads at its
+  // own binding, so only the program's read is rewritten.
+  if ix != daWriteTarget && !elabCapLive() {
+    const rf = identReadFnOfWrite(ix, ty)
+    if rf >= 0 {
+      const rfn = nodeAt(rf)
+      if rfn is FuncDecl && rfn.fnName != "" {
+        if symEnabled != 0 { symUse(ix, n.identName, ty) }
+        const nn: Node = { identName: rfn.fnName, pos: n.pos }
+        arenaSetNode(ix, nn)
+        sidNoteNodeName(ix, rf)
+        // The occurrence index filed this read under the binding's name.
+        cwFrameReset()
+        rewroteReadSet(ix)
+        return checkNodeReal(ix)
+      }
+    }
+  }
   // A module name declared as both a function and a value is refused as redeclared; which
   // of the two a read means is unknowable, so the read is that error's cascade.
   if (
@@ -357,7 +382,7 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
   if (
     ix != ckCalleeIx
     && ty < T.tys.length
-    && T.tys[ty] is TyFunc
+    && tyAt(ty) is TyFunc
     && (stampsStand() || globalInitRecordsFnSets)
   ) {
     elabFnValNote(ty, identFnDeclOf(ix))
@@ -365,12 +390,17 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
   }
   // `ty` is this use's type as the checker resolved it — narrowed when the use
   // sits inside a guarded arm. Threaded in so the occurrence retains it.
-  if symEnabled != 0 { symUse(ix, n.identName, ty) }
+  if symEnabled != 0 && !rewroteReadIs(ix) { symUse(ix, n.identName, ty) }
   if ovSetMod.length > 0 && ix != ckCalleeIx {
     ovNoteFnValue(ix, n.identName, ty)
   }
   if ix != daWriteTarget {
     if crCapLossAny { crNoteLostName(n.identName, ix) }
+    // The place an `is` test tests is not a narrowed read: a call that ended its narrowing makes
+    // it read its storage, which the test lowers against (D2408).
+    if crIsTestedPlace(ix) && strListHas(crRows.pendNames, n.identName) {
+      return identStoreTyOf(ix, n.identName)
+    }
     const crr = crReadHook(n.identName, ix)
     if crr >= 0 { return crr }
   }
@@ -398,7 +428,7 @@ function checkIdentNode(n: Ident, ix: i32): i32 {
       if dIx >= 0 { checkNode(dIx) }
     }
   }
-  ty
+  return ty
 }
 
 // Dispatches every node kind — expressions and statements — and returns the node's
@@ -450,7 +480,7 @@ function checkNodeReal(ix: i32) {
       return checkUnaryNode(n, ix)
     }
     BinExpr => {
-      if n.binCompound.length == 0 && cexOp(n.binOp) {
+      if n.binCompound.length == 0 && lbiArithOp(n.binOp) {
         const bf = cexTryFoldBin(n, ix)
         if bf == 1 { return checkNodeReal(ix) }
         if bf == 2 { return TY_ERR }
@@ -595,5 +625,5 @@ function checkNodeReal(ix: i32) {
     // a field row is checked by its owning literal or declaration
     FieldDef | FieldInit => {}
   }
-  TY_ERR
+  return TY_ERR
 }

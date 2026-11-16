@@ -277,7 +277,7 @@ const GRID: Row[] = [
     // `function f(a: i32): i32 { a }` — the second `f` at 10.
     name: "declaration: a redeclaration names the declared name",
     src:
-      "function f(a: i32): i32 { a }\nfunction f(a: i32): i32 { a }\nprint(f(1))\n",
+      "function f(a: i32): i32 { return a }\nfunction f(a: i32): i32 { return a }\nprint(f(1))\n",
     frag: "redeclared f",
     line: 2,
     col: 10,
@@ -413,6 +413,28 @@ const GRID: Row[] = [
     endCol: 15,
     underlines: "a & b",
     first: true,
+  },
+  // ── exception 4: an unknown type's COMPONENT, the name the message quotes ──
+  // D1590: `unknown type 'bool' within '{[i32]:bool}'` underlines `bool`, not the annotation.
+  {
+    // `const seen: {[i32]: bool} = Map()` — `bool` at 21..24.
+    name: "unknown type: a map value's component is the span",
+    src: "const seen: {[i32]: bool} = Map()\nprint(seen.length)\n",
+    frag: "unknown type 'bool' within",
+    line: 1,
+    col: 21,
+    endCol: 25,
+    underlines: "bool",
+  },
+  {
+    // `const q: (i32) => bool = (n: i32) => true` — `bool` at 19..22.
+    name: "unknown type: a function type's return component is the span",
+    src: "const q: (i32) => bool = (n: i32) => true\nprint(1)\n",
+    frag: "unknown type 'bool' within",
+    line: 1,
+    col: 19,
+    endCol: 23,
+    underlines: "bool",
   },
   // ── the three findings raised on the CHECKER side with `stage: "type"` ────
   // Not on `T.diags` at all — each is its own side table that `cli.vl` turns into a

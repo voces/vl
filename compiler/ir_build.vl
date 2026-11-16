@@ -1,0 +1,1035 @@
+// The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
+// hands each function here after its legacy lowering. The phase-A builder covers I1's set
+// (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
+// globals); any other construct leaves the function uncovered, a counted reason, not an error.
+// A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+import {
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  ContinueStmt,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  LetDecl,
+  Member,
+  NumLit,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  Unary,
+  WhileStmt,
+  hasNamedArgs,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
+import {
+  IrFamily,
+  IrFn,
+  IrNode,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
+  PrimOp,
+  Rhs,
+  SLet,
+  irBodyLeaves,
+  irFnNew,
+  irFnText,
+  irGlobalNote,
+  irNodeFamily,
+  irNodeNew,
+  irSigNote,
+  irSpanNote,
+  irVarNew,
+} from "./ir"
+import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
+import { irTyOpen, irVerify } from "./ir_verify"
+import { irDualEmit, irHexOf, irLowerClaim, irLoweredEntry } from "./ir_lower"
+import { GlobalCtx, callEndsNever, globalReadRecovers } from "./wasmEmit"
+import { repNodeGen, repNodeOfTy } from "./emit_rep"
+import { nodeTyAt, scopeTyAt } from "./emit_capture_frames"
+import {
+  declaredIndexAt,
+  envSlotShift,
+  fnIndexOfNode,
+  localIndexOf,
+} from "./emit_classify"
+import { declaredSlotOfDecl } from "./emit_struct_order"
+import { fRecRetTy, fRetVoid, fnStmts, gPromoInStart } from "./emit_state"
+import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
+import { identDeclOf, sidOfNode } from "./symbols"
+import { memOffsetLexValue } from "./check_intrinsics"
+import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
+import { isVoidTy } from "./tyquery"
+import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
+
+let ibArmed = false
+let ibDetail = false
+let ibCorrupt = 0
+let ibRowKey: string[] = []
+let ibRowN: i32[] = []
+
+// Arms (1) or disarms (0) the shadow for the compiles that follow; 2 also details the first
+// examples of each dual-emit mismatch class. 3 leaves it disarmed and claims I1's families
+// (scalar, control, call, global), the test of the claim path itself.
+export function irShadowArm(on: i32) {
+  ibArmed = on == 1 || on == 2
+  ibDetail = on == 2
+  ibClaimAll = on == 3
+  return 0
+}
+
+// The families whose every occurrence the shadow has matched, so a function built wholly of them
+// ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
+const CLAIMED: IrFamily[] = []
+let ibClaimAll = false
+
+function familyClaimed(fam: IrFamily): boolean {
+  if ibClaimAll { return fam != "list" && fam != "other" }
+  for c in CLAIMED {
+    if c == fam { return true }
+  }
+  return false
+}
+
+// Whether every node of the function just built is in a claimed family. A local or parameter of a
+// reference rep is a list's, whose frame slot the list lowering reads off legacy's layout.
+function claimable(): boolean {
+  if CLAIMED.length == 0 && !ibClaimAll { return false }
+  for n in ib.irNodes {
+    if !familyClaimed(irNodeFamily(n)) { return false }
+  }
+  for v in ib.irVars {
+    if v.vSlot >= 0 && !repIsScalar(v.vRep) && !familyClaimed("list") {
+      return false
+    }
+  }
+  return true
+}
+
+// The claim seam, before legacy lowers the function at `fnIx` (`fnStmts` slot `fnPos`): when the
+// builder covers it and every node is claimed, the lowering writes its code entry onto `out` and
+// this answers true, so legacy does not run. Armed, legacy always runs and the shadow checks it.
+export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
+  // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
+  if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
+  const gen = repNodeGen()
+  if build(fnIx, fnPos) != "" || repNodeGen() != gen || !claimable() {
+    return false
+  }
+  if irVerify(ib).vfRule != 0 {
+    count("claim fell back: verifier")
+    return false
+  }
+  const why = irLowerClaim(
+    ib,
+    globalCtxOf(fnPos),
+    firstLocalOf(fnIx),
+    fnPos,
+    out,
+  )
+  if why != "" {
+    count("claim fell back: " + why)
+    return false
+  }
+  count("claimed")
+  return true
+}
+
+// The shadow's failing controls: 0 none; 1 swaps the first variable's rep and 2 deletes the first
+// temp's definition, which the verifier must refuse; 3 adds a byte to the lowering and 4 drops a
+// span row, which the dual emit must report.
+export function irShadowCorrupt(k: i32) {
+  ibCorrupt = k
+  return 0
+}
+
+export function irShadowArmed(): boolean { return ibArmed }
+
+// Starts a compile's report.
+export function irShadowBegin() {
+  ibRowKey = []
+  ibRowN = []
+  return 0
+}
+
+function count(key: string) {
+  let i = 0
+  while i < ibRowKey.length {
+    if ibRowKey[i] == key {
+      ibRowN[i] = ibRowN[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  ibRowKey.push(key)
+  ibRowN.push(1)
+  return 0
+}
+
+export function irShadowRowCount() { return ibRowKey.length }
+
+export function irShadowRowLen(i: i32) { return ibRowKey[i].length }
+
+export function irShadowRowAt(i: i32, j: i32) { return ibRowKey[i][j] }
+
+export function irShadowRowN(i: i32) { return ibRowN[i] }
+
+// The function being built and the first construct outside the set.
+let ib: IrFn = irFnNew(-1, "")
+let ibFnIx = -1
+// Whether the builder admits an assignment as a value. It does not, so no global read it builds
+// is an assignment's re-read and the lowering's guard context is never `gcGuardOff`.
+const ASSIGN_AS_VALUE = false
+let ibMiss = ""
+let ibDeclVar: {[i32]: i32} = Map()
+let ibLoopName: string[] = []
+let ibLoopBrk: i32[] = []
+let ibLoopCont: i32[] = []
+let ibLabelN = 0
+let ibBool = -1
+let ibNoValue = -1
+
+// Whether a value of rep `r` and type `ty` can be a variable, a parameter, a result or an
+// expression here: a scalar, or a reference rep the list builder admits.
+function valueRep(r: i32, ty: i32): boolean {
+  return repIsScalar(r) || irVarRepOkHook(r, ty)
+}
+
+function refRepNone(_r: i32, _ty: i32): boolean { return false }
+
+function indexUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
+  return irBMiss("index hook not installed")
+}
+
+function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
+  return irBMiss("member hook not installed")
+}
+
+// The list builder's hooks (`ir_build_ref.vl`), installed before emit; the defaults leave every
+// reference rep, element read and member read outside the set.
+export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
+export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
+export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
+
+// The function being built, its declaration, and the rep a statement node carries.
+export function irBFn(): IrFn { return ib }
+
+export function irBFnIx(): i32 { return ibFnIx }
+
+export function irBNoValue(): i32 { return ibNoValue }
+
+export function irBMiss(why: string): Opnd {
+  if ibMiss == "" { ibMiss = why }
+  const o: Opnd = { ov: -1 }
+  return o
+}
+
+// `miss` for a statement, which yields nothing.
+function skip(why: string): i32 {
+  irBMiss(why)
+  return 0
+}
+
+function missRhs(why: string): Rhs {
+  irBMiss(why)
+  const r: Rhs = { ggSym: -1, ggNonNull: false }
+  return r
+}
+
+export function irBNode(b: i32[], n: IrNode, ty: i32, rep: i32, at: i32) {
+  b.push(irNodeNew(ib, n, ty, rep, at))
+  return 0
+}
+
+// Builds `stmts` into a fresh body and returns it.
+function bodyOf(stmts: i32[]): i32[] {
+  const nb: i32[] = []
+  for s in stmts { stmt(nb, s) }
+  return nb
+}
+
+// The rep of node `ix`'s checked type in this instance when it is a primitive one, else -1.
+function primRepOf(ix: i32): i32 {
+  // The tree gives `void` an i32 leaf for the flat kinds; it is no value here.
+  const t = nodeTyAt(ix, ibFnIx)
+  const r = repNodeOfTy(t)
+  if isVoidTy(t) || !valueRep(r, t) { return -1 }
+  return r
+}
+
+export function irBOpRep(o: Opnd): i32 {
+  return match o {
+    OVar => if o.ov >= 0 && o.ov < ib.irVars.length { ib.irVars[o.ov].vRep } else { -1 }
+    OImm => o.oiRep
+    OStr => -1
+  }
+}
+
+// A fresh temp of `ix`'s type, defined by `rhs`.
+export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
+  const ty = nodeTyAt(ix, irBFnIx())
+  const v = irVarNew(irBFn(), rep, ty, "temp", -1)
+  irBNode(b, { lDst: v, lRhs: rhs }, ty, rep, ix)
+  const o: Opnd = { ov: v }
+  return o
+}
+
+// The variable of local declaration `d` (a `LetDecl` or a `Param`), made on first use.
+export function irBDeclVar(d: i32): i32 {
+  const known = ibDeclVar[d] ?? -1
+  if known >= 0 { return known }
+  const ty = scopeTyAt(d, ibFnIx)
+  const rep = repNodeOfTy(ty)
+  if isVoidTy(ty) || !valueRep(rep, ty) {
+    irBMiss("local rep " + repWhat(rep))
+    return -1
+  }
+  if irTyOpen(ty) {
+    irBMiss("open local type")
+    return -1
+  }
+  const s = declaredSlotOfDecl(d)
+  const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
+  // One variable per wasm local: an instance's read resolves to the template's declaration.
+  const held = localVarAt(slot)
+  if held >= 0 {
+    if ib.irVars[held].vRep != rep {
+      irBMiss("local slot shared across reps")
+      return -1
+    }
+    ibDeclVar[d] = held
+    return held
+  }
+  const v = irVarNew(ib, rep, ty, "local", slot)
+  ibDeclVar[d] = v
+  return v
+}
+
+// The local variable holding wasm local `w`, or -1.
+function localVarAt(w: i32): i32 {
+  if w < 0 { return -1 }
+  let v = 0
+  while v < ib.irVars.length {
+    const x = ib.irVars[v]
+    if x.vKind == "local" && x.vSlot == w { return v }
+    v = v + 1
+  }
+  return -1
+}
+
+function binPrim(op: string, uns: boolean): PrimOp | null {
+  if op == "+" { return "add" }
+  if op == "-" { return "sub" }
+  if op == "*" { return "mul" }
+  if op == "/" { return if uns { "divu" } else { "div" } }
+  if op == "%" { return if uns { "remu" } else { "rem" } }
+  if op == "&" { return "and" }
+  if op == "|" { return "or" }
+  if op == "^" { return "xor" }
+  if op == "<<" { return "shl" }
+  if op == ">>" { return if uns { "shru" } else { "shr" } }
+  if op == ">>>" { return "shru" }
+  if op == "==" { return "eq" }
+  if op == "!=" { return "ne" }
+  if op == "<" { return if uns { "ltu" } else { "lt" } }
+  if op == "<=" { return if uns { "leu" } else { "le" } }
+  if op == ">" { return if uns { "gtu" } else { "gt" } }
+  if op == ">=" { return if uns { "geu" } else { "ge" } }
+  // Assignment, `&&`/`||`, `??` and every other operator are lowered by their own arms.
+  return null
+}
+
+// `a && b` / `a || b`: a local the two arms of an `if` write.
+function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
+  const ty = nodeTyAt(ix, ibFnIx)
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const rhsBody: i32[] = []
+  const r = irBExpr(rhsBody, n.binRight)
+  if irBOpRep(r) != ibBool { return irBMiss("logical operand") }
+  irBNode(rhsBody, { asDst: t, asSrc: r }, -1, irBNoValue(), ix)
+  const fixBody: i32[] = []
+  const bits: i64 = if n.binOp == "&&" { 0 } else { 1 }
+  const fixed: Opnd = { oiRep: ibBool, oiBits: bits }
+  irBNode(fixBody, { asDst: t, asSrc: fixed }, -1, ibNoValue, ix)
+  if n.binOp == "&&" {
+    irBNode(
+      b,
+      { siCond: l, siThen: rhsBody, siElse: fixBody, siOut: t },
+      ty,
+      rep,
+      ix,
+    )
+  } else {
+    irBNode(
+      b,
+      { siCond: l, siThen: fixBody, siElse: rhsBody, siOut: t },
+      ty,
+      rep,
+      ix,
+    )
+  }
+  const o: Opnd = { ov: t }
+  return o
+}
+
+function numLit(n: NumLit, rep: i32): Opnd {
+  const k: string = repPrim(rep) ?? ""
+  if k == "f64" || k == "f32" {
+    const bs = if k == "f64" { f64Bytes(n.numText) } else { f32Bytes(n.numText) }
+    let bits: i64 = 0
+    let i = bs.length - 1
+    while i >= 0 {
+      bits = bits * 256 + ((bs[i] & 255) as i64)
+      i = i - 1
+    }
+    const f: Opnd = { oiRep: rep, oiBits: bits }
+    return f
+  }
+  if numLexIsFloat(n.numText) { return irBMiss("float literal at an integer") }
+  const v = memOffsetLexValue(n.numText)
+  if v < 0 || k == "i32" && v > 2147483647 { return irBMiss("wide literal") }
+  const o: Opnd = { oiRep: rep, oiBits: v }
+  return o
+}
+
+function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
+  const d = identDeclOf(ix)
+  if d < 0 { return irBMiss("unresolved read") }
+  const dn = nodeAt(d)
+  const w = localIndexOf(ibFnIx, ix)
+  if (dn is LetDecl || dn is Param) && w >= 0 {
+    // A parameter is found by its wasm index: an instance's read resolves to the template's.
+    const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+    if v < 0 { return irBMiss("local rep") }
+    if ib.irVars[v].vRep != rep { return irBMiss("narrowed read") }
+    const o: Opnd = { ov: v }
+    return o
+  }
+  const g = globalIndexOfSid(sidOfNode(ix))
+  if dn is LetDecl && g >= 0 {
+    if globalRep(g, d) != rep { return irBMiss("global read coercion") }
+    const sid = sidOfNode(ix)
+    return irBLetTemp(
+      b,
+      { ggSym: g, ggNonNull: globalReadRecovers(sid, ix, ibFnIx) },
+      ix,
+      rep,
+    )
+  }
+  return irBMiss("read of " + n.identName)
+}
+
+// The parameter variable holding wasm local `w`, or -1.
+function paramVarAt(w: i32): i32 {
+  for v in ib.irParams {
+    if ib.irVars[v].vSlot == w { return v }
+  }
+  return -1
+}
+
+// The rep of global `g`, declared at `d`, noted in `ib`; -1 when it is no scalar.
+function globalRep(g: i32, d: i32): i32 {
+  const ty = scopeTyAt(d, -1)
+  const r = repNodeOfTy(ty)
+  if isVoidTy(ty) || !valueRep(r, ty) { return -1 }
+  irGlobalNote(ib, g, r)
+  return r
+}
+
+// The result type of the function at `fnStmts` slot `pos` (declared at `d`, annotated by `ann`):
+// its annotation, else the checker's inferred result, else its recorded type's; -1 for none.
+function resultTy(pos: i32, ann: i32, d: i32): i32 {
+  if ann >= 0 { return nodeTyAt(ann, d) }
+  const t = fnCheckedRetTy(pos)
+  if t >= 0 { return t }
+  return if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
+}
+
+// The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
+// functype does; the tree gives `void` an i32 leaf, so no value is `never`'s rep.
+function resultRep(pos: i32, ann: i32, d: i32): i32 {
+  if pos >= 0 && pos < fRetVoid.length && fRetVoid[pos] == 1 {
+    return repNodeOfTy(TY_NEVER)
+  }
+  const rt = resultTy(pos, ann, d)
+  return if isVoidTy(rt) { repNodeOfTy(TY_NEVER) } else { repNodeOfTy(rt) }
+}
+
+// The parameter and result reps of `fnStmts` slot `pos`, noted in `ib`; false when one is not
+// a primitive or void rep.
+function calleeSig(pos: i32): boolean {
+  if pos < 0 || pos >= fnStmts.length { return false }
+  const d = fnStmts[pos]
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return false }
+  const ps: i32[] = []
+  for p in fn.fnParams {
+    const pt = scopeTyAt(p, d)
+    const r = repNodeOfTy(pt)
+    if !valueRep(r, pt) { return false }
+    ps.push(r)
+  }
+  const rr = resultRep(pos, fn.fnRet, d)
+  if !(valueRep(rr, resultTy(pos, fn.fnRet, d)) || repIsNoValue(rr)) {
+    return false
+  }
+  irSigNote(ib, pos, ps, rr)
+  return true
+}
+
+// A direct call `ix` of a declared, capture-free function by name; its arguments by position.
+function callRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callFn < 0 || hasNamedArgs(c.callArgNames) {
+    return missRhs("named call")
+  }
+  if !(nodeAt(c.callFn) is Ident) { return missRhs("indirect call") }
+  const d = identDeclOf(c.callFn)
+  if d < 0 || !(nodeAt(d) is FuncDecl) {
+    return missRhs("call of a non-declaration")
+  }
+  const pos = fnIndexOfNode(c.callFn)
+  if pos < 0 || pos >= fnStmts.length || fnStmts[pos] != d {
+    return missRhs("call target")
+  }
+  if !calleeSig(pos) { return missRhs("callee signature") }
+  const callee = nodeAt(d)
+  const args: Opnd[] = []
+  if callee is FuncDecl {
+    if callee.fnParams.length != c.callArgs.length {
+      return missRhs("argument count")
+    }
+    let i = 0
+    while i < c.callArgs.length {
+      const a = irBExpr(b, c.callArgs[i])
+      if ibMiss != "" { return missRhs("argument") }
+      if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], d)) {
+        return missRhs("argument coercion")
+      }
+      args.push(a)
+      i = i + 1
+    }
+  }
+  const r: Rhs = { caCallee: pos, caArgs: args, caNever: callEndsNever(ix) }
+  return r
+}
+
+// Why operand `ix` is outside the set, or "": it must be typed at a numeric primitive or
+// `boolean`, whose signedness picks the op (`opUnsigned`).
+function operandWhy(ix: i32): string {
+  const p = tyScalarBasePrim(nodeTyAt(ix, ibFnIx))
+  if p == null { return "operand type" }
+  const ps: string = p
+  if isNumericPrim(ps) || ps == "boolean" { return "" }
+  return "operand at " + ps
+}
+
+function isNumericPrim(p: string): boolean {
+  return p == "i32"
+    || p == "i64"
+    || p == "f64"
+    || p == "f32"
+    || p == "u32"
+    || p == "u64"
+}
+
+// Whether operand `ix` is typed at an unsigned integer, so its op takes the unsigned form.
+function opUnsigned(ix: i32): boolean {
+  const p = tyScalarBasePrim(nodeTyAt(ix, ibFnIx))
+  if p == null { return false }
+  const ps: string = p
+  return ps == "u32" || ps == "u64"
+}
+
+export function irBExpr(b: i32[], ix: i32): Opnd {
+  if ibMiss != "" || ix < 0 { return irBMiss("no node") }
+  const n = nodeAt(ix)
+  if n is Paren { return irBExpr(b, n.parInner) }
+  const rep = primRepOf(ix)
+  if rep < 0 {
+    return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
+  }
+  if n is NumLit { return numLit(n, rep) }
+  if n is BoolLit {
+    const bits: i64 = if n.boolVal != 0 { 1 } else { 0 }
+    const o: Opnd = { oiRep: rep, oiBits: bits }
+    return o
+  }
+  if n is Ident { return identRead(b, n, ix, rep) }
+  if n is Unary {
+    if n.unOp != "-" && n.unOp != "!" { return irBMiss("unary " + n.unOp) }
+    const uw = operandWhy(n.unArg)
+    if uw != "" { return irBMiss(uw) }
+    const a = irBExpr(b, n.unArg)
+    if ibMiss != "" { return a }
+    if irBOpRep(a) != rep { return irBMiss("operand coercion") }
+    const op: PrimOp = if n.unOp == "-" { "neg" } else { "not" }
+    return irBLetTemp(b, { poOp: op, poArgs: [a] }, ix, rep)
+  }
+  if n is BinExpr {
+    if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
+    if n.binOp == "=" && !ASSIGN_AS_VALUE {
+      return irBMiss("assignment as a value")
+    }
+    const p = binPrim(n.binOp, opUnsigned(n.binLeft))
+    if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
+    const lw = operandWhy(n.binLeft)
+    if lw != "" { return irBMiss(lw) }
+    const rw = operandWhy(n.binRight)
+    if rw != "" { return irBMiss(rw) }
+    const l = irBExpr(b, n.binLeft)
+    const r = irBExpr(b, n.binRight)
+    if ibMiss != "" { return l }
+    if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
+    return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
+  }
+  if n is Call {
+    const rhs = callRhs(b, n, ix)
+    if ibMiss != "" { return irBMiss("call") }
+    return irBLetTemp(b, rhs, ix, rep)
+  }
+  if n is Index { return irIndexHook(b, ix, rep) }
+  if n is Member { return irMemberHook(b, ix, rep) }
+  return irBMiss("expression")
+}
+
+function assign(b: i32[], n: BinExpr, ix: i32) {
+  const t = nodeAt(n.binLeft)
+  if !(t is Ident) { return skip("assignment target") }
+  const d = identDeclOf(n.binLeft)
+  const src = irBExpr(b, n.binRight)
+  if ibMiss != "" { return 0 }
+  if d >= 0 && localIndexOf(ibFnIx, n.binLeft) >= 0 {
+    const v = irBDeclVar(d)
+    if v < 0 || irBOpRep(src) != ib.irVars[v].vRep {
+      return skip("assignment coercion")
+    }
+    irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
+    return 0
+  }
+  const g = globalIndexOfSid(sidOfNode(n.binLeft))
+  if g < 0 || d < 0 { return skip("assignment target") }
+  if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
+  irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
+  return 0
+}
+
+function loopIx(label: string): i32 {
+  let i = ibLoopName.length - 1
+  while i >= 0 {
+    if label == "" || ibLoopName[i] == label { return i }
+    i = i - 1
+  }
+  return -1
+}
+
+function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
+  if n.whileBlk != 0 || n.whileLv >= 0 { return skip("labelled block") }
+  const brk = labelNew()
+  const cont = labelNew()
+  ibLoopName.push(n.whileLabel)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(cont)
+  const loopBody: i32[] = []
+  const c = irBExpr(loopBody, n.whileCond)
+  if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
+  const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
+  const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
+  irBNode(
+    loopBody,
+    { siCond: c, siThen: [], siElse: exitBody, siOut: -1 },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  const wb = nodeAt(n.whileBody)
+  if wb is Block {
+    for s in wb.blkStmts { stmt(loopBody, s) }
+  } else {
+    stmt(loopBody, n.whileBody)
+  }
+  irBNode(
+    loopBody,
+    { brLabel: cont, brHas: false, brVal: c },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  const blockBody: i32[] = []
+  irBNode(blockBody, { lpLabel: cont, lpBody: loopBody }, -1, ibNoValue, ix)
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  ibLoopCont.pop()
+  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
+  return 0
+}
+
+// A label no other branch target in this function uses.
+function labelNew(): i32 {
+  ibLabelN = ibLabelN + 1
+  return ibLabelN - 1
+}
+
+function chainLink(e: i32): i32[] {
+  const nb: i32[] = []
+  stmtIn(nb, e)
+  return nb
+}
+
+function elseStmts(e: i32): i32[] {
+  if e < 0 { return [] }
+  const en = nodeAt(e)
+  if en is Block { return en.blkStmts }
+  return [e]
+}
+
+// Builds statement `ix` onto `b`, noting the run of nodes it built for the source map.
+function stmt(b: i32[], ix: i32) {
+  const n0 = b.length
+  stmtIn(b, ix)
+  if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
+  return 0
+}
+
+function stmtIn(b: i32[], ix: i32) {
+  if ibMiss != "" { return 0 }
+  const n = nodeAt(ix)
+  if n is Block {
+    for s in n.blkStmts { stmt(b, s) }
+    return 0
+  }
+  if n is LetDecl {
+    const v = irBDeclVar(ix)
+    if v < 0 || n.letInit < 0 { return skip("declaration") }
+    const src = irBExpr(b, n.letInit)
+    if ibMiss != "" { return 0 }
+    if irBOpRep(src) != ib.irVars[v].vRep {
+      return skip("declaration coercion")
+    }
+    irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
+    return 0
+  }
+  if n is IfStmt {
+    const c = irBExpr(b, n.ifCond)
+    if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+    const th = nodeAt(n.ifThen)
+    const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
+    // An `else if` link is part of its chain's statement: no span of its own.
+    const elseB = if n.ifElse >= 0 && nodeAt(n.ifElse) is IfStmt { chainLink(n.ifElse) } else { bodyOf(elseStmts(n.ifElse)) }
+    irBNode(
+      b,
+      { siCond: c, siThen: thenB, siElse: elseB, siOut: -1 },
+      -1,
+      ibNoValue,
+      ix,
+    )
+    return 0
+  }
+  if n is WhileStmt {
+    whileStmt(b, n, ix)
+    return 0
+  }
+  if n is BreakStmt {
+    const l = loopIx(n.brkLabel)
+    if l < 0 || n.brkHasVal != 0 { return skip("break") }
+    const z: Opnd = { ov: -1 }
+    irBNode(
+      b,
+      { brLabel: ibLoopBrk[l], brHas: false, brVal: z },
+      -1,
+      ibNoValue,
+      ix,
+    )
+    return 0
+  }
+  if n is ContinueStmt {
+    const l = loopIx(n.contLabel)
+    if l < 0 { return skip("continue") }
+    const z: Opnd = { ov: -1 }
+    irBNode(
+      b,
+      { brLabel: ibLoopCont[l], brHas: false, brVal: z },
+      -1,
+      ibNoValue,
+      ix,
+    )
+    return 0
+  }
+  if n is RetStmt {
+    const none = repIsNoValue(ib.irRetRep)
+    if n.retArg < 0 {
+      if !none { return skip("bare return") }
+      const z: Opnd = { ov: -1 }
+      irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
+      return 0
+    }
+    if none { return skip("void return value") }
+    const v = irBExpr(b, n.retArg)
+    if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
+      return skip("return coercion")
+    }
+    irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, ix)
+    return 0
+  }
+  if n is BinExpr && n.binOp == "=" {
+    assign(b, n, ix)
+    return 0
+  }
+  if n is Call {
+    const rhs = callRhs(b, n, ix)
+    if ibMiss != "" { return 0 }
+    irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
+    return 0
+  }
+  if (
+    n is Paren
+    || n is Ident
+    || n is NumLit
+    || n is BoolLit
+    || n is Unary
+    || n is BinExpr
+  ) {
+    // Legacy evaluates a bare value and drops it.
+    const v = irBExpr(b, ix)
+    if ibMiss != "" { return 0 }
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+    return 0
+  }
+  skip("statement")
+}
+
+// A non-void body's tail: its last statement's value is returned.
+function tailReturn(b: i32[], stmts: i32[], at: i32) {
+  if stmts.length == 0 { return skip("empty valued body") }
+  let i = 0
+  while i < stmts.length - 1 {
+    stmt(b, stmts[i])
+    i = i + 1
+  }
+  const last = stmts[stmts.length - 1]
+  const ln = nodeAt(last)
+  if ln is WhileStmt { return skip("valued tail loop") }
+  if ln is RetStmt || ln is IfStmt {
+    stmt(b, last)
+    // A tail `if` whose arms yield values rather than returning is I1's (`siOut`).
+    if ibMiss == "" && !irBodyLeaves(ib, b) { return skip("valued tail if") }
+    return 0
+  }
+  const n0 = b.length
+  const v = irBExpr(b, last)
+  if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
+  irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
+  irSpanNote(ib, last, b[n0], b[b.length - 1])
+  return 0
+}
+
+// Builds the IR of the function at `fnIx` (`fnStmts` slot `fnPos`), or "" plus a reason.
+function build(fnIx: i32, fnPos: i32): string {
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return "not a function" }
+  ib = irFnNew(fnIx, fn.fnName)
+  ibFnIx = fnIx
+  ibMiss = ""
+  ibDeclVar = Map()
+  ibLoopName = []
+  ibLoopBrk = []
+  ibLoopCont = []
+  ibLabelN = 0
+  ibBool = repNodeOfTy(TY_BOOL)
+  if fn.fnTyParams.length > 0 { return "template" }
+  ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
+  ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
+  const none = repIsNoValue(ib.irRetRep)
+  if !(valueRep(ib.irRetRep, ib.irRetTy) || none) {
+    return "result rep " + repWhat(ib.irRetRep)
+  }
+  ibNoValue = if none { ib.irRetRep } else { -1 }
+  const shift = envSlotShift(fnIx)
+  let i = 0
+  while i < fn.fnParams.length {
+    const p = fn.fnParams[i]
+    const ty = scopeTyAt(p, fnIx)
+    const r = repNodeOfTy(ty)
+    if isVoidTy(ty) || !valueRep(r, ty) { return "parameter rep " + repWhat(r) }
+    // An unannotated parameter's type is open until a call instances it.
+    if irTyOpen(ty) { return "open parameter type" }
+    const v = irVarNew(ib, r, ty, "param", shift + i)
+    ibDeclVar[p] = v
+    ib.irParams.push(v)
+    i = i + 1
+  }
+  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
+  if !repIsNoValue(ibNoValue) { return "no void rep" }
+  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
+  const body = nodeAt(fn.fnBody)
+  if !(body is Block) { return "body" }
+  const top: i32[] = []
+  if none {
+    for s in body.blkStmts { stmt(top, s) }
+  } else {
+    tailReturn(top, body.blkStmts, fn.fnBody)
+  }
+  ib.irBody = top
+  return ibMiss
+}
+
+// The failing control: breaks `ib` in the way `ibCorrupt` names.
+function corrupt() {
+  if ibCorrupt == 1 && ib.irVars.length > 0 {
+    const v = ib.irVars[0]
+    const other = if repPrim(v.vRep) == "bool" { repNodeOfTy(TY_I32) } else { ibBool }
+    v.vRep = other
+  }
+  if ibCorrupt == 2 {
+    let i = 0
+    while i < ib.irNodes.length {
+      const n = ib.irNodes[i]
+      if (
+        n is SLet
+        && n.lDst >= 0
+        && n.lDst < ib.irVars.length
+        && ib.irVars[n.lDst].vKind == "temp"
+      ) {
+        const t: IrNode = { tpWhy: 0 }
+        ib.irNodes[i] = t
+        return 0
+      }
+      i = i + 1
+    }
+  }
+  return 0
+}
+
+// The context the function at `fnStmts` slot `fnPos` accesses globals in. The start function's
+// top-level body never reaches the IR, so it is a body's.
+function globalCtxOf(fnPos: i32): GlobalCtx {
+  const c: GlobalCtx = {
+    gcInStart: false,
+    gcFnPos: fnPos,
+    gcGuardOff: ASSIGN_AS_VALUE,
+  }
+  return c
+}
+
+// The wasm index of the first declared local of the function at `fnIx`.
+function firstLocalOf(fnIx: i32): i32 {
+  const fn = nodeAt(fnIx)
+  return if fn is FuncDecl { fn.fnParams.length + envSlotShift(fnIx) } else { 0 }
+}
+
+// The dual emit of a verified function: its lowering against the legacy code entry `emitFuncCode`
+// wrote onto `out` from `outStart`, and the span rows it banked from `spanBase`. "" when they
+// match, else the mismatch class.
+function dualEmit(
+  fnIx: i32,
+  fnPos: i32,
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+): string {
+  const legacy: u8[] = []
+  let i = outStart
+  while i < out.length {
+    legacy.push(out[i])
+    i = i + 1
+  }
+  const skew = if ibCorrupt == 3 { 1 } else if ibCorrupt == 4 { 2 } else { 0 }
+  if gPromoInStart {
+    count("fail the start body reached the IR shadow")
+    return "start body"
+  }
+  const why = irDualEmit(
+    ib,
+    globalCtxOf(fnPos),
+    firstLocalOf(fnIx),
+    legacy,
+    spanBase,
+    outStart,
+    skew,
+  )
+  if why == "" {
+    count("matched")
+    return ""
+  }
+  count("mismatch " + why)
+  if ibDetail && rowN("mismatch " + why) <= 3 {
+    count(
+      "detail "
+        + why
+        + " in "
+        + ib.irName
+        + "\nlegacy "
+        + irHexOf(legacy)
+        + "\nir     "
+        + irHexOf(irLoweredEntry())
+        + "\n"
+        + irFnText(ib),
+    )
+  }
+  return why
+}
+
+// How many times row `key` has been counted.
+function rowN(key: string): i32 {
+  let i = 0
+  while i < ibRowKey.length {
+    if ibRowKey[i] == key { return ibRowN[i] }
+    i = i + 1
+  }
+  return 0
+}
+
+// The seam: builds, verifies, lowers and discards the function at `fnIx`, counting the outcome.
+export function irShadowFn(
+  fnIx: i32,
+  fnPos: i32,
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+) {
+  count("fns")
+  const gen = repNodeGen()
+  const why = build(fnIx, fnPos)
+  if why != "" {
+    count("uncovered " + why)
+    return 0
+  }
+  count("covered")
+  corrupt()
+  const v = irVerify(ib)
+  // A tree rebuilt mid-build leaves node indices that name nothing; no verdict holds.
+  if repNodeGen() != gen {
+    count("rep epoch moved")
+    return 0
+  }
+  if v.vfRule == 0 {
+    count("verified")
+    const dual = dualEmit(fnIx, fnPos, out, outStart, spanBase)
+    // A function the claim rule takes must match: a claim is never a fallback.
+    if dual != "" && claimable() {
+      count("fail a claimable function did not match: " + dual)
+    }
+    return 0
+  }
+  count(
+    "fail rule "
+      + i32ToStr(v.vfRule)
+      + " in "
+      + ib.irName
+      + " at "
+      + i32ToStr(v.vfNode)
+      + ": "
+      + v.vfMsg
+      + "\n"
+      + irFnText(ib),
+  )
+  return 0
+}

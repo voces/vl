@@ -182,9 +182,9 @@ Deno.test({
       const errs = await errorsOf(
         dir,
         "mixed",
-        'const c = true\nif c print(1)\nconst n: i32 = "hi"\nlet o = { x: 1 }\no.x++\n',
+        'const c = true\nif c print(1)\nconst n: i32 = "hi"\nlet o = { x: 1 }\n(1)++\n',
       );
-      const want = [BRACES, "postfix `++` target must be an identifier"];
+      const want = [BRACES, "postfix `++` target must be a name, a field or an element"];
       if (errs.length !== want.length) {
         throw new Error(
           `want exactly the ${want.length} PARSE diagnostics, got ${errs.length}: ${
@@ -202,7 +202,7 @@ Deno.test({
         }
       }
       // The CONTROL for this case is the payoff test above: the identical type
-      // error IS reported once the lossy `o.x++` is removed.
+      // error IS reported once the lossy `(1)++` is removed.
     });
   },
 });
@@ -474,9 +474,9 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      const F2 = "function f(a: i32, b: i32) { a + b }\n";
+      const F2 = "function f(a: i32, b: i32) { return a + b }\n";
       const TE = 'const n: i32 = "hi"\n';
-      // The retired pin's own program, minus the unrelated lossy `o.x++`.
+      // The retired pin's own program, minus the unrelated lossy `(1)++`.
       await gradeSpelling(
         dir,
         "call2",
@@ -487,14 +487,14 @@ Deno.test({
       await gradeSpelling(
         dir,
         "call3",
-        'function g(a: i32, b: i32, c: i32) { a + b + c }\nprint(g(1 2 3))\nconst n: i32 = "hi"\n',
+        'function g(a: i32, b: i32, c: i32) { return a + b + c }\nprint(g(1 2 3))\nconst n: i32 = "hi"\n',
         ["expected `,` but found `2`", "expected `,` but found `3`"],
       );
       // NESTED: the inner call recovers and the outer list is untouched.
       await gradeSpelling(
         dir,
         "nested",
-        `${F2}function g(a: i32, b: i32) { a * b }\nprint(g(f(1 2), 3))\n${TE}`,
+        `${F2}function g(a: i32, b: i32) { return a * b }\nprint(g(f(1 2), 3))\n${TE}`,
         ["expected `,` but found `2`"],
       );
       // An ARRAY literal — `expectClose("RBRACK")`'s list.
@@ -516,7 +516,7 @@ Deno.test({
       await gradeSpelling(
         dir,
         "params",
-        'function h(a: i32 b: i32) { a + b }\nprint(h(1, 2))\nconst n: i32 = "hi"\n',
+        'function h(a: i32 b: i32) { return a + b }\nprint(h(1, 2))\nconst n: i32 = "hi"\n',
         ["expected `,` but found `b`"],
       );
     });
@@ -535,7 +535,7 @@ Deno.test({
       const errs = await errorsOf(
         dir,
         "arity",
-        "function f(a: i32, b: i32) { a + b }\nprint(f(1 2 3))\n",
+        "function f(a: i32, b: i32) { return a + b }\nprint(f(1 2 3))\n",
       );
       // Report order is by POSITION, and the arity error spans the whole call
       // `f(1 2 3)` — so it starts before the two separator notes inside it.
@@ -603,7 +603,7 @@ Deno.test({
   fn: async () => {
     await withDir(async (dir) => {
       const file = `${dir}/fmtcomma.vl`;
-      const src = "function f(a: i32, b: i32) { a + b }\nprint(f(1 2))\n";
+      const src = "function f(a: i32, b: i32) { return a + b }\nprint(f(1 2))\n";
       await Deno.writeTextFile(file, src);
       const r = await run(["fmt", "-w", file]);
       if (r.code === 0) {

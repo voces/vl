@@ -10,7 +10,7 @@ import {
 } from "./strutil"
 import { engineFailOffset } from "./engine_msg"
 import { setTestEmitRefusal } from "./emit_state"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListDropLast, strListHas } from "./listutil"
 import { STRICT_EQ_CODE, i32ToStr } from "./ast"
 import {
   expInfColAt,
@@ -131,7 +131,6 @@ import {
   cliNeedsModules,
   cliPendingKey,
   cliPlural,
-  cliPopLast,
   cliRepeat,
   cliSevCode,
   cliSevRank,
@@ -424,6 +423,16 @@ let cliImpClash: string[] = []
 type CliSpanCols = { line: i32[], col: i32[], endLine: i32[], endCol: i32[] }
 // The spans of this file's `filled(n, 0)` calls refused into a `u8[]` (`cliNoteZeroBytesFix`).
 const cliZb: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
+// The value tails this file's block bodies refused, each at its statement's start (`cliNoteReturnFix`).
+const cliMr: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
+// The `return ` inserts this run owes another of its files, the path as the text: a callee there
+// ends in a call a caller here uses. Each is applied when the run fixes that file, once: its line
+// is negated when taken.
+const cliFx: CliSiteCols = { line: [], col: [], text: [] }
+// The files whose report waits for such an insert, checked again once after it, by path key.
+let cliFxWait: string[] = []
+// Whether the current file's check owes another file an insert, so its report waits.
+let cliFxOwes = false
 // The spans this file's fixes shorten to a prefix (`cliNoteCastFix`, `cliNoteStrictEqFix`), as
 // `CliSpanCols`: how many characters from each span's start the fix keeps, and the fix's name.
 type CliCutCols = {
@@ -566,7 +575,7 @@ let cliSrcCacheSrcs: string[] = []
 let cliSrcCacheFound: i32[] = []
 // Each key's slot in the three arrays above.
 let cliSrcCacheIx: {[string]: i32} = Map()
-function cliSrcCacheGet(key: string): i32 { cliSrcCacheIx[key] ?? -1 }
+function cliSrcCacheGet(key: string): i32 { return cliSrcCacheIx[key] ?? -1 }
 function cliSrcCachePut(key: string, src: string, found: i32) {
   const i = cliSrcCacheGet(key)
   if i >= 0 {
@@ -578,7 +587,7 @@ function cliSrcCachePut(key: string, src: string, found: i32) {
   cliSrcCacheKeys.push(key)
   cliSrcCacheSrcs.push(src)
   cliSrcCacheFound.push(found)
-  0
+  return 0
 }
 
 // ── argv intake (host pushes each arg before the run loop) ───────────────────
@@ -651,6 +660,9 @@ export function cliArgReset() {
   cliFmtResult = ""
   cliFix = 0
   cliFixCount = 0
+  cliSitesClear(cliFx)
+  cliFxWait = []
+  cliFxOwes = false
   cliFixDeclined = 0
   cliLintGraphed = 0
   cliFileFixed = 0
@@ -727,23 +739,23 @@ export function cliArgReset() {
   cliSibExpName = []
   cliSibSkipped = []
   mimpExtraSet([], [])
-  0
+  return 0
 }
 export function cliArgPush(c: i32) {
   cliArgAcc.push(c)
-  0
+  return 0
 }
 export function cliArgCommit() {
   cliArgs.push(fromCodePoints(cliArgAcc))
   cliArgAcc = []
-  0
+  return 0
 }
 
 // ── current-command payload accessors (valid until the next cliNext) ───────────
-export function cliCmdPathLen() { cliCmdPath.length }
-export function cliCmdPathAt(j: i32) { cliCmdPath[j] }
-export function cliCmdDataLen() { cliCmdData.length }
-export function cliCmdDataAt(j: i32) { cliCmdData[j] }
+export function cliCmdPathLen() { return cliCmdPath.length }
+export function cliCmdPathAt(j: i32) { return cliCmdPath[j] }
+export function cliCmdDataLen() { return cliCmdData.length }
+export function cliCmdDataAt(j: i32) { return cliCmdData[j] }
 // The bulk twin of `cliCmdDataAt` — the `<name>Store(off, count)` half of the host's
 // out ABI (protocol and staging window: `driver.rbyteStore`'s header). Writes
 // `written` = min(count, cliCmdDataLen() - off) bytes, packed four per i32 word
@@ -771,13 +783,13 @@ export function cliCmdDataStore(off: i32, count: i32): i32 {
     }
     __store_i32__(i, w)
   }
-  n
+  return n
 }
 
 // ── result intake (host commits the serviced command's result) ─────────────────
 export function cliResultPush(c: i32) {
   cpAccPush(cliResultAcc, c)
-  0
+  return 0
 }
 // The bulk twin of `cliResultPush` — the `<name>Load(count)` half of the host's
 // `StrIn` ABI (protocol, staging window and the why-a-loop in `driver.srcLoad`'s
@@ -785,12 +797,12 @@ export function cliResultPush(c: i32) {
 // so it is the LSP's own intake.
 export function cliResultLoad(count: i32) {
   cpAccLoad(cliResultAcc, count)
-  0
+  return 0
 }
 export function cliFileCommit(found: i32) {
   cliFileFound = found
   cliFileSrc = cpAccTake(cliResultAcc)
-  0
+  return 0
 }
 // The host's CMD_VALIDATE verdict for the file just emitted: `ok = 1` and the
 // module is one the engine accepts; `ok = 0` and `cliResultAcc` carries the
@@ -798,30 +810,30 @@ export function cliFileCommit(found: i32) {
 export function cliValidateCommit(ok: i32) {
   const msg = cpAccTake(cliResultAcc)
   if ok != 0 { cliValidateMsg = "" } else { cliValidateMsg = msg }
-  0
+  return 0
 }
 export function cliExitCode() { return cliExit }
 // 1: a `--codegen` CMD_VALIDATE names its file in `cliCmdPath`. A seed without this export
 // leaves an unrelated path there, so the host keeps no module it could misfile.
-export function cliValidateNamesFile(): i32 { 1 }
+export function cliValidateNamesFile(): i32 { return 1 }
 
 // ── directory-listing intake (host commits one CMD_LIST_DIR result) ─────────────
 export function cliDirNamePush(c: i32) {
   cliDirNameAcc.push(c)
-  0
+  return 0
 }
 export function cliDirEntryPush(isDir: i32) {
   cliDirNames.push(fromCodePoints(cliDirNameAcc))
   cliDirIsDirs.push(isDir)
   cliDirNameAcc = []
-  0
+  return 0
 }
 // `isDir = 1` when the listed path is a directory (entries pushed above); 0 when it
 // is a file or does not exist (no entries) — the VL program then treats the path as a
 // single file.
 export function cliDirCommit(isDir: i32) {
   cliDirWasDir = isDir
-  0
+  return 0
 }
 
 // ── lint-stream adapters ─────────────────────────────────────────────────────
@@ -832,35 +844,35 @@ export function cliDirCommit(isDir: i32) {
 // module 0 throughout.
 function cliLintCount() {
   if cliLintGraphed != 0 { return lintGraphCount() }
-  lintCount()
+  return lintCount()
 }
 function cliLintSevAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphSevAt(k) }
-  lintSevAt(k)
+  return lintSevAt(k)
 }
 function cliLintMsgAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphMsgAt(k) }
-  lintMsgAt(k)
+  return lintMsgAt(k)
 }
 function cliLintCodeAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphCodeAt(k) }
-  lintCodeAt(k)
+  return lintCodeAt(k)
 }
 function cliLintLineAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphLine(k) }
-  lintLineAt(k)
+  return lintLineAt(k)
 }
 function cliLintColAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphCol(k) }
-  lintColAt(k)
+  return lintColAt(k)
 }
 function cliLintEndAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphEnd(k) }
-  lintEndAt(k)
+  return lintEndAt(k)
 }
 function cliLintModAt(k: i32) {
   if cliLintGraphed != 0 { return lintGraphModule(k) }
-  0
+  return 0
 }
 
 // ── diagnostic formatting (the policy retired from the Rust host) ──────────────
@@ -901,7 +913,7 @@ function cliAddDiagSpan(
   dgMod.push(mod)
   dgCode.push(code)
   dgStage.push(stage)
-  0
+  return 0
 }
 // The redundant-annotation hint's exclusive end column, on `redunELineAt(ri)`: `redunS`..
 // `redunE` is the range `--fix` DELETES (the `:` through just before the `=`), so the caret
@@ -911,7 +923,7 @@ function cliRedunEndCol(ri: i32) {
   if redunELineAt(ri) != redunSLineAt(ri) { return redunEColAt(ri) }
   const e = redunEColAt(ri)
   if e <= redunSColAt(ri) { return redunSColAt(ri) + 1 }
-  e
+  return e
 }
 // Empty the parallel diagnostic columns. One home for the three places that start a
 // fresh report, so a column added here cannot be left stale by one of them.
@@ -925,13 +937,13 @@ function cliClearDiags() {
   dgMod = []
   dgCode = []
   dgStage = []
-  0
+  return 0
 }
 // Concise one-liner: `<file>: <severity> [<line>:<col>] <message>` (1-based L:C).
 function cliFmtConcise(d: i32) {
   let line = dgLine[d]
   if line <= 0 { line = 1 }
-  cliDiagFile(d)
+  return cliDiagFile(d)
     + ": "
     + dgSev[d]
     + " ["
@@ -967,7 +979,7 @@ function cliFmtJson(d: i32) {
     if el > dgLine[d] { out = out + ",\"endLine\":" + i32ToStr(el) }
     out = out + ",\"endCol\":" + i32ToStr(endc + 1)
   }
-  out + ",\"message\":\"" + cliJsonEsc(dgMsg[d]) + "\"}"
+  return out + ",\"message\":\"" + cliJsonEsc(dgMsg[d]) + "\"}"
 }
 // One input file's `--batch` record: the file, the exit code `vl check <file>` alone
 // would carry, and the diagnostics it appended to `cliJsonItems` from `from` on. A
@@ -990,7 +1002,7 @@ function cliBatchRecord(file: string, exit: CliExit, from: i32) {
   }
   pushCps(buf, "]}\n")
   cliBatchOut.push(fromCodePoints(buf))
-  0
+  return 0
 }
 // The file path to label diagnostic `d` with: the owning module's key in module mode,
 // so a graph-compile error in an imported file points at that file rather than the
@@ -998,7 +1010,7 @@ function cliBatchRecord(file: string, exit: CliExit, from: i32) {
 function cliDiagFile(d: i32) {
   const m = dgMod[d]
   if cliModMode != 0 && m >= 0 && m < cliModKeys.length { return cliModKeys[m] }
-  cliCurFile
+  return cliCurFile
 }
 // Why diagnostic `d` is withheld from the report, or "shown". Errors and the entry's own
 // diagnostics are always shown; an import's non-error is withheld when its key matches
@@ -1011,7 +1023,7 @@ function cliDiagWithheld(d: i32): CliWithheld {
   if cliModMode == 0 || m <= 0 { return "shown" }
   const f = cliDiagFile(d)
   if cliExcluded(f, cliBaseName(f)) { return "exclude" }
-  match cliImportScope(f) {
+  return match cliImportScope(f) {
     "linted" => "shown"
     "std" => "std"
     "prefixed" => "prefixed"
@@ -1029,13 +1041,13 @@ function cliImportScope(key: string): CliImportScope {
   }
   if scheme != "std" { return "prefixed" }
   if cliIncludeStd != 0 { return "linted" }
-  "std"
+  return "std"
 }
 // The last `/`-separated segment of `path`, for an `--exclude` basename match.
 function cliBaseName(path: string) {
   let i = path.length
   while i > 0 && path[i - 1] != '/' { i = i - 1 }
-  path.slice(i, path.length)
+  return path.slice(i, path.length)
 }
 // The source lines of diagnostic `d`'s owning module (its caret-context line),
 // memoized by module index. Falls back to `cliSrcLines` outside module mode.
@@ -1048,7 +1060,7 @@ function cliDiagSrcLines(d: i32) {
     }
     return cliDiagLineCache
   }
-  cliSrcLines
+  return cliSrcLines
 }
 // The 0-based column just past `raw`'s last non-space byte — where a multi-line span's
 // first-line slice ends, so the caret stops at the code rather than running to the margin.
@@ -1060,7 +1072,7 @@ function cliTrimEndCol(raw: string) {
   ) {
     e = e - 1
   }
-  e
+  return e
 }
 // Pretty rustc/Deno-style block: `[SEVERITY]: msg` / source line / caret /
 // `at file:line:col`. A positionless diagnostic drops the source+caret block.
@@ -1109,7 +1121,7 @@ function cliFmtPretty(d: i32) {
   } else {
     out = out + "\n" + cliAnsi(cliColor, "2", "  at " + dgFile)
   }
-  out
+  return out
 }
 
 // Stable insertion sort of a diagnostic-index array: errors first, so a lint tier
@@ -1119,7 +1131,7 @@ function cliDiagLess(a: i32, b: i32) {
   if ea != (dgSev[b] == "error") { return ea }
   if dgMod[a] != dgMod[b] { return dgMod[a] < dgMod[b] }
   if dgLine[a] != dgLine[b] { return dgLine[a] < dgLine[b] }
-  dgCol[a] < dgCol[b]
+  return dgCol[a] < dgCol[b]
 }
 function cliStableSort(order: i32[]) {
   let i = 1
@@ -1133,7 +1145,7 @@ function cliStableSort(order: i32[]) {
     order[j + 1] = key
     i = i + 1
   }
-  0
+  return 0
 }
 
 // ── the `check` policy ───────────────────────────────────────────────────────
@@ -1145,7 +1157,7 @@ function cliAddExclude(pat: string) {
   if p.length >= 2 && p[0] == '.' && p[1] == '/' { p = p.slice(2, p.length) }
   while p.length > 0 && p[p.length - 1] == '/' { p = p.slice(0, p.length - 1) }
   cliExcludes.push(p)
-  0
+  return 0
 }
 // True if any exclude pattern matches the path relative to the check root or its
 // basename — so `--exclude tests` prunes a whole subtree and `--exclude '*.gen.vl'`
@@ -1158,12 +1170,12 @@ function cliExcluded(relPath: string, basename: string) {
     if cliGlob(p, basename) { return true }
     i = i + 1
   }
-  false
+  return false
 }
 
 // A flag-shaped argument (so a value-taking flag never swallows one — e.g. the
 // host-injected trailing `--color=<v>` after a bare `--severity`).
-function cliIsFlag(a: string) { a.length > 0 && a[0] == '-' }
+function cliIsFlag(a: string) { return a.length > 0 && a[0] == '-' }
 // `--jobs` value → a positive worker count, or -1 for "not a positive count"
 // (the caller turns that into a usage error rather than silently running serially).
 function cliParseJobs(s: string) {
@@ -1177,33 +1189,33 @@ function cliParseJobs(s: string) {
     i = i + 1
   }
   if n < 1 { return -1 }
-  n
+  return n
 }
 // Record a usage error (first one wins; printed at exit tier 2).
 function cliUsageErr(msg: string) {
   if cliArgErr == "" { cliArgErr = msg }
-  0
+  return 0
 }
 // End the run: print `msg` on stderr and exit with the usage code.
 function cliUsageStop(msg: string) {
   cliOut = [msg]
   cliExit = EXIT_USAGE
-  cliBeginPrint()
+  return cliBeginPrint()
 }
 // Whether flag `cliArgs[i]` has its value at `i + 1`: present and not itself a flag.
 // When it does not, records `msg` as the usage error.
 function cliTakeValue(i: i32, msg: string): boolean {
   if i + 1 < cliArgs.length && !cliIsFlag(cliArgs[i + 1]) { return true }
   cliUsageErr(msg)
-  false
+  return false
 }
 // Whether `a` is `prefix` (a `--flag=` spelling) followed by a non-empty value.
 function cliHasPrefixValue(a: string, prefix: string): boolean {
-  a.length > prefix.length && a.slice(0, prefix.length) == prefix
+  return a.length > prefix.length && a.slice(0, prefix.length) == prefix
 }
 // The value after `prefix` in `a`, for an `a` that `cliHasPrefixValue` accepted.
 function cliPrefixValue(a: string, prefix: string): string {
-  a.slice(prefix.length, a.length)
+  return a.slice(prefix.length, a.length)
 }
 // Parse the subcommand's args strictly: an unknown flag or a second positional
 // argument is a usage error (exit 2), never silently ignored — `vl check a.vl b.vl`
@@ -1352,7 +1364,7 @@ function cliParseArgs() {
   // --json is machine output: never ANSI, whatever the host-resolved --color
   // (TTY detection / NO_COLOR) says.
   if cliJson != 0 { cliColor = 0 }
-  0
+  return 0
 }
 
 // Stage `cliEntrySrc` into the compiler's single-source input. One call, not a
@@ -1361,7 +1373,7 @@ function cliParseArgs() {
 function cliStageEntry() {
   srcReset()
   srcSetStr(cliEntrySrc)
-  0
+  return 0
 }
 
 // Stable merge sort of the file paths collected from `base` on — one target's own
@@ -1422,7 +1434,7 @@ function cliSortFilesFrom(base: i32) {
     cliFileFromDir[base + i] = fromDir[i]
     i = i + 1
   }
-  0
+  return 0
 }
 // Ingest one committed directory listing rooted at `base` (full path) / `relBase`
 // (relative to the check root): queue non-skipped, non-excluded subdirectories onto
@@ -1449,7 +1461,7 @@ function cliIngestEntries(base: string, relBase: string) {
     }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // ── per-file check (appends to cliOut + folds into the tally) ────────────────
@@ -1492,7 +1504,7 @@ function cliCheckCurFile() {
     cliCmdPath = cliCurFile
     return CMD_VALIDATE
   }
-  cliCheckCurFileRest()
+  return cliCheckCurFileRest()
 }
 
 // The rest of the per-file check, after the engine has had its say (see
@@ -1594,6 +1606,17 @@ function cliCheckCurFileRest() {
   }
 
   // ── report ──────────────────────────────────────────────────────────────────
+  // A file that owes another an insert is reported from its check after that one, once.
+  const waitKey = cliPathKey(cliCurFile)
+  if cliFxOwes && !strListHas(cliFxWait, waitKey) {
+    cliFxOwes = false
+    cliFxWait.push(waitKey)
+    cliFiles.push(cliCurFile)
+    cliFileFromDir.push(cliDirMode)
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFile()
+  }
+  cliFxOwes = false
   cliAddReportStreams()
 
   cliSrcLines = cliSplitLines(cliEntrySrc)
@@ -1671,7 +1694,7 @@ function cliCheckCurFileRest() {
   }
   // This file is done (reported); advance to the next.
   cliFileIdx = cliFileIdx + 1
-  cliStartFile()
+  return cliStartFile()
 }
 
 // `cliCheckCurFileRest`'s error tier: resets the per-file diagnostic and `--fix` note
@@ -1687,6 +1710,10 @@ function cliCaptureErrorDiags() {
   cliZb.col = []
   cliZb.endLine = []
   cliZb.endCol = []
+  cliMr.line = []
+  cliMr.col = []
+  cliMr.endLine = []
+  cliMr.endCol = []
   cliRc.line = []
   cliRc.col = []
   cliRc.endLine = []
@@ -1715,6 +1742,7 @@ function cliCaptureErrorDiags() {
     if cliFix != 0 && diagModule(i) == 0 {
       cliNoteImportFix(i)
       cliNoteZeroBytesFix(i)
+      cliNoteReturnFix(i)
       cliNoteGenBindFix(i)
       cliNoteCastFix(i)
       cliNoteStrictEqFix(i)
@@ -1817,7 +1845,15 @@ type CliRows = {
 let cliWiRows: {[string]: CliRows} = Map()
 
 function cliRowsNew(): CliRows {
-  { sev: [], code: [], line: [], col: [], endLine: [], endc: [], msg: [] }
+  return {
+    sev: [],
+    code: [],
+    line: [],
+    col: [],
+    endLine: [],
+    endc: [],
+    msg: [],
+  }
 }
 
 function cliRowAdd(
@@ -1837,7 +1873,7 @@ function cliRowAdd(
   r.endLine.push(endLine)
   r.endc.push(endc)
   r.msg.push(msg)
-  0
+  return 0
 }
 
 // Module `mod`'s rows of the checker's report streams. Only the entry's are reported, since a
@@ -1920,7 +1956,7 @@ function cliStreamRows(mod: i32): CliRows {
     }
     vi = vi + 1
   }
-  r
+  return r
 }
 
 // After a check that banked targets for serving (`wiBankedCount`), read each one's rows now,
@@ -1935,7 +1971,7 @@ function cliWiBankRows() {
     if held { wiHeldSwap() }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // `--budget`: note this file's findings of every budgeted code, at any severity, that the
@@ -1969,7 +2005,7 @@ function cliBudgetCollect() {
     }
     d = d + 1
   }
-  0
+  return 0
 }
 // `--budget`'s verdict, or `--budget-why`'s names, as the run's stdout.
 function cliBudgetFinish() {
@@ -1981,14 +2017,14 @@ function cliBudgetFinish() {
   cliExit = EXIT_OK
   if budgetFailed() { cliExit = EXIT_FAILED }
   if cliBudget == 2 && budgetFailed() { cliExit = EXIT_USAGE }
-  0
+  return 0
 }
 // `--write-baseline`: write the baseline this run counted.
 function cliBudgetWrite() {
   cliCmdPath = cliBudgetPath
   cliCmdData = budgetWriteText()
   cliState = ST_BUDGET_WROTE
-  CMD_WRITE_FILE
+  return CMD_WRITE_FILE
 }
 
 // A `--batch` entry the host could not read. It gets its OWN record — exit 2, the code
@@ -2018,7 +2054,7 @@ function cliBatchUnreadable() {
     cliOut.push("check: cannot read " + cliCurFile)
   }
   cliFileIdx = cliFileIdx + 1
-  cliStartFile()
+  return cliStartFile()
 }
 
 // Say which imported modules this run did not lint, so a skipped module is never a silent
@@ -2040,11 +2076,11 @@ function cliHiddenNotes() {
   if cliPrefUnlinted > 0 {
     cliHiddenNote("(modules under a package prefix not linted)")
   }
-  0
+  return 0
 }
 function cliHiddenNote(text: string) {
   cliOut.push(cliAnsi(cliColor, "2", text))
-  0
+  return 0
 }
 
 // The aggregate summary line, once every file is checked. A single-file target keeps
@@ -2109,16 +2145,13 @@ function cliFinishSummary() {
   }
   let summary = ""
   if cliErrors == 0 && cliWarnings == 0 {
+    const nf = cliDistinctFiles()
     let noun = "files"
-    if cliFiles.length == 1 { noun = "file" }
+    if nf == 1 { noun = "file" }
     summary = cliAnsi(
       cliColor,
       "2",
-      "Checked "
-        + i32ToStr(cliFiles.length)
-        + " "
-        + noun
-        + ", no errors.",
+      "Checked " + i32ToStr(nf) + " " + noun + ", no errors.",
     )
   } else {
     let parts = cliPlural(cliErrors, "error")
@@ -2147,7 +2180,7 @@ function cliFinishSummary() {
   cliOut.push(summary)
   cliHiddenNotes()
   cliExit = cliCheckExit()
-  0
+  return 0
 }
 
 // `vl check`'s exit code: a gating diagnostic fails the run, an unreadable `--batch` input
@@ -2156,7 +2189,7 @@ function cliCheckExit(): CliExit {
   if cliInvalidModule > 0 { return EXIT_COMPILER_BUG }
   if cliBatchUnread != 0 { return EXIT_USAGE }
   if cliGating > 0 { return EXIT_FAILED }
-  EXIT_OK
+  return EXIT_OK
 }
 
 // ── `vl test` — the runner brain (docs/internals/vl-test-design.md) ──────────
@@ -2171,7 +2204,7 @@ function cliCheckExit(): CliExit {
 // and never prepended, so every diagnostic position in the user's file is unchanged. A
 // file defining its own `vltCount` gets a duplicate-export error, reported as failure.
 function cliTestProtocol() {
-  "\nexport { vltCount, vltNameLen, vltNameAt, vltSkipped, vltRun, vltFailLen, vltFailAt } from \"std:test\"\n"
+  return "\nexport { vltCount, vltNameLen, vltNameAt, vltSkipped, vltRun, vltFailLen, vltFailAt } from \"std:test\"\n"
 }
 
 // Compile in the host's pool when it has one. A single file goes through it too, as one
@@ -2186,7 +2219,7 @@ function cliTestStart() {
     cliTestEnqIdx = 0
     return cliTestEnqueueNext()
   }
-  cliStartTestFile()
+  return cliStartTestFile()
 }
 
 // Queue the next discovered file for the pool, or — all queued — ask the host to
@@ -2199,7 +2232,7 @@ function cliTestEnqueueNext() {
   cliCmdPath = cliFiles[cliTestEnqIdx]
   cliTestEnqIdx = cliTestEnqIdx + 1
   cliState = ST_TEST_ENQUEUED
-  CMD_TEST_ENQUEUE
+  return CMD_TEST_ENQUEUE
 }
 
 // A pool worker's end: exit 0 once the host holds its module, 1 with the file's report
@@ -2208,7 +2241,7 @@ function cliTestWorkerDone(code: CliExit, msg: string) {
   cliCmdData = msg
   cliExit = code
   cliState = ST_DONE
-  CMD_DONE
+  return CMD_DONE
 }
 
 // The check loop. With a host pool and two or more roots, every root is queued for the
@@ -2231,7 +2264,7 @@ function cliCheckStart() {
     }
     return cliCheckEnqueueNext()
   }
-  cliStartFile()
+  return cliStartFile()
 }
 
 // ── serving a root from an importer's check (`wiArm`) ─────────────────────────
@@ -2263,7 +2296,7 @@ function cliWiStart() {
   }
   wiArm(1, 0)
   for f in cliFiles { wiTargetAdd(f) }
-  0
+  return 0
 }
 
 // Read the next root for its imports, or — all read — queue the roots importers first.
@@ -2282,7 +2315,7 @@ function cliWiReadNext() {
     cliWiReadIdx = cliWiReadIdx + 1
   }
   cliWiPerm = cliWiOrder()
-  cliCheckEnqueueNext()
+  return cliCheckEnqueueNext()
 }
 
 // The module keys source `src` of root `path` imports, as its own check resolves them.
@@ -2297,7 +2330,7 @@ function cliWiImportsOf(path: string, src: string, found: i32): string[] {
     k = k + 1
   }
   modReset()
-  out
+  return out
 }
 
 // The roots ordered by how many other roots each reaches through roots' imports, most
@@ -2367,7 +2400,7 @@ function cliWiOrder(): i32[] {
   }
   cliWiParent = []
   for r in perm { cliWiParent.push(last[r]) }
-  perm
+  return perm
 }
 
 // The latest queue slot before `j` whose root reaches slot `j`'s through roots' imports, or
@@ -2375,13 +2408,13 @@ function cliWiOrder(): i32[] {
 // check that holds it, so the slots form a forest the pool keeps together.
 export function cliCheckParentOf(j: i32): i32 {
   if j < 0 || j >= cliWiParent.length { return -1 }
-  cliWiParent[j]
+  return cliWiParent[j]
 }
 
 // The root the pool's `j`th queue slot holds.
 function cliWiSlot(j: i32): i32 {
   if j < cliWiPerm.length { return cliWiPerm[j] }
-  j
+  return j
 }
 
 // A worker begins root `cliCheckPick`, baselining the report so its payload is that
@@ -2409,7 +2442,7 @@ function cliCheckWorkerBegin() {
     cliStdUnlinted,
     cliPrefUnlinted,
   ]
-  cliStartFile()
+  return cliStartFile()
 }
 
 // Queue the next root for the pool, or — all queued — ask the host to check them.
@@ -2428,7 +2461,7 @@ function cliCheckEnqueueNext() {
   cliCmdData = i32ToStr(cliFileFromDir[root])
   cliCheckEnqIdx = cliCheckEnqIdx + 1
   cliState = ST_CHECK_ENQUEUED
-  CMD_CHECK_ENQUEUE
+  return CMD_CHECK_ENQUEUE
 }
 
 // A worker's root is done: `EXIT_OK` with its payload in `cliCmdData`, or `EXIT_FAILED` when the
@@ -2448,7 +2481,7 @@ function cliCheckWorkerDone() {
     cliCmdData = cliPwPayload()
   }
   cliState = ST_CHECK_NEXT
-  CMD_CHECK_ROOT_DONE
+  return CMD_CHECK_ROOT_DONE
 }
 
 // The worker's root as one string of fields, each `<n>:` for an integer or `<bytes>:`
@@ -2466,17 +2499,17 @@ function cliPwPayload() {
   cliPwList(buf, cliJsonItems, cliPwBase[1])
   cliPwList(buf, cliBatchOut, cliPwBase[2])
   cliPwList(buf, cliPwNotes, 0)
-  fromCodePoints(buf)
+  return fromCodePoints(buf)
 }
 function cliPwInt(buf: i32[], n: i32) {
   pushCps(buf, i32ToStr(n))
   buf.push(':')
-  0
+  return 0
 }
 function cliPwStr(buf: i32[], s: string) {
   cliPwInt(buf, s.length)
   pushCps(buf, s)
-  0
+  return 0
 }
 function cliPwList(buf: i32[], xs: string[], from: i32) {
   cliPwInt(buf, xs.length - from)
@@ -2485,7 +2518,7 @@ function cliPwList(buf: i32[], xs: string[], from: i32) {
     cliPwStr(buf, xs[i])
     i = i + 1
   }
-  0
+  return 0
 }
 
 // The payload readers, over `cliPpSrc` from `cliPpPos`.
@@ -2496,13 +2529,13 @@ function cliPpInt() {
     cliPpPos = cliPpPos + 1
   }
   cliPpPos = cliPpPos + 1
-  n
+  return n
 }
 function cliPpStr() {
   const n = cliPpInt()
   const s = cliPpSrc.slice(cliPpPos, cliPpPos + n)
   cliPpPos = cliPpPos + n
-  s
+  return s
 }
 
 // The integer `s` spells in decimal, as `i32ToStr` wrote it.
@@ -2515,7 +2548,7 @@ function cliDigits(s: string) {
     i = i + 1
   }
   if s.length > 0 && s[0] == '-' { return 0 - n }
-  n
+  return n
 }
 
 // Fold root `f`'s pooled payload into the run, as checking it here would have. The
@@ -2556,7 +2589,7 @@ function cliPoolApply(f: i32) {
     n = n - 5
   }
   cliPpSrc = ""
-  0
+  return 0
 }
 
 // Begin the next test file, or — work-list exhausted — move on to collection.
@@ -2574,7 +2607,7 @@ function cliStartTestFile() {
   }
   cliCmdPath = cliCurFile
   cliState = ST_TEST_READ
-  CMD_READ_FILE // — the test file's source
+  return CMD_READ_FILE // — the test file's source
 }
 
 // Record why the current file produced no tests and move to the next one. The message
@@ -2583,7 +2616,7 @@ function cliTestFileFailed(msg: string) {
   if cliTestPoolMode == 2 { return cliTestWorkerDone(EXIT_FAILED, msg) }
   cliTestFileErr[cliFileIdx] = msg
   cliFileIdx = cliFileIdx + 1
-  cliStartTestFile()
+  return cliStartTestFile()
 }
 
 // Set up the module table for the current test file and drive its fetch loop. A test
@@ -2596,7 +2629,7 @@ function cliTestBeginCompile() {
   cliModSrcs = [cliEntrySrc]
   cliDiagLineCacheMod = -1
   cliModCommitOne(cliCurFile, cliEntrySrc, 1)
-  cliTestFetchOrCompile()
+  return cliTestFetchOrCompile()
 }
 
 // Fetch the current file's remaining imports (from the per-run cache when we have
@@ -2615,7 +2648,7 @@ function cliTestFetchOrCompile() {
     cliModSrcs.push(cliSrcCacheSrcs[ci])
     cliModCommitOne(key, cliSrcCacheSrcs[ci], cliSrcCacheFound[ci])
   }
-  cliTestCompileNow()
+  return cliTestCompileNow()
 }
 
 // Emit the current test file's module. Success hands the bytes to the host to
@@ -2656,7 +2689,7 @@ function cliTestCompileNow() {
   cliTestStashOf.push(cliFileIdx)
   cliCmdPath = cliCurFile
   cliState = ST_TEST_STASH
-  CMD_TEST_STASH // — the host keeps the module now in rbyte*
+  return CMD_TEST_STASH // — the host keeps the module now in rbyte*
 }
 
 // Every file compiled: ask the host to instantiate the stashed modules and read their
@@ -2665,7 +2698,7 @@ function cliTestCompileNow() {
 function cliTestBeginCollect() {
   if cliTestStash.length == 0 { return cliTestReport() }
   cliState = ST_TEST_COLLECT
-  CMD_TEST_COLLECT
+  return CMD_TEST_COLLECT
 }
 
 // The plan: every collected test, in collection order, minus the ones `-t` filters
@@ -2680,7 +2713,7 @@ function cliTestPlanRun() {
   }
   if cliPlanEntry.length == 0 { return cliTestReport() }
   cliState = ST_TEST_RUN
-  CMD_TEST_RUN
+  return CMD_TEST_RUN
 }
 
 // One report line for a test, `<status> <name>`, with the failure message and any
@@ -2703,7 +2736,7 @@ function cliTestEmitResult(k: i32) {
   cliOut.push("  " + cliAnsi(cliColor, "31", "FAIL") + " " + cliTestName[e])
   cliTestEmitIndented(cliResMsg[k])
   cliTestEmitCaptured(k)
-  0
+  return 0
 }
 
 // The `--- captured output ---` block under test `k`'s line, when it printed anything.
@@ -2711,7 +2744,7 @@ function cliTestEmitCaptured(k: i32) {
   if cliResOut[k].length == 0 { return 0 }
   cliOut.push("       " + cliAnsi(cliColor, "2", "--- captured output ---"))
   cliTestEmitIndented(cliResOut[k])
-  0
+  return 0
 }
 
 // Push `text` into the report indented under a failing test, one line per line —
@@ -2726,7 +2759,7 @@ function cliTestEmitIndented(text: string) {
     }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // The whole report: one block per file, then the summary. Deterministic — files
@@ -2759,7 +2792,7 @@ function cliTestReport() {
   cliOut.push(cliAnsi(cliColor, code, text))
   cliExit = EXIT_OK
   if cliTestFailed > 0 { cliExit = EXIT_FAILED }
-  cliBeginPrint()
+  return cliBeginPrint()
 }
 
 // The per-test lines of file `f` (a cliFiles index): every plan entry that
@@ -2788,23 +2821,27 @@ function cliTestEmitFileTests(f: i32) {
     k = k + 1
   }
   if shown == 0 { cliOut.push("  " + cliAnsi(cliColor, "2", "no tests") + "") }
-  0
+  return 0
 }
 
 // ── the `vl test` protocol: what the host reads ──────────────────────────────
 // The plan, as (stashed file, test index within that file) pairs, plus the worker
 // count. `cliTestJobsWanted() == 0` means the host's choice, one per core.
-export function cliTestPlanCount(): i32 { cliPlanEntry.length }
-export function cliTestPlanFile(k: i32): i32 { cliTestOwner[cliPlanEntry[k]] }
-export function cliTestPlanTest(k: i32): i32 { cliTestLocal[cliPlanEntry[k]] }
-export function cliTestJobsWanted(): i32 { cliTestJobs }
+export function cliTestPlanCount(): i32 { return cliPlanEntry.length }
+export function cliTestPlanFile(k: i32): i32 {
+  return cliTestOwner[cliPlanEntry[k]]
+}
+export function cliTestPlanTest(k: i32): i32 {
+  return cliTestLocal[cliPlanEntry[k]]
+}
+export function cliTestJobsWanted(): i32 { return cliTestJobs }
 
 // ── the `vl test` protocol: what the host commits ────────────────────────────
 // Before the first `cliNext`, after argv: 1 = this host has a compile pool, 2 = this
 // instance is one of its workers (compile the one target, stash or fail, stop).
 export function cliTestPoolStage(mode: i32) {
   cliTestPoolMode = mode
-  0
+  return 0
 }
 // One pooled file's compile outcome, in queue order: 0 = the host stashed its module,
 // 1 = it did not compile, with the file's report entry on the shared `cliResult`.
@@ -2823,7 +2860,7 @@ export function cliTestCompiledCommit(status: i32) {
     }
     cliTestFileErr.push(msg)
   }
-  0
+  return 0
 }
 // ── the `vl check` root pool: what the host commits ─────────────────────────
 // Before the first `cliNext`, after argv: `mode` 1 = this host has a root pool, 2 = this
@@ -2831,19 +2868,19 @@ export function cliTestCompiledCommit(status: i32) {
 export function cliCheckPoolStage(mode: i32, pick: i32) {
   cliCheckPoolMode = mode
   cliCheckPick = pick
-  0
+  return 0
 }
 // A worker's copy of one root of the parent's walk, in walk order: the path on the
 // shared `cliResult`, `fromDir` as the parent's `CMD_CHECK_ENQUEUE` reported it.
 export function cliCheckPresetRoot(fromDir: i32) {
   cliPresetFiles.push(cpAccTake(cliResultAcc))
   cliPresetFromDir.push(fromDir)
-  0
+  return 0
 }
 // A worker's next root after `CMD_CHECK_ROOT_DONE`: `pick` of the walk, or -1 to end.
 export function cliCheckNextRoot(pick: i32) {
   cliCheckPick = pick
-  0
+  return 0
 }
 // One pooled root's outcome, in queue order: 0 = its worker's payload is on the shared
 // `cliResult`, anything else = this instance checks the root itself. A payload naming a
@@ -2878,7 +2915,7 @@ export function cliCheckPooledCommit(status: i32) {
   }
   cliPoolStatus[f] = st
   if st == 0 { cliPoolPayload[f] = payload }
-  0
+  return 0
 }
 
 // When the pool handed every root back (one worker), check them here in queue order, importers
@@ -2906,7 +2943,7 @@ function cliSelfOrderBegin() {
   cliSelfPerm = cliWiPerm
   cliFiles = files
   cliFileFromDir = fromDir
-  0
+  return 0
 }
 
 // Undo `cliSelfOrderBegin` once every root is checked: the paths in walk order, and the
@@ -2940,7 +2977,7 @@ function cliSelfOrderEnd() {
   cliBatchOut = cliSelfRestore(cliBatchOut, at, 2)
   cliSelfPerm = []
   cliSelfSegs = []
-  0
+  return 0
 }
 
 // `xs` with the rows each root appended (column `c` of `cliSelfSegs`) in walk order, where
@@ -2965,13 +3002,13 @@ function cliSelfRestore(xs: string[], at: i32[], c: i32): string[] {
     out.push(xs[i])
     i = i + 1
   }
-  out
+  return out
 }
 
 // A test name, one code point at a time (the `cliDirNamePush` idiom).
 export function cliTestNamePush(c: i32) {
   cliTestNameAcc.push(c)
-  0
+  return 0
 }
 // End of one test's name, for the file currently being collected. `skip` is the
 // registry's own `vltSkipped(i)`.
@@ -2982,7 +3019,7 @@ export function cliTestNameCommit(skip: i32) {
   cliTestSkip.push(skip)
   cliTestLocalNext = cliTestLocalNext + 1
   cliTestNameAcc = []
-  0
+  return 0
 }
 // End of one stashed file's registry. `status` 0 = instantiated and read, 1 = its top
 // level trapped, with the message on the shared `cliResult` channel. Files commit in
@@ -2992,12 +3029,12 @@ export function cliTestFileCommit(status: i32) {
   cliTestFileStatus.push(status)
   cliTestFileMsg.push(cpAccTake(cliResultAcc))
   cliTestLocalNext = 0
-  0
+  return 0
 }
 // Captured output of the test result being committed.
 export function cliTestOutPush(c: i32) {
   cliTestOutAcc.push(c)
-  0
+  return 0
 }
 // One plan entry's outcome: 0 = passed, 1 = failed, 2 = skipped. The failure
 // message rides the shared `cliResult` channel; the captured output rides
@@ -3013,7 +3050,7 @@ export function cliTestResultCommit(k: i32, status: i32) {
   cliResMsg.push(cpAccTake(cliResultAcc))
   cliResOut.push(fromCodePoints(cliTestOutAcc))
   cliTestOutAcc = []
-  0
+  return 0
 }
 
 // ── the state machine ────────────────────────────────────────────────────────
@@ -3028,7 +3065,7 @@ function cliBeginPrint() {
     cliJsonOut = ""
     return CMD_PRINT_OUT
   }
-  cliEmitNextOut()
+  return cliEmitNextOut()
 }
 function cliEmitNextOut() {
   if cliBatchIdx < cliBatchOut.length {
@@ -3042,7 +3079,7 @@ function cliEmitNextOut() {
     return CMD_PRINT_ERR
   }
   cliState = ST_DONE
-  CMD_DONE
+  return CMD_DONE
 }
 // Ask the host whether target `cliTargetIdx` is a directory. One target is the
 // ordinary case; `--batch` names several and each expands the same way, in turn.
@@ -3059,7 +3096,7 @@ function cliClassifyTarget() {
   cliDirIsDirs = []
   cliCmdPath = cliFile
   cliState = ST_CLASSIFY
-  CMD_LIST_DIR
+  return CMD_LIST_DIR
 }
 // Advance the directory walk: list the next pending dir, or — this target done — sort
 // its slice and either classify the next target or begin the per-file check loop.
@@ -3067,8 +3104,8 @@ function cliWalkStep() {
   if cliWalkStack.length > 0 {
     cliCurDir = cliWalkStack[cliWalkStack.length - 1]
     cliCurRel = cliWalkRel[cliWalkRel.length - 1]
-    cliWalkStack = cliPopLast(cliWalkStack)
-    cliWalkRel = cliPopLast(cliWalkRel)
+    cliWalkStack = strListDropLast(cliWalkStack)
+    cliWalkRel = strListDropLast(cliWalkRel)
     cliDirNames = []
     cliDirIsDirs = []
     cliCmdPath = cliCurDir
@@ -3094,7 +3131,7 @@ function cliWalkStep() {
     return cliBeginPrint()
   }
   cliValIdx = 0
-  cliValidateNext()
+  return cliValidateNext()
 }
 
 // Several paths: every named file must exist before any is checked, formatted or run, so a
@@ -3113,14 +3150,14 @@ function cliValidateNext() {
     }
   }
   cliFileIdx = 0
-  cliStartWork()
+  return cliStartWork()
 }
 
 // The subcommand's name, for a usage line.
 function cliSubName(): string {
   if cliCmd == 1 { return "fmt" }
   if cliCmd == 2 { return "test" }
-  "check"
+  return "check"
 }
 
 // Add `path` to the work-list unless an earlier target already named the same file (the
@@ -3134,7 +3171,7 @@ function cliAddFile(path: string, fromDir: i32) {
   }
   cliFiles.push(path)
   cliFileFromDir.push(fromDir)
-  0
+  return 0
 }
 
 // `path` with `.` and `..` segments and repeated `/`s removed, for comparing two spellings.
@@ -3166,7 +3203,7 @@ function cliPathKey(path: string): string {
     out = out + segs[k]
     k = k + 1
   }
-  out
+  return out
 }
 
 // Expand the targets (the working directory when none is named) and walk the first.
@@ -3179,7 +3216,7 @@ function cliBeginTargets() {
   }
   if cliTargets.length == 0 { cliTargets = ["."] }
   cliTargetIdx = 0
-  cliClassifyTarget()
+  return cliClassifyTarget()
 }
 
 // Dispatch the per-file loop on the subcommand: `check` runs the checker, `fmt`
@@ -3187,7 +3224,7 @@ function cliBeginTargets() {
 function cliStartWork() {
   if cliCmd == 1 { return cliStartFmtFile() }
   if cliCmd == 2 { return cliTestStart() }
-  cliCheckStart()
+  return cliCheckStart()
 }
 // Begin checking cliFiles[cliFileIdx] (read its source), or — work-list done —
 // build the summary and start printing.
@@ -3232,7 +3269,7 @@ function cliStartFile() {
   }
   cliCmdPath = cliCurFile
   cliState = ST_CHECK_READ
-  CMD_READ_FILE // — the file's source
+  return CMD_READ_FILE // — the file's source
 }
 // For the current file: fetch the next pending module — from the per-run source
 // cache when this run already read it, else from the host — or, graph closed,
@@ -3253,7 +3290,7 @@ function cliFetchOrCheckFile() {
   }
   // cliCheckCurFile reports + advances to the next file itself — or, for --fix,
   // returns CMD_WRITE_FILE mid-way to write the fixed source (then re-check).
-  cliCheckCurFile()
+  return cliCheckCurFile()
 }
 // Begin checking the current file's source (cliEntrySrc): set up module mode if it
 // imports, then run the fetch-or-check loop. Shared by the plain and `--fix` paths.
@@ -3273,7 +3310,7 @@ function cliBeginCheck() {
   } else {
     cliModMode = 0
   }
-  cliFetchOrCheckFile()
+  return cliFetchOrCheckFile()
 }
 
 // The directory part of `path`, "" when it has none.
@@ -3283,7 +3320,7 @@ function cliDirOf(path: string): string {
     if path[i] == '/' { return path.slice(0, i) }
     i = i - 1
   }
-  ""
+  return ""
 }
 
 // Queue the current file's candidates outside the module graph: every file of a directory
@@ -3302,7 +3339,7 @@ function cliSibBegin() {
   cliCmdPath = cliDirOf(cliCurFile)
   if cliCmdPath == "" { cliCmdPath = "." }
   cliState = ST_SIB_LIST
-  CMD_LIST_DIR
+  return CMD_LIST_DIR
 }
 
 // Queue the `.vl` files the listing of the current file's directory named.
@@ -3318,7 +3355,7 @@ function cliSibListed() {
     i = i + 1
   }
   cliSibQEnd = cliSibQueue.length
-  cliSibReadNext()
+  return cliSibReadNext()
 }
 
 // Scan the next unscanned candidate, from the source cache or the host; with none left,
@@ -3352,7 +3389,7 @@ function cliSibReadNext() {
     r = r + 1
   }
   mimpExtraSet(names, specs)
-  cliBeginCheck()
+  return cliBeginCheck()
 }
 
 // Record candidate `key`'s exported names (none when it could not be read).
@@ -3368,7 +3405,7 @@ function cliSibScan(key: string, src: string, found: i32) {
     cliSibExpKey.push(key)
     cliSibExpName.push(n)
   }
-  0
+  return 0
 }
 
 // ── check --fix ──────────────────────────────────────────────────────────────
@@ -3435,6 +3472,53 @@ function cliCollectFixes(src: string) {
   }
   for lb in impLb {
     cliImportFixEdits(src, lb, impOff, starts, "unused import")
+  }
+  // `return ` before each value tail a block body refused, and each discarded pure one, at the
+  // statement's start: before its label or the parentheses that open it.
+  // The inserts another file of this run owes this one, taken once.
+  const fxKey = cliPathKey(cliCurFile)
+  let fx = 0
+  while fx < cliFx.line.length {
+    const fl = cliFx.line[fx] - 1
+    if cliPathKey(cliFx.text[fx]) == fxKey && fl >= 0 && fl < starts.length {
+      const fo = starts[fl] + cliFx.col[fx]
+      if !i32ListHas(cliFixEdit.pos, fo) {
+        cliPushFixRepl(fo, 0, "return ", "missing return", starts)
+      }
+      cliFx.line[fx] = -cliFx.line[fx]
+    }
+    fx = fx + 1
+  }
+  let mr = 0
+  while mr < cliMr.line.length {
+    const ml = cliMr.line[mr] - 1
+    if ml >= 0 && ml < starts.length {
+      cliPushFixRepl(
+        starts[ml] + cliMr.col[mr],
+        0,
+        "return ",
+        "missing return",
+        starts,
+      )
+    }
+    mr = mr + 1
+  }
+  let rq = 0
+  while rq < rcoalCount() {
+    const rl = rcoalLineAt(rq) - 1
+    if (
+      rcoalCodeAt(rq) == "discarded-tail-value"
+      && rcoalModuleAt(rq) == 0
+      && rl >= 0
+      && rl < starts.length
+    ) {
+      let off = starts[rl] + rcoalColAt(rq)
+      while off > 0 && src[off - 1] == '(' { off = off - 1 }
+      if !i32ListHas(cliFixEdit.pos, off) {
+        cliPushFixRepl(off, 0, "return ", "missing return", starts)
+      }
+    }
+    rq = rq + 1
   }
   cliZeroBytesEdits(src, starts)
   cliCastEdits(src, starts)
@@ -3511,15 +3595,17 @@ function cliCollectFixes(src: string) {
     ecl[b + 1] = kcl
     a = a + 1
   }
-  0
+  return 0
 }
 
 // Whether `src[i]` is a space or a tab.
-function cliBlankAt(src: string, i: i32) { src[i] == ' ' || src[i] == '\t' }
+function cliBlankAt(src: string, i: i32) {
+  return src[i] == ' ' || src[i] == '\t'
+}
 
 // Whether `src[i]` is a space, a tab or a line break.
 function cliSpaceAt(src: string, i: i32) {
-  cliBlankAt(src, i) || src[i] == '\n' || src[i] == '\r'
+  return cliBlankAt(src, i) || src[i] == '\n' || src[i] == '\r'
 }
 
 // The `{` of the `import { … } from "…"` clause around offset `off`, where `import` opens
@@ -3536,7 +3622,7 @@ function cliImportBraceOf(src: string, off: i32) {
   while k >= 0 && cliBlankAt(src, k) { k = k - 1 }
   if k < 5 || src.slice(k - 5, k + 1) != "import" { return -1 }
   if k - 6 >= 0 && src[k - 6] != '\n' { return -1 }
-  b
+  return b
 }
 
 // The offset of the `}` closing the clause opened at `lb`; -1 past a comment or the end.
@@ -3547,7 +3633,7 @@ function cliImportRBrace(src: string, lb: i32) {
     r = r + 1
   }
   if r >= src.length { return -1 }
-  r
+  return r
 }
 
 // The end of the import statement whose clause closes at `rb`: just past its line's newline,
@@ -3571,14 +3657,14 @@ function cliImportStmtEnd(src: string, rb: i32) {
   if q == src.length { return q }
   if src[q] == '\n' { return q + 1 }
   if src[q] == '\r' && q + 1 < src.length && src[q + 1] == '\n' { return q + 2 }
-  -1
+  return -1
 }
 
 // The 1-based line holding offset `off`, given each line's start offset.
 function cliLineOfOff(starts: i32[], off: i32) {
   let i = 0
   while i + 1 < starts.length && starts[i + 1] <= off { i = i + 1 }
-  i + 1
+  return i + 1
 }
 
 // Push the edits that remove the unused specifiers of the import clause opened at `lb`; a
@@ -3644,7 +3730,7 @@ function cliImportFixEdits(
     const from = ce[lastKept]
     cliPushFixEdit(from, ce[cs.length - 1] - from, what, starts)
   }
-  0
+  return 0
 }
 
 // Empty every `cliFixEdit` column.
@@ -3655,7 +3741,7 @@ function cliFixEditClear() {
   cliFixEdit.what = []
   cliFixEdit.line = []
   cliFixEdit.col = []
-  0
+  return 0
 }
 
 // Empty every column of `t`.
@@ -3663,7 +3749,7 @@ function cliSitesClear(t: CliSiteCols) {
   t.line = []
   t.col = []
   t.text = []
-  0
+  return 0
 }
 
 // Append one deletion of `len` code units at `off` to the `cliFixEdit` rows.
@@ -3686,7 +3772,7 @@ function cliPushFixRepl(
   cliFixEdit.what.push(what)
   cliFixEdit.line.push(ln)
   cliFixEdit.col.push(off - starts[ln - 1])
-  0
+  return 0
 }
 
 // Diagnostic `i` is a cast that does nothing: note its span and the operand length it keeps.
@@ -3705,7 +3791,7 @@ function cliNoteCastFix(i: i32) {
   cliRc.endCol.push(diagEndCol(i))
   cliRc.keep.push(keep)
   cliRc.what.push("redundant cast")
-  0
+  return 0
 }
 
 // Diagnostic `i` is a `===` or `!==` over an operand with no identity: note its span, of which the
@@ -3721,7 +3807,7 @@ function cliNoteStrictEqFix(i: i32) {
   cliRc.endCol.push(diagEndCol(i))
   cliRc.keep.push(2)
   cliRc.what.push("strict equality")
-  0
+  return 0
 }
 
 // The edits shortening each noted span to the prefix it keeps: a cast to its operand, `!==` to `!=`.
@@ -3750,7 +3836,7 @@ function cliCastEdits(src: string, starts: i32[]) {
     }
     k = k + 1
   }
-  0
+  return 0
 }
 
 // Diagnostic `i` asks for an import with exactly one exporter: note the specifier and the
@@ -3765,7 +3851,7 @@ function cliNoteImportFix(i: i32) {
   // An aliased import also needs the call respelled, which this edit cannot do, so it is left
   // to the author rather than re-proposed under a fresh alias every round.
   if cliDataVals(data, "alias").length > 0 { return 0 }
-  cliImpAdd(member[0], mods[0], code == "ufcs-not-imported")
+  return cliImpAdd(member[0], mods[0], code == "ufcs-not-imported")
 }
 
 // Diagnostic `i` refuses a `filled(n, 0)` delivered into a `u8[]`: note the call's span.
@@ -3775,7 +3861,105 @@ function cliNoteZeroBytesFix(i: i32) {
   cliZb.col.push(diagCol(i))
   cliZb.endLine.push(diagEndLine(i))
   cliZb.endCol.push(diagEndCol(i))
-  0
+  return 0
+}
+
+// Diagnostic `i` refuses a block body's value tail, or a `void` call of a function whose block
+// body discards its last call: note where that `return` goes.
+function cliNoteReturnFix(i: i32) {
+  let ln = diagLine(i)
+  let cl = diagCol(i)
+  if vcDiagCode(i) == "void-callee-missing-return" {
+    const mv = cliDataVals(vcDiagData(i), "mod")
+    const lv = cliDataVals(vcDiagData(i), "line")
+    const cv = cliDataVals(vcDiagData(i), "col")
+    if mv.length != 1 || lv.length != 1 || cv.length != 1 { return 0 }
+    const m = cliDecOf(mv[0])
+    ln = cliDecOf(lv[0])
+    cl = cliDecOf(cv[0])
+    if m > 0 { return cliOweReturn(m, ln, cl) }
+    if m < 0 { return 0 }
+  } else if vcDiagCode(i) != "missing-return" {
+    return 0
+  }
+  if ln < 0 || cl < 0 { return 0 }
+  let k = 0
+  while k < cliMr.line.length {
+    if cliMr.line[k] == ln && cliMr.col[k] == cl { return 0 }
+    k = k + 1
+  }
+  cliMr.line.push(ln)
+  cliMr.col.push(cl)
+  cliMr.endLine.push(ln)
+  cliMr.endCol.push(cl)
+  return 0
+}
+
+// Owes a `return ` at line `ln`, column `cl` of module `m`'s file when the run checks that file,
+// once; the file is checked again when the run already passed it. Outside the run it is a note.
+function cliOweReturn(m: i32, ln: i32, cl: i32) {
+  // A `--batch` record is one per named file, so the run checks none of them twice.
+  if (
+    cliBatch != 0
+    || cliModMode == 0
+    || m >= cliModKeys.length
+    || ln < 0
+    || cl < 0
+  ) {
+    return 0
+  }
+  const key = cliPathKey(cliModKeys[m])
+  let at = -1
+  let f = 0
+  while f < cliFiles.length {
+    if cliPathKey(cliFiles[f]) == key { at = f }
+    f = f + 1
+  }
+  if at < 0 { return 0 }
+  let k = 0
+  while k < cliFx.line.length {
+    const kl = cliFx.line[k]
+    if (
+      (kl == ln || kl == -ln)
+      && cliFx.col[k] == cl
+      && cliPathKey(cliFx.text[k]) == key
+    ) {
+      return 0
+    }
+    k = k + 1
+  }
+  cliFx.line.push(ln)
+  cliFx.col.push(cl)
+  cliFx.text.push(cliFiles[at])
+  cliFxOwes = true
+  // The run fixed that file already: it is checked again, after the files still to come.
+  if at <= cliFileIdx {
+    cliFiles.push(cliFiles[at])
+    cliFileFromDir.push(cliFileFromDir[at])
+  }
+  return 0
+}
+
+// How many distinct files the run checked: a file checked again after an insert it waited for
+// counts once.
+function cliDistinctFiles(): i32 {
+  const seen: string[] = []
+  for f in cliFiles {
+    const k = cliPathKey(f)
+    if !strListHas(seen, k) { seen.push(k) }
+  }
+  return seen.length
+}
+
+// The decimal `s` spells, or -1 for an empty or non-digit spelling.
+function cliDecOf(s: string): i32 {
+  if s.length == 0 { return -1 }
+  let v = 0
+  for c in s {
+    if c < '0' || c > '9' { return -1 }
+    v = v * 10 + (c - '0')
+  }
+  return v
 }
 
 // Diagnostic `i` refuses a concrete function written to a `let` that keeps its generic type:
@@ -3797,7 +3981,7 @@ function cliNoteGenBindFix(i: i32) {
   cliGb.line.push(ln)
   cliGb.col.push(cl)
   cliGb.text.push(annot[0])
-  0
+  return 0
 }
 
 // The non-negative decimal `t` as an i32; a non-digit ends it.
@@ -3807,7 +3991,7 @@ function cliDecI32(t: string): i32 {
     if c < '0' || c > '9' { return v }
     v = v * 10 + (c - '0')
   }
-  v
+  return v
 }
 
 // The edits for the noted generic bindings: `: <type>` after each one's name.
@@ -3829,7 +4013,7 @@ function cliGenBindEdits(starts: i32[], srcLen: i32) {
     }
     k = k + 1
   }
-  0
+  return 0
 }
 
 // Diagnostic `i` refuses a positional argument after a misplaced named one: note the name each
@@ -3858,7 +4042,7 @@ function cliNoteNamedOrderFix(i: i32) {
     }
     a = a + 1
   }
-  0
+  return 0
 }
 
 // The edits for the noted positional arguments: `<name>: ` before each one.
@@ -3880,7 +4064,7 @@ function cliNamedOrderEdits(starts: i32[], srcLen: i32) {
     }
     k = k + 1
   }
-  0
+  return 0
 }
 
 // The edits for the noted `filled(n, 0)` calls: each becomes `zeroBytes(n)`, and `zeroBytes`
@@ -3912,7 +4096,7 @@ function cliZeroBytesEdits(src: string, starts: i32[]) {
     }
     k = k + 1
   }
-  0
+  return 0
 }
 
 // Whether `src`'s `std:bytes` import clause already names `zeroBytes`.
@@ -3921,7 +4105,7 @@ function cliZbImported(src: string): boolean {
   if rb < 0 { return false }
   let lb = rb
   while lb > 0 && src[lb] != '{' { lb = lb - 1 }
-  src.slice(lb, rb).includes("zeroBytes")
+  return src.slice(lb, rb).includes("zeroBytes")
 }
 
 // The offset of the comma ending `n` in a `filled(n, <fill>)` spanning `[so, eo)`, else -1:
@@ -3953,7 +4137,7 @@ function cliZbCountEnd(src: string, so: i32, eo: i32) {
     if depth < 0 { return -1 }
     q = q + 1
   }
-  comma
+  return comma
 }
 
 // A name two modules are asked for is a clash when a plain use asked: either import alone
@@ -3975,14 +4159,14 @@ function cliImpAdd(item: string, spec: string, method: boolean) {
   cliImpAsk.method.push(method)
   cliImpAsk.item.push(item)
   cliImpAsk.spec.push(spec)
-  0
+  return 0
 }
 
 // The name an import specifier binds: the alias after `as`, else the specifier.
 function cliImpLocal(item: string): string {
   let i = item.length - 1
   while i >= 0 && item[i] != ' ' { i = i - 1 }
-  item.slice(i + 1, item.length)
+  return item.slice(i + 1, item.length)
 }
 
 // The values of `key` in a diagnostic payload: netstrings read as alternating key and value.
@@ -4003,7 +4187,7 @@ function cliDataVals(data: string, key: string): string[] {
     else if keyHit { out.push(v) }
     isKey = !isKey
   }
-  out
+  return out
 }
 
 // The `}` of the top-level `import { … } from "<spec>"` in `src`, else -1.
@@ -4015,7 +4199,7 @@ function cliImportClauseOf(src: string, spec: string) {
     while ls < src.length && src[ls] != '\n' { ls = ls + 1 }
     ls = ls + 1
   }
-  -1
+  return -1
 }
 
 // Where a new import goes: past the last top-level import statement of any form, else past
@@ -4038,14 +4222,14 @@ function cliImportsEnd(src: string) {
     ls = next
   }
   if end >= 0 { return end }
-  cliHeaderEnd(src)
+  return cliHeaderEnd(src)
 }
 
 // Whether the line at `ls` opens an `import` statement: the keyword, then a blank, `{` or `*`.
 function cliIsImportLine(src: string, ls: i32): boolean {
   if ls + 7 > src.length || src.slice(ls, ls + 6) != "import" { return false }
   const c = src[ls + 6]
-  c == ' ' || c == '\t' || c == '{' || c == '*'
+  return c == ' ' || c == '\t' || c == '{' || c == '*'
 }
 
 // The offset just past the leading run of blank and `//` lines: the header comment block.
@@ -4061,7 +4245,7 @@ function cliHeaderEnd(src: string) {
     if q >= src.length { return src.length }
     ls = q + 1
   }
-  ls
+  return ls
 }
 
 // The `}` closing the clause of an `import {` that opens the line at `ls`, else -1.
@@ -4070,7 +4254,7 @@ function cliImportRBraceAtLine(src: string, ls: i32) {
   let q = ls + 6
   while q < src.length && cliBlankAt(src, q) { q = q + 1 }
   if q >= src.length || src[q] != '{' { return -1 }
-  cliImportRBrace(src, q)
+  return cliImportRBrace(src, q)
 }
 
 // The specifier text of the `from "…"` after the clause closing at `rb`, else "".
@@ -4079,14 +4263,14 @@ function cliImportSpecAfter(src: string, rb: i32): string {
   const q = cliImportSpecStart(src, rb)
   let e = q
   while e < src.length && src[e] != '"' { e = e + 1 }
-  src.slice(q, e)
+  return src.slice(q, e)
 }
 
 // The offset just inside the opening quote of the `from "…"` after `rb`.
 function cliImportSpecStart(src: string, rb: i32) {
   let q = rb + 1
   while q < src.length && src[q] != '"' { q = q + 1 }
-  q + 1
+  return q + 1
 }
 
 // The edits for the imports this file's errors ask for. A name exported by exactly one other
@@ -4146,7 +4330,7 @@ function cliMissingImportEdits(src: string, starts: i32[]) {
     if at > 0 && src[at - 1] != '\n' { fresh = "\n" + fresh }
     cliPushFixRepl(at, 0, fresh, "missing import", starts)
   }
-  0
+  return 0
 }
 
 // The edit for `name`, imported from `from` but exported by `to` alone: the specifier
@@ -4193,7 +4377,7 @@ function cliMovedImportEdit(
     return cliPushFixRepl(q, from.length, to, "moved import", starts)
   }
   cliImportFixEdits(src, lb, [hitAt], starts, "moved import")
-  cliImpAdd(src.slice(hitAt, hitEnd), to, false)
+  return cliImpAdd(src.slice(hitAt, hitEnd), to, false)
 }
 
 // `src` with every edit whose `keep` flag is set applied. A single forward pass into a
@@ -4216,7 +4400,7 @@ function cliApplyFixEdits(src: string, keep: i32[]) {
     e = e + 1
   }
   pushCps(buf, src.slice(cur, src.length))
-  fromCodePoints(buf)
+  return fromCodePoints(buf)
 }
 
 // ── verify-and-revert: the trial ladder (D1091) ──────────────────────────────
@@ -4263,7 +4447,7 @@ function cliFixVerdict(ok: i32) {
   if cliFixTrial >= n { return cliFixCommit() }
   cliFixKeep[cliFixTrial] = 1
   cliEntrySrc = cliApplyFixEdits(cliFixOrig, cliFixKeep)
-  cliBeginCheck()
+  return cliBeginCheck()
 }
 
 // Count one applied fix of kind `what` toward the summary.
@@ -4278,7 +4462,7 @@ function cliFixTally(what: string) {
   }
   cliFixKinds.push(what)
   cliFixKindN.push(1)
-  0
+  return 0
 }
 
 // The current file has no round left to run: fold its last round's declined edits and
@@ -4287,7 +4471,7 @@ function cliFixFileDone() {
   cliFileFixed = 1
   cliFixDeclined = cliFixDeclined + cliFixDecl.text.length
   if cliFixRound > cliFixRoundsMax { cliFixRoundsMax = cliFixRound }
-  0
+  return 0
 }
 
 // The accepted edit set is final: tally it, leave verification, and hand the
@@ -4319,12 +4503,19 @@ function cliFixCommit() {
   cliFixRound = cliFixRound + 1
   cliSitesClear(cliFixDecl)
   // Keep the per-run source cache coherent with the rewrite the host is
-  // about to perform, so later files that import this one see the fix.
+  // about to perform, so later files that import this one see the fix, under
+  // whichever spelling of its path they read it by.
   cliSrcCachePut(cliCurFile, out, 1)
+  const outKey = cliPathKey(cliCurFile)
+  let ck = 0
+  while ck < cliSrcCacheKeys.length {
+    if cliPathKey(cliSrcCacheKeys[ck]) == outKey { cliSrcCacheSrcs[ck] = out }
+    ck = ck + 1
+  }
   cliCmdPath = cliCurFile
   cliCmdData = out
   cliState = ST_FIX_WROTE
-  CMD_WRITE_FILE
+  return CMD_WRITE_FILE
 }
 
 // Begin formatting cliFiles[cliFileIdx] (read its source), or — work-list done —
@@ -4335,7 +4526,7 @@ function cliStartFmtFile() {
   cliDirMode = cliFileFromDir[cliFileIdx]
   cliCmdPath = cliCurFile
   cliState = ST_FMT_READ
-  CMD_READ_FILE
+  return CMD_READ_FILE
 }
 // One stderr line for a failed `fmt` of `path`; `status` is `cliFormatNow`'s nonzero
 // result. An unparseable input (1) reports its first parse diagnostic; a round-trip
@@ -4360,7 +4551,7 @@ function cliFmtFailNote(path: string, status: i32) {
     msg = msg + ": " + vcDiagMsg(0)
   }
   cliOut.push("fmt: " + path + ": " + msg + " — not formatted")
-  0
+  return 0
 }
 
 // End of the fmt work-list: compute the exit code and drain any accumulated stderr
@@ -4374,7 +4565,7 @@ function cliFmtFinish() {
   if cliFmtBug > 0 { cliExit = EXIT_FMT_BUG }
   if cliOut.length > 0 { return cliBeginPrint() }
   cliState = ST_DONE
-  CMD_DONE
+  return CMD_DONE
 }
 
 // ST_INIT: parse the arguments and start the command they name.
@@ -4668,5 +4859,5 @@ export function cliNext() {
   if st == ST_TEST_COLLECT { return cliTestPlanRun() }
   if st == ST_TEST_RUN { return cliTestReport() }
   if st == ST_PRINT { return cliEmitNextOut() }
-  CMD_DONE
+  return CMD_DONE
 }

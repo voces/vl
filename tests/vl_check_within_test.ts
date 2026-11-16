@@ -217,7 +217,7 @@ const ST = "export let g: i32 | null = 1\n" +
   "export function poke(): void { hh() }\n";
 const NARROW = 'import { g, poke } from "./st"\n' +
   "export function f(): i32 {\n  if g != null {\n    poke()\n    const k = g\n" +
-  "    const j = k ?? 0\n    return j\n  }\n  0\n}\n";
+  "    const j = k ?? 0\n    return j\n  }\n  return 0\n}\n";
 
 // `Q` declared beside the importer, with `x` of type `xTy`; G declares `P = { x: i32, tag }`.
 const TWIN_MAIN = (xTy: string) =>
@@ -226,10 +226,10 @@ const TWIN_MAIN = (xTy: string) =>
 const TWIN_LIB = (read: string) =>
   "export type P = { x: i32, tag: string }\nexport function mk(): i32 {\n" +
   `  const p: P = { x: 1, tag: "a" }\n  ${read}\n}\n`;
-const WRAP = "export function wrap<T>(v: T): T[] { [v] }\n";
+const WRAP = "export function wrap<T>(v: T): T[] { return [v] }\n";
 const FILL = "export function fill<T>(n: i32, v: T): T[] {\n  const o: T[] = []\n  let i = 0\n" +
-  "  while i < n {\n    o.push(v)\n    i = i + 1\n  }\n  o\n}\n";
-const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(1)[0] }\n';
+  "  while i < n {\n    o.push(v)\n    i = i + 1\n  }\n  return o\n}\n";
+const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { return wrap(1)[0] }\n';
 
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
@@ -239,7 +239,7 @@ const LOOSE_ARGS = 65536, LOOSE_GETTER = 131072, LOOSE_SETTLED = 262144, LOOSE_C
 
 // G builds a `J` from an inferred builder; main declares a record of the literal's own storage.
 const BUILT_LIB = (body: string) =>
-  `type J = { f: i32 | null }\nfunction id<T>(v: T): T { v }\nfunction mk() { ${body} }\n` +
+  `type J = { f: i32 | null }\nfunction id<T>(v: T): T { return v }\nfunction mk() { return ${body} }\n` +
   "export function jj(): void {\n  const xj: J = mk()\n  const kk = mk()\n" +
   "  print(xj.f ?? 0)\n  print([kk][0].f)\n}\n";
 const BUILT_MAIN = 'import { jj } from "./lib"\ntype II = { f: i32 }\njj()\n';
@@ -253,7 +253,7 @@ const CASES: Case[] = [
     name: "a closed function import is served",
     graph: {
       "main.vl": 'import { area } from "./lib"\nprint(area(2))\n',
-      "lib.vl": "export function area(n: i32): i32 { n * 2 }\n",
+      "lib.vl": "export function area(n: i32): i32 { return n * 2 }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -262,7 +262,7 @@ const CASES: Case[] = [
     name: "an uncalled untyped export is inferred only when its module is the entry",
     graph: {
       "main.vl": 'import { f } from "./lib"\nprint(f(2))\n',
-      "lib.vl": "export function f(n: i32): i32 { n * 2 }\nexport function g(x) { x + 1 }\n",
+      "lib.vl": "export function f(n: i32): i32 { return n * 2 }\nexport function g(x) { return x + 1 }\n",
     },
     target: "lib.vl",
     want: "entry",
@@ -274,7 +274,7 @@ const CASES: Case[] = [
       "main.vl": 'import { xs } from "./lib"\nxs.push("a")\nprint(xs.length)\n',
       // The read keeps lib's own check refusing the open element, so a check of lib alone
       // differs from the graph's, where main's push fixes it.
-      "lib.vl": "export let xs = []\nexport function first() { xs[0] }\n",
+      "lib.vl": "export let xs = []\nexport function first() { return xs[0] }\n",
     },
     target: "lib.vl",
     want: "demand",
@@ -285,7 +285,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { P, pt, px } from "./lib"\nconst w: P = pt\nprint(w.x / 8 + px())\n',
       "lib.vl": "export type P = { x: f64, y: f64 }\nexport let pt = { x: 1, y: 2 }\n" +
-        "export function px(): f64 {\n  const q = pt ?? pt\n  q.x\n}\n",
+        "export function px(): f64 {\n  const q = pt ?? pt\n  return q.x\n}\n",
     },
     target: "lib.vl",
     want: "demand",
@@ -297,7 +297,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": 'export function area(n: i32): i32 {\n  const k: "a" | "b" = "a"\n' +
-        '  const t = k ?? "b"\n  n\n}\n',
+        '  const t = k ?? "b"\n  return n\n}\n',
     },
     target: "lib.vl",
     want: "ambient",
@@ -309,7 +309,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": 'export function area(n: i32): i32 {\n  const k: "a" | "b" = "a"\n' +
-        '  const t = k ?? "b"\n  n\n}\n',
+        '  const t = k ?? "b"\n  return n\n}\n',
     },
     target: "lib.vl",
     want: "ambient",
@@ -322,7 +322,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": 'export function area(n: i32): i32 {\n  const k: "a" | "b" = "a"\n' +
-        '  const q: "a" | "b" = k\n  print(q)\n  n\n}\n',
+        '  const q: "a" | "b" = k\n  print(q)\n  return n\n}\n',
     },
     target: "lib.vl",
     want: "ambient",
@@ -335,7 +335,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": 'export function area(n: i32): i32 {\n  const k: Map<string, "a" | "b"> = Map()\n' +
-        '  const q: Map<string, "a" | "b"> = k\n  print(q.length)\n  n\n}\n',
+        '  const q: Map<string, "a" | "b"> = k\n  print(q.length)\n  return n\n}\n',
     },
     target: "lib.vl",
     want: "ambient",
@@ -347,7 +347,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { area } from "./lib"\nconst z: "b" | "a" = "b"\nprint(z)\nprint(area(2))\n',
       "lib.vl": 'export function area(n: i32): i32 {\n  const k: "a" | "b" = "a"\n' +
-        '  const t = k ?? "b"\n  print(t)\n  n\n}\n',
+        '  const t = k ?? "b"\n  print(t)\n  return n\n}\n',
     },
     target: "lib.vl",
     want: "ambient",
@@ -358,11 +358,11 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { two } from "./g2"\nimport { area } from "./lib"\nprint(two())\n' +
         "print(area(2))\n",
-      "g1.vl": 'export function one(): "a" | "b" { "a" }\n',
-      "g2.vl": 'export function two(): "b" | "a" { "b" }\n',
+      "g1.vl": 'export function one(): "a" | "b" { return "a" }\n',
+      "g2.vl": 'export function two(): "b" | "a" { return "b" }\n',
       "lib.vl": 'import { one } from "./g1"\nimport { two } from "./g2"\n' +
         "export function area(n: i32): i32 {\n  const k = one()\n  const j: i32 = k\n" +
-        "  print(two())\n  n + j\n}\n",
+        "  print(two())\n  return n + j\n}\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -373,12 +373,12 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { two } from "./g2"\nimport { area } from "./lib"\nprint(two())\n' +
         "print(area(2))\n",
-      "g1.vl": 'export type L1 = "p" | "q"\nexport function one(): i32 { 1 }\n',
-      "g2.vl": 'export type L2 = "q" | "p"\nexport function two(): i32 { 2 }\n',
+      "g1.vl": 'export type L1 = "p" | "q"\nexport function one(): i32 { return 1 }\n',
+      "g2.vl": 'export type L2 = "q" | "p"\nexport function two(): i32 { return 2 }\n',
       "lib.vl": 'import { one } from "./g1"\nimport { two } from "./g2"\n' +
-        'function lit(c: boolean): "p" | "q" {\n  if c { return "p" }\n  "q"\n}\n' +
+        'function lit(c: boolean): "p" | "q" {\n  if c { return "p" }\n  return "q"\n}\n' +
         "export function area(n: i32): i32 {\n  const j: i32 = lit(n > 1)\n" +
-        "  n + j + one() + two()\n}\n",
+        "  return n + j + one() + two()\n}\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -389,12 +389,12 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { two } from "./g2"\nimport { area } from "./lib"\nprint(two())\n' +
         "print(area(2))\n",
-      "g1.vl": 'export type L1 = "p" | "q"\nexport function one(): i32 { 1 }\n',
-      "g2.vl": 'export type L2 = "q" | "p"\nexport function two(): i32 { 2 }\n',
+      "g1.vl": 'export type L1 = "p" | "q"\nexport function one(): i32 { return 1 }\n',
+      "g2.vl": 'export type L2 = "q" | "p"\nexport function two(): i32 { return 2 }\n',
       "lib.vl": 'import { one } from "./g1"\nimport { two } from "./g2"\n' +
-        'function lit(c: boolean): "p" | "q" {\n  if c { return "p" }\n  "q"\n}\n' +
+        'function lit(c: boolean): "p" | "q" {\n  if c { return "p" }\n  return "q"\n}\n' +
         "export function area(n: i32): i32 {\n  const k = lit(n > 1)\n" +
-        "  if k != null { n + one() + two() } else { 0 }\n}\n",
+        "  return if k != null { n + one() + two() } else { 0 }\n}\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -406,7 +406,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype L2 = "q" | "r"\nconst y: L2 = "q"\n' +
         "print(y)\nprint(area(2))\n",
       "lib.vl": 'type L1 = "p" | "q"\nexport function area(n: i32): i32 {\n' +
-        '  const z: L1 = "p"\n  if z != null { n } else { 0 }\n}\n',
+        '  const z: L1 = "p"\n  return if z != null { n } else { 0 }\n}\n',
     },
     target: "lib.vl",
     want: "served",
@@ -416,7 +416,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { area } from "./lib"\nconst z: 2 | 1 = 2\nprint(z)\nprint(area(2))\n',
       "lib.vl": "export function area(n: i32): i32 {\n  const k: 1 | 2 = 1\n" +
-        "  const t = k ?? 2\n  print(t)\n  n\n}\n",
+        "  const t = k ?? 2\n  print(t)\n  return n\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -427,7 +427,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": "const stack: i32[] = [1, 2]\nexport function area(n: i32): i32 {\n" +
-        "  let s = n\n  if stack.length > 0 { s = s + (stack.pop() ?? 0) }\n  s\n}\n",
+        "  let s = n\n  if stack.length > 0 { s = s + (stack.pop() ?? 0) }\n  return s\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -438,7 +438,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": "export function area(n: i32): i32 {\n  const k: Map<string, i32> = Map()\n" +
-        "  const q: Map<string, i32> = k\n  print(q.length)\n  n\n}\n",
+        "  const q: Map<string, i32> = k\n  print(q.length)\n  return n\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -449,7 +449,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": "export function area(n: i32): i32 {\n  const b: boolean = n > 1\n" +
-        "  print(b)\n  n\n}\n",
+        "  print(b)\n  return n\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -460,7 +460,7 @@ const CASES: Case[] = [
       "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
         "print(area(2))\nprint(x)\n",
       "lib.vl": 'export function area(n: i32): i32 {\n  const o: string[] = ["x"]\n' +
-        "  print(o[0])\n  n\n}\n",
+        "  print(o[0])\n  return n\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -492,7 +492,7 @@ const CASES: Case[] = [
     name: "a same-shape record declared outside G is one type with G's own",
     graph: {
       "main.vl": TWIN_MAIN("i32"),
-      "lib.vl": TWIN_LIB("p.x"),
+      "lib.vl": TWIN_LIB("return p.x"),
     },
     target: "lib.vl",
     want: "served",
@@ -502,7 +502,7 @@ const CASES: Case[] = [
     name: "a same-shape record outside G is served beside a row that renders G's record",
     graph: {
       "main.vl": TWIN_MAIN("i32"),
-      "lib.vl": TWIN_LIB("(p ?? p).x"),
+      "lib.vl": TWIN_LIB("return (p ?? p).x"),
     },
     target: "lib.vl",
     want: "served",
@@ -511,7 +511,7 @@ const CASES: Case[] = [
     name: "a same-shape record outside G is one type with G's beside a row that renders a primitive",
     graph: {
       "main.vl": TWIN_MAIN("i32"),
-      "lib.vl": TWIN_LIB("const b: boolean = p.x > 0\n  if b { p.x } else { 0 }"),
+      "lib.vl": TWIN_LIB("const b: boolean = p.x > 0\n  return if b { p.x } else { 0 }"),
     },
     target: "lib.vl",
     want: "served",
@@ -521,7 +521,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { q } from "./oth"\nimport { mk } from "./lib"\nprint(mk())\nprint(q.tag)\n',
       "oth.vl": 'export type Q = { x: i32, tag: string }\nexport const q: Q = { x: 3, tag: "b" }\n',
-      "lib.vl": TWIN_LIB("const q: P = p\n  q.x"),
+      "lib.vl": TWIN_LIB("const q: P = p\n  return q.x"),
     },
     target: "lib.vl",
     want: "served",
@@ -532,7 +532,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { mk } from "./lib"\ntype Col = { r: i32, g: i32, b: i32 }\n' +
         "const c: Col = { r: 1, g: 2, b: 3 }\nprint(mk() + c.g)\n",
-      "lib.vl": "function box() { { w: 1, h: 2, d: 3 } }\nexport function mk(): i32 { box().h }\n",
+      "lib.vl": "function box() { return { w: 1, h: 2, d: 3 } }\nexport function mk(): i32 { return box().h }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -541,7 +541,7 @@ const CASES: Case[] = [
     name: "a record outside G that differs in one field type is not a twin",
     graph: {
       "main.vl": TWIN_MAIN("f64"),
-      "lib.vl": TWIN_LIB("p.x"),
+      "lib.vl": TWIN_LIB("return p.x"),
     },
     target: "lib.vl",
     want: "ambient",
@@ -552,7 +552,7 @@ const CASES: Case[] = [
       "main.vl": 'import { mk } from "./lib"\ntype Rng = { s: i32 }\nconst r: Rng = { s: 1 }\n' +
         "print(mk())\nprint(r.s)\n",
       "lib.vl": "export type W = { s: f64, t: i32 }\nexport function mk(): i32 {\n" +
-        "  const w: W = { s: 0.5, t: 2 }\n  w.t\n}\n",
+        "  const w: W = { s: 0.5, t: 2 }\n  return w.t\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -563,7 +563,7 @@ const CASES: Case[] = [
       "main.vl": 'import { mk } from "./lib"\ntype Key = { k: i32 }\nconst q: Key = { k: 1 }\n' +
         "print(mk())\nprint(q.k)\n",
       "lib.vl": 'type Key = { a: string }\nexport function mk(): i32 {\n  const q: Key = { a: "x" }\n' +
-        "  q.a.length\n}\n",
+        "  return q.a.length\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -573,9 +573,9 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { g } from "./lib"\nimport { mkV } from "./v"\nprint(g() + mkV()[1])\n',
       "v.vl": "export type V = new { base: i32, length: i32 }\n" +
-        'export function "[]"(self: V, i: i32): i32 { self.base + i }\n' +
+        'export function "[]"(self: V, i: i32): i32 { return self.base + i }\n' +
         "export function mkV(): V { return { base: 1, length: 2 } }\n",
-      "lib.vl": "export function g(): i32 {\n  const r = { base: 1, size: 2 }\n  r.base\n}\n",
+      "lib.vl": "export function g(): i32 {\n  const r = { base: 1, size: 2 }\n  return r.base\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -585,10 +585,10 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { g } from "./lib"\nimport { mk } from "./v"\nprint(mk() + g())\n',
       "v.vl": "export type V = { base: i32, length: i32 }\n" +
-        'export function "[]"(self: V, i: i32): i32 { self.base + i }\n' +
-        "export function mk(): i32 { 1 }\n",
+        'export function "[]"(self: V, i: i32): i32 { return self.base + i }\n' +
+        "export function mk(): i32 { return 1 }\n",
       "lib.vl": "type W = { base: i32, length: i32 }\nexport function g(): i32 {\n" +
-        "  const r: W = { base: 1, length: 2 }\n  r[0]\n}\n",
+        "  const r: W = { base: 1, length: 2 }\n  return r[0]\n}\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -600,8 +600,8 @@ const CASES: Case[] = [
     name: "a push G makes on a list an outside body types declines its target on demand",
     graph: {
       "main.vl": 'import { add, xs } from "./lib"\nimport { u } from "./use"\nprint(add("a") + u())\n',
-      "lib.vl": "export let xs = []\nexport function add(s: string): i32 {\n  xs.push(s)\n  0\n}\n",
-      "use.vl": 'import { xs } from "./lib"\nexport function u(): i32 {\n  xs.push(1)\n  0\n}\n',
+      "lib.vl": "export let xs = []\nexport function add(s: string): i32 {\n  xs.push(s)\n  return 0\n}\n",
+      "use.vl": 'import { xs } from "./lib"\nexport function u(): i32 {\n  xs.push(1)\n  return 0\n}\n',
     },
     target: "use.vl",
     want: "demand",
@@ -633,7 +633,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { NONE } from "./lib"\nconst x: i64 = NONE\nconst y: f64 = NONE\n' +
         "print(x)\nprint(y / 8)\n",
-      "lib.vl": "export const NONE = -1\nexport function f(): i32 { NONE }\n",
+      "lib.vl": "export const NONE = -1\nexport function f(): i32 { return NONE }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -644,7 +644,7 @@ const CASES: Case[] = [
       "main.vl": 'import { ks, ns, ws } from "./lib"\nks.push(2.0)\nws.push("c")\nns.push(3)\n' +
         "print(ks[2] / 8)\nprint(ws.length)\n",
       "lib.vl": 'let B = 2\nexport let ks = [0.5, -0.25]\nexport let ws = ["a", "b"]\n' +
-        "export let ns = [1, B]\nexport function f(): f64 { ks[0] }\n",
+        "export let ns = [1, B]\nexport function f(): f64 { return ks[0] }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -653,7 +653,7 @@ const CASES: Case[] = [
     name: "a closed call's result an importer delivers onward is served",
     graph: {
       "main.vl": 'import { C } from "./lib"\nconst x: i32 | null = C\nprint(x ?? 0)\n',
-      "lib.vl": "export function mk(a: f64): i32 { 1 }\nexport const C = mk(0.5)\n",
+      "lib.vl": "export function mk(a: f64): i32 { return 1 }\nexport const C = mk(0.5)\n",
     },
     target: "lib.vl",
     want: "served",
@@ -662,7 +662,7 @@ const CASES: Case[] = [
     name: "a call of a function with no declared return still declines its binding",
     graph: {
       "main.vl": 'import { xs } from "./lib"\nxs.push("a")\nprint(xs.length)\n',
-      "lib.vl": "function mk() { [] }\nexport let xs = mk()\n",
+      "lib.vl": "function mk() { return [] }\nexport let xs = mk()\n",
     },
     target: "lib.vl",
     want: "demand",
@@ -701,7 +701,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { xs } from "./lib"\nxs.push("a")\nprint(xs.length)\n',
       "lib.vl": 'import { same } from "./gen"\nexport let xs = same(1, [])\n',
-      "gen.vl": "export function same<T>(n: i32, v: T[]): T[] { v }\n",
+      "gen.vl": "export function same<T>(n: i32, v: T[]): T[] { return v }\n",
     },
     target: "lib.vl",
     want: "demand",
@@ -711,7 +711,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { C } from "./lib"\nconst x: i64 = C\nprint(x)\n',
       "lib.vl": "type Loc = { file: string, line: i32, col: i32 }\n" +
-        "function mk(n: i32, at: Loc = __callsite__): i32 { n + at.line }\nexport const C = mk(1)\n",
+        "function mk(n: i32, at: Loc = __callsite__): i32 { return n + at.line }\nexport const C = mk(1)\n",
     },
     target: "lib.vl",
     want: "served",
@@ -720,8 +720,8 @@ const CASES: Case[] = [
     name: "a self-function outside G whose name G spells only as a plain word is served",
     graph: {
       "main.vl": 'import { f } from "./lib"\ntype Rq = { zzt: i32 }\n' +
-        "function zzn(self: Rq): i32 { self.zzt }\nconst r: Rq = { zzt: 1 }\nprint(r.zzn() + f(2))\n",
-      "lib.vl": "export function f(n: i32): i32 {\n  const zzn = n * 2\n  zzn\n}\n",
+        "function zzn(self: Rq): i32 { return self.zzt }\nconst r: Rq = { zzt: 1 }\nprint(r.zzn() + f(2))\n",
+      "lib.vl": "export function f(n: i32): i32 {\n  const zzn = n * 2\n  return zzn\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -731,7 +731,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { f } from "./lib"\ntype Rq = { zzs: i32 }\nconst r: Rq = { zzs: 1 }\n' +
         "print(r.zzs + f(2))\n",
-      "lib.vl": "export function f(zzs: i32): i32 { zzs * 2 }\n",
+      "lib.vl": "export function f(zzs: i32): i32 { return zzs * 2 }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -741,7 +741,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { f } from "./lib"\ntype Rq = { zzs: i32 }\nconst r: Rq = { zzs: 1 }\n' +
         "print(r.zzs + f(2))\n",
-      "lib.vl": "export function f(n: i32): i32 {\n  const q = { zzs: n }\n  q.zzs\n}\n",
+      "lib.vl": "export function f(n: i32): i32 {\n  const q = { zzs: n }\n  return q.zzs\n}\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -758,7 +758,7 @@ const CASES: Case[] = [
     name: "a literal a builder hands to a generic call declines beside a record of its storage",
     graph: {
       "main.vl": BUILT_MAIN,
-      "lib.vl": "type J = { f: f64 }\nfunction id<T>(v: T): T { v }\nfunction mk() { id({ f: 4 }) }\n" +
+      "lib.vl": "type J = { f: f64 }\nfunction id<T>(v: T): T { return v }\nfunction mk() { return id({ f: 4 }) }\n" +
         "export function jj(): void {\n  const xj: J | string = mk()\n  const kk = mk()\n" +
         "  if xj is J { print(xj.f) }\n  print([kk][0].f)\n}\n",
     },
@@ -771,8 +771,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: i32, y: i32 }\n' +
         "const c: Ct = { x: 1, y: 2 }\nprint(mk() + c.y)\n",
-      "lib.vl": "type Pt = { x: f64, y: f64 }\nfunction pt(x: f64, y: f64): Pt { { x, y } }\n" +
-        "export function mk(): i32 {\n  const p = pt(1.5, 2.5)\n  if p.x > 1.0 { 1 } else { 0 }\n}\n",
+      "lib.vl": "type Pt = { x: f64, y: f64 }\nfunction pt(x: f64, y: f64): Pt { return { x, y } }\n" +
+        "export function mk(): i32 {\n  const p = pt(1.5, 2.5)\n  return if p.x > 1.0 { 1 } else { 0 }\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -782,8 +782,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: i32, y: i32 }\n' +
         "const c: Ct = { x: 1, y: 2 }\nprint(mk() + c.y)\n",
-      "lib.vl": "function pt(x: i32, y: i32): { x: i32, y: i32 } { { x, y } }\n" +
-        "export function mk(): i32 { pt(1, 2).y }\n",
+      "lib.vl": "function pt(x: i32, y: i32): { x: i32, y: i32 } { return { x, y } }\n" +
+        "export function mk(): i32 { return pt(1, 2).y }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -792,7 +792,7 @@ const CASES: Case[] = [
     name: "a built literal G delivers to a record stored apart from an outside one declines",
     graph: {
       "main.vl": BUILT_MAIN,
-      "lib.vl": "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nexport function jj(): void {\n" +
+      "lib.vl": "type J = { f: f64 }\nfunction mk() { return { f: 4 } }\nexport function jj(): void {\n" +
         "  const xj: J | string = mk()\n  const kk = mk()\n  if xj is J { print(xj.f) }\n" +
         "  print([kk][0].f)\n}\n",
     },
@@ -805,7 +805,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { indexOf } from "std:array"\nimport { at } from "./lib"\n' +
         "print(at() + [1, 2].indexOf(2))\n",
-      "lib.vl": "export function at(): i32 {\n  const xs: i32[] = [4, 5]\n  xs.indexOf(5)\n}\n",
+      "lib.vl": "export function at(): i32 {\n  const xs: i32[] = [4, 5]\n  return xs.indexOf(5)\n}\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -816,8 +816,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { indexOf } from "std:array"\nimport { at } from "./lib"\n' +
         "print(at() + [1, 2].indexOf(2))\n",
-      "lib.vl": "type W = { s: string }\nfunction indexOf(self: W, c: string): i32 { 1 }\n" +
-        'export function at(): i32 {\n  const w: W = { s: "ab" }\n  w.indexOf("b")\n}\n',
+      "lib.vl": "type W = { s: string }\nfunction indexOf(self: W, c: string): i32 { return 1 }\n" +
+        'export function at(): i32 {\n  const w: W = { s: "ab" }\n  return w.indexOf("b")\n}\n',
     },
     target: "lib.vl",
     want: "served",
@@ -826,7 +826,7 @@ const CASES: Case[] = [
     name: "a built literal G delivers only at an outside record's storage is served",
     graph: {
       "main.vl": BUILT_MAIN,
-      "lib.vl": "type J = { f: i32 }\nfunction mk() { { f: 4 } }\nexport function jj(): void {\n" +
+      "lib.vl": "type J = { f: i32 }\nfunction mk() { return { f: 4 } }\nexport function jj(): void {\n" +
         "  const xj: J | string = mk()\n  const kk = mk()\n  if xj is J { print(xj.f) }\n" +
         "  print([kk][0].f)\n}\n",
     },
@@ -839,7 +839,7 @@ const CASES: Case[] = [
       "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: f64, y: i32 }\n' +
         "const c: Ct = { x: 1.5, y: 2 }\nprint(mk() + c.y)\n",
       "lib.vl": "type Pt = { x: i32, y: i32 }\nexport function mk(): i32 {\n" +
-        "  const xs: Pt[] = []\n  xs.push({ x: 1, y: 2 })\n  xs[0].y\n}\n",
+        "  const xs: Pt[] = []\n  xs.push({ x: 1, y: 2 })\n  return xs[0].y\n}\n",
     },
     target: "lib.vl",
     want: "served",
@@ -847,9 +847,9 @@ const CASES: Case[] = [
   {
     name: "a self-function outside G whose name G reads only as a field is served",
     graph: {
-      "main.vl": 'import { Gr, at } from "./lib"\nfunction next(self: Gr): i32 { 0 }\n' +
+      "main.vl": 'import { Gr, at } from "./lib"\nfunction next(self: Gr): i32 { return 0 }\n' +
         "const g: Gr = { next: [4] }\nprint(at(g, 0) + g.next())\n",
-      "lib.vl": "export type Gr = { next: i32[] }\nexport function at(g: Gr, i: i32): i32 { g.next[i] }\n",
+      "lib.vl": "export type Gr = { next: i32[] }\nexport function at(g: Gr, i: i32): i32 { return g.next[i] }\n",
     },
     target: "lib.vl",
     want: "served",
@@ -857,9 +857,9 @@ const CASES: Case[] = [
   {
     name: "a self-function outside G that G calls declines",
     graph: {
-      "main.vl": 'import { Gr, at } from "./lib"\nfunction zzn(self: Gr): i32 { 1 }\n' +
+      "main.vl": 'import { Gr, at } from "./lib"\nfunction zzn(self: Gr): i32 { return 1 }\n' +
         "const g: Gr = { n: 4 }\nprint(at(g))\n",
-      "lib.vl": "export type Gr = { n: i32 }\nexport function at(g: Gr): i32 { g.zzn() }\n",
+      "lib.vl": "export type Gr = { n: i32 }\nexport function at(g: Gr): i32 { return g.zzn() }\n",
     },
     target: "lib.vl",
     want: "ambient",
@@ -880,8 +880,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
       "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 {\n' +
-        "  const s: string = x\n  f(x) * 2\n}\n",
-      "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
+        "  const s: string = x\n  return f(x) * 2\n}\n",
+      "lib.vl": "export function f(x: i32): i32 { return x + 1 }\n",
     },
     target: "mid.vl",
     want: "served",
@@ -890,8 +890,8 @@ const CASES: Case[] = [
     name: "an error in an imported body is served to every target whose G holds it",
     graph: {
       "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
-      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
-      "lib.vl": "export function f(x: i32): i32 {\n  const s: string = x\n  x + 1\n}\n",
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { return f(x) * 2 }\n',
+      "lib.vl": "export function f(x: i32): i32 {\n  const s: string = x\n  return x + 1\n}\n",
     },
     target: "mid.vl",
     want: "served",
@@ -900,8 +900,8 @@ const CASES: Case[] = [
     name: "an error that changes an exported type is served with the error",
     graph: {
       "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
-      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
-      "lib.vl": 'export function f(x: i32) { x * "a" }\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { return f(x) * 2 }\n',
+      "lib.vl": 'export function f(x: i32) { return x * "a" }\n',
     },
     target: "mid.vl",
     want: "served",
@@ -910,8 +910,8 @@ const CASES: Case[] = [
     name: "an unknown type name an importer's sibling might declare is not banked",
     graph: {
       "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
-      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
-      "lib.vl": "export function f(x: i32): Strng { x + 1 }\n",
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { return f(x) * 2 }\n',
+      "lib.vl": "export function f(x: i32): Strng { return x + 1 }\n",
     },
     target: "mid.vl",
     want: "dirty",
@@ -920,8 +920,8 @@ const CASES: Case[] = [
     name: "an error outside G is not the target's and is served without it",
     graph: {
       "main.vl": 'import { g } from "./mid"\nconst s: string = g(1)\nprint(s)\n',
-      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
-      "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { return f(x) * 2 }\n',
+      "lib.vl": "export function f(x: i32): i32 { return x + 1 }\n",
     },
     target: "mid.vl",
     want: "served",
@@ -930,7 +930,7 @@ const CASES: Case[] = [
     name: "a redundant annotation in G beside an error outside it is served with its hint",
     graph: {
       "main.vl": 'import { g } from "./mid"\nconst s: string = g(1)\nprint(s)\n',
-      "mid.vl": "export function g(x: i32): i32 {\n  const k: i32 = 2\n  x * k\n}\n",
+      "mid.vl": "export function g(x: i32): i32 {\n  const k: i32 = 2\n  return x * k\n}\n",
     },
     target: "mid.vl",
     want: "served",
@@ -940,8 +940,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { dbl } from "./lib"\nimport { m } from "./mid"\n' +
         'print(dbl("s"))\nprint(m())\n',
-      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { dbl("t") }\n',
-      "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
+      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { return dbl("t") }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { return v * 2 }\n",
     },
     target: "mid.vl",
     want: "served",
@@ -951,7 +951,7 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { z } from "./a"\nimport { g } from "./mid"\nprint(z + g())\n',
       "a.vl": "type U = Set<string> | {[string]: boolean}\nexport const z = 1\n",
-      "mid.vl": "type U = Set<string> | {[string]: boolean}\nexport function g(): i32 { 1 }\n",
+      "mid.vl": "type U = Set<string> | {[string]: boolean}\nexport function g(): i32 { return 1 }\n",
     },
     target: "mid.vl",
     want: "dirty",
@@ -962,30 +962,28 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { g } from "./mid"\nconst s: string = g()\nprint(s)\n',
       "mid.vl": "type B = { r: i32 | null }\nconst q = { r: 7 }\nconst d: B | string = q\n" +
-        "export function g(): i32 { q.r ?? 0 }\n",
+        "export function g(): i32 { return q.r ?? 0 }\n",
     },
     target: "mid.vl",
     want: "dirty",
   },
   {
-    name: "a deep-is site in a clean G beside an error outside it declines the target",
+    name: "a deep-is site in a clean G beside an error outside it is served: the rewrite's pass adds nothing",
     graph: {
       "main.vl": 'import { d } from "./mid"\nconst s: string = d(null)\nprint(s)\n',
       "mid.vl": "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
-        "export function d(r: Json): i32 {\n  if r is string[] {\n    const n = r[0].length\n" +
-        "    r = null\n    return n\n  }\n  0\n}\n",
+        "export function d(r: Json): i32 {\n  if !(r is string[]) { return 0 }\n  return r.length\n}\n",
     },
     target: "mid.vl",
-    want: "dirty",
-    mask: NO_OUTSIDE,
+    want: "served",
   },
   {
     name: "a warning-only target is served with its rows",
     graph: {
       "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
       "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 {\n' +
-        "  const k: i32 = 2\n  const u = 3\n  f(x) * k\n}\n",
-      "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
+        "  const k: i32 = 2\n  const u = 3\n  return f(x) * k\n}\n",
+      "lib.vl": "export function f(x: i32): i32 { return x + 1 }\n",
     },
     target: "mid.vl",
     want: "served",
@@ -995,8 +993,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { dbl } from "./lib"\nimport { m } from "./mid"\n' +
         'print(dbl("s"))\nprint(m())\n',
-      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { dbl(1) }\n',
-      "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
+      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { return dbl(1) }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { return v * 2 }\n",
     },
     target: "mid.vl",
     want: "served",
@@ -1005,7 +1003,7 @@ const CASES: Case[] = [
     name: "an error in G that renders a union by an outside declaration's name is not banked",
     graph: {
       "main.vl": 'import { g } from "./mid"\ntype U = "a" | "b"\nconst u: U = "a"\nprint(g())\n',
-      "mid.vl": 'export function g(): i32 {\n  const v: "a" | "b" = "a"\n  const t: i32 = v\n  0\n}\n',
+      "mid.vl": 'export function g(): i32 {\n  const v: "a" | "b" = "a"\n  const t: i32 = v\n  return 0\n}\n',
     },
     target: "mid.vl",
     want: "ambient",
@@ -1015,7 +1013,7 @@ const CASES: Case[] = [
     name: "an error in G whose message names no outside type is banked beside one",
     graph: {
       "main.vl": 'import { g } from "./mid"\ntype U = "a" | "b"\nconst u: U = "a"\nprint(g())\n',
-      "mid.vl": 'export function g(): i32 {\n  const t: i32 = "s"\n  0\n}\n',
+      "mid.vl": 'export function g(): i32 {\n  const t: i32 = "s"\n  return 0\n}\n',
     },
     target: "mid.vl",
     want: "served",
@@ -1025,9 +1023,9 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { w } from "./mid"\nimport { m } from "./mid2"\n' +
         'print(w("s"))\nprint(m())\n',
-      "mid2.vl": 'import { w } from "./mid"\nexport function m(): i32 { w(1) }\n',
-      "mid.vl": 'import { dbl } from "./lib"\nexport function w<T>(v: T): i32 { dbl(v) }\n',
-      "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
+      "mid2.vl": 'import { w } from "./mid"\nexport function m(): i32 { return w(1) }\n',
+      "mid.vl": 'import { dbl } from "./lib"\nexport function w<T>(v: T): i32 { return dbl(v) }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { return v * 2 }\n",
     },
     target: "mid2.vl",
     want: "served",
@@ -1037,8 +1035,8 @@ const CASES: Case[] = [
     graph: {
       "main.vl": 'import { dbl } from "./lib"\nimport { m } from "./mid"\n' +
         'print(dbl("s"))\nprint(m())\n',
-      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { dbl(1) }\n',
-      "lib.vl": "export function dbl<T>(v: T): i32 { v.length }\n",
+      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { return dbl(1) }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { return v.length }\n",
     },
     target: "mid.vl",
     want: "served",
@@ -1047,7 +1045,7 @@ const CASES: Case[] = [
     name: "a fresh record G builds is delivered into a wider type outside G",
     graph: {
       "main.vl": 'import { mk } from "./lib"\nconst ys: { f: f64 } = mk()\nprint(ys.f / 8)\n',
-      "lib.vl": "export function mk() { { f: 1 } }\n",
+      "lib.vl": "export function mk() { return { f: 1 } }\n",
     },
     target: "lib.vl",
     want: "fresh",
@@ -1088,7 +1086,7 @@ Deno.test({
   name: "check-within: an import-free check after a served one is its own",
   ignore: !ENABLED,
   fn() {
-    const g: Graph = { "main.vl": TWIN_MAIN("i32"), "lib.vl": TWIN_LIB("p.x") };
+    const g: Graph = { "main.vl": TWIN_MAIN("i32"), "lib.vl": TWIN_LIB("return p.x") };
     const sh = fresh();
     sh.wiArm(1, 0);
     for (const f of [...Object.keys(g), "leaf.vl"]) {
@@ -1102,7 +1100,7 @@ Deno.test({
     if (!sh.wiServed()) throw new Error("want lib.vl served, got its own check");
     sh.modReset();
     sh.srcReset();
-    push(sh.srcPush, "export function f(): i32 { const n: i32 = 1\n  n }\n");
+    push(sh.srcPush, "export function f(): i32 { const n: i32 = 1\n  return n }\n");
     sh.checkSrc();
     const got = `served=${sh.wiServed()} banked=${sh.wiBankedCount()}`;
     if (got !== "served=0 banked=0") {

@@ -79,6 +79,12 @@ first marker is a free header.
     @@VALUE@@     the expression under test, e.g. `orErr(5, false)`          [required]
     @@TYPE@@      its type spelling for the annotated face, e.g. `i32 | "err"`  [required]
     @@WANT@@      what the proof must print (the `Should print` contract)    [required]
+                  — the WHOLE output, each line compared exactly: `X` is one line, `X twice`
+                  two, `X then Y` the lines in order; a line the PRELUDE or SETUP prints belongs
+                  in it too
+    @@WANT_UNANNOTATED@@  what the un-annotated face prints instead, when the design gives that
+                  face another answer (an open value, D16047); every other face, and the
+                  positions whose un-annotated face still delivers into TYPE, read WANT
     @@PROOF@@     statements over the bound name `v`, printing WANT
     @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
                   `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination
@@ -92,7 +98,8 @@ first marker is a free header.
     @@CELL_<name>@@   a position of the template's own, graded in both faces after the built-in
                   ones: a whole program (after PRELUDE) with `__V__` the value, `__TY__` its type,
                   and `__A__` / `__LA__` the annotation `: TYPE` / `: TYPE[]` in the annotated face
-                  and nothing in the other; a leading `// want: X` overrides WANT for it, and
+                  and nothing in the other; a leading `// want: X` overrides WANT for it (one line
+                  per cell: a second is an error, so write `// want: A then B`), and
                   `// owed-annotated: X` grades a check refusal holding X in the annotated face
                   as OWED, a refusal the design owes, outside the graded count; `// owed: X`
                   does so in both faces

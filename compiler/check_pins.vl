@@ -30,6 +30,7 @@ import {
   arenaReplaceNode,
   arenaSetNode,
   declNameTokOf,
+  fnDeclNameAt,
   hasNamedArgs,
   i32ToStr,
   mkTypeRef,
@@ -42,6 +43,7 @@ import {
   ufcsModOfNode,
 } from "./ast"
 import { expInfPinLets } from "./check_state"
+import { lamRetApply, lamRetReset } from "./check_fn_decl"
 import { pinHint, pinHintDrop, pinHintReport } from "./check_pin_hints"
 import { nodeStartTok } from "./fmt_util"
 import { i32ListHas } from "./listutil"
@@ -50,6 +52,9 @@ import { strContains } from "./strutil"
 import { checkRestart, fvaBuiltReset } from "./check_core_state"
 import { ovUnpinnedReport, recAdForcedReport } from "./check_emit_queries"
 import { checkProgramPass } from "./check_program"
+import { annotateTyArgLambdas } from "./check_generic_args"
+import { intrinsicValuesWrap } from "./check_intrinsic_values"
+import { hoistMatchScrutinees } from "./check_match_hoist"
 import {
   callBindAdoptReps,
   recArmLitsAdopt,
@@ -69,6 +74,7 @@ import { pgrRefusals } from "./check_poly_growth"
 import { lbiSymTypes } from "./check_decl_scan"
 import { jwSiteNode, recordClosedHoles } from "./check_side_rows"
 import { jwExpand } from "./json_walk"
+import { crRows } from "./check_capture_rows"
 import { vrIndex, vrOuterReadsInert, vrReset, vrSetFollow } from "./value_reach"
 import {
   declIsExportedFn,
@@ -94,15 +100,11 @@ import { lbiSolve } from "./check_lbi_notes"
 import { recAdSolve } from "./check_rec_adopt"
 import { holeFieldBuildsFlush } from "./check_calls"
 import {
-  recAdLooseAt,
-  recAdOrigDecl,
+  recAdPass,
   recAdPassReset,
-  recAdPinDecl,
+  recAdProg,
   recAdRaising,
   recAdReset,
-  recAdSetLit,
-  recAdSetLitOk,
-  recAdSetLitTy,
 } from "./check_rec_adopt_rows"
 import { adoptLitAt } from "./check_fit_rules"
 import { recBindDeclOf } from "./check_record_origins"
@@ -139,7 +141,7 @@ import {
 // The re-checking solvers, in the order the driver runs them after the first walk: an uncalled
 // export's parameters (D3817), a wider record passed on (D3992), a declared record slot that takes
 // a wider record's own type, then a literal binding's type and a record's adopted width.
-type PinPhase = "expParam" | "width" | "slot" | "literal"
+type PinPhase = "lamRet" | "expParam" | "width" | "slot" | "literal"
 
 // Whether this check undid an adoption over a refusal, which may be outside the adopting module.
 export let pinAdoptUndid = false
@@ -155,7 +157,7 @@ let pinDeepIsOff = false
 // caller declines it and checks the whole graph when a site is recorded.
 export function pinDeepIsHold() {
   pinDeepIsHeld = true
-  0
+  return 0
 }
 
 // The checker's entry point; `initChecker()` must have run first. A literal binding whose uses
@@ -164,6 +166,11 @@ export function pinDeepIsHold() {
 // hole still open after it closes to its `i32` element.
 export function checkProgram(rootIx: i32) {
   parenNamesCollapse()
+  // The resolve-time lowering, once per program and before any table is sized, so every node
+  // it mints is checked (D1991) and a re-walk starts from the lowered tree.
+  intrinsicValuesWrap(rootIx)
+  hoistMatchScrutinees(rootIx)
+  annotateTyArgLambdas()
   // The last pass's kept functions and builds, and the arm-adoption queues, key by node index:
   // a program on a shared instance starts with none of the last program's.
   recBuildReset()
@@ -171,6 +178,7 @@ export function checkProgram(rootIx: i32) {
   recObjLitsSet([])
   recArmListLitsSet([])
   expInfReset()
+  lamRetReset()
   fnTagEtaReset()
   fvaBuiltReset()
   pinDeepIsRan = false
@@ -202,7 +210,7 @@ function parenNamesCollapse() {
     }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // `checkProgram` over a tree an earlier check of the same program already pinned, keeping
@@ -219,6 +227,7 @@ function checkProgramResumed(rootIx: i32) {
   checkProgramPass(rootIx)
   holeSlotLateRun()
   pinSolve()
+  pinRun("lamRet", rootIx)
   pinRun("expParam", rootIx)
   pinRun("width", rootIx)
   pinRun("slot", rootIx)
@@ -250,7 +259,7 @@ function litDefaultOf(p: i32): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   const n = nodeAt(d)
   if n is NumLit || n is StrLit || n is BoolLit || n is NullLit { return d }
-  -1
+  return -1
 }
 
 // Rewrites each named call to a declared function into its positional form where its names bind
@@ -306,7 +315,7 @@ function namedCallPositional(x: i32) {
   const none: string[] = []
   n.callArgs = supplied
   n.callArgNames = none
-  arenaNoteEdit(x)
+  return arenaNoteEdit(x)
 }
 
 // The last stage, once per check and only over a program the walk found no error in: a deep
@@ -316,7 +325,7 @@ function pinDeepIs(rootIx: i32) {
   if pinDeepIsRan || pinDeepIsOff || jwSiteNode.length == 0 { return 0 }
   if P.diags.length > 0 || T.diags.length > 0 { return 0 }
   pinDeepIsRan = true
-  const genTok = jwExpand(rootIx)
+  const genTok = jwExpand(rootIx, crRows.retCalls, crRows.retNames)
   if genTok < 0 { return 0 }
   checkRestart()
   fnTyFactsReset()
@@ -328,7 +337,8 @@ function pinDeepIs(rootIx: i32) {
 // The most re-checks a phase pays. A forwarding chain gains one link a width round; a literal
 // round settles a whole chain of `Map()` bindings at once (D14506).
 function pinBudget(p: PinPhase): i32 {
-  match p {
+  return match p {
+    "lamRet" => 2
     "expParam" => 1
     "width" => 8
     "slot" => 8
@@ -338,15 +348,18 @@ function pinBudget(p: PinPhase): i32 {
 
 // Applies phase `p`'s pending annotations; true when it wrote any, so a re-check is owed.
 function pinApply(p: PinPhase, rootIx: i32): boolean {
-  match p {
+  return match p {
+    "lamRet" => lamRetApply() > 0
     "expParam" => expParamInfer() > 0
     "width" => wsStep() > 0
     "slot" => slotApply(rootIx) > 0
     "literal" => {
       if !lbiPending() && !recAdPending() { return false }
-      lbiApplyPins()
+      // A round that writes no annotation leaves the re-check unchanged, so it is no progress.
+      const rec = recAdPending()
+      const wrote = lbiApplyPins()
       recAdApplyPins()
-      true
+      rec || wrote > 0
     }
   }
 }
@@ -356,24 +369,29 @@ function pinRun(p: PinPhase, rootIx: i32) {
   let round = 0
   while round < pinBudget(p) {
     const mark = recAdMark()
-    if !pinApply(p, rootIx) { return 0 }
+    if !pinApply(p, rootIx) {
+      // A literal pin no round can write is refused now, not after the budget's re-checks.
+      if p == "literal" && lbiPending() { pinUnsettled(p) }
+      return 0
+    }
     checkProgramAgain(rootIx)
     round = round + 1
     pinSettle(p, mark, rootIx)
   }
-  pinUnsettled(p)
+  return pinUnsettled(p)
 }
 
 // Refuses at the first pin a spent budget leaves pending, which would otherwise be dropped and
 // the program built at a type nothing settled (D14506).
 function pinUnsettled(p: PinPhase) {
-  match p {
+  return match p {
+    "lamRet" => 0
     "expParam" => 0
     "width" => 0
     "slot" => 0
     "literal" => {
       let d = -1
-      if recAdPinDecl.length > 0 { d = recAdPinDecl[0] }
+      if recAdPass.pinDecl.length > 0 { d = recAdPass.pinDecl[0] }
       else if lbiPinCand.length > 0 { d = lbiCands[lbiPinCand[0]] }
       if d < 0 || d >= P.nodes.length { return 0 }
       const n = nodeAt(d)
@@ -397,7 +415,8 @@ function pinUnsettled(p: PinPhase) {
 // literal's own type served, then every other one if refusals remain; one across a numeric width
 // stays, since its reads mean the adopted type (D3339).
 function pinSettle(p: PinPhase, mark: i32, rootIx: i32) {
-  match p {
+  return match p {
+    "lamRet" => 0
     "expParam" => 0
     "width" => 0
     "slot" => {
@@ -424,12 +443,12 @@ function pinSettle(p: PinPhase, mark: i32, rootIx: i32) {
 // refusal reads no adopted binding.
 function recAdBlamed(mark: i32): i32[] {
   const out: i32[] = []
-  for at in recAdLooseAt {
+  for at in recAdPass.looseAt {
     const n = out.length
     recAdBlameInto(at, mark, 6, out)
     if out.length == n { return [] }
   }
-  out
+  return out
 }
 
 // Adds to `out` each declaration adopted since `mark` that a binding read under `x` names.
@@ -440,8 +459,8 @@ function recAdBlameInto(x: i32, mark: i32, depth: i32, out: i32[]) {
     const d = recBindDeclOf(x)
     if d >= 0 && !i32ListHas(out, d) {
       let i = mark
-      while i < recAdOrigDecl.length {
-        if recAdOrigDecl[i] == d { out.push(d) }
+      while i < recAdProg.origDecl.length {
+        if recAdProg.origDecl[i] == d { out.push(d) }
         i = i + 1
       }
     }
@@ -449,7 +468,7 @@ function recAdBlameInto(x: i32, mark: i32, depth: i32, out: i32[]) {
   }
   if n is FuncDecl { return 0 }
   for c in nodeChildren(x) { recAdBlameInto(c, mark, depth - 1, out) }
-  0
+  return 0
 }
 
 // The solvers that read a finished walk.
@@ -460,11 +479,13 @@ function pinSolve() {
   recAdSolve()
   // Each literal a judged call built, where no other call builds it at another storage.
   let k = 0
-  while k < recAdSetLit.length {
-    if recAdSetLitOk[k] { adoptLitAt(recAdSetLit[k], recAdSetLitTy[k]) }
+  while k < recAdPass.setLit.length {
+    if recAdPass.setLitOk[k] {
+      adoptLitAt(recAdPass.setLit[k], recAdPass.setLitTy[k])
+    }
     k = k + 1
   }
-  0
+  return 0
 }
 
 // A fresh check of the program after a phase rewrote some declarations' annotations.
@@ -475,7 +496,7 @@ function checkProgramAgain(rootIx: i32) {
   recAdPassReset()
   checkProgramPass(rootIx)
   pinSolve()
-  0
+  return 0
 }
 
 // Raises solver `s`'s queued refusals, in queue order.
@@ -485,7 +506,7 @@ function pinRefRaise(s: PinSolver) {
     if pinRefSolver[i] == s { tErr(pinRefMsg[i], pinRefAt[i]) }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // What only the last walk may report, in phase order.
@@ -501,7 +522,7 @@ function pinReport() {
   pinRefRaise("expParam")
   pgrRaise()
   pinHintReport()
-  0
+  return 0
 }
 
 // Refuses each generic recursion that grows its type argument at every call (D2721).
@@ -514,7 +535,7 @@ function pgrRaise() {
     tErr(msgs[i], sites[i])
     i = i + 1
   }
-  0
+  return 0
 }
 
 // ── Exported entry functions nothing in the program calls (D3817) ───────────────────────────
@@ -531,12 +552,12 @@ let expInfEntryStd = false
 // the staged re-exports.
 export function expInfSetEntryStd(b: boolean) {
   expInfEntryStd = b
-  expReSet([], [])
+  return expReSet([], [])
 }
 
 // Stages the entry module's re-exports, after `expInfSetEntryStd` and before `checkProgram`.
 export function expInfSetReExports(targets: string[], publics: string[]) {
-  expReSet(targets, publics)
+  return expReSet(targets, publics)
 }
 
 // The entry module's exported functions no statement outside their own body names, among those
@@ -583,7 +604,7 @@ function expUncalledExports(): i32[] {
       }
     }
   }
-  out
+  return out
 }
 
 // Whether `expParamInfer` acts on export `f`: it is generic, or a parameter is un-annotated and
@@ -596,7 +617,7 @@ function expInfOwed(f: FuncDecl): boolean {
       if p.parType < 0 && !i32ListHas(expInfDone, px) { return true }
     }
   }
-  false
+  return false
 }
 
 // The exported function names `expNameReaders` tracks; a shadow list carries only these, so
@@ -630,7 +651,7 @@ function expNameReaders(): {[string]: i32} {
       }
     }
   }
-  out
+  return out
 }
 
 // Pushes the children of node `n` (at `ix`) walked under shadow list `sh`, each with the list it
@@ -688,7 +709,7 @@ function expShadowKids(
     stack.push(k)
     stackSh.push(inner)
   }
-  0
+  return 0
 }
 
 // Shadow list `sh` with the names a pattern of arm `i` of match `n` binds for its body.
@@ -706,13 +727,13 @@ function expArmShadow(n: MatchExpr, i: i32, sh: string): string {
     }
     p = p + 1
   }
-  out
+  return out
 }
 
 // Shadow list `sh` with `nm` added when it is a tracked export name.
 function expShAdd(sh: string, nm: string): string {
   if nm.length == 0 || (expShWanted[nm] ?? 0) != 1 { return sh }
-  sh + nm + "|"
+  return sh + nm + "|"
 }
 
 // The name statement `st` declares in its block, or "".
@@ -720,14 +741,7 @@ function expStmtDeclName(st: i32): string {
   if st < 0 || st >= P.nodes.length { return "" }
   const d = nodeAt(st)
   if d is LetDecl { return d.letName }
-  expFnDeclName(st)
-}
-
-// The name of function declaration `st`, or "" for any other statement.
-function expFnDeclName(st: i32): string {
-  const d = nodeAt(st)
-  if d is FuncDecl { return d.fnName }
-  ""
+  return fnDeclNameAt(st)
 }
 
 // Infers the un-annotated parameters of every uncalled entry export, annotating each that one
@@ -761,13 +775,13 @@ function expParamInfer(): i32 {
       }
     }
   }
-  made
+  return made
 }
 
 // Queues refusal `msg` at node `at` for the end of the check, once per node.
 function expInfRefuse(msg: string, at: i32) {
   if pinRefusedAt("expParam", at) { return 0 }
-  pinRefuse("expParam", msg, at)
+  return pinRefuse("expParam", msg, at)
 }
 
 // Each node's parent within body `b`.
@@ -785,7 +799,7 @@ function expParents(b: i32): {[i32]: i32} {
       }
     }
   }
-  up
+  return up
 }
 
 // The outermost parenthesis around `ix`, so its parent is the read's consumer.
@@ -929,7 +943,7 @@ function expInferParam(
   }
   expInfDone.push(px)
   expInfHintAdd(px, nm, tyToStrUser(pinTy[0]), pinUse[0])
-  true
+  return true
 }
 
 // Adds the pin read `at` of `nm` delivered whole to `ty` makes, when the delivery is one a
@@ -1012,7 +1026,7 @@ function expPinOf(
   if f.fnRet >= 0 && u == expTailValue(f.fnBody) {
     return expPinPush(ty, u, "the function's result", pinTy, pinAt, pinUse)
   }
-  0
+  return 0
 }
 
 // The one annotated `let` named `nm` in body `b`, outside nested functions, or -1 when there is
@@ -1037,7 +1051,7 @@ function expSoleLet(b: i32, nm: string): i32 {
     }
   }
   if count != 1 { return -1 }
-  found
+  return found
 }
 
 // Sorts the three pin columns by their use's position in the source, so a refusal quotes the
@@ -1060,7 +1074,7 @@ function expPinsBySource(pinTy: i32[], pinAt: i32[], pinUse: string[]) {
     }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // The name identifier `ix` reads, else "".
@@ -1068,7 +1082,7 @@ function expIdentName(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = nodeAt(ix)
   if n is Ident { return n.identName }
-  ""
+  return ""
 }
 
 function expPinPush(
@@ -1082,7 +1096,7 @@ function expPinPush(
   pinTy.push(t)
   pinAt.push(at)
   pinUse.push(use)
-  0
+  return 0
 }
 
 // The last statement of block `b`, the body's value when it is an expression; -1 otherwise.
@@ -1093,7 +1107,7 @@ function expTailValue(b: i32): i32 {
     if n.blkStmts.length == 0 { return -1 }
     return n.blkStmts[n.blkStmts.length - 1]
   }
-  -1
+  return -1
 }
 
 // Whether `name` is a declared, non-generic function whose parameter at `u`'s position among
@@ -1111,14 +1125,14 @@ function expDeclaredConcrete(name: string, args: i32[], u: i32): boolean {
     const p = nodeAt(f.fnParams[k])
     if p is Param { return p.parType >= 0 }
   }
-  false
+  return false
 }
 
 // The 1-based line node `ix` starts on, or 0.
 function expLineOf(ix: i32): i32 {
   const tk = nodeStartTok(ix)
   if tk < 0 || tk >= P.toks.length { return 0 }
-  P.toks[tk].line
+  return P.toks[tk].line
 }
 
 // Queues the hint for parameter `px`: inferred as `ty` from `use`, over the parameter's name, where
@@ -1145,5 +1159,5 @@ function expInfReset() {
   expInfDone = []
   expInfPinLets = []
   pinHintDrop("expParam")
-  0
+  return 0
 }

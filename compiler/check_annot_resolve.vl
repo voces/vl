@@ -3,7 +3,11 @@
 // Built on the relation core; it reads annotations and answers type indices, and does not
 // check expressions.
 
+import { rowParamIsSlot, rowParamRecordOf } from "./check_row_param"
+import { wsSlotSpelling } from "./check_width"
 import { identTyOf } from "./check_nar_store"
+import { strListIndexOf } from "./listutil"
+import { mkUnionTy } from "./check_union_mint"
 import {
   FieldDef,
   ForIn,
@@ -42,6 +46,7 @@ import {
   tsLeaf,
   tsMkKids,
   tsToName,
+  valueIfAdd,
 } from "./ast"
 import {
   annotCollapsed,
@@ -108,47 +113,66 @@ import {
   unkTyPartSet,
 } from "./check_messages"
 import {
+  TT_COVERED,
+  TT_NONE,
+  TT_PARTLY,
   annotResolve,
   assignable,
   joinVariantTys,
   mintedAnnTy,
+  recContainedIn,
   resolveCallTyArgs,
   spellsNever,
   tErr,
   tErrUnsupported,
   tsToTy,
+  tyTestMayFit,
+  tyTestMemberFit,
+  tyTestMembers,
   voidStoreCheck,
   voidStoreRefuse,
 } from "./check_relate_core"
 import { identConstDeclOf } from "./check_scopes"
-import { joinClashMsgSet, mkTyVarOwned } from "./check_subst"
+import { joinClashMsgSet, mkTyVarSlot } from "./check_subst"
 import { fvaFnMayDiffer } from "./check_ty_relate"
 import { flatScalarWidth, mapKeyTySupported } from "./check_ty_rep"
-import { flatFieldTyOf } from "./check_type_shape"
+import { flatFieldTyOf, recNeverFits } from "./check_type_shape"
 import {
   T,
   TY_BOOL,
   TY_ERR,
   TY_NEVER,
+  TY_NULL,
   TyArray,
   TyFunc,
+  TyLit,
   TyMap,
+  TyNullable,
+  TyObj,
   TyUnion,
   cUserTypes,
   cUserTypesVer,
   mkArrayTy,
   mkMapTy,
   mkNullableTy,
+  tvSlotSet,
   tyAt,
+  tyElemOf,
   tyEq,
+  tyKeyOf,
+  tyKeyOpen,
   tySame,
   tyToStr,
   tyToStrUser,
   tyToTs,
+  tyValOf,
+  tyValOpen,
+  tyVarOwner,
 } from "./check_types"
 import { identDeclOf, sidNoteNodeName } from "./symbols"
 import {
   arrElemValueTy,
+  flattenVariantsInto,
   isVoidTy,
   litPeekBaseTy,
   luAnyTyVar,
@@ -184,7 +208,7 @@ export function resolveHoleLinks() {
       i = i + 1
     }
   }
-  0
+  return 0
 }
 
 // The one wording for a key the map rep cannot hash (`mapKeyTySupported` has exactly three
@@ -192,7 +216,7 @@ export function resolveHoleLinks() {
 // (`checkInferredMapKey`) raise it, so the annotated and inferred spellings of one
 // program reject in the same channel with the same words.
 export function mapKeyUnsupportedErr(keyText: string, ctor: string, at: i32) {
-  tErrUnsupported(mapKeyUnsupportedMsg(keyText, ctor), at)
+  return tErrUnsupported(mapKeyUnsupportedMsg(keyText, ctor), at)
 }
 
 export function resolveFlatLayouts(stmts: i32[]) {
@@ -264,7 +288,7 @@ export function resolveFlatLayouts(stmts: i32[]) {
     }
     d3 = d3 + 1
   }
-  0
+  return 0
 }
 
 // Validate one flat declaration's fields and stage their widths. Every rejected field marks
@@ -332,7 +356,7 @@ function flatStageDecl(d: i32, sd: TypeDecl) {
   }
   flFCount[d] = flFNames.length - flFStart[d]
   if bad { flSizes[d] = FL_INVALID }
-  0
+  return 0
 }
 
 // The `N.size`/`N.field` interception at the top of `checkMemberNode`, the only place the
@@ -386,7 +410,7 @@ export function flatMemberFold(n: Member, ix: i32) {
     arenaReplaceNode(ix, mkNum(i32ToStr(v), n.pos))
     return 1
   }
-  0
+  return 0
 }
 
 // The layout constant `prop` of the `flat` type `ty`, for the monomorphizer's per-instance fold:
@@ -403,7 +427,7 @@ export function flatConstOfTyProp(ty: i32, prop: string): i32 {
     }
     d = d + 1
   }
-  -1
+  return -1
 }
 
 // The refusal a call owes for layout constant `tvProp` (`T.member`, after `MC_LAYOUT_MARK`) when
@@ -429,7 +453,7 @@ export function flatLayoutPinMsg(recv: i32, tvProp: string): string {
     }
     d = d + 1
   }
-  "`"
+  return "`"
     + tv
     + "` is bound to `"
     + tyToStr(recv)
@@ -464,14 +488,29 @@ export function collCtorTyArgsTy(ctor: string, ix: i32) {
     voidStoreRefuse(
       "Map<" + tyToStrUser(tys[0]) + ", " + tyToStrUser(tys[1]) + ">",
       ix,
+      "",
     )
     return TY_ERR
   }
-  mkMapTy(tys[0], tys[1], 0)
+  return mkMapTy(tys[0], tys[1], 0)
+}
+
+// Binds slot `(binder, idx)`, named `nm`, by its record when it is a row slot, printed as it: a
+// declared record by its name, an inline one by the spelling its rewrite row keeps.
+export function rowSlotBind(binder: i32, idx: i32, nm: string) {
+  if !rowParamIsSlot(nm) { return 0 }
+  const r = rowParamRecordOf(nm)
+  const sp = if r == "" { wsSlotSpelling(nm) } else { "" }
+  if r == "" && sp == "" { return 0 }
+  const b = if r != "" { cUserTypes[r] ?? -1 } else { resolveAnnot(sp, []) }
+  if b >= 0 && b < T.tys.length && tyAt(b) is TyObj {
+    tvSlotSet(binder, idx, b, true)
+  }
+  return 0
 }
 
 export function resolveAnnot(name: string, typarams: string[]) {
-  resolveAnnotTs(name, typarams, -1, "")
+  return resolveAnnotTs(name, typarams, -1, "", -1)
 }
 
 // `resolveAnnot`, with the annotation's spelling root threaded to the three legs that
@@ -483,6 +522,7 @@ function resolveAnnotTs(
   typarams: string[],
   root: i32,
   owner: string,
+  binder: i32,
 ) {
   if typarams.length == 0 {
     if tpEnvNames.length == 0 {
@@ -525,7 +565,10 @@ function resolveAnnotTs(
   let i = 0
   while i < typarams.length {
     tpEnvNames.push(typarams[i])
-    tpEnvTys.push(mkTyVarOwned(typarams[i], owner))
+    const tv = mkTyVarSlot("param", binder, i, typarams[i])
+    rowSlotBind(binder, i, typarams[i])
+    tyVarOwner[tv] = owner
+    tpEnvTys.push(tv)
     i = i + 1
   }
   const r = annotResolve(name, root)
@@ -535,7 +578,7 @@ function resolveAnnotTs(
     tpEnvTys.pop()
     j = j + 1
   }
-  r
+  return r
 }
 
 // A function's declared return type, where `never` resolves as it does in a function type's
@@ -545,9 +588,10 @@ export function resolveRetAnnotAt(
   typarams: string[],
   at: i32,
   owner: string,
+  binder: i32,
 ) {
   if spellsNever(name) { return TY_NEVER }
-  resolveAnnotAt(name, typarams, at, owner)
+  return resolveAnnotAt(name, typarams, at, owner, binder)
 }
 
 // `resolveAnnot` with resolution diagnostics anchored at node `at` (the
@@ -557,12 +601,13 @@ export function resolveAnnotAt(
   typarams: string[],
   at: i32,
   owner: string,
+  binder: i32,
 ) {
   const minted = mintedAnnTy(at)
   if minted >= 0 { return minted }
   const saved = annotDiagAt
   annotDiagAtSet(at)
-  const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
+  const r = resolveAnnotTs(name, typarams, annTsOf(at), owner, binder)
   annotDiagAtSet(saved)
   if name.length > 0 && name.slice(0, 1) == "{" { recAnnObjs.push(r) }
   // A container of vectors named by an annotation alone (a param, a field of a struct only
@@ -572,12 +617,12 @@ export function resolveAnnotAt(
     voidStoreCheck(at, r)
     noteNestCstr(r, at)
   }
-  r
+  return r
 }
 
-// A v128 vector lives in locals, parameters, returns and globals, and boxed as a nullable or
-// union member; a container holding one bare — an array element, a struct field, a map key or
-// value — has no lowering yet, so the first node typed with one is refused here, before emission.
+// A v128 vector lives in locals, parameters, returns, globals and struct fields, and boxed as a
+// nullable or union member; an array element or a map key or value holding one bare has no
+// lowering yet, so the first node typed with one is refused here, before emission.
 export function v128NestCheck(ix: i32, t: i32) {
   if ix < 0 || t < 0 { return 0 }
   if !tyNestsV128(t, 8) { return 0 }
@@ -588,7 +633,7 @@ export function v128NestCheck(ix: i32, t: i32) {
   }
   v128NestReported.push(t)
   tErrUnsupported(v128NestMsg(t), ix)
-  0
+  return 0
 }
 
 // Rewrites each arm pattern naming a constant into a read of it, and refuses every other bare
@@ -621,7 +666,7 @@ export function resolveMatchConstPats(n: MatchExpr, hole: boolean) {
     }
     i = i + 1
   }
-  0
+  return 0
 }
 
 // The union of the members' element types, each read at its value type, kept apart rather
@@ -632,7 +677,7 @@ export function luElemTy(ms: i32[]): i32 {
   while i < ms.length {
     const a = tyAt(ms[i])
     if a is TyArray {
-      const v = arrElemValueTy(a.aElem)
+      const v = arrElemValueTy(tyElemOf(a))
       if v < 0 { return -1 }
       if e < 0 { e = v } else { e = joinVariantTys(e, v) }
     }
@@ -642,7 +687,7 @@ export function luElemTy(ms: i32[]): i32 {
     joinClashMsgSet("")
     return -1
   }
-  e
+  return e
 }
 
 // The union of the map members' value types, kept apart as `luElemTy` keeps elements; -1 when
@@ -652,14 +697,14 @@ export function lmValTy(ms: i32[]): i32 {
   for m in ms {
     const a = tyAt(m)
     if a is TyMap {
-      if e < 0 { e = a.mVal } else { e = joinVariantTys(e, a.mVal) }
+      if e < 0 { e = tyValOf(a) } else { e = joinVariantTys(e, tyValOf(a)) }
     }
   }
   if e == TY_ERR {
     joinClashMsgSet("")
     return -1
   }
-  e
+  return e
 }
 
 // The written union of the map members' value lists, resolved from their trees; -1 when a list
@@ -669,7 +714,7 @@ function lmValsTs(ms: i32[]): i32 {
   for m in ms {
     const a = tyAt(m)
     if !(a is TyMap) { return -1 }
-    const k = luTs(mkArrayTy(a.mVal))
+    const k = luTs(mkArrayTy(tyValOf(a)))
     if k < 0 { return -1 }
     kids.push(k)
   }
@@ -678,7 +723,7 @@ function lmValsTs(ms: i32[]): i32 {
   const mark = T.diags.length
   const u = tsToTy(root)
   while T.diags.length > mark { T.diags.pop() }
-  u
+  return u
 }
 
 // The union of the map members' `.values()` lists, each the member's own value list, as an
@@ -690,7 +735,7 @@ export function lmValsTy(ms: i32[]): i32 {
   for m in ms {
     const a = tyAt(m)
     if a is TyMap {
-      const l = mkArrayTy(a.mVal)
+      const l = mkArrayTy(tyValOf(a))
       if e < 0 { e = l } else { e = joinVariantTys(e, l) }
     }
   }
@@ -698,7 +743,7 @@ export function lmValsTy(ms: i32[]): i32 {
     joinClashMsgSet("")
     return -1
   }
-  e
+  return e
 }
 
 // One arm's read over map `recv`: kind 0 its `.length`, 1 the index `recv[args[0]]`, 2 the
@@ -731,7 +776,7 @@ function lmArm(
   }
   const mt = tyAt(mem)
   if mt is TyMap && (kind == 1 || prop == "get") {
-    const own = mkNullableTy(mt.mVal)
+    const own = mkNullableTy(tyValOf(mt))
     if luTs(own) >= 0 {
       const otmp = "$lo" + i32ToStr(site)
       const od = luDecl("const", otmp, own, rd, site, pos)
@@ -743,7 +788,7 @@ function lmArm(
   const td = luDecl("const", tmp, res, rd, site, pos)
   stmts.push(td)
   stmts.push(luRef(td, site, pos))
-  luAt(mkBlock(stmts, pos), site)
+  return luAt(mkBlock(stmts, pos), site)
 }
 
 // The `is` chain over map `recv`'s members from `k` on, as `luChain`, each arm an `lmArm`.
@@ -769,7 +814,7 @@ export function lmChain(
     return luAt(mkIf(test, arm, luAt(mkBlock(tl, pos), site), pos), site)
   }
   const rest = lmChain(ms, k + 1, recv, kind, prop, args, res, site, pos)
-  luAt(mkIf(test, arm, rest, pos), site)
+  return luAt(mkIf(test, arm, rest, pos), site)
 }
 
 // The spelling tree the rewrite names `ty` by in an `is` test or an annotation, or -1 when the
@@ -779,7 +824,7 @@ export function luTs(ty: i32): i32 {
   const root = tyToTs(ty)
   if root < 0 { return -1 }
   if luTsSpellsAs(root, ty) || luUnionTsByMember(ty) { return root }
-  -1
+  return -1
 }
 
 // The spelling tree of `ty` when it resolves back to `ty` itself, or -1.
@@ -787,7 +832,7 @@ export function tyTsExact(ty: i32): i32 {
   if ty < 0 { return -1 }
   const root = tyToTs(ty)
   if root < 0 || !luTsSpellsAs(root, ty) { return -1 }
-  root
+  return root
 }
 
 // Whether tree `root` resolves to `ty`. A failed resolution's diagnostics are dropped, since the
@@ -796,7 +841,7 @@ function luTsSpellsAs(root: i32, ty: i32): boolean {
   const mark = T.diags.length
   const back = tsToTy(root)
   while T.diags.length > mark { T.diags.pop() }
-  back >= 0 && (tySame(back, ty) || tyEq(back, ty))
+  return back >= 0 && (tySame(back, ty) || tyEq(back, ty))
 }
 
 // Whether `ty` is a union naming a type parameter each of whose members has a tree.
@@ -809,7 +854,7 @@ function luUnionTsByMember(ty: i32): boolean {
     }
     return true
   }
-  false
+  return false
 }
 
 // Whether the union `u` and each of its members `ms` have a tree. The receiver's `const` is
@@ -820,7 +865,7 @@ export function luAllSpell(u: i32, ms: i32[]): boolean {
   for m in ms {
     if luTs(m) < 0 { return false }
   }
-  true
+  return true
 }
 
 // `recv is <ms[k]>`, the test node carrying member `ms[k]`'s tree and its type.
@@ -830,7 +875,215 @@ function luIsTest(recv: i32, ms: i32[], k: i32, site: i32, pos: i32): i32 {
   const test = luAt(mkIsExpr(luRef(recv, site, pos), nm, pos), site)
   if root >= 0 { setAnnTs(test, root) }
   luIsTyPut(test, ms[k])
-  test
+  return test
+}
+
+// The minted check for `x is chk` over union `objTy` where one record member `arm` may hold a
+// value fitting `chk` by its fields' values and no other member ever does:
+// `{ const $rf = x; if $rf is arm { const $ra: arm = $rf; $ra is chk } else { false } }`, the
+// arm's tag and then its fields (D4089). -1 for any other test.
+export function recPartFitBuild(
+  isObj: i32,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  pos: i32,
+): i32 {
+  const arm = recPartFitArm(objTy, chkTy)
+  if arm < 0 || luTs(arm) < 0 || luTs(chkTy) < 0 || luTs(objTy) < 0 {
+    return -1
+  }
+  const site = ix
+  const recv = luDecl("const", "$rf" + i32ToStr(ix), objTy, isObj, site, pos)
+  const isArm = luTyTest(luRef(recv, site, pos), arm, site, pos)
+  const own = luDecl(
+    "const",
+    "$ra" + i32ToStr(ix),
+    arm,
+    luRef(recv, site, pos),
+    site,
+    pos,
+  )
+  const isChk = luTyTest(luRef(own, site, pos), chkTy, site, pos)
+  const thenStmts: i32[] = []
+  thenStmts.push(own)
+  thenStmts.push(isChk)
+  const elseStmts: i32[] = []
+  elseStmts.push(luAt(mkBool(0, pos), site))
+  const pick = luAt(
+    mkIf(
+      isArm,
+      luAt(mkBlock(thenStmts, pos), site),
+      luAt(mkBlock(elseStmts, pos), site),
+      pos,
+    ),
+    site,
+  )
+  valueIfAdd(pick)
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(pick)
+  return luValueNode(site, stmts, pos)
+}
+
+// The one record member of union `objTy` record `chk` partly fits, by its fields' values,
+// where every other member is `null` or a record that never fits; else -1.
+export function recPartFitArm(objTy: i32, chkTy: i32): i32 {
+  if objTy < 0 || chkTy < 0 || tyHasTyVar(objTy) || tyHasTyVar(chkTy) {
+    return -1
+  }
+  const ct = tyAt(chkTy)
+  const ot = tyAt(objTy)
+  if !(ct is TyObj) || !(ot is TyUnion || ot is TyNullable) { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(objTy, ms)
+  let arm = -1
+  for m in ms {
+    const f = tyTestMemberFit(m, chkTy)
+    const mo = tyAt(m)
+    // A `null` member never fits a record.
+    if m == TY_NULL { continue }
+    if !(mo is TyObj) { return -1 }
+    if f == TT_PARTLY && recContainedIn(chkTy, m) {
+      if arm >= 0 { return -1 }
+      arm = m
+    } else if f != TT_NONE || !recNeverFits(m, ct) {
+      return -1
+    }
+  }
+  return arm
+}
+
+// The minted check for `x is chk` over a record `objTy` of `chk`'s fields that `chk` narrows:
+// `{ const $rf = x; $rf.f is F && ... }` over each field whose every member `F` does not
+// cover, so a nested record's field recurses through its own check. -1 for any other test.
+export function recFieldFitBuild(
+  isObj: i32,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  pos: i32,
+): i32 {
+  if objTy < 0 || chkTy < 0 || tyHasTyVar(objTy) || tyHasTyVar(chkTy) {
+    return -1
+  }
+  const ot = tyAt(objTy)
+  const ct = tyAt(chkTy)
+  if !(ot is TyObj) || !(ct is TyObj) || luTs(objTy) < 0 { return -1 }
+  if !recContainedIn(chkTy, objTy) { return -1 }
+  const names: string[] = []
+  const tys: i32[] = []
+  let i = 0
+  while i < ct.objFieldNames.length {
+    const at = strListIndexOf(ot.objFieldNames, ct.objFieldNames[i])
+    if at < 0 { return -1 }
+    const fb = ct.objFieldTypes[i]
+    if !recFieldCovered(ot.objFieldTypes[at], fb) {
+      if luTs(fb) < 0 { return -1 }
+      names.push(ct.objFieldNames[i])
+      tys.push(fb)
+    }
+    i = i + 1
+  }
+  if names.length == 0 { return -1 }
+  const site = ix
+  const recv = luDecl("const", "$rf" + i32ToStr(ix), objTy, isObj, site, pos)
+  let test = -1
+  let k = names.length - 1
+  while k >= 0 {
+    const fld = luAt(mkMember(luRef(recv, site, pos), names[k], pos), site)
+    const t = luTyTest(fld, tys[k], site, pos)
+    test = if test < 0 { t } else { luAt(mkBinary("&&", t, test, pos), site) }
+    k = k - 1
+  }
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(test)
+  return luValueNode(site, stmts, pos)
+}
+
+// The minted check for `x is chk` where `chk` is a literal set over two kinds (`1 | "a"`):
+// `{ const $ls = x; $ls is <one kind's members> || ... }`, each part a set of one kind, which
+// the test's lowering answers whole. -1 for any other test.
+export function litSetSplitBuild(
+  isObj: i32,
+  ix: i32,
+  objTy: i32,
+  chkTy: i32,
+  pos: i32,
+): i32 {
+  if objTy < 0 || chkTy < 0 || !litSetMixesBases(chkTy) { return -1 }
+  if !tyTestMayFit(objTy, chkTy) { return -1 }
+  // An open operand is bound as it reads, and each part re-asked at its pins.
+  const ann = if tyHasTyVar(objTy) { -1 } else { objTy }
+  if ann >= 0 && luTs(ann) < 0 { return -1 }
+  const kinds: string[] = []
+  const parts: i32[][] = []
+  for m in tyTestMembers(chkTy) {
+    let at = strListIndexOf(kinds, litSetKindOf(m))
+    if at < 0 {
+      kinds.push(litSetKindOf(m))
+      parts.push([])
+      at = kinds.length - 1
+    }
+    parts[at].push(m)
+  }
+  const tys: i32[] = []
+  for ms in parts {
+    const t = if ms.length == 1 { ms[0] } else { mkUnionTy(ms) }
+    if luTs(t) < 0 { return -1 }
+    tys.push(t)
+  }
+  const site = ix
+  const recv = luDecl("const", "$ls" + i32ToStr(ix), ann, isObj, site, pos)
+  let test = -1
+  let k = tys.length - 1
+  while k >= 0 {
+    const t = luTyTest(luRef(recv, site, pos), tys[k], site, pos)
+    test = if test < 0 { t } else { luAt(mkBinary("||", t, test, pos), site) }
+    k = k - 1
+  }
+  const stmts: i32[] = []
+  stmts.push(recv)
+  stmts.push(test)
+  return luValueNode(site, stmts, pos)
+}
+
+// Whether `t` is a literal set over two kinds, `null` among them (`1 | "a"`, `1 | null`); two
+// integer widths are one kind, which the test's lowering answers whole.
+function litSetMixesBases(t: i32): boolean {
+  let kind = ""
+  for m in tyTestMembers(t) {
+    const k = litSetKindOf(m)
+    if k == "" { return false }
+    if kind != "" && k != kind { return true }
+    kind = k
+  }
+  return false
+}
+
+// The kind of literal-set member `m` (its literal kind, or `null`), or "" for no literal.
+function litSetKindOf(m: i32): string {
+  if m == TY_NULL { return "null" }
+  const t = tyAt(m)
+  return if t is TyLit { t.litKind } else { "" }
+}
+
+// Whether every value of field type `fa` fits `fb`: each member covered.
+function recFieldCovered(fa: i32, fb: i32): boolean {
+  for m in tyTestMembers(fa) {
+    if tyTestMemberFit(m, fb) != TT_COVERED { return false }
+  }
+  return true
+}
+
+// `v is t`, minted at `site`, banked at `t`.
+export function luTyTest(v: i32, t: i32, site: i32, pos: i32): i32 {
+  const root = luTs(t)
+  const test = luAt(mkIsExpr(v, tsToName(root), pos), site)
+  setAnnTs(test, root)
+  luIsTyPut(test, t)
+  return test
 }
 
 // `kw name[: ann] = init`, where `ann` is a type rendered to its spelling (-1: none).
@@ -849,7 +1102,7 @@ export function luDecl(
     if root >= 0 { setAnnTs(tr, root) }
     luAnnTyPut(tr, ann)
   }
-  luAt(mkLet(kw, name, tr, init, pos), site)
+  return luAt(mkLet(kw, name, tr, init, pos), site)
 }
 
 // One arm's value over list `recv`: its `.length`, or with an index its element, delivered
@@ -868,7 +1121,7 @@ function luArm(recv: i32, idx: i32, elem: i32, site: i32, pos: i32): i32 {
     stmts.push(td)
     stmts.push(luRef(td, site, pos))
   }
-  luAt(mkBlock(stmts, pos), site)
+  return luAt(mkBlock(stmts, pos), site)
 }
 
 // The `is` chain over `recv`'s members from `k` on, the last member being the bare `else`.
@@ -893,7 +1146,7 @@ export function luChain(
     return luAt(mkIf(test, arm, luAt(mkBlock(tl, pos), site), pos), site)
   }
   const rest = luChain(ms, k + 1, recv, idx, elem, site, pos)
-  luAt(mkIf(test, arm, rest, pos), site)
+  return luAt(mkIf(test, arm, rest, pos), site)
 }
 
 // The annotation node naming `ty` for the adapter, or -1 when it has no spelling. The checker
@@ -909,7 +1162,7 @@ export function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
   const tr = luAt(mkTypeRef(tsToName(root), pos), site)
   setAnnTs(tr, root)
   luAnnTyPut(tr, ty)
-  tr
+  return tr
 }
 
 // An annotation node for type `ty` that has no spelling, such as a set of functions: the checker
@@ -918,7 +1171,7 @@ export function fvaAnnotMinted(ty: i32, site: i32, pos: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const tr = luAt(mkTypeRef(tyToStr(ty), pos), site)
   luAnnTyPut(tr, ty)
-  tr
+  return tr
 }
 
 // The function arm of union `u` that a value of function type `src` converts into; -1 when no
@@ -933,7 +1186,7 @@ export function fvaUnionArm(u: TyUnion, src: i32): i32 {
       found = m
     }
   }
-  found
+  return found
 }
 
 // The refusal for a container whose functions would need an adapter each.
@@ -950,7 +1203,7 @@ export function fvaRefuseNested(at: i32, srcTy: i32, dstTy: i32) {
       + "`, or wrap each function in a lambda of the wider type where it is stored",
     at,
   )
-  0
+  return 0
 }
 
 // The refusal for a function value whose adapter cannot be built: `why` is the checker's
@@ -967,7 +1220,7 @@ export function fvaRefuse(at: i32, srcTy: i32, dstTy: i32, why: string) {
     msg = msg + "that conversion is refused (" + why + ")"
   }
   tErr(msg, at)
-  0
+  return 0
 }
 // ── member `o.field` ───────────────────────────────────────────────────────
 
@@ -987,18 +1240,24 @@ export function mapFitBuild(
   const o = tyAt(objTy)
   const c = tyAt(chkTy)
   if !(o is TyMap) || !(c is TyMap) { return -1 }
-  if o.mSet == 1 || c.mSet == 1 || o.mKey < 0 || o.mVal < 0 || c.mVal < 0 {
-    return -1
-  }
   if (
-    !tyEq(o.mKey, c.mKey)
-    || tyEq(o.mVal, c.mVal)
-    || !assignable(c.mVal, o.mVal)
+    o.mSet == 1
+    || c.mSet == 1
+    || tyKeyOpen(o)
+    || tyValOpen(o)
+    || tyValOpen(c)
   ) {
     return -1
   }
-  const vroot = tyToTs(c.mVal)
-  if vroot < 0 || luTs(c.mVal) < 0 || luTs(objTy) < 0 { return -1 }
+  if (
+    !tyEq(tyKeyOf(o), tyKeyOf(c))
+    || tyEq(tyValOf(o), tyValOf(c))
+    || !assignable(tyValOf(c), tyValOf(o))
+  ) {
+    return -1
+  }
+  const vroot = tyToTs(tyValOf(c))
+  if vroot < 0 || luTs(tyValOf(c)) < 0 || luTs(objTy) < 0 { return -1 }
   const site = ix
   const recv = luDecl("const", "$mf" + i32ToStr(ix), objTy, isObj, site, pos)
   const ok = luDecl(
@@ -1020,7 +1279,7 @@ export function mapFitBuild(
     site,
   )
   setAnnTs(isV, vroot)
-  luIsTyPut(isV, c.mVal)
+  luIsTyPut(isV, tyValOf(c))
   const test = luAt(mkUnary("!", isV, pos), site)
   const clear = luAt(
     mkBinary("=", luRef(ok, site, pos), mkBool(0, pos), pos),
@@ -1038,5 +1297,5 @@ export function mapFitBuild(
   stmts.push(ok)
   stmts.push(loop)
   stmts.push(luRef(ok, site, pos))
-  luValueNode(site, stmts, pos)
+  return luValueNode(site, stmts, pos)
 }

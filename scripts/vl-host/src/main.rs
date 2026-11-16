@@ -843,6 +843,11 @@ the language are one artifact: this command is how an editor asks an installed
        vl seed --out <path>       {d}write to a file; prints nothing{r}
        vl seed --path             {d}print where the seed comes from: a
                                   filesystem path, or the literal `embedded`{r}
+       vl seed --cache-dir        {d}print the directory its compiled form is
+                                  cached in: $VL_SEED_CACHE_DIR, else seed/
+                                  under the user cache directory{r}
+       vl seed --cache-files      {d}print this seed's cached compiled forms,
+                                  one per engine configuration{r}
 
 {b}Flags:{r}
   {c}--out{r} <path>        Write the seed to <path> (parent dirs are created)
@@ -2045,41 +2050,31 @@ fn seed_content_key(bytes: &[u8]) -> String {
     format!("{acc:016x}")
 }
 
-/// Delete the on-disk seed's sidecars that belong to a DIFFERENT seed (and the
-/// mtime-era `<seed>.<tag>.cwasm` names, which belong to no key at all).
-///
-/// Content keys mean a new seed lands at a new path instead of overwriting, so
-/// without this every rebuild would leave ~16 MB per engine tag behind for ever. Ours
-/// is every name under `<seed>.<our key>.`, which is one file per engine tag —
-/// they are worth exactly as long as the seed is, so they retire as a unit.
-/// Best-effort: a read-only directory is not an error, just a cache that does not
-/// shrink.
-fn prune_seed_sidecars(compiler_path: &str, ours: &std::path::Path) {
-    let path = std::path::Path::new(compiler_path);
-    let (Some(dir), Some(stem)) = (path.parent(), path.file_name()) else {
-        return;
+/// The on-disk seed's compilation cache directory: `$VL_SEED_CACHE_DIR`, else `seed/` under
+/// the user cache root. Never beside the seed: a checkout the user cloned could ship a
+/// sidecar there, and a sidecar is native code. Both levels must pass `private_cache_dir`; a
+/// directory that fails runs the seed uncached, with one line saying why. Separate from the
+/// root so a test's private `$VL_CACHE_DIR` (the module cache) still shares one warm seed.
+fn seed_cache_dir() -> Option<std::path::PathBuf> {
+    let var = std::env::var_os("VL_SEED_CACHE_DIR").filter(|v| !v.is_empty());
+    let (dirs, dir) = match var {
+        Some(d) => {
+            let d = std::path::PathBuf::from(d);
+            (vec![d.clone()], d)
+        }
+        None => {
+            let root = user_cache_root()?;
+            let d = root.join("seed");
+            (vec![root, d.clone()], d)
+        }
     };
-    let keep = match ours.file_name().and_then(|n| n.to_str()) {
-        Some(n) => match n.rfind('.').and_then(|i| n[..i].rfind('.')) {
-            Some(i) => n[..i + 1].to_string(), // `<stem>.<key>.`
-            None => return,
-        },
-        None => return,
-    };
-    let prefix = format!("{}.", stem.to_string_lossy());
-    let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
-        std::path::Path::new(".")
-    } else {
-        dir
-    }) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with(".cwasm") && !name.starts_with(&keep) {
-            let _ = std::fs::remove_file(e.path());
+    for d in &dirs {
+        if let Err(why) = private_cache_dir(d) {
+            eprintln!("vl: not caching the compiler in `{}`: {why}", d.display());
+            return None;
         }
     }
+    Some(dir)
 }
 
 /// Where the EMBEDDED seed's compilation cache lives — the sidecar's counterpart for
@@ -2119,7 +2114,7 @@ fn seed_cache_path_impl(tag: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     let ours = dir.join(format!("seed-{}-{tag}.cwasm", env!("VL_SEED_KEY")));
-    prune_seed_cache(&dir, &ours);
+    prune_seed_cache(&dir, &ours, 3);
     Some(ours)
 }
 
@@ -2180,7 +2175,6 @@ fn private_cache_dir(dir: &std::path::Path) -> std::result::Result<(), &'static 
 /// name. One seed owns one entry per engine configuration, and they are worth exactly
 /// as long as the seed is, so pruning treats them as a unit. A name carrying no tag is
 /// its own group.
-#[cfg(feature = "embed-seed")]
 fn seed_group_key(path: &std::path::Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy().into_owned();
     let stem = name.strip_prefix("seed-")?.strip_suffix(".cwasm")?;
@@ -2195,19 +2189,17 @@ fn seed_group_key(path: &std::path::Path) -> Option<String> {
 /// new seed adds a group (~9 MB per engine configuration in it) and nothing retires
 /// the old ones — an upgrade treadmill would grow the user's cache dir without limit.
 ///
-/// Policy: keep the `KEEP` most-recently-written SEEDS plus our own, delete the rest.
+/// Policy: keep the `keep` most-recently-written SEEDS plus our own, delete the rest.
 /// Seeds rather than files, because one seed legitimately owns several files (one per
 /// engine configuration) and a file count would let a two-configuration workload evict
 /// a live seed on every other run — reinstating the recompile the per-configuration
 /// keying exists to remove. A COUNT rather than an age, because an entry in daily use
 /// is only ever READ — its mtime stays as old as the day it was written, so any age
-/// rule would evict exactly the entries that are working. `KEEP > 1` so a dev checkout
+/// rule would evict exactly the entries that are working. `keep > 1` so a dev checkout
 /// and a released `vl` sharing a cache dir do not evict each other on alternate runs.
 /// Evicting a live entry is survivable regardless — the next run recompiles and
 /// republishes it — which is why every step here is best-effort and silent.
-#[cfg(feature = "embed-seed")]
-fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
-    const KEEP: usize = 3;
+fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -2229,7 +2221,7 @@ fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
             None => seeds.push((key, mtime, vec![path])),
         }
     }
-    if seeds.len() <= KEEP {
+    if seeds.len() <= keep {
         return;
     }
     // Our own seed survives whatever its mtime says: `ours` has not been written yet
@@ -2237,7 +2229,7 @@ fn prune_seed_cache(dir: &std::path::Path, ours: &std::path::Path) {
     // engine configurations of the very seed this process is about to use.
     let ours_key = seed_group_key(ours);
     seeds.sort_by(|a, b| b.1.cmp(&a.1)); // newest first
-    for (key, _, files) in seeds.into_iter().skip(KEEP) {
+    for (key, _, files) in seeds.into_iter().skip(keep) {
         if Some(&key) == ours_key.as_ref() {
             continue;
         }
@@ -2353,6 +2345,36 @@ fn seed_cmd(rest: &[String]) -> Result<()> {
         .and_then(|i| rest.get(i + 1))
         .cloned();
     let source = resolve_compiler(explicit);
+    if rest.iter().any(|a| a == "--cache-files") {
+        // This seed's compiled forms, one per engine configuration, for a script to pack.
+        let (Some(dir), CompilerSource::Path(p)) = (seed_cache_dir(), &source) else {
+            return Ok(());
+        };
+        let key = seed_identity(p)
+            .map_err(|e| Error::from(e).context(format!("reading seed `{p}`")))?
+            .key;
+        let prefix = format!("seed-{key}-");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with(&prefix) && n.ends_with(".cwasm"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        for f in files {
+            println!("{}", dir.join(f).display());
+        }
+        return Ok(());
+    }
+    if rest.iter().any(|a| a == "--cache-dir") {
+        match seed_cache_dir() {
+            Some(d) => println!("{}", d.display()),
+            None => bail!("no usable seed cache directory (set $VL_SEED_CACHE_DIR, or $HOME)"),
+        }
+        return Ok(());
+    }
     if rest.iter().any(|a| a == "--path") {
         match &source {
             CompilerSource::Path(p) => println!("{p}"),
@@ -2481,9 +2503,8 @@ fn std_cmd(rest: &[String]) -> Result<()> {
 /// that caches the Cranelift compilation (the dominant fixed cost of every
 /// invocation), keyed by the seed's CONTENT and by engine configuration (a separate
 /// sidecar per one). Shared by every subcommand that
-/// drives the seed (`compile_vl_located`, the pump). `deserialize_file` is unsafe because a
-/// corrupt/forged artifact is UB — we only ever load a sidecar this same binary wrote
-/// next to the module it was derived from.
+/// drives the seed (`compile_vl_located`, the pump). `deserialize_file` runs the file as
+/// native code; what stands between it and a forged file is `cached_module`'s SAFETY note.
 ///
 /// Under `$VL_PROFILE_GUEST` this is also where the sampler starts and where the store
 /// is armed — before instantiation, since the module's start function is guest code an
@@ -2551,14 +2572,10 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
                     .map_err(|e| e.context("loading the embedded compiler seed"))
             })?
         }
-        // On-disk seed: the sidecar sits next to it and is CONTENT-KEYED, exactly as
-        // the embedded path above — `<seed>.<seed key>.<engine tag>.cwasm`. It used to
-        // be keyed by mtime, which made every byte-identical rewrite of the seed a full
-        // Cranelift recompile: a `cp` between worktrees, a `fetch-seed.sh`, a CI cache
-        // restore. Content keys have no freshness question to ask (different bytes ⇒
-        // different file), so those all HIT, and two seeds can be alternated without
-        // evicting each other. The key comes from `seed_identity`, so a warm run reads
-        // the seed's stat memo instead of the seed; the bytes are read only to compile.
+        // On-disk seed: CONTENT-KEYED like the embedded one, `seed-<seed key>-<engine
+        // tag>.cwasm` in `seed_cache_dir`, so a copy of the seed anywhere hits and two seeds
+        // alternate without evicting each other. The key comes from `seed_identity`, so a
+        // warm run reads the seed's stat memo instead of the seed.
         CompilerSource::Path(compiler_path) => {
             let loading = || {
                 format!(
@@ -2567,10 +2584,13 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
             };
             let ids =
                 seed_identity(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
-            let sidecar =
-                std::path::PathBuf::from(format!("{compiler_path}.{}.{tag}.cwasm", ids.key));
-            let hit = sidecar.exists();
-            let module = cached_module(engine, Some(&sidecar), hit, || {
+            let dir = seed_cache_dir();
+            let sidecar = dir
+                .as_ref()
+                .map(|d| d.join(format!("seed-{}-{tag}.cwasm", ids.key)));
+            let hit = sidecar.as_ref().is_some_and(|p| p.exists());
+            let cache = sidecar.as_deref();
+            let module = cached_module(engine, cache, hit, || {
                 let bytes =
                     seed_bytes(compiler_path).map_err(|e| Error::from(e).context(loading()))?;
                 // The memo vouched for the file as it was when it was stat'ed; bytes that
@@ -2590,8 +2610,10 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
             // Only after a MISS — the one invocation that just published a new key, and
             // so the only one that can have orphaned an old seed's entries. Keeping it
             // off the hit path keeps the warm case at zero directory reads.
-            if !hit {
-                prune_seed_sidecars(compiler_path, &sidecar);
+            if let (Some(d), Some(p), false) = (dir.as_ref(), sidecar.as_ref(), hit) {
+                // More than the embedded cache keeps: a development box alternates seeds
+                // (worktrees, a baseline beside a candidate), and an eviction costs seconds.
+                prune_seed_cache(d, p, 8);
             }
             module
         }
@@ -2616,8 +2638,12 @@ fn load_compiler_module(engine: &Engine, source: &CompilerSource) -> Result<Modu
 /// here. What still reaches it is a file at our path that is truncated, foreign, or
 /// otherwise unreadable.
 ///
-/// `deserialize_file` is unsafe because a corrupt or forged artifact is UB — we only
-/// ever read a file this same binary wrote for this same module.
+/// SAFETY of `deserialize_file`: a forged or corrupt artifact is native code execution or UB,
+/// and nothing here reads the bytes before wasmtime does (a full digest would cost every warm
+/// run more than the run itself). Every `cache` a caller passes is a file this binary wrote in
+/// a directory `private_cache_dir` vouched for (`seed_cache_dir`, the embedded seed's cache
+/// root), never a path inside a checkout, so no repository can ship one. DECISIONS.md, "The
+/// seed sidecar lives only in the user's private cache".
 fn cached_module(
     engine: &Engine,
     cache: Option<&std::path::Path>,
@@ -4514,6 +4540,7 @@ fn compile_vl_instance(
         }
     }
     arm_cls_census(inst, &mut store);
+    arm_ir_shadow(inst, &mut store);
     // Identity shadow ($VL_ID_SHADOW=1 records and reports, =2 also keys callback
     // specialization by it): armed before the compile, read back after it. A seed
     // without `setIdShadow` ignores it.
@@ -4540,7 +4567,9 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    report_ifaces(inst, store, source_path);
     report_cls_census(inst, store, source_path);
+    report_ir_shadow(inst, store, source_path);
     if id_shadow > 0 {
         report_id_shadow(inst, store, source_path);
     }
@@ -4587,6 +4616,58 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[id-shadow] {path}: {row}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// The mode `$VL_IR_SHADOW` asks the guest's IR shadow for: 0 off, 1 count, 2 also detail each
+/// dual-emit mismatch class's first examples, 3 disarmed but claiming every I1 family (the claim path's test).
+fn ir_shadow_mode() -> i32 {
+    match std::env::var("VL_IR_SHADOW").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        Some("3") => 3,
+        _ => 0,
+    }
+}
+
+fn ir_shadow_on() -> bool {
+    ir_shadow_mode() > 0
+}
+
+/// Under `$VL_IR_SHADOW`, arm the guest's IR shadow. A seed without `irShadowArm` ignores it.
+fn arm_ir_shadow(inst: &Instance, store: &mut Store<()>) {
+    if !ir_shadow_on() {
+        return;
+    }
+    if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut *store, "irShadowArm") {
+        let _ = set.call(&mut *store, ir_shadow_mode());
+    }
+}
+
+/// Under `$VL_IR_SHADOW`, print one `[ir] <path>: <n>\t<row>` line to stderr per row the
+/// shadow counted (a verifier failure's row carries the function's printed IR after it).
+fn report_ir_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !ir_shadow_on() {
+        return;
+    }
+    let (Ok(count), Ok(len), Ok(at), Ok(num)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "irShadowRowCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "irShadowRowAt"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "irShadowRowN"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        let k = num.call(&mut *store, i).unwrap_or(0);
+        rows.push_str(&format!("[ir] {path}: {k}\t{row}\n"));
     }
     eprint!("{rows}");
 }
@@ -4674,6 +4755,36 @@ fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
     eprint!("{rows}");
 }
 
+/// Whether `$VL_IFACES=1` asked for each compile's shadow interfaces.
+fn ifaces_on() -> bool {
+    std::env::var("VL_IFACES").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_IFACES=1`, print `[iface] <path>: <line>` to stderr for each line of the guest's
+/// shadow-interface dump (L2 S0): one per un-annotated top-level function, its parameters, the
+/// demand rows it owns and how its calls agree with its result at their bindings. A seed without
+/// `ifaceDumpBuild` prints nothing.
+fn report_ifaces(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !ifaces_on() {
+        return;
+    }
+    let (Ok(build), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "ifaceDumpBuild"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "ifaceDumpAt"),
+    ) else {
+        return;
+    };
+    let n = build.call(&mut *store, ()).unwrap_or(0);
+    let text: String = (0..n)
+        .map(|j| char::from_u32(at.call(&mut *store, j).unwrap_or(63) as u32).unwrap_or('?'))
+        .collect();
+    let mut rows = String::new();
+    for line in text.lines() {
+        rows.push_str(&format!("[iface] {path}: {line}\n"));
+    }
+    eprint!("{rows}");
+}
+
 /// Stream the guest's rep-shadow report ($VL_REP_SHADOW mode) to stderr: one
 /// greppable `rep-shadow[path]` line per coverage tally / unsupported-reason
 /// bucket / flat-vs-tree disagreement (the `render_diags` accessor pattern —
@@ -4726,42 +4837,35 @@ fn report_rep_shadow(inst: &Instance, store: &mut Store<()>, path: &str) -> Resu
     Ok(())
 }
 
-/// The SHORTEST round-tripping decimal for `v` in `{:e}` layout, with the spec's tie-break.
+/// The SHORTEST round-tripping decimal for `v` in `{:e}` layout, chosen as ECMA-262
+/// `Number::toString` step 5 chooses it: the fewest digits that round-trip, then the candidate
+/// closest to `v`, then on an exact tie the even last digit.
 ///
-/// `format!("{:e}", v)` is also shortest-round-tripping, but on an EXACT TIE — two candidate
-/// digit strings equidistant from `v` — Rust's shortest formatter chooses the odd last digit
-/// where ECMA-262 `Number::toString` step 5 chooses the even one. Measured over 50,000
-/// pseudo-random doubles against V8: 14 disagreements, every one an exact tie
-/// (silent-class-inventory D1011).
-///
-/// Asking for an EXPLICIT precision takes a different path: Rust's exact-precision float
-/// formatting rounds half-to-EVEN, which is the spec's rule. So walking precisions upward and
-/// taking the first that round-trips yields the shortest digit string under the spec's
-/// tie-break rather than under Rust's. Verified before relying on it: `{:.0}` renders 0.5→0,
-/// 1.5→2, 2.5→2, 3.5→4 and `{:.2}` renders 0.125→0.12, 0.375→0.38 — ties to even at every
-/// probe.
-///
-/// 17 significant digits always round-trips an f64, so the loop terminates; the fallback is
-/// unreachable and exists so this function has no panic path.
+/// `format!("{:e}", v)` gives the fewest digits, `k`, but on an exact tie Rust's shortest
+/// formatter takes the odd last digit (D1011). `{:.*e}` at precision `k` is the correctly
+/// rounded, half-to-even candidate, so when it round-trips it is the closest and the spec's
+/// choice. When it does not, the other neighbour at `k` digits is the one that does, and that
+/// is the one `{:e}` produced. 2^-24 is such a case: its 16-digit half-to-even candidate
+/// `…062` falls in the narrower gap below a power of two and does not round-trip (D16472).
 fn shortest_sci(v: f64) -> String {
-    for k in 1..=17 {
-        let s = format!("{:.*e}", k - 1, v);
-        if s.parse::<f64>() == Ok(v) {
-            return s;
-        }
+    let shortest = format!("{:e}", v);
+    let mant = shortest.split('e').next().unwrap_or("");
+    let k = mant.bytes().filter(|b| b.is_ascii_digit()).count().max(1);
+    let even = format!("{:.*e}", k - 1, v);
+    if even.parse::<f64>() == Ok(v) {
+        even
+    } else {
+        shortest
     }
-    format!("{:e}", v)
 }
 
-/// Render an f64 exactly as JS `String(v)` does (ECMA-262 `Number::toString`, radix
-/// 10) — the rule this host's float print sinks have always CLAIMED to follow, since
-/// `tests/support/runWasm.ts` and `playground/src/runtime.ts` both sink through
-/// `String(v)` and a corpus `@log` line has to match under either host.
+/// Render an f64 exactly as JS `String(v)` does (ECMA-262 `Number::toString`, radix 10). The JS
+/// hosts (`tests/support/runWasm.ts`, `playground/src/runtime.ts`) sink through `String(v)`, so a
+/// corpus `@log` line reads the same under either host; `tests/vl_host_float_print_test.ts`
+/// compares the two over every power of two, the subnormal boundaries and a random sample.
 ///
-/// Rust's `{}` Display already produces the SHORTEST round-tripping digit string,
-/// which is the same digit string JS produces — the two disagree only on FORMATTING,
-/// in four places. Each was measured against Deno on the same wasm module, not
-/// inferred:
+/// The digit string is `shortest_sci`'s, the spec's step 5. This function is the layout, where
+/// Rust's `{}` differs from JS in four places:
 ///
 /// | value           | Rust `{}`                | JS `String(v)` |
 /// | --------------- | ------------------------ | -------------- |
@@ -4769,36 +4873,6 @@ fn shortest_sci(v: f64) -> String {
 /// | `1e21`          | `1000000000000000000000`  | `1e+21`        |
 /// | `1e-7`          | `0.0000001`               | `1e-7`         |
 /// | `f64::INFINITY` | `inf`                     | `Infinity`     |
-///
-/// Only the first was filed; the census that verified it found the other three. The
-/// old comment here said Display "matches JS `String(v)` for the corpus values",
-/// which was true of the corpus and false of the rule.
-///
-/// The digits come from `{:e}` (`<d>[.<ddd>]e<exp>`), whose mantissa is that same
-/// shortest representation and whose exponent is the spec's `n - 1`.
-///
-/// ⚠ AND THAT LAST SENTENCE IS THE NEXT ONE THAT WAS TRUE OF THE CORPUS AND FALSE OF
-/// THE RULE. This function is a RE-FORMAT, so it inherits whatever `{:e}` chose, and
-/// `{:e}`'s shortest representation is not always JS's. ECMA-262 `Number::toString`
-/// step 5 takes the shortest digit string, then the one CLOSEST to the value, and on
-/// an exact tie the one whose last digit is EVEN; Rust's shortest formatter breaks
-/// that tie the other way. Measured 2026-09-01 over 50,000 pseudo-random doubles
-/// against V8: **14 disagreements, every one an exact tie**. Smallest witness: bits
-/// `4835952189745799117`, exactly 2023347301156851.25, whose two 17-digit candidates
-/// `…851.2` and `…851.3` are equidistant — V8 prints the even one, this prints the odd
-/// one. So the same VL program prints differently under the two hosts for those values,
-/// which is exactly what the table above exists to prevent.
-///
-/// THE FIX IS NOT A FIFTH LAYOUT ARM — the four rows above are layout and this is the
-/// DIGIT STRING, so it needs a shortest-with-ties-to-even producer. Cheapest correct
-/// route: `for k in 1..=17 { let s = format!("{:.*e}", k - 1, v); if s.parse::<f64>()
-/// == Ok(v) { take it } }` — exact-precision formatting rounds correctly, so the first
-/// `k` that round-trips is the shortest digit string under the spec's rule. VERIFY
-/// Rust's exact-precision rounding is half-to-EVEN before relying on that.
-/// `std:fmt`'s `toString` already implements the rule in pure VL (Burger–Dybvig with the
-/// spec's final digit choice) and agrees with V8 on 50,000 of 50,000;
-/// `tests/vl_std_float_text_test.ts` pins the divergent set by bit pattern, so fixing
-/// this flips a test rather than passing unnoticed.
 fn js_number_to_string(v: f64) -> String {
     if v.is_nan() {
         return "NaN".to_string();
@@ -6481,12 +6555,8 @@ fn instantiate_program(
     linker.func_wrap("imports", "__print_i64__", move |v: i64| {
         palette.emit(&s, &v.to_string())
     })?;
-    // f64: rendered through `js_number_to_string`, which is JS `String(v)` EXCEPT AT AN
-    // EXACT DECIMAL TIE — the JS hosts (`tests/support/runWasm.ts`,
-    // `playground/src/runtime.ts`) sink through `String(v)`, so a corpus `@log` line has
-    // to read the same under either, and at 14 values in 50,000 it does not. Display
-    // alone diverges on negative zero, on magnitudes outside 1e-7..1e21, and on the
-    // infinities; see that function, whose doc comment carries the tie defect. (Slice 3.)
+    // f64: rendered through `js_number_to_string`, which is JS `String(v)`: the JS hosts sink
+    // through `String(v)`, so a corpus `@log` line reads the same under either.
     let s = sink.clone();
     linker.func_wrap("imports", "__print_f64__", move |v: f64| {
         palette.emit(&s, &js_number_to_string(v))
@@ -9696,6 +9766,7 @@ fn pump_session(
     stage_vl_root_and_cwd(&mut store, &inst)?;
     let keep_dir = keep_modules_dir(&mut store, &inst)?;
     arm_cls_census(&inst, &mut store);
+    arm_ir_shadow(&inst, &mut store);
     arm_opaque_snames(&inst, &mut store);
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
@@ -10043,9 +10114,17 @@ fn pump_session(
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
                 }
+                if ifaces_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_ifaces(&inst, &mut store, &p);
+                }
                 if cls_census_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_cls_census(&inst, &mut store, &p);
+                }
+                if ir_shadow_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_ir_shadow(&inst, &mut store, &p);
                 }
                 let mut bytes = BytesOut::probe(&mut store, &inst, "rbyte")?.read(&mut store)?;
                 // THE SEAM. Between the emitter's bytes and the engine's verdict,

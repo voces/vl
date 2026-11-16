@@ -1,11 +1,16 @@
 // The statements: `let`, `if` with its narrowing head, `while`, `for` over a range or a
 // collection, `return` and a block.
 
-import { gnotRecordBase } from "./check_hole_pins"
+import { checkTailArmsAgainst } from "./check_fn_decl"
+import { noteOpenUnionRows } from "./check_hole_links"
+import { openMemberRows } from "./check_leaf_steps"
+import { HD_ITER1, HD_ITER2, gnotRecordBase } from "./check_hole_pins"
 import { strListHas, strListIndexOf } from "./listutil"
+import { exprIsCollCtorCall } from "./check_list_origin"
 import {
   nodeTyIx,
   nodeTyIxOf,
+  nodeTyOf,
   nodeTySet,
   nodeTySetGrow,
 } from "./check_node_tys"
@@ -73,6 +78,7 @@ import {
   elabFnMapLetTy,
   elabRetRecLitGrow,
   elabRetRecTy,
+  stampsStand,
 } from "./check_elab_cap"
 import {
   NAR_KIND_ASG,
@@ -90,6 +96,7 @@ import {
   luTs,
   mapKeyUnsupportedErr,
   resolveAnnotAt,
+  v128NestCheck,
 } from "./check_annot_resolve"
 import { assignableExpr, fvaValueRowAt } from "./check_assignable"
 import {
@@ -102,7 +109,8 @@ import {
   markObjLitBinding,
 } from "./check_bind_rows"
 import { strLitRecvTy } from "./check_builtin_methods"
-import { coalPinTy } from "./check_coal"
+import { coalPinTy, hdMint, mkDerivedHole } from "./check_coal"
+import { mkTyVarOwned, unannotParamTy } from "./check_subst"
 import {
   brkPrevIxSet,
   brkPrevTySet,
@@ -113,6 +121,7 @@ import {
   cycleBreakCount,
   efLeaf,
   fnSawValueRetSet,
+  globalBeforeDecl,
   inferObserved,
   inferObservedLit,
   inferVoidRetBlks,
@@ -134,7 +143,8 @@ import { markCtnLitBinding } from "./check_ctn_lit_bind"
 import {
   curFnDeclIx,
   inferQuiet,
-  quietDepth,
+  quietEnter,
+  quietLeave,
   tpEnvNames,
   tpEnvTys,
 } from "./check_cursor"
@@ -242,6 +252,8 @@ import {
   defaultReadOnlyContainer,
   elemFactFor,
   elemOnlyKeyOf,
+  ifChainExhausts,
+  letFnWriteRow,
   letUnionWriteNarrows,
   lpPopResult,
   narConvListDelivery,
@@ -284,6 +296,10 @@ import {
 import { noteNullHole } from "./check_null_holes"
 import {
   lbiDeferRedundant,
+  lbiHoleFields,
+  lbiHoleKinds,
+  lbiHoleLessNull,
+  lbiHoleRoot,
   lbiIsSynth,
   lbiKeepName,
   lbiMark,
@@ -292,12 +308,7 @@ import {
 } from "./check_num_lit_state"
 import { cexLitPeel, lbiNumTy, numLitBindCandidateTy } from "./check_num_lits"
 import { parenPeelIx } from "./check_places"
-import {
-  recAdBound,
-  recAdOrigDecl,
-  recAdPinInit,
-  recAdPinned,
-} from "./check_rec_adopt_rows"
+import { recAdPass, recAdPinInit, recAdProg } from "./check_rec_adopt_rows"
 import { recordRedundantAnnot } from "./check_redundant_annot"
 import {
   assignable,
@@ -311,6 +322,7 @@ import {
   tsLeafTy,
   unknownTyErr,
   voidStoreCheck,
+  voidValueErr,
   widenLitTy,
   writeMemberTy,
 } from "./check_relate_core"
@@ -322,12 +334,16 @@ import {
   declareDecl,
   identFnAliasOf,
   identFnDeclOf,
+  slotTyAt,
 } from "./check_scopes"
 import {
   deadArmNote,
   inDeadArm,
+  neverIsSeenMark,
+  neverIsSeenSince,
   notePending,
   notePendingNulList,
+  noteRetBareLambda,
   noteValBindLambda,
   recordDeadTest,
 } from "./check_side_rows"
@@ -339,6 +355,8 @@ import {
   TY_ERR,
   TY_I32,
   TY_NEVER,
+  TY_NULL,
+  TY_OPEN,
   TY_VOID,
   TyArray,
   TyErr,
@@ -352,19 +370,25 @@ import {
   mkNullableTy,
   mkObjTy,
   tyAt,
+  tyElemOf,
+  tyElemOpen,
   tyHasHole,
   tyIsHole,
   tyIsNewtypeBrand,
   tyIsStructBearingUnion,
+  tyKeyOf,
+  tyKeyOpen,
   tySame,
   tyToStr,
+  tyValOpen,
 } from "./check_types"
-import { breakValueAt } from "./check_unconsumed"
+import { breakValueAt, joinLeavesOf, tailValueLeaves } from "./check_unconsumed"
 import {
   cwBindingOnlyRead,
   cwFollowCalls,
   cwFollowEnd,
   cwLetUnwritten,
+  cwSoleReadInit,
   fnDeclIx,
 } from "./check_write_scan"
 import { identDeclOf, identFromDecl, identRedirect } from "./symbols"
@@ -387,6 +411,24 @@ type LetAnnot = {
   collapsedHere: boolean,
 }
 
+// The hole the literal solve wrote as annotation `ann`, minted again off its root, or -1 when
+// `ann` is no such annotation or its root has been solved to a type.
+function lbiHolePinTy(ann: i32): i32 {
+  const root = lbiHoleRoot[ann] ?? []
+  if root.length < 2 { return -1 }
+  let t = if root[0] == root[1] { unannotParamTy(root[0]) } else { mkTyVarOwned(root[0], root[1]) }
+  const kinds = lbiHoleKinds[ann] ?? []
+  const fields = lbiHoleFields[ann] ?? []
+  const lessNull = lbiHoleLessNull[ann] ?? []
+  let j = kinds.length - 1
+  while j >= 0 && t >= 0 && j < fields.length {
+    const alt = if j < lessNull.length && lessNull[j] { TY_NULL } else { -1 }
+    t = hdMint(kinds[j], fields[j], -1, alt, false, t)
+    j = j - 1
+  }
+  return t
+}
+
 // The type annotation node `ann` already holds from an earlier check of the same body, at this
 // pass's type-parameter bindings; -1 when it holds none, a type variable survives, or two bound
 // parameters share a name, which substitution by name cannot tell apart (D16012).
@@ -395,7 +437,7 @@ function letAnnHeldTyAt(ann: i32): i32 {
   if held < 0 || tpEnvNamesRepeat() { return -1 }
   const sub = if tpEnvNames.length > 0 { substTyDeep(held, tpEnvNames, tpEnvTys) } else { held }
   if sub < 0 || tyHasTyVar(sub) { return -1 }
-  sub
+  return sub
 }
 
 // Whether two of the bound type parameters share a name.
@@ -409,7 +451,7 @@ function tpEnvNamesRepeat(): boolean {
     }
     i = i + 1
   }
-  false
+  return false
 }
 
 // Resolves the annotation of `n` by reading its TypeRef child inline, refusing an unknown type
@@ -423,7 +465,8 @@ function letDeclResolveAnnot(n: LetDecl): LetAnnot {
     if tn is TypeRef {
       // A binding the list-union rewrite minted is typed as the rewrite typed it, since a
       // written `T[] | i32[]` resolves to one list (D2876).
-      const lua = mintedAnnTy(n.letType)
+      const hp = lbiHolePinTy(n.letType)
+      const lua = if hp >= 0 { hp } else { mintedAnnTy(n.letType) }
       if lua >= 0 {
         annot = lua
       } else {
@@ -453,11 +496,12 @@ function letDeclResolveAnnot(n: LetDecl): LetAnnot {
       if !inferQuiet && annot >= 0 {
         if n.letType < nodeTyIx.length { nodeTySet(n.letType, annot) }
         voidStoreCheck(n.letType, annot)
+        v128NestCheck(n.letType, annot)
       }
     }
   }
   const r: LetAnnot = { ty: annot, collapsedHere: annotCollapsedHere }
-  r
+  return r
 }
 
 // Grades the initializer of `n`, of type `initTy`, against its annotation `annot`: refuses one
@@ -470,7 +514,7 @@ function letDeclGradeAnnotated(n: LetDecl, ix: i32, annot: i32, initTy: i32) {
   // second "cannot assign ... of type <empty>" at every use site.
   const neverAnnot = isNeverTy(annot)
   const savedPin = recAdPinInit
-  recAdPinInit = recAdPinned[ix] ?? false
+  recAdPinInit = recAdProg.pinned[ix] ?? false
   const fits = neverAnnot || assignableExpr(n.letInit, initTy, annot)
   recAdPinInit = savedPin
   if !fits {
@@ -485,13 +529,21 @@ function letDeclGradeAnnotated(n: LetDecl, ix: i32, annot: i32, initTy: i32) {
     // The check above is vacuous whenever a side is a hole — record the pair for the pin to
     // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
     noteLetCstr(coalPinTy(n.letInit, initTy), annot, n.letInit, n.letName)
+    // The literal of a binding the solve gave a hole is built at each instance's pin.
+    if (
+      tyIsHole(annot)
+      && lbiIsSynth(n.letType, ix)
+      && cexLitPeel(n.letInit) >= 0
+    ) {
+      nodeTySet(cexLitPeel(n.letInit), annot)
+    }
     // And the slots of a literal source too, but only when the pair above carried no hole —
     // that is exactly when the literal's own element join dropped one, so nothing is recorded.
     if !tyHasHole(initTy) {
       if !tyHasHole(annot) { noteLitElemCstrs(n.letInit, annot, 6) }
     }
   }
-  0
+  return 0
 }
 
 // Marks the binding of `n` when its type came from a spelling
@@ -510,7 +562,7 @@ function letDeclMarkCollapsed(n: LetDecl, annotCollapsedHere: boolean) {
       }
     }
   }
-  0
+  return 0
 }
 
 // Whether `ix` reads a `let` the program writes after its initialiser.
@@ -518,7 +570,7 @@ function identReadsWrittenLet(ix: i32): boolean {
   const d = identDeclOf(ix)
   if d < 0 || d >= P.nodes.length { return false }
   const dn = nodeAt(d)
-  dn is LetDecl && dn.letKw == "let" && !cwLetUnwritten(d)
+  return dn is LetDecl && dn.letKw == "let" && !cwLetUnwritten(d)
 }
 
 // `const f = addT` — records which declaration the binding of `n` at `ix` aliases, for
@@ -541,7 +593,7 @@ function letDeclNoteFnAlias(n: LetDecl, ix: i32) {
       if aDecl >= 0 { declFnAliasSet(ix, aDecl) }
     }
   }
-  0
+  return 0
 }
 
 // The literal-binding marks of a `let` the module hoist did not already record at depth 0
@@ -559,7 +611,42 @@ function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
   }
   lbiMark(n.letName, T.frames.length - 1, ix, bound)
   markFnLitBinding(n.letName, T.frames.length - 1, ix)
-  0
+  return 0
+}
+
+// The container the hoist declared module binding `ix` at, where its initializer is a `[]`,
+// `Map()` or `Set()` and both are still open: a body declared above the binding reads the
+// hoisted one, so the binding keeps it, and later top-level pins reach that body (D16364).
+function letHoistedOpenCtn(ix: i32, init: i32, initTy: i32): i32 {
+  const lit = parenPeelIx(init)
+  if lit < 0 || lit >= P.nodes.length { return initTy }
+  if !(nodeAt(lit) is ArrayLit) && !exprIsCollCtorCall(lit) { return initTy }
+  const h = slotTyAt(ix, 0)
+  if (
+    h < 0
+    || initTy < 0
+    || h == initTy
+    || h >= T.tys.length
+    || initTy >= T.tys.length
+  ) {
+    return initTy
+  }
+  const a = tyAt(h)
+  const b = tyAt(initTy)
+  const openList = b is TyArray
+    && a is TyArray
+    && tyElemOpen(a)
+    && tyElemOpen(b)
+  const openMap = b is TyMap
+    && a is TyMap
+    && a.mSet == b.mSet
+    && tyKeyOpen(a)
+    && tyValOpen(a)
+    && tyKeyOpen(b)
+    && tyValOpen(b)
+  if !openList && !openMap { return initTy }
+  nodeTySet(lit, h)
+  return h
 }
 
 export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
@@ -594,6 +681,9 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     initTy = checkNodeHook(n.letInit)
   }
   if keptJoin >= 0 && initTy >= 0 { initTy = keptJoin }
+  if annot < 0 && T.frames.length == 1 && (moduleGlobals[n.letName] ?? false) {
+    initTy = letHoistedOpenCtn(ix, n.letInit, initTy)
+  }
   initTy = letDeclInitVerdicts(n, ix, annot, initTy, seedMark)
   let bound = TY_ERR
   if annot >= 0 {
@@ -614,15 +704,15 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     // a generic the signature is the instance's, which one node cannot record.
     const litInit = nodeAt(parenPeelIx(n.letInit)) is ArrayLit
     let wm: i32[] = []
-    if litInit && tpEnvNames.length == 0 {
+    if litInit && tpEnvNames.length == 0 && letFnListLitNamesFns(n.letInit) {
       wm = elabFnListOpenWideMembers(ix, bound)
     }
     const closedAt = letFnListClosedSig(wm)
     const lw = elabFnListLetTy(ix, bound, closedAt)
     // Each generic member is delivered at the closed signature, as an annotated list's is.
-    const lwa = if lw >= 0 && lw < T.tys.length { T.tys[lw] } else { T.tys[TY_ERR] }
+    const lwa = if lw >= 0 && lw < T.tys.length { tyAt(lw) } else { tyAt(TY_ERR) }
     if lw != bound && closedAt >= 0 && lwa is TyArray {
-      for m in wm { fvaValueRowAt(m, lwa.aElem) }
+      for m in wm { fvaValueRowAt(m, tyElemOf(lwa)) }
     }
     if lw != bound {
       bound = lw
@@ -646,6 +736,20 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       cwFollowCalls = true
       bound = letLitListsWidenAt(ix, parenPeelIx(n.letInit), bound, none)
       cwFollowEnd()
+    } else if letInitArmLits(n.letInit) && tpEnvNames.length == 0 {
+      // A value `if` or `match` of literals holds each, so each is widened at the binding's type.
+      const none: string[] = []
+      cwFollowCalls = true
+      let w = bound
+      for lv in letInitLeaves(n.letInit) {
+        w = letLitListsWidenAt(ix, lv, bound, none)
+      }
+      cwFollowEnd()
+      if w != bound {
+        for j in joinLeavesOf(n.letInit) { nodeTySetGrow(j, w) }
+        nodeTySetGrow(parenPeelIx(n.letInit), w)
+        bound = w
+      }
     } else if initLit is Call && tpEnvNames.length == 0 {
       // A binding a call initialises holds the records the call returns, through the calls it
       // returns, so its function fields take what is written into them too (D15270, D15742).
@@ -703,8 +807,10 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     noteNarShadow(ix, NAR_KIND_ASG)
     narLayerNote(ix, T.frames.length - 1, initTy)
   }
-  if recAdOrigDecl.length > 0 && (recAdPinned[ix] ?? false) {
-    recAdBound.push(bound)
+  // A function `let` re-pointed later reads its initialiser's function until the first write.
+  if annot < 0 { letFnWriteRow(ix, bound, n.letInit, initTy) }
+  if recAdProg.origDecl.length > 0 && (recAdProg.pinned[ix] ?? false) {
+    recAdPass.bound.push(bound)
   }
   crNoteSoleRef(n, ix)
   getLetBank(ix, bound)
@@ -734,7 +840,7 @@ function letKeptJoinAtPin(init: i32): i32 {
   if !tyIsTpJoinUnion(gen) { return -1 }
   const st = substTyDeep(gen, tpEnvNames, tpEnvTys)
   if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
-  st
+  return st
 }
 
 // The type the `let` just checked binds, recorded on its node by `letDeclBoundRecord` once
@@ -751,7 +857,7 @@ export function letDeclBoundRecord(ix: i32) {
   if elabCapOn && ix >= 0 && elabCapLive() { elabCapNote(ix, bt) }
   if !inferQuiet && ix >= 0 && ix < nodeTyIx.length { nodeTySet(ix, bt) }
   letDeclBound = -1
-  0
+  return 0
 }
 
 // The refusals `checkLetDeclNodeIn` asks of an initializer of type `initTy0`: a `void` or
@@ -770,10 +876,11 @@ function letDeclInitVerdicts(
   // A minted scrutinee binding (D1991) keeps the `void`, so the `match` reports it in its own words.
   if n.letInit >= 0 && isVoidTy(initTy) && !symNameIsMinted(n.letName) {
     if !voidSlotExemptExpr(n.letInit) {
-      tErr(
+      voidValueErr(
         "cannot bind the void result of '"
           + n.letName
           + "' — a void function returns no value",
+        n.letInit,
         ix,
       )
       initTy = TY_ERR
@@ -842,7 +949,7 @@ function letDeclInitVerdicts(
       recordRedundantAnnot(n, ix, initTy, annot)
     }
   }
-  initTy
+  return initTy
 }
 
 // The type an un-annotated `let` node `ix` binds from its initializer's type `initTy`, and
@@ -852,7 +959,7 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
   // A-infer-null: an un-annotated `let x = null` binds a nullable with an open inner hole;
   // the first non-null assignment fills it in place (the `=` arm), so `x` becomes `T | null`.
   if isNullTy(initTy) {
-    bound = mkNullableTy(-1)
+    bound = mkNullableTy(TY_OPEN)
     // ...and record the hole, so scope close can say whether anything ever filled it. A
     // hole nothing fills is the `null` type and has a rep (D1576).
     noteNullHole(bound, ix)
@@ -860,13 +967,22 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
   // Un-inferred empty-collection floor: a still-open hole may yet be pinned by a downstream
   // `.push`/`.set`/`.add` — recorded for the scope-close re-check (`flushUninferred`).
   // A container nothing but reads ever uses takes the default now, so each read is checked at it.
-  if unresolvedHole(bound) && cwBindingOnlyRead(ix) {
+  const ini = if n.letInit >= 0 { nodeAt(parenPeelIx(n.letInit)) } else { null }
+  // A copy of a module binding pass 2 has not declared yet reads that binding's row, which the
+  // top-level writes after this body still pin, and its own declaration flushes (D16364).
+  const later = ini is Ident
+    && globalBeforeDecl(parenPeelIx(n.letInit), ini.identName)
+  if unresolvedHole(bound) && cwBindingOnlyRead(ix) && !later {
     defaultReadOnlyContainer(bound)
   }
   const om: i32[] = [-1]
-  if unresolvedHole(bound) || recOpenHolePath(bound, 8, om) != "" {
+  if (unresolvedHole(bound) || recOpenHolePath(bound, 8, om) != "") && !later {
     notePending(n.letName, bound, ix)
   }
+  // A union's unwritten members are settled at the program's end, and its name with them (D16047).
+  const opens: i32[] = []
+  if om[0] < 0 && !unresolvedHole(bound) { openMemberRows(bound, opens) }
+  noteOpenUnionRows(opens)
   if !unresolvedHole(bound) { notePendingNulList(bound, 0) }
   // Exports an un-annotated if-expression binding's inferred value-union type for the
   // emitter. Gated to if-expr/`?.` inits only — rendering via `tyToStr` is costly on the hot path.
@@ -893,7 +1009,35 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
       if iniCallee is OptMember { isIfInit = true }
     }
   }
-  if isIfInit {
+  if isIfInit && opens.length > 0 {
+    openLetIx.push(ix)
+    openLetTy.push(bound)
+  } else if isIfInit {
+    inferLetExport(ix, bound)
+  }
+  return bound
+}
+
+// D16047: the if-expression bindings whose union held an unwritten member, named only once the
+// program's end settled it.
+let openLetIx: i32[] = []
+let openLetTy: i32[] = []
+
+// Exports the bindings `letDeclInferredBound` held back for their unwritten members, now settled.
+export function settleOpenLetNames() {
+  let i = 0
+  while i < openLetIx.length {
+    inferLetExport(openLetIx[i], openLetTy[i])
+    i = i + 1
+  }
+  openLetIx = []
+  openLetTy = []
+  return 0
+}
+
+// Exports if-expression binding `ix`'s inferred value-union type `bound` for the emitter.
+function inferLetExport(ix: i32, bound: i32) {
+  if bound >= 0 {
     const lvn = valueUnionRetName(bound)
     if lvn != "" {
       inferLetIx.push(ix)
@@ -907,7 +1051,7 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
       inferLetTy.push("")
     }
   }
-  bound
+  return 0
 }
 
 // An `else if` chain is checked along its spine: every link's head runs outermost-first, then
@@ -967,14 +1111,14 @@ export function checkIfStmtNode(ix: i32) {
   vloMemoSet(savedVlo)
   ifChainOnFnTailSet(savedOnTail)
   ifChainSpineSet(savedChainSpine)
-  res
+  return res
 }
 
 // Whether `if` condition `c` is a `!` over its test, through parentheses.
 function ifCondIsNot(c: i32): boolean {
   const e = nodeAt(parenPeelIx(c))
   if e is Unary { return e.unOp == "!" }
-  false
+  return false
 }
 
 // Registers the `is`-guard alternatives of the then-narrows `tnPlaces`/`tnTys` that refine a
@@ -1005,7 +1149,7 @@ function ifNoteGuardAlts(
     }
     ai = ai + 1
   }
-  0
+  return 0
 }
 
 // Seeds the inferred return from the then-arm value `thenTy` (tail node `thenIx`) of a value
@@ -1023,7 +1167,7 @@ function ifSeedThenRet(n: IfStmt, guardRows: i32[], thenIx: i32, thenTy: i32) {
     noteInferredSeed(seedThen, armLit(seedThen, n.ifThen))
   }
   if guardedRet { guardAltStackPop() }
-  0
+  return 0
 }
 
 // Splits what the arm checked since the definite-assignment fork `daFork` made into the ids
@@ -1034,7 +1178,7 @@ function ifDaArmDelta(daFork: i32, adds: i32[], rems: i32[]) {
   daTouchedSince(daFork, sid, was)
   daRollbackTo(daFork)
   daSplitDelta(sid, was, adds, rems)
-  0
+  return 0
 }
 
 // Enters the else arm of `n`: its else-narrows `enPlaces`/`enTys` in a fresh scope, the
@@ -1057,7 +1201,7 @@ function ifEnterElseArm(
   // `checkIfStmtNode` banks into `pgUpKeys` instead of a scope that is about to be popped.
   if enElse is IfStmt { pgUpArmIxSet(n.ifElse) }
   retTailPosSet(ifTail)
-  0
+  return 0
 }
 
 // Checks the condition of `n`, refusing one that is not boolean, and collects the narrows it
@@ -1076,15 +1220,17 @@ function ifCheckCondNarrows(
   // Narrowing over a simple identifier: `is T` refines to the variant, `!= null`/`== null`
   // refine a nullable. Union-complement narrowing after `is T` is deliberately excluded — it missed real errors.
   const thenMark = deadElseMark()
+  const neverMark = neverIsSeenMark()
   collectThenNarrows(n.ifCond, tnPlaces, tnTys)
+  neverIsSeenSince(neverMark, n.ifThen)
   const whyThen = deadElseSince(thenMark)
   const deadMark = deadElseMark()
   collectElseNarrows(n.ifCond, enPlaces, enTys)
   // A test the operand's closed type always passes leaves the `else` arm dead (the `then` arm under
   // `!`): a warning, and the operand reads as `never` there (D16006). An instance's dead arm is
-  // the elaboration's.
+  // the elaboration's, and a check whose types do not stand records none.
   const why = deadElseSince(deadMark)
-  if !elabCapLive() {
+  if !elabCapLive() && stampsStand() {
     if why != "" && n.ifElse >= 0 { deadArmNote(n.ifElse) }
     if whyThen != "" { deadArmNote(n.ifThen) }
   }
@@ -1096,7 +1242,7 @@ function ifCheckCondNarrows(
       recordDeadTest(n.ifThen, "this branch can never run (" + whyThen + ")")
     }
   }
-  0
+  return 0
 }
 
 // Enters the then arm of one link: its narrows `tnPlaces`/`tnTys` in a fresh scope and the
@@ -1116,7 +1262,7 @@ function ifEnterThenArm(
   // alternative — mark the branch so `noteInferredRet` records it as a guarded member.
   const guardedRet = guardRows.length > 0
   if guardedRet { guardAltStackPush(guardRows[guardRows.length - 1]) }
-  guardedRet
+  return guardedRet
 }
 
 // Checks the then arm of `n` (at `ix`) as the value arm, or discarded with the `if`, on the
@@ -1135,7 +1281,7 @@ function ifCheckThenBody(n: IfStmt, ix: i32) {
   neLeave(neMark)
   spineAtSet(thenSpine)
   valueArmAtSet(thenArm)
-  0
+  return 0
 }
 
 // The head of one link: everything up to checking its else arm.
@@ -1371,7 +1517,7 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
   }
   arenaSetNode(ix, w)
   luGrow()
-  checkNodeHook(ix)
+  return checkNodeHook(ix)
 }
 
 // `for k[, v] in recv { body }` over a union of maps whose keys agree, rewritten in place to a
@@ -1462,7 +1608,7 @@ function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
   }
   arenaSetNode(ix, w)
   luGrow()
-  checkNodeHook(ix)
+  return checkNodeHook(ix)
 }
 
 // Extracted from `checkNodeReal`'s `WhileStmt` arm (C3: thin the dispatcher).
@@ -1596,6 +1742,11 @@ export function checkForInNode(n: ForIn, ix: i32) {
   crLoopPreRetire(ix)
   let iterTy = checkNodeHook(n.fiIter)
   if iterTy >= 0 { iterTy = strLitRecvTy(iterTy) }
+  // A literal iterated in place is a container nothing but this loop reads, so it takes the
+  // read-only default as such a binding does.
+  if nodeAt(parenPeelIx(n.fiIter)) is ArrayLit && unresolvedHole(iterTy) {
+    defaultReadOnlyContainer(iterTy)
+  }
   pinIterKey(iterTy)
   let elemTy = forInBindTy(iterTy, false)
   let elem2Ty = forInBindTy(iterTy, true)
@@ -1622,13 +1773,18 @@ export function checkForInNode(n: ForIn, ix: i32) {
       if lmForInAt(n, ix, iterTy, lmMs) >= 0 { return TY_VOID }
       lmMs = []
     } else {
-      elemTy = lm0.mKey
+      elemTy = tyKeyOf(lm0)
       elem2Ty = if lm0.mSet == 1 { TY_I32 } else { lmValTy(lmMs) }
       if elem2Ty < 0 { elem2Ty = TY_ERR }
     }
   }
   if (luElem >= 0 || lmMs.length > 0) && inferQuiet {
     // Typed as the rewrite will type it; the real pass rewrites the loop.
+  } else if it is TyVar {
+    // A hole iterable binds each variable to a hole each call resolves as its loop binds it at
+    // the pin, where the loop is checked again (D2197).
+    elemTy = mkDerivedHole(HD_ITER1, "", -1, -1, iterTy)
+    elem2Ty = mkDerivedHole(HD_ITER2, "", -1, -1, iterTy)
   } else if it is TyArray || it is TyMap || isStringTy(iterTy) || it is TyErr {
     // Iterable (or already reported): `forInBindTy` has typed both bindings.
   } else if it is TyObj {
@@ -1698,10 +1854,34 @@ function retNomPinOk(retArg: i32, got: i32, want: i32): boolean {
   if !tyIsNewtypeBrand(want) { return false }
   const b = nomBaseTyIx(want)
   if b < 0 || b == want { return false }
-  assignableExpr(retArg, got, b)
+  return assignableExpr(retArg, got, b)
 }
 
 // Extracted from `checkNodeReal`'s `RetStmt` arm (C3: thin the dispatcher).
+// Whether `ix` is an `if` chain that ends without an `else`.
+function retIfElseLess(ix: i32): boolean {
+  let cur = ix
+  while cur >= 0 {
+    const c = nodeAt(cur)
+    if !(c is IfStmt) { return false }
+    if c.ifElse < 0 { return true }
+    cur = if nodeAt(c.ifElse) is IfStmt { c.ifElse } else { -1 }
+  }
+  return false
+}
+
+// Whether every arm of the returned `if` at `ix` yields a value: a `void` arm, or one already
+// refused, leaves the whole-value grade, which names it.
+function retIfArmsYield(ix: i32): boolean {
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  for lf in leaves {
+    const t = nodeTyOf(lf)
+    if t < 0 || t == TY_ERR || isVoidTy(t) { return false }
+  }
+  return true
+}
+
 export function checkRetStmtNode(n: RetStmt, ix: i32) {
   const want = T.curRet
   if tpEnvNames.length > 0 { tpIfMarkOk(n.retArg) }
@@ -1748,6 +1928,7 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
     // whole join, not the lossy collapse the emitter gets (`inferRetTyOf`).
     const savedInRetArg = inRetArg
     inRetArgSet(true)
+    noteRetBareLambda(n.retArg)
     const cbArg = cycleBreakCount
     const rArgTy = checkNodeHook(n.retArg)
     inRetArgSet(savedInRetArg)
@@ -1798,20 +1979,24 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
     }
     if voidValueSlotErr(got, n.retArg, "return", ix) { return TY_VOID }
   }
-  // Redundant-return rule: witness the explicit return's natural type (before
-  // constrainEmpty); an annotation-influenced return disqualifies the function.
-  if retInfluencedByAnnot(n.retArg) || retSiteTypedByAnnot(n.retArg, got) {
-    retNaturalErrSet(true)
-  }
-  noteNaturalRet(got)
-  // An explicit `return inner` of an empty collection pins its element from the
-  // declared return type — usage-driven inference clearing the floor.
-  constrainEmptyExpr(n.retArg, got, want)
-  if (
-    want >= 0
-    && !assignableExpr(n.retArg, got, want)
-    && !retNomPinOk(n.retArg, got, want)
-  ) {
+  // A returned `if` that fits is graded as one value. One whose join does not fit is graded arm by
+  // arm, as a tail one is, so each refusal names its arm; an else-less one that can fall through is
+  // a value with `null`.
+  const fits = want < 0
+    || assignableExpr(n.retArg, got, want)
+    || retNomPinOk(n.retArg, got, want)
+  const retIf = !fits
+    && !isVoidTy(want)
+    && want != TY_NEVER
+    && nodeAt(n.retArg) is IfStmt
+    && (!retIfElseLess(n.retArg)
+    || ifChainExhausts(n.retArg)
+    || assignable(TY_NULL, want))
+    && retIfArmsYield(n.retArg)
+  if retIf {
+    recordCtxTy(n.retArg, want)
+    checkTailArmsAgainst(n.retArg, want)
+  } else if !fits {
     tErrWant(
       "return type mismatch: expected "
         + tyToStr(want)
@@ -1830,6 +2015,14 @@ export function checkRetStmtNode(n: RetStmt, ix: i32) {
     // re-ask under substitution, only on the passing side (D551 body / D561 declared side).
     noteRetCstr(coalPinTy(n.retArg, got), want, n.retArg)
   }
+  // Redundant-return rule: witness the explicit return's natural type (before
+  // constrainEmpty); an annotation-influenced return disqualifies the function.
+  if retInfluencedByAnnot(n.retArg) || retSiteTypedByAnnot(n.retArg, got) {
+    retNaturalErrSet(true)
+  }
+  noteNaturalRet(got)
+  // An empty collection pins its element from the declared return once graded, as a tail's does.
+  constrainEmptyExpr(n.retArg, got, want)
   return TY_VOID
 }
 // ── block ─────────────────────────────────────────────────────────────────
@@ -1926,6 +2119,27 @@ export function checkBlockNode(n: Block, ix: i32) {
   return TY_VOID
 }
 
+// Whether every element of list literal `init` is a lambda or names a function declaration. A
+// binding listed there keeps the representation its own flow chose, which a closed literal's
+// closure elements do not convert from.
+function letFnListLitNamesFns(init: i32): boolean {
+  const ln = nodeAt(parenPeelIx(init))
+  if !(ln is ArrayLit) { return false }
+  for e in ln.arrElems {
+    const pe = parenPeelIx(e)
+    if pe < 0 || pe >= P.nodes.length { return false }
+    const en = nodeAt(pe)
+    if !(en is FuncDecl) {
+      if !(en is Ident) { return false }
+      const d = identDeclOf(pe)
+      if d < 0 || d >= P.nodes.length || !(nodeAt(d) is FuncDecl) {
+        return false
+      }
+    }
+  }
+  return true
+}
+
 // The one closed signature the functions of `ms` share: a plain named one's, else a generic one's
 // bound at the annotated parameters of a written lambda, whose result the write is then checked
 // against. -1 when a plain one is open, two disagree, or a generic one does not fit.
@@ -1940,7 +2154,7 @@ function letFnListClosedSig(ms: i32[]): i32 {
         lams.push(m)
       } else {
         const mt = nodeTyIxOf(m)
-        if mt < 0 || mt >= T.tys.length || !(T.tys[mt] is TyFunc) { return -1 }
+        if mt < 0 || mt >= T.tys.length || !(tyAt(mt) is TyFunc) { return -1 }
         if tyHasTyVar(mt) || tyReachesHole(mt, 8) { return -1 }
         if f < 0 { f = mt }
         else if !tySame(f, mt) { return -1 }
@@ -1952,7 +2166,7 @@ function letFnListClosedSig(ms: i32[]): i32 {
     if ps.length == 0 { return -1 }
     if f < 0 { f = letFnGenericAt(ms, ps) }
     if f < 0 { return -1 }
-    const ff = T.tys[f]
+    const ff = tyAt(f)
     if !(ff is TyFunc) || ff.fnParamTypes.length != ps.length { return -1 }
     let i = 0
     while i < ps.length {
@@ -1964,7 +2178,7 @@ function letFnListClosedSig(ms: i32[]): i32 {
   for m in ms {
     if !letFnGenericFitsAt(m, f) { return -1 }
   }
-  f
+  return f
 }
 
 // The closed types lambda `m`'s parameters are annotated with; [] when one is not annotated or
@@ -1974,27 +2188,25 @@ function letFnLambdaParamTys(m: i32): i32[] {
   const d = nodeAt(m)
   if !(d is FuncDecl) || d.fnParams.length == 0 { return none }
   const out: i32[] = []
-  const savedQuiet = inferQuiet
-  inferQuiet = true
-  quietDepth = quietDepth + 1
+  const quiet = quietEnter()
   for q in d.fnParams {
     const pn = nodeAt(q)
     let t = -1
     const at = if pn is Param { pn.parType } else { -1 }
     if at >= 0 {
       const tn = nodeAt(at)
-      if tn is TypeRef { t = resolveAnnotAt(tn.tyName, d.fnTyParams, at, "") }
+      if tn is TypeRef {
+        t = resolveAnnotAt(tn.tyName, d.fnTyParams, at, "", m)
+      }
     }
     if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyReachesHole(t, 8) {
-      inferQuiet = savedQuiet
-      quietDepth = quietDepth - 1
+      quietLeave(quiet)
       return none
     }
     out.push(t)
   }
-  inferQuiet = savedQuiet
-  quietDepth = quietDepth - 1
-  out
+  quietLeave(quiet)
+  return out
 }
 
 // The signature the first generic function of `ms` gives at closed parameter types `ps`: its
@@ -2005,7 +2217,7 @@ function letFnGenericAt(ms: i32[], ps: i32[]): i32 {
     if d is FuncDecl && d.fnTyParams.length > 0 {
       const gt = nodeTyIxOf(m)
       if gt < 0 || gt >= T.tys.length { return -1 }
-      const gf = T.tys[gt]
+      const gf = tyAt(gt)
       if !(gf is TyFunc) || gf.fnParamTypes.length != ps.length { return -1 }
       const bn: string[] = []
       const bt: i32[] = []
@@ -2026,7 +2238,7 @@ function letFnGenericAt(ms: i32[], ps: i32[]): i32 {
       return mkFuncTy(cp, r)
     }
   }
-  -1
+  return -1
 }
 
 // Whether declaration `m` is plain, or a generic whose signature, bound against closed function
@@ -2037,8 +2249,8 @@ function letFnGenericFitsAt(m: i32, f: i32): boolean {
   if d.fnTyParams.length == 0 { return true }
   const gt = nodeTyIxOf(m)
   if gt < 0 || gt >= T.tys.length { return false }
-  const gf = T.tys[gt]
-  const ff = T.tys[f]
+  const gf = tyAt(gt)
+  const ff = tyAt(f)
   if !(gf is TyFunc) || !(ff is TyFunc) { return false }
   if gf.fnParamTypes.length != ff.fnParamTypes.length { return false }
   const bn: string[] = []
@@ -2058,7 +2270,7 @@ function letFnGenericFitsAt(m: i32, f: i32): boolean {
     }
     i = i + 1
   }
-  tySame(substTyDeep(gf.fnRet, bn, bt), ff.fnRet)
+  return tySame(substTyDeep(gf.fnRet, bn, bt), ff.fnRet)
 }
 
 // Whether every field of record literal `o` is a named function, whose type no instance changes, or
@@ -2074,7 +2286,39 @@ function recLitNamesFns(o: ObjLit): boolean {
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
     if !(dn is Param) && (!(dn is FuncDecl) || dn.fnName == "") { return false }
   }
-  true
+  return true
+}
+
+// The list literal initialising the binding the read `v` names, where `v` is its one read
+// (`cwSoleReadInit`) and `ft`, its type, a list of functions; else -1.
+function letFnListSoleSource(v: i32, ft: i32): i32 {
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
+  const fa = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { tyAt(TY_ERR) }
+  const fe = if fa is TyArray && !tyElemOpen(fa) && tyElemOf(fa) < T.tys.length { tyAt(tyElemOf(fa)) } else { tyAt(TY_ERR) }
+  if !(fe is TyFunc) { return -1 }
+  const src = cwSoleReadInit(v)
+  return if src >= 0 && src < P.nodes.length && nodeAt(src) is ArrayLit { src } else { -1 }
+}
+
+// The tail values of a `let` initialiser `init`, peeled.
+function letInitLeaves(init: i32): i32[] {
+  const ls: i32[] = []
+  tailValueLeaves(init, ls)
+  const out: i32[] = []
+  for l in ls { out.push(parenPeelIx(l)) }
+  return out
+}
+
+// Whether `init` is a value `if` or `match` whose every tail value is a record literal.
+function letInitArmLits(init: i32): boolean {
+  const x = parenPeelIx(init)
+  if x < 0 || x >= P.nodes.length || nodeAt(x) is ObjLit { return false }
+  const ls = letInitLeaves(init)
+  if ls.length < 2 { return false }
+  for l in ls {
+    if l < 0 || l >= P.nodes.length || !(nodeAt(l) is ObjLit) { return false }
+  }
+  return true
 }
 
 // Type `t` of literal `lit` at step path `pre` of the binding `bd` initialises, each list of
@@ -2086,10 +2330,10 @@ function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
   if !(ln is ArrayLit) || t < 0 || t >= T.tys.length || pre.length > 8 {
     return t
   }
-  const ta = T.tys[t]
+  const ta = tyAt(t)
   if !(ta is TyArray) || ln.arrElems.length == 0 { return t }
   // A list of functions below the binding's own value is the leaf `elabFnFieldTy` widens.
-  const ea = if ta.aElem >= 0 && ta.aElem < T.tys.length { T.tys[ta.aElem] } else { T.tys[TY_ERR] }
+  const ea = if !tyElemOpen(ta) && tyElemOf(ta) < T.tys.length { tyAt(tyElemOf(ta)) } else { tyAt(TY_ERR) }
   if ea is TyFunc {
     const none: i32[] = []
     return if pre.length > 0 { elabFnFieldTy(bd, pre, t, none) } else { t }
@@ -2107,14 +2351,14 @@ function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
   let w = -1
   for e in ln.arrElems {
     const v = parenPeelIx(e)
-    const we = letLitListsWidenAt(bd, v, ta.aElem, steps)
+    const we = letLitListsWidenAt(bd, v, tyElemOf(ta), steps)
     if w < 0 { w = we }
   }
-  if w < 0 || w == ta.aElem { return t }
+  if w < 0 || w == tyElemOf(ta) { return t }
   for e in ln.arrElems { nodeTySetGrow(parenPeelIx(e), w) }
   const nt = mkArrayTy(w)
   nodeTySetGrow(lit, nt)
-  nt
+  return nt
 }
 
 // Type `t` of the record a call returns into binding `bd`, each field holding a function or a
@@ -2122,7 +2366,7 @@ function letLitListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
 // writes through `bd`.
 function letCallFieldsWiden(bd: i32, t: i32, rets: i32[]): i32 {
   if t < 0 || t >= T.tys.length { return t }
-  const to = T.tys[t]
+  const to = tyAt(t)
   if !(to is TyObj) { return t }
   const tys: i32[] = []
   let changed = false
@@ -2143,32 +2387,32 @@ function letCallFieldsWiden(bd: i32, t: i32, rets: i32[]): i32 {
   if !changed { return t }
   const names: string[] = []
   for nm in to.objFieldNames { names.push(nm) }
-  mkObjTy(names, tys)
+  return mkObjTy(names, tys)
 }
 
 // Whether `letCallFieldsWiden` can move `t`: a record with a function or function-list field.
 // Without one the callee's return values are not collected at all.
 function letCallFieldsWidenable(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
-  const to = T.tys[t]
+  const to = tyAt(t)
   if !(to is TyObj) { return false }
   for ft in to.objFieldTypes {
     if letFieldHoldsFn(ft) { return true }
   }
-  false
+  return false
 }
 
 // Whether a record field of type `ft` holds a function, directly or as a list's element.
 function letFieldHoldsFn(ft: i32): boolean {
-  const fa = if ft >= 0 && ft < T.tys.length { T.tys[ft] } else { T.tys[TY_ERR] }
-  const fe = if fa is TyArray && fa.aElem >= 0 && fa.aElem < T.tys.length { T.tys[fa.aElem] } else { fa }
-  fe is TyFunc
+  const fa = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { tyAt(TY_ERR) }
+  const fe = if fa is TyArray && !tyElemOpen(fa) && tyElemOf(fa) < T.tys.length { tyAt(tyElemOf(fa)) } else { fa }
+  return fe is TyFunc
 }
 
 // `letFieldListsWiden` for the record literal `lit` of type `t` at field path `pre`.
 function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
   if t < 0 || t >= T.tys.length || pre.length > 8 { return t }
-  const to = T.tys[t]
+  const to = tyAt(t)
   const ln = nodeAt(lit)
   if !(to is TyObj) || !(ln is ObjLit) { return t }
   const tys: i32[] = []
@@ -2192,10 +2436,20 @@ function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
           w = letLitListsWidenAt(bd, v, ft, steps)
         } else if nodeAt(v) is ObjLit {
           w = letFieldListsWidenAt(bd, v, ft, steps)
+        } else if letFnListSoleSource(v, ft) >= 0 {
+          // A list binding read only here is this field's producer: its literal takes the
+          // functions written into the field too, and is built at the field (D15392).
+          const none: i32[] = []
+          w = elabFnFieldTy(bd, steps, ft, none)
+          if w != ft {
+            const src = letFnListSoleSource(v, ft)
+            nodeTySetGrow(identDeclOf(v), w)
+            nodeTySetGrow(src, w)
+          }
         } else if (
           ft >= 0
           && ft < T.tys.length
-          && (T.tys[ft] is TyFunc || T.tys[ft] is TyMap)
+          && (tyAt(ft) is TyFunc || tyAt(ft) is TyMap)
         ) {
           // A field holding a function, or a map of them, takes the functions written into it
           // too (D15119, D15534).
@@ -2218,5 +2472,5 @@ function letFieldListsWidenAt(bd: i32, lit: i32, t: i32, pre: string[]): i32 {
   for nm in to.objFieldNames { names.push(nm) }
   const nt = mkObjTy(names, tys)
   nodeTySetGrow(lit, nt)
-  nt
+  return nt
 }

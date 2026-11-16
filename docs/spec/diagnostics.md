@@ -94,7 +94,7 @@ sources (`compiler/`, `std/`) are not listed: they report nothing on other progr
 | `duplicate-import` | warning | a name imported twice from one module |
 | `unreachable-code` | warning | a statement after `return`, `break` or a diverging branch |
 | `constant-condition` | warning | an `if` or `while` whose condition is a literal boolean that makes a branch dead |
-| `divide-by-zero` | warning | `/` or `%` by a literal `0`, also beside the error when the dividend is constant (D2.3) |
+| `divide-by-zero` | warning | `/` or `%` by a literal `0`, also beside the error when the dividend is constant (D2.3); a float `/` or `%` by a zero literal (D6.3) |
 | `range-inclusive-length` | warning | `0 to xs.length`, one step past the last index |
 | `unconditional-recursion` | warning | a function every path of which calls itself again |
 | `unused-pure-expression` | warning | a value computed and dropped, not the last statement of its block |
@@ -122,7 +122,7 @@ function f(a: i32) {
     let b = 2            // warns: `b` shadows the `b` declared at 2:7
     return b
   }
-  b
+  return b
 }
 print(f(1))              // prints 2
 ```
@@ -133,7 +133,7 @@ function so named gets a hint instead of a warning.
 ```vl
 function f() {
   let _a = 1             // hint: Intentionally-unused variable `_a`
-  0
+  return 0
 }
 print(f())               // prints 0
 ```
@@ -142,8 +142,8 @@ print(f())               // prints 0
 annotations of an export are its API.
 
 ```vl
-export function f(): i32 { 1 }
-function g(): i32 { 2 }   // hint: redundant type annotation: `g` is inferred as `i32`
+export function f(): i32 { return 1 }
+function g(): i32 { return 2 }   // hint: redundant type annotation: `g` is inferred as `i32`
 print(f() + g())          // prints 3
 ```
 
@@ -233,7 +233,7 @@ caught. Output printed before the trap is kept, `vl run` exits 1, and it writes 
 the engine's reason, the VL source frames from innermost out, and a note in words.
 
 ```vl
-function f(a: i32): i32 { a / 0 }   // warns: `/ 0` traps at run time
+function f(a: i32): i32 { return a / 0 }   // warns: `/ 0` traps at run time
 print(1)       // prints 1
 print(f(4))    // traps: integer divide by zero, at main.vl:1:27 in `f`
 ```
@@ -255,11 +255,15 @@ failure with a reason returns a union of the result and the error. A trap is for
 | `__trap__(msg)`, or a call that returns `never` | statements.md §S8.2 |
 
 **D6.3** Float division by zero does not trap. It gives the IEEE result (expressions.md
-§E2.4).
+§E2.4). A float `/` or `%` whose divisor is a zero literal (`0.0`, `-0.0`, a parenthesised
+zero) is a warning (`divide-by-zero`): "dividing by `0.0` gives Infinity or NaN". A named
+or computed divisor never warns, and `std:math`'s `INFINITY` and `NAN` spell the values.
 
 ```vl
 print(1.0 / 0.0)   // prints Infinity
 ```
+
+> Ruling: owner 2026-11-15 (lane O's spec question 9): the float zero-divisor warning.
 
 **D6.4** An integer `/` or `%` whose divisor is the literal `0` and whose dividend is not
 constant is a warning (`divide-by-zero`), and traps when it runs (D6.1). When both

@@ -141,6 +141,7 @@ row_mem() {
     "distilled corpus") echo 1700 ;;
     "rep-fuzz") echo 1600 ;;
     "deno task test"|"plumb-shape cost") echo 1400 ;;
+    "ir shadow") echo 1300 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 900 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
@@ -305,6 +306,9 @@ run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED"
 # The late-demand RATCHET: elaboration keys minted after `elabRun` returned, per file,
 # against scripts/late-demands-baseline.txt. `$VL_BIN` makes the sweep use this host.
 run "late demands"             env VL_BIN="$VL" "$VL" run scripts/late-demands.vl --compiler "$SEED" -- --check --seed "$SEED"
+# The phase-state RATCHET (L5): hidden-argument globals, cross-phase tables and the checker
+# symbols other phases import, per module, against scripts/phase-state-baseline.txt.
+run "phase state"              "$VL" run scripts/phase-state-census.vl --compiler "$SEED" -- --check
 # No Python anywhere in the tree: a tracked .py file or a python invocation in a script fails.
 run "no-python"                "$VL" run scripts/no-python.vl
 # No `emitter state` row: lane L7's invariant (`emitter-state-audit.vl --check`, 0 never-cleared)
@@ -392,6 +396,10 @@ if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
 else
   run "distilled corpus"       "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 fi
+# The IR shadow over the same corpus: every covered function's lowering must match legacy's
+# bytes and spans, and any verifier failure or mismatch class above
+# `ir-shadow-baseline.txt` reds. The shadow is the check behind every IR claim.
+run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED"
 
 echo "== $((${#CMDS[@]})) rows, at most $([ "$GATE_MAX_PAR" = 0 ] && echo all || echo "$GATE_MAX_PAR") at once, memory budget $([ "$GATE_MEM_BUDGET_MB" = 0 ] && echo none || echo "${GATE_MEM_BUDGET_MB} MiB") =="
 dispatch

@@ -13,16 +13,10 @@ import {
   loadWasmChecker,
 } from "../lsp/src/wasmCheckerNode.ts";
 import type { VLDiagnostic } from "../compiler/diagnostics.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const logs: string[] = [];
 const log = (m: string) => logs.push(m);
@@ -135,9 +129,9 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
     (await checker.check(src, "/tmp/x.vl", noSiblings))
       .filter((d) => d.severity === "error")
       .map((d) => d.message);
-  const body = "function mul32(a: f32, b: f32): f32 { a * b }\n" +
+  const body = "function mul32(a: f32, b: f32): f32 { return a * b }\n" +
     "const TABLE = [1.0, 0.0, 0.0, 1.0]\n" +
-    "function f(): f32 { mul32(TABLE[0], 1.0) }\nprint(f())\n";
+    "function f(): f32 { return mul32(TABLE[0], 1.0) }\nprint(f())\n";
   const hit = await msgs(body);
   const wantHit = [
     "argument 1: expected f32, got f64 — `TABLE` on line 2 has no annotation, so its literal " +
@@ -149,7 +143,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
   // No note: an annotated declaration, a non-literal initializer, and a list a non-literal write
   // reaches. A scalar `let` a non-literal write reaches takes its type from its uses (D3246), and
   // one whose read and write disagree is refused naming both, below.
-  const g = "function g(a: f32): f32 { a }\nfunction src(): f64 { 3.0 }\n";
+  const g = "function g(a: f32): f32 { return a }\nfunction src(): f64 { return 3.0 }\n";
   const misses = [
     body.replace("const TABLE =", "const TABLE: f64[] ="),
     g + "const T: f64[] = [1.0]\nconst V = T[0]\nprint(g(V))\n",
@@ -178,7 +172,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
       ["argument 1: expected f32, got f64", conflict("u", 4, "f64", 5, "f32")],
     ],
     // A literal `const` is its literal at the read, so the mismatch is the literal's own.
-    ["function h(a: i32): i32 { a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it"]],
+    ["function h(a: i32): i32 { return a }\nconst F = 2.5\nprint(h(F))\n", ["constant 2.5 is not a whole number, so i32 cannot hold it — round it first: `floor(…) as! i32`, `round(…) as! i32` or `trunc(…) as! i32`"]],
   ];
   for (const [src, want] of scalars) {
     const got = await msgs(src);
@@ -191,7 +185,7 @@ Deno.test({ name: "wasm-checker: a defaulted numeric literal names its declarati
   const lib = "export const TABLE = [1.0, 2.0]\n";
   const read = (key: string) => key.endsWith("lib.vl") ? lib : undefined;
   const cross = (await checker.check(
-    'import { TABLE as T } from "./lib"\nfunction g(a: f32): f32 { a }\nprint(g(T[0]))\n',
+    'import { TABLE as T } from "./lib"\nfunction g(a: f32): f32 { return a }\nprint(g(T[0]))\n',
     "/proj/main.vl",
     read,
   )).filter((d) => d.severity === "error").map((d) => d.message);
@@ -212,15 +206,15 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
     (await checker.check(src, "/tmp/x.vl", noSiblings))
       .filter((d) => d.severity === "error")
       .map((d) => d.message);
-  const witness = "function ld32(a: i64) { (__load_i32__(a as% i32) as% i64) & 4294967295 }\n" +
-    "function sum(p: i64, n: i64) { let s = 0; let i = 0; while i < n { s += ld32(p + i * 4); i += 1 }; s }\n" +
+  const witness = "function ld32(a: i64) { return (__load_i32__(a as% i32) as% i64) & 4294967295 }\n" +
+    "function sum(p: i64, n: i64) { let s = 0; let i = 0; while i < n { s += ld32(p + i * 4); i += 1 }; return s }\n" +
     "print(sum(0, 0))\n";
   // PL-054's witness now checks: `s` takes `i64` from its store (D3246).
   const clean = await msgs(witness);
   if (clean.length !== 0) throw new Error(`want the witness clean, got ${JSON.stringify(clean)}`);
   const hits: [string, string][] = [
     [
-      "function fl(): f32 { 1.5 }\nconst r = { x: 0 }\nr.x += fl()\nprint(r.x)\n",
+      "function fl(): f32 { return 1.5 }\nconst r = { x: 0 }\nr.x += fl()\nprint(r.x)\n",
       "operator '+' mixes i32 and f32 — field `x` of `r` on line 2 has no annotation, so its " +
       "literal defaulted to `i32`; write it `x: 0 as f32`",
     ],
@@ -231,16 +225,16 @@ Deno.test({ name: "wasm-checker: a store into a defaulted literal names its decl
       throw new Error(`want ${JSON.stringify([want])}, got ${JSON.stringify(got)}`);
     }
   }
-  // No note: an annotated declaration, an integer `let` a float is stored into, a float `let` an
-  // integer is stored into (each keeps its kind, D3246), and a store to a `const`.
-  const g = "function big(): i64 { 5 }\nfunction fl(): f32 { 1.5 }\n";
+  // No note: an annotated declaration, an integer `let` an `i64` and a float are stored into, a
+  // float `let` an integer is stored into (each keeps its kind, D3246), and a store to a `const`.
+  const g = "function big(): i64 { return 5 }\nfunction fl(): f32 { return 1.5 }\n";
   const misses: [string, string[]][] = [
     [g + "let a: i32 = 0\na = big()\nprint(a)\n", ["cannot assign i64 to i32"]],
     [g + "let b = 0\nb = big()\nb = fl()\nprint(b)\n", ["cannot assign f32 to i64"]],
     [g + "let c = 0.5\nc = big()\nprint(c)\n", ["cannot assign i64 to f64"]],
     // A whole store to a `const` is refused; a `const` is never re-typed by a store.
     [
-      "function big(): i64 { 5000000000 }\nconst t = 0\n" +
+      "function big(): i64 { return 5000000000 }\nconst t = 0\n" +
       "function run() { const s = 0; s += big(); t = big() }\nrun()\n",
       [
         "cannot reassign `const` s",
@@ -267,20 +261,20 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
     (await checker.check(src, "/tmp/x.vl", noSiblings))
       .filter((d) => d.severity === "error")
       .map((d) => d.message);
-  const g = "function mul(a: f32, b: f32): f32 { a * b }\nfunction gi(a: i32): i32 { a }\n";
+  const g = "function mul(a: f32, b: f32): f32 { return a * b }\nfunction gi(a: i32): i32 { return a }\n";
   // A literal `const` is its literal at every read (D3246, owner ruling C): a first argument, an
   // operand, a record field, a list element, and reads that want different types all check.
   const clean = [
-    g + "const x = 0.0\nfunction f(y: f32): f32 { mul(x, y) }\nprint(f(2.0))\n",
-    g + "function f(y: f32): f32 {\n  const n = 3\n  n * y\n}\nprint(f(2.0))\n",
+    g + "const x = 0.0\nfunction f(y: f32): f32 { return mul(x, y) }\nprint(f(2.0))\n",
+    g + "function f(y: f32): f32 {\n  const n = 3\n  return n * y\n}\nprint(f(2.0))\n",
     g + "type V = { v: f32 }\nlet fv = 1.5\nconst r: V = { v: fv }\nprint(r.v)\n",
     g + "const e = 4\nconst xs: f32[] = [e]\nprint(xs[0])\n",
     g + "const d = 7\nprint(mul(d, 1.0))\nprint(d / 2)\n",
     g + "const b = 3\nprint(mul(b, 1.0))\nprint(gi(b))\n",
     g + "const i = 1\nconst ys = [7, 8]\nprint(ys[i])\nprint(mul(i, 1.0))\n",
-    g + "const m = 3\nfunction a(): f32 { mul(m, 1.0) }\nfunction c(n: i32): boolean { m < n }\nprint(a())\n",
+    g + "const m = 3\nfunction a(): f32 { return mul(m, 1.0) }\nfunction c(n: i32): boolean { return m < n }\nprint(a())\n",
     g + "const q = 3\nprint(mul(q, 1.0))\nprint(q == 3)\n",
-    g + "function id<T>(a: T): T { a }\nconst p = 3\nprint(mul(p, 1.0))\nprint(id(p) + gi(1))\n",
+    g + "function id<T>(a: T): T { return a }\nconst p = 3\nprint(mul(p, 1.0))\nprint(id(p) + gi(1))\n",
   ];
   for (const src of clean) {
     const got = await msgs(src);
@@ -292,9 +286,10 @@ Deno.test({ name: "wasm-checker: a defaulted literal read inside a value names i
   if (JSON.stringify(v) !== JSON.stringify(wantV)) {
     throw new Error(`want the bare mismatch, got ${JSON.stringify(v)}`);
   }
-  // D2981: a float literal stored into an integer `let` is refused; the `let` keeps its kind.
+  // D2981: a float literal stored into an integer `let` delivered to an `i32` is refused; the
+  // destination vetoes the float the store would join it to (D16293), so the `let` keeps its kind.
   const store = await msgs(g + "const b = 1.5\nlet w = 0\nw = b\nprint(gi(w))\n");
-  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it"];
+  const wantStore = ["constant 1.5 is not a whole number, so i32 cannot hold it — round it first: `floor(…) as! i32`, `round(…) as! i32` or `trunc(…) as! i32`"];
   if (JSON.stringify(store) !== JSON.stringify(wantStore)) {
     throw new Error(`want ${JSON.stringify(wantStore)}, got ${JSON.stringify(store)}`);
   }
@@ -309,13 +304,13 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     (await checker.check(src, "/tmp/x.vl", noSiblings))
       .filter((d) => d.severity === "error")
       .map((d) => d.message);
-  const g = "function ap(f: (i64) => f32): f32 { f(1) }\nfunction ai(f: (i64) => i64): i64 { f(1) }\n" +
-    "function a32(f: (i64) => i32): i32 { f(1) }\n";
+  const g = "function ap(f: (i64) => f32): f32 { return f(1) }\nfunction ai(f: (i64) => i64): i64 { return f(1) }\n" +
+    "function a32(f: (i64) => i32): i32 { return f(1) }\n";
   // The destination returns `f32`, which an `i32` result does not widen to (D15896).
   const mis = "argument 1: expected (i64) => f32, got (i64) => i32";
   const hits: [string, string][] = [
     [
-      g + "function never(x: i64) { -1 }\nprint(ap(never))\n",
+      g + "function never(x: i64) { return -1 }\nprint(ap(never))\n",
       mis + " — `never` returns the literal `-1` on line 4, so its return defaulted to `i32`; " +
       "annotate it: `function never(x: i64): f32 { … }`",
     ],
@@ -326,13 +321,13 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
     ],
     // A tree of literals is its constant, so it is named by its value.
     [
-      g + "function m(x: i64) { 2 * 3 }\nprint(ap(m))\n",
+      g + "function m(x: i64) { return 2 * 3 }\nprint(ap(m))\n",
       mis + " — `m` returns the literal `6` on line 4, so its return defaulted to `i32`; " +
       "annotate it: `function m(x: i64): f32 { … }`",
     ],
     // A call whose result still fits the annotated return keeps the note.
     [
-      g + "function c(x: i64) { 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: f64 = c(4)\nprint(y)\n",
+      g + "function c(x: i64) { return 5 }\nprint(ap(c))\nprint(c(2))\nc(3)\nconst y: f64 = c(4)\nprint(y)\n",
       mis + " — `c` returns the literal `5` on line 4, so its return defaulted to `i32`; " +
       "annotate it: `function c(x: i64): f32 { … }`",
     ],
@@ -345,30 +340,30 @@ Deno.test({ name: "wasm-checker: a function value's defaulted literal return nam
   }
   const misses: [string, string[]][] = [
     // Another use needs the `i32` return: as a value, or as a call result.
-    [g + "function a(x: i64) { -1 }\nprint(ap(a))\nprint(a32(a))\n", [mis]],
-    [g + "function b(x: i64) { -1 }\nprint(ap(b))\nconst y: i32 = b(1)\nprint(y)\n", [mis]],
+    [g + "function a(x: i64) { return -1 }\nprint(ap(a))\nprint(a32(a))\n", [mis]],
+    [g + "function b(x: i64) { return -1 }\nprint(ap(b))\nconst y: i32 = b(1)\nprint(y)\n", [mis]],
     // Two destinations want two annotations.
     [
-      g + "function d(x: i64) { 2 }\nprint(ap(d))\nprint(ai(d))\n",
+      g + "function d(x: i64) { return 2 }\nprint(ap(d))\nprint(ai(d))\n",
       [mis],
     ],
     // An `f32` holds integers only up to 2^24 exactly.
-    [g + "function e(x: i64) { 16777217 }\nprint(ap(e))\n", [mis]],
+    [g + "function e(x: i64) { return 16777217 }\nprint(ap(e))\n", [mis]],
     // A lambda binding that is reassigned, or aliased.
-    [g + "function z(x: i64): i32 { 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
-    [g + "function h(x: i64) { 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
+    [g + "function z(x: i64): i32 { return 0 }\nlet k = (x: i64) => -1\nprint(ap(k))\nk = z\n", [mis]],
+    [g + "function h(x: i64) { return 7 }\nconst al = h\nprint(ap(h))\nprint(a32(al))\n", [mis]],
     // A return that is not a literal (a tree of literals is one: its constant, exact).
-    [g + "function m(x: i64) { (x as% i32) * 3 }\nprint(ap(m))\n", [mis]],
+    [g + "function m(x: i64) { return (x as% i32) * 3 }\nprint(ap(m))\n", [mis]],
     // A call result the annotation would change: cast, operator, inferred tail, member call.
-    [g + "function c1(x: i64) { 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
-    [g + "function c2(x: i64) { 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],
+    [g + "function c1(x: i64) { return 5 }\nprint(ap(c1))\nprint(c1(1) as i32)\n", [mis]],
+    [g + "function c2(x: i64) { return 5 }\nprint(ap(c2))\nprint(c2(1) * 1000000000)\n", [mis]],
     [
-      g + "function c3(x: i64) { 5 }\nprint(ap(c3))\nfunction w() { c3(1) }\nfunction t(v: i32): i32 { v }\nprint(t(w()))\n",
+      g + "function c3(x: i64) { return 5 }\nprint(ap(c3))\nfunction w() { return c3(1) }\nfunction t(v: i32): i32 { return v }\nprint(t(w()))\n",
       [mis],
     ],
-    [g + "function c4(self: i64) { 5 }\nprint(ap(c4))\nconst q: i32 = (1 as i64).c4()\nprint(q)\n", [mis]],
+    [g + "function c4(self: i64) { return 5 }\nprint(ap(c4))\nconst q: i32 = (1 as i64).c4()\nprint(q)\n", [mis]],
     // An exported function: another module may read its result at the old type.
-    [g + "export function c5(x: i64) { 5 }\nprint(ap(c5))\n", [mis]],
+    [g + "export function c5(x: i64) { return 5 }\nprint(ap(c5))\n", [mis]],
   ];
   for (const [src, want] of misses) {
     const got = await msgs(src);
@@ -596,8 +591,8 @@ Deno.test({
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   const src = "const K = 7\n" +
-    "function takeF32(x: f32): f32 { x }\n" +
-    "function takeI64(x: i64): i64 { x }\n" +
+    "function takeF32(x: f32): f32 { return x }\n" +
+    "function takeI64(x: i64): i64 { return x }\n" +
     "print(takeF32(K))\n" +
     "print(takeI64(K))\n" +
     "let bb = 1\n" +
@@ -624,19 +619,19 @@ Deno.test({
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   const src = "print(K + 1)\n" +
-    "function above(): i32 { K + N }\n" +
+    "function above(): i32 { return K + N }\n" +
     "const K = 3\n" +
-    "function one(): i32 { 1 }\n" +
+    "function one(): i32 { return 1 }\n" +
     "const N = one()\n";
   const at = (r: { start: { line: number; character: number } }) =>
     `${r.start.line}:${r.start.character}`;
   const k = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 2, 6, true)).map(at).sort();
-  if (JSON.stringify(k) !== '["0:6","1:24","2:6"]') {
-    throw new Error(`K references: want ["0:6","1:24","2:6"], got ${JSON.stringify(k)}`);
+  if (JSON.stringify(k) !== '["0:6","1:31","2:6"]') {
+    throw new Error(`K references: want ["0:6","1:31","2:6"], got ${JSON.stringify(k)}`);
   }
   const n = (await checker.referencesAt(src, "/tmp/x.vl", noSiblings, 4, 6, true)).map(at).sort();
-  if (JSON.stringify(n) !== '["1:28","4:6"]') {
-    throw new Error(`N references: want ["1:28","4:6"], got ${JSON.stringify(n)}`);
+  if (JSON.stringify(n) !== '["1:35","4:6"]') {
+    throw new Error(`N references: want ["1:35","4:6"], got ${JSON.stringify(n)}`);
   }
   const hover = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 6);
   if (hover !== "i32") throw new Error(`hover above the declaration: want i32, got ${hover}`);
@@ -783,7 +778,7 @@ Deno.test({
   // A FUNCTION binding still renders as its NAMED signature — `fnSigStr` is only
   // skipped for an occurrence that actually carries a narrowing, and a function
   // name never does.
-  const fn = "function add(a: i32, b: i32) {\n  a + b\n}\nprint(add(1, 2))\n";
+  const fn = "function add(a: i32, b: i32) {\n  return a + b\n}\nprint(add(1, 2))\n";
   const use = await checker.hoverTypeAt(fn, "/tmp/x.vl", noSiblings, 3, 6);
   if (use !== "(a: i32, b: i32) => i32") {
     throw new Error(`expected the named signature at a fn use, got ${JSON.stringify(use)}`);
@@ -869,7 +864,7 @@ Deno.test({ name: "wasm-symbols: an unannotated function's inferred return is re
   const checker = loadWasmChecker(SEED, log)!;
   // No return annotation — the checker now writes the demand-inferred return back
   // into the function's retained type, so hover renders `=> i32`, not the blank `=> _`.
-  const src = "function add(a: i32, b: i32) {\n  a + b\n}\n";
+  const src = "function add(a: i32, b: i32) {\n  return a + b\n}\n";
   const ty = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
   if (ty !== "(a: i32, b: i32) => i32") {
     throw new Error(`expected the inferred return retained, got ${JSON.stringify(ty)}`);
@@ -1026,7 +1021,7 @@ Deno.test({ name: "wasm-checker: lint surfaces unused-pure-expression, tagged un
   const checker = loadWasmChecker(SEED, log)!;
   // The motivating shape: a stray pure literal ahead of the real work fires; the
   // block-tail `0` (the function's value) and the call statement do not.
-  const src = "function f() {\n  3\n  print(1)\n  0\n}\nf()\n";
+  const src = "function f() {\n  3\n  print(1)\n  return 0\n}\nf()\n";
   const diags = checker.lint(src);
   const hits = diags.filter((d) => d.code === "unused-pure-expression");
   if (hits.length !== 1) {
@@ -1107,7 +1102,7 @@ Deno.test({ name: "wasm-checker: shadowed-local warns on the inner binding's nam
     throw new Error(`want the range over the inner \`sheet\` at 3:${innerCol}, got ${JSON.stringify(d.range)}`);
   }
   // The control: a lambda's own binding is not the enclosing function's.
-  const lam = "function g() {\n  const n = 1\n  const h = (k: i32) => { const n = k; n }\n  h(n)\n}\nprint(g())\n";
+  const lam = "function g() {\n  const n = 1\n  const h = (k: i32) => { const n = k; return n }\n  return h(n)\n}\nprint(g())\n";
   const quiet = checker.lint(lam).filter((x) => x.code === "shadowed-local");
   if (quiet.length !== 0) throw new Error(`a lambda binding fired: ${JSON.stringify(quiet)}`);
 });
@@ -1115,7 +1110,7 @@ Deno.test({ name: "wasm-checker: shadowed-local warns on the inner binding's nam
 Deno.test({ name: "wasm-checker: shadowed-function warns on a local hiding a function it calls above (D3599)", ignore }, () => {
   const checker = loadWasmChecker(SEED, log)!;
   // sunpa SP-029: `over` is called, then a `const over` hides the module's function.
-  const src = "function over(x: i32) { x + 1 }\n" +
+  const src = "function over(x: i32) { return x + 1 }\n" +
     "export function f(k: i32) {\n" +
     "  let a = over(k)\n" +
     "  const over = 3\n" +
@@ -1133,7 +1128,7 @@ Deno.test({ name: "wasm-checker: shadowed-function warns on a local hiding a fun
     throw new Error(`want the range over the \`const\`'s name on line 3, got ${JSON.stringify(d.range)}`);
   }
   // The control: a binding named like a builtin the function never calls is quiet.
-  const quiet = checker.lint("function h(max: i32) { max + 1 }\nprint(h(1))\n")
+  const quiet = checker.lint("function h(max: i32) { return max + 1 }\nprint(h(1))\n")
     .filter((x) => x.code === "shadowed-function");
   if (quiet.length !== 0) throw new Error(`an uncalled builtin name fired: ${JSON.stringify(quiet)}`);
 });
@@ -1459,7 +1454,7 @@ Deno.test({ name: "wasm-symbols: completion details demangle through the shared 
 
 Deno.test({ name: "wasm-symbols: a local function hovers with parameter names (decl + use)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const src = 'function greet(who: string, times: i32): string {\n  who + "!"\n}\nprint(greet("a", 1))\n';
+  const src = 'function greet(who: string, times: i32): string {\n  return who + "!"\n}\nprint(greet("a", 1))\n';
   const want = "(who: string, times: i32) => string";
   const decl = await checker.hoverTypeAt(src, "/tmp/x.vl", noSiblings, 0, 9);
   if (decl !== want) throw new Error(`expected ${want} at the decl, got ${JSON.stringify(decl)}`);
@@ -1493,12 +1488,12 @@ Deno.test({ name: "wasm-symbols: a lambda-bound value and a function-typed param
   }
   // A function-typed PARAMETER's decl node is the Param — bare type kept, at the
   // decl and at a use. (The enclosing function still zips: `cb` is named there.)
-  const hof = "function run(cb: (i32) => i32): i32 {\n  cb(1)\n}\nprint(run((x: i32) => x))\n";
+  const hof = "function run(cb: (i32) => i32): i32 {\n  return cb(1)\n}\nprint(run((x: i32) => x))\n";
   const paramDecl = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 0, 13);
   if (paramDecl !== "(i32) => i32") {
     throw new Error(`expected the bare type for a fn-typed param, got ${JSON.stringify(paramDecl)}`);
   }
-  const paramUse = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 1, 2);
+  const paramUse = await checker.hoverTypeAt(hof, "/tmp/x.vl", noSiblings, 1, 9);
   if (paramUse !== "(i32) => i32") {
     throw new Error(`expected the bare type at the param's use, got ${JSON.stringify(paramUse)}`);
   }
@@ -1563,7 +1558,7 @@ Deno.test({
   // must stay on the single-source path and check clean. This is the arm the `{`
   // test buys, and a gate widened to a bare `startsWith("export")` breaks here.
   const plainExport = await checker.check(
-    "export function twice(n: i32): i32 { n * 2 }\nprint(twice(2))\n",
+    "export function twice(n: i32): i32 { return n * 2 }\nprint(twice(2))\n",
     "/proj/main.vl",
     noSiblings,
   );
@@ -1582,7 +1577,7 @@ Deno.test({
   ignore,
 }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
-  const lib = "export function sq(n: i32): i32 { n * n }\n";
+  const lib = "export function sq(n: i32): i32 { return n * n }\n";
   const siblings = (p: string) => p === "/proj/lib.vl" ? lib : undefined;
   const src = 'import { sq } from "./lib"\nexport { sq }\nprint(sq(3))\n';
   const diags = await checker.check(src, "/proj/main.vl", siblings);

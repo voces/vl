@@ -91,7 +91,7 @@ the receiver at all. `RowAddr = new i32` is an address, and "set" is a store *th
 
 ```vl
 type RowAddr = new i32
-get hp(self: RowAddr): i32 { __load_i32__(self as! i32) }
+get hp(self: RowAddr): i32 { return __load_i32__(self as! i32) }
 function setHp(self: RowAddr, v: i32) { __store_i32__(self as! i32, v) }
 u.hp = u.hp - 7   // p5.vl: "cannot assign to `.hp`: … a getter is read-only"
 u.setHp(u.hp - 7) // what I must write today

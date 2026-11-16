@@ -5439,7 +5439,7 @@ const w = a * 3.0
 
 function f(): i32 {
   g()
-  -x               // two statements: the block's value is -x
+  return -x               // two statements: the block's value is -x
 }
 ```
 
@@ -9596,7 +9596,8 @@ parenthesised — is re-typed only by:
   map value or other stored place, a nullable number slot (its number), an annotated return, a
   list index (`i32`), a map key;
 * STORES into it (`s = e`, `s += e`), where `e`'s type counts, joined with the literal's own type
-  (so storing an `f32` into `let x = 0.5` keeps `f64`); a stored literal, whole or in the stored
+  (a float literal adopts the float stored into it: storing an `f32` into `let x = 0.5` makes it
+  `f32`, D16490); a stored literal, whole or in the stored
   expression (`y += 3000000000`), bounds it to the types that hold that literal (`y = 3000000000`
   needs a 64-bit type; `y = 0xFFFFFFFF` is `-1` at `i32` and 4294967295 at `i64`, the width the
   other uses choose);
@@ -9616,10 +9617,21 @@ Rules:
 * **Operands never choose.** `s < n64`, `b + mk()` or `take64(b + 1)` give `b` no type; a read
   inside an expression is an operand of it. It still vetoes a type that would make that
   expression wider than where it goes: `take64(b); xs[b - 6]` keeps `b` an `i32`.
-* **Within kind.** An integer literal becomes only a wider integer (`i32` → `i64`), a float one
-  only `f32`/`f64`. A destination of the other kind widens at that use as it always did, and the
-  binding keeps its type — `takeF64(b); print(b / 3)` stays integer division. Such a destination
-  still vetoes a choice the binding could not widen from: `take64(b); takeF64(b)` keeps `i32`.
+* **Within kind, except a float store.** An integer literal becomes only a wider integer (`i32`
+  → `i64`), a float one only `f32`/`f64`. A destination of the other kind widens at that use as
+  it always did, and the binding keeps its type — `takeF64(b); print(b / 3)` stays integer
+  division. Such a destination still vetoes a choice the binding could not widen from:
+  `take64(b); takeF64(b)` keeps `i32`.
+* **A float stored into an integer literal `let` joins it** (owner ruling, 2026-11-15, reversing
+  the clause above for stores: ruling 4.3's one join rule applied to a literal `let`'s stores). A
+  store of a typed float that holds the literal exactly makes the binding that float — `let t =
+  0; t = t + 1.5` is `f64`, `t = f` with `f: f32` is `f32`. A float literal stored, whole or
+  beside the binding (`t = t - 0.1`), adopts a typed float stored there and makes it `f64` only
+  where none is (`t = f; t = t - 0.1` is `f32`, D16490). A float that does not hold the literal
+  exactly keeps the refusal (`let t = 16777217; t
+  = f`). In an un-annotated generic, a store of the parameter's hole (`t = t + xs[i]`, `for x in
+  xs { t = t + x }`) types the binding as that hole, so each call's pin decides: `sum([1, 2])` is
+  `i32`, `sum([1.5, 2.5])` is `f64` (D16293). Integer-only stores keep the integer widening.
 * **Vetoes keep the default.** A float-literal operand (rules out `i64`), a bitwise operand (an
   integer) and `==` with an integer literal (rules out `f32`) choose nothing; when the chosen type
   would break one, the binding keeps its literal's own type rather than being refused.
@@ -9703,8 +9715,9 @@ seed-size baseline is rewritten with it.
 
 **The ruling.** A `const` whose initialiser is literal arithmetic — numeric literals, other such
 `const`s, parentheses, unary minus, `~`, `+ - * / %`, `& | ^`, `<< >> >>>`, with integer and
-float literals — is computed EXACTLY, like Go's untyped constants or Zig's `comptime_int`, and
-typed at each use. A use whose destination cannot hold the exact value is a check error
+float literals — is folded and typed at each use. Its integer arithmetic is EXACT, like Go's
+untyped constants or Zig's `comptime_int`; its float arithmetic is IEEE-754, as at run time
+(owner, 2026-11-15, below). A use whose destination cannot hold the exact value is a check error
 (`constant 2147483648 overflows i32`), never a silent wrap. It extends ruling C (a bare literal
 `const` is its literal at every read). A tree that reads a variable, calls a function, or names a
 `let` is untouched, and so is an annotated `const` except as below.
@@ -9743,19 +9756,19 @@ tree read stays an editor reference.
   element — is that integer when it is a whole number (`2.5 * 4` is `10` at `i64`); otherwise it
   is refused as any float there is.
 * An integer constant at `f32` or `f64` is taken as an integer literal is: when that float holds
-  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round). A float
-  constant is exact until its use: `0.1 + 0.2` is the `f64` nearest 0.3 and the `f32` nearest
-  0.3, not the sum of two rounded values.
+  it exactly, and refused otherwise (D1890's rule; a VL integer literal does not round).
+* **A float constant folds in IEEE-754 (owner, 2026-11-15, lane O's spec question 9; this
+  reverses ruling A's float half).** Folding never changes a float result: each float literal is
+  its nearest double, each float operation rounds to the nearest double, ties to even, and an
+  integer operand converts to the nearest double as it enters one. So `0.1 + 0.2` is
+  0.30000000000000004, `1.5 % 0.1` is 0.09999999999999992, `(1.5 % 0.1) / (2.5 % 0.1)` is
+  1.0000000000000007, and `1.0 + 1.0/9007199254740992.0` is `1.0`. A float zero keeps its sign
+  (`0.0 * -1.0` is `-0`). The integer part of a mixed tree still folds exactly, and a float
+  result at an integer destination is still refused unless it is whole. A tree initialising a
+  binding annotated `f32` folds in `f32` arithmetic; at any other `f32` use the fold sees no use
+  type, so the double result rounds once more to `f32` (D16414, open).
 * **Precision.** Integers are exact to 512 bits, past which the expression is a check error
-  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound. A
-  float constant is an exact fraction whose numerator and denominator are each held to 4096
-  bits, enough for every finite double and its reciprocal. It reaches its use as a decimal
-  literal: exact when its expansion terminates within 400 characters, otherwise to 800
-  significant digits and a sticky last digit when anything is cut. Every rounding boundary of
-  an `f32` or `f64` has fewer significant digits than that, so the use rounds the literal as it
-  would the exact value (`1.0 + 1.0/9007199254740992.0 + 1.0/3.0/1e70` is the double above 1,
-  where 60 digits read a tie and rounded to 1). A float zero keeps its sign, as IEEE does:
-  `0.0 * -1.0` is `-0`, and `-0.0 + 0.0` is `+0`.
+  (`constant overflows the 512-bit exact integer range`); Go's compiler uses the same bound.
 * **A refusal names the constant and the destination** at an integer, float or union
   destination: `constant 2147483648 overflows i32`, `constant 123456789000 is not exact at f32`,
   `constant 1.5 is not a whole number, so i64 cannot hold it`, `constant 2147483648 fits no
@@ -9779,9 +9792,28 @@ tree read stays an editor reference.
   `^`, `>>>`, and `<<` within 32 bits (`0xFFFF0000 | 0xFF` is -65281 at `i32` and 4294902015 at
   `i64`; `0xFF << 24` is `0xFF000000`). A decimal literal is a number: `1 << 31` at `i32` is
   refused as Go refuses `int32(1 << 31)`; `0x1 << 31` is the pattern.
+* **At an `f64` the use's width is 64 (owner, 2026-11-15, spec question 4.2).** A radix tree
+  delivered to an `f64`, or beside an `f64` operator peer, computes at 64 bits with integer
+  division and then converts: `let x: f64 = 0xFFFFFFFF + 1000` is 4294968295 and
+  `(0xFFFFFFFF + 1000) + p` with `p: f64` adds 4294968295. This reverses D14990's reading, which
+  computed such a tree at 32 bits (`const c: f64 = 0x7FFFFFFF << 2` was -4, now 8589934588).
+  An `f32` use and no context keep their 32 bits (D16390).
+* **In a float context a radix literal is the value its digits spell (owner, 2026-11-15, ruling
+  4.1, as clarified).** At an `f32` or `f64` destination, or beside a float, the float must hold
+  that value exactly, as it must a decimal integer literal (`const b: f32 = 0x7FFFFFFF` is
+  refused); `as f32` / `as f64` rounds it, so `0xFFFFFFFF as f32` is 4294967296 where it was -1.0,
+  the pattern's signed value. An integer context keeps the bit pattern.
+* **A numeric literal joined with a typed value adopts its type where it fits (owner, 2026-11-15,
+  ruling 4.3).** One rule for every join form, `if` and `match` arms, `??` and list elements: a
+  literal beside values of one numeric type takes that type when the type holds it (an integer
+  literal exactly, a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its
+  own and the join widens as before. `if c { 5 } else { f }` and `[5, f]` with `f: f32` are
+  `f32`; `[0.1, f]` is `f32[]`; `if c { 9000000000 } else { f }` is `i64 | f32`. A join of two
+  typed members of different types keeps today's reading. An un-annotated function's returns
+  are a join too, so `if c { return 5 } return fv` infers `f32` (D2774).
 * **A float division by zero, and a float constant past the largest double, are not folded.**
-  VL has no spelling for infinity or NaN, so `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE
-  computation they were; Go refuses both.
+  `1.0 / 0.0` and `1e308 * 10.0` stay the IEEE computation they were, which gives the same
+  Infinity or NaN; Go refuses both.
 * `>>>` of a negative constant depends on the width it runs at, so it is not folded either, and
   a tree containing one keeps the literal-tree reading at its destination's width (D2709).
 * A `u8` element takes a constant as it takes the literal (past 255 refused, a negative one
@@ -9790,8 +9822,19 @@ tree read stays an editor reference.
 * An annotated `const` is a typed constant (owner, 2026-09-30): its annotation is the tree's
   destination, so `const x: i32 = 2147483647 + 1` is refused rather than wrapped.
 * An integer literal past the `i64` range is refused wherever no float holds it exactly
-  (D3425), where it used to keep its low 64 bits; a constant past it (`1 << 64`) is refused at
-  the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
+  (D3425), where it used to keep its low 64 bits; a constant past it (`(1 << 62) * 4`) is refused
+  at the use, not where it is declared, so `((1 << 62) * 4) >> 60` is 16.
+* **A constant shift count decides an untyped literal operand's width (owner, 2026-11-15, Q8).**
+  A count of 0 to 31 leaves the literal `i32`; a count of 32 to 63 makes it `i64`, so
+  `(-3) >>> (40 + 1)` and `0xFFFFFFFF >> (40 + 1)` compute at 64 bits; a count of 64 or more is
+  refused with E6.2's sentence (`4294967296 >> 65535`, `1 << 64`). An operand whose type is fixed,
+  a declared `x: i32` or an `i32` destination (`const c: i32 = (-3) >>> (40 + 1)`), keeps E6.2's
+  refusal for a count past its width. The count may be a literal or a constant tree (D16378).
+  A shift is typed at its left operand, and a count never types it: an untyped literal takes its
+  destination's or peer's width first, then a constant count's widening, so
+  `(0xFFFFFFFF << 31) << c` at an `i64` is -17179869184 whether `c` is `i32` or `i64`; a variable
+  count widens nothing (`1 << c` with `c: i64` is an `i32`), and `x <<= w` with `x: i32` and an
+  `i64` count is legal.
 * In a generic body, an `i64` operand beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
   since the body alone cannot see the width (D2712, D3426);
@@ -10559,7 +10602,7 @@ position 0. The principle: a positional argument always lands at its written ind
 Kotlin's rule since 1.4.
 
 ```vl
-function box(w: i32, h: i32): i32 { w * 10 + h }
+function box(w: i32, h: i32): i32 { return w * 10 + h }
 box(w: 3, 2)   // ok: `w` is in position 0, so 2 lands at position 1 — 32
 box(h: 3, 2)   // refused: `h` is not in its own position
 box(3, w: 2)   // refused: `w` is given twice
@@ -10588,7 +10631,7 @@ runtime declared-type tag.
 ```vl
 type A = { x: i32 }
 type B = { x: 1 | 2 }
-function f(v: A | B): string { if v is B { return "B" } "A" }
+function f(v: A | B): string { if v is B { return "B" } return "A" }
 const a: A = { x: 1 }
 print(f(a))   // B
 ```
@@ -10626,9 +10669,10 @@ the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests
 and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
 string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every list depth
 (D4914), and two atom-list arms sharing a tag test their atoms (D4938). An arm in a disjoint
-rep fits when it is empty (D4915).
+rep fitted when empty (D4915) until the D16047 refinement (2026-11-15): an arm whose element
+type is fixed is tested by its tag alone.
 
-**An `is` that fits that way stores a new empty list back into the place (D4949).** The
+**Superseded by the D16047 refinement (2026-11-15):** an arm of another tag no longer fits an empty list, so nothing is stored back and the mechanism below is gone. **An `is` that fitted that way stored a new empty list back into the place (D4949).** The
 local, global, record field, list element or captured variable it tested now holds an empty
 list of the tested arm, so the then-branch reads, pushes into and delivers that arm's rep. A
 captured variable a closure tests so becomes a shared cell, as one a closure assigns does.
@@ -10692,7 +10736,7 @@ structural test.
 ```vl
 type A = { v: i32 }
 type B = { v: boolean }
-function f(u: A | B): i32 { if u is A { 1 } else { 2 } }
+function f(u: A | B): i32 { return if u is A { 1 } else { 2 } }
 print(f({ v: true }))   // prints 2
 ```
 
@@ -10716,7 +10760,7 @@ then-branch, in the else-branch, after an exiting guard, and with `!=` reversed.
 
 ```vl
 type K = "a" | "b" | "c"
-function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } 3 }
+function f(k: K): i32 { if k == "a" { return 1 } if k == "b" { return 2 } return 3 }
 ```
 
 **Why.** The guide already said it, and `x is L` reads as `x == L` with narrowing. One
@@ -10730,7 +10774,7 @@ spelling that narrows and one that does not was a trap. The checker does not do 
 type. Compiler intrinsics (`__name__`) stay refused.
 
 ```vl
-function print(s: string): i32 { 7 }
+function print(s: string): i32 { return 7 }
 print("x")   // calls the program's own `print`, typed by its own signature
 ```
 
@@ -10776,6 +10820,9 @@ the default set is versioned, or if agents keep retrying imports after the recei
 
 ## Exported signatures are not frozen at the module boundary (owner ruling, incremental-compilation Q4 (A), 2026-10-17)
 
+**Superseded 2026-11-15** by "Exports are frozen at the module boundary" below: an export's
+interface is its inferred signature, not its body. The no-annotation clause stands.
+
 **The rule.** An exported function may leave its parameters and return unannotated, as any
 function may. `export function twice(x) { x * 2 }` stays a generic whose body is its
 interface. Nothing requires an annotation on an export so that a build can be faster.
@@ -10788,6 +10835,9 @@ return, and an edit to one re-checks its importers
 (`docs/internals/incremental-compilation-design.md` §"Owner questions", Q4).
 
 ## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
+
+**Superseded 2026-11-14** by "An exported binding takes its type from its own module" below, and
+for every export by "Exports are frozen at the module boundary" (2026-11-15).
 
 **The rule.** An exported record binding without an annotation takes the field types its
 importers deliver it to, as it would in one file. `export let pt = { x: 1, y: 2 }` passed by
@@ -10882,7 +10932,7 @@ deferred return check reads each such open parameter as `never`, the type no val
 refuses exactly a body that would return a value the open parameter must hold:
 
 ```vl
-function G<A>(v: A | i32): A { v }
+function G<A>(v: A | i32): A { return v }
 const y: boolean = G(5)
 // refused: return type mismatch: expected never, got never | i32 (the return of `G` at the
 // call's argument types; the call binds no type to `A`, so give it an explicit type argument)
@@ -11574,7 +11624,7 @@ element of a literal. The error names the copy, `{ x: a.x }`.
 type A = { x: i32 }
 type B = { x: 1 | 2 }
 const keep: B[] = []
-function stash(a: A) { if a is B { keep.push({ x: a.x }) } }
+function stash(a: A) { return if a is B { keep.push({ x: a.x }) } }
 ```
 
 An un-annotated copy (`const c = a`) binds at the declared type (D4133). `as B` from a union
@@ -11632,7 +11682,7 @@ read-only. This supersedes "the imported name is read-only" in decided direction
 ```vl
 // file: c.vl
 export let count = 0
-export function get(): i32 { count }
+export function get(): i32 { return count }
 // file: main.vl
 import { count, get } from "./c"
 count = 5
@@ -11693,6 +11743,8 @@ takes implicitly, so joining over them adds no conversion a reader cannot alread
 A use typed by the enclosing type parameter (`mix(u, v)` with `u: U`) is not a number at the
 template, so the template types the call at `U`, and an instance that joined it would hand back
 a type its template never saw. Those calls keep their refusal (D15041).
+
+**The limit is retired (owner, 2026-11-14)** with L2: see "A type parameter carries the requirements its body places on it" below.
 
 ## A list callback op fixes the length at entry (owner ruling A, 2026-11-02) — D3068
 
@@ -11868,6 +11920,26 @@ through such a narrowing was not taken: it rejects a program the design can run.
 to the first tested `T` was not taken: two tests would disagree about one empty list. Joining two
 writes into `(i32 | string)[]` is not part of this ruling; it would change direct writes too.
 
+**Refined by the owner 2026-11-15.** The vacuous answer is for a genuinely open collection only:
+no annotation and no write fixes its element type, as in the examples above.
+
+* **An annotation fixes an empty collection's element type, as a write does.** An empty `i32[]`
+  delivered into `i32[] | f64[]` is tested by its arm: `is f64[]` is false and `is i32[]` true.
+  The same holds for a map (`{[i32]: boolean}` is not `{[i32]: i32}`) and a set.
+* **An empty literal delivered straight into a union takes the first arm it fits**, as D16276
+  does for `Map()`: `const p: i32[] | f64[] = []` holds an `i32[]`.
+
+```vl
+const m: i32[] = []
+const n: i32[] | f64[] = m
+print(n is f64[])   // false
+print(n is i32[])   // true
+```
+
+The type-test predicate answers a list partly only where its element may fit, and the list test
+over a union drops an arm whose element type is fixed apart from the test's, so this replaces the
+"fits when empty" answer of D4915 and the store-back of D4949 for such arms.
+
 ## An `is` that can never match is a warning, and its branch reads the operand as `never` (2026-11-14) — D16047
 
 **Ruled by the owner 2026-11-14.** An `is` test whose type can never match its operand is a
@@ -11903,3 +11975,300 @@ type L<T> = { v: T, next: L<L<T>> | null }                                // ref
 **Later.** Supporting them through a uniform (boxed) representation for exactly the generics the
 growth test flags is backlogged in ROADMAP.md, not rejected. Capping the nesting depth was not
 taken: whether a program ran would depend on its input, not its types.
+
+## The seed sidecar lives only in the user's private cache (2026-11-14) — engineering review 2026-11, Small 1
+
+**Ruled by the owner 2026-11-14: option C.** The on-disk seed's compiled `.cwasm` is read and
+written only in the seed cache, `$VL_SEED_CACHE_DIR` (default `seed/` under the user cache root),
+named `seed-<content key>-<engine tag>.cwasm`, and never beside the seed. It is handed to
+`Module::deserialize_file` only when that directory passes `private_cache_dir` (owned by this user,
+not writable by group or others). A directory that fails it runs the seed uncached, with one stderr
+line naming why, so the cost is visible. A `.cwasm` committed to a checkout the user cloned is
+never read, because nothing looks in the checkout.
+
+The seed cache is separate from `$VL_CACHE_DIR` so a test or tool that isolates its module cache
+does not recompile the seed on every run. Entries are keyed by content, so every copy of a seed
+shares them, and the eight most recently used seeds are kept. CI points `$VL_SEED_CACHE_DIR` at
+`$RUNNER_TEMP/vl-seed-cache` and caches that directory. `vl seed --cache-dir` and
+`--cache-files` name the directory and a seed's entries for scripts.
+
+The module cache's full envelope (SHA-256 of the artifact checked before every load) was built and
+measured first. The seed's sidecar is 46 MB, and hashing it costs 36 ms on a SHA-NI box. A warm
+`vl run hello.vl` went from 21.7 to 120.4 ms (median of 15, interleaved) and peak RSS from 58 to
+98 MB, because the file is read and copied rather than mapped. Compile time ranks first, so the
+envelope was not taken.
+
+Neither the directory check nor a digest could defend a sidecar committed to a checkout the user
+cloned: the user owns those files, and a digest is not a MAC. Option B, a per-user HMAC key and a
+`.seal` beside each sidecar, was the alternative; C closes the hole with no key and no new file,
+at the price of a first-run JIT in a fresh cache (measured ~12 s for one engine configuration).
+
+## A record-typed parameter is row-polymorphic, specialised per concrete row (2026-11-14) — engineering review 2026-11, L3
+
+**Ruled by the owner 2026-11-14: option A.** A wider record passed to a narrower record-typed
+parameter runs whatever its field names, because the parameter is specialised per concrete row
+rather than relying on the WasmGC prefix-subtype chain, which only works when the extra fields sort
+last.
+
+```vl
+type Cat = { name: string, age: i32 }
+function name(a: { name: string }): string { return a.name }
+print(name(c))   // runs; before, it ran only if the extra field sorted after `name`
+```
+
+The mechanism is a row variable: `function f(p: P)` is checked as `f<R extends P>(p: R)`, once in
+the signature, and the elaboration binds `R` per call, so every call spelling (direct, method,
+forwarded, returned, in a lambda) gets it with no per-position wiring. Diagnostics, hover and
+printed signatures show `P`, never `R`. A function takes at most 16 distinct rows (the corpus
+maximum is 4); a 17th is refused with a sentence naming that contract. A storage slot (a list
+element, a field) holding records of several shapes uses prefix subtyping when every shape is a
+prefix, and otherwise an accessor view, which keeps identity so a write through the slot is seen
+through the original. The view half rides on the slot-store engine.
+
+Taken over a uniform field-map representation (every read slowed, as JS engines do without a JIT)
+and over row polymorphism without subsumption (Roc, Elm: `[cat, dog]` as `{ name }[]` would be a
+type error, narrowing what the spec promises). Swift's witness tables and Go's itabs are the
+precedent for specialising where possible and carrying a table where not.
+
+## Spot fixes stop on rows an architecture item closes (2026-11-14) — engineering review 2026-11, Order
+
+**Ruled by the owner 2026-11-14: option B.** A clause-2 row (a program the design permits that VL
+refuses) whose ablated mechanism `docs/internals/refactor-notes/2026-11-14-clause2-architecture-map.md`
+assigns to the slot store, L3, L2, L1 or the Rep and hash-consed-type items is not fixed on its
+own; it becomes an acceptance row for that item. Spot fixes are for the map's local-fix bucket and
+for any clause-1 defect (a program `vl check` accepts that then builds or runs wrong), which always
+comes first. The measured split was 111 of 152 clause-2 rows closed by an architecture item and 33
+local; a spot fix in the first group is code the item later deletes. The prerequisites (hash-consed
+types, then `Rep` as an algebraic type) come before the typed IR, as the review orders them.
+
+## An exported binding takes its type from its own module (2026-11-14) — engineering review 2026-11, exports
+
+**Ruled by the owner 2026-11-14: option B, final.** Every exported binding without an annotation
+takes its type from its own module's uses. An importer's use is an ordinary use of that type: it
+may widen at the use, as any value does, but it never changes the binding's layout. This reverses
+"Record adoption crosses module boundaries" (2026-10-07).
+
+```vl
+// a.vl
+export let pt = { x: 1, y: 2 }        // { x: i32, y: i32 }, from a.vl alone
+// b.vl
+take(pt)                               // take(w: { x: i64, y: i64 }) widens at the call
+```
+
+A module's types then depend only on its own text, so an incremental build keys a module on its
+own source and its imports' interfaces, not on what its importers ask of it.
+
+## Unions stay structural; same-shape members are warned (2026-11-14) — engineering review 2026-11, L4
+
+**Ruled by the owner 2026-11-14: nominal variants dropped.** A union member is a type, not a
+name. A shared literal field (`kind: "a"`) is recognised as the discriminant, as today. Two
+warnings take the place of nominal variants: where a union is formed (a declaration or an inline
+union) with two members of the same type, and on an `is` or `match` arm that names a member the
+test cannot tell apart from another.
+
+```vl
+type NotFound = { msg: string }
+type Denied = { msg: string }
+type E = NotFound | Denied     // warning: one member; add a discriminant field
+if e is NotFound { … }         // warning: `is NotFound` also matches `Denied`
+```
+
+Kind tags already distinguish the members a program needs to distinguish; a nominal layer would
+add a second identity to every record for the case a warning names.
+
+## A type parameter carries the requirements its body places on it (2026-11-14) — engineering review 2026-11, L2
+
+**Ruled by the owner 2026-11-14.** A generic function's type parameter is constrained by what its
+body does with it, not forced to one concrete type. A call is checked against those requirements.
+
+```vl
+function add<U>(a: U, b: f64) { a + b }    // U: anything addable to f64
+function getValue<U>(v: U) { v.value }     // U: has a member `value`
+function mix<U>(u: U, v: U) { … }          // u and v: one U at each call
+```
+
+The requirements are joins, operators and fields. This retires "The limit" of the 2026-11-02
+widening ruling (D15041): a call inside a generic body is typed by its parameter's requirement,
+so an instance no longer hands back a type the template never saw.
+
+## An unannotated `let` takes its type from all its uses (2026-11-14) — D16293
+
+**Ruled by the owner 2026-11-14: option B.** `let t = 0` is not `i32` because of its literal; its
+type comes from every use, as the 2026-11-02 use-typing rule already says for other bindings.
+
+```vl
+let t = 0
+t = t + big        // big: i64, so t is i64
+```
+
+## A function's block body returns a value only through `return` (2026-11-14) — return rule
+
+**Ruled by the owner 2026-11-14: the hybrid.**
+- **Expression bodies** keep an implicit value: `(x) => x + 1`.
+- **A function's block body** `{ … }` returns a value only through `return`; without one it
+  returns nothing.
+- **`if` and `match` in value position** keep their arms' last expression as the value
+  (`const x = if c { 1 } else { 2 }`): the position states the intent, and braces are already
+  mandatory on every arm (2026-08-31, 2026-09-01).
+
+Why: VL infers result types, so an accidental tail value does not fail, it silently changes the
+inferred type. Rust catches the same mistake only because it requires return annotations. Kotlin,
+Swift, and TS/JS arrows split the same way. The migration is a script. Falling off the end of a
+body whose declared type admits `null` returns `null`.
+
+Three details are still open with the owner: whether braces after a signature are always a block,
+a warning for a discarded pure tail, and whether callbacks get an exception.
+
+## The pipeline's phases get a design first; the oracle is an external tool (2026-11-14) — engineering review 2026-11, L5 and L6
+
+**Ruled by the owner 2026-11-14.**
+- **L5** (phase products and a session value): a design note comes before any code.
+- **L6** (an independent oracle): an external tool, adding 0 bytes to the binary. Its CI step runs
+  only under the `sweep` label and stays within 30 s.
+
+## The hybrid return rule's details (2026-11-15) — return rule A1, A2, A3
+
+**Ruled by the owner 2026-11-15**, completing the 2026-11-14 hybrid ruling above.
+- **A1, braces.** After a `function` signature, `{` always begins a block: `function f() { x: 3 }`
+  is refused, and `return { x: 3 }` is the spelling. After `=>`, `{` begins an object literal when
+  what follows is a valid field list (`name`, `name: expr`, `...spread`, comma-separated), and a
+  block otherwise. An empty `{}` after `=>` is an empty block. The choice is syntactic only.
+  ```vl
+  () => { x: 3 }      // object
+  (x) => { x }        // object { x: x }
+  () => {}            // empty block (a no-op callback)
+  () => ({})          // empty object
+  ```
+- **A2.** A pure expression (no call, assignment or other effect) left as the last statement of a
+  function's block body, with its value discarded, is a warning with a `--fix` that inserts
+  `return`. A call at the tail is never warned.
+- **A3.** No callback exception: a lambda's block body returns a value only through `return`.
+  Where the expected function type wants a value, the valueless block is a type error at the tail,
+  with the same `--fix`.
+
+## A radix literal is a bit pattern in an integer context and its value in a float context (2026-11-15) — spec 4.1, 4.2, D16390
+
+**Ruled by the owner 2026-11-15.** The 2026-09-04 bit-pattern rule stands for every integer
+destination. In a float context (an `f32`/`f64` destination, peer or `as`), a radix literal is the
+value its digits spell. As a decimal integer literal does (D1890), it is legal at a float
+destination only when the float holds it exactly; an explicit `as` rounds to the nearest float.
+A radix constant tree at an `f64` destination or peer computes at 64 bits, which reverses
+D14990's f64 clause.
+
+```vl
+0x80000000 as f32                // 2147483648.0
+0xFFFFFFFF as f32                // 4294967296.0 (nearest f32)
+const b: f32 = 0xFFFFFFFF        // refused: constant 4294967295 is not exact at f32
+let x: f64 = 0xFFFFFFFF + 1000   // 4294968295
+```
+
+Why: hex in a float context has no pattern meaning; C, Go, JS and Rust's `u32` read the value, and
+games use hex for integer bits (colours, hashes, masks), never for float arithmetic.
+
+## A numeric literal joined with a typed value adopts its type when it fits (2026-11-15) — spec 4.3, T3.6
+
+**Ruled by the owner 2026-11-15.** One rule for `if`/`match` arms, `??` and list elements: a
+numeric literal beside a typed numeric value takes that value's type when it fits (an integer
+exactly; a float literal at `f32` as `let x: f32 = 0.1` does), and otherwise keeps its default and
+the join widens. `if c { 5 } else { f }` with `f: f32` is `f32`, `[5, f]` is `f32[]`, and
+`if c { 9000000000 } else { f }` is `i64 | f32`.
+
+The join decides a literal's context before its destination does (coordinator's reading of 4.3,
+2026-11-15): a radix tail beside a typed `i32` arm is the `i32` pattern, and only then is the join
+widened, so `(if c { 0xFFFFFFFF } else { v }) * k` with `v: i32`, `k: i64` is -1, as it is with
+the join bound first. A join of literals alone, or with a 64-bit arm, still reads a radix tail at
+its destination's width (D2617), and a pattern wider than 32 bits still widens the join.
+
+## An empty container's element type is fixed by its annotation (2026-11-15) — spec 4.4, refines D16047
+
+**Ruled by the owner 2026-11-15.** `is` on an empty list, map or set decides by the type it was
+built at, and an annotation fixes that type as a write does: `const m: i32[] = []` makes
+`(m as i32[] | f64[]) is f64[]` false. An empty literal delivered straight into a union takes the
+first matching arm, as D16276 does for `Map()`. D16047's vacuous answer remains only for an empty
+container nothing types: no annotation, no write. A map's `.length` is its entry count (4.6).
+
+## A shift count past 31 makes an untyped literal operand i64 (2026-11-15) — Q8, D16378
+
+**Ruled by the owner 2026-11-15.** A constant shift count from 32 to 63 makes an untyped literal
+operand `i64` (`1 << 40` is 1099511627776); a count of 64 or more is refused with E6.2's sentence.
+An operand whose type is already fixed (a declared `x: i32`, an `i32` destination) keeps E6.2's
+refusal for a count past its width.
+
+## Float constants fold in IEEE at their use type (2026-11-15) — Q9
+
+**Ruled by the owner 2026-11-15**, reversing the float half of "Exact constant arithmetic"
+(2026-09-30); integer constants stay exact. A float constant expression computes in IEEE at the
+type it is used at, identical to the same expression at run time: `0.1 + 0.2` is
+`0.30000000000000004`, `1.0 / 0.0` is Infinity. A float `/` or `%` whose divisor is literally zero
+is a warning. Why: refactoring a constant into a variable must not change a result; C, Rust, Java,
+Swift and JS fold floats this way.
+
+## Generic newtypes are branded per instance and erased (2026-11-15) — A14, D2031
+
+**Ruled by the owner 2026-11-15: option (a).** `type Handle<T> = new i32` gives each application
+its own compile-time brand, so `Handle<Texture>` and `Handle<Mesh>` are distinct and neither
+accepts a bare `i32`; `type Box<T> = new { … }` is branded per instance, so getters key on it and a
+structural value is refused. Brands are erased at run time; an `is` that would need to tell a
+newtype from its base at run time stays refused.
+
+## `==` between records needs one field set; a union compares its arm first (2026-11-15) — D16395
+
+**Ruled by the owner 2026-11-15.** `==` between two record types with different field sets is a
+check error. Comparing a union with one of its members tests the arm first, and a different arm is
+`false`, even when its fields are a superset. D1180's refusal of `==` between two general unions
+stands.
+
+## Nightly fuzzing runs on Actions (2026-11-15) — #8112
+
+**Ruled by the owner 2026-11-15.** The fuzz sweep with the oracle runs nightly on GitHub Actions
+(public repository, no minute cost) and fails only on a finding not already filed or known.
+
+## A destination binds a type parameter no argument binds (2026-11-15) — D16410, re-grades D9073
+
+**Ruled by the owner 2026-11-15.** The expected type of a call binds a type parameter of the callee
+that no argument binds. For `const k: (x: f64) => f64 = sel(gid)`, with `sel<A>(f: (x: A) => A)`,
+`A` is `f64` from the destination, so `gid` is delivered as its `f64` instance and `k(1.5)` prints
+`1.5`. D9073's annotated-destination face is to be re-graded under this rule.
+
+## A literal `let` joins to a float store (2026-11-15) — D16293 (a), 4.3 at stores
+
+**Ruled by the owner 2026-11-15: option (a).** Spec 4.3's adoption rule applies to stores as it
+does to joins. A `let` initialised by an integer literal and stored a float takes the float type:
+`let t = 0` followed by `t = t + xs[i]` with `xs: f64[]` makes `t` an `f64`, and the generic `sum`
+of D16293 prints `4` at `f64[]` and `3` at `i32[]`. This reverses the "Within kind" clause of "A
+literal binding takes its type from its uses" (B′ + C, 2026-09-29) for stores: an integer literal
+binding may now become a float.
+
+## A generic `as?`/`as!` pin that can never fit answers as the direct cast does (2026-11-15) — D16323, follows D2791
+
+**Ruled by the owner 2026-11-15.** D16323 follows D2791: a cast inside a generic instance behaves
+as the same cast written at the instance's types. A pin whose operand holds no member the target
+could take is a miss, not a refusal: `as?` is `null`, `as!` traps, and a bare `as` propagates.
+D16323 closed this way (`size<string>("ab")` prints `0`).
+
+## Exports are frozen at the module boundary (2026-11-15) — engineering review 2026-11, L2
+
+**Ruled by the owner 2026-11-15: yes.** From the review's L2: "freeze exports at the module
+boundary: an export's types and layouts are inferred from its own module alone, which reverses the
+ruling behind the `half()` result in §3.1. No annotation is required of the user; `vl` can print
+the inferred signature."
+
+- An exported function's interface is the signature inferred from its own module. An importer's call
+  is checked against that signature and reported at the call site. It never re-checks or re-types the
+  exporter's body.
+- This reverses "Exported signatures are not frozen at the module boundary" (Q4 (A), 2026-10-17),
+  where an exported generic's body was its interface. Q4's other half stands: nothing requires an
+  annotation on an export.
+- It extends "An exported binding takes its type from its own module" (2026-11-14), which ruled the
+  same for exported bindings and reversed "Record adoption crosses module boundaries" (Q1 (B)), the
+  ruling behind `half()`. So `half()` prints `0` whether or not a program also passes `origin`
+  to a `{ x: f64, y: f64 }` parameter.
+
+```vl
+// lib.vl
+export let origin = { x: 1, y: 2 }
+export function half() { return origin.x / 2 }   // () => i32, from lib.vl alone
+```
+
+Why: a module then has a meaning on its own, the precondition for separate compilation, a
+query-based LSP and a specifiable inference algorithm (engineering-review-2026-11.md §6, L2).

@@ -43,6 +43,7 @@ const LOCAL: Record<string, string> = {
     "ci-witnesses grades it in two --shard runs, not the one command the row runs",
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
+  "ir shadow": "no ci.yml job runs the IR shadow over the distilled corpus",
 };
 
 // What ci.yml must run for each covered row: fragments of the same command, on the seed.
@@ -62,6 +63,9 @@ const CI_RUNS: Record<string, string[]> = {
   ],
   "late demands": [
     "vl run scripts/late-demands.vl --compiler build/vl-compiler.wasm -- --check --seed build/vl-compiler.wasm",
+  ],
+  "phase state": [
+    "vl run scripts/phase-state-census.vl --compiler build/vl-compiler.wasm -- --check",
   ],
   "no-python": ["vl run scripts/no-python.vl"],
   "kind-ladder sets": [

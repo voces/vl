@@ -21,7 +21,7 @@
 
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
 import { lintPathFor, resetVlRootCache } from "../lsp/src/vlRoot.ts";
-import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
+import { COMPILER, exists, nativeEnv, VL } from "./support/tree.ts";
 
 /** The INTERNAL codes this fixture trips under `compiler/`. `comment-block-too-long`,
  * `comment-history` and `comment-shouting` share one block; the measurement line
@@ -29,6 +29,7 @@ import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
 const INTERNAL = [
   "arena-scan-outside-pass",
   "arena-slot-write",
+  "arena-write-after-lower",
   "comment-block-too-long",
   "comment-history",
   "comment-measurement-uncited",
@@ -52,17 +53,17 @@ let sNames: string[] = []
 // fifth line, ALWAYS SHOUTING here
 function holeOf(n: Node) {
   if n.nKid < 0 { return -1 }
-  n.nKid
+  return n.nKid
 }
 function readIt(n: Node) {
   const kid = nodes[n.nKid]
-  kid.nKid
+  return kid.nKid
 }
 function pick(k: string): i32 {
   if k == "nulbool" { return 1 }
   if k == "f64list" { return 2 }
   if k == "u8list" { return 3 }
-  -1
+  return -1
 }
 function perThing(seed: i32) {
   let i = 0
@@ -71,34 +72,43 @@ function perThing(seed: i32) {
     n = n + i
     i = i + 1
   }
-  n
+  return n
 }
-function wU8(b: i32) { b }
+function wU8(b: i32) { return b }
 const P = { nodes: nodes }
 function put(n: Node) {
   P.nodes[0] = n
-  0
+  return 0
 }
-function label(x: i32): string { "n=\\{x}" }
-let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f) + put({ nKid: 2 })
+function lower(t: { fnBody: i32 }) {
+  t.fnBody = 1
+  return 0
+}
+function label(x: i32): string { return "n=\\{x}" }
+let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f) + put({ nKid: 2 }) + lower({ fnBody: 0 })
 print(label(total))
 `;
 
 type Codes = Set<string>;
 
-const internalIn = (codes: Codes): string[] => INTERNAL.filter((c) => codes.has(c));
+const internalIn = (codes: Codes): string[] =>
+  INTERNAL.filter((c) => codes.has(c));
 
 /** The placement under test must carry no INTERNAL code and still carry the control. */
 const wantConsumer = (where: string, codes: Codes) => {
   const leaked = internalIn(codes);
   if (leaked.length !== 0) {
     throw new Error(
-      `${where}: a repo-policy code fired outside the VL tree: ${JSON.stringify(leaked)}`,
+      `${where}: a repo-policy code fired outside the VL tree: ${
+        JSON.stringify(leaked)
+      }`,
     );
   }
   if (!codes.has(LANGUAGE)) {
     throw new Error(
-      `${where}: the LANGUAGE control ${LANGUAGE} must still fire, got ${JSON.stringify([...codes])}`,
+      `${where}: the LANGUAGE control ${LANGUAGE} must still fire, got ${
+        JSON.stringify([...codes])
+      }`,
     );
   }
 };
@@ -134,26 +144,41 @@ const withTree = async (fn: (dir: string) => Promise<void> | void) => {
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const CLI = GATED && exists(VL) && exists(COMPILER);
 if (GATED && !CLI) {
-  console.warn("[vl-lint-rule-scope] CLI half skipped — missing vl binary or seed wasm.");
+  console.warn(
+    "[vl-lint-rule-scope] CLI half skipped — missing vl binary or seed wasm.",
+  );
 }
 
 const cliCodes = async (cwd: string, target: string): Promise<Codes> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["check", target, "--severity", "info", "--json", "--compiler", COMPILER],
+    args: [
+      "check",
+      target,
+      "--severity",
+      "info",
+      "--json",
+      "--compiler",
+      COMPILER,
+    ],
     cwd,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
   if (code > 1) {
-    throw new Error(`vl check ${target} exited ${code}: ${new TextDecoder().decode(stderr)}`);
+    throw new Error(
+      `vl check ${target} exited ${code}: ${new TextDecoder().decode(stderr)}`,
+    );
   }
-  const all = JSON.parse(new TextDecoder().decode(stdout)) as { code?: string }[];
+  const all = JSON.parse(new TextDecoder().decode(stdout)) as {
+    code?: string;
+  }[];
   return new Set(all.map((d) => d.code ?? ""));
 };
 
 Deno.test({
-  name: "lint rule scope (CLI): a consumer path and a foreign src/compiler/ get no INTERNAL code; compiler/ does",
+  name:
+    "lint rule scope (CLI): a consumer path and a foreign src/compiler/ get no INTERNAL code; compiler/ does",
   ignore: !CLI,
   fn: () =>
     withTree(async (dir) => {
@@ -165,8 +190,14 @@ Deno.test({
       );
       // Relative to its own root, the shape a consumer runs from their project.
       wantConsumer("relative main.vl", await cliCodes(dir, "main.vl"));
-      wantConsumer("relative src/compiler/x.vl", await cliCodes(dir, "src/compiler/x.vl"));
-      wantInTree("relative compiler/x.vl", await cliCodes(dir, "compiler/x.vl"));
+      wantConsumer(
+        "relative src/compiler/x.vl",
+        await cliCodes(dir, "src/compiler/x.vl"),
+      );
+      wantInTree(
+        "relative compiler/x.vl",
+        await cliCodes(dir, "compiler/x.vl"),
+      );
     }),
 });
 
@@ -175,7 +206,8 @@ Deno.test({
 const SEED = exists(COMPILER);
 
 Deno.test({
-  name: "lint rule scope (editor): the path lintPathFor answers keeps INTERNAL codes out of a consumer file",
+  name:
+    "lint rule scope (editor): the path lintPathFor answers keeps INTERNAL codes out of a consumer file",
   ignore: !SEED,
   fn: () =>
     withTree((dir) => {
@@ -187,7 +219,9 @@ Deno.test({
       // The temp root is no VL checkout, so the server stages nothing — "" in the seed.
       const staged = lintPathFor(`${dir}/main.vl`);
       if (staged !== undefined) {
-        throw new Error(`lintPathFor outside a checkout: want undefined, got ${staged}`);
+        throw new Error(
+          `lintPathFor outside a checkout: want undefined, got ${staged}`,
+        );
       }
       wantConsumer("editor, no checkout", codesAt(staged));
       wantConsumer("editor, src/compiler/x.vl", codesAt("src/compiler/x.vl"));

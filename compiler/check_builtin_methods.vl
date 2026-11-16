@@ -14,6 +14,7 @@ import {
   TY_STR,
   TY_U8,
   TY_VOID,
+  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -28,7 +29,10 @@ import {
   mkArrayTy,
   mkNullableTy,
   tyAt,
+  tyElemOf,
   tyFieldTyOf,
+  tyKeyOf,
+  tyValOf,
 } from "./check_types"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 
@@ -43,7 +47,7 @@ export function memberRungOnTy(recvTy: i32, name: string): i32 {
   if tyAt(rTy) is TyVar { return 0 }
   if builtinMethodClaims(rTy, name) { return MC_RUNG_BUILTIN }
   if tyFieldTyOf(rTy, name) >= 0 { return MC_RUNG_FIELD }
-  0
+  return 0
 }
 
 // A receiver's conventional spelling in the refusal's example call, so the sentence
@@ -63,7 +67,7 @@ export function selfFnRecvSpelling(selfTy: i32): string {
     }
     TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
   }
-  "p"
+  return "p"
 }
 
 // When member node `ix` calls a numeric builtin as a method of `objTy` (`x.abs()`,
@@ -89,7 +93,7 @@ export function builtinMethodNote(objTy: i32, prop: string, ix: i32): string {
     const spelled = builtinCallSpelling(prop, n.memObj, ix)
     if spelled != "" { call = spelled }
   }
-  " — `"
+  return " — `"
     + prop
     + "` is a builtin function, not a method: call it as `"
     + call
@@ -134,7 +138,7 @@ function builtinCallSpelling(prop: string, recv: i32, memIx: i32): string {
     e = e - 1
   }
   if e > m1 + 1 { out = out + ", " + tokSpanText(m1 + 2, e) }
-  out + ")"
+  return out + ")"
 }
 
 // The source tokens `a..b` on one line, joined with single spaces: none inside brackets,
@@ -166,12 +170,12 @@ function tokSpanText(a: i32, b: i32): string {
     }
     i = i + 1
   }
-  out
+  return out
 }
 
 // Whether a token of kind `k` can end an operand, so a `-` after it is binary.
 function tokEndsValue(k: string): boolean {
-  k == "IDENT"
+  return k == "IDENT"
     || k == "NUMBER"
     || k == "STRING"
     || k == "CHAR"
@@ -197,77 +201,107 @@ export function builtinSigOf(
   const ix = nomErasedTyIx(strLitRecvTy(recv))
   if ix < 0 || ix >= T.tys.length { return -1 }
   const t = tyAt(ix)
-  let res = -1
-  let arity = 0
+  if !builtinArityFits(builtinKindOf(t), prop, argc) { return -1 }
   match t {
     TyArray => {
+      if prop == "map" || prop == "filter" { return -1 }
       if prop == "push" {
-        while out.length < argc { out.push(t.aElem) }
-        if argc > 0 { return TY_I32 }
-        return -1
+        while out.length < argc { out.push(tyElemOf(t)) }
+        return TY_I32
       }
       if prop == "slice" {
         while out.length < argc { out.push(TY_I32) }
-        if argc == 1 || argc == 2 {
-          return listBuiltResultTy(ix, t.aElem, t.aRead)
-        }
-        return -1
+        return listBuiltResultTy(ix, tyElemOf(t), t.aRead)
       }
-      if prop == "pop" { res = mkNullableTy(arrElemValueTy(t.aElem)) }
-      if prop == "get" {
-        arity = 1
-        out.push(TY_I32)
-        res = mkNullableTy(arrElemValueTy(t.aElem))
+      if prop == "get" { out.push(TY_I32) }
+      if prop == "pop" || prop == "get" {
+        return mkNullableTy(arrElemValueTy(tyElemOf(t)))
       }
-      if prop == "clear" { res = TY_VOID }
+      return TY_VOID
     }
     TyMap => {
       if prop == "set" {
-        arity = 2
-        out.push(t.mKey)
-        out.push(t.mVal)
-        res = TY_VOID
+        out.push(tyKeyOf(t))
+        out.push(tyValOf(t))
+        return TY_VOID
       }
       if prop == "get" || prop == "add" || prop == "has" || prop == "delete" {
-        arity = 1
-        out.push(t.mKey)
-        res = TY_BOOL
-        if prop == "get" { res = mkNullableTy(t.mVal) }
-        if prop == "add" { res = TY_VOID }
+        out.push(tyKeyOf(t))
       }
-      if prop == "clear" { res = TY_VOID }
-      if prop == "keys" { res = mkArrayTy(t.mKey) }
-      if prop == "values" {
-        res = mkArrayTy(t.mVal)
-        if t.mSet == 1 { res = mkArrayTy(t.mKey) }
+      if prop == "get" { return mkNullableTy(tyValOf(t)) }
+      if prop == "has" || prop == "delete" { return TY_BOOL }
+      if prop == "keys" || (prop == "values" && t.mSet == 1) {
+        return mkArrayTy(tyKeyOf(t))
       }
+      if prop == "values" { return mkArrayTy(tyValOf(t)) }
+      return TY_VOID
     }
     TyPrim => {
       if prop == "slice" {
-        arity = 2
         out.push(TY_I32)
         out.push(TY_I32)
-        res = TY_STR
+        return TY_STR
       }
-      if prop == "indexOf" || prop == "includes" {
-        arity = 1
-        out.push(TY_STR)
-        res = TY_I32
-        if prop == "includes" { res = TY_BOOL }
-      }
+      if prop == "indexOf" || prop == "includes" { out.push(TY_STR) }
       if prop == "charCodeAt" || prop == "cpAt" || prop == "isCharBoundary" {
-        arity = 1
         out.push(TY_I32)
-        res = TY_I32
-        if prop == "isCharBoundary" { res = TY_BOOL }
       }
-      if prop == "cpLen" { res = TY_I32 }
-      if prop == "bytes" { res = mkArrayTy(TY_U8) }
+      if prop == "includes" || prop == "isCharBoundary" { return TY_BOOL }
+      if prop == "bytes" { return mkArrayTy(TY_U8) }
+      return TY_I32
     }
-    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return -1
+    }
   }
-  if argc != arity { return -1 }
-  res
+}
+
+// The receiver kinds `builtinArityFits` answers for: a list, a map or set, and a string.
+export const BK_LIST = 0
+export const BK_MAP = 1
+export const BK_STR = 2
+
+// The `BK_*` kind of receiver `t`, or -1 for a type with no built-in method.
+function builtinKindOf(t: Ty): i32 {
+  match t {
+    TyArray => {
+      return BK_LIST
+    }
+    TyMap => {
+      return BK_MAP
+    }
+    TyPrim => {
+      return if t.primName == "string" { BK_STR } else { -1 }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// Whether built-in method `prop` of a receiver of kind `kind` (`BK_*`) has a parameter list
+// of `argc`, `map`/`filter` taking their one callback; false for a method that kind lacks.
+export function builtinArityFits(kind: i32, prop: string, argc: i32): boolean {
+  if kind == BK_LIST {
+    if prop == "push" { return argc > 0 }
+    if prop == "slice" { return argc == 1 || argc == 2 }
+    if prop == "map" || prop == "filter" || prop == "get" { return argc == 1 }
+    return (prop == "pop" || prop == "clear") && argc == 0
+  }
+  if kind == BK_MAP {
+    if prop == "set" { return argc == 2 }
+    if prop == "get" || prop == "add" || prop == "has" || prop == "delete" {
+      return argc == 1
+    }
+    return (prop == "clear" || prop == "keys" || prop == "values") && argc == 0
+  }
+  if kind != BK_STR { return false }
+  if prop == "slice" { return argc == 2 }
+  if prop == "indexOf" || prop == "includes" || prop == "charCodeAt" {
+    return argc == 1
+  }
+  if prop == "cpAt" || prop == "isCharBoundary" { return argc == 1 }
+  return (prop == "cpLen" || prop == "bytes") && argc == 0
 }
 
 // The result of a list method that BUILDS a new list from the receiver (`.filter`,
@@ -275,7 +309,7 @@ export function builtinSigOf(
 // nobody else holds. A mutable receiver keeps its own arena index, so nothing is reminted.
 export function listBuiltResultTy(recvTy: i32, elem: i32, ro: i32): i32 {
   if ro == 1 { return mkArrayTy(elem) }
-  recvTy
+  return recvTy
 }
 
 // Extracted from `checkNodeReal`'s `LetDecl` arm (C3: thin the dispatcher).
@@ -287,5 +321,5 @@ export function strLitRecvTy(ty: i32): i32 {
   if t is TyLit {
     if t.litKind == "str" { return TY_STR }
   }
-  ty
+  return ty
 }

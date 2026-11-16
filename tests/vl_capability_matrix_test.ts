@@ -362,7 +362,7 @@ const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std im
 type __P = {a: i32}
 const __p: __P = {a: 1}
 function __len<T>(f: () => T | string) {
-  7
+  return 7
 }
 print("\\{__len(() => __p)}")
 // @@VALUE@@
@@ -426,6 +426,65 @@ Deno.test({
         throw new Error(`want the summary to count 4 program traps, got:\n${out}`);
       }
       if (code !== 1) throw new Error(`want exit 1 on a program trap (clause 1), got ${code}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// The control for the output contract: a want that is only a substring of what ran, a `twice`
+// that printed once, and a line beside the wanted one are each WRONG, never RUNS.
+Deno.test({
+  name: "matrix: a cell's want is its whole output, each line compared exactly",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir();
+    try {
+      const path = `${dir}/want-exact.matrix.vl`;
+      await Deno.writeTextFile(
+        path,
+        [
+          "// @@VALUE@@",
+          "1",
+          "// @@TYPE@@",
+          "i32",
+          "// @@WANT@@",
+          "1",
+          "// @@PROOF@@",
+          "print(v)",
+          "// @@CELL_substring@@",
+          "// want: 2147483648",
+          "print(-2147483648)",
+          "// @@CELL_twice_once@@",
+          "// want: 7 twice",
+          "print(7)",
+          "// @@CELL_extra_line@@",
+          "// want: true",
+          'print("noise")',
+          "print(true)",
+          "// @@CELL_exact@@",
+          "// want: 5",
+          "print(5)",
+          "// @@CELL_twice@@",
+          "// want: 7 twice",
+          "print(7)",
+          "print(7)",
+          "// @@CELL_lines@@",
+          "// want: noise then true",
+          'print("noise")',
+          "print(true)",
+          "",
+        ].join("\n"),
+      );
+      const { cells } = await runMatrix(path, "substring,twice_once,extra_line,exact,twice,lines");
+      for (const face of ["annotated", "un-annotated"]) {
+        for (const p of ["substring", "twice_once", "extra_line"]) {
+          wantVerdict(cells, p, face, "WRONG", "the output is not exactly the want");
+        }
+        for (const p of ["exact", "twice", "lines"]) {
+          wantVerdict(cells, p, face, "RUNS", "the output is exactly the want");
+        }
+      }
     } finally {
       await Deno.remove(dir, { recursive: true });
     }

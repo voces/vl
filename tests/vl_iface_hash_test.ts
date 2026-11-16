@@ -291,8 +291,8 @@ export function go(): void {
 export function head(xs: i32[]): i32 {
   return xs[0]
 }
-export function half(n: i32) { n / 2 }
-export function twice(x) { x * 2 }
+export function half(n: i32) { return n / 2 }
+export function twice(x) { return x * 2 }
 export function pick<T>(a: T, b: T): T { return a }
 export function size(sh: Shape): i32 { return sh.w * sh.h }
 `;
@@ -392,13 +392,13 @@ const INF_LIB = `export let s = 0
 let hidden = { x: 1, y: 2 }
 type Box = { w: i32 }
 export function u(b: boolean) { if b { return 1 } return "x" }
-export function k() { 1 }
+export function k() { return 1 }
 export function mk() { return [] }
-export function rec() { { x: 1 } }
-export function md() { "a" }
+export function rec() { return { x: 1 } }
+export function md() { return "a" }
 export function nul(b: boolean) { if b { return null } return 1 }
-export function gs() { s }
-export function hid() { hidden }
+export function gs() { return s }
+export function hid() { return hidden }
 export function bx() {
   const b: Box = { w: 1 }
   return b
@@ -472,10 +472,10 @@ const CASES: Case[] = [
   one(
     "rep: nullable list elements",
     "hit",
-    `export function f() { [1, null] }\n`,
+    `export function f() { return [1, null] }\n`,
     "const v = f()\nconst e = v[0]\nif e != null { print(e + 1) }",
-    "{ [1, null] }",
-    "{\n  const a: (i32 | null)[] = [1, null]\n  a\n}",
+    "{ return [1, null] }",
+    "{\n  const a: (i32 | null)[] = [1, null]\n  return a\n}",
   ),
   one(
     "rep: literal union return",
@@ -501,34 +501,35 @@ const CASES: Case[] = [
     '  if b { return { k: "a", n: 1 } }',
     '  const r: A | B = { k: "a", n: 1 }\n  if b { return r }',
   ),
+  // A returned hole lambda is checked at each call through the result, so its body is interface.
   one(
     "rep: lambda with an untyped parameter",
-    "hit",
-    `export function f() { (x) => x + 1 }\n`,
+    "miss",
+    `export function f() { return (x) => x + 1 }\n`,
     "print(f()(2))",
     "(x) => x + 1",
     "(x) => x",
   ),
   one(
     "rep: lambda with an untyped parameter, string",
-    "hit",
-    `export function f() { (x) => x }\n`,
+    "miss",
+    `export function f() { return (x) => x }\n`,
     'print(f()("s"))',
     "(x) => x",
     "(x) => x + x",
   ),
   one(
     "rep: lambda body refused at the dependent's argument",
-    "hit",
-    `export function f() { (x) => x }\n`,
+    "miss",
+    `export function f() { return (x) => x }\n`,
     'print(f()("s"))',
     "(x) => x",
     "(x) => x * 2",
   ),
   one(
     "rep: lambda body member at the dependent's argument",
-    "hit",
-    `export function f() { (x) => x }\n`,
+    "miss",
+    `export function f() { return (x) => x }\n`,
     "print(f()(1))",
     "(x) => x",
     "(x) => x.length",
@@ -536,7 +537,7 @@ const CASES: Case[] = [
   one(
     "rep: lambda result type from the dependent's argument",
     "miss",
-    `export function f() { (x) => x }\n`,
+    `export function f() { return (x) => x }\n`,
     "const r = f()(1.5)\nprint(r / 2.0)",
     "(x) => x",
     "(x) => 1",
@@ -544,26 +545,26 @@ const CASES: Case[] = [
   one(
     "rep: an empty map",
     "hit",
-    `export function f() { Map() }\n`,
+    `export function f() { return Map() }\n`,
     'const m = f()\nm["a"] = 1\nprint(m["a"] ?? 0)',
-    "{ Map() }",
-    "{\n  const a = Map()\n  a\n}",
+    "{ return Map() }",
+    "{\n  const a = Map()\n  return a\n}",
   ),
   one(
     "rep: f64 from a literal",
     "hit",
-    `export function f() { 1 }\n`,
+    `export function f() { return 1 }\n`,
     "const y: f64 = f()\nprint(y / 2.0)",
-    "{ 1 }",
-    "{ 1 + 1 - 1 }",
+    "{ return 1 }",
+    "{ return 1 + 1 - 1 }",
   ),
   one(
     "rep: i64 from a literal",
     "hit",
-    `export function f() { 1 }\n`,
+    `export function f() { return 1 }\n`,
     "const y: i64 = f()\nprint(y)",
-    "{ 1 }",
-    "{\n  const a = 1\n  a\n}",
+    "{ return 1 }",
+    "{\n  const a = 1\n  return a\n}",
   ),
   inf(
     "inferred: union return order",
@@ -580,12 +581,12 @@ const CASES: Case[] = [
     "return 1",
     "return 2",
   ),
-  inf("inferred: literal return value", "hit", "{ 1 }", "{ 2 }"),
+  inf("inferred: literal return value", "hit", "{ return 1 }", "{ return 2 }"),
   inf(
     "inferred: literal return through a local",
     "hit",
-    "{ 1 }",
-    "{ const a = 1\n  a }",
+    "{ return 1 }",
+    "{ const a = 1\n  return a }",
   ),
   inf(
     "inferred: empty list through a local",
@@ -596,22 +597,22 @@ const CASES: Case[] = [
   inf(
     "inferred: record through a local",
     "hit",
-    "{ { x: 1 } }",
-    "{ const r = { x: 1 }\n  r }",
+    "{ return { x: 1 } }",
+    "{ const r = { x: 1 }\n  return r }",
   ),
-  inf("inferred: literal string return", "hit", '{ "a" }', '{ "b" }'),
+  inf("inferred: literal string return", "hit", '{ return "a" }', '{ return "b" }'),
   inf(
     "inferred: nullable return order",
     "hit",
     "if b { return null } return 1",
     "if !b { return 1 } return null",
   ),
-  inf("inferred: literal let returned", "miss", "{ s }", "{ 0 }"),
+  inf("inferred: literal let returned", "miss", "{ return s }", "{ return 0 }"),
   inf(
     "inferred: private let returned",
     "miss",
-    "{ hidden }",
-    "{ { x: 1, y: 2 } }",
+    "{ return hidden }",
+    "{ return { x: 1, y: 2 } }",
   ),
   inf(
     "inferred: private type field",
@@ -628,7 +629,7 @@ const CASES: Case[] = [
   one(
     "inferred: a type elided past its render depth",
     "miss",
-    `export function f() { ${"{ a: ".repeat(DEEP)}1${" }".repeat(DEEP)} }\n`,
+    `export function f() { return ${"{ a: ".repeat(DEEP)}1${" }".repeat(DEEP)} }\n`,
     `const r = f()\nprint(r${".a".repeat(DEEP)} / 2)`,
     "{ a: 1 }",
     "{ a: 1.5 }",
@@ -715,14 +716,14 @@ const CASES: Case[] = [
     "area(n: i32): i32",
     "area(n: i32): i64",
   ),
-  lib("inferred-return body edit", "miss", "{ n / 2 }", "{ n / 2.0 }"),
+  lib("inferred-return body edit", "miss", "{ return n / 2 }", "{ return n / 2.0 }"),
   lib(
     "generic body edit",
     "miss",
     "b: T): T { return a }",
     "b: T): T { return b }",
   ),
-  lib("untyped-param body edit", "miss", "{ x * 2 }", "{ x * 2 + 1 }"),
+  lib("untyped-param body edit", "miss", "{ return x * 2 }", "{ return x * 2 + 1 }"),
   lib("type decl edit", "miss", "h: i32 }", "h: i32, d: i32 }"),
   lib("global initialiser edit", "miss", "let counter = 0", "let counter = 5"),
   lib(

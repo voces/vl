@@ -21,16 +21,10 @@
 
 import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { seedPresent } from "./support/tree.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
-const seedExists = (() => {
-  try {
-    Deno.statSync(SEED);
-    return true;
-  } catch {
-    return false;
-  }
-})();
+const seedExists = seedPresent(SEED);
 const ignore = !seedExists;
 const log = (_m: string) => {};
 
@@ -42,9 +36,9 @@ const ENTRY_KEY = "/proj/main.vl";
 const ENTRY = 'import { a } from "./a"\nimport { b } from "./b"\n' +
   'import { c } from "./c"\nprint(a() + b() + c())\n';
 const SIBLINGS: Record<string, string> = {
-  "/proj/a.vl": "export function a(): i32 {\n  1\n}\n",
-  "/proj/b.vl": "export function b(): i32 {\n  2\n}\n",
-  "/proj/c.vl": "export function c(): i32 {\n  3\n}\n",
+  "/proj/a.vl": "export function a(): i32 {\n  return 1\n}\n",
+  "/proj/b.vl": "export function b(): i32 {\n  return 2\n}\n",
+  "/proj/c.vl": "export function c(): i32 {\n  return 3\n}\n",
 };
 const read = (key: string): string | undefined => SIBLINGS[key];
 
@@ -86,7 +80,7 @@ Deno.test({
   await c.check(ENTRY, ENTRY_KEY, swappable);
   const first = c.stagingCounts();
 
-  a = "export function a(): i32 {\n  9\n}\n";
+  a = "export function a(): i32 {\n  return 9\n}\n";
   c.bumpReaderGeneration();
   await c.check(ENTRY + "// edit\n", ENTRY_KEY, swappable);
   const second = c.stagingCounts();
