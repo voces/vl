@@ -4729,7 +4729,7 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
 
 // `r is B` over a single record `r: A` or `A | null` where every `B` is an `A` but not the
 // reverse: the value fits when it is not null and each field `B` narrows holds a member of its
-// literal set (D3885, D4058). 0 when the test is not that shape, so the caller's rungs go on.
+// literal set, or an arm of its type (D3885, D4058, D16325). 0 when the test is not that shape.
 function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
@@ -4740,9 +4740,9 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const sets: i32[] = []
   const shape = recFitNarrowedFields(objTy, isVarTyIxOf(isIx), names, sets)
   if shape < 0 { return 0 }
-  if shape == 0 {
+  if names.length == 0 {
     return emitFail(
-      "emitProgram: `is` over a record tests a field that is not a literal set narrowed from the declared field, which has no lowering yet",
+      "emitProgram: `is` over a record reached its field test with no field narrowed",
     )
   }
   // A receiver that is not a re-readable place (a call) is evaluated once into the `?.` stash.
@@ -4777,11 +4777,33 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   if !laidOut {
     return emitFail("emitProgram: `is` over a record whose layout is not known")
   }
-  const nullable = nodeTyIsNullable(recv)
+  // The instance's type decides: a generic receiver handed `A | null` is nullable there.
+  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
   if nullable && !exprNullableRefNiche(recv, fnIx) {
     return emitFail(
       "emitProgram: `is` over a nullable record that is not a nullable reference",
     )
+  }
+  // A field narrowed to a type rather than a literal set is tested by its box's arm tags.
+  const fieldTags: i32[][] = []
+  let fk = 0
+  while fk < names.length {
+    const k = fk
+    fk = fk + 1
+    const ft: i32[] = []
+    if tyLitSetMemberLexes(sets[k]).length == 0 {
+      const vis: i32[] = []
+      if (
+        !fieldRowIsUnionBox(rows[k])
+        || !unionArmTagsOfTy(sets[k], -1, ft, vis)
+        || listNeedsDiscrim(vis)
+      ) {
+        return emitFail(
+          "emitProgram: `is` over a record tests a field narrowed to a type its storage holds no tag for",
+        )
+      }
+    }
+    fieldTags.push(ft)
   }
   if staged {
     if emitExpr(recv, fnIx) < 0 { return -1 }
@@ -4796,6 +4818,36 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   let k = 0
   while k < names.length {
+    if fieldTags[k].length > 0 {
+      // The box ref itself may stand for `null`; a null held in the box is its own arm's tag.
+      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if nullable && !staged { fbRefAsNonNull() }
+      fbStructGet(heap, fis[k])
+      fbRefIsNull()
+      fbIf(127)
+      fbI32Const(if tyAdmitsNull(sets[k]) { 1 } else { 0 })
+      fbElse()
+      let ti = 0
+      while ti < fieldTags[k].length {
+        if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+        if nullable && !staged { fbRefAsNonNull() }
+        fbStructGet(heap, fis[k])
+        fbRefAsNonNull()
+        fbStructGet(uBoxIdx, 0)
+        fbI32Rel(RS_TAG, fieldTags[k][ti])
+        fbI32Bin(70) // i32.eq
+        if ti > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        ti = ti + 1
+      }
+      fbEnd()
+      if k > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      k = k + 1
+      continue
+    }
     // A nullable string field answers its null apart, then compares only non-null strings.
     const nulStr = fieldRowIsStr(rows[k], true)
     const lexes = tyLitSetMemberLexes(
@@ -4831,6 +4883,20 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   if nullable { fbEnd() }
   return 1
+}
+
+// Whether any variant row of `vis` shares its tag with a twin that only a field value parts.
+function listNeedsDiscrim(vis: i32[]): boolean {
+  for vi in vis {
+    if vi >= 0 && vi < uFieldCount.length {
+      let fp = 0
+      while fp < uFieldCount[vi] {
+        if variantDiscrimFieldNeeded(vi, fp) { return true }
+        fp = fp + 1
+      }
+    }
+  }
+  return false
 }
 
 // `xs is L[]` over a list whose elements are a wider type than the literal set `L`: true when
@@ -7817,11 +7883,24 @@ function emitOptMemberValue(exprIx: i32, fnIx: i32) {
   return omR
 }
 
+// After a `?.` ref leaf: a read typed without `null` here, its receiver present (an instance's
+// hole handed a record), is held in a non-null cell, so the nullable ref is recovered (D16857). 0.
+function optReadRecoverNonNull(exprIx: i32, fnIx: i32): i32 {
+  const t = nodeTyAt(exprIx, fnIx)
+  if t >= 0 && tyExcludesNull(t) { fbRefAsNonNull() }
+  return 0
+}
+
 // The standalone `?.` arms themselves, with the chain's base already staged when it needed
 // staging, so every arm below may read the receiver as often as its rep requires.
 function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
   const e = nodeAt(unwrapParen(exprIx))
   if e is OptMember {
+    // A read off the `null` unit is the `null` its destination seeded, after the receiver (D16841).
+    if exprIsNulNone(exprIx, fnIx) {
+      if emitNulNoneForEffect(e.omObj, fnIx) < 0 { return -1 }
+      return emitNullAt(exprIx, fnIx)
+    }
     const osi = optChainStructIdxOf(e.omObj, fnIx)
     if osi < 0 {
       return emitFailAt(
@@ -7860,7 +7939,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
 
     // A LIST leaf, the record arm one table over: `T[] | null` is the list wrapper's own
@@ -7874,7 +7953,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
     // A MAP leaf: `{[K]: V} | null` is the field's map struct's own nullable ref, the list
     // arm's shape over the struct `sFieldMapShape` names.
@@ -7894,7 +7973,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
     // A function-value leaf: `F | null` is the closure fat pointer's own nullable ref.
     if oKind == "closure" || oKind == "nulclosure" {
@@ -7905,7 +7984,7 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
       if emitOptChainValue(e.omObj, fnIx) < 0 { return -1 }
       fbStructGet(sHeapIdx[osi], ofi)
       fbEnd()
-      return 0
+      return optReadRecoverNonNull(exprIx, fnIx)
     }
     // The leaf reps this arm can build, in the order the arms below take them: a nullable
     // REF (a list, a map, a function value, a nested struct, a string), the scalar box
@@ -9702,6 +9781,8 @@ function emitNulNoneForEffect(exprIx: i32, fnIx: i32) {
 function emitNulNoneLeafForEffect(exprIx: i32, fnIx: i32) {
   const n = nodeAt(unwrapParen(exprIx))
   if n is NullLit || n is Ident { return 0 }
+  // A `?.` read off the `null` unit reads nothing past its receiver.
+  if n is OptMember { return emitNulNoneForEffect(n.omObj, fnIx) }
   // A `null`-typed `a ?? b` has a `null`-typed left, so both sides always run.
   const co = plainCoalesceAt(exprIx)
   if co != null {
@@ -27425,6 +27506,10 @@ function emitCallCore(callIx: i32, fnIx: i32) {
     // An instance binding a type parameter to `never` reaches no call through it (D3178).
     if nodeTyAt(c.callFn, fnIx) == TY_NEVER { return emitNullCalleeCall() }
     if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NEVER {
+      return emitNullCalleeCall()
+    }
+    // A `?.` guard's arm over a receiver this instance types `null` is dead (D16841).
+    if um is Member && nodeTyAt(um.memObj, fnIx) == TY_NULL {
       return emitNullCalleeCall()
     }
     return emitFail("emitProgram: callee is not a function name")

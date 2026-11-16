@@ -187,6 +187,8 @@ import {
   lbiBindName,
   lbiCoalUnsafe,
   lbiOperandCand,
+  nlAsgGot,
+  nlAsgTgt,
 } from "./check_num_lit_state"
 import { numLitAdoptDeep } from "./check_num_adopt"
 import { cexRoundFirst, numCastCanFail, numLitOwnTy } from "./check_num_lits"
@@ -267,6 +269,7 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyChildrenOf,
   tyDenotesObj,
   tyElemOf,
   tyElemOpen,
@@ -278,6 +281,7 @@ import {
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyIsOneStrLit,
+  tyIsParamHole,
   tyKeyOf,
   tyKeyOpen,
   tyMapValIsLitUnion,
@@ -358,6 +362,10 @@ export const OP_CALL_PIN = "()"
 // A call under a null test of its callee: a pin of the `null` type leaves the branch dead, so
 // the call is not refused there, though the direct spelling refuses it (D3197).
 export const OP_CALL_GUARDED_PIN = "?()"
+
+// A `?.` call through a hole, `a?.f(…)`: it runs only on a present receiver, so the pin judges the
+// callee's non-null face, and a pin of `null` reads `null` (D16339).
+export const OP_CALL_OPT_PIN = "?.()"
 
 export const SUBST_DECLARED = 1
 
@@ -588,7 +596,7 @@ export function noteInferRetWitness(srcExpr: i32, srcTy: i32) {
   if srcTy < 0 { return 0 }
   // A chain link names no node here; its caller records the link itself.
   if srcExpr >= 0 { noteInferRetValue(srcExpr, srcTy) }
-  if tyReachesEmptyHole(srcTy, 8) {
+  if tyReachesEmptyHole(srcTy) {
     irhExprs.push(srcExpr)
     irhTys.push(srcTy)
     return 0
@@ -729,11 +737,15 @@ function idxRecvIx(ix: i32): i32 {
 }
 
 // Whether a write of `rt` into a place declared `dcl` leaves the place reading at the member
-// its pin lands on (`HD_TVW`): a value typed at a declared type parameter, into a concrete
-// declaration admitting `null`. Each instance re-reads the place at its pin, so a local, a
-// global, a field and a cell all take the pin's read over any union (D3240, D8820).
+// its pin lands on (`HD_TVW`): a value typed at a type parameter or an un-annotated parameter's
+// hole, into a concrete declaration admitting `null`. Each instance re-reads the place at its
+// pin, so a local, a global, a field and a cell all take the pin's read over any union (D3240).
 export function tvPlaceWrite(dcl: i32, rt: i32): boolean {
-  if (!tyIsDeclaredParam(rt) || !tyAdmitsNull(dcl) || tyHasTyVar(dcl)) {
+  if (
+    !(tyIsDeclaredParam(rt) || tyIsParamHole(rt))
+    || !tyAdmitsNull(dcl)
+    || tyHasTyVar(dcl)
+  ) {
     return false
   }
   const nn = nonNullTy(dcl)
@@ -2134,7 +2146,31 @@ export function holeArgOriginNode(
 export function noteHoleFlow(src: i32, dst: i32, at: i32) {
   if !paramSolveProbe { return 0 }
   if expObsFn >= 0 { expObsPin(src, dst, at) }
+  // A parameter written into a place that admits `null` is not answered by it: the place then
+  // reads at the pin's member (`tvPlaceWrite`), as a type parameter's write does.
+  if tyIsParamHole(src) && holeWriteIntoNullable(src, dst) { return 0 }
   return noteHoleFlowGo(src, dst, 6)
+}
+
+// Whether `src` is the value of the assignment being delivered (`nlAsgTgt`) and `dst`, the place's
+// storage, admits `null` and holds no type variable or literal. A literal is left to the flow
+// answer, which is what lets a literal argument adapt to the place.
+function holeWriteIntoNullable(src: i32, dst: i32): boolean {
+  if nlAsgTgt < 0 || nlAsgGot != src { return false }
+  if !tyAdmitsNull(dst) || tyHasTyVar(dst) || isNullTy(dst) { return false }
+  return !tyHoldsLit(dst, 8)
+}
+
+// Whether `t` reaches a literal type within `depth` levels.
+function tyHoldsLit(t: i32, depth: i32): boolean {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return false }
+  if tyAt(t) is TyLit { return true }
+  const kids: i32[] = []
+  tyChildrenOf(t, kids)
+  for k in kids {
+    if tyHoldsLit(k, depth - 1) { return true }
+  }
+  return false
 }
 
 // Records a deferred join that escaped call `ix` to callee `who` lossily — the collapse kept
@@ -2959,7 +2995,7 @@ export function mkBinOpRetTy(
     if !binOpSymDeclared(op) { return bTy }
   }
   // An annotated body is not excluded: D551 re-checks the annotation against the
-  // resolved body type at each pin (`noteRetCstr`/`validateRetCstrs`), so a per-pin deferral is safe.
+  // resolved body type at each pin (`noteRetCstr`/`retRule`), so a per-pin deferral is safe.
   const d = mkDerivedHole(HD_BINOP, op, bTy, -1, lt)
   if d < 0 { return bTy }
   return d

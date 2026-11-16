@@ -9,6 +9,18 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-ir-c2l-list-store](2026-11-16-ir-c2l-list-store.md): IR cutover C2l: a list element store (coverage step), 2026-11-16
+- [2026-11-16-l2-s3-4-walk-rest](2026-11-16-l2-s3-4-walk-rest.md): L2 S3.4: the remaining bound kinds join the body-order walk, 2026-11-16
+- [2026-11-16-rr-names-key-memo](2026-11-16-rr-names-key-memo.md): The record-row union scan keys each member once, 2026-11-16 (lane REP)
+- [2026-11-16-store-s3-4d-2-class-t](2026-11-16-store-s3-4d-2-class-t.md): S3.4d step 2: class T decided at check from the arrow rule's facts, 2026-11-16
+- [2026-11-16-slot-store-flip](2026-11-16-slot-store-flip.md): Slot store part D, the flip: mono's slot questions read the place classes (lane SLOT, 2026-11-16)
+- [2026-11-16-rep-adt-stage4b-shadow-classes](2026-11-16-rep-adt-stage4b-shadow-classes.md): Rep ADT stage 4b, part 1: the heap shadow reads its merges against today's heap key (lane REP)
+- [2026-11-16-l2-s3-4c-discriminant](2026-11-16-l2-s3-4c-discriminant.md): L2 S3.4c, part 2: a discriminant test on a hole's field narrows its parent at the pin, 2026-11-16
+- [2026-11-16-ir-c2k-list-push](2026-11-16-ir-c2k-list-push.md): IR cutover C2k: a one-argument list push (coverage step), 2026-11-16
+- [2026-11-16-ir-c2j-string-methods](2026-11-16-ir-c2j-string-methods.md): IR cutover C2j: string `.slice` and `.cpLen` (coverage step), 2026-11-16
+- [2026-11-16-type-hashcons-s6b20-node-src-chain](2026-11-16-type-hashcons-s6b20-node-src-chain.md): Type hash-cons stage 6b: the two `nodeSrc` copy-chain limits become visited paths (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b19-slot-path](2026-11-16-type-hashcons-s6b19-slot-path.md): Type hash-cons stage 6b: `cwSlotPath`'s 16-step limit becomes a visited path (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b18-hole-rec-srcs](2026-11-16-type-hashcons-s6b18-hole-rec-srcs.md): Type hash-cons stage 6b: `holeRecSrcsOf`'s 16-step budget becomes a path (lane HASH), 2026-11-16
 - [2026-11-16-store-s3-4d-1-arrow-solve](2026-11-16-store-s3-4d-1-arrow-solve.md): S3.4d step 1: the arrow rule's solve, with no storage consumer, 2026-11-16
 - [2026-11-16-l2-s3-4c-is-walk](2026-11-16-l2-s3-4c-is-walk.md): L2 S3.4c, part 1: the `is` kind answers by rule in body order, 2026-11-16
 - [2026-11-16-l2-s3-4b-type-bound](2026-11-16-l2-s3-4b-type-bound.md): L2 S3.4b, part 2: a type-bound member call meets a hole's demand, 2026-11-16

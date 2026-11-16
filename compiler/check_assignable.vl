@@ -6,10 +6,13 @@
 import {
   BND_ARG,
   BND_ARRDEF,
+  BND_BIN,
   BND_BM,
   BND_IS,
   BND_LET,
   BND_MEM,
+  BND_NEST,
+  BND_PRINT,
   BND_RET,
   BND_UFCS,
   Bound,
@@ -173,9 +176,9 @@ import {
   elabFnLetMembers,
   elabFnSetOf,
   elabLiveTyOf,
-  elabMakerBlock,
   elabMakerCallNote,
   elabMakerCallReset,
+  elabMakerCoverBlock,
   elabMakerReadCalled,
   elabMakerRowNote,
   elabRelayPerResult,
@@ -234,16 +237,16 @@ import {
   argFlowErr,
   arrDefRule,
   bareBraceDeliver,
+  binRule,
   holeFnDeliveryDemands,
   isRule,
   memRule,
   monoRecheckEnd,
+  nestRule,
   omitFieldNullDeliver,
   pinBmCstrElems,
+  printRule,
   ufcsRule,
-  validateBinCstrs,
-  validateNestCstrs,
-  validatePrintCstrs,
 } from "./check_demands"
 import { bmArgMsg, tpMembersListText } from "./check_diag_text"
 import { callDstTyForGeneric, setCallDstTy } from "./check_expected"
@@ -443,6 +446,7 @@ import {
   tpIfFn,
   tpIfFnHasRow,
   tpIfJoin,
+  tpIfNode,
   tpIfReCount,
   tpIfReFn,
   tpIfReNames,
@@ -453,6 +457,7 @@ import {
   tyIsDeferredJoin,
   tyParamsApartIn,
 } from "./check_tp_join"
+import { atCallWhere, atCallWhereAs } from "./check_at_call"
 import {
   fvaFnMayDiffer,
   fvaNestedFnDiffers,
@@ -911,17 +916,23 @@ function tpIfPinCheck(
   ix: i32,
 ) {
   let apartJ = -1
+  let apartK = -1
   let unbuilt = -1
+  let unbuiltK = -1
   let k = 0
   while k < tpIfFn.length {
     if tpIfFn[k] == fn {
       const sj = substTyDeep(tpIfJoin[k], bNames, bTys)
-      if sj >= 0 && !tyHasTyVar(sj) && tyReachesUnion(sj, 6) {
+      if sj >= 0 && !tyHasTyVar(sj) && tyReachesUnion(sj) {
         // The widest names the whole chain of an `else if`, whose links are rows too.
         if apartJ < 0 || unionMemberCountOf(sj) > unionMemberCountOf(apartJ) {
           apartJ = sj
+          apartK = k
         }
-        if unbuilt < 0 && !tpIfRowBuilt(k) { unbuilt = sj }
+        if unbuilt < 0 && !tpIfRowBuilt(k) {
+          unbuilt = sj
+          unbuiltK = k
+        }
       }
     }
     k = k + 1
@@ -930,22 +941,21 @@ function tpIfPinCheck(
   let msg = ""
   if unbuilt >= 0 {
     apartJ = unbuilt
+    apartK = unbuiltK
     msg = "no one list holds it where its value goes — bind it to a `const`, or deliver it where its union is declared"
   } else {
     msg = tpIfRecheck(fn, pTys, bNames, bTys, retTy)
   }
   if msg == "" { return 0 }
-  let fWho = "the callee's body"
+  let fName = ""
   const fd = nodeAt(fn)
-  if fd is FuncDecl {
-    if fd.fnName != "" { fWho = "the body of `" + fd.fnName + "`" }
-  }
+  if fd is FuncDecl { fName = fd.fnName }
   tErr(
-    "at the call's argument types, the branches of an `if`, `match` or `??` in "
-      + fWho
-      + " join "
+    "the branches of an `if`, `match` or `??` join "
       + tpMembersListText(apartJ)
-      + ": "
+      + " ("
+      + atCallWhere(fn, fName, tpIfJoin[apartK], tpIfNode[apartK], ix)
+      + "): "
       + msg,
     ix,
   )
@@ -1382,26 +1392,10 @@ export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
   return 0
 }
 
-// One step of `ifaceSolveAt`.
+// The one step of `ifaceSolveAt` that still runs its validator: `SS_ARG`, whose rule is the arrow
+// rule (S3.4d, lane STORE).
 function solveStep(at: SolveAt, st: i32) {
-  if st == SS_BIN {
-    if at.toggles { substSelfOwnerSet(at.selfOwner) }
-    validateBinCstrs(
-      at.bNames,
-      at.bTys,
-      at.ix,
-      at.callee,
-      at.who,
-      at.hNames,
-      at.hArgNo,
-      at.hArgNode,
-    )
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
-  } else if st == SS_PRINT {
-    validatePrintCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-  } else if st == SS_NEST {
-    validateNestCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-  } else if st == SS_ARG {
+  if st == SS_ARG {
     if at.toggles { substSelfOwnerSet(at.argOwner) }
     validateArgCstrs(
       at.bNames,
@@ -1412,14 +1406,6 @@ function solveStep(at: SolveAt, st: i32) {
       at.hArgNode,
     )
     if at.toggles { substSelfOwnerSet(at.ownerWas) }
-  } else if st == SS_RET {
-    validateRetCstrs(at.rNames, at.rTys, at.ix, at.callee, at.who)
-  } else if st == SS_LET {
-    if at.toggles { substSelfOwnerSet(at.selfOwner) }
-    validateLetCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
-    if at.toggles { substSelfOwnerSet(at.ownerWas) }
-  } else if st == SS_BM {
-    validateBmCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
   }
   return 0
 }
@@ -1427,7 +1413,13 @@ function solveStep(at: SolveAt, st: i32) {
 // The bound kind answered by a per-row rule whose home is solve step `st`, or -1 for a step that
 // still runs its validator (`solveStep`). A kind joins when its rule replaces its validator (S3.4).
 function ruleKindOfStep(st: i32): i32 {
+  if st == SS_BIN { return BND_BIN }
+  if st == SS_PRINT { return BND_PRINT }
   if st == SS_RULES { return BND_ARRDEF }
+  if st == SS_NEST { return BND_NEST }
+  if st == SS_RET { return BND_RET }
+  if st == SS_LET { return BND_LET }
+  if st == SS_BM { return BND_BM }
   if st == SS_IS { return BND_IS }
   if st == SS_MEM { return BND_MEM }
   if st == SS_UFCS { return BND_UFCS }
@@ -1490,6 +1482,41 @@ function solveRules(at: SolveAt, from: i32, to: i32) {
 // Returns 1 when the rule ends its kind's rows for this solve.
 function solveRule(at: SolveAt, k: i32, ci: i32, told0: i32[]): i32 {
   const row = bndAt(k, ci)
+  if k == BND_NEST {
+    return nestRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
+  }
+  if k == BND_PRINT {
+    return printRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
+  }
+  if k == BND_RET {
+    return retRule(at.rNames, at.rTys, at.ix, at.callee, at.who, ci, row)
+  }
+  if k == BND_BM {
+    return bmRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
+  }
+  if k == BND_BIN {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    binRule(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.who,
+      at.hNames,
+      at.hArgNo,
+      at.hArgNode,
+      ci,
+      row,
+    )
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+    return 0
+  }
+  if k == BND_LET {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    letRule(at.bNames, at.bTys, at.ix, at.callee, at.who, ci, row)
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+    return 0
+  }
   if k == BND_IS {
     return isRule(at.bNames, at.bTys, at.ix, at.callee, at.who, row)
   }
@@ -1728,6 +1755,12 @@ function holeDeclValueCstrsAt(
 // the closed parameter types `pts` as a direct call of it there is: a call through the choice is
 // typed by its first arm alone (D13740).
 export function holeChoiceArmCstrsAt(a: i32, pts: i32[]) {
+  const all: i32[] = []
+  return holeChoiceArmCstrsIn(a, pts, all)
+}
+
+// `holeChoiceArmCstrsAt` over the arms whose function is in `only`, every arm when it is empty.
+export function holeChoiceArmCstrsIn(a: i32, pts: i32[], only: i32[]) {
   const wp: i32[] = []
   for p in pts {
     if p < 0 || tyHasTyVar(p) { return 0 }
@@ -1744,7 +1777,9 @@ export function holeChoiceArmCstrsAt(a: i32, pts: i32[]) {
     const fd = nodeAt(decls[k])
     let who = ""
     if fd is FuncDecl { who = fd.fnName }
-    holeDeclValueCstrsAt(arms[k], decls[k], nodeTyOf(arms[k]), inst, who)
+    if only.length == 0 || i32ListHas(only, decls[k]) {
+      holeDeclValueCstrsAt(arms[k], decls[k], nodeTyOf(arms[k]), inst, who)
+    }
     k = k + 1
   }
   return 0
@@ -2061,8 +2096,8 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // stays at its own type. Writes only `nodeRepTyIx`.
   const rtStamp = stampsStand()
     && srcExpr >= 0
-    && (tyReachesEmptyHole(srcTy, 8)
-    || tyReachesUnion(dstTy, 8)
+    && (tyReachesEmptyHole(srcTy)
+    || tyReachesUnion(dstTy)
     || litAtDstStorage(srcExpr, dstTy)
     || deliversNullLit(srcExpr))
   if rtStamp && (repStampableLit(srcExpr) || deliversNullLit(srcExpr)) {
@@ -2491,7 +2526,7 @@ function argCstrFitsAt(
     // parameter through `call_ref` unconverted (D5790).
     if tyHasHole(rat) || tyHasHole(rexp) { return argCstrFits(rat, rexp, form) }
     // An argument whose type is already an earlier diagnostic's error is not refused again.
-    if tyMentionsErr(rat, 8) { return true }
+    if tyMentionsErr(rat) { return true }
     // A literal already retyped for another of the hole's demands is that type now; it is not
     // rebuilt a second time for this one.
     // A forwarder's literal some caller copied at this type fits it (D5880).
@@ -2791,7 +2826,7 @@ function argCstrFixedErr(
 // Re-validates every deferred call-argument constraint this call's callee owns
 // (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
 // to another hole is re-recorded under it for the outer call that pins it, and only where the
-// callee is named, as `validateBinCstrs` does.
+// callee is named, as `binRule` does.
 export function validateArgCstrs(
   bNames: string[],
   bTys: i32[],
@@ -2894,7 +2929,7 @@ export function validateArgCstrs(
       } else if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         // An argument still open here (a lambda's `Map()` result) is built at the parameter it
         // reaches, as the direct spelling's delivery pins it.
-        if tyReachesEmptyHole(rat, 8) { constrainEmpty(rat, rexp) }
+        if tyReachesEmptyHole(rat) { constrainEmpty(rat, rexp) }
         if (
           !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode)
           && !argCstrFixedErr(rat, rexp, ci, ix, calleeFn, bNames, bTys)
@@ -3022,7 +3057,7 @@ function adoptHoleLitArg(
 // its own type is not already the same rep (a wider record literal fits by width as it is).
 function holeLitAdopts(org: i32, rat: i32, rexp: i32): boolean {
   if rat == rexp || tyHasHole(rexp) { return false }
-  const empty = tyReachesEmptyHole(rat, 8)
+  const empty = tyReachesEmptyHole(rat)
   if tyHasHole(rat) && !empty { return false }
   if scalarPrimPair(rat, rexp) { return false }
   if !empty && assignable(rat, rexp) && assignable(rexp, rat) { return false }
@@ -3325,80 +3360,81 @@ function tyHoldsNoFnIn(w: i32, path: i32[]): boolean {
   }
 }
 
-// Re-validates every deferred return-type constraint this call resolves: substitutes the
-// call's bindings into the body's returned type and the declared return type, and asks the
-// mismatch question the body could only answer vacuously. Re-defers like `validateArgCstrs`
-// when a hole substitutes to another hole; the message is the direct spelling's, verbatim.
-export function validateRetCstrs(
+// The return rule for one `BND_RET` bound `row` (row `ci` of its kind) of `calleeFn`: the body's
+// returned type at the bindings must fit the declared return, refused in the direct spelling's
+// words; either side still open re-defers.
+export function retRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
+  ci: i32,
+  row: Bound,
 ) {
   const cvWas = cvNow
-  const n = bndCount(BND_RET)
-  let ci = bndNextRow(BND_RET, calleeFn, -1, n)
-  while ci < n {
-    const row = bndAt(BND_RET, ci)
-    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
-      cvNow = cvPick(CV_RET, ci, cvWas)
-      const rg = substTyDeep(row.on, bNames, bTys)
-      const rw = substTyDeep(row.a, bNames, bTys)
-      // Re-records only when the callee is named — an unnamed call cannot reassign ownership
-      // — and gates on either side still holding a hole, not just the body side.
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if rg != row.on || rw != row.a {
-          if tyHasHole(rg) || tyHasHole(rw) { noteRetCstr(rg, rw, row.site) }
-        }
+  if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+    cvNow = cvPick(CV_RET, ci, cvWas)
+    const rg = substTyDeep(row.on, bNames, bTys)
+    const rw = substTyDeep(row.a, bNames, bTys)
+    // Re-records only when the callee is named — an unnamed call cannot reassign ownership
+    // — and gates on either side still holding a hole, not just the body side.
+    if (
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
+    ) {
+      if rg != row.on || rw != row.a {
+        if tyHasHole(rg) || tyHasHole(rw) { noteRetCstr(rg, rw, row.site) }
       }
-      // A union whose holes this call leaves open is checked by its bound members, which are
-      // in every instance's value whatever the holes become (D14801).
-      let rgc = rg
-      if tyHasHole(rg) && !tyHasHole(rw) { rgc = boundUnionMembers(rg) }
-      // A function with open parameters returned where no function fits (D14979).
-      if (
-        (rgc < 0 || tyHasHole(rgc))
-        && !tyHasHole(rw)
-        && fnShapeClash(rg, rw, 0)
-      ) {
-        rgc = rg
-      }
-      const rClash = rgc == rg
-        && tyHasHole(rg)
-        && !tyHasHole(rw)
-        && fnShapeClash(rg, rw, 0)
-      if rgc >= 0 && (!tyHasHole(rgc) || rClash) {
-        if (!tyHasHole(rw) && !retNomOnlyAtHole(row.b, row.site, rgc, rw)) {
-          if (
-            rClash
-            || !litPinAssignable(row.site, rgc, rw, bNames, bTys, false)
-              && !bundleMemberFits(row.on, rw, bNames, bTys, ix)
-          ) {
-            let rWho = "the callee's return"
-            if who != "" { rWho = "the return of `" + who + "`" }
-            tErr(
-              "return type mismatch: expected "
-                + tyToStr(rw)
-                + ", got "
-                + tyToStr(rgc)
-                + boolForNumberNote(rgc, rw)
-                + " ("
-                + rWho
-                + " at the call's argument types"
-                + unboundParamsNote(bNames, bTys)
-                + ")",
+    }
+    // A union whose holes this call leaves open is checked by its bound members, which are
+    // in every instance's value whatever the holes become (D14801).
+    let rgc = rg
+    if tyHasHole(rg) && !tyHasHole(rw) { rgc = boundUnionMembers(rg) }
+    // A function with open parameters returned where no function fits (D14979).
+    if (
+      (rgc < 0 || tyHasHole(rgc))
+      && !tyHasHole(rw)
+      && fnShapeClash(rg, rw, 0)
+    ) {
+      rgc = rg
+    }
+    const rClash = rgc == rg
+      && tyHasHole(rg)
+      && !tyHasHole(rw)
+      && fnShapeClash(rg, rw, 0)
+    if rgc >= 0 && (!tyHasHole(rgc) || rClash) {
+      if (!tyHasHole(rw) && !retNomOnlyAtHole(row.b, row.site, rgc, rw)) {
+        if (
+          rClash
+          || !litPinAssignable(row.site, rgc, rw, bNames, bTys, false)
+            && !bundleMemberFits(row.on, rw, bNames, bTys, ix)
+        ) {
+          tErr(
+            "return type mismatch: expected "
+              + tyToStr(rw)
+              + ", got "
+              + tyToStr(rgc)
+              + boolForNumberNote(rgc, rw)
+              + " ("
+              + atCallWhereAs(
+              row.fn,
+              who,
+              row.on,
+              -1,
+              row.site,
               ix,
+              "returned",
+              "return",
             )
-          }
+              + unboundParamsNote(bNames, bTys)
+              + ")",
+            ix,
+          )
         }
       }
     }
-    ci = bndNextRow(BND_RET, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -3498,175 +3534,141 @@ function letFnRowOutsideCall(ci: i32, c: i32): boolean {
   return own >= 0 && d != own && nodeAt(d) is LetDecl
 }
 
-// `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
-// need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
-// with the attribution appended since the reader wrote no assignment.
-export function validateLetCstrs(
+// The binding rule for one `BND_LET` bound `row` (row `ci` of its kind) of `calleeFn`: a value the
+// body stores in a `let` or `const` must fit it at the bindings (`letAssignMsg`, attributed to the
+// call); either side still open re-defers.
+export function letRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
+  ci: i32,
+  row: Bound,
 ) {
   const cvWas = cvNow
-  const n = bndCount(BND_LET)
-  let ci = bndNextRow(BND_LET, calleeFn, -1, n)
-  while ci < n {
+  if (
+    cstrOwnedBy(row.fn, calleeFn)
+    && !lambdaCopyOnly(row.on, row.a)
+    && !nestCstrOutside(row.site)
+    && !letFnRowOutsideCall(ci, ix)
+    && !wrUnreachedBy(ci, ix, calleeFn)
+    && !ctnWrUnreachedBy(row.site, row.on, row.fn, ix)
+  ) {
+    cvNow = cvPick(CV_LET, ci, cvWas)
+    const lg = substTyDeep(row.on, bNames, bTys)
+    const lw = substTyDeep(row.a, bNames, bTys)
+    // Re-records only when the callee is named, for the same ownership reason
+    // `retRule` gates on; also gated on either side holding a hole.
     if (
-      cstrOwnedBy(bndAt(BND_LET, ci).fn, calleeFn)
-      && !lambdaCopyOnly(bndAt(BND_LET, ci).on, bndAt(BND_LET, ci).a)
-      && !nestCstrOutside(bndAt(BND_LET, ci).site)
-      && !letFnRowOutsideCall(ci, ix)
-      && !wrUnreachedBy(ci, ix, calleeFn)
-      && !ctnWrUnreachedBy(
-        bndAt(BND_LET, ci).site,
-        bndAt(BND_LET, ci).on,
-        bndAt(BND_LET, ci).fn,
-        ix,
-      )
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
     ) {
-      cvNow = cvPick(CV_LET, ci, cvWas)
-      const lg = substTyDeep(bndAt(BND_LET, ci).on, bNames, bTys)
-      const lw = substTyDeep(bndAt(BND_LET, ci).a, bNames, bTys)
-      // Re-records only when the callee is named, for the same ownership reason
-      // `validateRetCstrs` gates on; also gated on either side holding a hole.
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if lg != bndAt(BND_LET, ci).on || lw != bndAt(BND_LET, ci).a {
-          if tyHasHole(lg) || tyHasHole(lw) {
-            noteLetCstr(lg, lw, bndAt(BND_LET, ci).site, bndAt(BND_LET, ci).s)
-          }
-        }
-      }
-      // A function whose own parameters are still open fits no destination that holds no
-      // function, whatever they become, so it is judged now rather than deferred (D14979).
-      const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, 0)
-      if (
-        (!tyHasHole(lg) && !tyHasHole(lw) || clash)
-        && !letLamJudgedAtCall(ci, ix)
-      ) {
-        if (
-          clash
-          || !litPinAssignable(bndAt(BND_LET, ci).site, lg, lw, bNames, bTys, false)
-        ) {
-          // A destination one member of a value called at several signatures fits (D15146).
-          const member = !clash
-            && bundleMemberFits(
-            bndAt(BND_LET, ci).on,
-            lw,
-            bNames,
-            bTys,
-            ix,
-          )
-          if !member {
-            let lWho = "the callee's body"
-            if who != "" { lWho = "the body of `" + who + "`" }
-            tErr(
-              letAssignMsg(
-                bndAt(BND_LET, ci).site,
-                lg,
-                lw,
-                bndAt(BND_LET, ci).s,
-                -1,
-              )
-                + litLetStoreNote(bndAt(BND_LET, ci).site, lg, lw)
-                + " ("
-                + lWho
-                + " at the call's argument types)",
-              ix,
-            )
-          }
+      if lg != row.on || lw != row.a {
+        if tyHasHole(lg) || tyHasHole(lw) {
+          noteLetCstr(lg, lw, row.site, row.s)
         }
       }
     }
-    ci = bndNextRow(BND_LET, calleeFn, ci, n)
+    // A function whose own parameters are still open fits no destination that holds no
+    // function, whatever they become, so it is judged now rather than deferred (D14979).
+    const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, 0)
+    if (
+      (!tyHasHole(lg) && !tyHasHole(lw) || clash)
+      && !letLamJudgedAtCall(ci, ix)
+    ) {
+      if (clash || !litPinAssignable(row.site, lg, lw, bNames, bTys, false)) {
+        // A destination one member of a value called at several signatures fits (D15146).
+        const member = !clash && bundleMemberFits(row.on, lw, bNames, bTys, ix)
+        if !member {
+          tErr(
+            letAssignMsg(row.site, lg, lw, row.s, -1)
+              + litLetStoreNote(row.site, lg, lw)
+              + " ("
+              + atCallWhereAs(
+              row.fn,
+              who,
+              row.on,
+              row.a,
+              row.site,
+              ix,
+              "used",
+              "body",
+            )
+              + ")",
+            ix,
+          )
+        }
+      }
+    }
   }
   cvNow = cvWas
   return 0
 }
 
-// Whether the deferred builtin-method-argument constraints this binding resolves hold — the
-// twin of `validateLetCstrs` for a `.push`/`.set`/`.add` argument rather than an assignment
-// (D582 is why `BND_ARG` cannot serve this position). Same re-deferral rule, gated on either
-// side; the message is the arm's own (`bmArgMsg`), verbatim, with the attribution appended.
-export function validateBmCstrs(
+// The method-argument rule for one `BND_BM` bound `row` (row `ci` of its kind) of `calleeFn`: a
+// `.push`/`.set`/`.add` argument must fit its receiver at the bindings (`bmArgMsg`); either side
+// still open re-defers.
+export function bmRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
+  ci: i32,
+  row: Bound,
 ) {
   const cvWas = cvNow
-  const n = bndCount(BND_BM)
-  let ci = bndNextRow(BND_BM, calleeFn, -1, n)
-  while ci < n {
+  if (
+    cstrOwnedBy(row.fn, calleeFn)
+    && !nestCstrOutside(row.site)
+    && !ctnWrUnreachedBy(row.site, row.on, row.fn, ix)
+  ) {
+    cvNow = cvPick(CV_BM, ci, cvWas)
+    const bg = substTyDeep(row.on, bNames, bTys)
+    const bw = substTyDeep(row.a, bNames, bTys)
+    let bc = row.b
+    if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
+    // Re-records only when the callee is named — an unnamed call cannot reassign
+    // ownership of the constraint.
     if (
-      cstrOwnedBy(bndAt(BND_BM, ci).fn, calleeFn)
-      && !nestCstrOutside(bndAt(BND_BM, ci).site)
-      && !ctnWrUnreachedBy(
-        bndAt(BND_BM, ci).site,
-        bndAt(BND_BM, ci).on,
-        bndAt(BND_BM, ci).fn,
-        ix,
-      )
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
     ) {
-      cvNow = cvPick(CV_BM, ci, cvWas)
-      const bg = substTyDeep(bndAt(BND_BM, ci).on, bNames, bTys)
-      const bw = substTyDeep(bndAt(BND_BM, ci).a, bNames, bTys)
-      let bc = bndAt(BND_BM, ci).b
-      if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
-      // Re-records only when the callee is named — an unnamed call cannot reassign
-      // ownership of the constraint.
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if bg != bndAt(BND_BM, ci).on || bw != bndAt(BND_BM, ci).a {
-          if tyHasHole(bg) || tyHasHole(bw) {
-            noteBmCstr(
-              bndAt(BND_BM, ci).c,
-              bndAt(BND_BM, ci).s,
-              bg,
-              bw,
-              bc,
-              bndAt(BND_BM, ci).site,
-            )
-          }
-        }
-      }
-      if (
-        !tyHasHole(bg)
-        && !elabSlotSetHolds(bndAt(BND_BM, ci).a, bndAt(BND_BM, ci).site)
-      ) {
-        if !tyHasHole(bw) {
-          const held = stampsHeld
-          stampsHeldSet(true)
-          const fits = bmArgPred(
-            bndAt(BND_BM, ci).c,
-            bg,
-            bw,
-            bndAt(BND_BM, ci).site,
-          )
-          stampsHeldSet(held)
-          if !fits {
-            let bWho = "the callee's body"
-            if who != "" { bWho = "the body of `" + who + "`" }
-            tErr(
-              bmArgMsg(bndAt(BND_BM, ci).c, bndAt(BND_BM, ci).s, bg, bw, bc)
-                + " ("
-                + bWho
-                + " at the call's argument types)",
-              ix,
-            )
-          }
+      if bg != row.on || bw != row.a {
+        if tyHasHole(bg) || tyHasHole(bw) {
+          noteBmCstr(row.c, row.s, bg, bw, bc, row.site)
         }
       }
     }
-    ci = bndNextRow(BND_BM, calleeFn, ci, n)
+    if (!tyHasHole(bg) && !elabSlotSetHolds(row.a, row.site)) {
+      if !tyHasHole(bw) {
+        const held = stampsHeld
+        stampsHeldSet(true)
+        const fits = bmArgPred(row.c, bg, bw, row.site)
+        stampsHeldSet(held)
+        if !fits {
+          tErr(
+            bmArgMsg(row.c, row.s, bg, bw, bc)
+              + " ("
+              + atCallWhereAs(
+              row.fn,
+              who,
+              row.a,
+              row.on,
+              row.site,
+              ix,
+              "used",
+              "body",
+            )
+              + ")",
+            ix,
+          )
+        }
+      }
+    }
   }
   cvNow = cvWas
   return 0
@@ -5142,23 +5144,21 @@ function fvaValueIsCallResult(v: i32, depth: i32): boolean {
 // Withdraws the call notes of each maker one of whose reads takes no instance of its own: the
 // root it reaches shares its body with the instances, which retype that body's returned read.
 function fvaMakerCoverCheck() {
-  const reads: {[i32]: i32} = Map()
-  const covered: {[i32]: i32} = Map()
+  const uncovered: {[i32]: i32[]} = Map()
   const makerOf: {[i32]: i32} = Map()
   let ix = 0
   while ix < P.nodes.length {
     if nodeAt(ix) is Ident {
       const m = fvaMakerOfBindingIn(identDeclOf(ix), makerOf)
-      if m >= 0 && m != ix {
-        reads[m] = (reads.get(m) ?? 0) + 1
-        if fvaMakerReadCovered(ix) { covered[m] = (covered.get(m) ?? 0) + 1 }
+      if m >= 0 && m != ix && !fvaMakerReadCovered(ix) {
+        const rs = uncovered.get(m) ?? []
+        rs.push(ix)
+        uncovered[m] = rs
       }
     }
     ix = ix + 1
   }
-  for m in reads.keys() {
-    if (covered.get(m) ?? 0) < (reads.get(m) ?? 0) { elabMakerBlock(m) }
-  }
+  for m in uncovered.keys() { elabMakerCoverBlock(m, uncovered.get(m) ?? []) }
   return 0
 }
 
