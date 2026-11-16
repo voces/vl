@@ -10,7 +10,9 @@ This is step 1.
 
 ## What the solve produces
 
-`BND_ARG` joins `ruleKinds`, so the per-row walk of S3.4a (`solveRules`) visits it in body order.
+The per-row walk of S3.4a (`solveRules`) visits `BND_ARG` in body order, beside `SS_ARG`'s
+validator rather than in its place: `walkKindsOfStep` adds it to the walk, while `ruleKindOfStep`
+(which retires a step's validator) does not name it.
 - Its arm, `arrowRule`, reads an argument row of form N, which is argument N of a call through a hole
   callee in the callee's body.
 - It records that hole call's types at the outer call's bindings into `check_arrow.vl`: the callee's
