@@ -123,7 +123,9 @@ class Gen {
       case 8: // compose
         {
           const u = r.pick<T>(["i32", "i64", "f64"]);
-          this.body.push(`print(compose(${this.fnAt(u)}, ${this.fnAt(u)})(${this.lit(u)}))`);
+          // D16562: `A` is bound by nothing at the call, so it takes `i32`; name it at a wider type
+          const ty = u === "i32" ? "" : `<${u}, ${u}, ${u}>`;
+          this.body.push(`print(compose${ty}(${this.fnAt(u)}, ${this.fnAt(u)})(${this.lit(u)}))`);
         }
         return;
       case 9: // a hole higher-order function, called with closures at two types
