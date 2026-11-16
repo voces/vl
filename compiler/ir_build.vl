@@ -17,6 +17,7 @@ import {
   Index,
   LetDecl,
   Member,
+  NullLit,
   NumLit,
   P,
   Param,
@@ -64,6 +65,7 @@ import {
 } from "./ir_lower"
 import {
   GlobalCtx,
+  atomEqPlanOf,
   binNumWidth,
   boxOwedAt,
   callEndsNever,
@@ -100,7 +102,7 @@ import { fRecRetTy, fRetVoid, fnStmts, gPromoInStart } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
-import { charLitCp } from "./emit_base"
+import { charLitCp, unwrapParen } from "./emit_base"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
@@ -658,19 +660,31 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
+  // A `null` literal has no value of its own: the box writer writes the null tag alone.
+  if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
+    if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
+      const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+      return boxTemp(b, none, ix, dst)
+    }
+  }
   return widenTo(b, irBExpr(b, ix), ix, dst)
+}
+
+// `v`, built from `ix`, boxed into boxed nullable `dst` by legacy's box writer.
+function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  const bty = repTyOf(dst)
+  const bt = irVarNew(ib, dst, bty, "temp", -1)
+  irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
+  const bo: Opnd = { ov: bt }
+  return bo
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
 function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   if ibMiss != "" || dst < 0 || irBOpRep(v) == dst { return v }
+  // The checker records the box at the node; legacy's box writer builds it around the value.
   if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
-    // The checker records the box at the node; legacy's box writer builds it around the value.
-    const bty = repTyOf(dst)
-    const bt = irVarNew(ib, dst, bty, "temp", -1)
-    irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
-    const bo: Opnd = { ov: bt }
-    return bo
+    return boxTemp(b, v, ix, dst)
   }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
@@ -693,6 +707,56 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
 }
 
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
+// An `==`/`!=` with an atom operand, by legacy's own arm (`atomEqPlanOf`). A side typed as one
+// string literal is written by legacy's literal writer (an unread immediate here); only a `StrLit`
+// spelling is taken, since anything else it would evaluate with legacy's expression writer.
+function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const p = atomEqPlanOf(n, ibFnIx)
+  const ne = n.binOp == "!="
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if p.aqArm == "none" { return irBMiss("atom compare") }
+  if p.aqArm == "fold" { return irBMiss("atom compare fold") }
+  if p.aqArm == "static" {
+    const sIx = if p.aqStaticLeft { n.binLeft } else { n.binRight }
+    if !(nodeAt(unwrapParen(sIx)) is StrLit) {
+      return irBMiss("atom compare static operand")
+    }
+    const aIx = if p.aqStaticLeft { n.binRight } else { n.binLeft }
+    const a = atomSide(b, aIx)
+    if ibMiss != "" { return a }
+    const st = if p.aqStaticLeft { 1 } else { 2 }
+    const l = if p.aqStaticLeft { none } else { a }
+    const r = if p.aqStaticLeft { a } else { none }
+    return irBLetTemp(
+      b,
+      { aeL: l, aeR: r, aeStatic: st, aeNe: ne, aeAt: ix },
+      ix,
+      rep,
+    )
+  }
+  // `ids`: two atom values.
+  const l = atomSide(b, n.binLeft)
+  if ibMiss != "" { return l }
+  const r = atomSide(b, n.binRight)
+  if ibMiss != "" { return r }
+  return irBLetTemp(
+    b,
+    { aeL: l, aeR: r, aeStatic: 0, aeNe: ne, aeAt: ix },
+    ix,
+    rep,
+  )
+}
+
+// The value of atom operand `ix`, which must build at an atom rep.
+function atomSide(b: i32[], ix: i32): Opnd {
+  const v = irBExpr(b, ix)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RAtom) {
+    return irBMiss("atom compare operand")
+  }
+  return v
+}
+
 function atomOperand(ix: i32): boolean {
   return repNodeAt(repNodeOfTy(nodeTyAt(ix, ibFnIx))) is RAtom
 }
@@ -744,10 +808,8 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     if n.binOp == "=" && !ASSIGN_AS_VALUE {
       return irBMiss("assignment as a value")
     }
-    // Legacy's atom compares fold or widen a literal operand (`emitBinLitEq`), a decision the IR
-    // does not share yet.
     if atomOperand(n.binLeft) || atomOperand(n.binRight) {
-      return irBMiss("atom compare")
+      return atomCompare(b, n, ix, rep)
     }
     if (
       operandWhy(n.binLeft) == STR_OPERAND
