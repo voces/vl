@@ -9215,6 +9215,9 @@ function monoInstanceRet(
   ek: i32,
   tps: string[],
   retRep: i32,
+  retParam: i32,
+  pinned: string[],
+  pinTys: i32[],
 ): i32 {
   if fn.fnRet >= 0 && !monoAnnHasTyParam(fn.fnRet, -1, tps) { return fn.fnRet }
   // The failure is recorded and the walk goes on at the result's own type (emitFail does not halt).
@@ -9244,38 +9247,34 @@ function monoInstanceRet(
   }
   monoClosedRecordOwnRow(r)
   const nm = monoInstanceRetSpelling(r)
-  if nm == "" { return -1 }
+  if nm == "" {
+    // A list, record or map parameter handed back whole at the plain pin `monoMakeInstanceParams`
+    // gives it returns at that pin, where the instance would infer an `i32` (D16825). A map or
+    // record of a tagged set's ids is pinned as itself there, and returns as inferred.
+    const pt = if retParam >= 0 && retParam < pinTys.length { pinTys[retParam] } else { -1 }
+    const rt = tyAt(r)
+    if (
+      fn.fnRet >= 0
+      || pt < 0
+      || retParam >= pinned.length
+      || !tySameSealed(r, pt)
+      || !(rt is TyArray || rt is TyObj || rt is TyMap)
+      || monoTagMapTy(pt)
+      || rt is TyObj && monoTagMapRepTy(pt, [], []) >= 0
+    ) {
+      return -1
+    }
+    return monoSynthPinRef(
+      pinned[retParam],
+      monoPinWidenTy(pt),
+      monoPinRepTyOf(pt),
+    )
+  }
   if monoRegisterPinUnion(nm, r) < 0 { return -2 }
   if registerTyReachUnions(monoProgStmts, r) < 0 { return -2 }
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
   return synthTypeRefTy(nm, -1, if at >= 0 { at } else { r })
-}
-
-// The return annotation of an un-annotated instance handing back parameter `pi` whole, where its
-// result is a list, record or map with no spelling and is that parameter's pin type: the pin,
-// spelled as the parameter is. A function handed back is a set's id or a closure, which the
-// inferred return already is. -1 otherwise.
-function monoRetAtParamPin(
-  fn: FuncDecl,
-  ek: i32,
-  pi: i32,
-  pinned: string[],
-  pinTys: i32[],
-): i32 {
-  if fn.fnRet >= 0 || pi < 0 || pi >= pinned.length || pi >= pinTys.length {
-    return -1
-  }
-  const r = elabRetOf(ek)
-  if r < 0 || r >= T.tys.length || !tySameSealed(r, pinTys[pi]) { return -1 }
-  const rt = tyAt(r)
-  if !(rt is TyArray || rt is TyObj || rt is TyMap) { return -1 }
-  if monoInstanceRetSpelling(r) != "" { return -1 }
-  return monoSynthPinRef(
-    pinned[pi],
-    monoPinWidenTy(pinTys[pi]),
-    monoPinRepTyOf(pinTys[pi]),
-  )
 }
 
 // The source node of argument `a`, peeled: an instance copy's argument maps to its template's,
@@ -10250,11 +10249,16 @@ function monoMakeInstanceGo(
       monoOpenLamOwner = -1
       monoOpenLamFlush(monoOpenLamMark)
     }
-    const nretS = monoInstanceRet(fn, ek, k.tps, retRep)
-    if nretS < -1 { return monoBuildPop() - 1 }
-    // A parameter handed back whole, at a result type the naming rule cannot spell, returns at the
-    // parameter's own pin, whose row its argument was built at (D16825).
-    const nret0 = if nretS == -1 { monoRetAtParamPin(fn, ek, retParam, pinned, pinTys) } else { nretS }
+    const nret0 = monoInstanceRet(
+      fn,
+      ek,
+      k.tps,
+      retRep,
+      retParam,
+      pinned,
+      pinTys,
+    )
+    if nret0 < -1 { return monoBuildPop() - 1 }
     // A lambda instance whose body gives one numeric type, called at another from its own
     // parameters, returns the type it is called at (D16711).
     const ownSig = if fn.fnRet < 0 && monoCadIsLam(monoOrigNode[origFe]) { elabKeySig(ek) } else { -1 }
