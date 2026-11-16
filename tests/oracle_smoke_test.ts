@@ -108,6 +108,12 @@ Deno.test("oracle: pinned regressions", () => {
     ["print(2.0 * (0x80000000 >> 1))", "2147483648"],
     ["print((0xFFFFFFFF % 1_000) as i64)", "295"],
     ["print(0xFFFFFFFF / 2)", "0"], // no use: the 32-bit pattern
+    // 4.3: a radix tree that is no constant, beside a typed i64 arm, runs at that arm's width
+    ["let k: i32 = -5\nconst v2: i64 = 4294967296\nprint(if k > 0 { v2 } else { 0xFFFFFFFF << k })", "-576460752303423488"],
+    // D3043: a radix tree holding a decimal outside i32 is i64 beside an i32 arm
+    ["function f(p: i32): i64 { return if p == 0 { p - 9 } else { 0xFFFFFFFF - 9223372036854775807 } }\nprint(f(3))", "-9223372032559808512"],
+    // 4.3: a float join beside an `f32` argument of `min` adopts f32
+    ["function g(p: f32): f32 { return p }\nlet c: f64 = 1e-7\nconst m: f32 = min(g(2.5), 0.1 % (if 0.0 < c { 3.0 } else { 0.5 }))\nprint(m)", "0.10000000149011612"],
     // a shift's count never types its left operand; a constant count of 32 to 63 widens it (Q8)
     ["const c: i32 = 40\nconst v: i64 = 1 << c\nprint(v)", "1099511627776"],
     ["const c: i32 = 3\nconst v: i64 = (0xFFFFFFFF << 31) << c\nprint(v)", "-17179869184"],
