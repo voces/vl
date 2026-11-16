@@ -76,6 +76,7 @@ import {
   cwLetUnwritten,
 } from "./check_write_scan"
 import { i32ListHas, strListHas } from "./listutil"
+import { tyHasTyVar } from "./tyquery"
 import { declOrigOf, identDeclOf, nodeSrc } from "./symbols"
 
 // One row per (call, callee, parameter position) a set reaches: the call node, the callee
@@ -95,6 +96,12 @@ let sbDecls: i32[] = []
 let sbSetsOf: {[string]: i32[]} = Map()
 // By `decl|position`: the union of the argument types every row for it hands.
 let sbTysOf: {[string]: i32[]} = Map()
+// Per parameter key and one path step (`[]` or a field), the caller parameters a list or record
+// literal argument hands there, as `fn|param` keys: `call0([g], x)` hands `g` to `fs[]`.
+let sbPathFwd: {[string]: string[]} = Map()
+// Literal arguments whose every element or field reads a caller parameter: they hold exactly what
+// those parameters hold (`sbPathFwd`), so they lack no set.
+let sbFwdLit: {[i32]: boolean} = Map()
 
 // One row per declaration handing back its parameter: every value it returns reads it.
 let hbFn: i32[] = []
@@ -331,6 +338,14 @@ function sbFromClosure(r: i32): boolean {
 
 // Whether some row for parameter `q` of `d` hands a value of no set: a direct argument of no set,
 // or one handed on from a parameter holding a closure.
+// Whether row `r`'s argument is a literal of forwarded caller parameters (`sbFwdLit`).
+function sbRowArgFwd(r: i32): boolean {
+  const c = sbCall[r]
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || sbParam[r] >= cn.callArgs.length { return false }
+  return sbFwdLit[parenPeelIx(cn.callArgs[sbParam[r]])] ?? false
+}
+
 function sbRowsLackSet(d: i32, q: i32): boolean {
   return sbLacksSet[sbKey(d, q)] ?? false
 }
@@ -576,6 +591,7 @@ function sbArgRows(c: i32, n: Call, m: i32, fr: i32): boolean {
       const set = fnTagSetOfTy(ty)
       const fo = sbArgOwner(fr, a)
       const q = if set < 0 { sbParamIndexIn(fo, a) } else { -1 }
+      if set < 0 && q < 0 { sbPathFwdNote(m, j, a, fo) }
       if set >= 0 || q >= 0 || ty >= 0 {
         sbRowAdd(c, m, j, set, ty, fo, q)
         added = true
@@ -584,6 +600,82 @@ function sbArgRows(c: i32, n: Call, m: i32, fr: i32): boolean {
     j = j + 1
   }
   return added
+}
+
+// Notes each element or field of literal argument `a`, handed to parameter `j` of `m`, that reads
+// a parameter of `fo`: that parameter's sets reach `m`'s parameter one step down.
+function sbPathFwdNote(m: i32, j: i32, a: i32, fo: i32) {
+  const lit = sbConstLitOf(a)
+  const an = if lit >= 0 && lit < P.nodes.length { nodeAt(lit) } else { null }
+  let all = true
+  let any = false
+  if an is ArrayLit {
+    for e in an.arrElems {
+      if sbPathFwdAdd(m, j, "[]", fo, parenPeelIx(e)) { any = true } else { all = false }
+    }
+  } else if an is ObjLit {
+    for fi in an.objFields {
+      const fn = nodeAt(fi)
+      if fn is FieldInit && sbPathFwdAdd(m, j, fn.fiName, fo, parenPeelIx(fn.fiValue)) {
+        any = true
+      } else {
+        all = false
+      }
+    }
+  }
+  if any && all { sbFwdLit[a] = true }
+  return 0
+}
+
+// The list or record literal `a` is, or a `const` binding `a` reads is bound to; `a` otherwise.
+function sbConstLitOf(a: i32): i32 {
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Ident) { return a }
+  const d = identDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return a }
+  const li = parenPeelIx(dn.letInit)
+  const ln = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  return if ln is ArrayLit || ln is ObjLit { li } else { a }
+}
+
+// Records that `x`, when it reads a parameter of `fo`, reaches parameter `j` of `m` at `step`;
+// whether it reads one.
+function sbPathFwdAdd(m: i32, j: i32, step: string, fo: i32, x: i32): boolean {
+  const p = sbParamIndexIn(fo, x)
+  if p < 0 { return false }
+  const k = sbKey(m, j) + "|" + step
+  const was = sbPathFwd[k] ?? []
+  const from = sbKey(fo, p)
+  if !strListHas(was, from) {
+    was.push(from)
+    sbPathFwd[k] = was
+  }
+  return true
+}
+
+// The sets a literal argument's element or field hands to parameter `q` of `d` at the one path
+// step `steps` names; [] for a path of another length.
+function sbPathFwdSets(d: i32, q: i32, steps: string[]): i32[] {
+  const out: i32[] = []
+  if steps.length != 1 { return out }
+  for from in sbPathFwd[sbKey(d, q) + "|" + steps[0]] ?? [] {
+    for st in sbSetsOf[from] ?? [] {
+      if st >= 0 && !i32ListHas(out, st) { out.push(st) }
+    }
+  }
+  return out
+}
+
+// The sets parameter `q` of `d` holds at path `steps` (outermost step last): the arguments' own
+// types read at the path, and the sets literal arguments hand there from caller parameters.
+export function setBindPathSetsOf(d: i32, q: i32, steps: string[]): i32[] {
+  const out = sbPathFwdSets(d, q, steps)
+  for t in sbTysOf[sbKey(d, q)] ?? [] {
+    const s = fnTagSetOfTy(sbTyAtPath(t, steps))
+    if s >= 0 && !i32ListHas(out, s) { out.push(s) }
+  }
+  return out
 }
 
 // A call of a local `const` bound to a lambda or naming a declared function, `t(x)`, hands each
@@ -751,6 +843,8 @@ export function setBindBuild() {
   cbDone = []
   sbTys = []
   sbTysOf = Map()
+  sbPathFwd = Map()
+  sbFwdLit = Map()
   sbFromFn = []
   sbFromParam = []
   sbDecls = []
@@ -817,6 +911,7 @@ export function setBindBuild() {
           const q = if hs[k] < 0 { sbParamIndexIn(fr, a) } else { -1 }
           const c = sbCallOf(a)
           const ty = nodeTyIxOf(a)
+          if hs[k] < 0 && q < 0 { sbPathFwdNote(d, i, a, fr) }
           if hs[k] >= 0 || q >= 0 || ty >= 0 {
             sbRowAdd(c, d, i, hs[k], ty, fr, q)
           }
@@ -865,7 +960,7 @@ export function setBindBuild() {
     ri = ri + 1
     const k = sbKey(sbFn[r], sbParam[r])
     sbBoundDecl[sbFn[r]] = true
-    const direct = sbSets[r].length == 0 && sbFromParam[r] < 0
+    const direct = sbSets[r].length == 0 && sbFromParam[r] < 0 && !sbRowArgFwd(r)
     if direct || sbFromParam[r] >= 0 && sbFromClosure(r) {
       sbLacksSet[k] = true
     }
@@ -1081,20 +1176,21 @@ function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
       const q = sbParamIndexIn(d, v)
       if q >= 0 {
         if steps.length == 0 && depth == 1 { return 0 }
+        const fwd = sbPathFwdSets(d, q, steps)
         const seen: i32[] = []
+        for st in fwd { seen.push(st) }
         let lack = false
         for t in sbTysOf[sbKey(d, q)] ?? [] {
-          const s0 = fnTagSetOfTy(sbTyAtPath(t, steps))
-          if s0 < 0 { lack = true }
-          else if !i32ListHas(seen, s0) { seen.push(s0) }
+          const at = sbTyAtPath(t, steps)
+          const s0 = fnTagSetOfTy(at)
+          // A literal's element that reads a caller parameter is that parameter's sets (`fwd`).
+          if s0 < 0 && !(fwd.length > 0 && tyHasTyVar(at)) { lack = true }
+          else if s0 >= 0 && !i32ListHas(seen, s0) { seen.push(s0) }
         }
         sbPartialNote(seen, lack || sbRowsLackSet(d, q), false)
-        for t in sbTysOf[sbKey(d, q)] ?? [] {
-          const s = fnTagSetOfTy(sbTyAtPath(t, steps))
-          if s >= 0 {
-            out.push("C" + i32ToStr(x) + "|" + i32ToStr(s))
-            sbCalledSets.push(s)
-          }
+        for s in seen {
+          out.push("C" + i32ToStr(x) + "|" + i32ToStr(s))
+          sbCalledSets.push(s)
         }
         return 0
       }
