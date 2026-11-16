@@ -397,7 +397,10 @@ function sbElemSetOf(t: i32): i32 {
 }
 
 // The list literal a `const` binding read at `x` holds, else -1.
-function sbConstListLit(x: i32): i32 {
+function sbConstListLit(x: i32): i32 { return sbConstListLitIn(x, 8) }
+
+// `sbConstListLit` through at most `depth` `const` aliases of the binding.
+function sbConstListLitIn(x: i32, depth: i32): i32 {
   const v = parenPeelIx(x)
   if v >= 0 && v < P.nodes.length && nodeAt(v) is ArrayLit { return v }
   if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
@@ -412,6 +415,9 @@ function sbConstListLit(x: i32): i32 {
     return -1
   }
   const li = parenPeelIx(ln.letInit)
+  if li >= 0 && li < P.nodes.length && nodeAt(li) is Ident && depth > 0 {
+    return sbConstListLitIn(li, depth - 1)
+  }
   return if li >= 0 && nodeAt(li) is ArrayLit { li } else { -1 }
 }
 
@@ -474,6 +480,26 @@ let tcFn: i32[] = []
 let tcParam: i32[] = []
 let tcDone: i32[][] = []
 
+// The sets calls through a `const` bound to a hand-back call go through (`sbThroughNote`).
+let sbHandedCalls: i32[] = []
+
+// The set of the argument call `x` hands back, when `x` calls a declared function handing back
+// that argument (`check_hand_back.vl`); -1 otherwise.
+function sbHandedBackSet(x: i32): i32 {
+  const v = parenPeelIx(x)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const cn = nodeAt(v)
+  if !(cn is Call) { return -1 }
+  const fd = identFnDeclOf(parenPeelIx(cn.callFn))
+  const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { cn }
+  if !(fdn is FuncDecl) || fdn.fnBody < 0 { return -1 }
+  const own = handBackIx(fdn)
+  const i = if own >= 0 { own } else { handBackHoleIx(fdn, 0) }
+  // A parameter annotated by a closed function type holds a closure, whatever is handed to it.
+  if i < 0 || i >= cn.callArgs.length || !sbHandable(fdn, i) { return -1 }
+  return fnTagSetOfTy(nodeTyIxOf(parenPeelIx(cn.callArgs[i])))
+}
+
 // Notes call `n` at `c` when its callee is a parameter of the declaration it is in; a call through
 // a local `const` of a set adds its members' rows at once.
 function sbThroughNote(c: i32, n: Call) {
@@ -488,6 +514,10 @@ function sbThroughNote(c: i32, n: Call) {
     if st >= 0 {
       for m in fnTagMembers(st) { sbArgRows(c, n, m, sbEnclosingFn(c)) }
     }
+    // A `const` bound to the result of a declared function handing back its argument holds that
+    // argument's set, so its call goes through that set.
+    const hs = if st < 0 { sbHandedBackSet(pdn.letInit) } else { -1 }
+    if hs >= 0 && !i32ListHas(sbHandedCalls, hs) { sbHandedCalls.push(hs) }
     return 0
   }
   if !(pdn is Param) { return 0 }
@@ -693,6 +723,7 @@ export function setBindTrySets(end: i32): i32[] {
   sbWithHandBacks = true
   const keys: string[] = []
   for d in sbDecls { setBindCallsIn(d, keys) }
+  for hs in sbHandedCalls { sbCalledSets.push(hs) }
   const out: i32[] = []
   for s in sbCalledSets {
     const sure = !sbSetHasGeneric(s)
@@ -738,6 +769,7 @@ export function setBindBuild() {
   sbLacksSet = Map()
   sbStoredSets = Map()
   sbCalledSets = []
+  sbHandedCalls = []
   sbBoundDecl = Map()
   sbAliasFrom = []
   sbAliasTo = []
