@@ -65,6 +65,7 @@ import {
 import {
   GlobalCtx,
   binNumWidth,
+  boxOwedAt,
   callEndsNever,
   globalReadRecovers,
   idxStorePlainWhy,
@@ -78,12 +79,14 @@ import {
 import {
   RAtom,
   RList,
+  RNullable,
   repNodeAt,
   repNodeGen,
   repNodeOfTy,
   repTyOf,
 } from "./emit_rep"
 import { ctxTyAt, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
+import { fnUnionRetSinkOk } from "./emit_fn_scans"
 import {
   declaredIndexAt,
   envSlotShift,
@@ -245,7 +248,16 @@ let ibNoValue = -1
 // Whether a value of rep `r` and type `ty` can be a variable, a parameter, a result or an
 // expression here: a scalar, or a reference rep the list builder admits.
 function valueRep(r: i32, ty: i32): boolean {
-  return repIsScalar(r) || repNodeAt(r) is RAtom || irVarRepOkHook(r, ty)
+  return repIsScalar(r)
+    || repNodeAt(r) is RAtom
+    || boxedNullable(r)
+    || irVarRepOkHook(r, ty)
+}
+
+// Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
+function boxedNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 4
 }
 
 function refRepNone(_r: i32, _ty: i32): boolean { return false }
@@ -619,6 +631,19 @@ function operandWhy(ix: i32): string {
 
 const STR_OPERAND = "operand at string"
 
+// A returned value delivered at the result's rep. A function whose union result legacy builds in
+// one shared return sink (`fnUnionRetSinkOk`) boxes there, not at the return, and is a miss.
+function deliverReturn(b: i32[], ix: i32): Opnd {
+  if (
+    boxedNullable(ib.irRetRep)
+    && boxOwedAt(ix, ibFnIx)
+    && fnUnionRetSinkOk(ibFnIx)
+  ) {
+    return irBMiss("union return sink")
+  }
+  return deliver(b, ix, ib.irRetRep)
+}
+
 // The rep of binary `n`'s operator width (`binNumWidth`) where an operand has it and the two
 // differ, else -1.
 function binWidthRep(n: BinExpr): i32 {
@@ -652,6 +677,14 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
 function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   if ibMiss != "" || dst < 0 || irBOpRep(v) == dst { return v }
+  if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
+    // The checker records the box at the node; legacy's box writer builds it around the value.
+    const bty = repTyOf(dst)
+    const bt = irVarNew(ib, dst, bty, "temp", -1)
+    irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
+    const bo: Opnd = { ov: bt }
+    return bo
+  }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
   if sk < 0 || dk < 3 { return v }
@@ -996,7 +1029,7 @@ function stmtIn(b: i32[], ix: i32) {
       return 0
     }
     if none { return skip("void return value") }
-    const v = deliver(b, n.retArg, ib.irRetRep)
+    const v = deliverReturn(b, n.retArg)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
     }
@@ -1052,7 +1085,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return 0
   }
   const n0 = b.length
-  const v = deliver(b, last, ib.irRetRep)
+  const v = deliverReturn(b, last)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
