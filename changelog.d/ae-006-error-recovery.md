@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **D16680 closed (Aeomach AE-006):** one mistake reports one error. A refused bare `as` (its propagated miss does not fit the return) keeps the type it names, so `min((u * n) as i32, n - 1)` no longer falls to the f64 overload and adds `return type mismatch: expected i32, got f64`; an operand an earlier error refused, or a non-numeric one, takes no part in a `min`/`max`/`abs`/`sqrt` width; a wrong-arity numeric intrinsic answers the error type rather than a guessed width; and an un-annotated function returning an earlier error's value no longer adds "cannot infer a return type" (a base-case-less recursion beside it still does). Audit rows D16681-D16685 file five numeric-conversion first errors that mislead.

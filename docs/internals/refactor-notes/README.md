@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-type-hashcons-s4h-same-shadow](2026-11-16-type-hashcons-s4h-same-shadow.md): Type hash-cons stage 4h: the emitter's `tySame` and `tyEq` graded against ids (lane H), 2026-11-16
+- [2026-11-16-store-fntag-redecide-step1](2026-11-16-store-fntag-redecide-step1.md): One storage decider, step 1: the check-readable late branches, 2026-11-16
+- [2026-11-16-l2-s2-g5-close](2026-11-16-l2-s2-g5-close.md): L2 S2 group 5 closed: hole links and the remainder judge need no stored row, 2026-11-16
+- [2026-11-16-l2-s2-g4-close](2026-11-16-l2-s2-g4-close.md): L2 S2 group 4 closed: no literal judge needs a stored row, 2026-11-16
+- [2026-11-16-l2-s2-g3-close](2026-11-16-l2-s2-g3-close.md): L2 S2 group 3 closed: no container judge needs a stored row, 2026-11-16
+- [2026-11-16-ir-c1-scalar-opcode-table](2026-11-16-ir-c1-scalar-opcode-table.md): IR cutover C1: the shared scalar opcode table, 2026-11-16
+- [2026-11-16-ae4-record-field-inplace](2026-11-16-ae4-record-field-inplace.md): 2026-11-16 — lane AE4: a record field replaced in place (AE-004, the record face)
+- [2026-11-15-fold-classification](2026-11-15-fold-classification.md): Constant-fold classification: D16670 and D16673 (2026-11-15, lane O)
 - [2026-11-15-type-hashcons-s4g-emit-guard](2026-11-15-type-hashcons-s4g-emit-guard.md): Type hash-cons stage 4f, step 3a: the emit epoch's invariant is enforced (lane H), 2026-11-15
 - [2026-11-15-type-hashcons-s4f-emit-epoch](2026-11-15-type-hashcons-s4f-emit-epoch.md): Type hash-cons stage 4f: the emitter's memos stamp with an emit epoch (lane H), 2026-11-15
 - [2026-11-15-type-hashcons-s4e-emit-bump-census](2026-11-15-type-hashcons-s4e-emit-bump-census.md): Type hash-cons stage 4e: which writers still move `tyMutEpoch` during emit (lane H), 2026-11-15
