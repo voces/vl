@@ -94,5 +94,16 @@ type-parameter binding at the call (`callBind` rows).
 
 ## Gates
 
-- wasm and output byte-identical on all 6,477 programs against the shadow's seed.
+- **Phase-state surface:** `emit_elab.vl` goes from 334 to 339; the baseline is written in this PR.
+  - The elaboration now imports the check's hand-back test (`handBackIx`, `handBackHoleIx`,
+    `handBackShared`, `handBackCopySeedsNote`, `calleeNamesDecl`) instead of keeping its own copy.
+    That is the one-decider direction. Under L2 S2 the test becomes a `BND_HANDBACK` bound, read
+    through the `Iface` API.
+  - The memo stays on the elaboration's side (`elabHandBackIx`), so `check_hand_back.vl` holds no
+    cross-phase state (`cross` 0).
+- **Self-compile fuel:** this branch is 92,226,038,178, against 92,196,694,251 for master
+  `078e4116`'s own fixpoint seed (+0.03%).
+  - Both are +1.1% on the committed baseline, so the rise is master's. No baseline is written here.
+
+- wasm and output byte-identical on all 6,498 `@run` programs, against a same-commit fixpoint seed of master `078e4116`.
 - The refreshed seed is a fixpoint.
