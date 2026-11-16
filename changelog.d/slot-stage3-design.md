@@ -1,3 +1,3 @@
 ## Codegen, memory & runtime (Track B)
 
-- **Slot store stage 3 design:** mono's pins are decided before mono, kept in a side table keyed by the solved instantiation, and applied by mono where it writes them today; a closed slot fact bounds its class first (S3a). Closes D16768 when built.
+- **Slot store stage 3 design:** mono's pins move into the elaboration one writer at a time, each under its own gate, into a side table that bounds the place classes; mono applies them where it writes them today. Closes D16768 when built.
