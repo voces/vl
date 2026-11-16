@@ -1902,6 +1902,18 @@ export class Interp {
       try { r = this.eval(tk.e, env, null); } finally { f32Fold = false; }
       return r instanceof Lit ? litTo(r, "f32") : r;
     }
+    // 4.3: the join decides a radix tree's context before its destination does, so beside a typed
+    // integer arm the tree runs at that arm's width (`0xFFFFFFFF << 26` beside an i32 is the i32
+    // pattern), and only then is the join widened. A constant tree is pure, so it runs again.
+    if (
+      exp && (kOther === "i32" || kOther === "i64") && tk && tk.k === "expr" && isConstTree(tk.e) &&
+      treeHas(tk.e, "radix")
+    ) {
+      let r: Val;
+      try { r = this.eval(tk.e, env, { k: "name", name: kOther, args: [] }); } catch (x) { if (x instanceof Trap) throw x; r = v; }
+      if (r instanceof Lit) { try { return litTo(r, kOther); } catch { return asJoin(r); } }
+      return r;
+    }
     // A generic's erased parameter (`any`) is no context: the join settles here. With a
     // context, a constant arm beside a typed one still takes that type when it fits.
     // An integer arm beside a decimal arm outside i32 is the pair's i64, under a destination too

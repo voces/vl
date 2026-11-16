@@ -47,21 +47,15 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 2. **Clause-1 defects:** run `ls.vl -- --status open` and grep for `clause 1`.
 3. **Initialization order** (DECISIONS.md, "Initialization order"). Make init-before-read a compile
    error and reorder initializers.
-4. **Generated-code performance:**
-   - print imports only when reachable;
-   - B-range (D4000);
-   - L10;
-   - B-hint.
-
-   All four are in [Track B](docs/roadmap/track-b-codegen.md).
+4. **Generated-code performance:** B-range (D4000) waits for the IR's bounds-check pass, and
+   B-hint is parked on its measurement. Both are in [Track B](docs/roadmap/track-b-codegen.md).
 5. **Reference identity and equality (A15)**, after the owner reconfirms the ruling. See
    [Track A](docs/roadmap/track-a-types.md).
 6. **Width subtyping, the container half**, in [Track A](docs/roadmap/track-a-types.md).
 7. **Struct keys for `Map`/`Set` (A15.2)**, in [Track A](docs/roadmap/track-a-types.md).
 8. **`Buf` memory safety:** fix or accept (open-rulings §E,
    [Track B](docs/roadmap/track-b-codegen.md)).
-9. **Undeclared-identifier "did you mean"**, in [Track A](docs/roadmap/track-a-types.md).
-10. **`docs/guide/soundness.md` fixes**, in [Track A](docs/roadmap/track-a-types.md).
+9. **`docs/guide/soundness.md` fixes**, in [Track A](docs/roadmap/track-a-types.md).
 
 ## Parked: ruled low priority, or built on ask
 
@@ -109,6 +103,12 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   signature; `vl` may print it, and no annotation is required. This is built with L2's inferred
   interfaces (engineering-review-2026-11.md §6). DECISIONS.md §"Exports are frozen at the module
   boundary".
+
+- **Dead-code elimination in a plain build** (2026-11-16, not active work). A plain `vl build`
+  links every function of an imported module, so unused std functions cost bytes and pull in host
+  imports. A `Buf` import alone declares the four print imports, and the seed is a plain build. A
+  missed call edge would be a trap, so it needs an audit of every call the emitter synthesises.
+  [Track B](docs/roadmap/track-b-codegen.md), emoji-sheep-tag.
 
 ## Consumers
 

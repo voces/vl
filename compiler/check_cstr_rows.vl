@@ -35,6 +35,15 @@ import { FuncDecl, Ident, P, i32ToStr, nodeAt } from "./ast"
 import { i32ListHas } from "./listutil"
 import { identFnDeclOf } from "./check_scopes"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
+import {
+  BND_ARRDEF,
+  BND_NEST,
+  BND_PRINT,
+  bndAt,
+  bndCount,
+  bndOwnRows,
+  bndPush,
+} from "./check_iface"
 
 // Deferred binary-op constraints over un-annotated-param holes: with a hole operand, `a + b` /
 // `s + "!"` / `n < 2` cannot be decided in the body, a hole being permissively assignable to
@@ -125,47 +134,17 @@ export function argCstrTruncate(n: i32) {
   return 0
 }
 
-// D401 — deferred `print` constraints over un-annotated-param and type-parameter holes.
-// `print` takes one value of `printDomainStr()`, and the two floors that say so
-// (`tyPrintsAsRef`, `tyPrintsAsUnionBox`) both answer false at a hole, so the body admits the
-// call. Record the printed type and the argument node; the pin re-asks both floors substituted.
-export type TyIxCstrCols = {
-  ty: i32[],
-  ix: i32[],
-  fn: i32[],
-}
-
-export const printCstr: TyIxCstrCols = { ty: [], ix: [], fn: [] }
-
 // Each `__array_new_default__` list type whose element is a hole, with the call and its owner:
 // the pin asks the substituted element for a default, as the direct spelling does (D2578).
-export const arrDefCstr: TyIxCstrCols = { ty: [], ix: [], fn: [] }
-
-// Records the list `listTy` built by `__array_new_default__` call `ix` in the current body.
 export function noteArrDefCstr(listTy: i32, ix: i32) {
   if listTy < 0 { return 0 }
-  arrDefCstr.ty.push(listTy)
-  arrDefCstr.ix.push(ix)
-  arrDefCstr.fn.push(cstrOwnerTop())
+  bndPush(BND_ARRDEF, listTy, ix, cstrOwnerTop())
   return 0
 }
 
-// The vector-container twin of the `print` rows (`noteNestCstr`), deduped by type and owner.
-export const nestCstr: TyIxCstrCols = { ty: [], ix: [], fn: [] }
-
-// The row each type-and-owner key last matched. A probe's rollback can pop that row, so a hit
-// counts only when the row is still there and still matches.
+// The row each type-and-owner key last matched among the `BND_NEST` bounds. A probe's rollback
+// can pop that row, so a hit counts only when the row is still there and still matches.
 export let nestCstrSeen: {[string]: i32} = Map()
-
-// Drops every row of `c` (`printCstr` or `nestCstr`) from `n` on, all columns together.
-export function tyIxCstrTruncate(c: TyIxCstrCols, n: i32) {
-  while c.ty.length > n {
-    c.ty.pop()
-    c.ix.pop()
-    c.fn.pop()
-  }
-  return 0
-}
 
 // An `is` test over a hole parameter, re-asked at the pin as the annotated spelling asks it:
 // the tested operand's type, the checked type, the test's spelling, the node, and the owner.
@@ -544,17 +523,11 @@ export function notePrintCstr(pt: i32, argIx: i32) {
   if pt < 0 { return 0 }
   if tyHasHole(pt) {
     const owner = cstrOwnerTop()
-    let k = 0
-    while k < printCstr.ty.length {
-      if printCstr.fn[k] == owner && printCstr.ix[k] == argIx {
-        if tyEqSameHoles(printCstr.ty[k], pt) { return 0 }
-      }
-      k = k + 1
+    for k in bndOwnRows(BND_PRINT, owner) {
+      const b = bndAt(BND_PRINT, k)
+      if b.site == argIx && tyEqSameHoles(b.on, pt) { return 0 }
     }
-    printCstr.ty.push(pt)
-    printCstr.ix.push(argIx)
-    printCstr.fn.push(owner)
-    cvMark(CV_PRINT, printCstr.fn.length - 1)
+    cvMark(CV_PRINT, bndPush(BND_PRINT, pt, argIx, owner))
   }
   return 0
 }
@@ -728,26 +701,17 @@ export function noteNestCstr(t: i32, ix: i32) {
   const owner = cstrOwnerTop()
   const key = i32ToStr(t) + ":" + i32ToStr(owner)
   const seen = nestCstrSeen.get(key) ?? -1
-  if (
-    seen >= 0
-    && seen < nestCstr.ty.length
-    && nestCstr.fn[seen] == owner
-    && tyEqSameHoles(nestCstr.ty[seen], t)
-  ) {
-    return 0
+  if seen >= 0 && seen < bndCount(BND_NEST) {
+    const b = bndAt(BND_NEST, seen)
+    if b.fn == owner && tyEqSameHoles(b.on, t) { return 0 }
   }
-  let k = 0
-  while k < nestCstr.ty.length {
-    if nestCstr.fn[k] == owner && tyEqSameHoles(nestCstr.ty[k], t) {
+  for k in bndOwnRows(BND_NEST, owner) {
+    if tyEqSameHoles(bndAt(BND_NEST, k).on, t) {
       nestCstrSeen.set(key, k)
       return 0
     }
-    k = k + 1
   }
-  nestCstrSeen.set(key, nestCstr.ty.length)
-  nestCstr.ty.push(t)
-  nestCstr.ix.push(ix)
-  nestCstr.fn.push(owner)
+  nestCstrSeen.set(key, bndPush(BND_NEST, t, ix, owner))
   return 0
 }
 

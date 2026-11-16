@@ -514,8 +514,8 @@ The boundaries, and why each is where it is:
 - **Errors are always shown**, from any module, under either flag. A type error
   in an import fails the build of the named file; hiding it would leave a failing
   check with no diagnostic. The checker's errors do not come from the lint, so
-  skipping a module's lint drops none of them; the one error-tier lint rule,
-  `for-step-zero`, has a checker twin (`checkRangeNeverRuns`).
+  skipping a module's lint drops none of them; no lint rule is error-tier (a `step 0`
+  range, once the one that was, is the checker's `checkRangeNeverRuns` alone).
 - **Skipping a module's lint loses nothing in the modules still linted.** The
   graph facts a rule reads across modules (map and function globals, hole
   fields, readers) are built from every module's SOURCE before any module is
