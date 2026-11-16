@@ -29,10 +29,10 @@ const compiled = ignore
   : new WebAssembly.Module(Deno.readFileSync(COMPILER));
 
 /** Compiles `src` on a fresh instance; the shadow's rows when `arm` is set, and the output. */
-const run = (src: string, arm: boolean, corrupt = 0) => {
+const run = (src: string, arm: boolean | number, corrupt = 0) => {
   const exp = new WebAssembly.Instance(compiled!, {})
     .exports as unknown as Exports;
-  exp.irShadowArm(arm ? 1 : 0);
+  exp.irShadowArm(typeof arm === "number" ? arm : arm ? 1 : 0);
   exp.irShadowCorrupt(corrupt);
   exp.modReset();
   exp.srcReset();
@@ -241,6 +241,26 @@ main()
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
     if (!rows.has("uncovered open parameter type")) {
       throw new Error(`want an "uncovered open parameter type" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// The claim path (`irClaimFn`): mode 3 claims every I1 family, so legacy does not run for a
+// covered function and the lowering's code entry ships. The output must be byte-identical.
+Deno.test({
+  name: "ir claim: claiming every I1 family ships the same bytes legacy does",
+  ignore,
+  fn: () => {
+    const claimed = run(COVERED, 3);
+    if (claimed.rc !== 0) throw new Error(`want compileSrc rc 0, got ${claimed.rc}`);
+    const n = claimed.rows.get("claimed") ?? 0;
+    // sq, wide, pos, sum, pick and bump are each claimable.
+    if (n < 6) throw new Error(`want at least 6 claimed, got ${JSON.stringify([...claimed.rows])}`);
+    const fell = [...claimed.rows.keys()].filter((k) => k.startsWith("claim fell back"));
+    if (fell.length > 0) throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
+    const plain = run(COVERED, false);
+    if (plain.out.length !== claimed.out.length || plain.out.some((b, i) => b !== claimed.out[i])) {
+      throw new Error(`want byte-identical output claimed and not (${plain.out.length} vs ${claimed.out.length} bytes)`);
     }
   },
 });

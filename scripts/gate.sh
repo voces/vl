@@ -141,6 +141,7 @@ row_mem() {
     "distilled corpus") echo 1700 ;;
     "rep-fuzz") echo 1600 ;;
     "deno task test"|"plumb-shape cost") echo 1400 ;;
+    "ir shadow") echo 1300 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 900 ;;
     "capability probes"|"kind-ladder sets") echo 800 ;;
@@ -395,6 +396,10 @@ if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
 else
   run "distilled corpus"       "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 fi
+# The IR shadow over the same corpus: every covered function's lowering must match legacy's
+# bytes and spans, and any verifier failure or mismatch class above
+# `ir-shadow-baseline.txt` reds. The shadow is the check behind every IR claim.
+run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED"
 
 echo "== $((${#CMDS[@]})) rows, at most $([ "$GATE_MAX_PAR" = 0 ] && echo all || echo "$GATE_MAX_PAR") at once, memory budget $([ "$GATE_MEM_BUDGET_MB" = 0 ] && echo none || echo "${GATE_MEM_BUDGET_MB} MiB") =="
 dispatch

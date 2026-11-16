@@ -4621,11 +4621,12 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
 }
 
 /// The mode `$VL_IR_SHADOW` asks the guest's IR shadow for: 0 off, 1 count, 2 also detail each
-/// dual-emit mismatch class's first examples.
+/// dual-emit mismatch class's first examples, 3 disarmed but claiming every I1 family (the claim path's test).
 fn ir_shadow_mode() -> i32 {
     match std::env::var("VL_IR_SHADOW").ok().as_deref() {
         Some("1") => 1,
         Some("2") => 2,
+        Some("3") => 3,
         _ => 0,
     }
 }
