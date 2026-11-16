@@ -51,4 +51,4 @@ too, so this change does not cause it.
 |---|---|
 | seed | fixpoint, branch and base |
 | identity | IDENT |
-| net compiler lines | NETLINES |
+| net compiler lines | +20 over 24 files: the three walks gain a wrapper each, the shared stack and `tyWalkEnter`; every caller loses its depth argument |
