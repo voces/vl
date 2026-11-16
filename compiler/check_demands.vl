@@ -517,6 +517,7 @@ import {
   tyValOf,
   tyValOpen,
 } from "./check_types"
+import { recNestedWidthPair } from "./check_obj_shape"
 import { unionFieldGapNote } from "./check_union_arm_msgs"
 import { mkUnionTy } from "./check_union_mint"
 import {
@@ -787,8 +788,12 @@ export function wsCandidateAt(
   const pre = tyAt(ax)
   const ew = tyAt(ex)
   if !(ew is TyObj) { return "" }
+  // A record wider only inside a nested record goes on too (D3431).
+  const nested = pre is TyObj && recNestedWidthPair(ax, ex)
   if pre is TyObj {
-    if pre.objFieldNames.length <= ew.objFieldNames.length { return "" }
+    if pre.objFieldNames.length <= ew.objFieldNames.length && !nested {
+      return ""
+    }
   } else if !(pre is TyVar) {
     return ""
   }
@@ -811,7 +816,7 @@ export function wsCandidateAt(
     let f = 0
     while f < ew.objFieldNames.length {
       const sf = objFieldType(pre, ew.objFieldNames[f])
-      if sf < 0 || !tySame(sf, ew.objFieldTypes[f]) { return "" }
+      if sf < 0 || (!tySame(sf, ew.objFieldTypes[f]) && !nested) { return "" }
       f = f + 1
     }
     if !objShapeAdapterlessAt(arg, at, expected) { return "" }
@@ -4071,6 +4076,19 @@ export function monoRecheckEnd(sv: QuietRun) {
 // `(string | null)[]` the string-list backing (kind 9); -1 otherwise. Decided over `elem`'s member spans with no
 // split and no per-member slice, mirroring the three arms of the splitting form it replaces.
 
+// The `as` cast checked as the left operand of a `??`, or -1: set only around that operand's
+// check, so a refusal there names the spelling whose null the `??` does see.
+export let castCoalLeft = -1
+export function castCoalLeftSet(v: i32) { return castCoalLeft = v }
+
+// The refusal's note for a cast at `ix` that feeds a `??`, else "".
+function castCoalNote(asTy: string, ix: i32): string {
+  if ix < 0 || ix != castCoalLeft { return "" }
+  return "; the `??` after it never sees that null — write `(x as? "
+    + asTy
+    + ") ?? …` to default it there"
+}
+
 // `x as T` (B2) is an explicit, checked numeric conversion — unlike the implicit
 // lossless-widening rule, it permits every numeric-scalar direction (plus narrowings and
 // int/float conversions). The propagation obligation a bare `as` takes on, shared by the union
@@ -4092,7 +4110,8 @@ export function castPropagationFits(
         + tyToStr(rest)
         + " — use `as!` to trap instead, or `as?` to take the null here"
         + castWrapNote(asTy, src)
-        + "; to propagate it, annotate the enclosing function's return type",
+        + "; to propagate it, annotate the enclosing function's return type"
+        + castCoalNote(asTy, ix),
       ix,
     )
     return false
@@ -4106,7 +4125,8 @@ export function castPropagationFits(
         + "` propagates "
         + tyToStr(rest)
         + " out of the enclosing function, and there is none here — at module scope, use `as!` to trap or `as?` to take a nullable"
-        + castWrapNote(asTy, src),
+        + castWrapNote(asTy, src)
+        + castCoalNote(asTy, ix),
       ix,
     )
     return false
@@ -4120,7 +4140,8 @@ export function castPropagationFits(
         + ", which the enclosing function cannot return (it returns "
         + tyToStr(curRet)
         + ") — use `as!` to trap instead, or `as?` to take the null here"
-        + castWrapNote(asTy, src),
+        + castWrapNote(asTy, src)
+        + castCoalNote(asTy, ix),
       ix,
     )
     return false
