@@ -451,9 +451,11 @@ import {
   rcwWhySet,
   rcwWrote,
 } from "./check_rcw"
-import { recAdRaising } from "./check_rec_adopt_rows"
+import { recAdProg, recAdRaising } from "./check_rec_adopt_rows"
 import {
+  recFreshMapDeclOf,
   recFreshOriginDecl,
+  recHeldLit,
   recInferredFnOf,
   recOriginExpr,
 } from "./check_rec_fresh"
@@ -4383,6 +4385,26 @@ function recWidenLitElems(lit: ArrayLit, de: i32, depth: i32): boolean {
   return false
 }
 
+// Whether `box` may read a `Map()` binding that never adopts, through un-annotated aliases and
+// calls of functions with no declared result. `seen` holds the reads already followed.
+function recMapUndone(box: i32, seen: i32[]): boolean {
+  const x = cwPeelValue(box)
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return false }
+  seen.push(x)
+  if nodeAt(x) is Ident {
+    const d = recFreshMapDeclOf(x)
+    if d >= 0 { return recAdProg.noAdopt.has(d) }
+    const init = recHeldLit(x)
+    return init >= 0 && recMapUndone(init, seen)
+  }
+  const fd = recInferredFnOf(x)
+  if fd < 0 { return false }
+  for lf in recFnValueLeaves(fd) {
+    if recMapUndone(lf, seen) { return true }
+  }
+  return false
+}
+
 // An element `el` (a `src`) read out of the container `box`, delivered as a `dst`. A list
 // literal's elements are judged by their own expressions; a container built by inference (a
 // `Map()`, `Set()` or a call whose result is inferred) holds values built where they are
@@ -4393,7 +4415,13 @@ function recElemWalk(box: i32, src: i32, dst: i32, depth: i32): boolean {
   if bx >= 0 {
     const b = nodeAt(bx)
     if b is ArrayLit { return recWidenLitElems(b, dst, depth) }
-    if exprIsCollCtorCall(bx) || recCallResultInferred(bx) { return false }
+    // A `Map()` that never adopts keeps its own type, so its reads are judged by it (D16869).
+    if (
+      (exprIsCollCtorCall(bx) || recCallResultInferred(bx))
+      && !recMapUndone(box, [])
+    ) {
+      return false
+    }
     if recIsJoin(bx) {
       const leaves: i32[] = []
       tailValueLeaves(bx, leaves)
