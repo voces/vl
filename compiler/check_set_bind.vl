@@ -120,6 +120,23 @@ function sbCallOf(a: i32): i32 {
   return p
 }
 
+// The declaration whose parameter argument `a` reads: `fr`, the declaration the call is in, or
+// the enclosing declaration a nested function captures the parameter from.
+function sbArgOwner(fr: i32, a: i32): i32 {
+  if (
+    sbParamIndexIn(fr, a) >= 0
+    || a < 0
+    || a >= P.nodes.length
+    || !(nodeAt(a) is Ident)
+  ) {
+    return fr
+  }
+  const pd = identDeclOf(a)
+  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return fr }
+  const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
+  return if sbParamIndexIn(owner, a) >= 0 { owner } else { fr }
+}
+
 // The position of the parameter of `d` that argument `a` reads, -1 when it reads none. A `$`
 // parameter is none: the check minted it for an adapter it built (`fvaAdapt`, a list copy's
 // element map), which holds the source's closure, not a set.
@@ -436,10 +453,11 @@ function sbElemCallRows(c: i32, n: Call) {
         if pn is Param && pn.parType < 0 {
           const a = parenPeelIx(n.callArgs[j])
           const set = fnTagSetOfTy(nodeTyIxOf(a))
-          const q = if set < 0 { sbParamIndexIn(fr, a) } else { -1 }
+          const fo = sbArgOwner(fr, a)
+          const q = if set < 0 { sbParamIndexIn(fo, a) } else { -1 }
           const ty = nodeTyIxOf(a)
           if set >= 0 || q >= 0 || ty >= 0 {
-            sbRowAdd(c, ed, j, set, ty, fr, q)
+            sbRowAdd(c, ed, j, set, ty, fo, q)
           }
         }
         j = j + 1
@@ -456,11 +474,23 @@ let tcFn: i32[] = []
 let tcParam: i32[] = []
 let tcDone: i32[][] = []
 
-// Notes call `n` at `c` when its callee is a parameter of the declaration it is in.
+// Notes call `n` at `c` when its callee is a parameter of the declaration it is in; a call through
+// a local `const` of a set adds its members' rows at once.
 function sbThroughNote(c: i32, n: Call) {
   const f = parenPeelIx(n.callFn)
   const pd = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
-  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return 0 }
+  if pd < 0 || pd >= P.nodes.length { return 0 }
+  // A local `const` the check types at a set, such as a choice of declared functions, calls
+  // each member with the call's arguments.
+  const pdn = nodeAt(pd)
+  if pdn is LetDecl && pdn.letKw == "const" {
+    const st = fnTagSetOfTy(nodeTyIxOf(f))
+    if st >= 0 {
+      for m in fnTagMembers(st) { sbArgRows(c, n, m, sbEnclosingFn(c)) }
+    }
+    return 0
+  }
+  if !(pdn is Param) { return 0 }
   const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
   const q = sbParamIndexIn(owner, f)
   if q < 0 { return 0 }
@@ -514,9 +544,10 @@ function sbArgRows(c: i32, n: Call, m: i32, fr: i32): boolean {
       const a = parenPeelIx(n.callArgs[j])
       const ty = nodeTyIxOf(a)
       const set = fnTagSetOfTy(ty)
-      const q = if set < 0 { sbParamIndexIn(fr, a) } else { -1 }
+      const fo = sbArgOwner(fr, a)
+      const q = if set < 0 { sbParamIndexIn(fo, a) } else { -1 }
       if set >= 0 || q >= 0 || ty >= 0 {
-        sbRowAdd(c, m, j, set, ty, fr, q)
+        sbRowAdd(c, m, j, set, ty, fo, q)
         added = true
       }
     }
@@ -748,7 +779,7 @@ export function setBindBuild() {
         let k = 0
         while k < hs.length {
           const a = if k < args.length { args[k] } else { -1 }
-          const fr = if k < froms.length { froms[k] } else { -1 }
+          const fr = sbArgOwner(if k < froms.length { froms[k] } else { -1 }, a)
           const q = if hs[k] < 0 { sbParamIndexIn(fr, a) } else { -1 }
           const c = sbCallOf(a)
           const ty = nodeTyIxOf(a)
