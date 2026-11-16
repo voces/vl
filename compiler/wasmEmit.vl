@@ -1167,6 +1167,7 @@ import {
   recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
+  rlUnionRowCovers,
   sFieldIsPlainI32,
   sFieldIsRecordRef,
   sFieldIsUnionBox,
@@ -13895,19 +13896,26 @@ function emitArrSpreadBoxed(arrIx: i32, row: i32, fnIx: i32) {
   return spreadJoinGroups(slots, groupRows, wrap, back, kk, row, seq)
 }
 
-// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`.
+// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`. A list
+// literal source linked to the literal it is spread into is built there, as a run is (D16701).
 function emitSpreadGroupBoxed(
   grp: i32,
   isSrc: boolean,
   row: i32,
   fnIx: i32,
 ): i32 {
-  if !isSrc { return emitSpreadGroup(grp, fnIx, LBK_UNION, row) }
+  const lit = unwrapParen(grp)
+  if (
+    !isSrc
+    || lit >= 0 && nodeAt(lit) is ArrayLit && elabSpreadRunHolderOf(lit) >= 0
+  ) {
+    return emitSpreadGroup(grp, fnIx, LBK_UNION, row)
+  }
   const k = mfRecvKindOf(grp, fnIx)
   if k == "reflist" {
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(grp, fnIx, LBK_REF, s) < 0 { return -1 }
-    if s == row { return 0 }
+    if s == row || rlUnionRowCovers(s, row) { return 0 }
     if rlWidenTagOf(s, row) < 0 {
       return emitFailAt(
         "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
@@ -14010,14 +14018,14 @@ function listKindElemKind(k: ListKind): VKind {
   }
 }
 
-// A run of plain elements as its own `ArrayLit`, built at holder `h`'s type and reporting at
-// the spread literal's position.
-// A synthesized node takes the parser's last cursor otherwise, which would put a diagnostic
-// over it at the end of the file.
+// A run of plain elements as its own `ArrayLit`, built at holder `h`'s type, or at its holder's
+// when `h` is an untyped minted run (D16696). It reports at the spread literal's position: a
+// synthesized node otherwise takes the parser's last cursor, at the end of the file.
 function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
-  elabSpreadRunNote(ix, h)
+  const up = elabSpreadRunHolderOf(h)
+  elabSpreadRunNote(ix, if up >= 0 && nodeTyIxOf(h) < 0 { up } else { h })
   return ix
 }
 
@@ -25048,6 +25056,22 @@ function emitAsCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
       if amRef is Index { return emitAsMapProbeTrap(amRef, fnIx) }
     }
   }
+  // `m[k] as? V` over a scalar map's `V | null` read is the read itself, boxed as a consumed
+  // read is (D2467).
+  const aok = if e.asMode == "null" { mapReadScalarBoxKindIn(obj, fnIx) } else { -1 }
+  const aoRef = nodeAt(unwrapParen(obj))
+  if (
+    e.asMode == "null"
+    && aoRef is Index
+    && exprMap(aoRef.idxArr, fnIx)
+    && tySame(nodeTyAt(_exprIx, fnIx), nodeTyAt(obj, fnIx))
+  ) {
+    if aok >= 0 {
+      return emitMapGetScalarBox(aoRef.idxArr, aoRef.idxIndex, aok, fnIx)
+    }
+    // A niche-bearing value's read already carries its `null`.
+    return emitExpr(obj, fnIx)
+  }
   // A type-parameter operand fails as the direct spelling does at this instance's pin (D2791).
   if asExprHoleNumSad(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
     const hps = asExprHolePinSrc(_exprIx, fnIx)
@@ -32862,7 +32886,7 @@ export function emitUnionRetSink(fnIx: i32) {
 // written the box's own `struct.new $uBox`, with its two operands still on the wasm stack
 // in field order? Both conditions are load-bearing: the cursor alone admits nothing-written-
 // since, the byte pattern alone admits a false match (an operand can spell any opcode).
-function uBoxNewIsLast() {
+export function uBoxNewIsLast() {
   if uBoxNewEnd != wLen() { return false }
   const pat = unionBoxNewBytes()
   const np = pat.length
@@ -32878,7 +32902,7 @@ function uBoxNewIsLast() {
 // Unwrite the matched `struct.new $uBox` and pop its two operands into the sink pair,
 // restoring the wasm stack to before the box's operands pushed. Valid only immediately
 // after `uBoxNewIsLast()` answers true.
-function uBoxSinkToPair() {
+export function uBoxSinkToPair() {
   wDropBack(unionBoxNewBytes().length)
   fbLocalSet(unionSinkBase + 1) // the anyref payload — top of stack
   fbLocalSet(unionSinkBase) // the i32 tag — beneath it
