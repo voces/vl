@@ -1,0 +1,598 @@
+// `pin_gates.vl` — the gates mono's slot pins apply before writing an annotation: which bindings a
+// write index says are written, at what types, and in which frame a read resolves. Shared by mono and
+// the elaboration so that both decide from one implementation (slot store stage 3).
+
+import {
+  ArrayLit,
+  BinExpr,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  NumLit,
+  ObjLit,
+  P,
+  nodeAt,
+  nodeChildren,
+  nodeChildrenPush,
+} from "./ast"
+import { fnTagHoldsTy, fnTagTyIsTagged } from "./check_elab_cap"
+import { nodeTyFrozenOf, nodeTyIxOf, nodeTyRecord } from "./check_node_tys"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyAt,
+  tyElemOf,
+  tyValOf,
+} from "./check_types"
+import { unwrapParen } from "./emit_base"
+import { fnStmtsPosOf } from "./emit_capture_frames"
+import { elabDeclFnOf, elabIdentityTy, elabSlotTyAt } from "./emit_elab"
+import {
+  buildFnChildIndex,
+  fnChildHead,
+  fnChildNext,
+  fnParent,
+  fnStmts,
+  monoProgStmts,
+} from "./emit_state"
+import { tySameSealed } from "./emit_ty_seal"
+import { declOrigOf, identDeclOf } from "./symbols"
+import { tyHasTyVar, tyHoldsHole } from "./tyquery"
+
+// Per body `monoBodyDeclCopy` has indexed at arena stamp `monoBodyDeclStamp`: its row, and per
+// row each `let`'s visit order, and the first `let` copying each original declaration.
+let monoBodyDeclStamp = 0 - 1
+
+let monoBodyDeclRow: {[i32]: i32} = Map()
+
+let monoBodyDeclPos: {[i32]: i32}[] = []
+
+let monoBodyDeclByOrig: {[i32]: i32}[] = []
+
+// The module-scope function statement holding each node (`monoProgTopOf`), banked on the arena
+// stamp and the statement count: one walk answers every query between two edits (D4942).
+export let monoProgTop: i32[] = []
+
+let monoProgHeldStamp = 0 - 1
+
+// Whether that walk marked a node more than `MONO_PROG_DEPTH` below its statement.
+export let monoProgTopDeep = false
+
+// The program's assignments, as node indices, by the declaration (`monoDeclCanon`) they write:
+// `x = v`, a cell's `d[0] = v`, a field's `d.f = v`, an element's `d[k] = v`. Banked on an arena
+// prefix, so an instance body cloned during the pass, whose targets read the template's
+// declaration, joins the next time it is asked.
+export let monoDeclWrites: {[i32]: i32[]} = Map()
+
+export let monoCellWrites: {[i32]: i32[]} = Map()
+
+let monoFieldWrites: {[i32]: i32[]} = Map()
+
+let monoElemWrites: {[i32]: i32[]} = Map()
+
+// The values stored into an un-annotated `const` list literal, by the declaration
+// (`monoDeclCanon`) holding the literal: `.push` arguments and `d[k] = v` values.
+export let monoListStores: {[i32]: i32[]} = Map()
+
+let monoLetWritesSeen = 0
+
+// Every declaration written, in the order of its first write: `d` for `monoDeclWrites`, `-1 - d`
+// for `monoCellWrites`.
+export let monoWriteOrder: i32[] = []
+
+const MONO_PROG_DEPTH = 400
+
+// The arena's size, a memo key for the walks below that cache a whole-arena answer.
+export function monoArenaStamp() {
+  return P.nodes.length + fnStmts.length + fnParent.length
+}
+
+// Whether the binding `d` declared at `at` in frame `ctx` holds only its initializer's value, as a
+// `const` does, or each write of it stores a read of a binding already typed closed (D9101).
+export function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
+  if d.letKw == "const" { return true }
+  // A holder the elaboration closed is written at its fact; only an unfacted one reads its writes.
+  const sf = elabSlotTyAt(at, [], ctx)
+  if sf >= 0 && sf < T.tys.length && !monoTyOpen(sf) { return true }
+  for w in monoLetWholeWrites(at) {
+    // The type each write stores is the elaboration's: a record literal's identity type, or the
+    // pre-walk type of the binding a read names.
+    const wb = nodeAt(w)
+    let t = -1
+    if wb is BinExpr && wb.binOp == "=" {
+      const rx = unwrapParen(wb.binRight)
+      const fr = monoStoreFrame(w, ctx)
+      if rx >= 0 && rx < P.nodes.length && nodeAt(rx) is ObjLit {
+        t = elabIdentityTy(rx, fr)
+        if t < 0 { t = nodeTyFrozenOf(rx) }
+      } else if rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+        const bd = monoReadLetFrame(rx, fr)[1]
+        const b = if bd >= 0 { nodeAt(bd) } else { null }
+        if b is LetDecl {
+          t = nodeTyFrozenOf(if b.letType >= 0 { b.letType } else { b.letInit })
+        }
+      }
+    }
+    if (
+      monoLetWriteFreshMap(w) < 0
+      && !monoLetWriteHasListLit(w)
+      && (t < 0 || t >= T.tys.length || monoTyOpen(t))
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether the `let` declared at `at` holds values of type `t`: its slot fact is `t`, which the
+// elaboration closes only where every write agrees. A fresh `Map()` write is recorded at `t`.
+export function monoLetWritesAt(
+  d: LetDecl,
+  at: i32,
+  ctx: i32,
+  t: i32,
+): boolean {
+  if d.letKw == "const" { return true }
+  const et = elabSlotTyAt(at, [], ctx)
+  if et < 0 || !tySameSealed(et, t) { return false }
+  if t < T.tys.length && tyAt(t) is TyMap {
+    for w in monoLetWholeWrites(at) {
+      const fx = monoLetWriteFreshMap(w)
+      if fx >= 0 { nodeTyRecord(fx, t) }
+    }
+  }
+  return true
+}
+
+// Whether write `w` stores a record literal with a list literal field, which the binding's own
+// pin types (`monoLetWriteFieldLits`) and `monoLetWritesAt` then compares (D9301).
+function monoLetWriteHasListLit(w: i32): boolean {
+  const wb = nodeAt(w)
+  if !(wb is BinExpr) || wb.binOp != "=" { return false }
+  const rx = unwrapParen(wb.binRight)
+  if rx < 0 || rx >= P.nodes.length { return false }
+  const lit = nodeAt(rx)
+  if !(lit is ObjLit) { return false }
+  for fi in lit.objFields {
+    const f = nodeAt(fi)
+    if f is FieldInit {
+      const vx = unwrapParen(f.fiValue)
+      if vx >= 0 && vx < P.nodes.length && nodeAt(vx) is ArrayLit {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+// The right side of write `w` when it is a `Map()` call with no arguments, else -1 (D9182).
+function monoLetWriteFreshMap(w: i32): i32 {
+  const wb = nodeAt(w)
+  if !(wb is BinExpr) || wb.binOp != "=" { return -1 }
+  const rx = unwrapParen(wb.binRight)
+  if rx < 0 || rx >= P.nodes.length { return -1 }
+  const c = nodeAt(rx)
+  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return -1 }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || f.identName != "Map" || identDeclOf(c.callFn) >= 0 {
+    return -1
+  }
+  return rx
+}
+
+// The writes `d = v` of the binding declared at `at`, its capture cell's included.
+export function monoLetWholeWrites(at: i32): i32[] {
+  const out: i32[] = []
+  for w in monoWritesOf("n:", at) { out.push(w) }
+  for w in monoWritesOf("c:", at) { out.push(w) }
+  return out
+}
+
+// The value type of the map (no set) the expression `mx` takes, when that type is open; -1
+// otherwise.
+export function monoOpenMapValTy(mx: i32): i32 {
+  const rt = nodeTyIxOf(mx)
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  const mt = tyAt(rt)
+  if !(mt is TyMap) || mt.mSet != 0 { return -1 }
+  const vty = tyValOf(mt)
+  if vty < 0 || vty >= T.tys.length || !monoTyOpen(vty) { return -1 }
+  return vty
+}
+
+// Whether type `t` reaches a type variable or an inference hole outside a tagged function set,
+// whose values are member ids and so need no pin.
+export function monoTyOpen(t: i32): boolean {
+  if t < 0 { return true }
+  if !tyHasTyVar(t) && !tyHoldsHole(t) { return false }
+  if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t) { return true }
+  return monoTyOpenUntagged(t, 16)
+}
+
+// `monoTyOpen` within a type holding a tagged set: a list or record is open when a part other
+// than the set is, at most `depth` levels deep.
+function monoTyOpenUntagged(t: i32, depth: i32): boolean {
+  if t < 0 { return true }
+  if fnTagTyIsTagged(t) { return false }
+  if !tyHasTyVar(t) && !tyHoldsHole(t) { return false }
+  if depth <= 0 { return true }
+  const a = tyAt(t)
+  match a {
+    TyArray => {
+      return monoTyOpenUntagged(tyElemOf(a), depth - 1)
+    }
+    TyObj => {
+      for f in a.objFieldTypes {
+        if monoTyOpenUntagged(f, depth - 1) { return true }
+      }
+      return false
+    }
+    // Any other open kind is open as a whole.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      return true
+    }
+  }
+}
+
+// The frame node `ix` runs in, under frame `fx` (-1 for the module).
+export function monoStoreFrame(ix: i32, fx: i32): i32 {
+  if fx >= 0 { return monoFrameOfNode(ix, fx) }
+  return monoTopFrameOf(ix)
+}
+
+// The source declaration that declaration `d` is a rewrite's copy of, or `d` itself.
+export function monoDeclCanon(d: i32): i32 {
+  const o = declOrigOf(d)
+  if o >= 0 { return o }
+  return d
+}
+
+// `monoDeclCopyIn` as `[frame, declaration]`, the frame -1 at module scope; `[-1, -1]` for none.
+export function monoDeclFrameIn(e: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  if e < 0 || e >= P.nodes.length { return none }
+  if elabDeclFnOf(e) == -1 {
+    const top: i32[] = [0 - 1, e]
+    return top
+  }
+  let fx = ctx
+  let hops = 0
+  while hops < 8 && fx >= 0 {
+    const c = monoBodyDeclCopy(monoNestedBodyOf(fx), e)
+    if c >= 0 {
+      const out: i32[] = [fx, c]
+      return out
+    }
+    const slot = fnStmtsPosOf(fx)
+    if slot < 0 || slot >= fnParent.length { return none }
+    const ps = fnParent[slot]
+    if ps < 0 || ps >= fnStmts.length { return none }
+    fx = fnStmts[ps]
+    hops = hops + 1
+  }
+  return none
+}
+
+// `[frame, declaration]` of the `let` the read at `at` (a name, or a capture cell's `d[0]`)
+// names by declaration, in frame `ctx` or the nearest enclosing frame holding its copy;
+// `[-1, -1]` for a read of anything else, such as a parameter.
+export function monoReadLetFrame(at: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  if at < 0 || at >= P.nodes.length { return none }
+  let r = at
+  const rn = nodeAt(at)
+  if rn is Index {
+    if monoCellReadName(at) == "" { return none }
+    r = rn.idxArr
+  }
+  if !(nodeAt(r) is Ident) { return none }
+  const e = identDeclOf(r)
+  if e < 0 || e >= P.nodes.length || !(nodeAt(e) is LetDecl) { return none }
+  return monoDeclFrameIn(e, ctx)
+}
+
+// The `let` in `body`, outside the functions nested in it, that is or copies declaration `e`;
+// the first such in one walk of the body, which is indexed once per arena stamp.
+function monoBodyDeclCopy(body: i32, e: i32): i32 {
+  if body < 0 { return -1 }
+  let eo = declOrigOf(e)
+  if eo < 0 { eo = e }
+  const stamp = monoArenaStamp()
+  if stamp != monoBodyDeclStamp {
+    monoBodyDeclStamp = stamp
+    monoBodyDeclRow = Map()
+    monoBodyDeclPos = []
+    monoBodyDeclByOrig = []
+  }
+  let row = monoBodyDeclRow[body] ?? -1
+  if row < 0 {
+    row = monoBodyDeclPos.length
+    monoBodyDeclRow[body] = row
+    const pos: {[i32]: i32} = Map()
+    const byOrig: {[i32]: i32} = Map()
+    let n = 0
+    const stack: i32[] = [body]
+    while stack.length > 0 {
+      const cur = stack.pop() ?? -1
+      if cur >= 0 && cur < P.nodes.length {
+        if nodeAt(cur) is LetDecl {
+          pos[cur] = n
+          n = n + 1
+          const o = declOrigOf(cur)
+          if o >= 0 && (byOrig[o] ?? -1) < 0 { byOrig[o] = cur }
+        }
+        for k in nodeChildren(cur) { stack.push(k) }
+      }
+    }
+    monoBodyDeclPos.push(pos)
+    monoBodyDeclByOrig.push(byOrig)
+  }
+  const pos = monoBodyDeclPos[row]
+  let best = -1
+  let bestAt = 0
+  for c in [e, eo, monoBodyDeclByOrig[row][eo] ?? -1] {
+    const at = pos[c] ?? -1
+    if c >= 0 && at >= 0 && (best < 0 || at < bestAt) {
+      best = c
+      bestAt = at
+    }
+  }
+  return best
+}
+
+// The cell a read `cell[0]` at node `ix` names, or "" for any other node.
+export function monoCellReadName(ix: i32): string {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const n = nodeAt(ix)
+  if n is Index {
+    const a = nodeAt(n.idxArr)
+    const k = nodeAt(n.idxIndex)
+    if a is Ident && k is NumLit {
+      if k.numText == "0" { return a.identName }
+    }
+  }
+  return ""
+}
+
+// The innermost function node among `root` and the functions lifted out of it whose body holds
+// node `ix`; `root` itself when none of them does.
+export function monoFrameOfNode(ix: i32, root: i32): i32 {
+  let best = root
+  for k in monoLiftedDescendants(fnStmtsPosOf(root)) {
+    const kb = monoNestedBodyOf(fnStmts[k])
+    if kb >= 0 && monoSubtreeHolds(kb, ix) { best = fnStmts[k] }
+  }
+  return best
+}
+
+// Per node: the first module-scope function statement whose subtree holds it, -1 when only
+// another statement does, -2 when none does; rebuilt when the arena stamp moves.
+export function monoProgTopOf(ix: i32): i32 {
+  const stamp = monoArenaStamp() + monoProgStmts.length
+  if stamp != monoProgHeldStamp {
+    const top: i32[] = __array_new__(P.nodes.length, -2)
+    let deep = false
+    for st in monoProgStmts {
+      if nodeAt(st) is FuncDecl {
+        if monoProgTopMark(top, st, st) { deep = true }
+      }
+    }
+    for st in monoProgStmts {
+      if monoProgTopMark(top, st, -1) { deep = true }
+    }
+    monoProgTop = top
+    monoProgTopDeep = deep
+    monoProgHeldStamp = stamp
+  }
+  if ix < 0 || ix >= monoProgTop.length { return -2 }
+  return monoProgTop[ix]
+}
+
+// Marks every node `root`'s subtree reaches, entering function bodies (a function's body is
+// its last child), that no earlier walk marked, as held by `owner`; whether one it marked lies
+// more than `MONO_PROG_DEPTH` below `root`.
+function monoProgTopMark(top: i32[], root: i32, owner: i32): boolean {
+  const stack: i32[] = [root]
+  const depths: i32[] = [0]
+  let deep = false
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    const d = depths.pop() ?? 0
+    if cur >= 0 && cur < top.length && top[cur] == -2 {
+      top[cur] = owner
+      if d > MONO_PROG_DEPTH { deep = true }
+      let k = nodeChildrenPush(cur, stack)
+      while k > 0 {
+        depths.push(d + 1)
+        k = k - 1
+      }
+    }
+  }
+  return deep
+}
+
+// Whether node `ix` lies in the subtree at `root`, entering function bodies (a function's body
+// is its last child).
+export function monoSubtreeHolds(root: i32, ix: i32): boolean {
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur == ix { return true }
+    if cur >= 0 && cur < P.nodes.length { nodeChildrenPush(cur, stack) }
+  }
+  return false
+}
+
+// Indexes the assignments the arena gained since the last call. A target that resolved to no
+// declaration is not indexed.
+export function monoLetWritesExtend() {
+  let i = monoLetWritesSeen
+  while i < P.nodes.length {
+    const wn = nodeAt(i)
+    if wn is BinExpr {
+      if wn.binOp == "=" {
+        const tg = nodeAt(wn.binLeft)
+        if tg is Ident {
+          const d = identDeclOf(wn.binLeft)
+          if d >= 0 && d < P.nodes.length {
+            const k = monoDeclCanon(d)
+            if !monoDeclWrites.has(k) { monoWriteOrder.push(k) }
+            const wl = monoDeclWrites.get(k) ?? []
+            wl.push(i)
+            monoDeclWrites.set(k, wl)
+          }
+        } else if monoCellReadName(wn.binLeft) != "" && tg is Index {
+          const d = identDeclOf(tg.idxArr)
+          if d >= 0 && d < P.nodes.length {
+            const k = monoDeclCanon(d)
+            if !monoCellWrites.has(k) { monoWriteOrder.push(0 - 1 - k) }
+            const wl = monoCellWrites.get(k) ?? []
+            wl.push(i)
+            monoCellWrites.set(k, wl)
+          }
+        } else if tg is Member && nodeAt(tg.memObj) is Ident {
+          const d = identDeclOf(tg.memObj)
+          if d >= 0 && d < P.nodes.length {
+            const k = monoDeclCanon(d)
+            const wl = monoFieldWrites.get(k) ?? []
+            wl.push(i)
+            monoFieldWrites.set(k, wl)
+          }
+        }
+        monoElemWriteNote(wn.binLeft, i)
+        if tg is Index { monoListStoreNote(tg.idxArr, wn.binRight) }
+      }
+    } else if wn is Call && wn.callFn >= 0 {
+      const cf = nodeAt(wn.callFn)
+      if cf is Member && cf.memProp == "push" {
+        for a in wn.callArgs { monoListStoreNote(cf.memObj, a) }
+      }
+    }
+    i = i + 1
+  }
+  monoLetWritesSeen = P.nodes.length
+  return 0
+}
+
+// Banks value `v` stored into list `recv` in `monoListStores` when `recv` names, through
+// un-annotated `const` aliases, the `const` a list literal initializes.
+function monoListStoreNote(recv: i32, v: i32) {
+  const b = monoConstListBase(recv)
+  if b < 0 { return 0 }
+  const k = monoDeclCanon(b)
+  const wl = monoListStores.get(k) ?? []
+  wl.push(v)
+  monoListStores.set(k, wl)
+  return 0
+}
+
+// The un-annotated `const` holding the list literal `v` names through further such `const`s, or
+// -1 when `v` names none.
+export function monoConstListBase(v: i32): i32 {
+  let lx = unwrapParen(v)
+  let hops = 0
+  let d = -1
+  while lx >= 0 && lx < P.nodes.length && nodeAt(lx) is Ident && hops < 16 {
+    d = identDeclOf(lx)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    const dn = nodeAt(d)
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+    lx = unwrapParen(dn.letInit)
+    hops = hops + 1
+  }
+  if lx < 0 || lx >= P.nodes.length || !(nodeAt(lx) is ArrayLit) { return -1 }
+  return d
+}
+
+// Banks write `i` to target `lhs` in `monoElemWrites` when `lhs` is `d[k]`: `d[0] = v` counts
+// too, since `d` may be a list literal and not a capture cell.
+function monoElemWriteNote(lhs: i32, i: i32) {
+  const tg = nodeAt(lhs)
+  if !(tg is Index) || !(nodeAt(tg.idxArr) is Ident) { return 0 }
+  const d = identDeclOf(tg.idxArr)
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const k = monoDeclCanon(d)
+  const wl = monoElemWrites.get(k) ?? []
+  wl.push(i)
+  monoElemWrites.set(k, wl)
+  return 0
+}
+
+// The writes of the binding declared at `d` (`key` `n:`), of its capture cell (`c:`), of its
+// fields (`f:`), or of its elements (`e:`).
+export function monoWritesOf(key: string, d: i32): i32[] {
+  monoLetWritesExtend()
+  const none: i32[] = []
+  if d < 0 || d >= P.nodes.length { return none }
+  if key == "c:" { return monoCellWrites.get(monoDeclCanon(d)) ?? none }
+  if key == "f:" { return monoFieldWrites.get(monoDeclCanon(d)) ?? none }
+  if key == "e:" { return monoElemWrites.get(monoDeclCanon(d)) ?? none }
+  return monoDeclWrites.get(monoDeclCanon(d)) ?? none
+}
+
+// The function node holding node `ix` that a module-scope function is, or a function lifted
+// inside one; -1 for a node of the module's own statements.
+export function monoTopFrameOf(ix: i32): i32 {
+  const st = monoProgTopOf(ix)
+  if st < 0 { return -1 }
+  return monoFrameOfNode(ix, st)
+}
+
+// The `fnStmts` positions of the functions lifted out of the one at `slot`, at any depth,
+// parents before children; read off the frame child index.
+export function monoLiftedDescendants(slot: i32): i32[] {
+  const out: i32[] = []
+  if slot < 0 { return out }
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  const stack: i32[] = [slot]
+  while stack.length > 0 {
+    const p = stack.pop() ?? -1
+    if p >= 0 && p < fnChildHead.length {
+      let c = fnChildHead[p]
+      while c >= 0 && c < fnChildNext.length && out.length <= fnStmts.length {
+        out.push(c)
+        stack.push(c)
+        c = fnChildNext[c]
+      }
+    }
+  }
+  return out
+}
+
+// The body of function node `ix`, which `nodeChildren` does not enter; -1 for any other node.
+export function monoNestedBodyOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const nd = nodeAt(ix)
+  if nd is FuncDecl { return nd.fnBody }
+  return -1
+}
+
+// Clears the write index and the program-top walk for the next program.
+export function pinGatesReset() {
+  monoBodyDeclStamp = 0 - 1
+  monoProgHeldStamp = 0 - 1
+  monoProgTopDeep = false
+  monoProgTop = []
+  monoDeclWrites = Map()
+  monoWriteOrder = []
+  monoCellWrites = Map()
+  monoFieldWrites = Map()
+  monoElemWrites = Map()
+  monoListStores = Map()
+  monoLetWritesSeen = 0
+  return 0
+}
