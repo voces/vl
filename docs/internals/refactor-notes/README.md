@@ -9,6 +9,109 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-15-type-hashcons-s4g-emit-guard](2026-11-15-type-hashcons-s4g-emit-guard.md): Type hash-cons stage 4f, step 3a: the emit epoch's invariant is enforced (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s4f-emit-epoch](2026-11-15-type-hashcons-s4f-emit-epoch.md): Type hash-cons stage 4f: the emitter's memos stamp with an emit epoch (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s4e-emit-bump-census](2026-11-15-type-hashcons-s4e-emit-bump-census.md): Type hash-cons stage 4e: which writers still move `tyMutEpoch` during emit (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s4d-rep-id](2026-11-15-type-hashcons-s4d-rep-id.md): Type hash-cons stage 4d: the rep id, the layout id with each record's arm status (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s4c-instance-keys-by-id](2026-11-15-type-hashcons-s4c-instance-keys-by-id.md): Type hash-cons stage 4c: a mono instance key spells a type by its set id (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s4b-comparers-by-id](2026-11-15-type-hashcons-s4b-comparers-by-id.md): Type hash-cons stage 4b: two emit comparers become one `==` on an id (lane H), 2026-11-15
+- [2026-11-15-type-hashcons-s4a-layout-probes](2026-11-15-type-hashcons-s4a-layout-probes.md): Type hash-cons stage 4a: the layout id and the probes the switch needs (lane H), 2026-11-15
+- [2026-11-15-subst-pure-design](2026-11-15-subst-pure-design.md): `substTyDeep` without a mode: design note, 2026-11-15
+- [2026-11-15-slot-store-stage-2b-part2-sig](2026-11-15-slot-store-stage-2b-part2-sig.md): Slot store, stage 2b part 2b(i): a slot's whole signature reads the classes, with its first mono consumer (lane S, 2026-11-15)
+- [2026-11-15-slot-store-stage-2b-part2-readers](2026-11-15-slot-store-stage-2b-part2-readers.md): Slot store, stage 2b part 2b(ii): the last mono probe row closes, and one more elab reader reads the classes (lane S, 2026-11-15)
+- [2026-11-15-size-oob-trap-outline](2026-11-15-size-oob-trap-outline.md): A failing list-index guard traps through the shared empty backing, 2026-11-15
+- [2026-11-15-size-map-get-helper](2026-11-15-size-map-get-helper.md): A mono-valued map get is one call of a per-shape helper, 2026-11-15
+- [2026-11-15-size-map-entry-probe](2026-11-15-size-map-entry-probe.md): A map get or has probes for the entry, not the slot, 2026-11-15
+- [2026-11-15-return-rule-handoff](2026-11-15-return-rule-handoff.md): The hybrid return rule: lane D handoff, 2026-11-15
+- [2026-11-15-return-rule-fuel-split](2026-11-15-return-rule-fuel-split.md): The flag day's fuel is input, not the rule: 2026-11-15
+- [2026-11-15-rep-adt-stage3a-shadow](2026-11-15-rep-adt-stage3a-shadow.md): Rep ADT stage 3a: the field-code shadow, 2026-11-15 (lane E)
+- [2026-11-15-rep-adt-stage3-design](2026-11-15-rep-adt-stage3-design.md): Rep ADT stage 3, design delta: field codes are derived, 2026-11-15 (lane E)
+- [2026-11-15-rep-adt-d16350](2026-11-15-rep-adt-d16350.md): Rep ADT stage 3, D16350: an instance's anonymous row at the instance's types, 2026-11-15 (lane E)
+- [2026-11-15-relate-subst-p3](2026-11-15-relate-subst-p3.md): Relate P3: pin notes are dropped by the quiet level that wrote them, 2026-11-15
+- [2026-11-15-relate-subst-p2](2026-11-15-relate-subst-p2.md): Relate P2: the generic alias stops typing its shared field annotation node, 2026-11-15
+- [2026-11-15-relate-recorder-design](2026-11-15-relate-recorder-design.md): A pure `relate` and one recorder: design note, 2026-11-15
+- [2026-11-15-relate-quiet-flat](2026-11-15-relate-quiet-flat.md): Every quiet level goes through `quietEnter` or `quietEnterFlat`, 2026-11-15
+- [2026-11-15-relate-g2a-hole-bind-walk](2026-11-15-relate-g2a-hole-bind-walk.md): L2 S2 group 2: `holeChoice` needs no row, and the `holeBind` walk owns its state, 2026-11-15
+- [2026-11-15-relate-g2-fit-census](2026-11-15-relate-g2-fit-census.md): L2 S2 prerequisites, group 2 (flow and bindings): where each judge decides, 2026-11-15
+- [2026-11-15-relate-g2-close](2026-11-15-relate-g2-close.md): L2 S2 group 2 closed: no flow-and-binding judge needs a stored row, 2026-11-15
+- [2026-11-15-relate-c2-validate-comp-arg](2026-11-15-relate-c2-validate-comp-arg.md): Relate C2: `validateCompArgCstr` asks through `fitsExpr`; `Refused` is dropped, 2026-11-15
+- [2026-11-15-relate-c1-quiet-brackets-measured](2026-11-15-relate-c1-quiet-brackets-measured.md): Relate C1: what the last fit-question brackets protect, measured, 2026-11-15
+- [2026-11-15-relate-b1-join-and-returns](2026-11-15-relate-b1-join-and-returns.md): Relate B1: the join arm and the return-value probe ask through `fitsExpr`, 2026-11-15
+- [2026-11-15-relate-b0-fits-expr](2026-11-15-relate-b0-fits-expr.md): Relate B0: one entry owns the fit question's quiet bracket, 2026-11-15
+- [2026-11-15-r1-clause2-bucket-pass](2026-11-15-r1-clause2-bucket-pass.md): Bucket marks on the open clause-2 rows, 2026-11-15
+- [2026-11-15-oracle-u8-domain](2026-11-15-oracle-u8-domain.md): Oracle: narrow-integer cast domains (2026-11-15, lane O)
+- [2026-11-15-oracle-ruling-grid](2026-11-15-oracle-ruling-grid.md): The oracle grades D16410 and D16293 (a), 2026-11-15
+- [2026-11-15-oracle-refused-filed](2026-11-15-oracle-refused-filed.md): Oracle fuzz: REFUSED-FILED (2026-11-15, lane O)
+- [2026-11-15-oracle-refused-column](2026-11-15-oracle-refused-column.md): Oracle: a refusal is never agreement (2026-11-15, lane O)
+- [2026-11-15-oracle-radix-width-cells](2026-11-15-oracle-radix-width-cells.md): Eight radix-width cells from the first fuzz nightly, delta-debugged into four families, plus one oracle case, 2026-11-15
+- [2026-11-15-oracle-radix-use-width](2026-11-15-oracle-radix-use-width.md): The oracle computes a radix tree at its use's width (ruling A), 2026-11-15
+- [2026-11-15-oracle-flag-day](2026-11-15-oracle-flag-day.md): Oracle inputs after the return-rule flag day (2026-11-15, lane O)
+- [2026-11-15-oracle-filed-emulation](2026-11-15-oracle-filed-emulation.md): Oracle: filed wrong values are matched by an emulation of their row (2026-11-15, lane O)
+- [2026-11-15-oracle-cast-adopt](2026-11-15-oracle-cast-adopt.md): Oracle: four cast and adoption rules (2026-11-15, lane O)
+- [2026-11-15-oracle-arith-triage](2026-11-15-oracle-arith-triage.md): Oracle: triage of the arith fuzz on seeds 31-100 (2026-11-15, lane O)
+- [2026-11-15-oracle-arith-legal](2026-11-15-oracle-arith-legal.md): Oracle: the arithmetic generator emits legal programs (2026-11-15, lane O)
+- [2026-11-15-oracle-arith-five](2026-11-15-oracle-arith-five.md): The five unexamined arith fuzz cells, and one trap: all oracle-side, 2026-11-15
+- [2026-11-15-medium6-step64-after-i8](2026-11-15-medium6-step64-after-i8.md): Medium 6 step 6.4: the between-pass pins wait for L1's I8 (2026-11-15)
+- [2026-11-15-medium6-step63-arena-write-ratchet](2026-11-15-medium6-step63-arena-write-ratchet.md): Medium 6 step 6.3: a ratchet on writes into existing nodes (2026-11-15)
+- [2026-11-15-medium6-step61-lower-once](2026-11-15-medium6-step61-lower-once.md): Medium 6 step 6.1: the resolve-time lowering runs once per program (2026-11-15)
+- [2026-11-15-medium6-lowering-design](2026-11-15-medium6-lowering-design.md): Review medium 6, the lowering pass: mostly L1's, plus one small pass of its own (2026-11-15)
+- [2026-11-15-lane-l-v128list](2026-11-15-lane-l-v128list.md): 2026-11-15 — lane L: a flat `v128` list kind
+- [2026-11-15-lane-l-scalar-list-ek](2026-11-15-lane-l-scalar-list-ek.md): 2026-11-15 — lane L: one element kind for the scalar-list store and push
+- [2026-11-15-lane-l-fc-v128](2026-11-15-lane-l-fc-v128.md): 2026-11-15 — lane L: `FC_V128`, a vector as a struct field (AE-004)
+- [2026-11-15-lane-l-d16486](2026-11-15-lane-l-d16486.md): 2026-11-15 — lane L: D16486, a vector field write's parked value
+- [2026-11-15-lane-l-d16484](2026-11-15-lane-l-d16484.md): 2026-11-15 — lane L: one value-position spill for compound writes and list-cell `??`
+- [2026-11-15-lane-l-d16483](2026-11-15-lane-l-d16483.md): 2026-11-15 — lane L: D16483, `??` over a re-readable list cell
+- [2026-11-15-lane-l-d16482](2026-11-15-lane-l-d16482.md): 2026-11-15 — lane L: D16482, an annotated empty container of vectors
+- [2026-11-15-lane-l-d16433](2026-11-15-lane-l-d16433.md): A re-pointed open set settles with the set it joined, D16433 — 2026-11-15
+- [2026-11-15-lane-l-d16343](2026-11-15-lane-l-d16343.md): 2026-11-15 — lane L: D16343, a `K | null` field write used as a value
+- [2026-11-15-lane-l-d16341](2026-11-15-lane-l-d16341.md): An unwritten container stored as a map value is defaulted with its holder, D16341 — 2026-11-15
+- [2026-11-15-lane-l-d16184](2026-11-15-lane-l-d16184.md): An assignment's value over a `K | null` local is its atom, D16184 — 2026-11-15
+- [2026-11-15-l5-step4c-esrows](2026-11-15-l5-step4c-esrows.md): L5 step 4c: the effect-summary rows as one `EsRows` record (2026-11-15)
+- [2026-11-15-l5-step4b-crrows](2026-11-15-l5-step4b-crrows.md): L5 step 4b: the capture rows are one lifetime record, 2026-11-15 (lane Q)
+- [2026-11-15-l5-step4a-recad](2026-11-15-l5-step4a-recad.md): L5 step 4a: the record-adoption rows are two lifetime records, 2026-11-15 (lane Q)
+- [2026-11-15-l5-step3c-mono-quiet-run](2026-11-15-l5-step3c-mono-quiet-run.md): L5 step 3c: the pinned mono re-check opens a `QuietRun` (2026-11-15)
+- [2026-11-15-l5-step3b-elab-pin-family](2026-11-15-l5-step3b-elab-pin-family.md): L5 step 3b: the elaboration's pin notes as a rollback family (2026-11-15)
+- [2026-11-15-l5-step3a-quiet-run](2026-11-15-l5-step3a-quiet-run.md): L5 step 3a: the quiet re-check brackets as `QuietRun` values (2026-11-15)
+- [2026-11-15-l5-step3-remeasured](2026-11-15-l5-step3-remeasured.md): L5 step 3, re-measured: the family registry does not pay (2026-11-15)
+- [2026-11-15-l5-step2c-frame-records](2026-11-15-l5-step2c-frame-records.md): L5 step 2c: two emitter frames as records (2026-11-15)
+- [2026-11-15-l5-step2b-body](2026-11-15-l5-step2b-body.md): L5 step 2b: the emitter's `body: u8[]` parameter is gone, 2026-11-15 (lane Q)
+- [2026-11-15-l3-d16377-null-call-instance](2026-11-15-l3-d16377-null-call-instance.md): L3: the row slot's `null` call is the declared parameter's instance (D16377), 2026-11-15
+- [2026-11-15-l2-drift-since-8172](2026-11-15-l2-drift-since-8172.md): The self-compile fuel drift between #8172's baseline and #8221's, attributed, 2026-11-15
+- [2026-11-15-l2-close-and-storage](2026-11-15-l2-close-and-storage.md): L2: when a scheme closes, and where function storage is decided, measured, 2026-11-15
+- [2026-11-15-l1-i2-list-reads](2026-11-15-l1-i2-list-reads.md): L1 I2, list half: reference values and plain list reads in the IR shadow (2026-11-15)
+- [2026-11-15-k-d9073-result-only-bound-by-destination](2026-11-15-k-d9073-result-only-bound-by-destination.md): D9073: the destination binds a type parameter only the result names, 2026-11-15
+- [2026-11-15-k-d16590-record-field-open-fn](2026-11-15-k-d16590-record-field-open-fn.md): D16590: the destination binds a generic function at a record literal's field, 2026-11-15
+- [2026-11-15-k-d16493-minted-node-readers](2026-11-15-k-d16493-minted-node-readers.md): D16493: readers of the write-scan index and a minted instance, 2026-11-15
+- [2026-11-15-k-d16410-destination-binds-open-fn](2026-11-15-k-d16410-destination-binds-open-fn.md): D16410: the destination binds a type parameter only open function arguments name, 2026-11-15
+- [2026-11-15-k-d16333-optional-guard-over-non-null](2026-11-15-k-d16333-optional-guard-over-non-null.md): D16333: an optional call's guard over a receiver with no null is its call, 2026-11-15
+- [2026-11-15-ir-step0-list-hooks](2026-11-15-ir-step0-list-hooks.md): IR step 0 for the list slice: hooks and exported helpers, 2026-11-15
+- [2026-11-15-ir-shadow-corpus](2026-11-15-ir-shadow-corpus.md): The IR shadow over the distilled corpus (2026-11-15)
+- [2026-11-15-ir-shadow-corpus-clean](2026-11-15-ir-shadow-corpus-clean.md): IR shadow: the distilled corpus clean, 2026-11-15
+- [2026-11-15-ir-i1b2-static-claim](2026-11-15-ir-i1b2-static-claim.md): IR step I1b-2: the static claim, 2026-11-15
+- [2026-11-15-ir-i1b-shared-decisions](2026-11-15-ir-i1b-shared-decisions.md): IR step I1b-1: shared decisions, 2026-11-15
+- [2026-11-15-ir-i1a-dual-emit](2026-11-15-ir-i1a-dual-emit.md): IR step I1a: lowering and dual emit, 2026-11-15
+- [2026-11-15-ir-i0-shadow](2026-11-15-ir-i0-shadow.md): IR step I0: types, verifier and a phase-A shadow, 2026-11-15
+- [2026-11-15-g81-fn-tag-redecide-census](2026-11-15-g81-fn-tag-redecide-census.md): What `fnTagRedecide` changes over the check's tag decision, measured, 2026-11-15
+- [2026-11-15-g80-l2-s1-callee-first](2026-11-15-g80-l2-s1-callee-first.md): L2 S1: callee-first order for un-annotated callees, measured, 2026-11-15
+- [2026-11-15-g78-l2-s0-shadow-ifaces](2026-11-15-g78-l2-s0-shadow-ifaces.md): L2 S0, parts 3 and 4: the shadow-interface printer and its differential, 2026-11-15
+- [2026-11-15-g77-l2-s0-judge-coverage](2026-11-15-g77-l2-s0-judge-coverage.md): L2 S0, part 2: how much of the corpus a row-built scheme covers, measured, 2026-11-15
+- [2026-11-15-g76-l2-s0-polymorphic-recursion](2026-11-15-g76-l2-s0-polymorphic-recursion.md): L2 S0, part 1: polymorphic recursion through an un-annotated function, measured, 2026-11-15
+- [2026-11-15-g73-d16427-bound-nested-list-pins](2026-11-15-g73-d16427-bound-nested-list-pins.md): D16427: a bound list's own element list waits for a hole callee's write, 2026-11-15
+- [2026-11-15-g72-d16425-bound-list-record-link](2026-11-15-g72-d16425-bound-list-record-link.md): D16425: a record pushed beside a bound list's own shares its open list fields, 2026-11-15
+- [2026-11-15-g70-d16422-call-literal-pin-rows](2026-11-15-g70-d16422-call-literal-pin-rows.md): D16422: a list literal written at the call is a pin row, with the open lists in it, 2026-11-15
+- [2026-11-15-g69-d16421-nested-pin-rows](2026-11-15-g69-d16421-nested-pin-rows.md): D16421: a body's open lists written into a call-site list join the call's pin rows, 2026-11-15
+- [2026-11-15-g-bucket-ruling-packet](2026-11-15-g-bucket-ruling-packet.md): Bucket (g): the ruling packet, 2026-11-15
+- [2026-11-15-fuzz-nightly-first-run-triage](2026-11-15-fuzz-nightly-first-run-triage.md): The first fuzz-nightly run on GitHub, triaged, 2026-11-15
+- [2026-11-15-d2836-tail-match-apart-join](2026-11-15-d2836-tail-match-apart-join.md): D2836: a tail `match` keeps a type parameter's list apart in the return set, 2026-11-15
+- [2026-11-15-d16558-field-name-index](2026-11-15-d16558-field-name-index.md): D16558: a record type's field lookup reads a first-position name index (lane H), 2026-11-15
+- [2026-11-15-d16496-nested-join-held](2026-11-15-d16496-nested-join-held.md): D16496: a nested join that keeps its type keeps its literals (2026-11-15, lane O)
+- [2026-11-15-d16397-generic-instance-record-eq](2026-11-15-d16397-generic-instance-record-eq.md): D16397: a generic instance's record `==` compares per field pair, 2026-11-15
+- [2026-11-15-d16278-layer1-typing](2026-11-15-d16278-layer1-typing.md): D16278 layer 1: a place handed on is stamped where the decision decides it, 2026-11-15
+- [2026-11-15-d16261-never-argument-pin](2026-11-15-d16261-never-argument-pin.md): D16261, D16260: a parameter bound at `never` is pinned at the default, 2026-11-15
+- [2026-11-15-d16237-map-walk-value-variable](2026-11-15-d16237-map-walk-value-variable.md): D16237: a map walk's value variable is an element of the map, 2026-11-15
+- [2026-11-15-d16234-record-list-per-instance](2026-11-15-d16234-record-list-per-instance.md): D16234, D16236: a generic instance's record-list literal at its own slot fact, 2026-11-15
+- [2026-11-15-const-read-value-width](2026-11-15-const-read-value-width.md): A `const` read beside a radix literal is typed by its value (T2.4), 2026-11-15
+- [2026-11-14-hybrid-return-rule](2026-11-14-hybrid-return-rule.md): The hybrid return rule: design note for the flag day, 2026-11-14
 - [2026-11-15-type-hashcons-s3b-canon-shadow](2026-11-15-type-hashcons-s3b-canon-shadow.md): Type hash-cons stage 3b: a type's canonical id, shadowed beside the emit comparers (lane H), 2026-11-15
 - [2026-11-15-type-hashcons-s2c1-hole-union](2026-11-15-type-hashcons-s2c1-hole-union.md): Type hash-cons stage 2c-1: two open children that meet become one hole (lane H), 2026-11-15
 - [2026-11-15-slot-store-stage-2b-part2-api](2026-11-15-slot-store-stage-2b-part2-api.md): Slot store, stage 2b part 2a: the reader API's first read (lane S, 2026-11-15)
