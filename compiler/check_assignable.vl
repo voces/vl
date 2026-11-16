@@ -262,6 +262,7 @@ import {
   radixLitAdoptDst,
   rcwPend,
   recAdForce,
+  recPendHeldInit,
   recordCtxTy,
   recordListCopy,
   recordMapUnbox,
@@ -2060,9 +2061,11 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         }
       } else if srcTy != dstTy {
         recPend(srcExpr, srcTy, dstTy, srcExpr)
+        recPendHeldInit(srcExpr, dstTy)
         recordRecCopy(srcExpr, srcTy, dstTy)
       } else if tyAt(srcTy) is TyObj || tyAt(srcTy) is TyArray {
         recOwnPend(srcExpr, srcTy)
+        recPendHeldInit(srcExpr, srcTy)
       }
     }
     return true
@@ -4008,6 +4011,59 @@ function fvaListHoldsLetAlias(site: i32): boolean {
   return false
 }
 
+// Rewrites list `site` in place to `site.map(lam)`, the site's own value moved under the call, and
+// checks it: the one home of a list site's converting copy.
+function listSiteMapCopy(site: i32, lam: i32, pos: i32): boolean {
+  const siteNode = nodeAt(site)
+  const moved = addNode(siteNode)
+  if siteNode is Ident { identFrom(moved, site) }
+  adoptNodeTok(moved, site)
+  const mem = luAt(mkMember(moved, "map", pos), site)
+  adoptNodeTok(mem, site)
+  const cargs: i32[] = []
+  cargs.push(lam)
+  const names: string[] = []
+  const c: Node = {
+    callFn: mem,
+    callArgs: cargs,
+    callArgNames: names,
+    pos: pos,
+  }
+  arenaSetNode(site, c)
+  fvaListCopyNote(site)
+  fvaListCopyNote(mem)
+  luGrow()
+  checkNodeHook(site)
+  return true
+}
+
+// A list `site` of string literal atoms compared with a `string[]`: `site` becomes
+// `site.map(($e): string => $e)`, so both lists are read through one string core (D16393). The
+// copy is read once and never written, so no handle loses a write. False when it is no such site.
+export function eqAtomListCopy(site: i32, de: i32): boolean {
+  if (
+    site < 0
+    || de < 0
+    || inferQuiet
+    || monoRecheckDepth > 0
+    || fvaListCopyAt(site)
+  ) {
+    return false
+  }
+  if nodeAt(parenPeelIx(site)) is ArrayLit { return false }
+  const pos = nodePos(site)
+  const rt = fvaAnnot(de, site, pos)
+  if rt < 0 { return false }
+  const pd = luAt(mkParam("$e" + i32ToStr(site), -1, -1, 0, 0, pos), site)
+  const ps: i32[] = []
+  ps.push(pd)
+  const lam = luAt(
+    addNode(fvaLambda(ps, rt, luRef(pd, site, pos), site, pos)),
+    site,
+  )
+  return listSiteMapCopy(site, lam, pos)
+}
+
 // A list `site` of type `srcTy` whose elements are a function set, copied into slots of the closed
 // function type `de`: `site` becomes `site.map(($e): de => $e)`, whose return delivers each
 // element through its adapter, at the source's own position. False when it is no such copy.
@@ -4066,27 +4122,7 @@ export function fvaListSetCopy(site: i32, srcTy: i32, de: i32): boolean {
     body = luAt(addNode(fvaLambda(eps, ert, call, site, pos)), site)
   }
   const lam = luAt(addNode(fvaLambda(ps, rt, body, site, pos)), site)
-  const siteNode = nodeAt(site)
-  const moved = addNode(siteNode)
-  if siteNode is Ident { identFrom(moved, site) }
-  adoptNodeTok(moved, site)
-  const mem = luAt(mkMember(moved, "map", pos), site)
-  adoptNodeTok(mem, site)
-  const cargs: i32[] = []
-  cargs.push(lam)
-  const names: string[] = []
-  const c: Node = {
-    callFn: mem,
-    callArgs: cargs,
-    callArgNames: names,
-    pos: pos,
-  }
-  arenaSetNode(site, c)
-  fvaListCopyNote(site)
-  fvaListCopyNote(mem)
-  luGrow()
-  checkNodeHook(site)
-  return true
+  return listSiteMapCopy(site, lam, pos)
 }
 
 // Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
