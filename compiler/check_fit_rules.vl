@@ -21,7 +21,7 @@ import { callBindTyOf } from "./check_bind_rows"
 import { cwFieldNameOf } from "./check_write_scan"
 import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
-import { identDeclOf } from "./symbols"
+import { fnOnlyReturnsParam, identDeclOf } from "./symbols"
 import {
   ArrayLit,
   AsExpr,
@@ -378,6 +378,7 @@ import {
   rcwCallSites,
   rcwContainerRuleDomain,
   rcwPathOf,
+  rcwSameElems,
   rcwSlotFresh,
   rcwTyped,
 } from "./check_record_writes"
@@ -3738,6 +3739,9 @@ export function recBuiltReadRefuse(u: i32) {
     if oe >= 0 && ot is TyArray && recAnnArgTakesRep(p, mkArrayTy(et)) {
       return 0
     }
+    // Assigned into an un-annotated binding whose initialiser holds the same build (D16763).
+    const ai = recAsgBindInit(p)
+    if ot is TyArray && ai >= 0 && recHeldElemBuilt(ai) == et { return 0 }
     if oe >= 0 { recBuiltReadErr(p, own, nonNullTy(oe), et, true) }
     return 0
   }
@@ -3750,6 +3754,22 @@ export function recBuiltReadRefuse(u: i32) {
   if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
   if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
+  }
+  return 0
+}
+
+// Refuses each list an un-annotated function returns whose elements a build stores at another record:
+// the function's inferred result is the list's own type, a storage the build does not have (D16763).
+export function recBuiltRetListsRefuse() {
+  let i = 0
+  while i < storeFnCount() {
+    for lf in recFnValueLeaves(storeFnAt(i)) {
+      const t = nodeTyIxOf(cwPeelValue(lf))
+      if t >= 0 && t < T.tys.length && tyAt(t) is TyArray {
+        recBuiltReadRefuse(lf)
+      }
+    }
+    i = i + 1
   }
   return 0
 }
@@ -5122,7 +5142,10 @@ function recCbTakesBuild(c: i32, isMap: boolean): boolean {
     return false
   }
   if an is FuncDecl && f.fnName != "" { return false }
-  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) { return false }
+  // A `map` handing each element back keeps them, and its result is stamped at the build (D16211).
+  if isMap && tyHoldsObjDeep(nodeTyIxOf(c)) && !fnOnlyReturnsParam(fd) {
+    return false
+  }
   const p = nodeAt(f.fnParams[0])
   return p is Param && p.parType < 0
 }
@@ -5134,8 +5157,33 @@ function recBuiltElemOf(x: i32): i32 {
   return recBuiltElemIn(x, recBuildPassTable())
 }
 
+// The receiver of `x` where `x` is a call of a method handing back a list of the receiver's own
+// elements (`filter`, `slice`, `values`, an identity `map`), parentheses peeled; else -1.
+function recSameElemsRecv(x: i32): i32 {
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is Call) || n.callFn < 0 { return -1 }
+  const f = nodeAt(n.callFn)
+  if !(f is Member) { return -1 }
+  // A `map` whose callback hands each element back keeps them too (D16211).
+  const keeps = rcwSameElems(f.memProp)
+    || (f.memProp == "map"
+    && n.callArgs.length == 1
+    && fnOnlyReturnsParam(recCbDeclOf(n.callArgs[0])))
+  return if keeps { cwPeelValue(f.memObj) } else { -1 }
+}
+
+// The function a callback argument `a` names or is (a lambda), else -1.
+function recCbDeclOf(a: i32): i32 {
+  const ax = parenPeelIx(a)
+  const an = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { null }
+  return if an is FuncDecl { ax } else if an is Ident { identFnDeclOf(ax) } else { -1 }
+}
+
 // `recBuiltElemOf` read from build table `tbl` (`recBuildPassTable` or `recBuildTable`).
 function recBuiltElemIn(x: i32, tbl: Map<i32, i32>): i32 {
+  // A list of the receiver's own elements holds them where the receiver does (D16763).
+  const sr = recSameElemsRecv(x)
+  if sr >= 0 { return recBuiltElemIn(sr, tbl) }
   const d = recHeldDecl(x)
   return if d < 0 { -1 } else { recBuildTyIn(tbl, d, true) }
 }
@@ -8496,7 +8544,7 @@ export function recordMapUnbox(
 // `recordMapRetag` at each value a delivery into the union `dstTy` hands over: every tail of a
 // value `if`, `match` or block, and the left operand of a `??`, each at its own type.
 function recordMapRetagTails(srcExpr: i32, dstTy: i32, depth: i32) {
-  if !tyHasMapMember(dstTy, 8) { return 0 }
+  if !tyHasMapMember(dstTy) { return 0 }
   const leaves = valueTailLeaves(srcExpr)
   let i = 0
   while i < leaves.length {

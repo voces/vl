@@ -1,17 +1,20 @@
 // `ir_lower_ref.vl` — the IR lowering of reference values and list reads (ir-design-2026-11.md
 // §5.3, I2's list half). A list read writes its operands, then legacy's own guard and
-// `array.get`; a bounds check lowers as nothing, fused into the read after it (rule 8). The
-// wrapper's scratch slot comes from the shared lazy list frame (`listIdxWrapSlot`). Holds the
-// copy of legacy's list-read decision that the shared predicate replaces.
+// `array.get`; a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
+// slots come from the shared lazy list frame, and a loop opens legacy's header hoists, which a
+// read asks `liveHoistRow` for. Holds the copy of legacy's list-read decision the shared
+// predicate replaces.
 
-import { Index, OP_INDEX_GET, nodeAt } from "./ast"
-import { OImm, OStr, OVar, Opnd, RListGet, Rhs, SBoundsCheck } from "./ir"
-import { irLFn, irLMiss, irLOpnd } from "./ir_lower"
+import { Index, OP_INDEX_GET, WhileStmt, nodeAt } from "./ast"
+import { RListGet, Rhs, SBoundsCheck } from "./ir"
+import { irLFn, irLMiss, irLOpnd, irLSkip } from "./ir_lower"
 import {
   emitListIdxGuard,
-  hoistPathDecl,
-  hoistPathProp,
+  emitListIdxGuardHoisted,
   idxCellReadIsNull,
+  liveHoistRow,
+  loopHoistClose,
+  loopHoistOpen,
   scalarListBack,
   scalarListUsed,
   scalarListWrap,
@@ -27,8 +30,7 @@ import {
 import { scalarListElemKind } from "./emit_value_sites"
 import { listIdxKindOf, listIdxWrapSlot } from "./emit_union_casts"
 import { twoListUseMsg } from "./emit_fn_ret_kinds"
-import { ListKind, VKind } from "./emit_state"
-import { fbArrayGet, lhKind, lhProp, lhRoot, lhSlot } from "./emit_bytes"
+import { fbArrayGet } from "./emit_bytes"
 
 // Why legacy does not lower list read `idxIx` on its plain guarded path, or "" when it does:
 // the decision `emitIndex` makes before `emitIndexScalarList`'s unhoisted, unviewed arm.
@@ -49,112 +51,44 @@ export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null { return "index string" }
   if !scalarListUsed(ek) { return "index uncollected list" }
-  const row = exprPackedRow(nd.idxArr, fnIx)
-  if hoistRowAny(nd.idxArr, listIdxKindOf(ek), row) {
-    return "index maybe hoisted"
-  }
   if svDstOfKind(ek) >= 0 { return "index view" }
   return ""
 }
 
-// Whether any loop-hoisted header of the function matches the receiver, live or not. Legacy asks
-// `liveHoistRow` while the row is live; after the body is lowered none is, so a read that may
-// have been hoisted is refused rather than guessed.
-function hoistRowAny(exprIx: i32, kind: ListKind, slot: i32): boolean {
-  const d = hoistPathDecl(exprIx)
-  if d < 0 { return false }
-  const p = hoistPathProp(exprIx)
-  let k = 0
-  while k < lhRoot.length {
-    if (
-      lhRoot[k] == d
-      && lhProp[k] == p
-      && lhKind[k] == kind
-      && lhSlot[k] == slot
-    ) {
-      return true
-    }
-    k = k + 1
-  }
-  return false
-}
-
-// The list reads the builder admitted, by the receiver variable: the element kind and packed
-// row its guard and `array.get` read. Reset by the builder per function.
-let rgRecv: i32[] = []
-let rgKind: VKind[] = []
-let rgRow: i32[] = []
-
-// The function the notes belong to, by its node and name; another function reads none of them.
-let notesAt = -1
-let notesName = ""
-
-// Starts the notes of the function the builder has open, unless they are already its own.
-export function irRefNotesFor(at: i32, name: string) {
-  if at == notesAt && name == notesName { return 0 }
-  irRefNotesReset()
-  notesAt = at
-  notesName = name
-  return 0
-}
-
-// Forgets every note. Each compile starts here: two programs can hold a function of one name at
-// one node index, and a note of the first must not reach the second.
-export function irRefNotesReset() {
-  notesAt = -1
-  notesName = ""
-  rgRecv = []
-  rgKind = []
-  rgRow = []
-  return 0
-}
-
-export function irRefGetNote(v: i32, ek: VKind, row: i32) {
-  rgRecv.push(v)
-  rgKind.push(ek)
-  rgRow.push(row)
-  return 0
-}
-
-function notesMine(): boolean {
-  const f = irLFn()
-  return f.irAt == notesAt && f.irName == notesName
-}
-
-function noteOf(v: i32): i32 {
-  if !notesMine() { return -1 }
-  let i = 0
-  while i < rgRecv.length {
-    if rgRecv[i] == v { return i }
-    i = i + 1
-  }
-  return -1
-}
-
-function opndVar(o: Opnd): i32 {
-  return match o {
-    OVar => o.ov
-    OImm | OStr => -1
-  }
-}
-
-// `RListGet`: the receiver, the index, legacy's guard, then the backing's `array.get`.
+// `RListGet`: the index, then legacy's guard over the loop's hoisted header when one is live (the
+// receiver is not read), else the receiver too and the wrapper's guard; then the backing's read.
 function lowerList(r: Rhs): i32 {
   if !(r is RListGet) { return irLMiss("list length") }
-  const k = noteOf(opndVar(r.lgV))
-  if k < 0 { return irLMiss("list read unnoted") }
-  const ek = rgKind[k]
-  const row = rgRow[k]
-  irLOpnd(r.lgV)
-  irLOpnd(r.lgIx)
-  emitListIdxGuard(
-    listIdxWrapSlot(listIdxKindOf(ek), row),
-    scalarListWrap(ek, row),
-  )
+  const nd = nodeAt(r.lgAt)
+  if !(nd is Index) { return irLMiss("list read node") }
+  const fnIx = irLFn().irAt
+  const ek = scalarListElemKind(nd.idxArr, fnIx)
+  if ek == null { return irLMiss("list read element") }
+  const row = exprPackedRow(nd.idxArr, fnIx)
+  const hz = liveHoistRow(nd.idxArr, listIdxKindOf(ek), row)
+  if hz >= 0 {
+    irLSkip(r.lgV)
+    irLOpnd(r.lgIx)
+    emitListIdxGuardHoisted(hz, nd.idxIndex)
+  } else {
+    irLOpnd(r.lgV)
+    irLOpnd(r.lgIx)
+    emitListIdxGuard(
+      listIdxWrapSlot(listIdxKindOf(ek), row),
+      scalarListWrap(ek, row),
+    )
+  }
   fbArrayGet(scalarListBack(ek, row))
   return 0
 }
 
+// The list-header hoists of the loop statement at `at`, opened as legacy's loop opens them.
+function loopOpen(at: i32): i32 {
+  if at < 0 { return 0 }
+  const s = nodeAt(at)
+  if !(s is WhileStmt) { return 0 }
+  return loopHoistOpen(s.whileCond, s.whileBody, irLFn().irAt, -1, -1)
+}
 // A bounds check is fused into the `RListGet` after it, which writes the guard; its operand
 // reads consume nothing, so the temps it names stay pending for that read.
 function lowerBounds(_n: SBoundsCheck, _pending: i32[]): i32 { return 0 }
@@ -164,3 +98,7 @@ export function irLowerRefList(r: Rhs): i32 { return lowerList(r) }
 export function irLowerRefBounds(n: SBoundsCheck, pending: i32[]): i32 {
   return lowerBounds(n, pending)
 }
+
+export function irLowerRefLoopOpen(at: i32): i32 { return loopOpen(at) }
+
+export function irLowerRefLoopClose(n: i32): i32 { return loopHoistClose(n) }
