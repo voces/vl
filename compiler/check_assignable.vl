@@ -159,6 +159,7 @@ import { rcwPinProbe } from "./check_covar_pins"
 import { covarWriteThrough } from "./check_covar_write"
 import { cstrCandAny } from "./check_cstr_probe"
 import {
+  ELAB_MAKER_PER_TWIN,
   elabDeadRestClose,
   elabDeadRestOpen,
   elabEncl,
@@ -478,6 +479,10 @@ import {
   nestParentOf,
   nwTyIxs,
   objFieldType,
+  pinGuardArmed,
+  pinGuardFitEnter,
+  pinGuardFitLeave,
+  pinGuardSolveStep,
   primNameStr,
   tyArrayElemIx,
   tyAt,
@@ -494,6 +499,8 @@ import {
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
+  tyPathCycles,
+  tyPathWith,
   tyReachesBrand,
   tyReachesEmptyHole,
   tyReachesUnion,
@@ -1344,11 +1351,13 @@ export type SolveAt = {
 
 // Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order.
 export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
+  if pinGuardArmed { pinGuardSolveStep(1) }
   let st = from
   while st <= to {
     if (at.kinds & (1 << st)) != 0 { solveStep(at, st) }
     st = st + 1
   }
+  if pinGuardArmed { pinGuardSolveStep(-1) }
   return 0
 }
 
@@ -1807,6 +1816,13 @@ function listArmIn(
 // Whether `srcExpr` (of type `srcTy`) delivers to `dstTy`; a delivery that holds where stamps
 // stand records `dstTy` as the node's contextual type.
 export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  if pinGuardArmed {
+    pinGuardFitEnter(srcExpr)
+    const g = assignableExprIn(srcExpr, srcTy, dstTy)
+    pinGuardFitLeave()
+    if g { recordCtxTy(srcExpr, dstTy) }
+    return g
+  }
   const ok = assignableExprIn(srcExpr, srcTy, dstTy)
   if ok { recordCtxTy(srcExpr, dstTy) }
   return ok
@@ -3097,7 +3113,7 @@ function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
   }
   match gt {
     TyFunc => {
-      return tyHoldsNoFn(w, 0)
+      return tyHoldsNoFn(w)
     }
     TyNullable => {
       return fnShapeClash(gt.nInner, w, depth + 1)
@@ -3131,8 +3147,15 @@ function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
 
 // Whether no value of type `w` is a function: a scalar, a literal, or a union or nullable of
 // those. A type parameter, a record, a list or anything else may be one or is judged elsewhere.
-function tyHoldsNoFn(w: i32, depth: i32): boolean {
-  if w < 0 || w >= T.tys.length || depth > 8 { return false }
+function tyHoldsNoFn(w: i32): boolean {
+  const path: i32[] = []
+  return tyHoldsNoFnIn(w, path)
+}
+
+function tyHoldsNoFnIn(w: i32, path: i32[]): boolean {
+  if tyPathCycles(w, path) { return false }
+  const sub = tyPathWith(w, path)
+  if w < 0 || w >= T.tys.length { return false }
   const t = tyAt(w)
   match t {
     TyLit => {
@@ -3149,11 +3172,11 @@ function tyHoldsNoFn(w: i32, depth: i32): boolean {
         || t.primName == "null"
     }
     TyNullable => {
-      return tyHoldsNoFn(t.nInner, depth + 1)
+      return tyHoldsNoFnIn(t.nInner, sub)
     }
     TyUnion => {
       for m in t.uMembers {
-        if !tyHoldsNoFn(m, depth + 1) { return false }
+        if !tyHoldsNoFnIn(m, sub) { return false }
       }
       return true
     }
@@ -3245,8 +3268,15 @@ export function validateRetCstrs(
 // Whether the deferred destination constraints this binding resolves hold — the twin of
 // Whether every hole of `t` sits inside a function type, reached through lists, nullables and
 // record fields only: a hole anywhere else is a value's own open type, not a delivered function's.
-function holesOnlyInFns(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+function holesOnlyInFns(t: i32): boolean {
+  const path: i32[] = []
+  return holesOnlyInFnsIn(t, path)
+}
+
+function holesOnlyInFnsIn(t: i32, path: i32[]): boolean {
+  if tyPathCycles(t, path) { return false }
+  const sub = tyPathWith(t, path)
+  if t < 0 || t >= T.tys.length { return false }
   if !tyHasHole(t) { return true }
   const x = tyAt(t)
   match x {
@@ -3254,14 +3284,14 @@ function holesOnlyInFns(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return holesOnlyInFns(tyElemOf(x), depth + 1)
+      return holesOnlyInFnsIn(tyElemOf(x), sub)
     }
     TyNullable => {
-      return holesOnlyInFns(x.nInner, depth + 1)
+      return holesOnlyInFnsIn(x.nInner, sub)
     }
     TyObj => {
       for ft in x.objFieldTypes {
-        if !holesOnlyInFns(ft, depth + 1) { return false }
+        if !holesOnlyInFnsIn(ft, sub) { return false }
       }
       return true
     }
@@ -3275,12 +3305,7 @@ function holesOnlyInFns(t: i32, depth: i32): boolean {
 // bound by the closed `want`: the delivery types the lambda's copy there, so a call of the
 // lambda at another type does not re-ask the pair.
 function lambdaCopyOnly(got: i32, want: i32): boolean {
-  if (
-    want < 0
-    || tyHasHole(want)
-    || tyHasTyVar(want)
-    || !holesOnlyInFns(got, 0)
-  ) {
+  if (want < 0 || tyHasHole(want) || tyHasTyVar(want) || !holesOnlyInFns(got)) {
     return false
   }
   const bn: string[] = []
@@ -4458,6 +4483,10 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
       heldAt[rc] = list
     }
   }
+  // Each relay's calls at closed results, and the relays one of whose calls is at none.
+  const closedCalls: {[i32]: i32[]} = Map()
+  const callSig: {[i32]: i32} = Map()
+  const notClosed: {[i32]: boolean} = Map()
   for c in rl.calls {
     const cn = nodeAt(c)
     if cn is Call && !innerOf.has(c) {
@@ -4468,6 +4497,15 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
         && !tyHasTyVar(dt)
         && tyAt(dt) is TyFunc
       const held = heldAt.get(c) ?? []
+      const hs = fvaOneSig(held)
+      if closed || hs >= 0 {
+        const cl = closedCalls[d] ?? []
+        cl.push(c)
+        closedCalls[d] = cl
+        callSig[c] = if closed { dt } else { hs }
+      } else {
+        notClosed[d] = true
+      }
       if closed || held.length == 0 {
         fvaReachSig(relaySig, d, if closed { dt } else { -1 })
       } else {
@@ -4495,6 +4533,68 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
     if s >= 0 && fvaOpenMakerCall(c) >= 0 {
       const at = fvaMakerResultAt(c, s)
       fvaReachSig(sigAt, c, if at >= 0 && assignable(at, s) { s } else { -1 })
+    }
+  }
+  for d in relays {
+    if (relaySig.get(d) ?? -2) == -1 && !(notClosed.get(d) ?? false) {
+      fvaRelayTwinRows(sigAt, rl, d, closedCalls.get(d) ?? [], callSig, innerOf)
+    }
+  }
+  return 0
+}
+
+// The one closed result every entry of `sigs` names, or -1 for none, an open one, or two.
+function fvaOneSig(sigs: i32[]): i32 {
+  let r = -1
+  for t in sigs {
+    if t < 0 || (r >= 0 && !tySame(r, t)) { return -1 }
+    r = t
+  }
+  return r
+}
+
+// Twins relay `d` per delivered result, as a maker is, where its calls (`callSig`, a held one at
+// its binding's one result) differ: each is noted at its own, and each maker call `d` returns is
+// banked at every one and noted at `ELAB_MAKER_PER_TWIN`, built per twin (D16755). Declines unless
+// `d` is read only as their callee and every value it returns is a maker call.
+function fvaRelayTwinRows(
+  sigAt: {[i32]: i32},
+  rl: FvaRelayScan,
+  d: i32,
+  calls: i32[],
+  callSig: {[i32]: i32},
+  innerOf: {[i32]: i32},
+) {
+  if calls.length < 2 || (rl.handedOn.get(d) ?? false) { return 0 }
+  const sigs: i32[] = []
+  for c in calls {
+    const dt = callSig.get(c) ?? -1
+    let seen = false
+    for t in sigs {
+      if tySame(t, dt) { seen = true }
+    }
+    if !seen { sigs.push(dt) }
+  }
+  const inner: i32[] = []
+  for c in innerOf.keys() {
+    if (innerOf.get(c) ?? -1) == d {
+      if fvaOpenMakerCall(c) < 0 { return 0 }
+      for s in sigs {
+        const at = fvaMakerResultAt(c, s)
+        if at < 0 || !assignable(at, s) { return 0 }
+      }
+      inner.push(c)
+    }
+  }
+  if inner.length == 0 { return 0 }
+  for c in calls { sigAt[c] = callSig.get(c) ?? -1 }
+  for x in inner {
+    const xn = nodeAt(x)
+    if xn is Call {
+      const r = parenPeelIx(xn.callFn)
+      const m = fvaMakerOfBinding(identDeclOf(r))
+      for s in sigs { elabMakerRowNote(m, s) }
+      elabMakerCallNote(x, ELAB_MAKER_PER_TWIN)
     }
   }
   return 0
