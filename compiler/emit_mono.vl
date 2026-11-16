@@ -104,6 +104,7 @@ import {
   eplSlotPerInstance,
   eplSlotSig,
   eplValueSig,
+  eplValueTy,
 } from "./emit_elab"
 import {
   mkNumTyped,
@@ -21101,6 +21102,86 @@ function monoPinHoleParam(
       if it >= 0 && it < T.tys.length && !tyHasTyVar(it) {
         an = if tyHoldsObj(it, 8) { monoRecordRowPin(it) } else { monoPinOfClosedTy(it) }
         if an != "" { anTy = it }
+      }
+    }
+    // A literal argument holding a list of functions below its top, or chosen by an `if`, pins at
+    // the type its place classes close (D16839); a tagged set's holder and other literals keep the
+    // rungs below.
+    const ax = unwrapParen(args[i])
+    const axn = if ax >= 0 && ax < P.nodes.length { nodeAt(ax) } else { null }
+    let nested = axn is IfStmt
+    if !nested && (axn is ObjLit || axn is ArrayLit) {
+      const qx: i32[] = [ax]
+      const qd: i32[] = [0]
+      let qk = 0
+      let tagged = false
+      while qk < qx.length && qk < 64 && !tagged {
+        const qn = nodeAt(qx[qk])
+        if fnTagPlaceRepOf(qx[qk]) >= 0 {
+          tagged = true
+        } else if qn is ObjLit {
+          for fx in qn.objFields {
+            const fi = nodeAt(fx)
+            if fi is FieldInit {
+              qx.push(unwrapParen(fi.fiValue))
+              qd.push(qd[qk] + 1)
+            }
+          }
+        } else if qn is ArrayLit {
+          for e in qn.arrElems {
+            const ex = unwrapParen(e)
+            if (
+              qd[qk] > 0
+              && ex >= 0
+              && nodeAt(ex) is Ident
+              && identFnDeclOf(ex) >= 0
+            ) {
+              nested = true
+            }
+            qx.push(ex)
+            qd.push(qd[qk] + 1)
+          }
+        }
+        qk = qk + 1
+      }
+      if tagged { nested = false }
+    }
+    if an == "" && nested {
+      const vt = eplValueTy(ax, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+      if vt >= 0 && vt < T.tys.length && !tyHasTyVar(vt) && !tyHoldsHole(vt) {
+        an = if tyHoldsObj(vt, 8) { monoRecordRowPin(vt) } else { monoPinOfClosedTy(vt) }
+        if an != "" {
+          anTy = vt
+          // A literal handed there, and each literal part of it, is built at that type's part,
+          // which its own checked type leaves open.
+          const lx: i32[] = [ax]
+          const lt: i32[] = [vt]
+          let lk = 0
+          while lk < lx.length && lk < 64 {
+            const xn = if lx[lk] >= 0 && lx[lk] < P.nodes.length { nodeAt(lx[lk]) } else { null }
+            const xt = if lt[lk] >= 0 && lt[lk] < T.tys.length { tyAt(lt[lk]) } else { null }
+            if xn is ObjLit && xt is TyObj {
+              nodeTyRecord(lx[lk], lt[lk])
+              for fx in xn.objFields {
+                const fi = nodeAt(fx)
+                if fi is FieldInit {
+                  const fj = strListIndexOf(xt.objFieldNames, fi.fiName)
+                  if fj >= 0 {
+                    lx.push(unwrapParen(fi.fiValue))
+                    lt.push(xt.objFieldTypes[fj])
+                  }
+                }
+              }
+            } else if xn is ArrayLit && xt is TyArray {
+              nodeTyRecord(lx[lk], lt[lk])
+              for e in xn.arrElems {
+                lx.push(unwrapParen(e))
+                lt.push(tyArrayElemIx(lt[lk]))
+              }
+            }
+            lk = lk + 1
+          }
+        }
       }
     }
     if an == "" {

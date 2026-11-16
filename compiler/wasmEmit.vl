@@ -23738,9 +23738,6 @@ function emitAsgLitAs(exprIx: i32, w: string, fnIx: i32): i32 {
   return emitNumLitAs(a.binRight, w)
 }
 
-// The node whose next emission the table widens at its recorded numeric pair, or -1.
-let numSeat = -1
-
 // The numeric pair (`numPairCode`) the checker recorded for `ix` at instance `fnIx`, at the node,
 // its unparenthesised form or the node it stands in for; -1 for none.
 function numRecordAt(ix: i32, fnIx: i32): i32 {
@@ -23798,26 +23795,28 @@ function emitNumOpOf(src: i32, dst: i32): i32 {
   )
 }
 
-// The widening of recorded numeric pair `r`.
-function emitNumPairOp(r: i32): i32 { return emitNumOpOf(numPairSrc(r), r % 8) }
-
 // A value of plain kind `src` the site derived, delivered at kind `dst`: the table widens it at the
 // checker's numeric pair where that names the same pair, else the site widens it, a named floor.
 // Returns 0, or -1 failed.
 function emitNumPlain(src: i32, dst: i32, exprIx: i32, fnIx: i32): i32 {
-  const why = numFloorWhy(src, dst, exprIx, fnIx)
   if boxDstShadowArmed() {
+    const why = numFloorWhy(src, dst, exprIx, fnIx)
     boxDstShadowAs(if why == "" { "table" } else { why })
     numPairShadowNote(src, dst, exprIx, fnIx)
   }
-  if why == "" {
-    const seat = numSeat
-    numSeat = exprIx
-    const r = emitExpr(exprIx, fnIx)
-    numSeat = seat
-    return r
-  }
   if emitExpr(exprIx, fnIx) < 0 { return -1 }
+  return numWidenTail(src, dst, exprIx, fnIx)
+}
+
+// After value `exprIx` of kind `src`, built as itself: its widening to kind `dst`. Where the
+// checker's record serves, a dead `never` operand has already written `unreachable` and needs none.
+export function numWidenTail(src: i32, dst: i32, exprIx: i32, fnIx: i32): i32 {
+  if (
+    numFloorWhy(src, dst, exprIx, fnIx) == ""
+    && exprReadsDeadNever(exprIx, fnIx)
+  ) {
+    return 0
+  }
   return emitNumOpOf(src, dst)
 }
 
@@ -28681,21 +28680,15 @@ export function idxStorePlanOf(target: Index, fnIx: i32): IdxStore | null {
   return st
 }
 
-// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32
-// or string list whose value builds as itself, with no arm unbox.
+// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32,
+// string or scalar-width list whose value builds as itself or widens, with no arm unbox.
 export function idxStorePlainWhy(
   st: IdxStore,
   arrIx: i32,
   rhs: i32,
   fnIx: i32,
 ): string {
-  if (
-    st.isRef
-    || st.isU8
-    || st.sk != null
-    || st.nestSlot >= 0
-    || st.unionNm != ""
-  ) {
+  if st.isRef || st.isU8 || st.nestSlot >= 0 || st.unionNm != "" {
     return "store element"
   }
   if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
@@ -29347,17 +29340,18 @@ export function pushPlanOf(callIx: i32, fnIx: i32): PushPlan | null {
   return null
 }
 
-// Why push plan `pp` is not the plain append the IR writes, or "": an i32 or string list
-// whose value builds as itself, with no arm unbox and no late receiver.
+// Why push plan `pp` is not the plain append the IR writes, or "": an i32, string or scalar-width
+// list whose value builds as itself or widens, with no arm unbox and no late receiver.
 export function pushPlainWhy(pp: PushPlan, fnIx: i32): string {
   const pv = pp.ppVal
-  if pp.ppSlot.rSlot >= 0 || pv.sk != null || pv.pushNestSlot >= 0 {
-    return "push element"
-  }
+  if pp.ppSlot.rSlot >= 0 || pv.pushNestSlot >= 0 { return "push element" }
   if pv.isLitArr || pv.isNbArr || pv.isNlluArr || pv.isNsArr {
     return "push element seed"
   }
-  if pp.ppSlot.base != pushScratchBase && !pv.isStr { return "push element" }
+  // A packed byte list is the one family left off the plain push scratch base.
+  if pv.sk == null && !pv.isStr && pp.ppSlot.base != pushScratchBase {
+    return "push element"
+  }
   if pv.isStr && exprIsLitAtom(pp.ppArg, fnIx) { return "push atom" }
   if boxOwedAtRecord(pp.ppArg, fnIx) { return "push box" }
   if narrowedArmNeedsUnbox(pp.ppArg, fnIx) { return "push arm" }
@@ -30976,7 +30970,6 @@ type CoerceKind = "none"
   | "box"
   | "unbox"
   | "atomstr"
-  | "numeric"
 
 // The coercion recorded at `ix` in instance `fnIx`. A box is the outer one: any other record
 // at the node converts the value inside it. Otherwise each record is of one value type (a list,
@@ -30985,7 +30978,6 @@ function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
   if boxAtTable(ix, fnIx) { return "box" }
   if armSeat >= 0 && ix == armSeat { return "unbox" }
   if atomSeat >= 0 && ix == atomSeat { return "atomstr" }
-  if numSeat >= 0 && ix == numSeat { return "numeric" }
   if listCopyAtNode(ix) >= 0 { return "listCopy" }
   if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
   if mapDeliveryRecorded {
@@ -31039,11 +31031,6 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     return rb
   }
   if ck == "atomstr" { return emitAtomStrAtRecord(exprIx, fnIx) }
-  if ck == "numeric" {
-    numSeat = -1
-    if emitExpr(exprIx, fnIx) < 0 { return -1 }
-    return emitNumPairOp(numRecordAt(exprIx, fnIx))
-  }
   if ck == "unbox" {
     // The seat is spent, so any other record at the node converts the value before the cast.
     armSeat = -1
@@ -36457,7 +36444,7 @@ export function emitUserGlobalGet(gi: i32) {
 
 // Writes the immediate `captureFoldedConsts` banked for folded const `gi`. A read before the
 // capture ran has no cell to fall back on, so it fails loudly.
-function emitFoldedConstRead(gi: i32) {
+export function emitFoldedConstRead(gi: i32) {
   if gi >= gFoldAt.length || gi >= gFoldLen.length || gFoldAt[gi] < 0 {
     return emitFail(
       "emitProgram: a folded module const read before its value was captured",
@@ -36695,7 +36682,6 @@ export function wasmEmitStateReset() {
   armSeat = -1
   armServed = -1
   atomSeat = -1
-  numSeat = -1
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
