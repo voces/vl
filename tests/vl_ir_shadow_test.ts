@@ -179,7 +179,7 @@ print(sel(true))
 // The decisions legacy and the lowering share (I1b): a reference global's read and its
 // `ref.as_non_null`, a never-returning callee's `call; unreachable`, and an instance's parameter
 // read; string operators, a char literal, a string list read and a void call's tail form (C2h);
-// an atom result and its literals (C2i).
+// an atom result and its literals (C2i); string `.slice` and `.cpLen` (C2j); a list push (C2k).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -196,6 +196,9 @@ print(guard(2))
   `function at(xs: string[], i: i32): string { return xs[i] }\nprint(at(["a", "b"], 1))\n`,
   `function note(s: string) { print(s) }\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
   `type K = "p" | "q"\nfunction pick(c: boolean): K {\n  if c { return "p" }\n  return "q"\n}\nprint(pick(true) == "p")\n`,
+  `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
+  `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
+  `let gs: i32[] = []\nfunction add(x: i32): i32 {\n  gs.push(x)\n  return gs.push(x + 1)\n}\nprint(add(1))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",

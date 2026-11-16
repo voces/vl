@@ -4729,7 +4729,7 @@ function emitFieldLitEq(r: i32, lex: string, fnIx: i32) {
 
 // `r is B` over a single record `r: A` or `A | null` where every `B` is an `A` but not the
 // reverse: the value fits when it is not null and each field `B` narrows holds a member of its
-// literal set (D3885, D4058). 0 when the test is not that shape, so the caller's rungs go on.
+// literal set, or an arm of its type (D3885, D4058, D16325). 0 when the test is not that shape.
 function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
@@ -4740,9 +4740,9 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   const sets: i32[] = []
   const shape = recFitNarrowedFields(objTy, isVarTyIxOf(isIx), names, sets)
   if shape < 0 { return 0 }
-  if shape == 0 {
+  if names.length == 0 {
     return emitFail(
-      "emitProgram: `is` over a record tests a field that is not a literal set narrowed from the declared field, which has no lowering yet",
+      "emitProgram: `is` over a record reached its field test with no field narrowed",
     )
   }
   // A receiver that is not a re-readable place (a call) is evaluated once into the `?.` stash.
@@ -4777,11 +4777,33 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   if !laidOut {
     return emitFail("emitProgram: `is` over a record whose layout is not known")
   }
-  const nullable = nodeTyIsNullable(recv)
+  // The instance's type decides: a generic receiver handed `A | null` is nullable there.
+  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
   if nullable && !exprNullableRefNiche(recv, fnIx) {
     return emitFail(
       "emitProgram: `is` over a nullable record that is not a nullable reference",
     )
+  }
+  // A field narrowed to a type rather than a literal set is tested by its box's arm tags.
+  const fieldTags: i32[][] = []
+  let fk = 0
+  while fk < names.length {
+    const k = fk
+    fk = fk + 1
+    const ft: i32[] = []
+    if tyLitSetMemberLexes(sets[k]).length == 0 {
+      const vis: i32[] = []
+      if (
+        !fieldRowIsUnionBox(rows[k])
+        || !unionArmTagsOfTy(sets[k], -1, ft, vis)
+        || listNeedsDiscrim(vis)
+      ) {
+        return emitFail(
+          "emitProgram: `is` over a record tests a field narrowed to a type its storage holds no tag for",
+        )
+      }
+    }
+    fieldTags.push(ft)
   }
   if staged {
     if emitExpr(recv, fnIx) < 0 { return -1 }
@@ -4796,6 +4818,36 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   let k = 0
   while k < names.length {
+    if fieldTags[k].length > 0 {
+      // The box ref itself may stand for `null`; a null held in the box is its own arm's tag.
+      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if nullable && !staged { fbRefAsNonNull() }
+      fbStructGet(heap, fis[k])
+      fbRefIsNull()
+      fbIf(127)
+      fbI32Const(if tyAdmitsNull(sets[k]) { 1 } else { 0 })
+      fbElse()
+      let ti = 0
+      while ti < fieldTags[k].length {
+        if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+        if nullable && !staged { fbRefAsNonNull() }
+        fbStructGet(heap, fis[k])
+        fbRefAsNonNull()
+        fbStructGet(uBoxIdx, 0)
+        fbI32Rel(RS_TAG, fieldTags[k][ti])
+        fbI32Bin(70) // i32.eq
+        if ti > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        ti = ti + 1
+      }
+      fbEnd()
+      if k > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      k = k + 1
+      continue
+    }
     // A nullable string field answers its null apart, then compares only non-null strings.
     const nulStr = fieldRowIsStr(rows[k], true)
     const lexes = tyLitSetMemberLexes(
@@ -4831,6 +4883,20 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   if nullable { fbEnd() }
   return 1
+}
+
+// Whether any variant row of `vis` shares its tag with a twin that only a field value parts.
+function listNeedsDiscrim(vis: i32[]): boolean {
+  for vi in vis {
+    if vi >= 0 && vi < uFieldCount.length {
+      let fp = 0
+      while fp < uFieldCount[vi] {
+        if variantDiscrimFieldNeeded(vi, fp) { return true }
+        fp = fp + 1
+      }
+    }
+  }
+  return false
 }
 
 // `xs is L[]` over a list whose elements are a wider type than the literal set `L`: true when
@@ -9702,6 +9768,8 @@ function emitNulNoneForEffect(exprIx: i32, fnIx: i32) {
 function emitNulNoneLeafForEffect(exprIx: i32, fnIx: i32) {
   const n = nodeAt(unwrapParen(exprIx))
   if n is NullLit || n is Ident { return 0 }
+  // A `?.` read off the `null` unit reads nothing past its receiver.
+  if n is OptMember { return emitNulNoneForEffect(n.omObj, fnIx) }
   // A `null`-typed `a ?? b` has a `null`-typed left, so both sides always run.
   const co = plainCoalesceAt(exprIx)
   if co != null {
@@ -21772,47 +21840,53 @@ function emitStrSlice(callIx: i32, fnIx: i32) {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
-      setStrScrI(1)                  // raw end → I1
-      setStrScrI(0)                  // raw start → I0
-      fbLocalSet(strScratchBase + 0) // local.set strScrA (receiver)
-      // I2 = len(s) — the HEADER's `len` (field 2). `array.len` here would be the BACKING's
-      // physical length, so a slice of a slice would clamp against its parent's extent.
-      pushStrScrRef(0)
-      fbStrLen()
-      setStrScrI(2)
-      // I0 = clamp(rawStart, len)
-      if emitClampIdx(0, 2) < 0 { return -1 }
-      setStrScrI(0)
-      // I1 = clamp(rawEnd, len)
-      if emitClampIdx(1, 2) < 0 { return -1 }
-      setStrScrI(1)
-      // I3 = out length = max(end - start, 0) = select( end-start, 0, end > start )
-      pushStrScrI(1)
-      pushStrScrI(0)
-      fbI32Bin(107) // 0x6b i32.sub → end - start   [a]
-      fbI32Const(0) // i32.const 0                  [b]
-      pushStrScrI(1)
-      pushStrScrI(0)
-      fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
-      fbSelect()
-      setStrScrI(3)
-      // The VIEW: same backing, start biased by the receiver's own start, len = I3. This is
-      // the whole lowering now — no allocation of elements, no copy.
-      pushStrScrRef(0)
-      fbStrBack()    // field 0: the SHARED backing
-      pushStrScrRef(0)
-      fbStrStart()   // field 1: the receiver's own start …
-      pushStrScrI(0)
-      fbI32Bin(106)  // 0x6a i32.add — … plus the clamped slice start
-      pushStrScrI(3) // field 2: len = max(end - start, 0)
-      fbStrNew()     // 0xfb 0x00 <string header>
-      return 0
+      return strSliceTail()
     }
     return emitFail(
       "emitProgram: string .slice receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string slice call")
+}
+
+// `s.slice(start, end)` over its receiver, start and end on the stack: a view of the receiver's
+// backing over the clamped range, with no copy.
+export function strSliceTail() {
+  setStrScrI(1)                  // raw end → I1
+  setStrScrI(0)                  // raw start → I0
+  fbLocalSet(strScratchBase + 0) // local.set strScrA (receiver)
+  // I2 = len(s) — the HEADER's `len` (field 2). `array.len` here would be the BACKING's
+  // physical length, so a slice of a slice would clamp against its parent's extent.
+  pushStrScrRef(0)
+  fbStrLen()
+  setStrScrI(2)
+  // I0 = clamp(rawStart, len)
+  if emitClampIdx(0, 2) < 0 { return -1 }
+  setStrScrI(0)
+  // I1 = clamp(rawEnd, len)
+  if emitClampIdx(1, 2) < 0 { return -1 }
+  setStrScrI(1)
+  // I3 = out length = max(end - start, 0) = select( end-start, 0, end > start )
+  pushStrScrI(1)
+  pushStrScrI(0)
+  fbI32Bin(107) // 0x6b i32.sub → end - start   [a]
+  fbI32Const(0) // i32.const 0                  [b]
+  pushStrScrI(1)
+  pushStrScrI(0)
+  fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
+  fbSelect()
+  setStrScrI(3)
+  // The VIEW: same backing, start biased by the receiver's own start, len = I3. This is
+  // the whole lowering now — no allocation of elements, no copy.
+  pushStrScrRef(0)
+  fbStrBack()    // field 0: the SHARED backing
+  pushStrScrRef(0)
+  fbStrStart()   // field 1: the receiver's own start …
+  pushStrScrI(0)
+  fbI32Bin(106)  // 0x6a i32.add — … plus the clamped slice start
+  pushStrScrI(3) // field 2: len = max(end - start, 0)
+  fbStrNew()     // 0xfb 0x00 <string header>
+  return 0
 }
 
 // Lower `s.indexOf(sub)` (or `s.includes(sub)`), leaving an i32: the first index of `sub`
@@ -22078,14 +22152,19 @@ function emitStrCpLen(callIx: i32, fnIx: i32) {
     const callee = nodeAt(c.callFn)
     if callee is Member {
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      fbCall(helpUtf8CpLenFn())
-      return 0
+      return strCpLenTail()
     }
     return emitFail(
       "emitProgram: string .cpLen receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string cpLen call")
+}
+
+// `s.cpLen()` over its receiver on the stack: the shared UTF-8 code point count helper.
+export function strCpLenTail() {
+  fbCall(helpUtf8CpLenFn())
+  return 0
 }
 
 // Lower `s.isCharBoundary(i)` (Rust's primitive, O(1)): does byte `i` begin a UTF-8
@@ -28833,6 +28912,11 @@ function emitAssignUnder(binIx: i32, fnIx: i32) {
 // can test the raw cell); this slot is a non-null wrapper ref instead, safe by narrowing.
 function stageListRecv(objIx: i32, fnIx: i32, base: i32) {
   if emitExpr(objIx, fnIx) < 0 { return -1 }
+  return stageListRecvTail(objIx, fnIx, base)
+}
+
+// After a staged list-op receiver's read: its recover where owed, then the frame's `recvRef`.
+export function stageListRecvTail(objIx: i32, fnIx: i32, base: i32) {
   const r = nodeAt(unwrapParen(objIx))
   if r is Ident {
     if globalNulListCellRead(fnIx, unwrapParen(objIx)) {
@@ -28896,6 +28980,17 @@ function listOpRecvLocal(
   refSlot: i32,
   op: string,
 ): i32 {
+  const held = listOpRecvHeld(objIx, fnIx, op)
+  if held != -1 { return if held == -2 { -1 } else { held } }
+  // A field, an index, a call, or a parenthesised, `??` or `if` value (SP-044): any
+  // expression yielding the wrapper ref, evaluated once so the op's reads share it.
+  const sb = listOpStageBase(base, refSlot)
+  if stageListRecv(objIx, fnIx, sb) < 0 { return -1 }
+  return sb + 3
+}
+
+// The local list-op receiver `objIx` already is, -1 when it is staged, or -2 after a refusal.
+export function listOpRecvHeld(objIx: i32, fnIx: i32, op: string): i32 {
   const recv = nodeAt(objIx)
   if recv is Ident {
     if !listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
@@ -28903,7 +28998,8 @@ function listOpRecvLocal(
       // reads the arm's own, and a push lands there when the arm keeps it (D4934).
       const fitSh = listFitShadowRead(recv.identName, objIx, fnIx)
       if fitSh >= 0 && op == ".push" && !listFitGrowHolds(fitSh) {
-        return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+        emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+        return -2
       }
       if fitSh >= 0 { return fitSh }
       // A closure's stand-in for such a list is its own, and a push into it would be lost.
@@ -28911,7 +29007,8 @@ function listOpRecvLocal(
         op == ".push"
         && listFitCaptureStandIn(recv.identName, objIx, fnIx, true, []) >= 0
       ) {
-        return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+        emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+        return -2
       }
       const lIdx = localIndexOf(fnIx, objIx)
       if lIdx >= 0 { return lIdx }
@@ -28921,15 +29018,12 @@ function listOpRecvLocal(
         !identIsEnvCapture(fnIx, recv.identName)
         && globalIndexOfSid(sidOfNode(objIx)) < 0
       ) {
-        return emitFail("emitProgram: " + op + " receiver is not a list local")
+        emitFail("emitProgram: " + op + " receiver is not a list local")
+        return -2
       }
     }
   }
-  // A field, an index, a call, or a parenthesised, `??` or `if` value (SP-044): any
-  // expression yielding the wrapper ref, evaluated once so the op's reads share it.
-  const sb = listOpStageBase(base, refSlot)
-  if stageListRecv(objIx, fnIx, sb) < 0 { return -1 }
-  return sb + 3
+  return -1
 }
 
 // Lower a `recv.push(x)` member-call statement — the growable-list append, inlined rather
@@ -29103,75 +29197,135 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
     if c.callArgs.length != 1 || hasSpreadItem(c.callArgs) {
       return emitPushMany(callIx, fnIx, wantValue)
     }
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      // the receiver must produce a list — a bare list local/param or a struct-field array
-      // read. Both `exprArray`/`exprRefArray` classify a `Member` field read already, so a
-      // field receiver only needs its wrapper ref materialized into `recvRef`.
-      const isRef = exprRefArray(callee.memObj, fnIx)
-      const isStr = exprStringArray(callee.memObj, fnIx)
-      const sk = numListElemOf(exprListRep(callee.memObj, fnIx))
-      const isU8 = exprU8Array(callee.memObj, fnIx)
-      // a literal-union array push (`xs.push("a")` over `xs: K[]`) rides the i32-list
-      // spine, but the pushed member literal must lower as its atom id — seeded through
-      // the declaration fallback (`arrElemLitUnionTy`), since a monomorphized instance's
-      // receiver ident is shared with the generic body and the direct probe answers false.
-      const isLitArr = arrElemLitUnionTy(callee.memObj, fnIx) >= 0
-      // a `(boolean | null)[]` push also rides the i32-list spine, but a `null` value must
-      // lower as the sentinel 2.
-      const isNbArr = (arrElemIsNulBoolAt(callee.memObj, fnIx)
-        || arrElemIsNullUnitAt(callee.memObj, fnIx))
-      // a `(K | null)[]` push rides the same spine: a member literal lowers as its atom
-      // id, a `null` as the `-1` sentinel — seed both for the value emit.
-      const isNlluArr = nodeArrayElemIsNulLitUnion(callee.memObj)
-      // a `(string | null)[]` push rides the string-list spine, but a `null` value must
-      // lower as `ref.null $sTypeIdx` — seeded the same way `emitArr` seeds that list's
-      // element literals; without it a bare `null` push hit the bare-null reject.
-      const isNsArr = arrElemIsNulStrAt(callee.memObj, fnIx)
-      if (
-        !isRef
-        && !isStr
-        && sk == null
-        && !isU8
-        && !exprArray(callee.memObj, fnIx)
-      ) {
-        return emitFail("emitProgram: .push receiver is not a list")
-      }
-      const pv: PushValKinds = {
-        sk: sk,
-        pushNestSlot: -1,
-        isLitArr: isLitArr,
-        isNbArr: isNbArr,
-        isNlluArr: isNlluArr,
-        isNsArr: isNsArr,
-        isStr: isStr,
-      }
-      const ps = pushSlotOf(callee.memObj, fnIx, isRef, isU8, pv)
-      if ps == null { return -1 }
-      if c.callArgs.length != 1 {
-        return emitFail(
-          "emitProgram: internal: the one-argument .push reached with another count — `emitPush` routes every other count to `emitPushMany`",
-        )
-      }
-      return emitPushOne(
-        callIx,
-        callee.memObj,
-        c.callArgs[0],
-        fnIx,
-        ps,
-        pv,
-        wantValue,
-      )
-    }
+    const pp = pushPlanOf(callIx, fnIx)
+    if pp == null { return -1 }
+    return emitPushOne(
+      callIx,
+      pp.ppRecv,
+      pp.ppArg,
+      fnIx,
+      pp.ppSlot,
+      pp.ppVal,
+      wantValue,
+    )
   }
   return emitFail("emitProgram: expected a .push call")
+}
+
+// A one-argument `.push`: its receiver, its argument, where it appends and the element rep its
+// value builds at.
+export type PushPlan = {
+  ppRecv: i32,
+  ppArg: i32,
+  ppSlot: PushSlot,
+  ppVal: PushValKinds,
+}
+
+// The plan of one-argument `.push` call `callIx`, or null after recording the refusal.
+export function pushPlanOf(callIx: i32, fnIx: i32): PushPlan | null {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 { return null }
+  const callee = nodeAt(c.callFn)
+  if callee is Member {
+    // the receiver must produce a list — a bare list local/param or a struct-field array
+    // read. Both `exprArray`/`exprRefArray` classify a `Member` field read already, so a
+    // field receiver only needs its wrapper ref materialized into `recvRef`.
+    const isRef = exprRefArray(callee.memObj, fnIx)
+    const isStr = exprStringArray(callee.memObj, fnIx)
+    const sk = numListElemOf(exprListRep(callee.memObj, fnIx))
+    const isU8 = exprU8Array(callee.memObj, fnIx)
+    // a literal-union array push (`xs.push("a")` over `xs: K[]`) rides the i32-list
+    // spine, but the pushed member literal must lower as its atom id — seeded through
+    // the declaration fallback (`arrElemLitUnionTy`), since a monomorphized instance's
+    // receiver ident is shared with the generic body and the direct probe answers false.
+    const isLitArr = arrElemLitUnionTy(callee.memObj, fnIx) >= 0
+    // a `(boolean | null)[]` push also rides the i32-list spine, but a `null` value must
+    // lower as the sentinel 2.
+    const isNbArr = (arrElemIsNulBoolAt(callee.memObj, fnIx)
+      || arrElemIsNullUnitAt(callee.memObj, fnIx))
+    // a `(K | null)[]` push rides the same spine: a member literal lowers as its atom
+    // id, a `null` as the `-1` sentinel — seed both for the value emit.
+    const isNlluArr = nodeArrayElemIsNulLitUnion(callee.memObj)
+    // a `(string | null)[]` push rides the string-list spine, but a `null` value must
+    // lower as `ref.null $sTypeIdx` — seeded the same way `emitArr` seeds that list's
+    // element literals; without it a bare `null` push hit the bare-null reject.
+    const isNsArr = arrElemIsNulStrAt(callee.memObj, fnIx)
+    if (
+      !isRef
+      && !isStr
+      && sk == null
+      && !isU8
+      && !exprArray(callee.memObj, fnIx)
+    ) {
+      emitFail("emitProgram: .push receiver is not a list")
+      return null
+    }
+    const pv: PushValKinds = {
+      sk: sk,
+      pushNestSlot: -1,
+      isLitArr: isLitArr,
+      isNbArr: isNbArr,
+      isNlluArr: isNlluArr,
+      isNsArr: isNsArr,
+      isStr: isStr,
+    }
+    const ps = pushSlotOf(callee.memObj, fnIx, isRef, isU8, pv)
+    if ps == null { return null }
+    const pp: PushPlan = {
+      ppRecv: callee.memObj,
+      ppArg: c.callArgs[0],
+      ppSlot: ps,
+      ppVal: pv,
+    }
+    return pp
+  }
+  emitFail("emitProgram: expected a .push call")
+  return null
+}
+
+// Why push plan `pp` is not the plain append the IR writes, or "": an i32 or string list
+// whose value builds as itself, with no arm unbox and no late receiver.
+export function pushPlainWhy(pp: PushPlan, fnIx: i32): string {
+  const pv = pp.ppVal
+  if pp.ppSlot.rSlot >= 0 || pv.sk != null || pv.pushNestSlot >= 0 {
+    return "push element"
+  }
+  if pv.isLitArr || pv.isNbArr || pv.isNlluArr || pv.isNsArr {
+    return "push element seed"
+  }
+  if pp.ppSlot.base != pushScratchBase && !pv.isStr { return "push element" }
+  if pv.isStr && exprIsLitAtom(pp.ppArg, fnIx) { return "push atom" }
+  if boxOwedAtRecord(pp.ppArg, fnIx) { return "push box" }
+  if narrowedArmNeedsUnbox(pp.ppArg, fnIx) { return "push arm" }
+  if (exprPopBits(pp.ppArg, fnIx) & 512) != 0 { return "push late receiver" }
+  return ""
+}
+
+// After a plain push's value is on the stack: its recover where owed, then its stage.
+export function pushValueTail(pp: PushPlan, fnIx: i32) {
+  if nulNicheRecoverOwed(pp.ppSlot.destKind, pp.ppArg, fnIx) {
+    fbRefAsNonNull()
+  }
+  fbLocalSet(pp.ppSlot.base)
+  return 0
+}
+
+// The append of a plain push whose receiver is in local `lIdx` and value staged.
+export function pushAppendTail(
+  callIx: i32,
+  pp: PushPlan,
+  lIdx: i32,
+  wantValue: boolean,
+) {
+  const ps = pp.ppSlot
+  emitPushAppend(callIx, lIdx, ps.lTy, ps.aTy, ps.base, wantValue)
+  return 0
 }
 
 // Where a one-argument `.push` appends: the list's wrapper and backing types, its push
 // scratch base, the element-value seeds (declared struct, variant hint, narrowed-arm heap),
 // the value slot's rep kind for the non-null recover, and the ref-list row or -1.
-type PushSlot = {
+export type PushSlot = {
   lTy: i32,
   aTy: i32,
   base: i32,
@@ -29294,7 +29448,7 @@ function emitPushOne(
 
 // Which element rep a one-argument `.push` builds its value at: the scalar widths, the nested
 // list a ref list's element names, and the atom and niche seeds. A union box is the record's.
-type PushValKinds = {
+export type PushValKinds = {
   sk: VKind | null,
   pushNestSlot: i32,
   isLitArr: boolean,

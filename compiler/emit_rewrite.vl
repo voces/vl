@@ -1813,6 +1813,45 @@ function drwWalkOptMember(ix: i32, n: OptMember, ctx: i32): i32 {
   return ix
 }
 
+// The receiver of `?.` read `x?.f` or call `x?.f(…)` at `e`, or -1.
+function drwOptRecvOf(e: i32): i32 {
+  const x = unwrapParen(e)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  return match n {
+    OptMember => n.omObj
+    Call => {
+      const f = if n.callFn >= 0 && n.callFn < P.nodes.length { nodeAt(n.callFn) } else { null }
+      if f is OptMember { f.omObj } else { -1 }
+    }
+    // No other node reads through a `?.`.
+    Ident | NumLit | StrLit | CharLit | BoolLit | NullLit | Paren | Member | Index | Unary | BinExpr | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => -1
+  }
+}
+
+// Whether `?.` receiver `recv` is a read with no effect that is only ever `null`: typed `null`,
+// or a binding initialised `null` whose type is a bare type variable or `null`, which no
+// instance fills. The chain reads `null`, whatever follows it.
+function drwNullOnlyRecv(recv: i32): boolean {
+  if recv < 0 || recv >= P.nodes.length { return false }
+  const r = unwrapParen(recv)
+  if r < 0 || r >= P.nodes.length || !exprReReadable(r) { return false }
+  const t = nodeTyIxOf(r)
+  if t == TY_NULL { return true }
+  const o = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(o is TyNullable) || o.nInner >= T.tys.length { return false }
+  // An inner type nothing inferred (`_`) or a type variable.
+  if o.nInner >= 0 && !(tyAt(o.nInner) is TyVar) { return false }
+  const rn = nodeAt(r)
+  if !(rn is Ident) { return false }
+  const d = identDeclOf(r)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return dn is LetDecl
+    && dn.letType < 0
+    && dn.letInit >= 0
+    && nodeAt(unwrapParen(dn.letInit)) is NullLit
+}
+
 // Whether `recv`'s checked type has a field `name` of function type, gated on some record
 // declaring a field of that name, since most programs declare no operator field at all.
 function drwRecvFieldIsFn(recv: i32, name: string): boolean {
@@ -2185,6 +2224,12 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         return crIf
       }
     }
+  }
+  // `x?.f ?? d` or `x?.f(…) ?? d` over a receiver only ever `null` is `d`: the chain reads
+  // `null`, and the call's arguments are never evaluated (D16828).
+  if n.binOp == "??" && drwNullOnlyRecv(drwOptRecvOf(n.binLeft)) {
+    capMemoNoteEdit()
+    return drwWalk(n.binRight, ctx)
   }
   n.binLeft = drwWalk(n.binLeft, ctx)
   n.binRight = drwWalk(n.binRight, ctx)
