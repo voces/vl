@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **D16695 closed:** an un-annotated binding of a fresh list holding a generic function name, spread into a push in a generic body (`const src = [id]; rs.push(...src)`), passed the check and trapped at its second instance; it now runs at each instance, and the record spelling (`[{ f: id }]`), which the emitter refused, runs too. The elaboration's place graph and delivery walk follow a list spread into a push to the receiver's elements, as they followed one spread into a list literal. Filed D16698 (a field receiver `o.rs.push(...src)` and a spread initialiser `= [...src]` still trap) and D16699 (an un-annotated list a generic function name is pushed onto is refused when returned).
