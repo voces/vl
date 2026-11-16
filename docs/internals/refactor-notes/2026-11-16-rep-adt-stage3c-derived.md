@@ -33,7 +33,7 @@ Both populations, armed: `tests/cases` and `std` (8,259 modules) plus the distil
 
 | verdict | reads | files |
 |---|---|---|
-| derived, agrees with the stored code | 568,733 | 9,519 |
+| derived, agrees with the stored code | 568,776 | 9,520 |
 | derived, **moved** | **0** | |
 | kept, D16720 hole row | 649 | 18 |
 | kept, D16721 function field, stored differs | 49 | 3 |
@@ -47,13 +47,13 @@ all 3 files.
 
 ## Identity and cost
 
-Both seeds are fixpoints. The base is master `d30dbc538`.
+Both seeds are fixpoints. The base is master `c65ab77eb`; the fuel pair was read on `d30dbc538`.
 
 | | |
 |---|---|
-| `corpuscmp.vl` (`tests/cases`, `std`) | 8,289 modules: 6,928 identical, **0 DIFFER, 0 LOST** |
-| distilled cells and named, built with both seeds | 8,902 buildable: **8,902 identical** |
-| seed size | 6,377,064 → 6,377,711 (+647 bytes) |
+| `corpuscmp.vl` (`tests/cases`, `std`) | 8,292 modules: 6,930 identical, **0 DIFFER, 0 LOST** |
+| distilled cells and named, built with both seeds | 8,905 buildable: **8,905 identical** |
+| seed size | 6,376,429 → 6,377,080 (+651 bytes) |
 | L2 self-compile fuel | 90,974,799,348 → 91,214,748,864 (+0.26%: one `repOfTy` per read) |
 | net compiler lines | +50 |
 | pin-helper delta | 0 |
