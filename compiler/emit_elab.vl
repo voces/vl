@@ -447,6 +447,7 @@ import {
 } from "./tyquery"
 import {
   declOrigOf,
+  fnOnlyReturnsParam,
   identDeclOf,
   lvCarrierLoopOf,
   memberDeclOf,
@@ -2951,9 +2952,9 @@ function elabCloBundlePinTaken(ck: i32, p: i32, pin: i32): boolean {
 
 // Whether function type `f` names a literal in its result or a parameter, under a union.
 function elabSigHasLit(f: TyFunc): boolean {
-  if tyHasLitLeaf(f.fnRet, 4) { return true }
+  if tyHasLitLeaf(f.fnRet) { return true }
   for pt in f.fnParamTypes {
-    if tyHasLitLeaf(pt, 4) { return true }
+    if tyHasLitLeaf(pt) { return true }
   }
   return false
 }
@@ -14530,8 +14531,8 @@ export function elabCheckedTyOf(ix: i32): i32 {
 
 // The closed function types slot `path` (steps `e`, `v`, `f.<name>`) of binding or literal `d` is
 // delivered at in instance `k` and the instances it reaches (every instance at -1): each read's
-// recorded destination (`recordCtxTy`), each call through a read, and the slot's own closed type.
-// A literal answers for the bindings holding it.
+// destination, each call through a read, and the slot's own closed type. Only mono's pin readers
+// ask it, mid-rewrite, which the place classes cannot answer; they move to a pin table (D16768).
 export function elabSlotDeliveries(d0: i32, path: string[], k: i32): i32[] {
   // A literal or name an instance minted after the write index has no index facts to read; a
   // binding answers through its source (`declOrigOf`).
@@ -15426,7 +15427,10 @@ function elabCbAtBuild(c: i32, from: i32) {
   const tys: i32[] = []
   if an is Ident {
     names.push("?" + f.fnName + ".0")
-    tys.push(tyElemOf(la))
+    // A `map` callback handing each element back is instanced at the build, its result with it.
+    tys.push(
+      if m.memProp == "map" && fnOnlyReturnsParam(fd) { bt } else { tyElemOf(la) },
+    )
   } else if (
     from < 0
     && (elabEncl[fd] ?? -1) >= 0
@@ -15496,13 +15500,28 @@ function elabHeldFieldInit(r: i32, f: string): i32 {
   return vals[0]
 }
 
+// Whether `m` is `map` and call `cn`'s one callback, a lambda or a named function, hands each
+// element back (D16211).
+function elabMapKeepsElems(m: string, cn: Call): boolean {
+  if m != "map" || cn.callArgs.length != 1 { return false }
+  const a = parenPeelIx(cn.callArgs[0])
+  const an = if a >= 0 { nodeAt(a) } else { null }
+  const fd = if an is FuncDecl { a } else if an is Ident { identDeclOf(a) } else { -1 }
+  return fnOnlyReturnsParam(fd)
+}
+
 // Stamps a `filter` or `slice` call `c` with the list of the record its receiver's elements are
 // stored at, where that is another than its element type: the result holds the same elements.
 function elabSameSlotsAtBuild(c: i32) {
   const cn = nodeAt(c)
   if !(cn is Call) || cn.callFn < 0 { return 0 }
   const m = nodeAt(parenPeelIx(cn.callFn))
-  if !(m is Member) || (m.memProp != "filter" && m.memProp != "slice") {
+  if (
+    !(m is Member)
+    || (m.memProp != "filter"
+      && m.memProp != "slice"
+      && !elabMapKeepsElems(m.memProp, cn))
+  ) {
     return 0
   }
   const lt = nodeTyIxOf(c)
@@ -15722,6 +15741,8 @@ export function elabLamDeliveredParams(lam: i32, n: i32): i32[] {
 // parameter types count: an instance's own calls, not its siblings'.
 function elabLamDeliveredRet(lam: i32, n: i32, own: i32): i32 {
   if lam < 0 || lam >= cwIxCoveredLen() { return -1 }
+  const tw = elabTwinLamRet(lam, n, own)
+  if tw >= 0 { return tw }
   const was = elabDlvKey
   const wasAdmit = elabDlvAdmit
   elabDlvKey = elabWalkTop()
@@ -15756,6 +15777,24 @@ function elabLamDeliveredRet(lam: i32, n: i32, own: i32): i32 {
     }
   }
   return r
+}
+
+// The result of the wide twin of a maker that returns lambda `lam` whole, where the instance being
+// walked is that lambda's under the twin, or the twin itself: each twin is a closure per delivered
+// result, so its lambda returns that result (D16753). -1 otherwise.
+function elabTwinLamRet(lam: i32, n: i32, own: i32): i32 {
+  let p = elabWalkTop()
+  if p >= 0 && p < ekDecl.length && ekDecl[p] == lam { p = ekParent[p] }
+  if p < 0 || p >= ekDecl.length { return -1 }
+  const w = ekRetWide[p] ?? -1
+  const f = if w >= 0 && w < T.tys.length { tyAt(w) } else { null }
+  const of = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  if !(f is TyFunc) || f.fnParamTypes.length != n || f.fnRet < 0 { return -1 }
+  if of is TyFunc && !elabSameParams(f, of) { return -1 }
+  for lf in recFnValueLeaves(ekDecl[p]) {
+    if parenPeelIx(lf) == lam { return f.fnRet }
+  }
+  return -1
 }
 
 // The numeric result lambda `lam` is called at (`elabLamDeliveredRet`, `own` as there), where its
