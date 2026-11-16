@@ -18276,6 +18276,29 @@ export function idxCellReadIsNull(idxIx: i32, fnIx: i32): boolean {
   return cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx))
 }
 
+// The arm `emitIndex` lowers read `nd` by, from its receiver's rep, in the order the reps must be
+// asked: the nullable and string-element lists before the plain scalar list, which does not see
+// through either. A shared cell's null read is asked before this.
+export type IdxArm = "twolists"
+  | "nulscalar"
+  | "ref"
+  | "nulstr"
+  | "str"
+  | "scalar"
+  | "string"
+  | "none"
+
+export function idxArmOf(nd: Index, fnIx: i32): IdxArm {
+  if twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx) != "" { return "twolists" }
+  if exprNulScalarListKind(nd.idxArr, fnIx) != null { return "nulscalar" }
+  if exprRefArray(nd.idxArr, fnIx) { return "ref" }
+  if exprNulStrArray(nd.idxArr, fnIx) { return "nulstr" }
+  if exprStringArray(nd.idxArr, fnIx) { return "str" }
+  if scalarListElemKind(nd.idxArr, fnIx) != null { return "scalar" }
+  if exprString(nd.idxArr, fnIx) { return "string" }
+  return "none"
+}
+
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
   if nd is Index {
@@ -18284,62 +18307,46 @@ function emitIndex(idxIx: i32, fnIx: i32) {
     if idxCellReadIsNull(idxIx, fnIx) {
       if emitNullReadAtDst(idxIx, fnIx) { return 0 }
     }
-    const tlm = twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx)
-    if tlm != "" { return emitFailAt(tlm, idxIx) }
-    // A DISTINCT-backing nullable scalar list `t[i]` (narrowed inside `if t != null`): the slot is
-    // `(ref null $wrapper)`, so recover non-null (the guard proved it present) then read as the leaf
-    // list. Checked FIRST — the plain classifiers below do not see through the `| null`.
-    const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
-    if nsk != null { return emitIndexNulScalarList(nd, nsk, fnIx) }
-    // A REF list `xs[i]`.
-    if exprRefArray(nd.idxArr, fnIx) {
-      return emitIndexRefList(nd, idxIx, fnIx)
+    return match idxArmOf(nd, fnIx) {
+      "twolists" => emitFailAt(twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx), idxIx)
+      "nulscalar" => emitIndexNulScalarList(nd, fnIx)
+      "ref" => emitIndexRefList(nd, idxIx, fnIx)
+      // A `(string | null)[]` element stays nullable unless the checker types it non-null.
+      "nulstr" => emitIndexStrList(nd, fnIx, nodeTyProvesNonNull(idxIx))
+      "str" => emitIndexStrList(nd, fnIx, true)
+      "scalar" => emitIndexScalarList(nd, fnIx)
+      "string" => emitIndexRawString(nd, fnIx)
+      "none" => emitFail("emitProgram: index receiver is not an array or string")
     }
-    // A `(string | null)[]` `xs[i]` → the SAME string backing, but the element legitimately holds
-    // `null` (it is a `(ref null $aTypeIdx)`), so the read STAYS nullable — NO `ref.as_non_null`. The
-    // bound value is a `nulstr` the caller narrows with `!= null` (`nodeTyIsNulString` classifies it).
-    // Checked BEFORE `exprStringArray` (whose non-null recovery would trap on a null element).
-    if exprNulStrArray(nd.idxArr, fnIx) {
-      if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
-      // A read the checker types non-null recovers here for the same reason the ref-list arm
-      // does — this is the `(new string | null)[]` rep, eight of D451's 56 cells, and
-      // the one the row's "box rather than a niche" mechanism mis-classified.
-      if nodeTyProvesNonNull(idxIx) { fbRefAsNonNull() }
-      return 0
-    }
-    // A STRING list `xs[i]` → the string backing's element, then `ref.as_non_null` to
-    // surface the non-null string ref. (Checked before the i32 path: a string element is not an i32.)
-    if exprStringArray(nd.idxArr, fnIx) {
-      if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
-      fbRefAsNonNull() // (recover the non-null string)
-      return 0
-    }
-    // A SCALAR list `xs[i]` (f64/i64 checked before i32 since their elements are not i32).
-    const ek = scalarListElemKind(nd.idxArr, fnIx)
-    if ek != null { return emitIndexScalarList(nd, ek, fnIx) }
-    if !exprString(nd.idxArr, fnIx) {
-      return emitFail("emitProgram: index receiver is not an array or string")
-    }
-    // A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]`
-    // behind the `i u< len` guard that keeps an out-of-range index trapping instead of
-    // reading past the view into the rest of the backing. A binding with a live
-    // loop-hoisted header skips the receiver entirely and reads three locals.
-    const shz = liveHoistRow(nd.idxArr, "list", 0 - 1)
-    if shz < 0 {
-      if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
-    }
-    if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
-    if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
-    fbArrayGet(sBackTy()) // 0xfb 0x0b <string backing array type index>
-    return 0
   }
   return emitFail("emitProgram: expected an index access")
 }
 
-// A DISTINCT-backing nullable scalar list `t[i]` of kind `nsk`, narrowed inside `if t != null`:
-// the slot is `(ref null $wrapper)`, so it recovers non-null (the guard proved it present) and
-// reads as the leaf list. Returns 0, or -1 when an operand fails.
-function emitIndexNulScalarList(nd: Index, nsk: VKind, fnIx: i32): i32 {
+// A string list's element, recovered non-null when `nonNull`.
+function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
+  if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
+  if nonNull { fbRefAsNonNull() }
+  return 0
+}
+
+// A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]` behind the
+// `i u< len` guard. A binding with a live loop-hoisted header skips the receiver entirely.
+function emitIndexRawString(nd: Index, fnIx: i32): i32 {
+  const shz = liveHoistRow(nd.idxArr, "list", 0 - 1)
+  if shz < 0 {
+    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
+  fbArrayGet(sBackTy()) // 0xfb 0x0b <string backing array type index>
+  return 0
+}
+
+// A DISTINCT-backing nullable scalar list `t[i]`, narrowed inside `if t != null`: the slot is
+// `(ref null $wrapper)`, so it recovers non-null (the guard proved it present) and reads as the
+// leaf list. Returns 0, or -1 when an operand fails.
+function emitIndexNulScalarList(nd: Index, fnIx: i32): i32 {
+  const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
   if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
@@ -18357,7 +18364,7 @@ function emitIndexNulScalarList(nd: Index, nsk: VKind, fnIx: i32): i32 {
   // `nek` names the leaf element kind whose wrapper / backing / index-scratch pool this
   // read uses; `u8list` is the packed-byte leaf's spelling (the element is a plain i32,
   // so the kind names the list, not a scalar).
-  const nek = scalarListElemOfListKind(nulListBase(nsk) ?? "i32")
+  const nek = if nsk == null { null } else { scalarListElemOfListKind(nulListBase(nsk) ?? "i32") }
   if nek == null {
     return emitFail(
       "emitProgram: a nullable scalar list read has no element kind",
@@ -18453,35 +18460,53 @@ function emitIndexStrListRead(nd: Index, fnIx: i32): i32 {
   return 0
 }
 
-// A SCALAR list `xs[i]` of element kind `ek`: unwrap to its backing and `array.get <back>`,
+// A SCALAR list `xs[i]`: unwrap to its backing and `array.get <back>`,
 // yielding the element in its valtype rep. Returns 0, or -1 on a refusal or a failed operand.
-function emitIndexScalarList(nd: Index, ek: VKind, fnIx: i32): i32 {
-  if !scalarListUsed(ek) {
+function emitIndexScalarList(nd: Index, fnIx: i32): i32 {
+  const ek = scalarListElemKind(nd.idxArr, fnIx)
+  if ek == null || !scalarListUsed(ek) {
     return emitFail("emitProgram: index access but list type not collected")
   }
-  const skHz = liveHoistRow(
+  const hz = scalarListHoistOf(nd, ek, fnIx)
+  if hz < 0 {
+    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  return scalarListGetTail(nd, ek, fnIx, hz)
+}
+
+// The scalar list read both emitters write, in two halves around its operands. This half: the
+// live loop hoist holding the receiver, or -1; under one the receiver is not written.
+export function scalarListHoistOf(nd: Index, ek: VKind, fnIx: i32): i32 {
+  return liveHoistRow(
     nd.idxArr,
     listIdxKindOf(ek),
     exprPackedRow(nd.idxArr, fnIx),
   )
-  if skHz < 0 {
-    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
-  }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+}
+
+// The half after the receiver and index (`hz` from `scalarListHoistOf`): the guard, over the
+// hoisted header or the wrapper, then the backing's `array.get`; a possible view reads through its
+// source.
+export function scalarListGetTail(
+  nd: Index,
+  ek: VKind,
+  fnIx: i32,
+  hz: i32,
+): i32 {
+  const row = exprPackedRow(nd.idxArr, fnIx)
   // A list that may be a view reads its element through the view's source (D3028).
   const ixSv = svDstOfKind(ek)
-  if ixSv >= 0 && skHz < 0 { return emitSvIndexRead(ek, ixSv) }
-  // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
-  if skHz >= 0 {
-    emitListIdxGuardHoisted(skHz, nd.idxIndex)
+  if ixSv >= 0 && hz < 0 { return emitSvIndexRead(ek, ixSv) }
+  if hz >= 0 {
+    emitListIdxGuardHoisted(hz, nd.idxIndex)
   } else {
-    const irow = exprPackedRow(nd.idxArr, fnIx)
     emitListIdxGuard(
-      listIdxWrapSlot(listIdxKindOf(ek), irow),
-      scalarListWrap(ek, irow),
+      listIdxWrapSlot(listIdxKindOf(ek), row),
+      scalarListWrap(ek, row),
     )
   }
-  fbArrayGet(scalarListBack(ek, exprPackedRow(nd.idxArr, fnIx))) // yields the element in its rep
+  fbArrayGet(scalarListBack(ek, row)) // yields the element in its rep
   return 0
 }
 
