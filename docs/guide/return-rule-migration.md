@@ -24,21 +24,19 @@ compiler, where `--fix` over the directory took 28 min). Insert `return ` at eac
 | --- | --- | --- |
 | `missing-return` (error) | a value tail where a value is wanted: an annotated return type, or a lambda passed where a value-returning function type (or a `map`/`filter` callback) is expected | `return ` before the tail statement |
 | `discarded-tail-value` (warning) | a pure expression left as an un-annotated body's last statement, or an `if`/`match` there whose every value-yielding arm is pure | `return ` before it (after any opening parentheses) |
-| `void-callee-missing-return` (error at the caller) | a value slot gets the `void` result of an un-annotated function whose body ends in a call, an `if` or a `match` | `return ` before that tail, in the callee's file, when that file is in the same run (otherwise a note only) |
+| `void-callee-missing-return` (error at the caller) | a value slot, or an operand of a comparison, arithmetic or unary operator, gets the `void` result of an un-annotated function whose body ends in a call, an `if` or a `match` | `return ` before that tail, in the callee's file, when that file is in the same run (otherwise a note only) |
 
 ## What you write by hand
 
-Three shapes reached the migration of this tree and are fixed by hand. A fourth, an un-annotated
-function whose tail is an `if` or `match` used for its value, is now a `--fix` case (#8442): the
-`discarded-tail-value` warning, and the caller's `void-callee-missing-return`.
+Two shapes reached the migration of this tree and are fixed by hand. Two more are `--fix` cases
+now, through the caller's `void-callee-missing-return`: an un-annotated function whose tail is an
+`if` or `match` used for its value (#8442, with the `discarded-tail-value` warning), and a `void`
+operand of a comparison, arithmetic or unary operator (D16870).
 
-1. **A `void` operand of a comparison or arithmetic.** `if prep(x) < 0 { … }`, where `prep` is
-   un-annotated and ends in a call. The operand error does not name the callee, so there is no
-   fix. Add `return` to the callee's last line.
-2. **A lambda whose block ends in an assignment, passed where a function type wants a value.**
+1. **A lambda whose block ends in an assignment, passed where a function type wants a value.**
    `run(() => { r = null })` against `(f: () => null)` is a type mismatch, not a missing return.
    Write `() => { return r = null }`, or annotate the function the lambda is passed to.
-3. **A returned value `match` or `if` that an older compiler must also accept.** This only
+2. **A returned value `match` or `if` that an older compiler must also accept.** This only
    matters while you bootstrap from a compiler built before the flag day. An older checker
    grades `return match k { … }` as one joined value: a literal arm widens to `string` against a
    literal-union return, and an else-less exhaustive chain is `T | null`. A `return` in each arm
