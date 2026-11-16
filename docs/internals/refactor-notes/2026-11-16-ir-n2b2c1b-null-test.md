@@ -48,7 +48,7 @@ Together with 2c-1, discipline 3 adds 174 self-compile functions and 48 corpus f
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the 2c-1 seed, 12,294 cells | CORPUS_ID |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,557 claimed and byte-identical, the same 2 fallbacks as before; corpus CORPUS_M3 |
+| corpus identity against the 2c-1 seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the null-test split moves no corpus byte) |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,557 claimed and byte-identical, the same 2 fallbacks as before; corpus 9,016 identical, 0 differ, 0 fell back |
 | L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 95,316,549,942 to 95,358,365,190 (+0.04%) |
 | seed size, 2c-1 seed to this one | 6,516,503 to 6,517,996 (+1,493); +2.8% on the baseline, under +3% |
