@@ -58,8 +58,6 @@ import {
   tyKeyOf,
   tyLitMemberTexts,
   tyMutEpoch,
-  tyPathCycles,
-  tyPathWith,
   tySame,
   tyUnionWalkEnter,
   tyValOf,
@@ -1336,43 +1334,56 @@ export function tyIsOrHasBoolean(ty: i32): boolean {
   return false
 }
 
-// Whether `ty` reaches an inference hole anywhere in its tree, walked to the end: `tyReachesHole`
-// with no budget. A cycle back to a type still being walked reaches nothing new.
+// Whether `ty` reaches an inference hole (a `TyVar`, or a demanded shape like `{bar: _}`) anywhere
+// in its tree. Each union or record row is walked once per query: a row met again, on a cycle or
+// beside a shared subtree, adds nothing its first visit did not.
 export function tyHoldsHole(ty: i32): boolean {
-  const path: i32[] = []
-  return tyHoldsHoleIn(ty, path)
+  const seen: i32[] = []
+  return tyHoldsHoleIn(ty, seen)
 }
 
-function tyHoldsHoleIn(ty: i32, path: i32[]): boolean {
+function tyHoldsHoleIn(ty: i32, seen: i32[]): boolean {
   if ty < 0 { return true }
-  if tyPathCycles(ty, path) { return false }
-  const sub = tyPathWith(ty, path)
   const t = tyAt(ty)
-  return match t {
-    TyVar => true
-    TyArray => tyHoldsHoleIn(tyElemOf(t), sub)
-    TyMap => tyHoldsHoleIn(tyKeyOf(t), sub) || tyHoldsHoleIn(tyValOf(t), sub)
-    TyNullable => tyHoldsHoleIn(t.nInner, sub)
+  match t {
+    TyVar => {
+      return true
+    }
+    TyArray => {
+      return tyHoldsHoleIn(tyElemOf(t), seen)
+    }
+    TyMap => {
+      return tyHoldsHoleIn(tyKeyOf(t), seen) || tyHoldsHoleIn(tyValOf(t), seen)
+    }
+    TyNullable => {
+      return tyHoldsHoleIn(t.nInner, seen)
+    }
     TyObj => {
+      if i32ListHas(seen, ty) { return false }
+      seen.push(ty)
       for f in t.objFieldTypes {
-        if tyHoldsHoleIn(f, sub) { return true }
+        if tyHoldsHoleIn(f, seen) { return true }
       }
-      false
+      return false
     }
     TyUnion => {
+      if i32ListHas(seen, ty) { return false }
+      seen.push(ty)
       for m in t.uMembers {
-        if tyHoldsHoleIn(m, sub) { return true }
+        if tyHoldsHoleIn(m, seen) { return true }
       }
-      false
+      return false
     }
     TyFunc => {
       for p in t.fnParamTypes {
-        if tyHoldsHoleIn(p, sub) { return true }
+        if tyHoldsHoleIn(p, seen) { return true }
       }
-      t.fnRet == -2 || tyHoldsHoleIn(t.fnRet, sub)
+      return t.fnRet == -2 || tyHoldsHoleIn(t.fnRet, seen)
     }
     // Leaves, and a negation whose operand is a declared type: no hole below.
-    TyPrim | TyNeg | TyLit | TyErr => false
+    TyPrim | TyNeg | TyLit | TyErr => {
+      return false
+    }
   }
 }
 
