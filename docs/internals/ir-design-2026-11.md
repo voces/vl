@@ -793,6 +793,9 @@ The hole's one divergence under mode 3 (`emitListIdxBackRef`, tag 224 against 23
 predicate reading context: the builder had returned a block body's last statement as its value,
 where the body runs past it to `null` (D16861). No ladder predicate has yet been seen to read
 context; mode 3 stays the instrument that would show one.
+The writer must read the value once, except an IR immediate it writes itself (a `null`, or a
+literal at the destination width), which it may leave unread (N2a). That is sound because an
+immediate is built only from an effect-free node; verifier rule 2 checks it at each `RToBox`.
 
 **A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
 plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held
