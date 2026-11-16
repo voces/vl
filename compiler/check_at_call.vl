@@ -1,0 +1,160 @@
+// Where a callee's failed bound came from, as a refusal at the call names it: the parameter the
+// bound reads and the body site that recorded it. Reads only the AST and the derived-hole table.
+import {
+  FuncDecl,
+  P,
+  Param,
+  TypeRef,
+  i32ToStr,
+  nodeAt,
+  ufcsModOfNode,
+} from "./ast"
+import { nodeStartTok } from "./fmt_util"
+import { hdBase, hdRowOf } from "./check_hole_pins"
+import { TyVar, tyAt, tyChildrenOf } from "./check_types"
+import { fnDeclIx } from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+
+// The parenthetical a bound of `who`'s body (declaration `fn`, -1 to look it up by name) reports
+// at call `call`, where the bound's type `on` reads a parameter and `site` is the body node:
+// "parameter `x` of `f`, used at L:C". A part it cannot name is left out.
+export function atCallWhere(
+  fn: i32,
+  who: string,
+  on: i32,
+  site: i32,
+  call: i32,
+): string {
+  return atCallWhereAs(fn, who, on, -1, site, call, "used", "body")
+}
+
+// `atCallWhere` with a second type `alt` asked when `on` reads no one parameter (-1 for none), the
+// site's `verb` ("returned") and the `part` of the callee named when no parameter is ("return").
+export function atCallWhereAs(
+  fn: i32,
+  who: string,
+  on: i32,
+  alt: i32,
+  site: i32,
+  call: i32,
+  verb: string,
+  part: string,
+): string {
+  let d = fn
+  if d < 0 && who != "" { d = fnDeclIx[who] ?? -1 }
+  let pname = boundParamName(d, on)
+  if pname == "" && alt >= 0 { pname = boundParamName(d, alt) }
+  let s = "the callee's " + part
+  if who != "" { s = "the " + part + " of `" + who + "`" }
+  if pname != "" {
+    s = "parameter `" + pname + "`"
+    if who != "" { s = s + " of `" + who + "`" }
+  }
+  return s + siteAtSuffix(site, call, verb)
+}
+
+// ", used at L:C" (with `verb` for "used") for body node `site`, or "" when it has no position
+// or sits in another module than call `call`, whose line would read as the call's own file.
+export function siteAtSuffix(site: i32, call: i32, verb: string): string {
+  if site < 0 || site >= P.nodes.length { return "" }
+  const tk = nodeStartTok(site)
+  if tk < 0 || tk >= P.toks.length { return "" }
+  if call >= 0 && ufcsModOfNode(site) != ufcsModOfNode(call) { return "" }
+  let head = ", at "
+  if verb != "" { head = ", " + verb + " at " }
+  return head + i32ToStr(P.toks[tk].line) + ":" + i32ToStr(P.toks[tk].col + 1)
+}
+
+// The name of declaration `d`, or "" for none (-1) or an anonymous one.
+export function declWho(d: i32): string {
+  if d < 0 || d >= P.nodes.length { return "" }
+  const f = nodeAt(d)
+  if f is FuncDecl { return f.fnName }
+  return ""
+}
+
+// The name of the one parameter of declaration `d` that type `on` reads, through derived holes,
+// or "" when it reads none or more than one.
+export function boundParamName(d: i32, on: i32): string {
+  if d < 0 || d >= P.nodes.length { return "" }
+  const f = nodeAt(d)
+  if !(f is FuncDecl) { return "" }
+  const found: i32[] = []
+  const seen: i32[] = []
+  collectParamReads(d, f, on, found, seen)
+  if found.length != 1 { return "" }
+  const p = nodeAt(f.fnParams[found[0]])
+  if p is Param { return p.parName }
+  return ""
+}
+
+function collectParamReads(
+  d: i32,
+  f: FuncDecl,
+  ty: i32,
+  found: i32[],
+  seen: i32[],
+) {
+  if ty < 0 || i32ListHas(seen, ty) { return 0 }
+  seen.push(ty)
+  const row = hdRowOf(ty)
+  if row >= 0 {
+    collectParamReads(d, f, hdBase[row], found, seen)
+    return 0
+  }
+  const t = tyAt(ty)
+  if t is TyVar {
+    const k = paramPosOfVar(d, f, t.tvName)
+    if k >= 0 && !i32ListHas(found, k) { found.push(k) }
+    return 0
+  }
+  const kids: i32[] = []
+  tyChildrenOf(ty, kids)
+  for c in kids { collectParamReads(d, f, c, found, seen) }
+  return 0
+}
+
+// The position of the parameter of `f` (declaration `d`) that variable `name` stands for: an
+// inference hole's trailing position, or the one parameter annotated with the type parameter
+// itself; -1 for neither.
+function paramPosOfVar(d: i32, f: FuncDecl, name: string): i32 {
+  const n = f.fnParams.length
+  if name.length > 1 && name[0] == "?"[0] {
+    let i = name.length - 1
+    while i > 0 && name[i] >= "0"[0] && name[i] <= "9"[0] { i = i - 1 }
+    if i == name.length - 1 || name[i] != "."[0] { return -1 }
+    const head = name.slice(0, i)
+    const at = "?" + f.fnName + "@"
+    const named = f.fnName != ""
+      && (head == "?" + f.fnName
+      || head.length > at.length && head.slice(0, at.length) == at)
+    if !named && head != "?#L" + i32ToStr(d) { return -1 }
+    const k = strToI32(name.slice(i + 1, name.length))
+    if k < n { return k }
+    return -1
+  }
+  let hit = -1
+  let k = 0
+  while k < n {
+    const p = nodeAt(f.fnParams[k])
+    if p is Param && p.parType >= 0 {
+      const a = nodeAt(p.parType)
+      if a is TypeRef && a.tyName == name {
+        if hit >= 0 { return -1 }
+        hit = k
+      }
+    }
+    k = k + 1
+  }
+  return hit
+}
+
+function strToI32(s: string): i32 {
+  let v = 0
+  let i = 0
+  while i < s.length {
+    v = v * 10 + (s[i] - "0"[0])
+    i = i + 1
+  }
+  return v
+}
