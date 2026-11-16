@@ -1,5 +1,5 @@
 import { rowSettledByDefault } from "./check_hole_links"
-import { BND_NEST, BND_PRINT, bndCount } from "./check_iface"
+import { BND_IS, BND_NEST, BND_PRINT, BND_RET, bndCount } from "./check_iface"
 import { isWideLitJoin } from "./check_wide_lits"
 import { nodeCtxTyIxOf } from "./check_core_state"
 // Steps the checker core calls that do not call back into it: refusal and note texts,
@@ -96,12 +96,10 @@ import {
   bmCstr,
   cstrOwnerTop,
   cvMark,
-  isCstr,
   letCstr,
   memCstr,
   noteBinCstr,
   noteLetCstr,
-  retCstr,
   ufcsCstr,
 } from "./check_cstr_rows"
 import { inferQuiet } from "./check_cursor"
@@ -1491,9 +1489,29 @@ export function initMapCtorName(initIx: i32) {
   return "Map"
 }
 
+// The article before a key type's spelling, read aloud: "An" before a vowel sound (`f64`,
+// `i32[]`, `Item`), "A" otherwise.
+function mapKeyArticle(keyText: string): string {
+  if keyText.length == 0 { return "A " }
+  const c = keyText[0]
+  if (
+    c == 'a'
+    || c == 'e'
+    || c == 'i'
+    || c == 'o'
+    || c == 'f'
+    || c == 'A'
+    || c == 'E'
+  ) {
+    return "An "
+  }
+  if c == 'I' || c == 'O' { return "An " }
+  return "A "
+}
+
 // The unsupported-key refusal's sentence, shared by the index signature and `Map<K, V>`.
 export function mapKeyUnsupportedMsg(keyText: string, ctor: string): string {
-  return "A "
+  return mapKeyArticle(keyText)
     + keyText
     + "-keyed "
     + ctor
@@ -1738,35 +1756,57 @@ export function objDroppedFieldList(src: i32, dst: i32) {
 }
 
 // `objDroppedFieldList` for fields reached under the path `pre`, at most `depth` records down.
-function objDroppedFieldsAt(src: i32, dst: i32, pre: string, depth: i32) {
+function objDroppedFieldsAt(
+  src: i32,
+  dst: i32,
+  pre: string,
+  depth: i32,
+): string {
   if depth <= 0 || src < 0 || dst < 0 { return "" }
   const s = tyAt(src)
   const d = tyAt(dst)
-  let out = ""
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < s.objFieldNames.length {
-        const nm = s.objFieldNames[i]
-        const df = objFieldType(d, nm)
-        let part = ""
-        if df < 0 {
-          part = "`" + pre + nm + "`"
-        } else if !tyEq(s.objFieldTypes[i], df) {
-          part = objDroppedFieldsAt(
-            s.objFieldTypes[i],
-            df,
-            pre + nm + ".",
-            depth - 1,
-          )
-        }
-        if part != "" {
-          if out != "" { out = out + ", " }
-          out = out + part
-        }
-        i = i + 1
-      }
+  match s {
+    TyObj => {
+      return if d is TyObj { objDroppedObjFields(s, d, pre, depth) } else { "" }
     }
+    TyNullable => {
+      return if d is TyNullable { objDroppedFieldsAt(s.nInner, d.nInner, pre, depth - 1) } else { "" }
+    }
+    // Only a record, or a nullable one, carries fields to drop.
+    TyPrim | TyErr | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg | TyUnion => {
+      return ""
+    }
+  }
+}
+
+// `objDroppedFieldsAt` for two records.
+function objDroppedObjFields(
+  s: TyObj,
+  d: TyObj,
+  pre: string,
+  depth: i32,
+): string {
+  let out = ""
+  let i = 0
+  while i < s.objFieldNames.length {
+    const nm = s.objFieldNames[i]
+    const df = objFieldType(d, nm)
+    let part = ""
+    if df < 0 {
+      part = "`" + pre + nm + "`"
+    } else if !tyEq(s.objFieldTypes[i], df) {
+      part = objDroppedFieldsAt(
+        s.objFieldTypes[i],
+        df,
+        pre + nm + ".",
+        depth - 1,
+      )
+    }
+    if part != "" {
+      if out != "" { out = out + ", " }
+      out = out + part
+    }
+    i = i + 1
   }
   return out
 }
@@ -2524,8 +2564,8 @@ export function cstrRowCount(): i32 {
     + argCstr.at.length
     + bndCount(BND_PRINT)
     + bndCount(BND_NEST)
-    + isCstr.ty.length
-    + retCstr.got.length
+    + bndCount(BND_IS)
+    + bndCount(BND_RET)
     + letCstr.got.length
     + bmCstr.got.length
     + memCstr.ty.length
