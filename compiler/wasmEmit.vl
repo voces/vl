@@ -89,6 +89,7 @@ import {
   elabDeliveredBundles,
   elabHasTypedReads,
   elabInstTyAt,
+  elabIsTyIn,
   elabKeyAt,
   elabNestedCopyOnChain,
   elabNodeRepAt,
@@ -749,6 +750,7 @@ import {
   svViewTy,
   synthConstListIdx,
   synthGlobalIdx,
+  synthSitePairIdx,
   tailCallEnd,
   tailCallIdx,
   tailCallTable,
@@ -7160,8 +7162,12 @@ function emitIsTestRungs(isIx: i32, fnIx: i32) {
     fbI32Const(nst)
     return 0
   }
-  // A test the checker found can never match is false.
-  if nd0 is IsExpr && isVarTyIxOf(isIx) == TY_NEVER {
+  // A test the checker found can never match is false, at every instance or at this one.
+  if (
+    nd0 is IsExpr
+    && (isVarTyIxOf(isIx) == TY_NEVER
+      || elabIsTyIn(isIx, elabKeyAt(fnIx)) == TY_NEVER)
+  ) {
     if !unionEqOperandOk(nd0.isObj) {
       if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
       fbDrop()
@@ -17275,7 +17281,7 @@ function emitListIdxTrap(back: i32) {
 // with a live cached header: the backing ref and `len` are already in locals, so the
 // receiver is never (re-)emitted and the stack holds only the index. Leaves the same
 // [backing, safeIndex] pair; an index `idxIx` that `rangeProvenIndex` proves in bounds skips the select.
-function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
+export function emitListIdxGuardHoisted(row: i32, idxIx: i32) {
   fbLocalSet(listIdxScratchBase) // 0x21 local.set — stash the index
   const back = listBackOfWrap(hoistWrapTyOfRow(row))
   if back >= 0 && !rangeProvenIndex(row, idxIx) {
@@ -18069,7 +18075,7 @@ function hoistWrapTyOfRow(row: i32) {
 // the soundness conditions, read its header into the row's two locals. Returns the count
 // of rows opened (the `loopHoistClose` argument), or -1 on prologue failure. `condIx`, the
 // loop's per-iteration condition, is held to the body's own hoist-safety standard — a `while f()` re-runs `f` every iteration.
-function loopHoistOpen(
+export function loopHoistOpen(
   condIx: i32,
   bodyIx: i32,
   fnIx: i32,
@@ -18254,7 +18260,7 @@ function rangeProvenIndex(row: i32, idxIx: i32) {
 }
 
 // Close the `n` rows this loop opened, innermost first.
-function loopHoistClose(n: i32) {
+export function loopHoistClose(n: i32) {
   let i = 0
   while i < n {
     const row = lhOpen[lhOpen.length - 1]
@@ -18824,6 +18830,7 @@ function saResetRows() {
   saApps = []
   saBads = []
   saSites = []
+  saGlobal = Map()
   return 0
 }
 
@@ -19008,6 +19015,9 @@ function strAccScan(blockIx: i32, fnIx: i32) {
 // site's `SB` is the buffer it allocated last and `SE` that buffer's frontier; nothing else writes
 // `SB`, so a view ending at `SE` extends in place and any other copies (DECISIONS.md "String building is a lowering").
 let saSites: i32[] = []
+// The sites among `saSites` outside any loop, whose buffer and frontier are module globals: a
+// function called from a caller's loop starts each call with a fresh frame (D2669).
+let saGlobal: {[i32]: boolean} = Map()
 
 // True if `a` and `b` spell the same place: one node, or equal non-empty `strPlaceKey`s.
 function strSamePlace(a: i32, b: i32): boolean {
@@ -19082,14 +19092,43 @@ function strSiteMode(binIx: i32, fnIx: i32): i32 {
   return 0
 }
 
-// Note every site inside a loop of this body. A nested function is its own body.
+// Whether the place at `ix` outlives a call of `fnIx`: a name that is no local or parameter of
+// it, or a field or element chain rooted at a parameter or such a name. A site outside a loop
+// whose place dies with the frame (a fresh local) misses on every call, so it keeps no globals.
+function strSiteOutlives(ix: i32, fnIx: i32): boolean {
+  let u = unwrapParen(ix)
+  let chained = false
+  while u >= 0 {
+    const n = nodeAt(u)
+    if n is Member {
+      u = unwrapParen(n.memObj)
+      chained = true
+    } else if n is Index {
+      u = unwrapParen(n.idxArr)
+      chained = true
+    } else {
+      if !(n is Ident) { return false }
+      if chained && paramPosOfRead(fnIx, u) >= 0 { return true }
+      return localIndexOf(fnIx, u) < 0
+    }
+  }
+  return false
+}
+
+// Note every site inside a loop of this body, and every site outside one whose place outlives
+// the call. A nested function is its own body.
 function ssWalk(ix: i32, fnIx: i32, depth: i32) {
   if ix < 0 { return 0 }
   const n = nodeAt(ix)
   if n is FuncDecl { return 0 }
   if n is BinExpr {
-    if depth > 0 && n.binOp == "=" {
-      if strSiteMode(ix, fnIx) > 0 { saSites.push(ix) }
+    if n.binOp == "=" && strSiteMode(ix, fnIx) > 0 {
+      if depth > 0 {
+        saSites.push(ix)
+      } else if strSiteOutlives(n.binLeft, fnIx) {
+        saSites.push(ix)
+        saGlobal[ix] = true
+      }
     }
   }
   if n is WhileStmt {
@@ -19142,6 +19181,7 @@ function strSiteArm(binIx: i32, fnIx: i32) {
   ssArmRhs = -1
   const mode = strSiteModeAt(binIx, fnIx)
   if mode == 0 { return 0 }
+  if saGlobal.has(binIx) && synthSitePairIdx(binIx) < 0 { return 0 }
   const a = nodeAt(binIx)
   if a is BinExpr {
     ssArmRhs = a.binRight
@@ -19170,6 +19210,16 @@ function strSiteSlot(binIx: i32): i32 {
   return listIdxScratchBase + liKinds.length - 1
 }
 
+// A site's buffer or frontier read and write: a local, or the module global of a site outside a loop.
+function siteGet(i: i32, glob: boolean) {
+  if glob { fbGlobalGet(i) } else { fbLocalGet(i) }
+  return 0
+}
+function siteSet(i: i32, glob: boolean) {
+  if glob { fbGlobalSet(i) } else { fbLocalSet(i) }
+  return 0
+}
+
 // Lower an armed site's chain, parts evaluated in the copying lowering's order. `mode` 1
 // extends what part 0 read, 2 what the last part read. A miss allocates exact-fit, so a one-off
 // append keeps no slack; a full hit doubles, so a loop pays one extra copy and stays linear.
@@ -19185,7 +19235,8 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
     fbLocalSet(strCatSlot(j))
     j = j - 1
   }
-  const sb = strSiteSlot(binIx)
+  const glob = saGlobal.has(binIx)
+  const sb = if glob { synthSitePairIdx(binIx) } else { strSiteSlot(binIx) }
   const se = sb + 1
   let acc = 0
   if mode == 2 { acc = n - 1 }
@@ -19212,14 +19263,14 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
   fbLocalSet(strScratchBase + 2) // OUT = its backing
   // I2 = ours: this site's buffer, and a view whose edge is the frontier.
   fbLocalGet(strScratchBase + 2)
-  fbLocalGet(sb)
+  siteGet(sb, glob)
   fbRefEq()
   fbLocalGet(strScratchBase + 6)
   if mode == 1 {
     fbLocalGet(strScratchBase + 4)
     fbI32Bin(106)
   }
-  fbLocalGet(se)
+  siteGet(se, glob)
   fbI32Bin(70)  // i32.eq
   fbI32Bin(113) // i32.and
   fbLocalSet(strScratchBase + 5)
@@ -19258,7 +19309,7 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
   fbSelect()
   fbArrayNewDefault(sBackTy())
   fbLocalTee(strScratchBase + 2)
-  fbLocalSet(sb)
+  siteSet(sb, glob)
   if mode == 2 {
     // A prepend buffer keeps its value at the END, its slack in front.
     fbLocalGet(strScratchBase + 2)
@@ -19287,14 +19338,14 @@ function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
     fbLocalTee(strScratchBase + 5)
     fbLocalGet(strScratchBase + 3)
     fbI32Bin(106)
-    fbLocalSet(se)
+    siteSet(se, glob)
   } else {
     fbLocalGet(strScratchBase + 6)
     fbLocalGet(strScratchBase + 3)
     fbI32Bin(107)
     fbLocalTee(strScratchBase + 6)
     fbLocalTee(strScratchBase + 5)
-    fbLocalSet(se)
+    siteSet(se, glob)
   }
   let m = 0
   let left = n - 1

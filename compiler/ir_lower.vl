@@ -102,6 +102,7 @@ import {
   fbCall,
   fbDrop,
   fbElse,
+  fbEmitLocalsVec,
   fbEnd,
   fbF32ConstBits,
   fbF32DemoteF64,
@@ -115,14 +116,16 @@ import {
   fbI64Const,
   fbIf,
   fbLocalGet,
+  fbLocalIsUnsetRef,
+  fbLocalRun,
   fbLocalSet,
   fbLoop,
   fbRefAsNonNull,
+  fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
   fbUnreachable,
   wTarget,
-  wU8,
   wULEB,
 } from "./emit_bytes"
 import {
@@ -141,10 +144,15 @@ import {
   emitFnSpanKind,
   emitFnSpanNode,
   emitFnSpanStart,
+  fbEagerScratch,
+  fbFrameParams,
   fnStmts,
   gCellIdx,
   gHelpF64Rem,
   gImports,
+  listIdxScratchBase,
+  localIsRef,
+  localStructIdx,
 } from "./emit_state"
 
 // The function being lowered.
@@ -206,6 +214,18 @@ function takeUse(v: i32): boolean {
 
 function isTemp(v: i32): boolean {
   return v >= 0 && v < lw.irVars.length && lw.irVars[v].vKind == "temp"
+}
+
+// Consumes operand `o` without writing it, as legacy skips a receiver a live hoist already holds:
+// a temp's one use is taken in its order and its right-hand side never written; a variable
+// reads nothing.
+export function irLSkip(o: Opnd) {
+  if o is OVar && isTemp(o.ov) {
+    if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
+    if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
+    lwSeq.push(o.ov)
+  }
+  return 0
 }
 
 // Writes operand `o`: a variable's `local.get`, an immediate's constant, or a temp's own
@@ -494,11 +514,15 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     SBlock => {
       irLSettle(pending)
       if n.bkOut >= 0 { return irLMiss("valued block") }
+      // A loop's list-header hoists open before its block, as legacy's do.
+      const hoists = irLoopOpenHook(lw.irNodeAt[id])
+      if hoists < 0 { return irLMiss("loop hoist prologue") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
       body(n.bkBody, false, -1)
       lwFrames.pop()
       fbEnd()
+      irLoopCloseHook(hoists)
     }
     SLoop => {
       irLSettle(pending)
@@ -690,55 +714,37 @@ function valtypeOf(r: i32): i32 {
   }
 }
 
-// The locals vector: one `(1, valtype)` run per declared local, in slot order from the first
-// slot after the parameters, which must leave no gap.
-function localsVec(firstSlot: i32): u8[] {
+// The locals vector legacy's frame layout writes, read once the body has grown the lazy list
+// frame. A variable holding a declared slot must carry the valtype legacy declared there.
+function framedLocals(): u8[] {
+  const nLocals = listIdxScratchBase - fbFrameParams - fbEagerScratch
+  for v in lw.irVars {
+    if v.vKind == "local" && v.vSlot >= fbFrameParams {
+      const li = v.vSlot - fbFrameParams
+      if li >= nLocals || !runAgrees(v.vRep, li) { irLMiss("locals layout") }
+    }
+  }
   const out: u8[] = []
-  const slots: i32[] = []
-  const vars: i32[] = []
-  let vi = 0
-  while vi < lw.irVars.length {
-    const v = lw.irVars[vi]
-    // A local with no slot is a valued `if`'s out, which stays on the stack.
-    if v.vKind == "local" && v.vSlot >= 0 {
-      slots.push(v.vSlot)
-      vars.push(vi)
-    }
-    vi = vi + 1
-  }
-  const prev = wTarget(out)
-  wULEB(slots.length)
-  let want = firstSlot
-  while want < firstSlot + slots.length {
-    let k = 0
-    let found = -1
-    while k < slots.length {
-      if slots[k] == want { found = k }
-      k = k + 1
-    }
-    if found < 0 { irLMiss("locals layout") } else { localRun(vars[found]) }
-    want = want + 1
-  }
-  wTarget(prev)
+  fbEmitLocalsVec(out, nLocals)
   return out
 }
 
-// One `(1, valtype)` run for variable `v`: a scalar's own byte, else the bytes the list lowering
-// reads off legacy's frame for a reference rep.
-function localRun(v: i32) {
-  const r = irLFn().irVars[v]
-  const t = valtypeOf(r.vRep)
-  wULEB(1)
-  if t >= 0 { return wU8(t) }
-  const bs = irRefValtypeHook(v, r.vTy)
-  if bs.length == 0 { return irLMiss("locals layout") }
-  for x in bs { wU8(x) }
-  return 0
+// Whether declared local `li`'s run is scalar rep `rep`'s valtype; a reference rep takes the run
+// legacy declares for it.
+function runAgrees(rep: i32, li: i32): boolean {
+  const t = valtypeOf(rep)
+  if t < 0 { return true }
+  if li >= localIsRef.length || fbLocalIsUnsetRef(li) { return false }
+  const b: u8[] = []
+  const prev = wTarget(b)
+  fbLocalRun(localIsRef[li], localStructIdx[li])
+  wTarget(prev)
+  return b.length == 2 && b[1] == t
 }
 
 // The size-prefixed code entry `f` (its globals accessed in `ctx`) lowers to, or a mismatch class
-// in `lwMiss`; `firstLocal` is the wasm index of the first declared local.
-function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
+// in `lwMiss`. The frame is legacy's, opened by `fbBeginFunc`.
+function entry(f: IrFn, ctx: GlobalCtx): u8[] {
   lw = f
   lwGlobalCtx = ctx
   lwMiss = ""
@@ -761,7 +767,6 @@ function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
   lwRowAst = []
   lwRowFrom = []
   lwRowTo = []
-  const locals = localsVec(firstLocal)
   lwBuf = []
   // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
@@ -773,6 +778,7 @@ function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
   // Every frame a builder opened is closed, so the one depth not given back is the function's
   // own `end`'s, which opened none.
   ctrlDepth = ctrlDepth + 1
+  const locals = framedLocals()
   const code: u8[] = []
   for x in locals { code.push(x) }
   const bodyAt = code.length
@@ -798,14 +804,15 @@ function entry(f: IrFn, ctx: GlobalCtx, firstLocal: i32): u8[] {
 export function irLowerClaim(
   f: IrFn,
   ctx: GlobalCtx,
-  firstLocal: i32,
   fnPos: i32,
   out: u8[],
 ): string {
   const callees0 = dfeCallee.length
-  const got = entry(f, ctx, firstLocal)
+  const got = entry(f, ctx)
   if lwMiss != "" {
     while dfeCallee.length > callees0 { dfeCallee.pop() }
+    // Legacy lowers the function in its place, from the empty lazy frame `fbBeginFunc` left.
+    fbResetLazyFrame()
     return lwMiss
   }
   const at = out.length
@@ -831,15 +838,17 @@ function endsInReturn(f: IrFn): boolean {
 export function irDualEmit(
   f: IrFn,
   ctx: GlobalCtx,
-  firstLocal: i32,
   legacy: u8[],
   spanBase: i32,
   spanShift: i32,
   skew: i32,
 ): string {
-  // The lowering's calls note their callees as legacy's did; the shadow takes its own back.
+  // The lowering's calls note their callees as legacy's did; the shadow takes its own back. It
+  // grows a lazy list frame of its own from empty: legacy's is spent, its locals vector written,
+  // and the next function's `fbBeginFunc` resets it.
   const callees0 = dfeCallee.length
-  const got = entry(f, ctx, firstLocal)
+  fbResetLazyFrame()
+  const got = entry(f, ctx)
   while dfeCallee.length > callees0 { dfeCallee.pop() }
   lwGot = got
   if lwMiss != "" { return "unlowered: " + lwMiss }
@@ -977,10 +986,15 @@ function boundsUnset(_n: SBoundsCheck, _p: i32[]): i32 {
   return irLMiss("bounds hook not installed")
 }
 
-function refValtypeNone(_v: i32, _ty: i32): u8[] { return [] }
+function loopOpenNone(_at: i32): i32 { return 0 }
+
+function loopCloseNone(_n: i32): i32 { return 0 }
 
 // The list lowering's hooks (`ir_lower_ref.vl`), installed before emit; the defaults leave list
-// reads, bounds checks and reference locals unlowered.
+// reads and bounds checks unlowered.
 export let irLowerListHook: (r: Rhs) => i32 = listUnset
 export let irLowerBoundsHook: (n: SBoundsCheck, pending: i32[]) => i32 = boundsUnset
-export let irRefValtypeHook: (v: i32, ty: i32) => u8[] = refValtypeNone
+// Opens the list-header hoists of the loop statement at AST node `at` (how many, or -1 on a failed
+// prologue), and closes that many; the defaults open none.
+export let irLoopOpenHook: (at: i32) => i32 = loopOpenNone
+export let irLoopCloseHook: (n: i32) => i32 = loopCloseNone
