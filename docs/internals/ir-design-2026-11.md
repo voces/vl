@@ -780,6 +780,12 @@ restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in
 caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
 previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
 
+**A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
+plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held
+alone were string `.slice` (1,692) and `.cpLen` (674), and the self-compile's 731 were mostly list
+`.push` (428) and `.pop` (76); 6 were a real call through a value. A member callee now misses as
+`method <name>`, and `indirect call` means a call through a value.
+
 **The six coercion seats wait for claiming (I3).** These are `numSeat`, `coerceHeld`, `boxSeat`,
 `armSeat`, `armServed` and `atomSeat`. They are legacy-only ambient state: an outer site sets one
 and a nested `emitExpr` reads it. Their readers are `emitExpr` itself for every unclaimed function,
