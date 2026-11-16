@@ -2037,11 +2037,11 @@ function holeFnBesideClosedJoin(a: i32, b: i32): i32 {
   if !fnOrFnHolder(a) || !fnOrFnHolder(b) { return -1 }
   let open = a
   let closed = b
-  if tyHasInferHole(b, 0) {
+  if tyHasInferHole(b) {
     open = b
     closed = a
   }
-  if !tyHasInferHole(open, 0) || tyHasHole(closed) { return -1 }
+  if !tyHasInferHole(open) || tyHasHole(closed) { return -1 }
   if !assignable(closed, open) || !assignable(open, closed) { return -1 }
   return closed
 }
@@ -2050,7 +2050,7 @@ function holeFnBesideClosedJoin(a: i32, b: i32): i32 {
 function fnOrFnHolder(t: i32): boolean {
   const x = tyAt(t)
   if x is TyFunc { return true }
-  return (x is TyObj || x is TyArray) && tyMayHoldFn(t, 0)
+  return (x is TyObj || x is TyArray) && tyMayHoldFn(t)
 }
 
 // The join of a bare inference hole (an un-annotated parameter's value) and a function type: the
@@ -2058,8 +2058,8 @@ function fnOrFnHolder(t: i32): boolean {
 // parameter's own type joins the function's (D15462); -1 for any other pair.
 function bareHoleBesideFnJoin(a: i32, b: i32): i32 {
   if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return -1 }
-  const ah = tyAt(a) is TyVar && tyHasInferHole(a, 0)
-  const bh = tyAt(b) is TyVar && tyHasInferHole(b, 0)
+  const ah = tyAt(a) is TyVar && tyHasInferHole(a)
+  const bh = tyAt(b) is TyVar && tyHasInferHole(b)
   if ah && !bh && tyAt(b) is TyFunc { return a }
   if bh && !ah && tyAt(a) is TyFunc { return b }
   return -1
@@ -7963,9 +7963,7 @@ function holeRetDeferMisfit(
     return false
   }
   const want = holeGenRetAt(gen, pts)
-  if want < 0 || want >= T.tys.length || tyHasInferHole(want, 0) {
-    return false
-  }
+  if want < 0 || want >= T.tys.length || tyHasInferHole(want) { return false }
   const r = widenLitTy(ret)
   if tyHasTyVar(want) {
     noteArgCstr(want, r, sp, ACF_EXACT_RET, -1)
@@ -7988,7 +7986,7 @@ function holeGenRetAt(gen: i32, pts: i32[]): i32 {
   let j = 0
   while j < pts.length {
     const pt = pts[j]
-    if pt < 0 || pt >= T.tys.length || tyHasInferHole(pt, 0) { return -1 }
+    if pt < 0 || pt >= T.tys.length || tyHasInferHole(pt) { return -1 }
     bindGenWalk(g.fnParamTypes[j], widenLitTy(pt), bn, bt)
     j = j + 1
   }
@@ -11442,6 +11440,28 @@ function unionDeclNeverErr(sx: i32, sd: UnionDecl, variants: string[]) {
   return 0
 }
 
+// Whether union alias `name` reaches itself through bare members alone: a member naming a union
+// alias, followed through that alias's own bare members. A list, map, record or function in
+// between is a container the cycle may pass through, so it is not followed.
+function unionNamesItself(name: string): boolean {
+  const seen: string[] = []
+  const todo: string[] = [name]
+  while todo.length > 0 {
+    const at = cFillStmtIx[todo.pop() ?? ""] ?? -1
+    const dn = if at >= 0 && at < P.nodes.length { nodeAt(at) } else { null }
+    if dn is UnionDecl {
+      for v in dn.udVariants {
+        if v == name { return true }
+        if !strListHas(seen, v) {
+          seen.push(v)
+          todo.push(v)
+        }
+      }
+    }
+  }
+  return false
+}
+
 // `fillTypeDeclAt`'s union arm: resolves the variants of `sd` (statement `sx`) and fills the
 // placeholder's `members` in place, reporting a self-cycle or an empty (`never`) union.
 function fillUnionDeclMembers(sx: i32, sd: UnionDecl, members: i32[]) {
@@ -11456,6 +11476,16 @@ function fillUnionDeclMembers(sx: i32, sd: UnionDecl, members: i32[]) {
         + sd.udName
         + "` is defined in terms of itself "
         + "with no base type, so it can never have a value",
+      sx,
+    )
+  } else if unionNamesItself(sd.udName) {
+    // A member that is the union itself, directly or through other unions' bare members
+    // (D16733): the union would contain itself, so it has no members to stand for.
+    tErr(
+      "Type `"
+        + sd.udName
+        + "` is a member of itself — a type can refer to itself only inside a list, a map, "
+        + "a record field or a function",
       sx,
     )
   } else {
