@@ -96,7 +96,14 @@ so the build PR reads it with `plumb-shape-cost.vl`.
 The compiler cost is about +20 to +30 lines and no new functions. The seed's own size is
 unaffected, because the compiler holds no vectors.
 
-## Not proposed: AE-004's record face
+## AE-004's record face
+
+Landed 2026-11-16 another way than the one below: the record type is never written, so a copy
+cannot be told from the shared box and no alias analysis is needed. The `-O` inline-record step
+already stored such a field's record in its parent, and it now takes apart a global
+initializer too (D3679). Measured in `refactor-notes/2026-11-16-ae4-record-field-inplace.md`.
+The text below is the analysis as it stood before.
+
 
 Turning `r.f = { x: …, y: …, z: … }` into `struct.set`s on the record already in `r.f` is sound
 only when nothing else holds that record. That needs an alias fact the compiler does not
