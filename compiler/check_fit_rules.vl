@@ -444,7 +444,7 @@ import {
   isvalType,
 } from "./check_state"
 import { curFnOwner, joinClashMsg, joinClashMsgSet } from "./check_subst"
-import { tyVarOwnerOf } from "./check_types"
+import { tyPathCycles, tyPathWith, tyVarOwnerOf } from "./check_types"
 import { demangleName } from "./check_suggest"
 import { placeElemTy, tpBoundOfName } from "./check_tp_bound"
 import {
@@ -5246,12 +5246,50 @@ function recBuiltReadTyAt(
     const ot = tyAt(nonNullTy(o))
     return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
   }
+  // A loop variable or a list callback's parameter holds the list's elements (D16783).
+  const el = recElemVarList(x)
+  if el >= 0 { return recBuiltElemIn(el, tbl) }
   const d = recHeldDecl(x)
   if d < 0 { return -1 }
   const b = if fresh { recBuildTyIn(tbl, d, false) } else { -1 }
   const dn = nodeAt(d)
   if b >= 0 || !(dn is LetDecl) { return b }
   return recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// The list whose elements the read `x` names, parentheses peeled: the iterated list of the
+// `for … in` loop whose element variable it is, or the receiver of the `map` or `filter` call
+// whose callback's one parameter it is; else -1.
+function recElemVarList(x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is LoopVar {
+    if dn.lvLoop < 0 || dn.lvLoop >= P.nodes.length { return -1 }
+    const l = nodeAt(dn.lvLoop)
+    if !(l is ForIn) || dn.lvSlot != 0 { return -1 }
+    const it = cwPeelValue(l.fiIter)
+    return if it >= 0 && tyIsListTy(nonNulTyOf(nodeTyIxOf(it))) { it } else { -1 }
+  }
+  if !(dn is Param) { return -1 }
+  let fd = recEnclosingFn(x)
+  while fd >= 0 && !recFnHasParam(fd, d) { fd = recEnclosingFn(fd) }
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || !cwIxCovers(fd) { return -1 }
+  if cwIxUpKind[fd] != CW_UP_ARG { return -1 }
+  const c = nodeAt(cwIxUp[fd])
+  const m = if c is Call && c.callFn >= 0 { nodeAt(parenPeelIx(c.callFn)) } else { null }
+  if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
+    return -1
+  }
+  return cwPeelValue(m.memObj)
+}
+
+// Whether function `fd` declares parameter `d`.
+function recFnHasParam(fd: i32, d: i32): boolean {
+  const f = nodeAt(fd)
+  return f is FuncDecl && i32ListHas(f.fnParams, d)
 }
 
 // Whether `u` is a call handing back a record literal a pin built at another record (D15185).
@@ -8712,8 +8750,15 @@ function holeOfDecl(o: string, d: i32): boolean {
 
 // Whether `t` holds an inference hole that neither the function being checked nor one of its
 // parameters owns: such a hole is bound by a call into another function, not by this instance.
-function holeOutsideFn(t: i32, depth: i32): boolean {
-  if depth > 8 || !tyHasInferHole(t) { return false }
+function holeOutsideFn(t: i32): boolean {
+  const path: i32[] = []
+  return holeOutsideFnIn(t, path)
+}
+
+function holeOutsideFnIn(t: i32, path: i32[]): boolean {
+  if tyPathCycles(t, path) { return false }
+  const sub = tyPathWith(t, path)
+  if !tyHasInferHole(t) { return false }
   if tyAt(t) is TyVar {
     const o = tyVarOwnerOf(t)
     return o != curFnOwner
@@ -8723,7 +8768,7 @@ function holeOutsideFn(t: i32, depth: i32): boolean {
   const kids: i32[] = []
   tyChildrenOf(t, kids)
   for k in kids {
-    if holeOutsideFn(k, depth + 1) { return true }
+    if holeOutsideFnIn(k, sub) { return true }
   }
   return false
 }
@@ -8733,7 +8778,7 @@ function holeOutsideFn(t: i32, depth: i32): boolean {
 // (D3339). A type parameter, or a hole outside the literal's function, stays open; an anonymous
 // destination of the literal's own shape is already its storage, so it is not stamped.
 export function litAtDstStorage(x: i32, dstTy: i32): boolean {
-  if dstTy < 0 || x < 0 || !repStampableLit(x) || holeOutsideFn(dstTy, 0) {
+  if dstTy < 0 || x < 0 || !repStampableLit(x) || holeOutsideFn(dstTy) {
     return false
   }
   const own = nodeTyIxOf(parenPeelIx(x))
