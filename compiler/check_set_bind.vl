@@ -16,6 +16,7 @@ import {
   P,
   Param,
   Paren,
+  fnNameIsLambda,
   i32ToStr,
   nodeAt,
   nodeChildren,
@@ -28,7 +29,7 @@ import {
   fnTagSetOfTy,
 } from "./check_elab_cap"
 import { nodeTyIxOf } from "./check_node_tys"
-import { T, TyArray, tyAt, tyElemOf, tyFieldTyOf } from "./check_types"
+import { T, TyArray, TyFunc, tyAt, tyElemOf, tyFieldTyOf } from "./check_types"
 import { identFnDeclOf } from "./check_scopes"
 import {
   mintFactCallOf,
@@ -36,7 +37,7 @@ import {
   mintFactSetOf,
   mintRetParamsOf,
 } from "./check_mint"
-import { collectRetValues } from "./check_nj_join"
+import { handBackHoleIx, handBackIx, handBackShared } from "./check_hand_back"
 import { parenPeelIx } from "./check_places"
 import { cwIxBuild, cwIxParent } from "./check_write_scan"
 import { i32ListHas, strListHas } from "./listutil"
@@ -271,7 +272,7 @@ function sbConstLambdaCallRows(c: i32, n: Call) {
   if !(ln is LetDecl) || ln.letKw != "const" || ln.letInit < 0 { return 0 }
   const li = parenPeelIx(ln.letInit)
   const lam = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { n }
-  if !(lam is FuncDecl) || lam.fnName != "" { return 0 }
+  if !(lam is FuncDecl) || !fnNameIsLambda(lam.fnName) { return 0 }
   sbArgRows(c, n, li, sbEnclosingFn(c))
   return 0
 }
@@ -448,26 +449,37 @@ export function setBindBuild() {
   return 0
 }
 
-// Notes each declaration whose every returned value reads one parameter a set reaches.
+// Notes each declaration handing back a parameter (`check_hand_back.vl`) that some call binds
+// to a function: a set reaches it, or an argument of function type. An inline list-method
+// callback is no such declaration.
 function setBindHandBacks() {
   for d in sbDecls {
     const dn = nodeAt(d)
     if dn is FuncDecl && dn.fnBody >= 0 {
-      const vs: i32[] = []
-      collectRetValues(dn.fnBody, vs)
-      let at = -1
-      for v in vs {
-        const q = sbParamIndexIn(d, parenPeelIx(v))
-        if q < 0 || at >= 0 && q != at { at = -2 }
-        else if at != -2 { at = q }
-      }
-      if vs.length > 0 && at >= 0 && setBindSetsOf(d, at).length > 0 {
-        hbFn.push(d)
-        hbParam.push(at)
+      const own = handBackIx(d, dn)
+      const one = if own >= 0 { own } else { handBackHoleIx(d, dn, 0) }
+      const ats = if one >= 0 { [one] } else { handBackShared(d, dn) }
+      // An inline lambda handed to a list method runs inside the method's loop, no call of it
+      // stands anywhere to take the value back.
+      const inline = fnNameIsLambda(dn.fnName) && i32ListHas(cbFn, d)
+      for at in ats {
+        if !inline && sbFnReaches(d, at) {
+          hbFn.push(d)
+          hbParam.push(at)
+        }
       }
     }
   }
   return 0
+}
+
+// Whether some call binds parameter `i` of `d` to a function.
+function sbFnReaches(d: i32, i: i32): boolean {
+  if setBindSetsOf(d, i).length > 0 { return true }
+  for t in sbTysOf[sbKey(d, i)] ?? [] {
+    if t >= 0 && t < T.tys.length && tyAt(t) is TyFunc { return true }
+  }
+  return false
 }
 
 // Each call through a parameter of `d` in its body, as `[call, set, ...]` over the sets reaching

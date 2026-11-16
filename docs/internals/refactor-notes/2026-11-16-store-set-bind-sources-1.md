@@ -13,6 +13,7 @@ decision reads it, and no program's wasm moves.
 | a callee read through a path from a parameter: `[i]`, `.f`, a local `const` alias | the set at the end of the path, in each argument type handed to that parameter (types are closed beside sets) |
 | a call through a parameter | its arguments go to each member of each set reaching the parameter (a dynamic edge in the fixpoint) |
 | a call of a local `const` bound to a lambda | the lambda's parameters take the call's arguments |
+| hand-backs: the elaboration's own syntactic test, moved to `check_hand_back.vl` | a declaration's handed-back parameter, where some call binds it to a function |
 | list methods with an element callback (`map`, `filter`, `forEach`, `find`, `findIndex`, `some`, `every`) | the callback's first parameter takes the receiver's element set, from its own type or a parameter path's argument types |
 
 ## Measured
@@ -28,8 +29,17 @@ diff after that source was added, cumulative.
 | path callees | 1,397 / 451 | 48 / 27 | 601 / 206 |
 | calls into members | 1,427 / 451 | 48 / 27 | 571 / 196 |
 | `const` lambdas, callbacks | 1,537 / 467 | 76 / 38 | 461 / 182 |
+| lambda test fixed (`fnNameIsLambda`) | 1,570 / 477 | 76 / 38 | 428 / 173 |
 
-Hand-backs: 45 agree, 59 check only (53 at the shadow: more parameters now have a set reaching them, and v1 hand-backs need only that), 19 elaboration only.
+**Hand-backs.** These are now exact: 64 agree, 0 check only, 0 elaboration only. They were 45 / 53 / 19
+at the shadow.
+- The test is the elaboration's own. `handBackIx`, `handBackHoleIx`, `handBackShared` and their
+  helpers moved from `emit_elab.vl` to `check_hand_back.vl` unchanged. The elaboration imports them
+  from there, so one test serves both.
+- The producer adds the per-call condition: some call binds the parameter to a function, either a
+  set reaching it or an argument of function type.
+- An inline lambda handed to a list method is excluded. It runs inside the method's loop, no
+  instance of it exists, and no call takes its value back.
 
 **Check-only facts.** These are where the producer over-approximates. Before a call class switches
 the decision, each one is named and either removed or shown harmless. Two families account for the
