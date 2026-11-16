@@ -201,6 +201,7 @@ print(guard(2))
   `let gs: i32[] = []\nfunction add(x: i32): i32 {\n  gs.push(x)\n  return gs.push(x + 1)\n}\nprint(add(1))\n`,
   `let ns: string[] = ["a", "b"]\nfunction put(i: i32, s: string) { ns[i] = s + "!" }\nput(1, "z")\nprint(ns[1])\n`,
   `let fs: f64[] = [0.0, 0.0]\nfunction wid(i: i32, x: i32): f64 {\n  fs[i] = x\n  const y: f64 = x\n  return y\n}\nprint(wid(1, 3))\n`,
+  `function pick(c: boolean, x: i64): i64 | null {\n  if c { return x }\n  return x + 1\n}\nprint(pick(true, 3) ?? 0)\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -232,6 +233,27 @@ print(k(2, true, false))
     const { rows } = run(src, true);
     const want = "mismatch unlowered: operand above a valued if's value";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
+// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
+// the result's `null`.
+Deno.test({
+  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  ignore,
+  fn: () => {
+    const src = `function put(x: i32) { return x * 2 }
+function f(b: i32) {
+  if b >= 0 { return 0 }
+  put(9)
+}
+print(f(-1) ?? 5)
+`;
+    const { rows } = run(src, true);
+    const want = "uncovered block body falls off";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
