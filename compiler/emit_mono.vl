@@ -3147,24 +3147,6 @@ function monoExprMake(ix: i32, kids: i32[]): i32 {
   return ix
 }
 
-// A copy of the call `x`, its callee read copied too, where the relay twin being built returns it
-// and the checker noted it per twin (a result below -1), noted at the twin's result: the template's
-// node is shared by every twin, and a maker call is built by rewriting it (D16755). -1 otherwise.
-function monoTwinCallCopy(x: i32): i32 {
-  const c = if monoBuild.twinRet >= 0 && x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
-  if !(c is Call) || elabMakerCallSig(x) >= -1 { return -1 }
-  const r = unwrapParen(c.callFn)
-  const rn = if r >= 0 && r < P.nodes.length { nodeAt(r) } else { null }
-  if !(rn is Ident) { return -1 }
-  const nr = monoCopyOf(r, mkIdent(rn.identName, rn.pos))
-  nodeTyRecord(nr, nodeTyIxOf(r))
-  const nc = monoCopyOf(x, mkCall(nr, c.callArgs, c.pos))
-  nodeTyRecord(nc, nodeTyIxOf(x))
-  monoNoteCallTpl(x, nc)
-  if nc >= 0 { monoBuild.twinCalls.set(nc, monoBuild.twinRet) }
-  return nc
-}
-
 // Clone a monomorphized instance's body, substituting every `LetDecl` type-param
 // annotation through the binding. Only the statement spine is rebuilt; every leaf
 // expression, a nested lambda included, is shared, so no new function node is created.
@@ -3345,10 +3327,8 @@ function monoCloneBodyRaw(
     }
     LetDecl => {
       // A relay twin's binding of the maker call it returns takes its own copy (D16771).
-      const lc = monoTwinCallCopy(
-        if monoBuild.twinRet >= 0 && n.letInit >= 0 { unwrapParen(n.letInit) } else { -1 },
-      )
-      if lc >= 0 {
+      const lc = if monoBuild.twinRet >= 0 && n.letInit >= 0 { monoCloneBody(n.letInit, typarams, tvN, tvV, bN, bT) } else { n.letInit }
+      if lc != n.letInit {
         return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, lc, n.pos))
       }
       return monoCloneLetDecl(n, ix, typarams, bN, bT)
@@ -3394,9 +3374,19 @@ function monoCloneBodyRaw(
     }
     // A relay twin returns its own copy of each maker call noted per twin, through the arms and
     // block tails that reach it: the shared node points every twin at one instance (D16755).
+    // The copy's callee read is copied too, and the copy is noted at the twin's result.
     Call => {
-      const tc = monoTwinCallCopy(ix)
-      if tc >= 0 { return tc }
+      const r = if monoBuild.twinRet >= 0 && elabMakerCallSig(ix) < -1 { unwrapParen(n.callFn) } else { -1 }
+      const rn = if r >= 0 && r < P.nodes.length { nodeAt(r) } else { null }
+      if rn is Ident {
+        const nr = monoCopyOf(r, mkIdent(rn.identName, rn.pos))
+        nodeTyRecord(nr, nodeTyIxOf(r))
+        const nc = monoCopyOf(ix, mkCall(nr, n.callArgs, n.pos))
+        nodeTyRecord(nc, nodeTyIxOf(ix))
+        monoNoteCallTpl(ix, nc)
+        if nc >= 0 { monoBuild.twinCalls.set(nc, monoBuild.twinRet) }
+        return nc
+      }
     }
     // a pure expression or other statement carries no `LetDecl` annotation to rewrite: share
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread | LoopVar => {}
