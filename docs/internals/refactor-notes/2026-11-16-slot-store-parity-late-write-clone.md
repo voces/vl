@@ -11,7 +11,16 @@ delivery walk, so it changes no output. It is graded by `tests/cases` byte ident
 
 ## Readings
 
-READINGS
+Fixpoint seeds: master `4e48a976` and this branch.
+
+| check | reading |
+|---|---|
+| `tests/cases` built, byte for byte | 0 of 7,847 differ |
+| distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 `runs -> not-runs` |
+| L2 self-compile fuel | 93.647e9 against the 92.876e9 baseline: +0.8%, under the 1% bar |
+| seed size | 6,433,582 against 6,433,489: +93 |
+| `lint-self` | clean |
+| `scripts/gate.sh` | all gates pass |
 
 ## Gap list
 
