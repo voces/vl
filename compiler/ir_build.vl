@@ -9,6 +9,7 @@ import {
   BoolLit,
   BreakStmt,
   Call,
+  CharLit,
   ContinueStmt,
   FuncDecl,
   Ident,
@@ -78,9 +79,16 @@ import { fRecRetTy, fRetVoid, fnStmts, gPromoInStart } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
+import { charLitCp } from "./emit_base"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
-import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
+import {
+  TY_BOOL,
+  TY_I32,
+  TY_NEVER,
+  TY_STR,
+  tyScalarBasePrim,
+} from "./check_types"
 
 let ibArmed = false
 let ibDetail = false
@@ -220,6 +228,7 @@ let ibLoopBrk: i32[] = []
 let ibLoopCont: i32[] = []
 let ibLabelN = 0
 let ibBool = -1
+let ibStr = -1
 let ibNoValue = -1
 
 // Whether a value of rep `r` and type `ty` can be a variable, a parameter, a result or an
@@ -238,11 +247,19 @@ function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
   return irBMiss("member hook not installed")
 }
 
+function inPlaceNone(_ix: i32, _fnIx: i32): boolean { return false }
+
+function strBinUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
+  return irBMiss(STR_OPERAND)
+}
+
 // The list builder's hooks (`ir_build_ref.vl`), installed before emit; the defaults leave every
 // reference rep, element read and member read outside the set.
 export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
 export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
 export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
+export let irStrBinHook: (b: i32[], ix: i32, rep: i32) => Opnd = strBinUnset
+export let irInPlaceHook: (ix: i32, fnIx: i32) => boolean = inPlaceNone
 
 // The function being built, its declaration, and the rep a statement node carries.
 export function irBFn(): IrFn { return ib }
@@ -294,7 +311,7 @@ export function irBOpRep(o: Opnd): i32 {
   return match o {
     OVar => if o.ov >= 0 && o.ov < ib.irVars.length { ib.irVars[o.ov].vRep } else { -1 }
     OImm => o.oiRep
-    OStr => -1
+    OStr => ibStr
   }
 }
 
@@ -536,6 +553,8 @@ function operandWhy(ix: i32): string {
   return "operand at " + ps
 }
 
+const STR_OPERAND = "operand at string"
+
 function isNumericPrim(p: string): boolean {
   return p == "i32"
     || p == "i64"
@@ -583,6 +602,12 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     if n.binOp == "=" && !ASSIGN_AS_VALUE {
       return irBMiss("assignment as a value")
     }
+    if (
+      operandWhy(n.binLeft) == STR_OPERAND
+      || operandWhy(n.binRight) == STR_OPERAND
+    ) {
+      return irStrBinHook(b, ix, rep)
+    }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
     const lw = operandWhy(n.binLeft)
@@ -603,6 +628,12 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   if n is Index { return irIndexHook(b, ix, rep) }
   if n is Member { return irMemberHook(b, ix, rep) }
   if n is StrLit { return strLit(ix, rep) }
+  if n is CharLit {
+    const cp = charLitCp(n)
+    if cp < 0 || repPrim(rep) != "i32" { return irBMiss("char literal") }
+    const c: Opnd = { oiRep: rep, oiBits: cp as i64 }
+    return c
+  }
   return irBMiss("expression " + irAstKind(ix))
 }
 
@@ -619,6 +650,7 @@ function strLit(ix: i32, rep: i32): Opnd {
 function assign(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
   if !(t is Ident) { return skip("assignment target") }
+  if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   const d = identDeclOf(n.binLeft)
   const src = irBExpr(b, n.binRight)
   if ibMiss != "" { return 0 }
@@ -865,6 +897,7 @@ function build(fnIx: i32, fnPos: i32): string {
   ibLoopCont = []
   ibLabelN = 0
   ibBool = repNodeOfTy(TY_BOOL)
+  ibStr = repNodeOfTy(TY_STR)
   if fn.fnTyParams.length > 0 { return "template" }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
