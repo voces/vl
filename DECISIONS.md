@@ -12324,3 +12324,15 @@ empty list answers per call.
 **Interim.** Until inferred interfaces record the per-call binding fact (L2 S3), a function reached
 by both a fixed and an open empty list at one un-annotated parameter is refused loudly, naming the
 two calls; the refusal lifts with L2.
+
+## A radix literal tree under `as%` is its exact value (2026-11-16, chosen under the owner's delegation) — D16494, follows "Exact constant arithmetic" (D3053)
+
+**The rule.** A tree of radix literals folds exactly, as every literal tree does under ruling A, and
+`as% T` then applies to that exact value. At `i64` a value that fits is unchanged, so
+`(0xFFFFFFFF * 2) as% i64` is `8589934590` and `(0xFFFFFFFF + 1) as% i64` is `4294967296`, the
+same as `as i64`. A value that does not fit the target wraps, as `as%` always does.
+
+**Why.** The owner asked for the choice that is consistent and meets what a human or an LLM
+reading the code expects. A literal tree means what the `const` holding it means (ruling A, and
+D3053's negation chains); computing a hex tree at 32 bits first would make the answer depend on
+the operator, which is what the defect showed.
