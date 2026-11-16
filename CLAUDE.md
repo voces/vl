@@ -112,6 +112,9 @@ The parts:
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second
   `refresh-compiler.sh` is byte-identical). `$VL_LATE_DEMANDS=1` prints the keys for one build.
+  The same run ratchets **late tag rows** (`scripts/late-tags-baseline.txt`): a function set the
+  tag decision after the elaboration changes that the baseline does not name fails; fix it, or
+  `--write-baseline` and name the set and its mechanism in the PR body.
 
 Why: [evidence](docs/internals/working-rules-evidence.md#gates).
 
