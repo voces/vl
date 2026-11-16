@@ -38,6 +38,13 @@ program is byte-identical, over `tests/cases`, distilled, the capability probes 
 every writer has moved, the class readers read as of the freeze (B′-1 lands), and D16768 closes on
 that measurement.
 
+**One implementation.** Each writer's gate moves out of `emit_mono.vl` into a module both mono and
+the elaboration import (`compiler/pin_gates.vl` for writer 1), in its own identity-graded PR; the
+elaboration's call follows in the next. A second implementation of a gate, on the checker's write
+index, was declined: it could disagree with mono's. The residual risk is input, not code: the
+elaboration runs the gate over the program before mono, and mono over the program its own rewrites
+have changed by then. Each behavioural PR's byte-identity is what measures that.
+
 **Why per writer.** A prototype that bounded every un-annotated holder with a closed slot fact
 (branch `slot-s3a`) ran D16898 under freeze-time reads but lost 13 `tests/cases` programs
 (`closures/hole-fn-in-unannotated-map`: "a function slot pinned at one signature has no one closed
