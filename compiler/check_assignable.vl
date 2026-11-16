@@ -508,6 +508,7 @@ import {
   tyToStr,
   tyWideUnionMinted,
 } from "./check_types"
+import { tailValueLeaves } from "./check_unconsumed"
 import { mkUnionTy, numUnionConverts, numUnionMinted } from "./check_union_mint"
 import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
@@ -4352,17 +4353,77 @@ function fvaIsRelay(d: i32): boolean {
   if !fvaIsMaker(d) || fvaRetsNamed(d) { return false }
   const fn = nodeAt(d)
   if !(fn is FuncDecl) { return false }
-  const rets: i32[] = []
-  collectRetValues(fn.fnBody, rets)
-  if rets.length == 0 { return false }
-  for r in rets {
-    const x = parenPeelIx(r)
-    const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  const calls = fvaRelayCalls(d)
+  if calls.length == 0 { return false }
+  for x in calls {
+    const c = nodeAt(x)
     if !(c is Call) || c.callFn < 0 { return false }
     const m = calleeFnOfDecl(identDeclOf(parenPeelIx(c.callFn)))
     if m == d || !fvaIsMaker(m) { return false }
   }
   return true
+}
+
+// The calls whose results function `d` returns whole: a returned call, the initialiser of an
+// un-annotated `const` the body reads only where it returns it, and each arm of a returned `if` or
+// `match`; empty when any returned value is something else.
+function fvaRelayCalls(d: i32): i32[] {
+  const none: i32[] = []
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return none }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  const out: i32[] = []
+  for r in rets {
+    if !fvaRelayValueCalls(fn.fnBody, parenPeelIx(r), out, 0) { return none }
+  }
+  return out
+}
+
+// Adds to `out` the call returned value `x` of body `body` stands for (`fvaRelayCalls`); false
+// for a value that stands for none.
+function fvaRelayValueCalls(
+  body: i32,
+  x: i32,
+  out: i32[],
+  depth: i32,
+): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 4 { return false }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  for l in leaves {
+    const lx = parenPeelIx(l)
+    if lx >= 0 && lx < P.nodes.length && nodeAt(lx) is Call { out.push(lx) }
+    else if !fvaRelayHeldCalls(body, lx, out, depth) { return false }
+  }
+  return leaves.length > 0
+}
+
+// Adds to `out` the calls a name `x` returned from `body` holds: an un-annotated `const` declared
+// in `body` and read only there (`fvaRelayValueCalls`); false for any other value.
+function fvaRelayHeldCalls(body: i32, x: i32, out: i32[], depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+  const dc = identDeclOf(x)
+  const dn = if dc >= 0 && dc < P.nodes.length { nodeAt(dc) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+    || !nodeContains(body, dc)
+    || fvaReadsOf(body, dc) != 1
+  ) {
+    return false
+  }
+  return fvaRelayValueCalls(body, parenPeelIx(dn.letInit), out, depth + 1)
+}
+
+// How many identifiers in the subtree at `ix` read declaration `dc`.
+function fvaReadsOf(ix: i32, dc: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  let c = if nodeAt(ix) is Ident && identDeclOf(ix) == dc { 1 } else { 0 }
+  for kid in nodeSpineChildren(ix) { c = c + fvaReadsOf(kid, dc) }
+  return c
 }
 
 // The callee reads of the maker calls an unreachable relay returns: its body never runs, so they
@@ -4458,12 +4519,9 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
   const innerOf: {[i32]: i32} = Map()
   const relays: i32[] = []
   for d in rl.memo.keys() {
-    const fn = nodeAt(d)
-    if (rl.memo.get(d) ?? false) && fn is FuncDecl {
+    if rl.memo.get(d) ?? false {
       relays.push(d)
-      const rets: i32[] = []
-      collectRetValues(fn.fnBody, rets)
-      for r in rets { innerOf[parenPeelIx(r)] = d }
+      for c in fvaRelayCalls(d) { innerOf[c] = d }
     }
   }
   fvaDeadReads = Map()
@@ -4576,17 +4634,9 @@ function fvaRelayTwinRows(
     if !seen { sigs.push(dt) }
   }
   const inner: i32[] = []
-  for c in innerOf.keys() {
-    if (innerOf.get(c) ?? -1) == d {
-      if fvaOpenMakerCall(c) < 0 { return 0 }
-      for s in sigs {
-        const at = fvaMakerResultAt(c, s)
-        if at < 0 || !assignable(at, s) { return 0 }
-      }
-      inner.push(c)
-    }
+  if !fvaRelayTwinInner(rl, d, sigs, innerOf, inner, 0) || inner.length == 0 {
+    return 0
   }
-  if inner.length == 0 { return 0 }
   for c in calls { sigAt[c] = callSig.get(c) ?? -1 }
   for x in inner {
     const xn = nodeAt(x)
@@ -4598,6 +4648,64 @@ function fvaRelayTwinRows(
     }
   }
   return 0
+}
+
+// Adds to `out` each call relay `d` returns, and through a relay it calls there that call's own,
+// when each takes every result of `sigs`: a maker's call, or a call of a relay called only from
+// relays' returns, twinned at `sigs` with `d` (D16790). False when one cannot.
+function fvaRelayTwinInner(
+  rl: FvaRelayScan,
+  d: i32,
+  sigs: i32[],
+  innerOf: {[i32]: i32},
+  out: i32[],
+  depth: i32,
+): boolean {
+  if depth > 8 { return false }
+  for c in innerOf.keys() {
+    if (innerOf.get(c) ?? -1) == d {
+      for s in sigs {
+        const at = fvaMakerResultAt(c, s)
+        if at < 0 || !assignable(at, s) { return false }
+      }
+      out.push(c)
+      if fvaOpenMakerCall(c) < 0 {
+        const cn = nodeAt(c)
+        const r = if cn is Call { calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn))) } else { -1 }
+        if (
+          r < 0
+          || r == d
+          || !(rl.memo.get(r) ?? false)
+          || !fvaIsMaker(r)
+          || (rl.handedOn.get(r) ?? false)
+          || fvaCalledOutside(rl, r, innerOf)
+          || !fvaRelayTwinInner(rl, r, sigs, innerOf, out, depth + 1)
+        ) {
+          return false
+        }
+      }
+    }
+  }
+  return true
+}
+
+// Whether relay `r` is called other than from a relay's return.
+function fvaCalledOutside(
+  rl: FvaRelayScan,
+  r: i32,
+  innerOf: {[i32]: i32},
+): boolean {
+  for c in rl.calls {
+    const cn = nodeAt(c)
+    if (
+      cn is Call
+      && !innerOf.has(c)
+      && calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn))) == r
+    ) {
+      return true
+    }
+  }
+  return false
 }
 
 // Notes in `fvaDeadReads` the maker reads of each relay nothing can run: not exported, not read as
@@ -4661,6 +4769,9 @@ function fvaRetsNamed(m: i32): boolean {
     if x < 0 || x >= P.nodes.length { return false }
     const n = nodeAt(x)
     if !(n is Ident) && !(n is FuncDecl) { return false }
+    // A name holding a call the maker returns whole relays that call (`fvaRelayCalls`).
+    const held: i32[] = []
+    if n is Ident && fvaRelayValueCalls(fn.fnBody, x, held, 0) { return false }
   }
   return rets.length > 0
 }

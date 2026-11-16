@@ -12,7 +12,17 @@ admission: a `-1` means the literal mints no row. It also answers the kept class
 The anonymous rows keep D5341's rule: a lone string literal is stored as the string it was
 written as, while a declared row stores it as the atom.
 
-Step B shrinks the ladder to the admission predicate.
+Step B shrinks the ladder to the admission predicate. **It is deferred**, because the ladder
+still answers the codes of the three kept classes from the same rungs that decide admission:
+D16720 and D16721 close in lane SLOT's slot-store stage 3, and D16722 in this lane after 3d. Done
+before those close, it would delete about 60 lines and be redone afterwards.
+
+The 131 admission refusals are not capability gaps. All 108 programs that hold one run (88
+distilled cells graded `runs`, 21 `tests/cases` files printing their `@log`), and so do the
+plainest programs where no other row can host the literal: a list-of-records, a nested-record and
+a map field, each fresh and un-annotated. A refusal means the literal mints no row of its own and
+is built at a declared twin, a stamped held rep or an instance's row. Step B names the predicate
+for that and grades it by `runs`.
 
 ## The reading that sized it
 
