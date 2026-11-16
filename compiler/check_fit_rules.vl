@@ -4,7 +4,7 @@
 // Each answers a type or a verdict for a node the core checker has already typed.
 
 import { noteNullHoleDelivery } from "./check_null_holes"
-import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
+import { cwDeclAssigned, cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
 import { recDropFits, recDropOnlyReads } from "./check_rec_drop"
 import { MemoGen, memoGenNew } from "./memo"
 import {
@@ -672,11 +672,11 @@ export function nullReadHoleTy(ix: i32, ty: i32): i32 {
 // `recordRepTyAdopt` records a literal's destination rep only while `tyReachesEmptyHole` holds,
 // so the recording happens on that same condition and before the pin.
 export function constrainEmptyExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
-  if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
+  if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy) {
     recordRepTyAdopt(srcExpr, dstTy)
   }
   if inferQuiet || srcExpr < 0 { return constrainEmpty(srcTy, dstTy) }
-  const src = if tyReachesEmptyHole(dstTy, 8) || nhOpen(dstTy) { nullReadHoleTy(srcExpr, srcTy) } else { srcTy }
+  const src = if tyReachesEmptyHole(dstTy) || nhOpen(dstTy) { nullReadHoleTy(srcExpr, srcTy) } else { srcTy }
   noteNullHoleDelivery(src, dstTy, srcExpr)
   holeLinkSiteSet(srcExpr, src, dstTy)
   constrainEmpty(src, dstTy)
@@ -1129,7 +1129,7 @@ export function tpIfCmpNode(ix: i32, t: i32) {
   const tpl = nodeTyIx[ix]
   if tpl < 0 || tpIfJoinAt.has(ix) { return 0 }
   const wt = widenLitTy(t)
-  if wt == tpl || !tyReachesUnion(wt, 6) { return 0 }
+  if wt == tpl || !tyReachesUnion(wt) { return 0 }
   let st = tpl
   if tyHasTyVar(tpl) {
     const n = nodeAt(ix)
@@ -1212,7 +1212,7 @@ export function listFieldWidenDst(srcExpr: i32, dstTy: i32): i32 {
   const e = nodeAt(parenPeelIx(srcExpr))
   if !(d is TyObj) { return -1 }
   // A union-bearing destination is the union-softening stamp's, in `assignableExpr`.
-  if tyReachesUnion(dtix, 8) { return -1 }
+  if tyReachesUnion(dtix) { return -1 }
   if e is ObjLit {
     if e.objFields.length != d.objFieldNames.length { return -1 }
     let differs = false
@@ -6477,13 +6477,19 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         recAdHeldDepth = recAdHeldDepth - 1
       }
       // One aliasing a literal binding keeps its type, and the literal is built at the record.
+      // A re-pointed one also holds what is written to it, which is delivered as the binding's
+      // own read would be (D16867).
       const od = recFreshOriginDecl(p, 6)
       if (
         od >= 0
         && nodeAt(od) is LetDecl
         && nodeAt(parenPeelIx(letInitAt(od))) is ObjLit
       ) {
-        recBuildPush(od, srcTy, nonNulTyOf(dstTy), false)
+        if cwDeclAssigned(od) {
+          recAdPushDecl(od, srcTy, nonNulTyOf(dstTy), false, p)
+        } else {
+          recBuildPush(od, srcTy, nonNulTyOf(dstTy), false)
+        }
       }
       return 0
     }
@@ -10355,8 +10361,9 @@ export function recFitNarrowKeepsRep(cur: i32, chk: i32): boolean {
 }
 
 // For `r is B` over a single record `r: A` (or `A | null`) where every `B` is an `A` but not
-// the reverse, the fields `B` narrows and the literal set each must hold (D4058). -1 when the
-// test is not that shape, 0 when a narrowed field is not a literal set over `A`'s, else 1.
+// the reverse, the fields `B` narrows and the type each must hold (D4058). -1 when the test is
+// not that shape, 0 when a narrowed field is not a literal set over `A`'s (every narrowed field
+// still listed), else 1.
 export function recFitNarrowedFields(
   obj: i32,
   chk: i32,
@@ -10372,6 +10379,7 @@ export function recFitNarrowedFields(
   if base < 0 { return -1 }
   const bt = tyAt(base)
   if !(bt is TyObj) || !recContainedIn(chk, base) { return -1 }
+  let shape = 1
   let i = 0
   while i < ct.objFieldNames.length {
     const fb = ct.objFieldTypes[i]
@@ -10379,14 +10387,14 @@ export function recFitNarrowedFields(
     if at < 0 { return 0 }
     const fa = bt.objFieldTypes[at]
     if !assignable(fa, fb) {
-      if tyLitSetMemberLexes(fb).length == 0 { return 0 }
+      if tyLitSetMemberLexes(fb).length == 0 { shape = 0 }
       names.push(ct.objFieldNames[i])
       sets.push(fb)
     }
     i = i + 1
   }
   if names.length == 0 { return 0 }
-  return 1
+  return shape
 }
 
 // Whether a value `x` yields may be a record that already exists: a leaf of it (through `if`,
