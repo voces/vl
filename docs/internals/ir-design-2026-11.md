@@ -755,6 +755,21 @@ step is exempt from the net-negative bar and meets these bars instead:
 
 C2e (list length) is the first.
 
+**A coverage step is chosen and sized with the blocker census.** The first-miss histogram ranks
+blockers, not payoffs: a row that falls only helps the functions it was the last blocker of. In
+C2f, a string literal step left coverage unchanged. The census (`$VL_IR_SHADOW=4`, `ir-shadow.vl
+-- --blockers`) builds each function past its missed statements and reports the set of classes
+that keeps it uncovered. A step's payoff is the functions whose set it empties, an upper bound
+since a statement stops at its first miss. The coverage bar is functions unblocked per line, read
+off the census before the step and confirmed by the shadow after it.
+
+**The six coercion seats wait for claiming (I3).** These are `numSeat`, `coerceHeld`, `boxSeat`,
+`armSeat`, `armServed` and `atomSeat`. They are legacy-only ambient state: an outer site sets one
+and a nested `emitExpr` reads it. Their readers are `emitExpr` itself for every unclaimed function,
+so no op-seam slice can route all of them through a shared arm. They stay until claiming covers
+coercion, and delete at I8. The coercion decisions are shared before then: `widenPlanOf` (C3a),
+and the held argument of the floor checks.
+
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
