@@ -344,7 +344,7 @@ import {
 import { checkMemberCallNode } from "./check_member_call"
 import { callTyArgsCalleeOk, popScope } from "./check_narrow_flow"
 import { noteHoleArgNullRead, pushScope } from "./check_narrow_paths"
-import { njFnIx } from "./check_nj_join"
+import { collectRetValues, njFnIx } from "./check_nj_join"
 import {
   checkBoundSubsumes,
   checkFnValueRetTyParamBound,
@@ -3076,6 +3076,7 @@ function callFtyPinCstrs(
     let hd = namedFn
     if hd < 0 { hd = constLambdaOf(cfn, n.callFn) }
     retTy = directHoleBodyRet(n, hd, vNames, vTys, retTy)
+    if hd < 0 { retTy = makerCallLamRet(n, cfn, retTy) }
     // A fallback like the join reject above: an operand refusal already names this call.
     const mis = genericDeclRetMisfit(hd, vNames, vTys, retTy)
     if mis >= 0 && T.diags.length == dBeforeC {
@@ -4246,6 +4247,59 @@ function constLambdaOf(cfn: Node, cfnIx: i32): i32 {
   const fn = nodeAt(f)
   if fn is FuncDecl && fn.fnName == "" { return f }
   return -1
+}
+
+// The result of call `n` through `const` binding `cfn` that holds a call of an un-annotated maker
+// returning one lambda it writes: the lambda's body at this call's arguments, under the binding
+// the maker call pinned (`adder(2)` pins `n` at `i32`, so `v(3)` over `a + n` is `i32`, D16798).
+// `retTy` when the binding holds no such call or the result stays open.
+function makerCallLamRet(n: Call, cfn: Node, retTy: i32): i32 {
+  if !(cfn is Ident) { return retTy }
+  const d = identConstDeclOf(n.callFn)
+  const l = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(l is LetDecl) || l.letInit < 0 || l.letType >= 0 { return retTy }
+  const mc = parenPeelIx(l.letInit)
+  const mcn = if mc >= 0 && mc < P.nodes.length { nodeAt(mc) } else { null }
+  if !(mcn is Call) { return retTy }
+  const mf = parenPeelIx(mcn.callFn)
+  const m = if mf >= 0 && nodeAt(mf) is Ident { identDeclOf(mf) } else { -1 }
+  const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+  if !(mn is FuncDecl) || mn.fnTyParams.length > 0 || mn.fnRet >= 0 {
+    return retTy
+  }
+  if mcn.callArgs.length != mn.fnParams.length { return retTy }
+  const rets: i32[] = []
+  collectRetValues(mn.fnBody, rets)
+  let lam = -1
+  for r in rets {
+    const x = parenPeelIx(r)
+    const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+    if !(xn is FuncDecl) || (lam >= 0 && lam != x) { return retTy }
+    lam = x
+  }
+  if lam < 0 { return retTy }
+  const names: string[] = []
+  const tys: i32[] = []
+  let i = 0
+  while i < mn.fnParams.length {
+    const pn = nodeAt(mn.fnParams[i])
+    if pn is Param && pn.parType < 0 {
+      const at = widenLitTy(nodeTyIxOf(parenPeelIx(mcn.callArgs[i])))
+      if at < 0 || tyHasTyVar(at) { return retTy }
+      names.push(paramHoleName(mn.fnName, m, i))
+      tys.push(at)
+    }
+    i = i + 1
+  }
+  if names.length == 0 { return retTy }
+  const ats: i32[] = []
+  for a in n.callArgs {
+    const at = widenLitTy(nodeTyIxOf(parenPeelIx(a)))
+    if at < 0 || tyHasTyVar(at) { return retTy }
+    ats.push(at)
+  }
+  const r = holeLamRetAt(lam, mkFuncTy(ats, TY_I32), names, tys)
+  return if r >= 0 && !tyHasTyVar(r) { r } else { retTy }
 }
 
 // The assigned binding the callee name at `cfnIx` reads, itself or through aliases bound once,
