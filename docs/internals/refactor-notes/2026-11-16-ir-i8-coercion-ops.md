@@ -134,7 +134,7 @@ Compiler lines are +128 / −64, 64 net: about 27 corpus functions per net line.
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the C2l seed, 12,213 cells | IDENTITY |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,214 claimed and byte-identical; corpus MODE3 |
+| corpus identity against the C2l seed, 12,213 cells | 8,934 identical, 3,279 fail under both, 0 differ (so legacy's seat removal moves no corpus byte) |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,214 claimed and byte-identical; corpus 8,934 identical, 0 differ, 0 fell back |
 | L2 self-compile fuel, C2l tree to this tree from one seed | 94,817,098,747 to 94,860,855,931 (+0.046%) |
 | seed size | 6,466,781 to 6,467,969 (+1,188) |
