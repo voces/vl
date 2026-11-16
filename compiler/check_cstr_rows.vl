@@ -28,6 +28,8 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyKeyOf,
+  tyPathCycles,
+  tyPathWith,
   tyValOf,
 } from "./check_types"
 import { wsNoteInstErr } from "./check_width"
@@ -82,6 +84,25 @@ export const LIP_APART = 0
 export const LIP_MEET = 1
 export const LIP_OPEN = 2
 
+// The list a list `is` test reads in operand type `t`: `t` itself, else the one list member of a
+// nullable or union; -1 when `t` holds no list or several, whose test keeps its own answer.
+export function tySoleListMember(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const u = tyAt(t)
+  if u is TyArray { return t }
+  if u is TyNullable { return tySoleListMember(u.nInner) }
+  if !(u is TyUnion) { return -1 }
+  let found = -1
+  for m in u.uMembers {
+    const ml = tySoleListMember(m)
+    if ml >= 0 {
+      if found >= 0 { return -1 }
+      found = ml
+    }
+  }
+  return found
+}
+
 // Each disjoint pin's list row and call, by test node: a row the unbound default settles after
 // the pin is an open list, and is re-counted as one at the program's end.
 export const listIsApartIx: i32[] = []
@@ -96,26 +117,32 @@ export function listIsApartNote(ix: i32, row: i32, call: i32) {
   return listIsPinNote(ix, LIP_APART, call)
 }
 
-// Each argument a direct call hands a declared function, and that function; and each watched
-// list test with the function its body belongs to. Read at the program's end, when the unbound
-// default has settled every open list.
+// Each argument a direct call hands a declared function, with the call, its position and that
+// function; and each watched list test with the function its body belongs to and the position of
+// the parameter it reads (-1 for none). Read at the program's end, when every open list has settled.
 export const listCallDecl: i32[] = []
 export const listCallArg: i32[] = []
+export const listCallPos: i32[] = []
+export const listCallIx: i32[] = []
 export const listIsOwnNode: i32[] = []
 export const listIsOwnDecl: i32[] = []
+export const listIsOwnPos: i32[] = []
 
-// Notes that a direct call hands function `decl` argument `arg`.
-export function listCallNote(decl: i32, arg: i32) {
+// Notes that direct call `call` hands function `decl` argument `arg` at position `pos`.
+export function listCallNote(call: i32, decl: i32, arg: i32, pos: i32) {
+  listCallIx.push(call)
   listCallDecl.push(decl)
   listCallArg.push(arg)
+  listCallPos.push(pos)
   return 0
 }
 
-// Notes that list test `ix` sits in the body of function `decl`.
-export function listIsOwnerNote(ix: i32, decl: i32) {
+// Notes that list test `ix` sits in the body of function `decl`, reading parameter `pos`.
+export function listIsOwnerNote(ix: i32, decl: i32, pos: i32) {
   if !i32ListHas(listIsOwnNode, ix) {
     listIsOwnNode.push(ix)
     listIsOwnDecl.push(decl)
+    listIsOwnPos.push(pos)
   }
   return 0
 }
@@ -157,8 +184,11 @@ export function listIsPinReset() {
   listIsApartCall.clear()
   listCallDecl.clear()
   listCallArg.clear()
+  listCallPos.clear()
+  listCallIx.clear()
   listIsOwnNode.clear()
   listIsOwnDecl.clear()
+  listIsOwnPos.clear()
   return 0
 }
 
@@ -541,7 +571,7 @@ export function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
       if !tyHasHole(want) && namesTopFnDecl(ix) { return 0 }
       // So does one held in a literal or handed back by a call: every hole rides such a
       // function's own signature, which the delivery judged against `want` (D9031).
-      if !tyHasHole(want) && tyHolesOnlyInTopFnSigs(got, 8) { return 0 }
+      if !tyHasHole(want) && tyHolesOnlyInTopFnSigs(got) { return 0 }
     }
     letCstrRow(got, want, ix, name, owner)
   }
@@ -603,37 +633,44 @@ function namesTopFnDecl(ix: i32): boolean {
 
 // Whether every hole in `ty` sits inside the open signature of a top-level function with an
 // un-annotated parameter whose body is not being checked; false at the depth floor.
-function tyHolesOnlyInTopFnSigs(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+function tyHolesOnlyInTopFnSigs(ty: i32): boolean {
+  const path: i32[] = []
+  return tyHolesOnlyInTopFnSigsIn(ty, path)
+}
+
+function tyHolesOnlyInTopFnSigsIn(ty: i32, path: i32[]): boolean {
+  if tyPathCycles(ty, path) { return false }
+  const sub = tyPathWith(ty, path)
+  if ty < 0 || ty >= T.tys.length { return false }
   if !tyHasHole(ty) { return true }
   const t = tyAt(ty)
   return match t {
     TyFunc => {
       if fnTyIsTopHoleSig(t) { return true }
       for p in t.fnParamTypes {
-        if !tyHolesOnlyInTopFnSigs(p, depth - 1) { return false }
+        if !tyHolesOnlyInTopFnSigsIn(p, sub) { return false }
       }
-      tyHolesOnlyInTopFnSigs(t.fnRet, depth - 1)
+      tyHolesOnlyInTopFnSigsIn(t.fnRet, sub)
     }
-    TyArray => tyHolesOnlyInTopFnSigs(tyElemOf(t), depth - 1)
-    TyNullable => tyHolesOnlyInTopFnSigs(t.nInner, depth - 1)
+    TyArray => tyHolesOnlyInTopFnSigsIn(tyElemOf(t), sub)
+    TyNullable => tyHolesOnlyInTopFnSigsIn(t.nInner, sub)
     TyMap => {
-      tyHolesOnlyInTopFnSigs(tyKeyOf(t), depth - 1)
-        && tyHolesOnlyInTopFnSigs(tyValOf(t), depth - 1)
+      tyHolesOnlyInTopFnSigsIn(tyKeyOf(t), sub)
+        && tyHolesOnlyInTopFnSigsIn(tyValOf(t), sub)
     }
     TyObj => {
       for f in t.objFieldTypes {
-        if !tyHolesOnlyInTopFnSigs(f, depth - 1) { return false }
+        if !tyHolesOnlyInTopFnSigsIn(f, sub) { return false }
       }
       true
     }
     TyUnion => {
       for m in t.uMembers {
-        if !tyHolesOnlyInTopFnSigs(m, depth - 1) { return false }
+        if !tyHolesOnlyInTopFnSigsIn(m, sub) { return false }
       }
       true
     }
-    TyNeg => tyHolesOnlyInTopFnSigs(t.negTy, depth - 1)
+    TyNeg => tyHolesOnlyInTopFnSigsIn(t.negTy, sub)
     TyVar | TyPrim | TyErr | TyLit => false
   }
 }

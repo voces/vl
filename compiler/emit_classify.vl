@@ -5,7 +5,13 @@ import { unRowOfNullableKey } from "./emit_union_tykey_text"
 import { valueRowKind } from "./check_ty_rep"
 import { numPrimTyOfKind } from "./tyquery"
 import { mapStoredTyOf } from "./check_fn_tag_facts"
-import { TY_V128, cUserTypes, tyPrimNameIs } from "./check_types"
+import {
+  TY_V128,
+  cUserTypes,
+  tyPathCycles,
+  tyPathWith,
+  tyPrimNameIs,
+} from "./check_types"
 import { storageNormTy, widenLitTy } from "./check_relate_core"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
@@ -4356,7 +4362,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     const nf = o.objFields.length
     // An instance typing the literal as holding a tagged set's id builds it at the row for that.
     const ir = sLitIdRow.get(objIx) ?? -1
-    if ir >= 0 && fnIx >= 0 && fnTagHoldsTy(elabNodeTyAt(objIx, fnIx), 4) {
+    if ir >= 0 && fnIx >= 0 && fnTagHoldsTy(elabNodeTyAt(objIx, fnIx)) {
       return ir
     }
     // A bare `{}` completes the record the checker adopted for it, which a field-count scan
@@ -4419,7 +4425,7 @@ function objLitTaggedFieldRow(objIx: i32): i32 {
     const ft = ot.objFieldTypes[i]
     const fv = objFieldVal(objIx, ot.objFieldNames[i])
     const vt = if fv >= 0 { nodeTyAt(fv, emitCurFnIx) } else { -1 }
-    const tagged = vt >= 0 && (fnTagTyIsTagged(vt) || fnTagHoldsTy(vt, 4))
+    const tagged = vt >= 0 && (fnTagTyIsTagged(vt) || fnTagHoldsTy(vt))
     if tagged && vt != ft {
       tys.push(vt)
       moved = true
@@ -11813,7 +11819,7 @@ function arrLitOwnRow(exprIx: i32, fnIx: i32): i32 {
   const lt = nodeTyInOf(li, fnIx)
   if !tyIsRefArray(lt) { return -1 }
   const mint = arrLitRlSlotAt(li)
-  if mint >= 0 && mint < rlElemName.length && !tyNamesDeclaredParam(lt, 12) {
+  if mint >= 0 && mint < rlElemName.length && !tyNamesDeclaredParam(lt) {
     return mint
   }
   const own = arrLitRowSlotIn(li, fnIx)
@@ -11822,33 +11828,40 @@ function arrLitOwnRow(exprIx: i32, fnIx: i32): i32 {
 
 // Whether type `t` names a declared type parameter within `depth` steps. An inference hole is a
 // `TyVar` too, so `tyHasTyVar` cannot tell the two apart.
-function tyNamesDeclaredParam(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth <= 0 { return false }
+function tyNamesDeclaredParam(t: i32): boolean {
+  const path: i32[] = []
+  return tyNamesDeclaredParamIn(t, path)
+}
+
+function tyNamesDeclaredParamIn(t: i32, path: i32[]): boolean {
+  if tyPathCycles(t, path) { return false }
+  const sub = tyPathWith(t, path)
+  if t < 0 || t >= T.tys.length { return false }
   if tyIsDeclaredParam(t) { return true }
   const a = tyAt(t)
   return match a {
-    TyArray => tyNamesDeclaredParam(tyElemOf(a), depth - 1)
-    TyNullable => tyNamesDeclaredParam(a.nInner, depth - 1)
-    TyNeg => tyNamesDeclaredParam(a.negTy, depth - 1)
+    TyArray => tyNamesDeclaredParamIn(tyElemOf(a), sub)
+    TyNullable => tyNamesDeclaredParamIn(a.nInner, sub)
+    TyNeg => tyNamesDeclaredParamIn(a.negTy, sub)
     TyMap => {
-      tyNamesDeclaredParam(tyKeyOf(a), depth - 1)
-        || tyNamesDeclaredParam(tyValOf(a), depth - 1)
+      tyNamesDeclaredParamIn(tyKeyOf(a), sub)
+        || tyNamesDeclaredParamIn(tyValOf(a), sub)
     }
     TyObj => {
       for f in a.objFieldTypes {
-        if tyNamesDeclaredParam(f, depth - 1) { return true }
+        if tyNamesDeclaredParamIn(f, sub) { return true }
       }
       false
     }
     TyFunc => {
       for p in a.fnParamTypes {
-        if tyNamesDeclaredParam(p, depth - 1) { return true }
+        if tyNamesDeclaredParamIn(p, sub) { return true }
       }
-      tyNamesDeclaredParam(a.fnRet, depth - 1)
+      tyNamesDeclaredParamIn(a.fnRet, sub)
     }
     TyUnion => {
       for m in a.uMembers {
-        if tyNamesDeclaredParam(m, depth - 1) { return true }
+        if tyNamesDeclaredParamIn(m, sub) { return true }
       }
       false
     }
@@ -14681,7 +14694,7 @@ function readRepOf(ix: i32, fnIx: i32): ReadRep {
   // neither is served the other's memo entry.
   if isStorageRead(rx) { return readRepGo(ix, fnIx) }
   const t = nodeTyIxOf(rx)
-  if t < 0 || tyHasTyVar(t) { return readRepGo(ix, fnIx) }
+  if t < 0 || tyHasTyVar(t) { return readRepInQuery(ix, rx, fnIx) }
   // A call's result storage reads per-function banks a pass fills in place, outside the key.
   if nodeAt(rx) is Call { return readRepGo(ix, fnIx) }
   if readRepMoved() { memoGenAdvance(rrGen) }
@@ -14697,6 +14710,38 @@ function readRepOf(ix: i32, fnIx: i32): ReadRep {
   rrStamp[rx] = rrGen.at
   rrFn[rx] = fnIx
   rrVal[rx] = v
+  return v
+}
+
+// `readRepGo` for a read whose type names a type variable, remembered only while the outermost
+// such read is answered: the instance cannot change inside it, and a chain of field reads asks
+// each receiver more than once.
+let rrQDepth = 0
+let rrQVal: {[i32]: ReadRep} = Map()
+let rrQFn: {[i32]: i32} = Map()
+let rrQGen: {[i32]: i32} = Map()
+function readRepInQuery(ix: i32, rx: i32, fnIx: i32): ReadRep {
+  if readRepMoved() { memoGenAdvance(rrGen) }
+  const have = rrQVal[rx]
+  if (
+    have != null
+    && (rrQFn[rx] ?? -2) == fnIx
+    && (rrQGen[rx] ?? -1) == rrGen.at
+  ) {
+    return have
+  }
+  rrQDepth = rrQDepth + 1
+  const v = readRepGo(ix, fnIx)
+  rrQDepth = rrQDepth - 1
+  if rrQDepth == 0 {
+    rrQVal = Map()
+    rrQFn = Map()
+    rrQGen = Map()
+  } else {
+    rrQVal[rx] = v
+    rrQFn[rx] = fnIx
+    rrQGen[rx] = rrGen.at
+  }
   return v
 }
 

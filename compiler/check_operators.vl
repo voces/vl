@@ -60,6 +60,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  hasNamedArgs,
   i32ToStr,
   mkBinary,
   mkBlock,
@@ -95,6 +96,7 @@ import {
 } from "./check_elab_cap"
 import {
   declareAmbient,
+  identFnDeclOf,
   identIsConst,
   identSlotOf,
   identStoreTyOf,
@@ -152,11 +154,14 @@ import {
 import {
   listCallArg,
   listCallDecl,
+  listCallIx,
+  listCallPos,
   listIsApartCall,
   listIsApartIx,
   listIsApartRow,
   listIsOwnDecl,
   listIsOwnNode,
+  listIsOwnPos,
   listIsOwnerNote,
   listIsPinAt,
   listIsPinFixed,
@@ -171,6 +176,7 @@ import {
   noteIsCstr,
   noteLetCstr,
   noteMemCstr,
+  tySoleListMember,
 } from "./check_cstr_rows"
 import { curFnDeclIx, inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
 import { ctnBindingDeclOf, ctnWrRecvPut, wrDstDeclPut } from "./check_decl_scan"
@@ -1437,8 +1443,8 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     if assignable(rt, lt) { adoptLitAt(n.binRight, lt) }
     else if assignable(lt, rt) { adoptLitAt(n.binLeft, rt) }
     // A number literal compared with a value is read at the value's width (`u == 5` over `i64 | string`).
-    if cexLitPeel(n.binRight) >= 0 { numLitAdoptDeep(n.binRight, lt, 6) }
-    if cexLitPeel(n.binLeft) >= 0 { numLitAdoptDeep(n.binLeft, rt, 6) }
+    if cexLitPeel(n.binRight) >= 0 { numLitAdoptDeep(n.binRight, lt) }
+    if cexLitPeel(n.binLeft) >= 0 { numLitAdoptDeep(n.binLeft, rt) }
     let eqTy = lt
     let eqPath = eqListFieldPath(lt, [])
     if eqPath == "" {
@@ -3029,31 +3035,93 @@ function isPinnedDecl(d: i32): boolean {
   }
 }
 
-// Whether some call of the function enclosing `is` test `ix` hands it a list nothing fixed: an
-// empty literal, or one whose element the unbound default settled. Such a call may share an
-// instance with a disjoint one, so the test keeps the emptiness answer there.
-function listTestOwnerHasOpenCall(ix: i32): boolean {
+// A call argument the function enclosing `is` test `ix` is handed that no annotation or write
+// fixed: an empty literal, or a list the unbound default settled; -1 for none. Where the test
+// reads a parameter, only an argument at that parameter's position counts. With `apartOnly`, an
+// argument of a call that is itself a disjoint pin, through its type arguments, does not count.
+function listTestOwnerOpenArg(ix: i32, apartOnly: boolean): i32 {
   const o = i32ListIndexOf(listIsOwnNode, ix)
-  if o < 0 { return false }
+  if o < 0 { return -1 }
   const d = listIsOwnDecl[o]
-  if d < 0 { return false }
+  const pos = listIsOwnPos[o]
+  if d < 0 { return -1 }
   let c = 0
   while c < listCallDecl.length {
-    if listCallDecl[c] == d {
+    if (
+      listCallDecl[c] == d
+      && (pos < 0 || listCallPos[c] == pos || listCallPos[c] < 0)
+    ) {
       const a = listCallArg[c]
-      const an = nodeAt(parenPeelIx(a))
-      if an is ArrayLit && an.arrElems.length == 0 { return true }
-      const at = nodeTyIxOf(a)
-      if at >= 0 && at < T.tys.length && tyAt(at) is TyArray {
-        // A type parameter's list is re-pinned at its own callers, which count there.
-        if !tyHasTyVar(at) && (tyHasHole(at) || rowSettledByDefault(at)) {
-          return true
-        }
+      if (
+        listArgOpen(a)
+        && (!apartOnly || !i32ListHas(listIsApartCall, listCallIx[c]))
+      ) {
+        return a
       }
     }
     c = c + 1
   }
+  return -1
+}
+
+// Whether a disjoint pin of list test `ix` may hand an empty list: any but a direct call handing
+// a non-empty literal at the tested parameter, whose answer no rule changes.
+function listApartMayBeEmpty(ix: i32): boolean {
+  const o = i32ListIndexOf(listIsOwnNode, ix)
+  const d = if o >= 0 { listIsOwnDecl[o] } else { -1 }
+  const pos = if o >= 0 { listIsOwnPos[o] } else { -1 }
+  let q = 0
+  while q < listIsApartIx.length {
+    if listIsApartIx[q] == ix && !rowSettledByDefault(listIsApartRow[q]) {
+      if !callHandsFilledList(listIsApartCall[q], d, pos) { return true }
+    }
+    q = q + 1
+  }
   return false
+}
+
+// Whether call `call` of function `d` hands a non-empty list literal at parameter `pos`.
+function callHandsFilledList(call: i32, d: i32, pos: i32): boolean {
+  if call < 0 || call >= P.nodes.length || d < 0 || pos < 0 { return false }
+  const cn = nodeAt(call)
+  if (
+    !(cn is Call)
+    || hasNamedArgs(cn.callArgNames)
+    || pos >= cn.callArgs.length
+  ) {
+    return false
+  }
+  if identFnDeclOf(cn.callFn) != d { return false }
+  const an = nodeAt(parenPeelIx(cn.callArgs[pos]))
+  return an is ArrayLit && an.arrElems.length > 0
+}
+
+// Whether call argument `a` is a list nothing fixed. A type parameter's list is re-pinned at its
+// own callers, which count there.
+function listArgOpen(a: i32): boolean {
+  const an = nodeAt(parenPeelIx(a))
+  if an is ArrayLit && an.arrElems.length == 0 { return true }
+  const at = nodeTyIxOf(a)
+  if at < 0 || at >= T.tys.length || !(tyAt(at) is TyArray) { return false }
+  return !tyHasTyVar(at) && (tyHasHole(at) || rowSettledByDefault(at))
+}
+
+// The position of the parameter of function `decl` that operand `ix` reads, through field reads;
+// -1 when it reads none.
+function testParamPos(ix: i32, decl: i32): i32 {
+  if decl < 0 || decl >= P.nodes.length { return -1 }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) { return -1 }
+  let x = parenPeelIx(ix)
+  let guard = 0
+  while x >= 0 && x < P.nodes.length && guard < 32 {
+    const xn = nodeAt(x)
+    if xn is Member { x = parenPeelIx(xn.memObj) }
+    else if xn is Ident { return i32ListIndexOf(dn.fnParams, identDeclOf(x)) }
+    else { return -1 }
+    guard = guard + 1
+  }
+  return -1
 }
 
 // Whether the program's end settled the list-test pins; until then a pin may still come.
@@ -3102,17 +3170,22 @@ export function settleListIsPins() {
     const allApart = listIsPinFixed[k] > 0
       && listIsPinOther[k] == 0
       && listIsPinMeet[k] == 0
-    const noOpen = listIsPinOther[k] == 0 && !listTestOwnerHasOpenCall(ix)
+    const noOpen = listIsPinOther[k] == 0 && listTestOwnerOpenArg(ix, false) < 0
+    const openArg = listTestOwnerOpenArg(ix, true)
+    const openAt = if listIsPinOther[k] > 0 { listIsPinOtherAt[k] } else { openArg }
     if listIsPinFixed[k] > 0 && noOpen { listIsFixedOnlySet.push(ix) }
     if allApart && noOpen {
       listIsNeverSet.push(ix)
       settleIsNever(ix)
-    } else if listIsPinFixed[k] > 0 && listIsPinOther[k] > 0 {
+    } else if (
+      listIsPinFixed[k] > 0
+      && (listIsPinOther[k] > 0 || openArg >= 0 && listApartMayBeEmpty(ix))
+    ) {
       tErr(
         "this call hands a list whose element type is fixed, which the `is` test at line "
           + i32ToStr(nodeLineOf(ix))
           + " can never match, while the call at line "
-          + i32ToStr(nodeLineOf(listIsPinOtherAt[k]))
+          + i32ToStr(nodeLineOf(openAt))
           + " hands one it can; one body cannot answer both yet — annotate the parameter",
         listIsPinAt[k],
       )
@@ -3131,16 +3204,25 @@ function listIsFixedOnly(ix: i32): boolean {
   return listIsPinDone && i32ListHas(listIsFixedOnlySet, ix)
 }
 
-// Whether operand type `ot` is a list whose fixed element never meets tested list `chk`.
+// Whether operand type `t` is a list of a type parameter, alone or as the one list member of a
+// nullable or union.
+function tyListOfTyVar(t: i32): boolean {
+  const l = tySoleListMember(t)
+  return l >= 0 && tyHasTyVar(l)
+}
+
+// Whether operand type `ot` holds one list, whose fixed element never meets tested list `chk`.
 function listApartAt(ot: i32, chk: i32): boolean {
   if ot < 0 || ot >= T.tys.length || tyHasHole(ot) || tyHasTyVar(ot) {
     return false
   }
-  const o = tyAt(ot)
+  const ol = tySoleListMember(ot)
+  if ol < 0 { return false }
+  const o = tyAt(ol)
   if !(o is TyArray) || tyElemOpen(o) || tyIsUnionShaped(tyElemOf(o)) {
     return false
   }
-  return !assignable(chk, ot)
+  return !assignable(chk, ol)
 }
 
 // The list tests `settleListIsPins` settled as `never`.
@@ -3407,15 +3489,14 @@ function checkIsExprAt(n: IsExpr, ix: i32) {
     }
     // A list test over a type parameter, or a list of one, is settled from its pins too (D16342).
     else if (
-      (tyAt(objTy) is TyVar
-        || tyAt(objTy) is TyArray && tyHasTyVar(objTy) && isPinnedRead(n.isObj))
+      (tyAt(objTy) is TyVar || tyListOfTyVar(objTy) && isPinnedRead(n.isObj))
       && tyAt(chkTy) is TyArray
     ) {
       noteIsCstr(objTy, chkTy, n.isVariant, ix)
     }
     if tyAt(chkTy) is TyArray && !elabCapLive() {
       neverIsWatchNote(ix)
-      listIsOwnerNote(ix, curFnDeclIx)
+      listIsOwnerNote(ix, curFnDeclIx, testParamPos(n.isObj, curFnDeclIx))
     }
     // Soundness: `x is T` is meaningful only when `T` is assignable to `x`'s type, since the
     // then branch narrows verbatim — an ungated test would launder invalid wasm through a newtype.
