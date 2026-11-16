@@ -1658,6 +1658,19 @@ function drwRecvClone(ix: i32) {
 // so there is nothing to re-read and its caller declined the guard before asking.
 function drwRecvNotAPlace(ix: i32) { return ix }
 
+// Whether `ix` is a name, or a field read off one, whose skipped read loses no effect.
+function drwPureRecv(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is Ident { return true }
+  if n is Paren { return drwPureRecv(n.parInner) }
+  if n is Member { return drwPureRecv(n.memObj) }
+  return drwRecvMayEvaluate(ix)
+}
+
+// Every `Node` kind `drwPureRecv` does not walk, as one answer: reading it may evaluate something.
+function drwRecvMayEvaluate(_ix: i32): boolean { return false }
+
 // Wraps a rewritten optional call in the one guard its `?.` asks for — `if recv != null
 // { call } else { null }` — so the call itself lowers through the path it would have had
 // without the `?.`. `recvIx` is -1 for every other call, which passes through untouched
@@ -1670,6 +1683,14 @@ function drwOptGuard(
   atStmt: boolean,
 ) {
   if recvIx < 0 { return res }
+  // A call off a name or field only ever `null` is never made: it reads `null` (D16841).
+  if nodeTyIxOf(ix) == TY_NULL && drwPureRecv(recvIx) {
+    capMemoNoteEdit()
+    if atStmt { return mkBlock([], pos) }
+    const nl = mkNull("null", pos)
+    nodeTyRecord(nl, TY_NULL)
+    return nl
+  }
   const gThen: i32[] = []
   gThen.push(res)
   // A `void` call has no value to fold a null through, and neither has one whose value the
@@ -1694,6 +1715,12 @@ function drwOptGuard(
   // D969 — the `| null` belongs to the `if` from here on, and the call node keeps the
   // return the guarded arm actually leaves on the stack.
   nodeTyCarry(gIf, ix)
+  // A call through a hole is typed its result alone; the guard's value also holds the null arm,
+  // so an instance closes it at the result `| null` (D16339).
+  const gTy = nodeTyIxOf(ix)
+  if gElse >= 0 && gTy >= 0 && gTy < T.tys.length && tyAt(gTy) is TyVar {
+    nodeTyRecord(gIf, mkNullableTyOf(gTy))
+  }
   optCallRestamp(ix)
   return gIf
 }
