@@ -8,7 +8,7 @@ import {
   sharedFieldArmNulSet,
   sharedFieldArmSetTexts,
 } from "./emit_obj_lit_fits"
-import { armFieldElemTyIx } from "./emit_state"
+import { armFieldElemTyIx, armFieldStoreTy, sFieldStoreTy } from "./emit_state"
 import { cUserTypes, unionAliasDeclNameOfTy } from "./check_types"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import {
@@ -1647,6 +1647,8 @@ import {
   boxAtomKindOfMemberTy,
   boxTagOfPrim,
   boxTagOfTy,
+  fieldElemTyIn,
+  fieldLitTyIn,
   mapShapeKeyInt,
   mapShapeKeyKind,
   msHasPlainValKind,
@@ -11033,7 +11035,7 @@ function emitStructUnionEq(
 
 // The element type of field row `ufi` (`sFieldElemTyIx`), or -1 out of range.
 function sFieldElemTyIxOfRow(ufi: i32): i32 {
-  return if ufi >= 0 && ufi < sFieldElemTyIx.length { sFieldElemTyIx[ufi] } else { -1 }
+  return if ufi >= 0 && ufi < sFieldElemTyIx.length { fieldElemTyIn(sFieldElemTyIx, sFieldStoreTy, ufi, "wasmEmit:11036") } else { -1 }
 }
 
 // The arm columns of a box `==` over union type `uty`, index-parallel to its member types `tys`: a struct arm
@@ -11495,7 +11497,9 @@ function variantFieldCodeComparable(vi: i32, ufi: i32, c: VKind): boolean {
 function variantRefListFieldSlot(ufi: i32): i32 {
   if fieldRowSlotTable(ufi) != "reflist" { return 0 - 1 }
   if ufi >= sFieldElemTyIx.length { return 0 - 1 }
-  return rlSlotOfTyOrTwin(sFieldElemTyIx[ufi])
+  return rlSlotOfTyOrTwin(
+    fieldElemTyIn(sFieldElemTyIx, sFieldStoreTy, ufi, "wasmEmit:11498"),
+  )
 }
 
 // D1061 — the box tag of one arm of a mixed struct/scalar union, from whichever of the two
@@ -12254,10 +12258,9 @@ function sharedFieldPlanDispatchable(
 function armFieldsBoxAlike(a: i32, b: i32): boolean {
   const tys = armFieldElemTyIx()
   if a < 0 || b < 0 || a >= tys.length || b >= tys.length { return false }
-  return tys[a] >= 0
-    && tys[b] >= 0
-    && valueBoxOfTy(tys[a])
-    && valueBoxOfTy(tys[b])
+  const ta = fieldElemTyIn(tys, armFieldStoreTy(), a, "boxAlike")
+  const tb = fieldElemTyIn(tys, armFieldStoreTy(), b, "boxAlike")
+  return ta >= 0 && tb >= 0 && valueBoxOfTy(ta) && valueBoxOfTy(tb)
 }
 
 // Whether the plan `code` boxes member `vi0`'s field rather than reading it as stored: the
@@ -12692,7 +12695,10 @@ function sharedFieldTysIdentical(vis: i32[], fis: i32[]): boolean {
       return false
     }
     if at0 < 0 || at0 >= sFieldNames.length { return false }
-    if !variantRowFieldTysSame(at, at0) || sFieldLitTyIx[at] >= 0 {
+    if (
+      !variantRowFieldTysSame(at, at0)
+      || fieldLitTyIn(sFieldLitTyIx, sFieldStoreTy, at, "wasmEmit:12695") >= 0
+    ) {
       return false
     }
     if variantFieldIsLitUnion(vis[i], fis[i]) { return false }
@@ -16302,6 +16308,8 @@ function emitMapSetV(
       }
     }
   }
+  // A Set's store leaves its never-read `vals` alone, on helper rows of its own.
+  const mset = mapShapeIsSet(mapShapeOfExpr(recvIx, fnIx))
   // Receiver + key onto the operand stack; `cmSlot` pinned to the shape.
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   const mslot = cmSlot
@@ -16317,8 +16325,8 @@ function emitMapSetV(
   cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
   // A set whose value the assignment yields keeps it in the value stash.
   const park = asgParkWanted && !valConst1 && !msHelp
-  // [mapRef, key, value] are the shape's store helper's params, in order.
-  const setFn = mapSetFnOf(mslot)
+  // [mapRef, key, value] are the shape's store helper's params, in order; a Set has its own.
+  const setFn = mapSetFnOf(if mset { mapShapeOfSet(mslot) } else { mslot })
   if setFn >= 0 {
     if park { fbLocalTee(mapSetValStashLocal(mslot)) }
     fbCall(setFn)
@@ -16328,7 +16336,7 @@ function emitMapSetV(
   if setMapSetValStash(mslot) < 0 { return -1 }
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef()              // mapRef
-  const stRc = emitMapSetStore(mslot)
+  const stRc = emitMapSetStore(mslot, mset)
   if park { mapSetParked(mslot) }
   return stRc
 }
@@ -16366,20 +16374,37 @@ function mapSetFnOf(sh: i32) {
 }
 
 // The row of map shape `sh` in the per-shape helper tables: 0 the string-keyed mono map, 1 the
-// i32-keyed one, `2 + s` mv slot `s`, the last the i64-keyed one; a Set rows as its key's map.
+// i32-keyed one, `2 + s` mv slot `s`, then the i64-keyed one, then the string-, i32- and
+// i64-keyed Set, whose helpers leave its `vals` alone.
 function mapShapeRow(sh: i32) {
-  if sh == -1 || sh == -2 { return 0 }
-  if sh == -4 || sh == -5 { return 1 }
-  if sh == -6 || sh == -7 { return mvMapTypeIdx.length + 2 }
+  if sh == -1 { return 0 }
+  if sh == -4 { return 1 }
+  if sh == -6 { return mvMapTypeIdx.length + 2 }
+  if sh == -2 { return mvMapTypeIdx.length + 3 }
+  if sh == -5 { return mvMapTypeIdx.length + 4 }
+  if sh == -7 { return mvMapTypeIdx.length + 5 }
   if sh < 0 { return -1 }
   return sh + 2
+}
+
+// Whether map shape `sh` is a Set's, string-, i32- or i64-keyed.
+function mapShapeIsSet(sh: i32): boolean {
+  return sh == -2 || sh == -5 || sh == -7
+}
+
+// The Set shape over the same key as mono map shape `sh`; `sh` itself for any other shape.
+function mapShapeOfSet(sh: i32) {
+  if sh == -1 { return -2 }
+  if sh == -4 { return -5 }
+  if sh == -6 { return -7 }
+  return sh
 }
 
 // `__map_set_<row>__(m, k, v)`'s functype for map shape `sh`: the map, its key rep and the value
 // in the type a set site's value expression leaves.
 export function mapSetFuncType(sh: i32) {
   const saved = cmSlot
-  cmSlot = sh
+  cmSlot = mapShapeFoldSet(sh)
   fbFuncTypeHead(3)
   fbRefValtype(cmMapTy())
   const k = cmKeyKind()
@@ -16409,7 +16434,7 @@ export function mapSetFnBody(sh: i32): u8[] {
   const prev = wTarget(body)
   const savedSlot = cmSlot
   const savedBase = mapScratchBase
-  cmSlot = sh
+  cmSlot = mapShapeFoldSet(sh)
   wULEB(6)
   wULEB(3)
   fbValtype("i32", -1) // 3 slot, 4 cap, 5 entry
@@ -16429,7 +16454,7 @@ export function mapSetFnBody(sh: i32): u8[] {
   fbRefValtype(aTy()) // 12 liveBk, 13 hashBk
   mapScratchBase = 0
   msHelp = true
-  emitMapSetStore(sh)
+  emitMapSetStore(cmSlot, mapShapeIsSet(sh))
   msHelp = false
   mapScratchBase = savedBase
   cmSlot = savedSlot
@@ -16439,23 +16464,30 @@ export function mapSetFnBody(sh: i32): u8[] {
 }
 
 // A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
-// appends, compacting first when the dead entries call for it, and maybe resizes.
-function emitMapSetStore(mslot: i32) {
+// appends, compacting first when the dead entries call for it, and maybe resizes. A Set's
+// (`isSet`) leaves its `vals` alone: a hit does nothing and a miss pushes only the key.
+function emitMapSetStore(mslot: i32, isSet: boolean) {
   emitMapProbe(true, true)
   pushMapScr(5) // entry
-  fbIf(64)      // if (entry != 0 → overwrite), void
-  // OVERWRITE: vals.backing[entry-1] = stash
-  pushMapVals()
-  fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
-  pushMapScr(5)                // entry
-  fbI32Const(1)
-  fbI32Bin(107)                // i32.sub (entry - 1)
-  pushMapSetValStash(mslot)
-  fbArraySet(cmValsBack())     // array.set
-  fbElse()                     // else
+  if isSet {
+    // A Set's present key has nothing to overwrite: only a miss appends.
+    fbI32Eqz()
+    fbIf(64) // if (entry == 0 → append), void
+  } else {
+    fbIf(64) // if (entry != 0 → overwrite), void
+    // OVERWRITE: vals.backing[entry-1] = stash
+    pushMapVals()
+    fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
+    pushMapScr(5)                // entry
+    fbI32Const(1)
+    fbI32Bin(107)                // i32.sub (entry - 1)
+    pushMapSetValStash(mslot)
+    fbArraySet(cmValsBack())     // array.set
+    fbElse()                     // else
+  }
   // APPEND. Reclaim the dead entries first once they outnumber the live ones by
   // `INITIAL_CAP`: compaction rebuilds the index, so the free slot is probed again (D2315).
-  const cmpFn = mapCompactFnOf(mslot)
+  const cmpFn = mapCompactFnOf(if isSet { mapShapeOfSet(mslot) } else { mslot })
   if cmpFn >= 0 {
     pushMapCount()
     pushMapSize()
@@ -16490,7 +16522,7 @@ function emitMapSetStore(mslot: i32) {
   fbArraySet(aTy()) // array.set
   // keys.push(keyRef) ; vals.push(stash)  (clobbers slots 3/4 — already linked above).
   if emitMapPushKey() < 0 { return -1 }
-  if emitMapPushVal() < 0 { return -1 }
+  if !isSet && emitMapPushVal() < 0 { return -1 }
   // count = count + 1
   pushMapRef()              // mapRef (struct.set receiver)
   pushMapCount()
@@ -18276,6 +18308,29 @@ export function idxCellReadIsNull(idxIx: i32, fnIx: i32): boolean {
   return cboxReadTy.has(idxIx) && isNullTy(readNarrowedTyAt(idxIx, fnIx))
 }
 
+// The arm `emitIndex` lowers read `nd` by, from its receiver's rep, in the order the reps must be
+// asked: the nullable and string-element lists before the plain scalar list, which does not see
+// through either. A shared cell's null read is asked before this.
+export type IdxArm = "twolists"
+  | "nulscalar"
+  | "ref"
+  | "nulstr"
+  | "str"
+  | "scalar"
+  | "string"
+  | "none"
+
+export function idxArmOf(nd: Index, fnIx: i32): IdxArm {
+  if twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx) != "" { return "twolists" }
+  if exprNulScalarListKind(nd.idxArr, fnIx) != null { return "nulscalar" }
+  if exprRefArray(nd.idxArr, fnIx) { return "ref" }
+  if exprNulStrArray(nd.idxArr, fnIx) { return "nulstr" }
+  if exprStringArray(nd.idxArr, fnIx) { return "str" }
+  if scalarListElemKind(nd.idxArr, fnIx) != null { return "scalar" }
+  if exprString(nd.idxArr, fnIx) { return "string" }
+  return "none"
+}
+
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
   if nd is Index {
@@ -18284,62 +18339,46 @@ function emitIndex(idxIx: i32, fnIx: i32) {
     if idxCellReadIsNull(idxIx, fnIx) {
       if emitNullReadAtDst(idxIx, fnIx) { return 0 }
     }
-    const tlm = twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx)
-    if tlm != "" { return emitFailAt(tlm, idxIx) }
-    // A DISTINCT-backing nullable scalar list `t[i]` (narrowed inside `if t != null`): the slot is
-    // `(ref null $wrapper)`, so recover non-null (the guard proved it present) then read as the leaf
-    // list. Checked FIRST — the plain classifiers below do not see through the `| null`.
-    const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
-    if nsk != null { return emitIndexNulScalarList(nd, nsk, fnIx) }
-    // A REF list `xs[i]`.
-    if exprRefArray(nd.idxArr, fnIx) {
-      return emitIndexRefList(nd, idxIx, fnIx)
+    return match idxArmOf(nd, fnIx) {
+      "twolists" => emitFailAt(twoListUseMsg(nd.idxArr, OP_INDEX_GET, fnIx), idxIx)
+      "nulscalar" => emitIndexNulScalarList(nd, fnIx)
+      "ref" => emitIndexRefList(nd, idxIx, fnIx)
+      // A `(string | null)[]` element stays nullable unless the checker types it non-null.
+      "nulstr" => emitIndexStrList(nd, fnIx, nodeTyProvesNonNull(idxIx))
+      "str" => emitIndexStrList(nd, fnIx, true)
+      "scalar" => emitIndexScalarList(nd, fnIx)
+      "string" => emitIndexRawString(nd, fnIx)
+      "none" => emitFail("emitProgram: index receiver is not an array or string")
     }
-    // A `(string | null)[]` `xs[i]` → the SAME string backing, but the element legitimately holds
-    // `null` (it is a `(ref null $aTypeIdx)`), so the read STAYS nullable — NO `ref.as_non_null`. The
-    // bound value is a `nulstr` the caller narrows with `!= null` (`nodeTyIsNulString` classifies it).
-    // Checked BEFORE `exprStringArray` (whose non-null recovery would trap on a null element).
-    if exprNulStrArray(nd.idxArr, fnIx) {
-      if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
-      // A read the checker types non-null recovers here for the same reason the ref-list arm
-      // does — this is the `(new string | null)[]` rep, eight of D451's 56 cells, and
-      // the one the row's "box rather than a niche" mechanism mis-classified.
-      if nodeTyProvesNonNull(idxIx) { fbRefAsNonNull() }
-      return 0
-    }
-    // A STRING list `xs[i]` → the string backing's element, then `ref.as_non_null` to
-    // surface the non-null string ref. (Checked before the i32 path: a string element is not an i32.)
-    if exprStringArray(nd.idxArr, fnIx) {
-      if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
-      fbRefAsNonNull() // (recover the non-null string)
-      return 0
-    }
-    // A SCALAR list `xs[i]` (f64/i64 checked before i32 since their elements are not i32).
-    const ek = scalarListElemKind(nd.idxArr, fnIx)
-    if ek != null { return emitIndexScalarList(nd, ek, fnIx) }
-    if !exprString(nd.idxArr, fnIx) {
-      return emitFail("emitProgram: index receiver is not an array or string")
-    }
-    // A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]`
-    // behind the `i u< len` guard that keeps an out-of-range index trapping instead of
-    // reading past the view into the rest of the backing. A binding with a live
-    // loop-hoisted header skips the receiver entirely and reads three locals.
-    const shz = liveHoistRow(nd.idxArr, "list", 0 - 1)
-    if shz < 0 {
-      if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
-    }
-    if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
-    if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
-    fbArrayGet(sBackTy()) // 0xfb 0x0b <string backing array type index>
-    return 0
   }
   return emitFail("emitProgram: expected an index access")
 }
 
-// A DISTINCT-backing nullable scalar list `t[i]` of kind `nsk`, narrowed inside `if t != null`:
-// the slot is `(ref null $wrapper)`, so it recovers non-null (the guard proved it present) and
-// reads as the leaf list. Returns 0, or -1 when an operand fails.
-function emitIndexNulScalarList(nd: Index, nsk: VKind, fnIx: i32): i32 {
+// A string list's element, recovered non-null when `nonNull`.
+function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
+  if emitIndexStrListRead(nd, fnIx) < 0 { return -1 }
+  if nonNull { fbRefAsNonNull() }
+  return 0
+}
+
+// A raw string `s[i]` — the receiver is a header, so the read is `backing[start + i]` behind the
+// `i u< len` guard. A binding with a live loop-hoisted header skips the receiver entirely.
+function emitIndexRawString(nd: Index, fnIx: i32): i32 {
+  const shz = liveHoistRow(nd.idxArr, "list", 0 - 1)
+  if shz < 0 {
+    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if shz >= 0 { emitStrIdxGuardHoisted(shz) } else { emitStrIdxGuard() }
+  fbArrayGet(sBackTy()) // 0xfb 0x0b <string backing array type index>
+  return 0
+}
+
+// A DISTINCT-backing nullable scalar list `t[i]`, narrowed inside `if t != null`: the slot is
+// `(ref null $wrapper)`, so it recovers non-null (the guard proved it present) and reads as the
+// leaf list. Returns 0, or -1 when an operand fails.
+function emitIndexNulScalarList(nd: Index, fnIx: i32): i32 {
+  const nsk = exprNulScalarListKind(nd.idxArr, fnIx)
   if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
   fbRefAsNonNull() // (the `!= null` guard makes this safe)
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
@@ -18357,7 +18396,7 @@ function emitIndexNulScalarList(nd: Index, nsk: VKind, fnIx: i32): i32 {
   // `nek` names the leaf element kind whose wrapper / backing / index-scratch pool this
   // read uses; `u8list` is the packed-byte leaf's spelling (the element is a plain i32,
   // so the kind names the list, not a scalar).
-  const nek = scalarListElemOfListKind(nulListBase(nsk) ?? "i32")
+  const nek = if nsk == null { null } else { scalarListElemOfListKind(nulListBase(nsk) ?? "i32") }
   if nek == null {
     return emitFail(
       "emitProgram: a nullable scalar list read has no element kind",
@@ -18453,35 +18492,53 @@ function emitIndexStrListRead(nd: Index, fnIx: i32): i32 {
   return 0
 }
 
-// A SCALAR list `xs[i]` of element kind `ek`: unwrap to its backing and `array.get <back>`,
+// A SCALAR list `xs[i]`: unwrap to its backing and `array.get <back>`,
 // yielding the element in its valtype rep. Returns 0, or -1 on a refusal or a failed operand.
-function emitIndexScalarList(nd: Index, ek: VKind, fnIx: i32): i32 {
-  if !scalarListUsed(ek) {
+function emitIndexScalarList(nd: Index, fnIx: i32): i32 {
+  const ek = scalarListElemKind(nd.idxArr, fnIx)
+  if ek == null || !scalarListUsed(ek) {
     return emitFail("emitProgram: index access but list type not collected")
   }
-  const skHz = liveHoistRow(
+  const hz = scalarListHoistOf(nd, ek, fnIx)
+  if hz < 0 {
+    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+  }
+  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  return scalarListGetTail(nd, ek, fnIx, hz)
+}
+
+// The scalar list read both emitters write, in two halves around its operands. This half: the
+// live loop hoist holding the receiver, or -1; under one the receiver is not written.
+export function scalarListHoistOf(nd: Index, ek: VKind, fnIx: i32): i32 {
+  return liveHoistRow(
     nd.idxArr,
     listIdxKindOf(ek),
     exprPackedRow(nd.idxArr, fnIx),
   )
-  if skHz < 0 {
-    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
-  }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+}
+
+// The half after the receiver and index (`hz` from `scalarListHoistOf`): the guard, over the
+// hoisted header or the wrapper, then the backing's `array.get`; a possible view reads through its
+// source.
+export function scalarListGetTail(
+  nd: Index,
+  ek: VKind,
+  fnIx: i32,
+  hz: i32,
+): i32 {
+  const row = exprPackedRow(nd.idxArr, fnIx)
   // A list that may be a view reads its element through the view's source (D3028).
   const ixSv = svDstOfKind(ek)
-  if ixSv >= 0 && skHz < 0 { return emitSvIndexRead(ek, ixSv) }
-  // Guard `i u< len`, unwrap to the backing (`struct.get` field 0), read.
-  if skHz >= 0 {
-    emitListIdxGuardHoisted(skHz, nd.idxIndex)
+  if ixSv >= 0 && hz < 0 { return emitSvIndexRead(ek, ixSv) }
+  if hz >= 0 {
+    emitListIdxGuardHoisted(hz, nd.idxIndex)
   } else {
-    const irow = exprPackedRow(nd.idxArr, fnIx)
     emitListIdxGuard(
-      listIdxWrapSlot(listIdxKindOf(ek), irow),
-      scalarListWrap(ek, irow),
+      listIdxWrapSlot(listIdxKindOf(ek), row),
+      scalarListWrap(ek, row),
     )
   }
-  fbArrayGet(scalarListBack(ek, exprPackedRow(nd.idxArr, fnIx))) // yields the element in its rep
+  fbArrayGet(scalarListBack(ek, row)) // yields the element in its rep
   return 0
 }
 
