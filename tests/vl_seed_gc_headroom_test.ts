@@ -7,12 +7,12 @@
 // collection leaving more than 75% of a semispace live (`SeedGcHeadroom`,
 // scripts/vl-host/src/main.rs; docs/internals/perf/gc-heap-policy-2026-09.md §4).
 //
-// The workload is `vl check compiler/emit_mono.vl` at the default first heap (128 MiB a
-// semispace), whose live set crosses the 96 MiB the policy grows at: 9 collections, and 39 to
-// 45 with the policy off across four seeds and four checkout path lengths on 2026-11-09.
-// `emit_elab.vl` was the workload until its policy-off count fell from 30–32 to 22–24 against
-// its 8; `wasmEmit.vl`, `typecheck.vl`, `check_relate_core.vl` and `emit_base.vl` before it fell
-// the same way. A target whose live
+// The workload is `vl check compiler/emit_collect.vl` at the default first heap (128 MiB a
+// semispace), whose live set crosses the 96 MiB the policy grows at: 9 collections, and 46 to
+// 48 with the policy off on two seeds on 2026-11-16. `emit_mono.vl` was the workload until its
+// policy-off count fell from 52 to 28–30 against its 11; `emit_elab.vl`,
+// `wasmEmit.vl`, `typecheck.vl`, `check_relate_core.vl` and `emit_base.vl` before it fell the
+// same way. A target whose live
 // set sits just under a semispace is a cliff, so each one is graded across seeds and sources,
 // not on one (the PR body of the change that chose it). The
 // default heap is the engine configuration every other compile shares, so its
@@ -39,11 +39,11 @@ if (!ENABLED) {
 
 // Relative, run from ROOT: the policy-off count moves with the checkout path's length, so the
 // test does not read its own path.
-const TARGET = "compiler/emit_mono.vl";
+const TARGET = "compiler/emit_collect.vl";
 
 // 9 at the time of writing; loose so a compiler change that moves the live set cannot red it.
 const MAX_DEFAULT = 12;
-// 41 / 9 at the time of writing, 39–45 / 9 across four seeds and four checkout path lengths.
+// 46–48 / 9 at the time of writing, on two seeds.
 const MIN_SPREAD = 3;
 
 async function collections(grow: string, label: string): Promise<number> {
