@@ -9,6 +9,10 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-store-s3-4d-1-arrow-solve](2026-11-16-store-s3-4d-1-arrow-solve.md): S3.4d step 1: the arrow rule's solve, with no storage consumer, 2026-11-16
+- [2026-11-16-l2-s3-4c-is-walk](2026-11-16-l2-s3-4c-is-walk.md): L2 S3.4c, part 1: the `is` kind answers by rule in body order, 2026-11-16
+- [2026-11-16-l2-s3-4b-type-bound](2026-11-16-l2-s3-4b-type-bound.md): L2 S3.4b, part 2: a type-bound member call meets a hole's demand, 2026-11-16
+- [2026-11-16-ir-c2i-atoms](2026-11-16-ir-c2i-atoms.md): IR cutover C2i: the atom rep (coverage step), 2026-11-16
 - [2026-11-16-type-hashcons-s6b16-d16737](2026-11-16-type-hashcons-s6b16-d16737.md): Type hash-cons stage 6b: the value-chain walks without a hop budget, D16737 (lane H), 2026-11-16
 - [2026-11-16-type-hashcons-s6b15-d16769](2026-11-16-type-hashcons-s6b15-d16769.md): Type hash-cons stage 6b: the delivery walk's breadth cap goes, D16769 (lane H), 2026-11-16
 - [2026-11-16-sound-oracle-radix-join-width](2026-11-16-sound-oracle-radix-join-width.md): Oracle: a radix tree that is no constant in a join, and min's f32 peer (2026-11-16, lane SOUND)
