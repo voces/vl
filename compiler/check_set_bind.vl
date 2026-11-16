@@ -4,9 +4,15 @@
 // (`fnParamHandNote`), closed over parameters handed on to another un-annotated callee. A shadow:
 // `setBindDiffLine` compares it with the elaboration's per-instance notes; no decision reads it.
 import {
+  ArrayLit,
   Call,
+  ForIn,
   FuncDecl,
   Ident,
+  Index,
+  LetDecl,
+  LoopVar,
+  Member,
   P,
   Param,
   Paren,
@@ -18,7 +24,11 @@ import {
   fnParamHandArgsOf,
   fnParamHandFromsOf,
   fnParamHandSets,
+  fnTagSetOfTy,
 } from "./check_elab_cap"
+import { nodeTyIxOf } from "./check_node_tys"
+import { T, TyArray, tyAt, tyElemOf, tyFieldTyOf } from "./check_types"
+import { identFnDeclOf } from "./check_scopes"
 import {
   mintFactCallOf,
   mintFactRows,
@@ -38,12 +48,16 @@ let sbCall: i32[] = []
 let sbFn: i32[] = []
 let sbParam: i32[] = []
 let sbSets: i32[][] = []
+// Beside `sbSets`: the argument types the row hands, for a callee reading a path into one.
+let sbTys: i32[][] = []
 let sbFromFn: i32[] = []
 let sbFromParam: i32[] = []
 // Every declaration, in arena order, as the last build found them.
 let sbDecls: i32[] = []
 // By `decl|position`: the union of the sets every row for it carries.
 let sbSetsOf: {[string]: i32[]} = Map()
+// By `decl|position`: the union of the argument types every row for it hands.
+let sbTysOf: {[string]: i32[]} = Map()
 
 // One row per declaration handing back its parameter: every value it returns reads it.
 let hbFn: i32[] = []
@@ -95,12 +109,100 @@ function sbUnion(into: i32[], from: i32[]): boolean {
   return grew
 }
 
+// Adds a row: call `c` hands set `set` (-1 for none) to parameter `i` of `d`, or the value of
+// parameter `q` of the enclosing declaration `fr` when `q` is not -1.
+function sbRowAdd(c: i32, d: i32, i: i32, set: i32, ty: i32, fr: i32, q: i32) {
+  sbCall.push(c)
+  sbFn.push(d)
+  sbParam.push(i)
+  sbSets.push(if set >= 0 { [set] } else { [] })
+  sbTys.push(if q < 0 && ty >= 0 { [ty] } else { [] })
+  sbFromFn.push(if q >= 0 { fr } else { -1 })
+  sbFromParam.push(q)
+  return 0
+}
+
+// The declaration whose body holds node `x`, -1 at module scope.
+function sbEnclosingFn(x: i32): i32 {
+  let p = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  while p >= 0 && p < P.nodes.length {
+    if nodeAt(p) is FuncDecl { return p }
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  return -1
+}
+
+// The list literal a `const` binding read at `x` holds, else -1.
+function sbConstListLit(x: i32): i32 {
+  const v = parenPeelIx(x)
+  if v >= 0 && v < P.nodes.length && nodeAt(v) is ArrayLit { return v }
+  if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
+  const ld = identDeclOf(v)
+  const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { nodeAt(v) }
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letInit < 0 { return -1 }
+  const li = parenPeelIx(ln.letInit)
+  return if li >= 0 && nodeAt(li) is ArrayLit { li } else { -1 }
+}
+
+// The list literal of declared functions callee `f` reads one element of: `fs[i]`, or the
+// element variable of a `for` over the list; -1 for neither.
+function sbElemCalleeList(f: i32): i32 {
+  const cf = nodeAt(f)
+  if cf is Index { return sbConstListLit(cf.idxArr) }
+  if !(cf is Ident) { return -1 }
+  const vd = identDeclOf(f)
+  const vn = if vd >= 0 && vd < P.nodes.length { nodeAt(vd) } else { cf }
+  if (
+    !(vn is LoopVar)
+    || vn.lvSlot != 0
+    || vn.lvLoop < 0
+    || vn.lvLoop >= P.nodes.length
+  ) {
+    return -1
+  }
+  const lp = nodeAt(vn.lvLoop)
+  return if lp is ForIn { sbConstListLit(lp.fiIter) } else { -1 }
+}
+
+// A call through an element of a list literal of declared functions, `fs[i](…)` or `f(…)` in
+// `for f in fs`, hands each argument to that position's parameter of every element.
+function sbElemCallRows(c: i32, n: Call) {
+  const li = sbElemCalleeList(parenPeelIx(n.callFn))
+  if li < 0 { return 0 }
+  const lit = nodeAt(li)
+  if !(lit is ArrayLit) { return 0 }
+  const fr = sbEnclosingFn(c)
+  for e in lit.arrElems {
+    const ed = if e >= 0 && e < P.nodes.length && nodeAt(e) is Ident { identFnDeclOf(e) } else { -1 }
+    const en = if ed >= 0 { nodeAt(ed) } else { nodeAt(c) }
+    if en is FuncDecl {
+      let j = 0
+      while j < n.callArgs.length && j < en.fnParams.length {
+        const pn = nodeAt(en.fnParams[j])
+        if pn is Param && pn.parType < 0 {
+          const a = parenPeelIx(n.callArgs[j])
+          const set = fnTagSetOfTy(nodeTyIxOf(a))
+          const q = if set < 0 { sbParamIndexIn(fr, a) } else { -1 }
+          const ty = nodeTyIxOf(a)
+          if set >= 0 || q >= 0 || ty >= 0 {
+            sbRowAdd(c, ed, j, set, ty, fr, q)
+          }
+        }
+        j = j + 1
+      }
+    }
+  }
+  return 0
+}
+
 // Builds the rows from the tables the last check left.
 export function setBindBuild() {
   sbCall = []
   sbFn = []
   sbParam = []
   sbSets = []
+  sbTys = []
+  sbTysOf = Map()
   sbFromFn = []
   sbFromParam = []
   sbDecls = []
@@ -125,19 +227,16 @@ export function setBindBuild() {
           const fr = if k < froms.length { froms[k] } else { -1 }
           const q = if hs[k] < 0 { sbParamIndexIn(fr, a) } else { -1 }
           const c = sbCallOf(a)
-          if hs[k] >= 0 || q >= 0 {
-            sbCall.push(c)
-            sbFn.push(d)
-            sbParam.push(i)
-            sbSets.push(if hs[k] >= 0 { [hs[k]] } else { [] })
-            sbFromFn.push(if q >= 0 { fr } else { -1 })
-            sbFromParam.push(q)
+          const ty = nodeTyIxOf(a)
+          if hs[k] >= 0 || q >= 0 || ty >= 0 {
+            sbRowAdd(c, d, i, hs[k], ty, fr, q)
           }
           k = k + 1
         }
         i = i + 1
       }
     }
+    if dn is Call { sbElemCallRows(d, dn) }
     d = d + 1
   }
   // Closes the forwarded rows: each takes what reaches the parameter it reads, to a fixpoint.
@@ -148,12 +247,16 @@ export function setBindBuild() {
     rounds = rounds + 1
     let r = 0
     while r < sbCall.length {
-      const from = if sbFromParam[r] >= 0 { sbSetsOf[sbKey(sbFromFn[r], sbFromParam[r])] ?? [] } else { [] }
-      if sbUnion(sbSets[r], from) { grew = true }
+      const fk = if sbFromParam[r] >= 0 { sbKey(sbFromFn[r], sbFromParam[r]) } else { "" }
+      if fk != "" && sbUnion(sbSets[r], sbSetsOf[fk] ?? []) { grew = true }
+      if fk != "" && sbUnion(sbTys[r], sbTysOf[fk] ?? []) { grew = true }
       const key = sbKey(sbFn[r], sbParam[r])
       const have = sbSetsOf[key] ?? []
       if sbUnion(have, sbSets[r]) { grew = true }
       sbSetsOf[key] = have
+      const tys = sbTysOf[key] ?? []
+      if sbUnion(tys, sbTys[r]) { grew = true }
+      sbTysOf[key] = tys
       r = r + 1
     }
   }
@@ -195,6 +298,7 @@ function setBindCallsIn(d: i32, out: string[]) {
       const n = nodeAt(x)
       if n is Call {
         const q = sbParamIndexIn(d, parenPeelIx(n.callFn))
+        if q < 0 { sbPathCallKeys(d, x, n, out) }
         if q >= 0 {
           for s in setBindSetsOf(d, q) {
             if s >= 0 { out.push("P" + sbKey(d, q) + "|" + i32ToStr(s)) }
@@ -303,4 +407,57 @@ function sbFactKey(r: i32): string {
     }
   }
   return "C" + i32ToStr(c) + "|" + set
+}
+
+// The callee of call `n` at `x` in `d`'s body read through a path from a parameter of `d`: a
+// local `const` alias, an element `[i]` or a field `.f`, any number deep. Pushes `C<call>|<set>`
+// for each set the path reaches in each argument type handed to that parameter.
+function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
+  const steps: string[] = []
+  let v = parenPeelIx(n.callFn)
+  let depth = 0
+  while depth < 16 && v >= 0 && v < P.nodes.length {
+    depth = depth + 1
+    const vn = nodeAt(v)
+    if vn is Index {
+      steps.push("[]")
+      v = parenPeelIx(vn.idxArr)
+    } else if vn is Member {
+      steps.push(vn.memProp)
+      v = parenPeelIx(vn.memObj)
+    } else if vn is Ident {
+      const q = sbParamIndexIn(d, v)
+      if q >= 0 {
+        if steps.length == 0 && depth == 1 { return 0 }
+        for t in sbTysOf[sbKey(d, q)] ?? [] {
+          const s = fnTagSetOfTy(sbTyAtPath(t, steps))
+          if s >= 0 { out.push("C" + i32ToStr(x) + "|" + i32ToStr(s)) }
+        }
+        return 0
+      }
+      const ld = identDeclOf(v)
+      const ln = if ld >= 0 && ld < P.nodes.length { nodeAt(ld) } else { vn }
+      if !(ln is LetDecl) || ln.letKw != "const" || ln.letInit < 0 { return 0 }
+      v = parenPeelIx(ln.letInit)
+    } else {
+      return 0
+    }
+  }
+  return 0
+}
+
+// Type `t` read through `steps`, outermost last: `[]` an element, else a field; -1 off the type.
+function sbTyAtPath(t: i32, steps: string[]): i32 {
+  let cur = t
+  let k = steps.length - 1
+  while k >= 0 && cur >= 0 && cur < T.tys.length {
+    const ct = tyAt(cur)
+    if steps[k] == "[]" {
+      cur = if ct is TyArray { tyElemOf(ct) } else { -1 }
+    } else {
+      cur = tyFieldTyOf(cur, steps[k])
+    }
+    k = k - 1
+  }
+  return cur
 }
