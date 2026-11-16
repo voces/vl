@@ -40,5 +40,5 @@ is as deep as the parse.
 | reading | value |
 |---|---|
 | seed | fixpoint, branch and base (master 32ee97e56) |
-| identity | IDENT |
+| identity | 3,406 of 3,406 files byte-identical: the 2,000-file random sample (with `compiler/entry.vl`), every `tests/cases` numeric, cast, literal, constant and radix case, and the distilled cells of those families. The merge queue runs the full diff |
 | net compiler lines | −4 over 7 files (each walker's parameter, its guard term, the `depth ± 1` at every recursive call, and the callers' constants) |
