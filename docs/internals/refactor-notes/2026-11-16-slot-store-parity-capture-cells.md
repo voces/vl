@@ -13,7 +13,16 @@ delivery walk, so it changes no output. It is graded by `tests/cases` byte ident
 
 ## Readings
 
-READINGS
+Fixpoint seeds: master `1eef955a` and this branch.
+
+| check | reading |
+|---|---|
+| `tests/cases` built, byte for byte | 0 of 7,843 differ |
+| distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 `runs -> not-runs` |
+| L2 self-compile fuel | 93.194e9 against the 92.876e9 baseline: +0.3% |
+| seed size | 6,423,197 against 6,422,949: +248 |
+| `lint-self` | clean |
+| `scripts/gate.sh` | every row ok but `ci-native`: `vl_touch_set_test` fails on master's seed too; `vl_seed_gc_headroom_test` fails before #8610 and passes with master merged |
 
 **Gap list** (the class-reading part D candidate on `slot-2b3-d`, `tests/cases` byte compare): 6
 remain after this rule and the loop-exit rule. Two of them are per-instance capture cells in
