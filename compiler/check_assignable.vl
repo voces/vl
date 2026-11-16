@@ -334,6 +334,7 @@ import { boolForNumberNote, letAssignMsg } from "./check_mismatch_notes"
 import { narConvListDelivery, narListDeliveryErr } from "./check_narrow_flow"
 import { crFnEnter, pushScope } from "./check_narrow_paths"
 import { collectRetValues, njFnIx, njFnIxSet } from "./check_nj_join"
+import { declIsExportedFn } from "./check_exp_obs"
 import { fsbArgsFit, fsbBindParams } from "./check_node_rules"
 import {
   nodeTyIx,
@@ -4339,6 +4340,10 @@ function fvaIsRelay(d: i32): boolean {
   return true
 }
 
+// The callee reads of the maker calls an unreachable relay returns: its body never runs, so they
+// ask for no instance (D16757). Rebuilt by each `fvaMakerCallRows`.
+let fvaDeadReads: {[i32]: boolean} = Map()
+
 // What `fvaMakerCallRows`'s node walks gather about relays: whether there is one, which
 // declarations are relays (memo), each call of one and its callee read, every read naming one,
 // and the relays read other than as a callee.
@@ -4410,7 +4415,9 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
       for r in rets { innerOf[parenPeelIx(r)] = d }
     }
   }
+  fvaDeadReads = Map()
   if relays.length == 0 { return 0 }
+  fvaRelayDeadReads(rl, relays, innerOf)
   // Each relay's result, from its calls outside every relay's returns.
   const relaySig: {[i32]: i32} = Map()
   for c in rl.calls {
@@ -4445,6 +4452,43 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
     if s >= 0 && fvaOpenMakerCall(c) >= 0 {
       const at = fvaMakerResultAt(c, s)
       fvaReachSig(sigAt, c, if at >= 0 && assignable(at, s) { s } else { -1 })
+    }
+  }
+  return 0
+}
+
+// Notes in `fvaDeadReads` the maker reads of each relay nothing can run: not exported, not read as
+// a value, and called only from the returns of relays nothing can run.
+function fvaRelayDeadReads(
+  rl: FvaRelayScan,
+  relays: i32[],
+  innerOf: {[i32]: i32},
+) {
+  const live: {[i32]: boolean} = Map()
+  for d in relays {
+    if declIsExportedFn(d) || (rl.handedOn.get(d) ?? false) { live[d] = true }
+  }
+  // A call outside every relay's return makes its relay live; one inside a live relay's return
+  // does too. Each pass adds a relay or settles, so one pass per relay is enough.
+  let pass = 0
+  while pass <= relays.length {
+    for c in rl.calls {
+      const cn = nodeAt(c)
+      const from = innerOf.get(c) ?? -1
+      if cn is Call && (from < 0 || (live.get(from) ?? false)) {
+        live[calleeFnOfDecl(identDeclOf(parenPeelIx(cn.callFn)))] = true
+      }
+    }
+    pass = pass + 1
+  }
+  for c in innerOf.keys() {
+    const cn = nodeAt(c)
+    if (
+      cn is Call
+      && !(live.get(innerOf.get(c) ?? -1) ?? false)
+      && fvaOpenMakerCall(c) >= 0
+    ) {
+      fvaDeadReads[parenPeelIx(cn.callFn)] = true
     }
   }
   return 0
@@ -4555,6 +4599,7 @@ function fvaMakerCoverCheck() {
 // Whether maker read `r` takes an instance: the callee of a call noted at a closed result, or a
 // value delivered at a closed function type.
 function fvaMakerReadCovered(r: i32): boolean {
+  if fvaDeadReads.get(r) ?? false { return true }
   const dt = nodeCtxTyIxOf(r)
   if dt >= 0 && dt < T.tys.length && !tyHasTyVar(dt) && tyAt(dt) is TyFunc {
     return true
