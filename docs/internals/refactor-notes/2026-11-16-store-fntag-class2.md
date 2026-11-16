@@ -8,8 +8,9 @@ place it reaches is also reached by another set (reason P in the progress note's
 `sbPartialNote` marked a set partial when any other set reached the same parameter, at any call.
 - A declared function's instance is keyed by the set its parameter holds, so `f(add)` and
   `f(mul)` are two instances, each with a one-set parameter. Neither set is partial.
-- A function read as a value (aliased, held, passed, a lambda) is different: its instances share
-  the call, so two sets there do join. `sbValueFn` records those, and only they keep the old rule.
+- This holds for a function read as a value too (`const k = apply2`, `[apply2]`): a call through
+  its set still mints an instance per argument set. Only a lambda, which has one instance, keeps
+  the old rule.
 - A field or path read (`sbPathCallKeys`) keeps the old rule: one place, many writers.
 
 Two exclusions keep the late decision where the elaboration still owns it. Each was found as an A/B
@@ -25,23 +26,26 @@ This PR also carries one coverage slice: calls through a `const` bound to a hand
 ## Measurement
 
 ftlate probe, all 6,528 `@run` programs, fixpoint seeds:
-- programs whose decision the late pass changes: 352 → 341;
+- programs whose decision the late pass changes: 352 → 332;
 - late drops: 2, the same pre-existing pair;
-- P sets 268 → 205 (programs 141 → 110).
+- P sets 268 → 124 (programs 141 → 71). 66 sets move from P to T: the check now tries them, and
+  refuses them until S3 gives the member results.
 
 | reason | sets | programs |
 |---|---|---|
-| P, partial | 205 | 110 |
+| T, refused by the check (S3) | 151 | 96 |
 | N, never found | 190 | 94 |
 | G, a generic member (S3) | 117 | 93 |
-| T, refused by the check (S3) | 85 | 66 |
+| P, partial | 124 | 71 |
 | V, handed to or by members | 14 | 5 |
 | J, follows a join (new exclusion) | 12 | 9 |
 | C, delivered to a closed fn type (new exclusion) | 9 | 7 |
 | S, stored parameter (S3) | 7 | 7 |
 
-By blocker: P only 86, G only 70, T only 61, N only 58, N+P 14, N+G 12, C only 6, J only 5,
-V only 5, G+P 5.
+By blocker: T only 91, G only 70, N only 58, P only 47, N+P 14, N+G 12, C only 6, J only 5.
 
-A/B: wasm and output byte-identical on all `@run` programs, fixpoint seed against master's own
-fixpoint seed.
+A/B, fixpoint seed against master's own fixpoint seed, all 6,540 `@run` programs: output
+byte-identical everywhere; two named wasm movers, both smaller:
+- `closures/local-alias-of-hole-fn-handed-two-sets-beside-loop-list-call.vl` and its
+  `-other-order-` twin. `const k = apply2; k(add); k(mul)` beside `[apply2]` called with `add`:
+  `{add}` was a closure in master's output and the check now tags it (451 → 398 bytes).
