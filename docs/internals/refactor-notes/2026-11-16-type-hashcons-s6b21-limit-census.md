@@ -34,11 +34,14 @@ Raising every limit at once moved 20 of 3,223 programs, attributed to nine sites
   `recursive-tree.vl`, `nullable-recursive-call-narrow-canary.vl` and three other recursive-type fixtures hang:
   the walks re-enter the recursion with no guard. Each must take a path or visited set first. The limit then
   goes, and the answer must not move.
-- **An exhausted answer relied on (1 site).** `emitListEmptyFitIs` (`wasmEmit.vl`, `depth < 1`): one more level
-  turns `array-field-assign-element-kind.vl` and one other fixture into an emit reject. The limit hides a defect
-  or encodes a contract; it needs a trace before any change.
-- **Code shape only (1 site).** `handBackHoleIx` (`check_hand_back.vl`, `depth > 8`): fan-out of 30 or more
-  builds other bytes with the same output.
+- **Not a limit (1 site).** `emitListEmptyFitIs` (`wasmEmit.vl`, `depth < 1`): its `depth` is no counter but
+  `listDisjointDepth`'s answer, the list depth at which the receiver's and the tested type's elements cannot
+  meet, or -1; `< 1` means "not that shape". The census's countdown match read it as a budget, and rewriting
+  it to `< -48` sent every list `is` down the empty-fit path, so two fixtures became emit rejects. Traced
+  2026-11-16; no defect. `walk-limit` fires on a countdown floor only for a parameter of the enclosing
+  function since s6b26.
+- **Code shape only (1 site), priced.** `handBackHoleIx` (`check_hand_back.vl`, `depth > 8`): fan-out of 30 or
+  more builds other bytes with the same output. Left as it is (coordinator ruling, 2026-11-16).
 - Six fan-out alias cells move only when limits in several files rise together (`alias_*_n030`+, other bytes,
   same output), and `list-element-narrowing-callback-and-loop-runs.vl` likewise. Not attributed to one site.
 
@@ -50,7 +53,7 @@ No reached site turned a refused program into a running one when raised. The cap
 1. The seven load-bearing sites: each walk takes a path or visited set (the s6b rule: a revisit is a cycle and
    keeps the exhausted answer), then its limit goes. Graded by the five fixtures that hang when raised, plus
    identity and the deep grid.
-2. `emitListEmptyFitIs`: trace before any change.
+2. `emitListEmptyFitIs`: traced, not a limit (above).
 3. The other reached limits (table): converted with a witness from the grid that reaches them.
 4. The unreached limits: cleanup, converted in file batches under the identity sweep.
 
@@ -68,7 +71,7 @@ Ordered by effect, then by programs reaching them.
 | 267 | check_types.vl:3476 | `tyMentionsErr` | `depth <= 0` | if | 77 | hang (recursive type) |  |
 | 269 | check_types.vl:3838 | `tyHasRepHoleAt` | `depth > 8` | if | 58 | hang (recursive type) |  |
 | 121 | check_hand_back.vl:71 | `handBackHoleIx` | `depth > 8` | if | 11 | fan-out ≥30 builds other bytes (output same) |  |
-| 577 | wasmEmit.vl:4992 | `emitListEmptyFitIs` | `depth < 1` | if | 2 | answer changes: emit reject |  |
+| 577 | wasmEmit.vl:4992 | `emitListEmptyFitIs` | `depth < 1` | if | 2 | not a limit: a computed depth (traced) |  |
 | 570 | tyquery.vl:2155 | `tyHasTyVarGo` | `depth > 19988` | if | 3181 | none | mode-flag |
 | 351 | emit_elab.vl:5040 | `elabMintCalleeIn` | `hops < 16` | while | 825 | none | sentinel |
 | 408 | emit_elab.vl:18524 | `elabBoxedUnionsInto` | `depth <= 0` | if | 447 | none |  |
