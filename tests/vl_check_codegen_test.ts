@@ -39,13 +39,11 @@
 // class is empty that is now a DECLARED, corpus-CHECKED state (see the standing
 // note and the tripwire) rather than a silent gap.
 //
-// The emit-error fixture (`EMIT_ERROR_SRC`) is an `is` test over a literal-union list
-// arm — well-formed as a type (fast path clean), with no lowerable rep, so the
-// emitter rejects. If it graduates, swap in any other shape
-// that type-checks clean but emit-errors; that class is not scarce, and unlike
-// `INVALID_MODULE_SRC` the emitter names its own error. (The native emitter reports
-// it with an `error [line:col]` diagnostic plus the `(emit error)` summary marker.
-// We assert the exit-code contract + that emit-stage marker, not the wording.)
+// The emit-error fixture (`EMIT_ERROR_SRC`) calls the harness's own hook, which
+// `--test-emit-refusal` refuses at emit: it type-checks clean (fast path clean) and no
+// capability fix can move it. Unlike `INVALID_MODULE_SRC` the emitter names its own error.
+// (The native emitter reports it with an `error [line:col]` diagnostic plus the
+// `(emit error)` summary marker. We assert the exit-code contract + that emit-stage marker, not the wording.)
 //
 // This is the native counterpart to the retired tests/cli_codegen_test.ts.
 //
@@ -92,18 +90,14 @@ const check = async (
   }
 };
 
-// Type-checks cleanly, fails the emitter: `is` across record arms whose shared field's box
-// holds a member only some of whose values fit (D4265). Swap in another live emit refusal
-// when that row closes.
-const EMIT_ERROR_SRC =
-  `type A = { v: "a" | "b" }\n` +
-  `// D4265\n` +
-  `type B = { v: i32 | string }\n` +
-  `function useIt(u: A | B) {\n` +
-  `  if u is A { print("A") } else { print("B") }\n` +
+// Type-checks cleanly, fails the emitter under `--test-emit-refusal`: a call to the harness's
+// hook, refused at emit by a flag no user build sets.
+const EMIT_ERROR_SRC = `function __vl_test_emit_refusal__() {}\n` +
+  `function useIt(n: i32) {\n` +
+  `  print(n)\n` +
+  `  __vl_test_emit_refusal__()\n` +
   `}\n` +
-  `const c: B = { v: 3 }\n` +
-  `useIt(c)\n`;
+  `useIt(1)\n`;
 
 // A normal, fully valid file — passes both the fast and the full path.
 const CLEAN_SRC = `let x = 1\nprint(x)\n`;
@@ -998,7 +992,7 @@ Deno.test({
   name: "vl-check-codegen (no --codegen): emit-erroring file exits 0 (fast path misses it)",
   ignore: !ENABLED,
   fn: async () => {
-    const { code } = await check(EMIT_ERROR_SRC);
+    const { code } = await check(EMIT_ERROR_SRC, ["--test-emit-refusal"]);
     if (code !== 0) throw new Error(`expected exit 0 on the codegen-free path, got ${code}`);
   },
 });
@@ -1007,7 +1001,7 @@ Deno.test({
   name: "vl-check-codegen --codegen: emit-erroring file exits non-zero with an emit error",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, err } = await check(EMIT_ERROR_SRC, ["--codegen"]);
+    const { code, err } = await check(EMIT_ERROR_SRC, ["--codegen", "--test-emit-refusal"]);
     if (code === 0) throw new Error(`expected non-zero exit with --codegen, got ${code}`);
     // The emitter ran and the failure surfaced as an error at the emit stage:
     // the `--concise` `error [line:col]` diagnostic plus the `(emit error)`
