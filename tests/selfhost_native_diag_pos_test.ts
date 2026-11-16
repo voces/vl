@@ -201,9 +201,9 @@ Deno.test({
     "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
   ignore: !ENABLED,
   fn: async () => {
-    // `is` over a literal-union list arm has no interned arm representation (D14041), so
-    // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
-    // enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
+    // `is` across record arms whose shared field's box holds a member only some of whose
+    // values fit (D4265), so `useIt` (line 4) fails at the EMIT stage. The diagnostic
+    // anchors at the enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
     // positionless (line 0) as before — so a build/playground/LSP consumer can
     // point the reader at the offending function instead of rendering the message
     // bare. (`declNameTokOf` anchoring, matching the lint/type-diag convention.)
@@ -212,14 +212,14 @@ Deno.test({
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "type K = 0 | 1\n" +
-          "// D14041\n" +
-          "const z = 9\n" +
-          "function useIt(x: K[] | string) {\n" +
-          "  if x is K[] { print(x[0]) } else { print(z) }\n" +
+        'type A = { v: "a" | "b" }\n' +
+          "// D4265\n" +
+          "type B = { v: i32 | string }\n" +
+          "function useIt(u: A | B) {\n" +
+          '  if u is A { print("A") } else { print("B") }\n' +
           "}\n" +
-          "useIt([1])\n" +
-          'useIt("s")\n',
+          "const c: B = { v: 3 }\n" +
+          "useIt(c)\n",
       );
       const r = await build(path);
       if (r.code === 0) {
@@ -252,39 +252,57 @@ Deno.test({
     // reported line 3, inside an unrelated `g`, and a reader following it looked at code
     // that had nothing to do with the failure.
     //
-    // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 17 of line 11,
-    // printed 1-based as 11:18), and the start function arms a top-level STATEMENT cursor so
-    // any other failure it raises lands on the statement instead of on a stale function.
+    // Two things fix it and this pins both: the expression floors are NODE-anchored
+    // (`emitFailAt`, here the call node → its `(` token, 0-based col 25 of line 11, printed
+    // 1-based as 11:26), and the start function arms a top-level STATEMENT cursor so any other
+    // failure it raises lands on the statement instead of on a stale function.
     //
-    // The witness is a top-level `.length` on a generic identity's result over a list of an
-    // empty list, still a loud field-access reject (D16725). The earlier witnesses lower since
-    // D15314, D15882 (D4266), D16049, D16170 and D16207.
+    // The refusal is the harness's own (`--test-emit-refusal` refuses a call to
+    // `__vl_test_emit_refusal__`), so no capability fix can move it.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
-      const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
-        path,
-        "function take<B>(b: B): B {\n" +
+        `${dir}/case.vl`,
+        "function __vl_test_emit_refusal__() {}\n" +
+          "function take<B>(b: B): B {\n" +
           "  return b\n" +
           "}\n" +
-          "function pad(x: i32): i32 {\n" +
+          "function pad(x: i32) {\n" +
           "  return x + 1\n" +
           "}\n" +
           "print(pad(1))\n" +
           "const one = 1\n" +
-          "const two = 2\n" +
-          "print(one + two)\n" +
-          "print(take([[]]).length)\n",
+          "print(take(one))\n" +
+          "__vl_test_emit_refusal__()\n",
       );
-      const r = await build(path);
-      if (r.code === 0) {
-        throw new Error("expected emit-stage rejection, got exit 0");
-      }
-      const needle = `${path}:11:18:`;
-      if (!r.err.includes(needle)) {
+      const { code, stdout, stderr } = await new Deno.Command(VL, {
+        args: [
+          "check",
+          "--codegen",
+          "--test-emit-refusal",
+          "case.vl",
+          "--compiler",
+          COMPILER,
+        ],
+        cwd: dir,
+        stdout: "piped",
+        stderr: "piped",
+        env: nativeEnv(),
+      }).output();
+      const out = new TextDecoder().decode(stdout) +
+        new TextDecoder().decode(stderr);
+      if (code === 0 || !out.includes("test-only refusal")) {
         throw new Error(
-          `expected stderr to contain "${needle}", got:\n${r.err}`,
+          "`--test-emit-refusal` no longer refuses the hook call, so this guard is measuring " +
+            `nothing (exit ${code}):\n${out}`,
+        );
+      }
+      const blk = out.split(/\n(?=\[)/).find((b) => b.startsWith("[ERROR]")) ??
+        "";
+      const needle = "at case.vl:11:26";
+      if (!blk.includes(needle)) {
+        throw new Error(
+          `expected the [ERROR] block to contain "${needle}", got:\n${out}`,
         );
       }
     } finally {

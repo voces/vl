@@ -1395,7 +1395,7 @@ export function holeDemandOk(name: string, srcExpr: i32, at: i32) {
     if holeAssignOk(srcExpr, atBase, shape) { return true }
   }
   if holeAltOk(name, srcExpr, at, shape) { return true }
-  const tbShape = shapeLessTypeBound(shape, at)
+  const tbShape = shapeLessMethodAnswered(shape, at)
   if tbShape != shape && tbShape >= 0 && tbShape < T.tys.length {
     const tbt = tyAt(tbShape)
     if tbt is TyObj && tbt.objFieldNames.length == 0 { return true }
@@ -1414,9 +1414,10 @@ export function holeDemandOk(name: string, srcExpr: i32, at: i32) {
   return true
 }
 
-// `shape` without the members argument type `at` answers by a type-bound `self`-function rather
-// than a field (D4033's rung), or `shape` itself when there is none.
-function shapeLessTypeBound(shape: i32, at: i32): i32 {
+// `shape` without the members argument type `at` answers by a method rather than a field: a
+// type-bound `self`-function (D4033's rung), or a built-in of the arity a called member demands
+// (D16882). `shape` itself when there is none.
+function shapeLessMethodAnswered(shape: i32, at: i32): i32 {
   const st = tyAt(shape)
   if !(st is TyObj) { return shape }
   const ns: string[] = []
@@ -1426,7 +1427,11 @@ function shapeLessTypeBound(shape: i32, at: i32): i32 {
     const f = st.objFieldNames[i]
     const af = tyAt(at)
     const isField = af is TyObj && objFieldType(af, f) >= 0
-    if isField || typeBoundSelfFnOf(at, f) == "" {
+    if (
+      isField
+      || (typeBoundSelfFnOf(at, f) == ""
+        && !builtinAnswersCall(at, f, st.objFieldTypes[i]))
+    ) {
       ns.push(f)
       ts.push(st.objFieldTypes[i])
     }
@@ -1434,6 +1439,16 @@ function shapeLessTypeBound(shape: i32, at: i32): i32 {
   }
   if ns.length == st.objFieldNames.length { return shape }
   return mkObjTy(ns, ts)
+}
+
+// Whether `at` has a built-in method `f` and the demand `ft` leaves room for one: a function, or
+// a member the body has not yet typed (a hole), which the instance's re-check then asks of the
+// built-in.
+function builtinAnswersCall(at: i32, f: string, ft: i32): boolean {
+  if ft < 0 || ft >= T.tys.length { return false }
+  const t = tyAt(ft)
+  if !(t is TyFunc) && !tyIsHole(ft) { return false }
+  return memberRungOnTy(at, f) == MC_RUNG_BUILTIN
 }
 
 // Whether `at` meets one of hole `name`'s `is`-guard alternatives, with the demanded fields
@@ -3830,7 +3845,7 @@ export function dstRetypeLitArgs(
   while i < params.length && i < args.length {
     let hit = false
     for nm in names {
-      if tyMentionsTyVarNamed(params[i], nm, 8) { hit = true }
+      if tyMentionsTyVarNamed(params[i], nm) { hit = true }
     }
     if hit && args[i] >= 0 {
       const pt = substTyDeep(params[i], bNames, bTys)
