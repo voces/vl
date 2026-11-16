@@ -771,6 +771,15 @@ valued tail `if` test does, runs only when that statement built without a miss; 
 incomplete by a miss is not a class of its own. The coverage bar is functions unblocked per line,
 read off the census before the step and confirmed by the shadow after it.
 
+**A shared predicate must not read state legacy's body lowering writes (the claim hazard).** The
+shadow runs legacy first, so such a predicate answers correctly there and stale under a claim.
+`strAssignInPlace` read the accumulator scan that `emitFuncBody` runs, and now runs it itself for a
+function legacy has not lowered; mode 3 found it. An audit of every predicate the builder and
+lowering import (C2i) found no other: each reads pre-pass, checker or rep state, state it sets and
+restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes. One
+caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
+previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
+
 **The six coercion seats wait for claiming (I3).** These are `numSeat`, `coerceHeld`, `boxSeat`,
 `armSeat`, `armServed` and `atomSeat`. They are legacy-only ambient state: an outer site sets one
 and a nested `emitExpr` reads it. Their readers are `emitExpr` itself for every unclaimed function,
