@@ -1579,6 +1579,12 @@ function ftOtherTail(x: i32, p: i32, g: i32, fn: i32, s: i32, ds: i32[]): i32 {
   }
   if g < 0 { return -1 }
   const gn = nodeAt(g)
+  // A field of a record literal built at a record of another tagged set holds that set's id
+  // (D16749).
+  if pn is FieldInit && gn is ObjLit && pn.fiValue == x {
+    const o = fnTagSetOfTy(tyFieldTyOf(nodeRepTyIxOf(g), pn.fiName))
+    return if o >= 0 && o != s && fnTagSetIsTagged(o) { o } else { -1 }
+  }
   if !(pn is Block) || !(gn is IfStmt || gn is MatchExpr) { return -1 }
   const st = pn.blkStmts
   if st.length == 0 || st[st.length - 1] != x { return -1 }
@@ -1769,6 +1775,10 @@ function ftScan(
         }
         if hk == 7 && xt is TyArray {
           if !ftMapElemOk(v, s) { return false }
+        } else if hk == 4 && xt is TyArray {
+          // A list written into a list of lists is an inner literal of the set, or of a smaller
+          // set re-typed to the element, as the literal's own elements are (D16805).
+          if !ftListElemOk(v, tyElemOf(xt), s, ds, leaves, ids) { return false }
         } else if (
           !rec
           && !ftJoinAt(v, ftSlotTyOf(nodeTyIxOf(x), s), s, ds, leaves, ids)
@@ -2509,6 +2519,21 @@ function ftInnerLeaves(
     ftRespineTy.push(t)
   }
   return true
+}
+
+// Whether `el`, an element of a list of lists of set `s` whose element type is `et`, holds the
+// set's ids itself or is a list literal of a smaller set re-typed to `et`.
+function ftListElemOk(
+  el: i32,
+  et: i32,
+  s: i32,
+  ds: i32[],
+  leaves: i32[],
+  ids: i32[],
+): boolean {
+  const ek = ftHoldKind(nodeTyIxOf(el), s)
+  if ek == 1 || ek == 4 { return ftInnerLit(parenPeelIx(el)) }
+  return ftInnerLeaves(parenPeelIx(el), et, s, ds, leaves, ids)
 }
 
 // Whether `x` is a list literal, names a `const` bound to one, or calls a function returning one.
@@ -4662,6 +4687,8 @@ function ftSlotWrites(x: i32, p: i32, g: i32, s: i32): i32[] {
     const xt = nodeTyIxOf(x)
     const mt = if xt >= 0 && xt < T.tys.length { tyAt(xt) } else { null }
     if mt is TyMap && ftHoldKind(xt, s) == 8 { return [gn.binRight] }
+    // So does an element store into a list of lists, writing a list (D16805).
+    if mt is TyArray && ftHoldKind(xt, s) == 4 { return [gn.binRight] }
     return none
   }
   if (
@@ -4742,6 +4769,11 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
   }
   // A list of maps of the set takes a pushed map as its literal takes an element (D15395).
   if k == 7 && op == "push" { return true }
+  // A list of lists of the set takes a pushed list as its literal takes an element, and its
+  // copies and removals hand out lists of the same set (D16805).
+  if k == 4 {
+    return op == "push" || op == "slice" || op == "pop" || op == "get"
+  }
   // A slice copies the list's ids into a list of the same set, read as the holder is (D14931).
   if k == 1 {
     return op == "push" || op == "slice" || op == "pop" || op == "get"
@@ -4982,7 +5014,13 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
           || ftDstTakes(ftMapEntryOf(pn.binLeft, s), x, s)
       }
       if ftIsStore(pn) && pn.binLeft == x {
-        return ftDstTakes(tx, pn.binRight, s) || ftStoredAt(pn.binRight, s)
+        // An element of a list of lists is written as its holder's slot (`ftSlotWrites`).
+        const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+        const elemOfLists = xn is Index
+          && ftHoldKind(nodeTyIxOf(xn.idxArr), s) == 4
+        return elemOfLists
+          || ftDstTakes(tx, pn.binRight, s)
+          || ftStoredAt(pn.binRight, s)
       }
       // A holder compared with `null` is read for presence alone.
       if pn.binOp == "==" || pn.binOp == "!=" {
@@ -5293,13 +5331,15 @@ function ftRecIntoMapSet(x: i32, c: Call, s: i32, fd: i32): boolean {
 }
 
 // Whether record literal `x`, holding set `s`, is stored into a slot of map read `m`, a map of the
-// set's records (`ftHoldKind` 8) or a parameter of `fd` every call hands one, its function fields
-// naming declared functions; the literal is noted for its row.
+// set's records (`ftHoldKind` 8), or of a wider set's decided with `s` (D16749), or a parameter
+// of `fd` every call hands one, its function fields naming declared functions; the literal is
+// noted for its row.
 function ftRecIntoMap(x: i32, m: i32, s: i32, fd: i32): boolean {
   const lx = parenPeelIx(x)
   const ln = if lx >= 0 && lx < P.nodes.length { nodeAt(lx) } else { null }
   if !(ln is ObjLit) || m < 0 { return false }
   const direct = ftHoldKind(nodeTyIxOf(m), s) == 8
+    || ftHolderListOfWider(m, lx, s, 2, 8)
   if (!direct && !(ftRecFieldsNamed(ln, s) && ftParamHolderHolds(m, s, fd))) {
     return false
   }
