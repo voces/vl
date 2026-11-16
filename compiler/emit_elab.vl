@@ -15852,7 +15852,16 @@ function elabLamParamTyAt(lam: i32, pi: i32, n: i32, depth: i32): i32 {
   if pi < 0 || pi >= n || lam < 0 || lam >= cwIxCoveredLen() || depth > 4 {
     return -1
   }
-  const kt = elabWalkTop()
+  // A lambda its maker returns, asked at an instance of the maker, reads the calls of every
+  // instance: each instance's lambda is lifted at one signature (D16819).
+  const kw = elabWalkTop()
+  const lf = recEnclosingFn(elabSrcDecl(lam))
+  const inFrame = kw >= 0
+    && kw < ekDecl.length
+    && lf >= 0
+    && ekDecl[kw] == lf
+    && eplLamReturned(elabSrcDecl(lam))
+  const kt = if inFrame { -1 } else { kw }
   const none: i32[] = []
   const calls: i32[] = []
   for ci in eplSlotCallRecs(lam, [], kt, none) {
@@ -15908,6 +15917,41 @@ function elabLamParamsClose(fd: i32, depth: i32): boolean {
   return true
 }
 
+// Whether lambda `lam` is returned, as written or through the binding it initialises.
+function eplLamReturned(lam: i32): boolean {
+  if lam < 0 || lam >= cwIxCoveredLen() { return false }
+  const k = cwIxUpKind[lam]
+  if k == CW_UP_RET || k == CW_UP_TAIL { return true }
+  if k != CW_UP_LETINIT { return false }
+  const d = cwIxUp[lam]
+  if d < 0 || d >= P.nodes.length { return false }
+  cwIxWant()
+  const ow = cwOccWalk(d)
+  while cwOccNext(ow) {
+    const u = cwIxNode[ow.row]
+    if cwIxKind[ow.row] == CW_OCC_USE && u >= 0 && u < cwIxCoveredLen() {
+      const uk = cwIxUpKind[u]
+      if uk == CW_UP_RET || uk == CW_UP_TAIL { return true }
+    }
+  }
+  return false
+}
+
+// The closed function type lambda `lam`, handed to a list method that calls it back, has in
+// instance `k`; -1 for any other lambda, or an open type.
+function eplCallbackLamTy(lam: i32, k: i32): i32 {
+  if lam < 0 || lam >= cwIxCoveredLen() || cwIxUpKind[lam] != CW_UP_ARG { return -1 }
+  const up = cwIxUp[lam]
+  const cn = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  const cf = if cn is Call { nodeAt(parenPeelIx(cn.callFn)) } else { null }
+  if !(cf is Member) || !eplCbMethod(cf.memProp) || cwIxUpAux[lam] != 0 { return -1 }
+  const t = if k >= 0 { elabNodeTy(lam, k) } else { nodeTyIxOf(lam) }
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyFunc) || tyHasTyVar(t) || tyHoldsHole(t) {
+    return -1
+  }
+  return t
+}
+
 // The parameter types of the one closed function type lambda `lam` is delivered at with `n`
 // parameters, under the instance key its slot is read in; empty for none or several.
 export function elabLamDeliveredParams(lam: i32, n: i32): i32[] {
@@ -15915,6 +15959,10 @@ export function elabLamDeliveredParams(lam: i32, n: i32): i32[] {
   const k = elabKeyAt(lam)
   let hit: i32[] = none
   let count = 0
+  // A lambda a list method calls back is delivered at its own closed type in the instance asked.
+  const cb = eplCallbackLamTy(lam, k)
+  const cbo = if cb >= 0 { tyAt(cb) } else { null }
+  if cbo is TyFunc && cbo.fnParamTypes.length == n { return cbo.fnParamTypes }
   // Asked at its own instance, a lambda reads the calls that instance makes, not its frame's.
   if k >= 0 && k < ekDecl.length && ekDecl[k] == elabSrcDecl(lam) {
     return none
