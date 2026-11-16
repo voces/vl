@@ -422,6 +422,7 @@ import {
   substNestDeclSet,
   substNestMode,
   substNestModeSet,
+  substSelfOwnerSet,
   tyVarsOfEnclosingGeneric,
 } from "./check_subst"
 import {
@@ -779,33 +780,12 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   const callee = fsbOwnerCallee(o)
   cstrOwnedStrictSet(o >= 0)
   adoptHoleLitArgs(nm, ty, callee, fsbCallHNames[c], fsbCallHNode[c])
-  validateBinCstrs(
-    nm,
-    ty,
-    ix,
-    callee,
-    who,
-    fsbCallHNames[c],
-    fsbCallHNo[c],
-    fsbCallHNode[c],
-  )
-  validatePrintCstrs(nm, ty, ix, callee, who)
-  validateArrDefCstrs(nm, ty, ix, callee, who)
-  validateIsCstrs(nm, ty, ix, callee, who)
-  validateArgCstrs(nm, ty, ix, callee, fsbCallHNames[c], fsbCallHNode[c])
-  validateRetCstrs(nm, ty, ix, callee, who)
-  validateLetCstrs(nm, ty, ix, callee, who)
-  validateBmCstrs(nm, ty, ix, callee, who)
-  validateMemCstrs(
-    nm,
-    ty,
-    ix,
-    callee,
-    who,
-    fsbCallHNames[c],
-    fsbCallHNo[c],
-    fsbCallHNode[c],
-  )
+  const at = solvePlain(nm, ty, ix, callee, who)
+  at.hNames = fsbCallHNames[c]
+  at.hArgNo = fsbCallHNo[c]
+  at.hArgNode = fsbCallHNode[c]
+  at.kinds = SS_ALL - (1 << SS_NEST) - (1 << SS_UFCS)
+  ifaceSolveAt(at, SS_BIN, SS_UFCS)
   cstrOwnedStrictSet(false)
   substNestModeSet(modeWas)
   substNestDeclSet(declWas)
@@ -1325,6 +1305,143 @@ function ctnDeliveredDeclOf(ix: i32): i32 {
   return out
 }
 
+// The steps of a call's solve, in the order every caller asks them; a mask bit per step.
+export const SS_BIN = 0
+export const SS_PRINT = 1
+export const SS_ARRDEF = 2
+export const SS_NEST = 3
+export const SS_IS = 4
+export const SS_ARG = 5
+export const SS_RET = 6
+export const SS_LET = 7
+export const SS_BM = 8
+export const SS_MEM = 9
+export const SS_UFCS = 10
+export const SS_ALL = 2047
+
+// What one call's solve reads: the bindings (`rNames`/`rTys` for the declared return), the call,
+// the callee and its spelling, the hole arguments, the steps it takes (`kinds`, a mask over `SS_*`),
+// and, when `toggles`, the `substSelfOwner` its bin, let and ufcs steps (`selfOwner`) and its arg
+// step (`argOwner`) run under, restored to `ownerWas` after each.
+export type SolveAt = {
+  bNames: string[],
+  bTys: i32[],
+  rNames: string[],
+  rTys: i32[],
+  ix: i32,
+  callee: i32,
+  who: string,
+  hNames: string[],
+  hArgNo: i32[],
+  hArgNode: i32[],
+  kinds: i32,
+  toggles: boolean,
+  selfOwner: string,
+  argOwner: string,
+  ownerWas: string,
+}
+
+// Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order.
+export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
+  let st = from
+  while st <= to {
+    if (at.kinds & (1 << st)) != 0 { solveStep(at, st) }
+    st = st + 1
+  }
+  return 0
+}
+
+// One step of `ifaceSolveAt`.
+function solveStep(at: SolveAt, st: i32) {
+  if st == SS_BIN {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    validateBinCstrs(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.who,
+      at.hNames,
+      at.hArgNo,
+      at.hArgNode,
+    )
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  } else if st == SS_PRINT {
+    validatePrintCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_ARRDEF {
+    validateArrDefCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_NEST {
+    validateNestCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_IS {
+    validateIsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_ARG {
+    if at.toggles { substSelfOwnerSet(at.argOwner) }
+    validateArgCstrs(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.hNames,
+      at.hArgNode,
+    )
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  } else if st == SS_RET {
+    validateRetCstrs(at.rNames, at.rTys, at.ix, at.callee, at.who)
+  } else if st == SS_LET {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    validateLetCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  } else if st == SS_BM {
+    validateBmCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+  } else if st == SS_MEM {
+    validateMemCstrs(
+      at.bNames,
+      at.bTys,
+      at.ix,
+      at.callee,
+      at.who,
+      at.hNames,
+      at.hArgNo,
+      at.hArgNode,
+    )
+  } else if st == SS_UFCS {
+    if at.toggles { substSelfOwnerSet(at.selfOwner) }
+    validateUfcsCstrs(at.bNames, at.bTys, at.ix, at.callee, at.who)
+    if at.toggles { substSelfOwnerSet(at.ownerWas) }
+  }
+  return 0
+}
+
+// A solve of every step for a call with no hole arguments and no owner toggles.
+export function solvePlain(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  callee: i32,
+  who: string,
+): SolveAt {
+  const noN: string[] = []
+  const noNo: i32[] = []
+  const noNode: i32[] = []
+  return {
+    bNames: bNames,
+    bTys: bTys,
+    rNames: bNames,
+    rTys: bTys,
+    ix: ix,
+    callee: callee,
+    who: who,
+    hNames: noN,
+    hArgNo: noNo,
+    hArgNode: noNode,
+    kinds: SS_ALL,
+    toggles: false,
+    selfOwner: "",
+    argOwner: "",
+    ownerWas: "",
+  }
+}
+
 // Every constraint `owner`'s body deferred, adjudicated at the bindings `bNames`/`bTys` and
 // reported at `srcExpr`, as a direct call of `who` reports them.
 function declCstrsAtBinding(
@@ -1334,20 +1451,9 @@ function declCstrsAtBinding(
   owner: i32,
   who: string,
 ) {
-  const noN: string[] = []
-  const noNo: i32[] = []
-  const noNode: i32[] = []
-  validateBinCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
-  validatePrintCstrs(bNames, bTys, srcExpr, owner, who)
-  validateArrDefCstrs(bNames, bTys, srcExpr, owner, who)
-  validateNestCstrs(bNames, bTys, srcExpr, owner, who)
-  validateArgCstrs(bNames, bTys, srcExpr, owner, noN, noNode)
-  validateRetCstrs(bNames, bTys, srcExpr, owner, who)
-  validateLetCstrs(bNames, bTys, srcExpr, owner, who)
-  validateBmCstrs(bNames, bTys, srcExpr, owner, who)
-  validateMemCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
-  validateUfcsCstrs(bNames, bTys, srcExpr, owner, who)
-  return 0
+  const at = solvePlain(bNames, bTys, srcExpr, owner, who)
+  at.kinds = SS_ALL - (1 << SS_IS)
+  return ifaceSolveAt(at, SS_BIN, SS_UFCS)
 }
 
 // A top-level function `decl` with un-annotated parameters, named at `srcExpr` and typed
