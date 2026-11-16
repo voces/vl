@@ -14,8 +14,8 @@ answer.
 - **What is recorded.** Only records and unions go into `seen` (`tyWalkEnter`). A cycle of VL types
   passes through one of them: through a list, a map or a function alone it is refused or bottoms out
   (D16733's table).
-- **No allocation.** The three walks call nothing that re-enters them, so they share one module-level
-  stack, `tyWalkSeen`, emptied at each outermost call.
+- **The visited list** is local to each outermost call. A shared module-level stack measured the
+  same (+0.01%), but the phase-state census counts it as a table written across phases.
 - **The depth argument** goes from all 105 call sites.
 
 ## What changes for a program
@@ -25,9 +25,9 @@ recursive type. They now answer from the whole type.
 
 ## Cost
 
-The first cut allocated a `seen` list per call and recorded every row. Its guest fuel, measured on a
-fixed input (master's `compiler/entry.vl` under both seeds), was **+2.85%**. Recording only records
-and unions, in one shared stack, with the check only in those two arms:
+The first cut recorded every row, through a call per node. Its guest fuel, measured on a fixed input
+(master's `compiler/entry.vl` under both seeds), was **+2.85%**. Recording only records and unions,
+with the check only in those two arms:
 
 | seed | guest fuel | vs master |
 |---|---:|---:|
@@ -36,8 +36,8 @@ and unions, in one shared stack, with the check only in those two arms:
 | shared stack, every node through `tyWalkEnter` | 91,561,490,562 | +0.81% |
 | shared stack, check in the record and union arms only | 91,442,628,764 | **+0.68%** |
 
-After master 5b42a89c2 is merged in, the rise is **+0.52%** (91,031,904,770 → 91,504,580,106
-against that master's fixpoint). The remaining rise is the walks now reaching the bottom of large
+After master 5b42a89c2 is merged in, the rise is **+0.53%** with the per-call list (91,031,904,770 →
+91,514,422,158 against that master's fixpoint). The remaining rise is the walks now reaching the bottom of large
 types the cap used to stop at eight levels. `self-compile-time.sh` reads +0.3% on its committed baseline, which passes.
 
 ## Found on the way
