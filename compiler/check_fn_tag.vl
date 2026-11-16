@@ -114,7 +114,7 @@ import {
   tErr,
   widenLitTy,
 } from "./check_relate_core"
-import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
+import { fieldStorageEq } from "./check_ty_relate"
 import {
   T,
   TY_VOID,
@@ -139,7 +139,7 @@ import {
   tyValOf,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
-import { nonNullTy, tyHasTyVar, tyReachesHole } from "./tyquery"
+import { nonNullTy, tyHasTyVar, tyHoldsHole } from "./tyquery"
 import { lpExitsOf } from "./check_if_value"
 import {
   i32ListHas,
@@ -2133,7 +2133,7 @@ function ftClosedFnTy(t: i32): boolean {
     && t < T.tys.length
     && tyAt(t) is TyFunc
     && !tyHasTyVar(t)
-    && !tyReachesHole(t, 8)
+    && !tyHoldsHole(t)
 }
 
 // Whether node `d` declares a named function with no type parameters.
@@ -2474,6 +2474,8 @@ function ftWriteLeafOf(x: i32, s: i32): boolean {
 
 // Whether `x` is a list literal whose elements each carry set `s` or name one of its members
 // `ds`, with `t`, the row it is re-typed to, a list of the set's ids; the names go to `leaves`.
+// Where `t` is a list of such lists, each element is such a literal one level down, or a list
+// literal already holding the set.
 function ftInnerLeaves(
   x: i32,
   t: i32,
@@ -2485,10 +2487,18 @@ function ftInnerLeaves(
   if x < 0 || x >= P.nodes.length || t < 0 || t >= T.tys.length { return false }
   const n = nodeAt(x)
   const tt = tyAt(t)
-  if !(n is ArrayLit) || !(tt is TyArray) || fnTagSetOfTy(tyElemOf(tt)) != s {
+  if !(n is ArrayLit) || !(tt is TyArray) { return false }
+  if fnTagSetOfTy(tyElemOf(tt)) == s {
+    if !ftValuesOk(n.arrElems, s, ds, leaves, ids) { return false }
+  } else if ftHoldKind(t, s) == 4 {
+    for el in n.arrElems {
+      const ek = ftHoldKind(nodeTyIxOf(el), s)
+      const inner = if ek == 1 || ek == 4 { ftInnerLit(parenPeelIx(el)) } else { ftInnerLeaves(parenPeelIx(el), tyElemOf(tt), s, ds, leaves, ids) }
+      if !inner { return false }
+    }
+  } else {
     return false
   }
-  if !ftValuesOk(n.arrElems, s, ds, leaves, ids) { return false }
   if !i32ListHas(ftRespine, x) {
     ftRespine.push(x)
     ftRespineTy.push(t)
@@ -4698,7 +4708,7 @@ function ftSlotOp(p: Member, x: i32, g: i32, s: i32): boolean {
     const pt = ft.fnParamTypes[0]
     if pt < 0 { return false }
     return fnTagSetOfTy(pt) == s
-      || !tyHasTyVar(pt) && !tyReachesHole(pt, 8)
+      || !tyHasTyVar(pt) && !tyHoldsHole(pt)
       || ftHoleCallback(c.callArgs[0])
   }
   // A list of records rooted at a binding the field widener widened takes a pushed literal the
@@ -4887,9 +4897,12 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
   match pn {
     // Reads of the holder's slots and fields, and a loop binding each of its ids.
     Index => {
-      // An entry of a map of records read through `?.` is a guarded call no member call is built
-      // for.
-      const opt = g >= 0 && nodeAt(g) is OptMember && ftHoldKind(tx, s) == 8
+      // An entry of a map of records read through `?.` to a record nested in it is a guarded call
+      // no member call is built for; one to the entry's own field of the set is (D16743).
+      const opt = g >= 0
+        && nodeAt(g) is OptMember
+        && ftHoldKind(tx, s) == 8
+        && fnTagSetOfTy(nonNullTy(nodeTyIxOf(g))) != s
       return pn.idxArr == x && !opt
     }
     Member => {
@@ -4996,9 +5009,16 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A container slot of the holder's type is a holder of holders, which `ftHoldKind` names.
     ArrayLit => {
-      // A list of maps of a wider set decided with this one holds this set's maps (D15234), and a
-      // list of records of one holds this set's records (D15924).
-      if ftMapListOfWider(p, x, s) || ftRecListOfWider(p, x, s) { return true }
+      // A list of maps of a wider set decided with this one holds this set's maps (D15234), a
+      // list of records of one holds this set's records (D15924), and a list of lists of one
+      // holds this set's lists (D16804).
+      if (
+        ftMapListOfWider(p, x, s)
+        || ftRecListOfWider(p, x, s)
+        || ftListListOfWider(p, x, s)
+      ) {
+        return true
+      }
       if !ftHolds(p, s) { return false }
       const pk = ftHoldKind(nodeTyIxOf(p), s)
       return ftDstTakes(ftArrElemTy(p), x, s) || pk == 4 || pk == 6
@@ -5132,6 +5152,13 @@ function ftMapListOfWider(p: i32, x: i32, s: i32): boolean {
 // set (D15924).
 function ftRecListOfWider(p: i32, x: i32, s: i32): boolean {
   return ftHolderListOfWider(p, x, s, 2, 6)
+}
+
+// `ftMapListOfWider` for a list `x` of set `s`'s ids, or of such lists, in a list of lists of a
+// wider set.
+function ftListListOfWider(p: i32, x: i32, s: i32): boolean {
+  return ftHolderListOfWider(p, x, s, 1, 4)
+    || ftHolderListOfWider(p, x, s, 4, 4)
 }
 
 // Whether `x`, a holder of hold kind `xk` of set `s`, sits in `p`, a list of hold kind `pk` of a
@@ -5342,7 +5369,7 @@ function ftDstTakes(dst: i32, x: i32, s: i32): boolean {
     && dst < T.tys.length
     && tyAt(dst) is TyObj
     && tyAt(bt) is TyObj
-    && fieldStorageEq(dst, bt, REC_STORE_DEPTH)
+    && fieldStorageEq(dst, bt)
     && ftTyHoldsDecided(dst, s)
 }
 
@@ -5429,7 +5456,7 @@ function ftListLeavesOfSet(a: i32, b: i32, s: i32, depth: i32): boolean {
     return bs == s && ftSetDecidedWith(as, s) || as == s && ftSubsetNote(bs, s)
   }
   if ae is TyObj && be is TyObj {
-    return fieldStorageEq(tyElemOf(ao), tyElemOf(bo), REC_STORE_DEPTH)
+    return fieldStorageEq(tyElemOf(ao), tyElemOf(bo))
       && ftTyHoldsDecided(tyElemOf(ao), s)
       && ftSubsetsNoteIn(tyElemOf(bo), s, [])
   }

@@ -51,7 +51,7 @@ import { parenPeelIx } from "./check_places"
 import { recFreshDeclOf } from "./check_rec_fresh"
 import { recNestedWidthPair } from "./check_obj_shape"
 import { recAdOpen, recAdPushDrop } from "./check_rec_rows"
-import { REC_STORE_DEPTH, fieldStorageEq } from "./check_ty_relate"
+import { fieldStorageEq } from "./check_ty_relate"
 import {
   T,
   TyArray,
@@ -68,6 +68,8 @@ import {
   objFieldType,
   tyAt,
   tyElemOf,
+  tyPathCycles,
+  tyPathWith,
   tyToStr,
 } from "./check_types"
 import {
@@ -97,15 +99,14 @@ export function recDropAdopt(
   dstTy: i32,
   at: i32,
 ): boolean {
-  if !recDropPlans(src, srcTy, dstTy, REC_STORE_DEPTH) { return false }
-  recDropApply(src, srcTy, dstTy, at, REC_STORE_DEPTH)
+  if !recDropPlans(src, srcTy, dstTy) { return false }
+  recDropApply(src, srcTy, dstTy, at)
   return true
 }
 
 // Whether `src` is a fresh binding `recDropLeafDst` lands, or a fresh literal whose every member
 // not stored as its destination stores it is one, and at least one member is.
-function recDropPlans(src: i32, srcTy: i32, dstTy: i32, depth: i32) {
-  if depth <= 0 { return false }
+function recDropPlans(src: i32, srcTy: i32, dstTy: i32) {
   const p = cwPeelValue(src)
   if p < 0 || p >= P.nodes.length { return false }
   const leaf = recDropLeafDst(p, srcTy, dstTy)
@@ -114,16 +115,14 @@ function recDropPlans(src: i32, srcTy: i32, dstTy: i32, depth: i32) {
   const n = recDropKids(p, srcTy, dstTy)
   let i = 0
   while i < n.kids.length {
-    if !recDropPlans(n.kids[i], n.kidSrc[i], n.kidDst[i], depth - 1) {
-      return false
-    }
+    if !recDropPlans(n.kids[i], n.kidSrc[i], n.kidDst[i]) { return false }
     any = true
     i = i + 1
   }
   return any && n.ok
 }
 
-function recDropApply(src: i32, srcTy: i32, dstTy: i32, at: i32, depth: i32) {
+function recDropApply(src: i32, srcTy: i32, dstTy: i32, at: i32) {
   const p = cwPeelValue(src)
   if recDropLeafDst(p, srcTy, dstTy) >= 0 {
     return recDropLeaf(p, srcTy, dstTy, at)
@@ -131,7 +130,7 @@ function recDropApply(src: i32, srcTy: i32, dstTy: i32, at: i32, depth: i32) {
   const n = recDropKids(p, srcTy, dstTy)
   let i = 0
   while i < n.kids.length {
-    recDropApply(n.kids[i], n.kidSrc[i], n.kidDst[i], at, depth - 1)
+    recDropApply(n.kids[i], n.kidSrc[i], n.kidDst[i], at)
     i = i + 1
   }
   return 0
@@ -154,7 +153,7 @@ function recDropKids(p: i32, srcTy: i32, dstTy: i32): RecDropKids {
       if !(st is TyArray) || !(dt is TyArray) { return out }
       for x in e.arrElems {
         if nodeAt(x) is Spread { return out }
-        if !fieldStorageEq(tyElemOf(st), tyElemOf(dt), REC_STORE_DEPTH) {
+        if !fieldStorageEq(tyElemOf(st), tyElemOf(dt)) {
           out.kids.push(x)
           out.kidSrc.push(tyElemOf(st))
           out.kidDst.push(tyElemOf(dt))
@@ -171,7 +170,7 @@ function recDropKids(p: i32, srcTy: i32, dstTy: i32): RecDropKids {
         const of = objFieldType(st, f.fiName)
         const df = objFieldType(dt, f.fiName)
         if of < 0 || df < 0 { return out }
-        if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+        if !fieldStorageEq(of, df) {
           out.kids.push(f.fiValue)
           out.kidSrc.push(of)
           out.kidDst.push(df)
@@ -226,15 +225,16 @@ function recDropLeaf(p: i32, srcTy: i32, dstTy: i32, at: i32) {
 // The record `d` delivers record `own` as when it drops some of `own`'s fields: `d` itself, or
 // the one member of a union `d` that does; -1 when none does, or two do.
 function recDropLanding(own: i32, d: i32): i32 {
-  return recDropLandingAt(own, d, REC_STORE_DEPTH)
+  const path: i32[] = []
+  return recDropLandingAt(own, d, path)
 }
 
-function recDropLandingAt(own: i32, d: i32, depth: i32) {
+function recDropLandingAt(own: i32, d: i32, path: i32[]) {
   if d < 0 || d >= T.tys.length { return -1 }
   const dt = tyAt(d)
   match dt {
     TyObj => {
-      return if recDropFitsAt(own, d, depth) { d } else { -1 }
+      return if recDropFitsAt(own, d, path) { d } else { -1 }
     }
     TyUnion => {
       let hit = -1
@@ -263,11 +263,13 @@ function recDropLandingAt(own: i32, d: i32, depth: i32) {
 // record field that lands, as `recDropLanding` lands, on a record or the one union arm that drops
 // some of its fields (D3566). The seams ask it only of a pair `assignable` accepts.
 export function recDropFits(own: i32, d: i32): boolean {
-  return recDropFitsAt(own, d, REC_STORE_DEPTH)
+  const path: i32[] = []
+  return recDropFitsAt(own, d, path)
 }
 
-function recDropFitsAt(own: i32, d: i32, depth: i32) {
-  if depth <= 0 { return false }
+function recDropFitsAt(own: i32, d: i32, path: i32[]) {
+  if tyPathCycles(own, path) { return false }
+  const sub = tyPathWith(own, path)
   const o = tyAt(own)
   const dd = tyAt(d)
   if !(o is TyObj) || !(dd is TyObj) { return false }
@@ -279,10 +281,10 @@ function recDropFitsAt(own: i32, d: i32, depth: i32) {
     const of = objFieldType(o, dd.objFieldNames[i])
     if of < 0 { return false }
     const df = dd.objFieldTypes[i]
-    if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+    if !fieldStorageEq(of, df) {
       const on = nonNulTyOf(of)
       if on >= 0 && on < T.tys.length && tyAt(on) is TyObj {
-        if recDropLandingAt(on, nonNulTyOf(df), depth - 1) >= 0 { drops = true }
+        if recDropLandingAt(on, nonNulTyOf(df), sub) >= 0 { drops = true }
       }
     }
     i = i + 1
@@ -319,7 +321,7 @@ function recDropUseBlocks(decl: i32, p: i32, own: i32, dst: i32): string {
           + "` on line "
           + i32ToStr(nodeLineOf(n))
       }
-      if of < 0 || !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+      if of < 0 || !fieldStorageEq(of, df) {
         return REC_DROP_READ
           + m.memProp
           + "`, which "

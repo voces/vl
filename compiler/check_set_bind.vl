@@ -120,6 +120,23 @@ function sbCallOf(a: i32): i32 {
   return p
 }
 
+// The declaration whose parameter argument `a` reads: `fr`, the declaration the call is in, or
+// the enclosing declaration a nested function captures the parameter from.
+function sbArgOwner(fr: i32, a: i32): i32 {
+  if (
+    sbParamIndexIn(fr, a) >= 0
+    || a < 0
+    || a >= P.nodes.length
+    || !(nodeAt(a) is Ident)
+  ) {
+    return fr
+  }
+  const pd = identDeclOf(a)
+  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return fr }
+  const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
+  return if sbParamIndexIn(owner, a) >= 0 { owner } else { fr }
+}
+
 // The position of the parameter of `d` that argument `a` reads, -1 when it reads none. A `$`
 // parameter is none: the check minted it for an adapter it built (`fvaAdapt`, a list copy's
 // element map), which holds the source's closure, not a set.
@@ -288,13 +305,13 @@ function sbPushesOwn(b: i32, n: Call): boolean {
   return n.callArgs.length > 0
 }
 
-// Notes each set in `ss`, every set one place is reached by, as partial when the place is also
-// reached by another set or, when `lack`, by a value of no set: an instance binds it otherwise.
-function sbPartialNote(ss: i32[], lack: boolean) {
+// Notes each set in `ss`, every set one place is reached by, as partial when, with `others`, the
+// place is also reached by another set or, when `lack`, by a value of no set.
+function sbPartialNote(ss: i32[], lack: boolean, others: boolean) {
   for s in ss {
     let other = lack
     for o in ss {
-      if o != s && !fnTagMembersWithin(o, s) { other = true }
+      if others && o != s && !fnTagMembersWithin(o, s) { other = true }
     }
     if other { sbPartial[s] = true }
   }
@@ -380,7 +397,10 @@ function sbElemSetOf(t: i32): i32 {
 }
 
 // The list literal a `const` binding read at `x` holds, else -1.
-function sbConstListLit(x: i32): i32 {
+function sbConstListLit(x: i32): i32 { return sbConstListLitIn(x, 8) }
+
+// `sbConstListLit` through at most `depth` `const` aliases of the binding.
+function sbConstListLitIn(x: i32, depth: i32): i32 {
   const v = parenPeelIx(x)
   if v >= 0 && v < P.nodes.length && nodeAt(v) is ArrayLit { return v }
   if v < 0 || v >= P.nodes.length || !(nodeAt(v) is Ident) { return -1 }
@@ -395,6 +415,9 @@ function sbConstListLit(x: i32): i32 {
     return -1
   }
   const li = parenPeelIx(ln.letInit)
+  if li >= 0 && li < P.nodes.length && nodeAt(li) is Ident && depth > 0 {
+    return sbConstListLitIn(li, depth - 1)
+  }
   return if li >= 0 && nodeAt(li) is ArrayLit { li } else { -1 }
 }
 
@@ -436,10 +459,11 @@ function sbElemCallRows(c: i32, n: Call) {
         if pn is Param && pn.parType < 0 {
           const a = parenPeelIx(n.callArgs[j])
           const set = fnTagSetOfTy(nodeTyIxOf(a))
-          const q = if set < 0 { sbParamIndexIn(fr, a) } else { -1 }
+          const fo = sbArgOwner(fr, a)
+          const q = if set < 0 { sbParamIndexIn(fo, a) } else { -1 }
           const ty = nodeTyIxOf(a)
           if set >= 0 || q >= 0 || ty >= 0 {
-            sbRowAdd(c, ed, j, set, ty, fr, q)
+            sbRowAdd(c, ed, j, set, ty, fo, q)
           }
         }
         j = j + 1
@@ -456,11 +480,47 @@ let tcFn: i32[] = []
 let tcParam: i32[] = []
 let tcDone: i32[][] = []
 
-// Notes call `n` at `c` when its callee is a parameter of the declaration it is in.
+// The sets calls through a `const` bound to a hand-back call go through (`sbThroughNote`).
+let sbHandedCalls: i32[] = []
+
+// The set of the argument call `x` hands back, when `x` calls a declared function handing back
+// that argument (`check_hand_back.vl`); -1 otherwise.
+function sbHandedBackSet(x: i32): i32 {
+  const v = parenPeelIx(x)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const cn = nodeAt(v)
+  if !(cn is Call) { return -1 }
+  const fd = identFnDeclOf(parenPeelIx(cn.callFn))
+  const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { cn }
+  if !(fdn is FuncDecl) || fdn.fnBody < 0 { return -1 }
+  const own = handBackIx(fdn)
+  const i = if own >= 0 { own } else { handBackHoleIx(fdn, 0) }
+  // A parameter annotated by a closed function type holds a closure, whatever is handed to it.
+  if i < 0 || i >= cn.callArgs.length || !sbHandable(fdn, i) { return -1 }
+  return fnTagSetOfTy(nodeTyIxOf(parenPeelIx(cn.callArgs[i])))
+}
+
+// Notes call `n` at `c` when its callee is a parameter of the declaration it is in; a call through
+// a local `const` of a set adds its members' rows at once.
 function sbThroughNote(c: i32, n: Call) {
   const f = parenPeelIx(n.callFn)
   const pd = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
-  if pd < 0 || pd >= P.nodes.length || !(nodeAt(pd) is Param) { return 0 }
+  if pd < 0 || pd >= P.nodes.length { return 0 }
+  // A local `const` the check types at a set, such as a choice of declared functions, calls
+  // each member with the call's arguments.
+  const pdn = nodeAt(pd)
+  if pdn is LetDecl && pdn.letKw == "const" {
+    const st = fnTagSetOfTy(nodeTyIxOf(f))
+    if st >= 0 {
+      for m in fnTagMembers(st) { sbArgRows(c, n, m, sbEnclosingFn(c)) }
+    }
+    // A `const` bound to the result of a declared function handing back its argument holds that
+    // argument's set, so its call goes through that set.
+    const hs = if st < 0 { sbHandedBackSet(pdn.letInit) } else { -1 }
+    if hs >= 0 && !i32ListHas(sbHandedCalls, hs) { sbHandedCalls.push(hs) }
+    return 0
+  }
+  if !(pdn is Param) { return 0 }
   const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
   const q = sbParamIndexIn(owner, f)
   if q < 0 { return 0 }
@@ -514,9 +574,10 @@ function sbArgRows(c: i32, n: Call, m: i32, fr: i32): boolean {
       const a = parenPeelIx(n.callArgs[j])
       const ty = nodeTyIxOf(a)
       const set = fnTagSetOfTy(ty)
-      const q = if set < 0 { sbParamIndexIn(fr, a) } else { -1 }
+      const fo = sbArgOwner(fr, a)
+      const q = if set < 0 { sbParamIndexIn(fo, a) } else { -1 }
       if set >= 0 || q >= 0 || ty >= 0 {
-        sbRowAdd(c, m, j, set, ty, fr, q)
+        sbRowAdd(c, m, j, set, ty, fo, q)
         added = true
       }
     }
@@ -662,8 +723,10 @@ export function setBindTrySets(end: i32): i32[] {
   sbWithHandBacks = true
   const keys: string[] = []
   for d in sbDecls { setBindCallsIn(d, keys) }
+  for hs in sbHandedCalls { sbCalledSets.push(hs) }
   const out: i32[] = []
   for s in sbCalledSets {
+    if sbFollowsJoin(s) || (sbCloDelivered[s] ?? false) { continue }
     const sure = !sbSetHasGeneric(s)
       && !(sbStoredSets[s] ?? false)
       && !(sbViaMember[s] ?? false)
@@ -700,6 +763,7 @@ export function setBindBuild() {
   const ck = sbEnd
   const end = if ck >= 0 && ck < P.nodes.length { ck } else { P.nodes.length }
   sbEscaped = Map()
+  sbCloDelivered = Map()
   sbParamEscaped = Map()
   sbStoredParams = Map()
   sbPartial = Map()
@@ -707,6 +771,7 @@ export function setBindBuild() {
   sbLacksSet = Map()
   sbStoredSets = Map()
   sbCalledSets = []
+  sbHandedCalls = []
   sbBoundDecl = Map()
   sbAliasFrom = []
   sbAliasTo = []
@@ -748,7 +813,7 @@ export function setBindBuild() {
         let k = 0
         while k < hs.length {
           const a = if k < args.length { args[k] } else { -1 }
-          const fr = if k < froms.length { froms[k] } else { -1 }
+          const fr = sbArgOwner(if k < froms.length { froms[k] } else { -1 }, a)
           const q = if hs[k] < 0 { sbParamIndexIn(fr, a) } else { -1 }
           const c = sbCallOf(a)
           const ty = nodeTyIxOf(a)
@@ -764,6 +829,7 @@ export function setBindBuild() {
       sbElemCallRows(d, dn)
       sbThroughNote(d, dn)
       sbConstLambdaCallRows(d, dn)
+      sbCloDeliveryNote(dn)
       sbCallbackNote(d, dn)
     }
     d = d + 1
@@ -871,7 +937,10 @@ function setBindCallsIn(d: i32, out: string[]) {
         if q >= 0 {
           const esc = dn is FuncDecl
             && (sbParamEscaped[dn.fnParams[q]] ?? false)
-          sbPartialNote(setBindSetsOf(d, q), sbRowsLackSet(d, q) || esc)
+          // An instance is keyed by the set its parameter holds, so another set at another call
+          // is another instance; a lambda has one instance, so its calls share it.
+          const shared = fnNameIsLambda(dn.fnName)
+          sbPartialNote(setBindSetsOf(d, q), sbRowsLackSet(d, q) || esc, shared)
           for s in setBindSetsOf(d, q) {
             if s >= 0 {
               out.push("P" + sbKey(d, q) + "|" + i32ToStr(s))
@@ -1019,7 +1088,7 @@ function sbPathCallKeys(d: i32, x: i32, n: Call, out: string[]) {
           if s0 < 0 { lack = true }
           else if !i32ListHas(seen, s0) { seen.push(s0) }
         }
-        sbPartialNote(seen, lack || sbRowsLackSet(d, q))
+        sbPartialNote(seen, lack || sbRowsLackSet(d, q), false)
         for t in sbTysOf[sbKey(d, q)] ?? [] {
           const s = fnTagSetOfTy(sbTyAtPath(t, steps))
           if s >= 0 {
@@ -1054,6 +1123,40 @@ function sbTyAtPath(t: i32, steps: string[]): i32 {
     k = k - 1
   }
   return cur
+}
+
+// Each set a call hands to a parameter annotated by a closed function type: a closure is built
+// there, so the set's tag is decided after the elaboration notes that delivery.
+let sbCloDelivered: {[i32]: boolean} = Map()
+
+// Notes the sets call `n` hands to closed-function-typed parameters of a declared function.
+function sbCloDeliveryNote(n: Call) {
+  const fd = identFnDeclOf(parenPeelIx(n.callFn))
+  const fdn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { n }
+  if !(fdn is FuncDecl) { return 0 }
+  let i = 0
+  while i < n.callArgs.length && i < fdn.fnParams.length {
+    const pn = nodeAt(fdn.fnParams[i])
+    if pn is Param && pn.parType >= 0 && sbBareTyParamOf(fdn, i) == "" {
+      const st = fnTagSetOfTy(nodeTyIxOf(parenPeelIx(n.callArgs[i])))
+      if st >= 0 { sbCloDelivered[st] = true }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether one-member set `s` has its member inside a larger set the rows reach: the tag decision
+// decides it with that join (`fnTagDecide`'s two passes), so the check leaves it to the decision
+// that decides the join.
+function sbFollowsJoin(s: i32): boolean {
+  if fnTagMembers(s).length != 1 { return false }
+  for t in sbCalledSets {
+    if t != s && fnTagMembers(t).length > 1 && fnTagMembersWithin(s, t) {
+      return true
+    }
+  }
+  return false
 }
 
 // Whether set `s` has a generic member: an instance types a call through it at the member's

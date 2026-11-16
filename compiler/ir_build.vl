@@ -21,6 +21,7 @@ import {
   Param,
   Paren,
   RetStmt,
+  StrLit,
   Unary,
   WhileStmt,
   hasNamedArgs,
@@ -51,8 +52,19 @@ import {
 } from "./ir"
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { irTyOpen, irVerify } from "./ir_verify"
-import { irDualEmit, irHexOf, irLowerClaim, irLoweredEntry } from "./ir_lower"
-import { GlobalCtx, callEndsNever, globalReadRecovers } from "./wasmEmit"
+import {
+  irAstKind,
+  irDualEmit,
+  irHexOf,
+  irLowerClaim,
+  irLoweredEntry,
+} from "./ir_lower"
+import {
+  GlobalCtx,
+  callEndsNever,
+  globalReadRecovers,
+  strLitTakesAtom,
+} from "./wasmEmit"
 import { repNodeGen, repNodeOfTy } from "./emit_rep"
 import { nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import {
@@ -78,12 +90,28 @@ let ibRowN: i32[] = []
 
 // Arms (1) or disarms (0) the shadow for the compiles that follow; 2 also details the first
 // examples of each dual-emit mismatch class. 3 leaves it disarmed and claims I1's families
-// (scalar, control, call, global), the test of the claim path itself.
+// (scalar, control, call, global), the test of the claim path itself. 4 is the blocker census:
+// each function's build goes on past a missed statement, and its row names every class it missed.
 export function irShadowArm(on: i32) {
-  ibArmed = on == 1 || on == 2
+  ibArmed = on == 1 || on == 2 || on == 4
   ibDetail = on == 2
   ibClaimAll = on == 3
+  ibAllMiss = on == 4
   return 0
+}
+
+let ibAllMiss = false
+// The classes the blocker census met in the function being built.
+let ibMisses: string[] = []
+
+// Under the census, records `why` and lets the build go on; otherwise answers it.
+function censusGoesOn(why: string): boolean {
+  if !ibAllMiss { return false }
+  for m in ibMisses {
+    if m == why { return true }
+  }
+  ibMisses.push(why)
+  return true
 }
 
 // The families whose every occurrence the shadow has matched, so a function built wholly of them
@@ -571,7 +599,18 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   }
   if n is Index { return irIndexHook(b, ix, rep) }
   if n is Member { return irMemberHook(b, ix, rep) }
-  return irBMiss("expression")
+  if n is StrLit { return strLit(ix, rep) }
+  return irBMiss("expression " + irAstKind(ix))
+}
+
+// A string literal at the `str` rep, built by legacy's `emitStr` at its use; one delivered as an
+// interned atom is a miss.
+function strLit(ix: i32, rep: i32): Opnd {
+  if repPrim(rep) != "str" || strLitTakesAtom(ix, ibFnIx) {
+    return irBMiss("string atom")
+  }
+  const o: Opnd = { osAt: ix }
+  return o
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
@@ -668,6 +707,7 @@ function elseStmts(e: i32): i32[] {
 function stmt(b: i32[], ix: i32) {
   const n0 = b.length
   stmtIn(b, ix)
+  if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
   return 0
 }
@@ -811,6 +851,7 @@ function build(fnIx: i32, fnPos: i32): string {
   ib = irFnNew(fnIx, fn.fnName)
   ibFnIx = fnIx
   ibMiss = ""
+  ibMisses = []
   ibDeclVar = Map()
   ibLoopName = []
   ibLoopBrk = []
@@ -822,7 +863,9 @@ function build(fnIx: i32, fnPos: i32): string {
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)
   if !(valueRep(ib.irRetRep, ib.irRetTy) || none) {
-    return "result rep " + repWhat(ib.irRetRep)
+    if !censusGoesOn("result rep " + repWhat(ib.irRetRep)) {
+      return "result rep " + repWhat(ib.irRetRep)
+    }
   }
   ibNoValue = if none { ib.irRetRep } else { -1 }
   const shift = envSlotShift(fnIx)
@@ -831,9 +874,15 @@ function build(fnIx: i32, fnPos: i32): string {
     const p = fn.fnParams[i]
     const ty = scopeTyAt(p, fnIx)
     const r = repNodeOfTy(ty)
-    if isVoidTy(ty) || !valueRep(r, ty) { return "parameter rep " + repWhat(r) }
+    if isVoidTy(ty) || !valueRep(r, ty) {
+      if !censusGoesOn("parameter rep " + repWhat(r)) {
+        return "parameter rep " + repWhat(r)
+      }
+    }
     // An unannotated parameter's type is open until a call instances it.
-    if irTyOpen(ty) { return "open parameter type" }
+    if irTyOpen(ty) && !censusGoesOn("open parameter type") {
+      return "open parameter type"
+    }
     const v = irVarNew(ib, r, ty, "param", shift + i)
     ibDeclVar[p] = v
     ib.irParams.push(v)
@@ -958,6 +1007,7 @@ export function irShadowFn(
   count("fns")
   const gen = repNodeGen()
   const why = build(fnIx, fnPos)
+  if ibAllMiss { return censusRow(why) }
   if why != "" {
     count("uncovered " + why)
     return 0
@@ -991,5 +1041,34 @@ export function irShadowFn(
       + "\n"
       + irFnText(ib),
   )
+  return 0
+}
+
+// The census row of the function just built: its blocker classes, sorted, or none.
+function censusRow(why: string) {
+  if why != "" { censusGoesOn(why) }
+  if ibMisses.length == 0 {
+    count("blockers none")
+    return 0
+  }
+  // Insertion sort, so one set of classes is one key whatever order the build met them in.
+  let i = 1
+  while i < ibMisses.length {
+    const x = ibMisses[i]
+    let j = i - 1
+    while j >= 0 && ibMisses[j] > x {
+      ibMisses[j + 1] = ibMisses[j]
+      j = j - 1
+    }
+    ibMisses[j + 1] = x
+    i = i + 1
+  }
+  let key = ibMisses[0]
+  let k = 1
+  while k < ibMisses.length {
+    key = key + " + " + ibMisses[k]
+    k = k + 1
+  }
+  count("blockers " + key)
   return 0
 }

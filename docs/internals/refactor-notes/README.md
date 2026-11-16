@@ -9,6 +9,20 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-slot-store-parity-open-edge-instance](2026-11-16-slot-store-parity-open-edge-instance.md): Slot store parity 4: an open value takes its instance's type at its edge (lane SLOT, 2026-11-16)
+- [2026-11-16-slot-store-parity-late-write-clone](2026-11-16-slot-store-parity-late-write-clone.md): Slot store parity 3: an instance's clone of a capture write temp (lane SLOT, 2026-11-16)
+- [2026-11-16-store-fntag-progress](2026-11-16-store-fntag-progress.md): One storage decider: why the remaining late flips are late, 2026-11-16
+- [2026-11-16-ir-blocker-census](2026-11-16-ir-blocker-census.md): The IR blocker census, 2026-11-16
+- [2026-11-16-ir-c3a-widen-plan](2026-11-16-ir-c3a-widen-plan.md): IR cutover C3a: the numeric widening plan, 2026-11-16
+- [2026-11-16-type-hashcons-s6b11-rec-drop](2026-11-16-type-hashcons-s6b11-rec-drop.md): Type hash-cons stage 6b: the dropped-field walks without a depth, and D16735 (lane H), 2026-11-16
+- [2026-11-16-type-hashcons-s6b10-rcw-covs](2026-11-16-type-hashcons-s6b10-rcw-covs.md): Type hash-cons stage 6b: the covariance walk without a depth (lane H), 2026-11-16
+- [2026-11-16-store-fntag-switch-1](2026-11-16-store-fntag-switch-1.md): One storage decider: the first class moves to the check, 2026-11-16
+- [2026-11-16-slot-store-parity-capture-cells](2026-11-16-slot-store-parity-capture-cells.md): Slot store parity 2: capture cells (lane SLOT, 2026-11-16)
+- [2026-11-16-l2-s3-3-bin-walk](2026-11-16-l2-s3-3-bin-walk.md): L2 S3.3: the binary-operator validator reads only the callee's rows, 2026-11-16
+- [2026-11-16-ir-c2e-list-length](2026-11-16-ir-c2e-list-length.md): IR cutover C2e: list length, with the ref list read, 2026-11-16
+- [2026-11-16-slot-climb-depth](2026-11-16-slot-climb-depth.md): Slot delivery walk: a deep path ends at a cycle (2026-11-16)
+- [2026-11-16-type-hashcons-s6b9-d16734-width-caps](2026-11-16-type-hashcons-s6b9-d16734-width-caps.md): Type hash-cons stage 6b: D16734, three depth limits on the nested-width path (lane H), 2026-11-16
+- [2026-11-16-rep-adt-stage3d-i-sidecar-shadow](2026-11-16-rep-adt-stage3d-i-sidecar-shadow.md): Rep ADT stage 3d-i: the field sidecars' read-time shadow, 2026-11-16 (lane REP)
 - [2026-11-16-slot-store-parity-loop-exits](2026-11-16-slot-store-parity-loop-exits.md): Slot store parity 1: loop exits (lane SLOT, 2026-11-16)
 - [2026-11-16-set-drops-vals](2026-11-16-set-drops-vals.md): B6a-opt: a Set stops writing and growing its `vals` list, 2026-11-16 (lane AE4)
 - [2026-11-16-type-hashcons-s6b7-deep-grid](2026-11-16-type-hashcons-s6b7-deep-grid.md): Type hash-cons stage 6b: a depth grid for the caps the corpus cannot reach (lane H), 2026-11-16

@@ -37,7 +37,7 @@ import {
   tyHasNullMember,
   tyHasTyVar,
   tyHasV128Member,
-  tyReachesHole,
+  tyHoldsHole,
   tyStepElem,
   tyUnionIsOneLitCell,
   unionLeavesInto,
@@ -1067,9 +1067,7 @@ export function recEqSide(ty: i32): i32 {
 export function recEqFieldWise(lt: i32, rt: i32): boolean {
   const lr = recEqSide(lt)
   const rr = recEqSide(rt)
-  if lr < 0 || rr < 0 || fieldStorageEq(lr, rr, REC_STORE_DEPTH) {
-    return false
-  }
+  if lr < 0 || rr < 0 || fieldStorageEq(lr, rr) { return false }
   if tyHasTyVar(lt) || tyHasTyVar(rt) { return false }
   const lo = tyAt(lr)
   const ro = tyAt(rr)
@@ -1088,10 +1086,15 @@ export function recEqFieldWise(lt: i32, rt: i32): boolean {
 
 // The first field of `d` that `s` stores differently, or "".
 export function recStorageField(s: TyObj, d: TyObj): string {
+  const pairs: i32[] = []
+  return recStorageFieldOn(s, d, pairs)
+}
+
+function recStorageFieldOn(s: TyObj, d: TyObj, pairs: i32[]): string {
   let i = 0
   while i < d.objFieldNames.length {
     const sf = objFieldType(s, d.objFieldNames[i])
-    if sf >= 0 && !fieldStorageEq(sf, d.objFieldTypes[i], REC_STORE_DEPTH) {
+    if sf >= 0 && !fieldStorageEqOn(sf, d.objFieldTypes[i], pairs) {
       return d.objFieldNames[i]
     }
     i = i + 1
@@ -1101,29 +1104,35 @@ export function recStorageField(s: TyObj, d: TyObj): string {
 
 // Do two field types share one storage? The same type does; a list and its `readonly` view do;
 // an integer literal type is stored as `i32`; two records do when every field does. What the
-// rule cannot see into (a hole, the depth bound) is taken as shared, so it never refuses.
-export function fieldStorageEq(a: i32, b: i32, depth: i32): boolean {
+// rule cannot see into (a hole) is taken as shared, so it never refuses. A recursive pair met
+// again on the walk is shared so far, so the answer is decided by the fields outside the cycle.
+export function fieldStorageEq(a: i32, b: i32): boolean {
+  const pairs: i32[] = []
+  return fieldStorageEqOn(a, b, pairs)
+}
+
+// `fieldStorageEq` inside the record pairs `pairs` (flattened, source then destination).
+function fieldStorageEqOn(a: i32, b: i32, pairs: i32[]): boolean {
   if a == b { return true }
   if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return true }
-  if depth <= 0 { return true }
-  if tyReachesHole(a, 8) || tyReachesHole(b, 8) { return true }
+  if tyHoldsHole(a) || tyHoldsHole(b) { return true }
   if tyEq(a, b) { return true }
   if intLitStored(a) && intLitStored(b) { return true }
   const ta = tyAt(a)
   match ta {
     TyArray => {
       const eb = tyArrayElemIx(b)
-      return eb >= 0 && fieldStorageEq(tyElemOf(ta), eb, depth - 1)
+      return eb >= 0 && fieldStorageEqOn(tyElemOf(ta), eb, pairs)
     }
     TyNullable => {
       const nb = nullableInnerOrNone(b)
-      return nb >= 0 && fieldStorageEq(ta.nInner, nb, depth - 1)
+      return nb >= 0 && fieldStorageEqOn(ta.nInner, nb, pairs)
     }
     TyMap => {
-      return recMapStorageEq(ta, b, depth)
+      return recMapStorageEq(ta, b, pairs)
     }
     TyObj => {
-      return recObjStorageEq(ta, a, b)
+      return recObjStorageEq(ta, a, b, pairs)
     }
     // Any other pair of types that are not one type is stored apart.
     TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {
@@ -1134,20 +1143,27 @@ export function fieldStorageEq(a: i32, b: i32, depth: i32): boolean {
 
 // Do the record `ta` (at `a`) and the type `b` share a storage: a record of the same field names
 // whose every field does?
-function recObjStorageEq(ta: TyObj, a: i32, b: i32): boolean {
+function recObjStorageEq(ta: TyObj, a: i32, b: i32, pairs: i32[]): boolean {
   const tb = tyAt(b)
-  if tb is TyObj {
-    return objFieldNameSetsEq(a, b) && recStorageField(ta, tb) == ""
+  if !(tb is TyObj) { return false }
+  let k = 0
+  while k + 1 < pairs.length {
+    if pairs[k] == a && pairs[k + 1] == b { return true }
+    k = k + 2
   }
-  return false
+  const sub: i32[] = []
+  for x in pairs { sub.push(x) }
+  sub.push(a)
+  sub.push(b)
+  return objFieldNameSetsEq(a, b) && recStorageFieldOn(ta, tb, sub) == ""
 }
 
 // Do the map `ta` and the type `b` share a storage: a map whose keys and values do?
-function recMapStorageEq(ta: TyMap, b: i32, depth: i32): boolean {
+function recMapStorageEq(ta: TyMap, b: i32, pairs: i32[]): boolean {
   const tb = tyAt(b)
   if tb is TyMap {
-    return fieldStorageEq(tyKeyOf(ta), tyKeyOf(tb), depth - 1)
-      && fieldStorageEq(tyValOf(ta), tyValOf(tb), depth - 1)
+    return fieldStorageEqOn(tyKeyOf(ta), tyKeyOf(tb), pairs)
+      && fieldStorageEqOn(tyValOf(ta), tyValOf(tb), pairs)
   }
   return false
 }
@@ -1168,8 +1184,8 @@ export function recDeclaredRowOf(ut: i32, own: i32, dst: i32): boolean {
     && ut < T.tys.length
     && tyAt(ut) is TyObj
     && objFieldNameSetsEq(ut, own)
-    && fieldStorageEq(own, ut, REC_STORE_DEPTH)
-    && !fieldStorageEq(ut, dst, REC_STORE_DEPTH)
+    && fieldStorageEq(own, ut)
+    && !fieldStorageEq(ut, dst)
 }
 
 // Does the record `dst` store as an `f32` or `f64` a field the record `src` holds as an integer,
@@ -1374,7 +1390,7 @@ export function recAdLanding(own: i32, dst: i32): i32 {
   for m in d.uMembers {
     const mm = nonNulTyOf(m)
     if mm >= 0 && tyAt(mm) is TyObj && objFieldNameSetsEq(own, mm) {
-      if hit >= 0 || fieldStorageEq(own, mm, REC_STORE_DEPTH) { return dst }
+      if hit >= 0 || fieldStorageEq(own, mm) { return dst }
       hit = mm
     }
   }
@@ -1724,7 +1740,7 @@ export function fvaNestedFnDiffers(
   match st {
     TyFunc => {
       if level == 0 { return false }
-      if tyReachesHole(s, 8) || tyReachesHole(d, 8) { return false }
+      if tyHoldsHole(s) || tyHoldsHole(d) { return false }
       const du = tyAt(d)
       if du is TyUnion { return fvaFnArmsDiffer(s, du) }
       if !fvaIsFn(d) { return false }

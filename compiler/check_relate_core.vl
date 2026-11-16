@@ -9,6 +9,7 @@ import { udMemberTyAt, udMemberTySet } from "./check_canon_raw"
 
 import { BND_ARG, BND_BIN, BND_PRINT, bndAt, bndCount } from "./check_iface"
 import {
+  elabEncl,
   elabFnArmJoinNote,
   elabFnFieldWidened,
   elabFnJoinDeepTy,
@@ -25,9 +26,11 @@ import {
   fnChoiceWideNote,
   fnLetIsWide,
   fnLetKeptWide,
+  fnSetsHandedToParams,
   fnTagCallNote,
   fnTagCallRefusal,
   fnTagMembers,
+  fnTagSetIsTagged,
   fnTagSetOfTy,
   fnTagTyIsTagged,
 } from "./check_elab_cap"
@@ -667,11 +670,11 @@ import {
   tyExcludesNull,
   tyHasNullMember,
   tyHasTyVar,
+  tyHoldsHole,
   tyHoldsNumericPrim,
   tyIsLitUnionLike,
   tyJoinsVoidAt,
   tyMapValOf,
-  tyReachesHole,
   tyStoresVoid,
   unionArmSubsumedIn,
   unionCarriedArms,
@@ -766,6 +769,7 @@ export function constrainEmpty(srcTy: i32, dstTy: i32) {
 // binds each from the row once every row has settled (`settleHeldPins`).
 let ceHeldNames: string[] = []
 let ceHeldAt = -1
+let ceHeldNest = false
 
 // Each held pin: the call, the type parameter, and the open row whose element stands for it.
 export const ceHeldCall: i32[] = []
@@ -773,9 +777,11 @@ export const ceHeldName: string[] = []
 export const ceHeldRow: i32[] = []
 
 // Holds type parameters `names` of call `call` open until the next call; `[]` releases them.
-export function constrainEmptyHold(names: string[], call: i32) {
+// With `nest`, a binding's list of such lists is held at its inner list too.
+export function constrainEmptyHold(names: string[], call: i32, nest: boolean) {
   ceHeldNames = names
   ceHeldAt = call
+  ceHeldNest = nest
   return 0
 }
 
@@ -794,9 +800,10 @@ function ceHeldIn(el: i32): boolean {
   return false
 }
 
-// Records open list `row`, whose element is held type parameter `el`, for the call; an element
-// holding the parameter inside another shape is pinned to that shape.
-function ceHeldPin(row: i32, el: i32) {
+// Records open list `row`, whose element is held type parameter `el`, for the call. A binding's
+// list of such lists pins `row` to an open inner list, held in turn (D16760); any other shape
+// holding the parameter is pinned to that shape.
+function ceHeldPin(row: i32, el: i32, depth: i32) {
   const r = tyAt(row)
   if !(r is TyArray) || el < 0 { return 0 }
   const e = tyAt(el)
@@ -805,6 +812,11 @@ function ceHeldPin(row: i32, el: i32) {
     ceHeldName.push(e.tvName)
     ceHeldRow.push(row)
     return 0
+  }
+  if ceHeldNest && e is TyArray && !tyElemOpen(e) && depth < 8 {
+    const inner = mkArrayTy(-1)
+    tyPinElem(r, inner)
+    return ceHeldPin(inner, tyElemOf(e), depth + 1)
   }
   return tyPinElem(r, el)
 }
@@ -855,7 +867,7 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
               tyLinkElem(s, d)
               noteHoleLink(srcTy, dstTy)
             } else if ceHeldIn(tyElemOf(d)) {
-              ceHeldPin(srcTy, tyElemOf(d))
+              ceHeldPin(srcTy, tyElemOf(d), 0)
             } else {
               tyPinElem(s, tyElemOf(d))
             }
@@ -6470,6 +6482,48 @@ export function holeSetSplitsAt(s: i32, pts: i32[]): boolean {
   return false
 }
 
+// Whether the members of set `s`, called at the closed parameter types `pts`, give two or more
+// results, one of them `ret`: a closure call at `pts` and `ret` may hold a member of another.
+function holeSetSplitsBeside(s: i32, pts: i32[], ret: i32): boolean {
+  if ret < 0 || !holeSetSplitsAt(s, pts) { return false }
+  const wp: i32[] = []
+  for pt in pts { wp.push(widenLitTy(pt)) }
+  const ft = mkFuncTy(wp, TY_I32)
+  for d in fnTagMembers(s) {
+    const rd = setMemberRetAt(d, ft)
+    if rd >= 0 && tySame(widenLitTy(rd), widenLitTy(ret)) { return true }
+  }
+  return false
+}
+
+// Whether a closure call whose callee is typed `ft`, in the body of declaration `d`, may run a
+// member of a set at another member's signature: `ft` is an untagged set splitting at its
+// parameters, or a signature an untagged set handed to a parameter of `d`, or of a declaration
+// enclosing it, splits at (`holeSetSplitsBeside`).
+export function closureCallSetSplits(ft: i32, d: i32): boolean {
+  const f = if ft >= 0 && ft < T.tys.length { tyAt(ft) } else { null }
+  if !(f is TyFunc) || f.fnRet < 0 || tyHasTyVar(ft) { return false }
+  const own = fnTagSetOfTy(ft)
+  if own >= 0 {
+    return !fnTagSetIsTagged(own) && holeSetSplitsAt(own, f.fnParamTypes)
+  }
+  let at = d
+  let hops = 0
+  while at >= 0 && hops < 16 {
+    for s in fnSetsHandedToParams(at) {
+      if (
+        !fnTagSetIsTagged(s)
+        && holeSetSplitsBeside(s, f.fnParamTypes, f.fnRet)
+      ) {
+        return true
+      }
+    }
+    at = elabEncl.get(at) ?? -1
+    hops = hops + 1
+  }
+  return false
+}
+
 // Whether every member of set `s`, called at the closed parameter types `pts`, gives a result
 // assignable to `ret`; false where one stays open or cannot be read.
 export function holeSetFitsRetAt(s: i32, pts: i32[], ret: i32): boolean {
@@ -6982,7 +7036,8 @@ function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
       && holeSlotSetHolds(a, vals)
       && (!mapRoot
       || elem
-      || holeSlotMapLitWrites(cwBindingOf(root), vals) && !holeSlotReadsOpt(a)),
+      || holeSlotMapLitWrites(cwBindingOf(root), vals)
+      && (liftPath.length <= 1 || !holeSlotReadsOpt(a))),
   )
 }
 
@@ -7017,8 +7072,8 @@ function holeSlotMapLitWrites(b: i32, vals: i32[]): boolean {
   return true
 }
 
-// Whether the read `a` reaches its place through a `?.`, whose guarded call through a map's entry
-// the tag decision builds no member call for.
+// Whether the read `a` reaches its place through a `?.`, whose guarded call through a record
+// nested in a map's entry the tag decision builds no member call for.
 function holeSlotReadsOpt(a: i32): boolean {
   let x = cwPeel(a)
   let hops = 0
@@ -9254,11 +9309,7 @@ export function fvaHeldHoleFnDiffers(s: i32, d: i32, depth: i32): boolean {
       return fvaHeldHoleFnDiffers(st.nInner, nonNullTy(d), depth - 1)
     }
     TyFunc => {
-      if (
-        !(dt is TyFunc)
-        || !tyReachesHole(s, 8)
-        || tyReachesHole(nonNullTy(d), 8)
-      ) {
+      if (!(dt is TyFunc) || !tyHoldsHole(s) || tyHoldsHole(nonNullTy(d))) {
         return false
       }
       const none: string[] = []
@@ -9607,6 +9658,8 @@ export function coalJoinAtPin(row: i32, cPin: i32, cDft: i32): i32 {
   // A literal default the face does not hold widens to its base, as the concrete `??` types it.
   const cDt = tyAt(cDft)
   if cDt is TyLit { return joinTys(cInner, litBaseTy(cDt)) }
+  // An existing record is never widened in place, as the concrete `??` joins it.
+  njFixSet(hdField[row].includes("l"), hdField[row].includes("r"))
   return joinTys(cInner, widenLitTy(cDft))
 }
 

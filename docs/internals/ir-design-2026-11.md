@@ -755,6 +755,26 @@ step is exempt from the net-negative bar and meets these bars instead:
 
 C2e (list length) is the first.
 
+**A shared arm takes no callbacks.** When legacy and the IR write the same arm around different
+operand writers, the arm splits into halves around the operands: a decision half before them,
+and a writer half after them (`scalarListHoistOf` and `scalarListGetTail`). It does not take
+closures. A capturing lambda version of the scalar list read cost +3.9% L2 fuel and 21 KB of
+seed (C2c).
+
+**A coverage step is chosen and sized with the blocker census.** The first-miss histogram ranks
+blockers, not payoffs: a row that falls only helps the functions it was the last blocker of. In
+C2f, a string literal step left coverage unchanged. The census (`$VL_IR_SHADOW=4`, `ir-shadow.vl
+-- --blockers`) builds each function past its missed statements and reports the set of classes
+that keeps it uncovered. A step's payoff is the functions whose set it empties, an upper bound
+since a statement stops at its first miss. The coverage bar is functions unblocked per line, read
+off the census before the step and confirmed by the shadow after it.
+
+**The six coercion seats wait for claiming (I3).** These are `numSeat`, `coerceHeld`, `boxSeat`,
+`armSeat`, `armServed` and `atomSeat`. They are legacy-only ambient state: an outer site sets one
+and a nested `emitExpr` reads it. Their readers are `emitExpr` itself for every unclaimed function,
+so no op-seam slice can route all of them through a shared arm. They stay until claiming covers
+coercion, and delete at I8. The coercion decisions are shared before then, starting with `widenPlanOf` (C3a).
+
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
