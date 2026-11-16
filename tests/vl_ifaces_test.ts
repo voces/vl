@@ -1,7 +1,8 @@
 // `$VL_IFACES=1`, L2 S0's shadow interfaces (`compiler/check_iface_shadow.vl`): armed, a compile
-// prints one `[iface] <path>: fn …` row per un-annotated top-level function; unarmed, or for a
-// program with no un-annotated function, it prints none. The L2 grading reads these rows, so a host
-// or seed that stopped printing them, or changed their shape, would leave it reading nothing.
+// prints one `[iface] <path>: fn …` row per un-annotated top-level function, then the instance
+// vector's `instvec` summary; unarmed, or for a program with no un-annotated function, none.
+// The L2 grading reads these rows, so a host or seed that stopped printing them, or changed their
+// shape, would leave it reading nothing.
 //
 // @test-timing native
 
@@ -17,7 +18,10 @@ const dec = new TextDecoder();
 const CASES: { src: string; want: string[] }[] = [
   {
     src: "function get(o) { return o.x }\nprint(get({ x: 4 }))\n",
-    want: ["fn get('?get.0) -> '?fld.x.?get.0 hd0=1 calls=1 differ=0"],
+    want: [
+      "fn get('?get.0) -> '?fld.x.?get.0 hd0=1 calls=1 differ=0",
+      "instvec rows 1 calls 1 open 0 closed 1",
+    ],
   },
   {
     src: "function inc(x: i32): i32 { return x + 1 }\nprint(inc(2))\n",
