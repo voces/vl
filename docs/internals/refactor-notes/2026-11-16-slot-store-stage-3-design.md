@@ -55,9 +55,16 @@ reading types and bounds as of the freeze is identical, and D16768 closes on tha
   pins therefore live in a side table the classes and mono read; only mono's apply step writes the
   AST field, where it does today. STORE would read the table as a read-only fact if a residue class
   needs it (its S class, through the per-instance key), and is told when it lands.
-- **L2.** OPEN (asked 2026-11-16): whether S3b overlaps L2's interface inference, and whether the
-  node replacements of §5 are the `monoFlowReadSet` constant-index rewrite L2 is moving for D16881;
-  if they are, stage 3 designs nothing for them.
+- **L2** (answered 2026-11-16). No overlap with schemes or the bounds alphabet: those are type
+  bounds per function, and S3b's pins are value-flow facts. The overlap is the instance key: the
+  solved instantiation recorded per call (#8836, #8841) and interned by STORE's A0 into a `KeyId`.
+  S3b's side table keys a per-instance pin by that `KeyId`, not by mono's instance names, so check
+  and mono agree on what an instance is (A0's timing: STORE).
+- **The node replacements of §5** are mono's flow rewrite (`mfrElabFns`), which only gates the
+  rewrite: the answer is already the elaboration's. L2's population table (branch `l2-mfr-measure`,
+  `$VL_REP_SHADOW=1`), with the four programs added by name, says which rung answers each; if
+  L2's move of that rewrite to check lands, they leave stage 3's scope. Stage 3 designs nothing
+  for them until that table is in.
 
 ## 4. Acceptance
 
