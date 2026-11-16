@@ -1627,13 +1627,7 @@ export function covarTwoUnionsErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
 // A covariant slot path is a run of segments, `.f` for a field and `[]` for any element or map
 // value, relative to the delivered value. A trailing `*` marks a slot nothing below is followed
 // into, so everything reachable under it counts as widened. Answers whether `s` and `d` differ.
-export function rcwCovs(
-  s: i32,
-  d: i32,
-  path: string,
-  out: string[],
-  depth: i32,
-): boolean {
+export function rcwCovs(s: i32, d: i32, path: string, out: string[]): boolean {
   if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length { return false }
   if s == d || tyEq(s, d) { return false }
   let k = 0
@@ -1645,7 +1639,7 @@ export function rcwCovs(
   }
   rcwCovA.push(s)
   rcwCovB.push(d)
-  const r = rcwCovsGo(s, d, path, out, depth)
+  const r = rcwCovsGo(s, d, path, out)
   rcwCovA.pop()
   rcwCovB.pop()
   return r
@@ -1668,7 +1662,7 @@ function rcwCovsRevisit(s: i32, d: i32, path: string, out: string[]): boolean {
   rcwCovB = []
   rcwCovPure = true
   const scratch: string[] = []
-  const differs = rcwCovs(s, d, "", scratch, 0)
+  const differs = rcwCovs(s, d, "", scratch)
   rcwCovPure = false
   rcwCovA = savedA
   rcwCovB = savedB
@@ -1677,17 +1671,7 @@ function rcwCovsRevisit(s: i32, d: i32, path: string, out: string[]): boolean {
 }
 
 // `rcwCovs`'s walk, once the pair is on the stack.
-function rcwCovsGo(
-  s: i32,
-  d: i32,
-  path: string,
-  out: string[],
-  depth: i32,
-): boolean {
-  if depth > 12 {
-    out.push(path + "*")
-    return true
-  }
+function rcwCovsGo(s: i32, d: i32, path: string, out: string[]): boolean {
   const st = tyAt(s)
   const dt = tyAt(d)
   // A hole or type variable on the destination side adopts the source; a named type parameter
@@ -1710,7 +1694,7 @@ function rcwCovsGo(
   if dt is TyNullable && st is TyNullable {
     const dIn = dt.nInner
     if dIn >= 0 && dIn < T.tys.length && tyAt(dIn) is TyVar {
-      return rcwCovs(st.nInner, dIn, path, out, depth + 1)
+      return rcwCovs(st.nInner, dIn, path, out)
     }
     // A nullable record into a nullable record widens the slot exactly when the records
     // differ, as a record field does; `null` adds nothing either side.
@@ -1724,7 +1708,7 @@ function rcwCovsGo(
       && tyAt(sIn) is TyObj
       && tyAt(dIn) is TyObj
     ) {
-      const nd = rcwCovs(sIn, dIn, path, out, depth + 1)
+      const nd = rcwCovs(sIn, dIn, path, out)
       if nd { out.push(rcwTyped(path, s)) }
       return nd
     }
@@ -1738,7 +1722,7 @@ function rcwCovsGo(
     while mi < ms.length {
       const m = ms[mi]
       if m >= 0 && !isNullTy(m) && assignable(m, d) {
-        if rcwCovs(m, d, path, out, depth + 1) { any = true }
+        if rcwCovs(m, d, path, out) { any = true }
       }
       mi = mi + 1
     }
@@ -1754,9 +1738,7 @@ function rcwCovsGo(
         const sf = objFieldType(st, dt.objFieldNames[i])
         if sf >= 0 {
           const fp = path + "." + dt.objFieldNames[i]
-          if rcwCovs(sf, dt.objFieldTypes[i], fp, out, depth + 1) {
-            differs = true
-          }
+          if rcwCovs(sf, dt.objFieldTypes[i], fp, out) { differs = true }
         }
         i = i + 1
       }
@@ -1771,7 +1753,7 @@ function rcwCovsGo(
         return false
       }
       walked = true
-      differs = rcwCovs(tyElemOf(st), tyElemOf(dt), path + "[]", out, depth + 1)
+      differs = rcwCovs(tyElemOf(st), tyElemOf(dt), path + "[]", out)
     }
   }
   if st is TyMap {
@@ -1780,15 +1762,19 @@ function rcwCovsGo(
         return false
       }
       walked = true
-      differs = rcwCovs(tyValOf(st), tyValOf(dt), path + "[]", out, depth + 1)
+      differs = rcwCovs(tyValOf(st), tyValOf(dt), path + "[]", out)
     }
   }
   if walked {
     if differs && path != "" { out.push(rcwTyped(path, s)) }
     return differs
   }
-  if dt is TyUnion || dt is TyNullable { rcwIntoUnion(s, d, path, out, depth) }
-  else if rcwIsRefTy(s) { out.push(path + "*") }
+  if dt is TyUnion || dt is TyNullable {
+    const walk: i32[] = []
+    rcwIntoUnion(s, d, path, out, walk)
+  } else if rcwIsRefTy(s) {
+    out.push(path + "*")
+  }
   if path != "" { out.push(rcwTyped(path, s)) }
   return true
 }
@@ -1796,15 +1782,27 @@ function rcwCovsGo(
 // A value landing in a wider union keeps its own type, and a handle reaches its slots only by
 // narrowing to a member the value is assignable to, so each such member's widened slots are
 // the value's. A union value lands member by member.
-function rcwIntoUnion(s: i32, d: i32, path: string, out: string[], depth: i32) {
-  if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length || depth > 12 {
+function rcwIntoUnion(
+  s: i32,
+  d: i32,
+  path: string,
+  out: string[],
+  walk: i32[],
+) {
+  if (
+    s < 0
+    || d < 0
+    || s >= T.tys.length
+    || d >= T.tys.length
+    || tyPathCycles(s, walk)
+  ) {
     return 0
   }
   const parts = rcwMembersOf(s)
   if parts.length != 1 || parts[0] != s {
     let pi = 0
     while pi < parts.length {
-      rcwIntoUnion(parts[pi], d, path, out, depth + 1)
+      rcwIntoUnion(parts[pi], d, path, out, tyPathWith(s, walk))
       pi = pi + 1
     }
     return 0
@@ -1823,7 +1821,7 @@ function rcwIntoUnion(s: i32, d: i32, path: string, out: string[], depth: i32) {
     if !isNullTy(ms[i]) && assignable(s, ms[i]) {
       any = true
       const sub: string[] = []
-      rcwCovs(s, ms[i], path, sub, depth + 1)
+      rcwCovs(s, ms[i], path, sub)
       let k = 0
       while k < sub.length {
         if rcwPathOf(sub[k]) != path { out.push(sub[k]) }
@@ -1840,7 +1838,7 @@ function rcwIntoUnion(s: i32, d: i32, path: string, out: string[], depth: i32) {
 // existing value: the slots a fresh literal owns are dropped.
 function rcwSharedCovs(srcExpr: i32, srcTy: i32, dstTy: i32): string[] {
   const all: string[] = []
-  rcwCovs(srcTy, dstTy, "", all, 0)
+  rcwCovs(srcTy, dstTy, "", all)
   const out: string[] = []
   let i = 0
   while i < all.length {
