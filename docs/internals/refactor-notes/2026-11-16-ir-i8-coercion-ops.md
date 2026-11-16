@@ -104,3 +104,37 @@ met.
    boxed nullable discipline, N1. It is sized by the census before building.
 3. **I8c, `armSeat` and `atomSeat`.** `RUnbox` and `RAtomStr`. These are sized when they lead the
    census.
+
+## I8a part 1 as built
+
+- **`numSeat` retires from legacy too.** Where the checker's record served, the seat made the table
+  append `emitNumPairOp(record)`. `numFloorWhy` guarantees that pair is `(src, dst)`, so the op is
+  `emitNumOpOf(src, dst)`. `emitNumPlain` now builds the value and calls the shared `numWidenTail`.
+  The seat, its `numeric` table row and `emitNumPairOp` are gone. One case keeps its own branch: a
+  dead `never` operand writes `unreachable` and takes no op.
+- **`deliver`** sits at the declaration, assignment (local and global), return, tail, element-store
+  and push sites. `RNumWiden` lowers through `numWidenTail`, and its temp is typed at the
+  destination (`repTyOf`). Scalar-width lists join the push and store plans.
+- **The literal arms are named misses** (`widen instLit`, `floatLit`, `asgLit`, `radix`, `convert`).
+  Legacy writes each one's constant at the destination width with its own literal writer:
+  `emitSignedNumLitAt`, `emitAsgLitAs` and `emitAsgRadixAs`. `convert` is a union box, I8b's.
+  Sharing those writers is a later part.
+- **A folded global read lowers** through legacy's `emitFoldedConstRead`, behind the same
+  `userGlobalReadClass` the read already asks. This was the self-compile's four `folded global
+  read` rows, and 674 corpus functions the widening newly covered.
+
+| reading | C2l | I8a | gained |
+|---|---:|---:|---:|
+| corpus covered = matched | 18,825 | 20,583 | +1,758 |
+| self-compile covered | 5,216 | 5,216 | 0 |
+| self-compile matched | 5,210 | 5,214 | +4 |
+
+Compiler lines are +128 / −64, 64 net: about 27 corpus functions per net line.
+
+| bar | reading |
+|---|---|
+| self-build | fixpoint; the armed self-build is byte-identical |
+| corpus identity against the C2l seed, 12,213 cells | IDENTITY |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,214 claimed and byte-identical; corpus MODE3 |
+| L2 self-compile fuel, C2l tree to this tree from one seed | 94,817,098,747 to 94,860,855,931 (+0.046%) |
+| seed size | 6,466,781 to 6,467,969 (+1,188) |
