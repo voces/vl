@@ -137,6 +137,9 @@ Deno.test("oracle: pinned regressions", () => {
     ["let c = false\nprint((if c { -9000000003 } else { -1 }) + 0xFFFFFFFF)", "4294967294"],
     ["let c = true\nprint((if c { 2147483647 } else { 1 }) * 2)", "-2"],
     ["let c = false\nprint(((if c { 65535 } else { 0xFFFFFFFF }) * 7) + (0xFFFFFFFF + 4294967296))", "38654705656"],
+    // 4.3: the join decides a radix tree arm's context before its destination (fuzz cell ar_s11_0099)
+    ["let v2: i32 = 46341\nlet v3: i64 = (if (v2 == v2) { (3 + (0xFFFFFFFF << 26)) } else { max(0, 1) })\nprint(v3)", "-67108861"],
+    ["let v2: i32 = 46341\nlet v3: i64 = (if (v2 == v2) { (0xFFFFFFFF << 26) } else { v2 })\nprint(v3)", "-67108864"],
     // Q9: a float constant beside an f32 folds at f32, in a comparison and as a join's arm
     ["const f: f32 = 0.1\nprint((16777217.0 - 1.5) < max(f, 16777217.0))", "true"],
     ["const a: f32 = 1.0\nlet c = true\nprint(a / (if c { (0.1 * 0.1) } else { 0.5 }))", "99.99999237060547"],

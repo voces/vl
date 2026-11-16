@@ -4568,6 +4568,7 @@ fn compile_vl_instance(
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
     report_ifaces(inst, store, source_path);
+    report_touch_set(inst, store, source_path);
     report_cls_census(inst, store, source_path);
     report_ir_shadow(inst, store, source_path);
     if id_shadow > 0 {
@@ -4781,6 +4782,36 @@ fn report_ifaces(inst: &Instance, store: &mut Store<()>, path: &str) {
     let mut rows = String::new();
     for line in text.lines() {
         rows.push_str(&format!("[iface] {path}: {line}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_TOUCH_SET=1` asked for each compile's touch sets.
+fn touch_set_on() -> bool {
+    std::env::var("VL_TOUCH_SET").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_TOUCH_SET=1`, print `[touch] <path>: <line>` to stderr for each top-level function:
+/// its name, a tab, the module globals it or anything it calls reads or writes, and a trailing
+/// `lambda` / `unknown` where the set may be short (init-order-design-2026-11.md §2.1). A seed
+/// without `touchDumpBuild` prints nothing.
+fn report_touch_set(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !touch_set_on() {
+        return;
+    }
+    let (Ok(build), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "touchDumpBuild"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "touchDumpAt"),
+    ) else {
+        return;
+    };
+    let n = build.call(&mut *store, ()).unwrap_or(0);
+    let text: String = (0..n)
+        .map(|j| char::from_u32(at.call(&mut *store, j).unwrap_or(63) as u32).unwrap_or('?'))
+        .collect();
+    let mut rows = String::new();
+    for line in text.lines() {
+        rows.push_str(&format!("[touch] {path}: {line}\n"));
     }
     eprint!("{rows}");
 }
@@ -10117,6 +10148,10 @@ fn pump_session(
                 if ifaces_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_ifaces(&inst, &mut store, &p);
+                }
+                if touch_set_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_touch_set(&inst, &mut store, &p);
                 }
                 if cls_census_on() {
                     let p = cmd_path.read(&mut store)?;
