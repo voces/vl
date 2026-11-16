@@ -10329,6 +10329,8 @@ export function elabRun() {
   eplAsked = false
   eplFrozen = false
   eplTakesFn = -1
+  eplPinTys = Map()
+  eplPinCount = 0
   eplFrozenTys = []
   eplFrozenAnn = []
   elabPinsClosedSet(false)
@@ -20144,7 +20146,11 @@ function eplRootK(n: i32, kk: i32): i32 {
   if have >= 0 { return eplFind(have) }
   const id = eplNew()
   EPL.key.set(k, id)
-  if id >= 0 && id < EPL.boundSrc.length && eplAnnotated(n) {
+  if (
+    id >= 0
+    && id < EPL.boundSrc.length
+    && (eplAnnotated(n) || eplPinTyOf(n, kk) >= 0)
+  ) {
     EPL.boundSrc[id] = n
     EPL.boundK[id] = kk
   }
@@ -20160,6 +20166,28 @@ function eplAnnotated(n: i32): boolean {
     || (nd is FuncDecl && nd.fnRet >= 0)
 }
 
+// The types mono's pins give un-annotated holders in frames with no type parameter, by holder,
+// filled before mono from the pins' own gates (slot store stage 3); `eplPinCount` entries.
+let eplPinTys: {[i32]: i32} = Map()
+let eplPinCount = 0
+
+// Records `[holder, type]` pins decided before mono; a holder with one bounds its class.
+export function eplPinTysSet(pairs: i32[][]) {
+  for pr in pairs {
+    if pr.length == 2 {
+      eplPinTys[pr[0]] = pr[1]
+      eplPinCount = eplPinCount + 1
+    }
+  }
+  return 0
+}
+
+// The pinned type of un-annotated holder `n` in the program's frame (`kk` -1); -1 for none.
+function eplPinTyOf(n: i32, kk: i32): i32 {
+  if kk != -1 || eplPinCount == 0 { return -1 }
+  return eplPinTys.get(n) ?? -1
+}
+
 // Class `r`'s bound: the closed type of its annotated holder or of a call result the elaboration
 // closed, asked once per class; -1 for none.
 function eplBoundOf(r: i32): i32 {
@@ -20167,6 +20195,11 @@ function eplBoundOf(r: i32): i32 {
   if EPL.bound[r] != -2 { return EPL.bound[r] }
   EPL.bound[r] = -1
   const x = EPL.boundSrc[r]
+  const pt = if x >= 0 { eplPinTyOf(x, EPL.boundK[r]) } else { -1 }
+  if pt >= 0 {
+    EPL.bound[r] = pt
+    return pt
+  }
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   // A call result, or a holder written in a generic, is typed at the place's instance.
   const te = if xn is Call || EPL.boundK[r] >= 0 { elabNodeTy(x, EPL.boundK[r]) } else { -1 }
@@ -21316,6 +21349,7 @@ const EPL_FROZEN_MSG = "emitProgram: internal: the place classes were rebuilt af
 // no function as a value), settles every class's bound, and records each node's type and annotation.
 // A build or a stale mark after this fails the emit.
 export function eplFreeze() {
+  if !EPL.stale && eplPinCount > 0 && eplTakesFnOnce() { eplBuild() }
   if EPL.stale {
     if eplTakesFnOnce() {
       eplBuild()

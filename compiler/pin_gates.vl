@@ -2,6 +2,8 @@
 // write index says are written, at what types, and in which frame a read resolves. Shared by mono and
 // the elaboration so that both decide from one implementation (slot store stage 3).
 
+import { cwIxCoveredLen } from "./check_write_scan"
+import { recEnclosingFn } from "./check_fit_rules"
 import {
   ArrayLit,
   BinExpr,
@@ -11,6 +13,7 @@ import {
   Ident,
   Index,
   LetDecl,
+  LoopVar,
   Member,
   NumLit,
   ObjLit,
@@ -139,16 +142,22 @@ export function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
 }
 
 // Whether the `let` declared at `at` holds values of type `t`: its slot fact is `t`, which the
-// elaboration closes only where every write agrees. A fresh `Map()` write is recorded at `t`.
+// elaboration closes only where every write agrees.
+function monoLetWritesAtCheck(d: LetDecl, at: i32, ctx: i32, t: i32): boolean {
+  if d.letKw == "const" { return true }
+  const et = elabSlotTyAt(at, [], ctx)
+  return et >= 0 && tySameSealed(et, t)
+}
+
+// `monoLetWritesAtCheck`, recording each fresh `Map()` write at `t` where it holds.
 export function monoLetWritesAt(
   d: LetDecl,
   at: i32,
   ctx: i32,
   t: i32,
 ): boolean {
+  if !monoLetWritesAtCheck(d, at, ctx, t) { return false }
   if d.letKw == "const" { return true }
-  const et = elabSlotTyAt(at, [], ctx)
-  if et < 0 || !tySameSealed(et, t) { return false }
   if t < T.tys.length && tyAt(t) is TyMap {
     for w in monoLetWholeWrites(at) {
       const fx = monoLetWriteFreshMap(w)
@@ -595,4 +604,205 @@ export function pinGatesReset() {
   monoListStores = Map()
   monoLetWritesSeen = 0
   return 0
+}
+
+// Whether the read `ix` under frame `fx` (-1 for the module) is of the binding declared at
+// `decl`.
+export function monoReadIsBinding(ix: i32, fx: i32, decl: i32): boolean {
+  // A loop variable is read by name in its loop's body only.
+  if decl >= 0 && decl < P.nodes.length && nodeAt(decl) is LoopVar {
+    return identDeclOf(ix) == decl
+  }
+  let fr = monoTopFrameOf(ix)
+  if fx >= 0 { fr = monoFrameOfNode(ix, fx) }
+  // A read in a lambda a module-scope `const` holds is in the lambda's frame (D9102).
+  if fx < 0 && fr < 0 {
+    const df = elabDeclFnOf(decl)
+    const b = monoNestedBodyOf(df)
+    if df >= 0 && b >= 0 && monoSubtreeHolds(b, ix) {
+      fr = monoFrameOfNode(ix, df)
+    }
+  }
+  return monoReadLetFrame(ix, fr)[1] == decl
+}
+// Whether `v` is a read of the binding `nm` declared at `decl`, in frame `fx`.
+export function monoReadsBinding(
+  v: i32,
+  nm: string,
+  fx: i32,
+  decl: i32,
+): boolean {
+  const o = unwrapParen(v)
+  if o < 0 { return false }
+  const on = nodeAt(o)
+  if !(on is Ident) { return false }
+  return on.identName == nm && monoReadIsBinding(o, fx, decl)
+}
+// Every node of frame `fx`'s body, nested function bodies included, or of the program's
+// statements when `fx` is -1.
+export function monoFrameNodes(fx: i32): i32[] {
+  const out: i32[] = []
+  const stack: i32[] = []
+  if fx >= 0 {
+    const b = monoNestedBodyOf(fx)
+    if b < 0 { return out }
+    stack.push(b)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      out.push(ix)
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  return out
+}
+// The index of the last `.` in field path `fld`, or -1 for a single field.
+function monoPathLastDot(fld: string): i32 {
+  let k = fld.length - 1
+  while k >= 0 && fld.slice(k, k + 1) != "." { k = k - 1 }
+  return k
+}
+// Whether `v` reads the binding `name` declared at `at`, or, when `fld` is not "", its field `fld`
+// (`[]`: one of its elements).
+export function monoReadsSlotOf(
+  v: i32,
+  name: string,
+  fld: string,
+  ctx: i32,
+  at: i32,
+): boolean {
+  if fld == "" { return monoReadsBinding(v, name, ctx, at) }
+  const o = unwrapParen(v)
+  // The step `()` reads a call of the function declared at `at`.
+  if fld == "()" {
+    const c = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
+    const cf = if c is Call { c.callFn } else { -1 }
+    const fn = if cf >= 0 && cf < P.nodes.length { nodeAt(cf) } else { null }
+    return fn is Ident && fn.identName == name && identDeclOf(cf) == at
+  }
+  // The step `[]` reads an element of the list binding.
+  if fld == "[]" {
+    const ix = if o >= 0 && o < P.nodes.length { nodeAt(o) } else { null }
+    return ix is Index && monoReadsBinding(ix.idxArr, name, ctx, at)
+  }
+  if o < 0 || o >= P.nodes.length { return false }
+  const m = nodeAt(o)
+  if !(m is Member) { return false }
+  const dot = monoPathLastDot(fld)
+  if dot < 0 {
+    return m.memProp == fld && monoReadsBinding(m.memObj, name, ctx, at)
+  }
+  return m.memProp == fld.slice(dot + 1, fld.length)
+    && monoReadsSlotOf(m.memObj, name, fld.slice(0, dot), ctx, at)
+}
+// Whether node `ix` reads a value of the map or list the binding `name` declared at `at` holds
+// (`monoReadsSlotOf`), `d[k]` or `d.get(k)`.
+export function monoIsMapValueRead(
+  ix: i32,
+  name: string,
+  fld: string,
+  ctx: i32,
+  at: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is Index { return monoReadsSlotOf(n.idxArr, name, fld, ctx, at) }
+  const recv = monoMethodCallRecv(ix, "get")
+  return recv >= 0 && monoReadsSlotOf(recv, name, fld, ctx, at)
+}
+// The receiver of node `ix` when it is a call of method `method` (any method at ""), else -1.
+export function monoMethodCallRecv(ix: i32, method: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const c = nodeAt(ix)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const cf = nodeAt(c.callFn)
+  if !(cf is Member) || (method != "" && cf.memProp != method) { return -1 }
+  return cf.memObj
+}
+// Whether a method of a value of the map binding `name` declared at `at`, or of a `const` bound
+// to one, is called on a receiver typed nullable, as a `?.` call's guarded arm is, other than a
+// record field's: the flow table pins no such call, so a slot type taken from the pins could miss it.
+export function monoMapValueUnpinnedCall(
+  name: string,
+  fld: string,
+  ctx: i32,
+  at: i32,
+): boolean {
+  const nodes = monoFrameNodes(ctx)
+  const aliases: i32[] = []
+  for ix in nodes {
+    const a = nodeAt(ix)
+    if a is LetDecl && a.letInit >= 0 {
+      if monoIsMapValueRead(unwrapParen(a.letInit), name, fld, ctx, at) {
+        aliases.push(ix)
+      }
+    }
+  }
+  for ix in nodes {
+    const recv = monoMethodCallRecv(ix, "")
+    if recv >= 0 {
+      const o = unwrapParen(recv)
+      const ot = nodeTyIxOf(o)
+      if (ot < 0 || ot >= T.tys.length) {
+        if monoIsMapValueRead(o, name, fld, ctx, at) { return true }
+        for ax in aliases {
+          const a = nodeAt(ax)
+          if a is LetDecl && monoReadsBinding(o, a.letName, ctx, ax) {
+            return true
+          }
+        }
+      }
+    }
+  }
+  return false
+}
+
+// The un-annotated `let`s mono's map-value pin applies to in the program and in functions with no
+// type parameter in their enclosing chain, each with the type it pins, as `[holder, type]`. The
+// gate is mono's own; an instanced function's frame exists only once mono clones it, and a binding
+// a rewrite minted after the write index is left to mono.
+export function pinGatesMapValues(): i32[][] {
+  const out: i32[][] = []
+  let x = 0
+  while x < cwIxCoveredLen() && x < P.nodes.length {
+    const d = nodeAt(x)
+    if d is LetDecl && d.letType < 0 && d.letInit >= 0 {
+      const ctx = recEnclosingFn(x)
+      if pinGatesPlainFrame(ctx) {
+        const t = pinGatesMapValueTy(d, x, ctx)
+        if t >= 0 { out.push([x, t]) }
+      }
+    }
+    x = x + 1
+  }
+  return out
+}
+
+// Whether frame `ctx` (a function, or -1 for the program) and every function enclosing it declare
+// no type parameter.
+function pinGatesPlainFrame(ctx: i32): boolean {
+  let f = ctx
+  while f >= 0 {
+    const fd = nodeAt(f)
+    if !(fd is FuncDecl) || fd.fnTyParams.length > 0 { return false }
+    f = recEnclosingFn(f)
+  }
+  return true
+}
+
+// The type `monoPinMapValues` pins `d` at, declared at `at` in frame `ctx`, by its gate and the
+// checks `monoPinMapSlot` makes before it instances anything; -1 where it would not pin.
+function pinGatesMapValueTy(d: LetDecl, at: i32, ctx: i32): i32 {
+  if monoOpenMapValTy(d.letInit) < 0 { return -1 }
+  if !monoLetWritesClosed(d, at, ctx) { return -1 }
+  const et = elabSlotTyAt(at, [], ctx)
+  if et < 0 || !monoLetWritesAtCheck(d, at, ctx, et) { return -1 }
+  if !(tyAt(nodeTyIxOf(d.letInit)) is TyMap) { return -1 }
+  if monoMapValueUnpinnedCall(d.letName, "", ctx, at) { return -1 }
+  return et
 }
