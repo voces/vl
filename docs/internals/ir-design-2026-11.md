@@ -779,6 +779,9 @@ lowering import (C2i) found no other: each reads pre-pass, checker or rep state,
 restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes. One
 caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
 previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
+I8a's tail reads no seat: `numWidenTail` asks `numFloorWhy`, which compares the node with
+`coerceHeld`, set and restored around one legacy conversion and so -1 wherever the IR asks, and
+`exprReadsDeadNever`, which reads the tree and the checker's types.
 
 **A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
 plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held
@@ -791,6 +794,13 @@ alone were string `.slice` (1,692) and `.cpLen` (674), and the self-compile's 73
 and a nested `emitExpr` reads it. Their readers are `emitExpr` itself for every unclaimed function,
 so no op-seam slice can route all of them through a shared arm. They stay until claiming covers
 coercion, and delete at I8. The coercion decisions are shared before then, starting with `widenPlanOf` (C3a).
+
+**I8: a seat becomes an op at the delivery (undeferred after C2l).** A seat's whole effect lands on
+the node it marks: legacy builds the value, then one conversion read off the checker's record. The
+IR knows its delivery sites, so each one builds the operand and, where the reps differ, appends the
+op the shared plan names (`RNumWiden`, `RBox`, `RUnbox`, `RAtomStr`), lowered through legacy's
+tail. A record at a position the IR does not build leaves its function a miss. The design and its
+parts are in `refactor-notes/2026-11-16-ir-i8-coercion-ops.md`.
 
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their

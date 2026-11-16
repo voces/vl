@@ -82,6 +82,7 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `literal-byte-write` | INTERNAL | `scripts/byte-budget-baseline.json` (`vl check --budget`, targets `compiler/entry.vl`); the `wU8` writer and `emit_bytes.vl` are the compiler's | **none** | `compiler/` only, not `compiler/emit_bytes.vl` |
 | `arena-slot-write` | INTERNAL | a direct `P.nodes[i] = n` skips the arena edit log that the write scan and the parse bank read (`arenaSetNode`/`arenaReplaceNode` in `ast.vl`); no baseline, it landed at zero | n/a (new) | `compiler/` only, not `compiler/ast.vl` |
 | `arena-write-after-lower` | INTERNAL | medium 6 step 6.3 (`refactor-notes/2026-11-15-medium6-lowering-design.md`); `scripts/arena-write-budget-baseline.json` (`vl check --budget`, targets `compiler/entry.vl`); the node field list is `ast.vl`'s | **none** | `compiler/` only, not `compiler/ast.vl` or `compiler/parser.vl` |
+| `walk-limit` | INTERNAL | type hash-cons stage 6b (`refactor-notes/2026-11-16-type-hashcons-s6b21-limit-census.md`); `scripts/walk-limit-budget-baseline.json` (`vl check --budget`, targets `compiler/entry.vl`) | **none** | `compiler/` only |
 | `dead-export` | INTERNAL | `scripts/dead-exports.vl`; not emitted by `vl check` at all — the script writes a report that `vl check --budget --findings` counts | n/a | n/a (script-only) |
 | `unused-export` | LANGUAGE | editor workspace pass (`lsp/src/moduleGraph.ts`) | n/a | everywhere |
 | `redundant-export` | LANGUAGE | editor workspace pass | n/a | everywhere |
