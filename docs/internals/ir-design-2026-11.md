@@ -789,6 +789,13 @@ answers the one node `irHoleIx` names with the IR's writer, the substitution `is
 already makes for a staged receiver. `emitBoxAroundHole` is its one setter; a writer that asks for
 the value other than once leaves the function unlowered, and a hole open at a function's start
 fails the build. When body lowering retires, the ladder moves to the IR side and the hole is deleted.
+The hole's one divergence under mode 3 (`emitListIdxBackRef`, tag 224 against 230) was not a ladder
+predicate reading context: the builder had returned a block body's last statement as its value,
+where the body runs past it to `null` (D16861). No ladder predicate has yet been seen to read
+context; mode 3 stays the instrument that would show one.
+The writer must read the value once, except an IR immediate it writes itself (a `null`, or a
+literal at the destination width), which it may leave unread (N2a). That is sound because an
+immediate is built only from an effect-free node; verifier rule 2 checks it at each `RToBox`.
 
 **A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
 plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held

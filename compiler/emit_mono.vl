@@ -1,4 +1,5 @@
 import { nameToTy } from "./check_relate_core"
+import { aliasRootParam } from "./check_call_resolve"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { voidCtxLambdaCarry } from "./check_side_rows"
@@ -714,11 +715,11 @@ import {
   elabDeliveredBundles,
   elabDemand,
   elabHeldValTy,
+  elabHoleContainerClosed,
   elabHoleFnClosed,
   elabHoleGenFlowHolder,
   elabHoleGenFlowTy,
   elabHoleKeyAtPins,
-  elabHoleMapClosed,
   elabIdentityTy,
   elabInstShadow,
   elabInstSlotAt,
@@ -1713,7 +1714,7 @@ function monoIdentReadsValue(ix: i32): boolean {
 // The pin of a map whose key or value nothing types (an empty `Map()` handed to a bare
 // parameter): the closed map the elaboration binds it at (D1887). "" for any other type.
 function monoHoleMapPinName(t: i32): string {
-  const c = elabHoleMapClosed(t)
+  const c = elabHoleContainerClosed(t)
   return if c < 0 { "" } else { monoPinSpellShaped(c) }
 }
 
@@ -1743,7 +1744,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32, tyOut: i32[]): string {
   // would otherwise name a map an array.
   const hm = monoHoleMapPinName(nodeTyIxOf(unwrapParen(ix)))
   if hm != "" {
-    tyOut[0] = elabHoleMapClosed(nodeTyIxOf(unwrapParen(ix)))
+    tyOut[0] = elabHoleContainerClosed(nodeTyIxOf(unwrapParen(ix)))
     return hm
   }
   const mn = nodeTyMapName(unwrapParen(ix))
@@ -3848,10 +3849,37 @@ function monoCloneLambdaSubst(
     // Recursing here rather than teaching that walk a `FuncDecl` arm keeps the two facts a
     // clone owns together: the body substitution above and the frame its clones hang off.
     const mark = monoLamMintedSlots.length
+    const svPinN = monoLamPinN
+    const svPinT = monoLamPinT
+    // The lambda's own parameters shadow the instance's of the same name.
+    let dN = svPinN
+    let dT = svPinT
+    for p in a.fnParams {
+      const pp = nodeAt(p)
+      if pp is Param {
+        const nN: string[] = []
+        const nT: i32[] = []
+        monoPinDrop(pp.parName, dN, dT, nN, nT)
+        dN = nN
+        dT = nT
+      }
+    }
+    monoLamPinN = dN
+    monoLamPinT = dT
     const nbodyL = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
+    monoLamPinN = svPinN
+    monoLamPinT = svPinT
     // A generic call in the body is instantiated by rewriting its callee in place, so each
     // clone takes its own copy, as an instance body does (D2553).
-    const nbody = monoLamCloneGenericCalls(nbodyL, typarams)
+    let nbody = monoLamCloneGenericCalls(nbodyL, typarams)
+    // Its member calls on a captured parameter are re-dispatched for the instance being pinned,
+    // as the instance's own body is.
+    if monoLamPinCtx >= 0 && dN.length > 0 {
+      const ctxWas = monoPinCtx
+      monoPinCtx = monoLamPinCtx
+      nbody = monoPinBinOps(nbody, dN, dT)
+      monoPinCtx = ctxWas
+    }
     // The lambda twin of the named clone's rule: a bare `return` in the body is void, so the
     // return-expression pin above must not give this instance a result (D1600).
     let cloneRet = nret
@@ -4590,6 +4618,12 @@ let monoPinRetBox = false
 
 // The hole binding of the instance whose body `monoPinBodyLambdas` walks; empty outside it.
 let monoPinHoleN: string[] = []
+// While an instance's body is pinned, its parameter names, their pins and its template: a lambda
+// clone re-dispatches its body's member calls on a captured parameter under them (`monoPinBinOps`),
+// less the parameters it binds itself.
+let monoLamPinN: string[] = []
+let monoLamPinT: i32[] = []
+let monoLamPinCtx = -1
 let monoPinHoleT: i32[] = []
 
 // Records in `monoPinUnsafeNames` every name read under `ix` outside a sink.
@@ -6939,9 +6973,11 @@ function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
   const e = nodeAt(ix)
   if e is Ident {
     if !tyHasTyVar(nodeTyIxOf(ix)) { return -1 }
+    let name = e.identName
+    if !strListHas(pNames, name) { name = aliasRootParam(ix) }
     let i = 0
     while i < pNames.length {
-      if pNames[i] == e.identName {
+      if pNames[i] == name {
         const top = elabWalkTop()
         const et = if top >= 0 { elabNodeTy(ix, top) } else { -1 }
         if (
@@ -8344,6 +8380,9 @@ export function monoStateReset() {
   monoPinCtx = -1
   monoPinHoleN = []
   monoPinHoleT = []
+  monoLamPinN = []
+  monoLamPinT = []
+  monoLamPinCtx = -1
   monoPinInLit = false
   monoPinLetReaches = false
   monoWriteCoercedCall = -1
@@ -10292,6 +10331,14 @@ function monoMakeInstanceGo(
     // An instanced relay's instance builds its maker calls at the closed result its call
     // delivers it at (D16780).
     monoBuild.twinRet = if retWiden { req.retWidenTy } else { elabRelayResultAt(monoOrigNode[origFe], tplCall) }
+    const lamPinN: string[] = []
+    for pp0 in params {
+      const pp = nodeAt(pp0)
+      lamPinN.push(if pp is Param { pp.parName } else { "" })
+    }
+    monoLamPinN = lamPinN
+    monoLamPinT = pinnedTyIx
+    monoLamPinCtx = monoOrigNode[origFe]
     const instBody0L = monoMakeInstanceBodyPinned(
       fn,
       origFe,
@@ -10305,6 +10352,9 @@ function monoMakeInstanceGo(
       holeN,
       holeT,
     )
+    monoLamPinN = []
+    monoLamPinT = []
+    monoLamPinCtx = -1
     monoBuild.twinRet = -1
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
@@ -21147,7 +21197,86 @@ function monoPinHoleParam(
       if tagged { nested = false }
     }
     if an == "" && nested {
-      const vt = eplValueTy(ax, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+      let vt = eplValueTy(ax, if ctx >= 0 { elabKeyAt(ctx) } else { -1 })
+      // A record or list whose part holds functions of several results takes that part at its
+      // own pin, built from the literal tree's leaves up (D16859, D16876): a list of non-literal
+      // elements at its rep, a record from its fields, a list where every element pins alike.
+      if vt < 0 && (axn is ObjLit || axn is ArrayLit) {
+        const ek = if ctx >= 0 { elabKeyAt(ctx) } else { -1 }
+        const bn: i32[] = [ax]
+        let bi = 0
+        while bi < bn.length && bi < 64 {
+          const bnode = nodeAt(bn[bi])
+          if bnode is ObjLit {
+            for fx in bnode.objFields {
+              const fi = nodeAt(fx)
+              if fi is FieldInit {
+                const fv = unwrapParen(fi.fiValue)
+                if fv >= 0 && (nodeAt(fv) is ObjLit || nodeAt(fv) is ArrayLit) {
+                  bn.push(fv)
+                }
+              }
+            }
+          } else if bnode is ArrayLit {
+            for e in bnode.arrElems {
+              const ev = unwrapParen(e)
+              if ev >= 0 && (nodeAt(ev) is ObjLit || nodeAt(ev) is ArrayLit) {
+                bn.push(ev)
+              }
+            }
+          }
+          bi = bi + 1
+        }
+        const bt: i32[] = []
+        for _b in bn { bt.push(-1) }
+        let bj = bn.length - 1
+        while bj >= 0 && bn.length < 64 {
+          const bnode = nodeAt(bn[bj])
+          let t = eplValueTy(bn[bj], ek)
+          if t < 0 && bnode is ObjLit {
+            const fnm: string[] = []
+            const fty: i32[] = []
+            for fx in bnode.objFields {
+              const fi = nodeAt(fx)
+              if fi is FieldInit && t != -2 {
+                const fv = unwrapParen(fi.fiValue)
+                const fk = i32ListIndexOf(bn, fv)
+                let ft = if fk >= 0 { bt[fk] } else { eplValueTy(fv, ek) }
+                if ft < 0 && fk < 0 {
+                  const fo = [0 - 1]
+                  ft = if monoArgPinName(fv, ctx, fo) != "" { fo[0] } else { -1 }
+                }
+                if ft < 0 {
+                  t = -2
+                } else {
+                  fnm.push(fi.fiName)
+                  fty.push(ft)
+                }
+              }
+            }
+            t = if t == -2 || fnm.length == 0 { -1 } else { mkObjTy(fnm, fty) }
+          } else if t < 0 && bnode is ArrayLit && bnode.arrElems.length > 0 {
+            let lt0 = -1
+            let litEl = false
+            for e in bnode.arrElems {
+              const ev = unwrapParen(e)
+              const ekx = i32ListIndexOf(bn, ev)
+              if ekx >= 0 { litEl = true }
+              const pt = if ekx >= 0 { bt[ekx] } else { eplValueTy(ev, ek) }
+              lt0 = if pt < 0 || lt0 == -2 || lt0 >= 0 && pt != lt0 { -2 } else { pt }
+            }
+            if litEl {
+              t = if lt0 >= 0 { mkArrayTy(lt0) } else { -1 }
+            } else {
+              const lo = [0 - 1]
+              t = if monoArgPinName(bn[bj], ctx, lo) != "" { lo[0] } else { -1 }
+            }
+          }
+          bt[bj] = t
+          bj = bj - 1
+        }
+        vt = bt[0]
+      }
       if vt >= 0 && vt < T.tys.length && !tyHasTyVar(vt) && !tyHoldsHole(vt) {
         an = if tyHoldsObj(vt, 8) { monoRecordRowPin(vt) } else { monoPinOfClosedTy(vt) }
         if an != "" {

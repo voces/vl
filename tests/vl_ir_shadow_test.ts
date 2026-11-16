@@ -201,6 +201,9 @@ print(guard(2))
   `let gs: i32[] = []\nfunction add(x: i32): i32 {\n  gs.push(x)\n  return gs.push(x + 1)\n}\nprint(add(1))\n`,
   `let ns: string[] = ["a", "b"]\nfunction put(i: i32, s: string) { ns[i] = s + "!" }\nput(1, "z")\nprint(ns[1])\n`,
   `let fs: f64[] = [0.0, 0.0]\nfunction wid(i: i32, x: i32): f64 {\n  fs[i] = x\n  const y: f64 = x\n  return y\n}\nprint(wid(1, 3))\n`,
+  `function pick(c: boolean, x: i64): i64 | null {\n  if c { return x }\n  return x + 1\n}\nprint(pick(true, 3) ?? 0)\n`,
+  `function pn(c: boolean): i32 | null {\n  if c { return 3 }\n  return null\n}\nprint(pn(false) ?? 7)\n`,
+  `function pf(c: boolean): f32 | null {\n  if c { return null }\n  return 1.5\n}\nprint(pf(false) ?? 0.0)\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -232,6 +235,50 @@ print(k(2, true, false))
     const { rows } = run(src, true);
     const want = "mismatch unlowered: operand above a valued if's value";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
+// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
+// the result's `null`.
+Deno.test({
+  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  ignore,
+  fn: () => {
+    const src = `function put(x: i32) { return x * 2 }
+function f(b: i32) {
+  if b >= 0 { return 0 }
+  put(9)
+}
+print(f(-1) ?? 5)
+`;
+    const { rows } = run(src, true);
+    const want = "uncovered block body falls off";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// Only a `null` literal boxes with its value unread. A `null`-typed call has an effect that must
+// run once, so a function delivering one stays uncovered (`rep null`) rather than boxing unread.
+Deno.test({
+  name: "ir shadow: a null-typed call delivered into a box is never left unread",
+  ignore,
+  fn: () => {
+    const src = `function mk(): null {
+  print("effect")
+  return null
+}
+function f(b: boolean): i32 | null {
+  if b { return 1 }
+  return mk()
+}
+print(f(false) ?? 5)
+`;
+    const { rows } = run(src, true);
+    const want = "uncovered rep null";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 0) throw new Error(`want 0 covered, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -295,8 +342,9 @@ Deno.test({
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Case k breaks rule k for 1 to 7; case 8 falls off a valued function's end (rule 5) and
     // case 9 stores an i32 into a bool global (rule 2).
-    // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8];
+    // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
+    // case 11 a box whose immediate stands for a call (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);

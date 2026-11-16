@@ -252,10 +252,21 @@ function stageWitness(dir: string): Staged {
   }
 }
 
+// The test-only refusal a diagnostic-position row calls, refused at emit only under
+// `vl check --test-emit-refusal`, so the row's witness borrows no real defect's refusal.
+const TEST_REFUSAL_HOOK = "__vl_test_emit_refusal__"
+const TEST_REFUSAL_SAID = "test-only refusal"
+
+// Whether the witness staged in `dir` calls the test-only refusal hook.
+function usesRefusalHook(dir: string): boolean {
+  return contains(readText(dir + "/repro"), TEST_REFUSAL_HOOK)
+}
+
 // Classify the witness staged in `dir` on the check, run and build channels.
 function classify(dir: string): Ran {
   const st = stageWitness(dir)
   const f = st.entry
+  if usesRefusalHook(dir) { return classifyHook(f) }
   if st.before.length > 0 { return classifyAfter(dir, f, st.before) }
   const chk = vl(["check", f, "--compiler", COMPILER])
   if wasKilled(chk) { return timedOut("check") }
@@ -279,6 +290,31 @@ function classify(dir: string): Ran {
     return { outcome: "check_reject", detail: cpPrefix(diag, 200), stdout: "" }
   }
   return classifyRun(dir, f)
+}
+
+// Classify entry `f`, whose witness calls the test-only refusal hook, by `vl check --codegen`
+// with the hook on: its refusal is an emit reject, any other refusal a check reject.
+function classifyHook(f: string): Ran {
+  const p = vl(
+    [
+      "check",
+      f,
+      "--codegen",
+      "--test-emit-refusal",
+      "--compiler",
+      COMPILER,
+    ],
+  )
+  if wasKilled(p) { return timedOut("check") }
+  const diag = stripWs(p.out + p.err)
+  const detail = cpPrefix(diag, 200)
+  if p.code == 0 {
+    return { outcome: "runs", detail: "the hook was not refused", stdout: "" }
+  }
+  if contains(diag, TEST_REFUSAL_SAID) {
+    return { outcome: "emit_reject", detail: detail, stdout: "" }
+  }
+  return { outcome: "check_reject", detail: detail, stdout: "" }
 }
 
 // Classify entry `f` checked with codegen on the instance that just checked `before`, the batch
@@ -465,7 +501,11 @@ function gradeChunk(dirs: string[]) {
   const at: i32[] = []
   let k = 0
   while k < dirs.length {
-    if staged[k].alone != "" && !exists(dirs[k] + "/" + HINT_ALONE) {
+    if (
+      staged[k].alone != ""
+      && !exists(dirs[k] + "/" + HINT_ALONE)
+      && !contains(staged[k].alone, TEST_REFUSAL_HOOK)
+    ) {
       const name = "cfw-" + toString(k) + ".vl"
       writeText(dirs[k] + "/" + name, staged[k].alone)
       copies.push(dirs[k] + "/" + name)
@@ -535,8 +575,13 @@ function gradeChunk(dirs: string[]) {
   const rest: string[] = []
   k = 0
   while k < dirs.length {
-    // A row that needs its `batch-*.vl` files checked first is graded by `classify` alone.
-    if exists(dirs[k] + "/" + HINT_ALONE) || staged[k].before.length > 0 {
+    // A row that needs its `batch-*.vl` files checked first, or the refusal hook on, is graded
+    // by `classify` alone.
+    if (
+      exists(dirs[k] + "/" + HINT_ALONE)
+      || staged[k].before.length > 0
+      || usesRefusalHook(dirs[k])
+    ) {
       bad[k] = true
     }
     if got[k] == null && !bad[k] { rest.push(entries[k]) }

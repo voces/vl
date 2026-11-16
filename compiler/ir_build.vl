@@ -17,6 +17,7 @@ import {
   Index,
   LetDecl,
   Member,
+  NullLit,
   NumLit,
   P,
   Param,
@@ -86,7 +87,7 @@ import {
   repTyOf,
 } from "./emit_rep"
 import { ctxTyAt, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
-import { fnUnionRetSinkOk } from "./emit_fn_scans"
+import { isBlockBody } from "./block_body"
 import {
   declaredIndexAt,
   envSlotShift,
@@ -100,7 +101,7 @@ import { fRecRetTy, fRetVoid, fnStmts, gPromoInStart } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
-import { charLitCp } from "./emit_base"
+import { charLitCp, unwrapParen } from "./emit_base"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
@@ -631,19 +632,6 @@ function operandWhy(ix: i32): string {
 
 const STR_OPERAND = "operand at string"
 
-// A returned value delivered at the result's rep. A function whose union result legacy builds in
-// one shared return sink (`fnUnionRetSinkOk`) boxes there, not at the return, and is a miss.
-function deliverReturn(b: i32[], ix: i32): Opnd {
-  if (
-    boxedNullable(ib.irRetRep)
-    && boxOwedAt(ix, ibFnIx)
-    && fnUnionRetSinkOk(ibFnIx)
-  ) {
-    return irBMiss("union return sink")
-  }
-  return deliver(b, ix, ib.irRetRep)
-}
-
 // The rep of binary `n`'s operator width (`binNumWidth`) where an operand has it and the two
 // differ, else -1.
 function binWidthRep(n: BinExpr): i32 {
@@ -671,19 +659,31 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
+  // A `null` literal has no value of its own: the box writer writes the null tag alone.
+  if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
+    if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
+      const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+      return boxTemp(b, none, ix, dst)
+    }
+  }
   return widenTo(b, irBExpr(b, ix), ix, dst)
+}
+
+// `v`, built from `ix`, boxed into boxed nullable `dst` by legacy's box writer.
+function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  const bty = repTyOf(dst)
+  const bt = irVarNew(ib, dst, bty, "temp", -1)
+  irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
+  const bo: Opnd = { ov: bt }
+  return bo
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
 function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   if ibMiss != "" || dst < 0 || irBOpRep(v) == dst { return v }
+  // The checker records the box at the node; legacy's box writer builds it around the value.
   if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
-    // The checker records the box at the node; legacy's box writer builds it around the value.
-    const bty = repTyOf(dst)
-    const bt = irVarNew(ib, dst, bty, "temp", -1)
-    irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
-    const bo: Opnd = { ov: bt }
-    return bo
+    return boxTemp(b, v, ix, dst)
   }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
@@ -1029,7 +1029,7 @@ function stmtIn(b: i32[], ix: i32) {
       return 0
     }
     if none { return skip("void return value") }
-    const v = deliverReturn(b, n.retArg)
+    const v = deliver(b, n.retArg, ib.irRetRep)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
     }
@@ -1063,7 +1063,8 @@ function stmtIn(b: i32[], ix: i32) {
   skip("statement")
 }
 
-// A non-void body's tail: its last statement's value is returned.
+// A non-void body's tail. An expression body's one statement is its value; a block body's last
+// statement is a statement, and a body that runs past it returns its result's `null`.
 function tailReturn(b: i32[], stmts: i32[], at: i32) {
   if stmts.length == 0 { return skip("empty valued body") }
   let i = 0
@@ -1084,8 +1085,12 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     }
     return 0
   }
+  if isBlockBody(at) {
+    stmt(b, last)
+    return skip("block body falls off")
+  }
   const n0 = b.length
-  const v = deliverReturn(b, last)
+  const v = deliver(b, last, ib.irRetRep)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
