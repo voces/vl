@@ -179,7 +179,8 @@ print(sel(true))
 // The decisions legacy and the lowering share (I1b): a reference global's read and its
 // `ref.as_non_null`, a never-returning callee's `call; unreachable`, and an instance's parameter
 // read; string operators, a char literal, a string list read and a void call's tail form (C2h);
-// an atom result and its literals (C2i); string `.slice` and `.cpLen` (C2j); a list push (C2k).
+// an atom result and its literals (C2i); string `.slice` and `.cpLen` (C2j); a list push (C2k);
+// an atom `!=` against a literal and between two atoms, each `i32.eq` then `i32.eqz` (N2b-1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -204,6 +205,8 @@ print(guard(2))
   `function pick(c: boolean, x: i64): i64 | null {\n  if c { return x }\n  return x + 1\n}\nprint(pick(true, 3) ?? 0)\n`,
   `function pn(c: boolean): i32 | null {\n  if c { return 3 }\n  return null\n}\nprint(pn(false) ?? 7)\n`,
   `function pf(c: boolean): f32 | null {\n  if c { return null }\n  return 1.5\n}\nprint(pf(false) ?? 0.0)\n`,
+  `type K = "a" | "b"\nfunction nb(k: K): boolean { return "b" != k }\nconst ks: K[] = ["a", "b"]\nprint(nb(ks[0]))\n`,
+  `type K = "a" | "b"\nfunction df(x: K, y: K): boolean { return x != y }\nconst ks: K[] = ["a", "b"]\nprint(df(ks[0], ks[1]))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",

@@ -37495,7 +37495,7 @@ function strHasBackslash(s: string): boolean {
 
 // Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its
 // id outright, anything else is evaluated for its effects and dropped first.
-function emitStaticLitAtom(ix: i32, lex: string, fnIx: i32) {
+export function emitStaticLitAtom(ix: i32, lex: string, fnIx: i32) {
   if !(nodeAt(unwrapParen(ix)) is StrLit) {
     const rc = emitExprRaw(ix, fnIx)
     if rc < 0 { return -1 }
@@ -39559,75 +39559,115 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
 
 // `emitBinExprNode` past its union compares: the string-literal and atom compares, and the
 // `==` floors and nullable niches every later compare would misread.
+// Which arm legacy's `==`/`!=` over an atom takes. `fold`: both operands are typed as one string
+// literal (`aqLex`, `aqLexR`), so the compare is a constant. `static`: one side is such a literal
+// beside an atom (`aqStaticLeft` names it), spelled as the member `aqLex` it equals, since an atom
+// is interned by its member's lexeme. `ids`: two atom values. `none`: another compare.
+export type AtomEqArm = "fold" | "static" | "ids" | "none"
+export type AtomEqPlan = {
+  aqArm: AtomEqArm,
+  aqStaticLeft: boolean,
+  aqLex: string,
+  aqLexR: string,
+}
+
+// The atom compare arm of `==`/`!=` node `e` (D2156); see `AtomEqPlan`.
+export function atomEqPlanOf(e: BinExpr, fnIx: i32): AtomEqPlan {
+  const none: AtomEqPlan = {
+    aqArm: "none",
+    aqStaticLeft: false,
+    aqLex: "",
+    aqLexR: "",
+  }
+  if e.binOp != "==" && e.binOp != "!=" { return none }
+  const slL = staticStrLitLex(e.binLeft, fnIx)
+  const slR = staticStrLitLex(e.binRight, fnIx)
+  if slL != "" && slR != "" {
+    const f: AtomEqPlan = {
+      aqArm: "fold",
+      aqStaticLeft: false,
+      aqLex: slL,
+      aqLexR: slR,
+    }
+    return f
+  }
+  const slAtomL = slL != "" && exprIsLitAtom(e.binRight, fnIx)
+  const slAtomR = slR != "" && exprIsLitAtom(e.binLeft, fnIx)
+  if slAtomL || slAtomR {
+    // A value no member equals keeps its own lexeme, whose id no atom carries, so `==` is false.
+    const atomIx = if slAtomL { e.binRight } else { e.binLeft }
+    const lex = if slAtomL { slL } else { slR }
+    const st: AtomEqPlan = {
+      aqArm: "static",
+      aqStaticLeft: slAtomL,
+      aqLex: memberLexOfValue(
+        litAtomWidenTexts(atomIx, fnIx),
+        lex,
+      ),
+      aqLexR: "",
+    }
+    return st
+  }
+  // A `null` operand is the nullable-struct compare's: a litunion atom never equals it, and
+  // lowering that `null` as an atom would mis-route it to a bare-null struct context.
+  if nodeAt(unwrapParen(e.binLeft)) is NullLit { return none }
+  if nodeAt(unwrapParen(e.binRight)) is NullLit { return none }
+  if !exprIsLitAtom(e.binLeft, fnIx) && !exprIsLitAtom(e.binRight, fnIx) {
+    return none
+  }
+  // A mixed pair is the string compare's, which widens the atom to its member string.
+  if !eqAtomOperandOk(e.binLeft, fnIx) || !eqAtomOperandOk(e.binRight, fnIx) {
+    return none
+  }
+  const ids: AtomEqPlan = {
+    aqArm: "ids",
+    aqStaticLeft: false,
+    aqLex: "",
+    aqLexR: "",
+  }
+  return ids
+}
+
+// The compare after an atom `==`/`!=`'s two ids: `i32.eq`, and `i32.eqz` for `!=` (never
+// `i32.ne`, so every writer of the compare emits one byte form). 0.
+export function atomEqTail(ne: boolean): i32 {
+  fbI32Bin(70) // 0x46 i32.eq
+  if ne { fbI32Eqz() }
+  return 0
+}
+
 function emitBinLitEq(e: BinExpr, exprIx: i32, fnIx: i32) {
   // Two string-literal types compare in O(1): an operand typed as one string literal is that
   // literal whatever it reads, so beside another such operand the compare folds, and beside an
   // atom it is its interned id. Both operands still evaluate, for their effects (D2156).
   if e.binOp == "==" || e.binOp == "!=" {
-    const slL = staticStrLitLex(e.binLeft, fnIx)
-    const slR = staticStrLitLex(e.binRight, fnIx)
-    if slL != "" && slR != "" {
-      if emitStaticLitAtom(e.binLeft, slL, fnIx) < 0 { return -1 }
+    const aq = atomEqPlanOf(e, fnIx)
+    if aq.aqArm == "fold" {
+      if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
       fbDrop()
-      if emitStaticLitAtom(e.binRight, slR, fnIx) < 0 { return -1 }
+      if emitStaticLitAtom(e.binRight, aq.aqLexR, fnIx) < 0 { return -1 }
       fbDrop()
-      if strLexSameValue(slL, slR) == (e.binOp == "==") {
+      if strLexSameValue(aq.aqLex, aq.aqLexR) == (e.binOp == "==") {
         fbI32Const(1)
       } else {
         fbI32Const(0)
       }
       return 0
     }
-    const slAtomL = slL != "" && exprIsLitAtom(e.binRight, fnIx)
-    const slAtomR = slR != "" && exprIsLitAtom(e.binLeft, fnIx)
-    if slAtomL || slAtomR {
-      // The static side is spelled as the member it equals, since an atom is interned by its
-      // member's lexeme; a value no member equals leaves an id no atom carries, so `==` is false.
-      let slLex = slR
-      let slAtomIx = e.binLeft
-      if slAtomL {
-        slLex = slL
-        slAtomIx = e.binRight
-      }
-      const slMem = memberLexOfValue(litAtomWidenTexts(slAtomIx, fnIx), slLex)
-      if slAtomL {
-        if emitStaticLitAtom(e.binLeft, slMem, fnIx) < 0 { return -1 }
+    if aq.aqArm == "static" {
+      if aq.aqStaticLeft {
+        if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
         if emitExpr(e.binRight, fnIx) < 0 { return -1 }
       } else {
         if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-        if emitStaticLitAtom(e.binRight, slMem, fnIx) < 0 { return -1 }
+        if emitStaticLitAtom(e.binRight, aq.aqLex, fnIx) < 0 { return -1 }
       }
-      fbI32Bin(70) // 0x46 i32.eq
-      if e.binOp == "!=" { fbI32Eqz() }
-      return 0
+      return atomEqTail(e.binOp == "!=")
     }
-  }
-  // A literal-union atom compare (`k == "a"`, `k1 == k2`) emits both operands as i32 ids (a
-  // member `StrLit` as its id, a litunion var as its i32 value) and i32-compares, before the
-  // string-eq path. Both operands must be atom-lowerable (`eqAtomOperandOk`); a mixed pair
-  // falls through to string-eq instead, which widens the atom to its member string.
-  if e.binOp == "==" || e.binOp == "!=" {
-    // SKIP a `null` operand: `r == null` over a `K | null` niche is the `-1` sentinel compare (the
-    // nullable-struct block below owns it). A litunion atom never equals the `null` literal here, and
-    // lowering that `null` as an atom would mis-route it to a bare-null struct context.
-    let atomNull = false
-    if nodeAt(unwrapParen(e.binLeft)) is NullLit { atomNull = true }
-    if nodeAt(unwrapParen(e.binRight)) is NullLit { atomNull = true }
-    if !atomNull {
-      if exprIsLitAtom(e.binLeft, fnIx) || exprIsLitAtom(e.binRight, fnIx) {
-        if (
-          eqAtomOperandOk(e.binLeft, fnIx)
-          && eqAtomOperandOk(e.binRight, fnIx)
-        ) {
-          if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-          if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-          fbI32Bin(70) // 0x46 i32.eq
-          if e.binOp == "!=" {
-            fbI32Eqz() // 0x45 i32.eqz -> `!=`
-          }
-          return 0
-        }
-      }
+    if aq.aqArm == "ids" {
+      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      return atomEqTail(e.binOp == "!=")
     }
   }
   // A `==`/`!=` over a nullable ref niche, plus the emitter-capability floor for a rep with no
