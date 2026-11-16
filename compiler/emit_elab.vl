@@ -21921,6 +21921,81 @@ function eplEdges() {
   return 0
 }
 
+// The label of loop `ix`, or null for a node that is no loop.
+function eplLoopLabel(ix: i32): string | null {
+  const n = nodeAt(ix)
+  if n is WhileStmt { return n.whileLabel }
+  if n is ForRange { return n.frLabel }
+  if n is ForIn { return n.fiLabel }
+  return eplNotALoop(ix)
+}
+
+// Every other kind: an expression, a declaration or a statement no `break` leaves.
+function eplNotALoop(_ix: i32): string | null { return null }
+
+// Pushes onto `out` each value a `break` under `ix` hands to the loop labelled `label`, `depth`
+// loops inside it; a nested loop of the same label shadows it, and a function body is its own.
+function eplLoopExitsIn(ix: i32, label: string, depth: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length || depth > 32 { return 0 }
+  const n = nodeAt(ix)
+  if n is Block {
+    let j = 1
+    while j < n.blkStmts.length {
+      const st = n.blkStmts[j]
+      const b = if st >= 0 && st < P.nodes.length { nodeAt(st) } else { null }
+      if (
+        b is BreakStmt
+        && b.brkHasVal == 1
+        && (b.brkLabel == "" && depth == 0
+          || b.brkLabel != "" && b.brkLabel == label)
+      ) {
+        out.push(n.blkStmts[j - 1])
+      }
+      j = j + 1
+    }
+  }
+  for c in nodeChildren(ix) {
+    const cl = if c >= 0 && c < P.nodes.length { eplLoopLabel(c) } else { null }
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    if cl != null {
+      if cl == "" || cl != label { eplLoopExitsIn(c, label, depth + 1, out) }
+    } else if !(cn is FuncDecl) {
+      eplLoopExitsIn(c, label, depth, out)
+    }
+  }
+  return 0
+}
+
+// A value a loop or labelled block hands out by `break v` flows to where the loop's own value goes.
+// Read from the checked tree, before any rewrite lowers the loop.
+function eplLoopExits() {
+  let x = 0
+  while x < cwIxCoveredLen() && x < P.nodes.length {
+    const label = eplLoopLabel(x)
+    if label != null && cwIxUpKind[x] != CW_UP_NONE {
+      const vals: i32[] = []
+      const n = nodeAt(x)
+      const body = if n is WhileStmt { n.whileBody } else if n is ForRange { n.frBody } else if n is ForIn { n.fiBody } else { -1 }
+      eplLoopExitsIn(body, label, 0, vals)
+      const fr = eplFrameOf(recEnclosingFn(x))
+      const ks = if eplInstanced(fr) { EPL.insts.get(fr) ?? [] } else { [] }
+      const kk: i32[] = if ks.length > 0 { ks } else { [-1] }
+      for k in kk {
+        EPL.k = k
+        for v0 in vals {
+          const v = parenPeelIx(v0)
+          if v >= 0 && v < cwIxCoveredLen() {
+            eplEdge(eplPlaceOf(v, 0), eplPlaceOf(x, 0), v)
+          }
+        }
+      }
+    }
+    x = x + 1
+  }
+  EPL.k = -1
+  return 0
+}
+
 // Parameters a generic types by one type parameter hold one storage in each of its instances: a
 // set or bundle that parameter binds is shared, so their places unify (architecture-target §2.4).
 function eplTyParamShare(fx: i32) {
@@ -22473,6 +22548,7 @@ function eplBuild() {
   EPL.limit = limit
   eplInstsFile()
   eplEdges()
+  eplLoopExits()
   eplCallResults()
 }
 
@@ -22886,7 +22962,11 @@ function eplSlotParams(holder: i32, path: string[], k: i32): i32[] {
 // The holder the write index knows for `h0`: a capture cell's binding, and a binding an instance
 // cloned after the index its source; -1 where none is covered.
 function eplSrcHolder(h0: i32): i32 {
-  let h = elabCellLitBinding(h0)
+  // A loop's value carrier the rewrite minted, or a value it minted for the loop to hand out, holds
+  // what the loop's value is.
+  const lc = lvCarrierLoopOf(h0)
+  const lx = if h0 >= cwIxCoveredLen() { lvExitLoops[h0] ?? -1 } else { -1 }
+  let h = if lc >= 0 { lc } else if lx >= 0 { lx } else { elabCellLitBinding(h0) }
   if h >= cwIxCoveredLen() {
     const o = declOrigOf(h)
     h = if o >= 0 { o } else { nodeSrc[h] ?? -1 }
