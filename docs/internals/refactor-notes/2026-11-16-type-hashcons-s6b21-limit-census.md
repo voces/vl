@@ -39,7 +39,7 @@ Raising every limit at once moved 20 of 3,223 programs, attributed to nine sites
   meet, or -1; `< 1` means "not that shape". The census's countdown match read it as a budget, and rewriting
   it to `< -48` sent every list `is` down the empty-fit path, so two fixtures became emit rejects. Traced
   2026-11-16; no defect. `walk-limit` fires on a countdown floor only for a parameter of the enclosing
-  function since s6b26.
+  function since the change `2026-11-16-walk-limit-coverage.md` records.
 - **Code shape only (1 site), priced.** `handBackHoleIx` (`check_hand_back.vl`, `depth > 8`): fan-out of 30 or
   more builds other bytes with the same output. Left as it is (coordinator ruling, 2026-11-16).
 - Six fan-out alias cells move only when limits in several files rise together (`alias_*_n030`+, other bytes,
