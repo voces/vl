@@ -1,40 +1,62 @@
-# L2: a member call on a parameter from inside a closure (D16877), design notes, 2026-11-16
+# L2: a member call on a parameter from inside a closure is picked per instance, 2026-11-16
 
-Working notes for (ii), the closure half of the alias-receiver family. They record the mechanism
-measured so far; the change is not built yet.
+(ii), the closure half of the alias-receiver family (D16877; D2520's closure cell). Stacked on
+the alias half (`2026-11-16-l2-alias-receiver.md`). The coordinator approved it 2026-11-16, with
+a stop rule: if a per-instance clone breaks captures or boxes, report rather than widen.
 
-## Where it stops today
+## Three places stopped it
 
-**Checker.** `ufcsSitePinnable` (`check_call_resolve.vl`) requires the call to sit in the owner's
-own body (`owner == curFnDeclIx`). Inside a lambda, the constraint owner (`cstrOwnerTop`) is the
-outer generic, but `curFnDeclIx` is the lambda, so the site is refused. The refusals are D2520's
-closure cell, the overload closure cell, and `.indexOf`/`.slice`'s row demand.
+1. **Checker.** `ufcsSitePinnable` required the call to sit in the owner's own body
+   (`owner == curFnDeclIx`). Inside a lambda, the constraint owner is the outer generic but
+   `curFnDeclIx` is the lambda.
+2. **Rewrite.** `drwRecvIsTyParam` judged the receiver against the lambda being walked, so the
+   rewrite fixed a closure's call to the in-scope function once, for every instance, before mono.
+3. **Mono.** `monoPinBinOps` treated a lambda as a leaf. Its clone (`monoCloneLambdaSubst`, made
+   per instance for a capturing lambda) shares the template's body.
 
-**Emitter.**
-- `monoPinBinOps` (`emit_mono.vl`) is the per-instance re-dispatch walk, the last rung of the
-  instance-body pipeline (`instBody = monoPinBinOps(instBody4, pElemNames, pinnedTyIx)`). It
-  treats `FuncDecl` as a leaf, so no site inside a lambda is re-dispatched.
-- Lambdas are lifted into `fnStmts` slots before that rung. `monoCloneBody` rebuilds only the
-  statement spine and shares every nested lambda.
-- `monoCloneLambdaSubst` clones a lambda's signature, but shares its body, and only when an
-  annotation substitutes. A lambda like `() => { a.get("a") }` is never cloned, so its one body
-  serves every instance. `a.get` reaches emit with no callee resolved: D16877's
-  `callee is not a function name`.
+## The change
 
-## What a close needs
+- **Mono.** `monoCloneLambdaSubst` runs `monoPinBinOps` over the clone's body. It uses the
+  instance's parameters and pins (`monoLamPinN`/`T`/`Ctx`, set around
+  `monoMakeInstanceBodyPinned`), less the parameters the lambda binds. A nested clone inherits the
+  narrowed set.
+- **Rewrite.** `drwRecvIsTyParam` judges a receiver against the function whose parameter it holds
+  (`aliasRootParamOwner`).
+- **Checker.** `ufcsSitePinnable` drops the own-body requirement. The receiver's resolution to the
+  owner's parameter is what the emitter now needs.
 
-1. **Force a per-instance clone.** When a lambda in an instance body holds a site whose receiver
-   resolves (`aliasRootParam`) to the instance's parameter and no lambda parameter shadows it,
-   force a per-instance clone. Install it through `monoLamInstallClone`, which sets the slot, the
-   frame parent and the capture bookkeeping.
-2. **Rewrite the clone's body** with `monoPinBinOps` under the outer pins minus the lambda's own
-   parameters (`monoPinDrop`).
-3. **Then widen the checker:** `ufcsSitePinnable` accepts such a site in a nested lambda. This
-   goes last, because widening the checker before the emitter can lower the site would ship
-   clause-1.
+## The order-dependence the first version had
 
-## Risks to measure
+Without the rewrite fix, a string instance built first printed `fn` where `he` was owed (D2520's
+old miscompile); built second, it was right. Grading every program in both orders of its
+instances caught it. That check is now permanent:
+`scripts/capability-probes/matrix/member-call-per-instance-both-orders.matrix.vl` holds 30 cells,
+each program in both orders.
 
-- Captures and boxes: a forced clone must keep `monoLamParentOf`'s frame, so free names resolve.
-- Code size: only lambdas holding such a site are cloned.
-- A lambda nested two deep, one returned, one stored in a record.
+## Measured
+
+Against #8805's fixpoint seed:
+- **Grid:** 20 of 20 run. The adversarial closures run: two deep, in a record, returned, an alias
+  inside. A lambda parameter shadowing the name is unchanged.
+- **Both-orders matrix:** 60 of 60 cell-faces run, 20 of them gains.
+- **`check-filed-witnesses --strict`:** 5,390 of 5,390 as filed. D16877 closes.
+- **Fingerprint, one worktree:** 7 of 20,764 move.
+  - The 2 new cases and the renamed D2520 fixture.
+  - 4 `d3290_*_clo_*` named cells and `member-call-mutating-builtin-through-local.vl`: identical
+    output, emitted bytes smaller (760 → 752, 774 → 766, 3,290 → 3,275).
+- **Other gates:**
+  - `regress.vl`: 0 / 0, no movement.
+  - `decl-order-ab`: 0 clause-1.
+  - 228 matrices: 0 lost, traps or silent.
+  - Case suites: 8,124 pass. Fixpoint holds.
+- **Cost:** seed +1,147 bytes. Self-compile fuel +0.015%.
+- **Phase state:** `emit_rewrite` surface +1 (`aliasRootParamOwner`) and `emit_mono` hidden +3
+  (the scoped `monoLamPinN`, `monoLamPinT`, and `monoPinCtx` in `monoLamPinBody`). The
+  baseline is rewritten.
+
+## Found and filed
+
+[D16882](../inventory/D16882.md): a string or list built-in (`.slice`, a string's `.indexOf`)
+called on an un-annotated parameter is refused at the pin as an unmet row demand, in a closure or
+out of one. The member rule asks the demand as a field, never as the built-in at the solved
+receiver.
