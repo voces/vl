@@ -16737,6 +16737,11 @@ function elabLitCallResultTy(c: i32): i32 {
   return mkFuncTy(q, r)
 }
 
+// The literal and slot step `elabLitSlotCallTys` is asking about while it asks for one of its values'
+// calls; -1 otherwise. Read once, by the outermost ask.
+let elabSlotCallAlso = -1
+let elabSlotCallAlsoStep = ""
+
 // How deep `elabLitCallResultTy` has followed a function result to its own calls.
 let elabSlotCallResultDepth = 0
 
@@ -16756,29 +16761,23 @@ function elabSlotCallTysOpenFns(
   fas: i32[],
 ): boolean {
   elabSlotCallRet = -1
-  elabCallSink = []
-  elabCallSinkOn = true
-  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
-  const anon = dn is FuncDecl
-    && dn.fnName.length > 9
-    && dn.fnName.slice(0, 9) == "__lambda_"
-  if (dn is Call || anon) && d < cwIxCoveredLen() && path.length == 0 {
-    // A value a call hands back, or a lambda, is climbed from its node, under every instance.
-    const out: i32[] = []
-    const seen: i32[] = []
-    const was = elabDlvKey
-    const wasAdmit = elabDlvAdmit
-    elabDlvKey = -1
-    elabDlvAdmit = elabReachClosure(-1)
-    elabSlotClimb(d, [], out, seen)
-    elabDlvKey = was
-    elabDlvAdmit = wasAdmit
-  } else {
-    elabSlotDeliveries(d, path, -1)
+  // The calls the value reaches, each once.
+  const hits: i32[] = []
+  for ci in eplSlotCallRecs(d, path, -1) {
+    const c = EPL.callNode[ci]
+    if !i32ListHas(hits, c) { hits.push(c) }
   }
-  elabCallSinkOn = false
-  const hits = elabCallSink
-  elabCallSink = []
+  // A literal's value is also called through the literal's own slot, even where the program
+  // re-points that field and its class drops the literal's value.
+  const also = elabSlotCallAlso
+  elabSlotCallAlso = -1
+  if also >= 0 {
+    const st: string[] = [elabSlotCallAlsoStep]
+    for ci in eplSlotCallRecs(also, st, -1) {
+      const c = EPL.callNode[ci]
+      if !i32ListHas(hits, c) { hits.push(c) }
+    }
+  }
   let have = false
   let ret = -1
   for c in hits {
@@ -17001,7 +17000,10 @@ export function elabLitSlotCallTys(
     if nodeAt(v) is Spread { return false }
     const q: i32[] = []
     const fa: i32[] = []
+    elabSlotCallAlso = a0
+    elabSlotCallAlsoStep = step
     const got = if fromSpread >= 0 && vi >= fromSpread { elabSlotCallTysOpenFns(a0, [step], q, fa) } else { elabValueCallTysOpenFns(v, q, fa) }
+    elabSlotCallAlso = -1
     vi = vi + 1
     const hs = if got { elabSlotLastHits } else { [] }
     if !got || !elabCloseFnArgs(v, q, fa) { return false }
@@ -22573,23 +22575,16 @@ function eplSlotPerInstance(holder: i32, path: string[]): boolean {
   return false
 }
 
-// Pushes onto `tys` the checked argument types, each widened from its literal, that every call
-// through slot `path` of `holder` or a copy agrees on in instance `k`, leaving out calls made in a
-// function in `skip`; false when none calls it, an argument is open, or two calls differ.
-function eplSlotAgreedCalls(
-  holder: i32,
-  path: string[],
-  k: i32,
-  skip: i32[],
-  tys: i32[],
-): boolean {
+// The call records through slot `path` of `holder` or a copy in instance `k`, and through each
+// binding a call hands a parameter `holder`.
+function eplSlotCallRecs(holder: i32, path: string[], k: i32): i32[] {
+  const k0 = EPL.k
   // A slot in an instanced function, read for every instance, gathers the calls of all of them.
   const ks0 = if k < 0 { eplFrameKeysOf(holder) } else { [] }
   const ks: i32[] = if ks0.length > 0 { ks0 } else { [k] }
-  const k0 = EPL.k
   const cis: i32[] = []
   for kk in ks {
-    const p = eplSlotPlace(holder, path, kk)
+    const p = eplSlotPlaceOwn(holder, path, kk)
     for ci in if p >= 0 { eplCallsStar(p) } else { [] } {
       if !i32ListHas(cis, ci) { cis.push(ci) }
     }
@@ -22611,6 +22606,36 @@ function eplSlotAgreedCalls(
       if !i32ListHas(cis, ci) { cis.push(ci) }
     }
   }
+  EPL.k = k0
+  return cis
+}
+
+// `eplSlotPlace`, except that a call or a name read is placed where the value it yields is.
+function eplSlotPlaceOwn(holder: i32, path: string[], k: i32): i32 {
+  const hn = if holder >= 0 && holder < cwIxCoveredLen() { nodeAt(holder) } else { null }
+  if path.length == 0 && (hn is Call || hn is Ident) {
+    if EPL.stale {
+      eplBuild()
+      EPL.stale = false
+    }
+    EPL.k = k
+    return eplPlaceOf(holder, 0)
+  }
+  return eplSlotPlace(holder, path, k)
+}
+
+// Pushes onto `tys` the checked argument types, each widened from its literal, that every call
+// through slot `path` of `holder` or a copy agrees on in instance `k`, leaving out calls made in a
+// function in `skip`; false when none calls it, an argument is open, or two calls differ.
+function eplSlotAgreedCalls(
+  holder: i32,
+  path: string[],
+  k: i32,
+  skip: i32[],
+  tys: i32[],
+): boolean {
+  const k0 = EPL.k
+  const cis = eplSlotCallRecs(holder, path, k)
   let one: i32[] = []
   let have = false
   let ok = true
