@@ -108,9 +108,6 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   signature; `vl` may print it, and no annotation is required. This is built with L2's inferred
   interfaces (engineering-review-2026-11.md §6). DECISIONS.md §"Exports are frozen at the module
   boundary".
-- **AE-004: an unaliased record field reassigned in place** (2026-11-15, not active work). When
-  nothing else holds `r.f`, the assignment `r.f = { … }` of a fresh record lowers to `struct.set`s
-  on the record already there, not a new allocation.
 
 ## Consumers
 
