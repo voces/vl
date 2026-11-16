@@ -783,6 +783,17 @@ I8a's tail reads no seat: `numWidenTail` asks `numFloorWhy`, which compares the 
 `coerceHeld`, set and restored around one legacy conversion and so -1 wherever the IR asks, and
 `exprReadsDeadNever`, which reads the tree and the checker's types.
 
+**The value hole is a temporary seam (I8b).** A legacy writer whose value sits mid-ladder, the
+box writer first (`emitUnionBoxArg`), runs unchanged while the IR writes the value: `emitExpr`
+answers the one node `irHoleIx` names with the IR's writer, the substitution `isRecvStagedIx`
+already makes for a staged receiver. `emitBoxAroundHole` is its one setter; a writer that asks for
+the value other than once leaves the function unlowered, and a hole open at a function's start
+fails the build. When body lowering retires, the ladder moves to the IR side and the hole is deleted.
+The hole's one divergence under mode 3 (`emitListIdxBackRef`, tag 224 against 230) was not a ladder
+predicate reading context: the builder had returned a block body's last statement as its value,
+where the body runs past it to `null` (D16861). No ladder predicate has yet been seen to read
+context; mode 3 stays the instrument that would show one.
+
 **A census class names its mechanism.** Until C2j the builder called any call whose callee is not a
 plain name an `indirect call`. Split by callee on C2i's tree, the 2,410 corpus functions it held
 alone were string `.slice` (1,692) and `.cpLen` (674), and the self-compile's 731 were mostly list

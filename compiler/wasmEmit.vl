@@ -1167,6 +1167,7 @@ import {
   recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
+  rlUnionRowCovers,
   sFieldIsPlainI32,
   sFieldIsRecordRef,
   sFieldIsUnionBox,
@@ -9826,6 +9827,39 @@ function emitArmForEffect(blockIx: i32, fnIx: i32) {
   return emitIfArmClose(emitNulNoneForEffect(ifArmValueExpr(blockIx), fnIx))
 }
 
+// The node whose value the IR writes itself while one of legacy's writers runs around it, or -1,
+// and how many times that writer asked for it. `emitBoxAroundHole` is the one setter: a temporary
+// seam of `isRecvStagedIx`'s kind, deleted when the box writer moves to the IR.
+let irHoleIx = -1
+let irHoleUses = 0
+// Writes the open hole's value; `irRefInstall` installs the IR's. A hook, not a parameter: a
+// closure parameter would make the compiler a higher-order program the mono pass specializes.
+export let irHoleWrite: () => i32 = holeUnset
+
+const HOLE_STALE = "emitProgram: a value hole is open where no writer runs"
+
+function holeUnset(): i32 { return emitFail(HOLE_STALE) }
+
+// Whether no value hole is open, as holds between any two functions.
+export function irHoleClosed(): boolean { return irHoleIx == -1 }
+
+// Legacy's box of the value at `exprIx` into the union the checker records it delivered into,
+// the value written by `irHoleWrite`. Returns how many times the box wrote the value, or -1.
+export function emitBoxAroundHole(exprIx: i32, fnIx: i32): i32 {
+  if irHoleIx != -1 { return emitFail(HOLE_STALE) }
+  irHoleIx = exprIx
+  irHoleUses = 0
+  const r = emitUnionBoxArg(
+    "",
+    boxRecordUnionTyOf(boxRecordTyAt(exprIx, fnIx)),
+    exprIx,
+    fnIx,
+  )
+  irHoleIx = -1
+  if r < 0 { return -1 }
+  return irHoleUses
+}
+
 // The value at `exprIx` boxed into the union `unionName`. A box of a member set holding a member
 // `unionName` holds only widened is rebuilt there (`emitBoxAtomRetag`), so a record built or
 // written at a wider record's field reads back through every handle (D3006).
@@ -13750,19 +13784,26 @@ function emitArrSpreadBoxed(arrIx: i32, row: i32, fnIx: i32) {
   return spreadJoinGroups(slots, groupRows, wrap, back, kk, row, seq)
 }
 
-// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`.
+// One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`. A list
+// literal source linked to the literal it is spread into is built there, as a run is (D16701).
 function emitSpreadGroupBoxed(
   grp: i32,
   isSrc: boolean,
   row: i32,
   fnIx: i32,
 ): i32 {
-  if !isSrc { return emitSpreadGroup(grp, fnIx, LBK_UNION, row) }
+  const lit = unwrapParen(grp)
+  if (
+    !isSrc
+    || lit >= 0 && nodeAt(lit) is ArrayLit && elabSpreadRunHolderOf(lit) >= 0
+  ) {
+    return emitSpreadGroup(grp, fnIx, LBK_UNION, row)
+  }
   const k = mfRecvKindOf(grp, fnIx)
   if k == "reflist" {
     const s = refListSlotOfExpr(grp, fnIx)
     if emitSpreadGroup(grp, fnIx, LBK_REF, s) < 0 { return -1 }
-    if s == row { return 0 }
+    if s == row || rlUnionRowCovers(s, row) { return 0 }
     if rlWidenTagOf(s, row) < 0 {
       return emitFailAt(
         "emitProgram: a boxing spread reached a source `spreadSrcBoxes` does not admit",
@@ -13865,14 +13906,14 @@ function listKindElemKind(k: ListKind): VKind {
   }
 }
 
-// A run of plain elements as its own `ArrayLit`, built at holder `h`'s type and reporting at
-// the spread literal's position.
-// A synthesized node takes the parser's last cursor otherwise, which would put a diagnostic
-// over it at the end of the file.
+// A run of plain elements as its own `ArrayLit`, built at holder `h`'s type, or at its holder's
+// when `h` is an untyped minted run (D16696). It reports at the spread literal's position: a
+// synthesized node otherwise takes the parser's last cursor, at the end of the file.
 function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
-  elabSpreadRunNote(ix, h)
+  const up = elabSpreadRunHolderOf(h)
+  elabSpreadRunNote(ix, if up >= 0 && nodeTyIxOf(h) < 0 { up } else { h })
   return ix
 }
 
@@ -22599,6 +22640,10 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  if exprIx == irHoleIx {
+    irHoleUses = irHoleUses + 1
+    return irHoleWrite()
+  }
   // A dead arm's operand reads as `never`, and so does what it feeds: no value reaches here (D16006).
   if exprReadsDeadNever(exprIx, fnIx) {
     fbUnreachable()
@@ -23722,8 +23767,13 @@ function widenClassifyExpr(exprIx: i32, fnIx: i32) {
 // read at several widths: a numeric-union member's operator, or a numeric operator's operand.
 // Re-encoding keeps a hex literal past I32_MAX the value it spells.
 function emitNumLitAs(exprIx: i32, w: string): i32 {
-  if cexLitPeel(exprIx) < 0 { return -2 }
+  if !numLitAsApplies(exprIx) { return -2 }
   return emitSignedNumLitAt(unwrapParen(exprIx), w)
+}
+
+// Whether `exprIx` is a number literal an operator builds at its own width (`emitNumLitAs`).
+export function numLitAsApplies(exprIx: i32): boolean {
+  return cexLitPeel(exprIx) >= 0
 }
 
 // The assignment at `exprIx` whose value is its right side's number literal (`asgLitWidth`):
@@ -24893,6 +24943,22 @@ function emitAsCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
       const amRef = nodeAt(unwrapParen(obj))
       if amRef is Index { return emitAsMapProbeTrap(amRef, fnIx) }
     }
+  }
+  // `m[k] as? V` over a scalar map's `V | null` read is the read itself, boxed as a consumed
+  // read is (D2467).
+  const aok = if e.asMode == "null" { mapReadScalarBoxKindIn(obj, fnIx) } else { -1 }
+  const aoRef = nodeAt(unwrapParen(obj))
+  if (
+    e.asMode == "null"
+    && aoRef is Index
+    && exprMap(aoRef.idxArr, fnIx)
+    && tySame(nodeTyAt(_exprIx, fnIx), nodeTyAt(obj, fnIx))
+  ) {
+    if aok >= 0 {
+      return emitMapGetScalarBox(aoRef.idxArr, aoRef.idxIndex, aok, fnIx)
+    }
+    // A niche-bearing value's read already carries its `null`.
+    return emitExpr(obj, fnIx)
   }
   // A type-parameter operand fails as the direct spelling does at this instance's pin (D2791).
   if asExprHoleNumSad(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
@@ -31011,7 +31077,7 @@ function boxAtTable(ix: i32, fnIx: i32): boolean {
 }
 
 // Whether the checker records `ix` delivered into a union box a registry row names.
-function boxOwedAt(ix: i32, fnIx: i32): boolean {
+export function boxOwedAt(ix: i32, fnIx: i32): boolean {
   // A literal set or a nullable niche is no box, whatever row its union keys.
   return boxRecordOwed(boxRecordTyAt(ix, fnIx))
 }
@@ -32708,7 +32774,7 @@ export function emitUnionRetSink(fnIx: i32) {
 // written the box's own `struct.new $uBox`, with its two operands still on the wasm stack
 // in field order? Both conditions are load-bearing: the cursor alone admits nothing-written-
 // since, the byte pattern alone admits a false match (an operand can spell any opcode).
-function uBoxNewIsLast() {
+export function uBoxNewIsLast() {
   if uBoxNewEnd != wLen() { return false }
   const pat = unionBoxNewBytes()
   const np = pat.length
@@ -32724,7 +32790,7 @@ function uBoxNewIsLast() {
 // Unwrite the matched `struct.new $uBox` and pop its two operands into the sink pair,
 // restoring the wasm stack to before the box's operands pushed. Valid only immediately
 // after `uBoxNewIsLast()` answers true.
-function uBoxSinkToPair() {
+export function uBoxSinkToPair() {
   wDropBack(unionBoxNewBytes().length)
   fbLocalSet(unionSinkBase + 1) // the anyref payload — top of stack
   fbLocalSet(unionSinkBase) // the i32 tag — beneath it
@@ -33377,6 +33443,15 @@ function emitLetInitValue(
     if emitWidened(s.letInit, 4, fnIx) < 0 { return -1 }
   } else if letIsI64(stmtIx, fnIx) {
     if emitWidened(s.letInit, 3, fnIx) < 0 { return -1 }
+  } else if (
+    slot >= 0
+    && slot < localIsRef.length
+    && (localIsRef[slot] == "f64" || localIsRef[slot] == "i64")
+  ) {
+    // A slot laid out wider than its init emits (a direct call a value-flow rewrite resolved
+    // out of a list whose calls join a wider result) takes the init widened to it (D16872).
+    const wk = if localIsRef[slot] == "f64" { 4 } else { 3 }
+    if emitWidened(s.letInit, wk, fnIx) < 0 { return -1 }
   } else if (
     (nodeTyPrimName(s.letType) == "string"
       || tyIsBareStrLit(nodeTyIxOf(s.letType))
@@ -36671,6 +36746,8 @@ export function initBitOf(gi: i32): i32 {
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
   coerceHeld = -1
+  irHoleIx = -1
+  irHoleUses = 0
   asgParkedSlot = -1
   asgParkedRef = false
   asgParkWanted = false
@@ -39765,7 +39842,7 @@ function binOperandScalarTy(ix: i32, fnIx: i32): i32 {
 
 // The width a scalar numeric operator works at: the checker's pair rule over its operands
 // (`numPairOpTy`), or `i32` when an operand has no scalar type.
-function binNumWidth(e: BinExpr, fnIx: i32): string {
+export function binNumWidth(e: BinExpr, fnIx: i32): string {
   const t = numPairOpTy(
     e,
     binOperandScalarTy(e.binLeft, fnIx),

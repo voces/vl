@@ -84,8 +84,6 @@ import {
   SS_ALL,
   SS_ARG,
   SS_BIN,
-  SS_BM,
-  SS_MEM,
   SS_NEST,
   SS_RET,
   SS_UFCS,
@@ -199,8 +197,9 @@ import {
   listCallNote,
   noteArgCstr,
   noteArgCstrAt,
+  noteArgCstrFrom,
   noteArrDefCstr,
-  noteBinCstr,
+  noteBinCstrAt,
   noteMemCstr,
   notePrintCstr,
 } from "./check_cstr_rows"
@@ -469,18 +468,15 @@ import {
   SUBST_HOLES,
   SUBST_NESTED,
   cstrOwnedBy,
-  cstrOwnedStrict,
-  cstrOwnedStrictSet,
-  cstrSetOwners,
-  cstrSetOwnersSet,
   curFnOwner,
   fnOwnerKey,
   noteArrayWriteDemand,
-  substNestDecl,
-  substNestDeclSet,
-  substNestMode,
-  substNestModeSet,
-  substSelfOwner,
+  substCtxEnter,
+  substCtxLeave,
+  substCtxNest,
+  substCtxNow,
+  substCtxOwners,
+  substCtxStrict,
   topFnOwnerOf,
   tyFirstVarOwner,
   tyIsForeignGenericSig,
@@ -894,7 +890,7 @@ function numIntrCallTy(name: string, n: Call, ix: i32) {
   const holeTy = minMaxHoleOperand(name, argTys)
   if holeTy >= 0 {
     if argTys.length == args.length {
-      noteBinCstr(argTys[0], name, argTys[argTys.length - 1])
+      noteBinCstrAt(argTys[0], name, argTys[argTys.length - 1], ix, -1)
     }
     return holeTy
   }
@@ -2434,7 +2430,7 @@ function callFtyNoteArgCstr(
       if cfn is Ident { ccWho = cfn.identName }
       let acForm = ACF_PLAIN
       if nodeIsTplHole(args[i]) { acForm = ACF_TPL }
-      noteArgCstr(atCstr, expected, ccWho, acForm, -1)
+      noteArgCstrFrom(atCstr, expected, ccWho, acForm, args[i])
     }
   } else if (
     compArgCstrOk(atCstr, expected)
@@ -2883,16 +2879,17 @@ function callFtyPinCstrs(
   }
   // A call through a value of a set of named functions owns its members' constraints (D15066); a
   // lambda member's constraints are its encloser's, so such a set keeps every owner.
-  const ownersWas = cstrSetOwners
-  const noOwners: i32[] = []
-  cstrSetOwnersSet(noOwners)
+  let setOwners: i32[] = []
   if cstrCallee == CSTR_NODECL {
     const cs = fnTagSetOfTy(nodeTyIxOf(parenPeelIx(n.callFn)))
-    if cs >= 0 && csNamedMembers(cs) { cstrSetOwnersSet(fnTagMembers(cs)) }
+    if cs >= 0 && csNamedMembers(cs) { setOwners = fnTagMembers(cs) }
   }
+  const ownersCtx = substCtxOwners(substCtxNow(), setOwners)
+  const ownersWas = substCtxEnter(ownersCtx)
   // A call through a re-pointed `let` binds a hole in each function it may hold.
   const heldWas = holeBindHeld
-  holeBindHeldSet(noOwners)
+  const noHeld: i32[] = []
+  holeBindHeldSet(noHeld)
   if cstrCallee == CSTR_NODECL && cfn is Ident {
     const hs = holeFnArgDecls(n.callFn)
     if hs.length > 1 { holeBindHeldSet(hs) }
@@ -2903,8 +2900,6 @@ function callFtyPinCstrs(
   const dhArgNo: i32[] = []
   const dhArgNode: i32[] = []
   holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
-  const modeWas = substNestMode
-  const declWas = substNestDecl
   let nestCallee = -1
   let namedFn = -1
   if cfn is Ident {
@@ -2917,15 +2912,19 @@ function callFtyPinCstrs(
     // A nested generic, named directly or through an alias, owns no constraint: they are its
     // enclosing function's, and a top-level function of the same name is another declaration.
     cstrCallee = CSTR_NODECL
-    substNestModeSet(SUBST_NESTED)
-    substNestDeclSet(nestCallee)
-  } else if cstrCallee >= 0 {
-    substNestModeSet(SUBST_DECLARED)
-  } else if namesAllHoles(vNames) && tysHoldVar(vTys) {
-    substNestModeSet(SUBST_HOLES)
-  } else {
-    substNestModeSet(SUBST_ALL)
   }
+  let nestMode = SUBST_ALL
+  let nestDecl = ownersCtx.nestDecl
+  if nestCallee >= 0 {
+    nestMode = SUBST_NESTED
+    nestDecl = nestCallee
+  } else if cstrCallee >= 0 {
+    nestMode = SUBST_DECLARED
+  } else if namesAllHoles(vNames) && tysHoldVar(vTys) {
+    nestMode = SUBST_HOLES
+  }
+  const nestCtx = substCtxNest(ownersCtx, nestMode, nestDecl)
+  const nestWas = substCtxEnter(nestCtx)
   const wsVd = T.diags.length
   adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
   let opFn = cstrCallee
@@ -2972,11 +2971,10 @@ function callFtyPinCstrs(
   cstrPinBinding(cstrCallee, n.callFn, vNames, vTys, cNames, cTys)
   // An instance's re-check records under its own declaration, so an owner-less constraint is
   // the module's top-level code, which that code's own pins ask.
-  const strictWas = cstrOwnedStrict
-  if elabCapLive() { cstrOwnedStrictSet(true) }
+  const strictCtx = substCtxStrict(nestCtx, nestCtx.strict || elabCapLive())
+  const strictWas = substCtxEnter(strictCtx)
   // The callee's binding speaks for its own type parameters only: an operator or a write on
   // another generic's variable of the same name, read through a value of its type, stays open (D12212).
-  const ownerWas = substSelfOwner
   // A callee with no declaration (an element read) speaks for the generic its type's variables
   // belong to.
   let calleeOwner = topFnOwnerOf(cstrCallee)
@@ -3000,14 +2998,15 @@ function callFtyPinCstrs(
     toggles: true,
     selfOwner: calleeOwner,
     argOwner: topFnOwnerOf(cstrCallee),
-    ownerWas: ownerWas,
   }
+  // `SS_ARG` still runs its validator, which re-records and moves rows the later kinds read, so
+  // it closes the first walk until its arrow rule replaces it (S3.4d, D14724).
   ifaceSolveAt(at, SS_BIN, SS_ARG)
   forElemArgCstrs(n.callFn, ft, vNames, vTys)
   // The declared return rides the same pin: the body's mismatch check is vacuous under
-  // a hole, and this is the first position that knows the instance (D551).
+  // a hole, and this is the first position that knows the instance.
   withUnboundAsNever(namedFn, cNames, cTys, rNames, rTys)
-  ifaceSolveAt(at, SS_RET, SS_BM)
+  ifaceSolveAt(at, SS_RET, SS_UFCS)
   // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
   if !inferQuiet {
     let oa = 0
@@ -3016,14 +3015,12 @@ function callFtyPinCstrs(
       oa = oa + 1
     }
   }
-  ifaceSolveAt(at, SS_MEM, SS_UFCS)
   noteHoleLambdaArgPins(vNames, vTys, cstrCallee)
   validateRcwPins(vNames, vTys, cstrCallee, ix)
   recPendBoundArgs(params, args, vNames, vTys)
-  cstrOwnedStrictSet(strictWas)
+  substCtxLeave(strictWas, strictCtx)
   if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
-  substNestModeSet(modeWas)
-  substNestDeclSet(declWas)
+  substCtxLeave(nestWas, nestCtx)
   // Not a validation: the `??` result holes are substituted here for their BANK, which is
   // the only route the emitter has to the type this call gave the expression (D1702).
   if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
@@ -3169,7 +3166,7 @@ function callFtyPinCstrs(
     }
     validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
   }
-  cstrSetOwnersSet(ownersWas)
+  substCtxLeave(ownersWas, ownersCtx)
   holeBindHeldSet(heldWas)
   return retTy
 }
@@ -3226,12 +3223,13 @@ function judgeHoleLambdaAt(
   const d0 = T.diags.length
   holeFnDeliveryDemands(lam, want, ix, "this lambda")
   if T.diags.length > d0 { return 0 }
-  const modeWas = substNestMode
-  substNestModeSet(SUBST_ALL)
+  const c0 = substCtxNow()
+  const ctx = substCtxNest(c0, SUBST_ALL, c0.nestDecl)
+  const was = substCtxEnter(ctx)
   const at = solvePlain(nm, ty, ix, CSTR_NODECL, "")
   at.kinds = SS_ALL - (1 << SS_NEST)
   ifaceSolveAt(at, SS_BIN, SS_UFCS)
-  substNestModeSet(modeWas)
+  substCtxLeave(was, ctx)
   return 0
 }
 
@@ -3244,8 +3242,12 @@ function fsbGenFnHolePins(
   calleeFn: i32,
 ) {
   if decl < 0 { return 0 }
-  const mode = substNestMode
-  if mode == SUBST_HOLES { substNestModeSet(SUBST_DECLARED) }
+  const c0 = substCtxNow()
+  let ctx = c0
+  if c0.nestMode == SUBST_HOLES {
+    ctx = substCtxNest(c0, SUBST_DECLARED, c0.nestDecl)
+  }
+  const was = substCtxEnter(ctx)
   let k = 0
   while k < vNames.length {
     const vt = vTys[k]
@@ -3255,7 +3257,7 @@ function fsbGenFnHolePins(
     }
     k = k + 1
   }
-  substNestModeSet(mode)
+  substCtxLeave(was, ctx)
   return 0
 }
 

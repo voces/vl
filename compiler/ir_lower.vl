@@ -44,6 +44,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  i32ToStr,
   nodeAt,
 } from "./ast"
 import {
@@ -74,6 +75,7 @@ import {
   RStrOp,
   RTagOf,
   RTest,
+  RToBox,
   Rhs,
   SAssign,
   SBlock,
@@ -126,16 +128,20 @@ import {
   fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
+  fbStructNew,
   fbUnreachable,
   wTarget,
   wULEB,
 } from "./emit_bytes"
 import {
   GlobalCtx,
+  emitBoxAroundHole,
   emitFoldedConstRead,
   emitStrLitAt,
   initBitOf,
   numWidenTail,
+  uBoxNewIsLast,
+  uBoxSinkToPair,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -152,12 +158,16 @@ import {
   fbEagerScratch,
   fbFrameParams,
   fnStmts,
+  fnUses,
   gCellIdx,
   gHelpF64Rem,
   gImports,
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
+  uBoxIdx,
+  uBoxNewEnd,
+  unionSinkBase,
 } from "./emit_state"
 
 // The function being lowered.
@@ -397,8 +407,33 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
     }
+    RToBox => boxOp(r)
     RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RMapOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
   }
+}
+
+// The `RToBox` whose operand legacy's box writer asks for through the value hole, while one is
+// open. Held as an `Rhs`: an `Opnd` global costs the self-compile's mono pass.
+let lwHoleBox: Rhs[] = []
+
+// The value hole's writer (`irHoleWrite`): the open box's operand.
+export function irLowerHoleWrite(): i32 {
+  if lwHoleBox.length != 1 {
+    return irLMiss("value hole read with no box open")
+  }
+  const r = lwHoleBox[0]
+  if r is RToBox { irLOpnd(r.bxV) } else { irLMiss("value hole holds no box") }
+  return 0
+}
+
+// `RToBox`: legacy's own box writer, its value the operand, written where the writer asks for it.
+// A writer that asks other than once leaves the function unlowered.
+function boxOp(r: RToBox) {
+  lwHoleBox = [r]
+  const uses = emitBoxAroundHole(r.bxAt, lw.irAt)
+  lwHoleBox = []
+  if uses != 1 { irLMiss("box value written " + i32ToStr(uses) + " times") }
+  return 0
 }
 
 // The depth a branch to `label` crosses from the innermost frame, or -1.
@@ -674,6 +709,14 @@ function ret(n: SReturn, pending: i32[]) {
     return 0
   }
   cond(n.rtV, pending)
+  // A function taking legacy's union return sink pops a box built here into the sink pair and
+  // branches to the exit block wrapped round the body, as `emitUnionRetSink` does.
+  if fnUses.unionSink && uBoxNewIsLast() {
+    uBoxSinkToPair()
+    fbBr(lwFrames.length)
+    lwSinkFired = lwSinkFired + 1
+    return 0
+  }
   fbReturn()
 }
 
@@ -805,11 +848,14 @@ function entry(f: IrFn, ctx: GlobalCtx): u8[] {
   lwRowFrom = []
   lwRowTo = []
   lwBuf = []
+  lwSinkFired = 0
+  uBoxNewEnd = -1
   // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
   const valued = !repIsNoValue(f.irRetRep)
   body(f.irBody, !valued, -1)
   if valued && !endsInReturn(f) { fbUnreachable() }
+  if lwSinkFired > 0 { sinkClose() }
   fbEnd()
   wTarget(prev)
   // Every frame a builder opened is closed, so the one depth not given back is the function's
@@ -860,6 +906,29 @@ export function irLowerClaim(
     r = r + 1
   }
   return ""
+}
+
+// The returns that sank into the union return sink in the function being lowered.
+let lwSinkFired = 0
+
+// Wraps the body in the sink's exit block and builds the function's one box from the pair, as
+// legacy's `emitFuncCode` closes a sinking body.
+function sinkClose() {
+  const opened: u8[] = [0x02, 0x40]
+  for x in lwBuf { opened.push(x) }
+  lwBuf = opened
+  wTarget(lwBuf)
+  let r = 0
+  while r < lwRowFrom.length {
+    lwRowFrom[r] = lwRowFrom[r] + 2
+    lwRowTo[r] = lwRowTo[r] + 2
+    r = r + 1
+  }
+  fbEnd()
+  fbLocalGet(unionSinkBase)
+  fbLocalGet(unionSinkBase + 1)
+  fbStructNew(uBoxIdx)
+  return 0
 }
 
 function endsInReturn(f: IrFn): boolean {

@@ -187,6 +187,8 @@ import {
   lbiBindName,
   lbiCoalUnsafe,
   lbiOperandCand,
+  nlAsgGot,
+  nlAsgTgt,
 } from "./check_num_lit_state"
 import { numLitAdoptDeep } from "./check_num_adopt"
 import { cexRoundFirst, numCastCanFail, numLitOwnTy } from "./check_num_lits"
@@ -267,6 +269,7 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyChildrenOf,
   tyDenotesObj,
   tyElemOf,
   tyElemOpen,
@@ -278,6 +281,7 @@ import {
   tyIsLitUnion,
   tyIsNullableLitUnion,
   tyIsOneStrLit,
+  tyIsParamHole,
   tyKeyOf,
   tyKeyOpen,
   tyMapValIsLitUnion,
@@ -741,11 +745,15 @@ function idxRecvIx(ix: i32): i32 {
 }
 
 // Whether a write of `rt` into a place declared `dcl` leaves the place reading at the member
-// its pin lands on (`HD_TVW`): a value typed at a declared type parameter, into a concrete
-// declaration admitting `null`. Each instance re-reads the place at its pin, so a local, a
-// global, a field and a cell all take the pin's read over any union (D3240, D8820).
+// its pin lands on (`HD_TVW`): a value typed at a type parameter or an un-annotated parameter's
+// hole, into a concrete declaration admitting `null`. Each instance re-reads the place at its
+// pin, so a local, a global, a field and a cell all take the pin's read over any union (D3240).
 export function tvPlaceWrite(dcl: i32, rt: i32): boolean {
-  if (!tyIsDeclaredParam(rt) || !tyAdmitsNull(dcl) || tyHasTyVar(dcl)) {
+  if (
+    !(tyIsDeclaredParam(rt) || tyIsParamHole(rt))
+    || !tyAdmitsNull(dcl)
+    || tyHasTyVar(dcl)
+  ) {
     return false
   }
   const nn = nonNullTy(dcl)
@@ -2146,7 +2154,33 @@ export function holeArgOriginNode(
 export function noteHoleFlow(src: i32, dst: i32, at: i32) {
   if !paramSolveProbe { return 0 }
   if expObsFn >= 0 { expObsPin(src, dst, at) }
+  // A parameter written into a place that admits `null` is not answered by it: the place then
+  // reads at the pin's member (`tvPlaceWrite`), as a type parameter's write does.
+  if tyIsParamHole(src) && holeWriteIntoNullable(src, dst) { return 0 }
   return noteHoleFlowGo(src, dst, 6)
+}
+
+// Whether `src` is the value of the assignment being delivered (`nlAsgTgt`) and `dst`, the place's
+// storage, admits `null` and holds no type variable or literal. A literal is left to the flow
+// answer, which is what lets a literal argument adapt to the place.
+function holeWriteIntoNullable(src: i32, dst: i32): boolean {
+  if nlAsgTgt < 0 || nlAsgGot != src { return false }
+  if !tyAdmitsNull(dst) || tyHasTyVar(dst) || isNullTy(dst) { return false }
+  return !tyHoldsLit(dst, [])
+}
+
+// Whether `t` reaches a literal type; `seen` holds the entries already walked, so a recursive type
+// ends at its revisit.
+function tyHoldsLit(t: i32, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return false }
+  seen.push(t)
+  if tyAt(t) is TyLit { return true }
+  const kids: i32[] = []
+  tyChildrenOf(t, kids)
+  for k in kids {
+    if tyHoldsLit(k, seen) { return true }
+  }
+  return false
 }
 
 // Records a deferred join that escaped call `ix` to callee `who` lossily — the collapse kept
@@ -2870,12 +2904,12 @@ export function anyLitUnionUsed() {
       // classifiers would treat the interned atom id as a string, invalid wasm at the read.
       if tyMapValIsLitUnion(nodeTyIxOf(i), 4) { return true }
       // So does one used only as a record field, which a hole parameter reads (D2866).
-      if tyObjFieldIsLitUnion(nodeTyIxOf(i), 4) { return true }
+      if tyObjFieldIsLitUnion(nodeTyIxOf(i)) { return true }
       // And one used only as a function type's result or parameter, a list element's or a map
       // value's included, which a call in an instance reads (D3193, D3199).
       const pe = tyPeelElems(nodeTyIxOf(i), 4)
       if tyFnRetIsLitUnion(pe) || tyFnParamIsLitUnion(pe) { return true }
-      if tyObjFieldIsLitUnion(pe, 4) { return true }
+      if tyObjFieldIsLitUnion(pe) { return true }
     }
     // A field typed by one bare string literal is its one-member set's atom (D7220).
     if n is FieldDef {
@@ -2886,7 +2920,7 @@ export function anyLitUnionUsed() {
     // …and so is one on an inline record arm of a declared union, whose row a fresh literal
     // adopts even where no annotation names the union.
     if n is UnionDecl {
-      if tyObjFieldIsLitUnion(cUserTypes[n.udName] ?? -1, 4) { return true }
+      if tyObjFieldIsLitUnion(cUserTypes[n.udName] ?? -1) { return true }
     }
     // A litunion used only as an array element (or any expression the checker typed as one)
     // also counts — checked on the recorded type, not the annotation name, at every node.
