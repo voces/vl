@@ -4177,7 +4177,7 @@ export function fvaMakerCallRows() {
     if rl.any { fvaRelayNote(rl, ix) }
     ix = ix + 1
   }
-  // So does a relay read other than as a callee.
+  // So does a relay, or a binding holding one's call, read other than as a callee.
   for r in rl.reads {
     if !(rl.calleeOf.get(r) ?? false) { rl.handedOn[identDeclOf(r)] = true }
   }
@@ -4226,6 +4226,7 @@ type FvaRelayScan = {
   any: boolean,
   memo: {[i32]: boolean},
   calls: i32[],
+  bindCalls: i32[],
   reads: i32[],
   calleeOf: {[i32]: boolean},
   handedOn: {[i32]: boolean},
@@ -4236,6 +4237,7 @@ function fvaRelayScanNew(): FvaRelayScan {
     any: false,
     memo: Map(),
     calls: [],
+    bindCalls: [],
     reads: [],
     calleeOf: Map(),
     handedOn: Map(),
@@ -4257,12 +4259,36 @@ function fvaRelayNote(rl: FvaRelayScan, ix: i32) {
     if fvaIsFnDecl(d) && fvaRelayMemo(rl, d) {
       rl.calls.push(ix)
       rl.calleeOf[r] = true
+    } else if fvaRelayBindInit(rl, d) >= 0 {
+      rl.bindCalls.push(ix)
+      rl.calleeOf[r] = true
     }
   } else if n is Ident {
     const d = identDeclOf(ix)
     if d != ix && fvaIsFnDecl(d) && fvaRelayMemo(rl, d) { rl.reads.push(ix) }
+    if d != ix && fvaRelayBindInit(rl, d) >= 0 { rl.reads.push(ix) }
   }
   return 0
+}
+
+// The relay call an un-annotated `const` at `d` is initialised with, or -1.
+function fvaRelayBindInit(rl: FvaRelayScan, d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const c = parenPeelIx(dn.letInit)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) || cn.callFn < 0 { return -1 }
+  const r = parenPeelIx(cn.callFn)
+  const rd = if r >= 0 && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+  return if fvaIsFnDecl(rd) && fvaRelayMemo(rl, rd) { c } else { -1 }
 }
 
 // Whether `d` is a relay, asked once per declaration.
@@ -4295,6 +4321,18 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
   fvaRelayDeadReads(rl, relays, innerOf)
   // Each relay's result, from its calls outside every relay's returns.
   const relaySig: {[i32]: i32} = Map()
+  // A call held in an un-annotated `const` only called takes those calls' result, as a maker's does.
+  const heldAt: {[i32]: i32[]} = Map()
+  for b in rl.bindCalls {
+    const bn = nodeAt(b)
+    const bd = if bn is Call { identDeclOf(parenPeelIx(bn.callFn)) } else { -1 }
+    const rc = fvaRelayBindInit(rl, bd)
+    if rc >= 0 && bn is Call && !(rl.handedOn.get(bd) ?? false) {
+      const list = heldAt[rc] ?? []
+      list.push(fvaMakerResultAt(rc, fvaCallSig(bn, b)))
+      heldAt[rc] = list
+    }
+  }
   for c in rl.calls {
     const cn = nodeAt(c)
     if cn is Call && !innerOf.has(c) {
@@ -4304,7 +4342,12 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
         && dt < T.tys.length
         && !tyHasTyVar(dt)
         && tyAt(dt) is TyFunc
-      fvaReachSig(relaySig, d, if closed { dt } else { -1 })
+      const held = heldAt.get(c) ?? []
+      if closed || held.length == 0 {
+        fvaReachSig(relaySig, d, if closed { dt } else { -1 })
+      } else {
+        for h in held { fvaReachSig(relaySig, d, h) }
+      }
     }
   }
   for d in rl.handedOn.keys() { relaySig[d] = -1 }
