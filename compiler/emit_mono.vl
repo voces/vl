@@ -54,7 +54,7 @@ import {
   identFnDeclOf,
   tyParamIsBareOnly,
 } from "./check_scopes"
-import { fvaIsMaker } from "./check_assignable"
+import { elabRelayResultAt, fvaIsMaker } from "./check_assignable"
 import { mintCallSoleSet, mintNestedPerEnclOf } from "./check_mint"
 import { ftWithinInstancedFn } from "./check_fn_tag"
 import {
@@ -813,10 +813,10 @@ import {
   tyExcludesNull,
   tyHasTyVar,
   tyHasTyVarWasCapped,
+  tyHoldsHole,
   tyIsArray,
   tyIsNumericBox,
   tyMapValOf,
-  tyReachesHole,
 } from "./tyquery"
 import { nulNumScalarUnionName, nulNumScalarUnionRowTy } from "./check_ty_rep"
 import { tyIsWriteLandRead } from "./check_hole_pins"
@@ -3914,7 +3914,7 @@ function monoLamSubstParams(
       const etShut = et >= 0
         && et < T.tys.length
         && !tyHasTyVar(et)
-        && !tyReachesHole(et, 16)
+        && !tyHoldsHole(et)
       const tn = if p.parType >= 0 && p.parType < P.nodes.length { nodeAt(p.parType) } else { null }
       const tpos = if tn is TypeRef { tn.pos } else { p.pos }
       if nt0 >= 0 && !etShut {
@@ -4326,9 +4326,7 @@ function monoPinBodyLambdasRaw(
 function monoNumOperandPinTy(ix: i32): i32 {
   const n = elabWalkNarrowedTy(ix)
   const w = if n >= 0 && n < T.tys.length && !tyHasTyVar(n) { n } else { elabWalkTy(ix) }
-  if w < 0 || w >= T.tys.length || tyHasTyVar(w) || tyReachesHole(w, 16) {
-    return -1
-  }
+  if w < 0 || w >= T.tys.length || tyHasTyVar(w) || tyHoldsHole(w) { return -1 }
   return if tyIsNumericBox(w) && tyBearsNull(w) { nonNullTy(w) } else { w }
 }
 
@@ -7999,7 +7997,7 @@ function monoArgTaggedSetTy(ax: i32): i32 {
 // Whether the elaboration's binding `bt` of a hole is a closed type other than `i32`, which the
 // rep cascade's `i32` floor would pin wrongly.
 function monoFloorDisagrees(bt: i32): boolean {
-  if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) || tyReachesHole(bt, 16) {
+  if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) || tyHoldsHole(bt) {
     return false
   }
   return !tySameSealed(bt, TY_I32)
@@ -10226,7 +10224,9 @@ function monoMakeInstanceGo(
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
     monoMakeInstanceHoles(holeN, holeT)
-    monoBuild.twinRet = if retWiden { req.retWidenTy } else { -1 }
+    // An instanced relay's instance builds its maker calls at the closed result its call
+    // delivers it at (D16780).
+    monoBuild.twinRet = if retWiden { req.retWidenTy } else { elabRelayResultAt(monoOrigNode[origFe], tplCall) }
     const instBody0L = monoMakeInstanceBodyPinned(
       fn,
       origFe,
@@ -14614,7 +14614,7 @@ function monoUncalledListElems(
 
 // Whether `t` is a function type reaching neither a type variable nor an inference hole.
 function monoTyClosedFn(t: i32): boolean {
-  return monoTyConcreteFn(t) && !tyReachesHole(t, 16)
+  return monoTyConcreteFn(t) && !tyHoldsHole(t)
 }
 
 // The one closed function type the elaboration delivers slot `path` of binding frame `lf` at,
@@ -16034,7 +16034,7 @@ function monoStoredSlotDecline(r: i32): i32 {
 // whose values are member ids and so need no pin.
 function monoTyOpen(t: i32): boolean {
   if t < 0 { return true }
-  if !tyHasTyVar(t) && !tyReachesHole(t, 16) { return false }
+  if !tyHasTyVar(t) && !tyHoldsHole(t) { return false }
   if !fnTagTyIsTagged(t) && !fnTagHoldsTy(t) { return true }
   return monoTyOpenUntagged(t, 16)
 }
@@ -16044,7 +16044,7 @@ function monoTyOpen(t: i32): boolean {
 function monoTyOpenUntagged(t: i32, depth: i32): boolean {
   if t < 0 { return true }
   if fnTagTyIsTagged(t) { return false }
-  if !tyHasTyVar(t) && !tyReachesHole(t, 16) { return false }
+  if !tyHasTyVar(t) && !tyHoldsHole(t) { return false }
   if depth <= 0 { return true }
   const a = tyAt(t)
   match a {
@@ -17641,7 +17641,7 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
   // An open callee reads the type the elaboration gives it in this instance, and spells its
   // parameters from that type (D15480).
   let fromElab = false
-  if tyHasTyVar(ct) || tyReachesHole(ct, 8) {
+  if tyHasTyVar(ct) || tyHoldsHole(ct) {
     const et = elabNodeTyAt(n.callFn, ctx)
     if et >= 0 && et < T.tys.length && !tyHasTyVar(et) {
       ct = et
@@ -17670,7 +17670,7 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
       && pt < T.tys.length
       && tyAt(pt) is TyFunc
       && !tyHasTyVar(pt)
-      && !tyReachesHole(pt, 8)
+      && !tyHoldsHole(pt)
       && nodeAt(unwrapParen(n.callArgs[i])) is Ident
       && monoFnParamTypeAt(dfe, i) < 0
     ) {
@@ -18965,7 +18965,7 @@ function monoPreBindPastUnionRest(
         let ek = n0
         while ek < tvN.length && ek < tvT.length {
           const et = elabCallBindTy(monoCallTplOf(callIx), tvN[ek])
-          const esp = if et >= 0 && et < T.tys.length && !tyHasTyVar(et) && !tyReachesHole(et, 16) { monoPinAnnSpelling(et) } else { "" }
+          const esp = if et >= 0 && et < T.tys.length && !tyHasTyVar(et) && !tyHoldsHole(et) { monoPinAnnSpelling(et) } else { "" }
           if esp != "" {
             tvT[ek] = et
             if ek < tvV.length { tvV[ek] = esp }
@@ -20932,7 +20932,7 @@ function monoPinHoleParam(
         args[i],
       )
     }
-    if pt0 >= 0 && !tyHasTyVar(pt0) && !tyReachesHole(pt0, 16) {
+    if pt0 >= 0 && !tyHasTyVar(pt0) && !tyHoldsHole(pt0) {
       return emitFailAt(
         "emitProgram: internal: parameter `"
           + p.parName
@@ -24210,13 +24210,13 @@ function monoDeliverLamLit(at: i32, ctx: i32, callIx: i32, annTy: i32): i32 {
   const lx = unwrapParen(at)
   let lt = elabIdentityTy(lx, ctx)
   const ltf = if lt >= 0 { tyAt(lt) } else { tyAt(0) }
-  if !(ltf is TyFunc) || tyHasTyVar(lt) || tyReachesHole(lt, 16) {
+  if !(ltf is TyFunc) || tyHasTyVar(lt) || tyHoldsHole(lt) {
     lt = elabValueInstSig(lx)
   }
   if lt < 0 {
     const wt = elabWrittenSlotTy(lx, ctx)
     const wf = if wt >= 0 { tyAt(wt) } else { tyAt(0) }
-    if wf is TyFunc && !tyHasTyVar(wt) && !tyReachesHole(wt, 16) { lt = wt }
+    if wf is TyFunc && !tyHasTyVar(wt) && !tyHoldsHole(wt) { lt = wt }
   }
   // The literal takes its own signature where its parameters agree in number with the
   // destination's function type and each has a spelling; else the destination's.
@@ -26347,7 +26347,7 @@ function monoBindingAdoptInit(i: i32, k: i32) {
     et >= 0
     && et < T.tys.length
     && elabTyClosed(et, 16)
-    && !tyReachesHole(et, 16)
+    && !tyHoldsHole(et)
   ) {
     // A captured binding holds a one-element cell of the value the elaboration types.
     const cl = cboxCellLits[d.letInit]

@@ -652,7 +652,6 @@ import {
   tyHoldsNumericPrim,
   tyIsListTy,
   tyLitSetMemberLexes,
-  tyReachesHole,
   tysHaveTyVarIn,
   unionLeavesInto,
 } from "./tyquery"
@@ -1554,7 +1553,7 @@ export function nomLitAdopts(srcExpr: i32, srcTy: i32, dstTy: i32) {
 function listElemWidens(se: i32, de: i32): boolean {
   if se < 0 || de < 0 { return false }
   if se == de { return false }
-  if tyReachesHole(se, 8) || tyReachesHole(de, 8) { return false }
+  if tyHoldsHole(se) || tyHoldsHole(de) { return false }
   if primNameOf(se) == "never" { return false }
   return !assignable(de, se)
 }
@@ -2304,7 +2303,7 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     }
     const at = if mapped { -1 } else { recQueuedLandingOf(c, own, dst) }
     if at >= 0 {
-      if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
+      if !fieldStorageEq(at, dst) { return false }
       // A value landing at the build that a record is then written through takes its own copy.
       if (
         c != call
@@ -2420,9 +2419,7 @@ function recSlotReadHolds(m: i32, c: i32): boolean {
 function recOwnTypedAt(d: i32, own: i32): boolean {
   const t = nodeTyIxOf(d)
   if t < 0 || t >= T.tys.length { return false }
-  return tyReachesHole(t, 8)
-    || tyHasTyVar(t)
-    || fieldStorageEq(t, own, REC_STORE_DEPTH)
+  return tyHoldsHole(t) || tyHasTyVar(t) || fieldStorageEq(t, own)
 }
 
 // Whether argument `a` is handed to a parameter a record is written through (`recBindWrittenThrough`).
@@ -2510,16 +2507,16 @@ function recUseWritesThrough(u: i32, depth: i32): boolean {
 // type argument spells as a declared record, else `own` (D14818).
 function recCopyDstOf(c: i32, own: i32): i32 {
   const dt = recDeclaredPinTy(c)
-  if dt >= 0 && fieldStorageEq(dt, own, REC_STORE_DEPTH) { return dt }
+  if dt >= 0 && fieldStorageEq(dt, own) { return dt }
   const pt = recReachPinTy(c)
-  return if pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH) { pt } else { own }
+  return if pt >= 0 && fieldStorageEq(pt, own) { pt } else { own }
 }
 
 // Whether call `c` reaches a type parameter that a written type argument, or another argument
 // holding a value no call of its function produced, pins at a type storing as `own` (D14818).
 function recPinnedAtOwn(c: i32, own: i32): boolean {
   const pt = recReachPinTy(c)
-  return pt >= 0 && fieldStorageEq(pt, own, REC_STORE_DEPTH)
+  return pt >= 0 && fieldStorageEq(pt, own)
 }
 
 // The type name parameter `px` is annotated with, or "" for none or a composite annotation.
@@ -2558,7 +2555,7 @@ function recCopyNarrowsAt(wide: i32, own: i32, depth: i32): boolean {
     const wf = objFieldType(w, o.objFieldNames[i])
     if wf < 0 { return false }
     if (
-      !fieldStorageEq(wf, of, REC_STORE_DEPTH)
+      !fieldStorageEq(wf, of)
       && !(of == TY_NULL && nullableInnerOrNone(wf) >= 0)
       && !recCopyUnwraps(wf, of)
       && !(recCopyNestable(wf, of)
@@ -2586,9 +2583,7 @@ function recCopyNestable(sf: i32, df: i32): boolean {
 // result type, so every value its function builds holds an `of` there (D15184).
 function recCopyUnwraps(wf: i32, of: i32): boolean {
   const inner = nullableInnerOrNone(wf)
-  return of != TY_NULL
-    && inner >= 0
-    && fieldStorageEq(inner, of, REC_STORE_DEPTH)
+  return of != TY_NULL && inner >= 0 && fieldStorageEq(inner, of)
 }
 
 // The fields of record `own` a copy from wide row `wide` unwraps (`recCopyUnwraps`), as field
@@ -2615,7 +2610,7 @@ function recCopyUnwrapNamesAt(
   while i < o.objFieldNames.length {
     const wf = objFieldType(w, o.objFieldNames[i])
     const of = o.objFieldTypes[i]
-    if wf >= 0 && !fieldStorageEq(wf, of, REC_STORE_DEPTH) {
+    if wf >= 0 && !fieldStorageEq(wf, of) {
       if recCopyUnwraps(wf, of) {
         out.push(pre + o.objFieldNames[i])
       } else if recCopyNestable(wf, of) {
@@ -2983,11 +2978,11 @@ function recNullWidenedAt(
       const of = o.objFieldTypes[i]
       const df = objFieldType(d, o.objFieldNames[i])
       if df < 0 { return false }
-      if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+      if !fieldStorageEq(of, df) {
         const inner = nullableInnerOrNone(df)
         const at = if inner < 0 { df } else { inner }
         if (
-          !fieldStorageEq(of, at, REC_STORE_DEPTH)
+          !fieldStorageEq(of, at)
           && !(of == TY_NULL && inner >= 0)
           && !(stored && of == TY_I32 && at == TY_I64)
           && !recNullWidenedAt(of, at, stored, depth - 1)
@@ -3055,11 +3050,7 @@ function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
   for s in sites {
     if s % 2 == 0 {
       const at = recQueuedLandingOf(s / 2, own, dst)
-      if (
-        at >= 0
-        && !fieldStorageEq(at, dst, REC_STORE_DEPTH)
-        && !fieldStorageEq(at, own, REC_STORE_DEPTH)
-      ) {
+      if (at >= 0 && !fieldStorageEq(at, dst) && !fieldStorageEq(at, own)) {
         return true
       }
     }
@@ -3099,7 +3090,7 @@ function recQueuedLandingOf(c: i32, own: i32, dst: i32): i32 {
       REC_STORE_DEPTH,
     )
     if t >= 0 {
-      if got >= 0 && !fieldStorageEq(got, t, REC_STORE_DEPTH) { return -1 }
+      if got >= 0 && !fieldStorageEq(got, t) { return -1 }
       got = t
     }
     i = i + 1
@@ -3138,7 +3129,7 @@ function recRepArgOf(i: i32, c: i32, own: i32, dst: i32): boolean {
   const up = if src >= 0 && cwIxCovers(src) { cwIxUp[src] } else { -1 }
   if up >= 0 && callHasTyArgs(up) {
     const de = tyArrayElemIx(nonNulTyOf(recPendDstTy[i]))
-    if de < 0 || !fieldStorageEq(de, dst, REC_STORE_DEPTH) { return false }
+    if de < 0 || !fieldStorageEq(de, dst) { return false }
   }
   if recListRetArgRelayed(i, c, own) { return true }
   return recListArgTakesRep(src)
@@ -3622,8 +3613,8 @@ export function recStoresAgree(md: i32) {
     // A value whose own record already stores as the build is built there (D16442).
     const built = st >= 0
       && (lit
-      || (kd >= 0 && fieldStorageEq(kd, st, REC_STORE_DEPTH))
-      || fieldStorageEq(nodeTyIxOf(v), st, REC_STORE_DEPTH))
+      || (kd >= 0 && fieldStorageEq(kd, st))
+      || fieldStorageEq(nodeTyIxOf(v), st))
     if !built && at >= 0 { recRefuseAtOwnRow(v, nodeTyIxOf(v), at) }
     // A stored literal is built at the build, so its fields are boxed at the build's fields.
     if built && lit { litFieldsBoxAt(v, st, 4) }
@@ -3691,7 +3682,7 @@ function recFieldsBuiltTy(own: i32, vs: i32[]): i32 {
     while i >= 0 && ot.objFieldNames[i] != name { i = i - 1 }
     if kd >= 0 && i >= 0 {
       const was = tys[i] != ot.objFieldTypes[i]
-      if was && !fieldStorageEq(tys[i], kd, REC_STORE_DEPTH) { return -1 }
+      if was && !fieldStorageEq(tys[i], kd) { return -1 }
       tys[i] = kd
       moved = true
     }
@@ -3708,7 +3699,7 @@ function recFieldRebuiltTy(own: i32, bt: i32, name: string): i32 {
   if !(btT is TyObj) || !(ownT is TyObj) { return -1 }
   const f = objFieldType(btT, name)
   const o = objFieldType(ownT, name)
-  return if f < 0 || o < 0 || fieldStorageEq(f, o, REC_STORE_DEPTH) { -1 } else { f }
+  return if f < 0 || o < 0 || fieldStorageEq(f, o) { -1 } else { f }
 }
 
 // The field the value `v` is stored into: its name in an object literal, or `w.name = v`; else "".
@@ -3754,7 +3745,7 @@ export function recBuiltReadRefuse(u: i32) {
   // A `??` whose default is a fresh record literal builds the literal at the read's record too.
   if recCoalesceLitBuilt(p, nonNullTy(bt)) { return 0 }
   if recAsgIntoBuiltAt(p, nonNullTy(bt)) { return 0 }
-  if !fieldStorageEq(nonNullTy(bt), nonNullTy(own), REC_STORE_DEPTH) {
+  if !fieldStorageEq(nonNullTy(bt), nonNullTy(own)) {
     recBuiltReadErr(p, own, nonNullTy(own), nonNullTy(bt), false)
   }
   return 0
@@ -4175,7 +4166,7 @@ function recFnSetWidens(of: i32, wf: i32): boolean {
   ) {
     return false
   }
-  return fnTagSetOfTy(wf) >= 0 || !tyHasTyVar(wf) && !tyReachesHole(wf, 8)
+  return fnTagSetOfTy(wf) >= 0 || !tyHasTyVar(wf) && !tyHoldsHole(wf)
 }
 
 // The list a record literal `p` is pushed onto, peeled; else -1.
@@ -4295,7 +4286,7 @@ function recCoalesceDefaultsAt(d: i32, rep: i32): i32[] {
     const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
     if qn is BinExpr && cwPeelValue(qn.binRight) == u {
       const b = recBuiltReadTy(q)
-      if b >= 0 && fieldStorageEq(nonNullTy(b), rep, REC_STORE_DEPTH) {
+      if b >= 0 && fieldStorageEq(nonNullTy(b), rep) {
         out.push(u)
         out.push(q)
       }
@@ -4347,9 +4338,7 @@ export function recCoalLandsAt(u: i32, dst: i32): boolean {
     return false
   }
   const bt = recBuiltReadTy(pn.binLeft)
-  return bt >= 0
-    && dst >= 0
-    && fieldStorageEq(nonNullTy(bt), dst, REC_STORE_DEPTH)
+  return bt >= 0 && dst >= 0 && fieldStorageEq(nonNullTy(bt), dst)
 }
 
 // Whether call `u`, a join leaf, is built at a record storing as `dst`, not at its own type: its
@@ -4360,12 +4349,10 @@ export function recArmLandsAt(u: i32, dst: i32): boolean {
     return false
   }
   const c = nodeCtxTyIxOf(u)
-  if c >= 0 && fieldStorageEq(c, dst, REC_STORE_DEPTH) { return true }
+  if c >= 0 && fieldStorageEq(c, dst) { return true }
   const pl = recAsgPlaceOf(u)
   const bt = if pl >= 0 { recBuiltReadTy(pl) } else { -1 }
-  if bt >= 0 && fieldStorageEq(nonNullTy(bt), dst, REC_STORE_DEPTH) {
-    return true
-  }
+  if bt >= 0 && fieldStorageEq(nonNullTy(bt), dst) { return true }
   if recCallKeptAt(recAsgBindInit(u), dst) { return true }
   cwIxBuild()
   let x = u
@@ -4393,10 +4380,7 @@ function recCallKeptAt(v: i32, dst: i32): boolean {
   let k = 0
   while k < recKeptDecl.length {
     const kd = recKeptDecl[k]
-    if (
-      (kd == fd || kd == to)
-      && fieldStorageEq(recKeptDst[k], dst, REC_STORE_DEPTH)
-    ) {
+    if ((kd == fd || kd == to) && fieldStorageEq(recKeptDst[k], dst)) {
       return true
     }
     k = k + 1
@@ -4559,7 +4543,7 @@ export function recOwnPinSkip(u: i32): boolean {
   if x < 0 || !recOwnIsPin(x) { return false }
   if nodeAt(u) is Call { return true }
   const pt = recReachPinTy(u)
-  return pt < 0 || !fieldStorageEq(pt, nodeTyIxOf(u), REC_STORE_DEPTH)
+  return pt < 0 || !fieldStorageEq(pt, nodeTyIxOf(u))
 }
 
 // The type mismatch of a store `u` of the binding `d`, built as `dst`, into a container pinned at
@@ -4705,9 +4689,8 @@ function recHeldLetWritesAt(
         const vt = nodeTyIxOf(v)
         // A read its container builds at `rep` is already stored there.
         const vb = recBuiltReadTy(v)
-        const held = vb >= 0
-          && fieldStorageEq(nonNullTy(vb), rep, REC_STORE_DEPTH)
-        if vt >= 0 && !held && !fieldStorageEq(vt, rep, REC_STORE_DEPTH) {
+        const held = vb >= 0 && fieldStorageEq(nonNullTy(vb), rep)
+        if vt >= 0 && !held && !fieldStorageEq(vt, rep) {
           recAdRaising = true
           tErr(
             recKeptWhat(d)
@@ -5181,7 +5164,7 @@ export function recBuiltCallbackRefuse(md: i32) {
       && cwIxUpKind[m] == CW_UP_CALLEE
       && ot is TyArray
       && !tyElemOpen(ot)
-      && !fieldStorageEq(tyElemOf(ot), bt, REC_STORE_DEPTH)
+      && !fieldStorageEq(tyElemOf(ot), bt)
       && !recCbTakesBuild(cwIxUp[m], mn.memProp == "map")
     ) {
       recBuiltReadErr(u, own, tyElemOf(ot), bt, true)
@@ -5950,9 +5933,7 @@ export function recListElemRecCopies(oe: i32, de: i32): boolean {
   }
   if !(tyAt(de) is TyObj) { return false }
   const o = tyAt(oe)
-  if o is TyObj {
-    return !fieldStorageEq(oe, de, REC_STORE_DEPTH) && recCopyBoxesOnly(oe, de)
-  }
+  if o is TyObj { return !fieldStorageEq(oe, de) && recCopyBoxesOnly(oe, de) }
   if o is TyUnion {
     if o.uMembers.length == 0 { return false }
     for m in o.uMembers {
@@ -5997,7 +5978,7 @@ function recListElemCopies(se: i32, de: i32, depth: i32): boolean {
   if s is TyPrim && d is TyUnion { return recUnionHasMember(de, se) }
   // A reference is held by its `| null` as it is stored, a record copied into one (D16392).
   if !(s is TyPrim) && d is TyNullable {
-    if fieldStorageEq(se, d.nInner, REC_STORE_DEPTH) { return true }
+    if fieldStorageEq(se, d.nInner) { return true }
     return s is TyObj && recCopyBoxesAt(se, d.nInner, depth - 1)
   }
   if s is TyObj { return recCopyBoxesAt(se, de, depth - 1) }
@@ -6010,7 +5991,7 @@ function recListElemCopies(se: i32, de: i32, depth: i32): boolean {
     return true
   }
   if s is TyArray && d is TyArray {
-    return fieldStorageEq(tyElemOf(s), tyElemOf(d), REC_STORE_DEPTH)
+    return fieldStorageEq(tyElemOf(s), tyElemOf(d))
       || recListElemCopies(tyElemOf(s), tyElemOf(d), depth - 1)
   }
   return recListElemNoCopy(se, de)
@@ -6065,7 +6046,7 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
     // A reference is held by its `| null` as it is stored (D16392).
     const wraps = !(sp is TyPrim)
       && dn is TyNullable
-      && fieldStorageEq(sf, dn.nInner, REC_STORE_DEPTH)
+      && fieldStorageEq(sf, dn.nInner)
     // A number is converted exactly into a wider one.
     const widens = sp is TyPrim && recNumWidens(sf, df)
     // A nested record is copied by the level below, under the same rule, into a record or a
@@ -6088,7 +6069,7 @@ function recCopyBoxesAt(src: i32, dst: i32, depth: i32): boolean {
         || lists
         || nests
         || members
-        || fieldStorageEq(sf, df, REC_STORE_DEPTH))
+        || fieldStorageEq(sf, df))
     ) {
       return false
     }
@@ -6125,7 +6106,7 @@ export function recUnionRecMember(s: i32, u: i32, depth: i32): i32 {
   }
   if named.length <= 1 { return if named.length == 1 { named[0] } else { -1 } }
   for m in named {
-    if fieldStorageEq(s, m, REC_STORE_DEPTH) { return m }
+    if fieldStorageEq(s, m) { return m }
   }
   let found = -1
   for m in named {
@@ -6184,7 +6165,7 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
   ) {
     return false
   }
-  if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return false }
+  if fieldStorageEq(own, dst) { return false }
   const leaves: i32[] = []
   if recIsJoin(o) { tailValueLeaves(o, leaves) } else { leaves.push(o) }
   if leaves.length == 0 { return false }
@@ -6253,9 +6234,7 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
     return true
   }
   if !(oa is TyObj) || !(da is TyObj) { return false }
-  if fieldStorageEq(own, dst, REC_STORE_DEPTH) || !recCopyBoxesOnly(own, dst) {
-    return false
-  }
+  if fieldStorageEq(own, dst) || !recCopyBoxesOnly(own, dst) { return false }
   // A copy only the `null` arm admits is taken where some call lands off `dst`'s storage; calls
   // that all land there share one build, which keeps their identity.
   if (
@@ -6280,11 +6259,7 @@ function recElemBesideOwn(c: i32, own: i32): boolean {
   for e in ln.arrElems {
     const pe = parenPeelIx(e)
     const pn = if pe >= 0 && pe < P.nodes.length { nodeAt(pe) } else { null }
-    if (
-      pe != c
-      && pn is ObjLit
-      && fieldStorageEq(recLitBuiltTy(pe), own, REC_STORE_DEPTH)
-    ) {
+    if (pe != c && pn is ObjLit && fieldStorageEq(recLitBuiltTy(pe), own)) {
       return true
     }
     const sv = if pn is Spread { cwPeelValue(pn.spdArg) } else { -1 }
@@ -6292,14 +6267,14 @@ function recElemBesideOwn(c: i32, own: i32): boolean {
     const iv = if d >= 0 { parenPeelIx(letInitAt(d)) } else { -1 }
     if iv >= 0 && nodeAt(iv) is ArrayLit {
       const et = tyArrayElemIx(recLitBuiltTy(iv))
-      if et >= 0 && fieldStorageEq(et, own, REC_STORE_DEPTH) { return true }
+      if et >= 0 && fieldStorageEq(et, own) { return true }
     }
     // A binding annotated as a list stores its elements at the annotation's element.
     const bd = if sv >= 0 && d < 0 && nodeAt(sv) is Ident { recBindDeclOf(sv) } else { -1 }
     const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { null }
     if bn is LetDecl && bn.letType >= 0 {
       const at = tyArrayElemIx(nonNulTyOf(nodeTyIxOf(bn.letType)))
-      if at >= 0 && fieldStorageEq(at, own, REC_STORE_DEPTH) { return true }
+      if at >= 0 && fieldStorageEq(at, own) { return true }
     }
   }
   return false
@@ -6326,7 +6301,7 @@ function recRetBesideOwnLit(c: i32, own: i32): boolean {
       l >= 0
       && l != c
       && nodeAt(l) is ObjLit
-      && fieldStorageEq(recLitBuiltTy(l), own, REC_STORE_DEPTH)
+      && fieldStorageEq(recLitBuiltTy(l), own)
     ) {
       return true
     }
@@ -6357,7 +6332,7 @@ function recJoinBesideOwnLit(c: i32, own: i32): boolean {
           l >= 0
           && l != c
           && nodeAt(l) is ObjLit
-          && fieldStorageEq(recLitBuiltTy(l), own, REC_STORE_DEPTH)
+          && fieldStorageEq(recLitBuiltTy(l), own)
         ) {
           return true
         }
@@ -6410,7 +6385,7 @@ function recSitesLandOff(sites: i32[], own: i32, dst: i32): boolean {
           own,
           REC_STORE_DEPTH,
         )
-        if t >= 0 && !fieldStorageEq(t, dst, REC_STORE_DEPTH) { return true }
+        if t >= 0 && !fieldStorageEq(t, dst) { return true }
       }
       i = i + 1
     }
@@ -8721,7 +8696,7 @@ function recCopyConvertsAt(src: i32, dst: i32, depth: i32): boolean {
     if sc != "" && dc != "" && sc != dc {
       if nonNulTyOf(sf) != sf || nonNulTyOf(df) != df { return false }
       converts = true
-    } else if !fieldStorageEq(sf, df, REC_STORE_DEPTH) {
+    } else if !fieldStorageEq(sf, df) {
       if (
         !recCopyNestable(sf, df)
         || !recCopyConvertsAt(sf, nonNulTyOf(df), depth - 1)
@@ -8930,11 +8905,7 @@ export function adoptJoinArmAt(x: i32, dstTy: i32) {
   for lf in leaves {
     const p = cwPeelValue(lf)
     const own = if p >= 0 && p < P.nodes.length && nodeAt(p) is Call { nodeTyIxOf(p) } else { -1 }
-    if (
-      own >= 0
-      && fieldStorageEq(own, dstTy, REC_STORE_DEPTH)
-      && !i32ListHas(recOwnSrc, p)
-    ) {
+    if (own >= 0 && fieldStorageEq(own, dstTy) && !i32ListHas(recOwnSrc, p)) {
       recOwnPend(p, own)
     }
   }
