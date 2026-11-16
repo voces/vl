@@ -3435,6 +3435,17 @@ function stepsFrom(path: string[], k: i32): string[] {
   return out
 }
 
+// Whether the walk `seen`, pairs of node and path length, visited `v` with a path no longer than
+// `len`: a return to it that is not nearer its records is a cycle.
+function holeRecRevisits(v: i32, len: i32, seen: i32[]): boolean {
+  let i = 0
+  while i + 1 < seen.length {
+    if seen[i] == v && seen[i + 1] <= len { return true }
+    i = i + 2
+  }
+  return false
+}
+
 // Add to `s` the sources of the records the value `x` holds at `path`, under a binding that
 // fixes a literal's type when `held`; false when one is not a literal, a fresh binding, an
 // annotated one or a declared function's result.
@@ -3443,33 +3454,45 @@ function holeRecSrcsOf(
   path: string[],
   held: boolean,
   s: HoleRecSrcs,
-  depth: i32,
+  seen: i32[],
 ): boolean {
-  if depth > 16 { return false }
   const v = cwPeel(x)
-  if v < 0 || v >= P.nodes.length { return false }
+  if v < 0 || v >= P.nodes.length || holeRecRevisits(v, path.length, seen) {
+    return false
+  }
+  const sn: i32[] = []
+  for k in seen { sn.push(k) }
+  sn.push(v)
+  sn.push(path.length)
   const n = nodeAt(v)
   if n is ObjLit || n is ArrayLit {
     if !held {
       s.lits.push(v)
       s.lPaths.push(path)
     }
-    return holeRecLitSrcs(v, path, s, depth)
+    return holeRecLitSrcs(v, path, s, sn)
   }
   if n is Call && cwGetRecv(v) < 0 {
     if holeCallTailIsJoin(n) { return false }
     const rets: i32[] = []
     if !holeSlotCallRets(n, rets) || rets.length == 0 { return false }
     for r in rets {
-      if !holeRecSrcsOf(r, path, false, s, depth + 1) { return false }
+      if !holeRecSrcsOf(r, path, false, s, sn) { return false }
     }
     return true
   }
   const full: string[] = []
   const root = cwSlotPath(v, full)
+  // A field read rooted at no binding, such as one of a call's result, is a step into the records
+  // its object holds (D16826).
+  if root < 0 && n is Member {
+    const at: string[] = [n.memProp]
+    for st in path { at.push(st) }
+    return holeRecSrcsOf(n.memObj, at, held, s, sn)
+  }
   if root < 0 { return false }
   for st in path { full.push(st) }
-  return holeRecBindSrcs(root, full, s, depth)
+  return holeRecBindSrcs(root, full, s, sn)
 }
 
 // Whether the function call `c` runs ends its body in a value `if` or `match`, as its tail or
@@ -3490,7 +3513,7 @@ function holeRecLitSrcs(
   v: i32,
   path: string[],
   s: HoleRecSrcs,
-  depth: i32,
+  seen: i32[],
 ): boolean {
   const n = nodeAt(v)
   if path.length == 0 {
@@ -3503,7 +3526,7 @@ function holeRecLitSrcs(
     if !(n is ArrayLit) { return false }
     for el in n.arrElems {
       if nodeAt(cwPeel(el)) is Spread { return false }
-      if !holeRecSrcsOf(el, rest, true, s, depth + 1) { return false }
+      if !holeRecSrcsOf(el, rest, true, s, seen) { return false }
     }
     return true
   }
@@ -3511,7 +3534,7 @@ function holeRecLitSrcs(
   for f in n.objFields {
     const fi = nodeAt(f)
     if fi is FieldInit && fi.fiName == path[0] {
-      return holeRecSrcsOf(fi.fiValue, rest, true, s, depth + 1)
+      return holeRecSrcsOf(fi.fiValue, rest, true, s, seen)
     }
   }
   return false
@@ -3524,7 +3547,7 @@ function holeRecBindSrcs(
   root: i32,
   full: string[],
   s: HoleRecSrcs,
-  depth: i32,
+  seen: i32[],
 ): boolean {
   const rn = nodeAt(root)
   if !(rn is Ident) { return false }
@@ -3533,7 +3556,7 @@ function holeRecBindSrcs(
   if cwKeyOfRoot(root) < 0 { return false }
   if d < 0 {
     const init = recHeldLit(root)
-    if init >= 0 { return holeRecSrcsOf(init, full, false, s, depth + 1) }
+    if init >= 0 { return holeRecSrcsOf(init, full, false, s, seen) }
     const bd = cwSoleBinderAt(root)
     if bd < 0 || bd >= P.nodes.length { return false }
     const bn = nodeAt(bd)
@@ -3547,7 +3570,7 @@ function holeRecBindSrcs(
   s.decls.push(d)
   s.dPaths.push(full)
   if full.length == 0 {
-    return holeRecLitSrcs(cwPeel(recHeldLit(root)), full, s, depth)
+    return holeRecLitSrcs(cwPeel(recHeldLit(root)), full, s, seen)
   }
   let l = 1
   while l <= full.length {
@@ -3576,9 +3599,7 @@ function holeRecBindSrcs(
         return false
       }
       if named || l == full.length {
-        if !holeRecSrcsOf(w, stepsFrom(full, l), true, s, depth + 1) {
-          return false
-        }
+        if !holeRecSrcsOf(w, stepsFrom(full, l), true, s, seen) { return false }
       }
     }
     l = l + 1
@@ -3702,7 +3723,7 @@ function holeFieldCallAdopt(recv: i32, field: string, inst: i32, at: i32) {
     lPaths: [],
     recs: [],
   }
-  if !holeRecSrcsOf(recv, [], false, s, 0) { return 0 }
+  if !holeRecSrcsOf(recv, [], false, s, []) { return 0 }
   // Records whose functions there return different types at `inst` keep the field's set (D15801).
   if holeRecsFieldRetsDiffer(s.recs, field, inst) { return 0 }
   const grp = recAdSetGroup()
@@ -3850,7 +3871,7 @@ function judgeHoleFieldCalls(
     lPaths: [],
     recs: [],
   }
-  if !holeRecSrcsOf(a, path, false, s, 0) || s.recs.length == 0 { return 0 }
+  if !holeRecSrcsOf(a, path, false, s, []) || s.recs.length == 0 { return 0 }
   const fTys: i32[] = []
   for t in ro.objFieldTypes { fTys.push(t) }
   const set: boolean[] = []
