@@ -12487,3 +12487,43 @@ call the walk missed). It is named in the PR with its mechanism and pinned by a 
 
 **Why.** Byte identity with the walk is a means, not the goal; matching a known-imprecise answer would
 move the slot store backwards.
+
+## An un-annotated function argument does not bind a type parameter (2026-11-16, chosen under the owner's delegation) — D16412, D16562
+
+**The rule.** In `sel<A>(f: (x: A) => A)` called as `sel(hinc)` with an un-annotated `hinc`, nothing at the
+call binds `A`, so D16562's default (`i32`) applies there, whether or not the call's result is called
+later. `sel(hinc)(1)` runs; `sel(hinc)(2.5)` is a check refusal naming the fix (`write sel<f64>(…)`). The
+checker records the defaulted binding at the call and mono reads that record.
+
+**Why.** It is D16562 applied uniformly (`compose(gid, …)` already behaves this way), and letting a later
+call of the result decide a generic's type would make the generic's typing depend on its caller's
+later use. It accepts nothing new and refuses only programs emit already refused. Binding `A` through
+the result remains possible later as a capability extension.
+
+## A union arm keeps its own heap identity (2026-11-16, chosen under the owner's delegation) — REP stage 4b
+
+**The rule.** A union arm's ref row is never fused with a same-shape plain record row: it is a third named
+kept class, "discriminating arm row", beside function-field rows and hole or generic-instance rows.
+Struct rows are keyed by `repHeapId` plus layout (today's twin key, made an O(1) cache), not by
+`tyRepId`, which would fuse rows that store different function-set groups or instances.
+
+**Why.** A union discriminates its arms by struct identity (`ref.test` on the arm's type); fusing an arm
+with a plain record of the same shape would let a plain value test as that arm. That is soundness, not
+layout.
+
+## Temporary seams and staged deletions in the IR and storage work (2026-11-16, chosen under the owner's delegation) — IR I8, L2 S3.4d
+
+**The rule.**
+- The IR's I8 "value hole" (legacy's union box ladder writes the value the IR supplies at one marked
+  node) is accepted as a temporary seam: one helper sets and clears it, an open hole at a function
+  boundary fails, and it is deleted when legacy body lowering retires. Every ladder predicate it runs
+  must be context-free; a predicate found reading context is fixed at its source, not special-cased.
+- I8b (box delivery) lands with the boxed nullable rep (N1) as one step, since the op has nothing to
+  deliver into without the rep; the atom discipline (N2) follows it.
+- S3.4d's late branch, when narrowed rather than deleted, names a fifth exclusion: a set without
+  complete check facts.
+- A late-demands rise is accepted only when it is an existing mechanism showing up in a new fixture,
+  named in the PR with the row that owns removing it.
+
+**Why.** Each keeps one decider per fact at every commit while letting the migration land in measured
+steps.
