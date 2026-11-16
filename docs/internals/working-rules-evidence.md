@@ -731,6 +731,12 @@ red, so an instrument that stopped measuring cannot pass quietly.
 `scripts/self-compile-time.sh` trips past 1.5× a committed guest-FUEL baseline for the L2
 build; as CPU seconds at 4× it flaked on docs-only PRs at load 40–50. Details and when each fires: `docs/internals/profiling-the-compiler.md` §Guards.
 
+**A cost trap can sit in one spelling of the compiler's own source.** On 2026-11-16 I8b part 1 cost
++8.5% L2 fuel from two lines: a closure parameter on a function with an annotated return, which
+makes `monoHasConcreteHOFParam` run callback specialization over the whole self-compile, and a
+module `let` of the IR's `Opnd` union (D16863). Compiling both trees with one fixed compiler
+separates a source cost from a compiler cost, and flat `vl check` fuel places it after the checker.
+
 <a id="comments"></a>
 
 ## Comments state the contract; measurements live in the inventory

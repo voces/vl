@@ -3649,10 +3649,28 @@ export function repScanLim(): i32 {
   return n
 }
 
-// Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct
-// slot for slot `i`'s WasmGC heap type — the smallest earlier slot with the same
-// heap key (`slotHeapId`) and field-code layout, or `i` itself when first of its structure.
-// Keys are computed once up front, then matched pairwise; called from `mAssignTypeIndices` before `sHeapIdx` allocation.
+// Chains rows `0..keys.length` by equal key in ascending order: `next[r]` is the following row
+// with `keys[r]`, or -1, and `first` maps a key to its lowest row. A negative key is left out.
+export function twinChain(keys: i32[], first: {[i32]: i32}, next: i32[]) {
+  const last: {[i32]: i32} = Map()
+  let r = 0
+  while r < keys.length {
+    next.push(-1)
+    const k = keys[r]
+    if k >= 0 {
+      const p = last[k] ?? (-1)
+      if p < 0 { first[k] = r } else { next[p] = r }
+      last[k] = r
+    }
+    r = r + 1
+  }
+  return 0
+}
+
+// Populate `sTwin` (parallel to `sNames`): `sTwin[i]` is the representative struct slot for slot
+// `i`'s WasmGC heap type, the smallest earlier slot with the same heap key (`slotHeapId`) and
+// field-code layout (`structFieldCodesEq`), or `i` itself. Each row is compared only with the
+// earlier rows sharing its key, in ascending order, so the first hit is the smallest twin.
 export function buildStructTwins() {
   const keys: i32[] = []
   let i = 0
@@ -3660,23 +3678,58 @@ export function buildStructTwins() {
     keys.push(if sIsRefRow(i) { -1 } else { slotHeapId(i) })
     i = i + 1
   }
+  const first: {[i32]: i32} = Map()
+  const next: i32[] = []
+  twinChain(keys, first, next)
   sTwin = []
   i = 0
   while i < sNames.length {
     let rep = i
     if keys[i] >= 0 {
-      let j = 0
-      while j < i {
-        if keys[j] == keys[i] && structFieldCodesEq(j, i) == 1 {
+      let j = first[keys[i]] ?? (-1)
+      while j >= 0 && j < i {
+        if structFieldCodesEq(j, i) == 1 {
           rep = j
           j = i // stop at the first (smallest) twin
+        } else {
+          structHeapKeyDeclined(j, i)
+          j = next[j]
         }
-        j = j + 1
       }
     }
     sTwin.push(rep)
     i = i + 1
   }
+}
+
+// Under the rep shadow, fails on struct rows `a` and `b` that share a heap key but store
+// different layouts outside the kept classes: a function field's storage, or a hole or generic
+// instance. Such a pair would be one rep-keyed heap type of two layouts.
+function structHeapKeyDeclined(a: i32, b: i32) {
+  if !repShadowOn { return 0 }
+  if repRowsFnFieldDiffer(a, b) { return 0 }
+  const ta = if a >= 0 && a < sTyIx.length { sTyIx[a] } else { -1 }
+  const tb = if b >= 0 && b < sTyIx.length { sTyIx[b] } else { -1 }
+  if repRowAtTyVar(ta) || repRowAtTyVar(tb) { return 0 }
+  if repRowHoldsFn(ta) || repRowHoldsFn(tb) { return 0 }
+  return emitFail(
+    "emitProgram: two struct rows of one heap key store different layouts outside the kept classes",
+  )
+}
+
+// Whether struct rows `a` and `b` differ at a field one of them stores as a closure.
+export function repRowsFnFieldDiffer(a: i32, b: i32): boolean {
+  if sFieldCount[a] != sFieldCount[b] { return false }
+  let fi = 0
+  while fi < sFieldCount[a] {
+    const ca = sFieldTypes[sFieldStart[a] + fi]
+    const cb = sFieldTypes[sFieldStart[b] + fi]
+    const fa = ca == FC_CLOSURE || ca == FC_NUL_CLOSURE
+    const fb = cb == FC_CLOSURE || cb == FC_NUL_CLOSURE
+    if ca != cb && (fa || fb) { return true }
+    fi = fi + 1
+  }
+  return false
 }
 
 // `buildStructTwins`' answer for one row `i` minted after it ran: the smallest earlier row with

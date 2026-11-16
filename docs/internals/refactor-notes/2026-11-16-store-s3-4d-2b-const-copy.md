@@ -10,7 +10,7 @@ but resolved to other sets. Sampled cause: the hole callee is a `const` copy of 
 (`const hh = h; hh(1.5, 1.5)`), and the facts read a parameter's sets only through a `Param`
 declaration.
 
-`arrowParamDeclOf` now follows a `const`'s initialiser, up to 8 copies deep, to the parameter it
+`arrowParamDeclOf` now follows a `const`'s initialiser, copy by copy, to the parameter it
 reads. Both the sets a hole call goes through and the parameter-takes table use it.
 
 ## Measurement
