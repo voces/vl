@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D16899 closed:** a list of lambdas handed to a generic's `(() => T | string)[]` parameter (`many([() => 5])`) no longer traps with `indirect call type mismatch` when called through the list: each lambda is delivered at the bound union-result type, as a single function argument was. A list bound before the call is refused at check, as the non-generic spelling is.
