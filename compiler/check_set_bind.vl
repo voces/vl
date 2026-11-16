@@ -1,0 +1,306 @@
+// `check_set_bind.vl` — which function sets reach each un-annotated parameter, per call, at check
+// time: a call's instantiation of the parameter's `BK_ARROW` bounds, storage-free
+// (`refactor-notes/2026-11-16-store-set-bind-shadow.md`). Built from the check's hand rows
+// (`fnParamHandNote`), closed over parameters handed on to another un-annotated callee. A shadow:
+// `setBindDiffLine` compares it with the elaboration's per-instance notes; no decision reads it.
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  P,
+  Param,
+  Paren,
+  i32ToStr,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import {
+  fnParamHandArgsOf,
+  fnParamHandFromsOf,
+  fnParamHandSets,
+} from "./check_elab_cap"
+import {
+  mintFactCallOf,
+  mintFactRows,
+  mintFactSetOf,
+  mintRetParamsOf,
+} from "./check_mint"
+import { collectRetValues } from "./check_nj_join"
+import { parenPeelIx } from "./check_places"
+import { cwIxBuild, cwIxParent } from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+import { declOrigOf, identDeclOf, nodeSrc } from "./symbols"
+
+// One row per (call, callee, parameter position) a set reaches: the call node, the callee
+// declaration, the position, the set ids, and the caller's parameter the argument reads (-1 when
+// the argument carries its set itself).
+let sbCall: i32[] = []
+let sbFn: i32[] = []
+let sbParam: i32[] = []
+let sbSets: i32[][] = []
+let sbFromFn: i32[] = []
+let sbFromParam: i32[] = []
+// Every declaration, in arena order, as the last build found them.
+let sbDecls: i32[] = []
+// By `decl|position`: the union of the sets every row for it carries.
+let sbSetsOf: {[string]: i32[]} = Map()
+
+// One row per declaration handing back its parameter: every value it returns reads it.
+let hbFn: i32[] = []
+let hbParam: i32[] = []
+
+function sbKey(d: i32, i: i32): string {
+  return i32ToStr(d) + "|" + i32ToStr(i)
+}
+
+// The sets reaching parameter `i` of declaration `d` across every call, [] for none.
+export function setBindSetsOf(d: i32, i: i32): i32[] {
+  return sbSetsOf[sbKey(d, i)] ?? []
+}
+
+// The call node argument `a` is handed at, -1 when its parent is no call.
+function sbCallOf(a: i32): i32 {
+  let p = if a >= 0 && a < cwIxParent.length { cwIxParent[a] } else { -1 }
+  while p >= 0 && p < P.nodes.length && !(nodeAt(p) is Call) {
+    const pn = nodeAt(p)
+    if !(pn is Paren) { return -1 }
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  return p
+}
+
+// The position of the parameter of `d` that argument `a` reads, -1 when it reads none.
+function sbParamIndexIn(d: i32, a: i32): i32 {
+  if d < 0 || d >= P.nodes.length || a < 0 || a >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || !(nodeAt(a) is Ident) { return -1 }
+  const r = identDeclOf(a)
+  let i = 0
+  while i < dn.fnParams.length {
+    if dn.fnParams[i] == r { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+// Adds the sets of `from` to `into`; true when it gained one.
+function sbUnion(into: i32[], from: i32[]): boolean {
+  let grew = false
+  for s in from {
+    if !i32ListHas(into, s) {
+      into.push(s)
+      grew = true
+    }
+  }
+  return grew
+}
+
+// Builds the rows from the tables the last check left.
+export function setBindBuild() {
+  sbCall = []
+  sbFn = []
+  sbParam = []
+  sbSets = []
+  sbFromFn = []
+  sbFromParam = []
+  sbDecls = []
+  sbSetsOf = Map()
+  hbFn = []
+  hbParam = []
+  cwIxBuild()
+  // Direct rows, and each forwarded row with the caller's parameter it reads.
+  let d = 0
+  while d < P.nodes.length {
+    const dn = nodeAt(d)
+    if dn is FuncDecl {
+      sbDecls.push(d)
+      let i = 0
+      while i < dn.fnParams.length {
+        const hs = fnParamHandSets(d, i)
+        const froms = fnParamHandFromsOf(d, i)
+        const args = fnParamHandArgsOf(d, i)
+        let k = 0
+        while k < hs.length {
+          const a = if k < args.length { args[k] } else { -1 }
+          const fr = if k < froms.length { froms[k] } else { -1 }
+          const q = if hs[k] < 0 { sbParamIndexIn(fr, a) } else { -1 }
+          const c = sbCallOf(a)
+          if hs[k] >= 0 || q >= 0 {
+            sbCall.push(c)
+            sbFn.push(d)
+            sbParam.push(i)
+            sbSets.push(if hs[k] >= 0 { [hs[k]] } else { [] })
+            sbFromFn.push(if q >= 0 { fr } else { -1 })
+            sbFromParam.push(q)
+          }
+          k = k + 1
+        }
+        i = i + 1
+      }
+    }
+    d = d + 1
+  }
+  // Closes the forwarded rows: each takes what reaches the parameter it reads, to a fixpoint.
+  let grew = true
+  let rounds = 0
+  while grew && rounds <= sbCall.length {
+    grew = false
+    rounds = rounds + 1
+    let r = 0
+    while r < sbCall.length {
+      const from = if sbFromParam[r] >= 0 { sbSetsOf[sbKey(sbFromFn[r], sbFromParam[r])] ?? [] } else { [] }
+      if sbUnion(sbSets[r], from) { grew = true }
+      const key = sbKey(sbFn[r], sbParam[r])
+      const have = sbSetsOf[key] ?? []
+      if sbUnion(have, sbSets[r]) { grew = true }
+      sbSetsOf[key] = have
+      r = r + 1
+    }
+  }
+  setBindHandBacks()
+  return 0
+}
+
+// Notes each declaration whose every returned value reads one parameter a set reaches.
+function setBindHandBacks() {
+  for d in sbDecls {
+    const dn = nodeAt(d)
+    if dn is FuncDecl && dn.fnBody >= 0 {
+      const vs: i32[] = []
+      collectRetValues(dn.fnBody, vs)
+      let at = -1
+      for v in vs {
+        const q = sbParamIndexIn(d, parenPeelIx(v))
+        if q < 0 || at >= 0 && q != at { at = -2 }
+        else if at != -2 { at = q }
+      }
+      if vs.length > 0 && at >= 0 && setBindSetsOf(d, at).length > 0 {
+        hbFn.push(d)
+        hbParam.push(at)
+      }
+    }
+  }
+  return 0
+}
+
+// Each call through a parameter of `d` in its body, as `[call, set, ...]` over the sets reaching
+// that parameter.
+function setBindCallsIn(d: i32, out: string[]) {
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return 0 }
+  const xs: i32[] = [dn.fnBody]
+  while xs.length > 0 {
+    const x = xs.pop()
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Call {
+        const q = sbParamIndexIn(d, parenPeelIx(n.callFn))
+        if q >= 0 {
+          for s in setBindSetsOf(d, q) {
+            if s >= 0 { out.push("P" + sbKey(d, q) + "|" + i32ToStr(s)) }
+          }
+        }
+      }
+      for c in nodeChildren(x) { xs.push(c) }
+    }
+  }
+  return 0
+}
+
+// One line comparing these rows with the elaboration's notes: calls through a set
+// (`mintFactNote`) and hand-backs (`mintRetNote`), each as both / only here / only there.
+// "" when neither side has a row.
+export function setBindDiffLine(): string {
+  setBindBuild()
+  const mine: string[] = []
+  for d in sbDecls { setBindCallsIn(d, mine) }
+  const theirs: string[] = []
+  for r in mintFactRows() { theirs.push(sbFactKey(r)) }
+  const mineHb: string[] = []
+  let h = 0
+  while h < hbFn.length {
+    mineHb.push(sbKey(hbFn[h], hbParam[h]))
+    h = h + 1
+  }
+  const theirsHb: string[] = []
+  for d in sbDecls {
+    for i in mintRetParamsOf(d) { theirsHb.push(sbKey(d, i)) }
+  }
+  if mine.length + theirs.length + mineHb.length + theirsHb.length == 0 {
+    return ""
+  }
+  return "setbind calls "
+    + sbCmp(mine, theirs)
+    + " handback "
+    + sbCmp(mineHb, theirsHb)
+    + " rows "
+    + i32ToStr(sbCall.length)
+}
+
+// `both/onlyMine/onlyTheirs` over two lists of keys, each counted once.
+function sbCmp(mine: string[], theirs: string[]): string {
+  const inTheirs: {[string]: boolean} = Map()
+  for k in theirs { inTheirs[k] = true }
+  const seen: {[string]: boolean} = Map()
+  let both = 0
+  let onlyMine = 0
+  for k in mine {
+    if !(seen[k] ?? false) {
+      seen[k] = true
+      if inTheirs[k] ?? false {
+        both = both + 1
+      } else {
+        onlyMine = onlyMine + 1
+      }
+    }
+  }
+  let onlyTheirs = 0
+  for k in theirs {
+    if !(seen[k] ?? false) {
+      seen[k] = true
+      onlyTheirs = onlyTheirs + 1
+    }
+  }
+  return i32ToStr(both) + "/" + i32ToStr(onlyMine) + "/" + i32ToStr(onlyTheirs)
+}
+
+// The checked node minted node `x` copies, through every copy, else `x`.
+function sbSrcOf(x: i32): i32 {
+  let y = x
+  let n = 0
+  while n < 64 {
+    const s = nodeSrc[y] ?? -1
+    if s < 0 || s == y { return y }
+    y = s
+    n = n + 1
+  }
+  return y
+}
+
+// The declaration minted declaration `d` copies, else `d`.
+function sbOrigDecl(d: i32): i32 {
+  const s = sbSrcOf(d)
+  if s != d { return s }
+  const o = declOrigOf(d)
+  return if o >= 0 { sbSrcOf(o) } else { d }
+}
+
+// Fact row `r` at the grain of these rows: `P<decl>|<position>|<set>` for a call through a
+// parameter, else `C<call>|<set>`.
+function sbFactKey(r: i32): string {
+  const c = sbSrcOf(mintFactCallOf(r))
+  const set = i32ToStr(mintFactSetOf(r))
+  if c >= 0 && c < P.nodes.length {
+    const n = nodeAt(c)
+    if n is Call {
+      const f = parenPeelIx(n.callFn)
+      const pd = if f >= 0 && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
+      if pd >= 0 && pd < P.nodes.length && nodeAt(pd) is Param {
+        const owner = if pd < cwIxParent.length { cwIxParent[pd] } else { -1 }
+        const q = sbParamIndexIn(owner, f)
+        if q >= 0 { return "P" + sbKey(sbOrigDecl(owner), q) + "|" + set }
+      }
+    }
+  }
+  return "C" + i32ToStr(c) + "|" + set
+}
