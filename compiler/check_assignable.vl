@@ -508,6 +508,7 @@ import {
   tyToStr,
   tyWideUnionMinted,
 } from "./check_types"
+import { tailValueLeaves } from "./check_unconsumed"
 import { mkUnionTy, numUnionConverts, numUnionMinted } from "./check_union_mint"
 import { wideLitByNode } from "./check_wide_lits"
 import { recAdPinInit } from "./check_rec_adopt_rows"
@@ -1855,12 +1856,12 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   }
   // A number union converted to its destination still hands over its literals there (`x ?? 5`).
   if numUnionMinted && numUnionConverts(srcTy, dstTy) {
-    numLitAdoptDeep(srcExpr, dstTy, 6)
+    numLitAdoptDeep(srcExpr, dstTy)
     return true
   }
   if litNumUnionConverts(srcTy, dstTy) {
     numUnionMinted = true
-    numLitAdoptDeep(srcExpr, dstTy, 6)
+    numLitAdoptDeep(srcExpr, dstTy)
     return true
   }
   // Into a nullable number the box stays a box, its members retagged (`recordWidenRetagTails`).
@@ -1883,7 +1884,7 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // A value already of its destination's type holds its literals at that width.
   if srcTy != dstTy {
     if numLitReadopt(srcExpr, srcTy, dstTy) { return true }
-    numLitAdoptDeep(srcExpr, dstTy, 6)
+    numLitAdoptDeep(srcExpr, dstTy)
   }
   // A bare `{}` completes against a record destination; a required field it omits is refused
   // here, in words, instead of as the site's generic mismatch (D2223).
@@ -1903,7 +1904,7 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
       if recordNullHoleObjAdopt(srcExpr, dstTy, 6) == 1 {
         litBoxesAtDst(srcExpr, dstTy, 6)
       }
-      if lwd >= 0 { recordRepTyAdopt(srcExpr, lwd, 6) }
+      if lwd >= 0 { recordRepTyAdopt(srcExpr, lwd) }
     }
   }
   // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
@@ -1933,7 +1934,7 @@ function assignableExprIn(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     const sOk = assignableExpr(srcExpr, srcTy, dstTy)
     const at = if sOk { listArmOfUnionFit(srcExpr, srcTy, dstTy) } else { -1 }
     quietLeave(q)
-    if sOk { recordRepTyAdopt(srcExpr, if at >= 0 { at } else { dstTy }, 6) }
+    if sOk { recordRepTyAdopt(srcExpr, if at >= 0 { at } else { dstTy }) }
   }
   // A generic function named at a closed function type (an argument, a store, a field, a
   // return) is built at that type.
@@ -2111,7 +2112,7 @@ function assignableObjLitFields(
   // Rep sidecar: a field-wise-adopted ObjLit builds the destination struct rep (a boxed
   // union field, an i64/f32 field, an omitted nullable field), so record it on the literal
   // node and the emitter's row resolver keys the shape it builds, not the self-inference.
-  if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+  if ok { recordRepTyAdopt(srcExpr, dstTy) }
   // A field the record does not declare is refused where the literal is written, as at
   // a destination `assignable` accepts by width (#1460). Reported and answered true.
   if (
@@ -2186,7 +2187,7 @@ function assignableObjLitUnion(
             nodeTySet(srcExpr, members[mi])
             // Rep sidecar: the struct literal builds the concrete arm struct's rep — record
             // it, recursing into fields, for the row resolver.
-            recordRepTyAdopt(srcExpr, members[mi], 6)
+            recordRepTyAdopt(srcExpr, members[mi])
           }
           return true
         }
@@ -2256,7 +2257,7 @@ function assignableArrLitElems(
   // Rep sidecar: a literal array adopted element-wise (a struct-element list widened, an
   // i64/f32 element) builds the destination element rep — recurse into the elements so each
   // element ObjLit resolves the shape the emitter builds.
-  if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+  if ok { recordRepTyAdopt(srcExpr, dstTy) }
   return ok
 }
 
@@ -2286,7 +2287,7 @@ function assignableArrLitArm(srcExpr: i32, srcTy: i32, m: i32): boolean {
     nodeTySet(srcExpr, m)
     // Rep sidecar: record the concrete array arm, recursing into elements, so the row
     // resolver keys the arm the checker picked.
-    recordRepTyAdopt(srcExpr, m, 6)
+    recordRepTyAdopt(srcExpr, m)
   }
   return armOk
 }
@@ -2913,7 +2914,7 @@ function holeLitAdopt(org: i32, rat: i32, rexp: i32) {
   if inferQuiet { return 0 }
   assignableExpr(org, rat, rexp)
   nodeTySet(org, rexp)
-  recordRepTyAdopt(org, rexp, 6)
+  recordRepTyAdopt(org, rexp)
   // A string literal already pins at its literal union through the atom channel.
   if !(nodeAt(parenPeelIx(org)) is StrLit) {
     holeLitPinSet(parenPeelIx(org), rexp)
@@ -4352,17 +4353,77 @@ function fvaIsRelay(d: i32): boolean {
   if !fvaIsMaker(d) || fvaRetsNamed(d) { return false }
   const fn = nodeAt(d)
   if !(fn is FuncDecl) { return false }
-  const rets: i32[] = []
-  collectRetValues(fn.fnBody, rets)
-  if rets.length == 0 { return false }
-  for r in rets {
-    const x = parenPeelIx(r)
-    const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  const calls = fvaRelayCalls(d)
+  if calls.length == 0 { return false }
+  for x in calls {
+    const c = nodeAt(x)
     if !(c is Call) || c.callFn < 0 { return false }
     const m = calleeFnOfDecl(identDeclOf(parenPeelIx(c.callFn)))
     if m == d || !fvaIsMaker(m) { return false }
   }
   return true
+}
+
+// The calls whose results function `d` returns whole: a returned call, the initialiser of an
+// un-annotated `const` the body reads only where it returns it, and each arm of a returned `if` or
+// `match`; empty when any returned value is something else.
+function fvaRelayCalls(d: i32): i32[] {
+  const none: i32[] = []
+  const fn = nodeAt(d)
+  if !(fn is FuncDecl) { return none }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  const out: i32[] = []
+  for r in rets {
+    if !fvaRelayValueCalls(fn.fnBody, parenPeelIx(r), out, 0) { return none }
+  }
+  return out
+}
+
+// Adds to `out` the call returned value `x` of body `body` stands for (`fvaRelayCalls`); false
+// for a value that stands for none.
+function fvaRelayValueCalls(
+  body: i32,
+  x: i32,
+  out: i32[],
+  depth: i32,
+): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 4 { return false }
+  const leaves: i32[] = []
+  tailValueLeaves(x, leaves)
+  for l in leaves {
+    const lx = parenPeelIx(l)
+    if lx >= 0 && lx < P.nodes.length && nodeAt(lx) is Call { out.push(lx) }
+    else if !fvaRelayHeldCalls(body, lx, out, depth) { return false }
+  }
+  return leaves.length > 0
+}
+
+// Adds to `out` the calls a name `x` returned from `body` holds: an un-annotated `const` declared
+// in `body` and read only there (`fvaRelayValueCalls`); false for any other value.
+function fvaRelayHeldCalls(body: i32, x: i32, out: i32[], depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+  const dc = identDeclOf(x)
+  const dn = if dc >= 0 && dc < P.nodes.length { nodeAt(dc) } else { null }
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+    || !nodeContains(body, dc)
+    || fvaReadsOf(body, dc) != 1
+  ) {
+    return false
+  }
+  return fvaRelayValueCalls(body, parenPeelIx(dn.letInit), out, depth + 1)
+}
+
+// How many identifiers in the subtree at `ix` read declaration `dc`.
+function fvaReadsOf(ix: i32, dc: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  let c = if nodeAt(ix) is Ident && identDeclOf(ix) == dc { 1 } else { 0 }
+  for kid in nodeSpineChildren(ix) { c = c + fvaReadsOf(kid, dc) }
+  return c
 }
 
 // The callee reads of the maker calls an unreachable relay returns: its body never runs, so they
@@ -4458,12 +4519,9 @@ function fvaRelayRows(sigAt: {[i32]: i32}, rl: FvaRelayScan) {
   const innerOf: {[i32]: i32} = Map()
   const relays: i32[] = []
   for d in rl.memo.keys() {
-    const fn = nodeAt(d)
-    if (rl.memo.get(d) ?? false) && fn is FuncDecl {
+    if rl.memo.get(d) ?? false {
       relays.push(d)
-      const rets: i32[] = []
-      collectRetValues(fn.fnBody, rets)
-      for r in rets { innerOf[parenPeelIx(r)] = d }
+      for c in fvaRelayCalls(d) { innerOf[c] = d }
     }
   }
   fvaDeadReads = Map()
@@ -4661,6 +4719,9 @@ function fvaRetsNamed(m: i32): boolean {
     if x < 0 || x >= P.nodes.length { return false }
     const n = nodeAt(x)
     if !(n is Ident) && !(n is FuncDecl) { return false }
+    // A name holding a call the maker returns whole relays that call (`fvaRelayCalls`).
+    const held: i32[] = []
+    if n is Ident && fvaRelayValueCalls(fn.fnBody, x, held, 0) { return false }
   }
   return rets.length > 0
 }
