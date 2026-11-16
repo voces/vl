@@ -12272,3 +12272,67 @@ export function half() { return origin.x / 2 }   // () => i32, from lib.vl alone
 
 Why: a module then has a meaning on its own, the precondition for separate compilation, a
 query-based LSP and a specifiable inference algorithm (engineering-review-2026-11.md §6, L2).
+
+## Width subtyping reaches nested fields: an existing record is taken at its own type at any depth (owner ruling (b), 2026-11-16) — D3431, extends D4054
+
+**The rule.** An existing record whose nested record carries fields the destination's nested record
+does not name is delivered as D4054 delivers a wider record at the top level: the destination takes
+the record's own type, nested fields included, and no copy is made. The annotation is checked as a
+bound the record must fit; the binding's type is the record's.
+
+```vl
+const sv = { pet: { legs: 4, purr: true } }
+const u: { pet: { legs: i32 } } = sv   // runs: `u` is `sv`, typed { pet: { legs, purr } }
+print(sv.pet.purr)                     // true
+u.pet = { legs: 3 }                    // refused: `u.pet` stores { legs, purr }
+```
+
+**The contract.** D4054's: one storage has one layout. A slot fed two layouts, a join, a re-pointed
+`let`, an existing narrow container, a map value, a global or a closure capture of such a slot is
+refused; a declared parameter is instantiated per concrete record. D2996 still governs a field whose
+STORAGE differs (`i32` into `i32 | null`); this ruling covers only fields a nested record adds.
+
+**Why.** It is D4054's specialise-don't-copy rule one level down, sound for the same reason: every
+name for the record has the record's own type, so no narrow handle can write what the storage
+cannot hold. The cost is predictability: a write through the annotated name must fit the real
+layout, and its refusal says so ("`u` is `sv` itself, whose `pet` also stores `purr`").
+
+**Order.** Build the depth specialisation and wire every position (graded by a position-matrix
+template, annotated and un-annotated faces) before the refusal is lifted (CLAUDE.md, capability gap).
+
+## An annotation fixes an empty list's element type wherever the value goes (owner ruling (a), 2026-11-16) — D16342, D16447, follows D16047
+
+**The rule.** An empty list whose element type an annotation or a write fixed keeps that element
+type through a parameter, a type parameter and a container read, so `is` answers by the element
+type, not by emptiness. A list nothing fixed still fits every `is T[]` (D4910), wherever it goes.
+
+```vl
+const e: i32[] = []
+function take(v) { return v is f64[] }
+print(take(e))        // false: e's element is fixed at i32
+print(take([]))       // true: nothing fixed this list's element
+const m: {[string]: i32[]} = Map()
+m["k"] = e
+const r = m["k"]
+if r != null { print(r is f64[]) }   // false
+```
+
+**Why.** Moving `x is f64[]` into a helper must not change a program's output; the element type is
+a fact of the value, as every other fixed type is. A function reached by both a fixed and an open
+empty list answers per call.
+
+**Interim.** Until inferred interfaces record the per-call binding fact (L2 S3), a function reached
+by both a fixed and an open empty list at one un-annotated parameter is refused loudly, naming the
+two calls; the refusal lifts with L2.
+
+## A radix literal tree under `as%` is its exact value (2026-11-16, chosen under the owner's delegation) — D16494, follows "Exact constant arithmetic" (D3053)
+
+**The rule.** A tree of radix literals folds exactly, as every literal tree does under ruling A, and
+`as% T` then applies to that exact value. At `i64` a value that fits is unchanged, so
+`(0xFFFFFFFF * 2) as% i64` is `8589934590` and `(0xFFFFFFFF + 1) as% i64` is `4294967296`, the
+same as `as i64`. A value that does not fit the target wraps, as `as%` always does.
+
+**Why.** The owner asked for the choice that is consistent and meets what a human or an LLM
+reading the code expects. A literal tree means what the `const` holding it means (ruling A, and
+D3053's negation chains); computing a hex tree at 32 bits first would make the answer depend on
+the operator, which is what the defect showed.
