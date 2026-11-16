@@ -5,7 +5,15 @@
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
 import { BinExpr, Index, Member, WhileStmt, nodeAt } from "./ast"
-import { RListGet, RListLen, RStrOp, Rhs, SBoundsCheck, repPrim } from "./ir"
+import {
+  RListGet,
+  RListLen,
+  RListPush,
+  RStrOp,
+  Rhs,
+  SBoundsCheck,
+  repPrim,
+} from "./ir"
 import { irLFn, irLMiss, irLOpnd, irLSkip } from "./ir_lower"
 import {
   arrLenHoistOf,
@@ -15,8 +23,12 @@ import {
   idxArmOf,
   idxCellReadIsNull,
   listElemStaysNullable,
+  listOpRecvHeld,
   loopHoistClose,
   loopHoistOpen,
+  pushAppendTail,
+  pushPlanOf,
+  pushValueTail,
   rawStrGetTail,
   rawStrHoistOf,
   refListGetTail,
@@ -24,13 +36,16 @@ import {
   scalarListGetTail,
   scalarListHoistOf,
   scalarListUsed,
+  stageListRecvTail,
   strCatTail,
+  strCpLenTail,
   strEqFirstOf,
   strEqLitOf,
   strEqTail,
   strListGetTail,
   strListHoistOf,
   strOrderTail,
+  strSliceTail,
   svDstOfKind,
 } from "./wasmEmit"
 import { scalarListElemKind } from "./emit_value_sites"
@@ -84,6 +99,7 @@ export function irScalarListRep(r: i32): boolean {
 function lowerList(r: Rhs): i32 {
   if r is RListLen { return lowerLen(r) }
   if r is RStrOp { return lowerStr(r) }
+  if r is RListPush { return lowerPush(r, true) }
   if !(r is RListGet) { return irLMiss("list rhs") }
   const nd = nodeAt(r.lgAt)
   if !(nd is Index) { return irLMiss("list read node") }
@@ -116,19 +132,47 @@ function lowerList(r: Rhs): i32 {
   return scalarListGetTail(nd, ek, fnIx, hz)
 }
 
+// `RListPush`: the receiver held in its local or staged as legacy stages it, then the value and
+// legacy's append; `want` leaves the new length.
+function lowerPush(r: RListPush, want: boolean): i32 {
+  const fnIx = irLFn().irAt
+  const pp = pushPlanOf(r.lpAt, fnIx)
+  if pp == null { return irLMiss("push plan") }
+  let lIdx = listOpRecvHeld(pp.ppRecv, fnIx, ".push")
+  if lIdx == -2 { return irLMiss("push receiver") }
+  if lIdx >= 0 {
+    irLSkip(r.lpV)
+  } else {
+    irLOpnd(r.lpV)
+    stageListRecvTail(pp.ppRecv, fnIx, pp.ppSlot.base)
+    lIdx = pp.ppSlot.base + 3
+  }
+  irLOpnd(r.lpX)
+  pushValueTail(pp, fnIx)
+  return pushAppendTail(r.lpAt, pp, lIdx, want)
+}
+
+// A list op in statement position.
+export function irLowerRefEffect(r: Rhs): i32 {
+  if r is RListPush { return lowerPush(r, false) }
+  return irLMiss("effect outside I1")
+}
+
 // `RStrOp`: its operands, then legacy's operator tail. An equality operand is recovered after
 // it is pushed, as legacy recovers a narrowed nullable read.
 function lowerStr(r: RStrOp): i32 {
   const e = nodeAt(r.soAt)
-  if !(e is BinExpr) { return irLMiss("string operator node") }
   const fnIx = irLFn().irAt
   if r.soOp != "eq" {
     for a in r.soArgs { irLOpnd(a) }
   }
   return match r.soOp {
     "concat" => strCatTail(r.soArgs.length)
-    "lt" => strOrderTail(e)
+    "slice" => strSliceTail()
+    "cplen" => strCpLenTail()
+    "lt" => if e is BinExpr { strOrderTail(e) } else { irLMiss("string operator node") }
     "eq" => {
+      if !(e is BinExpr) { return irLMiss("string operator node") }
       const lit = strEqLitOf(r.soAt, fnIx)
       const asts = [strEqFirstOf(e, lit), e.binRight]
       let i = 0
@@ -139,7 +183,7 @@ function lowerStr(r: RStrOp): i32 {
       }
       strEqTail(e, r.soAt, lit, fnIx)
     }
-    "len" | "at" | "slice" => irLMiss("string operator " + r.soOp)
+    "len" | "at" => irLMiss("string operator " + r.soOp)
   }
 }
 
