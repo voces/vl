@@ -46,10 +46,16 @@ from a call graph built from `name(` sites only.
 A scratch build answered both the walk and the classes at both readers. It logged every call
 where they differed, over `tests/` and the distilled corpus (`cells/` and `named/`):
 
-| reader | differing calls |
-|---|---|
-| `elabRetFnListLitTy` (per-instance test and signature) | 0 |
-| `elabValueAgreedCallTys` | 0 |
+| reader | calls compared (control: log every call) | differing calls |
+|---|---|---|
+| `elabValueAgreedCallTys` | 348,202 over `tests/` | 0 |
+| `elabRetFnListLitTy` (per-instance test and signature) | 0: no `tests/` program, corpus cell or hand-written returned-list program reaches it | none measured |
+
+The probe logs through a list `elabRun` does not reset. `elabLateNames` is cleared when the run
+starts, so a probe that logs there misses every call made during the run. The control is what
+showed this. `elabRetFnListLitTy` is reached only through `elabWrittenValueTy`'s last arm. Nothing
+in the tree exercises it, so it is a candidate for deletion with the walk (part E) rather than a
+measured switch.
 
 ## Readings
 
