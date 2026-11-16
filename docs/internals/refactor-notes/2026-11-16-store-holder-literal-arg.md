@@ -1,7 +1,7 @@
 # Holder rule: a literal handed to a hole parameter is read at the call's binding, 2026-11-16
 
 Lane STORE, after N3 (coordinator ruling 2026-11-16: take the holder rule now, under the retry,
-with probe and control). Stacked on N3.
+with probe and control).
 
 ## The refusal
 
@@ -23,6 +23,18 @@ instance's after the elaboration).
   pre-existing pair again.
 - A first draft that read every argument this way, not only literals, also dropped sets late; the
   rule is the literal's.
+- A parameter the callee hands back is excluded. A draft without the exclusion built an invalid
+  module (a tagged list where the hand-back's instance keeps closures) on the error fixture
+  `closures/error-set-in-record-handed-to-hole-param-two-orders.vl`, which master refuses at emit.
+  The `@run` A/B could not see it: it is an `@emit-error` cell. Ablation, holder draft / with the
+  exclusion / master:
+
+| `id2` | holder draft | with exclusion | master |
+|---|---|---|---|
+| `return x` (hands back) | invalid module | emit refusal | emit refusal |
+| `const y = x; return y` (hands back) | invalid module | emit refusal | emit refusal |
+| `return 0` | builds | builds | builds |
+| `return x.length` | builds | builds | builds |
 
 ## Narrowing
 
@@ -36,7 +48,8 @@ facts refusing (`ftFactRefusal`), so the late decision tagging such a set fails 
 
 ## Measurement
 
-ftlate probe, all `@run` programs, fixpoint seeds, against N3 on master:
+ftlate probe, all `@run` programs, fixpoint seeds, against N3 on master (before the hand-back
+exclusion; the guard PR's `late-tags-baseline.txt` is the current count):
 
 | | N3 | holder rule |
 |---|---|---|
