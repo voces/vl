@@ -751,8 +751,8 @@ const hofAxis = (shape: HofShape, bar: number, note: string) =>
     note,
     (d) => twoFiles(d, genHofBodies(2000, shape), genHofBodies(500, shape)),
   );
-hofAxis("copy", 5.1, "`elabSlotDeliveries` (compiler/emit_elab.vl) is re-walking a slot per query, or its memo stopped answering (D4942).");
-hofAxis("list", 5.1, "`elabCallsReading` (compiler/emit_elab.vl) is scanning every call per slot query (D4942).");
+hofAxis("copy", 5.1, "The place classes (`eplBuild`, `eplReach`, compiler/emit_elab.vl) are re-walking a slot per query (D4942).");
+hofAxis("list", 5.1, "`eplSlotCallRecs` (compiler/emit_elab.vl) is scanning every call per slot query (D4942).");
 hofAxis("rewrite", 5.1, "`monoSubtreeHolds` or `monoTopFrameOf` (compiler/emit_mono.vl) is walking the program per write (D4942).");
 hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking the program per module-scope function (D4942).");
 
@@ -795,13 +795,13 @@ const genLayeredPushes = (w: number, l: number, chain: boolean, fns = false): st
 axis(
   "recursive walker self-calls handing a function list",
   2.5,
-  "`elabSlotDeliveries` (compiler/emit_elab.vl) is following a parameter's recursive call back into the query it is already answering (D15630).",
+  "The place classes (`eplBuild`, `eplReach`, compiler/emit_elab.vl) are following a parameter's recursive call per self-call (D15630).",
   (d) => twoFiles(d, genWalkerCalls(6, true), genWalkerCalls(6, false)),
 );
 axis(
   "a list parameter handed down layers of callers",
   2.5,
-  "`elabSlotDeliveries` (compiler/emit_elab.vl) is walking the callers of a slot whose type holds no function (D15630).",
+  "The place classes (`eplBuild`, compiler/emit_elab.vl) are uniting a value whose type holds no function (D15630).",
   (d) => twoFiles(d, genLayeredPushes(3, 7, true), genLayeredPushes(3, 7, false)),
 );
 // D15631's pair: the same layers handing down a list of functions, which the type test cannot
@@ -809,7 +809,7 @@ axis(
 axis(
   "a function list parameter handed down layers of callers",
   3.5,
-  "`elabSlotDeliveries` (compiler/emit_elab.vl) is re-walking a nested query per chain of callers; is `elabDlvNest` still answering (D15631)?",
+  "The place classes (`eplBuild`, `eplReach`, compiler/emit_elab.vl) are re-walking a chain of callers per query (D15631).",
   (d) => twoFiles(d, genLayeredPushes(3, 7, true, true), genLayeredPushes(3, 7, false, true)),
 );
 
@@ -2566,7 +2566,7 @@ const genFnFlowOne = (n: number): string => {
 axis(
   "fn-flow",
   2.5,
-  "The elaboration is re-walking a function per caller (`elabSlotReadDeliveries`, compiler/emit_elab.vl).",
+  "The elaboration is re-walking a function per caller (`eplReach`, compiler/emit_elab.vl).",
   (d) => twoFiles(d, genFnFlowChain(64), genFnFlowOne(64)),
 );
 
@@ -2653,7 +2653,7 @@ const genGenericProgram = (n: number): string => {
 axis(
   "functions in a program with one generic",
   5.0,
-  "An elaboration slot query (`elabSlotDeliveries`, compiler/emit_elab.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
+  "An elaboration slot query (`eplSlotCallRecs`, compiler/emit_elab.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
   (d) => twoFiles(d, genGenericProgram(1600), genGenericProgram(400)),
 );
 
