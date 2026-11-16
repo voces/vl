@@ -17,6 +17,7 @@ import { objSigSame } from "./check_union_arm_msgs"
 
 import { decDigitsOf } from "./strutil"
 import { parenPeelIx } from "./check_places"
+import { calleeNamesDecl, handBackIx, handBackShared } from "./check_hand_back"
 import {
   CW_DST_ELEM,
   CW_DST_VAL,
@@ -145,6 +146,7 @@ import {
 } from "./check_capture_widen"
 import { mkDerivedHole } from "./check_coal"
 import {
+  ambientCtorCalls,
   arrayCtorNote,
   chainProvenCond,
   checkNodeHook,
@@ -1340,6 +1342,83 @@ export function defaultReadOnlyContainer(ty: i32): boolean {
     if tyKeyOpen(t) { readOnlyKeyRows.push(ty) }
   } else {
     return false
+  }
+  return true
+}
+
+// Whether expression `ix` hands back a container no binding holds: a `Map()` or `Set()` call, a
+// call that hands back only such arguments, or an element of a list literal of them.
+// A call handed a binding can return it, so a read of it settles nothing early.
+export function freshContainerExpr(ix: i32): boolean {
+  const e = parenPeelIx(ix)
+  if e < 0 { return false }
+  if ambientCtorCalls.has(e) { return true }
+  const n = nodeAt(e)
+  if n is Call { return freshCallResult(n) }
+  return freshListElemExpr(e)
+}
+
+// Whether call `c` hands back only a fresh container: its callee returns nothing but the
+// parameters it hands back (`handBackIx`, `handBackShared`), and each of their arguments is fresh.
+function freshCallResult(c: Call): boolean {
+  const back = handedBackParams(calleeNamesDecl(c.callFn))
+  if back.length == 0 { return false }
+  for i in back {
+    if i >= c.callArgs.length { return false }
+    if i < c.callArgNames.length && c.callArgNames[i] != "" { return false }
+    if !freshContainerExpr(c.callArgs[i]) { return false }
+  }
+  return true
+}
+
+// The parameter positions declaration `d` hands back, [] when it hands back none.
+function handedBackParams(d: i32): i32[] {
+  if d < 0 { return [] }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return [] }
+  const shared = handBackShared(d, dn)
+  if shared.length > 0 { return shared }
+  const i = handBackIx(dn)
+  return if i >= 0 { [i] } else { [] }
+}
+
+// Whether node `e` indexes a fresh list (`freshListExpr`); any other node is no fresh container.
+function freshListElemExpr(e: i32): boolean {
+  const n = nodeAt(e)
+  if n is Index { return freshListExpr(n.idxArr) }
+  return false
+}
+
+// Whether `ix` is a list literal whose every element is fresh, or a call handing one back.
+function freshListExpr(ix: i32): boolean {
+  const e = parenPeelIx(ix)
+  if e < 0 { return false }
+  const n = nodeAt(e)
+  if n is ArrayLit {
+    return n.arrElems.length > 0 && allFreshContainerExprs(n.arrElems)
+  }
+  return freshListCallExpr(e)
+}
+
+// Whether node `e` is a call handing back only fresh lists; any other node is none.
+function freshListCallExpr(e: i32): boolean {
+  const n = nodeAt(e)
+  if n is Call {
+    const back = handedBackParams(calleeNamesDecl(n.callFn))
+    if back.length == 0 { return false }
+    for i in back {
+      if i >= n.callArgs.length || !freshListExpr(n.callArgs[i]) {
+        return false
+      }
+    }
+    return true
+  }
+  return false
+}
+
+function allFreshContainerExprs(xs: i32[]): boolean {
+  for x in xs {
+    if !freshContainerExpr(x) { return false }
   }
   return true
 }

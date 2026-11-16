@@ -72,6 +72,7 @@ import {
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  nullOwnIsAtom,
   numLitAsApplies,
   popPlanOf,
   popStmtPlainWhy,
@@ -255,7 +256,14 @@ function valueRep(r: i32, ty: i32): boolean {
   return repIsScalar(r)
     || repNodeAt(r) is RAtom
     || boxedNullable(r)
+    || atomNullable(r)
     || irVarRepOkHook(r, ty)
+}
+
+// Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
+function atomNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 3
 }
 
 // Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
@@ -686,6 +694,12 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
+  // A `null` literal into a `K | null` is legacy's own sentinel (`emitNullAt`).
+  if ibMiss == "" && dst >= 0 && atomNullable(dst) {
+    if nodeAt(unwrapParen(ix)) is NullLit && nullOwnIsAtom(ix, ibFnIx) {
+      return repTemp(b, { nuAt: ix }, ix, dst)
+    }
+  }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
     if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
@@ -698,11 +712,16 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
 
 // `v`, built from `ix`, boxed into boxed nullable `dst` by legacy's box writer.
 function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
-  const bty = repTyOf(dst)
-  const bt = irVarNew(ib, dst, bty, "temp", -1)
-  irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
-  const bo: Opnd = { ov: bt }
-  return bo
+  return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+}
+
+// A temp at destination rep `dst`, typed at it, holding `r` for delivery node `ix`.
+function repTemp(b: i32[], r: Rhs, ix: i32, dst: i32): Opnd {
+  const ty = repTyOf(dst)
+  const t = irVarNew(ib, dst, ty, "temp", -1)
+  irBNode(b, { lDst: t, lRhs: r }, ty, dst, ix)
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
@@ -711,6 +730,12 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   // The checker records the box at the node; legacy's box writer builds it around the value.
   if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
     return boxTemp(b, v, ix, dst)
+  }
+  // An atom into its `K | null` is the same i32: legacy's table has no row for it, since a
+  // nullable niche is no box (`boxOwedAt`).
+  const dn = repNodeAt(dst)
+  if dn is RNullable && dn.rnDisc == 3 && dn.rnInner == irBOpRep(v) {
+    if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
   }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)

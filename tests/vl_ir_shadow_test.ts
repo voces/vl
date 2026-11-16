@@ -181,7 +181,8 @@ print(sel(true))
 // read; string operators, a char literal, a string list read and a void call's tail form (C2h);
 // an atom result and its literals (C2i); string `.slice` and `.cpLen` (C2j); a list push (C2k);
 // an atom `!=` against a literal and between two atoms, each `i32.eq` then `i32.eqz` (N2b-1);
-// a `.pop()` statement past the list's end (N2b-2a).
+// a `.pop()` statement past the list's end (N2b-2a); an atom of id 0 and a `null` into its
+// `K | null`, and a call retagged into it in tail form, as legacy tail-calls it (N2b-2c-1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -209,6 +210,8 @@ print(guard(2))
   `type K = "a" | "b"\nfunction nb(k: K): boolean { return "b" != k }\nconst ks: K[] = ["a", "b"]\nprint(nb(ks[0]))\n`,
   `type K = "a" | "b"\nfunction df(x: K, y: K): boolean { return x != y }\nconst ks: K[] = ["a", "b"]\nprint(df(ks[0], ks[1]))\n`,
   `let gs: f64[] = [1.5, 2.5]\nfunction d() { gs.pop() }\nd()\nd()\nd()\nprint(gs.length)\n`,
+  `type K = "a" | "b"\nfunction pick(c: i32, k: K): K | null {\n  if c > 0 { return k }\n  return null\n}\nconst ks: K[] = ["a", "b"]\nprint(pick(1, ks[0]) == "a")\n`,
+  `type K = "a" | "b"\nfunction k0(): K {\n  const xs: K[] = ["a"]\n  return xs[0]\n}\nfunction pk(c: boolean): K | null {\n  if c { return null }\n  return k0()\n}\nprint(pk(false) == "a")\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
