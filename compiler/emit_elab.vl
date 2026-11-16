@@ -10368,6 +10368,7 @@ export function elabRun() {
   elabValueInstKeys = Map()
   elabValueInstVia = Map()
   elabHoleMapMemo = Map()
+  elabHoleContMemo = Map()
   elabKeyCalls = Map()
   elabRepRowCalls = Map()
   elabLitArg = Map()
@@ -13200,6 +13201,56 @@ export function elabHoleMapClosed(t: i32): i32 {
 // `elabHoleMapClosed`'s maps since the last `elabRun`, by key and value.
 let elabHoleMapMemo: {[string]: i32} = Map()
 
+// The closed container an empty container nothing types is built at when handed to a type
+// parameter, through lists, maps, sets and nullables: a hole key or set element as `string` and a
+// hole element or value as `i32`, as an open literal is built (D1887, D15040). -1 where no part
+// is open, or an open part sits beside a type variable.
+export function elabHoleContainerClosed(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const have = elabHoleContMemo.get(t) ?? -2
+  if have != -2 { return have }
+  const r = ehcGo(t)
+  const out = if r == t { -1 } else { r }
+  elabHoleContMemo.set(t, out)
+  return out
+}
+
+// `elabHoleContainerClosed`'s answers since the last `elabRun`, by type.
+let elabHoleContMemo: {[i32]: i32} = Map()
+
+// Whether map or set part `x` is a hole: absent, or an inference hole's variable.
+function ehcHole(x: i32): boolean {
+  return x < 0 || x < T.tys.length && tyAt(x) is TyVar && tyHasInferHole(x)
+}
+
+// `t` with its holes closed, `t` itself where none is open; -1 where a part cannot close.
+function ehcGo(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const ty = tyAt(t)
+  if ty is TyArray {
+    // A list's element is a hole only where it is absent (`[]`): an inference hole there may be a
+    // hole function the list holds.
+    const e = tyElemOf(ty)
+    const ce = if e < 0 { TY_I32 } else { ehcGo(e) }
+    if ce < 0 { return -1 }
+    return if ce == e { t } else { mkArrayTy(ce) }
+  }
+  if ty is TyMap {
+    const k = tyKeyOf(ty)
+    const v = tyValOf(ty)
+    const ck = if ehcHole(k) { TY_STR } else { ehcGo(k) }
+    const cv = if ehcHole(v) { TY_I32 } else { ehcGo(v) }
+    if ck < 0 || cv < 0 { return -1 }
+    return if ck == k && cv == v { t } else { mkMapTy(ck, cv, ty.mSet) }
+  }
+  if ty is TyNullable {
+    const ci = ehcGo(ty.nInner)
+    if ci < 0 { return -1 }
+    return if ci == ty.nInner { t } else { mkNullableTy(ci) }
+  }
+  return if tyHasTyVar(t) { -1 } else { t }
+}
+
 // The closed function type an open function `t` no instance reaches is built at: each open
 // parameter and an open result as `i32`, a default no program can observe since no call reaches
 // it (D9100). -1 for a closed or non-function type.
@@ -14501,11 +14552,12 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[], k: i32): i32[] {
     // unless it is a tagged set's id.
     const stub = elabStubArg.get(i32ToStr(ix) + ":" + i32ToStr(i)) ?? -1
     const js = if pn is Param && pn.parType >= 0 { fnTagSharedJoinSet(f, i, cn.callArgs) } else if pn is Param && !named { fnTagListJoinSet(d, f, i, ats) } else { -1 }
-    // An open map the call binds a type parameter to is that parameter's closed map (D1887).
+    // An open container the call binds a type parameter to is that parameter's closed one (D1887,
+    // D15040).
     const hmTv = if pn is Param { elabParamTyVarName(f, i) } else { "" }
     let j0 = 0
     while !named && hmTv != "" && j0 < names.length && j0 < out.length {
-      const hm = if names[j0] == hmTv { elabHoleMapClosed(out[j0]) } else { -1 }
+      const hm = if names[j0] == hmTv { elabHoleContainerClosed(out[j0]) } else { -1 }
       if hm >= 0 {
         if !copied {
           out = tys.slice(0, tys.length)

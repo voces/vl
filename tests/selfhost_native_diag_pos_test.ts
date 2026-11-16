@@ -253,13 +253,13 @@ Deno.test({
     // that had nothing to do with the failure.
     //
     // Two things fix it and this pins both: the field-access floors are NODE-anchored
-    // (`emitFailAt`, the `Member` node → its property token, 0-based col 18 of line 11,
-    // printed 1-based as 11:19), and the start function arms a top-level STATEMENT cursor so
+    // (`emitFailAt`, the `Member` node → its property token, 0-based col 17 of line 11,
+    // printed 1-based as 11:18), and the start function arms a top-level STATEMENT cursor so
     // any other failure it raises lands on the statement instead of on a stale function.
     //
-    // The witness is a top-level `.length` on a generic identity's result over an empty `Map()`,
-    // still a loud field-access reject (D16207). The earlier witnesses lower since D15314,
-    // D15882 (D4266), D16049 and D16170.
+    // The witness is a top-level `.length` on a generic identity's result over a list of an
+    // empty list, still a loud field-access reject (D16725). The earlier witnesses lower since
+    // D15314, D15882 (D4266), D16049, D16170 and D16207.
     const dir = await makeTempDir({ prefix: "vl_diag_pos_top_" });
     try {
       const path = `${dir}/case.vl`;
@@ -275,13 +275,13 @@ Deno.test({
           "const one = 1\n" +
           "const two = 2\n" +
           "print(one + two)\n" +
-          "print(take(Map()).length)\n",
+          "print(take([[]]).length)\n",
       );
       const r = await build(path);
       if (r.code === 0) {
         throw new Error("expected emit-stage rejection, got exit 0");
       }
-      const needle = `${path}:11:19:`;
+      const needle = `${path}:11:18:`;
       if (!r.err.includes(needle)) {
         throw new Error(
           `expected stderr to contain "${needle}", got:\n${r.err}`,
