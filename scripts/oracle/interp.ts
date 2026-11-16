@@ -1812,7 +1812,10 @@ export class Interp {
     // exact value too (D16494).
     const to64 = e.ty.k === "name" && (e.ty.name === "i64" || e.ty.name === "f64");
     const wide = to64 && (e.mode !== "as%" || (e.ty.k === "name" && e.ty.name === "i64"));
-    let v = this.eval(e.e, env, wide && ((isConstTree(e.e) && treeHas(e.e, "radix")) || (!isConstTree(e.e) && constLike(e.e))) ? e.ty : null);
+    // `as%` to any integer target applies to a radix tree's exact value, computed at i64 (D16494).
+    const wrapExact = e.mode === "as%" && e.ty.k === "name" && ["i32", "u8"].includes(e.ty.name) &&
+      isConstTree(e.e) && treeHas(e.e, "radix");
+    let v = this.eval(e.e, env, wrapExact ? I64_TY : wide && ((isConstTree(e.e) && treeHas(e.e, "radix")) || (!isConstTree(e.e) && constLike(e.e))) ? e.ty : null);
     const t = this.resolve(e.ty, env);
     if (t.k !== "name" || !NUMERIC.has(t.name) || (typeof v !== "boolean" && !(v instanceof Lit) && !numKind(v))) {
       // E8.6: a cast whose operand is a union selects a member.
@@ -1855,6 +1858,10 @@ export class Interp {
     if (v instanceof Lit && v.radix && e.mode === "as%" && k === "i64") {
       if (v.lone || negatedRadix(e.e)) return wrap64(v.i!);
       return wrap64(v64(v));
+    }
+    if (wrapExact && v instanceof Lit && !v.lone && !negatedRadix(e.e)) {
+      const x = v64(v);
+      return k === "u8" ? Number(BigInt.asUintN(8, x)) : wrap32(x);
     }
     if (v instanceof Lit) v = litDefault(v);
     const src = numKind(v);

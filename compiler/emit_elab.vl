@@ -2,6 +2,13 @@
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
 
+import {
+  calleeNamesDecl,
+  handBackCopySeedsNote,
+  handBackHoleIx,
+  handBackIx,
+  handBackShared,
+} from "./check_hand_back"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { primTyOfName, unboundDefaultTy } from "./check_decl_scan"
 import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
@@ -4093,7 +4100,7 @@ function elabKeyCallsHandSet(k: i32, c: i32, d: i32): boolean {
   for x in cs {
     const xn = nodeAt(x)
     if !(xn is Call) || pi >= xn.callArgs.length { return false }
-    if elabCalleeNamesDecl(xn.callFn) != d { return false }
+    if calleeNamesDecl(xn.callFn) != d { return false }
     const a = parenPeelIx(xn.callArgs[pi])
     if a < 0 || !(nodeAt(a) is Ident) || !i32ListHas(ms, identDeclOf(a)) {
       return false
@@ -4141,7 +4148,7 @@ function elabReachHandsSet(
   for x in cs {
     const xn = nodeAt(x)
     if !(xn is Call) || pi >= xn.callArgs.length { return false }
-    if elabCalleeNamesDecl(xn.callFn) != d { return false }
+    if calleeNamesDecl(xn.callFn) != d { return false }
     const ks = elabCallKeys[x] ?? []
     let j = 0
     while j + 1 < ks.length {
@@ -4228,7 +4235,7 @@ function elabKeyCallsHandRecClosure(k: i32, c: i32, d: i32): boolean {
   for x in cs {
     const xn = nodeAt(x)
     if !(xn is Call) || pi >= xn.callArgs.length { return false }
-    if elabCalleeNamesDecl(xn.callFn) != d { return false }
+    if calleeNamesDecl(xn.callFn) != d { return false }
     if pi < xn.callArgNames.length && xn.callArgNames[pi] != "" { return false }
     const ln = nodeAt(parenPeelIx(xn.callArgs[pi]))
     const vs: i32[] = []
@@ -4266,19 +4273,17 @@ function elabClosedFnOutside(v: i32, ms: i32[]): boolean {
   return true
 }
 
-// The declaration callee `f` names: directly, or through one `const` binding of its name; else -1.
-function elabCalleeNamesDecl(f: i32): i32 {
-  const x = parenPeelIx(f)
-  if x < 0 || !(nodeAt(x) is Ident) { return -1 }
-  const dx = identDeclOf(x)
-  if dx < 0 || dx >= P.nodes.length { return -1 }
-  const dn = nodeAt(dx)
-  if dn is FuncDecl { return dx }
-  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
-  const y = parenPeelIx(dn.letInit)
-  if y < 0 || !(nodeAt(y) is Ident) { return -1 }
-  const dy = identDeclOf(y)
-  return if dy >= 0 && dy < P.nodes.length && nodeAt(dy) is FuncDecl { dy } else { -1 }
+// Each declared function → the parameter it hands back (`handBackIx`), else -1; a property of
+// the body, so one walk per function serves all its instances.
+let elabHandBackMemo: {[i32]: i32} = Map()
+
+// `handBackIx`, once per declaration.
+function elabHandBackIx(decl: i32, dn: FuncDecl): i32 {
+  const had = elabHandBackMemo[decl] ?? -2
+  if had > -2 { return had }
+  const at = handBackIx(dn)
+  elabHandBackMemo[decl] = at
+  return at
 }
 
 // Notes instance `k`'s hand-back: every value its function returns reads one parameter, which
@@ -4288,10 +4293,10 @@ function elabMintRetFact(k: i32): i32 {
   if !(dn is FuncDecl) || dn.fnBody < 0 { return 0 }
   // A hole parameter handed back through a call of a function handing it back counts too.
   const own = elabHandBackIx(ekDecl[k], dn)
-  const one = if own >= 0 { own } else { elabHoleHandBackIx(ekDecl[k], dn, 0) }
+  const one = if own >= 0 { own } else { handBackHoleIx(dn, 0) }
   // Or each of several parameters one bare type parameter annotates, every value it returns
   // reading one of them: the call's value is one argument's, of the set they share (D15461).
-  const ats = if one >= 0 { [one] } else { elabHandBackShared(ekDecl[k], dn) }
+  const ats = if one >= 0 { [one] } else { handBackShared(ekDecl[k], dn) }
   let noted = 0
   for at in ats {
     let pt = elabTyIn(dn.fnParams[at], k)
@@ -4301,35 +4306,6 @@ function elabMintRetFact(k: i32): i32 {
     }
   }
   return if noted > 0 { 1 } else { 0 }
-}
-
-// The parameters of `dn` (declared at `decl`) every value it returns reads, when there are two or
-// more, one bare type parameter annotates each, and each is read nowhere but as a returned value;
-// [] otherwise.
-function elabHandBackShared(decl: i32, dn: FuncDecl): i32[] {
-  const none: i32[] = []
-  if decl < 0 { return none }
-  const vs: i32[] = []
-  collectRetValues(dn.fnBody, vs)
-  const ats: i32[] = []
-  let tp = ""
-  for v in vs {
-    const x = parenPeelIx(v)
-    if x < 0 || !(nodeAt(x) is Ident) { return none }
-    const i = i32ListIndexOf(dn.fnParams, identDeclOf(x))
-    if i < 0 { return none }
-    const pn = nodeAt(dn.fnParams[i])
-    const tn = if pn is Param && pn.parType >= 0 { nodeAt(pn.parType) } else { null }
-    if !(tn is TypeRef) || !strListHas(dn.fnTyParams, tn.tyName) { return none }
-    if tp != "" && tn.tyName != tp { return none }
-    tp = tn.tyName
-    if !i32ListHas(ats, i) { ats.push(i) }
-  }
-  if ats.length < 2 { return none }
-  for i in ats {
-    if !elabParamOnlyReturned(dn, dn.fnParams[i], vs) { return none }
-  }
-  return ats
 }
 
 // Whether read `ix` is a value function `decl` returns, and `decl` hands back parameter `i`.
@@ -4344,171 +4320,16 @@ function elabRetHandsBack(decl: i32, ix: i32, i: i32): boolean {
     if parenPeelIx(v) == ix { return true }
     rets.push(parenPeelIx(v))
   }
-  // So is the seed of a returned copy of the parameter (`elabCopySeedsNote`).
+  // So is the seed of a returned copy of the parameter (`handBackCopySeedsNote`).
   for r in rets.slice(0) {
     if r >= 0 && nodeAt(r) is Ident {
       const cd = identDeclOf(r)
       if cd >= 0 && fnTagParamCopyOf(dn, cd) == dn.fnParams[i] {
-        elabCopySeedsNote(cd, rets)
+        handBackCopySeedsNote(cd, rets)
       }
     }
   }
   return i32ListHas(rets, ix)
-}
-
-// Each declared function → the parameter every value it returns reads, else -1; a property of
-// the body, so one walk per function serves all its instances.
-let elabHandBackMemo: {[i32]: i32} = Map()
-
-// The un-annotated parameter `dn` (declared at `decl`) hands back: its own (`elabHandBackIx`), or
-// the one every returned value reads through a call of a declared function handing back that
-// argument (`fw2(f) { return fw(f) }`); -1 otherwise.
-function elabHoleHandBackIx(decl: i32, dn: FuncDecl, depth: i32): i32 {
-  const own = elabHandBackIx(decl, dn)
-  if own >= 0 || depth > 8 { return own }
-  const vs: i32[] = []
-  collectRetValues(dn.fnBody, vs)
-  let at = -1
-  for v in vs {
-    const x = parenPeelIx(v)
-    const cn = if x >= 0 { nodeAt(x) } else { nodeAt(0) }
-    if !(cn is Call) { return -1 }
-    const g = identFnDeclOf(parenPeelIx(cn.callFn))
-    const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { nodeAt(0) }
-    if !(gn is FuncDecl) { return -1 }
-    const j = elabHoleHandBackIx(g, gn, depth + 1)
-    if j < 0 || j >= cn.callArgs.length { return -1 }
-    if j < cn.callArgNames.length && cn.callArgNames[j] != "" { return -1 }
-    const ad = parenPeelIx(cn.callArgs[j])
-    const i = if ad >= 0 && nodeAt(ad) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(ad)) } else { -1 }
-    if i < 0 || at >= 0 && i != at { return -1 }
-    at = i
-  }
-  if at < 0 { return -1 }
-  const pn = nodeAt(dn.fnParams[at])
-  if (
-    !(pn is Param)
-    || pn.parType >= 0
-    || !elabParamOnlyReturned(dn, dn.fnParams[at], vs)
-  ) {
-    return -1
-  }
-  return at
-}
-
-function elabHandBackIx(decl: i32, dn: FuncDecl): i32 {
-  const had = elabHandBackMemo[decl] ?? -2
-  if had > -2 { return had }
-  let at = -1
-  const vs: i32[] = []
-  collectRetValues(dn.fnBody, vs)
-  for v in vs {
-    const x = parenPeelIx(v)
-    let i = if x >= 0 && nodeAt(x) is Ident { i32ListIndexOf(dn.fnParams, identDeclOf(x)) } else { -1 }
-    // A returned `const` copy of a parameter hands that parameter back.
-    if i < 0 && x >= 0 && nodeAt(x) is Ident {
-      i = i32ListIndexOf(dn.fnParams, fnTagParamCopyOf(dn, identDeclOf(x)))
-    }
-    if i < 0 || at >= 0 && i != at {
-      elabHandBackMemo[decl] = -1
-      return -1
-    }
-    at = i
-  }
-  // A parameter read any other way (called, stored, handed on, captured) reaches a place that
-  // holds a closure, so only a parameter whose every read is a returned value is handed back.
-  if at >= 0 && !elabParamOnlyReturned(dn, dn.fnParams[at], vs) { at = -1 }
-  elabHandBackMemo[decl] = at
-  return at
-}
-
-// Whether every read of parameter `par` in `body`, nested functions included, is one of the
-// returned values `vs`.
-function elabParamOnlyReturned(fn: FuncDecl, par: i32, vs: i32[]): boolean {
-  const rets: i32[] = []
-  for v in vs { rets.push(parenPeelIx(v)) }
-  // The seed of a returned copy of `par` reads it as the returned value does.
-  for r in rets.slice(0) {
-    if r >= 0 && nodeAt(r) is Ident {
-      const cd = identDeclOf(r)
-      if (
-        cd >= 0
-        && fnTagParamCopyOf(fn, cd) == par
-        && elabCopyOnlyReturned(fn.fnBody, cd, rets)
-      ) {
-        elabCopySeedsNote(cd, rets)
-      }
-    }
-  }
-  const todo: i32[] = [fn.fnBody]
-  const reads: i32[] = []
-  while todo.length > 0 {
-    const x = todo.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      const n = nodeAt(x)
-      if n is Ident && identDeclOf(x) == par && !i32ListHas(rets, x) {
-        reads.push(x)
-      }
-      // A positional argument landing in an un-annotated parameter of a declared function is
-      // bound there to the argument's own function, so it reaches no closure holder.
-      if n is Call { elabHoleArgsNote(n, rets) }
-      for k in nodeChildren(x) { todo.push(k) }
-    }
-  }
-  for r in reads {
-    if !i32ListHas(rets, r) { return false }
-  }
-  return true
-}
-
-// Whether every read of binding `d` in `body` is one of `rets`.
-function elabCopyOnlyReturned(body: i32, d: i32, rets: i32[]): boolean {
-  const todo: i32[] = [body]
-  while todo.length > 0 {
-    const x = todo.pop() ?? -1
-    if x >= 0 && x < P.nodes.length {
-      if nodeAt(x) is Ident && identDeclOf(x) == d && !i32ListHas(rets, x) {
-        return false
-      }
-      for k in nodeChildren(x) { todo.push(k) }
-    }
-  }
-  return true
-}
-
-// Pushes onto `out` the seed read of copy `d` and of each copy it is seeded from in turn.
-function elabCopySeedsNote(d: i32, out: i32[]) {
-  let x = d
-  let hops = 0
-  while hops < 8 && x >= 0 && x < P.nodes.length {
-    hops = hops + 1
-    const n = nodeAt(x)
-    if !(n is LetDecl) || n.letInit < 0 { return 0 }
-    const v = parenPeelIx(n.letInit)
-    if v < 0 || !(nodeAt(v) is Ident) { return 0 }
-    out.push(v)
-    x = identDeclOf(v)
-  }
-  return 0
-}
-
-// Pushes onto `out` each positional argument of call `c` to a declared function that lands in
-// one of its un-annotated parameters.
-function elabHoleArgsNote(c: Call, out: i32[]) {
-  const d = elabCalleeNamesDecl(c.callFn)
-  if d < 0 { return 0 }
-  const dn = nodeAt(d)
-  if !(dn is FuncDecl) { return 0 }
-  let i = 0
-  while i < c.callArgs.length && i < dn.fnParams.length {
-    const p = nodeAt(dn.fnParams[i])
-    const named = i < c.callArgNames.length && c.callArgNames[i] != ""
-    if !named && p is Param && p.parType < 0 {
-      out.push(parenPeelIx(c.callArgs[i]))
-    }
-    i = i + 1
-  }
-  return 0
 }
 
 // The type instance `k` binds parameter `par`'s own type variable to, else -1.
@@ -14510,8 +14331,7 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[], k: i32): i32[] {
     } else if (
       !named
       && pn is Param
-      && (i == elabHandBackIx(d, f)
-        || pn.parType < 0 && i == elabHoleHandBackIx(d, f, 0))
+      && (i == elabHandBackIx(d, f) || pn.parType < 0 && i == handBackHoleIx(f, 0))
     ) {
       // A function handed back to a closed function-typed destination is bound at that type:
       // the call's value is delivered there, and the open binding names no instance. A hole
@@ -18780,29 +18600,29 @@ function litIsEmptyList(ix: i32): boolean {
 }
 
 // Whether list type `t` has a closed element at every depth.
-function litListTyClosed(t: i32, depth: i32): boolean {
-  if t < 0 || depth > 8 { return false }
+function litListTyClosed(t: i32): boolean {
+  if t < 0 { return false }
   const a = tyAt(t)
   if !(a is TyArray) { return true }
   if tyElemOpen(a) { return false }
-  return litListTyClosed(tyElemOf(a), depth + 1)
+  return litListTyClosed(tyElemOf(a))
 }
 
 // The closed type such a list has in `fnIx`'s instance: its own there, else the element of the
 // list literal holding it (`elabArgInner`, noted as the holder resolves); -1 where neither closes.
-function litOpenListTyAt(ix: i32, fnIx: i32, depth: i32): i32 {
+function litOpenListTyAt(ix: i32, fnIx: i32): i32 {
   const ie = elabNodeTyAt(ix, fnIx)
   if (
     ie >= 0
     && !tyHasTyVar(ie)
     && !tyHasInferHole(ie)
-    && litListTyClosed(ie, 0)
+    && litListTyClosed(ie)
   ) {
     return ie
   }
   const o = elabArgInner[ix] ?? -1
-  if depth > 8 || o < 0 || !litIsEmptyList(o) { return -1 }
-  const ot = litOpenListTyAt(o, fnIx, depth + 1)
+  if o < 0 || !litIsEmptyList(o) { return -1 }
+  const ot = litOpenListTyAt(o, fnIx)
   const oa = if ot >= 0 { tyAt(ot) } else { null }
   return if oa is TyArray { tyElemOf(oa) } else { -1 }
 }
@@ -18820,7 +18640,7 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   // instance's own reading of it is where it is built, ahead of any shared stamp (D16510).
   if k >= 0 && litIsEmptyList(ix) {
     elabArgInnerNote(ix)
-    const ie = litOpenListTyAt(ix, fnIx, 0)
+    const ie = litOpenListTyAt(ix, fnIx)
     if ie >= 0 { return ie }
   }
   // The record solve's closed stamp is where the literal is built; the parameter its call
@@ -18828,7 +18648,7 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
   if nodeRepStamped(ix) && !tyHasTyVar(nodeRepTyIx[ix]) {
     return nodeRepTyIx[ix]
   }
-  const pa = elabArgTyAt(ix, k, 0)
+  const pa = elabArgTyAt(ix, k)
   if pa >= 0 { return pa }
   const sp = elabSpreadInner[ix] ?? -1
   const ht = if sp >= 0 { litRepTyAt(sp >> 1, fnIx) } else { -1 }
@@ -19022,14 +18842,14 @@ function litKeptStamp(x: i32): i32 {
 
 // The type instance `k` delivers literal argument `ix` (or the node it copies) into: the parameter
 // its call's instance closes, or for a list nested in one, that list's element; -1 where none.
-function elabArgTyAt(ix: i32, k: i32, depth: i32): i32 {
-  if ix < 0 || k < 0 || depth > 16 { return -1 }
+function elabArgTyAt(ix: i32, k: i32): i32 {
+  if ix < 0 || k < 0 { return -1 }
   let n = ix
   if !elabLitArg.has(n) && !elabArgInner.has(n) { n = nodeSrc[ix] ?? -1 }
   const ca = elabLitArg[n] ?? []
   if ca.length >= 2 { return elabParamTyOf(elabCallInstFrom(ca[0], k), ca[1]) }
   const up = elabArgInner[n] ?? -1
-  const pt = if up >= 0 { elabArgTyAt(up, k, depth + 1) } else { -1 }
+  const pt = if up >= 0 { elabArgTyAt(up, k) } else { -1 }
   if pt < 0 || pt >= T.tys.length { return -1 }
   const p = tyAt(pt)
   return if p is TyArray { tyElemOf(p) } else { -1 }
