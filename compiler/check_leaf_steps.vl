@@ -1,4 +1,19 @@
 import { rowSettledByDefault } from "./check_hole_links"
+import {
+  BND_BM,
+  BND_IS,
+  BND_LET,
+  BND_MEM,
+  BND_NEST,
+  BND_PRINT,
+  BND_RET,
+  BND_UFCS,
+  Bound,
+  bndAt,
+  bndCount,
+  bndOwnRows,
+  bndPush,
+} from "./check_iface"
 import { isWideLitJoin } from "./check_wide_lits"
 import { nodeCtxTyIxOf } from "./check_core_state"
 // Steps the checker core calls that do not call back into it: refusal and note texts,
@@ -92,18 +107,10 @@ import {
   CV_UFCS,
   argCstr,
   binCstr,
-  bmCstr,
   cstrOwnerTop,
   cvMark,
-  isCstr,
-  letCstr,
-  memCstr,
-  nestCstr,
   noteBinCstr,
   noteLetCstr,
-  printCstr,
-  retCstr,
-  ufcsCstr,
 } from "./check_cstr_rows"
 import { inferQuiet } from "./check_cursor"
 import { esRows } from "./check_effect_rows"
@@ -343,7 +350,7 @@ export const ACF_EXACT_RET = -5
 // as a call there does (D13782). Both sides are the call's function type, so it always fits.
 export const ACF_CHOICE = -6
 
-// The `memCstr.prop` a call through a hole records: not a field name, so no member row shares it.
+// The `BND_MEM` spelling a call through a hole records: not a field name, so no member row shares it.
 export const OP_CALL_PIN = "()"
 
 // A call under a null test of its callee: a pin of the `null` type leaves the branch dead, so
@@ -1492,9 +1499,29 @@ export function initMapCtorName(initIx: i32) {
   return "Map"
 }
 
+// The article before a key type's spelling, read aloud: "An" before a vowel sound (`f64`,
+// `i32[]`, `Item`), "A" otherwise.
+function mapKeyArticle(keyText: string): string {
+  if keyText.length == 0 { return "A " }
+  const c = keyText[0]
+  if (
+    c == 'a'
+    || c == 'e'
+    || c == 'i'
+    || c == 'o'
+    || c == 'f'
+    || c == 'A'
+    || c == 'E'
+  ) {
+    return "An "
+  }
+  if c == 'I' || c == 'O' { return "An " }
+  return "A "
+}
+
 // The unsupported-key refusal's sentence, shared by the index signature and `Map<K, V>`.
 export function mapKeyUnsupportedMsg(keyText: string, ctor: string): string {
-  return "A "
+  return mapKeyArticle(keyText)
     + keyText
     + "-keyed "
     + ctor
@@ -1732,26 +1759,67 @@ export function objLitFieldExpr(lit: i32, name: string): i32 {
   return -1
 }
 
-// The field names `src` carries that `dst` does not, rendered `` `a`, `b` ``.
+// The field names `src` carries that `dst` does not, rendered `` `a`, `b` ``, a nested record's by
+// its path (`` `pet.purr` ``).
 export function objDroppedFieldList(src: i32, dst: i32) {
+  return objDroppedFieldsAt(src, dst, "", 8)
+}
+
+// `objDroppedFieldList` for fields reached under the path `pre`, at most `depth` records down.
+function objDroppedFieldsAt(
+  src: i32,
+  dst: i32,
+  pre: string,
+  depth: i32,
+): string {
+  if depth <= 0 || src < 0 || dst < 0 { return "" }
   const s = tyAt(src)
   const d = tyAt(dst)
-  let out = ""
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < s.objFieldNames.length {
-        if objFieldType(d, s.objFieldNames[i]) < 0 {
-          if out != "" { out = out + ", " }
-          out = out + "`" + s.objFieldNames[i] + "`"
-        }
-        i = i + 1
-      }
+  match s {
+    TyObj => {
+      return if d is TyObj { objDroppedObjFields(s, d, pre, depth) } else { "" }
     }
+    TyNullable => {
+      return if d is TyNullable { objDroppedFieldsAt(s.nInner, d.nInner, pre, depth - 1) } else { "" }
+    }
+    // Only a record, or a nullable one, carries fields to drop.
+    TyPrim | TyErr | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg | TyUnion => {
+      return ""
+    }
+  }
+}
+
+// `objDroppedFieldsAt` for two records.
+function objDroppedObjFields(
+  s: TyObj,
+  d: TyObj,
+  pre: string,
+  depth: i32,
+): string {
+  let out = ""
+  let i = 0
+  while i < s.objFieldNames.length {
+    const nm = s.objFieldNames[i]
+    const df = objFieldType(d, nm)
+    let part = ""
+    if df < 0 {
+      part = "`" + pre + nm + "`"
+    } else if !tyEq(s.objFieldTypes[i], df) {
+      part = objDroppedFieldsAt(
+        s.objFieldTypes[i],
+        df,
+        pre + nm + ".",
+        depth - 1,
+      )
+    }
+    if part != "" {
+      if out != "" { out = out + ", " }
+      out = out + part
+    }
+    i = i + 1
   }
   return out
 }
-
 // The growable list over the same element as `ty` (a `readonly T[]` gives `T[]`), so a hint
 // naming a source's declaration never proposes a view the source is then written through.
 export function listMutableTwin(ty: i32): i32 {
@@ -1974,7 +2042,7 @@ function callPinArityMsg(f: TyFunc, site: i32): string {
     + i32ToStr(got)
 }
 
-// The `memCstr.prop` of a built-in method call on a gradual union, before the method's name.
+// The `BND_MEM` spelling of a built-in method call on a gradual union, before the method's name.
 export const MC_METHOD_MARK = "()"
 
 export function noteKillSure(by: i32, key: string) {
@@ -1990,34 +2058,30 @@ export function noteUfcsCstr(recv: i32, prop: string, ix: i32, p0: i32) {
   if recv < 0 { return 0 }
   if tyHasHole(recv) {
     const owner = cstrOwnerTop()
-    let k = 0
-    while k < ufcsCstr.ty.length {
-      if (
-        ufcsCstr.fn[k] == owner
-        && ufcsCstr.prop[k] == prop
-        && ufcsCstr.p0[k] == p0
-      ) {
-        if tyEqSameHoles(ufcsCstr.ty[k], recv) {
-          if ix != ufcsCstr.ix[k] && !i32ListHas(ufcsCstr.more[k], ix) {
-            ufcsCstr.more[k].push(ix)
-          }
-          return 0
-        }
+    for k in bndOwnRows(BND_UFCS, owner) {
+      const b = bndAt(BND_UFCS, k)
+      if b.s == prop && b.a == p0 && tyEqSameHoles(b.on, recv) {
+        if ix != b.site && !i32ListHas(b.more, ix) { b.more.push(ix) }
+        return 0
       }
-      k = k + 1
     }
     // An overloaded call's row (`p0` -1) makes its owner's instances pick per call.
     if p0 < 0 && owner >= 0 && !i32ListHas(ovDepFns, owner) {
       ovDepFnsPush(owner)
     }
-    ufcsCstr.ty.push(recv)
-    ufcsCstr.prop.push(prop)
-    ufcsCstr.ix.push(ix)
-    ufcsCstr.fn.push(owner)
-    ufcsCstr.p0.push(p0)
-    const noMore: i32[] = []
-    ufcsCstr.more.push(noMore)
-    cvMark(CV_UFCS, ufcsCstr.fn.length - 1)
+    const more: i32[] = []
+    const row: Bound = {
+      on: recv,
+      a: p0,
+      b: -1,
+      c: -1,
+      site: ix,
+      fn: owner,
+      s: prop,
+      seq: -1,
+      more: more,
+    }
+    cvMark(CV_UFCS, bndPush(BND_UFCS, row))
   }
   return 0
 }
@@ -2504,14 +2568,14 @@ export function armTailUndecided(armIx: i32): boolean {
 export function cstrRowCount(): i32 {
   return binCstr.op.length
     + argCstr.at.length
-    + printCstr.ty.length
-    + nestCstr.ty.length
-    + isCstr.ty.length
-    + retCstr.got.length
-    + letCstr.got.length
-    + bmCstr.got.length
-    + memCstr.ty.length
-    + ufcsCstr.ty.length
+    + bndCount(BND_PRINT)
+    + bndCount(BND_NEST)
+    + bndCount(BND_IS)
+    + bndCount(BND_RET)
+    + bndCount(BND_LET)
+    + bndCount(BND_BM)
+    + bndCount(BND_MEM)
+    + bndCount(BND_UFCS)
 }
 
 // The top-level function declaration a module global's initializer names bare, or -1.

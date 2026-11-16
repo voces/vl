@@ -3,6 +3,19 @@
 // overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
 // reads what the core checker recorded and reports through the relation core.
 
+import {
+  BND_ARRDEF,
+  BND_BM,
+  BND_IS,
+  BND_LET,
+  BND_MEM,
+  BND_NEST,
+  BND_PRINT,
+  BND_UFCS,
+  bndAt,
+  bndCount,
+  bndNextRow,
+} from "./check_iface"
 import { rowParamIsSlot } from "./check_row_param"
 import { identityCstrOffender, identityCstrRefusal } from "./check_identity"
 import { cwIxCovers, cwIxParent } from "./check_write_scan"
@@ -175,19 +188,17 @@ import {
   CV_MEM,
   CV_PRINT,
   CV_UFCS,
+  LIP_APART,
+  LIP_MEET,
+  LIP_OPEN,
   MC_LAYOUT_MARK,
   argCstr,
-  arrDefCstr,
   binCstr,
-  bmCstr,
   cstrOwnerTop,
   cvNow,
   cvPick,
-  isCstr,
-  letCstr,
+  listIsPinNote,
   memCalleeIs,
-  memCstr,
-  nestCstr,
   noteArgCstr,
   noteArrDefCstr,
   noteBinCstrAt,
@@ -195,8 +206,6 @@ import {
   noteMemCstr,
   noteNestCstr,
   notePrintCstr,
-  printCstr,
-  ufcsCstr,
 } from "./check_cstr_rows"
 import { curFnDeclIx, inferQuiet, njFnStack } from "./check_cursor"
 import {
@@ -433,6 +442,7 @@ import {
 } from "./check_subst"
 import {
   demangleName,
+  fieldNearNote,
   listMethodNames,
   listMethodSpellFrom,
   listMethodSpellTo,
@@ -517,6 +527,7 @@ import {
   tyValOf,
   tyValOpen,
 } from "./check_types"
+import { recNestedWidthPair } from "./check_obj_shape"
 import { unionFieldGapNote } from "./check_union_arm_msgs"
 import { mkUnionTy } from "./check_union_mint"
 import {
@@ -787,8 +798,12 @@ export function wsCandidateAt(
   const pre = tyAt(ax)
   const ew = tyAt(ex)
   if !(ew is TyObj) { return "" }
+  // A record wider only inside a nested record goes on too (D3431).
+  const nested = pre is TyObj && recNestedWidthPair(ax, ex)
   if pre is TyObj {
-    if pre.objFieldNames.length <= ew.objFieldNames.length { return "" }
+    if pre.objFieldNames.length <= ew.objFieldNames.length && !nested {
+      return ""
+    }
   } else if !(pre is TyVar) {
     return ""
   }
@@ -811,7 +826,7 @@ export function wsCandidateAt(
     let f = 0
     while f < ew.objFieldNames.length {
       const sf = objFieldType(pre, ew.objFieldNames[f])
-      if sf < 0 || !tySame(sf, ew.objFieldTypes[f]) { return "" }
+      if sf < 0 || (!tySame(sf, ew.objFieldTypes[f]) && !nested) { return "" }
       f = f + 1
     }
     if !objShapeAdapterlessAt(arg, at, expected) { return "" }
@@ -1628,7 +1643,11 @@ function memberFloorMsg(objTy: i32, prop: string) {
   const ot = tyAt(objTy)
   if ot is TyObj {
     if objFieldType(ot, prop) >= 0 { return "" }
-    return "no field '" + prop + "' on " + tyToStr(objTy)
+    return "no field '"
+      + prop
+      + "' on "
+      + tyToStr(objTy)
+      + fieldNearNote(ot.objFieldNames, prop)
   }
   if ot is TyErr { return "" }
   if ot is TyUnion {
@@ -1921,24 +1940,25 @@ export function validatePrintCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrigP = printCstr.ty.length
   const cvWas = cvNow
-  let ci = 0
-  while ci < nOrigP {
+  const n = bndCount(BND_PRINT)
+  let ci = bndNextRow(BND_PRINT, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_PRINT, ci)
     if (
-      cstrOwnedBy(printCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(printCstr.ix[ci])
-      && !gnotDeadAtPin(printCstr.ty[ci], bNames, bTys)
+      cstrOwnedBy(row.fn, calleeFn)
+      && !nestCstrOutside(row.site)
+      && !gnotDeadAtPin(row.on, bNames, bTys)
     ) {
       cvNow = cvPick(CV_PRINT, ci, cvWas)
-      const cpt = substTyDeep(printCstr.ty[ci], bNames, bTys)
+      const cpt = substTyDeep(row.on, bNames, bTys)
       if (
         calleeFn >= 0
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if cpt != printCstr.ty[ci] {
-          if tyHasHole(cpt) { notePrintCstr(cpt, printCstr.ix[ci]) }
+        if cpt != row.on {
+          if tyHasHole(cpt) { notePrintCstr(cpt, row.site) }
         }
       }
       if !tyHasHole(cpt) {
@@ -1965,7 +1985,7 @@ export function validatePrintCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_PRINT, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -1981,21 +2001,19 @@ export function validateArrDefCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const n0 = arrDefCstr.ty.length
-  let ci = 0
-  while ci < n0 {
-    if (
-      cstrOwnedBy(arrDefCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(arrDefCstr.ix[ci])
-    ) {
-      const lt = arrDefCstr.ty[ci]
+  const n = bndCount(BND_ARRDEF)
+  let ci = bndNextRow(BND_ARRDEF, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_ARRDEF, ci)
+    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+      const lt = row.on
       const l = tyAt(lt)
       if l is TyArray {
         if !tyElemOpen(l) && tyHasHole(tyElemOf(l)) {
           const el = substTyDeep(tyElemOf(l), bNames, bTys)
           if tyHasHole(el) {
             if el != tyElemOf(l) && calleeFn >= 0 {
-              noteArrDefCstr(mkArrayTy(el), arrDefCstr.ix[ci])
+              noteArrDefCstr(mkArrayTy(el), row.site)
             }
           } else if (
             el >= 0
@@ -2018,7 +2036,7 @@ export function validateArrDefCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_ARRDEF, calleeFn, ci, n)
   }
   return 0
 }
@@ -2240,19 +2258,25 @@ export function pinBmCstrElems(
   // A body's own lists are pinned in place only once pass 2 has checked it; a call above the
   // declaration of a body that writes its parameter is checked after it (D16426).
   const grow = calleeFn >= 0 && nodeTyOf(calleeFn) >= 0
-  const nb = bmCstr.got.length
-  const nl = letCstr.got.length
+  const nb = bndCount(BND_BM)
+  const nl = bndCount(BND_LET)
   let ci = 0
   let li = 0
   while ci < nb || li < nl {
-    while ci < nb && !cstrOwnedBy(bmCstr.fn[ci], calleeFn) { ci = ci + 1 }
-    while li < nl && !cstrOwnedBy(letCstr.fn[li], calleeFn) { li = li + 1 }
+    while ci < nb && !cstrOwnedBy(bndAt(BND_BM, ci).fn, calleeFn) {
+      ci = ci + 1
+    }
+    while li < nl && !cstrOwnedBy(bndAt(BND_LET, li).fn, calleeFn) {
+      li = li + 1
+    }
     let takeBm = ci < nb
-    if ci < nb && li < nl { takeBm = bmCstr.seq[ci] <= letCstr.seq[li] }
+    if ci < nb && li < nl {
+      takeBm = bndAt(BND_BM, ci).seq <= bndAt(BND_LET, li).seq
+    }
     if takeBm && ci < nb {
       pinOpenElemFrom(
-        bmCstr.got[ci],
-        bmCstr.want[ci],
+        bndAt(BND_BM, ci).on,
+        bndAt(BND_BM, ci).a,
         bNames,
         bTys,
         ix,
@@ -2262,8 +2286,8 @@ export function pinBmCstrElems(
       ci = ci + 1
     } else if li < nl {
       pinOpenElemFrom(
-        letCstr.got[li],
-        letCstr.want[li],
+        bndAt(BND_LET, li).on,
+        bndAt(BND_LET, li).a,
         bNames,
         bTys,
         ix,
@@ -2304,28 +2328,28 @@ export function validateUfcsCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrigU = ufcsCstr.ty.length
   const cvWas = cvNow
-  let ci = 0
-  while ci < nOrigU {
+  const n = bndCount(BND_UFCS)
+  let ci = bndNextRow(BND_UFCS, calleeFn, -1, n)
+  while ci < n {
     if (
-      cstrOwnedBy(ufcsCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(ufcsCstr.ix[ci])
+      cstrOwnedBy(bndAt(BND_UFCS, ci).fn, calleeFn)
+      && !nestCstrOutside(bndAt(BND_UFCS, ci).site)
     ) {
       cvNow = cvPick(CV_UFCS, ci, cvWas)
-      const ur = substTyDeep(ufcsCstr.ty[ci], bNames, bTys)
+      const ur = substTyDeep(bndAt(BND_UFCS, ci).on, bNames, bTys)
       if (
         calleeFn >= 0
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if ur != ufcsCstr.ty[ci] {
+        if ur != bndAt(BND_UFCS, ci).on {
           if tyHasHole(ur) {
             noteUfcsCstr(
               ur,
-              ufcsCstr.prop[ci],
-              ufcsCstr.ix[ci],
-              ufcsCstr.p0[ci],
+              bndAt(BND_UFCS, ci).s,
+              bndAt(BND_UFCS, ci).site,
+              bndAt(BND_UFCS, ci).a,
             )
           }
         }
@@ -2333,14 +2357,14 @@ export function validateUfcsCstrs(
       if !tyHasHole(ur) {
         // The member-call order at the pinned receiver (D2517): a built-in method or a field
         // takes the call over the `self`-function, and must fit how the body used it.
-        const uRung = memberRungOnTy(ur, ufcsCstr.prop[ci])
+        const uRung = memberRungOnTy(ur, bndAt(BND_UFCS, ci).s)
         if uRung != 0 {
           let uWho0 = "the callee's body"
           if who != "" { uWho0 = "the body of `" + who + "`" }
           memberPinFitsAt(
-            ufcsCstr.ix[ci],
+            bndAt(BND_UFCS, ci).site,
             ur,
-            ufcsCstr.prop[ci],
+            bndAt(BND_UFCS, ci).s,
             uRung,
             bNames,
             bTys,
@@ -2348,11 +2372,11 @@ export function validateUfcsCstrs(
             uWho0,
           )
           let mi = 0
-          while mi < ufcsCstr.more[ci].length {
+          while mi < bndAt(BND_UFCS, ci).more.length {
             memberPinFitsAt(
-              ufcsCstr.more[ci][mi],
+              bndAt(BND_UFCS, ci).more[mi],
               ur,
-              ufcsCstr.prop[ci],
+              bndAt(BND_UFCS, ci).s,
               uRung,
               bNames,
               bTys,
@@ -2363,50 +2387,58 @@ export function validateUfcsCstrs(
           }
         }
         // An overloaded call noted no `self` type: each pin picks its own candidate.
-        if uRung == 0 && ufcsCstr.p0[ci] < 0 {
+        if uRung == 0 && bndAt(BND_UFCS, ci).a < 0 {
           let oWho = "the callee's body"
           if who != "" { oWho = "the body of `" + who + "`" }
           ovPinCheck(
-            ufcsCstr.ix[ci],
+            bndAt(BND_UFCS, ci).site,
             ur,
-            ufcsCstr.prop[ci],
+            bndAt(BND_UFCS, ci).s,
             bNames,
             bTys,
             ix,
             oWho,
           )
-          for mo in ufcsCstr.more[ci] {
-            ovPinCheck(mo, ur, ufcsCstr.prop[ci], bNames, bTys, ix, oWho)
+          for mo in bndAt(BND_UFCS, ci).more {
+            ovPinCheck(mo, ur, bndAt(BND_UFCS, ci).s, bNames, bTys, ix, oWho)
           }
         } else if uRung == 0 {
-          if !assignable(ur, ufcsCstr.p0[ci]) {
-            let uMsg = memberFloorMsg(ur, ufcsCstr.prop[ci])
+          if !assignable(ur, bndAt(BND_UFCS, ci).a) {
+            let uMsg = memberFloorMsg(ur, bndAt(BND_UFCS, ci).s)
             let uSuggest = ""
             if uMsg == "" {
-              uMsg = "no method '." + ufcsCstr.prop[ci] + "' on " + tyToStr(ur)
-              uSuggest = methodDidYouMean(ur, ufcsCstr.prop[ci])
+              uMsg = "no method '."
+                + bndAt(BND_UFCS, ci).s
+                + "' on "
+                + tyToStr(ur)
+              uSuggest = methodDidYouMean(ur, bndAt(BND_UFCS, ci).s)
             }
             let uWho = "the callee's body"
             if who != "" { uWho = "the body of `" + who + "`" }
             tErr(
               uMsg
                 + " — the `"
-                + ufcsCstr.prop[ci]
+                + bndAt(BND_UFCS, ci).s
                 + "` in scope takes "
-                + tyToStr(ufcsCstr.p0[ci])
+                + tyToStr(bndAt(BND_UFCS, ci).a)
                 + " ("
                 + uWho
                 + " at the call's argument types)"
                 + uSuggest,
               ix,
             )
-          } else if !tyHasHole(ufcsCstr.p0[ci]) {
-            ufcsRecvPinSeam(ufcsCstr.ix[ci], ur, ufcsCstr.p0[ci], ix)
+          } else if !tyHasHole(bndAt(BND_UFCS, ci).a) {
+            ufcsRecvPinSeam(
+              bndAt(BND_UFCS, ci).site,
+              ur,
+              bndAt(BND_UFCS, ci).a,
+              ix,
+            )
           }
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_UFCS, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -2555,7 +2587,7 @@ function callPinOpenArityMsg(recv: i32, prop: string, site: i32): string {
 }
 
 // Whether the deferred receiver-classification constraints this binding resolves hold — see
-// `memCstr.ty`'s header for why the index and UFCS arms cannot decide it in the body (D651 /
+// `BND_MEM`'s header for why the index and UFCS arms cannot decide it in the body (D651 /
 // D691). The index form defers to the argument-flow gate where it already speaks; a receiver
 // that is not the bare parameter is uncovered by either gate, a known bound rather than a defect.
 export function validateMemCstrs(
@@ -2568,21 +2600,21 @@ export function validateMemCstrs(
   hArgNo: i32[],
   hArgNode: i32[],
 ) {
-  const nOrigM = memCstr.ty.length
   const cvWas = cvNow
   const told0: i32[] = []
-  let ci = 0
-  while ci < nOrigM {
+  const n = bndCount(BND_MEM)
+  let ci = bndNextRow(BND_MEM, calleeFn, -1, n)
+  while ci < n {
     if (
-      cstrOwnedBy(memCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(memCstr.ix[ci])
-      && !gnotDeadAtPin(memCstr.ty[ci], bNames, bTys)
+      cstrOwnedBy(bndAt(BND_MEM, ci).fn, calleeFn)
+      && !nestCstrOutside(bndAt(BND_MEM, ci).site)
+      && !gnotDeadAtPin(bndAt(BND_MEM, ci).on, bNames, bTys)
     ) {
       cvNow = cvPick(CV_MEM, ci, cvWas)
-      const mr = substTyDeep(memCstr.ty[ci], bNames, bTys)
+      const mr = substTyDeep(bndAt(BND_MEM, ci).on, bNames, bTys)
       refuseEmptyListCalledArg(
-        memCstr.ty[ci],
-        memCstr.prop[ci],
+        bndAt(BND_MEM, ci).on,
+        bndAt(BND_MEM, ci).s,
         mr,
         who,
         hNames,
@@ -2595,14 +2627,23 @@ export function validateMemCstrs(
         || substNestMode == SUBST_NESTED
         || substNestMode == SUBST_HOLES
       ) {
-        if mr != memCstr.ty[ci] {
+        if mr != bndAt(BND_MEM, ci).on {
           if tyHasHole(mr) {
             // A function value's arity is known before its types are (D5750).
-            const am = callPinOpenArityMsg(mr, memCstr.prop[ci], memCstr.ix[ci])
+            const am = callPinOpenArityMsg(
+              mr,
+              bndAt(BND_MEM, ci).s,
+              bndAt(BND_MEM, ci).site,
+            )
             if am != "" {
               tErr(memCstrAtCallMsg(am, who), ix)
             } else {
-              noteMemCstr(mr, memCstr.prop[ci], memCstr.ix[ci], memCstr.dem[ci])
+              noteMemCstr(
+                mr,
+                bndAt(BND_MEM, ci).s,
+                bndAt(BND_MEM, ci).site,
+                bndAt(BND_MEM, ci).a == 1,
+              )
             }
           }
         }
@@ -2612,12 +2653,12 @@ export function validateMemCstrs(
         // A resolved index operator: BANK it on its site for the emitter's dispatch rewrite,
         // or the read/write reaches the emitter as a raw Index over a receiver with no list
         // rep — a clause-2 emit reject on a check-clean program (D1892). GET's site is the
-        // index node, SET's the assignment node; each constraint carries the right `memCstr.ix`.
+        // index node, SET's the assignment node; each constraint carries the right `site`.
         if opIdxDeclared() && !tyBuiltinIndexable(mr) {
-          if memCstr.prop[ci] == OP_INDEX_GET {
+          if bndAt(BND_MEM, ci).s == OP_INDEX_GET {
             const gfn = opSelfFnKeyFor(OP_INDEX_GET, mr)
             if gfn != "" {
-              opSiteBank(memCstr.ix[ci], gfn)
+              opSiteBank(bndAt(BND_MEM, ci).site, gfn)
             } else {
               // A SET-only receiver has no readable index: the inline arm refuses an annotated
               // one here, so the hole path must too — `indexFloorMsg` answers "" for it (it
@@ -2635,10 +2676,10 @@ export function validateMemCstrs(
                 skip = true
               }
             }
-          } else if memCstr.prop[ci] == OP_INDEX_SET {
+          } else if bndAt(BND_MEM, ci).s == OP_INDEX_SET {
             const sfn = opSelfFnKeyFor(OP_INDEX_SET, mr)
             if sfn != "" {
-              opSiteBank(memCstr.ix[ci], sfn)
+              opSiteBank(bndAt(BND_MEM, ci).site, sfn)
             } else if opSelfFnKeyFor(OP_INDEX_GET, mr) != "" {
               // A GET operator with no SET: name the missing half, as the inline arm does.
               tErr(
@@ -2651,23 +2692,27 @@ export function validateMemCstrs(
             }
           }
         }
-        if memCstr.prop[ci] == OP_INDEX_GET {
+        if bndAt(BND_MEM, ci).s == OP_INDEX_GET {
           if tyRefusesArrayDemand(mr) { skip = true }
         }
         // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
         // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
         // is a real array/map write. The SET operator's own site is settled just above.
-        if memCstr.prop[ci] == OP_INDEX_SET { skip = true }
+        if bndAt(BND_MEM, ci).s == OP_INDEX_SET { skip = true }
         if !skip {
-          const mMsg = memCstrMsg(mr, memCstr.prop[ci], memCstr.ix[ci])
+          const mMsg = memCstrMsg(
+            mr,
+            bndAt(BND_MEM, ci).s,
+            bndAt(BND_MEM, ci).site,
+          )
           if mMsg != "" {
             // Refuses in the hole's own words, attributed to the argument only when exactly
             // one parameter is spelled with this type variable — otherwise naming one would guess.
             let told = false
-            if memCstr.dem[ci] {
-              const dNo = cstrArgNoOf(memCstr.ty[ci], hNames, hArgNo)
-              if dNo > 0 && cstrArgCountOf(memCstr.ty[ci], hNames) == 1 {
-                const dTy = tpDemandTy(memCstr.ty[ci], calleeFn)
+            if bndAt(BND_MEM, ci).a == 1 {
+              const dNo = cstrArgNoOf(bndAt(BND_MEM, ci).on, hNames, hArgNo)
+              if dNo > 0 && cstrArgCountOf(bndAt(BND_MEM, ci).on, hNames) == 1 {
+                const dTy = tpDemandTy(bndAt(BND_MEM, ci).on, calleeFn)
                 if dTy >= 0 {
                   argMismatchErr(
                     dNo,
@@ -2684,7 +2729,7 @@ export function validateMemCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_MEM, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -2701,20 +2746,20 @@ export function validateOpLayoutCstrs(
   if bNames.length == 0 { return 0 }
   const calleeFn = fnDeclIx[fn] ?? -1
   if calleeFn < 0 { return 0 }
-  const nOrig = memCstr.ty.length
+  const nOrig = bndCount(BND_MEM)
   let ci = 0
   while ci < nOrig {
     if (
-      memCstr.fn[ci] == calleeFn
-      && keyHasPrefix(memCstr.prop[ci], MC_LAYOUT_MARK)
+      bndAt(BND_MEM, ci).fn == calleeFn
+      && keyHasPrefix(bndAt(BND_MEM, ci).s, MC_LAYOUT_MARK)
     ) {
-      const mr = substTyDeep(memCstr.ty[ci], bNames, bTys)
+      const mr = substTyDeep(bndAt(BND_MEM, ci).on, bNames, bTys)
       if tyHasHole(mr) {
-        if mr != memCstr.ty[ci] {
-          noteMemCstr(mr, memCstr.prop[ci], memCstr.ix[ci], false)
+        if mr != bndAt(BND_MEM, ci).on {
+          noteMemCstr(mr, bndAt(BND_MEM, ci).s, bndAt(BND_MEM, ci).site, false)
         }
       } else {
-        const m = memCstrMsg(mr, memCstr.prop[ci], memCstr.ix[ci])
+        const m = memCstrMsg(mr, bndAt(BND_MEM, ci).s, bndAt(BND_MEM, ci).site)
         if m != "" { tErr(memCstrAtCallMsg(m, opDeclLabel(fn)), ix) }
       }
     }
@@ -3931,21 +3976,41 @@ export function validateIsCstrs(
   calleeFn: i32,
   who: string,
 ) {
-  const nOrig = isCstr.ty.length
-  let ci = 0
-  while ci < nOrig {
-    if cstrOwnedBy(isCstr.fn[ci], calleeFn) && !nestCstrOutside(isCstr.ix[ci]) {
-      const ct = substTyDeep(isCstr.ty[ci], bNames, bTys)
+  const n = bndCount(BND_IS)
+  let ci = bndNextRow(BND_IS, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_IS, ci)
+    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+      const ct = substTyDeep(row.on, bNames, bTys)
       if tyHasHole(ct) {
-        if calleeFn >= 0 && ct != isCstr.ty[ci] {
-          noteIsCstr(ct, isCstr.chk[ci], isCstr.name[ci], isCstr.ix[ci])
+        if calleeFn >= 0 && ct != row.on {
+          noteIsCstr(ct, row.a, row.s, row.site)
         }
+      } else if (
+        ct >= 0
+        && row.a >= 0
+        && row.a < T.tys.length
+        && tyAt(row.a) is TyArray
+      ) {
+        // A list whose element is fixed answers as the annotated spelling does, never matching
+        // a tested element it cannot meet; an open one fits every test (D16342).
+        // A pin that is not a bare list (a union of lists) keeps the test's own answer.
+        const ca = tyAt(ct)
+        let isList = false
+        let open = false
+        if ca is TyArray {
+          isList = true
+          open = tyElemOpen(ca) || tyHasHole(ct)
+        }
+        const meets = !isList || assignable(row.a, ct)
+        const kind = if open { LIP_OPEN } else if meets { LIP_MEET } else { LIP_APART }
+        listIsPinNote(row.site, kind, ix)
       } else if ct >= 0 {
         const t = tyAt(ct)
         let base = -1
         if t is TyUnion { base = ct }
         if t is TyNullable { base = t.nInner }
-        const chk = isCstr.chk[ci]
+        const chk = row.a
         const bad = base >= 0
           && (!assignable(chk, base) || isWidenNotVariant(chk, base))
         if bad && t is TyNullable && tyHasObjMember(base) {
@@ -3954,7 +4019,7 @@ export function validateIsCstrs(
           tErr(
             pWho
               + "`is` check type '"
-              + isCstr.name[ci]
+              + row.s
               + "' is not a variant of "
               + tyToStr(ct),
             ix,
@@ -3963,7 +4028,7 @@ export function validateIsCstrs(
         }
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_IS, calleeFn, ci, n)
   }
   return 0
 }
@@ -3984,18 +4049,14 @@ export function validateNestCstrs(
     bi = bi + 1
   }
   if !anyVec { return 0 }
-  const nOrig = nestCstr.ty.length
-  let ci = 0
-  while ci < nOrig {
-    if (
-      cstrOwnedBy(nestCstr.fn[ci], calleeFn)
-      && !nestCstrOutside(nestCstr.ix[ci])
-    ) {
-      const ct = substTyDeep(nestCstr.ty[ci], bNames, bTys)
+  const n = bndCount(BND_NEST)
+  let ci = bndNextRow(BND_NEST, calleeFn, -1, n)
+  while ci < n {
+    const row = bndAt(BND_NEST, ci)
+    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
+      const ct = substTyDeep(row.on, bNames, bTys)
       if tyHasHole(ct) {
-        if calleeFn >= 0 && ct != nestCstr.ty[ci] {
-          noteNestCstr(ct, nestCstr.ix[ci])
-        }
+        if calleeFn >= 0 && ct != row.on { noteNestCstr(ct, row.site) }
       } else if tyNestsV128(ct, 8) {
         let pWho = "a type parameter is stored in a container here: "
         if who != "" {
@@ -4017,7 +4078,7 @@ export function validateNestCstrs(
         return 0
       }
     }
-    ci = ci + 1
+    ci = bndNextRow(BND_NEST, calleeFn, ci, n)
   }
   return 0
 }
@@ -4071,6 +4132,19 @@ export function monoRecheckEnd(sv: QuietRun) {
 // `(string | null)[]` the string-list backing (kind 9); -1 otherwise. Decided over `elem`'s member spans with no
 // split and no per-member slice, mirroring the three arms of the splitting form it replaces.
 
+// The `as` cast checked as the left operand of a `??`, or -1: set only around that operand's
+// check, so a refusal there names the spelling whose null the `??` does see.
+export let castCoalLeft = -1
+export function castCoalLeftSet(v: i32) { return castCoalLeft = v }
+
+// The refusal's note for a cast at `ix` that feeds a `??`, else "".
+function castCoalNote(asTy: string, ix: i32): string {
+  if ix < 0 || ix != castCoalLeft { return "" }
+  return "; the `??` after it never sees that null — write `(x as? "
+    + asTy
+    + ") ?? …` to default it there"
+}
+
 // `x as T` (B2) is an explicit, checked numeric conversion — unlike the implicit
 // lossless-widening rule, it permits every numeric-scalar direction (plus narrowings and
 // int/float conversions). The propagation obligation a bare `as` takes on, shared by the union
@@ -4092,7 +4166,8 @@ export function castPropagationFits(
         + tyToStr(rest)
         + " — use `as!` to trap instead, or `as?` to take the null here"
         + castWrapNote(asTy, src)
-        + "; to propagate it, annotate the enclosing function's return type",
+        + "; to propagate it, annotate the enclosing function's return type"
+        + castCoalNote(asTy, ix),
       ix,
     )
     return false
@@ -4106,7 +4181,8 @@ export function castPropagationFits(
         + "` propagates "
         + tyToStr(rest)
         + " out of the enclosing function, and there is none here — at module scope, use `as!` to trap or `as?` to take a nullable"
-        + castWrapNote(asTy, src),
+        + castWrapNote(asTy, src)
+        + castCoalNote(asTy, ix),
       ix,
     )
     return false
@@ -4120,7 +4196,8 @@ export function castPropagationFits(
         + ", which the enclosing function cannot return (it returns "
         + tyToStr(curRet)
         + ") — use `as!` to trap instead, or `as?` to take the null here"
-        + castWrapNote(asTy, src),
+        + castWrapNote(asTy, src)
+        + castCoalNote(asTy, ix),
       ix,
     )
     return false

@@ -58,8 +58,10 @@ type Want =
   | "flat-costly";
 const FIXTURES: [string, Want][] = [
   ["stored-fields", "melts"],
+  ["global-initializer", "melts"],
   ["proof-rows", "grid"],
   ["width-subtyped", "grid"],
+  ["global-initializer-aliases", "grid"],
   ["kept-written", "kept"],
   ["kept-nullable", "kept"],
   ["kept-subtype", "kept"],
@@ -89,6 +91,7 @@ const FIXTURES: [string, Want][] = [
 // `<fixture> --stable-layout` for its `--stable-layout` one.
 const EXPLAIN: Record<string, RegExp> = {
   "stored-fields": /type \d+ field \d+ \(type \d+\): inlined; 2 store\(s\)/,
+  "global-initializer": /type \d+ field 1 \(type \d+\): inlined; 1 store\(s\) \(1 taken apart at the producer/,
   "kept-written": /refused: its fields are written \(struct\.set/,
   "kept-nullable": /not inlined: a value whose type admits null is stored into it/,
   "kept-identity": /refused: its identity is observable \(ref\.eq or extern\.convert_any in /,
