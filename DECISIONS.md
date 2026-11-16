@@ -12395,3 +12395,16 @@ the existing tagged dispatch serves it; no instance is re-keyed after the tag de
 second precision mechanism in the class engine, or a re-keying step after settle, would be a second
 place that decides storage, which the one-decider work removes. A union is the sound direction: it
 can cost size, never a wrong value, and the pin catches the day it costs a refusal.
+
+## The at-call solve lands before the late storage pass is deleted, one class at a time (2026-11-16, chosen under the owner's delegation) — L2 S3.4d, STORE, D16747
+
+**The rule.** S3.4d's per-call arrow solve lands first with no storage consumer (byte-identical).
+Then each class of late storage decisions moves in its own PR: `fnTagDecide` reads the solve and that
+class's `fnTagRedecide` branch is deleted in the same change; `fnTagRedecide` itself goes last. A
+partial function set whose members split at a call (D16747) is tagged by that solve, not by a second
+dispatch keyed on the closure; until then `#8640`'s refusal stands.
+
+**Why.** The earlier plan line ("S3.4d must not land before `fnTagRedecide` is deleted") was circular:
+most remaining late decisions need the solve's per-call results to move. Staging keeps the invariant
+it protected (storage has one decider at every commit) without the cycle, and one dispatch mechanism
+serves every set.
