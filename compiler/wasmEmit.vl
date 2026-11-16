@@ -506,7 +506,6 @@ import {
   cloLiftWriteCount,
   cloLiftedFes,
   cloStructIdx,
-  cmSet,
   cmSlot,
   coalLinkChains,
   coalesceCallBoolSlot,
@@ -14933,7 +14932,6 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
   // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
   // construction — an Ident/global/constructor).
   if pushMapRecvRef(recvIx, fnIx) < 0 { return -1 }
-  const recvSet = mshape0 != mshape
   // A string-keyed map's key is a string ref — shield it from an atom-typed destination, which
   // would lower the key literal as an i32 atom id. An i32 key wants no shielding but is unharmed by it. An inner map
   // op in the key expression also clobbers `cmSlot`, so pin it afterwards.
@@ -14945,7 +14943,6 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
   else { kr = emitExpr(keyIx, fnIx) }
   if kr < 0 { return -1 }
   cmSlot = mshape
-  cmSet = recvSet
   return 0
 }
 
@@ -16305,10 +16302,11 @@ function emitMapSetV(
       }
     }
   }
+  // A Set's store leaves its never-read `vals` alone, on helper rows of its own.
+  const mset = mapShapeIsSet(mapShapeOfExpr(recvIx, fnIx))
   // Receiver + key onto the operand stack; `cmSlot` pinned to the shape.
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   const mslot = cmSlot
-  const mset = cmSet
   // VALUE next — evaluated ONCE, while the map is still untouched and recv/key are
   // still stack-parked — then stashed. Only probe/store machinery runs after this.
   if valConst1 {
@@ -16319,7 +16317,6 @@ function emitMapSetV(
     }
   }
   cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
-  cmSet = mset
   // A set whose value the assignment yields keeps it in the value stash.
   const park = asgParkWanted && !valConst1 && !msHelp
   // [mapRef, key, value] are the shape's store helper's params, in order; a Set has its own.
@@ -16333,7 +16330,7 @@ function emitMapSetV(
   if setMapSetValStash(mslot) < 0 { return -1 }
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef()              // mapRef
-  const stRc = emitMapSetStore(mslot)
+  const stRc = emitMapSetStore(mslot, mset)
   if park { mapSetParked(mslot) }
   return stRc
 }
@@ -16384,6 +16381,11 @@ function mapShapeRow(sh: i32) {
   return sh + 2
 }
 
+// Whether map shape `sh` is a Set's, string-, i32- or i64-keyed.
+function mapShapeIsSet(sh: i32): boolean {
+  return sh == -2 || sh == -5 || sh == -7
+}
+
 // The Set shape over the same key as mono map shape `sh`; `sh` itself for any other shape.
 function mapShapeOfSet(sh: i32) {
   if sh == -1 { return -2 }
@@ -16425,10 +16427,8 @@ export function mapSetFnBody(sh: i32): u8[] {
   const body: u8[] = []
   const prev = wTarget(body)
   const savedSlot = cmSlot
-  const savedSet = cmSet
   const savedBase = mapScratchBase
   cmSlot = mapShapeFoldSet(sh)
-  cmSet = cmSlot != sh
   wULEB(6)
   wULEB(3)
   fbValtype("i32", -1) // 3 slot, 4 cap, 5 entry
@@ -16448,20 +16448,19 @@ export function mapSetFnBody(sh: i32): u8[] {
   fbRefValtype(aTy()) // 12 liveBk, 13 hashBk
   mapScratchBase = 0
   msHelp = true
-  emitMapSetStore(cmSlot)
+  emitMapSetStore(cmSlot, mapShapeIsSet(sh))
   msHelp = false
   mapScratchBase = savedBase
   cmSlot = savedSlot
-  cmSet = savedSet
   fbEnd()
   wTarget(prev)
   return body
 }
 
 // A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
-// appends, compacting first when the dead entries call for it, and maybe resizes.
-function emitMapSetStore(mslot: i32) {
-  const isSet = cmSet
+// appends, compacting first when the dead entries call for it, and maybe resizes. A Set's
+// (`isSet`) leaves its `vals` alone: a hit does nothing and a miss pushes only the key.
+function emitMapSetStore(mslot: i32, isSet: boolean) {
   emitMapProbe(true, true)
   pushMapScr(5) // entry
   if isSet {

@@ -1,9 +1,9 @@
 # 2026-11-16 — B6a-opt: a Set stops writing and growing its `vals` list
 
-Lane AE4. Code: `compiler/wasmEmit.vl` (`mapShapeRow`, `mapShapeOfSet`, `emitMapRecvKey`,
-`emitMapSetV`, `mapSetFnBody`, `emitMapSetStore`) and `compiler/emit_sections.vl`
+Lane AE4. Code: `compiler/wasmEmit.vl` (`mapShapeRow`, `mapShapeOfSet`,
+`emitMapSetV`, `mapSetFnBody`, `emitMapSetStore`, `mapShapeIsSet`) and `compiler/emit_sections.vl`
 (`mapCompactRowShape`, `mapShapeCompactable`, `MapCompactTys.isSet`,
-`emitMapCompactFnCode`, `mapCompactSlide`), plus `cmSet` in `compiler/emit_state.vl`.
+`emitMapCompactFnCode`, `mapCompactSlide`).
 
 ## What changed
 
@@ -26,8 +26,8 @@ compaction skips field 1. The `vals` list stays the empty list `Set()` built.
 The struct layout is unchanged, so box tags, casts, field indices and the shared probe and
 resize bytes all stay as they were. Each Set still allocates one empty `vals` wrapper at
 construction, and its backing is the module's shared empty array. Maps take no new branch:
-the Set test is made while emitting, through `cmSet`, which `emitMapRecvKey` sets from the
-receiver's unfolded shape and each Set helper sets from its row's.
+the Set test is made while emitting, as a parameter of `emitMapSetStore`, from the receiver's
+unfolded shape at a set site and from the row's shape in a Set helper.
 
 ## Inventory (read-only survey before the change)
 
