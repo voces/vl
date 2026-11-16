@@ -50,7 +50,7 @@ The population is 19,940 files: all of `tests/cases` outside `modules/`, `distil
 **No merge.** The ids never call equal two rows that the comparer calls unequal. So `==` on the ids
 answers "equal" correctly every time it does.
 
-**127 splits, in 11 files.** Every one is at a recursive type:
+**127 splits, in 9 files.** Two files split under both comparers. Every one is at a recursive type:
 
 | comparer | splits | file |
 |---|---:|---|
