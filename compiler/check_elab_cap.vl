@@ -743,6 +743,10 @@ let elabMakerCallSigs: {[i32]: i32} = Map()
 // The callee read of each such call, and the makers one of whose reads takes no instance.
 let elabMakerCalleeReads: {[i32]: boolean} = Map()
 let elabMakersBlocked: {[i32]: boolean} = Map()
+// For a maker blocked only by reads no noted call covered, those reads; a maker blocked for any
+// other reason is not here.
+let elabMakerUncovered: {[i32]: i32[]} = Map()
+let elabMakersOtherBlocked: {[i32]: boolean} = Map()
 // The instanced relays whose returned maker calls are built per delivered result: each instance
 // takes the result its call delivers it at (D16780).
 let elabRelaysPerResult: {[i32]: boolean} = Map()
@@ -751,6 +755,8 @@ export function elabMakerCallReset() {
   elabMakerCallSigs = Map()
   elabMakerCalleeReads = Map()
   elabMakersBlocked = Map()
+  elabMakerUncovered = Map()
+  elabMakersOtherBlocked = Map()
   elabRelaysPerResult = Map()
   return 0
 }
@@ -773,6 +779,15 @@ export function elabMakerCallNote(call: i32, sig: i32) {
   return 0
 }
 
+// The call that initialises the un-annotated binding read `r` names, or -1.
+function elabMakerBindingCall(r: i32): i32 {
+  const d = if r >= 0 && r < P.nodes.length && nodeAt(r) is Ident { identDeclOf(r) } else { -1 }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letInit < 0 { return -1 }
+  const c = parenPeelIx(dn.letInit)
+  return if c >= 0 && c < P.nodes.length && nodeAt(c) is Call { c } else { -1 }
+}
+
 // Whether read `r` is the callee of a noted maker call.
 export function elabMakerReadCalled(r: i32): boolean {
   return elabMakerCalleeReads.get(r) ?? false
@@ -781,6 +796,43 @@ export function elabMakerReadCalled(r: i32): boolean {
 // Withdraws maker `m` from instancing: one of its reads reaches its root.
 export function elabMakerBlock(m: i32) {
   elabMakersBlocked[m] = true
+  elabMakersOtherBlocked[m] = true
+  return 0
+}
+
+// Withdraws maker `m` from instancing because reads `rs` of it are the callee of no noted call.
+export function elabMakerCoverBlock(m: i32, rs: i32[]) {
+  elabMakersBlocked[m] = true
+  elabMakerUncovered[m] = rs
+  return 0
+}
+
+// Notes maker call `c` at closed result `w` where no result is noted for it yet, and returns its
+// maker to instancing once every read a cover block named is covered; whether it noted (D16846).
+export function elabMakerTwinNote(c: i32, w: i32): boolean {
+  if elabMakerCallSigs.has(c) { return false }
+  elabMakerCallNote(c, w)
+  const cn = nodeAt(c)
+  const f = if cn is Call { parenPeelIx(cn.callFn) } else { -1 }
+  if f >= 0 && nodeAt(f) is Ident { elabMakerCoverLift(identDeclOf(f)) }
+  return true
+}
+
+// Returns maker `m` to instancing where a cover block withdrew it and every read it named is now
+// the callee of a noted call, or reads a binding whose maker call is noted.
+function elabMakerCoverLift(m: i32) {
+  const rs = elabMakerUncovered.get(m) ?? []
+  if rs.length == 0 || (elabMakersOtherBlocked.get(m) ?? false) { return 0 }
+  for r in rs {
+    if (
+      !elabMakerReadCalled(r)
+      && elabMakerCallSig(elabMakerBindingCall(r)) < 0
+    ) {
+      return 0
+    }
+  }
+  elabMakersBlocked[m] = false
+  elabMakerUncovered[m] = []
   return 0
 }
 
@@ -3952,7 +4004,9 @@ export function fnTagHeldNote(x: i32) {
   if recs { fnTagHeldRecLits(v0, r) }
   // A bound record literal is built at the rep's record, and each list of lists it holds in a
   // field at the rep's field, as a bound list of lists is (D16806).
-  if n is LetDecl && r >= 0 && r != t { fnTagHeldRecFields(v0, r) }
+  if (n is LetDecl || n is ObjLit) && r >= 0 && r != t {
+    fnTagHeldRecFields(v0, r)
+  }
   return 0
 }
 
@@ -4226,21 +4280,37 @@ export function fnTagHeldWrittenInner(v: i32, r: i32, depth: i32) {
   return 0
 }
 
-// Queues record literal `x` of a list written whole to be built at record rep `r`; any other
-// value is a read, which keeps its own rep.
+// Queues record literal `x` of a list written whole to be built at record rep `r`, its nested
+// record literals at `r`'s fields (D16835); any other value is a read, which keeps its own rep.
 function fnTagHeldWrittenRec(x: i32, r: i32) {
   const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
   const ro = if r >= 0 && r < T.tys.length { tyAt(r) } else { null }
-  if xn is ObjLit && ro is TyObj {
-    fnTagHeldRecs.push(x)
-    fnTagHeldRecs.push(r)
-  }
+  if xn is ObjLit && ro is TyObj { fnTagHeldRecLit(x, r) }
   return 0
 }
 
 // The record literals `fnTagHeldInner` found built at another record, each beside that record;
 // the tag pass stamps and drains them.
 export let fnTagHeldRecs: i32[] = []
+
+// Whether record type `t` holds a list of lists in a field, or in a nested record's.
+export function fnTagRecHoldsListOfLists(t: i32): boolean {
+  const seen: i32[] = []
+  return fnTagRecHoldsListOfListsIn(t, seen)
+}
+
+function fnTagRecHoldsListOfListsIn(t: i32, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return false }
+  seen.push(t)
+  const o = tyAt(t)
+  if !(o is TyObj) { return false }
+  for f in o.objFieldTypes {
+    if fnTagListOfLists(f) || fnTagRecHoldsListOfListsIn(f, seen) {
+      return true
+    }
+  }
+  return false
+}
 
 // Whether `t` is a list whose element is a list.
 function fnTagListOfLists(t: i32): boolean {
@@ -4276,17 +4346,16 @@ function fnTagHeldInner(v: i32, r: i32, depth: i32) {
       if tyElemOf(ro) != nodeTyIxOf(ex) { fnTagHeldRep[ex] = tyElemOf(ro) }
       fnTagHeldInner(ex, tyElemOf(ro), depth + 1)
     }
-    // A record literal whose function field the rep holds as its id is built at the rep's
-    // record, so it shares that record's row.
+    // A record literal whose function field, or a nested record's, the rep holds as its id is
+    // built at the rep's record, its nested record literals at that record's fields (D16835).
     if (
       ex >= 0
       && ex < P.nodes.length
       && nodeAt(ex) is ObjLit
       && eo is TyObj
-      && fnTagHasTaggedField(nodeTyIxOf(ex))
+      && (fnTagHasTaggedField(nodeTyIxOf(ex)) || tyElemOf(ro) != nodeTyIxOf(ex))
     ) {
-      fnTagHeldRecs.push(ex)
-      fnTagHeldRecs.push(tyElemOf(ro))
+      fnTagHeldRecLit(ex, tyElemOf(ro))
     }
   }
   return 0
