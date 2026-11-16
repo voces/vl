@@ -59,6 +59,7 @@ The atom-compare misses that remain, counted as functions held by that class alo
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical; moving `emitBinLitEq`'s doc comment back is seed-identical |
-| corpus identity against the N2a seed, 12,223 cells | CORPUS_ID |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,314 claimed and byte-identical, the same 2 fallbacks as before; corpus CORPUS_M3 |
+| corpus identity against the N2a seed, 12,223 cells | 8,944 identical, 3,279 fail under both, 0 differ (so the `emitBinLitEq` split moves no corpus byte) |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,314 claimed and byte-identical, the same 2 fallbacks as before; corpus 8,944 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 95,918,084,809 to 96,043,131,943 (+0.13%) |
 | seed size, N2a seed to this one | 6,496,504 to 6,500,468 (+3,964) |
