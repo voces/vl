@@ -492,6 +492,7 @@ import {
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
+  tyPathEnter,
   tyReachesBrand,
   tyReachesEmptyHole,
   tyReachesUnion,
@@ -2990,7 +2991,7 @@ function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
   }
   match gt {
     TyFunc => {
-      return tyHoldsNoFn(w, 0)
+      return tyHoldsNoFn(w)
     }
     TyNullable => {
       return fnShapeClash(gt.nInner, w, depth + 1)
@@ -3024,8 +3025,23 @@ function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
 
 // Whether no value of type `w` is a function: a scalar, a literal, or a union or nullable of
 // those. A type parameter, a record, a list or anything else may be one or is judged elsewhere.
-function tyHoldsNoFn(w: i32, depth: i32): boolean {
-  if w < 0 || w >= T.tys.length || depth > 8 { return false }
+function tyHoldsNoFn(w: i32): boolean {
+  const path: i32[] = []
+  return tyHoldsNoFnIn(w, path)
+}
+
+// `tyHoldsNoFn` along walk `path`: a union or record already on it closes a cycle, which answers the
+// value an exhausted walk gives.
+function tyHoldsNoFnIn(w: i32, path: i32[]): boolean {
+  const at = tyPathEnter(w, path)
+  if at < 0 { return false }
+  const r = tyHoldsNoFnBody(w, path)
+  if at > 0 { path.pop() }
+  return r
+}
+
+function tyHoldsNoFnBody(w: i32, path: i32[]): boolean {
+  if w < 0 || w >= T.tys.length { return false }
   const t = tyAt(w)
   match t {
     TyLit => {
@@ -3042,11 +3058,11 @@ function tyHoldsNoFn(w: i32, depth: i32): boolean {
         || t.primName == "null"
     }
     TyNullable => {
-      return tyHoldsNoFn(t.nInner, depth + 1)
+      return tyHoldsNoFnIn(t.nInner, path)
     }
     TyUnion => {
       for m in t.uMembers {
-        if !tyHoldsNoFn(m, depth + 1) { return false }
+        if !tyHoldsNoFnIn(m, path) { return false }
       }
       return true
     }
@@ -3138,8 +3154,23 @@ export function validateRetCstrs(
 // Whether the deferred destination constraints this binding resolves hold — the twin of
 // Whether every hole of `t` sits inside a function type, reached through lists, nullables and
 // record fields only: a hole anywhere else is a value's own open type, not a delivered function's.
-function holesOnlyInFns(t: i32, depth: i32): boolean {
-  if t < 0 || t >= T.tys.length || depth > 16 { return false }
+function holesOnlyInFns(t: i32): boolean {
+  const path: i32[] = []
+  return holesOnlyInFnsIn(t, path)
+}
+
+// `holesOnlyInFns` along walk `path`: a union or record already on it closes a cycle, which answers the
+// value an exhausted walk gives.
+function holesOnlyInFnsIn(t: i32, path: i32[]): boolean {
+  const at = tyPathEnter(t, path)
+  if at < 0 { return false }
+  const r = holesOnlyInFnsBody(t, path)
+  if at > 0 { path.pop() }
+  return r
+}
+
+function holesOnlyInFnsBody(t: i32, path: i32[]): boolean {
+  if t < 0 || t >= T.tys.length { return false }
   if !tyHasHole(t) { return true }
   const x = tyAt(t)
   match x {
@@ -3147,14 +3178,14 @@ function holesOnlyInFns(t: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return holesOnlyInFns(tyElemOf(x), depth + 1)
+      return holesOnlyInFnsIn(tyElemOf(x), path)
     }
     TyNullable => {
-      return holesOnlyInFns(x.nInner, depth + 1)
+      return holesOnlyInFnsIn(x.nInner, path)
     }
     TyObj => {
       for ft in x.objFieldTypes {
-        if !holesOnlyInFns(ft, depth + 1) { return false }
+        if !holesOnlyInFnsIn(ft, path) { return false }
       }
       return true
     }
@@ -3168,12 +3199,7 @@ function holesOnlyInFns(t: i32, depth: i32): boolean {
 // bound by the closed `want`: the delivery types the lambda's copy there, so a call of the
 // lambda at another type does not re-ask the pair.
 function lambdaCopyOnly(got: i32, want: i32): boolean {
-  if (
-    want < 0
-    || tyHasHole(want)
-    || tyHasTyVar(want)
-    || !holesOnlyInFns(got, 0)
-  ) {
+  if (want < 0 || tyHasHole(want) || tyHasTyVar(want) || !holesOnlyInFns(got)) {
     return false
   }
   const bn: string[] = []

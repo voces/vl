@@ -28,6 +28,7 @@ import {
   tyHasHole,
   tyHasInferHole,
   tyKeyOf,
+  tyPathEnter,
   tyValOf,
 } from "./check_types"
 import { wsNoteInstErr } from "./check_width"
@@ -541,7 +542,7 @@ export function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
       if !tyHasHole(want) && namesTopFnDecl(ix) { return 0 }
       // So does one held in a literal or handed back by a call: every hole rides such a
       // function's own signature, which the delivery judged against `want` (D9031).
-      if !tyHasHole(want) && tyHolesOnlyInTopFnSigs(got, 8) { return 0 }
+      if !tyHasHole(want) && tyHolesOnlyInTopFnSigs(got) { return 0 }
     }
     letCstrRow(got, want, ix, name, owner)
   }
@@ -603,37 +604,52 @@ function namesTopFnDecl(ix: i32): boolean {
 
 // Whether every hole in `ty` sits inside the open signature of a top-level function with an
 // un-annotated parameter whose body is not being checked; false at the depth floor.
-function tyHolesOnlyInTopFnSigs(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+function tyHolesOnlyInTopFnSigs(ty: i32): boolean {
+  const path: i32[] = []
+  return tyHolesOnlyInTopFnSigsIn(ty, path)
+}
+
+// `tyHolesOnlyInTopFnSigs` along walk `path`: a union or record already on it closes a cycle, which answers the
+// value an exhausted walk gives.
+function tyHolesOnlyInTopFnSigsIn(ty: i32, path: i32[]): boolean {
+  const at = tyPathEnter(ty, path)
+  if at < 0 { return false }
+  const r = tyHolesOnlyInTopFnSigsBody(ty, path)
+  if at > 0 { path.pop() }
+  return r
+}
+
+function tyHolesOnlyInTopFnSigsBody(ty: i32, path: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
   if !tyHasHole(ty) { return true }
   const t = tyAt(ty)
   return match t {
     TyFunc => {
       if fnTyIsTopHoleSig(t) { return true }
       for p in t.fnParamTypes {
-        if !tyHolesOnlyInTopFnSigs(p, depth - 1) { return false }
+        if !tyHolesOnlyInTopFnSigsIn(p, path) { return false }
       }
-      tyHolesOnlyInTopFnSigs(t.fnRet, depth - 1)
+      tyHolesOnlyInTopFnSigsIn(t.fnRet, path)
     }
-    TyArray => tyHolesOnlyInTopFnSigs(tyElemOf(t), depth - 1)
-    TyNullable => tyHolesOnlyInTopFnSigs(t.nInner, depth - 1)
+    TyArray => tyHolesOnlyInTopFnSigsIn(tyElemOf(t), path)
+    TyNullable => tyHolesOnlyInTopFnSigsIn(t.nInner, path)
     TyMap => {
-      tyHolesOnlyInTopFnSigs(tyKeyOf(t), depth - 1)
-        && tyHolesOnlyInTopFnSigs(tyValOf(t), depth - 1)
+      tyHolesOnlyInTopFnSigsIn(tyKeyOf(t), path)
+        && tyHolesOnlyInTopFnSigsIn(tyValOf(t), path)
     }
     TyObj => {
       for f in t.objFieldTypes {
-        if !tyHolesOnlyInTopFnSigs(f, depth - 1) { return false }
+        if !tyHolesOnlyInTopFnSigsIn(f, path) { return false }
       }
       true
     }
     TyUnion => {
       for m in t.uMembers {
-        if !tyHolesOnlyInTopFnSigs(m, depth - 1) { return false }
+        if !tyHolesOnlyInTopFnSigsIn(m, path) { return false }
       }
       true
     }
-    TyNeg => tyHolesOnlyInTopFnSigs(t.negTy, depth - 1)
+    TyNeg => tyHolesOnlyInTopFnSigsIn(t.negTy, path)
     TyVar | TyPrim | TyErr | TyLit => false
   }
 }
