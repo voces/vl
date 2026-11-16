@@ -26,11 +26,12 @@
 // record depth`, `diamond record depth under ==`, `diamond record depth under == with a list
 // leaf`, `a function list parameter handed down layers of callers` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Thirteen are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
 // `in-function value writes`, the two `if joins` pairs, `nested inline record types across
-// functions (fuel)`, `record-parameter field calls`, `closure arguments in one function` and
-// the four `functions under a callback parameter` pairs.
+// functions (fuel)`, `record-parameter field calls`, `closure arguments in one function`,
+// `record literal fields beside a written captured copy` and the four `functions under a
+// callback parameter` pairs.
 // The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
@@ -2655,6 +2656,35 @@ axis(
   5.0,
   "An elaboration slot query (`eplSlotCallRecs`, compiler/emit_elab.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
   (d) => twoFiles(d, genGenericProgram(1600), genGenericProgram(400)),
+);
+
+// `n` sibling fields in a record literal built inside a generic function whose closure writes a
+// captured copy of a parameter (D16724).
+const genCopiedRecordFields = (n: number): string => {
+  const gs = Array.from({ length: n }, (_, k) => `, g${k}: a`).join("");
+  return [
+    "function viaCopy<H>(a: H, c: H) {",
+    "  let b = a",
+    "  const w = () => {",
+    "    return b = c",
+    "  }",
+    "  w()",
+    "  const v = b",
+    `  const r = { f: v${gs} }`,
+    "  print(r.f)",
+    "  print(r.g0)",
+    "}",
+    "viaCopy(3, 4)",
+    "viaCopy(1.5, 2.5)",
+  ].join("\n") + "\n";
+};
+
+// A GROWTH pair, 32 fields against 8, so linear reads 4; the fixed cost holds it near 1.8.
+axis(
+  "record literal fields beside a written captured copy",
+  2.5,
+  "A record literal's slot answer is re-derived once per sibling field, which grew about cubically in its fields (D16724).",
+  (d) => twoFiles(d, genCopiedRecordFields(32), genCopiedRecordFields(8)),
 );
 
 // THE FUEL AND ALLOCATION GRADERS' CONTROL. The same program at 20x the statements against 1x:
