@@ -23,6 +23,9 @@ All `@run` programs, fixpoint seeds:
 | mint only | 433 | 391 |
 | programs fully covered | 421 | 434 |
 
+This closes 42 of the bucket's 209 keys. The other 167 still resolve to other sets, for causes not
+sampled yet; they are the next slice of this bucket.
+
 The late-changed population is unchanged at 288: the keys this covers sit in sets something else
 still blocks.
 
