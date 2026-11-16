@@ -51,19 +51,19 @@ cumulatively across a batch (part B2's note), so 16 was not a per-program count.
 
 ## Readings
 
-Fixpoint seeds: master `97ed6de1`, part B2 (#8539) and this branch, each byte-identical on a
-second refresh.
+Fixpoint seeds: master `078e4116`, with part B2 merged, and this branch merged with it, each
+byte-identical on a second refresh.
 
 | check | reading |
 |---|---|
 | distilled corpus, per cell | `regress.vl --json` byte-identical to master's; 0 runs → not-runs, 0 → silent |
-| seed size | 6,376,723 bytes: +1,974 over part B2, +2,005 over master |
-| L2 self-compile fuel | 91.082e9 against part B2's 91.056e9: +0.03% |
+| seed size | 6,389,421 bytes against master's 6,387,453: +1,968 |
+| L2 self-compile fuel | 92.062e9 against master's 92.019e9: +0.05%. Master itself reads +0.9% on `self-compile-baseline.json`, and this branch +1.0% |
 | `emit_mono` pin helpers | 908: untouched (the mono sites move through the two elab functions) |
 | `lint-self` | clean |
-| `scripts/gate.sh` | every row ok but `ir shadow` (`named/hash4h_rolled_alias_map`) and `ci-native` (`tests/vl_touch_set_test.ts`). Both fail on master's seed too |
+| `scripts/gate.sh` | every row ok but two, which fail on master's seed too: `ir shadow` (`named/hash4h_rolled_alias_map`) and `ci-native` (`tests/vl_touch_set_test.ts`) |
 
-Net against part B2: +84 compiler lines (93 added, 9 deleted).
+Net: +84 compiler lines (93 added, 9 deleted).
 
 ## Next
 
