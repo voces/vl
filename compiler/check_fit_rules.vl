@@ -4,7 +4,7 @@
 // Each answers a type or a verdict for a node the core checker has already typed.
 
 import { noteNullHoleDelivery } from "./check_null_holes"
-import { cwIxCovers } from "./check_write_scan"
+import { cwIxCoveredLen, cwIxCovers } from "./check_write_scan"
 import { recDropFits, recDropOnlyReads } from "./check_rec_drop"
 import { MemoGen, memoGenNew } from "./memo"
 import {
@@ -357,6 +357,7 @@ import {
   recOwnSrc,
   recPend,
   recPendDstTy,
+  recPendHeld,
   recPendSrc,
   recPendSrcTy,
 } from "./check_rec_rows"
@@ -3196,6 +3197,9 @@ function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
   // A list of its receiver's own elements lands them where it lands (D16767).
   const sr = recSameElemsRecv(p)
   if sr >= 0 { return recLandingIn(sr, d, c, own, depth - 1) }
+  // A loop variable or callback parameter lands its list's elements where it lands (D16803).
+  const ev = recElemVarList(p)
+  if ev >= 0 { return recLandingIn(ev, mkArrayTy(d), c, own, depth - 1) }
   // A generic handing back an element of its list literal argument lands each element there.
   const epl = recElemPinLit(p)
   const eln = if epl >= 0 { nodeAt(epl) } else { null }
@@ -3765,6 +3769,31 @@ export function recBuiltRetListsRefuse() {
     i = i + 1
   }
   return 0
+}
+
+// A read `p` assigned whole into an un-annotated binding whose initialiser is an element read of
+// another container: the binding holds both at its own type `own`, so each element read among
+// them is delivered there, whichever comes first, and a build reaching one lands there (D16803).
+export function recPendHeldInit(p: i32, own: i32) {
+  const pv = cwPeelValue(p)
+  if pv < 0 || pv >= P.nodes.length || !tyHoldsObjDeep(own) { return 0 }
+  // Only an element read can be one of two containers' values. An index is told by its node
+  // alone; a loop variable needs the write index, which has no column for a node minted after it.
+  const px = recIndexBase(pv)
+  if px < 0 && !(nodeAt(pv) is Ident) { return 0 }
+  cwIxBuild()
+  if pv >= cwIxCoveredLen() { return 0 }
+  const pb = if px >= 0 { px } else { recElemVarList(pv) }
+  if pb < 0 { return 0 }
+  const init = recAsgBindInit(pv)
+  if init < 0 || init == pv { return 0 }
+  const ix = recIndexBase(init)
+  const ib = if ix >= 0 { ix } else { recElemVarList(init) }
+  if ib < 0 || identDeclOf(cwPeelValue(pb)) == identDeclOf(cwPeelValue(ib)) {
+    return 0
+  }
+  recPendHeld(pv, own, pv)
+  return recPendHeld(init, own, pv)
 }
 
 // Whether `p` is assigned into an un-annotated binding whose initialiser is a built read at
