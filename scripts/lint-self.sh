@@ -93,6 +93,7 @@ lint_graded() { # <target> <json path>
     $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/byte-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/arena-write-budget-baseline.json --exempt-codes) \
+    $("$VL" check --budget scripts/walk-limit-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/unused-budget-baseline.json --exempt-codes)
 }
 
@@ -249,7 +250,7 @@ budget_over() { # <budget> <report>
   return "$rc"
 }
 BUDGET_RC=0
-for budget in comment ladder sentinel byte arena-write; do
+for budget in comment ladder sentinel byte arena-write walk-limit; do
   budget_over "$budget" "$WORK/graph.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
 done
 budget_over scan "$WORK/scan.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
