@@ -5,12 +5,15 @@
 // Built on demand from the tables the last check left: `arrowFactsBuild`.
 
 import {
+  ArrayLit,
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   Index,
   LetDecl,
   Member,
+  ObjLit,
   P,
   Param,
   i32ToStr,
@@ -28,6 +31,7 @@ import { setBindPathSetsOf, setBindSetsOf } from "./check_set_bind"
 import { setMemberRetAt } from "./check_relate_core"
 import { TY_VOID, mkFuncTy } from "./check_types"
 import { parenPeelIx } from "./check_places"
+import { nodeTyIxOf } from "./check_node_tys"
 import { cwIxParent } from "./check_write_scan"
 import { tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
@@ -73,7 +77,51 @@ export function arrowFactsBuild(): i32 {
     }
     r = r + 1
   }
+  arrowPathEveryCall()
   return afCall.length
+}
+
+// A list or record parameter's instance is not keyed by the set its element or field holds, so
+// a set reaching a path call (`fs[0](x)`) at some outer calls only would have its arms typed in
+// every instance: such a set gets no fact.
+function arrowPathEveryCall() {
+  const holes: i32[] = []
+  let r = 0
+  while r < arrowCount() {
+    const h = arrowSrcOf(arrowHoleOf(r))
+    if arrowIsPathCall(h) && !i32ListHas(holes, h) { holes.push(h) }
+    r = r + 1
+  }
+  for h in holes {
+    const per: i32[][] = []
+    const all: i32[] = []
+    r = 0
+    while r < arrowCount() {
+      if arrowSrcOf(arrowHoleOf(r)) == h {
+        const ss = arrowSetsOf(r)
+        per.push(ss)
+        for st in ss {
+          if !i32ListHas(all, st) { all.push(st) }
+        }
+      }
+      r = r + 1
+    }
+    for st in all {
+      for ss in per {
+        if !i32ListHas(ss, st) && !i32ListHas(afOpen, st) { afOpen.push(st) }
+      }
+    }
+  }
+  return 0
+}
+
+// Whether call `c` goes through an element or field read rather than a name.
+function arrowIsPathCall(c: i32): boolean {
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  if !(cn is Call) { return false }
+  const f = parenPeelIx(cn.callFn)
+  const fn = if f >= 0 && f < P.nodes.length { nodeAt(f) } else { null }
+  return fn is Index || fn is Member
 }
 
 // The fact ids, in the order built.
@@ -141,18 +189,20 @@ export function arrowSetsOf(r: i32): i32[] {
   const own = fnTagSetOfTy(arrowCalleeOf(r))
   if own >= 0 { return [own] }
   const x = arrowFromOf(r)
-  if x >= 0 { return arrowParamSets(x) }
   const h = arrowHoleOf(r)
   const hn = if h >= 0 && h < P.nodes.length { nodeAt(h) } else { null }
-  if !(hn is Call) { return [] }
+  if !(hn is Call) { return if x >= 0 { arrowParamSets(x) } else { [] } }
   const f = parenPeelIx(hn.callFn)
-  if f >= 0 && f < P.nodes.length && nodeAt(f) is Ident { return arrowParamSets(f) }
-  return arrowPathSets(f)
+  const direct = f >= 0 && f < P.nodes.length && nodeAt(f) is Ident
+  if direct { return arrowParamSets(if x >= 0 { x } else { f }) }
+  // A path call reads the outer call's own argument along the path, so one caller's sets never
+  // stand for another's.
+  // With no outer argument to read, the path's sets would be every caller's at once.
+  return if x >= 0 { arrowArgPathSets(x, arrowPathSteps(f)) } else { [] }
 }
 
-// The sets an element or field read `x` off a parameter holds (`fs[0]`, `r.f`), through the
-// set-binding rows' path sets; [] when its root is no parameter.
-function arrowPathSets(x: i32): i32[] {
+// The steps element or field read `x` takes from its root, innermost first (`fs[0]` is `[]`).
+function arrowPathSteps(x: i32): string[] {
   const steps: string[] = []
   let v = x
   let depth = 0
@@ -165,23 +215,86 @@ function arrowPathSets(x: i32): i32[] {
     } else if vn is Member {
       steps.push(vn.memProp)
       v = parenPeelIx(vn.memObj)
-    } else if vn is Ident {
-      const d = arrowParamDeclOf(v)
-      if d < 0 || steps.length == 0 { return [] }
-      const e = if d < cwIxParent.length { cwIxParent[d] } else { -1 }
-      const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { vn }
-      if !(en is FuncDecl) { return [] }
-      let i = 0
-      while i < en.fnParams.length {
-        if en.fnParams[i] == d { return setBindPathSetsOf(e, i, steps) }
-        i = i + 1
-      }
-      return []
     } else {
-      return []
+      depth = 16
     }
   }
-  return []
+  return steps
+}
+
+// The sets argument `a` holds at path `steps` (innermost first): a list or record literal, or
+// the `const` one names, is walked along the path; a caller parameter reads the set-binding rows'
+// path sets; any other value its own type's set there.
+function arrowArgPathSets(a: i32, steps: string[]): i32[] {
+  let cur: i32[] = [arrowConstLitOf(a)]
+  let k = steps.length - 1
+  while k >= 0 {
+    const next: i32[] = []
+    for c in cur {
+      const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+      if cn is ArrayLit && steps[k] == "[]" {
+        for e in cn.arrElems { next.push(arrowConstLitOf(parenPeelIx(e))) }
+      } else if cn is ObjLit {
+        for fi in cn.objFields {
+          const fn = nodeAt(fi)
+          if fn is FieldInit && fn.fiName == steps[k] {
+            next.push(arrowConstLitOf(parenPeelIx(fn.fiValue)))
+          }
+        }
+      } else {
+        // Not a literal: the rest of the path is read off this value.
+        const rest: string[] = []
+        let j = 0
+        while j <= k {
+          rest.push(steps[j])
+          j = j + 1
+        }
+        return arrowValuePathSets(c, rest)
+      }
+    }
+    cur = next
+    k = k - 1
+  }
+  const out: i32[] = []
+  for c in cur {
+    for st in arrowValuePathSets(c, []) {
+      if !i32ListHas(out, st) { out.push(st) }
+    }
+  }
+  return out
+}
+
+// The sets value `v` holds at `steps`: a caller parameter through the set-binding rows, any other
+// value through its own type.
+function arrowValuePathSets(v: i32, steps: string[]): i32[] {
+  const d = arrowParamDeclOf(v)
+  if d >= 0 {
+    if steps.length == 0 { return arrowParamSets(v) }
+    const e = if d < cwIxParent.length { cwIxParent[d] } else { -1 }
+    const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { null }
+    if !(en is FuncDecl) { return [] }
+    let i = 0
+    while i < en.fnParams.length {
+      if en.fnParams[i] == d { return setBindPathSetsOf(e, i, steps) }
+      i = i + 1
+    }
+    return []
+  }
+  if steps.length > 0 { return [] }
+  const st = fnTagSetOfTy(nodeTyIxOf(v))
+  return if st >= 0 { [st] } else { [] }
+}
+
+// The list or record literal a `const` binding `a` reads is bound to; `a` otherwise.
+function arrowConstLitOf(a: i32): i32 {
+  const an = if a >= 0 && a < P.nodes.length { nodeAt(a) } else { null }
+  if !(an is Ident) { return a }
+  const d = identDeclOf(a)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return a }
+  const li = parenPeelIx(dn.letInit)
+  const ln = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  return if ln is ArrayLit || ln is ObjLit { li } else { a }
 }
 
 // The source node a copied node `x` comes from; `x` itself when it is a source node.
