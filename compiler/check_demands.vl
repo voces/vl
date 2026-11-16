@@ -2300,128 +2300,87 @@ function pinOpenElemFrom(
   return 0
 }
 
-// Whether the deferred UFCS-receiver constraints this binding resolves hold, in three steps
-// mirroring the language's own dispatch precedence: a receiver still carrying a hole
-// re-defers; a receiver with a field of that name (any field, `drwWalk`'s `sFieldIndex` test)
-// is a field call this constraint does not speak about; otherwise it must fit `self`, in the direct spelling's own words (`memberFloorMsg`).
-export function validateUfcsCstrs(
+// The UFCS rule for one `BND_UFCS` bound `row` (row `ci` of its kind) of `calleeFn`, in the
+// language's dispatch order: a receiver still carrying a hole re-defers; a built-in method or a
+// field must fit how the body used it; otherwise the receiver must fit `self` (`memberFloorMsg`).
+export function ufcsRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
+  ci: i32,
+  row: Bound,
 ) {
   const cvWas = cvNow
-  const n = bndCount(BND_UFCS)
-  let ci = bndNextRow(BND_UFCS, calleeFn, -1, n)
-  while ci < n {
+  if (cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site)) {
+    cvNow = cvPick(CV_UFCS, ci, cvWas)
+    const ur = substTyDeep(row.on, bNames, bTys)
     if (
-      cstrOwnedBy(bndAt(BND_UFCS, ci).fn, calleeFn)
-      && !nestCstrOutside(bndAt(BND_UFCS, ci).site)
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
     ) {
-      cvNow = cvPick(CV_UFCS, ci, cvWas)
-      const ur = substTyDeep(bndAt(BND_UFCS, ci).on, bNames, bTys)
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if ur != bndAt(BND_UFCS, ci).on {
-          if tyHasHole(ur) {
-            noteUfcsCstr(
-              ur,
-              bndAt(BND_UFCS, ci).s,
-              bndAt(BND_UFCS, ci).site,
-              bndAt(BND_UFCS, ci).a,
-            )
-          }
-        }
+      if ur != row.on {
+        if tyHasHole(ur) { noteUfcsCstr(ur, row.s, row.site, row.a) }
       }
-      if !tyHasHole(ur) {
-        // The member-call order at the pinned receiver (D2517): a built-in method or a field
-        // takes the call over the `self`-function, and must fit how the body used it.
-        const uRung = memberRungOnTy(ur, bndAt(BND_UFCS, ci).s)
-        if uRung != 0 {
-          let uWho0 = "the callee's body"
-          if who != "" { uWho0 = "the body of `" + who + "`" }
+    }
+    if !tyHasHole(ur) {
+      // The member-call order at the pinned receiver (D2517): a built-in method or a field
+      // takes the call over the `self`-function, and must fit how the body used it.
+      const uRung = memberRungOnTy(ur, row.s)
+      if uRung != 0 {
+        let uWho0 = "the callee's body"
+        if who != "" { uWho0 = "the body of `" + who + "`" }
+        memberPinFitsAt(row.site, ur, row.s, uRung, bNames, bTys, ix, uWho0)
+        let mi = 0
+        while mi < row.more.length {
           memberPinFitsAt(
-            bndAt(BND_UFCS, ci).site,
+            row.more[mi],
             ur,
-            bndAt(BND_UFCS, ci).s,
+            row.s,
             uRung,
             bNames,
             bTys,
             ix,
             uWho0,
           )
-          let mi = 0
-          while mi < bndAt(BND_UFCS, ci).more.length {
-            memberPinFitsAt(
-              bndAt(BND_UFCS, ci).more[mi],
-              ur,
-              bndAt(BND_UFCS, ci).s,
-              uRung,
-              bNames,
-              bTys,
-              ix,
-              uWho0,
-            )
-            mi = mi + 1
-          }
+          mi = mi + 1
         }
-        // An overloaded call noted no `self` type: each pin picks its own candidate.
-        if uRung == 0 && bndAt(BND_UFCS, ci).a < 0 {
-          let oWho = "the callee's body"
-          if who != "" { oWho = "the body of `" + who + "`" }
-          ovPinCheck(
-            bndAt(BND_UFCS, ci).site,
-            ur,
-            bndAt(BND_UFCS, ci).s,
-            bNames,
-            bTys,
+      }
+      // An overloaded call noted no `self` type: each pin picks its own candidate.
+      if uRung == 0 && row.a < 0 {
+        let oWho = "the callee's body"
+        if who != "" { oWho = "the body of `" + who + "`" }
+        ovPinCheck(row.site, ur, row.s, bNames, bTys, ix, oWho)
+        for mo in row.more { ovPinCheck(mo, ur, row.s, bNames, bTys, ix, oWho) }
+      } else if uRung == 0 {
+        if !assignable(ur, row.a) {
+          let uMsg = memberFloorMsg(ur, row.s)
+          let uSuggest = ""
+          if uMsg == "" {
+            uMsg = "no method '." + row.s + "' on " + tyToStr(ur)
+            uSuggest = methodDidYouMean(ur, row.s)
+          }
+          let uWho = "the callee's body"
+          if who != "" { uWho = "the body of `" + who + "`" }
+          tErr(
+            uMsg
+              + " — the `"
+              + row.s
+              + "` in scope takes "
+              + tyToStr(row.a)
+              + " ("
+              + uWho
+              + " at the call's argument types)"
+              + uSuggest,
             ix,
-            oWho,
           )
-          for mo in bndAt(BND_UFCS, ci).more {
-            ovPinCheck(mo, ur, bndAt(BND_UFCS, ci).s, bNames, bTys, ix, oWho)
-          }
-        } else if uRung == 0 {
-          if !assignable(ur, bndAt(BND_UFCS, ci).a) {
-            let uMsg = memberFloorMsg(ur, bndAt(BND_UFCS, ci).s)
-            let uSuggest = ""
-            if uMsg == "" {
-              uMsg = "no method '."
-                + bndAt(BND_UFCS, ci).s
-                + "' on "
-                + tyToStr(ur)
-              uSuggest = methodDidYouMean(ur, bndAt(BND_UFCS, ci).s)
-            }
-            let uWho = "the callee's body"
-            if who != "" { uWho = "the body of `" + who + "`" }
-            tErr(
-              uMsg
-                + " — the `"
-                + bndAt(BND_UFCS, ci).s
-                + "` in scope takes "
-                + tyToStr(bndAt(BND_UFCS, ci).a)
-                + " ("
-                + uWho
-                + " at the call's argument types)"
-                + uSuggest,
-              ix,
-            )
-          } else if !tyHasHole(bndAt(BND_UFCS, ci).a) {
-            ufcsRecvPinSeam(
-              bndAt(BND_UFCS, ci).site,
-              ur,
-              bndAt(BND_UFCS, ci).a,
-              ix,
-            )
-          }
+        } else if !tyHasHole(row.a) {
+          ufcsRecvPinSeam(row.site, ur, row.a, ix)
         }
       }
     }
-    ci = bndNextRow(BND_UFCS, calleeFn, ci, n)
   }
   cvNow = cvWas
   return 0
@@ -2569,11 +2528,10 @@ function callPinOpenArityMsg(recv: i32, prop: string, site: i32): string {
   return callFloorMsg(recv, site)
 }
 
-// Whether the deferred receiver-classification constraints this binding resolves hold — see
-// `BND_MEM`'s header for why the index and UFCS arms cannot decide it in the body (D651 /
-// D691). The index form defers to the argument-flow gate where it already speaks; a receiver
-// that is not the bare parameter is uncovered by either gate, a known bound rather than a defect.
-export function validateMemCstrs(
+// The member rule for one `BND_MEM` bound `row` (row `ci` of its kind) of `calleeFn`: the
+// receiver-classification demand the body deferred (D651, D691) must hold at the bindings.
+// `told0` holds the empty-list arguments already refused in this solve.
+export function memRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
@@ -2582,137 +2540,121 @@ export function validateMemCstrs(
   hNames: string[],
   hArgNo: i32[],
   hArgNode: i32[],
+  ci: i32,
+  row: Bound,
+  told0: i32[],
 ) {
   const cvWas = cvNow
-  const told0: i32[] = []
-  const n = bndCount(BND_MEM)
-  let ci = bndNextRow(BND_MEM, calleeFn, -1, n)
-  while ci < n {
+  if (
+    cstrOwnedBy(row.fn, calleeFn)
+    && !nestCstrOutside(row.site)
+    && !gnotDeadAtPin(row.on, bNames, bTys)
+  ) {
+    cvNow = cvPick(CV_MEM, ci, cvWas)
+    const mr = substTyDeep(row.on, bNames, bTys)
+    refuseEmptyListCalledArg(
+      row.on,
+      row.s,
+      mr,
+      who,
+      hNames,
+      hArgNo,
+      hArgNode,
+      told0,
+    )
     if (
-      cstrOwnedBy(bndAt(BND_MEM, ci).fn, calleeFn)
-      && !nestCstrOutside(bndAt(BND_MEM, ci).site)
-      && !gnotDeadAtPin(bndAt(BND_MEM, ci).on, bNames, bTys)
+      calleeFn >= 0
+      || substNestMode == SUBST_NESTED
+      || substNestMode == SUBST_HOLES
     ) {
-      cvNow = cvPick(CV_MEM, ci, cvWas)
-      const mr = substTyDeep(bndAt(BND_MEM, ci).on, bNames, bTys)
-      refuseEmptyListCalledArg(
-        bndAt(BND_MEM, ci).on,
-        bndAt(BND_MEM, ci).s,
-        mr,
-        who,
-        hNames,
-        hArgNo,
-        hArgNode,
-        told0,
-      )
-      if (
-        calleeFn >= 0
-        || substNestMode == SUBST_NESTED
-        || substNestMode == SUBST_HOLES
-      ) {
-        if mr != bndAt(BND_MEM, ci).on {
-          if tyHasHole(mr) {
-            // A function value's arity is known before its types are (D5750).
-            const am = callPinOpenArityMsg(
-              mr,
-              bndAt(BND_MEM, ci).s,
-              bndAt(BND_MEM, ci).site,
-            )
-            if am != "" {
-              tErr(memCstrAtCallMsg(am, who), ix)
-            } else {
-              noteMemCstr(
-                mr,
-                bndAt(BND_MEM, ci).s,
-                bndAt(BND_MEM, ci).site,
-                bndAt(BND_MEM, ci).a == 1,
-              )
-            }
-          }
-        }
-      }
-      if !tyHasHole(mr) {
-        let skip = false
-        // A resolved index operator: BANK it on its site for the emitter's dispatch rewrite,
-        // or the read/write reaches the emitter as a raw Index over a receiver with no list
-        // rep — a clause-2 emit reject on a check-clean program (D1892). GET's site is the
-        // index node, SET's the assignment node; each constraint carries the right `site`.
-        if opIdxDeclared() && !tyBuiltinIndexable(mr) {
-          if bndAt(BND_MEM, ci).s == OP_INDEX_GET {
-            const gfn = opSelfFnKeyFor(OP_INDEX_GET, mr)
-            if gfn != "" {
-              opSiteBank(bndAt(BND_MEM, ci).site, gfn)
-            } else {
-              // A SET-only receiver has no readable index: the inline arm refuses an annotated
-              // one here, so the hole path must too — `indexFloorMsg` answers "" for it (it
-              // sees the setter) and would fall silently to the emitter (D1932).
-              const sOnly = opSelfFnKeyFor(OP_INDEX_SET, mr)
-              if sOnly != "" {
-                tErr(
-                  "operator "
-                    + opDeclLabel(sOnly)
-                    + " needs a matching \""
-                    + OP_INDEX_GET
-                    + "\" operator — an index that cannot be READ cannot be written either",
-                  ix,
-                )
-                skip = true
-              }
-            }
-          } else if bndAt(BND_MEM, ci).s == OP_INDEX_SET {
-            const sfn = opSelfFnKeyFor(OP_INDEX_SET, mr)
-            if sfn != "" {
-              opSiteBank(bndAt(BND_MEM, ci).site, sfn)
-            } else if opSelfFnKeyFor(OP_INDEX_GET, mr) != "" {
-              // A GET operator with no SET: name the missing half, as the inline arm does.
-              tErr(
-                "no \""
-                  + OP_INDEX_SET
-                  + "\" operator for index assignment on "
-                  + tyToStr(mr),
-                ix,
-              )
-            }
-          }
-        }
-        if bndAt(BND_MEM, ci).s == OP_INDEX_GET {
-          if tyRefusesArrayDemand(mr) { skip = true }
-        }
-        // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
-        // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
-        // is a real array/map write. The SET operator's own site is settled just above.
-        if bndAt(BND_MEM, ci).s == OP_INDEX_SET { skip = true }
-        if !skip {
-          const mMsg = memCstrMsg(
-            mr,
-            bndAt(BND_MEM, ci).s,
-            bndAt(BND_MEM, ci).site,
-          )
-          if mMsg != "" {
-            // Refuses in the hole's own words, attributed to the argument only when exactly
-            // one parameter is spelled with this type variable — otherwise naming one would guess.
-            let told = false
-            if bndAt(BND_MEM, ci).a == 1 {
-              const dNo = cstrArgNoOf(bndAt(BND_MEM, ci).on, hNames, hArgNo)
-              if dNo > 0 && cstrArgCountOf(bndAt(BND_MEM, ci).on, hNames) == 1 {
-                const dTy = tpDemandTy(bndAt(BND_MEM, ci).on, calleeFn)
-                if dTy >= 0 {
-                  argMismatchErr(
-                    dNo,
-                    dTy,
-                    mr,
-                    cstrArgNodeOf(dNo, hArgNo, hArgNode),
-                  )
-                  told = true
-                }
-              }
-            }
-            if !told { tErr(memCstrAtCallMsg(mMsg, who), ix) }
+      if mr != row.on {
+        if tyHasHole(mr) {
+          // A function value's arity is known before its types are (D5750).
+          const am = callPinOpenArityMsg(mr, row.s, row.site)
+          if am != "" {
+            tErr(memCstrAtCallMsg(am, who), ix)
+          } else {
+            noteMemCstr(mr, row.s, row.site, row.a == 1)
           }
         }
       }
     }
-    ci = bndNextRow(BND_MEM, calleeFn, ci, n)
+    if !tyHasHole(mr) {
+      let skip = false
+      // A resolved index operator: BANK it on its site for the emitter's dispatch rewrite,
+      // or the read/write reaches the emitter as a raw Index over a receiver with no list
+      // rep — a clause-2 emit reject on a check-clean program (D1892). GET's site is the
+      // index node, SET's the assignment node; each constraint carries the right `site`.
+      if opIdxDeclared() && !tyBuiltinIndexable(mr) {
+        if row.s == OP_INDEX_GET {
+          const gfn = opSelfFnKeyFor(OP_INDEX_GET, mr)
+          if gfn != "" {
+            opSiteBank(row.site, gfn)
+          } else {
+            // A SET-only receiver has no readable index: the inline arm refuses an annotated
+            // one here, so the hole path must too — `indexFloorMsg` answers "" for it (it
+            // sees the setter) and would fall silently to the emitter (D1932).
+            const sOnly = opSelfFnKeyFor(OP_INDEX_SET, mr)
+            if sOnly != "" {
+              tErr(
+                "operator "
+                  + opDeclLabel(sOnly)
+                  + " needs a matching \""
+                  + OP_INDEX_GET
+                  + "\" operator — an index that cannot be READ cannot be written either",
+                ix,
+              )
+              skip = true
+            }
+          }
+        } else if row.s == OP_INDEX_SET {
+          const sfn = opSelfFnKeyFor(OP_INDEX_SET, mr)
+          if sfn != "" {
+            opSiteBank(row.site, sfn)
+          } else if opSelfFnKeyFor(OP_INDEX_GET, mr) != "" {
+            // A GET operator with no SET: name the missing half, as the inline arm does.
+            tErr(
+              "no \""
+                + OP_INDEX_SET
+                + "\" operator for index assignment on "
+                + tyToStr(mr),
+              ix,
+            )
+          }
+        }
+      }
+      if row.s == OP_INDEX_GET {
+        if tyRefusesArrayDemand(mr) { skip = true }
+      }
+      // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
+      // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
+      // is a real array/map write. The SET operator's own site is settled just above.
+      if row.s == OP_INDEX_SET { skip = true }
+      if !skip {
+        const mMsg = memCstrMsg(mr, row.s, row.site)
+        if mMsg != "" {
+          // Refuses in the hole's own words, attributed to the argument only when exactly
+          // one parameter is spelled with this type variable — otherwise naming one would guess.
+          let told = false
+          if row.a == 1 {
+            const dNo = cstrArgNoOf(row.on, hNames, hArgNo)
+            if dNo > 0 && cstrArgCountOf(row.on, hNames) == 1 {
+              const dTy = tpDemandTy(row.on, calleeFn)
+              if dTy >= 0 {
+                argMismatchErr(
+                  dNo,
+                  dTy,
+                  mr,
+                  cstrArgNodeOf(dNo, hArgNo, hArgNode),
+                )
+                told = true
+              }
+            }
+          }
+          if !told { tErr(memCstrAtCallMsg(mMsg, who), ix) }
+        }
+      }
+    }
   }
   cvNow = cvWas
   return 0
