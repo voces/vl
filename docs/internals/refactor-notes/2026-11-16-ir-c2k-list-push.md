@@ -39,8 +39,8 @@ On the self-compile, one more function is unlowered for `folded global read`, wh
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical |
-| corpus identity against the C2j seed, 12,213 cells | IDENTITY |
+| corpus identity against the C2j seed, 12,213 cells | 8,934 identical, 3,279 fail under both, 0 differ |
 | shadow | corpus 18,809 of 18,809 matched; self-compile 5,013 of 5,019, six named unlowered |
-| mode 3 with `list` admitted (throwaway build) | self-compile 5,013 claimed and byte-identical; corpus MODE3 |
+| mode 3 with `list` admitted (throwaway build) | self-compile 5,013 claimed and byte-identical; corpus 8,934 identical, 0 differ, 0 fell back |
 | L2 self-compile fuel, C2j tree to this tree from one seed | 94,728,682,607 to 94,793,071,267 (+0.068%) |
 | seed size | 6,462,813 to 6,465,215 (+2,402) |
