@@ -5,7 +5,6 @@
 
 import {
   BND_ARG,
-  BND_ARRDEF,
   BND_BIN,
   BND_BM,
   BND_IS,
@@ -14,6 +13,7 @@ import {
   BND_NEST,
   BND_PRINT,
   BND_UFCS,
+  Bound,
   bndAt,
   bndCount,
   bndNextRow,
@@ -1376,11 +1376,6 @@ export function holeDemandOk(name: string, srcExpr: i32, at: i32) {
     hm = holeMapNullValAt(hm, at)
     if !holeAssignOk(srcExpr, at, hm) { return false }
     constrainEmpty(at, hm)
-    // A demand the callee's own operations left open is not satisfiable here, and the
-    // reason is order, not assignability: the body has already been checked against the
-    // open type, so its recorded node types are stale, and pinning the demand now would
-    // emit against those. Bidirectional inference (roadmap), not a pin — refuse instead.
-    if holeMapDemandOpen(hm) { return false }
   }
   const shape = holeShapeOf(name)
   if shape < 0 { return true }
@@ -1448,10 +1443,7 @@ export function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
   if hmE >= 0 {
     if holeMapDemandOpen(hmE) {
       tErr(
-        "argument "
-          + i32ToStr(argN)
-          + ": parameter is used as a map but nothing in the body pins its key or value"
-          + " — add a type annotation",
+        "argument " + i32ToStr(argN) + ": expected a map, got " + tyToStr(at),
         ix,
       )
       return 0
@@ -1994,53 +1986,41 @@ export function validatePrintCstrs(
   return 0
 }
 
-// Re-asks every `__array_new_default__` in the body `calleeFn` instantiates for its element's
-// default, substituted, refusing at the call with the direct spelling's sentence; an element
-// still open under the caller's hole is re-recorded there (D2578).
-export function validateArrDefCstrs(
+// The container rule for one `BND_ARRDEF` bound `row` of `calleeFn`: an `__array_new_default__`
+// whose element the bindings close must have a default, refused at the call with the direct
+// spelling's sentence; an element still open under the caller's hole is re-recorded there (D2578).
+export function arrDefRule(
   bNames: string[],
   bTys: i32[],
   ix: i32,
   calleeFn: i32,
   who: string,
+  row: Bound,
 ) {
-  const n = bndCount(BND_ARRDEF)
-  let ci = bndNextRow(BND_ARRDEF, calleeFn, -1, n)
-  while ci < n {
-    const row = bndAt(BND_ARRDEF, ci)
-    if cstrOwnedBy(row.fn, calleeFn) && !nestCstrOutside(row.site) {
-      const lt = row.on
-      const l = tyAt(lt)
-      if l is TyArray {
-        if !tyElemOpen(l) && tyHasHole(tyElemOf(l)) {
-          const el = substTyDeep(tyElemOf(l), bNames, bTys)
-          if tyHasHole(el) {
-            if el != tyElemOf(l) && calleeFn >= 0 {
-              noteArrDefCstr(mkArrayTy(el), row.site)
-            }
-          } else if (
-            el >= 0
-            && el < T.tys.length
-            && !(tyAt(el) is TyErr)
-            && !elemHasZero(el)
-          ) {
-            let pWho = "a type parameter's list is built here: "
-            if who != "" {
-              pWho = "`" + who + "` builds its type parameter's list here: "
-            }
-            tErr(
-              pWho
-                + "__array_new_default__ fills every slot with the element's default value, and "
-                + tyToStr(el)
-                + " has none — use __array_new__(n, fill)",
-              ix,
-            )
-          }
-        }
-      }
+  if !cstrOwnedBy(row.fn, calleeFn) || nestCstrOutside(row.site) { return 0 }
+  const l = tyAt(row.on)
+  if !(l is TyArray) || tyElemOpen(l) || !tyHasHole(tyElemOf(l)) { return 0 }
+  const el = substTyDeep(tyElemOf(l), bNames, bTys)
+  if tyHasHole(el) {
+    if el != tyElemOf(l) && calleeFn >= 0 {
+      noteArrDefCstr(mkArrayTy(el), row.site)
     }
-    ci = bndNextRow(BND_ARRDEF, calleeFn, ci, n)
+    return 0
   }
+  if el < 0 || el >= T.tys.length || tyAt(el) is TyErr || elemHasZero(el) {
+    return 0
+  }
+  let pWho = "a type parameter's list is built here: "
+  if who != "" {
+    pWho = "`" + who + "` builds its type parameter's list here: "
+  }
+  tErr(
+    pWho
+      + "__array_new_default__ fills every slot with the element's default value, and "
+      + tyToStr(el)
+      + " has none — use __array_new__(n, fill)",
+    ix,
+  )
   return 0
 }
 
