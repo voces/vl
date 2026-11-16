@@ -5289,12 +5289,50 @@ function recBuiltReadTyAt(
     const ot = tyAt(nonNullTy(o))
     return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
   }
+  // A loop variable or a list callback's parameter holds the list's elements (D16783).
+  const el = recElemVarList(x)
+  if el >= 0 { return recBuiltElemIn(el, tbl) }
   const d = recHeldDecl(x)
   if d < 0 { return -1 }
   const b = if fresh { recBuildTyIn(tbl, d, false) } else { -1 }
   const dn = nodeAt(d)
   if b >= 0 || !(dn is LetDecl) { return b }
   return recBuiltReadTyAt(cwPeelValue(dn.letInit), tbl, fresh, depth - 1)
+}
+
+// The list whose elements the read `x` names, parentheses peeled: the iterated list of the
+// `for … in` loop whose element variable it is, or the receiver of the `map` or `filter` call
+// whose callback's one parameter it is; else -1.
+function recElemVarList(x: i32): i32 {
+  const n = nodeAt(x)
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if dn is LoopVar {
+    if dn.lvLoop < 0 || dn.lvLoop >= P.nodes.length { return -1 }
+    const l = nodeAt(dn.lvLoop)
+    if !(l is ForIn) || dn.lvSlot != 0 { return -1 }
+    const it = cwPeelValue(l.fiIter)
+    return if it >= 0 && tyIsListTy(nonNulTyOf(nodeTyIxOf(it))) { it } else { -1 }
+  }
+  if !(dn is Param) { return -1 }
+  let fd = recEnclosingFn(x)
+  while fd >= 0 && !recFnHasParam(fd, d) { fd = recEnclosingFn(fd) }
+  const f = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnParams.length != 1 || !cwIxCovers(fd) { return -1 }
+  if cwIxUpKind[fd] != CW_UP_ARG { return -1 }
+  const c = nodeAt(cwIxUp[fd])
+  const m = if c is Call && c.callFn >= 0 { nodeAt(parenPeelIx(c.callFn)) } else { null }
+  if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
+    return -1
+  }
+  return cwPeelValue(m.memObj)
+}
+
+// Whether function `fd` declares parameter `d`.
+function recFnHasParam(fd: i32, d: i32): boolean {
+  const f = nodeAt(fd)
+  return f is FuncDecl && i32ListHas(f.fnParams, d)
 }
 
 // Whether `u` is a call handing back a record literal a pin built at another record (D15185).
