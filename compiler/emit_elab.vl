@@ -4609,8 +4609,8 @@ function elabConstCalleeDecl(v: i32, depth: i32): i32 {
 }
 
 // The parameter of `decl` the binding `d` reads an element of, where `d` is initialised by an
-// element read of that parameter (`xs[i]`) and every read of `d` in the body, so never a write, is
-// a call's callee (D15365); -1 otherwise.
+// element read of that parameter (`xs[i]`), or of a `for` loop's element walking one, and every
+// read of `d` in the body, so never a write, roots a call's callee (D15365); -1 otherwise.
 function elabElemCallAlias(d: i32, decl: i32): i32 {
   if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
     return -1
@@ -4630,13 +4630,41 @@ function elabElemCallAlias(d: i32, decl: i32): i32 {
   ) {
     return -1
   }
-  const root = elabSlotRoot(init)
+  const root = elabLoopRootOf(elabSlotRoot(init), decl)
   if root < 0 || root >= P.nodes.length || !(nodeAt(root) is Ident) {
     return -1
   }
   const pd = identDeclOf(root)
   if !i32ListHas(fn.fnParams, pd) { return -1 }
-  return if elabOnlyCalled(d, fn.fnBody) { pd } else { -1 }
+  return if elabOnlyCalledRoot(d, fn.fnBody) { pd } else { -1 }
+}
+
+// Read `root`, or, where it names a `for` loop's element binding `elabLoopCallAlias` follows,
+// the root of the list that loop reads.
+function elabLoopRootOf(root: i32, decl: i32): i32 {
+  if root < 0 || root >= P.nodes.length || !(nodeAt(root) is Ident) {
+    return root
+  }
+  const via = elabLoopCallAlias(identDeclOf(root), decl)
+  return if via >= 0 { elabSlotRoot(via) } else { root }
+}
+
+// Whether every read of binding `d` in `body` roots a call's callee chain (`d(…)`, `d[i](…)`).
+function elabOnlyCalledRoot(d: i32, body: i32): boolean {
+  const roots: i32[] = []
+  const scan: i32[] = [body]
+  while scan.length > 0 {
+    const x = scan.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Call { roots.push(elabSlotRoot(parenPeelIx(xn.callFn))) }
+      if xn is Ident && identDeclOf(x) == d && !i32ListHas(roots, x) {
+        return false
+      }
+      for c in nodeChildren(x) { scan.push(c) }
+    }
+  }
+  return true
 }
 
 // Whether every read of binding `d` in `body` is a call's callee.
@@ -4694,18 +4722,29 @@ function elabLoopOf(d: i32): ForIn | null {
   return l
 }
 
-// `elabOnlyCalled`, where a read may also initialise an un-annotated `const` (or a `let` nothing
-// re-points) that is itself only ever called in `body`, or be the list an inner `for` loop walks
-// whose element is so read.
+// `elabOnlyCalled`, where a read may also root the element chain an un-annotated `const` (or a
+// `let` nothing re-points) is initialised with (`const y = d`, `const y = d[i]`) whose own reads
+// each root a callee chain, or be the list an inner `for` loop walks whose element is so read.
 function elabOnlyCalledOrCopied(d: i32, body: i32): boolean {
-  // The roots of the element chains a call's callee reads (`d(…)`, `d[i](…)`).
+  // The roots of the element chains a call's callee reads (`d(…)`, `d[i](…)`), and of those such
+  // a binding is initialised with.
   const roots: i32[] = []
+  const copyRoots: i32[] = []
   const scan: i32[] = [body]
   while scan.length > 0 {
     const x = scan.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
       if xn is Call { roots.push(elabSlotRoot(parenPeelIx(xn.callFn))) }
+      if (
+        xn is LetDecl
+        && (xn.letKw == "const" || cwLetUnwritten(x))
+        && xn.letType < 0
+        && xn.letInit >= 0
+        && elabOnlyCalledRoot(x, body)
+      ) {
+        copyRoots.push(elabSlotRoot(parenPeelIx(xn.letInit)))
+      }
       for c in nodeChildren(x) { scan.push(c) }
     }
   }
@@ -4718,11 +4757,7 @@ function elabOnlyCalledOrCopied(d: i32, body: i32): boolean {
       if nodeAt(x) is Ident && identDeclOf(x) == d {
         const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
         const called = i32ListHas(roots, x)
-        const copied = pn is LetDecl
-          && (pn.letKw == "const" || cwLetUnwritten(p))
-          && pn.letType < 0
-          && parenPeelIx(pn.letInit) == x
-          && elabOnlyCalled(p, body)
+        const copied = i32ListHas(copyRoots, x)
         const walked = pn is ForIn
           && parenPeelIx(pn.fiIter) == x
           && pn.fiDecl2 < 0
@@ -4746,18 +4781,29 @@ function elabElemAliasInit(cf: i32, decl: i32): i32 {
   if cr != cf && cr >= 0 && cr < P.nodes.length && nodeAt(cr) is Ident {
     const via = elabLoopCallAlias(identDeclOf(cr), decl)
     if via >= 0 { return via }
+    // So does one off an element alias.
+    const ai = elabElemAliasOf(identDeclOf(cr), decl)
+    if ai >= 0 { return ai }
   }
   if cf < 0 || cf >= P.nodes.length || !(nodeAt(cf) is Ident) { return cf }
   const d = identDeclOf(cf)
   const walked = elabLoopCallAlias(d, decl)
   if walked >= 0 { return walked }
+  const ai = elabElemAliasOf(d, decl)
+  return if ai >= 0 { ai } else { cf }
+}
+
+// The element read binding `d` of `decl` aliases (`elabElemCallAlias`), or the list the loop
+// whose element that read roots at walks; -1 when `d` is no such alias.
+function elabElemAliasOf(d: i32, decl: i32): i32 {
   if d < 0 || d >= P.nodes.length || elabElemCallAlias(d, decl) < 0 {
-    return cf
+    return -1
   }
   const ln = nodeAt(d)
-  if !(ln is LetDecl) { return cf }
+  if !(ln is LetDecl) { return -1 }
   const init = parenPeelIx(ln.letInit)
-  const via = if init >= 0 && init < P.nodes.length && nodeAt(init) is Ident { elabLoopCallAlias(identDeclOf(init), decl) } else { -1 }
+  const ir = elabSlotRoot(init)
+  const via = if ir >= 0 && ir < P.nodes.length && nodeAt(ir) is Ident { elabLoopCallAlias(identDeclOf(ir), decl) } else { -1 }
   return if via >= 0 { via } else { init }
 }
 
