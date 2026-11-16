@@ -9,6 +9,14 @@ also updates the target doc's status section.
 Newest first:
 
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
+- [2026-11-16-slot-store-parity-loop-exits](2026-11-16-slot-store-parity-loop-exits.md): Slot store parity 1: loop exits (lane SLOT, 2026-11-16)
+- [2026-11-16-set-drops-vals](2026-11-16-set-drops-vals.md): B6a-opt: a Set stops writing and growing its `vals` list, 2026-11-16 (lane AE4)
+- [2026-11-16-type-hashcons-s6b7-deep-grid](2026-11-16-type-hashcons-s6b7-deep-grid.md): Type hash-cons stage 6b: a depth grid for the caps the corpus cannot reach (lane H), 2026-11-16
+- [2026-11-16-type-hashcons-s6b6-path-walk-caps](2026-11-16-type-hashcons-s6b6-path-walk-caps.md): Type hash-cons stage 6b, batch 6: twenty-one type walkers on a path stack (lane H), 2026-11-16
+- [2026-11-16-rep-adt-stage3c-iv-anon-store](2026-11-16-rep-adt-stage3c-iv-anon-store.md): Rep ADT stage 3c-iv, step A: an anonymous field's code is its storage type's, 2026-11-16 (lane REP)
+- [2026-11-16-store-set-bind-shared-ty-params](2026-11-16-store-set-bind-shared-ty-params.md): One storage decider: shared type parameters, and the switch bar, 2026-11-16
+- [2026-11-16-l2-s3-2-pin-guard](2026-11-16-l2-s3-2-pin-guard.md): L2 S3.2: the pin guard, 2026-11-16
+- [2026-11-16-ir-c2c-list-read-shared](2026-11-16-ir-c2c-list-read-shared.md): IR cutover C2c: the list read's decisions are legacy's own, 2026-11-16
 - [2026-11-16-width-same-elems-in-literal-d16765](2026-11-16-width-same-elems-in-literal-d16765.md): A literal's list part takes its elements' build (D16765), 2026-11-16
 - [2026-11-16-type-hashcons-s6b5-union-walk-caps](2026-11-16-type-hashcons-s6b5-union-walk-caps.md): Type hash-cons stage 6b, batch 5: six union-member walkers get visited sets (lane H), 2026-11-16
 - [2026-11-16-store-set-bind-sealed-holders](2026-11-16-store-set-bind-sealed-holders.md): One storage decider: sealed holders, and the set-grain diff, 2026-11-16
