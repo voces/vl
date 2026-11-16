@@ -792,6 +792,13 @@ and a nested `emitExpr` reads it. Their readers are `emitExpr` itself for every 
 so no op-seam slice can route all of them through a shared arm. They stay until claiming covers
 coercion, and delete at I8. The coercion decisions are shared before then, starting with `widenPlanOf` (C3a).
 
+**I8: a seat becomes an op at the delivery (undeferred after C2l).** A seat's whole effect lands on
+the node it marks: legacy builds the value, then one conversion read off the checker's record. The
+IR knows its delivery sites, so each one builds the operand and, where the reps differ, appends the
+op the shared plan names (`RNumWiden`, `RBox`, `RUnbox`, `RAtomStr`), lowered through legacy's
+tail. A record at a position the IR does not build leaves its function a miss. The design and its
+parts are in `refactor-notes/2026-11-16-ir-i8-coercion-ops.md`.
+
 **What it does not change.** Phase B (I9) still waits for every function to be on the IR.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
