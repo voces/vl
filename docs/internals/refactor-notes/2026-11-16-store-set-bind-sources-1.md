@@ -30,6 +30,7 @@ diff after that source was added, cumulative.
 | calls into members | 1,427 / 451 | 48 / 27 | 571 / 196 |
 | `const` lambdas, callbacks | 1,537 / 467 | 76 / 38 | 461 / 182 |
 | lambda test fixed (`fnNameIsLambda`) | 1,570 / 477 | 76 / 38 | 428 / 173 |
+| check-minted `$` parameters excluded | 1,570 / 477 | 63 / 34 | 428 / 173 |
 
 **Hand-backs.** These are now exact: 64 agree, 0 check only, 0 elaboration only. They were 45 / 53 / 19
 at the shadow.
@@ -42,15 +43,27 @@ at the shadow.
   instance of it exists, and no call takes its value back.
 
 **Check-only facts.** These are where the producer over-approximates. Before a call class switches
-the decision, each one is named and either removed or shown harmless. Two families account for the
-rise:
-- **Holders written after their literal.** In `closures/hole-fn-list-written-then-called.vl` and
-  `closures/generic-fn-list-written-then-called.vl`, `a[0] = dbl` or `put(a)` widens the list. The
-  producer reads the literal's set and ignores the write. These are two of the four programs whose
-  check tag the late decision drops (#8472), so the census already points at the writes.
-- **Record and alias paths whose instance the elaboration does not note.** For example,
-  `functions/named-function-in-record-beside-hole-record.vl`: `call0({ f: g }, 2.5)` beside
-  `call0({ f: dbl }, 4)`.
+the decision, each one is named and either removed or shown harmless (the coordinator's bar). Two
+causes are already removed:
+- **Minted adapter parameters.** A `$`-named parameter (`$fv`, `$e…`) belongs to an adapter the
+  check built (`fvaAdapt`, a list copy's element map). It holds the source's closure, not a set.
+  This removed 13 facts in 4 programs and lost no agreeing fact.
+- **Inline callback hand-backs** (the hand-back side, above).
+
+The 63 that remain, by family (`$VL_IFACES` with a scratch key printer):
+
+| family | facts | programs | example |
+|---|---|---|---|
+| an inline list-method callback over a list written after its literal, or whose members' results differ | 15 | 7 | `closures/hole-fn-list-written-then-called.vl` (one of the four census drops) |
+| a named function whose parameter a set of generic members reaches, at a shared or seeded type parameter | 29 | 18 | `closures/shared-type-param-handed-generic-and-hole-function.vl`, `generics/nested-capture-argument-hop.vl` |
+| a record field or alias path the elaboration does not instance | 19 | 9 | `functions/named-function-record-beside-hole-handed-two-functions.vl` |
+
+What the three share: the elaboration notes a fact only where the instance types the callee at the
+set (`elabMintFactAt`: `fnTagSetOfTy` of the instance's node type, closed arguments, each member's
+result found). A write that widens the holder, a type parameter the instance binds to a closure,
+and a record rep built at a closure all leave the instance without the set. The producer reads the
+call-site set and so misses all three. The next round reads them: holder writes (`cwBindingWrittenValues`), and the
+type-parameter binding at the call (`callBind` rows).
 
 **What is left elaboration-only**, by callee shape (scratch classifier):
 
