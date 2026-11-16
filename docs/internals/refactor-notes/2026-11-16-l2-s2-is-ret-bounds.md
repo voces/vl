@@ -33,6 +33,11 @@ first (`2026-11-16-l2-s2-tyix-bounds.md`, #8500). It moves `isCstr` and `retCstr
     their bytes depend on the checkout's path. Fingerprinted from the same worktree with both
     seeds, those 25 are identical too.
   - Fingerprints compared across worktrees must be taken at one path.
+- **Re-proved after merging master `32ee97e5`**, into which #8500 merged squashed:
+  - two refreshes from that master's fixpoint seed are cmp-identical;
+  - 20,568 programs fingerprint identically, with both seeds run from one worktree;
+  - `lint-self.sh` is clean.
+  The gates below ran before the merge, against `c040079c`.
 - `regress.vl`: 0 runs → not-runs, no cell changed class.
 - `decl-order-ab.vl`: 16 of 5,246 cases move, 0 to a clause-1 outcome, 0 not in the baseline.
 - The 227 hole and inferred matrices, `--before` master against `--after` this seed: 0
