@@ -30,6 +30,10 @@ then fails: "a record type's rep changed during emit, from a union arm to a plai
 earlier shadow could not see this cell, because it did not build on that shadow's base. Rung 1
 answers records by shape, which keeps the cell building.
 
+**Rule for the later steps (3c-iv, 3e):** any change that moves a rep query earlier is graded only
+on cells that build at the current master. A shadow measured on an older base cannot see a cell
+that started building since then.
+
 ## Identity and cost
 
 Both seeds are fixpoints; the base is master `078e41168`.
