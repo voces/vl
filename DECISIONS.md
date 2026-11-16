@@ -12572,3 +12572,24 @@ reader matches the walk (parity) and the gap is a filed row.
 
 **Why.** Widening changes results; a single picked instance traps at the other signature. Per-signature
 instances are the one answer that matches the direct-binding semantics.
+
+## Un-annotated code stays more permissive than `<T>` on a write into a literal-union place (2026-11-16, chosen under the owner's delegation) — D3299, D3436
+
+**The rule.** An un-annotated parameter written into a nullable place stays pin-generic (the D3299/D3436
+ruling), except when the place holds a literal union (`"a" | "b" | null`): there the parameter keeps the
+flow answer the place gives it. So `g("a")` writing `x` into an `Ab | null` place runs un-annotated, while
+the same program with `<T>` is refused.
+
+**Why.** Removing the exception turns nine running cells into refusals; tightening un-annotated code to
+`<T>`'s strictness would be a clause-2 step backwards. The asymmetry is chosen and kept, not owed.
+
+## An un-annotated map's literal value is built at the union arm it is delivered to (2026-11-16, chosen under the owner's delegation) — D16866
+
+**The rule.** A record literal written into an un-annotated map and read back into a union-typed place is
+built at that union's arm, as a `const` bound to the literal already is. Reads delivered at two
+disagreeing arms are refused at check with the existing sentence, never a pick. An annotated map keeps
+its declared field types (invariance) and stays refused. Reads at an arm and at the map's own record type
+together are an open clause-1 row (filed with D16866's fix) until they get the same refusal.
+
+**Why.** The checker already accepts the un-annotated spelling, so building it changes no verdict; refusing
+it would newly reject a program `vl check` passes.
