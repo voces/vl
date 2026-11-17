@@ -31,6 +31,7 @@ import {
   internResetIn,
   internTag,
 } from "./intern"
+import { i32ListHas } from "./listutil"
 import { fieldNameOrder } from "./check_obj_shape"
 import {
   nominalStructNameOfTy,
@@ -2571,8 +2572,9 @@ export function nullBoxTag(): i32 { return scalarTagOfKind(nullValKind()) }
 // denotes its member (#1122), so the wrapper is peeled iteratively — the alias-tolerant reading a consumer wants when asking whether the named type is a closure type.
 export function tyDenotesFunc(m: i32): boolean {
   let cur = m
-  let steps = 0
-  while cur >= 0 && cur < T.tys.length && steps < 8 {
+  const seen: i32[] = []
+  while cur >= 0 && cur < T.tys.length && !i32ListHas(seen, cur) {
+    seen.push(cur)
     const t = tyAt(cur)
     match t {
       TyFunc => {
@@ -2581,7 +2583,6 @@ export function tyDenotesFunc(m: i32): boolean {
       TyUnion => {
         if t.uMembers.length != 1 { return false }
         cur = t.uMembers[0]
-        steps = steps + 1
       }
       // Any other member is not a function type.
       TyPrim | TyObj | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => {
@@ -3068,13 +3069,6 @@ function fcFuncTy(ty: i32): boolean {
   return t is TyNullable && t.nInner >= 0 && tyAt(t.nInner) is TyFunc
 }
 
-// A list-typed storage, bare or nullable.
-function fcListTy(ty: i32): boolean {
-  const t = tyAt(ty)
-  if t is TyArray { return true }
-  return t is TyNullable && t.nInner >= 0 && tyAt(t.nInner) is TyArray
-}
-
 // Whether row type `ty` is minted at a hole or a type variable, whose rep does not see the instance.
 export function repRowAtTyVar(ty: i32): boolean {
   return ty >= 0 && tyHasTyVar(ty)
@@ -3091,11 +3085,6 @@ function fcKeptHoleRow(ty: i32, d: RepDesc): boolean {
 // A function field: its code is the function storage's, which the rep may not share (D16721).
 function fcKeptFnRep(ty: i32, d: RepDesc): boolean {
   return d.rdKind != null && fcFuncTy(ty)
-}
-
-// An empty list joined with `null`: its element is a hole, and its uses chose the code (D16722).
-function fcKeptHoleList(ty: i32, d: RepDesc): boolean {
-  return d.rdKind == null && fcListTy(ty)
 }
 
 // The map key kind storage type `st` projects: its key's kind, the string key for a non-map.
@@ -3263,7 +3252,7 @@ export function fieldElemTyIn(col: i32[], tys: i32[], r: i32): i32 {
 
 // Notes a read that keeps its stored code by its named class; one in no class fails loudly.
 function fcKeptNote(site: string, c: i32, st: i32, d: RepDesc) {
-  const cls = if fcKeptHoleRow(st, d) { "holeRow" } else if fcKeptFnRep(st, d) { "fnRep" } else if fcKeptHoleList(st, d) { "holeList" } else { "" }
+  const cls = if fcKeptHoleRow(st, d) { "holeRow" } else if fcKeptFnRep(st, d) { "fnRep" } else { "" }
   if cls == "" {
     fcReadNote(site, "kept UNNAMED code=" + i32ToStr(c))
     emitFail(
@@ -3280,7 +3269,7 @@ function fcKeptNote(site: string, c: i32, st: i32, d: RepDesc) {
 
 // The field code at row `r` of code column `codes`, whose storage types are column `tys`: the
 // code the storage type's rep derives, or the stored code where the type is a function or has
-// no rep (the three classes above). `site` names the reader for the shadow, which fails loudly
+// no rep (the two classes above). `site` names the reader for the shadow, which fails loudly
 // on a moved code or a kept one in no class.
 export function fieldCodeIn(
   codes: i32[],
@@ -3821,7 +3810,7 @@ export function boxAtomKindOfMemberTy(t: i32): i32 {
 export function valueBoxOfTy(ty: i32): boolean {
   if !repBoxesTy(ty) { return false }
   const arms: i32[] = []
-  if !valueBoxArmsInto(ty, arms, 0) || arms.length == 0 { return false }
+  if !valueBoxArmsInto(ty, arms, []) || arms.length == 0 { return false }
   for m in arms {
     if boxTagOfTy(m) < 0 { return false }
   }
@@ -3896,19 +3885,28 @@ function nulInnerIsHole(inner: i32): boolean {
 }
 
 // Appends `ty`'s arms to `out`: a union or nullable contributes its members, nested unions
-// flattened, `null` dropped; a string-literal union is one arm. False past a depth.
-function valueBoxArmsInto(ty: i32, out: i32[], depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+// flattened, `null` dropped; a string-literal union is one arm. False on a cycle: `path` holds the
+// types being flattened.
+function valueBoxArmsInto(ty: i32, out: i32[], path: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(path, ty) { return false }
+  path.push(ty)
+  const r = valueBoxArmsGo(ty, out, path)
+  path.pop()
+  return r
+}
+
+function valueBoxArmsGo(ty: i32, out: i32[], path: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   return match t {
-    TyNullable => valueBoxArmsInto(t.nInner, out, depth + 1)
+    TyNullable => valueBoxArmsInto(t.nInner, out, path)
     TyUnion => {
-      if depth > 0 && tyIsLitUnion(ty) {
+      if path.length > 1 && tyIsLitUnion(ty) {
         out.push(ty)
         return true
       }
       for m in t.uMembers {
-        if !valueBoxArmsInto(m, out, depth + 1) { return false }
+        if !valueBoxArmsInto(m, out, path) { return false }
       }
       true
     }
@@ -3946,25 +3944,35 @@ function btSoftOfTy(ty: i32): i32 {
 }
 
 // Appends union `ty`'s members, nested unions flattened, each numeric literal (or numeric
-// literal union) as its base, and a member equal to an earlier one dropped. False past a depth.
+// literal union) as its base, and a member equal to an earlier one dropped. False on a cycle.
 function btSoftMembersInto(ty: i32, out: i32[]): boolean {
-  return btSoftMembersGo(ty, out, 0)
+  const path: i32[] = []
+  return btSoftMembersGo(ty, out, path)
 }
 
-function btSoftMembersGo(ty: i32, out: i32[], depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+// `path` holds the types being flattened, outermost first.
+function btSoftMembersGo(ty: i32, out: i32[], path: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(path, ty) { return false }
+  path.push(ty)
+  const r = btSoftMembersAt(ty, out, path)
+  path.pop()
+  return r
+}
+
+function btSoftMembersAt(ty: i32, out: i32[], path: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
   const t = tyAt(ty)
   if t is TyUnion {
     const nb = numLitUnionBaseTy(ty)
     if nb >= 0 { return btSoftPush(nb, out) }
-    if tyIsLitUnion(ty) && depth > 0 { return btSoftPush(ty, out) }
+    if tyIsLitUnion(ty) && path.length > 1 { return btSoftPush(ty, out) }
     for m in t.uMembers {
-      if !btSoftMembersGo(m, out, depth + 1) { return false }
+      if !btSoftMembersGo(m, out, path) { return false }
     }
     return true
   }
   if t is TyNullable {
-    if !btSoftMembersGo(t.nInner, out, depth + 1) { return false }
+    if !btSoftMembersGo(t.nInner, out, path) { return false }
     return btSoftPush(TY_NULL, out)
   }
   if t is TyLit {
@@ -3990,7 +3998,7 @@ function btSoftSame(a: i32, b: i32): boolean {
   const ta = tyAt(a)
   const tb = tyAt(b)
   if ta is TyArray {
-    if tb is TyArray { return btSoftElemSame(tyElemOf(ta), tyElemOf(tb), 0) }
+    if tb is TyArray { return btSoftElemSame(tyElemOf(ta), tyElemOf(tb)) }
     return false
   }
   if tb is TyArray { return false }
@@ -4021,8 +4029,7 @@ function btHoldsLit(ty: i32): boolean {
 }
 
 // Two list elements alike after numeric-literal softening.
-function btSoftElemSame(a: i32, b: i32, depth: i32): boolean {
-  if depth > 8 { return false }
+function btSoftElemSame(a: i32, b: i32): boolean {
   const sa: i32[] = []
   const sb: i32[] = []
   if !btSoftMembersInto(a, sa) || !btSoftMembersInto(b, sb) { return false }
@@ -4262,35 +4269,39 @@ export function repSigKindOfTy(ty: i32): VKind | null {
 // `ty` with each `never` a list element or record field holds read as the D4551 default `i32`:
 // no value reaches such a slot, so it needs only a valid rep (D15530). A bare `never`, and one
 // a nullable holds directly, stay. Asked only under `rtGo`, whose entries sync the rep tree.
-function repNeverCanon(ty: i32, depth: i32) {
-  if ty < 0 || ty >= T.tys.length || depth > 8 { return ty }
-  if ty < rncMemo.length && rncMemo[ty] > 0 { return rncMemo[ty] - 1 }
-  const r = repNeverCanonGo(ty, depth)
+function repNeverCanon(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return ty }
   while rncMemo.length <= ty { rncMemo.push(0) }
+  if rncMemo[ty] > 0 { return rncMemo[ty] - 1 }
+  // A type the walk is inside is a cycle, which stays as it is.
+  if rncMemo[ty] == RNC_OPEN { return ty }
+  rncMemo[ty] = RNC_OPEN
+  const r = repNeverCanonGo(ty)
   rncMemo[ty] = r + 1
   return r
 }
 
-// `repNeverCanon`'s answers by type, plus one, so a record shared along many paths is walked once
-// per arena epoch; `rtSync` clears it with the rep tree.
+// `repNeverCanon`'s answers by type, plus one (`RNC_OPEN` while walking it), so a record shared
+// along many paths is walked once per arena epoch; `rtSync` clears it with the rep tree.
+const RNC_OPEN = -1
 let rncMemo: i32[] = []
 
-function repNeverCanonGo(ty: i32, depth: i32) {
+function repNeverCanonGo(ty: i32) {
   const t = tyAt(ty)
   match t {
     TyArray => {
-      const e = if tyElemOf(t) == TY_NEVER { TY_I32 } else { repNeverCanon(tyElemOf(t), depth + 1) }
+      const e = if tyElemOf(t) == TY_NEVER { TY_I32 } else { repNeverCanon(tyElemOf(t)) }
       return if e == tyElemOf(t) { ty } else { repMkArrayTy(e) }
     }
     TyNullable => {
-      const i = repNeverCanon(t.nInner, depth + 1)
+      const i = repNeverCanon(t.nInner)
       return if i == t.nInner { ty } else { repMkNullableTy(i) }
     }
     TyObj => {
       const fs: i32[] = []
       let moved = false
       for f in t.objFieldTypes {
-        const c = if f == TY_NEVER { TY_I32 } else { repNeverCanon(f, depth + 1) }
+        const c = if f == TY_NEVER { TY_I32 } else { repNeverCanon(f) }
         if c != f { moved = true }
         fs.push(c)
       }
@@ -5281,7 +5292,7 @@ function repTreeOfTy(ty: i32): i32 {
 }
 
 function rtGo(ty0: i32): i32 {
-  const ty = repNeverCanon(ty0, 0)
+  const ty = repNeverCanon(ty0)
   if ty < 0 { return rtUnsup("hole", -1) }
   if ty < rtByTy.length {
     if rtByTy[ty] >= 0 { return rtByTy[ty] }

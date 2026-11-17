@@ -3767,6 +3767,8 @@ struct LinkOpts {
     /// `-O` / `-O3`: the seed emits the shapes binaryen scalarises (an inline map store) rather
     /// than the smaller out-of-line ones a plain build gets.
     optimizing: bool,
+    /// `--test-emit-refusal`: test harness only, the seed refuses a call to its test hooks.
+    test_emit_refusal: bool,
 }
 
 /// The largest page count an i32-addressed memory can declare (4 GiB).
@@ -3974,6 +3976,7 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
         heap_base_given: base.is_some(),
         low_memory: None,
         optimizing: false,
+        test_emit_refusal: false,
     };
     if let Some(m) = memory_sizes_error(&link) {
         usage_exit(&m);
@@ -4485,6 +4488,14 @@ fn compile_vl_instance(
         if set.call(&mut store, pages)? != 0 {
             bail!("the compiler refused a shared memory of {pages} pages");
         }
+    }
+    // `--test-emit-refusal`: refused on an old seed, since a test that pins a refusal would
+    // otherwise build clean and measure nothing.
+    if link.test_emit_refusal {
+        let set = inst
+            .get_typed_func::<i32, i32>(&mut store, "setTestEmitRefusal")
+            .map_err(|_| stale_seed_for("--test-emit-refusal", "setTestEmitRefusal"))?;
+        set.call(&mut store, 1)?;
     }
     // `--initial-memory=` / `--max-memory=`: refused on an old seed for the same reason — a
     // module that started at one page would grow, and detach the host's views, after all.
@@ -7624,6 +7635,9 @@ fn run_cmd(args: &[String]) -> Result<()> {
             // that is what they have always been on this path — turning a spelling
             // that runs today into an error is the thing this change is avoiding.
             "-O" | "-O3" | "--names" | "--wat" | "--no-validate" => {}
+            // Test harness only: the seed refuses a call to its test hooks, so a graded run can
+            // pin an emit refusal no capability fix moves.
+            "--test-emit-refusal" => link.test_emit_refusal = true,
             // Refused, not inert like the four above: it changes what the module LINKS
             // against, and `vl run` has no `env.memory` to supply — the run would fail at
             // instantiation with a sentence about imports rather than about the flag.
@@ -11583,6 +11597,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let mut link = parse_link_opts(args);
     link.low_memory = low_memory.map(|n| n as i32);
     link.optimizing = optimizing;
+    link.test_emit_refusal = args.iter().any(|a| a == "--test-emit-refusal");
     // A heap window that starts inside the promised-unused region breaks the promise with the
     // first allocation, so the two flags contradict each other.
     if let (Some(n), Some((base, _))) = (low_memory, link.heap) {

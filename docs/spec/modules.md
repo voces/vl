@@ -185,7 +185,7 @@ import { area } from "./geo.vl"   // refused: Cannot resolve import "./geo.vl"
 ```
 
 ```vl
-import { f } from "x"   // refused: Unsupported import specifier "x"
+import { f } from "x"   // refused: an import names a relative path ("./x") or a std module ("std:x"); a bare name has no meaning
 ```
 
 ```vl

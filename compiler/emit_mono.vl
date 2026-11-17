@@ -2724,7 +2724,7 @@ function monoIfChainRebuildPinned(
           && pin < T.tys.length
           && tyAt(pin) is TyUnion
           && ej >= 0
-          && elabTyClosed(ej, 0)
+          && elabTyClosed(ej)
           && !assignable(ej, pin)
         ) {
           emitFail(
@@ -2736,7 +2736,7 @@ function monoIfChainRebuildPinned(
       // so is a `??` over one, whose result the checker re-joins without the mark (D3568).
       // The instance's elaborated join, where it is closed and is not the template's own.
       const et = elabNodeTy(at, elabWalkTop())
-      if et >= 0 && et != raw && elabTyClosed(et, 0) {
+      if et >= 0 && et != raw && elabTyClosed(et) {
         pty = monoPinUnionBoxed(et, true)
       }
       const retype = pty >= 0
@@ -3895,7 +3895,7 @@ function monoCloneLambdaSubst(
       ety >= 0
       && ety < T.tys.length
       && !tyHasTyVar(ety)
-      && (ety == cty || elabTyClosed(ety, 0))
+      && (ety == cty || elabTyClosed(ety))
     ) {
       nodeTyRecord(clone, ety)
     }
@@ -6983,7 +6983,7 @@ function monoPinnedOperandTy(ix: i32, pNames: string[], pTys: i32[]) {
         if (
           et >= 0
           && et < T.tys.length
-          && elabTyClosed(et, 0)
+          && elabTyClosed(et)
           && !tyHasTyVar(et)
           && !tyHasHole(et)
         ) {
@@ -7142,7 +7142,7 @@ function monoPinnedReadTy(
       const pt = monoPinnedOperandTy(x, pNames, pTys)
       const top = elabWalkTop()
       const et = if pt < 0 && top >= 0 { elabNodeTy(x, top) } else { -1 }
-      const ok = et >= 0 && et < T.tys.length && elabTyClosed(et, 0)
+      const ok = et >= 0 && et < T.tys.length && elabTyClosed(et)
       if pt >= 0 { pt }
       else if ok && !tyHasTyVar(et) && !tyHasHole(et) { et }
       else { -1 }
@@ -15164,7 +15164,9 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
   if rt < 0 || !monoLetWritesAt(d, at, ctx, rt) { return 0 }
   // Each record literal a write stores takes the slot fact `monoLetWritesAt` compared.
   if d.letKw != "const" {
-    const st = elabSlotTyAt(at, [], ctx)
+    // The binding's type where it keeps a tagged set the slot fact closed (`monoLetWritesAt`).
+    const st0 = elabSlotTyAt(at, [], ctx)
+    const st = if tySameSealed(st0, rt) { st0 } else { rt }
     for w in monoLetWholeWrites(at) {
       const wb = nodeAt(w)
       if wb is BinExpr && wb.binOp == "=" {
@@ -15323,6 +15325,7 @@ function monoPinObjFields(
   const tys: i32[] = []
   for t in o.objFieldTypes { tys.push(t) }
   let any = false
+  let keptTag = false
   for fi in lit.objFields {
     const f = nodeAt(fi)
     if f is FieldInit {
@@ -15330,7 +15333,9 @@ function monoPinObjFields(
       while k < o.objFieldNames.length && o.objFieldNames[k] != f.fiName {
         k = k + 1
       }
-      if k < tys.length && monoTyOpen(tys[k]) {
+      // A field holding a tagged set keeps it: its literal and its reads store the set's ids.
+      if k < tys.length && fnTagHoldsTy(tys[k]) { keptTag = true }
+      if k < tys.length && monoTyOpen(tys[k]) && !fnTagHoldsTy(tys[k]) {
         let path = f.fiName
         if pre != "" { path = pre + "." + f.fiName }
         const nt = monoPinFieldValue(
@@ -15353,7 +15358,8 @@ function monoPinObjFields(
   if !any { return -1 }
   // The record's type is the elaboration's slot fact; a record whose generic is called at two
   // signatures has none, and keeps the type its fields give (D15494).
-  const st = elabSlotTyAt(at, monoSlotPath(pre, []), ctx)
+  // A field left at its tagged set is not the slot fact's, which closed it.
+  const st = if keptTag { -1 } else { elabSlotTyAt(at, monoSlotPath(pre, []), ctx) }
   return if st >= 0 { st } else { mkObjTy(o.objFieldNames, tys) }
 }
 
@@ -15581,7 +15587,35 @@ function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
 function monoLetWritesAt(d: LetDecl, at: i32, ctx: i32, t: i32): boolean {
   if d.letKw == "const" { return true }
   const et = elabSlotTyAt(at, [], ctx)
-  if et < 0 || !tySameSealed(et, t) { return false }
+  if et < 0 { return false }
+  // A record the slot fact closed only at fields `t` keeps a tagged set at is the same record.
+  if !tySameSealed(et, t) {
+    const a = if et < T.tys.length { tyAt(et) } else { null }
+    const b = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if (
+      !(a is TyObj)
+      || !(b is TyObj)
+      || a.objFieldNames.length != b.objFieldNames.length
+    ) {
+      return false
+    }
+    let i = 0
+    while i < b.objFieldNames.length {
+      let j = 0
+      while (
+        j < a.objFieldNames.length
+        && a.objFieldNames[j] != b.objFieldNames[i]
+      ) {
+        j = j + 1
+      }
+      if j == a.objFieldNames.length { return false }
+      const bt = b.objFieldTypes[i]
+      if !fnTagHoldsTy(bt) && !tySameSealed(a.objFieldTypes[j], bt) {
+        return false
+      }
+      i = i + 1
+    }
+  }
   if t < T.tys.length && tyAt(t) is TyMap {
     for w in monoLetWholeWrites(at) {
       const fx = monoLetWriteFreshMap(w)
@@ -17878,7 +17912,7 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     const closed = it >= 0
       && it < T.tys.length
       && !tyHasTyVar(it)
-      && elabTyClosed(it, 0)
+      && elabTyClosed(it)
     if closed && tyAt(it) is TyFunc { et = it }
   }
   const ef = if et >= 0 { tyAt(et) } else { tyAt(0) }
@@ -26682,12 +26716,7 @@ function monoBindingAdoptInit(i: i32, k: i32) {
   // The binding's type is the elaboration's where it closes there; the initializer's held type
   // answers only where it does not, and a disagreement is refused, never picked silently.
   const et = elabNodeTy(i, k)
-  if (
-    et >= 0
-    && et < T.tys.length
-    && elabTyClosed(et, 16)
-    && !tyHoldsHole(et)
-  ) {
+  if (et >= 0 && et < T.tys.length && elabTyClosed(et) && !tyHoldsHole(et)) {
     // A captured binding holds a one-element cell of the value the elaboration types.
     const cl = cboxCellLits[d.letInit]
       ?? (cboxCellLits[nodeSrc[d.letInit] ?? -1] ?? -1)
