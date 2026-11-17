@@ -246,14 +246,12 @@ mid(same, same, 1)
 `;
 
 // A refusal raised while the global section writes a cell (D15158): no body is lowered there, so
-// the anchor is the cell's declaration, `const p` on line 2 (D14082's witness, `P` reaching the
-// cell with no interned shape).
-const GLOBAL_CELL_WITNESS = `type P = {a: i32}
-const p: P = {a: 1}
-function len<T>(f: () => T | string) {
-  return 7
-}
-print(len(() => p))
+// the anchor is the cell's declaration, line 2. The refusal is the harness's own
+// (`--test-emit-refusal` refuses a top-level cell named `__vl_test_emit_refusal__`), so no
+// capability fix can move it.
+const GLOBAL_CELL_WITNESS = `const pad = [1]
+let __vl_test_emit_refusal__ = [2, 3]
+print(pad.length + __vl_test_emit_refusal__.length)
 `;
 
 Deno.test({
@@ -261,15 +259,25 @@ Deno.test({
     "vl-emit-diag-position: a refusal raised before any body is lowered names its call or declaration",
   ignore: !ENABLED,
   fn: async () => {
-    const cases: { name: string; src: string; line: number }[] = [
-      { name: "monomorphize", src: MONO_WITNESS, line: 9 },
-      { name: "global cell", src: GLOBAL_CELL_WITNESS, line: 2 },
+    const cases: {
+      name: string;
+      src: string;
+      line: number;
+      extra: string[];
+    }[] = [
+      { name: "monomorphize", src: MONO_WITNESS, line: 9, extra: [] },
+      {
+        name: "global cell",
+        src: GLOBAL_CELL_WITNESS,
+        line: 2,
+        extra: ["--test-emit-refusal"],
+      },
     ];
     for (const c of cases) {
       const dir = await Deno.makeTempDir({ prefix: "vl_emit_early_" });
       try {
         await Deno.writeTextFile(`${dir}/early.vl`, c.src);
-        const r = await checkCodegen("early.vl", dir);
+        const r = await checkCodegen("early.vl", dir, c.extra);
         if (!r.out.includes("emit error")) {
           throw new Error(
             `${c.name}: the witness no longer reaches an emit refusal, so this guard is ` +

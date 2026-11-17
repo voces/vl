@@ -456,6 +456,14 @@ Replies received 2026-11-15:
   - Under L2, `InstReq`'s call-site facts leave the key. `delivery` and `argLit` become coercions on
     the call edge. `retTy` and `retWidenTy` become part of the scheme, or a coercion at the result.
     `frame` and `call` stay as provenance. So no new field is needed.
+  - **That holds for non-fresh values only** (coordinator's ruling, 2026-11-17). A **fresh** literal or
+    call argument binds at its contextual type, so delivery shapes the key there as a binding, not a
+    coercion, because D965 forbids an implicit container copy. The contextual type comes from:
+    - **the call's own destination** (`id({r: 1})` into `{r: i32 | null}`): L2,
+      `instVecDeliveryClose` (check_bind_adopt.vl), which records it in the per-call vector once
+      check's rebuild decision is final;
+    - **a later call's parameter** (`g(x, y)` inside a forwarder, `g = h`): the arrow rule, S3.4d,
+      STORE's.
   - **Storage versus type identity, settled 2026-11-15.** Two calls with the same `TyId` vector can need
     different storage for a function-typed parameter (`RClosure`, `RSetId` or `RDirect`).
     - The scheme is storage-free: a `BK_ARROW` bound solves to types only.

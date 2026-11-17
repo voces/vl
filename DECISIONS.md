@@ -12659,15 +12659,16 @@ value it flows into; when such a call exists, its type decides the instance and 
 **Why.** It is the same rule an empty container's open element follows (`i32` list element, `string` set
 element or map key), and it makes mono's former accidental default a stated rule that check can see.
 
-## A generic function value handed on through a call is used at one type (2026-11-17) — D16843
+## A generic function value handed back through a call keeps its polymorphism (2026-11-17) — D16843
 
-**The rule.** Check refuses a generic function value that is handed through a call and then called at
-two types, whether the callee calls it directly or returns it in a closure. A parameter called directly
-at two types is still split per type. Whether a handed-on generic function value keeps its polymorphism is
-an open owner question; one row records the capability.
+**The rule.** A generic function value a callee hands back, directly (`pass(a)(3)`) or captured in a
+closure (`wrap(a)()(3)`), may be called at two types; mono splits it per type, and check accepts both.
+A callee that calls the value itself (`call1`) fixes its type inside that callee, and check refuses a
+second type there. D16843 (the closure capture) is a capability gap in the per-type split, not a contract.
 
-**Why.** It is the contract the direct hand-on (`call1(a)`) already has, and refusing at check is better than
-an emit refusal of a check-clean program.
+**Why.** The direct hand-back already runs, so a rule refusing the capture would cost `runs` and name a
+mechanism. This replaces the same-day ruling "used at one type", withdrawn once measured. Whether `call1`'s
+internal call should leave the value polymorphic for its caller is the open owner question.
 
 ## Stage 3 of the slot store is parked behind check-time types (2026-11-17) — D16768, D16898
 
