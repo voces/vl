@@ -94,7 +94,14 @@ line.
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches master already reports |
 | corpus identity against master's seed, 12,297 cells | 9,029 identical, 3,268 fail under both, 0 differ |
 | mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,341 claimed and byte-identical, the same 2 fallbacks as master; corpus 9,029 identical, 0 differ, 25,048 claimed, 0 fell back |
-| L2 self-compile fuel (`self-compile-time.sh`) | 95,735,881,085 to 95,626,704,192 (−0.11%) |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its checkout) | 95,560,432,768 to 95,626,704,192 (+0.07%) |
 | seed size, master's to this one | 6,605,491 to 6,607,590 (+2,099) |
 | pin helpers in `emit_mono.vl` | 908 |
 | phase-state census | flat |
+
+## Follow-ups
+
+- `arrLitShort` reads `gForIterLit`, which `emitForInList` sets and restores around one legacy
+  site, so it is -1 wherever the IR asks while `for … in` is a miss. When the IR builds a `for`
+  iterable that is a literal, it passes that fact to `arrLitShort` explicitly; otherwise a claimed
+  function would build short where legacy hoists the literal to a module constant.

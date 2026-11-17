@@ -123,9 +123,7 @@ import {
   fbEmitLocalsVec,
   fbEnd,
   fbF32ConstBits,
-  fbF32DemoteF64,
   fbF64ConstBits,
-  fbF64PromoteF32,
   fbGlobalGet,
   fbGlobalSet,
   fbI32Bin,
@@ -164,8 +162,12 @@ import {
   emitFoldedConstRead,
   emitForInCursorInit,
   emitNullAt,
+  emitNullForRet,
   emitStaticLitAtom,
   emitStrLitAt,
+  f64RemCallTail,
+  f64RemOperandTail,
+  fallThroughPadOf,
   forInListStore,
   forInListSync,
   forInLoopAt,
@@ -395,11 +397,9 @@ function floatRem(a: Opnd[], atF32: boolean) {
   if gHelpF64Rem < 0 || a.length != 2 { return irLMiss("float rem helper") }
   for x in a {
     irLOpnd(x)
-    if atF32 { fbF64PromoteF32() }
+    f64RemOperandTail(atF32)
   }
-  fbCall(gHelpF64Rem)
-  if atF32 { fbF32DemoteF64() }
-  return 0
+  return f64RemCallTail(atF32)
 }
 
 // Whether global `g` has the cell a pre-pass assigns before any body is emitted.
@@ -466,6 +466,27 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RListNew | RMapOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeList => makeList(r)
+  }
+}
+
+// Why a read of user global `g` in context `c` is not the IR's to lower, or "" when it is: the
+// builder asks before it builds the read, so a function holding one is never claimed.
+export function irGlobalReadMiss(g: i32, c: GlobalCtx): string {
+  return match userGlobalReadClass(g, c) {
+    "plain" => if globalMinted(g) { "" } else { "global index" }
+    "fold" => ""
+    "promo" => "promoted global read"
+    "guard" => "guarded global read"
+  }
+}
+
+// Why a write of user global `g` in context `c` is not the IR's to lower, or "" when it is.
+export function irGlobalWriteMiss(g: i32, c: GlobalCtx): string {
+  return match userGlobalWriteClass(g, c) {
+    "plain" => if globalMinted(g) { "" } else { "global index" }
+    "promo" => "promoted global write"
+    "immutable" => "immutable global write"
+    "guard" => "guarded global write"
   }
 }
 
@@ -872,7 +893,7 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
   const exitBr = n.siThen.length == 0
     && n.siElse.length == 1
     && isBr(n.siElse[0])
-  if isTrue(n.siCond) && (exitBr || n.siElse.length == 0) {
+  if isTrue(n.siCond) && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
     return 0
@@ -891,7 +912,7 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
   fbIf(64)
   lwFrames.push(-1)
   body(n.siThen, tail, -1)
-  if n.siElse.length > 0 {
+  if n.siElse.length > 0 || n.siElseKw {
     fbElse()
     body(n.siElse, tail, -1)
   }
@@ -965,13 +986,9 @@ function ret(n: SReturn, pending: i32[]) {
 }
 
 function spanOpen(id: i32) {
-  let k = 0
-  while k < lw.irSpanFirst.length {
-    if lw.irSpanFirst[k] == id {
-      lwSpanOpen.push(k)
-      lwSpanAt.push(curLen())
-    }
-    k = k + 1
+  for k in lw.irSpansAt[id] ?? [] {
+    lwSpanOpen.push(k)
+    lwSpanAt.push(curLen())
   }
   return 0
 }
@@ -1098,7 +1115,18 @@ function entry(f: IrFn, ctx: GlobalCtx): u8[] {
   const prev = wTarget(lwBuf)
   const valued = !repIsNoValue(f.irRetRep)
   body(f.irBody, !valued, -1)
-  if valued && !endsInReturn(f) { fbUnreachable() }
+  const fd = nodeAt(f.irAt)
+  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
+  if pad == "null" {
+    // Legacy sinks this `null` when the return sink fired; the IR does not build that exit.
+    if lwSinkFired > 0 {
+      irLMiss("null fall-through into the return sink")
+    } else {
+      emitNullForRet(f.irAt)
+    }
+  } else if pad == "unreachable" {
+    fbUnreachable()
+  }
   if lwSinkFired > 0 { sinkClose() }
   fbEnd()
   wTarget(prev)
@@ -1173,12 +1201,6 @@ function sinkClose() {
   fbLocalGet(unionSinkBase + 1)
   fbStructNew(uBoxIdx)
   return 0
-}
-
-function endsInReturn(f: IrFn): boolean {
-  if f.irBody.length == 0 { return false }
-  const last = f.irBody[f.irBody.length - 1]
-  return last >= 0 && last < f.irNodes.length && f.irNodes[last] is SReturn
 }
 
 // The dual emit: lowers `f` and compares it with the legacy code entry `legacy` (this function's
