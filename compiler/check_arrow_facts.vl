@@ -17,6 +17,7 @@ import {
   Param,
   Paren,
   RetStmt,
+  TypeRef,
   fnNameIsLambda,
   i32ToStr,
   nodeAt,
@@ -32,6 +33,8 @@ import {
 } from "./check_arrow"
 import {
   fnTagCallNote,
+  fnTagCallSetOf,
+  fnTagCalls,
   fnTagMembers,
   fnTagSetOfMembers,
   fnTagSetOfTy,
@@ -55,17 +58,19 @@ import { parenPeelIx } from "./check_places"
 import { cwIxParent, cwLetWrittenInClosure } from "./check_write_scan"
 import { setMemberRetAt, substTyDeepUnbanked } from "./check_relate_core"
 import {
+  IV_SET_CALL,
   instVecCalleeAt,
   instVecCount,
   instVecIxAt,
   instVecNamesAt,
+  instVecNote,
   instVecTysAt,
 } from "./check_bind_rows"
 import { nodeTyIxOf } from "./check_node_tys"
 import { identFnDeclOf } from "./check_scopes"
 import { isNeverTy, tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
-import { i32ListEq, i32ListHas, i32ListIndexOf } from "./listutil"
+import { i32ListEq, i32ListHas, i32ListIndexOf, strListHas } from "./listutil"
 
 let afCall: i32[] = []
 let afSet: i32[] = []
@@ -105,6 +110,7 @@ export function arrowFactsBuild(): i32 {
   const covered: {[string]: boolean} = Map()
   // A member's result at a row's types is asked quietly: a binding no call makes owes no diagnostic.
   const d0 = T.diags.length
+  arrowSetCallRows()
   arrowRowFacts(covered, afRowOpen)
   arrowSeedJoins()
   while T.diags.length > d0 { T.diags.pop() }
@@ -904,6 +910,81 @@ export function arrowSeedHeldOf(s: i32): i32[] {
     i = i + 1
   }
   return out
+}
+
+// A call through a function set hands its arguments to each named member's parameters: one vector
+// row per member, its holes and type parameters bound at the argument nodes' types, which keep a
+// set's identity (STORE B2c). Only a call handing some argument a set has one.
+function arrowSetCallRows() {
+  for c in fnTagCalls() {
+    const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+    const s = fnTagCallSetOf(c)
+    if cn is Call && s >= 0 && arrowHandsSet(cn) {
+      for m in fnTagMembers(s) {
+        const f = nodeAt(m)
+        if f is FuncDecl && f.fnName != "" && !fnNameIsLambda(f.fnName) {
+          const names: string[] = []
+          const tys: i32[] = []
+          if arrowMemberBinding(m, f, cn, names, tys) {
+            instVecNote(c, IV_SET_CALL, m, m, names, tys)
+          }
+        }
+      }
+    }
+  }
+  return 0
+}
+
+// Whether some argument of call `cn` holds a function set, and each set an argument holds has
+// named members only: a lambda is built as a closure where it is delivered (B3's).
+function arrowHandsSet(cn: Call): boolean {
+  let any = false
+  for a in cn.callArgs {
+    const t = nodeTyIxOf(parenPeelIx(a))
+    const hs: i32[] = []
+    if fnTagSetOfTy(t) >= 0 { hs.push(fnTagSetOfTy(t)) }
+    arrowSetsHeld(t, hs, [])
+    for st in hs {
+      if !arrowNamedMembers(st) { return false }
+      any = true
+    }
+  }
+  return any
+}
+
+// Member `f` (at `m`)'s binding at call `cn`'s argument nodes: a parameter with no annotation binds
+// its hole, one annotated with a bare type parameter of `f` binds that name. False when the arity
+// differs or another annotation reads a type parameter.
+function arrowMemberBinding(
+  m: i32,
+  f: FuncDecl,
+  cn: Call,
+  names: string[],
+  tys: i32[],
+): boolean {
+  if f.fnParams.length != cn.callArgs.length { return false }
+  let i = 0
+  while i < f.fnParams.length {
+    const pn = nodeAt(f.fnParams[i])
+    const at = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
+    if pn is Param && pn.parType < 0 {
+      names.push(arrowHolePrefix(f, m) + i32ToStr(i))
+      tys.push(at)
+    } else if pn is Param {
+      const tn = nodeAt(pn.parType)
+      if tn is TypeRef && strListHas(f.fnTyParams, tn.tyName) {
+        names.push(tn.tyName)
+        tys.push(at)
+      } else if (
+        f.fnTyParams.length > 0
+        && tyHasTyVar(nodeTyIxOf(f.fnParams[i]))
+      ) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  return names.length > 0
 }
 
 // The declared function whose body holds node `x`, or -1.

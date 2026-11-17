@@ -18,10 +18,12 @@ import {
   nodeAt,
 } from "./ast"
 import {
+  IV_SET_CALL,
   instVecCalleeAt,
   instVecCount,
   instVecIxAt,
   instVecNamesAt,
+  instVecPathAt,
   instVecTysAt,
 } from "./check_bind_rows"
 import { cwIxBuild, cwIxParent, cwLetUnwritten } from "./check_write_scan"
@@ -272,6 +274,7 @@ export function instKeysBuild(): i32 {
     ikRows.push("elab-only " + why + " " + ikNamed(k) + ikNearest(k, checkKeys))
   }
   ikStorageRows(inElab)
+  ikSetCallRows()
   return ikRows.length
 }
 
@@ -608,6 +611,80 @@ function ikStorageKey(
   const tys: i32[] = []
   if !arrowRowBinding(r, d, f, cn, tys) { return "" }
   return ikKeyFor(d, instVecNamesAt(r), tys, [], [], ns, ts)
+}
+
+// The set-call rows (STORE B2c) against the elaboration: a row is expected when an instance of its
+// member holds, at that parameter, the set the row's argument holds; extra otherwise.
+function ikSetCallRows() {
+  let rows = 0
+  let expected = 0
+  let extra = 0
+  let r = 0
+  while r < instVecCount() {
+    const m = instVecCalleeAt(r)
+    const f = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { null }
+    const cx = instVecIxAt(r)
+    const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+    if instVecPathAt(r) == IV_SET_CALL && f is FuncDecl && cn is Call {
+      let i = 0
+      while i < f.fnParams.length && i < cn.callArgs.length {
+        const t = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
+        const held: i32[] = []
+        const own = fnTagSetOfTy(t)
+        if own >= 0 { held.push(own) }
+        arrowSetsHeld(t, held, [])
+        for st in held {
+          rows = rows + 1
+          if ikElabHolds(m, i, st) {
+            expected = expected + 1
+          } else {
+            extra = extra + 1
+            ikRows.push(
+              "setcall extra "
+                + f.fnName
+                + " p"
+                + i32ToStr(i)
+                + " "
+                + ikSetNames(st),
+            )
+          }
+        }
+        i = i + 1
+      }
+    }
+    r = r + 1
+  }
+  ikRows.push(
+    "setcall summary rows="
+      + i32ToStr(rows)
+      + " expected="
+      + i32ToStr(expected)
+      + " extra="
+      + i32ToStr(extra),
+  )
+  return 0
+}
+
+// Whether some instance the elaboration made of declaration `m` holds set `st` at parameter `i`.
+function ikElabHolds(m: i32, i: i32, st: i32): boolean {
+  const f = nodeAt(m)
+  if !(f is FuncDecl) || i >= f.fnParams.length { return false }
+  let k = 0
+  while k < ekDecl.length {
+    if ekDecl[k] == m {
+      const t = substTyDeepUnbanked(
+        nodeTyIxOf(f.fnParams[i]),
+        ekNames[k],
+        ekTys[k],
+      )
+      const held: i32[] = []
+      if fnTagSetOfTy(t) >= 0 { held.push(fnTagSetOfTy(t)) }
+      arrowSetsHeld(t, held, [])
+      if i32ListHas(held, st) { return true }
+    }
+    k = k + 1
+  }
+  return false
 }
 
 // Notes that parameter `b` initialises or is written to binding `d`.
