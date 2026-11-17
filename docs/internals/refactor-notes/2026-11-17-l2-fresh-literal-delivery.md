@@ -44,6 +44,8 @@ Nothing but A0 and the iface shadow reads the vector, so the build is identical 
 Every check-only key is gone. Two keys remain elab-only:
 - **`call-through-hole-identity`:** holes. The elaboration's delivered-row entry `#r.0` beside the
   hole has no check-side counterpart; that is a key-composition question for A0.
-- **`identity-fresh-call-with-arguments`:** one key.
+- **`identity-fresh-call-with-arguments`:** one key, the hole function `u`'s `#r.0` row entry, the
+  same category.
 
-Neither shows a check binding that disagrees with the elaboration's.
+So no declared-parameter key disagrees any more; what remains is whether the vector should carry
+holes' row entries.
