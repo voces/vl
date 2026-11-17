@@ -255,7 +255,14 @@ import {
 } from "./check_literals"
 import { litTyOfExpr, strLitViewOf } from "./check_match_desugar"
 import { declTyOf, narDeclaredTy } from "./check_nar_store"
-import { armLit, gRootStmts, njFnIx, njMayPart } from "./check_nj_join"
+import {
+  armLit,
+  collectRetValues,
+  gRootStmts,
+  njFnIx,
+  njMayPart,
+} from "./check_nj_join"
+import { calleeNamesDecl } from "./check_hand_back"
 import {
   narrowedFromTyOf,
   nodeTyIx,
@@ -6225,11 +6232,30 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
   return true
 }
 
+// Whether call `c`'s result is a list nothing else holds: its callee is declared and every value
+// it returns is a list literal, or such a call, to `depth` calls deep.
+export function callBuildsFreshList(c: i32, depth: i32): boolean {
+  if depth <= 0 || c < 0 || c >= P.nodes.length { return false }
+  const n = nodeAt(parenPeelIx(c))
+  if !(n is Call) { return false }
+  const fd = calleeNamesDecl(n.callFn)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length == 0 { return false }
+  for r in rets {
+    const rv = cwPeel(r)
+    if !(nodeAt(rv) is ArrayLit) && !callBuildsFreshList(rv, depth - 1) { return false }
+  }
+  return true
+}
+
 // Copies the list call `c` a list literal spreads, element by element, into a list of the record
 // `rep` the list's other parts give it, where its records store a field differently (D16444).
 // False, recording nothing, where the copy does not serve.
 export function recSpreadCallCopy(c: i32, rep: i32): boolean {
-  if c < 0 || c >= P.nodes.length || !(nodeAt(c) is Call) { return false }
+  if c < 0 || c >= P.nodes.length || !callBuildsFreshList(c, 4) { return false }
   const own = nonNulTyOf(nodeTyIxOf(c))
   const oa = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   if !(oa is TyArray) || !recListElemRecCopies(tyElemOf(oa), rep) {
@@ -6262,6 +6288,7 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   // A list of records is copied element by element under the same rule.
   if oa is TyArray && da is TyArray {
     if !recListElemRecCopies(tyElemOf(oa), tyElemOf(da)) { return false }
+    if !callBuildsFreshList(p, 4) { return false }
     if recNullCopyOnly(own, dst) && !recSitesLandOff(sites, own, dst) {
       return false
     }
@@ -6594,16 +6621,19 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       const dl = recAdLandingList(nonNulTyOf(dstTy))
       const os = recReturnedOrigins(fd, p, sl, dl)
-      // One body builds one list, so calls landing it on two storages refuse (D8301).
-      if os.length == 0 && recSitesLandApart(fd, sl, dl) {
-        recRefuseAtOwnRow(p, sl, dl)
-        return 0
-      }
       let bare = os.length > 0
       let reads = true
       for b in os {
         if !(nodeAt(b) is ArrayLit) || !litAtDstStorage(b, dl) { bare = false }
         if !(nodeAt(b) is Ident) { reads = false }
+      }
+      // One body builds one list, so calls landing it on two storages refuse (D8301), and so do
+      // two calls of a held list, which the other call reads at its own storage.
+      const cs: i32[] = []
+      const twice = rcwCallSites(fd, cs) < 0 || cs.length > 1
+      if (os.length == 0 && recSitesLandApart(fd, sl, dl)) || (reads && twice) {
+        recRefuseAtOwnRow(p, sl, dl)
+        return 0
       }
       if bare {
         for b in os { recordRepTyAdopt(b, dl) }
