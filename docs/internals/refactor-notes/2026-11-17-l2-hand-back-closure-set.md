@@ -34,5 +34,5 @@ holding the parameter bare (`handBackFieldIx`). Both deciders read them:
   0 silent.
 - Corpus fingerprint, fixpoint seeds both sides, from one worktree: 2 of 20,896 files move. They are
   the two fixtures converted from `@emit-error` to `@run` (refused → built).
-- Not covered: the top-level spellings, where no parameter carries a set. They are D16928 (bound,
-  one type) and D16929 (two types).
+- Not covered: the top-level spellings, where no parameter carries a set. They are D16933 (bound,
+  one type) and D16934 (two types).
