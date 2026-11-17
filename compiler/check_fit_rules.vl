@@ -6236,14 +6236,20 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
 }
 
 // Whether call `c`'s result is a list nothing else holds: its callee is declared and every value
-// it returns is a list literal, a local only the return reads, or such a call, `depth` deep.
-export function callBuildsFreshList(c: i32, depth: i32): boolean {
-  if depth <= 0 || c < 0 || c >= P.nodes.length { return false }
+// it returns is a list literal, a local only the return reads, or such a call.
+export function callBuildsFreshList(c: i32): boolean {
+  return callBuildsFreshListVia(c, [])
+}
+
+// `callBuildsFreshList`, `seen` holding the functions already on the path: a cycle builds nothing.
+function callBuildsFreshListVia(c: i32, seen: i32[]): boolean {
+  if c < 0 || c >= P.nodes.length { return false }
   const n = nodeAt(parenPeelIx(c))
   if !(n is Call) { return false }
   const fd = calleeNamesDecl(n.callFn)
   const fn = if fd >= 0 { nodeAt(fd) } else { null }
-  if !(fn is FuncDecl) { return false }
+  if !(fn is FuncDecl) || i32ListHas(seen, fd) { return false }
+  seen.push(fd)
   const rets: i32[] = []
   collectRetValues(fn.fnBody, rets)
   if rets.length == 0 { return false }
@@ -6252,11 +6258,12 @@ export function callBuildsFreshList(c: i32, depth: i32): boolean {
     if (
       !(nodeAt(rv) is ArrayLit)
       && !fnLocalFreshList(rv, fd)
-      && !callBuildsFreshList(rv, depth - 1)
+      && !callBuildsFreshListVia(rv, seen)
     ) {
       return false
     }
   }
+  seen.pop()
   return true
 }
 
@@ -6315,15 +6322,13 @@ export function heldCallWhy(x: i32): string {
   const c = parenPeelIx(if xn is Spread { xn.spdArg } else { x })
   const n = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
   const fd = if n is Call { calleeNamesDecl(n.callFn) } else { -1 }
-  if fd < 0 || !(nodeAt(fd) is FuncDecl) || callBuildsFreshList(c, 4) {
-    return ""
-  }
+  if fd < 0 || !(nodeAt(fd) is FuncDecl) || callBuildsFreshList(c) { return "" }
   return " The callee hands back a list it holds, so a copy would not see later writes to it (D16954)."
 }
 
 // Whether `recSpreadCallCopy` serves call `c` at `rep`, recording nothing.
 export function recSpreadCallCopies(c: i32, rep: i32): boolean {
-  if c < 0 || c >= P.nodes.length || !callBuildsFreshList(c, 4) { return false }
+  if c < 0 || c >= P.nodes.length || !callBuildsFreshList(c) { return false }
   const own = nonNulTyOf(nodeTyIxOf(c))
   const oa = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
   return oa is TyArray && recListElemRecCopies(tyElemOf(oa), rep)
@@ -6357,7 +6362,7 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   // A list of records is copied element by element under the same rule.
   if oa is TyArray && da is TyArray {
     if !recListElemRecCopies(tyElemOf(oa), tyElemOf(da)) { return false }
-    if !callBuildsFreshList(p, 4) { return false }
+    if !callBuildsFreshList(p) { return false }
     if recNullCopyOnly(own, dst) && !recSitesLandOff(sites, own, dst) {
       return false
     }
@@ -6700,7 +6705,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // two calls of a held list, which the other call reads at its own storage.
       const cs: i32[] = []
       const twice = rcwCallSites(fd, cs) >= 0 || cs.length > 1
-      const held = reads && twice && !callBuildsFreshList(p, 4)
+      const held = reads && twice && !callBuildsFreshList(p)
       if (os.length == 0 && recSitesLandApart(fd, sl, dl)) || held {
         recRefuseAtOwnRow(p, sl, dl)
         return 0
@@ -7795,7 +7800,7 @@ function nestedCopyFresh(cx: i32, s: TyArray, d: TyArray): boolean {
   if !(lit is ArrayLit) { return false }
   for e in lit.arrElems {
     const pe = cwPeel(e)
-    if !(nodeAt(pe) is ArrayLit) && !callBuildsFreshList(pe, 4) { return false }
+    if !(nodeAt(pe) is ArrayLit) && !callBuildsFreshList(pe) { return false }
   }
   return true
 }
