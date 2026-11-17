@@ -12652,9 +12652,11 @@ instantiation vector answers that once, for all classes.
 ## An un-instantiated function's hole parameters close at check to the hole default (2026-11-17, chosen under the owner's delegation) — D16898
 
 **The rule.** A hole parameter of an un-annotated function that no call instantiates closes at check
-to the default the language already gives an unconstrained hole: `i32`, or the flush default for an
-operator-constrained hole. A call counts whether it is direct or reaches the function through a slot or
-value it flows into; when such a call exists, its type decides the instance and the default never applies.
+to the default the language already gives an unconstrained hole: `i32`; a body that does not check at
+it is never built (amended 2026-11-17, D16927: the flush has no operator-constrained default, and
+T9.5's `tag` example stores such a function). A call counts whether it is direct or reaches the
+function through a slot or value it flows into; when such a call exists, its type decides the
+instance and the default never applies.
 
 **Why.** It is the same rule an empty container's open element follows (`i32` list element, `string` set
 element or map key), and it makes mono's former accidental default a stated rule that check can see.
@@ -12705,6 +12707,12 @@ for an order dependence that loses no `runs`.
   then I8c; each step is chosen by the measured count of functions it alone unblocks.
 
 ## Rulings of 2026-11-17 (night)
+
+- **IR claiming is on (2026-11-17, coordinator, owner goal "implement IR").** The fully matched
+  families (scalar, control, call, global, map) ship the IR's bytes. The parking ruled earlier the
+  same day is reversed: shipping is the goal. The claim costs +0.67% L2 (the IR builds every function
+  to decide its claim), accepted with a rebaseline (ledger #8947). A blocking `ir claims` gate row
+  asserts zero fallbacks. Legacy deletions follow as the claimed share grows (design §10).
 
 - **A1 keys a fresh literal at its contextual type;** the edge coercion applies only to a non-fresh value, and
   D965's no-implicit-container-copy stands. A lambda passed to a generic builds its fresh result literals at
