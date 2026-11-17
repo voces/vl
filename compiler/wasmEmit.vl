@@ -157,7 +157,12 @@ import {
   mapDeliveryRecorded,
 } from "./check_side_rows"
 import { litNumUnionBasesOf, u8LexValue } from "./check_literals"
-import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
+import {
+  isPatTyIxOf,
+  isVarTyIxOf,
+  luIsTyOf,
+  luMembersAt,
+} from "./check_list_union"
 import {
   deliveryRetagHas,
   listWidenRetagAny,
@@ -38913,6 +38918,8 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
   if e.memProp == "length" {
     const growLen = emitListFitGrowLen(e, exprIx, fnIx)
     if growLen != 0 { return if growLen < 0 { -1 } else { 0 } }
+    const armLen = emitListUnionArmRead(e.memObj, LU_ARM_LEN, fnIx)
+    if armLen != 0 { return if armLen < 0 { -1 } else { 0 } }
     // A string-literal union atom widens to its member's string, whose header holds the length.
     if memberLenWidensAtom(e.memObj, fnIx) {
       if emitAtomToStr(e.memObj, fnIx) < 0 { return -1 }
@@ -38940,6 +38947,73 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
     }
   }
   return emitMem(exprIx, fnIx)
+}
+
+// What `emitListUnionArmRead` reads out of each list arm: its length.
+const LU_ARM_LEN = 1
+
+// A read of the union-of-lists box `recv` that a pin left unrewritten (D16897): a tag test per
+// list arm, then the read at that arm's wrapper. 0 when `recv` is not such a box, 1 when
+// emitted, -1 when an arm has no tag or wrapper to read through.
+function emitListUnionArmRead(recv: i32, op: i32, fnIx: i32): i32 {
+  if fnIx < 0 || !exprUnion(recv, fnIx) { return 0 }
+  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  if arms.length == 0 { return 0 }
+  const tags: i32[] = []
+  const heaps: i32[] = []
+  for a in arms {
+    const t = listIsArmTag(a)
+    const h = listArmHeapOf(a)
+    if t < 0 || h < 0 {
+      return emitFail(
+        "emitProgram: a union-of-lists arm has no box tag or wrapper to read",
+      )
+    }
+    if unMemIsRefElemArray(a) && rvMayView(unMemRefArrArmSlot(a)) {
+      return emitFail(
+        "emitProgram: a union-of-lists arm may hold a list view, which its read does not unwrap",
+      )
+    }
+    tags.push(t)
+    heaps.push(h)
+  }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbLocalSet(slot)
+  if emitListUnionArmChain(slot, tags, heaps, op, 0) < 0 { return -1 }
+  return 1
+}
+
+// Arm `i` onward of `emitListUnionArmRead`'s chain over the box in `slot`; past the last arm the
+// box holds no list the union names, which a checked read never reaches.
+function emitListUnionArmChain(
+  slot: i32,
+  tags: i32[],
+  heaps: i32[],
+  op: i32,
+  i: i32,
+): i32 {
+  if i >= tags.length {
+    fbUnreachable()
+    return 0
+  }
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, tags[i])
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(127)
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heaps[i])
+  if op == LU_ARM_LEN {
+    fbStructGet(heaps[i], 1) // field 1: len
+  } else {
+    return emitFail("emitProgram: unknown union-of-lists arm read")
+  }
+  fbElse()
+  if emitListUnionArmChain(slot, tags, heaps, op, i + 1) < 0 { return -1 }
+  fbEnd()
+  return 0
 }
 
 // ── numeric-union dispatch ─────────────────────────────────────────────────────
