@@ -38,7 +38,14 @@ by the set-binding rows) moved 9 more rows and added no `untag`; the owner test 
 `scripts/late-tags-baseline.txt`: 460 → 442 rows. Each row gone is a P-class set the check now decides
 with every call's facts.
 
-## Grading
+## Grading (fixpoint seeds both sides, master 534f3eda2)
 
-See the PR body: `@run` and non-`@run` A/B, the 73 matrix templates, the probe, late demands, phase
-state, seed size, fuel.
+- `@run` A/B: 6677 programs, 0 output movers; wasm movers
+  `closures/hole-fn-inline-and-annotated-list-one-param` (963 → 1036 bytes) and
+  `functions/hole-param-handed-on-in-list-literal` (614 → 682): the set the check now decides is
+  stored per its own decision instead of the late one, output unchanged.
+- Non-`@run` A/B: 1919 programs, 0 movers.
+- Capability matrix, 73 hole-fn / fn-list / generic-fn templates: 2981 of 3780 run, 0 runs → not-runs,
+  0 → silent, 0 program traps.
+- Probe `refused with every call`: 0 fires. Late demands 10 (unchanged). Seed +0.3% on baseline.
+  L2 self-compile fuel +0.9%.
