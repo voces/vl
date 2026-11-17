@@ -12,11 +12,13 @@ import {
   Call,
   CharLit,
   ContinueStmt,
+  ForIn,
   FuncDecl,
   Ident,
   IfStmt,
   Index,
   LetDecl,
+  LoopVar,
   Member,
   NullLit,
   NumLit,
@@ -82,6 +84,7 @@ import {
   coalResultKindOf,
   coalesceNulStrStaysNullable,
   deadNullTestOperand,
+  forInPlainWhy,
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
@@ -407,6 +410,18 @@ export function irBDeclVar(d: i32): i32 {
     irBMiss("open local type")
     return -1
   }
+  return declVarAt(d, rep, ty)
+}
+
+// The variable of loop variable `d`, a walk's element at rep `rep` and type `ty`.
+function irBLoopVar(d: i32, rep: i32, ty: i32): i32 {
+  const known = ibDeclVar[d] ?? -1
+  if known >= 0 { return known }
+  return declVarAt(d, rep, ty)
+}
+
+// The local variable of declaration `d` at its declared slot, of rep `rep` and type `ty`.
+function declVarAt(d: i32, rep: i32, ty: i32): i32 {
   const s = declaredSlotOfDecl(d)
   const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
   // One variable per wasm local: an instance's read resolves to the template's declaration.
@@ -496,7 +511,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
   const w = localIndexOf(ibFnIx, ix)
-  if (dn is LetDecl || dn is Param) && w >= 0 {
+  const walkVar = dn is LoopVar && (ibDeclVar[d] ?? -1) >= 0
+  if (dn is LetDecl || dn is Param || walkVar) && w >= 0 {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
     const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
@@ -1259,6 +1275,47 @@ function loopIx(label: string): i32 {
   return -1
 }
 
+// The label a plain walk holds on the loop stack: legacy's loop owns its branches, so none
+// the IR builds may target it or cross it.
+const WALK_LABEL = -2
+
+// Whether a branch to loop stack entry `l` targets a walk or crosses one.
+function crossesWalk(l: i32): boolean {
+  let i = l
+  while i < ibLoopBrk.length {
+    if ibLoopBrk[i] == WALK_LABEL { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// A `for` statement along legacy's plain walk (`forInPlainWhy`): the list once, its element
+// variable at the declared slot, and the body. Every other walk is a named miss.
+function forInStmt(b: i32[], n: ForIn, ix: i32) {
+  const why = forInPlainWhy(n, ix, ibFnIx)
+  if why != "" { return skip("for in " + why) }
+  const l = irBExpr(b, n.fiIter)
+  if ibMiss != "" { return 0 }
+  const ln = repNodeAt(irBOpRep(l))
+  if !(ln is RList) { return skip("for in operand coercion") }
+  const v = irBLoopVar(n.fiDecl1, ln.rlsElem, repTyOf(ln.rlsElem))
+  if v < 0 || ib.irVars[v].vRep != ln.rlsElem {
+    return skip("for in variable rep")
+  }
+  ibLoopName.push(n.fiLabel)
+  ibLoopBrk.push(WALK_LABEL)
+  ibLoopCont.push(WALK_LABEL)
+  const fb: i32[] = []
+  const body = nodeAt(n.fiBody)
+  if body is Block { stmtRun(fb, body.blkStmts) } else { stmt(fb, n.fiBody) }
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  ibLoopCont.pop()
+  if ibMiss != "" { return 0 }
+  irBNode(b, { xfList: l, xfVar: v, xfBody: fb, xfAt: ix }, -1, ibNoValue, ix)
+  return 0
+}
+
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   if n.whileBlk != 0 || n.whileLv >= 0 { return skip("labelled block") }
   const brk = labelNew()
@@ -1402,9 +1459,11 @@ function stmtIn(b: i32[], ix: i32) {
     whileStmt(b, n, ix)
     return 0
   }
+  if n is ForIn { return forInStmt(b, n, ix) }
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
     if l < 0 || n.brkHasVal != 0 { return skip("break") }
+    if crossesWalk(l) { return skip("for in break") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,
@@ -1418,6 +1477,7 @@ function stmtIn(b: i32[], ix: i32) {
   if n is ContinueStmt {
     const l = loopIx(n.contLabel)
     if l < 0 { return skip("continue") }
+    if crossesWalk(l) { return skip("for in continue") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,

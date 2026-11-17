@@ -192,7 +192,8 @@ print(sel(true))
 // `null` and from a string, passed through, assigned, and coalesced with a string literal to a
 // string and inside a `print` (N2b-2c-2a); a `string | null` tested `== null`, `!= null` and
 // `null !=`, and printed (N2b-2c-2b); list literals of i32s, of f64s with an i32 element widened,
-// of i64s, f32s, strings and booleans, and an empty one (A1).
+// of i64s, f32s, strings and booleans, and an empty one (A1); a plain walk over an i32 list and a
+// string list, and one whose body holds a loop with its own `break` (F1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -258,6 +259,9 @@ print(guard(2))
   `function ls(s: string): string[] { return [s, s + "!"] }\nprint(ls("a")[1])\n`,
   `function lb(x: i32): boolean[] { return [x > 1, x > 5] }\nprint(lb(3)[0])\n`,
   `function le(): i32[] { return [] }\nprint(le().length)\n`,
+  `function sum(xs: i32[]): i32 {\n  let t = 0\n  for x in xs {\n    print(x)\n    t = t + x\n  }\n  return t\n}\nprint(sum([1, 2, 3]))\n`,
+  `function all(xs: string[]): i32 {\n  let n = 0\n  for s in xs {\n    print(s + "!")\n    n = n + s.length\n  }\n  return n\n}\nprint(all(["ab", "c"]))\n`,
+  `function inner(xs: i32[]): i32 {\n  let t = 0\n  for x in xs {\n    let k = 0\n    while k < x {\n      if k > 1 { break }\n      k = k + 1\n    }\n    print(k)\n    t = t + k\n  }\n  return t\n}\nprint(inner([1, 5]))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -289,6 +293,41 @@ print(rv(2) + ln(2)[1].length)
 `;
     const { rows } = run(src, true);
     for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
+      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A walk's own `break` and `continue` are legacy's branches, and a walk whose body is hoist-safe
+// reads its header once and may unroll: each a named miss, never a byte mismatch.
+Deno.test({
+  name: "ir shadow: a walk's own branch and a hoisted walk are named misses",
+  ignore,
+  fn: () => {
+    const src = `function fb(xs: i32[]): i32 {
+  for x in xs {
+    print(x)
+    if x > 1 { break }
+  }
+  return 0
+}
+function fc(xs: i32[]): i32 {
+  for x in xs {
+    if x > 1 { continue }
+    print(x)
+  }
+  return 0
+}
+function fh(xs: i32[]): i32 {
+  let t = 0
+  for x in xs { t = t + x }
+  return t
+}
+print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
+`;
+    const { rows } = run(src, true);
+    for (const want of ["uncovered for in break", "uncovered for in continue", "uncovered for in hoisted"]) {
       if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
