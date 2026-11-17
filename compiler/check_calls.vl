@@ -6,7 +6,6 @@ import { paramSolveProbe } from "./check_exp_obs"
 
 import { BND_ARG, bndAt, bndCount } from "./check_iface"
 import { rowParamIsSlot, rowSlotBound } from "./check_row_param"
-import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { decDigitsOf } from "./strutil"
 import { identTyOf } from "./check_nar_store"
 import { optCallLandWrapNote, optCallLandWraps } from "./check_call_resolve"
@@ -111,6 +110,8 @@ import {
   validateTpIfJoins,
 } from "./check_assignable"
 import {
+  IV_CALL,
+  IV_HOLE_LAMBDA,
   callBindAdd,
   callBindNamesAt,
   callBindNote,
@@ -122,6 +123,7 @@ import {
   fsbDeclAtNode,
   fsbName,
   instVecNote,
+  withUnboundAsNever,
 } from "./check_bind_rows"
 import { crSubtreeMentions } from "./check_capture_walks"
 import {
@@ -1402,18 +1404,19 @@ function fnInferredUnchecked(dIx: i32): boolean {
 // Checks each un-annotated top-level function argument `a` hands over, bare, in a list or
 // record literal or through a `const`, that no check has reached yet: the callee's result at this
 // call reads it, as a forward call reads its callee's (D16369).
-function checkHandedFns(a: i32, depth: i32) {
+function checkHandedFns(a: i32, seen: i32[]) {
   const x = parenPeelIx(a)
-  if x < 0 || x >= P.nodes.length || depth > 4 { return 0 }
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return 0 }
+  seen.push(x)
   const n = nodeAt(x)
   if n is ArrayLit {
-    for e in n.arrElems { checkHandedFns(e, depth + 1) }
+    for e in n.arrElems { checkHandedFns(e, seen) }
     return 0
   }
   if n is ObjLit {
     for fx in n.objFields {
       const f = nodeAt(fx)
-      if f is FieldInit { checkHandedFns(f.fiValue, depth + 1) }
+      if f is FieldInit { checkHandedFns(f.fiValue, seen) }
     }
     return 0
   }
@@ -1422,7 +1425,7 @@ function checkHandedFns(a: i32, depth: i32) {
   const bd = identDeclOf(x)
   const bn = if bd >= 0 && bd < P.nodes.length { nodeAt(bd) } else { n }
   if bn is LetDecl && bn.letKw == "const" && bn.letType < 0 && bn.letInit >= 0 {
-    return checkHandedFns(bn.letInit, depth + 1)
+    return checkHandedFns(bn.letInit, seen)
   }
   const d = identFnDeclOf(x)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { n }
@@ -2002,7 +2005,7 @@ function callFtyNoteLateArgCstrs(
   while i < args.length && i < params.length {
     if argExp[i] >= 0 && tyHasTyVar(argExp[i]) {
       const hb: HoleBinds = { names: hNames, tys: hTys, src: hSrc, arg: i }
-      bindHoleElemWalk(params[i], nodeTyOf(args[i]), bNames, bTys, hb, 0)
+      bindHoleElemWalk(params[i], nodeTyOf(args[i]), bNames, bTys, hb, [])
     }
     i = i + 1
   }
@@ -2066,20 +2069,22 @@ function bindHoleElemWalk(
   bNames: string[],
   bTys: i32[],
   hb: HoleBinds,
-  depth: i32,
+  seen: i32[],
 ) {
   if (
     exp < 0
     || at < 0
     || exp >= T.tys.length
     || at >= T.tys.length
-    || depth > 8
+    || i32ListHas(seen, exp)
   ) {
     return 0
   }
+  seen.push(exp)
   const e = tyAt(exp)
   if e is TyVar {
-    if depth == 0 { return 0 }
+    // The parameter's own type variable is the caller's, not an element's.
+    if seen.length == 1 { return 0 }
     if bindOf(bNames, bTys, e.tvName) >= 0 { return 0 }
     if bindOf(hb.names, hb.tys, e.tvName) >= 0 { return 0 }
     hb.names.push(e.tvName)
@@ -2090,10 +2095,10 @@ function bindHoleElemWalk(
   const el = tyArrayElemIx(exp)
   if el < 0 { return 0 }
   const ael = tyArrayElemIx(at)
-  if ael >= 0 { return bindHoleElemWalk(el, ael, bNames, bTys, hb, depth + 1) }
+  if ael >= 0 { return bindHoleElemWalk(el, ael, bNames, bTys, hb, seen) }
   if !(tyAt(at) is TyVar) { return 0 }
   const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, at)
-  return bindHoleElemWalk(el, elemHole, bNames, bTys, hb, depth + 1)
+  return bindHoleElemWalk(el, elemHole, bNames, bTys, hb, seen)
 }
 
 // Whether an argument and the callee parameter `param` it meets hold type parameters that an
@@ -3029,7 +3034,7 @@ function callFtyPinCstrs(
   // The declared return rides the same pin: the body's mismatch check is vacuous under
   // a hole, and this is the first position that knows the instance.
   withUnboundAsNever(namedFn, cNames, cTys, rNames, rTys)
-  instVecNote(ix, namedFn, rNames, rTys)
+  instVecNote(ix, IV_CALL, ix, namedFn, rNames, rTys)
   ifaceSolveAt(at, SS_RET, SS_UFCS)
   // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
   if !inferQuiet {
@@ -3060,7 +3065,7 @@ function callFtyPinCstrs(
   const sigRet = retTy
   retTy = substTyDeep(retTy, vNames, vTys)
   if tyHasTyVar(retTy) && !inferQuiet {
-    for a in args { checkHandedFns(a, 0) }
+    for a in args { checkHandedFns(a, []) }
   }
   if tyHasTyVar(retTy) {
     const hr = holeRetTyOf(cstrCallee, vNames, vTys)
@@ -3250,6 +3255,7 @@ function judgeHoleLambdaAt(
   const c0 = substCtxNow()
   const ctx = substCtxNest(c0, SUBST_ALL, c0.nestDecl)
   const was = substCtxEnter(ctx)
+  instVecNote(ix, IV_HOLE_LAMBDA, lam, lam, nm, ty)
   const at = solvePlain(nm, ty, ix, CSTR_NODECL, "")
   at.kinds = SS_ALL - (1 << SS_NEST)
   ifaceSolveAt(at, SS_BIN, SS_UFCS)
@@ -3866,8 +3872,14 @@ function holeRecsFieldRetsDiffer(
 // it copies none.
 function holeFieldCopyOf(x: i32): i32 {
   let rx = parenPeelIx(x)
-  let hops = 0
-  while hops < 8 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+  const seen: i32[] = []
+  while (
+    rx >= 0
+    && rx < P.nodes.length
+    && nodeAt(rx) is Ident
+    && !i32ListHas(seen, rx)
+  ) {
+    seen.push(rx)
     const d = identDeclOf(rx)
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
     if (
@@ -3879,17 +3891,22 @@ function holeFieldCopyOf(x: i32): i32 {
       return -1
     }
     rx = parenPeelIx(dn.letInit)
-    hops = hops + 1
   }
-  return if hops > 0 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Member { rx } else { -1 }
+  return if seen.length > 0 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Member { rx } else { -1 }
 }
 
 // Whether `recv` reads a binding a call initialises, directly or through `const` copies, whose
 // function field `field` the elaboration widened.
 function holeFieldCallWidened(recv: i32, field: string): boolean {
   let rx = parenPeelIx(recv)
-  let hops = 0
-  while hops < 8 && rx >= 0 && rx < P.nodes.length && nodeAt(rx) is Ident {
+  const seen: i32[] = []
+  while (
+    rx >= 0
+    && rx < P.nodes.length
+    && nodeAt(rx) is Ident
+    && !i32ListHas(seen, rx)
+  ) {
+    seen.push(rx)
     const d = identDeclOf(rx)
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
     if !(dn is LetDecl) || dn.letInit < 0 { return false }
@@ -3899,7 +3916,6 @@ function holeFieldCallWidened(recv: i32, field: string): boolean {
     }
     // A `const` copy reads the binding it copies.
     rx = if dn.letKw == "const" { init } else { -1 }
-    hops = hops + 1
   }
   return false
 }
@@ -4351,12 +4367,12 @@ function constLambdaOf(cfn: Node, cfnIx: i32): i32 {
     f = cwLambdaDeclOf(cwBindingOf(cfnIx))
   }
   // An alias, `const k = lap`, is followed to the binding it names.
-  let hops = 0
-  while f >= 0 && f < P.nodes.length && hops < 8 {
+  const seen: i32[] = []
+  while f >= 0 && f < P.nodes.length && !i32ListHas(seen, f) {
+    seen.push(f)
     const a = nodeAt(f)
     if !(a is Ident) { break }
     f = cwBoundInitOf(cwBindingOf(f))
-    hops = hops + 1
   }
   if f < 0 || f >= P.nodes.length { return -1 }
   const fn = nodeAt(f)
@@ -4432,8 +4448,9 @@ function calleeReassignedFnValue(cfn: Node, cfnIx: i32): string {
   if !(cfn is Ident) { return "" }
   let nm = cfn.identName
   let at = cfnIx
-  let hops = 0
-  while hops < 8 {
+  const seen: i32[] = []
+  while !i32ListHas(seen, at) {
+    seen.push(at)
     if cwKeyOfRoot(at) < 0 { return "" }
     if !cwBoundOnce(cwOccWalkUse(at)) { return nm }
     const init = cwBoundInitOf(cwBindingOf(at))
@@ -4442,7 +4459,6 @@ function calleeReassignedFnValue(cfn: Node, cfnIx: i32): string {
     if !(a is Ident) { return "" }
     nm = a.identName
     at = init
-    hops = hops + 1
   }
   return ""
 }
@@ -4902,7 +4918,7 @@ export function checkCallNode(n: Call, ix: i32) {
       argGens,
     )
     const path: string[] = []
-    const holder = calleeSlotOf(n.callFn, path, 0)
+    const holder = calleeSlotOf(n.callFn, path, [])
     if holder >= 0 {
       fnSlotCallNote(
         holder,
@@ -4914,10 +4930,10 @@ export function checkCallNode(n: Call, ix: i32) {
       // A call through a `??` or a value `if` calls whichever operand it reaches, each at these
       // arguments, so each operand that reads a slot is noted as called.
       const ops: i32[] = []
-      calleeJoinOperands(n.callFn, ops, 0)
+      calleeJoinOperands(n.callFn, ops)
       for op in ops {
         const opath: string[] = []
-        const oh = calleeSlotOf(op, opath, 0)
+        const oh = calleeSlotOf(op, opath, [])
         if oh >= 0 { fnSlotCallNote(oh, opath, argTys, -1) }
       }
     }
@@ -4947,13 +4963,13 @@ function noteSlotArgsAnn(args: i32[], ct: i32) {
     const pt = f.fnParamTypes[i]
     if pt >= 0 && pt < T.tys.length && tyAt(pt) is TyFunc {
       const ap: string[] = []
-      const h = calleeSlotOf(args[i], ap, 0)
+      const h = calleeSlotOf(args[i], ap, [])
       // A slot read handed to an open function type is noted at its path; any other is followed on.
       if tyHasTyVar(pt) {
         if h >= 0 && ap.length > 0 {
           fnSlotAnnNote(h, ap, pt)
         } else {
-          noteHandedOpenIn(args[i], pt, 0)
+          noteHandedOpenIn(args[i], pt, [])
         }
       }
     }
@@ -4966,7 +4982,7 @@ function noteSlotArgsAnn(args: i32[], ct: i32) {
         && tyElemOf(a) < T.tys.length
         && tyAt(tyElemOf(a)) is TyFunc
       ) {
-        noteHandedOpenIn(args[i], tyElemOf(a), 0)
+        noteHandedOpenIn(args[i], tyElemOf(a), [])
       }
     }
     i = i + 1
@@ -4976,11 +4992,12 @@ function noteSlotArgsAnn(args: i32[], ct: i32) {
 
 // `fnSlotAnnNote` at the open function type `ft` for each slot read value `x` holds: itself, the
 // elements of a list literal, or the initialiser of a `let` it names.
-function noteHandedOpenIn(x0: i32, ft: i32, depth: i32) {
+function noteHandedOpenIn(x0: i32, ft: i32, seen: i32[]) {
   const x = parenPeelIx(x0)
-  if x < 0 || x >= P.nodes.length || depth > 8 { return 0 }
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return 0 }
+  seen.push(x)
   const ap: string[] = []
-  const h = calleeSlotOf(x, ap, 0)
+  const h = calleeSlotOf(x, ap, [])
   if h >= 0 && ap.length > 0 {
     fnSlotAnnNote(h, ap, ft)
     return 0
@@ -4988,13 +5005,13 @@ function noteHandedOpenIn(x0: i32, ft: i32, depth: i32) {
   const n = nodeAt(x)
   match n {
     ArrayLit => {
-      for e in n.arrElems { noteHandedOpenIn(e, ft, depth + 1) }
+      for e in n.arrElems { noteHandedOpenIn(e, ft, seen) }
     }
     Ident => {
       const d = identDeclOf(x)
       const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
       if dn is LetDecl && dn.letInit >= 0 {
-        noteHandedOpenIn(dn.letInit, ft, depth + 1)
+        noteHandedOpenIn(dn.letInit, ft, seen)
       }
     }
     // No other expression holds a slot read it hands on.
@@ -5007,16 +5024,16 @@ function noteHandedOpenIn(x0: i32, ft: i32, depth: i32) {
 // with that slot's path (`f.<name>`, `e`, `v`, outermost last) pushed onto `path`; -1 for none.
 // The values a callee `x0` that is a `??` or a value `if` may be, in `out`: each operand of a `??`
 // chain and each arm's tail value. Nothing for any other callee.
-function calleeJoinOperands(x0: i32, out: i32[], depth: i32) {
+function calleeJoinOperands(x0: i32, out: i32[]) {
   const x = parenPeelIx(x0)
-  if x < 0 || x >= P.nodes.length || depth > 8 { return 0 }
+  if x < 0 || x >= P.nodes.length { return 0 }
   const n = nodeAt(x)
   if n is BinExpr && n.binOp == "??" {
-    calleeJoinOperand(n.binLeft, out, depth)
-    calleeJoinOperand(n.binRight, out, depth)
+    calleeJoinOperand(n.binLeft, out)
+    calleeJoinOperand(n.binRight, out)
   } else if n is IfStmt {
-    calleeJoinOperand(calleeArmTail(n.ifThen), out, depth)
-    calleeJoinOperand(calleeArmTail(n.ifElse), out, depth)
+    calleeJoinOperand(calleeArmTail(n.ifThen), out)
+    calleeJoinOperand(calleeArmTail(n.ifElse), out)
   }
   return 0
 }
@@ -5033,21 +5050,22 @@ function calleeArmTail(a: i32): i32 {
 }
 
 // `calleeJoinOperands` for one operand `v`: a nested join's own operands, else `v` itself.
-function calleeJoinOperand(v: i32, out: i32[], depth: i32) {
+function calleeJoinOperand(v: i32, out: i32[]) {
   const x = parenPeelIx(v)
   if x < 0 || x >= P.nodes.length { return 0 }
   const n = nodeAt(x)
   if (n is BinExpr && n.binOp == "??") || n is IfStmt {
-    calleeJoinOperands(x, out, depth + 1)
+    calleeJoinOperands(x, out)
   } else {
     out.push(x)
   }
   return 0
 }
 
-function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
+function calleeSlotOf(x0: i32, path: string[], seen: i32[]): i32 {
   const x = parenPeelIx(x0)
-  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return -1 }
+  seen.push(x)
   const n = nodeAt(x)
   match n {
     Ident => {
@@ -5059,7 +5077,7 @@ function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
       if fi is ForIn && fi.fiDecl1 == d {
         const it = nodeTyIxOf(fi.fiIter)
         if it < 0 || it >= T.tys.length || !(tyAt(it) is TyArray) { return -1 }
-        const h = calleeSlotOf(fi.fiIter, path, depth + 1)
+        const h = calleeSlotOf(fi.fiIter, path, seen)
         if h >= 0 { path.push("e") }
         return h
       }
@@ -5069,24 +5087,24 @@ function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
       if dn.letKw != "const" || dn.letInit < 0 { return d }
       const src = calleeCopySrc(dn.letInit)
       const before = path.length
-      const via = calleeSlotOf(src, path, depth + 1)
+      const via = calleeSlotOf(src, path, seen)
       const alias = src >= 0 && src < P.nodes.length && nodeAt(src) is Ident
       if via >= 0 && (path.length > before || alias) { return via }
       while path.length > before { path.pop() }
       return d
     }
     Member => {
-      const h = calleeSlotOf(n.memObj, path, depth + 1)
+      const h = calleeSlotOf(n.memObj, path, seen)
       if h >= 0 { path.push("f." + n.memProp) }
       return h
     }
     OptMember => {
-      const h = calleeSlotOf(n.omObj, path, depth + 1)
+      const h = calleeSlotOf(n.omObj, path, seen)
       if h >= 0 { path.push("f." + n.omProp) }
       return h
     }
     Index => {
-      const h = calleeSlotOf(n.idxArr, path, depth + 1)
+      const h = calleeSlotOf(n.idxArr, path, seen)
       const at = nodeTyIxOf(n.idxArr)
       const isMap = at >= 0 && at < T.tys.length && tyAt(at) is TyMap
       if h >= 0 { path.push(if isMap { "v" } else { "e" }) }
@@ -5098,12 +5116,12 @@ function calleeSlotOf(x0: i32, path: string[], depth: i32): i32 {
       if n.binOp != "??" || !(r is ArrayLit) || r.arrElems.length > 0 {
         return -1
       }
-      return calleeSlotOf(n.binLeft, path, depth + 1)
+      return calleeSlotOf(n.binLeft, path, seen)
     }
     Call => {
-      const g = calleeMapGetSlot(n, path, depth)
+      const g = calleeMapGetSlot(n, path, seen)
       if g >= 0 { return g }
-      return calleeCopyCallSlot(n, path, depth)
+      return calleeCopyCallSlot(n, path, seen)
     }
     // No other expression reads a binding's slot.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {
@@ -5125,13 +5143,13 @@ function calleeCopySrc(init: i32): i32 {
 }
 
 // `calleeSlotOf` for `m.get(k)` on a map `m`: the slot of `m`'s values; -1 for any other call.
-function calleeMapGetSlot(n: Call, path: string[], depth: i32): i32 {
+function calleeMapGetSlot(n: Call, path: string[], seen: i32[]): i32 {
   if n.callArgs.length != 1 { return -1 }
   const f = nodeAt(parenPeelIx(n.callFn))
   if !(f is Member) || f.memProp != "get" { return -1 }
   const ot = nodeTyIxOf(f.memObj)
   if ot < 0 || ot >= T.tys.length || !(tyAt(ot) is TyMap) { return -1 }
-  const h = calleeSlotOf(f.memObj, path, depth + 1)
+  const h = calleeSlotOf(f.memObj, path, seen)
   if h >= 0 { path.push("v") }
   return h
 }
@@ -5139,12 +5157,12 @@ function calleeMapGetSlot(n: Call, path: string[], depth: i32): i32 {
 // `calleeSlotOf` for a call that copies or makes the value read: `b.slice(...)` of a list is `b`'s
 // slot, and a call of a declared non-generic function is that function's result (the function
 // itself as holder); -1 for any other call.
-function calleeCopyCallSlot(n: Call, path: string[], depth: i32): i32 {
+function calleeCopyCallSlot(n: Call, path: string[], seen: i32[]): i32 {
   const f = nodeAt(parenPeelIx(n.callFn))
   if f is Member && f.memProp == "slice" {
     const ot = nodeTyIxOf(f.memObj)
     if ot < 0 || ot >= T.tys.length || !(tyAt(ot) is TyArray) { return -1 }
-    return calleeSlotOf(f.memObj, path, depth + 1)
+    return calleeSlotOf(f.memObj, path, seen)
   }
   if !(f is Ident) { return -1 }
   const fd = identFnDeclOf(parenPeelIx(n.callFn))
@@ -5154,7 +5172,7 @@ function calleeCopyCallSlot(n: Call, path: string[], depth: i32): i32 {
 
 // `calleeSlotOf` for a read `x` delivered as a value rather than called: the one walker both use.
 export function slotOfRead(x: i32, path: string[]): i32 {
-  return calleeSlotOf(x, path, 0)
+  return calleeSlotOf(x, path, [])
 }
 
 // `checkCallNode` before the callee's set is noted.
@@ -5228,8 +5246,7 @@ function constRecFieldFnRead(m: i32): i32 {
 // function, a parameter, a binding or a loop variable.
 function nameDeclaredAround(x: i32, nm: string): boolean {
   let f = recEnclosingFn(x)
-  let guard = 0
-  while f >= 0 && f < P.nodes.length && guard < 64 {
+  while f >= 0 && f < P.nodes.length {
     const todo: i32[] = [f]
     while todo.length > 0 {
       const at = todo.pop() ?? -1
@@ -5244,7 +5261,6 @@ function nameDeclaredAround(x: i32, nm: string): boolean {
       }
     }
     f = recEnclosingFn(f)
-    guard = guard + 1
   }
   return false
 }
@@ -5481,45 +5497,6 @@ function adoptArgLits(
   return 0
 }
 
-// `names`/`tys` onto `outN`/`outT`, then each type parameter of the declaration `fd` that a
-// parameter position names and they leave unbound, or bind only to a bare inference hole, as
-// `never`: no value has that type (D14802).
-function withUnboundAsNever(
-  fd: i32,
-  names: string[],
-  tys: i32[],
-  outN: string[],
-  outT: i32[],
-) {
-  let k = 0
-  while k < names.length {
-    outN.push(names[k])
-    outT.push(tys[k])
-    k = k + 1
-  }
-  if fd < 0 || fd >= P.nodes.length { return 0 }
-  const d = nodeAt(fd)
-  if d is FuncDecl {
-    for p in d.fnTyParams {
-      // A parameter no parameter position names has its own refusal at the declaration.
-      const one: string[] = [p]
-      let bound = !anyParamMentionsTyParam(d.fnParams, one)
-      let j = 0
-      while j < names.length {
-        if names[j] == p && j < tys.length && !bareInferHole(tys[j]) {
-          bound = true
-        }
-        j = j + 1
-      }
-      if !bound {
-        outN.push(p)
-        outT.push(TY_NEVER)
-      }
-    }
-  }
-  return 0
-}
-
 // Resets the call's bindings to `b0N`/`b0T`, the ones it held before its arguments, with each
 // name of `wN` bound first at its widened `wT` (D2459).
 function callFtyRebind(
@@ -5545,14 +5522,6 @@ function callFtyRebind(
     i = i + 1
   }
   return 0
-}
-
-// Whether `t` is an inference hole and nothing else.
-function bareInferHole(t: i32): boolean {
-  if t < 0 || t >= T.tys.length { return true }
-  const tv = tyAt(t)
-  if tv is TyVar { return tv.tvName.length == 0 || tv.tvName[0] == "?"[0] }
-  return false
 }
 
 // Whether number-literal argument `i` binds its variable after the arguments beside it: an

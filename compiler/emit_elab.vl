@@ -516,6 +516,32 @@ let elabDeadKs: {[i32]: i32[]} = Map()
 // The cap past which an instance is not enqueued: polymorphic recursion grows without bound.
 const ELAB_MAX_KEYS = 20000
 
+// The key `decl` would be instanced at for binding `names0`/`tys0`, canonicalized as `elabEnqueue`
+// does, without its parent; "" when the binding does not close it.
+export function elabKeyStrFor(
+  decl: i32,
+  names0: string[],
+  tys0: i32[],
+): string {
+  if decl < 0 || decl >= P.nodes.length || !(nodeAt(decl) is FuncDecl) {
+    return ""
+  }
+  const names: string[] = []
+  const tys: i32[] = []
+  if !elabCanon(decl, names0, tys0, names, tys) { return "" }
+  return elabKeyOf(decl, names, tys)
+}
+
+// Every key the elaboration minted, without its parent.
+export function elabKeyStrs(): string[] {
+  const out: string[] = []
+  for k in ekIndex.keys() {
+    const c = k.indexOf("^")
+    out.push(if c >= 0 { k.slice(c + 1, k.length) } else { k })
+  }
+  return out
+}
+
 function elabKeyOf(decl: i32, names: string[], tys: i32[]): string {
   // Sorted by name, so two calls binding the same names in another order share a key; a body
   // testing a type parameter spells each binding exactly, a set apart from its map (D2684).
@@ -13226,6 +13252,40 @@ export function elabHoleMapClosed(t: i32): i32 {
 // `elabHoleMapClosed`'s maps since the last `elabRun`, by key and value.
 let elabHoleMapMemo: {[string]: i32} = Map()
 
+// `i32`, or `i32[]` where `list`, when `t` is a bare type variable or inference hole: the type an
+// `i32` or `i32`-list field code stores at a row minted there (D16720); -1 for any other type.
+export function elabTyVarAtI32(t: i32, list: boolean): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const x = tyAt(t)
+  return match x {
+    TyVar => if list { mkArrayTy(TY_I32) } else { TY_I32 }
+    TyPrim | TyObj | TyFunc | TyMap | TyUnion | TyArray | TyNullable | TyLit | TyErr | TyNeg => -1
+  }
+}
+
+// `t` with a list's absent or inference-hole element closed to `i32`, through one `| null`: the
+// type an `i32`-list field code stores an empty list joined with `null` at (D16722); -1 for any
+// other type.
+export function elabHoleListAtI32(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const x = tyAt(t)
+  return match x {
+    TyNullable => {
+      const inner = elabHoleListAtI32(x.nInner)
+      if inner < 0 { -1 } else { mkNullableTy(inner) }
+    }
+    TyArray => {
+      const e = tyElemOf(x)
+      if e < 0 || e < T.tys.length && tyAt(e) is TyVar && tyHasInferHole(e) {
+        mkArrayTy(TY_I32)
+      } else {
+        -1
+      }
+    }
+    TyPrim | TyObj | TyFunc | TyMap | TyUnion | TyVar | TyLit | TyErr | TyNeg => -1
+  }
+}
+
 // The closed container an empty container nothing types is built at when handed to a type
 // parameter, through lists, maps, sets and nullables: a hole key or set element as `string` and a
 // hole element or value as `i32`, as an open literal is built (D1887, D15040). -1 where no part
@@ -21362,9 +21422,10 @@ function eplBuild() {
 // function, repeated while a new member reaches a call.
 function eplCallResults() {
   const done: {[string]: boolean} = Map()
+  // Each round draws only pairs `done` has not seen, over a fixed set of calls and members, so the
+  // loop ends when a round draws none.
   let grew = true
-  let round = 0
-  while grew && round < 8 {
+  while grew {
     grew = false
     let r = 0
     while r < EPL.calls.length {
@@ -21375,7 +21436,6 @@ function eplCallResults() {
       }
       r = r + 1
     }
-    round = round + 1
   }
   // Reach answers taken while the pass grows the classes answer no reader.
   EPL.reachMemo = Map()
@@ -21422,18 +21482,44 @@ function eplCallResultFlow(
     // A function an instance minted after the write index has no frame the index files.
     if mn is FuncDecl && m < cwIxCoveredLen() && !done.has(key) {
       done.set(key, true)
-      const src = eplChild(eplRootK(m, eplKeyOfFn(m)), "r")
-      if src >= 0 && dst >= 0 {
-        EPL.flowSrc.push(src)
-        EPL.flowDst.push(dst)
-        EPL.flowVal.push(-1)
-        EPL.reachMemo = Map()
-        EPL.oneMemo = Map()
-        drew = true
+      for fk in eplResultKeysOf(m, EPL.callKey[ci]) {
+        // One edge per (frame key, member): the keys are the build's, so the pairs are finite.
+        const pair = i32ToStr(fk) + "|" + i32ToStr(m) + "|" + i32ToStr(c)
+        const src = if done.has(pair) { -1 } else { eplChild(eplRootK(m, fk), "r") }
+        done.set(pair, true)
+        if src >= 0 && dst >= 0 {
+          EPL.flowSrc.push(src)
+          EPL.flowDst.push(dst)
+          EPL.flowVal.push(-1)
+          EPL.reachMemo = Map()
+          EPL.oneMemo = Map()
+          drew = true
+        }
       }
     }
   }
   return drew
+}
+
+// The frame keys a call in instance `k` reads member `m`'s result at: the frame instance among
+// `k`'s ancestors, else each instance of the frame nested in `k`, such as a closure a callee made.
+function eplResultKeysOf(m: i32, k: i32): i32[] {
+  const k0 = EPL.k
+  EPL.k = k
+  const own = eplKeyOfFn(m)
+  EPL.k = k0
+  const ks: i32[] = []
+  if own != -2 {
+    ks.push(own)
+    return ks
+  }
+  const fr = eplFrameOf(m)
+  const none: i32[] = []
+  for kk in if fr >= 0 { EPL.insts.get(fr) ?? none } else { none } {
+    if k >= 0 && (eplKeyUnder(kk, k) || elabReaches(k, kk)) { ks.push(kk) }
+  }
+  if ks.length == 0 { ks.push(own) }
+  return ks
 }
 
 // The one closed type slot `path` of `holder` (steps `e`, `v`, `f.<name>`) is delivered at in
