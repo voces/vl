@@ -8,6 +8,40 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-17-slot-store-callres-round-cap](2026-11-17-slot-store-callres-round-cap.md): Place classes: the call-result pass ends on its done set (lane SLOT, 2026-11-17)
+- [2026-11-17-rep-adt-stage3-hole-list-store](2026-11-17-rep-adt-stage3-hole-list-store.md): Rep ADT stage 3: the hole-list class closes (D16722), and three measured declines, 2026-11-17 (lane REP)
+- [2026-11-17-l2-d16898-scope](2026-11-17-l2-d16898-scope.md): L2: what D16898 needs from check, scoped, 2026-11-17
+- [2026-11-16-union-return-join-accumulator](2026-11-16-union-return-join-accumulator.md): Union return joins grow linearly per return, 2026-11-16 (lane REP)
+- [2026-11-16-union-arm-rows-and-scan-census](2026-11-16-union-arm-rows-and-scan-census.md): Union arm rows in one pass, and the `fnDetectScratch` census, 2026-11-16 (lane REP)
+- [2026-11-16-type-hashcons-s6b36-emit-rep](2026-11-16-type-hashcons-s6b36-emit-rep.md): Type hash-cons stage 6b, tier 2: emit_rep.vl's walk limits (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b35-cost-bounds](2026-11-16-type-hashcons-s6b35-cost-bounds.md): Type hash-cons stage 6b, tier 2: two walk limits kept as cost bounds (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b33-emit-collect-1](2026-11-16-type-hashcons-s6b33-emit-collect-1.md): Type hash-cons stage 6b, tier 2: emit_collect.vl's reached walk limits, part 1 (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b32-store-rep-side-rows](2026-11-16-type-hashcons-s6b32-store-rep-side-rows.md): Type hash-cons stage 6b, tier 2: check_store_rep.vl and check_side_rows.vl (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b31-elab-cap-walks](2026-11-16-type-hashcons-s6b31-elab-cap-walks.md): Type hash-cons stage 6b, tier 2: check_elab_cap.vl's reached walk limits (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b30-check-types-walks](2026-11-16-type-hashcons-s6b30-check-types-walks.md): Type hash-cons stage 6b, tier 2: check_types.vl's reached walk limits (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b29-emit-elab-walks-2](2026-11-16-type-hashcons-s6b29-emit-elab-walks-2.md): Type hash-cons stage 6b, tier 2: emit_elab.vl's reached walk limits, part 2 (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b28-emit-elab-walks-1](2026-11-16-type-hashcons-s6b28-emit-elab-walks-1.md): Type hash-cons stage 6b, tier 2: emit_elab.vl's reached walk limits, part 1 (lane HASH), 2026-11-16
+- [2026-11-16-type-hashcons-s6b25-open-hole-path](2026-11-16-type-hashcons-s6b25-open-hole-path.md): Type hash-cons stage 6b: `recOpenHolePath` takes a visited set (lane HASH), 2026-11-16
+- [2026-11-16-store-n3-paths-and-copies](2026-11-16-store-n3-paths-and-copies.md): Producer slice N3: `for` elements, path lack and `const` copies, 2026-11-16
+- [2026-11-16-store-late-residue-guard](2026-11-16-store-late-residue-guard.md): The late tag decider keeps a named, closed residue, 2026-11-16
+- [2026-11-16-store-holder-literal-arg](2026-11-16-store-holder-literal-arg.md): Holder rule: a literal handed to a hole parameter is read at the call's binding, 2026-11-16
+- [2026-11-16-slot-store-stage-3-design](2026-11-16-slot-store-stage-3-design.md): Slot store stage 3: mono's pins decided before mono (lane SLOT, 2026-11-16)
+- [2026-11-16-slot-store-freeze-snapshot](2026-11-16-slot-store-freeze-snapshot.md): Slot store: answering mono's slot questions as of the freeze is refuted (lane SLOT, 2026-11-16)
+- [2026-11-16-slot-store-freeze-guard](2026-11-16-slot-store-freeze-guard.md): Slot store: the place classes are frozen when mono begins (lane SLOT, 2026-11-16)
+- [2026-11-16-slot-store-e](2026-11-16-slot-store-e.md): Slot store part E: the delivery walk is deleted (lane SLOT, 2026-11-16)
+- [2026-11-16-slot-store-closure-result-edge](2026-11-16-slot-store-closure-result-edge.md): Place classes: a call-result edge from a closure a reached instance makes (lane SLOT, 2026-11-16)
+- [2026-11-16-self-compile-fuel-round2](2026-11-16-self-compile-fuel-round2.md): Self-compile fuel, round 2, 2026-11-16 (lane REP)
+- [2026-11-16-l2-read-resolution](2026-11-16-l2-read-resolution.md): L2: mono's static read resolution, measured, and where it should move, 2026-11-16
+- [2026-11-16-l2-inst-vec](2026-11-16-l2-inst-vec.md): L2: the instance vector, recorded and read by nothing, 2026-11-16
+- [2026-11-16-l2-inst-vec-paths](2026-11-16-l2-inst-vec-paths.md): L2: the instance vector on every pin path, 2026-11-16
+- [2026-11-16-l2-hole-builtin-member](2026-11-16-l2-hole-builtin-member.md): L2: a built-in method on an un-annotated parameter answers its member demand, 2026-11-16
+- [2026-11-16-l2-d16881-arrow-reach](2026-11-16-l2-d16881-arrow-reach.md): L2: what decides D16881's refusal, and whether the arrow facts reach it, 2026-11-16
+- [2026-11-16-l2-closure-receiver](2026-11-16-l2-closure-receiver.md): L2: a member call on a parameter from inside a closure is picked per instance, 2026-11-16
+- [2026-11-16-ir-n2b2c1b-null-test](2026-11-16-ir-n2b2c1b-null-test.md): IR N2b-2c-1b: a `K | null`'s null test and literal compare through legacy's route, 2026-11-16
+- [2026-11-16-ir-n2b2c1-atom-nullable](2026-11-16-ir-n2b2c1-atom-nullable.md): IR N2b-2c-1: the `K | null` atom rep, its retag and its null, 2026-11-16
+- [2026-11-16-ir-n2b2a-pop-statement](2026-11-16-ir-n2b2a-pop-statement.md): IR N2b-2a: a `.pop()` statement through legacy's plan and drop tail, 2026-11-16
+- [2026-11-16-ir-n2b1-atom-compare](2026-11-16-ir-n2b1-atom-compare.md): IR N2b-1: atom compare through legacy's own arm decision, 2026-11-16
+- [2026-11-16-ir-n2a-null-box](2026-11-16-ir-n2a-null-box.md): IR N2a: a delivered `null` boxes through legacy's writer, 2026-11-16
 - [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
 - [2026-11-16-ir-i8b-box](2026-11-16-ir-i8b-box.md): IR I8b+N1 part 1: boxed nullables, the box through legacy's writer, 2026-11-16
 - [2026-11-16-ir-i8b2-sink](2026-11-16-ir-i8b2-sink.md): IR I8b part 2: the union return sink, shared, 2026-11-16

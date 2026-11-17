@@ -12648,3 +12648,52 @@ instantiation vector answers that once, for all classes.
 - **L2 S3.6 takes option B.** The five ambient substitution modes become one scoped `SubstCtx` with
   enter/leave pairs and a restore guard; threading them as arguments (option A) is deferred until after
   S3.4d, on the setter and reader counts in the S3.6b note.
+
+## An un-instantiated function's hole parameters close at check to the hole default (2026-11-17, chosen under the owner's delegation) — D16898
+
+**The rule.** A hole parameter of an un-annotated function that no call instantiates closes at check
+to the default the language already gives an unconstrained hole: `i32`, or the flush default for an
+operator-constrained hole. A call counts whether it is direct or reaches the function through a slot or
+value it flows into; when such a call exists, its type decides the instance and the default never applies.
+
+**Why.** It is the same rule an empty container's open element follows (`i32` list element, `string` set
+element or map key), and it makes mono's former accidental default a stated rule that check can see.
+
+## A generic function value handed on through a call is used at one type (2026-11-17) — D16843
+
+**The rule.** Check refuses a generic function value that is handed through a call and then called at
+two types, whether the callee calls it directly or returns it in a closure. A parameter called directly
+at two types is still split per type. Whether a handed-on generic function value keeps its polymorphism is
+an open owner question; one row records the capability.
+
+**Why.** It is the contract the direct hand-on (`call1(a)`) already has, and refusing at check is better than
+an emit refusal of a check-clean program.
+
+## Stage 3 of the slot store is parked behind check-time types (2026-11-17) — D16768, D16898
+
+Three attempts to decide mono's pins before mono were refuted, each measured: freeze-time reads (B′-1), a
+closed-slot-fact bound (S3a, 13 runs lost), and a pin-typing pre-step (A′, coupled to stored-record shapes and
+instancing). Writer 1's answer is the whole pin applied, instancing included. D16768 stays open, blocked on
+check-time types (D16898's hole default is its first fact); a mono pre-pass is declined as a large reorder
+for an order dependence that loses no `runs`.
+
+## Smaller rulings (2026-11-16/17)
+
+- **Union row keys separate a `Set` member from its boolean-map twin** only in the canonical member walk,
+  not in the key text, which generic instances share (D16885, D2720).
+- **A1 keys an instance as (KeyId, storage):** function identity sits beside the type vector, never inside it.
+- **An inline container read in place settles at its read;** a call result is fresh only when the callee
+  hands back a fresh argument or builds the container (hand-back facts), never because its arguments are fresh.
+- **D16296's held-container refusal is a contract:** re-wrapping a held container's elements would break its aliases.
+- **A mixed scalar-and-composite closure result is interned from its annotation** only once every producer
+  delivered at that type builds the box result (#8856's adapter rule); D16889 lands on it.
+- **Bare import specifiers have no meaning:** an import names a relative path or a `std:` module, and the
+  refusal states that rule.
+- **A cost-bound walk limit is allowed only if its answer at the cut is conservative** (`tySameAt`, `callBuiltTy`).
+- **D16897 is lowered per instance in emit;** a template shared by instances is never rewritten for one pin.
+- **`print(-0.0)` prints `0`,** the same text serialisation writes.
+- **Diagnostic, editor and matrix tests anchor on the test-only refusal hooks** (#8819, #8871), never on an open row.
+- **Self-compile speed work stays stateless where it can:** the union-arm index and the join accumulator are
+  per call or per function; a global memo needs a measured hit rate under a sound stamp.
+- **IR order:** N2b-2a, 2c-1, 2c-1b, M1 (`??`), P1 (`print`), the float bit built-ins, 2c-2 (`string | null`),
+  then I8c; each step is chosen by the measured count of functions it alone unblocks.
