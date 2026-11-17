@@ -48,4 +48,4 @@ with every call's facts.
 - Capability matrix, 73 hole-fn / fn-list / generic-fn templates: 2981 of 3780 run, 0 runs → not-runs,
   0 → silent, 0 program traps.
 - Probe `refused with every call`: 0 fires. Late demands 10 (unchanged). Seed +0.3% on baseline.
-  L2 self-compile fuel +0.9%.
+  L2 self-compile fuel +0.3% after merging master (late tags 442 = baseline on the merged fixpoint).
