@@ -1790,15 +1790,15 @@ function elabEnqueue(decl: i32, names0: string[], tys0: i32[], from: i32): i32 {
   return k
 }
 
-// Enqueues at the root the default instance (each parameter hole at `i32`) of each hole function
-// whose value is read and that no instance reaches, so a build where that value is stored has a key.
+// Enqueues at the root the default instance of each hole function whose value is read and that no
+// instance reaches, so a build where that value is stored has a key. Each parameter hole takes the
+// default it would take at check: `i32` unless the body refuses it there (`elabHoleDefaultTys`).
 function elabStoredHoleDefaults() {
   let grew = false
   for d in elabValueDecls.keys() {
     const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
     if dn is FuncDecl && elabIsHoleFn(d) && !elabHasInstance(d) {
-      const pts: i32[] = []
-      for _p in dn.fnParams { pts.push(TY_I32) }
+      const pts = elabHoleDefaultTys(d, dn)
       elabGuessing = true
       elabEnqueueAtParams(d, pts)
       elabGuessing = false
@@ -1807,6 +1807,74 @@ function elabStoredHoleDefaults() {
   }
   if grew { elabSettle(0) }
   return 0
+}
+
+// The primitives a parameter hole's default is chosen from, in order: the unconstrained default
+// first, then the types an operator or method the body applies may demand instead.
+const ELAB_HOLE_DEFAULT_CANDS: string[] = ["i32", "f64", "string", "boolean"]
+
+// The parameter types of hole function `d`'s default instance: the first assignment of candidates
+// to its parameters, in order with the earlier parameter varying slowest, that the body checks
+// at; every parameter at `i32` when none does or it has more than three.
+function elabHoleDefaultTys(d: i32, dn: FuncDecl): i32[] {
+  const n = dn.fnParams.length
+  const pts: i32[] = []
+  for _p in dn.fnParams { pts.push(TY_I32) }
+  if n > 3 || elabBodyChecksAt(d, pts) { return pts }
+  const nc = ELAB_HOLE_DEFAULT_CANDS.length
+  let total = 1
+  for _p in dn.fnParams { total = total * nc }
+  let code = 1
+  while code < total {
+    const at: i32[] = []
+    let rest = code
+    let i = n - 1
+    while i >= 0 {
+      at.push(0)
+      i = i - 1
+    }
+    i = n - 1
+    while i >= 0 {
+      at[i] = primTyOfName(ELAB_HOLE_DEFAULT_CANDS[rest % nc])
+      rest = rest / nc
+      i = i - 1
+    }
+    if elabBodyChecksAt(d, at) { return at }
+    code = code + 1
+  }
+  return pts
+}
+
+// Whether hole function `d`'s body checks with its parameters at `pts`, raising no diagnostic: a
+// quiet re-check under the bindings `elabEnqueueAtParams` would key, rolled back.
+function elabBodyChecksAt(d: i32, pts: i32[]): boolean {
+  const sig = nodeTyIxOf(d)
+  const f = if sig >= 0 && sig < T.tys.length { tyAt(sig) } else { null }
+  if !(f is TyFunc) || f.fnParamTypes.length != pts.length { return true }
+  const names: string[] = []
+  const tys: i32[] = []
+  let i = 0
+  while i < pts.length {
+    bindGenWalk(f.fnParamTypes[i], pts[i], names, tys)
+    i = i + 1
+  }
+  const savedRet = T.curRet
+  const savedFn = curFnDeclIx
+  const savedNj = njFnIx
+  T.curRet = TY_ERR
+  curFnDeclIx = d
+  cstrOwnerStack.push(d)
+  const em = checkMark()
+  const d0 = T.diags.length
+  const sv = monoRecheckBegin(d, pts, names, tys)
+  const ok = sv == null || T.diags.length == d0
+  if sv != null { monoRecheckEnd(sv) }
+  checkRollback(em, RB_ALL)
+  cstrOwnerStack.pop()
+  curFnDeclIx = savedFn
+  njFnIxSet(savedNj)
+  T.curRet = savedRet
+  return ok
 }
 
 // Whether each instance's body has been checked.
