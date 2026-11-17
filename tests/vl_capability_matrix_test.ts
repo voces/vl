@@ -53,11 +53,11 @@ const CACHE = new Map<string, Promise<{ code: number; cells: Cell[]; out: string
 // `only` narrows the run to a comma-separated position list. The D1244 templates are graded
 // that way: their whole point is the six `block_*` cells, and a full 52-cell sweep of three
 // more templates would put this suite over the gate's time budget for nothing.
-const runMatrix = (template: string, only = "") => {
-  const key = only ? `${template}#${only}` : template;
+const runMatrix = (template: string, only = "", extra: string[] = []) => {
+  const key = [template, only, ...extra].join("#");
   let p = CACHE.get(key);
   if (!p) {
-    p = runMatrixOnce(template, only);
+    p = runMatrixOnce(template, only, extra);
     CACHE.set(key, p);
   }
   return p;
@@ -66,6 +66,7 @@ const runMatrix = (template: string, only = "") => {
 const runMatrixOnce = async (
   template: string,
   only: string,
+  extra: string[],
 ): Promise<{ code: number; cells: Cell[]; out: string }> => {
   const args = [
     "run",
@@ -78,6 +79,7 @@ const runMatrixOnce = async (
     VL,
   ];
   if (only) args.push("--only", only);
+  args.push(...extra);
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
     cwd: ROOT,
@@ -356,15 +358,13 @@ null
 // An emit refusal's reason is the refusal's own text. `vl check` prints a parenthesised note
 // when a program imports std (`(std: modules not linted …)`), and the reason column once quoted
 // that note for every emit refusal, since it is the first line the check phase leaves. The
-// control imports std through interpolation and is refused at emit by D14082's lambda result.
-const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std imported.
+// control imports std through interpolation and is refused at emit by the test hook.
+const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std imported: the harness's own hook, which
+// \`--test-emit-refusal\` refuses at emit, so no capability fix moves it.
 // @@PRELUDE@@
-type __P = {a: i32}
-const __p: __P = {a: 1}
-function __len<T>(f: () => T | string) {
-  return 7
-}
-print("\\{__len(() => __p)}")
+function __vl_test_emit_refusal__() {}
+__vl_test_emit_refusal__()
+print("\\{1}")
 // @@VALUE@@
 1
 // @@TYPE@@
@@ -383,17 +383,17 @@ Deno.test({
     try {
       const t = `${dir}/emit-reason.matrix.vl`;
       await Deno.writeTextFile(t, EMIT_REASON_TEMPLATE);
-      const { cells } = await runMatrix(t, "binding,argument");
+      const { cells } = await runMatrix(t, "binding,argument", ["--test-emit-refusal"]);
       for (const face of ["annotated", "un-annotated"]) {
         for (const p of ["binding", "argument"]) {
           const grade = gradeOf(cells, p, face);
           if (verdictOf(grade) !== "emit refuses") {
             throw new Error(
               `${p}/${face}: the control no longer reaches an emit refusal, so this guard measures ` +
-                `nothing — replace its prelude with another check-clean emit refusal. Got: ${grade}`,
+                `nothing: \`--test-emit-refusal\` no longer refuses the hook call. Got: ${grade}`,
             );
           }
-          if (!grade.includes("ref valtype with no interned shape") || grade.includes("not linted")) {
+          if (!grade.includes("test-only refusal") || grade.includes("not linted")) {
             throw new Error(`${p}/${face}: want the refusal's own text as the reason, got ${grade}`);
           }
         }

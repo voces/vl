@@ -108,6 +108,8 @@ import {
   luDecl,
 } from "./check_annot_resolve"
 import {
+  IV_DECL,
+  IV_FSB,
   callBindTyOf,
   fsbCallArgTys,
   fsbCallArgTysPush,
@@ -143,6 +145,7 @@ import {
   holeLitMovedSet,
   holeLitPinOf,
   holeLitPinSet,
+  instVecNoteNever,
   nolNoteDelivery,
 } from "./check_bind_rows"
 import {
@@ -814,6 +817,7 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   const ix = fsbCallIx[c]
   const who = fsbCallWho[c]
   const callee = fsbOwnerCallee(o)
+  instVecNoteNever(ix, IV_FSB, o, callee, nm, ty)
   const ctx0 = substCtxNow()
   const mode = if o >= 0 { SUBST_DECLARED } else { SUBST_ALL }
   const ctx = substCtxStrict(substCtxNest(ctx0, mode, ctx0.nestDecl), o >= 0)
@@ -1060,15 +1064,15 @@ export function genFnValueCstrs(srcExpr: i32, srcTy: i32, dstTy: i32) {
   const anyCand = cstrCandAny || valBindLambda.length > 0
   if genFnCstrBusy || !anyCand || !tyMayHoldFn(dstTy) { return 0 }
   genFnCstrBusySet(true)
-  genFnValueCstrsAt(srcExpr, srcTy, dstTy, 0)
+  genFnValueCstrsAt(srcExpr, srcTy, dstTy)
   genFnCstrBusySet(false)
   return 0
 }
 
 // `genFnValueCstrs` at `srcExpr`, reaching through the fields of an object literal and the
-// elements of a list literal delivered to a record or list type, `depth` levels down.
-function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
-  if srcExpr < 0 || dstTy < 0 || depth > 8 { return 0 }
+// elements of a list literal delivered to a record or list type, at any depth.
+function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcExpr < 0 || dstTy < 0 { return 0 }
   const lit = nodeAt(parenPeelIx(srcExpr))
   if lit is ObjLit {
     const dobj = tyAt(dstTy)
@@ -1077,9 +1081,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
         const f = nodeAt(fi)
         if f is FieldInit {
           const ft = objFieldType(dobj, f.fiName)
-          if ft >= 0 {
-            genFnValueCstrsAt(f.fiValue, nodeTyOf(f.fiValue), ft, depth + 1)
-          }
+          if ft >= 0 { genFnValueCstrsAt(f.fiValue, nodeTyOf(f.fiValue), ft) }
         }
       }
     }
@@ -1089,7 +1091,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
     const darr = tyAt(dstTy)
     if darr is TyArray {
       for el in lit.arrElems {
-        genFnValueCstrsAt(el, nodeTyOf(el), tyElemOf(darr), depth + 1)
+        genFnValueCstrsAt(el, nodeTyOf(el), tyElemOf(darr))
       }
     }
     return 0
@@ -1644,6 +1646,7 @@ function declCstrsAtBinding(
   owner: i32,
   who: string,
 ) {
+  instVecNoteNever(srcExpr, IV_DECL, owner, owner, bNames, bTys)
   const at = solvePlain(bNames, bTys, srcExpr, owner, who)
   at.kinds = SS_ALL - (1 << SS_IS)
   return ifaceSolveAt(at, SS_BIN, SS_UFCS)
@@ -1969,24 +1972,25 @@ function assignableLitExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
 // -1 where `srcExpr` is no list literal or no member takes it. Asked quietly, records nothing.
 function listArmOfUnionFit(srcExpr: i32, srcTy: i32, dstTy: i32): i32 {
   if !(nodeAt(parenPeelIx(srcExpr)) is ArrayLit) { return -1 }
-  const own = listArmIn(srcExpr, srcTy, dstTy, true, 6)
+  const own = listArmIn(srcExpr, srcTy, dstTy, true, [])
   if own >= 0 { return own }
   const ex = listLitExactArm(dstTy, srcExpr)
   if ex >= 0 { return ex }
-  return listArmIn(srcExpr, srcTy, dstTy, false, 6)
+  return listArmIn(srcExpr, srcTy, dstTy, false, [])
 }
 
 // One pass of `listArmOfUnionFit`: `exact` asks for `srcTy` itself, else the first list member
-// `srcExpr` fits. `depth` bounds the walk through nested unions.
+// `srcExpr` fits. Each nested union is searched once (`seen`).
 function listArmIn(
   srcExpr: i32,
   srcTy: i32,
   dstTy: i32,
   exact: boolean,
-  depth: i32,
+  seen: i32[],
 ): i32 {
   const d = nonNullTy(dstTy)
-  if depth <= 0 || d < 0 { return -1 }
+  if d < 0 || i32ListHas(seen, d) { return -1 }
+  seen.push(d)
   const u = tyAt(d)
   if !(u is TyUnion) { return -1 }
   for m in u.uMembers {
@@ -1995,7 +1999,7 @@ function listArmIn(
       if !exact && tyAt(m) is TyArray && assignableExpr(srcExpr, srcTy, m) {
         return m
       }
-      const inner = listArmIn(srcExpr, srcTy, m, exact, depth - 1)
+      const inner = listArmIn(srcExpr, srcTy, m, exact, seen)
       if inner >= 0 { return inner }
     }
   }
@@ -3292,26 +3296,30 @@ function litPinAssignable(
 // Whether source `g`, holding open parameters somewhere, puts a function type where `w` holds no
 // function at any instance: walked through lists, nullables and shared record fields, deferring
 // (false) at every other pairing, a type parameter or a union of records included (D14979).
-function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
-  if g < 0 || w < 0 || g >= T.tys.length || w >= T.tys.length || depth > 8 {
-    return false
+function fnShapeClash(g: i32, w: i32, seen: i32[]): boolean {
+  if g < 0 || w < 0 || g >= T.tys.length || w >= T.tys.length { return false }
+  // A pair `seen` already holds answered false when first walked, or is a cycle.
+  let q = 0
+  while q + 1 < seen.length {
+    if seen[q] == g && seen[q + 1] == w { return false }
+    q = q + 2
   }
+  seen.push(g)
+  seen.push(w)
   const gt = tyAt(g)
   const wt = tyAt(w)
   if wt is TyNullable && !(gt is TyFunc) {
-    return fnShapeClash(g, wt.nInner, depth + 1)
+    return fnShapeClash(g, wt.nInner, seen)
   }
   match gt {
     TyFunc => {
       return tyHoldsNoFn(w)
     }
     TyNullable => {
-      return fnShapeClash(gt.nInner, w, depth + 1)
+      return fnShapeClash(gt.nInner, w, seen)
     }
     TyArray => {
-      if wt is TyArray {
-        return fnShapeClash(tyElemOf(gt), tyElemOf(wt), depth + 1)
-      }
+      if wt is TyArray { return fnShapeClash(tyElemOf(gt), tyElemOf(wt), seen) }
       return false
     }
     TyObj => {
@@ -3321,7 +3329,7 @@ function fnShapeClash(g: i32, w: i32, depth: i32): boolean {
         const k = strListIndexOf(gt.objFieldNames, wt.objFieldNames[i])
         if (
           k >= 0
-          && fnShapeClash(gt.objFieldTypes[k], wt.objFieldTypes[i], depth + 1)
+          && fnShapeClash(gt.objFieldTypes[k], wt.objFieldTypes[i], seen)
         ) {
           return true
         }
@@ -3412,14 +3420,14 @@ export function retRule(
     if (
       (rgc < 0 || tyHasHole(rgc))
       && !tyHasHole(rw)
-      && fnShapeClash(rg, rw, 0)
+      && fnShapeClash(rg, rw, [])
     ) {
       rgc = rg
     }
     const rClash = rgc == rg
       && tyHasHole(rg)
       && !tyHasHole(rw)
-      && fnShapeClash(rg, rw, 0)
+      && fnShapeClash(rg, rw, [])
     if rgc >= 0 && (!tyHasHole(rgc) || rClash) {
       if (!tyHasHole(rw) && !retNomOnlyAtHole(row.b, row.site, rgc, rw)) {
         if (
@@ -3589,7 +3597,7 @@ export function letRule(
     }
     // A function whose own parameters are still open fits no destination that holds no
     // function, whatever they become, so it is judged now rather than deferred (D14979).
-    const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, 0)
+    const clash = tyHasHole(lg) && !tyHasHole(lw) && fnShapeClash(lg, lw, [])
     if (
       (!tyHasHole(lg) && !tyHasHole(lw) || clash)
       && !letLamJudgedAtCall(ci, ix)
@@ -3785,7 +3793,7 @@ function dstOnlyOpenFnArgsName(
   while i < params.length {
     if tyMentionsTyVarNamed(params[i], name) {
       if i >= args.length { return false }
-      const slots = dstOpenFnSlotsNaming(name, params[i], args[i], 0)
+      const slots = dstOpenFnSlotsNaming(name, params[i], args[i])
       if slots.length == 0 { return false }
       // A type parameter of this slot another argument binds fixes the function's instance, and so
       // its result; a parameter position of the slot it leaves open.
@@ -3815,12 +3823,7 @@ function dstOnlyOpenFnArgsName(
 // The function types naming `name` that parameter type `pt` hands an open function at: `pt` where
 // argument `a` is one, else those of each record field naming it, read at the field's value in
 // the record literal `a` (D16590); [] where any position naming `name` holds no open function.
-function dstOpenFnSlotsNaming(
-  name: string,
-  pt: i32,
-  a: i32,
-  depth: i32,
-): i32[] {
+function dstOpenFnSlotsNaming(name: string, pt: i32, a: i32): i32[] {
   const none: i32[] = []
   if pt < 0 || pt >= T.tys.length { return none }
   const t = tyAt(pt)
@@ -3841,7 +3844,7 @@ function dstOpenFnSlotsNaming(
         const f = nodeAt(fi)
         if f is FieldInit && f.fiName == t.objFieldNames[k] { v = f.fiValue }
       }
-      const sub = if v >= 0 && depth < 8 { dstOpenFnSlotsNaming(name, ft, v, depth + 1) } else { none }
+      const sub = if v >= 0 { dstOpenFnSlotsNaming(name, ft, v) } else { none }
       if sub.length == 0 { return none }
       for q in sub { out.push(q) }
     }
@@ -4382,7 +4385,7 @@ function fvaInferredRetCall(n: Node): boolean {
 // `dstTy`, through record fields, list elements and a nullable: a function's type parameters are
 // bound by its signature against the destination function type's.
 function fvaValueRowNote(srcTy: i32, dstTy: i32) {
-  fvaValueRowWalk(srcTy, dstTy, 4)
+  fvaValueRowWalk(srcTy, dstTy, [])
 }
 
 // Banks the instance at closed function type `dstTy` of each generic function a binding read
@@ -4404,23 +4407,31 @@ export function fvaRetRowsNote(body: i32, ret: i32) {
   return 0
 }
 
-function fvaValueRowWalk(srcTy: i32, dstTy: i32, depth: i32) {
-  if depth <= 0 || srcTy < 0 || srcTy >= T.tys.length { return 0 }
+function fvaValueRowWalk(srcTy: i32, dstTy: i32, seen: i32[]) {
+  if srcTy < 0 || srcTy >= T.tys.length { return 0 }
   const dt = nonNullTy(dstTy)
   if dt < 0 || dt >= T.tys.length { return 0 }
+  // `seen` holds the (source, destination) pairs walked, so a recursive pair is walked once.
+  let q = 0
+  while q + 1 < seen.length {
+    if seen[q] == srcTy && seen[q + 1] == dt { return 0 }
+    q = q + 2
+  }
+  seen.push(srcTy)
+  seen.push(dt)
   const s = tyAt(srcTy)
   const d = tyAt(dt)
   if s is TyObj && d is TyObj {
     let i = 0
     while i < s.objFieldNames.length && i < s.objFieldTypes.length {
       const ft = objFieldType(d, s.objFieldNames[i])
-      if ft >= 0 { fvaValueRowWalk(s.objFieldTypes[i], ft, depth - 1) }
+      if ft >= 0 { fvaValueRowWalk(s.objFieldTypes[i], ft, seen) }
       i = i + 1
     }
     return 0
   }
   if s is TyArray && d is TyArray {
-    return fvaValueRowWalk(tyElemOf(s), tyElemOf(d), depth - 1)
+    return fvaValueRowWalk(tyElemOf(s), tyElemOf(d), seen)
   }
   // Each generic member of a set is banked at the destination, as one alone is.
   for m in elabFnSetOf(srcTy) { fvaValueRowAt(m, dt) }
@@ -5362,15 +5373,16 @@ function fvaMakerLambdaOf(m: i32): i32 {
   const rets: i32[] = []
   collectRetValues(fn.fnBody, rets)
   for r in rets {
-    if fvaValueIsCallResult(r, 0) { return -1 }
+    if fvaValueIsCallResult(r, []) { return -1 }
   }
   return m
 }
 
 // Whether value `v` is a call's result: a call, or a read of an un-annotated `const` holding one.
-function fvaValueIsCallResult(v: i32, depth: i32): boolean {
+function fvaValueIsCallResult(v: i32, seen: i32[]): boolean {
   const x = parenPeelIx(v)
-  if x < 0 || x >= P.nodes.length || depth > 8 { return false }
+  if x < 0 || x >= P.nodes.length || i32ListHas(seen, x) { return false }
+  seen.push(x)
   const n = nodeAt(x)
   if n is Call { return true }
   if !(n is Ident) { return false }
@@ -5384,7 +5396,7 @@ function fvaValueIsCallResult(v: i32, depth: i32): boolean {
   ) {
     return false
   }
-  return fvaValueIsCallResult(dn.letInit, depth + 1)
+  return fvaValueIsCallResult(dn.letInit, seen)
 }
 
 // Withdraws the call notes of each maker one of whose reads takes no instance of its own: the
