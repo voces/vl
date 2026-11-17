@@ -72,11 +72,13 @@ import {
   isvalType,
 } from "./check_state"
 import { i32ListAt, strListHas } from "./listutil"
+import { anyParamMentionsTyParam } from "./check_fn_lit_sites"
 import { tailValueLeaves } from "./check_unconsumed"
 import { ctnLitBindPopTo, ctnLitBindReset } from "./check_ctn_lit_bind"
 import {
   T,
   TY_ERR,
+  TY_NEVER,
   TY_NULL,
   TyArray,
   TyErr,
@@ -229,8 +231,10 @@ export function isvalReset() {
   callBind.ixs = []
   callBind.names = []
   callBind.tys = []
-  instVecRow = Map()
+  instVecRows = Map()
   instVec.ixs = []
+  instVec.paths = []
+  instVec.subs = []
   instVec.callees = []
   instVec.names = []
   instVec.tys = []
@@ -335,21 +339,46 @@ let callBindRow: {[i32]: i32} = Map()
 type CallBindCols = { ixs: i32[], names: string[][], tys: i32[][] }
 const callBind: CallBindCols = { ixs: [], names: [], tys: [] }
 
-// The instance vector: what each call's body check bound over its callee's type variables (the
-// declared ones, then its holes; one a parameter names but nothing binds is `never`), by call
-// node, with the callee declaration (-1 for a call through a function value, which stays open).
+// The instance vector: what a body check bound over a callee's type variables (the declared
+// ones, then its holes; one a parameter names but nothing binds is `never`), with the callee (-1
+// when none is known: a call through a function value stays open). One row per (node, path, sub).
 // A re-check never writes it; the instance closure substitutes through it.
-let instVecRow: {[i32]: i32} = Map()
+export const IV_CALL = 0
+export const IV_UFCS = 1
+// `sub` is the lambda handed to the hole parameter; `ix` is the call handing it.
+export const IV_HOLE_LAMBDA = 2
+// `sub` is the owner a set-of-functions binding re-checks the call under.
+export const IV_FSB = 3
+// `ix` is the binding's source expression; `sub` its owner.
+export const IV_DECL = 4
+
+let instVecRows: {[i32]: i32[]} = Map()
 
 type InstVecCols = {
   ixs: i32[],
+  paths: i32[],
+  subs: i32[],
   callees: i32[],
   names: string[][],
   tys: i32[][],
 }
-const instVec: InstVecCols = { ixs: [], callees: [], names: [], tys: [] }
+const instVec: InstVecCols = {
+  ixs: [],
+  paths: [],
+  subs: [],
+  callees: [],
+  names: [],
+  tys: [],
+}
 
-export function instVecNote(ix: i32, callee: i32, names: string[], tys: i32[]) {
+export function instVecNote(
+  ix: i32,
+  path: i32,
+  sub: i32,
+  callee: i32,
+  names: string[],
+  tys: i32[],
+) {
   if ix < 0 || inferQuiet || monoRecheckDepth > 0 { return 0 }
   const nm: string[] = []
   const ty: i32[] = []
@@ -359,28 +388,106 @@ export function instVecNote(ix: i32, callee: i32, names: string[], tys: i32[]) {
     ty.push(tys[i])
     i = i + 1
   }
-  const r = instVecRow[ix] ?? -1
+  const r = instVecFind(ix, path, sub)
   if r >= 0 {
     instVec.callees[r] = callee
     instVec.names[r] = nm
     instVec.tys[r] = ty
     return 0
   }
-  instVecRow[ix] = instVec.ixs.length
+  const rows = instVecRows[ix] ?? []
+  rows.push(instVec.ixs.length)
+  instVecRows[ix] = rows
   instVec.ixs.push(ix)
+  instVec.paths.push(path)
+  instVec.subs.push(sub)
   instVec.callees.push(callee)
   instVec.names.push(nm)
   instVec.tys.push(ty)
   return 0
 }
 
-// The instance vector's row for call `ix`, or -1 when its body check recorded none.
-export function instVecAt(ix: i32): i32 { return instVecRow[ix] ?? -1 }
+// `instVecNote` after padding `names`/`tys` with `never` for declaration `fd`'s unbound
+// type parameters, as the direct call's vector is.
+export function instVecNoteNever(
+  ix: i32,
+  path: i32,
+  sub: i32,
+  fd: i32,
+  names: string[],
+  tys: i32[],
+) {
+  if ix < 0 || inferQuiet || monoRecheckDepth > 0 { return 0 }
+  const nN: string[] = []
+  const nT: i32[] = []
+  withUnboundAsNever(fd, names, tys, nN, nT)
+  return instVecNote(ix, path, sub, fd, nN, nT)
+}
+
+// The row for (`ix`, `path`, `sub`), or -1 when the body check recorded none.
+export function instVecFind(ix: i32, path: i32, sub: i32): i32 {
+  const rows = instVecRows[ix] ?? []
+  for r in rows {
+    if instVec.paths[r] == path && instVec.subs[r] == sub { return r }
+  }
+  return -1
+}
+
+// The direct call's row for call `ix`, or -1.
+export function instVecAt(ix: i32): i32 { return instVecFind(ix, IV_CALL, ix) }
 export function instVecCount(): i32 { return instVec.ixs.length }
 export function instVecIxAt(r: i32): i32 { return instVec.ixs[r] }
+export function instVecPathAt(r: i32): i32 { return instVec.paths[r] }
+export function instVecSubAt(r: i32): i32 { return instVec.subs[r] }
 export function instVecCalleeAt(r: i32): i32 { return instVec.callees[r] }
 export function instVecNamesAt(r: i32): string[] { return instVec.names[r] }
 export function instVecTysAt(r: i32): i32[] { return instVec.tys[r] }
+// `names`/`tys` onto `outN`/`outT`, then each type parameter of the declaration `fd` that a
+// parameter position names and they leave unbound, or bind only to a bare inference hole, as
+// `never`: no value has that type (D14802).
+export function withUnboundAsNever(
+  fd: i32,
+  names: string[],
+  tys: i32[],
+  outN: string[],
+  outT: i32[],
+) {
+  let k = 0
+  while k < names.length {
+    outN.push(names[k])
+    outT.push(tys[k])
+    k = k + 1
+  }
+  if fd < 0 || fd >= P.nodes.length { return 0 }
+  const d = nodeAt(fd)
+  if d is FuncDecl {
+    for p in d.fnTyParams {
+      // A parameter no parameter position names has its own refusal at the declaration.
+      const one: string[] = [p]
+      let bound = !anyParamMentionsTyParam(d.fnParams, one)
+      let j = 0
+      while j < names.length {
+        if names[j] == p && j < tys.length && !bareInferHole(tys[j]) {
+          bound = true
+        }
+        j = j + 1
+      }
+      if !bound {
+        outN.push(p)
+        outT.push(TY_NEVER)
+      }
+    }
+  }
+  return 0
+}
+
+// Whether `t` is an inference hole and nothing else.
+function bareInferHole(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  const tv = tyAt(t)
+  if tv is TyVar { return tv.tvName.length == 0 || tv.tvName[0] == "?"[0] }
+  return false
+}
 
 // The shadow's must-fire control: 1 records nothing, 2 records every type as the error type.
 // Only a host sets it (`callBindDropSet`), and only to prove the shadow sees the column.
@@ -1290,6 +1397,41 @@ export function nolNoteDelivery(srcExpr: i32, dstTy: i32) {
   return 0
 }
 
+// The record member of union `u` that literal `lit` is built at: the one declaring exactly its
+// field names, else the one declaring every name it has; -1 for none or two.
+function nolObjArmOf(u: i32, lit: ObjLit): i32 {
+  const ut = tyAt(u)
+  if !(ut is TyUnion) { return -1 }
+  let exact = -1
+  let exactN = 0
+  let cover = -1
+  let coverN = 0
+  for m in ut.uMembers {
+    const mt = if m >= 0 && m < T.tys.length { tyAt(m) } else { tyAt(TY_ERR) }
+    if mt is TyObj {
+      let all = true
+      let n = 0
+      for fi in lit.objFields {
+        const f = nodeAt(fi)
+        if f is FieldInit {
+          n = n + 1
+          if !strListHas(mt.objFieldNames, f.fiName) { all = false }
+        }
+      }
+      if all {
+        cover = m
+        coverN = coverN + 1
+        if mt.objFieldNames.length == n {
+          exact = m
+          exactN = exactN + 1
+        }
+      }
+    }
+  }
+  if exactN == 1 { return exact }
+  return if exactN == 0 && coverN == 1 { cover } else { -1 }
+}
+
 // The value parts of node `at` a delivery into `dt` reaches, each beside its own destination: a
 // list literal's elements, an object literal's field values, and a value `if`, `match` or
 // block's tails. Marks a list literal taken when `dt` names its element type, and one that is
@@ -1327,7 +1469,10 @@ function nolPushParts(at: i32, dt: i32, todo: i32[], dsts: i32[]) {
       }
     }
   } else if e is ObjLit {
-    const dn = nonNullTy(dt)
+    const dn0 = nonNullTy(dt)
+    if dn0 < 0 { return 0 }
+    // A union destination delivers the literal to its one record arm holding every field (D16908).
+    const dn = if tyAt(dn0) is TyUnion { nolObjArmOf(dn0, e) } else { dn0 }
     if dn < 0 { return 0 }
     const d = tyAt(dn)
     if d is TyObj {
