@@ -5,9 +5,14 @@
 import { emitFail } from "./emit_bytes"
 import {
   calleeNamesDecl,
+  handBackCallParam,
+  handBackCloIx,
   handBackCopySeedsNote,
+  handBackFieldIx,
+  handBackFieldParam,
   handBackHoleIx,
   handBackIx,
+  handBackLamOf,
   handBackShared,
 } from "./check_hand_back"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
@@ -1800,13 +1805,27 @@ function elabStoredHoleDefaults() {
       const pts: i32[] = []
       for _p in dn.fnParams { pts.push(TY_I32) }
       elabGuessing = true
-      elabEnqueueAtParams(d, pts)
+      const k = elabEnqueueAtParams(d, pts)
       elabGuessing = false
+      if k >= 0 { elabStoredDefaultKeys[k] = true }
       grew = true
     }
   }
   if grew { elabSettle(0) }
   return 0
+}
+
+// The stored defaults `elabStoredHoleDefaults` minted, and those of them whose body does not check
+// at the default.
+let elabStoredDefaultKeys: {[i32]: boolean} = Map()
+let elabStoredDefaultFailed: {[i32]: boolean} = Map()
+
+// Whether instance `k` is a stored default no call reaches whose body does not check at its
+// parameter types: nothing can run it, so it is built with no body.
+export function elabKeyBodyRefused(k: i32): boolean {
+  return k >= 0
+    && (elabStoredDefaultFailed[k] ?? false)
+    && (elabGuessKeys[k] ?? false)
 }
 
 // Whether each instance's body has been checked.
@@ -3355,6 +3374,9 @@ function elabOneAt(k: i32) {
   if (elabUnboundOnly[k] ?? false) && T.diags.length > ed0 {
     elabGuessKeys[k] = true
     elabUnboundFailed[k] = true
+  }
+  if (elabStoredDefaultKeys[k] ?? false) && T.diags.length > ed0 {
+    elabStoredDefaultFailed[k] = true
   }
   if elabGuessKeys[k] ?? false { elabCapDeadDiagsSet(T.diags.length - ed0) }
   // A diagnostic the re-check raises outside a dead arm, in an instance the program needs, is the
@@ -5146,6 +5168,18 @@ function elabHeldSetOf(t: i32): i32 {
 // The parameter of `decl` read `root` names: the parameter itself, or a `const` alias of it
 // that is only ever called (`elabCallOnlyAlias`, at instance `k`); else -1.
 function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
+  const dn0 = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  const rn = if root >= 0 && root < P.nodes.length { nodeAt(root) } else { null }
+  // A call of a closure that only hands back a parameter reads that parameter.
+  if rn is Call && dn0 is FuncDecl {
+    const hb = handBackCallParam(root, dn0)
+    if hb >= 0 { return hb }
+  }
+  // So does a field of a record a call hands back the parameter in.
+  if rn is Member && dn0 is FuncDecl {
+    const hf = handBackFieldParam(root, dn0)
+    if hf >= 0 { return hf }
+  }
   const d = identDeclOf(root)
   if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
     return -1
@@ -6121,6 +6155,14 @@ function elabMintHandedIn(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         }
         if to.length > 0 { return 0 }
       }
+      // So does a record literal the function returns holding it at a field it hands back.
+      if (
+        p >= 0
+        && nodeAt(p) is FieldInit
+        && elabFieldInitHandsBack(p, dn, pd)
+      ) {
+        return 0
+      }
       // So does a record literal of it handed whole to a named function's parameter.
       if (
         p >= 0
@@ -6499,6 +6541,7 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
       } else if (
         !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
+        && !elabHandBackLamRead(ix, decl)
       ) {
         mintSetPartialNote(st)
       }
@@ -6507,6 +6550,61 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
   }
   for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
   return 0
+}
+
+// Whether field initialiser `fi` sits at the field of the record `fn` returns where it hands back
+// parameter `pd` (`handBackFieldIx`).
+function elabFieldInitHandsBack(fi: i32, fn: FuncDecl, pd: i32): boolean {
+  const f = nodeAt(fi)
+  if !(f is FieldInit) { return false }
+  const pi = i32ListIndexOf(fn.fnParams, pd)
+  return pi >= 0 && handBackFieldIx(fn, f.fiName) == pi
+}
+
+// The name of the record field under `body` whose value is `v`, or "" when `v` initialises none.
+function elabFieldNameOf(v: i32, body: i32): string {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is FieldInit && parenPeelIx(xn.fiValue) == v { return xn.fiName }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return ""
+}
+
+// Whether parameter read `ix` is the value a closure that only hands it back returns: one a
+// `const` of `decl` holds (`handBackLamOf`), or one `decl` itself returns (`handBackCloIx`).
+// The calls of that closure read the parameter where they stand.
+function elabHandBackLamRead(ix: i32, decl: i32): boolean {
+  const dn = nodeAt(decl)
+  const lam = recEnclosingFn(ix)
+  if !(dn is FuncDecl) || lam < 0 || recEnclosingFn(lam) != decl {
+    return false
+  }
+  const pd = identDeclOf(ix)
+  const pi = i32ListIndexOf(dn.fnParams, pd)
+  if (
+    pi >= 0
+    && (handBackCloIx(dn, "") == pi
+      || handBackCloIx(dn, elabFieldNameOf(lam, dn.fnBody)) == pi)
+  ) {
+    return true
+  }
+  const todo: i32[] = [dn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && parenPeelIx(xn.letInit) == lam {
+        return handBackLamOf(x, dn) == pd
+      }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return false
 }
 
 // The node a callee read `x` reads its slot of: `x` itself, or the root an element or field
@@ -10378,6 +10476,8 @@ export function elabRun() {
   elabArgCall = Map()
   elabKeyRefines = Map()
   elabUnboundFailed = Map()
+  elabStoredDefaultKeys = Map()
+  elabStoredDefaultFailed = Map()
   elabCandKeys = Map()
   elabPerEnclDecls = Map()
   elabListSigRows = []
@@ -12061,9 +12161,11 @@ function elabEnqueueAtParams(d: i32, pts: i32[]) {
     i = i + 1
   }
   if names.length > 0 && tysClosed(tys) {
-    elabReachNote(-1, elabEnqueue(d, names, tys, -1), -1)
+    const k = elabEnqueue(d, names, tys, -1)
+    elabReachNote(-1, k, -1)
+    return k
   }
-  return 0
+  return -1
 }
 
 // Whether node `g` is a lambda, enclosed by nothing that binds, a parameter of which holds a set

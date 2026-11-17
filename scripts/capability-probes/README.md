@@ -164,6 +164,13 @@ the literal. A row comes OFF when its witness starts RUNNING, in the PR that clo
 `--live-sites` reds until it does, and also on a witness that drifted onto another message or
 a literal that has left `compiler/*.vl`.
 
+**An empty list needs an `empty` note, and the note is not "clause 2 met".** `sites` may be `[]`
+only beside an `empty` object giving the date, the commit, the probe runner's passed/total and
+every probe still refusing, each with the stage it refuses at (`check` or `parse`). The test
+refuses a note whose GAP count disagrees with passed/total, names a missing probe, or names a
+GAP at `emit`: that is a live site, and its row goes back in `sites`. Delete the note when a row
+returns.
+
 `vl run scripts/emit-refusal-sites.vl` re-derives the population the list is a subset of:
 sites, templates, and which ones the wording predicate misses, grouped by the verb they reach
 for. `docs/internals/emit-refusal-wording-2026-09.md` is the measurement that built the list.

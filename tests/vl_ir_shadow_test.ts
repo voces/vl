@@ -190,7 +190,8 @@ print(sel(true))
 // `NaN` and `2e+300`, and of an f32, an i64, a boolean and an i32 (P1); the four bitcasts, f64
 // and f32 float intrinsics, and i32 and i64 integer intrinsics (N3); a `string | null` built from
 // `null` and from a string, passed through, assigned, and coalesced with a string literal to a
-// string and inside a `print` (N2b-2c-2a).
+// string and inside a `print` (N2b-2c-2a); a `string | null` tested `== null`, `!= null` and
+// `null !=`, and printed (N2b-2c-2b).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -245,6 +246,10 @@ print(guard(2))
   `function lc(s: string): string | null {\n  let t: string | null = null\n  if s.length > 0 { t = s }\n  return t\n}\nprint(lc("q") ?? "z")\n`,
   `function dn(x: string | null): string { return x ?? "n" }\nconst xs: (string | null)[] = [null, "a"]\nprint(dn(xs[0]) + dn(xs[1]))\n`,
   `function pd(x: string | null) { print(x ?? "n") }\nconst xs: (string | null)[] = [null, "a"]\npd(xs[0])\npd(xs[1])\n`,
+  `function isn(x: string | null): boolean { return x == null }\nconst xs: (string | null)[] = [null, "a"]\nprint(isn(xs[0]))\nprint(isn(xs[1]))\n`,
+  `function has(x: string | null): boolean { return x != null }\nconst xs: (string | null)[] = [null, "a"]\nprint(has(xs[0]))\nprint(has(xs[1]))\n`,
+  `function hr(x: string | null): boolean { return null != x }\nconst xs: (string | null)[] = [null, "a"]\nprint(hr(xs[1]))\n`,
+  `function pn(x: string | null) { print(x) }\nconst xs: (string | null)[] = [null, "a"]\npn(xs[0])\npn(xs[1])\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
