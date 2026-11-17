@@ -8,6 +8,7 @@ import {
   handBackCopySeedsNote,
   handBackHoleIx,
   handBackIx,
+  handBackLamOf,
   handBackShared,
 } from "./check_hand_back"
 import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
@@ -5146,6 +5147,13 @@ function elabHeldSetOf(t: i32): i32 {
 // The parameter of `decl` read `root` names: the parameter itself, or a `const` alias of it
 // that is only ever called (`elabCallOnlyAlias`, at instance `k`); else -1.
 function elabCalleeParam(root: i32, decl: i32, k: i32): i32 {
+  const dn0 = if decl >= 0 && decl < P.nodes.length { nodeAt(decl) } else { null }
+  const rn = if root >= 0 && root < P.nodes.length { nodeAt(root) } else { null }
+  // A call of a local closure that only hands back a parameter reads that parameter.
+  if rn is Call && dn0 is FuncDecl {
+    const hb = elabHandBackLamCallParam(root, dn0)
+    if hb >= 0 { return hb }
+  }
   const d = identDeclOf(root)
   if d < 0 || d >= P.nodes.length || decl < 0 || decl >= P.nodes.length {
     return -1
@@ -5769,6 +5777,17 @@ function elabCallOnlyAlias(d: i32, fn: FuncDecl, k: i32): i32 {
   const pd = elabAliasSource(d, fn, k)
   if pd < 0 || !elabAliasReadsOk(d, fn, [], k, false) { return -1 }
   return pd
+}
+
+// The parameter of `fn` that call `c` reads: `c` calls, with no arguments, a `const` of `fn`
+// initialised with a parameterless lambda whose every returned value is that parameter, which the
+// lambda reads nowhere else and every read of the `const` calls this way; -1 otherwise.
+function elabHandBackLamCallParam(c: i32, fn: FuncDecl): i32 {
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callArgs.length > 0 { return -1 }
+  const f = parenPeelIx(cn.callFn)
+  if f < 0 || !(nodeAt(f) is Ident) { return -1 }
+  return handBackLamOf(identDeclOf(f), fn)
 }
 
 // The parameter of `fn` the binding `d` is initialised with, through bindings each initialised
@@ -6499,6 +6518,7 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
         mintParamFwdNote(decl, i32ListIndexOf(dn.fnParams, pd), to[0], to[1])
       } else if (
         !(pn is Call && pn.callFn == ix && elabMintFactAt(pn, p, decl, k, sc))
+        && !elabHandBackLamRead(ix, decl)
       ) {
         mintSetPartialNote(st)
       }
@@ -6507,6 +6527,27 @@ function elabMintHandedNested(ix: i32, p: i32, decl: i32, k: i32, sc: i32) {
   }
   for kid in nodeChildren(ix) { elabMintHandedNested(kid, ix, decl, k, sc) }
   return 0
+}
+
+// Whether parameter read `ix` is the value a hand-back lambda of `decl` returns
+// (`handBackLamOf`): its calls read the parameter where they stand.
+function elabHandBackLamRead(ix: i32, decl: i32): boolean {
+  const dn = nodeAt(decl)
+  const lam = recEnclosingFn(ix)
+  if !(dn is FuncDecl) || lam < 0 || recEnclosingFn(lam) != decl { return false }
+  const pd = identDeclOf(ix)
+  const todo: i32[] = [dn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is LetDecl && parenPeelIx(xn.letInit) == lam {
+        return handBackLamOf(x, dn) == pd
+      }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return false
 }
 
 // The node a callee read `x` reads its slot of: `x` itself, or the root an element or field
