@@ -35,8 +35,9 @@ Each is a shared witness, one covered function matching legacy and printing the 
 
 ## Coverage
 
-The census's 41 and 18 counted functions with one other blocker each; most of those also
-stop at a third, so the corpus gain is smaller than their sum.
+The census's 41 counted the message `null test rest`, which covered seven arms; this step
+builds two of them, so the gain is not that count. The census of the remaining arms is the next
+sizing.
 
 | reading | 2c-2a | this step | gained |
 |---|---:|---:|---:|
