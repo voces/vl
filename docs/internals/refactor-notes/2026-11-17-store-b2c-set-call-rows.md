@@ -38,7 +38,8 @@ extra in 7 programs, every extra a lambda member's set. The elaboration closes t
 
 ## The ablation that replaces B0's heuristic split
 
-Population: the 83 late rows that had an elaboration instance row and no check row, on B2b. Each was
+Population: the 83 late rows that had an elaboration instance row and no check row, on B2b. The
+ablation ran before B2b's D15409 fix, which changes no row of this population. Each was
 re-classified by B0's join on this build.
 
 | after the set-call rows | late rows |
@@ -73,8 +74,10 @@ ablation):
 
 - `@run` A/B (6,714 programs): 0 wasm movers, 0 output movers.
 - `vl check --codegen tests`: output byte-identical apart from the late rows.
-- Late tag rows 393 → 392 (`hole-fn-list-handed-generic-fn-and-value-at-module.vl` `T {add}`), written
+- Late tag rows 397 → 396 (`hole-fn-list-handed-generic-fn-and-value-at-module.vl` `T {add}`), written
   from a fixpoint seed, none new; late demands 10.
+- `check-filed-witnesses.vl --strict` over both inventories: 5,458 graded, all as filed, 0 moved,
+  3,422 checked against their Want output, 0 mismatched.
 - `tests/vl_inst_keys_test.ts`: one setcall summary, every row expected. The control fails on B2b's seed.
-- L2 self-compile fuel: 96.702G against B2b's 96.632G (+0.07%).
+- L2 self-compile fuel: 96.703G against B2b's 96.640G (+0.07%).
 - Phase-state census ok; lint clean; `emit_mono.vl` untouched (908). Net compiler lines +161 / −1.
