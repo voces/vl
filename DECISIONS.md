@@ -12659,15 +12659,21 @@ value it flows into; when such a call exists, its type decides the instance and 
 **Why.** It is the same rule an empty container's open element follows (`i32` list element, `string` set
 element or map key), and it makes mono's former accidental default a stated rule that check can see.
 
-## A generic function value handed on through a call is used at one type (2026-11-17) — D16843
+**Where it lives (amended 2026-11-17).** The elaboration already fills this default at check's end
+(`elabStoredHoleDefaults`, 560 corpus files, all running), so the rule holds today and the language
+reference states it. Writing it into check's own node types moves bytes and has no reader while slot-store
+stage 3 is parked, so D16898 stays open as stage 3's dependency and the retype is stage 3's first step.
 
-**The rule.** Check refuses a generic function value that is handed through a call and then called at
-two types, whether the callee calls it directly or returns it in a closure. A parameter called directly
-at two types is still split per type. Whether a handed-on generic function value keeps its polymorphism is
-an open owner question; one row records the capability.
+## A generic function value handed back through a call keeps its polymorphism (2026-11-17) — D16843
 
-**Why.** It is the contract the direct hand-on (`call1(a)`) already has, and refusing at check is better than
-an emit refusal of a check-clean program.
+**The rule.** A generic function value a callee hands back, directly (`pass(a)(3)`) or captured in a
+closure (`wrap(a)()(3)`), may be called at two types; mono splits it per type, and check accepts both.
+A callee that calls the value itself (`call1`) fixes its type inside that callee, and check refuses a
+second type there. D16843 (the closure capture) is a capability gap in the per-type split, not a contract.
+
+**Why.** The direct hand-back already runs, so a rule refusing the capture would cost `runs` and name a
+mechanism. This replaces the same-day ruling "used at one type", withdrawn once measured. Whether `call1`'s
+internal call should leave the value polymorphic for its caller is the open owner question.
 
 ## Stage 3 of the slot store is parked behind check-time types (2026-11-17) — D16768, D16898
 
@@ -12697,3 +12703,29 @@ for an order dependence that loses no `runs`.
   per call or per function; a global memo needs a measured hit rate under a sound stamp.
 - **IR order:** N2b-2a, 2c-1, 2c-1b, M1 (`??`), P1 (`print`), the float bit built-ins, 2c-2 (`string | null`),
   then I8c; each step is chosen by the measured count of functions it alone unblocks.
+
+## Rulings of 2026-11-17 (night)
+
+- **A1 keys a fresh literal at its contextual type;** the edge coercion applies only to a non-fresh value, and
+  D965's no-implicit-container-copy stands. A lambda passed to a generic builds its fresh result literals at
+  the bound result once the call binds `T` (TS's two-phase inference), but only when every value it returns
+  is fresh (D16918); a returned binding keeps its own type and stays refused.
+- **D16845:** a maker's closure called at two signatures keeps one environment and calls the sibling
+  instance directly (instances share one environment layout). No check refusal for an escape at an open
+  type; the escape waits on mono following a closure capture (D16843).
+- **STORE A1:** A1.1 (arrow rows into the instance vector), then classes P, S and T. Class G (a set with a
+  generic member called at two instantiations through one holder) stays in the late residue: its storage
+  differs per instance, which the per-set decision cannot express. Storage per (KeyId, parameter) is the
+  design step that unlocks G and deletes `fnTagRedecide`.
+- **Type hash-cons:** 5b needed no switch (mono's anonymous pin key already carries the set id since 3b); its
+  id slot folds into the id-vector key. 5c keys a widened result by its set id; folding two keys into one
+  instance requires their storage to agree. The `#7` instance shared by an untagged single function and a
+  tagged set is benign: the elaboration keys them apart.
+- **REP 3e:** the no-rep code paths and the stored code columns go in one deletion PR, once every population
+  shows zero no-rep fields (it does, D16727 included).
+- **D16897:** `.length` over a join of a list and its `null`-element twin is accepted; it reads no element,
+  so D3367's element-storage ruling does not reach it. Step 2b (`for`) lands before the IR's for-in.
+- **IR for-in:** F1 (the non-hoisted walk over an i32 or string list), F2 (string code points), F3 (hoisted,
+  unrolled and map walks) later; every other shape is a named miss.
+- **The self-compile fuel baseline was rewritten at 94.79G (#8914):** the accumulated drift of many merges
+  each under the tier, with no single mechanism; a lane grades its own delta.
