@@ -52,7 +52,8 @@ const INERT: &[&str] = &[
 /// store would key a result on an observation. `VL_REP_SHADOW` prints a report the guest
 /// computes during the compile, so it is one too, as is `VL_CHECK_STATS` (read off the
 /// instances after a check). `VL_CHECK_KEEP_MODULES` writes files a hit would not write, and
-/// `VL_LATE_DEMANDS` prints the elaboration work the compile asked for after the run, `VL_IFACES`
+/// `VL_LATE_DEMANDS` prints the elaboration work the compile asked for after the run,
+/// `VL_INST_KEYS` the instance-key shadow (STORE A0), `VL_IFACES`
 /// the shadow interfaces (L2 S0), `VL_TOUCH_SET` each function's touch set, and
 /// `VL_ID_SHADOW` prints the identity shadow's rows (its mode 2 also moves the output),
 /// `VL_CLS_CENSUS` prints the classifier phase census, and `VL_IR_SHADOW` the IR shadow's rows.
@@ -68,6 +69,7 @@ fn is_bypass(k: &str) -> bool {
             | "VL_CHECK_STATS"
             | "VL_CHECK_KEEP_MODULES"
             | "VL_LATE_DEMANDS"
+            | "VL_INST_KEYS"
             | "VL_IFACES"
             | "VL_TOUCH_SET"
             | "VL_ID_SHADOW"

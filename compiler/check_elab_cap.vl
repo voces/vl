@@ -654,7 +654,7 @@ export function elabPinRollback(m: ElabPinMark) {
 export function elabHolePinNote(name: string, ty: i32) {
   const live = elabCapLive()
   if !live && elabPinsClosed { return 0 }
-  if !elabTyClosed(ty, 0) { return 0 }
+  if !elabTyClosed(ty) { return 0 }
   const d = elabHoleDeclOf(name)
   if d < 0 { return 0 }
   const from = if live { elabCapKey } else { elabWalkNow }
@@ -691,7 +691,7 @@ export function elabValueRowNote(d: i32, names: string[], tys: i32[]) {
   const live = elabCapLive()
   if (!live && inferQuiet) || d < 0 || names.length == 0 { return 0 }
   for t in tys {
-    if !elabTyClosed(t, 0) { return 0 }
+    if !elabTyClosed(t) { return 0 }
   }
   elabHoleRowDecl.push(d)
   elabHoleRowFrom.push(if live { elabCapKey } else { elabWalkNow })
@@ -718,12 +718,12 @@ export function elabWideRowNote(d: i32, names: string[], tys: i32[], ret: i32) {
     (!live && inferQuiet)
     || d < 0
     || names.length == 0
-    || !elabTyClosed(ret, 0)
+    || !elabTyClosed(ret)
   ) {
     return 0
   }
   for t in tys {
-    if !elabTyClosed(t, 0) { return 0 }
+    if !elabTyClosed(t) { return 0 }
   }
   elabWideRowDecl.push(d)
   elabWideRowFrom.push(if live { elabCapKey } else { -1 })
@@ -877,7 +877,7 @@ export function elabMakerCallSig(call: i32): i32 {
 // A maker's row: a wide row with no binding, built at the destination's closed result `ret`.
 export function elabMakerRowNote(d: i32, ret: i32) {
   const live = elabCapLive()
-  if ((!live && inferQuiet) || d < 0 || !elabTyClosed(ret, 0)) { return 0 }
+  if ((!live && inferQuiet) || d < 0 || !elabTyClosed(ret)) { return 0 }
   elabWideRowDecl.push(d)
   elabWideRowFrom.push(if live { elabCapKey } else { -1 })
   elabWideRowN.push([])
@@ -908,7 +908,7 @@ export function elabUnboundCallKeyNote(
   const live = elabCapLive()
   if (!live && inferQuiet) || ix < 0 || d < 0 || names.length == 0 { return 0 }
   for t in tys {
-    if !elabTyClosed(t, 0) { return 0 }
+    if !elabTyClosed(t) { return 0 }
   }
   elabUnboundCallIx.push(ix)
   elabUnboundCallD.push(d)
@@ -943,18 +943,19 @@ export function elabDefaultRowHas(d: i32, tys: i32[]): boolean {
 }
 
 // Whether `t` is a closed, fully resolved type: no type variable and no pending return anywhere.
-export function elabTyClosed(t: i32, depth: i32): boolean {
+export function elabTyClosed(t: i32): boolean {
   if etcN > 0 && etcEpoch != tyMutEpoch {
     etcMemo = Map()
     etcN = 0
   }
   etcEpoch = tyMutEpoch
-  return elabTyClosedOwn(t, depth, [])
+  return elabTyClosedOwn(t, [])
 }
 
-// The answers of `elabTyClosed` walks with no owning declaration, keyed by type and depth, so a
-// type reached along many paths or asked again is walked once; kept while no type is mutated in
-// place (`tyMutEpoch`; a hole solve bumps it, and a link joins only open holes).
+// The answers of `elabTyClosed` walks with no owning declaration, keyed by type, so a type reached
+// along many paths or asked again is walked once; kept while no type is mutated in place
+// (`tyMutEpoch`; a hole solve bumps it, and a link joins only open holes). An answer that met a
+// cycle (`ETC_CUT`) is not kept.
 let etcMemo: {[i32]: boolean} = Map()
 let etcN = 0
 let etcEpoch = -1
@@ -989,41 +990,70 @@ export function elabHoleRootName(t: i32): string {
 }
 
 // `elabTyClosed`, where a type variable of a declaration in `own` counts as closed.
-function elabTyClosedOwn(t: i32, depth: i32, own: i32[]): boolean {
-  if t < 0 || t >= T.tys.length { return false }
-  if depth > 16 { return true }
-  if own.length > 0 { return elabTyClosedWalk(t, depth, own) }
-  const key = t * 17 + depth
-  const hit = etcMemo[key]
-  if hit != null { return hit }
-  const r = elabTyClosedWalk(t, depth, own)
-  etcMemo[key] = r
-  etcN = etcN + 1
+function elabTyClosedOwn(t: i32, own: i32[]): boolean {
+  return etcGo(t, own) != ETC_NO
+}
+
+// The types being walked with the size of their `own`, outermost first: one met again is a
+// cycle, which answers closed as far as it goes (`ETC_CUT`).
+const etcPathT: i32[] = []
+const etcPathO: i32[] = []
+const ETC_NO = 0
+const ETC_YES = 1
+const ETC_CUT = 2
+
+function etcGo(t: i32, own: i32[]): i32 {
+  if t < 0 || t >= T.tys.length { return ETC_NO }
+  if own.length == 0 {
+    const hit = etcMemo[t]
+    if hit != null { return if hit { ETC_YES } else { ETC_NO } }
+  }
+  let i = 0
+  while i < etcPathT.length {
+    if etcPathT[i] == t && etcPathO[i] == own.length { return ETC_CUT }
+    i = i + 1
+  }
+  etcPathT.push(t)
+  etcPathO.push(own.length)
+  const r = elabTyClosedWalk(t, own)
+  etcPathT.pop()
+  etcPathO.pop()
+  if own.length == 0 && r != ETC_CUT {
+    etcMemo[t] = r == ETC_YES
+    etcN = etcN + 1
+  }
+  return r
+}
+
+// The answer for parts `ts`: no if one is not closed, else cut if one met a cycle, else yes.
+function etcAll(ts: i32[], own: i32[]): i32 {
+  let r = ETC_YES
+  for x in ts {
+    const a = etcGo(x, own)
+    if a == ETC_NO { return ETC_NO }
+    if a == ETC_CUT { r = ETC_CUT }
+  }
   return r
 }
 
 // One step of `elabTyClosedOwn` at `t`, which is in the arena and at most 16 deep.
-function elabTyClosedWalk(t: i32, depth: i32, own: i32[]): boolean {
+function elabTyClosedWalk(t: i32, own: i32[]): i32 {
   const x = tyAt(t)
   match x {
     TyVar => {
-      return elabOwnedBy(own, elabHoleRootName(t))
+      return if elabOwnedBy(own, elabHoleRootName(t)) { ETC_YES } else { ETC_NO }
     }
     TyArray => {
-      return elabTyClosedOwn(tyElemOf(x), depth + 1, own)
+      return etcGo(tyElemOf(x), own)
     }
     TyNullable => {
-      return elabTyClosedOwn(x.nInner, depth + 1, own)
+      return etcGo(x.nInner, own)
     }
     TyMap => {
-      return elabTyClosedOwn(tyKeyOf(x), depth + 1, own)
-        && elabTyClosedOwn(tyValOf(x), depth + 1, own)
+      return etcAll([tyKeyOf(x), tyValOf(x)], own)
     }
     TyObj => {
-      for ft in x.objFieldTypes {
-        if !elabTyClosedOwn(ft, depth + 1, own) { return false }
-      }
-      return true
+      return etcAll(x.objFieldTypes, own)
     }
     TyFunc => {
       // A function value is its singleton `Fn#d`, or any member of its set, when its
@@ -1039,20 +1069,20 @@ function elabTyClosedWalk(t: i32, depth: i32, own: i32[]): boolean {
           fresh = true
         }
       }
-      if fresh && elabTyClosedOwn(t, depth + 1, own2) { return true }
-      for pt in x.fnParamTypes {
-        if !elabTyClosedOwn(pt, depth + 1, own) { return false }
+      if fresh {
+        const f = etcGo(t, own2)
+        if f != ETC_NO { return f }
       }
-      return elabTyClosedOwn(x.fnRet, depth + 1, own)
+      const ps = etcAll(x.fnParamTypes, own)
+      if ps == ETC_NO { return ETC_NO }
+      const rt = etcGo(x.fnRet, own)
+      return if rt == ETC_YES { ps } else { rt }
     }
     TyUnion => {
-      for m in x.uMembers {
-        if !elabTyClosedOwn(m, depth + 1, own) { return false }
-      }
-      return true
+      return etcAll(x.uMembers, own)
     }
     TyPrim | TyErr | TyLit | TyNeg => {
-      return true
+      return ETC_YES
     }
   }
 }
@@ -5326,9 +5356,9 @@ function pcAnnOk(d: i32, f: FuncDecl, unannOk: boolean): boolean {
 // for any other binding. A copy holds the parameter's own value.
 export function fnTagParamCopyOf(f: FuncDecl, d: i32): i32 {
   let x = d
-  let hops = 0
-  while hops < 8 && x >= 0 && x < P.nodes.length {
-    hops = hops + 1
+  const seen: i32[] = []
+  while x >= 0 && x < P.nodes.length && !i32ListHas(seen, x) {
+    seen.push(x)
     if (
       !pcHas(x)
       || ((pcFlags[x] ?? 0) & PC_CONST) == 0
@@ -5751,12 +5781,13 @@ function elabListPushOfParam(
 }
 
 // The parameter of `fn` that binding `d` copies: an un-annotated `const`, or a `let` nothing
-// re-points (`cwLetUnwritten`), initialised by a read of it or of such a copy, at most 8 deep;
-// -1 otherwise.
+// re-points (`cwLetUnwritten`), initialised by a read of it or of such a copy; -1 otherwise, as
+// where the chain comes back to a binding.
 export function elabParamCopyOf(d: i32, fn: FuncDecl): i32 {
   let cur = d
-  let hops = 0
-  while hops < 8 {
+  const seen: i32[] = []
+  while !i32ListHas(seen, cur) {
+    seen.push(cur)
     if cur < 0 || cur >= P.nodes.length { return -1 }
     const ln = nodeAt(cur)
     if !(ln is LetDecl) || ln.letType >= 0 { return -1 }
@@ -5767,7 +5798,6 @@ export function elabParamCopyOf(d: i32, fn: FuncDecl): i32 {
     if i32ListHas(fn.fnParams, src) { return src }
     // A copy of a copy reads the parameter too (D15051).
     cur = src
-    hops = hops + 1
   }
   return -1
 }
