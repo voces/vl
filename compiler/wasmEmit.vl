@@ -38673,6 +38673,11 @@ export function nullOwnIsAtom(exprIx: i32, fnIx: i32): boolean {
   return nullOwnAt(exprIx, fnIx) == NULL_OWN_ATOM
 }
 
+// Whether the `null` value node `exprIx` is `string | null`'s typed null where it is delivered.
+export function nullOwnIsStr(exprIx: i32, fnIx: i32): boolean {
+  return nullOwnAt(exprIx, fnIx) == NULL_OWN_STR
+}
+
 function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   const er = elabNodeRepAt(exprIx, fnIx)
   const st = if er >= 0 { er } else { nodeRepTyAt(exprIx, fnIx) }
@@ -41300,7 +41305,7 @@ function emitArrayCopyIntr(callIx: i32, fnIx: i32) {
 // the read to `string` (`coalesceStaysNullable`), a nullable default leaves it `string | null`.
 // It asks `exprNullableString` of the `??` node itself, since the checker's banked type is
 // missing on a synthesized node (a chained `p ?? q ?? r` re-associates through `mkBinary`).
-function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
+export function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
   return exprNullableString(exprIx, fnIx)
 }
 
@@ -41642,12 +41647,11 @@ function emitCoalesceNulRefCtx(
       exprIx,
     )
   }
-  // blocktype `(ref null $heapIx)` keeps the result nullable; `(ref $heapIx)` is non-null.
-  fbBlockRefNul(heapIx, nulBlock)
+  coalNulRefOpen(heapIx, nulBlock)
   if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
-  fbBrOnNonNull(0) // non-null → branch to the block end with the (ref $heapIx)
+  coalNulRefBranch()
   if isSTy(heapIx) && exprIsLitAtom(e.binRight, fnIx) {
     if emitCoalesceAtomStrDefault(e.binRight, nulBlock, fnIx) < 0 { return -1 }
   } else {
@@ -41655,6 +41659,39 @@ function emitCoalesceNulRefCtx(
   }
   fbEnd() // 0x0b end
   return 0
+}
+
+// Before a nullable ref `??`'s operand: the block whose type is `(ref null $heapIx)` for
+// `nulBlock`, which keeps the result nullable, else `(ref $heapIx)`.
+export function coalNulRefOpen(heapIx: i32, nulBlock: boolean): i32 {
+  fbBlockRefNul(heapIx, nulBlock)
+  return 0
+}
+
+// After a nullable ref `??`'s operand: a non-null ref branches to the block's end, so the default
+// that follows runs only on `null`.
+export function coalNulRefBranch(): i32 {
+  fbBrOnNonNull(0)
+  return 0
+}
+
+// Whether `l ?? d` over a `string | null` (`coalNicheArmOf`'s `str`) is the plain block: no union
+// box joins the default, no record or list default diverts it, and the default is no
+// literal-union atom, which is widened to its member string.
+export function coalNulStrBlockPlain(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  if coalesceNicheJoinsToBox(exprIx, fnIx) { return false }
+  if (
+    tyIsStructBearingUnion(nodeTyIxOf(exprIx))
+    && !coalesceResultIsBox(exprIx, fnIx)
+  ) {
+    return false
+  }
+  if coalListDefaultClash(e, fnIx) { return false }
+  return !exprIsLitAtom(e.binRight, fnIx)
 }
 
 // The default of a `string | null` `??` when it is a literal-union atom (`K` or `K | null`):
@@ -42398,11 +42435,47 @@ function emitCoalesceCallArm(
   return emitPopOr(lhsIx, e.binRight, fnIx)
 }
 
+// The nullable-rep arm of `l ?? d` once `coalArmOf` names `niche`, in `emitCoalesceNiche`'s
+// order: the `boolean | null` select (boxed when the default joins), the `K | null` sentinel,
+// its widening to a string, a nullable collection, a nullable closure, `string | null`, and the
+// boxed operands (`identBox`).
+export type CoalNicheArm = "nulBoolJoin"
+  | "nulBool"
+  | "litUnion"
+  | "nulAtomStr"
+  | "coll"
+  | "clo"
+  | "str"
+  | "identBox"
+export function coalNicheArmOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNicheArm {
+  const nb = exprNulBool(e.binLeft, fnIx)
+  if nb && coalesceNicheJoinsToBox(exprIx, fnIx) { return "nulBoolJoin" }
+  // A call operand of `boolean | null` cannot be re-read; it takes a later arm.
+  if nb && !coalLhsIsCall(lhsIx) { return "nulBool" }
+  if coalesceLitUnionFits(exprIx, fnIx) { return "litUnion" }
+  if coalesceNulAtomToStr(exprIx, fnIx) { return "nulAtomStr" }
+  if nulCollWrapHeap(e.binLeft, fnIx) >= 0 { return "coll" }
+  if exprNulClosure(e.binLeft, fnIx) { return "clo" }
+  if exprNullableString(e.binLeft, fnIx) { return "str" }
+  return "identBox"
+}
+
+// Whether node `ix` is a call.
+function coalLhsIsCall(ix: i32): boolean {
+  return ix >= 0 && nodeAt(ix) is Call
+}
+
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   const lhs = nodeAt(lhsIx)
+  const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
   // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
   // and in the else arm for the string), so they apply only to an effect-free place —
   // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
@@ -42423,10 +42496,8 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // when the lhs is null. `select` evaluates both value operands unconditionally, so a
   // side-effecting default would run on the present path too — the same lowering the `K |
   // null` niche, the `string | null` niche and every nullable-ref rep already use.
-  if exprNulBool(e.binLeft, fnIx) && coalesceNicheJoinsToBox(exprIx, fnIx) {
-    return emitCoalesceNulBoolJoin(e, exprIx, fnIx)
-  }
-  if !(lhs is Call) && exprNulBool(e.binLeft, fnIx) {
+  if arm == "nulBoolJoin" { return emitCoalesceNulBoolJoin(e, exprIx, fnIx) }
+  if arm == "nulBool" {
     if emitExpr(e.binLeft, fnIx) < 0 {
       return -1 // the niche i32
     }
@@ -42459,7 +42530,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // A branching `if`, not a `select`: `select` evaluates both value operands, so a
   // side-effecting default would run on the present path. The `if` framing costs three bytes
   // more per site; a call lhs is stashed once in the shared i32 coalesce-call slot.
-  if coalesceLitUnionFits(exprIx, fnIx) {
+  if arm == "litUnion" {
     // The operand reads at the niche its classifier names, so a prelude join builds the atom.
     if (emitExpr(e.binLeft, fnIx) < 0) {
       return -1 // the niche i32, evaluated ONCE
@@ -42485,19 +42556,16 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   }
   // `<e> ?? d` over a `K | null` niche whose default is not a member: the result is a
   // `string`, so the atom is evaluated once and the present arm widens it (D3198).
-  if coalesceNulAtomToStr(exprIx, fnIx) {
-    return emitCoalesceNulAtomStr(e, fnIx)
-  }
+  if arm == "nulAtomStr" { return emitCoalesceNulAtomStr(e, fnIx) }
   // `<e> ?? d` over a nullable collection niche (`i32[] | null`, `string[] | null` /
   // `f64[] | null` / `i64[] | null` / `f32[] | null`, `i32[][] | null` / `S[] | null`): the
   // cell is a `(ref null $wrapper)`, so it takes the same `br_on_non_null` lowering as the
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
-  const cnclw = nulCollWrapHeap(e.binLeft, fnIx)
-  if cnclw >= 0 { return emitCoalesceNulRef(e, exprIx, cnclw, fnIx) }
-  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
-  if exprNulClosure(e.binLeft, fnIx) {
-    return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx)
+  if arm == "coll" {
+    return emitCoalesceNulRef(e, exprIx, nulCollWrapHeap(e.binLeft, fnIx), fnIx)
   }
+  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
+  if arm == "clo" { return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx) }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -42507,7 +42575,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // and the default follows the block type (`coalesceNulStrArmCtx`). Ungated on
   // re-readability: the core evaluates the operand ONCE, so a CALL takes this arm too —
   // gated, it fell past every niche to a lowering with the wrong heap (D1763).
-  if exprNullableString(e.binLeft, fnIx) {
+  if arm == "str" {
     const coNul = coalesceNulStrStaysNullable(exprIx, fnIx)
     return emitCoalesceNulRefCtx(e, exprIx, sTy(), coNul, fnIx)
   }
