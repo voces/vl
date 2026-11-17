@@ -38,6 +38,11 @@
 #
 # Buckets: OK (compiles + runs), REJECT (a loud diagnostic — acceptable), BAD (invalid
 # wasm or an out-of-bounds compiler crash). Only BAD is a defect.
+#
+# A grid whose cells the checker refuses grades nothing, so it fails when fewer than
+# MONO_GRID_MIN_CLEAN cells (default 240 of 261) pass `vl check --codegen`. The generator
+# once wrote a block body ending in a bare value after the language began refusing one, and
+# every cell came back REJECT under a "no BAD cells" line.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VL="${VL:-scripts/vl-host/target/release/vl}"
@@ -68,6 +73,13 @@ cat "$OUT"/res/* >> "$OUT/results.txt"
 sort -o "$OUT/results.txt" "$OUT/results.txt"
 echo "== mono type-parameter grid ($COMP) =="
 cut -f1 "$OUT/results.txt" | sort | uniq -c
+clean=$(grep -c "check=0$" "$OUT/results.txt" || true)
+total=$(wc -l < "$OUT/results.txt")
+echo "$clean of $total cells pass vl check --codegen"
+if [ "$clean" -lt "${MONO_GRID_MIN_CLEAN:-240}" ]; then
+  echo "too few cells pass the checker (floor ${MONO_GRID_MIN_CLEAN:-240}): the grid grades nothing; fix the generator first" >&2
+  exit 1
+fi
 if grep -q "^BAD" "$OUT/results.txt"; then
   echo "BAD cells (check-clean invalid wasm / compiler crash):"
   grep "^BAD" "$OUT/results.txt" | sed 's/^/  /'

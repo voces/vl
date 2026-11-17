@@ -38,6 +38,7 @@ import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { Interner, internIdIn, internNew } from "./intern"
 import { flattenVariantsInto, unMemPeelAliasWrapper } from "./tyquery"
 import { fnTagTyIsTagged } from "./check_fn_tag_facts"
+import { i32ListHas } from "./listutil"
 import { emitFail } from "./emit_bytes"
 
 // The id kinds. `CK_UNION` is a member set or list per equality, `CK_SEQ` `tyEq`'s ordered union,
@@ -113,6 +114,20 @@ export function tyRepId(ty: i32): i32 {
 // `tyRepId` before the variant shapes are primed: every record read as no union arm.
 export function tyRepIdProvisional(ty: i32): i32 {
   return canonOf(ty, CF_LAYOUT)
+}
+
+// A key two types share only when they are one type up to `tySameSet` and are stored alike: set id,
+// rep id (provisional before the variant shapes are primed) and function-leaf tagging. A fold of
+// two keys into one instance keys by this, so it never joins two storages.
+export function tyCanonFoldKey(ty: i32): string {
+  if ty < 0 { return "?" }
+  const rep = canonOf(ty, CF_LAYOUT)
+  return "#"
+    + i32ToStr(tyCanonSet(ty))
+    + "/"
+    + i32ToStr(rep)
+    + ":"
+    + canonFnTags(ty, [])
 }
 
 // Whether the rep ids are final for this program: the variant shapes are primed.
@@ -718,10 +733,91 @@ export function canonShadowReport() {
   }
   csCmp = []
   for r in csRows { idShadowRow(r) }
+  while ckCounts.length < 2 { ckCounts.push(0) }
+  idShadowRow(
+    "canon key5b notes "
+      + i32ToStr(ckCounts[0])
+      + " tagdiff "
+      + i32ToStr(ckCounts[1]),
+  )
+  for r in ckRows { idShadowRow(r) }
+  ckIdTags = Map()
+  ckIdTy = Map()
+  ckCounts = []
+  ckRows = []
   clAgree = 0
   clMerge = 0
   clSplit = 0
   canonShadowLayoutReset()
   csRows = []
   return 0
+}
+
+// Stage 5b's shadow. Mono keys an anonymous record or map pin by its set id
+// (`monoAnonPinDiscrim` spells `tyCanonKey`); the fold to an id-vector key holds only if no two
+// arguments on one head and id differ in function-leaf tagging, which this counts.
+let ckIdTags: {[string]: string} = Map()
+let ckIdTy: {[string]: i32} = Map()
+// Notes, then ids met with two taggings.
+let ckCounts: i32[] = []
+let ckRows: string[] = []
+
+// Notes pin head `head`'s anonymous discriminator for argument type `ty` under the shadow.
+export function canonKeyShadowNote(head: string, ty: i32) {
+  if idShadowModeOf() == 0 || ty < 0 { return 0 }
+  while ckCounts.length < 2 { ckCounts.push(0) }
+  ckCounts[0] = ckCounts[0] + 1
+  const tags = canonFnTags(ty, [])
+  const ik = head + "|" + i32ToStr(tyCanonSet(ty))
+  const ht = ckIdTags.get(ik)
+  if ht == null {
+    ckIdTags.set(ik, tags)
+    ckIdTy.set(ik, ty)
+  } else if ht != tags {
+    ckCounts[1] = ckCounts[1] + 1
+    const first = ckIdTy.get(ik) ?? -1
+    if ckRows.length < 24 {
+      ckRows.push(
+        "canon key5b tagdiff "
+          + ik
+          + " "
+          + ht
+          + " / "
+          + tags
+          + " ty "
+          + i32ToStr(first)
+          + "/"
+          + i32ToStr(ty),
+      )
+    }
+  }
+  return 0
+}
+
+// Each function leaf of `ty`, in walk order, as `T` where it holds a tagged set and `F` where not.
+// `path` holds the types being walked, so a shared subtree counts at each position and a cycle once.
+function canonFnTags(ty: i32, path: i32[]): string {
+  if ty < 0 || i32ListHas(path, ty) { return "" }
+  path.push(ty)
+  const t = tyAt(ty)
+  const r = match t {
+    TyFunc => if fnTagTyIsTagged(ty) { "T" } else { "F" }
+    TyArray => canonFnTags(tyElemOf(t), path)
+    TyNullable => canonFnTags(t.nInner, path)
+    TyMap => canonFnTags(tyKeyOf(t), path) + canonFnTags(tyValOf(t), path)
+    TyObj => {
+      let o = ""
+      for f in t.objFieldTypes { o = o + canonFnTags(f, path) }
+      o
+    }
+    TyUnion => {
+      let u = ""
+      for m in t.uMembers { u = u + canonFnTags(m, path) }
+      u
+    }
+    // A leaf holds no function.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => ""
+  }
+  path.pop()
+  return r
 }

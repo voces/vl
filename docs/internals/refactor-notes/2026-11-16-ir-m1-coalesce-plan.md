@@ -84,5 +84,5 @@ parameter map) and `coalesce popOr` (1 alone).
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches 2c-1b already reports |
 | corpus identity against the 2c-1b seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the ladder split moves no corpus byte) |
 | mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,726 claimed and byte-identical, the same 2 fallbacks as before; corpus 9,016 identical, 0 differ, 0 fell back |
-| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 95,358,365,190 to 95,397,732,148 (+0.04%); with master and 2c-1b merged, 94,216,301,702, +0.4% on master's baseline |
-| seed size, 2c-1b seed to this one | 6,517,996 to 6,522,903 (+4,907); with master and 2c-1b merged, 6,537,394, +3.1%, past the +3% bar, so this step writes `scripts/seed-size-baseline.json` |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 95,358,365,190 to 95,397,732,148 (+0.04%); with master merged, 94,199,841,546, +0.3% on master's baseline. REP's 2×2 puts the step's own share at +0.22%, 98% of it compiling the added source; the compiler's own extra work is +5M |
+| seed size, 2c-1b seed to this one | 6,517,996 to 6,522,903 (+4,907); with master merged, 6,545,717, +0.2% on the baseline master wrote |

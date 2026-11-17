@@ -46,7 +46,7 @@ import {
   tyValOpen,
 } from "./check_types"
 import { crUnParen } from "./check_narrow_ends"
-import { luAnyTyVar, tyHasTyVar } from "./tyquery"
+import { luAnyTyVar, nonNullTy, tyHasTyVar } from "./tyquery"
 import { peelParenIx } from "./check_write_effects"
 import { colAt, nodeTyIx } from "./check_node_tys"
 import { IDENT_BUILTIN, identFromDecl, identSet } from "./symbols"
@@ -241,6 +241,59 @@ export function recordClonedIsVarTyIx(nodeIx: i32, ty: i32) {
   return ty
 }
 
+// Whether two of members `ms` hold the same element apart only by `null`, as `i32[]` and
+// `(i32 | null)[]` do: their join would store one list's elements as the other's, which the
+// direct spelling refuses (D3367), so a pin's per-arm read does not take them.
+function luMembersNulTwins(ms: i32[]): boolean {
+  for a in ms {
+    const at = tyAt(a)
+    if !(at is TyArray) { continue }
+    const ae = tyElemOf(at)
+    const an = nonNullTy(ae)
+    if an == ae { continue }
+    for b in ms {
+      const bt = tyAt(b)
+      if bt is TyArray && tyEq(tyElemOf(bt), an) { return true }
+    }
+  }
+  return false
+}
+
+// Whether a pin's per-arm read declines members `ms`: lists apart only by `null`
+// (`luMembersNulTwins`), or an element holding a record, whose arm delivery is not built
+// (D16930).
+export function luPinDeclines(ms: i32[]): boolean {
+  if luMembersNulTwins(ms) { return true }
+  for a in ms {
+    const at = tyAt(a)
+    if at is TyArray && luElemHoldsRecord(tyElemOf(at)) { return true }
+  }
+  return false
+}
+
+// Whether element type `e` is a record, or a union or nullable with a record member.
+function luElemHoldsRecord(e: i32): boolean {
+  const t = tyAt(nonNullTy(e))
+  if t is TyUnion {
+    for m in t.uMembers {
+      if tyAt(nonNullTy(m)) is TyObj { return true }
+    }
+  }
+  return t is TyObj
+}
+
+// The element unions pins typed a union-of-lists read at, which no declaration spells: the
+// emitter registers their boxes before it lowers the reads (D16897).
+export let luPinElemTys: i32[] = []
+export function luPinElemNote(ty: i32) {
+  if ty < 0 { return 0 }
+  for t in luPinElemTys {
+    if t == ty { return 0 }
+  }
+  luPinElemTys.push(ty)
+  return 0
+}
+
 // How many pinned re-checks (`monoRecheckBegin`) are open. The body under one is shared by
 // every instance, so a check-time arena rewrite that depends on the pin must not run.
 export let monoRecheckDepth = 0
@@ -261,7 +314,15 @@ export function luOwnRecv(recv: i32): boolean {
 // do not lower; nor under a pinned re-check.
 export function luMembers(ty: i32): i32[] {
   const none: i32[] = []
-  if ty < 0 || monoRecheckDepth > 0 { return none }
+  if monoRecheckDepth > 0 { return none }
+  return luMembersAt(ty)
+}
+
+// `luMembers` without its pinned re-check guard: a pin reads the union's members to type a read
+// it does not rewrite, which its instance lowers per arm (D16897).
+export function luMembersAt(ty: i32): i32[] {
+  const none: i32[] = []
+  if ty < 0 { return none }
   const t = tyAt(ty)
   if t is TyUnion {
     if t.uMembers.length < 2 { return none }
@@ -485,5 +546,6 @@ export function listUnionReset() {
   luDeclPos = Map()
   luAnnTy = Map()
   luIsTy = Map()
+  luPinElemTys = []
   return isPatTyIx = Map()
 }

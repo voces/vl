@@ -1328,7 +1328,11 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   ibLoopCont.push(WALK_LABEL)
   const fb: i32[] = []
   const body = nodeAt(n.fiBody)
-  if body is Block { stmtRun(fb, body.blkStmts) } else { stmt(fb, n.fiBody) }
+  if body is Block {
+    stmtRun(fb, body.blkStmts)
+  } else {
+    stmt(fb, n.fiBody, NO_SIBS, -1)
+  }
   ibLoopName.pop()
   ibLoopBrk.pop()
   ibLoopCont.pop()
@@ -1360,7 +1364,7 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   if wb is Block {
     stmtRun(loopBody, wb.blkStmts)
   } else {
-    stmt(loopBody, n.whileBody)
+    stmt(loopBody, n.whileBody, NO_SIBS, -1)
   }
   irBNode(
     loopBody,
@@ -1386,7 +1390,7 @@ function labelNew(): i32 {
 
 function chainLink(e: i32): i32[] {
   const nb: i32[] = []
-  stmtIn(nb, e)
+  stmtIn(nb, e, NO_SIBS, -1)
   return nb
 }
 
@@ -1397,10 +1401,8 @@ function elseStmts(e: i32): i32[] {
   return [e]
 }
 
-// The statement list being built and the position in it, which a declaration's list reserve
-// reads its following statements from; -1 outside a list.
-let ibSibStmts: i32[] = []
-let ibSibPos = -1
+// The sibling list of a statement built outside a statement list; its position is -1.
+const NO_SIBS: i32[] = []
 
 // Each statement of `stmts` in order, as a statement list.
 function stmtRun(b: i32[], stmts: i32[]) {
@@ -1412,28 +1414,23 @@ function stmtRun(b: i32[], stmts: i32[]) {
   return 0
 }
 
-// Statement `i` of list `stmts`, with the list and position held for it.
+// Statement `i` of list `stmts`.
 function stmtAt(b: i32[], stmts: i32[], i: i32) {
-  const ps = ibSibStmts
-  const pp = ibSibPos
-  ibSibStmts = stmts
-  ibSibPos = i
-  stmt(b, stmts[i])
-  ibSibStmts = ps
-  ibSibPos = pp
-  return 0
+  return stmt(b, stmts[i], stmts, i)
 }
 
-// Builds statement `ix` onto `b`, noting the run of nodes it built for the source map.
-function stmt(b: i32[], ix: i32) {
+// Builds statement `ix` onto `b`, noting the run of nodes it built for the source map. `ix` is
+// `sibs[pos]`, which a declaration's list reserve reads its following statements from, or `pos`
+// is -1 outside a list.
+function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
-  stmtIn(b, ix)
+  stmtIn(b, ix, sibs, pos)
   if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
   return 0
 }
 
-function stmtIn(b: i32[], ix: i32) {
+function stmtIn(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
   if n is Block {
@@ -1444,12 +1441,7 @@ function stmtIn(b: i32[], ix: i32) {
     const v = irBDeclVar(ix)
     if v < 0 || n.letInit < 0 { return skip("declaration") }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
-    if (
-      ibSibPos >= 0
-      && ibSibPos < ibSibStmts.length
-      && ibSibStmts[ibSibPos] == ix
-      && listReserveScan(n, ibSibStmts, ibSibPos, ibFnIx) != null
-    ) {
+    if pos >= 0 && listReserveScan(n, sibs, pos, ibFnIx) != null {
       return skip("declaration list reserve")
     }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep)
@@ -1568,7 +1560,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   if ln is WhileStmt { return skip("valued tail loop") }
   if ln is RetStmt || ln is IfStmt {
     const past = ibMissesPast
-    stmt(b, last)
+    stmt(b, last, stmts, stmts.length - 1)
     // A tail `if` whose arms yield values rather than returning is I1's (`siOut`). An arm the
     // census built past a miss in is incomplete, not valued.
     if ibMiss == "" && past == ibMissesPast && !irBodyLeaves(ib, b) {
@@ -1577,7 +1569,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return 0
   }
   if isBlockBody(at) {
-    stmt(b, last)
+    stmt(b, last, stmts, stmts.length - 1)
     return skip("block body falls off")
   }
   const n0 = b.length

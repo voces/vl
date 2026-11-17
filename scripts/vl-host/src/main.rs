@@ -3767,6 +3767,8 @@ struct LinkOpts {
     /// `-O` / `-O3`: the seed emits the shapes binaryen scalarises (an inline map store) rather
     /// than the smaller out-of-line ones a plain build gets.
     optimizing: bool,
+    /// `--test-emit-refusal`: test harness only, the seed refuses a call to its test hooks.
+    test_emit_refusal: bool,
 }
 
 /// The largest page count an i32-addressed memory can declare (4 GiB).
@@ -3974,6 +3976,7 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
         heap_base_given: base.is_some(),
         low_memory: None,
         optimizing: false,
+        test_emit_refusal: false,
     };
     if let Some(m) = memory_sizes_error(&link) {
         usage_exit(&m);
@@ -4367,11 +4370,21 @@ fn arm_seed_store(store: &mut Store<()>) {
     let mut headroom = policy
         .and_then(|(initial, grow)| Some(SeedGcHeadroom::new(initial, grow?)));
     let alloc = std::env::var("VL_PROFILE_GUEST_ALLOC").is_ok_and(|v| v == "1");
+    // `VL_PROFILE_GUEST_FUEL=1` under `$VL_FUEL=1`: each sample weighs the fuel burned since the
+    // one before, written as microseconds so the weight reads as fuel. Fuel starts at `u64::MAX`
+    // and is never topped up, so the first delta is exact too.
+    let fuel = std::env::var("VL_PROFILE_GUEST_FUEL").is_ok_and(|v| v == "1");
     let mut last = resident_bytes();
+    let mut fuel_left = u64::MAX;
     store.epoch_deadline_callback(move |mut cx| {
         if let Some(p) = prof.as_ref() {
             if let Some(p) = p.lock().unwrap().as_mut() {
-                let delta = if alloc {
+                let delta = if fuel {
+                    let now = cx.get_fuel().unwrap_or(fuel_left);
+                    let used = fuel_left.saturating_sub(now);
+                    fuel_left = now;
+                    std::time::Duration::from_micros(used)
+                } else if alloc {
                     let now = resident_bytes();
                     let grew = now.saturating_sub(last);
                     last = now;
@@ -4486,6 +4499,14 @@ fn compile_vl_instance(
             bail!("the compiler refused a shared memory of {pages} pages");
         }
     }
+    // `--test-emit-refusal`: refused on an old seed, since a test that pins a refusal would
+    // otherwise build clean and measure nothing.
+    if link.test_emit_refusal {
+        let set = inst
+            .get_typed_func::<i32, i32>(&mut store, "setTestEmitRefusal")
+            .map_err(|_| stale_seed_for("--test-emit-refusal", "setTestEmitRefusal"))?;
+        set.call(&mut store, 1)?;
+    }
     // `--initial-memory=` / `--max-memory=`: refused on an old seed for the same reason — a
     // module that started at one page would grow, and detach the host's views, after all.
     if link.initial_pages.is_some() || link.max_pages.is_some() {
@@ -4567,6 +4588,7 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    report_inst_keys(inst, store, source_path);
     report_ifaces(inst, store, source_path);
     report_touch_set(inst, store, source_path);
     report_cls_census(inst, store, source_path);
@@ -4754,6 +4776,37 @@ fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[late] {path}: demand {name}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_INST_KEYS=1` asked for each compile's instance-key shadow (STORE A0).
+fn inst_keys_on() -> bool {
+    std::env::var("VL_INST_KEYS").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_INST_KEYS=1`, print one `[inst] <path>: <row>` line to stderr per row of the
+/// guest's instance-key shadow: a summary, then each key only the check or only the elaboration
+/// has. A seed without `instKeysBuild` prints nothing.
+fn report_inst_keys(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !inst_keys_on() {
+        return;
+    }
+    let (Ok(build), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "instKeysBuild"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "instKeysLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "instKeysAt"),
+    ) else {
+        return;
+    };
+    let n = build.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[inst] {path}: {row}\n"));
     }
     eprint!("{rows}");
 }
@@ -7624,6 +7677,9 @@ fn run_cmd(args: &[String]) -> Result<()> {
             // that is what they have always been on this path — turning a spelling
             // that runs today into an error is the thing this change is avoiding.
             "-O" | "-O3" | "--names" | "--wat" | "--no-validate" => {}
+            // Test harness only: the seed refuses a call to its test hooks, so a graded run can
+            // pin an emit refusal no capability fix moves.
+            "--test-emit-refusal" => link.test_emit_refusal = true,
             // Refused, not inert like the four above: it changes what the module LINKS
             // against, and `vl run` has no `env.memory` to supply — the run would fail at
             // instantiation with a sentence about imports rather than about the flag.
@@ -9801,6 +9857,13 @@ fn pump_session(
     arm_cls_census(&inst, &mut store);
     arm_ir_shadow(&inst, &mut store);
     arm_opaque_snames(&inst, &mut store);
+    // $VL_REP_SHADOW under the pump arms the shadow's check-time half (the read query's saved
+    // answers, which `$VL_IFACES` prints); the disagreement report stays a build's.
+    if std::env::var_os("VL_REP_SHADOW").is_some() {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setRepShadow") {
+            set.call(&mut store, 1)?;
+        }
+    }
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
     if compile_pool_allowed() {
@@ -10146,6 +10209,10 @@ fn pump_session(
                 if late_demands_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
+                }
+                if inst_keys_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_inst_keys(&inst, &mut store, &p);
                 }
                 if ifaces_on() {
                     let p = cmd_path.read(&mut store)?;
@@ -11583,6 +11650,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     let mut link = parse_link_opts(args);
     link.low_memory = low_memory.map(|n| n as i32);
     link.optimizing = optimizing;
+    link.test_emit_refusal = args.iter().any(|a| a == "--test-emit-refusal");
     // A heap window that starts inside the promised-unused region breaks the promise with the
     // first allocation, so the two flags contradict each other.
     if let (Some(n), Some((base, _))) = (low_memory, link.heap) {

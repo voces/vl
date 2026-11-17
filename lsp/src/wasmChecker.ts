@@ -410,6 +410,13 @@ export type WasmChecker = {
    */
   setEmitNames: (on: boolean) => void;
   /**
+   * Test harness only: refuse a call to `__vl_test_emit_refusal__` (node-anchored) or
+   * `__vl_test_emit_refusal_decl__` (declaration-anchored) at emit in the NEXT `compile`
+   * (`setTestEmitRefusal` on the seed, `vl check --test-emit-refusal`). Throws when asked to
+   * turn it on over a seed without the export, so a test cannot pass measuring nothing.
+   */
+  setTestEmitRefusal: (on: boolean) => void;
+  /**
    * Compile the NEXT `compile` for `-O` (`setOptimized` on the seed): the emitter keeps map
    * stores inline, where binaryen can scalarise them. Its bytes go on to `optimizeModule`
    * (`compiler/optHost.ts`). A no-op on a seed that predates the export.
@@ -2196,6 +2203,15 @@ export const createWasmChecker = (
     exp.setEmitNames(on ? 1 : 0);
   };
 
+  const setTestEmitRefusal = (on: boolean): void => {
+    const exp = instantiate();
+    if (exp === undefined || typeof exp.setTestEmitRefusal !== "function") {
+      if (on) throw new Error("setTestEmitRefusal: the seed exports no `setTestEmitRefusal`");
+      return;
+    }
+    exp.setTestEmitRefusal(on ? 1 : 0);
+  };
+
   const setOptimized = (on: boolean): void => {
     const exp = instantiate();
     if (exp === undefined || typeof exp.setOptimized !== "function") return;
@@ -2516,6 +2532,7 @@ export const createWasmChecker = (
     check,
     compile,
     setEmitNames,
+    setTestEmitRefusal,
     setOptimized,
     definitionAt,
     referencesAt,
