@@ -13,11 +13,14 @@ A scratch compiler, never seeded, made `fieldCodeIn`'s no-rep branch an uncondit
 | population | programs | no-rep cells |
 |---|---:|---:|
 | `tests/cases`, `std`, distilled cells, capability probes | 21,062 | 0 |
-| every matrix template (1,495), both faces | 85,570 | 1, already a loud emit reject on master (D16727, unfiled: D16727 until #8905 lands) |
+| every matrix template (1,495), both faces | 85,570 | 1 on master `c33b25c8d`, where emit already refused it (D16727, unfiled: D16727 until #8905 lands); it runs from #8856, the next merge |
 | full census (`mkmatrix`, `sab`, blocks A–E), at `JOBS=4`, alone | 250,438 | 0 |
 
 `gradecensus` keeps a cell's first error message, so the 265 cells emit already refuses could
 hide a probe behind their own message; none of them runs, so none is a runs→loud move.
+
+The D16727 cell is added to `distilled/named/` (`d16727-gradual-list-field`), so the one
+program that ever showed a no-rep field keeps being graded; it runs, and must keep running.
 
 ## The change
 
