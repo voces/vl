@@ -25718,47 +25718,143 @@ const OP_F64_REINTERPRET_I64 = 0xbf
 // success (0) and its failure (-1) — the caller falls through to its own error.
 const NUM_INTR_NONE = -2
 
-// Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
-// the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
-// `name` is not one of them. The operand goes out at the bitcast's own
-// source width.
-function emitBitcastIntr(callIx: i32, fnIx: i32, name: string) {
-  if (
-    name != "f32bits"
-    && name != "f64bits"
-    && name != "f32fromBits"
-    && name != "f64fromBits"
-  ) {
-    return NUM_INTR_NONE
+// How a numeric intrinsic call lowers (`numIntrPlanOf`): one instruction `niOp` over every
+// argument at kind `niKind` (`bitcast`, `float`, `int`), or an integer `abs`/`min`/`max`
+// through a select at that kind. `none` is no intrinsic; `bad` a call legacy cannot read.
+export type NumIntrArm = "bad"
+  | "none"
+  | "bitcast"
+  | "float"
+  | "intAbs"
+  | "intMinMax"
+  | "int"
+export type NumIntrPlan = { niArm: NumIntrArm, niKind: i32, niOp: i32 }
+
+// The plan for a call of intrinsic `name` at `callIx` in `fnIx`. A float intrinsic's width is
+// the binary operators': f32 when an operand is f32 and neither side is a genuine
+// (non-literal) f64, so `min(x, 0.5)` over an f32 `x` computes in f32 as `x * 0.5` does. An
+// integer intrinsic is i64 when an operand is i64, else i32.
+export function numIntrPlanOf(
+  callIx: i32,
+  fnIx: i32,
+  name: string,
+): NumIntrPlan {
+  const base = numIntrNamePlan(callIx, fnIx, name)
+  return match base.niArm {
+    "none" | "bad" | "intAbs" | "intMinMax" => base
+    "bitcast" | "float" | "int" => numIntrCallPlan(callIx, fnIx, name, base)
   }
+}
+
+// `numIntrPlanOf` by the name alone, at the narrow width: a bitcast's operand at its own
+// source width, an integer `abs`/`min`/`max` at the width `minMaxKind` names.
+function numIntrNamePlan(callIx: i32, fnIx: i32, name: string): NumIntrPlan {
+  let pl: NumIntrPlan = { niArm: "none", niKind: -1, niOp: -1 }
+  if name == "f32bits" {
+    pl = { niArm: "bitcast", niKind: 5, niOp: OP_I32_REINTERPRET_F32 }
+  } else if name == "f64bits" {
+    pl = { niArm: "bitcast", niKind: 4, niOp: OP_I64_REINTERPRET_F64 }
+  } else if name == "f32fromBits" {
+    pl = { niArm: "bitcast", niKind: 0, niOp: OP_F32_REINTERPRET_I32 }
+  } else if name == "f64fromBits" {
+    pl = { niArm: "bitcast", niKind: 3, niOp: OP_F64_REINTERPRET_I64 }
+  } else if floatIntrOpF32(name) >= 0 {
+    const mmk = minMaxKind(callIx, fnIx)
+    const wk = if mmk == "i64" { 3 } else { 0 }
+    if mmk == "i32" || mmk == "i64" {
+      const ia: NumIntrArm = if name == "abs" { "intAbs" } else { "intMinMax" }
+      pl = { niArm: ia, niKind: wk, niOp: -1 }
+    } else {
+      pl = { niArm: "float", niKind: 4, niOp: floatIntrOpF64(name) }
+    }
+  } else if intIntrOpI32(name) >= 0 {
+    pl = { niArm: "int", niKind: 0, niOp: intIntrOpI32(name) }
+  }
+  return pl
+}
+
+// A one-instruction intrinsic's plan `base` read against call `callIx`: `bad` for no call
+// index, `none` for a node that is no call, else widened by its operands.
+function numIntrCallPlan(
+  callIx: i32,
+  fnIx: i32,
+  name: string,
+  base: NumIntrPlan,
+): NumIntrPlan {
+  if callIx < 0 {
+    const bp: NumIntrPlan = { niArm: "bad", niKind: -1, niOp: -1 }
+    return bp
+  }
+  const c = nodeAt(callIx)
+  if !(c is Call) {
+    const np: NumIntrPlan = { niArm: "none", niKind: -1, niOp: -1 }
+    return np
+  }
+  const args = c.callArgs
+  let kind = base.niKind
+  let op = base.niOp
+  if floatIntrOpF32(name) >= 0 && args.length > 0 {
+    let anyF32 = false
+    for a in args {
+      if exprIsF32(a, fnIx) { anyF32 = true }
+    }
+    // A one-argument intrinsic passes its one operand as both sides.
+    if anyF32 && !binMixHardF64(args[0], args[args.length - 1], fnIx) {
+      kind = 5
+      op = floatIntrOpF32(name)
+    }
+  }
+  if intIntrOpI32(name) >= 0 {
+    for a in args {
+      if exprIsI64(a, fnIx) {
+        kind = 3
+        op = intIntrOpI64(name)
+      }
+    }
+  }
+  const pl: NumIntrPlan = { niArm: base.niArm, niKind: kind, niOp: op }
+  return pl
+}
+
+// A numeric intrinsic call: its plan's lowering, or `NUM_INTR_NONE` when `name` is not one.
+function emitNumIntr(callIx: i32, fnIx: i32, name: string) {
+  const pl = numIntrPlanOf(callIx, fnIx, name)
+  return match pl.niArm {
+    "none" => NUM_INTR_NONE
+    "bad" => -1
+    "intAbs" => emitIntAbs(callIx, fnIx, pl.niKind == 3)
+    "intMinMax" => emitIntMinMax(callIx, fnIx, name, pl.niKind == 3)
+    "bitcast" | "float" | "int" => emitNumIntrOp(callIx, fnIx, name, pl)
+  }
+}
+
+// A one-instruction numeric intrinsic: every argument at the plan's kind, then its instruction.
+function emitNumIntrOp(callIx: i32, fnIx: i32, name: string, pl: NumIntrPlan) {
   if callIx < 0 { return -1 }
   const c = nodeAt(callIx)
-  if c is Call {
-    if c.callArgs.length != 1 {
-      return emitFail(
-        "emitProgram: internal: "
-          + name
-          + " reached with the wrong argument count — the checker's arity rule refuses it",
-      )
-    }
-    const arg = c.callArgs[0]
-    if name == "f32bits" {
-      if emitExprAsKind(arg, 5, fnIx) < 0 { return -1 }
-      return fbI32Bin(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
-    }
-    if name == "f64bits" {
-      if emitExprAsKind(arg, 4, fnIx) < 0 { return -1 }
-      return fbI32Bin(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
-    }
-    if name == "f32fromBits" {
-      if emitExprAsKind(arg, 0, fnIx) < 0 { return -1 }
-      return fbI32Bin(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
-    }
-    if emitExprAsKind(arg, 3, fnIx) < 0 { return -1 }
-    return fbI32Bin(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
+  if !(c is Call) { return NUM_INTR_NONE }
+  if pl.niArm == "bitcast" && c.callArgs.length != 1 {
+    return emitFail(
+      "emitProgram: internal: "
+        + name
+        + " reached with the wrong argument count — the checker's arity rule refuses it",
+    )
   }
-  return NUM_INTR_NONE
+  if pl.niArm == "float" && c.callArgs.length == 0 {
+    return emitFail(
+      "emitProgram: internal: "
+        + name
+        + " reached with no argument — the checker's arity rule refuses it",
+    )
+  }
+  for a in c.callArgs {
+    if emitExprAsKind(a, pl.niKind, fnIx) < 0 { return -1 }
+  }
+  return numIntrTail(pl.niOp)
 }
+
+// After a numeric intrinsic's operands: its one instruction.
+export function numIntrTail(op: i32): i32 { return fbI32Bin(op) }
 
 // The f32 instruction for the float intrinsic `name`, or -1 when it is not one.
 //   abs 0x8b · ceil 0x8d · floor 0x8e · trunc 0x8f · nearest 0x90 · sqrt 0x91
@@ -25829,54 +25925,6 @@ function intIntrOpI64(name: string) {
   return -1
 }
 
-// Lower a FLOAT intrinsic (`sqrt`, `min`, `copysign`, …): push every argument at the
-// operation's width, then the one instruction. The width rule is the binary operators'
-// — f32 when an operand is f32 and neither side is a genuine (non-literal) f64 — so
-// `min(x, 0.5)` over an f32 `x` computes in f32 exactly as `x * 0.5` does.
-function emitFloatIntr(callIx: i32, fnIx: i32, name: string) {
-  const opF32 = floatIntrOpF32(name)
-  if opF32 < 0 { return NUM_INTR_NONE }
-  const mmk = minMaxKind(callIx, fnIx)
-  if mmk == "i32" || mmk == "i64" {
-    if name == "abs" { return emitIntAbs(callIx, fnIx, mmk == "i64") }
-    return emitIntMinMax(callIx, fnIx, name, mmk == "i64")
-  }
-  if callIx < 0 { return -1 }
-  const c = nodeAt(callIx)
-  if c is Call {
-    const args = c.callArgs
-    if args.length == 0 {
-      return emitFail(
-        "emitProgram: internal: "
-          + name
-          + " reached with no argument — the checker's arity rule refuses it",
-      )
-    }
-    let anyF32 = false
-    let i = 0
-    while i < args.length {
-      if exprIsF32(args[i], fnIx) { anyF32 = true }
-      i = i + 1
-    }
-    // `binMixHardF64` over the first and last argument IS the operators' rule: true when
-    // either side is a genuine (non-literal) f64. A one-argument intrinsic passes its one
-    // operand as both sides, which asks the same question of it.
-    const hardF64 = binMixHardF64(args[0], args[args.length - 1], fnIx)
-    const useF32 = anyF32 && !hardF64
-    // The chosen width is the OPERATION's, and each operand goes out at it.
-    let fiK = 4
-    if useF32 { fiK = 5 }
-    let j = 0
-    while j < args.length {
-      if emitExprAsKind(args[j], fiK, fnIx) < 0 { return -1 }
-      j = j + 1
-    }
-    if useF32 { return fbI32Bin(opF32) }
-    return fbI32Bin(floatIntrOpF64(name))
-  }
-  return NUM_INTR_NONE
-}
-
 // Lower an integer `min` / `max`, which has no wasm instruction: both operands are
 // evaluated in order before either is staged (so a nested call cannot clobber the frame),
 // then `select` over a signed compare. Staging slots: i32 at +0/+1, i64 at +2/+3.
@@ -25937,36 +25985,6 @@ function emitIntAbs(callIx: i32, fnIx: i32, wide: boolean) {
   if wide { fbI32Bin(0x53) } else { fbI32Bin(0x48) }
   fbSelect() // → the negation when the operand is negative
   return 0
-}
-
-// Lower an INTEGER intrinsic (`clz`, `rotl`, `divU`, `ltU`, …): push every argument at
-// the operation's width, then the one instruction. i64 when an operand is i64 (the i32
-// side sign-extends), else i32 — the selection the i64 binary operators use.
-function emitIntIntr(callIx: i32, fnIx: i32, name: string) {
-  const opI32 = intIntrOpI32(name)
-  if opI32 < 0 { return NUM_INTR_NONE }
-  if callIx < 0 { return -1 }
-  const c = nodeAt(callIx)
-  if c is Call {
-    const args = c.callArgs
-    let useI64 = false
-    let i = 0
-    while i < args.length {
-      if exprIsI64(args[i], fnIx) { useI64 = true }
-      i = i + 1
-    }
-    // The chosen width is the OPERATION's: an i32 op's operand is an i32.
-    let iiK = 0
-    if useI64 { iiK = 3 }
-    let j = 0
-    while j < args.length {
-      if emitExprAsKind(args[j], iiK, fnIx) < 0 { return -1 }
-      j = j + 1
-    }
-    if useI64 { return fbI32Bin(intIntrOpI64(name)) }
-    return fbI32Bin(opI32)
-  }
-  return NUM_INTR_NONE
 }
 
 // The value of an integer literal, of an unshadowed top-level `const` bound to one, or of an
@@ -27028,7 +27046,7 @@ function emitAtomicIntrinsic(c: Call, name: string, fnIx: i32) {
 export const TEST_EMIT_REFUSAL_MSG = "emitProgram: test-only refusal (--test-emit-refusal)"
 
 // Whether `name` is the test hook `hook`, bare or with a module build's `$m<id>` suffix.
-function testHookNamed(name: string, hook: string): boolean {
+export function testHookNamed(name: string, hook: string): boolean {
   return name == hook || name.slice(0, hook.length + 2) == hook + "$m"
 }
 
@@ -27241,7 +27259,7 @@ function callIsTrapIntrinsic(callIx: i32) {
 // The template hole of render call `c` when this instance pins it to a string or a literal
 // atom, else -1. The renderer takes neither, and the checker leaves a pinned body's call in
 // place (D2241).
-function tplStrHoleOf(c: Call, fnIx: i32) {
+export function tplStrHoleOf(c: Call, fnIx: i32) {
   if c.callArgs.length != 1 { return -1 }
   const h = c.callArgs[0]
   if !nodeIsTplHole(h) { return -1 }
@@ -27332,125 +27350,164 @@ function emitCallCorePrint(callIx: i32, c: Call, fnIx: i32) {
       "emitProgram: internal: print reached with the wrong argument count — the checker's arity rule refuses it",
     )
   }
-  // D1576 — `print(<the `null` type>)` prints the word `null`: the value is
-  // statically null, so there is no arm to select, and this must run first — every
-  // classifier below reads a rep this value does not have. The argument still
-  // evaluates, so a call's side effects happen.
-  if exprIsNulNone(c.callArgs[0], fnIx) {
-    if emitNulNoneForEffect(c.callArgs[0], fnIx) < 0 { return -1 }
+  const arg = c.callArgs[0]
+  const arm = printArmOf(arg, fnIx)
+  // The argument still evaluates, so a call's side effects happen.
+  if arm == "nulNone" {
+    if emitNulNoneForEffect(arg, fnIx) < 0 { return -1 }
     return emitPrintNullWord()
   }
-  // A nullable ref niche whose other arm has no printed form (a record, a list, a map, a
-  // closure) can print only as `null`, whatever narrowed it there (D3498).
-  const pnNiche = exprNulNicheKind(c.callArgs[0], fnIx)
-  if (
-    (pnNiche != "" && pnNiche != "nulstr")
-    || exprNullableMap(c.callArgs[0], fnIx)
-  ) {
-    const prNull = readNarrowedBoxToNull(c.callArgs[0], fnIx)
-    const prMark = if prNull { storageReadEnter(c.callArgs[0]) } else { -2 }
-    const prRc = emitPrintNulRefNiche(c.callArgs[0], fnIx)
+  if arm == "nulRefNiche" {
+    const prNull = readNarrowedBoxToNull(arg, fnIx)
+    const prMark = if prNull { storageReadEnter(arg) } else { -2 }
+    const prRc = emitPrintNulRefNiche(arg, fnIx)
     if prNull { storageReadLeave(prMark) }
     return prRc
   }
-  // A read the narrowing pins to `null` is printed with the narrowing lifted, so the box's
-  // own tag decides: every ladder below would unbox an arm it does not hold (D2801).
-  if readNarrowedBoxToNull(c.callArgs[0], fnIx) {
-    const pnMark = storageReadEnter(c.callArgs[0])
+  if arm == "boxNull" {
+    const pnMark = storageReadEnter(arg)
     const pnWas = printPlanPinNull(true)
     const pnRc = emitCallCore(callIx, fnIx)
     printPlanPinNull(pnWas)
     storageReadLeave(pnMark)
     return pnRc
   }
-  const pmk = mapReadScalarBoxKind(c.callArgs[0], fnIx)
-  if pmk >= 0 { return emitPrintScalarMapRead(c.callArgs[0], pmk, fnIx) }
-  // A read narrowed to `K | null` out of a wider box prints as that niche (D7965), a hole's
-  // or an instance's read at the type its calls pin (D8122).
-  if narrowedNulLitPinBoxKey(c.callArgs[0], fnIx) != "" {
-    const nbTexts = nulLitMemberTexts(instanceReadTyOf(c.callArgs[0], fnIx))
-    if nbTexts.length > 0 {
-      return emitPrintNulLitUnion(c.callArgs[0], nbTexts, fnIx)
-    }
+  if arm == "mapScalar" {
+    return emitPrintScalarMapRead(arg, mapReadScalarBoxKind(arg, fnIx), fnIx)
   }
-  // print(literal-union atom): widen it to its member string — a per-member
-  // `if id == <id> { print "<name>" }` chain. Asked before `exprString`, which also
-  // answers true for an atom-repped global (the softened render says `string` over a
-  // cell laid out as `(mut i32)`) — where they disagree, the atom answer is the rep.
-  if exprIsLitAtom(c.callArgs[0], fnIx) {
-    // an un-narrowed `K | null` niche is the same i32 with `-1` for null, so it prints
-    // its member or the word `null`, exactly like the two niches beside it. Asked
-    // first: the expanded spelling also satisfies the member-only query below, and
-    // only this arm emits the sentinel.
-    const lpNul = nulLitAtomTexts(c.callArgs[0], fnIx)
-    if lpNul.length > 0 {
-      return emitPrintNulLitUnion(c.callArgs[0], lpNul, fnIx)
-    }
+  if arm == "nulLitPin" {
+    return emitPrintNulLitUnion(
+      arg,
+      nulLitMemberTexts(instanceReadTyOf(arg, fnIx)),
+      fnIx,
+    )
+  }
+  if arm == "nulAtom" {
+    return emitPrintNulLitUnion(arg, nulLitAtomTexts(arg, fnIx), fnIx)
+  }
+  if arm == "atom" {
     // `litAtomWidenTexts` is `emitAtomToStr`'s shared ladder; its declaration rung is
     // what a monomorphized instance needs, since the instance's leaf nodes share the
     // generic body and record the generic's own type parameter instead.
-    const lpTexts = litAtomWidenTexts(c.callArgs[0], fnIx)
-    // a claim with no texts means the rep and the recorded type disagree: the chain
-    // matches nothing, rc 0 with no output — the quietest possible wrong answer.
+    const lpTexts = litAtomWidenTexts(arg, fnIx)
+    // A claim with no texts means the rep and the recorded type disagree: the chain would
+    // match nothing, rc 0 with no output.
     if lpTexts.length == 0 {
       return emitFail(
         "emitProgram: print of a literal-union atom whose type carries no member texts",
       )
     }
-    const lpRc = emitPrintAtomStr(c.callArgs[0], lpTexts, fnIx)
-    return lpRc
+    return emitPrintAtomStr(arg, lpTexts, fnIx)
   }
-  // a nullable-string value may genuinely hold null, and prints `null` when it does.
-  // Asked before `exprString`, which also claims it (the softened render says
-  // `string` over a `(ref null $a)` cell) — without the order, a possibly-null ref
-  // streams straight into `array.len`, a runtime trap on a `vl check`-clean program.
-  const pnk = exprNulKind(c.callArgs[0], fnIx)
-  if pnk == "nulstr" { return emitPrintNulString(c.callArgs[0], fnIx) }
-  // the other niche, `boolean | null` (an i32 with sentinel 2): the fallback ladder
-  // ends in `__print_bool__`, which renders any non-zero as true — an un-arrested
-  // null would print true, silently.
-  if pnk == "nulbool" { return emitPrintNulBool(c.callArgs[0], fnIx) }
-  // `print(<value-union box>)` dispatches on the box tag and prints the arm the
-  // value holds (D712). Asked after the two niche arms — they are niches, not boxes,
-  // and `printUnionPlan` declines both — and before `exprString`, on the same
-  // ordering argument as the litunion-atom arm above: a rendering can claim a box.
-  const puKinds: i32[] = []
-  if printUnionPlan(c.callArgs[0], fnIx, puKinds) {
-    return emitPrintValueUnion(c.callArgs[0], puKinds, fnIx)
+  if arm == "nulStr" { return emitPrintNulString(arg, fnIx) }
+  if arm == "nulBool" { return emitPrintNulBool(arg, fnIx) }
+  if arm == "union" {
+    const puKinds: i32[] = []
+    printUnionPlan(arg, fnIx, puKinds)
+    return emitPrintValueUnion(arg, puKinds, fnIx)
   }
-  // a union-valued argument the plan declined must not fall through: the ladder below
-  // ends in `call __print_i32__` with a `(ref $uBox)` on the stack, check-clean
-  // invalid wasm (D711). The checker gates on the type, this on the expression, so
-  // the residue is whatever the expression-side resolvers cannot name.
-  if (
-    printUnionArmsUnrenderable(c.callArgs[0], fnIx)
-    || printArgIsUnclassifiedBox(c.callArgs[0], fnIx)
-  ) {
+  // A union-valued argument the plan declined must not fall through: the scalar import would
+  // receive a `(ref $uBox)`, check-clean invalid wasm (D711).
+  if arm == "unrenderable" {
     return emitFail(
       "emitProgram: print of a union value whose arms the tag dispatch cannot classify",
     )
   }
-  if exprString(c.callArgs[0], fnIx) {
-    return emitPrintStrExpr(c.callArgs[0], fnIx)
+  if arm == "str" { return emitPrintStrExpr(arg, fnIx) }
+  if emitExpr(arg, fnIx) < 0 { return -1 }
+  return printScalarTail(arm)
+}
+
+// How `print` writes its argument: the word `null`, a niche, a box dispatch, an atom chain, a
+// string stream, or one scalar print import (`f32` … `i32`).
+export type PrintArm = "nulNone"
+  | "nulRefNiche"
+  | "boxNull"
+  | "mapScalar"
+  | "nulLitPin"
+  | "nulAtom"
+  | "atom"
+  | "nulStr"
+  | "nulBool"
+  | "union"
+  | "unrenderable"
+  | "str"
+  | "f32"
+  | "f64"
+  | "i64"
+  | "bool"
+  | "i32"
+
+// The arm `print` takes for argument `argIx` in function `fnIx`, in `emitCallCorePrint`'s order.
+export function printArmOf(argIx: i32, fnIx: i32): PrintArm {
+  // The `null` type has no arm to select, and every classifier below reads a rep this value
+  // lacks (D1576).
+  if exprIsNulNone(argIx, fnIx) { return "nulNone" }
+  // A nullable ref niche whose other arm has no printed form (a record, a list, a map, a
+  // closure) can print only as `null`, whatever narrowed it there (D3498).
+  const pnNiche = exprNulNicheKind(argIx, fnIx)
+  if (pnNiche != "" && pnNiche != "nulstr") || exprNullableMap(argIx, fnIx) {
+    return "nulRefNiche"
   }
-  // i64 routes to `__print_i64__` (a `(i64)->()` functype) checked before bool/i32;
-  // f64 to `__print_f64__`, checked first since a float operand is never i64/bool/i32;
-  // f32 to `__print_f32__`, checked before f64 so a mixed f32/float-literal
-  // expression (`x + 4.0` with f32 `x`) prints as f32, not f64.
-  const argF32 = exprIsF32(c.callArgs[0], fnIx)
-  const argI64 = exprIsI64(c.callArgs[0], fnIx)
-  const argF64 = exprIsF64(c.callArgs[0], fnIx)
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  if argF32 {
-    fbCall(gF32PrintIdx) // 0x10 call __print_f32__
-  } else if argF64 {
-    fbCall(gF64PrintIdx) // 0x10 call __print_f64__
-  } else if argI64 {
-    fbCall(4) // 0x10 call __print_i64__ (import index 4)
-  } else if exprIsBool(c.callArgs[0], fnIx) {
-    fbCall(1) // 0x10 call __print_bool__ (import index 1)
-  } else {
-    fbCall(0) // 0x10 call __print_i32__ (import index 0)
+  // A read the narrowing pins to `null` prints with the narrowing lifted, so the box's own tag
+  // decides (D2801).
+  if readNarrowedBoxToNull(argIx, fnIx) { return "boxNull" }
+  if mapReadScalarBoxKind(argIx, fnIx) >= 0 { return "mapScalar" }
+  // A read narrowed to `K | null` out of a wider box prints as that niche (D7965), a hole's or
+  // an instance's read at the type its calls pin (D8122).
+  if (
+    narrowedNulLitPinBoxKey(argIx, fnIx) != ""
+    && nulLitMemberTexts(instanceReadTyOf(argIx, fnIx)).length > 0
+  ) {
+    return "nulLitPin"
+  }
+  // Asked before `exprString`, which also answers true for an atom-repped global. An
+  // un-narrowed `K | null` prints its member or `null`; only that arm writes the sentinel test.
+  if exprIsLitAtom(argIx, fnIx) {
+    if nulLitAtomTexts(argIx, fnIx).length > 0 { return "nulAtom" }
+    return "atom"
+  }
+  // The two niches, asked before `exprString` and the bool import, which would stream a null
+  // ref into `array.len` or print the sentinel 2 as true.
+  const pnk = exprNulKind(argIx, fnIx)
+  if pnk == "nulstr" { return "nulStr" }
+  if pnk == "nulbool" { return "nulBool" }
+  // A value-union box dispatches on its tag (D712); one the plan declines must not fall through.
+  const puKinds: i32[] = []
+  if printUnionPlan(argIx, fnIx, puKinds) { return "union" }
+  if (
+    printUnionArmsUnrenderable(argIx, fnIx)
+    || printArgIsUnclassifiedBox(argIx, fnIx)
+  ) {
+    return "unrenderable"
+  }
+  if exprString(argIx, fnIx) { return "str" }
+  return printScalarArmOf(argIx, fnIx)
+}
+
+// The print import a scalar argument takes: f32 before f64, so a mixed f32 and float-literal
+// expression prints as f32, and either float before i64, bool and i32.
+function printScalarArmOf(argIx: i32, fnIx: i32): PrintArm {
+  if exprIsF32(argIx, fnIx) { return "f32" }
+  if exprIsF64(argIx, fnIx) { return "f64" }
+  if exprIsI64(argIx, fnIx) { return "i64" }
+  if exprIsBool(argIx, fnIx) { return "bool" }
+  return "i32"
+}
+
+// After a scalar `print` argument's value: the call of its host print import. Returns 0.
+export function printScalarTail(arm: PrintArm): i32 {
+  match arm {
+    "f32" => fbCall(gF32PrintIdx)
+    "f64" => fbCall(gF64PrintIdx)
+    "i64" => fbCall(4) // __print_i64__
+    "bool" => fbCall(1) // __print_bool__
+    "i32" => fbCall(0) // __print_i32__
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulAtom" | "atom" | "nulStr" | "nulBool" | "union" | "unrenderable" | "str" => {
+      return emitFail(
+        "emitProgram: internal: a print scalar tail for a non-scalar arm",
+      )
+    }
   }
   return 0
 }
@@ -27696,6 +27753,33 @@ function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
   return -1
 }
 
+// Whether a call of `callee`, a name no function in scope owns, is a closure-valued callee
+// dispatched through the closure fat-pointer: not where it is a numeric intrinsic's name no
+// binding covers here, which is the intrinsic even where a later local closure takes the name
+// (D3607).
+function unknownCallRoutesRef(c: Call, callee: Ident, fnIx: i32): boolean {
+  const intrHere = isNumIntrinsicName(callee.identName)
+    && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
+    && globalIndexOf(callee.identName) < 0
+  return !intrHere
+    && (exprIsClosure(c.callFn, fnIx)
+    || bundleParamOfRead(c.callFn, fnIx) >= 0)
+}
+
+// Whether call `c` of `callee` reaches the numeric intrinsics in `fnIx`, as
+// `emitCallCoreUserFn` routes it: no function of the name in scope, no closure-valued callee,
+// and no live frame binding (a captured loop variable), which is the shadowing rule the
+// checker types against: a program that defines its own `min` calls its own (D2010).
+export function numIntrCallReached(c: Call, callee: Ident, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const sid = sidOfNode(c.callFn)
+  if fnIndexOfInScopeChainAt(sid, callee.identName, fnIx, c.callFn) >= 0 {
+    return false
+  }
+  if unknownCallRoutesRef(c, callee, fnIx) { return false }
+  return !identNameIsLiveBound(callee.identName, fnIx)
+}
+
 // `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
 // direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
 // intrinsic when the name resolves to no function. Returns 0 or -1.
@@ -27724,29 +27808,12 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
     return emitCallRef(callIx, fnIx)
   }
   if target < 0 {
-    // Not a known function name — a closure-valued callee, dispatched through the closure
-    // fat-pointer — unless it is a numeric intrinsic's name that no binding covers here,
-    // which is the intrinsic even where a later local closure takes the name (D3607).
-    const intrHere = isNumIntrinsicName(callee.identName)
-      && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
-      && globalIndexOf(callee.identName) < 0
-    if (
-      !intrHere
-      && (exprIsClosure(c.callFn, fnIx) || bundleParamOfRead(c.callFn, fnIx) >= 0)
-    ) {
+    if unknownCallRoutesRef(c, callee, fnIx) {
       return emitCallRef(callIx, fnIx)
     }
-    // The numeric-opcode intrinsics: one wasm instruction over the arguments. Reached
-    // only where the name resolved to no function, no closure value and no frame binding
-    // (a captured loop variable), which IS the shadowing rule the checker types against —
-    // a program that defines its own `min` calls its own (D2010).
     if !identNameIsLiveBound(callee.identName, fnIx) {
-      const bcRc = emitBitcastIntr(callIx, fnIx, callee.identName)
-      if bcRc != NUM_INTR_NONE { return bcRc }
-      const fiRc = emitFloatIntr(callIx, fnIx, callee.identName)
-      if fiRc != NUM_INTR_NONE { return fiRc }
-      const iiRc = emitIntIntr(callIx, fnIx, callee.identName)
-      if iiRc != NUM_INTR_NONE { return iiRc }
+      const niRc = emitNumIntr(callIx, fnIx, callee.identName)
+      if niRc != NUM_INTR_NONE { return niRc }
     }
     if nodeTyAt(c.callFn, fnIx) == TY_NULL { return emitNullCalleeCall() }
     return emitFail("emitProgram: call to unknown function")
@@ -37519,6 +37586,12 @@ export function wasmEmitStateReset() {
 // `__print_str_flush__`. Factored from the print handler so the literal-union widening can reuse it.
 function emitPrintStrExpr(strExpr: i32, fnIx: i32) {
   if emitExpr(strExpr, fnIx) < 0 { return -1 }
+  return printStrTail()
+}
+
+// After a string `print` argument's value: its code points streamed through `__print_char__`,
+// then one `__print_str_flush__`.
+export function printStrTail(): i32 {
   fbLocalSet(strScratchBase + 0)
   return emitPrintStrFromScratch()
 }

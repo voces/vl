@@ -1,6 +1,6 @@
 import { nameToTy } from "./check_relate_core"
 import { aliasRootParam } from "./check_call_resolve"
-import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
+import { canonKeyShadowNote, tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { voidCtxLambdaCarry } from "./check_side_rows"
 import { idShadowSpec } from "./emit_id_shadow"
@@ -8593,9 +8593,11 @@ function monoKeyPinSeg(
       pk = pk + 1
       continue
     }
+    const anon = if unionPin || monoPinExactFree(exact, pinTys[pk]) { "" } else { monoAnonPinDiscrim(pinTys[pk], if pk < pinOwn.length { pinOwn[pk] } else { -1 }) }
+    if anon != "" { canonKeyShadowNote(heads[pk], pinTys[pk]) }
     seg = seg
       + heads[pk]
-      + (if unionPin || monoPinExactFree(exact, pinTys[pk]) { "" } else { monoAnonPinDiscrim(pinTys[pk], if pk < pinOwn.length { pinOwn[pk] } else { -1 }) })
+      + anon
       + monoSetPinDiscrim(pinTys[pk])
       + (if unionPin { "" } else { monoLitUnionPinDiscrim(pinTys[pk]) })
       + ","
@@ -15333,7 +15335,17 @@ function monoPinObjFields(
       while k < o.objFieldNames.length && o.objFieldNames[k] != f.fiName {
         k = k + 1
       }
-      // A field holding a tagged set keeps it: its literal and its reads store the set's ids.
+      // A field holding a tagged set keeps it: its literal and its reads store the set's ids. Its
+      // value may hold the set where the record's own type does not: a literal the tag decision
+      // re-typed at the binding it is written into.
+      if (
+        k < tys.length
+        && !fnTagHoldsTy(tys[k])
+        && fnTagHoldsTy(nodeTyIxOf(f.fiValue))
+      ) {
+        tys[k] = nodeTyIxOf(f.fiValue)
+        any = true
+      }
       if k < tys.length && fnTagHoldsTy(tys[k]) { keptTag = true }
       if k < tys.length && monoTyOpen(tys[k]) && !fnTagHoldsTy(tys[k]) {
         let path = f.fiName
@@ -15491,6 +15503,32 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
     return st
   }
   const lit = nodeAt(vx)
+  // A list of lists of functions pins its inner lists from every element they hold, each inner
+  // list and the field typed with that (D16915).
+  if lit is ArrayLit && tyAt(et) is TyArray {
+    const lf2: i32[] = [ctx, at]
+    const ivals: i32[][] = []
+    const inners: i32[] = []
+    for e in lit.arrElems {
+      const ix = unwrapParen(e)
+      if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is ArrayLit) {
+        return -1
+      }
+      inners.push(ix)
+      const inner = nodeAt(ix)
+      if inner is ArrayLit {
+        for ie in inner.arrElems { ivals.push([ie, ctx]) }
+      }
+    }
+    if ivals.length == 0 { return -1 }
+    const ft = monoStoredSlotFnTy(lf2, monoSlotPath(fld, ["e", "e"]), ivals)
+    if ft < 0 { return ft }
+    const it = mkArrayTy(ft)
+    for ix in inners { nodeTyRecord(ix, it) }
+    const lnt = if st >= 0 { st } else { mkArrayTy(it) }
+    nodeTyRecord(vx, lnt)
+    return lnt
+  }
   if !(lit is ArrayLit) || !(tyAt(et) is TyFunc) { return -1 }
   const lf: i32[] = [ctx, at]
   const vals: i32[][] = []
@@ -19462,6 +19500,12 @@ function monoElabPin(
   if !monoTyOpen(nodeTyIxOf(x)) {
     const cn = monoClosedTyName(t)
     if cn != "" { return cn }
+    // A closed function whose type has no spelled name (an anonymous record result) is pinned by
+    // its signature key, as an open one delivered here is (D16890).
+    if tyAt(t) is TyFunc {
+      const csk = sigKeyOfTy(t)
+      if csk != "" { return "=>" + csk }
+    }
     if tyMayHoldFn(t) || tyHoldsObj(t, 8) || tyIsUnionish(t) { return "" }
     return monoI32AtomPinName(t)
   }

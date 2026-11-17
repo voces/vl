@@ -1786,6 +1786,7 @@ function ftScan(
       const rw = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
       if ftHolds(x, s) && rw is BinExpr && ftIsStore(rw) && rw.binLeft == x {
         const wls: i32[] = []
+        const soleLits: i32[] = []
         tailValueLeaves(rw.binRight, wls)
         // A read of a binding read nowhere else writes its initialiser's literals (D15308).
         let wi = 0
@@ -1796,22 +1797,35 @@ function ftScan(
           let fw = false
           for b in bl {
             if recAsgFnWidenedTy(parenPeelIx(b)) >= 0 { fw = true }
+            // A record literal only this write reads, of another set, is stored here whole: its
+            // fields hold this binding's ids too.
+            if ftSoleRecLitOther(b, nodeTyIxOf(x)) { fw = true }
           }
           if fw {
             ftWrittenSourceAt(wls[wi], nodeTyIxOf(x))
-            for b in bl { wls.push(b) }
+            for b in bl {
+              wls.push(b)
+              if ftSoleRecLitOther(b, nodeTyIxOf(x)) {
+                soleLits.push(parenPeelIx(b))
+              }
+            }
           }
           wi = wi + 1
         }
         for wl in wls {
           const wx = parenPeelIx(wl)
+          // A record binding read elsewhere too keeps its own row, which a write of it here
+          // cannot re-type: the set stays a closure where that record's differs (D16919).
+          if ftRecSourceKeepsRow(wx, nodeTyIxOf(x)) { return false }
           if (
-            (recAsgFnWidenedTy(wx) >= 0 || ftStoredAt(wx, s))
+            (recAsgFnWidenedTy(wx) >= 0
+              || ftStoredAt(wx, s)
+              || i32ListHas(soleLits, wx))
             && !ftRecWriteJoins(wx, nodeTyIxOf(x), s, ds, leaves, ids)
           ) {
             return false
           }
-          if ftStoredAt(wx, s) {
+          if ftStoredAt(wx, s) || i32ListHas(soleLits, wx) {
             ftStoreLits.push(wx)
             ftStoreLitTys.push(nodeTyIxOf(x))
           }
@@ -2896,6 +2910,63 @@ function ftWrittenSourceAt(v: i32, t: i32): boolean {
     hops = hops + 1
   }
   return true
+}
+
+// Whether the value `wx` written whole into a record binding of type `t` is a read of a record
+// binding no single write owns (`cwSoleReadInit` answers none) holding another function set at a
+// field `t` holds one at.
+function ftRecSourceKeepsRow(wx: i32, t: i32): boolean {
+  if (
+    wx < 0
+    || wx >= P.nodes.length
+    || !(nodeAt(wx) is Ident)
+    || cwSoleReadInit(wx) >= 0
+  ) {
+    return false
+  }
+  return ftRecFieldSetsDiffer(nodeTyIxOf(wx), t)
+}
+
+// Whether record type `at` holds another function set than record type `t` at a field `t` holds
+// one at, each field's lists peeled.
+function ftRecFieldSetsDiffer(at: i32, t: i32): boolean {
+  const a = if at >= 0 && at < T.tys.length { tyAt(at) } else { null }
+  const b = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if !(a is TyObj) || !(b is TyObj) { return false }
+  let i = 0
+  while i < b.objFieldNames.length {
+    const j = strListIndexOf(a.objFieldNames, b.objFieldNames[i])
+    const bs = fnTagSetOfTy(ftListLeafOf(b.objFieldTypes[i]))
+    if (
+      j >= 0
+      && bs >= 0
+      && fnTagSetOfTy(ftListLeafOf(a.objFieldTypes[j])) != bs
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `b` is a record literal holding another function set than record type `t` at a field.
+function ftSoleRecLitOther(b: i32, t: i32): boolean {
+  const bx = parenPeelIx(b)
+  if bx < 0 || bx >= P.nodes.length || !(nodeAt(bx) is ObjLit) { return false }
+  return ftRecFieldSetsDiffer(nodeTyIxOf(bx), t)
+}
+
+// Type `t` with every list level peeled.
+function ftListLeafOf(t: i32): i32 {
+  let c = t
+  const seen: i32[] = []
+  while c >= 0 && c < T.tys.length && !i32ListHas(seen, c) {
+    const a = tyAt(c)
+    if !(a is TyArray) || tyElemOpen(a) { return c }
+    seen.push(c)
+    c = tyElemOf(a)
+  }
+  return c
 }
 
 // Splits join `x` into the joins it is made of, `sp`, and the values they hand on, `vs`: the arms
