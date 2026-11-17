@@ -33,8 +33,8 @@ values.
 
 | bar | reading |
 |---|---|
-| self-build | fixpoint; the armed self-build is byte-identical, with the 3 mismatches F1 already reports (A1's 2 and `armAdopt`'s) |
+| self-build | fixpoint; the armed self-build is byte-identical, with 0 mismatches (6,640 covered, 6,640 matched) |
 | corpus identity against the F1 seed | 12,294 cells: 9,016 identical, 3,278 fail under both, 0 differ |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,640 claimed and byte-identical, with F1's 3 fallbacks; corpus 9,016 identical, 0 differ, 0 fell back |
-| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 94,511,609,272 to 94,513,013,736 (+0.001%) |
-| seed size, F1 seed to this one | 6,550,824 to 6,550,870 (+46) |
+| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,640 claimed and byte-identical, 0 fell back; corpus 9,016 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | F1 94,526,000,660 to 94,521,775,321 (−0.004%) |
+| seed size, F1 seed to this one | 6,551,130 to 6,551,176 (+46) |
