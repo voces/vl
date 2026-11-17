@@ -347,22 +347,27 @@ Deno.test({
   },
 });
 
-// An operand written while a valued `if`'s value waits on the stack would land above it: the
-// lowering names that rather than writing its arguments out of order.
+// Legacy writes a short-circuit argument's `if` in place, above the arguments before it, whether
+// they are locals, globals or temps: the builder names that rather than lowering it out of order.
 Deno.test({
-  name: "ir shadow: an operand above a valued if's value is a named miss, not a byte mismatch",
+  name: "ir shadow: a short-circuit argument after another is a named miss, not a fallback",
   ignore,
   fn: () => {
-    const src = `function pair(a: i32, b: boolean): i32 { return if b { a } else { 0 - a } }
+    const src = `let g: i32[] = [1]
+function pair(a: i32, b: boolean): i32 { return if b { a } else { 0 - a } }
+function h(a: i32[], b: boolean): i32 { return a.length + pair(1, b) }
 function k(a: i32, c: boolean, d: boolean): i32 {
   const r = pair(a, c && d)
   return r
 }
-print(k(2, true, false))
+function f(x: boolean, y: boolean): i32 { return h(g, x || y) }
+function f2(x: boolean, y: boolean): i32 { return h([1], x && y) }
+print(k(2, true, false) + f(true, false) + f2(false, true))
 `;
     const { rows } = run(src, true);
-    const want = "mismatch unlowered: operand above a valued if's value";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    const want = "uncovered short-circuit argument after another";
+    if (rows.get(want) !== 3) throw new Error(`want three "${want}" rows, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
