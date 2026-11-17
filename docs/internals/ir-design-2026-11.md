@@ -729,19 +729,23 @@ lowering through the op seam (§5.2) instead of its own ladder. A slice therefor
 occurrence counts quoted. Families still behind an unshared decision wait for that decision to
 become shared, and they do not count as "fully matched" before then.
 
-**Claiming is parked until it pays.** Whole-function claiming (CLAIMED at the function seam)
-deletes nothing on its own, because unclaimed functions keep the legacy drivers alive. It also
-costs fuel: +0.021% for claiming {scalar, control, call, global}, because the IR's build plus
-lowering is slightly dearer than legacy's direct emit. So CLAIMED stays empty until one of two
-things holds:
-- a claim lets a family's or a driver's legacy path delete;
-- the builder is fuel-neutral, which a builder cost profile measures.
-
-Until then, cutover slices go through the op seam, starting with C1: the shared scalar opcode
-table, with the legacy ladders deleted. The armed gate's claim test mode keeps re-proving the
-claim evidence on every merge. The first PR that makes CLAIMED non-empty adds a blocking
-unarmed row that asserts zero `claim fell back`, with a verifier fallback counted as a hard
-failure.
+**Claiming is on (2026-11-17).** `CLAIMED` holds scalar, control, call, global and map, so a
+function built wholly of those families ships the IR's bytes and legacy does not run for it.
+Claiming was parked while it deleted nothing; it was turned on because the IR shipping is the
+goal. Its cost is +0.67% L2 fuel, because the IR builds every function to decide its claim; it was
+accepted with a rebaseline (ledger #8947). The follow-up that pays it back builds only functions a
+cheap pre-scan says could claim. Deletions follow as the claimed share
+grows: once every function that reaches a legacy driver is claimed, that driver deletes. The
+armed shadow still checks the unclaimed functions. The blocking unarmed `ir claims` gate row
+(`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back`, with a verifier
+fallback counted as a hard failure, so a lowering regression cannot hide behind legacy's bytes.
+A coverage step now widens what ships; it quotes the claimed counts beside its coverage.
+Op-seam slices still delete legacy ladders, starting with C1, the shared scalar opcode table.
+The builder leaves a construct nested deeper than `IR_NEST_MAX` (200) to legacy, because the
+IR's builder, verifier and lowering recurse where legacy loops along a chain's spine (D1990).
+**This is a prerequisite for I8:** before legacy's statement lowering deletes, the IR's passes must loop along
+`siElse` and the `match` and if-expression spine, `IR_NEST_MAX` must be deleted, and `ir_build.vl`'s
+`walk-limit` baseline must go back to 0.
 
 **A coverage step is graded on coverage, not lines.** Some steps widen what the builder covers
 where legacy has no IR duplicate to delete, so they cannot be net-negative in lines. An example is
@@ -776,9 +780,9 @@ shadow runs legacy first, so such a predicate answers correctly there and stale 
 `strAssignInPlace` read the accumulator scan that `emitFuncBody` runs, and now runs it itself for a
 function legacy has not lowered; mode 3 found it. An audit of every predicate the builder and
 lowering import (C2i) found no other: each reads pre-pass, checker or rep state, state it sets and
-restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes. One
-caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
-previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
+restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes.
+`emitResetScopeFrames` runs above the claim and again before legacy's body, so a claimed function's
+lowering starts from empty scope and loop frames, and so does legacy after a lowering fallback.
 I8a's tail reads no seat: `numWidenTail` asks `numFloorWhy`, which compares the node with
 `coerceHeld`, set and restored around one legacy conversion and so -1 wherever the IR asks, and
 `exprReadsDeadNever`, which reads the tree and the checker's types.

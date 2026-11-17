@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **D1981 closed: every container of vectors runs.** `F32x4[] | null` is the flat `v128` list wrapper in a nullable slot (`nulv128list`), which also carries a map whose value is a vector list (`{[string]: F32x4[]}`), `(F32x4[] | null)[]` and a nullable vector-list record field. The checker's container-of-vector refusal is deleted. A generic `T != null` at `T = F32x4[]` no longer asks whether the list is equatable: a null test compares no fields. D16943 files the one face left, a vector list as a value-union member (`F32x4[] | string`), which builds an invalid module.

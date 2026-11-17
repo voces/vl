@@ -14,6 +14,15 @@ function inc(a) { return a + 1 }
 print(id(3))
 print(id("s"))
 print(twice(inc, 4))
+function app(f, x) { return f(x) }
+print(app(inc, 4))
+function dbl(a) { return a * 2 }
+function sw(h) {
+  let hh = h
+  hh = dbl
+  return hh(1)
+}
+print(sw(inc))
 `;
 
 async function checkCodegen(
@@ -84,6 +93,27 @@ Deno.test({
     if (!m || Number(m[1]) < 3) {
       throw new Error(
         `want at least 3 equal keys (id twice, twice), got:\n${summary[0]}`,
+      );
+    }
+    // The storage shadow (B0): `app(inc, 4)` hands `{inc}` to a hole parameter called at `i32`, a
+    // row whose key closes and whose call is closed.
+    const storage = rows.filter((l) => l.includes(": storage summary "));
+    const sm = storage.length === 1
+      ? storage[0].match(/rows=(\d+) complete=(\d+)/)
+      : null;
+    if (!sm || Number(sm[1]) < 1 || Number(sm[2]) < 1) {
+      throw new Error(
+        `want one storage summary with a complete row, got:\n${
+          storage.join("\n")
+        }`,
+      );
+    }
+    // The written-binding join (B1): `hh` in `sw(inc)` holds `{inc, dbl}`, as the elaboration's.
+    const seed = rows.filter((l) => l.includes(": seed summary "));
+    const em = seed.length === 1 ? seed[0].match(/equal=(\d+)/) : null;
+    if (!em || Number(em[1]) < 1) {
+      throw new Error(
+        `want one seed summary with an equal join, got:\n${seed.join("\n")}`,
       );
     }
   },

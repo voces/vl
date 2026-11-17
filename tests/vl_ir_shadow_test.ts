@@ -104,7 +104,9 @@ Deno.test({
       throw new Error(`want every covered function to match legacy's bytes, got ${matched} of ${covered}`);
     }
     const plain = run(COVERED, false);
-    if (plain.rows.size !== 0) throw new Error(`want no rows unarmed, got ${plain.rows.size}`);
+    // Unarmed, the shipped claim records only its `claimed` rows; nothing else, and no fallback.
+    const other = [...plain.rows.keys()].filter((k) => k !== "claimed");
+    if (other.length !== 0) throw new Error(`want only claimed rows unarmed, got ${other.join(", ")}`);
     if (plain.out.length !== armed.out.length || plain.out.some((b, i) => b !== armed.out[i])) {
       throw new Error(`want byte-identical output armed and unarmed (${plain.out.length} vs ${armed.out.length} bytes)`);
     }
@@ -456,6 +458,33 @@ Deno.test({
     const plain = run(COVERED, false);
     if (plain.out.length !== claimed.out.length || plain.out.some((b, i) => b !== claimed.out[i])) {
       throw new Error(`want byte-identical output claimed and not (${plain.out.length} vs ${claimed.out.length} bytes)`);
+    }
+  },
+});
+
+// The shipped claim (`CLAIMED`, report-only mode 5): a covered function ships the IR's bytes, which
+// match legacy's (armed, legacy always runs); a verifier failure on the claim path falls back to
+// legacy and is counted, which the gate's `ir claims` row reds on.
+Deno.test({
+  name: "ir claim: the shipped claim emits legacy's bytes, and a broken claim falls back loudly",
+  ignore,
+  fn: () => {
+    const shipped = run(COVERED, 5);
+    if (shipped.rc !== 0) throw new Error(`want compileSrc rc 0, got ${shipped.rc}`);
+    const n = shipped.rows.get("claimed") ?? 0;
+    if (n < 6) throw new Error(`want at least 6 claimed, got ${JSON.stringify([...shipped.rows])}`);
+    const fell = [...shipped.rows.keys()].filter((k) => k.startsWith("claim fell back"));
+    if (fell.length > 0) throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
+    const legacy = run(COVERED, 1);
+    if (legacy.out.length !== shipped.out.length || legacy.out.some((b, i) => b !== shipped.out[i])) {
+      throw new Error(`want the shipped claim byte-identical to legacy (${legacy.out.length} vs ${shipped.out.length} bytes)`);
+    }
+    const broken = run(COVERED, 5, 1);
+    if ((broken.rows.get("claim fell back: verifier") ?? 0) < 1) {
+      throw new Error(`want a verifier fallback under the control, got ${JSON.stringify([...broken.rows])}`);
+    }
+    if (broken.out.length !== legacy.out.length || broken.out.some((b, i) => b !== legacy.out[i])) {
+      throw new Error(`want a fallen-back claim to ship legacy's bytes`);
     }
   },
 });

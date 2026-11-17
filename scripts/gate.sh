@@ -400,6 +400,8 @@ fi
 # bytes and spans, and any verifier failure or mismatch class above
 # `ir-shadow-baseline.txt` reds. The shadow is the check behind every IR claim.
 run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED"
+# The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
+run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
 
 echo "== $((${#CMDS[@]})) rows, at most $([ "$GATE_MAX_PAR" = 0 ] && echo all || echo "$GATE_MAX_PAR") at once, memory budget $([ "$GATE_MEM_BUDGET_MB" = 0 ] && echo none || echo "${GATE_MEM_BUDGET_MB} MiB") =="
 dispatch

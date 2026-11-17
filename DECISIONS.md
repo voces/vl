@@ -12652,9 +12652,11 @@ instantiation vector answers that once, for all classes.
 ## An un-instantiated function's hole parameters close at check to the hole default (2026-11-17, chosen under the owner's delegation) — D16898
 
 **The rule.** A hole parameter of an un-annotated function that no call instantiates closes at check
-to the default the language already gives an unconstrained hole: `i32`, or the flush default for an
-operator-constrained hole. A call counts whether it is direct or reaches the function through a slot or
-value it flows into; when such a call exists, its type decides the instance and the default never applies.
+to the default the language already gives an unconstrained hole: `i32`; a body that does not check at
+it is never built (amended 2026-11-17, D16927: the flush has no operator-constrained default, and
+T9.5's `tag` example stores such a function). A call counts whether it is direct or reaches the
+function through a slot or value it flows into; when such a call exists, its type decides the
+instance and the default never applies.
 
 **Why.** It is the same rule an empty container's open element follows (`i32` list element, `string` set
 element or map key), and it makes mono's former accidental default a stated rule that check can see.
@@ -12706,6 +12708,12 @@ for an order dependence that loses no `runs`.
 
 ## Rulings of 2026-11-17 (night)
 
+- **IR claiming is on (2026-11-17, coordinator, owner goal "implement IR").** The fully matched
+  families (scalar, control, call, global, map) ship the IR's bytes. The parking ruled earlier the
+  same day is reversed: shipping is the goal. The claim costs +0.67% L2 (the IR builds every function
+  to decide its claim), accepted with a rebaseline (ledger #8947). A blocking `ir claims` gate row
+  asserts zero fallbacks. Legacy deletions follow as the claimed share grows (design §10).
+
 - **A1 keys a fresh literal at its contextual type;** the edge coercion applies only to a non-fresh value, and
   D965's no-implicit-container-copy stands. A lambda passed to a generic builds its fresh result literals at
   the bound result once the call binds `T` (TS's two-phase inference), but only when every value it returns
@@ -12729,3 +12737,22 @@ for an order dependence that loses no `runs`.
   unrolled and map walks) later; every other shape is a named miss.
 - **The self-compile fuel baseline was rewritten at 94.79G (#8914):** the accumulated drift of many merges
   each under the tier, with no single mechanism; a lane grades its own delta.
+
+## Storage is decided per (KeyId, parameter), and the written-binding join moves to check (2026-11-17, chosen under the owner's delegation) — STORE B0–B3
+
+**The rule.** A function-holding parameter's storage (`RDirect`, `RSetId`, `RClosure`) is decided once, at
+check, per instance key and parameter; a set's tag is derived from those rows. Three rulings stand with it:
+- **The written-binding join moves to check.** The join of a parameter's set and the writes to a binding it
+  seeds is computed per key at check (B1). It is a shadow only until B3, which deletes the elaboration's join
+  (`mintSeedNote`), so storage has one producer after B3. This reverses the 2026-11-16 ruling against a
+  check-time join of a written binding. The context-insensitive slot store ruling still holds for
+  non-generic code; storage enters the key at decision time, so nothing is re-keyed after settling.
+- **Order:** B0 (shadow) → B1 (the join at check) → B2 (the decider reads rows where every key agrees) → B3
+  (storage in the instance key; `fnTagRedecide`, the elaboration's tag rounds and the mint tables' tag
+  readers deleted). The N rows' producer gaps are scheduled from B0's table and close before B3.
+- **A call edge between rows that disagree converts `RSetId` → `RClosure` only**, never the reverse, so the
+  decision is a fixpoint monotone toward `RClosure`.
+
+**Why.** Every late class but the producer gap needs a fact keyed by instance (G's two instantiations, S's
+join, T's lambda and generic bodies); one bit per set cannot hold it, and a second decider after the
+elaboration is what the per-row decision removes. Design: `refactor-notes/2026-11-17-store-storage-per-key-param-design.md`.

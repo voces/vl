@@ -1,7 +1,7 @@
 import { asgNameWiderRow, cloRetValSlot, sTwinRepOf } from "./emit_classify"
 import { isBlockBody } from "./block_body"
 import { lexOpcode, primOpcode } from "./ir"
-import { identityBinIsMixed } from "./emit_fn_scans"
+import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
   sharedFieldArmNulListKind,
@@ -488,8 +488,10 @@ import {
   RLK_STR_LIST,
   RLK_U8_LIST,
   RLK_UNION,
+  RLK_V128_LIST,
   SYNTH_CLOSURE,
   SYNTH_EMPTY_BACKING,
+  V128_LIST_KIND,
   VKind,
   aTy,
   armFieldElemSame,
@@ -884,6 +886,7 @@ import {
   fbStructNew,
   fbStructSet,
   fbUnreachable,
+  fbV128ConstZero,
   fbValtype,
   fbValtypeNullable,
   lbBack,
@@ -1411,6 +1414,7 @@ import {
 } from "./emit_nullable_rets"
 import {
   armRowSharedAtRecv,
+  armRowSharedMembers,
   atomNarrowOp,
   boxNarrowAtomFor,
   boxWidenAtomFor,
@@ -1825,13 +1829,13 @@ export function capCacheBuild() {
   return 0
 }
 
-// The scalar element kind (`"f64"`/`"i64"`/`"f32"`) of an mv map-value slot whose value
+// The scalar element kind (`"f64"`/`"i64"`/`"f32"`/`"v128"`) of an mv map-value slot whose value
 // is a non-i32 scalar, else null (a ref value rides the nullable valStash instead). The
 // chokepoint the map get/set/push consult to branch scalar-store vs ref-store.
 function mvScalarValKind(slot: i32): VKind | null {
   if slot < 0 || slot >= mvValRep.length { return null }
   const k = mvValRep[slot].mrKind
-  if k == "f64" || k == "i64" || k == "f32" { return k }
+  if k == "f64" || k == "i64" || k == "f32" || k == "v128" { return k }
   return null
 }
 
@@ -1918,7 +1922,7 @@ export function scalarListUsed(elemKind: VKind) {
       return true
     }
     // No other kind is a scalar list element, so its list types are never collected.
-    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {}
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" => {}
   }
   return false
 }
@@ -1958,7 +1962,7 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
   const k = fieldRowKind(r)
   if k == null { return -1 }
   match k {
-    "nulstr" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
+    "nulstr" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
       fbRefNullForKind(
         k,
         if k == "nulu8list" { fieldRowPackedRow(r) } else { -1 },
@@ -2129,7 +2133,7 @@ function emitStructFieldValueUnder(si: i32, fi: i32, valIx: i32, fnIx: i32) {
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       // An atom or atom-array field lowers its members as interned ids; the litunion context
       // keeps each string-lexeme element from building a string list.
       if emitExpr(valIx, fnIx) < 0 { return -1 }
@@ -2808,7 +2812,7 @@ function emitVariantFieldValueUnder(vi: i32, fj: i32, valIx: i32, fnIx: i32) {
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       if emitExpr(valIx, fnIx) < 0 { return -1 }
     }
   }
@@ -3002,7 +3006,7 @@ function emitScalarFieldStoreVal(valIx: i32, fnIx: i32, k: VKind | null) {
       if exprIsLitAtom(valIx, fnIx) { return emitStrValue(valIx, fnIx) }
       return emitExpr(valIx, fnIx)
     }
-    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return emitExpr(valIx, fnIx)
     }
   }
@@ -4466,7 +4470,9 @@ function emitNulIsNullTest(
       if !invert { fbI32Eqz() }
       return 1
     }
-    return -1
+    return emitFail(
+      "emitProgram: internal: a map null test whose operand is no index read",
+    )
   }
   if arm == "boxTag" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
@@ -4899,12 +4905,18 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   // A field narrowed to a type rather than a literal set is tested by its box's arm tags.
   const fieldTags: i32[][] = []
+  // A field narrowed to a record type is tested field by field (`emitRecordValueFits`).
+  const fieldNested: boolean[] = []
   let fk = 0
   while fk < names.length {
     const k = fk
     fk = fk + 1
     const ft: i32[] = []
-    if tyLitSetMemberLexes(sets[k]).length == 0 {
+    const nested = rows[k] >= 0
+      && fieldRowIsRecordRef(rows[k])
+      && tyAt(sets[k]) is TyObj
+    fieldNested.push(nested)
+    if !nested && tyLitSetMemberLexes(sets[k]).length == 0 {
       const vis: i32[] = []
       if (
         !fieldRowIsUnionBox(rows[k])
@@ -4931,6 +4943,24 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   let k = 0
   while k < names.length {
+    if fieldNested[k] {
+      const nsi = if si >= 0 { sFieldTgtStructIdx(si, fis[k]) } else { sFieldTgtStructIdx(variantRowOf(vi), fis[k]) }
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        if si >= 0 { sFieldStorageSlot(si, fis[k]) } else { uFieldStorageSlot(vi, fis[k]) },
+      )
+      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if nullable && !staged { fbRefAsNonNull() }
+      fbStructGet(heap, fis[k])
+      fbLocalSet(nslot)
+      if emitRecordValueFits(nsi, nslot, sets[k], fnIx) < 0 { return -1 }
+      if k > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      k = k + 1
+      continue
+    }
     if fieldTags[k].length > 0 {
       // The box ref itself may stand for `null`; a null held in the box is its own arm's tag.
       if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
@@ -5196,6 +5226,7 @@ function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
       else if k == depth - 1 && ek == RLK_F64_LIST { kind = "f64list" }
       else if k == depth - 1 && ek == RLK_I64_LIST { kind = "i64list" }
       else if k == depth - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+      else if k == depth - 1 && ek == RLK_V128_LIST { kind = "v128list" }
       else if k == depth - 1 && ek == RLK_U8_LIST { kind = "u8list" }
       else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
       k = k + 1
@@ -5299,6 +5330,7 @@ function emitListEmptyFitArms(isIx: i32, fnIx: i32, recvTy: i32): i32 {
         else if k == depths[i] - 1 && ek == RLK_F64_LIST { kind = "f64list" }
         else if k == depths[i] - 1 && ek == RLK_I64_LIST { kind = "i64list" }
         else if k == depths[i] - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+        else if k == depths[i] - 1 && ek == RLK_V128_LIST { kind = "v128list" }
         else if k == depths[i] - 1 && ek == RLK_U8_LIST { kind = "u8list" }
         else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
         k = k + 1
@@ -6267,6 +6299,159 @@ function emitVariantDiscrimTest(recvIx: i32, vi: i32, fnIx: i32) {
   return 0
 }
 
+// ANDs onto the shared-row fit of `recv is xTy` the literal sets of each nested record field
+// another member stored at row `vi` declares as another record type (D16939); the tag and the
+// top-level fields cannot tell those members apart.
+function emitSharedNestedFits(
+  recv: i32,
+  vi: i32,
+  xTy: i32,
+  fnIx: i32,
+  slot: i32,
+): i32 {
+  if vi < 0 || vi >= uFieldCount.length || vi >= uFieldStart.length { return 0 }
+  if xTy < 0 || xTy >= T.tys.length { return 0 }
+  const xt = tyAt(xTy)
+  if !(xt is TyObj) { return 0 }
+  const mems = armRowSharedMembers(recv, vi)
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    const name = sFieldNames[uFieldStart[vi] + fi]
+    const fx = objFieldType(xt, name)
+    let differs = false
+    if (
+      fx >= 0
+      && tyAt(fx) is TyObj
+      && fieldRowIsRecordRef(uFieldStart[vi] + fi)
+    ) {
+      for m in mems {
+        const mo = tyAt(m)
+        if mo is TyObj {
+          const fm = objFieldType(mo, name)
+          if fm >= 0 && !tyEq(fm, fx) { differs = true }
+        }
+      }
+    }
+    if differs {
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        uFieldStorageSlot(vi, fi),
+      )
+      if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1)
+      fbRefCast(variantHeap(vi))
+      fbStructGet(variantHeap(vi), fi)
+      fbLocalSet(nslot)
+      const nsi = sFieldTgtStructIdx(variantRowOf(vi), fi)
+      if emitRecordValueFits(nsi, nslot, fx, fnIx) < 0 { return -1 }
+      fbI32Bin(113) // i32.and
+    }
+    fi = fi + 1
+  }
+  return 0
+}
+
+// Leaves 1 when the record in local `rslot`, stored at struct row `si`, is a value of record type
+// `xTy`: every literal set `xTy` declares holds a member, every box field holds a member whose tag
+// is one of the field's, and every nested record fits the same way. Other fields are not read.
+function emitRecordValueFits(si: i32, rslot: i32, xTy: i32, fnIx: i32): i32 {
+  if si < 0 || si >= sHeapIdx.length || xTy < 0 || xTy >= T.tys.length {
+    return emitFail(
+      "emitProgram: `is` reaches a nested record with no struct row",
+    )
+  }
+  const xt = tyAt(xTy)
+  if !(xt is TyObj) {
+    return emitFail(
+      "emitProgram: `is` reaches a nested field that is no record",
+    )
+  }
+  const heap = sHeapIdx[si]
+  let terms = 0
+  let i = 0
+  while i < xt.objFieldNames.length {
+    const fx = xt.objFieldTypes[i]
+    const fi = sFieldIndex(si, xt.objFieldNames[i])
+    const r = sFieldFlatRow(si, fi)
+    const lexes = tyLitSetMemberLexes(fx)
+    let wrote = true
+    if r < 0 {
+      wrote = false
+    } else if fieldRowIsUnionBox(r) {
+      if emitBoxFieldTagsIn(heap, rslot, fi, fx) < 0 { return -1 }
+    } else if fieldRowIsRecordRef(r) && tyAt(fx) is TyObj {
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        sFieldStorageSlot(si, fi),
+      )
+      fbLocalGet(rslot)
+      fbStructGet(heap, fi)
+      fbLocalSet(nslot)
+      if emitRecordValueFits(sFieldTgtStructIdx(si, fi), nslot, fx, fnIx) < 0 {
+        return -1
+      }
+    } else if lexes.length > 0 && nonNullTy(fx) == fx {
+      let li = 0
+      while li < lexes.length {
+        fbLocalGet(rslot)
+        fbStructGet(heap, fi)
+        if emitFieldLitEq(r, lexes[li], fnIx) < 0 { return -1 }
+        if li > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        li = li + 1
+      }
+    } else if lexes.length > 0 {
+      return emitFail(
+        "emitProgram: `is` over a nested literal set stored beside `null`",
+      )
+    } else {
+      wrote = false
+    }
+    if wrote {
+      if terms > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      terms = terms + 1
+    }
+    i = i + 1
+  }
+  if terms == 0 { fbI32Const(1) }
+  return 0
+}
+
+// Leaves 1 when box field `fi` of the record in local `rslot` (heap `heap`) holds a member of
+// `fx`, by its tag: each member of `fx` has one tag.
+function emitBoxFieldTagsIn(heap: i32, rslot: i32, fi: i32, fx: i32): i32 {
+  const mems: i32[] = []
+  flattenVariantsInto(fx, mems)
+  const tags: i32[] = []
+  for mm in mems {
+    const one: i32[] = []
+    const vis: i32[] = []
+    if !unionArmTagsOfTy(mm, -1, one, vis) || one.length != 1 {
+      return emitFail(
+        "emitProgram: `is` over a nested box field whose tested member has no one tag",
+      )
+    }
+    tags.push(one[0])
+  }
+  if tags.length == 0 { fbI32Const(0) }
+  let j = 0
+  while j < tags.length {
+    fbLocalGet(rslot)
+    fbStructGet(heap, fi)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, tags[j])
+    fbI32Bin(70)
+    if j > 0 { fbI32Bin(114) }
+    j = j + 1
+  }
+  return 0
+}
+
 // The member of the union `recvIx` holds that a tested map `patTy` names up to the order of its
 // value union's members or a nested Set's spelling, so the test reads that member's tag; `patTy`
 // itself when the union has it exactly, has no such member, or `patTy` is not a map (D2733).
@@ -6543,9 +6728,10 @@ function isTestsStorage(recvIx: i32, fnIx: i32): boolean {
 function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
-  // A list-union rewrite's test over closed arms asks which arm is stored: the tag alone.
+  // A list-union rewrite's test over closed arms asks which arm is stored: the tag alone, unless
+  // the arm has no tag of its own, as a numeric literal-union list sharing `i32[]`'s (D4770).
   const luT = luIsTyOf(isIx)
-  if luT >= 0 && !tyHasTyVar(luT) { return 0 }
+  if luT >= 0 && !tyHasTyVar(luT) && isArmTagOfTy(luT) >= 0 { return 0 }
   if isTestsNull(isIx) { return 0 }
   const chk = isVarTyIxOf(isIx)
   const tags: i32[] = []
@@ -7359,6 +7545,14 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
       ctSlot,
     )
     if sf < 0 { return -1 }
+    const nf = emitSharedNestedFits(
+      nd.isObj,
+      vi,
+      isVarTyIxOf(isIx),
+      fnIx,
+      ctSlot,
+    )
+    if nf < 0 { return -1 }
     fbElse()
     fbI32Const(0)
     fbEnd()
@@ -7712,6 +7906,31 @@ function emitArmFieldsFit(
       i = i + 1
       continue
     }
+    // A nested record only some of whose values fit is tested field by field, one level down.
+    if (
+      fi >= 0
+      && fieldRowIsRecordRef(uFieldStart[yi] + fi)
+      && tyAt(fys[i]) is TyObj
+      && tyAt(fxs[i]) is TyObj
+    ) {
+      const nsi = sFieldTgtStructIdx(variantRowOf(yi), fi)
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        uFieldStorageSlot(yi, fi),
+      )
+      if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1)
+      fbRefCast(variantHeap(yi))
+      fbStructGet(variantHeap(yi), fi)
+      fbLocalSet(nslot)
+      if emitRecordValueFits(nsi, nslot, fxs[i], fnIx) < 0 { return -1 }
+      if i > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      i = i + 1
+      continue
+    }
     if fi < 0 || !fieldRowIsUnionBox(uFieldStart[yi] + fi) {
       return emitFail(
         "emitProgram: `is` across record arms whose shared field holds a value only some of which fit, outside a union box",
@@ -7719,38 +7938,81 @@ function emitArmFieldsFit(
     }
     const yes: i32[] = []
     const no: i32[] = []
+    // A scalar member only some of whose values fit: its tag and its atom kind.
+    const partTags: i32[] = []
+    const partKinds: i32[] = []
     const mems: i32[] = []
     flattenVariantsInto(fys[i], mems)
     for mm in mems {
       const fk = tyFitKind(mm, fxs[i])
       const tags: i32[] = []
       const vis: i32[] = []
-      if fk == 2 || !unionArmTagsOfTy(mm, -1, tags, vis) || tags.length != 1 {
+      if !unionArmTagsOfTy(mm, -1, tags, vis) || tags.length != 1 {
         return emitFail(
-          "emitProgram: `is` across record arms whose shared field's box holds a member only some of whose values fit",
+          "emitProgram: `is` across record arms whose shared field's box holds a member with no one tag",
         )
       }
-      if fk == 1 { yes.push(tags[0]) } else { no.push(tags[0]) }
+      if fk == 2 {
+        const ak = scalarArmKindOfTy(mm)
+        if boxFitLexes(ak, fxs[i]).length == 0 {
+          return emitFail(
+            "emitProgram: `is` across record arms whose shared field's box holds a member only some of whose values fit, and they are not a literal set",
+          )
+        }
+        partTags.push(tags[0])
+        partKinds.push(ak)
+      } else if fk == 1 {
+        yes.push(tags[0])
+      } else {
+        no.push(tags[0])
+      }
     }
     for t in yes {
+      if i32ListHas(no, t) || i32ListHas(partTags, t) {
+        return emitFail(
+          "emitProgram: `is` across record arms whose shared field's box tags a fitting and a non-fitting member alike",
+        )
+      }
+    }
+    for t in partTags {
       if i32ListHas(no, t) {
         return emitFail(
           "emitProgram: `is` across record arms whose shared field's box tags a fitting and a non-fitting member alike",
         )
       }
     }
-    if yes.length == 0 { fbI32Const(0) }
+    if yes.length == 0 && partTags.length == 0 { fbI32Const(0) }
     let j = 0
     while j < yes.length {
-      if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1)
-      fbRefCast(variantHeap(yi))
-      fbStructGet(variantHeap(yi), fi)
+      if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
       fbStructGet(uBoxIdx, 0)
       fbI32Rel(RS_TAG, yes[j])
       fbI32Bin(70)
       if j > 0 { fbI32Bin(114) }
       j = j + 1
+    }
+    let pj = 0
+    while pj < partTags.length {
+      // The member's tag, then inside it its payload against the fitting literals.
+      if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 0)
+      fbI32Rel(RS_TAG, partTags[pj])
+      fbI32Bin(70)
+      fbIf(127)
+      const partLexes = boxFitLexes(partKinds[pj], fxs[i])
+      let lj = 0
+      while lj < partLexes.length {
+        if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
+        if emitUnionUnboxTail(partKinds[pj]) < 0 { return -1 }
+        if emitAtomLitEq(partKinds[pj], partLexes[lj], fnIx) < 0 { return -1 }
+        if lj > 0 { fbI32Bin(114) }
+        lj = lj + 1
+      }
+      fbElse()
+      fbI32Const(0)
+      fbEnd()
+      if j + pj > 0 { fbI32Bin(114) }
+      pj = pj + 1
     }
     if i > 0 {
       fbI32Bin(113) // i32.and
@@ -7759,6 +8021,62 @@ function emitArmFieldsFit(
   }
   if names.length == 0 { fbI32Const(1) }
   return 0
+}
+
+// The arm-`yi` payload's field `fi`, a union box, read off the receiver.
+function emitArmBoxField(
+  recv: i32,
+  yi: i32,
+  fi: i32,
+  fnIx: i32,
+  slot: i32,
+): i32 {
+  if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(variantHeap(yi))
+  fbStructGet(variantHeap(yi), fi)
+  return 0
+}
+
+// The literal members of `fx` a box payload of atom kind `ak` can equal: the quoted ones for a
+// string, the numeric ones for `i32`, `i64` or `f64`; none for any other kind.
+function boxFitLexes(ak: i32, fx: i32): string[] {
+  const out: string[] = []
+  if ak != 0 && ak != 2 && ak != 3 && ak != 4 { return out }
+  const ms: i32[] = []
+  flattenVariantsInto(fx, ms)
+  for m in ms {
+    const mt = tyAt(m)
+    if mt is TyLit {
+      if ak == 2 && mt.litKind == "str" { out.push(quoteLex(mt.litText)) }
+      if ak != 2 && mt.litKind == "int" { out.push(mt.litText) }
+    }
+  }
+  return out
+}
+
+// Compares the unboxed payload of atom kind `ak` on the stack with literal `lex`, leaving an i32.
+function emitAtomLitEq(ak: i32, lex: string, fnIx: i32): i32 {
+  if ak == 2 { return emitStrEqLit(mkStr(lex, -1), fnIx) }
+  if ak == 0 {
+    fbI32Const(parseI32(lex))
+    fbI32Bin(70) // 0x46 i32.eq
+    return 0
+  }
+  if ak == 3 {
+    const pr = parseI64Pair(lex)
+    fbI64Const(pr[0], pr[1])
+    fbI32Bin(81) // 0x51 i64.eq
+    return 0
+  }
+  if ak == 4 {
+    fbF64Const(lex)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  return emitFail(
+    "emitProgram: a box payload of this atom kind has no literal compare",
+  )
 }
 
 // The `string | null` read rule for a field of code `code`, shared by every struct and variant
@@ -7881,7 +8199,7 @@ function optChainLeafNulDisc(si: i32, fi: i32): i32 {
   const k = fieldRowKind(r)
   if k == null { return 0 }
   match k {
-    "nulstruct" | "nulvariant" | "nulstr" | "nulclosure" | "nullist" | "nulreflist" | "nulmap" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" => {
+    "nulstruct" | "nulvariant" | "nulstr" | "nulclosure" | "nullist" | "nulreflist" | "nulmap" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" => {
       return 1
     }
     "nulbool" => {
@@ -8001,7 +8319,7 @@ function optChainLeafRefHeap(si: i32, fi: i32): i32 {
     "f32list" | "nulf32list" => {
       return fl32Ty()
     }
-    "v128list" => {
+    "v128list" | "nulv128list" => {
       return fl128Ty()
     }
     "u8list" | "nulu8list" => {
@@ -8404,6 +8722,7 @@ function listWrapHeapOfKind(k: i32) {
   if k == 9 { return mkListTy() }
   if k == 10 { return il64Ty() }
   if k == 12 { return fl32Ty() }
+  if k == V128_LIST_KIND { return fl128Ty() }
   // The packed byte list rides the box's anyref as its own `{backing, len, cap}` wrapper like
   // the five above; only its backing's element is the packed `i8` storage type.
   // `vbU8ArmUsed` is the guard: `uAtomBandTop` lifts the slot bands off it, so a kind-13 tag
@@ -9380,6 +9699,8 @@ function emitUnionCoerceValueAtom(
           nlParam = true
         }
       }
+      // A call whose callee hands its result back as the niche holds the atom (D12466).
+      if nlArg is Call && exprNulLitUnion(exprIx, fnIx) { nlParam = true }
       if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
         return emitFail(
           "emitProgram: literal-union string widening with no members",
@@ -9489,6 +9810,8 @@ function coerceValueAtomKind(
     // classifies f64 (`exprF32Array` never claims it) — the `f64[]` → `f32[]`
     // re-encode below retargets it when only the f32 arm exists.
     cak = 12 // "f32[]"
+  } else if exprListRep(bareIx, fnIx) == "v128list" {
+    cak = V128_LIST_KIND
   } else if exprF64Array(bareIx, fnIx) {
     cak = 8 // "f64[]"
   } else if exprI64Array(bareIx, fnIx) {
@@ -10821,7 +11144,7 @@ function armDestHeapOf(kind: VKind, idx: i32): i32 {
       if idx < sHeapIdx.length { return sHeapIdx[idx] }
       return -1
     }
-    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "v128" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
+    "i32" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "v128" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
       // No heap type of its own at an arm destination: a scalar, a list wrapper, a map
       // or a closure reaches its rep through its own writer, never this table pair.
       return -1
@@ -12586,7 +12909,7 @@ function fbIfForOptLeaf(k: VKind) {
     "str" => {
       return fbIfRef(sTy()) // string header ref
     }
-    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return fbIf(127) // i32 / boolean
     }
   }
@@ -12605,7 +12928,7 @@ function emitOptLeafDefault(dIx: i32, k: VKind, fnIx: i32) {
     "f32" => {
       return emitWidened(dIx, 5, fnIx)
     }
-    "i32" | "v128" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       return emitExpr(dIx, fnIx)
     }
   }
@@ -13522,6 +13845,11 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
         const shAk = memReadCheckerAtomKind(memIx, fnIx)
         if shAk >= 0 { return emitUnionUnboxTail(shAk) }
         return emitUnionFieldNarrowUnbox(memIx, fnIx)
+      }
+      // A `string | null` read the checker typed past `null` recovers the non-null ref, as one
+      // record's read does (`emitNulStrFieldRecover`).
+      if shCode == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx) {
+        fbRefAsNonNull()
       }
       return 0
     }
@@ -14594,6 +14922,7 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
       && elemNest != RLK_I64_LIST
       && elemNest != RLK_REF_LIST
       && elemNest != RLK_F32_LIST
+      && elemNest != RLK_V128_LIST
       && elemNest != RLK_U8_LIST
       && !elemUnionBox
     ) {
@@ -15973,6 +16302,7 @@ function emitMapGetTail(recvIx: i32, fnIx: i32) {
     if mvValKindAt(mslot) == "f64" { fbF64Const("0") }
     else if mvValKindAt(mslot) == "i64" { fbI64Const(0, 0) }
     else if mvValKindAt(mslot) == "f32" { fbF32Const("0") }
+    else if mvValKindAt(mslot) == "v128" { fbV128ConstZero() }
     else { fbRefNull(mvValElemHeapOf(mslot)) }
     fbLocalSet(fnMvValStashLocal(mslot))
     fbEnd() // end
@@ -16050,7 +16380,10 @@ export function emitMapGetUnionBox(recvIx: i32, keyIx: i32, fnIx: i32) {
 // the four widths `mapReadScalarBoxKind` can answer with. Only those four: this is a
 // membership query against a union's rendered atoms, and every other code either has a
 // niche of its own (so it never reaches here) or is not a scalar at all.
-function scalarAtomNameOfKind(k: i32): string { return numPrimOfKind(k) ?? "" }
+function scalarAtomNameOfKind(k: i32): string {
+  if k == 14 { return "v128" }
+  return numPrimOfKind(k) ?? ""
+}
 
 // Lower a bare scalar-valued map read `m[k]` directly into the union box: the tag and
 // the payload are each chosen by their own conditional (two allocation sites, so
@@ -17014,6 +17347,8 @@ export function mapSetFuncType(sh: i32) {
     fbValtype("i64", -1)
   } else if mvValKindAt(sh) == "f32" {
     fbValtype("f32", -1)
+  } else if mvValKindAt(sh) == "v128" {
+    fbValtype("v128", -1)
   } else {
     fbRefNullValtype(mvValElemHeapOf(sh)) // the vals element
   }
@@ -25016,6 +25351,16 @@ function emitAsUnionOpt(
     fbEnd()
     return 0
   }
+  // A function arm's `F | null` is the nullable closure ref: the payload on the hit, a null.
+  if ak == 11 {
+    fbIfRefNul(cloStructIdx, true)
+    fbLocalGet(unionAsBoxSlot())
+    if emitUnionUnboxTail(ak) < 0 { return -1 }
+    fbElse()
+    fbRefNull(cloStructIdx)
+    fbEnd()
+    return 0
+  }
   if ak != 2 {
     return emitFail(
       "emitProgram: `as? "
@@ -26666,6 +27011,12 @@ let lmaValNode = -1
 let lmaValArg = -1
 let lmaCallerFn = -1
 
+// Whether a call of function `fi` may be inlined as a folded memory access under the
+// low-memory promise; `emitLowMemAccessorCall` decides the call itself. Legacy and the IR share it.
+export function lowMemFoldsCallee(fi: i32): boolean {
+  return gLowMemUnused > 0 && lmaAccessBody(fi) >= 0
+}
+
 // Under `gLowMemUnused`, a call `f(x + K, v)` of a trivial memory accessor (`lmaAccessBody`)
 // emits `f`'s body in place, its address as `wrap(x)` with K in the memarg, exactly as the
 // direct spelling `__load_i64__(x as% i32, K)` folds. 1 when the call does not qualify.
@@ -27922,7 +28273,7 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if fnNestUsed && captureCountOf(target) > 0 {
     return emitCapturedCall(callIx, fnIx, target)
   }
-  if gLowMemUnused > 0 {
+  if lowMemFoldsCallee(target) {
     const lmaRc = emitLowMemAccessorCall(callIx, fnIx, target)
     if lmaRc <= 0 { return lmaRc }
   }
@@ -28231,7 +28582,7 @@ function emitNonNullParamRecover(pk: VKind | null, argIx: i32, fnIx: i32) {
     "closure" => {
       if exprNulClosure(argIx, fnIx) { fbRefAsNonNull() }
     }
-    "i32" | "str" | "union" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
+    "i32" | "str" | "union" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
       // Scalars and atoms have no reference to recover, a nullable slot takes the value as
       // it is, and a union box or a `u8[]` is never narrowed into a bare heap slot.
     }
@@ -29490,7 +29841,7 @@ function emitStructFieldStoreValue(
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
       // A `K | null` niche field takes a member as its atom id and `null` as -1.
       if emitExpr(rhs, fnIx) < 0 { return -1 }
     }
@@ -29614,7 +29965,7 @@ function asgParkField(k: VKind | null, owner: i32) {
     "str" => {
       lk = "strlist"
     }
-    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
+    "struct" | "list" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" => {
       return asgParkNone()
     }
   }
@@ -30345,7 +30696,7 @@ function scalarPushScratchBaseOf(k: VKind, row: i32): i32 {
       return pkPushBase(row)
     }
     // Every other kind pushes through the i32 list's scratch.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {}
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" => {}
   }
   return pushScratchBase
 }
@@ -30365,7 +30716,7 @@ function scalarListUsedOf(k: VKind): boolean {
       return true
     }
     // Every other kind rides the i32 list, which mints on first read.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => {}
   }
   return true
 }
@@ -31465,7 +31816,7 @@ function scalarWidenConvOp(srcKind: VKind, dstKind: VKind): i32 {
           return 183
         }
         // No other destination is a lossless widening of i32.
-        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
       }
       return -1
     }
@@ -31475,11 +31826,11 @@ function scalarWidenConvOp(srcKind: VKind, dstKind: VKind): i32 {
           return 187
         }
         // No other destination is a lossless widening of f32.
-        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+        "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
       }
     }
     // No other source kind widens.
-    "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+    "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
   }
   return -1
 }
@@ -33657,6 +34008,15 @@ function fRetNulHeapOf(fe: i32): i32 {
   return nulScalarListWrapHeap(k, si)
 }
 
+// The padding a valued body `fnBody` of `fnIx` needs at its end: "" when it ends in a `return` or
+// tail value, "null" when the return bears null (a live fall-through), else "unreachable", since
+// the checker proved the fall-through dead. Legacy and the IR's lowering both ask it.
+export function fallThroughPadOf(fnBody: i32, fnIx: i32): string {
+  if bodyEndsInReturn(fnBody, fnIx) { return "" }
+  if fnRetNullBearing(fnIx) { return "null" }
+  return "unreachable"
+}
+
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the
 // stack as the function's result (the fall-through path's implicit `return null`). Each
 // arm mirrors the `NullLit` lowering for that rep; an unsupported rep fails loudly.
@@ -33996,7 +34356,7 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   }
   // A `const` every read copied the tree of is never read, and computing it would trap where
   // the copies do not (D15001).
-  if s.letInit >= 0 && lbiKeptDeclUnread(stmtIx) {
+  if keptDeclStoresNothing(s, stmtIx) {
     scopeBind(s.letName, slot)
     return 0
   }
@@ -35260,7 +35620,7 @@ function emitIfLinkStmt(s: IfStmt, fnIx: i32, open: i32[], tail: boolean) {
     // D932 — the skipped arm's `let`s still own their collect-allocated slots.
     cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
-  if s.ifElse >= 0 && isDeadArm(s.ifElse) {
+  if s.ifElse >= 0 && !ifWritesElse(s) {
     // The dead `else` arm: uncollected, so neither emitted nor counted (D16006).
   } else if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
@@ -36448,11 +36808,13 @@ function forInBackingOf(
     || ek == "f64list"
     || ek == "i64list"
     || ek == "f32list"
+    || ek == "v128list"
     || ek == "u8list"
     || ek == "nulstrlist"
     || ek == "nulf64list"
     || ek == "nuli64list"
     || ek == "nulf32list"
+    || ek == "nulv128list"
     || ek == "nulu8list"
     || ek == "closure"
     || ek == "nulclosure"
@@ -36544,6 +36906,7 @@ function forInElemRecovers(ek: VKind): boolean {
     || ek == "f64list"
     || ek == "i64list"
     || ek == "f32list"
+    || ek == "v128list"
     || ek == "u8list"
     || ek == "closure"
     || ek == "reflist"
@@ -36789,12 +37152,15 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     const t = listIsArmTag(m)
     const h = listArmHeapOf(m)
     const e = tyArrayElemIx(m)
-    const en = if e >= 0 { nonNullTy(e) } else { -1 }
+    // A numeric literal-union element is boxed at its base scalar's tag (D4770).
+    const en0 = if e >= 0 { nonNullTy(e) } else { -1 }
+    const nb = if en0 >= 0 { numLitUnionBaseTy(en0) } else { -1 }
+    const en = if nb >= 0 { nb } else { en0 }
     const ek = if en >= 0 { boxTagOfTy(en) } else { -1 }
     const scalar = ek >= 0 && !atomIsRefKind(ek)
     // An element that is itself a value box is stored as one and read as it is.
     const boxed = e >= 0 && valueBoxOfTy(e)
-    const nul = !boxed && en != e
+    const nul = !boxed && en0 != e
     let et = -2
     if !boxed { et = if en >= 0 { isArmTagOfTy(en) } else { -1 } }
     if (
@@ -38640,9 +39006,21 @@ function emitNumLitNode(e: NumLit, exprIx: i32, fnIx: i32) {
   return emitNumLexAt(numLitLexAt(exprIx, e.numText, w), w)
 }
 
-// The lexeme literal `ix`, spelled `text`, is lowered from at width `w`: a folded float tree used
-// at `f32` is its value in `f32` arithmetic, as it runs there (E9.1).
-function numLitLexAt(ix: i32, text: string, w: string): string {
+// Whether `const` declaration `s` at `stmtIx` builds no store: every read copied its kept tree, and
+// computing it would trap where the copies do not (D15001). Legacy and the IR share it.
+export function keptDeclStoresNothing(s: LetDecl, stmtIx: i32): boolean {
+  return s.letInit >= 0 && lbiKeptDeclUnread(stmtIx)
+}
+
+// Whether `if` statement `s` writes an `else`: it has one and the checker did not find it dead.
+// Legacy and the IR share it.
+export function ifWritesElse(s: IfStmt): boolean {
+  return s.ifElse >= 0 && !isDeadArm(s.ifElse)
+}
+
+// The lexeme a numeric literal `ix` is written at width `w`: an f32 constant tree folds to its own
+// f32 lexeme (`cexF32LexOf`), every other literal is its source text. Legacy and the IR share it.
+export function numLitLexAt(ix: i32, text: string, w: string): string {
   if w != "f32" { return text }
   const l32 = cexF32LexOf(unwrapParen(ix))
   return if l32 != "" { l32 } else { text }
@@ -39616,11 +39994,7 @@ function luOvLocalOf(ix: i32): i32 {
 // The scratch local an arm `m`'s unboxed list is held in, typed at its wrapper, or -1 for a
 // list kind with none.
 function luArmWrapLocal(m: i32): i32 {
-  if unMemIsRefElemArray(m) {
-    const rs = unMemRefArrArmSlot(m)
-    if rs < 0 { return -1 }
-    return scratchSlot(46, "reflist", rs, SCRATCH_BY_BOTH)
-  }
+  // The box tag first: a numeric literal-union list rides the `i32[]` wrapper (D4770).
   const k = boxTagOfTy(m)
   // A boolean list rides the i32 list's wrapper.
   if k == 7 || k == 17 || k == 18 {
@@ -39630,6 +40004,14 @@ function luArmWrapLocal(m: i32): i32 {
   if k == 9 { return scratchSlot(46, "strlist", 0, SCRATCH_BY_BOTH) }
   if k == 10 { return scratchSlot(46, "i64list", 0, SCRATCH_BY_BOTH) }
   if k == 12 { return scratchSlot(46, "f32list", 0, SCRATCH_BY_BOTH) }
+  if k == V128_LIST_KIND {
+    return scratchSlot(46, "v128list", 0, SCRATCH_BY_BOTH)
+  }
+  if unMemIsRefElemArray(m) {
+    const rs = unMemRefArrArmSlot(m)
+    if rs < 0 { return -1 }
+    return scratchSlot(46, "reflist", rs, SCRATCH_BY_BOTH)
+  }
   return -1
 }
 
@@ -39958,18 +40340,12 @@ function njPair(a: i32, b: i32) {
   }
   if njResBox { fbI32Rel(RS_TAG, scalarTagOfKind(p)) }
   const fRem = njOp == "%" && (p == 4 || p == 5)
-  if fRem && gHelpF64Rem < 0 {
-    return emitFail(
-      "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
-    )
-  }
   if njPushSide(true, a, p) < 0 { return -1 }
-  if fRem && p == 5 { fbF64PromoteF32() }
+  if fRem { f64RemOperandTail(p == 5) }
   if njPushSide(false, b, p) < 0 { return -1 }
   if fRem {
-    if p == 5 { fbF64PromoteF32() }
-    fbCall(gHelpF64Rem)
-    if p == 5 { fbF32DemoteF64() }
+    f64RemOperandTail(p == 5)
+    if f64RemCallTail(p == 5) < 0 { return -1 }
   } else {
     const opc = lexOpcode(njOp, numPrimOfKind(p) ?? "i32")
     if opc < 0 {
@@ -40309,24 +40685,31 @@ function njNegArm(ms: i32[], i: i32, bs: i32) {
   return 0
 }
 
-// The `%` lowering over two float operands: both at f64, then a call into the shared
-// `__f64_rem__` helper (D1586). `atF32` re-encodes at f32 first so a literal like `0.1`
-// uses f32's value, then promotes and demotes the exact result. The reservation is load-
-// bearing: an unreserved helper is a `call` to index -1, so a miss fails loudly here first.
+// The `%` lowering over two float operands: each at f64, then a call into the shared
+// `__f64_rem__` helper (D1586). `atF32` writes each operand at f32 first, so a literal like `0.1`
+// uses f32's value, then promotes it, and demotes the exact result.
 function emitF64RemCall(lIx: i32, rIx: i32, fnIx: i32, atF32: boolean) {
+  const k = if atF32 { 5 } else { 4 }
+  if emitWidened(lIx, k, fnIx) < 0 { return -1 }
+  f64RemOperandTail(atF32)
+  if emitWidened(rIx, k, fnIx) < 0 { return -1 }
+  f64RemOperandTail(atF32)
+  return f64RemCallTail(atF32)
+}
+
+// Float `%`'s writer halves, which legacy's two writers and the IR's lowering call around their
+// operands: an operand written at f32 is promoted, then the helper is called and demoted back.
+export function f64RemOperandTail(atF32: boolean) {
+  if atF32 { fbF64PromoteF32() }
+  return 0
+}
+
+// An unreserved helper would be a `call` to index -1, so a miss fails loudly here.
+export function f64RemCallTail(atF32: boolean) {
   if gHelpF64Rem < 0 {
     return emitFail(
       "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
     )
-  }
-  if atF32 {
-    if emitWidened(lIx, 5, fnIx) < 0 { return -1 }
-    fbF64PromoteF32()
-    if emitWidened(rIx, 5, fnIx) < 0 { return -1 }
-    fbF64PromoteF32()
-  } else {
-    if emitWidened(lIx, 4, fnIx) < 0 { return -1 }
-    if emitWidened(rIx, 4, fnIx) < 0 { return -1 }
   }
   fbCall(gHelpF64Rem)
   if atF32 { fbF32DemoteF64() }
@@ -40524,17 +40907,22 @@ function srEmitNarrowed(src: i64[], fnIx: i32): i32 {
   return 0
 }
 
-// Emits `e` (at `exprIx`, width `w`) strength-reduced when it is one of the shapes above:
-// `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing `(y >>> k) as% i32 & m`.
-// Answers 0 when emitted, -1 on an emit failure, 1 when `e` is none of them (nothing
-// pushed). Every operand but x is a constant, so evaluation order and traps are unchanged.
-function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
-  if !srTyIs(exprIx, w == 64, fnIx) { return 1 }
+// The strength-reduced form of `e` (at `exprIx`, width `w`) as [x, k, narrow, m, j], or [] when it
+// is none of the shapes above: `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing
+// `(y >>> k) as% i32 & m`, whose j is -1. Legacy writes it; the IR builder misses it by name.
+export function shiftMaskFoldOf(
+  e: BinExpr,
+  exprIx: i32,
+  w: i32,
+  fnIx: i32,
+): i64[] {
+  const none: i64[] = []
+  if !srTyIs(exprIx, w == 64, fnIx) { return none }
   if e.binOp == "&" {
-    if w != 32 { return 1 }
+    if w != 32 { return none }
     const nsrc = srMaskedSource(exprIx, w, fnIx)
-    if nsrc.length == 0 || nsrc[2] != 1 { return 1 }
-    return srEmitNarrowed(nsrc, fnIx)
+    if nsrc.length == 0 || nsrc[2] != 1 { return none }
+    return [nsrc[0], nsrc[1], nsrc[2], nsrc[3], -1]
   }
   let j: i64 = -1
   let inner = -1
@@ -40549,11 +40937,22 @@ function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
       inner = e.binRight
     }
   }
-  if j < 0 { return 1 }
+  if j < 0 { return none }
   const src = srMaskedSource(inner, w, fnIx)
-  if src.length == 0 { return 1 }
-  if srPushSource(src, w, fnIx) < 0 { return -1 }
-  const k = src[1]
+  if src.length == 0 { return none }
+  return [src[0], src[1], src[2], src[3], j]
+}
+
+// Emits `e` strength-reduced when `shiftMaskFoldOf` names a form: 0 when emitted, -1 on an emit
+// failure, 1 when it names none (nothing pushed). Every operand but x is a constant, so
+// evaluation order and traps are unchanged.
+function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
+  const f = shiftMaskFoldOf(e, exprIx, w, fnIx)
+  if f.length == 0 { return 1 }
+  if f[4] < 0 { return srEmitNarrowed(f, fnIx) }
+  if srPushSource(f, w, fnIx) < 0 { return -1 }
+  const k = f[1]
+  const j = f[4]
   if k > j {
     srConst(k - j, w)
     fbI32Bin(srOpcode(">>>", w))
@@ -40561,7 +40960,7 @@ function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
     srConst(j - k, w)
     fbI32Bin(srOpcode("<<", w))
   }
-  srConst(src[3] << j, w)
+  srConst(f[3] << j, w)
   fbI32Bin(srOpcode("&", w))
   return 0
 }
@@ -41212,66 +41611,38 @@ function emitBinNumeric(e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitNumUnionBin(e, exprIx, fnIx)
   }
   const w = binNumWidth(e, fnIx)
-  if w == "f32" {
-    // float remainder at f32 rides the f64 helper (D1586): an f32 operand is exact in f64,
-    // the remainder of two f32-representable values is itself f32-representable, and every
-    // step of the helper is exact — so promote / call / demote loses nothing. A second
-    // helper would be the same algorithm at a narrower width for no gain.
-    if e.binOp == "%" {
-      if emitF64RemCall(e.binLeft, e.binRight, fnIx, true) < 0 { return -1 }
-      return 0
-    }
-    const opcF32 = lexOpcode(e.binOp, "f32")
-    // No f32 form ⇒ fail, never fall through. Ops with no float form (`%`, bitwise, shift) are
-    // integer-only in the checker, so this is unreachable from accepted source — it exists
-    // because falling through reaches the i32 tail below, emitting an i32 opcode over a float
-    // operand: invalid wasm the engine alone catches (`%` did exactly this before this backstop).
-    if opcF32 < 0 {
-      return emitFail("emitProgram: operator '" + e.binOp + "' has no f32 form")
-    }
-    if emitBinOperandAs(e.binLeft, "f32", fnIx) < 0 { return -1 }
-    if emitBinOperandAs(e.binRight, "f32", fnIx) < 0 { return -1 }
-    fbI32Bin(opcF32)
-    return 0
+  const p: RpPrim = if w == "f32" { "f32" } else if w == "f64" { "f64" } else if w == "i64" { "i64" } else { "i32" }
+  const flt = p == "f32" || p == "f64"
+  if flt && e.binOp == "%" {
+    return emitF64RemCall(e.binLeft, e.binRight, fnIx, p == "f32")
   }
-  if w == "f64" {
-    // float remainder — the one f64 operator with no instruction, so it calls the shared
-    // `__f64_rem__` helper instead of taking an opcode from the table below (D1586).
-    if e.binOp == "%" {
-      if emitF64RemCall(e.binLeft, e.binRight, fnIx, false) < 0 { return -1 }
-      return 0
-    }
-    const opcF = lexOpcode(e.binOp, "f64")
-    // NO f64 form ⇒ fail, never fall through — the f32 slice's reasoning, one width up.
-    if opcF < 0 {
-      return emitFail("emitProgram: operator '" + e.binOp + "' has no f64 form")
-    }
-    if emitBinOperandAs(e.binLeft, "f64", fnIx) < 0 { return -1 }
-    if emitBinOperandAs(e.binRight, "f64", fnIx) < 0 { return -1 }
-    fbI32Bin(opcF)
-    return 0
+  if !flt {
+    const sr = emitShiftMaskFold(
+      e,
+      exprIx,
+      if p == "i64" { 64 } else { 32 },
+      fnIx,
+    )
+    if sr <= 0 { return sr }
   }
-  if w == "i64" {
-    const sr64 = emitShiftMaskFold(e, exprIx, 64, fnIx)
-    if sr64 <= 0 { return sr64 }
-    const opc64 = lexOpcode(e.binOp, "i64")
-    if opc64 >= 0 {
-      if emitBinOperandAs(e.binLeft, "i64", fnIx) < 0 { return -1 }
-      if emitBinOperandAs(e.binRight, "i64", fnIx) < 0 { return -1 }
-      fbI32Bin(opc64)
-      return 0
-    }
+  // An operator with no form at its width is refused rather than written over the operands of
+  // another; the checker keeps every accepted program off this arm.
+  const opc = lexOpcode(e.binOp, p)
+  if opc < 0 {
+    return emitFail(
+      "emitProgram: operator '" + e.binOp + "' has no " + p + " form",
+    )
   }
-  const sr32 = emitShiftMaskFold(e, exprIx, 32, fnIx)
-  if sr32 <= 0 { return sr32 }
-  const opcode = lexOpcode(e.binOp, "i32")
-  if opcode < 0 { return emitFail("emitProgram: unsupported binary operator") }
-  // Operands first (left then right), then the operator — wasm's stack order. An `i64` shift
-  // count wraps to the `i32` operand's width, which masks it as wasm does.
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-  if binOperandScalarTy(e.binRight, fnIx) == TY_I64 { fbI32WrapI64() }
-  fbI32Bin(opcode)
+  if p != "i32" {
+    if emitBinOperandAs(e.binLeft, p, fnIx) < 0 { return -1 }
+    if emitBinOperandAs(e.binRight, p, fnIx) < 0 { return -1 }
+  } else {
+    // An `i64` shift count wraps to the `i32` operand's width, which masks it as wasm does.
+    if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+    if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+    if binOperandScalarTy(e.binRight, fnIx) == TY_I64 { fbI32WrapI64() }
+  }
+  fbI32Bin(opc)
   return 0
 }
 
@@ -42053,8 +42424,8 @@ function nulScalarListAtomKind(kind: VKind): i32 {
     "nulu8list" => {
       return 13
     }
-    // Not a nullable scalar-backed list, so no atom code.
-    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+    // Not a nullable scalar-backed list with a union atom, so no atom code.
+    "nulv128list" | "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
   }
   return -1
 }
@@ -42090,6 +42461,7 @@ function refAtomElemName(k: i32): string {
   if k == 9 { return "string" }
   if k == 10 { return "i64" }
   if k == 12 { return "f32" }
+  if k == V128_LIST_KIND { return "v128" }
   const pr = pkRowOfKind(k)
   if pr >= 0 { return pkElemNameOfRow(pr) }
   return ""
@@ -42467,6 +42839,7 @@ function coalOperandListRep(exprIx: i32, fnIx: i32): string {
   if nsk == "nulf64list" { return "f64list" }
   if nsk == "nuli64list" { return "i64list" }
   if nsk == "nulf32list" { return "f32list" }
+  if nsk == "nulv128list" { return "v128list" }
   if nsk == "nulu8list" { return "u8list" }
   return coalOperandRefListRep(exprIx, fnIx)
 }

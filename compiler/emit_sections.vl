@@ -37,7 +37,7 @@ import { idShadowModeOf } from "./id_shadow_state"
 import { lamChainSnap } from "./check_lam_chain"
 import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
-import { boxDstShadowBegin } from "./box_dst_shadow"
+import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
 import { irClaimFn, irShadowArmed, irShadowBegin, irShadowFn } from "./ir_build"
 import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
@@ -245,9 +245,6 @@ import {
   HELP_UTF8_DEC,
   HELP_UTF8_ENC,
   INIT_REACH_NEVER,
-  MVK_F32,
-  MVK_F64,
-  MVK_I64,
   MVK_STR,
   PK_I16,
   PK_U16,
@@ -539,6 +536,7 @@ import {
   mkArrTy,
   mkListTy,
   monoKeys,
+  mvClassIsScalar,
   mvKeyKind,
   mvMapTypeIdx,
   mvValClassOf,
@@ -795,7 +793,6 @@ import {
   blockHasStrOp,
   blockPushPopBits,
   blockStashMisses,
-  bodyEndsInReturn,
   callIsPushKind,
   callPushBits,
   exprHasMapOp,
@@ -827,7 +824,6 @@ import {
   recordRefPushSlot,
 } from "./emit_local_slots"
 import {
-  fnRetNullBearing,
   fnUnionLetSinkOk,
   mapAnnShape,
   nulVariantIndexOf,
@@ -960,6 +956,7 @@ import {
   eqHelpFnName,
   eqHelpFuncType,
   eqHelpReserve,
+  fallThroughPadOf,
   initGuardValue,
   irHoleClosed,
   maFoldCandidateCount,
@@ -1245,8 +1242,9 @@ function emitFallThroughPad(fnBody: i32, fnIx: i32, fnPos: i32): i32 {
   if fnPos >= 0 {
     if fRetVoid[fnPos] == 1 { isVoidFn = true }
   }
-  if !isVoidFn && !bodyEndsInReturn(fnBody, fnIx) {
-    if fnRetNullBearing(fnIx) {
+  const pad = if isVoidFn { "" } else { fallThroughPadOf(fnBody, fnIx) }
+  if pad != "" {
+    if pad == "null" {
       if emitNullForRet(fnIx) < 0 { return -1 }
       // Inside the sink's exit block this fall-through value cannot simply be left on
       // the stack for the function `end` — the block is void. It terminates like any
@@ -1359,10 +1357,17 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     if !irHoleClosed() {
       return emitFail("emitProgram: a value hole is open where no writer runs")
     }
+    // Both the IR's lowering and legacy's start from empty scope and loop frames.
+    emitResetScopeFrames()
     // A function the IR claims has its code entry written by the lowering, in the frame laid out
-    // above, and legacy's body lowering does not run. A lifted function's extra results are
-    // legacy's alone.
-    if fbRetExtra.length == 0 && irClaimFn(fnIx, fnPos, out) {
+    // above, and legacy's body lowering does not run. A lifted function's extra results, and every
+    // function under the test refusal hook or the box-dst shadow (both instrument legacy), stay legacy's.
+    if (
+      fbRetExtra.length == 0
+      && gTestEmitRefusal == 0
+      && !boxDstShadowArmed()
+      && irClaimFn(fnIx, fnPos, out)
+    ) {
       fbEndFunc()
       return 0
     }
@@ -1373,6 +1378,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // `body` arg, so `curBuf == body` throughout and not-yet-converted raw `body.push(...)` sites
     // interleave identically. Restores the previous target afterwards.
     const exprPrev = wTarget(bodyExpr)
+    // A claim that fell back during lowering may have left frames open; legacy starts clean.
     emitResetScopeFrames()
     // `emitFuncBody` banks a row per STATEMENT, relative to `bodyExpr`; the rebase below
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
@@ -1685,7 +1691,7 @@ function globalPromotable(gi: i32) {
         return true
       }
       // every other cell kind is a ref or a box
-      "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+      "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "f64list" | "closure" | "nullist" | "nulstr" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
     }
     return false
   }
@@ -4351,9 +4357,7 @@ function mapShapeCompactable(sh: i32): boolean {
   if sh == -2 || sh == -5 || sh == -7 { return true }
   if sh < 0 || sh >= mvMapTypeIdx.length { return false }
   const k = mvValClassOf(sh)
-  if k == MVK_STR || k == MVK_I64 || k == MVK_F64 || k == MVK_F32 {
-    return true
-  }
+  if k == MVK_STR || mvClassIsScalar(k) { return true }
   const r = mvValRep[sh].mrSlot
   return r >= 0 && r < rlBackIdx.length && r < rlWrapIdx.length
 }
@@ -4477,9 +4481,7 @@ function mapCompactTysOf(sh: i32): MapCompactTys {
     valsWrap = mvValsWrapOf(sh)
     valsBack = mvValsBackOf(sh)
     const vk = mvValClassOf(sh)
-    if vk != MVK_I64 && vk != MVK_F64 && vk != MVK_F32 {
-      valNull = mvValElemHeapOf(sh)
-    }
+    if !mvClassIsScalar(vk) { valNull = mvValElemHeapOf(sh) }
   }
   const t: MapCompactTys = {
     mapTy: mapTy,

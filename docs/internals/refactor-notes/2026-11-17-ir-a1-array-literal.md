@@ -94,7 +94,16 @@ line.
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches master already reports |
 | corpus identity against master's seed, 12,297 cells | 9,029 identical, 3,268 fail under both, 0 differ |
 | mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,341 claimed and byte-identical, the same 2 fallbacks as master; corpus 9,029 identical, 0 differ, 25,048 claimed, 0 fell back |
-| L2 self-compile fuel (`self-compile-time.sh`) | 95,735,881,085 to 95,626,704,192 (−0.11%) |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its checkout), before claiming | 95,560,432,768 to 95,626,704,192 (+0.07%), on master c97ab1fe |
+| L2 self-compile fuel, with claiming on (#8947, #8958) | 96,465,812,487 to 96,929,010,700 (+0.48%), on master 295b46e9: the claim path builds every function, and one whose first miss was its list literal now builds on to its next miss |
+| shipped claims (`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) | self-compile 2,183 to 2,187; corpus 10,868 on both; 0 fell back. The `list` family is not claimed, so a covered literal ships no IR byte yet |
 | seed size, master's to this one | 6,605,491 to 6,607,590 (+2,099) |
 | pin helpers in `emit_mono.vl` | 908 |
 | phase-state census | flat |
+
+## Follow-ups
+
+- `arrLitShort` reads `gForIterLit`, which `emitForInList` sets and restores around one legacy
+  site, so it is -1 wherever the IR asks while `for … in` is a miss. When the IR builds a `for`
+  iterable that is a literal, it passes that fact to `arrLitShort` explicitly; otherwise a claimed
+  function would build short where legacy hoists the literal to a module constant.
