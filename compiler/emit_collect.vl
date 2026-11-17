@@ -20,11 +20,14 @@ import { fusedMapReadRecvIx } from "./check_leaf_steps"
 import { chainHasPrelude } from "./emit_if_arm_values"
 import { arrNewAtTop, arrNewInFn } from "./check_decl_scan"
 import {
+  elabHoleListAtI32,
+  elabInstSigTys,
   elabListFnElemTy,
   elabLitBindingFact,
   elabLitInstTys,
   elabNodeInstTys,
   elabNodeTyAt,
+  elabTyVarAtI32,
   litRepTyAt,
   litRepTyOneClosed,
 } from "./emit_elab"
@@ -58,7 +61,7 @@ import {
 import { canonUnionMembersInto } from "./check_program"
 import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
-import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
+import { isListArmNodes, isVarTyIxOf, luPinElemTys } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
 import {
   inferRetNodeCarryNote,
@@ -245,8 +248,10 @@ import { exprIsIfStmt, ifArmValueExpr, tyHasFnDeep } from "./emit_query"
 import {
   FC_CLOSURE,
   FC_I32,
+  FC_I32_LIST,
   FC_MAP,
   FC_NUL_CLOSURE,
+  FC_NUL_I32_LIST,
   FC_NUL_LIT_UNION,
   FC_NUL_NONE,
   FC_NUL_REF_LIST,
@@ -1167,12 +1172,12 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
       // union is a union-box list, and reading only the first would key it under one arm. A
       // heterogeneous literal has no single committed rep, so the bank stays empty and the
       // checker-typed union rung keeps it.
-      const ca = alcCommitAnn(n.arrElems[0], bodyIx, fnIx, 0)
+      const ca = alcCommitAnn(n.arrElems[0], bodyIx, fnIx, [])
       const cn = alcAnnName(ca)
       let agree = alcNamesArm(cn, ca)
       let ei = 1
       while ei < n.arrElems.length {
-        if alcAnnName(alcCommitAnn(n.arrElems[ei], bodyIx, fnIx, 0)) != cn {
+        if alcAnnName(alcCommitAnn(n.arrElems[ei], bodyIx, fnIx, [])) != cn {
           agree = false
         }
         ei = ei + 1
@@ -1210,15 +1215,15 @@ function alcAnnName(ann: i32): string {
   return tyNameOf(ann)
 }
 
-// The annotation node the expression at `ex` has already committed its rep to, or -1. Four
-// sources, every one an annotation a user wrote or a pin synthesized and never an inference: a
-// bound local, a parameter, a callee's declared result, and a callee's inferred result read
-// through the binding that supplies it. Depth-bounded, since the arena is not this pass's to trust.
-function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
+// The annotation node the expression at `ex` has already committed its rep to, or -1: a bound
+// local's, a parameter's, a callee's declared result, or a callee's inferred result read through
+// the binding that supplies it; never an inference. A value `seen` already holds is a cycle, since
+// the arena is not this pass's to trust.
+function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, seen: i32[]): i32 {
   if ex < 0 { return -1 }
-  if depth > 4 { return -1 }
   const u = unwrapParen(ex)
-  if u < 0 { return -1 }
+  if u < 0 || i32ListHas(seen, u) { return -1 }
+  seen.push(u)
   const n = nodeAt(u)
   match n {
     Ident => {
@@ -1229,7 +1234,7 @@ function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
           if ld.letType >= 0 { return ld.letType }
           // An un-annotated binding is a link in the chain, not the end of it: the alias
           // re-names a value, it does not re-rep one.
-          return alcCommitAnn(ld.letInit, bodyIx, fnIx, depth + 1)
+          return alcCommitAnn(ld.letInit, bodyIx, fnIx, seen)
         }
         return -1
       }
@@ -1257,7 +1262,7 @@ function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
             if cfn.fnRet >= 0 { return cfn.fnRet }
             const crx = fnRetExprOf(cix)
             if crx < 0 { return -1 }
-            return alcCommitAnn(crx, cfn.fnBody, cix, depth + 1)
+            return alcCommitAnn(crx, cfn.fnBody, cix, seen)
           }
         }
       }
@@ -1437,8 +1442,7 @@ function internCloSigKey(key: string, rep: i32) {
 
 // Interns the `$fnsig` of a union arm of arena type `ty` (-1 when unknown) at rep -1, keyed
 // `kIn`, or by `unionArmSigKeyTy` when `kIn` is "". A mixed scalar-plus-composite union result
-// is skipped: its synthesized sig would pass the call's floor while the un-pinned producer keeps
-// its own functype, and the cast traps.
+// with no row is skipped: no producer builds that box, so the call keeps its loud floor.
 function internCloSigOfArmTy(kIn: string, ty: i32) {
   let k = kIn
   if k == "" { k = unionArmSigKeyTy(ty) }
@@ -1653,7 +1657,7 @@ export function collectCloSigs() {
   // `$fnsig`. Idempotent and order-stable via `cloSigPosOfKey`; unreachable without `fnValUsed`.
   let ri = 0
   while ri < cloSigWalkRoots.length {
-    if collectTyReachCloSigs(cloSigWalkRoots[ri], 16) < 0 { return -1 }
+    if collectTyReachCloSigs(cloSigWalkRoots[ri]) < 0 { return -1 }
     ri = ri + 1
   }
   // Every lifted function's own type is a root too (D1474). `cloSigWalkRoots` holds a
@@ -1665,7 +1669,7 @@ export function collectCloSigs() {
     const lfTy = nodeTyIxOf(fnStmts[lf])
     if valSlots.length > 0 && valSlots[lf] == 0 {
       if collectFnPartsCloSigs(lfTy) < 0 { return -1 }
-    } else if collectTyReachCloSigs(lfTy, 16) < 0 {
+    } else if collectTyReachCloSigs(lfTy) < 0 {
       return -1
     }
     lf = lf + 1
@@ -1740,12 +1744,12 @@ function collectFnPartsCloSigs(tyIx: i32) {
     const ps = t.fnParamTypes
     let i = 0
     while i < ps.length {
-      if collectTyReachCloSigs(ps[i], 15) < 0 { return -1 }
+      if collectTyReachCloSigs(ps[i]) < 0 { return -1 }
       i = i + 1
     }
-    return collectTyReachCloSigs(t.fnRet, 15)
+    return collectTyReachCloSigs(t.fnRet)
   }
-  return collectTyReachCloSigs(tyIx, 16)
+  return collectTyReachCloSigs(tyIx)
 }
 
 // Record a directly-bound lambda's debug display name for the name section. `slot` is the
@@ -4905,30 +4909,31 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
 // `collectATypeRef`'s function-type rung handles a top-level function type; a closure that is a field
 // of an inline shape (`{f: () => string}`) reaches no rung. Forces only from the result and
 // parameters of such a field, descending through unions, lists, function parts and shapes.
-function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
-  if depth > 6 || t < 0 || t >= T.tys.length { return 0 }
+function forceNestedCloSigRepsOfTy(t: i32, seen: i32[]): i32 {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
   const k = tyAt(t)
   match k {
     TyUnion => {
       let ai = 0
       while ai < k.uMembers.length {
-        forceNestedCloSigRepsOfTy(k.uMembers[ai], depth + 1)
+        forceNestedCloSigRepsOfTy(k.uMembers[ai], seen)
         ai = ai + 1
       }
     }
     TyNullable => {
-      forceNestedCloSigRepsOfTy(k.nInner, depth + 1)
+      forceNestedCloSigRepsOfTy(k.nInner, seen)
     }
     TyArray => {
-      forceNestedCloSigRepsOfTy(tyElemOf(k), depth + 1)
+      forceNestedCloSigRepsOfTy(tyElemOf(k), seen)
     }
     TyFunc => {
       // A function type's own parts are not forced here: a top-level return belongs to
       // `collectATypeRef`'s function-type rung.
-      forceNestedCloSigRepsOfTy(k.fnRet, depth + 1)
+      forceNestedCloSigRepsOfTy(k.fnRet, seen)
       let ti = 0
       while ti < k.fnParamTypes.length {
-        forceNestedCloSigRepsOfTy(k.fnParamTypes[ti], depth + 1)
+        forceNestedCloSigRepsOfTy(k.fnParamTypes[ti], seen)
         ti = ti + 1
       }
     }
@@ -4942,15 +4947,15 @@ function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
           const fk = tyAt(ft)
           if fk is TyFunc {
             forceAnnLeafRepsOfTy(fk.fnRet)
-            forceNestedCloSigRepsOfTy(fk.fnRet, depth + 1)
+            forceNestedCloSigRepsOfTy(fk.fnRet, seen)
             let pi = 0
             while pi < fk.fnParamTypes.length {
               forceAnnLeafRepsOfTy(fk.fnParamTypes[pi])
-              forceNestedCloSigRepsOfTy(fk.fnParamTypes[pi], depth + 1)
+              forceNestedCloSigRepsOfTy(fk.fnParamTypes[pi], seen)
               pi = pi + 1
             }
           } else {
-            forceNestedCloSigRepsOfTy(ft, depth + 1)
+            forceNestedCloSigRepsOfTy(ft, seen)
           }
         }
         fi = fi + 1
@@ -5111,6 +5116,12 @@ function collectFrameLeafRow(ix: i32, fnIx: i32) {
   const e = litRepTyAt(arrLitLeadInner(a), fnIx)
   if e < 0 || rlSlotOfTy(e) >= 0 { return 0 }
   if arrLitElemName(ix, fnIx) != "i32[]" { return 0 }
+  // A lead inner literal the frame stores as a ref list, such as strings held at a union
+  // element, mints its inner row first, as the annotated spelling does.
+  if refListElemKindOfTy(e) == RLK_REF_LIST {
+    ensureRefElemTys(rlRowNameOfTy(e, true), e, e)
+    return 0
+  }
   // The f64 and i64 pairs mint on first read (`fa64Ty`, `ia64Ty`).
   rlInternNameTy(pn, refListElemKindOfTy(e), e)
   return 0
@@ -5567,7 +5578,7 @@ function annTyIsRefList(i: i32, nd: TypeRef): boolean {
 function collectATypeRef(i: i32, nd: TypeRef) {
   // A closure that is a struct field reserves nothing through the rung below —
   // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
-  forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
+  forceNestedCloSigRepsOfTy(nodeTyIxOf(i), [])
   // A function type forces nothing here: its result's types are forced by
   // `forceNestedCloSigRepsOfTy` above.
   if tyIsFuncArena(nodeTyIxOf(i)) {
@@ -5806,7 +5817,7 @@ function internJoinedRecordRow(ix: i32) {
   if !recordJoinSeen() { return 0 }
   const ty = nodeTyIxOf(ix)
   if !initJoinsWiderRecord(ix, ty) { return 0 }
-  internArmShapeOfTy(ty, 0)
+  internArmShapeOfTy(ty, [])
   return internShapeDeepTy(ty)
 }
 
@@ -5836,7 +5847,7 @@ export function collectAnnShapes() {
       }
       // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
       // row to exist before `armFieldStructRow` is asked for it (D1672).
-      internArmFieldShapeTy(root, 0)
+      internArmFieldShapeTy(root, [])
       // An annotation the checker typed nothing at, such as a type parameter's bound, is not
       // the type of any value, so it has no shape to intern.
       if root >= 0 { internShapeDeepTy(root) }
@@ -5860,9 +5871,10 @@ export function collectAnnShapes() {
 }
 
 // Whether record field type `ft` is a value union's box, nullable or not, or a record holding
-// one in a field, at most four records down.
-function objFieldHoldsUnionBox(ft: i32, depth: i32): boolean {
-  if ft < 0 || ft >= T.tys.length || depth > 4 { return false }
+// one in a field, each record walked once.
+function objFieldHoldsUnionBox(ft: i32, seen: i32[]): boolean {
+  if ft < 0 || ft >= T.tys.length || i32ListHas(seen, ft) { return false }
+  seen.push(ft)
   const fu = tyAt(ft)
   match fu {
     TyUnion => {
@@ -5877,7 +5889,7 @@ function objFieldHoldsUnionBox(ft: i32, depth: i32): boolean {
     }
     TyObj => {
       for gt in fu.objFieldTypes {
-        if objFieldHoldsUnionBox(gt, depth + 1) { return true }
+        if objFieldHoldsUnionBox(gt, seen) { return true }
       }
     }
     TyPrim | TyErr | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
@@ -5896,7 +5908,7 @@ function mintUnionFieldObjRow(ix: i32) {
   if !(o is TyObj) { return 0 }
   for ft in o.objFieldTypes {
     if ft >= 0 && ft < T.tys.length {
-      if objFieldHoldsUnionBox(ft, 0) {
+      if objFieldHoldsUnionBox(ft, []) {
         if tyHasTyVar(lt) { return 0 }
         if structRowOfRecordTy(lt) < 0 || structIndexOfObj(ix) < 0 {
           internShapeDeepTy(lt)
@@ -6338,7 +6350,7 @@ function collectAnonShapes() {
   while ai < P.nodes.length {
     const an = nodeAt(ai)
     if an is ObjLit {
-      if anonHolderAwaitsElemRow(ai, 0, false) {
+      if anonHolderAwaitsElemRow(ai, false) {
         late.push(ai)
       } else {
         anonMintLiteral(ai)
@@ -6352,7 +6364,7 @@ function collectAnonShapes() {
   while pending.length > 0 {
     const next: i32[] = []
     for li in pending {
-      if anonHolderAwaitsElemRow(li, 0, true) {
+      if anonHolderAwaitsElemRow(li, true) {
         next.push(li)
       } else {
         anonMintLiteral(li)
@@ -6483,12 +6495,8 @@ function arrLitRepElemRow(ai: i32): boolean {
 
 // Whether the object literal at `objIx` has a field, directly or through a nested literal, that
 // is an empty list literal whose recorded element is a record type.
-function anonHolderAwaitsElemRow(
-  objIx: i32,
-  depth: i32,
-  unminted: boolean,
-): boolean {
-  if depth > 8 || objIx < 0 || objIx >= P.nodes.length { return false }
+function anonHolderAwaitsElemRow(objIx: i32, unminted: boolean): boolean {
+  if objIx < 0 || objIx >= P.nodes.length { return false }
   const o = nodeAt(objIx)
   if !(o is ObjLit) { return false }
   for fx in o.objFields {
@@ -6497,7 +6505,7 @@ function anonHolderAwaitsElemRow(
       const v = unwrapParen(f.fiValue)
       if anonEmptyRecordListLit(v, unminted) { return true }
       if anonRecordValuedMap(v, unminted) { return true }
-      if anonHolderAwaitsElemRow(v, depth + 1, unminted) { return true }
+      if anonHolderAwaitsElemRow(v, unminted) { return true }
     }
   }
   return false
@@ -6565,16 +6573,40 @@ function anonFieldStoreTy(objIx: i32, name: string, inst: i32): i32 {
   return if inst >= 0 && (t < 0 || tyHasTyVar(t)) { inst } else { t }
 }
 
+// `anonFieldStoreTy` at the code the field stores (`holeStoreTy`).
+function anonFieldStoreTyAt(
+  code: i32,
+  objIx: i32,
+  name: string,
+  inst: i32,
+): i32 {
+  return holeStoreTy(code, anonFieldStoreTy(objIx, name, inst))
+}
+
+// Field type `ty` at code `code`: the `i32` or `i32[]` an `i32` or `i32`-list code stores where
+// `ty` is a bare type variable or hole, or a list whose element is absent or a hole (the two
+// `elab` closers); any other pair is `ty`.
+function holeStoreTy(code: i32, ty: i32): i32 {
+  let c = -1
+  if code == FC_I32 {
+    c = elabTyVarAtI32(ty, false)
+  } else if code == FC_I32_LIST || code == FC_NUL_I32_LIST {
+    c = elabHoleListAtI32(ty)
+    if c < 0 && code == FC_I32_LIST { c = elabTyVarAtI32(ty, true) }
+  }
+  return if c >= 0 { c } else { ty }
+}
+
 // The code an admitted anonymous field stores at storage type `st`: the code `st`'s rep derives,
 // with a lone string literal kept at the string rep (D5341). `ladder` stands for a function-typed
 // field and for a type the rep does not code (the classes `fieldCodeIn` keeps); under the rep
 // shadow a derived code that differs from it fails loudly.
 function anonFieldCodeOfStore(ladder: i32, st: i32): i32 {
-  if st < 0 || st >= T.tys.length || tyIsFuncOrNulFunc(st) { return ladder }
+  if st < 0 || st >= T.tys.length { return ladder }
   const lt = tyAt(st)
   const dc = if lt is TyLit && lt.litKind == "str" { FC_STR } else { nameFieldCodeTy(st) }
   if dc < 0 { return ladder }
-  if repShadowOn && dc != ladder {
+  if repShadowOn && dc != ladder && !tyIsFuncOrNulFunc(st) {
     return emitFail(
       "emitProgram: an anonymous field's derived code is not its ladder's",
     )
@@ -6645,15 +6677,14 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         instTys.push(it)
         const nullBox = if code == FC_NUL_NONE { anonNullFieldBox(ai, f.fiName) } else { "" }
         if nullBox != "" { code = FC_UNION }
-        // The type a union field's box name is rendered from (`anonNullFieldBox`,
-        // `anonUnionFieldName`), so its mint reads the type rather than the name.
-        elemUnionTys.push(
-          if nullBox != "" { recFieldTyOf(nodeTyIxOf(ai), f.fiName) } else if code == FC_UNION { nodeTyIxOf(f.fiValue) } else { -1 },
-        )
         if code == FC_MAP && !anonMapFieldDestAdmits(ai, f.fiName) { code = -1 }
-        if code >= 0 {
-          code = anonFieldCodeOfStore(code, anonFieldStoreTy(ai, f.fiName, it))
-        }
+        const st = if code >= 0 { anonFieldStoreTyAt(code, ai, f.fiName, it) } else { -1 }
+        if code >= 0 { code = anonFieldCodeOfStore(code, st) }
+        // The type a union field's box name is rendered from (`anonNullFieldBox`,
+        // `anonUnionFieldName`), so its mint reads the type rather than the name. A value typed
+        // at one arm, such as a list into a list-or-boolean field, is boxed at its storage type.
+        const ut = if nullBox != "" { recFieldTyOf(nodeTyIxOf(ai), f.fiName) } else if code != FC_UNION { -1 } else if regUnionNameOfTy(nodeTyIxOf(f.fiValue)) == "" && st >= 0 { st } else { nodeTyIxOf(f.fiValue) }
+        elemUnionTys.push(ut)
         if code < 0 { ok = false }
         codes.push(code)
         names.push(f.fiName)
@@ -6663,9 +6694,15 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         elemRowTys.push(
           if er >= 0 && er < sTyIx.length { sTyIx[er] } else if code == FC_REF_LIST || code == FC_NUL_REF_LIST { anonRefListKeyElemTy(f.fiValue, code) } else { anonFieldElemValTy(f.fiValue, code) },
         )
-        if er >= 0 { elemNames.push(sNames[er]) }
-        else if nullBox != "" { elemNames.push(nullBox) }
-        else { elemNames.push(anonFieldElemName(f.fiValue, code)) }
+        if er >= 0 {
+          elemNames.push(sNames[er])
+        } else if nullBox != "" {
+          elemNames.push(nullBox)
+        } else if code == FC_UNION && ut >= 0 {
+          elemNames.push(regUnionNameOfTy(ut))
+        } else {
+          elemNames.push(anonFieldElemName(f.fiValue, code))
+        }
       } else {
         ok = false
       }
@@ -6695,7 +6732,7 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         const pi = aOrd[pj]
         const fst = fieldStoreTyOf(
           codes[pi],
-          anonFieldStoreTy(ai, names[pi], instTys[pi]),
+          anonFieldStoreTyAt(codes[pi], ai, names[pi], instTys[pi]),
         )
         storeTyPut(sFieldStoreTy, sFieldNames.length, fst)
         sFieldNames.push(names[pi])
@@ -6841,15 +6878,16 @@ export function collectGenAliasShapes() {
 // `g: Circle | null`), through a nullable's inner type, a list's element, a map's value and an
 // inline record's fields (D1672), so `armFieldStructRow` has a row to answer with. A declared
 // record is a leaf, as its name is. A no-op for a type with no arm, and costs no heap type.
-function internArmFieldShapeTy(ty: i32, depth: i32) {
-  if depth > 8 || ty < 0 || ty >= T.tys.length { return 0 }
+function internArmFieldShapeTy(ty: i32, seen: i32[]) {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return 0 }
+  seen.push(ty)
   const t = tyAt(ty)
-  if t is TyNullable { return internArmFieldShapeTy(t.nInner, depth + 1) }
-  if t is TyArray { return internArmFieldShapeTy(tyElemOf(t), depth + 1) }
-  if t is TyMap { return internArmFieldShapeTy(tyValOf(t), depth + 1) }
+  if t is TyNullable { return internArmFieldShapeTy(t.nInner, seen) }
+  if t is TyArray { return internArmFieldShapeTy(tyElemOf(t), seen) }
+  if t is TyMap { return internArmFieldShapeTy(tyValOf(t), seen) }
   if t is TyObj {
     if structNameOfTy(ty) == "" {
-      for f in t.objFieldTypes { internArmFieldShapeTy(f, depth + 1) }
+      for f in t.objFieldTypes { internArmFieldShapeTy(f, seen) }
       return 0
     }
   }
@@ -6858,14 +6896,15 @@ function internArmFieldShapeTy(ty: i32, depth: i32) {
 
 // `internArmFieldShapeTy` with a declared record's fields descended too, for a join whose
 // record is spelled by its shape; any other type mints the arm row that carries it.
-function internArmShapeOfTy(ty: i32, depth: i32) {
-  if depth > 8 || ty < 0 || ty >= T.tys.length { return 0 }
+function internArmShapeOfTy(ty: i32, seen: i32[]) {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return 0 }
+  seen.push(ty)
   const t = tyAt(ty)
-  if t is TyNullable { return internArmShapeOfTy(t.nInner, depth + 1) }
-  if t is TyArray { return internArmShapeOfTy(tyElemOf(t), depth + 1) }
-  if t is TyMap { return internArmShapeOfTy(tyValOf(t), depth + 1) }
+  if t is TyNullable { return internArmShapeOfTy(t.nInner, seen) }
+  if t is TyArray { return internArmShapeOfTy(tyElemOf(t), seen) }
+  if t is TyMap { return internArmShapeOfTy(tyValOf(t), seen) }
   if t is TyObj {
-    for f in t.objFieldTypes { internArmShapeOfTy(f, depth + 1) }
+    for f in t.objFieldTypes { internArmShapeOfTy(f, seen) }
     return 0
   }
   return internArmShapeRow(repVariantShapeRowOf(ty))
@@ -6900,9 +6939,9 @@ function collectNestedFieldShapes(stmts: i32[]) {
             } else {
               fdRoot = nodeTyIxOf(fnode.fdType)
             }
-            internArmFieldShapeTy(fdRoot, 0)
+            internArmFieldShapeTy(fdRoot, [])
           } else {
-            internArmFieldShapeTy(declAnnTyOf(fnode.fdType), 0)
+            internArmFieldShapeTy(declAnnTyOf(fnode.fdType), [])
           }
           // `internShapeDeepTy` peels composition wrappers and descends a map field's value, so a
           // declared nullable-map field's value struct interns before `collectS` codes the field.
@@ -6968,7 +7007,7 @@ function pushFieldRow(
     storeTyPut(
       armStageStoreTy,
       armStageNames.length,
-      fieldStoreTyOf(code, litTyIx),
+      fieldStoreTyOf(code, holeStoreTy(code, litTyIx)),
     )
     armStageTypes.push(code)
     // D1023 — the discriminant column: the field's own arena type when it is a literal set, -1
@@ -6978,7 +7017,11 @@ function pushFieldRow(
     recordUFieldElemRowTy(elemTyHint) // D5 + B6b
     armStageNames.push(fName)
   } else {
-    storeTyPut(sFieldStoreTy, sFieldNames.length, fieldStoreTyOf(code, litTyIx))
+    storeTyPut(
+      sFieldStoreTy,
+      sFieldNames.length,
+      fieldStoreTyOf(code, holeStoreTy(code, litTyIx)),
+    )
     sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
     sFieldCloSig.push(cloSig)
@@ -8225,40 +8268,41 @@ function tyIsLitFreeMapUnion(ty: i32): boolean {
   return hasMap
 }
 
-// Per arena type, the deepest `depth` a walk below completed at, one column per `underFunc`,
-// so a repeat reaching no deeper is skipped: it would meet only unions already registered.
-// Dropped with the union registry at `collectU`'s start; off while the A/B shadow counts calls.
+// Per arena type, one column per `underFunc`: `CTR_OPEN` while the walk is inside it, so a cycle
+// ends, and `CTR_DONE` once a walk below it completed, so a repeat is skipped: it would meet only
+// unions already registered. Dropped with the union registry at `collectU`'s start; the done
+// mark is off while the A/B shadow counts calls.
 let ctrDoneAt: i32[] = []
 let ctrDoneAtFn: i32[] = []
+const CTR_NONE = 0
+const CTR_OPEN = 1
+const CTR_DONE = 2
 
-function ctrDoneDepth(tyIx: i32, underFunc: boolean): i32 {
+function ctrStateOf(tyIx: i32, underFunc: boolean): i32 {
   const col = if underFunc { ctrDoneAtFn } else { ctrDoneAt }
-  if tyIx >= col.length { return 0 }
+  if tyIx >= col.length { return CTR_NONE }
   return col[tyIx]
 }
 
-function ctrDoneMark(tyIx: i32, underFunc: boolean, depth: i32) {
+function ctrStateSet(tyIx: i32, underFunc: boolean, st: i32) {
   const col = if underFunc { ctrDoneAtFn } else { ctrDoneAt }
-  while col.length <= tyIx { col.push(0) }
-  if col[tyIx] < depth { col[tyIx] = depth }
+  while col.length <= tyIx { col.push(CTR_NONE) }
+  col[tyIx] = st
   return 0
 }
 
 // ── unified arena registration walk ───────────────────────────────────────────
 // The structural sibling of the name walk: recurses over `tyIx`'s `T.tys` shape and registers
 // every reachable `TyUnion`, so a union in a novel nesting position the name walk cannot see
-// is never missed. Keys from `arenaEmitName`, so an already-reached union is a no-op; depth-capped at 16.
-function collectTyReachRegister(
-  stmts: i32[],
-  tyIx: i32,
-  depth: i32,
-  underFunc: boolean,
-) {
-  if tyIx < 0 || depth <= 0 { return 0 }
+// is never missed. Keys from `arenaEmitName`, so an already-reached union is a no-op.
+function collectTyReachRegister(stmts: i32[], tyIx: i32, underFunc: boolean) {
+  if tyIx < 0 { return 0 }
+  const st = ctrStateOf(tyIx, underFunc)
   const memo = unABOn() == 0
-  if memo && ctrDoneDepth(tyIx, underFunc) >= depth { return 0 }
-  const r = collectTyReachRegisterGo(stmts, tyIx, depth, underFunc)
-  if memo && r >= 0 { ctrDoneMark(tyIx, underFunc, depth) }
+  if st == CTR_OPEN || memo && st == CTR_DONE { return 0 }
+  ctrStateSet(tyIx, underFunc, CTR_OPEN)
+  const r = collectTyReachRegisterGo(stmts, tyIx, underFunc)
+  ctrStateSet(tyIx, underFunc, if memo && r >= 0 { CTR_DONE } else { st })
   return r
 }
 
@@ -8266,18 +8310,13 @@ function collectTyReachRegister(
 // type itself (a monomorphized instance's annotated return). Returns 0, or -1 (via `emitFail`).
 export function registerTyReachUnions(stmts: i32[], tyIx: i32) {
   const before = uVariants.length
-  if collectTyReachRegister(stmts, tyIx, 16, false) < 0 { return -1 }
+  if collectTyReachRegister(stmts, tyIx, false) < 0 { return -1 }
   if uVariants.length != before { return assignTags() }
   return 0
 }
 
 // One step of `collectTyReachRegister`'s walk, unmemoised.
-function collectTyReachRegisterGo(
-  stmts: i32[],
-  tyIx: i32,
-  depth: i32,
-  underFunc: boolean,
-) {
+function collectTyReachRegisterGo(stmts: i32[], tyIx: i32, underFunc: boolean) {
   const t = tyAt(tyIx)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a union must get a
   // descent here, not take the leaf `0` and drop every union beneath it.
@@ -8285,30 +8324,26 @@ function collectTyReachRegisterGo(
     TyNullable => {
       // Descends the inner union's members first, without registering the inner union itself, so
       // the outer `…|null` name registers first (the arms' field unions must precede `collectVariantFields`).
-      if collectTyMembersReach(stmts, t.nInner, depth - 1, underFunc) < 0 {
-        return -1
-      }
+      if collectTyMembersReach(stmts, t.nInner, underFunc) < 0 { return -1 }
       // A niche nullable carries its own emit-name registration too, since recursing only the
       // inner type misses it (`AB|null`'s inner registers `A|B`, not the outer name the registry looks up).
       const nn = reachRegisterName(tyIx, underFunc)
       if nn != "" {
         if registerInlineUnionAt(stmts, nn, 41, tyIx, tyIx) < 0 { return -1 }
       }
-      return collectTyReachRegister(stmts, t.nInner, depth - 1, underFunc)
+      return collectTyReachRegister(stmts, t.nInner, underFunc)
     }
     TyArray => {
-      return collectTyReachRegister(stmts, tyElemOf(t), depth - 1, underFunc)
+      return collectTyReachRegister(stmts, tyElemOf(t), underFunc)
     }
     TyMap => {
-      return collectTyReachRegister(stmts, tyValOf(t), depth - 1, underFunc)
+      return collectTyReachRegister(stmts, tyValOf(t), underFunc)
     }
     TyObj => {
       const ftys = t.objFieldTypes
       let i = 0
       while i < ftys.length {
-        if collectTyReachRegister(stmts, ftys[i], depth - 1, underFunc) < 0 {
-          return -1
-        }
+        if collectTyReachRegister(stmts, ftys[i], underFunc) < 0 { return -1 }
         i = i + 1
       }
       return 0
@@ -8319,19 +8354,15 @@ function collectTyReachRegisterGo(
       const ps = t.fnParamTypes
       let i = 0
       while i < ps.length {
-        if collectTyReachRegister(stmts, ps[i], depth - 1, true) < 0 {
-          return -1
-        }
+        if collectTyReachRegister(stmts, ps[i], true) < 0 { return -1 }
         i = i + 1
       }
-      return collectTyReachRegister(stmts, t.fnRet, depth - 1, true)
+      return collectTyReachRegister(stmts, t.fnRet, true)
     }
     TyUnion => {
       // Descends into the members first: a struct arm's field may itself be a union, and the
       // outer registration runs `collectVariantFields` synchronously, needing the arm fields registered first.
-      if collectTyMembersReach(stmts, tyIx, depth - 1, underFunc) < 0 {
-        return -1
-      }
+      if collectTyMembersReach(stmts, tyIx, underFunc) < 0 { return -1 }
       // A "" render (unresolvable nominal / over-deep recursion) declines silently; the name walk
       // still covers those, since this walk only adds coverage.
       const nm = reachRegisterName(tyIx, underFunc)
@@ -8364,14 +8395,21 @@ function collectTyReachRegisterGo(
 // Descends each member of the union at `tyIx` through `collectTyReachRegister`, without
 // registering the union itself — whoever is about to register a variant-box union calls this
 // first, so every struct arm's field unions are registered when `collectVariantFields` fires.
-// A non-union `tyIx` (or -1 / exhausted depth) is a no-op. Returns 0, or -1.
-function collectTyMembersReach(
+// A non-union `tyIx` (or -1) is a no-op. Returns 0, or -1.
+function collectTyMembersReach(stmts: i32[], tyIx: i32, underFunc: boolean) {
+  const seen: i32[] = []
+  return collectTyMembersIn(stmts, tyIx, underFunc, seen)
+}
+
+// `collectTyMembersReach` through lists and maps, each type walked once.
+function collectTyMembersIn(
   stmts: i32[],
   tyIx: i32,
-  depth: i32,
   underFunc: boolean,
+  seen: i32[],
 ) {
-  if tyIx < 0 || depth < 0 { return 0 }
+  if tyIx < 0 || i32ListHas(seen, tyIx) { return 0 }
+  seen.push(tyIx)
   const t = tyAt(tyIx)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a union owes this
   // walk a descent, and a silent leaf here leaves the arms' field unions unregistered.
@@ -8380,7 +8418,7 @@ function collectTyMembersReach(
       const members = t.uMembers
       let i = 0
       while i < members.length {
-        if collectTyReachRegister(stmts, members[i], depth, underFunc) < 0 {
+        if collectTyReachRegister(stmts, members[i], underFunc) < 0 {
           return -1
         }
         i = i + 1
@@ -8389,11 +8427,11 @@ function collectTyMembersReach(
     TyMap => {
       // A collection carrying the union has no arm-field pre-descent of its own (the caller's
       // registration recurses by name into it), so descend through it here to register the arms' field unions first.
-      return collectTyMembersReach(stmts, tyValOf(t), depth - 1, underFunc)
+      return collectTyMembersIn(stmts, tyValOf(t), underFunc, seen)
     }
     TyArray => {
       // As `TyMap`: the element carries the union.
-      return collectTyMembersReach(stmts, tyElemOf(t), depth - 1, underFunc)
+      return collectTyMembersIn(stmts, tyElemOf(t), underFunc, seen)
     }
     TyNullable => {
       // The caller strips the `| null` and asks about the inner type.
@@ -8429,10 +8467,9 @@ function objLeadsWithIndexOp(names: string[]): boolean {
   return names.length > 0 && names[0].length > 0 && names[0][0] == '['
 }
 
-// True if a closure whose result arena type is `retIx` is not yet representable through the
-// value ABI, so the arena sig walk must skip interning its sig — synthesizing one the concrete
-// producer declines would let a value call resolve past its clean reject into invalid emit.
-// Two holes: an inline result struct not `funcTypeShapeLowerable`, or a heterogeneous value union.
+// True if a closure whose result arena type is `retIx` has no direct sig key in the value ABI:
+// an inline result struct not `funcTypeShapeLowerable`, which the arena sig walk skips, or a
+// heterogeneous value union, which it interns only through `internCloSigOfArmTy`'s box test.
 function funcRetUnrepresentable(retIx: i32): boolean {
   if retIx < 0 { return false }
   const t = tyAt(retIx)
@@ -8524,51 +8561,50 @@ function funcRetUnrepresentable(retIx: i32): boolean {
 // The sig-interning sibling of `collectTyReachRegister`: recurses over `tyIx`'s `T.tys` shape
 // and interns every reachable `TyFunc`'s `$fnsig`. Render discipline mirrors the registration
 // walk, so keys agree; idempotent and order-stable, called last so an existing sig keeps its slot.
-function collectTyReachCloSigs(tyIx: i32, depth: i32) {
-  ctwSeenDepth = Map()
+function collectTyReachCloSigs(tyIx: i32) {
   ctwSeenGen = Map()
-  return collectTyReachCloSigsGo(tyIx, depth)
+  return collectTyReachCloSigsGo(tyIx)
 }
 
-// The deepest remaining budget each node has had in this root's walk, and the registry
-// generation of that visit: a revisit with no more budget in the same generation interns
-// only keys its first visit interned, so it is skipped, and a type nesting one record twice per
-// level is walked once per node rather than once per path.
-let ctwSeenDepth: {[i32]: i32} = Map()
+// The registry generation of each node's visit in this root's walk: a revisit in the same
+// generation interns only keys its first visit interned, so it is skipped, and a type nesting one
+// record twice per level is walked once per node rather than once per path. `ctwOpen` holds the
+// nodes the walk is inside, so a cycle ends whatever the generation.
 let ctwSeenGen: {[i32]: i32} = Map()
+const ctwOpen: i32[] = []
 
 // One node of `collectTyReachCloSigs`'s walk, behind the revisit memo.
-function collectTyReachCloSigsGo(tyIx: i32, depth: i32): i32 {
-  if tyIx < 0 || depth <= 0 { return 0 }
+function collectTyReachCloSigsGo(tyIx: i32): i32 {
+  if tyIx < 0 || i32ListHas(ctwOpen, tyIx) { return 0 }
   const gen = tyRegGenNow()
-  if (ctwSeenGen[tyIx] ?? -1) == gen && (ctwSeenDepth[tyIx] ?? 0) >= depth {
-    return 0
-  }
+  if (ctwSeenGen[tyIx] ?? -1) == gen { return 0 }
   ctwSeenGen[tyIx] = gen
-  ctwSeenDepth[tyIx] = depth
-  return collectTyReachCloSigsArm(tyIx, depth)
+  ctwOpen.push(tyIx)
+  const r = collectTyReachCloSigsArm(tyIx)
+  ctwOpen.pop()
+  return r
 }
 
 // The walk's step at `tyIx`, its children asked through `collectTyReachCloSigsGo`.
-function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
+function collectTyReachCloSigsArm(tyIx: i32): i32 {
   const t = tyAt(tyIx)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a closure must get a
   // descent, and a silent leaf here leaves its `$fnsig` un-interned.
   match t {
     TyNullable => {
-      return collectTyReachCloSigsGo(t.nInner, depth - 1)
+      return collectTyReachCloSigsGo(t.nInner)
     }
     TyArray => {
-      return collectTyReachCloSigsGo(tyElemOf(t), depth - 1)
+      return collectTyReachCloSigsGo(tyElemOf(t))
     }
     TyMap => {
-      return collectTyReachCloSigsGo(tyValOf(t), depth - 1)
+      return collectTyReachCloSigsGo(tyValOf(t))
     }
     TyObj => {
       const ftys = t.objFieldTypes
       let i = 0
       while i < ftys.length {
-        if collectTyReachCloSigsGo(ftys[i], depth - 1) < 0 { return -1 }
+        if collectTyReachCloSigsGo(ftys[i]) < 0 { return -1 }
         i = i + 1
       }
       return 0
@@ -8577,7 +8613,7 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       const members = t.uMembers
       let i = 0
       while i < members.length {
-        if collectTyReachCloSigsGo(members[i], depth - 1) < 0 { return -1 }
+        if collectTyReachCloSigsGo(members[i]) < 0 { return -1 }
         i = i + 1
       }
       return 0
@@ -8588,8 +8624,10 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       forceCloResultMapTypes(tyIx)
       forceCloResultListTypes(tyIx)
       // Interns this closure's sig from its arena render, the key the value-call site and a
-      // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
-      if !funcRetUnrepresentable(t.fnRet) {
+      // concrete lambda both derive. A mixed union result interns its box sig when the union has a
+      // row: every producer delivered at this type builds the box result, a lambda by taking the
+      // contextual result and any other function through the delivery's adapter (D16899).
+      if !funcRetUnrepresentable(t.fnRet) || cloResultMaybeMixed(tyIx) {
         // `sigKeyOfTy(tyIx)` gets the key directly off the type.
         const kAr = sigKeyOfTy(tyIx)
         if kAr != "" && !cloResultMaybeMixed(tyIx) { internCloSigKey(kAr, -1) }
@@ -8600,10 +8638,10 @@ function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
       const ps = t.fnParamTypes
       let i = 0
       while i < ps.length {
-        if collectTyReachCloSigsGo(ps[i], depth - 1) < 0 { return -1 }
+        if collectTyReachCloSigsGo(ps[i]) < 0 { return -1 }
         i = i + 1
       }
-      return collectTyReachCloSigsGo(t.fnRet, depth - 1)
+      return collectTyReachCloSigsGo(t.fnRet)
     }
     TyPrim => {
       // A leaf scalar holds no closure.
@@ -8632,7 +8670,7 @@ function rootUnionDeclMembers(stmts: i32[], udName: string) {
   let udTyIx = -1
   const udHit = cUserTypes[udName]
   if udHit is i32 { udTyIx = udHit }
-  return collectTyMembersReach(stmts, udTyIx, 16, false)
+  return collectTyMembersReach(stmts, udTyIx, false)
 }
 
 // The arena type of an un-annotated binding: its INITIALIZER's, since a `LetDecl` is a statement
@@ -8662,7 +8700,7 @@ function registerInferredUnionTy(stmts: i32[], ity: i32) {
   if inm == "" { return 0 }
   if tyNomNameCycled() { return 0 }
   if isUNameAB(46, ity) && unTyKeyHasRow(ity) { return 0 }
-  if collectTyMembersReach(stmts, ity, 15, false) < 0 { return -1 }
+  if collectTyMembersReach(stmts, ity, false) < 0 { return -1 }
   return registerInlineUnionAt(stmts, inm, 46, ity, ity)
 }
 
@@ -8690,7 +8728,27 @@ function collectInlineUnions(stmts: i32[]) {
   nliNames = []
   cloSigWalkRoots = []
   ciuFnSeen = Map()
-  return collectInlineUnionsIn(stmts, stmts)
+  if collectInlineUnionsIn(stmts, stmts) < 0 { return -1 }
+  // The element unions a pin typed a union-of-lists read at (D16897).
+  for pe in luPinElemTys {
+    if collectTyReachRegister(stmts, pe, false) < 0 { return -1 }
+  }
+  // The statement walk does not enter expressions, so an expression-position `if` registers the
+  // bindings in its arms here: a narrowed box bound there, the list-union rewrite's receiver
+  // among them, names its union (D16896).
+  for ix in valueIfNodes {
+    if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is IfStmt {
+      if collectInlineUnionsIn(stmts, [ix]) < 0 { return -1 }
+    }
+  }
+  // An instance's signature can hold a union no annotation spells (`() => T | string` at `T := P`),
+  // whose record arms are already variants (`elabInstUnionArmTys`).
+  for t in elabInstSigTys() {
+    if t >= 0 && t < T.tys.length && !tyHasTyVar(t) {
+      if collectTyReachRegister(stmts, t, false) < 0 { return -1 }
+    }
+  }
+  return 0
 }
 
 // The functions `collectInlineUnionsIn` has registered, so `collectU`'s lambda walk skips them.
@@ -8711,7 +8769,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       const retTy = s.fnRet
       const fnBody = s.fnBody
       // The arena walk registers every union the annotation's type reaches.
-      if collectTyReachRegister(stmts, nodeTyIxOf(retTy), 16, false) < 0 {
+      if collectTyReachRegister(stmts, nodeTyIxOf(retTy), false) < 0 {
         return -1
       }
       cloSigWalkRoots.push(nodeTyIxOf(retTy))
@@ -8720,7 +8778,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
         const p = nodeAt(params[pi])
         if p is Param {
           const pt = p.parType
-          if collectTyReachRegister(stmts, nodeTyIxOf(pt), 16, false) < 0 {
+          if collectTyReachRegister(stmts, nodeTyIxOf(pt), false) < 0 {
             return -1
           }
           cloSigWalkRoots.push(nodeTyIxOf(pt))
@@ -8730,13 +8788,13 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       if collectInlineUnionsBlock(stmts, fnBody) < 0 { return -1 }
     } else if s is LetDecl {
       const letTy = s.letType
-      if collectTyReachRegister(stmts, nodeTyIxOf(letTy), 16, false) < 0 {
+      if collectTyReachRegister(stmts, nodeTyIxOf(letTy), false) < 0 {
         return -1
       }
       // A `let x = null` whose hole a later write filled holds the checker's `T | null`.
       if letTy < 0 {
         const hty = letNullHoleFilledTy(walk[i])
-        if collectTyReachRegister(stmts, hty, 16, false) < 0 { return -1 }
+        if collectTyReachRegister(stmts, hty, false) < 0 { return -1 }
       }
       // An unannotated binding still has a type that can be a union (`const v = m["k"]` infers
       // `i32 | null`), so this mints the box here; idempotent, since an annotated binding just no-ops the second walk.
@@ -8744,16 +8802,13 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
         // A read narrowed to a smaller box binds that box, which no declaration
         // registers (D5921).
         if initIsNarrowedBoxRead(s.letInit) {
-          if (
-            collectTyReachRegister(stmts, nodeTyIxOf(s.letInit), 16, false)
-            < 0
-          ) {
+          if (collectTyReachRegister(stmts, nodeTyIxOf(s.letInit), false) < 0) {
             return -1
           }
         }
         if initNullableIsBoxScalar(s.letInit) {
           for bt in elabNodeInstTys(s.letInit) {
-            if collectTyReachRegister(stmts, bt, 16, false) < 0 { return -1 }
+            if collectTyReachRegister(stmts, bt, false) < 0 { return -1 }
           }
         }
       }
@@ -8776,7 +8831,7 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
           const fdn = nodeAt(flds[tfi])
           if fdn is FieldDef {
             const fdt = fdn.fdType
-            if collectTyReachRegister(stmts, nodeTyIxOf(fdt), 16, false) < 0 {
+            if collectTyReachRegister(stmts, nodeTyIxOf(fdt), false) < 0 {
               return -1
             }
             cloSigWalkRoots.push(nodeTyIxOf(fdt))
@@ -9010,7 +9065,7 @@ export function collectU(stmts: i32[]) {
       if aeu != "" {
         const aety = arrLitArenaElemRow(iau)
         if !(isUNameAB(24, aety) && unTyKeyHasRow(aety)) {
-          if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
+          if collectTyMembersReach(stmts, aety, false) < 0 { return -1 }
           if registerInlineUnionAt(stmts, aeu, 45, aety, aety) < 0 { return -1 }
         }
       }
@@ -9047,7 +9102,7 @@ export function collectU(stmts: i32[]) {
       if pcf is Ident && pcf.identName == "Map" && callHasTyArgs(ipu) {
         const mct = nodeTyIxOf(ipu)
         if mct >= 0 && mct < T.tys.length && tyAt(mct) is TyMap {
-          if collectTyReachRegister(stmts, mct, 16, false) < 0 { return -1 }
+          if collectTyReachRegister(stmts, mct, false) < 0 { return -1 }
         }
       }
     }
@@ -9066,7 +9121,7 @@ export function collectU(stmts: i32[]) {
         // nowhere, and a consumer with no annotation of its own reads the box (D3513).
         const cty = nodeTyIxOf(ipu)
         if cty >= 0 && tyAt(cty) is TyUnion && valueBoxOfTy(cty) {
-          if collectTyReachRegister(stmts, cty, 16, false) < 0 { return -1 }
+          if collectTyReachRegister(stmts, cty, false) < 0 { return -1 }
         }
         // A hole's `??` reads at each instance's binding, which no node records, so its join is
         // registered here.
@@ -9078,9 +9133,7 @@ export function collectU(stmts: i32[]) {
               && isValueUnionTyOr(cpin) >= 0
               && collectNoContainerArmJoin(cpin)
             ) {
-              if collectTyReachRegister(stmts, cpin, 16, false) < 0 {
-                return -1
-              }
+              if collectTyReachRegister(stmts, cpin, false) < 0 { return -1 }
             }
           }
         }
@@ -9099,8 +9152,8 @@ export function collectU(stmts: i32[]) {
       && tyAt(pru) is TyUnion
       && nodeTyIsUnionRow(unwrapParen(pn.memObj))
     ) {
-      if collectTyReachRegister(stmts, pru, 16, false) < 0 { return -1 }
-      if pru != prt && collectTyReachRegister(stmts, prt, 16, false) < 0 {
+      if collectTyReachRegister(stmts, pru, false) < 0 { return -1 }
+      if pru != prt && collectTyReachRegister(stmts, prt, false) < 0 {
         return -1
       }
     }
@@ -9114,7 +9167,7 @@ export function collectU(stmts: i32[]) {
           isn is Index
           && tyMapValOf(nodeTyIxOf(unwrapParen(isn.idxArr))) >= 0
         ) {
-          if collectTyReachRegister(stmts, nodeTyIxOf(iso), 16, false) < 0 {
+          if collectTyReachRegister(stmts, nodeTyIxOf(iso), false) < 0 {
             return -1
           }
         }
@@ -9526,7 +9579,7 @@ function collectInferredUnions(stmts: i32[]) {
     // and keyed by type, so the name fallback below adopts the walk's row rather than minting one.
     const irTyIx = inferRetTyIxAt(iru)
     const irNom = inferRetTyAt(iru)
-    if collectTyReachRegister(stmts, irTyIx, 16, false) < 0 { return -1 }
+    if collectTyReachRegister(stmts, irTyIx, false) < 0 { return -1 }
     // The name fallback: an inferred struct/variant-box return whose members are anonymous
     // shapes, recorded under its nominal composite, which the arena walk cannot reach (`registerInferRetNominalUnion`).
     if registerInferRetNominalUnion(stmts, irNom, iru) < 0 { return -1 }
