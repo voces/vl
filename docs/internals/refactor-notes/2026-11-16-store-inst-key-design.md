@@ -137,3 +137,47 @@ pass. Two findings for A1:
 | differs | 775 | 344 | a check key of the same declaration binds otherwise: mostly function identity, then a type parameter |
 
 A second reading follows when #8841 lands.
+
+## A0, second reading (after #8841)
+
+The same corpus with #8841's other pin paths recorded (member and UFCS calls, hole lambdas, a set
+binding's re-check, declared constraints). Two shadow rules came with it:
+- a row whose callee has no type variable, and sits in no declaration with one, keys nothing:
+  the `plain` count, 437 rows (123 programs);
+- a row that names none of its callee's own variables (the re-check rows name the owner's) is
+  open, `unbound`.
+
+| | first reading | second reading | programs |
+|---|---|---|---|
+| equal | 7,730 | 9,031 | 2,339 |
+| check-only | 62 | 68 | 44 |
+| elab-only | 11,615 | 10,323 | 1,790 |
+| open: function value | 4,941 | 5,076 | 1,118 |
+| open: outer hole | 2,332 | 2,347 | 577 |
+| open: unbound | 94 | 121 | 66 |
+| open: canonicalization refuses | 26 | 27 | 10 |
+
+Elab-only, by why:
+
+| reason | first | second | programs |
+|---|---|---|---|
+| unrecorded | 7,116 | 5,475 | 1,298 |
+| of which named | 5,155 | 3,514 | |
+| of which lambdas | 1,961 | 1,961 | |
+| open | 2,917 | 2,928 | 563 |
+| arg-keyed | 807 | 807 | 258 |
+| differs | 775 | 1,113 | 539 |
+
+What splits a `differs` pair now: a type parameter 409 (285 programs), function identity 367
+(135), a hole binding 249 (147), mixes 73, a delivered-row entry 8.
+
+The 68 check-only keys are the first reading's 62, in the same families, plus six:
+- four of an uncalled hole function the check pins at its use (`?apply3.0=string`) where the
+  elaboration builds the default instance (`elabStoredHoleDefaults`, each hole at `i32`);
+- two more of the same-named type variable.
+
+None is an instance a program needs that the elaboration misses.
+
+What the second reading says for A1: #8841 closed 1,641 unrecorded named declarations (member and
+UFCS calls). Every unrecorded lambda (1,961) and the remaining 3,514 named declarations are called
+through function values, which S3.4d's arrow rule binds. That is the gap A1 starts from.
