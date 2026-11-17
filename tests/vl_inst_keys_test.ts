@@ -23,6 +23,8 @@ function sw(h) {
   return hh(1)
 }
 print(sw(inc))
+function app2(f, x) { return f(x) + 1 }
+for g in [app, app2] { print(g(inc, 2)) }
 `;
 
 async function checkCodegen(
@@ -114,6 +116,22 @@ Deno.test({
     if (!em || Number(em[1]) < 1) {
       throw new Error(
         `want one seed summary with an equal join, got:\n${seed.join("\n")}`,
+      );
+    }
+    // The set-call rows (B2c): `g(inc, 2)` through `{app, app2}` hands `{inc}` to each member, as
+    // the elaboration's instances hold it.
+    const setcall = rows.filter((l) => l.includes(": setcall summary "));
+    const scm = setcall.length === 1
+      ? setcall[0].match(/rows=(\d+) expected=(\d+) extra=(\d+)/)
+      : null;
+    if (
+      !scm || Number(scm[1]) < 2 || Number(scm[2]) !== Number(scm[1]) ||
+      Number(scm[3]) !== 0
+    ) {
+      throw new Error(
+        `want one setcall summary, every row expected, got:\n${
+          setcall.join("\n")
+        }`,
       );
     }
   },

@@ -255,7 +255,14 @@ import {
 } from "./check_literals"
 import { litTyOfExpr, strLitViewOf } from "./check_match_desugar"
 import { declTyOf, narDeclaredTy } from "./check_nar_store"
-import { armLit, gRootStmts, njFnIx, njMayPart } from "./check_nj_join"
+import {
+  armLit,
+  collectRetValues,
+  gRootStmts,
+  njFnIx,
+  njMayPart,
+} from "./check_nj_join"
+import { calleeNamesDecl } from "./check_hand_back"
 import {
   narrowedFromTyOf,
   nodeTyIx,
@@ -587,6 +594,8 @@ import { isWideLitJoin, mkWideStrLitTy } from "./check_wide_lits"
 import {
   CW_OCC_ASG,
   CW_OCC_BIND,
+  CW_OCC_CALL,
+  CW_OCC_MCALL,
   CW_OCC_USE,
   CW_UP_ARG,
   CW_UP_ARM,
@@ -618,6 +627,7 @@ import {
   cwOccWalk,
   cwPeel,
   cwPeelValue,
+  cwSetOccs,
   cwSlotPath,
   cwSlotWrittenValues,
   cwSoleReadInit,
@@ -7677,6 +7687,61 @@ function objShapeListLitAdapts(
   return false
 }
 
+// Whether `cx`, a list of lists `s` delivered into `d`, is a `const` never written whose value is
+// a list literal of fresh lists: literals, or calls of a function returning only list literals.
+function nestedCopyFresh(cx: i32, s: TyArray, d: TyArray): boolean {
+  const se = nonNullTy(tyElemOf(s))
+  const de = nonNullTy(tyElemOf(d))
+  if se < 0 || de < 0 || !(tyAt(se) is TyArray) || !(tyAt(de) is TyArray) {
+    return false
+  }
+  if !covarRootFreshLocal(cx) || !nestedRootReadOnlyHere(cx) { return false }
+  const dx = identDeclOf(parenPeelIx(cx))
+  const dn = if dx >= 0 && dx < P.nodes.length { nodeAt(dx) } else { null }
+  if !(dn is LetDecl) { return false }
+  const lit = nodeAt(cwPeel(dn.letInit))
+  if !(lit is ArrayLit) { return false }
+  for e in lit.arrElems {
+    if !nestedPartFresh(cwPeel(e)) { return false }
+  }
+  return true
+}
+
+// Whether the binding `cx` reads is used nowhere but at `cx`: any other read could hand an inner
+// list to a binding that writes it, which the copy would not see.
+function nestedRootReadOnlyHere(cx: i32): boolean {
+  const key = cwKeyOfRoot(cx)
+  if key == -1 { return false }
+  const at = parenPeelIx(cx)
+  const set: i32[] = [key]
+  for k in [CW_OCC_USE, CW_OCC_ASG, CW_OCC_CALL, CW_OCC_MCALL] {
+    const occ: i32[] = []
+    cwSetOccs(set, k, occ)
+    for o in occ {
+      if o != at { return false }
+    }
+  }
+  return true
+}
+
+// Whether list part `e` is a list nothing else holds: a list literal, or a call of a declared
+// function every value of which is a list literal.
+function nestedPartFresh(e: i32): boolean {
+  const n = nodeAt(e)
+  if n is ArrayLit { return true }
+  if !(n is Call) { return false }
+  const fd = calleeNamesDecl(n.callFn)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length == 0 { return false }
+  for r in rets {
+    if !(nodeAt(cwPeel(r)) is ArrayLit) { return false }
+  }
+  return true
+}
+
 // A list pair other than a literal: the nested pair first, so an object pair keeps its precise
 // wording, then the element's storage class. Only a `readonly` destination over an unwritten
 // source takes the converting copy (D965); an unknown write state refuses.
@@ -7688,6 +7753,13 @@ function objShapeListElemAdapts(
   cx: i32,
   depth: i32,
 ): boolean {
+  // A readonly list of lists over a source whose inner lists only it holds, unwritten, takes the
+  // converting copy element by element (D2196); any other source waits on a nested view (D16950).
+  if cx >= 0 && d.aRead == 1 && nestedCopyFresh(cx, s, d) {
+    while listCopyTyIx.length <= cx { listCopyTyIx.push(-1) }
+    listCopyTyIx[cx] = dst
+    return false
+  }
   if objShapeAdapterless(-1, tyElemOf(s), tyElemOf(d), depth - 1, false) {
     return true
   }
