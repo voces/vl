@@ -4578,6 +4578,7 @@ fn compile_vl_instance(
     report_guest_fuel(store);
     report_guest_alloc(resident0);
     report_late_demands(inst, store, source_path);
+    report_inst_keys(inst, store, source_path);
     report_ifaces(inst, store, source_path);
     report_touch_set(inst, store, source_path);
     report_cls_census(inst, store, source_path);
@@ -4765,6 +4766,37 @@ fn report_late_demands(inst: &Instance, store: &mut Store<()>, path: &str) {
             .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
             .collect();
         rows.push_str(&format!("[late] {path}: demand {name}\n"));
+    }
+    eprint!("{rows}");
+}
+
+/// Whether `$VL_INST_KEYS=1` asked for each compile's instance-key shadow (STORE A0).
+fn inst_keys_on() -> bool {
+    std::env::var("VL_INST_KEYS").ok().as_deref() == Some("1")
+}
+
+/// Under `$VL_INST_KEYS=1`, print one `[inst] <path>: <row>` line to stderr per row of the
+/// guest's instance-key shadow: a summary, then each key only the check or only the elaboration
+/// has. A seed without `instKeysBuild` prints nothing.
+fn report_inst_keys(inst: &Instance, store: &mut Store<()>, path: &str) {
+    if !inst_keys_on() {
+        return;
+    }
+    let (Ok(build), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "instKeysBuild"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "instKeysLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "instKeysAt"),
+    ) else {
+        return;
+    };
+    let n = build.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let row: String = (0..l)
+            .map(|j| char::from_u32(at.call(&mut *store, (i, j)).unwrap_or(63) as u32).unwrap_or('?'))
+            .collect();
+        rows.push_str(&format!("[inst] {path}: {row}\n"));
     }
     eprint!("{rows}");
 }
@@ -9815,6 +9847,13 @@ fn pump_session(
     arm_cls_census(&inst, &mut store);
     arm_ir_shadow(&inst, &mut store);
     arm_opaque_snames(&inst, &mut store);
+    // $VL_REP_SHADOW under the pump arms the shadow's check-time half (the read query's saved
+    // answers, which `$VL_IFACES` prints); the disagreement report stays a build's.
+    if std::env::var_os("VL_REP_SHADOW").is_some() {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setRepShadow") {
+            set.call(&mut store, 1)?;
+        }
+    }
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
     if compile_pool_allowed() {
@@ -10160,6 +10199,10 @@ fn pump_session(
                 if late_demands_on() {
                     let p = cmd_path.read(&mut store)?;
                     report_late_demands(&inst, &mut store, &p);
+                }
+                if inst_keys_on() {
+                    let p = cmd_path.read(&mut store)?;
+                    report_inst_keys(&inst, &mut store, &p);
                 }
                 if ifaces_on() {
                     let p = cmd_path.read(&mut store)?;
