@@ -18,3 +18,4 @@ could differ (merge-ne 0).
 | identity, capability list | 3,223 / 3,223 byte-identical |
 | identity, the 52 programs with a widened-result note | 51 byte-identical; 1 differs, the predicted merge |
 | `closures/generic-returned-record-param.vl` | 29 → 28 functions, 1,773 → 1,760 bytes; output unchanged and matches its `@log` lines |
+| `tests/vl_inst_key_shadow_test.ts` | the program moves from `MERGES` (two of mono's keys spell one instance) to `SETTLED` (mono spells it once; the shadow reports no merge) |
