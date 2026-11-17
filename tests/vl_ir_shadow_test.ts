@@ -191,7 +191,8 @@ print(sel(true))
 // and f32 float intrinsics, and i32 and i64 integer intrinsics (N3); a `string | null` built from
 // `null` and from a string, passed through, assigned, and coalesced with a string literal to a
 // string and inside a `print` (N2b-2c-2a); a `string | null` tested `== null`, `!= null` and
-// `null !=`, and printed (N2b-2c-2b).
+// `null !=`, and printed (N2b-2c-2b); list literals of i32s, of f64s with an i32 element widened,
+// of i64s, f32s, strings and booleans, and an empty one (A1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -206,7 +207,7 @@ print(guard(2))
   `function cmp(a: string, b: string): boolean { return a + "x" == b || a > b }\nprint(cmp("a", "b"))\n`,
   `function dig(c: i32): boolean { return c >= '0' && c <= '9' }\nprint(dig(53))\n`,
   `function at(xs: string[], i: i32): string { return xs[i] }\nprint(at(["a", "b"], 1))\n`,
-  `function note(s: string) {\n  const xs = [s]\n  print(xs[0])\n}\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
+  `function note(s: string) {\n  const xs = [[s]]\n  print(xs[0][0])\n}\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
   `type K = "p" | "q"\nfunction pick(c: boolean): K {\n  if c { return "p" }\n  return "q"\n}\nprint(pick(true) == "p")\n`,
   `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
   `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
@@ -250,6 +251,13 @@ print(guard(2))
   `function has(x: string | null): boolean { return x != null }\nconst xs: (string | null)[] = [null, "a"]\nprint(has(xs[0]))\nprint(has(xs[1]))\n`,
   `function hr(x: string | null): boolean { return null != x }\nconst xs: (string | null)[] = [null, "a"]\nprint(hr(xs[1]))\n`,
   `function pn(x: string | null) { print(x) }\nconst xs: (string | null)[] = [null, "a"]\npn(xs[0])\npn(xs[1])\n`,
+  `function li(x: i32): i32[] { return [x, x + 1, 3] }\nconst xs = li(4)\nprint(xs[0] + xs[1] + xs[2] + xs.length)\n`,
+  `function lf(x: i32, y: f64): f64[] { return [x, y] }\nconst xs = lf(2, 0.5)\nprint(xs[0] + xs[1])\n`,
+  `function ll(x: i64): i64[] { return [x, x * 2] }\nconst xs = ll(5)\nprint(xs[1])\n`,
+  `function lg(x: f32): f32[] { return [x] }\nconst h: f32 = 1.5\nprint(lg(h)[0])\n`,
+  `function ls(s: string): string[] { return [s, s + "!"] }\nprint(ls("a")[1])\n`,
+  `function lb(x: i32): boolean[] { return [x > 1, x > 5] }\nprint(lb(3)[0])\n`,
+  `function le(): i32[] { return [] }\nprint(le().length)\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -262,6 +270,28 @@ Deno.test({
         throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
+  },
+});
+
+// A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
+// locals, and a nested list literal is a ref list: each a named miss, never a byte mismatch.
+Deno.test({
+  name: "ir shadow: a reserved list binding and a nested list literal are named misses",
+  ignore,
+  fn: () => {
+    const src = `function rv(x: i32): i32 {
+  const a: i32[] = []
+  a.push(x)
+  return a.length
+}
+function ln(x: i32): i32[][] { return [[x], [x, x]] }
+print(rv(2) + ln(2)[1].length)
+`;
+    const { rows } = run(src, true);
+    for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
+      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -429,7 +459,7 @@ print(two("a", "b"))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers coalesce string default + expression array";
+    const want = "blockers coalesce string default";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }

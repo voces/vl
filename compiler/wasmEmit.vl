@@ -14354,14 +14354,10 @@ function emitArrF32(elems: i32[], fnIx: i32) {
   }
   if dstF32 >= 0 {
     fbLocalGet(dstF32)
-    fbRefAsNonNull() // the chunk-built f32 backing
-  } else {
-    fbBacking(fa32Ty(), elems.length) // builds the f32 backing
+    fbRefAsNonNull() // the chunk-built backing
+    return arrLitLenCap(elems.length, fl32Ty())
   }
-  fbI32Const(elems.length) // len
-  fbI32Const(elems.length) // cap
-  fbStructNew(fl32Ty()) // the f32-list wrapper
-  return 0
+  return arrLitShortTail("f32", elems.length)
 }
 
 // The v128-list arm of `emitArrUnder`: each element is a vector already, so it lowers as itself.
@@ -14418,14 +14414,10 @@ function emitArrF64(arrIx: i32, elems: i32[], fnIx: i32) {
   }
   if dstF64 >= 0 {
     fbLocalGet(dstF64)
-    fbRefAsNonNull() // the chunk-built f64 backing
-  } else {
-    fbBacking(fa64Ty(), elems.length) // 0xfb 0x08; builds the f64 backing
+    fbRefAsNonNull() // the chunk-built backing
+    return arrLitLenCap(elems.length, fl64Ty())
   }
-  fbI32Const(elems.length) // 0x41 i32.const (len)
-  fbI32Const(elems.length) // 0x41 i32.const (cap)
-  fbStructNew(fl64Ty()) // 0xfb 0x00 <f64-list wrapper struct type index>
-  return 0
+  return arrLitShortTail("f64", elems.length)
 }
 
 // The i64-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
@@ -14453,14 +14445,10 @@ function emitArrI64(elems: i32[], fnIx: i32) {
   }
   if dstI64 >= 0 {
     fbLocalGet(dstI64)
-    fbRefAsNonNull() // the chunk-built i64 backing
-  } else {
-    fbBacking(ia64Ty(), elems.length) // builds the i64 backing
+    fbRefAsNonNull() // the chunk-built backing
+    return arrLitLenCap(elems.length, il64Ty())
   }
-  fbI32Const(elems.length) // len
-  fbI32Const(elems.length) // cap
-  fbStructNew(il64Ty()) // the i64-list wrapper
-  return 0
+  return arrLitShortTail("i64", elems.length)
 }
 
 // The string-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on
@@ -14498,14 +14486,10 @@ function emitArrStr(arrIx: i32, elems: i32[], fnIx: i32) {
   }
   if dstStr >= 0 {
     fbLocalGet(dstStr)
-    fbRefAsNonNull() // the chunk-built string-ref backing
-  } else {
-    fbBacking(mkArrTy(), elems.length) // 0xfb 0x08; builds the string-ref backing
+    fbRefAsNonNull() // the chunk-built backing
+    return arrLitLenCap(elems.length, mkListTy())
   }
-  fbI32Const(elems.length) // 0x41 i32.const (len)
-  fbI32Const(elems.length) // 0x41 i32.const (cap)
-  fbStructNew(mkListTy())  // 0xfb 0x00 <string-list wrapper struct type index>
-  return 0
+  return arrLitShortTail("str", elems.length)
 }
 
 // The ref-list arm of `emitArrUnder`: the element slot comes from a threaded annotation, else
@@ -14762,15 +14746,10 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
   }
   if dstI32 >= 0 {
     fbLocalGet(dstI32)
-    fbRefAsNonNull() // the chunk-built raw backing
-  } else {
-    fbBacking(aTy(), elems.length) // 0xfb 0x08; builds the raw backing
+    fbRefAsNonNull() // the chunk-built backing
+    return arrLitLenCap(elems.length, lTy())
   }
-  // Wrap { backing, len = count, cap = count } via struct.new.
-  fbI32Const(elems.length) // 0x41 i32.const (len)
-  fbI32Const(elems.length) // 0x41 i32.const (cap)
-  fbStructNew(lTy())       // 0xfb 0x00 <list wrapper struct type index>
-  return 0
+  return arrLitShortTail("i32", elems.length)
 }
 
 // Whether a non-empty literal's elements are all bare `null`s, so name no element kind.
@@ -14789,180 +14768,278 @@ function arrElemsAllNull(elems: i32[]): boolean {
 function emitArrUnder(arrIx: i32, fnIx: i32, lb: ListBuild) {
   arrLitMint(arrIx)
   const a = nodeAt(arrIx)
-  if a is ArrayLit {
-    const elems = a.arrElems
-    if hasSpreadItem(elems) { return emitArrSpread(arrIx, fnIx, lb) }
-    if monoIsClashLit(arrIx) {
-      return emitFailAt(
-        "emitProgram: a list literal around a generic call whose `??` default is a list of "
-          + "another element at this type argument has no lowering yet; give the default the "
-          + "operand's own element type",
-        arrIx,
+  const arm = arrLitArmOf(arrIx, fnIx, lb)
+  if !(a is ArrayLit) || arm == "notLit" {
+    return emitFail("emitProgram: expected an array literal")
+  }
+  const elems = a.arrElems
+  if arm == "spread" { return emitArrSpread(arrIx, fnIx, lb) }
+  if arm == "clash" {
+    return emitFailAt(
+      "emitProgram: a list literal around a generic call whose `??` default is a list of "
+        + "another element at this type argument has no lowering yet; give the default the "
+        + "operand's own element type",
+      arrIx,
+    )
+  }
+  // An empty `[]` whose pair is the i32 default builds at the element type the checker
+  // pinned on the literal itself — a join arm's sibling, a return's witness (D2209).
+  if arm == "emptyHole" {
+    const hb: ListBuild = {
+      lbKind: emptyArrHoleBuildKind(arrIx, fnIx),
+      lbSlot: emptyArrHoleBuildSlot(arrIx, fnIx),
+    }
+    return emitArrUnder(arrIx, fnIx, hb)
+  }
+  if arm == "v128" { return emitArrV128(elems, fnIx) }
+  if arm == "u8" { return emitArrU8(elems, fnIx, lb.lbSlot) }
+  if arm == "f32" { return emitArrF32(elems, fnIx) }
+  if arm == "f64" { return emitArrF64(arrIx, elems, fnIx) }
+  if arm == "i64" { return emitArrI64(elems, fnIx) }
+  if arm == "str" { return emitArrStr(arrIx, elems, fnIx) }
+  if arm == "ref" { return emitArrRef(arrIx, elems, fnIx, lb) }
+  return emitArrI32(arrIx, elems, fnIx, lb.lbKind)
+}
+
+// After a short list literal's elements: its backing built by `array.new_fixed` at arm `arm`'s
+// heap types, then the length and capacity, both `n`, and the wrapper.
+export function arrLitShortTail(arm: ArrLitArm, n: i32): i32 {
+  return match arm {
+    "i32" => arrLitBackWrap(aTy(), lTy(), n)
+    "f64" => arrLitBackWrap(fa64Ty(), fl64Ty(), n)
+    "i64" => arrLitBackWrap(ia64Ty(), il64Ty(), n)
+    "f32" => arrLitBackWrap(fa32Ty(), fl32Ty(), n)
+    "str" => arrLitBackWrap(mkArrTy(), mkListTy(), n)
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "u8" | "ref" => {
+      emitFail(
+        "emitProgram: internal: a short list literal tail for an arm with its own builder",
       )
     }
-    // An empty `[]` whose pair is the i32 default builds at the element type the checker
-    // pinned on the literal itself — a join arm's sibling, a return's witness (D2209).
-    if elems.length == 0 && lb.lbKind == LBK_I32_LIST {
-      const hbk = emptyArrHoleBuildKind(arrIx, fnIx)
-      if hbk != LBK_I32_LIST {
-        const hb: ListBuild = {
-          lbKind: hbk,
-          lbSlot: emptyArrHoleBuildSlot(arrIx, fnIx),
-        }
-        return emitArrUnder(arrIx, fnIx, hb)
-      }
-    }
-    // A vector literal is a v128 list whatever its pair says, since no other list holds one.
-    const vty = nodeTyIxOf(arrIx)
-    const vat = if vty >= 0 && vty < T.tys.length { tyAt(vty) } else { null }
-    if (
-      lb.lbKind == LBK_V128_LIST
-      || (vat is TyArray && primNameOf(tyElemOf(vat)) == "v128")
-    ) {
-      return emitArrV128(elems, fnIx)
-    }
-    // Which (backing, wrapper) pair the literal builds — `lb.lbKind` 1/2 a ref backing, 3 a
-    // string one, 4 f64, 6 i64, 7 f32, anything else the default `$lTypeIdx` i32 list. Two signals
-    // answer it: the literal's own elements (`arrLitIs*`) and the build pair `lb`, from the
-    // literal's type. A pair's kind is authoritative and clears what it displaces.
-    let isRefLit = arrLitIsRef(arrIx, fnIx)
-    let isStrLit = arrLitIsStr(arrIx, fnIx)
-    const numKind = arrLitNumKind(arrIx, fnIx)
-    let isF64Lit = numKind == ALK_F64
-    let isI64Lit = numKind == ALK_I64
-    // A literal whose elements are all f32-typed values self-identifies, exactly as the f64 and
-    // i64 forms above do. A bare float literal stays f64 — `arrLitIsF32` claims only `exprIsF32`
-    // elements, and a `.` literal is deliberately not one — so an annotation remains the only
-    // route to `[1.5]` as an f32 list.
-    let isF32Lit = arrLitIsF32(arrIx, fnIx)
-    if lb.lbKind == LBK_I64_LIST {
-      isI64Lit = true
-      isF64Lit = false
-      isStrLit = false
-      isF32Lit = false
-    }
-    if lb.lbKind == LBK_F64_LIST {
-      isF64Lit = true
-      isI64Lit = false
-      isStrLit = false
-      isF32Lit = false
-    }
-    if lb.lbKind == LBK_F32_LIST {
-      isF32Lit = true
-      isF64Lit = false
-      isI64Lit = false
-      isStrLit = false
-    }
-    // A string-list pair claims a literal whose elements name no kind of their own: a
-    // `(string | null)[]` niche under a threaded `null` seed, as in a run a variadic `.push`
-    // appends (D4553), or an all-`null` run of a spread literal (D2964). An atom literal under
-    // the pair stays an atom list, which the spread converts.
-    if (
-      lb.lbKind == LBK_STR_LIST
-      && !isRefLit
-      && (listCtxElemIsNulStr(arrIx, fnIx) || arrElemsAllNull(elems))
-    ) {
-      isStrLit = true
-      isF64Lit = false
-      isI64Lit = false
-      isF32Lit = false
-    }
-    if elems.length == 0 {
-      if lb.lbKind == LBK_STR_LIST {
-        isStrLit = true
-      } else if lb.lbKind == LBK_F64_LIST {
-        isF64Lit = true
-      } else if lb.lbKind == LBK_I64_LIST {
-        isI64Lit = true
-      } else if lb.lbKind == LBK_F32_LIST {
-        isF32Lit = true
-      } else if lb.lbKind == LBK_NUL_BOOL_LIST {
-        // A `(boolean | null)[]` empty literal — a plain i32-list wrapper (the boolean
-        // sentinel niche shares the i32 backing); nothing to force here.
-      } else {
-        if lb.lbKind != LBK_I32_LIST { isRefLit = true }
-      }
-    }
-    // A non-empty literal under a threaded union-list annotation (kind 2) is a ref literal even
-    // when its elements are bare scalars or strings: a `(string|i32)[]` literal's elements coerce
-    // into the union box at the write boundary, they do not type the list. Without the annotation
-    // a scalar literal stays the i32 list.
-    if lb.lbKind == LBK_UNION {
-      isRefLit = true
-      isStrLit = false
-      isF64Lit = false
-      // An `(i64 | null)[]` literal's i64-typed first element must not claim the scalar
-      // i64-list path — the elements box (kind 2), like the f64/string forms above.
-      isI64Lit = false
-      // An `(f32 | null)[]` literal's f32 elements box the same way.
-      isF32Lit = false
-    }
-    // A closure-element list (kind 5, `((i32) => i32)[]`): a literal of function values reads as
-    // bare idents, so `arrLitIsRef` — which keys off an objlit or nested-array first element —
-    // misses it, and the threaded annotation is authoritative. `isI64Lit` clears too, or a
-    // ref-list value with an i64-magnitude first element would build the scalar i64 wrapper.
-    if lb.lbKind == LBK_REF_AT_SLOT {
-      isRefLit = true
-      isStrLit = false
-      isF64Lit = false
-      isI64Lit = false
-      isF32Lit = false
-    }
-    // A STRUCT ref-list (kind 1) under a threaded annotation: authoritative, like kind 2/5.
-    // Matters for a NULLABLE-struct array (`(P | null)[]`) whose FIRST element is `null` —
-    // `arrLitIsRef` keys off the first element (a `null` is neither objlit nor nested array)
-    // and would otherwise mis-route the literal to the i32-list path.
-    if lb.lbKind == LBK_REF {
-      isRefLit = true
-      isStrLit = false
-      isF64Lit = false
-      isI64Lit = false
-      isF32Lit = false
-    }
-    // An ATOM-element literal whose recorded type is a `K[]` (a field or binding): the member elements are STRING exprs syntactically (`arrLitIsStr`
-    // would claim the string-list build), but each lowers as its interned i32 atom id —
-    // the i32-list path is authoritative, like the kind overrides above.
-    if arrLitTakesAtom(arrIx, fnIx) {
-      isRefLit = false
-      isStrLit = false
-      isF64Lit = false
-      isI64Lit = false
-      isF32Lit = false
-    }
-    // A `(K | null)[]` literal (kind 9, or a probe-detected element type unless a union-box
-    // destination is threaded, D3174): member elements lower as atom ids and `null` as -1, so the
-    // i32-list path is authoritative over `arrLitIsStr`'s string-literal claim. The element seeds
-    // are set further below.
-    if (
-      lb.lbKind == LBK_NUL_LIT_UNION_LIST
-      || (nodeArrayElemIsNulLitUnion(arrIx) && lb.lbKind != LBK_UNION)
-    ) {
-      isRefLit = false
-      isStrLit = false
-      isF64Lit = false
-      isI64Lit = false
-      isF32Lit = false
-    }
-    // A `u8[]` literal (`lb.lbKind == 10`) — the packed byte list. Checked ahead of every
-    // scalar arm below and returning directly, because the elements are ordinary i32 expressions:
-    // nothing about the literal itself says `u8`, only the threaded annotation does. Each element
-    // is emitted as a plain i32 and `array.new_fixed` truncates it into the packed byte.
-
-    // 13 is `nulu8list`, a `u8[] | null` destination: the same packed path with a nullable cell.
-    // Its three siblings each get an arm above (4 f64, 6 i64, 7 f32) that flips the literal's
-    // element flag; without one, the literal falls to the default i32 backing while the cell is
-    // typed as the packed wrapper — two heap types for one value (D983).
-    if (lb.lbKind == LBK_U8_LIST || lb.lbKind == LBK_NUL_U8_LIST) {
-      return emitArrU8(elems, fnIx, lb.lbSlot)
-    }
-    if isF32Lit { return emitArrF32(elems, fnIx) }
-    if isF64Lit { return emitArrF64(arrIx, elems, fnIx) }
-    if isI64Lit { return emitArrI64(elems, fnIx) }
-    if isStrLit { return emitArrStr(arrIx, elems, fnIx) }
-    if isRefLit { return emitArrRef(arrIx, elems, fnIx, lb) }
-    return emitArrI32(arrIx, elems, fnIx, lb.lbKind)
   }
-  return emitFail("emitProgram: expected an array literal")
+}
+
+// `n` elements' backing of heap type `back`, then the wrapper `wrap` around it.
+function arrLitBackWrap(back: i32, wrap: i32, n: i32): i32 {
+  fbBacking(back, n)
+  return arrLitLenCap(n, wrap)
+}
+
+// After a list's backing: the length and capacity, both `n`, and `struct.new` of wrapper `wrap`.
+function arrLitLenCap(n: i32, wrap: i32): i32 {
+  fbI32Const(n) // len
+  fbI32Const(n) // cap
+  fbStructNew(wrap)
+  return 0
+}
+
+// Before a list literal's elements, at build pair `lb`: its spread record noted and its types
+// minted, as `emitArr` does first.
+export function arrLitPrologue(arrIx: i32): i32 {
+  elabSpreadNote(arrIx)
+  arrLitMint(arrIx)
+  return 0
+}
+
+// The build pair list literal `arrIx` takes in `fnIx` (`arrLitListBuild`), for the IR.
+export function arrLitBuildOf(arrIx: i32, fnIx: i32): ListBuild {
+  return arrLitListBuild(arrIx, fnIx)
+}
+
+// Whether list literal `arrIx` of `n` elements builds at arm `arm` with `array.new_fixed` and the
+// short tail: within the chunk cap (a string list's own), the `for` iterable's hoist aside, and,
+// for the i32 list, no element seeded as an atom or a `null` sentinel.
+export function arrLitShort(
+  arrIx: i32,
+  fnIx: i32,
+  arm: ArrLitArm,
+  n: i32,
+): boolean {
+  const cap = if arm == "str" { allocLitChunk() } else { NEW_FIXED_MAX }
+  if n > cap || arrLitIsForIter(arrIx) { return false }
+  if arm != "i32" { return true }
+  return !nodeArrayElemIsLitUnion(arrIx) && !arrElemIsNullUnitAt(arrIx, fnIx)
+}
+
+// Whether list literal `arrIx` is the `for` iterable whose constants hoist into a module list.
+export function arrLitIsForIter(arrIx: i32): boolean {
+  return arrIx == gForIterLit
+}
+
+// Which builder list literal `arrIx` takes at build pair `lb` (`emitArrUnder`'s arms): a spread,
+// a refused clash, an empty literal rebuilt at its pinned element, a v128, packed u8, f32, f64,
+// i64, string or ref list, else the i32 list. `notLit` is a node that is no list literal.
+export type ArrLitArm = "notLit"
+  | "spread"
+  | "clash"
+  | "emptyHole"
+  | "v128"
+  | "u8"
+  | "f32"
+  | "f64"
+  | "i64"
+  | "str"
+  | "ref"
+  | "i32"
+export function arrLitArmOf(arrIx: i32, fnIx: i32, lb: ListBuild): ArrLitArm {
+  const a = nodeAt(arrIx)
+  if !(a is ArrayLit) { return "notLit" }
+  const elems = a.arrElems
+  if hasSpreadItem(elems) { return "spread" }
+  if monoIsClashLit(arrIx) { return "clash" }
+  if (
+    elems.length == 0
+    && lb.lbKind == LBK_I32_LIST
+    && emptyArrHoleBuildKind(arrIx, fnIx) != LBK_I32_LIST
+  ) {
+    return "emptyHole"
+  }
+  // A vector literal is a v128 list whatever its pair says, since no other list holds one.
+  const vty = nodeTyIxOf(arrIx)
+  const vat = if vty >= 0 && vty < T.tys.length { tyAt(vty) } else { null }
+  if (
+    lb.lbKind == LBK_V128_LIST
+    || (vat is TyArray && primNameOf(tyElemOf(vat)) == "v128")
+  ) {
+    return "v128"
+  }
+  // Which (backing, wrapper) pair the literal builds — `lb.lbKind` 1/2 a ref backing, 3 a
+  // string one, 4 f64, 6 i64, 7 f32, anything else the default `$lTypeIdx` i32 list. Two signals
+  // answer it: the literal's own elements (`arrLitIs*`) and the build pair `lb`, from the
+  // literal's type. A pair's kind is authoritative and clears what it displaces.
+  let isRefLit = arrLitIsRef(arrIx, fnIx)
+  let isStrLit = arrLitIsStr(arrIx, fnIx)
+  const numKind = arrLitNumKind(arrIx, fnIx)
+  let isF64Lit = numKind == ALK_F64
+  let isI64Lit = numKind == ALK_I64
+  // A literal whose elements are all f32-typed values self-identifies, exactly as the f64 and
+  // i64 forms above do. A bare float literal stays f64 — `arrLitIsF32` claims only `exprIsF32`
+  // elements, and a `.` literal is deliberately not one — so an annotation remains the only
+  // route to `[1.5]` as an f32 list.
+  let isF32Lit = arrLitIsF32(arrIx, fnIx)
+  if lb.lbKind == LBK_I64_LIST {
+    isI64Lit = true
+    isF64Lit = false
+    isStrLit = false
+    isF32Lit = false
+  }
+  if lb.lbKind == LBK_F64_LIST {
+    isF64Lit = true
+    isI64Lit = false
+    isStrLit = false
+    isF32Lit = false
+  }
+  if lb.lbKind == LBK_F32_LIST {
+    isF32Lit = true
+    isF64Lit = false
+    isI64Lit = false
+    isStrLit = false
+  }
+  // A string-list pair claims a literal whose elements name no kind of their own: a
+  // `(string | null)[]` niche under a threaded `null` seed, as in a run a variadic `.push`
+  // appends (D4553), or an all-`null` run of a spread literal (D2964). An atom literal under
+  // the pair stays an atom list, which the spread converts.
+  if (
+    lb.lbKind == LBK_STR_LIST
+    && !isRefLit
+    && (listCtxElemIsNulStr(arrIx, fnIx) || arrElemsAllNull(elems))
+  ) {
+    isStrLit = true
+    isF64Lit = false
+    isI64Lit = false
+    isF32Lit = false
+  }
+  if elems.length == 0 {
+    if lb.lbKind == LBK_STR_LIST {
+      isStrLit = true
+    } else if lb.lbKind == LBK_F64_LIST {
+      isF64Lit = true
+    } else if lb.lbKind == LBK_I64_LIST {
+      isI64Lit = true
+    } else if lb.lbKind == LBK_F32_LIST {
+      isF32Lit = true
+    } else if lb.lbKind == LBK_NUL_BOOL_LIST {
+      // A `(boolean | null)[]` empty literal — a plain i32-list wrapper (the boolean
+      // sentinel niche shares the i32 backing); nothing to force here.
+    } else {
+      if lb.lbKind != LBK_I32_LIST { isRefLit = true }
+    }
+  }
+  // A non-empty literal under a threaded union-list annotation (kind 2) is a ref literal even
+  // when its elements are bare scalars or strings: a `(string|i32)[]` literal's elements coerce
+  // into the union box at the write boundary, they do not type the list. Without the annotation
+  // a scalar literal stays the i32 list.
+  if lb.lbKind == LBK_UNION {
+    isRefLit = true
+    isStrLit = false
+    isF64Lit = false
+    // An `(i64 | null)[]` literal's i64-typed first element must not claim the scalar
+    // i64-list path — the elements box (kind 2), like the f64/string forms above.
+    isI64Lit = false
+    // An `(f32 | null)[]` literal's f32 elements box the same way.
+    isF32Lit = false
+  }
+  // A closure-element list (kind 5, `((i32) => i32)[]`): a literal of function values reads as
+  // bare idents, so `arrLitIsRef` — which keys off an objlit or nested-array first element —
+  // misses it, and the threaded annotation is authoritative. `isI64Lit` clears too, or a
+  // ref-list value with an i64-magnitude first element would build the scalar i64 wrapper.
+  if lb.lbKind == LBK_REF_AT_SLOT {
+    isRefLit = true
+    isStrLit = false
+    isF64Lit = false
+    isI64Lit = false
+    isF32Lit = false
+  }
+  // A STRUCT ref-list (kind 1) under a threaded annotation: authoritative, like kind 2/5.
+  // Matters for a NULLABLE-struct array (`(P | null)[]`) whose FIRST element is `null` —
+  // `arrLitIsRef` keys off the first element (a `null` is neither objlit nor nested array)
+  // and would otherwise mis-route the literal to the i32-list path.
+  if lb.lbKind == LBK_REF {
+    isRefLit = true
+    isStrLit = false
+    isF64Lit = false
+    isI64Lit = false
+    isF32Lit = false
+  }
+  // An ATOM-element literal whose recorded type is a `K[]` (a field or binding): the member elements are STRING exprs syntactically (`arrLitIsStr`
+  // would claim the string-list build), but each lowers as its interned i32 atom id —
+  // the i32-list path is authoritative, like the kind overrides above.
+  if arrLitTakesAtom(arrIx, fnIx) {
+    isRefLit = false
+    isStrLit = false
+    isF64Lit = false
+    isI64Lit = false
+    isF32Lit = false
+  }
+  // A `(K | null)[]` literal (kind 9, or a probe-detected element type unless a union-box
+  // destination is threaded, D3174): member elements lower as atom ids and `null` as -1, so the
+  // i32-list path is authoritative over `arrLitIsStr`'s string-literal claim. The element seeds
+  // are set further below.
+  if (
+    lb.lbKind == LBK_NUL_LIT_UNION_LIST
+    || (nodeArrayElemIsNulLitUnion(arrIx) && lb.lbKind != LBK_UNION)
+  ) {
+    isRefLit = false
+    isStrLit = false
+    isF64Lit = false
+    isI64Lit = false
+    isF32Lit = false
+  }
+  // A `u8[]` literal (`lb.lbKind == 10`) — the packed byte list. Checked ahead of every
+  // scalar arm below and returning directly, because the elements are ordinary i32 expressions:
+  // nothing about the literal itself says `u8`, only the threaded annotation does. Each element
+  // is emitted as a plain i32 and `array.new_fixed` truncates it into the packed byte.
+
+  // 13 is `nulu8list`, a `u8[] | null` destination: the same packed path with a nullable cell.
+  // Its three siblings each get an arm above (4 f64, 6 i64, 7 f32) that flips the literal's
+  // element flag; without one, the literal falls to the default i32 backing while the cell is
+  // typed as the packed wrapper — two heap types for one value (D983).
+  if lb.lbKind == LBK_U8_LIST || lb.lbKind == LBK_NUL_U8_LIST { return "u8" }
+  if isF32Lit { return "f32" }
+  if isF64Lit { return "f64" }
+  if isI64Lit { return "i64" }
+  if isStrLit { return "str" }
+  if isRefLit { return "ref" }
+  return "i32"
 }
 
 // ── G8: string-keyed maps — the open-addressing hash map ─────────────────────
@@ -34192,7 +34269,34 @@ const LIST_RESERVE_MAX = 65536
 
 // What a reserve scan found: the elements the pushes add, the push nodes counted, and the
 // last statement that pushes.
-type ListReserve = { lrCount: i32, lrPushes: i32[], lrLast: i32 }
+export type ListReserve = { lrCount: i32, lrPushes: i32[], lrLast: i32 }
+
+// The pushes a fresh `[]` binding `s`, at position `pos` of statement list `stmts`, takes before
+// any other use of it, as `emitListReserve` counts them; null when it is no `[]` or none follow.
+export function listReserveScan(
+  s: LetDecl,
+  stmts: i32[],
+  pos: i32,
+  fnIx: i32,
+): ListReserve | null {
+  const init = nodeAt(unwrapParen(s.letInit))
+  if !(init is ArrayLit) || init.arrElems.length != 0 { return null }
+  const r: ListReserve = { lrCount: 0, lrPushes: [], lrLast: -1 }
+  let j = pos + 1
+  while j < stmts.length {
+    const c = reservePushCount(stmts[j], s.letName, r, fnIx)
+    if c < 0 {
+      j = stmts.length
+    } else {
+      r.lrCount = r.lrCount + c
+      if c > 0 { r.lrLast = j }
+      j = j + 1
+    }
+    if r.lrCount > LIST_RESERVE_MAX { return null }
+  }
+  if r.lrCount <= 0 || r.lrPushes.length == 0 { return null }
+  return r
+}
 
 // A fresh `[]` binding whose next uses are unconditional `push`es inside constant-trip range
 // loops gets its backing at the final size, and those pushes append through locals while the
@@ -34210,28 +34314,11 @@ function emitListReserve(
   if pos < 0 || pos >= letSibStmts.length || letSibStmts[pos] != stmtIx {
     return 0
   }
-  const init = nodeAt(unwrapParen(s.letInit))
-  if !(init is ArrayLit) { return 0 }
-  if init is ArrayLit {
-    if init.arrElems.length != 0 { return 0 }
-  }
   const want = reserveListKindOfSlot(localIsRef[slot])
   if want == null { return 0 }
   const stmts = letSibStmts
-  const r: ListReserve = { lrCount: 0, lrPushes: [], lrLast: -1 }
-  let j = pos + 1
-  while j < stmts.length {
-    const c = reservePushCount(stmts[j], s.letName, r, fnIx)
-    if c < 0 {
-      j = stmts.length
-    } else {
-      r.lrCount = r.lrCount + c
-      if c > 0 { r.lrLast = j }
-      j = j + 1
-    }
-    if r.lrCount > LIST_RESERVE_MAX { return 0 }
-  }
-  if r.lrCount <= 0 || r.lrPushes.length == 0 { return 0 }
+  const r = listReserveScan(s, stmts, pos, fnIx)
+  if r == null { return 0 }
   const recv = listPushRecv(r.lrPushes[0])
   if mfRecvKindOf(recv, fnIx) != want { return 0 }
   let row = 0
