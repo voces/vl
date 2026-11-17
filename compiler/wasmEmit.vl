@@ -4346,7 +4346,13 @@ export type NulTestArm = "nnfold"
   | "nullty"
   | "bool"
   | "atom"
-  | "rest"
+  | "optChain"
+  | "mapHas"
+  | "boxTag"
+  | "nullRef"
+  | "nulStr"
+  | "instMap"
+  | "none"
 
 // The null-test arm of `refIx` in function `fnIx`, as `emitNulIsNullTest` takes it.
 export function nulTestArmOf(
@@ -4367,7 +4373,24 @@ export function nulTestArmOf(
   }
   if exprNulBool(refIx, fnIx) { return "bool" }
   if exprNulLitUnion(refIx, fnIx) { return "atom" }
-  return "rest"
+  if !nicheOnly {
+    if nodeAt(unwrapParen(refIx)) is OptMember { return "optChain" }
+    if (
+      mapReadScalarBoxKindIn(refIx, fnIx) >= 0
+      && nodeAt(unwrapParen(refIx)) is Index
+    ) {
+      return "mapHas"
+    }
+    if exprUnion(refIx, fnIx) || nodeTyIsNulNumLitUnion(refIx) {
+      return "boxTag"
+    }
+  }
+  if nodeRepIsNullRef(refIx, fnIx) { return "nullRef" }
+  // Read raw: a `string | null` ident is otherwise recovered to non-null, and `ref.is_null`
+  // would be a constant 0.
+  if exprNullableString(refIx, fnIx) { return "nulStr" }
+  if !nicheOnly { return "instMap" }
+  return "none"
 }
 
 // After a `K | null` value: its compare with the sentinel below every atom id, `i32.ne` for
@@ -4424,51 +4447,46 @@ function emitNulIsNullTest(
     if emitExpr(refIx, fnIx) < 0 { return -1 }
     return nulTestAtomTail(invert)
   }
-  if !nicheOnly {
-    const ncN = nodeAt(unwrapParen(refIx))
-    if ncN is OptMember {
-      const ncSv = optRecvStageSave()
-      optRecvStageMark(refIx)
-      if emitOptChainIsNull(refIx, fnIx) < 0 { return -1 }
-      optRecvStageRestore(ncSv)
-      if invert { fbI32Eqz() }
-      return 1
-    }
-
-    if mapReadScalarBoxKindIn(refIx, fnIx) >= 0 {
-      const mnRef = nodeAt(unwrapParen(refIx))
-      if mnRef is Index {
-        if emitMapHas(mnRef.idxArr, mnRef.idxIndex, fnIx) < 0 { return -1 }
-        if !invert { fbI32Eqz() }
-        return 1
-      }
-    }
-    if exprUnion(refIx, fnIx) || nodeTyIsNulNumLitUnion(refIx) {
-      if emitExpr(refIx, fnIx) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, nullBoxTag())
-      if invert { fbI32Bin(71) } else { fbI32Bin(70) }
-      return 1
-    }
-  }
-
-  if nodeRepIsNullRef(refIx, fnIx) {
-    if emitExpr(refIx, fnIx) < 0 { return -1 }
-    fbRefIsNull()
+  if arm == "optChain" {
+    const ncSv = optRecvStageSave()
+    optRecvStageMark(refIx)
+    if emitOptChainIsNull(refIx, fnIx) < 0 { return -1 }
+    optRecvStageRestore(ncSv)
     if invert { fbI32Eqz() }
     return 1
   }
-
-  if exprNullableString(refIx, fnIx) {
-    // the one arm that must read the receiver raw: a kind-16 ident is otherwise recovered
-    // to non-null, which would make `ref.is_null` a const 0.
+  if arm == "mapHas" {
+    const mnRef = nodeAt(unwrapParen(refIx))
+    if mnRef is Index {
+      if emitMapHas(mnRef.idxArr, mnRef.idxIndex, fnIx) < 0 { return -1 }
+      if !invert { fbI32Eqz() }
+      return 1
+    }
+    return -1
+  }
+  if arm == "boxTag" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
-    fbRefIsNull()
-    if invert { fbI32Eqz() }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    if invert { fbI32Bin(71) } else { fbI32Bin(70) }
     return 1
   }
-  if !nicheOnly { return emitInstMapReadIsNull(refIx, fnIx, invert) }
-  return 0
+  if arm == "nullRef" || arm == "nulStr" {
+    if emitExpr(refIx, fnIx) < 0 { return -1 }
+    return nulTestRefTail(invert)
+  }
+  if arm == "instMap" { return emitInstMapReadIsNull(refIx, fnIx, invert) }
+  // A niche-only test of no niche is no claim.
+  if arm == "none" { return 0 }
+  return emitFail("emitProgram: internal: a null test arm with no lowering")
+}
+
+// After a nullable ref's raw value: `ref.is_null`, then `i32.eqz` for `invert`. Returns 1, the
+// ladder's "claimed".
+export function nulTestRefTail(invert: boolean): i32 {
+  fbRefIsNull()
+  if invert { fbI32Eqz() }
+  return 1
 }
 
 // The null test of a map read `m[k]` / `m.get(k)` whose instance pins the map's value to a
@@ -37468,11 +37486,23 @@ function emitPrintNullWord() {
 // handle it. One `br_on_null` covers the argument in a single evaluation — there is no
 // nullable string local to stash it in, and re-evaluating would call a `string | null`-returning function twice.
 function emitPrintNulString(argIx: i32, fnIx: i32) {
-  fbBlock(64) // $out
-  fbBlock(64) // $null
+  printNulStrOpen()
   // The RAW nullable ref: the argument is typed `string | null`, so its read stays raw
   // (`nulStrReadRecovers`) and `br_on_null` sees the null a recovery would trap on.
   if emitExpr(argIx, fnIx) < 0 { return -1 }
+  return printNulStrTail()
+}
+
+// Before a `print` of a `string | null`: the `$out` block, then the `$null` block.
+export function printNulStrOpen(): i32 {
+  fbBlock(64) // $out
+  fbBlock(64) // $null
+  return 0
+}
+
+// After a `print` argument's raw `string | null`: a null branches to the word `null`, a string
+// streams its code points, and both leave through `$out`.
+export function printNulStrTail(): i32 {
   fbBrOnNull(0) // → $null (the enclosing block)
   fbLocalSet(strScratchBase + 0)
   if emitPrintStrFromScratch() < 0 { return -1 }
