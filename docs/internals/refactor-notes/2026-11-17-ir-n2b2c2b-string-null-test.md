@@ -35,17 +35,20 @@ Each is a shared witness, one covered function matching legacy and printing the 
 
 ## Coverage
 
+The census's 41 and 18 counted functions with one other blocker each; most of those also
+stop at a third, so the corpus gain is smaller than their sum.
+
 | reading | 2c-2a | this step | gained |
 |---|---:|---:|---:|
 | self-compile claimed in mode 3 | 5,732 | 5,734 | +2 |
-| corpus covered = matched (12,296 cells) | 24,099 | S3COV | S3GAIN |
+| corpus covered = matched (12,296 cells) | 24,099 | 24,120 | +21 |
 
 ## Bars
 
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches 2c-2a already reports |
-| corpus identity against the 2c-2a seed, 12,294 cells | IDROW |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,734 claimed and byte-identical, the same 2 fallbacks; corpus M3ROW |
-| L2 self-compile fuel | FUELROW |
-| seed size, 2c-2a seed to this one | SEEDROW |
+| corpus identity against the 2c-2a seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the arm split moves no corpus byte) |
+| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,734 claimed and byte-identical, the same 2 fallbacks; corpus 9,016 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 94,380,806,992 to 94,398,540,067 (+0.02%) |
+| seed size, 2c-2a seed to this one | 6,543,334 to 6,544,190 (+856) |
