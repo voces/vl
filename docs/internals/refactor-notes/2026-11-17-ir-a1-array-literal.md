@@ -64,14 +64,14 @@ A union-element literal stops earlier, at its result rep. Two older tests change
 | reading | 2c-2b | this step | gained |
 |---|---:|---:|---:|
 | self-compile claimed in mode 3 | 5,734 | 6,316 | +582 |
-| corpus covered = matched (12,296 cells) | 24,120 | ALCOV | ALGAIN |
+| corpus covered = matched (12,296 cells) | 24,120 | 25,060 | +940 |
 
 ## Bars
 
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches 2c-2b already reports |
-| corpus identity against the 2c-2b seed, 12,294 cells | IDROW |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,316 claimed and byte-identical, the same 2 fallbacks; corpus M3ROW |
-| L2 self-compile fuel | FUELROW |
-| seed size, 2c-2b seed to this one | SEEDROW |
+| corpus identity against the 2c-2b seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the builder split moves no corpus byte) |
+| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,316 claimed and byte-identical, the same 2 fallbacks; corpus 9,016 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 94,398,540,067 to 94,452,105,313 (+0.06%) |
+| seed size, 2c-2b seed to this one | 6,544,190 to 6,546,352 (+2,162) |
