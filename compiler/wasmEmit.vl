@@ -1413,6 +1413,7 @@ import {
 } from "./emit_nullable_rets"
 import {
   armRowSharedAtRecv,
+  armRowSharedMembers,
   atomNarrowOp,
   boxNarrowAtomFor,
   boxWidenAtomFor,
@@ -6271,6 +6272,128 @@ function emitVariantDiscrimTest(recvIx: i32, vi: i32, fnIx: i32) {
   return 0
 }
 
+// ANDs onto the shared-row fit of `recv is xTy` the literal sets of each nested record field
+// another member stored at row `vi` declares as another record type (D16939); the tag and the
+// top-level fields cannot tell those members apart.
+function emitSharedNestedFits(
+  recv: i32,
+  vi: i32,
+  xTy: i32,
+  fnIx: i32,
+  slot: i32,
+): i32 {
+  if vi < 0 || vi >= uFieldCount.length || vi >= uFieldStart.length { return 0 }
+  if xTy < 0 || xTy >= T.tys.length { return 0 }
+  const xt = tyAt(xTy)
+  if !(xt is TyObj) { return 0 }
+  const mems = armRowSharedMembers(recv, vi)
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    const name = sFieldNames[uFieldStart[vi] + fi]
+    const fx = objFieldType(xt, name)
+    let differs = false
+    if (
+      fx >= 0
+      && tyAt(fx) is TyObj
+      && fieldRowIsRecordRef(uFieldStart[vi] + fi)
+    ) {
+      for m in mems {
+        const mo = tyAt(m)
+        if mo is TyObj {
+          const fm = objFieldType(mo, name)
+          if fm >= 0 && !tyEq(fm, fx) { differs = true }
+        }
+      }
+    }
+    if differs {
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        uFieldStorageSlot(vi, fi),
+      )
+      if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1)
+      fbRefCast(variantHeap(vi))
+      fbStructGet(variantHeap(vi), fi)
+      fbLocalSet(nslot)
+      const nsi = sFieldTgtStructIdx(variantRowOf(vi), fi)
+      if emitRecordLitMembership(nsi, nslot, fx, fnIx) < 0 { return -1 }
+      fbI32Bin(113) // i32.and
+    }
+    fi = fi + 1
+  }
+  return 0
+}
+
+// Leaves 1 when the record in local `rslot`, stored at struct row `si`, holds a member of every
+// literal set record type `xTy` declares, at any depth; a field with no literal set is not read.
+function emitRecordLitMembership(
+  si: i32,
+  rslot: i32,
+  xTy: i32,
+  fnIx: i32,
+): i32 {
+  if si < 0 || si >= sHeapIdx.length || xTy < 0 || !(tyAt(xTy) is TyObj) {
+    return emitFail(
+      "emitProgram: `is` membership reaches a nested record with no struct row",
+    )
+  }
+  const xt = tyAt(xTy)
+  if !(xt is TyObj) { return -1 }
+  const heap = sHeapIdx[si]
+  let terms = 0
+  let i = 0
+  while i < xt.objFieldNames.length {
+    const fx = xt.objFieldTypes[i]
+    const fi = sFieldIndex(si, xt.objFieldNames[i])
+    const r = sFieldFlatRow(si, fi)
+    const lexes = tyLitSetMemberLexes(fx)
+    if (
+      r >= 0
+      && lexes.length > 0
+      && nonNullTy(fx) == fx
+      && !fieldRowIsUnionBox(r)
+    ) {
+      let li = 0
+      while li < lexes.length {
+        fbLocalGet(rslot)
+        fbStructGet(heap, fi)
+        if emitFieldLitEq(r, lexes[li], fnIx) < 0 { return -1 }
+        if li > 0 {
+          fbI32Bin(114) // i32.or
+        }
+        li = li + 1
+      }
+      if terms > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      terms = terms + 1
+    } else if r >= 0 && fieldRowIsRecordRef(r) && tyAt(fx) is TyObj {
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        sFieldStorageSlot(si, fi),
+      )
+      fbLocalGet(rslot)
+      fbStructGet(heap, fi)
+      fbLocalSet(nslot)
+      const nsi = sFieldTgtStructIdx(si, fi)
+      if emitRecordLitMembership(nsi, nslot, fx, fnIx) < 0 { return -1 }
+      if terms > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      terms = terms + 1
+    } else if r >= 0 && lexes.length > 0 {
+      return emitFail(
+        "emitProgram: `is` membership of a nested literal set stored in a box or beside `null`",
+      )
+    }
+    i = i + 1
+  }
+  if terms == 0 { fbI32Const(1) }
+  return 0
+}
+
 // The member of the union `recvIx` holds that a tested map `patTy` names up to the order of its
 // value union's members or a nested Set's spelling, so the test reads that member's tag; `patTy`
 // itself when the union has it exactly, has no such member, or `patTy` is not a map (D2733).
@@ -7363,6 +7486,14 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
       ctSlot,
     )
     if sf < 0 { return -1 }
+    const nf = emitSharedNestedFits(
+      nd.isObj,
+      vi,
+      isVarTyIxOf(isIx),
+      fnIx,
+      ctSlot,
+    )
+    if nf < 0 { return -1 }
     fbElse()
     fbI32Const(0)
     fbEnd()
