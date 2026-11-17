@@ -1,6 +1,6 @@
 # B2c: instance-vector rows for calls through a function set, 2026-11-17
 
-Lane STORE, stage B2c of storage per (KeyId, parameter), on B2b (#8970). The coordinator ruled on
+Lane STORE, stage B2c of storage per (KeyId, parameter), after B2b (#8970). The coordinator ruled on
 2026-11-17:
 - STORE owns `instVecAt` for this change;
 - B2c is the set-call rows, shadowed against the elaboration's instance rows;
@@ -70,14 +70,14 @@ ablation):
 - 24 are other: lambda callees handed a generic, written-binding joins whose keys disagree, and sets
   handed by a set's members (V).
 
-## Grading (fixpoint seeds both sides, against B2b's)
+## Grading (fixpoint seeds both sides, master `a1902979`, B2b merged)
 
-- `@run` A/B (6,714 programs): 0 wasm movers, 0 output movers.
+- `@run` A/B (6,717 programs): 0 wasm movers, 0 output movers.
 - `vl check --codegen tests`: output byte-identical apart from the late rows.
 - Late tag rows 397 → 396 (`hole-fn-list-handed-generic-fn-and-value-at-module.vl` `T {add}`), written
   from a fixpoint seed, none new; late demands 10.
-- `check-filed-witnesses.vl --strict` over both inventories: 5,458 graded, all as filed, 0 moved,
-  3,422 checked against their Want output, 0 mismatched.
+- `check-filed-witnesses.vl --strict` over both inventories: 5,461 graded, all as filed, 0 moved,
+  3,425 checked against their Want output, 0 mismatched.
 - `tests/vl_inst_keys_test.ts`: one setcall summary, every row expected. The control fails on B2b's seed.
-- L2 self-compile fuel: 96.703G against B2b's 96.640G (+0.07%).
+- L2 self-compile fuel: 96.776G against master's 96.711G measured alike (+0.07%).
 - Phase-state census ok; lint clean; `emit_mono.vl` untouched (908). Net compiler lines +161 / −1.
