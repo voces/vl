@@ -7,16 +7,21 @@ import {
   recordTestWarning,
 } from "./check_side_rows"
 import { fnDeclIx } from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+import { nodeTyIxOf } from "./check_node_tys"
+import { peelParenIx } from "./check_write_effects"
 import { callBindNote } from "./check_bind_rows"
 import { fieldNearNote } from "./check_suggest"
 import { elabCallDeclNote, elabCapLive } from "./check_elab_cap"
 import {
   Ident,
   Index,
+  LetDecl,
   Member,
   OP_INDEX_GET,
   OP_INDEX_SET,
   OptMember,
+  Param,
   getDeclLabel,
   i32ToStr,
   mkMember,
@@ -67,7 +72,7 @@ import {
   sharedFieldJoinWidens,
   sharedUnionFieldTy,
 } from "./check_fit_rules"
-import { getterFnFor } from "./check_getter_effects"
+import { getterFieldNote, getterFnFor } from "./check_getter_effects"
 import {
   HD_ELEMV,
   HD_FLD,
@@ -172,7 +177,7 @@ import {
   tyValOf,
   tyValOpen,
 } from "./check_types"
-import { IDENT_BUILTIN, identSet } from "./symbols"
+import { IDENT_BUILTIN, identDeclOf, identSet } from "./symbols"
 import { arrElemValueTy, isNullTy, nonNullTy, tyHasTyVar } from "./tyquery"
 
 // ── getters `get p(self: T): R` (property-access-design.md §D3a) ──────────────
@@ -330,6 +335,10 @@ export function checkMemberNode(n: Member, ix: i32) {
   }
   // A getter on the receiver's nominal type, when no field or built-in member shares its name.
   const gFn = getterFnFor(objTy, n.memProp)
+  if gFn != "" && readOfHoleParam(n.memObj) {
+    tErr(getterFieldNote(n.memProp, nonNullTy(objTy)), ix)
+    return TY_ERR
+  }
   if gFn != "" { return getterReadTy(gFn, n, ix) }
   const ot = tyAt(objTy)
   if ot is TyObj {
@@ -992,4 +1001,24 @@ function checkOptMemberRead(n: OptMember, ix: i32) {
     ix,
   )
   return TY_ERR
+}
+
+// Whether `recv` reads an un-annotated parameter, directly or through un-annotated `const`
+// copies, whose type its template leaves a hole: a member read of it infers a record field, which
+// a getter an instance finds does not satisfy.
+function readOfHoleParam(recv: i32): boolean {
+  const seen: i32[] = []
+  let r = peelParenIx(recv)
+  while r >= 0 && nodeAt(r) is Ident {
+    const d = identDeclOf(r)
+    if d < 0 || i32ListHas(seen, d) { return false }
+    seen.push(d)
+    const dn = nodeAt(d)
+    if dn is Param { return dn.parType < 0 && tyIsHole(nodeTyIxOf(d)) }
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 {
+      return false
+    }
+    r = peelParenIx(dn.letInit)
+  }
+  return false
 }
