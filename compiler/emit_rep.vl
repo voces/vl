@@ -2845,14 +2845,6 @@ export function sFieldElemTyIxAt(si: i32, fi: i32): i32 {
 const sfceStkA: i32[] = []
 const sfceStkB: i32[] = []
 
-// The field codes whose emitted storage is a `(ref [null] <heap>)` the code alone
-// does not name — the heap comes from the field's recorded element spelling, so two
-// rows may agree on every top-level code yet store different heap types (15 a
-// nested/nullable struct, 5 a struct/union/closure ref list, 28 `S[] | null`). D64: gating only code 15 let two such rows merge onto one heap type while their element heaps stayed apart — check-clean invalid wasm.
-function fieldCodeRefsElemHeap(code: i32): boolean {
-  return code == FC_STRUCT || code == FC_REF_LIST || code == FC_NUL_REF_LIST
-}
-
 // The row an element type no row records resolves to by its shape (`repRowOfTyStruct`), or
 // -1. An instance re-spells a declared element structurally, so the declared row is its
 // heap; a re-entry for the same type declines, since a recursive shape asks itself again.
@@ -3299,8 +3291,8 @@ export function fieldStorageKindOf(d: RepDesc | null): VKind | null {
 }
 
 // Whether row `a` of the table with storage types `ta` and codes `ca` is stored as row `b` of
-// `tb` and `cb` is: the same kind and null discipline, or the same code where either side has
-// only its code.
+// `tb` and `cb` is: the same kind and null discipline. Two missing rows are alike; a row whose
+// storage has no rep fails loudly (`fieldCodeIn`).
 export function rowsStoreAlikeIn(
   ta: i32[],
   ca: i32[],
@@ -3309,15 +3301,18 @@ export function rowsStoreAlikeIn(
   cb: i32[],
   b: i32,
 ): boolean {
-  const codeA = if a >= 0 && a < ca.length { fieldCodeIn(ca, ta, a, "storeAlike") } else { -1 }
-  const codeB = if b >= 0 && b < cb.length { fieldCodeIn(cb, tb, b, "storeAlike") } else { -1 }
   const da = rowStoreRepIn(ta, a)
   const db = rowStoreRepIn(tb, b)
+  if da == null && a >= 0 && a < ca.length {
+    fieldCodeIn(ca, ta, a, "storeAlike")
+  }
+  if db == null && b >= 0 && b < cb.length {
+    fieldCodeIn(cb, tb, b, "storeAlike")
+  }
+  if da == null || db == null { return da == null && db == null }
   const ka = fieldStorageKindOf(da)
   const kb = fieldStorageKindOf(db)
-  if da == null || db == null || ka == null || kb == null {
-    return codeA == codeB
-  }
+  if ka == null || kb == null { return false }
   if ka != kb || da.rdNul != db.rdNul { return false }
   // Two packed list fields store alike only at one row (`u8[]` beside `i16[]` does not).
   if ka == "u8list" || ka == "nulu8list" {
@@ -3333,11 +3328,15 @@ export function tyPackedRow(ty: i32): i32 {
 }
 
 // Whether struct-table flat row `r` stores a ref whose heap is named rather than pinned by its
-// storage: a record ref or a ref list, nullable or not; by the field code where only it answers.
+// storage: a record ref or a ref list, nullable or not. A row whose storage has no rep fails loudly.
 function fieldRowRefsElemHeap(r: i32): boolean {
-  const code = if r >= 0 && r < sFieldTypes.length { fieldCodeIn(sFieldTypes, sFieldStoreTy, r, "refsElemHeap") } else { -1 }
   const k = fieldStorageKindOf(rowStoreRepIn(sFieldStoreTy, r))
-  if k == null { return fieldCodeRefsElemHeap(code) }
+  if k == null {
+    if r >= 0 && r < sFieldTypes.length {
+      fieldCodeIn(sFieldTypes, sFieldStoreTy, r, "refsElemHeap")
+    }
+    return false
+  }
   return k == "struct"
     || k == "nulstruct"
     || k == "reflist"
