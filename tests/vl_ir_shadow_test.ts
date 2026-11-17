@@ -264,6 +264,7 @@ print(guard(2))
   `function sum(xs: i32[]): i32 {\n  let t = 0\n  for x in xs {\n    print(x)\n    t = t + x\n  }\n  return t\n}\nprint(sum([1, 2, 3]))\n`,
   `function all(xs: string[]): i32 {\n  let n = 0\n  for s in xs {\n    print(s + "!")\n    n = n + s.length\n  }\n  return n\n}\nprint(all(["ab", "c"]))\n`,
   `function inner(xs: i32[]): i32 {\n  let t = 0\n  for x in xs {\n    let k = 0\n    while k < x {\n      if k > 1 { break }\n      k = k + 1\n    }\n    print(k)\n    t = t + k\n  }\n  return t\n}\nprint(inner([1, 5]))\n`,
+  `function cs(s: string): i32 {\n  let n = 0\n  for c in s {\n    print(c)\n    n = n + c\n  }\n  return n\n}\nprint(cs("h\u00e9llo"))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
