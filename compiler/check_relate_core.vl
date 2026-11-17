@@ -427,6 +427,7 @@ import {
   tyIsGradualParam,
   tyParamBesideBare,
   tyParamBesideDerived,
+  tyParamOfInnermostBody,
   writtenTpUnion,
 } from "./check_tp_join"
 import {
@@ -1978,7 +1979,10 @@ function joinWidensRec(s: i32, d: i32): boolean {
 // The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
 // mutually-assignable types collapse to the wider; otherwise a two-member union. An operand
 // marked existing (`njFixSet`) is never widened: its record members stay members of the join.
-export function joinTys(a: i32, b: i32) {
+export function joinTys(a: i32, b: i32) { return joinTysAcc(jaNone, a, b) }
+
+// `joinTys`, whose plain variant join at the end of the ladder reads and records `acc`.
+function joinTysAcc(acc: JoinAcc, a: i32, b: i32): i32 {
   const apart = njApart
   njApartSet(false)
   const fixA = njFixA
@@ -2110,11 +2114,67 @@ export function joinTys(a: i32, b: i32) {
   ) {
     return b
   }
-  if !fixA && !fixB { return joinVariantTys(a, b) }
+  if !fixA && !fixB { return joinVariantGo(acc, a, b) }
   njNoFieldwise = true
-  const kept = joinVariantTys(a, b)
+  const kept = joinVariantGo(acc, a, b)
   njNoFieldwise = false
   return kept
+}
+
+// A caller's running join: the type its last plain variant join built (`ty`), whether that join
+// replaced no member by a fieldwise record join (`clean`), and the state the dedupe read then.
+// While `ty` is the next join's left side under the same state, its members are pairwise apart:
+// that join compared each with every member kept before it.
+export type JoinAcc = {
+  live: boolean,
+  ty: i32,
+  clean: boolean,
+  epoch: i32,
+  ver: i32,
+  relax: i32,
+  noFw: boolean,
+}
+
+export function joinAccNew(): JoinAcc {
+  return {
+    live: true,
+    ty: -1,
+    clean: false,
+    epoch: -1,
+    ver: -1,
+    relax: -1,
+    noFw: false,
+  }
+}
+
+// `joinTys(a, b)` for a caller that joins into one running type, which it passes back as `a` each
+// time: the plain variant join at the end of `joinTys`'s ladder then dedupes only `b`'s members.
+export function joinTysInto(acc: JoinAcc, a: i32, b: i32): i32 {
+  return joinTysAcc(acc, a, b)
+}
+
+// The accumulator no caller owns: `joinVariantGo` neither reads nor records it.
+const jaNone: JoinAcc = {
+  live: false,
+  ty: -1,
+  clean: false,
+  epoch: -1,
+  ver: -1,
+  relax: -1,
+  noFw: false,
+}
+
+// Whether `acc` vouches that `a`'s members are pairwise apart under the current state.
+function joinAccFits(acc: JoinAcc, a: i32): boolean {
+  return acc.live
+    && acc.clean
+    && acc.ty == a
+    && a >= 0
+    && acc.epoch == tyMutEpoch
+    && acc.ver == cUserTypesVer
+    && acc.relax == nomLitRelax
+    && acc.noFw == njNoFieldwise
+    && asgSrcStack.length == 0
 }
 
 // The join of a written union of declared parameters and a concrete type, kept apart; -1 for
@@ -2412,11 +2472,27 @@ export function tyParamArmAbsorbs(u: i32, o: i32): boolean {
 // The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
 // folding back into a `?` wrapper.
 export function joinVariantTys(a: i32, b: i32) {
+  return joinVariantGo(jaNone, a, b)
+}
+
+// `joinVariantTys`, where `acc` may vouch for `a`'s members (`joinAccFits`): those are kept as
+// they are and only `b`'s are compared. A caller's `acc` records the join it built.
+function joinVariantGo(acc: JoinAcc, a: i32, b: i32): i32 {
+  const fits = joinAccFits(acc, a)
   const vars: i32[] = []
-  flattenVariantsInto(a, vars)
-  flattenVariantsInto(b, vars)
   const kept: i32[] = []
   let hasNull = false
+  if fits {
+    const own: i32[] = []
+    flattenVariantsInto(a, own)
+    for v in own {
+      if isNullTy(v) { hasNull = true } else { kept.push(v) }
+    }
+  } else {
+    flattenVariantsInto(a, vars)
+  }
+  flattenVariantsInto(b, vars)
+  let clean = true
   let i = 0
   while i < vars.length {
     const v = vars[i]
@@ -2433,6 +2509,7 @@ export function joinVariantTys(a: i32, b: i32) {
           if fw >= 0 {
             kept[j] = fw
             dup = true
+            clean = false
           }
         }
         j = j + 1
@@ -2442,6 +2519,20 @@ export function joinVariantTys(a: i32, b: i32) {
     i = i + 1
   }
   dropLitsBesideBase(kept)
+  const res = joinVariantRes(kept, hasNull)
+  if acc.live {
+    acc.ty = res
+    acc.clean = clean
+    acc.epoch = tyMutEpoch
+    acc.ver = cUserTypesVer
+    acc.relax = nomLitRelax
+    acc.noFw = njNoFieldwise
+  }
+  return res
+}
+
+// The type `kept`'s members and a null make: one member as itself, more as a union.
+function joinVariantRes(kept: i32[], hasNull: boolean): i32 {
   if kept.length == 0 { return TY_NULL }
   // A set joined with a map it shares a rep with has no union to become (D2673); the node whose
   // check made the join reports it (`checkNodeDone`).
@@ -9304,7 +9395,7 @@ function ftParamCallsAt(body: i32, q: i32, n: i32, at: i32[]): i32 {
         let k = 0
         while k < n {
           const t = nodeTyIxOf(yn.callArgs[k])
-          if t < 0 || t >= T.tys.length || !elabTyClosed(t, 0) { return -1 }
+          if t < 0 || t >= T.tys.length || !elabTyClosed(t) { return -1 }
           if at.length < n { at.push(t) }
           else if !tySame(at[k], t) { return -1 }
           k = k + 1
@@ -10377,6 +10468,16 @@ function bgInferHole(t: i32): boolean {
   return v is TyVar && v.tvName.length > 0 && v.tvName.slice(0, 1) == "?"
 }
 
+// Whether a variable an earlier argument bound to the body's own type parameter `have` joins with
+// a later `f64` argument at `f64`: the widest number, so the join is `f64` at every instance
+// whose parameter joins `f64`, and an instance whose parameter does not is refused (D15041).
+function bgWidensDeclaredParam(have: i32, atIx: i32): boolean {
+  if bgWidenLit || atIx != TY_F64 || have < 0 || have >= T.tys.length {
+    return false
+  }
+  return tyAt(have) is TyVar && tyParamOfInnermostBody(have)
+}
+
 // Generic call-site binding, deep: walks an expected parameter type against the argument's
 // actual type and binds every `TyVar` leaf on first use. Later uses are checked by the caller
 // against the substituted expected type, so disagreeing uses still error. Nested positions
@@ -10417,7 +10518,7 @@ export function bindGenWalk(
     } else if (
       bgCallArg
       && bgWidenAsk
-      && numWidens(have, atIx)
+      && (numWidens(have, atIx) || bgWidensDeclaredParam(have, atIx))
       && !(bgWidenLit && primNameOf(have) == "f32")
     ) {
       if bindOf(bgWidenNames, bgWidenTys, e.tvName) < 0 {
@@ -10659,7 +10760,11 @@ export function bindGenInnerUnionArms(
         depth + 1,
       )
     }
-    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
+    TyFunc => {
+      // A function held inside is delivered at its bound type like a top-level one (D16899).
+      if depth > 0 { bindGenFnRetUnionArm(expIx, atIx, uNames, uTys, false) }
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {}
   }
   return 0
 }
@@ -10691,7 +10796,22 @@ export function bindGenFnRetUnionArm(
       if uNames.length == before { bindFnRetUnionDefault(e, a, uNames, uTys) }
       return 0
     }
+    // `() => T | string | null` given a non-null result binds at the union inside (D16900).
+    const en = tyAt(e)
+    const ei = if en is TyNullable { en.nInner } else { -1 }
+    if ei >= 0 && ei < T.tys.length && tyAt(ei) is TyUnion && !isNullTy(a) {
+      const an = nonNullTy(a)
+      const before = uNames.length
+      bindGenUnionArm(ei, an, uNames, uTys)
+      if uNames.length == before { bindFnRetUnionDefault(ei, an, uNames, uTys) }
+      return 0
+    }
     if bindFnRetNullDefault(e, a, adopted, uNames, uTys) { return 0 }
+    // A list, record or map result binds at the unions it holds (`() => (T | boolean)[]`, D16918).
+    if en is TyArray || en is TyObj || en is TyMap {
+      bindGenInnerUnionArms(e, a, uNames, uTys, 1)
+      return 0
+    }
     depth = depth + 1
   }
   return 0
