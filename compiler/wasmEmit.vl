@@ -8929,16 +8929,22 @@ function emitNulMapArmBox(
   return 1
 }
 
-// `l ?? d` whose left is a nullable map and whose result is a union box holding that map, as a
-// join of two map types is: the left's arm box, else `d` boxed. 1 handled, 0 not this shape.
+// Whether `l ?? d` has a nullable map left and a union result with an arm for that map, as a
+// join of two map types has. The union is the one its default is delivered into.
+function coalMapJoinWhen(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
+  if !exprNullableMap(e.binLeft, fnIx) { return false }
+  if boxDstNameAt(e.binRight, fnIx) == "" { return false }
+  return unionHasMapArmSlot(
+    nodeTyInOf(exprIx, fnIx),
+    mapShapeOfExpr(e.binLeft, fnIx),
+  )
+}
+
+// `l ?? d` of `coalMapJoinWhen`'s shape: the left's arm box, else `d` boxed. 1 handled, -1 failed.
 function emitCoalesceMapJoin(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
-  if !exprNullableMap(e.binLeft, fnIx) { return 0 }
-  // The union the result boxes into is the one its default is delivered into (`boxDstNameAt`).
   const un = boxDstNameAt(e.binRight, fnIx)
-  if un == "" { return 0 }
   const unTy = nodeTyInOf(exprIx, fnIx)
   const sh = mapShapeOfExpr(e.binLeft, fnIx)
-  if !unionHasMapArmSlot(unTy, sh) { return 0 }
   const tag = mapBoxTagOf(sh, unTy, e.binLeft, fnIx)
   if tag < 0 { return -1 }
   return emitNulMapArmBox(
@@ -15065,6 +15071,11 @@ function cmValsBkLocal() {
 // recovered before the mapRef store; omitting that is check-clean invalid wasm, never a message.
 function pushMapRecvRef(recvIx: i32, fnIx: i32) {
   if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  return mapRecvRefTail(recvIx, fnIx)
+}
+
+// After map receiver `recvIx`'s value: a nullable receiver recovered to its map.
+export function mapRecvRefTail(recvIx: i32, fnIx: i32): i32 {
   if exprNullableMap(recvIx, fnIx) { fbRefAsNonNull() }
   return 0
 }
@@ -15317,49 +15328,76 @@ function emitMapRecvKey(recvIx: i32, keyIx: i32, fnIx: i32) {
   // The KEY expression must match the receiver's key rep. The checker proves the pair
   // agrees, so a mismatch here means the receiver's shape resolved wrong — reject
   // loudly rather than emit a string ref into an i32 keys array (invalid wasm).
-  let keyAtom = false
-  // A literal-union-keyed map hashes as i32 because its keys REP as the interned atom, so a
-  // member written as a string literal must lower as that id rather than as a ref — the
-  // checker has already proved the spelling is a member (D1748).
-  let keyLitU = false
-  const keyK = mapShapeKeyKind(mshape)
-  if keyK == MAP_KEY_I64 {
-    // An i64 key is emitted at its own width below; the checker proved it is an i64.
-    if exprString(keyIx, fnIx) {
-      return emitFail("emitProgram: i64-keyed map indexed with a string key")
-    }
-  } else if keyK == MAP_KEY_I32 {
-    if exprString(keyIx, fnIx) {
-      if (
-        !nodeTyMapKeyIsLitUnion(unwrapParen(recvIx))
-        && !tyIsLitUnion(tyMapKeyOf(tyMapHeld(nodeTyAt(unwrapParen(recvIx), fnIx))))
-      ) {
-        return emitFail("emitProgram: i32-keyed map indexed with a string key")
-      }
-      keyLitU = true
-    }
-  } else if !exprString(keyIx, fnIx) {
-    // An atom-repped literal-union key is a string VALUE whose rep is the interned id, so it is
-    // widened to its member text at the boundary rather than refused — the same widen `print`
-    // performs, through the one home both consumers share (D1724).
-    if !exprIsLitAtom(keyIx, fnIx) {
-      return emitFail("emitProgram: map key is not a string")
-    }
-    keyAtom = true
+  const arm = mapKeyArmOf(recvIx, keyIx, fnIx, mshape)
+  if arm == "i64Str" {
+    return emitFail("emitProgram: i64-keyed map indexed with a string key")
   }
+  if arm == "i32Str" {
+    return emitFail("emitProgram: i32-keyed map indexed with a string key")
+  }
+  if arm == "notStr" { return emitFail("emitProgram: map key is not a string") }
   // The receiver expr is emitted OUTSIDE the context (it is map-op-free by
   // construction — an Ident/global/constructor).
   if pushMapRecvRef(recvIx, fnIx) < 0 { return -1 }
-  // A string-keyed map's key is a string ref — shield it from an atom-typed destination, which
-  // would lower the key literal as an i32 atom id. An i32 key wants no shielding but is unharmed by it. An inner map
-  // op in the key expression also clobbers `cmSlot`, so pin it afterwards.
-  let keySeed = 0
-  if keyLitU { keySeed = 1 }
   let kr = 0
-  if keyAtom { kr = emitAtomToStr(keyIx, fnIx) }
-  else if keyK == MAP_KEY_I64 { kr = emitScalarValue(keyIx, fnIx, "i64") }
+  if arm == "atom" { kr = emitAtomToStr(keyIx, fnIx) }
+  else if arm == "i64" { kr = emitScalarValue(keyIx, fnIx, "i64") }
   else { kr = emitExpr(keyIx, fnIx) }
   if kr < 0 { return -1 }
+  return mapRecvKeyTail(mshape)
+}
+
+// How a map op writes key `keyIx` for receiver `recvIx` of folded shape `mshape`: `plain` as
+// itself, `atom` widened to its member text, `i64` at its own width; the other arms are keys
+// the receiver's key rep refuses.
+export type MapKeyArm = "i64Str"
+  | "i32Str"
+  | "notStr"
+  | "atom"
+  | "i64"
+  | "plain"
+export function mapKeyArmOf(
+  recvIx: i32,
+  keyIx: i32,
+  fnIx: i32,
+  mshape: i32,
+): MapKeyArm {
+  const keyK = mapShapeKeyKind(mshape)
+  if keyK == MAP_KEY_I64 {
+    // An i64 key is emitted at its own width; the checker proved it is an i64.
+    if exprString(keyIx, fnIx) { return "i64Str" }
+    return "i64"
+  }
+  if keyK == MAP_KEY_I32 {
+    // A literal-union-keyed map hashes as i32 because its keys rep as the interned atom, so a
+    // member written as a string literal lowers as that id rather than as a ref (D1748).
+    if (
+      exprString(keyIx, fnIx)
+      && !nodeTyMapKeyIsLitUnion(unwrapParen(recvIx))
+      && !tyIsLitUnion(tyMapKeyOf(tyMapHeld(nodeTyAt(unwrapParen(recvIx), fnIx))))
+    ) {
+      return "i32Str"
+    }
+    return "plain"
+  }
+  if exprString(keyIx, fnIx) { return "plain" }
+  // An atom-repped literal-union key is a string value whose rep is the interned id, so it is
+  // widened to its member text at the boundary, through the home `print` shares (D1724).
+  if exprIsLitAtom(keyIx, fnIx) { return "atom" }
+  return "notStr"
+}
+
+// Map receiver `recvIx`'s shape with a set folded onto its key's mono machinery; -3 for a value
+// type no map op writes.
+export function mapRecvShapeOf(recvIx: i32, fnIx: i32): i32 {
+  const sh = mapShapeOfExpr(recvIx, fnIx)
+  if sh == -3 { return -3 }
+  return mapShapeFoldSet(sh)
+}
+
+// After a map op's receiver and key: the op context pinned to the receiver's folded shape
+// `mshape`, since an inner map op in the key expression clobbers it.
+export function mapRecvKeyTail(mshape: i32): i32 {
   cmSlot = mshape
   return 0
 }
@@ -15414,11 +15452,9 @@ function defExprNullable(ix: i32) {
 // reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
 // (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
+  const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
+  if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
   const wvk = mapRecvScalarKindInst(recvIx, fnIx)
-  if !(wvk >= 0 && coalWidens(wvk, rk)) {
-    const miss = mapGetOrHelperMiss(recvIx, defIx, fnIx)
-    if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
-  }
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
     pushMapScr(5)                // entry
@@ -15722,16 +15758,34 @@ function emitMapGet(recvIx: i32, keyIx: i32, fnIx: i32) {
 
 // `recvIx[keyIx]` through `__map_get_<row>__`, `miss` on a miss; `mapGetHelperShape` is nonzero.
 function emitMapGetCall(recvIx: i32, keyIx: i32, fnIx: i32, miss: i32) {
+  const fi = mapGetHelperFnOf(recvIx, fnIx, miss)
+  if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return fbCall(fi)
+}
+
+// The function `__map_get_<row>__` reads receiver `recvIx` through with `miss` on a miss, minted
+// before the receiver and key are written, while the tail rows are still open.
+export function mapGetHelperFnOf(recvIx: i32, fnIx: i32, miss: i32): i32 {
   const sh = mapGetHelperShape(recvIx, fnIx)
   const strKey = mapShapeKeyKind(sh) == MAP_KEY_STR
-  // The helper's own calls are minted here, while the tail rows are still open.
   if strKey {
     helpStrHashFn()
     helpStrEqFn()
   }
-  const fi = helpMapGetFn(sh, miss, strKey)
-  if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
-  return fbCall(fi)
+  return helpMapGetFn(sh, miss, strKey)
+}
+
+// `[d]` when `emitMapGetOr` reads `recvIx[k] ?? defIx` through `__map_get_<row>__` with `d` as its
+// miss, else []. A scalar value the `??`'s own atom kind `rk` widens is read inline.
+export function mapGetOrHelperRoute(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+  rk: i32,
+): i32[] {
+  const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if wvk >= 0 && coalWidens(wvk, rk) { return [] }
+  return mapGetOrHelperMiss(recvIx, defIx, fnIx)
 }
 
 // `[d]` when `recvIx[k] ?? defIx` can read through `__map_get_<row>__` with `d` as its miss: a
@@ -15977,29 +16031,51 @@ function emitMapGetOrScalarBox(ak: i32, defIx: i32, fnIx: i32) {
   return 0
 }
 
-// `m[k] ?? d` over a scalar-valued map where `d` is another arm of the result's union: a hit
-// boxes the stored scalar under its own arm's tag, a miss boxes `d`. 1 handled, 0 when the
-// value is not a boxed scalar (a ref value is the generic nullable operand), -1 (D4643).
-function emitMapGetOrScalarJoin(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+// The receiver of `??` operand `e.binLeft` read as `r[k]` or `r.f(k)`: -1 for any other
+// operand, -2 for a call with no callee.
+function coalMapRecvOf(e: BinExpr): i32 {
   const r = nodeAt(unwrapParen(e.binLeft))
-  let recvIx = -1
-  let keyIx = -1
-  if r is Index {
-    recvIx = r.idxArr
-    keyIx = r.idxIndex
-  } else if r is Call {
-    if r.callFn < 0 { return -1 }
+  if r is Index { return r.idxArr }
+  return coalCallRecvOf(unwrapParen(e.binLeft))
+}
+
+// The receiver of node `ix` read as a one-argument method call `r.f(k)`: -1 for any other
+// node, -2 for a call with no callee.
+function coalCallRecvOf(ix: i32): i32 {
+  const r = nodeAt(ix)
+  if r is Call {
+    if r.callFn < 0 { return -2 }
     const callee = nodeAt(r.callFn)
-    if callee is Member {
-      if r.callArgs.length == 1 {
-        recvIx = callee.memObj
-        keyIx = r.callArgs[0]
-      }
-    }
+    if callee is Member && r.callArgs.length == 1 { return callee.memObj }
   }
-  if recvIx < 0 { return 0 }
-  const ak = mapRecvScalarBoxKindIn(recvIx, fnIx)
-  if ak < 0 { return 0 }
+  return -1
+}
+
+// The key of the read `coalMapRecvOf` names a receiver of, else -1.
+function coalMapKeyOf(e: BinExpr): i32 {
+  const r = nodeAt(unwrapParen(e.binLeft))
+  if r is Index { return r.idxIndex }
+  return coalCallKeyOf(unwrapParen(e.binLeft))
+}
+
+// The argument of node `ix` read as a one-argument call, else -1.
+function coalCallKeyOf(ix: i32): i32 {
+  const r = nodeAt(ix)
+  if r is Call && r.callArgs.length == 1 { return r.callArgs[0] }
+  return -1
+}
+
+// `m[k] ?? d` over a map whose value boxes as scalar kind `ak`, where `d` is another arm of the
+// result's union: a hit boxes the stored scalar under its own arm's tag, a miss boxes `d`.
+// 1 handled, -1 failed (D4643).
+function emitMapGetOrScalarJoin(
+  e: BinExpr,
+  ak: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  const recvIx = coalMapRecvOf(e)
+  const keyIx = coalMapKeyOf(e)
   // The union the join's result boxes into is the one its default is delivered into
   // (`boxDstNameAt`).
   const joinN = boxDstNameAt(e.binRight, fnIx)
@@ -41666,7 +41742,7 @@ function coalWidens(from: i32, to: i32): boolean {
 }
 
 // The checker's atom kind for the `??` at `exprIx`, -1 when it is not a value atom or is null.
-function coalResultKindOf(exprIx: i32, fnIx: i32): i32 {
+export function coalResultKindOf(exprIx: i32, fnIx: i32): i32 {
   const k = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
   if k == nullValKind() { return -1 }
   return k
@@ -41858,15 +41934,9 @@ function emitCoalArmRecv(recvIx: i32, cast: i32, fnIx: i32) {
   return 0
 }
 
-// The `if lhs != null { lhs } else { d }` node for `lhs ?? d` when `lhs` reads a map off a hole
-// whose pin's value excludes null and is no literal union, and the default is nullable at the
-// pin; -1 otherwise. The node carries the `??`'s type.
-function coalHoleMapReadNullTest(
-  e: BinExpr,
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): i32 {
+// The value type of the map `lhs ?? d` reads off a hole when that read is the null test the
+// rewrite makes of the direct spelling (D2248), else -1. `coalHoleMapReadNullTest` builds it.
+function coalHoleMapReadValTy(e: BinExpr, lhsIx: i32, fnIx: i32): i32 {
   const rd = nodeAt(lhsIx)
   if !(rd is Index) || !exprReReadable(lhsIx) { return -1 }
   const own = nodeTyIxOf(unwrapParen(rd.idxArr))
@@ -41874,13 +41944,7 @@ function coalHoleMapReadNullTest(
   const mt = mapRecvTyIn(rd.idxArr, fnIx)
   if mt < 0 { return -1 }
   const vt = tyMapValOf(mt)
-  // A nullable number's box is the join's own rep, so its read is the `then` arm as is.
-  // Typed at that box, since a re-associated chain's inner link carries no type of its own.
-  if coalHoleNulNumRead(e, fnIx) {
-    const nnIf = coalNullTestIf(e, exprIx, fnIx)
-    nodeTyRecord(nnIf, vt)
-    return nnIf
-  }
+  if coalHoleNulNumRead(e, fnIx) { return vt }
   if vt < 0 || tyBearsNull(vt) || tyIsLitUnion(vt) { return -1 }
   const dix = unwrapParen(e.binRight)
   if dix < 0 { return -1 }
@@ -41889,6 +41953,24 @@ function coalHoleMapReadNullTest(
     && !tyBearsNull(nodeTyInOf(dix, fnIx))
   ) {
     return -1
+  }
+  return vt
+}
+
+// The `if lhs != null { lhs } else { d }` node for a hole's map read `lhs ?? d` whose value type
+// `coalHoleMapReadValTy` gave as `vt`. The node carries the `??`'s type.
+function coalHoleMapReadNullTest(
+  e: BinExpr,
+  vt: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  // A nullable number's box is the join's own rep, so its read is the `then` arm as is.
+  // Typed at that box, since a re-associated chain's inner link carries no type of its own.
+  if coalHoleNulNumRead(e, fnIx) {
+    const nnIf = coalNullTestIf(e, exprIx, fnIx)
+    nodeTyRecord(nnIf, vt)
+    return nnIf
   }
   const ifIx = coalNullTestIf(e, exprIx, fnIx)
   // Typed at the instance's join, which the shared `??` records only as its hole.
@@ -41899,22 +41981,16 @@ function coalHoleMapReadNullTest(
   return ifIx
 }
 
-// The `if lhs != null { lhs } else { d }` node for a re-readable map read `lhs ?? d` that joins
-// into a box the fused read cannot build, a boxed or atom value beside another arm; -1 otherwise.
-function coalMapReadJoinNullTest(
-  e: BinExpr,
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): i32 {
+// Whether `lhs` is a re-readable map read whose `??` joins into a box the fused read cannot
+// build, a boxed or atom value beside another arm: it lowers as `if lhs != null { lhs } else { d }`.
+function coalMapReadJoinWhen(lhsIx: i32, fnIx: i32): boolean {
   const rd = nodeAt(lhsIx)
-  if !(rd is Index) || !exprReReadable(lhsIx) { return -1 }
+  if !(rd is Index) || !exprReReadable(lhsIx) { return false }
   if !exprMap(rd.idxArr, fnIx) || mapRecvScalarBoxKindIn(rd.idxArr, fnIx) >= 0 {
-    return -1
+    return false
   }
   const vt = tyMapValOf(mapRecvTyIn(rd.idxArr, fnIx))
-  if !tyIsLitUnion(vt) && !tyIsUnionShaped(vt) && !tyBearsNull(vt) { return -1 }
-  return coalNullTestIf(e, exprIx, fnIx)
+  return tyIsLitUnion(vt) || tyIsUnionShaped(vt) || tyBearsNull(vt)
 }
 
 // `if l != null { l } else { d }` for `l ?? d`, carrying the `??`'s type. A declared atom niche's
@@ -41935,15 +42011,9 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   return ifIx
 }
 
-// `if true { l } else { d }` for an instance's `l ?? d` whose operand it typed without `null` at
-// a type the `??`'s join widens, so the dead default still shapes the join the arms deliver
-// into; -1 when the operand bears `null`, matches the join, or either type is a hole.
-function coalRetypedDeadJoinIf(
-  e: BinExpr,
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): i32 {
+// The join an instance's `l ?? d` widens to when it typed the operand without `null` at a
+// narrower type; -1 when the operand bears `null`, matches the join, or either type is a hole.
+function coalRetypedDeadJoinTy(lhsIx: i32, exprIx: i32, fnIx: i32): i32 {
   if !fnInPinnedInstance(fnIx) { return -1 }
   const lt = nodeTyAt(lhsIx, fnIx)
   if (
@@ -41956,6 +42026,12 @@ function coalRetypedDeadJoinIf(
   }
   const pt = nodeTyInOf(exprIx, fnIx)
   if pt < 0 || pt >= T.tys.length || pt == lt || tyHasTyVar(pt) { return -1 }
+  return pt
+}
+
+// `if true { l } else { d }` typed at join `pt`, so the dead default still shapes the join the
+// arms deliver into.
+function coalRetypedDeadJoinIf(e: BinExpr, pt: i32): i32 {
   const thenS: i32[] = []
   thenS.push(e.binLeft)
   const elseS: i32[] = []
@@ -42008,13 +42084,36 @@ function coalLinkTyAt(link: i32, src: i32, fnIx: i32) {
   nodeTyRecord(link, nodeTyAt(src, fnIx))
 }
 
-function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
-  // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
-  // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
-  // unwrapped place every structural branch below dispatches on; the generic niche paths
-  // re-evaluate `e.binLeft` directly and already peel parens, so they are unaffected.
+// Which arm of the `??` ladder lowers `l ?? d`, in the order `emitCoalesceGo` tries them:
+// folds of a dead or re-associated operand, map and list reads with a default fused into the
+// read, and `niche` for the nullable-rep arms after them. `bad` is a malformed operand.
+export type CoalArm = "bad"
+  | "closed"
+  | "chain"
+  | "nulnone"
+  | "armIf"
+  | "pinNonNull"
+  | "retypedDead"
+  | "deadJoin"
+  | "fieldFlat"
+  | "atomToStr"
+  | "boxRuntime"
+  | "popElem"
+  | "holeMap"
+  | "mapScalarJoin"
+  | "mapJoinIf"
+  | "mapIndexGetOr"
+  | "mapJoin"
+  | "mapGetOr"
+  | "listGetOr"
+  | "popOr"
+  | "niche"
+
+// The arm of `??` node `e` (at `exprIx`) in function `fnIx`, as `emitCoalesceGo` takes it.
+export function coalArmOf(e: BinExpr, exprIx: i32, fnIx: i32): CoalArm {
+  // Parens do not change `??`: `(m[k]) ?? d` takes the fused map read as `m[k] ?? d` does.
   const lhsIx = unwrapParen(e.binLeft)
-  if lhsIx < 0 { return -1 }
+  if lhsIx < 0 { return "bad" }
   // A left operand an instance closes to a type with no `null` is the whole `??`, as
   // `emit_rewrite` folds the concrete spelling; the shared node kept the template's hole.
   if (
@@ -42022,6 +42121,120 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     && (tyHasTyVar(nodeTyIxOf(lhsIx)) || readOfOpenBinding(lhsIx))
     && tyExcludesNull(nodeTyAt(lhsIx, fnIx))
   ) {
+    return "closed"
+  }
+  const lhs = nodeAt(lhsIx)
+  if lhs is BinExpr && lhs.binOp == "??" { return "chain" }
+  // The `null` type on the left makes the operand dead: `x ?? d` is `d` (D1576).
+  if exprIsNulNone(lhsIx, fnIx) { return "nulnone" }
+  // An instance's `if` with a `null` arm keeps the generic `V | null` no arm below has a rep for.
+  if (
+    lhs is IfStmt
+    && tyHasTyVar(nodeTyIxOf(lhsIx))
+    && fnInPinnedInstance(fnIx)
+    && coalNullArmShaped(e)
+  ) {
+    return "armIf"
+  }
+  if coalesceOperandPinNonNull(exprIx, fnIx) { return "pinNonNull" }
+  // An operand an instance re-typed at a pin that excludes `null` has a dead default.
+  if coalRetypedDead(exprIx, lhsIx, fnIx) { return "retypedDead" }
+  if coalRetypedDeadJoinTy(lhsIx, exprIx, fnIx) >= 0 { return "deadJoin" }
+  // A field the receiver's stored row holds flat cannot be null, whatever row a narrowing
+  // typed the read at, so the default is dead (D8342).
+  if coalFieldStoredFlat(exprIx, lhsIx, fnIx) { return "fieldFlat" }
+  if coalesceRetypedAtomToStr(exprIx, fnIx) { return "atomToStr" }
+  // A read the narrowing pins to `null` may have been written since the test (a loop, a
+  // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
+  if readNarrowedBoxToNull(lhsIx, fnIx) { return "boxRuntime" }
+  // A pop under a `.length` test of its receiver yields its element (D3558).
+  if popTakesElem(lhsIx) && nodeTyIxOf(lhsIx) == nodeTyIxOf(exprIx) {
+    return "popElem"
+  }
+  if coalHoleMapReadValTy(e, lhsIx, fnIx) >= 0 { return "holeMap" }
+  // A default that is another arm of the result's union reads the map as a nullable operand.
+  const mapFused = !coalesceMapReadJoins(exprIx, fnIx)
+  if !mapFused {
+    const sjRecv = coalMapRecvOf(e)
+    if sjRecv == -2 { return "bad" }
+    if sjRecv >= 0 && mapRecvScalarBoxKindIn(sjRecv, fnIx) >= 0 {
+      return "mapScalarJoin"
+    }
+    if coalMapReadJoinWhen(lhsIx, fnIx) { return "mapJoinIf" }
+  }
+  if lhs is Index && mapFused && exprMap(lhs.idxArr, fnIx) {
+    return "mapIndexGetOr"
+  }
+  if coalMapJoinWhen(e, exprIx, fnIx) { return "mapJoin" }
+  return coalCallArmOf(lhsIx, exprIx, fnIx, mapFused)
+}
+
+// The arm of a `??` over unwrapped operand `lhsIx` once every arm before it declined: a method
+// call's fused map read, list read or pop, else the nullable-rep arms (`niche`).
+function coalCallArmOf(
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+  mapFused: boolean,
+): CoalArm {
+  const lhs = nodeAt(lhsIx)
+  if lhs is Call {
+    if lhs.callFn < 0 { return "bad" }
+    const lcallee = nodeAt(lhs.callFn)
+    if lcallee is Member {
+      if lcallee.memProp == "get" {
+        // `recv.get(k) ?? d` over a map is the same fused read as `recv[k] ?? d`.
+        if mapFused && exprMap(lcallee.memObj, fnIx) { return "mapGetOr" }
+        // Over a scalar-element list it is the fused checked read-with-default (B6), a wide
+        // element only where the `??` keeps the element type.
+        const lgk = scalarListElemKind(lcallee.memObj, fnIx)
+        const lgPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
+        if (
+          exprF64Array(lcallee.memObj, fnIx)
+          || exprArray(lcallee.memObj, fnIx)
+          || (lgk == "i64" && lgPrim == "i64")
+          || (lgk == "f32" && lgPrim == "f32")
+        ) {
+          return "listGetOr"
+        }
+      }
+      if (
+        lcallee.memProp == "pop"
+        && coalPopOrFits(lcallee.memObj, exprIx, fnIx)
+      ) {
+        return "popOr"
+      }
+    }
+  }
+  return "niche"
+}
+
+// Whether `recv.pop() ?? d` at `exprIx` is the fused checked pop-with-default: a scalar list by
+// `emitPopOr`'s own discriminator, a wide kind only where the `??` keeps the element type. A
+// literal-union list's element widened to a string default takes the niche, which converts the
+// atom (D1413).
+function coalPopOrFits(recvIx: i32, exprIx: i32, fnIx: i32): boolean {
+  const pk = scalarListElemKind(recvIx, fnIx)
+  const pkPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
+  if (
+    pk != "i32"
+    && !(pk == "f64" && pkPrim == "f64")
+    && !(pk == "i64" && pkPrim == "i64")
+    && !(pk == "f32" && pkPrim == "f32")
+  ) {
+    return false
+  }
+  return !exprRefArray(recvIx, fnIx)
+    && !exprStringArray(recvIx, fnIx)
+    && !coalesceNulAtomToStr(exprIx, fnIx)
+}
+
+function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const arm = coalArmOf(e, exprIx, fnIx)
+  const lhsIx = unwrapParen(e.binLeft)
+  if arm == "bad" || lhsIx < 0 { return -1 }
+  const lhs = nodeAt(lhsIx)
+  if arm == "closed" {
     // An atom left takes the `??`'s own rep where that is no atom: the member string, or the
     // box of a join with another type (D16530).
     if exprIsLitAtom(lhsIx, fnIx) && !exprIsLitAtom(exprIx, fnIx) {
@@ -42033,172 +42246,124 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     return emitExpr(e.binLeft, fnIx)
   }
-  const lhs = nodeAt(lhsIx)
   // `a ?? b ?? d` parses LEFT-associative (`(a ?? b) ?? d`); `??` is
   // associative, so RE-ASSOCIATE to `a ?? (b ?? d)` — the inner coalesce
   // becomes the outer's default and each LHS is again a plain place the
   // single-step lowerings below handle (host: same chained-coalesce value).
-  if lhs is BinExpr {
-    if lhs.binOp == "??" {
-      const reInner = mkBinary("??", lhs.binRight, e.binRight, -1)
-      // The inner link is delivered at `d`'s destination, so it reads `d`'s box record.
-      tyCarrySrcNote(reInner, e.binRight)
-      const reOuter = mkBinary("??", lhs.binLeft, reInner, -1)
-      coalLinkChains[reInner] = reOuter
-      // A chain joining structs is one box: both links take the chain's union, a supertype of
-      // the inner link's own join with the same null-ness, so its arm tags agree (D2373).
-      const chTy = nodeTyInOf(exprIx, fnIx)
-      // A chain joining numbers of different types apart is one box the same way.
-      if (
-        tyIsStructBearingUnion(chTy)
-        || (numUnionMinted && tyHoldsNumbersApart(chTy))
-      ) {
-        nodeTyRecord(reInner, chTy)
-        nodeTyRecord(reOuter, chTy)
-      } else {
-        // Otherwise the outer link is the chain. The inner one lies between `d` and the chain,
-        // so it is the chain's type exactly when `d` already is.
-        coalLinkTyAt(reOuter, exprIx, fnIx)
-        if tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(e.binRight, fnIx)) {
-          coalLinkTyAt(reInner, exprIx, fnIx)
-        }
+  if arm == "chain" && lhs is BinExpr {
+    const reInner = mkBinary("??", lhs.binRight, e.binRight, -1)
+    // The inner link is delivered at `d`'s destination, so it reads `d`'s box record.
+    tyCarrySrcNote(reInner, e.binRight)
+    const reOuter = mkBinary("??", lhs.binLeft, reInner, -1)
+    coalLinkChains[reInner] = reOuter
+    // A chain joining structs is one box: both links take the chain's union, a supertype of
+    // the inner link's own join with the same null-ness, so its arm tags agree (D2373).
+    const chTy = nodeTyInOf(exprIx, fnIx)
+    // A chain joining numbers of different types apart is one box the same way.
+    if (
+      tyIsStructBearingUnion(chTy)
+      || (numUnionMinted && tyHoldsNumbersApart(chTy))
+    ) {
+      nodeTyRecord(reInner, chTy)
+      nodeTyRecord(reOuter, chTy)
+    } else {
+      // Otherwise the outer link is the chain. The inner one lies between `d` and the chain,
+      // so it is the chain's type exactly when `d` already is.
+      coalLinkTyAt(reOuter, exprIx, fnIx)
+      if tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(e.binRight, fnIx)) {
+        coalLinkTyAt(reInner, exprIx, fnIx)
       }
-      // The inner link is the outer's default, delivered at the outer's type.
-      numDeliverStamp(reInner, nodeTyIxOf(reInner), nodeTyIxOf(reOuter))
-      return emitExpr(reOuter, fnIx)
     }
+    // The inner link is the outer's default, delivered at the outer's type.
+    numDeliverStamp(reInner, nodeTyIxOf(reInner), nodeTyIxOf(reOuter))
+    return emitExpr(reOuter, fnIx)
   }
-  // D1576 — the `null` type on the left makes the operand dead, the mirror of the narrowing
-  // rule below. A never-filled `let x = null` binding (or a `nulnone`-returning call) is
-  // statically null, so `x ?? d` is `d`: there is no niche to test, and every arm below would
-  // read the operand at a nullable rep this value lacks. The operand is still evaluated and dropped for effect.
-  if exprIsNulNone(lhsIx, fnIx) {
+  // The operand is still evaluated and dropped for effect.
+  if arm == "nulnone" {
     if emitNulNoneForEffect(lhsIx, fnIx) < 0 { return -1 }
     return emitExpr(e.binRight, fnIx)
   }
-  // An instance's `if` with a `null` arm keeps the generic `V | null` no arm below has a rep for.
+  if arm == "armIf" { return emitExpr(coalNullArmIf(e, exprIx), fnIx) }
   if (
-    lhs is IfStmt
-    && tyHasTyVar(nodeTyIxOf(lhsIx))
-    && fnInPinnedInstance(fnIx)
+    arm == "pinNonNull"
+    || arm == "retypedDead"
+    || arm == "fieldFlat"
+    || arm == "popElem"
   ) {
-    const armIf = coalNullArmIf(e, exprIx)
-    if armIf >= 0 { return emitExpr(armIf, fnIx) }
+    return emitExpr(lhsIx, fnIx)
   }
-  if coalesceOperandPinNonNull(exprIx, fnIx) { return emitExpr(lhsIx, fnIx) }
-  // An operand an instance re-typed at a pin that excludes `null` has a dead default.
-  if coalRetypedDead(exprIx, lhsIx, fnIx) { return emitExpr(lhsIx, fnIx) }
-  const djIf = coalRetypedDeadJoinIf(e, lhsIx, exprIx, fnIx)
-  if djIf >= 0 { return emitExpr(djIf, fnIx) }
-  // A field the receiver's stored row holds flat cannot be null, whatever row a narrowing
-  // typed the read at, so the default is dead (D8342).
-  if coalFieldStoredFlat(exprIx, lhsIx, fnIx) { return emitExpr(lhsIx, fnIx) }
-  if coalesceRetypedAtomToStr(exprIx, fnIx) {
-    return emitAtomToStr(lhsIx, fnIx)
+  if arm == "deadJoin" {
+    return emitExpr(
+      coalRetypedDeadJoinIf(e, coalRetypedDeadJoinTy(lhsIx, exprIx, fnIx)),
+      fnIx,
+    )
   }
-  // A read the narrowing pins to `null` may have been written since the test (a loop, a
-  // closure, a call), so the narrowing is lifted and the box tested at run time (D2801).
-  if readNarrowedBoxToNull(lhsIx, fnIx) {
+  if arm == "atomToStr" { return emitAtomToStr(lhsIx, fnIx) }
+  if arm == "boxRuntime" {
     const cnMark = storageReadEnter(lhsIx)
     const cnRc = emitCoalesceBoxRuntime(e, exprIx, fnIx)
     storageReadLeave(cnMark)
     return cnRc
   }
-  // A pop under a `.length` test of its receiver yields its element (D3558).
-  if popTakesElem(lhsIx) && nodeTyIxOf(lhsIx) == nodeTyIxOf(exprIx) {
-    return emitExpr(lhsIx, fnIx)
+  if arm == "holeMap" {
+    const hvt = coalHoleMapReadValTy(e, lhsIx, fnIx)
+    return emitExpr(coalHoleMapReadNullTest(e, hvt, exprIx, fnIx), fnIx)
   }
-  // A hole's map read with a nullable default is the null test the rewrite makes of the direct
-  // spelling (D2248), decided here because only the instance knows the map and the default.
-  const holeIf = coalHoleMapReadNullTest(e, lhsIx, exprIx, fnIx)
-  if holeIf >= 0 { return emitExpr(holeIf, fnIx) }
-  // A default that is another arm of the result's union reads the map as a nullable operand,
-  // through the join arms below.
-  const mapFused = !coalesceMapReadJoins(exprIx, fnIx)
-  if !mapFused {
-    const msj = emitMapGetOrScalarJoin(e, exprIx, fnIx)
-    if msj < 0 { return -1 }
-    if msj > 0 { return 0 }
-    const mjIf = coalMapReadJoinNullTest(e, lhsIx, exprIx, fnIx)
-    if mjIf >= 0 { return emitExpr(mjIf, fnIx) }
+  if arm == "mapScalarJoin" {
+    const sjk = mapRecvScalarBoxKindIn(coalMapRecvOf(e), fnIx)
+    if emitMapGetOrScalarJoin(e, sjk, exprIx, fnIx) < 0 { return -1 }
+    return 0
   }
-  if lhs is Index {
-    if mapFused && exprMap(lhs.idxArr, fnIx) {
-      return emitMapGetOr(
-        lhs.idxArr,
-        lhs.idxIndex,
-        e.binRight,
-        fnIx,
-        coalResultKindOf(exprIx, fnIx),
-      )
-    }
+  if arm == "mapJoinIf" {
+    return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
   }
-  const cmj = emitCoalesceMapJoin(e, exprIx, fnIx)
-  if cmj < 0 { return -1 }
-  if cmj > 0 { return 0 }
-  // The METHOD form `recv.get(k) ?? d` over a map receiver is the SAME fused
-  // get-with-default as `recv[k] ?? d` — lower it identically. (The LIST `.get`
-  // at ~6890 is a distinct struct-element get and is NOT a map; `exprMap` gates
-  // this to map receivers only.)
-  if lhs is Call {
-    if lhs.callFn < 0 { return -1 }
-    const lcallee = nodeAt(lhs.callFn)
-    if lcallee is Member {
-      if lcallee.memProp == "get" {
-        if mapFused && exprMap(lcallee.memObj, fnIx) {
-          if lhs.callArgs.length != 1 {
-            return emitFail(
-              "emitProgram: internal: map .get reached with the wrong argument count — the checker's arity rule refuses it",
-            )
-          }
-          return emitMapGetOr(
-            lcallee.memObj,
-            lhs.callArgs[0],
-            e.binRight,
-            fnIx,
-            coalResultKindOf(exprIx, fnIx),
-          )
-        }
-        // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64, and an i64 or
-        // f32 one whose `??` keeps the element type) is the FUSED checked read-with-default
-        // (B6) — one bounds compare.
-        const lgk = scalarListElemKind(lcallee.memObj, fnIx)
-        const lgPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
-        if (
-          exprF64Array(lcallee.memObj, fnIx)
-          || exprArray(lcallee.memObj, fnIx)
-          || (lgk == "i64" && lgPrim == "i64")
-          || (lgk == "f32" && lgPrim == "f32")
-        ) {
-          return emitListGetOr(lhsIx, e.binRight, fnIx)
-        }
-      }
-      // `xs.pop() ?? d` over a scalar list is the fused checked pop-with-default: `len != 0`
-      // selects decrement-and-read or `d`. Gated on `scalarListElemKind`, the discriminator
-      // `emitPopOr` selects its rep with; a wide kind only where the `??` keeps the element type.
-      if lcallee.memProp == "pop" {
-        const pk = scalarListElemKind(lcallee.memObj, fnIx)
-        const pkPrim = tyPrimNameOf(nodeTyIxOf(exprIx))
-        if (
-          pk == "i32"
-          || (pk == "f64" && pkPrim == "f64")
-          || (pk == "i64" && pkPrim == "i64")
-          || (pk == "f32" && pkPrim == "f32")
-        ) {
-          // A literal-union list's i32 element widened to a string default takes the niche
-          // lowering, which converts the atom; the fused pop builds the default as is (D1413).
-          if (
-            !exprRefArray(lcallee.memObj, fnIx)
-            && !exprStringArray(lcallee.memObj, fnIx)
-            && !coalesceNulAtomToStr(exprIx, fnIx)
-          ) {
-            return emitPopOr(lhsIx, e.binRight, fnIx)
-          }
-        }
-      }
-    }
+  if arm == "mapIndexGetOr" && lhs is Index {
+    return emitMapGetOr(
+      lhs.idxArr,
+      lhs.idxIndex,
+      e.binRight,
+      fnIx,
+      coalResultKindOf(exprIx, fnIx),
+    )
+  }
+  if arm == "mapJoin" {
+    if emitCoalesceMapJoin(e, exprIx, fnIx) < 0 { return -1 }
+    return 0
+  }
+  if arm == "mapGetOr" || arm == "listGetOr" || arm == "popOr" {
+    return emitCoalesceCallArm(arm, e, lhsIx, exprIx, fnIx)
   }
   return emitCoalesceNiche(e, lhsIx, exprIx, fnIx)
+}
+
+// The fused `??` arms over a method call operand `recv.get(k)` or `recv.pop()`.
+function emitCoalesceCallArm(
+  arm: CoalArm,
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  const lhs = nodeAt(lhsIx)
+  if !(lhs is Call) || lhs.callFn < 0 { return -1 }
+  const lcallee = nodeAt(lhs.callFn)
+  if !(lcallee is Member) { return -1 }
+  if arm == "mapGetOr" {
+    if lhs.callArgs.length != 1 {
+      return emitFail(
+        "emitProgram: internal: map .get reached with the wrong argument count — the checker's arity rule refuses it",
+      )
+    }
+    return emitMapGetOr(
+      lcallee.memObj,
+      lhs.callArgs[0],
+      e.binRight,
+      fnIx,
+      coalResultKindOf(exprIx, fnIx),
+    )
+  }
+  if arm == "listGetOr" { return emitListGetOr(lhsIx, e.binRight, fnIx) }
+  return emitPopOr(lhsIx, e.binRight, fnIx)
 }
 
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
@@ -43336,16 +43501,13 @@ function emitCoalesceBoxFieldScalar(
 // rep an instance types, where the `if` keeps its generic `V | null` (D10130). Only a desugared
 // `if` reaches here: a written one is already bound to a local. -1 otherwise.
 function coalNullArmIf(e: BinExpr, exprIx: i32): i32 {
-  const lhsIx = unwrapParen(e.binLeft)
-  if lhsIx < 0 { return -1 }
-  const n = nodeAt(lhsIx)
-  if !(n is IfStmt) || n.ifElse < 0 { return -1 }
+  if !coalNullArmShaped(e) { return -1 }
+  const n = nodeAt(unwrapParen(e.binLeft))
+  if !(n is IfStmt) { return -1 }
   const tv = coalSoleStmt(n.ifThen)
   const ev = coalSoleStmt(n.ifElse)
   if tv < 0 || ev < 0 { return -1 }
   const tNull = nodeAt(tv) is NullLit
-  const eNull = nodeAt(ev) is NullLit
-  if tNull == eNull { return -1 }
   const pos = e.pos
   let live = tv
   if tNull { live = ev }
@@ -43364,6 +43526,19 @@ function coalNullArmIf(e: BinExpr, exprIx: i32): i32 {
   const ifIx = mkIf(n.ifCond, thenB, elseB, pos)
   nodeTyCarry(ifIx, exprIx)
   return ifIx
+}
+
+// Whether `??` operand `e.binLeft` is an `if` with an `else` whose arms are each one value,
+// exactly one of them `null`.
+function coalNullArmShaped(e: BinExpr): boolean {
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 { return false }
+  const n = nodeAt(lhsIx)
+  if !(n is IfStmt) || n.ifElse < 0 { return false }
+  const tv = coalSoleStmt(n.ifThen)
+  const ev = coalSoleStmt(n.ifElse)
+  if tv < 0 || ev < 0 { return false }
+  return (nodeAt(tv) is NullLit) != (nodeAt(ev) is NullLit)
 }
 
 // The one statement block `ix` holds, or -1 when it holds another number or is not a block.
