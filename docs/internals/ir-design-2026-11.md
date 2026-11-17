@@ -732,7 +732,9 @@ become shared, and they do not count as "fully matched" before then.
 **Claiming is on (2026-11-17).** `CLAIMED` holds scalar, control, call, global and map, so a
 function built wholly of those families ships the IR's bytes and legacy does not run for it.
 Claiming was parked while it deleted nothing; it was turned on because the IR shipping is the
-goal and its cost (+0.02% L2 fuel) is far under the tier. Deletions follow as the claimed share
+goal. Its cost is +0.67% L2 fuel, because the IR builds every function to decide its claim; it was
+accepted with a rebaseline (ledger #8947). The follow-up that pays it back builds only functions a
+cheap pre-scan says could claim. Deletions follow as the claimed share
 grows: once every function that reaches a legacy driver is claimed, that driver deletes. The
 armed shadow still checks the unclaimed functions. The blocking unarmed `ir claims` gate row
 (`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back`, with a verifier

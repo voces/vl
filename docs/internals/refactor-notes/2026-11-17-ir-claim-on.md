@@ -24,9 +24,19 @@ it. `list` stays out: claiming it reaches about 5,700 self-compile functions, bu
 | armed shadow, all of `tests/cases` (8,497 files) | 28,329 covered, 28,329 matched, 0 verifier failures |
 | armed shadow, distilled | 24,121 of 24,121 matched |
 | shipped claim (`--claims`, mode 5) | corpus 10,868 and `tests/cases` 12,820 functions emitted by the IR, 0 fell back |
-| self-compile | 2,179 functions emitted by the IR; fixpoint, and byte-identical to the legacy-built seed |
+| self-compile | 2,181 functions emitted by the IR; fixpoint, and byte-identical to the legacy-built seed |
 | corpus identity against the base's fixpoint seed | distilled 9,029 identical and `tests/cases` 7,125 identical, 0 differ, 0 lost |
 | L2 fuel | 96.22G: +0.84% master drift plus +0.67% for the claim (the IR builds every function to decide it); rebaselined with a ledger line |
+
+## The `ir claims` row's own control
+
+End to end, by IR-REV: a host built from this branch (mode 5) and a scratch seed compiled with
+`ibCorrupt = 1`. The shipped seed reads `ir claims: 10868 functions emitted by the IR`, rc 0. The
+corrupted seed reads 5,771 emitted, `5097 claim fell back: verifier`, rc 1. The Deno test drives the
+same fallback through the export, not through the row.
+
+Open caveat (§10): a claimed function returns before `emitResetScopeFrames`. Moving that reset above
+the claim writes no bytes and would close the caveat; it is a follow-up.
 
 ## What the corpus comparison found, and how each class closed
 
