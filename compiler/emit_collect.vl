@@ -1171,12 +1171,12 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
       // union is a union-box list, and reading only the first would key it under one arm. A
       // heterogeneous literal has no single committed rep, so the bank stays empty and the
       // checker-typed union rung keeps it.
-      const ca = alcCommitAnn(n.arrElems[0], bodyIx, fnIx, 0)
+      const ca = alcCommitAnn(n.arrElems[0], bodyIx, fnIx, [])
       const cn = alcAnnName(ca)
       let agree = alcNamesArm(cn, ca)
       let ei = 1
       while ei < n.arrElems.length {
-        if alcAnnName(alcCommitAnn(n.arrElems[ei], bodyIx, fnIx, 0)) != cn {
+        if alcAnnName(alcCommitAnn(n.arrElems[ei], bodyIx, fnIx, [])) != cn {
           agree = false
         }
         ei = ei + 1
@@ -1214,15 +1214,15 @@ function alcAnnName(ann: i32): string {
   return tyNameOf(ann)
 }
 
-// The annotation node the expression at `ex` has already committed its rep to, or -1. Four
-// sources, every one an annotation a user wrote or a pin synthesized and never an inference: a
-// bound local, a parameter, a callee's declared result, and a callee's inferred result read
-// through the binding that supplies it. Depth-bounded, since the arena is not this pass's to trust.
-function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
+// The annotation node the expression at `ex` has already committed its rep to, or -1: a bound
+// local's, a parameter's, a callee's declared result, or a callee's inferred result read through
+// the binding that supplies it; never an inference. A value `seen` already holds is a cycle, since
+// the arena is not this pass's to trust.
+function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, seen: i32[]): i32 {
   if ex < 0 { return -1 }
-  if depth > 4 { return -1 }
   const u = unwrapParen(ex)
-  if u < 0 { return -1 }
+  if u < 0 || i32ListHas(seen, u) { return -1 }
+  seen.push(u)
   const n = nodeAt(u)
   match n {
     Ident => {
@@ -1233,7 +1233,7 @@ function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
           if ld.letType >= 0 { return ld.letType }
           // An un-annotated binding is a link in the chain, not the end of it: the alias
           // re-names a value, it does not re-rep one.
-          return alcCommitAnn(ld.letInit, bodyIx, fnIx, depth + 1)
+          return alcCommitAnn(ld.letInit, bodyIx, fnIx, seen)
         }
         return -1
       }
@@ -1261,7 +1261,7 @@ function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
             if cfn.fnRet >= 0 { return cfn.fnRet }
             const crx = fnRetExprOf(cix)
             if crx < 0 { return -1 }
-            return alcCommitAnn(crx, cfn.fnBody, cix, depth + 1)
+            return alcCommitAnn(crx, cfn.fnBody, cix, seen)
           }
         }
       }
@@ -4909,30 +4909,31 @@ function forceAnnLeafRepsOfTy(t: i32): i32 {
 // `collectATypeRef`'s function-type rung handles a top-level function type; a closure that is a field
 // of an inline shape (`{f: () => string}`) reaches no rung. Forces only from the result and
 // parameters of such a field, descending through unions, lists, function parts and shapes.
-function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
-  if depth > 6 || t < 0 || t >= T.tys.length { return 0 }
+function forceNestedCloSigRepsOfTy(t: i32, seen: i32[]): i32 {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
   const k = tyAt(t)
   match k {
     TyUnion => {
       let ai = 0
       while ai < k.uMembers.length {
-        forceNestedCloSigRepsOfTy(k.uMembers[ai], depth + 1)
+        forceNestedCloSigRepsOfTy(k.uMembers[ai], seen)
         ai = ai + 1
       }
     }
     TyNullable => {
-      forceNestedCloSigRepsOfTy(k.nInner, depth + 1)
+      forceNestedCloSigRepsOfTy(k.nInner, seen)
     }
     TyArray => {
-      forceNestedCloSigRepsOfTy(tyElemOf(k), depth + 1)
+      forceNestedCloSigRepsOfTy(tyElemOf(k), seen)
     }
     TyFunc => {
       // A function type's own parts are not forced here: a top-level return belongs to
       // `collectATypeRef`'s function-type rung.
-      forceNestedCloSigRepsOfTy(k.fnRet, depth + 1)
+      forceNestedCloSigRepsOfTy(k.fnRet, seen)
       let ti = 0
       while ti < k.fnParamTypes.length {
-        forceNestedCloSigRepsOfTy(k.fnParamTypes[ti], depth + 1)
+        forceNestedCloSigRepsOfTy(k.fnParamTypes[ti], seen)
         ti = ti + 1
       }
     }
@@ -4946,15 +4947,15 @@ function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
           const fk = tyAt(ft)
           if fk is TyFunc {
             forceAnnLeafRepsOfTy(fk.fnRet)
-            forceNestedCloSigRepsOfTy(fk.fnRet, depth + 1)
+            forceNestedCloSigRepsOfTy(fk.fnRet, seen)
             let pi = 0
             while pi < fk.fnParamTypes.length {
               forceAnnLeafRepsOfTy(fk.fnParamTypes[pi])
-              forceNestedCloSigRepsOfTy(fk.fnParamTypes[pi], depth + 1)
+              forceNestedCloSigRepsOfTy(fk.fnParamTypes[pi], seen)
               pi = pi + 1
             }
           } else {
-            forceNestedCloSigRepsOfTy(ft, depth + 1)
+            forceNestedCloSigRepsOfTy(ft, seen)
           }
         }
         fi = fi + 1
@@ -5571,7 +5572,7 @@ function annTyIsRefList(i: i32, nd: TypeRef): boolean {
 function collectATypeRef(i: i32, nd: TypeRef) {
   // A closure that is a struct field reserves nothing through the rung below —
   // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
-  forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
+  forceNestedCloSigRepsOfTy(nodeTyIxOf(i), [])
   // A function type forces nothing here: its result's types are forced by
   // `forceNestedCloSigRepsOfTy` above.
   if tyIsFuncArena(nodeTyIxOf(i)) {
@@ -5810,7 +5811,7 @@ function internJoinedRecordRow(ix: i32) {
   if !recordJoinSeen() { return 0 }
   const ty = nodeTyIxOf(ix)
   if !initJoinsWiderRecord(ix, ty) { return 0 }
-  internArmShapeOfTy(ty, 0)
+  internArmShapeOfTy(ty, [])
   return internShapeDeepTy(ty)
 }
 
@@ -5840,7 +5841,7 @@ export function collectAnnShapes() {
       }
       // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
       // row to exist before `armFieldStructRow` is asked for it (D1672).
-      internArmFieldShapeTy(root, 0)
+      internArmFieldShapeTy(root, [])
       // An annotation the checker typed nothing at, such as a type parameter's bound, is not
       // the type of any value, so it has no shape to intern.
       if root >= 0 { internShapeDeepTy(root) }
@@ -5864,9 +5865,10 @@ export function collectAnnShapes() {
 }
 
 // Whether record field type `ft` is a value union's box, nullable or not, or a record holding
-// one in a field, at most four records down.
-function objFieldHoldsUnionBox(ft: i32, depth: i32): boolean {
-  if ft < 0 || ft >= T.tys.length || depth > 4 { return false }
+// one in a field, each record walked once.
+function objFieldHoldsUnionBox(ft: i32, seen: i32[]): boolean {
+  if ft < 0 || ft >= T.tys.length || i32ListHas(seen, ft) { return false }
+  seen.push(ft)
   const fu = tyAt(ft)
   match fu {
     TyUnion => {
@@ -5881,7 +5883,7 @@ function objFieldHoldsUnionBox(ft: i32, depth: i32): boolean {
     }
     TyObj => {
       for gt in fu.objFieldTypes {
-        if objFieldHoldsUnionBox(gt, depth + 1) { return true }
+        if objFieldHoldsUnionBox(gt, seen) { return true }
       }
     }
     TyPrim | TyErr | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
@@ -5900,7 +5902,7 @@ function mintUnionFieldObjRow(ix: i32) {
   if !(o is TyObj) { return 0 }
   for ft in o.objFieldTypes {
     if ft >= 0 && ft < T.tys.length {
-      if objFieldHoldsUnionBox(ft, 0) {
+      if objFieldHoldsUnionBox(ft, []) {
         if tyHasTyVar(lt) { return 0 }
         if structRowOfRecordTy(lt) < 0 || structIndexOfObj(ix) < 0 {
           internShapeDeepTy(lt)
@@ -6342,7 +6344,7 @@ function collectAnonShapes() {
   while ai < P.nodes.length {
     const an = nodeAt(ai)
     if an is ObjLit {
-      if anonHolderAwaitsElemRow(ai, 0, false) {
+      if anonHolderAwaitsElemRow(ai, false) {
         late.push(ai)
       } else {
         anonMintLiteral(ai)
@@ -6356,7 +6358,7 @@ function collectAnonShapes() {
   while pending.length > 0 {
     const next: i32[] = []
     for li in pending {
-      if anonHolderAwaitsElemRow(li, 0, true) {
+      if anonHolderAwaitsElemRow(li, true) {
         next.push(li)
       } else {
         anonMintLiteral(li)
@@ -6487,12 +6489,8 @@ function arrLitRepElemRow(ai: i32): boolean {
 
 // Whether the object literal at `objIx` has a field, directly or through a nested literal, that
 // is an empty list literal whose recorded element is a record type.
-function anonHolderAwaitsElemRow(
-  objIx: i32,
-  depth: i32,
-  unminted: boolean,
-): boolean {
-  if depth > 8 || objIx < 0 || objIx >= P.nodes.length { return false }
+function anonHolderAwaitsElemRow(objIx: i32, unminted: boolean): boolean {
+  if objIx < 0 || objIx >= P.nodes.length { return false }
   const o = nodeAt(objIx)
   if !(o is ObjLit) { return false }
   for fx in o.objFields {
@@ -6501,7 +6499,7 @@ function anonHolderAwaitsElemRow(
       const v = unwrapParen(f.fiValue)
       if anonEmptyRecordListLit(v, unminted) { return true }
       if anonRecordValuedMap(v, unminted) { return true }
-      if anonHolderAwaitsElemRow(v, depth + 1, unminted) { return true }
+      if anonHolderAwaitsElemRow(v, unminted) { return true }
     }
   }
   return false
@@ -6872,15 +6870,16 @@ export function collectGenAliasShapes() {
 // `g: Circle | null`), through a nullable's inner type, a list's element, a map's value and an
 // inline record's fields (D1672), so `armFieldStructRow` has a row to answer with. A declared
 // record is a leaf, as its name is. A no-op for a type with no arm, and costs no heap type.
-function internArmFieldShapeTy(ty: i32, depth: i32) {
-  if depth > 8 || ty < 0 || ty >= T.tys.length { return 0 }
+function internArmFieldShapeTy(ty: i32, seen: i32[]) {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return 0 }
+  seen.push(ty)
   const t = tyAt(ty)
-  if t is TyNullable { return internArmFieldShapeTy(t.nInner, depth + 1) }
-  if t is TyArray { return internArmFieldShapeTy(tyElemOf(t), depth + 1) }
-  if t is TyMap { return internArmFieldShapeTy(tyValOf(t), depth + 1) }
+  if t is TyNullable { return internArmFieldShapeTy(t.nInner, seen) }
+  if t is TyArray { return internArmFieldShapeTy(tyElemOf(t), seen) }
+  if t is TyMap { return internArmFieldShapeTy(tyValOf(t), seen) }
   if t is TyObj {
     if structNameOfTy(ty) == "" {
-      for f in t.objFieldTypes { internArmFieldShapeTy(f, depth + 1) }
+      for f in t.objFieldTypes { internArmFieldShapeTy(f, seen) }
       return 0
     }
   }
@@ -6889,14 +6888,15 @@ function internArmFieldShapeTy(ty: i32, depth: i32) {
 
 // `internArmFieldShapeTy` with a declared record's fields descended too, for a join whose
 // record is spelled by its shape; any other type mints the arm row that carries it.
-function internArmShapeOfTy(ty: i32, depth: i32) {
-  if depth > 8 || ty < 0 || ty >= T.tys.length { return 0 }
+function internArmShapeOfTy(ty: i32, seen: i32[]) {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return 0 }
+  seen.push(ty)
   const t = tyAt(ty)
-  if t is TyNullable { return internArmShapeOfTy(t.nInner, depth + 1) }
-  if t is TyArray { return internArmShapeOfTy(tyElemOf(t), depth + 1) }
-  if t is TyMap { return internArmShapeOfTy(tyValOf(t), depth + 1) }
+  if t is TyNullable { return internArmShapeOfTy(t.nInner, seen) }
+  if t is TyArray { return internArmShapeOfTy(tyElemOf(t), seen) }
+  if t is TyMap { return internArmShapeOfTy(tyValOf(t), seen) }
   if t is TyObj {
-    for f in t.objFieldTypes { internArmShapeOfTy(f, depth + 1) }
+    for f in t.objFieldTypes { internArmShapeOfTy(f, seen) }
     return 0
   }
   return internArmShapeRow(repVariantShapeRowOf(ty))
@@ -6931,9 +6931,9 @@ function collectNestedFieldShapes(stmts: i32[]) {
             } else {
               fdRoot = nodeTyIxOf(fnode.fdType)
             }
-            internArmFieldShapeTy(fdRoot, 0)
+            internArmFieldShapeTy(fdRoot, [])
           } else {
-            internArmFieldShapeTy(declAnnTyOf(fnode.fdType), 0)
+            internArmFieldShapeTy(declAnnTyOf(fnode.fdType), [])
           }
           // `internShapeDeepTy` peels composition wrappers and descends a map field's value, so a
           // declared nullable-map field's value struct interns before `collectS` codes the field.
@@ -8725,7 +8725,16 @@ function collectInlineUnions(stmts: i32[]) {
   nliNames = []
   cloSigWalkRoots = []
   ciuFnSeen = Map()
-  return collectInlineUnionsIn(stmts, stmts)
+  if collectInlineUnionsIn(stmts, stmts) < 0 { return -1 }
+  // The statement walk does not enter expressions, so an expression-position `if` registers the
+  // bindings in its arms here: a narrowed box bound there, the list-union rewrite's receiver
+  // among them, names its union (D16896).
+  for ix in valueIfNodes {
+    if ix >= 0 && ix < P.nodes.length && nodeAt(ix) is IfStmt {
+      if collectInlineUnionsIn(stmts, [ix]) < 0 { return -1 }
+    }
+  }
+  return 0
 }
 
 // The functions `collectInlineUnionsIn` has registered, so `collectU`'s lambda walk skips them.
