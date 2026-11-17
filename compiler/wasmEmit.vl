@@ -6571,6 +6571,9 @@ function listIsAcrossRepsPlan(
   const arms: i32[] = []
   if (!unionTyMemberTys(unionBoxTyOfRead(recv, fnIx), arms)) { return false }
   const chkTag = listIsArmTag(chk)
+  // A list of `i32` literals at any depth shares its rows with the `i32` lists, so a box can
+  // hold either under its tag (D16894).
+  const numLeaf = listArmNumsDepth(chk, chk) >= 0
   let other = false
   for a in arms {
     if tyArrayElemIx(a) >= 0 {
@@ -6581,7 +6584,7 @@ function listIsAcrossRepsPlan(
       if unMemIsRefElemArray(a) { unMemRefArrArmSlot(a) }
       // A list of `i32` literals is read by its elements even as its own arm: the box it shares
       // with `i32[]` may hold either.
-      let k = if !tySame(a, chk) { listArmFitAcrossReps(a, chk) } else if isArmTagOfTy(chk) >= 0 { LIST_ARM_OWN } else { 0 }
+      let k = if !tySame(a, chk) { listArmFitAcrossReps(a, chk) } else if !numLeaf { LIST_ARM_OWN } else { 0 }
       const slots: i32[] = []
       if k == 0 {
         // An arm with another tag holds a list whose element type is fixed apart from the
@@ -6619,7 +6622,7 @@ function listIsAcrossRepsPlan(
     }
   }
   // `L` alone is tested by its tag in the later rungs, unless only this plan has its tag.
-  return other || isArmTagOfTy(chk) < 0
+  return other || numLeaf || isArmTagOfTy(chk) < 0
 }
 
 // The planned test over the non-null box in local `slot`, leaving a 0/1 i32. 0, or -1 on failure.
@@ -9127,6 +9130,24 @@ function emitUnionCoerce(
   return r
 }
 
+// The one list arm slot of union `unionTy` whose wrapper is ref-list slot `slot`'s, or -1 when
+// none or several are.
+function refArrTwinArmSlot(unionTy: i32, slot: i32): i32 {
+  if slot < 0 || slot >= rlWrapIdx.length { return -1 }
+  const mems: i32[] = []
+  if !unionTyMemberTys(unionTy, mems) { return -1 }
+  let found = -1
+  for m in mems {
+    if m < 0 || !unMemIsRefElemArray(m) { continue }
+    const s = unMemRefArrArmSlot(m)
+    if s >= 0 && s < rlWrapIdx.length && rlWrapIdx[s] == rlWrapIdx[slot] {
+      if found >= 0 && found != s { return -1 }
+      found = s
+    }
+  }
+  return found
+}
+
 // `emitUnionCoerceUnder`'s arm for a ref-element array carrier entering `unionName`: the
 // wrapper rides the box under its arm's slot tag, or the literal rebuilds through a matching
 // arm. Returns 0, or -1 once failed; with no arm to carry it the failure is loud.
@@ -9158,6 +9179,15 @@ function emitUnionCoerceRefArray(
   const viaNest = emitUnionNestedListLit(unionTy, exprIx, fnIx)
   if viaNest < 0 { return -1 }
   if viaNest == 1 { return 0 }
+  // A row whose arm a twin spelling keyed (`K[][]` for `i32[][]`) holds the value under that
+  // arm's tag when the two lists share one wrapper; `is` reads its elements (D16894).
+  const twin = refArrTwinArmSlot(unionTy, raSlot)
+  if twin >= 0 {
+    fbI32Rel(RS_TAG, refArrSlotTag(twin))
+    if emitExpr(exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx)
+    return 0
+  }
   // A ref-element array carrier whose interned slot matches no ref-array arm of the union:
   // a non-literal carrier whose built leaves cannot re-encode in place, or an ambiguous or
   // absent arm. A ref array can only ride the box as a wrapper ref, so with no arm to carry
