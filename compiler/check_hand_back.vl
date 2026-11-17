@@ -3,9 +3,12 @@
 // for each instance (`mintRetNote`) and by the check-time set-binding rows (`check_set_bind.vl`).
 import {
   Call,
+  FieldInit,
   FuncDecl,
   Ident,
   LetDecl,
+  Member,
+  ObjLit,
   P,
   Param,
   TypeRef,
@@ -219,7 +222,9 @@ export function handBackCallParam(c: i32, fn: FuncDecl): i32 {
   const f = parenPeelIx(cn.callFn)
   if f < 0 { return -1 }
   const fx = nodeAt(f)
-  if fx is Call { return hbCloCallArgParam(f, fn) }
+  if fx is Call { return hbCloCallArgParam(f, fn, "") }
+  // A field of a record such a call returns, or of a `const` holding one, holding that closure.
+  if fx is Member { return hbRecCloParam(parenPeelIx(fx.memObj), fx.memProp, fn) }
   if !(fx is Ident) { return -1 }
   const d = identDeclOf(f)
   const own = handBackLamOf(d, fn)
@@ -230,18 +235,69 @@ export function handBackCallParam(c: i32, fn: FuncDecl): i32 {
     return -1
   }
   const init = parenPeelIx(ln.letInit)
-  return if init >= 0 && nodeAt(init) is Call { hbCloCallArgParam(init, fn) } else { -1 }
+  return if init >= 0 && nodeAt(init) is Call { hbCloCallArgParam(init, fn, "") } else { -1 }
+}
+
+// `handBackCallParam` for a closure read at field `prop` of `o`: a call handing back its argument
+// in that field of the record it returns, or a `const` holding one read only through that field.
+function hbRecCloParam(o: i32, prop: string, fn: FuncDecl): i32 {
+  if o < 0 { return -1 }
+  const on = nodeAt(o)
+  if on is Call { return hbCloCallArgParam(o, fn, prop) }
+  if !(on is Ident) { return -1 }
+  const d = identDeclOf(o)
+  const ln = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 || !hbOnlyFieldCalled(d, prop, fn) {
+    return -1
+  }
+  const init = parenPeelIx(ln.letInit)
+  return if init >= 0 && nodeAt(init) is Call { hbCloCallArgParam(init, fn, prop) } else { -1 }
+}
+
+// Whether every read of `d` in `fn` reads field `prop` as a callee called with no arguments.
+function hbOnlyFieldCalled(d: i32, prop: string, fn: FuncDecl): boolean {
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Member) || pn.memProp != prop || !hbCalledBareAt(p, fn.fnBody) { return false }
+      }
+      for k in nodeChildren(x) {
+        todo.push(k)
+        par.push(x)
+      }
+    }
+  }
+  return true
+}
+
+// Whether node `m` under `body` is the callee of a call with no arguments.
+function hbCalledBareAt(m: i32, body: i32): boolean {
+  const todo: i32[] = [body]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Call && parenPeelIx(xn.callFn) == m { return xn.callArgs.length == 0 }
+      for k in nodeChildren(x) { todo.push(k) }
+    }
+  }
+  return false
 }
 
 // The parameter of `fn` call `w` hands a declared function at the index it hands back in a
-// closure (`handBackCloIx`); -1 otherwise.
-function hbCloCallArgParam(w: i32, fn: FuncDecl): i32 {
+// closure, at field `prop` of its record when `prop` is not "" (`handBackCloIx`); -1 otherwise.
+function hbCloCallArgParam(w: i32, fn: FuncDecl, prop: string): i32 {
   const wn = nodeAt(w)
   if !(wn is Call) { return -1 }
   const g = identFnDeclOf(parenPeelIx(wn.callFn))
   const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { nodeAt(0) }
   if !(gn is FuncDecl) { return -1 }
-  const j = handBackCloIx(gn)
+  const j = handBackCloIx(gn, prop)
   if j < 0 || j >= wn.callArgs.length { return -1 }
   if j < wn.callArgNames.length && wn.callArgNames[j] != "" { return -1 }
   const a = parenPeelIx(wn.callArgs[j])
@@ -250,14 +306,15 @@ function hbCloCallArgParam(w: i32, fn: FuncDecl): i32 {
 }
 
 // The parameter index of `dn` that every value `dn` returns hands back in a parameterless
-// closure (`hbLamReturnedParam`), which `dn` reads nowhere else; -1 otherwise.
-export function handBackCloIx(dn: FuncDecl): i32 {
+// closure (`hbLamReturnedParam`), or in field `prop` of a record literal when `prop` is not "",
+// which `dn` reads nowhere else; -1 otherwise.
+export function handBackCloIx(dn: FuncDecl, prop: string): i32 {
   const vs: i32[] = []
   collectRetValues(dn.fnBody, vs)
   const rets: i32[] = []
   let pd = -1
   for v in vs {
-    const lam = parenPeelIx(v)
+    const lam = hbRetClosure(parenPeelIx(v), prop)
     const lf = if lam >= 0 { nodeAt(lam) } else { nodeAt(0) }
     if !(lf is FuncDecl) || lf.fnName != "" || lf.fnParams.length > 0 { return -1 }
     const d = hbLamReturnedParam(lf, dn, rets)
@@ -266,6 +323,19 @@ export function handBackCloIx(dn: FuncDecl): i32 {
   }
   if pd < 0 || !hbReadsOnly(dn.fnBody, pd, rets) { return -1 }
   return i32ListIndexOf(dn.fnParams, pd)
+}
+
+// The closure returned value `v` holds: `v` itself, or with `prop` not "" the value of the field
+// `prop` of record literal `v`; -1 otherwise.
+function hbRetClosure(v: i32, prop: string): i32 {
+  if prop == "" { return v }
+  const vn = if v >= 0 { nodeAt(v) } else { nodeAt(0) }
+  if !(vn is ObjLit) { return -1 }
+  for fi in vn.objFields {
+    const fn = nodeAt(fi)
+    if fn is FieldInit && fn.fiName == prop { return parenPeelIx(fn.fiValue) }
+  }
+  return -1
 }
 
 // Whether every read of `d` in `fn` calls it with no arguments, as a callee.
