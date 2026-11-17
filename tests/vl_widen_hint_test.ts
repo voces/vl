@@ -159,7 +159,7 @@ const CASES: Case[] = [
   {
     dst: "f64[][]",
     val: "nss",
-    want: ["build"],
+    want: ["readonly"],
     show: "print(w[0][0] / 4.0)",
     out: "0.25",
   },
