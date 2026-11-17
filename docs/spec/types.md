@@ -822,8 +822,8 @@ print("built")    // prints built
 > function's hole parameters close at check to the hole default" (D16898).
 
 > Status: check leaves the uninstanced function's type open and the default is applied in
-> emit (D16898). An uninstanced function whose body constrains a hole to `string`, stored as a
-> record into a map read back from a map, is built at `i32` and fails to validate (D16927).
+> emit (D16898). An uninstanced function whose body calls a built-in method, stored as a record
+> into a map read back from a map, is refused at emit (D16935).
 
 ## T10. Aliases and nominal types
 
