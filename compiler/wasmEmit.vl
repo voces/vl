@@ -36530,34 +36530,19 @@ function stmtAssignsName(ix: i32, nm: string): boolean {
   return false
 }
 
-function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
-  const luf = emitListUnionFor(s, stmtIx, fnIx)
-  if luf != 0 { return if luf < 0 { -1 } else { 0 } }
-  // `for v[, w] in <list> { body }` — iterate an i32 list, a string list, a struct ref list,
-  // or a map's ordered keys/values list. Cursor slots in collect pre-order: the element var
-  // `v`, a hidden cursor `v#i`, a hidden list temp `v#l` (the iterable evaluates once), and
-  // the second name last. Shape mirrors `while`: block/loop, exit on `cursor >= len`, cursor++.
-  const ek = forInElemKind(s.fiIter, fnIx)
-  if ek == null {
-    return emitFailAt("emitProgram: unsupported for-in iterable", s.fiIter)
-  }
-  // A STRING iterable (`for ch in s`): the `#l` temp IS the raw `(ref $sTypeIdx)` array (no
-  // list wrapper), so the length is `array.len` and each element `array.get $aTypeIdx` —
-  // skipping the `struct.get wrapTy` the i32-list path uses. The loop var is an i32 code unit.
-  const strSrc = forInStringSrc(s.fiIter, fnIx)
-  // a packed byte-list iterable (`for b in bs`, `bs: u8[]`): the `#l` temp is the `$bl8`
-  // wrapper over the one-byte backing, so length is `struct.get $bl8 1` and each element
-  // `array.get_u $ba8` — `fbArrayGet` picks the unsigned opcode off the backing heap index itself.
-  const u8Src = forInU8Src(s.fiIter, fnIx)
-  // The SECOND name's slot, minted last in the same pre-order the collect pass mints it.
+// The loop record of `for` statement `s` over element kind `ek`, its first slot `vSlot`: the
+// cursor, list temp and pair slots after it, the pair's kinds and types, the map receiver and
+// the backing (`forInBackingOf`). Null when a ref list has no row.
+export function forInLoopAt(
+  s: ForIn,
+  fnIx: i32,
+  vSlot: i32,
+  ek: VKind,
+  strSrc: boolean,
+  u8Src: boolean,
+): ForInLoop | null {
   const pairName = s.fiVar2
   const hasPair = pairName != ""
-  let nSlots = 3
-  if hasPair { nSlots = 4 }
-  const vSlot = declSlotTake(stmtIx, nSlots)
-  // An `is K[]` arm's empty list of ref elements never iterates, and its loop slots are
-  // typed at the receiver's own element, so the loop is not emitted (D4962).
-  if listFitShadowIsRef(s.fiIter, fnIx) { return 0 }
   const iSlot = vSlot + 1
   const lSlot = vSlot + 2
   let pSlot = -1
@@ -36595,7 +36580,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
     hSlot: 0,
     hOk: true,
   }
-  if forInBackingOf(s, fnIx, ek, u8Src, fb) < 0 { return -1 }
+  if forInBackingOf(s, fnIx, ek, u8Src, fb) < 0 { return null }
   const mapRecv = forInMapRecv(s.fiIter, fnIx)
   const lp: ForInLoop = {
     ek: ek,
@@ -36625,22 +36610,92 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
     backTy: fb.backTy,
     hKind: fb.hKind,
     hSlot: fb.hSlot,
+    fiHOk: fb.hOk,
   }
+  return lp
+}
+
+// After a walk's list value: a narrowed nullable list recovered, then stored in the list temp.
+export function forInListStore(iterIx: i32, fnIx: i32, lp: ForInLoop): i32 {
+  // A NARROWED nullable-list iterable keeps its nullable slot at EVERY element kind — the
+  // i32-list niche, a distinct-backing scalar list and a ref array alike; the `#l` temp is
+  // non-null, so recover first (checker-guarded). See `nulRecvNeedsRecover`.
+  if nulRecvNeedsRecover(iterIx, fnIx) { fbRefAsNonNull() }
+  fbLocalSet(lp.lIdx)
+  return 0
+}
+
+// After a list value pushed by a walk's iterable expression, the view sync its source owes.
+export function forInListSync(iterIx: i32, fnIx: i32): i32 {
+  return svSyncRecv(iterIx, fnIx)
+}
+
+// Why `for` statement `s` at `stmtIx` is not the plain list walk, or "": an i32 or string list
+// read once into its temp, no second name, no map, string or byte source, no literal iterable,
+// no slot pinned by node, and a body that may reallocate a list, so its header is re-read each
+// step and nothing is hoisted or unrolled.
+export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
+  if luForUnionIter(s.fiIter, fnIx) { return "list union" }
+  const ek = forInElemKind(s.fiIter, fnIx)
+  if ek == null { return "iterable" }
+  if ek != "i32" && ek != "str" { return "element " + ek }
+  if forInStringSrc(s.fiIter, fnIx) { return "string source" }
+  if forInU8Src(s.fiIter, fnIx) { return "byte source" }
+  if s.fiVar2 != "" { return "pair" }
+  if forInMapRecv(s.fiIter, fnIx) >= 0 { return "map" }
+  if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
+  if nodeAt(unwrapParen(s.fiIter)) is ArrayLit { return "literal" }
+  if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
+  if hoistSafeBlock(s.fiBody, fnIx) { return "hoisted" }
+  return ""
+}
+
+function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
+  const luf = emitListUnionFor(s, stmtIx, fnIx)
+  if luf != 0 { return if luf < 0 { -1 } else { 0 } }
+  // `for v[, w] in <list> { body }` — iterate an i32 list, a string list, a struct ref list,
+  // or a map's ordered keys/values list. Cursor slots in collect pre-order: the element var
+  // `v`, a hidden cursor `v#i`, a hidden list temp `v#l` (the iterable evaluates once), and
+  // the second name last. Shape mirrors `while`: block/loop, exit on `cursor >= len`, cursor++.
+  const ek = forInElemKind(s.fiIter, fnIx)
+  if ek == null {
+    return emitFailAt("emitProgram: unsupported for-in iterable", s.fiIter)
+  }
+  // A STRING iterable (`for ch in s`): the `#l` temp IS the raw `(ref $sTypeIdx)` array (no
+  // list wrapper), so the length is `array.len` and each element `array.get $aTypeIdx` —
+  // skipping the `struct.get wrapTy` the i32-list path uses. The loop var is an i32 code unit.
+  const strSrc = forInStringSrc(s.fiIter, fnIx)
+  // a packed byte-list iterable (`for b in bs`, `bs: u8[]`): the `#l` temp is the `$bl8`
+  // wrapper over the one-byte backing, so length is `struct.get $bl8 1` and each element
+  // `array.get_u $ba8` — `fbArrayGet` picks the unsigned opcode off the backing heap index itself.
+  const u8Src = forInU8Src(s.fiIter, fnIx)
+  // The SECOND name's slot, minted last in the same pre-order the collect pass mints it.
+  const pairName = s.fiVar2
+  const hasPair = pairName != ""
+  let nSlots = 3
+  if hasPair { nSlots = 4 }
+  const vSlot = declSlotTake(stmtIx, nSlots)
+  // An `is K[]` arm's empty list of ref elements never iterates, and its loop slots are
+  // typed at the receiver's own element, so the loop is not emitted (D4962).
+  if listFitShadowIsRef(s.fiIter, fnIx) { return 0 }
+  const lp = forInLoopAt(s, fnIx, vSlot, ek, strSrc, u8Src)
+  if lp == null { return -1 }
+  const mapRecv = lp.mapRecv
+  const pairValsSlot = forInPairValsSlot(s.fiIter, fnIx)
+  const pairIsVal = lp.pairIsVal
+  const pIdx = lp.pIdx
+  const pSlot = vSlot + 3
   if mapRecv >= 0 {
     if emitForInMapStash(fnIx, lp) < 0 { return -1 }
   }
   // list = <iter> (evaluated once); cursor = 0
   if emitForInList(s.fiIter, fnIx, mapRecv, lp.mwShape) < 0 { return -1 }
-  // A NARROWED nullable-list iterable keeps its nullable slot at EVERY element kind — the
-  // i32-list niche, a distinct-backing scalar list and a ref array alike; the `#l` temp is
-  // non-null, so recover first (checker-guarded). See `nulRecvNeedsRecover`.
-  if nulRecvNeedsRecover(s.fiIter, fnIx) { fbRefAsNonNull() }
-  fbLocalSet(lIdx)
+  forInListStore(s.fiIter, fnIx, lp)
   // A body that cannot reallocate a list (`hoistSafeBlock`: no call, so no push/pop through
   // any alias) sees one backing and one `len` throughout, so both are read once here. Any
   // other body re-reads the header per step, so an element pushed mid-walk is visited.
   if (
-    fb.hOk
+    lp.fiHOk
     && !strSrc
     && mapRecv < 0
     && pairValsSlot < 0
@@ -36652,7 +36707,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   // A walk whose body may write reads a view's length and elements through its source at every
   // step, as it re-reads a shared list's header (D3028).
   if lp.fiHLen < 0 && (ek == "f64" || ek == "i64") { lp.fiSv = svDstOfKind(ek) }
-  lp.fiRv = lp.fiHLen < 0 && fb.hKind == "reflist" && rvMayView(fb.hSlot)
+  lp.fiRv = lp.fiHLen < 0 && lp.hKind == "reflist" && rvMayView(lp.hSlot)
   emitForInCursorInit(lp)
   // A body that writes the index gets a hidden counter, and the index is a fresh copy of it
   // each iteration, so the write never moves the walk (D2342).
@@ -36709,7 +36764,7 @@ function emitForInHoistHeader(lp: ForInLoop) {
 // The walk's cursor start into `lp.iIdx`: 0, or for a string source its start in backing
 // coordinates, with the backing, the exit bound and the decoder's packed width in slots of
 // their own (`lp.fiSBack`, `lp.fiSEnd`, `lp.fiSPk`), so the loop runs no `struct.get`.
-function emitForInCursorInit(lp: ForInLoop) {
+export function emitForInCursorInit(lp: ForInLoop) {
   if lp.strSrc {
     lp.fiSBack = strBackSlot()
     lp.fiSEnd = strI32Slot()
@@ -36830,7 +36885,7 @@ function forInBackingOf(
 
 // What a `for`-in walk's loop reads from its setup: the element and pair kinds, the loop's
 // locals, the hoisted header and string bounds, the map stash, and the backing's types.
-type ForInLoop = {
+export type ForInLoop = {
   ek: VKind,
   strSrc: boolean,
   hasPair: boolean,
@@ -36858,6 +36913,7 @@ type ForInLoop = {
   backTy: i32,
   hKind: ListKind,
   hSlot: i32,
+  fiHOk: boolean,
 }
 
 // The element kinds whose loop var is a non-null ref recovered from a nullable slot.
@@ -37032,6 +37088,17 @@ function emitForInStep(lp: ForInLoop) {
 // A `for`-in walk's break block and loop: the exit test, the map's tombstone skip, the
 // element and pair binds, the body and the cursor step. Returns -1 on a failure, else 0.
 function emitForInLoop(s: ForIn, fnIx: i32, lp: ForInLoop) {
+  const fiSeq = forInLoopOpen(s, fnIx, lp)
+  if fiSeq == -2 { return -1 }
+  if emitStmts(s.fiBody, fnIx) < 0 { return -1 }
+  return forInLoopClose(s, lp, fiSeq)
+}
+
+// A walk's loop up to its body: the break block (and, ahead of a hoisted walk's rolled loop,
+// its unrolled copies), the loop, the exit test, the map's tombstone skip, the element's bind,
+// and the continue block when the body continues. Returns the skip's sequence local, -1 for
+// none, -2 on failure.
+export function forInLoopOpen(s: ForIn, fnIx: i32, lp: ForInLoop): i32 {
   const elemRecover = forInElemRecovers(lp.ek)
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
@@ -37050,23 +37117,27 @@ function emitForInLoop(s: ForIn, fnIx: i32, lp: ForInLoop) {
       backTy: lp.backTy,
       recover: elemRecover,
     }
-    if emitForInCopies(s, fnIx, fiCopies) < 0 { return -1 }
+    if emitForInCopies(s, fnIx, fiCopies) < 0 { return -2 }
   }
   fbLoop(64) // 0x03 loop, void
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
   emitForInExitTest(lp)
   const fiSeq = emitForInTombstoneSkip(lp)
-  if emitForInBind(s, lp, elemRecover) < 0 { return -1 }
+  if emitForInBind(s, lp, elemRecover) < 0 { return -2 }
   // Same INNER continue block as for-range: `continue` must still increment.
-  const fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
-  if fiHasCont {
+  if blockHasContinueFor(s.fiBody, s.fiLabel, false) {
     fbBlock(64) // continue block
     loopContDepth.push(ctrlDepth)
     loopContLabel.push(s.fiLabel)
   }
-  if emitStmts(s.fiBody, fnIx) < 0 { return -1 }
-  if fiHasCont {
+  return fiSeq
+}
+
+// A walk's loop after its body: the continue block's end, the map's resync, the step, the
+// back-branch, and the loop's and break block's ends.
+export function forInLoopClose(s: ForIn, lp: ForInLoop, fiSeq: i32): i32 {
+  if blockHasContinueFor(s.fiBody, s.fiLabel, false) {
     fbEnd() // end continue block — `continue` lands here
     loopContDepth.pop()
     loopContLabel.pop()
