@@ -59,6 +59,8 @@ import { irTyOpen, irVerify, numKindOf } from "./ir_verify"
 import {
   irAstKind,
   irDualEmit,
+  irGlobalReadMiss,
+  irGlobalWriteMiss,
   irHexOf,
   irLowerClaim,
   irLoweredEntry,
@@ -81,6 +83,9 @@ import {
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  ifWritesElse,
+  keptDeclStoresNothing,
+  lowMemFoldsCallee,
   mapGetOrHelperRoute,
   mapKeyArmOf,
   mapRecvShapeOf,
@@ -91,11 +96,13 @@ import {
   numIntrCallReached,
   numIntrPlanOf,
   numLitAsApplies,
+  numLitLexAt,
   popPlanOf,
   popStmtPlainWhy,
   printArmOf,
   pushPlainWhy,
   pushPlanOf,
+  shiftMaskFoldOf,
   strLitTakesAtom,
   tplStrHoleOf,
   widenPlanOf,
@@ -136,10 +143,9 @@ let ibCorrupt = 0
 let ibRowKey: string[] = []
 let ibRowN: i32[] = []
 
-// Arms (1) or disarms (0) the shadow for the compiles that follow; 2 also details the first
-// examples of each dual-emit mismatch class. 3 leaves it disarmed and claims I1's families
-// (scalar, control, call, global), the test of the claim path itself. 4 is the blocker census:
-// each function's build goes on past a missed statement, and its row names every class it missed.
+// The shadow's mode for the compiles that follow: 0 off, 1 armed, 2 armed with mismatch detail,
+// 3 disarmed claiming every family but list (the claim path's test), 4 the blocker census (each
+// row names every class the function missed), 5 disarmed with the shipped claim's rows printed.
 export function irShadowArm(on: i32) {
   ibArmed = on == 1 || on == 2 || on == 4
   ibDetail = on == 2
@@ -167,7 +173,7 @@ function censusGoesOn(why: string): boolean {
 
 // The families whose every occurrence the shadow has matched, so a function built wholly of them
 // ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
-const CLAIMED: IrFamily[] = []
+const CLAIMED: IrFamily[] = ["scalar", "control", "call", "global", "map"]
 let ibClaimAll = false
 
 function familyClaimed(fam: IrFamily): boolean {
@@ -203,6 +209,7 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   if build(fnIx, fnPos) != "" || repNodeGen() != gen || !claimable() {
     return false
   }
+  corrupt()
   if irVerify(ib).vfRule != 0 {
     count("claim fell back: verifier")
     return false
@@ -217,8 +224,8 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
 }
 
 // The shadow's failing controls: 0 none; 1 swaps the first variable's rep and 2 deletes the first
-// temp's definition, which the verifier must refuse; 3 adds a byte to the lowering and 4 drops a
-// span row, which the dual emit must report.
+// temp's definition, which the verifier must refuse, on the shadow and the claim path alike; 3 adds
+// a byte to the lowering and 4 drops a span row, which the dual emit must report.
 export function irShadowCorrupt(k: i32) {
   ibCorrupt = k
   return 0
@@ -258,6 +265,8 @@ export function irShadowRowN(i: i32) { return ibRowN[i] }
 // The function being built and the first construct outside the set.
 let ib: IrFn = irFnNew(-1, "")
 let ibFnIx = -1
+// The `fnStmts` slot of the function being built, for the global storage classes.
+let ibFnPos = -1
 // Whether the builder admits an assignment as a value. It does not, so no global read it builds
 // is an assignment's re-read and the lowering's guard context is never `gcGuardOff`.
 const ASSIGN_AS_VALUE = false
@@ -382,6 +391,9 @@ export function irBOpRep(o: Opnd): i32 {
 // A fresh temp of `ix`'s type, defined by `rhs`.
 export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
   const ty = nodeTyAt(ix, irBFnIx())
+  // A node typed at a still-open variable (a generic's result no call has instanced) has no type
+  // the verifier can close, so its function stays legacy's.
+  if irTyOpen(ty) { return irBMiss("open temp type") }
   const v = irVarNew(irBFn(), rep, ty, "temp", -1)
   irBNode(b, { lDst: v, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: v }
@@ -404,6 +416,11 @@ export function irBDeclVar(d: i32): i32 {
   }
   const s = declaredSlotOfDecl(d)
   const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
+  // A declaration with no local of this frame (a capture lifted into a parameter) is legacy's.
+  if slot < 0 {
+    irBMiss("local slot")
+    return -1
+  }
   // One variable per wasm local: an instance's read resolves to the template's declaration.
   const held = localVarAt(slot)
   if held >= 0 {
@@ -422,13 +439,7 @@ export function irBDeclVar(d: i32): i32 {
 // The local variable holding wasm local `w`, or -1.
 function localVarAt(w: i32): i32 {
   if w < 0 { return -1 }
-  let v = 0
-  while v < ib.irVars.length {
-    const x = ib.irVars[v]
-    if x.vKind == "local" && x.vSlot == w { return v }
-    v = v + 1
-  }
-  return -1
+  return ib.irLocalAt[w] ?? -1
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
@@ -436,6 +447,7 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
   const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const rhsBody: i32[] = []
   const r = irBExpr(rhsBody, n.binRight)
@@ -448,7 +460,7 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if n.binOp == "&&" {
     irBNode(
       b,
-      { siCond: l, siThen: rhsBody, siElse: fixBody, siOut: t },
+      { siCond: l, siThen: rhsBody, siElse: fixBody, siOut: t, siElseKw: true },
       ty,
       rep,
       ix,
@@ -456,7 +468,7 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   } else {
     irBNode(
       b,
-      { siCond: l, siThen: fixBody, siElse: rhsBody, siOut: t },
+      { siCond: l, siThen: fixBody, siElse: rhsBody, siOut: t, siElseKw: true },
       ty,
       rep,
       ix,
@@ -466,10 +478,11 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
-function numLit(n: NumLit, rep: i32): Opnd {
+function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
   const k: string = repPrim(rep) ?? ""
   if k == "f64" || k == "f32" {
-    const bs = if k == "f64" { f64Bytes(n.numText) } else { f32Bytes(n.numText) }
+    const text = numLitLexAt(ix, n.numText, k)
+    const bs = if k == "f64" { f64Bytes(text) } else { f32Bytes(text) }
     let bits: i64 = 0
     let i = bs.length - 1
     while i >= 0 {
@@ -502,6 +515,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     if globalRep(g, d) != rep { return irBMiss("global read coercion") }
+    const gm = irGlobalReadMiss(g, globalCtxOf(ibFnPos))
+    if gm != "" { return irBMiss(gm) }
     const sid = sidOfNode(ix)
     return irBLetTemp(
       b,
@@ -591,6 +606,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("call target")
   }
   if !calleeSig(pos) { return missRhs("callee signature") }
+  // A callee with a hidden environment parameter takes it before its arguments; the IR's call
+  // passes none, so such a call stays legacy's.
+  if envSlotShift(d) > 0 { return missRhs("callee environment") }
+  if lowMemFoldsCallee(pos) { return missRhs("low-memory accessor") }
   const callee = nodeAt(d)
   const args: Opnd[] = []
   if callee is FuncDecl {
@@ -1062,6 +1081,14 @@ function opUnsigned(ix: i32): boolean {
 }
 
 export function irBExpr(b: i32[], ix: i32): Opnd {
+  if ibDepth >= IR_NEST_MAX { return irBMiss("nesting depth") }
+  ibDepth = ibDepth + 1
+  const o = irBExprAt(b, ix)
+  ibDepth = ibDepth - 1
+  return o
+}
+
+function irBExprAt(b: i32[], ix: i32): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const n = nodeAt(ix)
   if n is Paren { return irBExpr(b, n.parInner) }
@@ -1069,7 +1096,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
-  if n is NumLit { return numLit(n, rep) }
+  if n is NumLit { return numLit(n, ix, rep) }
   if n is BoolLit {
     const bits: i64 = if n.boolVal != 0 { 1 } else { 0 }
     const o: Opnd = { oiRep: rep, oiBits: bits }
@@ -1094,6 +1121,13 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
     if n.binOp == "??" { return coalesce(b, n, ix, rep) }
+    // Two operands typed at single string literals fold to a constant (`atomEqPlanOf`).
+    if (
+      (n.binOp == "==" || n.binOp == "!=")
+      && atomEqPlanOf(n, ibFnIx).aqArm == "fold"
+    ) {
+      return irBMiss("atom compare fold")
+    }
     if atomOperand(n.binLeft) || atomOperand(n.binRight) {
       return atomCompare(b, n, ix, rep)
     }
@@ -1105,6 +1139,16 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
+    // Legacy strength-reduces a masked shift (`shiftMaskFoldOf`) at an integer width.
+    const fw = binNumWidth(n, ibFnIx)
+    if (
+      fw != "f32"
+      && fw != "f64"
+      && shiftMaskFoldOf(n, ix, if fw == "i64" { 64 } else { 32 }, ibFnIx).length
+        > 0
+    ) {
+      return irBMiss("shift-mask fold")
+    }
     const lw = operandWhy(n.binLeft)
     if lw != "" { return irBMiss(lw) }
     const rw = operandWhy(n.binRight)
@@ -1164,9 +1208,10 @@ function strLit(ix: i32, rep: i32): Opnd {
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
+  // Legacy appends a string in place at a local and at a list element alike.
+  if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   if t is Index { return elemStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
-  if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   const d = identDeclOf(n.binLeft)
   if d >= 0 && localIndexOf(ibFnIx, n.binLeft) >= 0 {
     const v = irBDeclVar(d)
@@ -1182,6 +1227,8 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
   const src = deliver(b, n.binRight, globalRep(g, d))
   if ibMiss != "" { return 0 }
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
+  const gm = irGlobalWriteMiss(g, globalCtxOf(ibFnPos))
+  if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
 }
@@ -1236,7 +1283,7 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
   irBNode(
     loopBody,
-    { siCond: c, siThen: [], siElse: exitBody, siOut: -1 },
+    { siCond: c, siThen: [], siElse: exitBody, siOut: -1, siElseKw: true },
     -1,
     ibNoValue,
     ix,
@@ -1291,7 +1338,20 @@ function stmt(b: i32[], ix: i32) {
   return 0
 }
 
+// A construct nested deeper than this is left to legacy, whose passes loop along a chain's spine
+// where the IR's recurse (a long `else if` chain, D1990).
+const IR_NEST_MAX = 200
+let ibDepth = 0
+
 function stmtIn(b: i32[], ix: i32) {
+  if ibDepth >= IR_NEST_MAX { return skip("nesting depth") }
+  ibDepth = ibDepth + 1
+  stmtAt(b, ix)
+  ibDepth = ibDepth - 1
+  return 0
+}
+
+function stmtAt(b: i32[], ix: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
   if n is Block {
@@ -1300,6 +1360,8 @@ function stmtIn(b: i32[], ix: i32) {
   }
   if n is LetDecl {
     const v = irBDeclVar(ix)
+    // A `const` every read copied the tree of computes nothing, as legacy writes it (D15001).
+    if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
     if v < 0 || n.letInit < 0 { return skip("declaration") }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep)
     if ibMiss != "" { return 0 }
@@ -1318,7 +1380,13 @@ function stmtIn(b: i32[], ix: i32) {
     const elseB = if n.ifElse >= 0 && nodeAt(n.ifElse) is IfStmt { chainLink(n.ifElse) } else { bodyOf(elseStmts(n.ifElse)) }
     irBNode(
       b,
-      { siCond: c, siThen: thenB, siElse: elseB, siOut: -1 },
+      {
+        siCond: c,
+        siThen: thenB,
+        siElse: elseB,
+        siOut: -1,
+        siElseKw: ifWritesElse(n),
+      },
       -1,
       ibNoValue,
       ix,
@@ -1440,6 +1508,7 @@ function build(fnIx: i32, fnPos: i32): string {
   if !(fn is FuncDecl) { return "not a function" }
   ib = irFnNew(fnIx, fn.fnName)
   ibFnIx = fnIx
+  ibFnPos = fnPos
   ibMiss = ""
   ibMisses = []
   ibDeclVar = Map()
@@ -1447,6 +1516,7 @@ function build(fnIx: i32, fnPos: i32): string {
   ibLoopBrk = []
   ibLoopCont = []
   ibLabelN = 0
+  ibDepth = 0
   ibBool = repNodeOfTy(TY_BOOL)
   if fn.fnTyParams.length > 0 { return "template" }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
