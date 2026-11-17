@@ -134,7 +134,7 @@ import {
   nameIsMemStoreIntrinsic,
 } from "./check_intrinsics"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
-import { isVarTyIxOf } from "./check_list_union"
+import { isVarTyIxOf, luMembersAt } from "./check_list_union"
 import {
   narrowedFromTyOf,
   nodeArrayElemIsBareStrLit,
@@ -707,7 +707,6 @@ import {
   declaredStructIndex,
   drwFieldClosure,
   enclosingLoopVarBinds,
-  fieldCodeVKind,
   fnBlockShadowsAt,
   fnRetVariantIndexSid,
   frameBodyEnd,
@@ -791,7 +790,6 @@ import {
   VKind,
   armFieldNames,
   armFieldStoreTy,
-  armFieldTypes,
   arrLitMint,
   capCountTbl,
   capNamesFlat,
@@ -843,7 +841,6 @@ import {
   sFieldCount,
   sFieldStart,
   sFieldStoreTy,
-  sFieldTypes,
   sHeapIdx,
   sIsRefRow,
   sLitIdRow,
@@ -10036,7 +10033,21 @@ export function listElemRepIsRow(arr: i32, fnIx: i32): boolean {
     || k == "nulvariant")
 }
 
+// Whether `ix` is an element read of a union-of-lists box that a pin typed and its instance
+// reads per arm, leaving the element union's box (D16897): a re-readable receiver.
+export function luArmIndexBoxes(ix: i32, fnIx: i32): boolean {
+  if fnIx < 0 || ix < 0 { return false }
+  const n = nodeAt(ix)
+  if !(n is Index) { return false }
+  const recv = unwrapParen(n.idxArr)
+  if recv < 0 || !(nodeAt(recv) is Ident) || !exprUnion(recv, fnIx) {
+    return false
+  }
+  return luMembersAt(nodeTyAt(recv, fnIx)).length > 0
+}
+
 function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
+  if luArmIndexBoxes(exprIx, fnIx) { return true }
   if exprRefArray(e.idxArr, fnIx) {
     // GUARD the slot (same discipline as the struct-element arm — a narrowed
     // union-arm rebind receiver resolves no slot; OOB otherwise).
@@ -11391,12 +11402,7 @@ function ovnStoredAlike(ty: i32, vi: i32): boolean {
     let fj = 0
     while fj < uFieldCount[vi] {
       if armFieldNames()[start + fj] == t.objFieldNames[i] {
-        const ac = fieldCodeIn(
-          armFieldTypes(),
-          armFieldStoreTy(),
-          start + fj,
-          "armObjFit",
-        )
+        const ac = fieldCodeIn(armFieldStoreTy(), start + fj, "armObjFit")
         if lc != ac && !isNullTy(ft) { return false }
       }
       fj = fj + 1
@@ -13306,20 +13312,19 @@ function armFieldPos(vi: i32, fi: i32): i32 {
 
 // The field code at a `memberFieldPos` row, or -1 for none.
 function fieldPosCode(p: i32): i32 {
-  if p >= 0 { return fieldCodeIn(sFieldTypes, sFieldStoreTy, p, "fieldPos") }
-  if p <= -3 {
-    return fieldCodeIn(armFieldTypes(), armFieldStoreTy(), -3 - p, "fieldPos")
-  }
+  if p >= 0 { return fieldCodeIn(sFieldStoreTy, p, "fieldPos") }
+  if p <= -3 { return fieldCodeIn(armFieldStoreTy(), -3 - p, "fieldPos") }
   return -1
 }
 
 // The kind struct `si`'s field `fi` is stored at, from its storage type, null where that type has
-// no rep (a hole, a type parameter); the field code answers only where no storage type is
-// recorded. A code-15 field's storage type carries `null`, so it never owes a recover.
+// no rep; a field with no storage type fails loudly (`fieldCodeIn`). A code-15 field's storage
+// type carries `null`, so it never owes a recover.
 export function sFieldStoreKind(si: i32, fi: i32): VKind | null {
   const ty = fieldPosStoreTy(sFieldStart[si] + fi)
   if ty >= 0 { return repOfTy(ty).rdKind }
-  return fieldCodeVKind(sFieldTypeAt(si, fi))
+  sFieldTypeAt(si, fi)
+  return null
 }
 
 // Whether struct `si`'s field `fi` holds the union box.

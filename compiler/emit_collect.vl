@@ -61,7 +61,7 @@ import {
 import { canonUnionMembersInto } from "./check_program"
 import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
-import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
+import { isListArmNodes, isVarTyIxOf, luPinElemTys } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
 import {
   inferRetNodeCarryNote,
@@ -303,7 +303,6 @@ import {
   armStageLitTyIx,
   armStageNames,
   armStageStoreTy,
-  armStageTypes,
   armStructRowMintOn,
   armsAdopted,
   arrLitMint,
@@ -473,7 +472,6 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldStoreTy,
-  sFieldTypes,
   sHeapIdx,
   sIsRefRow,
   sLateRowsOff,
@@ -1038,7 +1036,9 @@ function unionArmsMixed(ms: i32[]): boolean {
           hasScalar = true
         }
         TyUnion => {
-          // A nested union's own arms are its own question; this one asks about `ms`.
+          // A literal-union member (`K0` in `K0 | {w: i32}`) is one scalar atom, as
+          // `nulCloMixedUnionUnregisteredTy` counts it; any other nested union is its own question.
+          if tyIsLitUnion(ms[i]) { hasScalar = true }
         }
         TyNullable => {
           // The `| null` wrapper, which the caller strips before asking.
@@ -3640,7 +3640,7 @@ function leqNoteVariantFields(vi: i32) {
   const start = uFieldStart[vi]
   let j = 0
   while j < uFieldCount[vi] {
-    if start + j < sFieldTypes.length {
+    if start + j < sFieldNames.length {
       let c = fieldRowKind(start + j)
       // A `T[] | null` arm field runs its non-null twin's core under a null guard, so the
       // frame it needs is that twin's — the struct row's walk resolves it the same way (D1180).
@@ -5683,7 +5683,7 @@ export function collectUnionAndHeldRows() {
 // The struct row union-variant field row `ufn` stores, interned from the field's element type,
 // and the field relabelled with the interned row's name. -1 for a field that is no record.
 function armFieldStructRowMinted(ufn: i32): i32 {
-  if ufn < 0 || ufn >= sFieldTypes.length || !fieldRowIsRecordRef(ufn) {
+  if ufn < 0 || ufn >= sFieldNames.length || !fieldRowIsRecordRef(ufn) {
     return -1
   }
   const si = internShapeDeepTy(uFieldElemTyIxRow(ufn))
@@ -6736,7 +6736,6 @@ function anonMintRowFor(objIx: i32, fnIx: i32) {
         )
         storeTyPut(sFieldStoreTy, sFieldNames.length, fst)
         sFieldNames.push(names[pi])
-        sFieldTypes.push(codes[pi])
         // An anonymous literal's field has no annotation text to key a closure signature
         // from — "" is this recorder's honest answer, and the consumer reads it as unknown.
         sFieldCloSig.push("")
@@ -7009,7 +7008,6 @@ function pushFieldRow(
       armStageNames.length,
       fieldStoreTyOf(code, holeStoreTy(code, litTyIx)),
     )
-    armStageTypes.push(code)
     // D1023 — the discriminant column: the field's own arena type when it is a literal set, -1
     // otherwise. Pushed here, not per recorder, so no column drifts out of parallel across the three.
     armStageLitTyIx.push(litSetTyIxOf(litTyIx))
@@ -7022,7 +7020,6 @@ function pushFieldRow(
       sFieldNames.length,
       fieldStoreTyOf(code, holeStoreTy(code, litTyIx)),
     )
-    sFieldTypes.push(code)
     sFieldElemName.push(elemNm)
     sFieldCloSig.push(cloSig)
     recordSFieldElemRowTy(elemTyHint) // D5 + B6b
@@ -7060,7 +7057,6 @@ function structTableReset() {
   sFieldNames = []
   sFieldStart = []
   sFieldCount = []
-  sFieldTypes = []
   sFieldElemName = []
   sFieldCloSig = []
   sFieldElemTyIx = []
@@ -7283,7 +7279,7 @@ function fieldNamesDeclRecord(stmts: i32[], ft: i32): boolean {
 }
 
 // Record the field names + per-field wasm-type codes of record variant `ty` into the
-// flat `armFieldNames`/`uFieldStart`/`uFieldCount`/`armFieldTypes` table (declaration order = wasm
+// flat `armFieldNames`/`uFieldStart`/`uFieldCount`/`armFieldStoreTy` table (declaration order = wasm
 // field index). The struct must exist among the top-level statements and every field must
 // carry a code, else fails loudly. Returns 0, or -1 (via `emitFail`).
 function collectVariantFields(stmts: i32[], ty: i32) {
@@ -7497,8 +7493,8 @@ function reLayLitFieldsByName(va: i32, vb: i32): i32 {
     const fj = variantFieldIndex(vb, armStageNames[ra])
     if fj >= 0 {
       const rb = uFieldStart[vb] + fj
-      const ca = fieldCodeIn(armStageTypes, armStageStoreTy, ra, "reLayLit")
-      if ca != fieldCodeIn(armStageTypes, armStageStoreTy, rb, "reLayLit") {
+      const ca = fieldCodeIn(armStageStoreTy, ra, "reLayLit")
+      if ca != fieldCodeIn(armStageStoreTy, rb, "reLayLit") {
         if litFieldRowIsAtomisable(ra) && litFieldRowIsAtomisable(rb) {
           if promoteLitFieldToAtom(va, fi) < 0 { return -1 }
           if promoteLitFieldToAtom(vb, fj) < 0 { return -1 }
@@ -7539,8 +7535,7 @@ function promoteLitFieldToAtom(vi: i32, fi: i32): i32 {
   if lty < 0 { return 0 }
   const nm = litSetAtomNameOfTy(lty)
   if nm == "" { return 0 }
-  if fieldCodeIn(armStageTypes, armStageStoreTy, r, "promote") != FC_I32 {
-    armStageTypes[r] = FC_I32
+  if fieldCodeIn(armStageStoreTy, r, "promote") != FC_I32 {
     armStageElemName[r] = nm
     uFieldReLayNote()
     setUFieldElemRowTy(r, lty)
@@ -7549,8 +7544,7 @@ function promoteLitFieldToAtom(vi: i32, fi: i32): i32 {
   const si = variantStructHeapTwinAt(vi)
   if si >= 0 && fi < sFieldCount[si] {
     const sr = sFieldStart[si] + fi
-    if fieldCodeIn(sFieldTypes, sFieldStoreTy, sr, "promote") != FC_I32 {
-      sFieldTypes[sr] = FC_I32
+    if fieldCodeIn(sFieldStoreTy, sr, "promote") != FC_I32 {
       sFieldElemName[sr] = nm
       tyRegNoteWrite()
       setSFieldElemRowTy(sr, lty)
@@ -7573,8 +7567,7 @@ function demoteLitFieldToString(vi: i32, fi: i32): i32 {
   )
   if lty < 0 { return 0 }
   const nm = litUnionInlineNameOfTy(lty)
-  if fieldCodeIn(armStageTypes, armStageStoreTy, r, "demote") != FC_STR {
-    armStageTypes[r] = FC_STR
+  if fieldCodeIn(armStageStoreTy, r, "demote") != FC_STR {
     armStageElemName[r] = nm
     storeTyPut(armStageStoreTy, r, TY_STR)
     uFieldReLayNote()
@@ -7583,8 +7576,7 @@ function demoteLitFieldToString(vi: i32, fi: i32): i32 {
   const si = variantStructHeapTwinAt(vi)
   if si >= 0 && fi < sFieldCount[si] {
     const sr = sFieldStart[si] + fi
-    if fieldCodeIn(sFieldTypes, sFieldStoreTy, sr, "demote") != FC_STR {
-      sFieldTypes[sr] = FC_STR
+    if fieldCodeIn(sFieldStoreTy, sr, "demote") != FC_STR {
       sFieldElemName[sr] = nm
       storeTyPut(sFieldStoreTy, sr, TY_STR)
       tyRegNoteWrite()
@@ -8729,6 +8721,10 @@ function collectInlineUnions(stmts: i32[]) {
   cloSigWalkRoots = []
   ciuFnSeen = Map()
   if collectInlineUnionsIn(stmts, stmts) < 0 { return -1 }
+  // The element unions a pin typed a union-of-lists read at (D16897).
+  for pe in luPinElemTys {
+    if collectTyReachRegister(stmts, pe, false) < 0 { return -1 }
+  }
   // The statement walk does not enter expressions, so an expression-position `if` registers the
   // bindings in its arms here: a narrowed box bound there, the list-union rewrite's receiver
   // among them, names its union (D16896).
@@ -9232,7 +9228,6 @@ function collectUReset() {
   cloSigTagNames = []
   cloSigTagIds = []
   armStageNames = []
-  armStageTypes = []
   armStageLitTyIx = []
   armStageStoreTy = []
   armStageElemName = []
