@@ -40369,17 +40369,22 @@ function srEmitNarrowed(src: i64[], fnIx: i32): i32 {
   return 0
 }
 
-// Emits `e` (at `exprIx`, width `w`) strength-reduced when it is one of the shapes above:
-// `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing `(y >>> k) as% i32 & m`.
-// Answers 0 when emitted, -1 on an emit failure, 1 when `e` is none of them (nothing
-// pushed). Every operand but x is a constant, so evaluation order and traps are unchanged.
-function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
-  if !srTyIs(exprIx, w == 64, fnIx) { return 1 }
+// The strength-reduced form of `e` (at `exprIx`, width `w`) as [x, k, narrow, m, j], or [] when it
+// is none of the shapes above: `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing
+// `(y >>> k) as% i32 & m`, whose j is -1. Legacy writes it; the IR builder misses it by name.
+export function shiftMaskFoldOf(
+  e: BinExpr,
+  exprIx: i32,
+  w: i32,
+  fnIx: i32,
+): i64[] {
+  const none: i64[] = []
+  if !srTyIs(exprIx, w == 64, fnIx) { return none }
   if e.binOp == "&" {
-    if w != 32 { return 1 }
+    if w != 32 { return none }
     const nsrc = srMaskedSource(exprIx, w, fnIx)
-    if nsrc.length == 0 || nsrc[2] != 1 { return 1 }
-    return srEmitNarrowed(nsrc, fnIx)
+    if nsrc.length == 0 || nsrc[2] != 1 { return none }
+    return [nsrc[0], nsrc[1], nsrc[2], nsrc[3], -1]
   }
   let j: i64 = -1
   let inner = -1
@@ -40394,11 +40399,22 @@ function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
       inner = e.binRight
     }
   }
-  if j < 0 { return 1 }
+  if j < 0 { return none }
   const src = srMaskedSource(inner, w, fnIx)
-  if src.length == 0 { return 1 }
-  if srPushSource(src, w, fnIx) < 0 { return -1 }
-  const k = src[1]
+  if src.length == 0 { return none }
+  return [src[0], src[1], src[2], src[3], j]
+}
+
+// Emits `e` strength-reduced when `shiftMaskFoldOf` names a form: 0 when emitted, -1 on an emit
+// failure, 1 when it names none (nothing pushed). Every operand but x is a constant, so
+// evaluation order and traps are unchanged.
+function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
+  const f = shiftMaskFoldOf(e, exprIx, w, fnIx)
+  if f.length == 0 { return 1 }
+  if f[4] < 0 { return srEmitNarrowed(f, fnIx) }
+  if srPushSource(f, w, fnIx) < 0 { return -1 }
+  const k = f[1]
+  const j = f[4]
   if k > j {
     srConst(k - j, w)
     fbI32Bin(srOpcode(">>>", w))
@@ -40406,7 +40422,7 @@ function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
     srConst(j - k, w)
     fbI32Bin(srOpcode("<<", w))
   }
-  srConst(src[3] << j, w)
+  srConst(f[3] << j, w)
   fbI32Bin(srOpcode("&", w))
   return 0
 }
