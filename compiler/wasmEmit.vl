@@ -4900,12 +4900,18 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   // A field narrowed to a type rather than a literal set is tested by its box's arm tags.
   const fieldTags: i32[][] = []
+  // A field narrowed to a record type is tested field by field (`emitRecordValueFits`).
+  const fieldNested: boolean[] = []
   let fk = 0
   while fk < names.length {
     const k = fk
     fk = fk + 1
     const ft: i32[] = []
-    if tyLitSetMemberLexes(sets[k]).length == 0 {
+    const nested = rows[k] >= 0
+      && fieldRowIsRecordRef(rows[k])
+      && tyAt(sets[k]) is TyObj
+    fieldNested.push(nested)
+    if !nested && tyLitSetMemberLexes(sets[k]).length == 0 {
       const vis: i32[] = []
       if (
         !fieldRowIsUnionBox(rows[k])
@@ -4932,6 +4938,24 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   let k = 0
   while k < names.length {
+    if fieldNested[k] {
+      const nsi = if si >= 0 { sFieldTgtStructIdx(si, fis[k]) } else { sFieldTgtStructIdx(variantRowOf(vi), fis[k]) }
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        if si >= 0 { sFieldStorageSlot(si, fis[k]) } else { uFieldStorageSlot(vi, fis[k]) },
+      )
+      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if nullable && !staged { fbRefAsNonNull() }
+      fbStructGet(heap, fis[k])
+      fbLocalSet(nslot)
+      if emitRecordValueFits(nsi, nslot, sets[k], fnIx) < 0 { return -1 }
+      if k > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      k = k + 1
+      continue
+    }
     if fieldTags[k].length > 0 {
       // The box ref itself may stand for `null`; a null held in the box is its own arm's tag.
       if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
@@ -6313,7 +6337,7 @@ function emitSharedNestedFits(
       fbStructGet(variantHeap(vi), fi)
       fbLocalSet(nslot)
       const nsi = sFieldTgtStructIdx(variantRowOf(vi), fi)
-      if emitRecordLitMembership(nsi, nslot, fx, fnIx) < 0 { return -1 }
+      if emitRecordValueFits(nsi, nslot, fx, fnIx) < 0 { return -1 }
       fbI32Bin(113) // i32.and
     }
     fi = fi + 1
@@ -6321,21 +6345,21 @@ function emitSharedNestedFits(
   return 0
 }
 
-// Leaves 1 when the record in local `rslot`, stored at struct row `si`, holds a member of every
-// literal set record type `xTy` declares, at any depth; a field with no literal set is not read.
-function emitRecordLitMembership(
-  si: i32,
-  rslot: i32,
-  xTy: i32,
-  fnIx: i32,
-): i32 {
-  if si < 0 || si >= sHeapIdx.length || xTy < 0 || !(tyAt(xTy) is TyObj) {
+// Leaves 1 when the record in local `rslot`, stored at struct row `si`, is a value of record type
+// `xTy`: every literal set `xTy` declares holds a member, every box field holds a member whose tag
+// is one of the field's, and every nested record fits the same way. Other fields are not read.
+function emitRecordValueFits(si: i32, rslot: i32, xTy: i32, fnIx: i32): i32 {
+  if si < 0 || si >= sHeapIdx.length || xTy < 0 || xTy >= T.tys.length {
     return emitFail(
-      "emitProgram: `is` membership reaches a nested record with no struct row",
+      "emitProgram: `is` reaches a nested record with no struct row",
     )
   }
   const xt = tyAt(xTy)
-  if !(xt is TyObj) { return -1 }
+  if !(xt is TyObj) {
+    return emitFail(
+      "emitProgram: `is` reaches a nested field that is no record",
+    )
+  }
   const heap = sHeapIdx[si]
   let terms = 0
   let i = 0
@@ -6344,12 +6368,24 @@ function emitRecordLitMembership(
     const fi = sFieldIndex(si, xt.objFieldNames[i])
     const r = sFieldFlatRow(si, fi)
     const lexes = tyLitSetMemberLexes(fx)
-    if (
-      r >= 0
-      && lexes.length > 0
-      && nonNullTy(fx) == fx
-      && !fieldRowIsUnionBox(r)
-    ) {
+    let wrote = true
+    if r < 0 {
+      wrote = false
+    } else if fieldRowIsUnionBox(r) {
+      if emitBoxFieldTagsIn(heap, rslot, fi, fx) < 0 { return -1 }
+    } else if fieldRowIsRecordRef(r) && tyAt(fx) is TyObj {
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        sFieldStorageSlot(si, fi),
+      )
+      fbLocalGet(rslot)
+      fbStructGet(heap, fi)
+      fbLocalSet(nslot)
+      if emitRecordValueFits(sFieldTgtStructIdx(si, fi), nslot, fx, fnIx) < 0 {
+        return -1
+      }
+    } else if lexes.length > 0 && nonNullTy(fx) == fx {
       let li = 0
       while li < lexes.length {
         fbLocalGet(rslot)
@@ -6360,33 +6396,52 @@ function emitRecordLitMembership(
         }
         li = li + 1
       }
-      if terms > 0 {
-        fbI32Bin(113) // i32.and
-      }
-      terms = terms + 1
-    } else if r >= 0 && fieldRowIsRecordRef(r) && tyAt(fx) is TyObj {
-      const nslot = objOrderStashSlot(
-        "nulstruct",
-        FC_STRUCT,
-        sFieldStorageSlot(si, fi),
-      )
-      fbLocalGet(rslot)
-      fbStructGet(heap, fi)
-      fbLocalSet(nslot)
-      const nsi = sFieldTgtStructIdx(si, fi)
-      if emitRecordLitMembership(nsi, nslot, fx, fnIx) < 0 { return -1 }
-      if terms > 0 {
-        fbI32Bin(113) // i32.and
-      }
-      terms = terms + 1
-    } else if r >= 0 && lexes.length > 0 {
+    } else if lexes.length > 0 {
       return emitFail(
-        "emitProgram: `is` membership of a nested literal set stored in a box or beside `null`",
+        "emitProgram: `is` over a nested literal set stored beside `null`",
       )
+    } else {
+      wrote = false
+    }
+    if wrote {
+      if terms > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      terms = terms + 1
     }
     i = i + 1
   }
   if terms == 0 { fbI32Const(1) }
+  return 0
+}
+
+// Leaves 1 when box field `fi` of the record in local `rslot` (heap `heap`) holds a member of
+// `fx`, by its tag: each member of `fx` has one tag.
+function emitBoxFieldTagsIn(heap: i32, rslot: i32, fi: i32, fx: i32): i32 {
+  const mems: i32[] = []
+  flattenVariantsInto(fx, mems)
+  const tags: i32[] = []
+  for mm in mems {
+    const one: i32[] = []
+    const vis: i32[] = []
+    if !unionArmTagsOfTy(mm, -1, one, vis) || one.length != 1 {
+      return emitFail(
+        "emitProgram: `is` over a nested box field whose tested member has no one tag",
+      )
+    }
+    tags.push(one[0])
+  }
+  if tags.length == 0 { fbI32Const(0) }
+  let j = 0
+  while j < tags.length {
+    fbLocalGet(rslot)
+    fbStructGet(heap, fi)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, tags[j])
+    fbI32Bin(70)
+    if j > 0 { fbI32Bin(114) }
+    j = j + 1
+  }
   return 0
 }
 
@@ -7837,6 +7892,31 @@ function emitArmFieldsFit(
         li = li + 1
       }
       if nulStr { fbEnd() }
+      if i > 0 {
+        fbI32Bin(113) // i32.and
+      }
+      i = i + 1
+      continue
+    }
+    // A nested record only some of whose values fit is tested field by field, one level down.
+    if (
+      fi >= 0
+      && fieldRowIsRecordRef(uFieldStart[yi] + fi)
+      && tyAt(fys[i]) is TyObj
+      && tyAt(fxs[i]) is TyObj
+    ) {
+      const nsi = sFieldTgtStructIdx(variantRowOf(yi), fi)
+      const nslot = objOrderStashSlot(
+        "nulstruct",
+        FC_STRUCT,
+        uFieldStorageSlot(yi, fi),
+      )
+      if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 1)
+      fbRefCast(variantHeap(yi))
+      fbStructGet(variantHeap(yi), fi)
+      fbLocalSet(nslot)
+      if emitRecordValueFits(nsi, nslot, fxs[i], fnIx) < 0 { return -1 }
       if i > 0 {
         fbI32Bin(113) // i32.and
       }
