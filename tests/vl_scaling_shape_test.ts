@@ -20,18 +20,19 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Eight axes
+// every run, so the margin pays only for the compiler changing, not for the box. Nine axes
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep`, `diamond
 // record depth`, `diamond record depth under ==`, `diamond record depth under == with a list
-// leaf`, `a function list parameter handed down layers of callers` —
+// leaf`, `a function list parameter handed down layers of callers`, `record union arms
+// returned` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Thirteen are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Fourteen are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
 // `in-function value writes`, the two `if joins` pairs, `nested inline record types across
 // functions (fuel)`, `record-parameter field calls`, `closure arguments in one function`,
-// `record literal fields beside a written captured copy` and the four `functions under a
-// callback parameter` pairs.
+// `record literal fields beside a written captured copy`, `record union arms returned` and the
+// four `functions under a callback parameter` pairs.
 // The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
@@ -2685,6 +2686,28 @@ axis(
   2.5,
   "A record literal's slot answer is re-derived once per sibling field, which grew about cubically in its fields (D16724).",
   (d) => twoFiles(d, genCopiedRecordFields(32), genCopiedRecordFields(8)),
+);
+
+// One function returning a union of `n` declared record types from `n` returns, called `n` times.
+const genRecordUnionReturns = (n: number): string => {
+  const o: string[] = [];
+  for (let k = 0; k < n; k++) o.push(`type R${k} = { tag: "r${k}", v${k}: i32 }`);
+  o.push(`type U = ${Array.from({ length: n }, (_, k) => `R${k}`).join(" | ")}`);
+  o.push("function mk(i: i32): U {");
+  for (let k = 0; k < n; k++) o.push(`  if i == ${k} { return { tag: "r${k}", v${k}: ${k} } }`);
+  o.push(`  return { tag: "r0", v0: 0 }`, "}");
+  o.push("function show(u: U): string { return u.tag }");
+  o.push("let i = 0", `while i < ${n} {`, "  print(show(mk(i)))", "  i = i + 1", "}");
+  return o.join("\n") + "\n";
+};
+
+// A GROWTH pair, 64 record arms against 16, so linear reads 4. Super-linear today: each return
+// still asks the join ladder's absorption tests (`tyParamArmAbsorbs`) of every member.
+axis(
+  "record union arms returned",
+  9.0,
+  "Each return compares every arm with every row of its union (`unionArmRowsOfTys`, compiler/emit_local_slots.vl), or re-dedupes the running union's members (`joinTysInto`, compiler/check_relate_core.vl) or tests every pair for a Set/map clash (`setMapRecordClashMsg`).",
+  (d) => twoFiles(d, genRecordUnionReturns(64), genRecordUnionReturns(16)),
 );
 
 // THE FUEL AND ALLOCATION GRADERS' CONTROL. The same program at 20x the statements against 1x:

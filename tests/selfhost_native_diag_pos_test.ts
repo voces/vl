@@ -173,7 +173,10 @@ Deno.test({
 // `vl build` (codegen) an emit-error program, and return the exit code + stderr.
 // `check` above runs only parse+type; an EMIT-stage failure surfaces solely under
 // codegen, so its diagnostic position needs the build path.
-const build = async (path: string): Promise<{ code: number; err: string }> => {
+const build = async (
+  path: string,
+  flags: string[] = [],
+): Promise<{ code: number; err: string }> => {
   const dir = await makeTempDir({ prefix: "vl_diag_pos_out_" });
   try {
     const { code, stderr } = await new Deno.Command(VL, {
@@ -185,6 +188,7 @@ const build = async (path: string): Promise<{ code: number; err: string }> => {
         "--concise",
         "--compiler",
         COMPILER,
+        ...flags,
       ],
       stdout: "piped",
       stderr: "piped",
@@ -201,27 +205,27 @@ Deno.test({
     "native-diag-pos: EMIT-stage failure anchors at the failing function's name",
   ignore: !ENABLED,
   fn: async () => {
-    // `is` over a literal-union list arm has no interned arm representation (D14041), so
-    // `useIt` (line 4) fails at the EMIT stage. The diagnostic anchors at the
-    // enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as 4:10), not
-    // positionless (line 0) as before — so a build/playground/LSP consumer can
-    // point the reader at the offending function instead of rendering the message
-    // bare. (`declNameTokOf` anchoring, matching the lint/type-diag convention.)
+    // `__vl_test_emit_refusal_decl__` is refused unanchored under `--test-emit-refusal`, so
+    // `useIt` (line 4) fails at the EMIT stage with no node of its own. The diagnostic anchors
+    // at the enclosing function's NAME token (`useIt`, col 8 0-based, printed 1-based as
+    // 4:10), not positionless (line 0) as before, so a build/playground/LSP consumer can
+    // point the reader at the offending function instead of rendering the message bare
+    // (`declNameTokOf` anchoring, matching the lint/type-diag convention).
     const dir = await makeTempDir({ prefix: "vl_diag_pos_" });
     try {
       const path = `${dir}/case.vl`;
       await Deno.writeTextFile(
         path,
-        "type K = 0 | 1\n" +
-          "// D14041\n" +
+        "function __vl_test_emit_refusal_decl__() {}\n" +
+          "// the test hook, refused at emit\n" +
           "const z = 9\n" +
-          "function useIt(x: K[] | string) {\n" +
-          "  if x is K[] { print(x[0]) } else { print(z) }\n" +
+          "function useIt(n: i32) {\n" +
+          "  print(n + z)\n" +
+          "  __vl_test_emit_refusal_decl__()\n" +
           "}\n" +
-          "useIt([1])\n" +
-          'useIt("s")\n',
+          "useIt(1)\n",
       );
-      const r = await build(path);
+      const r = await build(path, ["--test-emit-refusal"]);
       if (r.code === 0) {
         throw new Error("expected emit-stage rejection, got exit 0");
       }
