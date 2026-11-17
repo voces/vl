@@ -780,9 +780,9 @@ shadow runs legacy first, so such a predicate answers correctly there and stale 
 `strAssignInPlace` read the accumulator scan that `emitFuncBody` runs, and now runs it itself for a
 function legacy has not lowered; mode 3 found it. An audit of every predicate the builder and
 lowering import (C2i) found no other: each reads pre-pass, checker or rep state, state it sets and
-restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes. One
-caveat stands: under a claim `emitResetScopeFrames` does not run, so the scope stack is whatever the
-previous function left. A balanced legacy run leaves it empty, as the shadow sees it.
+restores around one legacy site, or the hoist frame `fbResetLazyFrame` clears in both modes.
+`emitResetScopeFrames` runs above the claim and again before legacy's body, so a claimed function's
+lowering starts from empty scope and loop frames, and so does legacy after a lowering fallback.
 I8a's tail reads no seat: `numWidenTail` asks `numFloorWhy`, which compares the node with
 `coerceHeld`, set and restored around one legacy conversion and so -1 wherever the IR asks, and
 `exprReadsDeadNever`, which reads the tree and the checker's types.
