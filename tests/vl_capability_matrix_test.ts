@@ -16,16 +16,14 @@
 // @test-timing instrument
 
 import { builtScript } from "./support/builtScript.ts";
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const MATRIX = `${ROOT}/scripts/capability-matrix.vl`;
 const TEMPLATES = `${ROOT}/scripts/capability-probes/matrix`;
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER) && exists(MATRIX);
 if (GATED && !ENABLED) {
-  console.warn(
-    "[vl-capability-matrix] skipped — missing vl binary, seed wasm or capability-matrix.vl.",
-  );
+  console.warn("[vl-capability-matrix] skipped — missing vl binary, seed wasm or capability-matrix.vl.");
 }
 
 // The vocabulary `scripts/lib/probe-grade.vl` grades on. A verdict outside it means the two scripts have drifted.
@@ -44,31 +42,22 @@ const VERDICTS = [
 type Cell = { position: string; face: string; grade: string };
 
 const verdictOf = (grade: string): string => {
-  const hit = VERDICTS.find((v) =>
-    grade === v || grade.startsWith(v + ":") || grade.startsWith(v + " ")
-  );
-  if (!hit) {
-    throw new Error(
-      `grade ${JSON.stringify(grade)} is outside the probe-grade vocabulary`,
-    );
-  }
+  const hit = VERDICTS.find((v) => grade === v || grade.startsWith(v + ":") || grade.startsWith(v + " "));
+  if (!hit) throw new Error(`grade ${JSON.stringify(grade)} is outside the probe-grade vocabulary`);
   return hit;
 };
 
 // Memoised: three assertions over two templates would otherwise be five full matrix runs,
 // and the harness is the thing under test, not the seed's throughput.
-const CACHE = new Map<
-  string,
-  Promise<{ code: number; cells: Cell[]; out: string }>
->();
+const CACHE = new Map<string, Promise<{ code: number; cells: Cell[]; out: string }>>();
 // `only` narrows the run to a comma-separated position list. The D1244 templates are graded
 // that way: their whole point is the six `block_*` cells, and a full 52-cell sweep of three
 // more templates would put this suite over the gate's time budget for nothing.
-const runMatrix = (template: string, only = "") => {
-  const key = only ? `${template}#${only}` : template;
+const runMatrix = (template: string, only = "", extra: string[] = []) => {
+  const key = [template, only, ...extra].join("#");
   let p = CACHE.get(key);
   if (!p) {
-    p = runMatrixOnce(template, only);
+    p = runMatrixOnce(template, only, extra);
     CACHE.set(key, p);
   }
   return p;
@@ -77,6 +66,7 @@ const runMatrix = (template: string, only = "") => {
 const runMatrixOnce = async (
   template: string,
   only: string,
+  extra: string[],
 ): Promise<{ code: number; cells: Cell[]; out: string }> => {
   const args = [
     "run",
@@ -89,6 +79,7 @@ const runMatrixOnce = async (
     VL,
   ];
   if (only) args.push("--only", only);
+  args.push(...extra);
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args,
     cwd: ROOT,
@@ -96,16 +87,13 @@ const runMatrixOnce = async (
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
-  const out = new TextDecoder().decode(stdout) +
-    new TextDecoder().decode(stderr);
+  const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
   const cells: Cell[] = [];
   for (const line of out.split(/\r?\n/)) {
     const m = line.match(/^\| `([a-z_0-9]+)` \| ([a-z-]+) \| (.*?) \|$/);
     if (m) cells.push({ position: m[1], face: m[2], grade: m[3].trim() });
   }
-  if (cells.length === 0) {
-    throw new Error(`${template}: no table rows parsed from:\n${out}`);
-  }
+  if (cells.length === 0) throw new Error(`${template}: no table rows parsed from:\n${out}`);
   return { code, cells, out };
 };
 
@@ -132,8 +120,7 @@ const wantVerdict = (
 };
 
 Deno.test({
-  name:
-    "matrix: every grade is in the probe-grade vocabulary, and both faces are generated",
+  name: "matrix: every grade is in the probe-grade vocabulary, and both faces are generated",
   ignore: !ENABLED,
   fn: async () => {
     const { cells } = await runMatrix("orerr-generic-pin.matrix.vl");
@@ -182,9 +169,7 @@ Deno.test({
       ]
     ) {
       if (!positions.has(p)) {
-        throw new Error(
-          `capability-matrix.vl no longer generates the ${p} position`,
-        );
+        throw new Error(`capability-matrix.vl no longer generates the ${p} position`);
       }
     }
     const faces = new Set(cells.map((c) => c.face));
@@ -192,61 +177,28 @@ Deno.test({
       throw new Error(`want both faces, got ${[...faces].join(", ")}`);
     }
     if (cells.length !== positions.size * 2) {
-      throw new Error(
-        `want 2 cells per position, got ${cells.length} for ${positions.size}`,
-      );
+      throw new Error(`want 2 cells per position, got ${cells.length} for ${positions.size}`);
     }
   },
 });
 
 Deno.test({
-  name:
-    "matrix: D1042's template runs everywhere, the INFERRED return too (D1194)",
+  name: "matrix: D1042's template runs everywhere, the INFERRED return too (D1194)",
   ignore: !ENABLED,
   fn: async () => {
     const { code, cells } = await runMatrix("orerr-generic-pin.matrix.vl");
     for (const face of ["annotated", "un-annotated"]) {
       wantVerdict(cells, "binding", face, "RUNS", "D1042 closed 2026-09-02");
       wantVerdict(cells, "array_push", face, "RUNS", "D1042 closed 2026-09-02");
-      wantVerdict(
-        cells,
-        "global_assign",
-        face,
-        "RUNS",
-        "D965's missed position",
-      );
-      wantVerdict(
-        cells,
-        "two_instances",
-        face,
-        "RUNS",
-        "two pins of one generic in a module",
-      );
-      wantVerdict(
-        cells,
-        "return_inferred",
-        face,
-        "RUNS",
-        "D1194 closed 2026-10-03",
-      );
+      wantVerdict(cells, "global_assign", face, "RUNS", "D965's missed position");
+      wantVerdict(cells, "two_instances", face, "RUNS", "two pins of one generic in a module");
+      wantVerdict(cells, "return_inferred", face, "RUNS", "D1194 closed 2026-10-03");
       // THE BLOCK FAMILY REACHES THIS TEMPLATE TOO, and that is the point of adding it: the
       // generic-pinned box is check-clean invalid wasm when captured out of a module-scope
       // block, which nothing graded before the positions existed. D1244's mechanism, this
       // template's value.
-      wantVerdict(
-        cells,
-        "block_if",
-        face,
-        "RUNS",
-        "the plain read inside the block is fine",
-      );
-      wantVerdict(
-        cells,
-        "block_if_capture",
-        face,
-        "RUNS",
-        "D1244 closed: the module block is a frame",
-      );
+      wantVerdict(cells, "block_if", face, "RUNS", "the plain read inside the block is fine");
+      wantVerdict(cells, "block_if_capture", face, "RUNS", "D1244 closed: the module block is a frame");
     }
     // Back to `exit 0`, and the third value this assertion has held. It wanted 0 before the
     // `block_*` positions existed, non-zero while D1244's captured box was SILENT, and 0
@@ -259,13 +211,10 @@ Deno.test({
 });
 
 Deno.test({
-  name:
-    "matrix: D1197's `.push` cell runs, and D1370's four annotated captures run too",
+  name: "matrix: D1197's `.push` cell runs, and D1370's four annotated captures run too",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, cells } = await runMatrix(
-      "narrowed-nullable-ref-push.matrix.vl",
-    );
+    const { code, cells } = await runMatrix("narrowed-nullable-ref-push.matrix.vl");
     for (const face of ["annotated", "un-annotated"]) {
       wantVerdict(
         cells,
@@ -274,36 +223,12 @@ Deno.test({
         "RUNS",
         "D1197 closed: `.push` asks `nulNicheRecoverOwed` like its siblings",
       );
-      wantVerdict(
-        cells,
-        "binding",
-        face,
-        "RUNS",
-        "D1197's matrix: eight positions run",
-      );
-      wantVerdict(
-        cells,
-        "argument",
-        face,
-        "RUNS",
-        "D1197's matrix: eight positions run",
-      );
-      wantVerdict(
-        cells,
-        "return_annotated",
-        face,
-        "RUNS",
-        "D1197's matrix: eight positions run",
-      );
+      wantVerdict(cells, "binding", face, "RUNS", "D1197's matrix: eight positions run");
+      wantVerdict(cells, "argument", face, "RUNS", "D1197's matrix: eight positions run");
+      wantVerdict(cells, "return_annotated", face, "RUNS", "D1197's matrix: eight positions run");
       // A GUARDed template cannot nest a module global's initialiser, and the harness says
       // so rather than reporting a refusal it manufactured itself.
-      wantVerdict(
-        cells,
-        "global_init",
-        face,
-        "skipped",
-        "a global init cannot nest in a guard",
-      );
+      wantVerdict(cells, "global_init", face, "skipped", "a global init cannot nest in a guard");
     }
     // D1370 — CLOSED (D1632). Making a module-scope block a real frame let four captured
     // cells reach the emitter, and the ANNOTATED rebind then arrived with a rep nothing
@@ -311,28 +236,9 @@ Deno.test({
     // field from the LOCAL rather than re-deriving it from the annotation, so all four run.
     // The face stays part of the pin: the un-annotated one ran throughout, and a fix that
     // moved only one face would show here rather than in a count.
-    for (
-      const p of [
-        "closure_capture",
-        "block_if_capture",
-        "block_while_capture",
-        "block_bare_capture",
-      ]
-    ) {
-      wantVerdict(
-        cells,
-        p,
-        "annotated",
-        "RUNS",
-        "D1370 closed: the env field matches the local",
-      );
-      wantVerdict(
-        cells,
-        p,
-        "un-annotated",
-        "RUNS",
-        "D1370's un-annotated face always ran",
-      );
+    for (const p of ["closure_capture", "block_if_capture", "block_while_capture", "block_bare_capture"]) {
+      wantVerdict(cells, p, "annotated", "RUNS", "D1370 closed: the env field matches the local");
+      wantVerdict(cells, p, "un-annotated", "RUNS", "D1370's un-annotated face always ran");
     }
     // No silent cell survives, and the count is asserted so a new one cannot appear unnamed.
     const silent = cells.filter((c) => verdictOf(c.grade) === "SILENT");
@@ -362,47 +268,19 @@ const BLOCKS =
   "block_if,block_if_capture,block_while,block_while_capture,block_bare,block_bare_capture";
 
 Deno.test({
-  name:
-    "matrix: D1244 CLOSED — a captured struct in a module-scope block, three block kinds",
+  name: "matrix: D1244 CLOSED — a captured struct in a module-scope block, three block kinds",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, cells } = await runMatrix(
-      "module-block-capture-struct.matrix.vl",
-      BLOCKS,
-    );
+    const { code, cells } = await runMatrix("module-block-capture-struct.matrix.vl", BLOCKS);
     for (const face of ["annotated", "un-annotated"]) {
       // The controls: a PLAIN read of the same local in the same block runs. Without these
       // the loud cells below would be satisfied by a block that never worked at all.
-      wantVerdict(
-        cells,
-        "block_if",
-        face,
-        "RUNS",
-        "D1244: the capture is the ingredient",
-      );
-      wantVerdict(
-        cells,
-        "block_while",
-        face,
-        "RUNS",
-        "D1244: the capture is the ingredient",
-      );
-      for (
-        const p of [
-          "block_if_capture",
-          "block_while_capture",
-          "block_bare_capture",
-        ]
-      ) {
+      wantVerdict(cells, "block_if", face, "RUNS", "D1244: the capture is the ingredient");
+      wantVerdict(cells, "block_while", face, "RUNS", "D1244: the capture is the ingredient");
+      for (const p of ["block_if_capture", "block_while_capture", "block_bare_capture"]) {
         // Was D1244's `field access receiver is not a struct`; the close removes the message
         // along with the refusal, so the verdict IS the assertion now.
-        wantVerdict(
-          cells,
-          p,
-          face,
-          "RUNS",
-          "D1244 closed 2026-09-03: the module block is a frame",
-        );
+        wantVerdict(cells, p, face, "RUNS", "D1244 closed 2026-09-03: the module block is a frame");
       }
       // D1253 CLOSED the floor that used to sit under all three: a bare block now lowers like
       // any other scope, so the plain-read bare cell runs with its `if` and `while` siblings
@@ -411,58 +289,26 @@ Deno.test({
     }
     // No SILENT cell and no runs lost: a loud refusal is not a failure of the harness, and
     // this is the exit-0 control the orerr template used to be.
-    if (code !== 0) {
-      throw new Error(`want exit 0 with no silent cell, got ${code}`);
-    }
+    if (code !== 0) throw new Error(`want exit 0 with no silent cell, got ${code}`);
   },
 });
 
 Deno.test({
-  name:
-    "matrix: D1244 CLOSED at the `i32[]` rep too — the two silent cells and D1253's price",
+  name: "matrix: D1244 CLOSED at the `i32[]` rep too — the two silent cells and D1253's price",
   ignore: !ENABLED,
   fn: async () => {
-    const { code, cells } = await runMatrix(
-      "module-block-capture-list.matrix.vl",
-      BLOCKS,
-    );
+    const { code, cells } = await runMatrix("module-block-capture-list.matrix.vl", BLOCKS);
     for (const face of ["annotated", "un-annotated"]) {
-      wantVerdict(
-        cells,
-        "block_if",
-        face,
-        "RUNS",
-        "the plain read of the list is fine",
-      );
-      wantVerdict(
-        cells,
-        "block_if_capture",
-        face,
-        "RUNS",
-        "D1244 closed 2026-09-03",
-      );
-      wantVerdict(
-        cells,
-        "block_while_capture",
-        face,
-        "RUNS",
-        "D1244 closed 2026-09-03",
-      );
+      wantVerdict(cells, "block_if", face, "RUNS", "the plain read of the list is fine");
+      wantVerdict(cells, "block_if_capture", face, "RUNS", "D1244 closed 2026-09-03");
+      wantVerdict(cells, "block_while_capture", face, "RUNS", "D1244 closed 2026-09-03");
       // D1253's PRICE, NOW REPAID. Closing the bare-block floor made this cell reachable and
       // it moved emit-refuses -> SILENT; D1244's frame moves it the rest of the way. A price
       // pinned by name is what let this be read as repayment rather than noticed as a number.
-      wantVerdict(
-        cells,
-        "block_bare_capture",
-        face,
-        "RUNS",
-        "D1253's price, repaid by D1244",
-      );
+      wantVerdict(cells, "block_bare_capture", face, "RUNS", "D1253's price, repaid by D1244");
       wantVerdict(cells, "block_bare", face, "RUNS", "D1253 closed");
     }
-    if (code !== 0) {
-      throw new Error(`want exit 0 once the ref reps run, got ${code}`);
-    }
+    if (code !== 0) throw new Error(`want exit 0 once the ref reps run, got ${code}`);
   },
 });
 
@@ -475,22 +321,12 @@ Deno.test({
 // same value graded RUNS at all twenty-six other cells, in both faces. Only the one position
 // is run: this is the control for the POSITION, not a second sweep of the value.
 Deno.test({
-  name:
-    "matrix: D1500's `local_assign` position exists and its own template runs there",
+  name: "matrix: D1500's `local_assign` position exists and its own template runs there",
   ignore: !ENABLED,
   fn: async () => {
-    const { cells } = await runMatrix(
-      "index-read-into-local-assign.matrix.vl",
-      "local_assign",
-    );
+    const { cells } = await runMatrix("index-read-into-local-assign.matrix.vl", "local_assign");
     for (const face of ["annotated", "un-annotated"]) {
-      wantVerdict(
-        cells,
-        "local_assign",
-        face,
-        "RUNS",
-        "D1500 closed 2026-09-03",
-      );
+      wantVerdict(cells, "local_assign", face, "RUNS", "D1500 closed 2026-09-03");
     }
     if (cells.length !== 2) {
       throw new Error(`want the 2 local_assign cells, got ${cells.length}`);
@@ -522,17 +358,13 @@ null
 // An emit refusal's reason is the refusal's own text. `vl check` prints a parenthesised note
 // when a program imports std (`(std: modules not linted …)`), and the reason column once quoted
 // that note for every emit refusal, since it is the first line the check phase leaves. The
-// control imports std through interpolation and is refused at emit by D16832's `if` binding.
-const EMIT_REASON_TEMPLATE =
-  `// An emit refusal past a clean check, with std imported.
+// control imports std through interpolation and is refused at emit by the test hook.
+const EMIT_REASON_TEMPLATE = `// An emit refusal past a clean check, with std imported: the harness's own hook, which
+// \`--test-emit-refusal\` refuses at emit, so no capability fix moves it.
 // @@PRELUDE@@
-function __app<A, B>(f: (x: A) => B, x: A): B { return f(x) }
-function __hinc(x) { return x + 1 }
-function __hid(x) { return x }
-const __c = 3 > 2
-const __h = if __c { __hinc } else { __hid }
-print("\\{__app(__h, 4)}")
-print("\\{__app(__h, 2.5)}")
+function __vl_test_emit_refusal__() {}
+__vl_test_emit_refusal__()
+print("\\{1}")
 // @@VALUE@@
 1
 // @@TYPE@@
@@ -544,33 +376,25 @@ print("\\{v}")
 `;
 
 Deno.test({
-  name:
-    "matrix: an emit refusal's reason is the refusal text, not a check note",
+  name: "matrix: an emit refusal's reason is the refusal text, not a check note",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({
-      prefix: "vl_capability_matrix_reason_",
-    });
+    const dir = await Deno.makeTempDir({ prefix: "vl_capability_matrix_reason_" });
     try {
       const t = `${dir}/emit-reason.matrix.vl`;
       await Deno.writeTextFile(t, EMIT_REASON_TEMPLATE);
-      const { cells } = await runMatrix(t, "binding,argument");
+      const { cells } = await runMatrix(t, "binding,argument", ["--test-emit-refusal"]);
       for (const face of ["annotated", "un-annotated"]) {
         for (const p of ["binding", "argument"]) {
           const grade = gradeOf(cells, p, face);
           if (verdictOf(grade) !== "emit refuses") {
             throw new Error(
               `${p}/${face}: the control no longer reaches an emit refusal, so this guard measures ` +
-                `nothing — replace its prelude with another check-clean emit refusal. Got: ${grade}`,
+                `nothing: \`--test-emit-refusal\` no longer refuses the hook call. Got: ${grade}`,
             );
           }
-          if (
-            !grade.includes("a binding of an `if` choosing") ||
-            grade.includes("not linted")
-          ) {
-            throw new Error(
-              `${p}/${face}: want the refusal's own text as the reason, got ${grade}`,
-            );
+          if (!grade.includes("test-only refusal") || grade.includes("not linted")) {
+            throw new Error(`${p}/${face}: want the refusal's own text as the reason, got ${grade}`);
           }
         }
       }
@@ -581,26 +405,17 @@ Deno.test({
 });
 
 Deno.test({
-  name:
-    "matrix: a check-clean program that traps is TRAP (program) and exits 1",
+  name: "matrix: a check-clean program that traps is TRAP (program) and exits 1",
   ignore: !ENABLED,
   fn: async () => {
-    const dir = await Deno.makeTempDir({
-      prefix: "vl_capability_matrix_trap_",
-    });
+    const dir = await Deno.makeTempDir({ prefix: "vl_capability_matrix_trap_" });
     try {
       const t = `${dir}/program-trap.matrix.vl`;
       await Deno.writeTextFile(t, PROGRAM_TRAP_TEMPLATE);
       const { code, cells, out } = await runMatrix(t, "binding,argument");
       for (const face of ["annotated", "un-annotated"]) {
         for (const p of ["binding", "argument"]) {
-          wantVerdict(
-            cells,
-            p,
-            face,
-            "TRAP (program)",
-            "check rc 0, then the program traps",
-          );
+          wantVerdict(cells, p, face, "TRAP (program)", "check rc 0, then the program traps");
           const grade = gradeOf(cells, p, face);
           if (!grade.includes("wasm trap: out of bounds array access")) {
             throw new Error(`${p}/${face}: want the trap named, got ${grade}`);
@@ -608,15 +423,9 @@ Deno.test({
         }
       }
       if (!out.includes("-> program trap   4")) {
-        throw new Error(
-          `want the summary to count 4 program traps, got:\n${out}`,
-        );
+        throw new Error(`want the summary to count 4 program traps, got:\n${out}`);
       }
-      if (code !== 1) {
-        throw new Error(
-          `want exit 1 on a program trap (clause 1), got ${code}`,
-        );
-      }
+      if (code !== 1) throw new Error(`want exit 1 on a program trap (clause 1), got ${code}`);
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
@@ -667,19 +476,10 @@ Deno.test({
           "",
         ].join("\n"),
       );
-      const { cells } = await runMatrix(
-        path,
-        "substring,twice_once,extra_line,exact,twice,lines",
-      );
+      const { cells } = await runMatrix(path, "substring,twice_once,extra_line,exact,twice,lines");
       for (const face of ["annotated", "un-annotated"]) {
         for (const p of ["substring", "twice_once", "extra_line"]) {
-          wantVerdict(
-            cells,
-            p,
-            face,
-            "WRONG",
-            "the output is not exactly the want",
-          );
+          wantVerdict(cells, p, face, "WRONG", "the output is not exactly the want");
         }
         for (const p of ["exact", "twice", "lines"]) {
           wantVerdict(cells, p, face, "RUNS", "the output is exactly the want");
