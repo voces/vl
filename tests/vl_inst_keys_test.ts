@@ -16,6 +16,13 @@ print(id("s"))
 print(twice(inc, 4))
 function app(f, x) { return f(x) }
 print(app(inc, 4))
+function dbl(a) { return a * 2 }
+function sw(h) {
+  let hh = h
+  hh = dbl
+  return hh(1)
+}
+print(sw(inc))
 `;
 
 async function checkCodegen(
@@ -99,6 +106,14 @@ Deno.test({
         `want one storage summary with a complete row, got:\n${
           storage.join("\n")
         }`,
+      );
+    }
+    // The written-binding join (B1): `hh` in `sw(inc)` holds `{inc, dbl}`, as the elaboration's.
+    const seed = rows.filter((l) => l.includes(": seed summary "));
+    const em = seed.length === 1 ? seed[0].match(/equal=(\d+)/) : null;
+    if (!em || Number(em[1]) < 1) {
+      throw new Error(
+        `want one seed summary with an equal join, got:\n${seed.join("\n")}`,
       );
     }
   },
