@@ -1,0 +1,405 @@
+// `check_inst_keys.vl` — the instance-key shadow (STORE stage A0): the instances the check's
+// per-call bindings (`instVecAt` rows) close to by substitution, against the keys the elaboration
+// minted. Built only when the host asks (`$VL_INST_KEYS`); nothing reads it.
+// Design: the STORE instance-key note in docs/internals/refactor-notes/.
+
+import { FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
+import {
+  instVecCalleeAt,
+  instVecCount,
+  instVecIxAt,
+  instVecNamesAt,
+  instVecTysAt,
+} from "./check_bind_rows"
+import { cwIxBuild, cwIxParent } from "./check_write_scan"
+import { substTyDeepUnbanked } from "./check_relate_core"
+import { TY_NEVER } from "./check_types"
+import { tyHasTyVar } from "./tyquery"
+import { elabKeyStrFor, elabKeyStrs } from "./emit_elab"
+import { MONO_NEST_MAX } from "./emit_mono"
+
+let ikRows: string[] = []
+
+// Builds the report rows; returns how many.
+export function instKeysBuild(): i32 {
+  ikRows = []
+  cwIxBuild()
+  // Per declaration, the bindings it is instanced at, as the check's rows close them.
+  const keyNames: {[i32]: string[][]} = Map()
+  const keyTys: {[i32]: i32[][]} = Map()
+  const seen: {[string]: boolean} = Map()
+  const checkKeys: string[] = []
+  const work: i32[] = []
+  const workDepth: i32[] = []
+  let openFn = 0
+  let openHole = 0
+  let openCanon = 0
+  let openUnbound = 0
+  let plain = 0
+  let capped = 0
+  // Roots: rows whose binding is closed as recorded.
+  let r = 0
+  while r < instVecCount() {
+    const d = instVecCalleeAt(r)
+    if d < 0 {
+      openFn = openFn + 1
+    } else if !ikGeneric(d) {
+      plain = plain + 1
+    } else if ikUnbound(r) {
+      openUnbound = openUnbound + 1
+    } else if !ikRelative(r) {
+      const ns: string[] = []
+      const ts: i32[] = []
+      const k = ikKeyFor(d, instVecNamesAt(r), instVecTysAt(r), [], [], ns, ts)
+      if k == "" {
+        openCanon = openCanon + 1
+      } else if ikBindsNothing(d, k) {
+        openUnbound = openUnbound + 1
+      } else if !(seen[k] ?? false) {
+        seen[k] = true
+        checkKeys.push(k)
+        ikKeyAdd(keyNames, keyTys, d, ns, ts)
+        work.push(d)
+        workDepth.push(0)
+      }
+    }
+    r = r + 1
+  }
+  // Each new instance of a declaration closes the open rows its body makes, by substitution.
+  const done: {[string]: boolean} = Map()
+  let w = 0
+  while w < work.length {
+    const e = work[w]
+    const depth = workDepth[w]
+    w = w + 1
+    const ens = keyNames[e] ?? []
+    const ets = keyTys[e] ?? []
+    let ki = 0
+    while ki < ens.length {
+      const tag = i32ToStr(e) + "#" + i32ToStr(ki)
+      if !(done[tag] ?? false) {
+        done[tag] = true
+        let q = 0
+        while q < instVecCount() {
+          const d = instVecCalleeAt(q)
+          if (
+            d >= 0
+            && ikGeneric(d)
+            && !ikUnbound(q)
+            && ikRelative(q)
+            && ikEnclosingFn(instVecIxAt(q)) == e
+          ) {
+            const st: i32[] = []
+            for t in instVecTysAt(q) {
+              st.push(substTyDeepUnbanked(t, ens[ki], ets[ki]))
+            }
+            if !ikClosed(st) {
+              openHole = openHole + 1
+            } else if depth + 1 >= MONO_NEST_MAX {
+              capped = capped + 1
+            } else {
+              const ns: string[] = []
+              const ts: i32[] = []
+              const k = ikKeyFor(
+                d,
+                instVecNamesAt(q),
+                st,
+                ens[ki],
+                ets[ki],
+                ns,
+                ts,
+              )
+              if k == "" {
+                openCanon = openCanon + 1
+              } else if ikBindsNothing(d, k) {
+                openUnbound = openUnbound + 1
+              } else if !(seen[k] ?? false) {
+                seen[k] = true
+                checkKeys.push(k)
+                ikKeyAdd(keyNames, keyTys, d, ns, ts)
+                work.push(d)
+                workDepth.push(depth + 1)
+              }
+            }
+          }
+          q = q + 1
+        }
+      }
+      ki = ki + 1
+    }
+  }
+  // Rows whose binding stays open with no enclosing instance to close it.
+  let q = 0
+  while q < instVecCount() {
+    const d = instVecCalleeAt(q)
+    if d >= 0 && ikGeneric(d) && !ikUnbound(q) && ikRelative(q) {
+      const e = ikEnclosingFn(instVecIxAt(q))
+      if e < 0 || (keyNames[e] ?? []).length == 0 { openHole = openHole + 1 }
+    }
+    q = q + 1
+  }
+  const elab = elabKeyStrs()
+  const inElab: {[string]: boolean} = Map()
+  for k in elab { inElab[k] = true }
+  let equal = 0
+  const checkOnly: string[] = []
+  for k in checkKeys {
+    if inElab[k] ?? false { equal = equal + 1 } else { checkOnly.push(k) }
+  }
+  const elabOnly: string[] = []
+  const elabSeen: {[string]: boolean} = Map()
+  for k in elab {
+    if !(seen[k] ?? false) && !(elabSeen[k] ?? false) {
+      elabSeen[k] = true
+      elabOnly.push(k)
+    }
+  }
+  ikRows.push(
+    "summary equal="
+      + i32ToStr(equal)
+      + " check-only="
+      + i32ToStr(checkOnly.length)
+      + " elab-only="
+      + i32ToStr(elabOnly.length)
+      + " open.fn-value="
+      + i32ToStr(openFn)
+      + " open.outer-hole="
+      + i32ToStr(openHole)
+      + " open.unbound="
+      + i32ToStr(openUnbound)
+      + " open.canon="
+      + i32ToStr(openCanon)
+      + " plain="
+      + i32ToStr(plain)
+      + " capped="
+      + i32ToStr(capped),
+  )
+  for k in checkOnly {
+    ikRows.push("check-only " + ikNamed(k) + ikNearest(k, elab))
+  }
+  // Per declaration, whether some row calls it, and whether one of them closed to a key.
+  const called: {[i32]: boolean} = Map()
+  let c = 0
+  while c < instVecCount() {
+    const d = instVecCalleeAt(c)
+    if d >= 0 { called[d] = true }
+    c = c + 1
+  }
+  for k in elabOnly {
+    const d = ikDeclOf(k)
+    const why = if ikArgKeyed(k) { "arg-keyed" } else if !(called[d] ?? false) { "unrecorded" } else if (keyNames[d] ?? []).length == 0 { "open" } else { "differs" }
+    ikRows.push("elab-only " + why + " " + ikNamed(k) + ikNearest(k, checkKeys))
+  }
+  return ikRows.length
+}
+
+export function instKeysLen(i: i32): i32 {
+  return if i >= 0 && i < ikRows.length { ikRows[i].length } else { 0 }
+}
+
+export function instKeysAt(i: i32, j: i32): i32 {
+  return if i >= 0 && i < ikRows.length && j >= 0 && j < ikRows[i].length { ikRows[i][j] } else { 0 }
+}
+
+// The key callee `d` takes at binding `names`/`tys`, made inside an instance of the enclosing
+// declaration bound at `encNames`/`encTys`. A name the check padded with `never` takes the
+// enclosing binding of that name, else is left to the elaboration's default (`elabCanon`). The
+// binding used is left in `ns`/`ts`, which the key's own body calls substitute with.
+function ikKeyFor(
+  d: i32,
+  names: string[],
+  tys: i32[],
+  encNames: string[],
+  encTys: i32[],
+  ns: string[],
+  ts: i32[],
+): string {
+  let i = 0
+  while i < names.length && i < tys.length {
+    let t = tys[i]
+    if t == TY_NEVER {
+      let j = 0
+      while j < encNames.length && j < encTys.length {
+        if encNames[j] == names[i] { t = encTys[j] }
+        j = j + 1
+      }
+    }
+    if t != TY_NEVER {
+      ns.push(names[i])
+      ts.push(t)
+    }
+    i = i + 1
+  }
+  return elabKeyStrFor(d, ns, ts)
+}
+
+// Whether row `r` left one of its callee's names unbound: the check padded it with `never`, or
+// named none of them.
+function ikUnbound(r: i32): boolean {
+  if instVecNamesAt(r).length == 0 && ikOwnVars(instVecCalleeAt(r)) {
+    return true
+  }
+  for t in instVecTysAt(r) {
+    if t == TY_NEVER { return true }
+  }
+  return false
+}
+
+// Whether key `k` of declaration `d` binds none of `d`'s own variables: the row named another
+// declaration's, so it says nothing about `d`'s instance.
+function ikBindsNothing(d: i32, k: string): boolean {
+  return k.length > 0 && k[k.length - 1] == 124 && ikOwnVars(d)
+}
+
+// Whether declaration `d` has an instance per binding: it has a type parameter or an
+// un-annotated one, or sits in a declaration that does.
+function ikGeneric(d: i32): boolean {
+  let e = d
+  while e >= 0 {
+    if ikOwnVars(e) { return true }
+    e = ikEnclosingFn(e)
+  }
+  return false
+}
+
+// Whether declaration `d` has a type parameter or an un-annotated parameter of its own.
+function ikOwnVars(d: i32): boolean {
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(n is FuncDecl) { return false }
+  if n.fnTyParams.length > 0 { return true }
+  for p in n.fnParams {
+    const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
+}
+
+// Whether row `r` is read under an instance of its enclosing declaration: its binding is open, or
+// its callee is nested in an un-annotated or generic declaration whose names it may read.
+function ikRelative(r: i32): boolean {
+  if !ikClosed(instVecTysAt(r)) { return true }
+  const d = instVecCalleeAt(r)
+  const e = ikEnclosingFn(d)
+  const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { null }
+  if !(en is FuncDecl) { return false }
+  if en.fnTyParams.length > 0 { return true }
+  for p in en.fnParams {
+    const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
+}
+
+// Whether every type in `tys` is closed.
+function ikClosed(tys: i32[]): boolean {
+  for t in tys {
+    if t < 0 || tyHasTyVar(t) { return false }
+  }
+  return true
+}
+
+function ikKeyAdd(
+  keyNames: {[i32]: string[][]},
+  keyTys: {[i32]: i32[][]},
+  d: i32,
+  names: string[],
+  tys: i32[],
+) {
+  const ns = keyNames[d] ?? []
+  const ts = keyTys[d] ?? []
+  ns.push(names)
+  ts.push(tys)
+  keyNames[d] = ns
+  keyTys[d] = ts
+  return 0
+}
+
+// The declared function whose body holds node `x`, or -1.
+function ikEnclosingFn(x: i32): i32 {
+  let p = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  while p >= 0 && p < P.nodes.length {
+    if nodeAt(p) is FuncDecl { return p }
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
+  }
+  return -1
+}
+
+// Key `k` (`decl|bindings`) with its declaration's name in front.
+// The declaration key `k` (`decl|bindings`) names, or -1.
+function ikDeclOf(k: string): i32 {
+  const c = k.indexOf("|")
+  if c <= 0 { return -1 }
+  let d = 0
+  let i = 0
+  while i < c {
+    if k[i] < 48 || k[i] > 57 { return -1 }
+    d = d * 10 + (k[i] - 48)
+    i = i + 1
+  }
+  return d
+}
+
+// Whether key `k` is of the argument-keyed family: its bindings start with another `|` field.
+function ikArgKeyed(k: string): boolean {
+  const c = k.indexOf("|")
+  if c < 0 { return false }
+  const rest = k.slice(c + 1, k.length)
+  const bar = rest.indexOf("|")
+  const eq = rest.indexOf("=")
+  return bar >= 0 && (eq < 0 || bar < eq)
+}
+
+// Key `k` (`decl|bindings`) with its declaration's name in front.
+function ikNamed(k: string): string {
+  const d = ikDeclOf(k)
+  const n = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const nm = if n is FuncDecl { n.fnName } else { "?" }
+  return nm + " " + k
+}
+
+// The bindings in which key `k` differs from the nearest key of the same declaration in `others`.
+function ikNearest(k: string, others: string[]): string {
+  const c = k.indexOf("|")
+  if c < 0 { return "" }
+  const head = k.slice(0, c + 1)
+  const mine = ikParts(k.slice(c + 1, k.length))
+  let best = ""
+  let bestN = -1
+  for o in others {
+    if o.length > head.length && o.slice(0, head.length) == head {
+      const theirs = ikParts(o.slice(head.length, o.length))
+      let diff = ""
+      let n = 0
+      for p in mine {
+        let same = false
+        for t in theirs {
+          if t == p { same = true }
+        }
+        if !same {
+          n = n + 1
+          diff = diff + " " + p
+        }
+      }
+      if bestN < 0 || n < bestN {
+        bestN = n
+        best = diff
+      }
+    }
+  }
+  return if bestN < 0 { " (no peer)" } else { " (differs:" + best + ")" }
+}
+
+function ikParts(s: string): string[] {
+  const out: string[] = []
+  let i = 0
+  let j = 0
+  while j < s.length {
+    if s[j] == 59 {
+      out.push(s.slice(i, j))
+      i = j + 1
+    }
+    j = j + 1
+  }
+  if i < s.length { out.push(s.slice(i, s.length)) }
+  return out
+}

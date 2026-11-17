@@ -37,11 +37,15 @@ Fixpoint seeds on both sides: master `e45d81194` and this branch.
 ## Narrowings the grading forced
 
 1. **Every plain maker twin.** `lambda-maker-relay-at-two-results` trapped: its twins share
-   parameters and differ in result, which an instance keyed by parameters cannot tell apart.
-   The rung now declines there.
+   parameters and differ in result, which an instance keyed by parameters cannot tell apart. The
+   rung declines for every twin of a maker that has such a pair, since serving a third twin
+   beside them pinned the template slot they use and trapped too. Residue, still a loud refusal
+   as on master: [D16923](../inventory/D16923.md).
 2. **A lone non-capturing twin.** `hole-fn-lambda-relaying-i32-at-f64-fn-type`
    (`return_inferred`, un-annotated face) went runs → emit refuses: its lambda calls a hole
-   function, which the instance path does not re-instance. The old path already built that case.
+   function, which the instance path does not re-instance. The old path already built that
+   case. Residue at twins apart, loud as on master with another sentence:
+   [D16926](../inventory/D16926.md).
 
 ## Not done
 

@@ -183,7 +183,10 @@ print(sel(true))
 // an atom `!=` against a literal and between two atoms, each `i32.eq` then `i32.eqz` (N2b-1);
 // a `.pop()` statement past the list's end (N2b-2a); an atom of id 0 and a `null` into its
 // `K | null`, and a call retagged into it in tail form, as legacy tail-calls it (N2b-2c-1); a
-// `K | null` holding atom id 0 tested `!= null`, `null ==` and `== "a"` (N2b-2c-1b).
+// `K | null` holding atom id 0 tested `!= null`, `null ==` and `== "a"` (N2b-2c-1b); a global
+// map read with an i32 default through legacy's helper, by an i32 key, a built string key, and a
+// key holding another such read (M1); a `print` of a built string, of f64 values that are `-0`,
+// `NaN` and `2e+300`, and of an f32, an i64, a boolean and an i32 (P1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -198,7 +201,7 @@ print(guard(2))
   `function cmp(a: string, b: string): boolean { return a + "x" == b || a > b }\nprint(cmp("a", "b"))\n`,
   `function dig(c: i32): boolean { return c >= '0' && c <= '9' }\nprint(dig(53))\n`,
   `function at(xs: string[], i: i32): string { return xs[i] }\nprint(at(["a", "b"], 1))\n`,
-  `function note(s: string) { print(s) }\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
+  `function note(s: string) {\n  const xs = [s]\n  print(xs[0])\n}\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
   `type K = "p" | "q"\nfunction pick(c: boolean): K {\n  if c { return "p" }\n  return "q"\n}\nprint(pick(true) == "p")\n`,
   `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
   `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
@@ -216,6 +219,15 @@ print(guard(2))
   `type K = "a" | "b"\nfunction ne(x: K | null): boolean { return x != null }\nconst ks: (K | null)[] = ["a", null]\nprint(ne(ks[0]))\n`,
   `type K = "a" | "b"\nfunction nf(x: K | null): boolean { return null == x }\nconst ks: (K | null)[] = ["a", null]\nprint(nf(ks[0]))\n`,
   `type K = "a" | "b"\nfunction ea(x: K | null): boolean { return x == "a" }\nconst ks: (K | null)[] = ["a", null]\nprint(ea(ks[0]))\n`,
+  `let ix: {[i32]: i32} = Map()\nfunction look(k: i32): i32 { return ix[k] ?? -1 }\nix[3] = 4\nprint(look(3) + look(5))\n`,
+  `let tys: {[string]: i32} = Map()\nfunction ty(s: string): i32 { return tys[s + "!"] ?? 0 }\ntys["a!"] = 2\nprint(ty("a") + ty("b"))\n`,
+  `let ix: {[i32]: i32} = Map()\nfunction hop(k: i32): i32 { return ix[(ix[k] ?? 0) + 1] ?? -1 }\nix[3] = 4\nix[5] = 9\nprint(hop(3) + hop(7))\n`,
+  `function ps(s: string) { print(s + "!") }\nps("a")\n`,
+  `function pf(x: f64) {\n  print(-x)\n  print(x / x)\n  print(x * 1.0e300 + 2.0e300)\n}\npf(0.0)\n`,
+  `function pg(x: f32) { print(x + 1.5) }\npg(2.0)\n`,
+  `function pl(x: i64) { print(x * 3) }\npl(5)\n`,
+  `function pb(x: i32) { print(x > 2) }\npb(3)\n`,
+  `function pv(x: i32) {\n  print(x + 1)\n  return\n}\npv(3)\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -382,7 +394,7 @@ print(two("a", "b"))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers expression array + operand at string + parameter rep nullable";
+    const want = "blockers coalesce niche + expression array + parameter rep nullable";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }

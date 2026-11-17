@@ -66,29 +66,38 @@ import {
 import {
   BinNulTest,
   GlobalCtx,
+  PrintArm,
   atomEqPlanOf,
   binNulTestOf,
   binNumWidth,
   boxOwedAt,
   callEndsNever,
+  coalArmOf,
+  coalResultKindOf,
   deadNullTestOperand,
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  mapGetOrHelperRoute,
+  mapKeyArmOf,
+  mapRecvShapeOf,
   nulNoneEqSides,
   nulTestArmOf,
   nullOwnIsAtom,
   numLitAsApplies,
   popPlanOf,
   popStmtPlainWhy,
+  printArmOf,
   pushPlainWhy,
   pushPlanOf,
   strLitTakesAtom,
+  tplStrHoleOf,
   widenPlanOf,
 } from "./wasmEmit"
 import {
   RAtom,
   RList,
+  RMap,
   RNullable,
   repNodeAt,
   repNodeGen,
@@ -624,6 +633,44 @@ function isPopStmt(c: Call): boolean {
   return f is Member && f.memProp == "pop"
 }
 
+// Whether call `c` is the `print` builtin, legacy's own arm: one argument, a callee no
+// declaration owns, and no pinned template hole.
+function isPrintStmt(c: Call): boolean {
+  if c.callFn < 0 || c.callArgs.length != 1 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || f.identName != "print" { return false }
+  return identDeclOf(c.callFn) < 0
+    && fnIndexOfNode(c.callFn) < 0
+    && tplStrHoleOf(c, ibFnIx) < 0
+}
+
+// A `print` statement whose arm (`printArmOf`) is a string stream or a scalar import, its
+// argument at that arm's rep. Every other arm is a named miss.
+function printStmt(b: i32[], c: Call, ix: i32) {
+  const arm = printArmOf(c.callArgs[0], ibFnIx)
+  const want = printArmRep(arm)
+  if want == "" { return skip("print " + arm) }
+  const v = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return 0 }
+  const p = repPrim(irBOpRep(v))
+  if p == null || p != want { return skip("print operand rep") }
+  irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
+  return 0
+}
+
+// The rep a `print` arm the IR builds reads its argument at, or "" for an arm it leaves to legacy.
+function printArmRep(arm: PrintArm): string {
+  return match arm {
+    "str" => "str"
+    "f32" => "f32"
+    "f64" => "f64"
+    "i64" => "i64"
+    "bool" => "bool"
+    "i32" => "i32"
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulAtom" | "atom" | "nulStr" | "nulBool" | "union" | "unrenderable" => ""
+  }
+}
+
 // A `.pop()` statement legacy writes as its checked take-and-drop (`popStmtPlainWhy`).
 function popStmt(b: i32[], c: Call, ix: i32) {
   const pq = popPlanOf(ix, ibFnIx)
@@ -841,6 +888,60 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
+// `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
+function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const arm = coalArmOf(n, ix, ibFnIx)
+  if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
+  return mapGetOr(b, n, ix, rep)
+}
+
+// `g[k] ?? d` along legacy's helper route only (`mapGetOrHelperRoute`): a map global read
+// plainly, a key written as itself (`mapKeyArmOf`), and an i32 default the helper's miss holds.
+function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  if lhsIx < 0 { return irBMiss("map read") }
+  const rd = nodeAt(lhsIx)
+  if !(rd is Index) { return irBMiss("map read") }
+  const rk = coalResultKindOf(ix, ibFnIx)
+  if mapGetOrHelperRoute(rd.idxArr, n.binRight, ibFnIx, rk).length != 1 {
+    return irBMiss("map read inline")
+  }
+  const ka = mapKeyArmOf(
+    rd.idxArr,
+    rd.idxIndex,
+    ibFnIx,
+    mapRecvShapeOf(rd.idxArr, ibFnIx),
+  )
+  if ka != "plain" { return irBMiss("map key " + ka) }
+  if repPrim(rep) != "i32" { return irBMiss("map read rep") }
+  const g = mapGlobalOf(rd.idxArr)
+  if g < 0 { return irBMiss("map read receiver") }
+  const k = irBExpr(b, rd.idxIndex)
+  if ibMiss != "" { return k }
+  const sid = sidOfNode(rd.idxArr)
+  const r: Rhs = {
+    mgSym: g,
+    mgNonNull: globalReadRecovers(sid, rd.idxArr, ibFnIx),
+    mgKey: k,
+    mgAt: ix,
+  }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// The module global map read `recvIx` names, its rep noted in `ib`; -1 for any other receiver.
+function mapGlobalOf(recvIx: i32): i32 {
+  if recvIx < 0 || !(nodeAt(recvIx) is Ident) { return -1 }
+  const d = identDeclOf(recvIx)
+  if d < 0 || localIndexOf(ibFnIx, recvIx) >= 0 { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  const g = globalIndexOfSid(sidOfNode(recvIx))
+  if g < 0 { return -1 }
+  const r = repNodeOfTy(scopeTyAt(d, -1))
+  if !(repNodeAt(r) is RMap) { return -1 }
+  irGlobalNote(ib, g, r)
+  return g
+}
+
 function isNumericPrim(p: string): boolean {
   return p == "i32"
     || p == "i64"
@@ -890,6 +991,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
+    if n.binOp == "??" { return coalesce(b, n, ix, rep) }
     if atomOperand(n.binLeft) || atomOperand(n.binRight) {
       return atomCompare(b, n, ix, rep)
     }
@@ -1173,6 +1275,7 @@ function stmtIn(b: i32[], ix: i32) {
   }
   if n is Call {
     if isPopStmt(n) { return popStmt(b, n, ix) }
+    if isPrintStmt(n) { return printStmt(b, n, ix) }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)

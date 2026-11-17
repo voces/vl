@@ -1,6 +1,6 @@
 import { nameToTy } from "./check_relate_core"
 import { aliasRootParam } from "./check_call_resolve"
-import { tyEqSealed, tySameSealed } from "./emit_ty_seal"
+import { canonKeyShadowNote, tyEqSealed, tySameSealed } from "./emit_ty_seal"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { voidCtxLambdaCarry } from "./check_side_rows"
 import { idShadowSpec } from "./emit_id_shadow"
@@ -20,15 +20,15 @@ import { idShadowModeOf } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
 import {
+  elabReadNames,
   mfrChainFns,
-  mfrElabNames,
   mfrLitsDirectFn,
   mfrLitsExprOf,
   mfrLitsMapReadFn,
   mfrLitsMapStored,
   mfrLitsOf,
-  mfrShadowNote,
-} from "./mfr_shadow"
+} from "./elab_reads"
+import { mfrShadowNote } from "./mfr_shadow"
 import {
   LC_CHAIN_LONG,
   lamCellOf,
@@ -8454,7 +8454,7 @@ function monoNoteOpenArgs(calleeIx: i32, instFe: i32) {
 
 // Per template slot: how many of its instances are being walked, one inside another.
 let monoActiveDepth: i32[] = []
-const MONO_NEST_MAX = 32
+export const MONO_NEST_MAX = 32
 
 // What an instance build is asked beside its pins: the enclosing-frame instance (`frame`), the call
 // and value delivery it answers, the keyed decision (`specK`), the result a delivery widens it to
@@ -8616,9 +8616,11 @@ function monoKeyPinSeg(
       pk = pk + 1
       continue
     }
+    const anon = if unionPin || monoPinExactFree(exact, pinTys[pk]) { "" } else { monoAnonPinDiscrim(pinTys[pk], if pk < pinOwn.length { pinOwn[pk] } else { -1 }) }
+    if anon != "" { canonKeyShadowNote(heads[pk], pinTys[pk]) }
     seg = seg
       + heads[pk]
-      + (if unionPin || monoPinExactFree(exact, pinTys[pk]) { "" } else { monoAnonPinDiscrim(pinTys[pk], if pk < pinOwn.length { pinOwn[pk] } else { -1 }) })
+      + anon
       + monoSetPinDiscrim(pinTys[pk])
       + (if unionPin { "" } else { monoLitUnionPinDiscrim(pinTys[pk]) })
       + ","
@@ -13930,7 +13932,7 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   const call = if monoFlowCalledAt(x) { mfrParentOf(x) } else { -1 }
   if repShadowOn { mfrShadowNote(x, g, call) }
   // The generic is the elaboration's; the walkers that chose `g` only gate which reads are asked.
-  if !mfrElabNames(x, g, call) { return false }
+  if !elabReadNames(x, g, call) { return false }
   // A read of a tagged set is its member id, which no name read can carry.
   if fnTagTyIsTagged(nodeTyIxOf(x)) { return false }
   const nm = monoFlowLeafName(g)
@@ -15356,7 +15358,17 @@ function monoPinObjFields(
       while k < o.objFieldNames.length && o.objFieldNames[k] != f.fiName {
         k = k + 1
       }
-      // A field holding a tagged set keeps it: its literal and its reads store the set's ids.
+      // A field holding a tagged set keeps it: its literal and its reads store the set's ids. Its
+      // value may hold the set where the record's own type does not: a literal the tag decision
+      // re-typed at the binding it is written into.
+      if (
+        k < tys.length
+        && !fnTagHoldsTy(tys[k])
+        && fnTagHoldsTy(nodeTyIxOf(f.fiValue))
+      ) {
+        tys[k] = nodeTyIxOf(f.fiValue)
+        any = true
+      }
       if k < tys.length && fnTagHoldsTy(tys[k]) { keptTag = true }
       if k < tys.length && monoTyOpen(tys[k]) && !fnTagHoldsTy(tys[k]) {
         let path = f.fiName
@@ -19485,6 +19497,12 @@ function monoElabPin(
   if !monoTyOpen(nodeTyIxOf(x)) {
     const cn = monoClosedTyName(t)
     if cn != "" { return cn }
+    // A closed function whose type has no spelled name (an anonymous record result) is pinned by
+    // its signature key, as an open one delivered here is (D16890).
+    if tyAt(t) is TyFunc {
+      const csk = sigKeyOfTy(t)
+      if csk != "" { return "=>" + csk }
+    }
     if tyMayHoldFn(t) || tyHoldsObj(t, 8) || tyIsUnionish(t) { return "" }
     return monoI32AtomPinName(t)
   }
