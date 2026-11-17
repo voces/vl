@@ -35,8 +35,9 @@ End to end, by IR-REV: a host built from this branch (mode 5) and a scratch seed
 corrupted seed reads 5,771 emitted, `5097 claim fell back: verifier`, rc 1. The Deno test drives the
 same fallback through the export, not through the row.
 
-Open caveat (§10): a claimed function returns before `emitResetScopeFrames`. Moving that reset above
-the claim writes no bytes and would close the caveat; it is a follow-up.
+Closed caveat (§10): a claimed function used to return before `emitResetScopeFrames`. The reset now
+runs above the claim, and still before legacy's body, because a claim that falls back during lowering
+can leave `ctrlDepth` and the loop stacks open (IR-REV on #8958). It writes no bytes.
 
 ## What the corpus comparison found, and how each class closed
 
@@ -61,3 +62,9 @@ Both were claimed functions that legacy handles and the IR did not; neither show
 - Under `--low-memory-unused`, a call of a trivial memory accessor is inlined with its constant
   folded into the memarg (`tests/vl_memarg_offset_test.ts`). The IR emitted a plain call. It now
   misses (`low-memory accessor`) on legacy's own predicate, `lowMemFoldsCallee`.
+
+Control for the reset before legacy's body: a throwaway seed whose every lowering opens a block and
+then falls back builds the compiler byte-identical to legacy's own build. The same throwaway without
+that reset is also identical. Every `br` legacy computes is relative to its own frames, so a leaked
+`ctrlDepth` alone is benign. What the reset guards is a leaked scope binding or loop entry, which
+#8955's `forIn` writes and which a stale lookup would read.
