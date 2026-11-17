@@ -277,16 +277,94 @@ function hbOnlyFieldCalled(d: i32, prop: string, fn: FuncDecl): boolean {
 
 // Whether node `m` under `body` is the callee of a call with no arguments.
 function hbCalledBareAt(m: i32, body: i32): boolean {
+  return hbCalleeArgCount(m, body) == 0
+}
+
+// The parameter of `fn` that callee `m`, a field read, reads: field `prop` of a record a call of a
+// declared function returns holding that argument (`handBackFieldIx`), directly or through a
+// `const` read only as such callees; -1 otherwise.
+export function handBackFieldParam(m: i32, fn: FuncDecl): i32 {
+  const mn = if m >= 0 && m < P.nodes.length { nodeAt(m) } else { nodeAt(0) }
+  if !(mn is Member) { return -1 }
+  const o = parenPeelIx(mn.memObj)
+  const on = if o >= 0 { nodeAt(o) } else { nodeAt(0) }
+  if on is Call { return hbFieldCallArgParam(o, fn, mn.memProp) }
+  if !(on is Ident) { return -1 }
+  const d = identDeclOf(o)
+  const ln = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  if !(ln is LetDecl) || ln.letKw != "const" || ln.letType >= 0 { return -1 }
+  if !hbOnlyFieldCallee(d, mn.memProp, fn) { return -1 }
+  const init = parenPeelIx(ln.letInit)
+  return if init >= 0 && nodeAt(init) is Call { hbFieldCallArgParam(init, fn, mn.memProp) } else { -1 }
+}
+
+// The parameter of `fn` call `w` hands a declared function at the index it hands back at field
+// `prop` of its record (`handBackFieldIx`); -1 otherwise.
+function hbFieldCallArgParam(w: i32, fn: FuncDecl, prop: string): i32 {
+  const wn = nodeAt(w)
+  if !(wn is Call) { return -1 }
+  const g = identFnDeclOf(parenPeelIx(wn.callFn))
+  const gn = if g >= 0 && g < P.nodes.length { nodeAt(g) } else { nodeAt(0) }
+  if !(gn is FuncDecl) { return -1 }
+  const j = handBackFieldIx(gn, prop)
+  if j < 0 || j >= wn.callArgs.length { return -1 }
+  if j < wn.callArgNames.length && wn.callArgNames[j] != "" { return -1 }
+  const a = parenPeelIx(wn.callArgs[j])
+  const pd = if a >= 0 && nodeAt(a) is Ident { identDeclOf(a) } else { -1 }
+  return if i32ListHas(fn.fnParams, pd) { pd } else { -1 }
+}
+
+// The parameter index of `dn` that every value `dn` returns, a record literal, holds bare at field
+// `prop`, which `dn` reads nowhere else; -1 otherwise.
+export function handBackFieldIx(dn: FuncDecl, prop: string): i32 {
+  const vs: i32[] = []
+  collectRetValues(dn.fnBody, vs)
+  const rets: i32[] = []
+  let pd = -1
+  for v in vs {
+    const x = hbRetClosure(parenPeelIx(v), prop)
+    const d = if x >= 0 && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+    if !i32ListHas(dn.fnParams, d) || pd >= 0 && d != pd { return -1 }
+    pd = d
+    rets.push(x)
+  }
+  if pd < 0 || prop == "" || !hbReadsOnly(dn.fnBody, pd, rets) { return -1 }
+  return i32ListIndexOf(dn.fnParams, pd)
+}
+
+// Whether every read of `d` in `fn` reads field `prop` as the callee of a call.
+function hbOnlyFieldCallee(d: i32, prop: string, fn: FuncDecl): boolean {
+  const todo: i32[] = [fn.fnBody]
+  const par: i32[] = [-1]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    const p = par.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      if nodeAt(x) is Ident && identDeclOf(x) == d {
+        const pn = if p >= 0 { nodeAt(p) } else { nodeAt(x) }
+        if !(pn is Member) || pn.memProp != prop || hbCalleeArgCount(p, fn.fnBody) < 0 { return false }
+      }
+      for k in nodeChildren(x) {
+        todo.push(k)
+        par.push(x)
+      }
+    }
+  }
+  return true
+}
+
+// The argument count of the call under `body` whose callee is `m`; -1 when `m` is no callee.
+function hbCalleeArgCount(m: i32, body: i32): i32 {
   const todo: i32[] = [body]
   while todo.length > 0 {
     const x = todo.pop() ?? -1
     if x >= 0 && x < P.nodes.length {
       const xn = nodeAt(x)
-      if xn is Call && parenPeelIx(xn.callFn) == m { return xn.callArgs.length == 0 }
+      if xn is Call && parenPeelIx(xn.callFn) == m { return xn.callArgs.length }
       for k in nodeChildren(x) { todo.push(k) }
     }
   }
-  return false
+  return -1
 }
 
 // The parameter of `fn` call `w` hands a declared function at the index it hands back in a
@@ -325,8 +403,8 @@ export function handBackCloIx(dn: FuncDecl, prop: string): i32 {
   return i32ListIndexOf(dn.fnParams, pd)
 }
 
-// The closure returned value `v` holds: `v` itself, or with `prop` not "" the value of the field
-// `prop` of record literal `v`; -1 otherwise.
+// The value returned value `v` hands back: `v` itself, or with `prop` not "" the value of the
+// field `prop` of record literal `v`; -1 otherwise.
 function hbRetClosure(v: i32, prop: string): i32 {
   if prop == "" { return v }
   const vn = if v >= 0 { nodeAt(v) } else { nodeAt(0) }
