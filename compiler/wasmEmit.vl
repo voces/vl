@@ -39492,18 +39492,12 @@ function njPair(a: i32, b: i32) {
   }
   if njResBox { fbI32Rel(RS_TAG, scalarTagOfKind(p)) }
   const fRem = njOp == "%" && (p == 4 || p == 5)
-  if fRem && gHelpF64Rem < 0 {
-    return emitFail(
-      "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
-    )
-  }
   if njPushSide(true, a, p) < 0 { return -1 }
-  if fRem && p == 5 { fbF64PromoteF32() }
+  if fRem { f64RemOperandTail(p == 5) }
   if njPushSide(false, b, p) < 0 { return -1 }
   if fRem {
-    if p == 5 { fbF64PromoteF32() }
-    fbCall(gHelpF64Rem)
-    if p == 5 { fbF32DemoteF64() }
+    f64RemOperandTail(p == 5)
+    if f64RemCallTail(p == 5) < 0 { return -1 }
   } else {
     const opc = lexOpcode(njOp, numPrimOfKind(p) ?? "i32")
     if opc < 0 {
@@ -39843,24 +39837,31 @@ function njNegArm(ms: i32[], i: i32, bs: i32) {
   return 0
 }
 
-// The `%` lowering over two float operands: both at f64, then a call into the shared
-// `__f64_rem__` helper (D1586). `atF32` re-encodes at f32 first so a literal like `0.1`
-// uses f32's value, then promotes and demotes the exact result. The reservation is load-
-// bearing: an unreserved helper is a `call` to index -1, so a miss fails loudly here first.
+// The `%` lowering over two float operands: each at f64, then a call into the shared
+// `__f64_rem__` helper (D1586). `atF32` writes each operand at f32 first, so a literal like `0.1`
+// uses f32's value, then promotes it, and demotes the exact result.
 function emitF64RemCall(lIx: i32, rIx: i32, fnIx: i32, atF32: boolean) {
+  const k = if atF32 { 5 } else { 4 }
+  if emitWidened(lIx, k, fnIx) < 0 { return -1 }
+  f64RemOperandTail(atF32)
+  if emitWidened(rIx, k, fnIx) < 0 { return -1 }
+  f64RemOperandTail(atF32)
+  return f64RemCallTail(atF32)
+}
+
+// Float `%`'s writer halves, which legacy's two writers and the IR's lowering call around their
+// operands: an operand written at f32 is promoted, then the helper is called and demoted back.
+export function f64RemOperandTail(atF32: boolean) {
+  if atF32 { fbF64PromoteF32() }
+  return 0
+}
+
+// An unreserved helper would be a `call` to index -1, so a miss fails loudly here.
+export function f64RemCallTail(atF32: boolean) {
   if gHelpF64Rem < 0 {
     return emitFail(
       "emitProgram: a float '%' reached the emitter with no __f64_rem__ helper reserved",
     )
-  }
-  if atF32 {
-    if emitWidened(lIx, 5, fnIx) < 0 { return -1 }
-    fbF64PromoteF32()
-    if emitWidened(rIx, 5, fnIx) < 0 { return -1 }
-    fbF64PromoteF32()
-  } else {
-    if emitWidened(lIx, 4, fnIx) < 0 { return -1 }
-    if emitWidened(rIx, 4, fnIx) < 0 { return -1 }
   }
   fbCall(gHelpF64Rem)
   if atF32 { fbF32DemoteF64() }
@@ -40746,66 +40747,38 @@ function emitBinNumeric(e: BinExpr, exprIx: i32, fnIx: i32) {
     return emitNumUnionBin(e, exprIx, fnIx)
   }
   const w = binNumWidth(e, fnIx)
-  if w == "f32" {
-    // float remainder at f32 rides the f64 helper (D1586): an f32 operand is exact in f64,
-    // the remainder of two f32-representable values is itself f32-representable, and every
-    // step of the helper is exact — so promote / call / demote loses nothing. A second
-    // helper would be the same algorithm at a narrower width for no gain.
-    if e.binOp == "%" {
-      if emitF64RemCall(e.binLeft, e.binRight, fnIx, true) < 0 { return -1 }
-      return 0
-    }
-    const opcF32 = lexOpcode(e.binOp, "f32")
-    // No f32 form ⇒ fail, never fall through. Ops with no float form (`%`, bitwise, shift) are
-    // integer-only in the checker, so this is unreachable from accepted source — it exists
-    // because falling through reaches the i32 tail below, emitting an i32 opcode over a float
-    // operand: invalid wasm the engine alone catches (`%` did exactly this before this backstop).
-    if opcF32 < 0 {
-      return emitFail("emitProgram: operator '" + e.binOp + "' has no f32 form")
-    }
-    if emitBinOperandAs(e.binLeft, "f32", fnIx) < 0 { return -1 }
-    if emitBinOperandAs(e.binRight, "f32", fnIx) < 0 { return -1 }
-    fbI32Bin(opcF32)
-    return 0
+  const p: RpPrim = if w == "f32" { "f32" } else if w == "f64" { "f64" } else if w == "i64" { "i64" } else { "i32" }
+  const flt = p == "f32" || p == "f64"
+  if flt && e.binOp == "%" {
+    return emitF64RemCall(e.binLeft, e.binRight, fnIx, p == "f32")
   }
-  if w == "f64" {
-    // float remainder — the one f64 operator with no instruction, so it calls the shared
-    // `__f64_rem__` helper instead of taking an opcode from the table below (D1586).
-    if e.binOp == "%" {
-      if emitF64RemCall(e.binLeft, e.binRight, fnIx, false) < 0 { return -1 }
-      return 0
-    }
-    const opcF = lexOpcode(e.binOp, "f64")
-    // NO f64 form ⇒ fail, never fall through — the f32 slice's reasoning, one width up.
-    if opcF < 0 {
-      return emitFail("emitProgram: operator '" + e.binOp + "' has no f64 form")
-    }
-    if emitBinOperandAs(e.binLeft, "f64", fnIx) < 0 { return -1 }
-    if emitBinOperandAs(e.binRight, "f64", fnIx) < 0 { return -1 }
-    fbI32Bin(opcF)
-    return 0
+  if !flt {
+    const sr = emitShiftMaskFold(
+      e,
+      exprIx,
+      if p == "i64" { 64 } else { 32 },
+      fnIx,
+    )
+    if sr <= 0 { return sr }
   }
-  if w == "i64" {
-    const sr64 = emitShiftMaskFold(e, exprIx, 64, fnIx)
-    if sr64 <= 0 { return sr64 }
-    const opc64 = lexOpcode(e.binOp, "i64")
-    if opc64 >= 0 {
-      if emitBinOperandAs(e.binLeft, "i64", fnIx) < 0 { return -1 }
-      if emitBinOperandAs(e.binRight, "i64", fnIx) < 0 { return -1 }
-      fbI32Bin(opc64)
-      return 0
-    }
+  // An operator with no form at its width is refused rather than written over the operands of
+  // another; the checker keeps every accepted program off this arm.
+  const opc = lexOpcode(e.binOp, p)
+  if opc < 0 {
+    return emitFail(
+      "emitProgram: operator '" + e.binOp + "' has no " + p + " form",
+    )
   }
-  const sr32 = emitShiftMaskFold(e, exprIx, 32, fnIx)
-  if sr32 <= 0 { return sr32 }
-  const opcode = lexOpcode(e.binOp, "i32")
-  if opcode < 0 { return emitFail("emitProgram: unsupported binary operator") }
-  // Operands first (left then right), then the operator — wasm's stack order. An `i64` shift
-  // count wraps to the `i32` operand's width, which masks it as wasm does.
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-  if binOperandScalarTy(e.binRight, fnIx) == TY_I64 { fbI32WrapI64() }
-  fbI32Bin(opcode)
+  if p != "i32" {
+    if emitBinOperandAs(e.binLeft, p, fnIx) < 0 { return -1 }
+    if emitBinOperandAs(e.binRight, p, fnIx) < 0 { return -1 }
+  } else {
+    // An `i64` shift count wraps to the `i32` operand's width, which masks it as wasm does.
+    if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+    if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+    if binOperandScalarTy(e.binRight, fnIx) == TY_I64 { fbI32WrapI64() }
+  }
+  fbI32Bin(opc)
   return 0
 }
 
