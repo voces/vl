@@ -1,10 +1,17 @@
 // `check_inst_keys.vl` — the instance-key shadow (STORE stage A0): the instances the check's
 // per-call bindings (`instVecAt` rows) close to by substitution, against the keys the elaboration
-// minted. Built only when the host asks (`$VL_INST_KEYS`); nothing reads it.
+// minted; and the storage shadow (B0): per call, parameter and set, the facts a storage decision
+// per (key, parameter) reads. Built only when the host asks (`$VL_INST_KEYS`); nothing reads it.
 // Design: the STORE instance-key note in docs/internals/refactor-notes/.
 
 import {
+  BinExpr,
+  Call,
   FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
   P,
   Param,
   TypeRef,
@@ -19,16 +26,31 @@ import {
   instVecNamesAt,
   instVecTysAt,
 } from "./check_bind_rows"
-import { cwIxBuild, cwIxParent } from "./check_write_scan"
+import { cwIxBuild, cwIxParent, cwLetUnwritten } from "./check_write_scan"
 import { arrowArgsOf, arrowCount } from "./check_arrow"
-import { arrowSetsOf } from "./check_arrow_facts"
-import { fnTagMembers } from "./check_elab_cap"
+import { arrowSetsOf, arrowSrcOf } from "./check_arrow_facts"
+import { fnTagMembers, fnTagSetIsTagged, fnTagSetOfTy } from "./check_elab_cap"
 import { nodeTyIxOf } from "./check_node_tys"
-import { substTyDeepUnbanked } from "./check_relate_core"
-import { TY_NEVER } from "./check_types"
+import { setMemberRetAt, substTyDeepUnbanked } from "./check_relate_core"
+import {
+  T,
+  TY_NEVER,
+  TY_VOID,
+  TyArray,
+  TyMap,
+  TyObj,
+  mkFuncTy,
+  tyAt,
+  tyElemOf,
+  tyFieldTyOf,
+  tyValOf,
+} from "./check_types"
 import { tyHasTyVar } from "./tyquery"
-import { elabKeyStrFor, elabKeyStrs } from "./emit_elab"
+import { ekDecl, ekNames, ekTys, elabKeyStrFor, elabKeyStrs } from "./emit_elab"
 import { MONO_NEST_MAX } from "./emit_mono"
+import { parenPeelIx } from "./check_places"
+import { identDeclOf } from "./symbols"
+import { i32ListHas, strListHas } from "./listutil"
 
 let ikRows: string[] = []
 
@@ -252,7 +274,358 @@ export function instKeysBuild(): i32 {
     const why = if ikArgKeyed(k) { "arg-keyed" } else if !(called[d] ?? false) { "unrecorded" } else if (keyNames[d] ?? []).length == 0 { "open" } else { "differs" }
     ikRows.push("elab-only " + why + " " + ikNamed(k) + ikNearest(k, checkKeys))
   }
+  ikStorageRows(inElab)
   return ikRows.length
+}
+
+// The storage shadow (STORE B0): one row per (key, function-holding parameter, set), with the
+// facts a decision per row reads and why a row lacks them, beside the storage the elaboration
+// gave the set. Appended to the report; nothing reads it.
+function ikStorageRows(inElab: {[string]: boolean}) {
+  // Per parameter declaration: the calls through it (nested: in a function inside its owner),
+  // and whether it seeds a written binding.
+  const callsOf: {[i32]: i32[]} = Map()
+  const nestedOf: {[i32]: boolean} = Map()
+  const seeds: {[i32]: boolean} = Map()
+  let x = 0
+  while x < P.nodes.length {
+    const n = nodeAt(x)
+    if arrowSrcOf(x) == x {
+      if n is Call {
+        const b = ikParamRead(ikPathRoot(n.callFn))
+        if b >= 0 {
+          if ikEnclosingFn(x) == ikEnclosingFn(b) {
+            const cs = callsOf[b] ?? []
+            cs.push(x)
+            callsOf[b] = cs
+          } else {
+            nestedOf[b] = true
+          }
+        }
+      }
+      if (
+        n is LetDecl
+        && n.letKw == "let"
+        && n.letInit >= 0
+        && !cwLetUnwritten(x)
+      ) {
+        const b = ikParamRead(n.letInit)
+        if b >= 0 { seeds[b] = true }
+      }
+      if n is BinExpr && n.binOp == "=" {
+        const b = ikParamRead(n.binRight)
+        if b >= 0 { seeds[b] = true }
+      }
+    }
+    x = x + 1
+  }
+  // Per set: rows, complete rows, open reasons, call shapes over complete rows, elab-only rows.
+  const sets: i32[] = []
+  const nRows: {[i32]: i32} = Map()
+  const nDone: {[i32]: i32} = Map()
+  const whys: {[i32]: string} = Map()
+  const shapes: {[i32]: string[]} = Map()
+  const nElab: {[i32]: i32} = Map()
+  let rows = 0
+  let done = 0
+  let oKey = 0
+  let oWritten = 0
+  let oArgs = 0
+  let oNested = 0
+  let unmatched = 0
+  let elabRows = 0
+  // One row per call the check records (`instVecAt`), per parameter, per set its argument holds:
+  // the argument node keeps the set the binding vector's signature loses.
+  let r = 0
+  while r < instVecCount() {
+    const d = instVecCalleeAt(r)
+    const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    const cx = instVecIxAt(r)
+    const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+    // The key the row closes to, "" when it stays open.
+    const ns: string[] = []
+    const ts: i32[] = []
+    const key = if f is FuncDecl && cn is Call && ikGeneric(d) { ikStorageKey(r, d, f, cn, ns, ts) } else { "" }
+    let i = 0
+    while (
+      f is FuncDecl
+      && cn is Call
+      && i < f.fnParams.length
+      && i < cn.callArgs.length
+    ) {
+      const b = f.fnParams[i]
+      const t = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
+      const own = fnTagSetOfTy(t)
+      const held: i32[] = []
+      if own >= 0 { held.push(own) }
+      ikSetsHeld(t, held, [])
+      for st in held {
+        rows = rows + 1
+        if !i32ListHas(sets, st) { sets.push(st) }
+        nRows[st] = (nRows[st] ?? 0) + 1
+        let why = ""
+        if key == "" {
+          why = "key"
+          oKey = oKey + 1
+        } else if !(inElab[key] ?? false) {
+          why = "unmatched"
+          unmatched = unmatched + 1
+        } else if seeds[b] ?? false {
+          why = "written"
+          oWritten = oWritten + 1
+        } else if nestedOf[b] ?? false {
+          why = "nested"
+          oNested = oNested + 1
+        }
+        let shape = ""
+        if why == "" {
+          for c in callsOf[b] ?? [] {
+            const hn = nodeAt(c)
+            // Only a call whose callee path holds this row's set is asked of it.
+            if hn is Call && fnTagSetOfTy(ikPathTy(t, hn.callFn)) == st {
+              const args: i32[] = []
+              for a in hn.callArgs {
+                args.push(
+                  substTyDeepUnbanked(nodeTyIxOf(parenPeelIx(a)), ns, ts),
+                )
+              }
+              if !ikClosed(args) {
+                why = "args"
+              } else {
+                const ft = mkFuncTy(args, TY_VOID)
+                shape = shape + "("
+                for m in fnTagMembers(st) {
+                  shape = shape + i32ToStr(setMemberRetAt(m, ft)) + ","
+                }
+                shape = shape + ")"
+              }
+            }
+          }
+          if why == "args" { oArgs = oArgs + 1 }
+        }
+        if why == "" {
+          done = done + 1
+          nDone[st] = (nDone[st] ?? 0) + 1
+          const sh = shapes[st] ?? []
+          if shape != "" && !strListHas(sh, shape) { sh.push(shape) }
+          shapes[st] = sh
+        } else {
+          const w = whys[st] ?? ""
+          if w.indexOf(why) < 0 { whys[st] = w + " " + why }
+        }
+      }
+      i = i + 1
+    }
+    r = r + 1
+  }
+  // The elaboration's instance rows: each instance's function-holding parameter, per set.
+  let k = 0
+  while k < ekDecl.length {
+    const d = ekDecl[k]
+    const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    const key = if f is FuncDecl { elabKeyStrFor(d, ekNames[k], ekTys[k]) } else { "" }
+    if f is FuncDecl && key != "" {
+      for b in f.fnParams {
+        const t = substTyDeepUnbanked(nodeTyIxOf(b), ekNames[k], ekTys[k])
+        const held: i32[] = []
+        const own = fnTagSetOfTy(t)
+        if own >= 0 { held.push(own) }
+        ikSetsHeld(t, held, [])
+        for st in held {
+          elabRows = elabRows + 1
+          if !i32ListHas(sets, st) { sets.push(st) }
+          nElab[st] = (nElab[st] ?? 0) + 1
+        }
+      }
+    }
+    k = k + 1
+  }
+  let multi = 0
+  for st in sets {
+    if (shapes[st] ?? []).length > 1 { multi = multi + 1 }
+  }
+  ikRows.push(
+    "storage summary rows="
+      + i32ToStr(rows)
+      + " complete="
+      + i32ToStr(done)
+      + " open.key="
+      + i32ToStr(oKey)
+      + " open.written="
+      + i32ToStr(oWritten)
+      + " open.args="
+      + i32ToStr(oArgs)
+      + " open.nested="
+      + i32ToStr(oNested)
+      + " unmatched="
+      + i32ToStr(unmatched)
+      + " elab="
+      + i32ToStr(elabRows)
+      + " sets="
+      + i32ToStr(sets.length)
+      + " multi-shape="
+      + i32ToStr(multi),
+  )
+  for st in sets {
+    const ms = fnTagMembers(st)
+    const elab = if ms.length == 1 { "direct" } else if fnTagSetIsTagged(st) { "id" } else { "closure" }
+    ikRows.push(
+      "storage set "
+        + ikSetNames(st)
+        + " elab="
+        + elab
+        + " rows="
+        + i32ToStr(nRows[st] ?? 0)
+        + " complete="
+        + i32ToStr(nDone[st] ?? 0)
+        + " shapes="
+        + i32ToStr((shapes[st] ?? []).length)
+        + " elab-rows="
+        + i32ToStr(nElab[st] ?? 0)
+        + " open:"
+        + (whys[st] ?? ""),
+    )
+  }
+  return 0
+}
+
+// The key call row `r` (`cn`, to `f` at `d`) closes to with each hole parameter handed a set bound
+// at that set, as the elaboration keys it by function identity; "" when a binding stays open.
+function ikStorageKey(
+  r: i32,
+  d: i32,
+  f: FuncDecl,
+  cn: Call,
+  ns: string[],
+  ts: i32[],
+): string {
+  const names = instVecNamesAt(r)
+  const tys0 = instVecTysAt(r)
+  const tys: i32[] = []
+  let j = 0
+  while j < names.length && j < tys0.length {
+    let t = tys0[j]
+    let i = 0
+    while i < f.fnParams.length && i < cn.callArgs.length {
+      const pn = nodeAt(f.fnParams[i])
+      if (
+        pn is Param
+        && pn.parType < 0
+        && names[j] == ikHolePrefix(f, d) + i32ToStr(i)
+      ) {
+        const at = nodeTyIxOf(parenPeelIx(cn.callArgs[i]))
+        const hs: i32[] = []
+        ikSetsHeld(at, hs, [])
+        if fnTagSetOfTy(at) >= 0 || hs.length > 0 { t = at }
+      }
+      i = i + 1
+    }
+    tys.push(t)
+    j = j + 1
+  }
+  for t in tys {
+    if t < 0 || t == TY_NEVER || !ikKeyClosed(t, []) { return "" }
+  }
+  return ikKeyFor(d, names, tys, [], [], ns, ts)
+}
+
+// The name a field or element path `x` is read off: `x` itself when it is no path.
+function ikPathRoot(x: i32): i32 {
+  let v = parenPeelIx(x)
+  let n = 0
+  while n < 32 && v >= 0 && v < P.nodes.length {
+    const vn = nodeAt(v)
+    if vn is Member { v = parenPeelIx(vn.memObj) }
+    else if vn is Index { v = parenPeelIx(vn.idxArr) }
+    else { return v }
+    n = n + 1
+  }
+  return v
+}
+
+// The type path `x` reads when its root holds `t`: `t` walked down its fields and elements.
+function ikPathTy(t: i32, x: i32): i32 {
+  const v = parenPeelIx(x)
+  const vn = if v >= 0 && v < P.nodes.length { nodeAt(v) } else { null }
+  if vn is Member {
+    const o = ikPathTy(t, vn.memObj)
+    return if o >= 0 { tyFieldTyOf(o, vn.memProp) } else { -1 }
+  } else if vn is Index {
+    const o = ikPathTy(t, vn.idxArr)
+    const ot = if o >= 0 && o < T.tys.length { tyAt(o) } else { null }
+    return if ot is TyArray { tyElemOf(ot) } else { -1 }
+  } else {
+    // Any other node is the path's root, which holds `t`.
+    return t
+  }
+}
+
+// The parameter `x` reads, directly or through a `const` copy of it; -1 when it reads none.
+function ikParamRead(x: i32): i32 {
+  let y = parenPeelIx(x)
+  let n = 0
+  while n < 16 && y >= 0 && y < P.nodes.length && nodeAt(y) is Ident {
+    const d = identDeclOf(y)
+    const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    if dn is Param { return d }
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+    y = parenPeelIx(dn.letInit)
+    n = n + 1
+  }
+  return -1
+}
+
+// Whether type `t` is closed but for the function sets it holds, which key by identity.
+function ikKeyClosed(t: i32, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if fnTagSetOfTy(t) >= 0 || !tyHasTyVar(t) || i32ListHas(seen, t) {
+    return true
+  }
+  seen.push(t)
+  const a = tyAt(t)
+  if a is TyArray {
+    return ikKeyClosed(tyElemOf(a), seen)
+  } else if a is TyMap {
+    return ikKeyClosed(tyValOf(a), seen)
+  } else if a is TyObj {
+    for f in a.objFieldTypes {
+      if !ikKeyClosed(f, seen) { return false }
+    }
+    return true
+  } else {
+    // Any other type is closed only when it reads no type variable.
+    return !tyHasTyVar(t)
+  }
+}
+
+// The function sets type `t` holds in a list element, map value or record field, into `out`.
+function ikSetsHeld(t: i32, out: i32[], seen: i32[]) {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return 0 }
+  seen.push(t)
+  const a = tyAt(t)
+  const parts: i32[] = []
+  if a is TyArray { parts.push(tyElemOf(a)) }
+  if a is TyMap { parts.push(tyValOf(a)) }
+  if a is TyObj {
+    for f in a.objFieldTypes { parts.push(f) }
+  }
+  for e in parts {
+    const es = fnTagSetOfTy(e)
+    if es >= 0 && !i32ListHas(out, es) { out.push(es) }
+    ikSetsHeld(e, out, seen)
+  }
+  return 0
+}
+
+// Set `s`'s members by name, `{a,b}`.
+function ikSetNames(s: i32): string {
+  let out = ""
+  for m in fnTagMembers(s) {
+    const mn = nodeAt(m)
+    const nm = if mn is FuncDecl && !fnNameIsLambda(mn.fnName) { mn.fnName } else { "<lambda>" }
+    out = if out == "" { nm } else { out + "," + nm }
+  }
+  return "{" + out + "}"
 }
 
 export function instKeysLen(i: i32): i32 {
