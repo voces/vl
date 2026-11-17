@@ -13,7 +13,7 @@ A scratch compiler, never seeded, made `fieldCodeIn`'s no-rep branch an uncondit
 | population | programs | no-rep cells |
 |---|---:|---:|
 | `tests/cases`, `std`, distilled cells, capability probes | 21,062 | 0 |
-| every matrix template (1,495), both faces | 85,570 | 1, already a loud emit reject on master (D16727) |
+| every matrix template (1,495), both faces | 85,570 | 1, already a loud emit reject on master (D16727, unfiled: D16727 until #8905 lands) |
 | full census (`mkmatrix`, `sab`, blocks A–E), at `JOBS=4`, alone | 250,438 | 0 |
 
 `gradecensus` keeps a cell's first error message, so the 265 cells emit already refuses could
