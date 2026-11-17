@@ -149,16 +149,17 @@ for (const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as cons
   });
 }
 
-// Outside I1's set: a string, a list and a record each leave their function uncovered, named.
+// Outside I1's set: a string coalesce whose default is no literal, a record and a valued `if` each
+// leave their function uncovered, named.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
     // A returned `if` that yields its arms' values is outside the set too.
-    const src = `function greet(s: string | null): string { return s ?? "!" }
+    const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function fx(p: { x: i32 }): i32 { return p.x }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
-print(greet("a"))
+print(greet("a", "!"))
 print(fx({ x: 4 }))
 print(sel(true))
 `;
@@ -186,7 +187,10 @@ print(sel(true))
 // `K | null` holding atom id 0 tested `!= null`, `null ==` and `== "a"` (N2b-2c-1b); a global
 // map read with an i32 default through legacy's helper, by an i32 key, a built string key, and a
 // key holding another such read (M1); a `print` of a built string, of f64 values that are `-0`,
-// `NaN` and `2e+300`, and of an f32, an i64, a boolean and an i32 (P1).
+// `NaN` and `2e+300`, and of an f32, an i64, a boolean and an i32 (P1); the four bitcasts, f64
+// and f32 float intrinsics, and i32 and i64 integer intrinsics (N3); a `string | null` built from
+// `null` and from a string, passed through, assigned, and coalesced with a string literal to a
+// string and inside a `print` (N2b-2c-2a).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -228,6 +232,19 @@ print(guard(2))
   `function pl(x: i64) { print(x * 3) }\npl(5)\n`,
   `function pb(x: i32) { print(x > 2) }\npb(3)\n`,
   `function pv(x: i32) {\n  print(x + 1)\n  return\n}\npv(3)\n`,
+  `function fb(x: i64): f64 { return f64fromBits(x) }\nprint(fb(f64bits(1.5)))\n`,
+  `function bf(x: f64): i64 { return f64bits(x * 2.0) }\nprint(bf(-0.0))\n`,
+  `function g32(x: f32): i32 { return f32bits(x) }\nprint(g32(1.0))\n`,
+  `function h32(x: i32): f32 { return f32fromBits(x) }\nprint(h32(1065353216))\n`,
+  `function sq(x: f64, y: f64): f64 { return min(sqrt(x), copysign(y, -1.0)) }\nprint(sq(9.0, 2.0))\n`,
+  `function fl(x: f32): f32 { return floor(x) }\nconst h: f32 = 2.5\nprint(fl(h))\n`,
+  `function cz(x: i32): i32 { return clz(x) + rotl(x, 3) }\nprint(cz(16))\n`,
+  `function dz(x: i64): i64 { return divU(x, 3) }\nprint(dz(-1))\n`,
+  `function nm(c: boolean, s: string): string | null {\n  if c { return null }\n  return s + "!"\n}\nprint(nm(false, "a") ?? "z")\n`,
+  `function id(x: string | null): string | null { return x }\nconst xs: (string | null)[] = ["a", null]\nprint(id(xs[0]) ?? "z")\n`,
+  `function lc(s: string): string | null {\n  let t: string | null = null\n  if s.length > 0 { t = s }\n  return t\n}\nprint(lc("q") ?? "z")\n`,
+  `function dn(x: string | null): string { return x ?? "n" }\nconst xs: (string | null)[] = [null, "a"]\nprint(dn(xs[0]) + dn(xs[1]))\n`,
+  `function pd(x: string | null) { print(x ?? "n") }\nconst xs: (string | null)[] = [null, "a"]\npd(xs[0])\npd(xs[1])\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -240,6 +257,19 @@ Deno.test({
         throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
+  },
+});
+
+// An integer `abs` is legacy's staged `select`, not one instruction: a named miss, never a
+// byte mismatch.
+Deno.test({
+  name: "ir shadow: an integer abs is a named miss",
+  ignore,
+  fn: () => {
+    const { rows } = run(`function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`, true);
+    const want = "uncovered intrinsic intAbs";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -394,7 +424,7 @@ print(two("a", "b"))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers coalesce niche + expression array + parameter rep nullable";
+    const want = "blockers coalesce string default + expression array";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }

@@ -18,6 +18,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCoalStr,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -33,6 +34,7 @@ import {
   RMapOp,
   RNulTest,
   RNullOf,
+  RNumIntr,
   RNumWiden,
   RPrimOp,
   RPrint,
@@ -75,7 +77,7 @@ import {
   repNodeKids,
   repNodeOfTy,
 } from "./emit_rep"
-import { repIsNoValue, repPrim, repWhat } from "./ir"
+import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
@@ -397,15 +399,35 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RRetag => {
       use(r.rgV, at)
       const d = repNodeAt(dst)
-      if !(d is RNullable) || d.rnDisc != 3 || d.rnInner != opRep(r.rgV) {
-        return fail(2, at, "a retag is not of an atom into its K | null")
+      if (
+        !(d is RNullable)
+        || !nicheRetag(d.rnDisc, d.rnInner)
+        || d.rnInner != opRep(r.rgV)
+      ) {
+        return fail(
+          2,
+          at,
+          "a retag is not of an atom or a string into its own nullable niche",
+        )
       }
       0
     }
     RNullOf => {
       const d = repNodeAt(dst)
+      if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
+        return fail(
+          2,
+          at,
+          "a null is not delivered into a K | null or a string | null",
+        )
+      }
+      0
+    }
+    RNulTest => {
+      use(r.ntV, at)
+      const d = repNodeAt(opRep(r.ntV))
       if !(d is RNullable) || d.rnDisc != 3 {
-        return fail(2, at, "a null is not delivered into a K | null")
+        return fail(2, at, "a null test of a non-K | null")
       }
       0
     }
@@ -476,6 +498,40 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMapOp => uses(r.mpArgs, at)
+    RCoalStr => {
+      use(r.czL, at)
+      use(r.czD, at)
+      const l = repNodeAt(opRep(r.czL))
+      if (
+        !(l is RNullable)
+        || !nicheRetag(l.rnDisc, l.rnInner)
+        || l.rnDisc != 1
+      ) {
+        return fail(2, at, "a string coalesce of a non-string | null")
+      }
+      if !(r.czD is OStr) {
+        return fail(
+          2,
+          at,
+          "a string coalesce's default is not a string literal",
+        )
+      }
+      if dst >= 0 && dst != l.rnInner && dst != opRep(r.czL) {
+        return fail(
+          2,
+          at,
+          "a string coalesce yields a string or a string | null",
+        )
+      }
+      0
+    }
+    RNumIntr => {
+      uses(r.nxArgs, at)
+      if dst >= 0 && !repIsScalar(dst) {
+        return fail(2, at, "a numeric intrinsic's result is a scalar")
+      }
+      0
+    }
     RPrint => {
       use(r.pnV, at)
       if dst >= 0 { return fail(2, at, "a print statement has no value") }
@@ -784,7 +840,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapGetOr | RPrint | RStrOp | RNumWiden | RToBox | RRetag | RNullOf | RNulTest | RAtomEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapGetOr | RPrint | RNumIntr | RCoalStr | RStrOp | RNumWiden | RToBox | RRetag | RNullOf | RNulTest | RAtomEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet => false
   }
 }
 
@@ -844,4 +900,12 @@ export function irVerify(f: IrFn): IrVerdict {
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }
   return v
+}
+
+// Whether a nullable of discipline `disc` over rep `inner` is a niche that holds its inner value
+// unchanged: a `K | null` atom (3), or a `string | null` ref (1 over the string).
+function nicheRetag(disc: i32, inner: i32): boolean {
+  if disc == 3 { return true }
+  const p = repPrim(inner)
+  return disc == 1 && p != null && p == "str"
 }

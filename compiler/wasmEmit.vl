@@ -103,6 +103,8 @@ import {
   elabTypedReadMemberAt,
   elabValueSlotUncalled,
   litRepTyAt,
+  luOvEnter,
+  luOvLeave,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -1139,6 +1141,7 @@ import {
   listIsRecvTyOf,
   litArmRowOf,
   localIndexOf,
+  luArmIndexBoxes,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
   mapReadNarrowedContainer,
@@ -1543,6 +1546,7 @@ import {
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
 import {
+  SCRATCH_BY_BOTH,
   asExprHoleNumOpt,
   asExprHoleNumSad,
   asExprNumCastDomain,
@@ -1567,6 +1571,7 @@ import {
   nulNicheCastWiredTy,
   nulRefNichePayloadTy,
   numCastStashSlot,
+  scratchSlot,
   sharedFieldRecvSlot,
   unionAsBoxSlot,
   unionHasAtomK,
@@ -1710,7 +1715,7 @@ import {
   monoArgClosedPinTy,
   monoBundleFe,
   monoBundleReadFe,
-  monoBundleRetFe,
+  monoCadRowFe,
   monoInstantiatedAny,
   monoIsClashLit,
   monoTokenFe,
@@ -18829,6 +18834,8 @@ export function idxArmOf(nd: Index, fnIx: i32): IdxArm {
 
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
+  const lux = emitListUnionArmIndex(idxIx, fnIx)
+  if lux != 0 { return if lux < 0 { -1 } else { 0 } }
   if nd is Index {
     // A shared cell's read is its binding's name read respelled, so one narrowed to `null`
     // delivers that null as `emitIdentNode` does (D15951).
@@ -25712,47 +25719,143 @@ const OP_F64_REINTERPRET_I64 = 0xbf
 // success (0) and its failure (-1) — the caller falls through to its own error.
 const NUM_INTR_NONE = -2
 
-// Lower `f32bits` / `f64bits` / `f32fromBits` / `f64fromBits`: push the argument at
-// the source type, then the one reinterpret instruction. Returns `NUM_INTR_NONE` when
-// `name` is not one of them. The operand goes out at the bitcast's own
-// source width.
-function emitBitcastIntr(callIx: i32, fnIx: i32, name: string) {
-  if (
-    name != "f32bits"
-    && name != "f64bits"
-    && name != "f32fromBits"
-    && name != "f64fromBits"
-  ) {
-    return NUM_INTR_NONE
+// How a numeric intrinsic call lowers (`numIntrPlanOf`): one instruction `niOp` over every
+// argument at kind `niKind` (`bitcast`, `float`, `int`), or an integer `abs`/`min`/`max`
+// through a select at that kind. `none` is no intrinsic; `bad` a call legacy cannot read.
+export type NumIntrArm = "bad"
+  | "none"
+  | "bitcast"
+  | "float"
+  | "intAbs"
+  | "intMinMax"
+  | "int"
+export type NumIntrPlan = { niArm: NumIntrArm, niKind: i32, niOp: i32 }
+
+// The plan for a call of intrinsic `name` at `callIx` in `fnIx`. A float intrinsic's width is
+// the binary operators': f32 when an operand is f32 and neither side is a genuine
+// (non-literal) f64, so `min(x, 0.5)` over an f32 `x` computes in f32 as `x * 0.5` does. An
+// integer intrinsic is i64 when an operand is i64, else i32.
+export function numIntrPlanOf(
+  callIx: i32,
+  fnIx: i32,
+  name: string,
+): NumIntrPlan {
+  const base = numIntrNamePlan(callIx, fnIx, name)
+  return match base.niArm {
+    "none" | "bad" | "intAbs" | "intMinMax" => base
+    "bitcast" | "float" | "int" => numIntrCallPlan(callIx, fnIx, name, base)
   }
+}
+
+// `numIntrPlanOf` by the name alone, at the narrow width: a bitcast's operand at its own
+// source width, an integer `abs`/`min`/`max` at the width `minMaxKind` names.
+function numIntrNamePlan(callIx: i32, fnIx: i32, name: string): NumIntrPlan {
+  let pl: NumIntrPlan = { niArm: "none", niKind: -1, niOp: -1 }
+  if name == "f32bits" {
+    pl = { niArm: "bitcast", niKind: 5, niOp: OP_I32_REINTERPRET_F32 }
+  } else if name == "f64bits" {
+    pl = { niArm: "bitcast", niKind: 4, niOp: OP_I64_REINTERPRET_F64 }
+  } else if name == "f32fromBits" {
+    pl = { niArm: "bitcast", niKind: 0, niOp: OP_F32_REINTERPRET_I32 }
+  } else if name == "f64fromBits" {
+    pl = { niArm: "bitcast", niKind: 3, niOp: OP_F64_REINTERPRET_I64 }
+  } else if floatIntrOpF32(name) >= 0 {
+    const mmk = minMaxKind(callIx, fnIx)
+    const wk = if mmk == "i64" { 3 } else { 0 }
+    if mmk == "i32" || mmk == "i64" {
+      const ia: NumIntrArm = if name == "abs" { "intAbs" } else { "intMinMax" }
+      pl = { niArm: ia, niKind: wk, niOp: -1 }
+    } else {
+      pl = { niArm: "float", niKind: 4, niOp: floatIntrOpF64(name) }
+    }
+  } else if intIntrOpI32(name) >= 0 {
+    pl = { niArm: "int", niKind: 0, niOp: intIntrOpI32(name) }
+  }
+  return pl
+}
+
+// A one-instruction intrinsic's plan `base` read against call `callIx`: `bad` for no call
+// index, `none` for a node that is no call, else widened by its operands.
+function numIntrCallPlan(
+  callIx: i32,
+  fnIx: i32,
+  name: string,
+  base: NumIntrPlan,
+): NumIntrPlan {
+  if callIx < 0 {
+    const bp: NumIntrPlan = { niArm: "bad", niKind: -1, niOp: -1 }
+    return bp
+  }
+  const c = nodeAt(callIx)
+  if !(c is Call) {
+    const np: NumIntrPlan = { niArm: "none", niKind: -1, niOp: -1 }
+    return np
+  }
+  const args = c.callArgs
+  let kind = base.niKind
+  let op = base.niOp
+  if floatIntrOpF32(name) >= 0 && args.length > 0 {
+    let anyF32 = false
+    for a in args {
+      if exprIsF32(a, fnIx) { anyF32 = true }
+    }
+    // A one-argument intrinsic passes its one operand as both sides.
+    if anyF32 && !binMixHardF64(args[0], args[args.length - 1], fnIx) {
+      kind = 5
+      op = floatIntrOpF32(name)
+    }
+  }
+  if intIntrOpI32(name) >= 0 {
+    for a in args {
+      if exprIsI64(a, fnIx) {
+        kind = 3
+        op = intIntrOpI64(name)
+      }
+    }
+  }
+  const pl: NumIntrPlan = { niArm: base.niArm, niKind: kind, niOp: op }
+  return pl
+}
+
+// A numeric intrinsic call: its plan's lowering, or `NUM_INTR_NONE` when `name` is not one.
+function emitNumIntr(callIx: i32, fnIx: i32, name: string) {
+  const pl = numIntrPlanOf(callIx, fnIx, name)
+  return match pl.niArm {
+    "none" => NUM_INTR_NONE
+    "bad" => -1
+    "intAbs" => emitIntAbs(callIx, fnIx, pl.niKind == 3)
+    "intMinMax" => emitIntMinMax(callIx, fnIx, name, pl.niKind == 3)
+    "bitcast" | "float" | "int" => emitNumIntrOp(callIx, fnIx, name, pl)
+  }
+}
+
+// A one-instruction numeric intrinsic: every argument at the plan's kind, then its instruction.
+function emitNumIntrOp(callIx: i32, fnIx: i32, name: string, pl: NumIntrPlan) {
   if callIx < 0 { return -1 }
   const c = nodeAt(callIx)
-  if c is Call {
-    if c.callArgs.length != 1 {
-      return emitFail(
-        "emitProgram: internal: "
-          + name
-          + " reached with the wrong argument count — the checker's arity rule refuses it",
-      )
-    }
-    const arg = c.callArgs[0]
-    if name == "f32bits" {
-      if emitExprAsKind(arg, 5, fnIx) < 0 { return -1 }
-      return fbI32Bin(OP_I32_REINTERPRET_F32) // 0xbc i32.reinterpret_f32
-    }
-    if name == "f64bits" {
-      if emitExprAsKind(arg, 4, fnIx) < 0 { return -1 }
-      return fbI32Bin(OP_I64_REINTERPRET_F64) // 0xbd i64.reinterpret_f64
-    }
-    if name == "f32fromBits" {
-      if emitExprAsKind(arg, 0, fnIx) < 0 { return -1 }
-      return fbI32Bin(OP_F32_REINTERPRET_I32) // 0xbe f32.reinterpret_i32
-    }
-    if emitExprAsKind(arg, 3, fnIx) < 0 { return -1 }
-    return fbI32Bin(OP_F64_REINTERPRET_I64) // 0xbf f64.reinterpret_i64
+  if !(c is Call) { return NUM_INTR_NONE }
+  if pl.niArm == "bitcast" && c.callArgs.length != 1 {
+    return emitFail(
+      "emitProgram: internal: "
+        + name
+        + " reached with the wrong argument count — the checker's arity rule refuses it",
+    )
   }
-  return NUM_INTR_NONE
+  if pl.niArm == "float" && c.callArgs.length == 0 {
+    return emitFail(
+      "emitProgram: internal: "
+        + name
+        + " reached with no argument — the checker's arity rule refuses it",
+    )
+  }
+  for a in c.callArgs {
+    if emitExprAsKind(a, pl.niKind, fnIx) < 0 { return -1 }
+  }
+  return numIntrTail(pl.niOp)
 }
+
+// After a numeric intrinsic's operands: its one instruction.
+export function numIntrTail(op: i32): i32 { return fbI32Bin(op) }
 
 // The f32 instruction for the float intrinsic `name`, or -1 when it is not one.
 //   abs 0x8b · ceil 0x8d · floor 0x8e · trunc 0x8f · nearest 0x90 · sqrt 0x91
@@ -25823,54 +25926,6 @@ function intIntrOpI64(name: string) {
   return -1
 }
 
-// Lower a FLOAT intrinsic (`sqrt`, `min`, `copysign`, …): push every argument at the
-// operation's width, then the one instruction. The width rule is the binary operators'
-// — f32 when an operand is f32 and neither side is a genuine (non-literal) f64 — so
-// `min(x, 0.5)` over an f32 `x` computes in f32 exactly as `x * 0.5` does.
-function emitFloatIntr(callIx: i32, fnIx: i32, name: string) {
-  const opF32 = floatIntrOpF32(name)
-  if opF32 < 0 { return NUM_INTR_NONE }
-  const mmk = minMaxKind(callIx, fnIx)
-  if mmk == "i32" || mmk == "i64" {
-    if name == "abs" { return emitIntAbs(callIx, fnIx, mmk == "i64") }
-    return emitIntMinMax(callIx, fnIx, name, mmk == "i64")
-  }
-  if callIx < 0 { return -1 }
-  const c = nodeAt(callIx)
-  if c is Call {
-    const args = c.callArgs
-    if args.length == 0 {
-      return emitFail(
-        "emitProgram: internal: "
-          + name
-          + " reached with no argument — the checker's arity rule refuses it",
-      )
-    }
-    let anyF32 = false
-    let i = 0
-    while i < args.length {
-      if exprIsF32(args[i], fnIx) { anyF32 = true }
-      i = i + 1
-    }
-    // `binMixHardF64` over the first and last argument IS the operators' rule: true when
-    // either side is a genuine (non-literal) f64. A one-argument intrinsic passes its one
-    // operand as both sides, which asks the same question of it.
-    const hardF64 = binMixHardF64(args[0], args[args.length - 1], fnIx)
-    const useF32 = anyF32 && !hardF64
-    // The chosen width is the OPERATION's, and each operand goes out at it.
-    let fiK = 4
-    if useF32 { fiK = 5 }
-    let j = 0
-    while j < args.length {
-      if emitExprAsKind(args[j], fiK, fnIx) < 0 { return -1 }
-      j = j + 1
-    }
-    if useF32 { return fbI32Bin(opF32) }
-    return fbI32Bin(floatIntrOpF64(name))
-  }
-  return NUM_INTR_NONE
-}
-
 // Lower an integer `min` / `max`, which has no wasm instruction: both operands are
 // evaluated in order before either is staged (so a nested call cannot clobber the frame),
 // then `select` over a signed compare. Staging slots: i32 at +0/+1, i64 at +2/+3.
@@ -25931,36 +25986,6 @@ function emitIntAbs(callIx: i32, fnIx: i32, wide: boolean) {
   if wide { fbI32Bin(0x53) } else { fbI32Bin(0x48) }
   fbSelect() // → the negation when the operand is negative
   return 0
-}
-
-// Lower an INTEGER intrinsic (`clz`, `rotl`, `divU`, `ltU`, …): push every argument at
-// the operation's width, then the one instruction. i64 when an operand is i64 (the i32
-// side sign-extends), else i32 — the selection the i64 binary operators use.
-function emitIntIntr(callIx: i32, fnIx: i32, name: string) {
-  const opI32 = intIntrOpI32(name)
-  if opI32 < 0 { return NUM_INTR_NONE }
-  if callIx < 0 { return -1 }
-  const c = nodeAt(callIx)
-  if c is Call {
-    const args = c.callArgs
-    let useI64 = false
-    let i = 0
-    while i < args.length {
-      if exprIsI64(args[i], fnIx) { useI64 = true }
-      i = i + 1
-    }
-    // The chosen width is the OPERATION's: an i32 op's operand is an i32.
-    let iiK = 0
-    if useI64 { iiK = 3 }
-    let j = 0
-    while j < args.length {
-      if emitExprAsKind(args[j], iiK, fnIx) < 0 { return -1 }
-      j = j + 1
-    }
-    if useI64 { return fbI32Bin(intIntrOpI64(name)) }
-    return fbI32Bin(opI32)
-  }
-  return NUM_INTR_NONE
 }
 
 // The value of an integer literal, of an unshadowed top-level `const` bound to one, or of an
@@ -27729,6 +27754,33 @@ function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
   return -1
 }
 
+// Whether a call of `callee`, a name no function in scope owns, is a closure-valued callee
+// dispatched through the closure fat-pointer: not where it is a numeric intrinsic's name no
+// binding covers here, which is the intrinsic even where a later local closure takes the name
+// (D3607).
+function unknownCallRoutesRef(c: Call, callee: Ident, fnIx: i32): boolean {
+  const intrHere = isNumIntrinsicName(callee.identName)
+    && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
+    && globalIndexOf(callee.identName) < 0
+  return !intrHere
+    && (exprIsClosure(c.callFn, fnIx)
+    || bundleParamOfRead(c.callFn, fnIx) >= 0)
+}
+
+// Whether call `c` of `callee` reaches the numeric intrinsics in `fnIx`, as
+// `emitCallCoreUserFn` routes it: no function of the name in scope, no closure-valued callee,
+// and no live frame binding (a captured loop variable), which is the shadowing rule the
+// checker types against: a program that defines its own `min` calls its own (D2010).
+export function numIntrCallReached(c: Call, callee: Ident, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const sid = sidOfNode(c.callFn)
+  if fnIndexOfInScopeChainAt(sid, callee.identName, fnIx, c.callFn) >= 0 {
+    return false
+  }
+  if unknownCallRoutesRef(c, callee, fnIx) { return false }
+  return !identNameIsLiveBound(callee.identName, fnIx)
+}
+
 // `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
 // direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
 // intrinsic when the name resolves to no function. Returns 0 or -1.
@@ -27757,29 +27809,12 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
     return emitCallRef(callIx, fnIx)
   }
   if target < 0 {
-    // Not a known function name — a closure-valued callee, dispatched through the closure
-    // fat-pointer — unless it is a numeric intrinsic's name that no binding covers here,
-    // which is the intrinsic even where a later local closure takes the name (D3607).
-    const intrHere = isNumIntrinsicName(callee.identName)
-      && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
-      && globalIndexOf(callee.identName) < 0
-    if (
-      !intrHere
-      && (exprIsClosure(c.callFn, fnIx) || bundleParamOfRead(c.callFn, fnIx) >= 0)
-    ) {
+    if unknownCallRoutesRef(c, callee, fnIx) {
       return emitCallRef(callIx, fnIx)
     }
-    // The numeric-opcode intrinsics: one wasm instruction over the arguments. Reached
-    // only where the name resolved to no function, no closure value and no frame binding
-    // (a captured loop variable), which IS the shadowing rule the checker types against —
-    // a program that defines its own `min` calls its own (D2010).
     if !identNameIsLiveBound(callee.identName, fnIx) {
-      const bcRc = emitBitcastIntr(callIx, fnIx, callee.identName)
-      if bcRc != NUM_INTR_NONE { return bcRc }
-      const fiRc = emitFloatIntr(callIx, fnIx, callee.identName)
-      if fiRc != NUM_INTR_NONE { return fiRc }
-      const iiRc = emitIntIntr(callIx, fnIx, callee.identName)
-      if iiRc != NUM_INTR_NONE { return iiRc }
+      const niRc = emitNumIntr(callIx, fnIx, callee.identName)
+      if niRc != NUM_INTR_NONE { return niRc }
     }
     if nodeTyAt(c.callFn, fnIx) == TY_NULL { return emitNullCalleeCall() }
     return emitFail("emitProgram: call to unknown function")
@@ -28579,7 +28614,9 @@ function emitBundleRetLam(retArg: i32, fnIx: i32): i32 {
     const nm = sFieldNames[sFieldStart[si] + fi]
     let k = 0
     while k < sigs.length && nm != "c" + i32ToStr(k) { k = k + 1 }
-    const fe = monoBundleRetFe(x, fnIx, sigs, k)
+    // Built while the twin's body is cloned, before its instance exists, so the rows are unkeyed.
+    const fk = monoBundleFe(x, fnIx, sigs, k)
+    const fe = if fk >= 0 || k >= sigs.length { fk } else { monoCadRowFe(elabSrcDecl(x), -1, sigs[k]) }
     if fe < 0 {
       return emitFailAt(
         "emitProgram: a lambda returned at two signatures has no closure built for one of them",
@@ -37382,6 +37419,8 @@ export function initBitOf(gi: i32): i32 {
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
+  luOvLocNodes = []
+  luOvLocSlots = []
   coerceHeld = -1
   irHoleIx = -1
   irHoleUses = 0
@@ -38239,6 +38278,14 @@ export function globalReadRecovers(isid: i32, readIx: i32, fnIx: i32): boolean {
 // arena index `_exprIx`, already threaded in and unused, turns the id lookup and the
 // other six into array reads.
 function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
+  // A read a union-of-lists arm overrides is that arm's unboxed list (D16897).
+  if luOvLocNodes.length > 0 {
+    const ovl = luOvLocalOf(exprIx)
+    if ovl >= 0 {
+      fbLocalGet(ovl)
+      return 0
+    }
+  }
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
   // destination's null rep from the same table a bare `null` literal does.
   if identCellVKind(exprIx, fnIx) == "nulnone" {
@@ -38735,6 +38782,11 @@ export function nullOwnIsAtom(exprIx: i32, fnIx: i32): boolean {
   return nullOwnAt(exprIx, fnIx) == NULL_OWN_ATOM
 }
 
+// Whether the `null` value node `exprIx` is `string | null`'s typed null where it is delivered.
+export function nullOwnIsStr(exprIx: i32, fnIx: i32): boolean {
+  return nullOwnAt(exprIx, fnIx) == NULL_OWN_STR
+}
+
 function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   const er = elabNodeRepAt(exprIx, fnIx)
   const st = if er >= 0 { er } else { nodeRepTyAt(exprIx, fnIx) }
@@ -39045,7 +39097,10 @@ const LU_ARM_LEN = 1
 // list arm, then the read at that arm's wrapper. 0 when `recv` is not such a box, 1 when
 // emitted, -1 when an arm has no tag or wrapper to read through.
 function emitListUnionArmRead(recv: i32, op: i32, fnIx: i32): i32 {
-  if fnIx < 0 || !exprUnion(recv, fnIx) { return 0 }
+  if fnIx < 0 { return 0 }
+  if !exprUnion(recv, fnIx) && !luArmIndexBoxes(unwrapParen(recv), fnIx) {
+    return 0
+  }
   const arms = luMembersAt(nodeTyAt(recv, fnIx))
   if arms.length == 0 { return 0 }
   const tags: i32[] = []
@@ -39103,6 +39158,132 @@ function emitListUnionArmChain(
   if emitListUnionArmChain(slot, tags, heaps, op, i + 1) < 0 { return -1 }
   fbEnd()
   return 0
+}
+
+// `recv[i]` over a union-of-lists box a pin left unrewritten (D16897): per list arm, the read
+// lowers with `recv` overridden to that arm and the result to its element, delivered into the
+// element union. 0 when `idxIx` is not such a read, 1 when emitted, -1 on failure.
+function emitListUnionArmIndex(idxIx: i32, fnIx: i32): i32 {
+  if idxIx < 0 || idxIx >= P.nodes.length || !luArmIndexBoxes(idxIx, fnIx) {
+    return 0
+  }
+  const n = nodeAt(idxIx)
+  if !(n is Index) { return 0 }
+  const recv = unwrapParen(n.idxArr)
+  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  const u = nodeTyAt(idxIx, fnIx)
+  const uName = boxTyName(u)
+  if uName == "" {
+    return emitFail(
+      "emitProgram: a union-of-lists element read has no element union box",
+    )
+  }
+  return emitListUnionArmIndexAt(idxIx, recv, arms, 0, u, uName, fnIx)
+}
+
+// The reads `emitListUnionArmIndexAt` overrides to an arm's unboxed list, and the local each
+// reads; innermost last. Empty outside a union-of-lists arm.
+let luOvLocNodes: i32[] = []
+let luOvLocSlots: i32[] = []
+
+// Overrides read `ix` to local `slot`; returns the mark `luOvLocalLeave` restores to.
+function luOvLocalEnter(ix: i32, slot: i32): i32 {
+  const mark = luOvLocNodes.length
+  luOvLocNodes.push(ix)
+  luOvLocSlots.push(slot)
+  return mark
+}
+
+// Drops every local override pushed since `mark`.
+function luOvLocalLeave(mark: i32) {
+  while luOvLocNodes.length > mark {
+    luOvLocNodes.pop()
+    luOvLocSlots.pop()
+  }
+  return 0
+}
+
+// The local an override reads `ix` from, or -1.
+function luOvLocalOf(ix: i32): i32 {
+  let k = luOvLocNodes.length - 1
+  while k >= 0 {
+    if luOvLocNodes[k] == ix { return luOvLocSlots[k] }
+    k = k - 1
+  }
+  return -1
+}
+
+// The scratch local an arm `m`'s unboxed list is held in, typed at its wrapper, or -1 for a
+// list kind with none.
+function luArmWrapLocal(m: i32): i32 {
+  if unMemIsRefElemArray(m) {
+    const rs = unMemRefArrArmSlot(m)
+    if rs < 0 { return -1 }
+    return scratchSlot(46, "reflist", rs, SCRATCH_BY_BOTH)
+  }
+  const k = boxTagOfTy(m)
+  // A boolean list rides the i32 list's wrapper.
+  if k == 7 || k == 17 || k == 18 {
+    return scratchSlot(46, "list", 0, SCRATCH_BY_BOTH)
+  }
+  if k == 8 { return scratchSlot(46, "f64list", 0, SCRATCH_BY_BOTH) }
+  if k == 9 { return scratchSlot(46, "strlist", 0, SCRATCH_BY_BOTH) }
+  if k == 10 { return scratchSlot(46, "i64list", 0, SCRATCH_BY_BOTH) }
+  if k == 12 { return scratchSlot(46, "f32list", 0, SCRATCH_BY_BOTH) }
+  return -1
+}
+
+// Arm `i` onward of `emitListUnionArmIndex`'s tag chain.
+function emitListUnionArmIndexAt(
+  idxIx: i32,
+  recv: i32,
+  arms: i32[],
+  i: i32,
+  u: i32,
+  uName: string,
+  fnIx: i32,
+): i32 {
+  if i >= arms.length {
+    fbUnreachable()
+    return 1
+  }
+  const m = arms[i]
+  const t = listIsArmTag(m)
+  const e = tyArrayElemIx(m)
+  if t < 0 || e < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no box tag or element to read",
+    )
+  }
+  const loc = luArmWrapLocal(m)
+  const heap = listArmHeapOf(m)
+  if loc < 0 || heap < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to read through",
+    )
+  }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIfRef(uBoxIdx)
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  const mark = luOvEnter(recv, m)
+  luOvEnter(idxIx, e)
+  const lmark = luOvLocalEnter(recv, loc)
+  const r = emitUnionCoerce(uName, u, idxIx, fnIx)
+  luOvLocalLeave(lmark)
+  luOvLeave(mark)
+  if r < 0 { return -1 }
+  fbElse()
+  if emitListUnionArmIndexAt(idxIx, recv, arms, i + 1, u, uName, fnIx) < 0 {
+    return -1
+  }
+  fbEnd()
+  return 1
 }
 
 // ── numeric-union dispatch ─────────────────────────────────────────────────────
@@ -41431,7 +41612,7 @@ function emitArrayCopyIntr(callIx: i32, fnIx: i32) {
 // the read to `string` (`coalesceStaysNullable`), a nullable default leaves it `string | null`.
 // It asks `exprNullableString` of the `??` node itself, since the checker's banked type is
 // missing on a synthesized node (a chained `p ?? q ?? r` re-associates through `mkBinary`).
-function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
+export function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
   return exprNullableString(exprIx, fnIx)
 }
 
@@ -41773,12 +41954,11 @@ function emitCoalesceNulRefCtx(
       exprIx,
     )
   }
-  // blocktype `(ref null $heapIx)` keeps the result nullable; `(ref $heapIx)` is non-null.
-  fbBlockRefNul(heapIx, nulBlock)
+  coalNulRefOpen(heapIx, nulBlock)
   if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
-  fbBrOnNonNull(0) // non-null → branch to the block end with the (ref $heapIx)
+  coalNulRefBranch()
   if isSTy(heapIx) && exprIsLitAtom(e.binRight, fnIx) {
     if emitCoalesceAtomStrDefault(e.binRight, nulBlock, fnIx) < 0 { return -1 }
   } else {
@@ -41786,6 +41966,39 @@ function emitCoalesceNulRefCtx(
   }
   fbEnd() // 0x0b end
   return 0
+}
+
+// Before a nullable ref `??`'s operand: the block whose type is `(ref null $heapIx)` for
+// `nulBlock`, which keeps the result nullable, else `(ref $heapIx)`.
+export function coalNulRefOpen(heapIx: i32, nulBlock: boolean): i32 {
+  fbBlockRefNul(heapIx, nulBlock)
+  return 0
+}
+
+// After a nullable ref `??`'s operand: a non-null ref branches to the block's end, so the default
+// that follows runs only on `null`.
+export function coalNulRefBranch(): i32 {
+  fbBrOnNonNull(0)
+  return 0
+}
+
+// Whether `l ?? d` over a `string | null` (`coalNicheArmOf`'s `str`) is the plain block: no union
+// box joins the default, no record or list default diverts it, and the default is no
+// literal-union atom, which is widened to its member string.
+export function coalNulStrBlockPlain(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  if coalesceNicheJoinsToBox(exprIx, fnIx) { return false }
+  if (
+    tyIsStructBearingUnion(nodeTyIxOf(exprIx))
+    && !coalesceResultIsBox(exprIx, fnIx)
+  ) {
+    return false
+  }
+  if coalListDefaultClash(e, fnIx) { return false }
+  return !exprIsLitAtom(e.binRight, fnIx)
 }
 
 // The default of a `string | null` `??` when it is a literal-union atom (`K` or `K | null`):
@@ -42529,11 +42742,47 @@ function emitCoalesceCallArm(
   return emitPopOr(lhsIx, e.binRight, fnIx)
 }
 
+// The nullable-rep arm of `l ?? d` once `coalArmOf` names `niche`, in `emitCoalesceNiche`'s
+// order: the `boolean | null` select (boxed when the default joins), the `K | null` sentinel,
+// its widening to a string, a nullable collection, a nullable closure, `string | null`, and the
+// boxed operands (`identBox`).
+export type CoalNicheArm = "nulBoolJoin"
+  | "nulBool"
+  | "litUnion"
+  | "nulAtomStr"
+  | "coll"
+  | "clo"
+  | "str"
+  | "identBox"
+export function coalNicheArmOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNicheArm {
+  const nb = exprNulBool(e.binLeft, fnIx)
+  if nb && coalesceNicheJoinsToBox(exprIx, fnIx) { return "nulBoolJoin" }
+  // A call operand of `boolean | null` cannot be re-read; it takes a later arm.
+  if nb && !coalLhsIsCall(lhsIx) { return "nulBool" }
+  if coalesceLitUnionFits(exprIx, fnIx) { return "litUnion" }
+  if coalesceNulAtomToStr(exprIx, fnIx) { return "nulAtomStr" }
+  if nulCollWrapHeap(e.binLeft, fnIx) >= 0 { return "coll" }
+  if exprNulClosure(e.binLeft, fnIx) { return "clo" }
+  if exprNullableString(e.binLeft, fnIx) { return "str" }
+  return "identBox"
+}
+
+// Whether node `ix` is a call.
+function coalLhsIsCall(ix: i32): boolean {
+  return ix >= 0 && nodeAt(ix) is Call
+}
+
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   const lhs = nodeAt(lhsIx)
+  const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
   // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
   // and in the else arm for the string), so they apply only to an effect-free place —
   // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
@@ -42554,10 +42803,8 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // when the lhs is null. `select` evaluates both value operands unconditionally, so a
   // side-effecting default would run on the present path too — the same lowering the `K |
   // null` niche, the `string | null` niche and every nullable-ref rep already use.
-  if exprNulBool(e.binLeft, fnIx) && coalesceNicheJoinsToBox(exprIx, fnIx) {
-    return emitCoalesceNulBoolJoin(e, exprIx, fnIx)
-  }
-  if !(lhs is Call) && exprNulBool(e.binLeft, fnIx) {
+  if arm == "nulBoolJoin" { return emitCoalesceNulBoolJoin(e, exprIx, fnIx) }
+  if arm == "nulBool" {
     if emitExpr(e.binLeft, fnIx) < 0 {
       return -1 // the niche i32
     }
@@ -42590,7 +42837,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // A branching `if`, not a `select`: `select` evaluates both value operands, so a
   // side-effecting default would run on the present path. The `if` framing costs three bytes
   // more per site; a call lhs is stashed once in the shared i32 coalesce-call slot.
-  if coalesceLitUnionFits(exprIx, fnIx) {
+  if arm == "litUnion" {
     // The operand reads at the niche its classifier names, so a prelude join builds the atom.
     if (emitExpr(e.binLeft, fnIx) < 0) {
       return -1 // the niche i32, evaluated ONCE
@@ -42616,19 +42863,16 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   }
   // `<e> ?? d` over a `K | null` niche whose default is not a member: the result is a
   // `string`, so the atom is evaluated once and the present arm widens it (D3198).
-  if coalesceNulAtomToStr(exprIx, fnIx) {
-    return emitCoalesceNulAtomStr(e, fnIx)
-  }
+  if arm == "nulAtomStr" { return emitCoalesceNulAtomStr(e, fnIx) }
   // `<e> ?? d` over a nullable collection niche (`i32[] | null`, `string[] | null` /
   // `f64[] | null` / `i64[] | null` / `f32[] | null`, `i32[][] | null` / `S[] | null`): the
   // cell is a `(ref null $wrapper)`, so it takes the same `br_on_non_null` lowering as the
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
-  const cnclw = nulCollWrapHeap(e.binLeft, fnIx)
-  if cnclw >= 0 { return emitCoalesceNulRef(e, exprIx, cnclw, fnIx) }
-  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
-  if exprNulClosure(e.binLeft, fnIx) {
-    return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx)
+  if arm == "coll" {
+    return emitCoalesceNulRef(e, exprIx, nulCollWrapHeap(e.binLeft, fnIx), fnIx)
   }
+  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
+  if arm == "clo" { return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx) }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -42638,7 +42882,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // and the default follows the block type (`coalesceNulStrArmCtx`). Ungated on
   // re-readability: the core evaluates the operand ONCE, so a CALL takes this arm too —
   // gated, it fell past every niche to a lowering with the wrong heap (D1763).
-  if exprNullableString(e.binLeft, fnIx) {
+  if arm == "str" {
     const coNul = coalesceNulStrStaysNullable(exprIx, fnIx)
     return emitCoalesceNulRefCtx(e, exprIx, sTy(), coNul, fnIx)
   }

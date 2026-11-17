@@ -801,6 +801,30 @@ const p: Pair<i32, string> = { a: 1, b: "s" }
 print(p.b)   // prints s
 ```
 
+**T9.5** A parameter with no annotation is an open hole, as an unbounded `<T>` is. Each call
+instances the function at its own argument types, including a call through a record field or
+other value the function flows into. A function no call instances still builds: its hole
+parameters take the default the hole would take at check (`i32` when unconstrained).
+
+```vl
+function inc(a) { return a + 1 }
+print(inc(2))     // prints 3
+print(inc(2.5))   // prints 3.5
+const r = { f: inc }
+print(r.f(4))     // prints 5
+function tag(a) { return a + "!" }
+const fs = { t: tag }
+print("built")    // prints built
+```
+
+> Ruling: owner 2026-09-03, DECISIONS.md §"An unbounded `<T>` is an ENTIRELY OPEN HOLE";
+> 2026-11-17, chosen under the owner's delegation, DECISIONS.md §"An un-instantiated
+> function's hole parameters close at check to the hole default" (D16898).
+
+> Status: check leaves the uninstanced function's type open and the default is applied in
+> emit (D16898). An uninstanced function whose body constrains a hole to `string`, stored as a
+> record into a map read back from a map, is built at `i32` and fails to validate (D16927).
+
 ## T10. Aliases and nominal types
 
 **T10.1** `type N = T` makes `N` another name for `T`. They are the same type everywhere.

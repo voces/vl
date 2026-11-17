@@ -61,7 +61,7 @@ import {
 import { canonUnionMembersInto } from "./check_program"
 import { recAdAnnDropped } from "./check_rec_adopt_rows"
 import { assignable, substTyDeep } from "./check_relate_core"
-import { isListArmNodes, isVarTyIxOf } from "./check_list_union"
+import { isListArmNodes, isVarTyIxOf, luPinElemTys } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
 import {
   inferRetNodeCarryNote,
@@ -1442,8 +1442,7 @@ function internCloSigKey(key: string, rep: i32) {
 
 // Interns the `$fnsig` of a union arm of arena type `ty` (-1 when unknown) at rep -1, keyed
 // `kIn`, or by `unionArmSigKeyTy` when `kIn` is "". A mixed scalar-plus-composite union result
-// is skipped: its synthesized sig would pass the call's floor while the un-pinned producer keeps
-// its own functype, and the cast traps.
+// with no row is skipped: no producer builds that box, so the call keeps its loud floor.
 function internCloSigOfArmTy(kIn: string, ty: i32) {
   let k = kIn
   if k == "" { k = unionArmSigKeyTy(ty) }
@@ -8468,10 +8467,9 @@ function objLeadsWithIndexOp(names: string[]): boolean {
   return names.length > 0 && names[0].length > 0 && names[0][0] == '['
 }
 
-// True if a closure whose result arena type is `retIx` is not yet representable through the
-// value ABI, so the arena sig walk must skip interning its sig — synthesizing one the concrete
-// producer declines would let a value call resolve past its clean reject into invalid emit.
-// Two holes: an inline result struct not `funcTypeShapeLowerable`, or a heterogeneous value union.
+// True if a closure whose result arena type is `retIx` has no direct sig key in the value ABI:
+// an inline result struct not `funcTypeShapeLowerable`, which the arena sig walk skips, or a
+// heterogeneous value union, which it interns only through `internCloSigOfArmTy`'s box test.
 function funcRetUnrepresentable(retIx: i32): boolean {
   if retIx < 0 { return false }
   const t = tyAt(retIx)
@@ -8626,8 +8624,10 @@ function collectTyReachCloSigsArm(tyIx: i32): i32 {
       forceCloResultMapTypes(tyIx)
       forceCloResultListTypes(tyIx)
       // Interns this closure's sig from its arena render, the key the value-call site and a
-      // concrete lambda both derive; a mixed-union unregistered result is skipped so the call rejects loudly.
-      if !funcRetUnrepresentable(t.fnRet) {
+      // concrete lambda both derive. A mixed union result interns its box sig when the union has a
+      // row: every producer delivered at this type builds the box result, a lambda by taking the
+      // contextual result and any other function through the delivery's adapter (D16899).
+      if !funcRetUnrepresentable(t.fnRet) || cloResultMaybeMixed(tyIx) {
         // `sigKeyOfTy(tyIx)` gets the key directly off the type.
         const kAr = sigKeyOfTy(tyIx)
         if kAr != "" && !cloResultMaybeMixed(tyIx) { internCloSigKey(kAr, -1) }
@@ -8729,6 +8729,10 @@ function collectInlineUnions(stmts: i32[]) {
   cloSigWalkRoots = []
   ciuFnSeen = Map()
   if collectInlineUnionsIn(stmts, stmts) < 0 { return -1 }
+  // The element unions a pin typed a union-of-lists read at (D16897).
+  for pe in luPinElemTys {
+    if collectTyReachRegister(stmts, pe, false) < 0 { return -1 }
+  }
   // The statement walk does not enter expressions, so an expression-position `if` registers the
   // bindings in its arms here: a narrowed box bound there, the list-union rewrite's receiver
   // among them, names its union (D16896).

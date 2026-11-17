@@ -73,7 +73,10 @@ import {
   boxOwedAt,
   callEndsNever,
   coalArmOf,
+  coalNicheArmOf,
+  coalNulStrBlockPlain,
   coalResultKindOf,
+  coalesceNulStrStaysNullable,
   deadNullTestOperand,
   globalReadRecovers,
   idxStorePlainWhy,
@@ -84,6 +87,9 @@ import {
   nulNoneEqSides,
   nulTestArmOf,
   nullOwnIsAtom,
+  nullOwnIsStr,
+  numIntrCallReached,
+  numIntrPlanOf,
   numLitAsApplies,
   popPlanOf,
   popStmtPlainWhy,
@@ -271,6 +277,7 @@ function valueRep(r: i32, ty: i32): boolean {
     || repNodeAt(r) is RAtom
     || boxedNullable(r)
     || atomNullable(r)
+    || strNullable(r)
     || irVarRepOkHook(r, ty)
 }
 
@@ -278,6 +285,14 @@ function valueRep(r: i32, ty: i32): boolean {
 function atomNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 3
+}
+
+// Whether rep `r` is `string | null` (discipline 1): the string's ref, or a null ref.
+function strNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  if !(n is RNullable) || n.rnDisc != 1 { return false }
+  const p = repPrim(n.rnInner)
+  return p != null && p == "str"
 }
 
 // Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
@@ -565,6 +580,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if cf is Member { return methodRhs(b, c, cf, ix) }
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
+  if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
+    return numIntrRhs(b, c, cf, ix)
+  }
   if d < 0 || !(nodeAt(d) is FuncDecl) {
     return missRhs("call of a non-declaration")
   }
@@ -592,6 +610,39 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const r: Rhs = { caCallee: pos, caArgs: args, caNever: callEndsNever(ix) }
   return r
+}
+
+// A numeric intrinsic legacy writes as one instruction (`numIntrPlanOf`), each operand already
+// at the operation's kind. An integer `abs`/`min`/`max` select is a named miss.
+function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
+  const pl = numIntrPlanOf(ix, ibFnIx, f.identName)
+  if pl.niArm != "bitcast" && pl.niArm != "float" && pl.niArm != "int" {
+    return missRhs("intrinsic " + pl.niArm)
+  }
+  if c.callArgs.length == 0 || pl.niArm == "bitcast" && c.callArgs.length != 1 {
+    return missRhs("intrinsic argument count")
+  }
+  const want = numKindPrim(pl.niKind)
+  const args: Opnd[] = []
+  for a in c.callArgs {
+    const v = irBExpr(b, a)
+    if ibMiss != "" { return missRhs("argument") }
+    const p = repPrim(irBOpRep(v))
+    if p == null || p != want { return missRhs("intrinsic operand coercion") }
+    args.push(v)
+  }
+  const r: Rhs = { nxArgs: args, nxOp: pl.niOp, nxAt: ix }
+  return r
+}
+
+// The prim rep of number kind `k` as the numeric plans name kinds (0 i32, 3 i64, 4 f64,
+// 5 f32), or "" for any other kind.
+function numKindPrim(k: i32): string {
+  if k == 0 { return "i32" }
+  if k == 3 { return "i64" }
+  if k == 4 { return "f64" }
+  if k == 5 { return "f32" }
+  return ""
 }
 
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
@@ -746,9 +797,13 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
-  // A `null` literal into a `K | null` is legacy's own sentinel (`emitNullAt`).
-  if ibMiss == "" && dst >= 0 && atomNullable(dst) {
-    if nodeAt(unwrapParen(ix)) is NullLit && nullOwnIsAtom(ix, ibFnIx) {
+  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`emitNullAt`):
+  // the sentinel, or the string's typed null ref.
+  if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
+    if (
+      atomNullable(dst) && nullOwnIsAtom(ix, ibFnIx)
+      || strNullable(dst) && nullOwnIsStr(ix, ibFnIx)
+    ) {
       return repTemp(b, { nuAt: ix }, ix, dst)
     }
   }
@@ -783,10 +838,14 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
     return boxTemp(b, v, ix, dst)
   }
-  // An atom into its `K | null` is the same i32: legacy's table has no row for it, since a
-  // nullable niche is no box (`boxOwedAt`).
+  // An atom into its `K | null` is the same i32, and a string into `string | null` the same ref:
+  // legacy's table has no row for either, since a nullable niche is no box (`boxOwedAt`).
   const dn = repNodeAt(dst)
-  if dn is RNullable && dn.rnDisc == 3 && dn.rnInner == irBOpRep(v) {
+  if (
+    dn is RNullable
+    && (dn.rnDisc == 3 || strNullable(dst))
+    && dn.rnInner == irBOpRep(v)
+  ) {
     if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
   }
   const sk = numKindOf(irBOpRep(v))
@@ -891,8 +950,43 @@ function nulTest(
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
 function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = coalArmOf(n, ix, ibFnIx)
+  if arm == "niche" { return coalNiche(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
+}
+
+// `l ?? d` over a `string | null` along legacy's plain block (`coalNulStrBlockPlain`), its default
+// a string literal and its result the block's own rep. Every other niche arm is a named miss.
+function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  if lhsIx < 0 { return irBMiss("coalesce operand") }
+  const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
+  if na != "str" { return irBMiss("coalesce niche " + na) }
+  if !coalNulStrBlockPlain(n, ix, ibFnIx) {
+    return irBMiss("coalesce string shape")
+  }
+  const dIx = unwrapParen(n.binRight)
+  if dIx < 0 || !(nodeAt(dIx) is StrLit) {
+    return irBMiss("coalesce string default")
+  }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
+  const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
+  if rep != want { return irBMiss("coalesce result rep") }
+  const d = irBExpr(b, n.binRight)
+  if ibMiss != "" { return d }
+  if !(d is OStr) { return irBMiss("coalesce string default") }
+  const r: Rhs = { czL: l, czD: d, czAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// The string rep a `string | null` rep `r` holds.
+function strInnerOf(r: i32): i32 {
+  const n = repNodeAt(r)
+  if n is RNullable { return n.rnInner }
+  return -1
 }
 
 // `g[k] ?? d` along legacy's helper route only (`mapGetOrHelperRoute`): a map global read
