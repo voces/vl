@@ -63,6 +63,16 @@ Notes, each of which cost something to learn:
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 
+**FUEL, PER PHASE: `VL_PROFILE_GUEST_FUEL=1` under `$VL_FUEL=1`.** Each sample then weighs the
+fuel burned since the one before, and the weights sum to the run's `[fuel] guest` total
+(`tests/vl_profile_fuel_weight_test.ts`). `vl run scripts/perf/profile-phases.vl -- <p.json>
+--fuel <n> --weighted` sums them per pipeline phase. Two runs of one seed agree to 0.01G per phase,
+where the sample shares move by a point or more with box load. `scripts/self-compile-time.sh`
+prints this split on every gate run (the pair's stage 4 is profiled this way) and under
+`--phases`. It prints, never grades: the 1% tier stays on the total. A host that predates the flag
+writes time weights; `--weighted` sees their total miss the fuel and falls back to sample shares,
+and says so.
+
 ## Comparing CPU between two seeds: interleave, and read the ranges
 
 * **Interleave the builds.** A round builds every configuration once (base seed, candidate

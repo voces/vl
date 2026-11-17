@@ -23,13 +23,19 @@
 #   scripts/self-compile-time.sh                   # grade
 #   scripts/self-compile-time.sh --write-baseline  # after a real change in cost lands
 #   scripts/self-compile-time.sh --pair <dir>      # grade the stage 4 scripts/self-compile-pair.sh built
+#   scripts/self-compile-time.sh --phases          # also print the fuel per pipeline phase
+#
+# THE PHASE SPLIT is printed, never graded: the run's fuel shared out by guest-profile sample
+# (scripts/perf/profile-phases.vl), so a rise can be read by phase. The pair's stage 4 is already
+# profiled on a `--names` seed, so `--pair` prints it free; `--phases` builds that seed first.
 set -euo pipefail
-WRITE=0; PAIR=""
+WRITE=0; PAIR=""; PHASES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --write-baseline) WRITE=1; shift ;;
     --pair) PAIR="${2:?--pair takes a directory}"; shift 2 ;;
-    *) echo "usage: scripts/self-compile-time.sh [--write-baseline] [--pair <dir>]"; exit 2 ;;
+    --phases) PHASES=1; shift ;;
+    *) echo "usage: scripts/self-compile-time.sh [--write-baseline] [--pair <dir>] [--phases]"; exit 2 ;;
   esac
 done
 cd "$(dirname "$0")/.."
@@ -62,6 +68,7 @@ if [ -n "$PAIR" ]; then
   # fresh sidecar, which is why CPU is not graded.
   [ -f "$PAIR/stage4.time" ] || { echo "missing $PAIR/stage4.time (scripts/self-compile-pair.sh --build $PAIR)"; exit 1; }
   cp "$PAIR/stage4.time" "$WORK/t"
+  [ -s "$PAIR/profile.json" ] && cp "$PAIR/profile.json" "$WORK/profile.json"
 else
 # WARM THE FUEL ENGINE'S `.cwasm` SIDECAR FIRST, untimed. A fuel engine compiles the seed to
 # different code and caches it under its own sidecar; a fresh seed has none, and Cranelift
@@ -73,7 +80,17 @@ VL_FUEL=1 timeout 600 "$VL" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compile
 # compiling the compiler. `timeout` bounds the BUILD, never the shell around it — a
 # killed shell leaves the build re-parented to init at 90% of a core (CLAUDE.md,
 # "timeout KILLS THE SHELL, NOT THE BUILD").
-{ time -p VL_FUEL=1 VL_GC_STATS=1 timeout 600 "$VL" build "$SRC" -o "$WORK/l2.wasm" --compiler "$SEED"; } \
+# Under `--phases` the build runs on the seed's `--names` build, which costs the same fuel, so its
+# profile's frames carry names; the profiler's ticks add no fuel.
+L2SEED="$SEED"; PROFENV=""
+if [ "$PHASES" = 1 ]; then
+  timeout 300 "$VL" build "$SRC" -o "$WORK/names.wasm" --names --compiler "$SEED" > /dev/null 2>&1 \
+    || { echo "--phases: the --names build failed"; exit 1; }
+  VL_FUEL=1 timeout 600 "$VL" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compiler "$WORK/names.wasm" > /dev/null 2>&1
+  L2SEED="$WORK/names.wasm"; PROFENV="VL_PROFILE_GUEST=$WORK/profile.json VL_PROFILE_GUEST_FUEL=1"
+fi
+{ time -p env VL_FUEL=1 VL_GC_STATS=1 $PROFENV \
+    timeout 600 "$VL" build "$SRC" -o "$WORK/l2.wasm" --compiler "$L2SEED"; } \
   2> "$WORK/t" || { echo "L2 self-compile FAILED (rc above; 124 is a real hang)"; cat "$WORK/t"; exit 1; }
 fi
 CPU=$(awk '/^user/{u=$2} /^sys/{s=$2} END{printf "%.1f", u + s}' "$WORK/t")
@@ -117,6 +134,10 @@ fi
 LIMIT=$(awk -v b="$BASE" -v f="$FACTOR" 'BEGIN{printf "%.0f", b * f}')
 PCT=$(awk -v c="$FUEL" -v b="$BASE" 'BEGIN{printf "%+.1f", 100 * (c - b) / b}')
 echo "L2 self-compile fuel $FUEL (${PCT}% on baseline $BASE, trips past $LIMIT = ${FACTOR}x); ${CPU}s CPU, not graded"
+if [ -s "$WORK/profile.json" ]; then
+  echo "L2 self-compile fuel by phase (printed, not graded):"
+  "$VL" run scripts/perf/profile-phases.vl -- "$WORK/profile.json" --fuel "$FUEL" --weighted 2>&1 || true
+fi
 awk -v c="$FUEL" -v l="$LIMIT" 'BEGIN{exit !(c > l)}' && {
   echo "SELF-COMPILE COST TRIPWIRE: fuel $FUEL is over ${FACTOR}x the $BASE baseline."
   echo "  Fuel is a count of guest work, so a busy box is NOT the explanation. A pass is"

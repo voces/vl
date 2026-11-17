@@ -4,7 +4,7 @@
 # through `--pair <dir>` instead of building its own compiles.
 #
 #   names  = vl build compiler/entry.vl --names --compiler $SEED
-#   stage4 = vl build compiler/entry.vl --compiler names    (VL_FUEL=1 VL_GC_STATS=1 VL_PROFILE_GUEST)
+#   stage4 = vl build compiler/entry.vl --compiler names    (VL_FUEL=1 VL_GC_STATS=1 VL_PROFILE_GUEST, fuel-weighted)
 #
 # Why this pair is enough. A `--names` build is the plain build with the `name` and `vl-src`
 # custom sections appended, so `names` runs as stage 3 does and its first bytes ARE stage 3;
@@ -35,7 +35,7 @@ build_pair() {  # $1: the directory the pair is written into
   timeout 300 "$VL" build compiler/entry.vl -o "$d/names.wasm" --names --compiler "$SEED" \
     > "$d/names.log" 2>&1 || { echo "self-compile pair: the --names build failed"; cat "$d/names.log"; return 1; }
   # `timeout` bounds the BUILD, never a shell around it (CLAUDE.md, "timeout KILLS THE SHELL").
-  { time -p VL_FUEL=1 VL_GC_STATS=1 VL_PROFILE_GUEST="$d/profile.json" \
+  { time -p VL_FUEL=1 VL_GC_STATS=1 VL_PROFILE_GUEST="$d/profile.json" VL_PROFILE_GUEST_FUEL=1 \
       timeout 600 "$VL" build compiler/entry.vl -o "$d/stage4.wasm" --compiler "$d/names.wasm"; } \
     > "$d/stage4.log" 2> "$d/stage4.time" || {
     echo "self-compile pair: stage 4 FAILED (rc above; 124 is a real hang)"; cat "$d/stage4.time"; return 1; }

@@ -4370,11 +4370,21 @@ fn arm_seed_store(store: &mut Store<()>) {
     let mut headroom = policy
         .and_then(|(initial, grow)| Some(SeedGcHeadroom::new(initial, grow?)));
     let alloc = std::env::var("VL_PROFILE_GUEST_ALLOC").is_ok_and(|v| v == "1");
+    // `VL_PROFILE_GUEST_FUEL=1` under `$VL_FUEL=1`: each sample weighs the fuel burned since the
+    // one before, written as microseconds so the weight reads as fuel. Fuel starts at `u64::MAX`
+    // and is never topped up, so the first delta is exact too.
+    let fuel = std::env::var("VL_PROFILE_GUEST_FUEL").is_ok_and(|v| v == "1");
     let mut last = resident_bytes();
+    let mut fuel_left = u64::MAX;
     store.epoch_deadline_callback(move |mut cx| {
         if let Some(p) = prof.as_ref() {
             if let Some(p) = p.lock().unwrap().as_mut() {
-                let delta = if alloc {
+                let delta = if fuel {
+                    let now = cx.get_fuel().unwrap_or(fuel_left);
+                    let used = fuel_left.saturating_sub(now);
+                    fuel_left = now;
+                    std::time::Duration::from_micros(used)
+                } else if alloc {
                     let now = resident_bytes();
                     let grew = now.saturating_sub(last);
                     last = now;
