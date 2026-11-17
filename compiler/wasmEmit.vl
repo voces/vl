@@ -441,7 +441,6 @@ import {
   ifArmValueExpr,
   letIsF32,
   parTyNode,
-  paramNulString,
   paramPosOfRead,
 } from "./emit_query"
 import {
@@ -1002,7 +1001,6 @@ import {
   asgLitWidth,
   asgReReadEnter,
   asgReReadLeave,
-  asgReReadOf,
   asgReadNode,
   asgReadUnwidenOp,
   asgYieldsNullLit,
@@ -1338,7 +1336,6 @@ import {
 } from "./emit_lit_atoms"
 import {
   criFnIsAnonLambda,
-  declaredNulString,
   fnIndexOfInScopeAt,
   memNarrowVariantIndex,
   narrowedArmTyAt,
@@ -2600,30 +2597,6 @@ function emitCloCellRef(fe: i32, fnIx: i32) {
   )
 }
 
-// The rep recovery an env-field read owes after its `struct.get`, decided by
-// `captureValKind` so the recovery cannot disagree with the field's own type. A
-// `nulstr` capture must recover to non-null here; every other nullable cell
-// recovers at its own use site instead.
-function emitCapturedReadRecover(
-  fe: i32,
-  name: string,
-  readIx: i32,
-  fnIx: i32,
-) {
-  if captureValKind(fe, name) == "nulstr" {
-    if nulStrReadRecovers(readIx, fnIx) { fbRefAsNonNull() }
-  }
-  return 0
-}
-
-// Whether a `string | null` read `readIx` in `fnIx` recovers the non-null ref: exactly when its
-// own type there excludes null. An assignment's re-read of its target is the value just stored.
-function nulStrReadRecovers(readIx: i32, fnIx: i32): boolean {
-  const asg = asgReReadOf(readIx)
-  const rt = nodeTyAt(if asg >= 0 { asg } else { unwrapParen(readIx) }, fnIx)
-  return rt >= 0 && !tyBearsNull(rt) && !isNullTy(rt)
-}
-
 // If `name` is a captured variable of the capturing function `fnIx`, read it from the env
 // struct (`ref.cast` local 0 to the env, then `struct.get` the field index) and return 1;
 // else return 0 for the caller's param/local/global path. `recoverIx` is the read to recover, -1
@@ -2643,7 +2616,6 @@ function emitCapturedRead(name: string, fnIx: i32, recoverIx: i32) {
     while fi < cnt {
       if capNamesFlat[start + fi] == name {
         emitCaptureSlotRead(fe, envIdx, fi)
-        if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
         return 1
       }
       fi = fi + 1
@@ -2655,7 +2627,6 @@ function emitCapturedRead(name: string, fnIx: i32, recoverIx: i32) {
   while ci < caps.length {
     if caps[ci] == name {
       emitCaptureSlotRead(fe, envIdx, ci)
-      if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
       return 1
     }
     ci = ci + 1
@@ -7734,16 +7705,6 @@ function emitArmFieldsFit(
   return 0
 }
 
-// The `string | null` read rule for a field of code `code`, shared by every struct and variant
-// field read and by the ident reads in `emitIdentNode`: a value read recovers the non-null ref.
-// A read typed `string | null` keeps the raw ref (`nulStrReadRecovers`).
-function emitNulStrFieldRecover(r: i32, readIx: i32, fnIx: i32) {
-  if fieldRowIsStr(r, true) && nulStrReadRecovers(readIx, fnIx) {
-    fbRefAsNonNull()
-  }
-  return 0
-}
-
 // Lower a narrowed field read `recv.field` where `recv` is narrowed to `narrowVariant` by
 // an enclosing `if recv is Variant`: evaluate the box, `struct.get $box 1`, `ref.cast (ref
 // $variant)` (non-null: a box never is), then `struct.get` the field. Resolves the variant
@@ -7765,7 +7726,6 @@ function emitNarrowedMem(memIx: i32, fnIx: i32) {
     fbStructGet(uBoxIdx, 1)
     fbRefCast(variantHeap(vi))
     fbStructGet(variantHeap(vi), idx)
-    emitNulStrFieldRecover(uFieldStart[vi] + idx, memIx, fnIx)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
     // through the home the bare-arm twin uses: an index-rooted path has no member key, so
@@ -13365,7 +13325,6 @@ function emitMemVariantRead(memIx: i32, fnIx: i32): i32 {
       }
       if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
       fbStructGet(variantHeap(pvi), pvfi) // 0xfb 0x02 <variant struct ht> <field index>
-      emitNulStrFieldRecover(uFieldStart[pvi] + pvfi, memIx, fnIx)
       // A code-16 (value-union box) field of the arm, read while its member PATH is
       // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
       // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
@@ -13388,7 +13347,6 @@ function emitMemVariantRead(memIx: i32, fnIx: i32): i32 {
       if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
       fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
       fbStructGet(variantHeap(nvi), nvfi)
-      emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
       if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
         if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
       }
@@ -13547,7 +13505,6 @@ function emitMemStructRead(memIx: i32, fnIx: i32): i32 {
     fbStructGet(sHeapIdx[si], idx) // 0xfb 0x02 <struct ht> <field index>
     const narrowOp = memReadNarrowOp(memIx, fnIx)
     if narrowOp >= 0 { wU8(narrowOp) }
-    emitNulStrFieldRecover(sFieldStart[si] + idx, memIx, fnIx)
     // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
     // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
     // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
@@ -32759,8 +32716,7 @@ function emitReturnPlainValue(
   }
   if retBoxToNulStr { emitBoxToNulStr() }
   // a return is a kind-9 use site that never grew the recover: a nullable-struct/variant
-  // read deliberately stays the raw `(ref null $S)` (`emitCapturedReadRecover`'s rule),
-  // so returning it into a non-null struct result needs its own `ref.as_non_null` or the
+  // read deliberately stays the raw `(ref null $S)`, so returning it into a non-null struct result needs its own `ref.as_non_null` or the
   // functype promises `(ref $S)` over `(ref null $S)`. A no-op on an already-recovered value.
   if retNeedsNonNullRecover(retArg, fnIx, fnPos) { fbRefAsNonNull() }
   return 0
@@ -37462,7 +37418,7 @@ function emitPrintNulString(argIx: i32, fnIx: i32) {
   fbBlock(64) // $out
   fbBlock(64) // $null
   // The RAW nullable ref: the argument is typed `string | null`, so its read stays raw
-  // (`nulStrReadRecovers`) and `br_on_null` sees the null a recovery would trap on.
+  // (`readOwesNonNullRecover`) and `br_on_null` sees the null a recovery would trap on.
   if emitExpr(argIx, fnIx) < 0 { return -1 }
   fbBrOnNull(0) // → $null (the enclosing block)
   fbLocalSet(strScratchBase + 0)
@@ -38206,14 +38162,12 @@ function emitCharLitNode(e: CharLit, _exprIx: i32, _fnIx: i32) {
   return 0
 }
 
-// Whether a read of module global `isid` at `readIx` in `fnIx` is followed by `ref.as_non_null`,
-// for an identifier read and a substituted parameter default alike. A kind-16 `string | null`
-// cell recovers when the read's type bears no null; a non-const ref cell is start-initialised,
-// so nullable in wasm, and recovers unless its kind legitimately holds null.
-export function globalReadRecovers(isid: i32, readIx: i32, fnIx: i32): boolean {
-  const gck0 = globalCellKind(globalLetOfSid(isid))
-  if gck0 == "nulstr" { return nulStrReadRecovers(readIx, fnIx) }
-  return globalNameIsNonConstSid(isid) && vkIsNonNullRef(gck0)
+// Whether a read of module global `isid` is followed by `ref.as_non_null` before the read's own
+// recovery (`readOwesNonNullRecover`): a non-const ref cell is start-initialised, so nullable in
+// wasm, and recovers unless its kind legitimately holds null.
+export function globalReadRecovers(isid: i32): boolean {
+  return globalNameIsNonConstSid(isid)
+    && vkIsNonNullRef(globalCellKind(globalLetOfSid(isid)))
 }
 
 // the densest single-identifier site in the compiler: one identifier read resolves
@@ -38260,7 +38214,7 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
     if dgIdx >= 0 {
       if emitUserGlobalGet(dgIdx) < 0 { return -1 }
       // the same recovery the argument spelling of this read gets (D3510)
-      if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
+      if globalReadRecovers(isid) { fbRefAsNonNull() }
       return 0
     }
   }
@@ -38372,7 +38326,7 @@ function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
   const gIdx = globalIndexOfSid(isid)
   if gIdx >= 0 {
     if emitUserGlobalGet(gIdx) < 0 { return -1 }
-    if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
+    if globalReadRecovers(isid) { fbRefAsNonNull() }
     return 0
   }
   return emitFail(
@@ -38398,13 +38352,6 @@ function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32) {
     return 0
   }
   fbLocalGet(idx)
-  // A `string | null` param or local recovers the non-null ref exactly when the read's own
-  // type at the instance excludes null.
-  if paramNulString(fnIx, exprIx) || declaredNulString(exprIx) {
-    if nulStrReadRecovers(exprIx, fnIx) {
-      fbRefAsNonNull() // 0xd4
-    }
-  }
   return 0
 }
 
