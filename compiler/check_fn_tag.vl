@@ -1,11 +1,17 @@
 import { tailValueLeaves } from "./check_unconsumed"
 import {
   setBindHandedSets,
+  setBindParamDeclsOf,
+  setBindSetPartial,
   setBindSetsOf,
   setBindTryClass,
   setBindTrySets,
 } from "./check_set_bind"
-import { handBackHoleIx } from "./check_hand_back"
+import {
+  handBackCallParam,
+  handBackFieldParam,
+  handBackHoleIx,
+} from "./check_hand_back"
 import { demangleName } from "./check_suggest"
 // Which sets of functions a value holds as the i32 id of its member rather than as a closure
 // (D3975). A set is tagged when some call through it needs a member's own instance, and every
@@ -436,11 +442,38 @@ export function fnTagDecide(rootIx: i32) {
         ftTry(rootIx, s, calls, mint)
       }
     }
+    // A set a read hands to a generic's function-typed parameter: each instance coerces the id
+    // at its own instantiated parameter type (D16832, D16833). Check-time only.
+    if !ftLate {
+      let ei = 0
+      while ei < escTys.length && ei < ftEscapes.length {
+        const s = fnTagSetOfTy(escTys[ei])
+        const one = fnTagMembers(s).length == 1
+        if (
+          s >= 0
+          && one == (pass == 1)
+          && !i32ListHas(seen, s)
+          && !ftHandPartial(s)
+          && ftGenFnParamHand(ftEscapes[ei])
+          && ftHandFits(s, if ei < escDsts.length { escDsts[ei] } else { -1 })
+        ) {
+          seen.push(s)
+          ftTry(rootIx, s, calls, mint)
+        }
+        ei = ei + 1
+      }
+    }
     // A set the check's own rows find a call through, where a parameter is bound to it
     // (`check_set_bind.vl`).
     for s in sbTry {
       const one = fnTagMembers(s).length == 1
-      if s >= 0 && one == (pass == 1) && !i32ListHas(seen, s) {
+      // A partial set is tried only on the arrow rule's facts, every call closed, and only where
+      // no parameter it reaches belongs to a function called through a set.
+      const openP = setBindSetPartial(s)
+        && (arrowSetOpen(s)
+        || !(ftCheckFactSets[s] ?? false)
+        || ftParamOwnerCalledThroughSet(s))
+      if s >= 0 && !openP && one == (pass == 1) && !i32ListHas(seen, s) {
         seen.push(s)
         ftTry(rootIx, s, calls, mint)
       }
@@ -641,6 +674,22 @@ function ftLateRowOf(s: i32): string {
     names = if names == "" { nm } else { names + "," + nm }
   }
   return setBindTryClass(s) + " {" + names + "}"
+}
+
+// Whether a declaration a parameter of which takes set `s` is itself a member of a set some call
+// goes through: the rows do not follow those calls, so other values may reach that parameter.
+function ftParamOwnerCalledThroughSet(s: i32): boolean {
+  const ds = setBindParamDeclsOf(s)
+  if ds.length == 0 { return false }
+  for c in fnTagCalls() {
+    const cs = fnTagCallSetOf(c)
+    if cs >= 0 {
+      for m in fnTagMembers(cs) {
+        if i32ListHas(ds, m) { return true }
+      }
+    }
+  }
+  return false
 }
 
 // The record literals the plan in progress takes as written into a holder of its set
@@ -1260,7 +1309,11 @@ function ftMintComplete(r: i32, s: i32): boolean {
   const n = nodeAt(c)
   if !(n is Call) { return false }
   const cf = parenPeelIx(n.callFn)
+  const hf = ftHandBackParam(cf)
+  if hf >= 0 { return ftHandBackCallsComplete(r, s, hf) }
   const root = ftSlotRoot(cf)
+  const hb = ftHandBackParam(root)
+  if hb >= 0 { return ftHandBackCallsComplete(r, s, hb) }
   const pd = identDeclOf(root)
   if pd < 0 || pd >= P.nodes.length { return false }
   const p = nodeAt(pd)
@@ -1284,6 +1337,37 @@ function ftMintComplete(r: i32, s: i32): boolean {
       if m is Call && identDeclOf(m.callFn) == pd {
         if ftFactSetOf(ftFactInScope(r, at)) != s { return false }
       }
+    }
+  }
+  return true
+}
+
+// The parameter callee `c` reads where a callee hands it back: a call, made with no arguments, of a
+// closure that only hands it back (`handBackCallParam`), or a record field holding it
+// (`handBackFieldParam`); -1 otherwise.
+function ftHandBackParam(c: i32): i32 {
+  const fd = if c >= 0 && c < P.nodes.length { recEnclosingFn(c) } else { -1 }
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { nodeAt(0) }
+  if !(fn is FuncDecl) { return -1 }
+  const own = handBackCallParam(c, fn)
+  return if own >= 0 { own } else { handBackFieldParam(c, fn) }
+}
+
+// `ftMintComplete` for a call through a closure handing back parameter `pd`: every call whose
+// callee reads `pd` that way has a fact of set `s` in fact row `r`'s instance.
+function ftHandBackCallsComplete(r: i32, s: i32, pd: i32): boolean {
+  const fd = recEnclosingFn(pd)
+  const fn = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { nodeAt(0) }
+  if !(fn is FuncDecl) { return false }
+  const todo: i32[] = [fn.fnBody]
+  while todo.length > 0 {
+    const x = todo.pop() ?? -1
+    if x >= 0 && x < P.nodes.length {
+      const xn = nodeAt(x)
+      if xn is Call && ftHandBackParam(parenPeelIx(xn.callFn)) == pd {
+        if ftFactSetOf(ftFactInScope(r, x)) != s { return false }
+      }
+      for k in nodeChildren(x) { todo.push(k) }
     }
   }
   return true
@@ -1640,6 +1724,41 @@ function ftSlotWriteSet(c: Call, x: i32): i32 {
   }
 }
 
+// Whether the rows found set `s` partial: a place it reaches is reached through a parameter they
+// cannot follow, so the hand-off candidate leaves it to the decision after the elaboration.
+function ftHandPartial(s: i32): boolean {
+  return setBindTryClass(s).indexOf("P") >= 0
+}
+
+// Whether every member of set `s` returns, at the parameter types of destination type `edt`, a
+// value its result takes; a set one member of which does not is left to the write's refusal.
+function ftHandFits(s: i32, edt: i32): boolean {
+  if edt < 0 || edt >= T.tys.length { return false }
+  const edf = tyAt(edt)
+  if !(edf is TyFunc) { return false }
+  return holeSetFitsRetAt(s, edf.fnParamTypes, edf.fnRet)
+}
+
+function ftGenFnParamHand(site: i32): boolean {
+  cwIxBuild()
+  const x = parenPeelIx(site)
+  if x < 0 || !cwIxCovers(x) { return false }
+  const p = cwIxUp[x]
+  const c = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+  if !(c is Call) { return false }
+  const fd = identFnDeclOf(parenPeelIx(c.callFn))
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnTyParams.length == 0 { return false }
+  let i = 0
+  while i < c.callArgs.length && i < f.fnParams.length {
+    if parenPeelIx(c.callArgs[i]) == x {
+      return tyHasTyVar(nodeTyIxOf(f.fnParams[i]))
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // Whether node `x` carries set `s`.
 function ftIsS(x: i32, s: i32): boolean {
   return x >= 0 && fnTagSetOfTy(nodeTyIxOf(x)) == s
@@ -1831,6 +1950,12 @@ function ftScan(
           }
           ftWrittenNote(wx)
           if recAsgFnWidenedTy(wx) >= 0 { ftWrittenInitNote(x, wx) }
+          // A list literal of records stored at an element of a held list of lists is built at
+          // that element, as a pushed one is (D16858).
+          const lx = nodeAt(x)
+          if lx is Index && ftWholeRecListLit(wx) {
+            ftWrittenWholeNote(wx, parenPeelIx(lx.idxArr))
+          }
         }
       }
       // A written slot of a holder of the set's ids stores an id of it, whatever type the slot

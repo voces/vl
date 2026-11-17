@@ -14,13 +14,12 @@ const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
 const POOL = 4;
 
 // The instances two of mono's keys spell, each pair with identical bodies.
-const MERGES: Record<string, string[]> = {
-  "tests/cases/closures/generic-returned-record-param.vl": ["deliver"],
-};
+const MERGES: Record<string, string[]> = {};
 // Pairs mono's own key now spells once, since a key part is a type's set id (type hash-cons
-// stage 4c): the shadow must still run there and report no merge.
+// stages 4c and 5c): the shadow must still run there and report no merge.
 const SETTLED = [
   "tests/cases/generics/instance-call-of-literal-union-field-function.vl",
+  "tests/cases/closures/generic-returned-record-param.vl",
 ];
 // Controls: instances the key must keep apart (callback specialization; one nested generic per
 // enclosing call frame; one helper handed two tagged sets of one signature).

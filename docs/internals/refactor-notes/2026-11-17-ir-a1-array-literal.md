@@ -1,21 +1,21 @@
 # IR A1: list literals through one decision and legacy's short tail, 2026-11-17
 
-Lane IR-C. I8c (`armSeat`, `atomSeat`) was next, to be taken when it leads the census. On the
-2c-2b seed it does not. Its nearest blockers hold at most 54 corpus functions alone, and the
-leaders read:
+Lanes IR-C, then IR2. I8c (`armSeat`, `atomSeat`) was next, to be taken when it leads the
+census. On the 2c-2b seed (#8934's head) it does not: its classes hold 88 (`narrowed read`) and
+15 (`string atom`) corpus functions alone. The blocker census (`$VL_IR_SHADOW=4`, 45,661
+corpus functions, 24,121 with no blocker) reads:
 
-| blocker, functions held by it alone | corpus | self-compile |
-|---|---:|---:|
-| `expression array` (list literals) | 1,048 | 604 |
-| `statement`, which a throwaway resolved to `for … in` | 395 | 407 |
-| `parameter rep record` | 456 | – |
-| `expression if` (a valued `if`) | – | 366 |
-| `list length rep` | – | 353 |
-| `wide literal` and `expression as` (one grid) | 337 each | – |
-| `member record` | – | 285 |
+| blocker, corpus functions held by it alone | functions |
+|---|---:|
+| `expression array` (list literals) | 1,048 |
+| `statement`, which a throwaway resolved to `for … in` | 458 |
+| `parameter rep record` | 456 |
+| `wide literal` and `expression as` (one grid) | 337 each |
+| `expression array` with `intrinsic none` | 1,349 |
+| `expression array` with `statement` | 682 |
 
-By the coordinator's ruling the order is list literals, then `for … in`. No other lane owns
-either in the IR. `CLAIMED` stays empty, and no emitted byte moves.
+The order is list literals, then `for … in`. No other lane owns either in the IR. `CLAIMED`
+stays empty, and no emitted byte moves.
 
 ## What landed
 
@@ -41,7 +41,7 @@ either in the IR. `CLAIMED` stays empty, and no emitted byte moves.
   pushes follow a fresh `[]`, legacy builds it at its final size and appends through locals
   (D3623).
   - `listReserveScan` is legacy's own scan, shared, and `emitListReserve` reads it.
-  - The builder holds each statement's list and position (`stmtRun`, `stmtAt`) to ask it.
+  - The builder passes each statement its list and position (`stmtAt`) to ask it.
   - Without this the first armed self-build reported 15 byte mismatches, all at a reserved
     `[]`.
 - `ArrLitArm` is registered as a closed set in `compiler/lint.vl`.
@@ -61,17 +61,40 @@ A union-element literal stops earlier, at its result rep. Two older tests change
 
 ## Coverage
 
-| reading | 2c-2b | this step | gained |
+Each tree is built from its own fixpoint seed: master after #8934, and this step.
+
+| reading | master | this step | gained |
 |---|---:|---:|---:|
-| self-compile claimed in mode 3 | 5,734 | 6,316 | +582 |
-| corpus covered = matched (12,296 cells) | 24,120 | 25,060 | +940 |
+| self-compile claimed in mode 3 | 5,747 | 6,341 | +594 |
+| self-compile covered = verified (armed) | 5,749 | 6,343 | +594 |
+| corpus covered = verified = matched (12,296 cells) | 24,121 | 25,061 | +940 |
+
+The first-miss rows that move by more than 20:
+
+| first miss | corpus | self-compile |
+|---|---|---|
+| `expression array` | 4,483 → 0 | 1,616 → 0 |
+| `statement` (`for … in`, F1) | 808 → 2,165 | 481 → 794 |
+| `intrinsic none` | 354 → 1,703 | 17 → 32 |
+| `expression as` | 674 → 1,011 | 13 → 17 |
+| `string append in place` | 3 → 340 | 93 → 114 |
+| `array ref` (a nested literal), new | 0 → 51 | 0 → 30 |
+| `declaration list reserve`, new | 0 → 42 | 0 → 24 |
+| `local rep box` | – | 2,743 → 2,884 |
+| `list length rep` | – | 2,294 → 2,406 |
+| `expression if` | – | 676 → 746 |
+
+Net compiler lines are +171 (+416, −245): 5.5 corpus functions, or 3.5 self-compile ones, per
+line.
 
 ## Bars
 
 | bar | reading |
 |---|---|
-| self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches 2c-2b already reports |
-| corpus identity against the 2c-2b seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the builder split moves no corpus byte) |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,316 claimed and byte-identical, the same 2 fallbacks; corpus 9,016 identical, 0 differ, 0 fell back |
-| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 94,398,540,067 to 94,452,105,313 (+0.06%) |
-| seed size, 2c-2b seed to this one | 6,544,190 to 6,546,352 (+2,162) |
+| self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches master already reports |
+| corpus identity against master's seed, 12,297 cells | 9,029 identical, 3,268 fail under both, 0 differ |
+| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,341 claimed and byte-identical, the same 2 fallbacks as master; corpus 9,029 identical, 0 differ, 25,048 claimed, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`) | 95,735,881,085 to 95,626,704,192 (−0.11%) |
+| seed size, master's to this one | 6,605,491 to 6,607,590 (+2,099) |
+| pin helpers in `emit_mono.vl` | 908 |
+| phase-state census | flat |
