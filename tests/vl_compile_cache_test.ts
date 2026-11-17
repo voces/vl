@@ -630,6 +630,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   repShadowReasonN: "uncached", repShadowStat: "uncached", setEmitNames: "input",
   setEmitSrcMap: "input", setHeapWindow: "input", setImportMemory: "input",
   setLowMemoryUnused: "input", setMemoryPages: "input", setOneShot: "input",
+  setTestEmitRefusal: "input",
   idShadowAt: "uncached", idShadowCount: "uncached", idShadowLen: "uncached",
   setIdShadow: "uncached", setOpaqueSNames: "input", clsCensusAt: "uncached", clsCensusCount: "uncached",
   clsCensusLen: "uncached", setClsCensus: "uncached", irShadowArm: "uncached",

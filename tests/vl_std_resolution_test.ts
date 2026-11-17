@@ -139,7 +139,7 @@ Deno.test({
           `want rc != 0 and "${want}", got ${r.code}:\n${r.text}`,
         );
       }
-      if (r.text.includes("bare specifiers")) {
+      if (r.text.includes("a bare name")) {
         throw new Error(`an absolute path is not bare:\n${r.text}`);
       }
     } finally {
@@ -170,7 +170,7 @@ Deno.test({
         const r = await check(entry, stdDir);
         const wrong = spec.startsWith("std:")
           ? r.text.includes("std:a/b")
-          : r.text.includes("bare specifiers") || r.text.includes('write "C:');
+          : r.text.includes("a bare name") || r.text.includes('write "C:');
         if (r.code === 0 || !r.text.includes(want) || wrong) {
           throw new Error(
             `${spec}: want rc != 0 and "${want}", got ${r.code}:\n${r.text}`,
@@ -188,7 +188,12 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     // `std:Fmt` (uppercase — malformed) and a bare `fmt` both hit the
-    // unsupported-specifier branch (not the std-internal guard).
+    // unsupported-specifier branch (not the std-internal guard), each with its rule.
+    const rules: Record<string, string> = {
+      "std:Fmt": "a std module is `std:` then lower-case segments",
+      "fmt":
+        'an import names a relative path ("./fmt") or a std module ("std:fmt")',
+    };
     for (const spec of ["std:Fmt", "fmt"]) {
       const { dir, stdDir, entry } = await workspace(
         {},
@@ -201,9 +206,14 @@ Deno.test({
             `\`${spec}\` should be unsupported, but check passed:\n${r.text}`,
           );
         }
-        if (!r.text.includes("Unsupported import specifier")) {
+        if (
+          !r.text.includes("Unsupported import specifier") ||
+          !r.text.includes(rules[spec])
+        ) {
           throw new Error(
-            `\`${spec}\` should report an unsupported specifier, got:\n${r.text}`,
+            `\`${spec}\` should report an unsupported specifier with "${
+              rules[spec]
+            }", got:\n${r.text}`,
           );
         }
       } finally {

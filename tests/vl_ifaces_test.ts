@@ -20,7 +20,7 @@ const CASES: { src: string; want: string[] }[] = [
     src: "function get(o) { return o.x }\nprint(get({ x: 4 }))\n",
     want: [
       "fn get('?get.0) -> '?fld.x.?get.0 hd0=1 calls=1 differ=0",
-      "instvec rows 1 calls 1 open 0 closed 1",
+      "instvec rows 1 calls 1 ufcs 0 lambda 0 fsb 0 decl 0 dup 0 open 0 closed 1",
     ],
   },
   {
