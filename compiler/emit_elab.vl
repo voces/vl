@@ -10527,6 +10527,9 @@ export function elabRun() {
   elabTyRowCol = []
   elabNarRowCol = []
   elabRowNegs = false
+  luOvNodes = []
+  luOvTys = []
+  luOvOn = 0
   elabCalleeTys = Map()
   elabNodeReps = Map()
   elabSlotTys = Map()
@@ -15484,6 +15487,58 @@ function elabTwinLamRet(lam: i32, n: i32, own: i32): i32 {
   return -1
 }
 
+// The closed signature of the wide twin of a maker that returns hole lambda `lam` whole, where the
+// instance being walked is that twin: each twin builds its own closure at the signature its calls
+// are delivered at, parameters and result alike (D16851), where twins differ in parameters or the
+// lambda `captures`. -1 otherwise, and for a maker its calls pin, whose twins instance it already.
+export function elabTwinLamSig(lam: i32, captures: boolean): i32 {
+  const p = elabWalkTop()
+  if p < 0 || p >= ekDecl.length || lam < 0 || lam >= P.nodes.length {
+    return -1
+  }
+  if elabDeclPinnedByCall(ekDecl[p]) { return -1 }
+  const w = ekRetWide[p] ?? -1
+  const f = if w >= 0 && w < T.tys.length { tyAt(w) } else { null }
+  const a = nodeAt(lam)
+  if !(f is TyFunc) || !(a is FuncDecl) || f.fnRet < 0 { return -1 }
+  if (
+    f.fnParamTypes.length != a.fnParams.length
+    || tyHasTyVar(w)
+    || tyHoldsHole(w)
+  ) {
+    return -1
+  }
+  // Two twins at the same parameters and other results key the lambda by result, which an
+  // instance at the parameters cannot tell apart, so every twin of that maker keeps that path
+  // (D16770). A lone non-capturing lambda is already built at its one twin's signature.
+  let apart = captures
+  const sibs: i32[] = []
+  for k in ekRetWide.keys() {
+    const o = if k >= 0 && k < ekDecl.length && ekDecl[k] == ekDecl[p] { ekRetWide[k] ?? -1 } else { -1 }
+    if o >= 0 && o < T.tys.length && tyAt(o) is TyFunc { sibs.push(o) }
+  }
+  for o in sibs {
+    const of = tyAt(o)
+    if of is TyFunc && !elabSameParams(f, of) { apart = true }
+    for o2 in sibs {
+      const f2 = tyAt(o2)
+      if (
+        of is TyFunc
+        && f2 is TyFunc
+        && elabSameParams(of, f2)
+        && !tySameSealed(of.fnRet, f2.fnRet)
+      ) {
+        return -1
+      }
+    }
+  }
+  if !apart { return -1 }
+  for lf in recFnValueLeaves(ekDecl[p]) {
+    if parenPeelIx(lf) == lam { return w }
+  }
+  return -1
+}
+
 // The numeric result lambda `lam` is called at (`elabLamDeliveredRet`, `own` as there), where its
 // body's closed result `body` widens to it: its instance returns the type it is called at, as a
 // lambda delivered there directly does (D16711). A narrower one is a sibling instance's (D16817).
@@ -16750,11 +16805,51 @@ function elabRetOfValues(k: i32): i32 {
   return t
 }
 
+// The per-arm read override (D16897): while a union-of-lists read is lowered for one list arm,
+// node `luOvNodes[k]` reads at `luOvTys[k]`, the innermost entry first. Empty outside it.
+let luOvNodes: i32[] = []
+let luOvTys: i32[] = []
+// Whether any override is active: the one test the hot type readers make before a lookup.
+export let luOvOn = 0
+
+// Pushes an override of node `ix` to type `ty`; returns the mark `luOvLeave` restores to.
+export function luOvEnter(ix: i32, ty: i32): i32 {
+  const mark = luOvNodes.length
+  luOvNodes.push(ix)
+  luOvTys.push(ty)
+  luOvOn = 1
+  return mark
+}
+
+// Drops every override pushed since `mark`.
+export function luOvLeave(mark: i32) {
+  while luOvNodes.length > mark {
+    luOvNodes.pop()
+    luOvTys.pop()
+  }
+  luOvOn = if luOvNodes.length > 0 { 1 } else { 0 }
+  return 0
+}
+
+// The type an active override gives node `ix`, or -1.
+export function luOvTyOf(ix: i32): i32 {
+  let k = luOvNodes.length - 1
+  while k >= 0 {
+    if luOvNodes[k] == ix { return luOvTys[k] }
+    k = k - 1
+  }
+  return -1
+}
+
 // Node `ix`'s type at the instance `fnIx` is, or -1 where its elaboration leaves it open. A
 // module-scope argument the callee's type parameters type reads at the instance the call reaches;
 // outside every instance, a call is the result of the instance it reaches. An un-annotated
 // binding left open holds its initializer's type there.
 export function elabNodeTyAt(ix: i32, fnIx: i32): i32 {
+  if luOvOn != 0 {
+    const ov = luOvTyOf(ix)
+    if ov >= 0 { return ov }
+  }
   const ct = elabCalleeTyOf(ix)
   if ct >= 0 { return ct }
   const k = if fnIx >= 0 { elabKeyAt(fnIx) } else { elabKeyAtPos(monoArgInstFe.get(ix) ?? -1) }
