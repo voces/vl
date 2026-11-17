@@ -102,6 +102,8 @@ import {
   elabTypedReadMemberAt,
   elabValueSlotUncalled,
   litRepTyAt,
+  luOvEnter,
+  luOvLeave,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -1137,6 +1139,7 @@ import {
   listIsRecvTyOf,
   litArmRowOf,
   localIndexOf,
+  luArmIndexBoxes,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
   mapReadNarrowedContainer,
@@ -1541,6 +1544,7 @@ import {
   valueUnionNameOfTy,
 } from "./emit_union_atoms"
 import {
+  SCRATCH_BY_BOTH,
   asExprHoleNumOpt,
   asExprHoleNumSad,
   asExprNumCastDomain,
@@ -1565,6 +1569,7 @@ import {
   nulNicheCastWiredTy,
   nulRefNichePayloadTy,
   numCastStashSlot,
+  scratchSlot,
   sharedFieldRecvSlot,
   unionAsBoxSlot,
   unionHasAtomK,
@@ -18826,6 +18831,8 @@ export function idxArmOf(nd: Index, fnIx: i32): IdxArm {
 
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
+  const lux = emitListUnionArmIndex(idxIx, fnIx)
+  if lux != 0 { return if lux < 0 { -1 } else { 0 } }
   if nd is Index {
     // A shared cell's read is its binding's name read respelled, so one narrowed to `null`
     // delivers that null as `emitIdentNode` does (D15951).
@@ -37366,6 +37373,8 @@ export function initBitOf(gi: i32): i32 {
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
+  luOvLocNodes = []
+  luOvLocSlots = []
   coerceHeld = -1
   irHoleIx = -1
   irHoleUses = 0
@@ -38223,6 +38232,14 @@ export function globalReadRecovers(isid: i32, readIx: i32, fnIx: i32): boolean {
 // arena index `_exprIx`, already threaded in and unused, turns the id lookup and the
 // other six into array reads.
 function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
+  // A read a union-of-lists arm overrides is that arm's unboxed list (D16897).
+  if luOvLocNodes.length > 0 {
+    const ovl = luOvLocalOf(exprIx)
+    if ovl >= 0 {
+      fbLocalGet(ovl)
+      return 0
+    }
+  }
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
   // destination's null rep from the same table a bare `null` literal does.
   if identCellVKind(exprIx, fnIx) == "nulnone" {
@@ -38719,6 +38736,11 @@ export function nullOwnIsAtom(exprIx: i32, fnIx: i32): boolean {
   return nullOwnAt(exprIx, fnIx) == NULL_OWN_ATOM
 }
 
+// Whether the `null` value node `exprIx` is `string | null`'s typed null where it is delivered.
+export function nullOwnIsStr(exprIx: i32, fnIx: i32): boolean {
+  return nullOwnAt(exprIx, fnIx) == NULL_OWN_STR
+}
+
 function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   const er = elabNodeRepAt(exprIx, fnIx)
   const st = if er >= 0 { er } else { nodeRepTyAt(exprIx, fnIx) }
@@ -39029,7 +39051,10 @@ const LU_ARM_LEN = 1
 // list arm, then the read at that arm's wrapper. 0 when `recv` is not such a box, 1 when
 // emitted, -1 when an arm has no tag or wrapper to read through.
 function emitListUnionArmRead(recv: i32, op: i32, fnIx: i32): i32 {
-  if fnIx < 0 || !exprUnion(recv, fnIx) { return 0 }
+  if fnIx < 0 { return 0 }
+  if !exprUnion(recv, fnIx) && !luArmIndexBoxes(unwrapParen(recv), fnIx) {
+    return 0
+  }
   const arms = luMembersAt(nodeTyAt(recv, fnIx))
   if arms.length == 0 { return 0 }
   const tags: i32[] = []
@@ -39087,6 +39112,132 @@ function emitListUnionArmChain(
   if emitListUnionArmChain(slot, tags, heaps, op, i + 1) < 0 { return -1 }
   fbEnd()
   return 0
+}
+
+// `recv[i]` over a union-of-lists box a pin left unrewritten (D16897): per list arm, the read
+// lowers with `recv` overridden to that arm and the result to its element, delivered into the
+// element union. 0 when `idxIx` is not such a read, 1 when emitted, -1 on failure.
+function emitListUnionArmIndex(idxIx: i32, fnIx: i32): i32 {
+  if idxIx < 0 || idxIx >= P.nodes.length || !luArmIndexBoxes(idxIx, fnIx) {
+    return 0
+  }
+  const n = nodeAt(idxIx)
+  if !(n is Index) { return 0 }
+  const recv = unwrapParen(n.idxArr)
+  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  const u = nodeTyAt(idxIx, fnIx)
+  const uName = boxTyName(u)
+  if uName == "" {
+    return emitFail(
+      "emitProgram: a union-of-lists element read has no element union box",
+    )
+  }
+  return emitListUnionArmIndexAt(idxIx, recv, arms, 0, u, uName, fnIx)
+}
+
+// The reads `emitListUnionArmIndexAt` overrides to an arm's unboxed list, and the local each
+// reads; innermost last. Empty outside a union-of-lists arm.
+let luOvLocNodes: i32[] = []
+let luOvLocSlots: i32[] = []
+
+// Overrides read `ix` to local `slot`; returns the mark `luOvLocalLeave` restores to.
+function luOvLocalEnter(ix: i32, slot: i32): i32 {
+  const mark = luOvLocNodes.length
+  luOvLocNodes.push(ix)
+  luOvLocSlots.push(slot)
+  return mark
+}
+
+// Drops every local override pushed since `mark`.
+function luOvLocalLeave(mark: i32) {
+  while luOvLocNodes.length > mark {
+    luOvLocNodes.pop()
+    luOvLocSlots.pop()
+  }
+  return 0
+}
+
+// The local an override reads `ix` from, or -1.
+function luOvLocalOf(ix: i32): i32 {
+  let k = luOvLocNodes.length - 1
+  while k >= 0 {
+    if luOvLocNodes[k] == ix { return luOvLocSlots[k] }
+    k = k - 1
+  }
+  return -1
+}
+
+// The scratch local an arm `m`'s unboxed list is held in, typed at its wrapper, or -1 for a
+// list kind with none.
+function luArmWrapLocal(m: i32): i32 {
+  if unMemIsRefElemArray(m) {
+    const rs = unMemRefArrArmSlot(m)
+    if rs < 0 { return -1 }
+    return scratchSlot(46, "reflist", rs, SCRATCH_BY_BOTH)
+  }
+  const k = boxTagOfTy(m)
+  // A boolean list rides the i32 list's wrapper.
+  if k == 7 || k == 17 || k == 18 {
+    return scratchSlot(46, "list", 0, SCRATCH_BY_BOTH)
+  }
+  if k == 8 { return scratchSlot(46, "f64list", 0, SCRATCH_BY_BOTH) }
+  if k == 9 { return scratchSlot(46, "strlist", 0, SCRATCH_BY_BOTH) }
+  if k == 10 { return scratchSlot(46, "i64list", 0, SCRATCH_BY_BOTH) }
+  if k == 12 { return scratchSlot(46, "f32list", 0, SCRATCH_BY_BOTH) }
+  return -1
+}
+
+// Arm `i` onward of `emitListUnionArmIndex`'s tag chain.
+function emitListUnionArmIndexAt(
+  idxIx: i32,
+  recv: i32,
+  arms: i32[],
+  i: i32,
+  u: i32,
+  uName: string,
+  fnIx: i32,
+): i32 {
+  if i >= arms.length {
+    fbUnreachable()
+    return 1
+  }
+  const m = arms[i]
+  const t = listIsArmTag(m)
+  const e = tyArrayElemIx(m)
+  if t < 0 || e < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no box tag or element to read",
+    )
+  }
+  const loc = luArmWrapLocal(m)
+  const heap = listArmHeapOf(m)
+  if loc < 0 || heap < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to read through",
+    )
+  }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIfRef(uBoxIdx)
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  const mark = luOvEnter(recv, m)
+  luOvEnter(idxIx, e)
+  const lmark = luOvLocalEnter(recv, loc)
+  const r = emitUnionCoerce(uName, u, idxIx, fnIx)
+  luOvLocalLeave(lmark)
+  luOvLeave(mark)
+  if r < 0 { return -1 }
+  fbElse()
+  if emitListUnionArmIndexAt(idxIx, recv, arms, i + 1, u, uName, fnIx) < 0 {
+    return -1
+  }
+  fbEnd()
+  return 1
 }
 
 // ── numeric-union dispatch ─────────────────────────────────────────────────────
@@ -41415,7 +41566,7 @@ function emitArrayCopyIntr(callIx: i32, fnIx: i32) {
 // the read to `string` (`coalesceStaysNullable`), a nullable default leaves it `string | null`.
 // It asks `exprNullableString` of the `??` node itself, since the checker's banked type is
 // missing on a synthesized node (a chained `p ?? q ?? r` re-associates through `mkBinary`).
-function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
+export function coalesceNulStrStaysNullable(exprIx: i32, fnIx: i32) {
   return exprNullableString(exprIx, fnIx)
 }
 
@@ -41757,12 +41908,11 @@ function emitCoalesceNulRefCtx(
       exprIx,
     )
   }
-  // blocktype `(ref null $heapIx)` keeps the result nullable; `(ref $heapIx)` is non-null.
-  fbBlockRefNul(heapIx, nulBlock)
+  coalNulRefOpen(heapIx, nulBlock)
   if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
-  fbBrOnNonNull(0) // non-null → branch to the block end with the (ref $heapIx)
+  coalNulRefBranch()
   if isSTy(heapIx) && exprIsLitAtom(e.binRight, fnIx) {
     if emitCoalesceAtomStrDefault(e.binRight, nulBlock, fnIx) < 0 { return -1 }
   } else {
@@ -41770,6 +41920,39 @@ function emitCoalesceNulRefCtx(
   }
   fbEnd() // 0x0b end
   return 0
+}
+
+// Before a nullable ref `??`'s operand: the block whose type is `(ref null $heapIx)` for
+// `nulBlock`, which keeps the result nullable, else `(ref $heapIx)`.
+export function coalNulRefOpen(heapIx: i32, nulBlock: boolean): i32 {
+  fbBlockRefNul(heapIx, nulBlock)
+  return 0
+}
+
+// After a nullable ref `??`'s operand: a non-null ref branches to the block's end, so the default
+// that follows runs only on `null`.
+export function coalNulRefBranch(): i32 {
+  fbBrOnNonNull(0)
+  return 0
+}
+
+// Whether `l ?? d` over a `string | null` (`coalNicheArmOf`'s `str`) is the plain block: no union
+// box joins the default, no record or list default diverts it, and the default is no
+// literal-union atom, which is widened to its member string.
+export function coalNulStrBlockPlain(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  if coalesceNicheJoinsToBox(exprIx, fnIx) { return false }
+  if (
+    tyIsStructBearingUnion(nodeTyIxOf(exprIx))
+    && !coalesceResultIsBox(exprIx, fnIx)
+  ) {
+    return false
+  }
+  if coalListDefaultClash(e, fnIx) { return false }
+  return !exprIsLitAtom(e.binRight, fnIx)
 }
 
 // The default of a `string | null` `??` when it is a literal-union atom (`K` or `K | null`):
@@ -42513,11 +42696,47 @@ function emitCoalesceCallArm(
   return emitPopOr(lhsIx, e.binRight, fnIx)
 }
 
+// The nullable-rep arm of `l ?? d` once `coalArmOf` names `niche`, in `emitCoalesceNiche`'s
+// order: the `boolean | null` select (boxed when the default joins), the `K | null` sentinel,
+// its widening to a string, a nullable collection, a nullable closure, `string | null`, and the
+// boxed operands (`identBox`).
+export type CoalNicheArm = "nulBoolJoin"
+  | "nulBool"
+  | "litUnion"
+  | "nulAtomStr"
+  | "coll"
+  | "clo"
+  | "str"
+  | "identBox"
+export function coalNicheArmOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNicheArm {
+  const nb = exprNulBool(e.binLeft, fnIx)
+  if nb && coalesceNicheJoinsToBox(exprIx, fnIx) { return "nulBoolJoin" }
+  // A call operand of `boolean | null` cannot be re-read; it takes a later arm.
+  if nb && !coalLhsIsCall(lhsIx) { return "nulBool" }
+  if coalesceLitUnionFits(exprIx, fnIx) { return "litUnion" }
+  if coalesceNulAtomToStr(exprIx, fnIx) { return "nulAtomStr" }
+  if nulCollWrapHeap(e.binLeft, fnIx) >= 0 { return "coll" }
+  if exprNulClosure(e.binLeft, fnIx) { return "clo" }
+  if exprNullableString(e.binLeft, fnIx) { return "str" }
+  return "identBox"
+}
+
+// Whether node `ix` is a call.
+function coalLhsIsCall(ix: i32): boolean {
+  return ix >= 0 && nodeAt(ix) is Call
+}
+
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   const lhs = nodeAt(lhsIx)
+  const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
   // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
   // and in the else arm for the string), so they apply only to an effect-free place —
   // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
@@ -42538,10 +42757,8 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // when the lhs is null. `select` evaluates both value operands unconditionally, so a
   // side-effecting default would run on the present path too — the same lowering the `K |
   // null` niche, the `string | null` niche and every nullable-ref rep already use.
-  if exprNulBool(e.binLeft, fnIx) && coalesceNicheJoinsToBox(exprIx, fnIx) {
-    return emitCoalesceNulBoolJoin(e, exprIx, fnIx)
-  }
-  if !(lhs is Call) && exprNulBool(e.binLeft, fnIx) {
+  if arm == "nulBoolJoin" { return emitCoalesceNulBoolJoin(e, exprIx, fnIx) }
+  if arm == "nulBool" {
     if emitExpr(e.binLeft, fnIx) < 0 {
       return -1 // the niche i32
     }
@@ -42574,7 +42791,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // A branching `if`, not a `select`: `select` evaluates both value operands, so a
   // side-effecting default would run on the present path. The `if` framing costs three bytes
   // more per site; a call lhs is stashed once in the shared i32 coalesce-call slot.
-  if coalesceLitUnionFits(exprIx, fnIx) {
+  if arm == "litUnion" {
     // The operand reads at the niche its classifier names, so a prelude join builds the atom.
     if (emitExpr(e.binLeft, fnIx) < 0) {
       return -1 // the niche i32, evaluated ONCE
@@ -42600,19 +42817,16 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   }
   // `<e> ?? d` over a `K | null` niche whose default is not a member: the result is a
   // `string`, so the atom is evaluated once and the present arm widens it (D3198).
-  if coalesceNulAtomToStr(exprIx, fnIx) {
-    return emitCoalesceNulAtomStr(e, fnIx)
-  }
+  if arm == "nulAtomStr" { return emitCoalesceNulAtomStr(e, fnIx) }
   // `<e> ?? d` over a nullable collection niche (`i32[] | null`, `string[] | null` /
   // `f64[] | null` / `i64[] | null` / `f32[] | null`, `i32[][] | null` / `S[] | null`): the
   // cell is a `(ref null $wrapper)`, so it takes the same `br_on_non_null` lowering as the
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
-  const cnclw = nulCollWrapHeap(e.binLeft, fnIx)
-  if cnclw >= 0 { return emitCoalesceNulRef(e, exprIx, cnclw, fnIx) }
-  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
-  if exprNulClosure(e.binLeft, fnIx) {
-    return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx)
+  if arm == "coll" {
+    return emitCoalesceNulRef(e, exprIx, nulCollWrapHeap(e.binLeft, fnIx), fnIx)
   }
+  // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
+  if arm == "clo" { return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx) }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -42622,7 +42836,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // and the default follows the block type (`coalesceNulStrArmCtx`). Ungated on
   // re-readability: the core evaluates the operand ONCE, so a CALL takes this arm too —
   // gated, it fell past every niche to a lowering with the wrong heap (D1763).
-  if exprNullableString(e.binLeft, fnIx) {
+  if arm == "str" {
     const coNul = coalesceNulStrStaysNullable(exprIx, fnIx)
     return emitCoalesceNulRefCtx(e, exprIx, sTy(), coNul, fnIx)
   }
