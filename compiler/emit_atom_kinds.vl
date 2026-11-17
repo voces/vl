@@ -94,32 +94,14 @@ import {
   tyPackedRow,
 } from "./emit_rep"
 import {
-  FC_CLOSURE,
-  FC_F32,
-  FC_F64,
   FC_I32,
   FC_I32_LIST,
-  FC_I64,
-  FC_MAP,
-  FC_NUL_CLOSURE,
-  FC_NUL_LIT_UNION,
-  FC_NUL_MAP,
-  FC_NUL_NONE,
-  FC_NUL_REF_LIST,
-  FC_NUL_STR,
-  FC_NUL_U8_LIST,
-  FC_REF_LIST,
-  FC_STR,
-  FC_STRUCT,
-  FC_U8_LIST,
-  FC_UNION,
   VKind,
   armFieldElemName,
   armFieldElemTyIx,
+  armFieldNames,
   armFieldStoreTy,
-  armFieldTypes,
   armStageStoreTy,
-  armStageTypes,
   fnStmts,
   sAnonOwnTy,
   sFieldCount,
@@ -128,7 +110,6 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldStoreTy,
-  sFieldTypes,
   sIsRefRow,
   sNames,
   sTyIx,
@@ -141,12 +122,7 @@ import { nonNullTy, tyHasTyVar } from "./tyquery"
 // The wasm-type code (`0` i32, `3` string, `4` i32-list, `5` ref-list) of struct `si`'s
 // field at field index `fi`.
 export function sFieldTypeAt(si: i32, fi: i32) {
-  return fieldCodeIn(
-    sFieldTypes,
-    sFieldStoreTy,
-    sFieldStart[si] + fi,
-    "sFieldTypeAt",
-  )
+  return fieldCodeIn(sFieldStoreTy, sFieldStart[si] + fi, "sFieldTypeAt")
 }
 
 // The flat field row of struct `si`'s field `fi`, or -1 when either is off the table.
@@ -164,89 +140,82 @@ function fieldRowStoreRep(r: i32): RepDesc | null {
   return rowStoreRepIn(sFieldStoreTy, r)
 }
 
-// The field code of flat row `r`, or -1 for no row.
-function fieldRowCode(r: i32): i32 {
-  if r < 0 || r >= sFieldTypes.length { return -1 }
-  return fieldCodeIn(sFieldTypes, sFieldStoreTy, r, "fieldRowCode")
+// False for flat row `r`, whose storage has no covered rep: a row that exists fails loudly
+// (`fieldCodeIn`), and no row answers false.
+function fieldRowNoRep(r: i32): boolean {
+  if r >= 0 && r < sFieldNames.length {
+    fieldCodeIn(sFieldStoreTy, r, "fieldRowCode")
+  }
+  return false
 }
 
 // Whether flat field row `r` holds the union box.
 export function fieldRowIsUnionBox(r: i32): boolean {
   const d = fieldRowStoreRep(r)
-  if d == null { return fieldRowCode(r) == FC_UNION }
+  if d == null { return fieldRowNoRep(r) }
   return d.rdKind == "union"
 }
 
 // Whether flat field row `r` holds a non-null `i32`: a number, a boolean or an atom.
 export function fieldRowIsPlainI32(r: i32): boolean {
   const d = fieldRowStoreRep(r)
-  if d == null { return fieldRowCode(r) == FC_I32 }
+  if d == null { return fieldRowNoRep(r) }
   return d.rdKind == "i32" && d.rdNul == 0
 }
 
 // Whether flat field row `r` holds a record ref.
 export function fieldRowIsRecordRef(r: i32): boolean {
   const d = fieldRowStoreRep(r)
-  if d == null { return fieldRowCode(r) == FC_STRUCT }
+  if d == null { return fieldRowNoRep(r) }
   return d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
 }
 
 // Whether flat field row `r` holds only `null` (the `null` unit's `nullref` slot).
 export function fieldRowIsNulNone(r: i32): boolean {
   const d = fieldRowStoreRep(r)
-  if d == null { return fieldRowCode(r) == FC_NUL_NONE }
+  if d == null { return fieldRowNoRep(r) }
   return d.rdKind == "nulnone"
 }
 
 // Whether flat field row `r` holds a string, non-null (`nul` false) or `string | null` (true).
 export function fieldRowIsStr(r: i32, nul: boolean): boolean {
-  return strOfRep(fieldRowStoreRep(r), fieldRowCode(r), nul)
+  const d = fieldRowStoreRep(r)
+  if d == null { return fieldRowNoRep(r) }
+  return strOfRep(d, nul)
 }
 
 // Whether flat field row `r` holds a closure, non-null (`nul` false) or nullable (true).
 export function fieldRowIsClosure(r: i32, nul: boolean): boolean {
   const d = fieldRowStoreRep(r)
-  if d == null {
-    const want = if nul { FC_NUL_CLOSURE } else { FC_CLOSURE }
-    return fieldRowCode(r) == want
-  }
+  if d == null { return fieldRowNoRep(r) }
   return if nul { d.rdKind == "nulclosure" } else { d.rdKind == "closure" }
 }
 
 // Whether flat field row `r` holds a map, non-null (`nul` false) or nullable (true).
 export function fieldRowIsMap(r: i32, nul: boolean): boolean {
   const d = fieldRowStoreRep(r)
-  if d == null {
-    const want = if nul { FC_NUL_MAP } else { FC_MAP }
-    return fieldRowCode(r) == want
-  }
+  if d == null { return fieldRowNoRep(r) }
   return if nul { d.rdKind == "nulmap" } else { d.rdKind == "map" }
 }
 
-// `fieldRowIsStr` of a field with covered storage rep `d` and field code `code`.
-function strOfRep(d: RepDesc | null, code: i32, nul: boolean): boolean {
-  if d == null {
-    const want = if nul { FC_NUL_STR } else { FC_STR }
-    return code == want
-  }
+// `fieldRowIsStr` of a field with covered storage rep `d`.
+function strOfRep(d: RepDesc, nul: boolean): boolean {
   return if nul { d.rdKind == "nulstr" } else { d.rdKind == "str" }
 }
 
 // The numeric scalar kind flat field row `r` holds (0 a plain `i32`, 3 `i64`, 4 `f64`, 5 `f32`),
 // or -1 for any other storage.
 export function fieldRowNumKind(r: i32): i32 {
-  return numKindOfRep(fieldRowStoreRep(r), fieldRowCode(r))
-}
-
-// `fieldRowNumKind` of a field with covered storage rep `d` and field code `code`.
-function numKindOfRep(d: RepDesc | null, code: i32): i32 {
+  const d = fieldRowStoreRep(r)
   if d == null {
-    if code == FC_I32 { return 0 }
-    if code == FC_I64 { return 3 }
-    if code == FC_F64 { return 4 }
-    if code == FC_F32 { return 5 }
+    fieldRowNoRep(r)
     return -1
   }
+  return numKindOfRep(d)
+}
+
+// `fieldRowNumKind` of a field with covered storage rep `d`.
+function numKindOfRep(d: RepDesc): i32 {
   match d.rdKind {
     "i32" => {
       return if d.rdNul == 0 { 0 } else { -1 }
@@ -277,50 +246,58 @@ export function variantFieldIsUnionBox(vi: i32, fi: i32): boolean {
   return armRowIsUnionBox(uFieldStart[vi] + fi)
 }
 
-// The field code of arm-table flat row `r`, or -1 for no row.
-function armRowCode(r: i32): i32 {
-  const codes = armFieldTypes()
-  if r < 0 || r >= codes.length { return -1 }
-  return fieldCodeIn(codes, armFieldStoreTy(), r, "armRowCode")
+// `fieldRowNoRep` of arm-table flat row `r`.
+function armRowNoRep(r: i32): boolean {
+  if r >= 0 && r < armFieldNames().length {
+    fieldCodeIn(armFieldStoreTy(), r, "armRowCode")
+  }
+  return false
 }
 
 // Whether arm-table flat row `r` holds the union box.
 export function armRowIsUnionBox(r: i32): boolean {
   const d = rowStoreRepIn(armFieldStoreTy(), r)
-  if d == null { return armRowCode(r) == FC_UNION }
+  if d == null { return armRowNoRep(r) }
   return d.rdKind == "union"
 }
 
 // Whether arm-table flat row `r` holds a non-null `i32`: a number, a boolean or an atom.
 export function armRowIsPlainI32(r: i32): boolean {
-  return numKindOfRep(rowStoreRepIn(armFieldStoreTy(), r), armRowCode(r)) == 0
+  const d = rowStoreRepIn(armFieldStoreTy(), r)
+  if d == null { return armRowNoRep(r) }
+  return numKindOfRep(d) == 0
 }
 
 // Whether arm-table flat row `r` holds a string, non-null (`nul` false) or `string | null`.
 export function armRowIsStr(r: i32, nul: boolean): boolean {
-  return strOfRep(rowStoreRepIn(armFieldStoreTy(), r), armRowCode(r), nul)
+  const d = rowStoreRepIn(armFieldStoreTy(), r)
+  if d == null { return armRowNoRep(r) }
+  return strOfRep(d, nul)
 }
 
 // Whether flat field row `r` holds the `K | null` niche: an `i32` atom id with `-1` for null.
 export function fieldRowIsNulAtom(r: i32): boolean {
-  return nulAtomOfRep(fieldRowStoreRep(r), fieldRowCode(r))
+  const d = fieldRowStoreRep(r)
+  if d == null { return fieldRowNoRep(r) }
+  return nulAtomOfRep(d)
 }
 
 // `fieldRowIsNulAtom` of arm-table flat row `r`.
 export function armRowIsNulAtom(r: i32): boolean {
-  return nulAtomOfRep(rowStoreRepIn(armFieldStoreTy(), r), armRowCode(r))
+  const d = rowStoreRepIn(armFieldStoreTy(), r)
+  if d == null { return armRowNoRep(r) }
+  return nulAtomOfRep(d)
 }
 
-// `fieldRowIsNulAtom` of a field with covered storage rep `d` and field code `code`.
-function nulAtomOfRep(d: RepDesc | null, code: i32): boolean {
-  if d == null { return code == FC_NUL_LIT_UNION }
+// `fieldRowIsNulAtom` of a field with covered storage rep `d`.
+function nulAtomOfRep(d: RepDesc): boolean {
   return d.rdKind == "i32" && d.rdNul != 0
 }
 
 // Whether arm-table flat row `r` holds a record ref, as `fieldRowIsRecordRef` asks it.
 export function armRowIsRecordRef(r: i32): boolean {
   const d = rowStoreRepIn(armFieldStoreTy(), r)
-  if d == null { return armRowCode(r) == FC_STRUCT }
+  if d == null { return armRowNoRep(r) }
   return d.rdKind == "nulstruct" || d.rdKind == "nulvariant"
 }
 
@@ -331,18 +308,25 @@ export function variantFieldIsNulStr(vi: i32, fi: i32): boolean {
 
 // `fieldRowIsStr` of variant `vi`'s field `fi`.
 export function variantFieldIsStr(vi: i32, fi: i32, nul: boolean): boolean {
-  return strOfRep(variantFieldStoreRep(vi, fi), variantFieldTypeAt(vi, fi), nul)
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null { return armRowNoRep(uFieldStart[vi] + fi) }
+  return strOfRep(d, nul)
 }
 
 // `fieldRowNumKind` of variant `vi`'s field `fi`.
 export function variantFieldNumKind(vi: i32, fi: i32): i32 {
-  return numKindOfRep(variantFieldStoreRep(vi, fi), variantFieldTypeAt(vi, fi))
+  const d = variantFieldStoreRep(vi, fi)
+  if d == null {
+    armRowNoRep(uFieldStart[vi] + fi)
+    return -1
+  }
+  return numKindOfRep(d)
 }
 
 // Whether variant `vi`'s field `fi` holds only `null`.
 export function variantFieldIsNulNone(vi: i32, fi: i32): boolean {
   const d = variantFieldStoreRep(vi, fi)
-  if d == null { return variantFieldTypeAt(vi, fi) == FC_NUL_NONE }
+  if d == null { return armRowNoRep(uFieldStart[vi] + fi) }
   return d.rdKind == "nulnone"
 }
 
@@ -359,47 +343,25 @@ export function variantFieldStorageKind(vi: i32, fi: i32): VKind | null {
 // Whether flat field rows `a` and `b` are stored alike: the same kind and null discipline, or the
 // same field code where either has only its code.
 export function fieldRowsStoreAlike(a: i32, b: i32): boolean {
-  return rowsStoreAlikeIn(
-    sFieldStoreTy,
-    sFieldTypes,
-    a,
-    sFieldStoreTy,
-    sFieldTypes,
-    b,
-  )
+  return rowsStoreAlikeIn(sFieldStoreTy, a, sFieldStoreTy, b)
 }
 
 // `fieldRowsStoreAlike` of arm-table flat rows `a` and `b`.
 export function armRowsStoreAlike(a: i32, b: i32): boolean {
   const tys = armFieldStoreTy()
-  const codes = armFieldTypes()
-  return rowsStoreAlikeIn(tys, codes, a, tys, codes, b)
+  return rowsStoreAlikeIn(tys, a, tys, b)
 }
 
 // Whether staged arm row `a` is stored as struct-table flat row `b` is.
 export function armStageRowStoredAsField(a: i32, b: i32): boolean {
-  return rowsStoreAlikeIn(
-    armStageStoreTy,
-    armStageTypes,
-    a,
-    sFieldStoreTy,
-    sFieldTypes,
-    b,
-  )
+  return rowsStoreAlikeIn(armStageStoreTy, a, sFieldStoreTy, b)
 }
 
 // The table a field's storage slot names: a struct row, a map shape, a ref-list row, or none.
 type FieldSlotTable = "struct" | "map" | "reflist" | "packed" | "none"
 
-// `FieldSlotTable` of a field stored at `kind`, or of field code `code` where the kind is null.
-function fieldSlotTableOf(kind: VKind | null, code: i32): FieldSlotTable {
-  if kind == null {
-    if code == FC_STRUCT { return "struct" }
-    if code == FC_MAP || code == FC_NUL_MAP { return "map" }
-    if code == FC_REF_LIST || code == FC_NUL_REF_LIST { return "reflist" }
-    if code == FC_U8_LIST || code == FC_NUL_U8_LIST { return "packed" }
-    return "none"
-  }
+// `FieldSlotTable` of a field stored at `kind`.
+function fieldSlotTableOf(kind: VKind): FieldSlotTable {
   match kind {
     "struct" | "nulstruct" | "variant" | "nulvariant" => {
       return "struct"
@@ -435,15 +397,22 @@ export function variantFieldPackedRow(vi: i32, fi: i32): i32 {
 
 // The table flat field row `r`'s storage slot names.
 export function fieldRowSlotTable(r: i32): FieldSlotTable {
-  return fieldSlotTableOf(fieldRowStorageKind(r), fieldRowCode(r))
+  const k = fieldRowStorageKind(r)
+  if k == null {
+    fieldRowNoRep(r)
+    return "none"
+  }
+  return fieldSlotTableOf(k)
 }
 
 // The table variant `vi`'s field `fi`'s storage slot names.
 export function variantFieldSlotTable(vi: i32, fi: i32): FieldSlotTable {
-  return fieldSlotTableOf(
-    variantFieldStorageKind(vi, fi),
-    variantFieldTypeAt(vi, fi),
-  )
+  const k = variantFieldStorageKind(vi, fi)
+  if k == null {
+    armRowNoRep(uFieldStart[vi] + fi)
+    return "none"
+  }
+  return fieldSlotTableOf(k)
 }
 
 // Whether variant `vi`'s field `fi` holds a record ref.
@@ -1365,7 +1334,6 @@ export function listGetStagesOperand(ix: i32): boolean {
 // The wasm-type code (`0` i32, `3` string) of variant `vi`'s field at field index `fi`.
 export function variantFieldTypeAt(vi: i32, fi: i32) {
   return fieldCodeIn(
-    armFieldTypes(),
     armFieldStoreTy(),
     uFieldStart[vi] + fi,
     "variantFieldCode",
