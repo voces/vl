@@ -20,15 +20,15 @@ import { idShadowModeOf } from "./id_shadow_state"
 import { elabFnSetOf, elabTyClosed } from "./check_elab_cap"
 import { recEnclosingFn } from "./check_fit_rules"
 import {
+  elabReadNames,
   mfrChainFns,
-  mfrElabNames,
   mfrLitsDirectFn,
   mfrLitsExprOf,
   mfrLitsMapReadFn,
   mfrLitsMapStored,
   mfrLitsOf,
-  mfrShadowNote,
-} from "./mfr_shadow"
+} from "./elab_reads"
+import { mfrShadowNote } from "./mfr_shadow"
 import {
   LC_CHAIN_LONG,
   lamCellOf,
@@ -13907,7 +13907,7 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   const call = if monoFlowCalledAt(x) { mfrParentOf(x) } else { -1 }
   if repShadowOn { mfrShadowNote(x, g, call) }
   // The generic is the elaboration's; the walkers that chose `g` only gate which reads are asked.
-  if !mfrElabNames(x, g, call) { return false }
+  if !elabReadNames(x, g, call) { return false }
   // A read of a tagged set is its member id, which no name read can carry.
   if fnTagTyIsTagged(nodeTyIxOf(x)) { return false }
   const nm = monoFlowLeafName(g)
@@ -15164,7 +15164,9 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
   if rt < 0 || !monoLetWritesAt(d, at, ctx, rt) { return 0 }
   // Each record literal a write stores takes the slot fact `monoLetWritesAt` compared.
   if d.letKw != "const" {
-    const st = elabSlotTyAt(at, [], ctx)
+    // The binding's type where it keeps a tagged set the slot fact closed (`monoLetWritesAt`).
+    const st0 = elabSlotTyAt(at, [], ctx)
+    const st = if tySameSealed(st0, rt) { st0 } else { rt }
     for w in monoLetWholeWrites(at) {
       const wb = nodeAt(w)
       if wb is BinExpr && wb.binOp == "=" {
@@ -15323,6 +15325,7 @@ function monoPinObjFields(
   const tys: i32[] = []
   for t in o.objFieldTypes { tys.push(t) }
   let any = false
+  let keptTag = false
   for fi in lit.objFields {
     const f = nodeAt(fi)
     if f is FieldInit {
@@ -15330,7 +15333,9 @@ function monoPinObjFields(
       while k < o.objFieldNames.length && o.objFieldNames[k] != f.fiName {
         k = k + 1
       }
-      if k < tys.length && monoTyOpen(tys[k]) {
+      // A field holding a tagged set keeps it: its literal and its reads store the set's ids.
+      if k < tys.length && fnTagHoldsTy(tys[k]) { keptTag = true }
+      if k < tys.length && monoTyOpen(tys[k]) && !fnTagHoldsTy(tys[k]) {
         let path = f.fiName
         if pre != "" { path = pre + "." + f.fiName }
         const nt = monoPinFieldValue(
@@ -15353,7 +15358,8 @@ function monoPinObjFields(
   if !any { return -1 }
   // The record's type is the elaboration's slot fact; a record whose generic is called at two
   // signatures has none, and keeps the type its fields give (D15494).
-  const st = elabSlotTyAt(at, monoSlotPath(pre, []), ctx)
+  // A field left at its tagged set is not the slot fact's, which closed it.
+  const st = if keptTag { -1 } else { elabSlotTyAt(at, monoSlotPath(pre, []), ctx) }
   return if st >= 0 { st } else { mkObjTy(o.objFieldNames, tys) }
 }
 
@@ -15581,7 +15587,35 @@ function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
 function monoLetWritesAt(d: LetDecl, at: i32, ctx: i32, t: i32): boolean {
   if d.letKw == "const" { return true }
   const et = elabSlotTyAt(at, [], ctx)
-  if et < 0 || !tySameSealed(et, t) { return false }
+  if et < 0 { return false }
+  // A record the slot fact closed only at fields `t` keeps a tagged set at is the same record.
+  if !tySameSealed(et, t) {
+    const a = if et < T.tys.length { tyAt(et) } else { null }
+    const b = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+    if (
+      !(a is TyObj)
+      || !(b is TyObj)
+      || a.objFieldNames.length != b.objFieldNames.length
+    ) {
+      return false
+    }
+    let i = 0
+    while i < b.objFieldNames.length {
+      let j = 0
+      while (
+        j < a.objFieldNames.length
+        && a.objFieldNames[j] != b.objFieldNames[i]
+      ) {
+        j = j + 1
+      }
+      if j == a.objFieldNames.length { return false }
+      const bt = b.objFieldTypes[i]
+      if !fnTagHoldsTy(bt) && !tySameSealed(a.objFieldTypes[j], bt) {
+        return false
+      }
+      i = i + 1
+    }
+  }
   if t < T.tys.length && tyAt(t) is TyMap {
     for w in monoLetWholeWrites(at) {
       const fx = monoLetWriteFreshMap(w)

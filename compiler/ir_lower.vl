@@ -47,6 +47,7 @@ import {
   i32ToStr,
   nodeAt,
 } from "./ast"
+import { unwrapParen } from "./emit_base"
 import {
   IrFn,
   OImm,
@@ -71,6 +72,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapGetOr,
   RMapOp,
   RNulTest,
   RNullOf,
@@ -142,12 +144,18 @@ import {
   GlobalCtx,
   atomEqPlanOf,
   atomEqTail,
+  coalResultKindOf,
   emitBoxAroundHole,
   emitFoldedConstRead,
   emitNullAt,
   emitStaticLitAtom,
   emitStrLitAt,
   initBitOf,
+  mapGetHelperFnOf,
+  mapGetOrHelperRoute,
+  mapRecvKeyTail,
+  mapRecvRefTail,
+  mapRecvShapeOf,
   nulTestAtomTail,
   numWidenTail,
   uBoxNewIsLast,
@@ -396,22 +404,8 @@ function rhs(r: Rhs, tail: boolean) {
   match r {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
-    RGlobalGet => {
-      match userGlobalReadClass(r.ggSym, lwGlobalCtx) {
-        "plain" => {
-          if !globalMinted(r.ggSym) { return irLMiss("global index") }
-          leaf()
-          fbGlobalGet(userGlobalIdx(r.ggSym))
-          if r.ggNonNull { fbRefAsNonNull() }
-        }
-        "fold" => {
-          leaf()
-          emitFoldedConstRead(r.ggSym)
-        }
-        "promo" => irLMiss("promoted global read")
-        "guard" => irLMiss("guarded global read")
-      }
-    }
+    RGlobalGet => globalRead(r.ggSym, r.ggNonNull)
+    RMapGetOr => mapGetOr(r)
     RListGet | RListLen | RListPush | RStrOp => irLowerListHook(r)
     RListPop => irLMiss("pop value")
     RNumWiden => {
@@ -431,6 +425,51 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RCallRef | RCallHost | RTest | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RMapOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
   }
+}
+
+// A read of user global `sym`, recovered to non-null for `nonNull`, as legacy reads its class.
+function globalRead(sym: i32, nonNull: boolean) {
+  match userGlobalReadClass(sym, lwGlobalCtx) {
+    "plain" => {
+      if !globalMinted(sym) { return irLMiss("global index") }
+      leaf()
+      fbGlobalGet(userGlobalIdx(sym))
+      if nonNull { fbRefAsNonNull() }
+    }
+    "fold" => {
+      leaf()
+      emitFoldedConstRead(sym)
+    }
+    "promo" => irLMiss("promoted global read")
+    "guard" => irLMiss("guarded global read")
+  }
+  return 0
+}
+
+// `RMapGetOr`: legacy's `__map_get_<row>__` helper minted first, then the global, its recovery,
+// the key and the op context, then the call, as `emitMapGetCall` writes them.
+function mapGetOr(r: RMapGetOr) {
+  const fnIx = lw.irAt
+  if r.mgAt < 0 { return irLMiss("map read node") }
+  const e = nodeAt(r.mgAt)
+  if !(e is BinExpr) { return irLMiss("map read node") }
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 { return irLMiss("map read node") }
+  const rd = nodeAt(lhsIx)
+  if !(rd is Index) { return irLMiss("map read node") }
+  const rk = coalResultKindOf(r.mgAt, fnIx)
+  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
+  if miss.length != 1 { return irLMiss("map read route") }
+  if userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map read of a global not read plainly")
+  }
+  const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
+  globalRead(r.mgSym, r.mgNonNull)
+  mapRecvRefTail(rd.idxArr, fnIx)
+  irLOpnd(r.mgKey)
+  mapRecvKeyTail(mapRecvShapeOf(rd.idxArr, fnIx))
+  fbCall(fi)
+  return 0
 }
 
 // `RAtomEq`: each side as itself, or a static side through legacy's own literal writer spelled as

@@ -71,10 +71,15 @@ import {
   binNumWidth,
   boxOwedAt,
   callEndsNever,
+  coalArmOf,
+  coalResultKindOf,
   deadNullTestOperand,
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  mapGetOrHelperRoute,
+  mapKeyArmOf,
+  mapRecvShapeOf,
   nulNoneEqSides,
   nulTestArmOf,
   nullOwnIsAtom,
@@ -89,6 +94,7 @@ import {
 import {
   RAtom,
   RList,
+  RMap,
   RNullable,
   repNodeAt,
   repNodeGen,
@@ -841,6 +847,60 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
+// `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
+function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const arm = coalArmOf(n, ix, ibFnIx)
+  if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
+  return mapGetOr(b, n, ix, rep)
+}
+
+// `g[k] ?? d` along legacy's helper route only (`mapGetOrHelperRoute`): a map global read
+// plainly, a key written as itself (`mapKeyArmOf`), and an i32 default the helper's miss holds.
+function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  if lhsIx < 0 { return irBMiss("map read") }
+  const rd = nodeAt(lhsIx)
+  if !(rd is Index) { return irBMiss("map read") }
+  const rk = coalResultKindOf(ix, ibFnIx)
+  if mapGetOrHelperRoute(rd.idxArr, n.binRight, ibFnIx, rk).length != 1 {
+    return irBMiss("map read inline")
+  }
+  const ka = mapKeyArmOf(
+    rd.idxArr,
+    rd.idxIndex,
+    ibFnIx,
+    mapRecvShapeOf(rd.idxArr, ibFnIx),
+  )
+  if ka != "plain" { return irBMiss("map key " + ka) }
+  if repPrim(rep) != "i32" { return irBMiss("map read rep") }
+  const g = mapGlobalOf(rd.idxArr)
+  if g < 0 { return irBMiss("map read receiver") }
+  const k = irBExpr(b, rd.idxIndex)
+  if ibMiss != "" { return k }
+  const sid = sidOfNode(rd.idxArr)
+  const r: Rhs = {
+    mgSym: g,
+    mgNonNull: globalReadRecovers(sid, rd.idxArr, ibFnIx),
+    mgKey: k,
+    mgAt: ix,
+  }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// The module global map read `recvIx` names, its rep noted in `ib`; -1 for any other receiver.
+function mapGlobalOf(recvIx: i32): i32 {
+  if recvIx < 0 || !(nodeAt(recvIx) is Ident) { return -1 }
+  const d = identDeclOf(recvIx)
+  if d < 0 || localIndexOf(ibFnIx, recvIx) >= 0 { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  const g = globalIndexOfSid(sidOfNode(recvIx))
+  if g < 0 { return -1 }
+  const r = repNodeOfTy(scopeTyAt(d, -1))
+  if !(repNodeAt(r) is RMap) { return -1 }
+  irGlobalNote(ib, g, r)
+  return g
+}
+
 function isNumericPrim(p: string): boolean {
   return p == "i32"
     || p == "i64"
@@ -890,6 +950,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
+    if n.binOp == "??" { return coalesce(b, n, ix, rep) }
     if atomOperand(n.binLeft) || atomOperand(n.binRight) {
       return atomCompare(b, n, ix, rep)
     }
