@@ -8,6 +8,20 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-17-type-hashcons-s6b40-check-calls](2026-11-17-type-hashcons-s6b40-check-calls.md): Type hash-cons stage 6b, tier 2: check_calls.vl's type, literal and binding walks (lane HASH), 2026-11-17
+- [2026-11-17-type-hashcons-s6b39-walk-limit-backlog](2026-11-17-type-hashcons-s6b39-walk-limit-backlog.md): Type hash-cons stage 6b, tier 2: the walk-limit backlog (lane HASH), 2026-11-17
+- [2026-11-17-type-hashcons-s6b37-check-assignable](2026-11-17-type-hashcons-s6b37-check-assignable.md): Type hash-cons stage 6b, tier 2: check_assignable.vl's type and literal walks (lane HASH), 2026-11-17
+- [2026-11-17-type-hashcons-s5b-shadow](2026-11-17-type-hashcons-s5b-shadow.md): Type hash-cons stage 5b, the shadow: tagging under mono's anonymous pin key (lane HASH), 2026-11-17
+- [2026-11-17-store-a1-1-arrow-join](2026-11-17-store-a1-1-arrow-join.md): A1.1: A0's closure joins the arrow rule's rows, 2026-11-17 (lane STORE)
+- [2026-11-17-rep-adt-stage3-hole-rows-fn-fields](2026-11-17-rep-adt-stage3-hole-rows-fn-fields.md): Rep ADT stage 3: the hole-row and function-field classes close, 2026-11-17 (lane REP)
+- [2026-11-17-l2-fresh-literal-delivery](2026-11-17-l2-fresh-literal-delivery.md): L2: the per-call vector records a fresh argument at the row its delivery rebuilds it, 2026-11-17
+- [2026-11-17-l2-d15041](2026-11-17-l2-d15041.md): L2: a declared type parameter's binding joins with a later f64 argument, 2026-11-17
+- [2026-11-17-ir-n3-num-intrinsics](2026-11-17-ir-n3-num-intrinsics.md): IR N3: the numeric intrinsics through one plan and legacy's one-instruction tail, 2026-11-17 (lane IR-C)
+- [2026-11-16-type-hashcons-s6b34-emit-collect-2](2026-11-16-type-hashcons-s6b34-emit-collect-2.md): Type hash-cons stage 6b, tier 2: emit_collect.vl's union-registration walks, part 2 (lane HASH), 2026-11-16
+- [2026-11-16-store-inst-key-design](2026-11-16-store-inst-key-design.md): The per-call instantiation vector at check (STORE stage (a)), 2026-11-16
+- [2026-11-16-l2-elab-read-query](2026-11-16-l2-elab-read-query.md): L2: the read query moves into the elaboration, and check asks it, 2026-11-16
+- [2026-11-16-ir-p1-print](2026-11-16-ir-p1-print.md): IR P1: `print` through one decision and legacy's own tails, 2026-11-16 (lane IR-C)
+- [2026-11-16-ir-m1-coalesce-plan](2026-11-16-ir-m1-coalesce-plan.md): IR M1: one front door for the `??` ladder, and a global map read with an i32 default, 2026-11-16 (lane IR-C)
 - [2026-11-17-slot-store-callres-round-cap](2026-11-17-slot-store-callres-round-cap.md): Place classes: the call-result pass ends on its done set (lane SLOT, 2026-11-17)
 - [2026-11-17-rep-adt-stage3-hole-list-store](2026-11-17-rep-adt-stage3-hole-list-store.md): Rep ADT stage 3: the hole-list class closes (D16722), and three measured declines, 2026-11-17 (lane REP)
 - [2026-11-17-l2-d16898-scope](2026-11-17-l2-d16898-scope.md): L2: what D16898 needs from check, scoped, 2026-11-17
