@@ -17,20 +17,24 @@ it. `list` stays out: claiming it reaches about 5,700 self-compile functions, bu
   bytes.
 - Design §10 and DECISIONS record the reversal of the morning's parking.
 
-## Readings (master 406e47810, WIP)
+## Readings (final, master 54733d1ac merged in)
 
-- Self-build with the claim: fixpoint, byte-identical to the legacy-built seed. Mode 3 counts
-  2,178 claimed and 0 fallbacks.
-- `corpuscmp` against master's seed, first cut: 7,133 buildable, 9 LOST and 11 DIFFER.
-  - LOST, fixed here: the IR's direct call passed no environment to a callee with a hidden env
-    parameter (`envSlotShift > 0`), giving invalid modules (`expected structref`). Such a call is
-    now the named miss `callee environment`. All 9 build again.
-  - DIFFER, open, blocking the claim:
-    1. Wrong values. f32 constant trees fold differently (`(1.5 % 0.1) / (2.5 % 0.1)` prints `1`
-       under the claim, legacy `1.0000001`), along with shift-mask folds, kept constant trees, and
-       a nullable-string prefix. The armed shadow DOES flag these on `tests/cases`, but the gate's
-       shadow runs only over the distilled corpus, so they were never seen. The shadow's gate
-       population must include `tests/cases`.
-    2. Type-section growth. Building a function the claim then rejects still mints type rows, so
-       the claim adds unused struct and func types. Behaviour is unchanged, but bytes are not.
-       Building must not mint.
+| bar | reading |
+|---|---|
+| armed shadow, all of `tests/cases` (8,497 files) | 28,329 covered, 28,329 matched, 0 verifier failures |
+| armed shadow, distilled | 24,121 of 24,121 matched |
+| shipped claim (`--claims`, mode 5) | corpus 10,868 and `tests/cases` 12,820 functions emitted by the IR, 0 fell back |
+| self-compile | 2,179 functions emitted by the IR; fixpoint, and byte-identical to the legacy-built seed |
+| corpus identity against the base's fixpoint seed | distilled 9,029 identical and `tests/cases` 7,125 identical, 0 differ, 0 lost |
+| L2 fuel | 96.22G: +0.84% master drift plus +0.67% for the claim (the IR builds every function to decide it); rebaselined with a ledger line |
+
+## What the corpus comparison found, and how each class closed
+
+The gate's shadow ran only over the distilled corpus, so `tests/cases` held mismatches no row saw.
+Running the shadow there, then `corpuscmp`, found them. Each closed by sharing legacy's pure decision
+or by a named builder miss:
+- a callee with a hidden environment: the IR's call passed none (invalid modules), now `callee environment`;
+- f32 constant trees took the raw lexeme (wrong values), now legacy's `numLitLexAt`;
+- the global storage classes, open temps and lifted capture slots decided at lowering, now builder misses;
+- masked shifts (`shiftMaskFoldOf`), a written empty `else` (`SIf.siElseKw`), the valued fall-through pad
+  (`fallThroughPadOf`), kept-tree consts, in-place string appends and folded atom compares (IR3's commits).
