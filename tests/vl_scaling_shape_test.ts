@@ -2702,11 +2702,11 @@ const genRecordUnionReturns = (n: number): string => {
 };
 
 // A GROWTH pair, 64 record arms against 16, so linear reads 4. Super-linear today: each return
-// re-joins the running union pairwise in the checker (`joinVariantTys`).
+// still asks the join ladder's absorption tests (`tyParamArmAbsorbs`) of every member.
 axis(
   "record union arms returned",
-  13.0,
-  "Each return compares every arm with every row of its union (`unionArmRowsOfTys`, compiler/emit_local_slots.vl), or the checker's return join grew a further factor.",
+  9.0,
+  "Each return compares every arm with every row of its union (`unionArmRowsOfTys`, compiler/emit_local_slots.vl), or re-dedupes the running union's members (`joinTysInto`, compiler/check_relate_core.vl) or tests every pair for a Set/map clash (`setMapRecordClashMsg`).",
   (d) => twoFiles(d, genRecordUnionReturns(64), genRecordUnionReturns(16)),
 );
 

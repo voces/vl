@@ -75,17 +75,25 @@ Deno.test({ name: "playground-run: an EMIT-stage failure yields a POSITIONED err
   // Diagnostics pane — which the Run verdict points at — rendered nothing. Now the
   // diagnostic anchors at the failing function's declaration (`useIt`, line 4 →
   // LSP 0-based line 3), so the pane has a real location to show.
-  // The un-lowerable shape is D4265's: `is` across record arms whose shared field's box holds
-  // a member only some of whose values fit.
-  const src = 'type A = { v: "a" | "b" }\n' +
-    "// D4265\n" +
-    "type B = { v: i32 | string }\n" +
-    "function useIt(u: A | B) {\n" +
-    '  if u is A { print("A") } else { print("B") }\n' +
+  // The refusal is the harness's own: under `setTestEmitRefusal`, a call to
+  // `__vl_test_emit_refusal_decl__` is refused with no node of its own, so no fix moves it.
+  const src = "function __vl_test_emit_refusal_decl__() {}\n" +
+    "// the test hook, refused at emit\n" +
+    "const z = 9\n" +
+    "function useIt(n: i32) {\n" +
+    "  print(n + z)\n" +
+    "  __vl_test_emit_refusal_decl__()\n" +
     "}\n" +
-    "const c: B = { v: 3 }\n" +
-    "useIt(c)\n";
-  const { bytes, diagnostics } = await seedChecker().compile(src, "main.vl", noSiblings);
+    "useIt(1)\n";
+  const checker = seedChecker();
+  checker.setTestEmitRefusal(true);
+  let compiled;
+  try {
+    compiled = await checker.compile(src, "main.vl", noSiblings);
+  } finally {
+    checker.setTestEmitRefusal(false);
+  }
+  const { bytes, diagnostics } = compiled;
   if (bytes !== undefined) throw new Error("expected no bytes for an emit-stage failure");
   const errors = diagnostics.filter((d) => d.severity === "error");
   if (errors.length !== 1) {
