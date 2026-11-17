@@ -4291,7 +4291,7 @@ function cellReadProvesNonNull(ix: i32): boolean {
   return tyProvesNonNull(cboxReadTy[ix] ?? -1)
 }
 
-function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
+export function deadNullTestOperand(e: BinExpr, fnIx: i32): i32 {
   const l = unwrapParen(e.binLeft)
   const r = unwrapParen(e.binRight)
   if l < 0 || r < 0 || l >= P.nodes.length || r >= P.nodes.length { return -1 }
@@ -4329,6 +4329,60 @@ function emitDeadNullTest(opIx: i32, isNe: boolean, fnIx: i32) {
   return 0
 }
 
+// The arm of the null test of `refIx` (`emitNulIsNullTest`) up to the literal-union atom's:
+// `nnfold`/`nulfold`, a read the checker narrowed to a type with no null or to `null` itself;
+// `nullty`, a value typed `null`; `bool`, `boolean | null`'s niche; `atom`, a `K | null`'s
+// sentinel; `rest`, an arm after these.
+export type NulTestArm = "nnfold"
+  | "nulfold"
+  | "nullty"
+  | "bool"
+  | "atom"
+  | "rest"
+
+// The null-test arm of `refIx` in function `fnIx`, as `emitNulIsNullTest` takes it.
+export function nulTestArmOf(
+  refIx: i32,
+  fnIx: i32,
+  invert: boolean,
+  nicheOnly: boolean,
+): NulTestArm {
+  if !nicheOnly || !invert {
+    // Claimed first: every arm below reads the declared nullable rep, while a narrowed read is at
+    // its arm's rep, so without these the assignment spelling gets no arm.
+    const narrowed = readNarrowedStoreAt(refIx, fnIx) >= 0
+    const ty = nodeTyAt(unwrapParen(refIx), fnIx)
+    if narrowed && tyProvesNonNull(ty) { return "nnfold" }
+    if narrowed && isNullTy(ty) { return "nulfold" }
+    // A row-less record's `null` field read through the row of the place that stores it.
+    if isNullTy(ty) { return "nullty" }
+  }
+  if exprNulBool(refIx, fnIx) { return "bool" }
+  if exprNulLitUnion(refIx, fnIx) { return "atom" }
+  return "rest"
+}
+
+// After a `K | null` value: its compare with the sentinel below every atom id, `i32.ne` for
+// `invert`. Returns 1, the ladder's "claimed".
+export function nulTestAtomTail(invert: boolean): i32 {
+  fbI32Const(-1)
+  if invert { fbI32Bin(71) } else { fbI32Bin(70) }
+  return 1
+}
+
+// The operand and direction of `==`/`!=` node `e` against a `null` literal, as the binary
+// dispatch hands them to the null test (`!=` is `invert`), or null for any other compare.
+export type BinNulTest = { bnRef: i32, bnInvert: boolean }
+export function binNulTestOf(e: BinExpr): BinNulTest | null {
+  if e.binOp != "==" && e.binOp != "!=" { return null }
+  let ref = -1
+  if nodeAt(e.binRight) is NullLit { ref = e.binLeft }
+  if nodeAt(e.binLeft) is NullLit { ref = e.binRight }
+  if ref < 0 { return null }
+  const t: BinNulTest = { bnRef: ref, bnInvert: e.binOp == "!=" }
+  return t
+}
+
 // The null test for a nullable value — `x == null`/`x != null` and the `x is null`/`x is
 // <member>` guard ask the same question of the same rep. Leaves a 0/1 i32 (1 = null unless
 // `invert`); 0 means no arm claims the rep. `nicheOnly` restricts to single-non-null-member
@@ -4339,42 +4393,28 @@ function emitNulIsNullTest(
   invert: boolean,
   nicheOnly: boolean,
 ) {
-  if !nicheOnly || !invert {
-    // claimed first: every arm below reads the declared nullable rep while a narrowed
-    // read is at its arm's rep, so without this the assignment spelling gets no arm. A read the
-    // checker narrowed to a type that holds no null folds.
-    const nnFold = readNarrowedStoreAt(refIx, fnIx) >= 0
-      && tyProvesNonNull(nodeTyAt(unwrapParen(refIx), fnIx))
-    if nnFold {
-      if invert { fbI32Const(1) } else { fbI32Const(0) }
-      return 1
-    }
-    // …and one narrowed to `null` itself (a `let x = null` read before its fill) is null.
-    const nulFold = readNarrowedStoreAt(refIx, fnIx) >= 0
-      && isNullTy(nodeTyAt(unwrapParen(refIx), fnIx))
-    if nulFold {
-      if invert { fbI32Const(0) } else { fbI32Const(1) }
-      return 1
-    }
-    // A value the checker types `null` is null whatever rep its storage has: a row-less
-    // record's `null` field read through the row of the place that stores it.
-    if isNullTy(nodeTyAt(unwrapParen(refIx), fnIx)) {
-      if emitDeadNullTest(refIx, !invert, fnIx) < 0 { return -1 }
-      return 1
-    }
+  const arm = nulTestArmOf(refIx, fnIx, invert, nicheOnly)
+  if arm == "nnfold" {
+    if invert { fbI32Const(1) } else { fbI32Const(0) }
+    return 1
   }
-
-  if exprNulBool(refIx, fnIx) {
+  if arm == "nulfold" {
+    if invert { fbI32Const(0) } else { fbI32Const(1) }
+    return 1
+  }
+  if arm == "nullty" {
+    if emitDeadNullTest(refIx, !invert, fnIx) < 0 { return -1 }
+    return 1
+  }
+  if arm == "bool" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
     fbI32Const(2)
     if invert { fbI32Bin(71) } else { fbI32Bin(70) }
     return 1
   }
-  if exprNulLitUnion(refIx, fnIx) {
+  if arm == "atom" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
-    fbI32Const(-1)
-    if invert { fbI32Bin(71) } else { fbI32Bin(70) }
-    return 1
+    return nulTestAtomTail(invert)
   }
   if !nicheOnly {
     const ncN = nodeAt(unwrapParen(refIx))
@@ -6476,25 +6516,72 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   // A list-union rewrite's test over closed arms asks which arm is stored: the tag alone.
   const luT = luIsTyOf(isIx)
   if luT >= 0 && !tyHasTyVar(luT) { return 0 }
-  if isTestsNull(isIx) || !exprUnion(nd.isObj, fnIx) { return 0 }
+  if isTestsNull(isIx) { return 0 }
   const chk = isVarTyIxOf(isIx)
-  if tyArrayElemIx(chk) < 0 { return 0 }
-  const arms: i32[] = []
-  if (!unionTyMemberTys(unionBoxTyOfRead(nd.isObj, fnIx), arms)) { return 0 }
-  const chkTag = isArmTagOfTy(chk)
-  const chkLeaf = listLeafTyOf(chk)
   const tags: i32[] = []
   const fits: i32[] = []
   const slotsAt: i32[][] = []
+  if !listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt) {
+    return 0
+  }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  fbLocalSet(slot)
+  // A nullable operand is false on null; the box is a null reference then (D4953).
+  const nullable = nodeTyIsNullable(nd.isObj)
+  if nullable {
+    fbLocalGet(slot)
+    fbRefIsNull()
+    fbIf(127)
+    fbI32Const(0)
+    fbElse()
+  }
+  if emitListIsAcrossRepsAt(slot, chk, tags, fits, slotsAt, fnIx) < 0 {
+    return -1
+  }
+  if nullable { fbEnd() }
+  return 1
+}
+
+// The box tag of list type `ty` for `emitListIsAcrossReps`: `isArmTagOfTy`'s, or for a list of
+// `i32` literals the `i32[]` tag it shares, which a tag test alone does not decide (D14041).
+function listIsArmTag(ty: i32): i32 {
+  const t = isArmTagOfTy(ty)
+  if t >= 0 { return t }
+  const e = tyArrayElemIx(ty)
+  if e < 0 || numLitUnionBaseName(e) != "i32" || boxTagOfTy(ty) != 7 {
+    return -1
+  }
+  return scalarTagOfKind(7)
+}
+
+// Plans `recv is chk` for list type `chk` over a box: one entry per tag in `tags`, with how
+// `fits` tests it and the reflist `slotsAt` its element loop walks. False when the operand is
+// not a box of list arms, when some arm has no test, or when the tag alone answers.
+function listIsAcrossRepsPlan(
+  recv: i32,
+  chk: i32,
+  fnIx: i32,
+  tags: i32[],
+  fits: i32[],
+  slotsAt: i32[][],
+): boolean {
+  if !exprUnion(recv, fnIx) { return false }
+  if tyArrayElemIx(chk) < 0 { return false }
+  const arms: i32[] = []
+  if (!unionTyMemberTys(unionBoxTyOfRead(recv, fnIx), arms)) { return false }
+  const chkTag = listIsArmTag(chk)
   let other = false
   for a in arms {
     if tyArrayElemIx(a) >= 0 {
-      const t = isArmTagOfTy(a)
-      if t < 0 { return 0 }
+      const t = listIsArmTag(a)
+      if t < 0 { return false }
       // A ref-element arm's list row is minted here, where the test is lowered: the branch the
       // test narrows reads that arm's elements through it.
       if unMemIsRefElemArray(a) { unMemRefArrArmSlot(a) }
-      let k = if tySame(a, chk) { LIST_ARM_OWN } else { listArmFitAcrossReps(a, chk) }
+      // A list of `i32` literals is read by its elements even as its own arm: the box it shares
+      // with `i32[]` may hold either.
+      let k = if !tySame(a, chk) { listArmFitAcrossReps(a, chk) } else if isArmTagOfTy(chk) >= 0 { LIST_ARM_OWN } else { 0 }
       const slots: i32[] = []
       if k == 0 {
         // An arm with another tag holds a list whose element type is fixed apart from the
@@ -6502,7 +6589,7 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
         // is the exception: an `i32` list arm as deep fits it by its elements (D4778).
         if t != chkTag && listArmNumsDepth(a, chk) < 0 { continue }
         k = listArmSharedTagFit(a, chk, slots)
-        if k == 0 { return 0 }
+        if k == 0 { return false }
       }
       if !tySame(a, chk) { other = true }
       let j = tags.length - 1
@@ -6526,24 +6613,25 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
           fits[j] = k
           slotsAt[j] = slots
         } else if !(k == LIST_ARM_OWN && elemJ) {
-          return 0
+          return false
         }
       }
     }
   }
-  if !other { return 0 }
-  const slot = sharedFieldRecvSlot()
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-  fbLocalSet(slot)
-  // A nullable operand is false on null; the box is a null reference then (D4953).
-  const nullable = nodeTyIsNullable(nd.isObj)
-  if nullable {
-    fbLocalGet(slot)
-    fbRefIsNull()
-    fbIf(127)
-    fbI32Const(0)
-    fbElse()
-  }
+  // `L` alone is tested by its tag in the later rungs, unless only this plan has its tag.
+  return other || isArmTagOfTy(chk) < 0
+}
+
+// The planned test over the non-null box in local `slot`, leaving a 0/1 i32. 0, or -1 on failure.
+function emitListIsAcrossRepsAt(
+  slot: i32,
+  chk: i32,
+  tags: i32[],
+  fits: i32[],
+  slotsAt: i32[][],
+  fnIx: i32,
+): i32 {
+  const chkLeaf = listLeafTyOf(chk)
   const lexes = tyLitMemberTexts(chkLeaf)
   fbI32Const(0)
   let i = 0
@@ -6612,8 +6700,7 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
     fbI32Bin(114) // 0x72 i32.or
     i = i + 1
   }
-  if nullable { fbEnd() }
-  return 1
+  return 0
 }
 
 // How `emitListIsAcrossReps` tests one tag: by the tag alone (`L`, or an arm every element of
@@ -6646,8 +6733,8 @@ function listArmSharedTagFit(a: i32, chk: i32, slots: i32[]): i32 {
   return 0
 }
 
-// The list layers below the outermost when list arm `a` is `i32[]…[]` and `chk` a list of `i32`
-// literals as deep, which a value of `a` fits exactly when every leaf is a member (D4778); -1
+// The list layers below the outermost when list arm `a` is `i32[]…[]` or a list of `i32` literals
+// and `chk` a list of `i32` literals as deep, which a value of `a` fits exactly when every leaf is a member (D4778); -1
 // otherwise.
 function listArmNumsDepth(a: i32, chk: i32): i32 {
   let ae = tyArrayElemIx(a)
@@ -6658,7 +6745,8 @@ function listArmNumsDepth(a: i32, chk: i32): i32 {
     ce = tyArrayElemIx(ce)
     d = d + 1
   }
-  if ae < 0 || ce < 0 || tyPrimNameOf(ae) != "i32" { return -1 }
+  if ae < 0 || ce < 0 { return -1 }
+  if tyPrimNameOf(ae) != "i32" && numLitUnionBaseName(ae) != "i32" { return -1 }
   if tyArrayElemIx(ae) >= 0 || tyArrayElemIx(ce) >= 0 { return -1 }
   return if numLitUnionBaseName(ce) == "i32" { d } else { -1 }
 }
@@ -9831,7 +9919,7 @@ function plainCoalesceAt(exprIx: i32): BinExpr | null {
 // one operand is a `null`-typed value (`exprIsNulNone`) and both sides are either that or a bare
 // `null` literal, so both denote the one value `null` and the compare folds to a constant. A
 // genuinely nullable operand is excluded: there the answer is that operand's null-ness.
-function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
+export function nulNoneEqSides(leftIx: i32, rightIx: i32, fnIx: i32): boolean {
   if !exprIsNulNone(leftIx, fnIx) && !exprIsNulNone(rightIx, fnIx) {
     return false
   }
@@ -24824,6 +24912,8 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
     const rl = emitAsBoxToLitUnion(e, _exprIx, tty, fnIx)
     return rl
   }
+  const lxr = emitAsListAcrossReps(e, tty, fnIx)
+  if lxr != 0 { return if lxr < 0 { -1 } else { 0 } }
   const wantTags: i32[] = []
   const wantVis: i32[] = []
   const recvUt = unionTyOfRecv(nodeTyInOf(unwrapParen(obj), fnIx))
@@ -24878,6 +24968,71 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
     }
     wi = wi + 1
   }
+  return emitAsUnionTail(e, subUnion, armVi, ak, mapHeap)
+}
+
+// The cast of `e` to list type `tty` over a box whose list arms `emitListIsAcrossReps` tests by
+// their elements: that test, then the unbox at `tty`'s wrapper, which every tested arm shares
+// (D14042). 0 when the cast is not that shape, 1 when emitted, -1 on failure.
+function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
+  if nodeTyIsNullable(e.asObj) { return 0 }
+  const tags: i32[] = []
+  const fits: i32[] = []
+  const slotsAt: i32[][] = []
+  if !listIsAcrossRepsPlan(e.asObj, tty, fnIx, tags, fits, slotsAt) { return 0 }
+  const heap = listArmHeapOf(tty)
+  if heap < 0 { return 0 }
+  const arms: i32[] = []
+  if !unionTyMemberTys(unionBoxTyOfRead(e.asObj, fnIx), arms) { return 0 }
+  for a in arms {
+    if (
+      tyArrayElemIx(a) >= 0
+      && listIsArmTag(a) >= 0
+      && listArmHeapOf(a) != heap
+    ) {
+      let i = 0
+      while i < tags.length && tags[i] != listIsArmTag(a) { i = i + 1 }
+      if i < tags.length { return 0 }
+    }
+  }
+  if emitExpr(e.asObj, fnIx) < 0 { return -1 }
+  fbLocalSet(unionAsBoxSlot())
+  const r = emitListIsAcrossRepsAt(
+    unionAsBoxSlot(),
+    tty,
+    tags,
+    fits,
+    slotsAt,
+    fnIx,
+  )
+  if r < 0 { return -1 }
+  if emitAsUnionTail(e, false, -1, -1, heap) < 0 { return -1 }
+  return 1
+}
+
+// The heap of list type `ty`'s wrapper in a union box, or -1 when it has none.
+function listArmHeapOf(ty: i32): i32 {
+  const k = boxTagOfTy(ty)
+  if k >= 0 {
+    const h = listWrapHeapOfKind(k)
+    return if h > 0 { h } else { -1 }
+  }
+  if !unMemIsRefElemArray(ty) { return -1 }
+  const rs = unMemRefArrArmSlot(ty)
+  return if rs >= 0 && rs < rlWrapIdx.length { rlWrapIdx[rs] } else { -1 }
+}
+
+// A union-operand cast after its arm test is on the stack: `as?`'s value or `null`, or `as`'s
+// propagated and `as!`'s trapping miss, then the unbox at the arm `subUnion`, `armVi`, `ak` and
+// `mapHeap` name. Returns 0 or -1.
+function emitAsUnionTail(
+  e: AsExpr,
+  subUnion: boolean,
+  armVi: i32,
+  ak: i32,
+  mapHeap: i32,
+) {
+  const tgt = e.asTy
   // `as?` yields a value on both paths (a value-producing `if`, not the early exit `as`/
   // `as!` take): `T` when the tag matches, `null` when it does not. Supported only where
   // `T | null` already has a rep — `Circle | null` over a union arm has none yet
@@ -26752,19 +26907,30 @@ function emitAtomicIntrinsic(c: Call, name: string, fnIx: i32) {
 // The refusal a test pins under `--test-emit-refusal`: no capability, so no fix moves it.
 export const TEST_EMIT_REFUSAL_MSG = "emitProgram: test-only refusal (--test-emit-refusal)"
 
+// Whether `name` is the test hook `hook`, bare or with a module build's `$m<id>` suffix.
+function testHookNamed(name: string, hook: string): boolean {
+  return name == hook || name.slice(0, hook.length + 2) == hook + "$m"
+}
+
 function emitCall(callIx: i32, fnIx: i32) {
   if gTestEmitRefusal != 0 {
     const tc = nodeAt(callIx)
     if tc is Call && tc.callFn >= 0 {
       const tf = nodeAt(tc.callFn)
       // Bare in one file; a module build suffixes every top-level name with `$m<id>` (modid).
-      const hook = "__vl_test_emit_refusal__"
       if (
         tf is Ident
-        && (tf.identName == hook
-          || tf.identName.slice(0, hook.length + 2) == hook + "$m")
+        && testHookNamed(tf.identName, "__vl_test_emit_refusal__")
       ) {
         return emitFailAt(TEST_EMIT_REFUSAL_MSG, callIx)
+      }
+      // The declaration-anchored twin: refused unanchored, so the failure lands on the
+      // enclosing function's name as a refusal with no node of its own does.
+      if (
+        tf is Ident
+        && testHookNamed(tf.identName, "__vl_test_emit_refusal_decl__")
+      ) {
+        return emitFail(TEST_EMIT_REFUSAL_MSG)
       }
     }
   }
@@ -38358,12 +38524,17 @@ function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
 // The `null` value node `exprIx` evaluates to, built at the rep of the type the checker stamped
 // it with where it is delivered: the `boolean | null` or literal-union sentinel, a
 // `string | null`'s typed null, else the bottom ref.
-function emitNullAt(exprIx: i32, fnIx: i32) {
+export function emitNullAt(exprIx: i32, fnIx: i32) {
   return emitNullOwn(nullOwnAt(exprIx, fnIx))
 }
 
 // Which null the `null` value node `exprIx` is where it is delivered (`NULL_OWN_*`): the rep of
 // the type the checker stamped it with, the instance's own stamp first.
+// Whether the `null` value node `exprIx` is the literal-union atom sentinel where it is delivered.
+export function nullOwnIsAtom(exprIx: i32, fnIx: i32): boolean {
+  return nullOwnAt(exprIx, fnIx) == NULL_OWN_ATOM
+}
+
 function nullOwnAt(exprIx: i32, fnIx: i32): i32 {
   const er = elabNodeRepAt(exprIx, fnIx)
   const st = if er >= 0 { er } else { nodeRepTyAt(exprIx, fnIx) }
@@ -38547,7 +38718,7 @@ function listLitElemIsAtom(ix: i32, fnIx: i32): boolean {
 // closed contextual type, or for a run the emitter built, the type of the list it is built at.
 function listCtxElemIsNulStr(ix: i32, fnIx: i32): boolean {
   const pr = nodeCtxTyIxOf(ix)
-  if pr >= 0 && elabTyClosed(pr, 0) { return tyElemIsNulStr(pr) }
+  if pr >= 0 && elabTyClosed(pr) { return tyElemIsNulStr(pr) }
   const h = elabSpreadRunHolderOf(ix)
   if h >= 0 { return tyElemIsNulStr(nodeTyAt(h, fnIx)) }
   return false
@@ -40080,17 +40251,13 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
   // i32 compare. Checked before the structural string / struct / closure equality below,
   // each of which would compare a value against the `null` literal.
   if e.binOp == "==" || e.binOp == "!=" {
-    const nlhs = nodeAt(e.binLeft)
-    const nrhs = nodeAt(e.binRight)
-    let nref = -1
-    if nrhs is NullLit { nref = e.binLeft }
-    if nlhs is NullLit { nref = e.binRight }
-    if nref >= 0 {
+    const bt = binNulTestOf(e)
+    if bt != null {
       // The ladder is shared with the `is null` guard — the two spellings ask the same
       // question of the same rep, and `emitNulIsNullTest`'s header carries why they must
       // not be answered in only one place. `!=` is the INVERTED direction, which the ladder
       // emits directly (`i32.ne`) rather than leaving a caller to negate an `i32.eq`.
-      const bnt = emitNulIsNullTest(nref, fnIx, e.binOp == "!=", false)
+      const bnt = emitNulIsNullTest(bt.bnRef, fnIx, bt.bnInvert, false)
       if bnt < 0 { return -1 }
       if bnt > 0 { return 0 }
     }

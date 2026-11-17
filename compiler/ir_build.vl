@@ -64,14 +64,20 @@ import {
   irLoweredEntry,
 } from "./ir_lower"
 import {
+  BinNulTest,
   GlobalCtx,
   atomEqPlanOf,
+  binNulTestOf,
   binNumWidth,
   boxOwedAt,
   callEndsNever,
+  deadNullTestOperand,
   globalReadRecovers,
   idxStorePlainWhy,
   idxStorePlanOf,
+  nulNoneEqSides,
+  nulTestArmOf,
+  nullOwnIsAtom,
   numLitAsApplies,
   popPlanOf,
   popStmtPlainWhy,
@@ -255,7 +261,14 @@ function valueRep(r: i32, ty: i32): boolean {
   return repIsScalar(r)
     || repNodeAt(r) is RAtom
     || boxedNullable(r)
+    || atomNullable(r)
     || irVarRepOkHook(r, ty)
+}
+
+// Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
+function atomNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 3
 }
 
 // Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
@@ -686,6 +699,12 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
+  // A `null` literal into a `K | null` is legacy's own sentinel (`emitNullAt`).
+  if ibMiss == "" && dst >= 0 && atomNullable(dst) {
+    if nodeAt(unwrapParen(ix)) is NullLit && nullOwnIsAtom(ix, ibFnIx) {
+      return repTemp(b, { nuAt: ix }, ix, dst)
+    }
+  }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
     if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
@@ -698,11 +717,16 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
 
 // `v`, built from `ix`, boxed into boxed nullable `dst` by legacy's box writer.
 function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
-  const bty = repTyOf(dst)
-  const bt = irVarNew(ib, dst, bty, "temp", -1)
-  irBNode(b, { lDst: bt, lRhs: { bxV: v, bxAt: ix } }, bty, dst, ix)
-  const bo: Opnd = { ov: bt }
-  return bo
+  return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+}
+
+// A temp at destination rep `dst`, typed at it, holding `r` for delivery node `ix`.
+function repTemp(b: i32[], r: Rhs, ix: i32, dst: i32): Opnd {
+  const ty = repTyOf(dst)
+  const t = irVarNew(ib, dst, ty, "temp", -1)
+  irBNode(b, { lDst: t, lRhs: r }, ty, dst, ix)
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
@@ -711,6 +735,12 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   // The checker records the box at the node; legacy's box writer builds it around the value.
   if boxedNullable(dst) && boxOwedAt(ix, ibFnIx) {
     return boxTemp(b, v, ix, dst)
+  }
+  // An atom into its `K | null` is the same i32: legacy's table has no row for it, since a
+  // nullable niche is no box (`boxOwedAt`).
+  const dn = repNodeAt(dst)
+  if dn is RNullable && dn.rnDisc == 3 && dn.rnInner == irBOpRep(v) {
+    if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
   }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
@@ -773,18 +803,42 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   )
 }
 
-// The value of atom operand `ix`, which must build at an atom rep.
+// The value of atom operand `ix`, which must build at an atom rep or its `K | null`.
 function atomSide(b: i32[], ix: i32): Opnd {
   const v = irBExpr(b, ix)
   if ibMiss != "" { return v }
-  if !(repNodeAt(irBOpRep(v)) is RAtom) {
+  const r = irBOpRep(v)
+  if !(repNodeAt(r) is RAtom) && !atomNullable(r) {
     return irBMiss("atom compare operand")
   }
   return v
 }
 
 function atomOperand(ix: i32): boolean {
-  return repNodeAt(repNodeOfTy(nodeTyAt(ix, ibFnIx))) is RAtom
+  const r = repNodeOfTy(nodeTyAt(ix, ibFnIx))
+  return repNodeAt(r) is RAtom || atomNullable(r)
+}
+
+// A `==`/`!=` against a `null` literal, by legacy's own route: no dead test and no `null`-typed
+// pair (`deadNullTestOperand`, `nulNoneEqSides`), then the null test's arm (`nulTestArmOf`) with
+// the direction the dispatch hands it. Only a `K | null`'s sentinel compare is built.
+function nulTest(
+  b: i32[],
+  n: BinExpr,
+  bt: BinNulTest,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  if deadNullTestOperand(n, ibFnIx) >= 0 { return irBMiss("null test dead") }
+  if nulNoneEqSides(n.binLeft, n.binRight, ibFnIx) {
+    return irBMiss("null test of null")
+  }
+  const arm = nulTestArmOf(bt.bnRef, ibFnIx, bt.bnInvert, false)
+  if arm != "atom" { return irBMiss("null test " + arm) }
+  const v = irBExpr(b, bt.bnRef)
+  if ibMiss != "" { return v }
+  if !atomNullable(irBOpRep(v)) { return irBMiss("null test operand") }
+  return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
 function isNumericPrim(p: string): boolean {
@@ -834,6 +888,8 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     if n.binOp == "=" && !ASSIGN_AS_VALUE {
       return irBMiss("assignment as a value")
     }
+    const bt = binNulTestOf(n)
+    if bt != null { return nulTest(b, n, bt, ix, rep) }
     if atomOperand(n.binLeft) || atomOperand(n.binRight) {
       return atomCompare(b, n, ix, rep)
     }
