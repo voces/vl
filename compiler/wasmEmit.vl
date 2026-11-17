@@ -83,6 +83,7 @@ import {
   elabArmStagePop,
   elabArmStagePush,
   elabBundleRecordOf,
+  elabBundleSigsOfTy,
   elabCallHandMemberAt,
   elabCallKeepsRecordAt,
   elabDeliveredBundleSigs,
@@ -1012,6 +1013,7 @@ import {
   binMixHardF64,
   boxedArmOfMember,
   bundleRecordRowOfSigs,
+  bundleRecordRowOfTy,
   callIsArrSlice,
   callIsMapFilter,
   callResultMember,
@@ -1708,6 +1710,7 @@ import {
   monoArgClosedPinTy,
   monoBundleFe,
   monoBundleReadFe,
+  monoBundleRetFe,
   monoInstantiatedAny,
   monoIsClashLit,
   monoTokenFe,
@@ -28552,6 +28555,44 @@ function emitBundleParamRead(arg: i32, par: i32, fnIx: i32): i32 {
   )
 }
 
+// The hole lambda literal `retArg` a function returning a bundle record returns: the closure
+// built at each signature under this instance, in the record row's field order (D16845). 0, -1,
+// or 1 where the function or the value is no such one.
+function emitBundleRetLam(retArg: i32, fnIx: i32): i32 {
+  const fn = nodeAt(fnIx)
+  const x = unwrapParen(retArg)
+  if !(fn is FuncDecl) || fn.fnRet < 0 || x < 0 || !(nodeAt(x) is FuncDecl) {
+    return 1
+  }
+  const bt = nodeTyIxOf(fn.fnRet)
+  const sigs = elabBundleSigsOfTy(bt)
+  if sigs.length < 2 { return 1 }
+  const si = bundleRecordRowOfTy(bt)
+  if si < 0 || si >= sFieldCount.length || si >= sHeapIdx.length {
+    return emitFailAt(
+      "emitProgram: a lambda returned at two signatures has no record row for its closures",
+      x,
+    )
+  }
+  let fi = 0
+  while fi < sFieldCount[si] {
+    const nm = sFieldNames[sFieldStart[si] + fi]
+    let k = 0
+    while k < sigs.length && nm != "c" + i32ToStr(k) { k = k + 1 }
+    const fe = monoBundleRetFe(x, fnIx, sigs, k)
+    if fe < 0 {
+      return emitFailAt(
+        "emitProgram: a lambda returned at two signatures has no closure built for one of them",
+        x,
+      )
+    }
+    if emitClosureValueCore(fe, fnIx) < 0 { return -1 }
+    fi = fi + 1
+  }
+  fbStructNew(sHeapIdx[si])
+  return 0
+}
+
 // The lambda literal `arg` delivered to bundle parameter `par`: the closure built at each
 // signature, in the record row's field order, in one record. 0, or -1.
 function emitBundleArg(arg: i32, par: i32, fnIx: i32): i32 {
@@ -33061,6 +33102,9 @@ function emitReturnValueTail(
 // leaves the value on the stack. Unifies explicit `return e` with implicit tail returns.
 function emitReturnValue(retArg: i32, fnIx: i32) {
   const fn = nodeAt(fnIx)
+  // A maker twin returning its bundle record builds it from the returned lambda (D16845).
+  const brl = emitBundleRetLam(retArg, fnIx)
+  if brl != 1 { return brl }
   // the heap a niche struct/variant result names (`Circle | null`, `Dot | null`) — the
   // narrowed-arm unbox's destination at this boundary (D1031). A bare `: Circle` result
   // needs none: `retVi` routes it through `emitVariantCoerce`.
