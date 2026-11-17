@@ -267,7 +267,13 @@ import {
   nwBrandRow,
   registerInlineLitUnion,
 } from "./check_inline_lit_union"
-import { luAnnTy, tpRetJoinFixed, tpRetJoinTys } from "./check_list_union"
+import {
+  luAnnTy,
+  luMembersAt,
+  luPinDeclines,
+  tpRetJoinFixed,
+  tpRetJoinTys,
+} from "./check_list_union"
 import {
   funcArrowAt,
   isTopLevelFuncTypeName,
@@ -2467,6 +2473,27 @@ export function tyParamArmAbsorbs(u: i32, o: i32): boolean {
     j = j + 1
   }
   return false
+}
+
+// The union of the members' element types, each read at its value type, kept apart rather
+// than widened (`f64[] | i32[]` reads `f64 | i32`). -1 when the elements have no union.
+export function luElemTy(ms: i32[]): i32 {
+  let e = -1
+  let i = 0
+  while i < ms.length {
+    const a = tyAt(ms[i])
+    if a is TyArray {
+      const v = arrElemValueTy(tyElemOf(a))
+      if v < 0 { return -1 }
+      if e < 0 { e = v } else { e = joinVariantTys(e, v) }
+    }
+    i = i + 1
+  }
+  if e == TY_ERR {
+    joinClashMsgSet("")
+    return -1
+  }
+  return e
 }
 
 // The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
@@ -7338,6 +7365,31 @@ function holeSlotElemLitsFrom(els: i32[], path: string[], k: i32): boolean {
   return true
 }
 
+// Whether each function `els` holds at `path` from step `k`, through list and record literals,
+// is named: an identifier, not a lambda.
+function holeSlotLeavesNamed(els: i32[], path: string[], k: i32): boolean {
+  for el in els {
+    let x = parenPeelIx(el)
+    if k < path.length && path[k] == "[]" {
+      const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+      if !(xn is ArrayLit) || !holeSlotLeavesNamed(xn.arrElems, path, k + 1) {
+        return false
+      }
+    } else {
+      let j = k
+      while j < path.length {
+        if x < 0 || x >= P.nodes.length || !(nodeAt(x) is ObjLit) {
+          return false
+        }
+        x = parenPeelIx(objLitFieldExpr(x, path[j]))
+        j = j + 1
+      }
+      if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return false }
+    }
+  }
+  return true
+}
+
 // Whether `path` reads a field of exactly one list element: one `[]` step, then that element's
 // field, last. A record nested in the element is not lifted.
 function holeSlotOneElemField(path: string[]): boolean {
@@ -7395,14 +7447,18 @@ function holeSlotFieldLift(a: i32, init: i32, path: string[], b: i32): boolean {
       ) {
         return false
       }
-      // A list of lists' nested record stored by assignment rather than a push is not built at
-      // the rep (D16858).
-      if k >= 2 {
-        for at in ats {
-          if at >= 0 && at < P.nodes.length && nodeAt(at) is BinExpr {
+      // A list literal stored by assignment below the root's own element is not built at the
+      // rep; one at the root's element is, as a pushed one is (D16858).
+      // One whose functions are lambdas has no named member for the stamp to take.
+      let ai = 0
+      while ai < ats.length && ai < vals.length {
+        const at = ats[ai]
+        if at >= 0 && at < P.nodes.length && nodeAt(at) is BinExpr {
+          if d >= 2 && d < k || !holeSlotLeavesNamed([vals[ai]], path, d) {
             return false
           }
         }
+        ai = ai + 1
       }
       d = d + 1
     }
@@ -10136,6 +10192,12 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
     if innerI < 0 { return -1 }
     const fi = forInPinTy(innerI, kind == HD_ITER2)
     if fi >= 0 { return fi }
+    // A union of lists the pin walks per arm binds the element union (D16897).
+    const pm = luMembersAt(innerI)
+    if pm.length > 0 && !luPinDeclines(pm) {
+      const pe = if kind == HD_ITER2 { TY_I32 } else { luElemTy(pm) }
+      if pe >= 0 { return pe }
+    }
     return rebaseHoleUnder(row, innerI, bNames, bTys)
   }
   // The element of an indexed hole (`self[i]`): resolve the hole to its pinned

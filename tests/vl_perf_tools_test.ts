@@ -247,13 +247,27 @@ Deno.test({
           argv: [prof],
           code: 0,
           out: lines(
-            "samples 20; check side (everything but emitProgram) 16",
+            "samples 20; check side (every phase but the build-only ones) 16",
             "| phase | samples | % of run | % of the check side |",
             "| --- | ---: | ---: | ---: |",
             "| 1 order+validate (modVisit) | 1 | 5.00% | 6.2% |",
             "| 5 checkProgram (MERGED) | 9 | 45.00% | 56.2% |",
-            "| 6 emitProgram (MERGED, build only) | 4 | 20.00% | — |",
+            "| 6 emitProgram, other (build only) | 4 | 20.00% | — |",
             "| (outside every named phase) | 6 | 30.00% | 37.5% |",
+          ),
+        },
+        {
+          script: "profile-phases",
+          argv: [prof, "--fuel", "2000000000"],
+          code: 0,
+          out: lines(
+            "samples 20; check side (every phase but the build-only ones) 16",
+            "| phase | samples | % of run | % of the check side | fuel (by sample share) |",
+            "| --- | ---: | ---: | ---: | ---: |",
+            "| 1 order+validate (modVisit) | 1 | 5.00% | 6.2% | 0.10G |",
+            "| 5 checkProgram (MERGED) | 9 | 45.00% | 56.2% | 0.90G |",
+            "| 6 emitProgram, other (build only) | 4 | 20.00% | — | 0.40G |",
+            "| (outside every named phase) | 6 | 30.00% | 37.5% | 0.60G |",
           ),
         },
         {
@@ -267,7 +281,7 @@ Deno.test({
           argv: [],
           code: 2,
           out: lines(
-            "usage: vl run scripts/perf/profile-phases.vl -- <profile.json>",
+            "usage: vl run scripts/perf/profile-phases.vl -- <profile.json> [--fuel <n>] [--weighted]",
           ),
         },
       ]);

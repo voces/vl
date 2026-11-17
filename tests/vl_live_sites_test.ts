@@ -26,6 +26,83 @@ type Site = {
   row?: string;
 };
 
+// An empty list's justification: when and where the probe runner was read, its passed/total, and
+// every probe still refusing with the stage it refuses at. A GAP at emit is a live site, so the
+// list may not be empty while one is named.
+type Empty = {
+  why: string;
+  date: string;
+  commit: string;
+  probes: string;
+  gaps: { probe: string; stage: string }[];
+};
+
+async function checkEmptyNote(e: Empty) {
+  const bad: string[] = [];
+  for (const f of ["why", "date", "commit", "probes"] as const) {
+    if (typeof e[f] !== "string" || e[f].trim() === "") {
+      bad.push(`missing the \`${f}\` field, got ${JSON.stringify(e[f])}`);
+    }
+  }
+  if (typeof e.date === "string" && !/^\d{4}-\d{2}-\d{2}$/.test(e.date)) {
+    bad.push(`want \`date\` as YYYY-MM-DD, got ${JSON.stringify(e.date)}`);
+  }
+  const m = typeof e.probes === "string"
+    ? /^(\d+)\/(\d+)$/.exec(e.probes)
+    : null;
+  if (!m) {
+    bad.push(
+      `want \`probes\` as the runner's passed/total, got ${
+        JSON.stringify(e.probes)
+      }`,
+    );
+  }
+  if (!Array.isArray(e.gaps)) {
+    bad.push(`want a \`gaps\` array, got ${JSON.stringify(e.gaps)}`);
+  } else {
+    if (m && Number(m[2]) - Number(m[1]) !== e.gaps.length) {
+      bad.push(
+        `want one \`gaps\` entry per probe still refusing (${
+          Number(m[2]) - Number(m[1])
+        } by ` +
+          `${JSON.stringify(e.probes)}), got ${e.gaps.length}`,
+      );
+    }
+    for (const g of e.gaps) {
+      try {
+        await Deno.stat(`${PROBES}/${g.probe}`);
+      } catch {
+        bad.push(
+          `gap names probe ${
+            JSON.stringify(g.probe)
+          }, which does not exist in ${PROBES}/`,
+        );
+      }
+      if (g.stage === "emit") {
+        bad.push(
+          `gap ${
+            JSON.stringify(g.probe)
+          } refuses at emit: that is a live site, so want its row in ` +
+            `\`sites\`, not an empty list`,
+        );
+      } else if (g.stage !== "check" && g.stage !== "parse") {
+        bad.push(
+          `want gap ${
+            JSON.stringify(g.probe)
+          }'s \`stage\` as check, parse or emit, got ` +
+            `${JSON.stringify(g.stage)}`,
+        );
+      }
+    }
+  }
+  if (bad.length) {
+    throw new Error(
+      `${LIST}: the \`empty\` note does not justify an empty list:\n  ` +
+        bad.join("\n  "),
+    );
+  }
+}
+
 /** A probe's header comment as one line, so a literal broken across `//` lines still reads. */
 function header(text: string): string {
   const lines: string[] = [];
@@ -40,10 +117,28 @@ Deno.test("every witness-backed refusal site rests on a probe that names it", as
   const raw = JSON.parse(await Deno.readTextFile(LIST)) as {
     note: string;
     sites: Site[];
+    empty?: Empty;
   };
+  if (
+    Array.isArray(raw.sites) && raw.sites.length === 0 &&
+    raw.empty !== undefined
+  ) {
+    await checkEmptyNote(raw.empty);
+    return;
+  }
+  if (raw.empty !== undefined) {
+    throw new Error(
+      `${LIST}: want no \`empty\` note beside a non-empty \`sites\` list, got one dated ` +
+        `${
+          JSON.stringify(raw.empty.date)
+        }. Delete the note when a row comes back.`,
+    );
+  }
   if (!Array.isArray(raw.sites) || raw.sites.length === 0) {
     throw new Error(
-      `${LIST}: want a non-empty \`sites\` array, got ${JSON.stringify(raw.sites)}. An empty ` +
+      `${LIST}: want a non-empty \`sites\` array, got ${
+        JSON.stringify(raw.sites)
+      }. An empty ` +
         `list is not "clause 2 met" — it is a list nobody has written a witness for.`,
     );
   }
@@ -61,7 +156,9 @@ Deno.test("every witness-backed refusal site rests on a probe that names it", as
     const at = `${LIST}: ${JSON.stringify((s.literal ?? "").slice(0, 50))}`;
     for (const f of ["literal", "probe", "witnessed", "why"] as const) {
       if (typeof s[f] !== "string" || s[f].trim() === "") {
-        bad.push(`${at} — missing the \`${f}\` field, got ${JSON.stringify(s[f])}`);
+        bad.push(
+          `${at} — missing the \`${f}\` field, got ${JSON.stringify(s[f])}`,
+        );
       }
     }
     if (typeof s.literal !== "string" || typeof s.probe !== "string") continue;
@@ -82,7 +179,9 @@ Deno.test("every witness-backed refusal site rests on a probe that names it", as
       probe = await Deno.readTextFile(`${PROBES}/${s.probe}`);
     } catch {
       bad.push(
-        `${at} — names probe ${JSON.stringify(s.probe)}, which does not exist in ` +
+        `${at} — names probe ${
+          JSON.stringify(s.probe)
+        }, which does not exist in ` +
           `${PROBES}/. A row may only be added with a witness.`,
       );
       continue;
@@ -93,12 +192,16 @@ Deno.test("every witness-backed refusal site rests on a probe that names it", as
     if (!head.includes(s.literal.replace(/\s+/g, " "))) {
       bad.push(
         `${at} — ${s.probe}'s header does not quote the literal it witnesses.\n` +
-          `      want: the header comment to contain ${JSON.stringify(s.literal.slice(0, 60))}\n` +
+          `      want: the header comment to contain ${
+            JSON.stringify(s.literal.slice(0, 60))
+          }\n` +
           `      got:  ${JSON.stringify(head.slice(0, 160))}`,
       );
     }
     if (!/Should print /.test(head)) {
-      bad.push(`${at} — ${s.probe} has no \`Should print ...\` contract in its header`);
+      bad.push(
+        `${at} — ${s.probe} has no \`Should print ...\` contract in its header`,
+      );
     }
   }
 

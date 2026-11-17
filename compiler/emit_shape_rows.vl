@@ -267,7 +267,6 @@ import {
   armFieldElemSame,
   armFieldLitTyIx,
   armFieldStoreTy,
-  armFieldTypes,
   armStructRowMint,
   emitPhaseReached,
   heldRepOf,
@@ -291,7 +290,6 @@ import {
   sFieldNames,
   sFieldStart,
   sFieldStoreTy,
-  sFieldTypes,
   sIsRefRow,
   sNames,
   sRowIsShape,
@@ -518,14 +516,13 @@ function mvValNullOfTy(ty: i32): i32 {
 }
 
 // Whether union or nullable `root` is recursive: a list, map, record or function inside it reaches
-// back to `root` or to a union or nullable layer of it. A walk past 64 types answers true too.
+// back to `root` or to a union or nullable layer of it. Each type is walked once.
 function tyReachesItself(root: i32): boolean {
   // The union's own layers, which a recursive alias may name in place of `root` itself.
   const top: i32[] = []
   const rest: i32[] = []
   const todo: i32[] = [root]
   while todo.length > 0 {
-    if top.length > 64 { return true }
     const cur = todo.pop()
     if cur >= 0 && cur < T.tys.length && !i32ListHas(top, cur) {
       const t = tyAt(cur)
@@ -542,7 +539,6 @@ function tyReachesItself(root: i32): boolean {
   }
   const seen: i32[] = []
   while rest.length > 0 {
-    if seen.length > 64 { return true }
     const cur = rest.pop()
     if i32ListHas(top, cur) { return true }
     if cur >= 0 && cur < T.tys.length && !i32ListHas(seen, cur) {
@@ -684,13 +680,13 @@ export function fnTagListRepTy(ty: i32): i32 {
   if fnTagListRepName(ty) == "" { return -1 }
   let t = ty
   let r = TY_I32
-  let depth = 0
-  while t >= 0 && t < T.tys.length && depth < 16 {
+  const seen: i32[] = []
+  while t >= 0 && t < T.tys.length && !i32ListHas(seen, t) {
+    seen.push(t)
     const a = tyAt(t)
     if !(a is TyArray) { return r }
     r = mkArrayTy(r)
     t = tyElemOf(a)
-    depth = depth + 1
   }
   return -1
 }
@@ -701,13 +697,13 @@ export function fnTagListRepName(ty: i32): string {
   if !fnTagListTy(ty) { return "" }
   let t = ty
   let sfx = ""
-  let depth = 0
-  while t >= 0 && t < T.tys.length && depth < 16 {
+  const seen: i32[] = []
+  while t >= 0 && t < T.tys.length && !i32ListHas(seen, t) {
+    seen.push(t)
     const a = tyAt(t)
     if !(a is TyArray) { return "i32" + sfx }
     sfx = sfx + "[]"
     t = tyElemOf(a)
-    depth = depth + 1
   }
   return ""
 }
@@ -1873,9 +1869,9 @@ export function arrLitObjBesideNonRecord(arrIx: i32): boolean {
 
 // Does the type tree at `ty` mention a function type anywhere — an arrow at any depth,
 // inside a union arm, an array element, or a field?
-function tyMentionsFunc(ty: i32, depth: i32): boolean {
-  if ty < 0 { return false }
-  if depth > 12 { return false }
+function tyMentionsFunc(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || i32ListHas(seen, ty) { return false }
+  seen.push(ty)
   const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a function type owes
   // this walk a descent, and a silent leaf here answers `false` for a type that does mention one.
@@ -1884,19 +1880,19 @@ function tyMentionsFunc(ty: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return tyMentionsFunc(tyElemOf(t), depth + 1)
+      return tyMentionsFunc(tyElemOf(t), seen)
     }
     TyNullable => {
-      return tyMentionsFunc(t.nInner, depth + 1)
+      return tyMentionsFunc(t.nInner, seen)
     }
     TyMap => {
-      return tyMentionsFunc(tyValOf(t), depth + 1)
+      return tyMentionsFunc(tyValOf(t), seen)
     }
     TyUnion => {
       const ms = t.uMembers
       let i = 0
       while i < ms.length {
-        if tyMentionsFunc(ms[i], depth + 1) { return true }
+        if tyMentionsFunc(ms[i], seen) { return true }
         i = i + 1
       }
     }
@@ -1904,7 +1900,7 @@ function tyMentionsFunc(ty: i32, depth: i32): boolean {
       const fts = t.objFieldTypes
       let k = 0
       while k < fts.length {
-        if tyMentionsFunc(fts[k], depth + 1) { return true }
+        if tyMentionsFunc(fts[k], seen) { return true }
         k = k + 1
       }
     }
@@ -1953,7 +1949,7 @@ function arrElemIsClosureArena(arrIx: i32, fnIx: i32): boolean {
     // A value union with a function arm is the fourth: its element is the union's box, which
     // the annotated `(F | string)[]` already keys as one (D4347).
     if et is TyUnion { return false }
-    return tyMentionsFunc(ety, 0)
+    return tyMentionsFunc(ety, [])
   }
   return false
 }
@@ -1999,14 +1995,15 @@ function arrLitElemRendersNoMap(arrIx: i32, fnIx: i32): boolean {
 // resolves its struct row through `structIndexByName`, which answers only for a declared
 // name — so the structural key leaves a nested literal's element row unfindable (D1884).
 function nestedNulRefElemNominal(innerArrTy: i32): string {
-  return nestedNulRefElemNominalAt(innerArrTy, 0)
+  return nestedNulRefElemNominalAt(innerArrTy, [])
 }
 
 // The walk itself. Recurses through further nesting levels so `[[[{n: 42}, null]]]` names its
-// element too; the bound is a guard against a cyclic arena row, not a policy — past it the
-// walk declines and the structural render below stands.
-function nestedNulRefElemNominalAt(innerArrTy: i32, depth: i32): string {
-  if depth > 8 { return "" }
+// element too; a list type `seen` already holds is a cyclic arena row, where the walk declines and
+// the structural render below stands.
+function nestedNulRefElemNominalAt(innerArrTy: i32, seen: i32[]): string {
+  if i32ListHas(seen, innerArrTy) { return "" }
+  seen.push(innerArrTy)
   // This level: grouped, which is the spelling the annotation interns and the one
   // `refElemArrName` peels back.
   const here = nulRefElemNameOfArrTy(innerArrTy)
@@ -2014,7 +2011,7 @@ function nestedNulRefElemNominalAt(innerArrTy: i32, depth: i32): string {
   // ...else one level further down, so `[[[{n: 42}, null]]]` names its element too. A leaf
   // that is not a nullable and not another list has no nominal half to recover, and
   // `nodeArrayElemName`'s structural render stands.
-  const deeper = nestedNulRefElemNominalAt(tyArrayElemIx(innerArrTy), depth + 1)
+  const deeper = nestedNulRefElemNominalAt(tyArrayElemIx(innerArrTy), seen)
   if deeper == "" { return "" }
   return arrLitNulRefGrouped(deeper + "[]", innerArrTy)
 }
@@ -2049,34 +2046,36 @@ export function arrLitElemRender(arrIx: i32, fnIx: i32): string {
 // declared records by name: parenthesized when bare, as `nodeArrayElemName` keys it. "" for a
 // signature with a type variable, which that render keys at its pin instead.
 export function fnElemNominalName(e: i32): string {
-  if tyHasTyVar(e) || fnSigNamesLit(e, 8) { return "" }
+  if tyHasTyVar(e) || fnSigNamesLit(e, []) { return "" }
   const fnm = tyToNominalName(e)
   if fnm == "" || tyNomNameCycled() { return "" }
   if tyAt(e) is TyFunc { return "(" + fnm + ")" }
   return fnm
 }
 
-// Whether function type `ty` has a literal outside its records within `depth` levels, or is
-// deeper: the render softens a literal union to its base where the nominal name keeps it.
-function fnSigNamesLit(ty: i32, depth: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return true }
+// Whether function type `ty` has a literal outside its records: the render softens a literal union
+// to its base where the nominal name keeps it. Each type is walked once (`seen`).
+function fnSigNamesLit(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return true }
+  if i32ListHas(seen, ty) { return false }
+  seen.push(ty)
   const t = tyAt(ty)
   return match t {
     TyLit => true
-    TyNullable => fnSigNamesLit(t.nInner, depth - 1)
-    TyArray => fnSigNamesLit(tyElemOf(t), depth - 1)
-    TyMap => fnSigNamesLit(tyKeyOf(t), depth - 1) || fnSigNamesLit(tyValOf(t), depth - 1)
+    TyNullable => fnSigNamesLit(t.nInner, seen)
+    TyArray => fnSigNamesLit(tyElemOf(t), seen)
+    TyMap => fnSigNamesLit(tyKeyOf(t), seen) || fnSigNamesLit(tyValOf(t), seen)
     TyUnion => {
       for m in t.uMembers {
-        if fnSigNamesLit(m, depth - 1) { return true }
+        if fnSigNamesLit(m, seen) { return true }
       }
       false
     }
     TyFunc => {
       for p in t.fnParamTypes {
-        if fnSigNamesLit(p, depth - 1) { return true }
+        if fnSigNamesLit(p, seen) { return true }
       }
-      fnSigNamesLit(t.fnRet, depth - 1)
+      fnSigNamesLit(t.fnRet, seen)
     }
     TyObj | TyPrim | TyVar | TyErr | TyNeg => false
   }
@@ -2312,12 +2311,16 @@ export function arrLitLeadInner(a: ArrayLit): i32 {
 }
 
 // True if the type tree at `ty` mentions a literal-union type or an object shape anywhere,
-// depth-bounded, gating which `arrLitElemHintTy` arms are safe to hint.
-export function tyMentionsLitOrObj(ty: i32, depth: i32): boolean {
-  if ty < 0 { return false }
-  // The depth bound is a recursion guard, not a policy: a self-referential row would
-  // otherwise walk forever, and past this depth the arm declines rather than guesses.
-  if depth > 6 { return false }
+// gating which `arrLitElemHintTy` arms are safe to hint.
+export function tyMentionsLitOrObj(ty: i32): boolean {
+  const seen: i32[] = []
+  return tyMentionsLitOrObjIn(ty, seen)
+}
+
+// A self-referential row met again adds nothing its first visit did not.
+function tyMentionsLitOrObjIn(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || i32ListHas(seen, ty) { return false }
+  seen.push(ty)
   const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a literal or an
   // object owes this walk a descent, and a silent leaf answers `false` for a type that does.
@@ -2329,16 +2332,16 @@ export function tyMentionsLitOrObj(ty: i32, depth: i32): boolean {
       return true
     }
     TyArray => {
-      return tyMentionsLitOrObj(tyElemOf(t), depth + 1)
+      return tyMentionsLitOrObjIn(tyElemOf(t), seen)
     }
     TyNullable => {
-      return tyMentionsLitOrObj(t.nInner, depth + 1)
+      return tyMentionsLitOrObjIn(t.nInner, seen)
     }
     TyUnion => {
       const ms = t.uMembers
       let i = 0
       while i < ms.length {
-        if tyMentionsLitOrObj(ms[i], depth + 1) { return true }
+        if tyMentionsLitOrObjIn(ms[i], seen) { return true }
         i = i + 1
       }
       return false
@@ -2347,10 +2350,10 @@ export function tyMentionsLitOrObj(ty: i32, depth: i32): boolean {
       const ps = t.fnParamTypes
       let i = 0
       while i < ps.length {
-        if tyMentionsLitOrObj(ps[i], depth + 1) { return true }
+        if tyMentionsLitOrObjIn(ps[i], seen) { return true }
         i = i + 1
       }
-      return tyMentionsLitOrObj(t.fnRet, depth + 1)
+      return tyMentionsLitOrObjIn(t.fnRet, seen)
     }
     TyPrim | TyErr | TyMap | TyVar | TyNeg => {
       // A leaf: neither a literal nor an object, and nothing under it.
@@ -3193,9 +3196,8 @@ export function variantLitPairKind(a: i32, b: i32): i32 {
 
 // Whether arm-table flat rows `ra` and `rb` hold one field code.
 function armCodesEq(ra: i32, rb: i32, site: string): boolean {
-  const codes = armFieldTypes()
   const tys = armFieldStoreTy()
-  return fieldCodeIn(codes, tys, ra, site) == fieldCodeIn(codes, tys, rb, site)
+  return fieldCodeIn(tys, ra, site) == fieldCodeIn(tys, rb, site)
 }
 
 // Is variant field `fi` a string literal set in both arms whose storages differ only by the
@@ -3595,7 +3597,7 @@ function sigRowMayMatch(si: i32, j: i32): boolean {
 // Whether a render of the field at flat index `fi` may match the field at `fj`: false only
 // for a nested record against a non-record field, or against one of another canonical record.
 function sigFieldMayMatch(fi: i32, fj: i32): boolean {
-  if fi >= sFieldTypes.length || fj < 0 || fj >= sFieldTypes.length {
+  if fi >= sFieldNames.length || fj < 0 || fj >= sFieldNames.length {
     return true
   }
   if !fieldRowIsRecordRef(fi) { return true }
@@ -3712,11 +3714,7 @@ export function famRelayStructRow(si: i32) {
   while fi < sFieldCount[si] {
     const sr = sFieldStart[si] + fi
     const lty = famRelay.get(c + sFieldNames[sr])
-    if (
-      lty != null
-      && fieldCodeIn(sFieldTypes, sFieldStoreTy, sr, "famRelay") == FC_I32
-    ) {
-      sFieldTypes[sr] = FC_STR
+    if (lty != null && fieldCodeIn(sFieldStoreTy, sr, "famRelay") == FC_I32) {
       sFieldElemName[sr] = litUnionInlineNameOfTy(lty)
       storeTyPut(sFieldStoreTy, sr, TY_STR)
       tyRegNoteWrite()

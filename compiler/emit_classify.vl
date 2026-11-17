@@ -12,7 +12,7 @@ import {
   tyPathWith,
   tyPrimNameIs,
 } from "./check_types"
-import { storageNormTy, widenLitTy } from "./check_relate_core"
+import { luElemTy, storageNormTy, widenLitTy } from "./check_relate_core"
 import { unionTyMemberTys } from "./emit_map_twins"
 import { REC_STORE_DEPTH } from "./check_ty_relate"
 import { registeredUnionRowOfTy } from "./emit_start_block"
@@ -134,7 +134,7 @@ import {
   nameIsMemStoreIntrinsic,
 } from "./check_intrinsics"
 import { fusedMapReadRecvIx } from "./check_leaf_steps"
-import { isVarTyIxOf, luMembersAt } from "./check_list_union"
+import { isVarTyIxOf, luMembersAt, luPinDeclines } from "./check_list_union"
 import {
   narrowedFromTyOf,
   nodeArrayElemIsBareStrLit,
@@ -707,7 +707,6 @@ import {
   declaredStructIndex,
   drwFieldClosure,
   enclosingLoopVarBinds,
-  fieldCodeVKind,
   fnBlockShadowsAt,
   fnRetVariantIndexSid,
   frameBodyEnd,
@@ -791,7 +790,6 @@ import {
   VKind,
   armFieldNames,
   armFieldStoreTy,
-  armFieldTypes,
   arrLitMint,
   capCountTbl,
   capNamesFlat,
@@ -843,7 +841,6 @@ import {
   sFieldCount,
   sFieldStart,
   sFieldStoreTy,
-  sFieldTypes,
   sHeapIdx,
   sIsRefRow,
   sLitIdRow,
@@ -7018,7 +7015,7 @@ export function arrLitElemHintTy(arrIx: i32, fnIx: i32) {
     if arrElemIsClosureTy(arrIx, fnIx) {
       const cty = arrLitArenaElemRow(arrIx)
       if cty < 0 { return -1 }
-      if tyMentionsLitOrObj(cty, 0) { return -1 }
+      if tyMentionsLitOrObj(cty) { return -1 }
       // A row still carrying a hole is the TEMPLATE's, and the name arm answered through the
       // hole's pin — hinting the unsubstituted row would key a second one (D1794).
       if tyHasTyVar(cty) { return -1 }
@@ -10036,9 +10033,37 @@ export function listElemRepIsRow(arr: i32, fnIx: i32): boolean {
     || k == "nulvariant")
 }
 
+// Whether `iter` is a `for` iterable that is a union-of-lists box a pin typed and its instance
+// walks per arm, binding the element union's box (D16897).
+export function luForUnionIter(iter: i32, fnIx: i32): boolean {
+  if fnIx < 0 || iter < 0 || !exprUnion(iter, fnIx) { return false }
+  const ms = luMembersAt(nodeTyAt(iter, fnIx))
+  return ms.length > 0 && !luPinDeclines(ms)
+}
+
+// The rep kind of the element union a `for` over `iter` binds (`luForUnionIter`); null for none.
+export function luForElemKind(iter: i32, fnIx: i32): VKind | null {
+  const u = luElemTy(luMembersAt(nodeTyAt(iter, fnIx)))
+  return if u >= 0 { repSigKindOfTy(u) } else { null }
+}
+
+// Whether a per-arm `for` over `iter`, or element read at `ix`, widens a literal-union arm into
+// a string element union, which stages the atom in the string-op frame.
+export function luForWidensStr(iter: i32, fnIx: i32): boolean {
+  if !luForUnionIter(iter, fnIx) { return false }
+  const k = luForElemKind(iter, fnIx)
+  return k == "str" || k == "nulstr"
+}
+
+export function luIndexWidensStr(ix: i32, fnIx: i32): boolean {
+  if !luArmIndexReads(ix, fnIx) { return false }
+  const k = repSigKindOfTy(nodeTyAt(ix, fnIx))
+  return k == "str" || k == "nulstr"
+}
+
 // Whether `ix` is an element read of a union-of-lists box that a pin typed and its instance
-// reads per arm, leaving the element union's box (D16897): a re-readable receiver.
-export function luArmIndexBoxes(ix: i32, fnIx: i32): boolean {
+// reads per arm (D16897): a re-readable receiver.
+export function luArmIndexReads(ix: i32, fnIx: i32): boolean {
   if fnIx < 0 || ix < 0 { return false }
   const n = nodeAt(ix)
   if !(n is Index) { return false }
@@ -10047,6 +10072,13 @@ export function luArmIndexBoxes(ix: i32, fnIx: i32): boolean {
     return false
   }
   return luMembersAt(nodeTyAt(recv, fnIx)).length > 0
+}
+
+// Whether such a read leaves the element union's box: its rep is a union box, not the string
+// a literal union joined with `string` is.
+export function luArmIndexBoxes(ix: i32, fnIx: i32): boolean {
+  return luArmIndexReads(ix, fnIx)
+    && repSigKindOfTy(nodeTyAt(ix, fnIx)) == "union"
 }
 
 function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
@@ -11405,12 +11437,7 @@ function ovnStoredAlike(ty: i32, vi: i32): boolean {
     let fj = 0
     while fj < uFieldCount[vi] {
       if armFieldNames()[start + fj] == t.objFieldNames[i] {
-        const ac = fieldCodeIn(
-          armFieldTypes(),
-          armFieldStoreTy(),
-          start + fj,
-          "armObjFit",
-        )
+        const ac = fieldCodeIn(armFieldStoreTy(), start + fj, "armObjFit")
         if lc != ac && !isNullTy(ft) { return false }
       }
       fj = fj + 1
@@ -13320,20 +13347,19 @@ function armFieldPos(vi: i32, fi: i32): i32 {
 
 // The field code at a `memberFieldPos` row, or -1 for none.
 function fieldPosCode(p: i32): i32 {
-  if p >= 0 { return fieldCodeIn(sFieldTypes, sFieldStoreTy, p, "fieldPos") }
-  if p <= -3 {
-    return fieldCodeIn(armFieldTypes(), armFieldStoreTy(), -3 - p, "fieldPos")
-  }
+  if p >= 0 { return fieldCodeIn(sFieldStoreTy, p, "fieldPos") }
+  if p <= -3 { return fieldCodeIn(armFieldStoreTy(), -3 - p, "fieldPos") }
   return -1
 }
 
 // The kind struct `si`'s field `fi` is stored at, from its storage type, null where that type has
-// no rep (a hole, a type parameter); the field code answers only where no storage type is
-// recorded. A code-15 field's storage type carries `null`, so it never owes a recover.
+// no rep; a field with no storage type fails loudly (`fieldCodeIn`). A code-15 field's storage
+// type carries `null`, so it never owes a recover.
 export function sFieldStoreKind(si: i32, fi: i32): VKind | null {
   const ty = fieldPosStoreTy(sFieldStart[si] + fi)
   if ty >= 0 { return repOfTy(ty).rdKind }
-  return fieldCodeVKind(sFieldTypeAt(si, fi))
+  sFieldTypeAt(si, fi)
+  return null
 }
 
 // Whether struct `si`'s field `fi` holds the union box.
@@ -13437,6 +13463,11 @@ export function exprString(exprIx: i32, fnIx: i32) {
   // Before mono, the checked rep (the arms below read the generic template).
   if !emitPhaseReached("monomorphized") {
     return nodeRepIs(exprIx, "str", fnIx)
+  }
+  // A per-arm element read of a union of lists is its element union's rep.
+  const ux = unwrapParen(exprIx)
+  if luArmIndexReads(ux, fnIx) {
+    return repSigKindOfTy(nodeTyAt(ux, fnIx)) == "str"
   }
   // A name, field or element read is a string when what it reads there is one; a read whose
   // storage the read rep does not cover, or a literal-union atom store, keeps the arms below.
