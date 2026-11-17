@@ -31,3 +31,4 @@ change.
 | corpus shadow (mode 1) | 25,061 covered = matched | the same |
 | corpus blocker census (mode 4) | – | identical output |
 | mode 3 self-build | byte-identical | byte-identical |
+| corpus identity, 12,297 cells | – | 9,029 identical, 3,268 fail under both, 0 differ |
