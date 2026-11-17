@@ -729,19 +729,16 @@ lowering through the op seam (§5.2) instead of its own ladder. A slice therefor
 occurrence counts quoted. Families still behind an unshared decision wait for that decision to
 become shared, and they do not count as "fully matched" before then.
 
-**Claiming is parked until it pays.** Whole-function claiming (CLAIMED at the function seam)
-deletes nothing on its own, because unclaimed functions keep the legacy drivers alive. It also
-costs fuel: +0.021% for claiming {scalar, control, call, global}, because the IR's build plus
-lowering is slightly dearer than legacy's direct emit. So CLAIMED stays empty until one of two
-things holds:
-- a claim lets a family's or a driver's legacy path delete;
-- the builder is fuel-neutral, which a builder cost profile measures.
-
-Until then, cutover slices go through the op seam, starting with C1: the shared scalar opcode
-table, with the legacy ladders deleted. The armed gate's claim test mode keeps re-proving the
-claim evidence on every merge. The first PR that makes CLAIMED non-empty adds a blocking
-unarmed row that asserts zero `claim fell back`, with a verifier fallback counted as a hard
-failure.
+**Claiming is on (2026-11-17).** `CLAIMED` holds scalar, control, call, global and map, so a
+function built wholly of those families ships the IR's bytes and legacy does not run for it.
+Claiming was parked while it deleted nothing; it was turned on because the IR shipping is the
+goal and its cost (+0.02% L2 fuel) is far under the tier. Deletions follow as the claimed share
+grows: once every function that reaches a legacy driver is claimed, that driver deletes. The
+armed shadow still checks the unclaimed functions. The blocking unarmed `ir claims` gate row
+(`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back`, with a verifier
+fallback counted as a hard failure, so a lowering regression cannot hide behind legacy's bytes.
+A coverage step now widens what ships; it quotes the claimed counts beside its coverage.
+Op-seam slices still delete legacy ladders, starting with C1, the shared scalar opcode table.
 
 **A coverage step is graded on coverage, not lines.** Some steps widen what the builder covers
 where legacy has no IR duplicate to delete, so they cannot be net-negative in lines. An example is

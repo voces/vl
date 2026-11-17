@@ -385,6 +385,33 @@ Deno.test({
   },
 });
 
+// The shipped claim (`CLAIMED`, report-only mode 5): a covered function ships the IR's bytes, which
+// match legacy's (armed, legacy always runs); a verifier failure on the claim path falls back to
+// legacy and is counted, which the gate's `ir claims` row reds on.
+Deno.test({
+  name: "ir claim: the shipped claim emits legacy's bytes, and a broken claim falls back loudly",
+  ignore,
+  fn: () => {
+    const shipped = run(COVERED, 5);
+    if (shipped.rc !== 0) throw new Error(`want compileSrc rc 0, got ${shipped.rc}`);
+    const n = shipped.rows.get("claimed") ?? 0;
+    if (n < 6) throw new Error(`want at least 6 claimed, got ${JSON.stringify([...shipped.rows])}`);
+    const fell = [...shipped.rows.keys()].filter((k) => k.startsWith("claim fell back"));
+    if (fell.length > 0) throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
+    const legacy = run(COVERED, 1);
+    if (legacy.out.length !== shipped.out.length || legacy.out.some((b, i) => b !== shipped.out[i])) {
+      throw new Error(`want the shipped claim byte-identical to legacy (${legacy.out.length} vs ${shipped.out.length} bytes)`);
+    }
+    const broken = run(COVERED, 5, 1);
+    if ((broken.rows.get("claim fell back: verifier") ?? 0) < 1) {
+      throw new Error(`want a verifier fallback under the control, got ${JSON.stringify([...broken.rows])}`);
+    }
+    if (broken.out.length !== legacy.out.length || broken.out.some((b, i) => b !== legacy.out[i])) {
+      throw new Error(`want a fallen-back claim to ship legacy's bytes`);
+    }
+  },
+});
+
 // The verifier's own cases (`compiler/ir_selftest.vl`): hand-built IR breaking each of rules
 // 1-7 is refused under that rule, as are a fall-through and a mismatched global store, and the
 // unbroken function holds.

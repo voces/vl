@@ -12706,6 +12706,11 @@ for an order dependence that loses no `runs`.
 
 ## Rulings of 2026-11-17 (night)
 
+- **IR claiming is on (2026-11-17, coordinator, owner goal "implement IR").** The fully matched
+  families (scalar, control, call, global, map) ship the IR's bytes. The parking ruled earlier the
+  same day is reversed: shipping is the goal, and the claim costs +0.02% L2. A blocking `ir claims`
+  gate row asserts zero fallbacks. Legacy deletions follow as the claimed share grows (design §10).
+
 - **A1 keys a fresh literal at its contextual type;** the edge coercion applies only to a non-fresh value, and
   D965's no-implicit-container-copy stands. A lambda passed to a generic builds its fresh result literals at
   the bound result once the call binds `T` (TS's two-phase inference), but only when every value it returns
