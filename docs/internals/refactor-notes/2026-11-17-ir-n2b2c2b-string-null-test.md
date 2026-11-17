@@ -24,6 +24,12 @@ emitted byte moves.
 
   `RPrint` takes the `nulStr` arm over that rep.
 - `NulTestArm` grows from 6 to 12 members in `compiler/lint.vl`.
+- **No claim hazard** (§10): `binNulTestOf` reads only the compare's syntax, and `nulTestArmOf`
+  reads the elaboration (`readNarrowedStoreAt`), the checker's types and the rep layer
+  (`repOfNode`, `readRepOf`, `nodeRep`), none of which legacy's body lowering writes.
+- **Follow-up:** the lowering's `nulTestOp` names its three arms and misses on the rest
+  (`null test <arm>`), and legacy's `mapHas` arm fails with a sentence where its operand is no
+  index read, which `nulTestArmOf` never answers.
 
 ## Pins
 
