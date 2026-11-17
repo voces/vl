@@ -48,3 +48,16 @@ or by a named builder miss:
 - the global storage classes, open temps and lifted capture slots decided at lowering, now builder misses;
 - masked shifts (`shiftMaskFoldOf`), a written empty `else` (`SIf.siElseKw`), the valued fall-through pad
   (`fallThroughPadOf`), kept-tree consts, in-place string appends and folded atom compares (IR3's commits).
+
+## What gate162 found, and how each closed
+
+Both were claimed functions that legacy handles and the IR did not; neither showed in the corpus.
+- A 10,000-link `else if` chain, `match` or if-expression chain (`tests/vl_deep_else_chain_test.ts`,
+  D1990) overflowed the compiler's stack. Legacy loops along a chain's spine, but the IR's builder,
+  verifier and lowering recurse. The builder now misses (`nesting depth`) past `IR_NEST_MAX` = 200,
+  which leaves such a function to legacy. That counter is 2 `walk-limit` findings, and they raise
+  `ir_build.vl`'s baseline from 0 to 2: it bounds stack, not a cycle. The follow-up is to loop the
+  IR's passes along the `siElse` spine and delete the bound.
+- Under `--low-memory-unused`, a call of a trivial memory accessor is inlined with its constant
+  folded into the memarg (`tests/vl_memarg_offset_test.ts`). The IR emitted a plain call. It now
+  misses (`low-memory accessor`) on legacy's own predicate, `lowMemFoldsCallee`.
