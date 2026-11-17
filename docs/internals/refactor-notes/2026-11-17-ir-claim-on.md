@@ -35,8 +35,8 @@ End to end, by IR-REV: a host built from this branch (mode 5) and a scratch seed
 corrupted seed reads 5,771 emitted, `5097 claim fell back: verifier`, rc 1. The Deno test drives the
 same fallback through the export, not through the row.
 
-Open caveat (§10): a claimed function returns before `emitResetScopeFrames`. Moving that reset above
-the claim writes no bytes and would close the caveat; it is a follow-up.
+Closed caveat (§10): a claimed function used to return before `emitResetScopeFrames`. The reset now
+runs above the claim and writes no bytes: the seed is byte-identical.
 
 ## What the corpus comparison found, and how each class closed
 
