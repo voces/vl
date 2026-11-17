@@ -52,14 +52,14 @@ no literal, a named miss; the census test's row reads `coalesce string default`.
 | reading | N3 | this step | gained |
 |---|---:|---:|---:|
 | self-compile claimed in mode 3 | 5,728 | 5,732 | +4 |
-| corpus covered = matched (12,296 cells) | 23,593 | S2COV | S2GAIN |
+| corpus covered = matched (12,296 cells) | 23,593 | 24,099 | +506 |
 
 ## Bars
 
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches N3 already reports |
-| corpus identity against the N3 seed, 12,294 cells | IDROW |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,732 claimed and byte-identical, the same 2 fallbacks; corpus M3ROW |
-| L2 self-compile fuel | FUELROW |
-| seed size, N3 seed to this one | SEEDROW |
+| corpus identity against the N3 seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the niche split moves no corpus byte) |
+| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,732 claimed and byte-identical, the same 2 fallbacks; corpus 9,016 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 94,325,285,366 to 94,380,806,992 (+0.06%) |
+| seed size, N3 seed to this one | 6,540,580 to 6,543,334 (+2,754) |
