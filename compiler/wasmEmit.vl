@@ -36539,15 +36539,17 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   const heaps: i32[] = []
   const eTags: i32[] = []
   const eBoxes: i32[] = []
-  const eNonNull: boolean[] = []
+  const eNul: boolean[] = []
   for m in arms {
     const t = listIsArmTag(m)
     const h = listArmHeapOf(m)
     const e = tyArrayElemIx(m)
-    const ek = if e >= 0 { boxTagOfTy(e) } else { -1 }
-    let et = if e >= 0 { listIsArmTag(e) } else { -1 }
-    if et < 0 && ek >= 0 { et = scalarTagOfKind(ek) }
-    if t < 0 || h < 0 || listBackOfWrap(h) < 0 || et < 0 || ek < 0 {
+    const en = if e >= 0 { nonNullTy(e) } else { -1 }
+    const ek = if en >= 0 { boxTagOfTy(en) } else { -1 }
+    const scalar = ek >= 0 && !atomIsRefKind(ek)
+    const nul = en != e
+    const et = if en >= 0 { isArmTagOfTy(en) } else { -1 }
+    if t < 0 || h < 0 || listBackOfWrap(h) < 0 || et < 0 || (scalar && nul) {
       return emitFail("emitProgram: a union-of-lists `for` arm has no tag, wrapper or element box")
     }
     if unMemIsRefElemArray(m) && rvMayView(unMemRefArrArmSlot(m)) {
@@ -36556,8 +36558,8 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     tags.push(t)
     heaps.push(h)
     eTags.push(et)
-    eBoxes.push(if atomIsRefKind(ek) { -1 } else { vbHeapIdxOfKind(ek) })
-    eNonNull.push(atomIsRefKind(ek) && !tyAdmitsNull(e))
+    eBoxes.push(if scalar { vbHeapIdxOfKind(ek) } else { -1 })
+    eNul.push(nul)
   }
   if u < 0 { return emitFail("emitProgram: a union-of-lists `for` has no element union") }
   const hasPair = s.fiVar2 != ""
@@ -36574,6 +36576,8 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   fbLocalSet(lIdx)
   fbI32Const(0)
   fbLocalSet(iIdx)
+  const hoist = loopHoistOpen(-1, s.fiBody, fnIx, s.fiDecl1, s.fiDecl2)
+  if hoist < 0 { return -1 }
   fbBlock(64)
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.fiLabel)
@@ -36584,7 +36588,7 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   if emitListUnionArmChain(lIdx, tags, heaps, LU_ARM_LEN, 0) < 0 { return -1 }
   fbI32Bin(78) // 0x4e i32.ge_s
   fbBrIf(1)
-  if emitListUnionForElem(lIdx, iIdx, tags, heaps, eTags, eBoxes, eNonNull, 0) < 0 {
+  if emitListUnionForElem(lIdx, iIdx, tags, heaps, eTags, eBoxes, eNul, 0) < 0 {
     return -1
   }
   fbLocalSet(vIdx)
@@ -36596,7 +36600,11 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   fbI32Const(1)
   fbI32Bin(106) // 0x6a i32.add
   fbLocalSet(iIdx)
+  scopeBind(s.fiVar, vSlot)
+  if hasPair { scopeBind(s.fiVar2, vSlot + 3) }
   if emitStmts(s.fiBody, fnIx) < 0 { return -1 }
+  if hasPair { scopeUnbind() }
+  scopeUnbind()
   fbBr(0)
   fbEnd()
   loopContDepth.pop()
@@ -36604,12 +36612,13 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   fbEnd()
   loopBrkDepth.pop()
   loopBrkLabel.pop()
+  loopHoistClose(hoist)
   return 1
 }
 
 // Arm `i` onward of `emitListUnionFor`'s element read over the box in local `box` at cursor
-// `cur`: the element union's tag, then the element off that arm's backing, wrapped in its value
-// box when it is a scalar, as one union box.
+// `cur`, as one element-union box: a scalar wrapped in its value box, a `null` read off a
+// nullable element under the null tag.
 function emitListUnionForElem(
   box: i32,
   cur: i32,
@@ -36617,7 +36626,7 @@ function emitListUnionForElem(
   heaps: i32[],
   eTags: i32[],
   eBoxes: i32[],
-  eNonNull: boolean[],
+  eNul: boolean[],
   i: i32,
 ): i32 {
   if i >= tags.length {
@@ -36629,21 +36638,36 @@ function emitListUnionForElem(
   fbI32Rel(RS_TAG, tags[i])
   fbI32Bin(70) // 0x46 i32.eq
   fbIfRef(uBoxIdx)
+  if eNul[i] {
+    emitListUnionForRead(box, cur, heaps[i])
+    fbRefIsNull()
+    fbIfRef(uBoxIdx)
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone()
+    fbStructNew(uBoxIdx)
+    fbElse()
+  }
   fbI32Rel(RS_TAG, eTags[i])
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(heaps[i])
-  fbStructGet(heaps[i], 0) // field 0: the backing
-  fbLocalGet(cur)
-  fbArrayGet(listBackOfWrap(heaps[i]))
-  if eNonNull[i] { fbRefAsNonNull() }
+  emitListUnionForRead(box, cur, heaps[i])
   if eBoxes[i] >= 0 { fbStructNew(eBoxes[i]) }
   fbStructNew(uBoxIdx)
+  if eNul[i] { fbEnd() }
   fbElse()
-  if emitListUnionForElem(box, cur, tags, heaps, eTags, eBoxes, eNonNull, i + 1) < 0 {
+  if emitListUnionForElem(box, cur, tags, heaps, eTags, eBoxes, eNul, i + 1) < 0 {
     return -1
   }
   fbEnd()
+  return 0
+}
+
+// The element at cursor `cur` of the list arm wrapped by heap `heap` in the box in local `box`.
+function emitListUnionForRead(box: i32, cur: i32, heap: i32) {
+  fbLocalGet(box)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbStructGet(heap, 0) // field 0: the backing
+  fbLocalGet(cur)
+  fbArrayGet(listBackOfWrap(heap))
   return 0
 }
 
