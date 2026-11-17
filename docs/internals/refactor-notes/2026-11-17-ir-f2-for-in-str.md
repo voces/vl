@@ -1,9 +1,10 @@
 # IR F2: a string's code-point walk through legacy's own loop, 2026-11-17
 
-Lane IR-C. F1 left one walk the corpus holds above all others: `for c in s` over a string, which
+Lanes IR-C, then IR2. F1 left one walk the corpus holds above all others: `for c in s` over a string, which
 legacy walks one code point at a time. On the A1 seed, 2,026 corpus functions held one, and 1,013
 held nothing else the IR missed (F1's table). The self-compile held 23, and 13 alone. This step
-moves that walk onto F1's seam. `CLAIMED` stays empty, and no emitted byte moves.
+moves that walk onto F1's seam. `SForIn` is a `control` node, so a claimed function ships the
+IR's walk; corpus identity shows no emitted byte moves.
 
 ## What landed
 
@@ -24,17 +25,25 @@ values.
 
 ## Coverage
 
+Each tree is built from its own fixpoint seed and its own checkout: F1 (#8955) over master
+7974bfd7, and this step.
+
 | reading | F1 | this step | gained |
 |---|---:|---:|---:|
-| self-compile claimed in mode 3 | 6,636 | 6,640 | +4 |
-| corpus covered = matched (12,296 cells) | 25,060 | 25,736 | +676 (the rest also hold a walk's branch, a hoisted walk or another miss) |
+| self-compile claimed and shipped (`--claims`) | 2,214 | 2,215 | +1 |
+| self-compile covered = matched (armed) | 6,679 | 6,683 | +4 |
+| corpus covered = matched (12,297 cells) | 25,062 | 25,738 | +676 |
+| corpus claimed and shipped | 10,869 | 10,869 | 0: the corpus's string walks sit in functions that also hold an unclaimed family |
+
+The first miss `for in string source` falls from 2,025 to 0 on the corpus. Net compiler lines are
++16 (+37, −21): 42 corpus functions per line.
 
 ## Bars
 
 | bar | reading |
 |---|---|
-| self-build | fixpoint; the armed self-build is byte-identical, with 0 mismatches (6,640 covered, 6,640 matched) |
-| corpus identity against the F1 seed | 12,294 cells: 9,016 identical, 3,278 fail under both, 0 differ |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 6,640 claimed and byte-identical, 0 fell back; corpus 9,016 identical, 0 differ, 0 fell back |
-| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | F1 94,526,000,660 to 94,521,775,321 (−0.004%) |
-| seed size, F1 seed to this one | 6,551,130 to 6,551,176 (+46) |
+| self-build | fixpoint; the armed self-build is byte-identical, with 0 mismatches; the claimed self-build reproduces its fixpoint |
+| `--claims` | 0 fell back, self-compile and corpus |
+| corpus identity against F1's seed, claiming on in both | 9,029 identical, 3,268 fail under both, 0 differ |
+| L2 self-compile fuel | 96,582,062,497 to 96,584,809,420 (+0.003%), +0.4% on the baseline |
+| pin helpers in `emit_mono.vl` | 908 |
