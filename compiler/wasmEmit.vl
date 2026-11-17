@@ -7934,38 +7934,81 @@ function emitArmFieldsFit(
     }
     const yes: i32[] = []
     const no: i32[] = []
+    // A scalar member only some of whose values fit: its tag and its atom kind.
+    const partTags: i32[] = []
+    const partKinds: i32[] = []
     const mems: i32[] = []
     flattenVariantsInto(fys[i], mems)
     for mm in mems {
       const fk = tyFitKind(mm, fxs[i])
       const tags: i32[] = []
       const vis: i32[] = []
-      if fk == 2 || !unionArmTagsOfTy(mm, -1, tags, vis) || tags.length != 1 {
+      if !unionArmTagsOfTy(mm, -1, tags, vis) || tags.length != 1 {
         return emitFail(
-          "emitProgram: `is` across record arms whose shared field's box holds a member only some of whose values fit",
+          "emitProgram: `is` across record arms whose shared field's box holds a member with no one tag",
         )
       }
-      if fk == 1 { yes.push(tags[0]) } else { no.push(tags[0]) }
+      if fk == 2 {
+        const ak = scalarArmKindOfTy(mm)
+        if boxFitLexes(ak, fxs[i]).length == 0 {
+          return emitFail(
+            "emitProgram: `is` across record arms whose shared field's box holds a member only some of whose values fit, and they are not a literal set",
+          )
+        }
+        partTags.push(tags[0])
+        partKinds.push(ak)
+      } else if fk == 1 {
+        yes.push(tags[0])
+      } else {
+        no.push(tags[0])
+      }
     }
     for t in yes {
+      if i32ListHas(no, t) || i32ListHas(partTags, t) {
+        return emitFail(
+          "emitProgram: `is` across record arms whose shared field's box tags a fitting and a non-fitting member alike",
+        )
+      }
+    }
+    for t in partTags {
       if i32ListHas(no, t) {
         return emitFail(
           "emitProgram: `is` across record arms whose shared field's box tags a fitting and a non-fitting member alike",
         )
       }
     }
-    if yes.length == 0 { fbI32Const(0) }
+    if yes.length == 0 && partTags.length == 0 { fbI32Const(0) }
     let j = 0
     while j < yes.length {
-      if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1)
-      fbRefCast(variantHeap(yi))
-      fbStructGet(variantHeap(yi), fi)
+      if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
       fbStructGet(uBoxIdx, 0)
       fbI32Rel(RS_TAG, yes[j])
       fbI32Bin(70)
       if j > 0 { fbI32Bin(114) }
       j = j + 1
+    }
+    let pj = 0
+    while pj < partTags.length {
+      // The member's tag, then inside it its payload against the fitting literals.
+      if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 0)
+      fbI32Rel(RS_TAG, partTags[pj])
+      fbI32Bin(70)
+      fbIf(127)
+      const partLexes = boxFitLexes(partKinds[pj], fxs[i])
+      let lj = 0
+      while lj < partLexes.length {
+        if emitArmBoxField(recv, yi, fi, fnIx, slot) < 0 { return -1 }
+        if emitUnionUnboxTail(partKinds[pj]) < 0 { return -1 }
+        if emitAtomLitEq(partKinds[pj], partLexes[lj], fnIx) < 0 { return -1 }
+        if lj > 0 { fbI32Bin(114) }
+        lj = lj + 1
+      }
+      fbElse()
+      fbI32Const(0)
+      fbEnd()
+      if j + pj > 0 { fbI32Bin(114) }
+      pj = pj + 1
     }
     if i > 0 {
       fbI32Bin(113) // i32.and
@@ -7974,6 +8017,62 @@ function emitArmFieldsFit(
   }
   if names.length == 0 { fbI32Const(1) }
   return 0
+}
+
+// The arm-`yi` payload's field `fi`, a union box, read off the receiver.
+function emitArmBoxField(
+  recv: i32,
+  yi: i32,
+  fi: i32,
+  fnIx: i32,
+  slot: i32,
+): i32 {
+  if emitSharedFieldRecv(recv, fnIx, slot) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(variantHeap(yi))
+  fbStructGet(variantHeap(yi), fi)
+  return 0
+}
+
+// The literal members of `fx` a box payload of atom kind `ak` can equal: the quoted ones for a
+// string, the numeric ones for `i32`, `i64` or `f64`; none for any other kind.
+function boxFitLexes(ak: i32, fx: i32): string[] {
+  const out: string[] = []
+  if ak != 0 && ak != 2 && ak != 3 && ak != 4 { return out }
+  const ms: i32[] = []
+  flattenVariantsInto(fx, ms)
+  for m in ms {
+    const mt = tyAt(m)
+    if mt is TyLit {
+      if ak == 2 && mt.litKind == "str" { out.push(quoteLex(mt.litText)) }
+      if ak != 2 && mt.litKind == "int" { out.push(mt.litText) }
+    }
+  }
+  return out
+}
+
+// Compares the unboxed payload of atom kind `ak` on the stack with literal `lex`, leaving an i32.
+function emitAtomLitEq(ak: i32, lex: string, fnIx: i32): i32 {
+  if ak == 2 { return emitStrEqLit(mkStr(lex, -1), fnIx) }
+  if ak == 0 {
+    fbI32Const(parseI32(lex))
+    fbI32Bin(70) // 0x46 i32.eq
+    return 0
+  }
+  if ak == 3 {
+    const pr = parseI64Pair(lex)
+    fbI64Const(pr[0], pr[1])
+    fbI32Bin(81) // 0x51 i64.eq
+    return 0
+  }
+  if ak == 4 {
+    fbF64Const(lex)
+    fbI32Bin(97) // 0x61 f64.eq
+    return 0
+  }
+  return emitFail(
+    "emitProgram: a box payload of this atom kind has no literal compare",
+  )
 }
 
 // The `string | null` read rule for a field of code `code`, shared by every struct and variant
@@ -25163,6 +25262,16 @@ function emitAsUnionOpt(
     if emitUnionUnboxTail(ak) < 0 { return -1 }
     fbElse()
     fbI32Const(2) // the null sentinel
+    fbEnd()
+    return 0
+  }
+  // A function arm's `F | null` is the nullable closure ref: the payload on the hit, a null.
+  if ak == 11 {
+    fbIfRefNul(cloStructIdx, true)
+    fbLocalGet(unionAsBoxSlot())
+    if emitUnionUnboxTail(ak) < 0 { return -1 }
+    fbElse()
+    fbRefNull(cloStructIdx)
     fbEnd()
     return 0
   }
