@@ -1,8 +1,8 @@
 # Rep ADT stage 3e: a field with no rep fails loudly, and the code floors go, 2026-11-17 (lane REP)
 
 After D16720–D16722 (#8884, #8897), every field read derives its code from its storage type's rep.
-The consumers still kept a code floor for a row whose storage type has no rep. This step is the
-coordinator's (b), taken with (a)'s first slice, once (b)'s precondition held everywhere.
+The consumers still kept a code floor for a row whose storage type has no rep. This step takes the
+coordinator's (b) and (a) together, once (b)'s precondition held everywhere.
 
 ## The precondition
 
@@ -40,13 +40,19 @@ program that ever showed a no-rep field keeps being graded; it runs, and must ke
 - `readCellKind`'s code fallback stays: it serves member reads with no single field row (a
   shared field across union arms), which stage 5's shared-field plans own, not a missing rep.
 
+- The stored code columns go with their writers: `sFieldTypes`, `armStageTypes` and
+  `armFieldTypes()` (emit_state), their pushes in emit_collect, emit_shape_intern and
+  emit_union_atoms, the in-place writes in promote/demote and the shape-rows relay, and their
+  resets. `rowMintFrom` loses its `types` parameter; length checks read the name columns;
+  `rowDumpCodes` and the heap shadow derive codes from the storage type.
+
 | reading | value |
 |---|---|
 | corpus identity against master's compiler | 8,496 modules, 0 DIFFER, 0 LOST |
-| compiler lines | +100 / −131 |
+| L2 guest fuel, fixed seed, master `origin/master` vs this branch | 94,920,319,625 → 94,763,803,459 (−0.16%) |
+| compiler lines | +168 / −345 over 16 files |
 
 ## Next
 
-The stored code columns (`sFieldTypes`, `armStageTypes`, about 60 references in 14 files) are
-now read only where the rep answers too, or to reach `fieldCodeIn`'s failure. Deleting them is
-the follow-up.
+The field code survives only as `fieldCodeOfRep`'s answer and `readCellKind`'s shared-field
+fallback, which stage 5's shared-field plans replace.
