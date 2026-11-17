@@ -92,7 +92,7 @@ import {
   ufcsImpSpec,
   ufcsSiteRoot,
 } from "./ast"
-import { flatLayoutPinMsg, resolveAnnot } from "./check_annot_resolve"
+import { flatLayoutPinMsg, luElemTy, resolveAnnot } from "./check_annot_resolve"
 import {
   elabCapLive,
   elabFnSetTyMint,
@@ -324,6 +324,8 @@ import {
   v128NestMsg,
 } from "./check_leaf_steps"
 import {
+  luMembersAt,
+  luPinDeclines,
   monoRecheckDepth,
   monoRecheckDepthSet,
   tpIfCmpOn,
@@ -415,7 +417,8 @@ import {
   holeBindInstance,
   holeCallResultAt,
   holeSetCallRetOf,
-  joinTys,
+  joinAccNew,
+  joinTysInto,
   opSelfFnKeyFor,
   substHoleTy,
   substTyDeep,
@@ -1906,7 +1909,12 @@ export function indexFloorMsg(arrTy: i32) {
 // operation: `OP_INDEX_GET` is the index form, anything else is that member name. `site` is the
 // operation's own node, or -1 where none is at hand.
 export function memCstrMsg(recv: i32, prop: string, site: i32) {
-  if prop == OP_INDEX_GET { return indexFloorMsg(recv) }
+  if prop == OP_INDEX_GET {
+    // A pin reads a union of lists' element as the direct spelling's rewrite does (D16897).
+    const pm = luMembersAt(recv)
+    if pm.length > 0 && !luPinDeclines(pm) && luElemTy(pm) >= 0 { return "" }
+    return indexFloorMsg(recv)
+  }
   if prop == OP_CALL_PIN { return callFloorMsg(recv, site) }
   if prop == OP_CALL_GUARDED_PIN {
     if isNullTy(recv) { return "" }
@@ -1939,6 +1947,9 @@ export function memCstrMsg(recv: i32, prop: string, site: i32) {
       prop.slice(MC_LAYOUT_MARK.length, prop.length),
     )
   }
+  // A pin reads a union of lists' length as the direct spelling's list-union rewrite does; its
+  // instance reads each arm's (D16897).
+  if prop == "length" && luMembersAt(recv).length > 0 { return "" }
   const fm = memberFloorMsg(recv, prop)
   if fm != "" && memCalleeIs(site) && typeBoundSelfFnOf(recv, prop) != "" {
     return ""
@@ -3857,6 +3868,9 @@ export function dstRetypeLitArgs(
   return 0
 }
 
+// `noteNaturalRet`'s running join, renewed at a function's first return.
+let retNaturalAcc = joinAccNew()
+
 // The natural-return accumulator for the redundant-return rule (annotated funcs):
 // the FIRST non-void/non-error return observed, mirroring noteInferredRet so the
 // captured type IS what an unannotated version would infer.
@@ -3873,9 +3887,10 @@ export function noteNaturalRet(t: i32) {
   // JOIN, mirroring noteInferredRet (above) so the captured "natural" return IS what
   // an unannotated version would infer — a multi-return function joins to a union.
   if retNatural < 0 {
+    retNaturalAcc = joinAccNew()
     retNaturalSet(t)
   } else {
-    retNaturalSet(joinTys(retNatural, t))
+    retNaturalSet(joinTysInto(retNaturalAcc, retNatural, t))
   }
   return 0
 }

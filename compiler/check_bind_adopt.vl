@@ -22,6 +22,7 @@ import {
   nodeAt,
 } from "./ast"
 import {
+  IV_CALL,
   callBindCount,
   callBindIxAt,
   callBindNamesAt,
@@ -32,6 +33,12 @@ import {
   callBindRepTysSet,
   callBindRowOf,
   callBindTysAt,
+  instVecCalleeAt,
+  instVecCount,
+  instVecIxAt,
+  instVecNamesAt,
+  instVecPathAt,
+  instVecSetTyAt,
 } from "./check_bind_rows"
 import { nodeRepStamped, nodeRepTyIxOf, recCopyTyIx } from "./check_core_state"
 import { quietEnterFlat, quietLeaveFlat } from "./check_cursor"
@@ -129,6 +136,7 @@ import {
   tyFieldTyOf,
   tyHasHole,
   tyMentionsErr,
+  tyMentionsTyVarNamed,
   tySame,
   tyToStr,
 } from "./check_types"
@@ -1271,4 +1279,58 @@ function recRebuiltCallRow(lp: i32, depth: i32): i32 {
   const kd = recKeptFnDstOf(cd, own)
   const row = if kd >= 0 && kd < T.tys.length && tyAt(kd) is TyObj { kd } else { recRebuiltRetRow(cd, depth - 1) }
   return if held || row < 0 || recRepWidens(own, row) { row } else { -1 }
+}
+
+// Closes each direct call's instance vector at its delivery: a declared type parameter that only
+// bare parameters take, every argument there rebuilt at one row (`recRebuiltLeafRow`), is recorded
+// at that row, the type the elaboration builds the fresh argument at. An argument that keeps its
+// own type, two rebuilt apart, or a hole is left as the call bound it. Run once check ends.
+export function instVecDeliveryClose() {
+  let r = 0
+  while r < instVecCount() {
+    if instVecPathAt(r) == IV_CALL { instVecDeliveryCloseRow(r) }
+    r = r + 1
+  }
+  return 0
+}
+
+function instVecDeliveryCloseRow(r: i32) {
+  const c = instVecIxAt(r)
+  const d = instVecCalleeAt(r)
+  const cn = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { nodeAt(0) }
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { nodeAt(0) }
+  if !(cn is Call) || !(dn is FuncDecl) { return 0 }
+  const names = instVecNamesAt(r)
+  let i = 0
+  while i < names.length {
+    // A hole keeps its own binding: the elaboration keys its delivery as a row entry beside it.
+    const row = if names[i].length > 0 && names[i][0] == "?"[0] { -1 } else { instVecDeliveredRow(cn, d, names[i]) }
+    if row >= 0 { instVecSetTyAt(r, i, row) }
+    i = i + 1
+  }
+  return 0
+}
+
+// The one row every argument of call `cn` at a parameter of callee `d` typed bare `nm` is rebuilt at;
+// -1 when one keeps its own type, two differ, or `nm` also sits inside a parameter type.
+function instVecDeliveredRow(cn: Call, d: i32, nm: string): i32 {
+  const ftIx = nodeTyIxOf(d)
+  const ft = if ftIx >= 0 && ftIx < T.tys.length { tyAt(ftIx) } else { tyAt(0) }
+  if !(ft is TyFunc) { return -1 }
+  let one = -1
+  let k = 0
+  while k < ft.fnParamTypes.length {
+    const pt = ft.fnParamTypes[k]
+    const pv = if pt >= 0 && pt < T.tys.length { tyAt(pt) } else { tyAt(0) }
+    if pv is TyVar && pv.tvName == nm {
+      if k >= cn.callArgs.length { return -1 }
+      const rt = recRebuiltLeafRow(cn.callArgs[k], REC_REBUILT_DEPTH)
+      if rt < 0 || (one >= 0 && !tySame(one, rt)) { return -1 }
+      one = rt
+    } else if pt >= 0 && pt < T.tys.length && tyMentionsTyVarNamed(pt, nm) {
+      return -1
+    }
+    k = k + 1
+  }
+  return one
 }
