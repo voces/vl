@@ -163,7 +163,7 @@ const CASES: Case[] = [
     show: "print(w[0][0] / 4.0)",
     out: "0.25",
   },
-  // nullable destinations: a shared list may be a nullable view; a copy may not (D2196)
+  // nullable destinations: a shared list and a converting copy may each be a nullable view (D2196)
   {
     dst: "(C | null)[] | null",
     val: "cs",
@@ -174,15 +174,7 @@ const CASES: Case[] = [
   {
     dst: "Shape[] | null",
     val: "rs",
-    want: ["map"],
-    show:
-      "if w != null {\n  const e = w[0]\n  if e is Circle { print(e.r) }\n}",
-    out: "2",
-  },
-  {
-    dst: "readonly Shape[] | null",
-    val: "rs",
-    want: ["map"],
+    want: ["readonly", "map"],
     show:
       "if w != null {\n  const e = w[0]\n  if e is Circle { print(e.r) }\n}",
     out: "2",
@@ -190,7 +182,7 @@ const CASES: Case[] = [
   {
     dst: "f64[] | null",
     val: "ns",
-    want: ["map"],
+    want: ["readonly", "map"],
     show: "if w != null { print(w[1] / 4.0) }",
     out: "0.5",
   },
