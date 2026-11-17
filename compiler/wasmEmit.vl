@@ -1,7 +1,7 @@
 import { asgNameWiderRow, cloRetValSlot, sTwinRepOf } from "./emit_classify"
 import { isBlockBody } from "./block_body"
 import { lexOpcode, primOpcode } from "./ir"
-import { identityBinIsMixed } from "./emit_fn_scans"
+import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
   sharedFieldArmNulListKind,
@@ -26816,6 +26816,12 @@ let lmaValNode = -1
 let lmaValArg = -1
 let lmaCallerFn = -1
 
+// Whether a call of function `fi` may be inlined as a folded memory access under the
+// low-memory promise; `emitLowMemAccessorCall` decides the call itself. Legacy and the IR share it.
+export function lowMemFoldsCallee(fi: i32): boolean {
+  return gLowMemUnused > 0 && lmaAccessBody(fi) >= 0
+}
+
 // Under `gLowMemUnused`, a call `f(x + K, v)` of a trivial memory accessor (`lmaAccessBody`)
 // emits `f`'s body in place, its address as `wrap(x)` with K in the memarg, exactly as the
 // direct spelling `__load_i64__(x as% i32, K)` folds. 1 when the call does not qualify.
@@ -28072,7 +28078,7 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if fnNestUsed && captureCountOf(target) > 0 {
     return emitCapturedCall(callIx, fnIx, target)
   }
-  if gLowMemUnused > 0 {
+  if lowMemFoldsCallee(target) {
     const lmaRc = emitLowMemAccessorCall(callIx, fnIx, target)
     if lmaRc <= 0 { return lmaRc }
   }
@@ -33807,6 +33813,15 @@ function fRetNulHeapOf(fe: i32): i32 {
   return nulScalarListWrapHeap(k, si)
 }
 
+// The padding a valued body `fnBody` of `fnIx` needs at its end: "" when it ends in a `return` or
+// tail value, "null" when the return bears null (a live fall-through), else "unreachable", since
+// the checker proved the fall-through dead. Legacy and the IR's lowering both ask it.
+export function fallThroughPadOf(fnBody: i32, fnIx: i32): string {
+  if bodyEndsInReturn(fnBody, fnIx) { return "" }
+  if fnRetNullBearing(fnIx) { return "null" }
+  return "unreachable"
+}
+
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the
 // stack as the function's result (the fall-through path's implicit `return null`). Each
 // arm mirrors the `NullLit` lowering for that rep; an unsupported rep fails loudly.
@@ -34146,7 +34161,7 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   }
   // A `const` every read copied the tree of is never read, and computing it would trap where
   // the copies do not (D15001).
-  if s.letInit >= 0 && lbiKeptDeclUnread(stmtIx) {
+  if keptDeclStoresNothing(s, stmtIx) {
     scopeBind(s.letName, slot)
     return 0
   }
@@ -35400,7 +35415,7 @@ function emitIfLinkStmt(s: IfStmt, fnIx: i32, open: i32[], tail: boolean) {
     // D932 — the skipped arm's `let`s still own their collect-allocated slots.
     cursorAdvance(cursorSlotsUnder(s.ifThen))
   }
-  if s.ifElse >= 0 && isDeadArm(s.ifElse) {
+  if s.ifElse >= 0 && !ifWritesElse(s) {
     // The dead `else` arm: uncollected, so neither emitted nor counted (D16006).
   } else if s.ifElse >= 0 && staticGuard != 1 {
     fbElse() // 0x05 else
@@ -38712,9 +38727,21 @@ function emitNumLitNode(e: NumLit, exprIx: i32, fnIx: i32) {
   return emitNumLexAt(numLitLexAt(exprIx, e.numText, w), w)
 }
 
-// The lexeme literal `ix`, spelled `text`, is lowered from at width `w`: a folded float tree used
-// at `f32` is its value in `f32` arithmetic, as it runs there (E9.1).
-function numLitLexAt(ix: i32, text: string, w: string): string {
+// Whether `const` declaration `s` at `stmtIx` builds no store: every read copied its kept tree, and
+// computing it would trap where the copies do not (D15001). Legacy and the IR share it.
+export function keptDeclStoresNothing(s: LetDecl, stmtIx: i32): boolean {
+  return s.letInit >= 0 && lbiKeptDeclUnread(stmtIx)
+}
+
+// Whether `if` statement `s` writes an `else`: it has one and the checker did not find it dead.
+// Legacy and the IR share it.
+export function ifWritesElse(s: IfStmt): boolean {
+  return s.ifElse >= 0 && !isDeadArm(s.ifElse)
+}
+
+// The lexeme a numeric literal `ix` is written at width `w`: an f32 constant tree folds to its own
+// f32 lexeme (`cexF32LexOf`), every other literal is its source text. Legacy and the IR share it.
+export function numLitLexAt(ix: i32, text: string, w: string): string {
   if w != "f32" { return text }
   const l32 = cexF32LexOf(unwrapParen(ix))
   return if l32 != "" { l32 } else { text }
@@ -40597,17 +40624,22 @@ function srEmitNarrowed(src: i64[], fnIx: i32): i32 {
   return 0
 }
 
-// Emits `e` (at `exprIx`, width `w`) strength-reduced when it is one of the shapes above:
-// `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing `(y >>> k) as% i32 & m`.
-// Answers 0 when emitted, -1 on an emit failure, 1 when `e` is none of them (nothing
-// pushed). Every operand but x is a constant, so evaluation order and traps are unchanged.
-function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
-  if !srTyIs(exprIx, w == 64, fnIx) { return 1 }
+// The strength-reduced form of `e` (at `exprIx`, width `w`) as [x, k, narrow, m, j], or [] when it
+// is none of the shapes above: `((x >>> k) & m) << j`, the same with `* 2^j`, or a narrowing
+// `(y >>> k) as% i32 & m`, whose j is -1. Legacy writes it; the IR builder misses it by name.
+export function shiftMaskFoldOf(
+  e: BinExpr,
+  exprIx: i32,
+  w: i32,
+  fnIx: i32,
+): i64[] {
+  const none: i64[] = []
+  if !srTyIs(exprIx, w == 64, fnIx) { return none }
   if e.binOp == "&" {
-    if w != 32 { return 1 }
+    if w != 32 { return none }
     const nsrc = srMaskedSource(exprIx, w, fnIx)
-    if nsrc.length == 0 || nsrc[2] != 1 { return 1 }
-    return srEmitNarrowed(nsrc, fnIx)
+    if nsrc.length == 0 || nsrc[2] != 1 { return none }
+    return [nsrc[0], nsrc[1], nsrc[2], nsrc[3], -1]
   }
   let j: i64 = -1
   let inner = -1
@@ -40622,11 +40654,22 @@ function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
       inner = e.binRight
     }
   }
-  if j < 0 { return 1 }
+  if j < 0 { return none }
   const src = srMaskedSource(inner, w, fnIx)
-  if src.length == 0 { return 1 }
-  if srPushSource(src, w, fnIx) < 0 { return -1 }
-  const k = src[1]
+  if src.length == 0 { return none }
+  return [src[0], src[1], src[2], src[3], j]
+}
+
+// Emits `e` strength-reduced when `shiftMaskFoldOf` names a form: 0 when emitted, -1 on an emit
+// failure, 1 when it names none (nothing pushed). Every operand but x is a constant, so
+// evaluation order and traps are unchanged.
+function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
+  const f = shiftMaskFoldOf(e, exprIx, w, fnIx)
+  if f.length == 0 { return 1 }
+  if f[4] < 0 { return srEmitNarrowed(f, fnIx) }
+  if srPushSource(f, w, fnIx) < 0 { return -1 }
+  const k = f[1]
+  const j = f[4]
   if k > j {
     srConst(k - j, w)
     fbI32Bin(srOpcode(">>>", w))
@@ -40634,7 +40677,7 @@ function emitShiftMaskFold(e: BinExpr, exprIx: i32, w: i32, fnIx: i32): i32 {
     srConst(j - k, w)
     fbI32Bin(srOpcode("<<", w))
   }
-  srConst(src[3] << j, w)
+  srConst(f[3] << j, w)
   fbI32Bin(srOpcode("&", w))
   return 0
 }
