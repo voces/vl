@@ -179,6 +179,7 @@ import {
   elabFnLetMembers,
   elabFnSetOf,
   elabLiveTyOf,
+  elabMakerCallAltsNote,
   elabMakerCallNote,
   elabMakerCallReset,
   elabMakerCallSig,
@@ -4588,6 +4589,8 @@ export function fvaMakerCallRows() {
   const sigAt: {[i32]: i32} = Map()
   const callOfBind: {[i32]: i32} = Map()
   const calleeReads: {[i32]: boolean} = Map()
+  // Each maker call's binding's callee signatures, -1 among them where one does not close.
+  const altSigs: {[i32]: i32[]} = Map()
   const rl = fvaRelayScanNew()
   // The calls of each maker whose one lambda its un-noted calls share (`fvaSharedLambdaMaker`).
   const makerCalls: {[i32]: i32[]} = Map()
@@ -4626,11 +4629,9 @@ export function fvaMakerCallRows() {
         const cs = fvaCallSig(n, ix)
         const rs = fvaMakerResultAt(mc, cs)
         // A hole maker's call result closes at the signature its binding is called at.
-        fvaReachSig(
-          sigAt,
-          mc,
-          if rs < 0 && cs >= 0 && fvaHoleCallFits(mc, cs) { cs } else { rs },
-        )
+        const one = if rs < 0 && cs >= 0 && fvaHoleCallFits(mc, cs) { cs } else { rs }
+        fvaReachSig(sigAt, mc, one)
+        fvaNoteAltSig(altSigs, mc, one)
       }
       const dt = nodeCtxTyIxOf(ix)
       if (
@@ -4672,7 +4673,10 @@ export function fvaMakerCallRows() {
     if nodeAt(ix) is Ident && !(calleeReads.get(ix) ?? false) {
       const d = identDeclOf(ix)
       const mc = callOfBind.get(d) ?? -1
-      if d != ix && mc >= 0 { fvaReachSig(sigAt, mc, fvaHandedOnSig(mc, ix)) }
+      if d != ix && mc >= 0 {
+        fvaReachSig(sigAt, mc, fvaHandedOnSig(mc, ix))
+        fvaNoteAltSig(altSigs, mc, -1)
+      }
     }
     if rl.any { fvaRelayNote(rl, ix) }
     ix = ix + 1
@@ -4697,6 +4701,24 @@ export function fvaMakerCallRows() {
       elabMakerCallNote(mc, sig)
     }
   }
+  // A plain maker call whose binding is only called, at several closed signatures, is noted at all
+  // of them: each is a twin of the maker, and the binding's one environment serves every one.
+  for mc in altSigs.keys() {
+    const ss = altSigs.get(mc) ?? []
+    const c = nodeAt(mc)
+    if (
+      (sigAt.get(mc) ?? -1) < 0
+      && ss.length > 1
+      && !i32ListHas(ss, -1)
+      && c is Call
+    ) {
+      const m = fvaMakerOfBinding(identDeclOf(parenPeelIx(c.callFn)))
+      if !fvaHoleMaker(m) {
+        for s in ss { elabMakerRowNote(m, s) }
+        elabMakerCallAltsNote(mc, ss)
+      }
+    }
+  }
   const cover = fvaMakerCoverCheck()
   for m in makerCalls.keys() {
     fvaSharedLambdaRefuse(m, makerCalls.get(m) ?? [])
@@ -4718,6 +4740,18 @@ function fvaSharedLambdaMaker(d: i32): boolean {
     if x < 0 || x >= P.nodes.length || !(nodeAt(x) is FuncDecl) { return false }
   }
   return rets.length > 0
+}
+
+// Adds closed signature `sig` to maker call `mc`'s list in `alts` unless an equal one is there; -1
+// is kept, once, to mark a read that closes none.
+function fvaNoteAltSig(alts: {[i32]: i32[]}, mc: i32, sig: i32) {
+  const ss = alts.get(mc) ?? []
+  for s in ss {
+    if s == sig || (s >= 0 && sig >= 0 && tySame(s, sig)) { return 0 }
+  }
+  ss.push(sig)
+  alts[mc] = ss
+  return 0
 }
 
 // The closed function type maker call `mc`'s binding is handed on at by read `r`, where the call's
