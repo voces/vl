@@ -6,6 +6,7 @@
 
 import {
   ArrayLit,
+  BinExpr,
   Call,
   FuncDecl,
   Ident,
@@ -29,8 +30,13 @@ import {
   arrowHoleOf,
   arrowOuterOf,
 } from "./check_arrow"
-import { fnTagMembers, fnTagSetOfTy } from "./check_elab_cap"
-import { setBindSetsOf } from "./check_set_bind"
+import {
+  fnTagCallNote,
+  fnTagMembers,
+  fnTagSetOfMembers,
+  fnTagSetOfTy,
+} from "./check_elab_cap"
+import { setBindSetsOf, setBindWrittenJoin } from "./check_set_bind"
 import {
   T,
   TY_NEVER,
@@ -46,7 +52,7 @@ import {
   tyValOf,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
-import { cwIxParent } from "./check_write_scan"
+import { cwIxParent, cwLetWrittenInClosure } from "./check_write_scan"
 import { setMemberRetAt, substTyDeepUnbanked } from "./check_relate_core"
 import {
   instVecCalleeAt,
@@ -59,7 +65,7 @@ import { nodeTyIxOf } from "./check_node_tys"
 import { identFnDeclOf } from "./check_scopes"
 import { isNeverTy, tyHasTyVar } from "./tyquery"
 import { identDeclOf, nodeSrc } from "./symbols"
-import { i32ListEq, i32ListHas } from "./listutil"
+import { i32ListEq, i32ListHas, i32ListIndexOf } from "./listutil"
 
 let afCall: i32[] = []
 let afSet: i32[] = []
@@ -70,6 +76,11 @@ let afSplit: i32[] = []
 let afOpen: i32[] = []
 // The sets some call row reaches without closing its facts (STORE B2a).
 let afRowOpen: i32[] = []
+// Per written binding a parameter seeds and every call row joins alike (STORE B2b): the binding,
+// the interned join, and the parameter's set.
+let afSeedBind: i32[] = []
+let afSeedSet: i32[] = []
+let afSeedHeld: i32[] = []
 // Per parameter key `decl|i`, the sets its calls go through, directly or handed on.
 let afTakes: {[string]: i32[]} = Map()
 // Per parameter key `decl|i`, whether some arrow row's hole call goes through it.
@@ -85,6 +96,9 @@ export function arrowFactsBuild(): i32 {
   afSplit = []
   afOpen = []
   afRowOpen = []
+  afSeedBind = []
+  afSeedSet = []
+  afSeedHeld = []
   afTakes = Map()
   afSeen = Map()
   // The facts each call row's key gives (STORE B2a); per set, the outer calls they cover.
@@ -92,6 +106,7 @@ export function arrowFactsBuild(): i32 {
   // A member's result at a row's types is asked quietly: a binding no call makes owes no diagnostic.
   const d0 = T.diags.length
   arrowRowFacts(covered, afRowOpen)
+  arrowSeedJoins()
   while T.diags.length > d0 { T.diags.pop() }
   let r = 0
   while r < arrowCount() {
@@ -652,6 +667,254 @@ export function arrowSetsHeld(t: i32, out: i32[], seen: i32[]) {
     arrowSetsHeld(e, out, seen)
   }
   return 0
+}
+
+// The written bindings a parameter seeds (`setBindWrittenJoin`), joined per call row; where every
+// row of the callee gives one join, the join is a set of its own, the calls through the binding go
+// through it, and their facts stand (STORE B2b).
+function arrowSeedJoins() {
+  const seen: {[i32]: boolean} = Map()
+  const joins: {[i32]: i32[]} = Map()
+  const helds: {[i32]: i32} = Map()
+  const owners: {[i32]: i32} = Map()
+  const keys: {[i32]: string[][]} = Map()
+  const keyTys: {[i32]: i32[][]} = Map()
+  const torn: {[i32]: boolean} = Map()
+  const order: i32[] = []
+  let r = 0
+  while r < instVecCount() {
+    const d = instVecCalleeAt(r)
+    const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+    const cx = instVecIxAt(r)
+    const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+    if f is FuncDecl && cn is Call && f.fnBody >= 0 {
+      const tys: i32[] = []
+      const closed = arrowRowBinding(r, d, f, cn, tys)
+      // The set each parameter holds at this call; a closed function handed by name keys by its
+      // signature, not by identity, so it holds none.
+      const handed: i32[][] = []
+      let j = 0
+      while j < f.fnParams.length {
+        const ax = if j < cn.callArgs.length { parenPeelIx(cn.callArgs[j]) } else { -1 }
+        const hs = if ax >= 0 { fnTagSetOfTy(nodeTyIxOf(ax)) } else { -1 }
+        handed.push(if hs >= 0 { fnTagMembers(hs) } else { [] })
+        j = j + 1
+      }
+      for b in arrowSeedBindsIn(f) {
+        const p = arrowSeedParamOf(b, f)
+        const pi = i32ListIndexOf(f.fnParams, p)
+        const js = setBindWrittenJoin(b, f.fnParams, handed)
+        const ax = if pi >= 0 && pi < cn.callArgs.length { parenPeelIx(cn.callArgs[pi]) } else { -1 }
+        const held = if ax >= 0 { fnTagSetOfTy(nodeTyIxOf(ax)) } else { -1 }
+        const js2 = arrowSortedIds(js)
+        if !(seen[b] ?? false) {
+          seen[b] = true
+          order.push(b)
+          joins[b] = js2
+          helds[b] = held
+          owners[b] = d
+          keys[b] = []
+          keyTys[b] = []
+        }
+        if (
+          !closed
+          || js.length < 2
+          || held < 0
+          || !i32ListEq(joins[b] ?? [], js2)
+          || helds[b] != held
+        ) {
+          torn[b] = true
+        } else {
+          const ks = keys[b] ?? []
+          ks.push(instVecNamesAt(r))
+          keys[b] = ks
+          const kt = keyTys[b] ?? []
+          kt.push(tys)
+          keyTys[b] = kt
+        }
+      }
+    }
+    r = r + 1
+  }
+  for b in order {
+    const js = joins[b] ?? []
+    // A generic member is instanced per call shape, which the binding's one set does not follow
+    // when the seeding parameter is also called at another (B3's, D15409).
+    if !(torn[b] ?? false) && arrowAllNamed(js) && !arrowAnyGeneric(js) {
+      const st = fnTagSetOfMembers(js)
+      const d = owners[b] ?? -1
+      const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+      if (
+        st >= 0
+        && f is FuncDecl
+        && arrowSeedCallsNote(b, f, st, keys[b] ?? [], keyTys[b] ?? [])
+      ) {
+        afSeedBind.push(b)
+        afSeedSet.push(st)
+        afSeedHeld.push(helds[b] ?? -1)
+      }
+    }
+  }
+  return 0
+}
+
+// Notes each call through binding `b` in `f`'s body as a call through set `st`, with its fact at
+// every key's argument types; false, noting nothing, when a key leaves one open or the binding is
+// read other than as a callee.
+function arrowSeedCallsNote(
+  b: i32,
+  f: FuncDecl,
+  st: i32,
+  names: string[][],
+  tys: i32[][],
+): boolean {
+  const calls: i32[] = []
+  const xs: i32[] = [f.fnBody]
+  while xs.length > 0 {
+    const x = xs.pop()
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if n is Ident && identDeclOf(x) == b {
+        const p = if x < cwIxParent.length { cwIxParent[x] } else { -1 }
+        const pn = if p >= 0 && p < P.nodes.length { nodeAt(p) } else { null }
+        if pn is Call && pn.callFn == x {
+          calls.push(p)
+        } else if (
+          !(pn is LetDecl && p == b)
+          && !(pn is BinExpr && pn.binLeft == x)
+        ) {
+          return false
+        }
+      }
+      for c in nodeChildren(x) { xs.push(c) }
+    }
+  }
+  if calls.length == 0 { return false }
+  const rsOf: i32[][] = []
+  const argsOf: i32[][] = []
+  for c in calls {
+    const cn = nodeAt(c)
+    let rs: i32[] = []
+    let first: i32[] = []
+    let k = 0
+    while cn is Call && k < names.length {
+      const args: i32[] = []
+      for a in cn.callArgs {
+        args.push(
+          substTyDeepUnbanked(nodeTyIxOf(parenPeelIx(a)), names[k], tys[k]),
+        )
+      }
+      if !arrowArgsClosed(args) { return false }
+      const here = arrowRsAt(st, args)
+      if k == 0 {
+        rs = here
+        first = args
+      } else if !i32ListEq(rs, here) {
+        return false
+      }
+      k = k + 1
+    }
+    rsOf.push(rs)
+    argsOf.push(first)
+  }
+  let i = 0
+  while i < calls.length {
+    fnTagCallNote(calls[i], st, "", false, rsOf[i])
+    arrowFactNote(arrowSrcOf(calls[i]), st, rsOf[i], argsOf[i])
+    i = i + 1
+  }
+  return true
+}
+
+// The written `let`s in `f`'s body a parameter of `f` initialises.
+function arrowSeedBindsIn(f: FuncDecl): i32[] {
+  const out: i32[] = []
+  const xs: i32[] = [f.fnBody]
+  while xs.length > 0 {
+    const x = xs.pop()
+    if x >= 0 && x < P.nodes.length {
+      const n = nodeAt(x)
+      if (
+        n is LetDecl
+        && n.letKw == "let"
+        && n.letType < 0
+        && arrowSeedParamOf(x, f) >= 0
+        && !cwLetWrittenInClosure(x)
+      ) {
+        out.push(x)
+      }
+      for c in nodeChildren(x) { xs.push(c) }
+    }
+  }
+  return out
+}
+
+// The parameter of `f` binding `b` is initialised with, or -1.
+function arrowSeedParamOf(b: i32, f: FuncDecl): i32 {
+  const n = nodeAt(b)
+  if !(n is LetDecl) || n.letInit < 0 { return -1 }
+  const v = parenPeelIx(n.letInit)
+  const d = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identDeclOf(v) } else { -1 }
+  return if i32ListHas(f.fnParams, d) { d } else { -1 }
+}
+
+// Whether every declaration in `ds` is a named function.
+function arrowAllNamed(ds: i32[]): boolean {
+  for d in ds {
+    const f = nodeAt(d)
+    if !(f is FuncDecl) || f.fnName == "" || fnNameIsLambda(f.fnName) {
+      return false
+    }
+  }
+  return true
+}
+
+// Whether some declaration in `ds` has type parameters of its own.
+function arrowAnyGeneric(ds: i32[]): boolean {
+  for d in ds {
+    const f = nodeAt(d)
+    if f is FuncDecl && f.fnTyParams.length > 0 { return true }
+  }
+  return false
+}
+
+// `xs` ascending.
+function arrowSortedIds(xs: i32[]): i32[] {
+  const out: i32[] = []
+  for x in xs {
+    out.push(x)
+    let k = out.length - 1
+    while k > 0 && out[k - 1] > x {
+      out[k] = out[k - 1]
+      k = k - 1
+    }
+    out[k] = x
+  }
+  return out
+}
+
+// The written bindings `arrowSeedJoins` gave set `s`.
+export function arrowSeedBindsOf(s: i32): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < afSeedSet.length {
+    if afSeedSet[i] == s { out.push(afSeedBind[i]) }
+    i = i + 1
+  }
+  return out
+}
+
+// The parameters' sets the bindings of set `s` are seeded with.
+export function arrowSeedHeldOf(s: i32): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < afSeedSet.length {
+    if afSeedSet[i] == s && !i32ListHas(out, afSeedHeld[i]) {
+      out.push(afSeedHeld[i])
+    }
+    i = i + 1
+  }
+  return out
 }
 
 // The declared function whose body holds node `x`, or -1.
