@@ -47,14 +47,14 @@ An integer `abs` is a test of its own: a named miss, never a byte mismatch.
 | reading | P1 | this step | gained |
 |---|---:|---:|---:|
 | self-compile claimed in mode 3 | 5,726 | 5,728 | +2 |
-| corpus covered = matched (12,296 cells) | 23,256 | N3COV | N3GAIN |
+| corpus covered = matched (12,296 cells) | 23,256 | 23,593 | +337 |
 
 ## Bars
 
 | bar | reading |
 |---|---|
 | self-build | fixpoint; the armed self-build is byte-identical, with the 2 mismatches P1 already reports |
-| corpus identity against the P1 seed, 12,294 cells | IDROW |
-| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,728 claimed and byte-identical, the same 2 fallbacks; corpus M3ROW |
-| L2 self-compile fuel | FUELROW |
-| seed size, P1 seed to this one | 6,538,612 to 6,540,580 (+1,968); SEEDROW |
+| corpus identity against the P1 seed, 12,294 cells | 9,016 identical, 3,278 fail under both, 0 differ (so the plan split moves no corpus byte) |
+| mode 3 with `list` and `map` admitted (throwaway build) | self-compile 5,728 claimed and byte-identical, the same 2 fallbacks; corpus 9,016 identical, 0 differ, 0 fell back |
+| L2 self-compile fuel (`self-compile-time.sh`, each tree from its own fixpoint seed) | 94,264,501,013 to 94,325,285,366 (+0.06%) |
+| seed size, P1 seed to this one | 6,538,612 to 6,540,580 (+1,968) |
