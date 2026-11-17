@@ -38,6 +38,7 @@ import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { Interner, internIdIn, internNew } from "./intern"
 import { flattenVariantsInto, unMemPeelAliasWrapper } from "./tyquery"
 import { fnTagTyIsTagged } from "./check_fn_tag_facts"
+import { i32ListHas } from "./listutil"
 import { emitFail } from "./emit_bytes"
 
 // The id kinds. `CK_UNION` is a member set or list per equality, `CK_SEQ` `tyEq`'s ordered union,
@@ -719,6 +720,18 @@ export function canonShadowReport() {
   }
   csCmp = []
   for r in csRows { idShadowRow(r) }
+  while ckCounts.length < 2 { ckCounts.push(0) }
+  idShadowRow(
+    "canon key5b notes "
+      + i32ToStr(ckCounts[0])
+      + " tagdiff "
+      + i32ToStr(ckCounts[1]),
+  )
+  for r in ckRows { idShadowRow(r) }
+  ckIdTags = Map()
+  ckIdTy = Map()
+  ckCounts = []
+  ckRows = []
   clAgree = 0
   clMerge = 0
   clSplit = 0
@@ -727,20 +740,90 @@ export function canonShadowReport() {
   return 0
 }
 
+// Stage 5b's shadow. Mono keys an anonymous record or map pin by its set id
+// (`monoAnonPinDiscrim` spells `tyCanonKey`); the fold to an id-vector key holds only if no two
+// arguments on one head and id differ in function-leaf tagging, which this counts.
+let ckIdTags: {[string]: string} = Map()
+let ckIdTy: {[string]: i32} = Map()
+// Notes, then ids met with two taggings.
+let ckCounts: i32[] = []
+let ckRows: string[] = []
+
+// Notes pin head `head`'s anonymous discriminator for argument type `ty` under the shadow.
+export function canonKeyShadowNote(head: string, ty: i32) {
+  if idShadowModeOf() == 0 || ty < 0 { return 0 }
+  while ckCounts.length < 2 { ckCounts.push(0) }
+  ckCounts[0] = ckCounts[0] + 1
+  const tags = canonFnTags(ty, [])
+  const ik = head + "|" + i32ToStr(tyCanonSet(ty))
+  const ht = ckIdTags.get(ik)
+  if ht == null {
+    ckIdTags.set(ik, tags)
+    ckIdTy.set(ik, ty)
+  } else if ht != tags {
+    ckCounts[1] = ckCounts[1] + 1
+    const first = ckIdTy.get(ik) ?? -1
+    if ckRows.length < 24 {
+      ckRows.push(
+        "canon key5b tagdiff "
+          + ik
+          + " "
+          + ht
+          + " / "
+          + tags
+          + " ty "
+          + i32ToStr(first)
+          + "/"
+          + i32ToStr(ty),
+      )
+    }
+  }
+  return 0
+}
+
+// Each function leaf of `ty`, in walk order, as `T` where it holds a tagged set and `F` where not.
+// `path` holds the types being walked, so a shared subtree counts at each position and a cycle once.
+function canonFnTags(ty: i32, path: i32[]): string {
+  if ty < 0 || i32ListHas(path, ty) { return "" }
+  path.push(ty)
+  const t = tyAt(ty)
+  const r = match t {
+    TyFunc => if fnTagTyIsTagged(ty) { "T" } else { "F" }
+    TyArray => canonFnTags(tyElemOf(t), path)
+    TyNullable => canonFnTags(t.nInner, path)
+    TyMap => canonFnTags(tyKeyOf(t), path) + canonFnTags(tyValOf(t), path)
+    TyObj => {
+      let o = ""
+      for f in t.objFieldTypes { o = o + canonFnTags(f, path) }
+      o
+    }
+    TyUnion => {
+      let u = ""
+      for m in t.uMembers { u = u + canonFnTags(m, path) }
+      u
+    }
+    // A leaf holds no function.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => ""
+  }
+  path.pop()
+  return r
+}
+
 // Stage 5c's shadow. Mono keys a widened-result instance by `tyToStr` of the result; the fold keys
-// it by `tyCanonSet`. Per key prefix, a spelling met with two ids is a split, an id met with two
-// spellings a merge, and a merge whose two types `tyEqSealed` tells apart one whose reps may differ.
+// it by `tyCanonSet`. Per key prefix, a spelling met with two ids is a split and an id met with two
+// spellings a merge. A merge is vetoed where `tyEqSealed` tells its two types apart (`merge-ne`) or
+// their storage differs (`fold-storage-differs`): rep id and function-leaf tagging.
 let rwSpellId: {[string]: i32} = Map()
 let rwIdSpell: {[string]: string} = Map()
 let rwIdTy: {[string]: i32} = Map()
-// Notes, splits, merges, merges of types `tyEqSealed` tells apart.
+// Notes, splits, merges, `merge-ne`, `fold-storage-differs`.
 let rwCounts: i32[] = []
 let rwRows: string[] = []
 
 // Notes the widened result `ty`, spelled `spelled`, of an instance keyed `prefix` before it.
 export function retWidenShadowNote(prefix: string, spelled: string, ty: i32) {
   if idShadowModeOf() == 0 || ty < 0 { return 0 }
-  while rwCounts.length < 4 { rwCounts.push(0) }
+  while rwCounts.length < 5 { rwCounts.push(0) }
   rwCounts[0] = rwCounts[0] + 1
   const id = tyCanonSet(ty)
   const sk = prefix + "=>" + spelled
@@ -763,6 +846,9 @@ export function retWidenShadowNote(prefix: string, spelled: string, ty: i32) {
     const first = rwIdTy.get(ik) ?? -1
     const ordered = first >= 0 && tyEqSealed(first, ty)
     if !ordered { rwCounts[3] = rwCounts[3] + 1 }
+    const sa = retWidenStorage(first)
+    const sb = retWidenStorage(ty)
+    if sa != sb { rwCounts[4] = rwCounts[4] + 1 }
     retWidenShadowRow(
       "merge "
         + ik
@@ -770,10 +856,22 @@ export function retWidenShadowNote(prefix: string, spelled: string, ty: i32) {
         + hs
         + " / "
         + spelled
-        + (if ordered { " eq" } else { " ne" }),
+        + (if ordered { " eq" } else { " ne" })
+        + (if sa != sb { " fold-storage-differs " + sa + " / " + sb } else { " storage " + sa }),
     )
   }
   return 0
+}
+
+// `ty`'s storage as the shadow compares it: its rep id (provisional before the variant shapes are
+// primed, marked `p`) and its function leaves' tagging.
+function retWidenStorage(ty: i32): string {
+  if ty < 0 { return "?" }
+  const rep = canonOf(ty, CF_LAYOUT)
+  return (if canonRepReady { "" } else { "p" })
+    + i32ToStr(rep)
+    + ":"
+    + canonFnTags(ty, [])
 }
 
 function retWidenShadowRow(row: string) {
@@ -782,7 +880,7 @@ function retWidenShadowRow(row: string) {
 }
 
 function retWidenShadowReport() {
-  while rwCounts.length < 4 { rwCounts.push(0) }
+  while rwCounts.length < 5 { rwCounts.push(0) }
   idShadowRow(
     "canon ret5c notes "
       + i32ToStr(rwCounts[0])
@@ -791,7 +889,9 @@ function retWidenShadowReport() {
       + " merge "
       + i32ToStr(rwCounts[2])
       + " merge-ne "
-      + i32ToStr(rwCounts[3]),
+      + i32ToStr(rwCounts[3])
+      + " fold-storage-differs "
+      + i32ToStr(rwCounts[4]),
   )
   for r in rwRows { idShadowRow(r) }
   rwSpellId = Map()
