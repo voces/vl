@@ -3,6 +3,7 @@
 //
 //     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] [--write-baseline]
 //     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] --blockers [--top N]
+//     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] --claims
 //
 // It prints covered and matched, and every mismatch class with its count. It exits 1 on a
 // verifier failure, or on a mismatch class whose count is above `ir-shadow-baseline.txt` (a
@@ -12,6 +13,8 @@
 // run `$JOBS` at a time (default 4). `--blockers` runs the blocker census (`$VL_IR_SHADOW=4`) and
 // prints, per set of one or two miss classes, the functions that set alone keeps uncovered: the
 // functions a coverage step unblocks, an upper bound since a statement stops at its first miss.
+// `--claims` builds disarmed (`$VL_IR_SHADOW=5`), as shipped, and exits 1 on any `claim fell back`
+// row: a claimed function whose lowering or verifier failed would hide behind legacy's bytes.
 
 import { IoError, readTextFile, writeTextFile } from "std:fs"
 import { programArgs } from "std:args"
@@ -210,18 +213,30 @@ function writeBaseline(mm: Row[]) {
   return 0
 }
 
+// The shipped claim: how many functions the IR emitted, and every fallback, which reds.
+function reportClaims(m: Measured) {
+  if m.broken.length > 0 { exit(2) }
+  const fell = classes(m.rows, "claim fell back")
+  print("ir claims: \{countOf(m.rows, "claimed")} functions emitted by the IR")
+  for r in fell { print("  \{r.n}\t\{r.key}") }
+  if fell.length > 0 {
+    print("ir-shadow: a claimed function fell back to legacy")
+    exit(1)
+  }
+  print("ir-shadow: ok")
+  return 0
+}
+
 function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
   const paths = corpus()
   if paths.length == 0 { die("ir-shadow: no cells under \{HERE}", 2) }
   const census = hasFlag(args, "--blockers")
-  const m = measure(
-    paths,
-    seed,
-    envOr("JOBS", "4"),
-    if census { "4" } else { "1" },
-  )
+  const claims = hasFlag(args, "--claims")
+  const mode = if census { "4" } else if claims { "5" } else { "1" }
+  const m = measure(paths, seed, envOr("JOBS", "4"), mode)
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
+  if claims { return reportClaims(m) }
   if m.cells == 0 {
     die(
       "ir-shadow: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW`",
