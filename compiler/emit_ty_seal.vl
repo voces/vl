@@ -7,6 +7,7 @@
 // `$VL_ID_SHADOW` and changes none.
 
 import {
+  T,
   Ty,
   TyArray,
   TyErr,
@@ -38,6 +39,7 @@ import { idShadowModeOf, idShadowRow } from "./id_shadow_state"
 import { Interner, internIdIn, internNew } from "./intern"
 import { flattenVariantsInto, unMemPeelAliasWrapper } from "./tyquery"
 import { fnTagTyIsTagged } from "./check_fn_tag_facts"
+import { i32ListHas } from "./listutil"
 import { emitFail } from "./emit_bytes"
 
 // The id kinds. `CK_UNION` is a member set or list per equality, `CK_SEQ` `tyEq`'s ordered union,
@@ -718,10 +720,104 @@ export function canonShadowReport() {
   }
   csCmp = []
   for r in csRows { idShadowRow(r) }
+  while ckCounts.length < 4 { ckCounts.push(0) }
+  idShadowRow(
+    "canon key5b notes "
+      + i32ToStr(ckCounts[0])
+      + " split "
+      + i32ToStr(ckCounts[1])
+      + " merge "
+      + i32ToStr(ckCounts[2])
+      + " tagdiff "
+      + i32ToStr(ckCounts[3]),
+  )
+  for r in ckRows { idShadowRow(r) }
+  ckSpellId = Map()
+  ckIdSpell = Map()
+  ckIdTags = Map()
+  ckCounts = []
+  ckRows = []
   clAgree = 0
   clMerge = 0
   clSplit = 0
   canonShadowLayoutReset()
   csRows = []
   return 0
+}
+
+// Stage 5b's shadow: mono keys an anonymous record or map pin by its spelled canonical key
+// (`monoAnonPinDiscrim`); the switch keys it by `tyCanonSet`. Per pin head, each spelling's id and
+// each id's spelling and function-leaf tagging, so a merge or split the switch would make, and an
+// id whose arguments differ in tagging (the condition for the fold), are counted first.
+let ckSpellId: {[string]: i32} = Map()
+let ckIdSpell: {[string]: string} = Map()
+let ckIdTags: {[string]: string} = Map()
+// Notes, spellings with two ids, ids with two spellings, ids with two taggings.
+let ckCounts: i32[] = []
+let ckRows: string[] = []
+
+// Notes pin head `head`'s discriminator `spelled` for argument type `ty` under the shadow.
+export function canonKeyShadowNote(head: string, spelled: string, ty: i32) {
+  if idShadowModeOf() == 0 || spelled == "" || ty < 0 || ty >= T.tys.length {
+    return 0
+  }
+  while ckCounts.length < 4 { ckCounts.push(0) }
+  ckCounts[0] = ckCounts[0] + 1
+  const id = tyCanonSet(ty)
+  const tags = canonFnTags(ty, [])
+  const sk = head + "|" + spelled
+  const ik = head + "|" + i32ToStr(id)
+  const had = ckSpellId.get(sk) ?? -2
+  if had == -2 {
+    ckSpellId.set(sk, id)
+  } else if had != id {
+    canonKeyShadowRow(
+      1,
+      "split " + sk + " ids " + i32ToStr(had) + "/" + i32ToStr(id),
+    )
+  }
+  const hs = ckIdSpell.get(ik) ?? ""
+  if hs == "" {
+    ckIdSpell.set(ik, spelled)
+  } else if hs != spelled {
+    canonKeyShadowRow(2, "merge " + ik + " " + hs + " / " + spelled)
+  }
+  const ht = ckIdTags.get(ik)
+  if ht == null {
+    ckIdTags.set(ik, tags)
+  } else if ht != tags {
+    canonKeyShadowRow(3, "tagdiff " + ik + " " + ht + " / " + tags)
+  }
+  return 0
+}
+
+function canonKeyShadowRow(k: i32, row: string) {
+  ckCounts[k] = ckCounts[k] + 1
+  if ckRows.length < 24 { ckRows.push("canon key5b " + row) }
+  return 0
+}
+
+// Each function leaf of `ty`, in walk order, as `T` where it holds a tagged set and `F` where not.
+function canonFnTags(ty: i32, seen: i32[]): string {
+  if ty < 0 || ty >= T.tys.length || i32ListHas(seen, ty) { return "" }
+  seen.push(ty)
+  const t = tyAt(ty)
+  return match t {
+    TyFunc => if fnTagTyIsTagged(ty) { "T" } else { "F" }
+    TyArray => canonFnTags(tyElemOf(t), seen)
+    TyNullable => canonFnTags(t.nInner, seen)
+    TyMap => canonFnTags(tyKeyOf(t), seen) + canonFnTags(tyValOf(t), seen)
+    TyObj => {
+      let r = ""
+      for f in t.objFieldTypes { r = r + canonFnTags(f, seen) }
+      r
+    }
+    TyUnion => {
+      let r = ""
+      for m in t.uMembers { r = r + canonFnTags(m, seen) }
+      r
+    }
+    // A leaf holds no function.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => ""
+  }
 }
