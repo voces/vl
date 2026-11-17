@@ -216,8 +216,6 @@ import {
   shapeAdaptMapSharedSet,
   shapeAdaptNestedCopy,
   shapeAdaptNestedCopySet,
-  shapeAdaptNulCopy,
-  shapeAdaptNulCopySet,
   shapeAdaptRecField,
   shapeAdaptRecFieldSet,
   shapeAdaptRecStorage,
@@ -1909,12 +1907,11 @@ export function objShapeAdapterlessAt(
   src: i32,
   dst: i32,
 ): boolean {
-  shapeAdaptNulCopySet(false)
   shapeAdaptNestedCopySet(false)
   shapeAdaptMapSharedSet(false)
   shapeAdaptRecFieldSet(false)
   if objShapeAdapterless(srcExpr, src, dst, 12, true) { return true }
-  return listWidenWalk(srcExpr, src, dst, 12, false)
+  return listWidenWalk(srcExpr, src, dst, 12)
 }
 
 // A literal built inside a function, or handed through a generic call, is built at the row of a
@@ -1950,7 +1947,6 @@ function recRefuseAtOwnRow(at: i32, own: i32, dst: i32): boolean {
   shapeAdaptSrcExprSet(at)
   shapeAdaptElemPairSet(isList)
   shapeAdaptWidthFieldSet(false)
-  shapeAdaptNulCopySet(false)
   shapeAdaptNestedCopySet(false)
   shapeAdaptMapSharedSet(false)
   shapeAdaptRecFieldSet(false)
@@ -6931,14 +6927,8 @@ export function recAdForce(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
 // The readonly-only list rule (DECISIONS.md "No implicit container widening", D2161): a list
 // whose element widens is refused unless the destination is `readonly`. Keyed on each list's
 // ORIGIN: a list literal is built at the type it flows into, so it is exempt while the lists
-// inside it are judged by their own expressions. `underNul`: the pair sits under a `| null`.
-function listWidenWalk(
-  expr: i32,
-  src: i32,
-  dst: i32,
-  depth: i32,
-  underNul: boolean,
-): boolean {
+// inside it are judged by their own expressions.
+function listWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
   if src < 0 || dst < 0 || depth <= 0 { return false }
   if src >= T.tys.length || dst >= T.tys.length { return false }
   if src == dst { return false }
@@ -6946,9 +6936,7 @@ function listWidenWalk(
   const lets = recLetListLits(expr)
   if lets.length > 0 {
     for l in lets {
-      if listWidenWalk(l, nodeTyIxOf(l), dst, depth - 1, underNul) {
-        return true
-      }
+      if listWidenWalk(l, nodeTyIxOf(l), dst, depth - 1) { return true }
     }
     return false
   }
@@ -6964,31 +6952,27 @@ function listWidenWalk(
     return listWidenClaim(parenPeelIx(expr), src, dst)
   }
   if x == LW_INFERRED { return false }
-  if x >= 0 && listWidenJoin(x, dst, depth, underNul) { return true }
+  if x >= 0 && listWidenJoin(x, dst, depth) { return true }
   if x >= 0 && (recIsJoin(x) || recCoalesceOperands(x).length == 2) {
     return false
   }
   const pa = if x >= 0 { recPassThroughArg(x) } else { -1 }
-  if pa >= 0 {
-    return listWidenWalk(pa, nodeTyIxOf(pa), dst, depth - 1, underNul)
-  }
+  if pa >= 0 { return listWidenWalk(pa, nodeTyIxOf(pa), dst, depth - 1) }
   const d = tyAt(dst)
   if d is TyNullable {
     const sn = tyAt(src)
     if sn is TyNullable {
-      return listWidenWalk(-1, sn.nInner, d.nInner, depth - 1, true)
+      return listWidenWalk(-1, sn.nInner, d.nInner, depth - 1)
     }
-    return listWidenWalk(x, src, d.nInner, depth - 1, true)
+    return listWidenWalk(x, src, d.nInner, depth - 1)
   }
   if d is TyUnion {
     // A union source is delivered member by member, each to the member that accepts it, so
     // `f64[] | i32[]` into itself is not refused for `i32[]` meeting `f64[]` first (D2877).
-    if tyAt(src) is TyUnion {
-      return listWidenFromSrc(x, src, dst, depth, underNul)
-    }
-    return listWidenIntoUnion(x, src, d.uMembers, depth, underNul)
+    if tyAt(src) is TyUnion { return listWidenFromSrc(x, src, dst, depth) }
+    return listWidenIntoUnion(x, src, d.uMembers, depth)
   }
-  return listWidenFromSrc(x, src, dst, depth, underNul)
+  return listWidenFromSrc(x, src, dst, depth)
 }
 
 // The list literals a `let` read `x` holds, its initializer and each one assigned it whole, where
@@ -7019,12 +7003,7 @@ function recLetListLits(x: i32): i32[] {
 
 // A value `if`, `match` or block delivers each tail, and a `??` each operand, judged by its
 // own origin (D3441). True when one of them is refused.
-function listWidenJoin(
-  x: i32,
-  dst: i32,
-  depth: i32,
-  underNul: boolean,
-): boolean {
+function listWidenJoin(x: i32, dst: i32, depth: i32): boolean {
   const leaves: i32[] = []
   if recIsJoin(x) {
     tailValueLeaves(x, leaves)
@@ -7032,28 +7011,20 @@ function listWidenJoin(
     for o in recCoalesceOperands(x) { leaves.push(o) }
   }
   for lf in leaves {
-    if listWidenWalk(lf, nodeTyIxOf(lf), dst, depth - 1, underNul) {
-      return true
-    }
+    if listWidenWalk(lf, nodeTyIxOf(lf), dst, depth - 1) { return true }
   }
   return false
 }
 
 // A union destination accepts the source at some member; the walk refuses only when every
 // member that accepts it refuses.
-function listWidenIntoUnion(
-  x: i32,
-  src: i32,
-  dms: i32[],
-  depth: i32,
-  underNul: boolean,
-): boolean {
+function listWidenIntoUnion(x: i32, src: i32, dms: i32[], depth: i32): boolean {
   let anyClean = false
   let anyBad = false
   let i = 0
   while i < dms.length {
     if assignable(src, dms[i]) {
-      if listWidenWalk(x, src, dms[i], depth - 1, underNul) {
+      if listWidenWalk(x, src, dms[i], depth - 1) {
         anyBad = true
       } else {
         anyClean = true
@@ -7066,30 +7037,22 @@ function listWidenIntoUnion(
 }
 
 // The walk's dispatch on the source's own kind; a leaf holds no list.
-function listWidenFromSrc(
-  x: i32,
-  src: i32,
-  dst: i32,
-  depth: i32,
-  underNul: boolean,
-): boolean {
+function listWidenFromSrc(x: i32, src: i32, dst: i32, depth: i32): boolean {
   const s = tyAt(src)
   match s {
     TyNullable => {
-      return listWidenWalk(-1, s.nInner, dst, depth - 1, underNul)
+      return listWidenWalk(-1, s.nInner, dst, depth - 1)
     }
     TyUnion => {
       let i = 0
       while i < s.uMembers.length {
-        if listWidenWalk(-1, s.uMembers[i], dst, depth - 1, underNul) {
-          return true
-        }
+        if listWidenWalk(-1, s.uMembers[i], dst, depth - 1) { return true }
         i = i + 1
       }
       return false
     }
     TyArray => {
-      return listWidenArray(x, s, src, dst, depth, underNul)
+      return listWidenArray(x, s, src, dst, depth)
     }
     TyObj => {
       return listWidenObj(x, s, dst, depth)
@@ -7113,7 +7076,6 @@ function listWidenArray(
   src: i32,
   dst: i32,
   depth: i32,
-  underNul: boolean,
 ): boolean {
   const d = tyAt(dst)
   if d is TyArray {
@@ -7123,9 +7085,7 @@ function listWidenArray(
         return listWidenLitElems(lit.arrElems, tyElemOf(d), depth)
       }
     }
-    if listWidenWalk(-1, tyElemOf(s), tyElemOf(d), depth - 1, false) {
-      return true
-    }
+    if listWidenWalk(-1, tyElemOf(s), tyElemOf(d), depth - 1) { return true }
     if d.aRead != 1 {
       if listElemWidens(tyElemOf(s), tyElemOf(d)) {
         return listWidenClaim(x, src, dst)
@@ -7136,11 +7096,6 @@ function listWidenArray(
         return listWidenClaim(x, src, dst)
       }
       return false
-    }
-    // A readonly destination that needs a converting copy under `| null` has no lowering yet.
-    if underNul && listPairNeedsCopy(tyElemOf(s), tyElemOf(d)) {
-      shapeAdaptNulCopySet(true)
-      return listWidenClaim(x, src, dst)
     }
   }
   return false
@@ -7189,12 +7144,10 @@ function listWidenLitElems(els: i32[], de: i32, depth: i32): boolean {
       if st >= 0 && st < T.tys.length {
         const sa = tyAt(st)
         if sa is TyArray {
-          if listWidenWalk(-1, tyElemOf(sa), de, depth - 1, false) {
-            return true
-          }
+          if listWidenWalk(-1, tyElemOf(sa), de, depth - 1) { return true }
         }
       }
-    } else if listWidenWalk(els[i], nodeTyIxOf(els[i]), de, depth - 1, false) {
+    } else if listWidenWalk(els[i], nodeTyIxOf(els[i]), de, depth - 1) {
       return true
     }
     i = i + 1
@@ -7218,9 +7171,7 @@ function listWidenObj(x: i32, s: TyObj, dst: i32, depth: i32): boolean {
       const sf = objFieldType(s, d.objFieldNames[i])
       if sf >= 0 {
         const fx = objLitFieldExpr(lit, d.objFieldNames[i])
-        if listWidenWalk(fx, sf, d.objFieldTypes[i], depth - 1, false) {
-          return true
-        }
+        if listWidenWalk(fx, sf, d.objFieldTypes[i], depth - 1) { return true }
         if lit < 0 && listSlotWidens(sf, d.objFieldTypes[i], 8) {
           shapeAdaptRecFieldSet(true)
           return listWidenClaimInner(sf, d.objFieldTypes[i], x)
@@ -7277,12 +7228,8 @@ function listWidenMap(
 ): boolean {
   const d = tyAt(dst)
   if d is TyMap {
-    if listWidenWalk(-1, tyKeyOf(s), tyKeyOf(d), depth - 1, false) {
-      return true
-    }
-    if listWidenWalk(-1, tyValOf(s), tyValOf(d), depth - 1, false) {
-      return true
-    }
+    if listWidenWalk(-1, tyKeyOf(s), tyKeyOf(d), depth - 1) { return true }
+    if listWidenWalk(-1, tyValOf(s), tyValOf(d), depth - 1) { return true }
     const vw = listSlotWidens(tyValOf(s), tyValOf(d), 8)
     const kw = listSlotWidens(tyKeyOf(s), tyKeyOf(d), 8)
     if vw || kw {
@@ -7299,18 +7246,10 @@ function listWidenFunc(s: TyFunc, dst: i32, depth: i32): boolean {
   const d = tyAt(dst)
   if d is TyFunc {
     if s.fnParamTypes.length != d.fnParamTypes.length { return false }
-    if listWidenWalk(-1, s.fnRet, d.fnRet, depth - 1, false) { return true }
+    if listWidenWalk(-1, s.fnRet, d.fnRet, depth - 1) { return true }
     let i = 0
     while i < s.fnParamTypes.length {
-      if (
-        listWidenWalk(
-          -1,
-          d.fnParamTypes[i],
-          s.fnParamTypes[i],
-          depth - 1,
-          false,
-        )
-      ) {
+      if (listWidenWalk(-1, d.fnParamTypes[i], s.fnParamTypes[i], depth - 1)) {
         return true
       }
       i = i + 1
@@ -7877,7 +7816,6 @@ function readonlyFixOf(
   const sX = shapeAdaptSrcExpr
   const sE = shapeAdaptElemPair
   const sW = shapeAdaptWidthField
-  const nC = shapeAdaptNulCopy
   const nN = shapeAdaptNestedCopy
   const nM = shapeAdaptMapShared
   const nR = shapeAdaptRecField
@@ -7893,7 +7831,6 @@ function readonlyFixOf(
   shapeAdaptSrcExprSet(sX)
   shapeAdaptElemPairSet(sE)
   shapeAdaptWidthFieldSet(sW)
-  shapeAdaptNulCopySet(nC)
   shapeAdaptNestedCopySet(nN)
   shapeAdaptMapSharedSet(nM)
   if bad { return -1 }
@@ -8029,8 +7966,8 @@ function objShapeElemPairErr(
   const pairNote = tyToStr(sT) + " is not " + tyToStr(dT) + through
   let copyFix = buildFix
   if hint != "" { copyFix = " Copy it" + hint.slice(12, hint.length) }
-  if shapeAdaptNulCopy || shapeAdaptNestedCopy {
-    tErr(pairNote + containerCopyGapWhy(shapeAdaptNulCopy) + copyFix, srcExpr)
+  if shapeAdaptNestedCopy {
+    tErr(pairNote + containerCopyGapWhy() + copyFix, srcExpr)
     return 0
   }
   if shapeAdaptMapShared {
