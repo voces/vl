@@ -52,10 +52,16 @@ Measured against B2a as late rows gone, new rows, and regressions:
   `N {same,dbl}`, `SP {add}`
 - `closures/written-let-seeded-by-hole-param-written-with-named-fn.vl` `N {add,mul}`, `S {add}`
 
-Class S keeps 6 rows:
-- `written-with-same-fn`: a one-member join;
-- `handed-through-list-call`: the binding is handed as an argument, not called;
-- 4 `GS` or `GSP` rows whose keys give different joins, which is B3's case.
+19 rows still carry the S letter:
+- **pure S (2):**
+  - `written-let-seeded-by-hole-param-written-with-same-fn`, a one-member join;
+  - `written-let-seeded-by-hole-param-handed-through-list-call`, where the binding is handed as an
+    argument, not called.
+- **SP (2):**
+  - `closed-fn-handed-to-param-written-to-let-called-at-two-types`, a closed function handed by name;
+  - `forwarded-hole-fn-to-list-element-value-param`, where the parameter is forwarded through a list
+    literal.
+- **with G (15):** generic members whose keys give different joins or call shapes. These are B3's.
 
 ## Grading (fixpoint seeds both sides, against B2a's)
 
