@@ -127,7 +127,14 @@ export type SBoundsCheck = { bcV: Opnd, bcIx: Opnd }
 export type SEffect = { efRhs: Rhs }
 export type SBlock = { bkLabel: i32, bkBody: i32[], bkOut: i32 }
 export type SLoop = { lpLabel: i32, lpBody: i32[] }
-export type SIf = { siCond: Opnd, siThen: i32[], siElse: i32[], siOut: i32 }
+// `siElseKw`: the source wrote a live `else`, which legacy writes even when its arm is empty.
+export type SIf = {
+  siCond: Opnd,
+  siThen: i32[],
+  siElse: i32[],
+  siOut: i32,
+  siElseKw: boolean,
+}
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 export type SBr = { brLabel: i32, brHas: boolean, brVal: Opnd }
 export type SReturn = { rtHas: boolean, rtV: Opnd }
@@ -165,6 +172,10 @@ export type IrFn = {
   irSpanAst: i32[],
   irSpanFirst: i32[],
   irSpanLast: i32[],
+  // The first `local` variable at each wasm slot, so a slot's lookup is not a scan of every variable.
+  irLocalAt: {[i32]: i32},
+  // The spans opening at each node, in note order, so lowering a node does not scan every span.
+  irSpansAt: {[i32]: i32[]},
 }
 
 export function irFnNew(at: i32, name: string): IrFn {
@@ -188,6 +199,8 @@ export function irFnNew(at: i32, name: string): IrFn {
     irSpanAst: [],
     irSpanFirst: [],
     irSpanLast: [],
+    irLocalAt: Map(),
+    irSpansAt: Map(),
   }
   return f
 }
@@ -201,7 +214,11 @@ export function irVarNew(
   slot: i32,
 ): i32 {
   f.irVars.push({ vRep: rep, vTy: ty, vKind: kind, vSlot: slot })
-  return f.irVars.length - 1
+  const v = f.irVars.length - 1
+  if kind == "local" && slot >= 0 && (f.irLocalAt[slot] ?? -1) < 0 {
+    f.irLocalAt[slot] = v
+  }
+  return v
 }
 
 // Appends node `n` with its header fields to `f`'s arena and returns its id; the caller places
@@ -238,6 +255,9 @@ export function irSpanNote(f: IrFn, ast: i32, first: i32, last: i32) {
   f.irSpanAst.push(ast)
   f.irSpanFirst.push(first)
   f.irSpanLast.push(last)
+  const at = f.irSpansAt[first] ?? []
+  at.push(f.irSpanAst.length - 1)
+  f.irSpansAt[first] = at
   return 0
 }
 
@@ -434,7 +454,7 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
         + outText(n.siOut)
         + "\n"
         + bodyText(f, n.siThen, d + 1)
-      if n.siElse.length > 0 {
+      if n.siElse.length > 0 || n.siElseKw {
         s = s + p + "else\n" + bodyText(f, n.siElse, d + 1)
       }
       s
