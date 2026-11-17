@@ -4,6 +4,7 @@
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
 import {
+  ArrayLit,
   BinExpr,
   Block,
   BoolLit,
@@ -69,6 +70,9 @@ import {
   BinNulTest,
   GlobalCtx,
   PrintArm,
+  arrLitArmOf,
+  arrLitBuildOf,
+  arrLitShort,
   atomEqPlanOf,
   binNulTestOf,
   binNumWidth,
@@ -85,6 +89,7 @@ import {
   idxStorePlanOf,
   ifWritesElse,
   keptDeclStoresNothing,
+  listReserveScan,
   lowMemFoldsCallee,
   mapGetOrHelperRoute,
   mapKeyArmOf,
@@ -175,6 +180,8 @@ function censusGoesOn(why: string): boolean {
 // ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
 const CLAIMED: IrFamily[] = ["scalar", "control", "call", "global", "map"]
 let ibClaimAll = false
+// Set while `irClaimFn` builds, never under the shadow, which builds every function whole.
+let ibClaimBuild = false
 
 function familyClaimed(fam: IrFamily): boolean {
   if ibClaimAll { return fam != "list" && fam != "other" }
@@ -206,9 +213,10 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
   // Nothing claimed builds nothing: the predicate's cost is paid only once a family is claimed.
   if ibArmed || CLAIMED.length == 0 && !ibClaimAll { return false }
   const gen = repNodeGen()
-  if build(fnIx, fnPos) != "" || repNodeGen() != gen || !claimable() {
-    return false
-  }
+  ibClaimBuild = true
+  const built = build(fnIx, fnPos)
+  ibClaimBuild = false
+  if built != "" || repNodeGen() != gen || !claimable() { return false }
   corrupt()
   if irVerify(ib).vfRule != 0 {
     count("claim fell back: verifier")
@@ -361,13 +369,17 @@ function missRhs(why: string): Rhs {
 
 export function irBNode(b: i32[], n: IrNode, ty: i32, rep: i32, at: i32) {
   b.push(irNodeNew(ib, n, ty, rep, at))
+  // A claim's build ends at a node no claimed family holds: `claimable` would refuse it.
+  if ibClaimBuild && !familyClaimed(irNodeFamily(n)) {
+    irBMiss("unclaimed family")
+  }
   return 0
 }
 
 // Builds `stmts` into a fresh body and returns it.
 function bodyOf(stmts: i32[]): i32[] {
   const nb: i32[] = []
-  for s in stmts { stmt(nb, s) }
+  stmtRun(nb, stmts)
   return nb
 }
 
@@ -974,6 +986,37 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
+// A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32
+// or string list, each element delivered at the list's element rep. Every other arm is a named
+// miss.
+function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
+  const arm = arrLitArmOf(ix, ibFnIx, arrLitBuildOf(ix, ibFnIx))
+  if (
+    arm != "i32"
+    && arm != "f64"
+    && arm != "i64"
+    && arm != "f32"
+    && arm != "str"
+  ) {
+    return irBMiss("array " + arm)
+  }
+  if !arrLitShort(ix, ibFnIx, arm, n.arrElems.length) {
+    return irBMiss("array long or seeded")
+  }
+  const ln = repNodeAt(rep)
+  if !(ln is RList) { return irBMiss("array rep") }
+  const er = ln.rlsElem
+  const elems: Opnd[] = []
+  for e in n.arrElems {
+    const v = deliver(b, e, er)
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != er { return irBMiss("array element coercion") }
+    elems.push(v)
+  }
+  const r: Rhs = { mlElems: elems, mlAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
 function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = coalArmOf(n, ix, ibFnIx)
@@ -1184,6 +1227,7 @@ function irBExprAt(b: i32[], ix: i32): Opnd {
   if n is Index { return irIndexHook(b, ix, rep) }
   if n is Member { return irMemberHook(b, ix, rep) }
   if n is StrLit { return strLit(ix, rep) }
+  if n is ArrayLit { return arrayLit(b, n, ix, rep) }
   if n is CharLit {
     const cp = charLitCp(n)
     if cp < 0 || repPrim(rep) != "i32" { return irBMiss("char literal") }
@@ -1290,9 +1334,9 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   )
   const wb = nodeAt(n.whileBody)
   if wb is Block {
-    for s in wb.blkStmts { stmt(loopBody, s) }
+    stmtRun(loopBody, wb.blkStmts)
   } else {
-    stmt(loopBody, n.whileBody)
+    stmt(loopBody, n.whileBody, NO_SIBS, -1)
   }
   irBNode(
     loopBody,
@@ -1318,7 +1362,7 @@ function labelNew(): i32 {
 
 function chainLink(e: i32): i32[] {
   const nb: i32[] = []
-  stmtIn(nb, e)
+  stmtIn(nb, e, NO_SIBS, -1)
   return nb
 }
 
@@ -1329,10 +1373,30 @@ function elseStmts(e: i32): i32[] {
   return [e]
 }
 
-// Builds statement `ix` onto `b`, noting the run of nodes it built for the source map.
-function stmt(b: i32[], ix: i32) {
+// The sibling list of a statement built outside a statement list; its position is -1.
+const NO_SIBS: i32[] = []
+
+// Each statement of `stmts` in order, as a statement list.
+function stmtRun(b: i32[], stmts: i32[]) {
+  let i = 0
+  while i < stmts.length {
+    stmtAt(b, stmts, i)
+    i = i + 1
+  }
+  return 0
+}
+
+// Statement `i` of list `stmts`.
+function stmtAt(b: i32[], stmts: i32[], i: i32) {
+  return stmt(b, stmts[i], stmts, i)
+}
+
+// Builds statement `ix` onto `b`, noting the run of nodes it built for the source map. `ix` is
+// `sibs[pos]`, which a declaration's list reserve reads its following statements from, or `pos`
+// is -1 outside a list.
+function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
-  stmtIn(b, ix)
+  stmtIn(b, ix, sibs, pos)
   if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
   return 0
@@ -1343,19 +1407,19 @@ function stmt(b: i32[], ix: i32) {
 const IR_NEST_MAX = 200
 let ibDepth = 0
 
-function stmtIn(b: i32[], ix: i32) {
+function stmtIn(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if ibDepth >= IR_NEST_MAX { return skip("nesting depth") }
   ibDepth = ibDepth + 1
-  stmtAt(b, ix)
+  stmtNode(b, ix, sibs, pos)
   ibDepth = ibDepth - 1
   return 0
 }
 
-function stmtAt(b: i32[], ix: i32) {
+function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
   if n is Block {
-    for s in n.blkStmts { stmt(b, s) }
+    stmtRun(b, n.blkStmts)
     return 0
   }
   if n is LetDecl {
@@ -1363,6 +1427,10 @@ function stmtAt(b: i32[], ix: i32) {
     // A `const` every read copied the tree of computes nothing, as legacy writes it (D15001).
     if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
     if v < 0 || n.letInit < 0 { return skip("declaration") }
+    // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
+    if pos >= 0 && listReserveScan(n, sibs, pos, ibFnIx) != null {
+      return skip("declaration list reserve")
+    }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep {
@@ -1474,7 +1542,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   if stmts.length == 0 { return skip("empty valued body") }
   let i = 0
   while i < stmts.length - 1 {
-    stmt(b, stmts[i])
+    stmtAt(b, stmts, i)
     i = i + 1
   }
   const last = stmts[stmts.length - 1]
@@ -1482,7 +1550,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   if ln is WhileStmt { return skip("valued tail loop") }
   if ln is RetStmt || ln is IfStmt {
     const past = ibMissesPast
-    stmt(b, last)
+    stmt(b, last, stmts, stmts.length - 1)
     // A tail `if` whose arms yield values rather than returning is I1's (`siOut`). An arm the
     // census built past a miss in is incomplete, not valued.
     if ibMiss == "" && past == ibMissesPast && !irBodyLeaves(ib, b) {
@@ -1491,7 +1559,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return 0
   }
   if isBlockBody(at) {
-    stmt(b, last)
+    stmt(b, last, stmts, stmts.length - 1)
     return skip("block body falls off")
   }
   const n0 = b.length
@@ -1555,7 +1623,7 @@ function build(fnIx: i32, fnPos: i32): string {
   if !(body is Block) { return "body" }
   const top: i32[] = []
   if none {
-    for s in body.blkStmts { stmt(top, s) }
+    stmtRun(top, body.blkStmts)
   } else {
     tailReturn(top, body.blkStmts, fn.fnBody)
   }
