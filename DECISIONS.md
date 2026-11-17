@@ -12652,9 +12652,11 @@ instantiation vector answers that once, for all classes.
 ## An un-instantiated function's hole parameters close at check to the hole default (2026-11-17, chosen under the owner's delegation) — D16898
 
 **The rule.** A hole parameter of an un-annotated function that no call instantiates closes at check
-to the default the language already gives an unconstrained hole: `i32`, or the flush default for an
-operator-constrained hole. A call counts whether it is direct or reaches the function through a slot or
-value it flows into; when such a call exists, its type decides the instance and the default never applies.
+to the default the language already gives an unconstrained hole: `i32`; a body that does not check at
+it is never built (amended 2026-11-17, D16927: the flush has no operator-constrained default, and
+T9.5's `tag` example stores such a function). A call counts whether it is direct or reaches the
+function through a slot or value it flows into; when such a call exists, its type decides the
+instance and the default never applies.
 
 **Why.** It is the same rule an empty container's open element follows (`i32` list element, `string` set
 element or map key), and it makes mono's former accidental default a stated rule that check can see.
