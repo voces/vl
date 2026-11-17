@@ -186,7 +186,8 @@ print(sel(true))
 // `K | null` holding atom id 0 tested `!= null`, `null ==` and `== "a"` (N2b-2c-1b); a global
 // map read with an i32 default through legacy's helper, by an i32 key, a built string key, and a
 // key holding another such read (M1); a `print` of a built string, of f64 values that are `-0`,
-// `NaN` and `2e+300`, and of an f32, an i64, a boolean and an i32 (P1).
+// `NaN` and `2e+300`, and of an f32, an i64, a boolean and an i32 (P1); the four bitcasts, f64
+// and f32 float intrinsics, and i32 and i64 integer intrinsics (N3).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -228,6 +229,14 @@ print(guard(2))
   `function pl(x: i64) { print(x * 3) }\npl(5)\n`,
   `function pb(x: i32) { print(x > 2) }\npb(3)\n`,
   `function pv(x: i32) {\n  print(x + 1)\n  return\n}\npv(3)\n`,
+  `function fb(x: i64): f64 { return f64fromBits(x) }\nprint(fb(f64bits(1.5)))\n`,
+  `function bf(x: f64): i64 { return f64bits(x * 2.0) }\nprint(bf(-0.0))\n`,
+  `function g32(x: f32): i32 { return f32bits(x) }\nprint(g32(1.0))\n`,
+  `function h32(x: i32): f32 { return f32fromBits(x) }\nprint(h32(1065353216))\n`,
+  `function sq(x: f64, y: f64): f64 { return min(sqrt(x), copysign(y, -1.0)) }\nprint(sq(9.0, 2.0))\n`,
+  `function fl(x: f32): f32 { return floor(x) }\nconst h: f32 = 2.5\nprint(fl(h))\n`,
+  `function cz(x: i32): i32 { return clz(x) + rotl(x, 3) }\nprint(cz(16))\n`,
+  `function dz(x: i64): i64 { return divU(x, 3) }\nprint(dz(-1))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -240,6 +249,19 @@ Deno.test({
         throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
+  },
+});
+
+// An integer `abs` is legacy's staged `select`, not one instruction: a named miss, never a
+// byte mismatch.
+Deno.test({
+  name: "ir shadow: an integer abs is a named miss",
+  ignore,
+  fn: () => {
+    const { rows } = run(`function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`, true);
+    const want = "uncovered intrinsic intAbs";
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 

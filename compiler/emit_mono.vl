@@ -85,6 +85,7 @@ import {
   elabSlotSrcFns,
   elabSlotUncalled,
   elabSlotUncalledOmitting,
+  elabTwinLamSig,
   elabUncalledSlotTy,
   elabValueAgreedCallTys,
   elabValueInstKey,
@@ -4838,6 +4839,28 @@ function monoPinValueLambda(
 ) {
   if ix < 0 { return ix }
   if nodeAt(ix) is FuncDecl {
+    // A hole lambda a maker twin returns whole is its instance at the twin's closed signature, so
+    // each twin's closure has its own parameters, result and body typing (D16851).
+    const lf0 = monoSlotOfLamNode(ix)
+    const tw = if lf0 >= 0 { elabTwinLamSig(elabSrcDecl(ix), captureCountOf(lf0) > 0) } else { -1 }
+    const tf = if tw >= 0 { tyAt(tw) } else { null }
+    const lfe = if tf is TyFunc { lf0 } else { -1 }
+    if (
+      lfe >= 0
+      && lfe < monoGen.length
+      && monoGen[lfe] == 1
+      && monoLamIsHole(lfe)
+      && tf is TyFunc
+    ) {
+      const pnames: string[] = []
+      for pt in tf.fnParamTypes { pnames.push(monoPinOfClosedTy(pt)) }
+      monoLastInstFe = -1
+      const r = if strListHas(pnames, "") { -1 } else { monoInstanceFor(lfe, pnames, ix, -1, [], tf.fnParamTypes) }
+      // The first signature may pin the template's own slot in place; that slot is the instance.
+      if r >= 0 && monoLastInstFe >= 0 && monoLastInstFe < fnStmts.length {
+        return fnStmts[monoLastInstFe]
+      }
+    }
     const cl = monoCloneLambdaSubst(ix, typarams, tvN, tvV, bN, bT)
     if cl >= 0 { return cl }
     return ix
@@ -15503,6 +15526,32 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
     return st
   }
   const lit = nodeAt(vx)
+  // A list of lists of functions pins its inner lists from every element they hold, each inner
+  // list and the field typed with that (D16915).
+  if lit is ArrayLit && tyAt(et) is TyArray {
+    const lf2: i32[] = [ctx, at]
+    const ivals: i32[][] = []
+    const inners: i32[] = []
+    for e in lit.arrElems {
+      const ix = unwrapParen(e)
+      if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is ArrayLit) {
+        return -1
+      }
+      inners.push(ix)
+      const inner = nodeAt(ix)
+      if inner is ArrayLit {
+        for ie in inner.arrElems { ivals.push([ie, ctx]) }
+      }
+    }
+    if ivals.length == 0 { return -1 }
+    const ft = monoStoredSlotFnTy(lf2, monoSlotPath(fld, ["e", "e"]), ivals)
+    if ft < 0 { return ft }
+    const it = mkArrayTy(ft)
+    for ix in inners { nodeTyRecord(ix, it) }
+    const lnt = if st >= 0 { st } else { mkArrayTy(it) }
+    nodeTyRecord(vx, lnt)
+    return lnt
+  }
   if !(lit is ArrayLit) || !(tyAt(et) is TyFunc) { return -1 }
   const lf: i32[] = [ctx, at]
   const vals: i32[][] = []
