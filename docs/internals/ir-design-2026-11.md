@@ -824,6 +824,50 @@ parts are in `refactor-notes/2026-11-16-ir-i8-coercion-ops.md`.
 Movers (SSwitch, the local allocator, SDrop's removal and the I10 passes) still land as their
 own named PRs.
 
+### 10.1 What retiring legacy takes beyond function coverage (2026-11-18)
+
+Function coverage is not enough on its own. At 0b8c7beb, STORE's dynamic driver census found
+legacy's lines in three places:
+- reached only from module-level passes: 1,499 drivers, about 35k lines;
+- reached from module passes plus top-level code: 874 drivers, about 20k lines;
+- called from the claim path itself: 2,013 drivers, about 32k lines.
+
+At the self-compile's roughly 66% claimed, function coverage retires none of these. The two
+plans below say what does. Sizes are rough. The static figures are from a name-level call graph
+of the IR modules, so they are approximate.
+
+**(a) The claim path.** The IR modules call 220 legacy functions directly (2.9k lines). The
+roughly 32k lines are what those reach.
+
+| kind | direct | stays or goes | why |
+|---|---|---|---|
+| decisions and plans (`*ArmOf`, `*PlanOf`, `*Plain`, `*Why`) | 61 fns, 1.2k lines | **stay, as the one shared decision**; they move out of `wasmEmit.vl` into decision modules that write no bytes | legacy and the IR must answer alike. Each mirror gets an armed agreement check (B4a's `ifExprPlainKind`) or legacy consumes it |
+| byte writers and shared tails (`fb*`, `*Tail`) | 56 fns, 0.6k | **stay**: the IR lowering's back end | they write bytes, and take no callbacks |
+| classification, elaboration, rep, checker (`emit_classify`, `emit_elab`, `emit_rep`, `check_*`) | reached, about 25k | **stay** | type and rep facts both sides read; not legacy logic |
+| **re-entry into `emitExpr`** | `emitBoxAroundHole` (the value hole), `emitStaticLitAtom`, `loopHoistOpen` and `forInLoopOpen` (a hoisted header's receiver), `mapGetOrHelperRoute`, `strEqTail`, `popDropTail` | **goes**: the IR owns the operand | each lets legacy emit a subexpression inside an IR function. The template is STORE's union-equality step: the operand becomes a local the caller evaluates, and the shared algorithm takes it. About one PR each, with roughly 0.5–1.5k legacy lines behind them each |
+| legacy writers called whole | `emitNullForRet` (111), `emitForInCursorInit`, `emitFoldedConstRead`, `emitStrLitAt`, `emitNullAt`, `emitReadRecover`, `emitEqRecoverNarrowed`, `emitArrLenHeld` (about 0.2k) | **goes**: split into a shared tail plus an IR-owned decision | they read legacy state or decide inside the writer |
+| legacy lowering state the IR drives | the loop-hoist frames (`lhOpen`), the lazy list frame, the union-sink pair, the coercion seats (I8) | **goes**: an IR frame model | about 1–2k lines. I8 already plans the seats |
+
+**(b) The module passes.**
+
+| item | size | plan |
+|---|---|---|
+| **the start function** (top-level code: `emitStartBodyCode`, `emit_start_block.vl`) | about 0.9k lines, reaching 874 drivers and about 20k lines | build the top-level statements as an IR function body, as the builder builds any body. **The largest lever and the first stage.** A global's non-constant initializer is start code, so it comes with it |
+| runtime helper bodies (33 `*FnCode`, hand-written wasm: UTF-8, string equality and others) | 1.7k lines | rewrite each as an IR-built function, or as VL source compiled normally. Independent of the rest, one helper family per PR |
+| section assembly (type, import, export, table, element, data, memory, name, reloc; `emitModule`, the pass table) | about 2.2k in `emit_sections.vl`, plus `emit_link.vl` 1.6k | **stays** as the module assembler. It is not per-function logic. Later it reads a module record (functions, globals, data, tables) that the IR side fills, instead of legacy's tables. Net lines small |
+| module pre-passes (collect, shape rows, mono, the scans the 1,499 drivers sit in) | about 35k reached | **stay** as analysis. They run before both emitters, and the IR needs their facts. They retire only where the IR computes the fact itself, case by case, after the stages above |
+
+**Proposed staging:**
+1. the start function into the IR (unblocks the 20k);
+2. the `emitExpr` re-entries, one PR each;
+3. the decision modules, with agreement checks;
+4. the helper bodies;
+5. the module record and assembler.
+
+Function coverage continues alongside: the next doors are `is guard`, `map read inline` and
+`index ref`. The driver census (`scripts/ir-driver-census.sh`) is the measure of each stage, by
+the drivers it moves from hit-with-claiming-off to hit-with-claiming-on 0.
+
 ## A. Commands
 
 Run from the checkout root, with `PATH=$PWD/scripts/vl-host/target/release:$PATH`.

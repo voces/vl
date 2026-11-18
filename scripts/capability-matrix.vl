@@ -172,6 +172,7 @@ type Tpl = {
   openPos: string[],
   // A check refusal the design owes in the annotated face at every built-in position.
   owedAnn: string,
+  owedAll: string,
   setup: string,
   guard: string,
   fallback: string,
@@ -286,6 +287,7 @@ function loadTpl(path: string): Tpl {
     wantUnann: section(s, "WANT_UNANNOTATED"),
     openPos: openPos,
     owedAnn: section(s, "OWED_ANNOTATED"),
+    owedAll: section(s, "OWED"),
     setup: section(s, "SETUP"),
     guard: section(s, "GUARD"),
     fallback: section(s, "FALLBACK"),
@@ -934,7 +936,7 @@ function owedRefusal(t: Tpl, pos: string, face: string): string {
       return if c[4] != "" { c[4] } else if face == "ann" { c[3] } else { "" }
     }
   }
-  return if face == "ann" { t.owedAnn } else { "" }
+  return if face == "ann" { t.owedAnn + "\n" + t.owedAll } else { t.owedAll }
 }
 
 // The built-in positions, then the template's own cells.
@@ -1244,6 +1246,7 @@ function main(args: string[]): i32 {
   let before: Map<string, Cell> = Map()
   if hasBefore { before = gradeAll(t, beforeSeed, r) }
   const after = gradeAll(t, afterSeed, r)
+  const preludeErr = preludeRefusal(t, afterSeed, r)
   if !keep && outDir == "" { spawn("rm", ["-rf", outdir]) }
 
   print("# \{t.name} — position x face matrix")
@@ -1259,6 +1262,7 @@ function main(args: string[]): i32 {
   let skippedN = 0
   let owedN = 0
   let other = 0
+  let checkN = 0
   let total = 0
   const lostKeys: string[] = []
   const silentKeys: string[] = []
@@ -1281,6 +1285,7 @@ function main(args: string[]): i32 {
         owedN = owedN + 1
       } else {
         other = other + 1
+        if startsWith(c.verdict, "check refuses") { checkN = checkN + 1 }
         if c.verdict == "TRAP (program)" { trapKeys.push(key) }
         if c.verdict == "WRONG" { wrongKeys.push(key) }
       }
@@ -1333,15 +1338,49 @@ function main(args: string[]): i32 {
       "\nA WRONG cell passed check and printed another value than its WANT: clause 1.",
     )
   }
+  // A template no cell of which reaches the capability grades nothing: red, not a silent zero.
+  // A prelude alone may not check (its holes are inferred from the cells), so it only explains.
+  const graded = total - skippedN - owedN
+  let blind = ""
+  if only.length == 0 && graded > 0 && checkN == graded {
+    blind = "every graded cell refuses at check"
+    if preludeErr != "" {
+      blind = blind + ", and its PRELUDE alone fails `vl check`: " + preludeErr
+    }
+  }
+  if blind != "" {
+    print(
+      "\nBLIND TEMPLATE \{basename(template)}: \{blind}. It measures nothing until it is fixed.",
+    )
+  }
   if (
     lost.length > 0
     || silent.length > 0
     || traps.length > 0
     || wrong.length > 0
+    || blind != ""
   ) {
     return 1
   }
   return 0
+}
+
+// The refusal `vl check` gives the template's PRELUDE alone, or "" when it checks clean or the
+// template has none: the likely cause when every cell refuses alike.
+function preludeRefusal(t: Tpl, seed: string, r: Run): string {
+  if stripWs(t.prelude) == "" { return "" }
+  const path = r.outdir + "/" + t.name + "__prelude.vl"
+  const w = writeTextFile(path, t.prelude + "\nprint(0)\n")
+  if w != null {
+    die("capability-matrix.vl: cannot write \{path} (\{w.msg})", 1)
+  }
+  const g = gradeWith(
+    { vl: r.vl, seed: seed, std: r.std, probe: path, secs: r.secs },
+    null,
+    r.extra,
+  )
+  if !startsWith(g.verdict, "check refuses") { return "" }
+  return cpPrefix(replaceAll(g.detail, "\n", " "), 240)
 }
 
 const argv = programArgs()
