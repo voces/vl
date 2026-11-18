@@ -4,9 +4,11 @@ import { lexOpcode, primOpcode } from "./ir"
 import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
+  refListArmTagOfTy,
   sharedFieldArmListKind,
-  sharedFieldArmNulListKind,
+  sharedFieldArmNulListTag,
   sharedFieldArmNulSet,
+  sharedFieldArmRefListTag,
   sharedFieldArmSetTexts,
 } from "./emit_obj_lit_fits"
 import { armFieldElemTyIx, armFieldStoreTy, sFieldStoreTy } from "./emit_state"
@@ -4172,14 +4174,7 @@ function isArmTagOfTy(ity: i32): i32 {
   // A nested boolean-leaf list shares its reflist slot with the `i32` twin, not its tag.
   const bd = boolLeafListDepthOfTy(ity)
   if bd >= 1 { return boolListArmTag(bd) }
-  if unMemIsRefElemArray(ity) {
-    // A list of Sets shares its element slot with the list of boolean maps, so that slot's tag
-    // is not the Set list's own and no box is known to carry it (D2753).
-    if tyMentionsSet(tyRefArrElemOf(ity), TY_WALK_DEPTH) { return -1 }
-    const sl = unMemRefArrArmSlot(ity)
-    if sl >= 0 { return refArrSlotTag(sl) }
-  }
-  return -1
+  return refListArmTagOfTy(ity)
 }
 
 // `isArmTagOfTy` at receiver `recv`: a list of Sets, which shares its slot with the boolean-map
@@ -13435,9 +13430,9 @@ function emitSharedFieldArm(
   if boxes && bk < 0 && sharedFieldArmNulSet(vi, fi) {
     return emitSharedFieldNulSetBox(vi, fi, recvIx, fnIx, slot)
   }
-  const lk = if boxes && bk < 0 { sharedFieldArmNulListKind(vi, fi) } else { -1 }
-  if lk >= 0 {
-    return emitSharedFieldNulListBox(lk, vi, fi, recvIx, fnIx, slot)
+  const lt = if boxes && bk < 0 { sharedFieldArmNulListTag(vi, fi) } else { -1 }
+  if lt >= 0 {
+    return emitSharedFieldNulListBox(lt, vi, fi, recvIx, fnIx, slot)
   }
   const nulStr = boxes && bk < 0 && sharedFieldArmNulStr(vi, fi)
   // A string literal set stored at the atom boxes as the string it names (D14750).
@@ -13446,6 +13441,8 @@ function emitSharedFieldArm(
   let recTag = -1
   if boxes && bk < 0 && !nulStr && !setStr {
     recTag = if readIx >= 0 { sharedFieldArmStructTag(vi, fi, nodeTyAt(readIx, fnIx)) } else { -1 }
+    // A record list rides the box under its list's arm tag (D16952).
+    if recTag < 0 { recTag = sharedFieldArmRefListTag(vi, fi) }
   }
   const nulRec = recTag >= 0 && sharedFieldArmNulRecord(vi, fi)
   if recTag >= 0 && !nulRec {
@@ -13601,9 +13598,9 @@ function emitSharedFieldNulSetBox(
 }
 
 // A nullable list ref, boxed for a read whose join holds other arms: a null ref is the
-// null-tagged box, any other the list's wrapper under its kind `k`'s tag.
+// null-tagged box, any other the list's wrapper under the list's tag `tag`.
 function emitSharedFieldNulListBox(
-  k: i32,
+  tag: i32,
   vi: i32,
   fi: i32,
   recvIx: i32,
@@ -13624,7 +13621,7 @@ function emitSharedFieldNulListBox(
   fbRefNullNone()
   fbStructNew(uBoxIdx)
   fbElse()
-  fbI32Rel(RS_TAG, scalarTagOfKind(k))
+  fbI32Rel(RS_TAG, tag)
   fbLocalGet(refSlot)
   fbStructNew(uBoxIdx)
   fbEnd()
