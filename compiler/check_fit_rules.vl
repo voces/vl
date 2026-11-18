@@ -97,6 +97,7 @@ import {
   cohSiteCol,
   cohSiteLine,
   cohWitness,
+  copySafeAt,
   ctxElemNodes,
   ctxFieldNames,
   ctxFieldNodes,
@@ -1925,8 +1926,86 @@ export function objShapeAdapterlessAt(
   shapeAdaptNestedCopySet(false)
   shapeAdaptMapSharedSet(false)
   shapeAdaptRecFieldSet(false)
+  recordCopySafe(srcExpr, src, dst)
   if objShapeAdapterless(srcExpr, src, dst, 12, true) { return true }
   return listWidenWalk(srcExpr, src, dst, 12)
+}
+
+// The values deliveries handed on, and the type each is handed on as, whose `copySafe` is asked
+// once the check is done: the write scan it reads is complete only then.
+let copySafeAsked: i32[] = []
+let copySafeAskedTy: i32[] = []
+
+// Queues the value `srcExpr` a delivery hands on as `dstTy` for `copySafeRecordAll`.
+export function recordCopySafe(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  const p = parenPeelIx(srcExpr)
+  if p < 0 || p >= P.nodes.length || srcTy == dstTy || dstTy < 0 { return 0 }
+  copySafeAsked.push(p)
+  copySafeAskedTy.push(dstTy)
+  return 0
+}
+
+// Empties the queue at a program's start: it names another program's nodes and types.
+export function copySafeAskedReset() {
+  copySafeAsked = []
+  copySafeAskedTy = []
+  return 0
+}
+
+// Records `copySafe` where the emitter reads it: on each queued list, or part of a queued literal,
+// whose element its destination stores differently, or whose type is still open.
+export function copySafeRecordAll() {
+  let i = 0
+  while i < copySafeAsked.length && i < copySafeAskedTy.length {
+    copySafeRecordAt(copySafeAsked[i], copySafeAskedTy[i])
+    i = i + 1
+  }
+  copySafeAsked = []
+  copySafeAskedTy = []
+  return 0
+}
+
+// `copySafeRecordAll` at the value `p` handed on as `dstTy`, and at a literal's fields and elements.
+function copySafeRecordAt(p: i32, dstTy: i32) {
+  if p < 0 || p >= P.nodes.length || dstTy < 0 || dstTy >= T.tys.length {
+    return 0
+  }
+  const d = nonNulTyOf(dstTy)
+  if d < 0 || d >= T.tys.length { return 0 }
+  const n = nodeAt(p)
+  const dt = tyAt(d)
+  if n is ArrayLit {
+    if dt is TyArray {
+      for e in n.arrElems {
+        const sp = nodeAt(e)
+        if sp is Spread {
+          copySafeRecordAt(parenPeelIx(sp.spdArg), d)
+        } else {
+          copySafeRecordAt(parenPeelIx(e), tyElemOf(dt))
+        }
+      }
+    }
+    return 0
+  }
+  if n is ObjLit {
+    if dt is TyObj {
+      for fx in n.objFields {
+        const fi = nodeAt(fx)
+        if fi is FieldInit {
+          const df = objFieldType(dt, fi.fiName)
+          if df >= 0 { copySafeRecordAt(parenPeelIx(fi.fiValue), df) }
+        }
+      }
+    }
+    return 0
+  }
+  const t = nonNulTyOf(nodeTyIxOf(p))
+  const a = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if a is TyVar || listTysElemDiffer(t, d) {
+    while copySafeAt.length <= p { copySafeAt.push(-1) }
+    if copySafeAt[p] < 0 { copySafeAt[p] = if copySafe(p) { 1 } else { 0 } }
+  }
+  return 0
 }
 
 // A literal built inside a function, or handed through a generic call, is built at the row of a
@@ -6313,6 +6392,21 @@ function fnLocalFreshList(r: i32, fd: i32, seen: i32[]): boolean {
   return litBuildsFresh(init, seen)
 }
 
+// Whether a converting copy of list `x` can never go stale: nothing else holds any part of it
+// (`deliveryFresh`), or nothing writes its root, a `const` bound to a literal building every value
+// it holds, since a copy then reads what any handle reads. An inner list or record another binding
+// holds forfeits the second arm: the write state does not follow it (D16954).
+export function copySafe(x: i32): boolean {
+  if deliveryFresh(x) { return true }
+  const p = parenPeelIx(x)
+  if !covarRootFreshLocal(p) || covarValueWriteState(cwKeyOfRoot(p)) != 0 {
+    return false
+  }
+  const d = identDeclOf(p)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return dn is LetDecl && litBuildsFresh(cwPeel(dn.letInit), [])
+}
+
 // Whether the list value `x` is one nothing else holds, so a converting copy of it at this
 // delivery cannot go stale: a literal building every value it holds, a fresh call, or a `const`
 // bound to such a literal and read nowhere but at `x`. Adoption's `recLitOnlyDeclOf` differs: it
@@ -7899,8 +7993,13 @@ function objShapeListElemAdapts(
     if d.aRead == 1 && scalarElemWidenServed(tyElemOf(s), tyElemOf(d)) {
       if cx < 0 {
         shapeAdaptNestedCopySet(true)
-      } else if (covarValueWriteState(cwKeyOfRoot(cx)) == 0) {
-        if !covarRootFreshLocal(cx) { noteScalarView(tyElemOf(s), tyElemOf(d)) }
+      } else if cwKeyOfRoot(cx) != -1 {
+        if (
+          covarValueWriteState(cwKeyOfRoot(cx)) != 0
+          || !covarRootFreshLocal(cx)
+        ) {
+          noteScalarView(tyElemOf(s), tyElemOf(d))
+        }
         return false
       }
     }
@@ -8196,17 +8295,9 @@ function objShapeElemPairErr(
     return 0
   }
   if through == "" && containerWidenServed(sT, dT) {
-    const wAt = covarValueWriteAt(cwKeyOfRoot(sX))
-    let written = "nothing shows this list is never written, and a container that may be "
-      + "written"
-    if wAt >= 0 {
-      written = "this list is written (line "
-        + i32ToStr(nodeLineOf(wAt))
-        + "), and a written container"
-    }
-    rule = " here: "
-      + written
-      + " never widens implicitly. Its elements would have to be stored differently, which "
+    // A written source with a named root is the view (D3040); only one with none reaches here.
+    rule = " here: nothing shows this list is never written, and a container that may be "
+      + "written never widens implicitly. Its elements would have to be stored differently, which "
       + "takes a copy, and a write would not reach both."
   }
   // A pair reached through a literal spelled in the source is fixed at that inner value.

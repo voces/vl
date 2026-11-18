@@ -15,7 +15,7 @@ import { tyIsPlainString } from "./emit_variant_sig"
 import { emitFail } from "./emit_bytes"
 import { nodeRepTyAt, nodeTyAt } from "./emit_capture_frames"
 import { elabNodeInstTys } from "./emit_elab"
-import { unRowOfTyKey } from "./emit_union_tykey_text"
+import { TY_WALK_DEPTH, unRowOfTyKey } from "./emit_union_tykey_text"
 
 // `emit_obj_lit_fits.vl` — whether an object literal or field fits a row, and the
 // leaf an arm path reaches.
@@ -116,7 +116,11 @@ import {
 } from "./emit_atom_kinds"
 import { objFieldVal, unwrapParen } from "./emit_base"
 import { fnIndexOfInScopeAt } from "./emit_local_scope"
-import { annBareRefArrElemName } from "./emit_map_value_slots"
+import {
+  annBareRefArrElemName,
+  tyRefArrElemOf,
+  unMemRefArrArmSlot,
+} from "./emit_map_value_slots"
 import { repSlotOfKind } from "./emit_rep_slot"
 import { exactArmRowOfTy } from "./emit_local_slots"
 import { vtKindOfType } from "./emit_nullable_rets"
@@ -127,9 +131,10 @@ import {
   fieldLitTyIn,
   nodeMapValTyIx,
   nullValKind,
+  scalarTagOfKind,
   valueBoxOfTy,
 } from "./emit_rep"
-import { mapTwinSame } from "./emit_map_twins"
+import { mapTwinSame, refArrSlotTag } from "./emit_map_twins"
 import {
   emptyArrLitIxOf,
   mvValKindOfTy,
@@ -172,13 +177,18 @@ import {
   variantHeap,
 } from "./emit_state"
 import { declaredSlotOf, rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
-import { nodeTyInOf, tySameSet, tySameSpelled } from "./emit_ty_canon"
+import {
+  nodeTyInOf,
+  tyMentionsSet,
+  tySameSet,
+  tySameSpelled,
+} from "./emit_ty_canon"
 import {
   registerValueUnionOfTy,
   valueUnionKeyTextOfTy,
   valueUnionNameOfSoftTy,
 } from "./emit_union_atoms"
-import { unionRowKeyAB } from "./emit_union_registry"
+import { unMemIsRefElemArray, unionRowKeyAB } from "./emit_union_registry"
 import { strListHas } from "./listutil"
 import {
   litSetBaseTy,
@@ -676,9 +686,11 @@ export function sharedFieldArmsBoxable(
       atoms = atoms + 1
     } else if sharedFieldArmNulSet(vis[i], fis[i]) {
       atoms = atoms + 1
-    } else if sharedFieldArmNulListKind(vis[i], fis[i]) >= 0 {
+    } else if sharedFieldArmNulListTag(vis[i], fis[i]) >= 0 {
       atoms = atoms + 1
     } else if sharedFieldArmListKind(vis[i], fis[i]) >= 0 {
+      atoms = atoms + 1
+    } else if sharedFieldArmRefListTag(vis[i], fis[i]) >= 0 {
       atoms = atoms + 1
     } else if sharedFieldArmStructTag(vis[i], fis[i], rt) >= 0 {
       // A record rides the box under its arm of the read's union (D16949).
@@ -1351,7 +1363,7 @@ export function sharedFieldArmBoxKind(vi: i32, fi: i32): i32 {
 // The box kind of member `vi`'s field `fi` stored as a non-null list, which a mixed shared read
 // boxes under that kind's tag as its ref (D16951), or -1 for any other storage.
 export function sharedFieldArmListKind(vi: i32, fi: i32): i32 {
-  if variantFieldIsUnionBox(vi, fi) || sharedFieldArmNulListKind(vi, fi) >= 0 {
+  if variantFieldIsUnionBox(vi, fi) || sharedFieldArmNulListTag(vi, fi) >= 0 {
     return -1
   }
   if vi < 0 || vi >= uFieldStart.length || vi >= uVarTyIx.length { return -1 }
@@ -1364,9 +1376,32 @@ export function sharedFieldArmListKind(vi: i32, fi: i32): i32 {
   return k
 }
 
-// The box tag kind of the list member `vi` stores shared field `fi` as beside `null`, a nullable
-// list ref a boxing read boxes under that list's tag, or as `null` when the ref is; -1 otherwise.
-export function sharedFieldArmNulListKind(vi: i32, fi: i32): i32 {
+// The box tag member `vi`'s field `fi` takes when it stores a non-null record list, which a mixed
+// shared read boxes as its ref (D16952); -1 for any other storage.
+export function sharedFieldArmRefListTag(vi: i32, fi: i32): i32 {
+  if variantFieldIsUnionBox(vi, fi) { return -1 }
+  if vi < 0 || vi >= uFieldStart.length || vi >= uVarTyIx.length { return -1 }
+  const at = uFieldStart[vi] + fi
+  if at < 0 || at >= armFieldNames().length || uVarTyIx[vi] < 0 { return -1 }
+  const ft = tyFieldTyOf(uVarTyIx[vi], armFieldNames()[at])
+  if ft < 0 || ft >= T.tys.length || !(tyAt(ft) is TyArray) { return -1 }
+  return refListArmTagOfTy(ft)
+}
+
+// The box tag of record-list arm type `ity`, its ref-list slot's, which the box site and the
+// `is` test both read; -1 for any other type, and for a list of Sets, whose slot the boolean-map
+// list shares (D2753).
+export function refListArmTagOfTy(ity: i32): i32 {
+  if ity < 0 || !unMemIsRefElemArray(ity) { return -1 }
+  if tyMentionsSet(tyRefArrElemOf(ity), TY_WALK_DEPTH) { return -1 }
+  const sl = unMemRefArrArmSlot(ity)
+  if sl < 0 { return -1 }
+  return refArrSlotTag(sl)
+}
+
+// The box tag of the list member `vi` stores shared field `fi` as beside `null`, a nullable list
+// ref a boxing read boxes under that list's tag, or as `null` when the ref is; -1 otherwise.
+export function sharedFieldArmNulListTag(vi: i32, fi: i32): i32 {
   const c = variantFieldTypeAt(vi, fi)
   if (
     c != FC_NUL_I32_LIST
@@ -1388,9 +1423,10 @@ export function sharedFieldArmNulListKind(vi: i32, fi: i32): i32 {
   const t = tyAt(ft)
   const inner = if t is TyNullable { t.nInner } else { -1 }
   if inner < 0 || !(tyAt(inner) is TyArray) { return -1 }
+  if c == FC_NUL_REF_LIST { return refListArmTagOfTy(inner) }
   const k = boxTagOfTy(inner)
   if k < 0 || k == nullValKind() { return -1 }
-  return k
+  return scalarTagOfKind(k)
 }
 
 // Whether member `vi` stores shared field `fi` as a string literal set beside `null` at the atom

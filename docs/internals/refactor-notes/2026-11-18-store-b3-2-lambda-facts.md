@@ -18,7 +18,7 @@ let a lambda stand as an id only after the elaboration.
 ## Change
 
 - `arrowFactsBuild`: a lambda member's fact stands where the lambda types at the row's arguments,
-  asked in a quiet run rolled back whole (`quietRunOpen` / `quietRunDrop(RB_ALL)`). Without the
+  asked in a quiet run rolled back whole (`setMemberRetsQuiet`). Without the
   rollback, typing a lambda at a member's arguments it never meets (D10795's element pin)
   leaves diagnostics behind.
 - `ftNodeOk`: under the check's fact retry, a lambda is its own leaf where it stands as a list
@@ -62,4 +62,6 @@ Sets moved to check: 17. Kept late: 375.
   - a literal-index exclusion: lost 10 rows and fixed nothing.
 - L2 fuel 96.361G against the base's 96.339G measured alike (+0.02%). Census ok; lint clean;
   `emit_mono.vl` 908.
-- Net compiler lines: +77 / −11. The net (condition 2) is 34 of the added lines.
+- Net compiler lines: +93 / −12. The net (condition 2) is 34 of the added lines. The lambda facts'
+  quiet run sits in `setMemberRetsQuiet` (`check_relate_core.vl`, beside `setMemberRetAt`), so
+  `check_arrow_facts.vl` opens no quiet run and the probe-rollback reach does not grow.
