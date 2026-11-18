@@ -21,11 +21,8 @@ the IR. No emitted byte moves.
   back: <why>`; a claim as `claimed start`, apart from the functions' `claimed`. The scope and
   loop resets are one helper (`startFrameReset`) run before the claim and again before legacy.
 - **Named misses kept from S1a:** string accumulator, progress cell, every initializer arm but
-  `plain`, init-function windows (S1c). **One added:** `hoisted receiver read`, a start `while`
-  whose receiver legacy hoists has no read the lowering can repeat (`loopHoistCands` asked as the
-  lowering asks it). It covers a master gap from #9039 (a field of a global record as a hoisted
-  receiver), which STORE fixes on `ir-hoist-global-field`; it is the start's only, so functions
-  keep master's behaviour until that lands, and then the miss can go.
+  `plain`, init-function windows (S1c). A start loop over a global record's list field (a hoisted
+  receiver read off a global) matches and is claimed now that STORE's #9049 records the read.
 
 ## Readings (master `53ff806b` against this branch, fixpoint seeds both)
 
