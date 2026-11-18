@@ -17,6 +17,7 @@ import {
   Ident,
   IfStmt,
   Index,
+  IsExpr,
   LetDecl,
   LoopVar,
   Member,
@@ -92,6 +93,10 @@ import {
   idxStorePlainWhy,
   idxStorePlanOf,
   ifWritesElse,
+  isArmOf,
+  isBoxGuardPlain,
+  isRecvStageRep,
+  isVariantTagPlain,
   keptDeclStoresNothing,
   listReserveScan,
   lowMemFoldsCallee,
@@ -118,6 +123,7 @@ import {
 } from "./wasmEmit"
 import {
   RAtom,
+  RBox,
   RList,
   RMap,
   RNullable,
@@ -191,7 +197,7 @@ function censusGoesOn(why: string): boolean {
 // The families whose every occurrence the shadow has matched, so a function built wholly of them
 // ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
 const CLAIMED: IrFamily[] = [
-  "scalar", "control", "call", "global", "map", "list",
+  "scalar", "control", "call", "global", "map", "list", "box",
 ]
 let ibClaimAll = false
 // Set while `irClaimFn` builds, never under the shadow, which builds every function whole.
@@ -307,10 +313,28 @@ let ibNoValue = -1
 function valueRep(r: i32, ty: i32): boolean {
   return repIsScalar(r)
     || repNodeAt(r) is RAtom
+    || repNodeAt(r) is RBox
     || boxedNullable(r)
     || atomNullable(r)
     || strNullable(r)
     || irVarRepOkHook(r, ty)
+}
+
+// A box's `is` test at the variant rung legacy answers by the tag alone (`isArmOf` from rank 0,
+// no staged receiver, `isVariantTagPlain`), over a plain read (`isBoxGuardPlain`).
+function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
+    return irBMiss("is staged")
+  }
+  if isArmOf(ix, ibFnIx, 0, false) != "variant" { return irBMiss("is rung") }
+  if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
+  const vi = isVariantTagPlain(ix, ibFnIx)
+  if vi < 0 { return irBMiss("is variant shape") }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RBox) { return irBMiss("is operand rep") }
+  return irBLetTemp(b, { teV: v, teTarget: vi }, ix, rep)
 }
 
 // Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
@@ -1310,6 +1334,7 @@ function irBExprAt(b: i32[], ix: i32): Opnd {
     const c: Opnd = { oiRep: rep, oiBits: cp as i64 }
     return c
   }
+  if n is IsExpr { return boxTest(b, n, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
 
