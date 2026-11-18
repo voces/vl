@@ -91,6 +91,11 @@ first marker is a free header.
     @@OWED_ANNOTATED@@  a check refusal the design owes in the annotated face at every built-in
                   position, one spelling per line, any of which grades the cell OWED (a cell's
                   own `// owed-annotated:` is the per-cell form)
+    @@OWED@@      the same in BOTH faces, for a template whose program the design refuses
+                  (`// owed:` is the per-cell form); a template every graded cell of which
+                  refuses at check without one is a BLIND TEMPLATE, and exits non-zero. A
+                  spelling is matched against the refusal's first ~70 characters, so name
+                  its opening words
     @@PROOF@@     statements over the bound name `v`, printing WANT
     @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
                   `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination

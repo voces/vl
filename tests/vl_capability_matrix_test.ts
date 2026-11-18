@@ -498,3 +498,58 @@ Deno.test({
     }
   },
 });
+
+// A template every graded cell of which refuses at check measures nothing, so it is red (a BLIND
+// TEMPLATE) unless it declares the refusal owed. Every built-in position but `binding` is skipped,
+// which keeps the full grade the guard needs to two cells.
+const blindTemplate = async (dir: string, owed: boolean): Promise<string> => {
+  const list = await new Deno.Command(VL, {
+    args: ["run", await builtScript(MATRIX, { cwd: ROOT }), "--", "--list-positions"],
+    cwd: ROOT,
+    stdout: "piped",
+    env: nativeEnv({ NO_COLOR: "1" }),
+  }).output();
+  const positions = new TextDecoder().decode(list.stdout).split(/\r?\n/)
+    .map((l) => l.split(/\s+/)[0]).filter((p) => p !== "" && p !== "binding");
+  const lines = [
+    "// @@VALUE@@",
+    "__never_declared",
+    "// @@TYPE@@",
+    "i32",
+    "// @@WANT@@",
+    "1",
+    "// @@PROOF@@",
+    "print(v)",
+    "// @@SKIP@@",
+    ...positions.map((p) => `${p}: the guard's test grades only \`binding\``),
+  ];
+  if (owed) lines.push("// @@OWED@@", "undeclared identifier");
+  const path = `${dir}/${owed ? "owed" : "blind"}.matrix.vl`;
+  await Deno.writeTextFile(path, lines.join("\n") + "\n");
+  return path;
+};
+
+Deno.test({
+  name: "matrix: a template every cell of which refuses at check is BLIND and exits 1, unless owed",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_capability_matrix_blind_" });
+    try {
+      const blind = await runMatrix(await blindTemplate(dir, false));
+      if (!blind.out.includes("BLIND TEMPLATE blind.matrix.vl: every graded cell refuses at check")) {
+        throw new Error(`want the blind template named, got:\n${blind.out}`);
+      }
+      if (blind.code !== 1) throw new Error(`want exit 1 on a blind template, got ${blind.code}`);
+      const owed = await runMatrix(await blindTemplate(dir, true));
+      if (owed.out.includes("BLIND TEMPLATE")) {
+        throw new Error(`want an owed template not called blind, got:\n${owed.out}`);
+      }
+      if (!owed.out.includes("2 owed refusals")) {
+        throw new Error(`want both binding cells graded owed, got:\n${owed.out}`);
+      }
+      if (owed.code !== 0) throw new Error(`want exit 0 on an all-owed template, got ${owed.code}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
