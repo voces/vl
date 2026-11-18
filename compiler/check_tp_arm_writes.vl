@@ -1,0 +1,259 @@
+// What a generic's `is K` arms fix its type parameters to (DECISIONS.md "No default type"): an
+// arm that writes through a receiver typed by a parameter makes that receiver a `K`, so a call that
+// binds the parameter to nothing binds it there. Read from the declaration's signature and body
+// syntax alone, so the order the body and the call are checked in cannot change the answer.
+import {
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  Member,
+  P,
+  Param,
+  i32ToStr,
+  identNameAt,
+  nodeAt,
+  nodeChildren,
+} from "./ast"
+import { resolveAnnot } from "./check_annot_resolve"
+import { declTyOf } from "./check_nar_store"
+import { parenPeelIx } from "./check_places"
+import { bindGenWalk } from "./check_relate_core"
+import { TyFunc, tyAt, tyEq, tyFieldTyOf, tyMutEpoch } from "./check_types"
+import { strListHas } from "./listutil"
+import { tyHasTyVar } from "./tyquery"
+
+// By `<decl>:<param>`: the type the arms bind, the `is` node that first bound it, a second `is`
+// node binding it to another type, and whether an arm hands the receiver on. Rebuilt whenever
+// `tyMutEpoch` moves, which it does at every program's checker init.
+let tawTy: {[string]: i32} = Map()
+let tawAt: {[string]: i32} = Map()
+let tawClash: {[string]: i32} = Map()
+let tawUnknown: {[string]: boolean} = Map()
+let tawDone: {[i32]: boolean} = Map()
+let tawEpoch = -1
+
+// The type generic `d`'s `is` arms bind type parameter `tp` to, or -1: none binds it, or an arm
+// hands the receiver to a call, closure or store, which leaves the call to the default it had.
+export function tpArmWriteTy(d: i32, tp: string): i32 {
+  tawScan(d)
+  const k = tawKey(d, tp)
+  if tawUnknown[k] ?? false { return -1 }
+  return tawTy[k] ?? -1
+}
+
+// The `is` nodes of two arms of `d` that bind `tp` to different types, or an empty list.
+export function tpArmWriteClash(d: i32, tp: string): i32[] {
+  tawScan(d)
+  const k = tawKey(d, tp)
+  const b = tawClash[k] ?? -1
+  if b < 0 { return [] }
+  return [tawAt[k] ?? -1, b]
+}
+
+function tawKey(d: i32, tp: string): string { return i32ToStr(d) + ":" + tp }
+
+function tawScan(d: i32) {
+  if tawEpoch != tyMutEpoch {
+    tawTy = Map()
+    tawAt = Map()
+    tawClash = Map()
+    tawUnknown = Map()
+    tawDone = Map()
+    tawEpoch = tyMutEpoch
+  }
+  if tawDone[d] ?? false { return 0 }
+  tawDone[d] = true
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const fd = nodeAt(d)
+  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return 0 }
+  const sig = declTyOf(d)
+  if sig < 0 { return 0 }
+  const st = tyAt(sig)
+  if !(st is TyFunc) { return 0 }
+  const ifs: i32[] = []
+  tawIfsUnder(fd.fnBody, ifs)
+  for ix in ifs { tawArm(d, fd, st.fnParamTypes, ix) }
+  return 0
+}
+
+// Every `if` under `ix`, a nested function's included: its arms test the same parameters.
+function tawIfsUnder(ix: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if nodeAt(ix) is IfStmt { out.push(ix) }
+  for k in nodeChildren(ix) { tawIfsUnder(k, out) }
+  return 0
+}
+
+// Records what the `is` arm at `ifIx` of generic `d` binds, when its test's receiver is a
+// parameter or a field path into one.
+function tawArm(d: i32, fd: FuncDecl, ptys: i32[], ifIx: i32) {
+  const s = nodeAt(ifIx)
+  if !(s is IfStmt) { return 0 }
+  const isIx = parenPeelIx(s.ifCond)
+  const t = if isIx >= 0 { nodeAt(isIx) } else { nodeAt(0) }
+  if !(t is IsExpr) || t.isNeg > 0 { return 0 }
+  const path: string[] = []
+  const root = tawPathOf(t.isObj, path)
+  if root == "" { return 0 }
+  let pi = 0
+  let rt = -1
+  while pi < fd.fnParams.length && pi < ptys.length {
+    const p = nodeAt(fd.fnParams[pi])
+    if p is Param && p.parName == root { rt = ptys[pi] }
+    pi = pi + 1
+  }
+  let k = path.length - 1
+  while k >= 0 && rt >= 0 {
+    rt = tyFieldTyOf(rt, path[k])
+    k = k - 1
+  }
+  if rt < 0 || !tyHasTyVar(rt) { return 0 }
+  const kt = resolveAnnot(t.isVariant, fd.fnTyParams)
+  if kt < 0 || tyHasTyVar(kt) { return 0 }
+  const names: string[] = []
+  const tys: i32[] = []
+  bindGenWalk(rt, kt, names, tys)
+  const tally: i32[] = [0, 0]
+  const aliases: string[] = []
+  tawArmUses(s.ifThen, root, path, aliases, tally)
+  let i = 0
+  while i < names.length && i < tys.length {
+    const key = tawKey(d, names[i])
+    if tally[1] > 0 {
+      tawUnknown[key] = true
+    } else if tally[0] > 0 {
+      const have = tawTy[key] ?? -1
+      if have < 0 {
+        tawTy[key] = tys[i]
+        tawAt[key] = isIx
+      } else if !tyEq(have, tys[i]) && (tawClash[key] ?? -1) < 0 {
+        tawClash[key] = isIx
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The parameter name receiver `ix` is rooted at, its field steps pushed innermost last, or "".
+function tawPathOf(ix: i32, path: string[]): string {
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return "" }
+  const n = nodeAt(x)
+  if n is Member {
+    path.push(n.memProp)
+    return tawPathOf(n.memObj, path)
+  }
+  return identNameAt(x)
+}
+
+// Whether `ix` is the receiver: `root` with field steps `path` (innermost last), or a `const` the
+// arm bound to it.
+function tawIsRecv(
+  ix: i32,
+  root: string,
+  path: string[],
+  aliases: string[],
+): boolean {
+  if tawIsPath(ix, root, path) { return true }
+  const x = parenPeelIx(ix)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = nodeAt(x)
+  return n is Ident && strListHas(aliases, n.identName)
+}
+
+// Whether `ix` spells receiver `root` with field steps `path` (innermost last).
+function tawIsPath(ix: i32, root: string, path: string[]): boolean {
+  const p: string[] = []
+  if tawPathOf(ix, p) != root || p.length != path.length { return false }
+  let i = 0
+  while i < p.length {
+    if p[i] != path[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// Counts under `ix` the writes through the receiver (`tally[0]`: a `push`, `add` or `set` on it,
+// or a store at an index of it) and the mentions of it that are neither one of those, a read of
+// its length or an element, a test of it, nor a `const` naming it (`tally[1]`): a call, closure
+// or store that takes it, after which a write is out of sight. A nested function's mention counts so.
+function tawArmUses(
+  ix: i32,
+  root: string,
+  path: string[],
+  aliases: string[],
+  tally: i32[],
+) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl {
+    if tawMentions(ix, root, aliases) { tally[1] = tally[1] + 1 }
+    return 0
+  }
+  if (
+    n is LetDecl
+    && n.letKw == "const"
+    && n.letInit >= 0
+    && tawIsRecv(n.letInit, root, path, aliases)
+  ) {
+    aliases.push(n.letName)
+    return 0
+  }
+  if n is Call {
+    const cf = parenPeelIx(n.callFn)
+    const c = if cf >= 0 { nodeAt(cf) } else { nodeAt(0) }
+    if c is Member && tawIsRecv(c.memObj, root, path, aliases) {
+      if c.memProp == "push" || c.memProp == "add" || c.memProp == "set" {
+        tally[0] = tally[0] + 1
+        for a in n.callArgs { tawArmUses(a, root, path, aliases, tally) }
+        return 0
+      }
+    }
+  }
+  if n is BinExpr && n.binOp == "=" {
+    const l = nodeAt(parenPeelIx(n.binLeft))
+    if l is Index && tawIsRecv(l.idxArr, root, path, aliases) {
+      tally[0] = tally[0] + 1
+      tawArmUses(l.idxIndex, root, path, aliases, tally)
+      tawArmUses(n.binRight, root, path, aliases, tally)
+      return 0
+    }
+  }
+  if (
+    n is Member
+    && n.memProp == "length"
+    && tawIsRecv(n.memObj, root, path, aliases)
+  ) {
+    return 0
+  }
+  if n is Index && tawIsRecv(n.idxArr, root, path, aliases) {
+    tawArmUses(n.idxIndex, root, path, aliases, tally)
+    return 0
+  }
+  if n is IsExpr && tawIsRecv(n.isObj, root, path, aliases) { return 0 }
+  if n is Ident && (n.identName == root || strListHas(aliases, n.identName)) {
+    tally[1] = tally[1] + 1
+    return 0
+  }
+  for k in nodeChildren(ix) { tawArmUses(k, root, path, aliases, tally) }
+  return 0
+}
+
+// Whether `root` or one of its `aliases` is named anywhere under `ix`.
+function tawMentions(ix: i32, root: string, aliases: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if n is Ident && (n.identName == root || strListHas(aliases, n.identName)) {
+    return true
+  }
+  for k in nodeChildren(ix) {
+    if tawMentions(k, root, aliases) { return true }
+  }
+  return false
+}
