@@ -13,9 +13,9 @@
 # scripts/capability-probes program, under both, comparing the wasm and the exit code. It prints
 # `cases: identical N, fail under both N, differ N` and each that differs.
 # Either exits 1 on any difference. Run from the checkout root; $VL names the host, $JOBS the
-# fan-out (default 4). Temp files live under $TMPDIR and are removed on exit.
+# fan-out (default 4); $VL defaults to the checkout's host. Temp files live under $TMPDIR and are removed on exit.
 set -euo pipefail
-export VL=${VL:-vl}
+export VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 T=$(mktemp -d)
 trap 'rm -rf "${T:?}"' EXIT
 
