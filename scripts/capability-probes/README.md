@@ -85,6 +85,9 @@ first marker is a free header.
     @@WANT_UNANNOTATED@@  what the un-annotated face prints instead, when the design gives that
                   face another answer (an open value, D16047); every other face, and the
                   positions whose un-annotated face still delivers into TYPE, read WANT
+    @@OPEN_POSITIONS@@  positions, one per line, whose ANNOTATED face leaves the value open too
+                  (`return_inferred` computes inside a function with no declared result), so
+                  both of their faces read WANT_UNANNOTATED
     @@PROOF@@     statements over the bound name `v`, printing WANT
     @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
                   `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination
