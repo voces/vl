@@ -21,7 +21,7 @@ import { callBindTyOf } from "./check_bind_rows"
 import { cwFieldNameOf } from "./check_write_scan"
 import { holeLinkSiteSet } from "./check_hole_links"
 import { decDigitsOf } from "./strutil"
-import { fnOnlyReturnsParam, identDeclOf } from "./symbols"
+import { fnOnlyReturnsParam, identDeclOf, nodeSrc } from "./symbols"
 import {
   ArrayLit,
   AsExpr,
@@ -121,6 +121,7 @@ import {
   nodeRepTyIx,
   nodeRepTyIxOf,
   nodeRepUnionIx,
+  optReadPartOf,
   optReadParts,
   recCopyFrom,
   recCopyFromOf,
@@ -360,6 +361,7 @@ import {
   recKeptDecl,
   recKeptDst,
   recKeptFnPush,
+  recListLits,
   recOwnPend,
   recOwnSrc,
   recPend,
@@ -2258,6 +2260,22 @@ export function recBuildOwnEdges() {
           tys[k] = if tyAt(tys[k]) is TyNullable { mkNullableTy(b) } else { b }
           recBuildPush(r.decl, own, mkObjTy(ot.objFieldNames, tys), false)
         }
+      }
+    }
+  }
+  // A list literal initialising a binding builds its elements as their literals agree (D16967).
+  for l in recListLits {
+    const ln = nodeAt(l)
+    const r = if ln is ArrayLit && ln.arrElems.length > 0 { deliveryRoot(l, "held") } else { null }
+    if ln is ArrayLit && r != null && r.part == "whole" {
+      const eb = recLitFieldsBuiltTy(ln.arrElems[0])
+      let agree = eb >= 0
+      for el in ln.arrElems {
+        const b = recLitFieldsBuiltTy(el)
+        if b < 0 || !fieldStorageEq(eb, b) { agree = false }
+      }
+      if agree {
+        recBuildPush(r.decl, nodeTyIxOf(cwPeelValue(ln.arrElems[0])), eb, true)
       }
     }
   }
@@ -4701,11 +4719,16 @@ function recCoalesceDefaultsAt(d: i32, rep: i32): i32[] {
   const w = cwOccWalk(d)
   while cwOccNext(w) {
     const u = if cwIxKind[w.row] == CW_OCC_USE { cwIxNode[w.row] } else { -1 }
-    const q = if u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_COAL { cwIxUp[u] } else { -1 }
+    // A field of a record literal defaulting the `??` is delivered at that field of the read's build.
+    const inLit = u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_FIELD
+    const dv = if inLit { cwIxUp[u] } else { u }
+    const q = if dv >= 0 && cwIxCovers(dv) && cwIxUpKind[dv] == CW_UP_COAL { cwIxUp[dv] } else { -1 }
     const qn = if q >= 0 && q < P.nodes.length { nodeAt(q) } else { null }
-    if qn is BinExpr && cwPeelValue(qn.binRight) == u {
+    if qn is BinExpr && cwPeelValue(qn.binRight) == dv {
       const b = recBuiltReadTy(q)
-      if b >= 0 && fieldStorageEq(nonNullTy(b), rep) {
+      const bt = if b >= 0 && b < T.tys.length { tyAt(nonNullTy(b)) } else { null }
+      const at = if !inLit { nonNullTy(b) } else if bt is TyObj { objFieldType(bt, cwFieldNameOf(cwIxUpAux[u])) } else { -1 }
+      if at >= 0 && at < T.tys.length && fieldStorageEq(nonNullTy(at), rep) {
         out.push(u)
         out.push(q)
       }
@@ -5036,6 +5059,7 @@ export function recKeptOwnMsg(
   let how = " where line "
     + i32ToStr(nodeLineOf(at))
     + " delivers it, and it is handed on here at its own type"
+
   if inst {
     how = " by this delivery at one instance of the generic function around it, and "
       + "kept at its own type at another"
@@ -5778,6 +5802,21 @@ function recBuiltReadTyAt(
   if n is BinExpr {
     return if n.binOp == "??" { recBuiltReadTyAt(cwPeelValue(n.binLeft), tbl, fresh, depth) } else { -1 }
   }
+  // A value join reads where every non-null tail does, all at one record (D16965).
+  if n is IfStmt || n is MatchExpr {
+    const leaves: i32[] = []
+    tailValueLeaves(x, leaves)
+    let r = -1
+    for lf in leaves {
+      const v = cwPeelValue(lf)
+      if v >= 0 && v < P.nodes.length && !(nodeAt(v) is NullLit) {
+        const b = if v == x { -1 } else { nonNullTy(recBuiltReadTyAt(v, tbl, fresh, depth - 1)) }
+        if b < 0 || (r >= 0 && !fieldStorageEq(r, b)) { return -1 }
+        r = b
+      }
+    }
+    return r
+  }
   if n is Index { return recBuiltElemIn(cwPeelValue(n.idxArr), tbl) }
   if n is Call {
     if n.callFn < 0 { return -1 }
@@ -5798,11 +5837,13 @@ function recBuiltReadTyAt(
     }
     return recBuiltLeavesTy(recInferredFnOf(x), tbl, depth - 1)
   }
-  if n is Member {
-    const o = recBuiltReadTyAt(cwPeelValue(n.memObj), tbl, fresh, depth)
+  if n is Member || n is OptMember {
+    const recv = if n is Member { n.memObj } else if n is OptMember { n.omObj } else { -1 }
+    const prop = if n is Member { n.memProp } else if n is OptMember { n.omProp } else { "" }
+    const o = recBuiltReadTyAt(cwPeelValue(recv), tbl, fresh, depth)
     if o < 0 { return -1 }
     const ot = tyAt(nonNullTy(o))
-    return if ot is TyObj { objFieldType(ot, n.memProp) } else { -1 }
+    return if ot is TyObj { objFieldType(ot, prop) } else { -1 }
   }
   // A loop variable or a list callback's parameter holds the list's elements (D16783).
   const el = recElemVarList(x)
@@ -5975,7 +6016,10 @@ export function storeLetBuiltSet(call: i32, rec: i32) {
 // The record every result of the call `call` an un-annotated binding holds is built at, where
 // that is another record than the call's own type; else -1.
 export function storeLetBuiltOf(call: i32): i32 {
-  return storeLetBuilt[call] ?? -1
+  // A node a later rewrite copied, or the field read a `?.` read is rewritten to, answers as the
+  // node the check saw.
+  const src = nodeSrc[call] ?? (optReadPartOf[call] ?? -1)
+  return storeLetBuilt[call] ?? (storeLetBuilt[src] ?? -1)
 }
 
 // Empties the built-record column and both queues, as a check pass begins.
