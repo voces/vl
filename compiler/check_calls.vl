@@ -494,7 +494,7 @@ import {
   tyIsDeferredJoin,
 } from "./check_tp_join"
 import { holeArgScalarRefused, scalarPrimPair } from "./check_ty_relate"
-import { unionRidesI32Spine } from "./check_ty_rep"
+import { mapTwinUnionMember, unionRidesI32Spine } from "./check_ty_rep"
 import {
   T,
   TY_BOOL,
@@ -522,6 +522,7 @@ import {
   mkObjTy,
   nestParentOf,
   objFieldType,
+  oneListUnionRender,
   tvSlotBound,
   tyArrayElemIx,
   tyAt,
@@ -1681,6 +1682,11 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     vNames,
     vTys,
   )
+  if !inferQuiet && !explicitTa && !rtpRefused && cfn is Ident {
+    if openArgTyParamRefused(n, ix, cfn.identName, params, vNames, vTys) {
+      return TY_ERR
+    }
+  }
   // What this call bound, for the refusal of a generic recursion that grows its type (D2721).
   const cDecl = if cfn is Ident { fnDeclIx[cfn.identName] ?? -1 } else { -1 }
   if !inferQuiet && cfn is Ident && cDecl >= 0 {
@@ -2349,6 +2355,68 @@ export function settleHeldPins() {
   }
   heldUnboundCalls = []
   return ceHeldReset()
+}
+
+// Whether `t`, past a `| null`, is a list, record or map: a type parameter inside it is bound
+// by one argument type's elements, never by a union of them.
+function tyHoldsInContainer(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const c = tyAt(nonNullTy(t))
+  return c is TyArray || c is TyObj || c is TyMap
+}
+
+// Refuses, and answers true, when a union reaches a list, record or map parameter naming one of
+// the callee's type parameters and the call binds that parameter to nothing, or only to itself:
+// each member would bind it differently, so neither the result's type nor the instance is known
+// (D16959). A union stored as its one map or list (twin members) binds as that one.
+function openArgTyParamRefused(
+  n: Call,
+  ix: i32,
+  who: string,
+  params: i32[],
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  const d = fnDeclIx[who] ?? -1
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = nodeAt(d)
+  if !(dn is FuncDecl) { return false }
+  for tp in dn.fnTyParams {
+    const b = bindOf(bNames, bTys, tp)
+    const bv = if b >= 0 && b < T.tys.length { tyAt(b) } else { tyAt(TY_I32) }
+    if b < 0 || bv is TyVar && bv.tvName == tp {
+      let i = 0
+      while i < n.callArgs.length && i < params.length {
+        const a = nodeTyIxOf(n.callArgs[i])
+        const an = if a >= 0 { nonNullTy(a) } else { -1 }
+        if (
+          an >= 0
+          && tyAt(an) is TyUnion
+          && !tyHasTyVar(an)
+          && mapTwinUnionMember(an) < 0
+          && oneListUnionRender(an) == ""
+          && tyHoldsInContainer(params[i])
+          && tyMentionsTyVarNamed(params[i], tp)
+        ) {
+          tErr(
+            "cannot infer type parameter `"
+              + tp
+              + "` in this call to `"
+              + who
+              + "`: its argument is `"
+              + tyToStr(a)
+              + "`, and each member would bind `"
+              + tp
+              + "` differently — hand it one member, with `as!` or a copy under an `is` test",
+            ix,
+          )
+          return true
+        }
+        i = i + 1
+      }
+    }
+  }
+  return false
 }
 
 // The type parameters of callee `decl` no binding in `bNames` has set, when the call is not from
