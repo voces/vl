@@ -24,16 +24,18 @@ the IR. No emitted byte moves.
   `plain`, init-function windows (S1c). A start loop over a global record's list field (a hoisted
   receiver read off a global) matches and is claimed now that STORE's #9049 records the read.
 
-## Readings (master `53ff806b` against this branch, fixpoint seeds both)
+## Readings (master `8365bb0b` against this branch, fixpoint seeds both)
 
 - Start-order matrix (`tests/cases/start-order/`): every row claimed and matched, or a named miss
   (the two guarded rows: progress cell; the accumulator; the multi-module files run through init
   functions, S1c). Corpus oracle 9 passed with the start claimed.
-- `ir-identity.sh --cases`: `identical 7465, fail under both 69, differ 0`.
-- Identity, distilled cells and self-compile: 0 differ plain and `--names`; self-compile identical.
-- Armed shadow over `tests/cases`, the probes and the corpus: 0 mismatch, 0 fail; 4,196 start
-  bodies covered = matched of 15,150; functions 66,331 covered = matched.
-- Mode 3: self byte-identical; corpus `claimed start` 2,674; corpus mode-3 identity `differ 0`.
-- `--claims` 30,510, `ir-shadow: ok`.
-- L2 fuel 97,380,760,205 against master's 97,350,003,955 on the same box (+0.03%).
-- Pin helpers 904; phase-state census flat; lint clean; IR tests 27 passed.
+- `ir-identity.sh --cases` (the matrix included): `identical 7467, fail under both 69, differ 0`.
+- Identity, distilled cells and self-compile: `identical 9032, fail under both 3267, differ 0`,
+  plain and `--names`; self-compile identical.
+- Armed shadow over `tests/cases`, the probes and the corpus: 0 mismatch, 0 fail; 4,199 start
+  bodies covered = matched of 15,154; functions 66,333 covered = matched.
+- Mode 3: self byte-identical; corpus `claimed start` 2,676; corpus mode-3 identity `differ 0`.
+- `--claims` 30,511, `ir-shadow: ok`, no claim fell back.
+- L2 fuel 97,453,587,124 against master's 97,430,856,743 on the same box (+0.02%).
+- Pin helpers 904; phase-state census flat; ladder sets ok; lint clean; IR tests 27 passed.
+- Net lines in `compiler/`: +162 -54, net +108.
