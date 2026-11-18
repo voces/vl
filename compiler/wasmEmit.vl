@@ -243,7 +243,6 @@ import {
   tyMayHoldFn,
   tyNulLitUnionInner,
   tyNulNumScalarValKind,
-  tyPrimNameIs,
   tyPrimNameOf,
   tySame,
   tyScalarBasePrim,
@@ -12236,56 +12235,6 @@ function wideKindOf(a: i32, b: i32): i32 {
   return -1
 }
 
-// For each number member of `lTys` and a different one of `rTys` one widens to the other, an
-// `if` on the two operands holding exactly that pair, comparing the values at the wider type,
-// each left open on its `else`. Returns how many it opened, or -1 on error.
-function emitUnionUnionNumCross(
-  lIx: i32,
-  rIx: i32,
-  lTys: i32[],
-  rTys: i32[],
-  fnIx: i32,
-): i32 {
-  let opened = 0
-  for lt in lTys {
-    for rt in rTys {
-      const ka = boxAtomKindOfMemberTy(lt)
-      const kb = boxAtomKindOfMemberTy(rt)
-      const upL = widenConvOpOfKinds(ka, kb)
-      const upR = widenConvOpOfKinds(kb, ka)
-      if ka != kb && (upL >= 0 || upR >= 0) {
-        let wide = kb
-        if upR >= 0 { wide = ka }
-        const eqOp = numEqOpOfKind(wide)
-        if eqOp >= 0 {
-          if emitExpr(lIx, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 0)
-          fbI32Rel(RS_TAG, scalarTagOfKind(ka))
-          fbI32Bin(70) // i32.eq
-          if emitExpr(rIx, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 0)
-          fbI32Rel(RS_TAG, scalarTagOfKind(kb))
-          fbI32Bin(70) // i32.eq
-          fbI32And()
-          fbIf(127)
-          if emitExpr(lIx, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 1)
-          if emitUnionPayloadUnbox(ka) < 0 { return -1 }
-          if upL >= 0 { wU8(upL) }
-          if emitExpr(rIx, fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 1)
-          if emitUnionPayloadUnbox(kb) < 0 { return -1 }
-          if upR >= 0 { wU8(upR) }
-          wU8(eqOp)
-          fbElse()
-          opened = opened + 1
-        }
-      }
-    }
-  }
-  return opened
-}
-
 // For each left number arm of `aks` and right one of `rAks` one widens to the other, an `if` on
 // the boxes parked in `sl` and `sr` holding exactly that pair, comparing the two values at the
 // wider type, each left open on its `else`. Returns how many it opened, or -1 on error.
@@ -12710,24 +12659,21 @@ function unionEqOperandTy(ix: i32, fnIx: i32): i32 {
 }
 
 // The union operand `ix` of `==` is boxed in, named from its box type (`boxTyName`), else by the
-// declared alias its type is; "" where neither names one. A union-typed operand neither names is
-// refused, since its name would come from a spelling.
+// declared alias its type is; "" where neither names one.
 function unionEqNameOf(ix: i32, fnIx: i32): string {
   const n = boxTyName(unionBoxTyIxOfExpr(ix, fnIx))
   if n != "" { return n }
+  return unionAliasDeclNameOfTy(nodeTyAt(unwrapParen(ix), fnIx))
+}
+
+const UNION_EQ_NAMELESS_MSG = "emitProgram: union `==`: an operand's type names no union it is boxed in"
+
+// Whether union operand `ix` is typed at a union `unionEqNameOf` names none for: its name would
+// come from a spelling, so the compare is refused.
+function unionEqNameless(ix: i32, fnIx: i32): boolean {
+  if unionEqNameOf(ix, fnIx) != "" { return false }
   const t = nodeTyAt(unwrapParen(ix), fnIx)
-  const an = unionAliasDeclNameOfTy(t)
-  if an != "" { return an }
-  if (
-    t >= 0
-    && t < T.tys.length
-    && (tyAt(t) is TyUnion || tyAt(t) is TyNullable)
-  ) {
-    emitFail(
-      "emitProgram: union `==`: an operand's type names no union it is boxed in",
-    )
-  }
-  return ""
+  return t >= 0 && t < T.tys.length && (tyAt(t) is TyUnion || tyAt(t) is TyNullable)
 }
 
 // Of union types `a` and `b`, the one that carries `null` when the two have the same
@@ -12760,217 +12706,127 @@ function nonNullVariantsInto(ty: i32, out: i32[]): boolean {
   return had
 }
 
-// Union against union: equal iff the same arm (tag) holds and the unboxed payloads value-compare
-// equal per that arm. Folded as a nested value-typed `if` chain over the shared non-null arms,
-// bottoming out at bare tag equality — which covers the `null` arm and any non-shared arm. The
-// right payload's unbox short-circuits on its tag too.
-function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
-  let lname = unionEqNameOf(lIx, fnIx)
-  let rname = unionEqNameOf(rIx, fnIx)
-  let lUTy = unionEqOperandTy(lIx, fnIx)
+// The two operands' union names and the union type a union `==` reads its arms from.
+type UeNames = { uenL: string, uenR: string, uenTy: i32 }
+
+function unionEqNamesOf(lIx: i32, rIx: i32, fnIx: i32): UeNames {
+  const nm: UeNames = {
+    uenL: unionEqNameOf(lIx, fnIx),
+    uenR: unionEqNameOf(rIx, fnIx),
+    uenTy: unionEqOperandTy(lIx, fnIx),
+  }
+  const lt = nodeTyAt(unwrapParen(lIx), fnIx)
+  const rt = nodeTyAt(unwrapParen(rIx), fnIx)
   // Two spellings of one member set are one union: both name the row their types reach.
-  if lname != rname {
-    const lr = unRowOfRecordTy(nodeTyAt(unwrapParen(lIx), fnIx))
-    if lr >= 0 && lr == unRowOfRecordTy(nodeTyAt(unwrapParen(rIx), fnIx)) {
-      lname = unNames[lr]
-      rname = lname
-      lUTy = nodeTyAt(unwrapParen(lIx), fnIx)
+  if nm.uenL != nm.uenR {
+    const lr = unRowOfRecordTy(lt)
+    if lr >= 0 && lr == unRowOfRecordTy(rt) {
+      nm.uenL = unNames[lr]
+      nm.uenR = nm.uenL
+      nm.uenTy = lt
     }
   }
   // A union beside its own `| null` twin is one box, `null` one more tag of it: the compare
   // reads the arms of the side that carries `null`.
-  if lname != rname {
-    const nt = unionNulTwinTy(
-      nodeTyAt(unwrapParen(lIx), fnIx),
-      nodeTyAt(unwrapParen(rIx), fnIx),
-    )
+  if nm.uenL != nm.uenR {
+    const nt = unionNulTwinTy(lt, rt)
     if nt >= 0 {
-      if nt == nodeTyAt(unwrapParen(lIx), fnIx) {
-        rname = lname
-      } else {
-        lname = rname
-      }
-      lUTy = nt
+      if nt == lt { nm.uenR = nm.uenL } else { nm.uenL = nm.uenR }
+      nm.uenTy = nt
     }
   }
-  // D973 — the struct-union path is tried before the re-readability gate, because it does not
-  // need it: it evaluates each operand once into its own slot and reads the slots. The gate
-  // exists for the value-union lowering below, which re-reads both sides per arm.
-  if lname != "" && lname == rname {
-    if !isValueUnionOfSet(msSetOfTyAny(lUTy), lUTy) {
-      if emitStructUnionEq(lIx, rIx, isNe, lUTy, fnIx) == 0 { return 0 }
-    }
+  return nm
+}
+
+// Whether a union `==` under `nm` first tries the struct union's field compare (D973).
+function unionEqStructFirst(nm: UeNames): boolean {
+  return nm.uenL != ""
+    && nm.uenL == nm.uenR
+    && !isValueUnionOfSet(msSetOfTyAny(nm.uenTy), nm.uenTy)
+}
+
+// The staged compare's columns for a union `==` under `nm` whose right operand is `rIx`, into
+// `arms`/`vis`/`aks` and the right union's kinds `rKs`: "" when it serves them, else the refusal.
+function unionEqStagedPlan(
+  nm: UeNames,
+  rIx: i32,
+  fnIx: i32,
+  arms: i32[],
+  vis: i32[],
+  aks: i32[],
+  rKs: i32[],
+): string {
+  if nm.uenL == "" || nm.uenR == "" || !unionBoxEqColumns(nm.uenTy, arms, vis, aks) {
+    return "emitProgram: union `==`: an operand's union has arms the box compare cannot serve"
   }
-  if !unionEqOperandOk(lIx) || !unionEqOperandOk(rIx) {
-    // An operand that cannot be re-read is evaluated once and compared by the staged core,
-    // over the left union's arms: tags are per atom, so a right-hand arm the left lacks
-    // fails the tag test, and a shared tag names the same payload rep on both sides.
-    const sArms: i32[] = []
-    const sVis: i32[] = []
-    const sAks: i32[] = []
-    if (
-      lname != ""
-      && rname != ""
-      && unionBoxEqColumns(lUTy, sArms, sVis, sAks)
-    ) {
-      const rKs: i32[] = []
-      if !msMemberValKindsOf(msSetOfTyAny(unionEqOperandTy(rIx, fnIx)), rKs) {
-        return emitFail(
-          "emitProgram: a union `==` operand's type has no banked member kinds",
-        )
-      }
-      if emitExpr(lIx, fnIx) < 0 { return -1 }
-      if emitExpr(rIx, fnIx) < 0 { return -1 }
-      return emitUnionBoxEqStagedX(sArms, sVis, sAks, rKs, isNe, fnIx)
-    }
-    return emitFail(
-      "emitProgram: union `==` over a non-binding union value is not supported yet",
-    )
+  if !msMemberValKindsOf(msSetOfTyAny(unionEqOperandTy(rIx, fnIx)), rKs) {
+    return "emitProgram: a union `==` operand's type has no banked member kinds"
   }
-  // Both operands' member sets are resolved once, from their types, and every later reader takes
-  // the id.
-  const lsid = msSetOfTyAny(lUTy)
-  const rsid = msSetOfTyAny(unionEqOperandTy(rIx, fnIx))
-  // A literal-union arm rides a value box as its member string, so it compares as one (D3347).
-  const lVal = isValueUnionOfSet(lsid, unionEqOperandTy(lIx, fnIx))
-    || unionCarriesLitUnionArmOfSet(lsid, unionEqOperandTy(lIx, fnIx))
-  const rVal = isValueUnionOfSet(rsid, unionEqOperandTy(rIx, fnIx))
-    || unionCarriesLitUnionArmOfSet(rsid, unionEqOperandTy(rIx, fnIx))
-  if !lVal || !rVal {
-    // A struct union compares by tag, then by the arm's fields (D973), riding the same
-    // `{tag, payload}` box a value union does. Reaching here means `emitStructUnionEq` declined
-    // the arm set, so the refusal names what it could not serve.
-    return emitFail(
-      "emitProgram: `==` over a struct union is not supported yet",
-    )
+  return ""
+}
+
+// Union against union: equal iff the same arm (tag) holds and the unboxed payloads value-compare
+// equal per that arm. Each operand is evaluated once into the staged core
+// (`emitUnionBoxEqStagedX`), which compares over the left union's arms: tags are per atom, so a
+// right-hand arm the left lacks fails the tag test.
+function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
+  if unionEqNameless(lIx, fnIx) { emitFail(UNION_EQ_NAMELESS_MSG) }
+  if unionEqNameless(rIx, fnIx) { emitFail(UNION_EQ_NAMELESS_MSG) }
+  const nm = unionEqNamesOf(lIx, rIx, fnIx)
+  if unionEqStructFirst(nm) {
+    if emitStructUnionEq(lIx, rIx, isNe, nm.uenTy, fnIx) == 0 { return 0 }
   }
-  // The shared non-null arms, matched by member type (`memberTySame`): each operand's member types
-  // come from its recorded member set, else from the union its read holds, and each side declines
-  // independently. The left set's banked kinds travel with the surviving arms, index-parallel to
-  // its member types; an uncovered set marks its arms -2.
-  const lTys: i32[] = []
-  if !msMemberTysOfSet(lsid, lTys) {
-    unionTyMemberTys(unionBoxTyOfRead(lIx, fnIx), lTys)
-  }
-  const lKinds: i32[] = []
-  let lKindsOk = msMemberValKindsOf(lsid, lKinds)
-  if lKinds.length != lTys.length { lKindsOk = false }
-  const rTys: i32[] = []
-  let rOk = msMemberTysOfSet(rsid, rTys)
-  if !rOk {
-    // A right side with no recorded set still has its type's members; without them every arm
-    // would filter out and `==` would compare just the two tags (D989).
-    rOk = unionTyMemberTys(unionBoxTyOfRead(rIx, fnIx), rTys)
-  }
-  const arms: i32[] = []
-  const armKinds: i32[] = []
-  let ai = 0
-  while ai < lTys.length {
-    let inR = false
-    if rOk {
-      for rt in rTys {
-        if memberTySame(lTys[ai], rt) { inR = true }
-      }
-    } else {
-      // The right operand's arms come from its member set or its box type; one with neither has
-      // nothing to match the left's arms against.
-      return emitFail(
-        "emitProgram: union `==`: the right operand's arms are known from neither its member set nor its type",
-      )
-    }
-    const isNull = lTys[ai] < 0 || tyPrimNameIs(lTys[ai], "null")
-    if !isNull && inR {
-      arms.push(lTys[ai])
-      if lKindsOk { armKinds.push(lKinds[ai]) } else { armKinds.push(-2) }
-    }
-    ai = ai + 1
-  }
-  // The READ half of the banked-kind pair: the arm's recorded code, refined by its member type.
-  // Both sides read the LEFT union's arm type; the intersection above matched the two arms as the
-  // same member, so they claim the same slot.
-  const armKs: i32[] = []
-  const armTys: i32[] = []
-  const cloTags: i32[] = []
-  let ki = 0
-  while ki < arms.length {
-    let armK = armKinds[ki]
-    if armK == -2 {
-      return emitFail("emitProgram: a union == arm has no banked kind")
-    }
-    const armTy = arms[ki]
-    armK = boxArmKindOfTy(armK, armTy)
-    armKs.push(armK)
-    armTys.push(armTy)
-    if armK == 11 { cloTags.push(unionEqTagOfArmTy(armK, armTy)) }
-    ki = ki + 1
-  }
-  // Outermost `if` is the LAST arm (the host wraps its chain in arm order).
-  let k = arms.length - 1
-  while k >= 0 {
-    const armK = armKs[k]
-    if emitExpr(lIx, fnIx) < 0 { return -1 }
-    // The arm's TAG, not `scalarTagOfKind(armK)`: a closure arm tags by SIGNATURE.
-    const armTag = unionEqTagOfArmTy(armK, armTys[k])
-    fbStructGet(uBoxIdx, 0) // left tag
-    fbI32Rel(RS_TAG, armTag)
-    fbI32Bin(70)            // 0x46 i32.eq
-    fbIf(127)               // left holds this arm
-    // A function value's identity is its declaration, whichever function-type arm holds it, so
-    // a closure arm admits the right operand in any closure arm; the payload rep is shared.
-    const rightTags: i32[] = []
-    if armK == 11 {
-      for t in cloTags { rightTags.push(t) }
-    } else {
-      rightTags.push(armTag)
-    }
-    let ti = 0
-    while ti < rightTags.length {
-      if emitExpr(rIx, fnIx) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 0) // right tag
-      fbI32Rel(RS_TAG, rightTags[ti])
-      fbI32Bin(70) // 0x46 i32.eq
-      if ti > 0 {
-        fbI32Bin(114) // 0x72 i32.or
-      }
-      ti = ti + 1
-    }
-    fbIf(127)               // right holds it too → payload value-compare
-    if emitExpr(lIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // left payload (anyref)
-    if emitUnionPayloadUnbox(armK) < 0 { return -1 }
-    if emitExpr(rIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // right payload (anyref)
-    if emitUnionPayloadUnbox(armK) < 0 { return -1 }
-    // D-EQOPCODE: `armK` came out of the banked `unMemValKind` column (or the per-atom
-    // derivation where the row is uncovered) and already decided the two tag compares and
-    // both payload unboxes above — the compare is the same code's fifth projection, not a
-    // fresh question about `arms[k]`'s spelling.
-    if emitUnionAtomPayloadEq(armK, fnIx) < 0 { return -1 }
-    fbElse() // right holds a different arm → unequal
-    fbI32Const(0)
-    fbEnd()
-    fbElse() // left holds an earlier arm → recurse down the chain
-    k = k - 1
-  }
-  // Two number arms the sides do not share compare by value at the wider one (D15090).
-  const crossOpened = emitUnionUnionNumCross(lIx, rIx, lTys, rTys, fnIx)
-  if crossOpened < 0 { return -1 }
-  // Chain bottom: bare tag equality (null arm / non-shared arms).
   if emitExpr(lIx, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
   if emitExpr(rIx, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Bin(70) // 0x46 i32.eq
-  // Close every arm's outer `if` frame.
-  let c = 0
-  while c < arms.length + crossOpened {
-    fbEnd()
-    c = c + 1
+  return unionUnionEqTail(lIx, rIx, isNe, fnIx)
+}
+
+// After a union `==`'s two boxes, left below right: the staged compare (`emitUnionUnionEq`).
+export function unionUnionEqTail(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
+  const arms: i32[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  const rKs: i32[] = []
+  const why = unionEqStagedPlan(
+    unionEqNamesOf(lIx, rIx, fnIx),
+    rIx,
+    fnIx,
+    arms,
+    vis,
+    aks,
+    rKs,
+  )
+  if why != "" { return emitFail(why) }
+  return emitUnionBoxEqStagedX(arms, vis, aks, rKs, isNe, fnIx)
+}
+
+// Whether `emitBinExprNode` routes compare `e` to `emitUnionUnionEq` and its staged compare
+// serves the two unions: neither side a `null` literal, a scalar map read or an atom operand.
+export function unionUnionEqStagedOf(e: BinExpr, fnIx: i32): boolean {
+  if e.binIdent != 0 || e.binOp != "==" && e.binOp != "!=" { return false }
+  if numUnionMinted && njDispatches(e, fnIx) { return false }
+  const l = e.binLeft
+  const r = e.binRight
+  if nodeAt(unwrapParen(l)) is NullLit || nodeAt(unwrapParen(r)) is NullLit {
+    return false
   }
-  if isNe {
-    fbI32Eqz() // 0x45 i32.eqz
+  if mapReadScalarBoxKind(l, fnIx) >= 0 || mapReadScalarBoxKind(r, fnIx) >= 0 {
+    return false
   }
-  return 0
+  if !exprUnion(l, fnIx) || eqAtomOperandOk(l, fnIx) { return false }
+  if !exprUnion(r, fnIx) || eqAtomOperandOk(r, fnIx) { return false }
+  if unionEqNameless(l, fnIx) || unionEqNameless(r, fnIx) { return false }
+  const nm = unionEqNamesOf(l, r, fnIx)
+  if unionEqStructFirst(nm) { return false }
+  // The columns refuse a union with no arm rows loudly; that refusal stays legacy's.
+  const tys: i32[] = []
+  const rows: i32[] = []
+  if nm.uenTy < 0 || !armRowTysOfUnionTy(nm.uenTy, tys, rows) { return false }
+  const arms: i32[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  const rKs: i32[] = []
+  return unionEqStagedPlan(nm, r, fnIx, arms, vis, aks, rKs) == ""
 }
 
 // Whether `obj` has a float member and no integer arm and `chk` is a set of integer literals:
