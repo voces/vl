@@ -41,9 +41,7 @@ const run = (src: string, arm: boolean | number, corrupt = 0) => {
   const rows = new Map<string, number>();
   for (let i = 0; i < exp.irShadowRowCount(); i++) {
     const b: number[] = [];
-    for (let j = 0; j < exp.irShadowRowLen(i); j++) {
-      b.push(exp.irShadowRowAt(i, j));
-    }
+    for (let j = 0; j < exp.irShadowRowLen(i); j++) b.push(exp.irShadowRowAt(i, j));
     rows.set(String.fromCodePoint(...b), exp.irShadowRowN(i));
   }
   const out: number[] = [];
@@ -90,56 +88,34 @@ Deno.test({
   ignore,
   fn: () => {
     const armed = run(COVERED, true);
-    if (armed.rc !== 0) {
-      throw new Error(`want compileSrc rc 0, got ${armed.rc}`);
-    }
+    if (armed.rc !== 0) throw new Error(`want compileSrc rc 0, got ${armed.rc}`);
     const fails = failures(armed.rows);
-    if (fails.length > 0) {
-      throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    }
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
     const covered = armed.rows.get("covered") ?? 0;
     const verified = armed.rows.get("verified") ?? 0;
     const fns = armed.rows.get("fns") ?? 0;
-    console.log(
-      `[ir-shadow] covered ${covered} of ${fns}; rows ${
-        JSON.stringify([...armed.rows])
-      }`,
-    );
+    console.log(`[ir-shadow] covered ${covered} of ${fns}; rows ${JSON.stringify([...armed.rows])}`);
     // sq, wide, pos, above, sum, pick and bump are each inside the set.
     if (covered < 7 || verified !== covered) {
-      throw new Error(
-        `want at least 7 covered, all verified; got covered ${covered}, verified ${verified}`,
-      );
+      throw new Error(`want at least 7 covered, all verified; got covered ${covered}, verified ${verified}`);
     }
     const matched = armed.rows.get("matched") ?? 0;
     if (matched !== covered) {
-      throw new Error(
-        `want every covered function to match legacy's bytes, got ${matched} of ${covered}`,
-      );
+      throw new Error(`want every covered function to match legacy's bytes, got ${matched} of ${covered}`);
     }
     const plain = run(COVERED, false);
     // Unarmed, the shipped claim records only its `claimed` rows; nothing else, and no fallback.
     const other = [...plain.rows.keys()].filter((k) => k !== "claimed");
-    if (other.length !== 0) {
-      throw new Error(
-        `want only claimed rows unarmed, got ${other.join(", ")}`,
-      );
-    }
-    if (
-      plain.out.length !== armed.out.length ||
-      plain.out.some((b, i) => b !== armed.out[i])
-    ) {
-      throw new Error(
-        `want byte-identical output armed and unarmed (${plain.out.length} vs ${armed.out.length} bytes)`,
-      );
+    if (other.length !== 0) throw new Error(`want only claimed rows unarmed, got ${other.join(", ")}`);
+    if (plain.out.length !== armed.out.length || plain.out.some((b, i) => b !== armed.out[i])) {
+      throw new Error(`want byte-identical output armed and unarmed (${plain.out.length} vs ${armed.out.length} bytes)`);
     }
   },
 });
 
 for (const [mode, rule] of [[1, 3], [2, 4]] as const) {
   Deno.test({
-    name:
-      `ir shadow: the failing control ${mode} makes the verifier name rule ${rule}`,
+    name: `ir shadow: the failing control ${mode} makes the verifier name rule ${rule}`,
     ignore,
     fn: () => {
       const { rc, rows } = run(COVERED, true, mode);
@@ -147,18 +123,10 @@ for (const [mode, rule] of [[1, 3], [2, 4]] as const) {
       const fails = failures(rows);
       const named = fails.filter((k) => k.startsWith(`fail rule ${rule} `));
       if (named.length === 0) {
-        throw new Error(
-          `want a rule ${rule} failure, got: ${
-            JSON.stringify([...rows.keys()].map((k) => k.split("\n")[0]))
-          }`,
-        );
+        throw new Error(`want a rule ${rule} failure, got: ${JSON.stringify([...rows.keys()].map((k) => k.split("\n")[0]))}`);
       }
       if (named.length !== fails.length) {
-        throw new Error(
-          `want only rule ${rule}, got: ${
-            fails.map((k) => k.split("\n")[0]).join("; ")
-          }`,
-        );
+        throw new Error(`want only rule ${rule}, got: ${fails.map((k) => k.split("\n")[0]).join("; ")}`);
       }
     },
   });
@@ -167,28 +135,17 @@ for (const [mode, rule] of [[1, 3], [2, 4]] as const) {
 // The dual emit's controls: a byte added to the lowering, and a span row dropped from it, must
 // each turn every match into a mismatch of that class. Without these a comparison that compared
 // nothing would pass.
-for (
-  const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as const
-) {
+for (const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as const) {
   Deno.test({
-    name: `ir shadow: the dual emit's control ${mode} reports a ${
-      cls.slice(9)
-    } mismatch`,
+    name: `ir shadow: the dual emit's control ${mode} reports a ${cls.slice(9)} mismatch`,
     ignore,
     fn: () => {
       const { rc, rows } = run(COVERED, true, mode);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      const got = [...rows].filter(([k]) => k.startsWith(cls)).reduce(
-        (n, [, c]) => n + c,
-        0,
-      );
+      const got = [...rows].filter(([k]) => k.startsWith(cls)).reduce((n, [, c]) => n + c, 0);
       const covered = rows.get("covered") ?? 0;
       if ((rows.get("matched") ?? 0) !== 0 || got !== covered) {
-        throw new Error(
-          `want all ${covered} covered as "${cls}", got ${
-            JSON.stringify([...rows])
-          }`,
-        );
+        throw new Error(`want all ${covered} covered as "${cls}", got ${JSON.stringify([...rows])}`);
       }
     },
   });
@@ -197,25 +154,16 @@ for (
 // The element-read rows' control: a list read banks a row of its own (kind 6), and dropping the
 // lowering's must turn the match into a span mismatch.
 Deno.test({
-  name:
-    "ir shadow: the dual emit's control 5 reports a list read's missing row",
+  name: "ir shadow: the dual emit's control 5 reports a list read's missing row",
   ignore,
   fn: () => {
-    const src =
-      `function at(xs: i32[], i: i32): i32 { return xs[i] + 1 }\nprint(at([1, 2, 3], 1))\n`;
+    const src = `function at(xs: i32[], i: i32): i32 { return xs[i] + 1 }\nprint(at([1, 2, 3], 1))\n`;
     const ok = run(src, true);
-    if ((ok.rows.get("matched") ?? 0) !== 1) {
-      throw new Error(
-        `want the read matched, got ${JSON.stringify([...ok.rows])}`,
-      );
-    }
+    if ((ok.rows.get("matched") ?? 0) !== 1) throw new Error(`want the read matched, got ${JSON.stringify([...ok.rows])}`);
     const { rows } = run(src, true, 5);
-    const got = [...rows].filter(([k]) => k.startsWith("mismatch spans"))
-      .reduce((n, [, c]) => n + c, 0);
+    const got = [...rows].filter(([k]) => k.startsWith("mismatch spans")).reduce((n, [, c]) => n + c, 0);
     if (got !== 1 || (rows.get("matched") ?? 0) !== 0) {
-      throw new Error(
-        `want one "mismatch spans", got ${JSON.stringify([...rows])}`,
-      );
+      throw new Error(`want one "mismatch spans", got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -223,13 +171,11 @@ Deno.test({
 // Outside the set: a string coalesce whose default is no literal, a closure parameter and a
 // valued `if` each leave their function uncovered, named.
 Deno.test({
-  name:
-    "ir shadow: a construct outside the set leaves its function uncovered, by reason",
+  name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
     // A returned `if` that yields its arms' values is outside the set too.
-    const src =
-      `function greet(s: string | null, d: string): string { return s ?? d }
+    const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
 print(greet("a", "!"))
@@ -239,22 +185,14 @@ print(sel(true))
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
-    if (fails.length > 0) {
-      throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    }
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
     for (const why of ["expression if"]) {
       if (!rows.has(`uncovered ${why}`)) {
-        throw new Error(
-          `want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`,
-        );
+        throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
     }
     const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered "));
-    if (unc.length < 3) {
-      throw new Error(
-        `want three uncovered reasons, got ${JSON.stringify([...rows])}`,
-      );
-    }
+    if (unc.length < 3) throw new Error(`want three uncovered reasons, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -362,21 +300,14 @@ print(guard(2))
   `function orEmpty(s: string | null): string {\n  if s == null { return "" }\n  return s\n}\nprint(orEmpty("a"))\nprint(orEmpty(null))\n`,
 ];
 Deno.test({
-  name:
-    "ir shadow: each shared decision's witness is covered and matches legacy",
+  name: "ir shadow: each shared decision's witness is covered and matches legacy",
   ignore,
   fn: () => {
     for (const src of SHARED) {
       const { rc, rows } = run(src, true);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      if (
-        (rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1
-      ) {
-        throw new Error(
-          `want one covered, matched function, got ${
-            JSON.stringify([...rows])
-          }\n${src}`,
-        );
+      if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+        throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
   },
@@ -388,27 +319,19 @@ Deno.test({
   name: "ir shadow: a spilled code-point list is a named miss",
   ignore,
   fn: () => {
-    const src =
-      `function sp(n: i32): string { return fromCodePoints([n, 33]) }\nprint(sp(111))\n`;
+    const src = `function sp(n: i32): string { return fromCodePoints([n, 33]) }\nprint(sp(111))\n`;
     const { rows } = run(src, true);
     if (rows.get("uncovered code point list spill") !== 1) {
-      throw new Error(
-        `want one "uncovered code point list spill" row, got ${
-          JSON.stringify([...rows])
-        }`,
-      );
+      throw new Error(`want one "uncovered code point list spill" row, got ${JSON.stringify([...rows])}`);
     }
-    if (failures(rows).length > 0) {
-      throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
 // locals, and a nested list literal is a ref list: each a named miss, never a byte mismatch.
 Deno.test({
-  name:
-    "ir shadow: a reserved list binding and a nested list literal are named misses",
+  name: "ir shadow: a reserved list binding and a nested list literal are named misses",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -420,21 +343,10 @@ function ln(x: i32): i32[][] { return [[x], [x, x]] }
 print(rv(2) + ln(2)[1].length)
 `;
     const { rows } = run(src, true);
-    for (
-      const want of [
-        "uncovered declaration list reserve",
-        "uncovered array ref",
-      ]
-    ) {
-      if (rows.get(want) !== 1) {
-        throw new Error(
-          `want one "${want}" row, got ${JSON.stringify([...rows])}`,
-        );
-      }
+    for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
+      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     }
-    if (failures(rows).length > 0) {
-      throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -466,22 +378,10 @@ function fh(xs: i32[]): i32 {
 print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
 `;
     const { rows } = run(src, true);
-    for (
-      const want of [
-        "uncovered for in break",
-        "uncovered for in continue",
-        "uncovered for in hoisted",
-      ]
-    ) {
-      if (rows.get(want) !== 1) {
-        throw new Error(
-          `want one "${want}" row, got ${JSON.stringify([...rows])}`,
-        );
-      }
+    for (const want of ["uncovered for in break", "uncovered for in continue", "uncovered for in hoisted"]) {
+      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     }
-    if (failures(rows).length > 0) {
-      throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -491,27 +391,17 @@ Deno.test({
   name: "ir shadow: an integer abs is a named miss",
   ignore,
   fn: () => {
-    const { rows } = run(
-      `function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`,
-      true,
-    );
+    const { rows } = run(`function ab(x: i32): i32 { return abs(x) }\nprint(ab(-4))\n`, true);
     const want = "uncovered intrinsic intAbs";
-    if (rows.get(want) !== 1) {
-      throw new Error(
-        `want one "${want}" row, got ${JSON.stringify([...rows])}`,
-      );
-    }
-    if (failures(rows).length > 0) {
-      throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    }
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
 // Legacy writes a short-circuit argument's `if` in place, above the arguments before it, whether
 // they are locals, globals or temps: the builder names that rather than lowering it out of order.
 Deno.test({
-  name:
-    "ir shadow: a short-circuit argument after another is a named miss, not a fallback",
+  name: "ir shadow: a short-circuit argument after another is a named miss, not a fallback",
   ignore,
   fn: () => {
     const src = `let g: i32[] = [1]
@@ -527,14 +417,8 @@ print(k(2, true, false) + f(true, false) + f2(false, true))
 `;
     const { rows } = run(src, true);
     const want = "uncovered short-circuit argument after another";
-    if (rows.get(want) !== 3) {
-      throw new Error(
-        `want three "${want}" rows, got ${JSON.stringify([...rows])}`,
-      );
-    }
-    if (failures(rows).length > 0) {
-      throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    }
+    if (rows.get(want) !== 3) throw new Error(`want three "${want}" rows, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -542,8 +426,7 @@ print(k(2, true, false) + f(true, false) + f2(false, true))
 // (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
 // the result's `null`.
 Deno.test({
-  name:
-    "ir shadow: a block body that runs past its last statement is a named miss",
+  name: "ir shadow: a block body that runs past its last statement is a named miss",
   ignore,
   fn: () => {
     const src = `function put(x: i32) { return x * 2 }
@@ -555,22 +438,15 @@ print(f(-1) ?? 5)
 `;
     const { rows } = run(src, true);
     const want = "uncovered block body falls off";
-    if (rows.get(want) !== 1) {
-      throw new Error(
-        `want one "${want}" row, got ${JSON.stringify([...rows])}`,
-      );
-    }
-    if (failures(rows).length > 0) {
-      throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    }
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
 // Only a `null` literal boxes with its value unread. A `null`-typed call has an effect that must
 // run once, so a function delivering one stays uncovered (`rep null`) rather than boxing unread.
 Deno.test({
-  name:
-    "ir shadow: a null-typed call delivered into a box is never left unread",
+  name: "ir shadow: a null-typed call delivered into a box is never left unread",
   ignore,
   fn: () => {
     const src = `function mk(): null {
@@ -585,22 +461,15 @@ print(f(false) ?? 5)
 `;
     const { rows } = run(src, true);
     const want = "uncovered rep null";
-    if (rows.get(want) !== 1) {
-      throw new Error(
-        `want one "${want}" row, got ${JSON.stringify([...rows])}`,
-      );
-    }
-    if ((rows.get("covered") ?? 0) !== 0) {
-      throw new Error(`want 0 covered, got ${JSON.stringify([...rows])}`);
-    }
+    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 0) throw new Error(`want 0 covered, got ${JSON.stringify([...rows])}`);
   },
 });
 
 // An unannotated parameter's type stays open until a call instances it: the builder leaves that
 // function uncovered rather than handing the verifier an open-typed variable (rule 1).
 Deno.test({
-  name:
-    "ir shadow: an open-typed parameter is uncovered, never a verifier failure",
+  name: "ir shadow: an open-typed parameter is uncovered, never a verifier failure",
   ignore,
   fn: () => {
     const src = `function k<T>(x: T): T { return x }
@@ -614,15 +483,9 @@ main()
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
-    if (fails.length > 0) {
-      throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    }
+    if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
     if (!rows.has("uncovered open parameter type")) {
-      throw new Error(
-        `want an "uncovered open parameter type" row, got ${
-          JSON.stringify([...rows])
-        }`,
-      );
+      throw new Error(`want an "uncovered open parameter type" row, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -634,30 +497,15 @@ Deno.test({
   ignore,
   fn: () => {
     const claimed = run(COVERED, 3);
-    if (claimed.rc !== 0) {
-      throw new Error(`want compileSrc rc 0, got ${claimed.rc}`);
-    }
+    if (claimed.rc !== 0) throw new Error(`want compileSrc rc 0, got ${claimed.rc}`);
     const n = claimed.rows.get("claimed") ?? 0;
     // sq, wide, pos, sum, pick and bump are each claimable.
-    if (n < 6) {
-      throw new Error(
-        `want at least 6 claimed, got ${JSON.stringify([...claimed.rows])}`,
-      );
-    }
-    const fell = [...claimed.rows.keys()].filter((k) =>
-      k.startsWith("claim fell back")
-    );
-    if (fell.length > 0) {
-      throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
-    }
+    if (n < 6) throw new Error(`want at least 6 claimed, got ${JSON.stringify([...claimed.rows])}`);
+    const fell = [...claimed.rows.keys()].filter((k) => k.startsWith("claim fell back"));
+    if (fell.length > 0) throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
     const plain = run(COVERED, false);
-    if (
-      plain.out.length !== claimed.out.length ||
-      plain.out.some((b, i) => b !== claimed.out[i])
-    ) {
-      throw new Error(
-        `want byte-identical output claimed and not (${plain.out.length} vs ${claimed.out.length} bytes)`,
-      );
+    if (plain.out.length !== claimed.out.length || plain.out.some((b, i) => b !== claimed.out[i])) {
+      throw new Error(`want byte-identical output claimed and not (${plain.out.length} vs ${claimed.out.length} bytes)`);
     }
   },
 });
@@ -666,47 +514,24 @@ Deno.test({
 // match legacy's (armed, legacy always runs); a verifier failure on the claim path falls back to
 // legacy and is counted, which the gate's `ir claims` row reds on.
 Deno.test({
-  name:
-    "ir claim: the shipped claim emits legacy's bytes, and a broken claim falls back loudly",
+  name: "ir claim: the shipped claim emits legacy's bytes, and a broken claim falls back loudly",
   ignore,
   fn: () => {
     const shipped = run(COVERED, 5);
-    if (shipped.rc !== 0) {
-      throw new Error(`want compileSrc rc 0, got ${shipped.rc}`);
-    }
+    if (shipped.rc !== 0) throw new Error(`want compileSrc rc 0, got ${shipped.rc}`);
     const n = shipped.rows.get("claimed") ?? 0;
-    if (n < 6) {
-      throw new Error(
-        `want at least 6 claimed, got ${JSON.stringify([...shipped.rows])}`,
-      );
-    }
-    const fell = [...shipped.rows.keys()].filter((k) =>
-      k.startsWith("claim fell back")
-    );
-    if (fell.length > 0) {
-      throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
-    }
+    if (n < 6) throw new Error(`want at least 6 claimed, got ${JSON.stringify([...shipped.rows])}`);
+    const fell = [...shipped.rows.keys()].filter((k) => k.startsWith("claim fell back"));
+    if (fell.length > 0) throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
     const legacy = run(COVERED, 1);
-    if (
-      legacy.out.length !== shipped.out.length ||
-      legacy.out.some((b, i) => b !== shipped.out[i])
-    ) {
-      throw new Error(
-        `want the shipped claim byte-identical to legacy (${legacy.out.length} vs ${shipped.out.length} bytes)`,
-      );
+    if (legacy.out.length !== shipped.out.length || legacy.out.some((b, i) => b !== shipped.out[i])) {
+      throw new Error(`want the shipped claim byte-identical to legacy (${legacy.out.length} vs ${shipped.out.length} bytes)`);
     }
     const broken = run(COVERED, 5, 1);
     if ((broken.rows.get("claim fell back: verifier") ?? 0) < 1) {
-      throw new Error(
-        `want a verifier fallback under the control, got ${
-          JSON.stringify([...broken.rows])
-        }`,
-      );
+      throw new Error(`want a verifier fallback under the control, got ${JSON.stringify([...broken.rows])}`);
     }
-    if (
-      broken.out.length !== legacy.out.length ||
-      broken.out.some((b, i) => b !== legacy.out[i])
-    ) {
+    if (broken.out.length !== legacy.out.length || broken.out.some((b, i) => b !== legacy.out[i])) {
       throw new Error(`want a fallen-back claim to ship legacy's bytes`);
     }
   },
@@ -716,8 +541,7 @@ Deno.test({
 // 1-7 is refused under that rule, as are a fall-through and a mismatched global store, and the
 // unbroken function holds.
 Deno.test({
-  name:
-    "ir shadow: each hand-built case fails the rule it breaks, and the control holds",
+  name: "ir shadow: each hand-built case fails the rule it breaks, and the control holds",
   ignore,
   fn: () => {
     const exp = new WebAssembly.Instance(compiled!, {})
@@ -726,9 +550,7 @@ Deno.test({
     exp.modReset();
     exp.srcReset();
     for (const ch of "print(1)\n") exp.srcPush(ch.codePointAt(0)!);
-    if (exp.compileSrc() !== 0) {
-      throw new Error("want the priming compile to pass");
-    }
+    if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Case k breaks rule k for 1 to 7; case 8 falls off a valued function's end (rule 5) and
     // case 9 stores an i32 into a bool global (rule 2).
     // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
@@ -736,18 +558,16 @@ Deno.test({
     const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
-      if (got !== want[k]) {
-        throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
-      }
+      if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
     }
   },
 });
 
+
 // The blocker census (mode 4): a function's build goes on past a missed statement, so its row names
 // every class it missed, sorted into one key; a covered function reads `blockers none`.
 Deno.test({
-  name:
-    "ir shadow: the blocker census names every class a function missed, and moves no byte",
+  name: "ir shadow: the blocker census names every class a function missed, and moves no byte",
   ignore,
   fn: () => {
     const src = `function ok(x: i32): i32 { return x + 1 }
@@ -760,28 +580,17 @@ print(ok(1))
 print(two("a", "b"))
 `;
     const census = run(src, 4);
-    if (census.rc !== 0) {
-      throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    }
+    if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
     const want = "blockers coalesce string default";
     if ((census.rows.get(want) ?? 0) !== 1) {
-      throw new Error(
-        `want one row ${want}, got ${JSON.stringify([...census.rows])}`,
-      );
+      throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
     if ((census.rows.get("blockers none") ?? 0) !== 1) {
-      throw new Error(
-        `want one covered function, got ${JSON.stringify([...census.rows])}`,
-      );
+      throw new Error(`want one covered function, got ${JSON.stringify([...census.rows])}`);
     }
     const plain = run(src, false);
-    if (
-      plain.out.length !== census.out.length ||
-      plain.out.some((b, i) => b !== census.out[i])
-    ) {
-      throw new Error(
-        `want byte-identical output under the census (${plain.out.length} vs ${census.out.length} bytes)`,
-      );
+    if (plain.out.length !== census.out.length || plain.out.some((b, i) => b !== census.out[i])) {
+      throw new Error(`want byte-identical output under the census (${plain.out.length} vs ${census.out.length} bytes)`);
     }
   },
 });
