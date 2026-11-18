@@ -601,8 +601,8 @@ print(xs.length)   // prints 3
 const xs = []   // refused: cannot infer a type for 'xs' — an empty array literal has no element type
 ```
 
-> Status: `[null]` with no context passes `vl check` and fails at build time with "bare
-> null needs a struct-typed context" (D1832; open-rulings.md §D1832 is waiting on a ruling).
+> `[null]` with no destination that names its element type is a check error: "a list of only
+> `null` has no element type; annotate it" (D1832, ruled 2026-10-12, open-rulings.md §D1832).
 
 **T6.2** A list is a shared reference and is invariant. `S[]` is not a `T[]` even when
 every `S` is a `T`, because a write through the `T[]` could store a `T` that is not an `S`.
