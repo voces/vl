@@ -104,8 +104,9 @@ Deno.test({
       throw new Error(`want every covered function to match legacy's bytes, got ${matched} of ${covered}`);
     }
     const plain = run(COVERED, false);
-    // Unarmed, the shipped claim records only its `claimed` rows; nothing else, and no fallback.
-    const other = [...plain.rows.keys()].filter((k) => k !== "claimed");
+    // Unarmed, the shipped claim records only its `claimed` rows (a function's, the start's);
+    // nothing else, and no fallback.
+    const other = [...plain.rows.keys()].filter((k) => k !== "claimed" && k !== "claimed start");
     if (other.length !== 0) throw new Error(`want only claimed rows unarmed, got ${other.join(", ")}`);
     if (plain.out.length !== armed.out.length || plain.out.some((b, i) => b !== armed.out[i])) {
       throw new Error(`want byte-identical output armed and unarmed (${plain.out.length} vs ${armed.out.length} bytes)`);
