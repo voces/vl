@@ -452,7 +452,12 @@ import {
   isvalType,
 } from "./check_state"
 import { curFnOwner, joinClashMsg, joinClashMsgSet } from "./check_subst"
-import { tyPathCycles, tyPathWith, tyVarOwnerOf } from "./check_types"
+import {
+  tyIsPrimIx,
+  tyPathCycles,
+  tyPathWith,
+  tyVarOwnerOf,
+} from "./check_types"
 import { demangleName } from "./check_suggest"
 import { placeElemTy, tpBoundOfName } from "./check_tp_bound"
 import {
@@ -6257,8 +6262,8 @@ function callBuildsFreshListVia(c: i32, seen: i32[]): boolean {
     const rv = cwPeel(r)
     if rv < 0 || rv >= P.nodes.length { return false }
     if (
-      !(nodeAt(rv) is ArrayLit)
-      && !fnLocalFreshList(rv, fd)
+      !litBuildsFresh(rv, seen)
+      && !fnLocalFreshList(rv, fd, seen)
       && !callBuildsFreshListVia(rv, seen)
     ) {
       return false
@@ -6268,9 +6273,47 @@ function callBuildsFreshListVia(c: i32, seen: i32[]): boolean {
   return true
 }
 
-// Whether `r` reads a `const` of function `fd` bound to a list literal and read nowhere but at `r`:
-// each call binds a new one.
-function fnLocalFreshList(r: i32, fd: i32): boolean {
+// Whether literal `x` builds every value it holds: each element or field is a primitive, `null`,
+// such a literal, or a spread of one or of a fresh call. A held record inside it is shared.
+function litBuildsFresh(x: i32, seen: i32[]): boolean {
+  const n = nodeAt(parenPeelIx(x))
+  if n is ArrayLit {
+    for e in n.arrElems {
+      const sp = nodeAt(e)
+      if sp is Spread {
+        const a = parenPeelIx(sp.spdArg)
+        if !litBuildsFresh(a, seen) && !callBuildsFreshListVia(a, seen) {
+          return false
+        }
+      } else if !partBuildsFresh(e, seen) {
+        return false
+      }
+    }
+    return true
+  }
+  if n is ObjLit {
+    for fx in n.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit && !partBuildsFresh(fi.fiValue, seen) { return false }
+    }
+    return true
+  }
+  return false
+}
+
+// Whether part `e` of a literal is built by it: a primitive value, `null`, or a fresh literal.
+function partBuildsFresh(e: i32, seen: i32[]): boolean {
+  const p = parenPeelIx(e)
+  if p < 0 || p >= P.nodes.length { return false }
+  if nodeAt(p) is NullLit || tyIsPrimIx(nonNullTy(nodeTyIxOf(p))) {
+    return true
+  }
+  return litBuildsFresh(p, seen)
+}
+
+// Whether `r` reads a `const` of function `fd` bound to a literal `litBuildsFresh` admits and read
+// nowhere but at `r`: each call binds a new one.
+function fnLocalFreshList(r: i32, fd: i32, seen: i32[]): boolean {
   if (
     !(nodeAt(r) is Ident)
     || !covarRootFreshLocal(r)
@@ -6281,7 +6324,10 @@ function fnLocalFreshList(r: i32, fd: i32): boolean {
   const binds: i32[] = []
   cwSetOccs([cwKeyOfRoot(r)], CW_OCC_BIND, binds)
   cwIxBuild()
-  return binds.length == 1 && recEnclosingFn(binds[0]) == fd
+  if binds.length != 1 || recEnclosingFn(binds[0]) != fd { return false }
+  const d = identDeclOf(parenPeelIx(r))
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return dn is LetDecl && litBuildsFresh(cwPeel(dn.letInit), seen)
 }
 
 // Copies the list call `c` a list literal spreads, element by element, into a list of the record
