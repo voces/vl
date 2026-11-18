@@ -58,6 +58,7 @@ import {
   irNodeNew,
   irSigNote,
   irSpanNote,
+  irSpanNoteKind,
   irVarNew,
 } from "./ir"
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
@@ -218,6 +219,7 @@ function censusGoesOn(why: string): boolean {
 // ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
 const CLAIMED: IrFamily[] = [
   "scalar", "control", "call", "global", "map", "list", "box", "record",
+  "start",
 ]
 let ibClaimAll = false
 // Set while `irClaimFn` builds, never under the shadow, which builds every function whole.
@@ -268,6 +270,35 @@ export function irClaimFn(fnIx: i32, fnPos: i32, out: u8[]): boolean {
     return false
   }
   count("claimed")
+  return true
+}
+
+// Whether the start body may be claimed: the `start` family is, and the shadow is not armed.
+export function irStartClaimOn(): boolean {
+  return !ibArmed && familyClaimed("start")
+}
+
+// The claim seam for the single start body, before legacy writes it: built from `order` (an
+// `orderGi` entry at or above 0 being that global's initializer), and when every node is in a
+// claimed family, the lowering writes its code entry onto `out` and this answers true.
+export function irClaimStart(order: i32[], orderGi: i32[], out: u8[]): boolean {
+  if !irStartClaimOn() { return false }
+  const gen = repNodeGen()
+  ibClaimBuild = true
+  const built = buildStart(order, orderGi)
+  ibClaimBuild = false
+  if built != "" || repNodeGen() != gen || !claimable() { return false }
+  corrupt()
+  if irVerify(ib).vfRule != 0 {
+    count("claim fell back: verifier")
+    return false
+  }
+  const why = irLowerClaim(ib, ibGlobalCtx(), -1, out)
+  if why != "" {
+    count("claim fell back: " + why)
+    return false
+  }
+  count("claimed start")
   return true
 }
 
@@ -2259,7 +2290,7 @@ export function irShadowStart(
 }
 
 // Builds the start body: each top-level statement, or global `orderGi[i]`'s initializer, in
-// order, with no row of its own (legacy banks a start row by another kind). "" or the first miss.
+// order, each under a top-level row (kind 1) and no statement row. "" or the first miss.
 function buildStart(order: i32[], orderGi: i32[]): string {
   ib = irFnNew(-1, "@start")
   ibFnIx = -1
@@ -2283,10 +2314,15 @@ function buildStart(order: i32[], orderGi: i32[]): string {
   const top: i32[] = []
   let i = 0
   while i < order.length {
+    const n0 = top.length
     if orderGi[i] >= 0 {
       globalInit(top, orderGi[i], order[i])
     } else {
       stmtIn(top, order[i], NO_SIBS, -1)
+    }
+    // Legacy banks a top-level row (kind 1) over each item that wrote bytes.
+    if top.length > n0 {
+      irSpanNoteKind(ib, order[i], top[n0], top[top.length - 1], 1)
     }
     if ibMiss != "" { return ibMiss }
     i = i + 1
