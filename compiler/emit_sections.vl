@@ -2494,23 +2494,15 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // (merged on `startStmtOrd`/`globalStmtOrd`, the list positions): `xs.push(1)` before
   // `const ys = xs.map(f)` must execute before that init. A program with only inits, or only
   // statements, emits the same bytes as before. The emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
-  let gi = swG0
-  let si = swS0
-  // The merged order, for the IR shadow of a single start body; collected only when armed.
-  const shOn = irShadowArmed() && k < 0
-  const order: i32[] = []
-  const orderGi: i32[] = []
+  const ent = startMergeOrder()
   // The promotion context window (G2c): a promoted binding's `local.get`/`local.set` is only
   // meaningful in this frame, so the flag that lets `emitUserGlobalGet`/`emitUserGlobalSet`
   // produce one is armed for exactly the span streaming this body. Every user function body and
   // every const cell's constexpr init has already run with the flag false, so a promoted binding reaching them is a loud reject rather than a wrong opcode.
   gPromoInStart = true
-  while gi < swG1 || si < swS1 {
-    let takeGlobal = gi < swG1
-    if takeGlobal && si < swS1 {
-      if startStmtOrd[si] < globalStmtOrd[gi] { takeGlobal = false }
-    }
-    if takeGlobal {
+  for e in ent {
+    if e >= 0 {
+      const gi = e
       // ANCHOR any emit failure raised below at the top-level node being lowered (see
       // `emitCurStmtIx`) — the start function has no declaration of its own to name.
       emitCurStmtIx = globalStmts[gi]
@@ -2519,15 +2511,6 @@ function emitStartBodyCode(out: u8[], k: i32) {
       let gArmKept = -1
       if globalArmScopeOk(globalStmts[gi]) {
         gArmKept = stmtArmScopeOpen(globalStmts[gi])
-      }
-      // A global whose initializer runs elsewhere (a constexpr cell) contributes nothing here.
-      if (
-        shOn
-        && globalRunsInStartFn(gi)
-        && !lbiKeptDeclUnread(globalStmts[gi])
-      ) {
-        order.push(globalStmts[gi])
-        orderGi.push(gi)
       }
       const gInitRc = emitStartGlobalInit(
         bodyExpr,
@@ -2544,15 +2527,11 @@ function emitStartBodyCode(out: u8[], k: i32) {
       if bodyExpr.length > gSpanAt {
         bankFnSpan(globalStmts[gi], -1, gSpanAt, bodyExpr.length, 1, "")
       }
-      gi = gi + 1
     } else {
+      const si = -1 - e
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
-      if shOn {
-        order.push(startStmts[si])
-        orderGi.push(-1)
-      }
       if emitStmt(startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
@@ -2561,7 +2540,6 @@ function emitStartBodyCode(out: u8[], k: i32) {
       if bodyExpr.length > sSpanAt {
         bankFnSpan(startStmts[si], -1, sSpanAt, bodyExpr.length, 1, "")
       }
-      si = si + 1
     }
   }
   scopePop()
@@ -2598,7 +2576,53 @@ function emitStartBodyCode(out: u8[], k: i32) {
   wBytes(body)
   wTarget(outPrev)
   // The IR shadow reads the single start body after legacy wrote it; it writes no byte.
-  if shOn { irShadowStart(out, outStart, spanBase, order, orderGi) }
+  if irShadowArmed() && k < 0 {
+    const order: i32[] = []
+    const orderGi: i32[] = []
+    startIrOrder(ent, order, orderGi)
+    irShadowStart(out, outStart, spanBase, order, orderGi)
+  }
+  return 0
+}
+
+// The start body's top-level order over the window `startWalkWindows` set: global `gi` as `gi`,
+// statement `si` as `-1 - si`, merged on source position so an initializer runs where it is
+// written. Legacy's merge loop and the IR's start body both walk it.
+function startMergeOrder(): i32[] {
+  const o: i32[] = []
+  let gi = swG0
+  let si = swS0
+  while gi < swG1 || si < swS1 {
+    let takeGlobal = gi < swG1
+    if takeGlobal && si < swS1 && startStmtOrd[si] < globalStmtOrd[gi] {
+      takeGlobal = false
+    }
+    if takeGlobal {
+      o.push(gi)
+      gi = gi + 1
+    } else {
+      o.push(-1 - si)
+      si = si + 1
+    }
+  }
+  return o
+}
+
+// The IR's view of order `ent`, pushed onto `order` (each item's node) and `orderGi` (a global's
+// index, -1 for a statement). A global whose initializer runs elsewhere (a constexpr cell, or a
+// kept `const` no read reaches) writes nothing in start and is left out.
+function startIrOrder(ent: i32[], order: i32[], orderGi: i32[]) {
+  for e in ent {
+    if e >= 0 {
+      if globalRunsInStartFn(e) && !lbiKeptDeclUnread(globalStmts[e]) {
+        order.push(globalStmts[e])
+        orderGi.push(e)
+      }
+    } else {
+      order.push(startStmts[-1 - e])
+      orderGi.push(-1)
+    }
+  }
   return 0
 }
 
