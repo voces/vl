@@ -19,9 +19,10 @@
 #   lines            its own body; the call chains that die with it are not counted
 #   doors            what still reaches it as shipped, joined: the blocker classes of every
 #                    unclaimed function whose legacy body hits it; `@ir` when the claim path
-#                    itself calls it; `@start <miss>` for top-level code, by the first miss of
-#                    each start body in that program (`@start` alone when none was recorded);
-#                    `@module` for module passes
+#                    itself calls it; `@start <miss>` for a start body's code (the single start
+#                    or an init function's), by the first miss of each start body in that
+#                    program (`@start` alone when none was recorded); `@module` for module
+#                    passes, those over the top level and the init-set start entry included
 #   role             what deleting it needs (a heuristic over its body):
 #                      `ast` (calls emitExpr and kin: it walks the AST, so only a new IR lowering
 #                      replaces it); `value` (writes code from values: the IR can share it, so it
@@ -95,7 +96,12 @@ let drvTagIx: {[i32]: i32} = Map()
 let drvTagList: i32[] = []
 let drvInIr = false
 let drvFn = -1
-let drvStmt = -1
+// Set while a start body (`emitStartBodyCode`) is lowered: the only code `@start` names.
+let drvBody = false
+export function drvBodySet(b: boolean) {
+  drvBody = b
+  return 0
+}
 let drvMode = 0
 // The re-entry (`DRV_RE`) the IR's lowering is inside, or -1.
 let drvRe = -1
@@ -120,17 +126,14 @@ export function drvFnSet(x: i32) {
   drvFn = x
   return 0
 }
-export function drvStmtSet(x: i32) {
-  drvStmt = x
-  return 0
-}
-// A hit on driver `i`: its count, and under mode 5 its tag's bit (0 IR, 1 top level, 2 none, 3 + node).
+// A hit on driver `i`: its count, and under mode 5 its tag's bit (0 IR, 1 a start body, 2 none or
+// a module pass over the top level, 3 + node).
 export function dh(i: i32) {
   if drvMode == 4 { return 0 }
   while drvCnt.length < DRV_N { drvCnt.push(0) }
   drvCnt[i] = drvCnt[i] + 1
   if drvMode != 5 { return 0 }
-  const tag = if drvInIr && drvRe >= 0 { -1 - drvRe } else if drvInIr { 0 } else if drvStmt >= 0 { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }
+  const tag = if drvInIr && drvRe >= 0 { -1 - drvRe } else if drvInIr { 0 } else if drvBody { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }
   let d = drvTagIx[tag] ?? -1
   if d < 0 {
     d = drvTagList.length
@@ -182,13 +185,30 @@ export function drvFlush(keys: string[], ns: i32[]) {
 }
 PROBE
 } > "$T/probe/drv_probe.vl"
-# The emitter's function and statement cursors, mirrored into the probe beside each assignment.
+# The emitter's function cursor, mirrored into the probe beside each assignment.
 for f in "$T"/probe/emit_*.vl; do
   if grep -q 'from "./drv_probe"' "$f"; then
-    sed -i -E 's/^( *)emitCurFnIx = ([^/]*[^ /])( *\/\/.*)?$/&\n\1drvFnSet(\2)/; s/^( *)emitCurStmtIx = ([^/]*[^ /])( *\/\/.*)?$/&\n\1drvStmtSet(\2)/' "$f"
-    sed -i 's/^import { dh } from "\.\/drv_probe"$/import { dh, drvFnSet, drvStmtSet } from ".\/drv_probe"/' "$f"
+    sed -i -E 's/^( *)emitCurFnIx = ([^/]*[^ /])( *\/\/.*)?$/&\n\1drvFnSet(\2)/' "$f"
+    sed -i 's/^import { dh } from "\.\/drv_probe"$/import { dh, drvFnSet } from ".\/drv_probe"/' "$f"
   fi
 done
+# A start body runs inside a wrapper that marks it: the module passes that walk the top level
+# (collection, the global section) set the statement cursor too, and are not top-level code.
+awk '
+  /^function emitStartBodyCode\(out: u8\[\], k: i32\) \{$/ {
+    print "function emitStartBodyCode(out: u8[], k: i32) {"
+    print "  drvBodySet(true)"
+    print "  const r = emitStartBodyCode0(out, k)"
+    print "  drvBodySet(false)"
+    print "  return r"
+    print "}"
+    print "function emitStartBodyCode0(out: u8[], k: i32) {"
+    hit = 1; next
+  }
+  { print }
+  END { if (!hit) { print "ir-driver-census: emitStartBodyCode not found" > "/dev/stderr"; exit 1 } }
+' "$T/probe/emit_sections.vl" > "$T/es.vl"
+{ echo 'import { drvBodySet } from "./drv_probe"'; cat "$T/es.vl"; } > "$T/probe/emit_sections.vl"
 # Each re-entry: a wrapper under its own name that tags what it reaches inside the IR's lowering,
 # around the renamed original.
 k=0
