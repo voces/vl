@@ -23927,8 +23927,12 @@ function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(ifIx: i32, fnIx: i32) {
+  // The IR claims an `if` by `ifExprPlainKind`; every exit here proves that decision agrees.
+  const pk = ifExprPlainKind(ifIx, fnIx)
   const gv = optGuardCallOf(ifIx, fnIx)
-  if gv >= 0 { return emitExpr(gv, fnIx) }
+  if gv >= 0 {
+    return if pk >= 0 { ifPlainDisagrees(ifIx) } else { emitExpr(gv, fnIx) }
+  }
   // The join is classified from its arms' tail values, and a tail naming its own prelude's
   // local reads that local's slot, bound for the classification alone and popped before any
   // arm lowers: in a generic instance the checker's type of such a tail is the type parameter.
@@ -23966,7 +23970,10 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   const jpin = nodeTyInOf(ifIx, fnIx)
   const atomJoin = tyIsLitUnion(jpin) || (how == 0 && jpin < 0)
   if how != 1 && atomJoin && strJoinDropsNulAtom(ifIx, fnIx) {
-    return refuseJoinDropsNul(ifIx)
+    return if pk >= 0 { ifPlainDisagrees(ifIx) } else { refuseJoinDropsNul(ifIx) }
+  }
+  if pk >= 0 && (how != 0 || rk != null || vt != pk) {
+    return ifPlainDisagrees(ifIx)
   }
   if how == 1 { return emitAllNullIf(ifIx, fnIx) }
   if how == 2 {
@@ -23976,6 +23983,14 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   if how == 3 { return emitUnionIfValue(iun, jpin, ifIx, fnIx) }
   if rk != null { return emitIfExprRef(ifIx, fnIx, rk, rslot) }
   return emitIfExprAs(ifIx, fnIx, vt)
+}
+
+// The internal failure where `ifExprPlainKind` and `emitIfExpr`'s ladder part ways.
+function ifPlainDisagrees(ifIx: i32) {
+  return emitFailAt(
+    "emitProgram: internal: ifExprPlainKind disagrees with emitIfExpr",
+    ifIx,
+  )
 }
 
 // The blocktype byte `emitIfExpr` gives `ifIx` when it takes the plain scalar path with one
@@ -24441,7 +24456,9 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
   if !nodeTyIsNullable(ifIx) {
     const sw = emitIntSwitch(ifIx, fnIx, 2, kind, "i32", -1)
     if sw < 0 { return -1 }
-    if sw > 0 { return 0 }
+    if sw > 0 {
+      return if ifExprPlainKind(ifIx, fnIx) >= 0 { ifPlainDisagrees(ifIx) } else { 0 }
+    }
   }
   if ifIx < 0 { return -1 }
   const s = nodeAt(ifIx)
@@ -24459,6 +24476,9 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
     const condStart = wLen()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
     const sg = staticValueIfCond(s.ifCond, condStart)
+    if sg >= 0 && ifExprPlainKind(ifIx, fnIx) >= 0 {
+      return ifPlainDisagrees(ifIx)
+    }
     fbIf(kind) // 0x04 if, <kind> result blocktype
     let rcT = 0
     if sg == 0 {
