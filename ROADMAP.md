@@ -74,6 +74,10 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 
 ## Backlogged: ruled, waiting to be built
 
+- **Narrowing that survives indirect writes** (owner ruling 2026-11-18). An `is K[]`
+  narrowing ends at any write the checker cannot rule out, including writes through aliases and
+  callees it cannot see into. Tracking indirect writes precisely (alias and effect summaries) keeps
+  more narrowings alive. DECISIONS.md §"`is K[]` tests a list's contents".
 - **Flow-sensitive reads of a `let`** (owner ruling B, 2026-11-02). A read of a `let` takes
   the type of the most recent write in scope, not the join of every write. DECISIONS.md §"A
   read of a `let` takes its most recent write's type". The `let x = null`, annotated-union and
