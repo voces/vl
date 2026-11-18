@@ -195,7 +195,8 @@ print(sel(true))
 // string and inside a `print` (N2b-2c-2a); a `string | null` tested `== null`, `!= null` and
 // `null !=`, and printed (N2b-2c-2b); list literals of i32s, of f64s with an i32 element widened,
 // of i64s, f32s, strings and booleans, and an empty one (A1); a plain walk over an i32 list and a
-// string list, and one whose body holds a loop with its own `break` (F1).
+// string list, and one whose body holds a loop with its own `break` (F1); a string from one code
+// point and from a local code-point list (S1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -264,6 +265,9 @@ print(guard(2))
   `function sum(xs: i32[]): i32 {\n  let t = 0\n  for x in xs {\n    print(x)\n    t = t + x\n  }\n  return t\n}\nprint(sum([1, 2, 3]))\n`,
   `function all(xs: string[]): i32 {\n  let n = 0\n  for s in xs {\n    print(s + "!")\n    n = n + s.length\n  }\n  return n\n}\nprint(all(["ab", "c"]))\n`,
   `function inner(xs: i32[]): i32 {\n  let t = 0\n  for x in xs {\n    let k = 0\n    while k < x {\n      if k > 1 { break }\n      k = k + 1\n    }\n    print(k)\n    t = t + k\n  }\n  return t\n}\nprint(inner([1, 5]))\n`,
+  `function cs(s: string): i32 {\n  let n = 0\n  for c in s {\n    print(c)\n    n = n + c\n  }\n  return n\n}\nprint(cs("h\u00e9llo"))\n`,
+  `function one(c: i32): string { return fromCodePoint(c) }\nprint(one(233))\n`,
+  `function many(n: i32): string {\n  const xs: i32[] = [104, 233, n]\n  return fromCodePoints(xs)\n}\nprint(many(108))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -276,6 +280,21 @@ Deno.test({
         throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
+  },
+});
+
+// A code-point list that is no local is legacy's spill through a scratch slot: a named miss,
+// never a byte mismatch.
+Deno.test({
+  name: "ir shadow: a spilled code-point list is a named miss",
+  ignore,
+  fn: () => {
+    const src = `function sp(n: i32): string { return fromCodePoints([n, 33]) }\nprint(sp(111))\n`;
+    const { rows } = run(src, true);
+    if (rows.get("uncovered code point list spill") !== 1) {
+      throw new Error(`want one "uncovered code point list spill" row, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
