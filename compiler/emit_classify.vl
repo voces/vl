@@ -2343,9 +2343,37 @@ function letElemReadHeldTy(init: i32): i32 {
     if f is Member && f.memProp == "get" { recv = f.memObj }
   }
   if recv < 0 || !(nodeAt(recv) is Ident) { return -1 }
-  const et = recBuildElemTyOf(identDeclOf(recv))
+  const d = identDeclOf(recv)
+  let et = recBuildElemTyOf(d)
+  if et < 0 { et = listLitElemStamp(d) }
   if et < 0 { return -1 }
   return if tyAdmitsNull(nodeTyIxOf(u)) { mkNullableTy(et) } else { et }
+}
+
+// The record every element of the list literal binding `d` is stamped as built at, where that is
+// another than the elements' own type; else -1.
+function listLitElemStamp(d: i32): i32 {
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+  const l = nodeAt(unwrapParen(dn.letInit))
+  if !(l is ArrayLit) || l.arrElems.length == 0 { return -1 }
+  let r = -1
+  for el in l.arrElems {
+    const u = unwrapParen(el)
+    if u < 0 || !nodeRepStamped(u) { return -1 }
+    const s = nodeRepTyIxOf(u)
+    if (
+      s < 0
+      || s >= T.tys.length
+      || !(tyAt(s) is TyObj)
+      || tySameSealed(s, nodeTyIxOf(u))
+    ) {
+      return -1
+    }
+    if r >= 0 && !tySameSealed(r, s) { return -1 }
+    r = s
+  }
+  return r
 }
 
 // The type the binding `init` names holds, where it holds only a literal built at another type than
@@ -2464,10 +2492,12 @@ function letStoreHeldTy(init: i32): i32 {
   const u = unwrapParen(init)
   if u < 0 { return -1 }
   const own = nodeTyAt(u, emitCurFnIx)
-  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyObj) { return -1 }
+  const own0 = nonNullTy(own)
+  if own0 < 0 || own0 >= T.tys.length || !(tyAt(own0) is TyObj) { return -1 }
   const r = storeLetBuiltOf(u)
-  if r < 0 || tySameSealed(r, own) { return -1 }
-  return r
+  if r < 0 || tySameSealed(r, own0) { return -1 }
+  // A nullable binding holds the record or `null`, as its read does.
+  return if own0 != own { mkNullableTy(r) } else { r }
 }
 
 // The record a value `if` or `match` `init` is stamped as built at, where its arms are all built
@@ -9437,8 +9467,10 @@ function structIndexOfExprGo(exprIx: i32, fnIx: i32): i32 {
     Member => structIndexOrRep(structIndexOfMemberStore(e, exprIx, fnIx), exprIx, fnIx)
     Index => structIndexOrRep(structIndexOfIndexStore(e, exprIx, fnIx), exprIx, fnIx)
     Call => structIndexOrRep(structIndexOfCallStore(e, exprIx, fnIx), exprIx, fnIx)
+    // A `?.` read holds what its receiver's row stores in the field, as its lowering reads it.
+    OptMember => structIndexOrRep(optChainStructIdxOf(exprIx, fnIx), exprIx, fnIx)
     // Every other node answers by its rep.
-    OptMember | NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => structIndexOfRep(exprIx, fnIx)
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => structIndexOfRep(exprIx, fnIx)
   }
 }
 
@@ -12594,6 +12626,14 @@ export function recBuildRowOf(objIx: i32): i32 {
   const pn = nodeAt(li)
   if pn is BinExpr && pn.binOp == "=" && pn.binRight == objIx {
     const tn = nodeAt(pn.binLeft)
+    // A record stored into a field of a binding the solve builds elsewhere is built at that
+    // field's record (D16964).
+    if tn is Member && nodeAt(tn.memObj) is Ident {
+      const rt = recBuildTyOf(identDeclOf(tn.memObj))
+      const rn = if rt >= 0 && rt < T.tys.length { tyAt(rt) } else { null }
+      const ft = if rn is TyObj { objFieldType(rn, tn.memProp) } else { -1 }
+      return if ft >= 0 { structIdxOfElemTy(nonNullTy(ft)) } else { -1 }
+    }
     if !(tn is Index) || !(nodeAt(tn.idxArr) is Ident) { return -1 }
     const et = recBuildElemTyOf(identDeclOf(tn.idxArr))
     if et < 0 { return -1 }

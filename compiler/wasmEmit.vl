@@ -661,8 +661,8 @@ import {
   i64PushScratchBase,
   ia64Ty,
   ia64TypeIdx,
-  idxRowShadow,
   il64Ty,
+  irShadowOn,
   isFl32Ty,
   isFl64Ty,
   isIl64Ty,
@@ -23789,8 +23789,14 @@ function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(ifIx: i32, fnIx: i32) {
+  // The IR claims an `if` by `ifExprPlainKind`; under the armed shadow, where legacy emits every
+  // function, every exit here proves that decision agrees. Its exclusions keep this `if` off the
+  // link's int-switch and static-condition exits.
+  const pk = if irShadowOn { ifExprPlainKind(ifIx, fnIx) } else { -1 }
   const gv = optGuardCallOf(ifIx, fnIx)
-  if gv >= 0 { return emitExpr(gv, fnIx) }
+  if gv >= 0 {
+    return if pk >= 0 { ifPlainDisagrees(ifIx) } else { emitExpr(gv, fnIx) }
+  }
   // The join is classified from its arms' tail values, and a tail naming its own prelude's
   // local reads that local's slot, bound for the classification alone and popped before any
   // arm lowers: in a generic instance the checker's type of such a tail is the type parameter.
@@ -23828,7 +23834,10 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   const jpin = nodeTyInOf(ifIx, fnIx)
   const atomJoin = tyIsLitUnion(jpin) || (how == 0 && jpin < 0)
   if how != 1 && atomJoin && strJoinDropsNulAtom(ifIx, fnIx) {
-    return refuseJoinDropsNul(ifIx)
+    return if pk >= 0 { ifPlainDisagrees(ifIx) } else { refuseJoinDropsNul(ifIx) }
+  }
+  if pk >= 0 && (how != 0 || rk != null || vt != pk) {
+    return ifPlainDisagrees(ifIx)
   }
   if how == 1 { return emitAllNullIf(ifIx, fnIx) }
   if how == 2 {
@@ -23838,6 +23847,48 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   if how == 3 { return emitUnionIfValue(iun, jpin, ifIx, fnIx) }
   if rk != null { return emitIfExprRef(ifIx, fnIx, rk, rslot) }
   return emitIfExprAs(ifIx, fnIx, vt)
+}
+
+// The internal failure where `ifExprPlainKind` and `emitIfExpr`'s ladder part ways.
+function ifPlainDisagrees(ifIx: i32) {
+  return emitFailAt(
+    "emitProgram: internal: ifExprPlainKind disagrees with emitIfExpr",
+    ifIx,
+  )
+}
+
+// The blocktype byte `emitIfExpr` gives `ifIx` when it takes the plain scalar path with one
+// value per arm and no `else if`, or -1: no guard call, null, atom, union or ref join, integer
+// switch, static `is` or literal-true condition, prelude, or v128.
+export function ifExprPlainKind(ifIx: i32, fnIx: i32): i32 {
+  if ifIx < 0 || ifIx >= P.nodes.length { return -1 }
+  const n = nodeAt(ifIx)
+  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return -1 }
+  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return -1 }
+  const c = nodeAt(unwrapParen(n.ifCond))
+  if c is BoolLit || c is IsExpr || c is Unary && c.unOp == "!" { return -1 }
+  if optGuardCallOf(ifIx, fnIx) >= 0 || intMatchHeadAt(ifIx) { return -1 }
+  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) { return -1 }
+  if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
+    return -1
+  }
+  if exprUnion(ifIx, fnIx) { return -1 }
+  if ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx)) != null {
+    return -1
+  }
+  const jpin = nodeTyInOf(ifIx, fnIx)
+  if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
+    return -1
+  }
+  const vt = ifExprValtype(ifIx, fnIx)
+  return if vt == 123 { -1 } else { vt }
+}
+
+// Whether `blockIx` is a block whose one statement is its value.
+function ifArmIsLone(blockIx: i32): boolean {
+  if blockIx < 0 || blockIx >= P.nodes.length { return false }
+  const b = nodeAt(blockIx)
+  return b is Block && b.blkStmts.length == 1 && ifArmValueExpr(blockIx) >= 0
 }
 
 // Whether the `if` join at `ifIx`, typed `string | null` or `K | null`, is delivered into the
@@ -37796,7 +37847,7 @@ export function idxSpanOn(): boolean {
 }
 
 // Whether element reads note their rows: for the `vl-src` section, or for the armed IR shadow.
-export function idxRowsOn(): boolean { return idxSpanOn() || idxRowShadow }
+export function idxRowsOn(): boolean { return idxSpanOn() || irShadowOn }
 
 // Lowers element read `exprIx` and banks its byte range as an element-read span row, so a
 // trap in it resolves to the read's own column rather than its statement's. Adds no code:

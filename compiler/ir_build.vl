@@ -95,6 +95,7 @@ import {
   identReadIsList,
   idxStorePlainWhy,
   idxStorePlanOf,
+  ifExprPlainKind,
   ifWritesElse,
   isArmOf,
   isBoxGuardPlain,
@@ -149,18 +150,23 @@ import {
   localIndexOf,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
-import { callSpillsFcpArg } from "./emit_fn_scans"
+import {
+  callSpillsFcpArg,
+  elseLessNullableTail,
+  lastStmtIsValueIf,
+} from "./emit_fn_scans"
 import {
   fRecRetTy,
   fRetVoid,
   fnStmts,
   gPromoInStart,
-  setIdxRowShadow,
+  setIrShadowOn,
 } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import { charLitCp, unwrapParen } from "./emit_base"
+import { ifArmValueExpr } from "./emit_query"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
@@ -176,7 +182,7 @@ let ibRowN: i32[] = []
 // row names every class the function missed), 5 disarmed with the shipped claim's rows printed.
 export function irShadowArm(on: i32) {
   ibArmed = on == 1 || on == 2 || on == 4
-  setIdxRowShadow(ibArmed)
+  setIrShadowOn(ibArmed)
   ibDetail = on == 2
   ibClaimAll = on == 3
   ibAllMiss = on == 4
@@ -529,6 +535,53 @@ function declVarAt(d: i32, rep: i32, ty: i32): i32 {
 function localVarAt(w: i32): i32 {
   if w < 0 { return -1 }
   return ib.irLocalAt[w] ?? -1
+}
+
+// A value `if` on legacy's plain scalar path (`ifExprPlainKind`): a slotless out each arm's one
+// value writes, as `&&` and `||` build it.
+function ifExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
+  if ifExprPlainKind(ix, ibFnIx) < 0 { return irBMiss("expression if") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("if after an operand") }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const thenB = ifArm(n.ifThen, t, rep)
+  const elseB = ifArm(n.ifElse, t, rep)
+  if ibMiss != "" { return irBMiss("if arm") }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// Whether body `b` ends in a temp's definition, an operand still waiting to be read.
+function endsInTemp(b: i32[]): boolean {
+  if b.length == 0 { return false }
+  const id = b[b.length - 1]
+  if id < 0 || id >= ib.irNodes.length { return false }
+  const n = ib.irNodes[id]
+  if !(n is SLet) || n.lDst < 0 || n.lDst >= ib.irVars.length { return false }
+  return ib.irVars[n.lDst].vKind == "temp"
+}
+
+// The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`.
+function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
+  const body: i32[] = []
+  const tv = ifArmValueExpr(blockIx)
+  const v = deliver(body, tv, rep)
+  if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
+  if ibMiss == "" {
+    irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
+  }
+  return body
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
@@ -1415,6 +1468,7 @@ function irBExprAt(b: i32[], ix: i32): Opnd {
     return c
   }
   if n is IsExpr { return boxTest(b, n, ix, rep) }
+  if n is IfStmt { return ifExpr(b, n, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
 
@@ -1471,6 +1525,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   const i = irBExpr(b, t.idxIndex)
   const ln = repNodeAt(irBOpRep(v))
   if !(ln is RList) { return skip("store operand coercion") }
+  // The bounds check is built after the value, which a value `if` leaves on the stack.
+  if nodeAt(unwrapParen(n.binRight)) is IfStmt {
+    return skip("if into an element store")
+  }
   const x = deliver(b, n.binRight, ln.rlsElem)
   if ibMiss != "" { return 0 }
   if (
@@ -1734,6 +1792,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     }
     if none { return skip("void return value") }
     if retBoxesCall(n.retArg) { return skip("return of a boxed call") }
+    // A returned value `if` is legacy's tail `if`, each arm's value its own exit.
+    if retIsValueIf(n.retArg) { return skip("return of a value if") }
     const v = deliver(b, n.retArg, ib.irRetRep)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
@@ -1782,6 +1842,13 @@ function retBoxesCall(ix: i32): boolean {
   return nodeAt(u) is Call
     && boxedNullable(ib.irRetRep)
     && primRepOf(u) != ib.irRetRep
+}
+
+// Whether `return ix` is legacy's tail `if` (`emitIfTail`): a returned value `if`.
+function retIsValueIf(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length || !(nodeAt(u) is IfStmt) { return false }
+  return lastStmtIsValueIf(u, ibFnIx) || elseLessNullableTail(u, ibFnIx)
 }
 
 // A non-void body's tail. An expression body's one statement is its value; a block body's last
