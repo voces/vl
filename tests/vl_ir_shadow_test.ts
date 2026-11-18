@@ -168,18 +168,18 @@ Deno.test({
   },
 });
 
-// Outside I1's set: a string coalesce whose default is no literal, a record and a valued `if` each
-// leave their function uncovered, named.
+// Outside the set: a string coalesce whose default is no literal, a closure parameter and a
+// valued `if` each leave their function uncovered, named.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
     // A returned `if` that yields its arms' values is outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
-function fx(p: { x: i32 }): i32 { return p.x }
+function ap(f: (x: i32) => i32): i32 { return f(4) }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
 print(greet("a", "!"))
-print(fx({ x: 4 }))
+print(ap((x: i32) => x + 1))
 print(sel(true))
 `;
     const { rc, rows } = run(src, true);
@@ -215,7 +215,8 @@ print(sel(true))
 // string list, and one whose body holds a loop with its own `break` (F1); a string from one code
 // point and from a local code-point list (S1); a box's `is` test of a record variant, plain and
 // told apart by a literal field (B1); a narrowed box's field read, of an i32 and of a string
-// (B2).
+// (B2); a struct parameter's field reads, a list of records' length, and a global record's list
+// field's length (B3).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -291,6 +292,9 @@ print(guard(2))
   `type Lit = { kind: "lit", v: i32 }\ntype Add = { kind: "add", l: i32, r: i32 }\nfunction isLit(e: Lit | Add): boolean { return e is Lit }\nprint(isLit({ kind: "lit", v: 1 }))\n`,
   `type P = { x: i32 }\ntype Q = { y: string }\nfunction px(u: P | Q): i32 {\n  if u is P { return u.x }\n  return 0\n}\nprint(px({ x: 4 }))\nprint(px({ y: "a" }))\n`,
   `type P = { x: i32, s: string }\ntype Q = { y: string }\nfunction ps(u: P | Q): string {\n  if u is P { return u.s }\n  return u.y\n}\nprint(ps({ x: 4, s: "p" }))\nprint(ps({ y: "q" }))\n`,
+  `type P = { x: i32, y: i32 }\nfunction sum(p: P): i32 { return p.x + p.y }\nprint(sum({ x: 1, y: 2 }))\n`,
+  `type P = { x: i32 }\nfunction n(ps: P[]): i32 { return ps.length }\nprint(n([{ x: 1 }, { x: 2 }]))\n`,
+  `type S = { xs: i32[], name: string }\nconst s: S = { xs: [1, 2, 3], name: "s" }\nfunction cnt(): i32 { return s.xs.length }\nprint(cnt())\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
@@ -437,7 +441,8 @@ print(f(-1) ?? 5)
 });
 
 // Only a `null` literal boxes with its value unread. A `null`-typed call has an effect that must
-// run once, so a function delivering one stays uncovered (`rep null`) rather than boxing unread.
+// run once, so a function returning one boxed stays uncovered (`return of a boxed call`, B3)
+// rather than boxing unread.
 Deno.test({
   name: "ir shadow: a null-typed call delivered into a box is never left unread",
   ignore,
@@ -453,7 +458,7 @@ function f(b: boolean): i32 | null {
 print(f(false) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered rep null";
+    const want = "uncovered return of a boxed call";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     if ((rows.get("covered") ?? 0) !== 0) throw new Error(`want 0 covered, got ${JSON.stringify([...rows])}`);
   },
@@ -584,6 +589,50 @@ print(two("a", "b"))
     const plain = run(src, false);
     if (plain.out.length !== census.out.length || plain.out.some((b, i) => b !== census.out[i])) {
       throw new Error(`want byte-identical output under the census (${plain.out.length} vs ${census.out.length} bytes)`);
+    }
+  },
+});
+
+// `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
+// bound to a literal delivered to an atom, a function-tag leaf, a tagged call's dispatch, and a
+// delivery `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+const PRE_PATHS: [string, string][] = [
+  [
+    "atom hook",
+    `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
+  ],
+  [
+    "tag leaf",
+    `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`,
+  ],
+  [
+    "tag dispatch",
+    `function inc0(a) { return a + 1 }\nfunction half(a) { return a / 2.0 }\nconst r = { fs: [inc0] }\nconst a = r.fs\nconst v: readonly ((x: i32) => i32 | f64)[] = r.fs\nprint(v[0](3))\n`,
+  ],
+  [
+    "coercion",
+    `type Box1 = {[string]: {r: string}}[]\ntype Circle = { r: string }\nfunction thru(x: {[string]: {r: string}}[]) { return x }\nconst _sp1: Box1 = []\nfunction outer() {\n  const lv1 = Map()\n  const c = [lv1]\n  function inner() {\n    const dd = thru(c)\n    const g0 = dd\n    if g0.length > 0 {\n      const g1 = (g0[0])["k0"] ?? { r: "" }\n      if (g1).r == "seven" { print(7) } else { print(0) }\n    } else { print(0) }\n  }\n  inner()\n}\nouter()\n`,
+  ],
+];
+Deno.test({
+  name:
+    "ir shadow: a node emitExpr takes a generic pre-path for is a named miss",
+  ignore,
+  fn: () => {
+    for (const [why, src] of PRE_PATHS) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`${why}: want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) {
+        throw new Error(`${why}: want no failure, got:\n${fails.join("\n")}`);
+      }
+      if (!rows.has(`uncovered pre-path ${why}`)) {
+        throw new Error(
+          `${why}: want an "uncovered pre-path ${why}" row, got ${
+            JSON.stringify([...rows])
+          }`,
+        );
+      }
     }
   },
 });
