@@ -4267,8 +4267,51 @@ fn arm_guest_fuel(store: &mut Store<()>) -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    // The fuel left at this thread's last fuel-weighed sample, which the next sample and a
+    // store's tail are weighed from; `None` once the tail is weighed, so guest work after the
+    // `[fuel] guest` report weighs nothing. Arming a store starts it at `u64::MAX`.
+    static FUEL_WEIGHED_AT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether profile samples weigh fuel (`VL_PROFILE_GUEST_FUEL=1` under `$VL_FUEL=1`), written as
+/// microseconds so a weight reads as fuel.
+fn guest_profile_fuel_on() -> bool {
+    std::env::var("VL_PROFILE_GUEST_FUEL").is_ok_and(|v| v == "1")
+}
+
+/// The fuel burned since this thread's last fuel-weighed sample, `now` being the fuel left, as a
+/// sample's weight: zero when `now` is unreadable or the store's tail is already weighed.
+fn fuel_weigh_since(now: Option<u64>) -> std::time::Duration {
+    let used = FUEL_WEIGHED_AT.with(|c| match (c.get(), now) {
+        (Some(at), Some(now)) => {
+            c.set(Some(now));
+            at.saturating_sub(now)
+        }
+        _ => 0,
+    });
+    std::time::Duration::from_micros(used)
+}
+
+/// On a fuel-weighed profile, weigh the fuel `store` burned since its last sample as one final
+/// sample, so the weights sum to the `[fuel] guest` total this precedes. Call on the thread that
+/// ran the store.
+fn weigh_guest_fuel_tail(store: &Store<()>) {
+    if !guest_fuel_on() || !guest_profile_fuel_on() {
+        return;
+    }
+    let delta = fuel_weigh_since(store.get_fuel().ok());
+    FUEL_WEIGHED_AT.with(|c| c.set(None));
+    if let Some(g) = GUEST_PROFILE.lock().unwrap().as_ref() {
+        if let Some(p) = g.profiler.lock().unwrap().as_mut() {
+            p.sample(store, delta);
+        }
+    }
+}
+
 /// Under `$VL_FUEL=1`, print `[fuel] guest: <n>` to stderr: the fuel `store` has burned.
 fn report_guest_fuel(store: &Store<()>) {
+    weigh_guest_fuel_tail(store);
     if guest_fuel_on() {
         if let Ok(left) = store.get_fuel() {
             eprintln!("[fuel] guest: {}", u64::MAX - left);
@@ -4370,20 +4413,16 @@ fn arm_seed_store(store: &mut Store<()>) {
     let mut headroom = policy
         .and_then(|(initial, grow)| Some(SeedGcHeadroom::new(initial, grow?)));
     let alloc = std::env::var("VL_PROFILE_GUEST_ALLOC").is_ok_and(|v| v == "1");
-    // `VL_PROFILE_GUEST_FUEL=1` under `$VL_FUEL=1`: each sample weighs the fuel burned since the
-    // one before, written as microseconds so the weight reads as fuel. Fuel starts at `u64::MAX`
-    // and is never topped up, so the first delta is exact too.
-    let fuel = std::env::var("VL_PROFILE_GUEST_FUEL").is_ok_and(|v| v == "1");
+    let fuel = guest_profile_fuel_on();
+    if fuel {
+        FUEL_WEIGHED_AT.with(|c| c.set(Some(u64::MAX)));
+    }
     let mut last = resident_bytes();
-    let mut fuel_left = u64::MAX;
     store.epoch_deadline_callback(move |mut cx| {
         if let Some(p) = prof.as_ref() {
             if let Some(p) = p.lock().unwrap().as_mut() {
                 let delta = if fuel {
-                    let now = cx.get_fuel().unwrap_or(fuel_left);
-                    let used = fuel_left.saturating_sub(now);
-                    fuel_left = now;
-                    std::time::Duration::from_micros(used)
+                    fuel_weigh_since(cx.get_fuel().ok())
                 } else if alloc {
                     let now = resident_bytes();
                     let grew = now.saturating_sub(last);
@@ -8481,6 +8520,7 @@ fn harvest_check_instance(store: &mut Store<()>, inst: &Instance) {
 /// `$VL_CHECK_STATS=1`, one `[check]` line per reason with its roots and module checks,
 /// then the module-check total.
 fn report_check_run(store: &mut Store<()>, inst: &Instance) {
+    weigh_guest_fuel_tail(store);
     if guest_fuel_on() {
         if let Ok(left) = store.get_fuel() {
             eprintln!("[fuel] guest: {}", u64::MAX - left);
