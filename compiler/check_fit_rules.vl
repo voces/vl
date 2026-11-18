@@ -2232,6 +2232,68 @@ function declNameOf(d: i32): string {
   return if n is LetDecl { n.letName } else { "this binding" }
 }
 
+// A record literal delivered at its own type into a list or map binding, with a field holding a
+// read built at another record, is built with that field's build, and the binding's elements are.
+export function recBuildOwnEdges() {
+  cwIxBuild()
+  const seen: i32[] = []
+  for u in recOwnSrc {
+    // The queue holds a literal's field values, not the literal: the record is the field's owner.
+    const p = cwPeelValue(u)
+    const lit = if p >= 0 && nodeAt(p) is ObjLit { p } else if u >= 0 && cwIxCovers(u) && cwIxUpKind[u] == CW_UP_FIELD { cwIxUp[u] } else { -1 }
+    if lit >= 0 && !i32ListHas(seen, lit) {
+      seen.push(lit)
+      const b = recLitFieldsBuiltTy(lit)
+      const r = if b >= 0 { deliveryRoot(lit, "held") } else { null }
+      if r != null && r.part == "elem" {
+        recBuildPush(r.decl, nodeTyIxOf(lit), b, true)
+      } else if r != null && r.part == "field" {
+        // A record binding holding the literal in a field is built with that field's build.
+        const own = nodeTyIxOf(r.decl)
+        const ot = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+        const k = if ot is TyObj { strListIndexOf(ot.objFieldNames, r.field) } else { -1 }
+        if ot is TyObj && k >= 0 {
+          const tys: i32[] = []
+          for ft in ot.objFieldTypes { tys.push(ft) }
+          tys[k] = if tyAt(tys[k]) is TyNullable { mkNullableTy(b) } else { b }
+          recBuildPush(r.decl, own, mkObjTy(ot.objFieldNames, tys), false)
+        }
+      }
+    }
+  }
+  return 0
+}
+
+// The record the literal `x` is built as when a field holds a read built at another record
+// (`recBuiltReadTy`); -1 when `x` is no record literal or no field is such a read.
+function recLitFieldsBuiltTy(x: i32): i32 {
+  const p = cwPeelValue(x)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = nodeAt(p)
+  const ot = nodeTyIxOf(p)
+  if !(n is ObjLit) || ot < 0 || ot >= T.tys.length { return -1 }
+  const t = tyAt(ot)
+  if !(t is TyObj) { return -1 }
+  const tys: i32[] = []
+  for ft in t.objFieldTypes { tys.push(ft) }
+  let changed = false
+  for fx in n.objFields {
+    const fi = nodeAt(fx)
+    if fi is FieldInit {
+      const k = strListIndexOf(t.objFieldNames, fi.fiName)
+      const b = recBuiltReadTy(cwPeelValue(fi.fiValue))
+      if k >= 0 && k < tys.length && b >= 0 && b < T.tys.length {
+        const bn = nonNullTy(b)
+        if !fieldStorageEq(bn, nonNullTy(tys[k])) {
+          tys[k] = if tyAt(tys[k]) is TyNullable { mkNullableTy(bn) } else { bn }
+          changed = true
+        }
+      }
+    }
+  }
+  return if changed { mkObjTy(t.objFieldNames, tys) } else { -1 }
+}
+
 // Closes this pass's adoption demands over the deliveries queued at their own type (`recOwnSrc`):
 // a value landing in a binding a demand adopts is delivered at the type that binding takes there,
 // so the re-check that would raise its demand a round later is not needed (D16958).
