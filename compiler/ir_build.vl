@@ -31,6 +31,7 @@ import {
   StrLit,
   Unary,
   WhileStmt,
+  blockTailIsDead,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -124,6 +125,7 @@ import {
   pushPlanOf,
   shiftMaskFoldOf,
   strLitTakesAtom,
+  tailIfPlainWhy,
   tplStrHoleOf,
   widenPlanOf,
 } from "./wasmEmit"
@@ -167,6 +169,7 @@ import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import { charLitCp, unwrapParen } from "./emit_base"
 import { ifArmValueExpr } from "./emit_query"
+import { fnRetNullBearing } from "./emit_nullable_rets"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
@@ -1771,7 +1774,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if none { return skip("void return value") }
     if retBoxesCall(n.retArg) { return skip("return of a boxed call") }
     // A returned value `if` is legacy's tail `if`, each arm's value its own exit.
-    if retIsValueIf(n.retArg) { return skip("return of a value if") }
+    if retIsValueIf(n.retArg) {
+      // `end` is followed by the result's `null` where it bears one (`emitNullForRet`).
+      if fnRetNullBearing(ibFnIx) { return skip("returned if null pad") }
+      tailIf(b, unwrapParen(n.retArg))
+      // Legacy's `unreachable` after the `end` its returning arms leave behind.
+      if ibMiss == "" { irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix) }
+      return 0
+    }
     const v = deliver(b, n.retArg, ib.irRetRep)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
@@ -1841,6 +1851,18 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   const last = stmts[stmts.length - 1]
   const ln = nodeAt(last)
   if ln is WhileStmt { return skip("valued tail loop") }
+  if ln is IfStmt && lastStmtIsValueIf(last, ibFnIx) {
+    // The body's tail `if` is a body statement, which legacy banks a row for.
+    const n0 = b.length
+    tailIf(b, last)
+    if ibMiss == "" && b.length > n0 {
+      irSpanNote(ib, last, b[n0], b[b.length - 1])
+    }
+    return 0
+  }
+  if ln is IfStmt && elseLessNullableTail(last, ibFnIx) {
+    return skip("else-less nullable tail")
+  }
   if ln is RetStmt || ln is IfStmt {
     const past = ibMissesPast
     stmt(b, last, stmts, stmts.length - 1)
@@ -1862,6 +1884,73 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
+}
+
+// A value `if` in tail position (legacy's `emitIfTail`): the statement `if` with each arm's last
+// value returned, its `else if` the chain's next link.
+function tailIf(b: i32[], ix: i32) {
+  const n = nodeAt(ix)
+  if !(n is IfStmt) { return skip("tail if node") }
+  const why = tailIfPlainWhy(ix)
+  if why != "" { return skip(why) }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+  const thenB = tailArm(n.ifThen)
+  const elseB: i32[] = []
+  if n.ifElse >= 0 && n.ifElse < P.nodes.length && nodeAt(n.ifElse) is IfStmt {
+    tailIf(elseB, n.ifElse)
+  } else {
+    const eb = tailArm(n.ifElse)
+    for x in eb { elseB.push(x) }
+  }
+  if ibMiss != "" { return 0 }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: true },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
+// A tail `if` arm: its statements, the last returned when it is a value or a nested value `if`.
+function tailArm(blockIx: i32): i32[] {
+  const body: i32[] = []
+  const stmts = elseStmts(blockIx)
+  if stmts.length == 0 || blockTailIsDead(stmts) {
+    skip("dead tail arm")
+    return body
+  }
+  let i = 0
+  // Legacy lowers an arm's prelude by `emitStmtIn`, which banks no row of its own.
+  while i < stmts.length - 1 {
+    stmtIn(body, stmts[i], stmts, i)
+    i = i + 1
+  }
+  const last = stmts[stmts.length - 1]
+  const ln = nodeAt(last)
+  if ln is IfStmt && lastStmtIsValueIf(last, ibFnIx) {
+    tailIf(body, last)
+    return body
+  }
+  if ln is RetStmt || ln is IfStmt || ifArmValueExpr(blockIx) != last {
+    stmt(body, last, stmts, stmts.length - 1)
+    if ibMiss == "" && !irBodyLeaves(ib, body) { skip("tail arm") }
+    return body
+  }
+  if retBoxesCall(last) {
+    skip("return of a boxed call")
+    return body
+  }
+  const v = deliver(body, last, ib.irRetRep)
+  if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
+    skip("tail coercion")
+    return body
+  }
+  // Legacy banks no statement row for an arm's tail value (`emitTailReturnExit`).
+  irBNode(body, { rtHas: true, rtV: v }, -1, ibNoValue, last)
+  return body
 }
 
 // Builds the IR of the function at `fnIx` (`fnStmts` slot `fnPos`), or "" plus a reason.
