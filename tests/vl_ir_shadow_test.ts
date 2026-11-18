@@ -174,7 +174,7 @@ Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A returned `if` that yields its arms' values is outside the set too.
+    // A returned `if` that yields its arms' values is legacy's tail `if`, outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
@@ -186,7 +186,7 @@ print(sel(true))
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["expression if"]) {
+    for (const why of ["return of a value if"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
@@ -217,7 +217,8 @@ print(sel(true))
 // told apart by a literal field (B1); a narrowed box's field read, of an i32 and of a string
 // (B2); a struct parameter's field reads, a list of records' length, and a global record's list
 // field's length (B3); a narrowed box read whole at its variant, and a `string | null`
-// parameter read at its string (narrowed read).
+// parameter read at its string (narrowed read); a value `if` bound and one widened into an
+// `f64` binding (B4a).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -298,6 +299,8 @@ print(guard(2))
   `type S = { xs: i32[], name: string }\nconst s: S = { xs: [1, 2, 3], name: "s" }\nfunction cnt(): i32 { return s.xs.length }\nprint(cnt())\n`,
   `type P = { x: i32 }\ntype Q = { y: string }\nfunction viaP(u: P | Q): i32 {\n  if u is P {\n    const p: P = u\n    return p.x\n  }\n  return 0\n}\nprint(viaP({ x: 4 }))\nprint(viaP({ y: "a" }))\n`,
   `function orEmpty(s: string | null): string {\n  if s == null { return "" }\n  return s\n}\nprint(orEmpty("a"))\nprint(orEmpty(null))\n`,
+  `function f(c: boolean, x: i32): i32 {\n  const y = if c { x + 1 } else { 0 }\n  return y * 2\n}\nprint(f(true, 2))\nprint(f(false, 2))\n`,
+  `function w(c: boolean, x: i32): f64 {\n  const y: f64 = if c { x } else { 2.5 }\n  return y\n}\nprint(w(true, 3))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
