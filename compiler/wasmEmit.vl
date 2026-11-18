@@ -1294,6 +1294,7 @@ import {
   exprIsStrOrder,
   exprNulNicheKind,
   exprPopBits,
+  globalInitIsLitAtom,
   identSlotIsUnionBox,
   identityOperandIsFn,
   ifArmIsValue,
@@ -1723,6 +1724,7 @@ import {
   monoArgClosedPinTy,
   monoBundleFe,
   monoBundleReadFe,
+  monoGenericAliasFe,
   monoInstantiatedAny,
   monoIsClashLit,
   monoTokenFe,
@@ -11388,12 +11390,52 @@ function globalCellArmIdx(gLet: i32, kind: VKind): i32 {
 // The arm unbox at a module global's start-fn initializer, the assignment arm's twin: a box
 // delivered into a record cell recovers its payload. A `variant` cell's coerce owns its own.
 export function emitGlobalInitArmUnbox(gLet: i32, kind: VKind, initIx: i32) {
-  if kind == "variant" || !narrowedArmNeedsUnbox(initIx, -1) { return 0 }
+  if !globalInitArmUnboxes(kind, initIx) { return 0 }
   return emitNarrowedArmUnboxTo(
     armDestHeapOf(kind, globalCellArmIdx(gLet, kind)),
     initIx,
     -1,
   )
+}
+
+// Whether a global's start-fn initializer `initIx`, into a cell of kind `kind`, takes the arm
+// unbox `emitGlobalInitArmUnbox` writes.
+export function globalInitArmUnboxes(kind: VKind, initIx: i32): boolean {
+  return kind != "variant" && narrowedArmNeedsUnbox(initIx, -1)
+}
+
+// How the start function writes global `gst`'s initializer value into a cell of kind `gck`:
+// a bundle holder's member, a numeric widening, a union-valued map read's box, a union box, a
+// bare arm's struct, a generic alias's closure, a `null`-typed init's effects, a literal atom's
+// string, or the expression itself. Both the legacy writer and the IR's start body read it.
+export type StartInitArm = "holder"
+  | "widen"
+  | "mapBox"
+  | "unionBox"
+  | "variant"
+  | "alias"
+  | "nulnone"
+  | "atom"
+  | "plain"
+export function startInitArmOf(gst: i32, gck: VKind): StartInitArm {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) { return "plain" }
+  if typedHolderMember(gst, -1) >= 0 { return "holder" }
+  if gck == "f32" || gck == "f64" || gck == "i64" { return "widen" }
+  if letNulMapReadUnionBox(gst, -1) { return "mapBox" }
+  if gck == "union" { return "unionBox" }
+  if gck == "variant" {
+    const svi = globalCellStructIdx(gst)
+    if svi >= 0 && svi < uVarRow.length { return "variant" }
+  }
+  if fnTagLeafId(g.letInit) < 0 && monoGenericAliasFe(gst) >= 0 {
+    return "alias"
+  }
+  if gck == "nulnone" { return "nulnone" }
+  if (gck == "str" || gck == "nulstr") && globalInitIsLitAtom(g.letInit) {
+    return "atom"
+  }
+  return "plain"
 }
 
 function armDestHeapOf(kind: VKind, idx: i32): i32 {
@@ -29310,10 +29352,16 @@ function emitBundleMemberArg(arg: i32, fnIx: i32): i32 {
 // An annotated binding `letIx` initialised with a bundle holder's read: the member its type
 // names, picked off the holder's record. 0, -1, or 1 where the binding is no such one.
 export function emitTypedHolderInit(letIx: i32, fnIx: i32): i32 {
-  const tm = if elabHasTypedReads() { elabTypedReadMemberAt(nodeSrc[letIx] ?? letIx, elabKeyOfFn(fnIx)) } else { -1 }
+  const tm = typedHolderMember(letIx, fnIx)
   const ln = nodeAt(letIx)
   if tm < 0 || !(ln is LetDecl) { return 1 }
   return emitBundleMemberPick(ln.letInit, tm, fnIx)
+}
+
+// The bundle member binding `letIx` in function `fnIx` picks off its holder's read, or -1.
+export function typedHolderMember(letIx: i32, fnIx: i32): i32 {
+  if !elabHasTypedReads() { return -1 }
+  return elabTypedReadMemberAt(nodeSrc[letIx] ?? letIx, elabKeyOfFn(fnIx))
 }
 
 // The bundle read `arg`'s member `m`, -1 where the record holds none at the destination's type.

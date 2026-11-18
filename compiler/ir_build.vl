@@ -91,6 +91,7 @@ import {
   deadNullTestOperand,
   exprPrePathWhy,
   forInPlainWhy,
+  globalInitArmUnboxes,
   globalReadRecovers,
   identReadArmOf,
   identReadIsList,
@@ -124,6 +125,7 @@ import {
   pushPlainWhy,
   pushPlanOf,
   shiftMaskFoldOf,
+  startInitArmOf,
   startStrAccMarked,
   strLitTakesAtom,
   tailIfPlainWhy,
@@ -150,6 +152,7 @@ import {
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
+  globalCellKind,
   localIndexOf,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
@@ -2174,10 +2177,10 @@ export function irShadowStart(
   outStart: i32,
   spanBase: i32,
   order: i32[],
-  orderIsInit: boolean[],
+  orderGi: i32[],
 ) {
   count("fns")
-  const why = buildStart(order, orderIsInit)
+  const why = buildStart(order, orderGi)
   if why != "" {
     count("uncovered start " + why)
     return 0
@@ -2200,9 +2203,9 @@ export function irShadowStart(
   return 0
 }
 
-// Builds the start body: each top-level statement in order, with no row of its own (legacy
-// banks a start statement's row by another kind). "" or the first miss.
-function buildStart(order: i32[], orderIsInit: boolean[]): string {
+// Builds the start body: each top-level statement, or global `orderGi[i]`'s initializer, in
+// order, with no row of its own (legacy banks a start row by another kind). "" or the first miss.
+function buildStart(order: i32[], orderGi: i32[]): string {
   ib = irFnNew(-1, "@start")
   ibFnIx = -1
   ibFnPos = -1
@@ -2225,13 +2228,38 @@ function buildStart(order: i32[], orderIsInit: boolean[]): string {
   const top: i32[] = []
   let i = 0
   while i < order.length {
-    if orderIsInit[i] { return "global initializer" }
-    stmtIn(top, order[i], NO_SIBS, -1)
+    if orderGi[i] >= 0 {
+      globalInit(top, orderGi[i], order[i])
+    } else {
+      stmtIn(top, order[i], NO_SIBS, -1)
+    }
     if ibMiss != "" { return ibMiss }
     i = i + 1
   }
   ib.irBody = top
   return ibMiss
+}
+
+// Global `gi`'s initializer, at statement `gst`, written as legacy's plain arm writes it: the
+// value delivered at the cell's rep, then its store.
+function globalInit(b: i32[], gi: i32, gst: i32) {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) { return 0 }
+  const gck = globalCellKind(gst)
+  const arm = startInitArmOf(gst, gck)
+  if arm != "plain" { return skip("global initializer " + arm) }
+  if globalInitArmUnboxes(gck, g.letInit) {
+    return skip("global initializer arm unbox")
+  }
+  const rep = globalRep(gi, gst)
+  if rep < 0 { return skip("global initializer rep") }
+  const src = deliver(b, g.letInit, rep)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(src) != rep { return skip("global initializer coercion") }
+  const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
+  if gm != "" { return skip(gm) }
+  irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
+  return 0
 }
 
 // The census row of the function just built: its blocker classes, sorted, or none.
