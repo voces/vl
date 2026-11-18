@@ -74,3 +74,48 @@ Lowered like `emitFnTagDispatch`, but keyed on value tags, not a function set.
 - Instance growth: one instance per combination, at most `m1 × m2`.
 - Fuel and seed size on the self-compile, which has no such calls today, so it should be flat.
 - Late demands and late tag rows: the per-combination rows are new rows.
+
+## As built (stage 1)
+
+The split is a check-time lowering at the call, not a plan the emitter dispatches on. Where
+`openArgTyParamRefused` would fire, `openArgSplitAt` (check_calls) rewrites the call node to
+
+    { const $u0 = a0; const $u1 = a1; if $u1 is M1 { f($u0, $u1) } else if $u1 is M2 { … } else { __trap__() } }
+
+with each written argument snapshotted once, in source order, at its checked type, and the call
+re-checked. Narrowing binds `T` per arm; mono, elaboration and the join of the arms' results are
+the existing machinery's. Named arguments keep their names; a filled default is not snapshotted.
+
+Two things the design did not foresee:
+
+- **D4928 refused every arm.** A list narrowed by `is` was read at the member but never delivered
+  at it, even for `string[] | i32[]`, where the test is the box tag: an empty `i32[]` answers
+  `is string[]` false at run time. `narFitElems` (check_leaf_steps) now leaves no elements-only
+  entry for a declared member whose box tag differs from the test's (`listTagApart`: one-deep lists
+  of distinct scalars among `i32`, `f64`, `string`, `i64`, `f32`, `u8`, `boolean`). The plain
+  spelling `if q is string[] { g(q) }` now runs too.
+- **D16963 keeps its refusal.** A twin's test reads the elements' values. In the soundness cell
+  (`f<T>` calls `poke()`, which pushes `9` into the `i32[]` alias of the `K[]`-narrowed argument),
+  delivering at `K[]` would read `9` as a `K`. D4928's rule refuses that delivery, so the split
+  declines any union with a pair of members that is not tag-apart and keeps #9015's sentence
+  (`tests/cases/soundness/error-union-of-twin-lists-callee-writes-alias.vl`).
+
+Caps: at most two split arguments and at most eight member combinations; past either, #9015's
+refusal stands. Maps, records and nested lists are not split.
+
+Combination counts:
+
+| population | split sites | combinations |
+| --- | --- | --- |
+| grid, 1 argument × 2 members (`str_i32`, `i32_str` × len/first/wrap/push; named, default, order, in-generic, loop, result join, nullable-narrowed) | 15 cells | 2 |
+| grid, 1 argument × 3 members (`three`) | 1 | 3 |
+| grid, 2 arguments × 2 members (`two__len`) | 1 | 4 |
+| grid, 3 × 2 members (`cap6`) | 1 | 6 |
+| grid, 3 × 3 members (`cap9`) | refused | 9 |
+| grid, 3 arguments (`ctl_three`) | refused | — |
+| grid, twins (`twin*`, `twin_alias_write`), 13 cells | refused | 2 |
+| grid, `u8[] \| f64[]`, 4 cells | refused by `u8`'s own storage-type refusal in the `u8[]` arm | 2 |
+| distilled corpus (9,032 modules) | 0: regress output identical with the split disabled | — |
+
+Self-compile fuel +0.6%, seed +2.3% on its baseline, late demands 10 = baseline, phase-state
+census unchanged.
