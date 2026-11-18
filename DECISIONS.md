@@ -12759,3 +12759,21 @@ check, per instance key and parameter; a set's tag is derived from those rows. T
 **Why.** Every late class but the producer gap needs a fact keyed by instance (G's two instantiations, S's
 join, T's lambda and generic bodies); one bit per set cannot hold it, and a second decider after the
 elaboration is what the per-row decision removes. Design: `refactor-notes/2026-11-17-store-storage-per-key-param-design.md`.
+
+## A `readonly` destination over a written source is a live view (2026-11-18, the coordinator applying the 2026-09-06 ruling; the owner may reverse it) — D3040, D3056
+
+**The rule.** A list the program writes, delivered where a `readonly` list of another element
+storage is declared, is the converting VIEW that reads through the source, so a later write
+shows through it. The 2026-09-06 ruling (D1686/D1687) defines `readonly T[]` as a shallow,
+read-only VIEW, Kotlin's `List`: it constrains writes through the destination, not the source's.
+The licence above, "a `readonly` destination keeps the converting copy for now, licensed where
+nothing writes the source", was an interim lowering from before the converting views existed.
+With the scalar view (`svMk`, D3028) and the record-list view (`rvEmitView`, D3041) built, it is
+lifted: an unwritten source may still take the copy, and a written one takes the view.
+
+**What stays refused.** A source with no named root (a call result) has no handle for a view to
+read through. A list of scalar lists into a `readonly` union list has no view built yet.
+
+**Flagged for the owner.** This applies an existing ruling rather than making a new one. If the
+owner wants the copy-only reading back, the two checker gates in `objShapeListElemAdapts` and
+`covarWriteThrough` restore it, and D3040 and D3056 reopen.
