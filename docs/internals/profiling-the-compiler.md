@@ -126,6 +126,24 @@ source of truth, this is a copy of it.
 | `string-concat-sites.vl` | Counts the two O(n²) string-concatenation shapes in `compiler/*.vl` + `std/*.vl`. | |
 | `vl-fixed-cost.sh` | The FIXED cost of one `vl` process: argv-only, a warm `.cwasm` deserialize, and a cold JIT of the seed. | |
 
+## Which functions a corpus never runs: `scripts/fn-coverage.ts`
+
+Exact, not sampled. It instruments a `--names` seed with binaryen's `--log-execution`, drives
+`compileSrc` over each program from Deno with the module graph loaded, and lists the functions no
+logged id fired in, by module:
+
+    vl build compiler/entry.vl --names -o /tmp/names.wasm
+    deno run -A scripts/fn-coverage.ts --names /tmp/names.wasm --jobs 4 --out /tmp/never.json
+
+Over the default population (every `.vl` under `tests/`, `std/`, `scripts/` and `bench/`, plus
+`compiler/entry.vl`, 22,964 programs), 2,944 of 18,860 functions
+never ran on 2026-11-18. Read the list as coverage, not deadness:
+- the CLI, lint, fmt, LSP and optimiser entries are not driven;
+- an env-gated instrument never fires;
+- an `emitFail` refusal never fires on a corpus that holds no emit reject.
+
+A deletion still needs its own argument that the code is unreachable.
+
 ## Measured 2026-09-02 (#2419)
 
 Self-compile before the memo, 28,755 guest samples: `moduleHasUnionAs` 29.8% self time and
