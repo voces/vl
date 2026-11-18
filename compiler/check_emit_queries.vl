@@ -25,36 +25,11 @@ import {
   ovHoleSites,
 } from "./check_call_resolve"
 import { opIdxDecls, opIdxFns, opIdxOps } from "./check_callee"
-import { concatsAsStr, funcPinTyIx, objPinTyIx } from "./check_core_state"
-import {
-  HD_BINOP,
-  HD_COAL,
-  HD_DISC,
-  HD_ELEM,
-  HD_ELEMV,
-  HD_FLD,
-  HD_GNOT,
-  HD_HWR,
-  HD_ITER1,
-  HD_ITER2,
-  HD_OFLD,
-  HD_RET,
-  HD_TVW,
-  coalDeadAtPin,
-  forInPinTy,
-  hdAlt,
-  hdAltAdopts,
-  hdBase,
-  hdField,
-  hdInner,
-  hdKind,
-  hdRowOf,
-  mapPinReadTy,
-} from "./check_hole_pins"
+import { funcPinTyIx, objPinTyIx } from "./check_core_state"
+import {} from "./check_hole_pins"
 import { intrinsicNameRefusal } from "./check_intrinsics"
 import {
   bindOf,
-  callPinFnTy,
   njApartSet,
   nomLitRelax,
   rejoinDropSubsumed,
@@ -71,17 +46,10 @@ import {
 } from "./check_ret_names"
 import { joinClashMsg, joinClashMsgSet } from "./check_subst"
 import { mixedVariantBoxGate } from "./check_ty_rep"
-import {
-  arrElemValueTy,
-  flattenVariantsInto,
-  nonNullTy,
-  tyHasTyVar,
-} from "./tyquery"
+import { flattenVariantsInto, tyHasTyVar } from "./tyquery"
 import {
   T,
   TY_ERR,
-  TY_NULL,
-  TY_STR,
   TY_VOID,
   TyArray,
   TyErr,
@@ -103,9 +71,7 @@ import {
   tyAt,
   tyElemOf,
   tyElemOpen,
-  tyFieldTyOf,
   tyHasRepHoleAt,
-  tyIsHole,
   tyIsLitUnion,
   tyIsTwinRecordUnion,
   tyMutEpoch,
@@ -116,24 +82,17 @@ import {
   tyVarRenames,
   unionAliasDeclNameOfTy,
 } from "./check_types"
-import { binArithPinTy } from "./check_union_mint"
 import { i32ListHas } from "./listutil"
 import { nominalDeclAtOfObj, nullableRetName } from "./check_fit_rules"
 import {
   assignable,
   bindGenUnionArm,
   bindGenWalk,
-  coalJoinAtPin,
-  discrimKeepTy,
   joinTys,
-  optFieldAtPin,
-  subtractTy,
   tErr,
   tErrPushTok,
-  tvWriteLandTy,
   tyFitKind,
   tyProvesNonNull,
-  writeMemberTy,
 } from "./check_relate_core"
 import {
   refArmUnionRetName,
@@ -239,149 +198,6 @@ export function recAdForcedReport() {
     i = i + 1
   }
   return 0
-}
-
-// `substHoleTyReal`'s read of a hole against `bNames`/`bTys`, noting no pin: a direct binding,
-// or a field, element or element-value derivation off one. -1 for any other derivation, an
-// unbound hole, or a non-hole. What the emitter asks of a node a hole instance shares (D2921).
-export function holePinReadOf(tyIx: i32, bNames: string[], bTys: i32[]): i32 {
-  return holePinReadAt(tyIx, bNames, bTys, 0)
-}
-
-function holePinReadAt(
-  tyIx: i32,
-  bNames: string[],
-  bTys: i32[],
-  depth: i32,
-): i32 {
-  if tyIx < 0 || tyIx >= T.tys.length || depth > 8 { return -1 }
-  const t = tyAt(tyIx)
-  if !(t is TyVar) { return -1 }
-  const b = bindOf(bNames, bTys, t.tvName)
-  if b >= 0 { return b }
-  const row = hdRowOf(tyIx)
-  if row < 0 { return -1 }
-  const kind = hdKind[row]
-  // A hole read under a null test is the non-null face of its pin (D3182).
-  if kind == HD_GNOT && hdAlt[row] == TY_NULL {
-    const nn = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-    if nn < 0 { return -1 }
-    return nonNullTy(nn)
-  }
-  // The `else` of `is T` over a hole is its pin less `T`, or the pin where nothing is less (D4899).
-  if kind == HD_GNOT && hdAlt[row] >= 0 {
-    const gp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-    if gp < 0 || gp >= T.tys.length || tyIsHole(gp) { return -1 }
-    const rest = subtractTy(gp, hdAlt[row])
-    if rest >= 0 { return rest }
-    return gp
-  }
-  if kind == HD_DISC {
-    const dp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-    if dp < 0 || dp >= T.tys.length || tyIsHole(dp) { return -1 }
-    const kept = discrimKeepTy(dp, hdField[row], hdInner[row], hdAlt[row] == 1)
-    return if kept >= 0 { kept } else { dp }
-  }
-  if kind == HD_TVW {
-    const wp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-    if wp < 0 { return -1 }
-    return tvWriteLandTy(hdInner[row], wp)
-  }
-  if kind == HD_HWR {
-    const hp = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-    if hp < 0 { return -1 }
-    return writeMemberTy(hp, hdInner[row])
-  }
-  if kind == HD_OFLD {
-    const op = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-    if op < 0 || op >= T.tys.length || tyIsHole(op) { return -1 }
-    return optFieldAtPin(op, hdField[row])
-  }
-  if kind == HD_BINOP { return holeBinOpReadAt(row, bNames, bTys, depth) }
-  if kind == HD_COAL { return holeCoalReadAt(row, bNames, bTys, depth) }
-  if (
-    kind != HD_FLD
-    && kind != HD_ELEM
-    && kind != HD_ELEMV
-    && kind != HD_RET
-    && kind != HD_ITER1
-    && kind != HD_ITER2
-  ) {
-    return -1
-  }
-  const inner = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-  if inner < 0 || inner >= T.tys.length { return -1 }
-  if kind == HD_ITER1 || kind == HD_ITER2 {
-    return forInPinTy(inner, kind == HD_ITER2)
-  }
-  // The result of calling a hole the pin reads as a function (D3117).
-  if kind == HD_RET {
-    const fi = callPinFnTy(inner)
-    if fi < 0 { return -1 }
-    const ft = tyAt(fi)
-    if ft is TyFunc { return ft.fnRet }
-    return -1
-  }
-  if kind == HD_ELEM { return tyArrayElemIx(inner) }
-  if kind == HD_ELEMV {
-    const mr = mapPinReadTy(inner)
-    if mr >= 0 { return mr }
-    const ev = tyArrayElemIx(inner)
-    if ev < 0 { return -1 }
-    return arrElemValueTy(ev)
-  }
-  if hdField[row].length == 0 { return -1 }
-  return tyFieldTyOf(inner, hdField[row])
-}
-
-// `substHoleTyReal`'s binary-operator arm without banking: a string concat, else the body's own
-// answer. -1 for a record operand, whose overload only the checker resolves, and where the
-// answer names a hole this read leaves unbound.
-function holeBinOpReadAt(
-  row: i32,
-  bNames: string[],
-  bTys: i32[],
-  depth: i32,
-): i32 {
-  if row < 0 || row >= hdBase.length { return -1 }
-  const op = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-  if op < 0 || op >= T.tys.length || tyIsHole(op) || tyAt(op) is TyObj {
-    return -1
-  }
-  if hdField[row] == "+" && concatsAsStr(op) { return TY_STR }
-  const ans = hdInner[row]
-  if ans == hdBase[row] {
-    let alt = hdAlt[row]
-    if alt >= 0 && tyIsHole(alt) {
-      alt = holePinReadAt(alt, bNames, bTys, depth + 1)
-    }
-    return binArithPinTy(hdField[row], op, alt, hdAltAdopts[row])
-  }
-  if ans < 0 || ans >= T.tys.length { return -1 }
-  if !tyHasTyVar(ans) { return ans }
-  if !(tyAt(ans) is TyVar) { return -1 }
-  return holePinReadAt(ans, bNames, bTys, depth + 1)
-}
-
-// `substHoleTyReal`'s `??` arm without banking: the concrete `??`'s typing at the operand's pin.
-// -1 where the operand or a default naming a hole reads unbound.
-function holeCoalReadAt(
-  row: i32,
-  bNames: string[],
-  bTys: i32[],
-  depth: i32,
-): i32 {
-  if row < 0 || row >= hdBase.length { return -1 }
-  const pin = holePinReadAt(hdBase[row], bNames, bTys, depth + 1)
-  if pin < 0 || pin >= T.tys.length || tyIsHole(pin) { return -1 }
-  if coalDeadAtPin(row, pin) { return pin }
-  let dft = hdInner[row]
-  if dft >= 0 && dft < T.tys.length && tyHasTyVar(dft) {
-    if !(tyAt(dft) is TyVar) { return -1 }
-    dft = holePinReadAt(dft, bNames, bTys, depth + 1)
-    if dft < 0 { return -1 }
-  }
-  return coalJoinAtPin(row, pin, dft)
 }
 
 // Appends to `bNames`/`bTys` the union-arm binding (`bindGenUnionArm`) of parameter type
