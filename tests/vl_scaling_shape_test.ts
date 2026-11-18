@@ -1111,7 +1111,7 @@ axis(
   (d) => twoFiles(d, genPins(400, true), genPins(400, false)),
 );
 
-// 1.83 (0.138G / 0.075G fuel) against 2.50 before D16992's four fixes: a first instance's slot
+// 1.82 (0.137G / 0.075G fuel) against 2.53 before D16992's four fixes: a first instance's slot
 // write had retired the whole `fnStmts` position index, and three per-instance scans walked the
 // whole arena (D16992). Before that, 5.75 from `buildFnMap` re-classifying every function (D3761).
 axis(
