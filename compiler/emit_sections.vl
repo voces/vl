@@ -38,7 +38,14 @@ import { lamChainSnap } from "./check_lam_chain"
 import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
-import { irClaimFn, irShadowArmed, irShadowBegin, irShadowFn } from "./ir_build"
+import {
+  irClaimFn,
+  irShadowArmed,
+  irShadowBegin,
+  irShadowFn,
+  irShadowStart,
+} from "./ir_build"
+import { irStartPrologueHook } from "./ir_lower"
 import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
@@ -2443,6 +2450,8 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // top-level statement at `bodyExpr`-relative offsets; the tail rebases exactly this
   // suffix onto `out` once the locals vector and the size prefix are known.
   const spanBase = emitFnSpanStart.length
+  // The element-read rows the armed shadow notes start empty, as for a function body.
+  shIdxReset()
   const nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return -1 }
   startFnDetectFrames()
@@ -2487,6 +2496,9 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // statements, emits the same bytes as before. The emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
   let gi = swG0
   let si = swS0
+  // The merged order, for the IR shadow of a single start body.
+  const order: i32[] = []
+  const orderIsInit: boolean[] = []
   // The promotion context window (G2c): a promoted binding's `local.get`/`local.set` is only
   // meaningful in this frame, so the flag that lets `emitUserGlobalGet`/`emitUserGlobalSet`
   // produce one is armed for exactly the span streaming this body. Every user function body and
@@ -2507,6 +2519,10 @@ function emitStartBodyCode(out: u8[], k: i32) {
       if globalArmScopeOk(globalStmts[gi]) {
         gArmKept = stmtArmScopeOpen(globalStmts[gi])
       }
+      order.push(globalStmts[gi])
+      orderIsInit.push(
+        globalRunsInStartFn(gi) && !lbiKeptDeclUnread(globalStmts[gi]),
+      )
       const gInitRc = emitStartGlobalInit(
         bodyExpr,
         exprPrev,
@@ -2527,6 +2543,8 @@ function emitStartBodyCode(out: u8[], k: i32) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
+      order.push(startStmts[si])
+      orderIsInit.push(false)
       if emitStmt(startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
@@ -2562,6 +2580,7 @@ function emitStartBodyCode(out: u8[], k: i32) {
   wTarget(endPrev)
 
   const outPrev = wTarget(out)
+  const outStart = out.length
   wULEB(body.length)
   // REBASE this body's statement rows off `bodyExpr` and onto the entry (D1594): the size
   // prefix is written, so `out.length` is where the body itself begins. The caller moves
@@ -2575,6 +2594,10 @@ function emitStartBodyCode(out: u8[], k: i32) {
   }
   wBytes(body)
   wTarget(outPrev)
+  // The IR shadow reads the single start body after legacy wrote it; it writes no byte.
+  if irShadowArmed() && k < 0 {
+    irShadowStart(out, outStart, spanBase, order, orderIsInit)
+  }
   return 0
 }
 
@@ -7976,6 +7999,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   boxDstShadowBegin()
   irShadowBegin()
   irRefInstall()
+  irStartPrologueHook = emitStrFillCalls
   tyHasFnMemoReset()
   identAuditBegin()
   const passDone: EmitPass[] = []

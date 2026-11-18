@@ -124,6 +124,7 @@ import {
   pushPlainWhy,
   pushPlanOf,
   shiftMaskFoldOf,
+  startStrAccMarked,
   strLitTakesAtom,
   tailIfPlainWhy,
   tplStrHoleOf,
@@ -161,6 +162,7 @@ import {
   fRecRetTy,
   fRetVoid,
   fnStmts,
+  gInitProgIdx,
   gPromoInStart,
   setIrShadowOn,
 } from "./emit_state"
@@ -657,7 +659,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     if globalRep(g, d) != rep { return irBMiss("global read coercion") }
-    const gm = irGlobalReadMiss(g, globalCtxOf(ibFnPos))
+    const gm = irGlobalReadMiss(g, ibGlobalCtx())
     if gm != "" { return irBMiss(gm) }
     const sid = sidOfNode(ix)
     return irBLetTemp(
@@ -1487,7 +1489,7 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
   const src = deliver(b, n.binRight, globalRep(g, d))
   if ibMiss != "" { return 0 }
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
-  const gm = irGlobalWriteMiss(g, globalCtxOf(ibFnPos))
+  const gm = irGlobalWriteMiss(g, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
@@ -2043,6 +2045,17 @@ function corrupt() {
 
 // The context the function at `fnStmts` slot `fnPos` accesses globals in. The start function's
 // top-level body never reaches the IR, so it is a body's.
+// The context the function being built accesses globals in: the start function's, or a body's.
+function ibGlobalCtx(): GlobalCtx {
+  if ibFnIx >= 0 { return globalCtxOf(ibFnPos) }
+  const c: GlobalCtx = {
+    gcInStart: true,
+    gcFnPos: -1,
+    gcGuardOff: ASSIGN_AS_VALUE,
+  }
+  return c
+}
+
 function globalCtxOf(fnPos: i32): GlobalCtx {
   const c: GlobalCtx = {
     gcInStart: false,
@@ -2055,7 +2068,12 @@ function globalCtxOf(fnPos: i32): GlobalCtx {
 // The dual emit of a verified function: its lowering against the legacy code entry `emitFuncCode`
 // wrote onto `out` from `outStart`, and the span rows it banked from `spanBase`. "" when they
 // match, else the mismatch class.
-function dualEmit(fnPos: i32, out: u8[], outStart: i32, spanBase: i32): string {
+function dualEmit(
+  ctx: GlobalCtx,
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+): string {
   const legacy: u8[] = []
   let i = outStart
   while i < out.length {
@@ -2067,14 +2085,7 @@ function dualEmit(fnPos: i32, out: u8[], outStart: i32, spanBase: i32): string {
     count("fail the start body reached the IR shadow")
     return "start body"
   }
-  const why = irDualEmit(
-    ib,
-    globalCtxOf(fnPos),
-    legacy,
-    spanBase,
-    outStart,
-    skew,
-  )
+  const why = irDualEmit(ib, ctx, legacy, spanBase, outStart, skew)
   if why == "" {
     count("matched")
     return ""
@@ -2133,7 +2144,7 @@ export function irShadowFn(
   }
   if v.vfRule == 0 {
     count("verified")
-    const dual = dualEmit(fnPos, out, outStart, spanBase)
+    const dual = dualEmit(globalCtxOf(fnPos), out, outStart, spanBase)
     // A function the claim rule takes must match: a claim is never a fallback.
     if dual != "" && claimable() {
       count("fail a claimable function did not match: " + dual)
@@ -2153,6 +2164,74 @@ export function irShadowFn(
       + irFnText(ib),
   )
   return 0
+}
+
+// The seam for the start function: builds the single start body from its top-level `order`
+// (an `orderIsInit` entry being a global whose initializer runs there), verifies, lowers and
+// compares it with the entry `emitStartBodyCode` wrote onto `out` from `outStart`.
+export function irShadowStart(
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+  order: i32[],
+  orderIsInit: boolean[],
+) {
+  count("fns")
+  const why = buildStart(order, orderIsInit)
+  if why != "" {
+    count("uncovered start " + why)
+    return 0
+  }
+  count("covered")
+  const v = irVerify(ib)
+  if v.vfRule != 0 {
+    count(
+      "fail rule "
+        + i32ToStr(v.vfRule)
+        + " in @start: "
+        + v.vfMsg
+        + "\n"
+        + irFnText(ib),
+    )
+    return 0
+  }
+  count("verified")
+  dualEmit(ibGlobalCtx(), out, outStart, spanBase)
+  return 0
+}
+
+// Builds the start body: each top-level statement in order, with no row of its own (legacy
+// banks a start statement's row by another kind). "" or the first miss.
+function buildStart(order: i32[], orderIsInit: boolean[]): string {
+  ib = irFnNew(-1, "@start")
+  ibFnIx = -1
+  ibFnPos = -1
+  ibMiss = ""
+  ibMisses = []
+  ibDeclVar = Map()
+  ibLoopName = []
+  ibLoopBrk = []
+  ibLoopCont = []
+  ibLabelN = 0
+  ibDepth = 0
+  ibBool = repNodeOfTy(TY_BOOL)
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  if !repIsNoValue(ibNoValue) { return "no void rep" }
+  ib.irRetRep = ibNoValue
+  ib.irRetTy = TY_NEVER
+  // The accumulator rows `strAssignInPlace` reads are the start's only while legacy just ran.
+  if startStrAccMarked() { return "string accumulator" }
+  if gInitProgIdx >= 0 { return "progress cell" }
+  const top: i32[] = []
+  let i = 0
+  while i < order.length {
+    if orderIsInit[i] { return "global initializer" }
+    stmtIn(top, order[i], NO_SIBS, -1)
+    if ibMiss != "" { return ibMiss }
+    i = i + 1
+  }
+  ib.irBody = top
+  return ibMiss
 }
 
 // The census row of the function just built: its blocker classes, sorted, or none.
