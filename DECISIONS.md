@@ -10887,6 +10887,9 @@ and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.
 
 ## An unbound type parameter defaults at the call (D4551 option (b), 2026-10-15) — D4551, D4910
 
+**Superseded 2026-11-18** by [No default type](#no-default-type-an-empty-containers-element-is-inferred-from-its-uses-2026-11-18--d4961-d4964-d4551).
+The section below records the rule the compiler implements until that ruling is built.
+
 **The rule.** An inferred call that leaves a type parameter unbound, because no parameter
 annotation of the callee names it and no type argument is written, binds it to `i32`
 (`MONO_UNBOUND_TY_PARAM_DEFAULT`, `monoDefaultUnboundTyParams` in `compiler/emit_mono.vl`). The
@@ -10935,6 +10938,82 @@ later `q.length` reads it (D4934); the caller's own list is not pushed onto, the
 pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
 (D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.
 
+
+## No default type: an empty container's element is inferred from its uses (2026-11-18) — D4961, D4964, D4551
+
+Owner rulings, 2026-11-18. They replace D4551's `i32` default.
+
+**(1) No default type.** An unresolved type parameter, or an empty container's element type, has no
+default storage type. `i32` is the default only for an integer-shaped literal that no use types as
+another number. An empty container's element type is inferred from its uses. A push inside an
+`is K[]` arm is one such use: over a list whose element type is not yet fixed, the test is
+statically known to pass, so the list is a `K[]`.
+
+```vl
+function g<V>(v: V[]) {
+  if v is f64[] { v.push(1.5) }
+  print(v.length)
+  const w = v        // an f64[]: the push above fixed it
+  print(w.length)
+}
+g([])                // 1, then 1 (D4961)
+```
+
+Where two uses contradict each other, the program is refused at check with a message that names
+both. That case is harder than inference and is left to the refusal for now.
+
+**A genuinely unconstrained empty container still runs** (owner addendum, 2026-11-18). Where
+nothing reads, writes or narrows an element, no element type is ever observed, so any concrete
+storage is correct. This is the only place a default storage survives: `i32` is acceptable, and a
+dedicated empty or `never` element rep may be better.
+
+```vl
+const foo = []
+print(foo.length)    // 0
+```
+
+**Open: the type shown for it** (hover, diagnostics). The owner is undecided between `never[]`,
+`unknown[]` and `T[]`. Recommendation: `never[]`. It says what is known, that the list holds no
+value, and `never` is assignable to every element type, so the list fits any `K[]` destination it
+could legally reach. That matches how the checker already reads an open parameter as `never` in a
+call's deferred return. `unknown[]` would claim elements of some type could be read, and would not
+be assignable to `i32[]`. `T[]` names a type parameter the program never declared.
+
+**(2) A push through an `is K[]` arm is checked by type, not storage.** The push is allowed exactly
+when the value is valid for the list's real element type. `i32[] | (1|2)[]` pushing `1` is
+accepted. `i32[] | ("A"|"B")[]` pushing `"A"` is refused, although a string-literal union is
+stored as a number. This rule is sound and admits as much as soundness allows.
+
+**What it changes.** D4551 bound an unbound parameter to `i32` and argued the choice was not
+observable, because a local of such a parameter could only be empty. D4910 and D4911 then read an
+empty receiver under an `is K[]` arm as a fresh empty `K[]`. Ruling (1) makes the arm's test the
+use that types the list, so the receiver itself is the `K[]`, inside and after the arm. D4961 and
+D4964 are its first witnesses. The census of the compiler's default sites, each classified as
+inferable, contradictory or unconstrained, comes before any build.
+
+## A union of lists handed to a generic is split by type at run time (D2772 ruling (a), 2026-11-18) — D2772, D16959
+
+**The rule.** A generic call whose argument is a union of list or map types, each member of which
+binds the type parameter cleanly, dispatches at run time on the box's tag. Each member's value goes
+to the instance that member binds, and the call's result type is the union of those instances'
+results.
+
+```vl
+function h(c: boolean, t: string) {
+  if c { return [t] }
+  return [1]
+}
+function glen<T>(xs: T[]): i32 { return xs.length }
+const q = h(true, "s")     // string[] | i32[]
+print(glen(q))             // 1: the tag picks glen<string>
+```
+
+**The cap.** At most two such arguments per call; the dispatch over two is the product of their
+members. Past two, the call keeps #9015's check refusal (D16959): a union that leaves `T` open at a
+generic list, record or map parameter.
+
+**Backlogged, not part of the ruling's build.** Where the member is statically known at the call,
+the dispatch resolves at compile time to the one instance, as an optimisation. ROADMAP.md, Backlogged.
 
 ## A parameter a call leaves open is `never` in that call's deferred return (2026-11-01) — D14802, D2803, D12581
 
