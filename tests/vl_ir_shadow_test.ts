@@ -104,8 +104,9 @@ Deno.test({
       throw new Error(`want every covered function to match legacy's bytes, got ${matched} of ${covered}`);
     }
     const plain = run(COVERED, false);
-    // Unarmed, the shipped claim records only its `claimed` rows; nothing else, and no fallback.
-    const other = [...plain.rows.keys()].filter((k) => k !== "claimed");
+    // Unarmed, the shipped claim records only its `claimed` rows (a function's, the start's);
+    // nothing else, and no fallback.
+    const other = [...plain.rows.keys()].filter((k) => k !== "claimed" && k !== "claimed start");
     if (other.length !== 0) throw new Error(`want only claimed rows unarmed, got ${other.join(", ")}`);
     if (plain.out.length !== armed.out.length || plain.out.some((b, i) => b !== armed.out[i])) {
       throw new Error(`want byte-identical output armed and unarmed (${plain.out.length} vs ${armed.out.length} bytes)`);
@@ -678,6 +679,47 @@ Deno.test({
       if (rows.get(`start uncovered ${why}`) !== 1) {
         throw new Error(`want one "start uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
+    }
+  },
+});
+
+// The start body's claim (`irClaimStart`, family `start`, stage 1 S1b): a start inside the set is
+// claimed and ships legacy's bytes; under the verifier control the claim falls back to legacy,
+// loudly. A start owing the string accumulator stays legacy's.
+const START_CLAIMED = `function note(s: string, v: i32): i32 {
+  print(s)
+  return v
+}
+const a = note("a", 1)
+let n = 2
+while n < 5 { n = n + a }
+print(n)
+`;
+Deno.test({
+  name: "ir claim: a start body inside the set is claimed and ships legacy's bytes",
+  ignore,
+  fn: () => {
+    const shipped = run(START_CLAIMED, 5);
+    if (shipped.rc !== 0) throw new Error(`want compileSrc rc 0, got ${shipped.rc}`);
+    if ((shipped.rows.get("claimed start") ?? 0) !== 1) {
+      throw new Error(`want the start claimed, got ${JSON.stringify([...shipped.rows])}`);
+    }
+    const fell = [...shipped.rows.keys()].filter((k) => k.startsWith("claim fell back"));
+    if (fell.length > 0) throw new Error(`want no claim to fall back, got ${fell.join(", ")}`);
+    const legacy = run(START_CLAIMED, 1);
+    if (legacy.out.length !== shipped.out.length || legacy.out.some((b, i) => b !== shipped.out[i])) {
+      throw new Error(`want the claimed start byte-identical to legacy (${legacy.out.length} vs ${shipped.out.length} bytes)`);
+    }
+    const broken = run(START_CLAIMED, 5, 1);
+    if ((broken.rows.get("claim fell back: verifier") ?? 0) < 1) {
+      throw new Error(`want a verifier fallback under the control, got ${JSON.stringify([...broken.rows])}`);
+    }
+    if (broken.out.length !== legacy.out.length || broken.out.some((b, i) => b !== legacy.out[i])) {
+      throw new Error(`want a fallen-back start claim to ship legacy's bytes`);
+    }
+    const acc = run(`let s = ""\nlet i = 0\nwhile i < 3 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\n`, 5);
+    if (acc.rows.has("claimed start")) {
+      throw new Error(`want a start owing the string accumulator left to legacy, got ${JSON.stringify([...acc.rows])}`);
     }
   },
 });
