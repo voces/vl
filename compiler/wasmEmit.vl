@@ -11271,19 +11271,20 @@ function exprTyIsRecord(exprIx: i32, nullable: boolean, fnIx: i32): boolean {
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
 function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32, fnIx: i32) {
-  // A union of records is unboxed into one record slot only where every arm is stored at that
-  // slot's heap; one built at the slot's own record (D15719) is no box and casts nothing.
-  if (
-    !exprRecordArmsAt(exprIx, fnIx, heapIdx)
-    && narrowedStructArmVi(exprIx, fnIx) < 0
-    && !narrowedNulStructArm(exprIx, fnIx)
-    && !exprTyIsRecord(exprIx, false, fnIx)
-    && !exprTyIsRecord(exprIx, true, fnIx)
-  ) {
-    return 0
-  }
+  if !armUnboxCastOwed(heapIdx, exprIx, fnIx) { return 0 }
   armSrcShadowNote(heapIdx, exprIx, fnIx)
   return emitArmUnboxCast(heapIdx, armUnboxNullable(exprIx, fnIx))
+}
+
+// Whether a value `narrowedArmNeedsUnbox` owes is a box to cast to `heapIdx`. A union of records is
+// one only where every arm is stored at that heap; one built at the slot's own record (D15719)
+// is no box and casts nothing.
+function armUnboxCastOwed(heapIdx: i32, exprIx: i32, fnIx: i32): boolean {
+  return exprRecordArmsAt(exprIx, fnIx, heapIdx)
+    || narrowedStructArmVi(exprIx, fnIx) >= 0
+    || narrowedNulStructArm(exprIx, fnIx)
+    || exprTyIsRecord(exprIx, false, fnIx)
+    || exprTyIsRecord(exprIx, true, fnIx)
 }
 
 // Whether the unbox of `exprIx` casts nullably: it is narrowed to `X | null`.
@@ -34958,7 +34959,13 @@ function emitLetDelivery(
   // the destination.
   if letArmOwed && !letArmCell {
     const letArmHeap = armDestHeapOf(localIsRef[slot], localStructIdx[slot])
-    if letArmHeap >= 0 {
+    // An arm the init's own type owes passes the global initializer's guard; one owed by the
+    // binding's narrowed type alone (`letInitTyIsNarrowedArm`) is a box by construction.
+    const owedByInit = narrowedArmNeedsUnbox(s.letInit, fnIx)
+    if (
+      letArmHeap >= 0
+      && (!owedByInit || armUnboxCastOwed(letArmHeap, s.letInit, fnIx))
+    ) {
       emitArmUnboxCast(
         letArmHeap,
         narrowedNulStructArm(s.letInit, fnIx) || localIsRef[slot] == "nulvariant",
