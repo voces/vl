@@ -476,7 +476,10 @@ Deno.test({
           "",
         ].join("\n"),
       );
-      const { cells } = await runMatrix(path, "substring,twice_once,extra_line,exact,twice,lines");
+      const { code, cells, out } = await runMatrix(
+        path,
+        "substring,twice_once,extra_line,exact,twice,lines",
+      );
       for (const face of ["annotated", "un-annotated"]) {
         for (const p of ["substring", "twice_once", "extra_line"]) {
           wantVerdict(cells, p, face, "WRONG", "the output is not exactly the want");
@@ -485,6 +488,11 @@ Deno.test({
           wantVerdict(cells, p, face, "RUNS", "the output is exactly the want");
         }
       }
+      // A WRONG cell ran check-clean and printed another value: clause 1, so the matrix exits 1.
+      if (!out.includes("-> wrong value    6")) {
+        throw new Error(`want the summary to count 6 wrong cells, got:\n${out}`);
+      }
+      if (code !== 1) throw new Error(`want exit 1 on a WRONG cell (clause 1), got ${code}`);
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
