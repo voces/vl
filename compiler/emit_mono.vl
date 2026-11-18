@@ -150,7 +150,6 @@ import {
 } from "./check_core_state"
 import {
   bindGenUnionShapedArmInto,
-  holePinReadOf,
   joinPinnedArmTys,
   nominalStructNameOfTy,
   nulRecListNominalName,
@@ -247,7 +246,6 @@ import {
   litUnionAliasNameOfTy,
   litUnionAliasTyOfLitTexts,
   memberTyIn,
-  mixedLitRunAliasOf,
   mkArrayTy,
   mkFuncTy,
   mkMapTy,
@@ -827,7 +825,6 @@ import {
   tyIsNumericBox,
   tyMapValOf,
 } from "./tyquery"
-import { nulNumScalarUnionName, nulNumScalarUnionRowTy } from "./check_ty_rep"
 import { tyIsWriteLandRead } from "./check_hole_pins"
 import { recLitOnlyDeclOf } from "./check_rec_fresh"
 import { recArgRepOf, recBuildTable, recBuildTyOf } from "./check_rec_rows"
@@ -1384,7 +1381,7 @@ function monoLoopVarRecordPin(ix: i32, fnIx: i32): string {
 // registering it failed.
 function monoRegisterValueUnion(ty: i32): string {
   const vn = valueUnionRetName(ty)
-  if vn == "" || monoRegisterPinUnion(vn, ty) < 0 { return "" }
+  if vn == "" { return "" }
   return vn
 }
 
@@ -2776,7 +2773,6 @@ function monoPinUnionBoxed(j: i32, refArm: boolean): i32 {
   if name == "" && refArm && monoTyHoldsRefArm(j) {
     name = monoPinSpellShaped(j)
   }
-  if name != "" { monoRegisterPinUnion(name, j) }
   return j
 }
 
@@ -2908,8 +2904,6 @@ function monoRemintCompound(n: BinExpr, target: i32, value: i32): i32 {
 // expression's type ran before the pin minted this one.
 function monoPinRecordTy(nx: i32, ty: i32) {
   nodeTyRecord(nx, ty)
-  const nun = nulNumScalarUnionName(ty)
-  if nun != "" { monoRegisterPinUnion(nun, nulNumScalarUnionRowTy(ty)) }
   return 0
 }
 
@@ -3247,7 +3241,6 @@ function monoRegisterElabJoinRows() {
         ) {
           let name = tpIfJoinPinName(st)
           if name == "" { name = monoListUnionRowName(st) }
-          if name != "" { monoRegisterPinUnion(name, st) }
         } else if (
           closed
           && t >= 0
@@ -3297,21 +3290,6 @@ function monoTyAllStringy(u: i32): boolean {
     if !s { return false }
   }
   return true
-}
-
-// Registers the box of list literal `ix`'s element at its pinned list type `pty` when its template
-// element is a join the checker kept apart, so the build finds the box row: 0, or -1 on failure.
-function monoTpJoinListElemBox(ix: i32, pty: i32): i32 {
-  const t = nodeTyIxOf(ix)
-  if t < 0 || t >= T.tys.length || pty < 0 || pty >= T.tys.length { return 0 }
-  const tt = tyAt(t)
-  if !(tt is TyArray) || !tyIsTpJoinUnion(tyElemOf(tt)) { return 0 }
-  const pl = tyAt(pty)
-  if !(pl is TyArray) || tyElemOpen(pl) { return 0 }
-  if !(tyAt(tyElemOf(pl)) is TyUnion) || tyIsLitUnion(tyElemOf(pl)) { return 0 }
-  const en = valueUnionRetName(tyElemOf(pl))
-  if en == "" { return 0 }
-  return monoRegisterPinUnion(en, tyElemOf(pl))
 }
 
 function monoCloneBodyRaw(
@@ -4052,13 +4030,6 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32) {
         const dr = elabLamDeliveredNumRet(fnIx, rs, -1)
         if dr >= 0 { return synthTypeRefOfTy(dr, -1) }
         const rnm = monoPinAnnSpelling(rs)
-        // The box a kept-apart join returns is registered here, as an instance return's is.
-        if (
-          (keptJoin || nulJoin || er >= 0)
-          && monoRegisterValuePin(rnm, rs) < 0
-        ) {
-          return -2
-        }
         if rnm != "" { return synthTypeRefOfTy(rs, -1) }
       }
     }
@@ -4347,9 +4318,6 @@ function monoPinBodyLambdasRaw(
       }
     }
   }
-  if n is BinExpr && n.binOp == "??" && monoPinHoleN.length > 0 {
-    monoHoleCoalUnion(ix)
-  }
   if n is BinExpr && n.binOp == "??" { rb = monoPinCoalListDefault(ix, rb) }
   // A `??` the checker kept apart is read at the pin wherever it goes, as its `if` is (D2846).
   if sink || (tpIfJoinAt.get(ix) ?? -1) >= 0 { rb = monoPinCoalJoin(ix, rb) }
@@ -4392,10 +4360,6 @@ function monoNumUnionOpPin(ix: i32, rb: i32): i32 {
   let nx = rb
   if nx == ix { nx = monoExprRemake(ix, monoExprKids(ix)) }
   monoPinRecordTy(nx, nu)
-  if tyIsNumUnion(nu) {
-    const vn = valueUnionRetName(nu)
-    if vn != "" { monoRegisterPinUnion(vn, nu) }
-  }
   return nx
 }
 
@@ -4449,21 +4413,6 @@ function monoEqOfTpJoin(ix: i32): boolean {
       || tyIsTpJoinUnion(nodeTyIxOf(n.binRight))
   }
   return false
-}
-
-// Registers the numeric box a hole instance's `??` at `ix` reads at the instance's holes, which
-// no template type spells when the function has several pins (D9913). A join with a reference
-// member is left to the `??` lowering's own refusal.
-function monoHoleCoalUnion(ix: i32) {
-  const t = nodeTyIxOf(ix)
-  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyVar) { return 0 }
-  const j = holePinReadOf(t, monoPinHoleN, monoPinHoleT)
-  if j < 0 || j >= T.tys.length || tyHasTyVar(j) || !tyIsNumericBox(j) {
-    return 0
-  }
-  const name = valueUnionRetName(j)
-  if name == "" { return 0 }
-  return monoRegisterPinUnion(name, j)
 }
 
 // A `??` at `ix`, rebuilt as `rb`, whose default is an open list literal: a copy whose default
@@ -4532,9 +4481,7 @@ function monoPinCoalJoin(ix: i32, rb: i32): i32 {
     // A kept-apart union of lists has its row from `monoRegisterElabJoinRows`.
     const listRow = (tpIfJoinAt.get(ix) ?? -1) >= 0 && tyUnionAllLists(j)
     const name = valueUnionRetName(j)
-    if !listRow && (name == "" || monoRegisterPinUnion(name, j) < 0) {
-      return rb
-    }
+    if !listRow && name == "" { return rb }
   }
   let nx = rb
   if nx == ix { nx = monoExprRemake(ix, monoExprKids(ix)) }
@@ -4712,7 +4659,6 @@ function monoPinRetype(ix: i32, bN: string[], bT: i32[]): i32 {
   // store's closed type on the re-made node breaks hole instances (D15259).
   const pty = monoPinnedTyOf(ix, bN, bT)
   if pty < 0 || pty == nodeTyIxOf(ix) { return ix }
-  if n is ArrayLit && monoTpJoinListElemBox(ix, pty) < 0 { return ix }
   // A join the checker kept apart is a union at the pin only as a box registered here.
   if tyIsTpJoinUnion(nodeTyIxOf(ix)) { monoPinUnionBoxed(pty, false) }
   const nx = monoExprRemake(ix, monoExprKids(ix))
@@ -8184,15 +8130,8 @@ function monoPinCanonIsUnion(ty: i32): boolean {
 // direct spelling reuses (D2657) and typed by `own`, the whole annotation (-1: `ty`). One that
 // collapses at the pin is spelled as its survivor (D7044). `shTag` names the shadow root.
 function monoPinMintedUnion(name: string, ty: i32, own: i32): string {
-  // A record the pin minted (`{ v: V | M }` at `V := string`) registers the unions it reaches, then
-  // takes a row of its own, its nested records' with it: `collectS` never saw it (D2681).
   const rt = if ty >= 0 && ty < T.tys.length { tyAt(ty) } else { tyAt(0) }
-  if rt is TyObj {
-    if tyHasTyVar(ty) { return name }
-    registerTyReachUnions(monoProgStmts, ty)
-    monoClosedRecordOwnRow(ty)
-    return name
-  }
+  if rt is TyObj { return name }
   // A list whose element is a union boxes each element, whether the union is spelled inline or
   // named by an alias: one set, one row. A nullable `boolean`, `string` or literal union element
   // is a niche, not a box.
@@ -8215,31 +8154,9 @@ function monoPinMintedUnion(name: string, ty: i32, own: i32): string {
     return name
   }
   if !monoTyHoldsRefArm(ty) { return name }
-  // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
-  if pun != "" {
-    // The registered type is the whole annotation's (`own`) at the rep its spelling collapses to.
-    const elemTy = if own >= 0 { monoAnnPinTy(monoListElemTy(own)) } else { monoListElemTy(ty) }
-    if monoRegisterPinUnion(pun, elemTy) < 0 { return name }
-    return "(" + pun + ")[]"
-  }
-  if !wu { return name }
-  monoRegisterPinUnion(name, if own >= 0 { monoAnnPinTy(own) } else { ty })
+  // A list of such a union is spelled by its element union, as a direct `(A | B)[]` is (D2678).
+  if pun != "" { return "(" + pun + ")[]" }
   return name
-}
-
-// Whether union `ty` has a literal-union arm beside a non-literal one (`K | i32`), as a member
-// or as the run of string literals an alias renders back to.
-function monoTyHoldsLitUnionArm(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const n = tyAt(ty)
-  if n is TyNullable { return monoTyHoldsLitUnionArm(n.nInner) }
-  const t = tyAt(ty)
-  if !(t is TyUnion) { return false }
-  if mixedLitRunAliasOf(t.uMembers) != "" { return true }
-  for m in t.uMembers {
-    if tyIsLitUnion(m) { return true }
-  }
-  return false
 }
 
 // Whether the union or nullable `ty` has a map or a record among its members: the arms a
@@ -8308,16 +8225,6 @@ function monoRegisterPinUnion(name: string, ty: i32) {
   // union pushes none, so unconditional re-ranking would be quadratic.
   if uVariants.length != before { return assignTags() }
   return 0
-}
-
-// Registers the value union `ty` a pin minted under its pin spelling `name`, the row `collectU`
-// never saw, for an instance's return and its parameters alike (D1042, D15170). 0 when `ty` is no
-// value union, or a union holding a map or record arm, whose spelling registers elsewhere; -1 failed.
-function monoRegisterValuePin(name: string, ty: i32): i32 {
-  if name == "" || !monoTyIsUnionOrNulUnion(ty) || monoTyHoldsRefArm(ty) {
-    return 0
-  }
-  return monoRegisterPinUnion(name, ty)
 }
 
 // Binds `typarams` into `outN` / `outT`: the explicit type arguments first, then each other one
@@ -8881,9 +8788,6 @@ function monoMakeInstanceParams(
           }
           // A literal-union arm beside a scalar (`T | i32` at `T := K`) boxes under a row too,
           // and no direct spelling minted one (D5310).
-          if monoTyHoldsLitUnionArm(nodeTyIxOf(nt)) {
-            monoRegisterPinUnion(pinName, nodeTyIxOf(nt))
-          }
           if pinTys[pj] >= 0 { monoParamPinTy.set(nt, pinTys[pj]) }
           synthed = true
         }
@@ -8953,7 +8857,6 @@ function monoMakeInstanceParams(
         && monoTyHasLitMember(pinTy)
       ) {
         const unm = monoPinAnnSpelling(pinTy)
-        if monoRegisterValuePin(unm, pinTy) < 0 { return -1 }
         if (
           unm != ""
           && unm != pinned[pj]
@@ -9350,7 +9253,6 @@ function monoInstanceRet(
       monoPinRepTyOf(pt),
     )
   }
-  if monoRegisterPinUnion(nm, r) < 0 { return -2 }
   if registerTyReachUnions(monoProgStmts, r) < 0 { return -2 }
   // A literal union spelled by its alias carries the alias's row, whose rep the name promises.
   const at = if tyIsLitUnion(r) { litUnionAliasTyOfLitTexts(tyLitMemberTexts(r)) } else { -1 }
