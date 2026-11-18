@@ -1117,7 +1117,7 @@ axis(
 // `monoRegisterInstance` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
 // Bar 2.6, not 2.5: master `b928815a` read 2.497 (0.1903G / 0.0762G); claiming the start body
 // (#9055) made the reshaped arm's 200-statement start 1.2% cheaper, while the many arm, whose
-// start misses at its first generic call, moved +0.04%: 2.529. The growth is unfiled: D16992.
+// start misses at its first generic call, moved +0.04%: 2.529. The growth is D16992.
 axis(
   "generic first instances",
   2.6,
