@@ -10991,6 +10991,30 @@ use that types the list, so the receiver itself is the `K[]`, inside and after t
 D4964 are its first witnesses. The census of the compiler's default sites, each classified as
 inferable, contradictory or unconstrained, comes before any build.
 
+## A union of lists handed to a generic is split by type at run time (D2772 ruling (a), 2026-11-18) — D2772, D16959
+
+**The rule.** A generic call whose argument is a union of list or map types, each member of which
+binds the type parameter cleanly, dispatches at run time on the box's tag. Each member's value goes
+to the instance that member binds, and the call's result type is the union of those instances'
+results.
+
+```vl
+function h(c: boolean, t: string) {
+  if c { return [t] }
+  return [1]
+}
+function glen<T>(xs: T[]): i32 { return xs.length }
+const q = h(true, "s")     // string[] | i32[]
+print(glen(q))             // 1: the tag picks glen<string>
+```
+
+**The cap.** At most two such arguments per call; the dispatch over two is the product of their
+members. Past two, the call keeps #9015's check refusal (D16959): a union that leaves `T` open at a
+generic list, record or map parameter.
+
+**Backlogged, not part of the ruling's build.** Where the member is statically known at the call,
+the dispatch resolves at compile time to the one instance, as an optimisation. ROADMAP.md, Backlogged.
+
 ## A parameter a call leaves open is `never` in that call's deferred return (2026-11-01) — D14802, D2803, D12581
 
 **The rule.** A call can leave open a type parameter that a parameter annotation names. D2803 makes
