@@ -28,6 +28,8 @@
 # `<out>.doors` ranks the classes by the lines of the drivers whose one remaining door they are,
 # split by role. Covering a door deletes its `decide` rows and the dispatch arms above them; its
 # `value` rows move to `@ir`.
+# `<out>.reentry` ranks the IR's re-entries into `emitExpr` ($REENTRY, door `@re:<name>`) by the
+# lines the claim path reaches only through each: what leaves it when the IR owns the operand.
 #
 # What the ranking cannot show (master, 2026-11): most legacy lines are reached by no door.
 #   (1) Drivers reached only from `@module`/`@start` are module passes and top-level code, which
