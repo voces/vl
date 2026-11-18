@@ -312,10 +312,6 @@ let ibFnPos = -1
 // is an assignment's re-read and the lowering's guard context is never `gcGuardOff`.
 const ASSIGN_AS_VALUE = false
 let ibMiss = ""
-// Where the statement being built began in its body (`stmtNode`), so a value `if` knows whether
-// an operand before it in that statement built a node.
-let ibStmtMark = 0
-let ibStmtAt = -1
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
@@ -541,14 +537,8 @@ function localVarAt(w: i32): i32 {
 // value writes, as `&&` and `||` build it.
 function ifExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
   if ifExprPlainKind(ix, ibFnIx) < 0 { return irBMiss("expression if") }
-  // Its value stays on the stack from here, so no temp its statement built before it may be
-  // read after it.
-  if b.length != ibStmtMark { return irBMiss("if after an operand") }
-  // An element store builds its bounds check after its value.
-  const st = if ibStmtAt >= 0 { nodeAt(ibStmtAt) } else { null }
-  if st is BinExpr && st.binOp == "=" && nodeAt(st.binLeft) is Index {
-    return irBMiss("if into an element store")
-  }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("if after an operand") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
   const ty = nodeTyAt(ix, ibFnIx)
@@ -568,14 +558,21 @@ function ifExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// Whether body `b` ends in a temp's definition, an operand still waiting to be read.
+function endsInTemp(b: i32[]): boolean {
+  if b.length == 0 { return false }
+  const id = b[b.length - 1]
+  if id < 0 || id >= ib.irNodes.length { return false }
+  const n = ib.irNodes[id]
+  if !(n is SLet) || n.lDst < 0 || n.lDst >= ib.irVars.length { return false }
+  return ib.irVars[n.lDst].vKind == "temp"
+}
+
 // The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`.
 function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
   const body: i32[] = []
   const tv = ifArmValueExpr(blockIx)
-  const mark = ibStmtMark
-  ibStmtMark = 0
   const v = deliver(body, tv, rep)
-  ibStmtMark = mark
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
@@ -1506,6 +1503,10 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   const i = irBExpr(b, t.idxIndex)
   const ln = repNodeAt(irBOpRep(v))
   if !(ln is RList) { return skip("store operand coercion") }
+  // The bounds check is built after the value, which a value `if` leaves on the stack.
+  if nodeAt(unwrapParen(n.binRight)) is IfStmt {
+    return skip("if into an element store")
+  }
   const x = deliver(b, n.binRight, ln.rlsElem)
   if ibMiss != "" { return 0 }
   if (
@@ -1680,19 +1681,7 @@ function stmtIn(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   return 0
 }
 
-// Builds statement `ix` into `b`, marking where its nodes start for `ifExpr`.
 function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
-  const mark = ibStmtMark
-  const at = ibStmtAt
-  ibStmtMark = b.length
-  ibStmtAt = ix
-  stmtNodeGo(b, ix, sibs, pos)
-  ibStmtMark = mark
-  ibStmtAt = at
-  return 0
-}
-
-function stmtNodeGo(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if ibMiss != "" { return 0 }
   const n = nodeAt(ix)
   if n is Block {
@@ -1796,7 +1785,7 @@ function stmtNodeGo(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   }
   // A parenthesised call statement is that call statement, as legacy's `emitStmt` has it.
   if n is Paren && nodeAt(unwrapParen(ix)) is Call {
-    return stmtNodeGo(b, unwrapParen(ix), sibs, pos)
+    return stmtNode(b, unwrapParen(ix), sibs, pos)
   }
   if n is Call {
     if isPopStmt(n) { return popStmt(b, n, ix) }

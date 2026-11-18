@@ -174,7 +174,7 @@ Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A returned `if` that yields its arms' values is outside the set too.
+    // A returned `if` that yields its arms' values is legacy's tail `if`, outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
@@ -186,7 +186,7 @@ print(sel(true))
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["expression if"]) {
+    for (const why of ["return of a value if"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }
