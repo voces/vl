@@ -144,6 +144,37 @@ Late rows: 394 on master, 394 after B3.1 (392 once B2f, #8989, lands).
 - Splits into B3.2a (15, 16, 11: arguments of calls through a set) and B3.2b (5, 6, 13, 14:
   handed-on parameters) if the first exceeds a reviewable size.
 
+*After B3.2a: the plan re-ordered by which family dies soonest.* Arms die per family, not per
+site: a class-T lambda set needed site 15 (the argument of a call through a set) and site 9 (the
+lambda leaf) together, so an arm goes only when the last set it decides has moved. The remaining
+stages are ordered by the late rows an arm still decides (B3.2a's re-ablation of all 19 sites, rows
+new + gone) against the lines its deletion frees. B3.3 to B3.5 above keep their producers, but they
+ship in this order:
+
+| order | arm (B3.2a site) | rows it still decides | freed when it dies |
+|---|---|---|---|
+| 1 | `ftReachHandsOne` late branch (12) | 1 | the branch |
+| 2 | `ftCloDelivered` (11) | 2 | the term, plus `mintCloDeliveryNote`'s reader |
+| 3 | `ftStoredAt` (0), `mintSeedHeldOf` (4) | 3, 3 | `ftStoredAt` 9; `mintStore*`, `mintSeedHeld*` readers |
+| 4 | `ftEscBuilt` (16), named record literals (17) | 0 rows, 2 and 1 programs that change build shape | `ftEscBuilt` 19, `ftNamedRecLits` |
+| 5 | `ftOpenFieldHolds` (18) | 10 | 33 |
+| 6 | `ftLateParamOk` (13), `ftLateArgOfSet` (14, 15) | 17, 32 + 1 | 39 + 55 + `ftLateParamTakes` 13 |
+| 7 | hand-back per instance (8) | 29 | the late `mintRetParamsOf` reads |
+| 8 | `ftHandedHolder` (19), the lambda leaf (9) | 51, 71 | the late arms; `mintLamClosed` (2) with them |
+| 9 | the refusals (2, 7) and the decider | 3 new, 21 new | B3.6 |
+
+The coordinator's bar from here on: each stage deletes an arm family outright and comes out net
+negative by more than B3.2a's +66, or the lane stops and reports. By that bar, rows 1 to 5 together
+are one stage (about 100 lines freed, 19 rows to move), and row 6 is the first single family that
+clears it alone.
+
+**The outer-hole producer opens up after B3.2.** The A0 shadow's largest open class over the late
+programs is `outer-hole`, 831 bindings: an instance nested in an instance, whose binding the check
+leaves at the encloser's hole while the elaboration keys it after substitution. Next are
+`arrow-args` (311) and `fn-value` (239). The producer substitutes each nested binding through the
+encloser's key. Under the per-set scope of the veto it is likely what B3.3 to B3.5 meet next. B3.2a's 10 sets
+opened by "open argument types" are the first to trace against it; that is not yet measured.
+
 **B3.3 — hand-back and member-call arms per key.**
 - Sites: 8 (29 rows), 9 (88 rows, the largest family).
 - Producers: `check_hand_back` per key, beyond one hole parameter; and the instance's member call
