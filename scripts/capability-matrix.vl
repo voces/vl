@@ -168,6 +168,10 @@ type Tpl = {
   ty: string,
   want: string,
   wantUnann: string,
+  // Positions whose annotated face leaves the value open too, so they read WANT_UNANNOTATED.
+  openPos: string[],
+  // A check refusal the design owes in the annotated face at every built-in position.
+  owedAnn: string,
   setup: string,
   guard: string,
   fallback: string,
@@ -260,6 +264,10 @@ function loadTpl(path: string): Tpl {
       skips[stripWs(line.slice(0, c))] = stripWs(line.slice(c + 1, line.length))
     }
   }
+  const openPos: string[] = []
+  for line in splitLines(section(s, "OPEN_POSITIONS")) {
+    if stripWs(line) != "" { openPos.push(stripWs(line)) }
+  }
   let name = basename(path)
   const ext = ".matrix.vl"
   if (
@@ -276,6 +284,8 @@ function loadTpl(path: string): Tpl {
     ty: section(s, "TYPE"),
     want: section(s, "WANT"),
     wantUnann: section(s, "WANT_UNANNOTATED"),
+    openPos: openPos,
+    owedAnn: section(s, "OWED_ANNOTATED"),
     setup: section(s, "SETUP"),
     guard: section(s, "GUARD"),
     fallback: section(s, "FALLBACK"),
@@ -924,7 +934,7 @@ function owedRefusal(t: Tpl, pos: string, face: string): string {
       return if c[4] != "" { c[4] } else if face == "ann" { c[3] } else { "" }
     }
   }
-  return ""
+  return if face == "ann" { t.owedAnn } else { "" }
 }
 
 // The built-in positions, then the template's own cells.
@@ -945,19 +955,16 @@ const TYPED_IN_BOTH_FACES = [
 ]
 
 // The output the cell at `pos` in `face` must print: its own `// want:`, else the template's,
-// with `@@WANT_UNANNOTATED@@` standing in for WANT where the un-annotated face leaves it open.
+// with `@@WANT_UNANNOTATED@@` standing in for WANT where the un-annotated face, or an
+// `@@OPEN_POSITIONS@@` position in either face, leaves it open.
 function wantFor(t: Tpl, pos: string, face: string): string {
   for c in t.cells {
     if c[0] == pos && c[2] != "" { return c[2] }
   }
   let w = t.want
-  if (
-    face == FACES[1]
-    && t.wantUnann != ""
-    && !TYPED_IN_BOTH_FACES.includes(pos)
-  ) {
-    w = t.wantUnann
-  }
+  const open = t.openPos.includes(pos)
+    || (face == FACES[1] && !TYPED_IN_BOTH_FACES.includes(pos))
+  if t.wantUnann != "" && open { w = t.wantUnann }
   if pos == "two_instances" && t.want2 != "" { return w + " then " + t.want2 }
   return w
 }
@@ -1017,13 +1024,13 @@ function gradeAll(t: Tpl, seed: string, r: Run): Map<string, Cell> {
         if detail == "" { detail = "(no output)" }
       }
       let verdict = g.verdict
-      const owed = owedRefusal(t, pos, face)
-      if (
-        owed != ""
-        && startsWith(verdict, "check refuses")
-        && contains(detail, owed)
-      ) {
-        verdict = "OWED"
+      if startsWith(verdict, "check refuses") {
+        // An owed refusal may name several spellings, one per line; any one serves.
+        for owed in splitLines(owedRefusal(t, pos, face)) {
+          if stripWs(owed) != "" && contains(detail, stripWs(owed)) {
+            verdict = "OWED"
+          }
+        }
       }
       cells[key] = { verdict: verdict, detail: detail }
     }
