@@ -1111,17 +1111,13 @@ axis(
   (d) => twoFiles(d, genPins(400, true), genPins(400, false)),
 );
 
-// 1.73 (0.116G / 0.067G fuel) against master `b05991d98`'s 5.75 (0.385G): a first instance's
-// slot write retired `buildFnMap`'s whole banked prefix, so every instance re-classified every
-// function (D3761). Still super-linear in N through the other whole-program passes of
-// `monoRegisterInstance` (300 reads 2.0, 600 reads 2.76), so a bigger pair needs its own bar.
-// Bar 2.6, not 2.5: master `b928815a` read 2.497 (0.1903G / 0.0762G); claiming the start body
-// (#9055) made the reshaped arm's 200-statement start 1.2% cheaper, while the many arm, whose
-// start misses at its first generic call, moved +0.04%: 2.529. The growth is unfiled: D16992.
+// 1.83 (0.138G / 0.075G fuel) against 2.50 before D16992's four fixes: a first instance's slot
+// write had retired the whole `fnStmts` position index, and three per-instance scans walked the
+// whole arena (D16992). Before that, 5.75 from `buildFnMap` re-classifying every function (D3761).
 axis(
   "generic first instances",
-  2.6,
-  "`buildFnMap` re-classifies the whole program per first instance of a generic (D3761).",
+  2.5,
+  "A whole-program pass or arena scan runs per first instance of a generic (D3761, D16992).",
   (d) => twoFiles(d, genFirstInsts(200, true), genFirstInsts(200, false)),
 );
 
