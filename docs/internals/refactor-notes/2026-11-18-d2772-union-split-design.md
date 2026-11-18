@@ -117,5 +117,16 @@ Combination counts:
 | grid, `u8[] \| f64[]`, 4 cells | refused by `u8`'s own storage-type refusal in the `u8[]` arm | 2 |
 | distilled corpus (9,032 modules) | 0: regress output identical with the split disabled | — |
 
-Self-compile fuel +0.6%, seed +2.3% on its baseline, late demands 10 = baseline, phase-state
-census unchanged.
+Cost against master `e7861b6fd`, both sides fixpoint seeds on one box:
+
+| | master | head | delta |
+| --- | --- | --- | --- |
+| L2 self-compile fuel | 97,646,420,625 | 97,642,747,273 | -3,673,352 (-0.004%) |
+| seed bytes | 6,711,379 | 6,716,165 | +4,786 (+0.07%) |
+
+The bytes are the nine new functions (`openArgSplitAt` 1,303, `openArgSplitArm` 1,044,
+`openArgUnionArgs` 707, `rcwPendDrop` 645, `openArgSplitOrder` 406, the rest under 125 each).
+A first cut cost +0.36% fuel, by ablation almost all of it `listTagApart` asked once per member
+of every declared union an `is` narrows (the compiler's own `Node` and `Ty` unions): it is now asked
+only of a member pair already found to be lists, inside `narFitElemsOf`. The refusal's loop runs
+only when the split's own scan found a union argument, over the same normalized arguments.
