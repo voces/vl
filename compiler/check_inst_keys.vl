@@ -38,10 +38,17 @@ import {
   arrowSetsOf,
   arrowSrcOf,
 } from "./check_arrow_facts"
-import { fnTagMembers, fnTagSetIsTagged, fnTagSetOfTy } from "./check_elab_cap"
+import {
+  elabFnSetOf,
+  elabFnSetTyMint,
+  fnTagMembers,
+  fnTagSetIsTagged,
+  fnTagSetOfTy,
+} from "./check_elab_cap"
+import { idSetOf } from "./elab_fn_id"
 import { nodeTyIxOf } from "./check_node_tys"
 import { setMemberRetAt, substTyDeepUnbanked } from "./check_relate_core"
-import { TY_NEVER, TY_VOID, mkFuncTy } from "./check_types"
+import { T, TY_NEVER, TY_VOID, TyFunc, mkFuncTy, tyAt } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 import { ekDecl, ekNames, ekTys, elabKeyStrFor, elabKeyStrs } from "./emit_elab"
 import { MONO_NEST_MAX } from "./emit_mono"
@@ -86,7 +93,7 @@ export function instKeysBuild(): i32 {
     } else if !ikRelative(r) {
       const ns: string[] = []
       const ts: i32[] = []
-      const k = ikKeyFor(d, instVecNamesAt(r), instVecTysAt(r), [], [], ns, ts)
+      const k = ikKeyFor(d, instVecNamesAt(r), ikRowTys(r), [], [], ns, ts)
       if k == "" {
         openCanon = openCanon + 1
       } else if ikBindsNothing(d, k) {
@@ -167,7 +174,7 @@ export function instKeysBuild(): i32 {
             && ikEnclosingFn(instVecIxAt(q)) == e
           ) {
             const st: i32[] = []
-            for t in instVecTysAt(q) {
+            for t in ikRowTys(q) {
               st.push(substTyDeepUnbanked(t, ens[ki], ets[ki]))
             }
             if !ikClosed(st) {
@@ -816,7 +823,7 @@ function ikOwnVars(d: i32): boolean {
 // Whether row `r` is read under an instance of its enclosing declaration: its binding is open, or
 // its callee is nested in an un-annotated or generic declaration whose names it may read.
 function ikRelative(r: i32): boolean {
-  if !ikClosed(instVecTysAt(r)) { return true }
+  if !ikClosed(ikRowTys(r)) { return true }
   const d = instVecCalleeAt(r)
   const e = ikEnclosingFn(d)
   const en = if e >= 0 && e < P.nodes.length { nodeAt(e) } else { null }
@@ -877,11 +884,49 @@ function ikReadsTyParam(f: FuncDecl, p: i32): boolean {
 }
 
 // Whether every type in `tys` is closed.
+// Whether each of `tys` is closed, or a function type carrying its identity set, which the
+// elaboration keys by that set (`Fn#d`) however open its signature.
 function ikClosed(tys: i32[]): boolean {
   for t in tys {
-    if t < 0 || tyHasTyVar(t) { return false }
+    if t < 0 || tyHasTyVar(t) && elabFnSetOf(t).length == 0 { return false }
   }
   return true
+}
+
+// Row `r`'s binding types, each hole its call hands a function value bound at that value's
+// identity set (`idSetOf`), as the elaboration binds it.
+function ikRowTys(r: i32): i32[] {
+  const tys = instVecTysAt(r)
+  const names = instVecNamesAt(r)
+  const d = instVecCalleeAt(r)
+  const cx = instVecIxAt(r)
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  const cn = if cx >= 0 && cx < P.nodes.length { nodeAt(cx) } else { null }
+  if !(f is FuncDecl) || !(cn is Call) { return tys }
+  const prefix = arrowHolePrefix(f, d)
+  const out: i32[] = []
+  let i = 0
+  while i < tys.length {
+    let t = tys[i]
+    let a = 0
+    while i < names.length && a < cn.callArgs.length {
+      if names[i] == prefix + i32ToStr(a) { t = ikIdTy(t, cn.callArgs[a]) }
+      a = a + 1
+    }
+    out.push(t)
+    i = i + 1
+  }
+  return out
+}
+
+// Open function type `t` bound from argument `ax`, carrying `ax`'s identity set where it has one.
+function ikIdTy(t: i32, ax: i32): i32 {
+  if t < 0 || t >= T.tys.length || !tyHasTyVar(t) || !(tyAt(t) is TyFunc) {
+    return t
+  }
+  if elabFnSetOf(t).length > 0 { return t }
+  const s = idSetOf(parenPeelIx(ax), 0)
+  return if s.length == 0 { t } else { elabFnSetTyMint(t, s) }
 }
 
 function ikKeyAdd(
