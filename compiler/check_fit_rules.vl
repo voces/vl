@@ -2069,6 +2069,110 @@ function recAtStoreArg(at: i32): boolean {
     && (tyAt(rt) is TyArray || tyAt(rt) is TyMap)
 }
 
+// The binding a delivered value lands in, and where in it: the whole binding, an element of a
+// list or map, or a field of a record. `null` where it lands in no binding (a parameter, a return).
+type DeliveryRoot = {
+  decl: i32,
+  part: "whole" | "elem" | "field",
+  field: string,
+}
+
+// The `DeliveryRoot` of the value `at`, read from the write scan's edge to its consumer: a binding's
+// initialiser, an assignment's right side, a `push` or `set` argument, or a literal part, which
+// lands where the literal does. One hop through a literal; deeper is `null`.
+function deliveryRoot(at: i32): DeliveryRoot | null {
+  cwIxBuild()
+  if at < 0 || !cwIxCovers(at) { return null }
+  const uk = cwIxUpKind[at]
+  const up = cwIxUp[at]
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  if uk == CW_UP_LETINIT { return { decl: up, part: "whole", field: "" } }
+  if uk == CW_UP_ASG_RHS && un is BinExpr && un.binOp == "=" {
+    const t = cwPeelValue(un.binLeft)
+    const tn = if t >= 0 && t < P.nodes.length { nodeAt(t) } else { null }
+    if tn is Ident { return deliveryRootOf(recHeldDecl(t), "whole", "") }
+    if tn is Index {
+      return deliveryRootOf(recHeldDecl(cwPeelValue(tn.idxArr)), "elem", "")
+    }
+    if tn is Member {
+      return deliveryRootOf(
+        recHeldDecl(cwPeelValue(tn.memObj)),
+        "field",
+        tn.memProp,
+      )
+    }
+    return null
+  }
+  if uk == CW_UP_ARG && recAtStoreArg(at) && un is Call {
+    const f = nodeAt(un.callFn)
+    if f is Member {
+      return deliveryRootOf(recHeldDecl(cwPeelValue(f.memObj)), "elem", "")
+    }
+    return null
+  }
+  if uk == CW_UP_ELEM || uk == CW_UP_FIELD {
+    const outer = deliveryRoot(up)
+    if outer == null || outer.part != "whole" { return null }
+    if uk == CW_UP_ELEM { return { decl: outer.decl, part: "elem", field: "" } }
+    return {
+      decl: outer.decl,
+      part: "field",
+      field: cwFieldNameOf(cwIxUpAux[at]),
+    }
+  }
+  return null
+}
+
+// A `DeliveryRoot` on binding `d`, or `null` where `d` names no binding.
+function deliveryRootOf(
+  d: i32,
+  part: "whole" | "elem" | "field",
+  field: string,
+): DeliveryRoot | null {
+  return if d >= 0 && d < P.nodes.length { { decl: d, part: part, field: field } } else { null }
+}
+
+// Closes this pass's adoption demands over the deliveries queued at their own type (`recOwnSrc`):
+// a value landing in a binding a demand adopts is delivered at the type that binding takes there,
+// so the re-check that would raise its demand a round later is not needed (D16958).
+export function recAdCloseEdges() {
+  let i = 0
+  while i < recAdPass.decl.length {
+    const d = recAdPass.decl[i]
+    for u in recOwnSrc {
+      const r = deliveryRoot(u)
+      if r != null && r.decl == d {
+        const t = recAdEdgeDst(i, r)
+        if t >= 0 { recAdoptNote(u, nodeTyIxOf(u), t) }
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The type demand `i` gives the part of its binding that root `r` names, or -1.
+function recAdEdgeDst(i: i32, r: DeliveryRoot): i32 {
+  const dst = recAdPass.dst[i]
+  if dst < 0 || dst >= T.tys.length { return -1 }
+  const elemDemand = recAdPass.elem[i]
+  return match r.part {
+    "whole" => if elemDemand { mkArrayTy(dst) } else { dst }
+    "elem" => {
+      if elemDemand { return dst }
+      const dt = tyAt(dst)
+      if dt is TyArray { tyElemOf(dt) }
+      else if dt is TyMap { tyValOf(dt) }
+      else { -1 }
+    }
+    "field" => {
+      if elemDemand { return -1 }
+      const dt = tyAt(dst)
+      if dt is TyObj { objFieldType(dt, r.field) } else { -1 }
+    }
+  }
+}
+
 // The record of `dstTy` a record of `srcTy` lands on, past null and through a union
 // (`recAdLanding`); -1 when either is -1.
 function recLandingOf(srcTy: i32, dstTy: i32): i32 {
