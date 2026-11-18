@@ -151,6 +151,23 @@ for (const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as cons
   });
 }
 
+// The element-read rows' control: a list read banks a row of its own (kind 6), and dropping the
+// lowering's must turn the match into a span mismatch.
+Deno.test({
+  name: "ir shadow: the dual emit's control 5 reports a list read's missing row",
+  ignore,
+  fn: () => {
+    const src = `function at(xs: i32[], i: i32): i32 { return xs[i] + 1 }\nprint(at([1, 2, 3], 1))\n`;
+    const ok = run(src, true);
+    if ((ok.rows.get("matched") ?? 0) !== 1) throw new Error(`want the read matched, got ${JSON.stringify([...ok.rows])}`);
+    const { rows } = run(src, true, 5);
+    const got = [...rows].filter(([k]) => k.startsWith("mismatch spans")).reduce((n, [, c]) => n + c, 0);
+    if (got !== 1 || (rows.get("matched") ?? 0) !== 0) {
+      throw new Error(`want one "mismatch spans", got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // Outside I1's set: a string coalesce whose default is no literal, a record and a valued `if` each
 // leave their function uncovered, named.
 Deno.test({
