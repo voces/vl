@@ -2645,38 +2645,29 @@ function nulStrReadRecovers(readIx: i32, fnIx: i32): boolean {
 // else return 0 for the caller's param/local/global path. `recoverIx` is the read to recover, -1
 // for the env-to-env copy building a nested closure's frame, where recovering traps a null capture.
 function emitCapturedRead(name: string, fnIx: i32, recoverIx: i32) {
-  if fnIx < 0 { return 0 }
-  if !fnNestUsed { return 0 }
+  const fi = captureSlotOf(name, fnIx)
+  if fi < 0 { return 0 }
   const fe = fnStmtsPosOf(fnIx)
-  if fe < 0 { return 0 }
-  const envIdx = fnEnvIdxOf(fe)
-  if envIdx < 0 { return 0 }
+  emitCaptureSlotRead(fe, fnEnvIdxOf(fe), fi)
+  if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
+  return 1
+}
 
+// The capture slot `name` reads from the env of capturing function `fnIx`, or -1.
+function captureSlotOf(name: string, fnIx: i32): i32 {
+  if fnIx < 0 || !fnNestUsed { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 || fnEnvIdxOf(fe) < 0 { return -1 }
   if emitPhaseReached("capsCached") && fe < capCountTbl.length {
     const start = capStartTbl[fe]
-    const cnt = capCountTbl[fe]
     let fi = 0
-    while fi < cnt {
-      if capNamesFlat[start + fi] == name {
-        emitCaptureSlotRead(fe, envIdx, fi)
-        if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
-        return 1
-      }
+    while fi < capCountTbl[fe] {
+      if capNamesFlat[start + fi] == name { return fi }
       fi = fi + 1
     }
-    return 0
+    return -1
   }
-  const caps = captureNamesOf(fe)
-  let ci = 0
-  while ci < caps.length {
-    if caps[ci] == name {
-      emitCaptureSlotRead(fe, envIdx, ci)
-      if recoverIx >= 0 { emitCapturedReadRecover(fe, name, recoverIx, fnIx) }
-      return 1
-    }
-    ci = ci + 1
-  }
-  return 0
+  return strListIndexOf(captureNamesOf(fe), name)
 }
 
 // Pushes capture `fi` of lifted function `fe`: its own parameter after the env when the
@@ -39393,15 +39384,15 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
       return 0
     }
   }
+  let arm = identReadArmOf(e, exprIx, fnIx, false)
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
   // destination's null rep from the same table a bare `null` literal does.
-  if identCellVKind(exprIx, fnIx) == "nulnone" {
-    return emitNullAt(exprIx, fnIx)
-  }
+  if arm == "nulnone" { return emitNullAt(exprIx, fnIx) }
   // A read whose most recent write is a `null` (a `let x = null` read before the write that
   // fills it) holds its storage's null, delivered at a destination of another rep as its null.
-  if isNullTy(readNarrowedTyAt(exprIx, fnIx)) {
+  if arm == "nullread" {
     if emitNullReadAtDst(exprIx, fnIx) { return 0 }
+    arm = identReadArmOf(e, exprIx, fnIx, true)
   }
   // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
   // unboxes, which would cast the receiver's own list to `K[]`.
@@ -39423,100 +39414,97 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
     return 0
   }
   const isid = sidOfNode(exprIx)
-  // a module-`const` parameter default reads its global, not a caller-local of the same
-  // name: this node is the declaration's expression, substituted into whichever frame
-  // omitted the argument, so the only hygienic reading is the declaration's own. The
-  // checker resolves the same node the same way, so the two agree by construction.
-  if isDefaultGlobalRef(exprIx) {
-    const dgIdx = globalIndexOfSid(isid)
-    if dgIdx >= 0 {
-      if emitUserGlobalGet(dgIdx) < 0 { return -1 }
+  match arm {
+    "nulnone" | "nullread" => {
+      return emitFail(
+        "emitProgram: internal: an identifier read's null arm survived its own test",
+      )
+    }
+    // A module-`const` parameter default reads its global, not a caller-local of the same name:
+    // the node is the declaration's own expression, whichever frame omitted the argument.
+    "defglobal" => {
+      if emitUserGlobalGet(globalIndexOfSid(isid)) < 0 { return -1 }
       // the same recovery the argument spelling of this read gets (D3510)
       if globalReadRecovers(isid, exprIx, fnIx) { fbRefAsNonNull() }
       return 0
     }
-  }
-  // the narrowed-arm unboxes come first (each sourcing its box through
-  // `emitUnionBoxPush`, whose capture leg reads the env field raw). A union-box cell the
-  // checker typed this read as one atom of reads unboxed: push the box, recover the `anyref`
-  // payload, cast it, and read the value-box field — `if u is i32 { print(u) }` yields the raw i32.
-  const vak = identReadAtomKindAt(exprIx, fnIx)
-  if vak >= 0 {
-    // D947 — a dead generic narrow reads `unreachable`, not a value box: a type
-    // parameter narrowed to an impossible arm type-checks, so the arm is
-    // constant-false there and would otherwise read a box that is not there.
-    if fnHasTyParams(fnIx) {
-      if unionTyHasValueKind(unionBoxTyOfRead(exprIx, fnIx), vak) == 0 {
-        fbUnreachable()
-        return 0
+    // A union-box cell the checker typed this read as one atom of reads unboxed, through
+    // `emitUnionBoxPush`: `if u is i32 { print(u) }` yields the raw i32.
+    "unbox" => {
+      const vak = identReadAtomKindAt(exprIx, fnIx)
+      // D947 — a dead generic narrow reads `unreachable`: a type parameter narrowed to an
+      // impossible arm type-checks, and its arm is constant-false there.
+      if fnHasTyParams(fnIx) {
+        if unionTyHasValueKind(unionBoxTyOfRead(exprIx, fnIx), vak) == 0 {
+          fbUnreachable()
+          return 0
+        }
       }
+      return emitValueUnionUnboxRead(exprIx, vak, fnIx)
     }
-    return emitValueUnionUnboxRead(exprIx, vak, fnIx)
-  }
-  // a union binding narrowed to a niche-repped `A | null` reads as that niche, under the
-  // storage gates `identReadsUnionBox` names (D2590).
-  const nNk = nicheReadKindAt(exprIx, fnIx)
-  if nNk >= 0 {
-    if identReadsUnionBox(e.identName, exprIx, fnIx) {
-      return emitNarrowedNicheRead(exprIx, nNk, fnIx)
+    // A union binding narrowed to a niche-repped `A | null` reads as that niche (D2590).
+    "niche" => {
+      return emitNarrowedNicheRead(exprIx, nicheReadKindAt(exprIx, fnIx), fnIx)
     }
-  }
-  // a union binding narrowed to a ref-element array arm reads unboxed to the reflist
-  // wrapper: push the box, recover the anyref payload, `ref.cast` to the arm's wrapper —
-  // the ref-array analogue of the scalar unbox above, so indexing/`.length` see the list.
-  const iCon = identReadContainerAt(exprIx, fnIx)
-  if iCon == RC_REF_LIST {
-    if identReadsUnionBox(e.identName, exprIx, fnIx) {
+    // A union binding narrowed to a ref-element list or a map arm reads unboxed to it.
+    "reflist" => {
       return emitRefArrayUnionUnboxRead(exprIx, fnIx)
     }
+    "map" => {
+      return emitMapUnionUnboxRead(exprIx, fnIx)
+    }
+    // A free variable of a capturing lifted function reads from its env, shadowing nothing.
+    "capture" => {
+      emitCapturedRead(e.identName, fnIx, exprIx)
+      return 0
+    }
+    "nonlocal" => {
+      return emitIdentNonLocalRead(e, isid, exprIx, fnIx)
+    }
+    "local" => {
+      return emitIdentLocalRead(exprIx, localIndexOf(fnIx, exprIx), fnIx)
+    }
   }
-  // a union binding narrowed to a map arm reads unboxed to the map struct ref: push the
-  // box, recover the anyref payload, `ref.cast` to the arm's map struct — the map
-  // analogue of the ref-array unbox above, so `emitMapPrep` sees the map ref directly.
-  if iCon == RC_MAP {
-    // `identReadContainerAt` answers only for a binding whose storage is the box, which an
-    // instance's narrowed parameter is though it names no union and has no chain (D16709).
-    return emitMapUnionUnboxRead(exprIx, fnIx)
-  }
-  // a captured variable (a free var of a capturing lifted function): read it from the
-  // env struct threaded as the leading param (local 0). Checked before the param/local/
-  // global paths so a capture shadows nothing. Only fires inside a capturing lifted function.
-  if emitCapturedRead(e.identName, fnIx, exprIx) == 1 { return 0 }
-  // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
-  const idx = localIndexOf(fnIx, exprIx)
-  if idx < 0 { return emitIdentNonLocalRead(e, isid, exprIx, fnIx) }
-  return emitIdentLocalRead(exprIx, idx, fnIx)
 }
 
-// Whether `emitIdentNode` reads Ident `ix`, typed as a record or an atom, through
-// `emitIdentLocalRead`: no null read, unbox or capture arm takes it. Its list overrides and
-// stand-ins, which read the body lowering's state, never type a read that is not a list.
-export function identReadsLocalPlain(e: Ident, ix: i32, fnIx: i32): boolean {
-  if identCellVKind(ix, fnIx) == "nulnone" { return false }
-  if isNullTy(readNarrowedTyAt(ix, fnIx)) { return false }
-  if isDefaultGlobalRef(ix) || identReadAtomKindAt(ix, fnIx) >= 0 {
-    return false
+// Which arm of `emitIdentNode` past its list overrides reads Ident `ix`, in the ladder's order;
+// `pastNull` once a null read found no other null to deliver. The IR reads `local` off it.
+export type IdentReadArm = "nulnone" | "nullread" | "defglobal" | "unbox" | "niche"
+  | "reflist" | "map" | "capture" | "nonlocal" | "local"
+export function identReadArmOf(
+  e: Ident,
+  ix: i32,
+  fnIx: i32,
+  pastNull: boolean,
+): IdentReadArm {
+  if identCellVKind(ix, fnIx) == "nulnone" { return "nulnone" }
+  if !pastNull && isNullTy(readNarrowedTyAt(ix, fnIx)) { return "nullread" }
+  if isDefaultGlobalRef(ix) && globalIndexOfSid(sidOfNode(ix)) >= 0 {
+    return "defglobal"
   }
-  const boxed = identReadsUnionBox(e.identName, ix, fnIx)
-  if nicheReadKindAt(ix, fnIx) >= 0 && boxed { return false }
+  if identReadAtomKindAt(ix, fnIx) >= 0 { return "unbox" }
+  if (
+    nicheReadKindAt(ix, fnIx) >= 0
+    && identReadsUnionBox(e.identName, ix, fnIx)
+  ) {
+    return "niche"
+  }
   const con = identReadContainerAt(ix, fnIx)
-  if con == RC_MAP || con == RC_REF_LIST && boxed { return false }
-  return !capturedNameIn(e.identName, fnIx) && localIndexOf(fnIx, ix) >= 0
-}
-
-// Whether `name` is a capture `emitCapturedRead` reads from the env of capturing function `fnIx`.
-function capturedNameIn(name: string, fnIx: i32): boolean {
-  if fnIx < 0 || !fnNestUsed { return false }
-  const fe = fnStmtsPosOf(fnIx)
-  if fe < 0 || fnEnvIdxOf(fe) < 0 { return false }
-  return strListHas(captureNamesOf(fe), name)
+  if con == RC_REF_LIST && identReadsUnionBox(e.identName, ix, fnIx) {
+    return "reflist"
+  }
+  if con == RC_MAP { return "map" }
+  if captureSlotOf(e.identName, fnIx) >= 0 { return "capture" }
+  return if localIndexOf(fnIx, ix) < 0 { "nonlocal" } else { "local" }
 }
 
 // The variant a box local's plain read `ix` unboxes to at a destination of that variant
 // (`emitVariantCoerce`'s box arm), or -1; a cross-tag fit owes a refusal there.
 export function narrowedBoxVariantPlain(ix: i32, fnIx: i32): i32 {
   const n = nodeAt(ix)
-  if !(n is Ident) || !identReadsLocalPlain(n, ix, fnIx) { return -1 }
+  if !(n is Ident) || identReadArmOf(n, ix, fnIx, false) != "local" {
+    return -1
+  }
   if exprVariantIndex(ix, fnIx) >= 0 || !exprUnion(ix, fnIx) { return -1 }
   const vi = narrowedStructArmVi(ix, fnIx)
   if vi < 0 || variantHasCrossTagFits(vi, ix, fnIx) { return -1 }
