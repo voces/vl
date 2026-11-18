@@ -137,3 +137,9 @@ when `diff` does. The population and the tool come from the head commit.
 Every pull_request run ends in `sweep-gate`, the status branch protection requires. Without the
 label it passes at once; with it, it passes only if `diff` succeeded (a cancelled sweep fails it).
 Adding the label re-runs the workflow (`labeled`), and removing it re-runs it green.
+
+Beside the diff, a `census` job runs `scripts/registration-census.vl --check` on the head seed over
+the distilled corpus. It is red when any program registers a union, struct or variant row once
+`registerReachRows` has made the rows final. Every compile already refuses a late union row
+(`unTyKeyPushRow`); the census also counts struct and variant rows and names each producer.
+`sweep-gate` requires both.
