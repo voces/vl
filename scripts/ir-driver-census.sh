@@ -52,68 +52,83 @@ for f in "$T"/probe/wasmEmit.vl "$T"/probe/emit_*.vl; do
   rm -f "$f.new"
   n=$(cat "$T/count")
 done
+# Mode 1 counts each driver's hits; mode 5 also records which tag (the IR, top-level code, no
+# function, or a function node) reached each driver, one bit row per tag; mode 4 counts nothing.
 {
-  echo 'let drvHit: {[i32]: i32} = Map()'
-  echo 'export let drvKeyList: i32[] = []'
-  echo '// A tag is a function node index, so a key packs its dense position instead.'
-  echo 'let drvTagIx: {[i32]: i32} = Map()'
-  echo 'let drvTagList: i32[] = []'
-  echo 'let drvInIr = false'
-  echo 'let drvFn = -1'
-  echo 'let drvStmt = -1'
-  echo '// Mode 5 keys each hit by its function, mode 1 by driver alone; mode 4 counts nothing.'
-  echo 'let drvMode = 0'
-  echo 'export function drvModeSet(m: i32) {'
-  echo '  drvMode = m'
-  echo '  return 0'
-  echo '}'
-  echo 'export function drvIr(b: boolean) {'
-  echo '  drvInIr = b'
-  echo '  return 0'
-  echo '}'
-  echo 'export function drvFnSet(x: i32) {'
-  echo '  drvFn = x'
-  echo '  return 0'
-  echo '}'
-  echo 'export function drvStmtSet(x: i32) {'
-  echo '  drvStmt = x'
-  echo '  return 0'
-  echo '}'
-  echo '// A hit keyed by its tag (0 the IR, 1 top-level code, 2 no function, 3 + n function node n) and id.'
-  echo 'export function dh(i: i32) {'
-  echo '  if drvMode == 4 { return 0 }'
-  echo '  const tag = if drvMode != 5 { 2 } else if drvInIr { 0 } else if drvStmt >= 0 { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }'
-  echo '  let d = drvTagIx[tag] ?? -1'
-  echo '  if d < 0 {'
-  echo '    d = drvTagList.length'
-  echo '    drvTagIx[tag] = d'
-  echo '    drvTagList.push(tag)'
-  echo '  }'
-  echo '  const k = d * 8192 + i'
-  echo '  const n = drvHit[k] ?? 0'
-  echo '  if n == 0 { drvKeyList.push(k) }'
-  echo '  drvHit[k] = n + 1'
-  echo '  return 0'
-  echo '}'
-  echo 'const DRV_DIGITS: string[] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]'
-  echo 'function drvItos(n: i32): string {'
-  echo '  if n < 10 { return DRV_DIGITS[n] }'
-  echo '  return drvItos(n / 10) + DRV_DIGITS[n % 10]'
-  echo '}'
-  echo "// The rows of the hits since the last flush: \`<driver id> <tag>\` and the count."
-  echo 'export function drvFlush(keys: string[], ns: i32[]) {'
-  echo '  for k in drvKeyList {'
-  echo '    const tag = drvTagList[k / 8192]'
-  echo '    const t = if tag == 0 { "@ir" } else if tag == 1 { "@start" } else if tag == 2 { "@module" } else { "f" + drvItos(tag - 3) }'
-  echo '    keys.push("drv " + drvItos(k % 8192) + " " + t)'
-  echo '    ns.push(drvHit[k] ?? 0)'
-  echo '  }'
-  echo '  drvHit = Map()'
-  echo '  drvKeyList = []'
-  echo '  drvTagIx = Map()'
-  echo '  drvTagList = []'
-  echo '  return 0'
-  echo '}'
+  echo "const DRV_N = $(wc -l < "$T/names")"
+  cat <<'PROBE'
+const DRV_W = DRV_N / 32 + 1
+let drvCnt: i32[] = []
+let drvBits: i32[] = []
+let drvTagIx: {[i32]: i32} = Map()
+let drvTagList: i32[] = []
+let drvInIr = false
+let drvFn = -1
+let drvStmt = -1
+let drvMode = 0
+export function drvModeSet(m: i32) {
+  drvMode = m
+  return 0
+}
+export function drvIr(b: boolean) {
+  drvInIr = b
+  return 0
+}
+export function drvFnSet(x: i32) {
+  drvFn = x
+  return 0
+}
+export function drvStmtSet(x: i32) {
+  drvStmt = x
+  return 0
+}
+// A hit on driver `i`: its count, and under mode 5 its tag's bit (0 IR, 1 top level, 2 none, 3 + node).
+export function dh(i: i32) {
+  if drvMode == 4 { return 0 }
+  while drvCnt.length < DRV_N { drvCnt.push(0) }
+  drvCnt[i] = drvCnt[i] + 1
+  if drvMode != 5 { return 0 }
+  const tag = if drvInIr { 0 } else if drvStmt >= 0 { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }
+  let d = drvTagIx[tag] ?? -1
+  if d < 0 {
+    d = drvTagList.length
+    drvTagIx[tag] = d
+    drvTagList.push(tag)
+    for _ in 0..DRV_W { drvBits.push(0) }
+  }
+  const w = d * DRV_W + i / 32
+  drvBits[w] = drvBits[w] | (1 << (i % 32))
+  return 0
+}
+const DRV_DIGITS: string[] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+function drvItos(n: i32): string {
+  if n < 10 { return DRV_DIGITS[n] }
+  return drvItos(n / 10) + DRV_DIGITS[n % 10]
+}
+// The rows since the last flush: `drv <id>` with its count, and `drvf <tag> <id>...` per tag.
+export function drvFlush(keys: string[], ns: i32[]) {
+  for i in 0..drvCnt.length {
+    if drvCnt[i] > 0 {
+      keys.push("drv " + drvItos(i))
+      ns.push(drvCnt[i])
+    }
+  }
+  for d in 0..drvTagList.length {
+    const tag = drvTagList[d]
+    let row = if tag == 0 { "drvf @ir" } else if tag == 1 { "drvf @start" } else if tag == 2 { "drvf @module" } else { "drvf f" + drvItos(tag - 3) }
+    for i in 0..DRV_N {
+      if (drvBits[d * DRV_W + i / 32] >> (i % 32)) & 1 == 1 { row = row + " " + drvItos(i) }
+    }
+    keys.push(row)
+    ns.push(0)
+  }
+  drvCnt = []
+  drvBits = []
+  drvTagIx = Map()
+  drvTagList = []
+  return 0
+}
+PROBE
 } > "$T/probe/drv_probe.vl"
 # The emitter's function and statement cursors, mirrored into the probe beside each assignment.
 for f in "$T"/probe/emit_*.vl; do
@@ -169,12 +184,11 @@ fi | awk -F'\t' -v mode="$mode" -v names="$T/names" '
   BEGIN { while ((getline l < names) > 0) name[i++] = l }
   /^\[ir\] / {
     h = $1; sub(/^\[ir\] /, "", h); n = h; sub(/.*: /, "", n); sub(/: [0-9]+$/, "", h)
-    if ($2 ~ /^drv /) { split(substr($2, 5), k, " "); k[1] = name[k[1]] }
-    if (mode == 1 && $2 ~ /^drv /) s[k[1]] += n
-    else if (mode == 5 && $2 ~ /^drv /) print h "\t" n "\tdrv " k[1] " " k[2]
+    if ($2 ~ /^drv /) s[name[substr($2, 5)]] += n
+    else if (mode == 5 && $2 ~ /^drvf /) print h "\t0\t" $2
     else if (mode == 4 && $2 ~ /^fnb /) print h "\t" n "\t" $2
   }
-  END { for (f in s) print "-\t" s[f] "\tdrv " f " -" }
+  END { for (f in s) print "-\t" s[f] "\tdrv " f }
 ' > "$out"
 ONE
 run() {
@@ -193,23 +207,24 @@ run 4
 
 # Hits per function, claiming off and on.
 for m in 1 5; do
-  awk -F'\t' '$3 ~ /^drv / { split(substr($3, 5), k, " "); s[k[1]] += $2 } END { for (f in s) print f "\t" s[f] }' \
+  awk -F'\t' '$3 ~ /^drv / { s[substr($3, 5)] += $2 } END { for (f in s) print f "\t" s[f] }' \
     "$T/rows$m" | sort > "$T/hits$m"
 done
 # Under the shipped claim, the doors reaching each function: every tag's blocker classes, joined.
-awk -F'\t' '
+awk -F'\t' -v names="$T/names" '
+  BEGIN { while ((getline l < names) > 0) name[c++] = l }
   FNR == NR { if ($3 ~ /^fnb /) { r = substr($3, 5); i = index(r, " "); set[$1 SUBSEP substr(r, 1, i - 1)] = substr(r, i + 1) }; next }
-  $3 ~ /^drv / {
-    split(substr($3, 5), k, " "); f = k[1]; tag = k[2]
+  $3 ~ /^drvf / {
+    m = split($3, k, " "); tag = k[2]
     if (tag ~ /^f[0-9]+$/) {
       b = set[$1 SUBSEP substr(tag, 2)]
       if (b == "") b = "?"
       if (b == "none") b = "@unclaimed covered"
-      n = split(b, parts, / \+ /)
-      for (j = 1; j <= n; j++) d[f SUBSEP parts[j]] = 1
     } else {
-      d[f SUBSEP tag] = 1
+      b = tag
     }
+    n = split(b, parts, / \+ /)
+    for (i = 3; i <= m; i++) for (j = 1; j <= n; j++) d[name[k[i]] SUBSEP parts[j]] = 1
   }
   END { for (x in d) { split(x, y, SUBSEP); print y[1] "\t" y[2] } }
 ' "$T/rows4" "$T/rows5" | sort -t$'\t' -k1,1 -k2,2 > "$T/doors"
