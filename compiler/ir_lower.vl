@@ -599,19 +599,31 @@ function boxField(r: RBoxField) {
 // `RGetField`: the record, then legacy's field read and its recover, and the read's own recover,
 // as `emitExpr` writes a member read through `emitMemVariantRead` or `emitMemStructRead`.
 function getField(r: RGetField) {
-  const fnIx = lw.irAt
   const m = nodeAt(r.gfAt)
   if !(m is Member) { return irLMiss("field node") }
-  const vi = exprVariantIndex(m.memObj, fnIx)
-  const idx = if vi >= 0 { variantFieldPlain(r.gfAt, fnIx) } else { structFieldPlain(r.gfAt, fnIx) }
-  if idx < 0 { return irLMiss("field shape") }
+  if fieldIdxAt(r.gfAt, m) < 0 { return irLMiss("field shape") }
   irLOpnd(r.gfV)
+  return fieldTail(r.gfAt, m)
+}
+
+// The plain field index member read `at` reads, or -1.
+function fieldIdxAt(at: i32, m: Member): i32 {
+  const fnIx = lw.irAt
+  return if exprVariantIndex(m.memObj, fnIx) >= 0 { variantFieldPlain(at, fnIx) } else { structFieldPlain(at, fnIx) }
+}
+
+// After a plain field read's object: the field, and the read's recovery.
+function fieldTail(at: i32, m: Member) {
+  const fnIx = lw.irAt
+  const vi = exprVariantIndex(m.memObj, fnIx)
+  const idx = fieldIdxAt(at, m)
+  if idx < 0 { return irLMiss("field shape") }
   if vi >= 0 {
-    variantFieldTail(vi, idx, r.gfAt, fnIx)
+    variantFieldTail(vi, idx, at, fnIx)
   } else {
-    structFieldTail(structIndexOfExpr(m.memObj, fnIx), idx, r.gfAt, fnIx)
+    structFieldTail(structIndexOfExpr(m.memObj, fnIx), idx, at, fnIx)
   }
-  return emitReadRecover(r.gfAt, fnIx)
+  return emitReadRecover(at, fnIx)
 }
 
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
@@ -826,8 +838,13 @@ export function irLoopHoistOpen(
   return opened
 }
 
-// A hoisted receiver's read: its variable, or the read the builder noted it may write again.
+// A hoisted receiver's read, as the builder read it: its variable, a global's read, or a plain
+// field read's object read the same way, then the field.
 function irHoistRecv(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length {
+    irLMiss("hoisted receiver node")
+    return -1
+  }
   const v = lw.irReadVar[ix] ?? -1
   if v >= 0 {
     fbLocalGet(varSlot(v))
@@ -838,7 +855,13 @@ function irHoistRecv(ix: i32): i32 {
     rhs(lw.irReadAgain[ix] ?? none, false)
     return 0
   }
-  return irLMiss("hoisted receiver read")
+  const m = nodeAt(ix)
+  if lw.irReadField.has(ix) && m is Member {
+    if irHoistRecv(m.memObj) < 0 { return -1 }
+    return fieldTail(ix, m)
+  }
+  irLMiss("hoisted receiver read")
+  return -1
 }
 
 // The depth a branch to `label` crosses from the innermost frame, or -1.
