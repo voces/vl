@@ -168,18 +168,18 @@ Deno.test({
   },
 });
 
-// Outside I1's set: a string coalesce whose default is no literal, a record and a valued `if` each
-// leave their function uncovered, named.
+// Outside the set: a string coalesce whose default is no literal, a closure parameter and a
+// valued `if` each leave their function uncovered, named.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
     // A returned `if` that yields its arms' values is outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
-function fx(p: { x: i32 }): i32 { return p.x }
+function ap(f: (x: i32) => i32): i32 { return f(4) }
 function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
 print(greet("a", "!"))
-print(fx({ x: 4 }))
+print(ap((x: i32) => x + 1))
 print(sel(true))
 `;
     const { rc, rows } = run(src, true);
