@@ -124,9 +124,8 @@ pass's loud internal check.
 - Re-ablation on B3.1: refutations at every site are 0 (site 8's 24 changed programs fall to 8,
   site 15's 64 to 11, with the same rows). Sites 10 and 21 are 0 / 0 / 0, so they are deleted. The
   other 19 still move rows.
-- L2 fuel: 96.078G against master's 96.069G measured alike (+0.01%). The re-plan saved nothing
-  measurable, because the self-compile has no late sets; the saving the design expected is not
-  there.
+- L2 fuel: 96.078G against master's 96.069G measured alike (+0.01%). Dropping the re-plan saves nothing
+  measurable on the self-compile; the saving the design expected is not there.
 - The 19 plan globals became one record (`ftP: FtRec`), so recording is one push and replay one
   assignment. Net compiler lines: +180 / −152.
 - Phase-state census ok; lint clean; `emit_mono.vl` untouched (908).
