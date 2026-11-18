@@ -591,3 +591,47 @@ print(two("a", "b"))
     }
   },
 });
+
+// `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
+// bound to a literal delivered to an atom, a function-tag leaf, a tagged call's dispatch, and a
+// delivery `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+const PRE_PATHS: [string, string][] = [
+  [
+    "atom hook",
+    `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
+  ],
+  [
+    "tag leaf",
+    `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`,
+  ],
+  [
+    "tag dispatch",
+    `function inc0(a) { return a + 1 }\nfunction half(a) { return a / 2.0 }\nconst r = { fs: [inc0] }\nconst a = r.fs\nconst v: readonly ((x: i32) => i32 | f64)[] = r.fs\nprint(v[0](3))\n`,
+  ],
+  [
+    "coercion",
+    `type Box1 = {[string]: {r: string}}[]\ntype Circle = { r: string }\nfunction thru(x: {[string]: {r: string}}[]) { return x }\nconst _sp1: Box1 = []\nfunction outer() {\n  const lv1 = Map()\n  const c = [lv1]\n  function inner() {\n    const dd = thru(c)\n    const g0 = dd\n    if g0.length > 0 {\n      const g1 = (g0[0])["k0"] ?? { r: "" }\n      if (g1).r == "seven" { print(7) } else { print(0) }\n    } else { print(0) }\n  }\n  inner()\n}\nouter()\n`,
+  ],
+];
+Deno.test({
+  name:
+    "ir shadow: a node emitExpr takes a generic pre-path for is a named miss",
+  ignore,
+  fn: () => {
+    for (const [why, src] of PRE_PATHS) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`${why}: want compileSrc rc 0, got ${rc}`);
+      const fails = failures(rows);
+      if (fails.length > 0) {
+        throw new Error(`${why}: want no failure, got:\n${fails.join("\n")}`);
+      }
+      if (!rows.has(`uncovered pre-path ${why}`)) {
+        throw new Error(
+          `${why}: want an "uncovered pre-path ${why}" row, got ${
+            JSON.stringify([...rows])
+          }`,
+        );
+      }
+    }
+  },
+});
