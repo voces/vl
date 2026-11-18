@@ -22,7 +22,12 @@ import {
 } from "./check_iface"
 import { rangeVarFits } from "./check_range_var"
 import { arrowNote } from "./check_arrow"
-import { cwIxCovers, cwPeelValue } from "./check_write_scan"
+import {
+  cwBuildFrames,
+  cwFrameOf,
+  cwIxCovers,
+  cwPeelValue,
+} from "./check_write_scan"
 import { recLitOnlyDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
 import {
@@ -414,6 +419,7 @@ import {
   holeLetWritesDisagree,
   holeLetWritesDisagreeAtCall,
   holeSlotDeliveryJudge,
+  instFreshSet,
   joinLitsFitAt,
   litLeafFitting,
   substTyDeep,
@@ -488,6 +494,7 @@ import {
   TY_I64,
   TY_NEVER,
   TY_NULL,
+  TY_OPEN,
   TY_VOID,
   TyArray,
   TyErr,
@@ -500,6 +507,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  mkArrayTy,
   mkFuncTy,
   nestParentOf,
   nwTyIxs,
@@ -524,6 +532,7 @@ import {
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
+  tyOpen,
   tyPathCycles,
   tyPathWith,
   tyReachesBrand,
@@ -1396,6 +1405,120 @@ export type SolveAt = {
 // Re-asks the callee's bounds for steps `from` to `to` of `at`, in step order; the steps whose kind
 // has a rule are walked together in body order at the first of them (`solveRules`).
 export function ifaceSolveAt(at: SolveAt, from: i32, to: i32) {
+  const fresh = instFreshOf(at.callee, at.ix)
+  if fresh.length > 0 { instFreshSet(fresh) }
+  ifaceSolveSteps(at, from, to)
+  if fresh.length > 0 { instFreshSet(Map()) }
+  return 0
+}
+
+// The empty lists callee `fn`'s body allocates still open when its first call is solved, and the
+// first call's ix. Keyed by callee, per arena.
+type InstAllocs = { first: i32, tys: i32[] }
+let instAllocs: Map<i32, InstAllocs> = Map()
+let instFreshByCall: Map<i32, Map<i32, i32>> = Map()
+let instArenaLen = 0
+
+// The fresh copies call `ix` of `fn` reads its body's containers at: none at the first call, which
+// keeps the template's own, and one fresh open list per allocation at every later call.
+function instFreshOf(fn: i32, ix: i32): Map<i32, i32> {
+  const none: Map<i32, i32> = Map()
+  if fn < 0 || fn >= P.nodes.length || ix < 0 || !(nodeAt(fn) is FuncDecl) {
+    return none
+  }
+  if T.tys.length < instArenaLen {
+    instAllocs = Map()
+    instFreshByCall = Map()
+  }
+  instArenaLen = T.tys.length
+  const a = instAllocs.get(fn)
+  if a == null {
+    const na = instAllocsOf(fn, ix)
+    instAllocs.set(fn, na)
+    return none
+  }
+  if a.first == ix || a.tys.length == 0 { return none }
+  const had = instFreshByCall.get(ix)
+  if had != null { return had }
+  const m: Map<i32, i32> = Map()
+  for t in a.tys { m.set(t, mkArrayTy(TY_OPEN)) }
+  instFreshByCall.set(ix, m)
+  return m
+}
+
+// Every empty `[]` allocated in `fn`'s body, element still open, that reaches only direct arguments
+// of calls through `fn`'s own parameters: the literal itself, or an un-annotated binding of it read
+// nowhere else. The emitter types those at the instance's callee; a list nested in a record, one
+// relayed to another hole, or a `Map()` it types from the template, so they stay shared.
+function instAllocsOf(fn: i32, first: i32): InstAllocs {
+  const r: InstAllocs = { first: first, tys: [] }
+  const f = nodeAt(fn)
+  if !(f is FuncDecl) { return r }
+  cwBuildFrames()
+  const argReads: Map<i32, i32> = Map()
+  const bound: i32[] = []
+  let ix = 0
+  while ix < cwFrameOf.length && ix < P.nodes.length {
+    const c = nodeAt(ix)
+    if cwFrameOf[ix] == fn && c is Call && c.callFn >= 0 {
+      if i32ListHas(f.fnParams, identDeclOf(c.callFn)) {
+        for a in c.callArgs {
+          const ax = parenPeelIx(a)
+          if instOpenEmptyList(ax) { r.tys.push(nodeTyIxOf(ax)) }
+          const d = if ax >= 0 && nodeAt(ax) is Ident { identDeclOf(ax) } else { -1 }
+          if (
+            d >= 0
+            && d < cwFrameOf.length
+            && cwFrameOf[d] == fn
+            && instOpenListBinding(d)
+          ) {
+            argReads.set(d, (argReads.get(d) ?? 0) + 1)
+            if !i32ListHas(bound, d) { bound.push(d) }
+          }
+        }
+      }
+    }
+    ix = ix + 1
+  }
+  for d in bound {
+    let reads = 0
+    let j = 0
+    while j < cwFrameOf.length && j < P.nodes.length {
+      if cwFrameOf[j] == fn && nodeAt(j) is Ident && identDeclOf(j) == d {
+        reads = reads + 1
+      }
+      j = j + 1
+    }
+    const ld = nodeAt(d)
+    if ld is LetDecl && reads == (argReads.get(d) ?? 0) {
+      r.tys.push(nodeTyIxOf(parenPeelIx(ld.letInit)))
+    }
+  }
+  return r
+}
+
+// Whether `ix` is an empty `[]` whose element type is still open.
+function instOpenEmptyList(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  const t = nodeTyIxOf(ix)
+  if !(n is ArrayLit) || n.arrElems.length != 0 || t < 0 || t >= T.tys.length {
+    return false
+  }
+  const tt = tyAt(t)
+  return tt is TyArray && tyOpen(tyElemOf(tt))
+}
+
+// Whether declaration `d` is an un-annotated binding initialised by an open empty `[]`.
+function instOpenListBinding(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  return n is LetDecl
+    && n.letType < 0
+    && instOpenEmptyList(parenPeelIx(n.letInit))
+}
+
+function ifaceSolveSteps(at: SolveAt, from: i32, to: i32) {
   if pinGuardArmed { pinGuardSolveStep(1) }
   let st = from
   let walked = false
