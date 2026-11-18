@@ -28,6 +28,8 @@
 # `<out>.doors` ranks the classes by the lines of the drivers whose one remaining door they are,
 # split by role. Covering a door deletes its `decide` rows and the dispatch arms above them; its
 # `value` rows move to `@ir`.
+# `<out>.reentry` ranks the IR's re-entries into `emitExpr` ($REENTRY, door `@re:<name>`) by the
+# lines the claim path reaches only through each: what leaves it when the IR owns the operand.
 #
 # What the ranking cannot show (master, 2026-11): most legacy lines are reached by no door.
 #   (1) Drivers reached only from `@module`/`@start` are module passes and top-level code, which
@@ -42,6 +44,9 @@ SEED=${1:?usage: scripts/ir-driver-census.sh <seed> [out.tsv]}
 OUT=${2:-/dev/stdout}
 VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 JOBS=${JOBS:-4}
+# The IR's re-entries into legacy's expression writer (ir-design-2026-11.md §10.1), each tagged
+# `@re:<name>` where the IR's lowering reaches a driver through it; REENTRY="" tags none.
+REENTRY=${REENTRY-emitBoxAroundHole emitStaticLitAtom loopHoistOpen forInLoopOpen mapGetOrHelperRoute strEqTail popDropTail}
 T=$(mktemp -d)
 trap '[ -n "${KEEP:-}" ] && echo "kept $T" >&2 || rm -rf "${T:?}"' EXIT
 cp -r compiler "$T/probe"
@@ -76,6 +81,9 @@ done
 # function, or a function node) reached each driver, one bit row per tag; mode 4 counts nothing.
 {
   echo "const DRV_N = $(wc -l < "$T/names")"
+  printf 'const DRV_RE: string[] = ['
+  for r in $REENTRY; do printf '"%s", ' "$r"; done
+  echo ']'
   cat <<'PROBE'
 const DRV_W = DRV_N / 32 + 1
 let drvCnt: i32[] = []
@@ -86,6 +94,17 @@ let drvInIr = false
 let drvFn = -1
 let drvStmt = -1
 let drvMode = 0
+// The re-entry (`DRV_RE`) the IR's lowering is inside, or -1.
+let drvRe = -1
+export function drvReEnter(k: i32): i32 {
+  const s = drvRe
+  drvRe = k
+  return s
+}
+export function drvReLeave(s: i32) {
+  drvRe = s
+  return 0
+}
 export function drvModeSet(m: i32) {
   drvMode = m
   return 0
@@ -108,7 +127,7 @@ export function dh(i: i32) {
   while drvCnt.length < DRV_N { drvCnt.push(0) }
   drvCnt[i] = drvCnt[i] + 1
   if drvMode != 5 { return 0 }
-  const tag = if drvInIr { 0 } else if drvStmt >= 0 { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }
+  const tag = if drvInIr && drvRe >= 0 { -1 - drvRe } else if drvInIr { 0 } else if drvStmt >= 0 { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }
   let d = drvTagIx[tag] ?? -1
   if d < 0 {
     d = drvTagList.length
@@ -142,7 +161,7 @@ export function drvFlush(keys: string[], ns: i32[]) {
   let d = 0
   while d < drvTagList.length {
     const tag = drvTagList[d]
-    let row = if tag == 0 { "drvf @ir" } else if tag == 1 { "drvf @start" } else if tag == 2 { "drvf @module" } else { "drvf f" + drvItos(tag - 3) }
+    let row = if tag < 0 { "drvf @re:" + DRV_RE[-1 - tag] } else if tag == 0 { "drvf @ir" } else if tag == 1 { "drvf @start" } else if tag == 2 { "drvf @module" } else { "drvf f" + drvItos(tag - 3) }
     let j = 0
     while j < DRV_N {
       if ((drvBits[d * DRV_W + j / 32] >> (j % 32)) & 1) == 1 { row = row + " " + drvItos(j) }
@@ -167,6 +186,36 @@ for f in "$T"/probe/emit_*.vl; do
     sed -i 's/^import { dh } from "\.\/drv_probe"$/import { dh, drvFnSet, drvStmtSet } from ".\/drv_probe"/' "$f"
   fi
 done
+# Each re-entry: a wrapper under its own name that tags what it reaches inside the IR's lowering,
+# around the renamed original.
+k=0
+for r in $REENTRY; do
+  awk -v n="$r" -v k="$k" '
+    !done && $0 ~ "^(export )?function " n "[(<]" { head = $0; inh = 1; if ($0 ~ /\{$/) { inh = 0; emit() }; next }
+    inh { head = head "\n" $0; if ($0 ~ /\{$/) { inh = 0; emit() }; next }
+    { print }
+    function emit(   h, ps, ret, args, a, m, i, nm) {
+      h = head; gsub(/\n/, " ", h)
+      ps = h; sub(/^[^(]*\(/, "", ps); ret = ps; sub(/\)[^)]*$/, "", ps); sub(/^.*\)/, "", ret); sub(/\{$/, "", ret)
+      m = split(ps, a, ","); args = ""
+      for (i = 1; i <= m; i++) { nm = a[i]; sub(/^ */, "", nm); sub(/:.*/, "", nm); if (nm != "") args = args (args == "" ? "" : ", ") nm }
+      print (h ~ /^export / ? "export " : "") "function " n "(" ps ")" ret "{"
+      print "  const drvRs = drvReEnter(" k ")"
+      print "  const drvR = " n "DrvGo(" args ")"
+      print "  drvReLeave(drvRs)"
+      print "  return drvR"
+      print "}"
+      h = head; sub("^(export )?function " n, "function " n "DrvGo", h); print h
+      done = 1
+    }
+    END { if (!done) { print "ir-driver-census: re-entry " n " not found" > "/dev/stderr"; exit 1 } }
+  ' "$T/probe/wasmEmit.vl" > "$T/w.vl"
+  mv "$T/w.vl" "$T/probe/wasmEmit.vl"
+  k=$((k + 1))
+done
+if [ -n "$REENTRY" ]; then
+  sed -i 's/^import { \(.*\) } from "\.\/drv_probe"$/import { \1, drvReEnter, drvReLeave } from ".\/drv_probe"/' "$T/probe/wasmEmit.vl"
+fi
 # Flush the counts into the shadow's rows, which the host prints as `[ir]` lines.
 awk '
   /^export function irShadowRowCount\(\) \{ return ibRowKey.length \}$/ {
@@ -295,4 +344,25 @@ if [ "$OUT" != /dev/stdout ]; then
       for (d in l) print l[d] "\t" n[d] "\t" r[d SUBSEP "decide"] + 0 "\t" r[d SUBSEP "value"] + 0 "\t" r[d SUBSEP "ast"] + 0 "\t" d
     }' "$T/table" | sort -rn \
     | { printf 'lines\tfunctions\tdecide\tvalue\tast\tdoor\n'; cat; } > "$OUT.doors"
+fi
+
+# Each re-entry's reach under the claim: the drivers the IR's lowering hits through it, those of
+# them the IR reaches through nothing else (no `@ir`, no other re-entry), which leave the claim
+# path when the IR owns the operand, and those of them no unclaimed body or module pass reaches.
+if [ "$OUT" != /dev/stdout ] && [ -n "$REENTRY" ]; then
+  awk -F'\t' 'NR > 1 && $3 > 0 {
+      n = split($6, d, / \+ /); ir = 0; k = 0
+      for (i = 1; i <= n; i++) {
+        if (d[i] == "@ir") ir = 1
+        else if (d[i] ~ /^@re:/) { k++; re[k] = substr(d[i], 5) }
+      }
+      for (j = 1; j <= k; j++) {
+        x = re[j]; rl[x] += $5; rn[x]++
+        if (!ir && k == 1) { cl[x] += $5; cn[x]++; if (n == 1) { fl[x] += $5; fn[x]++ } }
+      }
+    }
+    END {
+      for (x in rl) print cl[x] + 0 "\t" cn[x] + 0 "\t" fl[x] + 0 "\t" fn[x] + 0 "\t" rl[x] "\t" rn[x] "\t" x
+    }' "$T/table" | sort -rn \
+    | { printf 'leaves_claim_lines\tleaves_claim\tfreed_lines\tfreed\treach_lines\treach\treentry\n'; cat; } > "$OUT.reentry"
 fi
