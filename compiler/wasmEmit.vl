@@ -4992,15 +4992,28 @@ function listNeedsDiscrim(vis: i32[]): boolean {
 function emitListFitIs(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
+  return emitListFitAt(nd.isObj, isVarTyIxOf(isIx), isIx, -1, fnIx)
+}
+
+// The fit test of list `recv` against `chk`, leaving 1 or 0, with `recv` read from scratch
+// slot `stash` when it is one, else emitted. 0 when the test is not that shape, 1 when
+// emitted, -1 when refused at `anchor`.
+function emitListFitAt(
+  recv: i32,
+  chk: i32,
+  anchor: i32,
+  stash: i32,
+  fnIx: i32,
+): i32 {
   // A generic receiver tests its instance's type, or only its rep where the instance names no
   // type; a nullable one is false on null.
-  const instTy = listIsRecvTyOf(nd.isObj, fnIx)
-  const nullable = nodeTyIsNullable(nd.isObj)
+  const instTy = listIsRecvTyOf(recv, fnIx)
+  const nullable = nodeTyIsNullable(recv)
   const recvTy = if nullable { nonNullTy(instTy) } else { instTy }
   const layers: i32[] = []
-  const lit = listFitLitLeafOf(isVarTyIxOf(isIx), recvTy, layers)
+  const lit = listFitLitLeafOf(chk, recvTy, layers)
   if lit < 0 { return 0 }
-  const rep = exprListRep(nd.isObj, fnIx)
+  const rep = exprListRep(recv, fnIx)
   if (
     recvTy < 0
     && rep != "list"
@@ -5012,7 +5025,7 @@ function emitListFitIs(isIx: i32, fnIx: i32): i32 {
   }
   const depth = layers.length - 1
   const slots: i32[] = []
-  const scalar = listFitScalarOf(nd.isObj, rep, layers, slots, isIx, fnIx)
+  const scalar = listFitScalarOf(recv, rep, layers, slots, anchor, fnIx)
   if scalar == "" { return -1 }
   const scalarKind: ListKind = if scalar == "str" { "strlist" } else if scalar == "i64" { "i64list" } else { "list" }
   const scalarV: VKind = if scalar == "str" { "str" } else if scalar == "i64" { "i64" } else { "i32" }
@@ -5041,10 +5054,11 @@ function emitListFitIs(isIx: i32, fnIx: i32): i32 {
   if leafKind == "" || lexes.length == 0 {
     return emitFailAt(
       "emitProgram: `is` over a list tests its elements against a literal set this element type has no compare for",
-      isIx,
+      anchor,
     )
   }
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  if stash >= 0 { fbLocalGet(stash) }
+  else if emitExpr(recv, fnIx) < 0 { return -1 }
   if (
     emitListFitLoop(
       slots,
@@ -25490,10 +25504,14 @@ function emitAsNulNiche(e: AsExpr, fnIx: i32) {
   const obj = e.asObj
   const payload = nulRefNichePayloadTy(nodeTyAt(obj, fnIx))
   if payload < 0 {
+    // Names the operand's own shape: a `| null` niche only when the operand is nullable.
+    const what = if nodeTyIsNullable(obj) { "this `| null` is a value niche whose null is a spare scalar" } else { "this union is stored unboxed" }
     return emitFailAt(
       "emitProgram: `as "
         + e.asTy
-        + "` needs a BOXED union operand or a nullable-REF one; this `| null` is a value niche whose null is a spare scalar, with neither a tag nor a ref to test",
+        + "` needs a BOXED union operand or a nullable-REF one; "
+        + what
+        + ", with neither a tag nor a ref to test",
       obj,
     )
   }
@@ -25768,7 +25786,11 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
   const tgt = e.asTy
   // A niche-repped operand carries no tag, so none of the tag machinery below applies to
   // it: the arm test is the null test, and the whole trio shares one lowering.
-  if !exprUnion(obj, fnIx) { return emitAsNulNiche(e, fnIx) }
+  if !exprUnion(obj, fnIx) {
+    const ol = emitAsOneListCast(e, _exprIx, fnIx)
+    if ol != 0 { return if ol < 0 { -1 } else { 0 } }
+    return emitAsNulNiche(e, fnIx)
+  }
   // the target arm's type is the cast node's own recorded type, the checker's proof; for
   // `as?` the node's type is `T | null`, so it is peeled to recover `T` — without the peel
   // the tag and heap derive from the wrong type.
@@ -25839,6 +25861,71 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
     wi = wi + 1
   }
   return emitAsUnionTail(e, subUnion, armVi, ak, mapHeap)
+}
+
+// The cast of `e` over a union of lists stored as its one list (`oneListUnionRender`), which
+// has no tag: the whole list always fits, and a narrower target fits when every element does,
+// by `is`'s own element test. 0 when the cast is not that shape, 1 when emitted, -1 on failure.
+function emitAsOneListCast(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
+  const obj = e.asObj
+  const nullable = nodeTyIsNullable(obj)
+  const oty0 = nodeTyAt(unwrapParen(obj), fnIx)
+  const oty = if nullable { nonNullTy(oty0) } else { oty0 }
+  if oneListUnionRender(oty) == "" { return 0 }
+  const tty = if e.asMode == "null" { tyPeelNul(nodeTyIxOf(exprIx)) } else { nodeTyIxOf(exprIx) }
+  const heap = listArmHeapOf(tty)
+  const rep = exprListRep(obj, fnIx)
+  if (
+    heap < 0
+    || rep != "list" && rep != "i64list" && rep != "strlist" && rep != "reflist"
+  ) {
+    return 0
+  }
+  if emitExpr(obj, fnIx) < 0 { return -1 }
+  if isWholeOfOneListUnion(oty, tty) && !nullable { return 1 }
+  const key = if rep == "reflist" { refListSlotOfExpr(obj, fnIx) } else { 0 }
+  const lk: ListKind = if rep == "list" { "list" } else if rep == "i64list" { "i64list" } else if rep == "strlist" { "strlist" } else { "reflist" }
+  const st = scratchSlot(46, lk, key, SCRATCH_BY_BOTH)
+  fbLocalSet(st)
+  // The whole list fits whenever the operand is a list; a nullable one misses on null.
+  let fit = 1
+  if isWholeOfOneListUnion(oty, tty) {
+    fbLocalGet(st)
+    fbRefIsNull()
+    fbI32Eqz()
+  } else {
+    fit = emitListFitAt(obj, tty, exprIx, st, fnIx)
+  }
+  if fit < 0 { return -1 }
+  if fit == 0 {
+    return emitFailAt(
+      "emitProgram: `as "
+        + e.asTy
+        + "` over a union of lists stored as one list tests its elements, and this target has no element test",
+      exprIx,
+    )
+  }
+  if e.asMode == "null" {
+    fbIfRefNul(heap, true)
+    fbLocalGet(st)
+    fbElse()
+    fbRefNull(heap)
+    fbEnd()
+    return 1
+  }
+  fbI32Eqz()
+  fbIf(64)
+  if e.asMode == "trap" {
+    fbUnreachable()
+  } else {
+    fbLocalGet(st)
+    if !nullable { fbRefAsNonNull() }
+    fbReturn()
+  }
+  fbEnd()
+  fbLocalGet(st)
+  fbRefAsNonNull()
+  return 1
 }
 
 // The cast of `e` to list type `tty` over a box whose list arms `emitListIsAcrossReps` tests by
