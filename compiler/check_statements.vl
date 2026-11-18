@@ -260,6 +260,7 @@ import {
   narrowFreshBinding,
   pinIterKey,
   pinOpenReadFromDest,
+  pinOpenRowFromDest,
   popScope,
 } from "./check_narrow_flow"
 import {
@@ -383,9 +384,11 @@ import {
 import { breakValueAt, joinLeavesOf } from "./check_unconsumed"
 import {
   cwBindingOnlyRead,
+  cwBindingReadTyped,
   cwFollowCalls,
   cwFollowEnd,
   cwLetUnwritten,
+  cwLoopVarTypedLet,
   cwSoleReadInit,
   fnDeclIx,
 } from "./check_write_scan"
@@ -966,7 +969,13 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
   // top-level writes after this body still pin, and its own declaration flushes (D16364).
   const later = ini is Ident
     && globalBeforeDecl(parenPeelIx(n.letInit), ini.identName)
-  if unresolvedHole(bound) && cwBindingOnlyRead(ix) && !later {
+  // A read delivered to a typed destination fixes the element there instead (`pinOpenReadFromDest`).
+  if (
+    unresolvedHole(bound)
+    && cwBindingOnlyRead(ix)
+    && !later
+    && !cwBindingReadTyped(ix)
+  ) {
     defaultReadOnlyContainer(bound)
   }
   const om: i32[] = [-1]
@@ -1739,6 +1748,20 @@ export function checkForRangeNode(n: ForRange, ix: i32) {
   popReBarrier()
   return res
 }
+// Pins an open list the `for` loop at `lp` walks to the annotated type its element variable is
+// read into (DECISIONS.md "No default type"), so the variable binds there.
+function forInPinFromTypedRead(lp: i32, iterTy: i32) {
+  if !unresolvedHole(iterTy) { return 0 }
+  const dl = cwLoopVarTypedLet(lp)
+  const d = if dl >= 0 { nodeAt(dl) } else { nodeAt(0) }
+  if !(d is LetDecl) || d.letType < 0 { return 0 }
+  const tn = nodeAt(d.letType)
+  if !(tn is TypeRef) { return 0 }
+  let t = letAnnHeldTyAt(d.letType)
+  if t < 0 { t = nameToTyAt(tn.tyName, d.letType) }
+  return pinOpenRowFromDest(iterTy, t)
+}
+
 // ── for v in iterable ───────────────────────────────────────────────────────
 // A for-in loop over an array: the loop variable binds to the element type.
 
@@ -1761,6 +1784,7 @@ export function checkForInNode(n: ForIn, ix: i32) {
     notePending("the iterated list", iterTy, n.fiIter)
   }
   pinIterKey(iterTy)
+  forInPinFromTypedRead(ix, iterTy)
   let elemTy = forInBindTy(iterTy, false)
   let elem2Ty = forInBindTy(iterTy, true)
   const it = tyAt(iterTy)
