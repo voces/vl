@@ -152,8 +152,8 @@ whole, and an arm goes only when its last family has moved.
 programs is `outer-hole`, 831 bindings: an instance nested in an instance, whose binding the check
 leaves at the encloser's hole while the elaboration keys it after substitution. Next are
 `arrow-args` (311) and `fn-value` (239). The producer substitutes each nested binding through the
-encloser's key. Under the per-set scope of the veto it is what B3.3 to B3.5 meet next: an arrow
-row inside such an instance is open (B3.2a's "open argument types", 10 of site 15's sets).
+encloser's key. Under the per-set scope of the veto it is likely what B3.3 to B3.5 meet next. B3.2a's 10 sets
+opened by "open argument types" are the first to trace against it; that is not yet measured.
 
 **B3.3 — hand-back and member-call arms per key.**
 - Sites: 8 (29 rows), 9 (88 rows, the largest family).

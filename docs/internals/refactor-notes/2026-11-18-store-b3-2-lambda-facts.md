@@ -8,7 +8,7 @@ set moves to check only where every arrow row reaching it is closed, by the deci
 
 A probe on the 44 rows `ftLateArgOfSet` (site 15) decides gave the check's reason per set:
 - 15 sets: the only open row is a lambda member's (`arrowNamedMembers`);
-- 13 sets: never tried at check (they exist only at instance calls);
+- 13 sets: never tried at check (no `ftTry` at check reached them; why is not yet traced);
 - 10 sets: open argument types;
 - 6 sets: a body not keyed per set.
 
