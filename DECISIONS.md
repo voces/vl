@@ -10887,6 +10887,9 @@ and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.
 
 ## An unbound type parameter defaults at the call (D4551 option (b), 2026-10-15) — D4551, D4910
 
+**Superseded 2026-11-18** by [No default type](#no-default-type-an-empty-containers-element-is-inferred-from-its-uses-2026-11-18--d4961-d4964-d4551).
+The section below records the rule the compiler implements until that ruling is built.
+
 **The rule.** An inferred call that leaves a type parameter unbound, because no parameter
 annotation of the callee names it and no type argument is written, binds it to `i32`
 (`MONO_UNBOUND_TY_PARAM_DEFAULT`, `monoDefaultUnboundTyParams` in `compiler/emit_mono.vl`). The
@@ -10935,6 +10938,41 @@ later `q.length` reads it (D4934); the caller's own list is not pushed onto, the
 pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
 (D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.
 
+
+## No default type: an empty container's element is inferred from its uses (2026-11-18) — D4961, D4964, D4551
+
+Owner rulings, 2026-11-18. They replace D4551's `i32` default.
+
+**(1) No default type.** An unresolved type parameter, or an empty container's element type, has no
+default storage type. `i32` is the default only for an integer-shaped literal that no use types as
+another number. An empty container's element type is inferred from its uses. A push inside an
+`is K[]` arm is one such use: over a list whose element type is not yet fixed, the test is
+statically known to pass, so the list is a `K[]`.
+
+```vl
+function g<V>(v: V[]) {
+  if v is f64[] { v.push(1.5) }
+  print(v.length)
+  const w = v        // an f64[]: the push above fixed it
+  print(w.length)
+}
+g([])                // 1, then 1 (D4961)
+```
+
+Where two uses contradict each other, the program is refused at check with a message that names
+both. That case is harder than inference and is left to the refusal for now.
+
+**(2) A push through an `is K[]` arm is checked by type, not storage.** The push is allowed exactly
+when the value is valid for the list's real element type. `i32[] | (1|2)[]` pushing `1` is
+accepted. `i32[] | ("A"|"B")[]` pushing `"A"` is refused, although a string-literal union is
+stored as a number. This rule is sound and admits as much as soundness allows.
+
+**What it changes.** D4551 bound an unbound parameter to `i32` and argued the choice was not
+observable, because a local of such a parameter could only be empty. D4910 and D4911 then read an
+empty receiver under an `is K[]` arm as a fresh empty `K[]`. Ruling (1) makes the arm's test the
+use that types the list, so the receiver itself is the `K[]`, inside and after the arm. D4961 and
+D4964 are its first witnesses. The census of the compiler's default sites, each classified as
+inferable, contradictory or unconstrained, comes before any build.
 
 ## A parameter a call leaves open is `never` in that call's deferred return (2026-11-01) — D14802, D2803, D12581
 
