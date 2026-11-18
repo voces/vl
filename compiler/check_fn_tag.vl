@@ -396,7 +396,6 @@ export function fnTagDecide(rootIx: i32) {
   ftLetElemCalls = Map()
   if !ftLate {
     ftCheckLen = P.nodes.length
-    ftLateRefused = []
     ftRetryRefused = []
     ftLateRan = false
     ftCheckTagged = []
@@ -427,6 +426,16 @@ export function fnTagDecide(rootIx: i32) {
   // Sets of two or more first: a one-member set whose member is a leaf of one of their joins
   // follows that set's decision.
   const seen: i32[] = []
+  // After the elaboration, the check's sets are committed first: their decision is the check's,
+  // and the late pass builds their arms at the instances' calls.
+  if ftLate {
+    for s0 in ftCheckTagged {
+      if !i32ListHas(seen, s0) {
+        seen.push(s0)
+        ftTry(rootIx, s0, calls, mint)
+      }
+    }
+  }
   let pass = 0
   while pass < 2 {
     for c in calls {
@@ -649,10 +658,10 @@ let ftEscDstLast: i32[] = []
 let ftLate = false
 let ftWas: i32[] = []
 
-// Decides every set again once the elaboration has noted each instance's calls through a set
-// (`elabMintFacts`): 0 when it tags the sets the last decision did, 1 when it tags more, 2 when it
-// leaves one of those untagged, which the rounds' bound relies on never happening; 10 more when it
-// tags a set the check refused with every call's facts (a second decider).
+// Decides again once the elaboration has noted each instance's calls through a set (`elabMintFacts`),
+// the check's sets first: 0 when it tags the sets the last decision did, 1 when it tags more, 10
+// more when it tags a set the check refused with every call's facts, 20 when it refutes one the
+// check decided (each a second decider).
 export function fnTagRedecide(rootIx: i32): i32 {
   ftWas = fnTagTaggedSets()
   if !ftLateRan {
@@ -665,15 +674,11 @@ export function fnTagRedecide(rootIx: i32): i32 {
   ftLate = false
   while T.diags.length > d0 { T.diags.pop() }
   const now = fnTagTaggedSets()
-  let dropped = false
-  for w in ftWas {
-    if !i32ListHas(now, w) {
-      if !i32ListHas(ftLateRefused, w) { ftLateRefused.push(w) }
-      dropped = true
-    }
+  // A set the check decided is final: the late inputs refuting one is a second decider.
+  for w in ftCheckTagged {
+    if !i32ListHas(now, w) { return 20 }
   }
   const second = if ftLateOutsideExclusions() >= 0 { 10 } else { 0 }
-  if dropped { return 2 + second }
   return second + (if now.length > ftWas.length { 1 } else { 0 })
 }
 
@@ -681,17 +686,14 @@ export function fnTagRedecide(rootIx: i32): i32 {
 let ftCheckTagged: i32[] = []
 let ftLateRan = false
 
-// One row per set the decisions after the elaboration tagged or untagged against the check's:
-// `tag <class> <members>` or `untag <class> <members>`, the class `setBindTryClass`'s.
+// One row per set the decisions after the elaboration tagged beyond the check's:
+// `tag <class> <members>`, the class `setBindTryClass`'s.
 export function fnTagLateRows(): string[] {
   const out: string[] = []
   if !ftLateRan { return out }
   const now = fnTagTaggedSets()
   for s in now {
     if !i32ListHas(ftCheckTagged, s) { out.push("tag " + ftLateRowOf(s)) }
-  }
-  for s in ftCheckTagged {
-    if !i32ListHas(now, s) { out.push("untag " + ftLateRowOf(s)) }
   }
   return out
 }
@@ -737,10 +739,6 @@ function ftStoredAt(v: i32, s: i32): boolean {
     || st >= 0 && i32ListHas(ftAssume, st) && fnTagMembersWithin(s, st)
 }
 
-// The sets a decision after the elaboration left untagged once an earlier one had tagged them:
-// they stay untagged, so the rounds settle where tagging a set refutes itself (D15484).
-let ftLateRefused: i32[] = []
-
 // Tags set `s` when every node carrying it is a place an id can stand, and builds each call's
 // member calls. A read of a smaller set stored where `s` is held is decided with it: both are
 // tagged or neither, since the store hands the smaller set's id on as one of `s`.
@@ -776,7 +774,6 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
 // `ftTry` reading facts `mint`.
 function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   if fnTagSetIsTagged(s) { return 0 }
-  if ftLate && i32ListHas(ftLateRefused, s) { return 0 }
   ftPlReset()
   ftCloAt = []
   ftCloTy = []
@@ -5372,6 +5369,18 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return pn.fnBody == x && rcwInferredRetTy(p) == tx
     }
     Call => {
+      // Before the elaboration, a list seeded with fewer of the set's members than the set, handed
+      // to a hole parameter whose callee writes into it, holds a wider set in that instance than
+      // its own; one whose members agree there stays closures (`mintSetPartial`).
+      if (
+        !ftLate
+        && ftHoleArg(pn, x)
+        && !fnTagSetSplits(s)
+        && ftSeededNarrower(x, s)
+        && ftArgSlotWritten(pn, x)
+      ) {
+        return false
+      }
       // A binding, or a named function's result, handed to a hole parameter binds it to that
       // value's own type, and the callee's writes through it join this set (D14648, D15430).
       // Before the elaboration, a literal is held so only where the callee does not hand it back.
@@ -6284,6 +6293,59 @@ function ftArgHandedBack(c: Call, x: i32): boolean {
   while i < c.callArgs.length {
     if c.callArgs[i] == x { return i32ListHas(back, i) }
     i = i + 1
+  }
+  return false
+}
+
+// Whether the callee of call `c` writes an element or a field of the binding argument `x` reads,
+// through the parameter it is handed to (`cwSlotWrittenValues`, which follows the alias).
+function ftArgSlotWritten(c: Call, x: i32): boolean {
+  const v = parenPeelIx(x)
+  const b = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identDeclOf(v) } else { -1 }
+  const callee = identFnDeclOf(parenPeelIx(c.callFn))
+  if b < 0 || callee < 0 { return false }
+  const paths: string[] = ["[]"]
+  const t = nodeTyIxOf(v)
+  const tt = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if tt is TyObj {
+    for nm in tt.objFieldNames { paths.push(nm) }
+  }
+  for nm in paths {
+    const vals: i32[] = []
+    const ats: i32[] = []
+    cwSlotWrittenValues(cwKeyOfDecl(b), [nm], vals, ats)
+    for at in ats {
+      if ftWithinDecl(at, callee) { return true }
+    }
+  }
+  return false
+}
+
+// Whether `x` names a binding initialised with a list literal whose elements name fewer of set
+// `s`'s members than `s` has.
+function ftSeededNarrower(x: i32, s: i32): boolean {
+  const v = parenPeelIx(x)
+  const b = if v >= 0 && v < P.nodes.length && nodeAt(v) is Ident { identDeclOf(v) } else { -1 }
+  const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { null }
+  const li = if bn is LetDecl { parenPeelIx(bn.letInit) } else { -1 }
+  const ln = if li >= 0 && li < P.nodes.length { nodeAt(li) } else { null }
+  if !(ln is ArrayLit) { return false }
+  const named: i32[] = []
+  for e in ln.arrElems {
+    const ex = parenPeelIx(e)
+    const ed = if ex >= 0 && ex < P.nodes.length && nodeAt(ex) is Ident { identFnDeclOf(ex) } else { -1 }
+    if ed < 0 { return false }
+    if !i32ListHas(named, ed) { named.push(ed) }
+  }
+  return named.length > 0 && named.length < fnTagMembers(s).length
+}
+
+// Whether node `x` sits in the body of declaration `d`.
+function ftWithinDecl(x: i32, d: i32): boolean {
+  let p = if x >= 0 && x < cwIxParent.length { cwIxParent[x] } else { -1 }
+  while p >= 0 && p < P.nodes.length {
+    if p == d { return true }
+    p = if p < cwIxParent.length { cwIxParent[p] } else { -1 }
   }
   return false
 }
