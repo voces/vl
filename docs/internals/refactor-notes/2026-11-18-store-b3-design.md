@@ -88,23 +88,30 @@ Every stage meets the standing bars:
 - the late-tags baseline written from a fixpoint seed, with the retired rows quoted;
 - the late code it makes dead re-ablated and deleted in the same PR.
 
-**B3.1 — replay, not re-plan.** At late, every set tagged before the round (`ftWas`, which holds the
-check's sets) is kept tagged instead of being undecided and re-planned. A set's tags only grow
-across rounds, so this is safe. Its arms at the instance calls are built from the mint rows by
-`ftBuildArmsAt`, with no `ftPlan`. The late decider then sees only sets nobody has tagged.
+**B3.1 — replay, not re-plan.** At check, each plan that tags its sets is kept as a record of
+everything the apply step reads (`FtRec`: the plan rows, held lists, closure, map and store
+literals, written literals). At late, `fnTagUndecide` still clears the tables. Then each of the
+check's records is applied again (`ftReplay` then `ftApply`), with the round's mint rows, so its
+arms at the instance calls are built by `ftBuildArmsAt` with no `ftPlan`. The late decider plans
+only sets the check did not tag.
+
+*As built:* only the check's records are replayed. A set an earlier late round tagged is still
+decided again each round. A first draft also replayed late-round records, and that moved one
+program: `functions/hole-and-closed-function-handed-to-one-slot-through-a-list-runs.vl` gained
+`tag P {id}`. Its witness (D15484) settles untagged because a later round refutes that late tag. So
+the `i32ListHas(ftWas, s)` exemptions at sites 7, 11, 14 and 17 stay live, for late-round sets, and
+go with the decider in B3.6.
 
 Deletes:
 - the re-commit loop in `fnTagDecide`;
-- code 20: `fnTagRedecide`'s check-set loop, `elabPrepare`'s `refuted` path and its `emitFail`;
-- the `i32ListHas(ftWas, s)` exemptions at sites 7, 11, 14 and 17, which are dead once no
-  tagged set reaches `ftPlan`;
-- sites 21 and 10 if re-ablation shows them dead;
+- the refutation test, `fnTagRedecide`'s check-set loop (code 20's old meaning);
+- sites 10 and 21, which re-ablation on B3.1 shows dead (0 changed, 0 rows);
 - the re-commit halves of 6, 8, 15 and 20.
 
-`ftBuildArmsAt` gains a loud check in place of code 20: an instance row whose result list does not
-cover the set's members ends in `emitFail`, so a refutation cannot turn silent. The gate expects
-byte-identical check output and the same late rows. The expected cost is negative: no re-plan per
-round. B3.1 measures the fuel saved, which buys headroom for B3.2 onwards.
+Code 20 now means a missing arm. `ftArmsCovered` fails when an instance call (a mint row) through a
+tagged set has fewer arms than members, and `elabPrepare` then ends in `emitFail` ("an instance call
+through a tagged function set has no arm for each member"). It replaces the refutation as the late
+pass's loud internal check.
 
 **B3.2 — parameter takes per (KeyId, parameter).**
 - Sites: 5, 6, 11, 13, 14, 15, 16.
