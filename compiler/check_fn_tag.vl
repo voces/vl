@@ -398,6 +398,7 @@ export function fnTagDecide(rootIx: i32) {
     ftRetryRefused = []
     ftLateRan = false
     ftCheckTagged = []
+    ftRecsCheck = 0
   }
   ftDecideRoot = rootIx
   fnTagUndecide()
@@ -425,15 +426,20 @@ export function fnTagDecide(rootIx: i32) {
   // Sets of two or more first: a one-member set whose member is a leaf of one of their joins
   // follows that set's decision.
   const seen: i32[] = []
-  // After the elaboration, the check's sets are committed first: their decision is the check's,
-  // and the late pass builds their arms at the instances' calls.
+  // After the elaboration, a set the check tagged keeps the check's plan, applied at the round's
+  // instance calls; a set a later round tagged is decided again each round.
   if ftLate {
-    for s0 in ftCheckTagged {
-      if !i32ListHas(seen, s0) {
-        seen.push(s0)
-        ftTry(rootIx, s0, calls, mint)
+    while ftRecs.length > ftRecsCheck { ftRecs.pop() }
+    const recs = ftRecs.slice(0, ftRecs.length)
+    for r in recs {
+      if r.s.length > 0 && !fnTagSetIsTagged(r.s[0]) {
+        for s0 in r.s { seen.push(s0) }
+        ftP = r
+        ftApply(rootIx, calls, mint)
       }
     }
+  } else {
+    ftRecs = []
   }
   let pass = 0
   while pass < 2 {
@@ -658,13 +664,14 @@ let ftLate = false
 let ftWas: i32[] = []
 
 // Decides again once the elaboration has noted each instance's calls through a set (`elabMintFacts`),
-// the check's sets first: 0 when it tags the sets the last decision did, 1 when it tags more, 10
-// more when it tags a set the check refused with every call's facts, 20 when it refutes one the
-// check decided (each a second decider).
+// the check's sets kept: 0 when it tags the sets the last decision did, 1 when it tags more, 10
+// more when it tags a set the check refused with every call's facts (a second decider), 20 when an
+// instance call through a tagged set lacks an arm.
 export function fnTagRedecide(rootIx: i32): i32 {
   ftWas = fnTagTaggedSets()
   if !ftLateRan {
     ftCheckTagged = ftWas
+    ftRecsCheck = ftRecs.length
     ftLateRan = true
   }
   ftLate = true
@@ -673,12 +680,28 @@ export function fnTagRedecide(rootIx: i32): i32 {
   ftLate = false
   while T.diags.length > d0 { T.diags.pop() }
   const now = fnTagTaggedSets()
-  // A set the check decided is final: the late inputs refuting one is a second decider.
-  for w in ftCheckTagged {
-    if !i32ListHas(now, w) { return 20 }
-  }
+  if !ftArmsCovered(mintFactRows()) { return 20 }
   const second = if ftLateOutsideExclusions() >= 0 { 10 } else { 0 }
   return second + (if now.length > ftWas.length { 1 } else { 0 })
+}
+
+// Whether each instance call through a tagged set has an arm per member (`ftBuildArmsAt`).
+function ftArmsCovered(mint: i32[]): boolean {
+  for fr in mint {
+    const s = ftFactSetOf(fr)
+    const c = ftFactCallOf(fr)
+    if (
+      s >= 0
+      && fnTagSetIsTagged(s)
+      && c >= 0
+      && c < P.nodes.length
+      && nodeAt(c) is Call
+      && fnTagArmsAt(c, s).length != fnTagMembers(s).length
+    ) {
+      return false
+    }
+  }
+  return true
 }
 
 // The sets the check tagged, as the first decision after the elaboration found them.
@@ -722,11 +745,6 @@ function ftParamOwnerCalledThroughSet(s: i32): boolean {
   }
   return false
 }
-
-// The record literals the plan in progress takes as written into a holder of its set
-// (`ftStoredAt`), beside the holder's type.
-let ftStoreLits: i32[] = []
-let ftStoreLitTys: i32[] = []
 
 // Whether, after the elaboration, record literal `v` is written into a binding an instance holds
 // set `s` in (`mintStoreNote`), or a set the plan decides `s` with, so its function fields are
@@ -773,17 +791,9 @@ function ftTry(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
 // `ftTry` reading facts `mint`.
 function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   if fnTagSetIsTagged(s) { return 0 }
-  ftPlReset()
-  ftCloAt = []
-  ftCloTy = []
-  ftMapRecLit = []
-  ftMapRecMap = []
-  ftMapRecFn = []
-  ftStoreLits = []
-  ftStoreLitTys = []
+  ftP = ftRecNew()
   ftSubNeed = []
   ftAssume = [s]
-  ftNamedRecLits = []
   let ok = ftPlan(rootIx, s, calls, mint)
   let q = 0
   while ok && q < ftSubNeed.length {
@@ -796,49 +806,118 @@ function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
   }
   ftAssume = []
   if !ok || !ftPlLeafTysFill() { return 0 }
+  ftRecs.push(ftP)
+  ftApply(rootIx, calls, mint)
+  return 0
+}
+
+// A plan in progress, then one that tagged its sets, kept so the decision after the elaboration
+// applies the check's plans at the round's instance calls instead of planning their sets again.
+type FtRec = {
+  // One planned set per row: its leaves and their ids, each member's leaf type, the joins
+  // re-typed to it, the `let`s it is held by, and the list literals and `let`s it is held by.
+  s: i32[],
+  leaves: i32[][],
+  ids: i32[][],
+  leafTy: i32[][],
+  resp: i32[][],
+  respTy: i32[][],
+  binds: i32[][],
+  held: i32[][],
+  // The deliveries built as the closure of the set's one member, and their types.
+  cloAt: i32[],
+  cloTy: i32[],
+  // The record literals written into a map of the set's records, the map read, and its function.
+  mapLit: i32[],
+  mapMap: i32[],
+  mapFn: i32[],
+  // The record literals written into a holder of the set (`ftStoredAt`), and the holder's type.
+  storeLits: i32[],
+  storeTys: i32[],
+  // List literals written whole into a held list of lists, each beside the holder's declaration.
+  whole: i32[],
+  // The record literals held through a field naming a function.
+  named: i32[],
+  // The record literals written into a holder's slot or pushed onto one.
+  written: i32[],
+  // Each `let` initialiser a record written whole over its binding is built beside, then that
+  // written literal: the initialiser is built at the written record's type too (D15391).
+  inits: i32[],
+}
+
+function ftRecNew(): FtRec {
+  return {
+    s: [],
+    leaves: [],
+    ids: [],
+    leafTy: [],
+    resp: [],
+    respTy: [],
+    binds: [],
+    held: [],
+    cloAt: [],
+    cloTy: [],
+    mapLit: [],
+    mapMap: [],
+    mapFn: [],
+    storeLits: [],
+    storeTys: [],
+    whole: [],
+    named: [],
+    written: [],
+    inits: [],
+  }
+}
+
+let ftP: FtRec = ftRecNew()
+let ftRecs: FtRec[] = []
+// How many of `ftRecs` the check's decision made.
+let ftRecsCheck = 0
+
+// Tags the planned sets, builds their arms at `calls` and the instance calls of `mint`, and
+// stamps every holder and literal the plan wrote.
+function ftApply(rootIx: i32, calls: i32[], mint: i32[]) {
   let k = 0
-  while k < ftPlS.length {
+  while k < ftP.s.length {
     ftCommit(rootIx, k, calls, mint)
     k = k + 1
   }
   let ci = 0
-  while ci < ftCloAt.length {
-    fnCloCoerceNote(ftCloAt[ci], ftCloTy[ci])
+  while ci < ftP.cloAt.length {
+    fnCloCoerceNote(ftP.cloAt[ci], ftP.cloTy[ci])
     ci = ci + 1
   }
   // Every holder's rep, once each planned set is tagged.
   // Twice, so a binding of a read of another holder sees that holder's stamp (D15350).
   for _pass in [0, 1] {
-    for hs in ftPlHeld {
+    for hs in ftP.held {
       for h in hs { fnTagHeldNote(h) }
     }
   }
   // A record literal `set` into a held map nesting the set's records is built at the map's storage
   // row, its nested records too (D16829).
-  for hs in ftPlHeld {
+  for hs in ftP.held {
     for h in hs { ftStampMapSetLits(h) }
   }
   // A record literal written into a map of the set's records is built at the map's record rep.
   let mr = 0
-  while mr < ftMapRecLit.length {
-    const rr = ftMapRecRep(ftMapRecMap[mr], ftMapRecFn[mr])
-    if rr >= 0 { repStampHeldRead(ftMapRecLit[mr], rr) }
+  while mr < ftP.mapLit.length {
+    const rr = ftMapRecRep(ftP.mapMap[mr], ftP.mapFn[mr])
+    if rr >= 0 { repStampHeldRead(ftP.mapLit[mr], rr) }
     mr = mr + 1
   }
   // A record literal an instance writes into a holder of the set is built at the holder's rep.
   let sl = 0
-  while sl < ftStoreLits.length {
-    repStampHeldRead(ftStoreLits[sl], fnTagRepTyOf(ftStoreLitTys[sl]))
+  while sl < ftP.storeLits.length {
+    repStampHeldRead(ftP.storeLits[sl], fnTagRepTyOf(ftP.storeTys[sl]))
     sl = sl + 1
   }
   // A list literal written whole into a held list of lists is built at the holder's element.
   let ww = 0
-  while ww + 1 < ftWrittenWhole.length {
-    const hr = fnTagHeldRepOf(ftWrittenWhole[ww + 1])
+  while ww + 1 < ftP.whole.length {
+    const hr = fnTagHeldRepOf(ftP.whole[ww + 1])
     const ho = if hr >= 0 && hr < T.tys.length { tyAt(hr) } else { null }
-    if ho is TyArray {
-      fnTagHeldWrittenInner(ftWrittenWhole[ww], tyElemOf(ho), 0)
-    }
+    if ho is TyArray { fnTagHeldWrittenInner(ftP.whole[ww], tyElemOf(ho), 0) }
     ww = ww + 2
   }
   // A record literal of an inner list is built at that list's record, so it shares its row.
@@ -848,16 +927,16 @@ function ftTryWith(rootIx: i32, s: i32, calls: i32[], mint: i32[]) {
     q2 = q2 + 2
   }
   while fnTagHeldRecs.length > 0 { fnTagHeldRecs.pop() }
-  for l in ftNamedRecLits { repStampHeldRead(l, fnTagRepTyOf(nodeTyIxOf(l))) }
+  for l in ftP.named { repStampHeldRead(l, fnTagRepTyOf(nodeTyIxOf(l))) }
   // A record literal written into a holder is built at the record its stamped rep holds there.
-  for l in ftWrittenLits {
+  for l in ftP.written {
     const t = recAsgFnWidenedTy(l)
     if t >= 0 { recLitFnFieldsRestamp(l, t) }
   }
   let wi = 0
-  while wi + 1 < ftWrittenInits.length {
-    const t = recAsgFnWidenedTy(ftWrittenInits[wi + 1])
-    if t >= 0 { recLitFnFieldsRestamp(ftWrittenInits[wi], t) }
+  while wi + 1 < ftP.inits.length {
+    const t = recAsgFnWidenedTy(ftP.inits[wi + 1])
+    if t >= 0 { recLitFnFieldsRestamp(ftP.inits[wi], t) }
     wi = wi + 2
   }
   return 0
@@ -872,9 +951,9 @@ function ftWrittenInitNote(x: i32, wl: i32) {
   if il < 0 || il >= P.nodes.length || !(nodeAt(il) is ObjLit) || il == wl {
     return 0
   }
-  if !i32ListHas(ftWrittenInits, il) {
-    ftWrittenInits.push(il)
-    ftWrittenInits.push(wl)
+  if !i32ListHas(ftP.inits, il) {
+    ftP.inits.push(il)
+    ftP.inits.push(wl)
   }
   return 0
 }
@@ -894,20 +973,17 @@ function ftWholeRecListLit(x: i32): boolean {
 // Notes list literal `l` as written whole into holder `h`, a read of a held `let`.
 function ftWrittenWholeNote(l: i32, h: i32) {
   const d = if h >= 0 && h < P.nodes.length && nodeAt(h) is Ident { identDeclOf(h) } else { -1 }
-  if d >= 0 && !i32ListHas(ftWrittenWhole, l) {
-    ftWrittenWhole.push(l)
-    ftWrittenWhole.push(d)
+  if d >= 0 && !i32ListHas(ftP.whole, l) {
+    ftP.whole.push(l)
+    ftP.whole.push(d)
   }
   return 0
 }
 
-// List literals written whole into a held list of lists, each beside the holder's declaration.
-let ftWrittenWhole: i32[] = []
-
 // Notes record literal `l` as written into a holder of the plan in progress.
 function ftWrittenNote(l: i32) {
-  if recAsgFnWidenedTy(l) >= 0 && !i32ListHas(ftWrittenLits, l) {
-    ftWrittenLits.push(l)
+  if recAsgFnWidenedTy(l) >= 0 && !i32ListHas(ftP.written, l) {
+    ftP.written.push(l)
   }
   return 0
 }
@@ -916,57 +992,26 @@ function ftWrittenNote(l: i32) {
 let ftAssume: i32[] = []
 let ftSubNeed: i32[] = []
 
-// One planned set per row: its leaves and their ids, each member's leaf type, and the joins
-// re-typed to it.
-let ftPlS: i32[] = []
-let ftPlLeaves: i32[][] = []
-let ftPlIds: i32[][] = []
-let ftPlLeafTy: i32[][] = []
-let ftPlResp: i32[][] = []
-let ftPlRespTy: i32[][] = []
-// The `let` declarations each planned set is held by.
-let ftPlBinds: i32[][] = []
-// The `let` declarations the scan in progress found holding its set.
+// The `let` declarations, and the list literals and `let`s, the scan in progress found holding
+// its set.
 let ftBindsCur: i32[] = []
-// The list literals and `let` declarations each planned set is held by, and the scan's own.
-let ftPlHeld: i32[][] = []
 let ftHeldCur: i32[] = []
-// The record literals the plans write into a holder's slot or push onto one.
-let ftWrittenLits: i32[] = []
-// Each `let` initialiser a record written whole over its binding is built beside, then that
-// written literal: the initialiser is built at the written record's type too (D15391).
-let ftWrittenInits: i32[] = []
-
-function ftPlReset() {
-  ftWrittenLits = []
-  ftWrittenInits = []
-  ftWrittenWhole = []
-  ftPlS = []
-  ftPlLeaves = []
-  ftPlIds = []
-  ftPlLeafTy = []
-  ftPlResp = []
-  ftPlRespTy = []
-  ftPlBinds = []
-  ftPlHeld = []
-  return 0
-}
 
 // Gives each planned member with no leaf of its own the type of its leaf in another row; false
 // when some member has none in any row.
 function ftPlLeafTysFill(): boolean {
   let k = 0
-  while k < ftPlS.length {
-    const ds = fnTagMembers(ftPlS[k])
-    const lt = ftPlLeafTy[k]
+  while k < ftP.s.length {
+    const ds = fnTagMembers(ftP.s[k])
+    const lt = ftP.leafTy[k]
     let i = 0
     while i < lt.length && i < ds.length {
       if lt[i] < 0 {
         let t = -1
         let j = 0
-        while j < ftPlS.length && t < 0 {
-          const ls = ftPlLeaves[j]
-          const lids = ftPlIds[j]
+        while j < ftP.s.length && t < 0 {
+          const ls = ftP.leaves[j]
+          const lids = ftP.ids[j]
           let m = 0
           while m < ls.length && m < lids.length && t < 0 {
             if lids[m] == ds[i] { t = nodeTyIxOf(ls[m]) }
@@ -1002,15 +1047,15 @@ function ftTaggedLeafTy(d: i32): i32 {
 
 // Tags the set planned in row `k` and builds each call's member calls.
 function ftCommit(rootIx: i32, k: i32, calls: i32[], mint: i32[]) {
-  if k < 0 || k >= ftPlS.length { return 0 }
-  const s = ftPlS[k]
+  if k < 0 || k >= ftP.s.length { return 0 }
+  const s = ftP.s[k]
   const ds = fnTagMembers(s)
-  const leafTy = ftPlLeafTy[k]
-  fnTagMark(s, ftPlLeaves[k], ftPlIds[k])
-  for b in ftPlBinds[k] { fnTagBindNote(b, s) }
+  const leafTy = ftP.leafTy[k]
+  fnTagMark(s, ftP.leaves[k], ftP.ids[k])
+  for b in ftP.binds[k] { fnTagBindNote(b, s) }
   ftLeafTys[s] = leafTy
-  const rs = ftPlResp[k]
-  const rt = ftPlRespTy[k]
+  const rs = ftP.resp[k]
+  const rt = ftP.respTy[k]
   let ri = 0
   while ri < rs.length && ri < rt.length {
     nodeTySetGrow(rs[ri], rt[ri])
@@ -1312,18 +1357,18 @@ function ftPlan(rootIx: i32, s: i32, calls: i32[], mint: i32[]): boolean {
   // After the elaboration, a set the check left a closure is tagged only where every instance
   // of a function calling through it binds it there.
   if ftLate && !i32ListHas(ftWas, s) && mintSetPartial(s) { return false }
-  ftPlS.push(s)
-  ftPlLeaves.push(leaves)
-  ftPlIds.push(ids)
-  ftPlLeafTy.push(leafTy)
+  ftP.s.push(s)
+  ftP.leaves.push(leaves)
+  ftP.ids.push(ids)
+  ftP.leafTy.push(leafTy)
   const rs: i32[] = []
   const rt: i32[] = []
   for x in ftRespine { rs.push(x) }
   for t in ftRespineTy { rt.push(t) }
-  ftPlResp.push(rs)
-  ftPlRespTy.push(rt)
-  ftPlBinds.push(ftBindsCur.slice(0, ftBindsCur.length))
-  ftPlHeld.push(ftHeldCur.slice(0, ftHeldCur.length))
+  ftP.resp.push(rs)
+  ftP.respTy.push(rt)
+  ftP.binds.push(ftBindsCur.slice(0, ftBindsCur.length))
+  ftP.held.push(ftHeldCur.slice(0, ftHeldCur.length))
   return true
 }
 
@@ -1971,8 +2016,8 @@ function ftScan(
             return false
           }
           if ftStoredAt(wx, s) || i32ListHas(soleLits, wx) {
-            ftStoreLits.push(wx)
-            ftStoreLitTys.push(nodeTyIxOf(x))
+            ftP.storeLits.push(wx)
+            ftP.storeTys.push(nodeTyIxOf(x))
           }
           ftWrittenNote(wx)
           if recAsgFnWidenedTy(wx) >= 0 { ftWrittenInitNote(x, wx) }
@@ -2393,10 +2438,6 @@ function ftOneGenericMember(s: i32): boolean {
   return ms.length == 1 && ftNamedDecl(ms[0]) && !ftPlainDecl(ms[0])
 }
 
-// The deliveries the plan in progress builds as the closure of its one member, and their types.
-let ftCloAt: i32[] = []
-let ftCloTy: i32[] = []
-
 // The argument call `x` hands back, by the elaboration's hand-back fact for its declared callee:
 // a positional argument naming a function; -1 for any other node.
 function ftHandBackArg(x: i32): i32 {
@@ -2742,9 +2783,9 @@ function ftHeldWider(t: i32, s: i32): boolean {
 // planned with it or tagged: the write stores that set's id, and its own value is the same id.
 function ftWriteLeafOf(x: i32, s: i32): boolean {
   let k = 0
-  while k < ftPlS.length {
-    const o = ftPlS[k]
-    if o != s && fnTagMembersWithin(s, o) && i32ListHas(ftPlLeaves[k], x) {
+  while k < ftP.s.length {
+    const o = ftP.s[k]
+    if o != s && fnTagMembersWithin(s, o) && i32ListHas(ftP.leaves[k], x) {
       return true
     }
     k = k + 1
@@ -3322,8 +3363,6 @@ let ftLitLet: {[i32]: i32} = Map()
 let ftLetRefs: {[i32]: i32} = Map()
 let ftLetElemCalls: {[i32]: i32[]} = Map()
 
-// The arena's length at the check's own decision. A later decision counts only those nodes: the
-// calls the elaboration adds (a set's arms) hand nothing the check noted.
 let ftCheckLen = -1
 
 // The arena's length at the check's own tag decision, -1 before one ran.
@@ -3331,9 +3370,8 @@ export function fnTagCheckLen(): i32 { return ftCheckLen }
 
 // Counts the nodes added since `ftDirectLen` into the tables above.
 function ftDirectCountsGrow() {
-  const end = if ftLate && ftCheckLen >= 0 && ftCheckLen < P.nodes.length { ftCheckLen } else { P.nodes.length }
   let x = ftDirectLen
-  while x < end {
+  while x < P.nodes.length {
     const n = nodeAt(x)
     match n {
       Ident => {
@@ -3401,7 +3439,7 @@ function ftDirectCountsGrow() {
     }
     x = x + 1
   }
-  ftDirectLen = end
+  ftDirectLen = x
   return 0
 }
 
@@ -4652,8 +4690,8 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       // A call handing back the one generic member, bound to a closed function type, delivers
       // that member's closure there, built from the id the call hands back.
       if ftHandBackAtClosed(x, p) && ftOneGenericMember(s) {
-        ftCloAt.push(x)
-        ftCloTy.push(nodeTyIxOf(p))
+        ftP.cloAt.push(x)
+        ftP.cloTy.push(nodeTyIxOf(p))
         return true
       }
       return pn.letInit == x && (pn.letType < 0 || ftParamCopyAt(p, fn))
@@ -4745,8 +4783,8 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       if !ftClosedFnTy(et) || fnTagSetOfTy(et) >= 0 || !ftOneGenericMember(s) {
         return false
       }
-      ftCloAt.push(x)
-      ftCloTy.push(et)
+      ftP.cloAt.push(x)
+      ftP.cloTy.push(et)
       return true
     }
     // A record literal holds the id as the field's value.
@@ -4754,8 +4792,8 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       const held = pn.fiValue == x
         && (ftRecHolds(g, s) || ftOpenFieldHolds(g, pn.fiName, s))
       // Its literal is built at the record of the set's ids, whatever rep check adopted.
-      if held && ftLate && ftNamedFnValue(x) && !i32ListHas(ftNamedRecLits, g) {
-        ftNamedRecLits.push(g)
+      if held && ftLate && ftNamedFnValue(x) && !i32ListHas(ftP.named, g) {
+        ftP.named.push(g)
       }
       return held
     }
@@ -4898,9 +4936,6 @@ function ftHolds(x: i32, s: i32): boolean {
 function ftRecHolds(x: i32, s: i32): boolean {
   return x >= 0 && ftTyHoldsDecided(nodeRepTyIxOf(x), s)
 }
-
-// The record literals the plan in progress holds through a field naming a function.
-let ftNamedRecLits: i32[] = []
 
 // Whether field `name` of record literal `x`, adopted at a hole parameter's record whose field is
 // open, holds set `s` in the literal's own type: after the elaboration the literal is built at
@@ -5682,12 +5717,6 @@ function ftMethodTyParamArg(cx: i32, x: i32, s: i32): boolean {
   return i > 0 && ftTyParamOfHeldList(f, i, args, s)
 }
 
-// The record literals the plan in progress writes into a map of its set's records, and the map
-// read each is written through.
-let ftMapRecLit: i32[] = []
-let ftMapRecMap: i32[] = []
-let ftMapRecFn: i32[] = []
-
 // `ftRecIntoMap` for record literal `x` stored by index into slot `slot`.
 function ftRecIntoMapSlot(x: i32, slot: i32, s: i32, fd: i32): boolean {
   const sn = if slot >= 0 && slot < P.nodes.length { nodeAt(slot) } else { null }
@@ -5718,9 +5747,9 @@ function ftRecIntoMap(x: i32, m: i32, s: i32, fd: i32): boolean {
   if (!direct && !(ftRecFieldsNamed(ln, s) && ftParamHolderHolds(m, s, fd))) {
     return false
   }
-  ftMapRecLit.push(lx)
-  ftMapRecMap.push(m)
-  ftMapRecFn.push(fd)
+  ftP.mapLit.push(lx)
+  ftP.mapMap.push(m)
+  ftP.mapFn.push(fd)
   return true
 }
 
@@ -6004,7 +6033,7 @@ function ftArgDstTy(c: Call, x: i32): i32 {
       // the callee hands back reaches the call's result, which that binding does not type.
       const pt = f.fnParamTypes[i]
       if (
-        (ftUseArrow || ftLate)
+        ftUseArrow
         && tyHasTyVar(pt)
         && ftLiteralArg(x)
         && !ftArgHandedBack(c, x)
