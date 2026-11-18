@@ -168,25 +168,25 @@ Deno.test({
   },
 });
 
-// Outside the set: a string coalesce whose default is no literal, a closure parameter and a
-// valued `if` each leave their function uncovered, named.
+// Outside the set: a string coalesce whose default is no literal, a closure parameter and an
+// `as` conversion each leave their function uncovered, named.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A returned `if` that yields its arms' values is legacy's tail `if`, outside the set too.
+    // A conversion by `as` is outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function sel(c: boolean): i32 { return if c { 1 } else { 2 } }
+function cv(x: i64): i32 { return x as i32 }
 print(greet("a", "!"))
 print(ap((x: i32) => x + 1))
-print(sel(true))
+print(cv(3))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    for (const why of ["return of a value if"]) {
+    for (const why of ["expression as"]) {
       if (!rows.has(`uncovered ${why}`)) {
         throw new Error(`want an "uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
       }

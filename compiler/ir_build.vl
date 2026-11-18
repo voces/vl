@@ -125,6 +125,7 @@ import {
   pushPlanOf,
   shiftMaskFoldOf,
   strLitTakesAtom,
+  tailIfPlainWhy,
   tplStrHoleOf,
   widenPlanOf,
 } from "./wasmEmit"
@@ -160,7 +161,6 @@ import {
   fRecRetTy,
   fRetVoid,
   fnStmts,
-  fnUses,
   gPromoInStart,
   setIrShadowOn,
 } from "./emit_state"
@@ -169,7 +169,6 @@ import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import { charLitCp, unwrapParen } from "./emit_base"
 import { ifArmValueExpr } from "./emit_query"
-import { intMatchHeadAt } from "./check_match_heads"
 import { fnRetNullBearing } from "./emit_nullable_rets"
 import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
@@ -1852,7 +1851,15 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   const last = stmts[stmts.length - 1]
   const ln = nodeAt(last)
   if ln is WhileStmt { return skip("valued tail loop") }
-  if ln is IfStmt && lastStmtIsValueIf(last, ibFnIx) { return tailIf(b, last) }
+  if ln is IfStmt && lastStmtIsValueIf(last, ibFnIx) {
+    // The body's tail `if` is a body statement, which legacy banks a row for.
+    const n0 = b.length
+    tailIf(b, last)
+    if ibMiss == "" && b.length > n0 {
+      irSpanNote(ib, last, b[n0], b[b.length - 1])
+    }
+    return 0
+  }
   if ln is IfStmt && elseLessNullableTail(last, ibFnIx) {
     return skip("else-less nullable tail")
   }
@@ -1884,14 +1891,8 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
 function tailIf(b: i32[], ix: i32) {
   const n = nodeAt(ix)
   if !(n is IfStmt) { return skip("tail if node") }
-  const c0 = nodeAt(unwrapParen(n.ifCond))
-  // An instance decides its own `is` test, and legacy reads the decision off the bytes it wrote.
-  if c0 is IsExpr || c0 is Unary && c0.unOp == "!" {
-    return skip("tail if guard")
-  }
-  if intMatchHeadAt(ix) { return skip("tail if switch") }
-  if fnUses.unionSink { return skip("tail if union sink") }
-  if n.ifElse < 0 { return skip("else-less tail if") }
+  const why = tailIfPlainWhy(ix)
+  if why != "" { return skip(why) }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
   const thenB = tailArm(n.ifThen)
