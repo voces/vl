@@ -1,22 +1,42 @@
 #!/usr/bin/env bash
 # The legacy driver census: which emitter functions every function that reaches them now ships
 # from the IR (ir-design-2026-11.md §10, "once every function that reaches a legacy driver is
-# claimed, that driver deletes").
+# claimed, that driver deletes"), and which coverage step would unlock which deletion.
 #
 #     scripts/ir-driver-census.sh <seed> [out.tsv]
 #
 # A throwaway copy of compiler/ counts the calls into every top-level function of wasmEmit.vl
 # and emit_*.vl. It is built with <seed> into a temp dir, never into build/, and builds the
-# self-compile and every distilled cell twice: armed with claiming off ($VL_IR_SHADOW=1, legacy
-# emits every function) and as shipped ($VL_IR_SHADOW=5, legacy runs only for unclaimed ones).
-# Each row: `file:function`, hits claiming off, hits claiming on, static call sites in compiler/,
-# its lines, and the doors still reaching it: under the shipped claim, the blocker classes
-# (`$VL_IR_SHADOW=4`) of every unclaimed function whose legacy body hits it, joined, or `@ir` when
-# the IR's own build or lowering calls it, `@start` for top-level code. A row hit off and not on
-# is a candidate: on this population every function reaching it is claimed. A row whose doors are
-# one class is that class's to delete; `<out>.doors` ranks the classes by those lines. Evidence,
-# not proof: a deletion still needs every caller to be an arm the IR fully replaces. Run from the
-# checkout root; $VL names the host, $JOBS the fan-out (default 4).
+# self-compile and every distilled cell three times: claiming off ($VL_IR_SHADOW=1), as shipped
+# ($VL_IR_SHADOW=5, legacy runs only for unclaimed functions) and as the blocker census
+# ($VL_IR_SHADOW=4, each function's first-miss classes).
+#
+# Each row of out.tsv:
+#   function         `file:function`
+#   hits_claim_off   calls with claiming off
+#   hits_claim_on    calls as shipped; hit off and not on means every reaching function is claimed
+#   static_callers   call sites in compiler/, its definition excluded
+#   lines            its own body; the call chains that die with it are not counted
+#   doors            what still reaches it as shipped, joined: the blocker classes of every
+#                    unclaimed function whose legacy body hits it; `@ir` when the claim path
+#                    itself calls it; `@start` for top-level code; `@module` for module passes
+#   role             what deleting it needs (a heuristic over its body):
+#                      `ast` (calls emitExpr and kin: it walks the AST, so only a new IR lowering
+#                      replaces it); `value` (writes code from values: the IR can share it, so it
+#                      stays); `decide` (writes nothing: a gate or re-derivation, so routing that
+#                      dies with its door)
+# `<out>.doors` ranks the classes by the lines of the drivers whose one remaining door they are,
+# split by role. Covering a door deletes its `decide` rows and the dispatch arms above them; its
+# `value` rows move to `@ir`.
+#
+# What the ranking cannot show (master, 2026-11): most legacy lines are reached by no door.
+#   (1) Drivers reached only from `@module`/`@start` are module passes and top-level code, which
+#       no function's coverage deletes.
+#   (2) Drivers the claim path also reaches (`@ir`) stay while the IR calls them.
+#   (3) Very few are already dead under the claim.
+# Evidence, not proof: a deletion still needs every caller to be an arm the IR fully replaces.
+# Run from the checkout root; $VL names the host, $JOBS the fan-out (default 4), and a set $KEEP
+# keeps the temp dir for inspection.
 set -euo pipefail
 SEED=${1:?usage: scripts/ir-driver-census.sh <seed> [out.tsv]}
 OUT=${2:-/dev/stdout}
@@ -242,27 +262,37 @@ awk -F'\t' -v names="$T/names" '
 # The static call sites of each name in compiler/, its definition excluded, and its lines.
 cat compiler/*.vl > "$T/all.vl"
 {
-  printf 'function\thits_claim_off\thits_claim_on\tstatic_callers\tlines\tdoors\n'
+  printf 'function\thits_claim_off\thits_claim_on\tstatic_callers\tlines\tdoors\trole\n'
   while read -r key; do
     base=${key%%:*}
     name=${key#*:}
     off=$(awk -F'\t' -v k="$key" '$1 == k { print $2 }' "$T/hits1")
     on=$(awk -F'\t' -v k="$key" '$1 == k { print $2 }' "$T/hits5")
     c=$(grep -oE "(^|[^A-Za-z0-9_.])$name\(" "$T/all.vl" | wc -l)
-    lines=$(awk -v nm="$name" '
+    body=$(awk -v nm="$name" '
       !inside && $0 ~ "^(export )?function " nm "[ (<]" { inside = 1 }
-      inside { n++ }
-      inside && /^}/ { print n; exit }
+      inside { print }
+      inside && /^}/ { exit }
     ' "compiler/$base.vl")
+    lines=$(printf '%s' "$body" | awk 'END { print NR }')
+    if printf '%s' "$body" | grep -qE '\bemit(Expr|ExprAsKind|Widened|Stmt|Block)[A-Za-z]*\('; then
+      role=ast
+    elif printf '%s' "$body" | grep -qE '\bfb[A-Z][A-Za-z0-9]*\('; then
+      role=value
+    else
+      role=decide
+    fi
     doors=$(awk -F'\t' -v k="$key" '$1 == k { printf "%s%s", (n++ ? " + " : ""), $2 }' "$T/doors")
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "${off:-0}" "${on:-0}" "$((c - 1))" "${lines:-0}" "${doors:--}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "${off:-0}" "${on:-0}" "$((c - 1))" "${lines:-0}" "${doors:--}" "$role"
   done < "$T/names"
 } > "$T/table"
 cat "$T/table" > "$OUT"
 
 # Each door's deletion: the lines of every function hit under the claim whose one door it is.
 if [ "$OUT" != /dev/stdout ]; then
-  awk -F'\t' 'NR > 1 && $3 > 0 && $6 !~ / \+ / && $6 !~ /^[@?-]/ { l[$6] += $5; n[$6]++ }
-    END { for (d in l) print l[d] "\t" n[d] "\t" d }' "$T/table" | sort -rn \
-    | { printf 'lines\tfunctions\tdoor\n'; cat; } > "$OUT.doors"
+  awk -F'\t' 'NR > 1 && $3 > 0 && $6 !~ / \+ / && $6 !~ /^[@?-]/ { l[$6] += $5; n[$6]++; r[$6 SUBSEP $7] += $5 }
+    END {
+      for (d in l) print l[d] "\t" n[d] "\t" r[d SUBSEP "decide"] + 0 "\t" r[d SUBSEP "value"] + 0 "\t" r[d SUBSEP "ast"] + 0 "\t" d
+    }' "$T/table" | sort -rn \
+    | { printf 'lines\tfunctions\tdecide\tvalue\tast\tdoor\n'; cat; } > "$OUT.doors"
 fi
