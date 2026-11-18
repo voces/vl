@@ -40,7 +40,7 @@
 set -euo pipefail
 SEED=${1:?usage: scripts/ir-driver-census.sh <seed> [out.tsv]}
 OUT=${2:-/dev/stdout}
-VL=${VL:-vl}
+VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 JOBS=${JOBS:-4}
 T=$(mktemp -d)
 trap '[ -n "${KEEP:-}" ] && echo "kept $T" >&2 || rm -rf "${T:?}"' EXIT
