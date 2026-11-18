@@ -2074,6 +2074,13 @@ function recAtStoreArg(at: i32): boolean {
     && (tyAt(rt) is TyArray || tyAt(rt) is TyMap)
 }
 
+function deliveryBind(bind: "held" | "bound", x: i32): i32 {
+  return match bind {
+    "held" => recHeldDecl(x)
+    "bound" => recBindDeclOf(x)
+  }
+}
+
 // The binding a delivered value lands in, and where in it: the whole binding, an element of a
 // list or map, or a field of a record. `null` where it lands in no binding (a parameter, a return).
 type DeliveryRoot = {
@@ -2084,9 +2091,9 @@ type DeliveryRoot = {
 
 // The `DeliveryRoot` of the value `at`, read from the write scan's edge to its consumer: a binding's
 // initialiser, an assignment's right side, a `push` or `set` argument, or a literal part, which
-// lands where the literal does. One hop through a literal; deeper is `null`. `bind` resolves the
-// binding a place names, -1 for none.
-function deliveryRoot(at: i32, bind: (i32) => i32): DeliveryRoot | null {
+// lands where the literal does. One hop through a literal; deeper is `null`. `bind` says how a
+// place names its binding: one holding literals only (`recHeldDecl`), or any (`recBindDeclOf`).
+function deliveryRoot(at: i32, bind: "held" | "bound"): DeliveryRoot | null {
   cwIxBuild()
   if at < 0 || !cwIxCovers(at) { return null }
   const uk = cwIxUpKind[at]
@@ -2096,19 +2103,31 @@ function deliveryRoot(at: i32, bind: (i32) => i32): DeliveryRoot | null {
   if uk == CW_UP_ASG_RHS && un is BinExpr && un.binOp == "=" {
     const t = cwPeelValue(un.binLeft)
     const tn = if t >= 0 && t < P.nodes.length { nodeAt(t) } else { null }
-    if tn is Ident { return deliveryRootOf(bind(t), "whole", "") }
+    if tn is Ident { return deliveryRootOf(deliveryBind(bind, t), "whole", "") }
     if tn is Index {
-      return deliveryRootOf(bind(cwPeelValue(tn.idxArr)), "elem", "")
+      return deliveryRootOf(
+        deliveryBind(bind, cwPeelValue(tn.idxArr)),
+        "elem",
+        "",
+      )
     }
     if tn is Member {
-      return deliveryRootOf(bind(cwPeelValue(tn.memObj)), "field", tn.memProp)
+      return deliveryRootOf(
+        deliveryBind(bind, cwPeelValue(tn.memObj)),
+        "field",
+        tn.memProp,
+      )
     }
     return null
   }
   if uk == CW_UP_ARG && recAtStoreArg(at) && un is Call {
     const f = nodeAt(un.callFn)
     if f is Member {
-      return deliveryRootOf(bind(cwPeelValue(f.memObj)), "elem", "")
+      return deliveryRootOf(
+        deliveryBind(bind, cwPeelValue(f.memObj)),
+        "elem",
+        "",
+      )
     }
     return null
   }
@@ -2163,7 +2182,7 @@ export function recAdLateMiss(): LateMiss | null {
   while j < recAdPass.decl.length {
     if i32ListHas(recAdPass.pinDecl, recAdPass.decl[j]) {
       const at = recAdPass.at[j]
-      const r = deliveryRoot(at, recBindDeclOf)
+      const r = deliveryRoot(at, "bound")
       if r == null {
         return {
           at: at,
@@ -2258,7 +2277,7 @@ export function recAdCloseEdges() {
         }
       }
       for u in recOwnSrc {
-        const r = deliveryRoot(u, recHeldDecl)
+        const r = deliveryRoot(u, "held")
         if r != null && r.decl == d {
           const t = recAdEdgeDst(i, r)
           // Delivered as the pending loop delivers it: a `Map()` binding through the map rule.
