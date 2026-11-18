@@ -14,7 +14,7 @@ with their resets and writes:
 | `emit_atom_kinds.vl` | `sfnEmpty` |
 | `emit_mono.vl` | `cadSite`, `monoCgcHoleT` (and its parameter), `monoReachStmts`, `monoReachRoots` |
 
-The ratchet's baseline falls to 0 / 0. Net compiler lines: +5 / −34.
+The ratchet's baseline falls to 0 / 0. Net compiler lines: +8 / −36.
 
 ## Grades (fixpoint seeds both sides, master `8a0890936`)
 
