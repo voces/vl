@@ -40,10 +40,12 @@ import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
 import {
   irClaimFn,
+  irClaimStart,
   irShadowArmed,
   irShadowBegin,
   irShadowFn,
   irShadowStart,
+  irStartClaimOn,
 } from "./ir_build"
 import { irStartPrologueHook } from "./ir_lower"
 import { irRefInstall } from "./ir_build_ref"
@@ -2467,34 +2469,42 @@ function emitStartBodyCode(out: u8[], k: i32) {
   uSinkFired = 0
   envCacheOpen(-1)
   fbBeginFunc(0, nStartLocals)
+  const ent = startMergeOrder()
+  // The single start body the IR claims has its code entry written by the lowering, in the frame
+  // laid out above, and legacy's does not run. Under the test refusal hook or the box-dst shadow
+  // (both instrument legacy) it stays legacy's.
+  if (
+    k < 0
+    && gTestEmitRefusal == 0
+    && !boxDstShadowArmed()
+    && irStartClaimOn()
+  ) {
+    startFrameReset()
+    const order: i32[] = []
+    const orderGi: i32[] = []
+    startIrOrder(ent, order, orderGi)
+    if irClaimStart(order, orderGi, out) {
+      fbEndFunc()
+      return 0
+    }
+  }
 
   const bodyExpr: u8[] = []
   const exprPrev = wTarget(bodyExpr)
   // The pool fills first: every later line of the module may read a pool string.
   if k < 0 { emitStrFillCalls() }
   // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
-  // mirroring `emitFuncCode` — no leak from the last user function.
-  scopeNames = []
-  scopeSlots = []
-  scopeFrames = []
+  // mirroring `emitFuncCode` — no leak from the last user function or a fallen-back claim.
+  startFrameReset()
   // One frame for the top-level statement list, as `collectStartLocals` pushes for the same
   // walk. A function body takes its frame from `emitStmts` on its `Block`; the top level
   // has no `Block`, so without this the lowering cannot be told from a scope-less detection
   // pass. Popped below; a `return -1` path leaves it, and the next program resets. D1597.
   scopePush()
-  emitLetCursor = 0
-  ctrlDepth = 0
-  loopContDepth = []
-  loopBrkDepth = []
-  loopContLabel = []
-  loopBrkLabel = []
-  if lvFrameDepth.length > 0 { lvFrameDepth = [] }
-  if lvFrameLocal.length > 0 { lvFrameLocal = [] }
   // Non-const global initializers and top-level statements run interleaved in source order
   // (merged on `startStmtOrd`/`globalStmtOrd`, the list positions): `xs.push(1)` before
   // `const ys = xs.map(f)` must execute before that init. A program with only inits, or only
   // statements, emits the same bytes as before. The emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
-  const ent = startMergeOrder()
   // The promotion context window (G2c): a promoted binding's `local.get`/`local.set` is only
   // meaningful in this frame, so the flag that lets `emitUserGlobalGet`/`emitUserGlobalSet`
   // produce one is armed for exactly the span streaming this body. Every user function body and
@@ -2582,6 +2592,22 @@ function emitStartBodyCode(out: u8[], k: i32) {
     startIrOrder(ent, order, orderGi)
     irShadowStart(out, outStart, spanBase, order, orderGi)
   }
+  return 0
+}
+
+// Empties the emit-time scope and loop bookkeeping before the start body is lowered.
+function startFrameReset() {
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  emitLetCursor = 0
+  ctrlDepth = 0
+  loopContDepth = []
+  loopBrkDepth = []
+  loopContLabel = []
+  loopBrkLabel = []
+  if lvFrameDepth.length > 0 { lvFrameDepth = [] }
+  if lvFrameLocal.length > 0 { lvFrameLocal = [] }
   return 0
 }
 
