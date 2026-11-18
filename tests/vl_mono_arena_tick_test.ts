@@ -42,6 +42,9 @@ const SLOT_ROW_NOTE_CALL = "buildFnMapNoteFnStmtWrite(";
 // The row note covers only a `fnStmts` slot: a `fnParent` or `.fnRet`/`.fnName` write moves what
 // the note assumes stands, so it still needs the retiring note.
 const FN_STMTS_SLOT = /\bfnStmts\s*\[/;
+// The note a `fnParent` write may use instead: it retires the banked rows but no `fnStmts` position.
+const PARENT_NOTE_CALL = "buildFnMapNoteFnParentWrite(";
+const FN_PARENT_SLOT = /\bfnParent\s*\[/;
 
 /** The code half of a line: everything before an unquoted `//`. */
 const stripComment = (line: string): string => {
@@ -87,7 +90,8 @@ const classify = (lines: string[]): Hit[] => {
       text: lines[i].trim(),
       repoints: SLOT_WRITE.test(code),
       slotNoted: above.some((l) =>
-        l.includes(SLOT_NOTE_CALL) || (FN_STMTS_SLOT.test(code) && l.includes(SLOT_ROW_NOTE_CALL))
+        l.includes(SLOT_NOTE_CALL) || (FN_STMTS_SLOT.test(code) && l.includes(SLOT_ROW_NOTE_CALL)) ||
+        (FN_PARENT_SLOT.test(code) && l.includes(PARENT_NOTE_CALL))
       ),
       exempt: mark === undefined ? null : mark.slice(mark.indexOf(EXEMPT_MARK) + EXEMPT_MARK.length).trim(),
     });

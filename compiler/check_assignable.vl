@@ -22,12 +22,7 @@ import {
 } from "./check_iface"
 import { rangeVarFits } from "./check_range_var"
 import { arrowNote } from "./check_arrow"
-import {
-  cwBuildFrames,
-  cwFrameOf,
-  cwIxCovers,
-  cwPeelValue,
-} from "./check_write_scan"
+import { cwIxCovers, cwPeelValue } from "./check_write_scan"
 import { recLitOnlyDeclOf } from "./check_rec_fresh"
 import { identTyOf } from "./check_nar_store"
 import {
@@ -99,6 +94,7 @@ import {
   mkStr,
   mkUnary,
   nodeAt,
+  nodeChildren,
   nodeContains,
   nodeSpineChildren,
   spreadArgOf,
@@ -1454,40 +1450,29 @@ function instAllocsOf(fn: i32, first: i32): InstAllocs {
   const r: InstAllocs = { first: first, tys: [] }
   const f = nodeAt(fn)
   if !(f is FuncDecl) { return r }
-  cwBuildFrames()
+  const own = instFrameNodes(f)
   const argReads: Map<i32, i32> = Map()
   const bound: i32[] = []
-  let ix = 0
-  while ix < cwFrameOf.length && ix < P.nodes.length {
+  for ix in own {
     const c = nodeAt(ix)
-    if cwFrameOf[ix] == fn && c is Call && c.callFn >= 0 {
+    if c is Call && c.callFn >= 0 {
       if i32ListHas(f.fnParams, identDeclOf(c.callFn)) {
         for a in c.callArgs {
           const ax = parenPeelIx(a)
           if instOpenEmptyList(ax) { r.tys.push(nodeTyIxOf(ax)) }
           const d = if ax >= 0 && nodeAt(ax) is Ident { identDeclOf(ax) } else { -1 }
-          if (
-            d >= 0
-            && d < cwFrameOf.length
-            && cwFrameOf[d] == fn
-            && instOpenListBinding(d)
-          ) {
+          if d >= 0 && i32ListHas(own, d) && instOpenListBinding(d) {
             argReads.set(d, (argReads.get(d) ?? 0) + 1)
             if !i32ListHas(bound, d) { bound.push(d) }
           }
         }
       }
     }
-    ix = ix + 1
   }
   for d in bound {
     let reads = 0
-    let j = 0
-    while j < cwFrameOf.length && j < P.nodes.length {
-      if cwFrameOf[j] == fn && nodeAt(j) is Ident && identDeclOf(j) == d {
-        reads = reads + 1
-      }
-      j = j + 1
+    for j in own {
+      if nodeAt(j) is Ident && identDeclOf(j) == d { reads = reads + 1 }
     }
     const ld = nodeAt(d)
     if ld is LetDecl && reads == (argReads.get(d) ?? 0) {
@@ -1495,6 +1480,52 @@ function instAllocsOf(fn: i32, first: i32): InstAllocs {
     }
   }
   return r
+}
+
+// The nodes of `f`'s own frame in arena order: its parameters and body, a nested function's node
+// but nothing under it. The set `cwFrameOf` files under `f`, found without walking the arena.
+function instFrameNodes(f: FuncDecl): i32[] {
+  const out: i32[] = []
+  for p in f.fnParams { instFrameCollect(p, out) }
+  instFrameCollect(f.fnBody, out)
+  return instSortedAsc(out)
+}
+
+// `xs` in ascending order (a bottom-up merge sort).
+function instSortedAsc(xs: i32[]): i32[] {
+  let a = xs
+  let w = 1
+  while w < a.length {
+    const b: i32[] = []
+    let lo = 0
+    while lo < a.length {
+      const mid = if lo + w < a.length { lo + w } else { a.length }
+      const hi = if lo + 2 * w < a.length { lo + 2 * w } else { a.length }
+      let i = lo
+      let j = mid
+      while i < mid || j < hi {
+        if j >= hi || (i < mid && a[i] <= a[j]) {
+          b.push(a[i])
+          i = i + 1
+        } else {
+          b.push(a[j])
+          j = j + 1
+        }
+      }
+      lo = hi
+    }
+    a = b
+    w = w * 2
+  }
+  return a
+}
+
+function instFrameCollect(ix: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  out.push(ix)
+  if nodeAt(ix) is FuncDecl { return 0 }
+  for k in nodeChildren(ix) { instFrameCollect(k, out) }
+  return 0
 }
 
 // Whether `ix` is an empty `[]` whose element type is still open.

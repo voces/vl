@@ -2739,6 +2739,10 @@ const fnPosMo: i32[] = []
 const fnPosMoStamp: i32[] = []
 // Did either indexed prefix hold a negative entry? Only then can a negative query match.
 let fnPosNeg = false
+// The epoch the indexed prefixes belong to; `fnPosNoteSlotWrite` patches only a current index.
+let fnPosBuiltFor = 0 - 1
+// Each `fnStmts` entry held at more than one position, where its stamp equals `fnPosEpoch`.
+const fnPosFsDup: i32[] = []
 
 export function fnPosIndexDrop() { return memoGenAdvance(fnPosEpoch) }
 
@@ -2789,7 +2793,9 @@ export function fnStmtsIndexOf(fnIx: i32) {
     fnPosMoLen = 0
     fnPosNeg = false
   }
+  fnPosBuiltFor = fnPosEpoch.at
   while fnPosFsLen < fnStmts.length {
+    fnPosDupNote(fnStmts[fnPosFsLen])
     fnPosPut(fnPosFs, fnPosFsStamp, fnStmts[fnPosFsLen], fnPosFsLen)
     fnPosFsLen = fnPosFsLen + 1
   }
@@ -2808,6 +2814,59 @@ export function fnStmtsIndexOf(fnIx: i32) {
     return fnPosMo[fnIx]
   }
   return -1
+}
+
+// Mark `ix` as held twice when the `fnStmts` column already indexes it.
+function fnPosDupNote(ix: i32) {
+  if ix < 0 || ix >= fnPosFsStamp.length || fnPosFsStamp[ix] != fnPosEpoch.at {
+    return 0
+  }
+  while fnPosFsDup.length <= ix { fnPosFsDup.push(-1) }
+  fnPosFsDup[ix] = fnPosEpoch.at
+  return 0
+}
+
+// Keep the index true across `fnStmts[slot] = node`, noted before the write lands: `node` takes
+// `slot` where that is its first position, and the replaced entry leaves the column, unless it is
+// held elsewhere too, when the whole index drops.
+export function fnPosNoteSlotWrite(slot: i32, node: i32) {
+  if (
+    fnPosBuiltFor != fnPosEpoch.at
+    || slot < 0
+    || slot >= fnPosFsLen
+    || slot >= fnStmts.length
+  ) {
+    return 0
+  }
+  const old = fnStmts[slot]
+  if old == node { return 0 }
+  if (
+    old >= 0
+    && old < fnPosFsStamp.length
+    && fnPosFsStamp[old] == fnPosEpoch.at
+  ) {
+    if old < fnPosFsDup.length && fnPosFsDup[old] == fnPosEpoch.at {
+      fnPosIndexDrop()
+      return 0
+    }
+    fnPosFsStamp[old] = -1
+  }
+  if node < 0 {
+    fnPosNeg = true
+    return 0
+  }
+  fnPosDupNote(node)
+  while fnPosFsStamp.length <= node {
+    fnPosFsStamp.push(-1)
+    fnPosFs.push(-1)
+  }
+  if fnPosFsStamp[node] != fnPosEpoch.at {
+    fnPosFsStamp[node] = fnPosEpoch.at
+    fnPosFs[node] = slot
+  } else if fnPosFs[node] > slot {
+    fnPosFs[node] = slot
+  }
+  return 0
 }
 
 // `fnParent` inverted — the child list of each frame, as two intrusive i32 columns:
