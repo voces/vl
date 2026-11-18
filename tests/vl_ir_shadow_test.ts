@@ -642,3 +642,42 @@ Deno.test({
     }
   },
 });
+
+// The start body under the shadow (stage 1, S1a): a top-level statement, a global's plain
+// initializer and a promoted global each build and match legacy's entry, counted under `start `
+// rows; a start owing the string accumulator scan and a widened initializer are named misses.
+const START_MATCHED = [
+  `let i = 0\nwhile i < 3 { i = i + 1 }\nprint(i)\n`,
+  `function sq(x: i32): i32 { return x * x }\nconst k = sq(3)\nprint(k + 1)\n`,
+  `let n = 2\nn = n + 3\nprint(n)\n`,
+];
+Deno.test({
+  name: "ir shadow: a start body inside the set is covered and matches legacy",
+  ignore,
+  fn: () => {
+    for (const src of START_MATCHED) {
+      const { rc, rows } = run(src, true);
+      if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+      if ((rows.get("start covered") ?? 0) !== 1 || (rows.get("start matched") ?? 0) !== 1) {
+        throw new Error(`want the start covered and matched, got ${JSON.stringify([...rows])}\n${src}`);
+      }
+      if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+Deno.test({
+  name: "ir shadow: a start owing the string accumulator, or widening an initializer, misses by name",
+  ignore,
+  fn: () => {
+    const cases: [string, string][] = [
+      [`let s = ""\nlet i = 0\nwhile i < 3 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\n`, "string accumulator"],
+      [`const w: f64 = 3\nprint(w)\n`, "global initializer widen"],
+    ];
+    for (const [src, why] of cases) {
+      const { rows } = run(src, true);
+      if (rows.get(`start uncovered ${why}`) !== 1) {
+        throw new Error(`want one "start uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
+      }
+    }
+  },
+});
