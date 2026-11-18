@@ -190,6 +190,7 @@ import {
 import { covarValueWriteState } from "./check_covar_write"
 import {
   EqCmpKind,
+  EqCore,
   REC_STORE_DEPTH,
   eqCoreKindOfTyToken,
 } from "./check_ty_relate"
@@ -41832,6 +41833,79 @@ function emitBinLitEq(e: BinExpr, exprIx: i32, fnIx: i32) {
   return emitBinRefOps(e, exprIx, fnIx)
 }
 
+// Which list compare `emitBinRefOps` runs for `e` (its `listOpKindOfBin` is `lopK`): "any" for
+// a rep's generic core, "nonnull" for the non-null core, "" for none. Any operator but `+`
+// with a list operand takes the non-null core.
+function listEqArmOf(e: BinExpr, exprIx: i32, fnIx: i32, lopK: EqCore): string {
+  if (
+    (e.binOp == "==" || e.binOp == "!=")
+    && eqgListKindOfBin(exprIx, fnIx, lopK) >= 0
+  ) {
+    return "any"
+  }
+  return if lopK != "none" && e.binOp != "+" { "nonnull" } else { "" }
+}
+
+// After one list compare operand: its narrowed read recovered and a view synced.
+export function listEqOperandTail(ix: i32, fnIx: i32): i32 {
+  if emitEqRecoverNarrowed(ix, fnIx) < 0 { return -1 }
+  svSyncRecv(ix, fnIx)
+  return 0
+}
+
+// After both list compare operands: the compare `listEqArmOf` picks, negated for `!=`.
+export function listEqTail(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  const lopK = listOpKindOfBin(exprIx, fnIx)
+  if listEqArmOf(e, exprIx, fnIx, lopK) == "any" {
+    const gK = eqgListKindOfBin(exprIx, fnIx, lopK)
+    if emitListEqAnyRep(gK, listOpSlotOfBin(exprIx, fnIx), fnIx) < 0 {
+      return -1
+    }
+  } else if emitEqNonNullCore(exprIx, fnIx) < 0 {
+    return -1
+  }
+  if e.binOp == "!=" { fbI32Eqz() }
+  return 0
+}
+
+// Whether `emitBinExprNode` routes `==`/`!=` node `e` (at `exprIx`) to the list compare
+// (`listEqTail`), past every earlier arm: identity, union, atom, `null`, niche, string and the
+// two-rep number lists, each of which takes the compare first.
+export function listEqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
+  if e.binIdent != 0 || e.binOp != "==" && e.binOp != "!=" { return false }
+  if numUnionMinted && njDispatches(e, fnIx) { return false }
+  const l = e.binLeft
+  const r = e.binRight
+  if nodeAt(unwrapParen(l)) is NullLit || nodeAt(unwrapParen(r)) is NullLit {
+    return false
+  }
+  if mapReadScalarBoxKind(l, fnIx) >= 0 || mapReadScalarBoxKind(r, fnIx) >= 0 {
+    return false
+  }
+  if exprUnion(l, fnIx) && !eqAtomOperandOk(l, fnIx) { return false }
+  if exprUnion(r, fnIx) && !eqAtomOperandOk(r, fnIx) { return false }
+  if atomEqPlanOf(e, fnIx).aqArm != "none" || nulNoneEqSides(l, r, fnIx) {
+    return false
+  }
+  if (
+    binEqHasNoLowering(exprIx)
+    || xrepEmitPair(e, fnIx)
+    || binEqGRepUnresolved(exprIx, fnIx)
+    || binEqNulNiche(exprIx, fnIx) != ""
+    || binConcatRepUnresolved(exprIx, fnIx)
+  ) {
+    return false
+  }
+  if (
+    exprIsStrConcat(exprIx, fnIx)
+    || exprIsStrEq(exprIx, fnIx)
+    || exprIsStrOrder(exprIx, fnIx)
+  ) {
+    return false
+  }
+  return listEqArmOf(e, exprIx, fnIx, listOpKindOfBin(exprIx, fnIx)) != ""
+}
+
 // `emitBinExprNode` over reference operands: the list `+` floor, the string, list, struct
 // and function-value compares, and a `null` test of any nullable value.
 function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
@@ -41868,51 +41942,26 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
       )
     }
   }
-  // Asked once and threaded into both arms below, which are one node's answer.
+  // Asked once and threaded into the concat and compare arms below, one node's answer.
   const lopK = listOpKindOfBin(exprIx, fnIx)
-  // the generic list compare — every list rep with no core of its own, above the
-  // `listOpKindOfBin` branch because its own home already declines every shape that branch
-  // claims, and below the `+` concat arm because the two operators never overlap.
   if e.binOp == "==" || e.binOp == "!=" {
     // Two number lists stored apart: one loop reading each side at its own rep (D15055).
     if xrepEmitPair(e, fnIx) { return emitListEqXBin(e, fnIx) }
-    const gK = eqgListKindOfBin(exprIx, fnIx, lopK)
-    if gK >= 0 {
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-      if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
-      svSyncRecv(e.binLeft, fnIx)
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-      if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
-      svSyncRecv(e.binRight, fnIx)
-      if (emitListEqAnyRep(gK, listOpSlotOfBin(exprIx, fnIx), fnIx) < 0) {
-        return -1
-      }
-      if e.binOp == "!=" {
-        fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
-      }
-      return 0
-    }
   }
-  if lopK != "none" {
-    if e.binOp == "+" {
-      if lopK != "i32list" {
-        return emitFail(
-          "emitProgram: list concat over this element kind is not supported",
-        )
-      }
-      return emitListConcatI(e.binLeft, e.binRight, fnIx)
+  if lopK != "none" && e.binOp == "+" {
+    if lopK != "i32list" {
+      return emitFail(
+        "emitProgram: list concat over this element kind is not supported",
+      )
     }
+    return emitListConcatI(e.binLeft, e.binRight, fnIx)
+  }
+  if listEqArmOf(e, exprIx, fnIx, lopK) != "" {
     if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-    if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
-    svSyncRecv(e.binLeft, fnIx)
+    if listEqOperandTail(e.binLeft, fnIx) < 0 { return -1 }
     if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-    if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
-    svSyncRecv(e.binRight, fnIx)
-    if emitEqNonNullCore(exprIx, fnIx) < 0 { return -1 }
-    if e.binOp == "!=" {
-      fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
-    }
-    return 0
+    if listEqOperandTail(e.binRight, fnIx) < 0 { return -1 }
+    return listEqTail(e, exprIx, fnIx)
   }
   // `x == null` / `x != null` over any NULLABLE value — the rep's own null test, never the
   // i32 compare. Checked before the structural string / struct / closure equality below,
