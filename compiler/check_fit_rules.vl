@@ -1926,47 +1926,74 @@ export function objShapeAdapterlessAt(
   shapeAdaptNestedCopySet(false)
   shapeAdaptMapSharedSet(false)
   shapeAdaptRecFieldSet(false)
-  recordCopySafe(srcExpr)
+  recordCopySafe(srcExpr, src, dst)
   if objShapeAdapterless(srcExpr, src, dst, 12, true) { return true }
   return listWidenWalk(srcExpr, src, dst, 12)
 }
 
-// The values deliveries handed on, whose `copySafe` is asked once the check is done: the write
-// scan it reads is complete only then.
+// The values deliveries handed on, and the type each is handed on as, whose `copySafe` is asked
+// once the check is done: the write scan it reads is complete only then.
 let copySafeAsked: i32[] = []
+let copySafeAskedTy: i32[] = []
 
-// Queues the value `srcExpr` a delivery hands on for `copySafeRecordAll`.
-export function recordCopySafe(srcExpr: i32) {
+// Queues the value `srcExpr` a delivery hands on as `dstTy` for `copySafeRecordAll`.
+export function recordCopySafe(srcExpr: i32, srcTy: i32, dstTy: i32) {
   const p = parenPeelIx(srcExpr)
-  if p >= 0 && p < P.nodes.length { copySafeAsked.push(p) }
+  if p < 0 || p >= P.nodes.length || srcTy == dstTy || dstTy < 0 { return 0 }
+  copySafeAsked.push(p)
+  copySafeAskedTy.push(dstTy)
   return 0
 }
 
-// Records `copySafe` on every queued value and on each part of a literal it is, at any depth, which
-// the emitter reads where it copies or views a list. The type is not asked: a hole may close to a list.
+// Records `copySafe` where the emitter reads it: on each queued list, or part of a queued literal,
+// whose element its destination stores differently, or whose type is still open.
 export function copySafeRecordAll() {
-  for p in copySafeAsked { copySafeRecordAt(p) }
+  let i = 0
+  while i < copySafeAsked.length && i < copySafeAskedTy.length {
+    copySafeRecordAt(copySafeAsked[i], copySafeAskedTy[i])
+    i = i + 1
+  }
   copySafeAsked = []
+  copySafeAskedTy = []
   return 0
 }
 
-// `copySafeRecordAll` at the value `p` and the fields and elements of a literal it is.
-function copySafeRecordAt(p: i32) {
-  if p < 0 || p >= P.nodes.length { return 0 }
-  while copySafeAt.length <= p { copySafeAt.push(-1) }
-  if copySafeAt[p] >= 0 { return 0 }
-  copySafeAt[p] = if copySafe(p) { 1 } else { 0 }
+// `copySafeRecordAll` at the value `p` handed on as `dstTy`, and at a literal's fields and elements.
+function copySafeRecordAt(p: i32, dstTy: i32) {
+  const d = nonNulTyOf(dstTy)
+  if p < 0 || p >= P.nodes.length || d < 0 || d >= T.tys.length { return 0 }
   const n = nodeAt(p)
+  const dt = tyAt(d)
   if n is ArrayLit {
-    for e in n.arrElems {
-      const sp = nodeAt(e)
-      copySafeRecordAt(parenPeelIx(if sp is Spread { sp.spdArg } else { e }))
+    if dt is TyArray {
+      for e in n.arrElems {
+        const sp = nodeAt(e)
+        if sp is Spread {
+          copySafeRecordAt(parenPeelIx(sp.spdArg), d)
+        } else {
+          copySafeRecordAt(parenPeelIx(e), tyElemOf(dt))
+        }
+      }
     }
-  } else if n is ObjLit {
-    for fx in n.objFields {
-      const fi = nodeAt(fx)
-      if fi is FieldInit { copySafeRecordAt(parenPeelIx(fi.fiValue)) }
+    return 0
+  }
+  if n is ObjLit {
+    if dt is TyObj {
+      for fx in n.objFields {
+        const fi = nodeAt(fx)
+        if fi is FieldInit {
+          const df = objFieldType(dt, fi.fiName)
+          if df >= 0 { copySafeRecordAt(parenPeelIx(fi.fiValue), df) }
+        }
+      }
     }
+    return 0
+  }
+  const t = nonNulTyOf(nodeTyIxOf(p))
+  const a = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  if a is TyVar || listTysElemDiffer(t, d) {
+    while copySafeAt.length <= p { copySafeAt.push(-1) }
+    if copySafeAt[p] < 0 { copySafeAt[p] = if copySafe(p) { 1 } else { 0 } }
   }
   return 0
 }
