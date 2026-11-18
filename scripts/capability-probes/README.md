@@ -88,6 +88,9 @@ first marker is a free header.
     @@OPEN_POSITIONS@@  positions, one per line, whose ANNOTATED face leaves the value open too
                   (`return_inferred` computes inside a function with no declared result), so
                   both of their faces read WANT_UNANNOTATED
+    @@OWED_ANNOTATED@@  a check refusal the design owes in the annotated face at every built-in
+                  position, one spelling per line, any of which grades the cell OWED (a cell's
+                  own `// owed-annotated:` is the per-cell form)
     @@PROOF@@     statements over the bound name `v`, printing WANT
     @@TEST@@ @@HIT@@ @@MISS@@   a boolean over `v` plus its two branches; PROOF defaults to
                   `if TEST { HIT } else { MISS }`, and these UNLOCK the six discrimination
