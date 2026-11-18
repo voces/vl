@@ -216,7 +216,12 @@ print(sel(true))
 // point and from a local code-point list (S1); a box's `is` test of a record variant, plain and
 // told apart by a literal field (B1); a narrowed box's field read, of an i32 and of a string
 // (B2); a struct parameter's field reads, a list of records' length, and a global record's list
+<<<<<<< ours
+// field's length (B3); a narrowed box read whole at its variant, and a `string | null`
+// parameter read at its string (narrowed read).
+=======
 // field's length (B3); a value `if` bound and one widened into an `f64` binding (B4a).
+>>>>>>> theirs
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -295,8 +300,13 @@ print(guard(2))
   `type P = { x: i32, y: i32 }\nfunction sum(p: P): i32 { return p.x + p.y }\nprint(sum({ x: 1, y: 2 }))\n`,
   `type P = { x: i32 }\nfunction n(ps: P[]): i32 { return ps.length }\nprint(n([{ x: 1 }, { x: 2 }]))\n`,
   `type S = { xs: i32[], name: string }\nconst s: S = { xs: [1, 2, 3], name: "s" }\nfunction cnt(): i32 { return s.xs.length }\nprint(cnt())\n`,
+<<<<<<< ours
+  `type P = { x: i32 }\ntype Q = { y: string }\nfunction viaP(u: P | Q): i32 {\n  if u is P {\n    const p: P = u\n    return p.x\n  }\n  return 0\n}\nprint(viaP({ x: 4 }))\nprint(viaP({ y: "a" }))\n`,
+  `function orEmpty(s: string | null): string {\n  if s == null { return "" }\n  return s\n}\nprint(orEmpty("a"))\nprint(orEmpty(null))\n`,
+=======
   `function f(c: boolean, x: i32): i32 {\n  const y = if c { x + 1 } else { 0 }\n  return y * 2\n}\nprint(f(true, 2))\nprint(f(false, 2))\n`,
   `function w(c: boolean, x: i32): f64 {\n  const y: f64 = if c { x } else { 2.5 }\n  return y\n}\nprint(w(true, 3))\n`,
+>>>>>>> theirs
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",

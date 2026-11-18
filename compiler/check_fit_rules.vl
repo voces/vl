@@ -320,7 +320,7 @@ import {
 } from "./check_obj_shape"
 import { parenPeelIx } from "./check_places"
 import { rcwMembersOf } from "./check_rcw"
-import { recAdRecOf } from "./check_rec_adopt"
+import { recAdDeclAgrees, recAdRecOf } from "./check_rec_adopt"
 import {
   recAdPass,
   recAdPinInit,
@@ -608,12 +608,17 @@ import {
   CW_UP_ASG_LHS,
   CW_UP_ASG_RHS,
   CW_UP_CALLEE,
+  CW_UP_CMP,
   CW_UP_COAL,
   CW_UP_ELEM,
   CW_UP_FIELD,
+  CW_UP_IS,
+  CW_UP_ITER,
   CW_UP_LETINIT,
+  CW_UP_NONE,
   CW_UP_OBJ,
   CW_UP_RET,
+  CW_UP_SPREAD,
   CW_UP_TAIL,
   covarRootName,
   cwBindingOf,
@@ -2069,6 +2074,254 @@ function recAtStoreArg(at: i32): boolean {
     && (tyAt(rt) is TyArray || tyAt(rt) is TyMap)
 }
 
+function deliveryBind(bind: "held" | "bound", x: i32): i32 {
+  return match bind {
+    "held" => recHeldDecl(x)
+    "bound" => recBindDeclOf(x)
+  }
+}
+
+// The binding a delivered value lands in, and where in it: the whole binding, an element of a
+// list or map, or a field of a record. `null` where it lands in no binding (a parameter, a return).
+type DeliveryRoot = {
+  decl: i32,
+  part: "whole" | "elem" | "field",
+  field: string,
+}
+
+// The `DeliveryRoot` of the value `at`, read from the write scan's edge to its consumer: a binding's
+// initialiser, an assignment's right side, a `push` or `set` argument, or a literal part, which
+// lands where the literal does. One hop through a literal; deeper is `null`. `bind` says how a
+// place names its binding: one holding literals only (`recHeldDecl`), or any (`recBindDeclOf`).
+function deliveryRoot(at: i32, bind: "held" | "bound"): DeliveryRoot | null {
+  cwIxBuild()
+  if at < 0 || !cwIxCovers(at) { return null }
+  const uk = cwIxUpKind[at]
+  const up = cwIxUp[at]
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  if uk == CW_UP_LETINIT { return { decl: up, part: "whole", field: "" } }
+  if uk == CW_UP_ASG_RHS && un is BinExpr && un.binOp == "=" {
+    const t = cwPeelValue(un.binLeft)
+    const tn = if t >= 0 && t < P.nodes.length { nodeAt(t) } else { null }
+    if tn is Ident { return deliveryRootOf(deliveryBind(bind, t), "whole", "") }
+    if tn is Index {
+      return deliveryRootOf(
+        deliveryBind(bind, cwPeelValue(tn.idxArr)),
+        "elem",
+        "",
+      )
+    }
+    if tn is Member {
+      return deliveryRootOf(
+        deliveryBind(bind, cwPeelValue(tn.memObj)),
+        "field",
+        tn.memProp,
+      )
+    }
+    return null
+  }
+  if (
+    uk == CW_UP_ARG
+    && recAtStoreArg(at)
+    && un is Call
+    && un.callFn >= 0
+    && un.callFn < P.nodes.length
+  ) {
+    const f = nodeAt(un.callFn)
+    if f is Member {
+      return deliveryRootOf(
+        deliveryBind(bind, cwPeelValue(f.memObj)),
+        "elem",
+        "",
+      )
+    }
+    return null
+  }
+  if uk == CW_UP_ELEM || uk == CW_UP_FIELD {
+    const outer = deliveryRoot(up, bind)
+    if outer == null || outer.part != "whole" { return null }
+    if uk == CW_UP_ELEM { return { decl: outer.decl, part: "elem", field: "" } }
+    return {
+      decl: outer.decl,
+      part: "field",
+      field: cwFieldNameOf(cwIxUpAux[at]),
+    }
+  }
+  // A parameter, a result, or a value no binding holds: an argument to a call other than a
+  // container's store, a return or tail, a comparison, a callee, an object, a loop's iterable, an
+  // `is` operand, a `??` operand, a match arm, a spread, or no consumer at all.
+  if (
+    uk == CW_UP_ARG
+    || uk == CW_UP_ASG_RHS
+    || uk == CW_UP_RET
+    || uk == CW_UP_TAIL
+    || uk == CW_UP_CMP
+    || uk == CW_UP_CALLEE
+    || uk == CW_UP_OBJ
+    || uk == CW_UP_ITER
+    || uk == CW_UP_IS
+    || uk == CW_UP_COAL
+    || uk == CW_UP_ARM
+    || uk == CW_UP_SPREAD
+    || uk == CW_UP_ASG_LHS
+    || uk == CW_UP_NONE
+  ) {
+    return null
+  }
+  return null
+}
+
+// A `DeliveryRoot` on binding `d`, or `null` where `d` names no binding.
+function deliveryRootOf(
+  d: i32,
+  part: "whole" | "elem" | "field",
+  field: string,
+): DeliveryRoot | null {
+  return if d >= 0 && d < P.nodes.length { { decl: d, part: part, field: field } } else { null }
+}
+
+// A re-check's adoption demand the closure owed a round earlier: one whose delivery reaches a
+// binding an earlier round adopted, or reaches no binding at all. Null for a demand rooted at a
+// binding another pin settled, which the re-check budget bounds.
+export function recAdLateMiss(): LateMiss | null {
+  let j = 0
+  while j < recAdPass.decl.length {
+    if i32ListHas(recAdPass.pinDecl, recAdPass.decl[j]) {
+      const at = recAdPass.at[j]
+      const r = deliveryRoot(at, "bound")
+      if r == null {
+        return {
+          at: at,
+          msg: recAdLateMsg(
+            j,
+            "it is "
+              + cwUpPhrase(cwIxUpKind[at])
+              + ", an edge the adoption closure does not follow",
+          ),
+        }
+      }
+      if i32ListHas(recAdProg.origDecl, r.decl) {
+        return {
+          at: at,
+          msg: recAdLateMsg(
+            j,
+            "it lands in "
+              + rootPartPhrase(r)
+              + " `"
+              + declNameOf(r.decl)
+              + "`, adopted a round earlier, when the adoption closure owed it",
+          ),
+        }
+      }
+    }
+    j = j + 1
+  }
+  return null
+}
+
+export type LateMiss = { at: i32, msg: string }
+
+function recAdLateMsg(j: i32, edge: string): string {
+  return "internal: the delivery of `"
+    + declNameOf(recAdPass.decl[j])
+    + "` at line "
+    + i32ToStr(nodeLineOf(recAdPass.at[j]))
+    + " raised its adoption a re-check late; "
+    + edge
+}
+
+function rootPartPhrase(r: DeliveryRoot): string {
+  return match r.part {
+    "whole" => "the whole of"
+    "elem" => "an element of"
+    "field" => "field `" + r.field + "` of"
+  }
+}
+
+function declNameOf(d: i32): string {
+  const n = nodeAt(d)
+  return if n is LetDecl { n.letName } else { "this binding" }
+}
+
+// What an up-edge kind delivers into, as the late-adoption assertion names it.
+function cwUpPhrase(k: i32): string {
+  if k == CW_UP_LETINIT { return "a binding's initialiser" }
+  if k == CW_UP_ASG_LHS { return "an assignment's target" }
+  if k == CW_UP_ASG_RHS { return "an assignment" }
+  if k == CW_UP_CMP { return "a comparison operand" }
+  if k == CW_UP_ARG { return "an argument" }
+  if k == CW_UP_CALLEE { return "a callee" }
+  if k == CW_UP_OBJ { return "a member read's receiver" }
+  if k == CW_UP_FIELD { return "a record literal's field" }
+  if k == CW_UP_ELEM { return "a list literal's element" }
+  if k == CW_UP_RET { return "a return" }
+  if k == CW_UP_TAIL { return "a block's result" }
+  if k == CW_UP_ITER { return "an iterated value" }
+  if k == CW_UP_COAL { return "a `??` operand" }
+  if k == CW_UP_IS { return "an `is` test" }
+  if k == CW_UP_ARM { return "a branch's result" }
+  if k == CW_UP_SPREAD { return "a spread" }
+  if k == CW_UP_NONE { return "a statement" }
+  return "outside the occurrence index"
+}
+
+// Closes this pass's adoption demands over the deliveries queued at their own type (`recOwnSrc`):
+// a value landing in a binding a demand adopts is delivered at the type that binding takes there,
+// so the re-check that would raise its demand a round later is not needed (D16958).
+export function recAdCloseEdges() {
+  let i = 0
+  while i < recAdPass.decl.length {
+    const d = recAdPass.decl[i]
+    if recAdDeclAgrees(i) {
+      // A map stored into a `Map()` binding is no own-type delivery, so its values are read from
+      // the stores, as the map rule follows a chain of them.
+      const w = recAdPass.whole[i]
+      const wt = if w >= 0 && w < T.tys.length { tyAt(w) } else { null }
+      if wt is TyMap && tyAt(tyValOf(wt)) is TyMap {
+        for v in recMapStoredValues(d) {
+          recAdoptMapNote(v, nodeTyIxOf(v), tyValOf(wt))
+        }
+      }
+      for u in recOwnSrc {
+        const r = deliveryRoot(u, "held")
+        if r != null && r.decl == d {
+          const t = recAdEdgeDst(i, r)
+          // Delivered as the pending loop delivers it: a `Map()` binding through the map rule.
+          if t >= 0 {
+            recAdoptNote(u, nodeTyIxOf(u), t)
+            recAdoptMapNote(u, nodeTyIxOf(u), t)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return 0
+}
+
+// The type demand `i` gives the part of its binding that root `r` names, or -1: read from the
+// binding's whole type, the map a `Map()` binding is delivered as, or else the record or its list.
+function recAdEdgeDst(i: i32, r: DeliveryRoot): i32 {
+  if (
+    i < 0
+    || i >= recAdPass.dst.length
+    || i >= recAdPass.whole.length
+    || i >= recAdPass.elem.length
+  ) {
+    return -1
+  }
+  const dst = recAdPass.dst[i]
+  if dst < 0 || dst >= T.tys.length { return -1 }
+  const w = recAdPass.whole[i]
+  const b = if w >= 0 && w < T.tys.length { w } else if recAdPass.elem[i] { mkArrayTy(dst) } else { dst }
+  const bt = tyAt(b)
+  return match r.part {
+    "whole" => b
+    "elem" => if bt is TyArray { tyElemOf(bt) } else if bt is TyMap { tyValOf(bt) } else { -1 }
+    "field" => if bt is TyObj { objFieldType(bt, r.field) } else { -1 }
+  }
+}
+
 // The record of `dstTy` a record of `srcTy` lands on, past null and through a union
 // (`recAdLanding`); -1 when either is -1.
 function recLandingOf(srcTy: i32, dstTy: i32): i32 {
@@ -2222,11 +2475,17 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
     }
     i = i + 1
   }
-  // A literal read through a binding is built at `dst`, and the binding keeps its type.
+  // A literal read through a binding is built at `dst`, and the binding keeps its type. A
+  // re-pointed binding also holds what is written to it, delivered as its own read is (D16961).
   i = 0
   while i < lits.length {
     if litVia[i] >= 0 {
-      recBuildPush(recHeldDecl(litVia[i]), nodeTyIxOf(lits[i]), dst, false)
+      const hd = recHeldDecl(litVia[i])
+      if cwDeclAssigned(hd) {
+        recAdPushDecl(hd, nodeTyIxOf(lits[i]), dst, false, litVia[i])
+      } else {
+        recBuildPush(hd, nodeTyIxOf(lits[i]), dst, false)
+      }
     }
     recordRepTyAdopt(lits[i], dst)
     recLitFieldsDeliver(lits[i], dst, REC_STORE_DEPTH)
