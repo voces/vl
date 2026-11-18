@@ -49,7 +49,11 @@ import {
   nodeAt,
 } from "./ast"
 import { unwrapParen } from "./emit_base"
-import { forInElemKind } from "./emit_classify"
+import {
+  exprVariantIndex,
+  forInElemKind,
+  structIndexOfExpr,
+} from "./emit_classify"
 import { forInStringSrc } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { declaredSlotOfDecl } from "./emit_struct_order"
@@ -198,11 +202,15 @@ import {
   printNulStrTail,
   printScalarTail,
   printStrTail,
+  structFieldPlain,
+  structFieldTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
+  variantFieldPlain,
+  variantFieldTail,
   variantTagTail,
   voidTailCallee,
 } from "./wasmEmit"
@@ -303,6 +311,9 @@ export function irLSkip(o: Opnd) {
   if o is OVar && isTemp(o.ov) {
     if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
     if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
+    // A field read's receiver is consumed first, as `irLOpnd` writes it.
+    const r = tempRhs(o.ov)
+    if r is RGetField { irLSkip(r.gfV) }
     lwSeq.push(o.ov)
   }
   return 0
@@ -482,7 +493,8 @@ function rhs(r: Rhs, tail: boolean) {
       variantTagTail(r.teTarget)
     }
     RBoxField => boxField(r)
-    RCallRef | RCallHost | RCast | RTagOf | RMakeRec | RGetField | RListNew | RMapOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RGetField => getField(r)
+    RCallRef | RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMakeClo | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeList => makeList(r)
   }
 }
@@ -559,6 +571,24 @@ function boxField(r: RBoxField) {
   irLOpnd(r.bfV)
   narrowedFieldTail(memNarrowVariantIndex(r.bfAt, fnIx), idx, r.bfAt, fnIx)
   return emitReadRecover(r.bfAt, fnIx)
+}
+
+// `RGetField`: the record, then legacy's field read and its recover, and the read's own recover,
+// as `emitExpr` writes a member read through `emitMemVariantRead` or `emitMemStructRead`.
+function getField(r: RGetField) {
+  const fnIx = lw.irAt
+  const m = nodeAt(r.gfAt)
+  if !(m is Member) { return irLMiss("field node") }
+  const vi = exprVariantIndex(m.memObj, fnIx)
+  const idx = if vi >= 0 { variantFieldPlain(r.gfAt, fnIx) } else { structFieldPlain(r.gfAt, fnIx) }
+  if idx < 0 { return irLMiss("field shape") }
+  irLOpnd(r.gfV)
+  if vi >= 0 {
+    variantFieldTail(vi, idx, r.gfAt, fnIx)
+  } else {
+    structFieldTail(structIndexOfExpr(m.memObj, fnIx), idx, r.gfAt, fnIx)
+  }
+  return emitReadRecover(r.gfAt, fnIx)
 }
 
 // `RMakeList`: legacy's build pair and prologue, then each element, then the short tail at the

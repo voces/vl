@@ -88,6 +88,7 @@ import {
   coalResultKindOf,
   coalesceNulStrStaysNullable,
   deadNullTestOperand,
+  exprPrePathWhy,
   forInPlainWhy,
   globalReadRecovers,
   idxStorePlainWhy,
@@ -127,6 +128,7 @@ import {
   RList,
   RMap,
   RNullable,
+  RRecord,
   repNodeAt,
   repNodeGen,
   repNodeOfTy,
@@ -197,7 +199,7 @@ function censusGoesOn(why: string): boolean {
 // The families whose every occurrence the shadow has matched, so a function built wholly of them
 // ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
 const CLAIMED: IrFamily[] = [
-  "scalar", "control", "call", "global", "map", "list", "box",
+  "scalar", "control", "call", "global", "map", "list", "box", "record",
 ]
 let ibClaimAll = false
 // Set while `irClaimFn` builds, never under the shadow, which builds every function whole.
@@ -314,6 +316,7 @@ function valueRep(r: i32, ty: i32): boolean {
   return repIsScalar(r)
     || repNodeAt(r) is RAtom
     || repNodeAt(r) is RBox
+    || repNodeAt(r) is RRecord
     || boxedNullable(r)
     || atomNullable(r)
     || strNullable(r)
@@ -891,6 +894,10 @@ function popStmt(b: i32[], c: Call, ix: i32) {
 // A one-argument `.push` legacy writes as the plain append (`pushPlainWhy`): its receiver, then
 // its value at the list's element rep.
 function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  // The checker typed the receiver: a record's function-valued field named `push` is a call.
+  if !(repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList) {
+    return missRhs("member call on a record field")
+  }
   const pp = pushPlanOf(ix, ibFnIx)
   if pp == null { return missRhs("push plan") }
   const why = pushPlainWhy(pp, ibFnIx)
@@ -1248,6 +1255,8 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
 
 function irBExprAt(b: i32[], ix: i32): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
+  const pre = exprPrePathWhy(ix, ibFnIx)
+  if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return irBExpr(b, n.parInner) }
   const rep = primRepOf(ix)
@@ -1668,6 +1677,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return 0
     }
     if none { return skip("void return value") }
+    if retBoxesCall(n.retArg) { return skip("return of a boxed call") }
     const v = deliver(b, n.retArg, ib.irRetRep)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
@@ -1678,6 +1688,10 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is BinExpr && n.binOp == "=" {
     assign(b, n, ix)
     return 0
+  }
+  // A parenthesised call statement is that call statement, as legacy's `emitStmt` has it.
+  if n is Paren && nodeAt(unwrapParen(ix)) is Call {
+    return stmtNode(b, unwrapParen(ix), sibs, pos)
   }
   if n is Call {
     if isPopStmt(n) { return popStmt(b, n, ix) }
@@ -1702,6 +1716,16 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     return 0
   }
   skip("statement")
+}
+
+// Whether returning `ix` boxes a call's result into a boxed nullable: legacy tail-calls it when
+// the box writer writes nothing, a choice made on the bytes the lowering cannot see ahead.
+function retBoxesCall(ix: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  return nodeAt(u) is Call
+    && boxedNullable(ib.irRetRep)
+    && primRepOf(u) != ib.irRetRep
 }
 
 // A non-void body's tail. An expression body's one statement is its value; a block body's last
@@ -1731,6 +1755,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return skip("block body falls off")
   }
   const n0 = b.length
+  if retBoxesCall(last) { return skip("return of a boxed call") }
   const v = deliver(b, last, ib.irRetRep)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
