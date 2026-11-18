@@ -19,14 +19,17 @@
 #   lines            its own body; the call chains that die with it are not counted
 #   doors            what still reaches it as shipped, joined: the blocker classes of every
 #                    unclaimed function whose legacy body hits it; `@ir` when the claim path
-#                    itself calls it; `@start` for top-level code; `@module` for module passes
+#                    itself calls it; `@start <miss>` for top-level code, by the first miss of
+#                    each start body in that program (`@start` alone when none was recorded);
+#                    `@module` for module passes
 #   role             what deleting it needs (a heuristic over its body):
 #                      `ast` (calls emitExpr and kin: it walks the AST, so only a new IR lowering
 #                      replaces it); `value` (writes code from values: the IR can share it, so it
 #                      stays); `decide` (writes nothing: a gate or re-derivation, so routing that
 #                      dies with its door)
 # `<out>.doors` ranks the classes by the lines of the drivers whose one remaining door they are,
-# split by role. Covering a door deletes its `decide` rows and the dispatch arms above them; its
+# split by role. `<out>.start-doors` ranks the start misses over the drivers only top-level code
+# reaches: the lines each keeps alone, and those it keeps beside other start misses. Covering a door deletes its `decide` rows and the dispatch arms above them; its
 # `value` rows move to `@ir`.
 # `<out>.reentry` ranks the IR's re-entries into `emitExpr` ($REENTRY, door `@re:<name>`) by the
 # lines the claim path reaches only through each: what leaves it when the IR owns the operand.
@@ -266,6 +269,7 @@ fi | awk -F'\t' -v mode="$mode" -v names="$T/names" '
     if ($2 ~ /^drv /) s[name[substr($2, 5)]] += n
     else if (mode == 5 && $2 ~ /^drvf /) print h "\t0\t" $2
     else if (mode == 4 && $2 ~ /^fnb /) print h "\t" n "\t" $2
+    else if (mode == 1 && $2 ~ /^start uncovered /) print h "\t0\tsmiss " substr($2, 17)
   }
   END { for (f in s) print "-\t" s[f] "\tdrv " f }
 ' > "$out"
@@ -290,15 +294,25 @@ for m in 1 5; do
     "$T/rows$m" | sort > "$T/hits$m"
 done
 # Under the shipped claim, the doors reaching each function: every tag's blocker classes, joined.
-awk -F'\t' -v names="$T/names" '
+# A program's top-level code is `@start <miss>`, one door per start body's first miss in it.
+awk -F'\t' -v names="$T/names" -v r1="$T/rows1" -v r4="$T/rows4" '
   BEGIN { while ((getline l < names) > 0) name[c++] = l }
-  FNR == NR { if ($3 ~ /^fnb /) { r = substr($3, 5); i = index(r, " "); set[$1 SUBSEP substr(r, 1, i - 1)] = substr(r, i + 1) }; next }
+  FILENAME == r1 {
+    if ($3 ~ /^smiss /) {
+      w = "@start " substr($3, 7)
+      if (index(" + " smiss[$1] " + ", " + " w " + ") == 0) smiss[$1] = (smiss[$1] == "" ? w : smiss[$1] " + " w)
+    }
+    next
+  }
+  FILENAME == r4 { if ($3 ~ /^fnb /) { r = substr($3, 5); i = index(r, " "); set[$1 SUBSEP substr(r, 1, i - 1)] = substr(r, i + 1) }; next }
   $3 ~ /^drvf / {
     m = split($3, k, " "); tag = k[2]
     if (tag ~ /^f[0-9]+$/) {
       b = set[$1 SUBSEP substr(tag, 2)]
       if (b == "") b = "?"
       if (b == "none") b = "@unclaimed covered"
+    } else if (tag == "@start" && smiss[$1] != "") {
+      b = smiss[$1]
     } else {
       b = tag
     }
@@ -306,7 +320,7 @@ awk -F'\t' -v names="$T/names" '
     for (i = 3; i <= m; i++) for (j = 1; j <= n; j++) d[name[k[i]] SUBSEP parts[j]] = 1
   }
   END { for (x in d) { split(x, y, SUBSEP); print y[1] "\t" y[2] } }
-' "$T/rows4" "$T/rows5" | sort -t$'\t' -k1,1 -k2,2 > "$T/doors"
+' "$T/rows1" "$T/rows4" "$T/rows5" | sort -t$'\t' -k1,1 -k2,2 > "$T/doors"
 
 # The static call sites of each name in compiler/, its definition excluded, and its lines.
 cat compiler/*.vl > "$T/all.vl"
@@ -344,6 +358,17 @@ if [ "$OUT" != /dev/stdout ]; then
       for (d in l) print l[d] "\t" n[d] "\t" r[d SUBSEP "decide"] + 0 "\t" r[d SUBSEP "value"] + 0 "\t" r[d SUBSEP "ast"] + 0 "\t" d
     }' "$T/table" | sort -rn \
     | { printf 'lines\tfunctions\tdecide\tvalue\tast\tdoor\n'; cat; } > "$OUT.doors"
+  # The drivers only top-level code reaches, by the start miss that keeps them: `alone` counts
+  # those whose one door it is, `shared` those it reaches beside other start misses.
+  awk -F'\t' 'NR > 1 && $3 > 0 {
+      n = split($6, d, / \+ /); only = 1
+      for (i = 1; i <= n; i++) if (d[i] !~ /^@start/) only = 0
+      if (!only) next
+      if (n == 1) { a[d[1]] += $5; f[d[1]]++ }
+      for (i = 1; i <= n; i++) s[d[i]] += $5
+    }
+    END { for (x in s) print a[x] + 0 "\t" f[x] + 0 "\t" s[x] "\t" x }' "$T/table" | sort -rn \
+    | { printf 'alone_lines\tfunctions\tshared_lines\tdoor\n'; cat; } > "$OUT.start-doors"
 fi
 
 # Each re-entry's reach under the claim: the drivers the IR's lowering hits through it, those of
