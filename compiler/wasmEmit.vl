@@ -8314,11 +8314,17 @@ function emitNulStrFieldRecover(r: i32, readIx: i32, fnIx: i32) {
   return 0
 }
 
+// After a box: its payload cast to variant `vi`'s struct.
+export function narrowedVariantTail(vi: i32) {
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(variantHeap(vi))
+  return 0
+}
+
 // After a box narrowed to variant `vi`: its payload as that variant, then field `idx`, recovered
 // non-null where a narrowed `string | null` field reads present.
 export function narrowedFieldTail(vi: i32, idx: i32, memIx: i32, fnIx: i32) {
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(variantHeap(vi))
+  narrowedVariantTail(vi)
   return variantFieldTail(vi, idx, memIx, fnIx)
 }
 
@@ -11504,10 +11510,8 @@ export function emitVariantCoerce(vi: i32, exprIx: i32, fnIx: i32) {
       return emitFailCrossTagDelivery(exprIx, vi)
     }
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     if vi < 0 { return -1 }
-    fbRefCast(variantHeap(vi)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
-    return 0
+    return narrowedVariantTail(vi)
   }
   return emitVariantPassThrough(exprIx, fnIx)
 }
@@ -39513,6 +39517,41 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
   return emitIdentLocalRead(exprIx, idx, fnIx)
 }
 
+// Whether `emitIdentNode` reads Ident `ix`, typed as a record or an atom, through
+// `emitIdentLocalRead`: no null read, unbox or capture arm takes it. Its list overrides and
+// stand-ins, which read the body lowering's state, never type a read that is not a list.
+export function identReadsLocalPlain(e: Ident, ix: i32, fnIx: i32): boolean {
+  if identCellVKind(ix, fnIx) == "nulnone" { return false }
+  if isNullTy(readNarrowedTyAt(ix, fnIx)) { return false }
+  if isDefaultGlobalRef(ix) || identReadAtomKindAt(ix, fnIx) >= 0 {
+    return false
+  }
+  const boxed = identReadsUnionBox(e.identName, ix, fnIx)
+  if nicheReadKindAt(ix, fnIx) >= 0 && boxed { return false }
+  const con = identReadContainerAt(ix, fnIx)
+  if con == RC_MAP || con == RC_REF_LIST && boxed { return false }
+  return !capturedNameIn(e.identName, fnIx) && localIndexOf(fnIx, ix) >= 0
+}
+
+// Whether `name` is a capture `emitCapturedRead` reads from the env of capturing function `fnIx`.
+function capturedNameIn(name: string, fnIx: i32): boolean {
+  if fnIx < 0 || !fnNestUsed { return false }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 || fnEnvIdxOf(fe) < 0 { return false }
+  return strListHas(captureNamesOf(fe), name)
+}
+
+// The variant a box local's plain read `ix` unboxes to at a destination of that variant
+// (`emitVariantCoerce`'s box arm), or -1; a cross-tag fit owes a refusal there.
+export function narrowedBoxVariantPlain(ix: i32, fnIx: i32): i32 {
+  const n = nodeAt(ix)
+  if !(n is Ident) || !identReadsLocalPlain(n, ix, fnIx) { return -1 }
+  if exprVariantIndex(ix, fnIx) >= 0 || !exprUnion(ix, fnIx) { return -1 }
+  const vi = narrowedStructArmVi(ix, fnIx)
+  if vi < 0 || variantHasCrossTagFits(vi, ix, fnIx) { return -1 }
+  return vi
+}
+
 // Whether a narrowed read of `name` finds the union box it unboxes: a binding of this frame
 // with a union render, a capture held as a box, or the typed-IR net for a binding with neither.
 function identReadsUnionBox(name: string, exprIx: i32, fnIx: i32): boolean {
@@ -39595,14 +39634,15 @@ function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32) {
     return 0
   }
   fbLocalGet(idx)
-  // A `string | null` param or local recovers the non-null ref exactly when the read's own
-  // type at the instance excludes null.
-  if paramNulString(fnIx, exprIx) || declaredNulString(exprIx) {
-    if nulStrReadRecovers(exprIx, fnIx) {
-      fbRefAsNonNull() // 0xd4
-    }
-  }
+  if localNulStrRecovers(exprIx, fnIx) { fbRefAsNonNull() }
   return 0
+}
+
+// Whether the read `exprIx` of a `string | null` param or local recovers the non-null ref:
+// exactly when the read's own type at the instance excludes null.
+export function localNulStrRecovers(exprIx: i32, fnIx: i32): boolean {
+  return (paramNulString(fnIx, exprIx) || declaredNulString(exprIx))
+    && nulStrReadRecovers(exprIx, fnIx)
 }
 
 function emitUnaryNode(e: Unary, exprIx: i32, fnIx: i32) {
