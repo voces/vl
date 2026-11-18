@@ -6476,9 +6476,9 @@ function isPatUnionArmTy(recvIx: i32, patTy: i32, fnIx: i32): i32 {
 
 // A box test naming a map with a numeric literal-union value, or its base twin, where the box
 // cannot say which it holds: the receiver's union has two members of that one member class, or
-// the instance is pinned at the other (D2493). Refused at `at`; -1 when refused, else 0.
-function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
-  if patTy < 0 { return 0 }
+// the instance is pinned at the other (D2493). The map type that clashes, or -1.
+function mapSoftTwinClashOf(recvIx: i32, patTy: i32, fnIx: i32): i32 {
+  if patTy < 0 { return -1 }
   const pat: i32[] = []
   flattenVariantsInto(patTy, pat)
   const arms: i32[] = []
@@ -6509,18 +6509,23 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
         }
         q = q + 1
       }
-      if soft && inClass > 1 {
-        return emitFailAt(
-          "emitProgram: a test cannot tell "
-            + tyToEmitName(pm)
-            + " from the map its numeric literal union reads as yet — wrap each map in a record with a discriminant field",
-          at,
-        )
-      }
+      if soft && inClass > 1 { return pm }
     }
     i = i + 1
   }
-  return 0
+  return -1
+}
+
+// `mapSoftTwinClashOf`'s clash refused at `at`: -1 when refused, else 0.
+function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
+  const pm = mapSoftTwinClashOf(recvIx, patTy, fnIx)
+  if pm < 0 { return 0 }
+  return emitFailAt(
+    "emitProgram: a test cannot tell "
+      + tyToEmitName(pm)
+      + " from the map its numeric literal union reads as yet — wrap each map in a record with a discriminant field",
+    at,
+  )
 }
 
 // Whether literal test `nd` (a literal or literal set) can never hold at instance `fnIx`: the
@@ -7007,116 +7012,143 @@ function atomArmSlots(a: i32, depth: i32, slots: i32[]): boolean {
   return true
 }
 
-// The scalar and literal rungs of `emitIsTest`, in order: a scalar map read, a nullable niche,
-// a literal atom, a literal-union arm, a numeric-literal base and literal membership. 1 when
-// the test is emitted, 0 when every rung declines, -1 on failure.
-function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32) {
-  const imk = mapReadScalarBoxKind(nd0.isObj, fnIx)
-  if imk >= 0 {
-    const imr = emitScalarMapReadIs(isIx, nd0.isObj, imk, fnIx)
-    if imr < 0 { return -1 }
-    if imr > 0 { return 1 }
-  }
-  if exprNullableRefNiche(nd0.isObj, fnIx) {
-    if nulNicheIsTestImpossible(nd0.isObj, isVarTyIxOf(isIx), fnIx) {
-      fbI32Const(0)
-      return 1
-    }
-    const nst = emitNulIsNullTest(nd0.isObj, fnIx, !isTestsNull(isIx), true)
-    if nst < 0 { return -1 }
-    if nst > 0 { return 1 }
-    // The storage is the ref niche even where the checked type holds no `null`.
-    if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-    fbRefIsNull()
-    if !isTestsNull(isIx) { fbI32Eqz() }
-    return 1
-  }
-  if exprIsLitAtom(nd0.isObj, fnIx) {
-    // Every member of a literal union is a string, so `is string` holds of the atom
-    // outright, and of the `K | null` niche exactly when it is not the `-1` null (D2154).
-    if tyPrimNameOf(isVarTyIxOf(isIx)) == "string" {
-      if exprNulLitUnion(nd0.isObj, fnIx) {
-        if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-        fbI32Const(-1)
-        fbI32Bin(71) // 0x47 i32.ne
-        return 1
-      }
-      fbI32Const(1)
-      return 1
-    }
-    const laTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
-    if laTexts.length > 0 {
-      if nodeLitMembersWithin(nd0.isObj, laTexts) {
-        fbI32Const(1)
-        return 1
-      }
+// The literal and niche arms `emitIsTestLitArms` writes, in order; `none` where none answers.
+export type LitIsArm = "mapNull"
+  | "mapHas"
+  | "nicheNever"
+  | "nicheTest"
+  | "nicheRaw"
+  | "atomNotNul"
+  | "atomTrue"
+  | "atomEq"
+  | "boxLits"
+  | "numBox"
+  | "memberTrue"
+  | "memberNoRecv"
+  | "memberEq"
+  | "none"
 
-      let laOk = laTexts.length == 1
-      if unionEqOperandOk(nd0.isObj) { laOk = true }
-      if laOk {
-        let laI = 0
-        while laI < laTexts.length {
-          if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-          fbI32Rel(RS_ATOM, internAtom(quoteLex(laTexts[laI])))
-          fbI32Bin(70)
-          if laI > 0 { fbI32Bin(114) }
-          laI = laI + 1
-        }
-        return 1
-      }
+// The literal arm of `is` test `isIx`: a scalar map read's presence, a ref niche's null test, an
+// atom's membership, a box's literal arms, or literal membership over a plain receiver.
+function litIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): LitIsArm {
+  const t = isVarTyIxOf(isIx)
+  const imk = mapReadScalarBoxKind(nd.isObj, fnIx)
+  const rd = nodeAt(unwrapParen(nd.isObj))
+  // `m[k] is T` over a bare scalar-valued map read (D2466): `is null` is a miss, and `is` the
+  // value's own scalar a hit.
+  if imk >= 0 && rd is Index {
+    const tn = tyPrimNameOf(t)
+    if tn != null && tn == "null" { return "mapNull" }
+    if tn != null && tn == scalarAtomNameOfKind(imk) { return "mapHas" }
+  }
+  if exprNullableRefNiche(nd.isObj, fnIx) {
+    if nulNicheIsTestImpossible(nd.isObj, t, fnIx) { return "nicheNever" }
+    if nulTestArmOf(nd.isObj, fnIx, !isTestsNull(isIx), true) != "none" {
+      return "nicheTest"
     }
+    // The storage is the ref niche even where the checked type holds no `null`.
+    return "nicheRaw"
+  }
+  const atom = exprIsLitAtom(nd.isObj, fnIx)
+  const texts = tyLitMemberTexts(t)
+  const reread = unionEqOperandOk(nd.isObj)
+  if atom {
+    // Every member of a literal union is a string, so `is string` holds of the atom outright,
+    // and of the `K | null` niche exactly when it is not the `-1` null (D2154).
+    if tyPrimNameOf(t) == "string" {
+      return if exprNulLitUnion(nd.isObj, fnIx) { "atomNotNul" } else { "atomTrue" }
+    }
+    if texts.length > 0 && nodeLitMembersWithin(nd.isObj, texts) {
+      return "atomTrue"
+    }
+    if texts.length > 0 && (texts.length == 1 || reread) { return "atomEq" }
   }
   const lur: i32[] = []
-  const luNm = unionNameRowOfExpr(nd0.isObj, fnIx, lur)
-  if (luNm != "" && unionCarriesLitUnionArmOfSet(msSetOfRow(lur[0]), lur[1])) {
-    const luTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
-    if luTexts.length > 0 && unionEqOperandOk(nd0.isObj) {
-      let luI = 0
-      while luI < luTexts.length {
-        const luLit = quoteLex(luTexts[luI])
-        if emitUnionLitIs(nd0.isObj, luLit, fnIx) < 0 { return -1 }
-        if luI > 0 { fbI32Bin(114) }
-        luI = luI + 1
-      }
-      return 1
-    }
+  const luNm = unionNameRowOfExpr(nd.isObj, fnIx, lur)
+  const carries = luNm != ""
+    && unionCarriesLitUnionArmOfSet(msSetOfRow(lur[0]), lur[1])
+  if carries && texts.length > 0 && reread { return "boxLits" }
+  if (
+    numLitUnionHasBase(t)
+    && tyNumLitMemberTexts(t).length > 0
+    && exprUnion(nd.isObj, fnIx)
+    && reread
+    && luNm != ""
+    && (isValueUnionOfSet(msSetOfRow(lur[0]), lur[1]) || carries)
+  ) {
+    return "numBox"
   }
-  if numLitUnionHasBase(isVarTyIxOf(isIx)) {
-    const nbTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
-    if (
-      nbTexts.length > 0
-      && exprUnion(nd0.isObj, fnIx)
-      && unionEqOperandOk(nd0.isObj)
-    ) {
-      const nbr: i32[] = []
-      const nbNm = unionNameRowOfExpr(nd0.isObj, fnIx, nbr)
-      if (
-        nbNm != ""
-        && (isValueUnionOfSet(msSetOfRow(nbr[0]), nbr[1])
-          || unionCarriesLitUnionArmOfSet(msSetOfRow(nbr[0]), nbr[1]))
-      ) {
-        let nbI = 0
-        while nbI < nbTexts.length {
-          if emitUnionLitIs(nd0.isObj, nbTexts[nbI], fnIx) < 0 { return -1 }
-          if nbI > 0 { fbI32Bin(114) }
-          nbI = nbI + 1
-        }
-        return 1
-      }
+  if !atom && texts.length > 0 && litMembershipRecvOk(nd.isObj, fnIx) {
+    if nodeTyIsLitUnion(nd.isObj) && nodeLitMembersWithin(nd.isObj, texts) {
+      return "memberTrue"
     }
+    return if texts.length == 1 || reread { "memberEq" } else { "memberNoRecv" }
   }
-  if !exprIsLitAtom(nd0.isObj, fnIx) {
-    const lsTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
-    if lsTexts.length > 0 && litMembershipRecvOk(nd0.isObj, fnIx) {
-      if nodeTyIsLitUnion(nd0.isObj) {
-        if nodeLitMembersWithin(nd0.isObj, lsTexts) {
-          fbI32Const(1)
-          return 1
-        }
+  return "none"
+}
+
+// The literal arm `arm` of `is` test `isIx`; 1 once written, -1 on failure.
+function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
+  const t = isVarTyIxOf(isIx)
+  return match arm {
+    "mapNull" | "mapHas" => {
+      const rd = nodeAt(unwrapParen(nd0.isObj))
+      if !(rd is Index) {
+        return emitFail(
+          "emitProgram: internal: a map read's `is` lost its index",
+        )
       }
-      let lsOk = lsTexts.length == 1
-      if unionEqOperandOk(nd0.isObj) { lsOk = true }
-      if !lsOk { return emitFailNoMembershipRecv() }
+      if emitMapHas(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
+      if arm == "mapNull" { fbI32Eqz() }
+      1
+    }
+    "nicheNever" => {
+      fbI32Const(0)
+      1
+    }
+    "nicheTest" => if emitNulIsNullTest(nd0.isObj, fnIx, !isTestsNull(isIx), true) < 0 { -1 } else { 1 }
+    "nicheRaw" => {
+      if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
+      fbRefIsNull()
+      if !isTestsNull(isIx) { fbI32Eqz() }
+      1
+    }
+    "atomNotNul" => {
+      if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
+      fbI32Const(-1)
+      fbI32Bin(71) // 0x47 i32.ne
+      1
+    }
+    "atomTrue" | "memberTrue" => {
+      fbI32Const(1)
+      1
+    }
+    "atomEq" => {
+      const laTexts = tyLitMemberTexts(t)
+      let laI = 0
+      while laI < laTexts.length {
+        if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
+        fbI32Rel(RS_ATOM, internAtom(quoteLex(laTexts[laI])))
+        fbI32Bin(70)
+        if laI > 0 { fbI32Bin(114) }
+        laI = laI + 1
+      }
+      1
+    }
+    "boxLits" | "numBox" => {
+      const bt = if arm == "boxLits" { tyLitMemberTexts(t) } else { tyNumLitMemberTexts(t) }
+      let bI = 0
+      while bI < bt.length {
+        const lit = if arm == "boxLits" { quoteLex(bt[bI]) } else { bt[bI] }
+        if emitUnionLitIs(nd0.isObj, lit, fnIx) < 0 { return -1 }
+        if bI > 0 { fbI32Bin(114) }
+        bI = bI + 1
+      }
+      1
+    }
+    "memberNoRecv" => emitFailNoMembershipRecv()
+    "memberEq" => {
+      const lsTexts = tyLitMemberTexts(t)
       let lsI = 0
       while lsI < lsTexts.length {
         if (emitLitMemberEq(nd0.isObj, quoteLex(lsTexts[lsI]), fnIx) < 0) {
@@ -7125,186 +7157,206 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32) {
         if lsI > 0 { fbI32Bin(114) }
         lsI = lsI + 1
       }
-      return 1
+      1
     }
+    "none" => emitFail("emitProgram: internal: an `is` literal arm with no lowering")
   }
-  return 0
 }
 
-// The box-tag rung of `emitIsTest`: list emptiness, literal membership over a plain string arm,
-// and the arm-tag compare through an ident, member, optional member or box value. 1 when the
-// test is emitted, 0 when the rung declines, -1 on failure.
-function emitIsTestArmTag(isIx: i32, ndv: IsExpr, fnIx: i32) {
-  // A list `K[]` can never meet is a fit exactly when empty, which neither a box's tag nor a
-  // non-null test can say (D4912).
-  const fitK = isVarTyIxOf(isIx)
-  if fitK >= 0 && tyAt(fitK) is TyArray {
-    const uf = emitListEmptyFitIs(isIx, fnIx)
-    if uf < 0 { return -1 }
-    if uf > 0 { return 1 }
-  }
+// The box-tag arms `emitIsTestArmTag` writes, in order; `none` where none answers.
+export type TagIsArm = "boxLitSet"
+  | "softTwin"
+  | "lacks"
+  | "strTag"
+  | "tagAbsent"
+  | "identBox"
+  | "memNarrow"
+  | "memStruct"
+  | "memVariant"
+  | "optField"
+  | "box"
+  | "none"
+
+// The box-tag arm of `is` test `isIx`: a literal set over a box's string payload, a map the
+// box cannot hold, or the arm's tag read off the box wherever the receiver keeps it.
+function tagIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): TagIsArm {
+  const t = isVarTyIxOf(isIx)
+  const box = exprUnion(nd.isObj, fnIx)
   // A literal union tested against a box whose string arm is a plain `string` is membership
   // over the payload: the tag alone answers true for a non-member string (D3348).
-  const smTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
   if (
-    smTexts.length > 0
-    && tyIsLitUnion(isVarTyIxOf(isIx))
-    && exprUnion(ndv.isObj, fnIx)
-    && unionEqOperandOk(ndv.isObj)
-    && msSetCarriesLitUnionArm(msSetOfUnionBox(ndv.isObj, fnIx)) != 1
-    && msSetTakesAtomAsStr(msSetOfUnionBox(ndv.isObj, fnIx))
-    && !readIsCallResult(ndv.isObj, fnIx)
+    tyLitMemberTexts(t).length > 0
+    && tyIsLitUnion(t)
+    && box
+    && unionEqOperandOk(nd.isObj)
+    && msSetCarriesLitUnionArm(msSetOfUnionBox(nd.isObj, fnIx)) != 1
+    && msSetTakesAtomAsStr(msSetOfUnionBox(nd.isObj, fnIx))
+    && !readIsCallResult(nd.isObj, fnIx)
   ) {
-    let smI = 0
-    while smI < smTexts.length {
-      if emitUnionLitIs(ndv.isObj, quoteLex(smTexts[smI]), fnIx) < 0 {
-        return -1
-      }
-      if smI > 0 { fbI32Bin(114) }
-      smI = smI + 1
-    }
-    return 1
+    return "boxLitSet"
   }
-  const patTy = isArmPatTy(isIx, ndv, fnIx)
-  if mapSoftTwinTagFail(ndv.isObj, patTy, fnIx, isIx) < 0 { return -1 }
-  const armTag = isArmTagOfTyAt(patTy, ndv.isObj, fnIx)
-  // An exact instance's union may hold the pattern's twin under one tag (a Set and its
-  // boolean map), so a member set without the pattern itself answers false.
-  const lacksExact = (unMemIsMap(patTy)
-    && exprUnion(ndv.isObj, fnIx)
-    && exactUnionLacksMap(ndv.isObj, isVarTyIxOf(isIx), fnIx))
-    || (exprUnion(ndv.isObj, fnIx)
-    && exactUnionLacksTwin(ndv.isObj, isVarTyIxOf(isIx), fnIx))
-  // A map type no arm of the box registered is a member of no value it can hold (a generic
-  // body's `is M` at a pin whose union lacks `M`): the answer is false, after the receiver.
+  const patTy = isArmPatTy(isIx, nd, fnIx)
+  if mapSoftTwinClashOf(nd.isObj, patTy, fnIx) >= 0 { return "softTwin" }
+  const armTag = isArmTagOfTyAt(patTy, nd.isObj, fnIx)
+  // An exact instance's union may hold the pattern's twin under one tag (a Set and its boolean
+  // map), so a member set without the pattern itself answers false. A map type no arm of the
+  // box registered is a member of no value it can hold.
   if (
-    lacksExact
-    || armTag < 0 && unMemIsMap(patTy) && exprUnion(ndv.isObj, fnIx)
+    unMemIsMap(patTy) && box && exactUnionLacksMap(nd.isObj, t, fnIx)
+    || box && exactUnionLacksTwin(nd.isObj, t, fnIx)
+    || armTag < 0 && unMemIsMap(patTy) && box
   ) {
-    if emitExpr(ndv.isObj, fnIx) < 0 { return -1 }
-    fbDrop()
-    fbI32Const(0)
-    return 1
+    return "lacks"
   }
-
-  // A literal union tested by its string tag would answer true for every string the box holds,
-  // members or not, so no box test reaches here with one; one that does fails loudly.
-  if armTag == 2 && tyIsLitUnion(isVarTyIxOf(isIx)) {
-    return emitFail(
-      "emitProgram: `is` over a literal union reached the box's string-tag test, which cannot tell its members from other strings",
-    )
-  }
+  // A literal union tested by its string tag would answer true for every string the box holds.
+  if armTag == 2 && tyIsLitUnion(t) { return "strTag" }
   if armTag >= 0 {
-    const vrecv = nodeAt(unwrapParen(ndv.isObj))
-    // No arm of this box carries the tag (a generic body's `is i32[]` at a pin whose union
-    // has no list), so the test is false and a bare name needs no read (D2955).
-    if vrecv is Ident && unionBoxLacksTag(ndv.isObj, armTag, fnIx) {
-      fbI32Const(0)
-      return 1
-    }
+    const r = unwrapParen(nd.isObj)
+    const vrecv = nodeAt(unwrapParen(nd.isObj))
     if vrecv is Ident {
-      // pushes the raw box slot directly, even when an outer arm already narrowed it to
-      // a single atom — the narrowed Ident read would unbox instead of yielding the box.
-      if (
-        unionNameOfRead(unwrapParen(ndv.isObj), fnIx) != ""
-        && identSlotIsUnionBox(fnIx, unwrapParen(ndv.isObj))
-      ) {
-        if emitUnionBoxPush(unwrapParen(ndv.isObj), fnIx) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0)
-        fbI32Rel(RS_TAG, armTag)
-        fbI32Bin(70)
-        return 1
+      if unionBoxLacksTag(nd.isObj, armTag, fnIx) { return "tagAbsent" }
+      if unionNameOfRead(r, fnIx) != "" && identSlotIsUnionBox(fnIx, r) {
+        return "identBox"
       }
     }
-
-    if vrecv is Member {
-      if memberUnionFieldNameRead(unwrapParen(ndv.isObj), fnIx) != "" {
-        // Only a receiver narrowed to a variant of a box, as `emitMem` asks; a nullable record
-        // narrowed by `!= null` is the record itself (D8000).
-        if (
-          memNarrowVariantIndex(unwrapParen(ndv.isObj), fnIx) >= 0
-          && exprUnion(vrecv.memObj, fnIx)
-        ) {
-          if emitNarrowedMem(unwrapParen(ndv.isObj), fnIx) < 0 { return -1 }
-          fbStructGet(uBoxIdx, 0)
-          fbI32Rel(RS_TAG, armTag)
-          fbI32Bin(70)
-          return 1
-        }
-
-        const msi = structIndexOfExpr(vrecv.memObj, fnIx)
-        if msi >= 0 {
-          const mfi = sFieldIndex(msi, vrecv.memProp)
-          if mfi >= 0 {
-            if emitExpr(vrecv.memObj, fnIx) < 0 { return -1 }
-            if (
-              exprNullableStruct(vrecv.memObj, fnIx)
-              && !readOwesNonNullRecover(vrecv.memObj, fnIx)
-            ) {
-              fbRefAsNonNull()
-            }
-            fbStructGet(sHeapIdx[msi], mfi)
-            fbStructGet(uBoxIdx, 0)
-            fbI32Rel(RS_TAG, armTag)
-            fbI32Bin(70)
-            return 1
-          }
-        }
-
-        const aivi = exprVariantIndex(vrecv.memObj, fnIx)
-        if aivi >= 0 {
-          const aifi = variantFieldIndex(aivi, vrecv.memProp)
-          if aifi >= 0 {
-            if emitExpr(vrecv.memObj, fnIx) < 0 { return -1 }
-            fbStructGet(variantHeap(aivi), aifi)
-            fbStructGet(uBoxIdx, 0)
-            fbI32Rel(RS_TAG, armTag)
-            fbI32Bin(70)
-            return 1
-          }
-        }
+    if vrecv is Member && memberUnionFieldNameRead(r, fnIx) != "" {
+      if memNarrowVariantIndex(r, fnIx) >= 0 && exprUnion(vrecv.memObj, fnIx) {
+        return "memNarrow"
+      }
+      const msi = structIndexOfExpr(vrecv.memObj, fnIx)
+      if msi >= 0 && sFieldIndex(msi, vrecv.memProp) >= 0 { return "memStruct" }
+      const vi = exprVariantIndex(vrecv.memObj, fnIx)
+      if vi >= 0 && variantFieldIndex(vi, vrecv.memProp) >= 0 {
+        return "memVariant"
       }
     }
-
     if vrecv is OptMember {
-      const oisSi = optChainStructIdxOf(vrecv.omObj, fnIx)
-      if oisSi >= 0 {
-        const oisFi = sFieldIndex(oisSi, vrecv.omProp)
-        if oisFi >= 0 {
-          if sFieldIsUnionBox(oisSi, oisFi) {
-            const oisSv = optRecvStageSave()
-            optRecvStageMark(vrecv.omObj)
-            if emitOptChainIsNull(vrecv.omObj, fnIx) < 0 { return -1 }
-            fbIf(127)
-            fbI32Const(0)
-            fbElse()
-            if emitOptChainValue(vrecv.omObj, fnIx) < 0 { return -1 }
-            fbStructGet(sHeapIdx[oisSi], oisFi)
-            fbStructGet(uBoxIdx, 0)
-            fbI32Rel(RS_TAG, armTag)
-            fbI32Bin(70)
-            fbEnd()
-            optRecvStageRestore(oisSv)
-            return 1
-          }
-        }
+      const si = optChainStructIdxOf(vrecv.omObj, fnIx)
+      if si >= 0 {
+        const fi = sFieldIndex(si, vrecv.omProp)
+        if fi >= 0 && sFieldIsUnionBox(si, fi) { return "optField" }
       }
     }
-    if exprUnion(ndv.isObj, fnIx) {
-      if emitExpr(ndv.isObj, fnIx) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, armTag)
-      fbI32Bin(70)
-      return 1
-    }
+    return tagIsValueArm(nd, fnIx)
   }
-  return 0
+  return "none"
 }
 
-// The numeric-literal-union rung of `emitIsTest` over a non-box receiver: one compare per
-// member at the receiver's base, re-read or read once into a slot. 1 when the test is
-// emitted, 0 when the rung declines, -1 on failure.
-function emitIsTestNumLit(isIx: i32, nd0: IsExpr, fnIx: i32) {
+// Any other receiver: the arm's tag read off a box value, or no tag arm.
+function tagIsValueArm(nd: IsExpr, fnIx: i32): TagIsArm {
+  return if exprUnion(nd.isObj, fnIx) { "box" } else { "none" }
+}
+
+// After a box: its tag compared with `tag`.
+function boxTagIsTail(tag: i32) {
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, tag)
+  fbI32Bin(70)
+  return 1
+}
+
+// The box-tag arm `arm` of `is` test `isIx`; 1 once written, -1 on failure.
+function emitIsTestArmTag(isIx: i32, ndv: IsExpr, fnIx: i32, arm: TagIsArm) {
+  const patTy = isArmPatTy(isIx, ndv, fnIx)
+  const armTag = isArmTagOfTyAt(patTy, ndv.isObj, fnIx)
+  const r = unwrapParen(ndv.isObj)
+  const vrecv = nodeAt(unwrapParen(ndv.isObj))
+  return match arm {
+    "boxLitSet" => {
+      const smTexts = tyLitMemberTexts(isVarTyIxOf(isIx))
+      let smI = 0
+      while smI < smTexts.length {
+        if emitUnionLitIs(ndv.isObj, quoteLex(smTexts[smI]), fnIx) < 0 {
+          return -1
+        }
+        if smI > 0 { fbI32Bin(114) }
+        smI = smI + 1
+      }
+      1
+    }
+    "softTwin" => mapSoftTwinTagFail(ndv.isObj, patTy, fnIx, isIx)
+    "lacks" => {
+      if emitExpr(ndv.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+      fbI32Const(0)
+      1
+    }
+    "strTag" => emitFail(
+      "emitProgram: `is` over a literal union reached the box's string-tag test, which cannot tell its members from other strings",
+    )
+    // No arm of this box carries the tag (a generic body's `is i32[]` at a pin whose union has
+    // no list), so the test is false and a bare name needs no read (D2955).
+    "tagAbsent" => {
+      fbI32Const(0)
+      1
+    }
+    // The raw box slot, even where an outer arm narrowed it to one atom: the narrowed read
+    // would unbox instead of yielding the box.
+    "identBox" => if emitUnionBoxPush(r, fnIx) < 0 { -1 } else { boxTagIsTail(armTag) }
+    // Only a receiver narrowed to a variant of a box, as `emitMem` asks; a nullable record
+    // narrowed by `!= null` is the record itself (D8000).
+    "memNarrow" => if emitNarrowedMem(r, fnIx) < 0 { -1 } else { boxTagIsTail(armTag) }
+    "memStruct" => {
+      if !(vrecv is Member) {
+        return emitFail("emitProgram: internal: a field's `is` lost its member")
+      }
+      const msi = structIndexOfExpr(vrecv.memObj, fnIx)
+      if msi < 0 || msi >= sHeapIdx.length {
+        return emitFail("emitProgram: internal: a field's `is` lost its record")
+      }
+      if emitExpr(vrecv.memObj, fnIx) < 0 { return -1 }
+      if (
+        exprNullableStruct(vrecv.memObj, fnIx)
+        && !readOwesNonNullRecover(vrecv.memObj, fnIx)
+      ) {
+        fbRefAsNonNull()
+      }
+      fbStructGet(sHeapIdx[msi], sFieldIndex(msi, vrecv.memProp))
+      boxTagIsTail(armTag)
+    }
+    "memVariant" => {
+      if !(vrecv is Member) {
+        return emitFail("emitProgram: internal: a field's `is` lost its member")
+      }
+      const vi = exprVariantIndex(vrecv.memObj, fnIx)
+      if emitExpr(vrecv.memObj, fnIx) < 0 { return -1 }
+      fbStructGet(variantHeap(vi), variantFieldIndex(vi, vrecv.memProp))
+      boxTagIsTail(armTag)
+    }
+    "optField" => {
+      if !(vrecv is OptMember) {
+        return emitFail("emitProgram: internal: a field's `is` lost its chain")
+      }
+      const si = optChainStructIdxOf(vrecv.omObj, fnIx)
+      if si < 0 || si >= sHeapIdx.length {
+        return emitFail("emitProgram: internal: a field's `is` lost its record")
+      }
+      const sv = optRecvStageSave()
+      optRecvStageMark(vrecv.omObj)
+      if emitOptChainIsNull(vrecv.omObj, fnIx) < 0 { return -1 }
+      fbIf(127)
+      fbI32Const(0)
+      fbElse()
+      if emitOptChainValue(vrecv.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[si], sFieldIndex(si, vrecv.omProp))
+      boxTagIsTail(armTag)
+      fbEnd()
+      optRecvStageRestore(sv)
+      1
+    }
+    "box" => if emitExpr(ndv.isObj, fnIx) < 0 { -1 } else { boxTagIsTail(armTag) }
+    "none" => emitFail("emitProgram: internal: an `is` tag arm with no lowering")
+  }
+}
+
+// How `emitIsTestNumLit` compares a numeric receiver with a numeric literal pattern: `nlBase` the
+// width, `nlTexts` the members, `nlOnce` a receiver read once into a slot of that width; an
+// empty base where it does not.
+export type NumIsPlan = { nlBase: string, nlTexts: string[], nlOnce: boolean }
+
+function numIsPlanOf(isIx: i32, nd0: IsExpr, fnIx: i32): NumIsPlan {
+  const no: NumIsPlan = { nlBase: "", nlTexts: [], nlOnce: false }
+  if exprUnion(nd0.isObj, fnIx) { return no }
   let nlBase = numLitUnionBaseName(isVarTyIxOf(isIx))
   let nlTexts = tyNumLitMemberTexts(isVarTyIxOf(isIx))
   // An `i64` receiver compares at `i64`, which holds every member of an `i32` union and
@@ -7328,37 +7380,46 @@ function emitIsTestNumLit(isIx: i32, nd0: IsExpr, fnIx: i32) {
       nlBase = fb
     }
   }
-  if nlBase != "" && isNumRecvBaseName(nd0.isObj, fnIx) == nlBase {
-    let nlOk = nlTexts.length == 1
-    if unionEqOperandOk(nd0.isObj) { nlOk = true }
-    if nlTexts.length > 0 && nlOk {
-      let nlI = 0
-      while nlI < nlTexts.length {
-        if emitNumLitEq(nd0.isObj, nlTexts[nlI], fnIx) < 0 { return -1 }
-        if nlI > 0 { fbI32Bin(114) }
-        nlI = nlI + 1
-      }
-      return 1
-    }
-    // A receiver that cannot be re-read is read once into a slot of its base; the name
-    // fold below answers by spelling and would say false for a member (D3570, D3590).
-    if nlTexts.length > 0 && numLitOnceReadOk(nlBase, nlTexts) {
-      if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-      const nlSlot = numLitOnceSlot(nlBase)
-      fbLocalSet(nlSlot)
-      let nsI = 0
-      while nsI < nlTexts.length {
-        fbLocalGet(nlSlot)
-        emitNumLitConstEq(nlBase, nlTexts[nsI])
-        if nsI > 0 {
-          fbI32Bin(114) // 0x72 i32.or
-        }
-        nsI = nsI + 1
-      }
-      return 1
-    }
+  if (
+    nlBase == ""
+    || isNumRecvBaseName(nd0.isObj, fnIx) != nlBase
+    || nlTexts.length == 0
+  ) {
+    return no
   }
-  return 0
+  if nlTexts.length == 1 || unionEqOperandOk(nd0.isObj) {
+    const eq: NumIsPlan = { nlBase: nlBase, nlTexts: nlTexts, nlOnce: false }
+    return eq
+  }
+  // A receiver that cannot be re-read is read once into a slot of its base; the name fold below
+  // answers by spelling and would say false for a member (D3570, D3590).
+  if !numLitOnceReadOk(nlBase, nlTexts) { return no }
+  const once: NumIsPlan = { nlBase: nlBase, nlTexts: nlTexts, nlOnce: true }
+  return once
+}
+
+// The numeric literal test plan `pl` names; 1 once written, -1 on failure.
+function emitIsTestNumLit(nd0: IsExpr, fnIx: i32, pl: NumIsPlan) {
+  if !pl.nlOnce {
+    let nlI = 0
+    while nlI < pl.nlTexts.length {
+      if emitNumLitEq(nd0.isObj, pl.nlTexts[nlI], fnIx) < 0 { return -1 }
+      if nlI > 0 { fbI32Bin(114) }
+      nlI = nlI + 1
+    }
+    return 1
+  }
+  if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
+  const nlSlot = numLitOnceSlot(pl.nlBase)
+  fbLocalSet(nlSlot)
+  let nsI = 0
+  while nsI < pl.nlTexts.length {
+    fbLocalGet(nlSlot)
+    emitNumLitConstEq(pl.nlBase, pl.nlTexts[nsI])
+    if nsI > 0 { fbI32Bin(114) }
+    nsI = nsI + 1
+  }
+  return 1
 }
 
 // Whether no value of the closed record type `rcv` can be record arm `arm`: their field names
@@ -7617,6 +7678,7 @@ export type IsArm = "optNull"
   | "listAcross"
   | "pinNever"
   | "litArms"
+  | "emptyFit"
   | "armTag"
   | "numLit"
   | "litMember"
@@ -7639,16 +7701,17 @@ function isArmRank(a: IsArm): i32 {
     "listAcross" => 6
     "pinNever" => 7
     "litArms" => 8
-    "armTag" => 9
-    "numLit" => 10
-    "litMember" => 11
-    "nulTest" => 12
-    "noMembership" => 13
-    "static" => 14
-    "nulClosure" => 15
-    "noUnion" => 16
-    "variant" => 17
-    "notIs" => 18
+    "emptyFit" => 9
+    "armTag" => 10
+    "numLit" => 11
+    "litMember" => 12
+    "nulTest" => 13
+    "noMembership" => 14
+    "static" => 15
+    "nulClosure" => 16
+    "noUnion" => 17
+    "variant" => 18
+    "notIs" => 19
   }
 }
 
@@ -7695,14 +7758,17 @@ export function isArmOf(
     return "listAcross"
   }
   if from <= 7 && litIsPinNever(isIx, nd, fnIx) { return "pinNever" }
-  if from <= 8 && litArmsMayAnswer(isIx, nd, fnIx) { return "litArms" }
-  if from <= 9 && armTagMayAnswer(isIx, nd, fnIx) { return "armTag" }
-  if from <= 10 && !box && numLitMayAnswer(t) { return "numLit" }
-  if from <= 11 && isTestedLitLex(t) != "" { return "litMember" }
-  if from <= 12 && isNulTestAnswers(isIx, nd, fnIx) { return "nulTest" }
-  if from <= 13 && isNoMembershipRecv(isIx, nd, fnIx) { return "noMembership" }
-  if from <= 14 && monoStaticIsResult(isIx, fnIx) >= 0 { return "static" }
-  if from <= 15 && tyDenotesFunc(t) && exprNulClosure(nd.isObj, fnIx) {
+  if from <= 8 && litIsArmOf(isIx, nd, fnIx) != "none" { return "litArms" }
+  // A list `K[]` can never meet is a fit exactly when empty, which neither a box's tag nor a
+  // non-null test can say (D4912).
+  if from <= 9 && t >= 0 && tyAt(t) is TyArray { return "emptyFit" }
+  if from <= 10 && tagIsArmOf(isIx, nd, fnIx) != "none" { return "armTag" }
+  if from <= 11 && numIsPlanOf(isIx, nd, fnIx).nlBase != "" { return "numLit" }
+  if from <= 12 && isTestedLitLex(t) != "" { return "litMember" }
+  if from <= 13 && isNulTestAnswers(isIx, nd, fnIx) { return "nulTest" }
+  if from <= 14 && isNoMembershipRecv(isIx, nd, fnIx) { return "noMembership" }
+  if from <= 15 && monoStaticIsResult(isIx, fnIx) >= 0 { return "static" }
+  if from <= 16 && tyDenotesFunc(t) && exprNulClosure(nd.isObj, fnIx) {
     return "nulClosure"
   }
   if !uDeclared { return "noUnion" }
@@ -7754,22 +7820,6 @@ function listAcrossIsPlanned(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
   )
 }
 
-// Whether `emitIsTestLitArms` may answer: a scalar map read, a ref niche, an atom, a box
-// carrying literal arms, a numeric literal union, or literal membership.
-function litArmsMayAnswer(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
-  const t = isVarTyIxOf(isIx)
-  if mapReadScalarBoxKind(nd.isObj, fnIx) >= 0 { return true }
-  if exprNullableRefNiche(nd.isObj, fnIx) || exprIsLitAtom(nd.isObj, fnIx) {
-    return true
-  }
-  if numLitUnionHasBase(t) { return true }
-  if tyLitMemberTexts(t).length == 0 { return false }
-  const lur: i32[] = []
-  const luNm = unionNameRowOfExpr(nd.isObj, fnIx, lur)
-  return luNm != "" && unionCarriesLitUnionArmOfSet(msSetOfRow(lur[0]), lur[1])
-    || litMembershipRecvOk(nd.isObj, fnIx)
-}
-
 // The arm type `emitIsTestArmTag` tests the tag of: a numeric literal union's base where the
 // pattern is that primitive (D3522).
 function isArmPatTy(isIx: i32, nd: IsExpr, fnIx: i32): i32 {
@@ -7786,32 +7836,6 @@ function isArmPatTy(isIx: i32, nd: IsExpr, fnIx: i32): i32 {
     return plb
   }
   return patTy
-}
-
-// Whether `emitIsTestArmTag` may answer: a list pattern, a literal set over a box, an arm with
-// a tag, or a map pattern (its soft-twin refusal included).
-function armTagMayAnswer(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
-  const t = isVarTyIxOf(isIx)
-  if t >= 0 && tyAt(t) is TyArray { return true }
-  if tyLitMemberTexts(t).length > 0 && tyIsLitUnion(t) { return true }
-  const patTy = isArmPatTy(isIx, nd, fnIx)
-  if isArmTagOfTyAt(patTy, nd.isObj, fnIx) >= 0 || unMemIsMap(patTy) {
-    return true
-  }
-  if patTy >= 0 {
-    const pat: i32[] = []
-    flattenVariantsInto(patTy, pat)
-    for pm in pat {
-      if unMemIsMap(pm) { return true }
-    }
-  }
-  return exprUnion(nd.isObj, fnIx) && exactUnionLacksTwin(nd.isObj, t, fnIx)
-}
-
-// Whether `emitIsTestNumLit` may answer: the pattern is a numeric literal union, or has
-// integer members a wider receiver compares.
-function numLitMayAnswer(t: i32): boolean {
-  return numLitUnionBaseName(t) != "" || tyIntLitWideTexts(t).length > 0
 }
 
 // Whether the niche null test answers: a receiver that is no box, atom niche or literal union,
@@ -7889,9 +7913,10 @@ function emitIsArm(isIx: i32, fnIx: i32, arm: IsArm): i32 {
     "recordFit" => emitRecordFitIs(isIx, fnIx)
     "listFit" => emitListFitIs(isIx, fnIx)
     "listAcross" => emitListIsAcrossReps(isIx, fnIx)
-    "litArms" => emitIsTestLitArms(isIx, nd, fnIx)
-    "armTag" => emitIsTestArmTag(isIx, nd, fnIx)
-    "numLit" => emitIsTestNumLit(isIx, nd, fnIx)
+    "litArms" => emitIsTestLitArms(isIx, nd, fnIx, litIsArmOf(isIx, nd, fnIx))
+    "emptyFit" => emitListEmptyFitIs(isIx, fnIx)
+    "armTag" => emitIsTestArmTag(isIx, nd, fnIx, tagIsArmOf(isIx, nd, fnIx))
+    "numLit" => emitIsTestNumLit(nd, fnIx, numIsPlanOf(isIx, nd, fnIx))
     "litMember" => {
       if (
         emitLitMemberEq(nd.isObj, isTestedLitLex(isVarTyIxOf(isIx)), fnIx)
@@ -16878,26 +16903,6 @@ function emitScalarMapReadBoxEq(
   fbI32Bin(70)            // 0x46 i32.eq
   fbEnd()
   return 1
-}
-
-// `m[k] is T` over a bare scalar-valued map read (D2466): `is null` is a miss and `is` the
-// value's own scalar is a hit. 1 when lowered, 0 to decline (any other tested type).
-function emitScalarMapReadIs(isIx: i32, readIx: i32, k: i32, fnIx: i32): i32 {
-  const rd = nodeAt(unwrapParen(readIx))
-  if rd is Index {
-    const tn = tyPrimNameOf(isVarTyIxOf(isIx))
-    if tn == null { return 0 }
-    if tn == "null" {
-      if emitMapHas(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-      fbI32Eqz()
-      return 1
-    }
-    if tn == scalarAtomNameOfKind(k) {
-      if emitMapHas(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-      return 1
-    }
-  }
-  return 0
 }
 
 // Push whether entry `iL` of the `live` array in `liveL` is live: `live[i] != 0` in a module
