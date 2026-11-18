@@ -91,6 +91,7 @@ import {
   deadNullTestOperand,
   exprPrePathWhy,
   forInPlainWhy,
+  globalInitArmUnboxes,
   globalReadRecovers,
   identReadArmOf,
   identReadIsList,
@@ -124,6 +125,8 @@ import {
   pushPlainWhy,
   pushPlanOf,
   shiftMaskFoldOf,
+  startInitArmOf,
+  startStrAccMarked,
   strLitTakesAtom,
   tailIfPlainWhy,
   tplStrHoleOf,
@@ -149,6 +152,7 @@ import {
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
+  globalCellKind,
   localIndexOf,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
@@ -161,6 +165,7 @@ import {
   fRecRetTy,
   fRetVoid,
   fnStmts,
+  gInitProgIdx,
   gPromoInStart,
   setIrShadowOn,
 } from "./emit_state"
@@ -665,7 +670,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     if globalRep(g, d) != rep { return irBMiss("global read coercion") }
-    const gm = irGlobalReadMiss(g, globalCtxOf(ibFnPos))
+    const gm = irGlobalReadMiss(g, ibGlobalCtx())
     if gm != "" { return irBMiss(gm) }
     const sid = sidOfNode(ix)
     const gr: Rhs = { ggSym: g, ggNonNull: globalReadRecovers(sid, ix, ibFnIx) }
@@ -1542,7 +1547,7 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
   const src = deliver(b, n.binRight, globalRep(g, d))
   if ibMiss != "" { return 0 }
   if globalRep(g, d) != irBOpRep(src) { return skip("global store coercion") }
-  const gm = irGlobalWriteMiss(g, globalCtxOf(ibFnPos))
+  const gm = irGlobalWriteMiss(g, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: g, gsSrc: src }, -1, ibNoValue, ix)
   return 0
@@ -2098,6 +2103,17 @@ function corrupt() {
 
 // The context the function at `fnStmts` slot `fnPos` accesses globals in. The start function's
 // top-level body never reaches the IR, so it is a body's.
+// The context the function being built accesses globals in: the start function's, or a body's.
+function ibGlobalCtx(): GlobalCtx {
+  if ibFnIx >= 0 { return globalCtxOf(ibFnPos) }
+  const c: GlobalCtx = {
+    gcInStart: true,
+    gcFnPos: -1,
+    gcGuardOff: ASSIGN_AS_VALUE,
+  }
+  return c
+}
+
 function globalCtxOf(fnPos: i32): GlobalCtx {
   const c: GlobalCtx = {
     gcInStart: false,
@@ -2110,7 +2126,13 @@ function globalCtxOf(fnPos: i32): GlobalCtx {
 // The dual emit of a verified function: its lowering against the legacy code entry `emitFuncCode`
 // wrote onto `out` from `outStart`, and the span rows it banked from `spanBase`. "" when they
 // match, else the mismatch class.
-function dualEmit(fnPos: i32, out: u8[], outStart: i32, spanBase: i32): string {
+function dualEmit(
+  pre: string,
+  ctx: GlobalCtx,
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+): string {
   const legacy: u8[] = []
   let i = outStart
   while i < out.length {
@@ -2122,20 +2144,13 @@ function dualEmit(fnPos: i32, out: u8[], outStart: i32, spanBase: i32): string {
     count("fail the start body reached the IR shadow")
     return "start body"
   }
-  const why = irDualEmit(
-    ib,
-    globalCtxOf(fnPos),
-    legacy,
-    spanBase,
-    outStart,
-    skew,
-  )
+  const why = irDualEmit(ib, ctx, legacy, spanBase, outStart, skew)
   if why == "" {
-    count("matched")
+    count(pre + "matched")
     return ""
   }
-  count("mismatch " + why)
-  if ibDetail && rowN("mismatch " + why) <= 3 {
+  count("mismatch " + pre + why)
+  if ibDetail && rowN("mismatch " + pre + why) <= 3 {
     count(
       "detail "
         + why
@@ -2188,7 +2203,7 @@ export function irShadowFn(
   }
   if v.vfRule == 0 {
     count("verified")
-    const dual = dualEmit(fnPos, out, outStart, spanBase)
+    const dual = dualEmit("", globalCtxOf(fnPos), out, outStart, spanBase)
     // A function the claim rule takes must match: a claim is never a fallback.
     if dual != "" && claimable() {
       count("fail a claimable function did not match: " + dual)
@@ -2207,6 +2222,100 @@ export function irShadowFn(
       + "\n"
       + irFnText(ib),
   )
+  return 0
+}
+
+// The seam for the start function: builds the single start body from its top-level `order`
+// (an `orderGi` entry at or above 0 being that global's initializer), verifies, lowers and
+// compares it with the entry `emitStartBodyCode` wrote onto `out` from `outStart`. Its rows
+// carry a `start ` prefix; a mismatch row is `mismatch start <why>` and a failure names `@start`.
+export function irShadowStart(
+  out: u8[],
+  outStart: i32,
+  spanBase: i32,
+  order: i32[],
+  orderGi: i32[],
+) {
+  count("start fns")
+  const why = buildStart(order, orderGi)
+  if why != "" {
+    count("start uncovered " + why)
+    return 0
+  }
+  count("start covered")
+  const v = irVerify(ib)
+  if v.vfRule != 0 {
+    count(
+      "fail rule "
+        + i32ToStr(v.vfRule)
+        + " in @start: "
+        + v.vfMsg
+        + "\n"
+        + irFnText(ib),
+    )
+    return 0
+  }
+  count("start verified")
+  dualEmit("start ", ibGlobalCtx(), out, outStart, spanBase)
+  return 0
+}
+
+// Builds the start body: each top-level statement, or global `orderGi[i]`'s initializer, in
+// order, with no row of its own (legacy banks a start row by another kind). "" or the first miss.
+function buildStart(order: i32[], orderGi: i32[]): string {
+  ib = irFnNew(-1, "@start")
+  ibFnIx = -1
+  ibFnPos = -1
+  ibMiss = ""
+  ibMisses = []
+  ibDeclVar = Map()
+  ibLoopName = []
+  ibLoopBrk = []
+  ibLoopCont = []
+  ibLabelN = 0
+  ibDepth = 0
+  ibBool = repNodeOfTy(TY_BOOL)
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  if !repIsNoValue(ibNoValue) { return "no void rep" }
+  ib.irRetRep = ibNoValue
+  ib.irRetTy = TY_NEVER
+  // The accumulator rows `strAssignInPlace` reads are the start's only while legacy just ran.
+  if startStrAccMarked() { return "string accumulator" }
+  if gInitProgIdx >= 0 { return "progress cell" }
+  const top: i32[] = []
+  let i = 0
+  while i < order.length {
+    if orderGi[i] >= 0 {
+      globalInit(top, orderGi[i], order[i])
+    } else {
+      stmtIn(top, order[i], NO_SIBS, -1)
+    }
+    if ibMiss != "" { return ibMiss }
+    i = i + 1
+  }
+  ib.irBody = top
+  return ibMiss
+}
+
+// Global `gi`'s initializer, at statement `gst`, written as legacy's plain arm writes it: the
+// value delivered at the cell's rep, then its store.
+function globalInit(b: i32[], gi: i32, gst: i32) {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) { return 0 }
+  const gck = globalCellKind(gst)
+  const arm = startInitArmOf(gst, gck)
+  if arm != "plain" { return skip("global initializer " + arm) }
+  if globalInitArmUnboxes(gck, g.letInit) {
+    return skip("global initializer arm unbox")
+  }
+  const rep = globalRep(gi, gst)
+  if rep < 0 { return skip("global initializer rep") }
+  const src = deliver(b, g.letInit, rep)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(src) != rep { return skip("global initializer coercion") }
+  const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
+  if gm != "" { return skip(gm) }
+  irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
 }
 

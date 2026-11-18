@@ -38,7 +38,14 @@ import { lamChainSnap } from "./check_lam_chain"
 import { recordRowClassOf, recordRowsRun } from "./record_rows"
 import { fvaMakerCallRows } from "./check_assignable"
 import { boxDstShadowArmed, boxDstShadowBegin } from "./box_dst_shadow"
-import { irClaimFn, irShadowArmed, irShadowBegin, irShadowFn } from "./ir_build"
+import {
+  irClaimFn,
+  irShadowArmed,
+  irShadowBegin,
+  irShadowFn,
+  irShadowStart,
+} from "./ir_build"
+import { irStartPrologueHook } from "./ir_lower"
 import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
@@ -781,7 +788,6 @@ import {
   globalCellStructIdx,
   inferredRetMapSlot,
   letCellSlot,
-  letNulMapReadUnionBox,
   refListSlotOfExpr,
   rsResetUseIx,
 } from "./emit_classify"
@@ -805,7 +811,6 @@ import {
   fnHasGlobalMapOp,
   fnHasStrOp,
   fnUnionRetSinkOk,
-  globalInitIsLitAtom,
   globalInitWidensAtomToStr,
   stashListGet,
   stashOptRecv,
@@ -939,6 +944,7 @@ import {
   monomorphize,
 } from "./emit_mono"
 import {
+  StartInitArm,
   TEST_EMIT_REFUSAL_MSG,
   capCacheBuild,
   emitAtomToStr,
@@ -968,6 +974,7 @@ import {
   mapSetFnBody,
   mapSetFuncType,
   sFieldStorageSlot,
+  startInitArmOf,
   strAccScanStart,
   stubWriteRhsReset,
   testHookNamed,
@@ -2443,6 +2450,8 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // top-level statement at `bodyExpr`-relative offsets; the tail rebases exactly this
   // suffix onto `out` once the locals vector and the size prefix are known.
   const spanBase = emitFnSpanStart.length
+  // The element-read rows the armed shadow notes start empty, as for a function body.
+  shIdxReset()
   const nStartLocals = collectStartLocals()
   if nStartLocals < 0 { return -1 }
   startFnDetectFrames()
@@ -2487,6 +2496,10 @@ function emitStartBodyCode(out: u8[], k: i32) {
   // statements, emits the same bytes as before. The emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
   let gi = swG0
   let si = swS0
+  // The merged order, for the IR shadow of a single start body; collected only when armed.
+  const shOn = irShadowArmed() && k < 0
+  const order: i32[] = []
+  const orderGi: i32[] = []
   // The promotion context window (G2c): a promoted binding's `local.get`/`local.set` is only
   // meaningful in this frame, so the flag that lets `emitUserGlobalGet`/`emitUserGlobalSet`
   // produce one is armed for exactly the span streaming this body. Every user function body and
@@ -2506,6 +2519,15 @@ function emitStartBodyCode(out: u8[], k: i32) {
       let gArmKept = -1
       if globalArmScopeOk(globalStmts[gi]) {
         gArmKept = stmtArmScopeOpen(globalStmts[gi])
+      }
+      // A global whose initializer runs elsewhere (a constexpr cell) contributes nothing here.
+      if (
+        shOn
+        && globalRunsInStartFn(gi)
+        && !lbiKeptDeclUnread(globalStmts[gi])
+      ) {
+        order.push(globalStmts[gi])
+        orderGi.push(gi)
       }
       const gInitRc = emitStartGlobalInit(
         bodyExpr,
@@ -2527,6 +2549,10 @@ function emitStartBodyCode(out: u8[], k: i32) {
       emitCurStmtIx = startStmts[si]
       gInitStartOrd = startStmtOrd[si]
       const sSpanAt = bodyExpr.length
+      if shOn {
+        order.push(startStmts[si])
+        orderGi.push(-1)
+      }
       if emitStmt(startStmts[si], -1) < 0 {
         wTarget(exprPrev)
         return -1
@@ -2562,19 +2588,17 @@ function emitStartBodyCode(out: u8[], k: i32) {
   wTarget(endPrev)
 
   const outPrev = wTarget(out)
+  const outStart = out.length
   wULEB(body.length)
   // REBASE this body's statement rows off `bodyExpr` and onto the entry (D1594): the size
   // prefix is written, so `out.length` is where the body itself begins. The caller moves
   // them onto the payload and then the module, exactly as it does for a user function's row.
   const bodyInOut = out.length
-  let ssp = spanBase
-  while ssp < emitFnSpanStart.length {
-    emitFnSpanStart[ssp] = emitFnSpanStart[ssp] + bodyInOut + exprInBody
-    emitFnSpanEnd[ssp] = emitFnSpanEnd[ssp] + bodyInOut + exprInBody
-    ssp = ssp + 1
-  }
+  rebaseStmtSpans(spanBase, bodyInOut, exprInBody)
   wBytes(body)
   wTarget(outPrev)
+  // The IR shadow reads the single start body after legacy wrote it; it writes no byte.
+  if shOn { irShadowStart(out, outStart, spanBase, order, orderGi) }
   return 0
 }
 
@@ -2588,121 +2612,78 @@ function emitStartGlobalInit(
   gst: i32,
 ) {
   // A `const` every read copied the tree of is never read, as at a local (D15001).
-  if globalRunsInStartFn(gi) && !lbiKeptDeclUnread(gst) {
-    const g = nodeAt(gst)
-    const th = if g is LetDecl { emitTypedHolderInit(gst, -1) } else { 1 }
-    if th < 0 {
+  if !globalRunsInStartFn(gi) || lbiKeptDeclUnread(gst) { return 0 }
+  if gst < 0 || gst >= P.nodes.length { return 0 }
+  const g = nodeAt(gst)
+  if !(g is LetDecl) { return 0 }
+  const gck = globalCellKind(gst)
+  const arm = startInitArmOf(gst, gck)
+  if arm == "holder" {
+    if emitTypedHolderInit(gst, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
-    if g is LetDecl {
-      // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
-      // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
-      // `emitWidened` inserts the lattice convert so the start-fn `global.set`
-      // matches the cell valtype. An i32 cell is untouched. (Slice 5 widening.)
-      const gck = globalCellKind(gst)
-      // A bundle holder's read picked its member above (`emitTypedHolderInit`).
-      const wk = if gck == "f32" { 5 } else if gck == "f64" { 4 } else if gck == "i64" { 3 } else { -1 }
-      if th == 1 && wk > 0 {
-        if emitWidened(g.letInit, wk, -1) < 0 {
-          wTarget(exprPrev)
-          return -1
-        }
-      } else if th == 1 {
-        if (emitStartGlobalInitValue(exprPrev, gst, g, gck) < 0) { return -1 }
-        emitGlobalInitArmUnbox(gst, gck, g.letInit)
-      }
-      const setPrev = wTarget(bodyExpr)
-      if emitUserGlobalSet(gi) < 0 {
-        wTarget(setPrev)
-        wTarget(exprPrev)
-        return -1
-      }
-      wTarget(setPrev)
-    }
-  }
-  return 0
-}
-
-// `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
-// `gck`): emits the initializer into the writer's buffer by the cell's coercion. On
-// failure restores the writer to `exprPrev` and returns -1, else 0.
-function emitStartGlobalInitValue(
-  exprPrev: u8[],
-  gst: i32,
-  g: LetDecl,
-  gck: VKind,
-) {
-  let svi = -1
-  if gck == "variant" { svi = globalCellStructIdx(gst) }
-  // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
-  // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
-  // position: a union global's cell is always the box (unlike `buildLocals`), so a
-  // concrete-variant init must be boxed exactly as a call argument, return, or array element is, or a plain coerce would store the wrong ref into the box cell.
-  const gunBox = gck == "union"
-  // An un-annotated global's union is its init's type, or its filled `null` hole's.
-  const gunTy = letBindingUnionTy(gst, -1)
-  // A module-level `let f = add` aliasing a GENERIC (un-annotated-param) named
-  // function, used only as a direct-call callee: the closure through the floor-LESS
-  // core, the start-fn twin of the const-cell arm in `emitGlobalSection`. A member of a
-  // tagged set is held as its id instead (D15927).
-  const gAliasFe = if fnTagLeafId(g.letInit) >= 0 { -1 } else { monoGenericAliasFe(gst) }
-  // The module-scope twin of `emitLetDeclStmt`'s union-box map-read arm. A bare top-level
-  // `const t = m[k]` over a union-valued map must lower its miss as the null-tagged box,
-  // because the consuming `!= null`/`is`/`match`/`??` is a tag compare that recovers the box
-  // with `ref.as_non_null` first. Without this arm the init falls through to `emitMapGet`'s bare `ref.null` miss — check-clean, then a runtime `null reference` trap.
-  const gUmr = letNulMapReadUnionBox(gst, -1)
-  if gUmr {
-    const gumrN = nodeAt(unwrapParen(g.letInit))
-    if gumrN is Index {
-      if (emitMapGetUnionBox(gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
-        wTarget(exprPrev)
-        return -1
-      }
-    } else {
-      wTarget(exprPrev)
-      return emitFail(
-        "emitProgram: union-valued map read binding's init is not an index read",
-      )
-    }
-  } else if gunBox {
-    if emitUnionBoxOwed("", gunTy, g.letInit, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
-    }
-  } else if (gck == "variant" && svi >= 0 && svi < uVarRow.length) {
-    // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-    if emitVariantCoerce(svi, g.letInit, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
-    }
-  } else if gAliasFe >= 0 {
-    if emitClosureValueCore(gAliasFe, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
-    }
-  } else if gck == "nulnone" {
-    // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-    if emitNulNoneBoxPayload(g.letInit, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
-    }
-  } else if (
-    (gck == "str" || gck == "nulstr")
-    && globalInitIsLitAtom(g.letInit)
-  ) {
-    // A literal-union atom initializing a `string` global widens to its member string.
-    // The start fn is a real function, so the runtime widening tower runs here (unlike a
-    // CONST global, whose constexpr init has no `select`/scratch).
-    if emitAtomToStr(g.letInit, -1) < 0 {
+  } else if arm == "widen" {
+    // Numeric widening at the global-init boundary (a `: f64`/`: f32`/`: i64` global whose
+    // init is a narrower numeric): the start-fn `global.set` matches the cell valtype.
+    const wk = if gck == "f32" { 5 } else if gck == "f64" { 4 } else { 3 }
+    if emitWidened(g.letInit, wk, -1) < 0 {
       wTarget(exprPrev)
       return -1
     }
   } else {
-    if emitExpr(g.letInit, -1) < 0 {
-      wTarget(exprPrev)
-      return -1
+    if emitStartGlobalInitValue(exprPrev, gst, g, arm) < 0 { return -1 }
+    emitGlobalInitArmUnbox(gst, gck, g.letInit)
+  }
+  const setPrev = wTarget(bodyExpr)
+  if emitUserGlobalSet(gi) < 0 {
+    wTarget(setPrev)
+    wTarget(exprPrev)
+    return -1
+  }
+  wTarget(setPrev)
+  return 0
+}
+
+// `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`), at value
+// arm `arm` of `startInitArmOf`. On failure restores the writer to `exprPrev`
+// and returns -1, else 0.
+function emitStartGlobalInitValue(
+  exprPrev: u8[],
+  gst: i32,
+  g: LetDecl,
+  arm: StartInitArm,
+) {
+  const rc = match arm {
+    // A bare top-level `const t = m[k]` over a union-valued map lowers its miss as the
+    // null-tagged box the consuming tag compare recovers, not `emitMapGet`'s bare `ref.null`.
+    "mapBox" => {
+      const gumrN = nodeAt(unwrapParen(g.letInit))
+      if gumrN is Index {
+        emitMapGetUnionBox(gumrN.idxArr, gumrN.idxIndex, -1)
+      } else {
+        emitFail(
+          "emitProgram: union-valued map read binding's init is not an index read",
+        )
+      }
     }
+    // A union cell is always the box: a concrete-variant init is boxed as a call argument is.
+    "unionBox" => emitUnionBoxOwed("", letBindingUnionTy(gst, -1), g.letInit, -1)
+    // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
+    "variant" => emitVariantCoerce(globalCellStructIdx(gst), g.letInit, -1)
+    // A module-level alias of a generic function, used only as a direct-call callee: the
+    // closure through the floor-less core, the start-fn twin of `emitGlobalSection`'s arm.
+    "alias" => emitClosureValueCore(monoGenericAliasFe(gst), -1)
+    // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
+    "nulnone" => emitNulNoneBoxPayload(g.letInit, -1)
+    // A literal-union atom initializing a `string` global widens to its member string.
+    "atom" => emitAtomToStr(g.letInit, -1)
+    "plain" => emitExpr(g.letInit, -1)
+    "holder" | "widen" => emitFail("emitProgram: a start global init arm reached the value step")
+  }
+  if rc < 0 {
+    wTarget(exprPrev)
+    return -1
   }
   return 0
 }
@@ -7976,6 +7957,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   boxDstShadowBegin()
   irShadowBegin()
   irRefInstall()
+  irStartPrologueHook = emitStrFillCalls
   tyHasFnMemoReset()
   identAuditBegin()
   const passDone: EmitPass[] = []
