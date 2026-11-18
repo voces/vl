@@ -185,12 +185,15 @@ import {
   forInLoopAt,
   forInLoopClose,
   forInLoopOpen,
+  hoistCandRow,
+  hoistReadTail,
+  hoistRowMark,
+  hoistRowReads,
   idxRowsOn,
   initBitOf,
   localNulStrRecovers,
   loopHoistCands,
   loopHoistClose,
-  loopHoistOpenAt,
   mapGetHelperFnOf,
   mapGetOrHelperRoute,
   mapRecvKeyTail,
@@ -790,21 +793,45 @@ function boxOp(r: RToBox) {
   return 0
 }
 
-// Opens legacy's header hoists for the loop over `condIx` and `bodyIx`, each receiver the builder
-// read as a plain variable (`irReadVar`) written as that variable, any other by legacy.
+// Opens legacy's header hoists for the loop over `condIx` and `bodyIx`, its rows and header
+// reads legacy's, each receiver read as the builder read it (`irHoistRecv`).
 export function irLoopHoistOpen(
   condIx: i32,
   bodyIx: i32,
   own: i32,
   own2: i32,
 ): i32 {
-  const cands = loopHoistCands(condIx, bodyIx, lw.irAt, own, own2)
-  const slots: i32[] = []
-  for c in cands {
-    const v = lw.irReadVar[c.hcRecv] ?? -1
-    slots.push(if v >= 0 { varSlot(v) } else { -1 })
+  const fnIx = lw.irAt
+  let opened = 0
+  for c in loopHoistCands(condIx, bodyIx, fnIx, own, own2) {
+    const row = hoistCandRow(c, condIx, bodyIx, fnIx)
+    if row >= 0 {
+      let k = 0
+      while k < hoistRowReads(row) {
+        if irHoistRecv(c.hcRecv) < 0 { return -1 }
+        hoistReadTail(row, k, c.hcRecv, fnIx)
+        k = k + 1
+      }
+      hoistRowMark(row)
+      opened = opened + 1
+    }
   }
-  return loopHoistOpenAt(cands, slots, condIx, bodyIx, lw.irAt)
+  return opened
+}
+
+// A hoisted receiver's read: its variable, or the read the builder noted it may write again.
+function irHoistRecv(ix: i32): i32 {
+  const v = lw.irReadVar[ix] ?? -1
+  if v >= 0 {
+    fbLocalGet(varSlot(v))
+    return 0
+  }
+  if lw.irReadAgain.has(ix) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false }
+    rhs(lw.irReadAgain[ix] ?? none, false)
+    return 0
+  }
+  return irLMiss("hoisted receiver read")
 }
 
 // The depth a branch to `label` crosses from the innermost frame, or -1.
