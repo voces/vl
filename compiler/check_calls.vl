@@ -1,4 +1,6 @@
 import { paramSolveProbe } from "./check_exp_obs"
+import { tpArmWriteClash, tpArmWriteTy } from "./check_tp_arm_writes"
+import { nodeLineOf } from "./check_capture_loss"
 
 // The type of a call: a built-in identifier call, a memory-offset or numeric intrinsic, an
 // optional call, or a call through a function type with its bounds, constraints and rest
@@ -7,7 +9,7 @@ import { paramSolveProbe } from "./check_exp_obs"
 import { BND_ARG, bndAt, bndCount } from "./check_iface"
 import { rowParamIsSlot, rowSlotBound } from "./check_row_param"
 import { decDigitsOf } from "./strutil"
-import { identTyOf } from "./check_nar_store"
+import { declTyOf, identTyOf } from "./check_nar_store"
 import { optCallLandWrapNote, optCallLandWraps } from "./check_call_resolve"
 import {
   ArrayLit,
@@ -2740,7 +2742,8 @@ function elabUnboundCallNote(n: Call, ix: i32, hNames: string[], hTys: i32[]) {
   let k = 0
   for tp in f.fnTyParams {
     const hi = strListIndexOf(hNames, tp)
-    const t = if hi >= 0 { hTys[hi] } else if elabNullOnlyTp(f, n, tp) { elabNullOnlyPin(d, k, tp) } else { elabUnionArgPin(f, n, tp) }
+    let t = if hi >= 0 { hTys[hi] } else if elabNullOnlyTp(f, n, tp) { elabNullOnlyPin(d, k, tp) } else { elabUnionArgPin(f, n, tp) }
+    if t < 0 { t = callArmWritePin(n, ix, d, tp) }
     if t < 0 { byDefault = true }
     tys.push(if t < 0 { TY_I32 } else { t })
     k = k + 1
@@ -2748,6 +2751,42 @@ function elabUnboundCallNote(n: Call, ix: i32, hNames: string[], hTys: i32[]) {
   elabValueRowNote(d, f.fnTyParams, tys)
   elabUnboundCallKeyNote(ix, d, f.fnTyParams, tys)
   return if byDefault { elabDefaultRowNote(d, tys) }
+}
+
+// The type generic `d`'s `is K` arms fix `tp` at for call `n` that binds it to nothing
+// (`tpArmWriteTy`), with each argument handed a `tp`-typed parameter pinned to it; -1 when no arm
+// fixes it. Two arms that fix it apart are refused at the call, naming both.
+function callArmWritePin(n: Call, ix: i32, d: i32, tp: string): i32 {
+  const clash = tpArmWriteClash(d, tp)
+  if clash.length == 2 {
+    tErr(
+      "an empty value handed to '"
+        + tp
+        + "' is written as one type in the `is` arm at line "
+        + i32ToStr(nodeLineOf(clash[0]))
+        + " and as another in the one at line "
+        + i32ToStr(nodeLineOf(clash[1]))
+        + "; annotate the argument",
+      ix,
+    )
+    return -1
+  }
+  const t = tpArmWriteTy(d, tp)
+  if t < 0 { return -1 }
+  const sig = declTyOf(d)
+  const st = if sig >= 0 { tyAt(sig) } else { tyAt(TY_ERR) }
+  if st is TyFunc {
+    let i = 0
+    while i < n.callArgs.length && i < st.fnParamTypes.length {
+      const pt = st.fnParamTypes[i]
+      const a = n.callArgs[i]
+      if a >= 0 && tyHasTyVar(pt) {
+        constrainEmptyExpr(a, nodeTyIxOf(a), substTyDeep(pt, [tp], [t]))
+      }
+      i = i + 1
+    }
+  }
+  return t
 }
 
 // What type parameter `tp`, position `k` of declaration `d`, binds where only a `null` reaches
@@ -5533,7 +5572,8 @@ function foreignLenCall(n: Call, cfn: Ident): boolean {
 
 // Stores each fresh literal argument of a generic call as its parameter at the call's solved
 // binding `vNames`/`vTys`, where that holds a record and no type parameter is left open. A
-// type parameter of the callee's declaration `d` the call leaves unbound is bound to `i32` (D4551).
+// type parameter of the callee's declaration `d` the call leaves unbound is bound to what its `is`
+// arms write it at (`tpArmWriteTy`), else `i32` (D4551).
 function adoptArgLits(
   d: i32,
   params: i32[],
@@ -5548,7 +5588,10 @@ function adoptArgLits(
     if args[i] >= 0 && tyHasTyVar(params[i]) {
       let pt = params[i]
       for tp in tps {
-        if !strListHas(vNames, tp) { pt = substTyDeep(pt, [tp], [TY_I32]) }
+        if !strListHas(vNames, tp) {
+          const aw = tpArmWriteTy(d, tp)
+          pt = substTyDeep(pt, [tp], [if aw >= 0 { aw } else { TY_I32 }])
+        }
       }
       pt = substTyDeep(pt, vNames, vTys)
       if !tyHasTyVar(pt) { adoptLitAt(args[i], pt) }
