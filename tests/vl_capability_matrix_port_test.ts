@@ -309,6 +309,32 @@ Deno.test({
 
 Deno.test({
   name:
+    "capability matrix: --generate writes every cell's program and grades none",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir();
+    try {
+      const got = await port([TEMPLATE, "--generate", "--out-dir", dir]);
+      const files = [...Deno.readDirSync(dir)].filter((e) =>
+        e.name.endsWith(".vl")
+      );
+      want("generate", got, 0, [
+        `generated ${files.length} programs in ${dir}`,
+      ]);
+      if (files.length === 0) {
+        throw new Error("generate: want programs, got none");
+      }
+      if (got.out.includes("RUNS") || got.out.includes("position x face")) {
+        throw new Error(`generate: want no grading, got:\n${got.out}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+Deno.test({
+  name:
     "capability matrix: argument errors and refusals go to stdout under the port's name",
   ignore: !ENABLED,
   fn: async () => {

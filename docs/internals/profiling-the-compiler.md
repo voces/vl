@@ -134,10 +134,16 @@ logged id fired in, by module:
 
     vl build compiler/entry.vl --names -o /tmp/names.wasm
     deno run -A scripts/fn-coverage.ts --names /tmp/names.wasm --jobs 4 --out /tmp/never.json
+    deno run -A scripts/fn-coverage.ts --names /tmp/names.wasm --matrix --jobs 4
+
+`--matrix` adds the capability-matrix templates' cell programs, generated with
+`capability-matrix.vl --generate` (written, not graded); the tree holds those only as templates.
 
 Over the default population (every `.vl` under `tests/`, `std/`, `scripts/` and `bench/`, plus
 `compiler/entry.vl`, 22,964 programs), 2,944 of 18,860 functions
-never ran on 2026-11-18. Read the list as coverage, not deadness:
+never ran on 2026-11-18. With `--matrix` (1,534 templates, 88,018 more programs) it is 2,889. The 55
+the matrix reaches are mostly emit and checker arms of capability positions, among them 3
+record-adoption functions in `check_fit_rules.vl`. Read the list as coverage, not deadness:
 - the CLI, lint, fmt, LSP and optimiser entries are not driven;
 - an env-gated instrument never fires;
 - an `emitFail` refusal never fires on a corpus that holds no emit reject.

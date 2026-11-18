@@ -3,11 +3,12 @@
 // each program on the instrumented module, and lists the functions no id of theirs fired in.
 //
 //   vl build compiler/entry.vl --names -o /tmp/names.wasm
-//   deno run -A scripts/fn-coverage.ts --names /tmp/names.wasm [--list <file>] [--jobs 4]
-//     [--out <never.json>]
+//   deno run -A scripts/fn-coverage.ts --names /tmp/names.wasm [--list <file>] [--matrix]
+//     [--jobs 4] [--out <never.json>]
 //
 // The default population is every `.vl` under tests/, std/, scripts/ and bench/, plus
-// compiler/entry.vl. A function this reports is one `compileSrc` never reached on that population,
+// compiler/entry.vl; `--matrix` adds every cell program the capability-matrix templates generate
+// (`capability-matrix.vl --generate`), which the tree holds only as templates. A function this reports is one `compileSrc` never reached on that population,
 // not a dead one: the CLI, lint, fmt, LSP and optimiser entries are not driven, and a refusal or an
 // env-gated instrument never fires on a corpus that holds no emit reject.
 
@@ -148,6 +149,54 @@ const listCorpus = (): string[] => {
   return out.sort();
 };
 
+// Every capability-matrix template's cell programs, generated under `dir`, `jobs` templates at a
+// time; a template that fails to generate is counted, not fatal.
+const matrixPrograms = async (dir: string, jobs: number): Promise<string[]> => {
+  const tdir = `${ROOT}/scripts/capability-probes/matrix`;
+  const tpls = [...Deno.readDirSync(tdir)]
+    .map((e) => e.name)
+    .filter((n) => n.endsWith(".matrix.vl"))
+    .sort();
+  const vl = `${ROOT}/scripts/vl-host/target/release/vl`;
+  let next = 0;
+  let failed = 0;
+  const one = async () => {
+    while (next < tpls.length) {
+      const i = next++;
+      const r = await new Deno.Command(vl, {
+        args: [
+          "run",
+          `${ROOT}/scripts/capability-matrix.vl`,
+          "--",
+          `${tdir}/${tpls[i]}`,
+          "--generate",
+          "--out-dir",
+          `${dir}/${i}`,
+        ],
+        cwd: ROOT,
+        stdout: "null",
+        stderr: "null",
+      }).output();
+      if (!r.success) failed++;
+    }
+  };
+  await Promise.all([...Array(jobs).keys()].map(one));
+  const out: string[] = [];
+  for (let i = 0; i < tpls.length; i++) {
+    try {
+      for (const e of Deno.readDirSync(`${dir}/${i}`)) {
+        if (e.name.endsWith(".vl")) out.push(`${dir}/${i}/${e.name}`);
+      }
+    } catch {
+      // A template that wrote nothing.
+    }
+  }
+  console.log(
+    `matrix: ${tpls.length} templates, ${failed} failed to generate, ${out.length} programs`,
+  );
+  return out.sort();
+};
+
 const main = async () => {
   const shard = arg("--shard");
   if (shard !== undefined) {
@@ -178,7 +227,11 @@ const main = async () => {
     await Deno.remove(`${tmp}/logged.wat`);
     const list = arg("--list") ?? `${tmp}/list.txt`;
     if (arg("--list") === undefined) {
-      Deno.writeTextFileSync(list, listCorpus().join("\n") + "\n");
+      const progs = listCorpus();
+      if (Deno.args.includes("--matrix")) {
+        progs.push(...await matrixPrograms(`${tmp}/matrix`, jobs));
+      }
+      Deno.writeTextFileSync(list, progs.join("\n") + "\n");
     }
     const self = new URL(import.meta.url).pathname;
     await Promise.all([...Array(jobs).keys()].map((i) =>
