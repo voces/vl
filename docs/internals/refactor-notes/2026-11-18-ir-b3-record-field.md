@@ -39,13 +39,15 @@ Fixpoint seeds of master d28639f5 and of this step, each built from its own chec
 | self-compile covered = matched = claimed | 8,388 | 11,018 | **+2,630** |
 | corpus covered = matched = claimed (12,297 cells) | 28,695 | 30,409 | **+1,714** |
 
-First miss, self-compile, master → this step:
+First miss, master → this step:
 
-| first miss | master | this step |
-|---|---:|---:|
-| `member record` | 481 | 0 |
-| `list length rep` | 2,696 | 0 |
-| `parameter rep record` | 1,568 | 0 |
+| first miss | self-compile | corpus |
+|---|---|---|
+| `list length rep` | 2,699 → 0 | – |
+| `parameter rep record` | 1,568 → 0 | 1,530 → 0 |
+| `member record` | 486 → 11 | 29 → 296 |
+| `local rep record` | 163 → 0 | 588 → 0 |
+| `parameter rep list` | 168 → 0 | 505 → 0 |
 
 Net compiler lines are +125 (+157, −32): 21 self-compile and 14 corpus functions per line.
 
