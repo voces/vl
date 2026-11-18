@@ -12,47 +12,56 @@ split them: a box read at a record (552 alone) and a nullable read at its inner 
     box arm and `narrowedFieldTail` now call it.
   - `localNulStrRecovers(ix, fnIx)` names the `string | null` local read that recovers non-null.
     `emitIdentLocalRead` now asks it.
-- **Predicates the IR reads.**
-  - `identReadsLocalPlain` says `emitIdentNode` takes the plain local read: no null read, unbox or
-    capture arm fires.
-  - `narrowedBoxVariantPlain` adds the box arm's own conditions: a union read with no bare variant
-    and no cross-tag fit owing a refusal.
+- **One decision for `emitIdentNode`'s ladder.** `identReadArmOf(e, ix, fnIx, pastNull)` names the
+  arm that reads an identifier past the list overrides, in the ladder's own order: `nulnone`,
+  `nullread`, `defglobal`, `unbox`, `niche`, `reflist`, `map`, `capture`, `nonlocal` or `local`.
+  `emitIdentNode` dispatches on it with an exhaustive `match`. After a null read that found no
+  other null to deliver, it asks again past that arm. The IR asks the same function whether the
+  answer is `local`. The capture test is `captureSlotOf`, which `emitCapturedRead` also reads. The
+  ladder exists once, so no copy can drift from it.
+- **`narrowedBoxVariantPlain`** adds the box arm's own conditions to a `local` read: a union read
+  with no bare variant and no cross-tag fit owing a refusal.
 - **`RBoxNarrow { bnV, bnAt }`** (box family): the box local, then `narrowedVariantTail`. **`RRecover
   { rcV, rcAt }`** (scalar family): the nullable local, then `ref.as_non_null` where
   `localNulStrRecovers`. The builder's `narrowedLocalRead` takes a box read at a record, or a
   nullable read at exactly its inner rep. Anything else stays the named miss `narrowed read`. The
   verifier requires a box, or a nullable, operand.
-- **Claim hazard.** `emitIdentNode`'s list arms (the union-of-lists override, the list-fit shadow
-  and capture stand-in) and the unrolled-slot read consult state the body lowering writes. The
-  predicate does not ask them: those arms only fire for a read typed as a list, and these reads are
-  typed as a record or as a nullable's inner rep, and `identRead`'s existing path does not ask the
-  unrolled slot either. Everything it does ask is checker, rep or pre-pass state. Mode 3 is clean.
+- **Claim hazard.** The list arms run ahead of the decision and stay legacy's alone: the
+  union-of-lists override, the list-fit shadow and the capture stand-in. They read state the body
+  lowering writes, and they fire only for a read typed as a list. These reads are typed as a record
+  or as a nullable's inner rep. Everything the decision reads is checker, rep or pre-pass state
+  (the capture cache is filled before any body lowers). Mode 3 is clean.
 
 ## Coverage
 
-Fixpoint seeds of B3 (`40b4835a`) and of this step, each built from its own checkout.
+Fixpoint seeds of B3's head (`5867876e`) and of this step merged onto it, each built from its own
+checkout.
 
 | reading | B3 | this step | gained |
 |---|---:|---:|---:|
-| self-compile covered = matched = claimed | 11,022 | 11,642 | **+620** |
-| corpus covered = matched = claimed (12,297 cells) | 30,409 | 30,494 | +85 |
+| self-compile covered = matched | 11,011 | 11,634 | **+623** |
+| self-compile claimed (`$VL_IR_SHADOW=5`) | 11,013 | 11,634 | +621 |
+| corpus claimed (12,297 cells) | 30,400 | 30,485 | +85 |
 | self-compile blocked by `narrowed read` alone | 653 | 7 | |
 
-Net compiler lines are +117 (+140, −23): 5.3 self-compile functions per line. Most of the cost is
-the predicate that mirrors `emitIdentNode`'s ladder.
+Net compiler lines are +112 (+234, −122): 5.6 self-compile functions per line. Making the ladder one
+decision cost no lines: it replaced the mirrored predicate.
 
 ## Bars
 
 | bar | reading |
 |---|---|
-| self-build | fixpoint; armed self-build covered = verified = matched = 11,642 |
+| self-build | fixpoint; armed self-build covered = verified = matched = 11,634 |
 | corpus identity, B3 seed vs this seed | 9,030 identical, 3,267 fail under both, 0 differ, 0 one-only; self-compile identical |
 | `--names` identity | the same: 0 differ, self-compile identical |
-| `--claims` | corpus 30,494, `ir-shadow: ok`, 0 fell back; self-compile 11,642 claimed, 0 fell back |
+| `ir-identity.sh --cases` (shipped vs same-tree `CLAIMED = []`, every non-error `tests/cases` program plus the capability probes) | 7,432 identical, 69 fail under both, 0 differ |
+| `--claims` | corpus 30,485, `ir-shadow: ok`, 0 fell back; self-compile 11,634 claimed, 0 fell back |
 | mode 3 (this seed under `$VL_IR_SHADOW=3` against B3's default) | 9,030 same, 0 differ, 0 one-only; self-compile identical |
 | shadow | corpus all matched, `ir-shadow: ok` |
-| L2 self-compile fuel | 96,453,502,814 (B3) to 96,326,992,124 (−0.13%) |
-| witnesses (`vl_ir_shadow_test`) | a narrowed box read whole at its variant; a `string \| null` parameter read at its string; 23 passed |
+| L2 self-compile fuel | 96,851,398,582 (B3) to 96,765,426,273 (−0.09%) |
+| `ladder-sets.vl` | 50 closed sets and 87 set-typed fields match (`IdentReadArm` added; `bnV`, `rcV` registered) |
+| lint-self | clean except B3's own `sentinel-index-unguarded` in `retBoxesCall` (`ir_build.vl`), which B3 fixes |
+| witnesses (`vl_ir_shadow_test`) | a narrowed box read whole at its variant; a `string \| null` parameter read at its string |
 
 The `--claims` readings need a host with the shipped claim. The shared `vl` here predates it, so they
 were taken with one built in an isolated target dir.
