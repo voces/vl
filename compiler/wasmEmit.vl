@@ -19112,19 +19112,24 @@ function hoistWrapTyOfRow(row: i32) {
   return scalarListWrap("i32", 0)
 }
 
-// Open the hoists for one loop: scan its body, and for every index receiver that survives
-// the soundness conditions, read its header into the row's two locals. Returns the count
-// of rows opened (the `loopHoistClose` argument), or -1 on prologue failure. `condIx`, the
-// loop's per-iteration condition, is held to the body's own hoist-safety standard — a `while f()` re-runs `f` every iteration.
-export function loopHoistOpen(
+// A receiver a loop's prologue may hoist: list read `hcRecv`, held to root declaration `hcRoot`
+// and field `hcProp` ("" for the root itself).
+export type HoistCand = { hcRecv: i32, hcRoot: i32, hcProp: string }
+
+// The receivers whose headers the prologue of the loop over `condIx` and `bodyIx` may hoist: no
+// rebinding of the root (bar the loop's own `ownDecl`/`ownDecl2`), no write of the field, and a
+// field receiver that reads as one plain `struct.get`. The condition re-runs every iteration, so
+// it is held to the body's own hoist-safety standard.
+export function loopHoistCands(
   condIx: i32,
   bodyIx: i32,
   fnIx: i32,
   ownDecl: i32,
   ownDecl2: i32,
-) {
-  if !hoistSafeExpr(condIx, fnIx) { return 0 }
-  if !hoistSafeBlock(bodyIx, fnIx) { return 0 }
+): HoistCand[] {
+  const out: HoistCand[] = []
+  if !hoistSafeExpr(condIx, fnIx) { return out }
+  if !hoistSafeBlock(bodyIx, fnIx) { return out }
   lhScanRoot = []
   lhScanProp = []
   lhScanRep = []
@@ -19132,11 +19137,8 @@ export function loopHoistOpen(
   hoistScanBlock(bodyIx)
   const own = hoistDeclKey(ownDecl)
   const own2 = hoistDeclKey(ownDecl2)
-  let opened = 0
   let i = 0
   while i < lhScanRoot.length {
-    // A field path `b.xs` is held to its root's rebinding, to no write of any `xs` field in
-    // the loop, and to a receiver that reads as one plain `struct.get`.
     const root = lhScanRoot[i]
     const prop = lhScanProp[i]
     const scanned = nodeAt(lhScanRep[i])
@@ -19151,49 +19153,94 @@ export function loopHoistOpen(
         if !hoistFieldRecvOk(scanned.idxArr, fnIx) { ok = false }
       }
     }
-    if ok {
-      const rep = nodeAt(lhScanRep[i])
-      if rep is Index {
-        let row = -1
-        // A view's cached header is its snapshot, refreshed here; a store through an index in
-        // the loop would miss it (D3028).
-        if !svHoistBlocked(rep.idxArr, fnIx, condIx, bodyIx) {
-          row = hoistRowOfRecv(rep.idxArr, root, prop, fnIx)
-        }
-        if row >= 0 && lhLive[row] == 0 {
-          if hoistRowIsStr(row) {
-            // A raw string's header is `{backing, start, len}` — three reads, because a
-            // view's element offset is `start + i` and its bound is `len`, neither
-            // recoverable from the other. The list arm below reads two; keeping both
-            // spellings in one `if` (rather than a second `loopHoistOpen`) stops them drifting.
-            if emitExpr(rep.idxArr, fnIx) < 0 { return 0 - 1 }
-            fbStrBack()
-            fbLocalSet(lhBack[row])
-            if emitExpr(rep.idxArr, fnIx) < 0 { return 0 - 1 }
-            fbStrStart()
-            fbLocalSet(lhStart[row])
-            if emitExpr(rep.idxArr, fnIx) < 0 { return 0 - 1 }
-            fbStrLen()
-            fbLocalSet(lhLen[row])
-          } else {
-            const wrapTy = hoistWrapTyOfRow(row)
-            if emitExpr(rep.idxArr, fnIx) < 0 { return 0 - 1 }
-            svSyncRecv(rep.idxArr, fnIx)
-            fbStructGet(wrapTy, 0) // field 0: backing
-            fbLocalSet(lhBack[row])
-            if emitExpr(rep.idxArr, fnIx) < 0 { return 0 - 1 }
-            fbStructGet(wrapTy, 1) // field 1: len
-            fbLocalSet(lhLen[row])
-          }
-          lhLive[row] = 1
-          lhOpen.push(row)
-          opened = opened + 1
-        }
+    if ok && scanned is Index {
+      out.push({ hcRecv: scanned.idxArr, hcRoot: root, hcProp: prop })
+    }
+    i = i + 1
+  }
+  return out
+}
+
+// The header row the prologue opens for `c`, or -1: no row, a view a store in the loop would
+// leave stale (D3028), or a row an enclosing loop already holds.
+function hoistCandRow(c: HoistCand, condIx: i32, bodyIx: i32, fnIx: i32): i32 {
+  if svHoistBlocked(c.hcRecv, fnIx, condIx, bodyIx) { return -1 }
+  const row = hoistRowOfRecv(c.hcRecv, c.hcRoot, c.hcProp, fnIx)
+  if row < 0 || lhLive[row] != 0 { return -1 }
+  return row
+}
+
+// After read `k` of row `row`'s receiver `recvIx`: that header field into its local. A raw
+// string's header is `{backing, start, len}`, three reads; a list's `{backing, len}`, two.
+function hoistReadTail(row: i32, k: i32, recvIx: i32, fnIx: i32) {
+  if hoistRowIsStr(row) {
+    if k == 0 {
+      fbStrBack()
+      fbLocalSet(lhBack[row])
+    } else if k == 1 {
+      fbStrStart()
+      fbLocalSet(lhStart[row])
+    } else {
+      fbStrLen()
+      fbLocalSet(lhLen[row])
+    }
+    return 0
+  }
+  const wrapTy = hoistWrapTyOfRow(row)
+  if k == 0 {
+    svSyncRecv(recvIx, fnIx)
+    fbStructGet(wrapTy, 0) // field 0: backing
+    fbLocalSet(lhBack[row])
+  } else {
+    fbStructGet(wrapTy, 1) // field 1: len
+    fbLocalSet(lhLen[row])
+  }
+  return 0
+}
+
+// Opens the header hoists of `cands` before the loop over `condIx` and `bodyIx`, each read of
+// candidate `i`'s receiver a `local.get` of `slots[i]` where that is a slot, else its expression.
+// Returns how many rows it opened, or -1.
+export function loopHoistOpenAt(
+  cands: HoistCand[],
+  slots: i32[],
+  condIx: i32,
+  bodyIx: i32,
+  fnIx: i32,
+): i32 {
+  let opened = 0
+  let i = 0
+  while i < cands.length {
+    const c = cands[i]
+    const row = hoistCandRow(c, condIx, bodyIx, fnIx)
+    if row >= 0 {
+      const reads = if hoistRowIsStr(row) { 3 } else { 2 }
+      let k = 0
+      while k < reads {
+        if i < slots.length && slots[i] >= 0 { fbLocalGet(slots[i]) }
+        else if emitExpr(c.hcRecv, fnIx) < 0 { return -1 }
+        hoistReadTail(row, k, c.hcRecv, fnIx)
+        k = k + 1
       }
+      lhLive[row] = 1
+      lhOpen.push(row)
+      opened = opened + 1
     }
     i = i + 1
   }
   return opened
+}
+
+// Opens the header hoists of the loop over `condIx` and `bodyIx`, each receiver read by legacy.
+export function loopHoistOpen(
+  condIx: i32,
+  bodyIx: i32,
+  fnIx: i32,
+  ownDecl: i32,
+  ownDecl2: i32,
+) {
+  const cands = loopHoistCands(condIx, bodyIx, fnIx, ownDecl, ownDecl2)
+  return loopHoistOpenAt(cands, [], condIx, bodyIx, fnIx)
 }
 
 // The live list (not raw-string) hoist row cached for receiver (`d`, `prop`), or -1.
