@@ -212,7 +212,7 @@ for r in $REENTRY; do
   k=$((k + 1))
 done
 if [ -n "$REENTRY" ]; then
-  sed -i 's/^import { dh, drvFnSet, drvStmtSet } from "\.\/drv_probe"$/import { dh, drvFnSet, drvReEnter, drvReLeave, drvStmtSet } from ".\/drv_probe"/' "$T/probe/wasmEmit.vl"
+  sed -i 's/^import { \(.*\) } from "\.\/drv_probe"$/import { \1, drvReEnter, drvReLeave } from ".\/drv_probe"/' "$T/probe/wasmEmit.vl"
 fi
 # Flush the counts into the shadow's rows, which the host prints as `[ir]` lines.
 awk '
