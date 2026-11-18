@@ -113,6 +113,26 @@ tagged set has fewer arms than members, and `elabPrepare` then ends in `emitFail
 through a tagged function set has no arm for each member"). It replaces the refutation as the late
 pass's loud internal check.
 
+*B3.1 results* (fixpoint seeds both sides, master `ece7aa606`):
+- `VL_LATE_DEMANDS=1 vl check --codegen tests`: byte-identical to master's, late rows included
+  (394, none gone or new; late demands 10).
+- @run A/B over 6,724 programs: 0 wasm movers (byte compare of every built module).
+- `check-filed-witnesses --strict` on both inventories: 5,468 graded, 0 MOVED, 3,432 checked
+  against Want, 0 mismatched.
+- The coverage check's control: a throwaway `ftBuildArmsAt` that drops one member's arm at
+  instance calls makes 126 corpus programs end in the new `emitFail`; the real build makes 0.
+- Re-ablation on B3.1: refutations at every site are 0 (site 8's 24 changed programs fall to 8,
+  site 15's 64 to 11, with the same rows). Sites 10 and 21 are 0 / 0 / 0, so they are deleted. The
+  other 19 still move rows.
+- L2 fuel: 96.078G against master's 96.069G measured alike (+0.01%). The re-plan saved nothing
+  measurable, because the self-compile has no late sets; the saving the design expected is not
+  there.
+- The 19 plan globals became one record (`ftP: FtRec`), so recording is one push and replay one
+  assignment. Net compiler lines: +180 / −152.
+- Phase-state census ok; lint clean; `emit_mono.vl` untouched (908).
+
+Late rows: 394 on master, 394 after B3.1 (392 once B2f, #8989, lands).
+
 **B3.2 — parameter takes per (KeyId, parameter).**
 - Sites: 5, 6, 11, 13, 14, 15, 16.
 - Producer: B2c's set-call rows (`arrowSetCallRows`, `IV_SET_CALL`) and B2a's row facts, extended
