@@ -74,7 +74,7 @@ that owns each one. The detail lives in that doc, and each fact has one home.
 
 ## Backlogged: ruled, waiting to be built
 
-- **Narrowing that survives indirect writes** (owner ruling 2026-11-18, D16970). An `is K[]`
+- **Narrowing that survives indirect writes** (owner ruling 2026-11-18). An `is K[]`
   narrowing ends at any write the checker cannot rule out, including writes through aliases and
   callees it cannot see into. Tracking indirect writes precisely (alias and effect summaries) keeps
   more narrowings alive. DECISIONS.md §"`is K[]` tests a list's contents".
