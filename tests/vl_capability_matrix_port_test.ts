@@ -189,9 +189,19 @@ Deno.test({
         ],
       );
 
-      // A loud refusal and a wrong value are neither movement: the exit stays 0.
+      // A loud refusal is no movement: the exit stays 0.
       want(
         "loud",
+        await port([...base, "--compiler", "new.wasm", "--only", "argument"]),
+        0,
+        [
+          "runs -> not-runs  0\n-> silent         0\n-> program trap   0\n-> wrong value    0\n",
+        ],
+      );
+
+      // A wrong value passed check and printed another answer: clause 1, so the exit is 1.
+      want(
+        "wrong",
         await port([
           ...base,
           "--compiler",
@@ -199,9 +209,10 @@ Deno.test({
           "--only",
           "argument,global_init",
         ]),
-        0,
+        1,
         [
-          "runs -> not-runs  0\n-> silent         0\n-> program trap   0\n",
+          "-> wrong value    1   global_init/unann\n",
+          "A WRONG cell passed check and printed another value than its WANT: clause 1.",
         ],
       );
 
