@@ -137,6 +137,7 @@ import {
   localIndexOf,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
+import { callSpillsFcpArg } from "./emit_fn_scans"
 import { fRecRetTy, fRetVoid, fnStmts, gPromoInStart } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
@@ -625,6 +626,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
   if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
+    if cf.identName == "fromCodePoint" || cf.identName == "fromCodePoints" {
+      return fromCpRhs(b, c, cf, ix)
+    }
     return numIntrRhs(b, c, cf, ix)
   }
   if d < 0 || !(nodeAt(d) is FuncDecl) {
@@ -674,6 +678,35 @@ function valuedIfFrom(b: i32[], at: i32): boolean {
     i = i + 1
   }
   return false
+}
+
+// `fromCodePoint(cp)` over an i32, or `fromCodePoints(xs)` over a local i32 list, which legacy
+// reads twice by name. Any other list spelling legacy spills to a scratch slot: a named miss.
+function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
+  if c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread {
+    return missRhs("code point argument")
+  }
+  const many = f.identName == "fromCodePoints"
+  if many && callSpillsFcpArg(ix) { return missRhs("code point list spill") }
+  const a = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("code point operand") }
+  if many {
+    if !(a is OVar) || a.ov < 0 || a.ov >= ib.irVars.length {
+      return missRhs("code point list read")
+    }
+    if ib.irVars[a.ov].vKind == "temp" {
+      return missRhs("code point list read")
+    }
+    const ln = repNodeAt(irBOpRep(a))
+    if !(ln is RList) || repPrim(ln.rlsElem) != "i32" {
+      return missRhs("code point operand coercion")
+    }
+  } else if repPrim(irBOpRep(a)) != "i32" {
+    return missRhs("code point operand coercion")
+  }
+  const op: StrOp = if many { "fromcps" } else { "fromcp" }
+  const r: Rhs = { soOp: op, soArgs: [a], soAt: ix }
+  return r
 }
 
 // A numeric intrinsic legacy writes as one instruction (`numIntrPlanOf`), each operand already

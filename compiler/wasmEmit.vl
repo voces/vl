@@ -4,6 +4,7 @@ import { lexOpcode, primOpcode } from "./ir"
 import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
 import { identityArmSlot } from "./emit_if_arm_values"
 import {
+  sharedFieldArmListKind,
   sharedFieldArmNulListKind,
   sharedFieldArmNulSet,
   sharedFieldArmSetTexts,
@@ -13262,7 +13263,9 @@ function emitSharedFieldArm(
     fbStructNew(uBoxIdx)
     return 0
   }
-  const bk = sharedFieldArmAtomKind(vi, fi)
+  // A non-null list rides the box as its ref under its kind's tag, as an atom does (D16951).
+  const ak = sharedFieldArmAtomKind(vi, fi)
+  const bk = if ak < 0 && boxes { sharedFieldArmListKind(vi, fi) } else { ak }
   if boxes && bk < 0 && sharedFieldArmNulSet(vi, fi) {
     return emitSharedFieldNulSetBox(vi, fi, recvIx, fnIx, slot)
   }
@@ -27901,17 +27904,26 @@ function emitCallCoreFromCodePoints(callIx: i32, c: Call, fnIx: i32) {
   if callSpillsFcpArg(callIx) {
     if emitExpr(fcpArg, fnIx) < 0 { return -1 }
     fbLocalTee(fcpSpillStashSlot())
-    fbStructGet(lTy(), 0)
-    fbI32Const(0)
+    fcpBackingTail()
     fbLocalGet(fcpSpillStashSlot())
-    fbStructGet(lTy(), 1)
-    fbCall(helpUtf8EncFn())
-    return 0
+    return fcpLenTail()
   }
   if emitExpr(fcpArg, fnIx) < 0 { return -1 }
+  fcpBackingTail()
+  if emitExpr(fcpArg, fnIx) < 0 { return -1 }
+  return fcpLenTail()
+}
+
+// After a code-point list: its backing, then the start index `__utf8_enc__` takes.
+export function fcpBackingTail() {
   fbStructGet(lTy(), 0)
   fbI32Const(0)
-  if emitExpr(fcpArg, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the code-point list's second read: its length, then the encoder call, which leaves
+// the string.
+export function fcpLenTail() {
   fbStructGet(lTy(), 1)
   fbCall(helpUtf8EncFn())
   return 0
@@ -27926,9 +27938,14 @@ function emitCallCoreFromCodePoint(c: Call, fnIx: i32) {
     )
   }
   if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  fbArrayNewFixed(aTy(), 1) // the one-element CODE-POINT array
-  fbI32Const(0)             // start
-  fbI32Const(1)             // len
+  return fromCpTail()
+}
+
+// After a code point: the one-element code-point array, encoded whole into its string.
+export function fromCpTail() {
+  fbArrayNewFixed(aTy(), 1)
+  fbI32Const(0)
+  fbI32Const(1)
   fbCall(helpUtf8EncFn())
   return 0
 }
