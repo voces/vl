@@ -1,7 +1,7 @@
 # IR: a narrowed local read (coverage step), 2026-11-18
 
-Lane STORE, assigned the `narrowed read` door beside IR2's B4, on IR2's step pattern. On B3
-(`ir-b3-list-length`), the self-compile blocker census put 653 functions behind this class alone:
+Lane STORE, assigned the `narrowed read` door beside IR2's B4, on IR2's step pattern, and reviewed
+by IR-REV. On B3, the self-compile blocker census put 653 functions behind this class alone:
 `identRead` refused any local read whose rep differs from its variable's. A probe naming the two reps
 split them: a box read at a record (552 alone) and a nullable read at its inner rep (91 alone).
 
@@ -42,13 +42,13 @@ split them: a box read at a record (552 alone) and a nullable read at its inner 
 
 ## Coverage
 
-Fixpoint seeds of B3's head (`9afa0ee3`) and of this step merged onto it, each built from its own
-checkout.
+Fixpoint seeds of master (`559a02d2`, IR B3 merged) and of this step merged onto it, each built
+from its own checkout.
 
-| reading | B3 | this step | gained |
+| reading | master | this step | gained |
 |---|---:|---:|---:|
-| self-compile covered = matched | 11,016 | 11,637 | **+621** |
-| self-compile claimed (`$VL_IR_SHADOW=5`) | 11,016 | 11,637 | +621 |
+| self-compile covered = matched | 11,017 | 11,638 | **+621** |
+| self-compile claimed (`$VL_IR_SHADOW=5`) | 11,017 | 11,638 | +621 |
 | corpus claimed (12,297 cells) | 30,400 | 30,485 | +85 |
 | self-compile blocked by `narrowed read` alone | 653 | 7 | |
 
@@ -60,14 +60,14 @@ list overrides, add 32 lines.
 
 | bar | reading |
 |---|---|
-| self-build | fixpoint; armed self-build covered = verified = matched = 11,637 |
-| corpus identity, B3 seed vs this seed | 9,030 identical, 3,267 fail under both, 0 differ, 0 one-only; self-compile identical |
+| self-build | fixpoint; armed self-build covered = verified = matched = 11,638 |
+| corpus identity, master seed vs this seed | 9,030 identical, 3,267 fail under both, 0 differ, 0 one-only; self-compile identical |
 | `--names` identity | the same: 0 differ, self-compile identical |
-| `ir-identity.sh --cases` (shipped vs same-tree `CLAIMED = []`, every non-error `tests/cases` program plus the capability probes) | 7,432 identical, 69 fail under both, 0 differ |
-| `--claims` | corpus 30,485, `ir-shadow: ok`, 0 fell back; self-compile 11,637 claimed, 0 fell back |
-| mode 3 (this seed under `$VL_IR_SHADOW=3` against B3's default) | 9,030 same, 0 differ, 0 one-only; self-compile identical |
+| `ir-identity.sh --cases` (shipped vs same-tree `CLAIMED = []`, every non-error `tests/cases` program plus the capability probes) | 7,433 identical, 69 fail under both, 0 differ |
+| `--claims` | corpus 30,485, `ir-shadow: ok`, 0 fell back; self-compile 11,638 claimed, 0 fell back |
+| mode 3 (this seed under `$VL_IR_SHADOW=3` against master's default) | 9,030 same, 0 differ, 0 one-only; self-compile identical |
 | shadow | corpus all matched, `ir-shadow: ok` |
-| L2 self-compile fuel | 96,852,104,405 (B3) to 96,776,231,378 (−0.08%) |
+| L2 self-compile fuel | 96,859,338,266 (master) to 96,787,253,920 (−0.07%) |
 | `ladder-sets.vl` | 50 closed sets and 87 set-typed fields match (`IdentReadArm` added; `bnV`, `rcV` registered) |
 | lint-self | clean |
 | witnesses (`vl_ir_shadow_test`, `vl_ir_list_test`) | a narrowed box read whole at its variant; a `string \| null` parameter read at its string; 24 passed |
