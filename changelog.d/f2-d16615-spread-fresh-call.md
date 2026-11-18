@@ -1,0 +1,3 @@
+## Type system (Track A)
+
+- **D16615 closed:** a list literal that only spreads a call (`[...mk()]`) whose function builds its list is copied into an annotated wider record list, at every position, as the call delivered whole is. One predicate, `callBuildsFreshList`, now decides "fresh call" for every copy path (the spread copy, the whole-call copy, D2196's nested copy), and also accepts a function returning a local list literal. A call whose function hands back a list it holds was copied as if fresh, and later writes to its records were lost. That clause-1 hole is now refused with a sentence naming the mechanism (D16954).

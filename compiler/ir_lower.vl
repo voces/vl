@@ -174,6 +174,7 @@ import {
   forInLoopAt,
   forInLoopClose,
   forInLoopOpen,
+  idxRowsOn,
   initBitOf,
   loopHoistClose,
   loopHoistOpen,
@@ -218,6 +219,9 @@ import {
   localIsRef,
   localStructIdx,
   sTy,
+  shIdxFrom,
+  shIdxNode,
+  shIdxTo,
   uBoxIdx,
   uBoxNewEnd,
   unionSinkBase,
@@ -252,6 +256,8 @@ let lwSpanAt: i32[] = []
 let lwRowAst: i32[] = []
 let lwRowFrom: i32[] = []
 let lwRowTo: i32[] = []
+// Each row's kind: 5 a statement, 6 an element read (`bankSpanRow`).
+let lwRowKind: i32[] = []
 
 export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
@@ -1021,6 +1027,7 @@ function spanClose(id: i32) {
         lwRowAst.push(lw.irSpanAst[k])
         lwRowFrom.push(from)
         lwRowTo.push(to)
+        lwRowKind.push(5)
       }
       lwSpanOpen[i] = -1
     }
@@ -1056,6 +1063,20 @@ export function irHexOf(b: u8[]): string {
 }
 
 function curLen(): i32 { return lwBuf.length }
+
+// The lowering's write position, which an element read's row starts at.
+export function irLAt(): i32 { return lwBuf.length }
+
+// Banks the element-read row of `Index` node `ix` written from `from` on, as legacy's
+// `emitIndexBanked` does: only where names and the source map are emitted, and only over bytes.
+export function irLIndexRow(ix: i32, from: i32) {
+  if !idxRowsOn() || lwBuf.length <= from { return 0 }
+  lwRowAst.push(ix)
+  lwRowFrom.push(from)
+  lwRowTo.push(lwBuf.length)
+  lwRowKind.push(6)
+  return 0
+}
 
 // The valtype byte of a scalar rep, or -1.
 function valtypeOf(r: i32): i32 {
@@ -1123,6 +1144,7 @@ function entry(f: IrFn, ctx: GlobalCtx): u8[] {
   lwRowAst = []
   lwRowFrom = []
   lwRowTo = []
+  lwRowKind = []
   lwBuf = []
   lwSinkFired = 0
   uBoxNewEnd = -1
@@ -1189,7 +1211,14 @@ export function irLowerClaim(
   for x in got { out.push(x) }
   let r = 0
   while r < lwRowAst.length {
-    bankSpanRow(lwRowAst[r], fnPos, lwRowFrom[r] + at, lwRowTo[r] + at, 5, "")
+    bankSpanRow(
+      lwRowAst[r],
+      fnPos,
+      lwRowFrom[r] + at,
+      lwRowTo[r] + at,
+      lwRowKind[r],
+      "",
+    )
     r = r + 1
   }
   return ""
@@ -1219,7 +1248,7 @@ function sinkClose() {
 }
 
 // The dual emit: lowers `f` and compares it with the legacy code entry `legacy` (this function's
-// whole entry) and the statement-span rows banked from `spanBase` on, at offsets in `legacy`
+// whole entry) and the statement and element-read rows banked from `spanBase` on, at offsets in `legacy`
 // once `spanShift` is taken off. "" when they are identical, else the first difference's class;
 // `skew` breaks the lowering on purpose (`irShadowCorrupt`).
 export function irDualEmit(
@@ -1242,6 +1271,7 @@ export function irDualEmit(
   // The comparison's own controls: 1 adds a byte to the lowering, 2 drops its first span row.
   if skew == 1 { got.push(0x01) }
   if skew == 2 && lwRowAst.length > 0 { lwRowAst[0] = -2 }
+  if skew == 3 { dropReadRows() }
   let i = 0
   while i < got.length && i < legacy.length && got[i] == legacy[i] { i = i + 1 }
   if i < got.length || i < legacy.length {
@@ -1252,34 +1282,77 @@ export function irDualEmit(
       + " vs "
       + byteText(got, i)
   }
-  // The statement rows (kind 5) legacy banked for this function, against the lowering's.
+  // The statement and element-read rows (kinds 5 and 6) legacy banked for this function,
+  // against the lowering's.
   const ln: i32[] = []
   const lf: i32[] = []
   const lt: i32[] = []
+  const lk: i32[] = []
   let k = spanBase
   while k < emitFnSpanStart.length {
-    if emitFnSpanKind[k] == 5 {
+    if emitFnSpanKind[k] == 5 || emitFnSpanKind[k] == 6 {
       ln.push(emitFnSpanNode[k])
       lf.push(emitFnSpanStart[k] - spanShift)
       lt.push(emitFnSpanEnd[k] - spanShift)
+      lk.push(emitFnSpanKind[k])
     }
     k = k + 1
+  }
+  // The element reads the armed shadow noted where the section banks none.
+  let q = 0
+  while q < shIdxNode.length {
+    ln.push(shIdxNode[q])
+    lf.push(shIdxFrom[q] - spanShift)
+    lt.push(shIdxTo[q] - spanShift)
+    lk.push(6)
+    q = q + 1
   }
   if ln.length != lwRowAst.length { return "spans: count" }
   let j = 0
   while j < ln.length {
-    if !rowListed(ln[j], lf[j], lt[j]) { return "spans: " + kindOf(ln[j]) }
+    if !rowListed(ln[j], lf[j], lt[j], lk[j]) {
+      const what = if lk[j] == 6 { "read " } else { "" }
+      return "spans: " + what + kindOf(ln[j])
+    }
     j = j + 1
   }
   return ""
 }
 
-// Whether the lowering banked the row `(node, from, to)`, in any order: rows close innermost
-// first in both emitters, but a nested statement's order is not the comparison.
-function rowListed(n: i32, from: i32, to: i32): boolean {
+// The control that drops every element-read row the lowering banked (`irShadowCorrupt(5)`).
+function dropReadRows() {
+  const a: i32[] = []
+  const f: i32[] = []
+  const t: i32[] = []
+  const k: i32[] = []
   let i = 0
   while i < lwRowAst.length {
-    if lwRowAst[i] == n && lwRowFrom[i] == from && lwRowTo[i] == to {
+    if lwRowKind[i] != 6 {
+      a.push(lwRowAst[i])
+      f.push(lwRowFrom[i])
+      t.push(lwRowTo[i])
+      k.push(lwRowKind[i])
+    }
+    i = i + 1
+  }
+  lwRowAst = a
+  lwRowFrom = f
+  lwRowTo = t
+  lwRowKind = k
+  return 0
+}
+
+// Whether the lowering banked the row `(node, from, to)`, in any order: rows close innermost
+// first in both emitters, but a nested statement's order is not the comparison.
+function rowListed(n: i32, from: i32, to: i32, kind: i32): boolean {
+  let i = 0
+  while i < lwRowAst.length {
+    if (
+      lwRowAst[i] == n
+      && lwRowFrom[i] == from
+      && lwRowTo[i] == to
+      && lwRowKind[i] == kind
+    ) {
       return true
     }
     i = i + 1

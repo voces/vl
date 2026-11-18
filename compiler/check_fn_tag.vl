@@ -175,7 +175,6 @@ import {
   mintFactSetOf,
   mintFwdFieldSetsOf,
   mintLamClosed,
-  mintNestedPerEnclOf,
   mintParamFwdInsOf,
   mintParamHeldSets,
   mintParamSetsOf,
@@ -3416,11 +3415,6 @@ function ftReadInNestedFn(body: i32, pd: i32): boolean {
     if x >= 0 && x < P.nodes.length {
       const n = nodeAt(x)
       if inFn && n is Ident && identDeclOf(x) == pd { return true }
-      // After the elaboration, a nested declaration built per encloser instance reads each
-      // instance's own value.
-      if n is FuncDecl && x != body && ftLate && mintNestedPerEnclOf(x) {
-        continue
-      }
       const deeper = inFn || n is FuncDecl
       for c in nodeChildren(x) {
         xs.push(c)
@@ -4758,9 +4752,7 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     // A record literal holds the id as the field's value.
     FieldInit => {
       const held = pn.fiValue == x
-        && (ftRecHolds(g, s)
-        || ftOpenFieldHolds(g, pn.fiName, s)
-        || ftNamedFieldHolds(g, x, pn.fiName, s))
+        && (ftRecHolds(g, s) || ftOpenFieldHolds(g, pn.fiName, s))
       // Its literal is built at the record of the set's ids, whatever rep check adopted.
       if held && ftLate && ftNamedFnValue(x) && !i32ListHas(ftNamedRecLits, g) {
         ftNamedRecLits.push(g)
@@ -4884,7 +4876,7 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
       if ftHolds(parenPeelIx(v), s) { any = true }
     } else if fnTagSetOfTy(nodeTyIxOf(v)) == s {
       const wide = (i32ListHas(ftEscapes, v) || fnTagEtaAt(v)) && ftWideEscOk(s)
-      if !(ftLate && ftCoercedEscape(v, s)) && !wide { return false }
+      if !wide { return false }
       any = true
     } else if fnTagEtaAt(v) && fnTagEtaSetOf(v) == s {
       // The adapter the last check built there holds a closure.
@@ -4892,24 +4884,6 @@ function ftHolderCoerced(x: i32, s: i32): boolean {
     }
   }
   return any
-}
-
-// Whether `v` is a delivery of one-member set `s` the late decision coerces to a closure.
-function ftCoercedEscape(v: i32, s: i32): boolean {
-  const ms = fnTagMembers(s)
-  if ms.length != 1 || !ftHoleLambdaAlone(s, ms[0]) { return false }
-  let i = 0
-  while i < ftEscapes.length && i < ftEscDstLast.length {
-    if ftEscapes[i] == v {
-      const dt = ftEscDstLast[i]
-      return dt >= 0
-        && dt < T.tys.length
-        && tyAt(dt) is TyFunc
-        && !tyHasTyVar(dt)
-    }
-    i = i + 1
-  }
-  return false
 }
 
 // Whether node `x` is a list whose element carries set `s`, or a record with a field that holds
@@ -4927,19 +4901,6 @@ function ftRecHolds(x: i32, s: i32): boolean {
 
 // The record literals the plan in progress holds through a field naming a function.
 let ftNamedRecLits: i32[] = []
-
-// Whether, after the elaboration, `x`, the value of field `name` of record literal `g`, names a
-// declared function the literal's own type holds as set `s`, and the literal is not built with a
-// closure there: a named function in a record field is a set id, as a list element naming one
-// is, though an earlier round stamped the literal at the record of its ids.
-function ftNamedFieldHolds(g: i32, x: i32, name: string, s: i32): boolean {
-  if !ftLate || g < 0 || !ftNamedFnValue(x) { return false }
-  if fnTagSetOfTy(tyFieldTyOf(nodeTyIxOf(g), name)) != s { return false }
-  const rf = tyFieldTyOf(nodeRepTyIxOf(g), name)
-  return rf >= 0
-    && rf < T.tys.length
-    && (!(tyAt(rf) is TyFunc) || fnTagSetOfTy(rf) == s)
-}
 
 // Whether field `name` of record literal `x`, adopted at a hole parameter's record whose field is
 // open, holds set `s` in the literal's own type: after the elaboration the literal is built at
@@ -5369,12 +5330,11 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       return pn.fnBody == x && rcwInferredRetTy(p) == tx
     }
     Call => {
-      // Before the elaboration, a list seeded with fewer of the set's members than the set, handed
-      // to a hole parameter whose callee writes into it, holds a wider set in that instance than
-      // its own; one whose members agree there stays closures (`mintSetPartial`).
+      // A list seeded with fewer of the set's members than the set, handed to a hole parameter
+      // whose callee writes into it, holds a wider set in that instance than its own; one whose
+      // members agree there stays closures (`mintSetPartial`).
       if (
-        !ftLate
-        && ftHoleArg(pn, x)
+        ftHoleArg(pn, x)
         && !fnTagSetSplits(s)
         && ftSeededNarrower(x, s)
         && ftArgSlotWritten(pn, x)
@@ -5383,7 +5343,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
       }
       // A binding, or a named function's result, handed to a hole parameter binds it to that
       // value's own type, and the callee's writes through it join this set (D14648, D15430).
-      // Before the elaboration, a literal is held so only where the callee does not hand it back.
+      // A literal is held so only where the callee does not hand it back.
       const ok = ftDstTakes(ftArgDstTy(pn, x), x, s)
         || ftDstTakes(ftMapSetValTy(pn, x, s), x, s)
         || ftPushRecvOf(pn, x) >= 0
@@ -5398,7 +5358,7 @@ function ftHoldCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
         && ftHandedHolder(x)
         && ftDeclsOnly(s)
         && !mintSetPartial(s)
-        && (ftLate || !ftArgHandedBack(pn, x))
+        && !ftArgHandedBack(pn, x)
       // A field or element read, or a named call's result, handed on is held, so its place's
       // rep is stamped on it.
       const xp = parenPeelIx(x)
