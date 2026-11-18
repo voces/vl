@@ -8314,6 +8314,37 @@ function emitNulStrFieldRecover(r: i32, readIx: i32, fnIx: i32) {
   return 0
 }
 
+// After a box narrowed to variant `vi`: its payload as that variant, then field `idx`, recovered
+// non-null where a narrowed `string | null` field reads present.
+export function narrowedFieldTail(vi: i32, idx: i32, memIx: i32, fnIx: i32) {
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), idx)
+  return emitNulStrFieldRecover(uFieldStart[vi] + idx, memIx, fnIx)
+}
+
+// The variant field `emitExpr` reads off a narrowed box local in `emitNarrowedMem`'s plain form,
+// or -1: no null-unit or niche read, no `length`, a box receiver read raw, and no union-box field
+// to unbox.
+export function narrowedFieldPlain(memIx: i32, fnIx: i32): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) || m.memProp == "length" { return -1 }
+  if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return -1 }
+  if (
+    placeNicheAtomKind(memIx, fnIx) >= 0
+    || twoListUseMsg(m.memObj, m.memProp, fnIx) != ""
+  ) {
+    return -1
+  }
+  if !(nodeAt(m.memObj) is Ident) || !exprUnion(m.memObj, fnIx) { return -1 }
+  if readOwesNonNullRecover(m.memObj, fnIx) { return -1 }
+  const vi = memNarrowVariantIndex(memIx, fnIx)
+  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  const idx = variantFieldIndex(vi, m.memProp)
+  if idx < 0 || fieldRowIsUnionBox(uFieldStart[vi] + idx) { return -1 }
+  return idx
+}
+
 // Lower a narrowed field read `recv.field` where `recv` is narrowed to `narrowVariant` by
 // an enclosing `if recv is Variant`: evaluate the box, `struct.get $box 1`, `ref.cast (ref
 // $variant)` (non-null: a box never is), then `struct.get` the field. Resolves the variant
@@ -8332,10 +8363,7 @@ function emitNarrowedMem(memIx: i32, fnIx: i32) {
       )
     }
     if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 1)
-    fbRefCast(variantHeap(vi))
-    fbStructGet(variantHeap(vi), idx)
-    emitNulStrFieldRecover(uFieldStart[vi] + idx, memIx, fnIx)
+    narrowedFieldTail(vi, idx, memIx, fnIx)
 
     // A value-union field read while the checker types it as one atom unboxes to that atom,
     // through the home the bare-arm twin uses: an index-rooted path has no member key, so
@@ -23572,7 +23600,7 @@ function emitBoxAtomRetagMembers(ft: i32[], tt: i32[], at: i32) {
 
 // A read leaves its recorded rep on the stack: a nullable cell the checker narrowed to its
 // non-null twin recovers here, once, rather than at each consumer.
-function emitReadRecover(exprIx: i32, fnIx: i32) {
+export function emitReadRecover(exprIx: i32, fnIx: i32) {
   if readOwesNonNullRecover(exprIx, fnIx) { fbRefAsNonNull() }
   return 0
 }
