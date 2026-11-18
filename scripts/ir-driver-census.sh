@@ -53,11 +53,11 @@ for f in "$T"/probe/wasmEmit.vl "$T"/probe/emit_*.vl; do
   n=$(cat "$T/count")
 done
 {
-  echo 'export const DRV_NAMES: string[] = ['
-  sed 's/.*/  "&",/' "$T/names"
-  echo ']'
   echo 'let drvHit: {[i32]: i32} = Map()'
   echo 'export let drvKeyList: i32[] = []'
+  echo '// A tag is a function node index, so a key packs its dense position instead.'
+  echo 'let drvTagIx: {[i32]: i32} = Map()'
+  echo 'let drvTagList: i32[] = []'
   echo 'let drvInIr = false'
   echo 'let drvFn = -1'
   echo 'let drvStmt = -1'
@@ -79,11 +79,17 @@ done
   echo '  drvStmt = x'
   echo '  return 0'
   echo '}'
-  echo '// A hit keyed by its tag (0 the IR, 1 top-level code, 2 no function, 3 + n function n) and id.'
+  echo '// A hit keyed by its tag (0 the IR, 1 top-level code, 2 no function, 3 + n function node n) and id.'
   echo 'export function dh(i: i32) {'
   echo '  if drvMode == 4 { return 0 }'
   echo '  const tag = if drvMode != 5 { 2 } else if drvInIr { 0 } else if drvStmt >= 0 { 1 } else if drvFn < 0 { 2 } else { 3 + drvFn }'
-  echo '  const k = tag * 8192 + i'
+  echo '  let d = drvTagIx[tag] ?? -1'
+  echo '  if d < 0 {'
+  echo '    d = drvTagList.length'
+  echo '    drvTagIx[tag] = d'
+  echo '    drvTagList.push(tag)'
+  echo '  }'
+  echo '  const k = d * 8192 + i'
   echo '  const n = drvHit[k] ?? 0'
   echo '  if n == 0 { drvKeyList.push(k) }'
   echo '  drvHit[k] = n + 1'
@@ -94,16 +100,18 @@ done
   echo '  if n < 10 { return DRV_DIGITS[n] }'
   echo '  return drvItos(n / 10) + DRV_DIGITS[n % 10]'
   echo '}'
-  echo '// The rows of the hits since the last flush: `<name> <tag>` and the count.'
+  echo "// The rows of the hits since the last flush: \`<driver id> <tag>\` and the count."
   echo 'export function drvFlush(keys: string[], ns: i32[]) {'
   echo '  for k in drvKeyList {'
-  echo '    const tag = k / 8192'
+  echo '    const tag = drvTagList[k / 8192]'
   echo '    const t = if tag == 0 { "@ir" } else if tag == 1 { "@start" } else if tag == 2 { "@module" } else { "f" + drvItos(tag - 3) }'
-  echo '    keys.push("drv " + DRV_NAMES[k % 8192] + " " + t)'
+  echo '    keys.push("drv " + drvItos(k % 8192) + " " + t)'
   echo '    ns.push(drvHit[k] ?? 0)'
   echo '  }'
   echo '  drvHit = Map()'
   echo '  drvKeyList = []'
+  echo '  drvTagIx = Map()'
+  echo '  drvTagList = []'
   echo '  return 0'
   echo '}'
 } > "$T/probe/drv_probe.vl"
@@ -151,16 +159,19 @@ awk '
 # One mode's `[ir]` rows over the self-compile and the corpus, condensed as they come: mode 1
 # keeps each function's hits, mode 5 its tagged hits, mode 4 each function's blocker set.
 cat > "$T/one.sh" <<'ONE'
+T=$(dirname "$0")
 mode=$1; out=$2; probe=$3; shift 3
 if [ "$1" = self ]; then
   VL_IR_SHADOW=$mode "$VL" build compiler/entry.vl -o "$out.wasm" --compiler "$probe" 2>&1 > /dev/null
 else
   VL_IR_SHADOW=$mode "$VL" check --codegen --compiler "$probe" "$@" 2>&1 > /dev/null
-fi | awk -F'\t' -v mode="$mode" '
+fi | awk -F'\t' -v mode="$mode" -v names="$T/names" '
+  BEGIN { while ((getline l < names) > 0) name[i++] = l }
   /^\[ir\] / {
     h = $1; sub(/^\[ir\] /, "", h); n = h; sub(/.*: /, "", n); sub(/: [0-9]+$/, "", h)
-    if (mode == 1 && $2 ~ /^drv /) { split(substr($2, 5), k, " "); s[k[1]] += n }
-    else if (mode == 5 && $2 ~ /^drv /) print h "\t" n "\t" $2
+    if ($2 ~ /^drv /) { split(substr($2, 5), k, " "); k[1] = name[k[1]] }
+    if (mode == 1 && $2 ~ /^drv /) s[k[1]] += n
+    else if (mode == 5 && $2 ~ /^drv /) print h "\t" n "\tdrv " k[1] " " k[2]
     else if (mode == 4 && $2 ~ /^fnb /) print h "\t" n "\t" $2
   }
   END { for (f in s) print "-\t" s[f] "\tdrv " f " -" }
