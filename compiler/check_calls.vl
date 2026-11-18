@@ -1,6 +1,7 @@
 import { paramSolveProbe } from "./check_exp_obs"
 import { tpArmWriteClash, tpArmWriteTy } from "./check_tp_arm_writes"
 import { nodeLineOf } from "./check_capture_loss"
+import { unresolvedHole } from "./check_leaf_steps"
 
 // The type of a call: a built-in identifier call, a memory-offset or numeric intrinsic, an
 // optional call, or a call through a function type with its bounds, constraints and rest
@@ -1778,6 +1779,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     )
   }
   pinHeldAtCall(ix, vNames, vTys)
+  callArmWritePinOpen(n, cDecl, vNames, vTys)
   if vNames.length == 0 {
     // A call whose list argument a later write may still fix is banked once its rows settle.
     if !elabCapLive() && i32ListHas(ceHeldCall, ix) {
@@ -2787,6 +2789,32 @@ function callArmWritePin(n: Call, ix: i32, d: i32, tp: string): i32 {
     }
   }
   return t
+}
+
+// Pins each empty argument of call `n` that is all a type parameter of generic `d` binds to, at
+// the type `d`'s `is K` arms write that parameter at (`tpArmWriteTy`). The pinned type depends on
+// the callee alone, so every instance of a hole-template caller agrees on it; per-call implicit
+// holes are to carry it as a bound row instead (D16986).
+function callArmWritePinOpen(n: Call, d: i32, vNames: string[], vTys: i32[]) {
+  if d < 0 { return 0 }
+  const sig = declTyOf(d)
+  const st = if sig >= 0 { tyAt(sig) } else { tyAt(TY_ERR) }
+  if !(st is TyFunc) { return 0 }
+  let k = 0
+  while k < vNames.length && k < vTys.length {
+    const t = if unresolvedHole(vTys[k]) { tpArmWriteTy(d, vNames[k]) } else { -1 }
+    let i = 0
+    while t >= 0 && i < n.callArgs.length && i < st.fnParamTypes.length {
+      const a = n.callArgs[i]
+      const pt = st.fnParamTypes[i]
+      if a >= 0 && tyHasTyVar(pt) && unresolvedHole(nodeTyIxOf(a)) {
+        constrainEmptyExpr(a, nodeTyIxOf(a), substTyDeep(pt, [vNames[k]], [t]))
+      }
+      i = i + 1
+    }
+    k = k + 1
+  }
+  return 0
 }
 
 // What type parameter `tp`, position `k` of declaration `d`, binds where only a `null` reaches
