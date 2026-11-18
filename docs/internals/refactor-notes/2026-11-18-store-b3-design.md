@@ -144,6 +144,17 @@ Late rows: 394 on master, 394 after B3.1 (392 once B2f, #8989, lands).
 - Splits into B3.2a (15, 16, 11: arguments of calls through a set) and B3.2b (5, 6, 13, 14:
   handed-on parameters) if the first exceeds a reviewable size.
 
+*After B3.2a:* arms die per family, not per site. A class-T lambda set needs site 15 (the argument
+of a call through a set) and site 9 (the lambda leaf) together, so a stage is a set family moved
+whole, and an arm goes only when its last family has moved.
+
+**The outer-hole producer opens up after B3.2.** The A0 shadow's largest open class over the late
+programs is `outer-hole`, 831 bindings: an instance nested in an instance, whose binding the check
+leaves at the encloser's hole while the elaboration keys it after substitution. Next are
+`arrow-args` (311) and `fn-value` (239). The producer substitutes each nested binding through the
+encloser's key. Under the per-set scope of the veto it is what B3.3 to B3.5 meet next: an arrow
+row inside such an instance is open (B3.2a's "open argument types", 10 of site 15's sets).
+
 **B3.3 — hand-back and member-call arms per key.**
 - Sites: 8 (29 rows), 9 (88 rows, the largest family).
 - Producers: `check_hand_back` per key, beyond one hole parameter; and the instance's member call
