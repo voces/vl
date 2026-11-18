@@ -1,3 +1,5 @@
+import { parseI32 } from "./emit_bignum"
+import { instFreshSet } from "./check_relate_core"
 // `emit_elab.vl` — elaboration: every function instance the program reaches, keyed by its
 // declaration and its closed type arguments, checked once, with each body node's type at the
 // instance. Roots are the generic pass's closed calls; an instance's own closed calls enqueue.
@@ -1493,7 +1495,12 @@ function elabCanon(
     }
     if (
       !has
-      && (elabOwnName(decl, nm) || elabSigReads(decl, nm) || elabIsRowEntry(nm))
+      && (
+        elabOwnName(decl, nm)
+        || elabSigReads(decl, nm)
+        || elabIsRowEntry(nm)
+        || elabIsOpenCopyName(nm)
+      )
     ) {
       if !elabTyClosed(tys0[i0]) { return false }
       names.push(nm)
@@ -10520,6 +10527,7 @@ export function elabRun() {
   elabValueInstVia = Map()
   elabHoleMapMemo = Map()
   elabHoleContMemo = Map()
+  elabOpenKeyMemo = Map()
   elabKeyCalls = Map()
   elabRepRowCalls = Map()
   elabLitArg = Map()
@@ -16637,6 +16645,12 @@ function elabSpreadSources(d: i32): i32[] {
 export function elabNodeTy(ix: i32, k: i32): i32 {
   const ct = elabCalleeTyOf(ix)
   if ct >= 0 { return ct }
+  // A template container allocated per call is read at the instance's copy (D16976).
+  if elabKeyHasOpenCopies(k) {
+    const raw0 = elabCheckedTyOf(ix)
+    const oc = if raw0 >= 0 { elabSubstOpen(raw0, k) } else { -1 }
+    if oc >= 0 && oc != raw0 && elabTyClosed(oc) { return oc }
+  }
   const t = elabTyIn(ix, k)
   let raw = elabCheckedTyOf(ix)
   if t >= 0 && t < T.tys.length {
@@ -16741,9 +16755,50 @@ function elabSubstOpen(t: i32, k: i32): i32 {
   }
   // A lambda instance reads its enclosing generic's binding, which speaks for that generic's own
   // variables only, not another's of the same name the lambda is typed at (D15034).
+  const opens = elabOpenCopies(names, tys)
+  if opens.length > 0 { instFreshSet(opens) }
   const s = substTyDeepOf(t, names, tys, elabOwnerOf(k))
+  if opens.length > 0 { instFreshSet(Map()) }
   if s < 0 || s >= T.tys.length || s == TY_ERR { return -1 }
   return s
+}
+
+// Whether instance `k` binds a template container's per-call copy; memoised by key.
+function elabKeyHasOpenCopies(k: i32): boolean {
+  if k < 0 || k >= ekNames.length { return false }
+  const m = elabOpenKeyMemo.get(k)
+  if m != null { return m }
+  let r = false
+  for n in ekNames[k] {
+    if elabIsOpenCopyName(n) { r = true }
+  }
+  elabOpenKeyMemo.set(k, r)
+  return r
+}
+let elabOpenKeyMemo: Map<i32, boolean> = Map()
+
+// Whether frame `fnIx`'s instance binds a template container's per-call copy (D16976).
+export function elabFnHasOpenCopies(fnIx: i32): boolean {
+  return fnIx >= 0 && elabKeyHasOpenCopies(elabKeyAt(fnIx))
+}
+
+// Whether binding name `n` is a template container's per-call copy (`$open<type>`, D16976).
+function elabIsOpenCopyName(n: string): boolean {
+  return n.length > 5 && n.slice(0, 5) == "$open"
+}
+
+// The template containers instance bindings `names` give a per-call copy (`$open<type>`), by type.
+function elabOpenCopies(names: string[], tys: i32[]): Map<i32, i32> {
+  const m: Map<i32, i32> = Map()
+  let i = 0
+  while i < names.length && i < tys.length {
+    const n = names[i]
+    if elabIsOpenCopyName(n) && tys[i] >= 0 {
+      m.set(parseI32(n.slice(5, n.length)), tys[i])
+    }
+    i = i + 1
+  }
+  return m
 }
 
 // The record every call reaching instance `k` is built at, as the checker stamped each call's
