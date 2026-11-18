@@ -94,7 +94,11 @@ export function dh(i: i32) {
     d = drvTagList.length
     drvTagIx[tag] = d
     drvTagList.push(tag)
-    for _ in 0..DRV_W { drvBits.push(0) }
+    let z = 0
+    while z < DRV_W {
+      drvBits.push(0)
+      z = z + 1
+    }
   }
   const w = d * DRV_W + i / 32
   drvBits[w] = drvBits[w] | (1 << (i % 32))
@@ -107,20 +111,26 @@ function drvItos(n: i32): string {
 }
 // The rows since the last flush: `drv <id>` with its count, and `drvf <tag> <id>...` per tag.
 export function drvFlush(keys: string[], ns: i32[]) {
-  for i in 0..drvCnt.length {
+  let i = 0
+  while i < drvCnt.length {
     if drvCnt[i] > 0 {
       keys.push("drv " + drvItos(i))
       ns.push(drvCnt[i])
     }
+    i = i + 1
   }
-  for d in 0..drvTagList.length {
+  let d = 0
+  while d < drvTagList.length {
     const tag = drvTagList[d]
     let row = if tag == 0 { "drvf @ir" } else if tag == 1 { "drvf @start" } else if tag == 2 { "drvf @module" } else { "drvf f" + drvItos(tag - 3) }
-    for i in 0..DRV_N {
-      if (drvBits[d * DRV_W + i / 32] >> (i % 32)) & 1 == 1 { row = row + " " + drvItos(i) }
+    let j = 0
+    while j < DRV_N {
+      if ((drvBits[d * DRV_W + j / 32] >> (j % 32)) & 1) == 1 { row = row + " " + drvItos(j) }
+      j = j + 1
     }
     keys.push(row)
     ns.push(0)
+    d = d + 1
   }
   drvCnt = []
   drvBits = []
