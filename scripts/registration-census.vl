@@ -1,0 +1,246 @@
+// The registration census (docs/internals/refactor-notes/2026-11-17-registration-census.md): which
+// emit tables gain a row after the passes have run, which canon key `repOfTy` answers two ways, and
+// which emitted node has no rep. It builds a scratch compiler from a copy of `compiler/` with the
+// edits in `scripts/registration-census-edits.json` applied, so the checkout's seed carries nothing,
+// then compiles each program with it and tallies the one `CENSUS` line each compile reports.
+//
+//     vl run scripts/registration-census.vl -- [--check] [--seed P] [--jobs N] [path...]
+//
+// Paths default to the distilled corpus. `--check` exits 1 when any program registers a row once
+// the rows are final (`rowsFinal` on). Run from the checkout root.
+
+import { IoError, readTextFile, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { getEnv } from "std:env"
+import { exit, runProgram } from "std:process"
+import { Json, JsonError, parseJson } from "std:json"
+import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseI32, toString } from "std:fmt"
+import { split, startsWith, trim } from "std:str"
+import { concat } from "std:array"
+import { JsonMap, mktempDirArgs } from "./lib/common"
+
+const EDITS = "scripts/registration-census-edits.json"
+
+// One program's line: `<path>|CENSUS …`, `<path>|clean`, or `<path>|fail` (unmeasured). Its
+// arguments are the host, the census seed and the program.
+const ONE_SH = "o=$(timeout 120 \"$1\" build \"$3\" --compiler \"$2\" -o /dev/null 2>&1); rc=$?\nc=$(printf '%s' \"$o\" | grep -oE 'CENSUS[^\"]*' | head -1)\nif [ -n \"$c\" ]; then echo \"$3|$c\"; elif [ $rc -eq 0 ]; then echo \"$3|clean\"; else echo \"$3|fail\"; fi\n"
+const DEFAULT_PATHS = [
+  "scripts/silent-sweep/distilled/cells",
+  "scripts/silent-sweep/distilled/named",
+]
+
+function fail(msg: string): never {
+  print("registration-census: " + msg)
+  exit(2)
+}
+
+function vlBin(): string {
+  const v = getEnv("VL_BIN")
+  if v is string { return v }
+  return "./scripts/vl-host/target/release/vl"
+}
+
+// Runs `cmd args`, dying with `what` when it cannot start or exits non-zero.
+function run(what: string, cmd: string, args: string[]): string {
+  const r = runProgram(cmd, args)
+  if r is IoError { return fail(what + ": " + r.msg) }
+  const out = decodeUtf8Lossy(r.stdout)
+  if r.code != 0 {
+    return fail(
+      what
+        + " exited "
+        + toString(r.code)
+        + "\n"
+        + decodeUtf8Lossy(r.stderr),
+    )
+  }
+  return out
+}
+
+function readOrDie(p: string): string {
+  const s = readTextFile(p)
+  if s is IoError { return fail("cannot read " + p) }
+  return s
+}
+
+// Applies every edit to the copy under `root`, in file order; an anchor that is not unique stops.
+function applyEdits(root: string) {
+  const j = parseJson(readOrDie(EDITS))
+  if j is JsonError || !(j is Json[]) {
+    return fail("" + EDITS + " is not a JSON array")
+  }
+  for e in j {
+    if !(e is JsonMap) { return fail("an edit is not an object") }
+    const f = e["file"]
+    if !(f is string) { return fail("an edit names no file") }
+    const p = root + "/" + f
+    let s = readOrDie(p)
+    const pre = e["prepend"]
+    if pre is string {
+      s = pre + s
+    } else {
+      const o = e["old"]
+      const n = e["new"]
+      if !(o is string) || !(n is string) {
+        return fail("an edit of " + f + " has no old/new")
+      }
+      const parts = split(s, o)
+      if parts.length != 2 {
+        return fail(
+          "an anchor in \{f} occurs \{toString(parts.length - 1)} times, want 1",
+        )
+      }
+      s = parts[0] + n + parts[1]
+    }
+    const w = writeTextFile(p, s)
+    if w is IoError { return fail("cannot write " + p) }
+  }
+  return 0
+}
+
+// The one tally key's parts: `late/<kind>/<producer>/<phase>`, `canonSplit/<a>-><b>` or
+// `norep/<node>/<type>`.
+type Tally = { keys: string[], counts: i32[], files: i32[] }
+
+function bump(t: Tally, k: string, v: i32) {
+  let i = 0
+  while i < t.keys.length {
+    if t.keys[i] == k {
+      t.counts[i] = t.counts[i] + v
+      t.files[i] = t.files[i] + 1
+      return 0
+    }
+    i = i + 1
+  }
+  t.keys.push(k)
+  t.counts.push(v)
+  t.files.push(1)
+  return 0
+}
+
+// Whether tally key `k` is a defect the check counts: a row registered once the rows are final.
+// A canon key answered two ways is reported, not counted: the 22 distilled programs it names all
+// print right, a function list following its set's tag decision or a generic union arm its read
+// narrows, neither of which the canon key carries (the refactor note's grading).
+function isDefect(k: string): boolean {
+  if !startsWith(k, "late/") { return false }
+  const parts = split(k, "/")
+  if parts.length != 4 { return false }
+  const ph = parts[3]
+  return ph == "rowsFinal" || ph == "capsCached" || ph == "arenaFinal"
+}
+
+function main() {
+  const argv = programArgs()
+  if argv is Utf8Error { return fail("the arguments are not valid text") }
+  const args = argv
+  let check = false
+  let seed = "build/vl-compiler.wasm"
+  let jobs = 4
+  const paths: string[] = []
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if a == "--check" {
+      check = true
+    } else if a == "--seed" && i + 1 < args.length {
+      seed = args[i + 1]
+      i = i + 1
+    } else if a == "--jobs" && i + 1 < args.length {
+      const n = parseI32(args[i + 1])
+      if n is i32 { jobs = n }
+      i = i + 1
+    } else {
+      paths.push(a)
+    }
+    i = i + 1
+  }
+  if paths.length == 0 {
+    for p in DEFAULT_PATHS { paths.push(p) }
+  }
+  const vl = vlBin()
+  const tmp = trim(run("mktemp", "mktemp", mktempDirArgs("vl-regcensus")))
+  run("copy", "cp", ["-r", "compiler", "deno.json", tmp])
+  applyEdits(tmp)
+  const censusSeed = tmp + "/census.wasm"
+  run(
+    "build the census compiler",
+    vl,
+    ["build", tmp + "/compiler/entry.vl", "--compiler", seed, "-o", censusSeed],
+  )
+  // One line per program: `<path>|CENSUS …`, `<path>|clean` or `<path>|fail` (unmeasured).
+  const oneSh = tmp + "/one.sh"
+  const ow = writeTextFile(oneSh, ONE_SH)
+  if ow is IoError { return fail("cannot write " + oneSh) }
+  const list = tmp + "/files.txt"
+  const found = run(
+    "list programs",
+    "find",
+    paths.concat(["-name", "*.vl", "-type", "f"]),
+  )
+  const fw = writeTextFile(list, found)
+  if fw is IoError { return fail("cannot write " + list) }
+  const out = run(
+    "census run",
+    "xargs",
+    [
+      "-a",
+      list,
+      "-P",
+      toString(jobs),
+      "-n",
+      "1",
+      "sh",
+      oneSh,
+      vl,
+      censusSeed,
+    ],
+  )
+  run("clean up", "rm", ["-rf", tmp])
+  const t: Tally = { keys: [], counts: [], files: [] }
+  let measured = 0
+  let clean = 0
+  let failed = 0
+  const defectFiles: string[] = []
+  for ln in split(out, "\n") {
+    const bar = split(ln, "|")
+    if bar.length != 2 { continue }
+    if bar[1] == "clean" {
+      clean = clean + 1
+    } else if bar[1] == "fail" {
+      failed = failed + 1
+    } else {
+      measured = measured + 1
+      let hit = false
+      for kv in split(bar[1], " ") {
+        const eq = split(kv, "=")
+        if eq.length == 2 {
+          const v = parseI32(eq[1])
+          bump(t, eq[0], if v is i32 { v } else { 1 })
+          if isDefect(eq[0]) { hit = true }
+        }
+      }
+      if hit { defectFiles.push(bar[0]) }
+    }
+  }
+  print(
+    "programs: \{toString(measured)} reported, \{toString(clean)} clean, \{toString(failed)} failed before the report (unmeasured)",
+  )
+  print("key | count | files")
+  let k = 0
+  while k < t.keys.length {
+    print(
+      t.keys[k] + " | " + toString(t.counts[k]) + " | " + toString(t.files[k]),
+    )
+    k = k + 1
+  }
+  print(
+    "registered after the rows are final: \{toString(defectFiles.length)} programs",
+  )
+  for f in defectFiles { print("  " + f) }
+  if check && defectFiles.length > 0 { exit(1) }
+  return 0
+}
+
+main()
