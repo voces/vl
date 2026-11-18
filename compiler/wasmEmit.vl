@@ -6248,6 +6248,17 @@ function unionArmTagsOfTy(
   return true
 }
 
+// Whether variant `vi` has a discriminant field its tag alone does not settle.
+function variantNeedsDiscrim(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldCount.length { return false }
+  let fp = 0
+  while fp < uFieldCount[vi] {
+    if variantDiscrimFieldNeeded(vi, fp) { return true }
+    fp = fp + 1
+  }
+  return false
+}
+
 // The membership half of `x is A` (D1023) — emitted after the arm's tag test and `i32.and`ed
 // onto it, for each field the tag alone cannot settle. `A`'s tag names the shape; where two
 // declared types share a shape, the ruling makes `is` a question about the value. It emits
@@ -6258,15 +6269,8 @@ function unionArmTagsOfTy(
 // `i32.and`ed, because `i32.and` evaluates both operands: the discriminant read casts to this
 // arm and would run on every other arm's values too, trapping once a third arm differs.
 function emitVariantDiscrimTest(recvIx: i32, vi: i32, fnIx: i32) {
-  if vi < 0 || vi >= uFieldCount.length { return 0 }
+  if vi < 0 || vi >= uFieldCount.length || !variantNeedsDiscrim(vi) { return 0 }
   const cnt = uFieldCount[vi]
-  let need = false
-  let fp = 0
-  while fp < cnt {
-    if variantDiscrimFieldNeeded(vi, fp) { need = true }
-    fp = fp + 1
-  }
-  if !need { return 0 }
   if !unionEqOperandOk(recvIx) { return emitFailNoMembershipRecv() }
   // <tag test> if (result i32) { <membership> } else { 0 }
   fbIf(127) // 0x04 if, i32 result
@@ -6562,6 +6566,20 @@ function litIsPinNever(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
     }
   }
   return true
+}
+
+// Whether `emitIs` hands the box test `isIx` to `emitIsTest` over a plain read: its box receiver
+// is not read at its storage, and the tested type does not hold every member.
+export function isBoxGuardPlain(isIx: i32, fnIx: i32): boolean {
+  const nd = nodeAt(isIx)
+  if (
+    !(nd is IsExpr)
+    || !exprUnion(nd.isObj, fnIx)
+    || isTestsStorage(nd.isObj, fnIx)
+  ) {
+    return false
+  }
+  return !isTestedEveryMember(nodeTyAt(nd.isObj, fnIx), isVarTyIxOf(isIx))
 }
 
 // Lower a type guard `recv is X`: a narrowed operand's narrowing is lifted for the test, an
@@ -7443,10 +7461,39 @@ function recNeverFitsArm(arm: i32, rcv: i32): boolean {
   return recArmFitKind(arm, rcv) == 0
 }
 
+// After a box: whether its tag is variant `vi`'s.
+export function variantTagTail(vi: i32) {
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, uTags[vi])
+  fbI32Bin(70)
+  return 0
+}
+
+// The variant row `is` test `isIx` answers by a box's tag alone, or -1: a tested row no other
+// member shares, a box receiver no static fold knows, no cross-tag fit and no discriminant.
+export function isVariantTagPlain(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) || !exprUnion(nd.isObj, fnIx) { return -1 }
+  const t = isVarTyIxOf(isIx)
+  const vi = isTestedRowOf(t, nd.isObj)
+  if vi < 0 || vi >= uTags.length || armRowSharedAtRecv(nd.isObj, vi) {
+    return -1
+  }
+  if exprVariantIndex(nd.isObj, fnIx) >= 0 || variantNeedsDiscrim(vi) {
+    return -1
+  }
+  return if isFitsAcrossTagRows(vi, t, nd.isObj, fnIx) { -1 } else { vi }
+}
+
 // The variant rung of `emitIsTest`: `recv is V` for a union variant, alias arm or record,
 // by a static row fold where the row is the answer, else the box tag and discriminant test.
 // Returns 0 once the test is on the stack, -1 on failure.
 function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
+  const plain = isVariantTagPlain(isIx, fnIx)
+  if plain >= 0 {
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    return variantTagTail(plain)
+  }
   const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
   if vi < 0 {
     if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) {
@@ -7583,9 +7630,7 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
     fbLocalSet(ctSlot)
   }
   if emitSharedFieldRecv(nd.isObj, fnIx, ctSlot) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, uTags[vi])
-  fbI32Bin(70)
+  variantTagTail(vi)
   if emitVariantDiscrimTest(nd.isObj, vi, fnIx) < 0 { return -1 }
   if shared {
     fbIf(127)
@@ -7659,7 +7704,7 @@ function emitIsTest(isIx: i32, fnIx: i32) {
 // literal-union test re-reads its receiver once per member, so one that is not a re-readable
 // place is evaluated first into a local. 0 a union box, 1 an atom id, 2 a nullable string,
 // 3 a string.
-function isRecvStageRep(isIx: i32, fnIx: i32): i32 {
+export function isRecvStageRep(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) || unionEqOperandOk(nd.isObj) { return -1 }
   const ity = isVarTyIxOf(isIx)
