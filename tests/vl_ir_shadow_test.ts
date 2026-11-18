@@ -444,7 +444,8 @@ print(f(-1) ?? 5)
 });
 
 // Only a `null` literal boxes with its value unread. A `null`-typed call has an effect that must
-// run once, so a function delivering one stays uncovered (`rep null`) rather than boxing unread.
+// run once, so a function returning one boxed stays uncovered (`return of a boxed call`, B3)
+// rather than boxing unread.
 Deno.test({
   name: "ir shadow: a null-typed call delivered into a box is never left unread",
   ignore,
@@ -460,7 +461,7 @@ function f(b: boolean): i32 | null {
 print(f(false) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered rep null";
+    const want = "uncovered return of a boxed call";
     if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     if ((rows.get("covered") ?? 0) !== 0) throw new Error(`want 0 covered, got ${JSON.stringify([...rows])}`);
   },

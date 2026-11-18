@@ -30,14 +30,52 @@ functions, and `member record` rose to 3,095. This step takes both.
   `declAnnTy.node`, held in a local by legacy, is skipped together with the global read beneath
   it. This fixed the 14 functions whose lowering had stopped at "non-stack temp: out of order".
 
+## The gate220 fixes, and the pre-path guard (G0, folded in)
+
+The merge queue's gate red B3 on master 665aeae3: four `tests/cases` programs became invalid
+modules and one an emit error. They are outside the distilled corpus these bars ran on. Every
+claim decision now misses on those shapes, and the armed shadow over all of `tests/cases` plus
+`scripts/capability-probes` (10,340 programs) is a standing bar: 35,526 covered, 35,526 matched,
+no `fail` row.
+
+- **A field whose row stores another kind** (`fieldStoresRead`). The rep says `str` where an
+  adopted row stores the `i32` atom, and legacy converts at the delivery (D7445, D11030). The
+  field predicates require the row's storage kind to equal the read's recorded kind.
+- **`emitExpr`'s generic pre-paths** (`exprPrePathWhy`, at the top of `irBExprAt`). These are
+  the table's coercions, a function tag's leaf and dispatch, the atom hooks, the nullable-atom
+  place and niche, and the null-unit and niche reads, each a named miss. It turns the two wider
+  record deliveries from a call into misses, and makes "no pre-path runs under a covered node"
+  structural. Each check is asked only where it can fire (a dispatch at a call; the coercion,
+  tag and atom checks at a node not typed a numeric or boolean primitive), and a dead `never`
+  read at its own node, which keeps it to about 0.2% of L2 fuel.
+- **A `.push` on a record's field named `push`** reads the checker's receiver type and misses
+  "member call on a record field". `pushPlanOf` had emitFailed on it once records were values.
+- Three more, two of which master's own claim also shipped wrong:
+  - a parenthesised call statement is that call statement, as in legacy's `emitStmt`;
+  - an element read narrowed past its element's rep misses (`index element coercion`);
+  - a return of a call's result boxed into a boxed nullable misses (`return of a boxed call`).
+    Legacy tail-calls it when the box writer writes nothing, a choice made on bytes the
+    lowering cannot see ahead.
+
+Their price is 7 self-compile and 9 corpus functions. New first misses, self-compile / corpus:
+
+| miss | self-compile | corpus |
+|---|---:|---:|
+| `pre-path coercion` | 5 | 90 |
+| `pre-path tag dispatch` | 0 | 88 |
+| `pre-path tag leaf` | 0 | 83 |
+| `pre-path atom hook` | 10 | 0 |
+| `return of a boxed call` | 11 | 338 |
+| `member record` (now with the storage check) | 13 | 296 |
+
 ## Coverage
 
-Fixpoint seeds of master d28639f5 and of this step, each built from its own checkout.
+Fixpoint seeds of master 665aeae3 and of this step, each built from its own checkout.
 
 | reading | master | this step | gained |
 |---|---:|---:|---:|
-| self-compile covered = matched = claimed | 8,388 | 11,018 | **+2,630** |
-| corpus covered = matched = claimed (12,297 cells) | 28,695 | 30,409 | **+1,714** |
+| self-compile covered = matched = claimed | 8,386 | 11,011 | **+2,625** |
+| corpus covered = matched = claimed (12,297 cells) | 28,695 | 30,400 | **+1,705** |
 
 First miss, master → this step:
 
@@ -49,12 +87,12 @@ First miss, master → this step:
 | `local rep record` | 163 → 0 | 588 → 0 |
 | `parameter rep list` | 168 → 0 | 505 → 0 |
 
-Net compiler lines are +125 (+157, −32): 21 self-compile and 14 corpus functions per line.
+Net compiler lines are +221 (+253, −32), the pre-path guard and the gate220 misses included: 12 self-compile and 8 corpus functions per line.
 
 Next doors, from the self-compile blocker census on this step (one class alone):
-- `expression if` 1,136;
+- `expression if` 1,127;
 - `narrowed read` 653;
-- `is guard` 564;
+- `is guard` 566;
 - `map read inline` 290.
 
 ## The driver census
@@ -80,10 +118,11 @@ population. That is where a deletion is sought, not its proof. Its five rows are
 
 | bar | reading |
 |---|---|
-| self-build | fixpoint; master's fixpoint seed builds this source to it byte for byte; `--names` build too (11,005,826 B both) |
+| self-build | fixpoint; master's fixpoint seed builds this source to it byte for byte |
 | corpus identity, master seed vs this seed | 9,030 identical, 3,267 fail under both, 0 differ; `--names`: 0 differ |
-| `--claims` and mode 3 | 11,018 self-compile and 30,409 corpus claimed, 0 fell back; mode 3 corpus identity 0 differ |
+| `--claims` and mode 3 | 11,011 self-compile and 30,400 corpus claimed, 0 fell back; mode 3 corpus identity 0 differ |
+| `tests/cases` and probes, armed shadow | 35,526 covered, 35,526 matched |
 | shadow | all matched; the armed self-build is byte-identical |
-| L2 self-compile fuel | 96,507,684,434 to 96,453,569,876 (−0.06%) |
+| L2 self-compile fuel | 96,464,709,530 to 96,852,171,467 (+0.40%; the pre-path guard about 0.2%) |
 | pin helpers in `emit_mono.vl` | 904 |
 | phase-state census | ok |
