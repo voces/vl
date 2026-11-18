@@ -23,3 +23,30 @@ change.
 
 The fuel falls because a claimed function's bytes come from the IR's lowering and legacy's body
 lowering does not run for it.
+
+## The source map: element-read rows
+
+The first gate run (gate193) failed six source-map tests (`vl_addr2line`,
+`vl_trap_source_frames`, `playground_trap_frames`): a trap in a claimed list read named its
+statement's column, not the read's. Legacy's `emitIndexBanked` banks an element-read row (kind
+6) around every `Index` read, but only where names and the source map are emitted
+(`idxSpanOn`), so the plain identity diff and the shadow never saw it.
+
+- **The lowering banks the row.** `lowerList` banks `RListGet`'s range as kind 6
+  (`irLIndexRow`) under the same gate; `irLowerClaim` banks each row at its own kind.
+- **The shadow compares it.** Under the armed shadow (`idxRowShadow`, set by `irShadowArm`)
+  legacy and the IR note element-read rows in a shadow-only list (`shIdx*`, rebased with the
+  statement rows) where the `vl-src` section banks none, and the dual emit compares kinds 5 and
+  6. The armed output stays byte-identical to the unarmed. A throwaway whose lowering banks no
+  read row reports `mismatch spans: count` under a plain armed `vl check --codegen`.
+- **The identity diff reads debug info.** Built with `--names` on both seeds, the whole file,
+  name and `vl-src` sections included: 9,029 identical, 3,268 fail under both, 0 differ. The
+  same throwaway differs from master there.
+
+| reading | after the fix |
+|---|---|
+| the six source-map tests, the IR shadow and IR list tests | 46 of 46 |
+| corpus shadow, statement and element-read rows compared | 28,098 covered = matched |
+| self-compile armed | 6,710 covered = matched, byte-identical |
+| `--claims` | self-compile 6,710, corpus 28,098, 0 fell back |
+| L2 self-compile fuel, master to this change | 96,917,999,226 to 96,524,828,003 (−0.41%) |
