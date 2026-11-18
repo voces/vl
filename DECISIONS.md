@@ -10972,12 +10972,11 @@ const foo = []
 print(foo.length)    // 0
 ```
 
-**Open: the type shown for it** (hover, diagnostics). The owner is undecided between `never[]`,
-`unknown[]` and `T[]`. Recommendation: `never[]`. It says what is known, that the list holds no
-value, and `never` is assignable to every element type, so the list fits any `K[]` destination it
-could legally reach. That matches how the checker already reads an open parameter as `never` in a
-call's deferred return. `unknown[]` would claim elements of some type could be read, and would not
-be assignable to `i32[]`. `T[]` names a type parameter the program never declared.
+**The type shown for it is `never[]`** (owner ruling 2026-11-18; hover, diagnostics). It says what
+is known, that the list holds no value, and `never` is assignable to every element type, so the list
+fits any `K[]` destination it could legally reach. That matches how the checker already reads an open
+parameter as `never` in a call's deferred return. `unknown[]` would claim elements of some type could
+be read; `T[]` names a type parameter the program never declared.
 
 **(2) A push through an `is K[]` arm is checked by type, not storage.** The push is allowed exactly
 when the value is valid for the list's real element type. `i32[] | (1|2)[]` pushing `1` is
@@ -12856,3 +12855,35 @@ read through. A list of scalar lists into a `readonly` union list has no view bu
 **Flagged for the owner.** This applies an existing ruling rather than making a new one. If the
 owner wants the copy-only reading back, the two checker gates in `objShapeListElemAdapts` and
 `covarWriteThrough` restore it, and D3040 and D3056 reopen.
+
+## `is K[]` tests a list's contents, and the narrowing lasts until a write it cannot rule out (2026-11-18) — D16970, D4771
+
+**Ruled by the owner 2026-11-18.** `is K[]` on a list answers by its elements, whatever list type
+holds them: a `u8[]`, `i64[]`, `f64[]` or record list whose every element is a `K` tests true,
+as `i32[]` and `string[]` already did. How a list is stored never decides the answer.
+
+```vl
+type K = 1 | 2
+const a: u8[] = [1, 2]
+const q: u8[] | K[] = a
+print(q is K[])      // true
+```
+
+**The narrowing.** Inside the arm the value is a `K[]` (reads convert to `K`, a write of a `K`
+converts back) until a write that could change the list. A direct write ends it, as the checker
+already does ("'q' is no longer narrowed … re-test 'q' after the call"). Where the checker cannot
+tell whether a write reaches the list (an alias written through a function, a callee's effects),
+the narrowing ends there too: unnarrow when unsure. Tracking indirect writes more precisely is
+backlogged (ROADMAP), not owed now.
+
+**Why.** It is sound: a `K[]` view holds only `K`s while no write intervenes, and the arm stops
+being a `K[]` at the first write that might add a non-`K`. It is as open as soundness allows, and
+it removes the representation dependence D16970 measured (true for `i32[]` and `string[]`, false
+for `u8[]`, `i64[]`, `f64[]` and record lists).
+
+## The function-value storage series resumes; removing code is the goal, not a per-PR bar (2026-11-18) — STORE B3, families A and B
+
+**Ruled by the owner 2026-11-18.** The STORE B-series and the function-value families A (fn-set tag
+carriers) and B (a generic as a value) resume after their pause. A stage may add lines when it moves
+late rows or unlocks programs, provided it advances toward B3.6 (deleting the late decider). Each
+stage still reports its net lines and the late rows it moves.
