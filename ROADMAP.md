@@ -103,6 +103,11 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   interfaces (engineering-review-2026-11.md §6). DECISIONS.md §"Exports are frozen at the module
   boundary".
 
+- **A union-of-lists generic call resolved at compile time** (owner ruling D2772 (a), 2026-11-18).
+  Where a union argument's member is statically known at the call, the run-time tag dispatch the
+  ruling builds resolves to the one instance, as an optimisation. DECISIONS.md §"A union of lists
+  handed to a generic is split by type at run time".
+
 - **Dead-code elimination in a plain build** (2026-11-16, not active work). A plain `vl build`
   links every function of an imported module, so unused std functions cost bytes and pull in host
   imports. A `Buf` import alone declares the four print imports, and the seed is a plain build. A
