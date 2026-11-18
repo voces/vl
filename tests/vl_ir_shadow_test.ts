@@ -177,7 +177,7 @@ Deno.test({
     // A conversion by `as` is outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv(x: i64): i32 { return x as i32 }
+function cv(x: i32): f64 { return x as f64 }
 print(greet("a", "!"))
 print(ap((x: i32) => x + 1))
 print(cv(3))
