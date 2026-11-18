@@ -12713,6 +12713,9 @@ for an order dependence that loses no `runs`.
   same day is reversed: shipping is the goal. The claim costs +0.67% L2 (the IR builds every function
   to decide its claim), accepted with a rebaseline (ledger #8947). A blocking `ir claims` gate row
   asserts zero fallbacks. Legacy deletions follow as the claimed share grows (design §10).
+  `list` joined `CLAIMED` once its mode-3 throwaway read 0 fallbacks and 0 differ (#8982,
+  2026-11-18): the self-compile ships 6,707 functions from the IR (2,218 before), the distilled
+  corpus 28,098 (10,869 before), and L2 fell 0.42% because a claimed function skips legacy.
 
 - **A1 keys a fresh literal at its contextual type;** the edge coercion applies only to a non-fresh value, and
   D965's no-implicit-container-copy stands. A lambda passed to a generic builds its fresh result literals at
