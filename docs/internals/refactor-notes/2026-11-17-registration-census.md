@@ -208,3 +208,24 @@ back to master's size.
 wider rows they share, and broke 8 cases, one by recursion. It gives a row only to an
 annotation's closed record that has none, together with the records nested in it: the rows
 D2681's arm minted.
+
+## The assertion (PR 2)
+
+**What fails.** Once `rowsFinal` is reached, `unTyKeyPushRow` fails the emit with a message that
+names the union and its producer: an inline, declared or value union. The message asks for the
+row to be registered in `registerReachRows`. A struct or variant row registered that late is not
+refused; the census counts those.
+
+**Validated against a failing control.** A scratch build armed the assertion from
+`monomorphizing` instead. On D16953's witness it fired with "union `string|{[i32]:i32}` was
+registered by an inline union after the rows were final".
+
+**The growth rebuild (#8979) stays.** Replacing it was tried and refused by measurement. Without
+it, and with the tree dropped explicitly before the step's held-rep reads and again at the step's
+end, q1/l4 and two pinned-record cases fail again. The step interleaves registrations with rep
+reads: `ownRecordRows` reads the rep of a union the same step just registered. So the rebuild is
+needed during the step, and after the step it cannot fire.
+
+**The gate.** The assertion makes every compile in the gate the check, so the census does not
+join `gate.sh`: it builds a scratch compiler, about 4 minutes, before it compiles anything. It runs
+on the `sweep` label as its own job, which `sweep-gate` requires.

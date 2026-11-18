@@ -439,10 +439,45 @@ jobs:
           [ "$d" = 0 ] || exit "$d"
           exit "$o"
 
+  # The registration census (scripts/registration-census.vl) on the head seed over the distilled
+  # corpus: red when a program registers a row once the rows are final. Every compile already
+  # refuses a late union row; this also counts struct and variant rows, and names the producer.
+  census:
+    needs: [plan, record]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Seed cache location
+        run: echo "VL_SEED_CACHE_DIR=$RUNNER_TEMP/vl-seed-cache" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.head }}
+
+      - uses: actions/download-artifact@v5
+        with:
+          name: sweep-side-head
+
+      - name: Census
+        run: |
+          mkdir -p sides/head scripts/vl-host/target/release build
+          tar -I zstd -xf side.tar.zst -C sides/head --strip-components=1
+          cp sides/head/vl scripts/vl-host/target/release/vl
+          cp sides/head/vl-compiler.wasm build/
+          mkdir -p -m 700 "$VL_SEED_CACHE_DIR" && cp sides/head/seed-*.cwasm "$VL_SEED_CACHE_DIR"/ 2>/dev/null || true
+          vl=scripts/vl-host/target/release/vl
+          set +e
+          VL_BIN=$vl VL_STD=$PWD/std $vl run scripts/registration-census.vl --compiler build/vl-compiler.wasm -- --check --jobs 4 > census.txt
+          rc=$?
+          set -e
+          cat census.txt
+          { echo "## Registration census (exit $rc)"; echo; echo '```'; tail -c 200000 census.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
   # The required status. A pull_request run's checks attach to the PR head SHA. `always()`, not
   # `!cancelled()`: a skipped job counts as passing, so a cancelled labelled sweep must fail.
   sweep-gate:
-    needs: [diff]
+    needs: [diff, census]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -453,9 +488,10 @@ jobs:
             echo "sweep-gate: no \`sweep\` label on PR #$PR, nothing to wait for"
             exit 0
           fi
-          echo "sweep-gate: \`sweep\` label on PR #$PR, diff $DIFF"
-          [ "$DIFF" = success ]
+          echo "sweep-gate: \`sweep\` label on PR #$PR, diff $DIFF, census $CENSUS"
+          [ "$DIFF" = success ] && [ "$CENSUS" = success ]
         env:
           LABELED: ${{ contains(github.event.pull_request.labels.*.name, 'sweep') }}
           DIFF: ${{ needs.diff.result }}
+          CENSUS: ${{ needs.census.result }}
           PR: ${{ github.event.pull_request.number }}
