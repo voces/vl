@@ -452,7 +452,12 @@ import {
   isvalType,
 } from "./check_state"
 import { curFnOwner, joinClashMsg, joinClashMsgSet } from "./check_subst"
-import { tyPathCycles, tyPathWith, tyVarOwnerOf } from "./check_types"
+import {
+  tyIsPrimIx,
+  tyPathCycles,
+  tyPathWith,
+  tyVarOwnerOf,
+} from "./check_types"
 import { demangleName } from "./check_suggest"
 import { placeElemTy, tpBoundOfName } from "./check_tp_bound"
 import {
@@ -6235,20 +6240,135 @@ function recHeldFreshCopy(p: i32, o: i32, srcTy: i32, dstTy: i32): boolean {
   return true
 }
 
+// Whether call `c`'s result is a list nothing else holds: its callee is declared and every value
+// it returns is a list literal, a local only the return reads, or such a call.
+export function callBuildsFreshList(c: i32): boolean {
+  return callBuildsFreshListVia(c, [])
+}
+
+// `callBuildsFreshList`, `seen` holding the functions already on the path: a cycle builds nothing.
+function callBuildsFreshListVia(c: i32, seen: i32[]): boolean {
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = nodeAt(parenPeelIx(c))
+  if !(n is Call) { return false }
+  const fd = calleeNamesDecl(n.callFn)
+  const fn = if fd >= 0 { nodeAt(fd) } else { null }
+  if !(fn is FuncDecl) || i32ListHas(seen, fd) { return false }
+  seen.push(fd)
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  if rets.length == 0 { return false }
+  for r in rets {
+    const rv = cwPeel(r)
+    if rv < 0 || rv >= P.nodes.length { return false }
+    if (!litBuildsFresh(rv, seen) && !fnLocalFreshList(rv, fd, seen)) {
+      return false
+    }
+  }
+  seen.pop()
+  return true
+}
+
+// Whether `x` builds every value it holds: a literal whose each element or field is a primitive,
+// `null`, or such a value (a spread too), or a fresh call. A held record inside it is shared.
+function litBuildsFresh(x: i32, seen: i32[]): boolean {
+  const n = nodeAt(parenPeelIx(x))
+  if n is ArrayLit {
+    for e in n.arrElems {
+      const sp = nodeAt(e)
+      const part = if sp is Spread { sp.spdArg } else { e }
+      if !partBuildsFresh(part, seen) { return false }
+    }
+    return true
+  }
+  if n is ObjLit {
+    for fx in n.objFields {
+      const fi = nodeAt(fx)
+      if fi is FieldInit && !partBuildsFresh(fi.fiValue, seen) { return false }
+    }
+    return true
+  }
+  return callBuildsFreshListVia(x, seen)
+}
+
+// Whether part `e` of a literal is built by it: a primitive value, `null`, or `litBuildsFresh`.
+function partBuildsFresh(e: i32, seen: i32[]): boolean {
+  const p = parenPeelIx(e)
+  if p < 0 || p >= P.nodes.length { return false }
+  if nodeAt(p) is NullLit || tyIsPrimIx(nonNullTy(nodeTyIxOf(p))) {
+    return true
+  }
+  return litBuildsFresh(p, seen)
+}
+
+// Whether `r` reads a `const` of function `fd` bound to a literal `litBuildsFresh` admits and read
+// nowhere but at `r`: each call binds a new one.
+function fnLocalFreshList(r: i32, fd: i32, seen: i32[]): boolean {
+  if (
+    !(nodeAt(r) is Ident)
+    || !covarRootFreshLocal(r)
+    || !nestedRootReadOnlyHere(r)
+  ) {
+    return false
+  }
+  const binds: i32[] = []
+  cwSetOccs([cwKeyOfRoot(r)], CW_OCC_BIND, binds)
+  cwIxBuild()
+  if binds.length != 1 || recEnclosingFn(binds[0]) != fd { return false }
+  const d = identDeclOf(parenPeelIx(r))
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  return dn is LetDecl && litBuildsFresh(cwPeel(dn.letInit), seen)
+}
+
 // Copies the list call `c` a list literal spreads, element by element, into a list of the record
 // `rep` the list's other parts give it, where its records store a field differently (D16444).
 // False, recording nothing, where the copy does not serve.
 export function recSpreadCallCopy(c: i32, rep: i32): boolean {
-  if c < 0 || c >= P.nodes.length || !(nodeAt(c) is Call) { return false }
-  const own = nonNulTyOf(nodeTyIxOf(c))
-  const oa = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
-  if !(oa is TyArray) || !recListElemRecCopies(tyElemOf(oa), rep) {
-    return false
-  }
+  if !recSpreadCallCopies(c, rep) { return false }
   while listCopyTyIx.length <= c { listCopyTyIx.push(-1) }
   listCopyTyIx[c] = mkArrayTy(rep)
   listRecCopyNote()
   return true
+}
+
+// Whether function `fd` returns a list literal that spreads a call, whose list is copied where
+// the literal is delivered, not where the function's call lands.
+function fnReturnsCallSpread(fd: i32): boolean {
+  const fn = nodeAt(fd)
+  if !(fn is FuncDecl) { return false }
+  const rets: i32[] = []
+  collectRetValues(fn.fnBody, rets)
+  for r in rets {
+    const n = nodeAt(cwPeel(r))
+    if n is ArrayLit {
+      for e in n.arrElems {
+        const sp = nodeAt(e)
+        if sp is Spread && nodeAt(parenPeelIx(sp.spdArg)) is Call {
+          return true
+        }
+      }
+    }
+  }
+  return false
+}
+
+// The refusal's reason where `x`, or the list it spreads, is a call of a declared function that
+// hands back a list it holds; "" for any other value.
+export function heldCallWhy(x: i32): string {
+  const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  const c = parenPeelIx(if xn is Spread { xn.spdArg } else { x })
+  const n = if c >= 0 && c < P.nodes.length { nodeAt(c) } else { null }
+  const fd = if n is Call { calleeNamesDecl(n.callFn) } else { -1 }
+  if fd < 0 || !(nodeAt(fd) is FuncDecl) || callBuildsFreshList(c) { return "" }
+  return " The callee hands back a list it holds, so a copy would not see later writes to it (D16954)."
+}
+
+// Whether `recSpreadCallCopy` serves call `c` at `rep`, recording nothing.
+export function recSpreadCallCopies(c: i32, rep: i32): boolean {
+  if c < 0 || c >= P.nodes.length || !callBuildsFreshList(c) { return false }
+  const own = nonNulTyOf(nodeTyIxOf(c))
+  const oa = if own >= 0 && own < T.tys.length { tyAt(own) } else { null }
+  return oa is TyArray && recListElemRecCopies(tyElemOf(oa), rep)
 }
 
 // How many bindings `recAdoptNote` is delivering through: a call a binding holds is not the
@@ -6260,10 +6380,17 @@ let recAdHeldDepth = 0
 // False, recording nothing, where the copy does not serve.
 function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   if recAdHeldDepth > 0 { return false }
-  // A function called once is built where that call lands (D3444).
+  // A function called once is built where that call lands (D3444), unless it returns a literal
+  // spreading a call, which is copied where it is delivered.
   cwIxBuild()
   const sites: i32[] = []
-  if rcwCallSites(fd, sites) < 0 && sites.length <= 1 { return false }
+  if (
+    rcwCallSites(fd, sites) < 0
+    && sites.length <= 1
+    && !fnReturnsCallSpread(fd)
+  ) {
+    return false
+  }
   const own = nonNulTyOf(srcTy)
   const dst = nonNulTyOf(dstTy)
   if own < 0 || dst < 0 { return false }
@@ -6272,6 +6399,7 @@ function recFreshCallCopy(fd: i32, p: i32, srcTy: i32, dstTy: i32): boolean {
   // A list of records is copied element by element under the same rule.
   if oa is TyArray && da is TyArray {
     if !recListElemRecCopies(tyElemOf(oa), tyElemOf(da)) { return false }
+    if !callBuildsFreshList(p) { return false }
     if recNullCopyOnly(own, dst) && !recSitesLandOff(sites, own, dst) {
       return false
     }
@@ -6604,16 +6732,20 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if recFreshCallCopy(fd, p, srcTy, dstTy) { return 0 }
       const dl = recAdLandingList(nonNulTyOf(dstTy))
       const os = recReturnedOrigins(fd, p, sl, dl)
-      // One body builds one list, so calls landing it on two storages refuse (D8301).
-      if os.length == 0 && recSitesLandApart(fd, sl, dl) {
-        recRefuseAtOwnRow(p, sl, dl)
-        return 0
-      }
-      let bare = os.length > 0
+      let bare = os.length > 0 && !fnReturnsCallSpread(fd)
       let reads = true
       for b in os {
         if !(nodeAt(b) is ArrayLit) || !litAtDstStorage(b, dl) { bare = false }
         if !(nodeAt(b) is Ident) { reads = false }
+      }
+      // One body builds one list, so calls landing it on two storages refuse (D8301), and so do
+      // two calls of a held list, which the other call reads at its own storage.
+      const cs: i32[] = []
+      const twice = rcwCallSites(fd, cs) >= 0 || cs.length > 1
+      const held = reads && twice && !callBuildsFreshList(p)
+      if (os.length == 0 && recSitesLandApart(fd, sl, dl)) || held {
+        recRefuseAtOwnRow(p, sl, dl)
+        return 0
       }
       if bare {
         for b in os { recordRepTyAdopt(b, dl) }
@@ -7671,6 +7803,8 @@ function objShapeListLitAdapts(
       if (objShapeAdapterless(hl, nodeTyIxOf(hl), dst, depth - 1, direct)) {
         return true
       }
+    } else if sp is Spread && recSpreadCallCopy(parenPeelIx(sp.spdArg), dElem) {
+      // A call's list of records nothing else holds is copied into the element (D16615).
     } else if sp is Spread {
       // An existing list's elements are existing records, handed over one at a time (D13960).
       const se = tyArrayElemIx(nodeTyIxOf(sp.spdArg))
@@ -7702,7 +7836,9 @@ function nestedCopyFresh(cx: i32, s: TyArray, d: TyArray): boolean {
   const lit = nodeAt(cwPeel(dn.letInit))
   if !(lit is ArrayLit) { return false }
   for e in lit.arrElems {
-    if !nestedPartFresh(cwPeel(e)) { return false }
+    const pe = cwPeel(e)
+    if pe < 0 || pe >= P.nodes.length { return false }
+    if !(nodeAt(pe) is ArrayLit) && !callBuildsFreshList(pe) { return false }
   }
   return true
 }
@@ -7720,24 +7856,6 @@ function nestedRootReadOnlyHere(cx: i32): boolean {
     for o in occ {
       if o != at { return false }
     }
-  }
-  return true
-}
-
-// Whether list part `e` is a list nothing else holds: a list literal, or a call of a declared
-// function every value of which is a list literal.
-function nestedPartFresh(e: i32): boolean {
-  const n = nodeAt(e)
-  if n is ArrayLit { return true }
-  if !(n is Call) { return false }
-  const fd = calleeNamesDecl(n.callFn)
-  const fn = if fd >= 0 { nodeAt(fd) } else { null }
-  if !(fn is FuncDecl) { return false }
-  const rets: i32[] = []
-  collectRetValues(fn.fnBody, rets)
-  if rets.length == 0 { return false }
-  for r in rets {
-    if !(nodeAt(cwPeel(r)) is ArrayLit) { return false }
   }
   return true
 }
@@ -8112,6 +8230,7 @@ function objShapeReadonlyFixErr(
     pairNote
       + ": a container never widens implicitly, and only a readonly list is covariant. "
       + containerWidenWhy(sT, dT)
+      + heldCallWhy(srcExpr)
       + fix,
     srcExpr,
   )
