@@ -1,6 +1,7 @@
 // `VL_PROFILE_GUEST_FUEL=1` under `$VL_FUEL=1` weighs each guest-profile sample by the fuel burned
-// since the one before, so the weights sum to the run's `[fuel] guest` total and a phase's share
-// is its fuel (scripts/perf/profile-phases.vl `--weighted`). Without it the weights are time.
+// since the one before, and the tail after the last as one more, so the weights sum to the run's
+// `[fuel] guest` total exactly and a phase's share is its fuel
+// (scripts/perf/profile-phases.vl `--weighted`). Without it the weights are time.
 import { filePath } from "./support/filePath.ts";
 const ROOT = filePath(new URL("..", import.meta.url)).replace(/[\\/]$/, "");
 const VL = `${ROOT}/scripts/vl-host/target/release/vl${
@@ -60,9 +61,9 @@ Deno.test({
       if (f.n < 20) {
         throw new Error(`want at least 20 samples to weigh, got ${f.n}`);
       }
-      if (Math.abs(f.weight - f.fuel) > 0.01 * f.fuel) {
+      if (f.weight !== f.fuel) {
         throw new Error(
-          `want weights summing to the fuel within 1%: fuel ${f.fuel}, weights ${f.weight}`,
+          `want weights summing to the fuel exactly: fuel ${f.fuel}, weights ${f.weight}`,
         );
       }
       const t = await profiled(dir, false);
