@@ -213,7 +213,8 @@ print(sel(true))
 // `null !=`, and printed (N2b-2c-2b); list literals of i32s, of f64s with an i32 element widened,
 // of i64s, f32s, strings and booleans, and an empty one (A1); a plain walk over an i32 list and a
 // string list, and one whose body holds a loop with its own `break` (F1); a string from one code
-// point and from a local code-point list (S1).
+// point and from a local code-point list (S1); a box's `is` test of a record variant, plain and
+// told apart by a literal field (B1).
 // Each witness is one covered function that must match legacy's bytes.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
@@ -285,6 +286,8 @@ print(guard(2))
   `function cs(s: string): i32 {\n  let n = 0\n  for c in s {\n    print(c)\n    n = n + c\n  }\n  return n\n}\nprint(cs("h\u00e9llo"))\n`,
   `function one(c: i32): string { return fromCodePoint(c) }\nprint(one(233))\n`,
   `function many(n: i32): string {\n  const xs: i32[] = [104, 233, n]\n  return fromCodePoints(xs)\n}\nprint(many(108))\n`,
+  `type P = { x: i32 }\ntype Q = { y: string }\nfunction isP(u: P | Q): boolean { return u is P }\nprint(isP({ x: 1 }))\nprint(isP({ y: "a" }))\n`,
+  `type Lit = { kind: "lit", v: i32 }\ntype Add = { kind: "add", l: i32, r: i32 }\nfunction isLit(e: Lit | Add): boolean { return e is Lit }\nprint(isLit({ kind: "lit", v: 1 }))\n`,
 ];
 Deno.test({
   name: "ir shadow: each shared decision's witness is covered and matches legacy",
