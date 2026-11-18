@@ -52,6 +52,7 @@ import {
   hasNamedArgs,
   loopVarLoop,
   nodeAt,
+  nodeChildren,
   nodeChildrenPush,
   nodeSpineChildrenPush,
 } from "./ast"
@@ -3912,6 +3913,78 @@ export function cwBindingOnlyRead(bd: i32): boolean {
     }
   }
   return true
+}
+
+// Whether a read of binding `bd`'s elements is delivered whole to a typed destination: an element
+// read `bd[i]` that is an annotated `let`'s initializer or an assignment's value, or a loop over `bd`
+// whose variable is read so. Such a read fixes the element type (DECISIONS.md "No default type").
+export function cwBindingReadTyped(bd: i32): boolean {
+  if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return false }
+  const ow = cwOccWalk(bd)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if cwIxKind[r] == CW_OCC_USE && u >= 0 && u < cwIxParent.length {
+      const p = cwIxParent[u]
+      if cwIxUpKind[u] == CW_UP_ITER {
+        if p >= 0 && p < P.nodes.length && cwLoopVarReadTyped(p) { return true }
+      } else if p >= 0 && p < P.nodes.length {
+        const pn = nodeAt(p)
+        if pn is Index && pn.idxArr == u && cwReadIsTypedDest(p) { return true }
+      }
+    }
+  }
+  return false
+}
+
+// Whether the `for` loop at `lp` reads its element variable into a typed destination.
+function cwLoopVarReadTyped(lp: i32): boolean {
+  const l = nodeAt(lp)
+  if !(l is ForIn) || l.fiVar == "" { return false }
+  return cwNameReadTypedUnder(l.fiBody, l.fiVar) >= 0
+}
+
+// The first annotated `let` the `for` loop at `lp` reads its element variable into whole, or -1.
+export function cwLoopVarTypedLet(lp: i32): i32 {
+  if lp < 0 || lp >= P.nodes.length { return -1 }
+  const l = nodeAt(lp)
+  if !(l is ForIn) || l.fiVar == "" { return -1 }
+  const r = cwNameReadTypedUnder(l.fiBody, l.fiVar)
+  if r < 0 || r >= cwIxParent.length { return -1 }
+  const q = cwIxParent[r]
+  return if q >= 0 && q < P.nodes.length && nodeAt(q) is LetDecl { q } else { -1 }
+}
+
+// The first read of `name` under `ix` delivered whole to a typed destination, or -1.
+function cwNameReadTypedUnder(ix: i32, name: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = nodeAt(ix)
+  if n is Ident && n.identName == name {
+    return if cwReadIsTypedDest(ix) { ix } else { -1 }
+  }
+  for k in nodeChildren(ix) {
+    const r = cwNameReadTypedUnder(k, name)
+    if r >= 0 { return r }
+  }
+  return -1
+}
+
+// Whether expression `x` is the whole initializer of an annotated `let` or the value of an
+// assignment.
+function cwReadIsTypedDest(x: i32): boolean {
+  if x < 0 || x >= cwIxParent.length { return false }
+  const q = cwIxParent[x]
+  if q < 0 || q >= P.nodes.length { return false }
+  const qn = nodeAt(q)
+  if qn is LetDecl { return qn.letType >= 0 && qn.letInit == x }
+  return cwIsAssignedValue(q, x)
+}
+
+// Whether `x` is the value the assignment at `q` stores; any other parent fixes no type.
+function cwIsAssignedValue(q: i32, x: i32): boolean {
+  const qn = nodeAt(q)
+  if qn is BinExpr { return qn.binOp == "=" && qn.binRight == x }
+  return false
 }
 
 // Whether the `Ident` read `u` is one of `cwBindingOnlyRead`'s read-only positions.
