@@ -344,21 +344,23 @@ if [ "$OUT" != /dev/stdout ]; then
     | { printf 'lines\tfunctions\tdecide\tvalue\tast\tdoor\n'; cat; } > "$OUT.doors"
 fi
 
-# Each re-entry's deletion: the lines of every driver hit under the claim that the IR's lowering
-# reaches only through it. `freed` drivers have no other door; `claim_path` ones are still
-# reached by unclaimed functions' bodies, and leave the claim path when the IR owns the operand.
+# Each re-entry's reach under the claim: the drivers the IR's lowering hits through it, those of
+# them the IR reaches through nothing else (no `@ir`, no other re-entry), which leave the claim
+# path when the IR owns the operand, and those of them no unclaimed body or module pass reaches.
 if [ "$OUT" != /dev/stdout ] && [ -n "$REENTRY" ]; then
   awk -F'\t' 'NR > 1 && $3 > 0 {
-      n = split($6, d, / \+ /); re = ""; nre = 0; ir = 0; mod = 0
+      n = split($6, d, / \+ /); ir = 0; k = 0
       for (i = 1; i <= n; i++) {
-        if (d[i] ~ /^@re:/) { re = substr(d[i], 5); nre++ }
-        else if (d[i] == "@ir") ir = 1
-        else if (d[i] ~ /^@/) mod = 1
+        if (d[i] == "@ir") ir = 1
+        else if (d[i] ~ /^@re:/) { k++; re[k] = substr(d[i], 5) }
       }
-      if (nre != 1 || ir) next
-      if (n == 1) { fl[re] += $5; fn[re]++ } else if (!mod) { cl[re] += $5; cn[re]++ }
-      seen[re] = 1
+      for (j = 1; j <= k; j++) {
+        x = re[j]; rl[x] += $5; rn[x]++
+        if (!ir && k == 1) { cl[x] += $5; cn[x]++; if (n == 1) { fl[x] += $5; fn[x]++ } }
+      }
     }
-    END { for (r in seen) print fl[r] + 0 "\t" fn[r] + 0 "\t" cl[r] + 0 "\t" cn[r] + 0 "\t" r }' "$T/table" \
-    | sort -rn | { printf 'freed_lines\tfreed\tclaim_path_lines\tclaim_path\treentry\n'; cat; } > "$OUT.reentry"
+    END {
+      for (x in rl) print cl[x] + 0 "\t" cn[x] + 0 "\t" fl[x] + 0 "\t" fn[x] + 0 "\t" rl[x] "\t" rn[x] "\t" x
+    }' "$T/table" | sort -rn \
+    | { printf 'leaves_claim_lines\tleaves_claim\tfreed_lines\tfreed\treach_lines\treach\treentry\n'; cat; } > "$OUT.reentry"
 fi
