@@ -168,6 +168,10 @@ import {
   fnStmts,
   gInitProgIdx,
   gPromoInStart,
+  monoGen,
+  monoInstFe,
+  monoInstOrig,
+  monoOrigNode,
   setIrShadowOn,
 } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
@@ -812,6 +816,26 @@ function calleeSig(pos: i32): boolean {
   return true
 }
 
+// Whether slot `pos` holds declaration `d`, or the instance the monomorphizer minted from generic
+// `d`: a first instance takes the template's own slot (`monoOrigNode` keeps the original), a later
+// one a slot of its own (`monoInstFe`, from the template's slot `monoInstOrig`).
+function callTargetIs(pos: i32, d: i32): boolean {
+  if pos < 0 || pos >= fnStmts.length { return false }
+  if fnStmts[pos] == d { return true }
+  if pos < monoGen.length && monoGen[pos] == 1 && pos < monoOrigNode.length {
+    return monoOrigNode[pos] == d
+  }
+  let k = 0
+  while k < monoInstFe.length && k < monoInstOrig.length {
+    if monoInstFe[k] == pos {
+      const o = monoInstOrig[k]
+      return o >= 0 && o < monoOrigNode.length && monoOrigNode[o] == d
+    }
+    k = k + 1
+  }
+  return false
+}
+
 // A direct call `ix` of a declared, capture-free function by name; its arguments by position.
 function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if c.callFn < 0 || hasNamedArgs(c.callArgNames) {
@@ -831,15 +855,14 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("call of a non-declaration")
   }
   const pos = fnIndexOfNode(c.callFn)
-  if pos < 0 || pos >= fnStmts.length || fnStmts[pos] != d {
-    return missRhs("call target")
-  }
+  if !callTargetIs(pos, d) { return missRhs("call target") }
+  const inst = fnStmts[pos]
   if !calleeSig(pos) { return missRhs("callee signature") }
   // A callee with a hidden environment parameter takes it before its arguments; the IR's call
   // passes none, so such a call stays legacy's.
-  if envSlotShift(d) > 0 { return missRhs("callee environment") }
+  if envSlotShift(inst) > 0 { return missRhs("callee environment") }
   if lowMemFoldsCallee(pos) { return missRhs("low-memory accessor") }
-  const callee = nodeAt(d)
+  const callee = nodeAt(inst)
   const args: Opnd[] = []
   if callee is FuncDecl {
     if callee.fnParams.length != c.callArgs.length {
@@ -853,7 +876,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
       if i > 0 && valuedIfFrom(b, at) {
         return missRhs("short-circuit argument after another")
       }
-      if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], d)) {
+      if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], inst)) {
         return missRhs("argument coercion")
       }
       args.push(a)
