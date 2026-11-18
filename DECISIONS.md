@@ -10962,6 +10962,23 @@ g([])                // 1, then 1 (D4961)
 Where two uses contradict each other, the program is refused at check with a message that names
 both. That case is harder than inference and is left to the refusal for now.
 
+**A genuinely unconstrained empty container still runs** (owner addendum, 2026-11-18). Where
+nothing reads, writes or narrows an element, no element type is ever observed, so any concrete
+storage is correct. This is the only place a default storage survives: `i32` is acceptable, and a
+dedicated empty or `never` element rep may be better.
+
+```vl
+const foo = []
+print(foo.length)    // 0
+```
+
+**Open: the type shown for it** (hover, diagnostics). The owner is undecided between `never[]`,
+`unknown[]` and `T[]`. Recommendation: `never[]`. It says what is known, that the list holds no
+value, and `never` is assignable to every element type, so the list fits any `K[]` destination it
+could legally reach. That matches how the checker already reads an open parameter as `never` in a
+call's deferred return. `unknown[]` would claim elements of some type could be read, and would not
+be assignable to `i32[]`. `T[]` names a type parameter the program never declared.
+
 **(2) A push through an `is K[]` arm is checked by type, not storage.** The push is allowed exactly
 when the value is valid for the list's real element type. `i32[] | (1|2)[]` pushing `1` is
 accepted. `i32[] | ("A"|"B")[]` pushing `"A"` is refused, although a string-literal union is
