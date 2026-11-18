@@ -136,7 +136,7 @@ logged id fired in, by module:
     deno run -A scripts/fn-coverage.ts --names /tmp/names.wasm --jobs 4 --out /tmp/never.json
 
 Over the default population (every `.vl` under `tests/`, `std/`, `scripts/` and `bench/`, plus
-`compiler/entry.vl`, 22,964 programs, about 15 minutes at four jobs), 2,944 of 18,860 functions
+`compiler/entry.vl`, 22,964 programs), 2,944 of 18,860 functions
 never ran on 2026-11-18. Read the list as coverage, not deadness:
 - the CLI, lint, fmt, LSP and optimiser entries are not driven;
 - an env-gated instrument never fires;
