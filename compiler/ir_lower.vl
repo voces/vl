@@ -34,6 +34,7 @@ import {
   NumLit,
   ObjLit,
   OptMember,
+  P,
   Param,
   Paren,
   Program,
@@ -214,6 +215,7 @@ import {
   printNulStrTail,
   printScalarTail,
   printStrTail,
+  promoSlotIn,
   structFieldPlain,
   structFieldTail,
   uBoxNewIsLast,
@@ -521,7 +523,7 @@ export function irGlobalReadMiss(g: i32, c: GlobalCtx): string {
   return match userGlobalReadClass(g, c) {
     "plain" => if globalMinted(g) { "" } else { "global index" }
     "fold" => ""
-    "promo" => "promoted global read"
+    "promo" => if promoSlotIn(g, c) >= 0 { "" } else { "promoted global read" }
     "guard" => "guarded global read"
   }
 }
@@ -530,7 +532,7 @@ export function irGlobalReadMiss(g: i32, c: GlobalCtx): string {
 export function irGlobalWriteMiss(g: i32, c: GlobalCtx): string {
   return match userGlobalWriteClass(g, c) {
     "plain" => if globalMinted(g) { "" } else { "global index" }
-    "promo" => "promoted global write"
+    "promo" => if promoSlotIn(g, c) >= 0 { "" } else { "promoted global write" }
     "immutable" => "immutable global write"
     "guard" => "guarded global write"
   }
@@ -549,7 +551,12 @@ function globalRead(sym: i32, nonNull: boolean) {
       leaf()
       emitFoldedConstRead(sym)
     }
-    "promo" => irLMiss("promoted global read")
+    "promo" => {
+      const ps = promoSlotIn(sym, lwGlobalCtx)
+      if ps < 0 { return irLMiss("promoted global read") }
+      leaf()
+      fbLocalGet(ps)
+    }
     "guard" => irLMiss("guarded global read")
   }
   return 0
@@ -968,7 +975,12 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
             fbGlobalSet(bit)
           }
         }
-        "promo" => irLMiss("promoted global write")
+        "promo" => {
+          const ps = promoSlotIn(n.gsSym, lwGlobalCtx)
+          if ps < 0 { return irLMiss("promoted global write") }
+          cond(n.gsSrc, pending)
+          fbLocalSet(ps)
+        }
         "immutable" => irLMiss("immutable global write")
         "guard" => irLMiss("guarded global write")
       }
@@ -1288,8 +1300,11 @@ function entry(f: IrFn, ctx: GlobalCtx): u8[] {
   // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
   const valued = !repIsNoValue(f.irRetRep)
-  body(f.irBody, !valued, -1)
-  const fd = nodeAt(f.irAt)
+  // The start function's body opens with legacy's pool fill.
+  if f.irAt < 0 { irStartPrologueHook() }
+  // Legacy tail-calls a void body's last call, but not the start function's.
+  body(f.irBody, !valued && f.irAt >= 0, -1)
+  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
   const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
   if pad == "null" {
     // Legacy sinks this `null` when the return sink fired; the IR does not build that exit.
@@ -1596,6 +1611,9 @@ function loopCloseNone(_n: i32): i32 { return 0 }
 // The list lowering's hooks (`ir_lower_ref.vl`), installed before emit; the defaults leave list
 // reads and bounds checks unlowered.
 export let irLowerListHook: (r: Rhs) => i32 = listUnset
+// The start function's prologue (`emitStrFillCalls`), set by the emitter that owns it.
+export let irStartPrologueHook: () => i32 = noPrologue
+function noPrologue(): i32 { return irLMiss("start prologue unset") }
 // An element store, given its assignment node.
 export let irLowerListSetHook: (n: SListSet, at: i32) => i32 = listSetUnset
 // A list op in statement position, whose value is not wanted.
