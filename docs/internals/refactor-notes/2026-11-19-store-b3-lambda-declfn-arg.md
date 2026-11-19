@@ -26,7 +26,7 @@ With it:
   - `generics/hof-hole-fn-and-closed-lambda-instances`
   - `literal-unions/coalesce-hole-call-retyped-dead`
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,760 programs: 0 RC, wasm or output movers.
 
 ## Left
 The remaining declared-callee argument rows are called at two signatures. Deciding them at check
