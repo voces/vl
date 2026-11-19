@@ -876,7 +876,7 @@ with what legacy decides at the same node.
 
 **Before the first non-shadow caller of `irLowerNodeIn`, the door must miss ("legacy context
 live") unless each of these is at its resting value:**
-- the coercion seats: `coerceHeld`, `atomSeat`;
+- the coercion seats, all six named above: `numSeat`, `coerceHeld`, `boxSeat`, `armSeat`, `armServed`, `atomSeat`;
 - storage-read mode (`storageReadEnter` without its `storageReadLeave`);
 - the narrowing frames legacy pushes around a guarded arm;
 - the loop-hoist frames (`lhOpen`) and the lazy list frame;
