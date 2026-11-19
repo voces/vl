@@ -14,6 +14,7 @@ import {
   RNoValue,
   RNullable,
   RPrim,
+  RRaw,
   RRecord,
   RUnsup,
   RpPrim,
@@ -143,10 +144,16 @@ export type RCellNew = { cnInit: Opnd }
 export type RCellGet = { cgCell: Opnd }
 // `ggNonNull`: the read is followed by `ref.as_non_null` (`globalReadRecovers`).
 export type RGlobalGet = { ggSym: i32, ggNonNull: boolean }
+// A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
+// a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
+// reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing.
+export type RawOp = "struct.get" | "struct.new" | "array.get" | "array.new_default" | "array.len"
+  | "ref.eq" | "ref.cast" | "ref.as_non_null" | "ref.null" | "ref.is_null" | "call" | "tee" | "test"
+export type RRawOp = { rwOp: RawOp, rwHeap: i32, rwArgs: Opnd[], rwImm: i32 }
 export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf
   | RMakeRec | RGetField | RMakeList | RListNew | RListGet | RListLen | RListPush | RListPop | RMapOp | RMapNew | RMapSet
   | RMapGetOr | RPrint | RStrOp | RNumWiden | RNumIntr | RCoalStr | RToBox | RRetag | RNullOf | RNulTest | RAtomEq
-  | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet
+  | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp
 
 // A `match` arm: union arm `swArm` (-1 for the default, which names what it excludes in
 // `swWhy`), and its body.
@@ -182,8 +189,15 @@ export type STrap = { tpWhy: i32 }
 // A value evaluated and discarded, as legacy writes a bare value statement. Migration only: it
 // goes, with every use, once bytes may move.
 export type SDrop = { dpV: Opnd }
+// A helper's raw instruction that yields nothing: `srImm` is a set's field, a data segment, a callee.
+export type RawEff = "struct.set"
+  | "array.set"
+  | "array.copy"
+  | "array.init_data"
+  | "call"
+export type SRawOp = { srOp: RawEff, srHeap: i32, srArgs: Opnd[], srImm: i32 }
 export type IrNode = SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet
-  | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SIf | SSwitch | SBr | SReturn | STrap | SDrop
+  | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SIf | SSwitch | SBr | SReturn | STrap | SDrop | SRawOp
 
 export type VarKind = "param" | "local" | "temp"
 // A variable: its rep (fixed at its definition), type, kind and wasm local index (-1 unset).
@@ -206,6 +220,8 @@ export type IrFn = {
   irName: string,
   // A start body that opens with legacy's pool fill: the single start, never an init function.
   irPoolFill: boolean,
+  // A runtime helper the door builds: the only function a raw rep or op may appear in.
+  irHelper: boolean,
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -243,6 +259,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irAt: at,
     irName: name,
     irPoolFill: false,
+    irHelper: false,
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -359,7 +376,7 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
   return match n {
     SBr | SReturn | STrap => true
     SIf => irBodyLeaves(f, n.siThen) && irBodyLeaves(f, n.siElse)
-    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SSwitch | SDrop => false
+    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SSwitch | SDrop | SRawOp => false
   }
 }
 
@@ -369,7 +386,7 @@ export function repPrim(r: i32): RpPrim | null {
   if n == null { return null }
   return match n {
     RPrim => if n.rpPacked != 0 { null } else { n.rpK }
-    RAtom | RList | RMap | RBox | RClosure | RRecord | RNullable | RUnsup | RNoValue => null
+    RAtom | RList | RMap | RBox | RClosure | RRecord | RNullable | RUnsup | RNoValue | RRaw => null
   }
 }
 
@@ -398,6 +415,7 @@ export function repWhat(r: i32): string {
     RNullable => "nullable"
     RUnsup => "unsup"
     RNoValue => "novalue"
+    RRaw => "raw"
   }
 }
 
@@ -477,6 +495,14 @@ function rhsText(r: Rhs): string {
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RCellNew => "cell " + opndText(r.cnInit)
     RCellGet => "cell_get " + opndText(r.cgCell)
+    RRawOp => r.rwOp
+      + " h"
+      + i32ToStr(r.rwHeap)
+      + " #"
+      + i32ToStr(r.rwImm)
+      + "("
+      + opndsText(r.rwArgs)
+      + ")"
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -572,6 +598,15 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
     SReturn => if n.rtHas { p + "return " + opndText(n.rtV) + "\n" } else { p + "return\n" }
     STrap => p + "trap " + i32ToStr(n.tpWhy) + "\n"
     SDrop => p + "drop " + opndText(n.dpV) + "\n"
+    SRawOp => p
+      + n.srOp
+      + " h"
+      + i32ToStr(n.srHeap)
+      + " #"
+      + i32ToStr(n.srImm)
+      + "("
+      + opndsText(n.srArgs)
+      + ")\n"
   }
 }
 
@@ -589,6 +624,7 @@ export type IrFamily = "scalar"
   | "record"
   | "closure"
   | "start"
+  | "raw"
   | "other"
 
 export function irNodeFamily(n: IrNode): IrFamily {
@@ -599,6 +635,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SGlobalSet => "global"
     SBoundsCheck | SListSet => "list"
     SSetField | SCellSet | SSwitch => "other"
+    SRawOp => "raw"
   }
 }
 
@@ -613,6 +650,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RGetField => "record"
     RMakeClo => "closure"
     RCallRef | RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RFnId | RCellNew | RCellGet => "other"
+    RRawOp => "raw"
   }
 }
 
