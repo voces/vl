@@ -21,7 +21,7 @@ import { irVerify } from "./ir_verify"
 import { emitFail } from "./emit_bytes"
 import { repNodeOfTy, repRawOf } from "./emit_rep"
 import { TY_BOOL, TY_F64, TY_I32 } from "./check_types"
-import { ba8Ty, bl8Ty, sBackTy, sTy } from "./emit_state"
+import { aTy, ba8Ty, bl8Ty, helpUtf8DecFn, sBackTy, sTy } from "./emit_state"
 
 let hf: IrFn = irFnNew(-1, "")
 // The bodies being built, innermost last.
@@ -176,6 +176,7 @@ function returnNanIf(c: Opnd) {
   when(c, close())
 }
 
+// `v` must be a variable or an immediate: a temp would be defined outside the arm.
 function returnIf(c: Opnd, v: Opnd) {
   open()
   ret(v)
@@ -462,4 +463,212 @@ export function irStrFillFnCode(out: u8[], seg: i32): i32 {
   eff("array.init_data", sBackTy(), [strBack(s), i32(0), at, strLen(s)], seg)
   ret(add(at, strLen(s)))
   return finish("__str_fill__", out)
+}
+
+function shru(a: Opnd, k: i32): Opnd { return op(I32(), "shru", a, i32(k)) }
+
+function or(a: Opnd, b: Opnd): Opnd { return op(I32(), "or", a, b) }
+
+function and(a: Opnd, k: i32): Opnd { return op(I32(), "and", a, i32(k)) }
+
+// `cp = U+FFFD` when `cp` is below `lo`, past U+10FFFF, or a UTF-16 surrogate.
+function sanitize(cp: OVar, lo: Opnd) {
+  const out = test("or", test("lt", cp, lo), test("gt", cp, i32(1114111)))
+  const sur = test(
+    "and",
+    test("ge", cp, i32(55296)),
+    test("le", cp, i32(57343)),
+  )
+  const bad = test("or", out, sur)
+  open()
+  set(cp, i32(65533))
+  when(bad, close())
+}
+
+// Returns U+FFFD after one consumed byte when `c` holds: a width of 0 would never advance.
+function decBadIf(c: Opnd) { returnIf(c, i32(16842749)) }
+
+// The UTF-8 codec is a loop with a variable stride, so it is one helper, not inlined. Its
+// encoder has a twin in VL, `emit_base.cpsToUtf8`, which must agree with it byte for byte.
+
+// `__utf8_dec__(back, i, end) -> i32`: decodes the sequence at backing offset `i`, reading
+// nothing at or past `end`, as `(width << 24) | codepoint` with `width` at least 1. A malformed
+// sequence decodes to U+FFFD: a stray continuation, a bad lead, a truncation one byte, an
+// overlong, surrogate or out-of-range value its whole width.
+export function irUtf8DecFnCode(out: u8[]): i32 {
+  begin(I32())
+  const bk = param(repRawOf(sBackTy(), false))
+  const i = param(I32())
+  const end = param(I32())
+  const b = local(I32(), 3)
+  const n = local(I32(), 4)
+  const cp = local(I32(), 5)
+  const k = local(I32(), 6)
+  const c = local(I32(), 7)
+  const lo = local(I32(), 8)
+  set(b, byteAt(bk, i))
+  const ascii = test("lt", b, i32(128))
+  open()
+  ret(or(i32(16777216), b))
+  when(ascii, close())
+  decBadIf(test("lt", b, i32(194)))
+  set(n, i32(2))
+  const three = test("ge", b, i32(224))
+  open()
+  set(n, i32(3))
+  const four = test("ge", b, i32(240))
+  open()
+  set(n, i32(4))
+  decBadIf(test("ge", b, i32(245)))
+  when(four, close())
+  when(three, close())
+  decBadIf(test("gt", add(i, n), end))
+  set(cp, op(I32(), "and", b, op(I32(), "shru", i32(127), n)))
+  set(k, i32(1))
+  open()
+  exitIf(test("ge", k, n), 0)
+  set(c, byteAt(bk, add(i, k)))
+  decBadIf(test("ne", and(c, 192), i32(128)))
+  set(cp, or(op(I32(), "shl", cp, i32(6)), and(c, 63)))
+  set(k, add(k, i32(1)))
+  loopIn(0, close())
+  // The smallest code point each width may encode: below it is an overlong form.
+  set(lo, i32(128))
+  const w3 = test("eq", n, i32(3))
+  open()
+  set(lo, i32(2048))
+  when(w3, close())
+  const w4 = test("eq", n, i32(4))
+  open()
+  set(lo, i32(65536))
+  when(w4, close())
+  sanitize(cp, lo)
+  ret(or(op(I32(), "shl", n, i32(24)), cp))
+  return finish("__utf8_dec__", out)
+}
+
+// Code point `i` of `__utf8_enc__`'s source, sanitized, into `cp`.
+function encRead(bk: Opnd, start: Opnd, i: OVar, cp: OVar) {
+  set(cp, raw(I32(), "array.get", aTy(), [bk, add(start, i)], 0))
+  sanitize(cp, i32(0))
+}
+
+// The bytes of a `width`-byte sequence for `cp` at `o[w ..]`: a lead byte, then six bits a
+// continuation; then `w` moves past them.
+function encBytes(o: Opnd, w: OVar, cp: OVar, width: i32) {
+  let b = 0
+  while b < width {
+    const at = plus(w, b)
+    const sh = 6 * (width - 1 - b)
+    let v: Opnd = cp
+    if b == 0 && width > 1 {
+      v = or(
+        i32(if width == 2 { 192 } else if width == 3 { 224 } else { 240 }),
+        shru(cp, sh),
+      )
+    } else if b > 0 {
+      v = or(i32(128), and(if sh == 0 { cp } else { shru(cp, sh) }, 63))
+    }
+    eff("array.set", sBackTy(), [o, at, v], 0)
+    b = b + 1
+  }
+  set(w, add(w, i32(width)))
+}
+
+// `if cp < 0x80 { 1 byte } else { if cp < 0x800 { 2 } else { ... } }`, from `width` on.
+function encArms(o: Opnd, w: OVar, cp: OVar, width: i32) {
+  if width == 4 {
+    encBytes(o, w, cp, 4)
+    return 0
+  }
+  const fits = test(
+    "lt",
+    cp,
+    i32(
+      if width == 1 { 128 } else if width == 2 { 2048 } else { 65536 },
+    ),
+  )
+  open()
+  encBytes(o, w, cp, width)
+  const one = close()
+  open()
+  encArms(o, w, cp, width + 1)
+  put({ siCond: fits, siThen: one, siElse: close(), siOut: -1, siElseKw: true })
+  return 0
+}
+
+// `__utf8_enc__(back, start, len) -> (ref str)`: the UTF-8 encoding of the `len` code points at
+// `back[start ..]`, in a fresh exact-fit string. A wasm array is fixed-length, so one pass sums
+// the widths and a second writes; both read through `encRead`, so they agree on each width.
+export function irUtf8EncFnCode(out: u8[]): i32 {
+  begin(str())
+  const bk = param(repRawOf(aTy(), false))
+  const start = param(I32())
+  const len = param(I32())
+  const n = local(I32(), 3)
+  const i = local(I32(), 4)
+  const cp = local(I32(), 5)
+  const o = local(repRawOf(sBackTy(), false), 6)
+  const w = local(I32(), 7)
+  set(n, i32(0))
+  set(i, i32(0))
+  open()
+  exitIf(test("ge", i, len), 0)
+  encRead(bk, start, i, cp)
+  set(n, add(n, i32(1)))
+  // One more byte past each of 0x80, 0x800 and 0x10000.
+  for bound in [128, 2048, 65536] {
+    const wider = test("ge", cp, i32(bound))
+    open()
+    set(n, add(n, i32(1)))
+    when(wider, close())
+  }
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  set(
+    o,
+    raw(repRawOf(sBackTy(), false), "array.new_default", sBackTy(), [n], 0),
+  )
+  set(w, i32(0))
+  set(i, i32(0))
+  open()
+  exitIf(test("ge", i, len), 0)
+  encRead(bk, start, i, cp)
+  encArms(o, w, cp, 1)
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  ret(strNew(o, n))
+  return finish("__utf8_enc__", out)
+}
+
+// `__utf8_cplen__(s) -> i32`: the code point count of a string, driven by `__utf8_dec__`'s width,
+// so malformed input counts as the decoder walks it.
+export function irUtf8CpLenFnCode(out: u8[]): i32 {
+  begin(I32())
+  const s = param(str())
+  const bk = local(back(), 1)
+  const i = local(I32(), 2)
+  const end = local(I32(), 3)
+  const n = local(I32(), 4)
+  set(bk, strBack(s))
+  set(i, strStart(s))
+  set(end, add(i, strLen(s)))
+  set(n, i32(0))
+  open()
+  exitIf(test("ge", i, end), 0)
+  set(n, add(n, i32(1)))
+  const nn = raw(
+    repRawOf(sBackTy(), false),
+    "ref.as_non_null",
+    sBackTy(),
+    [bk],
+    0,
+  )
+  set(
+    i,
+    add(i, shru(raw(I32(), "call", -1, [nn, i, end], helpUtf8DecFn()), 24)),
+  )
+  loopIn(0, close())
+  ret(n)
+  return finish("__utf8_cplen__", out)
 }
