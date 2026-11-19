@@ -29,7 +29,10 @@ print(ap(fw(lam), 3))
 ## Measured (master de44e8985 fixpoint vs this branch's fixpoint)
 - Late tag rows: 1 gone, 0 new.
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,757 programs: 0 RC or output movers; 1 wasm mover,
+  `closures/written-let-in-list-arg-called-beside-generic-first.vl`. It drops from 754 to 693 bytes and
+  loses its closure table, with output the same and matching `@log`. The lambda set handed in `run([k])` now
+  stands as an id.
 
 ## Still open on site 9
 `closures/hole-lambda-inferred-return-in-generic-at-two-pins` N {<lambda>}:
