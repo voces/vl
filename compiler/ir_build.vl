@@ -176,6 +176,7 @@ import {
 } from "./emit_rep"
 import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
+import { narrowedNulLitPinBoxKey } from "./emit_value_sites"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
   declaredIndexAt,
@@ -186,6 +187,7 @@ import {
   fnIndexOfNode,
   globalCellKind,
   localIndexOf,
+  nulLitAtomTexts,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -1207,11 +1209,18 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const arm = printArmOf(c.callArgs[0], ibFnIx)
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
+  // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
+  if arm == "nulAtom" && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != "" {
+    return skip("print nulAtom from a box")
+  }
   const v = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return 0 }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
-  const ok = if want == "nulStr" { strNullable(vr) } else { p != null && p == want }
+  let ok = p != null && p == want
+  if want == "nulStr" { ok = strNullable(vr) }
+  if want == "atom" { ok = repNodeAt(vr) is RAtom }
+  if want == "nulAtom" { ok = atomNullable(vr) }
   if !ok { return skip("print operand rep") }
   irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
   return 0
@@ -1227,7 +1236,9 @@ function printArmRep(arm: PrintArm): string {
     "bool" => "bool"
     "i32" => "i32"
     "nulStr" => "nulStr"
-    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulAtom" | "atom" | "nulBool" | "union" | "unrenderable" => ""
+    "atom" => "atom"
+    "nulAtom" => "nulAtom"
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulBool" | "union" | "unrenderable" => ""
   }
 }
 
@@ -1674,6 +1685,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("coalesce operand") }
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
+  if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   if !coalNulStrBlockPlain(n, ix, ibFnIx) {
     return irBMiss("coalesce string shape")
@@ -1692,6 +1704,35 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return d }
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
+// plain string literal, which the null branch writes as itself.
+function coalAtomStr(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const dIx = unwrapParen(n.binRight)
+  if dIx < 0 || !(nodeAt(dIx) is StrLit) || exprIsLitAtom(dIx, ibFnIx) {
+    return irBMiss("coalesce atom default")
+  }
+  if nulLitAtomTexts(lhsIx, ibFnIx).length == 0 {
+    return irBMiss("coalesce atom members")
+  }
+  if repPrim(rep) != "str" { return irBMiss("coalesce result rep") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !atomNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const d = irBExpr(b, n.binRight)
+  if ibMiss != "" { return d }
+  if !(d is OStr) || irBOpRep(d) != rep {
+    return irBMiss("coalesce atom default")
+  }
+  const r: Rhs = { zaL: l, zaD: d, zaAt: ix }
   return irBLetTemp(b, r, ix, rep)
 }
 
@@ -1920,8 +1961,11 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 function strLit(ix: i32, rep: i32): Opnd {
   if strLitTakesAtom(ix, ibFnIx) {
     const ar = repNodeOfTy(ctxTyAt(ix, ibFnIx))
-    if !(repNodeAt(ar) is RAtom) { return irBMiss("string atom") }
-    const a: Opnd = { osAt: ix, osRep: ar }
+    // At a `K | null` the literal is its member's id, which the niche holds as is (`RRetag`).
+    const an = repNodeAt(ar)
+    const at = if an is RNullable && an.rnDisc == 3 { an.rnInner } else { ar }
+    if !(repNodeAt(at) is RAtom) { return irBMiss("string atom") }
+    const a: Opnd = { osAt: ix, osRep: at }
     return a
   }
   if repPrim(rep) != "str" { return irBMiss("string literal rep") }
@@ -2025,11 +2069,11 @@ function loopIx(label: string): i32 {
   return -1
 }
 
-// A `for` statement along legacy's plain walk (`forInPlainWhy`): the list once, its element
-// variable at the declared slot, and the body. Every other walk is a named miss.
+// A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
+// once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const why = forInPlainWhy(n, ix, ibFnIx)
-  if why != "" { return skip("for in " + why) }
+  if why != "" && why != "hoisted" { return skip("for in " + why) }
   const l = irBExpr(b, n.fiIter)
   if ibMiss != "" { return 0 }
   // A list walks its elements; a string its code points, each an i32.
