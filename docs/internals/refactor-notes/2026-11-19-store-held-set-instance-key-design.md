@@ -1,4 +1,4 @@
-# STORE: an instance key for a hole handed a holder of a tagged set (design, 2026-11-19)
+# STORE: an instance key for a hole handed a holder of a tagged set (2026-11-19)
 
 The coordinator assigned this after D15900 parked. #9051 keys a hole by a function value's identity
 set; this stage keys it by the set a handed record or list holds. D15900 is the witness. The pinned
@@ -60,15 +60,37 @@ master), not handed on, and handed a scalar. Bars:
 - late rows do not rise;
 - a full @run A/B.
 
-## Progress (WIP commit on this branch, not for merge)
-- `elabCallArgSetTy` now keys a call argument holding a tagged set at any depth (`fnTagHoldsTy`:
-  list, record, map), replacing the list-only `fnTagListTy`. This is the one function F2's D14433
-  map arm will use too.
-- `ftHandedRecHolds` (the decision half) is in.
-- D15900 is still an invalid module. The handed literal is built as `array.new_fixed $0 1
-  (struct.new $9 (i32.const 4))`, where `$9 = struct {ref $5}` is a closure record, and `take`'s
-  parameter `$8` is that closure-record list. So `take`'s instance is still not keyed at the set.
-- Next to establish: whether `elabCallTaggedArgs` sees the handed literal as holding the tagged set.
-  Is `nodeTyIxOf` of the literal its set-typed record list, or the type closed at `take`'s pin? If it
-  is the pin's, the key must read the literal's identity (each leaf's `idSetOf`, as `ikIdTy` does
-  for a bare function value) rather than its node type.
+## What shipped
+The key itself was already right once #9107 landed: `elabCallArgSetTy` reads the handed literal's
+own type, which holds the tagged set, so `take`'s instance is keyed `{f: (_) => _}[]#4`. Plan step 1
+needed no `idSetOf` read, and step 2 (the partiality twin) was not reached. What failed was
+everything after the key:
+1. **Mono pinned the hole at the closed closure type** (`monoPinHoleParam`). Its held refinement
+   took the bound set-holding type only for a list of ids. It now also takes a list literal of
+   records holding the set's ids, and pins at the list of their stored rows (`monoTagMapRepTy` of
+   the element). `monoMakeInstanceParams` types that pin as the set-holding list itself, as it does
+   a record of ids. A bound list keeps its own literal's rows:
+   `list-of-records-of-hole-fns-handed-to-open-param.vl` stores closures under a tagged set.
+2. **A second clone of the call lost its set** (`monoTagSetAt`). The first clone, inside the
+   instance's walk, carries the set and its arms (`fnTagCallCopy`). The clone of that clone read
+   its callee's closed type, `(f64) => f64`, and returned -1. A clone that carries a tagged set with
+   arms now keeps it.
+3. **The handed literal was built at the closure record.** `ftP.named` stamps a record at its own
+   rep only in the late pass. A handed record, and each list literal around it
+   (`ftHandedListsNote`), is now stamped when the decision takes it.
+4. **The decision is narrowed** to what the facts can hold. A record handed bare (no list literal)
+   regressed `hole-fn-record-field-called-at-other-param.vl`, so that spelling stays refused, as on
+   master. A callee named twice (`use5` in `hole-fn-record-list-literal-beside-shared-field-record.vl`)
+   met "an instance call ... meets a key those facts lacked" at check, and added two late rows when
+   decided late, so the callee must be named once (`ftFnReadCount`, counted in the walk
+   `ftShapeLitsOf` already makes).
+
+## Measurements (fixpoint seeds: master `0fffbbb4c`, this branch)
+- @run A/B over 6,777 cases: one mover, the new fixture
+  `closures/record-literal-of-a-tagged-set-handed-to-a-hole-param.vl` (emit refuses → runs).
+  0 runs → not-runs, 0 wasm-only diffs.
+- Late demands 9 (baseline 9); late tag rows 307 (baseline 307).
+- A0 shadow (`VL_INST_KEYS`): elab-only keys identical per file, 7,793 over 6,780 files.
+- `record-list-hole-fn-lone-use-beside-two-signatures.matrix.vl`: `argument` un-annotated moves to
+  RUNS; 0 runs → not-runs, 0 silent. The other 22 cells (returns, fields, list elements, locals,
+  map values, and the annotated argument) are still refused, and D15900 stays open on a return witness.
