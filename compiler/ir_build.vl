@@ -128,7 +128,8 @@ import {
   legacyContextLiveWhy,
   lowMemFoldsCallee,
   mapFilterWhy,
-  mapGetOrHelperRoute,
+  mapGetOrArmOf,
+  mapGetOrMvPlain,
   mapKeyArmOf,
   mapRecvIsSet,
   mapRecvShapeOf,
@@ -2111,17 +2112,22 @@ function strInnerOf(r: i32): i32 {
   return -1
 }
 
-// `g[k] ?? d` along legacy's helper route only (`mapGetOrHelperRoute`): a map global read
-// plainly, a key written as itself (`mapKeyArmOf`), and an i32 default the helper's miss holds.
+// `g[k] ?? d` along legacy's helper route, its plain `i32` read or its plain mv slot read
+// (`mapGetOrArmOf`, `mapGetOrMvPlain`): a map global read plainly and a key written as itself
+// (`mapKeyArmOf`); the helper's miss holds an i32 default, and a plain read's miss arm a default
+// that computes nothing ahead of the read.
 function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("map read") }
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return irBMiss("map read") }
   const rk = coalResultKindOf(ix, ibFnIx)
-  if mapGetOrHelperRoute(rd.idxArr, n.binRight, ibFnIx, rk).length != 1 {
-    return irBMiss("map read inline")
+  const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
+  const mv = arm == "mv" && mapGetOrMvPlain(rd.idxArr, n.binRight, ibFnIx)
+  if arm != "helper" && arm != "i32" && !mv {
+    return irBMiss("map read " + arm)
   }
+  const inline = arm != "helper"
   const ka = mapKeyArmOf(
     rd.idxArr,
     rd.idxIndex,
@@ -2129,19 +2135,46 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     mapRecvShapeOf(rd.idxArr, ibFnIx),
   )
   if ka != "plain" { return irBMiss("map key " + ka) }
-  if repPrim(rep) != "i32" { return irBMiss("map read rep") }
+  const rp = repPrim(rep)
+  if !(rp == "i32" || arm == "i32" && rp == "bool" || mv) {
+    return irBMiss("map read rep")
+  }
   const g = mapGlobalOf(rd.idxArr)
   if g < 0 { return irBMiss("map read receiver") }
   const k = irBExpr(b, rd.idxIndex)
   if ibMiss != "" { return k }
+  // The default is written in the miss arm, so it may compute nothing ahead of the read.
+  const at = b.length
+  const dv: Opnd = if inline { irBExpr(b, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
+  if ibMiss != "" { return dv }
+  if !defaultSelfContained(b, at, dv) {
+    return irBMiss("map read default computes")
+  }
+  if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
   const sid = sidOfNode(rd.idxArr)
   const r: Rhs = {
     mgSym: g,
     mgNonNull: globalReadRecovers(sid, rd.idxArr, ibFnIx),
     mgKey: k,
     mgAt: ix,
+    mgForm: if mv { 2 } else if inline { 1 } else { 0 },
+    mgDef: dv,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// Whether operand `o`, built into `b` from `at` on, computes nothing ahead of its use: a variable or
+// an immediate, or the temp of the one node built, which its use writes in place.
+function defaultSelfContained(b: i32[], at: i32, o: Opnd): boolean {
+  if b.length == at {
+    return !(o is OVar
+      && o.ov >= 0
+      && o.ov < ib.irVars.length
+      && ib.irVars[o.ov].vKind == "temp")
+  }
+  if b.length != at + 1 || !(o is OVar) { return false }
+  const n = ib.irNodes[b[at]]
+  return n is SLet && n.lDst == o.ov
 }
 
 // The module global map read `recvIx` names, its rep noted in `ib`; -1 for any other receiver.
