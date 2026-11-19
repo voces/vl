@@ -30,3 +30,15 @@ Value `match` and value `else if` chains do not reach the IR at any length (`tai
 | statement `else if` chain, 30,000 links | `nesting depth` (legacy) | claimed |
 | nested value `if`, 300 and 5,000 links | `nesting depth` (legacy) | claimed; 5,000 links: fuel 113,527,281,776 → 109,382,346,298 |
 | nested value `if`, 30,000 links | over 300 s | over 300 s (outside the IR) |
+
+## Cost
+
+| reading | master | this change |
+| --- | --- | --- |
+| L2 self-compile fuel, each tree compiling itself | 98,651,427,549 | 98,843,686,740 (+0.19%) |
+| the two seeds compiling the master tree | 98,651,427,549 | 98,791,954,569 (+0.14%) |
+
+So about 0.05% is the larger source and 0.14% is the walks' frame arrays. The profile cannot
+split that by function at 30k samples; `__grow_0__` is the largest riser. Two cuts measured
+nothing: module-level frame stacks in `body` (+23M) and a one-link fast path in `ifChain` (−5M).
+The bounds rule pushes a node's bodies without building a list (−5M).
