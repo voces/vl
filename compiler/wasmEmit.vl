@@ -37755,8 +37755,8 @@ export function forInLoopClose(s: ForIn, lp: ForInLoop, fiSeq: i32): i32 {
 }
 
 // `for v[, i] in recv` over a union-of-lists box a pin left unrewritten (D16897): the box is
-// held in the loop's `#l` slot, its length read per arm (`emitListUnionForLen`), and each
-// element read per arm and boxed into the element union `v` holds. 0 when `s` is no such loop.
+// held in the loop's `#l` slot, one tag test picks the arm, and that arm's walk boxes each
+// element into the element union `v` holds. 0 when `s` is no such loop.
 function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   if !luForUnionIter(s.fiIter, fnIx) { return 0 }
   const arms = luMembersAt(nodeTyAt(s.fiIter, fnIx))
@@ -37878,8 +37878,8 @@ function emitListUnionForFlat(
   return emitListUnionForLoop(s, stmtIx, fnIx, plan)
 }
 
-// The loop of `emitListUnionFor`: the box held in `#l`, the length per arm, each element per
-// arm by `plan`, then the body under the loop's names.
+// The loop of `emitListUnionFor`: the box held in `#l`, one tag test, then per arm its own walk
+// (`emitListUnionForArm`), the body emitted under each.
 function emitListUnionForLoop(
   s: ForIn,
   stmtIx: i32,
@@ -37894,12 +37894,40 @@ function emitListUnionForLoop(
     if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
   }
   const vIdx = paramN + vSlot
+  if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
+  fbLocalSet(vIdx + 2)
+  if emitListUnionForArm(s, fnIx, plan, vSlot, vIdx, emitLetCursor, 0) < 0 { return -1 }
+  return 1
+}
+
+// Arm `i` onward of the loop's tag chain over the box in `#l`: under arm `i`'s tag, a walk of
+// that arm's list, each element entering the element union at a known arm; past the last arm the
+// box holds no list the union names, which a checked walk never reaches.
+function emitListUnionForArm(
+  s: ForIn,
+  fnIx: i32,
+  plan: LuForPlan,
+  vSlot: i32,
+  vIdx: i32,
+  cur0: i32,
+  i: i32,
+): i32 {
+  if i >= plan.tags.length {
+    fbUnreachable()
+    return 0
+  }
   const iIdx = vIdx + 1
   const lIdx = vIdx + 2
-  if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
-  fbLocalSet(lIdx)
+  const hasPair = s.fiVar2 != ""
+  fbLocalGet(lIdx)
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, plan.tags[i])
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
   fbI32Const(0)
   fbLocalSet(iIdx)
+  // The arms exclude each other, so each walk's body takes the same slots as the first's.
+  emitLetCursor = cur0
   const hoist = loopHoistOpen(-1, s.fiBody, fnIx, s.fiDecl1, s.fiDecl2)
   if hoist < 0 { return -1 }
   fbBlock(64)
@@ -37909,10 +37937,13 @@ function emitListUnionForLoop(
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
   fbLocalGet(iIdx)
-  if emitListUnionForLen(lIdx, plan, 0) < 0 { return -1 }
+  fbLocalGet(lIdx)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(plan.heaps[i])
+  fbStructGet(plan.heaps[i], 1) // field 1: len
   fbI32Bin(78) // 0x4e i32.ge_s
   fbBrIf(1)
-  if emitListUnionForElem(lIdx, iIdx, plan, 0) < 0 { return -1 }
+  if emitListUnionForElem(lIdx, iIdx, plan, i) < 0 { return -1 }
   fbLocalSet(vIdx)
   if hasPair {
     fbLocalGet(iIdx)
@@ -37935,32 +37966,23 @@ function emitListUnionForLoop(
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   loopHoistClose(hoist)
-  return 1
+  fbElse()
+  if emitListUnionForArm(s, fnIx, plan, vSlot, vIdx, cur0, i + 1) < 0 {
+    return -1
+  }
+  fbEnd()
+  return 0
 }
 
-// Arm `i` onward of `emitListUnionFor`'s element read over the box in local `box` at cursor
-// `cur`, at the element union's rep: a boxed element as stored, a scalar wrapped in its value
-// box, a `null` off a nullable element under the null tag, an atom widened to its string.
+// Arm `i`'s element read over the box in local `box` at cursor `cur`, at the element union's
+// rep: a boxed element as stored, a scalar wrapped in its value box, a `null` off a nullable
+// element under the null tag, an atom widened to its string.
 function emitListUnionForElem(
   box: i32,
   cur: i32,
   plan: LuForPlan,
   i: i32,
 ): i32 {
-  if i >= plan.tags.length {
-    fbUnreachable()
-    return 0
-  }
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, plan.tags[i])
-  fbI32Bin(70) // 0x46 i32.eq
-  if plan.destKind == "union" {
-    fbIfRef(uBoxIdx)
-  } else {
-    fbOpenIf()
-    fbValtype(plan.destKind, -1)
-  }
   const heap = plan.heaps[i]
   const et = plan.eTags[i]
   if plan.eNul[i] {
@@ -37990,31 +38012,6 @@ function emitListUnionForElem(
     fbStructNew(uBoxIdx)
   }
   if plan.eNul[i] { fbEnd() }
-  fbElse()
-  if emitListUnionForElem(box, cur, plan, i + 1) < 0 { return -1 }
-  fbEnd()
-  return 0
-}
-
-// Arm `i` onward of the loop's length read over the box in local `box`; past the last arm the
-// box holds no list the union names, which a checked walk never reaches.
-function emitListUnionForLen(box: i32, plan: LuForPlan, i: i32): i32 {
-  if i >= plan.tags.length {
-    fbUnreachable()
-    return 0
-  }
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, plan.tags[i])
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(127)
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(plan.heaps[i])
-  fbStructGet(plan.heaps[i], 1) // field 1: len
-  fbElse()
-  if emitListUnionForLen(box, plan, i + 1) < 0 { return -1 }
-  fbEnd()
   return 0
 }
 
