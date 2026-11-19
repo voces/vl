@@ -158,6 +158,7 @@ import {
   fbI32RelOf,
   fbI64Const,
   fbIf,
+  fbIfRefNul,
   fbLocalGet,
   fbLocalIsUnsetRef,
   fbLocalRun,
@@ -170,9 +171,11 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefTest,
   fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
+  fbSelect,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -402,7 +405,9 @@ export function irLOpnd(o: Opnd) {
 // Before a value that reads no operand: one written while a valued `if`'s value waits on the
 // stack lands above it, out of order.
 function leaf() {
-  if lwStackLive > 0 { irLMiss("operand above a valued if's value") }
+  if lwStackLive > 0 && !lwPushing {
+    irLMiss("operand above a valued if's value")
+  }
 }
 
 function imm(o: OImm) {
@@ -584,6 +589,9 @@ function rawOp(r: RRawOp) {
     "test" => 0
     "load" => fbI32Load()
     "tag64" => 0
+    "push" => irLMiss("push read as an operand")
+    "ref.test" => fbRefTest(h)
+    "select" => fbSelect()
     "tee" => {
       const s = varSlot(r.rwImm)
       if s < 0 { return irLMiss("unmapped slot") }
@@ -593,10 +601,42 @@ function rawOp(r: RRawOp) {
   return 0
 }
 
-// A helper's raw instruction that yields nothing; `array.copy`'s source heap is its `srImm`.
+// A helper's `push`: its variable or immediate written where it is defined, kept on the stack
+// below whatever the body computes next, for a later effect whose leading operands the pushes are.
+function pushNow(dst: i32, r: RRawOp) {
+  if !lw.irHelper || r.rwArgs.length != 1 || r.rwArgs[0] is OStr {
+    return irLMiss("push")
+  }
+  lwPushing = true
+  irLOpnd(r.rwArgs[0])
+  lwPushing = false
+  lwPushed.push(dst)
+  return 0
+}
+
+// The temps `push` wrote and no effect has consumed yet, in push order, and whether a push is
+// being written, which may sit above a valued `if`'s value by design.
+let lwPushed: i32[] = []
+let lwPushing = false
+
+// A helper's raw instruction that yields nothing; `array.copy`'s source heap is its `srImm`. Its
+// pushed operands, if any, are its leading ones, in push order.
 function rawEff(n: SRawOp, pending: i32[]) {
   lwSeq = []
-  for a in n.srArgs { irLOpnd(a) }
+  let k = 0
+  const queued = lwPushed.length
+  while k < n.srArgs.length && k < queued {
+    const a = n.srArgs[k]
+    if !(a is OVar) || a.ov != lwPushed[k] { break }
+    takeUse(a.ov)
+    k = k + 1
+  }
+  if k < queued { return irLMiss("push not consumed first") }
+  lwPushed = []
+  while k < n.srArgs.length {
+    irLOpnd(n.srArgs[k])
+    k = k + 1
+  }
   irLSettle(pending)
   const h = n.srHeap
   match n.srOp {
@@ -1097,6 +1137,12 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       lwTempRhs[n.lDst] = n.lRhs
       lwTempDef[n.lDst] = true
       pending.push(n.lDst)
+      // A push is consumed through `lwPushed`, not the pending order of the next node.
+      const r = n.lRhs
+      if r is RRawOp && r.rwOp == "push" {
+        pending.pop()
+        return pushNow(n.lDst, r)
+      }
     }
     SAssign => {
       cond(n.asSrc, pending)
@@ -1273,9 +1319,12 @@ function valuedIf(n: SIf, pending: i32[]) {
     return irLMiss("valued if out")
   }
   const vt = valtypeOf(lw.irVars[t].vRep)
-  if vt < 0 { return irLMiss("valued if rep") }
+  // A helper's `if` may yield a raw reference, as its hand-written body's did.
+  const rr = repNodeAt(lw.irVars[t].vRep)
+  const refOut = lw.irHelper && rr is RRaw
+  if vt < 0 && !refOut { return irLMiss("valued if rep") }
   cond(n.siCond, pending)
-  fbIf(vt)
+  if rr is RRaw && refOut { fbIfRefNul(rr.rwHeap, rr.rwNull) } else { fbIf(vt) }
   lwFrames.push(-1)
   body(n.siThen, false, t)
   fbElse()
@@ -1492,6 +1541,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   lwRowKind = []
   lwBuf = []
   lwSinkFired = 0
+  lwPushed = []
   uBoxNewEnd = -1
   // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
@@ -1606,6 +1656,7 @@ export function irLowerHelper(f: IrFn, out: u8[]): string {
       }
     }
   }
+  if lwPushed.length > 0 { irLMiss("push never consumed") }
   if lwMiss != "" { return lwMiss }
   const locals: u8[] = []
   const prev = wTarget(locals)
