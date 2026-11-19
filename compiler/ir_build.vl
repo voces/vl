@@ -42,6 +42,7 @@ import {
   hasNamedArgs,
   i32ToStr,
   nodeAt,
+  nodeChildrenPush,
 } from "./ast"
 import {
   IrFamily,
@@ -95,6 +96,8 @@ import {
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
+  clearPlanOf,
+  clearRecvIsList,
   cloLiftCalleeOf,
   closureValueWhy,
   coerceHeldSwap,
@@ -1289,13 +1292,62 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
-// The captures lifted function `pos` takes after its environment, each a parameter of the
-// function being built, read in order; a miss names any other.
+// The `let` or `const` of the function being built that capture `name` of lifted function `pos`
+// reads, found at a read of it in the lifted body; -1 for none, or for a binding of another frame.
+function liftCapDecl(pos: i32, name: string): i32 {
+  const key = i32ToStr(pos) + "|" + name
+  const known = ibLiftCapDecl[key] ?? -2
+  if known != -2 { return known }
+  let found = -1
+  const todo: i32[] = [fnStmts[pos]]
+  while todo.length > 0 && found < 0 {
+    const i = todo.pop() ?? -1
+    const n = if i >= 0 && i < P.nodes.length { nodeAt(i) } else { null }
+    if n is Ident && n.identName == name {
+      const d = identDeclOf(i)
+      if d >= 0 && d < P.nodes.length && nodeAt(d) is LetDecl { found = d }
+    }
+    if i >= 0 && i < P.nodes.length { nodeChildrenPush(i, todo) }
+  }
+  if found >= 0 && !ownBinding(found) { found = -1 }
+  ibLiftCapDecl[key] = found
+  return found
+}
+
+// Whether declaration `d` stands in the body of the function being built, outside any function
+// nested in it. The set is built once per function.
+function ownBinding(d: i32): boolean {
+  if !ibOwnBuilt {
+    ibOwnBuilt = true
+    const fn = if ibFnIx >= 0 && ibFnIx < P.nodes.length { nodeAt(ibFnIx) } else { null }
+    const todo: i32[] = if fn is FuncDecl { [fn.fnBody] } else { [] }
+    while todo.length > 0 {
+      const i = todo.pop() ?? -1
+      if i >= 0 && i < P.nodes.length && !(nodeAt(i) is FuncDecl) {
+        if nodeAt(i) is LetDecl { ibOwnDecls[i] = true }
+        nodeChildrenPush(i, todo)
+      }
+    }
+  }
+  return ibOwnDecls[d] ?? false
+}
+
+// The `let`s and `const`s of the function being built, outside any nested function, once built.
+let ibOwnDecls: {[i32]: boolean} = Map()
+let ibOwnBuilt = false
+
+// For the function being built, by lifted function and capture name, the binding `liftCapDecl`
+// found.
+let ibLiftCapDecl: {[string]: i32} = Map()
+
+// The captures lifted function `pos` takes after its environment, each a parameter or a binding
+// of the function being built, read in order; a miss names any other.
 function liftCaps(pos: i32): Opnd[] {
   const out: Opnd[] = []
   for name in captureNamesOf(pos) {
     const p = paramIndexOf(ibFnIx, name)
-    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+    const d = if p < 0 { liftCapDecl(pos, name) } else { -1 }
+    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
     if v < 0 || capCellTargetOf(name) >= 0 {
       irBMiss("callee captures")
       return out
@@ -1307,7 +1359,7 @@ function liftCaps(pos: i32): Opnd[] {
 }
 
 // A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
-// closure, then each argument at its parameter's scalar rep.
+// closure, then each argument at its parameter's scalar, string or record rep.
 function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = callRefPlainKey(ix, ibFnIx)
   if key == "" { return missRhs("call of a non-declaration") }
@@ -1336,7 +1388,8 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     const pk = sigParamKindAt(key, i)
     const aps: string = if ap == null { "" } else { ap }
     const pks: string = if pk == null { "-" } else { pk }
-    if aps != pks { return missRhs("closure argument coercion") }
+    const rec = pks == "struct" && repNodeAt(irBOpRep(a)) is RRecord
+    if aps != pks && !rec { return missRhs("closure argument coercion") }
     args.push(a)
     i = i + 1
   }
@@ -1696,6 +1749,32 @@ function popStmt(b: i32[], c: Call, ix: i32) {
   if ibMiss != "" { return 0 }
   if !(repNodeAt(irBOpRep(v)) is RList) { return skip("pop operand coercion") }
   irBNode(b, { efRhs: { lqV: v, lqAt: ix } }, -1, ibNoValue, ix)
+  return 0
+}
+
+// Whether call `c` is a no-argument `.clear()` on a list, legacy's own gate (`clearRecvIsList`).
+function isListClearStmt(c: Call): boolean {
+  if c.callFn < 0 || c.callFn >= P.nodes.length || c.callArgs.length != 0 {
+    return false
+  }
+  const f = nodeAt(c.callFn)
+  return f is Member
+    && f.memProp == "clear"
+    && clearRecvIsList(f.memObj, ibFnIx)
+}
+
+// A list `.clear()` statement, through legacy's plan (`clearPlanOf`) and length reset.
+function clearStmt(b: i32[], c: Call, ix: i32) {
+  if clearPlanOf(ix, ibFnIx).clFail != "" { return skip("clear plan") }
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return skip("clear callee") }
+  const f = nodeAt(c.callFn)
+  if !(f is Member) { return skip("clear callee") }
+  const v = irBExpr(b, f.memObj)
+  if ibMiss != "" { return 0 }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return skip("clear operand coercion")
+  }
+  irBNode(b, { efRhs: { lkV: v, lkAt: ix } }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -2849,6 +2928,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   }
   if n is Call {
     if isPopStmt(n) { return popStmt(b, n, ix) }
+    if isListClearStmt(n) { return clearStmt(b, n, ix) }
     const ms = mapSetCallOf(n)
     if ms >= 0 && n.callFn < P.nodes.length {
       const mf = nodeAt(n.callFn)
@@ -3059,6 +3139,9 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMiss = ""
   ibMisses = []
   ibDeclVar = Map()
+  ibLiftCapDecl = Map()
+  ibOwnDecls = Map()
+  ibOwnBuilt = false
   ibLoopName = []
   ibLoopBrk = []
   ibLoopCont = []
