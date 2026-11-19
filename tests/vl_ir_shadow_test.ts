@@ -436,6 +436,23 @@ print(ap(3))
   },
 });
 
+// A packed byte list's element reads unsigned into an i32 along legacy's scalar read tail.
+Deno.test({
+  name: "ir shadow: a packed byte element read is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function at(bs: u8[], i: i32): i32 { return bs[i] + 1 }
+const bs: u8[] = [200, 7]
+print(at(bs, 0))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A proven loop accumulator, local or module, appends its parts through `emitStrAccAppend`'s
 // shared tail and matches legacy's bytes.
 Deno.test({
@@ -615,6 +632,30 @@ run(2.5)
       throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A record literal on legacy's layout path builds field by field and matches; a field at another
+// arm (here a widened `f64`) stays a named miss.
+Deno.test({
+  name: "ir shadow: a plain record literal builds; a field at a converting arm is a named miss",
+  ignore,
+  fn: () => {
+    const src = `type P = { x: i32, y: string }
+type Q = { w: f64 }
+function mk(a: i32, s: string): P { return { x: a + 1, y: s } }
+function mkq(a: i32): Q { return { w: a } }
+const p = mk(2, "k")
+print(p.x)
+print(p.y)
+print(mkq(3).w)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want mk matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered object field f64") !== 1) {
+      throw new Error(`want mkq a named miss, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
