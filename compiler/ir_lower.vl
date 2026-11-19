@@ -47,6 +47,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  condLitTrue,
   i32ToStr,
   nodeAt,
 } from "./ast"
@@ -75,6 +76,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCoalAtomStr,
   RCoalStr,
   RFnId,
   RGetField,
@@ -198,18 +200,18 @@ import {
   atomEqTail,
   atomStrPlanOf,
   atomStrTail,
-  binNulTestOf,
   boxTagIsTail,
+  coalAtomStrClose,
+  coalAtomStrOpen,
+  coalAtomStrReserve,
   coalNulRefBranch,
   coalNulRefOpen,
-  coalResultKindOf,
-  coalesceNulStrStaysNullable,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapNew,
-  emitNullAt,
-  emitNullForRet,
+  emitNullOwn,
+  emitNullRetTail,
   emitReadRecover,
   emitStrLitAt,
   f64RemCallTail,
@@ -237,7 +239,6 @@ import {
   holeBoxTyAt,
   idxRowsOn,
   initBitOf,
-  localNulStrRecovers,
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
@@ -252,13 +253,13 @@ import {
   narrowedFieldTail,
   narrowedVariantRepIs,
   narrowedVariantTail,
-  nulTestArmOf,
   nulTestAtomTail,
   nulTestRefTail,
   numCastTail,
   numIntrTail,
   numWidenTail,
   printArmOf,
+  printAtomTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarTail,
@@ -279,6 +280,14 @@ import {
   variantUnionBoxTail,
   voidTailCallee,
 } from "./wasmEmit"
+import { nullRetPlanOf } from "./emit_plan_null"
+import {
+  binNulTestOf,
+  coalResultKindOf,
+  coalesceNulStrStaysNullable,
+  localNulStrRecovers,
+  nulTestArmOf,
+} from "./emit_plan_null"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
 import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
@@ -538,6 +547,15 @@ function rhs(r: Rhs, tail: boolean) {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
     }
+    RCoalAtomStr => {
+      const e = nodeAt(r.zaAt)
+      if !(e is BinExpr) { return irLMiss("atom coalesce node") }
+      coalAtomStrReserve()
+      irLOpnd(r.zaL)
+      coalAtomStrOpen(e)
+      irLOpnd(r.zaD)
+      coalAtomStrClose(e, lw.irAt)
+    }
     RCoalStr => {
       coalNulRefOpen(sTy(), coalesceNulStrStaysNullable(r.czAt, lw.irAt))
       irLOpnd(r.czL)
@@ -566,7 +584,7 @@ function rhs(r: Rhs, tail: boolean) {
     RNulTest => nulTestOp(r)
     RNullOf => {
       leaf()
-      emitNullAt(r.nuAt, lw.irAt)
+      emitNullOwn(r.nuOwn)
     }
     RTest => {
       irLOpnd(r.teV)
@@ -973,6 +991,9 @@ function printOp(r: RPrint) {
   }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
+  if arm == "atom" || arm == "nulAtom" {
+    return printAtomTail(arm, c.callArgs[0], lw.irAt)
+  }
   return printScalarTail(arm)
 }
 
@@ -1139,6 +1160,14 @@ function brDepth(label: i32): i32 {
 }
 
 // Whether `o` is the immediate `true`.
+// Whether the `if` built from node `at` tests the literal `true` (`condLitTrue`); a node that is
+// no `if` statement, a loop's exit or a helper's, has no test of its own to read.
+function testIsLitTrue(at: i32): boolean {
+  if at < 0 || at >= P.nodes.length { return true }
+  const s = nodeAt(at)
+  return if s is IfStmt { condLitTrue(s.ifCond) } else { true }
+}
+
 function isTrue(o: Opnd): boolean {
   return match o {
     OImm => repPrim(o.oiRep) == "bool" && o.oiBits == 1
@@ -1417,7 +1446,8 @@ const IF_VALUED = 2
 
 // Opens `if` node `id` up to its `else`. The loop exit `if c {} else { br L }` is legacy's
 // `eqz; br_if`, and a literal-true test writes no test at all, either for that exit or for an
-// else-less `if`, whose arm runs inline.
+// else-less `if`, whose arm runs inline. A test that is only constant, as a dead null test is,
+// keeps its `if` (`condLitTrue`).
 function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   if id < 0 || id >= lw.irNodes.length { return IF_NOT }
   const n = lw.irNodes[id]
@@ -1426,7 +1456,8 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   const exitBr = n.siThen.length == 0
     && n.siElse.length == 1
     && isBr(n.siElse[0])
-  if isTrue(n.siCond) && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
+  const litTrue = isTrue(n.siCond) && testIsLitTrue(lw.irNodeAt[id])
+  if litTrue && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
     return IF_DONE
@@ -1739,7 +1770,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     if lwSinkFired > 0 {
       irLMiss("null fall-through into the return sink")
     } else {
-      emitNullForRet(f.irAt)
+      emitNullRetTail(nullRetPlanOf(f.irAt))
     }
   } else if pad == "unreachable" {
     fbUnreachable()
