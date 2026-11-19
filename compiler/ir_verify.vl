@@ -1,7 +1,8 @@
 // The IR verifier (ir-design-2026-11.md §2): one linear walk over an `IrFn` that checks rules
 // 1-7: closed reps, rep agreement, types against reps, definitions before uses, control, calls
 // and switch coverage. Rule 10 keeps raw reps and ops (`RRaw`, `RRawOp`, `SRawOp`) and valued
-// blocks and branches inside a runtime helper, each reference operand at its op's heap type. It
+// blocks and branches inside a runtime helper, each reference operand at its op's heap type, and
+// each `push` the leading operand of the next raw effect, in push order. It
 // answers the first rule a function breaks, with the node; it never reports through the
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
@@ -110,6 +111,9 @@ let vfMsg = ""
 let vfDefined: boolean[] = []
 // The temps defined in the open bodies, in order, so a body's exit undoes its own.
 let vfDefLog: i32[] = []
+// The `push` temps not yet consumed, in push order, and which temps are such pushes.
+let vfPushed: i32[] = []
+let vfPushes: {[i32]: boolean} = Map()
 let vfLabels: i32[] = []
 let vfLabelOut: i32[] = []
 let vfBool = -1
@@ -155,6 +159,13 @@ function opRep(o: Opnd): i32 {
 function use(o: Opnd, at: i32) {
   match o {
     OVar => {
+      if vfPushes[o.ov] ?? false {
+        return fail(
+          10,
+          at,
+          "a push read anywhere but as its store's leading operand",
+        )
+      }
       if o.ov < 0 || o.ov >= vf.irVars.length {
         return fail(
           4,
@@ -680,6 +691,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
 }
 
 // Whether rep `r` is raw, at heap `heap` unless that is -1.
+// A variable operand naming no variable, for a missing leading operand.
+function i32Opnd(v: i32): Opnd { return { ov: v } }
+
+// Whether rep `r` is a raw reference whose heap type no table tracks (heap -1).
+function untracked(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RRaw && n.rwHeap == -1
+}
+
 function rawAt(r: i32, heap: i32): boolean {
   const n = repNodeAt(r)
   return n is RRaw && (heap < 0 || n.rwHeap == heap)
@@ -706,6 +726,12 @@ function rawRhs(r: RRawOp, dst: i32, at: i32) {
     "call" => true
     "test" => n == 1 && opRep(a[0]) == vfI32 && dst == vfBool
     "load" => n == 1 && opRep(a[0]) == vfI32 && dst == vfI32
+    "push" => n == 1 && !(a[0] is OStr) && dst == opRep(a[0])
+    "ref.test" => n == 1 && rawAt(opRep(a[0]), -1) && dst == vfBool
+    "select" => n == 3
+      && opRep(a[2]) == vfBool
+      && opRep(a[0]) == opRep(a[1])
+      && dst == opRep(a[0])
     "tag64" => n == 1 && a[0] is OVar && repPrim(opRep(a[0])) == "i64" && dst == vfI32
     "tee" => n == 1
       && r.rwImm >= 0
@@ -722,6 +748,21 @@ function rawRhs(r: RRawOp, dst: i32, at: i32) {
 // Rule 10 for a raw effect: `array.copy`'s source is at heap `srImm`.
 function rawEff(e: SRawOp, at: i32) {
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
+  // Every outstanding push is this effect's leading operands, in push order.
+  let k = 0
+  while k < vfPushed.length {
+    const p = if k < e.srArgs.length { e.srArgs[k] } else { i32Opnd(-1) }
+    if !(p is OVar) || p.ov != vfPushed[k] {
+      return fail(
+        10,
+        at,
+        "a push is not its store's leading operand, in push order",
+      )
+    }
+    vfPushes[p.ov] = false
+    k = k + 1
+  }
+  vfPushed = []
   uses(e.srArgs, at)
   const a = e.srArgs
   const n = a.length
@@ -851,6 +892,11 @@ function stmt(id: i32) {
         return fail(4, id, "defines no variable")
       }
       rhsCheck(n.lRhs, vf.irVars[d].vRep, id)
+      const r = n.lRhs
+      if r is RRawOp && r.rwOp == "push" {
+        vfPushed.push(d)
+        vfPushes[d] = true
+      }
       if vf.irVars[d].vKind == "temp" {
         if vfDefined[d] {
           return fail(4, id, "defines temp v" + i32ToStr(d) + " twice")
@@ -1107,17 +1153,26 @@ export function irVerify(f: IrFn): IrVerdict {
   vfStr = repNodeOfTy(TY_STR)
   vfDefined = []
   vfDefLog = []
+  vfPushed = []
+  vfPushes = Map()
   let i = 0
   while i < f.irVars.length {
     const v = f.irVars[i]
     vfDefined.push(false)
     if rawAt(v.vRep, -1) || v.vTy < 0 {
-      // A raw variable has no VL type, and only a helper holds one.
+      // A raw variable has no VL type, and only a helper holds one. One whose heap is not
+      // tracked is a temp, on the stack between its read and its one use.
       if !f.irHelper || v.vTy >= 0 || !rawAt(v.vRep, -1) {
         fail(
           10,
           -1,
           "v" + i32ToStr(i) + " is raw outside a runtime helper, or typed",
+        )
+      } else if untracked(v.vRep) && v.vKind != "temp" {
+        fail(
+          10,
+          -1,
+          "v" + i32ToStr(i) + " holds an untracked raw value outside a temp",
         )
       }
     } else if !closedRep(v.vRep) {
@@ -1145,6 +1200,9 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 {
     const b = irBoundsRuleHook(f)
     if b != "" { fail(8, -1, b) }
+  }
+  if vfRule == 0 && vfPushed.length > 0 {
+    fail(10, -1, "a push no store consumes")
   }
   // Rule 5 at the end: a function with a result leaves its body on every path.
   if !repIsNoValue(f.irRetRep) && !irBodyLeaves(f, f.irBody) {
