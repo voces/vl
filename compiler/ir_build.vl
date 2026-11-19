@@ -1449,8 +1449,8 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
 // An `==`/`!=` with an atom operand, by legacy's own arm (`atomEqPlanOf`). A side typed as one
-// string literal is written by legacy's literal writer (an unread immediate here); only a `StrLit`
-// spelling is taken, since anything else it would evaluate with legacy's expression writer.
+// string literal is its member's id: a `StrLit` spelling is an unread immediate here, anything
+// else is built and dropped by the lowering, in source order.
 function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = atomEqPlanOf(n, ibFnIx)
   const ne = n.binOp == "!="
@@ -1459,15 +1459,16 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if p.aqArm == "fold" { return irBMiss("atom compare fold") }
   if p.aqArm == "static" {
     const sIx = if p.aqStaticLeft { n.binLeft } else { n.binRight }
-    if !(nodeAt(unwrapParen(sIx)) is StrLit) {
-      return irBMiss("atom compare static operand")
-    }
     const aIx = if p.aqStaticLeft { n.binRight } else { n.binLeft }
+    const sl = if p.aqStaticLeft { staticSideOf(b, sIx) } else { none }
+    if ibMiss != "" { return sl }
     const a = atomSide(b, aIx)
     if ibMiss != "" { return a }
+    const sr = if p.aqStaticLeft { none } else { staticSideOf(b, sIx) }
+    if ibMiss != "" { return sr }
     const st = if p.aqStaticLeft { 1 } else { 2 }
-    const l = if p.aqStaticLeft { none } else { a }
-    const r = if p.aqStaticLeft { a } else { none }
+    const l = if p.aqStaticLeft { sl } else { a }
+    const r = if p.aqStaticLeft { a } else { sr }
     return irBLetTemp(
       b,
       { aeL: l, aeR: r, aeStatic: st, aeNe: ne, aeAt: ix },
@@ -1486,6 +1487,19 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     ix,
     rep,
   )
+}
+
+// The operand of static side `ix`: the unread immediate of a `StrLit`, else its value, which the
+// lowering drops.
+function staticSideOf(b: i32[], ix: i32): Opnd {
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if nodeAt(unwrapParen(ix)) is StrLit { return none }
+  const v = irBExpr(b, ix)
+  if ibMiss != "" { return v }
+  if v is OImm || irBOpRep(v) == ibNoValue {
+    return irBMiss("atom compare static operand")
+  }
+  return v
 }
 
 // The value of atom operand `ix`, which must build at an atom rep or its `K | null`.
@@ -1935,20 +1949,6 @@ function loopIx(label: string): i32 {
   return -1
 }
 
-// The label a plain walk holds on the loop stack: legacy's loop owns its branches, so none
-// the IR builds may target it or cross it.
-const WALK_LABEL = -2
-
-// Whether a branch to loop stack entry `l` targets a walk or crosses one.
-function crossesWalk(l: i32): boolean {
-  let i = l
-  while i < ibLoopBrk.length {
-    if ibLoopBrk[i] == WALK_LABEL { return true }
-    i = i + 1
-  }
-  return false
-}
-
 // A `for` statement along legacy's plain walk (`forInPlainWhy`): the list once, its element
 // variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
@@ -1966,9 +1966,11 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if er < 0 { return skip("for in operand coercion") }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
+  const brk = labelNew()
+  const cont = labelNew()
   ibLoopName.push(n.fiLabel)
-  ibLoopBrk.push(WALK_LABEL)
-  ibLoopCont.push(WALK_LABEL)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(cont)
   const fb: i32[] = []
   const body = nodeAt(n.fiBody)
   if body is Block {
@@ -1980,7 +1982,13 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   ibLoopBrk.pop()
   ibLoopCont.pop()
   if ibMiss != "" { return 0 }
-  irBNode(b, { xfList: l, xfVar: v, xfBody: fb, xfAt: ix }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { xfList: l, xfVar: v, xfBody: fb, xfAt: ix, xfBrk: brk, xfCont: cont },
+    -1,
+    ibNoValue,
+    ix,
+  )
   return 0
 }
 
@@ -2153,7 +2161,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
     if l < 0 || n.brkHasVal != 0 { return skip("break") }
-    if crossesWalk(l) { return skip("for in break") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,
@@ -2167,7 +2174,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is ContinueStmt {
     const l = loopIx(n.contLabel)
     if l < 0 { return skip("continue") }
-    if crossesWalk(l) { return skip("for in continue") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,
