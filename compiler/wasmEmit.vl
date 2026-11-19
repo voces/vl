@@ -28660,7 +28660,16 @@ function emitCallCoreTrap(c: Call, fnIx: i32) {
   // (the same `__print_char__`/`__print_str_flush__` path `print(<string>)`
   // uses), so an abort carries a human-readable reason, THEN `unreachable`.
   if c.callArgs.length == 1 {
-    if emitPrintStrExpr(c.callArgs[0], fnIx) < 0 { return -1 }
+    // An atom message is an interned id, not a string ref; it decodes as `print(atom)` does.
+    const msg = c.callArgs[0]
+    if exprIsLitAtom(msg, fnIx) {
+      if emitStashAtomId(msg, fnIx) < 0 { return -1 }
+      if printAtomStashed(printAtomTexts("atom", msg, fnIx), false) < 0 {
+        return -1
+      }
+    } else if emitPrintStrExpr(msg, fnIx) < 0 {
+      return -1
+    }
   }
   fbUnreachable()
   return 0
@@ -31245,64 +31254,86 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
       const lIdx = listOpRecvLocal(callee.memObj, fnIx, base, popRefSlot, opNm)
       if lIdx < 0 { return -1 }
       if getIdx >= 0 { emitListGetViewSync(lIdx, popEk, callee.memObj, fnIx) }
-      // A pop the checker typed as the element itself, under a `.length` test of its receiver
-      // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
-      if getIdx < 0 && nodeTyExcludesNull(callIx) {
-        if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
-        if elemIsRef {
-          fbRefAsNonNull()
-          if popUnionBoxElem(popRefSlot) {
-            if emitStaleBoxRetag(popRefSlot, callIx) < 0 { return -1 }
-          }
-        }
-        return 0
-      }
       if !elemIsRef {
-        // A BOOLEAN-element list pops CHECKED: `boolean | null` rides the i32
-        // niche (true=1 / false=0 / null=2), so an empty pop yields the sentinel
-        // 2 instead of trapping — mirroring the host's nullable `.pop()` (B6).
-        if listElemIsBool(callee.memObj, fnIx) {
-          return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 2)
-        }
-        // the reps with no niche of their own, at a value position (`nulBox`): i32/i64/
-        // f64/f32 have no spare bit pattern for absence, so their `T | null` is the
-        // shared value box, built here. The statement caller passes `false` and keeps
-        // the raw form, since boxing there would allocate for a value no one reads.
-        if nulBox {
-          // A tagged set's member id is an `i32`, boxed as one.
-          const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
-          if pnk >= 0 {
-            return emitPopNulBox(lIdx, wrapTy, popBack, pnk, getIdx, fnIx)
-          }
-        }
-        // a `K[]` atom list reads checked too, on the `-1` sentinel below every interned
-        // atom id — the boolean arm's shape at the one other niche rep, applying at a
-        // statement `.pop()` too since the read itself traps, not the boxing (D1281).
-        if tyNulLitUnionInner(nodeTyIxOf(callIx)) {
-          return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 0 - 1)
-        }
-      }
-      if elemIsRef {
-        return emitPopRefChecked(
+        return popScalarTail(
           callIx,
+          callee.memObj,
           lIdx,
           wrapTy,
           popBack,
           getIdx,
+          nulBox,
           fnIx,
-          popRefSlot,
-          opNm,
         )
       }
-      // A numeric `.pop` statement has no null cell to answer with, so it pops under the
-      // length test and drops the element itself: an empty list is left as it is (D8360).
-      if !nulBox && getIdx < 0 { return popDropTail(lIdx, wrapTy, popBack) }
-      // the unchecked tail: the reps with no `T | null` cell of their own.
-      if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
-      return 0
+      // A pop the checker typed as the element itself, under a `.length` test of its receiver
+      // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
+      if getIdx < 0 && nodeTyExcludesNull(callIx) {
+        if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+        fbRefAsNonNull()
+        if popUnionBoxElem(popRefSlot) {
+          if emitStaleBoxRetag(popRefSlot, callIx) < 0 { return -1 }
+        }
+        return 0
+      }
+      return emitPopRefChecked(
+        callIx,
+        lIdx,
+        wrapTy,
+        popBack,
+        getIdx,
+        fnIx,
+        popRefSlot,
+        opNm,
+      )
     }
   }
   return emitFail("emitProgram: expected a .pop or .get call")
+}
+
+// After an i32 or scalar list's receiver is in local `lIdx`: `.pop()` or `.get` call `callIx`
+// (`getIdx` the index, or -1). Returns 0 with the element, its niche or its null box (`nulBox`, a
+// value position) on the stack; 1 when a statement pop left none; or -1.
+export function popScalarTail(
+  callIx: i32,
+  recvIx: i32,
+  lIdx: i32,
+  wrapTy: i32,
+  popBack: i32,
+  getIdx: i32,
+  nulBox: boolean,
+  fnIx: i32,
+) {
+  // A pop the checker typed as the element itself, under a `.length` test of its receiver
+  // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
+  if getIdx < 0 && nodeTyExcludesNull(callIx) {
+    if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+    return 0
+  }
+  // A boolean list pops checked on its i32 niche (null is 2), so an empty pop yields the
+  // sentinel instead of trapping.
+  if listElemIsBool(recvIx, fnIx) {
+    return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 2)
+  }
+  // i32/i64/f64/f32 have no spare bit pattern for absence, so at a value position their
+  // `T | null` is the shared value box; a statement keeps the raw form. A tagged set's member id
+  // is an `i32`, boxed as one.
+  if nulBox {
+    const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
+    if pnk >= 0 {
+      return emitPopNulBox(lIdx, wrapTy, popBack, pnk, getIdx, fnIx)
+    }
+  }
+  // An atom list reads checked on the -1 sentinel below every interned id, at a statement too,
+  // since the read itself traps (D1281).
+  if tyNulLitUnionInner(nodeTyIxOf(callIx)) {
+    return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 0 - 1)
+  }
+  // A number statement pop has no null cell to answer with: it pops under the length test and
+  // drops the element itself, leaving an empty list as it is (D8360).
+  if !nulBox && getIdx < 0 { return popDropTail(lIdx, wrapTy, popBack) }
+  if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+  return 0
 }
 
 // A `.get` of a view reads its refreshed snapshot (D3028, D3041): sync the scalar view of

@@ -7,6 +7,7 @@ import { mfCallbackLocal } from "./emit_union_casts"
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
 import { BinExpr, Call, Index, Member, P, WhileStmt, nodeAt } from "./ast"
+import { fbDrop } from "./emit_bytes"
 import {
   OImm,
   RListEq,
@@ -51,7 +52,7 @@ import {
   mapFilterPlanOf,
   mfLoopTail,
   mfRecvTail,
-  popDropTail,
+  popScalarTail,
   pushAppendTail,
   pushValueTail,
   rawStrGetTail,
@@ -122,6 +123,7 @@ function lowerList(r: Rhs): i32 {
   if r is RStrOp { return lowerStr(r) }
   if r is RListEq { return lowerListEq(r) }
   if r is RListPush { return lowerPush(r, true) }
+  if r is RListPop { return lowerPop(r, true) }
   if r is RMapFilter { return lowerMapFilter(r) }
   if !(r is RListGet) { return irLMiss("list rhs") }
   const from = irLAt()
@@ -200,8 +202,9 @@ export function irLowerRefListSet(n: SListSet, at: i32): i32 {
   return 0
 }
 
-// `RListPop`: the receiver held or staged as for a push, then legacy's checked take-and-drop.
-function lowerPop(r: RListPop): i32 {
+// `RListPop`: the receiver held or staged as for a push, then legacy's scalar pop tail, at a value
+// position when `want`.
+function lowerPop(r: RListPop, want: boolean): i32 {
   const fnIx = irLFn().irAt
   const pq = popPlanOf(r.lqAt, fnIx)
   if pq == null { return irLMiss("pop plan") }
@@ -214,14 +217,26 @@ function lowerPop(r: RListPop): i32 {
     stageListRecvTail(pq.pqRecv, fnIx, pq.pqBase)
     lIdx = pq.pqBase + 3
   }
-  popDropTail(lIdx, pq.pqWrap, pq.pqBack)
+  // A statement drops what the tail left, as legacy's statement caller does.
+  const got = popScalarTail(
+    r.lqAt,
+    pq.pqRecv,
+    lIdx,
+    pq.pqWrap,
+    pq.pqBack,
+    -1,
+    want,
+    fnIx,
+  )
+  if got < 0 { return -1 }
+  if !want && got == 0 { fbDrop() }
   return 0
 }
 
 // A list op in statement position.
 export function irLowerRefEffect(r: Rhs): i32 {
   if r is RListPush { return lowerPush(r, false) }
-  if r is RListPop { return lowerPop(r) }
+  if r is RListPop { return lowerPop(r, false) }
   if r is RStrOp && r.soOp == "acc" { return lowerStr(r) }
   return irLMiss("effect outside I1")
 }

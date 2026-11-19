@@ -436,6 +436,33 @@ print(ap(3))
   },
 });
 
+// A `.pop()` over a number or boolean list, at a value position or as a statement, along legacy's
+// scalar pop tail: the element when the checker proved it, else its null box or niche.
+Deno.test({
+  name: "ir shadow: a scalar list pop, value or statement, is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function last(xs: i32[]): i32 {
+  if xs.length > 0 { return xs.pop() }
+  return 0
+}
+function opt(xs: f64[]): f64 | null { return xs.pop() }
+function drop(bs: boolean[]): i32 {
+  bs.pop()
+  return bs.length
+}
+print(last([1, 2]))
+print(opt([]) == null)
+print(drop([true]))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want the three functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A packed byte list's element reads unsigned into an i32 along legacy's scalar read tail.
 Deno.test({
   name: "ir shadow: a packed byte element read is covered and matched",
