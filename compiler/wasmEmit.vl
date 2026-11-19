@@ -32914,130 +32914,180 @@ export function listElemStaysNullable(exprIx: i32, fnIx: i32) {
   return false
 }
 
+// The plan list `.slice` call `callIx` is lowered by: the receiver's wrapper and backing heap types
+// and the `.map`/`.filter` frame's source and result locals. `slFail` is the refusal to raise, or
+// "row" where the receiver's ref-list row does not resolve.
+export type SlicePlan = {
+  slFail: string,
+  slRecv: i32,
+  slWrap: i32,
+  slBack: i32,
+  slSrcL: i32,
+  slDstL: i32,
+  slTwo: boolean,
+}
+
+function slRefused(why: string): SlicePlan {
+  const p: SlicePlan = {
+    slFail: why,
+    slRecv: -1,
+    slWrap: -1,
+    slBack: -1,
+    slSrcL: -1,
+    slDstL: -1,
+    slTwo: false,
+  }
+  return p
+}
+
+// The plan of list `.slice` call `callIx`, asked where legacy's arm asks it; it mints nothing.
+export function arrSlicePlanOf(callIx: i32, fnIx: i32): SlicePlan {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 {
+    return slRefused("emitProgram: expected an array slice call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) {
+    return slRefused("emitProgram: .slice receiver is not a member access")
+  }
+  const recvK = mfRecvKindOf(callee.memObj, fnIx)
+  if recvK == null {
+    return slRefused("emitProgram: .slice receiver is not a supported list")
+  }
+  let srcSlot = -1
+  if recvK == "reflist" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
+  // A packed receiver's slot is its row, which keys its scratch frames.
+  if recvK == "u8list" { srcSlot = exprPackedRow(callee.memObj, fnIx) }
+  const p = slRefused("")
+  // The element kind's wrapper + backing heap types.
+  const rek = numListElemOf(recvK)
+  if rek != null {
+    p.slWrap = scalarListWrap(rek, 0)
+    p.slBack = scalarListBack(rek, 0)
+  } else if recvK == "reflist" {
+    if !rlRowsMinted() {
+      return slRefused(
+        "emitProgram: .slice over a ref list but ref list type not collected",
+      )
+    }
+    if srcSlot < 0 { return slRefused("row") }
+    p.slWrap = rlWrapIdx[srcSlot]
+    p.slBack = rlBackIdx[srcSlot]
+  } else if recvK == "strlist" {
+    p.slWrap = mkListTy()
+    p.slBack = mkArrTy()
+  } else if recvK == "u8list" {
+    // the packed byte list (D1141): a `(array (mut i8))` backing under the `$bl8`
+    // wrapper, the arm this ladder needs since `mfRecvKindOf` would otherwise answer
+    // `"list"` for a `u8[]` receiver and mint the new list over the wrong 4-byte
+    // backing. `array.copy` below is i8-to-i8, so the elements survive the copy.
+    p.slWrap = pkWrapAt(srcSlot)
+    p.slBack = pkBackAt(srcSlot)
+  } else {
+    p.slWrap = lTy()
+    p.slBack = aTy()
+  }
+  p.slSrcL = mfSrcLocalFor(recvK, srcSlot)
+  p.slDstL = mfDstLocalFor(recvK, srcSlot)
+  if !fnUses.mapFilter || p.slSrcL < 0 || p.slDstL < 0 {
+    return slRefused("emitProgram: .slice scratch frame not reserved")
+  }
+  p.slRecv = callee.memObj
+  p.slTwo = c.callArgs.length == 2
+  return p
+}
+
 // Lower an array `xs.slice(start, end?)` onto `body`, leaving a new list wrapper of the
 // same element kind over the half-open clamped range `[start, end)` (JS semantics). Rides
 // the `.map`/`.filter` scratch frame (`srcL`/`dstL` plus four i32 temps), evaluating the
 // receiver once into `srcL`; works across i32/boolean, f64, ref and string lists.
 function emitArrSlice(callIx: i32, fnIx: i32) {
+  const p = arrSlicePlanOf(callIx, fnIx)
+  if p.slFail == "row" { return refListRowRefused(p.slRecv) }
+  if p.slFail != "" { return emitFail(p.slFail) }
   const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      const recvK = mfRecvKindOf(callee.memObj, fnIx)
-      if recvK == null {
-        return emitFail("emitProgram: .slice receiver is not a supported list")
-      }
-      let srcSlot = -1
-      if recvK == "reflist" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
-      // A packed receiver's slot is its row, which keys its scratch frames.
-      if recvK == "u8list" { srcSlot = exprPackedRow(callee.memObj, fnIx) }
-      // The element kind's wrapper + backing heap types.
-      let wrap = -1
-      let back = -1
-      const rek = numListElemOf(recvK)
-      if rek != null {
-        wrap = scalarListWrap(rek, 0)
-        back = scalarListBack(rek, 0)
-      } else if recvK == "reflist" {
-        if !rlRowsMinted() {
-          return emitFail(
-            "emitProgram: .slice over a ref list but ref list type not collected",
-          )
-        }
-        if srcSlot < 0 { return refListRowRefused(callee.memObj) }
-        wrap = rlWrapIdx[srcSlot]
-        back = rlBackIdx[srcSlot]
-      } else if recvK == "strlist" {
-        wrap = mkListTy()
-        back = mkArrTy()
-      } else if recvK == "u8list" {
-        // the packed byte list (D1141): a `(array (mut i8))` backing under the `$bl8`
-        // wrapper, the arm this ladder needs since `mfRecvKindOf` would otherwise answer
-        // `"list"` for a `u8[]` receiver and mint the new list over the wrong 4-byte
-        // backing. `array.copy` below is i8-to-i8, so the elements survive the copy.
-        const sr = exprPackedRow(callee.memObj, fnIx)
-        wrap = pkWrapAt(sr)
-        back = pkBackAt(sr)
-      } else {
-        wrap = lTy()
-        back = aTy()
-      }
-      const srcL = mfSrcLocalFor(recvK, srcSlot)
-      const dstL = mfDstLocalFor(recvK, srcSlot)
-      if !fnUses.mapFilter || srcL < 0 || dstL < 0 {
-        return emitFail("emitProgram: .slice scratch frame not reserved")
-      }
-      // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
-      // closure ref. So slice has THREE i32 temps: `startL`, `endL`, and `auxL` which
-      // holds the length during clamping then is reused for the out length.
-      const startL = mfScratchBase + 0
-      const endL = mfScratchBase + 1
-      const auxL = mfScratchBase + 2
-      // src = <receiver>, evaluated ONCE. A NARROWED nullable list recovers non-null at
-      // EVERY element kind (`srcL` is declared non-null and `struct.get wrap` demands it),
-      // not just the i32 one — see `nulRecvNeedsRecover`.
-      if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
-      svSyncRecv(callee.memObj, fnIx)
-      // The receiver and both bounds reach the stack before the frame is written: the frame
-      // is shared, so a slice, `.map` or `.filter` in an argument would overwrite it (D2332).
-      if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      if c.callArgs.length == 2 {
-        if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
-        fbLocalSet(endL)
-      }
-      fbLocalSet(startL)
-      fbLocalSet(srcL)
-      // auxL = src.len (the wrapper's logical length, field 1)
-      fbLocalGet(srcL)
-      fbStructGet(wrap, 1)
-      fbLocalSet(auxL)
-      // start = clamp(rawStart, len)
-      emitClampLocal(startL, auxL)
-      fbLocalSet(startL)
-      // end = clamp(rawEnd, len), or len when omitted (the 1-arg form slices to the end)
-      if c.callArgs.length == 2 {
-        emitClampLocal(endL, auxL)
-        fbLocalSet(endL)
-      } else {
-        fbLocalGet(auxL)
-        fbLocalSet(endL)
-      }
-      // auxL (len now dead) = outLen = max(end - start, 0) = select(end-start, 0, end>start)
-      fbLocalGet(endL)
-      fbLocalGet(startL)
-      fbI32Bin(107) // i32.sub → end - start  [a]
-      fbI32Const(0) // [b]
-      fbLocalGet(endL)
-      fbLocalGet(startL)
-      fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
-      fbSelect()
-      fbLocalSet(auxL)
-      // dst backing = array.new_default <back> outLen
-      fbLocalGet(auxL)
-      fbArrayNewDefault(back)
-      fbLocalSet(dstL)
-      // result wrapper = struct.new <wrap> (dstBacking, outLen, outLen) — pushed FIRST so
-      // it remains on the stack after the trailing `array.copy` consumes its own operands.
-      fbLocalGet(dstL)
-      fbLocalGet(auxL)
-      fbLocalGet(auxL)
-      fbStructNew(wrap)
-      // array.copy dst 0 src.backing start outLen
-      fbLocalGet(dstL)        // dest backing
-      fbI32Const(0)           // dest offset
-      fbLocalGet(srcL)
-      fbStructGet(wrap, 0)    // src backing
-      fbLocalGet(startL)      // src offset
-      fbLocalGet(auxL)        // count
-      fbArrayCopy(back, back) // array.copy (dest type, src type)
-      // The result wrapper from `struct.new` above is the value left on the stack.
-      return 0
-    }
-    return emitFail("emitProgram: .slice receiver is not a member access")
+  if !(c is Call) {
+    return emitFail("emitProgram: expected an array slice call")
   }
-  return emitFail("emitProgram: expected an array slice call")
+  // The receiver and both bounds reach the stack before the frame is written: the frame
+  // is shared, so a slice, `.map` or `.filter` in an argument would overwrite it (D2332).
+  if emitExpr(p.slRecv, fnIx) < 0 { return -1 }
+  sliceRecvTail(p, fnIx)
+  for a in c.callArgs {
+    if emitExpr(a, fnIx) < 0 { return -1 }
+  }
+  return arrSliceTail(p)
+}
+
+// After a list `.slice` receiver: its recovery, non-null at every element kind (`srcL` is declared
+// non-null; `nulRecvNeedsRecover`), and the scalar-view sync.
+export function sliceRecvTail(p: SlicePlan, fnIx: i32) {
+  if nulRecvNeedsRecover(p.slRecv, fnIx) { fbRefAsNonNull() }
+  svSyncRecv(p.slRecv, fnIx)
+  return 0
+}
+
+// A list `.slice` over its receiver and bounds on the stack: the clamped range copied into a new
+// list of the receiver's kind, left on the stack.
+export function arrSliceTail(p: SlicePlan): i32 {
+  const wrap = p.slWrap
+  const back = p.slBack
+  const srcL = p.slSrcL
+  const dstL = p.slDstL
+  // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
+  // closure ref. So slice has THREE i32 temps: `startL`, `endL`, and `auxL` which
+  // holds the length during clamping then is reused for the out length.
+  const startL = mfScratchBase + 0
+  const endL = mfScratchBase + 1
+  const auxL = mfScratchBase + 2
+  if p.slTwo { fbLocalSet(endL) }
+  fbLocalSet(startL)
+  fbLocalSet(srcL)
+  // auxL = src.len (the wrapper's logical length, field 1)
+  fbLocalGet(srcL)
+  fbStructGet(wrap, 1)
+  fbLocalSet(auxL)
+  // start = clamp(rawStart, len)
+  emitClampLocal(startL, auxL)
+  fbLocalSet(startL)
+  // end = clamp(rawEnd, len), or len when omitted (the 1-arg form slices to the end)
+  if p.slTwo {
+    emitClampLocal(endL, auxL)
+    fbLocalSet(endL)
+  } else {
+    fbLocalGet(auxL)
+    fbLocalSet(endL)
+  }
+  // auxL (len now dead) = outLen = max(end - start, 0) = select(end-start, 0, end>start)
+  fbLocalGet(endL)
+  fbLocalGet(startL)
+  fbI32Bin(107) // i32.sub → end - start  [a]
+  fbI32Const(0) // [b]
+  fbLocalGet(endL)
+  fbLocalGet(startL)
+  fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
+  fbSelect()
+  fbLocalSet(auxL)
+  // dst backing = array.new_default <back> outLen
+  fbLocalGet(auxL)
+  fbArrayNewDefault(back)
+  fbLocalSet(dstL)
+  // result wrapper = struct.new <wrap> (dstBacking, outLen, outLen) — pushed FIRST so
+  // it remains on the stack after the trailing `array.copy` consumes its own operands.
+  fbLocalGet(dstL)
+  fbLocalGet(auxL)
+  fbLocalGet(auxL)
+  fbStructNew(wrap)
+  // array.copy dst 0 src.backing start outLen
+  fbLocalGet(dstL)        // dest backing
+  fbI32Const(0)           // dest offset
+  fbLocalGet(srcL)
+  fbStructGet(wrap, 0)    // src backing
+  fbLocalGet(startL)      // src offset
+  fbLocalGet(auxL)        // count
+  fbArrayCopy(back, back) // array.copy (dest type, src type)
+  // The result wrapper from `struct.new` above is the value left on the stack.
+  return 0
 }
 
 // Push `elem(i)` — `src.backing[i]` — onto the stack (`ref.as_non_null` for a ref
