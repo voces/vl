@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR function values, step 1:** the IR builds a local or parameter holding a closure, a capture-free function name or literal read as a value (`RMakeClo`), and a call through a closure binding (`RCallRef`) where legacy writes the plain `call_indirect` (`callRefPlainKey`). A direct call passes a callee's null environment and a lifted callee's parameter captures (`caEnv`, `caCaps`), a `const` bound to a lifted lambda writes nothing, and a nested function declaration writes nothing. `RCallRef` joins the claimed `closure` family. Byte-identical; the distilled corpus covers 455 more functions (30,648 → 31,103).
