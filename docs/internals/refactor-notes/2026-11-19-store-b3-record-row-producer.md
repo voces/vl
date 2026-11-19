@@ -24,7 +24,7 @@ literal with the same field names (`ftShapeLitsOf`, indexed once per decision):
   - `named-function-record-beside-hole-handed-two-functions` P {idf} stays late: `hand1`'s
     `{ f: g }` has an open field. It is also the grading cell for the coupling, and it runs.
   - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-  - Full @run A/B: see the PR.
+  - Full @run A/B over 6,760 programs: 0 RC, wasm or output movers.
 
 ## Next in this stage
 - D15923: an outer literal whose field is a named call's result holding the set's records.
