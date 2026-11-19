@@ -390,6 +390,8 @@ import {
   isStorageRead,
   litRepTyAt,
   litRepUnionAt,
+  luOvOn,
+  luOvTyOf,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -5887,6 +5889,11 @@ export function forInWalkKind(iterIx: i32, fnIx: i32): VKind | null {
 // that instance reads it unnarrowed, else the storage `readContainerTyAt` reads.
 function forInIterTyAt(iterIx: i32, fnIx: i32): i32 {
   const r = unwrapParen(iterIx)
+  // A union walk's arm reads the iterable at that arm.
+  if luOvOn != 0 {
+    const ov = luOvTyOf(r)
+    if ov >= 0 { return ov }
+  }
   const el = elabClosedTyAt(r, fnIx)
   if el >= 0 && elabNarrowedFromAt(r, fnIx) == -1 { return el }
   return readContainerTyAt(iterIx, fnIx)
@@ -10157,6 +10164,30 @@ export function armSiteRecv(ix: i32): i32 {
   return -1
 }
 
+// The map arms of a `for` over `iter` that a pin typed over a union of maps, which its instance
+// walks per arm (`emitMapUnionFor`); empty for any other loop or inside one arm's walk.
+export function lmForUnionArms(iter: i32, fnIx: i32): i32[] {
+  const none: i32[] = []
+  if (
+    fnIx < 0
+    || iter < 0
+    || iter >= P.nodes.length
+    || !(nodeAt(iter) is Ident)
+  ) {
+    return none
+  }
+  if luOvOn != 0 && luOvTyOf(iter) >= 0 { return none }
+  if !exprUnion(iter, fnIx) { return none }
+  const arms = ctnArmsAt(nodeTyAt(iter, fnIx))
+  if arms.length == 0 || !(tyAt(arms[0]) is TyMap) { return none }
+  return arms
+}
+
+// The rep the value union of map arms `arms` is held at: a `for k, v` over them binds `v` there.
+export function lmForValKind(arms: i32[]): VKind | null {
+  return repSigKindOfTy(luElemTy(arms))
+}
+
 // Whether `ix` is an element read of a union-of-containers box that a pin typed and its
 // instance reads per arm: a re-readable receiver.
 export function luArmIndexReads(ix: i32, fnIx: i32): boolean {
@@ -11168,6 +11199,12 @@ function unionNameOfExprGo(exprIx: i32, fnIx: i32) {
   return ""
 }
 
+// A tagged set's `F | null` is stored as its nullable id, `i32 | null`; any other type is itself.
+export function nulTagIdRepTy(t: i32): i32 {
+  const n = if t >= 0 && t < T.tys.length { tyAt(t) } else { null }
+  return if n is TyNullable && n.nInner >= 0 && fnTagTyIsTagged(n.nInner) { mkNullableTy(TY_I32) } else { t }
+}
+
 // The union name a call `e` returns: a declared callee's annotated or inferred return, then the
 // checker's recorded type, each beside the row its type keys to. "" when the result is not a
 // union. A call whose name would carry no row is a floor (`callNameFloor`).
@@ -11193,7 +11230,7 @@ function unionNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
         if arw >= 0 {
           // The call's own type, or its literal leaves widened, stands for the annotation's row
           // where the two fold to one row; a literal-union annotation folds to its base's.
-          const cty = nodeTyIxOf(unwrapParen(exprIx))
+          const cty = nulTagIdRepTy(nodeTyIxOf(unwrapParen(exprIx)))
           if unRowOfTyKey(cty) == arw || unRowOfTyKey(widenLitTy(cty)) == arw {
             unNameRowLast = arw
             return tyNameOf(fn.fnRet)

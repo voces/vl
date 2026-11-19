@@ -16245,7 +16245,16 @@ function monoStoredFnListLits(
 function monoMapStoredFields(stored: i32[][], name: string): i32[][] {
   const out: i32[][] = []
   for s in stored {
-    const lit = nodeAt(unwrapParen(s[0]))
+    // A stored read of a binding never rewritten, bound to a record literal, holds that literal's
+    // fields (D16202).
+    const sx = unwrapParen(s[0])
+    const sdi = if sx >= 0 && nodeAt(sx) is Ident { identDeclOf(sx) } else { -1 }
+    const sd = if sdi >= 0 { nodeAt(sdi) } else { null }
+    const sOnce = sd is LetDecl
+      && sd.letType < 0
+      && (sd.letKw == "const" || monoLetWholeWrites(sdi).length == 0)
+    const li = if sOnce && sd is LetDecl { unwrapParen(sd.letInit) } else { sx }
+    const lit = nodeAt(li)
     if lit is ObjLit {
       for fi in lit.objFields {
         const f = nodeAt(fi)
@@ -16342,6 +16351,17 @@ function monoUncalledSlotFnTy(at: i32, path: string[], vals: i32[][]): i32 {
     if x >= 0 && nodeAt(x) is Ident && !monoTyClosedFn(nodeTyIxOf(x)) {
       elabValueSlotNote(x, at, path)
       monoReachNote(x, true)
+      // So is the function a binding it reads, never rewritten, holds from its initialiser (D16202).
+      const xdi = identDeclOf(x)
+      const xd = if xdi >= 0 { nodeAt(xdi) } else { null }
+      const xOnce = xd is LetDecl
+        && xd.letType < 0
+        && (xd.letKw == "const" || monoLetWholeWrites(xdi).length == 0)
+      const xi = if xOnce && xd is LetDecl { unwrapParen(xd.letInit) } else { -1 }
+      if xi >= 0 && nodeAt(xi) is Ident && !monoTyClosedFn(nodeTyIxOf(xi)) {
+        elabValueSlotNote(xi, at, path)
+        monoReachNote(xi, true)
+      }
     }
   }
   return ft
@@ -21507,6 +21527,17 @@ function monoPinAnnotatedParam(
         return 0
       }
     }
+  }
+  // A map of a tagged set's ids handed to a map of the type parameter is pinned at the set, as a
+  // bare tagged set is at `T`, so the instance is the one the elaboration keys (D14433).
+  const mapArg = if tp == "" { monoArgTaggedSetTy(args[i]) } else { -1 }
+  const mapOwn = nodeTyIxOf(unwrapParen(args[i]))
+  const mapSet = if tp != "" { -1 } else if mapArg >= 0 && monoTagMapTy(mapArg) { mapArg } else if monoTagMapTy(mapOwn) { mapOwn } else { -1 }
+  if mapSet >= 0 && monoAnnHasTyParam(p.parType, -1, fn.fnTyParams) {
+    pinned.push(tyToStr(mapSet))
+    pinTys.push(mapSet)
+    pinOwn.push(mapSet)
+    return 0
   }
   if tp == "" {
     // A composite annotation riding type params (`Box<T>`): bind them by
