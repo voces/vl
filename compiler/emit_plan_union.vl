@@ -217,6 +217,7 @@ import {
   RNullable,
   RpPrim,
   boxAtomKindOfMemberTy,
+  boxTagOfPrim,
   boxTagOfTy,
   fieldElemTyIn,
   msHasPlainValKind,
@@ -257,9 +258,11 @@ import {
   fl32Ty,
   fl64Ty,
   fnNestUsed,
+  fnStmts,
   il64Ty,
   lTy,
   mkListTy,
+  monoOrigNode,
   pkKindOfRow,
   pkRowOfKind,
   pkTwinCodeOfRow,
@@ -3069,4 +3072,71 @@ export function memFieldUnionBox(memIx: i32, fnIx: i32): boolean {
   if si < 0 || si >= sHeapIdx.length { return false }
   const sf = sFieldIndex(si, m.memProp)
   return sf >= 0 && sFieldIsUnionBox(si, sf)
+}
+
+// Does the function being emitted declare type parameters? The dead-atom elision is
+// bounded to these: only a generic instance can carry an `is` arm the instantiation makes
+// constant-false, and only there is the name-keyed union lookup single-valued.
+function fnHasTyParams(fnIx: i32): boolean {
+  const fp = fnStmtsPosOf(fnIx)
+  if fp < 0 { return false }
+  if fp >= fnStmts.length { return false }
+  const f = nodeAt(fnStmts[fp])
+  if f is FuncDecl {
+    if f.fnTyParams.length > 0 { return true }
+  }
+  // A monomorphized instance has no type params of its own — `mkFunc(instName, noTyParams, …)`
+  // strips them — so the instance must be recognised through its template. Without this the
+  // bound never fires for the very shape it exists to admit.
+  if fp < monoOrigNode.length {
+    const o = monoOrigNode[fp]
+    if o >= 0 {
+      const of = nodeAt(o)
+      if of is FuncDecl { return of.fnTyParams.length > 0 }
+    }
+  }
+  return false
+}
+
+// Lower the narrowed value-union ident read at `ix` (active narrowing = a single scalar member,
+// arriving as its ABI kind `ak`): push the box, `struct.get $box 1` for the `anyref` payload,
+// then recover the atom's rep — a `ref.cast (ref $sTypeIdx)` for a string payload, stored
+// unboxed, or a `ref.cast (ref $vb)` plus `struct.get $vb 0` for a scalar in its value box.
+// The atom kind an identifier read on `identReadArmOf`'s `unbox` arm reads out of its union box,
+// or -1 for a dead generic narrow, which reads `unreachable`: a type parameter narrowed to an
+// impossible arm type-checks, and its arm is constant-false there (D947).
+export function identUnboxAtomOf(ix: i32, fnIx: i32): i32 {
+  const vak = identReadAtomKindAt(ix, fnIx)
+  if vak < 0 { return -1 }
+  if (
+    fnHasTyParams(fnIx)
+    && unionTyHasValueKind(unionBoxTyOfRead(ix, fnIx), vak) == 0
+  ) {
+    return -1
+  }
+  return vak
+}
+
+// Whether union type `ty` has an arm of value kind `vak`, by its member set's banked kinds: 0 only
+// when every member is a bare primitive or `null` and none is `vak`. A set the bank does not
+// cover, or a member a kind cannot rule out (a record, list, closure or nested union), answers 1.
+function unionTyHasValueKind(ty: i32, vak: i32): i32 {
+  const ks: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) || ks.length < 2 { return 1 }
+  for k in ks {
+    if k == vak || !valueKindIsPlainScalar(k) { return 1 }
+  }
+  return 0
+}
+
+// Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
+function valueKindIsPlainScalar(k: i32): boolean {
+  if k < 0 { return false }
+  const ps: PrimName[] = [
+    "i32", "i64", "f32", "f64", "boolean", "string", "null",
+  ]
+  for p in ps {
+    if boxTagOfPrim(p) == k { return true }
+  }
+  return false
 }
