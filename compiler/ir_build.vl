@@ -83,11 +83,9 @@ import {
   GlobalCtx,
   HoleBox,
   PrintArm,
-  arrLitArmOf,
-  arrLitBuildOf,
-  arrLitRefPlainSlot,
   arrLitShort,
   atomEqPlanOf,
+  atomStrPlanOf,
   binNulTestOf,
   binNumWidth,
   boxOwedAt,
@@ -113,9 +111,7 @@ import {
   holeBoxPlanOf,
   holeBoxTyAt,
   identReadArmOf,
-  identReadIsList,
   idxStorePlainWhy,
-  idxStorePlanOf,
   ifExprPlainKind,
   ifWritesElse,
   irEnvCached,
@@ -124,7 +120,6 @@ import {
   isRecvStageRep,
   isVariantTagPlain,
   keptDeclStoresNothing,
-  listReserveScan,
   lowMemFoldsCallee,
   mapGetOrHelperRoute,
   mapKeyArmOf,
@@ -134,7 +129,6 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
-  narrowedArmNeedsUnbox,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
   nulNoneEqSides,
@@ -145,11 +139,8 @@ import {
   numIntrPlanOf,
   numLitAsApplies,
   numLitLexAt,
-  popPlanOf,
-  popStmtPlainWhy,
   printArmOf,
   pushPlainWhy,
-  pushPlanOf,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
@@ -159,6 +150,18 @@ import {
   tplStrHoleOf,
   widenPlanOf,
 } from "./wasmEmit"
+import { arrLitRefPlainSlot } from "./emit_plan_list"
+import { narrowedArmNeedsUnbox } from "./emit_plan_union"
+import {
+  arrLitArmOf,
+  arrLitListBuild,
+  identReadIsList,
+  idxStorePlanOf,
+  listReserveScan,
+  popPlanOf,
+  popStmtPlainWhy,
+  pushPlanOf,
+} from "./emit_plan_list"
 import {
   RAtom,
   RBox,
@@ -180,6 +183,7 @@ import {
   captureNamesOf,
   declaredIndexAt,
   envSlotShift,
+  exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
@@ -1490,6 +1494,19 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   ) {
     if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
   }
+  // An atom at a string, or its `K | null` at a `string | null`, is legacy's atom decode.
+  const sr = irBOpRep(v)
+  if (
+    repNodeAt(sr) is RAtom && (repPrim(dst) == "str" || strNullable(dst))
+    || atomNullable(sr) && strNullable(dst)
+  ) {
+    if !exprIsLitAtom(ix, ibFnIx) { return irBMiss("atom string source") }
+    // The decode's `null` comes from the plan, which the verifier cannot see.
+    if atomStrPlanOf(ix, ibFnIx, false).apNul && !strNullable(dst) {
+      return irBMiss("atom decode nullable into a non-null string")
+    }
+    return repTemp(b, { sxV: v, sxAt: ix }, ix, dst)
+  }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
   if sk < 0 || dk < 3 { return v }
@@ -1632,10 +1649,10 @@ function nulTest(
 }
 
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32,
-// string or plain ref list, each element delivered at the list's element rep. Every other arm is a
-// named miss.
+// string, packed or plain ref list, each element delivered at the list's element rep. Every other
+// arm is a named miss.
 function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
-  const lb = arrLitBuildOf(ix, ibFnIx)
+  const lb = arrLitListBuild(ix, ibFnIx)
   const arm = arrLitArmOf(ix, ibFnIx, lb)
   // A ref list builds along `emitArrRef`'s plain arm (`arrLitRefPlainSlot`) or not at all.
   if arm == "ref" && arrLitRefPlainSlot(ix, ibFnIx, lb) < 0 {
@@ -1648,6 +1665,7 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     && arm != "f32"
     && arm != "str"
     && arm != "ref"
+    && arm != "u8"
   ) {
     return irBMiss("array " + arm)
   }
@@ -1656,7 +1674,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   }
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array rep") }
-  const er = ln.rlsElem
+  // A packed list's elements are built as plain i32s, which its backing truncates.
+  const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   for e in n.arrElems {
     const v = deliver(b, e, er)
