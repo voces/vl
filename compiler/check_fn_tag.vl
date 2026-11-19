@@ -861,6 +861,9 @@ type FtRec = {
   storeTys: i32[],
   // List literals written whole into a held list of lists, each beside the holder's declaration.
   whole: i32[],
+  // Record literals holding a list of lists written whole over a held binding, each beside that
+  // binding's declaration (D16920).
+  fieldWhole: i32[],
   // The record literals held through a field naming a function.
   named: i32[],
   // The record literals written into a holder's slot or pushed onto one.
@@ -888,6 +891,7 @@ function ftRecNew(): FtRec {
     storeLits: [],
     storeTys: [],
     whole: [],
+    fieldWhole: [],
     named: [],
     written: [],
     inits: [],
@@ -964,6 +968,31 @@ function ftApply(rootIx: i32, calls: i32[], mint: i32[]) {
     if t >= 0 { recLitFnFieldsRestamp(ftP.inits[wi], t) }
     wi = wi + 2
   }
+  // A record holding a list of lists written whole over a held binding is built at the binding's
+  // rep, its lists at that rep's fields, as its initialiser is (D16821, D16920).
+  let fw = 0
+  while fw + 1 < ftP.fieldWhole.length {
+    const hr = fnTagHeldRepOf(ftP.fieldWhole[fw + 1])
+    if hr >= 0 { ftRecListsAtRep(ftP.fieldWhole[fw], hr) }
+    fw = fw + 2
+  }
+  return 0
+}
+
+// Builds record literal `l` at record rep `hr`, and each list-of-lists literal in its fields at
+// that field of `hr`.
+function ftRecListsAtRep(l: i32, hr: i32) {
+  const ln = nodeAt(l)
+  if !(ln is ObjLit) { return 0 }
+  repStampHeldRead(l, hr)
+  for f in ln.objFields {
+    const fn = nodeAt(f)
+    const v = if fn is FieldInit { parenPeelIx(fn.fiValue) } else { -1 }
+    if fn is FieldInit && v >= 0 && ftWholeListOfLists(v) {
+      const ft = tyFieldTyOf(hr, fn.fiName)
+      if ft >= 0 { fnTagHeldWrittenInner(v, ft, 0) }
+    }
+  }
   return 0
 }
 
@@ -1003,6 +1032,39 @@ function ftWrittenWholeNote(l: i32, h: i32) {
     ftP.whole.push(d)
   }
   return 0
+}
+
+// Notes record literal `l`, written whole over the binding `x` reads, when a field holds a list
+// of lists: it is built at the binding's rep.
+function ftWrittenFieldListsNote(l: i32, x: i32) {
+  const ln = if l >= 0 && l < P.nodes.length { nodeAt(l) } else { null }
+  const d = if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident { identDeclOf(x) } else { -1 }
+  if !(ln is ObjLit) || d < 0 { return 0 }
+  for f in ln.objFields {
+    const fn = nodeAt(f)
+    const v = if fn is FieldInit { parenPeelIx(fn.fiValue) } else { -1 }
+    if (
+      fn is FieldInit
+      && v >= 0
+      && ftWholeListOfLists(v)
+      && !i32ListHas(ftP.fieldWhole, l)
+    ) {
+      ftP.fieldWhole.push(l)
+      ftP.fieldWhole.push(d)
+      return 0
+    }
+  }
+  return 0
+}
+
+// Whether list literal `v` holds only list literals.
+function ftWholeListOfLists(v: i32): boolean {
+  const n = nodeAt(v)
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return false }
+  for el in n.arrElems {
+    if !(nodeAt(parenPeelIx(el)) is ArrayLit) { return false }
+  }
+  return true
 }
 
 // Notes record literal `l` as written into a holder of the plan in progress.
@@ -2091,7 +2153,10 @@ function ftScan(
             ftP.storeTys.push(nodeTyIxOf(x))
           }
           ftWrittenNote(wx)
-          if recAsgFnWidenedTy(wx) >= 0 { ftWrittenInitNote(x, wx) }
+          if recAsgFnWidenedTy(wx) >= 0 {
+            ftWrittenInitNote(x, wx)
+            ftWrittenFieldListsNote(wx, x)
+          }
           // A list literal of records stored at an element of a held list of lists is built at
           // that element, as a pushed one is (D16858).
           const lx = nodeAt(x)
