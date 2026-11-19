@@ -17,20 +17,25 @@ accumulator (`strAccAppendOk`). In the self-compile the class had 198 first-miss
   builder skips the accumulator (now `string accumulator`) and arms the site's right side.
 - **One shared tail.** `strSiteCatTail(n, mode, binIx)` is `emitStrSiteCat` after its operand
   loop; legacy's site lowering ends through it.
-- **The IR.** `buildStrBin` builds the armed right side as `str.site`, `soAt` the assignment; the
-  store around it is the IR's ordinary local, global or element store. A site whose right side the
-  store did not deliver through `buildStrBin` stays a miss (`string append site`), as does a lowering
-  that finds the site no longer armed.
+- **The IR.** `buildStrBin` asks `strSiteOfRhs` whether its chain is an armed site's right side
+  and builds it as `str.site`, `soAt` the assignment; the store around it is the IR's ordinary
+  local, global or element store. No builder state carries the arm: `assign` checks that its store
+  built the site's node (`siteBuilt`), and a site whose right side was delivered another way stays
+  a miss (`string append site`), as does a lowering the scan does not arm.
 
 ## Coverage
 
 | population | before | after |
 | --- | ---: | ---: |
-| self-compile functions covered | 12,663 of 18,905 | 12,719 of 18,908 |
+| self-compile functions covered | 12,663 of 18,905 | 12,720 of 18,910 |
 | self-compile first-miss `string append in place` | 198 | — |
 | self-compile first-miss `string accumulator` | — | 132 |
-| corpus functions covered (45,675) | BASECORPUS | 31,043 |
+| corpus functions covered (45,675) | 30,703 | 31,043 |
 
 All covered functions verified and matched (shadow mode 1); the mode-3 self-compile is
-byte-identical to the shipped build. Functions gained per compiler line: 56 self-compile over +40
-net compiler lines (54 added, 14 deleted); legacy's lines are moved into the shared tail, not deleted.
+byte-identical to the shipped build. The corpus gain is the census's whole alone-blocked count.
+Functions gained per compiler line: 57 self-compile and 340 corpus over +69 net compiler lines
+(84 added, 15 deleted); legacy's site lines are moved into the shared tail, not deleted.
+
+`ir-identity.sh` against master's seed: identical 9,034, differ 0, self-compile identical;
+`--cases`: identical 7,512, differ 0.
