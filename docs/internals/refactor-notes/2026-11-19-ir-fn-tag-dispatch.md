@@ -27,16 +27,19 @@ generic's still-open parameter.
     included. Legacy's writer opens each arm through it, and the IR's valued `if` opens a string
     out, which only a dispatch makes, through it.
 
-Compiler lines on top of the tag leaf: +248 −34, 214 net (`ir_build.vl` +121, `wasmEmit.vl` +38,
-`ir_lower.vl` +26, `ir_verify.vl` +18, `ir.vl` +10, `lint.vl` +1).
+Compiler lines against master `6949b7666`: +281 −46, 235 net (`ir_build.vl` +121, `wasmEmit.vl`
++48, `ir_lower.vl` +25, `ir_verify.vl` +19, `ir.vl` +18, `emit_classify.vl` +3, `lint.vl` +1).
 
-## Readings
+## Readings (fixpoint seeds, master `6949b7666` against this change)
 
-| reading | tag leaf (#9148) | this change |
+| reading | master | this change |
 | --- | ---: | ---: |
-| corpus functions with no blocker (census) | 32,152 | 33,708 (+1,556) |
-| corpus covered = verified = matched (shadow) | 32,152 | 33,708 (73.8%) |
+| corpus functions with no blocker (census) | 34,229 | 34,582 (+353) |
+| corpus covered = verified = matched (shadow) | | 34,582 (75.7%) |
 
-Remaining in the family: `open local type` 56, `open temp type` 27, `open parameter type` 11,
-`tag dispatch after an operand` 6, `tag dispatch lambda arm` 3, `tag dispatch result` 3, and pairs,
-led by `assignment target + open local type` (112).
+On the tag-leaf base (#9148, before master moved) the same change read 32,152 → 33,708 (+1,556);
+lanes merged since unblocked many of the same functions' other blockers, so +353 is the count
+this change alone owns against master.
+
+Remaining in the family: `open local type` 71, `open temp type` 43, `open parameter type` 28,
+`tag dispatch after an operand` 6, `tag dispatch lambda arm` 3, `tag dispatch result` 3.
