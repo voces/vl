@@ -170,18 +170,18 @@ Deno.test({
 });
 
 // Outside the set: a string coalesce whose default is no literal, a closure parameter and an
-// `as` conversion each leave their function uncovered, named.
+// `as?` conversion each leave their function uncovered, named.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A conversion by `as` is outside the set too.
+    // A conversion by `as?`, whose result is a box, is outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv(x: i32): f64 { return x as f64 }
+function cv(x: f64): i32 | null { return x as? i32 }
 print(greet("a", "!"))
 print(ap((x: i32) => x + 1))
-print(cv(3))
+print(cv(3.0))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -363,6 +363,23 @@ Deno.test({
   fn: () => {
     const src = `function ln(x: i32): i32[][] { return [[x], [x, x]] }
 print(ln(2)[1].length)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A short packed list literal builds along `emitArrU8`'s shared tail and matches legacy's bytes;
+// an empty one returned at its destination is the self-compile's common spelling.
+Deno.test({
+  name: "ir shadow: a short u8 list literal is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function e(): u8[] { return [] }
+print(e().length)
 `;
     const { rows } = run(src, true);
     if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
