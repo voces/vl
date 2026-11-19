@@ -410,7 +410,7 @@ print(e().length)
 });
 
 // An append and a prepend site in a loop build their right side through `emitStrSiteCat`'s
-// shared tail and match legacy's bytes; the loop accumulator stays a named miss.
+// shared tail and match legacy's bytes.
 Deno.test({
   name: "ir shadow: a string append site is covered and matched",
   ignore,
@@ -448,6 +448,36 @@ print(at(bs, 0))
     const { rows } = run(src, true);
     if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
       throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A proven loop accumulator, local or module, appends its parts through `emitStrAccAppend`'s
+// shared tail and matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a string accumulator append is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let g = ""
+function acc(xs: string[]): string {
+  let s = "<"
+  for x in xs { s = s + x + "," }
+  return s
+}
+function bump(n: i32) {
+  let i = 0
+  while i < n {
+    g = g + "g"
+    i = i + 1
+  }
+}
+bump(2)
+print(acc(["p", "q"]) + g)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
