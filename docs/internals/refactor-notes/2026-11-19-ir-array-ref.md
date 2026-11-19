@@ -18,7 +18,11 @@ scalar writers (IR2 agreed the order).
   variant coercion, no record twin, no narrowed unbox, and no list element a non-list slot does
   not hold. `arrRefSlotPlain` is `arrRefSlotOf`'s slot without its refusals; legacy keeps them.
 - **One shared tail.** `arrLitRefShortTail` writes the backing, length, capacity and wrapper;
-  legacy's `emitArrRef` ends through it, and the chunked build through `arrLitLenCap`.
+  the chunked build ends through `arrLitLenCap`.
+- **Legacy consumes the decision.** `emitArrRef` asks `arrLitRefPlainSlot` first and, where it
+  names the literal's slot, writes each element with `emitExpr` and ends through the shared tail;
+  only the other literals take its per-element ladder. One decision serves both emitters, so an arm
+  added to `emitArrRefElem` later cannot leave the IR shipping uncoerced bytes (review, option b).
 - **The IR.** `arrayLit` builds a ref list along that decision, each element delivered at the
   list's element rep; `makeList` writes the shared tail. Every other ref literal misses as before.
 
@@ -31,7 +35,10 @@ scalar writers (IR2 agreed the order).
 | self-compile functions covered (18,842) | 12,655 | 12,680 |
 | self-compile first-miss `array ref` | 108 | 8 |
 
-Functions gained per compiler line: 76 over +66 net (92 added, 26 deleted), about 1.15. Most of
+Functions gained per compiler line: 76 over +74 net (100 added, 26 deleted), about 1.0. Of
+legacy's lines, 26 are deleted from `emitArrRef`'s and `arrRefSlotOf`'s bodies, against the
+decision (`arrLitRefPlainSlot`, `arrRefSlotPlain`) and tail (`arrLitRefShortTail`) moved into
+shared functions both emitters call. Most of
 the 251 functions `array ref` no longer blocks alone stop at their next class instead.
 
 ## Bars
