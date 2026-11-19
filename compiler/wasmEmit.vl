@@ -1079,7 +1079,6 @@ import {
   fnReturnsLitAtom,
   fnValuePlain,
   forInElemKind,
-  forInMapRecv,
   forInPairValsSlot,
   globalCellKind,
   globalCellStructIdx,
@@ -33110,17 +33109,21 @@ function pushListBacking(lIdx: i32, lTy: i32) {
 // stashed (`mapRecv >= 0`): field 1 for a vals walk, field 0 for a keys walk — not
 // re-emitted, so the walked list, tombstone `live[]` and loop bound stay on one object.
 function emitForInList(iterIx: i32, fnIx: i32, mapRecv: i32, mwShape: i32) {
-  if mapRecv >= 0 {
-    cmSlot = mwShape
-    if forInWalksMapValues(iterIx, fnIx) { return pushMapVals() }
-    return pushMapKeys()
-  }
+  if mapRecv >= 0 { return forInMapList(iterIx, fnIx, mwShape) }
   const prevLit = gForIterLit
   gForIterLit = unwrapParen(iterIx)
   const rc = emitExpr(iterIx, fnIx)
   gForIterLit = prevLit
   if rc < 0 { return -1 }
   return svSyncRecv(iterIx, fnIx)
+}
+
+// A map walk's list off the stashed map `mapRef` of shape `mwShape`: its values list for a
+// `.values()` walk, else its keys list.
+export function forInMapList(iterIx: i32, fnIx: i32, mwShape: i32) {
+  cmSlot = mwShape
+  if forInWalksMapValues(iterIx, fnIx) { return pushMapVals() }
+  return pushMapKeys()
 }
 
 // Whether function `fnIx` (at `fnStmts` position `fnPos` when inferred) declares a ref-list result.
@@ -36342,10 +36345,10 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
   return svSyncRecv(iterIx, fnIx)
 }
 
-// Why `for` statement `s` at `stmtIx` is not the plain walk, or "": an i32 or string list, or a
-// string's code points, read once into its temp, no second name, no map or byte source, no
-// literal iterable, no slot pinned by node, and a body that may reallocate a list, so its header
-// is re-read each step and nothing is hoisted or unrolled.
+// Why `for` statement `s` at `stmtIx` is not the plain walk, or "": an i32 or string list, a
+// string's code points, or a map's keys or values, read once into its temp, no second name, no
+// byte source, no literal iterable, no slot pinned by node, and a body that may reallocate a list,
+// so its header is re-read each step and nothing is hoisted or unrolled ("hoisted" otherwise).
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
@@ -36353,7 +36356,6 @@ export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if ek != "i32" && ek != "str" { return "element " + ek }
   if forInU8Src(s.fiIter, fnIx) { return "byte source" }
   if s.fiVar2 != "" { return "pair" }
-  if forInMapRecv(s.fiIter, fnIx) >= 0 { return "map" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if nodeAt(unwrapParen(s.fiIter)) is ArrayLit { return "literal" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
@@ -36434,8 +36436,13 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
 // The stash is per loop, never the shared mapRef, which any map op in the body rewrites
 // (D2313). Writes `lp.mwShape` and `lp.fiMap`; returns -1 when the receiver fails, else 0.
 function emitForInMapStash(fnIx: i32, lp: ForInLoop): i32 {
-  lp.mwShape = mapShapeFoldSet(mapShapeOfExpr(lp.mapRecv, fnIx))
   if pushMapRecvRef(lp.mapRecv, fnIx) < 0 { return -1 }
+  return forInMapStash(fnIx, lp)
+}
+
+// After a map walk's receiver `(ref $map)`: the walk's stash, through the op's mapRef.
+export function forInMapStash(fnIx: i32, lp: ForInLoop): i32 {
+  lp.mwShape = mapShapeFoldSet(mapShapeOfExpr(lp.mapRecv, fnIx))
   cmSlot = lp.mwShape
   setMapRef() // mapRef — read by `emitForInList`, before any body op rewrites it
   lp.fiMap = forInMapStashSlot(cmMapTy())
