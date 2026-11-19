@@ -47,6 +47,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  condLitTrue,
   i32ToStr,
   nodeAt,
 } from "./ast"
@@ -75,6 +76,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCoalAtomStr,
   RCoalStr,
   RFnId,
   RGetField,
@@ -95,6 +97,7 @@ import {
   RMapSet,
   RNulTest,
   RNullOf,
+  RNumCast,
   RNumIntr,
   RNumWiden,
   RPrimOp,
@@ -198,27 +201,35 @@ import {
   atomEqTail,
   atomStrPlanOf,
   atomStrTail,
-  binNulTestOf,
+  boxTagIsTail,
+  coalAtomStrClose,
+  coalAtomStrOpen,
+  coalAtomStrReserve,
   coalNulRefBranch,
   coalNulRefOpen,
-  coalResultKindOf,
-  coalesceNulStrStaysNullable,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapNew,
-  emitNullAt,
-  emitNullForRet,
+  emitNullOwn,
+  emitNullRetTail,
   emitReadRecover,
-  emitStaticLitAtom,
   emitStrLitAt,
   f64RemCallTail,
   f64RemOperandTail,
   fallThroughPadOf,
+  forInBreakOpen,
+  forInCopiesHead,
+  forInCopiesOf,
+  forInCopiesTail,
+  forInCopyClose,
+  forInCopyCount,
+  forInCopyOpen,
+  forInHeaderHoist,
   forInListStore,
   forInListSync,
   forInLoopClose,
-  forInLoopOpen,
+  forInRolledOpen,
   hoistCandRow,
   hoistReadTail,
   hoistRowMark,
@@ -229,7 +240,6 @@ import {
   holeBoxTyAt,
   idxRowsOn,
   initBitOf,
-  localNulStrRecovers,
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
@@ -244,17 +254,19 @@ import {
   narrowedFieldTail,
   narrowedVariantRepIs,
   narrowedVariantTail,
-  nulTestArmOf,
   nulTestAtomTail,
   nulTestRefTail,
+  numCastTail,
   numIntrTail,
   numWidenTail,
   printArmOf,
+  printAtomTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarTail,
   printStrTail,
   promoSlotIn,
+  staticAtomId,
   structFieldPlain,
   structFieldTail,
   uBoxNewIsLast,
@@ -265,9 +277,16 @@ import {
   userGlobalWriteClass,
   variantFieldPlain,
   variantFieldTail,
-  variantTagTail,
   voidTailCallee,
 } from "./wasmEmit"
+import { nullRetPlanOf } from "./emit_plan_null"
+import {
+  binNulTestOf,
+  coalResultKindOf,
+  coalesceNulStrStaysNullable,
+  localNulStrRecovers,
+  nulTestArmOf,
+} from "./emit_plan_null"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
 import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
@@ -288,6 +307,8 @@ import {
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
+  loopBrkDepth,
+  loopContDepth,
   sTy,
   shIdxFrom,
   shIdxNode,
@@ -525,6 +546,15 @@ function rhs(r: Rhs, tail: boolean) {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
     }
+    RCoalAtomStr => {
+      const e = nodeAt(r.zaAt)
+      if !(e is BinExpr) { return irLMiss("atom coalesce node") }
+      coalAtomStrReserve()
+      irLOpnd(r.zaL)
+      coalAtomStrOpen(e)
+      irLOpnd(r.zaD)
+      coalAtomStrClose(e, lw.irAt)
+    }
     RCoalStr => {
       coalNulRefOpen(sTy(), coalesceNulStrStaysNullable(r.czAt, lw.irAt))
       irLOpnd(r.czL)
@@ -538,6 +568,10 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
     }
+    RNumCast => {
+      irLOpnd(r.ncV)
+      numCastTail(r.ncAt, lw.irAt)
+    }
     RToBox => boxOp(r)
     RAtomStr => {
       irLOpnd(r.sxV)
@@ -549,11 +583,11 @@ function rhs(r: Rhs, tail: boolean) {
     RNulTest => nulTestOp(r)
     RNullOf => {
       leaf()
-      emitNullAt(r.nuAt, lw.irAt)
+      emitNullOwn(r.nuOwn)
     }
     RTest => {
       irLOpnd(r.teV)
-      variantTagTail(r.teTarget)
+      boxTagIsTail(r.teTag)
     }
     RBoxField => boxField(r)
     RBoxNarrow => boxNarrow(r)
@@ -816,9 +850,9 @@ function makeList(r: RMakeList) {
   return arrLitShortTail(arm, r.mlElems.length)
 }
 
-// `SForIn`: legacy's plain walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at
-// the element variable's slot, the list stored, the cursor, the body's index hoists (none for a
-// body that is not hoist-safe), the loop around the IR's body, and the scope closed.
+// `SForIn`: legacy's walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at the
+// element variable's slot, the list stored, its header hoist, the cursor, the body's index hoists,
+// the IR's body in each unrolled copy and the rolled loop, and the scope closed.
 function forIn(n: SForIn, pending: i32[]) {
   const fnIx = lw.irAt
   if n.xfAt < 0 { return irLMiss("walk node") }
@@ -840,28 +874,98 @@ function forIn(n: SForIn, pending: i32[]) {
   cond(n.xfList, pending)
   if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
   forInListStore(s.fiIter, fnIx, lp)
+  forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
   const h = irLoopHoistOpen(-1, s.fiBody, s.fiDecl1, s.fiDecl2)
-  if h != 0 { return irLMiss("walk hoists") }
+  if h < 0 { return irLMiss("walk hoists") }
   scopeBind(s.fiVar, vSlot)
-  const d0 = ctrlDepth
-  const seq = forInLoopOpen(s, fnIx, lp)
+  let d0 = ctrlDepth
+  forInBreakOpen(s)
+  const kb = walkFrames(n, d0)
+  // The unrolled copies, each the IR's body over the element its copy binds.
+  const c = forInCopiesOf(s, fnIx, lp)
+  const marks = tempMarks()
+  if c != null {
+    d0 = ctrlDepth
+    forInCopiesHead(c)
+    const kh = walkFrames(n, d0)
+    let k = 0
+    while k < forInCopyCount() {
+      d0 = ctrlDepth
+      forInCopyOpen(s, c, k)
+      const kc = walkFrames(n, d0)
+      tempMarksRestore(marks)
+      body(n.xfBody, false, -1)
+      framesPop(kc)
+      forInCopyClose(c)
+      k = k + 1
+    }
+    framesPop(kh)
+    forInCopiesTail(c)
+  }
+  d0 = ctrlDepth
+  const seq = forInRolledOpen(s, lp)
   if seq == -2 { return irLMiss("walk loop") }
-  // A branch out of the body counts the blocks and loop legacy opened around it.
-  const opened = ctrlDepth - d0
-  let k = 0
-  while k < opened {
-    lwFrames.push(-1)
-    k = k + 1
-  }
+  const kr = walkFrames(n, d0)
+  tempMarksRestore(marks)
   body(n.xfBody, false, -1)
-  while k > 0 {
-    lwFrames.pop()
-    k = k - 1
-  }
+  framesPop(kr)
+  framesPop(kb)
   forInLoopClose(s, lp, seq)
   loopHoistClose(h)
   scopeUnbind()
+  return 0
+}
+
+// Pushes a frame for each block legacy opened past depth `d0`: the walk's break block and its
+// current continue target carry its labels. Returns the count, for `framesPop`.
+function walkFrames(n: SForIn, d0: i32): i32 {
+  const brkAt = if loopBrkDepth.length > 0 { loopBrkDepth[loopBrkDepth.length - 1] } else { -1 }
+  const contAt = if loopContDepth.length > 0 { loopContDepth[loopContDepth.length - 1] } else { -1 }
+  let k = 0
+  while d0 + k < ctrlDepth {
+    const at = d0 + 1 + k
+    lwFrames.push(
+      if at == brkAt { n.xfBrk } else if at == contAt { n.xfCont } else { -1 },
+    )
+    k = k + 1
+  }
+  return k
+}
+
+// The temps' definition and use marks, so a body lowered once per unrolled copy defines and uses
+// its temps afresh each time.
+type TempMarks = { tmDef: boolean[], tmUsed: boolean[], tmStack: boolean[] }
+
+function tempMarks(): TempMarks {
+  const m: TempMarks = { tmDef: [], tmUsed: [], tmStack: [] }
+  marksCopy(lwTempDef, m.tmDef)
+  marksCopy(lwTempUsed, m.tmUsed)
+  marksCopy(lwStackVal, m.tmStack)
+  return m
+}
+
+function tempMarksRestore(m: TempMarks) {
+  lwTempDef = []
+  lwTempUsed = []
+  lwStackVal = []
+  marksCopy(m.tmDef, lwTempDef)
+  marksCopy(m.tmUsed, lwTempUsed)
+  marksCopy(m.tmStack, lwStackVal)
+  return 0
+}
+
+function marksCopy(from: boolean[], to: boolean[]) {
+  for b in from { to.push(b) }
+  return 0
+}
+
+function framesPop(k: i32) {
+  let i = 0
+  while i < k {
+    lwFrames.pop()
+    i = i + 1
+  }
   return 0
 }
 
@@ -879,6 +983,9 @@ function printOp(r: RPrint) {
   }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
+  if arm == "atom" || arm == "nulAtom" {
+    return printAtomTail(arm, c.callArgs[0], lw.irAt)
+  }
   return printScalarTail(arm)
 }
 
@@ -939,19 +1046,21 @@ function atomEq(r: RAtomEq) {
   ) {
     return irLMiss("atom compare plan")
   }
-  if r.aeStatic == 1 {
-    leaf()
-    emitStaticLitAtom(n.binLeft, p.aqLex, lw.irAt)
-  } else {
-    irLOpnd(r.aeL)
-  }
-  if r.aeStatic == 2 {
-    leaf()
-    emitStaticLitAtom(n.binRight, p.aqLex, lw.irAt)
-  } else {
-    irLOpnd(r.aeR)
-  }
+  if r.aeStatic == 1 { staticSide(r.aeL, p.aqLex) } else { irLOpnd(r.aeL) }
+  if r.aeStatic == 2 { staticSide(r.aeR, p.aqLex) } else { irLOpnd(r.aeR) }
   return atomEqTail(r.aeNe)
+}
+
+// An atom compare's static side: its operand evaluated and dropped unless it is the literal's
+// unread immediate, then the id of the member lexeme `lex`.
+function staticSide(o: Opnd, lex: string) {
+  if o is OImm {
+    leaf()
+  } else {
+    irLOpnd(o)
+    fbDrop()
+  }
+  return staticAtomId(lex)
 }
 
 // `RUnionEq`: both boxes, then legacy's staged compare.
@@ -1043,6 +1152,14 @@ function brDepth(label: i32): i32 {
 }
 
 // Whether `o` is the immediate `true`.
+// Whether the `if` built from node `at` tests the literal `true` (`condLitTrue`); a node that is
+// no `if` statement, a loop's exit or a helper's, has no test of its own to read.
+function testIsLitTrue(at: i32): boolean {
+  if at < 0 || at >= P.nodes.length { return true }
+  const s = nodeAt(at)
+  return if s is IfStmt { condLitTrue(s.ifCond) } else { true }
+}
+
 function isTrue(o: Opnd): boolean {
   return match o {
     OImm => repPrim(o.oiRep) == "bool" && o.oiBits == 1
@@ -1321,7 +1438,8 @@ const IF_VALUED = 2
 
 // Opens `if` node `id` up to its `else`. The loop exit `if c {} else { br L }` is legacy's
 // `eqz; br_if`, and a literal-true test writes no test at all, either for that exit or for an
-// else-less `if`, whose arm runs inline.
+// else-less `if`, whose arm runs inline. A test that is only constant, as a dead null test is,
+// keeps its `if` (`condLitTrue`).
 function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   if id < 0 || id >= lw.irNodes.length { return IF_NOT }
   const n = lw.irNodes[id]
@@ -1330,7 +1448,8 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   const exitBr = n.siThen.length == 0
     && n.siElse.length == 1
     && isBr(n.siElse[0])
-  if isTrue(n.siCond) && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
+  const litTrue = isTrue(n.siCond) && testIsLitTrue(lw.irNodeAt[id])
+  if litTrue && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
     return IF_DONE
@@ -1643,7 +1762,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     if lwSinkFired > 0 {
       irLMiss("null fall-through into the return sink")
     } else {
-      emitNullForRet(f.irAt)
+      emitNullRetTail(nullRetPlanOf(f.irAt))
     }
   } else if pad == "unreachable" {
     fbUnreachable()
