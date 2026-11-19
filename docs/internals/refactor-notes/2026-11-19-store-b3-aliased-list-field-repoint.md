@@ -28,4 +28,4 @@ Witness: `const xs = [id1]; let r = { f: xs }; r = { f: [id2] }; r.f[0](2); r.f[
   and master refuses it. Spellings: the row's witness at two signatures, F2's minimal spelling, a call
   before the re-point, no call of the list, and the twin with no re-point (a `const`).
 - `check-filed-witnesses --strict`: 5,521 graded, 0 moved; D16242 runs as filed.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,769 programs, on master + #9095: 1 mover, the new fixture (RC 1 → 0); 0 wasm or output movers.
