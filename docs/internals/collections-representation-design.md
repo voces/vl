@@ -191,13 +191,15 @@ total([1, 2, 3])
 const xs: {[i32]: i32} = [1, 2, 3]
 // cannot assign i32[] to 'xs' of type {[i32]: i32}
 
-function first(c) { c[0] }
+function first(c) { return c[0] }
 first(m)
-// parameter is indexed with an i32, which is ambiguous between an array and an i32-keyed map
+// runs: the call resolves the i32 index against the argument's kind
 ```
 
-The last line is the inference engine stating that the two types are distinct, and it refuses
-to guess which one a hole means.
+The first two lines keep the types distinct. The last does not need them to be related: an
+un-annotated parameter records the container operations its body applies, and each call resolves
+them against the argument's kind (`docs/internals/refactor-notes/2026-11-19-container-demand.md`).
+So a list, a string or an i32-keyed map can each take the index.
 
 **The interface-by-bound route does not work for built-in methods today.**
 
