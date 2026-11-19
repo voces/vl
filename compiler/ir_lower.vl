@@ -89,11 +89,13 @@ import {
   RListNew,
   RListPop,
   RListPush,
+  RListSlice,
   RMakeClo,
   RMakeList,
   RMakeRec,
   RMapFilter,
   RMapGetOr,
+  RMapHas,
   RMapNew,
   RMapOp,
   RMapSet,
@@ -249,7 +251,15 @@ import {
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
+  mapGetOrArmOf,
   mapGetOrHelperRoute,
+  mapGetOrI32Head,
+  mapGetOrI32Tail,
+  mapGetOrMvHead,
+  mapGetOrMvPlain,
+  mapGetOrMvTail,
+  mapHasTail,
+  mapPrepProbeTail,
   mapRecvIsSet,
   mapRecvKeyTail,
   mapRecvRefTail,
@@ -573,6 +583,7 @@ function rhs(r: Rhs, tail: boolean) {
     RCall => call(r, tail)
     RGlobalGet => globalRead(r.ggSym, r.ggNonNull)
     RMapGetOr => mapGetOr(r)
+    RMapHas => mapHas(r)
     RPrint => irLMiss("print value")
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
@@ -594,8 +605,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet | RListLen | RListPush | RListEq | RStrOp | RMapFilter => irLowerListHook(r)
-    RListPop => irLMiss("pop value")
+    RListGet | RListLen | RListPush | RListPop | RListEq | RStrOp | RMapFilter | RListSlice => irLowerListHook(r)
     RNumWiden => {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
@@ -1058,7 +1068,9 @@ function printOp(r: RPrint) {
   return printScalarTail(arm)
 }
 
-// `RMapGetOr`: legacy's `__map_get_<row>__` helper minted first, then the global, its recovery,
+// `RMapGetOr`, inline: the global, its recovery, the key and the op context, then legacy's probe,
+// its plain read's head, the default and the tail. Otherwise legacy's `__map_get_<row>__` helper
+// minted first, then the global, its recovery,
 // the key and the op context, then the call, as `emitMapGetCall` writes them.
 function mapGetOr(r: RMapGetOr) {
   const fnIx = lw.irAt
@@ -1070,11 +1082,29 @@ function mapGetOr(r: RMapGetOr) {
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
-  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
-  if miss.length != 1 { return irLMiss("map read route") }
+  const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
+  const want = if r.mgForm == 1 { "i32" } else if r.mgForm == 2 { "mv" } else { "helper" }
+  if (
+    arm != want
+    || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+  ) {
+    return irLMiss("map read route")
+  }
   if userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
     return irLMiss("map read of a global not read plainly")
   }
+  if r.mgForm > 0 {
+    const sh = mapRecvShapeOf(rd.idxArr, fnIx)
+    globalRead(r.mgSym, r.mgNonNull)
+    mapRecvRefTail(rd.idxArr, fnIx)
+    irLOpnd(r.mgKey)
+    mapRecvKeyTail(sh)
+    mapPrepProbeTail()
+    if r.mgForm == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+    irLOpnd(r.mgDef)
+    return if r.mgForm == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+  }
+  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
   globalRead(r.mgSym, r.mgNonNull)
   mapRecvRefTail(rd.idxArr, fnIx)
@@ -1082,6 +1112,20 @@ function mapGetOr(r: RMapGetOr) {
   mapRecvKeyTail(mapRecvShapeOf(rd.idxArr, fnIx))
   fbCall(fi)
   return 0
+}
+
+// `RMapHas`: the global, its recovery, the key and the op context, then legacy's probe and hit flag.
+function mapHas(r: RMapHas) {
+  const fnIx = lw.irAt
+  if userGlobalReadClass(r.mhSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map has of a global not read plainly")
+  }
+  const sh = mapRecvShapeOf(r.mhRecv, fnIx)
+  globalRead(r.mhSym, r.mhNonNull)
+  mapRecvRefTail(r.mhRecv, fnIx)
+  irLOpnd(r.mhKey)
+  mapRecvKeyTail(sh)
+  return mapHasTail()
 }
 
 // `RMapSet`: the global, its recovery, the key and the op context, then the value and legacy's

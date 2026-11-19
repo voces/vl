@@ -3,7 +3,9 @@
 # baseline. Fails past the baseline's per-PR tier (+1%), past its factor (1.5x), and when the live
 # set nears the heap's cap. A rise is accepted by `--write-baseline` in the same PR together with a
 # line in scripts/self-compile-ledger.txt naming the PR and the mechanism; the check refuses a
-# baseline whose fuel the ledger's last line does not name.
+# baseline whose fuel the ledger's last line does not name. A coordinator drift refresh (no single
+# mechanism) also gives in its line the cumulative rise since the last owner-ruled baseline; past
+# +3% cumulative it needs an owner ruling, named in the line (docs/internals/merge-queue.md).
 #
 # It is a tripwire, not a measurement. A cost regression does not slow the SOURCE, it
 # slows the compiler BUILT from it — stage 3 runs the old compiler and stays fast, so an
