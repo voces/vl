@@ -5,6 +5,7 @@
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { memNarrowVariantIndex } from "./emit_local_scope"
+import { RRaw, repNodeAt } from "./emit_rep"
 import {
   ArrayLit,
   AsExpr,
@@ -96,6 +97,7 @@ import {
   RNumWiden,
   RPrimOp,
   RPrint,
+  RRawOp,
   RRecover,
   RRetag,
   RStrOp,
@@ -117,6 +119,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRawOp,
   SReturn,
   SSetField,
   SSwitch,
@@ -128,6 +131,12 @@ import {
   repPrim,
 } from "./ir"
 import {
+  fbArrayCopy,
+  fbArrayGet,
+  fbArrayInitData,
+  fbArrayLen,
+  fbArrayNewDefault,
+  fbArraySet,
   fbBlock,
   fbBr,
   fbBrIf,
@@ -149,14 +158,23 @@ import {
   fbLocalIsUnsetRef,
   fbLocalRun,
   fbLocalSet,
+  fbLocalTee,
   fbLoop,
   fbRefAsNonNull,
+  fbRefCast,
+  fbRefEq,
+  fbRefIsNull,
+  fbRefNull,
   fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
+  fbStructGet,
   fbStructNew,
+  fbStructSet,
   fbUnreachable,
+  wSLEB,
   wTarget,
+  wU8,
   wULEB,
 } from "./emit_bytes"
 import {
@@ -523,7 +541,50 @@ function rhs(r: Rhs, tail: boolean) {
       leaf()
       emitMapNew(r.mnAt, lw.irAt)
     }
+    RRawOp => rawOp(r)
   }
+}
+
+// A helper's raw value instruction: its operands, then the one writer it names.
+function rawOp(r: RRawOp) {
+  if r.rwArgs.length == 0 { leaf() }
+  for a in r.rwArgs { irLOpnd(a) }
+  const h = r.rwHeap
+  match r.rwOp {
+    "struct.get" => fbStructGet(h, r.rwImm)
+    "struct.new" => fbStructNew(h)
+    "array.get" => fbArrayGet(h)
+    "array.new_default" => fbArrayNewDefault(h)
+    "array.len" => fbArrayLen()
+    "ref.eq" => fbRefEq()
+    "ref.cast" => fbRefCast(h)
+    "ref.as_non_null" => fbRefAsNonNull()
+    "ref.null" => fbRefNull(h)
+    "ref.is_null" => fbRefIsNull()
+    "call" => fbCall(r.rwImm)
+    "tee" => {
+      const s = varSlot(r.rwImm)
+      if s < 0 { return irLMiss("unmapped slot") }
+      fbLocalTee(s)
+    }
+  }
+  return 0
+}
+
+// A helper's raw instruction that yields nothing; `array.copy`'s source heap is its `srImm`.
+function rawEff(n: SRawOp, pending: i32[]) {
+  lwSeq = []
+  for a in n.srArgs { irLOpnd(a) }
+  irLSettle(pending)
+  const h = n.srHeap
+  match n.srOp {
+    "struct.set" => fbStructSet(h, n.srImm)
+    "array.set" => fbArraySet(h)
+    "array.copy" => fbArrayCopy(h, n.srImm)
+    "array.init_data" => fbArrayInitData(h, n.srImm)
+    "call" => fbCall(n.srImm)
+  }
+  return 0
 }
 
 // Why a read of user global `g` in context `c` is not the IR's to lower, or "" when it is: the
@@ -1063,8 +1124,8 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLMiss("effect outside I1")
     }
     SBlock => {
+      if n.bkOut >= 0 { return valuedBlock(n, pending) }
       irLSettle(pending)
-      if n.bkOut >= 0 { return irLMiss("valued block") }
       // A loop's list-header hoists open before its block, as legacy's do.
       const hoists = irLoopOpenHook(lw.irNodeAt[id])
       if hoists < 0 { return irLMiss("loop hoist prologue") }
@@ -1086,13 +1147,24 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     SForIn => forIn(n, pending)
     SIf => ifNode(n, pending, tail)
     SBr => {
+      if n.brHas {
+        if !lw.irHelper { return irLMiss("valued branch") }
+        cond(n.brVal, pending)
+      }
       irLSettle(pending)
-      if n.brHas { return irLMiss("valued branch") }
       const d = brDepth(n.brLabel)
       if d < 0 { return irLMiss("branch out of its frames") }
       fbBr(d)
     }
-    SReturn => ret(n, pending)
+    SReturn => {
+      // A helper's last value falls through its `end`, as the hand-written bodies did.
+      if lw.irHelper && n.rtHas && id == lw.irBody[lw.irBody.length - 1] {
+        cond(n.rtV, pending)
+        return 0
+      }
+      ret(n, pending)
+    }
+    SRawOp => rawEff(n, pending)
     STrap => {
       irLSettle(pending)
       fbUnreachable()
@@ -1121,6 +1193,21 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
     irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
     return 0
+  }
+  // A helper's `if c { br L }` is the hand-written bodies' `br_if`.
+  if (
+    lw.irHelper
+    && n.siThen.length == 1
+    && isBr(n.siThen[0])
+    && n.siElse.length == 0
+  ) {
+    const b = lw.irNodes[n.siThen[0]]
+    if b is SBr && !b.brHas {
+      cond(n.siCond, pending)
+      const d = brDepth(b.brLabel)
+      if d < 0 { return irLMiss("branch out of its frames") }
+      return fbBrIf(d)
+    }
   }
   cond(n.siCond, pending)
   if exitBr {
@@ -1160,6 +1247,28 @@ function valuedIf(n: SIf, pending: i32[]) {
   body(n.siThen, false, t)
   fbElse()
   body(n.siElse, false, t)
+  lwFrames.pop()
+  fbEnd()
+  lwStackVal[t] = true
+  lwStackLive = lwStackLive + 1
+  pending.push(t)
+  return 0
+}
+
+// A helper's valued block: its out is written by each branch to it and by its last node, and
+// stays on the stack for the out's one later read, as a valued `if`'s does.
+function valuedBlock(n: SBlock, pending: i32[]) {
+  const t = n.bkOut
+  if !lw.irHelper { return irLMiss("valued block") }
+  if varSlot(t) >= 0 || t >= lwStackVal.length {
+    return irLMiss("valued block out")
+  }
+  const vt = valtypeOf(lw.irVars[t].vRep)
+  if vt < 0 { return irLMiss("valued block rep") }
+  irLSettle(pending)
+  fbBlock(vt)
+  lwFrames.push(n.bkLabel)
+  body(n.bkBody, false, t)
   lwFrames.pop()
   fbEnd()
   lwStackVal[t] = true
@@ -1444,21 +1553,20 @@ export function irLowerClaim(
 // Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after
 // its parameters. "" when written, else the miss, with nothing written.
 export function irLowerHelper(f: IrFn, out: u8[]): string {
+  if !f.irHelper { return "not a helper" }
   fnUses.unionSink = false
-  const ctx: GlobalCtx = { gcInStart: false, gcFnPos: -1, gcGuardOff: false }
-  lowerBody(f, ctx)
+  lowerBody(f, lwGlobalCtx)
   const runs: i32[] = []
   let slot = f.irParams.length
   for v in f.irVars {
     if v.vKind == "local" {
-      const t = valtypeOf(v.vRep)
-      if t < 0 || v.vSlot != slot { irLMiss("helper locals") }
+      if v.vSlot != slot { irLMiss("helper locals") }
       slot = slot + 1
-      if runs.length > 0 && runs[runs.length - 1] == t {
+      if runs.length > 0 && runs[runs.length - 1] == v.vRep {
         runs[runs.length - 2] = runs[runs.length - 2] + 1
       } else {
         runs.push(1)
-        runs.push(t)
+        runs.push(v.vRep)
       }
     }
   }
@@ -1466,10 +1574,28 @@ export function irLowerHelper(f: IrFn, out: u8[]): string {
   const locals: u8[] = []
   const prev = wTarget(locals)
   wULEB(runs.length / 2)
-  for x in runs { wULEB(x) }
+  let i = 0
+  while i < runs.length {
+    wULEB(runs[i])
+    helperValtype(runs[i + 1])
+    i = i + 2
+  }
   wTarget(prev)
+  if lwMiss != "" { return lwMiss }
   for x in framed(locals) { out.push(x) }
   return ""
+}
+
+// Writes rep `r`'s valtype: a scalar's, or a raw reference at its heap type.
+function helperValtype(r: i32) {
+  const n = repNodeAt(r)
+  if n is RRaw {
+    wU8(if n.rwNull { 0x63 } else { 0x64 })
+    return wSLEB(n.rwHeap)
+  }
+  const t = valtypeOf(r)
+  if t < 0 { return irLMiss("helper local rep") }
+  return wU8(t)
 }
 
 // The returns that sank into the union return sink in the function being lowered.
