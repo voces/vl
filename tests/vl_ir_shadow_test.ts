@@ -170,18 +170,18 @@ Deno.test({
 });
 
 // Outside the set: a string coalesce whose default is no literal, a closure parameter and an
-// `as` conversion each leave their function uncovered, named.
+// `as?` conversion each leave their function uncovered, named.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
   fn: () => {
-    // A conversion by `as` is outside the set too.
+    // A conversion by `as?`, whose result is a box, is outside the set too.
     const src = `function greet(s: string | null, d: string): string { return s ?? d }
 function ap(f: (x: i32) => i32): i32 { return f(4) }
-function cv(x: i32): f64 { return x as f64 }
+function cv(x: f64): i32 | null { return x as? i32 }
 print(greet("a", "!"))
 print(ap((x: i32) => x + 1))
-print(cv(3))
+print(cv(3.0))
 `;
     const { rc, rows } = run(src, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
@@ -389,10 +389,10 @@ print(e().length)
   },
 });
 
-// A walk's own `break` and `continue` are legacy's branches, and a walk whose body is hoist-safe
-// reads its header once and may unroll: each a named miss, never a byte mismatch.
+// A walk's own `break` and `continue` branch to the frames legacy's loop opens: covered and
+// matched. A walk whose body is hoist-safe reads its header once and may unroll: a named miss.
 Deno.test({
-  name: "ir shadow: a walk's own branch and a hoisted walk are named misses",
+  name: "ir shadow: a walk's own branch is matched, a hoisted walk a named miss",
   ignore,
   fn: () => {
     const src = `function fb(xs: i32[]): i32 {
@@ -417,8 +417,11 @@ function fh(xs: i32[]): i32 {
 print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
 `;
     const { rows } = run(src, true);
-    for (const want of ["uncovered for in break", "uncovered for in continue", "uncovered for in hoisted"]) {
-      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want the two branching walks covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered for in hoisted") !== 1) {
+      throw new Error(`want one "uncovered for in hoisted" row, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
