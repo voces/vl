@@ -524,6 +524,30 @@ run(2.5)
   },
 });
 
+// A record literal on legacy's layout path builds field by field and matches; a field at another
+// arm (here a widened `f64`) stays a named miss.
+Deno.test({
+  name: "ir shadow: a plain record literal builds; a field at a converting arm is a named miss",
+  ignore,
+  fn: () => {
+    const src = `type P = { x: i32, y: string }
+type Q = { w: f64 }
+function mk(a: i32, s: string): P { return { x: a + 1, y: s } }
+function mkq(a: i32): Q { return { w: a } }
+const p = mk(2, "k")
+print(p.x)
+print(p.y)
+print(mkq(3).w)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want mk matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered object field f64") !== 1) {
+      throw new Error(`want mkq a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
 // (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
 // the result's `null`.
