@@ -30,22 +30,22 @@ alone. The IR built `g[k] ?? d` only on legacy's `__map_get_<row>__` helper rout
   in the miss arm, as legacy writes it. The lowering re-asks the arm, and the verifier checks the
   default is at the read's rep.
 
-## Measured on fixpoint seeds: master `58c69581c` against this branch
+## Measured on fixpoint seeds: master `6949b7666` against this branch
 
 | | master | this branch |
 |---|---|---|
-| self-compile functions claimed, of 18,945 | 12,794 | 13,141 |
-| self-compile `map read inline`, alone | 406 | 0 |
-| distilled functions claimed (`--claims`, 0 fell back) | 31,513 | 31,526 |
+| self-compile functions claimed | 14,171 | 14,556 |
+| self-compile `map read inline`, alone | 441 | 0 |
+| distilled functions claimed (`--claims`, 0 fell back), all matched armed | 34,229 | 34,242 |
 
-- **`ir-identity.sh`:** plain and `--names`, 9,034 identical, 0 differ, self-compile identical.
-  `--cases`: 7,512 identical, 0 differ.
+- **`ir-identity.sh`:** plain and `--names`, 9,037 identical, 0 differ, self-compile identical.
+  `--cases`: 7,513 identical, 0 differ.
 - **Mode 3:** 19,079 cells and run cases byte-identical, and the self-compile identical.
-- **Cost:** L2 self-compile fuel, same box against master's seed: 99,569,777,324 → 99,617,080,753
-  (+0.05%).
-- **Lines:** +234 / −54 in `compiler/`. A coverage step: 347 self-compile and 13 distilled functions.
+- **L2 fuel**, same box against master's seed: 100,402,922,530 → 100,434,454,138 (+0.03%).
+- **Lines:** +241 / −60 in `compiler/`. A coverage step: 385 self-compile and 13 distilled functions.
 
 ## What is left
-- `map read receiver` (29 alone, 27 beside `parameter rep map`): a local or parameter map. Legacy
-  reads it the same way; the IR builds only module globals today.
+- `map read receiver`: a local or parameter map. Legacy reads it the same way; the IR builds only
+  module globals today. It is 31 self-compile functions alone (29 more beside `parameter rep map`),
+  and on the distilled corpus 139 alone and 65 beside `read of c`.
 - `map read default computes` (10): a default with more than one node.
