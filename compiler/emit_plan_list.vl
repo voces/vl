@@ -18,6 +18,7 @@ import {
   Member,
   NullLit,
   NumLit,
+  ObjLit,
   P,
   RetStmt,
   Unary,
@@ -26,14 +27,20 @@ import {
   nodeAt,
   nodeSpineChildren,
 } from "./ast"
+import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
 import { nodeCtxTyIxOf } from "./check_core_state"
 import { elabTyClosed } from "./check_elab_cap"
-import { nodeArrayElemIsNulLitUnion, nodeTyExcludesNull, nodeTyIxOf } from "./check_node_tys"
+import {
+  nodeArrayElemIsNulLitUnion,
+  nodeTyExcludesNull,
+  nodeTyIxOf,
+} from "./check_node_tys"
 import { cexLitPeel, intLitIsNegated } from "./check_num_lits"
 import {
   T,
   TyArray,
   TyNullable,
+  mkArrayTy,
   tyAt,
   tyElemOf,
   tyNulLitUnionInner,
@@ -69,16 +76,31 @@ import {
   forInPairValsSlot,
   globalLetOfRead,
   listElemRepIsRow,
+  recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
 } from "./emit_classify"
 import { listElemIsBool } from "./emit_closure_sites"
-import { elabSpreadRunHolderOf } from "./emit_elab"
+import {
+  elabBundleRecordOf,
+  elabSlotRecordListSigs,
+  elabSpreadRunHolderOf,
+  litRepTyAt,
+} from "./emit_elab"
 import { listRepOrNull } from "./emit_list_rep"
-import { arrElemIsNulBoolAt, arrElemIsNulStrAt, arrElemIsNullUnitAt } from "./emit_lit_atoms"
+import {
+  arrElemIsNulBoolAt,
+  arrElemIsNulStrAt,
+  arrElemIsNullUnitAt,
+} from "./emit_lit_atoms"
 import { monoIsClashLit } from "./emit_mono"
 import { refPushScratchBaseFor } from "./emit_mv_slots"
-import { ListBuild, emptyArrHoleBuildKind } from "./emit_ref_list_kinds"
+import {
+  ListBuild,
+  emptyArrHoleBuildKind,
+  listBuildOfTy,
+  listBuildOfTyHeld,
+} from "./emit_ref_list_kinds"
 import { repOfTy, rlElemKindAt } from "./emit_rep"
 import {
   ALK_F64,
@@ -112,6 +134,7 @@ import {
   fl128Ty,
   fl32Ty,
   fl64Ty,
+  heldRepOf,
   i64PushScratchBase,
   ia64Ty,
   il64Ty,
@@ -130,11 +153,17 @@ import {
   v128PushScratchBase,
 } from "./emit_state"
 import { rlElemTyIxAt } from "./emit_struct_order"
-import { forRangeStepIsConst } from "./emit_ty_canon"
+import { forRangeStepIsConst, instanceTyOf } from "./emit_ty_canon"
 import { listIdxKindOf } from "./emit_union_casts"
 import { rlElemUnionName } from "./emit_union_registry"
-import { forInStringSrc, scalarListElemKind, scalarListElemOfListKind } from "./emit_value_sites"
-import { nonNullTy, primNameOf } from "./tyquery"
+import {
+  exprListCellBuildKind,
+  exprListCellBuildSlot,
+  forInStringSrc,
+  scalarListElemKind,
+  scalarListElemOfListKind,
+} from "./emit_value_sites"
+import { nonNullTy, primNameOf, tyHasTyVar } from "./tyquery"
 
 // Every `VKind` the four scalar-list descriptors below do not name, as one answer: a
 // recorded failure plus the i32 list's own index, so the module stays well-formed while the
@@ -181,6 +210,72 @@ export function rlElemArmHeapOf(rslot: i32): i32 {
   if rlElemKindAt(rslot) != RLK_STRUCT { return -1 }
   if rslot >= rlElemHeap.length { return -1 }
   return rlElemHeap[rslot]
+}
+
+// The build pair list literal `arrIx` takes in `fnIx`: its stamp's, else its own shape's.
+export function arrLitListBuild(arrIx: i32, fnIx: i32): ListBuild {
+  // A list holding a tagged set's ids is built at the rep the checker stamped (D15220), and one
+  // whose elements hold a returned record whole at the list of it mono typed it (B2).
+  const held = heldRepOf(arrIx)
+  const recSigs = elabSlotRecordListSigs(arrIx)
+  const recBt = if recSigs.length >= 2 { elabBundleRecordOf(recSigs) } else { -1 }
+  const recTy = if recBt >= 0 { mkArrayTy(recBt) } else { -1 }
+  const tb = arrLitBuild(
+    arrIx,
+    if held >= 0 { held } else if recTy >= 0 { recTy } else { arrLitTyAt(arrIx, fnIx) },
+    fnIx,
+  )
+  if tb != null { return tb }
+  const own: ListBuild = {
+    lbKind: exprListCellBuildKind(arrIx, fnIx),
+    lbSlot: exprListCellBuildSlot(arrIx, fnIx),
+  }
+  return own
+}
+
+// The type list literal `arrIx` builds at in `fnIx`: its stamp, a type parameter in it read at
+// the instance `fnIx` is.
+export function arrLitTyAt(arrIx: i32, fnIx: i32): i32 {
+  return tyAtInstance(litRepTyAt(arrIx, fnIx), fnIx)
+}
+
+// `ty` with its type parameters read at the instance `fnIx` is; `ty` where that leaves one open.
+export function tyAtInstance(ty: i32, fnIx: i32): i32 {
+  if ty < 0 || !tyHasTyVar(ty) { return ty }
+  const it = instanceTyOf(ty, fnIx)
+  if it >= 0 { return it }
+  return ty
+}
+
+// The build pair list literal `arrIx` of type `ty` takes: its type's, else that of the list type
+// its destinations agree on; null, for its own shape's, when the record solve builds its
+// elements at another record (`recBuildRowOf`).
+export function arrLitBuild(arrIx: i32, ty: i32, fnIx: i32): ListBuild | null {
+  const a = nodeAt(arrIx)
+  // Kept until the checker records the list type such elements make (D14381).
+  if (
+    a is ArrayLit
+    && a.arrElems.length > 0
+    && nodeAt(a.arrElems[0]) is ObjLit
+    && recBuildRowOf(a.arrElems[0]) >= 0
+  ) {
+    return null
+  }
+  // A destination's union element boxes the elements, so the list is built at it (D4635).
+  if arrLitUnionDestTaken(arrIx) {
+    const db = listBuildOfTy(tyAtInstance(arrLitDestTy(arrIx), fnIx))
+    if db != null { return db }
+  }
+  // An empty literal's row is its destination's, so its type reads a row and mints none.
+  const dt = tyAtInstance(arrLitDestTy(arrIx), fnIx)
+  if a is ArrayLit && a.arrElems.length == 0 {
+    const hb = listBuildOfTyHeld(ty)
+    if hb != null { return hb }
+    return listBuildOfTyHeld(dt)
+  }
+  const tb = listBuildOfTy(ty)
+  if tb != null { return tb }
+  return listBuildOfTy(dt)
 }
 
 // Whether a non-empty literal's elements are all bare `null`s, so name no element kind.
