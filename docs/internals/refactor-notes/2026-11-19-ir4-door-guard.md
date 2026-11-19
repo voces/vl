@@ -78,4 +78,19 @@ They came from a scratch seed that counts `node-in cursor at head` whenever
 
 ## Measured
 
-BARS
+Fixpoint seeds: master 6949b7666 (byte-identical to the a4ecfb4a3 fixpoint) against this branch on
+the same base.
+
+| bar | result |
+|---|---|
+| `ir-identity.sh` plain / `--names` | identical 9,037, differ 0; self-compile identical |
+| `ir-identity.sh --cases` | identical 7,513, differ 0 |
+| `--claims` / mode 3 | ok / identical |
+| armed shadow | 34,229 covered = verified = matched; ok |
+| L2 fuel | 100,417,958,749: +0.01% on master (100,403,115,591), +0.6% on the baseline file |
+| pin helpers, `emit_mono.vl` | 905 |
+| lint-self, ladder-sets, dead exports | clean / ok / 0 |
+| phase state, late demands | ok (hidden 154) / 9 of baseline 9, 307 tag rows |
+| `deno task test` | 9,570 passed, 0 failed |
+
+**Lines: compiler +40 / −3.** Nothing is deleted or moved. The guard is a precondition.
