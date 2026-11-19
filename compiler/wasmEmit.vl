@@ -29453,6 +29453,8 @@ function emitCallRefArg(
   args: i32[],
   i: i32,
 ) {
+  // Whether the argument takes the general arm with nothing owed (`callRefPlainKey`'s plain path).
+  let argPlainArm = false
   // D940 — the struct row the functype declares, seeded exactly as the direct call
   // seeds it from `paramStructIdxOf`: an object-literal argument otherwise resolves
   // its own row by field set, the pre-merge row wherever the callee's parameter row
@@ -29577,6 +29579,13 @@ function emitCallRefArg(
       // recover a `null` argument into a nullable parameter, a trap (D2552).
       // A narrowed struct argument is unboxed at the key's slot, as a direct call does (D1723).
       const pkOwed = pkk != null && narrowedArmNeedsUnbox(args[i], fnIx)
+      argPlainArm = !pkOwed
+        && (pkk == "i32"
+        || pkk == "i64"
+        || pkk == "f64"
+        || pkk == "f32"
+        || pkk == "str"
+        || pkk == "struct" && !exprNullableRecord(args[i], fnIx))
       const pkHeap = if pkk != null { armDestHeapOf(pkk, sigParamSlotAt(ckey, i)) } else { -1 }
       const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
@@ -29587,6 +29596,7 @@ function emitCallRefArg(
     // The same boundary as a direct call's, keyed off the `$fnsig` param (D2537).
     emitNonNullParamRecover(pkk, args[i], fnIx)
   }
+  if !argPlainArm { callRefArgsPlain = false }
   return 0
 }
 
@@ -29661,6 +29671,7 @@ function emitCallRefUnder(callIx: i32, fnIx: i32) {
     if bun != 1 { return bun }
     const hcall = emitHolderCall(callIx, c, fnIx)
     if hcall != 1 { return hcall }
+    if irShadowOn { callRefLegacyPlain[callIx] = "" }
     // Evaluate the closure once into the call-ref scratch local (`callRefNestSlot`).
     if emitExpr(c.callFn, fnIx) < 0 { return -1 }
     // A NULLABLE function value (`fn | null`, kind 19) loads as `(ref null $cloStruct)`;
@@ -29668,8 +29679,7 @@ function emitCallRefUnder(callIx: i32, fnIx: i32) {
     // null` narrowing), so recover to non-null.
     if exprNulClosure(c.callFn, fnIx) { fbRefAsNonNull() }
     const crDepth = callRefDepth
-    const crSlot = callRefNestSlot(callRefDepth)
-    fbLocalSet(crSlot)
+    const crSlot = callRefStash()
     // the callee's interned `$fnsig` key — from a function-typed annotation, an inferred
     // binding's sig, a field closure's, or a closure-array element's. Its tokens drive
     // argument coercion below and resolve the functype `ref.cast`s to; "" falls back to
@@ -29708,6 +29718,9 @@ function emitCallRefUnder(callIx: i32, fnIx: i32) {
     // A top-level lambda's returned record: the member its use takes, as for a direct call.
     const tfe = topLambdaRecordFe(unwrapParen(c.callFn))
     if tfe >= 0 { return emitBundleResultPick(callIx, tfe, fnIx) }
+    if irShadowOn && callRefLastPlain && !exprNulClosure(c.callFn, fnIx) {
+      callRefLegacyPlain[callIx] = ckey
+    }
     return 0
   }
   return emitFail("emitProgram: expected a call expression")
@@ -29723,10 +29736,9 @@ function emitCallRefAt(
   crDepth: i32,
   crSlot: i32,
 ): i32 {
-  // env = closure.env (field 0).
-  fbLocalGet(crSlot)
-  fbStructGet(cloStructIdx, 0)
-  callRefDepth = crDepth + 1
+  callRefEnvOpen(crSlot, crDepth)
+  const outerPlain = callRefArgsPlain
+  callRefArgsPlain = true
   // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
   // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
   const args = c.callArgs
@@ -29738,6 +29750,9 @@ function emitCallRefAt(
     const bty: i32[] = [0 - 1]
     const bsigs = bundleCallArgSigs(c.callFn, fnIx, i, bty)
     const kt = if bsigs.length > 0 { -1 } else { bundleKeyParamTy(ckey, i, args[i]) }
+    if bsigs.length > 0 || kt >= 0 || emitBundleRecordRead(args[i], fnIx) {
+      callRefArgsPlain = false
+    }
     if bsigs.length > 0 {
       if emitBundleReadArg(args[i], bty[0], bsigs, fnIx) < 0 { return -1 }
     } else if kt >= 0 {
@@ -29758,6 +29773,8 @@ function emitCallRefAt(
     i = i + 1
   }
   callRefDepth = crDepth
+  const argsPlain = callRefArgsPlain
+  callRefArgsPlain = outerPlain
   // The judge let a call whose members return different types through for its set to be
   // tagged; left a closure set, the call would run each member at one signature (D15926).
   if fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx)) {
@@ -29808,11 +29825,53 @@ function emitCallRefAt(
       "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call reads an `i32` result from a wider one",
     )
   }
-  fbLocalGet(crSlot)
-  fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
-  fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
+  callRefCallTail(crSlot, sig, false)
   armTailCallIndirect(sig, sigKeyRetVoid(ckey))
+  callRefLastPlain = argsPlain
   return 0
+}
+
+// A closure call's head and tail, which legacy and the IR both write: the closure on the stack
+// into the stash of the current nesting depth, which `callRefStash` returns.
+export function callRefStash(): i32 {
+  const s = callRefNestSlot(callRefDepth)
+  fbLocalSet(s)
+  return s
+}
+
+// The stashed closure's env, the call's first operand; its arguments are written one nesting
+// depth below `depth`.
+export function callRefEnvOpen(crSlot: i32, depth: i32) {
+  fbLocalGet(crSlot)
+  fbStructGet(cloStructIdx, 0)
+  callRefDepth = depth + 1
+  return 0
+}
+
+// After the arguments: the stashed closure's function index, called at `$fnsig` type `sig`, in
+// its tail form when `tail`.
+export function callRefCallTail(crSlot: i32, sig: i32, tail: boolean) {
+  fbLocalGet(crSlot)
+  fbStructGet(cloStructIdx, 1)
+  if tail {
+    fbReturnCallIndirect(sig, gFnTableIdx)
+  } else {
+    fbCallIndirect(sig, gFnTableIdx)
+  }
+  return 0
+}
+
+// Under the IR shadow, by call, the `$fnsig` key legacy wrote a closure call at with no bundle,
+// coercion or narrowing arm on the way; "" for any other. `callRefPlainKey` must agree.
+let callRefLegacyPlain: {[i32]: string} = Map()
+// Whether the closure call being written took only plain arms for its arguments so far.
+let callRefArgsPlain = true
+// Whether the closure call last written took only plain arms for its arguments.
+let callRefLastPlain = false
+
+// The key legacy wrote closure call `ix` at plainly, under the IR shadow; "" otherwise.
+export function callRefLegacyPlainKey(ix: i32): string {
+  return callRefLegacyPlain[ix] ?? ""
 }
 
 // The `$fnsig` key of call `callIx` in function `fnIx` where legacy writes it as a plain call through
@@ -29840,14 +29899,16 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
   if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
   if holderRecordSigs(d, fnIx).length > 0 { return "" }
-  const target = fnIndexOfInScopeChainAt(
-    sidOfNode(c.callFn),
-    nm,
-    fnIx,
-    c.callFn,
-  )
-  const routed = if target >= 0 { identNameIsLiveBound(nm, fnIx) && identIsBoundClosure(c.callFn, fnIx) } else { unknownCallRoutesRef(c, callee, fnIx) }
-  if !routed || bundleParamOfRead(c.callFn, fnIx) >= 0 { return "" }
+  // A function of the name in scope makes legacy ask its live scope which one the name means.
+  if fnIndexOfInScopeChainAt(sidOfNode(c.callFn), nm, fnIx, c.callFn) >= 0 {
+    return ""
+  }
+  if (
+    !unknownCallRoutesRef(c, callee, fnIx)
+    || bundleParamOfRead(c.callFn, fnIx) >= 0
+  ) {
+    return ""
+  }
   if cloLiftCalleeOf(c.callFn, fnIx) >= 0 || exprNulClosure(c.callFn, fnIx) {
     return ""
   }
