@@ -22002,10 +22002,9 @@ function emitNulNicheEq(binIx: i32, fnIx: i32, niche: EqCmpKind) {
   return emitFail("emitProgram: expected a `==`/`!=` over a nullable niche")
 }
 
-// The `nulstruct` arm of `emitNulNicheEq`. The struct core is RE-READ based by contract
-// (`emitStructEq`: both operands must be pure re-reads, because every field compare
-// re-evaluates the full chain from its root), so there is no single-evaluation form to preserve
-// and the guard is spelled as two null TESTS instead of the `br_on_null` consume.
+// The `nulstruct` arm of `emitNulNicheEq`. The struct core re-reads each operand from its root,
+// so the guard is spelled as two null TESTS over the roots `structEqStage` staged, instead of
+// the `br_on_null` consume.
 function emitNulStructEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
@@ -22040,28 +22039,40 @@ function emitNulStructEq(binIx: i32, fnIx: i32) {
     if !siFound {
       return emitFail("emitProgram: struct equality over a non-struct operand")
     }
-    fbBlock(127) // block i32 — $out
-    if emitEqIsNull(e.binLeft, fnIx) < 0 { return -1 }
-    if emitEqIsNull(e.binRight, fnIx) < 0 { return -1 }
-    fbI32Bin(71) // 0x47 i32.ne — the two sides disagree on nullness
-    fbIf(64)
-    fbI32Const(0)
-    fbBr(1) // → $out
-    fbEnd()
-    if emitEqIsNull(e.binLeft, fnIx) < 0 { return -1 }
-    fbIf(64)
-    fbI32Const(1) // both null ⇒ equal
-    fbBr(1) // → $out
-    fbEnd()
-    const pathSi: i32[] = []
-    const pathFi: i32[] = []
-    if (emitStructEqRec(e.binLeft, e.binRight, si, pathSi, pathFi, fnIx) < 0) {
-      return -1
-    }
-    fbEnd()
-    return 0
+    const savedL = eqStashL
+    const savedR = eqStashR
+    const r = emitNulStructEqAt(e.binLeft, e.binRight, si, fnIx)
+    eqStashL = savedL
+    eqStashR = savedR
+    return r
   }
   return emitFail("emitProgram: expected a nullable-struct equality")
+}
+
+// `emitNulStructEq`'s guard and compare at eq row `si`, over roots staged once (`structEqStage`).
+function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
+  const roots = structEqStage(lIx, rIx, si, fnIx)
+  if roots[0] == -1 { return -1 }
+  const lRoot = roots[0]
+  const rRoot = roots[1]
+  fbBlock(127) // block i32 — $out
+  if emitEqRootIsNull(lRoot, lIx, fnIx) < 0 { return -1 }
+  if emitEqRootIsNull(rRoot, rIx, fnIx) < 0 { return -1 }
+  fbI32Bin(71) // 0x47 i32.ne — the two sides disagree on nullness
+  fbIf(64)
+  fbI32Const(0)
+  fbBr(1) // → $out
+  fbEnd()
+  if emitEqRootIsNull(lRoot, lIx, fnIx) < 0 { return -1 }
+  fbIf(64)
+  fbI32Const(1) // both null ⇒ equal
+  fbBr(1) // → $out
+  fbEnd()
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  if (emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx) < 0) { return -1 }
+  fbEnd()
+  return 0
 }
 
 // True for the `eqCmpKindOfTy` tokens that name a nullable ref niche — the ones whose
@@ -22191,23 +22202,68 @@ function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
 }
 
 // Lower a structural struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1 i32:
-// field-wise compare mirroring the host's `valueEq`. Both operands must be pure re-reads
-// (names / field chains), since every field compare re-evaluates the full chain from its
-// root. Takes `row` rather than re-deriving it — the caller already asked both namespaces (struct and variant) and knows which answered; re-asking loses that (`structIndexOfExpr` alone answers -1 for a variant operand).
+// field-wise compare mirroring the host's `valueEq`. Every field compare re-reads its operand
+// from the root, so an operand that is not a re-readable place is evaluated once into a stash
+// first (`structEqStage`). Takes `row` rather than re-deriving it — the caller already asked both namespaces (struct and variant) and knows which answered; re-asking loses that (`structIndexOfExpr` alone answers -1 for a variant operand).
 function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
+    const savedL = eqStashL
+    const savedR = eqStashR
+    const roots = structEqStage(e.binLeft, e.binRight, row, fnIx)
     const pathSi: i32[] = []
     const pathFi: i32[] = []
-    if (emitStructEqRec(e.binLeft, e.binRight, row, pathSi, pathFi, fnIx) < 0) {
-      return -1
-    }
+    const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
+    eqStashL = savedL
+    eqStashR = savedR
+    if r < 0 { return -1 }
     if e.binOp == "!=" {
       fbI32Eqz() // 0x45 i32.eqz — negate value-equality
     }
     return 0
   }
   return emitFail("emitProgram: expected a struct equality")
+}
+
+// The roots `emitStructEqRec` reads operands `lIx`/`rIx` of a compare at eq row `row` through:
+// a re-readable place as itself, else the stash sentinel (-2 left, -3 right) over a slot
+// `eqStashL`/`eqStashR` now names; `[-1, -1]` on failure. Both are evaluated in source order
+// before either slot is set, so a compare nested in an operand is done with them (D17022).
+function structEqStage(lIx: i32, rIx: i32, row: i32, fnIx: i32): i32[] {
+  const lStage = !unionEqOperandOk(lIx)
+  const rStage = !unionEqOperandOk(rIx)
+  if lStage && emitExpr(lIx, fnIx) < 0 { return [-1, -1] }
+  if rStage && emitExpr(rIx, fnIx) < 0 { return [-1, -1] }
+  let rRoot = rIx
+  if rStage {
+    eqStashR = structEqSlot(row, 1)
+    fbLocalSet(eqStashR)
+    rRoot = -3
+  }
+  let lRoot = lIx
+  if lStage {
+    eqStashL = structEqSlot(row, 0)
+    fbLocalSet(eqStashL)
+    lRoot = -2
+  }
+  return [lRoot, rRoot]
+}
+
+// The stash slot of operand `side` (0 left, 1 right) of a compare at eq row `row`, keyed above
+// the band a nested-shape compare uses.
+function structEqSlot(row: i32, side: i32): i32 {
+  const key = 2048 + side * 1024
+  return if row >= 0 { structEqStashSlot(row + key) } else { unionEqArmSlot(-1 - row + key) }
+}
+
+// `emitEqIsNull` over a compare root: a stashed operand is tested off its slot.
+function emitEqRootIsNull(root: i32, ix: i32, fnIx: i32) {
+  if root == -2 || root == -3 {
+    fbLocalGet(if root == -2 { eqStashL } else { eqStashR })
+    fbRefIsNull()
+    return 0
+  }
+  return emitEqIsNull(ix, fnIx)
 }
 
 // One shape's field-wise compare at path (`pathSi`/`pathFi` from the roots), leaving 0/1:
