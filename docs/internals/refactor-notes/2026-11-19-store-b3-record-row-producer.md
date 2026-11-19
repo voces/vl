@@ -6,13 +6,13 @@ shares a record row together at check, or none of them.
 ## Mechanism
 `ftOpenFieldHolds` runs in the check's retry (`ftUseArrow`) as well as after the elaboration. At
 check it also consults `ftShapeFieldDecidedWith`, which applies two rules to every other record
-literal with the same field names (`ftShapeLitsOf`, indexed once per decision):
+literal with the same field names (`ftShapeLitsOf`, a tree walk from the decision's root, indexed once per decision):
 - **A set at that field:** it is pushed onto `ftSubNeed`, so it is decided with `s`. If any of them
   fails to plan, the whole group stays undecided.
 - **An open field** (a type variable, bound per instance): refuses at check, so the late pass
   decides the row's sets together.
 
-## Measured (master 804aa1262 fixpoint vs this branch's fixpoint)
+## Measured (master 25657b799 fixpoint vs this branch's fixpoint)
 - Running `ftOpenFieldHolds` at check without the shape rule moves 4 rows and breaks
   `functions/named-function-record-beside-hole-handed-two-functions.vl` (validation in `both$1`),
   the D15641 coupling.
@@ -24,7 +24,7 @@ literal with the same field names (`ftShapeLitsOf`, indexed once per decision):
   - `named-function-record-beside-hole-handed-two-functions` P {idf} stays late: `hand1`'s
     `{ f: g }` has an open field. It is also the grading cell for the coupling, and it runs.
   - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-  - Full @run A/B over 6,760 programs: 0 RC, wasm or output movers.
+  - Full @run A/B over 6,761 programs: 0 RC, wasm or output movers.
 
 ## Next in this stage
 - D15923: an outer literal whose field is a named call's result holding the set's records.
