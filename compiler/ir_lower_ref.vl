@@ -10,6 +10,7 @@ import { BinExpr, Index, Member, WhileStmt, nodeAt } from "./ast"
 import { fbDrop } from "./emit_bytes"
 import {
   OImm,
+  RListClear,
   RListEq,
   RListGet,
   RListLen,
@@ -36,6 +37,8 @@ import {
   arrLenTail,
   arrSlicePlanOf,
   arrSliceTail,
+  clearLenTail,
+  clearPlanOf,
   emitArrLenHeld,
   emitClosureValue,
   emitEqNonNullCore,
@@ -233,10 +236,29 @@ function lowerPop(r: RListPop, want: boolean): i32 {
   return 0
 }
 
+// `RListClear`: the receiver held or staged as for a pop, then legacy's length reset.
+function lowerClear(r: RListClear): i32 {
+  const fnIx = irLFn().irAt
+  const p = clearPlanOf(r.lkAt, fnIx)
+  if p.clFail != "" { return irLMiss("clear plan") }
+  let lIdx = listOpRecvHeld(p.clRecv, fnIx, ".clear")
+  if lIdx == -2 { return irLMiss("clear receiver") }
+  if lIdx >= 0 {
+    irLSkip(r.lkV)
+  } else {
+    irLOpnd(r.lkV)
+    const sb = listOpStageBase(p.clBase, p.clRefSlot)
+    stageListRecvTail(p.clRecv, fnIx, sb)
+    lIdx = sb + 3
+  }
+  return clearLenTail(p, lIdx)
+}
+
 // A list op in statement position.
 export function irLowerRefEffect(r: Rhs): i32 {
   if r is RListPush { return lowerPush(r, false) }
   if r is RListPop { return lowerPop(r, false) }
+  if r is RListClear { return lowerClear(r) }
   if r is RStrOp && r.soOp == "acc" { return lowerStr(r) }
   return irLMiss("effect outside I1")
 }
@@ -259,6 +281,8 @@ function lowerListSlice(r: RListSlice): i32 {
   const fnIx = irLFn().irAt
   const p = arrSlicePlanOf(r.scAt, fnIx)
   if p.slFail != "" { return irLMiss("slice plan") }
+  // `arrSliceTail` pops the bounds the plan counts, so the IR's must be that many.
+  if r.scArgs.length != p.slArgs.length { return irLMiss("slice arity") }
   irLOpnd(r.scV)
   sliceRecvTail(p, fnIx)
   for a in r.scArgs { irLOpnd(a) }
