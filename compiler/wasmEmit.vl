@@ -145,6 +145,7 @@ import {
 import { nodeTyProvesNonNull, recArmPartialFields } from "./check_emit_queries"
 import { binPlusIsListByTy } from "./check_leaf_steps"
 import {
+  listArmRecFits,
   numDeliverStamp,
   recFitNarrowedFields,
   recUnionRecMember,
@@ -4815,11 +4816,39 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   if staged && !fnUses.optRecv {
     return emitFailAt("emitProgram: `is` receiver stash not reserved", recv)
   }
+  const si = structIndexOfExpr(recv, fnIx)
+  const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
+  // The instance's type decides: a generic receiver handed `A | null` is nullable there.
+  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
+  if nullable && !exprNullableRefNiche(recv, fnIx) {
+    return emitFail(
+      "emitProgram: `is` over a nullable record that is not a nullable reference",
+    )
+  }
+  if staged {
+    if emitExpr(recv, fnIx) < 0 { return -1 }
+    fbLocalSet(optRecvSlot)
+  }
+  const src = if staged { optRecvSlot } else { -1 }
+  return emitRecordFitCore(recv, src, si, vi, nullable, names, sets, fnIx)
+}
+
+// `emitRecordFitIs`'s field tests over the record `recv` reads (or local `src`, when not -1),
+// laid out as struct `si` or variant `vi`; `names` and `sets` are its narrowed fields.
+function emitRecordFitCore(
+  recv: i32,
+  src: i32,
+  si: i32,
+  vi: i32,
+  nullable: boolean,
+  names: string[],
+  sets: i32[],
+  fnIx: i32,
+): i32 {
+  const staged = src >= 0
   let heap = -1
   const rows: i32[] = []
   const fis: i32[] = []
-  const si = structIndexOfExpr(recv, fnIx)
-  const vi = if si >= 0 { -1 } else { exprVariantIndex(recv, fnIx) }
   if si >= 0 && si < sHeapIdx.length {
     heap = sHeapIdx[si]
     for f in names {
@@ -4841,13 +4870,6 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
   }
   if !laidOut {
     return emitFail("emitProgram: `is` over a record whose layout is not known")
-  }
-  // The instance's type decides: a generic receiver handed `A | null` is nullable there.
-  const nullable = nodeTyIsNullable(recv) || tyAdmitsNull(objTy)
-  if nullable && !exprNullableRefNiche(recv, fnIx) {
-    return emitFail(
-      "emitProgram: `is` over a nullable record that is not a nullable reference",
-    )
   }
   // A field narrowed to a type rather than a literal set is tested by its box's arm tags.
   const fieldTags: i32[][] = []
@@ -4876,12 +4898,8 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
     }
     fieldTags.push(ft)
   }
-  if staged {
-    if emitExpr(recv, fnIx) < 0 { return -1 }
-    fbLocalSet(optRecvSlot)
-  }
   if nullable {
-    if emitRecordFitRecv(recv, fnIx, staged, -1) < 0 { return -1 }
+    if emitRecordFitRecv(recv, fnIx, src, -1) < 0 { return -1 }
     fbRefIsNull()
     fbIf(127)
     fbI32Const(0)
@@ -4896,7 +4914,7 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
         FC_STRUCT,
         if si >= 0 { sFieldStorageSlot(si, fis[k]) } else { uFieldStorageSlot(vi, fis[k]) },
       )
-      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if emitRecordFitRecv(recv, fnIx, src, heap) < 0 { return -1 }
       if nullable && !staged { fbRefAsNonNull() }
       fbStructGet(heap, fis[k])
       fbLocalSet(nslot)
@@ -4909,7 +4927,7 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
     }
     if fieldTags[k].length > 0 {
       // The box ref itself may stand for `null`; a null held in the box is its own arm's tag.
-      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if emitRecordFitRecv(recv, fnIx, src, heap) < 0 { return -1 }
       if nullable && !staged { fbRefAsNonNull() }
       fbStructGet(heap, fis[k])
       fbRefIsNull()
@@ -4918,7 +4936,7 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
       fbElse()
       let ti = 0
       while ti < fieldTags[k].length {
-        if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+        if emitRecordFitRecv(recv, fnIx, src, heap) < 0 { return -1 }
         if nullable && !staged { fbRefAsNonNull() }
         fbStructGet(heap, fis[k])
         fbRefAsNonNull()
@@ -4943,7 +4961,7 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
       if nulStr { nonNullTy(sets[k]) } else { sets[k] },
     )
     if nulStr {
-      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if emitRecordFitRecv(recv, fnIx, src, heap) < 0 { return -1 }
       if nullable && !staged { fbRefAsNonNull() }
       fbStructGet(heap, fis[k])
       fbRefIsNull()
@@ -4954,7 +4972,7 @@ function emitRecordFitIs(isIx: i32, fnIx: i32): i32 {
     }
     let li = 0
     while li < lexes.length {
-      if emitRecordFitRecv(recv, fnIx, staged, heap) < 0 { return -1 }
+      if emitRecordFitRecv(recv, fnIx, src, heap) < 0 { return -1 }
       if nullable && !staged { fbRefAsNonNull() }
       fbStructGet(heap, fis[k])
       if nulStr { fbRefAsNonNull() }
@@ -6154,16 +6172,11 @@ function listFitSlot(kind: ListKind, slot: i32, code: i32): i32 {
   return listIdxScratchBase + liKinds.length
 }
 
-// One read of the record-fit receiver: the stash cast back to `heap` (left uncast when `heap`
-// is -1, for the null test) when `staged`, else the receiver expression itself.
-function emitRecordFitRecv(
-  recv: i32,
-  fnIx: i32,
-  staged: boolean,
-  heap: i32,
-): i32 {
-  if !staged { return emitExpr(recv, fnIx) }
-  fbLocalGet(optRecvSlot)
+// One read of the record-fit receiver: local `src` cast back to `heap` (left uncast when `heap`
+// is -1, for the null test) when it is not -1, else the receiver expression itself.
+function emitRecordFitRecv(recv: i32, fnIx: i32, src: i32, heap: i32): i32 {
+  if src < 0 { return emitExpr(recv, fnIx) }
+  fbLocalGet(src)
   if heap >= 0 { fbRefCast(heap) }
   return 0
 }
@@ -6787,6 +6800,14 @@ function listIsAcrossRepsPlan(
       const slots: i32[] = []
       // A wide numeric arm's element loop reads the arm's own list, so the plan keeps its type.
       if k == LIST_ARM_WIDE { slots.push(a) }
+      // A record-list arm fits when each record does, by its fields (D16989).
+      if k == 0 && listArmRecFits(a, chk) {
+        const rs = unMemRefArrArmSlot(a)
+        if rs < 0 || rs >= rlWrapIdx.length { return false }
+        k = LIST_ARM_RECS
+        slots.push(rs)
+        slots.push(a)
+      }
       if k == 0 {
         // An arm with another tag holds a list whose element type is fixed apart from the
         // test's: it never fits, empty or not (the D16047 refinement). A list of `i32` literals
@@ -6849,6 +6870,66 @@ function emitListWideArmFit(a: i32, leaf: i32, fnIx: i32): i32 {
   )
 }
 
+// Whether every record of record-list arm `a`, stored in ref list `rs` and its payload on the
+// stack, fits record list `chk` by its fields (`emitRecordFitCore`), leaving 0/1 (D16989). An
+// empty list fits.
+function emitListRecArmFit(rs: i32, a: i32, chk: i32, fnIx: i32): i32 {
+  const ae = tyArrayElemIx(a)
+  const si = structIndexOfTy(ae)
+  if si < 0 || si >= sHeapIdx.length {
+    return emitFail(
+      "emitProgram: `is` over a record-list arm whose records have no struct row",
+    )
+  }
+  const names: string[] = []
+  const sets: i32[] = []
+  recFitNarrowedFields(ae, tyArrayElemIx(chk), names, sets)
+  const eL = objOrderStashSlot("nulstruct", FC_STRUCT, si)
+  const wL = listFitSlot("reflist", rs, 11)
+  const bL = listFitSlot("reflist", rs, 3)
+  const nL = listFitSlot("list", 0, 4)
+  const iL = listFitSlot("list", 0, 4)
+  fbRefCast(rlWrapIdx[rs])
+  fbLocalSet(wL)
+  fbLocalGet(wL)
+  fbStructGet(rlWrapIdx[rs], 0)
+  fbLocalSet(bL)
+  fbLocalGet(wL)
+  fbStructGet(rlWrapIdx[rs], 1)
+  fbLocalSet(nL)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  // block (result i32) { loop { 1 if i >= n; 0 unless record i fits; i += 1 } }
+  fbBlock(127)
+  fbLoop(64)
+  fbI32Const(1)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbBrIf(1)
+  fbDrop()
+  fbI32Const(0)
+  fbLocalGet(bL)
+  fbLocalGet(iL)
+  fbArrayGet(rlBackIdx[rs])
+  fbLocalSet(eL)
+  if emitRecordFitCore(-1, eL, si, -1, false, names, sets, fnIx) < 0 {
+    return -1
+  }
+  fbI32Eqz()
+  fbBrIf(1)
+  fbDrop()
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)
+  fbEnd()
+  fbUnreachable()
+  fbEnd()
+  return 0
+}
+
 // The planned test over the non-null box in local `slot`, leaving a 0/1 i32. 0, or -1 on failure.
 function emitListIsAcrossRepsAt(
   slot: i32,
@@ -6896,6 +6977,10 @@ function emitListIsAcrossRepsAt(
         }
       } else if k == LIST_ARM_WIDE {
         if emitListWideArmFit(slotsAt[i][0], chkLeaf, fnIx) < 0 { return -1 }
+      } else if k == LIST_ARM_RECS {
+        if emitListRecArmFit(slotsAt[i][0], slotsAt[i][1], chk, fnIx) < 0 {
+          return -1
+        }
       } else if k == LIST_ARM_NONNULL {
         if emitUnionPayloadUnbox(9) < 0 { return -1 }
         const one = [""]
@@ -6943,6 +7028,7 @@ const LIST_ARM_ATOMS = 4
 const LIST_ARM_NULLS = 5
 const LIST_ARM_NONNULL = 6
 const LIST_ARM_NUMS = 7
+const LIST_ARM_RECS = 8
 
 // How `emitListIsAcrossReps` tests list arm `a` against `chk` when the two share one tag and
 // rep: by `a`'s atoms (filling `slots`), by null elements, by no null element, or 0 when no
@@ -9632,7 +9718,9 @@ function unionBoxHasNoRow(unionName: string, unionTy: i32): boolean {
 function armTagTestHolds(chk: i32, other: i32): boolean {
   if tyFitKind(other, chk) == 1 { return true }
   if tyArrayElemIx(chk) < 0 || tyArrayElemIx(other) < 0 { return false }
-  if listArmFitAcrossReps(other, chk) != 0 { return true }
+  if listArmFitAcrossReps(other, chk) != 0 || listArmRecFits(other, chk) {
+    return true
+  }
   return listArmSharedTagFit(other, chk, []) != 0
 }
 
