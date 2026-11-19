@@ -1,6 +1,6 @@
-# IR: a struct field store through one arm decision and legacy's store tail (2026-11-19, lane DEAD)
+# IR: a struct or variant-param field store through one arm decision and legacy's store tail (2026-11-19, lane DEAD)
 
-`assignment target` blocked 159 self-compile functions alone (on #9146's tree). An instrumented
+`assignment target` blocked 167 self-compile functions alone on master b306ab952. An instrumented
 miss shows every one is a field store, `o.f = v`: the builder's `assign` covered an `Ident` or an
 `Index` target and nothing else, and `SSetField` had a verifier rule but no lowering.
 
@@ -31,33 +31,37 @@ miss shows every one is a field store, `o.f = v`: the builder's `assign` covered
 
 ## Coverage
 
-| reading | #9146's tree | this step | gained |
-|---|---:|---:|---:|
-| self-compile functions the shipped claim emits (`$VL_IR_SHADOW=5`) | 13,747 | 13,840 | +93 |
-| corpus functions covered = matched (`ir-shadow.vl`, 45,678) | 32,189 | 32,211 | +22 |
-| `assignment target` alone, self-compile | 159 | 0 | |
+Measured against master b306ab952's fixpoint seed, after merging it:
 
-That is +151 net compiler lines (+210 −59). No legacy line is deleted or moved to `@ir`.
+| reading | master | this step | gained |
+|---|---:|---:|---:|
+| self-compile functions the shipped claim emits (`$VL_IR_SHADOW=5`) | 14,125 | 14,239 | +114 |
+| corpus functions covered = matched (`ir-shadow.vl`, 45,678) | 33,583 | 33,605 | +22 |
+| `assignment target` alone, self-compile | 167 | 0 | |
+
+That is +197 net compiler lines (+258 −61). No legacy line is deleted or moved to `@ir`.
+
+The struct arm and the variant-param arm are covered. `emitVariantFieldWrite` now ends with the
+shared `fieldStoreVariantTail`, and `fieldStoreVariantValuePlain` mirrors
+`emitVariantFieldStoreVal`'s arms.
 
 Left in the class, as named misses:
-- 45 self-compile functions store through a narrowed union box;
-- 12 store into a variant parameter;
+- 45 self-compile functions store through a narrowed union box. The box is unwrapped between
+  receiver and value, and the receiver is no record rep for `SSetField`'s verifier rule.
 - 3 store a short-circuit value.
-
-The first two go through `emitVariantFieldStoreVal`, a separate value writer: the next step.
 
 ## Bars
 
 | bar | reading |
 |---|---|
-| `ir-identity.sh` plain, #9146's seed against this one | 9,037 identical, 3,267 fail under both, 0 differ; self-compile identical |
+| `ir-identity.sh` plain, master's seed against this one | 9,037 identical, 3,267 fail under both, 0 differ; self-compile identical |
 | `--names` | 9,037 identical, 0 differ; self-compile identical |
-| `--cases` | 7,512 identical, 68 fail under both, 0 differ |
+| `--cases` | 7,513 identical, 68 fail under both, 0 differ |
 | mode 3 over the corpus | 9,037 identical, 0 differ; self-compile identical |
-| armed shadow | 32,211 covered = verified = matched; `ir-shadow: ok`; `--claims` ok |
+| armed shadow | 33,605 covered = verified = matched; `ir-shadow: ok`; `--claims` ok |
 | seed fixpoint | a second refresh is byte-identical |
 | `regress.vl` | 0 runs → not-runs of 260,828 |
-| L2 fuel | +0.9% on the 99.03G baseline the coordinator is refreshing (master drift is most of it) |
-| seed size | +0.8% on its baseline |
+| L2 fuel | +0.3% on the refreshed 99.81G baseline |
+| seed size | +0.9% on its baseline |
 | late demands | 9, baseline 9; late tag rows 307, baseline 307 |
-| lint-self, phase-state, ladder-sets | clean; ok; 59 sets |
+| lint-self, phase-state, ladder-sets | clean; ok; 60 sets |
