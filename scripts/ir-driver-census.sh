@@ -294,12 +294,19 @@ fi | awk -F'\t' -v mode="$mode" -v names="$T/names" '
   END { for (f in s) print "-\t" s[f] "\tdrv " f }
 ' > "$out"
 ONE
+# The corpus beside the self-compile: `$CENSUS_PROGRAMS` names a file with one program path per
+# line (a wider corpus, such as tests/cases, for a dead-code or deletion check); the distilled
+# cells otherwise.
+census_programs() {
+  if [ -n "${CENSUS_PROGRAMS:-}" ]; then grep -v '^[[:space:]]*$' "$CENSUS_PROGRAMS"
+  else ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl; fi
+}
 run() {
   local mode=$1 dir="$T/m$1"
   mkdir -p "$dir"
   VL="$VL" sh "$T/one.sh" "$mode" "$dir/self" "$T/probe.wasm" self
   [ -s "$dir/self" ] || { echo "ir-driver-census: self-compile gave no rows (mode $mode)" >&2; exit 2; }
-  ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl \
+  census_programs \
     | xargs -n 200 -P "$JOBS" sh -c 'VL="$0" sh '"$T/one.sh $mode $dir"'/$$ '"$T/probe.wasm"' "$@"' "$VL"
   cat "$dir"/* > "$T/rows$1"
   rm -rf "$dir"

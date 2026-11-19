@@ -1,4 +1,9 @@
-import { asgNameWiderRow, cloRetValSlot, sTwinRepOf } from "./emit_classify"
+import {
+  asgNameWiderRow,
+  cloRetValSlot,
+  nulTagIdRepTy,
+  sTwinRepOf,
+} from "./emit_classify"
 import { isBlockBody } from "./block_body"
 import { lexOpcode, primOpcode } from "./ir"
 import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
@@ -1157,6 +1162,7 @@ import {
   lmForUnionArms,
   localIndexOf,
   luForElemKind,
+  luForKTy,
   luForUnionIter,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
@@ -2040,6 +2046,18 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
 // stash pass (D1510) can run exactly the same lowering, once per field. The caller has
 // resolved `valIx` and consumed the struct seed; its context is restored on every exit.
 function emitStructFieldValue(si: i32, fi: i32, valIx: i32, fnIx: i32) {
+  // A fresh `Map()` the field's row stores at another map struct than the call builds would not
+  // validate: the row and the call took the value's functions at different reps (D17015).
+  if fieldRowKind(sFieldStart[si] + fi) == "map" && mapNewCallAt(valIx) {
+    const built = mapNewShapeOf(unwrapParen(valIx), fnIx)
+    const held = sFieldMapShape(si, fi)
+    if built != -3 && held != -3 && mapTypeIdxOf(built) != mapTypeIdxOf(held) {
+      return emitFailAt(
+        "emitProgram: a record field holds a fresh `Map()` whose values store functions at one rep while the record's row stores them at another, so the two map types differ; building it at one rep is not done yet",
+        valIx,
+      )
+    }
+  }
   // A holder stored into a field of one closure type stores its record's member of that type.
   const sm = elabStoreMemberOf(nodeSrc[valIx] ?? valIx)
   if sm >= 0 && emitHolderRead(valIx, fnIx) {
@@ -2389,12 +2407,19 @@ function nameUsedAsValueIn(name: string, ix: i32) {
 // the i32 default, so a `call_indirect` traps the signature check at any other type.
 // Reject it as a value unless it is an anonymous lambda used only as a direct-call callee
 // (`criFnIsAnonLambda`), which is sound and routes straight to `emitClosureValueCore`.
-function emitClosureValue(fe: i32, fnIx: i32) {
-  if fnHasUnannotatedParam(fe) {
-    if !criFnIsAnonLambda(fe) { return emitFail(genericFnValueRejectMsg(fe)) }
-  }
+export function emitClosureValue(fe: i32, fnIx: i32) {
+  const why = closureValueWhy(fe)
+  if why != "" { return emitFail(why) }
+  return emitClosureValueOf(cloAdapterCanonOf(fe), fnIx)
+}
 
-  return emitClosureValueCore(fe, fnIx)
+// The refusal `emitClosureValue` raises for function `fe`, or "": a generic function's, then
+// `closureValueCoreWhy`'s.
+export function closureValueWhy(fe: i32): string {
+  if fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe) {
+    return genericFnValueRejectMsg(fe)
+  }
+  return closureValueCoreWhy(fe)
 }
 
 // The closure-value fat pointer for lifted function `fe`: `struct.new $cloStruct [ env, id,
@@ -2402,28 +2427,27 @@ function emitClosureValue(fe: i32, fnIx: i32) {
 // $envStruct` of the enclosing frame's captured values; `id` is the lifted wasm index, the
 // `call_indirect` operand; `decl` is the `==` identity token (`cloDeclOf`).
 export function emitClosureValueCore(fe: i32, fnIx: i32) {
+  const why = closureValueCoreWhy(fe)
+  if why != "" { return emitFail(why) }
+  return emitClosureValueOf(cloAdapterCanonOf(fe), fnIx)
+}
+
+// The refusal `emitClosureValueCore` raises for function `fe`, or "". A signature with no
+// closure `$fnsig` cannot be called as a value: the call would `call_indirect` at the wrong type.
+export function closureValueCoreWhy(fe: i32): string {
   if fe < 0 || fe >= fnStmts.length {
-    return emitFail("emitProgram: function value with no lifted function")
+    return "emitProgram: function value with no lifted function"
   }
   if cloLifted(fe) {
-    return emitFail(
-      "emitProgram: a lambda-lifted local function was taken as a value",
-    )
+    return "emitProgram: a lambda-lifted local function was taken as a value"
   }
-
-  // a signature not representable as a closure `$fnsig` cannot be soundly called as a
-  // value even for a direct-call-only binding: the call site would fall back to the
-  // all-i32 arity functype and `call_indirect` at the wrong type, trapping the engine.
   if cloSigKeyExt(fe) == "" {
-    return emitFail(
-      "emitProgram: a function value's signature is not yet supported — "
-        + cloSigRejectWhat(fe)
-        + " has no representation in the function-value ABI; annotate and call it as a "
-        + "named function instead",
-    )
+    return "emitProgram: a function value's signature is not yet supported — "
+      + cloSigRejectWhat(fe)
+      + " has no representation in the function-value ABI; annotate and call it as a "
+      + "named function instead"
   }
-
-  return emitClosureValueOf(cloAdapterCanonOf(fe), fnIx)
+  return ""
 }
 
 // The function a function-value adapter `fe` calls (`fvaAdapt` in check_assignable.vl): it takes
@@ -16136,18 +16160,39 @@ function failMapValueType() {
   )
 }
 
-// Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
-// count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
-export function emitMapNew(exprIx: i32, fnIx: i32) {
-  // The shape of the map type the call is stamped with (D14226), keyed as its receivers key it
-  // (D14229): -1/-2 the mono map, an mv slot >= 0 THIS value type's map struct. A call whose
-  // type still holds a hole has no stamp, and builds as its binding's receivers read it.
+// Whether `ix` is a `Map()` call with no arguments that no user function named `Map` serves.
+function mapNewCallAt(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if (
+    !(n is Call)
+    || n.callArgs.length != 0
+    || n.callFn < 0
+    || n.callFn >= P.nodes.length
+  ) {
+    return false
+  }
+  const f = nodeAt(n.callFn)
+  return f is Ident && f.identName == "Map" && fnIndexOfNode(n.callFn) < 0
+}
+
+// The map shape `Map()` call `exprIx` builds in `fnIx`: its stamp's shape (D14226), keyed as its
+// receivers key it (D14229), or for a call whose type still holds a hole its binding's receivers'.
+// -1/-4/-6 the mono map by key, an mv slot >= 0 that value type's map struct, -3 none.
+function mapNewShapeOf(exprIx: i32, fnIx: i32): i32 {
   const mt = litRepTyAt(exprIx, fnIx)
   let slot = if mt >= 0 { mapCtorShapeOf(exprIx, mt) } else { mapShapeOfExpr(exprIx, fnIx) }
-  if slot == -3 { return failMapValueType() }
   if slot == -2 { slot = -1 }
   if slot == -5 { slot = -4 }
   if slot == -7 { slot = -6 }
+  return slot
+}
+
+// Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
+// count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
+export function emitMapNew(exprIx: i32, fnIx: i32) {
+  const slot = mapNewShapeOf(exprIx, fnIx)
+  if slot == -3 { return failMapValueType() }
   // The keys/vals accessors below read the op context, so pin it to the shape being
   // constructed (a `Map()` is not reached through `emitMapRecvKey`).
   const savedCm = cmSlot
@@ -30372,6 +30417,9 @@ let mapSetDidPark = false
 function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   asgParkedSlot = -1
   asgParkedRef = false
+  // Inside `is K[]` a store through a box of list arms writes the arm the box holds (D17002).
+  const armW = emitArmIndexWrite(fnIx, a, target)
+  if armW != 0 { return if armW < 0 { -1 } else { 0 } }
   // G8: a map store `m[k] = v` — scan for `k`; overwrite `vals[hit]` on a hit, else
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
@@ -34170,7 +34218,7 @@ function retFlagsSeedResult(
   }
   // An un-annotated value-union result the checker's inferred name does not name (an
   // instance's `() => null` for `T | null`) boxes each value at its recorded type.
-  const recU = fnRecordedUnionRet(fn, fnPos)
+  const recU = nulTagIdRepTy(fnRecordedUnionRet(fn, fnPos))
   if rf.retUNm == "" && !rf.retLitUnion && !rf.retNulLitUnion && recU >= 0 {
     rf.retUNm = boxTyName(recU)
     rf.retUTy = recU
@@ -37918,8 +37966,13 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   const arms = luMembersAt(nodeTyAt(s.fiIter, fnIx))
   const u = luElemTy(arms)
   // The element union's rep: a box, or the string a literal union joined with `string` is.
-  const k: VKind = luForElemKind(s.fiIter, fnIx) ?? "union"
-  if k != "union" { return emitListUnionForFlat(s, stmtIx, fnIx, arms, k) }
+  // Inside `is K[]` each element converts to `K`'s rep (D17002).
+  const kt = luForKTy(s, fnIx)
+  const k: VKind = (if kt >= 0 { repSigKindOfTy(kt) } else { luForElemKind(s.fiIter, fnIx) })
+    ?? "union"
+  if k != "union" {
+    return emitListUnionForFlat(s, stmtIx, fnIx, arms, k, kt >= 0)
+  }
   const tags: i32[] = []
   const heaps: i32[] = []
   const eTags: i32[] = []
@@ -37955,6 +38008,7 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     eBoxes: eBoxes,
     eNul: eNul,
     eTexts: [],
+    eFrom: [],
     destKind: k,
   }
   return emitListUnionForLoop(s, stmtIx, fnIx, plan)
@@ -38130,6 +38184,7 @@ type LuForPlan = {
   eBoxes: i32[],
   eNul: boolean[],
   eTexts: string[][],
+  eFrom: VKind[],
   destKind: VKind,
 }
 
@@ -38141,6 +38196,7 @@ function emitListUnionForFlat(
   fnIx: i32,
   arms: i32[],
   k: VKind,
+  toK: boolean,
 ): i32 {
   const plan: LuForPlan = {
     tags: [],
@@ -38149,6 +38205,7 @@ function emitListUnionForFlat(
     eBoxes: [],
     eNul: [],
     eTexts: [],
+    eFrom: [],
     destKind: k,
   }
   for m in arms {
@@ -38160,7 +38217,7 @@ function emitListUnionForFlat(
       || h < 0
       || e < 0
       || listBackOfWrap(h) < 0
-      || (k != "str" && k != "i32")
+      || (k != "str" && k != "i32" && !toK)
     ) {
       return emitFail(
         "emitProgram: a union-of-lists `for` arm has no tag or wrapper, or its element union no rep the walk delivers",
@@ -38169,7 +38226,8 @@ function emitListUnionForFlat(
     const atom = tyIsLitUnionOrLit(e)
     plan.tags.push(t)
     plan.heaps.push(h)
-    plan.eTags.push(if atom && k == "str" { -3 } else { -4 })
+    plan.eTags.push(if toK { -5 } else if atom && k == "str" { -3 } else { -4 })
+    plan.eFrom.push(repSigKindOfTy(e) ?? k)
     plan.eBoxes.push(-1)
     plan.eNul.push(false)
     plan.eTexts.push(if atom { tyLitMemberTexts(e) } else { [] })
@@ -38321,6 +38379,10 @@ function emitListUnionForElem(
     fbRefAsNonNull()
   } else if et == -4 {
     emitListUnionForRead(box, cur, heap)
+  } else if et == -5 {
+    // A numeric literal set's member, read off an arm stored wider or apart (D17002).
+    emitListUnionForRead(box, cur, heap)
+    if emitNumRepNarrow(plan.eFrom[i], plan.destKind) < 0 { return -1 }
   } else if et == -3 {
     emitListUnionForRead(box, cur, heap)
     setStrScrI(0)
@@ -40208,48 +40270,57 @@ function identReadsUnionBox(name: string, exprIx: i32, fnIx: i32): boolean {
   return r
 }
 
+// The function a bare name `e` read at `exprIx` in frame `fnIx` builds as a value, or -1 for a
+// module global: a maker instance's token, else the instance's nested copy found by its
+// declaration (the read node is shared by every clone), else the scope's own function (D12213).
+export function fnValueFeOf(e: Ident, isid: i32, exprIx: i32, fnIx: i32): i32 {
+  const tk = monoTokenFe(exprIx, fnIx)
+  if tk >= 0 { return tk }
+  const nc = elabNestedCopyOnChain(elabSrcDecl(identDeclOf(exprIx)), fnIx)
+  if nc >= 0 { return nc }
+  return fnIndexOfInScopeAt(isid, e.identName, fnIx, exprIx)
+}
+
+// How function value `fe` at `exprIx` is written: its void twin's closure where the checker
+// coerced it to return `void`, a refusal for a generic one no call fixes (unless `exprIx` is the
+// stubbed write's right side `stubRhs`, -1 for none), the unchecked core for one nothing calls or
+// only an alias calls (a hole function may be one, D6660), else checked.
+export type FnValueArm = "twin" | "unfixed" | "inert" | "aliasCore" | "checked"
+export function fnValueArmOf(fe: i32, exprIx: i32, stubRhs: i32): FnValueArm {
+  if voidTwinForNode(exprIx, fe) >= 0 { return "twin" }
+  if (
+    exprIx != stubRhs
+    && !vrValueInert(exprIx)
+    && !elabValueSlotUncalled(exprIx)
+    && !monoStubValueOk(fe, exprIx)
+  ) {
+    return "unfixed"
+  }
+  if i32ListHas(monoInertCalled, exprIx) { return "inert" }
+  if (
+    (vrValueInert(exprIx) || elabValueSlotUncalled(exprIx))
+    && monoInstantiatedAny(fe)
+  ) {
+    return "aliasCore"
+  }
+  return "checked"
+}
+
 // A read of `e` that is no param or local of this frame: a function value, else a module
 // global. Returns 0, or -1 once failed.
 function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
-  // A value a maker's instance returns is the closure the row built for that instance (D14825).
-  const tk = monoTokenFe(exprIx, fnIx)
-  // A nested function read in an instance's frame is that instance's copy of it, found by its
-  // declaration: the read node is shared by every instance's clone of the body (D12213).
-  const nc = if tk < 0 { elabNestedCopyOnChain(elabSrcDecl(identDeclOf(exprIx)), fnIx) } else { -1 }
-  // A bare function name in value position constructs a function value: `fnIndexOf` is the
-  // function index `emitClosureValue` expects, scope-aware so a nested function sharing a name
-  // with another maker's nested function resolves to this frame's.
-  const fe = if tk >= 0 { tk } else if nc >= 0 { nc } else { fnIndexOfInScopeAt(isid, e.identName, fnIx, exprIx) }
+  const fe = fnValueFeOf(e, isid, exprIx, fnIx)
   if fe >= 0 {
-    // void-coerced value seam: this node's `(P…) => T` is coerced to `(P…) => void`
-    // by the checker (`fnValVoidCoerce`), so build the void twin's closure instead
-    // (`voidTwinForNode`), or the `>v`-sig call signature-checks against the wrong functype.
-    const vtw = voidTwinForNode(exprIx, fe)
-    if vtw >= 0 { return emitClosureValue(vtw, fnIx) }
-    if (
-      exprIx != stubWriteRhs
-      && !vrValueInert(exprIx)
-      && !elabValueSlotUncalled(exprIx)
-      && !monoStubValueOk(fe, exprIx)
-    ) {
-      return emitFailAt(
+    return match fnValueArmOf(fe, exprIx, stubWriteRhs) {
+      "twin" => emitClosureValue(voidTwinForNode(exprIx, fe), fnIx)
+      "unfixed" => emitFailAt(
         "emitProgram: a generic function taken as a value reaches no call that fixes its type "
           + "— annotate the destination's function type",
         exprIx,
       )
+      "inert" | "aliasCore" => emitClosureValueCore(fe, fnIx)
+      "checked" => emitClosureValue(fe, fnIx)
     }
-    // A value nothing can call has no signature to keep, so a hole function may be one (D6660).
-    if i32ListHas(monoInertCalled, exprIx) {
-      return emitClosureValueCore(fe, fnIx)
-    }
-    // So may one whose template a call instanced, called only through an alias (D7383).
-    if (
-      (vrValueInert(exprIx) || elabValueSlotUncalled(exprIx))
-      && monoInstantiatedAny(fe)
-    ) {
-      return emitClosureValueCore(fe, fnIx)
-    }
-    return emitClosureValue(fe, fnIx)
   }
   // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
   const gIdx = globalIndexOfSid(isid)
@@ -41077,6 +41148,67 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   return emitFail(
     "emitProgram: a list arm's element has no conversion to the literal set read",
   )
+}
+
+// `recv[i] = v` through a union-of-lists box a pin or an `is K[]` arm left unrewritten: per list
+// arm, the store lowers with `recv` overridden to that arm, its value converted to the arm's
+// element as any store converts it. 0 when `target` is no such store, 1 when emitted.
+function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
+  const recv = unwrapParen(target.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) { return 0 }
+  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return 0 }
+  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  if arms.length == 0 { return 0 }
+  if emitArmIndexWriteAt(fnIx, a, target, recv, arms, 0) < 0 { return -1 }
+  asgParkedSlot = -1
+  return 1
+}
+
+function emitArmIndexWriteAt(
+  fnIx: i32,
+  a: BinExpr,
+  target: Index,
+  recv: i32,
+  arms: i32[],
+  i: i32,
+): i32 {
+  if i >= arms.length {
+    fbUnreachable()
+    return 0
+  }
+  const m = arms[i]
+  const t = listIsArmTag(m)
+  const heap = armHeapOf(m)
+  const loc = armWrapLocal(m)
+  if t < 0 || heap < 0 || loc < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to store through",
+    )
+  }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  const mark = luOvEnter(recv, m)
+  const lmark = luOvLocalEnter(recv, loc)
+  const r = emitAssignIndex(fnIx, a, target)
+  // The arm's own store parks nothing a caller reads: the assignment is a statement here.
+  if asgParkedSlot >= 0 {
+    fbLocalGet(asgParkedSlot)
+    fbDrop()
+  }
+  luOvLocalLeave(lmark)
+  luOvLeave(mark)
+  if r < 0 { return -1 }
+  fbElse()
+  if emitArmIndexWriteAt(fnIx, a, target, recv, arms, i + 1) < 0 { return -1 }
+  fbEnd()
+  return 0
 }
 
 // Arm `i` onward of `emitArmSite`'s tag chain.
@@ -45017,6 +45149,8 @@ function emitCoalesceElemBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
 // Returns what `emitCoalesceGo` returns.
 function emitCoalesceCallStash(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   const lhs = nodeAt(lhsIx)
+  // A tagged set's nullable id is the `i32 | null` box it is stored as.
+  const lTy = nulTagIdRepTy(nodeTyIxOf(lhsIx))
   // `f(x) ?? d` over a call returning a value union with `null`: a call cannot be re-evaluated
   // (effects and cost), so stash the box once in the coalesce-call slot, then test the tag and
   // unbox off that single evaluation. Scalar atoms only (the value-typed `if` blocktype); one
@@ -45029,15 +45163,15 @@ function emitCoalesceCallStash(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   if (
     lhs is Call
     || ((lhs is AsExpr || lhs is IfStmt)
-      && (tyIsNulValueUnionBox(nodeTyIxOf(lhsIx)) || nodeTyIsNulScalarBox(lhsIx)))
+      && (tyIsNulValueUnionBox(lTy) || nodeTyIsNulScalarBox(lhsIx)))
   ) {
-    const kunm = boxTyName(nodeTyIxOf(lhsIx))
+    const kunm = boxTyName(lTy)
     if kunm != "" {
       // D-VALUNION + D-SETONCE: one resolution feeds the value-union gate AND the
       // residual code below, which master resolved a second time inside
       // `unionResidualSoloKindOfSet`.
-      const ksid = msSetOfTy(nodeTyIxOf(lhsIx))
-      if (isValueUnionOfSet(ksid, nodeTyIxOf(lhsIx)) && setHasNullAtom(ksid)) {
+      const ksid = msSetOfTy(lTy)
+      if (isValueUnionOfSet(ksid, lTy) && setHasNullAtom(ksid)) {
         // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
         const kak = unionResidualSoloKindOfSet(ksid)
         if kak == -2 {
@@ -45050,7 +45184,7 @@ function emitCoalesceCallStash(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
           // `emitExpr`. `emitIfExpr` picks the join's blocktype off the arms' scalar ladder,
           // so a `T | null` if-expression came back as a bare i32; the coerce's own `IfStmt`
           // arm (`emitUnionIfValue`) makes the blocktype the box, with a missing else as the null-tagged arm.
-          if (emitUnionBoxOwed(kunm, nodeTyIxOf(lhsIx), e.binLeft, fnIx) < 0) {
+          if (emitUnionBoxOwed(kunm, lTy, e.binLeft, fnIx) < 0) {
             return -1 // the box, evaluated ONCE
           }
           fbLocalSet(coalesceCallSlot)
@@ -45069,7 +45203,7 @@ function emitCoalesceCallStash(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
             let kCoerceTy = kResTy
             if kCoerceN == "" {
               kCoerceN = kunm
-              kCoerceTy = nodeTyIxOf(lhsIx)
+              kCoerceTy = lTy
             }
             fbLocalGet(coalesceCallSlot)
             fbStructGet(uBoxIdx, 0) // field 0: tag
