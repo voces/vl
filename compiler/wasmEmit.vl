@@ -20894,9 +20894,12 @@ export function strEqTail(e: BinExpr, binIx: i32, lit: i32, fnIx: i32) {
   } else if emitEqNonNullCore(binIx, fnIx) < 0 {
     return -1
   }
-  if e.binOp == "!=" {
-    fbI32Eqz() // 0x45 i32.eqz  (`!=` negates value-equality)
-  }
+  return strEqNegTail(e)
+}
+
+// `!=` negates value-equality: `i32.eqz` after the 0/1 a string `==` left.
+export function strEqNegTail(e: BinExpr) {
+  if e.binOp == "!=" { fbI32Eqz() }
   return 0
 }
 
@@ -21059,42 +21062,62 @@ function emitStrBytesEq(bytes: i32[]) {
   return 0
 }
 
-// Compare the string on the stack with literal node `litIx`, leaving the 0/1 result: a length
-// other than the literal's answers 0 without evaluating the literal or calling `__str_eq__`,
-// and an empty or short literal is compared in place without the call either.
-// The operand waits in the string-op frame's last slot; without that frame it is the bare call.
-function emitStrEqLit(litIx: i32, fnIx: i32) {
+// The form a string compare with quoted literal `litIx` takes: 0 the core over the pushed
+// literal; 1 an empty literal, a length test alone; 2 a short literal compared in place; 3 the
+// `__str_eq__` call under the length test. Forms 0 and 3 write the literal, 1 and 2 never do.
+// Forms 1 to 3 hold the other operand in the string-op frame's last slot.
+export function strEqLitForm(litIx: i32): i32 {
   const n = strLitLenOf(litIx)
-  if n < 0 || !fnUses.strOp {
-    if emitStrValue(litIx, fnIx) < 0 { return -1 }
-    return emitStrEqCore()
+  if n < 0 || !fnUses.strOp { return 0 }
+  if n == 0 { return 1 }
+  if (
+    n <= STR_EQ_INLINE_BYTES
+    && litIx < P.nodes.length
+    && nodeAt(litIx) is StrLit
+  ) {
+    return 2
   }
+  return 3
+}
+
+// Writes form `f`'s code before its literal: forms 1 and 2 whole, form 3 the length test and the
+// held operand's read. A length other than the literal's answers 0 without the literal.
+export function strEqLitHead(litIx: i32, f: i32) {
+  if f == 0 { return 0 }
   fbLocalTee(strScratchBase + 11)
   fbStrLen()
-  if n == 0 {
-    fbI32Eqz()
-    return 0
-  }
-  fbI32Const(n)
+  if f == 1 { return fbI32Eqz() }
+  fbI32Const(strLitLenOf(litIx))
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(127)    // if (result i32)
-  if n <= STR_EQ_INLINE_BYTES && litIx < P.nodes.length {
-    const lit = nodeAt(litIx)
-    if lit is StrLit {
-      emitStrBytesEq(cpsToUtf8(decodeStr(strToCps(lit.strText))))
-      fbElse()
-      fbI32Const(0)
-      fbEnd()
-      return 0
-    }
+  if f == 3 { return fbLocalGet(strScratchBase + 11) }
+  const lit = nodeAt(litIx)
+  if lit is StrLit {
+    emitStrBytesEq(cpsToUtf8(decodeStr(strToCps(lit.strText))))
   }
-  fbLocalGet(strScratchBase + 11)
-  if emitStrValue(litIx, fnIx) < 0 { return -1 }
+  fbElse()
+  fbI32Const(0)
+  return fbEnd()
+}
+
+// Writes form `f`'s code after its literal.
+export function strEqLitTail(f: i32) {
+  if f == 0 { return emitStrEqCore() }
+  if f != 3 { return 0 }
   fbCall(helpStrEqFn())
   fbElse()
   fbI32Const(0)
-  fbEnd()
-  return 0
+  return fbEnd()
+}
+
+// Compares the string on the stack with literal node `litIx`, leaving the 0/1 result.
+function emitStrEqLit(litIx: i32, fnIx: i32) {
+  const f = strEqLitForm(litIx)
+  strEqLitHead(litIx, f)
+  if f == 0 || f == 3 {
+    if emitStrValue(litIx, fnIx) < 0 { return -1 }
+  }
+  return strEqLitTail(f)
 }
 
 // ── list value-equality + concat cores (collections-design §VL.4/§VL.6) ───────
@@ -22063,7 +22086,7 @@ function emitCloEqCore() {
 // stack as non-null refs. Leaves the 0/1 equality answer, never the negation — `!=`
 // belongs to the caller. Shared by the plain compare paths and `emitNulNicheEq`, so a rep
 // the plain compare handles is a rep the nullable form handles by construction — two ladders is how the two drift apart.
-function emitEqNonNullCore(binIx: i32, fnIx: i32) {
+export function emitEqNonNullCore(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
     // One ask, threaded into both users below — the `coreK == 7` arm's own generic-rep
