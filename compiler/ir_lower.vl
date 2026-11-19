@@ -1322,9 +1322,9 @@ function runAgrees(rep: i32, li: i32): boolean {
   return b.length == 2 && b[1] == t
 }
 
-// The size-prefixed code entry `f` (its globals accessed in `ctx`) lowers to, or a mismatch class
-// in `lwMiss`. The frame is legacy's, opened by `fbBeginFunc`.
-function entry(f: IrFn, ctx: GlobalCtx): u8[] {
+// Lowers `f`'s body, with its globals accessed in `ctx`, into `lwBuf` up to its `end`, or a
+// mismatch class in `lwMiss`.
+function lowerBody(f: IrFn, ctx: GlobalCtx) {
   lw = f
   lwGlobalCtx = ctx
   lwMiss = ""
@@ -1376,7 +1376,18 @@ function entry(f: IrFn, ctx: GlobalCtx): u8[] {
   // Every frame a builder opened is closed, so the one depth not given back is the function's
   // own `end`'s, which opened none.
   ctrlDepth = ctrlDepth + 1
-  const locals = framedLocals()
+  return 0
+}
+
+// The size-prefixed code entry `f` (its globals accessed in `ctx`) lowers to, or a mismatch class
+// in `lwMiss`. The frame is legacy's, opened by `fbBeginFunc`.
+function entry(f: IrFn, ctx: GlobalCtx): u8[] {
+  lowerBody(f, ctx)
+  return framed(framedLocals())
+}
+
+// The code entry of the body in `lwBuf` behind locals vector `locals`, its rows moved with it.
+function framed(locals: u8[]): u8[] {
   const code: u8[] = []
   for x in locals { code.push(x) }
   const bodyAt = code.length
@@ -1427,6 +1438,37 @@ export function irLowerClaim(
     )
     r = r + 1
   }
+  return ""
+}
+
+// Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after
+// its parameters. "" when written, else the miss, with nothing written.
+export function irLowerHelper(f: IrFn, out: u8[]): string {
+  fnUses.unionSink = false
+  const ctx: GlobalCtx = { gcInStart: false, gcFnPos: -1, gcGuardOff: false }
+  lowerBody(f, ctx)
+  const runs: i32[] = []
+  let slot = f.irParams.length
+  for v in f.irVars {
+    if v.vKind == "local" {
+      const t = valtypeOf(v.vRep)
+      if t < 0 || v.vSlot != slot { irLMiss("helper locals") }
+      slot = slot + 1
+      if runs.length > 0 && runs[runs.length - 1] == t {
+        runs[runs.length - 2] = runs[runs.length - 2] + 1
+      } else {
+        runs.push(1)
+        runs.push(t)
+      }
+    }
+  }
+  if lwMiss != "" { return lwMiss }
+  const locals: u8[] = []
+  const prev = wTarget(locals)
+  wULEB(runs.length / 2)
+  for x in runs { wULEB(x) }
+  wTarget(prev)
+  for x in framed(locals) { out.push(x) }
   return ""
 }
 
