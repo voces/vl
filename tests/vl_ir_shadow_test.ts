@@ -476,6 +476,36 @@ print(intr(true, 0.5))
   },
 });
 
+// An instance's `is` test over a box: a tag the box holds is compared off the raw slot, even
+// narrowed, and a tag it lacks is a decided guard whose then arm is not written. Elsewhere the
+// decided constant stays a named miss.
+Deno.test({
+  name: "ir shadow: an instance's arm-tag and decided `is` guards build; a decided test elsewhere misses",
+  ignore,
+  fn: () => {
+    const src = `function kind<T>(v: T): string {
+  if v is i32 { return "i32" }
+  if v is f32 { return "f32" }
+  if v is f64 { return "f64" }
+  return "other"
+}
+function neg<T>(v: T): boolean { return !(v is i32) }
+function run(q: f32 | f64) {
+  print(kind(q))
+  print(neg(q))
+}
+run(1.5 as f32)
+run(2.5)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered is arm tag tagAbsent") !== 1) {
+      throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
+    }
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
 // (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
 // the result's `null`.

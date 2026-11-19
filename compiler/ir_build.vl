@@ -77,7 +77,9 @@ import {
 import {
   BinNulTest,
   GlobalCtx,
+  IsArm,
   PrintArm,
+  TagIsArm,
   arrLitArmOf,
   arrLitBuildOf,
   arrLitShort,
@@ -106,8 +108,10 @@ import {
   ifExprPlainKind,
   ifWritesElse,
   isArmOf,
+  isArmTagOf,
   isBoxGuardPlain,
   isRecvStageRep,
+  isTestsStorage,
   isVariantTagPlain,
   keptDeclStoresNothing,
   listReserveScan,
@@ -140,6 +144,7 @@ import {
   startInitArmOf,
   startStrAccMarked,
   strLitTakesAtom,
+  tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
   widenPlanOf,
@@ -159,6 +164,8 @@ import {
 } from "./emit_rep"
 import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
+import { storageReadEnter, storageReadLeave } from "./emit_elab"
+import { isDeadArm } from "./check_side_rows"
 import {
   declaredIndexAt,
   envSlotShift,
@@ -186,6 +193,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   setIrShadowOn,
+  uTags,
 } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
@@ -379,6 +387,8 @@ let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
 let ibLoopCont: i32[] = []
 let ibLabelN = 0
+// The condition a statement `if` is building, the one place a decided `is` test may be a constant.
+let ibGuardCond = -1
 let ibBool = -1
 let ibNoValue = -1
 
@@ -398,18 +408,94 @@ function valueRep(r: i32, ty: i32): boolean {
 // A box's `is` test at the variant rung legacy answers by the tag alone (`isArmOf` from rank 0,
 // no staged receiver, `isVariantTagPlain`), over a plain read (`isBoxGuardPlain`).
 function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if isTestsStorage(n.isObj, ibFnIx) { return storedBoxTest(b, n, ix, rep) }
   if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
     return irBMiss("is staged")
   }
-  if isArmOf(ix, ibFnIx, 0, false) != "variant" { return irBMiss("is rung") }
+  const arm = isArmOf(ix, ibFnIx, 0, false)
+  if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
-  const vi = isVariantTagPlain(ix, ibFnIx)
-  if vi < 0 { return irBMiss("is variant shape") }
   if rep != ibBool { return irBMiss("is result rep") }
+  const tag = boxTestTagOf(n, ix, arm)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  if tag < 0 {
+    const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+    return no
+  }
   const v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
-  if !(repNodeAt(irBOpRep(v)) is RBox) { return irBMiss("is operand rep") }
-  return irBLetTemp(b, { teV: v, teTarget: vi }, ix, rep)
+  if !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v)) {
+    return irBMiss("is operand rep")
+  }
+  return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
+// mode: only the arm-tag test over a local box, which reads the raw slot whatever the narrowing.
+function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const mark = storageReadEnter(n.isObj)
+  const plain = n.isFit < 0
+    && isRecvStageRep(ix, ibFnIx) < 0
+    && isArmOf(ix, ibFnIx, 0, false) == "armTag"
+  const ta: TagIsArm = if plain { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
+  const tag = if ta == "identBox" { isArmTagOf(ix, n, ibFnIx) } else { -1 }
+  storageReadLeave(mark)
+  if !plain { return irBMiss("is storage rung") }
+  if ta == "tagAbsent" && ix == ibGuardCond {
+    const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+    return no
+  }
+  if ta != "identBox" || tag < 0 { return irBMiss("is arm tag " + ta) }
+  const v = rawBoxVar(unwrapParen(n.isObj))
+  if v < 0 { return irBMiss("is box not a local") }
+  const o: Opnd = { ov: v }
+  return irBLetTemp(b, { teV: o, teTag: tag }, ix, rep)
+}
+
+// The variable holding local box `r` in legacy's live slot, read raw past any narrowing, or -1.
+function rawBoxVar(r: i32): i32 {
+  const d = identDeclOf(r)
+  const w = localIndexOf(ibFnIx, r)
+  if d < 0 || w < 0 || !(nodeAt(r) is Ident) { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) && !(dn is Param) { return -1 }
+  const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+  if (
+    v < 0
+    || ib.irVars[v].vSlot != w
+    || !(repNodeAt(ib.irVars[v].vRep) is RBox)
+  ) {
+    return -1
+  }
+  ib.irReadVar[r] = v
+  return v
+}
+
+// The tag box test `ix` compares at rung `arm`: a plain variant row's, or the pattern's arm tag
+// over a local box read raw (`tagIsArmOf`'s `identBox`); -1 for `tagAbsent` as a statement `if`'s
+// own condition, a constant `false` that reads nothing. Legacy reads that constant back off its
+// bytes (`staticIsGuard`) wherever else it lands, so there it stays a miss.
+function boxTestTagOf(n: IsExpr, ix: i32, arm: IsArm): i32 {
+  if arm == "variant" {
+    const vi = isVariantTagPlain(ix, ibFnIx)
+    if vi < 0 || vi >= uTags.length {
+      irBMiss("is variant shape")
+      return 0
+    }
+    return uTags[vi]
+  }
+  const ta = tagIsArmOf(ix, n, ibFnIx)
+  if ta == "tagAbsent" && ix == ibGuardCond { return -1 }
+  if ta != "identBox" {
+    irBMiss("is arm tag " + ta)
+    return 0
+  }
+  if localIndexOf(ibFnIx, unwrapParen(n.isObj)) < 0 {
+    irBMiss("is box not a local")
+    return 0
+  }
+  return isArmTagOf(ix, n, ibFnIx)
 }
 
 // Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
@@ -1939,10 +2025,18 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     return 0
   }
   if n is IfStmt {
+    const svGuard = ibGuardCond
+    ibGuardCond = unwrapParen(n.ifCond)
     const c = irBExpr(b, n.ifCond)
+    ibGuardCond = svGuard
     if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+    // A decided `is` guard: legacy reads its constant back and writes no then arm (D932).
+    const decided = c is OImm && nodeAt(unwrapParen(n.ifCond)) is IsExpr
+    if decided && isDeadArm(n.ifThen) {
+      return skip("decided guard over a dead arm")
+    }
     const th = nodeAt(n.ifThen)
-    const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
+    const thenB = if decided { [] } else if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
     // An `else if` link is part of its chain's statement: no span of its own.
     const elseB = if n.ifElse >= 0 && nodeAt(n.ifElse) is IfStmt { chainLink(n.ifElse) } else { bodyOf(elseStmts(n.ifElse)) }
     irBNode(
