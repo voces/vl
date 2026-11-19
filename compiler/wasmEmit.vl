@@ -94,6 +94,7 @@ import {
   elabInstTyAt,
   elabIsTyIn,
   elabKeyAt,
+  elabLetAssigned,
   elabNestedCopyOnChain,
   elabNodeRepAt,
   elabSlotRecordListSigs,
@@ -37848,7 +37849,10 @@ function armElemRowOf(e: i32): ArmElemRow {
 function emitMapUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   const arms = lmForUnionArms(s.fiIter, fnIx)
   if arms.length == 0 { return 0 }
-  return emitMapUnionForArm(s, stmtIx, fnIx, arms, emitLetCursor, 0)
+  // Inside an enclosing walk of the same binding the arm is known: its walk alone is emitted.
+  const ka = knownArmOf(s.fiIter)
+  const from = if ka >= 0 { ka } else { 0 }
+  return emitMapUnionForArm(s, stmtIx, fnIx, arms, emitLetCursor, from, ka >= 0)
 }
 
 // Arm `i` onward of `emitMapUnionFor`'s tag chain.
@@ -37859,6 +37863,7 @@ function emitMapUnionForArm(
   arms: i32[],
   cur0: i32,
   i: i32,
+  only: boolean,
 ): i32 {
   if i >= arms.length {
     fbUnreachable()
@@ -37878,11 +37883,13 @@ function emitMapUnionForArm(
       "emitProgram: a union-of-maps `for` arm has no tag, map or value box",
     )
   }
-  if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, t)
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)
+  if !only {
+    if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, t)
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+  }
   if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
   fbStructGet(uBoxIdx, 1)
   fbRefCast(heap)
@@ -37891,16 +37898,64 @@ function emitMapUnionForArm(
   emitLetCursor = cur0
   const mark = luOvEnter(s.fiIter, m)
   const lmark = luOvLocalEnter(s.fiIter, loc)
+  const known = knownArmEnter(s.fiIter, i)
   forInPairBox = if boxV { row } else { null }
   const r = emitForInStmt(s, stmtIx, fnIx)
   forInPairBox = null
+  knownArmLeave(known)
   luOvLocalLeave(lmark)
   luOvLeave(mark)
   if r < 0 { return -1 }
+  if only { return 1 }
   fbElse()
-  if emitMapUnionForArm(s, stmtIx, fnIx, arms, cur0, i + 1) < 0 { return -1 }
+  if emitMapUnionForArm(s, stmtIx, fnIx, arms, cur0, i + 1, false) < 0 {
+    return -1
+  }
   fbEnd()
   return 1
+}
+
+// The bindings a per-arm walk knows the arm of, innermost last: inside arm `knownArmIdx[k]`'s
+// walk of binding `knownArmDecl[k]`, a walk of the same binding takes that arm alone.
+let knownArmDecl: i32[] = []
+let knownArmIdx: i32[] = []
+
+// Records, for the walk of `iter` at arm `i`, that its binding holds that arm throughout, when
+// nothing can rebind it: no assignment anywhere writes that binding, a closure's included.
+// Returns the mark `knownArmLeave` restores.
+function knownArmEnter(iter: i32, i: i32): i32 {
+  const mark = knownArmDecl.length
+  if iter < 0 || iter >= P.nodes.length { return mark }
+  const n = nodeAt(iter)
+  if !(n is Ident) { return mark }
+  const d = identDeclOf(iter)
+  if d < 0 || elabLetAssigned(d) { return mark }
+  knownArmDecl.push(d)
+  knownArmIdx.push(i)
+  return mark
+}
+
+function knownArmLeave(mark: i32) {
+  while knownArmDecl.length > mark {
+    knownArmDecl.pop()
+    knownArmIdx.pop()
+  }
+  return 0
+}
+
+// The arm an enclosing walk knows `iter`'s binding holds, or -1.
+function knownArmOf(iter: i32): i32 {
+  if knownArmDecl.length == 0 || iter < 0 || iter >= P.nodes.length {
+    return -1
+  }
+  if !(nodeAt(iter) is Ident) { return -1 }
+  const d = identDeclOf(iter)
+  let k = knownArmDecl.length - 1
+  while k >= 0 {
+    if knownArmDecl[k] == d { return knownArmIdx[k] }
+    k = k - 1
+  }
+  return -1
 }
 
 // The row a union-of-maps walk's arm boxes the pair's value at, read by `emitForInBind`; null
@@ -37982,7 +38037,22 @@ function emitListUnionForLoop(
   const vIdx = paramN + vSlot
   if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
   fbLocalSet(vIdx + 2)
-  if emitListUnionForArm(s, fnIx, plan, vSlot, vIdx, emitLetCursor, 0) < 0 {
+  // Inside an enclosing walk of the same binding the arm is known: its loop alone is emitted.
+  const ka = knownArmOf(s.fiIter)
+  const from = if ka >= 0 { ka } else { 0 }
+  if (
+    emitListUnionForArm(
+      s,
+      fnIx,
+      plan,
+      vSlot,
+      vIdx,
+      emitLetCursor,
+      from,
+      ka >= 0,
+    )
+    < 0
+  ) {
     return -1
   }
   return 1
@@ -37999,6 +38069,7 @@ function emitListUnionForArm(
   vIdx: i32,
   cur0: i32,
   i: i32,
+  only: boolean,
 ): i32 {
   if i >= plan.tags.length {
     fbUnreachable()
@@ -38007,15 +38078,18 @@ function emitListUnionForArm(
   const iIdx = vIdx + 1
   const lIdx = vIdx + 2
   const hasPair = s.fiVar2 != ""
-  fbLocalGet(lIdx)
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, plan.tags[i])
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)
+  if !only {
+    fbLocalGet(lIdx)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, plan.tags[i])
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+  }
   fbI32Const(0)
   fbLocalSet(iIdx)
   // The arms exclude each other, so each walk's body takes the same slots as the first's.
   emitLetCursor = cur0
+  const known = knownArmEnter(s.fiIter, i)
   const hoist = loopHoistOpen(-1, s.fiBody, fnIx, s.fiDecl1, s.fiDecl2)
   if hoist < 0 { return -1 }
   fbBlock(64)
@@ -38054,8 +38128,10 @@ function emitListUnionForArm(
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   loopHoistClose(hoist)
+  knownArmLeave(known)
+  if only { return 0 }
   fbElse()
-  if emitListUnionForArm(s, fnIx, plan, vSlot, vIdx, cur0, i + 1) < 0 {
+  if emitListUnionForArm(s, fnIx, plan, vSlot, vIdx, cur0, i + 1, false) < 0 {
     return -1
   }
   fbEnd()
