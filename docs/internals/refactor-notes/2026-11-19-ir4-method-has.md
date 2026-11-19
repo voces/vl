@@ -38,5 +38,5 @@ Fixpoint seeds: master a4ecfb4a3 against this branch on the same base.
 | `deno task test` | 9,570 passed, 0 failed |
 
 **Lines: compiler +94 / −26.** Nothing legacy is deleted. `emitMapHas` is split so its tail is shared
-(+5 / −5 in `wasmEmit.vl`), the IR arm is new (+68), and the lint mirrors take 37 lines (+19 / −18,
-mostly re-wrapping). This is a coverage step: it moves no legacy line onto the IR and deletes none.
+(+10 / −5 in `wasmEmit.vl`), the IR arm is new (+65 / −3 across `ir*.vl`), and the lint mirrors
+are +19 / −18, mostly re-wrapping. This is a coverage step: it moves no legacy line onto the IR and deletes none.
