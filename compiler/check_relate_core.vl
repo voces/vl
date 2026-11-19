@@ -37,6 +37,9 @@ import {
   fnSetsHandedToParams,
   fnTagCallNote,
   fnTagCallRefusal,
+  fnTagCallRsOf,
+  fnTagCallRsSet,
+  fnTagCallSplitOf,
   fnTagMembers,
   fnTagSetIsTagged,
   fnTagSetOfTy,
@@ -6616,18 +6619,17 @@ export function holeSetCallRetOf(
   let r0 = -1
   let split = false
   const rs: i32[] = []
+  const early: i32[] = []
   for d in ds {
     let rd = setMemberRetAt(d, ft)
     if rd < 0 && setMemberInfer(d) { rd = setMemberRetAt(d, ft) }
-    // A lambda written after this call is not checked yet; the call is decided with the set,
-    // typed by its own callee, and each arm takes its member's result when it is instanced.
+    // A lambda written after this call is not checked yet: the call is typed by the members that
+    // are, and the lambda's result is judged against that type once it is checked (D17000).
     if rd < 0 && setMemberUnchecked(d) {
       holeSetEarlyLamNote(d)
-      const none: i32[] = []
-      if note && !inferQuiet && !holePinHeld {
-        fnTagCallNote(ix, s, key, false, none)
-      }
-      return -1
+      early.push(rs.length)
+      rs.push(-1)
+      continue
     }
     if rd < 0 || tyHasTyVar(rd) { return -1 }
     const w = widenLitTy(rd)
@@ -6640,10 +6642,87 @@ export function holeSetCallRetOf(
       r = joinRetTys(r, w)
     }
   }
+  // With no member checked, the call is decided with the set, typed by its own callee.
+  if early.length > 0 && r < 0 {
+    const none: i32[] = []
+    if note && !inferQuiet && !holePinHeld {
+      fnTagCallNote(ix, s, key, false, none)
+    }
+    return -1
+  }
   if note && !inferQuiet && !holePinHeld {
     fnTagCallNote(ix, s, key, split, rs)
+    if early.length > 0 { holeSetEarlyCallNote(ix, s, ft, r, early) }
   }
   return r
+}
+
+// Whether call `ix` calls a `let` directly.
+function holeSetCallThroughLet(ix: i32): boolean {
+  const cn = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  if !(cn is Call) { return false }
+  const f = parenPeelIx(cn.callFn)
+  const d = if f >= 0 && f < P.nodes.length && nodeAt(f) is Ident { identDeclOf(f) } else { -1 }
+  return d >= 0 && d < P.nodes.length && nodeAt(d) is LetDecl
+}
+
+// The calls typed ahead of a later lambda member: call, set, the member function type, the call's
+// type, and the positions in the set of the lambdas not yet checked.
+let hsEarlyCalls: i32[] = []
+let hsEarlySets: i32[] = []
+let hsEarlyFts: i32[] = []
+let hsEarlyRets: i32[] = []
+let hsEarlyAt: i32[][] = []
+
+function holeSetEarlyCallNote(ix: i32, s: i32, ft: i32, r: i32, early: i32[]) {
+  hsEarlyCalls.push(ix)
+  hsEarlySets.push(s)
+  hsEarlyFts.push(ft)
+  hsEarlyRets.push(r)
+  hsEarlyAt.push(early)
+  return 0
+}
+
+// Once every body is checked, each later lambda's result at its early call: recorded as that
+// member's result there, or refused where the call's type cannot take it.
+export function holeSetEarlyCallsJudge() {
+  let i = 0
+  while i < hsEarlyCalls.length {
+    const ix = hsEarlyCalls[i]
+    const ds = fnTagMembers(hsEarlySets[i])
+    const rs = fnTagCallRsOf(ix).slice(0, fnTagCallRsOf(ix).length)
+    let split = fnTagCallSplitOf(ix)
+    for k in hsEarlyAt[i] {
+      const d = if k < ds.length { ds[k] } else { -1 }
+      const lr = if d >= 0 { setMemberRetAt(d, hsEarlyFts[i]) } else { -1 }
+      const w = if lr >= 0 { widenLitTy(lr) } else { -1 }
+      if w < 0 || tyHasTyVar(w) || !assignable(w, hsEarlyRets[i]) {
+        // A `let`'s later lambda is refused where it is written (D16096).
+        if !holeSetCallThroughLet(ix) {
+          tErr(
+            "this call is typed `"
+              + tyToStr(hsEarlyRets[i])
+              + "` by the functions it may run that come before it, and a lambda written into its "
+              + "set later returns "
+              + (if w < 0 { "a type not known here" } else { "`" + tyToStr(w) + "`" })
+              + " at its arguments; write the lambda before this call",
+            ix,
+          )
+        }
+      } else if k < rs.length {
+        rs[k] = w
+        if !tySame(w, hsEarlyRets[i]) { split = true }
+      }
+    }
+    fnTagCallRsSet(ix, rs, split)
+    i = i + 1
+  }
+  hsEarlyCalls = []
+  hsEarlySets = []
+  hsEarlyFts = []
+  hsEarlyRets = []
+  hsEarlyAt = []
+  return 0
 }
 
 // Whether the members of set `s`, called at the closed parameter types `pts`, give two or more
