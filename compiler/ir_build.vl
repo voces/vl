@@ -114,7 +114,7 @@ import {
   holeBoxTyAt,
   identReadArmOf,
   idxStorePlainWhy,
-  ifExprPlainKind,
+  ifExprPlainWhy,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -126,6 +126,7 @@ import {
   isTestsStorage,
   isVariantTagPlain,
   keptDeclStoresNothing,
+  legacyContextLiveWhy,
   lowMemFoldsCallee,
   mapFilterWhy,
   mapGetOrHelperRoute,
@@ -876,7 +877,16 @@ function localVarAt(w: i32): i32 {
   return ib.irLocalAt[w] ?? -1
 }
 
-// A value `if` on legacy's plain scalar path (`ifExprPlainKind`): a slotless out each arm's one
+// Whether condition `ix` is an `is` test or its negation, the shapes `staticIsGuard` reads back.
+function condIsTest(ix: i32): boolean {
+  const c = nodeAt(unwrapParen(ix))
+  if c is Unary {
+    return c.unOp == "!" && nodeAt(unwrapParen(c.unArg)) is IsExpr
+  }
+  return c is IsExpr
+}
+
+// A value `if` on legacy's plain scalar path (`ifExprPlainWhy`): a slotless out each arm's one
 // value writes, as `&&` and `||` build it. An `else` arm whose value is itself a value `if` is the
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
@@ -894,11 +904,16 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   let cix = ix0
   let crep = rep0
   while true {
-    if ifExprPlainKind(cix, ibFnIx) < 0 { return irBMiss("expression if") }
+    const pw = ifExprPlainWhy(cix, ibFnIx)
+    if pw != "" { return irBMiss("expression if " + pw) }
     // Its value stays on the stack from here, so no temp an operand before it built may wait.
     if endsInTemp(cb) { return irBMiss("if after an operand") }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+    // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
+    if c is OImm && condIsTest(n.ifCond) {
+      return irBMiss("decided is condition")
+    }
     const ty = nodeTyAt(cix, ibFnIx)
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
@@ -1443,6 +1458,27 @@ function numKindPrim(k: i32): string {
   return ""
 }
 
+// `g.has(k)` on a map global read plainly, with a key written as itself (`mapKeyArmOf`), as
+// legacy's map has writes it.
+function mapHasRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const sh = mapRecvShapeOf(m.memObj, ibFnIx)
+  if sh == -3 { return missRhs("map has value type") }
+  const ka = mapKeyArmOf(m.memObj, c.callArgs[0], ibFnIx, sh)
+  if ka != "plain" { return missRhs("map key " + ka) }
+  const g = mapGlobalOf(m.memObj)
+  if g < 0 { return missRhs("map has receiver") }
+  const k = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("method operand") }
+  const r: Rhs = {
+    mhSym: g,
+    mhNonNull: globalReadRecovers(sidOfNode(m.memObj), m.memObj, ibFnIx),
+    mhRecv: m.memObj,
+    mhKey: k,
+    mhAt: ix,
+  }
+  return r
+}
+
 // `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding as
 // the callback's value, or the `null` immediate for a capture-free function the lowering builds.
 function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -1475,6 +1511,9 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
     return pushRhs(b, c, m, ix)
+  }
+  if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
+    return mapHasRhs(b, c, m, ix)
   }
   if m.memProp == "map" || m.memProp == "filter" {
     return mapFilterRhs(b, c, m, ix)
@@ -2951,9 +2990,16 @@ function tailIf(b: i32[], ix: i32) {
   if !(n is IfStmt) { return skip("tail if node") }
   const why = tailIfPlainWhy(ix)
   if why != "" { return skip(why) }
-  const c = irBExpr(b, n.ifCond)
+  // A decided `false` `is` writes no then arm (`emitGuardCond`); another constant `is` is one
+  // legacy decides off its bytes, so it is a miss.
+  const decided = isDecidedFalse(n.ifCond, ibFnIx)
+  const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+  const c = if decided { no } else { irBExpr(b, n.ifCond) }
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-  const thenB = tailArm(n.ifThen)
+  if !decided && c is OImm && condIsTest(n.ifCond) {
+    return skip("decided is condition")
+  }
+  const thenB = if decided { [] } else { tailArm(n.ifThen) }
   const elseB: i32[] = []
   if n.ifElse >= 0 && n.ifElse < P.nodes.length && nodeAt(n.ifElse) is IfStmt {
     tailIf(elseB, n.ifElse)
@@ -3140,10 +3186,14 @@ function ibRestore(f: IbFrame) {
 }
 
 // The op seam's legacy-to-IR door: node `ix` of function `fnIx` lowered onto the buffer legacy is
-// writing, at the rep of type `ty` its writer leaves it at (-1: the node's type), in legacy's frame
-// (live slots, no new local, no seat). "" when written; else the miss (a build miss, a moved rep
-// epoch, a verifier failure, or a lowering miss), nothing written. A `probe` banks no row.
+// writing, at the rep of `ty` (-1: the node's type), in legacy's frame (live slots, no new local).
+// "" when written; else the miss, nothing written: a live legacy context (`legacyContextLiveWhy`; a
+// `probe` skips it and banks no row), a build, rep-epoch, verifier or lowering miss.
 function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+  if !probe {
+    const live = legacyContextLiveWhy()
+    if live != "" { return "legacy context live: " + live }
+  }
   const sv = ibSave()
   const why = lowerNodeIn(ix, fnIx, ty, probe)
   ibRestore(sv)
@@ -3155,6 +3205,8 @@ function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
 // fragment into a scratch buffer and counted `node-in <kind>: matched`, `differ` or `miss <why>`.
 export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
   if !ibArmed { return 0 }
+  const live = legacyContextLiveWhy()
+  if live != "" { count("node-in context live: " + live) }
   const cur = wTarget([])
   const why = irLowerNodeIn(ix, fnIx, ty, true)
   const got = wTarget(cur)

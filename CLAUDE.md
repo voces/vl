@@ -39,6 +39,11 @@ Why: [evidence](docs/internals/working-rules-evidence.md#std-review).
   time**, re-reading the load first.
 * CPU is the binding resource. A builder does not re-run proof the merge queue re-proves on the
   merged tree: the full identity diff, the three-run L2 fuel comparison, the whole `vl_*` shard.
+* **Each proof runs once.** The lane proves its change once, before its first READY. After merging
+  master with a mechanical resolution (lists, imports) it runs only `scripts/gate.sh --fast` and
+  `scripts/ir-identity.sh --cases <seed>`, and says the resolution was mechanical. The reviewer
+  reruns only a reading it disputes and otherwise takes the lane's and the queue's. The queue proves
+  the merged tree with the full gate. A non-mechanical change after a review OK needs a re-OK.
 
 Why: [evidence](docs/internals/working-rules-evidence.md#agent-concurrency).
 
@@ -60,10 +65,12 @@ Why: [evidence](docs/internals/working-rules-evidence.md#disk).
 * What earns a place in the gate: `docs/internals/testing-strategy.md` — a check stays while it
   catches a breakage nothing else catches (kill matrix, `scripts/kill-matrix/`); a redundant one is
   deleted with its intent folded into a survivor.
-* **`scripts/gate.sh` runs the whole ladder and is the thing to run.** It refuses inside
-  `.claude/worktrees/` (override `GATE_IN_WORKTREE=1`) because the merge queue gates every PR.
-  Fan-out caps: `GATE_MAX_PAR`, `GATE_MEM_BUDGET_MB`; WALL >> CPU in its table means starved. Budget
-  **~90 s** wall; a gate pushing it past a couple of minutes is what needs rethinking.
+* **`scripts/gate.sh` runs the whole ladder and is the thing to run.** The full gate refuses inside
+  `.claude/worktrees/` (override `GATE_IN_WORKTREE=1`) because the merge queue gates every PR;
+  `--fast` runs anywhere. Fan-out caps: `GATE_MAX_PAR`, `GATE_MEM_BUDGET_MB`; WALL >> CPU in its
+  table means starved. Budget in CPU, not wall: about **1,100 CPU-s** on the 4-core queue box,
+  plus about **4 min** of `ir-identity.sh --cases`; a row whose CPU rises sharply needs rethinking.
+* The merge queue's procedure (READY, batching, vetoes, folds): `docs/internals/merge-queue.md`.
 * The proof sweep is `scripts/sweep.vl`; CI runs it on the `sweep` label (`scripts/sweep.md`).
 
 The parts:
@@ -107,7 +114,9 @@ The parts:
 * **Self-compile fuel is gated per PR:** `scripts/self-compile-time.sh` reds on an L2 rise past
   **+1%** of `scripts/self-compile-baseline.json` (and past 1.5×). Accept a rise with
   `--write-baseline` from a fixpoint seed plus one line in `scripts/self-compile-ledger.txt` (fuel,
-  commit, PR, mechanism); a baseline the ledger's last line does not name reds.
+  commit, PR, mechanism); a baseline the ledger's last line does not name reds. A coordinator drift
+  refresh also gives the cumulative rise since the last owner-ruled baseline; past **+3%**
+  cumulative it needs an owner ruling, named in the line (`merge-queue.md` §Fuel drift).
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second
@@ -191,7 +200,8 @@ Why: [evidence](docs/internals/working-rules-evidence.md#capability-gap).
 * **Read a gate by its exit code or its summary line, never by `tail -1`** (`lint-self.sh` passes
   only on `self-lint + fmt-check clean`). **Never put a gate and a commit in the same command.**
 * **After every push, confirm a workflow run exists**: a PR with a merge conflict gets no CI run and
-  looks silent, not red. Merge the base in (merge, not rebase), resolve, re-run fast gates, push.
+  looks silent, not red. Merge the base in (merge, not rebase), resolve, re-run
+  `scripts/gate.sh --fast`, push.
 * **Quote the instrument's output, not its summary**; check the INPUT has the defect before blaming
   the instrument; a subset check says what it compared. Explain a ratchet's fall with
   `vl check --budget <baseline> --budget-why` (comment, scan, sentinel, interp, ladder, export,
