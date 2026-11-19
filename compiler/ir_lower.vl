@@ -56,6 +56,7 @@ import { relTrim } from "./emit_reloc"
 import {
   exprVariantIndex,
   forInElemKind,
+  readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
 import { forInStringSrc } from "./emit_value_sites"
@@ -88,6 +89,7 @@ import {
   RListNew,
   RListPop,
   RListPush,
+  RListSlice,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -200,7 +202,6 @@ import {
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
-  atomEqPlanOf,
   atomEqTail,
   atomStrPlanOf,
   atomStrTail,
@@ -219,7 +220,6 @@ import {
   emitMapNew,
   emitNullOwn,
   emitNullRetTail,
-  emitReadRecover,
   emitStrLitAt,
   f64RemCallTail,
   f64RemOperandTail,
@@ -243,7 +243,6 @@ import {
   hoistRowMark,
   hoistRowReads,
   holeBoxHead,
-  holeBoxPlanOf,
   holeBoxTail,
   holeBoxTyAt,
   idxRowsOn,
@@ -252,17 +251,21 @@ import {
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
+  mapGetOrArmOf,
   mapGetOrHelperRoute,
+  mapGetOrI32Head,
+  mapGetOrI32Tail,
+  mapGetOrMvHead,
+  mapGetOrMvPlain,
+  mapGetOrMvTail,
   mapHasTail,
+  mapPrepProbeTail,
   mapRecvIsSet,
   mapRecvKeyTail,
   mapRecvRefTail,
   mapRecvShapeOf,
   mapSetTail,
-  narrowedBoxVariantPlain,
-  narrowedFieldPlain,
   narrowedFieldTail,
-  narrowedVariantRepIs,
   narrowedVariantTail,
   nulTestAtomTail,
   nulTestRefTail,
@@ -281,7 +284,6 @@ import {
   printStrTail,
   promoSlotIn,
   staticAtomId,
-  structFieldPlain,
   structFieldTail,
   structUnionBoxTail,
   uBoxNewIsLast,
@@ -290,12 +292,20 @@ import {
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
-  variantFieldPlain,
   variantFieldTail,
   variantStructNewTail,
   variantUnionBoxTail,
   voidTailCallee,
 } from "./wasmEmit"
+import {
+  atomEqPlanOf,
+  holeBoxPlanOf,
+  narrowedBoxVariantPlain,
+  narrowedFieldPlain,
+  narrowedVariantRepIs,
+  structFieldPlain,
+  variantFieldPlain,
+} from "./emit_plan_union"
 import { nullRetPlanOf } from "./emit_plan_null"
 import {
   binNulTestOf,
@@ -598,8 +608,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet | RListLen | RListPush | RListEq | RStrOp | RMapFilter => irLowerListHook(r)
-    RListPop => irLMiss("pop value")
+    RListGet | RListLen | RListPush | RListPop | RListEq | RStrOp | RMapFilter | RListSlice => irLowerListHook(r)
     RNumWiden => {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
@@ -754,7 +763,9 @@ function makeClo(r: RMakeClo) {
   if r.mcEnv.length > 0 { return irLMiss("closure env") }
   leaf()
   emitClosureValue(r.mcFn, lw.irAt)
-  if nodeAt(r.mcAt) is Ident { emitReadRecover(r.mcAt, lw.irAt) }
+  if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
+    fbRefAsNonNull()
+  }
   return 0
 }
 
@@ -834,7 +845,8 @@ function boxField(r: RBoxField) {
   if idx < 0 { return irLMiss("box field shape") }
   irLOpnd(r.bfV)
   narrowedFieldTail(memNarrowVariantIndex(r.bfAt, fnIx), idx, r.bfAt, fnIx)
-  return emitReadRecover(r.bfAt, fnIx)
+  if readOwesNonNullRecover(r.bfAt, fnIx) { fbRefAsNonNull() }
+  return 0
 }
 
 // `RGetField`: the record, then legacy's field read and its recover, and the read's own recover,
@@ -871,7 +883,8 @@ function fieldTail(at: i32, m: Member) {
       return irLMiss("field unbox")
     }
   }
-  return emitReadRecover(at, fnIx)
+  if readOwesNonNullRecover(at, fnIx) { fbRefAsNonNull() }
+  return 0
 }
 
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
@@ -1058,7 +1071,9 @@ function printOp(r: RPrint) {
   return printScalarTail(arm)
 }
 
-// `RMapGetOr`: legacy's `__map_get_<row>__` helper minted first, then the global, its recovery,
+// `RMapGetOr`, inline: the global, its recovery, the key and the op context, then legacy's probe,
+// its plain read's head, the default and the tail. Otherwise legacy's `__map_get_<row>__` helper
+// minted first, then the global, its recovery,
 // the key and the op context, then the call, as `emitMapGetCall` writes them.
 function mapGetOr(r: RMapGetOr) {
   const fnIx = lw.irAt
@@ -1070,11 +1085,29 @@ function mapGetOr(r: RMapGetOr) {
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
-  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
-  if miss.length != 1 { return irLMiss("map read route") }
+  const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
+  const want = if r.mgForm == 1 { "i32" } else if r.mgForm == 2 { "mv" } else { "helper" }
+  if (
+    arm != want
+    || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+  ) {
+    return irLMiss("map read route")
+  }
   if userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
     return irLMiss("map read of a global not read plainly")
   }
+  if r.mgForm > 0 {
+    const sh = mapRecvShapeOf(rd.idxArr, fnIx)
+    globalRead(r.mgSym, r.mgNonNull)
+    mapRecvRefTail(rd.idxArr, fnIx)
+    irLOpnd(r.mgKey)
+    mapRecvKeyTail(sh)
+    mapPrepProbeTail()
+    if r.mgForm == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+    irLOpnd(r.mgDef)
+    return if r.mgForm == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+  }
+  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
   globalRead(r.mgSym, r.mgNonNull)
   mapRecvRefTail(rd.idxArr, fnIx)
