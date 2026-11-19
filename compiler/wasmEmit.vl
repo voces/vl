@@ -13727,6 +13727,30 @@ function emitSharedFieldNulSetBox(
   return 0
 }
 
+// How `emitSharedFieldAssign` writes a shared field with plan `code` over members `vis`/`fis`: 0
+// not at all (no dispatchable plan, or members storing it at different types), 1 per arm (a
+// boxed or literal-union arm stores at its own atoms, D5158), 2 through one slot.
+function sharedFieldAssignPlanOf(code: i32, vis: i32[], fis: i32[]): i32 {
+  if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
+  if (
+    sharedFieldAnyArmBoxes(code, vis, fis)
+    || sharedFieldAnyArmLitUnion(vis, fis)
+  ) {
+    return 1
+  }
+  return if sharedFieldTysIdentical(vis, fis) { 2 } else { 0 }
+}
+
+// Whether `emitSharedFieldAssign` writes the field target `memIx`.
+function sharedFieldAssignTaken(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return sharedFieldAssignPlanOf(code, vis, fis) != 0
+}
+
 // A field write through an un-narrowed struct union (`(A | B).n = v`): the value is evaluated
 // once into a slot of the field's storage type, then each member's arm stores it at that
 // member's own index. 1 when lowered, 0 when the write is not such a read's twin (the members
@@ -13744,16 +13768,11 @@ function emitSharedFieldAssign(memIx: i32, valIx: i32, fnIx: i32) {
       vis,
       fis,
     )
-    if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
-    // A literal-union field stores at each member's own atoms, which the member's construct
-    // path already lowers (D5158).
-    if (
-      sharedFieldAnyArmBoxes(code, vis, fis)
-      || sharedFieldAnyArmLitUnion(vis, fis)
-    ) {
+    const plan = sharedFieldAssignPlanOf(code, vis, fis)
+    if plan == 0 { return 0 }
+    if plan == 1 {
       return emitSharedFieldAssignPerArm(m.memObj, valIx, fnIx, vis, fis)
     }
-    if !sharedFieldTysIdentical(vis, fis) { return 0 }
     let rslot = -1
     if !(nodeAt(unwrapParen(m.memObj)) is Ident) {
       rslot = sharedFieldRecvSlot()
@@ -30306,61 +30325,93 @@ function emitStructFieldStoreValue(
 // a variant receiver, or straight into the record. `target` is `P.nodes[lhsIx]`. Returns 0
 // lowered, -1 failed.
 function emitAssignMember(fnIx: i32, a: BinExpr, lhsIx: i32, target: Member) {
-  // a field write on a narrowed union identifier (`if v is M { v.field = x }`)
-  // downcasts through the box like the read path: push the box ref, unbox to the
-  // variant struct, push the value, then `struct.set` — mutating the shared arena object.
-  const nvi = memNarrowVariantIndex(lhsIx, fnIx)
-  if nvi >= 0 {
-    if lhsIx < 0 { return -1 }
-    const nm = nodeAt(lhsIx)
-    if nm is Member {
-      const nfi = variantFieldIndex(nvi, nm.memProp)
-      if nfi < 0 {
-        return emitFail(
-          "emitProgram: unknown variant field in narrowed field assignment",
-        )
-      }
-      if emitExpr(nm.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1)     // box field 1: value (anyref)
-      fbRefCast(variantHeap(nvi)) // ref.cast to the variant struct
-      // The field's context is taken AFTER the receiver's own emit, which may leave seeds
-      // of its own behind.
-      return emitVariantFieldWrite(nvi, nfi, a.binRight, fnIx)
-    }
+  return match fieldStoreArmOf(lhsIx, fnIx) {
+    "narrowVariant" => emitFieldStoreNarrowed(fnIx, a, lhsIx)
+    "variantParam" => emitFieldStoreVariant(fnIx, a, lhsIx, target)
+    "nulVariant" => emitFieldStoreNulVariant(fnIx, a, target)
+    "shared" => if emitSharedFieldAssign(lhsIx, a.binRight, fnIx) < 0 { -1 } else { 0 }
+    "struct" => emitFieldStoreStruct(fnIx, a, target)
   }
+}
+
+// The arm `emitAssignMember` takes for field target `lhsIx`, decided once for legacy and the IR
+// (which covers `struct`): through a narrowed union box, into a variant receiver or a nullable
+// variant's, through an un-narrowed struct union's shared field, or straight into the record.
+export type FieldStoreArm = "narrowVariant"
+  | "variantParam"
+  | "nulVariant"
+  | "shared"
+  | "struct"
+
+export function fieldStoreArmOf(lhsIx: i32, fnIx: i32): FieldStoreArm {
+  const t = nodeAt(lhsIx)
+  if memNarrowVariantIndex(lhsIx, fnIx) >= 0 { return "narrowVariant" }
+  if t is Member {
+    if exprVariantIndex(t.memObj, fnIx) >= 0 { return "variantParam" }
+    if nulVariantIdxOfExpr(t.memObj, fnIx) >= 0 { return "nulVariant" }
+  }
+  if sharedFieldAssignTaken(lhsIx, fnIx) { return "shared" }
+  return "struct"
+}
+
+function emitFieldStoreNarrowed(fnIx: i32, a: BinExpr, lhsIx: i32) {
+  const nvi = memNarrowVariantIndex(lhsIx, fnIx)
+  if lhsIx < 0 { return -1 }
+  const nm = nodeAt(lhsIx)
+  if nm is Member {
+    const nfi = variantFieldIndex(nvi, nm.memProp)
+    if nfi < 0 {
+      return emitFail(
+        "emitProgram: unknown variant field in narrowed field assignment",
+      )
+    }
+    if emitExpr(nm.memObj, fnIx) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 1)     // box field 1: value (anyref)
+    fbRefCast(variantHeap(nvi)) // ref.cast to the variant struct
+    // The field's context is taken AFTER the receiver's own emit, which may leave seeds
+    // of its own behind.
+    return emitVariantFieldWrite(nvi, nfi, a.binRight, fnIx)
+  }
+  return -1
+}
+
+function emitFieldStoreVariant(
+  fnIx: i32,
+  a: BinExpr,
+  lhsIx: i32,
+  target: Member,
+) {
   // A field WRITE on a variant-typed param (`o: TyObj`) writes the variant struct
   // directly (the param IS the unboxed variant ref — no box unwrap).
   const pwvi = exprVariantIndex(target.memObj, fnIx)
-  if pwvi >= 0 {
-    if lhsIx < 0 { return -1 }
-    const m1 = nodeAt(lhsIx)
-    if m1 is Member {
-      const pwfi = variantFieldIndex(pwvi, m1.memProp)
-      if pwfi < 0 {
-        return emitFail(
-          "emitProgram: unknown variant field in field assignment",
-        )
-      }
-      if emitExpr(m1.memObj, fnIx) < 0 { return -1 }
-      return emitVariantFieldWrite(pwvi, pwfi, a.binRight, fnIx)
+  if lhsIx < 0 { return -1 }
+  const m1 = nodeAt(lhsIx)
+  if m1 is Member {
+    const pwfi = variantFieldIndex(pwvi, m1.memProp)
+    if pwfi < 0 {
+      return emitFail("emitProgram: unknown variant field in field assignment")
     }
+    if emitExpr(m1.memObj, fnIx) < 0 { return -1 }
+    return emitVariantFieldWrite(pwvi, pwfi, a.binRight, fnIx)
   }
+  return -1
+}
+
+function emitFieldStoreNulVariant(fnIx: i32, a: BinExpr, target: Member) {
   // the nullable-variant receiver: a `T | null` binding whose `T` is a union arm holds
   // `(ref null $variantHeap(vi))`, so this differs from the variant-param write above only
   // by one `ref.as_non_null`, safe since the checker admits the write only inside a null test.
   const nwvi = nulVariantIdxOfExpr(target.memObj, fnIx)
-  if nwvi >= 0 {
-    const nwfi = variantFieldIndex(nwvi, target.memProp)
-    if nwfi < 0 {
-      return emitFail("emitProgram: unknown variant field in field assignment")
-    }
-    if emitExpr(target.memObj, fnIx) < 0 { return -1 }
-    fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-    return emitVariantFieldWrite(nwvi, nwfi, a.binRight, fnIx)
+  const nwfi = variantFieldIndex(nwvi, target.memProp)
+  if nwfi < 0 {
+    return emitFail("emitProgram: unknown variant field in field assignment")
   }
-  const shw = emitSharedFieldAssign(lhsIx, a.binRight, fnIx)
-  if shw < 0 { return -1 }
-  if shw == 1 { return 0 }
+  if emitExpr(target.memObj, fnIx) < 0 { return -1 }
+  fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+  return emitVariantFieldWrite(nwvi, nwfi, a.binRight, fnIx)
+}
+
+function emitFieldStoreStruct(fnIx: i32, a: BinExpr, target: Member) {
   // field write `recv.field = v` → `struct.set $0 <fieldidx>`; the single declared
   // struct lives at WasmGC type index 0. Operand order is load-bearing: struct ref
   // first, then the value.
@@ -30381,13 +30432,57 @@ function emitAssignMember(fnIx: i32, a: BinExpr, lhsIx: i32, target: Member) {
   if (emitStructFieldStoreValue(si, fieldIdx, a.binRight, fnIx) < 0) {
     return -1
   }
-  // D1222 — the STORE half of the construct-side recover in `emitObj`; the two halves of
-  // every field code have to be wired together, as the code-20 arm above records.
-  if nulNicheRecoverOwed(sFieldStoreKind(si, fieldIdx), a.binRight, fnIx) {
+  return fieldStoreTail(si, fieldIdx, a.binLeft, a.binRight, fnIx)
+}
+
+// The struct row and field index `emitFieldStoreStruct` stores field target `lhsIx` at, or [] when
+// it is no struct field.
+export function fieldStoreStructAt(lhsIx: i32, fnIx: i32): i32[] {
+  const t = nodeAt(lhsIx)
+  if !(t is Member) || !sDeclared { return [] }
+  const si = structIndexOfExpr(t.memObj, fnIx)
+  if si < 0 { return [] }
+  const fi = sFieldIndex(si, t.memProp)
+  if fi < 0 { return [] }
+  return [si, fi]
+}
+
+// Whether `emitStructFieldStoreValue` writes `rhs` into field `fieldIdx` of row `si` as the bare
+// value (`emitExpr`), with no box, atom widen, scalar re-encode or niche seed around it.
+export function fieldStoreValuePlain(
+  si: i32,
+  fieldIdx: i32,
+  rhs: i32,
+  fnIx: i32,
+): boolean {
+  const k = fieldRowKind(sFieldStart[si] + fieldIdx)
+  if k == null { return false }
+  const atoms = sFieldIsLitUnion(si, fieldIdx)
+    || sFieldIsLitUnionArray(si, fieldIdx)
+  return match k {
+    "union" => false
+    "str" | "nulstr" => !exprIsLitAtom(rhs, fnIx)
+    "f64" | "i64" | "f32" | "nulnone" | "nulstruct" | "nulvariant" => atoms
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" => true
+    "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" => true
+    "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" => true
+    "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => true
+  }
+}
+
+// After a struct field store's record and value: the construct-side recover's STORE half (D1222),
+// the scalar covariant copy at the field-store boundary (D2163), then `struct.set`.
+export function fieldStoreTail(
+  si: i32,
+  fieldIdx: i32,
+  lhs: i32,
+  rhs: i32,
+  fnIx: i32,
+): i32 {
+  if nulNicheRecoverOwed(sFieldStoreKind(si, fieldIdx), rhs, fnIx) {
     fbRefAsNonNull()
   }
-  // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
-  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx), a.binLeft) }
+  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx), lhs) }
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
 }
