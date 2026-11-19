@@ -91,6 +91,7 @@ import {
   PrintArm,
   TagIsArm,
   arrLitShort,
+  asgValueArmOf,
   atomEqPlanOf,
   atomStrPlanOf,
   binNumWidth,
@@ -222,6 +223,9 @@ import {
   nulNicheRecoverOwed,
 } from "./emit_value_sites"
 import {
+  asgReReadEnter,
+  asgReReadLeave,
+  asgReadUnwidenOp,
   callIsArrSlice,
   capCellTargetOf,
   captureCountOf,
@@ -462,9 +466,6 @@ let ib: IrFn = irFnNew(-1, "")
 let ibFnIx = -1
 // The `fnStmts` slot of the function being built, for the global storage classes.
 let ibFnPos = -1
-// Whether the builder admits an assignment as a value. It does not, so no global read it builds
-// is an assignment's re-read and the lowering's guard context is never `gcGuardOff`.
-const ASSIGN_AS_VALUE = false
 let ibMiss = ""
 let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
@@ -2270,9 +2271,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   }
   if n is BinExpr {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
-    if n.binOp == "=" && !ASSIGN_AS_VALUE {
-      return irBMiss("assignment as a value")
-    }
+    if n.binOp == "=" { return assignValue(b, n, ix, rep) }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
     if n.binOp == "??" { return coalesce(b, n, ix, rep) }
@@ -2452,6 +2451,25 @@ function siteBuilt(n0: i32, ix: i32): boolean {
     i = i + 1
   }
   return false
+}
+
+// An assignment as a value that legacy re-reads (`asgValueArmOf` "reRead") with no unwidening:
+// the store, then the target's read. A guarded global's read misses, so the guard-off context
+// legacy re-reads in reads it as the builder's own does.
+function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const arm = asgValueArmOf(ix, ibFnIx)
+  if arm != "reRead" { return irBMiss("assignment value " + arm) }
+  if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
+    return irBMiss("assignment value unwiden")
+  }
+  const t = nodeAt(n.binLeft)
+  if !(t is Ident) { return irBMiss("assignment value target") }
+  assignTo(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const m = asgReReadEnter(ix)
+  const o = identRead(b, t, n.binLeft, rep)
+  asgReReadLeave(m)
+  return o
 }
 
 function assignTo(b: i32[], n: BinExpr, ix: i32) {
@@ -3237,20 +3255,12 @@ function corrupt() {
 // The context the function being built accesses globals in: the start function's, or a body's.
 function ibGlobalCtx(): GlobalCtx {
   if ibFnIx >= 0 { return globalCtxOf(ibFnPos) }
-  const c: GlobalCtx = {
-    gcInStart: true,
-    gcFnPos: -1,
-    gcGuardOff: ASSIGN_AS_VALUE,
-  }
+  const c: GlobalCtx = { gcInStart: true, gcFnPos: -1, gcGuardOff: false }
   return c
 }
 
 function globalCtxOf(fnPos: i32): GlobalCtx {
-  const c: GlobalCtx = {
-    gcInStart: false,
-    gcFnPos: fnPos,
-    gcGuardOff: ASSIGN_AS_VALUE,
-  }
+  const c: GlobalCtx = { gcInStart: false, gcFnPos: fnPos, gcGuardOff: false }
   return c
 }
 
@@ -3414,8 +3424,6 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
-  // The accumulator rows `strInPlaceMode` reads are the start's only while legacy just ran.
-  if startStrAccMarked() { return "string accumulator" }
   if gInitProgIdx >= 0 { return "progress cell" }
   const top: i32[] = []
   let i = 0
