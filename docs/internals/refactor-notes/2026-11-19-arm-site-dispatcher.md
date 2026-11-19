@@ -46,6 +46,9 @@ box stash. A name is re-read per arm, as the index read always did.
   (`list-union-length-through-hole`, `-element-`, `-for-`). Their output is the same; the receiver
   is re-read per arm and the arm's payload goes through its local. Every index read is
   byte-identical.
+- Over all of `tests/cases` with `--names`: 7214 same, 4 differing. The fourth is
+  `generics/if-join-two-list-types-length.vl`, also a `.length` over a list-union box, with the
+  same output.
 - Capability matrices: `union-of-maps-index-read-open` 62 → 64 of 64, and both
   `union-of-maps-second-store-into-wider-slot` templates take their `argument` cell. Over every
   list-union and union-of-maps template, `runs → not-runs` 0 and `→ silent` 0.
