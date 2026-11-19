@@ -436,6 +436,28 @@ print(ap(3))
   },
 });
 
+// A `.pop()` at a value position over a number list: the element when the checker proved it,
+// else its null box, both along legacy's value tail.
+Deno.test({
+  name: "ir shadow: a number list's value pop is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function last(xs: i32[]): i32 {
+  if xs.length > 0 { return xs.pop() }
+  return 0
+}
+function opt(xs: f64[]): f64 | null { return xs.pop() }
+print(last([1, 2]))
+print(opt([]) == null)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
