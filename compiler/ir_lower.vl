@@ -47,10 +47,12 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  condLitTrue,
   i32ToStr,
   nodeAt,
 } from "./ast"
 import { unwrapParen } from "./emit_base"
+import { relTrim } from "./emit_reloc"
 import {
   exprVariantIndex,
   forInElemKind,
@@ -75,6 +77,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCoalAtomStr,
   RCoalStr,
   RFnId,
   RGetField,
@@ -88,6 +91,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapFilter,
   RMapGetOr,
   RMapNew,
   RMapOp,
@@ -173,6 +177,7 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullStruct,
   fbRefTest,
   fbResetLazyFrame,
   fbReturn,
@@ -198,26 +203,38 @@ import {
   atomEqTail,
   atomStrPlanOf,
   atomStrTail,
-  binNulTestOf,
+  boxTagIsTail,
+  callRefCallTail,
+  callRefEnvOpen,
+  callRefStash,
+  coalAtomStrClose,
+  coalAtomStrOpen,
+  coalAtomStrReserve,
   coalNulRefBranch,
   coalNulRefOpen,
-  coalResultKindOf,
-  coalesceNulStrStaysNullable,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapNew,
-  emitNullAt,
-  emitNullForRet,
+  emitNullOwn,
+  emitNullRetTail,
   emitReadRecover,
   emitStrLitAt,
   f64RemCallTail,
   f64RemOperandTail,
   fallThroughPadOf,
+  forInBreakOpen,
+  forInCopiesHead,
+  forInCopiesOf,
+  forInCopiesTail,
+  forInCopyClose,
+  forInCopyCount,
+  forInCopyOpen,
+  forInHeaderHoist,
   forInListStore,
   forInListSync,
   forInLoopClose,
-  forInLoopOpen,
+  forInRolledOpen,
   hoistCandRow,
   hoistReadTail,
   hoistRowMark,
@@ -227,8 +244,8 @@ import {
   holeBoxTail,
   holeBoxTyAt,
   idxRowsOn,
+  idxSpanOn,
   initBitOf,
-  localNulStrRecovers,
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
@@ -250,13 +267,13 @@ import {
   narrowedFieldTail,
   narrowedVariantRepIs,
   narrowedVariantTail,
-  nulTestArmOf,
   nulTestAtomTail,
   nulTestRefTail,
   numCastTail,
   numIntrTail,
   numWidenTail,
   printArmOf,
+  printAtomTail,
   printNulStrOpen,
   printNulStrTail,
   printScalarTail,
@@ -273,13 +290,21 @@ import {
   userGlobalWriteClass,
   variantFieldPlain,
   variantFieldTail,
-  variantTagTail,
   voidTailCallee,
 } from "./wasmEmit"
+import { nullRetPlanOf } from "./emit_plan_null"
+import {
+  binNulTestOf,
+  coalResultKindOf,
+  coalesceNulStrStaysNullable,
+  localNulStrRecovers,
+  nulTestArmOf,
+} from "./emit_plan_null"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
 import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
+  callRefDepth,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -514,7 +539,9 @@ function call(c: RCall, tail: boolean) {
   if c.caCallee < 0 || c.caCallee >= fnStmts.length {
     return irLMiss("callee index")
   }
-  if c.caArgs.length == 0 { leaf() }
+  if c.caArgs.length == 0 || c.caEnv { leaf() }
+  if c.caEnv { fbRefNullStruct() }
+  for a in c.caCaps { irLOpnd(a) }
   for a in c.caArgs { irLOpnd(a) }
   if tail && !c.caNever {
     fbReturnCall(gImports + c.caCallee)
@@ -522,6 +549,18 @@ function call(c: RCall, tail: boolean) {
     fbCall(gImports + c.caCallee)
     if c.caNever { fbUnreachable() }
   }
+}
+
+// `RCallRef`: the closure, then legacy's shared head and tail around the arguments
+// (`callRefStash`, `callRefEnvOpen`, `callRefCallTail`).
+function callRef(r: RCallRef, tail: boolean) {
+  irLOpnd(r.crFn)
+  const d = callRefDepth
+  const s = callRefStash()
+  callRefEnvOpen(s, d)
+  for a in r.crArgs { irLOpnd(a) }
+  callRefDepth = d
+  return callRefCallTail(s, r.crSig, tail)
 }
 
 function rhs(r: Rhs, tail: boolean) {
@@ -535,6 +574,15 @@ function rhs(r: Rhs, tail: boolean) {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
     }
+    RCoalAtomStr => {
+      const e = nodeAt(r.zaAt)
+      if !(e is BinExpr) { return irLMiss("atom coalesce node") }
+      coalAtomStrReserve()
+      irLOpnd(r.zaL)
+      coalAtomStrOpen(e)
+      irLOpnd(r.zaD)
+      coalAtomStrClose(e, lw.irAt)
+    }
     RCoalStr => {
       coalNulRefOpen(sTy(), coalesceNulStrStaysNullable(r.czAt, lw.irAt))
       irLOpnd(r.czL)
@@ -542,7 +590,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet | RListLen | RListPush | RListEq | RStrOp => irLowerListHook(r)
+    RListGet | RListLen | RListPush | RListEq | RStrOp | RMapFilter => irLowerListHook(r)
     RListPop => irLMiss("pop value")
     RNumWiden => {
       irLOpnd(r.nwV)
@@ -563,17 +611,18 @@ function rhs(r: Rhs, tail: boolean) {
     RNulTest => nulTestOp(r)
     RNullOf => {
       leaf()
-      emitNullAt(r.nuAt, lw.irAt)
+      emitNullOwn(r.nuOwn)
     }
     RTest => {
       irLOpnd(r.teV)
-      variantTagTail(r.teTarget)
+      boxTagIsTail(r.teTag)
     }
     RBoxField => boxField(r)
     RBoxNarrow => boxNarrow(r)
     RRecover => recoverRead(r)
     RGetField => getField(r)
-    RCallRef | RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RCallRef => callRef(r, tail)
+    RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
     RMapNew => {
@@ -830,9 +879,9 @@ function makeList(r: RMakeList) {
   return arrLitShortTail(arm, r.mlElems.length)
 }
 
-// `SForIn`: legacy's plain walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at
-// the element variable's slot, the list stored, the cursor, the body's index hoists (none for a
-// body that is not hoist-safe), the loop around the IR's body, and the scope closed.
+// `SForIn`: legacy's walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at the
+// element variable's slot, the list stored, its header hoist, the cursor, the body's index hoists,
+// the IR's body in each unrolled copy and the rolled loop, and the scope closed.
 function forIn(n: SForIn, pending: i32[]) {
   const fnIx = lw.irAt
   if n.xfAt < 0 { return irLMiss("walk node") }
@@ -854,33 +903,98 @@ function forIn(n: SForIn, pending: i32[]) {
   cond(n.xfList, pending)
   if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
   forInListStore(s.fiIter, fnIx, lp)
+  forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
   const h = irLoopHoistOpen(-1, s.fiBody, s.fiDecl1, s.fiDecl2)
-  if h != 0 { return irLMiss("walk hoists") }
+  if h < 0 { return irLMiss("walk hoists") }
   scopeBind(s.fiVar, vSlot)
-  const d0 = ctrlDepth
-  const seq = forInLoopOpen(s, fnIx, lp)
+  let d0 = ctrlDepth
+  forInBreakOpen(s)
+  const kb = walkFrames(n, d0)
+  // The unrolled copies, each the IR's body over the element its copy binds.
+  const c = forInCopiesOf(s, fnIx, lp)
+  const marks = tempMarks()
+  if c != null {
+    d0 = ctrlDepth
+    forInCopiesHead(c)
+    const kh = walkFrames(n, d0)
+    let k = 0
+    while k < forInCopyCount() {
+      d0 = ctrlDepth
+      forInCopyOpen(s, c, k)
+      const kc = walkFrames(n, d0)
+      tempMarksRestore(marks)
+      body(n.xfBody, false, -1)
+      framesPop(kc)
+      forInCopyClose(c)
+      k = k + 1
+    }
+    framesPop(kh)
+    forInCopiesTail(c)
+  }
+  d0 = ctrlDepth
+  const seq = forInRolledOpen(s, lp)
   if seq == -2 { return irLMiss("walk loop") }
-  // Legacy's frames around the body: its break block and continue target carry the walk's labels.
-  const brkAt = loopBrkDepth[loopBrkDepth.length - 1]
-  const contAt = loopContDepth[loopContDepth.length - 1]
-  const opened = ctrlDepth - d0
+  const kr = walkFrames(n, d0)
+  tempMarksRestore(marks)
+  body(n.xfBody, false, -1)
+  framesPop(kr)
+  framesPop(kb)
+  forInLoopClose(s, lp, seq)
+  loopHoistClose(h)
+  scopeUnbind()
+  return 0
+}
+
+// Pushes a frame for each block legacy opened past depth `d0`: the walk's break block and its
+// current continue target carry its labels. Returns the count, for `framesPop`.
+function walkFrames(n: SForIn, d0: i32): i32 {
+  const brkAt = if loopBrkDepth.length > 0 { loopBrkDepth[loopBrkDepth.length - 1] } else { -1 }
+  const contAt = if loopContDepth.length > 0 { loopContDepth[loopContDepth.length - 1] } else { -1 }
   let k = 0
-  while k < opened {
+  while d0 + k < ctrlDepth {
     const at = d0 + 1 + k
     lwFrames.push(
       if at == brkAt { n.xfBrk } else if at == contAt { n.xfCont } else { -1 },
     )
     k = k + 1
   }
-  body(n.xfBody, false, -1)
-  while k > 0 {
+  return k
+}
+
+// The temps' definition and use marks, so a body lowered once per unrolled copy defines and uses
+// its temps afresh each time.
+type TempMarks = { tmDef: boolean[], tmUsed: boolean[], tmStack: boolean[] }
+
+function tempMarks(): TempMarks {
+  const m: TempMarks = { tmDef: [], tmUsed: [], tmStack: [] }
+  marksCopy(lwTempDef, m.tmDef)
+  marksCopy(lwTempUsed, m.tmUsed)
+  marksCopy(lwStackVal, m.tmStack)
+  return m
+}
+
+function tempMarksRestore(m: TempMarks) {
+  lwTempDef = []
+  lwTempUsed = []
+  lwStackVal = []
+  marksCopy(m.tmDef, lwTempDef)
+  marksCopy(m.tmUsed, lwTempUsed)
+  marksCopy(m.tmStack, lwStackVal)
+  return 0
+}
+
+function marksCopy(from: boolean[], to: boolean[]) {
+  for b in from { to.push(b) }
+  return 0
+}
+
+function framesPop(k: i32) {
+  let i = 0
+  while i < k {
     lwFrames.pop()
-    k = k - 1
+    i = i + 1
   }
-  forInLoopClose(s, lp, seq)
-  loopHoistClose(h)
-  scopeUnbind()
   return 0
 }
 
@@ -898,6 +1012,9 @@ function printOp(r: RPrint) {
   }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
+  if arm == "atom" || arm == "nulAtom" {
+    return printAtomTail(arm, c.callArgs[0], lw.irAt)
+  }
   return printScalarTail(arm)
 }
 
@@ -1084,6 +1201,14 @@ function brDepth(label: i32): i32 {
 }
 
 // Whether `o` is the immediate `true`.
+// Whether the `if` built from node `at` tests the literal `true` (`condLitTrue`); a node that is
+// no `if` statement, a loop's exit or a helper's, has no test of its own to read.
+function testIsLitTrue(at: i32): boolean {
+  if at < 0 || at >= P.nodes.length { return true }
+  const s = nodeAt(at)
+  return if s is IfStmt { condLitTrue(s.ifCond) } else { true }
+}
+
 function isTrue(o: Opnd): boolean {
   return match o {
     OImm => repPrim(o.oiRep) == "bool" && o.oiBits == 1
@@ -1130,12 +1255,15 @@ function retagOperand(t: i32): Opnd {
   return none
 }
 
+// 0 for a closure call's right-hand side, which a return takes in its tail form too; -1 else.
+function callRefTemp(r: Rhs): i32 { return if r is RCallRef { 0 } else { -1 } }
+
 function callTemp(o: Opnd): i32 {
   return match o {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
       const r = tempRhs(o.ov)
-      if r is RCall { r.caCallee } else { -1 }
+      if r is RCall { r.caCallee } else { callRefTemp(r) }
     }
     OImm | OStr => -1
   }
@@ -1216,6 +1344,7 @@ function callReturns(b: i32[], i: i32): boolean {
   const nx = lw.irNodes[b[i + 1]]
   if !(n is SEffect && nx is SReturn) || nx.rtHas { return false }
   const r = n.efRhs
+  if r is RCallRef { return r.crVoid }
   return r is RCall && !r.caNever && voidTailCallee(r.caCallee)
 }
 
@@ -1275,6 +1404,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
         if !t && si >= 0 && !repIsNoValue(lw.irSigRet[si]) { fbDrop() }
+        return 0
+      }
+      if r is RCallRef {
+        const t = tail && r.crVoid
+        callRef(r, t)
+        irLSettle(pending)
+        if !t && r.crDrop { fbDrop() }
         return 0
       }
       if r is RListPush || r is RListPop {
@@ -1362,7 +1498,8 @@ const IF_VALUED = 2
 
 // Opens `if` node `id` up to its `else`. The loop exit `if c {} else { br L }` is legacy's
 // `eqz; br_if`, and a literal-true test writes no test at all, either for that exit or for an
-// else-less `if`, whose arm runs inline.
+// else-less `if`, whose arm runs inline. A test that is only constant, as a dead null test is,
+// keeps its `if` (`condLitTrue`).
 function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   if id < 0 || id >= lw.irNodes.length { return IF_NOT }
   const n = lw.irNodes[id]
@@ -1371,7 +1508,8 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   const exitBr = n.siThen.length == 0
     && n.siElse.length == 1
     && isBr(n.siElse[0])
-  if isTrue(n.siCond) && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
+  const litTrue = isTrue(n.siCond) && testIsLitTrue(lw.irNodeAt[id])
+  if litTrue && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
     return IF_DONE
@@ -1509,6 +1647,7 @@ function ret(n: SReturn, pending: i32[]) {
       const r = tempRhs(t.ov)
       lwSeq = []
       if r is RCall { call(r, true) }
+      if r is RCallRef { callRef(r, true) }
       lwSeq.push(t.ov)
       if outer >= 0 { lwSeq.push(outer) }
       irLSettle(pending)
@@ -1643,6 +1782,38 @@ function runAgrees(rep: i32, li: i32): boolean {
 // Lowers `f`'s body, with its globals accessed in `ctx`, into `lwBuf` up to its `end`, or a
 // mismatch class in `lwMiss`.
 function lowerBody(f: IrFn, ctx: GlobalCtx) {
+  lwReset(f, ctx, [])
+  uBoxNewEnd = -1
+  // The builders keep the emitter's control depth; it goes back as found.
+  const prev = wTarget(lwBuf)
+  const valued = !repIsNoValue(f.irRetRep)
+  // The single start body opens with legacy's pool fill; an init function's does not.
+  if f.irPoolFill { irStartPrologueHook() }
+  // Legacy tail-calls a void body's last call, but not the start function's.
+  body(f.irBody, !valued && f.irAt >= 0, -1)
+  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
+  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
+  if pad == "null" {
+    // Legacy sinks this `null` when the return sink fired; the IR does not build that exit.
+    if lwSinkFired > 0 {
+      irLMiss("null fall-through into the return sink")
+    } else {
+      emitNullRetTail(nullRetPlanOf(f.irAt))
+    }
+  } else if pad == "unreachable" {
+    fbUnreachable()
+  }
+  if lwSinkFired > 0 { sinkClose() }
+  fbEnd()
+  wTarget(prev)
+  // Every frame a builder opened is closed, so the one depth not given back is the function's
+  // own `end`'s, which opened none.
+  ctrlDepth = ctrlDepth + 1
+  return 0
+}
+
+// Starts lowering `f`, its globals accessed in `ctx`, onto `buf`.
+function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lw = f
   lwGlobalCtx = ctx
   lwMiss = ""
@@ -1666,35 +1837,161 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   lwRowFrom = []
   lwRowTo = []
   lwRowKind = []
-  lwBuf = []
+  lwBuf = buf
   lwSinkFired = 0
   lwPushed = []
-  uBoxNewEnd = -1
-  // The builders keep the emitter's control depth; it goes back as found.
-  const prev = wTarget(lwBuf)
-  const valued = !repIsNoValue(f.irRetRep)
-  // The single start body opens with legacy's pool fill; an init function's does not.
-  if f.irPoolFill { irStartPrologueHook() }
-  // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && f.irAt >= 0, -1)
-  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
-  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
-  if pad == "null" {
-    // Legacy sinks this `null` when the return sink fired; the IR does not build that exit.
-    if lwSinkFired > 0 {
-      irLMiss("null fall-through into the return sink")
-    } else {
-      emitNullForRet(f.irAt)
-    }
-  } else if pad == "unreachable" {
-    fbUnreachable()
+  lwPushing = false
+  return 0
+}
+
+// The lowering's whole state, saved around a fragment lowered while another lowering is open.
+type LwFrame = {
+  lfFn: IrFn,
+  lfCtx: GlobalCtx,
+  lfMiss: string,
+  lfTempRhs: Rhs[],
+  lfTempDef: boolean[],
+  lfTempUsed: boolean[],
+  lfStackVal: boolean[],
+  lfStackLive: i32,
+  lfSeq: i32[],
+  lfFrames: i32[],
+  lfSpanOpen: i32[],
+  lfSpanAt: i32[],
+  lfRowAst: i32[],
+  lfRowFrom: i32[],
+  lfRowTo: i32[],
+  lfRowKind: i32[],
+  lfBuf: u8[],
+  lfSinkFired: i32,
+  lfPushed: i32[],
+  lfPushing: boolean,
+}
+
+function lwSave(): LwFrame {
+  const f: LwFrame = {
+    lfFn: lw,
+    lfCtx: lwGlobalCtx,
+    lfMiss: lwMiss,
+    lfTempRhs: lwTempRhs,
+    lfTempDef: lwTempDef,
+    lfTempUsed: lwTempUsed,
+    lfStackVal: lwStackVal,
+    lfStackLive: lwStackLive,
+    lfSeq: lwSeq,
+    lfFrames: lwFrames,
+    lfSpanOpen: lwSpanOpen,
+    lfSpanAt: lwSpanAt,
+    lfRowAst: lwRowAst,
+    lfRowFrom: lwRowFrom,
+    lfRowTo: lwRowTo,
+    lfRowKind: lwRowKind,
+    lfBuf: lwBuf,
+    lfSinkFired: lwSinkFired,
+    lfPushed: lwPushed,
+    lfPushing: lwPushing,
   }
-  if lwSinkFired > 0 { sinkClose() }
-  fbEnd()
-  wTarget(prev)
-  // Every frame a builder opened is closed, so the one depth not given back is the function's
-  // own `end`'s, which opened none.
-  ctrlDepth = ctrlDepth + 1
+  return f
+}
+
+function lwRestore(f: LwFrame) {
+  lw = f.lfFn
+  lwGlobalCtx = f.lfCtx
+  lwMiss = f.lfMiss
+  lwTempRhs = f.lfTempRhs
+  lwTempDef = f.lfTempDef
+  lwTempUsed = f.lfTempUsed
+  lwStackVal = f.lfStackVal
+  lwStackLive = f.lfStackLive
+  lwSeq = f.lfSeq
+  lwFrames = f.lfFrames
+  lwSpanOpen = f.lfSpanOpen
+  lwSpanAt = f.lfSpanAt
+  lwRowAst = f.lfRowAst
+  lwRowFrom = f.lfRowFrom
+  lwRowTo = f.lfRowTo
+  lwRowKind = f.lfRowKind
+  lwBuf = f.lfBuf
+  lwSinkFired = f.lfSinkFired
+  lwPushed = f.lfPushed
+  lwPushing = f.lfPushing
+  return 0
+}
+
+// Lowers fragment `f` with value `out` (`irLowerNodeIn`) onto the buffer being written, where
+// legacy's own writer would leave it, in legacy's frame for `fnStmts` slot `fnPos`. "" when
+// written, its rows banked as legacy banks them unless `probe`; else the miss, with the buffer,
+// its relocation rows and the callees as found. A `probe` leaves the emitter's state as found.
+export function irLowerFragment(
+  f: IrFn,
+  out: Opnd,
+  ctx: GlobalCtx,
+  fnPos: i32,
+  probe: boolean,
+): string {
+  const sv = lwSave()
+  const callees0 = dfeCallee.length
+  const box0 = uBoxNewEnd
+  const depth0 = ctrlDepth
+  const cur = wTarget([])
+  wTarget(cur)
+  const at = cur.length
+  lwReset(f, ctx, cur)
+  fragmentBody(f.irBody, out)
+  if lwSinkFired > 0 { irLMiss("fragment return") }
+  if ctrlDepth != depth0 { irLMiss("fragment control depth") }
+  const why = lwMiss
+  if why == "" && probe {
+    while dfeCallee.length > callees0 { dfeCallee.pop() }
+    uBoxNewEnd = box0
+  } else if why == "" {
+    fragmentRows(fnPos)
+  } else {
+    while cur.length > at { cur.pop() }
+    relTrim()
+    while dfeCallee.length > callees0 { dfeCallee.pop() }
+    ctrlDepth = depth0
+  }
+  lwRestore(sv)
+  return why
+}
+
+// Writes fragment body `b`, then its value `out`, which consumes what the body left pending as a
+// `return`'s value does.
+function fragmentBody(b: i32[], out: Opnd) {
+  const pending: i32[] = []
+  for id in b {
+    if lwMiss != "" { return 0 }
+    spanOpen(id)
+    node(id, pending, false, -1)
+    spanClose(id)
+  }
+  cond(out, pending)
+  if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
+  return 0
+}
+
+// A fragment's rows, banked as legacy's writers bank them: an element read's only where the
+// `vl-src` section is written, else noted for the shadow; a statement's always.
+function fragmentRows(fnPos: i32) {
+  let r = 0
+  while r < lwRowAst.length {
+    if lwRowKind[r] == 6 && !idxSpanOn() {
+      shIdxNode.push(lwRowAst[r])
+      shIdxFrom.push(lwRowFrom[r])
+      shIdxTo.push(lwRowTo[r])
+    } else {
+      bankSpanRow(
+        lwRowAst[r],
+        fnPos,
+        lwRowFrom[r],
+        lwRowTo[r],
+        lwRowKind[r],
+        "",
+      )
+    }
+    r = r + 1
+  }
   return 0
 }
 
