@@ -436,6 +436,23 @@ print(ap(3))
   },
 });
 
+// A packed byte list's element reads unsigned into an i32 along legacy's scalar read tail.
+Deno.test({
+  name: "ir shadow: a packed byte element read is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function at(bs: u8[], i: i32): i32 { return bs[i] + 1 }
+const bs: u8[] = [200, 7]
+print(at(bs, 0))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A proven loop accumulator, local or module, appends its parts through `emitStrAccAppend`'s
 // shared tail and matches legacy's bytes.
 Deno.test({
