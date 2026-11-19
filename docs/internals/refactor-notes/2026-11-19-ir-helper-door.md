@@ -10,7 +10,9 @@ helpers: `__f64_rem__` (family B), the six string helpers (D) and the three UTF-
   so the function, type and name sections do not change. The locals vector comes from the
   function's `local` variables in slot order; a slotless local is a valued block's out.
 - **The builder** (`compiler/ir_helper.vl`). Operands are values; each operation appends its node
-  to the open body (a stack of bodies, so no global is saved and rewritten).
+  to the open body (a stack of bodies, so no global is saved and rewritten). Its state (`hf`, `hb`)
+  is reset by `begin`; a family that nests one helper's build inside another's must make it an
+  explicit builder value first.
 - **The raw layer.** A helper holds wasm GC references no VL type names: a string's backing,
   later a map's row array. They are typed by one rep node, `RRaw { rwHeap, rwNull }`
   (`emit_rep.vl`), and moved by two IR kinds, `RRawOp` and `SRawOp`, whose ops each lower to one
@@ -21,8 +23,10 @@ helpers: `__f64_rem__` (family B), the six string helpers (D) and the three UTF-
   - Verifier rule 10 confines raw reps and ops to a function with `irHelper` set, and checks every
     reference operand is raw at its op's heap type. The ops form the `raw` family, which
     `CLAIMED` never lists.
-  - Not checked: a `struct.get`'s result rep and a `call`'s arguments. No table keeps a heap's
-    layout or a helper's signature; wasm validation of every built module is the backstop.
+  - Not checked: a `struct.get`'s result rep, a `call`'s arguments, and a nullable reference
+    flowing where a non-null one is required (`rwNull` is not read by the verifier). No table
+    keeps a heap's layout or a helper's signature; wasm validation of every built module is the
+    backstop.
 - **Helper-only lowering forms**, so the bytes are the hand bodies' own: a valued block and
   valued branch, `if c { br L }` as `br_if`, and a final valued return as fall-through.
   Each is gated on `irHelper`, so no user function's lowering changes.
@@ -30,8 +34,8 @@ helpers: `__f64_rem__` (family B), the six string helpers (D) and the three UTF-
 ## Builder rules
 1. **A loop exit is `if c { br L }`, never `if !c {} else { br L }`.** The second form lowers to
    `cmp; eqz; br_if`, and a float compare under `eqz` cannot be folded (NaN): it measured +3-4%
-   CPU on `__f64_rem__`'s loops (median of 10, interleaved). `exitIf` is the only exit the builder
-   offers.
+   CPU on `__f64_rem__`'s loops (median of 10, interleaved). `exitIf` writes the `br_if` form;
+   `unless` (`if c {} else { b }`) exists only where a hand body's own loop test has that shape.
 2. **A temp is defined inside the arm that uses it.** Arguments evaluate before the call, so
    `when(test(..), close())` after `open()` defines the test inside the arm. The lowering refuses
    such a function loudly (`non-stack temp: out of order`, `reads temp before its definition`),
