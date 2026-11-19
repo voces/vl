@@ -28371,21 +28371,11 @@ function emitCallCorePrint(callIx: i32, c: Call, fnIx: i32) {
     )
   }
   if arm == "nulAtom" {
-    return emitPrintNulLitUnion(arg, nulLitAtomTexts(arg, fnIx), fnIx)
+    return emitPrintNulLitUnion(arg, printAtomTexts(arm, arg, fnIx), fnIx)
   }
   if arm == "atom" {
-    // `litAtomWidenTexts` is `emitAtomToStr`'s shared ladder; its declaration rung is
-    // what a monomorphized instance needs, since the instance's leaf nodes share the
-    // generic body and record the generic's own type parameter instead.
-    const lpTexts = litAtomWidenTexts(arg, fnIx)
-    // A claim with no texts means the rep and the recorded type disagree: the chain would
-    // match nothing, rc 0 with no output.
-    if lpTexts.length == 0 {
-      return emitFail(
-        "emitProgram: print of a literal-union atom whose type carries no member texts",
-      )
-    }
-    return emitPrintAtomStr(arg, lpTexts, fnIx)
+    if emitStashAtomId(arg, fnIx) < 0 { return -1 }
+    return printAtomStashed(printAtomTexts(arm, arg, fnIx), false)
   }
   if arm == "nulStr" { return emitPrintNulString(arg, fnIx) }
   if arm == "nulBool" { return emitPrintNulBool(arg, fnIx) }
@@ -38409,13 +38399,46 @@ function emitPrintNulBool(argIx: i32, fnIx: i32) {
   return 0
 }
 
-// `print(<literal-union atom>)` — widen the atom to its member string through the shared
-// `emitAtomToStrChain` tower, then stream it. Shared rather than re-spelled, since a
-// per-member `if id == <id> { print "<member>" }` chain re-reads the receiver once per
-// member — free for a place, but another call each time for `print(f())`.
-function emitPrintAtomStr(argIx: i32, texts: string[], fnIx: i32) {
-  if emitStashAtomId(argIx, fnIx) < 0 { return -1 }
-  return emitPrintAtomFromStash(texts)
+// The members a `print` of the atom `argIx` (arm `atom` or `nulAtom`) decodes at, which legacy's
+// print and the IR's both spend. `litAtomWidenTexts` is `emitAtomToStr`'s ladder; its declaration
+// rung is what a monomorphized instance needs, its leaves recording the generic's parameter.
+export function printAtomTexts(arm: PrintArm, argIx: i32, fnIx: i32): string[] {
+  if arm == "nulAtom" { return nulLitAtomTexts(argIx, fnIx) }
+  return litAtomWidenTexts(argIx, fnIx)
+}
+
+// The print of the atom id stashed in str-op scratch i32 slot 0: its decode at `texts` through the
+// shared tower, which reads the id once where a per-member chain would re-run `print(f())`'s call,
+// then the stream; behind the `-1` null word where `nul`. Returns 0, or -1 failed.
+function printAtomStashed(texts: string[], nul: boolean): i32 {
+  if !nul {
+    // No texts means the rep and the recorded type disagree: the chain would match nothing.
+    if texts.length == 0 {
+      return emitFail(
+        "emitProgram: print of a literal-union atom whose type carries no member texts",
+      )
+    }
+    return emitPrintAtomFromStash(texts)
+  }
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)     // if (void)
+  emitPrintNullWord()
+  fbEnd()
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(71) // 0x47 i32.ne
+  fbIf(64)     // if (void)
+  if emitPrintAtomFromStash(texts) < 0 { return -1 }
+  fbEnd()
+  return 0
+}
+
+// A `print` of an atom or its `K | null` after its operand, the id on the stack: the IR's tail.
+export function printAtomTail(arm: PrintArm, argIx: i32, fnIx: i32): i32 {
+  setStrScrI(0)
+  return printAtomStashed(printAtomTexts(arm, argIx, fnIx), arm == "nulAtom")
 }
 
 // The stashed-id half of the atom print: the shared widen tower over str-op scratch i32 slot 0,
@@ -38440,19 +38463,7 @@ function emitPrintNulLitUnion(argIx: i32, texts: string[], fnIx: i32) {
   } else if emitStashAtomId(argIx, fnIx) < 0 {
     return -1
   }
-  pushStrScrI(0)
-  fbI32Const(-1)
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)     // if (void)
-  emitPrintNullWord()
-  fbEnd()
-  pushStrScrI(0)
-  fbI32Const(-1)
-  fbI32Bin(71) // 0x47 i32.ne
-  fbIf(64)     // if (void)
-  if emitPrintAtomFromStash(texts) < 0 { return -1 }
-  fbEnd()
-  return 0
+  return printAtomStashed(texts, true)
 }
 
 // one arm of the value-union print: the box is already stashed in `slot`, so recover this
@@ -42962,27 +42973,47 @@ function emitCoalesceNulBoolJoin(e: BinExpr, exprIx: i32, fnIx: i32) {
 // `k ?? d` at a `string` result over the `K | null` atom niche: `-1` takes the default as a
 // string, any other id widens through the member tower `emitAtomToStr` uses.
 function emitCoalesceNulAtomStr(e: BinExpr, fnIx: i32) {
-  const texts = nulLitAtomTexts(e.binLeft, fnIx)
-  if texts.length == 0 {
+  if nulLitAtomTexts(e.binLeft, fnIx).length == 0 {
     return emitFail(
       "emitProgram: `??` over a nullable literal union has no member strings",
     )
   }
-  const slot = widenTmpSlot(4001)
+  coalAtomStrReserve()
   if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalTee(slot)
-  fbI32Const(-1)
-  fbI32Bin(70) // 0x46 i32.eq → null?
-  fbIfRefNul(sTy(), defExprNullable(e.binRight))
+  coalAtomStrOpen(e)
   if exprIsLitAtom(e.binRight, fnIx) {
     if emitAtomToStr(e.binRight, fnIx) < 0 { return -1 }
   } else {
     if emitExpr(e.binRight, fnIx) < 0 { return -1 }
   }
-  fbElse() // present → the id's member string
-  fbLocalGet(slot)
+  return coalAtomStrClose(e, fnIx)
+}
+
+// Takes the slot `coalAtomStrOpen` keeps the id in, before `l` is written, as its first use
+// numbers it.
+export function coalAtomStrReserve(): i32 { return widenTmpSlot(4001) }
+
+// `l ?? d` over a `K | null`, after `l`'s id: keep it, and open the `null` branch the default
+// fills, typed by whether the default may be null.
+export function coalAtomStrOpen(e: BinExpr): i32 {
+  fbLocalTee(widenTmpSlot(4001))
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq → null?
+  fbIfRefNul(sTy(), defExprNullable(e.binRight))
+  return 0
+}
+
+// After the default: the present branch, the kept id's member string at `l`'s members.
+export function coalAtomStrClose(e: BinExpr, fnIx: i32): i32 {
+  fbElse()
+  fbLocalGet(widenTmpSlot(4001))
   setStrScrI(0)
-  if emitAtomToStrChain(texts, 0, strScratchBase + 3) < 0 { return -1 }
+  if (
+    emitAtomToStrChain(nulLitAtomTexts(e.binLeft, fnIx), 0, strScratchBase + 3)
+    < 0
+  ) {
+    return -1
+  }
   fbEnd()
   return 0
 }
