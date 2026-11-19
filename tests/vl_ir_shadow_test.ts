@@ -389,10 +389,10 @@ print(e().length)
   },
 });
 
-// A walk's own `break` and `continue` branch to the frames legacy's loop opens: covered and
-// matched. A walk whose body is hoist-safe reads its header once and may unroll: a named miss.
+// A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
+// body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
-  name: "ir shadow: a walk's own branch is matched, a hoisted walk a named miss",
+  name: "ir shadow: a walk's own branch and a hoisted walk are matched",
   ignore,
   fn: () => {
     const src = `function fb(xs: i32[]): i32 {
@@ -417,11 +417,8 @@ function fh(xs: i32[]): i32 {
 print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
 `;
     const { rows } = run(src, true);
-    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
-      throw new Error(`want the two branching walks covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered for in hoisted") !== 1) {
-      throw new Error(`want one "uncovered for in hoisted" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want the three walks covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
