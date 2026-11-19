@@ -70,8 +70,8 @@ now builds past 3,000 closure-global reads, so the `closures` scaling axis read 
   - L2 self-compile fuel, same box against master's seed: 99,541,376,265 → 99,766,184,054
     (+0.23%);
   - scaling axes green.
-- **Lines:** in `compiler/`, plus the field table's reflow in `lint.vl`. A coverage step, so the bar
-  is functions per line.
+- **Lines:** +408 / −65 in `compiler/`, the field table's reflow in `lint.vl` among them. A coverage step, so the bar
+  is functions per line: 468 distilled and 37 self-compile functions.
 
 ## What is left in these classes
 - `call of a non-declaration` alone: 46. A callee `callRefPlainKey` declines: a wide or coerced
