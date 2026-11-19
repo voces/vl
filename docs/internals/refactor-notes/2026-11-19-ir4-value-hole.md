@@ -60,9 +60,27 @@ Fixpoint seeds on both sides, master e1419277f against this branch.
 
 | re-entry | master: lines leaving the claim path / drivers / reached | this branch |
 |---|---|---|
-| `emitBoxAroundHole` | 1,452 / 58 / 8,332 | CENSUS_AFTER |
+| `emitBoxAroundHole` | 1,452 / 58 / 8,332 | gone: no re-entry |
 
-**Lines.** HOLE_LINES
+Of the 58 drivers the claim path reached only through the hole (1,452 lines):
+- 25 (988 lines) no longer run in an IR-lowered function. They are the ladder's writers that call
+  `emitExpr` themselves (`emitUnionCoerce*`, `emitUnionArmValueBox`, `emitUnionWideArmBox`,
+  `emitUnionBoxNulNiche`, `emitUnionBoxArg`/`Go`, `emitUnionMapArmBox`, `emitWidened`,
+  `emitNumPlain`, `emitStashAtomId` and the like), and unclaimed functions keep them.
+- 32 (450 lines) are now `@ir`. These are the deciders and writers the plan shares:
+  `coerceValueAtomKind`, `coerceListAtomOf`, `unionArmTagClash`, `wideRetagPairs`,
+  `boxRetagArmsOfTys`, `emitAtomToStrChain`, the `msHas*` predicates, and byte writers.
+- 1 (14 lines, `emitBoxAroundHole`) is deleted.
+
+The remaining re-entries on this branch are unchanged: `mapGetOrHelperRoute` 357 / 11,
+`forInLoopOpen` 171 / 6, `strEqTail` 73 / 4, `popDropTail` 38 / 3, `emitStaticLitAtom` 9 / 1.
+
+**Lines.** The compiler grows by 159 lines (+295 / −136). Legacy deletes the hole and its plumbing
+(about 70 lines). The plan, its halves and the builder's operand check add about 175. About 60
+lines move out of `emitUnionCoerceValueAtom` into `atomNulStrWhy` and `atomNulStrTail`. This step
+retires a re-entry and moves the box decision to where both sides call it. It deletes no ladder
+rung, because every rung still serves the unions the plan leaves to the ladder and the unclaimed
+functions.
 
 Before the plan took the `null` literal below the record rungs, the builder missed 463 functions
 as `box ladder`. They were `null` literals that `exprIsNulNone` does not answer for, which legacy
