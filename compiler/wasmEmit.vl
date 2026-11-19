@@ -23747,7 +23747,7 @@ function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
 function emitIfExpr(ifIx: i32, fnIx: i32) {
   // The IR claims an `if` by `ifExprPlainKind`; under the armed shadow, where legacy emits every
   // function, every exit here proves that decision agrees. Its exclusions keep this `if` off the
-  // link's int-switch and static-condition exits.
+  // link's int-switch and literal-`true` exits.
   const pk = if irShadowOn { ifExprPlainKind(ifIx, fnIx) } else { -1 }
   const gv = optGuardCallOf(ifIx, fnIx)
   if gv >= 0 {
@@ -23817,27 +23817,33 @@ function ifPlainDisagrees(ifIx: i32) {
 // value per arm and no `else if`, or -1: no guard call, null, atom, union or ref join, integer
 // switch, static `is` or literal-true condition, prelude, or v128.
 export function ifExprPlainKind(ifIx: i32, fnIx: i32): i32 {
-  if ifIx < 0 || ifIx >= P.nodes.length { return -1 }
+  if ifExprPlainWhy(ifIx, fnIx) != "" { return -1 }
+  return ifExprValtype(ifIx, fnIx)
+}
+
+// Why the value `if` at `ifIx` is not on the plain scalar path `ifExprPlainKind` names, or "".
+export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
+  if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
-  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return -1 }
-  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return -1 }
+  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return "no else" }
+  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return "arm not lone" }
   const c = nodeAt(unwrapParen(n.ifCond))
-  if c is BoolLit || c is IsExpr || c is Unary && c.unOp == "!" { return -1 }
-  if optGuardCallOf(ifIx, fnIx) >= 0 || intMatchHeadAt(ifIx) { return -1 }
-  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) { return -1 }
-  if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
-    return -1
-  }
-  if exprUnion(ifIx, fnIx) { return -1 }
-  if ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx)) != null {
-    return -1
-  }
+  // A decided `is` folds its dead arm off the condition's own bytes (`staticValueIfCond`): the
+  // IR builds an `is` only as a tag compare, never that constant, and misses a constant one.
+  if c is BoolLit { return "constant condition" }
+  if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
+  if intMatchHeadAt(ifIx) { return "int match" }
+  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) { return "null join" }
+  if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) { return "atom join" }
+  if exprUnion(ifIx, fnIx) { return "union" }
+  const rk = ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx))
+  if rk != null { return "ref " + rk }
   const jpin = nodeTyInOf(ifIx, fnIx)
   if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
-    return -1
+    return "string drops null atom"
   }
-  const vt = ifExprValtype(ifIx, fnIx)
-  return if vt == 123 { -1 } else { vt }
+  if ifExprValtype(ifIx, fnIx) == 123 { return "valtype" }
+  return ""
 }
 
 // Whether `blockIx` is a block whose one statement is its value.
@@ -37673,14 +37679,12 @@ function emitStmtTail(stmtIx: i32, fnIx: i32) {
 }
 
 // Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": an
-// `is` test or its `!` it decides off the bytes it wrote, an integer `match` chain, a function
-// taking the union return sink, or no `else`.
+// integer `match` chain, a function taking the union return sink, or no `else`. Its condition
+// is `emitGuardCond`'s, a decided `false` (`isDecidedFalse`) writing no then arm.
 export function tailIfPlainWhy(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "tail if node" }
   const n = nodeAt(ix)
   if !(n is IfStmt) || n.ifCond < 0 { return "tail if node" }
-  const c = nodeAt(unwrapParen(n.ifCond))
-  if c is IsExpr || c is Unary && c.unOp == "!" { return "tail if guard" }
   if intMatchHeadAt(ix) { return "tail if switch" }
   if fnUses.unionSink { return "tail if union sink" }
   return if n.ifElse < 0 { "else-less tail if" } else { "" }
