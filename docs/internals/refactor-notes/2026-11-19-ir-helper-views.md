@@ -19,13 +19,16 @@ emitted. The writers and their sub-writers (`svGuardedIdx`, `svRefTest`, `rvSrcE
   valued `if` at its statement position, so the store's two leading operands are pushed first. The
   lowering keeps pushes off the pending order and checks that the next effect consumes every
   outstanding push as its leading operands, in push order; a push left unconsumed is a miss.
-- The record element's heap type is not tracked: it is a raw rep at heap -1 (any) between its
-  `array.get` and its box or null test.
+- An element whose heap type no table keeps is untracked: a raw rep at heap -1. That covers the
+  record views' element between its `array.get` and its box or null test, and step 3's compaction
+  move between `array.get` and `array.set`, which was an i32 rep. Rule 10 now refuses an untracked
+  rep in anything but a temp, so the value stays on the stack, where wasm validation types it,
+  and can never be spilled to a local of the wrong type. A later step can type it from the shape.
 
 ## Measured
 - Against the F seed (hand-written views): the self-compile is identical; every `tests/cases`
   program not `@error` plus every capability probe: identical 7511, fail under both 68, differ 0.
   The scalar and record view cases (`readonly-*-view-*`, nullable-record sources included) build
   identically.
-- Lines, compiler only: +406 / −429. A first cut with separate scalar and record builders was
+- Lines, compiler only: +423 / −433 against master after the merge. A first cut with separate scalar and record builders was
   +53. Folding them into one view model is what made it negative.
