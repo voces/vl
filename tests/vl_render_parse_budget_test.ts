@@ -46,7 +46,7 @@ const census = async (
 const EMIT = `export function nameIsArray(name: string) {
   splitUnionAtoms(name, [])
 }
-function nameIsArrayGo(name: string) { nullablePartOf(name) }
+function nameIsArrayGo(name: string) { nameIsLitUnionType(name) }
 
 function kindOf(t: i32) {
   // nameIsArray(tyToEmitName(t)) in a comment is not a call
@@ -64,11 +64,11 @@ function rowOf(t: i32) {
   emitFail(tyToStr(t))
 }
 
-export function tyToEmitNameAt(ix: i32, rc: i32) { nullablePartOf(tyToEmitName(ix)) }
+export function tyToEmitNameAt(ix: i32, rc: i32) { nameIsLitUnionType(tyToEmitName(ix)) }
 
 function emitCast(fromTy: i32, toTy: i32) {
   const fk = valueAtomKind(tyToEmitName(fromTy))
-  if nullablePartOf(tyToEmitName(toTy)) != "" && fk >= 0 { return }
+  if nameIsLitUnionType(tyToEmitName(toTy)) != "" && fk >= 0 { return }
 }
 `;
 const CHECKER = `function render(t: i32) { tyToEmitName(t) }
@@ -135,7 +135,7 @@ Deno.test({
         "compiler/emit_x.vl:19  rowOf  tyToStr",
         "compiler/emit_x.vl:25  emitCast  valueAtomKind",
         "compiler/emit_x.vl:25  emitCast  tyToEmitName",
-        "compiler/emit_x.vl:26  emitCast  nullablePartOf",
+        "compiler/emit_x.vl:26  emitCast  nameIsLitUnionType",
         "compiler/emit_x.vl:26  emitCast  tyToEmitName",
       ];
       if (r.code !== 0 || JSON.stringify(got) !== JSON.stringify(want)) {
@@ -180,7 +180,7 @@ Deno.test({
         "ty-parse-unclassified": [
           "compiler/check_emit_queries.vl:1  recordClonedTy  nameToTy",
           "compiler/emit_x.vl:25  emitCast  valueAtomKind",
-          "compiler/emit_x.vl:26  emitCast  nullablePartOf",
+          "compiler/emit_x.vl:26  emitCast  nameIsLitUnionType",
         ],
       };
       if (JSON.stringify(graded) !== JSON.stringify(wantGraded)) {
@@ -329,19 +329,19 @@ Deno.test({
       await Deno.mkdir(`${dir}/scripts`);
       await Deno.writeTextFile(
         `${dir}/scripts/render-parse-origins.txt`,
-        "source\tcompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tunionHasAtom\t0\n",
+        "source\tcompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tvalueAtomKind\t0\n",
       );
       await Deno.writeTextFile(
         `${dir}/scripts/render-parse-fed.txt`,
-        "# fixture\ncompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tunionHasAtom\t0\n",
+        "# fixture\ncompiler/emit_map_twins.vl\tunionHasBoolLeafArm\tvalueAtomKind\t0\n",
       );
       await Deno.writeTextFile(
         `${dir}/compiler/emit_map_twins.vl`,
-        `function unionHasBoolLeafArm(arms: string[]) {\n  return unionHasAtom(arms[0])\n}\n`,
+        `function unionHasBoolLeafArm(arms: string[]) {\n  return valueAtomKind(arms[0])\n}\n`,
       );
       const fed = await census(["--list", "ty-string-parse", "--root", dir]);
       const want =
-        "compiler/emit_map_twins.vl:2  unionHasBoolLeafArm  unionHasAtom";
+        "compiler/emit_map_twins.vl:2  unionHasBoolLeafArm  valueAtomKind";
       if (fed.code !== 0 || fed.out.trim() !== want) {
         throw new Error(
           `render-fed: want ${want}, got rc ${fed.code} ${fed.out}`,
