@@ -410,7 +410,7 @@ print(e().length)
 });
 
 // An append and a prepend site in a loop build their right side through `emitStrSiteCat`'s
-// shared tail and match legacy's bytes; the loop accumulator stays a named miss.
+// shared tail and match legacy's bytes.
 Deno.test({
   name: "ir shadow: a string append site is covered and matched",
   ignore,
@@ -431,6 +431,53 @@ print(ap(3))
     const { rows } = run(src, true);
     if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
       throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A packed byte list's element reads unsigned into an i32 along legacy's scalar read tail.
+Deno.test({
+  name: "ir shadow: a packed byte element read is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function at(bs: u8[], i: i32): i32 { return bs[i] + 1 }
+const bs: u8[] = [200, 7]
+print(at(bs, 0))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A proven loop accumulator, local or module, appends its parts through `emitStrAccAppend`'s
+// shared tail and matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a string accumulator append is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let g = ""
+function acc(xs: string[]): string {
+  let s = "<"
+  for x in xs { s = s + x + "," }
+  return s
+}
+function bump(n: i32) {
+  let i = 0
+  while i < n {
+    g = g + "g"
+    i = i + 1
+  }
+}
+bump(2)
+print(acc(["p", "q"]) + g)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -585,6 +632,30 @@ run(2.5)
       throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A record literal on legacy's layout path builds field by field and matches; a field at another
+// arm (here a widened `f64`) stays a named miss.
+Deno.test({
+  name: "ir shadow: a plain record literal builds; a field at a converting arm is a named miss",
+  ignore,
+  fn: () => {
+    const src = `type P = { x: i32, y: string }
+type Q = { w: f64 }
+function mk(a: i32, s: string): P { return { x: a + 1, y: s } }
+function mkq(a: i32): Q { return { w: a } }
+const p = mk(2, "k")
+print(p.x)
+print(p.y)
+print(mkq(3).w)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want mk matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered object field f64") !== 1) {
+      throw new Error(`want mkq a named miss, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -763,16 +834,12 @@ print(two("a", "b"))
 });
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom, a function-tag leaf, a tagged call's dispatch, and a
-// delivery `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+// bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
+// `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
-  ],
-  [
-    "tag leaf",
-    `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`,
   ],
   [
     "tag dispatch",
@@ -802,6 +869,28 @@ Deno.test({
           }`,
         );
       }
+    }
+  },
+});
+
+// A function-tag leaf is its member's id (`fnTagLeafEmitted`), which the IR builds as an i32
+// immediate: no node misses at the leaf, and every function built matches legacy's bytes.
+const TAG_LEAF =
+  `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`;
+Deno.test({
+  name: "ir shadow: a function-tag leaf builds as its member's id and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_LEAF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path tag leaf")) {
+      throw new Error(`want no tag-leaf miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

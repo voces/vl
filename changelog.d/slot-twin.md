@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **D16851, D16871, D16922, D16294 closed:** a maker that returns a lambda with un-annotated parameters (`function mk() { return (a) => a + 2.5 }`) can now hand its calls' values to destinations of different function types (`take(mk())` at `(a: i32) => f64`, `half(mk())` at `(a: f64) => f64`, or through `const` bindings). Each call builds its own closure at its destination's signature. Before, the bound spelling was refused at check and the in-place one at emit. A maker capturing an annotated `f64` parameter, stored at a function type (`const v: (a: i32) => f64 = adder(2)`), no longer builds an invalid module. One binding called at two parameter types (D16845) is still refused.
