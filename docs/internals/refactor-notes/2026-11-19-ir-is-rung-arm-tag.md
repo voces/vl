@@ -21,9 +21,10 @@ back off its own bytes (`staticIsGuard`) to drop the guarded arm (D932). The dec
 function, `isDecidedFalse` beside `staticIsGuard`: legacy's two statement-`if` writers
 (`emitIfStmtStmt`, `emitIfLinkTail`) write a decided test as `i32.const 0` through `emitGuardCond`
 before reading it back, and each `ifChain` link asks the same predicate, so the two cannot
-disagree about a dropped arm. A `tagAbsent` arm is never a covering one: a covering test is one
-every member of the operand passes (`isTestedEveryMember`, which `isBoxGuardPlain` excludes),
-and a tag the box lacks is passed by none, so legacy never writes that then arm as dead.
+disagree about a dropped arm. Legacy's dead-arm write (`isDeadArm`) never meets a decided guard: the checker
+notes a then arm dead only under `!`, when every value of the operand passes the test
+(`check_statements.vl`'s `deadArmNote`), and never in an instance, while `isDecidedFalse` takes
+only a bare `is` test.
 Anywhere else (`!`, `&&`, a value `if`) legacy folds the constant, so `tagAbsent` there stays the
 named miss `is arm tag tagAbsent`.
 
