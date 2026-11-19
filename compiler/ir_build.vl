@@ -3,6 +3,7 @@
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+import { recEnclosingFn } from "./check_fit_rules"
 import { emitFail } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt } from "./emit_closure_callee"
@@ -41,6 +42,7 @@ import {
   hasNamedArgs,
   i32ToStr,
   nodeAt,
+  nodeChildrenPush,
 } from "./ast"
 import {
   IrFamily,
@@ -1200,13 +1202,40 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
-// The captures lifted function `pos` takes after its environment, each a parameter of the
-// function being built, read in order; a miss names any other.
+// The `let` or `const` of the function being built that capture `name` of lifted function `pos`
+// reads, found at a read of it in the lifted body; -1 for none, or for a binding of another frame.
+function liftCapDecl(pos: i32, name: string): i32 {
+  const key = i32ToStr(ibFnIx) + "|" + i32ToStr(pos) + "|" + name
+  const known = ibLiftCapDecl[key] ?? -2
+  if known != -2 { return known }
+  let found = -1
+  const todo: i32[] = [fnStmts[pos]]
+  while todo.length > 0 && found < 0 {
+    const i = todo.pop() ?? -1
+    const n = if i >= 0 && i < P.nodes.length { nodeAt(i) } else { null }
+    if n is Ident && n.identName == name {
+      const d = identDeclOf(i)
+      if d >= 0 && nodeAt(d) is LetDecl && recEnclosingFn(d) == ibFnIx {
+        found = d
+      }
+    }
+    if i >= 0 && i < P.nodes.length { nodeChildrenPush(i, todo) }
+  }
+  ibLiftCapDecl[key] = found
+  return found
+}
+
+// Per lifted function and capture name, the binding `liftCapDecl` found.
+let ibLiftCapDecl: {[string]: i32} = Map()
+
+// The captures lifted function `pos` takes after its environment, each a parameter or a binding
+// of the function being built, read in order; a miss names any other.
 function liftCaps(pos: i32): Opnd[] {
   const out: Opnd[] = []
   for name in captureNamesOf(pos) {
     const p = paramIndexOf(ibFnIx, name)
-    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+    const d = if p < 0 { liftCapDecl(pos, name) } else { -1 }
+    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
     if v < 0 || capCellTargetOf(name) >= 0 {
       irBMiss("callee captures")
       return out
@@ -1218,7 +1247,7 @@ function liftCaps(pos: i32): Opnd[] {
 }
 
 // A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
-// closure, then each argument at its parameter's scalar rep.
+// closure, then each argument at its parameter's scalar, string or record rep.
 function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = callRefPlainKey(ix, ibFnIx)
   if key == "" { return missRhs("call of a non-declaration") }
@@ -1247,7 +1276,8 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     const pk = sigParamKindAt(key, i)
     const aps: string = if ap == null { "" } else { ap }
     const pks: string = if pk == null { "-" } else { pk }
-    if aps != pks { return missRhs("closure argument coercion") }
+    const rec = pks == "struct" && repNodeAt(irBOpRep(a)) is RRecord
+    if aps != pks && !rec { return missRhs("closure argument coercion") }
     args.push(a)
     i = i + 1
   }
