@@ -52,13 +52,12 @@ Found while gating: `irGlobalRepOf` scanned the function's noted globals linearl
 now builds past 3,000 closure-global reads, so the `closures` scaling axis read 2.97 against its
 2.5 bar. It is now a map lookup.
 
-## Measured on fixpoint seeds: master `d1de0b7d4` against this branch
+## Measured on fixpoint seeds: master `a37ca941e` against this branch
 
 | | master | this branch |
 |---|---|---|
-| distilled functions covered = verified = matched | 30,703 | 31,165 |
-| distilled functions claimed (`--claims`, 0 fell back) | 30,703 | 31,165 |
-| self-compile functions claimed, of 18,895 | 12,662 (67.0%) | 12,699 (67.2%) |
+| distilled functions claimed (`--claims`, 0 fell back), all matched armed | 30,836 | 31,304 |
+| self-compile functions claimed, of 18,895 | 12,727 | 12,764 |
 | `call of a non-declaration` + `local rep closure` | 233 | 0 |
 | `callee environment` + `statement` | 203 | 0 |
 | `call of a non-declaration` + `parameter rep closure` | 61 | 0 |
@@ -68,11 +67,11 @@ now builds past 3,000 closure-global reads, so the `closures` scaling axis read 
 - **Mode 3** (claim everything): 19,079 cells and run cases byte-identical, and the self-compile
   identical.
 - **Cost:**
-  - L2 self-compile fuel +0.4%;
-  - plumb-shape main +2.9% and tail +2.6% (bar +5%);
+  - L2 self-compile fuel, same box against master's seed: 99,541,376,265 → 99,766,184,054
+    (+0.23%);
   - scaling axes green.
-- **Lines:** +333 / −52 in `compiler/`; `lint.vl`'s 40 are the field table's reflow. A coverage
-  step, so the bar is functions per line: 462 distilled and 37 self-compile functions for +281.
+- **Lines:** in `compiler/`, plus the field table's reflow in `lint.vl`. A coverage step, so the bar
+  is functions per line.
 
 ## What is left in these classes
 - `call of a non-declaration` alone: 46. A callee `callRefPlainKey` declines: a wide or coerced
