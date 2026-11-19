@@ -19,11 +19,13 @@ generic's still-open parameter.
   the verifier read. A type that is still open is held only when it is a function type and its rep
   is `i32`, a set's id. Closure reps stay STORE's, as agreed (`fnTagSetIsTagged` decides).
   `heldTy` closes a type at the instance first (`instTyOrSelf`).
-- **Two legacy facts the shadow surfaced:**
-  - Legacy disarms its tail-call cursor after every dispatch. A one-arm dispatch's call returned
-    directly therefore stays `call; return`, so the IR marks that temp (`irNoTail`).
-  - A string-valued dispatch writes `if (str)`. The IR's valued `if` gains that block type, through
-    `fbValtype`.
+- **Two legacy decisions the shadow surfaced, each now one read on both sides:**
+  - `dispatchDeclinesTail()`: legacy disarms its tail-call cursor after a dispatch when it is true,
+    and the builder marks a one-arm dispatch's call temp `irNoTail` when it is true, so a return of
+    it stays `call; return` on both.
+  - `tagDispatchIfOf(ty)`: the arm `if`'s block type for a dispatch's result type. Legacy's writer
+    opens each arm through it (`tagDispatchOpenIf`), and the IR's valued `if` opens a string out,
+    which only a dispatch makes, through it.
 
 Compiler lines on top of the tag leaf: +248 −34, 214 net (`ir_build.vl` +121, `wasmEmit.vl` +38,
 `ir_lower.vl` +26, `ir_verify.vl` +18, `ir.vl` +10, `lint.vl` +1).
