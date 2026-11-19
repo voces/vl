@@ -92,6 +92,7 @@ import {
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapFilter,
   RMapGetOr,
   RMapNew,
   RMapOp,
@@ -177,6 +178,7 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullStruct,
   fbRefTest,
   fbResetLazyFrame,
   fbReturn,
@@ -202,6 +204,9 @@ import {
   atomStrPlanOf,
   atomStrTail,
   boxTagIsTail,
+  callRefCallTail,
+  callRefEnvOpen,
+  callRefStash,
   coalAtomStrClose,
   coalAtomStrOpen,
   coalAtomStrReserve,
@@ -228,6 +233,8 @@ import {
   forInListStore,
   forInListSync,
   forInLoopClose,
+  forInMapList,
+  forInMapStash,
   forInRolledOpen,
   hoistCandRow,
   hoistReadTail,
@@ -264,6 +271,7 @@ import {
   promoSlotIn,
   staticAtomId,
   structFieldTail,
+  structUnionBoxTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionUnionEqTail,
@@ -271,6 +279,7 @@ import {
   userGlobalReadClass,
   userGlobalWriteClass,
   variantFieldTail,
+  variantUnionBoxTail,
   voidTailCallee,
 } from "./wasmEmit"
 import {
@@ -294,6 +303,7 @@ import { arrLitRefPlainSlot } from "./emit_plan_list"
 import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
+  callRefDepth,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -528,7 +538,9 @@ function call(c: RCall, tail: boolean) {
   if c.caCallee < 0 || c.caCallee >= fnStmts.length {
     return irLMiss("callee index")
   }
-  if c.caArgs.length == 0 { leaf() }
+  if c.caArgs.length == 0 || c.caEnv { leaf() }
+  if c.caEnv { fbRefNullStruct() }
+  for a in c.caCaps { irLOpnd(a) }
   for a in c.caArgs { irLOpnd(a) }
   if tail && !c.caNever {
     fbReturnCall(gImports + c.caCallee)
@@ -536,6 +548,18 @@ function call(c: RCall, tail: boolean) {
     fbCall(gImports + c.caCallee)
     if c.caNever { fbUnreachable() }
   }
+}
+
+// `RCallRef`: the closure, then legacy's shared head and tail around the arguments
+// (`callRefStash`, `callRefEnvOpen`, `callRefCallTail`).
+function callRef(r: RCallRef, tail: boolean) {
+  irLOpnd(r.crFn)
+  const d = callRefDepth
+  const s = callRefStash()
+  callRefEnvOpen(s, d)
+  for a in r.crArgs { irLOpnd(a) }
+  callRefDepth = d
+  return callRefCallTail(s, r.crSig, tail)
 }
 
 function rhs(r: Rhs, tail: boolean) {
@@ -565,7 +589,7 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet | RListLen | RListPush | RListEq | RStrOp => irLowerListHook(r)
+    RListGet | RListLen | RListPush | RListEq | RStrOp | RMapFilter => irLowerListHook(r)
     RListPop => irLMiss("pop value")
     RNumWiden => {
       irLOpnd(r.nwV)
@@ -596,7 +620,8 @@ function rhs(r: Rhs, tail: boolean) {
     RBoxNarrow => boxNarrow(r)
     RRecover => recoverRead(r)
     RGetField => getField(r)
-    RCallRef | RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RCallRef => callRef(r, tail)
+    RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
     RMapNew => {
@@ -815,8 +840,15 @@ function fieldTail(at: i32, m: Member) {
   if idx < 0 { return irLMiss("field shape") }
   if vi >= 0 {
     variantFieldTail(vi, idx, at, fnIx)
+    if variantUnionBoxTail(vi, idx, at, fnIx) < 0 {
+      return irLMiss("field unbox")
+    }
   } else {
-    structFieldTail(structIndexOfExpr(m.memObj, fnIx), idx, at, fnIx)
+    const si = structIndexOfExpr(m.memObj, fnIx)
+    structFieldTail(si, idx, at, fnIx)
+    if structUnionBoxTail(si, idx, at, fnIx) < 0 {
+      return irLMiss("field unbox")
+    }
   }
   if readOwesNonNullRecover(at, fnIx) { fbRefAsNonNull() }
   return 0
@@ -878,8 +910,18 @@ function forIn(n: SForIn, pending: i32[]) {
     false,
   )
   if lp == null { return irLMiss("walk backing") }
-  cond(n.xfList, pending)
-  if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
+  if n.xfMap >= 0 {
+    if lp.mapRecv < 0 { return irLMiss("walk map") }
+    irLSettle(pending)
+    globalRead(n.xfMap, n.xfMapNonNull)
+    mapRecvRefTail(lp.mapRecv, fnIx)
+    forInMapStash(fnIx, lp)
+    forInMapList(s.fiIter, fnIx, lp.mwShape)
+  } else {
+    if lp.mapRecv >= 0 { return irLMiss("walk map") }
+    cond(n.xfList, pending)
+    if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
+  }
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
@@ -1213,12 +1255,15 @@ function retagOperand(t: i32): Opnd {
   return none
 }
 
+// 0 for a closure call's right-hand side, which a return takes in its tail form too; -1 else.
+function callRefTemp(r: Rhs): i32 { return if r is RCallRef { 0 } else { -1 } }
+
 function callTemp(o: Opnd): i32 {
   return match o {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
       const r = tempRhs(o.ov)
-      if r is RCall { r.caCallee } else { -1 }
+      if r is RCall { r.caCallee } else { callRefTemp(r) }
     }
     OImm | OStr => -1
   }
@@ -1299,6 +1344,7 @@ function callReturns(b: i32[], i: i32): boolean {
   const nx = lw.irNodes[b[i + 1]]
   if !(n is SEffect && nx is SReturn) || nx.rtHas { return false }
   const r = n.efRhs
+  if r is RCallRef { return r.crVoid }
   return r is RCall && !r.caNever && voidTailCallee(r.caCallee)
 }
 
@@ -1358,6 +1404,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
         if !t && si >= 0 && !repIsNoValue(lw.irSigRet[si]) { fbDrop() }
+        return 0
+      }
+      if r is RCallRef {
+        const t = tail && r.crVoid
+        callRef(r, t)
+        irLSettle(pending)
+        if !t && r.crDrop { fbDrop() }
         return 0
       }
       if r is RListPush || r is RListPop {
@@ -1594,6 +1647,7 @@ function ret(n: SReturn, pending: i32[]) {
       const r = tempRhs(t.ov)
       lwSeq = []
       if r is RCall { call(r, true) }
+      if r is RCallRef { callRef(r, true) }
       lwSeq.push(t.ov)
       if outer >= 0 { lwSeq.push(outer) }
       irLSettle(pending)

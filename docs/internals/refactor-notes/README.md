@@ -8,6 +8,115 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-19-union-for-per-arm](2026-11-19-union-for-per-arm.md): A union `for` at a pin walks per arm (2026-11-19)
+- [2026-11-19-store-held-set-instance-key-design](2026-11-19-store-held-set-instance-key-design.md): STORE: an instance key for a hole handed a holder of a tagged set (2026-11-19)
+- [2026-11-19-store-elab-arg-holder-2](2026-11-19-store-elab-arg-holder-2.md): STORE: a holder of the callee's own type parameter is keyed and planned at the set (2026-11-19)
+- [2026-11-19-store-elab-arg-holder](2026-11-19-store-elab-arg-holder.md): STORE: `elabCallArgSetTy` keys a holder of a tagged set at any depth (2026-11-19)
+- [2026-11-19-store-b3-value-if-record-lists](2026-11-19-store-b3-value-if-record-lists.md): STORE record-row producer: a value `if` of records holding lists (2026-11-19)
+- [2026-11-19-store-b3-record-row-producer](2026-11-19-store-b3-record-row-producer.md): STORE B3 record-row producer, step 1: `ftOpenFieldHolds` at check (2026-11-19)
+- [2026-11-19-store-b3-record-repoint-lists](2026-11-19-store-b3-record-repoint-lists.md): STORE record-row producer: a re-pointed record holding a list of lists (2026-11-19)
+- [2026-11-19-store-b3-per-signature-calls](2026-11-19-store-b3-per-signature-calls.md): STORE B3: a lambda called at several signatures by a declared callee (2026-11-19)
+- [2026-11-19-store-b3-lambda-row-facts](2026-11-19-store-b3-lambda-row-facts.md): STORE B3.10b step 1: a lambda set through a hand-back call (2026-11-19)
+- [2026-11-19-store-b3-lambda-declfn-arg](2026-11-19-store-b3-lambda-declfn-arg.md): STORE B3.10b step 2: a lambda as a declared callee's argument (2026-11-19)
+- [2026-11-19-store-b3-hand-back-shared](2026-11-19-store-b3-hand-back-shared.md): STORE B3.3 step 1: the shared hand-back at check (2026-11-19)
+- [2026-11-19-store-b3-arrow-stray](2026-11-19-store-b3-arrow-stray.md): STORE B3.10b, step 0: stray arrow rows (2026-11-19)
+- [2026-11-19-store-b3-aliased-list-field-repoint](2026-11-19-store-b3-aliased-list-field-repoint.md): STORE: a re-pointed record whose field aliases a list binding (2026-11-19)
+- [2026-11-19-never-hit-emitter-classified](2026-11-19-never-hit-emitter-classified.md): The never-hit emitter functions, classified (2026-11-19, lane DEAD)
+- [2026-11-19-ir4-value-hole](2026-11-19-ir4-value-hole.md): IR re-entry 1: the value hole retired (2026-11-19, lane IR4)
+- [2026-11-19-ir4-node-in](2026-11-19-ir4-node-in.md): IR seam: `irLowerNodeIn`, the legacy-to-IR door (2026-11-19, lane IR4)
+- [2026-11-19-ir4-method-map](2026-11-19-ir4-method-map.md): IR coverage: `.map` and `.filter` (2026-11-19, lane IR4)
+- [2026-11-19-ir4-map-default](2026-11-19-ir4-map-default.md): IR re-entry: the `??` default's helper constant (2026-11-19, lane IR4)
+- [2026-11-19-ir-wide-literal](2026-11-19-ir-wide-literal.md): IR: an integer literal past the narrow reading, 2026-11-19
+- [2026-11-19-ir-union-compare-boxed-nullable](2026-11-19-ir-union-compare-boxed-nullable.md): IR: a union compare over boxed nullables (2026-11-19)
+- [2026-11-19-ir-string-append-site](2026-11-19-ir-string-append-site.md): IR coverage step: a string append site, 2026-11-19
+- [2026-11-19-ir-streq-reentry](2026-11-19-ir-streq-reentry.md): The `strEqTail` re-entry: the IR owns a string compare's literal (2026-11-19)
+- [2026-11-19-ir-start-map-store](2026-11-19-ir-start-map-store.md): IR: a map store, `.set` and a Set's `.add` on a map global (2026-11-19)
+- [2026-11-19-ir-start-map-global-init](2026-11-19-ir-start-map-global-init.md): IR: a global initialized by `Map()` or `Set()` (2026-11-19)
+- [2026-11-19-ir-start-closure-global](2026-11-19-ir-start-closure-global.md): IR: a closure global initialized by a function literal or name (2026-11-19)
+- [2026-11-19-ir-spine-loop](2026-11-19-ir-spine-loop.md): IR: an `if` chain walked along its spine (I8 prerequisite)
+- [2026-11-19-ir-seam-frame-model](2026-11-19-ir-seam-frame-model.md): IR seam: one frame model for the re-entries and for legacy→IR calls (2026-11-19, lane IR4)
+- [2026-11-19-ir-rep-unknown](2026-11-19-ir-rep-unknown.md): IR: nodes written after the check take their type, and a switchable chain stays legacy's (2026-11-19, lane DEAD)
+- [2026-11-19-ir-pop-static-atom-reentry](2026-11-19-ir-pop-static-atom-reentry.md): The `popDropTail` and `emitStaticLitAtom` re-entries (2026-11-19)
+- [2026-11-19-ir-plan-null](2026-11-19-ir-plan-null.md): IR decision modules 2: the coercion and null plans (2026-11-19, lane IR6)
+- [2026-11-19-ir-plan-list](2026-11-19-ir-plan-list.md): IR decision modules 1: the list plans (2026-11-19, lane IR6)
+- [2026-11-19-ir-member-record](2026-11-19-ir-member-record.md): `member record`: three record reads made plain (2026-11-19)
+- [2026-11-19-ir-is-rung-arm-tag](2026-11-19-ir-is-rung-arm-tag.md): IR: an instance's arm-tag `is` test, and its decided guard (2026-11-19)
+- [2026-11-19-ir-index-ref](2026-11-19-ir-index-ref.md): IR coverage step: a ref list read at any element rep, 2026-11-19
+- [2026-11-19-ir-if-below-lead](2026-11-19-ir-if-below-lead.md): IR: one builder guard for a valued `if` below a node's lead (2026-11-19)
+- [2026-11-19-ir-i8c2-atom-rest](2026-11-19-ir-i8c2-atom-rest.md): IR I8c part 2: the rest of the atom decode, 2026-11-19
+- [2026-11-19-ir-i8c-atomstr](2026-11-19-ir-i8c-atomstr.md): IR I8c part 1: the atom decode as an op (`RAtomStr`), 2026-11-19
+- [2026-11-19-ir-helper-views](2026-11-19-ir-helper-views.md): Runtime helpers through the IR, step 4: the list view helpers (2026-11-19)
+- [2026-11-19-ir-helper-map](2026-11-19-ir-helper-map.md): Runtime helpers through the IR, step 3: the map and list helpers (2026-11-19)
+- [2026-11-19-ir-helper-fail](2026-11-19-ir-helper-fail.md): Runtime helpers through the IR, step 2: the fail and log helpers (2026-11-19)
+- [2026-11-19-ir-helper-door](2026-11-19-ir-helper-door.md): Runtime helper bodies through the IR: the door, the raw layer, B + D + E (2026-11-19)
+- [2026-11-19-ir-forin-hoisted](2026-11-19-ir-forin-hoisted.md): The hoisted `for` walk and the `forInLoopOpen` re-entry (2026-11-19)
+- [2026-11-19-ir-forin-break](2026-11-19-ir-forin-break.md): `break` and `continue` out of a `for` walk (2026-11-19)
+- [2026-11-19-ir-fn-values-1](2026-11-19-ir-fn-values-1.md): IR: function values, step 1 (2026-11-19)
+- [2026-11-19-ir-fn-tag-leaf](2026-11-19-ir-fn-tag-leaf.md): IR: a tagged function set's value (the tag leaf), 2026-11-19
+- [2026-11-19-ir-expression-as](2026-11-19-ir-expression-as.md): IR: a numeric `as` through one arm decision and legacy's tail (2026-11-19, lane DEAD)
+- [2026-11-19-ir-call-generic-instance](2026-11-19-ir-call-generic-instance.md): IR: calls to a generic instance (2026-11-19)
+- [2026-11-19-ir-array-u8](2026-11-19-ir-array-u8.md): IR coverage step: a short packed (u8) list literal, 2026-11-19
+- [2026-11-19-ir-array-ref](2026-11-19-ir-array-ref.md): IR coverage step: a short plain ref-list literal, 2026-11-19
+- [2026-11-19-f2-set-keyed-map-instances](2026-11-19-f2-set-keyed-map-instances.md): Set-keyed instances of a generic over a map of a tagged set (D17014)
+- [2026-11-19-container-demand](2026-11-19-container-demand.md): One container demand for an un-annotated parameter (2026-11-19)
+- [2026-11-19-arm-site-dispatcher](2026-11-19-arm-site-dispatcher.md): One per-arm dispatcher for list and map unions at a pin (2026-11-19)
+- [2026-11-18-store-union-eq-one-compare](2026-11-18-store-union-eq-one-compare.md): Union `==` has one compare, and the IR shares it, 2026-11-18 (lane STORE)
+- [2026-11-18-store-loop-hoist-reads](2026-11-18-store-loop-hoist-reads.md): The loop prologue's hoisted receivers are the IR's own reads, 2026-11-18 (lane STORE)
+- [2026-11-18-store-list-eq-door](2026-11-18-store-list-eq-door.md): The IR claims list `==`, through legacy's own list compare, 2026-11-18 (lane STORE)
+- [2026-11-18-store-dead-state](2026-11-18-store-dead-state.md): Dead-code sweep 1: the write-only module state, 2026-11-18
+- [2026-11-18-store-clo-delivered](2026-11-18-store-clo-delivered.md): ftCloDelivered deleted: a late arm whose two sets run as closures, 2026-11-18
+- [2026-11-18-store-b3-lambda-leaf-design](2026-11-18-store-b3-lambda-leaf-design.md): B3 site 10, the lambda leaf: design and measurement, 2026-11-18 (lane STORE)
+- [2026-11-18-store-b3-design](2026-11-18-store-b3-design.md): B3 design: the elaboration builds arms from decided storage and never re-plans, 2026-11-18
+- [2026-11-18-store-b3-2-lambda-facts](2026-11-18-store-b3-2-lambda-facts.md): B3.2a: lambda members' facts at check; the fact-key net, 2026-11-18
+- [2026-11-18-store-b2f-arg-of-set](2026-11-18-store-b2f-arg-of-set.md): B2f: a complete call row records the set its parameter takes, 2026-11-18
+- [2026-11-18-store-b2e-dead-arms](2026-11-18-store-b2e-dead-arms.md): B2e: the late arms dead on the corpus, deleted; the live ones named, 2026-11-18
+- [2026-11-18-store-a0-fn-identity-keys](2026-11-18-store-a0-fn-identity-keys.md): A0 keys a hole handed a function value by that value's identity, 2026-11-18 (lane STORE)
+- [2026-11-18-ir-s1c-init-windows](2026-11-18-ir-s1c-init-windows.md): IR S1c: init functions claimed, 2026-11-18
+- [2026-11-18-ir-s1b-start-claim](2026-11-18-ir-s1b-start-claim.md): IR S1b: the start body claimed, 2026-11-18
+- [2026-11-18-ir-s1a-start-shadow](2026-11-18-ir-s1a-start-shadow.md): IR S1a: the start body under the shadow, 2026-11-18
+- [2026-11-18-ir-s1-start-design](2026-11-18-ir-s1-start-design.md): IR stage 1 design: the start function as an IR body, 2026-11-18
+- [2026-11-18-ir-reentry-ranking](2026-11-18-ir-reentry-ranking.md): The IR's `emitExpr` re-entries, ranked by the legacy lines each keeps on the claim path, 2026-11-18 (lane STORE)
+- [2026-11-18-ir-narrowed-read](2026-11-18-ir-narrowed-read.md): IR: a narrowed local read (coverage step), 2026-11-18
+- [2026-11-18-ir-g1-guard-followup](2026-11-18-ir-g1-guard-followup.md): IR G1: the pre-path guard's follow-up, 2026-11-18
+- [2026-11-18-ir-driver-doors](2026-11-18-ir-driver-doors.md): The driver census ranks coverage steps by the legacy lines they would delete, 2026-11-18 (lane STORE)
+- [2026-11-18-ir-claim-list](2026-11-18-ir-claim-list.md): IR: the `list` family joins `CLAIMED`, 2026-11-18
+- [2026-11-18-ir-b4b-tail-if-design](2026-11-18-ir-b4b-tail-if-design.md): IR B4b design: the returned value `if` is the same `SIf` in return position, 2026-11-18
+- [2026-11-18-ir-b4b-tail-if](2026-11-18-ir-b4b-tail-if.md): IR B4b: the returned value `if`, 2026-11-18
+- [2026-11-18-ir-b4a-value-if](2026-11-18-ir-b4a-value-if.md): IR B4a: a plain scalar value `if`, 2026-11-18
+- [2026-11-18-ir-b3-record-field](2026-11-18-ir-b3-record-field.md): IR B3: the record field read, and the driver census, 2026-11-18
+- [2026-11-18-ir-b2-narrowed-field](2026-11-18-ir-b2-narrowed-field.md): IR B2: a narrowed box's field read, 2026-11-18
+- [2026-11-18-ir-b1-box-is](2026-11-18-ir-b1-box-is.md): IR B1: a box's `is` test of a variant row, and the `box` family claimed, 2026-11-18
+- [2026-11-18-ir-b0b-is-plans](2026-11-18-ir-b0b-is-plans.md): IR B0b: the literal, tag and numeric `is` rungs as exact plans and writers, 2026-11-18
+- [2026-11-18-empty-list-per-instance](2026-11-18-empty-list-per-instance.md): Empty lists a hole template allocates are fresh per call (D16603)
+- [2026-11-18-d2772-union-split-design](2026-11-18-d2772-union-split-design.md): D2772 (a): a generic call over a union of lists, split by type at run time — design
+- [2026-11-18-check-reject-census-fragmentation](2026-11-18-check-reject-census-fragmentation.md): The open `check_reject` rows by mechanism, 2026-11-18
+- [2026-11-17-type-hashcons-s6b38-shape-rows](2026-11-17-type-hashcons-s6b38-shape-rows.md): Type hash-cons stage 6b, tier 2: emit_shape_rows.vl's walk limits (lane HASH), 2026-11-17
+- [2026-11-17-type-hashcons-s5c-retwiden-switch](2026-11-17-type-hashcons-s5c-retwiden-switch.md): Type hash-cons stage 5c, the switch: a widened result keys its instance by its set id (lane H), 2026-11-17
+- [2026-11-17-store-storage-per-key-param-design](2026-11-17-store-storage-per-key-param-design.md): Storage per (KeyId, parameter): design, 2026-11-17
+- [2026-11-17-store-b2d-final](2026-11-17-store-b2d-final.md): B2d: the check's decision is final, 2026-11-17
+- [2026-11-17-store-b2c-set-call-rows](2026-11-17-store-b2c-set-call-rows.md): B2c: instance-vector rows for calls through a function set, 2026-11-17
+- [2026-11-17-store-b2b-seed-join](2026-11-17-store-b2b-seed-join.md): B2b: the written-binding join decided at check, 2026-11-17
+- [2026-11-17-store-b2a-row-facts](2026-11-17-store-b2a-row-facts.md): B2a: the decider reads each call row's facts, 2026-11-17
+- [2026-11-17-store-b2-design](2026-11-17-store-b2-design.md): B2: the decider reads storage rows where every key agrees — design, 2026-11-17
+- [2026-11-17-store-b1-written-join](2026-11-17-store-b1-written-join.md): B1: the written-binding join at check, shadowed, 2026-11-17
+- [2026-11-17-store-b0-storage-shadow](2026-11-17-store-b0-storage-shadow.md): B0: the storage shadow, 2026-11-17
+- [2026-11-17-store-a1-3-class-t](2026-11-17-store-a1-3-class-t.md): A1.3: class T's literal holders decided at check, and class S measured, 2026-11-17
+- [2026-11-17-store-a1-2-class-p](2026-11-17-store-a1-2-class-p.md): A1.2: the check tries a partial set on the arrow rule's facts, 2026-11-17
+- [2026-11-17-self-compile-fuel-profile](2026-11-17-self-compile-fuel-profile.md): Self-compile fuel, profiled: where an L2 build's time goes, and what grew since 93.95G (lane H), 2026-11-17
+- [2026-11-17-rep-adt-stage3e-no-rep-loud](2026-11-17-rep-adt-stage3e-no-rep-loud.md): Rep ADT stage 3e: a field with no rep fails loudly, and the code floors go, 2026-11-17 (lane REP)
+- [2026-11-17-registration-census](2026-11-17-registration-census.md): Registration census: rows registered after the rep tree is built
+- [2026-11-17-maker-twin-per-signature](2026-11-17-maker-twin-per-signature.md): Maker twins build their returned hole lambda per signature (lane SLOT, 2026-11-17)
+- [2026-11-17-l2-hand-back-closure-set](2026-11-17-l2-hand-back-closure-set.md): L2: a set stays tagged through a callee that hands its member back in a closure or a field, 2026-11-17
+- [2026-11-17-ir-s1-from-code-points](2026-11-17-ir-s1-from-code-points.md): IR S1: `fromCodePoint` and `fromCodePoints` through legacy's encoder tails, 2026-11-17
+- [2026-11-17-ir-n2b2c2b-string-null-test](2026-11-17-ir-n2b2c2b-string-null-test.md): IR N2b-2c-2b: a `string | null`'s null test and `print`, 2026-11-17
+- [2026-11-17-ir-n2b2c2a-string-nullable](2026-11-17-ir-n2b2c2a-string-nullable.md): IR N2b-2c-2a: `string | null`, its null and its `??` through legacy's block, 2026-11-17
+- [2026-11-17-ir-f2-for-in-str](2026-11-17-ir-f2-for-in-str.md): IR F2: a string's code-point walk through legacy's own loop, 2026-11-17
+- [2026-11-17-ir-f1-for-in](2026-11-17-ir-f1-for-in.md): IR F1: the plain `for … in` walk through legacy's own loop, 2026-11-17
+- [2026-11-17-ir-claim-on](2026-11-17-ir-claim-on.md): IR claim on: the IR's bytes ship for fully matched families
+- [2026-11-17-ir-claim-early-out](2026-11-17-ir-claim-early-out.md): IR claim early-out: a claim's build ends at the first node of an unclaimed family, 2026-11-17
+- [2026-11-17-ir-c4-binop-writer](2026-11-17-ir-c4-binop-writer.md): IR cutover C4: the scalar binary-operator writer, 2026-11-17
+- [2026-11-17-ir-b0-is-arm](2026-11-17-ir-b0-is-arm.md): IR B0: the `is` test's rungs as one decision legacy's ladder consumes, 2026-11-17
+- [2026-11-17-ir-a1-array-literal](2026-11-17-ir-a1-array-literal.md): IR A1: list literals through one decision and legacy's short tail, 2026-11-17
 - [2026-11-17-type-hashcons-s6b40-check-calls](2026-11-17-type-hashcons-s6b40-check-calls.md): Type hash-cons stage 6b, tier 2: check_calls.vl's type, literal and binding walks (lane HASH), 2026-11-17
 - [2026-11-17-type-hashcons-s6b39-walk-limit-backlog](2026-11-17-type-hashcons-s6b39-walk-limit-backlog.md): Type hash-cons stage 6b, tier 2: the walk-limit backlog (lane HASH), 2026-11-17
 - [2026-11-17-type-hashcons-s6b37-check-assignable](2026-11-17-type-hashcons-s6b37-check-assignable.md): Type hash-cons stage 6b, tier 2: check_assignable.vl's type and literal walks (lane HASH), 2026-11-17
