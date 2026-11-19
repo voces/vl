@@ -2495,7 +2495,12 @@ function elabCallArgSetTy(call: i32, decl: i32, p: i32, from: i32): i32 {
   if p >= cn.callArgs.length || p >= f.fnParams.length { return -1 }
   if p < cn.callArgNames.length && cn.callArgNames[p] != "" { return -1 }
   const q = nodeAt(f.fnParams[p])
-  if !(q is Param) || q.parType >= 0 && !fnTagOwnTyParamJoins(f, p, []) {
+  if (
+    !(q is Param)
+    || q.parType >= 0
+      && !fnTagOwnTyParamJoins(f, p, [])
+      && !elabTyHoldsOwnTyParam(nodeTyIxOf(f.fnParams[p]), f, [])
+  ) {
     return -1
   }
   // A parameter a list of the callee's body joins with others is bound at the joined set (D15577).
@@ -2514,6 +2519,36 @@ function elabCallArgSetTy(call: i32, decl: i32, p: i32, from: i32): i32 {
   // A parameter of the calling instance handed on holds the set that instance binds it to.
   const it = if ax >= 0 && from >= 0 { elabNodeTy(ax, from) } else { -1 }
   return if fnTagSetIsTagged(fnTagSetOfTy(it)) || fnTagHoldsTy(it) { it } else { -1 }
+}
+
+// Whether declared type `t` holds one of `f`'s own type parameters as a list element, a map value or
+// a record field, at any depth: the argument there binds it, keyed at a set it holds (D14433).
+function elabTyHoldsOwnTyParam(t: i32, f: FuncDecl, seen: i32[]): boolean {
+  if t < 0 || t >= T.tys.length || i32ListHas(seen, t) { return false }
+  const top = seen.length == 0
+  seen.push(t)
+  const o = tyAt(t)
+  match o {
+    TyVar => {
+      return !top && strListHas(f.fnTyParams, o.tvName)
+    }
+    TyArray => {
+      return elabTyHoldsOwnTyParam(tyElemOf(o), f, seen)
+    }
+    TyMap => {
+      return elabTyHoldsOwnTyParam(tyValOf(o), f, seen)
+    }
+    TyObj => {
+      for ft in o.objFieldTypes {
+        if elabTyHoldsOwnTyParam(ft, f, seen) { return true }
+      }
+      return false
+    }
+    // A function, a scalar or a union holds no slot an argument binds the parameter at.
+    TyFunc | TyPrim | TyErr | TyUnion | TyNullable | TyLit | TyNeg => {
+      return false
+    }
+  }
 }
 
 // Whether some argument of call `call` to `decl` is a tagged set its parameter takes as itself.
@@ -14841,6 +14876,33 @@ function elabSetArgBind(ix: i32, names: string[], tys: i32[], k: i32): i32[] {
           out[j] = st
         }
         j = j + 1
+      }
+    } else if (
+      !named
+      && pn is Param
+      && pn.parType >= 0
+      && elabTyHoldsOwnTyParam(nodeTyIxOf(f.fnParams[i]), f, [])
+      && fnTagHoldsTy(st)
+    ) {
+      // A holder of the callee's own type parameter, handed a holder of a tagged set, binds that
+      // parameter to the set, as `elabCallArgSetTy` keys the demand (D14433).
+      const an: string[] = []
+      const atys: i32[] = []
+      bindGenWalk(nodeTyIxOf(f.fnParams[i]), st, an, atys)
+      let q = 0
+      while q < an.length && q < atys.length {
+        let j = 0
+        while j < names.length && j < out.length {
+          if names[j] == an[q] && fnTagTyIsTagged(atys[q]) {
+            if !copied {
+              out = tys.slice(0, tys.length)
+              copied = true
+            }
+            out[j] = atys[q]
+          }
+          j = j + 1
+        }
+        q = q + 1
       }
     } else if (
       !named
