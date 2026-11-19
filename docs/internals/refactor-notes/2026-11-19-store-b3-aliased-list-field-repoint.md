@@ -26,6 +26,6 @@ Witness: `const xs = [id1]; let r = { f: xs }; r = { f: [id2] }; r.f[0](2); r.f[
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical over the existing corpus.
 - New fixture `closures/record-field-aliasing-a-list-repointed-at-another-set.vl`: matches `@log`,
   and master refuses it. Spellings: the row's witness at two signatures, F2's minimal spelling, a call
-  before the re-point, no call of the list, and the twin with no re-point.
+  before the re-point, no call of the list, and the twin with no re-point (a `const`).
 - `check-filed-witnesses --strict`: 5,521 graded, 0 moved; D16242 runs as filed.
 - Full @run A/B: see the PR.
