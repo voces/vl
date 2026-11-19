@@ -54,6 +54,7 @@ import {
   Opnd,
   PrimOp,
   RCall,
+  RMapNew,
   RStrOp,
   Rhs,
   SIf,
@@ -124,6 +125,7 @@ import {
   mapGetOrArmOf,
   mapGetOrMvPlain,
   mapKeyArmOf,
+  mapNewShapeOf,
   mapRecvIsSet,
   mapRecvShapeOf,
   mapSetAtomVal,
@@ -1170,26 +1172,26 @@ function resultRep(pos: i32, ann: i32, d: i32): i32 {
   return if isVoidTy(rt) { repNodeOfTy(TY_NEVER) } else { repNodeOfTy(rt) }
 }
 
-// The parameter and result reps of `fnStmts` slot `pos`, noted in `ib`; false when one is not
-// a primitive or void rep.
-function calleeSig(pos: i32): boolean {
-  if pos < 0 || pos >= fnStmts.length { return false }
+// The parameter and result reps of `fnStmts` slot `pos`, noted in `ib`: "", or the miss naming
+// the parameter or result rep the IR holds no value of.
+function calleeSig(pos: i32): string {
+  if pos < 0 || pos >= fnStmts.length { return "callee signature" }
   const d = fnStmts[pos]
   const fn = nodeAt(d)
-  if !(fn is FuncDecl) { return false }
+  if !(fn is FuncDecl) { return "callee signature" }
   const ps: i32[] = []
   for p in fn.fnParams {
     const pt = scopeTyAt(p, d)
     const r = repNodeOfTy(pt)
-    if !valueRep(r, pt) { return false }
+    if !valueRep(r, pt) { return "callee parameter rep " + repWhat(r) }
     ps.push(r)
   }
   const rr = resultRep(pos, fn.fnRet, d)
   if !(valueRep(rr, resultTy(pos, fn.fnRet, d)) || repIsNoValue(rr)) {
-    return false
+    return "callee result rep " + repWhat(rr)
   }
   irSigNote(ib, pos, ps, rr)
-  return true
+  return ""
 }
 
 // Whether slot `pos` holds declaration `d`, or the instance the monomorphizer minted from generic
@@ -1221,6 +1223,12 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if cf is Member { return methodRhs(b, c, cf, ix) }
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
+  // An empty `Map()` or `Set()` at any value position, by legacy's constructor.
+  if mapCtorOf(ix) {
+    if mapNewShapeOf(ix, ibFnIx) == -3 { return missRhs("map new value type") }
+    const mn: Rhs = { mnAt: ix }
+    return mn
+  }
   if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
     if cf.identName == "fromCodePoint" || cf.identName == "fromCodePoints" {
       return fromCpRhs(b, c, cf, ix)
@@ -1243,7 +1251,8 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("binding call misfit")
   }
   const inst = fnStmts[pos]
-  if !calleeSig(pos) { return missRhs("callee signature") }
+  const sw = calleeSig(pos)
+  if sw != "" { return missRhs(sw) }
   // A callee with a hidden environment parameter takes a null one before its arguments, and a
   // lifted one its captures next; one that captures through its environment stays legacy's.
   const env = envSlotShift(inst) > 0
@@ -2938,6 +2947,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if isPrintStmt(n) { return printStmt(b, n, ix) }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
+    if rhs is RMapNew { return skip("map new statement") }
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
   }
