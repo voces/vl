@@ -29,6 +29,7 @@ import {
   Member,
   NullLit,
   NumLit,
+  ObjLit,
   P,
   Param,
   Paren,
@@ -86,6 +87,7 @@ import {
   GlobalCtx,
   HoleBox,
   IsArm,
+  ObjLitArm,
   PrintArm,
   TagIsArm,
   arrLitShort,
@@ -143,16 +145,22 @@ import {
   numIntrPlanOf,
   numLitAsApplies,
   numLitLexAt,
+  objLitArmOf,
+  objLitLayoutRowOf,
+  objLitVariantLayoutOf,
   printArmOf,
   pushPlainWhy,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
-  stmtIsBareFnName,
+  stmtWritesNothing,
+  strCatPartsOf,
   strLitTakesAtom,
+  structFieldArmOf,
   tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
+  variantFieldArmOf,
   widenPlanOf,
 } from "./wasmEmit"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
@@ -193,7 +201,9 @@ import {
   RRecord,
   repNodeAt,
   repNodeGen,
+  repNodeKids,
   repNodeOfTy,
+  repRecordKidOf,
   repTyOf,
 } from "./emit_rep"
 import {
@@ -205,8 +215,11 @@ import {
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import { wTarget } from "./emit_bytes"
-import { narrowedNulLitPinBoxKey } from "./emit_value_sites"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
+import {
+  narrowedNulLitPinBoxKey,
+  nulNicheRecoverOwed,
+} from "./emit_value_sites"
 import {
   capCellTargetOf,
   captureCountOf,
@@ -218,9 +231,12 @@ import {
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
+  forInElemTyOf,
+  forInMapRecv,
   globalCellKind,
   localIndexOf,
   nulLitAtomTexts,
+  sFieldStoreKind,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -240,7 +256,12 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  sFieldCount,
+  sFieldNames,
+  sFieldStart,
   setIrShadowOn,
+  uFieldCount,
+  uFieldStart,
   uTags,
 } from "./emit_state"
 import {
@@ -251,7 +272,7 @@ import {
 } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
-import { charLitCp, unwrapParen } from "./emit_base"
+import { charLitCp, objFieldVal, unwrapParen } from "./emit_base"
 import { ifArmValueExpr, paramIndexOf } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
 import {
@@ -483,6 +504,67 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is operand rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// An object literal on a layout path legacy builds it by alone (`objLitArmOf`: a struct's
+// `objLitLayoutRowOf`, a variant's `objLitVariantLayoutOf`): each field in layout order at its
+// `plain` arm, owing no recovery, kept at its kid of the record rep, then the row's `struct.new`.
+function objLit(b: i32[], ix: i32, rep: i32): Opnd {
+  const arm = objLitArmOf(ix, ibFnIx)
+  if arm == "unionBox" { return irBMiss("object " + arm) }
+  const row = if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
+  if row < 0 { return irBMiss("object layout") }
+  const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
+  const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if !(repNodeAt(rep) is RRecord) || repNodeOfTy(ty) != rep {
+    return irBMiss("object rep")
+  }
+  const ks = repNodeKids(rep)
+  if ks.length != cnt { return irBMiss("object field count") }
+  const fields: Opnd[] = []
+  const layout: i32[] = []
+  const none: Opnd = { ov: -1 }
+  for _k in ks { fields.push(none) }
+  let fi = 0
+  while fi < cnt {
+    const name = sFieldNames[start + fi]
+    const k = repRecordKidOf(rep, ty, name)
+    if k < 0 || k >= ks.length { return irBMiss("object field kid") }
+    const valIx = objFieldVal(ix, name)
+    const why = fieldPlainWhy(arm, row, fi, valIx)
+    if why != "" { return irBMiss(why) }
+    const at = b.length
+    const v = deliver(b, valIx, ks[k])
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
+    if fi > 0 && ifBelowLead(b, at, "short-circuit field after another") {
+      return v
+    }
+    fields[k] = v
+    layout.push(k)
+    fi = fi + 1
+  }
+  return irBLetTemp(
+    b,
+    { mrFields: fields, mrLayout: layout, mrAt: ix },
+    ix,
+    rep,
+  )
+}
+
+// Why field `fi` of literal row `row` at arm `arm` is not written as its value alone, or "".
+function fieldPlainWhy(arm: ObjLitArm, row: i32, fi: i32, valIx: i32): string {
+  if arm == "variant" {
+    const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
+    return if va == "plain" { "" } else { "object variant field " + va }
+  }
+  const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
+  if fa != "plain" { return "object field " + fa }
+  if nulNicheRecoverOwed(sFieldStoreKind(row, fi), valIx, ibFnIx) {
+    return "object field recovery"
+  }
+  return ""
 }
 
 // A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
@@ -1349,6 +1431,27 @@ function numKindPrim(k: i32): string {
   return ""
 }
 
+// `g.has(k)` on a map global read plainly, with a key written as itself (`mapKeyArmOf`), as
+// legacy's map has writes it.
+function mapHasRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const sh = mapRecvShapeOf(m.memObj, ibFnIx)
+  if sh == -3 { return missRhs("map has value type") }
+  const ka = mapKeyArmOf(m.memObj, c.callArgs[0], ibFnIx, sh)
+  if ka != "plain" { return missRhs("map key " + ka) }
+  const g = mapGlobalOf(m.memObj)
+  if g < 0 { return missRhs("map has receiver") }
+  const k = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("method operand") }
+  const r: Rhs = {
+    mhSym: g,
+    mhNonNull: globalReadRecovers(sidOfNode(m.memObj), m.memObj, ibFnIx),
+    mhRecv: m.memObj,
+    mhKey: k,
+    mhAt: ix,
+  }
+  return r
+}
+
 // `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding as
 // the callback's value, or the `null` immediate for a capture-free function the lowering builds.
 function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -1381,6 +1484,9 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
     return pushRhs(b, c, m, ix)
+  }
+  if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
+    return mapHasRhs(b, c, m, ix)
   }
   if m.memProp == "map" || m.memProp == "filter" {
     return mapFilterRhs(b, c, m, ix)
@@ -2219,6 +2325,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   if n is IfStmt { return ifExpr(b, n, ix, rep) }
   if n is FuncDecl && repNodeAt(rep) is RClosure { return cloValue(b, ix, rep) }
   if n is AsExpr { return numCast(b, n, ix, rep) }
+  if n is ObjLit { return objLit(b, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
 
@@ -2261,15 +2368,33 @@ function strLit(ix: i32, rep: i32): Opnd {
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
-  // Legacy appends a string in place at a local and at a list element alike; the accumulator
-  // keeps its own lowering, and a site's chain must be the right side the store delivers.
+  // Legacy appends a string in place at a local and at a list element alike; a site's chain
+  // must be the right side the store delivers.
   const mode = irInPlaceHook(ix, ibFnIx)
-  if mode < 0 { return skip("string accumulator") }
+  if mode < 0 { return accAppend(b, n, ix) }
   const n0 = ib.irNodes.length
   assignTo(b, n, ix)
   if ibMiss == "" && mode > 0 && !siteBuilt(n0, ix) {
     return skip("string append site")
   }
+  return 0
+}
+
+// A proven accumulator append: the chain's parts after the accumulator, then legacy's tail,
+// which reads, grows and writes the accumulator itself.
+function accAppend(b: i32[], n: BinExpr, ix: i32) {
+  const parts = strCatPartsOf(n.binRight, ibFnIx)
+  const args: Opnd[] = []
+  let i = 1
+  while i < parts.length {
+    const a = irBExpr(b, parts[i])
+    if ibMiss != "" { return 0 }
+    if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
+    args.push(a)
+    i = i + 1
+  }
+  const r: Rhs = { soOp: "acc", soArgs: args, soAt: ix }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -2361,15 +2486,21 @@ function loopIx(label: string): i32 {
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const why = forInPlainWhy(n, ix, ibFnIx)
   if why != "" && why != "hoisted" { return skip("for in " + why) }
-  const l = irBExpr(b, n.fiIter)
+  // A map walk's operand is its receiver, whose keys or values list the lowering reads.
+  const mr = forInMapRecv(n.fiIter, ibFnIx)
+  const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
+  if mr >= 0 && g < 0 { return skip("for in map receiver") }
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  const l = if mr >= 0 { none } else { irBExpr(b, n.fiIter) }
   if ibMiss != "" { return 0 }
-  // A list walks its elements; a string its code points, each an i32.
+  // A list walks its elements; a string its code points, each an i32; a map its keys or values.
   const lr = irBOpRep(l)
   const ln = repNodeAt(lr)
   const lpr = repPrim(lr)
   let er = -1
   if ln is RList { er = ln.rlsElem }
   if lpr != null && lpr == "str" { er = repNodeOfTy(TY_I32) }
+  if mr >= 0 { er = repNodeOfTy(forInElemTyOf(n.fiIter, ibFnIx)) }
   if er < 0 { return skip("for in operand coercion") }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
@@ -2391,7 +2522,16 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if ibMiss != "" { return 0 }
   irBNode(
     b,
-    { xfList: l, xfVar: v, xfBody: fb, xfAt: ix, xfBrk: brk, xfCont: cont },
+    {
+      xfList: l,
+      xfVar: v,
+      xfBody: fb,
+      xfAt: ix,
+      xfBrk: brk,
+      xfCont: cont,
+      xfMap: g,
+      xfMapNonNull: mr >= 0 && globalReadRecovers(sidOfNode(mr), mr, ibFnIx),
+    },
     -1,
     ibNoValue,
     ix,
@@ -2657,6 +2797,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
   }
+  // A discarded value legacy does not write: a bare function name or an inert literal.
+  if stmtWritesNothing(ix) { return 0 }
   if (
     n is Paren
     || n is Ident
@@ -2665,8 +2807,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     || n is Unary
     || n is BinExpr
   ) {
-    // A function's bare name has no effect: legacy writes nothing for it (D6980).
-    if stmtIsBareFnName(ix) { return 0 }
     // Legacy evaluates a bare value and drops it.
     const v = irBExpr(b, ix)
     if ibMiss != "" { return 0 }
