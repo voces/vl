@@ -6,7 +6,7 @@ import { mfCallbackLocal } from "./emit_union_casts"
 // `idxArmOf`); a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
-import { BinExpr, Index, Member, WhileStmt, nodeAt } from "./ast"
+import { BinExpr, Call, Index, Member, P, WhileStmt, nodeAt } from "./ast"
 import { fbDrop } from "./emit_bytes"
 import {
   OImm,
@@ -147,7 +147,7 @@ function lowerGet(r: RListGet): i32 {
   const fnIx = irLFn().irAt
   const arm = idxArmOf(nd, fnIx)
   if arm == "string" {
-    const sz = rawStrHoistOf(nd)
+    const sz = rawStrHoistOf(nd.idxArr)
     if sz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
     irLOpnd(r.lgIx)
     return rawStrGetTail(sz)
@@ -284,12 +284,19 @@ function siteTail(r: RStrOp, fnIx: i32): i32 {
   return strSiteCatTail(r.soArgs.length, mode, r.soAt)
 }
 
+// The live loop hoist holding the header of method call `c`'s string receiver, or -1.
+function strCallHoistOf(c: Call): i32 {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const m = nodeAt(c.callFn)
+  return if m is Member { rawStrHoistOf(m.memObj) } else { -1 }
+}
+
 // `RStrOp`: its operands, then legacy's operator tail. An equality operand is recovered after
 // it is pushed, as legacy recovers a narrowed nullable read.
 function lowerStr(r: RStrOp): i32 {
   const e = nodeAt(r.soAt)
   const fnIx = irLFn().irAt
-  if r.soOp != "eq" {
+  if r.soOp != "eq" && r.soOp != "charcode" {
     for a in r.soArgs { irLOpnd(a) }
   }
   return match r.soOp {
@@ -330,6 +337,13 @@ function lowerStr(r: RStrOp): i32 {
       fcpBackingTail()
       irLOpnd(r.soArgs[0])
       fcpLenTail()
+    }
+    "charcode" => {
+      // A receiver a live loop hoist holds is consumed without being written, as `s[i]`'s is.
+      const hz = if e is Call { strCallHoistOf(e) } else { -1 }
+      if hz >= 0 { irLSkip(r.soArgs[0]) } else { irLOpnd(r.soArgs[0]) }
+      irLOpnd(r.soArgs[1])
+      rawStrGetTail(hz)
     }
     "len" | "at" => irLMiss("string operator " + r.soOp)
   }
