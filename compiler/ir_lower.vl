@@ -4,6 +4,8 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import { printUnionPlan } from "./emit_fn_scans"
+import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { RRaw, repNodeAt } from "./emit_rep"
 import {
@@ -225,6 +227,11 @@ import {
   f64RemCallTail,
   f64RemOperandTail,
   fallThroughPadOf,
+  fieldStoreArmOf,
+  fieldStoreStructAt,
+  fieldStoreTail,
+  fieldStoreVariantAt,
+  fieldStoreVariantTail,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -283,6 +290,7 @@ import {
   printNulStrTail,
   printScalarTail,
   printStrTail,
+  printUnionTail,
   promoSlotIn,
   staticAtomId,
   structFieldTail,
@@ -851,6 +859,20 @@ function boxField(r: RBoxField) {
   return 0
 }
 
+// `SSetField`: the record, the value, then legacy's struct-store tail (`fieldStoreTail`).
+function setField(n: SSetField, at: i32) {
+  const a = nodeAt(at)
+  if !(a is BinExpr) { return irLMiss("field store node") }
+  const lhs = unwrapParen(a.binLeft)
+  const arm = fieldStoreArmOf(lhs, lw.irAt)
+  const sf = if arm == "struct" { fieldStoreStructAt(lhs, lw.irAt) } else if arm == "variantParam" { fieldStoreVariantAt(lhs, lw.irAt) } else { [] }
+  if sf.length != 2 { return irLMiss("field store shape") }
+  irLOpnd(n.sfV)
+  irLOpnd(n.sfSrc)
+  if arm == "variantParam" { return fieldStoreVariantTail(sf[0], sf[1]) }
+  return fieldStoreTail(sf[0], sf[1], a.binLeft, a.binRight, lw.irAt)
+}
+
 // `RGetField`: the record, then legacy's field read and its recover, and the read's own recover,
 // as `emitExpr` writes a member read through `emitMemVariantRead` or `emitMemStructRead`.
 function getField(r: RGetField) {
@@ -1064,6 +1086,14 @@ function printOp(r: RPrint) {
     printNulStrOpen()
     irLOpnd(r.pnV)
     return printNulStrTail()
+  }
+  if arm == "union" {
+    // Legacy reads the plan and takes the stash slot before it writes the box.
+    const kinds: i32[] = []
+    printUnionPlan(c.callArgs[0], lw.irAt, kinds)
+    const slot = sharedFieldRecvSlot()
+    irLOpnd(r.pnV)
+    return printUnionTail(slot, kinds)
   }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
@@ -1554,7 +1584,11 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLowerListSetHook(n, lw.irNodeAt[id])
       irLSettle(pending)
     }
-    SSetField | SCellSet | SSwitch => irLMiss("statement outside I1")
+    SSetField => {
+      setField(n, lw.irNodeAt[id])
+      irLSettle(pending)
+    }
+    SCellSet | SSwitch => irLMiss("statement outside I1")
   }
 }
 
