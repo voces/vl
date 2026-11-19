@@ -18,4 +18,4 @@ F2 found two gaps on the D14433 combined tree; both are fixed here.
 - Late demands: 10 → 9. `functions/hole-lambda-listed-handed-to-generic-list-param.vl` is now
   planned at the key it is demanded at (its `V[]` parameter). The baseline is lowered here.
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,770 programs: 0 RC, wasm or output movers.
