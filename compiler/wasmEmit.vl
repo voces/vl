@@ -407,7 +407,6 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import {
-  ALLOC_LIT_CHUNK,
   LIT_PART,
   NEW_FIXED_MAX,
   charLitCp,
@@ -573,7 +572,6 @@ import {
   fnUses,
   fsIdxAt,
   gCellIdx,
-  gConstExprEmit,
   gEmitNames,
   gEmitSrcMap,
   gEqHelpFn,
@@ -1001,7 +999,6 @@ import {
   armSiteReads,
   armSiteRecv,
   arrElemLitUnionTy,
-  arrLitRowSlotIn,
   arrNewIntrKind,
   asExprBoxToLitUnion,
   asExprIsUnionCastIn,
@@ -1139,7 +1136,6 @@ import {
   letNulScalarBoxName,
   letUnionNameOf,
   listIsRecvTyOf,
-  litArmRowOf,
   lmForUnionArms,
   localIndexOf,
   luForElemKind,
@@ -1165,7 +1161,6 @@ import {
   nulLitAtomTexts,
   nulRefStructIdxOfLet,
   nulVariantIdxOfExpr,
-  objLitVariantIdxNoStructRow,
   objVariantName,
   objVariantNameCtx,
   objVariantRowCtx,
@@ -1680,7 +1675,6 @@ import {
   rvMayView,
   sFieldElemTyIxAt,
   scalarTagOfKind,
-  structFieldCodesEq,
   tyDenotesFunc,
   tyMapKeyOf,
   tyPackedRow,
@@ -1783,17 +1777,22 @@ import {
   PushPlan,
   PushSlot,
   PushValKinds,
+  allocLitChunk,
   arrLitArmOf,
   arrLitBuild,
   arrLitListBuild,
+  arrLitRefPlainSlot,
   arrLitTakesAtom,
   arrLitTyAt,
+  arrRefElemTwinRow,
+  arrRefSlotPlain,
   forInElemRecovers,
   forInLoopAt,
   identReadIsList,
   idxStorePlanOf,
   listReserveScan,
   numListElemOf,
+  objLitBuildVariantRow,
   popPlanOf,
   popRecvIsList,
   pushPlanOf,
@@ -1810,6 +1809,12 @@ import {
   tyElemRepsAsAtom,
   tyRepsAsAtom,
 } from "./emit_plan_list"
+
+import {
+  exprRecordArmsTy,
+  exprTyIsRecord,
+  narrowedArmNeedsUnbox,
+} from "./emit_plan_union"
 
 export function capCacheBuild() {
   capStartTbl = []
@@ -11366,22 +11371,6 @@ function emitUnionIfArm(
 // ref-array and map arms and none for the struct one — so every destination typed at the arm has
 // to recover the payload itself.
 
-// The cast target is the destination's heap and not `variantHeap(vi)`: the slot is what the store
-// must satisfy, and where the arm is merged with a declared twin the indices are the same
-// anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
-export function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
-  if (
-    narrowedStructArmVi(exprIx, fnIx) < 0
-    && !narrowedNulStructArm(exprIx, fnIx)
-    && !exprTyIsRecord(exprIx, false, fnIx)
-    && !exprTyIsRecord(exprIx, true, fnIx)
-    && exprRecordArmsTy(exprIx, fnIx) < 0
-  ) {
-    return false
-  }
-  return exprUnion(exprIx, fnIx)
-}
-
 // Whether `exprIx` is a union of records each stored at heap `heapIdx` (`exprRecordArmsTy`).
 function exprRecordArmsAt(exprIx: i32, fnIx: i32, heapIdx: i32): boolean {
   const ru = exprRecordArmsTy(exprIx, fnIx)
@@ -11392,30 +11381,6 @@ function exprRecordArmsAt(exprIx: i32, fnIx: i32, heapIdx: i32): boolean {
     if armHeapOfTy(m) != heapIdx { return false }
   }
   return true
-}
-
-// The checker's union type of `exprIx` where every member is a record, which the checker let a
-// record slot take because each member fits it (D16321); -1 otherwise.
-function exprRecordArmsTy(exprIx: i32, fnIx: i32): i32 {
-  if exprIx < 0 { return -1 }
-  const ty = nodeTyAt(unwrapParen(exprIx), fnIx)
-  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyUnion) { return -1 }
-  const ms: i32[] = []
-  flattenVariantsInto(ty, ms)
-  for m in ms {
-    if !tyIsRecord(m) { return -1 }
-  }
-  return ty
-}
-
-// Whether the checker typed `exprIx` as one record, or as `record | null` when `nullable`.
-// A box of that type is a union of same-shape records collapsed to the record (D4989), so
-// its payload is the record itself.
-function exprTyIsRecord(exprIx: i32, nullable: boolean, fnIx: i32): boolean {
-  if exprIx < 0 { return false }
-  const ty = nodeTyAt(unwrapParen(exprIx), fnIx)
-  if nullable { return ty >= 0 && tyIsRecord(nullableInnerOrNone(ty)) }
-  return tyIsRecord(ty)
 }
 
 // The unbox itself: recover the box's `anyref` payload and cast it to `heapIdx`, nullably when
@@ -15088,6 +15053,14 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   // row, else element 0's.
   const rslot = arrRefSlotOf(arrIx, elems, fnIx, lb)
   if rslot < 0 { return -1 }
+  // A literal whose elements each build as themselves takes the one decision the IR reads, and
+  // its tail.
+  if arrLitRefPlainSlot(arrIx, fnIx, lb) == rslot {
+    for e in elems {
+      if emitExpr(e, fnIx) < 0 { return -1 }
+    }
+    return arrLitRefShortTail(rslot, elems.length)
+  }
   // A concrete-VARIANT element list (`Cat[]`) has no `sNames` entry: each element is coerced
   // into the arm read off the slot's element type, any `| null` peeled.
   let elemVariantIdx = -1
@@ -15167,32 +15140,22 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   if dstRef >= 0 {
     fbLocalGet(dstRef)
     fbRefAsNonNull() // the chunk-built ref backing
-  } else {
-    fbBacking(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
+    return arrLitLenCap(elems.length, rlWrapIdx[rslot])
   }
-  fbI32Const(elems.length)      // 0x41 i32.const (len)
-  fbI32Const(elems.length)      // 0x41 i32.const (cap)
-  fbStructNew(rlWrapIdx[rslot]) // 0xfb 0x00 <this slot's ref-list wrapper>
-  return 0
+  return arrLitRefShortTail(rslot, elems.length)
+}
+
+// After a short ref-list literal's `n` elements at slot `rslot`: the backing, its length and
+// capacity, and the slot's wrapper.
+export function arrLitRefShortTail(rslot: i32, n: i32): i32 {
+  fbBacking(rlBackIdx[rslot], n)
+  return arrLitLenCap(n, rlWrapIdx[rslot])
 }
 
 // `emitArrRef`'s ref-list slot: a ref build pair's row, else element 0's, else
 // slot 0 when the literal names none. -1 when no element type is interned at all.
 function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
-  const annKind = lb.lbKind
-  const annSlot = lb.lbSlot
-  let rslot = 0
-  if (
-    annKind == LBK_REF
-    || annKind == LBK_UNION
-    || annKind == LBK_REF_AT_SLOT
-  ) {
-    rslot = annSlot
-  } else if elems.length >= 1 {
-    rslot = arrLitRowSlotIn(arrIx, fnIx)
-  } else {
-    rslot = annSlot
-  }
+  const rslot = arrRefSlotPlain(arrIx, elems, fnIx, lb)
   if rslot < 0 {
     if rlElemName.length < 1 {
       return emitFail(
@@ -15207,7 +15170,7 @@ function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
         arrIx,
       )
     }
-    rslot = 0
+    return 0
   }
   return rslot
 }
@@ -15232,24 +15195,6 @@ function emitArrRefElem(e: i32, fnIx: i32, rslot: i32, elemVariantIdx: i32) {
   // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
   // `(readonly Shape[])[]`.
   return 0
-}
-
-// The element row of ref-list slot `rslot` where element `e` is a record literal built at another
-// row of the same layout, as a literal holding a widened set's ids is; -1 to build it as it is.
-function arrRefElemTwinRow(e: i32, fnIx: i32, rslot: i32): i32 {
-  const x = unwrapParen(e)
-  if x < 0 || !(nodeAt(x) is ObjLit) || objLitBuildVariantRow(x, fnIx) >= 0 {
-    return -1
-  }
-  const own = structIndexOfObjCtx(x, fnIx)
-  const er = rlElemStructRow(rslot)
-  if own < 0 || er < 0 || own >= sHeapIdx.length || er >= sHeapIdx.length {
-    return -1
-  }
-  if sHeapIdx[own] == sHeapIdx[er] || structFieldCodesEq(own, er) != 1 {
-    return -1
-  }
-  return er
 }
 
 // The default i32-list arm of `emitArrUnder`, including literal-union, nullable-boolean and
@@ -17794,13 +17739,6 @@ function setMapScrHB() {
 function pushMapScrHB() {
   fbLocalGet(mapScratchBase + 13)
   return 0
-}
-
-// The chunk length of a string or ref literal here: a constant initializer has no locals to
-// chunk through, and `isConstInit` admits one only within the operand cap.
-function allocLitChunk(): i32 {
-  if gConstExprEmit { return NEW_FIXED_MAX }
-  return ALLOC_LIT_CHUNK
 }
 
 // Begin a chunked long-literal build: allocate the full `n`-element backing into a fresh
@@ -28611,7 +28549,7 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // The linear-memory intrinsics, lowered inline (the host defines `__store_i32__`/
   // `__load_i32__` as one-instruction wasm functions): store/load become
   // `i32.store`/`i32.load` directly; `__log__` calls the synthetic in-module decoder
-  // at `gMemLogIdx` (see `emitMemLogFnCode`).
+  // at `gMemLogIdx` (see `irMemLogFnCode`).
   if !userBindsName && callee.identName == "__store_i32__" {
     const s32Off = emitMemAddr(c, 2, fnIx, "__store_i32__")
     if s32Off < 0 { return -1 }
@@ -39538,15 +39476,6 @@ function emitNullOwn(own: i32) {
   if own == NULL_OWN_ATOM { return fbI32Const(-1) }
   if own == NULL_OWN_STR { return fbRefNull(sTy()) }
   return fbRefNullNone()
-}
-
-// The variant row object literal `exprIx` is constructed at, or -1: one the checker built at a
-// concrete arm, or one unadopted whose field set names a variant and no struct, is the bare
-// variant struct rather than a union box.
-function objLitBuildVariantRow(exprIx: i32, fnIx: i32): i32 {
-  const ad = nodeRepTyAt(exprIx, fnIx)
-  const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
-  return if pvi >= 0 && pvi < uVariants.length { pvi } else { -1 }
 }
 
 function emitObjLitNode(_e: ObjLit, exprIx: i32, fnIx: i32, row: i32) {
