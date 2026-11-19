@@ -234,6 +234,8 @@ import {
   forInListStore,
   forInListSync,
   forInLoopClose,
+  forInMapList,
+  forInMapStash,
   forInRolledOpen,
   hoistCandRow,
   hoistReadTail,
@@ -265,6 +267,10 @@ import {
   numCastTail,
   numIntrTail,
   numWidenTail,
+  objLitArmOf,
+  objLitLayoutRowOf,
+  objLitVariantLayoutOf,
+  objStructNewTail,
   printArmOf,
   printAtomTail,
   printNulStrOpen,
@@ -275,6 +281,7 @@ import {
   staticAtomId,
   structFieldPlain,
   structFieldTail,
+  structUnionBoxTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionUnionEqTail,
@@ -283,6 +290,8 @@ import {
   userGlobalWriteClass,
   variantFieldPlain,
   variantFieldTail,
+  variantStructNewTail,
+  variantUnionBoxTail,
   voidTailCallee,
 } from "./wasmEmit"
 import { nullRetPlanOf } from "./emit_plan_null"
@@ -615,7 +624,8 @@ function rhs(r: Rhs, tail: boolean) {
     RRecover => recoverRead(r)
     RGetField => getField(r)
     RCallRef => callRef(r, tail)
-    RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RMakeRec => makeRec(r)
+    RCallHost | RCast | RTagOf | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
     RMapNew => {
@@ -716,6 +726,20 @@ function rawEff(n: SRawOp, pending: i32[]) {
     "call" => fbCall(n.srImm)
   }
   return 0
+}
+
+// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row.
+function makeRec(r: RMakeRec) {
+  const fnIx = lw.irAt
+  const variant = objLitArmOf(r.mrAt, fnIx) == "variant"
+  const row = if variant { objLitVariantLayoutOf(r.mrAt, fnIx) } else { objLitLayoutRowOf(r.mrAt, fnIx) }
+  if row < 0 { return irLMiss("record row") }
+  if r.mrFields.length == 0 { leaf() }
+  for k in r.mrLayout {
+    if k < 0 || k >= r.mrFields.length { return irLMiss("record layout") }
+    irLOpnd(r.mrFields[k])
+  }
+  return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
 }
 
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
@@ -831,8 +855,15 @@ function fieldTail(at: i32, m: Member) {
   if idx < 0 { return irLMiss("field shape") }
   if vi >= 0 {
     variantFieldTail(vi, idx, at, fnIx)
+    if variantUnionBoxTail(vi, idx, at, fnIx) < 0 {
+      return irLMiss("field unbox")
+    }
   } else {
-    structFieldTail(structIndexOfExpr(m.memObj, fnIx), idx, at, fnIx)
+    const si = structIndexOfExpr(m.memObj, fnIx)
+    structFieldTail(si, idx, at, fnIx)
+    if structUnionBoxTail(si, idx, at, fnIx) < 0 {
+      return irLMiss("field unbox")
+    }
   }
   return emitReadRecover(at, fnIx)
 }
@@ -893,8 +924,18 @@ function forIn(n: SForIn, pending: i32[]) {
     false,
   )
   if lp == null { return irLMiss("walk backing") }
-  cond(n.xfList, pending)
-  if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
+  if n.xfMap >= 0 {
+    if lp.mapRecv < 0 { return irLMiss("walk map") }
+    irLSettle(pending)
+    globalRead(n.xfMap, n.xfMapNonNull)
+    mapRecvRefTail(lp.mapRecv, fnIx)
+    forInMapStash(fnIx, lp)
+    forInMapList(s.fiIter, fnIx, lp.mwShape)
+  } else {
+    if lp.mapRecv >= 0 { return irLMiss("walk map") }
+    cond(n.xfList, pending)
+    if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
+  }
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
@@ -1386,7 +1427,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if !t && r.crDrop { fbDrop() }
         return 0
       }
-      if r is RListPush || r is RListPop {
+      if r is RListPush || r is RListPop || r is RStrOp {
         irLowerEffectHook(r)
         irLSettle(pending)
         return 0
