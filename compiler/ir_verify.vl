@@ -1,7 +1,9 @@
 // The IR verifier (ir-design-2026-11.md §2): one linear walk over an `IrFn` that checks rules
 // 1-7: closed reps, rep agreement, types against reps, definitions before uses, control, calls
-// and switch coverage. It answers the first rule a function breaks, with the node; it never
-// reports through the emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
+// and switch coverage. Rule 10 keeps raw reps and ops (`RRaw`, `RRawOp`, `SRawOp`) and valued
+// blocks and branches inside a runtime helper, each reference operand at its op's heap type. It
+// answers the first rule a function breaks, with the node; it never reports through the
+// emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
 import {
@@ -43,6 +45,7 @@ import {
   RNumWiden,
   RPrimOp,
   RPrint,
+  RRawOp,
   RRecover,
   RRetag,
   RStrOp,
@@ -64,6 +67,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRawOp,
   SReturn,
   SSetField,
   SSwitch,
@@ -79,6 +83,7 @@ import {
   RList,
   RMap,
   RNullable,
+  RRaw,
   RRecord,
   RUnsup,
   repNodeAt,
@@ -639,7 +644,66 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RRawOp => rawRhs(r, dst, at)
   }
+}
+
+// Whether rep `r` is raw, at heap `heap` unless that is -1.
+function rawAt(r: i32, heap: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RRaw && (heap < 0 || n.rwHeap == heap)
+}
+
+// Rule 10 for a raw value op into destination rep `dst`. A `struct.get` result and a `call`'s
+// operands are not checked here: no table keeps a heap's layout or a helper's signature.
+function rawRhs(r: RRawOp, dst: i32, at: i32) {
+  if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
+  uses(r.rwArgs, at)
+  const a = r.rwArgs
+  const h = r.rwHeap
+  const n = a.length
+  const ref0 = n > 0 && rawAt(opRep(a[0]), h)
+  const ok = match r.rwOp {
+    "struct.get" | "array.len" | "ref.is_null" => n == 1 && ref0
+    "ref.as_non_null" => n == 1 && ref0 && rawAt(dst, h)
+    "array.get" => n == 2 && ref0 && opRep(a[1]) == vfI32
+    "array.new_default" => n == 1 && opRep(a[0]) == vfI32 && rawAt(dst, h)
+    "struct.new" => rawAt(dst, h)
+    "ref.eq" => n == 2 && rawAt(opRep(a[0]), -1) && rawAt(opRep(a[1]), -1)
+    "ref.cast" => n == 1 && rawAt(opRep(a[0]), -1) && rawAt(dst, h)
+    "ref.null" => n == 0 && rawAt(dst, h)
+    "call" => true
+    "test" => n == 1 && opRep(a[0]) == vfI32 && dst == vfBool
+    "tee" => n == 1
+      && r.rwImm >= 0
+      && r.rwImm < vf.irVars.length
+      && vf.irVars[r.rwImm].vRep == opRep(a[0])
+      && dst == opRep(a[0])
+  }
+  if !ok {
+    return fail(10, at, r.rwOp + " is not over heap type " + i32ToStr(h))
+  }
+  return 0
+}
+
+// Rule 10 for a raw effect: `array.copy`'s source is at heap `srImm`.
+function rawEff(e: SRawOp, at: i32) {
+  if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
+  uses(e.srArgs, at)
+  const a = e.srArgs
+  const n = a.length
+  const ref0 = n > 0 && rawAt(opRep(a[0]), e.srHeap)
+  const ok = match e.srOp {
+    "struct.set" => n == 2 && ref0
+    "array.set" => n == 3 && ref0 && opRep(a[1]) == vfI32
+    "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
+    "array.init_data" => n == 4 && ref0
+    "call" => true
+  }
+  if !ok {
+    return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
+  }
+  return 0
 }
 
 // Whether node `id` leaves its body: a branch, a return or a trap.
@@ -822,6 +886,9 @@ function stmt(id: i32) {
     }
     SEffect => rhsCheck(n.efRhs, -1, id)
     SBlock => {
+      if n.bkOut >= 0 && !vf.irHelper {
+        return fail(10, id, "a valued block outside a runtime helper")
+      }
       labelled(n.bkLabel, n.bkOut, n.bkBody)
       endsWriting(n.bkBody, n.bkOut, id)
     }
@@ -852,6 +919,9 @@ function stmt(id: i32) {
     SIf => ifSpine(id)
     SSwitch => switchCheck(n, id)
     SBr => {
+      if n.brHas && !vf.irHelper {
+        return fail(10, id, "a valued branch outside a runtime helper")
+      }
       let i = vfLabels.length - 1
       while i >= 0 {
         if vfLabels[i] == n.brLabel {
@@ -901,6 +971,7 @@ function stmt(id: i32) {
     }
     STrap => 0
     SDrop => use(n.dpV, id)
+    SRawOp => rawEff(n, id)
   }
 }
 
@@ -972,14 +1043,14 @@ function touchesList(n: IrNode): boolean {
     SListSet | SBoundsCheck => true
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
-    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SForIn | SIf | SSwitch | SBr | SReturn | STrap | SDrop => false
+    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SForIn | SIf | SSwitch | SBr | SReturn | STrap | SDrop | SRawOp => false
   }
 }
 
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapNew | RMapSet | RMapGetOr | RPrint | RNumIntr | RCoalStr | RStrOp | RNumWiden | RToBox | RRetag | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapNew | RMapSet | RMapGetOr | RPrint | RNumIntr | RCoalStr | RStrOp | RNumWiden | RToBox | RRetag | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp => false
   }
 }
 
@@ -1007,7 +1078,16 @@ export function irVerify(f: IrFn): IrVerdict {
   while i < f.irVars.length {
     const v = f.irVars[i]
     vfDefined.push(false)
-    if !closedRep(v.vRep) {
+    if rawAt(v.vRep, -1) || v.vTy < 0 {
+      // A raw variable has no VL type, and only a helper holds one.
+      if !f.irHelper || v.vTy >= 0 || !rawAt(v.vRep, -1) {
+        fail(
+          10,
+          -1,
+          "v" + i32ToStr(i) + " is raw outside a runtime helper, or typed",
+        )
+      }
+    } else if !closedRep(v.vRep) {
       fail(
         1,
         -1,

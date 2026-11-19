@@ -1162,6 +1162,7 @@ import {
   lmForUnionArms,
   localIndexOf,
   luForElemKind,
+  luForKTy,
   luForUnionIter,
   mapReadNarrowableSlot,
   mapReadNarrowedAtomKind,
@@ -30268,6 +30269,9 @@ let mapSetDidPark = false
 function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   asgParkedSlot = -1
   asgParkedRef = false
+  // Inside `is K[]` a store through a box of list arms writes the arm the box holds (D17002).
+  const armW = emitArmIndexWrite(fnIx, a, target)
+  if armW != 0 { return if armW < 0 { -1 } else { 0 } }
   // G8: a map store `m[k] = v` — scan for `k`; overwrite `vals[hit]` on a hit, else
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
@@ -37814,8 +37818,13 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   const arms = luMembersAt(nodeTyAt(s.fiIter, fnIx))
   const u = luElemTy(arms)
   // The element union's rep: a box, or the string a literal union joined with `string` is.
-  const k: VKind = luForElemKind(s.fiIter, fnIx) ?? "union"
-  if k != "union" { return emitListUnionForFlat(s, stmtIx, fnIx, arms, k) }
+  // Inside `is K[]` each element converts to `K`'s rep (D17002).
+  const kt = luForKTy(s, fnIx)
+  const k: VKind = (if kt >= 0 { repSigKindOfTy(kt) } else { luForElemKind(s.fiIter, fnIx) })
+    ?? "union"
+  if k != "union" {
+    return emitListUnionForFlat(s, stmtIx, fnIx, arms, k, kt >= 0)
+  }
   const tags: i32[] = []
   const heaps: i32[] = []
   const eTags: i32[] = []
@@ -37851,6 +37860,7 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     eBoxes: eBoxes,
     eNul: eNul,
     eTexts: [],
+    eFrom: [],
     destKind: k,
   }
   return emitListUnionForLoop(s, stmtIx, fnIx, plan)
@@ -38026,6 +38036,7 @@ type LuForPlan = {
   eBoxes: i32[],
   eNul: boolean[],
   eTexts: string[][],
+  eFrom: VKind[],
   destKind: VKind,
 }
 
@@ -38037,6 +38048,7 @@ function emitListUnionForFlat(
   fnIx: i32,
   arms: i32[],
   k: VKind,
+  toK: boolean,
 ): i32 {
   const plan: LuForPlan = {
     tags: [],
@@ -38045,6 +38057,7 @@ function emitListUnionForFlat(
     eBoxes: [],
     eNul: [],
     eTexts: [],
+    eFrom: [],
     destKind: k,
   }
   for m in arms {
@@ -38056,7 +38069,7 @@ function emitListUnionForFlat(
       || h < 0
       || e < 0
       || listBackOfWrap(h) < 0
-      || (k != "str" && k != "i32")
+      || (k != "str" && k != "i32" && !toK)
     ) {
       return emitFail(
         "emitProgram: a union-of-lists `for` arm has no tag or wrapper, or its element union no rep the walk delivers",
@@ -38065,7 +38078,8 @@ function emitListUnionForFlat(
     const atom = tyIsLitUnionOrLit(e)
     plan.tags.push(t)
     plan.heaps.push(h)
-    plan.eTags.push(if atom && k == "str" { -3 } else { -4 })
+    plan.eTags.push(if toK { -5 } else if atom && k == "str" { -3 } else { -4 })
+    plan.eFrom.push(repSigKindOfTy(e) ?? k)
     plan.eBoxes.push(-1)
     plan.eNul.push(false)
     plan.eTexts.push(if atom { tyLitMemberTexts(e) } else { [] })
@@ -38217,6 +38231,10 @@ function emitListUnionForElem(
     fbRefAsNonNull()
   } else if et == -4 {
     emitListUnionForRead(box, cur, heap)
+  } else if et == -5 {
+    // A numeric literal set's member, read off an arm stored wider or apart (D17002).
+    emitListUnionForRead(box, cur, heap)
+    if emitNumRepNarrow(plan.eFrom[i], plan.destKind) < 0 { return -1 }
   } else if et == -3 {
     emitListUnionForRead(box, cur, heap)
     setStrScrI(0)
@@ -40984,6 +41002,67 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   return emitFail(
     "emitProgram: a list arm's element has no conversion to the literal set read",
   )
+}
+
+// `recv[i] = v` through a union-of-lists box a pin or an `is K[]` arm left unrewritten: per list
+// arm, the store lowers with `recv` overridden to that arm, its value converted to the arm's
+// element as any store converts it. 0 when `target` is no such store, 1 when emitted.
+function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
+  const recv = unwrapParen(target.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) { return 0 }
+  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return 0 }
+  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  if arms.length == 0 { return 0 }
+  if emitArmIndexWriteAt(fnIx, a, target, recv, arms, 0) < 0 { return -1 }
+  asgParkedSlot = -1
+  return 1
+}
+
+function emitArmIndexWriteAt(
+  fnIx: i32,
+  a: BinExpr,
+  target: Index,
+  recv: i32,
+  arms: i32[],
+  i: i32,
+): i32 {
+  if i >= arms.length {
+    fbUnreachable()
+    return 0
+  }
+  const m = arms[i]
+  const t = listIsArmTag(m)
+  const heap = armHeapOf(m)
+  const loc = armWrapLocal(m)
+  if t < 0 || heap < 0 || loc < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to store through",
+    )
+  }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  const mark = luOvEnter(recv, m)
+  const lmark = luOvLocalEnter(recv, loc)
+  const r = emitAssignIndex(fnIx, a, target)
+  // The arm's own store parks nothing a caller reads: the assignment is a statement here.
+  if asgParkedSlot >= 0 {
+    fbLocalGet(asgParkedSlot)
+    fbDrop()
+  }
+  luOvLocalLeave(lmark)
+  luOvLeave(mark)
+  if r < 0 { return -1 }
+  fbElse()
+  if emitArmIndexWriteAt(fnIx, a, target, recv, arms, i + 1) < 0 { return -1 }
+  fbEnd()
+  return 0
 }
 
 // Arm `i` onward of `emitArmSite`'s tag chain.
