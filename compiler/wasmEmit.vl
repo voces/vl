@@ -2392,12 +2392,19 @@ function nameUsedAsValueIn(name: string, ix: i32) {
 // the i32 default, so a `call_indirect` traps the signature check at any other type.
 // Reject it as a value unless it is an anonymous lambda used only as a direct-call callee
 // (`criFnIsAnonLambda`), which is sound and routes straight to `emitClosureValueCore`.
-function emitClosureValue(fe: i32, fnIx: i32) {
-  if fnHasUnannotatedParam(fe) {
-    if !criFnIsAnonLambda(fe) { return emitFail(genericFnValueRejectMsg(fe)) }
-  }
+export function emitClosureValue(fe: i32, fnIx: i32) {
+  const why = closureValueWhy(fe)
+  if why != "" { return emitFail(why) }
+  return emitClosureValueOf(cloAdapterCanonOf(fe), fnIx)
+}
 
-  return emitClosureValueCore(fe, fnIx)
+// The refusal `emitClosureValue` raises for function `fe`, or "": a generic function's, then
+// `closureValueCoreWhy`'s.
+export function closureValueWhy(fe: i32): string {
+  if fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe) {
+    return genericFnValueRejectMsg(fe)
+  }
+  return closureValueCoreWhy(fe)
 }
 
 // The closure-value fat pointer for lifted function `fe`: `struct.new $cloStruct [ env, id,
@@ -2405,28 +2412,27 @@ function emitClosureValue(fe: i32, fnIx: i32) {
 // $envStruct` of the enclosing frame's captured values; `id` is the lifted wasm index, the
 // `call_indirect` operand; `decl` is the `==` identity token (`cloDeclOf`).
 export function emitClosureValueCore(fe: i32, fnIx: i32) {
+  const why = closureValueCoreWhy(fe)
+  if why != "" { return emitFail(why) }
+  return emitClosureValueOf(cloAdapterCanonOf(fe), fnIx)
+}
+
+// The refusal `emitClosureValueCore` raises for function `fe`, or "". A signature with no
+// closure `$fnsig` cannot be called as a value: the call would `call_indirect` at the wrong type.
+export function closureValueCoreWhy(fe: i32): string {
   if fe < 0 || fe >= fnStmts.length {
-    return emitFail("emitProgram: function value with no lifted function")
+    return "emitProgram: function value with no lifted function"
   }
   if cloLifted(fe) {
-    return emitFail(
-      "emitProgram: a lambda-lifted local function was taken as a value",
-    )
+    return "emitProgram: a lambda-lifted local function was taken as a value"
   }
-
-  // a signature not representable as a closure `$fnsig` cannot be soundly called as a
-  // value even for a direct-call-only binding: the call site would fall back to the
-  // all-i32 arity functype and `call_indirect` at the wrong type, trapping the engine.
   if cloSigKeyExt(fe) == "" {
-    return emitFail(
-      "emitProgram: a function value's signature is not yet supported — "
-        + cloSigRejectWhat(fe)
-        + " has no representation in the function-value ABI; annotate and call it as a "
-        + "named function instead",
-    )
+    return "emitProgram: a function value's signature is not yet supported — "
+      + cloSigRejectWhat(fe)
+      + " has no representation in the function-value ABI; annotate and call it as a "
+      + "named function instead"
   }
-
-  return emitClosureValueOf(cloAdapterCanonOf(fe), fnIx)
+  return ""
 }
 
 // The function a function-value adapter `fe` calls (`fvaAdapt` in check_assignable.vl): it takes
@@ -40067,48 +40073,57 @@ function identReadsUnionBox(name: string, exprIx: i32, fnIx: i32): boolean {
   return r
 }
 
+// The function a bare name `e` read at `exprIx` in frame `fnIx` builds as a value, or -1 for a
+// module global: a maker instance's token, else the instance's nested copy found by its
+// declaration (the read node is shared by every clone), else the scope's own function (D12213).
+export function fnValueFeOf(e: Ident, isid: i32, exprIx: i32, fnIx: i32): i32 {
+  const tk = monoTokenFe(exprIx, fnIx)
+  if tk >= 0 { return tk }
+  const nc = elabNestedCopyOnChain(elabSrcDecl(identDeclOf(exprIx)), fnIx)
+  if nc >= 0 { return nc }
+  return fnIndexOfInScopeAt(isid, e.identName, fnIx, exprIx)
+}
+
+// How function value `fe` at `exprIx` is written: its void twin's closure where the checker
+// coerced it to return `void`, a refusal for a generic one no call fixes (unless `exprIx` is the
+// stubbed write's right side `stubRhs`, -1 for none), the unchecked core for one nothing calls or
+// only an alias calls (a hole function may be one, D6660), else checked.
+export type FnValueArm = "twin" | "unfixed" | "inert" | "aliasCore" | "checked"
+export function fnValueArmOf(fe: i32, exprIx: i32, stubRhs: i32): FnValueArm {
+  if voidTwinForNode(exprIx, fe) >= 0 { return "twin" }
+  if (
+    exprIx != stubRhs
+    && !vrValueInert(exprIx)
+    && !elabValueSlotUncalled(exprIx)
+    && !monoStubValueOk(fe, exprIx)
+  ) {
+    return "unfixed"
+  }
+  if i32ListHas(monoInertCalled, exprIx) { return "inert" }
+  if (
+    (vrValueInert(exprIx) || elabValueSlotUncalled(exprIx))
+    && monoInstantiatedAny(fe)
+  ) {
+    return "aliasCore"
+  }
+  return "checked"
+}
+
 // A read of `e` that is no param or local of this frame: a function value, else a module
 // global. Returns 0, or -1 once failed.
 function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
-  // A value a maker's instance returns is the closure the row built for that instance (D14825).
-  const tk = monoTokenFe(exprIx, fnIx)
-  // A nested function read in an instance's frame is that instance's copy of it, found by its
-  // declaration: the read node is shared by every instance's clone of the body (D12213).
-  const nc = if tk < 0 { elabNestedCopyOnChain(elabSrcDecl(identDeclOf(exprIx)), fnIx) } else { -1 }
-  // A bare function name in value position constructs a function value: `fnIndexOf` is the
-  // function index `emitClosureValue` expects, scope-aware so a nested function sharing a name
-  // with another maker's nested function resolves to this frame's.
-  const fe = if tk >= 0 { tk } else if nc >= 0 { nc } else { fnIndexOfInScopeAt(isid, e.identName, fnIx, exprIx) }
+  const fe = fnValueFeOf(e, isid, exprIx, fnIx)
   if fe >= 0 {
-    // void-coerced value seam: this node's `(P…) => T` is coerced to `(P…) => void`
-    // by the checker (`fnValVoidCoerce`), so build the void twin's closure instead
-    // (`voidTwinForNode`), or the `>v`-sig call signature-checks against the wrong functype.
-    const vtw = voidTwinForNode(exprIx, fe)
-    if vtw >= 0 { return emitClosureValue(vtw, fnIx) }
-    if (
-      exprIx != stubWriteRhs
-      && !vrValueInert(exprIx)
-      && !elabValueSlotUncalled(exprIx)
-      && !monoStubValueOk(fe, exprIx)
-    ) {
-      return emitFailAt(
+    return match fnValueArmOf(fe, exprIx, stubWriteRhs) {
+      "twin" => emitClosureValue(voidTwinForNode(exprIx, fe), fnIx)
+      "unfixed" => emitFailAt(
         "emitProgram: a generic function taken as a value reaches no call that fixes its type "
           + "— annotate the destination's function type",
         exprIx,
       )
+      "inert" | "aliasCore" => emitClosureValueCore(fe, fnIx)
+      "checked" => emitClosureValue(fe, fnIx)
     }
-    // A value nothing can call has no signature to keep, so a hole function may be one (D6660).
-    if i32ListHas(monoInertCalled, exprIx) {
-      return emitClosureValueCore(fe, fnIx)
-    }
-    // So may one whose template a call instanced, called only through an alias (D7383).
-    if (
-      (vrValueInert(exprIx) || elabValueSlotUncalled(exprIx))
-      && monoInstantiatedAny(fe)
-    ) {
-      return emitClosureValueCore(fe, fnIx)
-    }
-    return emitClosureValue(fe, fnIx)
   }
   // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
   const gIdx = globalIndexOfSid(isid)
