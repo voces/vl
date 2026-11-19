@@ -234,7 +234,6 @@ print(guard(2))
   `function cmp(a: string, b: string): boolean { return a + "x" == b || a > b }\nprint(cmp("a", "b"))\n`,
   `function dig(c: i32): boolean { return c >= '0' && c <= '9' }\nprint(dig(53))\n`,
   `function at(xs: string[], i: i32): string { return xs[i] }\nprint(at(["a", "b"], 1))\n`,
-  `function note(s: string) {\n  const xs = [[s]]\n  print(xs[0][0])\n}\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
   `type K = "p" | "q"\nfunction pick(c: boolean): K {\n  if c { return "p" }\n  return "q"\n}\nprint(pick(true) == "p")\n`,
   `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
   `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
@@ -350,6 +349,27 @@ print(rv(2) + ln(2).length)
     const { rows } = run(src, true);
     for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
       if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A read off a ref list at a string-list element, and a string concat delivered as an argument:
+// both functions covered and matched, along `refListGetTail` and the concat's shared tail.
+Deno.test({
+  name: "ir shadow: a ref list read at a non-scalar element is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function note(s: string) {
+  const xs = [[s]]
+  print(xs[0][0])
+}
+function tw(s: string) { return note(s + "!") }
+tw("a")
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
