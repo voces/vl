@@ -114,6 +114,10 @@ import {
   identReadArmOf,
   idxStorePlainWhy,
   ifExprPlainWhy,
+  ifRefJoinOf,
+  RefJoin,
+  refIfArmOf,
+  strJoinDropsNulAtom,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -215,6 +219,7 @@ import {
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import { wTarget } from "./emit_bytes"
+import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
   narrowedNulLitPinBoxKey,
@@ -264,6 +269,7 @@ import {
   uFieldCount,
   uFieldStart,
   uTags,
+  VKind,
 } from "./emit_state"
 import {
   cloSigPosOfKey,
@@ -879,6 +885,11 @@ function condIsTest(ix: i32): boolean {
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
 function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
+  const rj = ifRefJoinOf(ix0, ibFnIx)
+  const rk = rj.rjKind
+  if rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
+    return ifRefExpr(b, n0, ix0, rep0, rj)
+  }
   const bs: i32[][] = []
   const ixs: i32[] = []
   const reps: i32[] = []
@@ -969,6 +980,56 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   }
   const o: Opnd = { ov: outs[0] }
   return o
+}
+
+// A value `if` joined at a reference (legacy's `emitIfExprRef`): one link whose arms each write
+// their value as itself (`refIfArmOf`'s `plain`) at the join's rep, under the blocktype the
+// lowering asks `ifRefJoinOf` for. A chain's links share the head's kind, so a chain is a miss.
+function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
+  const kind = rj.rjKind ?? "struct"
+  if kind != "str" && kind != "list" && kind != "strlist" && kind != "reflist" {
+    return irBMiss("expression if ref " + kind)
+  }
+  if n.ifElse < 0 || nodeAt(n.ifElse) is IfStmt { return irBMiss("ref if chain") }
+  if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
+  if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) { return irBMiss("ref if drops null atom") }
+  if endsInTemp(b) { return irBMiss("if after an operand") }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  if c is OImm && condIsTest(n.ifCond) { return irBMiss("decided is condition") }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nul = ifLinkYieldsNull(ix, ibFnIx)
+  const thenB = refIfArm(n.ifThen, t, rep, kind, rj.rjSlot, nul)
+  if ibMiss != "" { return irBMiss("ref if arm") }
+  const elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+  if ibMiss != "" { return irBMiss("ref if arm") }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// One arm of `ifRefExpr`: its value as itself at `rep`, written to out `t`.
+function refIfArm(blockIx: i32, t: i32, rep: i32, kind: VKind, slot: i32, nul: boolean): i32[] {
+  const body: i32[] = []
+  const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
+  if arm != "plain" {
+    irBMiss("ref if arm " + arm)
+    return body
+  }
+  const v = irBExpr(body, ifArmValueExpr(blockIx))
+  if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
+  if ibMiss == "" {
+    irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
+  }
+  return body
 }
 
 // Whether body `b` ends in a temp's definition, an operand still waiting to be read.
@@ -1364,7 +1425,7 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 // Whether operands built into `b` from `at` on hold a valued `if` below a part their node writes
 // first (a receiver or an earlier operand, read at its use), naming `why` as the miss. Legacy
 // writes such an `if` in place, which the IR's statement-level `if` cannot reorder.
-function ifBelowLead(b: i32[], at: i32, why: string): boolean {
+export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
@@ -2373,8 +2434,10 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
   const args: Opnd[] = []
   let i = 1
   while i < parts.length {
+    const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
+    if args.length > 0 && ifBelowLead(b, from, "string operand after another") { return 0 }
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
     args.push(a)
     i = i + 1

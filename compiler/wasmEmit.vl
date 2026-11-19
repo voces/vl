@@ -23840,11 +23840,11 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
     if iun != "" {
       how = 3
     } else {
-      const destStruct = ifTypedStructRow(ifIx, fnIx)
-      rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+      const rj = ifRefJoinOf(ifIx, fnIx)
+      rk = rj.rjKind
       if rk != null {
         how = 4
-        rslot = ifExprRefSlot(ifIx, fnIx, rk, destStruct)
+        rslot = rj.rjSlot
       } else {
         vt = ifExprValtype(ifIx, fnIx)
       }
@@ -23869,6 +23869,29 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   if how == 3 { return emitUnionIfValue(iun, jpin, ifIx, fnIx) }
   if rk != null { return emitIfExprRef(ifIx, fnIx, rk, rslot) }
   return emitIfExprAs(ifIx, fnIx, vt)
+}
+
+// The ref kind and table slot a value `if` at `ifIx` joins at (`emitIfExprRef`), or a null kind
+// for a join that is not a reference.
+export type RefJoin = { rjKind: VKind | null, rjSlot: i32 }
+
+// The `RefJoin` of a join that is not a reference.
+export function noRefJoin(): RefJoin {
+  return { rjKind: null, rjSlot: -1 }
+}
+
+export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
+  const destStruct = ifTypedStructRow(ifIx, fnIx)
+  const rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+  const slot = if rk != null { ifExprRefSlot(ifIx, fnIx, rk, destStruct) } else { -1 }
+  return { rjKind: rk, rjSlot: slot }
+}
+
+// The result blocktype of a ref join's `if`, after its opcode: `(ref null $ht)` when the join
+// can yield `null`, else `(ref $ht)`.
+export function fbRefIfOpenType(kind: VKind, slot: i32, nul: boolean) {
+  if nul { return fbValtypeNullable(kind, slot) }
+  return fbValtype(kind, slot)
 }
 
 // The internal failure where `ifExprPlainKind` and `emitIfExpr`'s ladder part ways.
@@ -23904,7 +23927,7 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
     return "atom join"
   }
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx))
+  const rk = ifRefJoinOf(ifIx, fnIx).rjKind
   if rk != null { return "ref " + rk }
   const jpin = nodeTyInOf(ifIx, fnIx)
   if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
@@ -24090,7 +24113,7 @@ function refuseJoinDropsNul(ifIx: i32): i32 {
 // Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
 // `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
 // as a generic's `??` joined with a nullable pin's other side does (D3290).
-function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
+export function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
   let cur = ifIx
   let widens = false
   while cur >= 0 {
@@ -24145,11 +24168,7 @@ function emitIfExprRefLink(
     // needs a nullable blocktype, else a `(ref null $ht)` arm mismatches the non-null result.
     // A non-nullable join, or a binding whose arms are both non-null, stays non-null and widens on store.
     const nulJoin = chainNul
-    if nulJoin {
-      fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
-    } else {
-      fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
-    }
+    fbRefIfOpenType(kind, slot, nulJoin)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
@@ -24258,6 +24277,41 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
   )
 }
 
+// How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
+// itself, `recover` the same under `ref.as_non_null`, `nestedIf` an `if` value joined at this
+// rep; `null`, `atomStr` and `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
+export type RefIfArm = "plain" | "recover" | "null" | "atomStr" | "recordCopy" | "nestedIf" | "noValue"
+
+// `emitRefIfArm`'s ladder for arm `blockIx` (D1577, D1560, D2100).
+export function refIfArmOf(
+  blockIx: i32,
+  fnIx: i32,
+  kind: VKind,
+  slot: i32,
+  nulJoin: boolean,
+): RefIfArm {
+  const b = nodeAt(blockIx)
+  if !(b is Block) { return "noValue" }
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 { return "noValue" }
+  if ifArmIsValue(tv, fnIx) {
+    if nodeAt(unwrapParen(tv)) is NullLit { return "null" }
+    if kind == "struct" && refIfArmNeedsRecordCopy(tv, slot, fnIx) { return "recordCopy" }
+    if kind == "str" && exprIsLitAtom(tv, fnIx) { return "atomStr" }
+    if !nulJoin && nulNicheRecoverOwed(kind, tv, fnIx) { return "recover" }
+    return "plain"
+  }
+  const inner = unwrapParen(tv)
+  if (
+    inner >= 0
+    && nodeAt(inner) is IfStmt
+    && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
+  ) {
+    return "nestedIf"
+  }
+  return "noValue"
+}
+
 // One arm of a ref-typed if-expression: its prelude, then its tail-value statement emitted
 // in the join rep. `nulJoin` is threaded from the caller rather than re-derived, so the
 // declaration and the arm's recover cannot disagree about nullness (D1577).
@@ -24269,61 +24323,36 @@ function emitRefIfArm(
   nulJoin: boolean,
 ) {
   const b = nodeAt(blockIx)
-  if b is Block {
-    const tv = ifArmValueExpr(blockIx)
-    if tv >= 0 {
-      if ifArmIsValue(tv, fnIx) {
-        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        // A bare `null` arm lowers as the join's own null, not through `emitNullLitNode`'s
-        // seed ladder: `fbRefNullOfKind` is `fbValtypeNullable`'s value twin, so the arm and
-        // the blocktype cannot name different heap types. Without it an explicit
-        // `else { null }` refuses at every ref kind whose null no boundary seed carries (D1560), while the else-less spelling of the same value keeps working.
-        if nodeAt(unwrapParen(tv)) is NullLit {
-          return emitIfArmClose(fbRefNullOfKind(kind, slot))
-        }
-        if kind == "struct" {
-          // A record value, not a literal, joined into a wider record would need a converting
-          // copy, which a delivery of it has nowhere else either (D2100).
-          if refIfArmNeedsRecordCopy(tv, slot, fnIx) {
-            return emitIfArmClose(
-              emitFailAt(
-                "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared",
-                tv,
-              ),
-            )
-          }
-        }
-        // An ATOM arm in a `string` join widens to its member string (the atom is a
-        // bare i32 id; the join blocktype is the string ref) — the if-expression seam
-        // of the atom-as-string-subtype widen (`retStrWiden` at returns).
-        if kind == "str" && exprIsLitAtom(tv, fnIx) {
-          return emitIfArmClose(emitAtomToStr(tv, fnIx))
-        }
-        // A non-null blocktype is a delivery (D1577), so an arm whose rep is the join
-        // kind's nullable niche owes the same `ref.as_non_null` the return / argument /
-        // binding boundaries make (`nulNicheRecoverOwed`) — a nested-struct field stores
-        // `(ref null $S)` though its type is not nullable, so an unrecovered arm pushes that under a `(ref $S)` result: invalid wasm. Under a nullable blocktype nothing is owed.
-        const rcV = emitExpr(tv, fnIx)
-        if rcV >= 0 && !nulJoin {
-          if nulNicheRecoverOwed(kind, tv, fnIx) { fbRefAsNonNull() }
-        }
-        return emitIfArmClose(rcV)
-      }
-      // An arm ending in an if-expression the value test declines (an else-less one yields
-      // `null` on its missing path) joins at this rep too, once this frame can hold its null.
-      const inner = unwrapParen(tv)
-      if (
-        inner >= 0
-        && nodeAt(inner) is IfStmt
-        && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
-      ) {
-        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        return emitIfArmClose(emitIfExprRef(inner, fnIx, kind, slot))
-      }
+  if !(b is Block) { return emitFail("emitProgram: if-expression arm is not a block") }
+  const arm = refIfArmOf(blockIx, fnIx, kind, slot, nulJoin)
+  const tv = ifArmValueExpr(blockIx)
+  match arm {
+    "noValue" => {
+      return ifArmNoValueFail("if-expression arm", blockIx)
     }
-    return ifArmNoValueFail("if-expression arm", blockIx)
+    "nestedIf" => {
+      if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+      return emitIfArmClose(emitIfExprRef(unwrapParen(tv), fnIx, kind, slot))
+    }
+    "null" | "atomStr" | "recover" | "plain" | "recordCopy" => {}
   }
-  return emitFail("emitProgram: if-expression arm is not a block")
+  if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+  // A record joined into a wider record would need a converting copy (D2100).
+  if arm == "recordCopy" {
+    return emitIfArmClose(
+      emitFailAt(
+        "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared",
+        tv,
+      ),
+    )
+  }
+  // A bare `null` arm is the join's own null (`fbRefNullOfKind`, `fbValtypeNullable`'s value twin).
+  if arm == "null" { return emitIfArmClose(fbRefNullOfKind(kind, slot)) }
+  // An atom arm in a `string` join widens to its member string.
+  if arm == "atomStr" { return emitIfArmClose(emitAtomToStr(tv, fnIx)) }
+  const rcV = emitExpr(tv, fnIx)
+  if rcV >= 0 && arm == "recover" { fbRefAsNonNull() }
+  return emitIfArmClose(rcV)
 }
 
 // Lower the if-expression at `ifIx` with a known blocktype byte `kind`, threading it
