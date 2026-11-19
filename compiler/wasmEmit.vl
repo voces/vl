@@ -36119,6 +36119,35 @@ function emittedCondConst(condStart: i32): i32 {
   return -1
 }
 
+// Whether statement condition `condIx` is a box `is` test `tagIsArmOf` answers `tagAbsent`, a
+// decided `false` that reads nothing: asked in storage mode when its receiver is narrowed, past
+// the checks `emitIs` makes first. The IR's builder asks the same.
+export function isDecidedFalse(condIx: i32, fnIx: i32): boolean {
+  const ix = unwrapParen(condIx)
+  const n = if ix >= 0 { nodeAt(ix) } else { null }
+  if !(n is IsExpr) || n.isFit >= 0 { return false }
+  const stored = isTestsStorage(n.isObj, fnIx)
+  if !stored && !isBoxGuardPlain(ix, fnIx) { return false }
+  const mark = if stored { storageReadEnter(n.isObj) } else { -1 }
+  const r = isRecvStageRep(ix, fnIx) < 0
+    && isArmOf(ix, fnIx, 0, false) == "armTag"
+    && tagIsArmOf(ix, n, fnIx) == "tagAbsent"
+  if stored { storageReadLeave(mark) }
+  return r
+}
+
+// A statement `if`'s condition `condIx` written, and its decided constant (`staticIsGuard`), or
+// -2 once failed. A decided `false` (`isDecidedFalse`) is written as itself, `i32.const 0`.
+function emitGuardCond(condIx: i32, fnIx: i32): i32 {
+  if isDecidedFalse(condIx, fnIx) {
+    fbI32Const(0)
+    return 0
+  }
+  const condStart = wLen()
+  if emitCondExpr(condIx, fnIx) < 0 { return -2 }
+  return staticIsGuard(condIx, condStart)
+}
+
 // `emittedCondConst` of an `is` test `condIx`, or its `!`, emitted since `condStart`, or -1 for
 // any other condition: an instance decides its own `is` tests, so one arm can be dead there.
 function staticIsGuard(condIx: i32, condStart: i32): i32 {
@@ -36493,11 +36522,9 @@ function emitIfLinkStmt(s: IfStmt, fnIx: i32, open: i32[], tail: boolean) {
   }
   // structured void `if`: push the i32 condition, then `if`/`else`/`end`. A
   // monomorphized-instance `is` guard is decided at compile time, so one arm can be
-  // provably unreachable in this instance and is emitted empty instead (D932) — read
-  // off the emitted condition itself (`emittedCondConst`), not a parallel predicate.
-  const condStart = wLen()
-  if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-  const staticGuard = staticIsGuard(s.ifCond, condStart)
+  // provably unreachable in this instance and is emitted empty instead (D932).
+  const staticGuard = emitGuardCond(s.ifCond, fnIx)
+  if staticGuard == -2 { return -1 }
   negGuardFn = fnIx
   negGuardCond = s.ifCond
   negGuardVal = staticGuard
@@ -38923,9 +38950,8 @@ function emitIfLinkTail(s: IfStmt, fnIx: i32, open: i32[]) {
   // gate (`emittedCondConst`), same slot accounting (`cursorSlotsUnder`). The tail form
   // is the same defect one position over: `function f(v) { if v is string { "\"" + v }
   // else { "o" } }` emitted the statically-false arm's narrowed use in the i32 instance.
-  const condStart = wLen()
-  if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-  const staticGuard = staticIsGuard(s.ifCond, condStart)
+  const staticGuard = emitGuardCond(s.ifCond, fnIx)
+  if staticGuard == -2 { return -1 }
   fbIf(64) // 0x04 if, 0x40 void blocktype
   if staticGuard != 0 {
     if emitStmtsTail(s.ifThen, fnIx) < 0 { return -1 }

@@ -17,9 +17,22 @@ receiver is tested at its storage (D2447): the builder sets and restores legacy'
 Covering `identBox` alone unblocked about 0 functions: the census is an upper bound, and those
 functions held further blockers behind it, mostly the std float printer every `nj2` cell compiles
 (`expression as`). The payoff was `tagAbsent`. Legacy writes `i32.const 0` and reads that constant
-back off its own bytes (`staticIsGuard`) to drop the guarded arm (D932). So a statement `if`'s link
-asks `decidedFalseGuard` and builds no then arm; anywhere else (`!`, `&&`, a value `if`) legacy
-folds the constant, so `tagAbsent` there stays the named miss `is arm tag tagAbsent`.
+back off its own bytes (`staticIsGuard`) to drop the guarded arm (D932). The decision is one shared
+function, `isDecidedFalse` beside `staticIsGuard`: legacy's two statement-`if` writers
+(`emitIfStmtStmt`, `emitIfLinkTail`) write a decided test as `i32.const 0` through `emitGuardCond`
+before reading it back, and each `ifChain` link asks the same predicate, so the two cannot
+disagree about a dropped arm. Legacy's dead-arm write (`isDeadArm`) never meets a decided guard: the checker
+notes a then arm dead only under `!`, when every value of the operand passes the test
+(`check_statements.vl`'s `deadArmNote`), and never in an instance, while `isDecidedFalse` takes
+only a bare `is` test.
+Anywhere else (`!`, `&&`, a value `if`) legacy folds the constant, so `tagAbsent` there stays the
+named miss `is arm tag tagAbsent`.
+
+The self-compile's own narrowed chains (`if n is A … else if n is B` over AST nodes) were `is
+guard` on master, 695 functions blocked alone: a narrowed receiver tested at its storage on the
+`variant` rung. In storage mode the read is the declared box, so a plain variant row's tag
+(`isVariantTagPlain`, asked in storage mode) compares over the raw slot too. Self-compile
+functions with no blocker: 12,663 → 13,327.
 
 Measured on fixpoint seeds, master d1de0b7d against this branch:
 
