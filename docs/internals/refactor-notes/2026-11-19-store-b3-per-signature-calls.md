@@ -27,7 +27,7 @@ bundle record, and it stays with the late decision.
   `functions/hole-lambda-literal-at-two-instances.vl` (`lap4`, which also calls `g([1, 2])`) and
   `functions/generic-structured-param-through-hole.vl`.
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,762 programs: 0 RC, wasm or output movers.
 
 ## Left of the 13
 Three rows: `closures/bundle-record-param-copied-into-a-const`,
