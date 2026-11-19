@@ -15791,6 +15791,7 @@ function emitMapPrep(recvIx: i32, keyIx: i32, fnIx: i32) {
 function emitMapPrepFor(recvIx: i32, keyIx: i32, fnIx: i32, needSlot: boolean) {
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   // Pop the stacked pair into the frame only now — user code is done running.
+  if !needSlot { return mapPrepProbeTail() }
   fbLocalSet(cmKeyLocal()) // the target key
   setMapRef()              // mapRef (the shared mono slot, or this mv/i32 frame's)
   return emitMapProbe(false, needSlot)
@@ -15830,11 +15831,14 @@ function defExprNullable(ix: i32) {
 // reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
 // (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
-  const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
-  if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
+  const arm = mapGetOrArmOf(recvIx, defIx, fnIx, rk)
+  if arm == "helper" {
+    const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
+    return emitMapGetCall(recvIx, keyIx, fnIx, miss[0])
+  }
   const wvk = mapRecvScalarKindInst(recvIx, fnIx)
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
-  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+  if arm == "widen" {
     pushMapScr(5)                // entry
     fbIf(valBlockTypeOfKind(rk)) // if (entry != 0 → found), the result's blocktype
     pushMapScalarHit()
@@ -15844,7 +15848,15 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     fbEnd()
     return 0
   }
-  if cmSlot >= 0 {
+  if arm == "mv" && mapGetOrMvPlain(recvIx, defIx, fnIx) {
+    const pslot = cmSlot
+    mapGetOrMvHead(pslot)
+    if emitMapValDefault(pslot, mvScalarValKind(pslot), defIx, fnIx) < 0 {
+      return -1
+    }
+    return mapGetOrMvTail(pslot)
+  }
+  if arm == "mv" {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
     // `(ref null)` slot read, the miss arm from the default, and `ref.as_non_null`
@@ -15917,38 +15929,19 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   // stores null as an i32 sentinel in the mono vals slot (`-1` litunion atom, `2`
   // boolean): a missing key and the stored sentinel both read as null, and `??`
   // coalesces on that — read the raw i32 and default when it equals the sentinel.
-  let nulSentinel = 0
-  let hasSentinel = false
-  const orMt = mapRecvTyIn(recvIx, fnIx)
-  if mapTyValIsNulLitUnion(orMt) {
-    nulSentinel = 0 - 1
-    hasSentinel = true
-  } else if mapTyValIsNulBool(orMt) || mapTyValIsNullUnit(orMt) {
-    nulSentinel = 2
-    hasSentinel = true
+  if arm == "scalarBox" {
+    return emitMapGetOrScalarBox(
+      mapRecvScalarBoxKindIn(recvIx, fnIx),
+      defIx,
+      fnIx,
+    )
   }
-  if !hasSentinel {
-    if defExprNullable(defIx) {
-      // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
-      const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
-      if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
-        return emitMapGetOrScalarBox(mbk, defIx, fnIx)
-      }
-    }
-    // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
-    pushMapScr(5)         // entry
-    fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
-    pushMapVals()
-    fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
-    pushMapScr(5)         // entry
-    fbI32Const(1)
-    fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
-    fbArrayGet(aTy())     // array.get
-    fbElse()              // else
+  if arm == "i32" || arm == "atom" {
+    mapGetOrI32Head()
     if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
-    fbEnd()               // end (if)
-    return 0
+    return mapGetOrI32Tail()
   }
+  const nulSentinel = mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx))
   // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
   pushMapScr(5)           // entry
   fbIf(127)               // if (entry != 0 → found), i32 blocktype
@@ -15972,6 +15965,119 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   pushMapScr(8)
   fbEnd()
   return 0
+}
+
+// How `recvIx[k] ?? defIx` (`rk` the `??`'s atom kind, -1 none) reads its map: through the
+// `__map_get_<row>__` helper, widened to `rk`, at an mv slot's value, as a nullable value boxed or
+// held at its null sentinel, or as the plain `i32` read with the default in its miss arm, an
+// atom-valued map's (`atom`) written as a member literal.
+export type MapGetOrArm = "helper"
+  | "widen"
+  | "mv"
+  | "scalarBox"
+  | "sentinel"
+  | "atom"
+  | "i32"
+export function mapGetOrArmOf(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+  rk: i32,
+): MapGetOrArm {
+  if mapGetOrHelperRoute(recvIx, defIx, fnIx, rk).length == 1 {
+    return "helper"
+  }
+  const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+    return "widen"
+  }
+  if mapRecvShapeOf(recvIx, fnIx) >= 0 { return "mv" }
+  if mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx)) != 0 { return "sentinel" }
+  if defExprNullable(defIx) {
+    // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
+    const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
+    if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
+      return "scalarBox"
+    }
+  }
+  if mapTyValLitUnionTexts(mapRecvTyIn(recvIx, fnIx)).length > 0 {
+    return "atom"
+  }
+  return "i32"
+}
+
+// Whether `recvIx[k] ?? defIx` at an mv slot takes its plain arm: a value that is neither a union
+// nor a nullable niche, and a default that is not nullable, written in the value's own rep.
+export function mapGetOrMvPlain(recvIx: i32, defIx: i32, fnIx: i32): boolean {
+  const ms = mapRecvShapeOf(recvIx, fnIx)
+  if ms < 0 || mvValKindAt(ms) == "union" || defExprNullable(defIx) {
+    return false
+  }
+  return mvScalarValKind(ms) != null || !mvSlotNullable(ms)
+}
+
+// The mv plain arm's head after the probe: `if entry != 0 { stash = vals.backing[entry-1] } else`,
+// a void `if`; the default follows, then `mapGetOrMvTail`.
+export function mapGetOrMvHead(mslot: i32) {
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)                // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // scalar (f64/i64) / (ref null <elem>) slot read
+  fbLocalSet(fnMvValStashLocal(mslot))
+  fbElse()                     // else — a MISS
+  return 0
+}
+
+// After the default: the stash set from it, the `if` closed, the stash read, and a ref value
+// recovered to non-null (a live entry's slot is never null, nor is the default).
+export function mapGetOrMvTail(mslot: i32) {
+  cmSlot = mslot
+  const stashL = fnMvValStashLocal(mslot)
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  if mvScalarValKind(mslot) == null { fbRefAsNonNull() }
+  return 0
+}
+
+// The i32 a mono map of type `mt` stores for a null value: `-1` for a nullable literal union, `2`
+// for a nullable boolean or `null`; 0 for a map with no null sentinel.
+function mapGetOrSentinel(mt: i32): i32 {
+  if mapTyValIsNulLitUnion(mt) { return 0 - 1 }
+  if mapTyValIsNulBool(mt) || mapTyValIsNullUnit(mt) { return 2 }
+  return 0
+}
+
+// The plain `i32` read's head after the probe: `if entry != 0 { vals.backing[entry-1] } else`, a
+// value-typed `if`; the default follows, then `mapGetOrI32Tail`.
+export function mapGetOrI32Head() {
+  pushMapScr(5)         // entry
+  fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
+  pushMapVals()
+  fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
+  pushMapScr(5)         // entry
+  fbI32Const(1)
+  fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
+  fbArrayGet(aTy())     // array.get
+  fbElse()              // else
+  return 0
+}
+
+export function mapGetOrI32Tail() {
+  fbEnd()
+  return 0
+}
+
+// A map read's probe after its receiver and key: the key into the frame, then the map ref, then
+// the probe, leaving `entry`; `emitMapPrep`'s tail.
+export function mapPrepProbeTail() {
+  fbLocalSet(cmKeyLocal())
+  setMapRef()
+  return emitMapProbe(false, false)
 }
 
 // Lower `m[k] ?? d` over a boxed value-union map value that includes null: read the box
@@ -22833,10 +22939,7 @@ export function strSliceTail() {
   return 0
 }
 
-// Lower `s.indexOf(sub)` (or `s.includes(sub)`), leaving an i32: the first index of `sub`
-// in `s`, or -1 (empty `sub` yields 0, the JS convention); `includes` is `indexOf != -1`.
-// An outer loop per verify attempt wraps a skip loop that hoists `B[0]` to advance to the
-// next matching-first-character start in one load, then a verify loop over the rest — both the empty-needle short-circuit and the too-long-needle guard are load-bearing for that hoist.
+// Lower `s.indexOf(sub)` (or `s.includes(sub)`): its two operands, then `strIndexOfTail`.
 function emitStrIndexOf(callIx: i32, fnIx: i32) {
   if callIx < 0 { return -1 }
   const c = nodeAt(callIx)
@@ -22849,122 +22952,129 @@ function emitStrIndexOf(callIx: i32, fnIx: i32) {
     if c.callFn < 0 { return -1 }
     const callee = nodeAt(c.callFn)
     if callee is Member {
-      const isIncludes = callee.memProp == "includes"
-      // Eval receiver + needle onto the stack first (nested string ops complete),
-      // then stash: needle on top → B, then receiver → A.
+      // Eval receiver + needle onto the stack first (nested string ops complete).
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      fbLocalSet(strScratchBase + 1) // local.set strScrB (sub)
-      fbLocalSet(strScratchBase + 0) // local.set strScrA (s)
-      // Hoist both headers' backing + start before the search — every one of the three
-      // loops below reads one or both operands per trip (§Header: hoist in codegen).
-      hoistStrScr(0)
-      hoistStrScr(1)
-      // I3 = len(sub); I2 = len(s) - len(sub), the last start the needle fits at. Both are
-      // the HEADER's `len` (field 2): `array.len` would be the shared backing's extent, so a
-      // needle that is a VIEW would report its parent's length and the scan would run off it.
-      pushStrScrRef(1)
-      fbStrLen()
-      setStrScrI(3)
-      pushStrScrRef(0)
-      fbStrLen()
-      pushStrScrI(3)
-      fbI32Bin(107) // 0x6b i32.sub
-      setStrScrI(2)
-      fbBlock(127)  // 0x02 block, 0x7f i32 blocktype — yields index / -1
-      // Empty needle → 0. This is also what makes the hoisted B[0] below safe.
-      pushStrScrI(3)
-      fbI32Const(0)
-      fbI32Bin(70) // 0x46 i32.eq
-      fbIf(64)     // 0x04 if, 0x40 void blocktype
-      fbI32Const(0)
-      fbBr(1)      // → out of the i32 block
-      fbEnd()
-      // Needle longer than haystack → -1 (no start exists).
-      pushStrScrI(2)
-      fbI32Const(0)
-      fbI32Bin(72)  // 0x48 i32.lt_s
-      fbIf(64)
-      fbI32Const(-1)
-      fbBr(1)       // → out of the i32 block
-      fbEnd()
-      fbI32Const(0)
-      setStrScrI(0) // I0 = 0
-      fbLoop(64)    // 0x03 loop (outer) — one trip per verify attempt
-      // I1 = B[0]: the character every candidate start has to carry.
-      pushStrScrBase(1)     // needle backing + its start …
-      fbArrayGet(sBackTy()) // … which IS the offset of B[0]
-      setStrScrI(1)
-      fbLoop(64)            // 0x03 loop (skip) — advance to the next candidate
-      // Past the last possible start → no match.
-      pushStrScrI(0)
-      pushStrScrI(2)
-      fbI32Bin(74) // 0x4a i32.gt_s
-      fbIf(64)
-      fbI32Const(-1)
-      fbBr(3)      // depths: if(0)·skip(1)·outer(2)·block(3)
-      fbEnd()
-      // A[I0] != B[0] → not a candidate: advance and keep skipping. ONE load.
-      pushStrScrElem(0, 0)
-      pushStrScrI(1)
-      fbI32Bin(71)  // 0x47 i32.ne
-      fbIf(64)
-      pushStrScrI(0)
-      fbI32Const(1)
-      fbI32Bin(106) // 0x6a i32.add
-      setStrScrI(0)
-      fbBr(1)       // → skip loop header
-      fbEnd()
-      fbEnd()       // 0x0b end (skip loop) — falls through with A[I0]==B[0]
-      // I1 = 1: B[0] already matched, so verification starts at index 1.
-      fbI32Const(1)
-      setStrScrI(1)
-      fbLoop(64) // 0x03 loop (verify)
-      // I1 >= len(sub) → full match at I0: yield I0 out of the i32 block.
-      pushStrScrI(1)
-      pushStrScrI(3)
-      fbI32Bin(78) // 0x4e i32.ge_s
-      fbIf(64)
-      pushStrScrI(0)
-      fbBr(3)      // depths: if(0)·verify(1)·outer(2)·block(3)
-      fbEnd()
-      // A[I0+I1] != B[I1] → mismatch: advance I0 and re-enter the skip loop.
-      pushStrScrBase(0)
-      pushStrScrI(0)
-      fbI32Bin(106)         // 0x6a i32.add — startA + I0
-      pushStrScrI(1)
-      fbI32Bin(106)         // 0x6a i32.add — … + I1
-      fbArrayGet(sBackTy()) // 0xfb 0x0b array.get
-      pushStrScrElem(1, 1)  // B[I1]
-      fbI32Bin(71)          // 0x47 i32.ne
-      fbIf(64)
-      pushStrScrI(0)
-      fbI32Const(1)
-      fbI32Bin(106)         // i32.add
-      setStrScrI(0)         // I0 = I0 + 1
-      fbBr(2)               // 0x0c br depth 2 → outer loop header
-      fbEnd()               // 0x0b end (mismatch if)
-      // I1 = I1 + 1; br verify loop
-      pushStrScrI(1)
-      fbI32Const(1)
-      fbI32Bin(106)  // i32.add
-      setStrScrI(1)
-      fbBr(0)        // 0x0c br depth 0 → verify loop header
-      fbEnd()        // 0x0b end (verify loop)
-      fbEnd()        // 0x0b end (outer loop)
-      fbI32Const(-1) // block result; the skip loop owns the real exhaustion exit
-      fbEnd()        // 0x0b end (block) — leaves the i32 result
-      if isIncludes {
-        fbI32Const(-1)
-        fbI32Bin(71) // 0x47 i32.ne — `includes` ≡ `indexOf(sub) != -1`
-      }
-      return 0
+      return strIndexOfTail(callee.memProp == "includes")
     }
     return emitFail(
       "emitProgram: string .indexOf receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string indexOf call")
+}
+
+// `s.indexOf(sub)` over the receiver and needle on the stack, leaving an i32: the first index of
+// `sub` in `s`, or -1 (empty `sub` yields 0); `includes` is `indexOf != -1`.
+// An outer loop per verify attempt wraps a skip loop that hoists `B[0]` to advance to the
+// next matching-first-character start in one load, then a verify loop over the rest — both the empty-needle short-circuit and the too-long-needle guard are load-bearing for that hoist.
+export function strIndexOfTail(isIncludes: boolean): i32 {
+  // Stash: needle on top → B, then receiver → A.
+  fbLocalSet(strScratchBase + 1) // local.set strScrB (sub)
+  fbLocalSet(strScratchBase + 0) // local.set strScrA (s)
+  // Hoist both headers' backing + start before the search — every one of the three
+  // loops below reads one or both operands per trip (§Header: hoist in codegen).
+  hoistStrScr(0)
+  hoistStrScr(1)
+  // I3 = len(sub); I2 = len(s) - len(sub), the last start the needle fits at. Both are
+  // the HEADER's `len` (field 2): `array.len` would be the shared backing's extent, so a
+  // needle that is a VIEW would report its parent's length and the scan would run off it.
+  pushStrScrRef(1)
+  fbStrLen()
+  setStrScrI(3)
+  pushStrScrRef(0)
+  fbStrLen()
+  pushStrScrI(3)
+  fbI32Bin(107) // 0x6b i32.sub
+  setStrScrI(2)
+  fbBlock(127)  // 0x02 block, 0x7f i32 blocktype — yields index / -1
+  // Empty needle → 0. This is also what makes the hoisted B[0] below safe.
+  pushStrScrI(3)
+  fbI32Const(0)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)     // 0x04 if, 0x40 void blocktype
+  fbI32Const(0)
+  fbBr(1)      // → out of the i32 block
+  fbEnd()
+  // Needle longer than haystack → -1 (no start exists).
+  pushStrScrI(2)
+  fbI32Const(0)
+  fbI32Bin(72)  // 0x48 i32.lt_s
+  fbIf(64)
+  fbI32Const(-1)
+  fbBr(1)       // → out of the i32 block
+  fbEnd()
+  fbI32Const(0)
+  setStrScrI(0) // I0 = 0
+  fbLoop(64)    // 0x03 loop (outer) — one trip per verify attempt
+  // I1 = B[0]: the character every candidate start has to carry.
+  pushStrScrBase(1)     // needle backing + its start …
+  fbArrayGet(sBackTy()) // … which IS the offset of B[0]
+  setStrScrI(1)
+  fbLoop(64)            // 0x03 loop (skip) — advance to the next candidate
+  // Past the last possible start → no match.
+  pushStrScrI(0)
+  pushStrScrI(2)
+  fbI32Bin(74) // 0x4a i32.gt_s
+  fbIf(64)
+  fbI32Const(-1)
+  fbBr(3)      // depths: if(0)·skip(1)·outer(2)·block(3)
+  fbEnd()
+  // A[I0] != B[0] → not a candidate: advance and keep skipping. ONE load.
+  pushStrScrElem(0, 0)
+  pushStrScrI(1)
+  fbI32Bin(71)  // 0x47 i32.ne
+  fbIf(64)
+  pushStrScrI(0)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  setStrScrI(0)
+  fbBr(1)       // → skip loop header
+  fbEnd()
+  fbEnd()       // 0x0b end (skip loop) — falls through with A[I0]==B[0]
+  // I1 = 1: B[0] already matched, so verification starts at index 1.
+  fbI32Const(1)
+  setStrScrI(1)
+  fbLoop(64) // 0x03 loop (verify)
+  // I1 >= len(sub) → full match at I0: yield I0 out of the i32 block.
+  pushStrScrI(1)
+  pushStrScrI(3)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbIf(64)
+  pushStrScrI(0)
+  fbBr(3)      // depths: if(0)·verify(1)·outer(2)·block(3)
+  fbEnd()
+  // A[I0+I1] != B[I1] → mismatch: advance I0 and re-enter the skip loop.
+  pushStrScrBase(0)
+  pushStrScrI(0)
+  fbI32Bin(106)         // 0x6a i32.add — startA + I0
+  pushStrScrI(1)
+  fbI32Bin(106)         // 0x6a i32.add — … + I1
+  fbArrayGet(sBackTy()) // 0xfb 0x0b array.get
+  pushStrScrElem(1, 1)  // B[I1]
+  fbI32Bin(71)          // 0x47 i32.ne
+  fbIf(64)
+  pushStrScrI(0)
+  fbI32Const(1)
+  fbI32Bin(106)         // i32.add
+  setStrScrI(0)         // I0 = I0 + 1
+  fbBr(2)               // 0x0c br depth 2 → outer loop header
+  fbEnd()               // 0x0b end (mismatch if)
+  // I1 = I1 + 1; br verify loop
+  pushStrScrI(1)
+  fbI32Const(1)
+  fbI32Bin(106)  // i32.add
+  setStrScrI(1)
+  fbBr(0)        // 0x0c br depth 0 → verify loop header
+  fbEnd()        // 0x0b end (verify loop)
+  fbEnd()        // 0x0b end (outer loop)
+  fbI32Const(-1) // block result; the skip loop owns the real exhaustion exit
+  fbEnd()        // 0x0b end (block) — leaves the i32 result
+  if isIncludes {
+    fbI32Const(-1)
+    fbI32Bin(71) // 0x47 i32.ne — `includes` ≡ `indexOf(sub) != -1`
+  }
+  return 0
 }
 
 // Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32: a guarded
@@ -23809,7 +23919,7 @@ function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
 function emitIfExpr(ifIx: i32, fnIx: i32) {
   // The IR claims an `if` by `ifExprPlainKind`; under the armed shadow, where legacy emits every
   // function, every exit here proves that decision agrees. Its exclusions keep this `if` off the
-  // link's int-switch and static-condition exits.
+  // link's int-switch and literal-`true` exits.
   const pk = if irShadowOn { ifExprPlainKind(ifIx, fnIx) } else { -1 }
   const gv = optGuardCallOf(ifIx, fnIx)
   if gv >= 0 {
@@ -23879,27 +23989,35 @@ function ifPlainDisagrees(ifIx: i32) {
 // value per arm and no `else if`, or -1: no guard call, null, atom, union or ref join, integer
 // switch, static `is` or literal-true condition, prelude, or v128.
 export function ifExprPlainKind(ifIx: i32, fnIx: i32): i32 {
-  if ifIx < 0 || ifIx >= P.nodes.length { return -1 }
+  if ifExprPlainWhy(ifIx, fnIx) != "" { return -1 }
+  return ifExprValtype(ifIx, fnIx)
+}
+
+// Why the value `if` at `ifIx` is not on the plain scalar path `ifExprPlainKind` names, or "".
+export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
+  if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
-  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return -1 }
-  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return -1 }
+  if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return "no else" }
+  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return "arm not lone" }
   const c = nodeAt(unwrapParen(n.ifCond))
-  if c is BoolLit || c is IsExpr || c is Unary && c.unOp == "!" { return -1 }
-  if optGuardCallOf(ifIx, fnIx) >= 0 || intMatchHeadAt(ifIx) { return -1 }
-  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) { return -1 }
+  // A decided `is` folds its dead arm off the condition's own bytes (`staticValueIfCond`): the
+  // IR builds an `is` only as a tag compare, never that constant, and misses a constant one.
+  if c is BoolLit { return "constant condition" }
+  if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
+  if intMatchHeadAt(ifIx) { return "int match" }
+  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) { return "null join" }
   if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
-    return -1
+    return "atom join"
   }
-  if exprUnion(ifIx, fnIx) { return -1 }
-  if ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx)) != null {
-    return -1
-  }
+  if exprUnion(ifIx, fnIx) { return "union" }
+  const rk = ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx))
+  if rk != null { return "ref " + rk }
   const jpin = nodeTyInOf(ifIx, fnIx)
   if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
-    return -1
+    return "string drops null atom"
   }
-  const vt = ifExprValtype(ifIx, fnIx)
-  return if vt == 123 { -1 } else { vt }
+  if ifExprValtype(ifIx, fnIx) == 123 { return "valtype" }
+  return ""
 }
 
 // Whether `blockIx` is a block whose one statement is its value.
@@ -37744,14 +37862,12 @@ function emitStmtTail(stmtIx: i32, fnIx: i32) {
 }
 
 // Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": an
-// `is` test or its `!` it decides off the bytes it wrote, an integer `match` chain, a function
-// taking the union return sink, or no `else`.
+// integer `match` chain, a function taking the union return sink, or no `else`. Its condition
+// is `emitGuardCond`'s, a decided `false` (`isDecidedFalse`) writing no then arm.
 export function tailIfPlainWhy(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "tail if node" }
   const n = nodeAt(ix)
   if !(n is IfStmt) || n.ifCond < 0 { return "tail if node" }
-  const c = nodeAt(unwrapParen(n.ifCond))
-  if c is IsExpr || c is Unary && c.unOp == "!" { return "tail if guard" }
   if intMatchHeadAt(ix) { return "tail if switch" }
   if fnUses.unionSink { return "tail if union sink" }
   return if n.ifElse < 0 { "else-less tail if" } else { "" }
