@@ -1,3 +1,0 @@
-## Type system (Track A)
-
-- **D4961, D4964, D16987 closed:** a generic call that binds a type parameter to nothing binds it where the generic's `is K` arm writes through a receiver of that parameter, directly, through a field or through a `const` the arm names it by, and the empty argument is built there: `g([])` with `if v is f64[] { v.push(1.5) }` hands `g` an `f64[]`. The answer reads the signature and body syntax, so check order cannot change it. Two arms writing it at different types are refused at the call, naming both; an arm that hands the receiver to a call, closure or store keeps the call's earlier behaviour.
