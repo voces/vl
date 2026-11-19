@@ -99,6 +99,7 @@ import {
   RPrint,
   RRawOp,
   RRecover,
+  RRel,
   RRetag,
   RStrOp,
   RTagOf,
@@ -132,6 +133,7 @@ import {
 } from "./ir"
 import {
   fbArrayCopy,
+  fbArrayFill,
   fbArrayGet,
   fbArrayInitData,
   fbArrayLen,
@@ -152,6 +154,8 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
+  fbI32Load,
+  fbI32RelOf,
   fbI64Const,
   fbIf,
   fbLocalGet,
@@ -160,6 +164,7 @@ import {
   fbLocalSet,
   fbLocalTee,
   fbLoop,
+  fbMapTagOfI64,
   fbRefAsNonNull,
   fbRefCast,
   fbRefEq,
@@ -172,6 +177,7 @@ import {
   fbStructNew,
   fbStructSet,
   fbUnreachable,
+  wBytes,
   wSLEB,
   wTarget,
   wU8,
@@ -182,6 +188,8 @@ import {
   arrLitArmOf,
   arrLitBuildOf,
   arrLitPrologue,
+  arrLitRefPlainSlot,
+  arrLitRefShortTail,
   arrLitShortTail,
   atomEqPlanOf,
   atomEqTail,
@@ -544,11 +552,22 @@ function rhs(r: Rhs, tail: boolean) {
       emitMapNew(r.mnAt, lw.irAt)
     }
     RRawOp => rawOp(r)
+    RRel => {
+      leaf()
+      fbI32RelOf(r.rlSp, r.rlSub, r.rlVal)
+    }
   }
 }
 
 // A helper's raw value instruction: its operands, then the one writer it names.
 function rawOp(r: RRawOp) {
+  if r.rwOp == "tag64" {
+    const k = r.rwArgs[0]
+    const s = if k is OVar { varSlot(k.ov) } else { -1 }
+    if s < 0 { return irLMiss("tag64 of a non-variable") }
+    leaf()
+    return fbMapTagOfI64(s)
+  }
   if r.rwArgs.length == 0 { leaf() }
   for a in r.rwArgs { irLOpnd(a) }
   const h = r.rwHeap
@@ -565,6 +584,8 @@ function rawOp(r: RRawOp) {
     "ref.is_null" => fbRefIsNull()
     "call" => fbCall(r.rwImm)
     "test" => 0
+    "load" => fbI32Load()
+    "tag64" => 0
     "tee" => {
       const s = varSlot(r.rwImm)
       if s < 0 { return irLMiss("unmapped slot") }
@@ -585,6 +606,7 @@ function rawEff(n: SRawOp, pending: i32[]) {
     "array.set" => fbArraySet(h)
     "array.copy" => fbArrayCopy(h, n.srImm)
     "array.init_data" => fbArrayInitData(h, n.srImm)
+    "array.fill" => fbArrayFill(h)
     "call" => fbCall(n.srImm)
   }
   return 0
@@ -734,6 +756,12 @@ function makeList(r: RMakeList) {
   arrLitPrologue(r.mlAt)
   const arm = arrLitArmOf(r.mlAt, fnIx, lb)
   for e in r.mlElems { irLOpnd(e) }
+  if arm == "ref" {
+    return arrLitRefShortTail(
+      arrLitRefPlainSlot(r.mlAt, fnIx, lb),
+      r.mlElems.length,
+    )
+  }
   return arrLitShortTail(arm, r.mlElems.length)
 }
 
@@ -1033,27 +1061,70 @@ function callTemp(o: Opnd): i32 {
 }
 
 // Writes body `b`; `tail` when its last node ends a void function, and `out` the slotless
-// variable its valued `if`'s arm ends by writing (-1 for none).
-function body(b: i32[], tail: boolean, out: i32) {
-  const pending: i32[] = []
-  let i = 0
-  while i < b.length {
-    if lwMiss != "" { return 0 }
-    const id = b[i]
-    spanOpen(id)
-    // A valueless `return` after a call in its tail form writes nothing.
-    if !(i > 0 && callReturns(b, i - 1)) {
-      node(
-        id,
-        pending,
-        tail && i == b.length - 1 || callReturns(b, i),
-        if i == b.length - 1 { out } else { -1 },
-      )
+// variable its valued `if`'s arm ends by writing (-1 for none). An `if` opens a frame for its
+// `else` and closes when that frame does, so an `else if` chain's length costs no stack (D1990).
+function body(b0: i32[], tail0: boolean, out0: i32) {
+  const p0: i32[] = []
+  const fb: i32[][] = [b0]
+  const fi: i32[] = [0]
+  const fp: i32[][] = [p0]
+  const ft: boolean[] = [tail0]
+  const fo: i32[] = [out0]
+  // The `if` whose `else` a frame is, and how it opened (`ifOpen`); -1 for the call's own body.
+  const fif: i32[] = [-1]
+  const fk: i32[] = [-1]
+  while fb.length > 0 {
+    const top = fb.length - 1
+    const b = fb[top]
+    const i = fi[top]
+    const pending = fp[top]
+    if lwMiss == "" && i < b.length {
+      const id = b[i]
+      spanOpen(id)
+      // A valueless `return` after a call in its tail form writes nothing.
+      if !(i > 0 && callReturns(b, i - 1)) {
+        const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
+        const k = ifOpen(id, pending, tl)
+        if k == IF_NOT {
+          node(id, pending, tl, if i == b.length - 1 { fo[top] } else { -1 })
+        }
+        if k == IF_ELSE || k == IF_VALUED {
+          const n = lw.irNodes[id]
+          if n is SIf {
+            const pe: i32[] = []
+            fb.push(n.siElse)
+            fi.push(0)
+            fp.push(pe)
+            ft.push(k == IF_ELSE && tl)
+            fo.push(if k == IF_ELSE { -1 } else { n.siOut })
+            fif.push(id)
+            fk.push(k)
+            continue
+          }
+        }
+      }
+      spanClose(id)
+      fi[top] = i + 1
+      continue
     }
-    spanClose(id)
-    i = i + 1
+    if lwMiss == "" && pending.length > 0 {
+      irLMiss("non-stack temp: unconsumed")
+    }
+    const ifId = fif[top]
+    const k = fk[top]
+    fb.pop()
+    fi.pop()
+    fp.pop()
+    ft.pop()
+    fo.pop()
+    fif.pop()
+    fk.pop()
+    if ifId >= 0 {
+      ifClose(ifId, k, fp[top - 1])
+      spanClose(ifId)
+      fi[top - 1] = fi[top - 1] + 1
+    }
   }
-  if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
   return 0
 }
 
@@ -1158,7 +1229,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbEnd()
     }
     SForIn => forIn(n, pending)
-    SIf => ifNode(n, pending, tail)
+    SIf => irLMiss("an `if` outside a body walk")
     SBr => {
       if n.brHas {
         if !lw.irHelper { return irLMiss("valued branch") }
@@ -1195,17 +1266,28 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   }
 }
 
-// An `if`. The loop exit `if c {} else { br L }` is legacy's `eqz; br_if`, and a literal-true
-// test writes no test at all, either for that exit or for an else-less `if`, whose arm runs inline.
-function ifNode(n: SIf, pending: i32[], tail: boolean) {
-  if n.siOut >= 0 { return valuedIf(n, pending) }
+// What `ifOpen` did with a node: not an `if`, wrote all of it, or opened its `else` (a plain or a
+// valued `if`), which `ifClose` ends once the body walk has written that `else`.
+const IF_NOT = -1
+const IF_DONE = 0
+const IF_ELSE = 1
+const IF_VALUED = 2
+
+// Opens `if` node `id` up to its `else`. The loop exit `if c {} else { br L }` is legacy's
+// `eqz; br_if`, and a literal-true test writes no test at all, either for that exit or for an
+// else-less `if`, whose arm runs inline.
+function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
+  if id < 0 || id >= lw.irNodes.length { return IF_NOT }
+  const n = lw.irNodes[id]
+  if !(n is SIf) { return IF_NOT }
+  if n.siOut >= 0 { return valuedIfOpen(n, pending) }
   const exitBr = n.siThen.length == 0
     && n.siElse.length == 1
     && isBr(n.siElse[0])
   if isTrue(n.siCond) && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
     if !exitBr { body(n.siThen, tail, -1) }
-    return 0
+    return IF_DONE
   }
   // A helper's `if c { br L }` is the hand-written bodies' `br_if`.
   if (
@@ -1218,8 +1300,12 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
     if b is SBr && !b.brHas {
       cond(n.siCond, pending)
       const d = brDepth(b.brLabel)
-      if d < 0 { return irLMiss("branch out of its frames") }
-      return fbBrIf(d)
+      if d < 0 {
+        irLMiss("branch out of its frames")
+        return IF_DONE
+      }
+      fbBrIf(d)
+      return IF_DONE
     }
   }
   cond(n.siCond, pending)
@@ -1227,44 +1313,64 @@ function ifNode(n: SIf, pending: i32[], tail: boolean) {
     const b = lw.irNodes[n.siElse[0]]
     if b is SBr {
       const d = brDepth(b.brLabel)
-      if d < 0 { return irLMiss("branch out of its frames") }
+      if d < 0 {
+        irLMiss("branch out of its frames")
+        return IF_DONE
+      }
       fbI32Eqz()
       fbBrIf(d)
     }
-    return 0
+    return IF_DONE
   }
   fbIf(64)
   lwFrames.push(-1)
   body(n.siThen, tail, -1)
   if n.siElse.length > 0 || n.siElseKw {
     fbElse()
-    body(n.siElse, tail, -1)
+    return IF_ELSE
   }
   lwFrames.pop()
   fbEnd()
+  return IF_DONE
 }
 
 // An `if` whose arms each end by writing its slotless out: a value-typed `if` (legacy's `&&` and
 // `||`), whose result stays on the stack for the out's one later read.
-function valuedIf(n: SIf, pending: i32[]) {
+function valuedIfOpen(n: SIf, pending: i32[]): i32 {
   const t = n.siOut
-  if varSlot(t) >= 0 { return irLMiss("valued if into a slot") }
+  if varSlot(t) >= 0 {
+    irLMiss("valued if into a slot")
+    return IF_DONE
+  }
   if t < 0 || t >= lw.irVars.length || t >= lwStackVal.length {
-    return irLMiss("valued if out")
+    irLMiss("valued if out")
+    return IF_DONE
   }
   const vt = valtypeOf(lw.irVars[t].vRep)
-  if vt < 0 { return irLMiss("valued if rep") }
+  if vt < 0 {
+    irLMiss("valued if rep")
+    return IF_DONE
+  }
   cond(n.siCond, pending)
   fbIf(vt)
   lwFrames.push(-1)
   body(n.siThen, false, t)
   fbElse()
-  body(n.siElse, false, t)
+  return IF_VALUED
+}
+
+// Ends `if` node `id` that `ifOpen` opened as `k`, once its `else` is written; a valued `if`'s
+// out joins `pending`, the body the `if` stands in.
+function ifClose(id: i32, k: i32, pending: i32[]) {
   lwFrames.pop()
   fbEnd()
-  lwStackVal[t] = true
-  lwStackLive = lwStackLive + 1
-  pending.push(t)
+  if k != IF_VALUED || id < 0 || id >= lw.irNodes.length { return 0 }
+  const n = lw.irNodes[id]
+  if n is SIf && n.siOut >= 0 && n.siOut < lwStackVal.length {
+    lwStackVal[n.siOut] = true
+    lwStackLive = lwStackLive + 1
+    pending.push(n.siOut)
+  }
   return 0
 }
 
@@ -1513,13 +1619,15 @@ function framed(locals: u8[]): u8[] {
   const code: u8[] = []
   for x in locals { code.push(x) }
   const bodyAt = code.length
-  for x in lwBuf { code.push(x) }
   const out: u8[] = []
-  const p2 = wTarget(out)
+  // `wBytes` carries a relocated constant's row with the bytes that hold it.
+  const p2 = wTarget(code)
+  wBytes(lwBuf)
+  wTarget(out)
   wULEB(code.length)
-  wTarget(p2)
   const shift = out.length + bodyAt
-  for x in code { out.push(x) }
+  wBytes(code)
+  wTarget(p2)
   let r = 0
   while r < lwRowFrom.length {
     lwRowFrom[r] = lwRowFrom[r] + shift
@@ -1596,7 +1704,9 @@ export function irLowerHelper(f: IrFn, out: u8[]): string {
   }
   wTarget(prev)
   if lwMiss != "" { return lwMiss }
-  for x in framed(locals) { out.push(x) }
+  const p3 = wTarget(out)
+  wBytes(framed(locals))
+  wTarget(p3)
   return ""
 }
 
