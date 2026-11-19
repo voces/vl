@@ -55,6 +55,27 @@ The `coerceHeld` rows are §10.2's own example: a list literal inside a held coe
 `named/d1629_literal_fill_annotated.vl`, misses at the door. At every other site the guard stays
 quiet. So 39 of the 14,743 sites are the gap a shipping list-literal caller would face.
 
+To rerun it, copy `compiler/` and `std/` to a scratch tree. In its `irNodeInShadow`, put a
+second count under the `context live` one:
+`if live != "" { count("node-in control: " + irLowerNodeIn(ix, fnIx, ty, false)) }`. Then:
+
+```
+vl build compiler/entry.vl --compiler <fixpoint seed> -o ctl.wasm      # in the scratch tree
+ls scripts/silent-sweep/distilled/{cells,named}/*.vl | split -l 200 - chunk.
+ls chunk.* | xargs -P3 -I{} sh -c 'VL_IR_SHADOW=1 vl check --codegen --compiler ctl.wasm \
+  $(cat {}) 2>&1 | grep "node-in" > {}.out'
+cat chunk.*.out | awk -F'\t' '{split($1,a,": "); c[$2]+=a[length(a)]} END{for(k in c) print c[k]"\t"k}'
+```
+
+The first draft's cursor check fired at 24 sites, all in `named/`:
+- `d15201_run_i32_elements`;
+- `irhoist_global_field_fn` and `irhoist_global_field_start`;
+- the `{nuli64,nulint,unis}_{tofld,tounion}_{bare,forin,list}_destdeep` grid, plus
+  `nuli64_bare_{bare,forin,list}_destdeep`.
+
+They came from a scratch seed that counts `node-in cursor at head` whenever
+`uBoxNewEnd == wLen()` at the probe.
+
 ## Measured
 
 BARS
