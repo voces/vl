@@ -1,0 +1,153 @@
+// The shared runtime helpers, built as IR and lowered by `irLowerHelper` into the slot and name
+// the code section gives each. A helper is written against the small builder below: operands
+// are values, and each operation appends its node to the body being built.
+import { IrFn, IrNode, OVar, Opnd, PrimOp, Rhs, irFnNew, irNodeNew, irVarNew } from "./ir"
+import { irLowerHelper } from "./ir_lower"
+import { irVerify } from "./ir_verify"
+import { emitFail } from "./emit_bytes"
+import { repNodeOfTy } from "./emit_rep"
+import { TY_BOOL, TY_F64, TY_NEVER } from "./check_types"
+
+let hf: IrFn = irFnNew(-1, "")
+let hb: i32[] = []
+
+function begin(ret: i32) {
+  hf = irFnNew(-1, "")
+  hb = []
+  hf.irRetTy = ret
+  hf.irRetRep = repNodeOfTy(ret)
+  return 0
+}
+
+// Lowers the helper built since `begin` onto `out`; -1, with the refusal recorded, when the
+// verifier or the lowering refuses it.
+function finish(name: string, out: u8[]): i32 {
+  hf.irBody = hb
+  const vd = irVerify(hf)
+  if vd.vfRule != 0 { return emitFail("emitProgram: helper " + name + ": " + vd.vfMsg) }
+  const why = irLowerHelper(hf, out)
+  if why != "" { return emitFail("emitProgram: helper " + name + ": " + why) }
+  return 0
+}
+
+function node(n: IrNode, ty: i32): i32 {
+  return irNodeNew(hf, n, ty, repNodeOfTy(ty), -1)
+}
+
+function put(n: IrNode) { hb.push(node(n, TY_NEVER)) }
+
+function param(ty: i32): Opnd {
+  const v = irVarNew(hf, repNodeOfTy(ty), ty, "param", hf.irParams.length)
+  hf.irParams.push(v)
+  return { ov: v }
+}
+
+function local(ty: i32, slot: i32): OVar {
+  return { ov: irVarNew(hf, repNodeOfTy(ty), ty, "local", slot) }
+}
+
+// A temp of type `ty` defined by `r`, for one later use.
+function def(ty: i32, r: Rhs): Opnd {
+  const t = irVarNew(hf, repNodeOfTy(ty), ty, "temp", -1)
+  hb.push(node({ lDst: t, lRhs: r }, ty))
+  return { ov: t }
+}
+
+function op(ty: i32, o: PrimOp, a: Opnd, b: Opnd): Opnd {
+  return def(ty, { poOp: o, poArgs: [a, b] })
+}
+
+function test(o: PrimOp, a: Opnd, b: Opnd): Opnd { return op(TY_BOOL, o, a, b) }
+
+function f64(x: f64): Opnd { return { oiRep: repNodeOfTy(TY_F64), oiBits: f64bits(x) } }
+
+function f64Op(code: i32, a: Opnd[]): Opnd {
+  return def(TY_F64, { nxArgs: a, nxOp: code, nxAt: -1 })
+}
+
+function set(d: OVar, s: Opnd) { put({ asDst: d.ov, asSrc: s }) }
+
+function ret(v: Opnd) { put({ rtHas: true, rtV: v }) }
+
+// Opens a nested body; `close` with what this returned gives it back.
+function open(): i32[] {
+  const outer = hb
+  hb = []
+  return outer
+}
+
+function close(outer: i32[]): i32[] {
+  const b = hb
+  hb = outer
+  return b
+}
+
+function when(c: Opnd, then: i32[]) {
+  put({ siCond: c, siThen: then, siElse: [], siOut: -1, siElseKw: false })
+}
+
+// Leaves the frame labelled `label` when `c` holds.
+function exitIf(c: Opnd, label: i32) {
+  when(c, [node({ brLabel: label, brHas: false, brVal: c }, TY_NEVER)])
+}
+
+// A block labelled `label` around a loop labelled `label + 1`, whose body `b` ends by looping.
+function loopIn(label: i32, b: i32[]) {
+  b.push(node({ brLabel: label + 1, brHas: false, brVal: f64(0.0) }, TY_NEVER))
+  const lp = node({ lpLabel: label + 1, lpBody: b }, TY_NEVER)
+  put({ bkLabel: label, bkBody: [lp], bkOut: -1 })
+}
+
+function returnNanIf(c: Opnd) {
+  const o = open()
+  ret(op(TY_F64, "div", f64(0.0), f64(0.0)))
+  when(c, close(o))
+}
+
+function returnIf(c: Opnd, v: Opnd) {
+  const o = open()
+  ret(v)
+  when(c, close(o))
+}
+
+// `__f64_rem__(x, y) -> f64`: the truncated remainder, with the dividend's sign (JS's `%`, C's
+// `fmod`). Not `x - y * trunc(x / y)`, which is off by an ulp once the quotient passes 2^53, but
+// repeated subtraction: double `b` up to the largest `b * 2^k <= a`, then halve back down,
+// subtracting where it fits, each step exact.
+export function irF64RemFnCode(out: u8[]): i32 {
+  begin(TY_F64)
+  const x = param(TY_F64)
+  const y = param(TY_F64)
+  const a = local(TY_F64, 2)
+  const b = local(TY_F64, 3)
+  const t = local(TY_F64, 4)
+  const s = local(TY_F64, 5)
+  // `v - v` is NaN for a NaN or an infinity, and 0 for every finite `v`.
+  set(s, op(TY_F64, "sub", x, x))
+  returnNanIf(test("ne", s, s))
+  set(b, f64Op(0x99, [y]))
+  returnNanIf(test("or", test("eq", b, f64(0.0)), test("ne", y, y)))
+  set(s, op(TY_F64, "sub", y, y))
+  returnIf(test("ne", s, s), x)
+  // `|x| < |y|` gives `x` itself, which keeps a negative zero dividend negative.
+  set(a, f64Op(0x99, [x]))
+  returnIf(test("lt", a, b), x)
+  // Doubling overflows to +inf, which exceeds every finite `a`, so the loop ends.
+  set(t, b)
+  const up = open()
+  set(s, op(TY_F64, "mul", t, f64(2.0)))
+  exitIf(test("gt", s, a), 0)
+  set(t, s)
+  loopIn(0, close(up))
+  // `a < 2t` holds at every step, so each subtraction is exact and `a` ends in [0, b).
+  const down = open()
+  const fits = test("ge", a, t)
+  const sub = open()
+  set(a, op(TY_F64, "sub", a, t))
+  when(fits, close(sub))
+  exitIf(test("eq", t, b), 2)
+  set(t, op(TY_F64, "mul", t, f64(0.5)))
+  loopIn(2, close(down))
+  ret(f64Op(0xa6, [a, x]))
+  return finish("__f64_rem__", out)
+}

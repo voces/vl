@@ -48,6 +48,7 @@ import {
   irStartClaimOn,
 } from "./ir_build"
 import { irStartPrologueHook } from "./ir_lower"
+import { irF64RemFnCode } from "./ir_helper"
 import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
@@ -5640,118 +5641,6 @@ function rvLenFnCode(out: u8[]) {
   return helpFrameBody(out, body)
 }
 
-// `__f64_rem__(x, y) -> f64`: the truncated remainder — `x - y * trunc(x / y)` in value, with
-// the sign of the dividend (Rust's `f64::rem`, JS's `%`, C's `fmod`; wasm has no instruction
-// for it, D1586). Not that identity evaluated directly — it is off by an ulp once the
-// quotient passes 2^53 — but a scaled repeated-subtraction form: double `b` to the largest `b * 2^k <= a`, then halve back down subtracting where it fits, each step exact in Sterbenz's range.
-function emitF64RemFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // one locals run
-  wULEB(4) // four of them
-  wU8(124) // 0x7c f64 — a, b, t, s
-  // x not finite (NaN or ±inf) → NaN. `v - v` is NaN for both and 0 for every finite v, which is
-  // the whole finiteness test and needs no `inf` constant to compare against.
-  fbLocalGet(0)
-  fbLocalGet(0)
-  fbI32Bin(161) // 0xa1 f64.sub
-  fbLocalTee(5)
-  fbLocalGet(5)
-  fbI32Bin(98) // 0x62 f64.ne
-  fbIf(64)
-  fbF64Const("0.0")
-  fbF64Const("0.0")
-  fbI32Bin(163) // 0xa3 f64.div — 0/0 is the NaN this returns
-  fbReturn()
-  fbEnd()
-  // b = |y|; y NaN, or y zero → NaN. The NaN arm is separate because `|NaN| == 0.0` is FALSE.
-  fbLocalGet(1)
-  fbI32Bin(153) // 0x99 f64.abs
-  fbLocalTee(3)
-  fbF64Const("0.0")
-  fbI32Bin(97) // 0x61 f64.eq
-  fbLocalGet(1)
-  fbLocalGet(1)
-  fbI32Bin(98) // 0x62 f64.ne
-  fbI32Bin(114) // 0x72 i32.or
-  fbIf(64)
-  fbF64Const("0.0")
-  fbF64Const("0.0")
-  fbI32Bin(163) // 0xa3 f64.div
-  fbReturn()
-  fbEnd()
-  // y INFINITE → x. y is not NaN by here, so the same `v - v` test names ±inf alone.
-  fbLocalGet(1)
-  fbLocalGet(1)
-  fbI32Bin(161) // 0xa1 f64.sub
-  fbLocalTee(5)
-  fbLocalGet(5)
-  fbI32Bin(98) // 0x62 f64.ne
-  fbIf(64)
-  fbLocalGet(0)
-  fbReturn()
-  fbEnd()
-  // a = |x|; |x| < |y| → x itself, which is what carries `-0.0 % 1` through unharmed (D1586).
-  fbLocalGet(0)
-  fbI32Bin(153) // 0x99 f64.abs
-  fbLocalTee(2)
-  fbLocalGet(3)
-  fbI32Bin(99) // 0x63 f64.lt
-  fbIf(64)
-  fbLocalGet(0)
-  fbReturn()
-  fbEnd()
-  // SCALE UP: t = b, doubling while `t * 2 <= a`. A double that overflows lands on +inf,
-  // which is `> a` for every finite a, so the loop exits rather than looping forever.
-  fbLocalGet(3)
-  fbLocalSet(4)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(4)
-  fbF64Const("2.0")
-  fbI32Bin(162) // 0xa2 f64.mul
-  fbLocalTee(5)
-  fbLocalGet(2)
-  fbI32Bin(100) // 0x64 f64.gt
-  fbBrIf(1)
-  fbLocalGet(5)
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // DESCEND: subtract t where it fits, halve, stop at t == b. `a < 2t` holds at every step,
-  // so each subtraction is exact and `a` ends in [0, b) — the remainder's magnitude.
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(2)
-  fbLocalGet(4)
-  fbI32Bin(102) // 0x66 f64.ge
-  fbIf(64)
-  fbLocalGet(2)
-  fbLocalGet(4)
-  fbI32Bin(161) // 0xa1 f64.sub
-  fbLocalSet(2)
-  fbEnd()
-  fbLocalGet(4)
-  fbLocalGet(3)
-  fbI32Bin(97) // 0x61 f64.eq
-  fbBrIf(1)
-  fbLocalGet(4)
-  fbF64Const("0.5")
-  fbI32Bin(162) // 0xa2 f64.mul
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // The sign is the dividend's, including on a zero result (`-4.0 % 2.0` is `-0.0`; D1586).
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbI32Bin(166) // 0xa6 f64.copysign
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
 // The start function's `@file:line`. Module 0 is the ENTRY and top-level statements live
 // there, so the frame names the entry at line 1; a single-file compile has no module key and
 // carries the line alone.
@@ -10390,7 +10279,7 @@ function buildCodePayload(
   if gHelpF64Rem >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitF64RemFnCode(entry) < 0 { return -1 }
+    if irF64RemFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__f64_rem__")
   }
   if gHelpInitFail >= 0 {
