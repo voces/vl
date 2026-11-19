@@ -136,6 +136,10 @@ import {
   startInitArmOf,
   startStrAccMarked,
   strLitTakesAtom,
+  tagArmStaged,
+  tagDispatchArms,
+  tagDispatchIds,
+  tagDispatchTy,
   tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
@@ -158,7 +162,7 @@ import {
   nulTestArmOf,
   nullOwnAt,
 } from "./emit_plan_null"
-import { boxOwedAt } from "./emit_plan_coerce"
+import { boxOwedAt, instTyOrSelf } from "./emit_plan_coerce"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -1870,10 +1874,103 @@ function tagLeaf(ix: i32): Opnd {
   return o
 }
 
+// A call through a tagged function set, as `emitFnTagDispatch` writes it: the callee's set id kept,
+// then a valued `if` per member but the last, which takes the final `else`. Each arm is its call,
+// delivered at the call's rep. A lambda arm, which legacy stages at its instance, and a result
+// past the scalars and strings, are named misses.
+function tagDispatch(b: i32[], ix: i32): Opnd {
+  const c = nodeAt(unwrapParen(ix))
+  if !(c is Call) { return irBMiss("tag dispatch node") }
+  const arms = tagDispatchArms(ix, ibFnIx)
+  const ids = tagDispatchIds(ix, ibFnIx)
+  if arms.length == 0 || ids.length != arms.length {
+    return irBMiss("tag dispatch members")
+  }
+  for a in arms {
+    if tagArmStaged(a) { return irBMiss("tag dispatch lambda arm") }
+  }
+  // The call's type read at this instance, as legacy keys its result.
+  const ty = instTyOrSelf(tagDispatchTy(ix, arms, ibFnIx), ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const rep = repNodeOfTy(ty)
+  const p = repPrim(rep)
+  if p == null || p != "i32" && p != "i64" && p != "f32" && p != "f64" && p != "str" {
+    return irBMiss("tag dispatch result")
+  }
+  if primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
+  // Its value stays on the stack, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("tag dispatch after an operand") }
+  const f = irBExpr(b, c.callFn)
+  if ibMiss != "" { return f }
+  if repPrim(irBOpRep(f)) != "i32" { return irBMiss("tag dispatch callee rep") }
+  irBNode(b, { efRhs: { tgsV: f } }, -1, ibNoValue, ix)
+  if arms.length == 1 { return tagArm(b, arms[0], rep) }
+  // Links in member order, then their `if`s innermost first, each out assigned into its parent's.
+  const bs: i32[][] = []
+  const conds: Opnd[] = []
+  const outs: i32[] = []
+  const thens: i32[][] = []
+  let cb = b
+  let k = 0
+  while k < arms.length - 1 {
+    const cv = irBLetTemp(cb, { tgiId: ids[k] }, ix, ibBool)
+    const t = irVarNew(ib, rep, ty, "local", -1)
+    const th: i32[] = []
+    const v = tagArm(th, arms[k], rep)
+    if ibMiss != "" { return v }
+    irBNode(th, { asDst: t, asSrc: v }, -1, ibNoValue, arms[k])
+    bs.push(cb)
+    conds.push(cv)
+    outs.push(t)
+    thens.push(th)
+    const eb: i32[] = []
+    cb = eb
+    k = k + 1
+  }
+  const last = arms.length - 1
+  const lv = tagArm(cb, arms[last], rep)
+  if ibMiss != "" { return lv }
+  irBNode(cb, { asDst: outs[last - 1], asSrc: lv }, -1, ibNoValue, arms[last])
+  let elseB = cb
+  let j = last - 1
+  while j >= 0 {
+    irBNode(
+      bs[j],
+      {
+        siCond: conds[j],
+        siThen: thens[j],
+        siElse: elseB,
+        siOut: outs[j],
+        siElseKw: true,
+      },
+      ty,
+      rep,
+      ix,
+    )
+    if j == 0 { break }
+    const inner: Opnd = { ov: outs[j] }
+    irBNode(bs[j], { asDst: outs[j - 1], asSrc: inner }, -1, ibNoValue, ix)
+    elseB = bs[j]
+    j = j - 1
+  }
+  const o: Opnd = { ov: outs[0] }
+  return o
+}
+
+// Dispatch arm call `a`, delivered at the call's rep `rep` into body `b`.
+function tagArm(b: i32[], a: i32, rep: i32): Opnd {
+  const v = deliver(b, a, rep)
+  if ibMiss == "" && irBOpRep(v) != rep {
+    return irBMiss("tag dispatch arm coercion")
+  }
+  return v
+}
+
 export function irBExpr(b: i32[], ix: i32): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const pre = exprPrePathWhy(ix, ibFnIx)
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
+  if pre == "pre-path tag dispatch" { return tagDispatch(b, ix) }
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return irBExpr(b, n.parInner) }
