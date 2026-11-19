@@ -4914,13 +4914,22 @@ function ftCtxOk(x: i32, p: i32, g: i32, fn: i32, s: i32): boolean {
     }
     // A record literal holds the id as the field's value.
     FieldInit => {
-      const held = pn.fiValue == x
+      const own = pn.fiValue == x
         && (ftRecHolds(g, s) || ftOpenFieldHolds(g, pn.fiName, s))
+      const handed = pn.fiValue == x
+        && !own
+        && ftHandedRecHolds(g, pn.fiName, s)
       // Its literal is built at the record of the set's ids, whatever rep check adopted.
-      if held && ftLate && ftNamedFnValue(x) && !i32ListHas(ftP.named, g) {
+      if (
+        (own && ftLate || handed)
+        && ftNamedFnValue(x)
+        && !i32ListHas(ftP.named, g)
+      ) {
         ftP.named.push(g)
       }
-      return held
+      // So is each list literal holding it up to the hole it is handed to.
+      if handed { ftHandedListsNote(g) }
+      return own || handed
     }
     // Any other parent reads the value as a closure.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | TypeRef | BreakStmt | ContinueStmt | FieldDef | TypeDecl | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | ImportDecl | Spread | LoopVar => {
@@ -5062,6 +5071,46 @@ function ftRecHolds(x: i32, s: i32): boolean {
   return x >= 0 && ftTyHoldsDecided(nodeRepTyIxOf(x), s)
 }
 
+// Whether field `name` of record literal `x` holds set `s`, and a list literal holding `x` is
+// handed to an un-annotated parameter of a function named once: its instance is keyed at the set,
+// so the literals' rows are their own (D15900). At check, every literal of `x`'s field names is
+// decided with `s` (D15641).
+function ftHandedRecHolds(x: i32, name: string, s: i32): boolean {
+  if !(ftLate || ftUseArrow) || x < 0 { return false }
+  if fnTagSetOfTy(tyFieldTyOf(nodeTyIxOf(x), name)) != s { return false }
+  cwIxBuild()
+  let c = x
+  let up = if cwIxCovers(c) { cwIxParent[c] } else { -1 }
+  while up >= 0 && up < P.nodes.length && nodeAt(up) is ArrayLit {
+    c = up
+    up = if cwIxCovers(c) { cwIxParent[c] } else { -1 }
+  }
+  const un = if up >= 0 && up < P.nodes.length { nodeAt(up) } else { null }
+  if !(un is Call) || c == x { return false }
+  const i = i32ListIndexOf(un.callArgs, c)
+  const d = ftNamedFn(un.callFn)
+  const f = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if i < 0 || !(f is FuncDecl) || i >= f.fnParams.length { return false }
+  if i < un.callArgNames.length && un.callArgNames[i] != "" { return false }
+  const pr = nodeAt(f.fnParams[i])
+  if !(pr is Param) || pr.parType >= 0 { return false }
+  // The facts hold the hole's one instance only for a callee named once.
+  return ftFnReadCount(d) == 1
+    && (ftLate || ftShapeFieldDecidedWith(x, name, s))
+}
+
+// Notes each list literal enclosing record literal `x`, up to the call it is handed to, as built
+// at its own type's rep.
+function ftHandedListsNote(x: i32) {
+  cwIxBuild()
+  let up = if cwIxCovers(x) { cwIxParent[x] } else { -1 }
+  while up >= 0 && up < P.nodes.length && nodeAt(up) is ArrayLit {
+    if !i32ListHas(ftP.named, up) { ftP.named.push(up) }
+    up = if cwIxCovers(up) { cwIxParent[up] } else { -1 }
+  }
+  return 0
+}
+
 // Whether the other record literals of `x`'s field names can be decided with set `s` at field
 // `name`: they share one row, whose rep holds ids at that field for all of them or none (D15641),
 // so each set they hold there is decided with `s`. An open field is bound per instance, after the
@@ -5086,9 +5135,17 @@ function ftShapeFieldDecidedWith(x: i32, name: string, s: i32): boolean {
 
 // The record literals sharing record literal `x`'s field names, `x` included.
 function ftShapeLitsOf(x: i32): i32[] {
+  ftShapeBuild()
+  return ftShapeLits[ftLitShapeKey(x)] ?? []
+}
+
+// Builds, once per decision, the record literals by field names and the function reads under the
+// decision's root.
+function ftShapeBuild() {
   if !ftShapeBuilt {
     ftShapeBuilt = true
     ftShapeLits = Map()
+    ftFnReads = Map()
     const todo: i32[] = [ftDecideRoot]
     while todo.length > 0 {
       const i = todo.pop() ?? -1
@@ -5099,11 +5156,13 @@ function ftShapeLitsOf(x: i32): i32[] {
           was.push(i)
           ftShapeLits[k] = was
         }
+        const fd = ftNamedFn(i)
+        if fd >= 0 { ftFnReads[fd] = (ftFnReads[fd] ?? 0) + 1 }
         nodeChildrenPush(i, todo)
       }
     }
   }
-  return ftShapeLits[ftLitShapeKey(x)] ?? []
+  return 0
 }
 
 // Record literal `x`'s field names, in order, joined by commas.
@@ -5122,6 +5181,14 @@ function ftLitShapeKey(x: i32): string {
 // Per field-name key, the record literals under the current decision's root.
 let ftShapeLits: {[string]: i32[]} = Map()
 let ftShapeBuilt = false
+// Per function declaration, how many names under that root read it.
+let ftFnReads: {[i32]: i32} = Map()
+
+// How many names under the current decision's root read function declaration `d`.
+function ftFnReadCount(d: i32): i32 {
+  ftShapeBuild()
+  return ftFnReads[d] ?? 0
+}
 
 // Whether field `name` of record literal `x`, adopted at a hole parameter's record whose field is
 // open, holds set `s` in the literal's own type: after the elaboration the literal is built at
