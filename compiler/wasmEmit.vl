@@ -22833,10 +22833,7 @@ export function strSliceTail() {
   return 0
 }
 
-// Lower `s.indexOf(sub)` (or `s.includes(sub)`), leaving an i32: the first index of `sub`
-// in `s`, or -1 (empty `sub` yields 0, the JS convention); `includes` is `indexOf != -1`.
-// An outer loop per verify attempt wraps a skip loop that hoists `B[0]` to advance to the
-// next matching-first-character start in one load, then a verify loop over the rest — both the empty-needle short-circuit and the too-long-needle guard are load-bearing for that hoist.
+// Lower `s.indexOf(sub)` (or `s.includes(sub)`): its two operands, then `strIndexOfTail`.
 function emitStrIndexOf(callIx: i32, fnIx: i32) {
   if callIx < 0 { return -1 }
   const c = nodeAt(callIx)
@@ -22849,122 +22846,129 @@ function emitStrIndexOf(callIx: i32, fnIx: i32) {
     if c.callFn < 0 { return -1 }
     const callee = nodeAt(c.callFn)
     if callee is Member {
-      const isIncludes = callee.memProp == "includes"
-      // Eval receiver + needle onto the stack first (nested string ops complete),
-      // then stash: needle on top → B, then receiver → A.
+      // Eval receiver + needle onto the stack first (nested string ops complete).
       if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      fbLocalSet(strScratchBase + 1) // local.set strScrB (sub)
-      fbLocalSet(strScratchBase + 0) // local.set strScrA (s)
-      // Hoist both headers' backing + start before the search — every one of the three
-      // loops below reads one or both operands per trip (§Header: hoist in codegen).
-      hoistStrScr(0)
-      hoistStrScr(1)
-      // I3 = len(sub); I2 = len(s) - len(sub), the last start the needle fits at. Both are
-      // the HEADER's `len` (field 2): `array.len` would be the shared backing's extent, so a
-      // needle that is a VIEW would report its parent's length and the scan would run off it.
-      pushStrScrRef(1)
-      fbStrLen()
-      setStrScrI(3)
-      pushStrScrRef(0)
-      fbStrLen()
-      pushStrScrI(3)
-      fbI32Bin(107) // 0x6b i32.sub
-      setStrScrI(2)
-      fbBlock(127)  // 0x02 block, 0x7f i32 blocktype — yields index / -1
-      // Empty needle → 0. This is also what makes the hoisted B[0] below safe.
-      pushStrScrI(3)
-      fbI32Const(0)
-      fbI32Bin(70) // 0x46 i32.eq
-      fbIf(64)     // 0x04 if, 0x40 void blocktype
-      fbI32Const(0)
-      fbBr(1)      // → out of the i32 block
-      fbEnd()
-      // Needle longer than haystack → -1 (no start exists).
-      pushStrScrI(2)
-      fbI32Const(0)
-      fbI32Bin(72)  // 0x48 i32.lt_s
-      fbIf(64)
-      fbI32Const(-1)
-      fbBr(1)       // → out of the i32 block
-      fbEnd()
-      fbI32Const(0)
-      setStrScrI(0) // I0 = 0
-      fbLoop(64)    // 0x03 loop (outer) — one trip per verify attempt
-      // I1 = B[0]: the character every candidate start has to carry.
-      pushStrScrBase(1)     // needle backing + its start …
-      fbArrayGet(sBackTy()) // … which IS the offset of B[0]
-      setStrScrI(1)
-      fbLoop(64)            // 0x03 loop (skip) — advance to the next candidate
-      // Past the last possible start → no match.
-      pushStrScrI(0)
-      pushStrScrI(2)
-      fbI32Bin(74) // 0x4a i32.gt_s
-      fbIf(64)
-      fbI32Const(-1)
-      fbBr(3)      // depths: if(0)·skip(1)·outer(2)·block(3)
-      fbEnd()
-      // A[I0] != B[0] → not a candidate: advance and keep skipping. ONE load.
-      pushStrScrElem(0, 0)
-      pushStrScrI(1)
-      fbI32Bin(71)  // 0x47 i32.ne
-      fbIf(64)
-      pushStrScrI(0)
-      fbI32Const(1)
-      fbI32Bin(106) // 0x6a i32.add
-      setStrScrI(0)
-      fbBr(1)       // → skip loop header
-      fbEnd()
-      fbEnd()       // 0x0b end (skip loop) — falls through with A[I0]==B[0]
-      // I1 = 1: B[0] already matched, so verification starts at index 1.
-      fbI32Const(1)
-      setStrScrI(1)
-      fbLoop(64) // 0x03 loop (verify)
-      // I1 >= len(sub) → full match at I0: yield I0 out of the i32 block.
-      pushStrScrI(1)
-      pushStrScrI(3)
-      fbI32Bin(78) // 0x4e i32.ge_s
-      fbIf(64)
-      pushStrScrI(0)
-      fbBr(3)      // depths: if(0)·verify(1)·outer(2)·block(3)
-      fbEnd()
-      // A[I0+I1] != B[I1] → mismatch: advance I0 and re-enter the skip loop.
-      pushStrScrBase(0)
-      pushStrScrI(0)
-      fbI32Bin(106)         // 0x6a i32.add — startA + I0
-      pushStrScrI(1)
-      fbI32Bin(106)         // 0x6a i32.add — … + I1
-      fbArrayGet(sBackTy()) // 0xfb 0x0b array.get
-      pushStrScrElem(1, 1)  // B[I1]
-      fbI32Bin(71)          // 0x47 i32.ne
-      fbIf(64)
-      pushStrScrI(0)
-      fbI32Const(1)
-      fbI32Bin(106)         // i32.add
-      setStrScrI(0)         // I0 = I0 + 1
-      fbBr(2)               // 0x0c br depth 2 → outer loop header
-      fbEnd()               // 0x0b end (mismatch if)
-      // I1 = I1 + 1; br verify loop
-      pushStrScrI(1)
-      fbI32Const(1)
-      fbI32Bin(106)  // i32.add
-      setStrScrI(1)
-      fbBr(0)        // 0x0c br depth 0 → verify loop header
-      fbEnd()        // 0x0b end (verify loop)
-      fbEnd()        // 0x0b end (outer loop)
-      fbI32Const(-1) // block result; the skip loop owns the real exhaustion exit
-      fbEnd()        // 0x0b end (block) — leaves the i32 result
-      if isIncludes {
-        fbI32Const(-1)
-        fbI32Bin(71) // 0x47 i32.ne — `includes` ≡ `indexOf(sub) != -1`
-      }
-      return 0
+      return strIndexOfTail(callee.memProp == "includes")
     }
     return emitFail(
       "emitProgram: string .indexOf receiver is not a member access",
     )
   }
   return emitFail("emitProgram: expected a string indexOf call")
+}
+
+// `s.indexOf(sub)` over the receiver and needle on the stack, leaving an i32: the first index of
+// `sub` in `s`, or -1 (empty `sub` yields 0); `includes` is `indexOf != -1`.
+// An outer loop per verify attempt wraps a skip loop that hoists `B[0]` to advance to the
+// next matching-first-character start in one load, then a verify loop over the rest — both the empty-needle short-circuit and the too-long-needle guard are load-bearing for that hoist.
+export function strIndexOfTail(isIncludes: boolean): i32 {
+  // Stash: needle on top → B, then receiver → A.
+  fbLocalSet(strScratchBase + 1) // local.set strScrB (sub)
+  fbLocalSet(strScratchBase + 0) // local.set strScrA (s)
+  // Hoist both headers' backing + start before the search — every one of the three
+  // loops below reads one or both operands per trip (§Header: hoist in codegen).
+  hoistStrScr(0)
+  hoistStrScr(1)
+  // I3 = len(sub); I2 = len(s) - len(sub), the last start the needle fits at. Both are
+  // the HEADER's `len` (field 2): `array.len` would be the shared backing's extent, so a
+  // needle that is a VIEW would report its parent's length and the scan would run off it.
+  pushStrScrRef(1)
+  fbStrLen()
+  setStrScrI(3)
+  pushStrScrRef(0)
+  fbStrLen()
+  pushStrScrI(3)
+  fbI32Bin(107) // 0x6b i32.sub
+  setStrScrI(2)
+  fbBlock(127)  // 0x02 block, 0x7f i32 blocktype — yields index / -1
+  // Empty needle → 0. This is also what makes the hoisted B[0] below safe.
+  pushStrScrI(3)
+  fbI32Const(0)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)     // 0x04 if, 0x40 void blocktype
+  fbI32Const(0)
+  fbBr(1)      // → out of the i32 block
+  fbEnd()
+  // Needle longer than haystack → -1 (no start exists).
+  pushStrScrI(2)
+  fbI32Const(0)
+  fbI32Bin(72)  // 0x48 i32.lt_s
+  fbIf(64)
+  fbI32Const(-1)
+  fbBr(1)       // → out of the i32 block
+  fbEnd()
+  fbI32Const(0)
+  setStrScrI(0) // I0 = 0
+  fbLoop(64)    // 0x03 loop (outer) — one trip per verify attempt
+  // I1 = B[0]: the character every candidate start has to carry.
+  pushStrScrBase(1)     // needle backing + its start …
+  fbArrayGet(sBackTy()) // … which IS the offset of B[0]
+  setStrScrI(1)
+  fbLoop(64)            // 0x03 loop (skip) — advance to the next candidate
+  // Past the last possible start → no match.
+  pushStrScrI(0)
+  pushStrScrI(2)
+  fbI32Bin(74) // 0x4a i32.gt_s
+  fbIf(64)
+  fbI32Const(-1)
+  fbBr(3)      // depths: if(0)·skip(1)·outer(2)·block(3)
+  fbEnd()
+  // A[I0] != B[0] → not a candidate: advance and keep skipping. ONE load.
+  pushStrScrElem(0, 0)
+  pushStrScrI(1)
+  fbI32Bin(71)  // 0x47 i32.ne
+  fbIf(64)
+  pushStrScrI(0)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  setStrScrI(0)
+  fbBr(1)       // → skip loop header
+  fbEnd()
+  fbEnd()       // 0x0b end (skip loop) — falls through with A[I0]==B[0]
+  // I1 = 1: B[0] already matched, so verification starts at index 1.
+  fbI32Const(1)
+  setStrScrI(1)
+  fbLoop(64) // 0x03 loop (verify)
+  // I1 >= len(sub) → full match at I0: yield I0 out of the i32 block.
+  pushStrScrI(1)
+  pushStrScrI(3)
+  fbI32Bin(78) // 0x4e i32.ge_s
+  fbIf(64)
+  pushStrScrI(0)
+  fbBr(3)      // depths: if(0)·verify(1)·outer(2)·block(3)
+  fbEnd()
+  // A[I0+I1] != B[I1] → mismatch: advance I0 and re-enter the skip loop.
+  pushStrScrBase(0)
+  pushStrScrI(0)
+  fbI32Bin(106)         // 0x6a i32.add — startA + I0
+  pushStrScrI(1)
+  fbI32Bin(106)         // 0x6a i32.add — … + I1
+  fbArrayGet(sBackTy()) // 0xfb 0x0b array.get
+  pushStrScrElem(1, 1)  // B[I1]
+  fbI32Bin(71)          // 0x47 i32.ne
+  fbIf(64)
+  pushStrScrI(0)
+  fbI32Const(1)
+  fbI32Bin(106)         // i32.add
+  setStrScrI(0)         // I0 = I0 + 1
+  fbBr(2)               // 0x0c br depth 2 → outer loop header
+  fbEnd()               // 0x0b end (mismatch if)
+  // I1 = I1 + 1; br verify loop
+  pushStrScrI(1)
+  fbI32Const(1)
+  fbI32Bin(106)  // i32.add
+  setStrScrI(1)
+  fbBr(0)        // 0x0c br depth 0 → verify loop header
+  fbEnd()        // 0x0b end (verify loop)
+  fbEnd()        // 0x0b end (outer loop)
+  fbI32Const(-1) // block result; the skip loop owns the real exhaustion exit
+  fbEnd()        // 0x0b end (block) — leaves the i32 result
+  if isIncludes {
+    fbI32Const(-1)
+    fbI32Bin(71) // 0x47 i32.ne — `includes` ≡ `indexOf(sub) != -1`
+  }
+  return 0
 }
 
 // Lower `s.charCodeAt(i)` onto `body`, leaving the char code i32: a guarded
