@@ -75,22 +75,13 @@ import {
   irLoweredEntry,
 } from "./ir_lower"
 import {
-  BinNulTest,
   GlobalCtx,
   PrintArm,
   arrLitShort,
   atomEqPlanOf,
-  binNulTestOf,
   binNumWidth,
-  boxOwedAt,
   callEndsNever,
   closureValueWhy,
-  coalArmOf,
-  coalNicheArmOf,
-  coalNulStrBlockPlain,
-  coalResultKindOf,
-  coalesceNulStrStaysNullable,
-  deadNullTestOperand,
   exprPrePathWhy,
   fnValueArmOf,
   fnValueFeOf,
@@ -118,10 +109,6 @@ import {
   narrowedArmNeedsUnbox,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
-  nulNoneEqSides,
-  nulTestArmOf,
-  nullOwnIsAtom,
-  nullOwnIsStr,
   numIntrCallReached,
   numIntrPlanOf,
   numLitAsApplies,
@@ -136,6 +123,22 @@ import {
   tplStrHoleOf,
   widenPlanOf,
 } from "./wasmEmit"
+import {
+  BinNulTest,
+  NULL_OWN_ATOM,
+  NULL_OWN_STR,
+  binNulTestOf,
+  coalArmOf,
+  coalNicheArmOf,
+  coalNulRefArmOf,
+  coalResultKindOf,
+  coalesceNulStrStaysNullable,
+  deadNullTestOperand,
+  nulNoneEqSides,
+  nulTestArmOf,
+  nullOwnAt,
+} from "./emit_plan_null"
+import { boxOwedAt } from "./emit_plan_coerce"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -1218,14 +1221,13 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
-  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`emitNullAt`):
+  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`nullOwnAt`):
   // the sentinel, or the string's typed null ref.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
-    if (
-      atomNullable(dst) && nullOwnIsAtom(ix, ibFnIx)
-      || strNullable(dst) && nullOwnIsStr(ix, ibFnIx)
-    ) {
-      return repTemp(b, { nuAt: ix }, ix, dst)
+    const atom = atomNullable(dst)
+    const own = if atom || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
+    if own == (if atom { NULL_OWN_ATOM } else { NULL_OWN_STR }) {
+      return repTemp(b, { nuAt: ix, nuOwn: own }, ix, dst)
     }
   }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
@@ -1448,14 +1450,14 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return mapGetOr(b, n, ix, rep)
 }
 
-// `l ?? d` over a `string | null` along legacy's plain block (`coalNulStrBlockPlain`), its default
+// `l ?? d` over a `string | null` along legacy's plain block (`coalNulRefArmOf`), its default
 // a string literal and its result the block's own rep. Every other niche arm is a named miss.
 function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("coalesce operand") }
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
   if na != "str" { return irBMiss("coalesce niche " + na) }
-  if !coalNulStrBlockPlain(n, ix, ibFnIx) {
+  if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
   }
   const dIx = unwrapParen(n.binRight)
