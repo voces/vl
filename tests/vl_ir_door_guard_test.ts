@@ -7,11 +7,14 @@
 //           fragment matches legacy byte for byte under it.
 //   fires — a context it can read still misses, by name, until it becomes a door parameter.
 //
-// Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
+//   reach — the push receiver's strict cast is dropped because no IR module reaches the list
+//           payload cast: a `compiler/ir_*.vl` importing it, or a tail that calls it, fails here.
+//
+// Loads the real seed (`build/vl-compiler.wasm`); absent, the seed halves self-ignore.
 //
 // Run with:  deno test -A tests/vl_ir_door_guard_test.ts
 
-import { COMPILER, exists } from "./support/tree.ts";
+import { COMPILER, exists, ROOT } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
 if (ignore) {
@@ -79,11 +82,16 @@ const LOOP = `function walk(s: string): i32 {
 print(walk("ab"))
 `;
 
+// A push receiver read through a list literal: legacy casts its payload strictly here.
+const PUSH_CAST = `[[]][0].push(2.5)
+print(1)
+`;
+
 Deno.test({
   name: "ir door guard: a context the fragment cannot read leaves no row, and the fragment matches",
   ignore,
   fn: () => {
-    for (const [what, src] of [["held ancestor", HELD_ANCESTOR], ["build region", BUILD_REGION], ["loop", LOOP]]) {
+    for (const [what, src] of [["held ancestor", HELD_ANCESTOR], ["build region", BUILD_REGION], ["loop", LOOP], ["push cast", PUSH_CAST]]) {
       const r = rows(src);
       const live = [...r.keys()].filter((k) => k.startsWith("node-in context live"));
       if (live.length > 0) throw new Error(`${what}: want no live context, got ${show(r)}`);
@@ -97,7 +105,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "ir door guard: a staged receiver inside the fragment, and the push receiver cast, still miss",
+  name: "ir door guard: a staged receiver inside the fragment still misses",
   ignore,
   fn: () => {
     const staged = rows(`function f(): i32 { return 3 }
@@ -106,10 +114,6 @@ print(at(1))
 `);
     if ((staged.get("node-in context live: staged list get") ?? 0) < 1) {
       throw new Error(`want the staged receiver named, got ${show(staged)}`);
-    }
-    const cast = rows(`[[]][0].push(2.5)\nprint(1)\n`);
-    if ((cast.get("node-in context live: push receiver cast") ?? 0) < 1) {
-      throw new Error(`want the push receiver cast named, got ${show(cast)}`);
     }
   },
 });
@@ -124,6 +128,55 @@ Deno.test({
     }
     if ((r.get("node-in held ancestor: ") ?? 0) < 1) {
       throw new Error(`want the ancestor-held fragment clean, got ${show(r)}`);
+    }
+  },
+});
+
+// The tails that reach the list payload cast, which a push receiver's strict flag changes.
+const PAYLOAD_CAST = [
+  "listPayloadCastTail",
+  "emitUnionUnboxTail",
+  "emitPlaceNarrowContainerUnbox",
+  "emitRefArrayUnionUnboxRead",
+];
+
+Deno.test({
+  name: "ir door guard: no IR module imports a tail that reaches the list payload cast",
+  fn: () => {
+    const hits: string[] = [];
+    for (const e of Deno.readDirSync(`${ROOT}/compiler`)) {
+      if (!e.name.startsWith("ir") || !e.name.endsWith(".vl")) continue;
+      const text = Deno.readTextFileSync(`${ROOT}/compiler/${e.name}`);
+      for (const m of text.matchAll(/import\s*\{([^}]*)\}/g)) {
+        for (const name of PAYLOAD_CAST) {
+          if (new RegExp(`\\b${name}\\b`).test(m[1])) hits.push(`${e.name}: ${name}`);
+        }
+      }
+    }
+    if (hits.length > 0) {
+      throw new Error(
+        `want no IR import of a payload-cast tail, got ${hits.join(", ")} — ir-design §10.2.1: thread \`strict\` through the door before importing this`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name: "ir door guard: a list-arm narrowing in a push receiver is not the IR's yet",
+  ignore,
+  fn: () => {
+    const r = rows(`function f(u: i32[] | string): i32 {
+  if u is i32[] {
+    u.push(1)
+    return u.length
+  }
+  return 0
+}
+print(f([3]))
+print(f("s"))
+`);
+    if ((r.get("uncovered is rung") ?? 0) < 1) {
+      throw new Error(`want the list-arm narrowing uncovered at \`is rung\`, got ${JSON.stringify([...r])}`);
     }
   },
 });
