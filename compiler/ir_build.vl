@@ -72,6 +72,7 @@ import {
   irGlobalWriteMiss,
   irHexOf,
   irLowerClaim,
+  irLowerFragment,
   irLoweredEntry,
 } from "./ir_lower"
 import {
@@ -159,6 +160,7 @@ import {
 } from "./emit_rep"
 import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
+import { wTarget } from "./emit_bytes"
 import {
   declaredIndexAt,
   envSlotShift,
@@ -2200,7 +2202,37 @@ function tailArm(blockIx: i32): i32[] {
 function build(fnIx: i32, fnPos: i32): string {
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return "not a function" }
-  ib = irFnNew(fnIx, fn.fnName)
+  ibReset(fnIx, fn.fnName, fnPos)
+  if fn.fnTyParams.length > 0 { return "template" }
+  ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
+  ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
+  const none = repIsNoValue(ib.irRetRep)
+  if !(valueRep(ib.irRetRep, ib.irRetTy) || none) {
+    if !censusGoesOn("result rep " + repWhat(ib.irRetRep)) {
+      return "result rep " + repWhat(ib.irRetRep)
+    }
+  }
+  ibNoValue = if none { ib.irRetRep } else { -1 }
+  const pw = buildParams(fn, fnIx, true)
+  if pw != "" { return pw }
+  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
+  if !repIsNoValue(ibNoValue) { return "no void rep" }
+  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
+  const body = nodeAt(fn.fnBody)
+  if !(body is Block) { return "body" }
+  const top: i32[] = []
+  if none {
+    stmtRun(top, body.blkStmts)
+  } else {
+    tailReturn(top, body.blkStmts, fn.fnBody)
+  }
+  ib.irBody = top
+  return ibMiss
+}
+
+// Starts building function `fnIx` (named `name`, at `fnStmts` slot `fnPos`) into a fresh `ib`.
+function ibReset(fnIx: i32, name: string, fnPos: i32) {
+  ib = irFnNew(fnIx, name)
   ibFnIx = fnIx
   ibFnPos = fnPos
   ibMiss = ""
@@ -2212,22 +2244,22 @@ function build(fnIx: i32, fnPos: i32): string {
   ibLabelN = 0
   ibDepth = 0
   ibBool = repNodeOfTy(TY_BOOL)
-  if fn.fnTyParams.length > 0 { return "template" }
-  ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
-  ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
-  const none = repIsNoValue(ib.irRetRep)
-  if !(valueRep(ib.irRetRep, ib.irRetTy) || none) {
-    if !censusGoesOn("result rep " + repWhat(ib.irRetRep)) {
-      return "result rep " + repWhat(ib.irRetRep)
-    }
-  }
-  ibNoValue = if none { ib.irRetRep } else { -1 }
+  return 0
+}
+
+// The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A
+// fragment's (`whole` false) leaves out a parameter it could not hold, so only reading it misses.
+function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
   const shift = envSlotShift(fnIx)
   let i = 0
   while i < fn.fnParams.length {
     const p = fn.fnParams[i]
     const ty = scopeTyAt(p, fnIx)
     const r = repNodeOfTy(ty)
+    if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyOpen(ty)) {
+      i = i + 1
+      continue
+    }
     if isVoidTy(ty) || !valueRep(r, ty) {
       if !censusGoesOn("parameter rep " + repWhat(r)) {
         return "parameter rep " + repWhat(r)
@@ -2242,19 +2274,126 @@ function build(fnIx: i32, fnPos: i32): string {
     ib.irParams.push(v)
     i = i + 1
   }
-  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
-  if !repIsNoValue(ibNoValue) { return "no void rep" }
-  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
-  const body = nodeAt(fn.fnBody)
-  if !(body is Block) { return "body" }
-  const top: i32[] = []
-  if none {
-    stmtRun(top, body.blkStmts)
-  } else {
-    tailReturn(top, body.blkStmts, fn.fnBody)
+  return ""
+}
+
+// The builder's whole state, saved around a fragment built while another build is open.
+type IbFrame = {
+  bfIb: IrFn,
+  bfFnIx: i32,
+  bfFnPos: i32,
+  bfMiss: string,
+  bfMisses: string[],
+  bfDeclVar: {[i32]: i32},
+  bfLoopName: string[],
+  bfLoopBrk: i32[],
+  bfLoopCont: i32[],
+  bfLabelN: i32,
+  bfDepth: i32,
+  bfBool: i32,
+  bfNoValue: i32,
+}
+
+function ibSave(): IbFrame {
+  const f: IbFrame = {
+    bfIb: ib,
+    bfFnIx: ibFnIx,
+    bfFnPos: ibFnPos,
+    bfMiss: ibMiss,
+    bfMisses: ibMisses,
+    bfDeclVar: ibDeclVar,
+    bfLoopName: ibLoopName,
+    bfLoopBrk: ibLoopBrk,
+    bfLoopCont: ibLoopCont,
+    bfLabelN: ibLabelN,
+    bfDepth: ibDepth,
+    bfBool: ibBool,
+    bfNoValue: ibNoValue,
   }
+  return f
+}
+
+function ibRestore(f: IbFrame) {
+  ib = f.bfIb
+  ibFnIx = f.bfFnIx
+  ibFnPos = f.bfFnPos
+  ibMiss = f.bfMiss
+  ibMisses = f.bfMisses
+  ibDeclVar = f.bfDeclVar
+  ibLoopName = f.bfLoopName
+  ibLoopBrk = f.bfLoopBrk
+  ibLoopCont = f.bfLoopCont
+  ibLabelN = f.bfLabelN
+  ibDepth = f.bfDepth
+  ibBool = f.bfBool
+  ibNoValue = f.bfNoValue
+  return 0
+}
+
+// The op seam's legacy-to-IR door: node `ix` of function `fnIx` lowered onto the buffer legacy is
+// writing, at the rep of type `ty` its own writer leaves it at (-1: the node's type), in legacy's
+// frame (live slots, no new local, no seat). "" when written; else the miss, nothing written.
+export function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32): string {
+  const sv = ibSave()
+  const why = lowerNodeIn(ix, fnIx, ty, false)
+  ibRestore(sv)
+  return why
+}
+
+// Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
+// `fnIx` at type `ty`, legacy's bytes for it in the current buffer from `from` on, lowered as a
+// fragment into a scratch buffer and counted `node-in <kind>: matched`, `differ` or `miss <why>`.
+export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
+  if !ibArmed { return 0 }
+  const cur = wTarget([])
+  const sv = ibSave()
+  const why = lowerNodeIn(ix, fnIx, ty, true)
+  ibRestore(sv)
+  const got = wTarget(cur)
+  let row = "matched"
+  if why != "" {
+    row = "miss " + why
+  } else if !bytesFrom(cur, from, got) {
+    row = "differ"
+    if ibDetail {
+      row = row + " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got)
+    }
+  }
+  return count("node-in " + irAstKind(ix) + ": " + row)
+}
+
+// Whether `b` from `at` on holds exactly `want`.
+function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
+  if at < 0 || b.length - at != want.length { return false }
+  let i = 0
+  while i < want.length {
+    if b[at + i] != want[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+  if fnIx < 0 || fnIx >= P.nodes.length { return "fragment outside a function" }
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return "fragment outside a function" }
+  if fn.fnTyParams.length > 0 { return "template" }
+  const fnPos = fnStmtsPosOf(fnIx)
+  const gen = repNodeGen()
+  ibReset(fnIx, fn.fnName, fnPos)
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  ib.irRetRep = ibNoValue
+  buildParams(fn, fnIx, false)
+  const top: i32[] = []
+  const out = irBExpr(top, ix)
   ib.irBody = top
-  return ibMiss
+  if ibMiss != "" { return ibMiss }
+  const want = repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) })
+  if irBOpRep(out) != want { return "fragment rep" }
+  if repNodeGen() != gen { return "rep epoch moved" }
+  const v = irVerify(ib)
+  if v.vfRule != 0 { return "verifier rule " + i32ToStr(v.vfRule) }
+  return irLowerFragment(ib, out, globalCtxOf(fnPos), fnPos, probe)
 }
 
 // The failing control: breaks `ib` in the way `ibCorrupt` names.
