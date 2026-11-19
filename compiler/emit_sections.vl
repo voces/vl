@@ -49,7 +49,10 @@ import {
 } from "./ir_build"
 import { irStartPrologueHook } from "./ir_lower"
 import {
+  irAsFailFnCode,
   irF64RemFnCode,
+  irInitFailFnCode,
+  irMemLogFnCode,
   irStrBytesFnCode,
   irStrConcatFnCode,
   irStrEqFnCode,
@@ -244,7 +247,6 @@ import {
   tyHasFnMemoReset,
 } from "./emit_query"
 import {
-  AS_FAIL_DOMS,
   ByteChunk,
   ByteRope,
   HELP_LIST_GROW,
@@ -664,7 +666,6 @@ import {
   fbI32Bin,
   fbI32Const,
   fbI32Eqz,
-  fbI32Load,
   fbI32Rel,
   fbI32RelOf,
   fbI64Const,
@@ -730,8 +731,6 @@ import {
 import {
   RELOC_ARMED,
   RELOC_VERSION,
-  RS_GNAME,
-  RS_GREAD,
   RS_GUARD,
   RS_SLOT,
   RS_TAG,
@@ -2733,53 +2732,6 @@ function emitStartGlobalInitValue(
   return 0
 }
 
-// The synthetic `__log__(offset, length)` decoder body: walks the tag/value pairs in linear
-// memory (two words per pair) and prints each value, mirroring the host runner's `__log__`
-// import. Tag 0 is a plain i32; a non-zero tag traps (`unreachable`) since no corpus program
-// logs one natively and a silent wrong decode is worse. The host joins a multi-pair log into one line, this prints one per pair — harmless, since every corpus call logs exactly one.
-function emitMemLogFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  // Locals vector: params occupy 0 (offset) and 1 (length); local 2 is the cursor.
-  wULEB(1)      // 1 locals run
-  wULEB(1)      // count 1
-  wU8(127)      // 0x7f i32
-  fbLocalGet(0)
-  fbLocalSet(2) // cursor = offset
-  fbBlock(64)   // block (void)
-  fbLoop(64)    // loop (void)
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbI32Bin(106) // 0x6a i32.add — offset + length (the end)
-  fbI32Bin(78)  // 0x4e i32.ge_s — cursor >= end?
-  fbBrIf(1)     // exit the block
-  fbLocalGet(2)
-  fbI32Load()   // the pair's TAG
-  fbIf(64)      // tag != 0 → unsupported payload kind
-  fbUnreachable()
-  fbEnd()
-  fbLocalGet(2)
-  fbI32Const(4)
-  fbI32Bin(106) // i32.add — the value word
-  fbI32Load()
-  fbCall(0)     // __print_i32__ (import 0)
-  fbLocalGet(2)
-  fbI32Const(8)
-  fbI32Bin(106) // i32.add
-  fbLocalSet(2) // cursor += 8
-  fbBr(0)       // next pair
-  fbEnd()       // end loop
-  fbEnd()       // end block
-  fbEnd()       // 0x0b end (void function: stack empty)
-  wTarget(prev)
-  const outPrev = wTarget(out)
-  wULEB(body.length)
-  wBytes(body)
-  wTarget(outPrev)
-  return 0
-}
-
 // ── shared runtime helper bodies (module-tail functions) ──
 // Each body below is the once-per-module copy of machinery every lowering site otherwise
 // inlines. Hand-rolled like the `__log__` decoder above: a locals vector, then straight `fb*`
@@ -3889,133 +3841,6 @@ function mapCompactMove(mapTy: i32, field: i32, wrap: i32, back: i32) {
   fbArrayGet(back)
   fbArraySet(back)
   return 0
-}
-
-// Prints `strs[k]` when local `param` equals `k`, for every row: one `if` per row.
-// Each `k` is a guard row of space `sp`, its symbol named from `subs[k]`.
-function emitInitFailPick(param: i32, strs: string[], sp: i32, subs: i32[]) {
-  let k = 0
-  while k < strs.length {
-    fbLocalGet(param)
-    fbI32RelOf(sp, subs[k], k + relSkew(sp))
-    fbI32Bin(70) // 0x46 i32.eq
-    fbIf(64)
-    emitInitFailText(strs[k])
-    fbEnd()
-    k = k + 1
-  }
-  return 0
-}
-
-// Streams `text` through `__print_char__`, unflushed.
-function emitInitFailText(text: string) {
-  for cp in text {
-    fbI32Const(cp)
-    fbCall(2) // __print_char__ (import 2)
-  }
-  return 0
-}
-
-// `__init_fail__(g, verb, r)`: prints "`name` read|written before its initializer ran (place),
-// via reader" from the rows guard sites interned, then traps (D2652). Each row's text is here
-// once, however many sites name it; the code section emits every user body first.
-function emitInitFailFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0) // no locals
-  emitInitFailPick(0, gInitGNames, RS_GNAME, gInitGIdx)
-  fbLocalGet(1)
-  fbIf(64)
-  emitInitFailText("written")
-  fbElse()
-  emitInitFailText("read")
-  fbEnd()
-  emitInitFailText(" before its initializer ran")
-  emitInitFailPick(0, gInitGLocs, RS_GNAME, gInitGIdx)
-  const readers: i32[] = []
-  while readers.length < gInitReaders.length { readers.push(readers.length) }
-  emitInitFailPick(2, gInitReaders, RS_GREAD, readers)
-  fbCall(3) // __print_str_flush__ (import 3)
-  fbUnreachable()
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// Prints local `x`, a non-negative i32, in decimal: `p` climbs to x's leading power of ten,
-// then each digit is `x / p % 10` as `p` falls back to zero. Local `p` is scratch.
-function emitAsFailDecimal(x: i32, p: i32) {
-  fbI32Const(1)
-  fbLocalSet(p)
-  fbLoop(64)
-  fbLocalGet(x)
-  fbLocalGet(p)
-  fbI32Bin(110) // 0x6e i32.div_u
-  fbI32Const(10)
-  fbI32Bin(79) // 0x4f i32.ge_u
-  fbIf(64)
-  fbLocalGet(p)
-  fbI32Const(10)
-  fbI32Bin(108) // 0x6c i32.mul
-  fbLocalSet(p)
-  fbBr(1)
-  fbEnd()
-  fbEnd()
-  fbLoop(64)
-  fbLocalGet(x)
-  fbLocalGet(p)
-  fbI32Bin(110) // 0x6e i32.div_u
-  fbI32Const(10)
-  fbI32Bin(112) // 0x70 i32.rem_u
-  fbI32Const(48)
-  fbI32Bin(106) // 0x6a i32.add
-  fbCall(2) // __print_char__ (import 2)
-  fbLocalGet(p)
-  fbI32Const(10)
-  fbI32Bin(110) // 0x6e i32.div_u
-  fbLocalTee(p)
-  fbBrIf(0)
-  fbEnd()
-  return 0
-}
-
-// `__as_fail__(line, colRow)`: prints "as! <domain> at <line>:<col>: not exact" and returns;
-// each site then traps, so a reason costs a site one call rather than a call per character.
-function emitAsFailFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // one locals run
-  wULEB(1) // p
-  wU8(127) // 0x7f i32
-  emitInitFailText("as! ")
-  let k = 0
-  while k < AS_FAIL_DOMS.length {
-    fbLocalGet(1)
-    fbI32Const(7)
-    fbI32Bin(113) // 0x71 i32.and
-    fbI32Const(k)
-    fbI32Bin(70) // 0x46 i32.eq
-    fbIf(64)
-    emitInitFailText(AS_FAIL_DOMS[k])
-    fbEnd()
-    k = k + 1
-  }
-  fbLocalGet(0)
-  fbIf(64)
-  emitInitFailText(" at ")
-  emitAsFailDecimal(0, 2)
-  emitInitFailText(":")
-  fbLocalGet(1)
-  fbI32Const(3)
-  fbI32Bin(118) // 0x76 i32.shr_u
-  fbLocalSet(1)
-  emitAsFailDecimal(1, 2)
-  fbEnd()
-  emitInitFailText(": not exact")
-  fbCall(3) // __print_str_flush__ (import 3)
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
 }
 
 // —— scalar list views (D3028) ——
@@ -9380,7 +9205,7 @@ function buildCodePayload(
   if memLogUsed {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitMemLogFnCode(entry) < 0 { return -1 }
+    if irMemLogFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__log__")
   }
   // The shared runtime helpers, each banked under the name the name section gives it — one body, one row, so a trace and a validate diagnostic cannot disagree about what to call the same function.
@@ -9393,7 +9218,7 @@ function buildCodePayload(
   if gHelpInitFail >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitInitFailFnCode(entry) < 0 { return -1 }
+    if irInitFailFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__init_fail__")
   }
   svPlaceHelpers(codePayload)
@@ -9401,7 +9226,7 @@ function buildCodePayload(
   if gHelpAsFail >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitAsFailFnCode(entry) < 0 { return -1 }
+    if irAsFailFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__as_fail__")
   }
   if gHelpStrFromBytes >= 0 {
