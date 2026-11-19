@@ -3,6 +3,10 @@
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+import { emitFail } from "./emit_bytes"
+import { cloLiftLetFe, cloLifted } from "./emit_lift"
+import { sigParamKindAt } from "./emit_closure_callee"
+import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { numUnionMinted } from "./check_union_mint"
 import {
   ArrayLit,
@@ -25,6 +29,7 @@ import {
   Member,
   NullLit,
   NumLit,
+  ObjLit,
   P,
   Param,
   Paren,
@@ -82,6 +87,7 @@ import {
   GlobalCtx,
   HoleBox,
   IsArm,
+  ObjLitArm,
   PrintArm,
   TagIsArm,
   arrLitShort,
@@ -89,7 +95,12 @@ import {
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
+  callRefLegacyPlainKey,
+  callRefPlainKey,
+  callRefPlainVoid,
+  cloLiftCalleeOf,
   closureValueWhy,
+  directCallInstanceArgMisfit,
   exprPrePathWhy,
   fieldStoreArmOf,
   fieldStoreStructAt,
@@ -110,6 +121,7 @@ import {
   ifExprPlainKind,
   ifWritesElse,
   intSwitchMayLower,
+  irEnvCached,
   isArmOf,
   isArmTagOf,
   isBoxGuardPlain,
@@ -119,6 +131,7 @@ import {
   isVariantTagPlain,
   keptDeclStoresNothing,
   lowMemFoldsCallee,
+  mapFilterWhy,
   mapGetOrHelperRoute,
   mapKeyArmOf,
   mapRecvIsSet,
@@ -136,15 +149,22 @@ import {
   numIntrPlanOf,
   numLitAsApplies,
   numLitLexAt,
+  objLitArmOf,
+  objLitLayoutRowOf,
+  objLitVariantLayoutOf,
   printArmOf,
   pushPlainWhy,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
+  stmtWritesNothing,
+  strCatPartsOf,
   strLitTakesAtom,
+  structFieldArmOf,
   tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
+  variantFieldArmOf,
   widenPlanOf,
 } from "./wasmEmit"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
@@ -199,18 +219,28 @@ import {
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import { wTarget } from "./emit_bytes"
-import { narrowedNulLitPinBoxKey } from "./emit_value_sites"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
+  narrowedNulLitPinBoxKey,
+  nulNicheRecoverOwed,
+} from "./emit_value_sites"
+import {
+  capCellTargetOf,
+  captureCountOf,
+  captureNamesOf,
+  cbIdentNamesFn,
   declaredIndexAt,
   envSlotShift,
   exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
+  forInElemTyOf,
+  forInMapRecv,
   globalCellKind,
   localIndexOf,
   nulLitAtomTexts,
+  sFieldStoreKind,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -219,6 +249,7 @@ import {
   lastStmtIsValueIf,
 } from "./emit_fn_scans"
 import {
+  cloLiftWriteCount,
   fRecRetTy,
   fRetVoid,
   fnStmts,
@@ -229,14 +260,24 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  sFieldCount,
+  sFieldNames,
+  sFieldStart,
   setIrShadowOn,
+  uFieldCount,
+  uFieldStart,
   uTags,
 } from "./emit_state"
-import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
+import {
+  cloSigPosOfKey,
+  cloSigTypeIdxAt,
+  fnCheckedRetTy,
+  globalIndexOfSid,
+} from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
-import { charLitCp, unwrapParen } from "./emit_base"
-import { ifArmValueExpr } from "./emit_query"
+import { charLitCp, objFieldVal, unwrapParen } from "./emit_base"
+import { ifArmValueExpr, paramIndexOf } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
 import {
   f32Bytes,
@@ -441,6 +482,7 @@ function valueRep(r: i32, ty: i32): boolean {
     || repNodeAt(r) is RAtom
     || repNodeAt(r) is RBox
     || repNodeAt(r) is RRecord
+    || repNodeAt(r) is RClosure
     || boxedNullable(r)
     || atomNullable(r)
     || strNullable(r)
@@ -466,6 +508,67 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is operand rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// An object literal on a layout path legacy builds it by alone (`objLitArmOf`: a struct's
+// `objLitLayoutRowOf`, a variant's `objLitVariantLayoutOf`): each field in layout order at its
+// `plain` arm, owing no recovery, kept at its kid of the record rep, then the row's `struct.new`.
+function objLit(b: i32[], ix: i32, rep: i32): Opnd {
+  const arm = objLitArmOf(ix, ibFnIx)
+  if arm == "unionBox" { return irBMiss("object " + arm) }
+  const row = if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
+  if row < 0 { return irBMiss("object layout") }
+  const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
+  const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if !(repNodeAt(rep) is RRecord) || repNodeOfTy(ty) != rep {
+    return irBMiss("object rep")
+  }
+  const ks = repNodeKids(rep)
+  if ks.length != cnt { return irBMiss("object field count") }
+  const fields: Opnd[] = []
+  const layout: i32[] = []
+  const none: Opnd = { ov: -1 }
+  for _k in ks { fields.push(none) }
+  let fi = 0
+  while fi < cnt {
+    const name = sFieldNames[start + fi]
+    const k = repRecordKidOf(rep, ty, name)
+    if k < 0 || k >= ks.length { return irBMiss("object field kid") }
+    const valIx = objFieldVal(ix, name)
+    const why = fieldPlainWhy(arm, row, fi, valIx)
+    if why != "" { return irBMiss(why) }
+    const at = b.length
+    const v = deliver(b, valIx, ks[k])
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
+    if fi > 0 && ifBelowLead(b, at, "short-circuit field after another") {
+      return v
+    }
+    fields[k] = v
+    layout.push(k)
+    fi = fi + 1
+  }
+  return irBLetTemp(
+    b,
+    { mrFields: fields, mrLayout: layout, mrAt: ix },
+    ix,
+    rep,
+  )
+}
+
+// Why field `fi` of literal row `row` at arm `arm` is not written as its value alone, or "".
+function fieldPlainWhy(arm: ObjLitArm, row: i32, fi: i32, valIx: i32): string {
+  if arm == "variant" {
+    const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
+    return if va == "plain" { "" } else { "object variant field " + va }
+  }
+  const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
+  if fa != "plain" { return "object field " + fa }
+  if nulNicheRecoverOwed(sFieldStoreKind(row, fi), valIx, ibFnIx) {
+    return "object field recovery"
+  }
+  return ""
 }
 
 // A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
@@ -976,7 +1079,20 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     ib.irReadAgain[ix] = gr
     return irBLetTemp(b, gr, ix, rep)
   }
+  if dn is FuncDecl && repNodeAt(rep) is RClosure {
+    return cloValue(b, ix, rep)
+  }
   return irBMiss("read of " + n.identName)
+}
+
+// A function name or literal `ix` read as a capture-free closure value, as a global's initializer
+// reads one.
+function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
+  const fe = cloValueFeOf(ix)
+  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
+  if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
+  if fnEnvIdxOf(fe) >= 0 { return irBMiss("closure env") }
+  return irBLetTemp(b, { mcFn: fe, mcEnv: [], mcAt: ix }, ix, rep)
 }
 
 // Local `v` read at `rep`, which its narrowing gives it, not its own: a box at the variant a
@@ -1109,18 +1225,38 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return numIntrRhs(b, c, cf, ix)
   }
-  if d < 0 || !(nodeAt(d) is FuncDecl) {
+  // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
+  const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
+    return closureCallRhs(b, c, ix)
+  }
+  if lf < 0 && (d < 0 || !(nodeAt(d) is FuncDecl)) {
     return missRhs("call of a non-declaration")
   }
-  const pos = fnIndexOfNode(c.callFn)
-  if pos < 0 || pos >= fnStmts.length || !callTargetIs(pos, d) {
+  const pos = if lf >= 0 { lf } else { fnIndexOfNode(c.callFn) }
+  if pos < 0 || pos >= fnStmts.length || lf < 0 && !callTargetIs(pos, d) {
     return missRhs("call target")
+  }
+  if lf >= 0 && directCallInstanceArgMisfit(c.callArgs, lf, ibFnIx) >= 0 {
+    return missRhs("binding call misfit")
   }
   const inst = fnStmts[pos]
   if !calleeSig(pos) { return missRhs("callee signature") }
-  // A callee with a hidden environment parameter takes it before its arguments; the IR's call
-  // passes none, so such a call stays legacy's.
-  if envSlotShift(inst) > 0 { return missRhs("callee environment") }
+  // A callee with a hidden environment parameter takes a null one before its arguments, and a
+  // lifted one its captures next; one that captures through its environment stays legacy's.
+  const env = envSlotShift(inst) > 0
+  const caps = if cloLifted(pos) { liftCaps(pos) } else { [] }
+  if ibMiss != "" { return missRhs("callee captures") }
+  // A lifted callee that assigns a capture hands it back after its result (D3664).
+  if cloLiftWriteCount(pos) > 0 {
+    return missRhs("callee writes back captures")
+  }
+  if (
+    envSlotShift(inst) > 1 + caps.length
+    || env && !cloLifted(pos) && captureCountOf(pos) > 0
+  ) {
+    return missRhs("callee environment")
+  }
   if lowMemFoldsCallee(pos) { return missRhs("low-memory accessor") }
   const callee = nodeAt(inst)
   const args: Opnd[] = []
@@ -1143,7 +1279,74 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
       i = i + 1
     }
   }
-  const r: Rhs = { caCallee: pos, caArgs: args, caNever: callEndsNever(ix) }
+  const r: Rhs = {
+    caCallee: pos,
+    caArgs: args,
+    caNever: callEndsNever(ix),
+    caEnv: env,
+    caCaps: caps,
+  }
+  return r
+}
+
+// The captures lifted function `pos` takes after its environment, each a parameter of the
+// function being built, read in order; a miss names any other.
+function liftCaps(pos: i32): Opnd[] {
+  const out: Opnd[] = []
+  for name in captureNamesOf(pos) {
+    const p = paramIndexOf(ibFnIx, name)
+    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+    if v < 0 || capCellTargetOf(name) >= 0 {
+      irBMiss("callee captures")
+      return out
+    }
+    const o: Opnd = { ov: v }
+    out.push(o)
+  }
+  return out
+}
+
+// A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
+// closure, then each argument at its parameter's scalar rep.
+function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const key = callRefPlainKey(ix, ibFnIx)
+  if key == "" { return missRhs("call of a non-declaration") }
+  // Armed, legacy has written this call already, and must have taken the plain path at this key.
+  if ibArmed && callRefLegacyPlainKey(ix) != key {
+    emitFail(
+      "emitProgram: internal: the IR's plain closure call disagrees with legacy's",
+    )
+    return missRhs("closure call plan disagrees")
+  }
+  const f = irBExpr(b, c.callFn)
+  if ibMiss != "" { return missRhs("closure callee") }
+  if !(repNodeAt(irBOpRep(f)) is RClosure) {
+    return missRhs("closure callee rep")
+  }
+  const args: Opnd[] = []
+  let i = 0
+  while i < c.callArgs.length {
+    const at = b.length
+    const a = irBExpr(b, c.callArgs[i])
+    if ibMiss != "" { return missRhs("argument") }
+    if ifBelowLead(b, at, "short-circuit closure argument") {
+      return missRhs("short-circuit closure argument")
+    }
+    const ap = repPrim(irBOpRep(a))
+    const pk = sigParamKindAt(key, i)
+    const aps: string = if ap == null { "" } else { ap }
+    const pks: string = if pk == null { "-" } else { pk }
+    if aps != pks { return missRhs("closure argument coercion") }
+    args.push(a)
+    i = i + 1
+  }
+  const r: Rhs = {
+    crFn: f,
+    crSig: cloSigTypeIdxAt(cloSigPosOfKey(key)),
+    crArgs: args,
+    crVoid: sigKeyRetIsVoid(key),
+    crDrop: !callRefPlainVoid(ix, ibFnIx),
+  }
   return r
 }
 
@@ -1232,6 +1435,29 @@ function numKindPrim(k: i32): string {
   return ""
 }
 
+// `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding as
+// the callback's value, or the `null` immediate for a capture-free function the lowering builds.
+function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const why = mapFilterWhy(ix, ibFnIx)
+  if why != "" { return missRhs(why) }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("map receiver rep") }
+  const at = b.length
+  const cb = unwrapParen(c.callArgs[0])
+  if cb < 0 || cb >= P.nodes.length { return missRhs("map callback") }
+  let f: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if !(nodeAt(cb) is FuncDecl || cbIdentNamesFn(c.callArgs[0], ibFnIx)) {
+    f = irBExpr(b, cb)
+    if ibMiss != "" { return missRhs("method operand") }
+    if ifBelowLead(b, at, "map short-circuit operand") {
+      return missRhs("map short-circuit operand")
+    }
+  }
+  const r: Rhs = { hfV: v, hfC: f, hfAt: ix }
+  return r
+}
+
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -1241,6 +1467,9 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
     return pushRhs(b, c, m, ix)
+  }
+  if m.memProp == "map" || m.memProp == "filter" {
+    return mapFilterRhs(b, c, m, ix)
   }
   let op: StrOp = "slice"
   if exprIsStrMethod(ix, ibFnIx, "cpLen") {
@@ -2042,7 +2271,9 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   }
   if n is IsExpr { return boxTest(b, n, ix, rep) }
   if n is IfStmt { return ifExpr(b, n, ix, rep) }
+  if n is FuncDecl && repNodeAt(rep) is RClosure { return cloValue(b, ix, rep) }
   if n is AsExpr { return numCast(b, n, ix, rep) }
+  if n is ObjLit { return objLit(b, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
 
@@ -2085,15 +2316,33 @@ function strLit(ix: i32, rep: i32): Opnd {
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
-  // Legacy appends a string in place at a local and at a list element alike; the accumulator
-  // keeps its own lowering, and a site's chain must be the right side the store delivers.
+  // Legacy appends a string in place at a local and at a list element alike; a site's chain
+  // must be the right side the store delivers.
   const mode = irInPlaceHook(ix, ibFnIx)
-  if mode < 0 { return skip("string accumulator") }
+  if mode < 0 { return accAppend(b, n, ix) }
   const n0 = ib.irNodes.length
   assignTo(b, n, ix)
   if ibMiss == "" && mode > 0 && !siteBuilt(n0, ix) {
     return skip("string append site")
   }
+  return 0
+}
+
+// A proven accumulator append: the chain's parts after the accumulator, then legacy's tail,
+// which reads, grows and writes the accumulator itself.
+function accAppend(b: i32[], n: BinExpr, ix: i32) {
+  const parts = strCatPartsOf(n.binRight, ibFnIx)
+  const args: Opnd[] = []
+  let i = 1
+  while i < parts.length {
+    const a = irBExpr(b, parts[i])
+    if ibMiss != "" { return 0 }
+    if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
+    args.push(a)
+    i = i + 1
+  }
+  const r: Rhs = { soOp: "acc", soArgs: args, soAt: ix }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -2214,15 +2463,21 @@ function loopIx(label: string): i32 {
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const why = forInPlainWhy(n, ix, ibFnIx)
   if why != "" && why != "hoisted" { return skip("for in " + why) }
-  const l = irBExpr(b, n.fiIter)
+  // A map walk's operand is its receiver, whose keys or values list the lowering reads.
+  const mr = forInMapRecv(n.fiIter, ibFnIx)
+  const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
+  if mr >= 0 && g < 0 { return skip("for in map receiver") }
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  const l = if mr >= 0 { none } else { irBExpr(b, n.fiIter) }
   if ibMiss != "" { return 0 }
-  // A list walks its elements; a string its code points, each an i32.
+  // A list walks its elements; a string its code points, each an i32; a map its keys or values.
   const lr = irBOpRep(l)
   const ln = repNodeAt(lr)
   const lpr = repPrim(lr)
   let er = -1
   if ln is RList { er = ln.rlsElem }
   if lpr != null && lpr == "str" { er = repNodeOfTy(TY_I32) }
+  if mr >= 0 { er = repNodeOfTy(forInElemTyOf(n.fiIter, ibFnIx)) }
   if er < 0 { return skip("for in operand coercion") }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
@@ -2244,7 +2499,16 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if ibMiss != "" { return 0 }
   irBNode(
     b,
-    { xfList: l, xfVar: v, xfBody: fb, xfAt: ix, xfBrk: brk, xfCont: cont },
+    {
+      xfList: l,
+      xfVar: v,
+      xfBody: fb,
+      xfAt: ix,
+      xfBrk: brk,
+      xfCont: cont,
+      xfMap: g,
+      xfMapNonNull: mr >= 0 && globalReadRecovers(sidOfNode(mr), mr, ibFnIx),
+    },
     -1,
     ibNoValue,
     ix,
@@ -2400,7 +2664,19 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     stmtRun(b, n.blkStmts)
     return 0
   }
+  // A nested function declaration is lifted, and writes nothing where it stands, unless it
+  // drops a cached environment.
+  if n is FuncDecl {
+    if irEnvCached(fnStmtsPosOf(ix)) {
+      return skip("nested function env cache")
+    }
+    return 0
+  }
   if n is LetDecl {
+    // A `const` bound to a lambda-lifted function holds no value: every use calls it directly.
+    if n.letInit >= 0 && cloLiftLetFe(fnStmtsPosOf(ibFnIx), ix) >= 0 {
+      return 0
+    }
     const v = irBDeclVar(ix)
     // A `const` every read copied the tree of computes nothing, as legacy writes it (D15001).
     if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
@@ -2498,6 +2774,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
   }
+  // A discarded value legacy does not write: a bare function name or an inert literal.
+  if stmtWritesNothing(ix) { return 0 }
   if (
     n is Paren
     || n is Ident
@@ -3152,12 +3430,9 @@ function cloInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   if repNodeOfTy(nodeTyAt(ix, ibFnIx)) != rep {
     return irBMiss("global initializer coercion")
   }
-  const fe = cloValueFeOf(ix)
-  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
-  if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
-  if fnEnvIdxOf(fe) >= 0 { return irBMiss("closure env") }
-  irGlobalNote(ib, gi, rep)
-  return irBLetTemp(b, { mcFn: fe, mcEnv: [], mcAt: ix }, ix, rep)
+  const v = cloValue(b, ix, rep)
+  if ibMiss == "" { irGlobalNote(ib, gi, rep) }
+  return v
 }
 
 // The function closure value `ix` names: a lifted function literal, or a bare name the read

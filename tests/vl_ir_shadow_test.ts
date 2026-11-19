@@ -410,7 +410,7 @@ print(e().length)
 });
 
 // An append and a prepend site in a loop build their right side through `emitStrSiteCat`'s
-// shared tail and match legacy's bytes; the loop accumulator stays a named miss.
+// shared tail and match legacy's bytes.
 Deno.test({
   name: "ir shadow: a string append site is covered and matched",
   ignore,
@@ -431,6 +431,53 @@ print(ap(3))
     const { rows } = run(src, true);
     if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
       throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A packed byte list's element reads unsigned into an i32 along legacy's scalar read tail.
+Deno.test({
+  name: "ir shadow: a packed byte element read is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function at(bs: u8[], i: i32): i32 { return bs[i] + 1 }
+const bs: u8[] = [200, 7]
+print(at(bs, 0))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A proven loop accumulator, local or module, appends its parts through `emitStrAccAppend`'s
+// shared tail and matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a string accumulator append is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let g = ""
+function acc(xs: string[]): string {
+  let s = "<"
+  for x in xs { s = s + x + "," }
+  return s
+}
+function bump(n: i32) {
+  let i = 0
+  while i < n {
+    g = g + "g"
+    i = i + 1
+  }
+}
+bump(2)
+print(acc(["p", "q"]) + g)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -585,6 +632,30 @@ run(2.5)
       throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A record literal on legacy's layout path builds field by field and matches; a field at another
+// arm (here a widened `f64`) stays a named miss.
+Deno.test({
+  name: "ir shadow: a plain record literal builds; a field at a converting arm is a named miss",
+  ignore,
+  fn: () => {
+    const src = `type P = { x: i32, y: string }
+type Q = { w: f64 }
+function mk(a: i32, s: string): P { return { x: a + 1, y: s } }
+function mkq(a: i32): Q { return { w: a } }
+const p = mk(2, "k")
+print(p.x)
+print(p.y)
+print(mkq(3).w)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want mk matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered object field f64") !== 1) {
+      throw new Error(`want mkq a named miss, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
