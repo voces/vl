@@ -4,6 +4,7 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import { callRefNestSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { RRaw, repNodeAt } from "./emit_rep"
 import {
@@ -141,6 +142,7 @@ import {
   fbBr,
   fbBrIf,
   fbCall,
+  fbCallIndirect,
   fbDrop,
   fbElse,
   fbEmitLocalsVec,
@@ -165,9 +167,11 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefNullStruct,
   fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
+  fbReturnCallIndirect,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -255,6 +259,8 @@ import {
 } from "./wasmEmit"
 import {
   bankSpanRow,
+  callRefDepth,
+  cloStructIdx,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -266,6 +272,7 @@ import {
   fnStmts,
   fnUses,
   gCellIdx,
+  gFnTableIdx,
   gHelpF64Rem,
   gImports,
   listIdxScratchBase,
@@ -485,7 +492,9 @@ function call(c: RCall, tail: boolean) {
   if c.caCallee < 0 || c.caCallee >= fnStmts.length {
     return irLMiss("callee index")
   }
-  if c.caArgs.length == 0 { leaf() }
+  if c.caArgs.length == 0 || c.caEnv { leaf() }
+  if c.caEnv { fbRefNullStruct() }
+  for a in c.caCaps { irLOpnd(a) }
   for a in c.caArgs { irLOpnd(a) }
   if tail && !c.caNever {
     fbReturnCall(gImports + c.caCallee)
@@ -493,6 +502,28 @@ function call(c: RCall, tail: boolean) {
     fbCall(gImports + c.caCallee)
     if c.caNever { fbUnreachable() }
   }
+}
+
+// `RCallRef`: the closure into the call stash of its nesting depth, its env, the arguments, then
+// the closure's function index called at the key's type, or its tail form, as `emitCallRefAt`.
+function callRef(r: RCallRef, tail: boolean) {
+  irLOpnd(r.crFn)
+  const d = callRefDepth
+  const s = callRefNestSlot(d)
+  fbLocalSet(s)
+  fbLocalGet(s)
+  fbStructGet(cloStructIdx, 0)
+  callRefDepth = d + 1
+  for a in r.crArgs { irLOpnd(a) }
+  callRefDepth = d
+  fbLocalGet(s)
+  fbStructGet(cloStructIdx, 1)
+  if tail {
+    fbReturnCallIndirect(r.crSig, gFnTableIdx)
+  } else {
+    fbCallIndirect(r.crSig, gFnTableIdx)
+  }
+  return 0
 }
 
 function rhs(r: Rhs, tail: boolean) {
@@ -536,7 +567,8 @@ function rhs(r: Rhs, tail: boolean) {
     RBoxNarrow => boxNarrow(r)
     RRecover => recoverRead(r)
     RGetField => getField(r)
-    RCallRef | RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RCallRef => callRef(r, tail)
+    RCallHost | RCast | RTagOf | RMakeRec | RListNew | RMapOp | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
     RMapNew => {
@@ -1026,7 +1058,9 @@ function callTemp(o: Opnd): i32 {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
       const r = tempRhs(o.ov)
-      if r is RCall { r.caCallee } else { -1 }
+      if r is RCall { r.caCallee }
+      else if r is RCallRef { 0 }
+      else { -1 }
     }
     OImm | OStr => -1
   }
@@ -1064,6 +1098,7 @@ function callReturns(b: i32[], i: i32): boolean {
   const nx = lw.irNodes[b[i + 1]]
   if !(n is SEffect && nx is SReturn) || nx.rtHas { return false }
   const r = n.efRhs
+  if r is RCallRef { return r.crVoid }
   return r is RCall && !r.caNever && voidTailCallee(r.caCallee)
 }
 
@@ -1117,6 +1152,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
         if !t && si >= 0 && !repIsNoValue(lw.irSigRet[si]) { fbDrop() }
+        return 0
+      }
+      if r is RCallRef {
+        const t = tail && r.crVoid
+        callRef(r, t)
+        irLSettle(pending)
+        if !t && r.crDrop { fbDrop() }
         return 0
       }
       if r is RListPush || r is RListPop {
@@ -1313,6 +1355,7 @@ function ret(n: SReturn, pending: i32[]) {
       const r = tempRhs(t.ov)
       lwSeq = []
       if r is RCall { call(r, true) }
+      if r is RCallRef { callRef(r, true) }
       lwSeq.push(t.ov)
       if outer >= 0 { lwSeq.push(outer) }
       irLSettle(pending)

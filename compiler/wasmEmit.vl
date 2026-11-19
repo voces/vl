@@ -2529,6 +2529,11 @@ function cloDeclOf(fe: i32): i32 {
 
 // The local holding the env of capturing function `fe` in the frame being emitted, or -1 when
 // that frame does not declare `fe` (`envCacheFes`).
+// Whether nested function `fe`'s declaration drops a cached environment where it stands.
+export function irEnvCached(fe: i32): boolean {
+  return envCacheFes.length > 0 && envCacheSlotOf(fe) >= 0
+}
+
 function envCacheSlotOf(fe: i32): i32 {
   let k = 0
   while k < envCacheFes.length {
@@ -29172,7 +29177,7 @@ function cloArgIsArmHeapTwin(argIx: i32, vi: i32, fnIx: i32): boolean {
 
 // The lifted slot the callee `calleeIx` names when it reads a `const` bound to a
 // lambda-lifted function in frame `fnIx`, else -1.
-function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
+export function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
   if fnIx < 0 || calleeIx < 0 || calleeIx >= P.nodes.length { return -1 }
   const callee = nodeAt(calleeIx)
   if !(callee is Ident) { return -1 }
@@ -29363,7 +29368,11 @@ function emitCallRefArg(
 
 // The first argument whose type at frame `fnIx` is a scalar or string other than the one
 // parameter `i` of function `fe` takes, which no coercion bridges; -1 when every argument fits.
-function directCallInstanceArgMisfit(args: i32[], fe: i32, fnIx: i32): i32 {
+export function directCallInstanceArgMisfit(
+  args: i32[],
+  fe: i32,
+  fnIx: i32,
+): i32 {
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
@@ -29580,6 +29589,93 @@ function emitCallRefAt(
   fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
   armTailCallIndirect(sig, sigKeyRetVoid(ckey))
   return 0
+}
+
+// The `$fnsig` key of call `callIx` in function `fnIx` where legacy writes it as a plain call through
+// a closure binding: a name no builtin or function owns, no dispatch, lift, bundle or holder, each
+// argument a scalar at its parameter's own valtype, and no refusal on the way; "" for any other.
+export function callRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Ident) { return "" }
+  const nm = callee.identName
+  const d = identDeclOf(c.callFn)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl || dn is Param)
+    || nm.length < 1
+    || nm.length >= 2 && nm.slice(0, 2) == "__"
+  ) {
+    return ""
+  }
+  if nm == "print" || nm == "fromCodePoint" || nm == "fromCodePoints" {
+    return ""
+  }
+  if fsIntrinsicSlot(nm) >= 0 || externLinkOf(nm) >= 0 { return "" }
+  if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
+  if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
+  if holderRecordSigs(d, fnIx).length > 0 { return "" }
+  const target = fnIndexOfInScopeChainAt(
+    sidOfNode(c.callFn),
+    nm,
+    fnIx,
+    c.callFn,
+  )
+  const routed = if target >= 0 { identNameIsLiveBound(nm, fnIx) && identIsBoundClosure(c.callFn, fnIx) } else { unknownCallRoutesRef(c, callee, fnIx) }
+  if !routed || bundleParamOfRead(c.callFn, fnIx) >= 0 { return "" }
+  if cloLiftCalleeOf(c.callFn, fnIx) >= 0 || exprNulClosure(c.callFn, fnIx) {
+    return ""
+  }
+  if topLambdaRecordFe(c.callFn) >= 0 { return "" }
+  const ckey = cloCallSigKey(callIx, fnIx)
+  if ckey == "" || cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
+  const n = c.callArgs.length
+  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if (
+    cloCallUnionResultUnrepresentable(callIx, fnIx)
+    || cloCallReflistElemTwin(callIx, fnIx)
+    || fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
+    || closureCallSetSplits(nodeTyAt(c.callFn, fnIx), elabSrcDecl(fnIx))
+  ) {
+    return ""
+  }
+  let i = 0
+  while i < n {
+    const a = c.callArgs[i]
+    const k = sigParamKindAt(ckey, i)
+    const bty: i32[] = [0 - 1]
+    if (
+      !(k == "i32" || k == "i64" || k == "f64" || k == "f32")
+      || sigParamCoerceKind(ckey, i) != null
+      || bundleCallArgSigs(c.callFn, fnIx, i, bty).length > 0
+      || bundleKeyParamTy(ckey, i, a) >= 0
+      || emitBundleRecordRead(a, fnIx)
+      || cloCallParamLitUnion(callIx, i, fnIx) != 0
+      || tyIsLitUnion(nodeTyAt(a, fnIx))
+      || exprScalarWidth(a, fnIx) != k
+    ) {
+      return ""
+    }
+    i = i + 1
+  }
+  const rk = sigKeyRetKind(ckey)
+  if (
+    (rk == "f64" || rk == "i64" || rk == "f32")
+    && exprScalarWidth(callIx, fnIx) == "i32"
+  ) {
+    return ""
+  }
+  return ckey
+}
+
+// Whether a statement of plain closure call `ix` (`callRefPlainKey`) leaves nothing to drop: its
+// key or its callee's read returns nothing, as `emitCallStmtIdent` asks.
+export function callRefPlainVoid(ix: i32, fnIx: i32): boolean {
+  const c = nodeAt(ix)
+  if !(c is Call) { return false }
+  return sigKeyRetVoid(cloCallSigKey(ix, fnIx))
+    || calleeReturnsVoidOfRead(unwrapParen(c.callFn), fnIx)
 }
 
 // Whether parameter `par` takes the lambda literal `arg` as a bundle.
