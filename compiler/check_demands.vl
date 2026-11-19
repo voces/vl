@@ -253,11 +253,17 @@ import {
   hdRowOf,
 } from "./check_hole_pins"
 import {
+  CTN_IDX,
+  CTN_KEY,
+  CTN_LIST0,
+  CTN_OPS,
+  arrayDemandKey,
   calleeWriteAt,
   calleeWriteGot,
   calleeWriteRow,
   coalHoleFn,
   coalHoleTy,
+  ctnOpsOf,
   holeAltNames,
   holeAltResidualTy,
   holeAltTys,
@@ -266,7 +272,7 @@ import {
   holeHasIsAlt,
   holeMapOf,
   holeShapeOf,
-  rowIsArrayDemanded,
+  noteCtnOps,
   tyLinkRecLists,
 } from "./check_hole_rows"
 import {
@@ -301,7 +307,6 @@ import {
   cstrArgCountOf,
   cstrArgNoOf,
   cstrArgNodeOf,
-  holeMapDemandOpen,
   irhConcrete,
   irhExprs,
   irhMarks,
@@ -484,6 +489,7 @@ import { nomErasedTyIx } from "./check_ty_rep"
 import { elemHasZero, fieldSigOf, jsonReceiverDeclTy } from "./check_type_shape"
 import {
   T,
+  TY_BOOL,
   TY_ERR,
   TY_I32,
   TY_I64,
@@ -523,13 +529,14 @@ import {
   tyHasHole,
   tyIsHole,
   tyIsLitUnion,
+  tyIsNonIndexableScalar,
   tyKeyOf,
+  tyKeyOpen,
   tyMentionsErr,
   tyMentionsTyVarNamed,
   tyPinElem,
   tyPinVal,
   tyPrintsAsRef,
-  tyRefusesArrayDemand,
   tySame,
   tyToStr,
   tyToStrUser,
@@ -1368,21 +1375,31 @@ export function holeKidMapDemands(hole: i32, at: i32, depth: i32) {
   return 0
 }
 
+// Whether argument `at` meets map demand `hm`'s key and value pins, a Set under the flavour the
+// container table admitted it by. Both pins run on the way through: `constrainEmpty` pins an
+// argument still open at the call; the reverse pins a demand the callee left open from a
+// concrete argument.
+function holeMapDemandMet(srcExpr: i32, at: i32, hm: i32): boolean {
+  const t = tyAt(at)
+  holeMapArgNullPin(hm, at, srcExpr)
+  let d = holeMapNullValAt(hm, at)
+  const dm = tyAt(d)
+  if t is TyMap && dm is TyMap && t.mSet == 1 && dm.mSet == 0 && tyValOpen(dm) {
+    d = mkMapTy(dm.mKey, TY_BOOL, 1)
+  }
+  if !holeAssignOk(srcExpr, at, d) { return false }
+  constrainEmpty(at, d)
+  return true
+}
+
 // Does `at` (the argument expression `srcExpr`) satisfy hole `name`'s demand? The
 // accumulated shape satisfies it, and so does any `is`-guard alternative whose still-
 // reachable demanded fields (`holeAltResidualTy`) are satisfied too. True when the hole demands nothing.
 export function holeDemandOk(name: string, srcExpr: i32, at: i32) {
-  // A map demand is checked first, and it is a hard requirement, not one arm of a
-  // disjunction: a hole the body used the map surface on is a map. Both pins run on the way
-  // through: `constrainEmpty(at, hm)` pins an argument still open at the call; the reverse
-  // pins a demand the callee left open from a concrete argument.
-  let hm = holeMapOf(name)
-  if hm >= 0 {
-    holeMapArgNullPin(hm, at, srcExpr)
-    hm = holeMapNullValAt(hm, at)
-    if !holeAssignOk(srcExpr, at, hm) { return false }
-    constrainEmpty(at, hm)
-  }
+  // A map demand is a hard requirement, not one arm of a disjunction: its key and value pins
+  // must meet the argument's.
+  const hm = holeMapOf(name)
+  if hm >= 0 && !holeMapDemandMet(srcExpr, at, hm) { return false }
   const shape = holeShapeOf(name)
   if shape < 0 { return true }
   if holeAssignOk(srcExpr, at, shape) { return true }
@@ -1488,16 +1505,6 @@ export function holeArgViewErr(argN: i32, at: i32, ix: i32) {
 // call path and the UFCS one. An open map demand gets its own sentence, since the generic
 // `expected …, got …` would render the unpinned demand and read as a mismatch.
 export function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
-  const hmE = holeMapOf(name)
-  if hmE >= 0 {
-    if holeMapDemandOpen(hmE) {
-      tErr(
-        "argument " + i32ToStr(argN) + ": expected a map, got " + tyToStr(at),
-        ix,
-      )
-      return 0
-    }
-  }
   tErr(
     "argument "
       + i32ToStr(argN)
@@ -1532,22 +1539,26 @@ export function holeFnDeliveryDemands(
     const at = d.fnParamTypes[i]
     if pv is TyVar {
       if tyIsHole(s.fnParamTypes[i]) && !tyHasHole(at) {
-        if !holeDemandOk(pv.tvName, -1, at) {
-          holeDeliveryErr(pv.tvName, i + 1, at, dstTy, ix, who)
-          return 0
-        }
-        if rowIsArrayDemanded(s.fnParamTypes[i]) && tyRefusesArrayDemand(at) {
+        const op = ctnRefusedOp(ctnOpsOf(s.fnParamTypes[i]), at)
+        if op >= 0 {
           tErr(
             who
               + " cannot be delivered as "
               + tyToStr(dstTy)
-              + ": its body indexes parameter "
+              + ": parameter "
               + i32ToStr(i + 1)
-              + ", and "
+              + " wants "
+              + ctnWantStr(op)
+              + ", not "
               + tyToStr(at)
-              + " cannot be indexed",
+              + " — its body "
+              + ctnUseStr(op),
             ix,
           )
+          return 0
+        }
+        if !holeDemandOk(pv.tvName, -1, at) {
+          holeDeliveryErr(pv.tvName, i + 1, at, dstTy, ix, who)
           return 0
         }
       }
@@ -1606,29 +1617,128 @@ function holeDeliveryErr(
   return 0
 }
 
-// Reports an argument an indexed hole cannot take — one home for the wording, shared by the
-// general call path and the UFCS one. A map argument gets its own sentence: `q[i]` with an
-// i32 index is ambiguous between an array and an i32-keyed map, so "expected an array"
-// alone would send the reader to change the argument when the fix is to annotate the parameter.
+// Reports an argument a hole the body writes as a list cannot take, shared by the general call
+// path and the UFCS one.
 export function holeArgArrayErr(argN: i32, at: i32, ix: i32) {
-  if at >= 0 {
-    const t = tyAt(at)
-    if t is TyMap {
-      tErr(
-        "argument "
-          + i32ToStr(argN)
-          + ": parameter is indexed with an i32, which is ambiguous between an array and"
-          + " an i32-keyed map — add a type annotation",
-        ix,
-      )
-      return 0
-    }
-  }
   tErr(
     "argument " + i32ToStr(argN) + ": expected an array, got " + tyToStr(at),
     ix,
   )
   return 0
+}
+
+// The first operation in `ops` (bits over `CTN_OPS`) argument `at` does not take, or -1 when
+// it takes them all — the one table a hole parameter's container uses resolve against.
+export function ctnRefusedOp(ops: i32, at: i32): i32 {
+  if ops == 0 || at < 0 || at >= T.tys.length { return -1 }
+  const have = ctnOpsTaken(at)
+  let i = 0
+  while i < CTN_OPS.length {
+    if (ops & (1 << i)) != 0 && (have & (1 << i)) == 0 { return i }
+    i = i + 1
+  }
+  return -1
+}
+
+// The operations `at` takes, by its container kind: a list its i32 index and list methods, a
+// string its i32 index, a map its key index and map methods (an i32 index too when its key is
+// i32), a Set `has`/`delete`/`add`/`keys`/`values`, and a union of containers what every member
+// takes. No other type takes a map method; its list uses are left to the instance's own check,
+// except a scalar's, which has none.
+function ctnOpsTaken(at: i32): i32 {
+  const all = (1 << CTN_OPS.length) - 1
+  const listOps = ctnOpBits(["map", "filter", "push", "pop"]) | (1 << CTN_IDX)
+  const t = tyAt(at)
+  if t is TyArray { return listOps }
+  if t is TyMap {
+    if t.mSet == 1 {
+      return ctnOpBits(["has", "delete", "add", "keys", "values"])
+    }
+    const mapOps = ctnOpBits(["get", "set", "has", "delete", "keys", "values"])
+      | (1 << CTN_KEY)
+    if tyKeyOpen(t) || tyIsHole(tyKeyOf(t)) || assignable(tyKeyOf(t), TY_I32) {
+      return mapOps | (1 << CTN_IDX)
+    }
+    return mapOps
+  }
+  if t is TyUnion {
+    const mems: i32[] = []
+    flattenVariantsInto(at, mems)
+    let have = all
+    let ctn = true
+    for m in mems {
+      const mt = tyAt(m)
+      ctn = ctn && (mt is TyArray || mt is TyMap)
+      have = have & ctnOpsTaken(m)
+    }
+    if ctn { return have }
+  }
+  // A type variable or an earlier error answers at its own pin.
+  if t is TyVar || at == TY_ERR { return all }
+  if t is TyPrim && t.primName == "string" { return 1 << CTN_IDX }
+  if tyIsNonIndexableScalar(at) { return 0 }
+  return listOps
+}
+
+function ctnOpBits(names: string[]): i32 {
+  let b = 0
+  for nm in names {
+    let i = 0
+    while i < CTN_OPS.length {
+      if CTN_OPS[i] == nm { b = b | (1 << i) }
+      i = i + 1
+    }
+  }
+  return b
+}
+
+// Whether argument `argN` of type `at` takes the container operations the body applied to the
+// parameter typed `row`, reporting the first it does not. A hole of the caller's handed in takes
+// them to its own call.
+export function holeArgCtnOk(row: i32, at: i32, argN: i32, ix: i32): boolean {
+  const ops = ctnOpsOf(row)
+  const op = ctnRefusedOp(ops, at)
+  if op >= 0 {
+    holeArgCtnErr(argN, op, at, ix)
+    return false
+  }
+  if ops != 0 && at >= 0 && tyAt(at) is TyVar {
+    noteCtnOps(arrayDemandKey(at), ops)
+  }
+  return true
+}
+
+// Reports argument `at` refused operation `op`, naming the kinds that take it and the use.
+export function holeArgCtnErr(argN: i32, op: i32, at: i32, ix: i32) {
+  tErr(
+    "argument "
+      + i32ToStr(argN)
+      + ": expected "
+      + ctnWantStr(op)
+      + ", got "
+      + tyToStr(at)
+      + " — the body "
+      + ctnUseStr(op),
+    ix,
+  )
+  return 0
+}
+
+// The container kinds that take operation `op`, read off the same table `ctnOpsTaken` is.
+function ctnWantStr(op: i32): string {
+  if op == CTN_IDX { return "a list, string or i32-keyed map" }
+  const nm = CTN_OPS[op]
+  if op == CTN_KEY || nm == "get" || nm == "set" { return "a map" }
+  if op >= CTN_LIST0 { return "a list" }
+  if nm == "add" { return "a set" }
+  return "a map or set"
+}
+
+// How the body applies operation `op`.
+function ctnUseStr(op: i32): string {
+  if op == CTN_IDX { return "indexes it with an i32" }
+  if op == CTN_KEY { return "indexes it with a key" }
+  return "calls `." + CTN_OPS[op] + "` on it"
 }
 
 // A template hole's delivery, decided by the hole's type. True when the call is finished
@@ -2736,7 +2846,7 @@ export function memRule(
         }
       }
       if row.s == OP_INDEX_GET {
-        if tyRefusesArrayDemand(mr) { skip = true }
+        if tyIsNonIndexableScalar(mr) || tyAt(mr) is TyMap { skip = true }
       }
       // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
       // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
