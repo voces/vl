@@ -525,6 +525,7 @@ import {
   tyIsLitUnion,
   tyIsNewtypeBrand,
   tyIsNicheNulScalarElem,
+  tyIxIsView,
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
@@ -536,6 +537,7 @@ import {
   tyReachesUnion,
   tySame,
   tyToStr,
+  tyValOf,
   tyWideUnionMinted,
 } from "./check_types"
 import { mkUnionTy, numUnionConverts, numUnionMinted } from "./check_union_mint"
@@ -5817,6 +5819,10 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         fvaRefuseNested(srcExpr, srcTy, dm)
         return true
       }
+      if sharedHoleHolder(srcTy, dm) && fvaHeldHoleFnDiffers(srcTy, dm, 8) {
+        sharedHoleRefuse(srcExpr, srcTy, dm)
+        return true
+      }
     }
     return false
   }
@@ -6032,6 +6038,55 @@ function recLitListBinding(x: i32): boolean {
     && dn.letType < 0
     && dn.letInit >= 0
     && nodeAt(parenPeelIx(dn.letInit)) is ArrayLit
+}
+
+// Whether list or map `t` is delivered at `d` as the same storage: a mutable list or a map, whose
+// functions a call through `d` reaches unconverted; a view takes a converting copy instead. Only
+// an un-annotated function's holder: a generic function held is instanced per delivery.
+function sharedHoleHolder(t: i32, d: i32): boolean {
+  if t < 0 || t >= T.tys.length || !heldHoleFn(t) { return false }
+  const s = tyAt(t)
+  if s is TyMap { return true }
+  return s is TyArray && !tyIxIsView(nonNullTy(d))
+}
+
+// The refusal for a mutable list or a map of un-annotated functions delivered where its function
+// type is another: the destination is the same storage, so its function type must match exactly.
+function sharedHoleRefuse(at: i32, srcTy: i32, dstTy: i32) {
+  const isMap = tyAt(srcTy) is TyMap
+  const what = if isMap { "map" } else { "mutable list" }
+  let fix = "annotate the functions it holds at the destination's function type"
+  if !isMap { fix = "take it as `readonly " + tyToStr(dstTy) + "`, or " + fix }
+  tErr(
+    "a `"
+      + tyToStr(srcTy)
+      + "` cannot be used as `"
+      + tyToStr(dstTy)
+      + "` here: a "
+      + what
+      + " is passed as the same storage, so the function type it holds must match exactly, and "
+      + "its functions return another type at those parameters. To pass it, "
+      + fix,
+    at,
+  )
+}
+
+// Whether the function list, map or nullable `t` holds has a parameter left a hole, no type
+// parameter of a generic.
+function heldHoleFn(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const s = tyAt(t)
+  if s is TyArray { return heldHoleFn(tyElemOf(s)) }
+  if s is TyMap { return heldHoleFn(tyValOf(s)) }
+  if s is TyNullable { return heldHoleFn(s.nInner) }
+  if !(s is TyFunc) || s.fnParamTypes.length == 0 { return false }
+  for p in s.fnParamTypes {
+    const pv = if p >= 0 && p < T.tys.length { tyAt(p) } else { null }
+    if !(pv is TyVar) || pv.tvName.length == 0 || pv.tvName[0] != '?' {
+      return false
+    }
+  }
+  return true
 }
 
 // Whether `t` is a record, or a list of records, the places a function of open parameters is held

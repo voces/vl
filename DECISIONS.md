@@ -12881,6 +12881,33 @@ being a `K[]` at the first write that might add a non-`K`. It is as open as soun
 it removes the representation dependence D16970 measured (true for `i32[]` and `string[]`, false
 for `u8[]`, `i64[]`, `f64[]` and record lists).
 
+## A narrowed list is not handed on as `K[]`, whatever its storage (2026-11-19) — D16970, D4928
+
+**Ruled by the owner 2026-11-19.** Inside an `is K[]` arm the list may be read and written as a
+`K[]`, but it is not delivered as a `K[]`: not to a parameter, a binding, a field, a return or a
+capture that outlives the arm. This holds when the storage matches too (`i32[] | K[]`), not only
+across storages as D4928 already ruled. To hand the elements on, copy them: `f([...q])`.
+
+```vl
+type K = 1 | 2
+let keep: K[] = []
+function f(xs: K[]) { keep = xs }
+const a: i32[] = [1, 2]
+const q: i32[] | K[] = a
+if q is K[] {
+  print(q.length)   // fine: a read
+  f(q)              // refused: f could keep q, and a.push(200) would put a non-K in keep
+  f([...q])         // fine: keep holds its own copy
+}
+```
+
+**Why.** The narrowing describes this list at this moment. An alias that escapes keeps the `K[]`
+type after the arm ends, and a later write through the original (`a.push(200)`) breaks it. Only a
+refusal or a copy is sound, and a silent copy is lossy for a caller who meant to share the list.
+
+**Backlogged.** A purity or escape analysis may allow the delivery where the receiver provably
+neither keeps nor writes the list (ROADMAP).
+
 ## The function-value storage series resumes; removing code is the goal, not a per-PR bar (2026-11-18) — STORE B3, families A and B
 
 **Ruled by the owner 2026-11-18.** The STORE B-series and the function-value families A (fn-set tag
