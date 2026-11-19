@@ -372,6 +372,33 @@ print(ln(2)[1].length)
   },
 });
 
+// An append and a prepend site in a loop build their right side through `emitStrSiteCat`'s
+// shared tail and match legacy's bytes; the loop accumulator stays a named miss.
+Deno.test({
+  name: "ir shadow: a string append site is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function ap(n: i32): string {
+  const xs = ["x", "y"]
+  let s = "q"
+  let i = 0
+  while i < n {
+    s = "a" + xs[0] + s
+    xs[0] = xs[0] + "b" + s
+    i = i + 1
+  }
+  return xs[0]
+}
+print(ap(3))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A walk's own `break` and `continue` are legacy's branches, and a walk whose body is hoist-safe
 // reads its header once and may unroll: each a named miss, never a byte mismatch.
 Deno.test({
