@@ -48,6 +48,7 @@ import {
   Opnd,
   PrimOp,
   RCall,
+  RStrOp,
   Rhs,
   SIf,
   SLet,
@@ -74,6 +75,7 @@ import {
   irGlobalWriteMiss,
   irHexOf,
   irLowerClaim,
+  irLowerFragment,
   irLoweredEntry,
 } from "./ir_lower"
 import {
@@ -92,6 +94,7 @@ import {
   fnValueArmOf,
   fnValueFeOf,
   forInPlainWhy,
+  globalCtxNow,
   globalInitArmUnboxes,
   globalReadRecovers,
   holeBoxPlanOf,
@@ -187,6 +190,7 @@ import {
   scopeTyAt,
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
+import { wTarget } from "./emit_bytes"
 import { narrowedNulLitPinBoxKey } from "./emit_value_sites"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
@@ -555,7 +559,7 @@ function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
   return irBMiss("member hook not installed")
 }
 
-function inPlaceNone(_ix: i32, _fnIx: i32): boolean { return false }
+function inPlaceNone(_ix: i32, _fnIx: i32): i32 { return 0 }
 
 function unionEqNone(_ix: i32, _fnIx: i32): boolean { return false }
 
@@ -572,7 +576,7 @@ export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
 export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
 export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
 export let irStrBinHook: (b: i32[], ix: i32, rep: i32) => Opnd = strBinUnset
-export let irInPlaceHook: (ix: i32, fnIx: i32) => boolean = inPlaceNone
+export let irInPlaceHook: (ix: i32, fnIx: i32) => i32 = inPlaceNone
 export let irUnionEqHook: (ix: i32, fnIx: i32) => boolean = unionEqNone
 export let irListEqHook: (ix: i32, fnIx: i32) => boolean = listEqNone
 
@@ -2051,9 +2055,34 @@ function strLit(ix: i32, rep: i32): Opnd {
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
+  // Legacy appends a string in place at a local and at a list element alike; the accumulator
+  // keeps its own lowering, and a site's chain must be the right side the store delivers.
+  const mode = irInPlaceHook(ix, ibFnIx)
+  if mode < 0 { return skip("string accumulator") }
+  const n0 = ib.irNodes.length
+  assignTo(b, n, ix)
+  if ibMiss == "" && mode > 0 && !siteBuilt(n0, ix) {
+    return skip("string append site")
+  }
+  return 0
+}
+
+// Whether a node from `n0` on joins site `ix`'s chain (`buildStrBin`'s `str.site`).
+function siteBuilt(n0: i32, ix: i32): boolean {
+  let i = n0
+  while i < ib.irNodes.length {
+    const nd = ib.irNodes[i]
+    if nd is SLet {
+      const r = nd.lRhs
+      if r is RStrOp && r.soOp == "site" && r.soAt == ix { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
-  // Legacy appends a string in place at a local and at a list element alike.
-  if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   if t is Index { return elemStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
   const d = identDeclOf(n.binLeft)
@@ -2561,17 +2590,7 @@ function tailArm(blockIx: i32): i32[] {
 function build(fnIx: i32, fnPos: i32): string {
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return "not a function" }
-  ib = irFnNew(fnIx, fn.fnName)
-  ibFnIx = fnIx
-  ibFnPos = fnPos
-  ibMiss = ""
-  ibMisses = []
-  ibDeclVar = Map()
-  ibLoopName = []
-  ibLoopBrk = []
-  ibLoopCont = []
-  ibLabelN = 0
-  ibBool = repNodeOfTy(TY_BOOL)
+  ibReset(fnIx, fn.fnName, fnPos)
   if fn.fnTyParams.length > 0 { return "template" }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
@@ -2582,12 +2601,52 @@ function build(fnIx: i32, fnPos: i32): string {
     }
   }
   ibNoValue = if none { ib.irRetRep } else { -1 }
+  const pw = buildParams(fn, fnIx, true)
+  if pw != "" { return pw }
+  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
+  if !repIsNoValue(ibNoValue) { return "no void rep" }
+  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
+  const body = nodeAt(fn.fnBody)
+  if !(body is Block) { return "body" }
+  const top: i32[] = []
+  if none {
+    stmtRun(top, body.blkStmts)
+  } else {
+    tailReturn(top, body.blkStmts, fn.fnBody)
+  }
+  ib.irBody = top
+  return ibMiss
+}
+
+// Starts building function `fnIx` (named `name`, at `fnStmts` slot `fnPos`) into a fresh `ib`.
+function ibReset(fnIx: i32, name: string, fnPos: i32) {
+  ib = irFnNew(fnIx, name)
+  ibFnIx = fnIx
+  ibFnPos = fnPos
+  ibMiss = ""
+  ibMisses = []
+  ibDeclVar = Map()
+  ibLoopName = []
+  ibLoopBrk = []
+  ibLoopCont = []
+  ibLabelN = 0
+  ibBool = repNodeOfTy(TY_BOOL)
+  return 0
+}
+
+// The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A
+// fragment's (`whole` false) leaves out a parameter it could not hold, so only reading it misses.
+function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
   const shift = envSlotShift(fnIx)
   let i = 0
   while i < fn.fnParams.length {
     const p = fn.fnParams[i]
     const ty = scopeTyAt(p, fnIx)
     const r = repNodeOfTy(ty)
+    if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyOpen(ty)) {
+      i = i + 1
+      continue
+    }
     if isVoidTy(ty) || !valueRep(r, ty) {
       if !censusGoesOn("parameter rep " + repWhat(r)) {
         return "parameter rep " + repWhat(r)
@@ -2602,19 +2661,132 @@ function build(fnIx: i32, fnPos: i32): string {
     ib.irParams.push(v)
     i = i + 1
   }
-  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
-  if !repIsNoValue(ibNoValue) { return "no void rep" }
-  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
-  const body = nodeAt(fn.fnBody)
-  if !(body is Block) { return "body" }
-  const top: i32[] = []
-  if none {
-    stmtRun(top, body.blkStmts)
-  } else {
-    tailReturn(top, body.blkStmts, fn.fnBody)
+  return ""
+}
+
+// The builder's whole state, saved around a fragment built while another build is open.
+type IbFrame = {
+  bfIb: IrFn,
+  bfFnIx: i32,
+  bfFnPos: i32,
+  bfMiss: string,
+  bfMisses: string[],
+  bfDeclVar: {[i32]: i32},
+  bfLoopName: string[],
+  bfLoopBrk: i32[],
+  bfLoopCont: i32[],
+  bfLabelN: i32,
+  bfBool: i32,
+  bfNoValue: i32,
+}
+
+function ibSave(): IbFrame {
+  const f: IbFrame = {
+    bfIb: ib,
+    bfFnIx: ibFnIx,
+    bfFnPos: ibFnPos,
+    bfMiss: ibMiss,
+    bfMisses: ibMisses,
+    bfDeclVar: ibDeclVar,
+    bfLoopName: ibLoopName,
+    bfLoopBrk: ibLoopBrk,
+    bfLoopCont: ibLoopCont,
+    bfLabelN: ibLabelN,
+    bfBool: ibBool,
+    bfNoValue: ibNoValue,
   }
+  return f
+}
+
+function ibRestore(f: IbFrame) {
+  ib = f.bfIb
+  ibFnIx = f.bfFnIx
+  ibFnPos = f.bfFnPos
+  ibMiss = f.bfMiss
+  ibMisses = f.bfMisses
+  ibDeclVar = f.bfDeclVar
+  ibLoopName = f.bfLoopName
+  ibLoopBrk = f.bfLoopBrk
+  ibLoopCont = f.bfLoopCont
+  ibLabelN = f.bfLabelN
+  ibBool = f.bfBool
+  ibNoValue = f.bfNoValue
+  return 0
+}
+
+// The op seam's legacy-to-IR door: node `ix` of function `fnIx` lowered onto the buffer legacy is
+// writing, at the rep of type `ty` its writer leaves it at (-1: the node's type), in legacy's frame
+// (live slots, no new local, no seat). "" when written; else the miss (a build miss, a moved rep
+// epoch, a verifier failure, or a lowering miss), nothing written. A `probe` banks no row.
+function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+  const sv = ibSave()
+  const why = lowerNodeIn(ix, fnIx, ty, probe)
+  ibRestore(sv)
+  return why
+}
+
+// Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
+// `fnIx` at type `ty`, legacy's bytes for it in the current buffer from `from` on, lowered as a
+// fragment into a scratch buffer and counted `node-in <kind>: matched`, `differ` or `miss <why>`.
+export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
+  if !ibArmed { return 0 }
+  const cur = wTarget([])
+  const why = irLowerNodeIn(ix, fnIx, ty, true)
+  const got = wTarget(cur)
+  let row = "matched"
+  if why != "" {
+    row = "miss " + why
+  } else if !bytesFrom(cur, from, got) {
+    row = "differ"
+    if ibDetail {
+      row = row + " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got)
+    }
+  }
+  return count("node-in " + irAstKind(ix) + ": " + row)
+}
+
+// Whether `b` from `at` on holds exactly `want`.
+function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
+  if at < 0 || b.length - at != want.length { return false }
+  let i = 0
+  while i < want.length {
+    if b[at + i] != want[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+  const gen = repNodeGen()
+  let fnPos = -1
+  if fnIx < 0 {
+    // A start body's top-level code, under the guards its whole build takes (`buildStart`).
+    if !gPromoInStart { return "fragment outside a body" }
+    if startStrAccMarked() { return "string accumulator" }
+    if gInitProgIdx >= 0 { return "progress cell" }
+    ibReset(-1, "@fragment", -1)
+  } else {
+    if fnIx >= P.nodes.length { return "fragment outside a body" }
+    const fn = nodeAt(fnIx)
+    if !(fn is FuncDecl) { return "fragment outside a body" }
+    if fn.fnTyParams.length > 0 { return "template" }
+    fnPos = fnStmtsPosOf(fnIx)
+    ibReset(fnIx, fn.fnName, fnPos)
+    buildParams(fn, fnIx, false)
+  }
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  ib.irRetRep = ibNoValue
+  ib.irRetTy = TY_NEVER
+  const top: i32[] = []
+  const out = irBExpr(top, ix)
   ib.irBody = top
-  return ibMiss
+  if ibMiss != "" { return ibMiss }
+  const want = repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) })
+  if irBOpRep(out) != want { return "fragment rep" }
+  if repNodeGen() != gen { return "rep epoch moved" }
+  const v = irVerify(ib)
+  if v.vfRule != 0 { return "verifier rule " + i32ToStr(v.vfRule) }
+  return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 
 // The failing control: breaks `ib` in the way `ibCorrupt` names.
@@ -2826,7 +2998,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
-  // The accumulator rows `strAssignInPlace` reads are the start's only while legacy just ran.
+  // The accumulator rows `strInPlaceMode` reads are the start's only while legacy just ran.
   if startStrAccMarked() { return "string accumulator" }
   if gInitProgIdx >= 0 { return "progress cell" }
   const top: i32[] = []
