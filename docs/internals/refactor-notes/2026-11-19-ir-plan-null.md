@@ -52,4 +52,20 @@ The compiler total rises because the two modules' import blocks are new.
 
 ## Bars
 
-(Filled from the run on master 0bf13a76's fixpoint; see the PR body.)
+On fixpoint seeds: master 5c0fd9a6 (6,797,398 bytes) against this branch merged with it (6,798,005).
+
+| bar | reading |
+|---|---|
+| corpus identity | 9,034 identical, 3,267 fail under both, 0 differ, 0 one-only; self-compile identical |
+| `--names` identity | the same, self-compile identical |
+| `ir-identity.sh --cases` | 7,512 identical, 68 fail under both, 0 differ |
+| mode 3 | 9,034 same, 0 differ; self-compile identical |
+| shadow | 31,361 covered, verified and matched; `ir-shadow: ok` |
+| `--claims` | 31,361 functions emitted by the IR |
+| blocker census | functions with no blocker 31,176 to 31,361 (+185); `null test dead` (189 alone) gone |
+| self-compile coverage | unchanged |
+| L2 self-compile fuel | 99,570,469,641 (master) to 99,601,689,229 (+0.031%) |
+| seed size | 6,798,005 bytes (+607 on master) |
+| late demands | 9, baseline 9; late tag rows 307 |
+| phase state | distinct checker symbols 1,185 on both; imports 2,762 to 2,797 (`emit_plan_null.vl` 25, `emit_plan_coerce.vl` 13, `ir_build.vl` +1, `wasmEmit.vl` −4); the 3 hidden seats moved from `wasmEmit.vl` to `emit_plan_coerce.vl` |
+| lint-self, ladder sets | clean; 59 closed sets match (`CoalNulRefArm` registered) |
