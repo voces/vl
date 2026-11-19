@@ -23,6 +23,16 @@ On the self-compile, lifting the ref-list refusal alone covered +29, and the pac
 (measured on 85ce0724c). The rest of the 121 stop at their next class (`push operand coercion`,
 `push element seed`, `push short-circuit operand`).
 
-BARS
+| bar | result |
+|---|---|
+| `ir-identity.sh --names` | identical 9,034, differ 0; self-compile identical |
+| `ir-identity.sh --cases` | identical 7,512, differ 0 |
+| `--claims` / mode 3 | 33,414 ok / identical, 0 fell back, 13,983 claimed |
+| L2 fuel | 99,828,151,604 against master's 99,819,201,615: +0.01% |
+| pin helpers, `emit_mono.vl` | 905 |
+| lint-self, `ladder-sets.vl`, phase state, late demands | clean; ok; ok; 9 |
+| `deno task test` | 9,569 passed, 0 failed |
+
+`pushPlainWhy` gates only the IR, so legacy's bytes cannot move. The identity runs confirm it.
 
 **Lines.** −4 (+1 / −5).
