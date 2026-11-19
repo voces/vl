@@ -32,6 +32,6 @@ miss to.
 
 All covered functions verified and matched (shadow mode 1). `ir-identity.sh --names` against
 master's seed: identical 9,034, differ 0, self-compile identical; `--cases`: identical 7,512, differ 0.
-L2 fuel +0.8% on the baseline. Functions gained per compiler line: 132 self-compile over +42 net
+L2 fuel, same box on both fixpoint seeds: master 99,820,247,197, this branch 99,794,041,090 (−0.03%). Functions gained per compiler line: 132 self-compile over +42 net
 compiler lines (57 added, 15 deleted); legacy's accumulator lines are moved into the shared tail,
 not deleted.
