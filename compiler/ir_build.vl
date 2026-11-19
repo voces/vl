@@ -3,6 +3,7 @@
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+import { numUnionMinted } from "./check_union_mint"
 import {
   ArrayLit,
   AsExpr,
@@ -47,6 +48,7 @@ import {
   Opnd,
   PrimOp,
   RCall,
+  RStrOp,
   Rhs,
   SIf,
   SLet,
@@ -73,10 +75,10 @@ import {
   irGlobalWriteMiss,
   irHexOf,
   irLowerClaim,
+  irLowerFragment,
   irLoweredEntry,
 } from "./ir_lower"
 import {
-  BinNulTest,
   GlobalCtx,
   HoleBox,
   IsArm,
@@ -85,26 +87,20 @@ import {
   arrLitShort,
   atomEqPlanOf,
   atomStrPlanOf,
-  binNulTestOf,
   binNumWidth,
-  boxOwedAt,
   callEndsNever,
   closureValueWhy,
-  coalArmOf,
-  coalNicheArmOf,
-  coalNulStrBlockPlain,
-  coalResultKindOf,
-  coalesceNulStrStaysNullable,
-  deadNullTestOperand,
   exprPrePathWhy,
   fieldStoreArmOf,
   fieldStoreStructAt,
   fieldStoreValuePlain,
   fieldStoreVariantAt,
   fieldStoreVariantValuePlain,
+  fnTagLeafEmitted,
   fnValueArmOf,
   fnValueFeOf,
   forInPlainWhy,
+  globalCtxNow,
   globalInitArmUnboxes,
   globalReadRecovers,
   holeBoxPlanOf,
@@ -133,10 +129,7 @@ import {
   mapSetValArmOf,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
-  nulNoneEqSides,
-  nulTestArmOf,
-  nullOwnIsAtom,
-  nullOwnIsStr,
+  njDispatches,
   numCastKindOf,
   numCastKindTy,
   numIntrCallReached,
@@ -156,6 +149,22 @@ import {
 } from "./wasmEmit"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
 import { narrowedArmNeedsUnbox } from "./emit_plan_union"
+import {
+  BinNulTest,
+  NULL_OWN_ATOM,
+  NULL_OWN_STR,
+  binNulTestOf,
+  coalArmOf,
+  coalNicheArmOf,
+  coalNulRefArmOf,
+  coalResultKindOf,
+  coalesceNulStrStaysNullable,
+  deadNullTestOperand,
+  nulNoneEqSides,
+  nulTestArmOf,
+  nullOwnAt,
+} from "./emit_plan_null"
+import { boxOwedAt } from "./emit_plan_coerce"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -181,8 +190,16 @@ import {
   repRecordKidOf,
   repTyOf,
 } from "./emit_rep"
-import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
+import {
+  ctxTyAt,
+  fnEnvIdxOf,
+  nodeTyAt,
+  numLitWidth,
+  scopeTyAt,
+} from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
+import { wTarget } from "./emit_bytes"
+import { narrowedNulLitPinBoxKey } from "./emit_value_sites"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
   declaredIndexAt,
@@ -193,6 +210,7 @@ import {
   fnIndexOfNode,
   globalCellKind,
   localIndexOf,
+  nulLitAtomTexts,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -220,7 +238,13 @@ import { memOffsetLexValue } from "./check_intrinsics"
 import { charLitCp, unwrapParen } from "./emit_base"
 import { ifArmValueExpr } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
-import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
+import {
+  f32Bytes,
+  f64Bytes,
+  numLexIsFloat,
+  parseI32,
+  parseI64Pair,
+} from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { strListHas } from "./listutil"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
@@ -543,7 +567,7 @@ function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
   return irBMiss("member hook not installed")
 }
 
-function inPlaceNone(_ix: i32, _fnIx: i32): boolean { return false }
+function inPlaceNone(_ix: i32, _fnIx: i32): i32 { return 0 }
 
 function unionEqNone(_ix: i32, _fnIx: i32): boolean { return false }
 
@@ -560,7 +584,7 @@ export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
 export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
 export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
 export let irStrBinHook: (b: i32[], ix: i32, rep: i32) => Opnd = strBinUnset
-export let irInPlaceHook: (ix: i32, fnIx: i32) => boolean = inPlaceNone
+export let irInPlaceHook: (ix: i32, fnIx: i32) => i32 = inPlaceNone
 export let irUnionEqHook: (ix: i32, fnIx: i32) => boolean = unionEqNone
 export let irListEqHook: (ix: i32, fnIx: i32) => boolean = listEqNone
 
@@ -907,9 +931,24 @@ function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
   }
   if numLexIsFloat(n.numText) { return irBMiss("float literal at an integer") }
   const v = memOffsetLexValue(n.numText)
-  if v < 0 || k == "i32" && v > 2147483647 { return irBMiss("wide literal") }
-  const o: Opnd = { oiRep: rep, oiBits: v }
-  return o
+  if v >= 0 && (k != "i32" || v <= 2147483647) {
+    const o: Opnd = { oiRep: rep, oiBits: v }
+    return o
+  }
+  // Past the narrow reading, the bits legacy's literal writer spells at its own width: the lexeme
+  // split into halves at `i64`, wrapped at `i32` (`emitNumLexAt`).
+  if numLitWidth(ix, ibFnIx) != k { return irBMiss("wide literal width") }
+  let bits: i64 = 0
+  if k == "i64" {
+    const pr = parseI64Pair(n.numText)
+    bits = ((pr[0] as i64) << 32) | ((pr[1] as i64) & 4294967295)
+  } else if k == "i32" {
+    bits = parseI32(n.numText) as i64
+  } else {
+    return irBMiss("wide literal")
+  }
+  const w: Opnd = { oiRep: rep, oiBits: bits }
+  return w
 }
 
 function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
@@ -1253,11 +1292,18 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const arm = printArmOf(c.callArgs[0], ibFnIx)
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
+  // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
+  if arm == "nulAtom" && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != "" {
+    return skip("print nulAtom from a box")
+  }
   const v = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return 0 }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
-  const ok = if want == "nulStr" { strNullable(vr) } else { p != null && p == want }
+  let ok = p != null && p == want
+  if want == "nulStr" { ok = strNullable(vr) }
+  if want == "atom" { ok = repNodeAt(vr) is RAtom }
+  if want == "nulAtom" { ok = atomNullable(vr) }
   if !ok { return skip("print operand rep") }
   irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
   return 0
@@ -1273,7 +1319,9 @@ function printArmRep(arm: PrintArm): string {
     "bool" => "bool"
     "i32" => "i32"
     "nulStr" => "nulStr"
-    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulAtom" | "atom" | "nulBool" | "union" | "unrenderable" => ""
+    "atom" => "atom"
+    "nulAtom" => "nulAtom"
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulBool" | "union" | "unrenderable" => ""
   }
 }
 
@@ -1422,14 +1470,13 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
-  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`emitNullAt`):
+  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`nullOwnAt`):
   // the sentinel, or the string's typed null ref.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
-    if (
-      atomNullable(dst) && nullOwnIsAtom(ix, ibFnIx)
-      || strNullable(dst) && nullOwnIsStr(ix, ibFnIx)
-    ) {
-      return repTemp(b, { nuAt: ix }, ix, dst)
+    const atom = atomNullable(dst)
+    const own = if atom || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
+    if own == (if atom { NULL_OWN_ATOM } else { NULL_OWN_STR }) {
+      return repTemp(b, { nuAt: ix, nuOwn: own }, ix, dst)
     }
   }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
@@ -1640,9 +1687,10 @@ function atomOperand(ix: i32): boolean {
   return repNodeAt(r) is RAtom || atomNullable(r)
 }
 
-// A `==`/`!=` against a `null` literal, by legacy's own route: no dead test and no `null`-typed
-// pair (`deadNullTestOperand`, `nulNoneEqSides`), then the null test's arm (`nulTestArmOf`) with
-// the direction the dispatch hands it. Only a `K | null`'s sentinel compare is built.
+// A `==`/`!=` against a `null` literal, by legacy's own route: a dead test is its constant
+// (`deadNulTest`); a `null`-typed pair (`nulNoneEqSides`) misses; then the null test's arm
+// (`nulTestArmOf`) with the direction the dispatch hands it. Only a `K | null`'s sentinel compare
+// and a string's typed null test are built.
 function nulTest(
   b: i32[],
   n: BinExpr,
@@ -1650,7 +1698,8 @@ function nulTest(
   ix: i32,
   rep: i32,
 ): Opnd {
-  if deadNullTestOperand(n, ibFnIx) >= 0 { return irBMiss("null test dead") }
+  const dn = deadNullTestOperand(n, ibFnIx)
+  if dn >= 0 { return deadNulTest(b, n, dn, ix, rep) }
   if nulNoneEqSides(n.binLeft, n.binRight, ibFnIx) {
     return irBMiss("null test of null")
   }
@@ -1665,6 +1714,23 @@ function nulTest(
     return irBMiss("null test operand")
   }
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
+}
+
+// A null test the checker proved dead (`deadNullTestOperand`), as legacy's `emitDeadNullTest`
+// writes it: the operand for its effects and dropped, unless it is a bare name, then the constant.
+// A numeric union's per-member compare takes the node first in legacy (`njDispatches`).
+function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
+  if numUnionMinted && njDispatches(n, ibFnIx) {
+    return irBMiss("null test numeric union")
+  }
+  if !(nodeAt(opIx) is Ident) {
+    const v = irBExpr(b, opIx)
+    if ibMiss != "" { return v }
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  }
+  const bits: i64 = if n.binOp == "!=" { 1 } else { 0 }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
+  return o
 }
 
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32,
@@ -1714,14 +1780,15 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return mapGetOr(b, n, ix, rep)
 }
 
-// `l ?? d` over a `string | null` along legacy's plain block (`coalNulStrBlockPlain`), its default
+// `l ?? d` over a `string | null` along legacy's plain block (`coalNulRefArmOf`), its default
 // a string literal and its result the block's own rep. Every other niche arm is a named miss.
 function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("coalesce operand") }
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
+  if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
-  if !coalNulStrBlockPlain(n, ix, ibFnIx) {
+  if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
   }
   const dIx = unwrapParen(n.binRight)
@@ -1738,6 +1805,35 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return d }
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
+// plain string literal, which the null branch writes as itself.
+function coalAtomStr(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const dIx = unwrapParen(n.binRight)
+  if dIx < 0 || !(nodeAt(dIx) is StrLit) || exprIsLitAtom(dIx, ibFnIx) {
+    return irBMiss("coalesce atom default")
+  }
+  if nulLitAtomTexts(lhsIx, ibFnIx).length == 0 {
+    return irBMiss("coalesce atom members")
+  }
+  if repPrim(rep) != "str" { return irBMiss("coalesce result rep") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !atomNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const d = irBExpr(b, n.binRight)
+  if ibMiss != "" { return d }
+  if !(d is OStr) || irBOpRep(d) != rep {
+    return irBMiss("coalesce atom default")
+  }
+  const r: Rhs = { zaL: l, zaD: d, zaAt: ix }
   return irBLetTemp(b, r, ix, rep)
 }
 
@@ -1812,9 +1908,19 @@ function opUnsigned(ix: i32): boolean {
   return ps == "u32" || ps == "u64"
 }
 
+// A tagged function set's value: its member's id, an i32 immediate as legacy writes it.
+function tagLeaf(ix: i32): Opnd {
+  const rep = primRepOf(ix)
+  const p = repPrim(rep)
+  if p == null || p != "i32" { return irBMiss("tag leaf rep") }
+  const o: Opnd = { oiRep: rep, oiBits: fnTagLeafEmitted(ix, ibFnIx) as i64 }
+  return o
+}
+
 export function irBExpr(b: i32[], ix: i32): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const pre = exprPrePathWhy(ix, ibFnIx)
+  if pre == "pre-path tag leaf" { return tagLeaf(ix) }
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return irBExpr(b, n.parInner) }
@@ -1966,8 +2072,11 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
 function strLit(ix: i32, rep: i32): Opnd {
   if strLitTakesAtom(ix, ibFnIx) {
     const ar = repNodeOfTy(ctxTyAt(ix, ibFnIx))
-    if !(repNodeAt(ar) is RAtom) { return irBMiss("string atom") }
-    const a: Opnd = { osAt: ix, osRep: ar }
+    // At a `K | null` the literal is its member's id, which the niche holds as is (`RRetag`).
+    const an = repNodeAt(ar)
+    const at = if an is RNullable && an.rnDisc == 3 { an.rnInner } else { ar }
+    if !(repNodeAt(at) is RAtom) { return irBMiss("string atom") }
+    const a: Opnd = { osAt: ix, osRep: at }
     return a
   }
   if repPrim(rep) != "str" { return irBMiss("string literal rep") }
@@ -1976,9 +2085,34 @@ function strLit(ix: i32, rep: i32): Opnd {
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
+  // Legacy appends a string in place at a local and at a list element alike; the accumulator
+  // keeps its own lowering, and a site's chain must be the right side the store delivers.
+  const mode = irInPlaceHook(ix, ibFnIx)
+  if mode < 0 { return skip("string accumulator") }
+  const n0 = ib.irNodes.length
+  assignTo(b, n, ix)
+  if ibMiss == "" && mode > 0 && !siteBuilt(n0, ix) {
+    return skip("string append site")
+  }
+  return 0
+}
+
+// Whether a node from `n0` on joins site `ix`'s chain (`buildStrBin`'s `str.site`).
+function siteBuilt(n0: i32, ix: i32): boolean {
+  let i = n0
+  while i < ib.irNodes.length {
+    const nd = ib.irNodes[i]
+    if nd is SLet {
+      const r = nd.lRhs
+      if r is RStrOp && r.soOp == "site" && r.soAt == ix { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
-  // Legacy appends a string in place at a local and at a list element alike.
-  if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   if t is Index { return elemStore(b, n, t, ix) }
   if t is Member { return fieldStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
@@ -2516,17 +2650,7 @@ function tailArm(blockIx: i32): i32[] {
 function build(fnIx: i32, fnPos: i32): string {
   const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return "not a function" }
-  ib = irFnNew(fnIx, fn.fnName)
-  ibFnIx = fnIx
-  ibFnPos = fnPos
-  ibMiss = ""
-  ibMisses = []
-  ibDeclVar = Map()
-  ibLoopName = []
-  ibLoopBrk = []
-  ibLoopCont = []
-  ibLabelN = 0
-  ibBool = repNodeOfTy(TY_BOOL)
+  ibReset(fnIx, fn.fnName, fnPos)
   if fn.fnTyParams.length > 0 { return "template" }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
@@ -2537,12 +2661,52 @@ function build(fnIx: i32, fnPos: i32): string {
     }
   }
   ibNoValue = if none { ib.irRetRep } else { -1 }
+  const pw = buildParams(fn, fnIx, true)
+  if pw != "" { return pw }
+  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
+  if !repIsNoValue(ibNoValue) { return "no void rep" }
+  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
+  const body = nodeAt(fn.fnBody)
+  if !(body is Block) { return "body" }
+  const top: i32[] = []
+  if none {
+    stmtRun(top, body.blkStmts)
+  } else {
+    tailReturn(top, body.blkStmts, fn.fnBody)
+  }
+  ib.irBody = top
+  return ibMiss
+}
+
+// Starts building function `fnIx` (named `name`, at `fnStmts` slot `fnPos`) into a fresh `ib`.
+function ibReset(fnIx: i32, name: string, fnPos: i32) {
+  ib = irFnNew(fnIx, name)
+  ibFnIx = fnIx
+  ibFnPos = fnPos
+  ibMiss = ""
+  ibMisses = []
+  ibDeclVar = Map()
+  ibLoopName = []
+  ibLoopBrk = []
+  ibLoopCont = []
+  ibLabelN = 0
+  ibBool = repNodeOfTy(TY_BOOL)
+  return 0
+}
+
+// The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A
+// fragment's (`whole` false) leaves out a parameter it could not hold, so only reading it misses.
+function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
   const shift = envSlotShift(fnIx)
   let i = 0
   while i < fn.fnParams.length {
     const p = fn.fnParams[i]
     const ty = scopeTyAt(p, fnIx)
     const r = repNodeOfTy(ty)
+    if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyOpen(ty)) {
+      i = i + 1
+      continue
+    }
     if isVoidTy(ty) || !valueRep(r, ty) {
       if !censusGoesOn("parameter rep " + repWhat(r)) {
         return "parameter rep " + repWhat(r)
@@ -2557,19 +2721,132 @@ function build(fnIx: i32, fnPos: i32): string {
     ib.irParams.push(v)
     i = i + 1
   }
-  if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
-  if !repIsNoValue(ibNoValue) { return "no void rep" }
-  if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
-  const body = nodeAt(fn.fnBody)
-  if !(body is Block) { return "body" }
-  const top: i32[] = []
-  if none {
-    stmtRun(top, body.blkStmts)
-  } else {
-    tailReturn(top, body.blkStmts, fn.fnBody)
+  return ""
+}
+
+// The builder's whole state, saved around a fragment built while another build is open.
+type IbFrame = {
+  bfIb: IrFn,
+  bfFnIx: i32,
+  bfFnPos: i32,
+  bfMiss: string,
+  bfMisses: string[],
+  bfDeclVar: {[i32]: i32},
+  bfLoopName: string[],
+  bfLoopBrk: i32[],
+  bfLoopCont: i32[],
+  bfLabelN: i32,
+  bfBool: i32,
+  bfNoValue: i32,
+}
+
+function ibSave(): IbFrame {
+  const f: IbFrame = {
+    bfIb: ib,
+    bfFnIx: ibFnIx,
+    bfFnPos: ibFnPos,
+    bfMiss: ibMiss,
+    bfMisses: ibMisses,
+    bfDeclVar: ibDeclVar,
+    bfLoopName: ibLoopName,
+    bfLoopBrk: ibLoopBrk,
+    bfLoopCont: ibLoopCont,
+    bfLabelN: ibLabelN,
+    bfBool: ibBool,
+    bfNoValue: ibNoValue,
   }
+  return f
+}
+
+function ibRestore(f: IbFrame) {
+  ib = f.bfIb
+  ibFnIx = f.bfFnIx
+  ibFnPos = f.bfFnPos
+  ibMiss = f.bfMiss
+  ibMisses = f.bfMisses
+  ibDeclVar = f.bfDeclVar
+  ibLoopName = f.bfLoopName
+  ibLoopBrk = f.bfLoopBrk
+  ibLoopCont = f.bfLoopCont
+  ibLabelN = f.bfLabelN
+  ibBool = f.bfBool
+  ibNoValue = f.bfNoValue
+  return 0
+}
+
+// The op seam's legacy-to-IR door: node `ix` of function `fnIx` lowered onto the buffer legacy is
+// writing, at the rep of type `ty` its writer leaves it at (-1: the node's type), in legacy's frame
+// (live slots, no new local, no seat). "" when written; else the miss (a build miss, a moved rep
+// epoch, a verifier failure, or a lowering miss), nothing written. A `probe` banks no row.
+function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+  const sv = ibSave()
+  const why = lowerNodeIn(ix, fnIx, ty, probe)
+  ibRestore(sv)
+  return why
+}
+
+// Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
+// `fnIx` at type `ty`, legacy's bytes for it in the current buffer from `from` on, lowered as a
+// fragment into a scratch buffer and counted `node-in <kind>: matched`, `differ` or `miss <why>`.
+export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
+  if !ibArmed { return 0 }
+  const cur = wTarget([])
+  const why = irLowerNodeIn(ix, fnIx, ty, true)
+  const got = wTarget(cur)
+  let row = "matched"
+  if why != "" {
+    row = "miss " + why
+  } else if !bytesFrom(cur, from, got) {
+    row = "differ"
+    if ibDetail {
+      row = row + " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got)
+    }
+  }
+  return count("node-in " + irAstKind(ix) + ": " + row)
+}
+
+// Whether `b` from `at` on holds exactly `want`.
+function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
+  if at < 0 || b.length - at != want.length { return false }
+  let i = 0
+  while i < want.length {
+    if b[at + i] != want[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+  const gen = repNodeGen()
+  let fnPos = -1
+  if fnIx < 0 {
+    // A start body's top-level code, under the guards its whole build takes (`buildStart`).
+    if !gPromoInStart { return "fragment outside a body" }
+    if startStrAccMarked() { return "string accumulator" }
+    if gInitProgIdx >= 0 { return "progress cell" }
+    ibReset(-1, "@fragment", -1)
+  } else {
+    if fnIx >= P.nodes.length { return "fragment outside a body" }
+    const fn = nodeAt(fnIx)
+    if !(fn is FuncDecl) { return "fragment outside a body" }
+    if fn.fnTyParams.length > 0 { return "template" }
+    fnPos = fnStmtsPosOf(fnIx)
+    ibReset(fnIx, fn.fnName, fnPos)
+    buildParams(fn, fnIx, false)
+  }
+  ibNoValue = repNodeOfTy(TY_NEVER)
+  ib.irRetRep = ibNoValue
+  ib.irRetTy = TY_NEVER
+  const top: i32[] = []
+  const out = irBExpr(top, ix)
   ib.irBody = top
-  return ibMiss
+  if ibMiss != "" { return ibMiss }
+  const want = repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) })
+  if irBOpRep(out) != want { return "fragment rep" }
+  if repNodeGen() != gen { return "rep epoch moved" }
+  const v = irVerify(ib)
+  if v.vfRule != 0 { return "verifier rule " + i32ToStr(v.vfRule) }
+  return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 
 // The failing control: breaks `ib` in the way `ibCorrupt` names.
@@ -2781,7 +3058,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
-  // The accumulator rows `strAssignInPlace` reads are the start's only while legacy just ran.
+  // The accumulator rows `strInPlaceMode` reads are the start's only while legacy just ran.
   if startStrAccMarked() { return "string accumulator" }
   if gInitProgIdx >= 0 { return "progress cell" }
   const top: i32[] = []
