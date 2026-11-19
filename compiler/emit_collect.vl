@@ -2,6 +2,8 @@ import { PrimName, nomNameOfTy, tyPathCycles, tyPathWith } from "./check_types"
 import { tySameSealed } from "./emit_ty_seal"
 import {
   exprPackedRow,
+  lmForUnionArms,
+  lmForValKind,
   luForElemKind,
   luForUnionIter,
   unionArmKindRowsOfExpr,
@@ -35,6 +37,8 @@ import {
   elabTyVarAtI32,
   litRepTyAt,
   litRepTyOneClosed,
+  luOvEnter,
+  luOvLeave,
 } from "./emit_elab"
 import {
   nodeTyArrayElemRepName,
@@ -2550,6 +2554,9 @@ export function declareForRangeLocals(s: ForRange, loopIx: i32) {
   return 0
 }
 
+// The pair slot's kind a union-of-maps walk declares at its value union; null outside one.
+let forInPairKindOv: VKind | null = null
+
 // Declare the locals a `for v[, w] in <iter>` needs, in the pre-order `emitForInStmt` consumes
 // them: the element var `v`, a hidden cursor `v#i`, a hidden `v#l` holding the iterable, and
 // the SECOND name last when the source wrote one. Leaves each written name bound, one
@@ -2569,6 +2576,20 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
       scopeBind(s.fiVar2, up)
     }
     return 0
+  }
+  // A union of maps a pin typed declares its first arm's walk, the pair at the value union every
+  // arm's walk boxes its value into (`emitMapUnionFor`).
+  const lmArms = lmForUnionArms(s.fiIter, fnIx)
+  if lmArms.length > 0 {
+    const mark = luOvEnter(s.fiIter, lmArms[0])
+    const m0 = tyAt(lmArms[0])
+    if s.fiVar2 != "" && m0 is TyMap && m0.mSet == 0 {
+      forInPairKindOv = lmForValKind(lmArms)
+    }
+    const r = declareForInLocals(s, fnIx)
+    forInPairKindOv = null
+    luOvLeave(mark)
+    return r
   }
   const fiEk = forInElemKind(s.fiIter, fnIx)
   if fiEk == null {
@@ -2636,7 +2657,7 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   // string's cursor is a backing offset and a set's skips tombstones, so the cursor is not
   // the index at two of the three sequences.
   if s.fiVar2 != "" {
-    const fiPk = forInPairElemKind(s.fiIter, fnIx)
+    const fiPk = forInPairKindOv ?? forInPairElemKind(s.fiIter, fnIx)
     if fiPk == null {
       return emitFail("emitProgram: unsupported for-in second binding")
     }
