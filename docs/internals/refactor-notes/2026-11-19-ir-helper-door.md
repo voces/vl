@@ -41,9 +41,13 @@ helpers: `__f64_rem__` (family B), the six string helpers (D) and the three UTF-
 - Byte identity: a string program (eq, hash, concat, bytes, from_bytes, fill), a UTF-8 program
   (for-cp, `cpAt`, `cpLen`, `fromCodePoint(s)` over surrogates and out-of-range code points) and
   an f64 `%` program build to identical wasm under the master seed and this one.
-  `scripts/ir-identity.sh` over the distilled cells and the self-compile: see the PR body.
+  `scripts/ir-identity.sh` (e1419277 seed against this one): identical 9034, fail under both 3267,
+  differ 0, built under one only 0; self-compile identical. Every `tests/cases` program not
+  `@error` plus every capability probe: identical 7504, fail under both 68, differ 0.
+- `rep-fuzz-check.sh` exact (0 unsound, 0 new). L2 self-compile fuel +0.31% on master's own
+  reading (98,671,091,527 to 98,976,878,011). Seed +0.17% (6,760,941 to 6,772,497 bytes).
 - The run-time cost is zero by construction: the helper bytes are identical.
-- Lines, compiler only: +1129 / −1154.
+- Lines, compiler only: +1139 / −1163.
   - door ~72, builder 184, raw layer ~227 (counted once, here);
   - bodies: f64 rem ~45 against 115 deleted; strings ~237 against 438; UTF-8 ~217 against 462.
 
