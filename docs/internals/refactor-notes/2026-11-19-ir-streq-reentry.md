@@ -24,9 +24,11 @@ The seam template (`2026-11-19-ir-seam-frame-model.md`): split around the operan
   IR calls it directly, without `strEqTail`.
 
 ## Measured
-- The self-compile is identical to master's (d1de0b7d4).
+- The self-compile is identical to master's (93c5fe0f1, both seeds at fixpoint).
 - Every `tests/cases` program not `@error` plus every capability probe, master seed vs this one:
   identical 7512, fail under both 68, differ 0.
 - `ir-identity.sh --cases` (claiming on vs off on this tree): identical 7512, differ 0.
-- `REENTRY=strEqTail scripts/ir-driver-census.sh`: see the PR body (master: 73 lines, 4 drivers,
-  2,129 reached).
+- `REENTRY=strEqTail scripts/ir-driver-census.sh`, tagging only this re-entry:
+  - master: 119 driver functions reached (2,129 lines), 4 of them (73 lines) left only by a claim;
+  - this tree: 0 reached.
+- L2 self-compile fuel, same box: 99,484,096,211 on master, 99,498,777,286 here (+0.015%).
