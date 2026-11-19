@@ -21936,7 +21936,7 @@ function emitNulNicheEq(binIx: i32, fnIx: i32, niche: EqCmpKind) {
 }
 
 // The `nulstruct` arm of `emitNulNicheEq`. The struct core re-reads each operand from its root,
-// so the guard is spelled as two null TESTS over the roots `structEqRootOf` staged, instead of
+// so the guard is spelled as two null TESTS over the roots `structEqStage` staged, instead of
 // the `br_on_null` consume.
 function emitNulStructEq(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
@@ -21982,12 +21982,12 @@ function emitNulStructEq(binIx: i32, fnIx: i32) {
   return emitFail("emitProgram: expected a nullable-struct equality")
 }
 
-// `emitNulStructEq`'s guard and compare at eq row `si`, over roots staged once (`structEqRootOf`).
+// `emitNulStructEq`'s guard and compare at eq row `si`, over roots staged once (`structEqStage`).
 function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
-  const lRoot = structEqRootOf(lIx, si, 0, fnIx)
-  if lRoot == -1 { return -1 }
-  const rRoot = structEqRootOf(rIx, si, 1, fnIx)
-  if rRoot == -1 { return -1 }
+  const roots = structEqStage(lIx, rIx, si, fnIx)
+  if roots[0] == -1 { return -1 }
+  const lRoot = roots[0]
+  const rRoot = roots[1]
   fbBlock(127) // block i32 — $out
   if emitEqRootIsNull(lRoot, lIx, fnIx) < 0 { return -1 }
   if emitEqRootIsNull(rRoot, rIx, fnIx) < 0 { return -1 }
@@ -22137,17 +22137,16 @@ function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
 // Lower a structural struct equality `a == b` (or `!=`) onto `body`, leaving a 0/1 i32:
 // field-wise compare mirroring the host's `valueEq`. Every field compare re-reads its operand
 // from the root, so an operand that is not a re-readable place is evaluated once into a stash
-// first (`structEqRootOf`). Takes `row` rather than re-deriving it — the caller already asked both namespaces (struct and variant) and knows which answered; re-asking loses that (`structIndexOfExpr` alone answers -1 for a variant operand).
+// first (`structEqStage`). Takes `row` rather than re-deriving it — the caller already asked both namespaces (struct and variant) and knows which answered; re-asking loses that (`structIndexOfExpr` alone answers -1 for a variant operand).
 function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
     const savedL = eqStashL
     const savedR = eqStashR
-    const lRoot = structEqRootOf(e.binLeft, row, 0, fnIx)
-    const rRoot = if lRoot == -1 { -1 } else { structEqRootOf(e.binRight, row, 1, fnIx) }
+    const roots = structEqStage(e.binLeft, e.binRight, row, fnIx)
     const pathSi: i32[] = []
     const pathFi: i32[] = []
-    const r = if rRoot == -1 { -1 } else { emitStructEqRec(lRoot, rRoot, row, pathSi, pathFi, fnIx) }
+    const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
     eqStashL = savedL
     eqStashR = savedR
     if r < 0 { return -1 }
@@ -22159,22 +22158,35 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   return emitFail("emitProgram: expected a struct equality")
 }
 
-// The root `emitStructEqRec` reads operand `ix` of a compare at eq row `row` through: `ix` when
-// it is a re-readable place, else the stash sentinel (-2 left, -3 right for `side` 0 / 1) after
-// evaluating it once into a slot `eqStashL`/`eqStashR` now names; -1 on failure. The caller
-// restores the stash pair. Its slot keys sit above a nested-shape compare's (D17022).
-function structEqRootOf(ix: i32, row: i32, side: i32, fnIx: i32): i32 {
-  if unionEqOperandOk(ix) { return ix }
-  if emitExpr(ix, fnIx) < 0 { return -1 }
-  const key = 2048 + side * 1024
-  const slot = if row >= 0 { structEqStashSlot(row + key) } else { unionEqArmSlot(-1 - row + key) }
-  fbLocalSet(slot)
-  if side == 0 {
-    eqStashL = slot
-    return -2
+// The roots `emitStructEqRec` reads operands `lIx`/`rIx` of a compare at eq row `row` through:
+// a re-readable place as itself, else the stash sentinel (-2 left, -3 right) over a slot
+// `eqStashL`/`eqStashR` now names; `[-1, -1]` on failure. Both are evaluated in source order
+// before either slot is set, so a compare nested in an operand is done with them (D17022).
+function structEqStage(lIx: i32, rIx: i32, row: i32, fnIx: i32): i32[] {
+  const lStage = !unionEqOperandOk(lIx)
+  const rStage = !unionEqOperandOk(rIx)
+  if lStage && emitExpr(lIx, fnIx) < 0 { return [-1, -1] }
+  if rStage && emitExpr(rIx, fnIx) < 0 { return [-1, -1] }
+  let rRoot = rIx
+  if rStage {
+    eqStashR = structEqSlot(row, 1)
+    fbLocalSet(eqStashR)
+    rRoot = -3
   }
-  eqStashR = slot
-  return -3
+  let lRoot = lIx
+  if lStage {
+    eqStashL = structEqSlot(row, 0)
+    fbLocalSet(eqStashL)
+    lRoot = -2
+  }
+  return [lRoot, rRoot]
+}
+
+// The stash slot of operand `side` (0 left, 1 right) of a compare at eq row `row`, keyed above
+// the band a nested-shape compare uses.
+function structEqSlot(row: i32, side: i32): i32 {
+  const key = 2048 + side * 1024
+  return if row >= 0 { structEqStashSlot(row + key) } else { unionEqArmSlot(-1 - row + key) }
 }
 
 // `emitEqIsNull` over a compare root: a stashed operand is tested off its slot.
