@@ -28,7 +28,6 @@ import {
   TyLit,
   TyMap,
   TyNullable,
-  TyObj,
   TyPrim,
   TyVar,
   litUnionAliasNameOfTy,
@@ -38,7 +37,6 @@ import {
   tyAt,
   tyElemOf,
   tyElemOpen,
-  tyIsLitUnion,
   tyIsLitUnionOrLit,
   tyIsNulStringRep,
   tyIsNullableLitUnion,
@@ -46,8 +44,6 @@ import {
   tyKeyOf,
   tyMentionsTyVarNamed,
   tyNulInnerIsPrim,
-  tyPathCycles,
-  tyPathWith,
 } from "./check_types"
 import { nodeRepTyIxOf } from "./check_core_state"
 import {
@@ -65,7 +61,6 @@ import { isPatTyIxOf, isVarTyIxOf, luIsTyOf } from "./check_list_union"
 // A leaf with zero imports; this file binds them for its own calls and republishes
 // none — every emitter module asks the home directly. The layering is one-directional:
 // `emit_base.vl` imports `typecheck.vl`, which imports nothing from `emit_*`, avoiding a cycle.
-import { spanEqAt, tyTopIndexOf } from "./tyname"
 import {
   ArrayLit,
   AsExpr,
@@ -2118,7 +2113,7 @@ function litPieceFlush(piece: i32[], out: { b: u8[] }[]) {
 // UTF-8-encodes a code-point vector into the byte vector a Stage 2c string literal is built
 // from — the inverse of `strToCps` plus the decode `for cp in s` lowers to. A code point
 // outside [0, 0x10FFFF] or inside the UTF-16 surrogate range D800..DFFF has no UTF-8 encoding
-// and is replaced by U+FFFD rather than trapping; `emitUtf8EncFnCode` is this function transliterated into wasm and must stay in step with it.
+// and is replaced by U+FFFD rather than trapping; `irUtf8EncFnCode` is this function transliterated into wasm and must stay in step with it.
 export function cpsToUtf8(cps: i32[]) {
   const out: i32[] = []
   let i = 0
@@ -2237,26 +2232,6 @@ export function inferNicheNullByName(name: string) {
 // separator sits inside a quoted literal member (`Box<"a,b" | "c" | null>`), silently
 // rebuilding the annotation from the wrong split — sometimes into a module the runtime cannot parse. `sep` must not itself be a grouper; the home returns at the first hit.
 
-// ── nullable struct refs (`S | null`) ──
-// "S|null" / "null|S" (exactly two `|` parts, one of them `null`) → the non-null
-// part's name, or "" when the name is not a two-part nullable.
-export function nullablePartOf(name: string) {
-  // Depth-aware: a `|` inside an inline shape (`{y:string|i32}|null`) is part of the field's
-  // union, not the nullable wrapper — only a depth-0 bar splits. A `|` inside a quoted literal
-  // member is part of the member's text, which the home skips. Only a name opening on `null|`
-  // (a depth-0 bar) or closing on `|null` can answer, so any other name skips the scan.
-  const n = name.length
-  if n < 5 { return "" }
-  if spanEqAt(name, 0, 5, "null|") { return name.slice(5, n) }
-  if !spanEqAt(name, n - 5, n, "|null") { return "" }
-  const bar = tyTopIndexOf(name, '|', 0, 0)
-  if bar < 0 { return "" }
-  const a = name.slice(0, bar)
-  const b = name.slice(bar + 1, name.length)
-  if a == "null" { return b }
-  if b == "null" { return a }
-  return ""
-}
 // True if the annotation node at `tyIx` is `boolean|null` — the niche scalar nullable
 // (host: `nullSentinel`): an i32 holding 0/1, with the spare value 2 encoding `null` (no
 // box). `== null` is a sentinel compare; narrowing to non-null is purely type-level (the i32 is already 0/1 in the branch).
@@ -2561,22 +2536,6 @@ export function strLess(a: string, b: string) {
   }
   return na < nb
 }
-// True if the value union `name` contains the member atom `atom`.
-export function unionHasAtom(name: string, atom: string) {
-  // No split: `splitUnionAtoms` materializes every member as its own slice just to throw it
-  // away. Atoms are verbatim substrings between top-level `|` separators, so membership is
-  // decidable by comparing each span in place — same scanner, same bounds, same top-level `=>` stop, zero allocations.
-  let start = 0
-  let going = true
-  while going {
-    const at = tyTopIndexOf(name, '|', '=', start)
-    let end = name.length
-    if at >= 0 && name[at] != '=' { end = at } else { going = false }
-    if spanEqAt(name, start, end, atom) { return true }
-    if going { start = at + 1 }
-  }
-  return false
-}
 // The declared-struct index — the arena NODE of the first top-level `TypeDecl` at each
 // declared name's interned id, or -1. `declStructStmtsLen` stamps the statement list it
 // answers for, so a reader holding a list of another length rebuilds rather than read rows
@@ -2646,39 +2605,7 @@ export function callMemProp(exprIx: i32) {
   if e is Member { return e.memProp }
   return ""
 }
-// The `$fnsig` signature key a closure-pinned parameter carries — the part after the `"=>"` of
-// a monomorphized instance's synthetic annotation (`"=>ii>i"` → `"ii>i"`), or "" when `name` is
-// not such a param of function `fnIx`. Below: top-level (paren/brace/bracket depth 0) index of `=>` in a synthetic function-type name, or -1.
-export function annArrowAt(name: string) {
-  return tyTopIndexOf(name, '=', 0, 0)
-}
-// Whether record type `ty` has a field, at any depth through record fields, whose type is a
-// string literal union (`{f:K0}`). Its slot is the i32 atom, which a body `ObjLit` built from
-// a bare string literal does not produce. False for a non-record.
-export function tyIsStructWithLitUnionField(ty: i32): boolean {
-  return structLitUnionFieldAt(ty)
-}
 
-function structLitUnionFieldAt(ty: i32): boolean {
-  const path: i32[] = []
-  return structLitUnionFieldAtIn(ty, path)
-}
-
-function structLitUnionFieldAtIn(ty: i32, path: i32[]): boolean {
-  if tyPathCycles(ty, path) { return false }
-  const sub = tyPathWith(ty, path)
-  if ty < 0 { return false }
-  const t = tyAt(ty)
-  if !(t is TyObj) { return false }
-  const ftys = t.objFieldTypes
-  let fi = 0
-  while fi < ftys.length {
-    if tyIsLitUnion(ftys[fi]) { return true }
-    if structLitUnionFieldAtIn(ftys[fi], sub) { return true }
-    fi = fi + 1
-  }
-  return false
-}
 // True if the type-annotation node at `tyIx` is a function type — the self-host parses a
 // function-typed annotation as a `TypeRef` whose name contains `=>` or `(`/`)->`. For the
 // corpus, function params are rare; a closure param is detected structurally elsewhere.

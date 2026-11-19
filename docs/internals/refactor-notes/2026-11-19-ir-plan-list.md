@@ -46,9 +46,15 @@ What deletes:
 
 ## This step
 
-Moved: `pushPlanOf`, `popPlanOf`, `popStmtPlainWhy`, `idxStorePlanOf`, `listReserveScan`,
-`arrLitArmOf`, `forInLoopAt`, `identReadIsList` and `arrLitListBuild`, with their closure. That is
-51 declarations and 1,231 lines with their comments.
+Moved into `emit_plan_list.vl`, with their closure:
+- `pushPlanOf`, `popPlanOf`, `popStmtPlainWhy`, `idxStorePlanOf` and `listReserveScan`;
+- `arrLitArmOf`, `arrLitListBuild` and `forInLoopAt`;
+- `identReadIsList`;
+- `arrLitRefPlainSlot` and `arrRefSlotPlain`, the ref-list decisions #9121 added.
+
+The narrowed-arm unbox decision those last two read (`narrowedArmNeedsUnbox`, `exprRecordArmsTy`,
+`exprTyIsRecord`) opens `emit_plan_union.vl`. That is 59 declarations and 1,369 lines with their
+comments.
 
 - `arrLitShort` stays in `wasmEmit.vl`, because it reads `gForIterLit`, which legacy's
   `emitForInList` writes.
@@ -72,32 +78,33 @@ Its control, a module breaking each rule, fails all five.
 
 | | lines |
 |---|---|
-| moved (declarations with their comments) | 1,231 |
+| moved (declarations with their comments) | 1,369 |
 | deleted | 5 |
-| new module's header and imports | 167 |
-| compiler net | +164 (+1,448, −1,284) |
+| the two modules' headers and imports | 201 |
+| compiler net | +206 (+1,634, −1,428) |
 
 ## Bars
 
+On fixpoint seeds: master d1de0b7d (6,786,131 bytes) against this branch merged with it (6,786,109).
+
 | bar | reading |
 |---|---|
-| self-build | fixpoint; 6,760,918 bytes against master's 6,760,941 |
-| corpus identity, master fixpoint vs this fixpoint | 9,034 identical, 3,267 fail under both, 0 differ, 0 one-only; self-compile identical |
+| corpus identity | 9,034 identical, 3,267 fail under both, 0 differ, 0 one-only; self-compile identical |
 | `--names` identity | the same, self-compile identical |
-| `ir-identity.sh --cases` | 7,508 identical, 68 fail under both, 0 differ |
+| `ir-identity.sh --cases` | 7,512 identical, 68 fail under both, 0 differ |
 | mode 3 (this seed under `$VL_IR_SHADOW=3` against master's default) | 9,034 same, 0 differ, 0 one-only; self-compile identical |
-| shadow | 30,648 covered, verified and matched; `ir-shadow: ok` |
-| `--claims` | 30,648 functions emitted by the IR; `ir-shadow: ok` |
-| L2 self-compile fuel | 98,670,948,575 (master) to 98,680,491,212 (+0.01%) |
-| seed size | 6,760,918 bytes, baseline 6,749,691 (+0.2%) |
+| shadow | 30,703 covered, verified and matched; `ir-shadow: ok` |
+| `--claims` | 30,703 functions emitted by the IR; `ir-shadow: ok` |
+| L2 self-compile fuel | 99,533,348,344 (master) to 99,540,393,413 (+0.007%) |
+| seed size | 6,786,109 bytes, baseline 6,749,691 (+0.5%, master's own drift) |
 | late demands | 9, baseline 9; late tag rows 307, baseline 307 |
-| phase state | wasmEmit.vl surface 276 to 273, `emit_plan_list.vl` 17 (new), baseline rewritten |
-| lint-self, ladder sets | clean; 53 closed sets match |
+| phase state | distinct checker symbols 1,185 on both; imports 2,743 to 2,762 (`emit_plan_list.vl` 17, `emit_plan_union.vl` 5, `wasmEmit.vl` −3); baseline rewritten |
+| lint-self, ladder sets | clean; 55 closed sets match |
 
 ## The price of a split
 
 The phase-state census counts checker imports per module. A symbol both the moved code and
-`wasmEmit.vl` still use is now imported twice. Distinct checker symbols are unchanged at 1,187,
-and imports rise from 2,746 to 2,760 (+14). The moved functions import no checker symbol
-`wasmEmit.vl` did not already import. Each later family adds such a count, and it falls only as
-legacy's remaining users of a symbol delete.
+`wasmEmit.vl` still use is now imported twice. The stage's bar is that distinct checker symbols do
+not rise, and here they are unchanged. The moved functions import no checker symbol `wasmEmit.vl`
+did not already import. Each later family adds such a count, and it falls only as legacy's
+remaining users of a symbol delete.

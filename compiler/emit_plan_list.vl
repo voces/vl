@@ -45,7 +45,12 @@ import {
   tyElemOf,
   tyNulLitUnionInner,
 } from "./check_types"
-import { tyNameOf, unwrapParen } from "./emit_base"
+import {
+  ALLOC_LIT_CHUNK,
+  NEW_FIXED_MAX,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
 import { numLexFitsI32, numLexIsFloat, parseI32 } from "./emit_bignum"
 import {
   emitFail,
@@ -55,13 +60,14 @@ import {
   pkBackAt,
   pkWrapAt,
 } from "./emit_bytes"
-import { ctxTyAt, nodeTyAt } from "./emit_capture_frames"
+import { ctxTyAt, nodeRepTyAt, nodeTyAt } from "./emit_capture_frames"
 import {
   arrElemLitUnionTy,
   arrLitIsF32,
   arrLitIsRef,
   arrLitIsStr,
   arrLitNumKind,
+  arrLitRowSlotIn,
   envSlotShift,
   exprArray,
   exprListRep,
@@ -76,9 +82,12 @@ import {
   forInPairValsSlot,
   globalLetOfRead,
   listElemRepIsRow,
+  litArmRowOf,
+  objLitVariantIdxNoStructRow,
   recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
+  structIndexOfObjCtx,
 } from "./emit_classify"
 import { listElemIsBool } from "./emit_closure_sites"
 import {
@@ -95,13 +104,14 @@ import {
 } from "./emit_lit_atoms"
 import { monoIsClashLit } from "./emit_mono"
 import { refPushScratchBaseFor } from "./emit_mv_slots"
+import { narrowedArmNeedsUnbox } from "./emit_plan_union"
 import {
   ListBuild,
   emptyArrHoleBuildKind,
   listBuildOfTy,
   listBuildOfTyHeld,
 } from "./emit_ref_list_kinds"
-import { repOfTy, rlElemKindAt } from "./emit_rep"
+import { repOfTy, rlElemKindAt, structFieldCodesEq } from "./emit_rep"
 import {
   ALK_F64,
   ALK_I64,
@@ -123,7 +133,16 @@ import {
   LBK_UNION,
   LBK_V128_LIST,
   ListKind,
+  RLK_F32_LIST,
+  RLK_F64_LIST,
+  RLK_I32_LIST,
+  RLK_I64_LIST,
+  RLK_REF_LIST,
   RLK_STRUCT,
+  RLK_STR_LIST,
+  RLK_U8_LIST,
+  RLK_UNION,
+  RLK_V128_LIST,
   VKind,
   aTy,
   f32PushScratchBase,
@@ -134,6 +153,7 @@ import {
   fl128Ty,
   fl32Ty,
   fl64Ty,
+  gConstExprEmit,
   heldRepOf,
   i64PushScratchBase,
   ia64Ty,
@@ -149,7 +169,9 @@ import {
   rlElemTyIx,
   rlRowsMinted,
   rlWrapIdx,
+  sHeapIdx,
   strPushScratchBase,
+  uVariants,
   v128PushScratchBase,
 } from "./emit_state"
 import { rlElemTyIxAt } from "./emit_struct_order"
@@ -1395,4 +1417,99 @@ export function tyRepsAsAtom(t: i32): boolean {
   if t < 0 { return false }
   const d = repOfTy(t)
   return d.rdAtom == 1
+}
+
+// The ref-list slot list literal `arrIx` builds at as a short list of elements each built as is
+// in `fnIx`: within the chunk cap, at a slot whose element is no union box and no non-null variant,
+// and no element a record twin, a narrowed unbox or a list the slot does not hold; -1 otherwise.
+export function arrLitRefPlainSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
+  const a = nodeAt(arrIx)
+  if (
+    !(a is ArrayLit)
+    || !rlRowsMinted()
+    || a.arrElems.length > allocLitChunk()
+  ) {
+    return -1
+  }
+  const rslot = arrRefSlotPlain(arrIx, a.arrElems, fnIx, lb)
+  if rslot < 0 { return -1 }
+  const k = rlElemKindAt(rslot)
+  if k == RLK_UNION { return -1 }
+  if (
+    k == RLK_STRUCT
+    && rlElemVariantRow(rslot) >= 0
+    && rlElemNullable[rslot] != 1
+  ) {
+    return -1
+  }
+  const nests = k == RLK_I32_LIST
+    || k == RLK_STR_LIST
+    || k == RLK_F64_LIST
+    || k == RLK_I64_LIST
+    || k == RLK_REF_LIST
+    || k == RLK_F32_LIST
+    || k == RLK_V128_LIST
+    || k == RLK_U8_LIST
+  for e in a.arrElems {
+    if !nests && (exprArray(e, fnIx) || exprRefArray(e, fnIx)) { return -1 }
+    if (
+      arrRefElemTwinRow(e, fnIx, rslot) >= 0
+      || narrowedArmNeedsUnbox(e, fnIx)
+    ) {
+      return -1
+    }
+  }
+  return rslot
+}
+
+// `arrRefSlotOf`'s slot where it finds one, -1 where it would fall back or refuse.
+export function arrRefSlotPlain(
+  arrIx: i32,
+  elems: i32[],
+  fnIx: i32,
+  lb: ListBuild,
+): i32 {
+  if (
+    lb.lbKind == LBK_REF
+    || lb.lbKind == LBK_UNION
+    || lb.lbKind == LBK_REF_AT_SLOT
+  ) {
+    return lb.lbSlot
+  }
+  if elems.length >= 1 { return arrLitRowSlotIn(arrIx, fnIx) }
+  return lb.lbSlot
+}
+
+// The element row of ref-list slot `rslot` where element `e` is a record literal built at another
+// row of the same layout, as a literal holding a widened set's ids is; -1 to build it as it is.
+export function arrRefElemTwinRow(e: i32, fnIx: i32, rslot: i32): i32 {
+  const x = unwrapParen(e)
+  if x < 0 || !(nodeAt(x) is ObjLit) || objLitBuildVariantRow(x, fnIx) >= 0 {
+    return -1
+  }
+  const own = structIndexOfObjCtx(x, fnIx)
+  const er = rlElemStructRow(rslot)
+  if own < 0 || er < 0 || own >= sHeapIdx.length || er >= sHeapIdx.length {
+    return -1
+  }
+  if sHeapIdx[own] == sHeapIdx[er] || structFieldCodesEq(own, er) != 1 {
+    return -1
+  }
+  return er
+}
+
+// The chunk length of a string or ref literal here: a constant initializer has no locals to
+// chunk through, and `isConstInit` admits one only within the operand cap.
+export function allocLitChunk(): i32 {
+  if gConstExprEmit { return NEW_FIXED_MAX }
+  return ALLOC_LIT_CHUNK
+}
+
+// The variant row object literal `exprIx` is constructed at, or -1: one the checker built at a
+// concrete arm, or one unadopted whose field set names a variant and no struct, is the bare
+// variant struct rather than a union box.
+export function objLitBuildVariantRow(exprIx: i32, fnIx: i32): i32 {
+  const ad = nodeRepTyAt(exprIx, fnIx)
+  const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
+  return if pvi >= 0 && pvi < uVariants.length { pvi } else { -1 }
 }

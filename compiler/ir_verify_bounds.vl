@@ -24,6 +24,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRawOp,
   SReturn,
   SSetField,
   SSwitch,
@@ -57,10 +58,22 @@ function checkAt(f: IrFn, id: i32): SBoundsCheck | null {
   return null
 }
 
-// The first broken pairing in `body` and the bodies under it, or "".
-function bodyRule(f: IrFn, body: i32[]): string {
-  let i = 0
-  while i < body.length {
+// The first broken pairing in `body` and the bodies under it, or "". One frame per open body
+// rather than a recursion, so an `else if` chain's length costs no stack (D1990); a node's own
+// pairing is checked before its bodies, which are walked in order.
+function bodyRule(f: IrFn, body0: i32[]): string {
+  const bodies: i32[][] = [body0]
+  const pos: i32[] = [0]
+  while bodies.length > 0 {
+    const top = bodies.length - 1
+    const body = bodies[top]
+    const i = pos[top]
+    if i >= body.length {
+      bodies.pop()
+      pos.pop()
+      continue
+    }
+    pos[top] = i + 1
     const id = body[i]
     const g = getAt(f, id)
     if g != null {
@@ -80,34 +93,45 @@ function bodyRule(f: IrFn, body: i32[]): string {
           + ": a bounds check with no element read after it"
       }
     }
-    const inner = innerRule(f, id)
-    if inner != "" { return inner }
-    i = i + 1
+    pushBodies(f, id, bodies, pos)
   }
   return ""
 }
 
-function innerRule(f: IrFn, id: i32): string {
-  if id < 0 || id >= f.irNodes.length { return "" }
+// Pushes the bodies node `id` holds onto the walk, last first, so they are walked in order.
+function pushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
+  if id < 0 || id >= f.irNodes.length { return 0 }
   const n = f.irNodes[id]
-  return match n {
-    SBlock => bodyRule(f, n.bkBody)
-    SLoop => bodyRule(f, n.lpBody)
-    SForIn => bodyRule(f, n.xfBody)
+  match n {
+    SBlock => {
+      bodies.push(n.bkBody)
+      pos.push(0)
+    }
+    SLoop => {
+      bodies.push(n.lpBody)
+      pos.push(0)
+    }
+    SForIn => {
+      bodies.push(n.xfBody)
+      pos.push(0)
+    }
     SIf => {
-      const t = bodyRule(f, n.siThen)
-      if t != "" { return t }
-      bodyRule(f, n.siElse)
+      bodies.push(n.siElse)
+      pos.push(0)
+      bodies.push(n.siThen)
+      pos.push(0)
     }
     SSwitch => {
-      for a in n.swArms {
-        const s = bodyRule(f, a.swBody)
-        if s != "" { return s }
+      let k = n.swArms.length - 1
+      while k >= 0 {
+        bodies.push(n.swArms[k].swBody)
+        pos.push(0)
+        k = k - 1
       }
-      ""
     }
-    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBr | SReturn | STrap | SDrop => ""
+    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBr | SReturn | STrap | SDrop | SRawOp => {}
   }
+  return 0
 }
 
 // Rule 8 over `f`: "" when every element read is fused with its bounds check, else what broke.
