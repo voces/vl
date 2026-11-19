@@ -32,12 +32,33 @@ is cached in legacy's frame state.
 
 ## Measured
 
-Fixpoint seeds: master c7f7f628b against this branch merged with it.
+Fixpoint seeds: master 85ce0724c against this branch merged with it.
 
 | | master | this branch |
 |---|---|---|
-| corpus functions covered = verified = matched | 32,272 | 33,118 (+846) |
-| self-compile covered = matched | 13,593 | 13,595 |
+| corpus functions covered = verified = matched | 33,340 | 33,512 (+172) |
+| self-compile covered = matched | 13,922 | 13,922 |
 | `method map` in the blocker census (one class alone) | 305 | 0 |
 
-BARS
+Of the 305 functions `method map` blocked alone, 172 are now covered. The rest stop at their next
+class, since a statement stops at its first miss: `open parameter type` +17 and the for-in element
+classes (`union` +20, `struct`, `nulstr`) take most of them. The self-compile uses `.map` and
+`.filter` in no function that was otherwise covered.
+
+| bar | result |
+|---|---|
+| `ir-identity.sh --names` | identical 9,034, differ 0; self-compile identical (at c7f7f628b+) |
+| `ir-identity.sh --cases` | identical 7,512, differ 0 (also re-run on the merged tree) |
+| armed shadow / `--claims` | 33,512 matched / emitted, ok |
+| mode 3 self | byte-identical, 0 fell back |
+| L2 fuel | 99,902,506,328 against master's 99,794,501,004: +0.11% |
+| pin helpers, `emit_mono.vl` | 905 |
+| lint-self, `ladder-sets.vl`, phase state, late demands, dead exports | clean; ok; ok; 9; 0 |
+| `deno task test` | 9,566 passed, 0 failed |
+
+**Lines.** The compiler grows by 157 lines (+345 / −188). That covers the plan record and its
+refusal constructor, the decision split out of the arm, the two tails, `RMapFilter` in the IR,
+verifier and lowering, and the lint mirrors. Legacy's arm loses its inline body to the shared
+halves, so this step moves lines; it deletes no ladder, because unclaimed functions still take the
+arm. Under §10 it is a coverage step, graded on functions gained per line: 172 corpus functions for
+157 lines.
