@@ -79,7 +79,9 @@ import {
   BinNulTest,
   GlobalCtx,
   HoleBox,
+  IsArm,
   PrintArm,
+  TagIsArm,
   arrLitShort,
   atomEqPlanOf,
   atomStrPlanOf,
@@ -107,8 +109,11 @@ import {
   ifExprPlainKind,
   ifWritesElse,
   isArmOf,
+  isArmTagOf,
   isBoxGuardPlain,
+  isDecidedFalse,
   isRecvStageRep,
+  isTestsStorage,
   isVariantTagPlain,
   keptDeclStoresNothing,
   lowMemFoldsCallee,
@@ -138,6 +143,7 @@ import {
   startInitArmOf,
   startStrAccMarked,
   strLitTakesAtom,
+  tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
   widenPlanOf,
@@ -169,6 +175,7 @@ import {
 } from "./emit_rep"
 import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
+import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
   declaredIndexAt,
   envSlotShift,
@@ -197,6 +204,7 @@ import {
   monoInstOrig,
   monoOrigNode,
   setIrShadowOn,
+  uTags,
 } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
@@ -409,18 +417,86 @@ function valueRep(r: i32, ty: i32): boolean {
 // A box's `is` test at the variant rung legacy answers by the tag alone (`isArmOf` from rank 0,
 // no staged receiver, `isVariantTagPlain`), over a plain read (`isBoxGuardPlain`).
 function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if isTestsStorage(n.isObj, ibFnIx) { return storedBoxTest(b, n, ix, rep) }
   if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
     return irBMiss("is staged")
   }
-  if isArmOf(ix, ibFnIx, 0, false) != "variant" { return irBMiss("is rung") }
+  const arm = isArmOf(ix, ibFnIx, 0, false)
+  if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
-  const vi = isVariantTagPlain(ix, ibFnIx)
-  if vi < 0 { return irBMiss("is variant shape") }
   if rep != ibBool { return irBMiss("is result rep") }
+  const tag = boxTestTagOf(n, ix, arm)
+  if ibMiss != "" { return irBMiss(ibMiss) }
   const v = irBExpr(b, n.isObj)
   if ibMiss != "" { return v }
-  if !(repNodeAt(irBOpRep(v)) is RBox) { return irBMiss("is operand rep") }
-  return irBLetTemp(b, { teV: v, teTarget: vi }, ix, rep)
+  if !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v)) {
+    return irBMiss("is operand rep")
+  }
+  return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
+// mode, where its read is the declared box: a plain variant row's tag or the arm-tag test, over the
+// raw slot of a local box.
+function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const mark = storageReadEnter(n.isObj)
+  const arm = if n.isFit < 0 && isRecvStageRep(ix, ibFnIx) < 0 { isArmOf(ix, ibFnIx, 0, false) } else { "notIs" }
+  const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
+  const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
+  const tag = if ta == "identBox" { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
+  storageReadLeave(mark)
+  if arm != "armTag" && arm != "variant" { return irBMiss("is storage rung") }
+  if arm == "variant" && tag < 0 { return irBMiss("is variant shape") }
+  if arm == "armTag" && (ta != "identBox" || tag < 0) {
+    return irBMiss("is arm tag " + ta)
+  }
+  const v = rawBoxVar(unwrapParen(n.isObj))
+  if v < 0 { return irBMiss("is box not a local") }
+  const o: Opnd = { ov: v }
+  return irBLetTemp(b, { teV: o, teTag: tag }, ix, rep)
+}
+
+// The variable holding local box `r` in legacy's live slot, read raw past any narrowing, or -1.
+function rawBoxVar(r: i32): i32 {
+  const d = identDeclOf(r)
+  const w = localIndexOf(ibFnIx, r)
+  if d < 0 || w < 0 || !(nodeAt(r) is Ident) { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) && !(dn is Param) { return -1 }
+  const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+  if (
+    v < 0
+    || ib.irVars[v].vSlot != w
+    || !(repNodeAt(ib.irVars[v].vRep) is RBox)
+  ) {
+    return -1
+  }
+  return v
+}
+
+// The tag box test `ix` compares at rung `arm`: a plain variant row's, or the pattern's arm tag
+// over a local box read raw (`tagIsArmOf`'s `identBox`). `tagAbsent` is a constant legacy reads
+// back off its bytes (`staticIsGuard`); only a statement `if` builds it (`isDecidedFalse`).
+function boxTestTagOf(n: IsExpr, ix: i32, arm: IsArm): i32 {
+  if arm == "variant" {
+    const vi = isVariantTagPlain(ix, ibFnIx)
+    if vi < 0 || vi >= uTags.length {
+      irBMiss("is variant shape")
+      return 0
+    }
+    return uTags[vi]
+  }
+  const ta = tagIsArmOf(ix, n, ibFnIx)
+  if ta != "identBox" {
+    irBMiss("is arm tag " + ta)
+    return 0
+  }
+  if localIndexOf(ibFnIx, unwrapParen(n.isObj)) < 0 {
+    irBMiss("is box not a local")
+    return 0
+  }
+  return isArmTagOf(ix, n, ibFnIx)
 }
 
 // Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
@@ -1448,8 +1524,8 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
 // An `==`/`!=` with an atom operand, by legacy's own arm (`atomEqPlanOf`). A side typed as one
-// string literal is written by legacy's literal writer (an unread immediate here); only a `StrLit`
-// spelling is taken, since anything else it would evaluate with legacy's expression writer.
+// string literal is its member's id: a `StrLit` spelling is an unread immediate here, anything
+// else is built and dropped by the lowering, in source order.
 function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = atomEqPlanOf(n, ibFnIx)
   const ne = n.binOp == "!="
@@ -1458,15 +1534,16 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if p.aqArm == "fold" { return irBMiss("atom compare fold") }
   if p.aqArm == "static" {
     const sIx = if p.aqStaticLeft { n.binLeft } else { n.binRight }
-    if !(nodeAt(unwrapParen(sIx)) is StrLit) {
-      return irBMiss("atom compare static operand")
-    }
     const aIx = if p.aqStaticLeft { n.binRight } else { n.binLeft }
+    const sl = if p.aqStaticLeft { staticSideOf(b, sIx) } else { none }
+    if ibMiss != "" { return sl }
     const a = atomSide(b, aIx)
     if ibMiss != "" { return a }
+    const sr = if p.aqStaticLeft { none } else { staticSideOf(b, sIx) }
+    if ibMiss != "" { return sr }
     const st = if p.aqStaticLeft { 1 } else { 2 }
-    const l = if p.aqStaticLeft { none } else { a }
-    const r = if p.aqStaticLeft { a } else { none }
+    const l = if p.aqStaticLeft { sl } else { a }
+    const r = if p.aqStaticLeft { a } else { sr }
     return irBLetTemp(
       b,
       { aeL: l, aeR: r, aeStatic: st, aeNe: ne, aeAt: ix },
@@ -1485,6 +1562,19 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     ix,
     rep,
   )
+}
+
+// The operand of static side `ix`: the unread immediate of a `StrLit`, else its value, which the
+// lowering drops.
+function staticSideOf(b: i32[], ix: i32): Opnd {
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if nodeAt(unwrapParen(ix)) is StrLit { return none }
+  const v = irBExpr(b, ix)
+  if ibMiss != "" { return v }
+  if v is OImm || irBOpRep(v) == ibNoValue {
+    return irBMiss("atom compare static operand")
+  }
+  return v
 }
 
 // The value of atom operand `ix`, which must build at an atom rep or its `K | null`.
@@ -1909,25 +1999,11 @@ function loopIx(label: string): i32 {
   return -1
 }
 
-// The label a plain walk holds on the loop stack: legacy's loop owns its branches, so none
-// the IR builds may target it or cross it.
-const WALK_LABEL = -2
-
-// Whether a branch to loop stack entry `l` targets a walk or crosses one.
-function crossesWalk(l: i32): boolean {
-  let i = l
-  while i < ibLoopBrk.length {
-    if ibLoopBrk[i] == WALK_LABEL { return true }
-    i = i + 1
-  }
-  return false
-}
-
-// A `for` statement along legacy's plain walk (`forInPlainWhy`): the list once, its element
-// variable at the declared slot, and the body. Every other walk is a named miss.
+// A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
+// once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const why = forInPlainWhy(n, ix, ibFnIx)
-  if why != "" { return skip("for in " + why) }
+  if why != "" && why != "hoisted" { return skip("for in " + why) }
   const l = irBExpr(b, n.fiIter)
   if ibMiss != "" { return 0 }
   // A list walks its elements; a string its code points, each an i32.
@@ -1940,9 +2016,11 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if er < 0 { return skip("for in operand coercion") }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
+  const brk = labelNew()
+  const cont = labelNew()
   ibLoopName.push(n.fiLabel)
-  ibLoopBrk.push(WALK_LABEL)
-  ibLoopCont.push(WALK_LABEL)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(cont)
   const fb: i32[] = []
   const body = nodeAt(n.fiBody)
   if body is Block {
@@ -1954,7 +2032,13 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   ibLoopBrk.pop()
   ibLoopCont.pop()
   if ibMiss != "" { return 0 }
-  irBNode(b, { xfList: l, xfVar: v, xfBody: fb, xfAt: ix }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { xfList: l, xfVar: v, xfBody: fb, xfAt: ix, xfBrk: brk, xfCont: cont },
+    -1,
+    ibNoValue,
+    ix,
+  )
   return 0
 }
 
@@ -2020,10 +2104,14 @@ function ifChain(b: i32[], ix: i32) {
   while true {
     const n = nodeAt(cur)
     if !(n is IfStmt) { return skip("condition") }
-    const c = irBExpr(out, n.ifCond)
+    // A decided `is` guard: legacy reads its constant back and writes no then arm (D932). A
+    // tag the box lacks is never a covering test, so the arm is not one legacy writes dead.
+    const decided = isDecidedFalse(n.ifCond, ibFnIx)
+    const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+    const c = if decided { no } else { irBExpr(out, n.ifCond) }
     if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
     const th = nodeAt(n.ifThen)
-    const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
+    const thenB = if decided { [] } else if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
     links.push(cur)
     outs.push(out)
     conds.push(c)
@@ -2127,7 +2215,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
     if l < 0 || n.brkHasVal != 0 { return skip("break") }
-    if crossesWalk(l) { return skip("for in break") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,
@@ -2141,7 +2228,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is ContinueStmt {
     const l = loopIx(n.contLabel)
     if l < 0 { return skip("continue") }
-    if crossesWalk(l) { return skip("for in continue") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,
