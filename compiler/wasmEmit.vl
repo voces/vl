@@ -30222,6 +30222,9 @@ let mapSetDidPark = false
 function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   asgParkedSlot = -1
   asgParkedRef = false
+  // Inside `is K[]` a store through a box of list arms writes the arm the box holds (D17002).
+  const armW = emitArmIndexWrite(fnIx, a, target)
+  if armW != 0 { return if armW < 0 { -1 } else { 0 } }
   // G8: a map store `m[k] = v` — scan for `k`; overwrite `vals[hit]` on a hit, else
   // append `keys.push(k); vals.push(v)`. Checked BEFORE the list path (a map index
   // is not an array index).
@@ -40757,6 +40760,67 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   return emitFail(
     "emitProgram: a list arm's element has no conversion to the literal set read",
   )
+}
+
+// `recv[i] = v` through a union-of-lists box a pin or an `is K[]` arm left unrewritten: per list
+// arm, the store lowers with `recv` overridden to that arm, its value converted to the arm's
+// element as any store converts it. 0 when `target` is no such store, 1 when emitted.
+function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
+  const recv = unwrapParen(target.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) { return 0 }
+  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return 0 }
+  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  if arms.length == 0 { return 0 }
+  if emitArmIndexWriteAt(fnIx, a, target, recv, arms, 0) < 0 { return -1 }
+  asgParkedSlot = -1
+  return 1
+}
+
+function emitArmIndexWriteAt(
+  fnIx: i32,
+  a: BinExpr,
+  target: Index,
+  recv: i32,
+  arms: i32[],
+  i: i32,
+): i32 {
+  if i >= arms.length {
+    fbUnreachable()
+    return 0
+  }
+  const m = arms[i]
+  const t = listIsArmTag(m)
+  const heap = armHeapOf(m)
+  const loc = armWrapLocal(m)
+  if t < 0 || heap < 0 || loc < 0 {
+    return emitFail(
+      "emitProgram: a union-of-lists arm has no wrapper to store through",
+    )
+  }
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, t)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)
+  if emitExpr(recv, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  const mark = luOvEnter(recv, m)
+  const lmark = luOvLocalEnter(recv, loc)
+  const r = emitAssignIndex(fnIx, a, target)
+  // The arm's own store parks nothing a caller reads: the assignment is a statement here.
+  if asgParkedSlot >= 0 {
+    fbLocalGet(asgParkedSlot)
+    fbDrop()
+  }
+  luOvLocalLeave(lmark)
+  luOvLeave(mark)
+  if r < 0 { return -1 }
+  fbElse()
+  if emitArmIndexWriteAt(fnIx, a, target, recv, arms, i + 1) < 0 { return -1 }
+  fbEnd()
+  return 0
 }
 
 // Arm `i` onward of `emitArmSite`'s tag chain.
