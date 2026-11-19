@@ -190,7 +190,6 @@ import {
   idxStorePlanOf,
   listReserveScan,
   popPlanOf,
-  popStmtPlainWhy,
   pushPlanOf,
 } from "./emit_plan_list"
 import {
@@ -290,7 +289,6 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
-import { strListHas } from "./listutil"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
 let ibArmed = false
@@ -743,15 +741,11 @@ function primRepOfTy(t: i32): i32 {
 }
 
 // `primRepOf` at `exprTyOf`'s type.
-function exprRepOf(ix: i32): i32 {
-  if untypedBoolOp(ix) { return ibBool }
-  return primRepOfTy(exprTyOf(ix))
-}
+function exprRepOf(ix: i32): i32 { return primRepOfTy(exprTyOf(ix)) }
 
-// `ix`'s type: `boolean` for an untyped boolean operator (`untypedBoolOp`), its callee's result
-// for an untyped call of a declaration (an operator a generic instance rewrote to its overload).
+// `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
+// instance rewrote to its overload), else its recorded type.
 function exprTyOf(ix: i32): i32 {
-  if untypedBoolOp(ix) { return TY_BOOL }
   const t = nodeTyAt(ix, ibFnIx)
   if t >= 0 { return t }
   const n = nodeAt(ix)
@@ -767,17 +761,6 @@ function exprTyOf(ix: i32): i32 {
   }
   return t
 }
-
-// Whether `ix` is a compare or a logical operator no check recorded a type for: the `match`
-// lowering writes its arm tests (`==`, joined by `||`) after the check.
-function untypedBoolOp(ix: i32): boolean {
-  if nodeTyAt(ix, ibFnIx) >= 0 { return false }
-  const n = nodeAt(ix)
-  if n is BinExpr { return strListHas(BOOL_OPS, n.binOp) }
-  return false
-}
-
-const BOOL_OPS = ["==", "!=", "<", "<=", ">", ">=", "&&", "||"]
 
 export function irBOpRep(o: Opnd): i32 {
   return match o {
@@ -1522,6 +1505,9 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   ) {
     return pushRhs(b, c, m, ix)
   }
+  if m.memProp == "pop" && c.callArgs.length == 0 {
+    return popValueRhs(b, m, ix)
+  }
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
     return mapHasRhs(b, c, m, ix)
   }
@@ -1677,13 +1663,24 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   return 0
 }
 
-// A `.pop()` statement legacy writes as its checked take-and-drop (`popStmtPlainWhy`).
+// A `.pop()` at a value position over an i32 or scalar list (`popPlanOf`): its receiver, then
+// legacy's scalar pop tail (`popScalarTail`). A ref or string list is legacy's.
+function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
+  if popPlanOf(ix, ibFnIx) == null { return missRhs("method pop") }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return missRhs("pop operand coercion")
+  }
+  const r: Rhs = { lqV: v, lqAt: ix }
+  return r
+}
+
+// A `.pop()` statement over an i32 or scalar list (`popPlanOf`), through legacy's scalar pop tail.
 function popStmt(b: i32[], c: Call, ix: i32) {
   const pq = popPlanOf(ix, ibFnIx)
   // No plan is a ref or string list, which legacy pops checked as a ref.
   if pq == null { return skip("pop ref element") }
-  const why = popStmtPlainWhy(pq, ix, ibFnIx)
-  if why != "" { return skip(why) }
   if c.callFn < 0 || c.callFn >= P.nodes.length { return skip("pop callee") }
   const f = nodeAt(c.callFn)
   if !(f is Member) { return skip("pop callee") }
