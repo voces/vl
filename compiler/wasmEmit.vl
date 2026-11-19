@@ -16003,6 +16003,7 @@ function emitMapPrep(recvIx: i32, keyIx: i32, fnIx: i32) {
 function emitMapPrepFor(recvIx: i32, keyIx: i32, fnIx: i32, needSlot: boolean) {
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   // Pop the stacked pair into the frame only now — user code is done running.
+  if !needSlot { return mapPrepProbeTail() }
   fbLocalSet(cmKeyLocal()) // the target key
   setMapRef()              // mapRef (the shared mono slot, or this mv/i32 frame's)
   return emitMapProbe(false, needSlot)
@@ -16042,11 +16043,14 @@ function defExprNullable(ix: i32) {
 // reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
 // (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
-  const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
-  if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
+  const arm = mapGetOrArmOf(recvIx, defIx, fnIx, rk)
+  if arm == "helper" {
+    const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
+    return emitMapGetCall(recvIx, keyIx, fnIx, miss[0])
+  }
   const wvk = mapRecvScalarKindInst(recvIx, fnIx)
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
-  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+  if arm == "widen" {
     pushMapScr(5)                // entry
     fbIf(valBlockTypeOfKind(rk)) // if (entry != 0 → found), the result's blocktype
     pushMapScalarHit()
@@ -16056,7 +16060,7 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     fbEnd()
     return 0
   }
-  if cmSlot >= 0 {
+  if arm == "mv" {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
     // `(ref null)` slot read, the miss arm from the default, and `ref.as_non_null`
@@ -16129,38 +16133,19 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   // stores null as an i32 sentinel in the mono vals slot (`-1` litunion atom, `2`
   // boolean): a missing key and the stored sentinel both read as null, and `??`
   // coalesces on that — read the raw i32 and default when it equals the sentinel.
-  let nulSentinel = 0
-  let hasSentinel = false
-  const orMt = mapRecvTyIn(recvIx, fnIx)
-  if mapTyValIsNulLitUnion(orMt) {
-    nulSentinel = 0 - 1
-    hasSentinel = true
-  } else if mapTyValIsNulBool(orMt) || mapTyValIsNullUnit(orMt) {
-    nulSentinel = 2
-    hasSentinel = true
+  if arm == "scalarBox" {
+    return emitMapGetOrScalarBox(
+      mapRecvScalarBoxKindIn(recvIx, fnIx),
+      defIx,
+      fnIx,
+    )
   }
-  if !hasSentinel {
-    if defExprNullable(defIx) {
-      // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
-      const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
-      if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
-        return emitMapGetOrScalarBox(mbk, defIx, fnIx)
-      }
-    }
-    // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
-    pushMapScr(5)         // entry
-    fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
-    pushMapVals()
-    fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
-    pushMapScr(5)         // entry
-    fbI32Const(1)
-    fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
-    fbArrayGet(aTy())     // array.get
-    fbElse()              // else
+  if arm == "i32" {
+    mapGetOrI32Head()
     if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
-    fbEnd()               // end (if)
-    return 0
+    return mapGetOrI32Tail()
   }
+  const nulSentinel = mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx))
   // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
   pushMapScr(5)           // entry
   fbIf(127)               // if (entry != 0 → found), i32 blocktype
@@ -16184,6 +16169,76 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   pushMapScr(8)
   fbEnd()
   return 0
+}
+
+// How `recvIx[k] ?? defIx` (`rk` the `??`'s atom kind, -1 none) reads its map: through the
+// `__map_get_<row>__` helper, widened to `rk`, at an mv slot's value, as a nullable value boxed or
+// held at its null sentinel, or as the plain `i32` read with the default in its miss arm.
+export type MapGetOrArm = "helper"
+  | "widen"
+  | "mv"
+  | "scalarBox"
+  | "sentinel"
+  | "i32"
+export function mapGetOrArmOf(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+  rk: i32,
+): MapGetOrArm {
+  if mapGetOrHelperRoute(recvIx, defIx, fnIx, rk).length == 1 {
+    return "helper"
+  }
+  const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+    return "widen"
+  }
+  if mapRecvShapeOf(recvIx, fnIx) >= 0 { return "mv" }
+  if mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx)) != 0 { return "sentinel" }
+  if defExprNullable(defIx) {
+    // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
+    const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
+    if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
+      return "scalarBox"
+    }
+  }
+  return "i32"
+}
+
+// The i32 a mono map of type `mt` stores for a null value: `-1` for a nullable literal union, `2`
+// for a nullable boolean or `null`; 0 for a map with no null sentinel.
+function mapGetOrSentinel(mt: i32): i32 {
+  if mapTyValIsNulLitUnion(mt) { return 0 - 1 }
+  if mapTyValIsNulBool(mt) || mapTyValIsNullUnit(mt) { return 2 }
+  return 0
+}
+
+// The plain `i32` read's head after the probe: `if entry != 0 { vals.backing[entry-1] } else`, a
+// value-typed `if`; the default follows, then `mapGetOrI32Tail`.
+export function mapGetOrI32Head() {
+  pushMapScr(5)         // entry
+  fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
+  pushMapVals()
+  fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
+  pushMapScr(5)         // entry
+  fbI32Const(1)
+  fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
+  fbArrayGet(aTy())     // array.get
+  fbElse()              // else
+  return 0
+}
+
+export function mapGetOrI32Tail() {
+  fbEnd()
+  return 0
+}
+
+// A map read's probe after its receiver and key: the key into the frame, then the map ref, then
+// the probe, leaving `entry`; `emitMapPrep`'s tail.
+export function mapPrepProbeTail() {
+  fbLocalSet(cmKeyLocal())
+  setMapRef()
+  return emitMapProbe(false, false)
 }
 
 // Lower `m[k] ?? d` over a boxed value-union map value that includes null: read the box
