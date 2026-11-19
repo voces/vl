@@ -78,7 +78,7 @@ index, in one docs PR.
 A coordinator refresh of `scripts/self-compile-baseline.json` that names no single mechanism gives,
 in its `scripts/self-compile-ledger.txt` line, the cumulative rise since the last owner-ruled
 baseline. Past +3% cumulative, the refresh needs an owner ruling, named in the line. The current
-reference is the 100.73G line (#PRNUM), which the owner ruled on 2026-11-19 (left to the
+reference is the 100.73G line (#9194), which the owner ruled on 2026-11-19 (left to the
 coordinator) at +6.3% on the previous 94.79G reference (#8914). Existing ledger lines are not
 edited.
 
