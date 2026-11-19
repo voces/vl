@@ -12651,6 +12651,34 @@ reader matches the walk (parity) and the gap is a filed row.
 **Why.** Widening changes results; a single picked instance traps at the other signature. Per-signature
 instances are the one answer that matches the direct-binding semantics.
 
+## A container slot called at several signatures holds one instance per signature (2026-11-19, application of D3975 and the maker ruling) — D15900, D16242, D14433
+
+Not a new decision: it applies the owner ruling of 2026-10-15 (D3975) and the per-signature maker
+ruling of 2026-11-16 to a function stored in a list element, record field or map value.
+
+**The rule.** A slot of an un-annotated container whose functions are called at more than one
+signature holds an instance record with one closure per signature, as a reassigned binding does.
+Every write into the slot, through any alias, fills every signature the slot is called at, and each
+call reads its own signature. The signatures are the union of the slot's calls, because the slot
+store is context-insensitive (2026-11-16). The value is never widened to a join, and is never one
+instance picked from two calls.
+
+```vl
+function id(x) { return x }
+const xs = [{ f: id }]
+print(xs[0].f(2))     // 2
+print(xs[0].f(2.5))   // 2.5
+```
+
+**Why.** A binding is a slot, and D3975 already gives a written binding called at several types one
+closure per type. Widening changes results, and a single instance traps at the other signature. A
+refusal would be a capability refusal of a program the design permits. D3975's note that a
+destination with no fixed function type "keeps the emit refusal" described the compiler as it then
+was. That note is not part of the rule.
+
+**Cost.** Only a slot called at two or more signatures changes rep. Each write into it builds one
+closure per signature.
+
 ## Un-annotated code stays more permissive than `<T>` on a write into a literal-union place (2026-11-16, chosen under the owner's delegation) — D3299, D3436
 
 **The rule.** An un-annotated parameter written into a nullable place stays pin-generic (the D3299/D3436
