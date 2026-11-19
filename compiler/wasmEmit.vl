@@ -23876,9 +23876,7 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
 export type RefJoin = { rjKind: VKind | null, rjSlot: i32 }
 
 // The `RefJoin` of a join that is not a reference.
-export function noRefJoin(): RefJoin {
-  return { rjKind: null, rjSlot: -1 }
-}
+export function noRefJoin(): RefJoin { return { rjKind: null, rjSlot: -1 } }
 
 export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
   const destStruct = ifTypedStructRow(ifIx, fnIx)
@@ -24280,7 +24278,13 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
 // How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
 // itself, `recover` the same under `ref.as_non_null`, `nestedIf` an `if` value joined at this
 // rep; `null`, `atomStr` and `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
-export type RefIfArm = "plain" | "recover" | "null" | "atomStr" | "recordCopy" | "nestedIf" | "noValue"
+export type RefIfArm = "plain"
+  | "recover"
+  | "null"
+  | "atomStr"
+  | "recordCopy"
+  | "nestedIf"
+  | "noValue"
 
 // `emitRefIfArm`'s ladder for arm `blockIx` (D1577, D1560, D2100).
 export function refIfArmOf(
@@ -24296,7 +24300,9 @@ export function refIfArmOf(
   if tv < 0 { return "noValue" }
   if ifArmIsValue(tv, fnIx) {
     if nodeAt(unwrapParen(tv)) is NullLit { return "null" }
-    if kind == "struct" && refIfArmNeedsRecordCopy(tv, slot, fnIx) { return "recordCopy" }
+    if kind == "struct" && refIfArmNeedsRecordCopy(tv, slot, fnIx) {
+      return "recordCopy"
+    }
     if kind == "str" && exprIsLitAtom(tv, fnIx) { return "atomStr" }
     if !nulJoin && nulNicheRecoverOwed(kind, tv, fnIx) { return "recover" }
     return "plain"
@@ -24323,7 +24329,9 @@ function emitRefIfArm(
   nulJoin: boolean,
 ) {
   const b = nodeAt(blockIx)
-  if !(b is Block) { return emitFail("emitProgram: if-expression arm is not a block") }
+  if !(b is Block) {
+    return emitFail("emitProgram: if-expression arm is not a block")
+  }
   const arm = refIfArmOf(blockIx, fnIx, kind, slot, nulJoin)
   const tv = ifArmValueExpr(blockIx)
   match arm {
@@ -34685,26 +34693,41 @@ function emitLetInitValue(
   return 0
 }
 
+// The rep `emitLetIfInit` writes a binding's `if` initializer at, in each arm: 0 the union box
+// of `nulTy` (D969: an un-annotated binding boxes too), 1 `string | null`, 2 `boolean | null`; -1
+// when the binding takes the plain path. `slotKind` is the binding's local's kind.
+export function letIfInitRep(slotKind: VKind, nulTy: i32): i32 {
+  return match slotKind {
+    "union" => if boxTyName(nulTy) != "" { 0 } else { -1 }
+    "nulstr" => 1
+    "nulbool" => 2
+    "i32" | "struct" | "list" | "str" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => -1
+  }
+}
+
+// The type `emitLetIfInit` names a binding's union by: its annotation, else its joined `if`.
+function letIfInitTy(s: LetDecl, fnIx: i32): i32 {
+  if s.letType >= 0 { return nodeTyIxOf(s.letType) }
+  return nodeTyAt(s.letInit, fnIx)
+}
+
+// Whether the declaration at `declIx` is a binding whose `if` initializer legacy writes in each
+// arm (`emitLetIfInit`), rather than as one value.
+export function letIfInitPerArm(declIx: i32, fnIx: i32): boolean {
+  const s = nodeAt(declIx)
+  if !(s is LetDecl) || !exprIsIfStmt(s.letInit) { return false }
+  const slot = declaredSlotOfDecl(declIx)
+  if slot < 0 || slot >= localIsRef.length { return false }
+  return letIfInitRep(localIsRef[slot], letIfInitTy(s, fnIx)) >= 0
+}
+
 // A `let` whose init is an `if` over a nullable or value-union cell, written into local
 // `idx` by each arm. Returns 0 once bound, 1 when the cell's rep takes no such lowering, and
 // -1 on a failure.
 function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
-  const slotKind = localIsRef[slot]
-  let nulRep = -1
-  let nulNm = ""
-  // The binding's union type: its annotation, else the joined `if` it is initialised by.
-  let nulTy = nodeTyAt(s.letInit, fnIx)
-  if s.letType >= 0 { nulTy = nodeTyIxOf(s.letType) }
-  if slotKind == "union" {
-    // The box is named by the binding's union type, annotated or joined (D969: an
-    // un-annotated binding boxes too, rather than fall to a scalar join over two ref arms).
-    nulNm = boxTyName(nulTy)
-    if nulNm != "" { nulRep = 0 }
-  } else if slotKind == "nulstr" {
-    nulRep = 1
-  } else if slotKind == "nulbool" {
-    nulRep = 2
-  }
+  const nulTy = letIfInitTy(s, fnIx)
+  const nulRep = letIfInitRep(localIsRef[slot], nulTy)
+  const nulNm = if nulRep == 0 { boxTyName(nulTy) } else { "" }
   if nulRep >= 0 {
     // the binding sink: with every arm writing the shared pair and ONE `struct.new`
     // after the `if`, the arms' construction sites collapse to that one — and the

@@ -89,6 +89,7 @@ import {
   IsArm,
   ObjLitArm,
   PrintArm,
+  RefJoin,
   TagIsArm,
   arrLitShort,
   atomEqPlanOf,
@@ -115,9 +116,6 @@ import {
   idxStorePlainWhy,
   ifExprPlainWhy,
   ifRefJoinOf,
-  RefJoin,
-  refIfArmOf,
-  strJoinDropsNulAtom,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -130,6 +128,7 @@ import {
   isVariantTagPlain,
   keptDeclStoresNothing,
   legacyContextLiveWhy,
+  letIfInitPerArm,
   lowMemFoldsCallee,
   mapFilterWhy,
   mapGetOrHelperRoute,
@@ -154,11 +153,13 @@ import {
   objLitVariantLayoutOf,
   printArmOf,
   pushPlainWhy,
+  refIfArmOf,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
   stmtWritesNothing,
   strCatPartsOf,
+  strJoinDropsNulAtom,
   strLitTakesAtom,
   structFieldArmOf,
   tagIsArmOf,
@@ -251,6 +252,7 @@ import {
   lastStmtIsValueIf,
 } from "./emit_fn_scans"
 import {
+  VKind,
   cloLiftWriteCount,
   fRecRetTy,
   fRetVoid,
@@ -269,7 +271,6 @@ import {
   uFieldCount,
   uFieldStart,
   uTags,
-  VKind,
 } from "./emit_state"
 import {
   cloSigPosOfKey,
@@ -990,13 +991,19 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   if kind != "str" && kind != "list" && kind != "strlist" && kind != "reflist" {
     return irBMiss("expression if ref " + kind)
   }
-  if n.ifElse < 0 || nodeAt(n.ifElse) is IfStmt { return irBMiss("ref if chain") }
+  if n.ifElse < 0 || nodeAt(n.ifElse) is IfStmt {
+    return irBMiss("ref if chain")
+  }
   if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
-  if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) { return irBMiss("ref if drops null atom") }
+  if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
+    return irBMiss("ref if drops null atom")
+  }
   if endsInTemp(b) { return irBMiss("if after an operand") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
-  if c is OImm && condIsTest(n.ifCond) { return irBMiss("decided is condition") }
+  if c is OImm && condIsTest(n.ifCond) {
+    return irBMiss("decided is condition")
+  }
   const ty = nodeTyAt(ix, ibFnIx)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
@@ -1017,7 +1024,14 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
 }
 
 // One arm of `ifRefExpr`: its value as itself at `rep`, written to out `t`.
-function refIfArm(blockIx: i32, t: i32, rep: i32, kind: VKind, slot: i32, nul: boolean): i32[] {
+function refIfArm(
+  blockIx: i32,
+  t: i32,
+  rep: i32,
+  kind: VKind,
+  slot: i32,
+  nul: boolean,
+): i32[] {
   const body: i32[] = []
   const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
   if arm != "plain" {
@@ -1624,8 +1638,14 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   if arm == "nulAtom" && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != "" {
     return skip("print nulAtom from a box")
   }
+  const from = b.length
   const v = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return 0 }
+  // Legacy opens a nullable string's print blocks before its operand, so a valued `if` in it
+  // would sit above them.
+  if want == "nulStr" && ifBelowLead(b, from, "print nulStr of a valued if") {
+    return 0
+  }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
   let ok = p != null && p == want
@@ -2437,7 +2457,9 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
     const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
-    if args.length > 0 && ifBelowLead(b, from, "string operand after another") { return 0 }
+    if args.length > 0 && ifBelowLead(b, from, "string operand after another") {
+      return 0
+    }
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
     args.push(a)
     i = i + 1
@@ -2757,6 +2779,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pos >= 0 && listReserveScan(n, sibs, pos, ibFnIx) != null {
       return skip("declaration list reserve")
     }
+    // Legacy writes a nullable or union binding's `if` initializer in each arm.
+    if letIfInitPerArm(ix, ibFnIx) { return skip("declaration if per arm") }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep {
