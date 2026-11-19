@@ -22,4 +22,8 @@ leaves are the list elements, and every arm's list holds the join's ids.
   the mixed-storage arms in both orders (master refused both), returned, and beside a set-list record
   of the same shape.
 - `check-filed-witnesses --strict`: 5,521 graded, 0 moved; D15303 runs as filed.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,767 programs: 2 movers, 0 output movers.
+  - The new fixture: RC 1 → 0.
+  - `closures/tail-join-of-lists-of-hole-fn-records.vl`, wasm only: 669 → 615 bytes, 7 → 5 functions,
+    no closure table, output matching `@log`. Its tail join's arm sets are now decided with the join,
+    as ids.
