@@ -33,3 +33,10 @@ the trap reason, `emitMapPlaceEntry`, the five `mapCompact*` steps and `fbMapSlo
   identical wasm and identical output.
 - `tests/cases` and the distilled cells against the master seed: see the PR body.
 - Lines, compiler only: +637 / −939. The bodies are about 0.6× the hand lines they replace.
+
+## Not in this step
+- G (scalar and record list views), H (struct compare, waiting on IR4), and the exit-form mover.
+- Relocation stays unarmed. The door's copies (`framed`, shared with claimed user functions)
+  carry relocation rows through `wBytes`, so arming changes what those functions' rows do too.
+  The arming PR proves both a claimed user function with a relocated constant and a helper with
+  `RRel` (step 2).
