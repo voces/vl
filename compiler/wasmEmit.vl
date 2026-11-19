@@ -26991,6 +26991,10 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
   if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
   const callee = nodeAt(c.callFn)
+  if callee is Member {
+    if !fieldCallRefPlainHead(callIx, c, callee, fnIx) { return "" }
+    return callRefPlainTail(callIx, c, fnIx)
+  }
   if !(callee is Ident) { return "" }
   const nm = callee.identName
   const d = identDeclOf(c.callFn)
@@ -27019,6 +27023,22 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   ) {
     return ""
   }
+  return callRefPlainTail(callIx, c, fnIx)
+}
+
+// `callRefPlainKey`'s head for a function-valued field of a record, `o.f(…)`, which legacy's
+// `emitCallCore` sends to `emitCallRef` with no name dispatch: no bundle and no held record.
+function fieldCallRefPlainHead(callIx: i32, c: Call, m: Member, fnIx: i32): boolean {
+  return exprIsClosure(c.callFn, fnIx)
+    && exprStruct(m.memObj, fnIx)
+    && bundleParamOfRead(c.callFn, fnIx) < 0
+    && placeRecordSigs(callIx, fnIx).length == 0
+}
+
+// The part of `callRefPlainKey` every callee shares: no lift, nullable value or top-level
+// lambda's record, an interned key, no refusal, and each argument a scalar at its parameter's
+// own valtype.
+function callRefPlainTail(callIx: i32, c: Call, fnIx: i32): string {
   if cloLiftCalleeOf(c.callFn, fnIx) >= 0 || exprNulClosure(c.callFn, fnIx) {
     return ""
   }
@@ -27064,11 +27084,22 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   return ckey
 }
 
+// Whether a statement calling function-valued field `m` (call `ix`) leaves nothing to drop: the
+// call's key returns nothing, or, unless the call's type is closed, the field's function is void.
+function fieldCallStmtVoid(ix: i32, m: Member, fnIx: i32): boolean {
+  if sigKeyRetIsVoid(cloCallSigKey(ix, fnIx)) { return true }
+  if callTyClosedIn(ix, fnIx) { return false }
+  const fe = fieldClosureFeOfRecv(m.memObj, m.memProp, fnIx)
+  return fe >= 0 && fRetVoid[fe] == 1
+}
+
 // Whether a statement of plain closure call `ix` (`callRefPlainKey`) leaves nothing to drop: its
 // key or its callee's read returns nothing, as `emitCallStmtIdent` asks.
 export function callRefPlainVoid(ix: i32, fnIx: i32): boolean {
   const c = nodeAt(ix)
   if !(c is Call) { return false }
+  const f = if c.callFn >= 0 { nodeAt(c.callFn) } else { null }
+  if f is Member { return fieldCallStmtVoid(ix, f, fnIx) }
   return sigKeyRetVoid(cloCallSigKey(ix, fnIx))
     || calleeReturnsVoidOfRead(unwrapParen(c.callFn), fnIx)
 }
@@ -32690,14 +32721,7 @@ function emitCallStmt(s: Call, stmtIx: i32, fnIx: i32) {
       // key leaves nothing on the stack, so dropping is invalid wasm regardless of the
       // field's rep function. Asked first, since the rep-function fallback is wrong
       // exactly when the two disagree.
-      let mcVoid = sigKeyRetIsVoid(cloCallSigKey(stmtIx, fnIx))
-      if !mcVoid && !callTyClosedIn(stmtIx, fnIx) {
-        const mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if mcFe >= 0 {
-          if fRetVoid[mcFe] == 1 { mcVoid = true }
-        }
-      }
-      if !mcVoid {
+      if !fieldCallStmtVoid(stmtIx, callee, fnIx) {
         fbDrop() // 0x1a drop (discard the unused result)
       }
       return 0
