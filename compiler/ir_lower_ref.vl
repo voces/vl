@@ -6,7 +6,9 @@ import { mfCallbackLocal } from "./emit_union_casts"
 // `idxArmOf`); a bounds check lowers as nothing, fused into the read after it (rule 8). Scratch
 // slots come from the shared lazy list frame, and a loop opens legacy's header hoists.
 
-import { BinExpr, Index, Member, WhileStmt, nodeAt } from "./ast"
+import { fbRefAsNonNull } from "./emit_bytes"
+import { BinExpr, Call, Index, Member, P, WhileStmt, nodeAt } from "./ast"
+import { fbDrop } from "./emit_bytes"
 import {
   OImm,
   RListEq,
@@ -14,6 +16,7 @@ import {
   RListLen,
   RListPop,
   RListPush,
+  RListSlice,
   RMapFilter,
   RStrOp,
   Rhs,
@@ -32,10 +35,11 @@ import {
 import {
   arrLenHoistOf,
   arrLenTail,
+  arrSlicePlanOf,
+  arrSliceTail,
   emitArrLenHeld,
   emitClosureValue,
   emitEqNonNullCore,
-  emitEqRecoverNarrowed,
   fcpBackingTail,
   fcpLenTail,
   fromCpTail,
@@ -47,11 +51,14 @@ import {
   listEqOperandTail,
   listEqTail,
   listOpRecvHeld,
+  listOpStageBase,
   loopHoistClose,
   mapFilterPlanOf,
   mfLoopTail,
   mfRecvTail,
-  popDropTail,
+  popAnyPlanOf,
+  popRefTail,
+  popScalarTail,
   pushAppendTail,
   pushValueTail,
   rawStrGetTail,
@@ -61,6 +68,7 @@ import {
   scalarListGetTail,
   scalarListHoistOf,
   scalarListUsed,
+  sliceRecvTail,
   stageListRecvTail,
   strAccAppendTail,
   strCatTail,
@@ -72,6 +80,7 @@ import {
   strEqLitTail,
   strEqNegTail,
   strInPlaceMode,
+  strIndexOfTail,
   strListGetTail,
   strListHoistOf,
   strOrderTail,
@@ -79,7 +88,8 @@ import {
   strSliceTail,
   svDstOfKind,
 } from "./wasmEmit"
-import { idxStorePlanOf, popPlanOf, pushPlanOf } from "./emit_plan_list"
+import { eqOperandRecovers } from "./emit_plan_union"
+import { idxStorePlanOf, pushPlanOf } from "./emit_plan_list"
 import { scalarListElemKind } from "./emit_value_sites"
 import { exprNullableRefArray, refListSlotOfExpr } from "./emit_classify"
 import { rvMayView } from "./emit_rep"
@@ -121,7 +131,9 @@ function lowerList(r: Rhs): i32 {
   if r is RStrOp { return lowerStr(r) }
   if r is RListEq { return lowerListEq(r) }
   if r is RListPush { return lowerPush(r, true) }
+  if r is RListPop { return lowerPop(r, true) }
   if r is RMapFilter { return lowerMapFilter(r) }
+  if r is RListSlice { return lowerListSlice(r) }
   if !(r is RListGet) { return irLMiss("list rhs") }
   const from = irLAt()
   const got = lowerGet(r)
@@ -136,7 +148,7 @@ function lowerGet(r: RListGet): i32 {
   const fnIx = irLFn().irAt
   const arm = idxArmOf(nd, fnIx)
   if arm == "string" {
-    const sz = rawStrHoistOf(nd)
+    const sz = rawStrHoistOf(nd.idxArr)
     if sz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
     irLOpnd(r.lgIx)
     return rawStrGetTail(sz)
@@ -199,10 +211,11 @@ export function irLowerRefListSet(n: SListSet, at: i32): i32 {
   return 0
 }
 
-// `RListPop`: the receiver held or staged as for a push, then legacy's checked take-and-drop.
-function lowerPop(r: RListPop): i32 {
+// `RListPop`: the receiver held or staged as for a push, then legacy's scalar or ref pop tail, at a
+// value position when `want`.
+function lowerPop(r: RListPop, want: boolean): i32 {
   const fnIx = irLFn().irAt
-  const pq = popPlanOf(r.lqAt, fnIx)
+  const pq = popAnyPlanOf(r.lqAt, fnIx)
   if pq == null { return irLMiss("pop plan") }
   let lIdx = listOpRecvHeld(pq.pqRecv, fnIx, ".pop")
   if lIdx == -2 { return irLMiss("pop receiver") }
@@ -210,17 +223,21 @@ function lowerPop(r: RListPop): i32 {
     irLSkip(r.lqV)
   } else {
     irLOpnd(r.lqV)
-    stageListRecvTail(pq.pqRecv, fnIx, pq.pqBase)
-    lIdx = pq.pqBase + 3
+    const sb = listOpStageBase(pq.pqBase, pq.pqRefSlot)
+    stageListRecvTail(pq.pqRecv, fnIx, sb)
+    lIdx = sb + 3
   }
-  popDropTail(lIdx, pq.pqWrap, pq.pqBack)
+  // A statement drops what the tail left, as legacy's statement caller does.
+  const got = if pq.pqElemRef { popRefTail(r.lqAt, lIdx, pq.pqWrap, pq.pqBack, -1, pq.pqRefSlot, fnIx) } else { popScalarTail(r.lqAt, pq.pqRecv, lIdx, pq.pqWrap, pq.pqBack, -1, want, fnIx) }
+  if got < 0 { return -1 }
+  if !want && got == 0 { fbDrop() }
   return 0
 }
 
 // A list op in statement position.
 export function irLowerRefEffect(r: Rhs): i32 {
   if r is RListPush { return lowerPush(r, false) }
-  if r is RListPop { return lowerPop(r) }
+  if r is RListPop { return lowerPop(r, false) }
   if r is RStrOp && r.soOp == "acc" { return lowerStr(r) }
   return irLMiss("effect outside I1")
 }
@@ -236,6 +253,17 @@ function lowerMapFilter(r: RMapFilter): i32 {
   mfRecvTail(p, fnIx)
   if r.hfC is OImm { emitClosureValue(p.mfCbFe, fnIx) } else { irLOpnd(r.hfC) }
   return mfLoopTail(p, cL)
+}
+
+// `RListSlice`: legacy's plan, the receiver and its tail, the bounds, then legacy's copy.
+function lowerListSlice(r: RListSlice): i32 {
+  const fnIx = irLFn().irAt
+  const p = arrSlicePlanOf(r.scAt, fnIx)
+  if p.slFail != "" { return irLMiss("slice plan") }
+  irLOpnd(r.scV)
+  sliceRecvTail(p, fnIx)
+  for a in r.scArgs { irLOpnd(a) }
+  return arrSliceTail(p)
 }
 
 // `RListEq`: each list and its own recovery, then legacy's list compare.
@@ -257,12 +285,19 @@ function siteTail(r: RStrOp, fnIx: i32): i32 {
   return strSiteCatTail(r.soArgs.length, mode, r.soAt)
 }
 
+// The live loop hoist holding the header of method call `c`'s string receiver, or -1.
+function strCallHoistOf(c: Call): i32 {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const m = nodeAt(c.callFn)
+  return if m is Member { rawStrHoistOf(m.memObj) } else { -1 }
+}
+
 // `RStrOp`: its operands, then legacy's operator tail. An equality operand is recovered after
 // it is pushed, as legacy recovers a narrowed nullable read.
 function lowerStr(r: RStrOp): i32 {
   const e = nodeAt(r.soAt)
   const fnIx = irLFn().irAt
-  if r.soOp != "eq" {
+  if r.soOp != "eq" && r.soOp != "charcode" {
     for a in r.soArgs { irLOpnd(a) }
   }
   return match r.soOp {
@@ -271,6 +306,8 @@ function lowerStr(r: RStrOp): i32 {
     "acc" => if strInPlaceMode(r.soAt, fnIx) < 0 { strAccAppendTail(r.soAt, fnIx) } else { irLMiss("string accumulator") }
     "slice" => strSliceTail()
     "cplen" => strCpLenTail()
+    "indexof" => strIndexOfTail(false)
+    "includes" => strIndexOfTail(true)
     "lt" => if e is BinExpr { strOrderTail(e) } else { irLMiss("string operator node") }
     "eq" => {
       if !(e is BinExpr) || r.soArgs.length != 2 {
@@ -278,7 +315,7 @@ function lowerStr(r: RStrOp): i32 {
       }
       const lit = strEqLitOf(r.soAt, fnIx)
       irLOpnd(r.soArgs[0])
-      emitEqRecoverNarrowed(strEqFirstOf(e, lit), fnIx)
+      if eqOperandRecovers(strEqFirstOf(e, lit), fnIx) { fbRefAsNonNull() }
       if lit >= 0 {
         // The literal is the IR's operand, written where its form takes it, or never.
         const f = strEqLitForm(lit)
@@ -291,7 +328,7 @@ function lowerStr(r: RStrOp): i32 {
         strEqLitTail(f)
       } else {
         irLOpnd(r.soArgs[1])
-        emitEqRecoverNarrowed(e.binRight, fnIx)
+        if eqOperandRecovers(e.binRight, fnIx) { fbRefAsNonNull() }
         emitEqNonNullCore(r.soAt, fnIx)
       }
       strEqNegTail(e)
@@ -301,6 +338,13 @@ function lowerStr(r: RStrOp): i32 {
       fcpBackingTail()
       irLOpnd(r.soArgs[0])
       fcpLenTail()
+    }
+    "charcode" => {
+      // A receiver a live loop hoist holds is consumed without being written, as `s[i]`'s is.
+      const hz = if e is Call { strCallHoistOf(e) } else { -1 }
+      if hz >= 0 { irLSkip(r.soArgs[0]) } else { irLOpnd(r.soArgs[0]) }
+      irLOpnd(r.soArgs[1])
+      rawStrGetTail(hz)
     }
     "len" | "at" => irLMiss("string operator " + r.soOp)
   }

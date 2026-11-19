@@ -876,13 +876,23 @@ with what legacy decides at the same node.
 
 **Before the first non-shadow caller of `irLowerNodeIn`, the door must miss ("legacy context
 live") unless each of these is at its resting value:**
-- the coercion seats, all six named above: `numSeat`, `coerceHeld`, `boxSeat`, `armSeat`, `armServed`, `atomSeat`;
+- the coercion seats: `coerceHeld`, `boxSeat`, `armSeat`, `armServed`, `atomSeat` (`numSeat` no
+  longer exists);
 - storage-read mode (`storageReadEnter` without its `storageReadLeave`);
-- the narrowing frames legacy pushes around a guarded arm;
-- the loop-hoist frames (`lhOpen`) and the lazy list frame;
-- the union-sink pair.
+- the narrowing frames legacy pushes around a guarded arm (`knownArmDecl`), and the staged `is`
+  receiver (`isRecvStagedIx`);
+- the loop-hoist frames (`lhOpen`) and the lazy list frame's ambient part: the list-get operand
+  staging, the list fit stand-in, and any open list-build region (`lbEnd`);
+- the push receiver cast (`listCastForPush`).
 
-The list lives in one function the door calls, so a new context global is added in one place.
+The union-sink pair is not on the list. Its two locals are per-function frame slots, and a
+fragment carries no `return`, so it never writes them. Its peephole cursor (`uBoxNewEnd`) is a
+fact about bytes, not a plan input: a fragment's bytes either move the write head past a stale
+cursor, which costs the peephole and is still correct, or end in the fragment's own box
+construction, which is truly last.
+
+The list lives in one function the door calls (`legacyContextLiveWhy`), so a new context global is
+added in one place.
 The PR that adds it carries a **failing control**: a fragment requested under a live context
 (e.g. inside a held coercion) must miss, and the PR quotes that miss. A context the door is
 meant to run under instead becomes an explicit parameter of the shared plan (as `held` did), not
