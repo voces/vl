@@ -14165,10 +14165,29 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       return 0
     }
   }
-  // A re-pointed list of lists nothing calls through is pinned with its re-points (D16921).
-  if repoints.length == 0 || elabSlotUncalled(at, ["e", "e"]) {
-    const nr = monoPinNestedListElems(d, lf, lit, repoints)
-    if nr != 0 { return if nr < 0 { -1 } else { 0 } }
+  // A list of lists, and the lists of lists it is re-pointed to, are pinned level by level
+  // (D16915, D16921). A generic's instances share `d`, unless this one took its own copy (D9662).
+  if (
+    lit.arrElems.length > 0
+    && monoWritesOf("e:", at).length == 0
+    && !(monoFrameIsGenericInstance(ctx) && !monoInstOwns(ctx, at))
+  ) {
+    // Elements reading bindings already pinned take their type, as inline literals would (D9661).
+    const blits: i32[] = [d.letInit]
+    const bt = monoBoundFnListElemsTy(blits, ctx)
+    const roots: i32[][] = [[d.letInit, ctx]]
+    let ri = 0
+    while ri + 1 < repoints.length {
+      roots.push([repoints[ri], repoints[ri + 1]])
+      ri = ri + 2
+    }
+    const nt = if bt >= 0 { mkArrayTy(bt) } else { monoPinListNest(lf, "", roots) }
+    if nt == -2 { return -1 }
+    if nt >= 0 {
+      d.letType = synthTypeRefOfTy(nt, -1)
+      if bt >= 0 { nodeTyRecord(d.letInit, nt) }
+      return 0
+    }
   }
   const path: string[] = ["e"]
   let pinFts: i32[] = []
@@ -14293,105 +14312,6 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     }
   }
   return 0
-}
-
-// Gives the un-annotated list `d` (`lf`) of list literals of functions, written nowhere, the
-// function type the flow table pins the inner element at, as `monoPinListElems` does one level
-// down (D9173): 1 when pinned, 0 when left alone, -1 when an instance is refused.
-function monoPinNestedListElems(
-  d: LetDecl,
-  lf: i32[],
-  lit: ArrayLit,
-  repoints: i32[],
-): i32 {
-  const ctx = lf[0]
-  const at = lf[1]
-  if lit.arrElems.length == 0 || monoWritesOf("e:", at).length > 0 { return 0 }
-  // A generic's instances share `d`, unless this instance took its own copy (D9662).
-  if monoFrameIsGenericInstance(ctx) && !monoInstOwns(ctx, at) { return 0 }
-  // Its elements reading bindings already pinned take their type, as inline literals would (D9661).
-  const lits: i32[] = [d.letInit]
-  const bt = monoBoundFnListElemsTy(lits, ctx)
-  if bt >= 0 {
-    const blt = mkArrayTy(bt)
-    d.letType = synthTypeRefOfTy(blt, -1)
-    nodeTyRecord(d.letInit, blt)
-    return 1
-  }
-  const inner: i32[] = []
-  const vals: i32[] = []
-  for e in lit.arrElems {
-    const x = unwrapParen(e)
-    if x < 0 || x >= P.nodes.length { return 0 }
-    const il = nodeAt(x)
-    if !(il is ArrayLit) || il.arrElems.length == 0 { return 0 }
-    inner.push(x)
-    for v in il.arrElems { vals.push(v) }
-  }
-  const held: i32[][] = []
-  for v in vals { held.push([v, ctx]) }
-  // Each list of lists the binding is re-pointed to holds its functions too.
-  let ri = 0
-  while ri + 1 < repoints.length {
-    const rl = nodeAt(repoints[ri])
-    if !(rl is ArrayLit) { return 0 }
-    for e in rl.arrElems {
-      const x = unwrapParen(e)
-      const il = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
-      if !(il is ArrayLit) { return 0 }
-      inner.push(x)
-      for v in il.arrElems { held.push([v, repoints[ri + 1]]) }
-    }
-    ri = ri + 2
-  }
-  const pins = monoDeclPathPins(lf, ["e", "e"])
-  if pins.length != 1 || repoints.length > 0 {
-    // A slot nothing calls, or one whose every read now names its generic (D9711), takes the
-    // type its functions hold at no call, as the flat list does.
-    if pins.length == 0 && !elabSlotUncalled(at, ["e", "e"]) { return 0 }
-    if (
-      pins.length > 1
-      && !elabSlotUncalledOmitting(at, ["e", "e"], mfrRepointed)
-    ) {
-      return 0
-    }
-    // It is annotated at the type `monoUncalledSlotFnTy` gives the functions it holds.
-    const uft = monoUncalledSlotFnTy(at, ["e", "e"], held)
-    if uft < 0 { return 0 }
-    const uit = mkArrayTy(uft)
-    const ult = mkArrayTy(uit)
-    d.letType = synthTypeRefOfTy(ult, -1)
-    nodeTyRecord(d.letInit, ult)
-    ri = 0
-    while ri + 1 < repoints.length {
-      nodeTyRecord(repoints[ri], ult)
-      ri = ri + 2
-    }
-    for x in inner { nodeTyRecord(x, uit) }
-    for vw in held {
-      if !monoTyClosedFn(nodeTyIxOf(vw[0])) { nodeTyRecord(vw[0], uft) }
-    }
-    return 1
-  }
-  const dTys: i32[] = []
-  // The inner element's type is the elaboration's slot fact, at this frame's instance.
-  const ft = elabSlotTyAt(at, ["e", "e"], ctx)
-  if ft < 0 || ft >= T.tys.length || !monoTyClosedFn(ft) { return 0 }
-  for v in vals {
-    if monoCoerceFnValueTys(v, ctx, -1, dTys, ft) < 0 { return -1 }
-  }
-  const fty = tyAt(ft)
-  if !(fty is TyFunc) { return 0 }
-  const it = mkArrayTy(ft)
-  const lt = mkArrayTy(it)
-  d.letType = synthTypeRefOfTy(lt, -1)
-  nodeTyRecord(d.letInit, lt)
-  for x in inner { nodeTyRecord(x, it) }
-  for v in vals {
-    const et = nodeTyIxOf(v)
-    if et < 0 || tyHasTyVar(et) { nodeTyRecord(v, ft) }
-  }
-  return 1
 }
 
 // Annotates the un-annotated list `d` (`lf`) of record literals, whose element the checker left
@@ -15473,31 +15393,24 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
     return st
   }
   const lit = nodeAt(vx)
-  // A list of lists of functions pins its inner lists from every element they hold, each inner
-  // list and the field typed with that (D16915).
+  // A list of lists of functions, and each whole one written at the field, is pinned level by
+  // level from every element its innermost lists hold (D16915, D16921).
   if lit is ArrayLit && tyAt(et) is TyArray {
     const lf2: i32[] = [ctx, at]
-    const ivals: i32[][] = []
-    const inners: i32[] = []
-    for e in lit.arrElems {
-      const ix = unwrapParen(e)
-      if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is ArrayLit) {
-        return -1
-      }
-      inners.push(ix)
-      const inner = nodeAt(ix)
-      if inner is ArrayLit {
-        for ie in inner.arrElems { ivals.push([ie, ctx]) }
+    const roots: i32[][] = [[vx, ctx]]
+    for w in monoWritesOf("f:", at) {
+      const wb = nodeAt(w)
+      const m = if wb is BinExpr { nodeAt(wb.binLeft) } else { null }
+      if wb is BinExpr && m is Member && m.memProp == fld {
+        const wf = monoLetWriteFrame(lf2, w)
+        if wf.length != 1 { return -1 }
+        roots.push([unwrapParen(wb.binRight), wf[0]])
       }
     }
-    if ivals.length == 0 { return -1 }
-    const ft = monoStoredSlotFnTy(lf2, monoSlotPath(fld, ["e", "e"]), ivals)
-    if ft < 0 { return ft }
-    const it = mkArrayTy(ft)
-    for ix in inners { nodeTyRecord(ix, it) }
-    const lnt = if st >= 0 { st } else { mkArrayTy(it) }
-    nodeTyRecord(vx, lnt)
-    return lnt
+    const nt = monoPinListNest(lf2, fld, roots)
+    if nt < 0 { return nt }
+    if st >= 0 { nodeTyRecord(vx, st) }
+    return if st >= 0 { st } else { nt }
   }
   if !(lit is ArrayLit) || !(tyAt(et) is TyFunc) { return -1 }
   const lf: i32[] = [ctx, at]
@@ -15511,6 +15424,63 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
   nodeTyRecord(vx, nt)
   monoRetypeMapReads(ctx, at, nt, monoContainerElemTy(nt), fld)
   return nt
+}
+
+// Types the list literals `roots` (each beside its frame), the lists of lists slot `fld` of the
+// binding at `lf` holds, level by level from the one function type `monoStoredSlotFnTy` gives the
+// functions their innermost lists hold; the outer type, -1 for none, -2 refused. Below two levels
+// only a slot nothing calls is pinned.
+function monoPinListNest(lf: i32[], fld: string, roots: i32[][]): i32 {
+  let depth = 0
+  let at = if roots.length > 0 { unwrapParen(roots[0][0]) } else { -1 }
+  while at >= 0 && at < P.nodes.length && nodeAt(at) is ArrayLit {
+    depth = depth + 1
+    const l = nodeAt(at)
+    at = if l is ArrayLit && l.arrElems.length > 0 { unwrapParen(l.arrElems[0]) } else { -1 }
+  }
+  if depth < 2 { return -1 }
+  const steps: string[] = []
+  while steps.length < depth { steps.push("e") }
+  const path = monoSlotPath(fld, steps)
+  if depth > 2 && !elabSlotUncalled(lf[1], path) { return -1 }
+  // Each list literal with its level below the top, and each innermost element with its frame.
+  const lits: i32[] = []
+  const lvls: i32[] = []
+  const held: i32[][] = []
+  const work: i32[][] = []
+  for r in roots { work.push([unwrapParen(r[0]), 0, r[1]]) }
+  // Walked in source order, so each function is instanced where the literal names it first.
+  let wi = 0
+  while wi < work.length {
+    const w = work[wi]
+    wi = wi + 1
+    const l = if w[0] >= 0 && w[0] < P.nodes.length { nodeAt(w[0]) } else { null }
+    if !(l is ArrayLit) || w[1] > 0 && l.arrElems.length == 0 { return -1 }
+    lits.push(w[0])
+    lvls.push(w[1])
+    for e in l.arrElems {
+      if w[1] == depth - 1 {
+        held.push([e, w[2]])
+      } else {
+        work.push([unwrapParen(e), w[1] + 1, w[2]])
+      }
+    }
+  }
+  if held.length == 0 { return -1 }
+  const ft = monoStoredSlotFnTy(lf, path, held)
+  if ft < 0 { return ft }
+  const tys: i32[] = []
+  let t = ft
+  while tys.length < depth {
+    t = mkArrayTy(t)
+    tys.push(t)
+  }
+  let k = 0
+  while k < lits.length {
+    nodeTyRecord(lits[k], tys[depth - 1 - lvls[k]])
+    k = k + 1
+  }
+  return tys[depth - 1]
 }
 
 // The type binding `b` holds: its annotation's, which a pin may have given it, else its

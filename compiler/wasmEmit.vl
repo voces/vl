@@ -40636,7 +40636,8 @@ function emitListUnionArmIndex(idxIx: i32, fnIx: i32): i32 {
   const recv = unwrapParen(n.idxArr)
   const arms = luMembersAt(nodeTyAt(recv, fnIx))
   const u = nodeTyAt(idxIx, fnIx)
-  const uName = boxTyName(u)
+  // A read at a numeric literal set is at the set's scalar rep, never boxed (D17001).
+  const uName = if numLitUnionBaseName(u) != "" { "" } else { boxTyName(u) }
   // An element union that is no box is a string (a literal union joined with `string`) or an
   // atom (two literal unions); each arm's element is delivered at that rep.
   const k = if uName == "" { repSigKindOfTy(u) } else { "union" }
@@ -40696,12 +40697,52 @@ function luArmWrapLocal(m: i32): i32 {
   if k == V128_LIST_KIND {
     return scratchSlot(46, "v128list", 0, SCRATCH_BY_BOTH)
   }
+  // A packed byte list rides its own row's wrapper (`listWrapHeapOfKind`).
+  const pr = if k == 13 { PK_U8 } else { pkRowOfKind(k) }
+  if pr >= 0 { return scratchSlot(46, "u8list", pr, SCRATCH_BY_BOTH) }
   if unMemIsRefElemArray(m) {
     const rs = unMemRefArrArmSlot(m)
     if rs < 0 { return -1 }
     return scratchSlot(46, "reflist", rs, SCRATCH_BY_BOTH)
   }
   return -1
+}
+
+// Converts the scalar on the stack from rep `from` to rep `to`, a member of a numeric literal set
+// read out of a list arm stored wider or apart, so the conversion is exact.
+function emitNumRepNarrow(from: VKind, to: VKind): i32 {
+  if from == to { return 0 }
+  if to == "i32" && from == "i64" {
+    fbI32WrapI64()
+    return 0
+  }
+  if to == "i32" && from == "f64" {
+    fbI32TruncF64S()
+    return 0
+  }
+  if to == "i32" && from == "f32" {
+    fbI32TruncF32S()
+    return 0
+  }
+  if to == "i64" && from == "f64" {
+    fbI64TruncF64S()
+    return 0
+  }
+  if to == "i64" && from == "f32" {
+    fbI64TruncF32S()
+    return 0
+  }
+  if to == "f64" && from == "i32" {
+    fbF64ConvertI32S()
+    return 0
+  }
+  if to == "f64" && from == "i64" {
+    fbF64ConvertI64S()
+    return 0
+  }
+  return emitFail(
+    "emitProgram: a list arm's element has no conversion to the literal set read",
+  )
 }
 
 // Arm `i` onward of `emitListUnionArmIndex`'s tag chain.
@@ -40763,6 +40804,10 @@ function emitListUnionArmIndexAt(
     }
   } else {
     r = emitExpr(idxIx, fnIx)
+    // A read at a numeric literal set takes each arm's member at the set's own rep (D17001).
+    if r >= 0 && numLitUnionBaseName(u) != "" {
+      r = emitNumRepNarrow(repSigKindOfTy(e) ?? k, k)
+    }
   }
   luOvLocalLeave(lmark)
   luOvLeave(mark)
