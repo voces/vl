@@ -65,3 +65,4 @@ Compiler internals, self-hosting, contributor and agent process.
 - [`internals/vl-dogfooding-notes.md`](internals/vl-dogfooding-notes.md) — dogfooding friction notes.
 - [`internals/agent-playbook.md`](internals/agent-playbook.md) — agent operating playbook.
 - [`internals/agent-pr-watch.md`](internals/agent-pr-watch.md) — PR-watch runbook.
+- [`internals/merge-queue.md`](internals/merge-queue.md) — the merge queue's procedure: READY, batching, vetoes, folds.
