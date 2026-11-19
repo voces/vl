@@ -16,7 +16,6 @@ import {
   Rhs,
   SBoundsCheck,
   SListSet,
-  repPrim,
 } from "./ir"
 import {
   irLAt,
@@ -63,9 +62,11 @@ import {
   strEqLitOf,
   strEqLitTail,
   strEqNegTail,
+  strInPlaceMode,
   strListGetTail,
   strListHoistOf,
   strOrderTail,
+  strSiteCatTail,
   strSliceTail,
   svDstOfKind,
 } from "./wasmEmit"
@@ -73,19 +74,18 @@ import { eqOperandRecovers } from "./emit_plan_union"
 import { idxStorePlanOf, popPlanOf, pushPlanOf } from "./emit_plan_list"
 import { scalarListElemKind } from "./emit_value_sites"
 import { exprNullableRefArray, refListSlotOfExpr } from "./emit_classify"
-import { RList, repNodeAt, repNodeOfTy, rvMayView } from "./emit_rep"
+import { rvMayView } from "./emit_rep"
 import { rlRowsMinted } from "./emit_state"
-import { nodeTyAt } from "./emit_capture_frames"
 
 // Why the IR does not lower list read `idxIx`, or "" when it does: legacy's own arm decision
-// (`idxArmOf`) took a scalar list, collected and not a view, or a ref list of scalar lists whose
-// read keeps no nullable niche, reads no view and needs no element tail.
+// (`idxArmOf`) took a scalar list, collected and not a view, or a ref list whose read keeps no
+// nullable niche and reads no view.
 export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const nd = nodeAt(idxIx)
   if !(nd is Index) { return "index node" }
   if idxCellReadIsNull(idxIx, fnIx) { return "index cell null" }
   const arm = idxArmOf(nd, fnIx)
-  if arm == "ref" { return refReadWhy(nd, idxIx, fnIx) }
+  if arm == "ref" { return refReadWhy(nd, fnIx) }
   if arm == "string" || arm == "str" { return "" }
   if arm != "scalar" { return "index " + arm }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
@@ -94,8 +94,7 @@ export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   return ""
 }
 
-function refReadWhy(nd: Index, idxIx: i32, fnIx: i32): string {
-  if !irScalarListRep(repNodeOfTy(nodeTyAt(idxIx, fnIx))) { return "index ref" }
+function refReadWhy(nd: Index, fnIx: i32): string {
   if !rlRowsMinted() || exprNullableRefArray(nd.idxArr, fnIx) {
     return "index ref receiver"
   }
@@ -105,16 +104,6 @@ function refReadWhy(nd: Index, idxIx: i32, fnIx: i32): string {
   const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
   if rslot < 0 || rvMayView(rslot) { return "index ref view" }
   return ""
-}
-
-// Whether rep `r` is a list of unpacked primitives.
-export function irScalarListRep(r: i32): boolean {
-  const n = repNodeAt(r)
-  if n is RList {
-    const e = repPrim(n.rlsElem)
-    return e == "i32" || e == "i64" || e == "f64" || e == "f32" || e == "bool"
-  }
-  return false
 }
 
 // `RListGet`: legacy's read arm, scalar or ref, its receiver and index the read's operands. A
@@ -238,6 +227,13 @@ function lowerListEq(r: RListEq): i32 {
   return listEqTail(e, r.qeAt, fnIx)
 }
 
+// An append site's tail, at the mode the builder read; a site the scan does not arm is a miss.
+function siteTail(r: RStrOp, fnIx: i32): i32 {
+  const mode = strInPlaceMode(r.soAt, fnIx)
+  if mode <= 0 { return irLMiss("string append site") }
+  return strSiteCatTail(r.soArgs.length, mode, r.soAt)
+}
+
 // `RStrOp`: its operands, then legacy's operator tail. An equality operand is recovered after
 // it is pushed, as legacy recovers a narrowed nullable read.
 function lowerStr(r: RStrOp): i32 {
@@ -248,6 +244,7 @@ function lowerStr(r: RStrOp): i32 {
   }
   return match r.soOp {
     "concat" => strCatTail(r.soArgs.length)
+    "site" => siteTail(r, fnIx)
     "slice" => strSliceTail()
     "cplen" => strCpLenTail()
     "lt" => if e is BinExpr { strOrderTail(e) } else { irLMiss("string operator node") }
