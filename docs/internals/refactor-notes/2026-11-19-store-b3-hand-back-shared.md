@@ -14,7 +14,7 @@ master `938930861`. This step moves 7 of them (336 → 329 late tag rows; 0 new)
 ## Measured
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: the diagnostics are byte-identical to the hb HEAD fixpoint.
 - The full @run A/B over 6,753 programs found 0 RC, wasm or output movers.
-- Lines: compiler +7 / −2.
+- Lines: compiler +9 / −2.
 
 ## Site 9's other 5 rows, by the probe's ftTry trace
 - `generic-fn-value-two-type-param-params-one-handed-back` G {same}: the check never tries this
