@@ -333,9 +333,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals, and a nested list literal is a ref list: each a named miss, never a byte mismatch.
+// locals, and a list literal whose elements box into a union is a ref list legacy coerces: each a
+// named miss, never a byte mismatch.
 Deno.test({
-  name: "ir shadow: a reserved list binding and a nested list literal are named misses",
+  name: "ir shadow: a reserved list binding and a union-element list literal are named misses",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -343,12 +344,46 @@ Deno.test({
   a.push(x)
   return a.length
 }
-function ln(x: i32): i32[][] { return [[x], [x, x]] }
-print(rv(2) + ln(2)[1].length)
+function ln(x: i32): (i32 | string)[] { return [x, "s"] }
+print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
     for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
       if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A nested list literal whose elements build as themselves is a plain ref list, built along
+// `emitArrRef`'s shared decision and tail, and matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a plain nested list literal is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function ln(x: i32): i32[][] { return [[x], [x, x]] }
+print(ln(2)[1].length)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A short packed list literal builds along `emitArrU8`'s shared tail and matches legacy's bytes;
+// an empty one returned at its destination is the self-compile's common spelling.
+Deno.test({
+  name: "ir shadow: a short u8 list literal is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function e(): u8[] { return [] }
+print(e().length)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },

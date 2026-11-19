@@ -77,11 +77,11 @@ import {
 import {
   BinNulTest,
   GlobalCtx,
+  HoleBox,
   PrintArm,
-  arrLitArmOf,
-  arrLitBuildOf,
   arrLitShort,
   atomEqPlanOf,
+  atomStrPlanOf,
   binNulTestOf,
   binNumWidth,
   boxOwedAt,
@@ -99,10 +99,10 @@ import {
   forInPlainWhy,
   globalInitArmUnboxes,
   globalReadRecovers,
+  holeBoxPlanOf,
+  holeBoxTyAt,
   identReadArmOf,
-  identReadIsList,
   idxStorePlainWhy,
-  idxStorePlanOf,
   ifExprPlainKind,
   ifWritesElse,
   isArmOf,
@@ -110,7 +110,6 @@ import {
   isRecvStageRep,
   isVariantTagPlain,
   keptDeclStoresNothing,
-  listReserveScan,
   lowMemFoldsCallee,
   mapGetOrHelperRoute,
   mapKeyArmOf,
@@ -120,7 +119,6 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
-  narrowedArmNeedsUnbox,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
   nulNoneEqSides,
@@ -131,11 +129,8 @@ import {
   numIntrPlanOf,
   numLitAsApplies,
   numLitLexAt,
-  popPlanOf,
-  popStmtPlainWhy,
   printArmOf,
   pushPlainWhy,
-  pushPlanOf,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
@@ -144,6 +139,18 @@ import {
   tplStrHoleOf,
   widenPlanOf,
 } from "./wasmEmit"
+import { arrLitRefPlainSlot } from "./emit_plan_list"
+import { narrowedArmNeedsUnbox } from "./emit_plan_union"
+import {
+  arrLitArmOf,
+  arrLitListBuild,
+  identReadIsList,
+  idxStorePlanOf,
+  listReserveScan,
+  popPlanOf,
+  popStmtPlainWhy,
+  pushPlanOf,
+} from "./emit_plan_list"
 import {
   RAtom,
   RBox,
@@ -162,6 +169,7 @@ import { isBlockBody } from "./block_body"
 import {
   declaredIndexAt,
   envSlotShift,
+  exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
@@ -608,27 +616,94 @@ function localVarAt(w: i32): i32 {
 }
 
 // A value `if` on legacy's plain scalar path (`ifExprPlainKind`): a slotless out each arm's one
-// value writes, as `&&` and `||` build it.
-function ifExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
-  if ifExprPlainKind(ix, ibFnIx) < 0 { return irBMiss("expression if") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("if after an operand") }
-  const c = irBExpr(b, n.ifCond)
-  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
-  const ty = nodeTyAt(ix, ibFnIx)
-  if irTyOpen(ty) { return irBMiss("open temp type") }
-  const t = irVarNew(ib, rep, ty, "local", -1)
-  const thenB = ifArm(n.ifThen, t, rep)
-  const elseB = ifArm(n.ifElse, t, rep)
+// value writes, as `&&` and `||` build it. An `else` arm whose value is itself a value `if` is the
+// next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
+// their outs' assigns then land innermost first, the order a recursion's returns give them.
+function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
+  const bs: i32[][] = []
+  const ixs: i32[] = []
+  const reps: i32[] = []
+  const conds: Opnd[] = []
+  const tys: i32[] = []
+  const outs: i32[] = []
+  const thens: i32[][] = []
+  const elses: i32[] = []
+  let cb = b
+  let n = n0
+  let cix = ix0
+  let crep = rep0
+  while true {
+    if ifExprPlainKind(cix, ibFnIx) < 0 { return irBMiss("expression if") }
+    // Its value stays on the stack from here, so no temp an operand before it built may wait.
+    if endsInTemp(cb) { return irBMiss("if after an operand") }
+    const c = irBExpr(cb, n.ifCond)
+    if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+    const ty = nodeTyAt(cix, ibFnIx)
+    if irTyOpen(ty) { return irBMiss("open temp type") }
+    const t = irVarNew(ib, crep, ty, "local", -1)
+    const thenB = ifArm(n.ifThen, t, crep)
+    if ibMiss != "" { return irBMiss("if arm") }
+    bs.push(cb)
+    ixs.push(cix)
+    reps.push(crep)
+    conds.push(c)
+    tys.push(ty)
+    outs.push(t)
+    thens.push(thenB)
+    elses.push(n.ifElse)
+    const tv = ifArmValueExpr(n.ifElse)
+    if tv < 0 { break }
+    const nx = nodeAt(tv)
+    if !(nx is IfStmt) { break }
+    // `irBExpr`'s own prelude for the link it would reach.
+    const pre = exprPrePathWhy(tv, ibFnIx)
+    if pre != "" { return irBMiss(pre) }
+    const r = primRepOf(tv)
+    if r < 0 {
+      return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(tv, ibFnIx))))
+    }
+    const eb: i32[] = []
+    cb = eb
+    n = nx
+    cix = tv
+    crep = r
+  }
+  let k = bs.length - 1
+  let elseB = ifArm(elses[k], outs[k], reps[k])
   if ibMiss != "" { return irBMiss("if arm") }
-  irBNode(
-    b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
-    ty,
-    rep,
-    ix,
-  )
-  const o: Opnd = { ov: t }
+  while k >= 0 {
+    irBNode(
+      bs[k],
+      {
+        siCond: conds[k],
+        siThen: thens[k],
+        siElse: elseB,
+        siOut: outs[k],
+        siElseKw: true,
+      },
+      tys[k],
+      reps[k],
+      ixs[k],
+    )
+    if k == 0 { break }
+    // Link `k` is link `k - 1`'s `else` value, delivered at that link's rep as `ifArm` does.
+    const inner: Opnd = { ov: outs[k] }
+    const v = widenTo(bs[k], inner, ixs[k], reps[k - 1])
+    if ibMiss == "" && irBOpRep(v) != reps[k - 1] { irBMiss("if arm coercion") }
+    if ibMiss == "" {
+      irBNode(
+        bs[k],
+        { asDst: outs[k - 1], asSrc: v },
+        -1,
+        ibNoValue,
+        elses[k - 1],
+      )
+    }
+    if ibMiss != "" { return irBMiss("if arm") }
+    elseB = bs[k]
+    k = k - 1
+  }
+  const o: Opnd = { ov: outs[0] }
   return o
 }
 
@@ -1241,9 +1316,35 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
   return widenTo(b, irBExpr(b, ix), ix, dst)
 }
 
-// `v`, built from `ix`, boxed into boxed nullable `dst` by legacy's box writer.
+// `v`, built from `ix`, boxed into boxed nullable `dst` by the shared box plan.
 function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  const why = boxPlanWhy(holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx), v)
+  if why != "" { return irBMiss(why) }
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+}
+
+// Why box plan `p` does not take operand `v`, or "": a `null` and a literal leave an immediate
+// unread, an atom box takes the value at its kind (or at the kind its widening starts from), a
+// `K | null` atom its id, and a box passes a box.
+function boxPlanWhy(p: HoleBox, v: Opnd): string {
+  const r = irBOpRep(v)
+  const ok = match p.hbArm {
+    "null" => v is OImm && r == ibNoValue
+    "lit" => v is OImm
+    "pass" => repNodeAt(r) is RBox || boxedNullable(r)
+    "atomStr" => atomNullable(r)
+    "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else { holeKindRep(p.hbKind, r) }
+    "ladder" => false
+  }
+  if ok { return "" }
+  return "box " + p.hbArm
+}
+
+// Whether rep `r` is value-atom kind `k`'s own: `i32`, `boolean` or `string`.
+function holeKindRep(k: i32, r: i32): boolean {
+  const p = repPrim(r)
+  if p == null { return false }
+  return k == 0 && p == "i32" || k == 1 && p == "bool" || k == 2 && p == "str"
 }
 
 // A temp at destination rep `dst`, typed at it, holding `r` for delivery node `ix`.
@@ -1271,6 +1372,19 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
     && dn.rnInner == irBOpRep(v)
   ) {
     if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
+  }
+  // An atom at a string, or its `K | null` at a `string | null`, is legacy's atom decode.
+  const sr = irBOpRep(v)
+  if (
+    repNodeAt(sr) is RAtom && (repPrim(dst) == "str" || strNullable(dst))
+    || atomNullable(sr) && strNullable(dst)
+  ) {
+    if !exprIsLitAtom(ix, ibFnIx) { return irBMiss("atom string source") }
+    // The decode's `null` comes from the plan, which the verifier cannot see.
+    if atomStrPlanOf(ix, ibFnIx, false).apNul && !strNullable(dst) {
+      return irBMiss("atom decode nullable into a non-null string")
+    }
+    return repTemp(b, { sxV: v, sxAt: ix }, ix, dst)
   }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
@@ -1413,26 +1527,34 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
-// A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32
-// or string list, each element delivered at the list's element rep. Every other arm is a named
-// miss.
+// A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32,
+// string, packed or plain ref list, each element delivered at the list's element rep. Every other
+// arm is a named miss.
 function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
-  const arm = arrLitArmOf(ix, ibFnIx, arrLitBuildOf(ix, ibFnIx))
+  const lb = arrLitListBuild(ix, ibFnIx)
+  const arm = arrLitArmOf(ix, ibFnIx, lb)
+  // A ref list builds along `emitArrRef`'s plain arm (`arrLitRefPlainSlot`) or not at all.
+  if arm == "ref" && arrLitRefPlainSlot(ix, ibFnIx, lb) < 0 {
+    return irBMiss("array ref")
+  }
   if (
     arm != "i32"
     && arm != "f64"
     && arm != "i64"
     && arm != "f32"
     && arm != "str"
+    && arm != "ref"
+    && arm != "u8"
   ) {
     return irBMiss("array " + arm)
   }
-  if !arrLitShort(ix, ibFnIx, arm, n.arrElems.length) {
+  if arm != "ref" && !arrLitShort(ix, ibFnIx, arm, n.arrElems.length) {
     return irBMiss("array long or seeded")
   }
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array rep") }
-  const er = ln.rlsElem
+  // A packed list's elements are built as plain i32s, which its backing truncates.
+  const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   for e in n.arrElems {
     const v = deliver(b, e, er)
@@ -1551,14 +1673,6 @@ function opUnsigned(ix: i32): boolean {
 }
 
 export function irBExpr(b: i32[], ix: i32): Opnd {
-  if ibDepth >= IR_NEST_MAX { return irBMiss("nesting depth") }
-  ibDepth = ibDepth + 1
-  const o = irBExprAt(b, ix)
-  ibDepth = ibDepth - 1
-  return o
-}
-
-function irBExprAt(b: i32[], ix: i32): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const pre = exprPrePathWhy(ix, ibFnIx)
   if pre != "" { return irBMiss(pre) }
@@ -1865,10 +1979,57 @@ function labelNew(): i32 {
   return ibLabelN - 1
 }
 
-function chainLink(e: i32): i32[] {
-  const nb: i32[] = []
-  stmtIn(nb, e, NO_SIBS, -1)
-  return nb
+// An `if` statement and its `else if` links, built along the chain's spine rather than by
+// recursing per link (D1990): each link's test and `then` arm in source order into the body the
+// link before it leaves as its `else`, then the final `else`, then each link's node innermost
+// first, the order a recursion's returns allocate them in. A link has no span of its own.
+function ifChain(b: i32[], ix: i32) {
+  const links: i32[] = []
+  const outs: i32[][] = []
+  const conds: Opnd[] = []
+  const thens: i32[][] = []
+  let cur = ix
+  let out = b
+  let lastElse = -1
+  while true {
+    const n = nodeAt(cur)
+    if !(n is IfStmt) { return skip("condition") }
+    const c = irBExpr(out, n.ifCond)
+    if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+    const th = nodeAt(n.ifThen)
+    const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
+    links.push(cur)
+    outs.push(out)
+    conds.push(c)
+    thens.push(thenB)
+    lastElse = n.ifElse
+    if n.ifElse < 0 || !(nodeAt(n.ifElse) is IfStmt) { break }
+    const nb: i32[] = []
+    out = nb
+    cur = n.ifElse
+  }
+  let elseB = bodyOf(elseStmts(lastElse))
+  let k = links.length - 1
+  while k >= 0 {
+    const ln = nodeAt(links[k])
+    const kw = if ln is IfStmt { ifWritesElse(ln) } else { false }
+    irBNode(
+      outs[k],
+      {
+        siCond: conds[k],
+        siThen: thens[k],
+        siElse: elseB,
+        siOut: -1,
+        siElseKw: kw,
+      },
+      -1,
+      ibNoValue,
+      links[k],
+    )
+    elseB = outs[k]
+    k = k - 1
+  }
+  return 0
 }
 
 function elseStmts(e: i32): i32[] {
@@ -1901,22 +2062,9 @@ function stmtAt(b: i32[], stmts: i32[], i: i32) {
 // is -1 outside a list.
 function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
-  stmtIn(b, ix, sibs, pos)
+  stmtNode(b, ix, sibs, pos)
   if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
-  return 0
-}
-
-// A construct nested deeper than this is left to legacy, whose passes loop along a chain's spine
-// where the IR's recurse (a long `else if` chain, D1990).
-const IR_NEST_MAX = 200
-let ibDepth = 0
-
-function stmtIn(b: i32[], ix: i32, sibs: i32[], pos: i32) {
-  if ibDepth >= IR_NEST_MAX { return skip("nesting depth") }
-  ibDepth = ibDepth + 1
-  stmtNode(b, ix, sibs, pos)
-  ibDepth = ibDepth - 1
   return 0
 }
 
@@ -1944,28 +2092,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
     return 0
   }
-  if n is IfStmt {
-    const c = irBExpr(b, n.ifCond)
-    if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-    const th = nodeAt(n.ifThen)
-    const thenB = if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
-    // An `else if` link is part of its chain's statement: no span of its own.
-    const elseB = if n.ifElse >= 0 && nodeAt(n.ifElse) is IfStmt { chainLink(n.ifElse) } else { bodyOf(elseStmts(n.ifElse)) }
-    irBNode(
-      b,
-      {
-        siCond: c,
-        siThen: thenB,
-        siElse: elseB,
-        siOut: -1,
-        siElseKw: ifWritesElse(n),
-      },
-      -1,
-      ibNoValue,
-      ix,
-    )
-    return 0
-  }
+  if n is IfStmt { return ifChain(b, ix) }
   if n is WhileStmt {
     whileStmt(b, n, ix)
     return 0
@@ -2168,7 +2295,7 @@ function tailArm(blockIx: i32): i32[] {
   let i = 0
   // Legacy lowers an arm's prelude by `emitStmtIn`, which banks no row of its own.
   while i < stmts.length - 1 {
-    stmtIn(body, stmts[i], stmts, i)
+    stmtNode(body, stmts[i], stmts, i)
     i = i + 1
   }
   const last = stmts[stmts.length - 1]
@@ -2210,7 +2337,6 @@ function build(fnIx: i32, fnPos: i32): string {
   ibLoopBrk = []
   ibLoopCont = []
   ibLabelN = 0
-  ibDepth = 0
   ibBool = repNodeOfTy(TY_BOOL)
   if fn.fnTyParams.length > 0 { return "template" }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
@@ -2461,7 +2587,6 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibLoopBrk = []
   ibLoopCont = []
   ibLabelN = 0
-  ibDepth = 0
   ibBool = repNodeOfTy(TY_BOOL)
   ibNoValue = repNodeOfTy(TY_NEVER)
   if !repIsNoValue(ibNoValue) { return "no void rep" }
@@ -2477,7 +2602,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
     if orderGi[i] >= 0 {
       globalInit(top, orderGi[i], order[i])
     } else {
-      stmtIn(top, order[i], NO_SIBS, -1)
+      stmtNode(top, order[i], NO_SIBS, -1)
     }
     // Legacy banks a top-level row (kind 1) over each item that wrote bytes.
     if top.length > n0 {
