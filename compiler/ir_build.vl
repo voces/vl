@@ -77,6 +77,7 @@ import {
 import {
   BinNulTest,
   GlobalCtx,
+  HoleBox,
   PrintArm,
   arrLitShort,
   atomEqPlanOf,
@@ -97,6 +98,8 @@ import {
   forInPlainWhy,
   globalInitArmUnboxes,
   globalReadRecovers,
+  holeBoxPlanOf,
+  holeBoxTyAt,
   identReadArmOf,
   idxStorePlainWhy,
   ifExprPlainKind,
@@ -1311,9 +1314,35 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
   return widenTo(b, irBExpr(b, ix), ix, dst)
 }
 
-// `v`, built from `ix`, boxed into boxed nullable `dst` by legacy's box writer.
+// `v`, built from `ix`, boxed into boxed nullable `dst` by the shared box plan.
 function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  const why = boxPlanWhy(holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx), v)
+  if why != "" { return irBMiss(why) }
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+}
+
+// Why box plan `p` does not take operand `v`, or "": a `null` and a literal leave an immediate
+// unread, an atom box takes the value at its kind (or at the kind its widening starts from), a
+// `K | null` atom its id, and a box passes a box.
+function boxPlanWhy(p: HoleBox, v: Opnd): string {
+  const r = irBOpRep(v)
+  const ok = match p.hbArm {
+    "null" => v is OImm && r == ibNoValue
+    "lit" => v is OImm
+    "pass" => repNodeAt(r) is RBox || boxedNullable(r)
+    "atomStr" => atomNullable(r)
+    "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else { holeKindRep(p.hbKind, r) }
+    "ladder" => false
+  }
+  if ok { return "" }
+  return "box " + p.hbArm
+}
+
+// Whether rep `r` is value-atom kind `k`'s own: `i32`, `boolean` or `string`.
+function holeKindRep(k: i32, r: i32): boolean {
+  const p = repPrim(r)
+  if p == null { return false }
+  return k == 0 && p == "i32" || k == 1 && p == "bool" || k == 2 && p == "str"
 }
 
 // A temp at destination rep `dst`, typed at it, holding `r` for delivery node `ix`.
@@ -1484,8 +1513,8 @@ function nulTest(
 }
 
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32,
-// string or plain ref list, each element delivered at the list's element rep. Every other arm is a
-// named miss.
+// string, packed or plain ref list, each element delivered at the list's element rep. Every other
+// arm is a named miss.
 function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   const lb = arrLitListBuild(ix, ibFnIx)
   const arm = arrLitArmOf(ix, ibFnIx, lb)
@@ -1500,6 +1529,7 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     && arm != "f32"
     && arm != "str"
     && arm != "ref"
+    && arm != "u8"
   ) {
     return irBMiss("array " + arm)
   }
@@ -1508,7 +1538,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   }
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array rep") }
-  const er = ln.rlsElem
+  // A packed list's elements are built as plain i32s, which its backing truncates.
+  const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   for e in n.arrElems {
     const v = deliver(b, e, er)
