@@ -1079,7 +1079,6 @@ import {
   fnReturnsLitAtom,
   fnValuePlain,
   forInElemKind,
-  forInMapRecv,
   forInPairValsSlot,
   globalCellKind,
   globalCellStructIdx,
@@ -8333,7 +8332,8 @@ export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   const vi = exprVariantIndex(m.memObj, fnIx)
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const idx = variantFieldIndex(vi, m.memProp)
-  if idx < 0 || fieldRowIsUnionBox(uFieldStart[vi] + idx) { return -1 }
+  if idx < 0 { return -1 }
+  if fieldRowIsUnionBox(uFieldStart[vi] + idx) { return idx }
   return if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { idx } else { -1 }
 }
 
@@ -8365,8 +8365,10 @@ export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   const si = structIndexOfExpr(o, fnIx)
   if si < 0 || si >= sHeapIdx.length { return -1 }
   const idx = sFieldIndex(si, m.memProp)
-  if idx < 0 || memReadNarrowOp(memIx, fnIx) >= 0 || sFieldIsUnionBox(si, idx) {
-    return -1
+  if idx < 0 || memReadNarrowOp(memIx, fnIx) >= 0 { return -1 }
+  // A union-box field's tail unboxes to the read's own type, but never an ambiguous box.
+  if sFieldIsUnionBox(si, idx) {
+    return if memReadBoxAmbiguous(memIx, fnIx) { -1 } else { idx }
   }
   return if fieldStoresRead(sFieldStart[si] + idx, memIx, fnIx) { idx } else { -1 }
 }
@@ -13870,14 +13872,9 @@ function emitMemVariantRead(memIx: i32, fnIx: i32): i32 {
       }
       if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
       variantFieldTail(pvi, pvfi, memIx, fnIx)
-      // A code-16 (value-union box) field of the arm, read while its member PATH is
-      // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
-      // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
-      // i32 consumer: check-clean INVALID WASM (silent-class-inventory D219).
-      if fieldRowIsUnionBox(uFieldStart[pvi] + pvfi) {
-        if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-      }
-      return 0
+      // A code-16 (value-union box) field of the arm, read while its member path is narrowed,
+      // unboxes to the narrowed atom, the arm-for-arm twin of the plain struct read (D219).
+      return variantUnionBoxTail(pvi, pvfi, memIx, fnIx)
     }
     // The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch).
     // Identical `struct.get`, one `ref.as_non_null` ahead of it: the cell is a
@@ -14061,34 +14058,68 @@ function emitMemStructRead(memIx: i32, fnIx: i32): i32 {
     } else {
       structFieldTail(si, idx, memIx, fnIx)
     }
-    // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
-    // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
-    // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
-    if sFieldIsUnionBox(si, idx) {
-      // A record read at its own type out of the union of records it is built into is that
-      // member's record (`boxedArmOfMember`).
-      const avi = boxedArmOfMember(memIx, fnIx)
-      if avi >= 0 { return emitArmUnboxCast(variantHeap(avi), false) }
-      if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
-      const own = memReadBoxNarrowTy(memIx, fnIx)
-      // A read at one scalar of a box holding one wider scalar unboxes and converts it, with no
-      // box rebuilt at the scalar's own set.
-      if own >= 0 {
-        const sc = boxNarrowScalarKinds(sFieldElemTyIxAt(si, idx), own)
-        if sc.length == 2 {
-          if emitUnionUnboxTail(sc[0]) < 0 { return -1 }
-          wU8(atomConvOp(sc[0], sc[1]))
-          return 0
-        }
-        if emitBoxAtomRetagTys(sFieldElemTyIxAt(si, idx), own, memIx) < 0 {
-          return -1
-        }
-      }
-      if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-    }
-    return 0
+    return structUnionBoxTail(si, idx, memIx, fnIx)
   }
   return emitFail("emitProgram: expected a field access")
+}
+
+// After struct `si`'s field `idx` is read at member read `memIx`: a union-typed field (code 16)
+// read while its member path is narrowed unboxes to the read's own type, as a narrowed union ident
+// read does; an un-narrowed read is the box. Returns 0, or -1.
+export function structUnionBoxTail(
+  si: i32,
+  idx: i32,
+  memIx: i32,
+  fnIx: i32,
+): i32 {
+  if !sFieldIsUnionBox(si, idx) { return 0 }
+  // A record read at its own type out of the union of records it is built into is that
+  // member's record (`boxedArmOfMember`).
+  const avi = boxedArmOfMember(memIx, fnIx)
+  if avi >= 0 { return emitArmUnboxCast(variantHeap(avi), false) }
+  if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
+  const own = memReadBoxNarrowTy(memIx, fnIx)
+  // A read at one scalar of a box holding one wider scalar unboxes and converts it, with no
+  // box rebuilt at the scalar's own set.
+  if own >= 0 {
+    const sc = boxNarrowScalarKinds(sFieldElemTyIxAt(si, idx), own)
+    if sc.length == 2 {
+      if emitUnionUnboxTail(sc[0]) < 0 { return -1 }
+      wU8(atomConvOp(sc[0], sc[1]))
+      return 0
+    }
+    if emitBoxAtomRetagTys(sFieldElemTyIxAt(si, idx), own, memIx) < 0 {
+      return -1
+    }
+  }
+  return emitUnionFieldNarrowUnbox(memIx, fnIx)
+}
+
+// Whether plain member read `memIx` reads a union-box field, whose tail delivers the read's own rep.
+export function memFieldUnionBox(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const vi = exprVariantIndex(m.memObj, fnIx)
+  if vi >= 0 {
+    const vf = variantFieldIndex(vi, m.memProp)
+    return vf >= 0 && fieldRowIsUnionBox(uFieldStart[vi] + vf)
+  }
+  const si = structIndexOfExpr(m.memObj, fnIx)
+  if si < 0 || si >= sHeapIdx.length { return false }
+  const sf = sFieldIndex(si, m.memProp)
+  return sf >= 0 && sFieldIsUnionBox(si, sf)
+}
+
+// After variant `vi`'s field `idx` is read at member read `memIx`: a union-typed field read while
+// its member path is narrowed unboxes to the narrowed atom. Returns 0, or -1.
+export function variantUnionBoxTail(
+  vi: i32,
+  idx: i32,
+  memIx: i32,
+  fnIx: i32,
+): i32 {
+  if !fieldRowIsUnionBox(uFieldStart[vi] + idx) { return 0 }
+  return emitUnionFieldNarrowUnbox(memIx, fnIx)
 }
 
 // ── string-literal decoding ─────────────────────────────────────────────────
@@ -20163,16 +20194,22 @@ function strSiteArmsAt(binIx: i32, fnIx: i32): i32 {
 // site mode its chain lowers under (`strSiteCatTail`), or 0 as a plain value.
 // A function legacy does not lower is scanned here, as its body lowering would scan it.
 export function strInPlaceMode(binIx: i32, fnIx: i32): i32 {
-  if saFnIx != fnIx {
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl { strAccScan(fn.fnBody, fnIx) }
-  }
+  saScanFor(fnIx)
   if strAccAppendOk(binIx, fnIx) { return -1 }
   return strSiteArmsAt(binIx, fnIx)
 }
 
+// Scans function `fnIx` unless the rows are already its own.
+function saScanFor(fnIx: i32) {
+  if saFnIx == fnIx { return 0 }
+  const fn = nodeAt(fnIx)
+  if fn is FuncDecl { strAccScan(fn.fnBody, fnIx) }
+  return 0
+}
+
 // The armed site assignment whose right side is the chain at `rhsIx`, or -1.
 export function strSiteOfRhs(rhsIx: i32, fnIx: i32): i32 {
+  saScanFor(fnIx)
   let i = 0
   while i < saSites.length {
     const a = nodeAt(saSites[i])
@@ -20508,6 +20545,23 @@ function strAccAppendOk(binIx: i32, fnIx: i32) {
 // running offset, then one new header. Borrows the string scratch frame's slots.
 function emitStrAccAppend(binIx: i32, fnIx: i32) {
   const a = nodeAt(binIx)
+  if !(a is BinExpr) {
+    return emitFail("emitProgram: expected a string accumulator append")
+  }
+  const parts: i32[] = []
+  strCatParts(a.binRight, fnIx, parts)
+  let i = 1
+  while i < parts.length {
+    if emitStrValue(parts[i], fnIx) < 0 { return -1 }
+    i = i + 1
+  }
+  return strAccAppendTail(binIx, fnIx)
+}
+
+// After the appended parts (every chain part but the first) are on the stack: accumulator
+// append `binIx` grows the target's buffer if they do not fit, copies them and stores it.
+export function strAccAppendTail(binIx: i32, fnIx: i32) {
+  const a = nodeAt(binIx)
   if a is BinExpr {
     const tIx = unwrapParen(a.binLeft)
     if tIx >= 0 && nodeAt(tIx) is Ident {
@@ -20516,11 +20570,6 @@ function emitStrAccAppend(binIx: i32, fnIx: i32) {
       const parts: i32[] = []
       strCatParts(a.binRight, fnIx, parts)
       const n = parts.length
-      let i = 1
-      while i < n {
-        if emitStrValue(parts[i], fnIx) < 0 { return -1 }
-        i = i + 1
-      }
       let j = n - 1
       while j >= 1 {
         fbLocalSet(strCatSlot(j - 1))
@@ -30646,13 +30695,9 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
 // list whose value builds as itself or widens, with no arm unbox and no late receiver.
 export function pushPlainWhy(pp: PushPlan, fnIx: i32): string {
   const pv = pp.ppVal
-  if pp.ppSlot.rSlot >= 0 || pv.pushNestSlot >= 0 { return "push element" }
+  if pv.pushNestSlot >= 0 { return "push nested list element" }
   if pv.isLitArr || pv.isNbArr || pv.isNlluArr || pv.isNsArr {
     return "push element seed"
-  }
-  // A packed byte list is the one family left off the plain push scratch base.
-  if pv.sk == null && !pv.isStr && pp.ppSlot.base != pushScratchBase {
-    return "push element"
   }
   if pv.isStr && exprIsLitAtom(pp.ppArg, fnIx) { return "push atom" }
   if boxOwedAtRecord(pp.ppArg, fnIx) { return "push box" }
@@ -33115,17 +33160,21 @@ function pushListBacking(lIdx: i32, lTy: i32) {
 // stashed (`mapRecv >= 0`): field 1 for a vals walk, field 0 for a keys walk — not
 // re-emitted, so the walked list, tombstone `live[]` and loop bound stay on one object.
 function emitForInList(iterIx: i32, fnIx: i32, mapRecv: i32, mwShape: i32) {
-  if mapRecv >= 0 {
-    cmSlot = mwShape
-    if forInWalksMapValues(iterIx, fnIx) { return pushMapVals() }
-    return pushMapKeys()
-  }
+  if mapRecv >= 0 { return forInMapList(iterIx, fnIx, mwShape) }
   const prevLit = gForIterLit
   gForIterLit = unwrapParen(iterIx)
   const rc = emitExpr(iterIx, fnIx)
   gForIterLit = prevLit
   if rc < 0 { return -1 }
   return svSyncRecv(iterIx, fnIx)
+}
+
+// A map walk's list off the stashed map `mapRef` of shape `mwShape`: its values list for a
+// `.values()` walk, else its keys list.
+export function forInMapList(iterIx: i32, fnIx: i32, mwShape: i32) {
+  cmSlot = mwShape
+  if forInWalksMapValues(iterIx, fnIx) { return pushMapVals() }
+  return pushMapKeys()
 }
 
 // Whether function `fnIx` (at `fnStmts` position `fnPos` when inferred) declares a ref-list result.
@@ -36347,10 +36396,10 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
   return svSyncRecv(iterIx, fnIx)
 }
 
-// Why `for` statement `s` at `stmtIx` is not the plain walk, or "": an i32 or string list, or a
-// string's code points, read once into its temp, no second name, no map or byte source, no
-// literal iterable, no slot pinned by node, and a body that may reallocate a list, so its header
-// is re-read each step and nothing is hoisted or unrolled.
+// Why `for` statement `s` at `stmtIx` is not the plain walk, or "": an i32 or string list, a
+// string's code points, or a map's keys or values, read once into its temp, no second name, no
+// byte source, no literal iterable, no slot pinned by node, and a body that may reallocate a list,
+// so its header is re-read each step and nothing is hoisted or unrolled ("hoisted" otherwise).
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
@@ -36358,7 +36407,6 @@ export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if ek != "i32" && ek != "str" { return "element " + ek }
   if forInU8Src(s.fiIter, fnIx) { return "byte source" }
   if s.fiVar2 != "" { return "pair" }
-  if forInMapRecv(s.fiIter, fnIx) >= 0 { return "map" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if nodeAt(unwrapParen(s.fiIter)) is ArrayLit { return "literal" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
@@ -36439,8 +36487,13 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
 // The stash is per loop, never the shared mapRef, which any map op in the body rewrites
 // (D2313). Writes `lp.mwShape` and `lp.fiMap`; returns -1 when the receiver fails, else 0.
 function emitForInMapStash(fnIx: i32, lp: ForInLoop): i32 {
-  lp.mwShape = mapShapeFoldSet(mapShapeOfExpr(lp.mapRecv, fnIx))
   if pushMapRecvRef(lp.mapRecv, fnIx) < 0 { return -1 }
+  return forInMapStash(fnIx, lp)
+}
+
+// After a map walk's receiver `(ref $map)`: the walk's stash, through the op's mapRef.
+export function forInMapStash(fnIx: i32, lp: ForInLoop): i32 {
+  lp.mwShape = mapShapeFoldSet(mapShapeOfExpr(lp.mapRecv, fnIx))
   cmSlot = lp.mwShape
   setMapRef() // mapRef — read by `emitForInList`, before any body op rewrites it
   lp.fiMap = forInMapStashSlot(cmMapTy())
@@ -39702,6 +39755,8 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
   // length field — the list wrapper's `len` (field 1) or the string header's `len`
   // (field 2), a code-point count. `length` over any other receiver falls through to the struct path.
   if e.memProp == "length" {
+    // A record's own `length` field is any field; the IR's plain read takes the same decision.
+    if lengthIsField(e, exprIx, fnIx) { return emitMem(exprIx, fnIx) }
     const growLen = emitListFitGrowLen(e, exprIx, fnIx)
     if growLen != 0 { return if growLen < 0 { -1 } else { 0 } }
     const armLen = emitArmSite(exprIx, fnIx)

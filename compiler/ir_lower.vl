@@ -235,6 +235,8 @@ import {
   forInListStore,
   forInListSync,
   forInLoopClose,
+  forInMapList,
+  forInMapStash,
   forInRolledOpen,
   hoistCandRow,
   hoistReadTail,
@@ -277,6 +279,7 @@ import {
   staticAtomId,
   structFieldPlain,
   structFieldTail,
+  structUnionBoxTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionUnionEqTail,
@@ -285,6 +288,7 @@ import {
   userGlobalWriteClass,
   variantFieldPlain,
   variantFieldTail,
+  variantUnionBoxTail,
   voidTailCallee,
 } from "./wasmEmit"
 import { nullRetPlanOf } from "./emit_plan_null"
@@ -834,8 +838,15 @@ function fieldTail(at: i32, m: Member) {
   if idx < 0 { return irLMiss("field shape") }
   if vi >= 0 {
     variantFieldTail(vi, idx, at, fnIx)
+    if variantUnionBoxTail(vi, idx, at, fnIx) < 0 {
+      return irLMiss("field unbox")
+    }
   } else {
-    structFieldTail(structIndexOfExpr(m.memObj, fnIx), idx, at, fnIx)
+    const si = structIndexOfExpr(m.memObj, fnIx)
+    structFieldTail(si, idx, at, fnIx)
+    if structUnionBoxTail(si, idx, at, fnIx) < 0 {
+      return irLMiss("field unbox")
+    }
   }
   return emitReadRecover(at, fnIx)
 }
@@ -896,8 +907,18 @@ function forIn(n: SForIn, pending: i32[]) {
     false,
   )
   if lp == null { return irLMiss("walk backing") }
-  cond(n.xfList, pending)
-  if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
+  if n.xfMap >= 0 {
+    if lp.mapRecv < 0 { return irLMiss("walk map") }
+    irLSettle(pending)
+    globalRead(n.xfMap, n.xfMapNonNull)
+    mapRecvRefTail(lp.mapRecv, fnIx)
+    forInMapStash(fnIx, lp)
+    forInMapList(s.fiIter, fnIx, lp.mwShape)
+  } else {
+    if lp.mapRecv >= 0 { return irLMiss("walk map") }
+    cond(n.xfList, pending)
+    if forInListSync(s.fiIter, fnIx) < 0 { return irLMiss("walk list") }
+  }
   forInListStore(s.fiIter, fnIx, lp)
   forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
@@ -1403,7 +1424,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if !t && r.crDrop { fbDrop() }
         return 0
       }
-      if r is RListPush || r is RListPop {
+      if r is RListPush || r is RListPop || r is RStrOp {
         irLowerEffectHook(r)
         irLSettle(pending)
         return 0
