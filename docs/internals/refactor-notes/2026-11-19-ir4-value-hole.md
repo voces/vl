@@ -42,19 +42,19 @@
 
 ## Measured
 
-Fixpoint seeds on both sides, master e1419277f against this branch.
+Fixpoint seeds on both sides, master 6af1fed0c against this branch merged with it.
 
 | bar | result |
 |---|---|
 | `ir-identity.sh` plain | identical 9,034, fail under both 3,267, differ 0; self-compile identical |
 | `ir-identity.sh --names` | identical 9,034, differ 0; self-compile identical |
-| `ir-identity.sh --cases` | identical 7,504, fail under both 68, differ 0 |
+| `ir-identity.sh --cases` | identical 7,508, fail under both 68, differ 0 |
 | armed shadow | 30,648 covered = verified = matched (master 30,648) |
 | `--claims` | 30,648 emitted by the IR, ok |
-| mode 3 self | byte-identical, 0 fell back, 12,646 claimed (master 12,645) |
+| mode 3 self | byte-identical, 0 fell back, 12,665 claimed |
 | pin helpers, `emit_mono.vl` | 905 |
-| L2 fuel | L2_FUEL |
-| lint-self, phase state, late demands | LINT_ETC |
+| L2 fuel | 98,791,652,397: master 98,981,064,907, so −0.19% (+0.7% on the committed baseline, which master is +0.9% on) |
+| lint-self, phase state, late demands | clean; ok (not rising); 9 = baseline 9, late tag rows 307 = 307 |
 
 **Driver census** (`ir-driver-census.sh`, `.reentry`):
 
