@@ -48,6 +48,7 @@ import {
   Opnd,
   PrimOp,
   RCall,
+  RStrOp,
   Rhs,
   SIf,
   SLet,
@@ -556,7 +557,7 @@ function memberUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
   return irBMiss("member hook not installed")
 }
 
-function inPlaceNone(_ix: i32, _fnIx: i32): boolean { return false }
+function inPlaceNone(_ix: i32, _fnIx: i32): i32 { return 0 }
 
 function unionEqNone(_ix: i32, _fnIx: i32): boolean { return false }
 
@@ -573,7 +574,7 @@ export let irVarRepOkHook: (r: i32, ty: i32) => boolean = refRepNone
 export let irIndexHook: (b: i32[], ix: i32, rep: i32) => Opnd = indexUnset
 export let irMemberHook: (b: i32[], ix: i32, rep: i32) => Opnd = memberUnset
 export let irStrBinHook: (b: i32[], ix: i32, rep: i32) => Opnd = strBinUnset
-export let irInPlaceHook: (ix: i32, fnIx: i32) => boolean = inPlaceNone
+export let irInPlaceHook: (ix: i32, fnIx: i32) => i32 = inPlaceNone
 export let irUnionEqHook: (ix: i32, fnIx: i32) => boolean = unionEqNone
 export let irListEqHook: (ix: i32, fnIx: i32) => boolean = listEqNone
 
@@ -2026,9 +2027,34 @@ function strLit(ix: i32, rep: i32): Opnd {
 }
 
 function assign(b: i32[], n: BinExpr, ix: i32) {
+  // Legacy appends a string in place at a local and at a list element alike; the accumulator
+  // keeps its own lowering, and a site's chain must be the right side the store delivers.
+  const mode = irInPlaceHook(ix, ibFnIx)
+  if mode < 0 { return skip("string accumulator") }
+  const n0 = ib.irNodes.length
+  assignTo(b, n, ix)
+  if ibMiss == "" && mode > 0 && !siteBuilt(n0, ix) {
+    return skip("string append site")
+  }
+  return 0
+}
+
+// Whether a node from `n0` on joins site `ix`'s chain (`buildStrBin`'s `str.site`).
+function siteBuilt(n0: i32, ix: i32): boolean {
+  let i = n0
+  while i < ib.irNodes.length {
+    const nd = ib.irNodes[i]
+    if nd is SLet {
+      const r = nd.lRhs
+      if r is RStrOp && r.soOp == "site" && r.soAt == ix { return true }
+    }
+    i = i + 1
+  }
+  return false
+}
+
+function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
-  // Legacy appends a string in place at a local and at a list element alike.
-  if irInPlaceHook(ix, ibFnIx) { return skip("string append in place") }
   if t is Index { return elemStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
   const d = identDeclOf(n.binLeft)
@@ -2944,7 +2970,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
-  // The accumulator rows `strAssignInPlace` reads are the start's only while legacy just ran.
+  // The accumulator rows `strInPlaceMode` reads are the start's only while legacy just ran.
   if startStrAccMarked() { return "string accumulator" }
   if gInitProgIdx >= 0 { return "progress cell" }
   const top: i32[] = []
