@@ -1303,7 +1303,11 @@ import {
   widenSrcWrapSlot,
   widenTmpSlot,
 } from "./emit_if_arm_values"
-import { isScalarBackedListRep, nulListBase } from "./emit_list_rep"
+import {
+  isScalarBackedListRep,
+  nulListBase,
+  vkNonNullRefTwin,
+} from "./emit_list_rep"
 import {
   arrElemIsNulBoolAt,
   arrElemIsNullUnitAt,
@@ -1744,6 +1748,7 @@ import {
   allocLitChunk,
   arrLitArmOf,
   arrLitBuild,
+  arrLitBuildTyOf,
   arrLitListBuild,
   arrLitRefPlainSlot,
   arrLitTakesAtom,
@@ -7927,9 +7932,9 @@ function emitIsArm(isIx: i32, fnIx: i32, arm: IsArm): i32 {
       1
     }
     "nulTest" => {
+      // An impossible test still evaluates a receiver that is not a re-readable place.
       if nulNicheIsTestImpossible(nd.isObj, isVarTyIxOf(isIx), fnIx) {
-        fbI32Const(0)
-        return 1
+        return isConstAfterRecv(nd, 0, fnIx)
       }
       if emitNulIsNullTest(nd.isObj, fnIx, !isTestsNull(isIx), true) < 0 {
         return -1
@@ -8283,14 +8288,27 @@ export function variantFieldTail(vi: i32, idx: i32, memIx: i32, fnIx: i32) {
 }
 
 // Whether `emitExpr` reads member `memIx` through `emitMem`'s plain arms: no null-unit or niche
-// read, no `length`, no two-list use, and a receiver read raw.
+// read, no `length` but a record's own field, no two-list use, and a receiver read raw unless it is
+// a field read, which recovers itself.
 function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   const m = nodeAt(memIx)
-  if !(m is Member) || m.memProp == "length" { return false }
+  if !(m is Member) { return false }
+  if m.memProp == "length" && !lengthIsField(m, memIx, fnIx) { return false }
   if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
+  // A field read's receiver recovers in its own read; any other receiver owing one is not plain.
   return twoListUseMsg(m.memObj, m.memProp, fnIx) == ""
-    && !readOwesNonNullRecover(m.memObj, fnIx)
+    && (nodeAt(m.memObj) is Member || !readOwesNonNullRecover(m.memObj, fnIx))
+}
+
+// Whether `.length` read `m` at `memIx` is a record's own field, which `emitMemberNode` reads as
+// any field: a struct or variant receiver, with no list-fit grow row and no union-of-containers arm.
+function lengthIsField(m: Member, memIx: i32, fnIx: i32): boolean {
+  const o = m.memObj
+  if structIndexOfExpr(o, fnIx) < 0 && exprVariantIndex(o, fnIx) < 0 {
+    return false
+  }
+  return listFitGrowRow(o, -1, fnIx) < 0 && !armSiteReads(memIx, fnIx)
 }
 
 // The field `emitExpr` reads off a bare variant receiver in `emitMemVariantRead`'s plain form,
@@ -8308,12 +8326,14 @@ export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   return if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { idx } else { -1 }
 }
 
-// Whether flat field row `row` stores the kind member read `memIx` records, or its nullable
-// string twin the field read recovers: a row adopted at another kind converts at the delivery.
+// Whether flat field row `row` stores the kind member read `memIx` records, or its nullable twin
+// the read recovers (`emitReadRecover`): a row adopted at another kind converts at the delivery.
 function fieldStoresRead(row: i32, memIx: i32, fnIx: i32): boolean {
   const sk = fieldRowStorageKind(row)
   const rk = repOfNode(memIx, fnIx).rdKind
-  return sk != null && (sk == rk || sk == "nulstr" && rk == "str")
+  if sk == null { return false }
+  if sk == rk || sk == "nulstr" && rk == "str" { return true }
+  return vkNonNullRefTwin(sk) == rk && readOwesNonNullRecover(memIx, fnIx)
 }
 
 // The field `emitExpr` reads off a plain struct receiver in `emitMemStructRead`'s plain form, or
@@ -14702,7 +14722,20 @@ function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
 // `struct.new` for the wrapper; an empty `[]` shares its type's empty backing. Built at the
 // checker's type for it unless it has none; context restored on exit.
 function emitArr(arrIx: i32, fnIx: i32) {
-  return emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
+  const from = wLen()
+  const r = emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
+  if r >= 0 && irShadowOn {
+    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from)
+  }
+  return r
+}
+
+// The armed shadow's per-occurrence count of a legacy site (`irNodeInShadow`); a hook, since the
+// IR's builder imports this module.
+export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32) => i32 = nodeInShadowNone
+
+function nodeInShadowNone(_ix: i32, _fnIx: i32, _ty: i32, _from: i32): i32 {
+  return 0
 }
 
 // `emitArr` at the build pair `lb`: the literal's own, or the one a spread literal builds each
@@ -16109,34 +16142,29 @@ function mapGetOrHelperMiss(recvIx: i32, defIx: i32, fnIx: i32): i32[] {
     return []
   }
   if mapTyValLitUnionTexts(mt).length > 0 { return [] }
-  const d = nodeAt(unwrapParen(defIx))
-  let lit = d is NumLit
-  if d is Unary { lit = nodeAt(unwrapParen(d.unArg)) is NumLit }
-  if !lit { return [] }
-  const ins: u8[] = []
-  const prev = wTarget(ins)
-  const rc = emitMonoMapDefault(recvIx, defIx, fnIx)
-  wTarget(prev)
-  if rc < 0 || !isOneConstIns(ins) || (ins[0] as i32) != 0x41 { return [] }
-  return [slebI32At(ins, 1)]
+  return mapDefaultI32Of(defIx, fnIx)
 }
 
-// The signed LEB128 i32 at `at` in `b`.
-function slebI32At(b: u8[], at: i32): i32 {
-  let v = 0
-  let sh = 0
-  let i = at
-  while i < b.length {
-    const x = b[i] as i32
-    v = v | ((x & 127) << sh)
-    sh = sh + 7
-    i = i + 1
-    if (x & 128) == 0 {
-      if sh < 32 && (x & 64) != 0 { v = v | (0 - (1 << sh)) }
-      return v
-    }
+// `[v]` when `??` default `defIx` is written as the one `i32.const v`: an integer literal at
+// `i32` (`emitNumLitNode`), or one negated at `i32` (`emitSignedNumLitAt`); else [].
+function mapDefaultI32Of(defIx: i32, fnIx: i32): i32[] {
+  const ix = unwrapParen(defIx)
+  if ix < 0 { return [] }
+  const d = nodeAt(ix)
+  if d is NumLit {
+    if numLitWidth(ix, fnIx) != "i32" { return [] }
+    const v = memOffsetLexValue(numLitLexAt(ix, d.numText, "i32"))
+    return if v < 0 { [] } else { [v as% i32] }
   }
-  return v
+  if !(d is Unary) || d.unOp != "-" || numLitTyWidth(ix, fnIx) != "i32" {
+    return []
+  }
+  const inner = unwrapParen(d.unArg)
+  if inner < 0 { return [] }
+  const n = nodeAt(inner)
+  if !(n is NumLit) { return [] }
+  const v = memOffsetLexValue(numLitLexAt(inner, n.numText, "i32"))
+  return if v < 0 { [] } else { [0 - (v as% i32)] }
 }
 
 // The mono-valued map shape a plain build reads `recvIx[k]` through `__map_get_<row>__` with, or
@@ -20115,15 +20143,33 @@ function strSiteArmsAt(binIx: i32, fnIx: i32): i32 {
   return mode
 }
 
-// Whether assignment `binIx` writes its string right side in place, as the loop accumulator or
-// an append site, rather than evaluating it as a value.
+// How assignment `binIx` writes its string right side in place: -1 as the loop accumulator, the
+// site mode its chain lowers under (`strSiteCatTail`), or 0 as a plain value.
 // A function legacy does not lower is scanned here, as its body lowering would scan it.
-export function strAssignInPlace(binIx: i32, fnIx: i32): boolean {
+export function strInPlaceMode(binIx: i32, fnIx: i32): i32 {
   if saFnIx != fnIx {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl { strAccScan(fn.fnBody, fnIx) }
   }
-  return strAccAppendOk(binIx, fnIx) || strSiteArmsAt(binIx, fnIx) != 0
+  if strAccAppendOk(binIx, fnIx) { return -1 }
+  return strSiteArmsAt(binIx, fnIx)
+}
+
+// The armed site assignment whose right side is the chain at `rhsIx`, or -1.
+export function strSiteOfRhs(rhsIx: i32, fnIx: i32): i32 {
+  let i = 0
+  while i < saSites.length {
+    const a = nodeAt(saSites[i])
+    if (
+      a is BinExpr
+      && a.binRight == rhsIx
+      && strSiteArmsAt(saSites[i], fnIx) > 0
+    ) {
+      return saSites[i]
+    }
+    i = i + 1
+  }
+  return -1
 }
 
 // Arm the site lowering for the assignment at `binIx`, or disarm it.
@@ -20173,12 +20219,16 @@ function siteSet(i: i32, glob: boolean) {
 // extends what part 0 read, 2 what the last part read. A miss allocates exact-fit, so a one-off
 // append keeps no slack; a full hit doubles, so a loop pays one extra copy and stays linear.
 function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
-  const n = parts.length
   let i = 0
-  while i < n {
+  while i < parts.length {
     if emitStrValue(parts[i], fnIx) < 0 { return -1 }
     i = i + 1
   }
+  return strSiteCatTail(parts.length, mode, binIx)
+}
+
+// Joins the `n` string parts on the stack into site `binIx`'s buffer under `mode`.
+export function strSiteCatTail(n: i32, mode: i32, binIx: i32) {
   let j = n - 1
   while j >= 0 {
     fbLocalSet(strCatSlot(j))
@@ -23373,10 +23423,7 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   const prim = nodeTyPrimName(w)
   if prim != "" && prim != "string" { return placePrePathWhy(w, fnIx) }
   if coerceKindAt(ix, fnIx) != "none" { return "pre-path coercion" }
-  const tagLeaf = fnTagLeafId(ix)
-  if tagLeaf >= 0 && monoTokenReturnedFe(ix, fnIx) < 0 {
-    return "pre-path tag leaf"
-  }
+  if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
   if hookTakesAtom(ix, fnIx) && !(nodeAt(w) is StrLit) {
@@ -23398,6 +23445,14 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
     }
   }
   return placePrePathWhy(ix, fnIx)
+}
+
+// The member id node `ix` is written as, a tagged function set's value, or -1. A maker twin's
+// returned member is the closure its token names, not the id (D14825). Legacy and the IR share it.
+export function fnTagLeafEmitted(ix: i32, fnIx: i32): i32 {
+  const id = fnTagLeafId(ix)
+  if id < 0 || monoTokenReturnedFe(ix, fnIx) >= 0 { return -1 }
+  return id
 }
 
 // `emitExpr`'s null-unit and niche reads of a place or method call `ix`, or "".
@@ -23437,9 +23492,8 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
     return 0
   }
   // A tagged function set's value is its member's id, and a call through one dispatches on it.
-  // A maker twin's returned member is the closure its token names, not the id (D14825).
-  const tagLeaf = fnTagLeafId(exprIx)
-  if tagLeaf >= 0 && monoTokenReturnedFe(exprIx, fnIx) < 0 {
+  const tagLeaf = fnTagLeafEmitted(exprIx, fnIx)
+  if tagLeaf >= 0 {
     fbI32Const(tagLeaf)
     return 0
   }
@@ -25163,6 +25217,7 @@ function emitNumWrapCast(e: AsExpr, exprIx: i32, fnIx: i32) {
     "narrowMask" => srEmitNarrowed(srWrappedMask(exprIx, fnIx), fnIx)
     "litFold" => emitNumWrapLit(obj, exprIx)
     "plain" => emitNumWrapPlain(obj, exprIx, fnIx)
+    "notCast" => emitFail("emitProgram: a wrap cast's arm was asked of a node that is no cast")
   }
 }
 
@@ -25179,10 +25234,11 @@ export type AsWrapArm = "floatFloor"
   | "narrowMask"
   | "litFold"
   | "plain"
+  | "notCast"
 
 export function asWrapArmOf(exprIx: i32, fnIx: i32): AsWrapArm {
   const e = nodeAt(exprIx)
-  if !(e is AsExpr) { return "unionFloor" }
+  if !(e is AsExpr) { return "notCast" }
   const obj = e.asObj
   const tgt = wrapCastTgt(exprIx)
   if (
@@ -25956,6 +26012,7 @@ export type AsCastArm = "zextLoad"
   | "exact"
   | "union"
   | "plain"
+  | "notCast"
 
 // An unsigned narrow load widened to i64 is the zero-extending i64 load (`zextLoadOf`). A `new
 // v128` brand cast re-brands the same 128 bits; a boxed `v128 | null` or union operand takes the
@@ -25963,7 +26020,7 @@ export type AsCastArm = "zextLoad"
 // exact-or-fail (D1041) is checked ahead of it and disjoint from it by operand.
 export function asCastArmOf(exprIx: i32, fnIx: i32): AsCastArm {
   const e = nodeAt(exprIx)
-  if !(e is AsExpr) { return "union" }
+  if !(e is AsExpr) { return "notCast" }
   const obj = e.asObj
   if e.asTy == "i64" && zextLoadOf(exprIx, fnIx) >= 0 { return "zextLoad" }
   if e.asTy == "v128" && !exprUnion(obj, fnIx) { return "v128" }
@@ -26037,6 +26094,7 @@ function emitAsCast(e: AsExpr, exprIx: i32, fnIx: i32) {
     "exact" => emitNumExactCast(e, exprIx, fnIx)
     "union" => emitAsUnionCast(e, exprIx, fnIx)
     "plain" => emitNumPlainCast(obj, e.asTy, fnIx)
+    "notCast" => emitFail("emitProgram: a cast's arm was asked of a node that is no cast")
   }
 }
 
@@ -26109,12 +26167,12 @@ export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
     "exact" => if e.asMode == "trap" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => -1
-    "union" => -1
+    "union" | "notCast" => -1
   }
 }
 
 // The primitive type of value kind `k` (3 i64, 4 f64, 5 f32) that `numCastKindOf` builds an
-// operand at, or -1 for kind 0, the operand as itself.
+// operand at, or -1 for any other kind (0 is the operand as itself).
 export function numCastKindTy(k: i32): i32 {
   if k == 3 { return TY_I64 }
   if k == 4 { return TY_F64 }
@@ -26134,7 +26192,7 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
     "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
     "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => numCastNoTail()
-    "union" => numCastNoTail()
+    "union" | "notCast" => numCastNoTail()
   }
 }
 
@@ -34966,6 +35024,12 @@ function emitSwitchArm(
   return emitStmt(blk, fnIx)
 }
 
+// Whether `emitIntSwitch` may lower the chain at `ix` as a `br_table`: it may still decline, so
+// a builder that writes chains leaves every such link to legacy.
+export function intSwitchMayLower(ix: i32): boolean {
+  return intMatchHeadAt(ix)
+}
+
 // Lowers the integer-`match` chain headed at `headIx` as a `br_table` in `mode` (see
 // `emitSwitchArm`): 1 when lowered, 0 when it declined having written nothing, -1 on an emit
 // failure. Arms are emitted in chain order — the collect pass's — so the let cursor stays in step.
@@ -37447,7 +37511,7 @@ export type GlobalCtx = {
 }
 
 // The context of the access legacy's emitter is writing now.
-function globalCtxNow(): GlobalCtx {
+export function globalCtxNow(): GlobalCtx {
   const c: GlobalCtx = {
     gcInStart: gPromoInStart,
     gcFnPos: emitCurFnPos,

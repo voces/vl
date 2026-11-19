@@ -234,7 +234,6 @@ print(guard(2))
   `function cmp(a: string, b: string): boolean { return a + "x" == b || a > b }\nprint(cmp("a", "b"))\n`,
   `function dig(c: i32): boolean { return c >= '0' && c <= '9' }\nprint(dig(53))\n`,
   `function at(xs: string[], i: i32): string { return xs[i] }\nprint(at(["a", "b"], 1))\n`,
-  `function note(s: string) {\n  const xs = [[s]]\n  print(xs[0][0])\n}\nfunction tw(s: string) { return note(s + "!") }\ntw("a")\n`,
   `type K = "p" | "q"\nfunction pick(c: boolean): K {\n  if c { return "p" }\n  return "q"\n}\nprint(pick(true) == "p")\n`,
   `function tl(s: string, n: i32): string { return s.slice(n, s.length) }\nprint(tl("hello", 2))\n`,
   `function cps(s: string): i32 { return s.cpLen() + 1 }\nprint(cps("ab"))\n`,
@@ -355,6 +354,27 @@ print(rv(2) + ln(2).length)
   },
 });
 
+// A read off a ref list at a string-list element, and a string concat delivered as an argument:
+// both functions covered and matched, along `refListGetTail` and the concat's shared tail.
+Deno.test({
+  name: "ir shadow: a ref list read at a non-scalar element is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function note(s: string) {
+  const xs = [[s]]
+  print(xs[0][0])
+}
+function tw(s: string) { return note(s + "!") }
+tw("a")
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A nested list literal whose elements build as themselves is a plain ref list, built along
 // `emitArrRef`'s shared decision and tail, and matches legacy's bytes.
 Deno.test({
@@ -380,6 +400,33 @@ Deno.test({
   fn: () => {
     const src = `function e(): u8[] { return [] }
 print(e().length)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// An append and a prepend site in a loop build their right side through `emitStrSiteCat`'s
+// shared tail and match legacy's bytes; the loop accumulator stays a named miss.
+Deno.test({
+  name: "ir shadow: a string append site is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function ap(n: i32): string {
+  const xs = ["x", "y"]
+  let s = "q"
+  let i = 0
+  while i < n {
+    s = "a" + xs[0] + s
+    xs[0] = xs[0] + "b" + s
+    i = i + 1
+  }
+  return xs[0]
+}
+print(ap(3))
 `;
     const { rows } = run(src, true);
     if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
@@ -740,16 +787,12 @@ print(two("a", "b"))
 });
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom, a function-tag leaf, a tagged call's dispatch, and a
-// delivery `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+// bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
+// `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
-  ],
-  [
-    "tag leaf",
-    `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`,
   ],
   [
     "tag dispatch",
@@ -779,6 +822,28 @@ Deno.test({
           }`,
         );
       }
+    }
+  },
+});
+
+// A function-tag leaf is its member's id (`fnTagLeafEmitted`), which the IR builds as an i32
+// immediate: no node misses at the leaf, and every function built matches legacy's bytes.
+const TAG_LEAF =
+  `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`;
+Deno.test({
+  name: "ir shadow: a function-tag leaf builds as its member's id and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_LEAF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path tag leaf")) {
+      throw new Error(`want no tag-leaf miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

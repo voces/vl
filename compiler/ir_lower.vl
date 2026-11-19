@@ -52,6 +52,7 @@ import {
   nodeAt,
 } from "./ast"
 import { unwrapParen } from "./emit_base"
+import { relTrim } from "./emit_reloc"
 import {
   exprVariantIndex,
   forInElemKind,
@@ -238,6 +239,7 @@ import {
   holeBoxTail,
   holeBoxTyAt,
   idxRowsOn,
+  idxSpanOn,
   initBitOf,
   loopHoistCands,
   loopHoistClose,
@@ -1740,32 +1742,7 @@ function runAgrees(rep: i32, li: i32): boolean {
 // Lowers `f`'s body, with its globals accessed in `ctx`, into `lwBuf` up to its `end`, or a
 // mismatch class in `lwMiss`.
 function lowerBody(f: IrFn, ctx: GlobalCtx) {
-  lw = f
-  lwGlobalCtx = ctx
-  lwMiss = ""
-  lwTempRhs = []
-  lwTempDef = []
-  lwTempUsed = []
-  lwStackVal = []
-  lwStackLive = 0
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
-  for _v in f.irVars {
-    lwTempRhs.push(none)
-    lwTempDef.push(false)
-    lwTempUsed.push(false)
-    lwStackVal.push(false)
-  }
-  lwSeq = []
-  lwFrames = []
-  lwSpanOpen = []
-  lwSpanAt = []
-  lwRowAst = []
-  lwRowFrom = []
-  lwRowTo = []
-  lwRowKind = []
-  lwBuf = []
-  lwSinkFired = 0
-  lwPushed = []
+  lwReset(f, ctx, [])
   uBoxNewEnd = -1
   // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
@@ -1792,6 +1769,189 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   // Every frame a builder opened is closed, so the one depth not given back is the function's
   // own `end`'s, which opened none.
   ctrlDepth = ctrlDepth + 1
+  return 0
+}
+
+// Starts lowering `f`, its globals accessed in `ctx`, onto `buf`.
+function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
+  lw = f
+  lwGlobalCtx = ctx
+  lwMiss = ""
+  lwTempRhs = []
+  lwTempDef = []
+  lwTempUsed = []
+  lwStackVal = []
+  lwStackLive = 0
+  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  for _v in f.irVars {
+    lwTempRhs.push(none)
+    lwTempDef.push(false)
+    lwTempUsed.push(false)
+    lwStackVal.push(false)
+  }
+  lwSeq = []
+  lwFrames = []
+  lwSpanOpen = []
+  lwSpanAt = []
+  lwRowAst = []
+  lwRowFrom = []
+  lwRowTo = []
+  lwRowKind = []
+  lwBuf = buf
+  lwSinkFired = 0
+  lwPushed = []
+  lwPushing = false
+  return 0
+}
+
+// The lowering's whole state, saved around a fragment lowered while another lowering is open.
+type LwFrame = {
+  lfFn: IrFn,
+  lfCtx: GlobalCtx,
+  lfMiss: string,
+  lfTempRhs: Rhs[],
+  lfTempDef: boolean[],
+  lfTempUsed: boolean[],
+  lfStackVal: boolean[],
+  lfStackLive: i32,
+  lfSeq: i32[],
+  lfFrames: i32[],
+  lfSpanOpen: i32[],
+  lfSpanAt: i32[],
+  lfRowAst: i32[],
+  lfRowFrom: i32[],
+  lfRowTo: i32[],
+  lfRowKind: i32[],
+  lfBuf: u8[],
+  lfSinkFired: i32,
+  lfPushed: i32[],
+  lfPushing: boolean,
+}
+
+function lwSave(): LwFrame {
+  const f: LwFrame = {
+    lfFn: lw,
+    lfCtx: lwGlobalCtx,
+    lfMiss: lwMiss,
+    lfTempRhs: lwTempRhs,
+    lfTempDef: lwTempDef,
+    lfTempUsed: lwTempUsed,
+    lfStackVal: lwStackVal,
+    lfStackLive: lwStackLive,
+    lfSeq: lwSeq,
+    lfFrames: lwFrames,
+    lfSpanOpen: lwSpanOpen,
+    lfSpanAt: lwSpanAt,
+    lfRowAst: lwRowAst,
+    lfRowFrom: lwRowFrom,
+    lfRowTo: lwRowTo,
+    lfRowKind: lwRowKind,
+    lfBuf: lwBuf,
+    lfSinkFired: lwSinkFired,
+    lfPushed: lwPushed,
+    lfPushing: lwPushing,
+  }
+  return f
+}
+
+function lwRestore(f: LwFrame) {
+  lw = f.lfFn
+  lwGlobalCtx = f.lfCtx
+  lwMiss = f.lfMiss
+  lwTempRhs = f.lfTempRhs
+  lwTempDef = f.lfTempDef
+  lwTempUsed = f.lfTempUsed
+  lwStackVal = f.lfStackVal
+  lwStackLive = f.lfStackLive
+  lwSeq = f.lfSeq
+  lwFrames = f.lfFrames
+  lwSpanOpen = f.lfSpanOpen
+  lwSpanAt = f.lfSpanAt
+  lwRowAst = f.lfRowAst
+  lwRowFrom = f.lfRowFrom
+  lwRowTo = f.lfRowTo
+  lwRowKind = f.lfRowKind
+  lwBuf = f.lfBuf
+  lwSinkFired = f.lfSinkFired
+  lwPushed = f.lfPushed
+  lwPushing = f.lfPushing
+  return 0
+}
+
+// Lowers fragment `f` with value `out` (`irLowerNodeIn`) onto the buffer being written, where
+// legacy's own writer would leave it, in legacy's frame for `fnStmts` slot `fnPos`. "" when
+// written, its rows banked as legacy banks them unless `probe`; else the miss, with the buffer,
+// its relocation rows and the callees as found. A `probe` leaves the emitter's state as found.
+export function irLowerFragment(
+  f: IrFn,
+  out: Opnd,
+  ctx: GlobalCtx,
+  fnPos: i32,
+  probe: boolean,
+): string {
+  const sv = lwSave()
+  const callees0 = dfeCallee.length
+  const box0 = uBoxNewEnd
+  const depth0 = ctrlDepth
+  const cur = wTarget([])
+  wTarget(cur)
+  const at = cur.length
+  lwReset(f, ctx, cur)
+  fragmentBody(f.irBody, out)
+  if lwSinkFired > 0 { irLMiss("fragment return") }
+  if ctrlDepth != depth0 { irLMiss("fragment control depth") }
+  const why = lwMiss
+  if why == "" && probe {
+    while dfeCallee.length > callees0 { dfeCallee.pop() }
+    uBoxNewEnd = box0
+  } else if why == "" {
+    fragmentRows(fnPos)
+  } else {
+    while cur.length > at { cur.pop() }
+    relTrim()
+    while dfeCallee.length > callees0 { dfeCallee.pop() }
+    ctrlDepth = depth0
+  }
+  lwRestore(sv)
+  return why
+}
+
+// Writes fragment body `b`, then its value `out`, which consumes what the body left pending as a
+// `return`'s value does.
+function fragmentBody(b: i32[], out: Opnd) {
+  const pending: i32[] = []
+  for id in b {
+    if lwMiss != "" { return 0 }
+    spanOpen(id)
+    node(id, pending, false, -1)
+    spanClose(id)
+  }
+  cond(out, pending)
+  if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
+  return 0
+}
+
+// A fragment's rows, banked as legacy's writers bank them: an element read's only where the
+// `vl-src` section is written, else noted for the shadow; a statement's always.
+function fragmentRows(fnPos: i32) {
+  let r = 0
+  while r < lwRowAst.length {
+    if lwRowKind[r] == 6 && !idxSpanOn() {
+      shIdxNode.push(lwRowAst[r])
+      shIdxFrom.push(lwRowFrom[r])
+      shIdxTo.push(lwRowTo[r])
+    } else {
+      bankSpanRow(
+        lwRowAst[r],
+        fnPos,
+        lwRowFrom[r],
+        lwRowTo[r],
+        lwRowKind[r],
+        "",
+      )
+    }
+    r = r + 1
+  }
   return 0
 }
 
