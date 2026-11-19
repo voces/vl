@@ -10079,70 +10079,10 @@ function emitUnionCoerceValueAtom(
     // under the string tag; the id is read once (D3347).
     const nlTexts = nulAtomWidenTexts(exprIx, fnIx)
     if nlTexts.length > 0 {
-      // Beside a plain `string` arm the join is `string | null`, not this box.
-      const nlStrArm = msHasPlainValKind(msSetOfTyAny(uTy), 2)
-      // A binding typed `K | null` holds the atom at every spelling; a parameter does too, unless
-      // its function's declared return reads the box at the declaration's rep.
-      const nlArg = nodeAt(unwrapParen(exprIx))
-      let nlParam = false
-      if (nlArg is Ident && (fnIx < 0 || paramPosOfRead(fnIx, exprIx) < 0)) {
-        nlParam = true
-      }
-      if nlArg is Ident && fnIx >= 0 {
-        const nlFn = nodeAt(fnIx)
-        // A pinned instance's parameter holds the atom too: the instance reads it at its own rep.
-        if nlFn is FuncDecl && (nlFn.fnRet < 0 || fnInPinnedInstance(fnIx)) {
-          if paramPosOfRead(fnIx, exprIx) >= 0 { nlParam = true }
-        }
-        // A `K | null` niche parameter holds the atom id whatever the function's return (D4041).
-        if (
-          paramPosOfRead(fnIx, exprIx) >= 0
-          && exprNulLitUnion(exprIx, fnIx)
-        ) {
-          nlParam = true
-        }
-        // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
-        if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
-      }
-      // A declared `K | null` field or an atom-valued map read is the niche, outside an instance
-      // or where the instance's own type for the read is that niche.
-      if (
-        (nlArg is Member || nlArg is Index)
-        && ((!fnInPinnedInstance(fnIx) && !nodeTyHasTyVar(unwrapParen(exprIx)))
-          || tyIsNulLitUnionNiche(holeOperandTyOf(exprIx, fnIx)))
-        && exprNulLitUnion(exprIx, fnIx)
-      ) {
-        nlParam = true
-      }
-      if nlArg is Index && fnInPinnedInstance(fnIx) {
-        if tyIsLitUnion(tyMapValOf(mapRecvTyIn(nlArg.idxArr, fnIx))) {
-          nlParam = true
-        }
-      }
-      // A call whose callee hands its result back as the niche holds the atom (D12466).
-      if nlArg is Call && exprNulLitUnion(exprIx, fnIx) { nlParam = true }
-      if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
-        return emitFail(
-          "emitProgram: literal-union string widening with no members",
-        )
-      }
-      if emitStashAtomId(exprIx, fnIx) < 0 { return -1 }
-      fbI32Rel(RS_TAG, nullBoxTag())
-      fbI32Rel(RS_TAG, scalarTagOfKind(2))
-      pushStrScrI(0)
-      fbI32Const(-1)
-      fbI32Bin(70) // i32.eq
-      fbSelect() // the null tag if the id is -1
-      pushStrScrI(0)
-      fbI32Const(-1)
-      fbI32Bin(70)
-      fbIfRefNul(sTy(), true)
-      fbRefNull(sTy())
-      fbElse()
-      if emitAtomToStrChain(nlTexts, 0, strScratchBase + 3) < 0 { return -1 }
-      fbEnd()
-      fbStructNew(uBoxIdx)
-      return 0
+      const nlWhy = atomNulStrWhy(unionName, uSet, uTy, exprIx, fnIx)
+      if nlWhy != "" { return emitFail(nlWhy) }
+      if emitExpr(exprIx, fnIx) < 0 { return -1 }
+      return atomNulStrTail(nlTexts)
     }
     fbI32Rel(RS_TAG, scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
     if emitAtomToStr(exprIx, fnIx) < 0 { return -1 }
@@ -10150,6 +10090,86 @@ function emitUnionCoerceValueAtom(
     return 0
   }
   return emitUnionCoerceAtomBox(uSet, uTy, exprIx, bareIx, fnIx)
+}
+
+// Why a `K | null` atom `exprIx` does not box into set `uSet` (type `uTy`) as its member string,
+// or "": the union holds `null` and no plain `string` arm, and every spelling of the read holds
+// the atom (a binding, a parameter, a capture, a niche field or map read, a niche call).
+function atomNulStrWhy(
+  unionName: string,
+  uSet: i32,
+  uTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): string {
+  // Beside a plain `string` arm the join is `string | null`, not this box.
+  const nlStrArm = msHasPlainValKind(msSetOfTyAny(uTy), 2)
+  // A binding typed `K | null` holds the atom at every spelling; a parameter does too, unless
+  // its function's declared return reads the box at the declaration's rep.
+  const nlArg = nodeAt(unwrapParen(exprIx))
+  let nlParam = false
+  if (nlArg is Ident && (fnIx < 0 || paramPosOfRead(fnIx, exprIx) < 0)) {
+    nlParam = true
+  }
+  if nlArg is Ident && fnIx >= 0 {
+    const nlFn = nodeAt(fnIx)
+    // A pinned instance's parameter holds the atom too: the instance reads it at its own rep.
+    if nlFn is FuncDecl && (nlFn.fnRet < 0 || fnInPinnedInstance(fnIx)) {
+      if paramPosOfRead(fnIx, exprIx) >= 0 { nlParam = true }
+    }
+    // A `K | null` niche parameter holds the atom id whatever the function's return (D4041).
+    if (
+      paramPosOfRead(fnIx, exprIx) >= 0
+      && exprNulLitUnion(exprIx, fnIx)
+    ) {
+      nlParam = true
+    }
+    // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
+    if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
+  }
+  // A declared `K | null` field or an atom-valued map read is the niche, outside an instance
+  // or where the instance's own type for the read is that niche.
+  if (
+    (nlArg is Member || nlArg is Index)
+    && ((!fnInPinnedInstance(fnIx) && !nodeTyHasTyVar(unwrapParen(exprIx)))
+      || tyIsNulLitUnionNiche(holeOperandTyOf(exprIx, fnIx)))
+    && exprNulLitUnion(exprIx, fnIx)
+  ) {
+    nlParam = true
+  }
+  if nlArg is Index && fnInPinnedInstance(fnIx) {
+    if tyIsLitUnion(tyMapValOf(mapRecvTyIn(nlArg.idxArr, fnIx))) {
+      nlParam = true
+    }
+  }
+  // A call whose callee hands its result back as the niche holds the atom (D12466).
+  if nlArg is Call && exprNulLitUnion(exprIx, fnIx) { nlParam = true }
+  if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
+    return "emitProgram: literal-union string widening with no members"
+  }
+  return ""
+}
+
+// After a `K | null` atom's id: the null tag if the id is -1, else its member string among
+// `nlTexts` under the string tag, boxed.
+function atomNulStrTail(nlTexts: string[]): i32 {
+  setStrScrI(0)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(70) // i32.eq
+  fbSelect() // the null tag if the id is -1
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(70)
+  fbIfRefNul(sTy(), true)
+  fbRefNull(sTy())
+  fbElse()
+  if emitAtomToStrChain(nlTexts, 0, strScratchBase + 3) < 0 { return -1 }
+  fbEnd()
+  fbStructNew(uBoxIdx)
+  return 0
 }
 
 // The value-atom box `{ tag, payload }` for `exprIx` entering set `uSet`: the atom ladder
@@ -10873,8 +10893,9 @@ function emitArmForEffect(blockIx: i32, fnIx: i32) {
 // How a value is boxed into the `T | null` box the checker records at its delivery, around the
 // value: the null tag over an unread payload (`null`), a box as itself (`pass`), a value-atom box
 // of kind `hbKind` (`atom`, widened from kind `hbSrc` where that is not -1), the same box over a
-// literal written at the payload width (`lit`), or the box writer's own ladder (`ladder`).
-export type HoleBoxArm = "null" | "pass" | "atom" | "lit" | "ladder"
+// literal written at the payload width (`lit`), a `K | null` atom widened to its member string
+// (`atomStr`), or the box writer's own ladder (`ladder`).
+export type HoleBoxArm = "null" | "pass" | "atom" | "lit" | "atomStr" | "ladder"
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
 
 function holeBox(arm: HoleBoxArm, kind: i32, src: i32): HoleBox {
@@ -10902,17 +10923,37 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   if bareIx < 0 { return ladder }
   const bare = nodeAt(bareIx)
   if bare is IfStmt || bare is Index || callIsNever(bareIx) { return ladder }
-  if exprIsNulNone(exprIx, fnIx) {
-    return if bare is NullLit { holeBox("null", -1, -1) } else { ladder }
-  }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
-  const pn = tyPrimNameOf(nodeTyAt(bareIx, fnIx))
-  if pn == null || exprIsLitAtom(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
+  // Every rung below takes a value the record, niche and map rungs above it decline.
+  if (
+    nulVariantIdxOfExpr(exprIx, fnIx) >= 0
+    || exprVariantIndex(exprIx, fnIx) >= 0
+    || structIndexOfExpr(exprIx, fnIx) >= 0
+    || exprNulBool(bareIx, fnIx)
+    || coalesceNulRefNicheOperand(bareIx, fnIx)
+    || mapReadScalarBoxKind(exprIx, fnIx) >= 0
+  ) {
     return ladder
   }
+  // `emitUnionCoerceUnder`'s literal rung, or the null-typed value's.
+  if bare is NullLit { return holeBox("null", -1, -1) }
+  if exprIsNulNone(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
+    return ladder
+  }
+  const uSet = msSetOfRow(unRowOfTyKey(unionTy))
+  if exprIsLitAtom(exprIx, fnIx) {
+    const ur2 = unRowOfTyKey(unionTy)
+    const ums = unionMemberSetOfRow(ur2, boxDstName("", unionTy))
+    const un = if ums != "" { ums } else { boxDstName("", unionTy) }
+    const ok = coerceTakesAtomAsStr(uSet, unionTy)
+      && nulAtomWidenTexts(exprIx, fnIx).length > 0
+      && atomNulStrWhy(un, uSet, unionTy, exprIx, fnIx) == ""
+    return if ok { holeBox("atomStr", 2, -1) } else { ladder }
+  }
+  const pn = tyPrimNameOf(nodeTyAt(bareIx, fnIx))
+  if pn == null { return ladder }
   const pk = holePrimKind(pn)
   if pk < 0 { return ladder }
-  const uSet = msSetOfRow(unRowOfTyKey(unionTy))
   const k = coerceListAtomOf(
     coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
     unionTy,
@@ -10974,16 +11015,17 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
     }
-    "pass" => 0
+    "pass" | "atomStr" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
 
-// What plan `p` writes after its value (an `atom` plan's widening already applied).
-export function holeBoxTail(p: HoleBox): i32 {
+// What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
+export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
     "null" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
+    "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "ladder" => 0
   }
 }
@@ -10993,10 +11035,10 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
   if p.hbArm == "atom" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
-  } else if p.hbArm == "pass" {
+  } else if p.hbArm == "pass" || p.hbArm == "atomStr" {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
-  return holeBoxTail(p)
+  return holeBoxTail(p, exprIx, fnIx)
 }
 
 // The value at `exprIx` boxed into the union `unionName`. A box of a member set holding a member
