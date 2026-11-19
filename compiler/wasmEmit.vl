@@ -15791,6 +15791,7 @@ function emitMapPrep(recvIx: i32, keyIx: i32, fnIx: i32) {
 function emitMapPrepFor(recvIx: i32, keyIx: i32, fnIx: i32, needSlot: boolean) {
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   // Pop the stacked pair into the frame only now — user code is done running.
+  if !needSlot { return mapPrepProbeTail() }
   fbLocalSet(cmKeyLocal()) // the target key
   setMapRef()              // mapRef (the shared mono slot, or this mv/i32 frame's)
   return emitMapProbe(false, needSlot)
@@ -15830,11 +15831,14 @@ function defExprNullable(ix: i32) {
 // reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
 // (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
-  const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
-  if miss.length == 1 { return emitMapGetCall(recvIx, keyIx, fnIx, miss[0]) }
+  const arm = mapGetOrArmOf(recvIx, defIx, fnIx, rk)
+  if arm == "helper" {
+    const miss = mapGetOrHelperRoute(recvIx, defIx, fnIx, rk)
+    return emitMapGetCall(recvIx, keyIx, fnIx, miss[0])
+  }
   const wvk = mapRecvScalarKindInst(recvIx, fnIx)
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
-  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+  if arm == "widen" {
     pushMapScr(5)                // entry
     fbIf(valBlockTypeOfKind(rk)) // if (entry != 0 → found), the result's blocktype
     pushMapScalarHit()
@@ -15844,7 +15848,15 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     fbEnd()
     return 0
   }
-  if cmSlot >= 0 {
+  if arm == "mv" && mapGetOrMvPlain(recvIx, defIx, fnIx) {
+    const pslot = cmSlot
+    mapGetOrMvHead(pslot)
+    if emitMapValDefault(pslot, mvScalarValKind(pslot), defIx, fnIx) < 0 {
+      return -1
+    }
+    return mapGetOrMvTail(pslot)
+  }
+  if arm == "mv" {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
     // `(ref null)` slot read, the miss arm from the default, and `ref.as_non_null`
@@ -15917,38 +15929,19 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   // stores null as an i32 sentinel in the mono vals slot (`-1` litunion atom, `2`
   // boolean): a missing key and the stored sentinel both read as null, and `??`
   // coalesces on that — read the raw i32 and default when it equals the sentinel.
-  let nulSentinel = 0
-  let hasSentinel = false
-  const orMt = mapRecvTyIn(recvIx, fnIx)
-  if mapTyValIsNulLitUnion(orMt) {
-    nulSentinel = 0 - 1
-    hasSentinel = true
-  } else if mapTyValIsNulBool(orMt) || mapTyValIsNullUnit(orMt) {
-    nulSentinel = 2
-    hasSentinel = true
+  if arm == "scalarBox" {
+    return emitMapGetOrScalarBox(
+      mapRecvScalarBoxKindIn(recvIx, fnIx),
+      defIx,
+      fnIx,
+    )
   }
-  if !hasSentinel {
-    if defExprNullable(defIx) {
-      // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
-      const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
-      if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
-        return emitMapGetOrScalarBox(mbk, defIx, fnIx)
-      }
-    }
-    // if entry != 0 { vals.backing[entry-1] } else { d }  — a value-typed if yielding i32.
-    pushMapScr(5)         // entry
-    fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
-    pushMapVals()
-    fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
-    pushMapScr(5)         // entry
-    fbI32Const(1)
-    fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
-    fbArrayGet(aTy())     // array.get
-    fbElse()              // else
+  if arm == "i32" || arm == "atom" {
+    mapGetOrI32Head()
     if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
-    fbEnd()               // end (if)
-    return 0
+    return mapGetOrI32Tail()
   }
+  const nulSentinel = mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx))
   // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
   pushMapScr(5)           // entry
   fbIf(127)               // if (entry != 0 → found), i32 blocktype
@@ -15972,6 +15965,119 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   pushMapScr(8)
   fbEnd()
   return 0
+}
+
+// How `recvIx[k] ?? defIx` (`rk` the `??`'s atom kind, -1 none) reads its map: through the
+// `__map_get_<row>__` helper, widened to `rk`, at an mv slot's value, as a nullable value boxed or
+// held at its null sentinel, or as the plain `i32` read with the default in its miss arm, an
+// atom-valued map's (`atom`) written as a member literal.
+export type MapGetOrArm = "helper"
+  | "widen"
+  | "mv"
+  | "scalarBox"
+  | "sentinel"
+  | "atom"
+  | "i32"
+export function mapGetOrArmOf(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+  rk: i32,
+): MapGetOrArm {
+  if mapGetOrHelperRoute(recvIx, defIx, fnIx, rk).length == 1 {
+    return "helper"
+  }
+  const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+    return "widen"
+  }
+  if mapRecvShapeOf(recvIx, fnIx) >= 0 { return "mv" }
+  if mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx)) != 0 { return "sentinel" }
+  if defExprNullable(defIx) {
+    // A hole's read whose pin no node registered a value box for keeps the unboxed lowering.
+    const mbk = mapRecvScalarBoxKindIn(recvIx, fnIx)
+    if mbk >= 0 && (vbHeapIdxOfKind(mbk) >= 0 || nodeTyIsMap(recvIx)) {
+      return "scalarBox"
+    }
+  }
+  if mapTyValLitUnionTexts(mapRecvTyIn(recvIx, fnIx)).length > 0 {
+    return "atom"
+  }
+  return "i32"
+}
+
+// Whether `recvIx[k] ?? defIx` at an mv slot takes its plain arm: a value that is neither a union
+// nor a nullable niche, and a default that is not nullable, written in the value's own rep.
+export function mapGetOrMvPlain(recvIx: i32, defIx: i32, fnIx: i32): boolean {
+  const ms = mapRecvShapeOf(recvIx, fnIx)
+  if ms < 0 || mvValKindAt(ms) == "union" || defExprNullable(defIx) {
+    return false
+  }
+  return mvScalarValKind(ms) != null || !mvSlotNullable(ms)
+}
+
+// The mv plain arm's head after the probe: `if entry != 0 { stash = vals.backing[entry-1] } else`,
+// a void `if`; the default follows, then `mapGetOrMvTail`.
+export function mapGetOrMvHead(mslot: i32) {
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)                // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // scalar (f64/i64) / (ref null <elem>) slot read
+  fbLocalSet(fnMvValStashLocal(mslot))
+  fbElse()                     // else — a MISS
+  return 0
+}
+
+// After the default: the stash set from it, the `if` closed, the stash read, and a ref value
+// recovered to non-null (a live entry's slot is never null, nor is the default).
+export function mapGetOrMvTail(mslot: i32) {
+  cmSlot = mslot
+  const stashL = fnMvValStashLocal(mslot)
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  if mvScalarValKind(mslot) == null { fbRefAsNonNull() }
+  return 0
+}
+
+// The i32 a mono map of type `mt` stores for a null value: `-1` for a nullable literal union, `2`
+// for a nullable boolean or `null`; 0 for a map with no null sentinel.
+function mapGetOrSentinel(mt: i32): i32 {
+  if mapTyValIsNulLitUnion(mt) { return 0 - 1 }
+  if mapTyValIsNulBool(mt) || mapTyValIsNullUnit(mt) { return 2 }
+  return 0
+}
+
+// The plain `i32` read's head after the probe: `if entry != 0 { vals.backing[entry-1] } else`, a
+// value-typed `if`; the default follows, then `mapGetOrI32Tail`.
+export function mapGetOrI32Head() {
+  pushMapScr(5)         // entry
+  fbIf(127)             // if (entry != 0 → found; a nonzero condition is true), 0x7f i32 blocktype
+  pushMapVals()
+  fbStructGet(lTy(), 0) // struct.get (vals backing), field 0: backing
+  pushMapScr(5)         // entry
+  fbI32Const(1)
+  fbI32Bin(107)         // 0x6b i32.sub  (entry - 1)
+  fbArrayGet(aTy())     // array.get
+  fbElse()              // else
+  return 0
+}
+
+export function mapGetOrI32Tail() {
+  fbEnd()
+  return 0
+}
+
+// A map read's probe after its receiver and key: the key into the frame, then the map ref, then
+// the probe, leaving `entry`; `emitMapPrep`'s tail.
+export function mapPrepProbeTail() {
+  fbLocalSet(cmKeyLocal())
+  setMapRef()
+  return emitMapProbe(false, false)
 }
 
 // Lower `m[k] ?? d` over a boxed value-union map value that includes null: read the box
@@ -20197,6 +20303,8 @@ export function strInPlaceMode(binIx: i32, fnIx: i32): i32 {
 // Scans function `fnIx` unless the rows are already its own.
 function saScanFor(fnIx: i32) {
   if saFnIx == fnIx { return 0 }
+  // The start body (-1) is the whole top level, as legacy scans it before the start's code.
+  if fnIx < 0 { return strAccScanStart() }
   const fn = nodeAt(fnIx)
   if fn is FuncDecl { strAccScan(fn.fnBody, fnIx) }
   return 0
@@ -22229,10 +22337,10 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
 // The roots `emitStructEqRec` reads operands `lIx`/`rIx` of a compare at eq row `row` through:
 // a re-readable place as itself, else the stash sentinel (-2 left, -3 right) over a slot
 // `eqStashL`/`eqStashR` now names; `[-1, -1]` on failure. Both are evaluated in source order
-// before either slot is set, so a compare nested in an operand is done with them (D17022).
+// before either slot is set, and a left place is staged when the right may write it (D17023).
 function structEqStage(lIx: i32, rIx: i32, row: i32, fnIx: i32): i32[] {
-  const lStage = !unionEqOperandOk(lIx)
   const rStage = !unionEqOperandOk(rIx)
+  const lStage = rStage || !unionEqOperandOk(lIx)
   if lStage && emitExpr(lIx, fnIx) < 0 { return [-1, -1] }
   if rStage && emitExpr(rIx, fnIx) < 0 { return [-1, -1] }
   let rRoot = rIx
@@ -41110,6 +41218,35 @@ function emitBinExprInRegion(e: BinExpr, exprIx: i32, fnIx: i32) {
   return rc
 }
 
+// How assignment `asgIx` yields its value, in the order legacy tries them: its literal built at its
+// width, the `null` it writes, a re-read of its target, the cell or box its store parks, a
+// non-null cell re-read or parked, a record its wider row extends, or "none".
+export type AsgValueArm = "lit"
+  | "nullLit"
+  | "reRead"
+  | "parked"
+  | "nonNullRead"
+  | "nonNullPark"
+  | "boxedArm"
+  | "widerRow"
+  | "none"
+
+export function asgValueArmOf(asgIx: i32, fnIx: i32): AsgValueArm {
+  if asgLitWidth(unwrapParen(asgIx), fnIx) != "" { return "lit" }
+  if asgYieldsNullLit(asgIx) { return "nullLit" }
+  // A byte-list cell holds the low byte, so its re-read is not the value; its store parks it.
+  if !asgIsByteElem(asgIx, fnIx) && assignTargetReReads(asgIx, fnIx) {
+    return "reRead"
+  }
+  if asgYieldsParkedCell(asgIx, fnIx) { return "parked" }
+  const nnc = asgNonNullCell(asgIx, fnIx)
+  if nnc == 1 { return "nonNullRead" }
+  if nnc == 2 { return "nonNullPark" }
+  if asgYieldsBoxedArm(asgIx, fnIx) { return "boxedArm" }
+  if asgNameWiderRow(asgIx, fnIx) >= 0 { return "widerRow" }
+  return "none"
+}
+
 // Store the assignment at `asgIx` and re-read its target cell, then apply `unwidenOp` (an
 // opcode, or -1 for none) to take the cell's rep back to the value's (D2512).
 function emitAsgValue(asgIx: i32, fnIx: i32, unwidenOp: i32): i32 {
@@ -41125,6 +41262,82 @@ function emitAsgValue(asgIx: i32, fnIx: i32, unwidenOp: i32): i32 {
   initGuardOff = savedGuardOff
   if asgRc >= 0 && unwidenOp >= 0 { wU8(unwidenOp) }
   return asgRc
+}
+
+// Assignment `exprIx` as a value, on its arm (`asgValueArmOf`).
+function emitAsgValueOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  return match asgValueArmOf(exprIx, fnIx) {
+    "lit" => emitAsgLitAs(exprIx, asgLitWidth(exprIx, fnIx), fnIx)
+    "nullLit" => {
+      if emitAssign(exprIx, fnIx) < 0 { return -1 }
+      emitExpr(e.binRight, fnIx)
+    }
+    "reRead" => emitAsgValue(exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
+    "parked" => {
+      const savedWant = asgParkWanted
+      asgParkWanted = true
+      const pRc = emitAssign(exprIx, fnIx)
+      asgParkWanted = savedWant
+      if pRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      if asgParkedRef && !tyBearsNull(nodeTyAt(exprIx, fnIx)) {
+        fbRefAsNonNull()
+      }
+      const pOp = asgReadUnwidenOp(exprIx, fnIx)
+      if pOp >= 0 { wU8(pOp) }
+      0
+    }
+    "nonNullRead" => {
+      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
+      fbRefAsNonNull()
+      0
+    }
+    "nonNullPark" => {
+      const nnWant = asgParkWanted
+      asgParkWanted = true
+      const nnRc = emitAssign(exprIx, fnIx)
+      asgParkWanted = nnWant
+      if nnRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      fbRefAsNonNull()
+      0
+    }
+    "boxedArm" => {
+      const savedWant = asgParkWanted
+      asgParkWanted = true
+      const bRc = emitAssign(exprIx, fnIx)
+      asgParkWanted = savedWant
+      if bRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft || !asgParkedRef {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a box no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      fbRefAsNonNull()
+      emitUnionUnboxTail(boxTagOfTy(nodeTyAt(exprIx, fnIx)))
+    }
+    // A name whose record the right side's wider record extends by its row's `sub` chain stores
+    // that record itself, so the re-read cast back to its row is the value (D16105).
+    "widerRow" => {
+      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
+      fbRefCast(sHeapIdx[asgNameWiderRow(exprIx, fnIx)])
+      0
+    }
+    "none" => emitFail(
+      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
+    )
+  }
 }
 
 // Emit the assignment at `exprIx`, whose right side is built at the wide primitive `wp`
@@ -41243,83 +41456,7 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
     // assignment-as-expression), lowered as store-then-re-read — `emitAssign` stores, then
     // the target re-reads through the Ident path (a local or module global). The functype
     // reads the checker's type of the assignment; D29 is the `string | null` half.
-    const asgLit = emitAsgLitAs(exprIx, asgLitWidth(exprIx, fnIx), fnIx)
-    if asgLit != -2 { return asgLit }
-    if asgYieldsNullLit(exprIx) {
-      if emitAssign(exprIx, fnIx) < 0 { return -1 }
-      return emitExpr(e.binRight, fnIx)
-    }
-    // A byte-list cell holds the low byte, so its re-read is not the right-hand side the
-    // assignment yields; the value its store parks is.
-    if !asgIsByteElem(exprIx, fnIx) && assignTargetReReads(exprIx, fnIx) {
-      return emitAsgValue(exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
-    }
-    if asgYieldsParkedCell(exprIx, fnIx) {
-      const savedWant = asgParkWanted
-      asgParkWanted = true
-      const pRc = emitAssign(exprIx, fnIx)
-      asgParkWanted = savedWant
-      if pRc < 0 { return -1 }
-      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
-        return emitFail(
-          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
-        )
-      }
-      fbLocalGet(asgParkedSlot)
-      if asgParkedRef && !tyBearsNull(nodeTyAt(exprIx, fnIx)) {
-        fbRefAsNonNull()
-      }
-      const pOp = asgReadUnwidenOp(exprIx, fnIx)
-      if pOp >= 0 { wU8(pOp) }
-      return 0
-    }
-    const nnc = asgNonNullCell(exprIx, fnIx)
-    if nnc == 1 {
-      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
-      fbRefAsNonNull()
-      return 0
-    }
-    if nnc == 2 {
-      const nnWant = asgParkWanted
-      asgParkWanted = true
-      const nnRc = emitAssign(exprIx, fnIx)
-      asgParkWanted = nnWant
-      if nnRc < 0 { return -1 }
-      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
-        return emitFail(
-          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
-        )
-      }
-      fbLocalGet(asgParkedSlot)
-      fbRefAsNonNull()
-      return 0
-    }
-    if asgYieldsBoxedArm(exprIx, fnIx) {
-      const savedWant = asgParkWanted
-      asgParkWanted = true
-      const bRc = emitAssign(exprIx, fnIx)
-      asgParkWanted = savedWant
-      if bRc < 0 { return -1 }
-      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft || !asgParkedRef {
-        return emitFail(
-          "emitProgram: an assignment used as a value stores a box no local can hold its value from",
-        )
-      }
-      fbLocalGet(asgParkedSlot)
-      fbRefAsNonNull()
-      return emitUnionUnboxTail(boxTagOfTy(nodeTyAt(exprIx, fnIx)))
-    }
-    // A name whose record the right side's wider record extends by its row's `sub` chain stores
-    // that record itself, so the re-read cast back to its row is the value (D16105).
-    const wsr = asgNameWiderRow(exprIx, fnIx)
-    if wsr >= 0 {
-      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
-      fbRefCast(sHeapIdx[wsr])
-      return 0
-    }
-    return emitFail(
-      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
-    )
+    return emitAsgValueOf(e, exprIx, fnIx)
   }
   // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
