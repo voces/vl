@@ -48,6 +48,31 @@ import {
   irStartClaimOn,
 } from "./ir_build"
 import { irStartPrologueHook } from "./ir_lower"
+import {
+  MapCompactTys,
+  irAsFailFnCode,
+  irF64RemFnCode,
+  irInitFailFnCode,
+  irListGrowFnCode,
+  irMapCompactFnCode,
+  irMapGetFnCode,
+  irMapProbeFnCode,
+  irMapProbeI32FnCode,
+  irMapProbeI64FnCode,
+  irMapResizeFnCode,
+  irMapResizeI32FnCode,
+  irMapResyncFnCode,
+  irMemLogFnCode,
+  irStrBytesFnCode,
+  irStrConcatFnCode,
+  irStrEqFnCode,
+  irStrFillFnCode,
+  irStrFromBytesFnCode,
+  irStrHashFnCode,
+  irUtf8CpLenFnCode,
+  irUtf8DecFnCode,
+  irUtf8EncFnCode,
+} from "./ir_helper"
 import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
 import {
@@ -232,7 +257,6 @@ import {
   tyHasFnMemoReset,
 } from "./emit_query"
 import {
-  AS_FAIL_DOMS,
   ByteChunk,
   ByteRope,
   HELP_LIST_GROW,
@@ -305,7 +329,6 @@ import {
   armStageElemTyIx,
   arrLitCommitAnn,
   arrLitCommitName,
-  ba8Ty,
   bankSpanRow,
   bl8Ty,
   bodyRebuiltFrom,
@@ -453,7 +476,6 @@ import {
   gInitialMemPages,
   gLowMemUnused,
   gMapDeletes,
-  gMapGetMiss,
   gMapGetShape,
   gMapGetStrKey,
   gMapSetFn,
@@ -498,9 +520,6 @@ import {
   globalStmtOrd,
   globalStmts,
   growRowsReset,
-  helpStrEqFn,
-  helpStrHashFn,
-  helpUtf8DecFn,
   ia64Ty,
   ia64TypeIdx,
   il64Ty,
@@ -630,11 +649,7 @@ import {
 } from "./emit_state"
 import {
   emitFail,
-  fbArrayCopy,
-  fbArrayFill,
   fbArrayGet,
-  fbArrayInitData,
-  fbArrayLen,
   fbArrayNewDefault,
   fbArrayNewFixed,
   fbArraySet,
@@ -654,8 +669,6 @@ import {
   fbGlobalSet,
   fbI32Bin,
   fbI32Const,
-  fbI32Eqz,
-  fbI32Load,
   fbI32Rel,
   fbI32RelOf,
   fbI64Const,
@@ -664,10 +677,7 @@ import {
   fbImmutI32Field,
   fbLocalGet,
   fbLocalSet,
-  fbLocalTee,
   fbLoop,
-  fbMapSlotOf,
-  fbMapTagOfI64,
   fbMutRefNullField,
   fbPushRetExtra,
   fbRefAsNonNull,
@@ -682,12 +692,7 @@ import {
   fbReturn,
   fbReturnCall,
   fbSelect,
-  fbStrBack,
-  fbStrHash,
-  fbStrLen,
   fbStrNew,
-  fbStrSetHash,
-  fbStrStart,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -726,8 +731,6 @@ import {
 import {
   RELOC_ARMED,
   RELOC_VERSION,
-  RS_GNAME,
-  RS_GREAD,
   RS_GUARD,
   RS_SLOT,
   RS_TAG,
@@ -849,11 +852,7 @@ import {
 } from "./emit_nullable_rets"
 import { registerSharedReadUnion } from "./emit_obj_lit_fits"
 import { binRemFloatNeed } from "./emit_ref_list_kinds"
-import {
-  shapeRowsReset,
-  tyRegMemoReset,
-  typeDeclNameIxReset,
-} from "./emit_shape_rows"
+import { shapeRowsReset, tyRegMemoReset } from "./emit_shape_rows"
 import { iisReset } from "./emit_shape_intern"
 import { typeOrderReset, typeOrderRun } from "./emit_type_order"
 import {
@@ -2729,53 +2728,6 @@ function emitStartGlobalInitValue(
   return 0
 }
 
-// The synthetic `__log__(offset, length)` decoder body: walks the tag/value pairs in linear
-// memory (two words per pair) and prints each value, mirroring the host runner's `__log__`
-// import. Tag 0 is a plain i32; a non-zero tag traps (`unreachable`) since no corpus program
-// logs one natively and a silent wrong decode is worse. The host joins a multi-pair log into one line, this prints one per pair — harmless, since every corpus call logs exactly one.
-function emitMemLogFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  // Locals vector: params occupy 0 (offset) and 1 (length); local 2 is the cursor.
-  wULEB(1)      // 1 locals run
-  wULEB(1)      // count 1
-  wU8(127)      // 0x7f i32
-  fbLocalGet(0)
-  fbLocalSet(2) // cursor = offset
-  fbBlock(64)   // block (void)
-  fbLoop(64)    // loop (void)
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbI32Bin(106) // 0x6a i32.add — offset + length (the end)
-  fbI32Bin(78)  // 0x4e i32.ge_s — cursor >= end?
-  fbBrIf(1)     // exit the block
-  fbLocalGet(2)
-  fbI32Load()   // the pair's TAG
-  fbIf(64)      // tag != 0 → unsupported payload kind
-  fbUnreachable()
-  fbEnd()
-  fbLocalGet(2)
-  fbI32Const(4)
-  fbI32Bin(106) // i32.add — the value word
-  fbI32Load()
-  fbCall(0)     // __print_i32__ (import 0)
-  fbLocalGet(2)
-  fbI32Const(8)
-  fbI32Bin(106) // i32.add
-  fbLocalSet(2) // cursor += 8
-  fbBr(0)       // next pair
-  fbEnd()       // end loop
-  fbEnd()       // end block
-  fbEnd()       // 0x0b end (void function: stack empty)
-  wTarget(prev)
-  const outPrev = wTarget(out)
-  wULEB(body.length)
-  wBytes(body)
-  wTarget(outPrev)
-  return 0
-}
-
 // ── shared runtime helper bodies (module-tail functions) ──
 // Each body below is the once-per-module copy of machinery every lowering site otherwise
 // inlines. Hand-rolled like the `__log__` decoder above: a locals vector, then straight `fb*`
@@ -2809,901 +2761,6 @@ function eqHelpFnCode(out: u8[], si: i32): i32 {
   return helpFrameBody(out, body)
 }
 
-// One `h = (h ^ back[i + k]) * 16777619` step of the FNV chain, against the `__str_hash__`
-// frame (back = local 5, h = local 1, i = local 2). `k == 0` skips the offset add. Shared by
-// the unrolled block and the remainder loop so the two cannot drift into hashing differently.
-// `i` is a backing offset, not a view offset: the prologue seeds it from the header's `start` and bounds it at `start + len`.
-function fbStrHashStep(k: i32) {
-  fbLocalGet(1)
-  fbLocalGet(5)
-  fbLocalGet(2)
-  if k != 0 {
-    fbI32Const(k)
-    fbI32Bin(106) // i32.add (i + k)
-  }
-  fbArrayGet(sBackTy())
-  fbI32Bin(115) // 0x73 i32.xor
-  fbI32Const(16777619)
-  fbI32Bin(108) // 0x6c i32.mul
-  fbLocalSet(1)
-  return 0
-}
-
-// `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash of a string. Params: s(0).
-// Locals: h(1), i(2), n(3), lim(4), back(5). Memoised in the header's mutable `$hash` field
-// (field 3) — sound because the hash is a pure function of the three immutable header
-// fields, so one mutable field in an immutable string is a memo, not state; `0` means "not computed yet", so a string whose hash is genuinely 0 re-walks.
-function emitStrHashFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2)     // 2 locals runs
-  wULEB(4)     // count 4
-  wU8(127)     // 0x7f i32 (h, i, n, lim)
-  wULEB(1)     // count 1
-  wU8(99)      // 0x63 (ref null ht) — the hoisted backing
-  wSLEB(sBackTy())
-  fbBlock(127) // block i32 — yields the hash, cached or freshly walked
-  // Memo hit: `h = s.hash ; if h != 0 { yield h }`. Two instructions and a branch on the path
-  // that matters — the compiler hashes the same immutable key object (a pooled literal, a token's text, an interned name) over and over.
-  fbLocalGet(0)
-  fbStrHash()
-  fbLocalTee(1)           // h = s.hash
-  fbIf(64)                // if h != 0, void
-  fbLocalGet(1)
-  fbBr(1)                 // → out of the i32 block with the cached hash
-  fbEnd()
-  fbI32Const(-2128831035) // 2166136261 as signed (the FNV offset basis)
-  fbLocalSet(1)           // h
-  // Hoist the header ONCE: backing into local 5, the cursor seeded to `start`, the bound to
-  // `start + len`. Every element step below then costs one `array.get` and no `struct.get`.
-  fbLocalGet(0)
-  fbStrBack()
-  fbLocalSet(5) // back = s.backing
-  fbLocalGet(0)
-  fbStrStart()
-  fbLocalSet(2) // i = s.start
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbStrLen()
-  fbI32Bin(106) // i32.add
-  fbLocalSet(3) // n = s.start + s.len  (one past the last offset)
-  fbLocalGet(3)
-  fbI32Const(4)
-  fbI32Bin(107) // i32.sub
-  fbLocalSet(4) // lim = n - 4
-  // Wide block: while i <= lim { 4 chained steps ; i += 4 }
-  fbLoop(64)    // loop, void
-  fbLocalGet(2) // i
-  fbLocalGet(4) // lim
-  fbI32Bin(74)  // 0x4a i32.gt_s (i > lim → no full block fits)
-  fbIf(64)      // then: done (empty)
-  fbElse()
-  fbStrHashStep(0)
-  fbStrHashStep(1)
-  fbStrHashStep(2)
-  fbStrHashStep(3)
-  fbLocalGet(2)
-  fbI32Const(4)
-  fbI32Bin(106) // i32.add
-  fbLocalSet(2) // i += 4
-  fbBr(1)       // → loop header
-  fbEnd()       // end (gt_s if)
-  fbEnd()       // end (wide loop)
-  // Remainder: while i < n { one step ; i += 1 }
-  fbLoop(64)    // loop, void
-  fbLocalGet(2) // i
-  fbLocalGet(3) // n
-  fbI32Bin(78)  // 0x4e i32.ge_s (i >= n → done)
-  fbIf(64)      // then: done (empty)
-  fbElse()
-  fbStrHashStep(0)
-  fbLocalGet(2)
-  fbI32Const(1)
-  fbI32Bin(106) // i32.add
-  fbLocalSet(2)
-  fbBr(1)       // → loop header
-  fbEnd()       // end (ge_s if)
-  fbEnd()       // end (remainder loop)
-  // h & 0x7fffffff — force non-negative (the result), then MEMOISE it. The store is the
-  // only write anyone ever makes to field 3 and it stores exactly what this walk computed,
-  // so a second caller either reads this value or recomputes the identical one.
-  fbLocalGet(1)
-  fbI32Const(2147483647)
-  fbI32Bin(113)  // 0x71 i32.and
-  fbLocalSet(1)  // h = the masked result
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbStrSetHash() // s.hash = h  — 0 stays 0 and simply re-walks next time (see the header)
-  fbLocalGet(1)
-  fbEnd()        // end (block) — leaves the i32 result
-  fbEnd()        // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__str_eq__(a, b) -> i32`: element-wise string value-equality — 0 if the lengths differ or
-// any code point differs, else 1. Params: a(0), b(1). Locals: n(2), i(3), lim(4). Unrolled
-// eight wide over an xor/or accumulator; `lim = n - 8` is a subtraction so a maximal-length
-// string cannot overflow the gate. Identity fast path (`ref.eq`): the literal pool interns every distinct literal as one module global, so a pooled compare is reference-identical.
-function fbStrEqReadA(k: i32) {
-  fbLocalGet(5) // aBack
-  fbLocalGet(3) // i
-  if k > 0 {
-    fbI32Const(k)
-    fbI32Bin(106) // i32.add
-  }
-  fbArrayGet(sBackTy())
-  return 0
-}
-function fbStrEqReadB(k: i32) {
-  fbLocalGet(6) // bBack
-  fbLocalGet(3) // i
-  fbLocalGet(7) // d = b.start - a.start
-  fbI32Bin(106) // i32.add
-  if k > 0 {
-    fbI32Const(k)
-    fbI32Bin(106) // i32.add
-  }
-  fbArrayGet(sBackTy())
-  return 0
-}
-
-function emitStrEqFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(3)     // 3 locals runs
-  wULEB(3)     // count 3
-  wU8(127)     // 0x7f i32 (n, i, lim)
-  wULEB(2)     // count 2
-  wU8(99)      // 0x63 (ref null ht) — the two hoisted backings
-  wSLEB(sBackTy())
-  wULEB(1)     // count 1
-  wU8(127)     // 0x7f i32 (d — b's start relative to a's)
-  fbBlock(127) // block i32 — yields the 0/1 result
-  // `if ref.eq(a, b) { 1 ; br out }`. The operands are headers now, so `ref.eq` compares views,
-  // not element arrays — still a pure short-circuit (a header trivially equals itself, and it
-  // still fires on the literal pool), but it stops covering two distinct headers over the same
-  // backing and range, which now walk instead. That is a lost optimisation, never a wrong answer.
-  fbLocalGet(0)
-  fbLocalGet(1)
-  wU8(211) // 0xd3 ref.eq
-  fbIf(64) // if, void
-  fbI32Const(1)
-  fbBr(1)  // → out of the i32 block
-  fbEnd()
-  // if a.len != b.len { 0 ; br out }
-  fbLocalGet(0)
-  fbStrLen()
-  fbLocalGet(1)
-  fbStrLen()
-  fbI32Bin(71) // 0x47 i32.ne
-  fbIf(64)     // if, void
-  fbI32Const(0)
-  fbBr(1)      // → out of the i32 block
-  fbEnd()
-  // Hoist BOTH headers once. The cursor `i` walks A's BACKING coordinates, so an A read is
-  // `aBack[i]` with no bias at all and a B read is `bBack[i + d]` for the one-time
-  // `d = b.start - a.start`. `n` is A's END offset (`a.start + a.len`).
-  fbLocalGet(0)
-  fbStrBack()
-  fbLocalSet(5) // aBack
-  fbLocalGet(1)
-  fbStrBack()
-  fbLocalSet(6) // bBack
-  fbLocalGet(0)
-  fbStrStart()
-  fbLocalSet(3) // i = a.start
-  fbLocalGet(3)
-  fbLocalGet(0)
-  fbStrLen()
-  fbI32Bin(106) // i32.add
-  fbLocalSet(2) // n = a.start + a.len
-  fbLocalGet(1)
-  fbStrStart()
-  fbLocalGet(3)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(7) // d = b.start - a.start
-  // lim = n - 8 — the last cursor at which a full eight-element block fits. A SUBTRACTION
-  // rather than `i + 8 > n`: `n` is bounded by the backing's length and cannot overflow it,
-  // while `i + 8` on a maximal-length string could.
-  fbLocalGet(2)
-  fbI32Const(8)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(4)
-  // Short-string gate: skip the wide loop entirely unless a full block can run at least once.
-  // Strings shorter than the unroll factor are the common case (identifiers, keywords, tags),
-  // and for them the whole wide region is dead weight. The test is `lim >= i` rather than `n >=
-  // 8`, because `i` no longer starts at 0 — a view starts at its own `start`, and `n >= 8` would ask about the parent's extent instead of this view's length.
-  fbLocalGet(4)
-  fbLocalGet(3)
-  fbI32Bin(78) // 0x4e i32.ge_s (lim >= i → at least one full block fits)
-  fbIf(64)     // if, void
-  fbLoop(64)   // loop (eight wide), void
-  fbLocalGet(3)
-  fbLocalGet(4)
-  fbI32Bin(74) // 0x4a i32.gt_s (i > lim → no full block left)
-  fbIf(64)     // then: done (empty)
-  fbElse()
-  // acc = (a[i]^b[i]) | (a[i+1]^b[i+1]) | ... | (a[i+7]^b[i+7]), on the stack.
-  let k = 0
-  while k < 8 {
-    fbStrEqReadA(k)
-    fbStrEqReadB(k)
-    fbI32Bin(115) // 0x73 i32.xor — 0 exactly when the pair matches
-    if k > 0 {
-      fbI32Bin(114) // 0x72 i32.or — fold into the accumulator
-    }
-    k = k + 1
-  }
-  // A non-zero accumulator means at least one of the eight pairs differed.
-  fbIf(64)
-  fbI32Const(0)
-  fbBr(4) // → out of: if(0)·else(1)·loop(2)·n>=8 if(3)·block(4)
-  fbEnd()
-  // i = i + 8
-  fbLocalGet(3)
-  fbI32Const(8)
-  fbI32Bin(106)
-  fbLocalSet(3)
-  fbBr(1) // → loop header
-  fbEnd() // end (gt_s if/else)
-  fbEnd() // end (eight-wide loop)
-  fbEnd() // end (n >= 8 if)
-  // Scalar remainder: the fewer than eight elements the wide loop could not cover.
-  fbLoop(64)   // loop, void
-  fbLocalGet(3)
-  fbLocalGet(2)
-  fbI32Bin(78) // i32.ge_s (i >= n → done)
-  fbIf(64)     // then: done (empty)
-  fbElse()
-  // if a[i] != b[i] { 0 ; br out }
-  fbStrEqReadA(0)
-  fbStrEqReadB(0)
-  fbI32Bin(71) // i32.ne
-  fbIf(64)
-  fbI32Const(0)
-  fbBr(3)      // → out of: if(0)·else(1)·loop(2)·block(3)
-  fbEnd()
-  // i = i + 1
-  fbLocalGet(3)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(3)
-  fbBr(1)       // → loop header
-  fbEnd()       // end (ge_s if/else)
-  fbEnd()       // end (loop)
-  fbI32Const(1) // every element matched
-  fbEnd()       // end (block)
-  fbEnd()       // end (function) — leaves the 0/1 result
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__str_concat__(a, b) -> (ref str)`: allocates a fresh `lenA + lenB` backing, `array.copy`s
-// both operands' live ranges in, and wraps a whole-backing header around it. Params: a(0),
-// b(1). Locals: lenA(2), lenB(3) i32; out(4) a non-null `(ref $sBackIdx)`. Concat is the one
-// string op a view cannot make cheaper, but each `array.copy` reads from its operand's `start`, not from 0, so a view operand does not concatenate its parent's leading characters.
-function emitStrConcatFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2) // 2 locals runs
-  wULEB(2) // count 2
-  wU8(127) // 0x7f i32 (lenA, lenB)
-  wULEB(1) // count 1
-  wU8(100) // 0x64 (ref $sBackIdx) — out
-  wSLEB(sBackTy())
-  // lenA = a.len ; lenB = b.len
-  fbLocalGet(0)
-  fbStrLen()
-  fbLocalSet(2)
-  fbLocalGet(1)
-  fbStrLen()
-  fbLocalSet(3)
-  // out = array.new_default $sBackIdx (lenA + lenB)
-  fbLocalGet(2)
-  fbLocalGet(3)
-  fbI32Bin(106) // i32.add
-  fbArrayNewDefault(sBackTy())
-  fbLocalSet(4)
-  // array.copy out 0 a.backing a.start lenA
-  fbLocalGet(4)
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbStrBack()
-  fbLocalGet(0)
-  fbStrStart()
-  fbLocalGet(2)
-  fbArrayCopy(sBackTy(), sBackTy())
-  // array.copy out lenA b.backing b.start lenB
-  fbLocalGet(4)
-  fbLocalGet(2)
-  fbLocalGet(1)
-  fbStrBack()
-  fbLocalGet(1)
-  fbStrStart()
-  fbLocalGet(3)
-  fbArrayCopy(sBackTy(), sBackTy())
-  // The header over the exact-fit backing.
-  fbLocalGet(4)
-  fbI32Const(0)
-  fbLocalGet(2)
-  fbLocalGet(3)
-  fbI32Bin(106) // i32.add
-  fbStrNew()
-  fbEnd() // end (function) — leaves the fresh string ref
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// ── the UTF-8 codec helpers ──
-// Three module-tail functions, minted on first ask like the string trio above: the codec
-// is a loop with a variable stride, the one shape a lowering cannot inline at every use site.
-// One copy each: `for cp in s`/`s.cpAt(i)` share `__utf8_dec__`; `fromCodePoint`/`fromCodePoints` share `__utf8_enc__`, which has a fourth twin in VL — `emit_base.cpsToUtf8` — that must agree with it exactly or `"é" == fromCodePoint(233)` goes false.
-
-// Replaces the code point in local `cpL` with U+FFFD when it has no UTF-8 encoding — outside
-// [0, 0x10FFFF], or inside the UTF-16 surrogate range D800..DFFF. Emitted into both of
-// `__utf8_enc__`'s passes (width and write), since sanitizing changes the width and a width pass that disagreed with the write pass would size the backing wrong.
-function fbUtf8Sanitize(cpL: i32) {
-  fbLocalGet(cpL)
-  fbI32Const(0)
-  fbI32Bin(72)      // 0x48 i32.lt_s
-  fbLocalGet(cpL)
-  fbI32Const(1114111)
-  fbI32Bin(74)      // 0x4a i32.gt_s
-  fbI32Bin(114)     // 0x72 i32.or
-  fbLocalGet(cpL)
-  fbI32Const(55296)
-  fbI32Bin(78)      // 0x4e i32.ge_s
-  fbLocalGet(cpL)
-  fbI32Const(57343)
-  fbI32Bin(76)      // 0x4c i32.le_s
-  fbI32Bin(113)     // 0x71 i32.and
-  fbI32Bin(114)     // 0x72 i32.or
-  fbIf(64)
-  fbI32Const(65533) // U+FFFD
-  fbLocalSet(cpL)
-  fbEnd()
-  return 0
-}
-
-// `(1 << 24) | 0xFFFD` — the decoder's "consume ONE byte, yield the replacement character"
-// answer, and the only answer it gives for a byte that begins nothing. Consuming exactly one
-// byte is what makes `for cp in s` terminate on arbitrary bytes: a width of 0 would spin.
-function fbUtf8DecBad() {
-  fbI32Const(16842749) // (1 << 24) | 65533 — width 1, U+FFFD
-  fbReturn()
-  return 0
-}
-
-// `__utf8_dec__(back, i, end) -> i32` — decodes the UTF-8 sequence beginning at backing offset
-// `i`, never reading at or past `end`. Returns `(width << 24) | codepoint`, so one call answers
-// both questions a decoding cursor has; `width` is always >= 1. A malformed sequence — a stray
-// continuation byte, an invalid lead, a truncated tail, an overlong form, a surrogate, or a value past U+10FFFF — decodes to U+FFFD rather than trapping (Go-lean).
-function emitUtf8DecFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // 1 locals run
-  wULEB(6) // b, n, cp, k, c, lo
-  wU8(127) // 0x7f i32
-  // b = back[i]  (array.get_u — the backing is packed i8, so this zero-extends to 0..255)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbArrayGet(sBackTy())
-  fbLocalSet(3)
-  // ASCII: one byte, the code point IS the byte.
-  fbLocalGet(3)
-  fbI32Const(128)
-  fbI32Bin(72)         // i32.lt_s
-  fbIf(64)
-  fbI32Const(16777216) // 1 << 24
-  fbLocalGet(3)
-  fbI32Bin(114)        // i32.or
-  fbReturn()
-  fbEnd()
-  // A lead byte below 0xC2 is a continuation byte or a 2-byte overlong — neither begins a
-  // sequence.
-  fbLocalGet(3)
-  fbI32Const(194)
-  fbI32Bin(72) // i32.lt_s
-  fbIf(64)
-  fbUtf8DecBad()
-  fbEnd()
-  // n = 2 / 3 / 4 by lead-byte range; 0xF5 and up is not a lead byte at all.
-  fbI32Const(2)
-  fbLocalSet(4)
-  fbLocalGet(3)
-  fbI32Const(224)
-  fbI32Bin(78) // i32.ge_s
-  fbIf(64)
-  fbI32Const(3)
-  fbLocalSet(4)
-  fbLocalGet(3)
-  fbI32Const(240)
-  fbI32Bin(78) // i32.ge_s
-  fbIf(64)
-  fbI32Const(4)
-  fbLocalSet(4)
-  fbLocalGet(3)
-  fbI32Const(245)
-  fbI32Bin(78) // i32.ge_s
-  fbIf(64)
-  fbUtf8DecBad()
-  fbEnd()
-  fbEnd()
-  fbEnd()
-  // A sequence that runs past `end` is truncated — the slice-off-a-boundary case the API
-  // deliberately permits, so it is lenient rather than a trap.
-  fbLocalGet(1)
-  fbLocalGet(4)
-  fbI32Bin(106) // i32.add
-  fbLocalGet(2)
-  fbI32Bin(74)  // i32.gt_s
-  fbIf(64)
-  fbUtf8DecBad()
-  fbEnd()
-  // cp = b & (0x7f >> n) — 0x1f / 0x0f / 0x07 for n = 2 / 3 / 4.
-  fbLocalGet(3)
-  fbI32Const(127)
-  fbLocalGet(4)
-  fbI32Bin(118) // 0x76 i32.shr_u
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalSet(5)
-  // for k in 1..n { c = back[i + k]; require 10xxxxxx; cp = (cp << 6) | (c & 0x3f) }
-  fbI32Const(1)
-  fbLocalSet(6)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(6)
-  fbLocalGet(4)
-  fbI32Bin(78)  // i32.ge_s
-  fbBrIf(1)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbLocalGet(6)
-  fbI32Bin(106) // i32.add
-  fbArrayGet(sBackTy())
-  fbLocalSet(7)
-  fbLocalGet(7)
-  fbI32Const(192)
-  fbI32Bin(113) // i32.and
-  fbI32Const(128)
-  fbI32Bin(71)  // 0x47 i32.ne
-  fbIf(64)
-  fbUtf8DecBad()
-  fbEnd()
-  fbLocalGet(5)
-  fbI32Const(6)
-  fbI32Bin(116) // 0x74 i32.shl
-  fbLocalGet(7)
-  fbI32Const(63)
-  fbI32Bin(113) // i32.and
-  fbI32Bin(114) // i32.or
-  fbLocalSet(5)
-  fbLocalGet(6)
-  fbI32Const(1)
-  fbI32Bin(106) // i32.add
-  fbLocalSet(6)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // lo = the smallest code point this width is allowed to encode (the overlong test).
-  fbI32Const(128)
-  fbLocalSet(8)
-  fbLocalGet(4)
-  fbI32Const(3)
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)
-  fbI32Const(2048)
-  fbLocalSet(8)
-  fbEnd()
-  fbLocalGet(4)
-  fbI32Const(4)
-  fbI32Bin(70) // i32.eq
-  fbIf(64)
-  fbI32Const(65536)
-  fbLocalSet(8)
-  fbEnd()
-  // Overlong, surrogate, or past U+10FFFF: U+FFFD, but consume the WHOLE malformed
-  // sequence (width n) — the maximal-subpart rule the lossy decoder already follows.
-  fbLocalGet(5)
-  fbLocalGet(8)
-  fbI32Bin(72) // i32.lt_s
-  fbLocalGet(5)
-  fbI32Const(1114111)
-  fbI32Bin(74) // i32.gt_s
-  fbI32Bin(114) // i32.or
-  fbLocalGet(5)
-  fbI32Const(55296)
-  fbI32Bin(78) // i32.ge_s
-  fbLocalGet(5)
-  fbI32Const(57343)
-  fbI32Bin(76) // i32.le_s
-  fbI32Bin(113) // i32.and
-  fbI32Bin(114) // i32.or
-  fbIf(64)
-  fbI32Const(65533)
-  fbLocalSet(5)
-  fbEnd()
-  fbLocalGet(4)
-  fbI32Const(24)
-  fbI32Bin(116) // i32.shl
-  fbLocalGet(5)
-  fbI32Bin(114) // i32.or
-  fbEnd() // end (function) — leaves (width << 24) | cp
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// Push `[out, w + off]` — the destination array and index for the `off`-th byte of the
-// sequence being written. The caller pushes the byte value and closes with `array.set`.
-function fbUtf8Put(outL: i32, wL: i32, off: i32) {
-  fbLocalGet(outL)
-  fbLocalGet(wL)
-  if off != 0 {
-    fbI32Const(off)
-    fbI32Bin(106) // i32.add
-  }
-  return 0
-}
-
-// `back[start + i]` for `__utf8_enc__`'s source list — the i32 code point at logical index
-// `i`, read through `$aTypeIdx` (a plain i32 array, not the packed string backing).
-function fbUtf8EncRead(iL: i32, cpL: i32) {
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbLocalGet(iL)
-  fbI32Bin(106) // i32.add
-  fbArrayGet(aTy())
-  fbLocalSet(cpL)
-  fbUtf8Sanitize(cpL)
-  return 0
-}
-
-// `if cp >= <bound> { n = n + 1 }` — one rung of `__utf8_enc__`'s width sum. Three rungs at
-// 0x80 / 0x800 / 0x10000 give 1 / 2 / 3 / 4 with no branch tree.
-function fbUtf8WidthStep(bound: i32) {
-  fbLocalGet(5)
-  fbI32Const(bound)
-  fbI32Bin(78) // i32.ge_s
-  fbIf(64)
-  fbLocalGet(3)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(3)
-  fbEnd()
-  return 0
-}
-
-// The LEAD byte of a multi-byte sequence: `mark | (cp >> shift)`.
-function fbUtf8Lead(mark: i32, shift: i32) {
-  fbI32Const(mark)
-  fbLocalGet(5)
-  fbI32Const(shift)
-  fbI32Bin(118) // i32.shr_u
-  fbI32Bin(114) // i32.or
-  return 0
-}
-
-// A CONTINUATION byte: `0x80 | ((cp >> shift) & 0x3f)`.
-function fbUtf8Cont(shift: i32) {
-  fbI32Const(128)
-  fbLocalGet(5)
-  if shift != 0 {
-    fbI32Const(shift)
-    fbI32Bin(118) // i32.shr_u
-  }
-  fbI32Const(63)
-  fbI32Bin(113) // i32.and
-  fbI32Bin(114) // i32.or
-  return 0
-}
-
-// `w = w + k` — advance `__utf8_enc__`'s write cursor past the sequence just written.
-function fbUtf8Bump(wL: i32, k: i32) {
-  fbLocalGet(wL)
-  fbI32Const(k)
-  fbI32Bin(106) // i32.add
-  fbLocalSet(wL)
-  return 0
-}
-
-// `__utf8_enc__(back, start, len) -> (ref str)` — UTF-8-encodes `len` i32 code points read
-// from `back[start ..]` into a fresh, exact-fit string. Params: back(0) `(ref $aTypeIdx)`,
-// start(1), len(2). Locals: n(3), i(4), cp(5), out(6) `(ref $sBackIdx)`, w(7). Two passes,
-// because a WasmGC array is fixed-length: pass 1 sums the widths to size the backing, pass 2 writes; both read through `fbUtf8EncRead`, so they cannot disagree about what a code point is.
-function emitUtf8EncFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(3) // 3 locals runs — the ref sits BETWEEN two i32 runs, so the vector splits
-  wULEB(3) // n(3), i(4), cp(5)
-  wU8(127) // 0x7f i32
-  wULEB(1)
-  wU8(100) // 0x64 (ref $sBackIdx) — out(6), set once at top level before any read
-  wSLEB(sBackTy())
-  wULEB(1) // w(7)
-  wU8(127) // 0x7f i32
-  // pass 1: n = Σ width(cp)
-  fbI32Const(0)
-  fbLocalSet(3)
-  fbI32Const(0)
-  fbLocalSet(4)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(4)
-  fbLocalGet(2)
-  fbI32Bin(78) // i32.ge_s
-  fbBrIf(1)
-  fbUtf8EncRead(4, 5)
-  fbLocalGet(3)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(3)
-  fbUtf8WidthStep(128)
-  fbUtf8WidthStep(2048)
-  fbUtf8WidthStep(65536)
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // out = array.new_default $sBackIdx n
-  fbLocalGet(3)
-  fbArrayNewDefault(sBackTy())
-  fbLocalSet(6)
-  // pass 2: write
-  fbI32Const(0)
-  fbLocalSet(7)
-  fbI32Const(0)
-  fbLocalSet(4)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(4)
-  fbLocalGet(2)
-  fbI32Bin(78) // i32.ge_s
-  fbBrIf(1)
-  fbUtf8EncRead(4, 5)
-  // 1 byte: 0xxxxxxx
-  fbLocalGet(5)
-  fbI32Const(128)
-  fbI32Bin(72) // i32.lt_s
-  fbIf(64)
-  fbUtf8Put(6, 7, 0)
-  fbLocalGet(5)
-  fbArraySet(sBackTy())
-  fbUtf8Bump(7, 1)
-  fbElse()
-  // Two-byte form: 110xxxxx 10xxxxxx
-  fbLocalGet(5)
-  fbI32Const(2048)
-  fbI32Bin(72) // i32.lt_s
-  fbIf(64)
-  fbUtf8Put(6, 7, 0)
-  fbUtf8Lead(192, 6)
-  fbArraySet(sBackTy())
-  fbUtf8Put(6, 7, 1)
-  fbUtf8Cont(0)
-  fbArraySet(sBackTy())
-  fbUtf8Bump(7, 2)
-  fbElse()
-  // Three-byte form: 1110xxxx 10xxxxxx 10xxxxxx
-  fbLocalGet(5)
-  fbI32Const(65536)
-  fbI32Bin(72) // i32.lt_s
-  fbIf(64)
-  fbUtf8Put(6, 7, 0)
-  fbUtf8Lead(224, 12)
-  fbArraySet(sBackTy())
-  fbUtf8Put(6, 7, 1)
-  fbUtf8Cont(6)
-  fbArraySet(sBackTy())
-  fbUtf8Put(6, 7, 2)
-  fbUtf8Cont(0)
-  fbArraySet(sBackTy())
-  fbUtf8Bump(7, 3)
-  fbElse()
-  // Four-byte form: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-  fbUtf8Put(6, 7, 0)
-  fbUtf8Lead(240, 18)
-  fbArraySet(sBackTy())
-  fbUtf8Put(6, 7, 1)
-  fbUtf8Cont(12)
-  fbArraySet(sBackTy())
-  fbUtf8Put(6, 7, 2)
-  fbUtf8Cont(6)
-  fbArraySet(sBackTy())
-  fbUtf8Put(6, 7, 3)
-  fbUtf8Cont(0)
-  fbArraySet(sBackTy())
-  fbUtf8Bump(7, 4)
-  fbEnd()
-  fbEnd()
-  fbEnd()
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // The whole-backing header over the exact fit.
-  fbLocalGet(6)
-  fbI32Const(0)
-  fbLocalGet(3)
-  fbStrNew()
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__utf8_cplen__(s) -> i32` — the code point count of a string view, O(n). Params: s(0).
-// Locals: back(1) `(ref null $sBackIdx)`, i(2), end(3), n(4). Drives `__utf8_dec__` rather
-// than counting non-continuation bytes: the difference shows only on malformed input, where
-// a cheap count and the decode-driven count disagree (a stray continuation byte or truncated sequence each yield their own U+FFFD) — this stays the decode's own answer, not a second one.
-function emitUtf8CpLenFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2)
-  wULEB(1)
-  wU8(99)       // 0x63 (ref null ht) — the hoisted backing
-  wSLEB(sBackTy())
-  wULEB(3)
-  wU8(127)      // 0x7f i32 (i, end, n)
-  fbLocalGet(0)
-  fbStrBack()
-  fbLocalSet(1)
-  fbLocalGet(0)
-  fbStrStart()
-  fbLocalSet(2)
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbStrLen()
-  fbI32Bin(106) // i32.add
-  fbLocalSet(3)
-  fbI32Const(0)
-  fbLocalSet(4)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(2)
-  fbLocalGet(3)
-  fbI32Bin(78)  // i32.ge_s
-  fbBrIf(1)
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(4) // one more code point
-  fbLocalGet(2)
-  fbLocalGet(1)
-  wU8(212)      // 0xd4 ref.as_non_null — the hoist slot is nullable; the call is not
-  fbLocalGet(2)
-  fbLocalGet(3)
-  fbCall(helpUtf8DecFn())
-  fbI32Const(24)
-  fbI32Bin(118) // 0x76 i32.shr_u — the WIDTH, the same stride `for cp in s` takes
-  fbI32Bin(106) // i32.add
-  fbLocalSet(2)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  fbLocalGet(4)
-  fbEnd()       // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__str_bytes__(s) -> (ref $bl8TypeIdx)` — `s.bytes()`, the `u8[]` view of a string's UTF-8
-// storage. One `array.copy` of the view's byte range into an exact-fit packed backing,
-// wrapped in the ordinary list struct. Params: s(0). Locals: out(1), a non-null
-// `(ref $ba8TypeIdx)` set before reads. It copies though the design doc says it should not: a `u8[]` wrapper has no `start` field, so a zero-copy `bytes()` would be silently wrong on `s.slice(1)` (filed, not done).
-function emitStrBytesFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1)
-  wULEB(1)
-  wU8(100) // 0x64 (ref $ba8TypeIdx) — out
-  wSLEB(ba8Ty())
-  // out = array.new_default $ba8 (s.len)
-  fbLocalGet(0)
-  fbStrLen()
-  fbArrayNewDefault(ba8Ty())
-  fbLocalSet(1)
-  // array.copy out 0 s.backing s.start s.len — the cross-heap-type copy is legal because
-  // `array.copy` validates on STORAGE types (i8 into i8), not on heap-type identity.
-  fbLocalGet(1)
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbStrBack()
-  fbLocalGet(0)
-  fbStrStart()
-  fbLocalGet(0)
-  fbStrLen()
-  fbArrayCopy(ba8Ty(), sBackTy())
-  // { backing: out, len: s.len, cap: s.len } — an exact fit, as `array.new_fixed` makes.
-  fbLocalGet(1)
-  fbLocalGet(0)
-  fbStrLen()
-  fbLocalGet(0)
-  fbStrLen()
-  fbStructNew(bl8Ty())
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__str_from_bytes__(src, at, count) -> (ref str)` — a fresh exact-fit string over the bytes
-// `src[at .. at + count]`, which the caller guarantees are UTF-8. A range outside `src`'s live
-// length traps, so stale capacity past `len` is never read. Params: src(0) `(ref $bl8TypeIdx)`,
-// at(1), count(2). Locals: out(3), a non-null `(ref $sBackIdx)` set before reads.
-function emitStrFromBytesFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1)
-  wULEB(1)
-  wU8(100) // 0x64 (ref $sBackIdx) — out
-  wSLEB(sBackTy())
-  // at < 0 | count < 0 | (at + count) >u src.len — both non-negative, so the sum cannot wrap unsigned.
-  fbLocalGet(1)
-  fbI32Const(0)
-  fbI32Bin(72) // i32.lt_s
-  fbLocalGet(2)
-  fbI32Const(0)
-  fbI32Bin(72) // i32.lt_s
-  fbI32Bin(114) // i32.or
-  fbLocalGet(1)
-  fbLocalGet(2)
-  fbI32Bin(106) // i32.add
-  fbLocalGet(0)
-  fbStructGet(bl8Ty(), 1)
-  fbI32Bin(75) // i32.gt_u
-  fbI32Bin(114) // i32.or
-  fbIf(64)
-  fbUnreachable()
-  fbEnd()
-  // out = array.new_default $sBack count; array.copy out 0 src.backing at count
-  fbLocalGet(2)
-  fbArrayNewDefault(sBackTy())
-  fbLocalSet(3)
-  fbLocalGet(3)
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbStructGet(bl8Ty(), 0)
-  fbLocalGet(1)
-  fbLocalGet(2)
-  fbArrayCopy(sBackTy(), ba8Ty())
-  // The whole-backing header over the exact fit.
-  fbLocalGet(3)
-  fbI32Const(0)
-  fbLocalGet(2)
-  fbStrNew()
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__str_fill__(off, s) -> off + s.len` — copies `s.len` bytes of the pool segment from `off`
-// into the zeroed backing of pool string `s`. The start function threads the offset through
-// one call per filled entry, so a fill costs a `global.get` and a `call` and no constant.
-function emitStrFillFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0) // no locals
-  fbLocalGet(1)
-  fbStrBack()
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbStrLen()
-  fbArrayInitData(sBackTy(), gStrFillSeg)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbStrLen()
-  fbI32Bin(106) // i32.add
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
 // The fill prologue of the start function: every filled pool entry, in segment order.
 function emitStrFillCalls() {
   if gHelpStrFill < 0 { return 0 }
@@ -3726,32 +2783,6 @@ function emitStrFillCalls() {
   return fbDrop()
 }
 
-// The wrap-trap's reason, streamed through the same base print pair `__trap__("reason")`
-// uses — ONLY when the module already reserves it (`gImports >= 4`), never forced: the
-// self-hosted compiler is `Map`'s heaviest user and must keep zero imports (D2290). With
-// no other reason to print, the caller falls back to a bare `unreachable`.
-function emitMapProbeTrapReason() {
-  if gImports < 4 { return 0 }
-  for cp in "map probe found no free slot (internal invariant)" {
-    fbI32Const(cp)
-    fbCall(2) // __print_char__ (import 2)
-  }
-  fbCall(3) // __print_str_flush__ (import 3)
-  return 0
-}
-
-// The probe loop's back-edge, bounded: with the advanced slot on the stack, re-enter the loop
-// unless it has wrapped back to `start` (local `startL`), so a probe that has seen every slot traps
-// instead of spinning, with a reason when the module has somewhere to print it. `__map_resize__`
-// keeps a free slot in every index, so the trap is a broken invariant, never a full map (D2280, D2290).
-function emitMapProbeBackEdge(startL: i32) {
-  fbLocalGet(startL)
-  fbI32Bin(71) // 0x47 i32.ne
-  fbBrIf(0)    // → loop header while unvisited slots remain
-  emitMapProbeTrapReason()
-  fbUnreachable()
-}
-
 // A map's index has one layout per key kind, each an i32 array whose slot count `cap` is a power
 // of two. A string-keyed map's holds `entry` per slot and its stored hashes gate the key
 // compare; an i32-keyed map's holds a (key, entry) pair per slot, so its probe never reads the
@@ -3766,525 +2797,6 @@ function mapGetFuncType(row: i32) {
   wULEB(1)
   wValI32()
   return 0
-}
-
-// The body of `__map_get_<row>__(m, key)`: the probe loop over `m`'s index into locals, then the
-// i32 value of the key's entry, or the row's miss value when it has none. A get is one call, and
-// the site keeps no scratch.
-function emitMapGetFnCode(out: u8[], row: i32) {
-  const mTy = mapTypeIdxOf(gMapGetShape[row])
-  const body: u8[] = []
-  const prev = wTarget(body)
-  let ent = 5
-  if gMapGetStrKey[row] {
-    // locals: 2 hash, 3 index, 4 hashes, 5 live, 6 keys backing, 7..10 mask/slot/entry/start
-    wULEB(4)
-    wULEB(1)
-    wValI32()
-    wULEB(3)
-    wValRef(aTy(), true)
-    wULEB(1)
-    wValRef(mkArrTy(), true)
-    wULEB(4)
-    wValI32()
-    fbLocalGet(1)
-    fbCall(helpStrHashFn())
-    fbLocalSet(2)
-    fbLocalGet(0)
-    fbStructGet(mTy, 3) // field 3: index
-    fbLocalSet(3)
-    fbLocalGet(0)
-    fbStructGet(mTy, 6) // field 6: hashes
-    fbLocalSet(4)
-    fbLocalGet(0)
-    fbStructGet(mTy, 2) // field 2: live
-    fbLocalSet(5)
-    fbLocalGet(0)
-    fbStructGet(mTy, 0) // field 0: keys
-    fbStructGet(mkListTy(), 0)
-    fbLocalSet(6)
-    emitMapProbeStrLoop(2, 3, 4, 5, 6, 1, 7, 8, 9, 10)
-    ent = 9
-  } else {
-    // locals: 2 the pair index, 3..6 mask/slot/entry/start
-    wULEB(2)
-    wULEB(1)
-    wValRef(aTy(), true)
-    wULEB(4)
-    wValI32()
-    fbLocalGet(0)
-    fbStructGet(mTy, 3) // field 3: index
-    fbLocalSet(2)
-    emitMapProbeI32Loop(2, 1, 3, 4, 5, 6)
-  }
-  fbLocalGet(ent)
-  fbIf(127)
-  fbLocalGet(0)
-  fbStructGet(mTy, 1) // field 1: vals
-  fbStructGet(lTy(), 0)
-  fbLocalGet(ent)
-  fbI32Const(1)
-  fbI32Bin(107) // 0x6b i32.sub (entry - 1)
-  fbArrayGet(aTy())
-  fbElse()
-  fbI32Const(gMapGetMiss[row])
-  fbEnd()
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__map_probe__`'s loop over locals: `h` the key's hash, `ix`/`hs`/`lv` the index, hashes and live
-// arrays, `kb` the keys backing, `key` the key, and i32 scratch `mask`, `slot`, `ent`, `start`.
-// Leaves `slot` at the key's slot or the free one ending its chain, and `ent` at its entry.
-function emitMapProbeStrLoop(
-  h: i32,
-  ix: i32,
-  hs: i32,
-  lv: i32,
-  kb: i32,
-  key: i32,
-  mask: i32,
-  slot: i32,
-  ent: i32,
-  start: i32,
-) {
-  // mask = array.len(index) - 1  (the index length is a power of two)
-  fbLocalGet(ix)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(mask)
-  // slot = start = keyHash & mask
-  fbLocalGet(h)
-  fbLocalGet(mask)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(slot)
-  fbLocalSet(start)
-  fbBlock(64)   // block (probe break target), void
-  fbLoop(64)    // loop, void
-  // entry = index[slot] ; if entry == 0 { br out (miss) }
-  fbLocalGet(ix)
-  fbLocalGet(slot)
-  fbArrayGet(aTy())
-  fbLocalTee(ent)
-  fbI32Eqz()
-  fbBrIf(1) // → out of the probe block
-  // hashes[entry-1] == keyHash (&& live[entry-1] != 0) ? __str_eq__(keysBack[entry-1], key) : 0
-  fbLocalGet(hs)
-  fbLocalGet(ent)
-  fbI32Const(1)
-  fbI32Bin(107) // i32.sub (entry - 1)
-  fbArrayGet(aTy())
-  fbLocalGet(h)
-  fbI32Bin(70)  // 0x46 i32.eq
-  if gMapDeletes {
-    fbLocalGet(lv)
-    fbLocalGet(ent)
-    fbI32Const(1)
-    fbI32Bin(107)
-    fbArrayGet(aTy())
-    fbI32Const(0)
-    fbI32Bin(71)  // 0x47 i32.ne (live != 0)
-    fbI32Bin(113) // 0x71 i32.and
-  }
-  fbIf(127)             // if, i32 blocktype — the expensive compare rides it
-  fbLocalGet(kb)
-  fbLocalGet(ent)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbArrayGet(mkArrTy()) // keysBack[entry-1] — (ref null $aTypeIdx)
-  fbRefAsNonNull()      // a stored slot is populated
-  fbLocalGet(key)
-  fbCall(helpStrEqFn())
-  fbElse()
-  fbI32Const(0)         // hash/live mismatch → not a hit
-  fbEnd()
-  fbBrIf(1)             // hit → out of the probe block
-  // slot = (slot + 1) & mask  (collision OR a dead marker: keep probing)
-  fbLocalGet(slot)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(mask)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(slot)
-  emitMapProbeBackEdge(start)
-  fbEnd() // end (loop)
-  fbEnd() // end (probe block)
-  return 0
-}
-
-// `__map_probe_i32__`'s loop over locals: `ix` the pair index, `key` the key, and i32 scratch
-// `mask`, `slot`, `ent`, `start`; leaves `slot` and `ent` as `emitMapProbeStrLoop` does.
-function emitMapProbeI32Loop(
-  ix: i32,
-  key: i32,
-  mask: i32,
-  slot: i32,
-  ent: i32,
-  start: i32,
-) {
-  // mask = len(index) / 2 - 1 ; slot = start = slotOf(key)
-  fbLocalGet(ix)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(118) // 0x76 i32.shr_u
-  fbI32Const(1)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(mask)
-  fbMapSlotOf(key, mask)
-  fbLocalTee(slot)
-  fbLocalSet(start)
-  fbBlock(64)   // block (probe break target), void
-  fbLoop(64)    // loop, void
-  // entry = index[2*slot + 1] ; if entry == 0 { br out (miss) }
-  fbLocalGet(ix)
-  fbLocalGet(slot)
-  fbI32Const(1)
-  fbI32Bin(116) // 0x74 i32.shl
-  fbI32Const(1)
-  fbI32Bin(114) // 0x72 i32.or
-  fbArrayGet(aTy())
-  fbLocalTee(ent)
-  fbI32Eqz()
-  fbBrIf(1) // → out of the probe block
-  // index[2*slot] == key (&& entry > 0) → hit
-  fbLocalGet(ix)
-  fbLocalGet(slot)
-  fbI32Const(1)
-  fbI32Bin(116) // i32.shl
-  fbArrayGet(aTy())
-  fbLocalGet(key)
-  fbI32Bin(70) // 0x46 i32.eq
-  if gMapDeletes {
-    fbLocalGet(ent)
-    fbI32Const(0)
-    fbI32Bin(74)  // 0x4a i32.gt_s
-    fbI32Bin(113) // 0x71 i32.and
-  }
-  fbBrIf(1) // hit → out of the probe block
-  // slot = (slot + 1) & mask  (collision OR a deleted marker: keep probing)
-  fbLocalGet(slot)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(mask)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(slot)
-  emitMapProbeBackEdge(start)
-  fbEnd() // end (loop)
-  fbEnd() // end (probe block)
-  return 0
-}
-
-// `__map_probe__(keyHash, index, hashes, live, keysBacking, key) -> i32`: wrapping linear probe
-// of a string-keyed index to the slot holding the key's entry or the free slot ending its chain.
-// A dead entry is a probe marker, never a hit; only a module that deletes has one to test.
-function emitMapProbeFnCode(out: u8[], entry: boolean) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1)                              // 1 locals run
-  wULEB(4)                              // count 4
-  wU8(127)                              // 0x7f i32 (mask, slot, entry, start)
-  emitMapProbeStrLoop(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-  fbLocalGet(if entry { 8 } else { 7 }) // the slot's entry (`__map_entry__`), else the slot
-  fbEnd()                               // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__map_probe_i32__(index, key) -> slot`: the i32-keyed probe over (key, entry) pairs, placed
-// by `fbMapSlotOf`, to the pair slot holding the key or the free one ending its chain. It reads
-// the index alone; a deleted pair (entry -1) is never a hit, and only a module that deletes has one.
-function emitMapProbeI32FnCode(out: u8[], entry: boolean) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // 1 locals run
-  wULEB(4) // count 4
-  wU8(127) // 0x7f i32 (mask 2, slot 3, entry 4, start 5)
-  emitMapProbeI32Loop(0, 1, 2, 3, 4, 5)
-  fbLocalGet(if entry { 4 } else { 3 }) // the pair's entry (`__map_entry_i32__`), else the slot
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__map_probe_i64__(index, key, keysBacking) -> slot`: the i64-keyed probe over the same pair
-// layout, whose tag is `fbMapTagOfI64` of the key, so a tag match is confirmed against the keys
-// backing. A deleted pair (entry -1) is never a hit and is never read through.
-function emitMapProbeI64FnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // 1 locals run
-  wULEB(5) // count 5
-  wU8(127) // 0x7f i32 (mask 3, slot 4, entry 5, start 6, tag 7)
-  // mask = len(index) / 2 - 1 ; tag = tagOf(key) ; slot = start = slotOf(tag)
-  fbLocalGet(0)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(118) // 0x76 i32.shr_u
-  fbI32Const(1)
-  fbI32Bin(107) // 0x6b i32.sub
-  fbLocalSet(3)
-  fbMapTagOfI64(1)
-  fbLocalSet(7)
-  fbMapSlotOf(7, 3)
-  fbLocalTee(4)
-  fbLocalSet(6)
-  fbBlock(64)   // block (probe break target), void
-  fbLoop(64)    // loop, void
-  // entry = index[2*slot + 1] ; if entry == 0 { br out (miss) }
-  fbLocalGet(0)
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(116) // 0x74 i32.shl
-  fbI32Const(1)
-  fbI32Bin(114) // 0x72 i32.or
-  fbArrayGet(aTy())
-  fbLocalTee(5)
-  fbI32Eqz()
-  fbBrIf(1) // → out of the probe block
-  // index[2*slot] == tag (&& entry > 0) ? keysBacking[entry-1] == key : 0 → hit
-  fbLocalGet(0)
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(116) // i32.shl
-  fbArrayGet(aTy())
-  fbLocalGet(7)
-  fbI32Bin(70) // 0x46 i32.eq
-  if gMapDeletes {
-    fbLocalGet(5)
-    fbI32Const(0)
-    fbI32Bin(74)  // 0x4a i32.gt_s
-    fbI32Bin(113) // 0x71 i32.and
-  }
-  fbIf(127)     // if, i32 blocktype — the key compare rides the tag match
-  fbLocalGet(2)
-  fbLocalGet(5)
-  fbI32Const(1)
-  fbI32Bin(107) // i32.sub (entry - 1)
-  fbArrayGet(ia64TypeIdx)
-  fbLocalGet(1)
-  fbI32Bin(81)  // 0x51 i64.eq
-  fbElse()
-  fbI32Const(0)
-  fbEnd()
-  fbBrIf(1)     // hit → out of the probe block
-  // slot = (slot + 1) & mask  (collision OR a deleted marker: keep probing)
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(3)
-  fbI32Bin(113) // 0x71 i32.and
-  fbLocalTee(4)
-  emitMapProbeBackEdge(6)
-  fbEnd() // end (loop)
-  fbEnd() // end (probe block)
-  fbLocalGet(4)
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// Store `entryL` at the first free slot from `slotL`'s value in the index in `idxL` (mask
-// `maskL`), advancing `slotL`: the one insertion loop both resizes and the compaction share.
-// With `tagL >= 0` the index is the i32 pair layout, and `tagL`'s value goes beside the entry.
-function emitMapPlaceEntry(
-  idxL: i32,
-  maskL: i32,
-  tagL: i32,
-  entryL: i32,
-  slotL: i32,
-) {
-  let tw = 0
-  if tagL >= 0 { tw = 1 }
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(idxL)
-  fbLocalGet(slotL)
-  if tw > 0 {
-    fbI32Const(1)
-    fbI32Bin(116) // i32.shl
-    fbI32Const(1)
-    fbI32Bin(114) // i32.or
-  }
-  fbArrayGet(aTy())
-  fbI32Eqz()
-  fbBrIf(1) // free → out
-  fbLocalGet(slotL)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalGet(maskL)
-  fbI32Bin(113) // i32.and
-  fbLocalSet(slotL)
-  fbBr(0)
-  fbEnd() // end (loop)
-  fbEnd() // end (block)
-  if tw > 0 {
-    fbLocalGet(idxL)
-    fbLocalGet(slotL)
-    fbI32Const(1)
-    fbI32Bin(116)
-    fbLocalGet(tagL)
-    fbArraySet(aTy())
-  }
-  fbLocalGet(idxL)
-  fbLocalGet(slotL)
-  if tw > 0 {
-    fbI32Const(1)
-    fbI32Bin(116)
-    fbI32Const(1)
-    fbI32Bin(114)
-  }
-  fbLocalGet(entryL)
-  fbArraySet(aTy())
-  return 0
-}
-
-// `__map_resize__(index, hashes, live, count, size) -> (ref $aTypeIdx)`: when a string-keyed
-// map's occupancy crosses 1/2 (`count*2 >= len(index)`), a doubled index with every live entry
-// re-placed from its stored hash; else `index` unchanged. The gate is `count`, not `size`,
-// because a dead entry's slot stays a probe marker until then.
-function emitMapResizeFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2) // 2 locals runs
-  wULEB(4) // count 4
-  wU8(127) // 0x7f i32 (mask 5, i 6, rslot 7, entry 8)
-  wULEB(1) // count 1
-  wU8(100) // 0x64 (ref $aTypeIdx) — newIdx 9
-  wSLEB(aTy())
-  // if count * 2 >= len(index) { grow + rehash + early-return newIdx }
-  fbLocalGet(3)
-  fbI32Const(1)
-  fbI32Bin(116) // i32.shl (count * 2)
-  fbLocalGet(0)
-  fbArrayLen()
-  fbI32Bin(79)  // 0x4f i32.ge_u
-  fbIf(64)      // if, void
-  // newCap = 2 * len(index) ; newIdx = array.new_default newCap ; mask (local 5) = newCap - 1
-  fbLocalGet(0)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(116)
-  fbArrayNewDefault(aTy())
-  fbLocalSet(9)
-  fbLocalGet(0)
-  fbArrayLen()
-  fbI32Const(1)
-  fbI32Bin(116)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbLocalSet(5)
-  // for i < count: if entry i is live, place it at hashes[i] & mask
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(6)
-  fbLocalGet(3)
-  fbI32Bin(78) // i32.ge_s (i >= count → done)
-  fbBrIf(1)
-  fbLocalGet(6)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(8) // entry = i + 1
-  if gMapDeletes {
-    fbLocalGet(2)
-    fbLocalGet(6)
-    fbArrayGet(aTy())
-  } else {
-    fbI32Const(1)
-  }
-  fbIf(64)
-  fbLocalGet(1)
-  fbLocalGet(6)
-  fbArrayGet(aTy())
-  fbLocalGet(5)
-  fbI32Bin(113) // i32.and
-  fbLocalSet(7)
-  emitMapPlaceEntry(9, 5, -1, 8, 7)
-  fbEnd()       // end (live if)
-  fbLocalGet(8)
-  fbLocalSet(6) // i = i + 1
-  fbBr(0)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (block)
-  fbLocalGet(9)
-  fbReturn()    // the fresh, rebuilt index
-  fbEnd()       // end (resize if)
-  fbLocalGet(0) // load factor fine → the index unchanged
-  fbEnd()       // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__map_resize_i32__(index, count) -> (ref $aTypeIdx)`: the i32-keyed twin, over pairs: when
-// `count*2 >= cap`, an index of twice the slots with every pair that is not a deleted marker
-// re-placed, reading only the old index; otherwise `index` unchanged.
-function emitMapResizeI32FnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2) // 2 locals runs
-  wULEB(6) // count 6
-  wU8(127) // 0x7f i32 (oldLen 2, mask 3, i 4, tag 5, entry 6, rslot 7)
-  wULEB(1) // count 1
-  wU8(100) // 0x64 (ref $aTypeIdx) — newIdx 8
-  wSLEB(aTy())
-  // if count * 4 >= len(index) { grow + rehash + early-return newIdx }
-  fbLocalGet(1)
-  fbI32Const(2)
-  fbI32Bin(116) // i32.shl (count * 4)
-  fbLocalGet(0)
-  fbArrayLen()
-  fbLocalTee(2)
-  fbI32Bin(79)  // 0x4f i32.ge_u
-  fbIf(64)      // if, void
-  // newIdx = array.new_default (2 * oldLen) ; mask = oldLen - 1 (the new slot count is oldLen)
-  fbLocalGet(2)
-  fbI32Const(1)
-  fbI32Bin(116)
-  fbArrayNewDefault(aTy())
-  fbLocalSet(8)
-  fbLocalGet(2)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbLocalSet(3)
-  // for i = 0; i < oldLen; i += 2: if index[i+1] > 0 { place (index[i], index[i+1]) }
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(4)
-  fbLocalGet(2)
-  fbI32Bin(79)  // i32.ge_u (i >= oldLen → done)
-  fbBrIf(1)
-  fbLocalGet(0)
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(114) // i32.or
-  fbArrayGet(aTy())
-  fbLocalTee(6)
-  fbI32Const(0)
-  fbI32Bin(74)  // 0x4a i32.gt_s
-  fbIf(64)
-  fbLocalGet(0)
-  fbLocalGet(4)
-  fbArrayGet(aTy())
-  fbLocalSet(5)
-  fbMapSlotOf(5, 3)
-  fbLocalSet(7)
-  emitMapPlaceEntry(8, 3, 5, 6, 7)
-  fbEnd()       // end (entry if)
-  fbLocalGet(4)
-  fbI32Const(2)
-  fbI32Bin(106)
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (block)
-  fbLocalGet(8)
-  fbReturn()    // the fresh, rebuilt index
-  fbEnd()       // end (resize if)
-  fbLocalGet(0) // load factor fine → the index unchanged
-  fbEnd()       // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
 }
 
 // A map struct's field count: the seven every map has, plus `seqs` and `next` in a module
@@ -4304,42 +2816,6 @@ function mapSeqFieldTypes() {
   wU8(126) // field 8 next: 0x7e i64
   wU8(1)   // mutable
   return 0
-}
-
-// `__map_resync__(seqs, count, seq) -> i32`: one before the first entry whose sequence is later
-// than `seq` (or `count - 1`), for a map walk whose entry a compaction moved. Sequences are i64
-// and grow along the entries, so the first later one is where JS `Map` iteration goes next.
-function emitMapResyncFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1)      // 1 locals run
-  wULEB(1)      // count 1
-  wU8(127)      // 0x7f i32 (i)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(3)
-  fbLocalGet(1)
-  fbI32Bin(78)  // 0x4e i32.ge_s (i >= count)
-  fbBrIf(1)
-  fbLocalGet(0)
-  fbLocalGet(3)
-  fbArrayGet(ia64TypeIdx)
-  fbLocalGet(2)
-  fbI32Bin(85)  // 0x55 i64.gt_s (later than seq)
-  fbBrIf(1)
-  fbLocalGet(3)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(3)
-  fbBr(0)
-  fbEnd()       // end (loop)
-  fbEnd()       // end (block)
-  fbLocalGet(3)
-  fbI32Const(1)
-  fbI32Bin(107) // the caller's step adds one back
-  fbEnd()       // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
 }
 
 // The resync helper's functype: `(ref <i64 array>, i32, i64) -> i32`.
@@ -4429,69 +2905,6 @@ function listGrowFuncType(row: i32) {
   return 0
 }
 
-// The body of `__grow_<row>__(L)`: the backing a `push` at full capacity replaces, 4 slots when
-// it has none and twice its capacity otherwise, with the live prefix copied over. The append
-// itself stays at the site (`emitPushAppend`).
-function emitListGrowFnCode(out: u8[], row: i32) {
-  const lTy = gGrowLTy[row]
-  const aTy = gGrowATy[row]
-  const body: u8[] = []
-  const prev = wTarget(body)
-  // locals: 1 the new capacity, 2 the new backing
-  wULEB(2)
-  wULEB(1)
-  wValI32()
-  wULEB(1)
-  wValRef(aTy, false)
-  fbLocalGet(0)
-  fbStructGet(lTy, 2)
-  fbI32Eqz()
-  fbIf(127)
-  fbI32Const(4)
-  fbElse()
-  fbLocalGet(0)
-  fbStructGet(lTy, 2)
-  fbI32Const(2)
-  fbI32Bin(108) // 0x6c i32.mul
-  fbEnd()
-  fbLocalSet(1)
-  fbLocalGet(1)
-  fbArrayNewDefault(aTy)
-  fbLocalSet(2)
-  fbLocalGet(2)
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbStructGet(lTy, 0)
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbStructGet(lTy, 1)
-  fbArrayCopy(aTy, aTy)
-  fbLocalGet(0)
-  fbLocalGet(2)
-  fbStructSet(lTy, 0)
-  fbLocalGet(0)
-  fbLocalGet(1)
-  fbStructSet(lTy, 2)
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// The type indices `__map_compact__` reads for one map shape: the map, its key kind, the keys'
-// and values' list wrappers and backing arrays, and the value element's heap type when a
-// vacated value slot is cleared to null (-1 for a numeric value).
-type MapCompactTys = {
-  mapTy: i32,
-  keyK: i32,
-  keysWrap: i32,
-  keysBack: i32,
-  valsWrap: i32,
-  valsBack: i32,
-  valNull: i32,
-  // A Set's `vals` is never written, so its compaction leaves it alone.
-  isSet: boolean,
-}
-
 // `__map_compact__`'s type indices for map shape `sh`, as `MapCompactTys` names them.
 function mapCompactTysOf(sh: i32): MapCompactTys {
   const mapTy = mapTypeIdxOf(sh)
@@ -4520,7 +2933,8 @@ function mapCompactTysOf(sh: i32): MapCompactTys {
   }
   const t: MapCompactTys = {
     mapTy: mapTy,
-    keyK: keyK,
+    keyStr: keyK == MAP_KEY_STR,
+    keyI64: keyK == MAP_KEY_I64,
     keysWrap: keysWrap,
     keysBack: keysBack,
     valsWrap: valsWrap,
@@ -4529,384 +2943,6 @@ function mapCompactTysOf(sh: i32): MapCompactTys {
     isSet: sh == -2 || sh == -5 || sh == -7,
   }
   return t
-}
-
-// `__map_compact__`'s slide: for i < count, a live entry i moves down to entry j and j counts
-// it, so j ends as the live count.
-function mapCompactSlide(t: MapCompactTys) {
-  const mapTy = t.mapTy
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(1)
-  fbLocalGet(3)
-  fbI32Bin(78) // i32.ge_s
-  fbBrIf(1)
-  fbLocalGet(0)
-  fbStructGet(mapTy, 2)
-  fbLocalGet(1)
-  fbArrayGet(aTy())
-  fbIf(64)     // live[i] != 0
-  mapCompactMove(mapTy, 0, t.keysWrap, t.keysBack)
-  if !t.isSet { mapCompactMove(mapTy, 1, t.valsWrap, t.valsBack) }
-  mapCompactMove(mapTy, 2, -1, aTy())
-  if t.keyK == MAP_KEY_STR { mapCompactMove(mapTy, 6, -1, aTy()) }
-  mapCompactMove(mapTy, 7, -1, ia64TypeIdx)
-  fbLocalGet(2)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(2)
-  fbEnd()      // end (live if)
-  fbLocalGet(1)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(1)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-}
-
-// `__map_compact__`'s vacated tail, j <= i < count: each entry dead, with no sequence, and its
-// string key and ref value cleared to null.
-function mapCompactClearTail(t: MapCompactTys) {
-  const mapTy = t.mapTy
-  fbLocalGet(2)
-  fbLocalSet(1)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(1)
-  fbLocalGet(3)
-  fbI32Bin(78)
-  fbBrIf(1)
-  fbLocalGet(0)
-  fbStructGet(mapTy, 2)
-  fbLocalGet(1)
-  fbI32Const(0)
-  fbArraySet(aTy())
-  fbLocalGet(0)
-  fbStructGet(mapTy, 7)
-  fbLocalGet(1)
-  fbI64Const(-1, -1)
-  fbArraySet(ia64TypeIdx)
-  if t.keyK == MAP_KEY_STR {
-    fbLocalGet(0)
-    fbStructGet(mapTy, 0)
-    fbStructGet(t.keysWrap, 0)
-    fbLocalGet(1)
-    fbRefNull(sTy())
-    fbArraySet(t.keysBack)
-  }
-  if t.valNull >= 0 {
-    fbLocalGet(0)
-    fbStructGet(mapTy, 1)
-    fbStructGet(t.valsWrap, 0)
-    fbLocalGet(1)
-    fbRefNull(t.valNull)
-    fbArraySet(t.valsBack)
-  }
-  fbLocalGet(1)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(1)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-}
-
-// `__map_compact__`'s new index cap into local 4: 16, doubled while it is at most
-// `4*size + 18`.
-function mapCompactGrowCap(mapTy: i32) {
-  fbI32Const(16)
-  fbLocalSet(4)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(4)
-  fbLocalGet(0)
-  fbStructGet(mapTy, 5)
-  fbI32Const(4)
-  fbI32Bin(108) // size * 4
-  fbI32Const(18)
-  fbI32Bin(106)
-  fbI32Bin(75)  // 0x4b i32.gt_u
-  fbBrIf(1)
-  fbLocalGet(4)
-  fbI32Const(2)
-  fbI32Bin(108)
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-}
-
-// `__map_compact__`'s reindex: idx is the index cleared in place when it already has cap slots
-// (a steady churn's case), else a fresh one; then entry i < j is re-placed from the entries,
-// never the old index: an i32 key as its own pair tag, an i64 key at its hash, a string key at
-// its stored hash. Stores idx back into the map.
-function mapCompactReindex(t: MapCompactTys) {
-  const mapTy = t.mapTy
-  const keyInt = t.keyK != MAP_KEY_STR
-  let pairShift = 0
-  if keyInt { pairShift = 1 }
-  fbLocalGet(0)
-  fbStructGet(mapTy, 3)
-  fbLocalTee(9)
-  fbArrayLen()
-  fbLocalGet(4)
-  fbI32Const(pairShift)
-  fbI32Bin(116) // i32.shl (the index length of cap slots)
-  fbI32Bin(70)  // i32.eq
-  fbIf(64)
-  fbLocalGet(9)
-  fbI32Const(0)
-  fbI32Const(0)
-  fbLocalGet(9)
-  fbArrayLen()
-  fbArrayFill(aTy())
-  fbElse()
-  fbLocalGet(4)
-  fbI32Const(pairShift)
-  fbI32Bin(116)
-  fbArrayNewDefault(aTy())
-  fbLocalSet(9)
-  fbEnd()
-  fbLocalGet(4)
-  fbI32Const(1)
-  fbI32Bin(107)
-  fbLocalSet(6) // mask = cap - 1
-  fbI32Const(0)
-  fbLocalSet(1)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(1)
-  fbLocalGet(2)
-  fbI32Bin(78)  // i32.ge_s (i >= j)
-  fbBrIf(1)
-  fbLocalGet(1)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(8) // entry = i + 1
-  fbLocalGet(0)
-  if keyInt {
-    fbStructGet(mapTy, 0)
-    fbStructGet(t.keysWrap, 0)
-    fbLocalGet(1)
-    fbArrayGet(t.keysBack)
-    if t.keyK == MAP_KEY_I64 {
-      fbLocalSet(10)
-      fbMapTagOfI64(10)
-    }
-    fbLocalSet(7) // tag = keys[i], or an i64 key's hash
-    fbMapSlotOf(7, 6)
-    fbLocalSet(5)
-    emitMapPlaceEntry(9, 6, 7, 8, 5)
-  } else {
-    fbStructGet(mapTy, 6)
-    fbLocalGet(1)
-    fbArrayGet(aTy())
-    fbLocalGet(6)
-    fbI32Bin(113) // i32.and (hashes[i] & mask)
-    fbLocalSet(5)
-    emitMapPlaceEntry(9, 6, -1, 8, 5)
-  }
-  fbLocalGet(8)
-  fbLocalSet(1) // i = i + 1
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  fbLocalGet(0)
-  fbLocalGet(9)
-  fbRefAsNonNull()
-  fbStructSet(mapTy, 3)
-}
-
-// `__map_compact__(m)` for map shape `sh`: slide the live entries down in place, in order and
-// with their sequences, clear the vacated tail (refs to null, `seqs` to -1, which no entry
-// holds), then rebuild the index at the next power of two above `4*size + 2*INITIAL_CAP`, the
-// cap `__map_resize__` would grow into anyway (D2291, D2315). Only a resized index allocates.
-function emitMapCompactFnCode(out: u8[], sh: i32) {
-  const t = mapCompactTysOf(sh)
-  const mapTy = t.mapTy
-  const body: u8[] = []
-  const prev = wTarget(body)
-  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 mask, 7 tag, 8 entry, 9 idx[, 10 an i64 key]
-  let runs = 2
-  if t.keyK == MAP_KEY_I64 { runs = 3 }
-  wULEB(runs) // locals runs
-  wULEB(8)
-  wU8(127)    // 0x7f i32
-  wULEB(1)
-  wU8(99)     // 0x63 (ref null ht)
-  wSLEB(aTy())
-  if t.keyK == MAP_KEY_I64 {
-    wULEB(1)
-    wU8(126) // 0x7e i64
-  }
-  fbLocalGet(0)
-  fbStructGet(mapTy, 4)
-  fbLocalSet(3)
-  mapCompactSlide(t)
-  mapCompactClearTail(t)
-  // keys.len = vals.len = count = j; a Set keeps its empty vals
-  fbLocalGet(0)
-  fbStructGet(mapTy, 0)
-  fbLocalGet(2)
-  fbStructSet(t.keysWrap, 1)
-  if !t.isSet {
-    fbLocalGet(0)
-    fbStructGet(mapTy, 1)
-    fbLocalGet(2)
-    fbStructSet(t.valsWrap, 1)
-  }
-  fbLocalGet(0)
-  fbLocalGet(2)
-  fbStructSet(mapTy, 4)
-  mapCompactGrowCap(mapTy)
-  mapCompactReindex(t)
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// One entry-parallel array's move in `__map_compact__`: `arr[j] = arr[i]`, where `arr` is map
-// field `field` (through list wrapper `wrap` when `wrap >= 0`) and `back` its array type.
-function mapCompactMove(mapTy: i32, field: i32, wrap: i32, back: i32) {
-  fbLocalGet(0)
-  fbStructGet(mapTy, field)
-  if wrap >= 0 { fbStructGet(wrap, 0) }
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbStructGet(mapTy, field)
-  if wrap >= 0 { fbStructGet(wrap, 0) }
-  fbLocalGet(1)
-  fbArrayGet(back)
-  fbArraySet(back)
-  return 0
-}
-
-// Prints `strs[k]` when local `param` equals `k`, for every row: one `if` per row.
-// Each `k` is a guard row of space `sp`, its symbol named from `subs[k]`.
-function emitInitFailPick(param: i32, strs: string[], sp: i32, subs: i32[]) {
-  let k = 0
-  while k < strs.length {
-    fbLocalGet(param)
-    fbI32RelOf(sp, subs[k], k + relSkew(sp))
-    fbI32Bin(70) // 0x46 i32.eq
-    fbIf(64)
-    emitInitFailText(strs[k])
-    fbEnd()
-    k = k + 1
-  }
-  return 0
-}
-
-// Streams `text` through `__print_char__`, unflushed.
-function emitInitFailText(text: string) {
-  for cp in text {
-    fbI32Const(cp)
-    fbCall(2) // __print_char__ (import 2)
-  }
-  return 0
-}
-
-// `__init_fail__(g, verb, r)`: prints "`name` read|written before its initializer ran (place),
-// via reader" from the rows guard sites interned, then traps (D2652). Each row's text is here
-// once, however many sites name it; the code section emits every user body first.
-function emitInitFailFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0) // no locals
-  emitInitFailPick(0, gInitGNames, RS_GNAME, gInitGIdx)
-  fbLocalGet(1)
-  fbIf(64)
-  emitInitFailText("written")
-  fbElse()
-  emitInitFailText("read")
-  fbEnd()
-  emitInitFailText(" before its initializer ran")
-  emitInitFailPick(0, gInitGLocs, RS_GNAME, gInitGIdx)
-  const readers: i32[] = []
-  while readers.length < gInitReaders.length { readers.push(readers.length) }
-  emitInitFailPick(2, gInitReaders, RS_GREAD, readers)
-  fbCall(3) // __print_str_flush__ (import 3)
-  fbUnreachable()
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// Prints local `x`, a non-negative i32, in decimal: `p` climbs to x's leading power of ten,
-// then each digit is `x / p % 10` as `p` falls back to zero. Local `p` is scratch.
-function emitAsFailDecimal(x: i32, p: i32) {
-  fbI32Const(1)
-  fbLocalSet(p)
-  fbLoop(64)
-  fbLocalGet(x)
-  fbLocalGet(p)
-  fbI32Bin(110) // 0x6e i32.div_u
-  fbI32Const(10)
-  fbI32Bin(79) // 0x4f i32.ge_u
-  fbIf(64)
-  fbLocalGet(p)
-  fbI32Const(10)
-  fbI32Bin(108) // 0x6c i32.mul
-  fbLocalSet(p)
-  fbBr(1)
-  fbEnd()
-  fbEnd()
-  fbLoop(64)
-  fbLocalGet(x)
-  fbLocalGet(p)
-  fbI32Bin(110) // 0x6e i32.div_u
-  fbI32Const(10)
-  fbI32Bin(112) // 0x70 i32.rem_u
-  fbI32Const(48)
-  fbI32Bin(106) // 0x6a i32.add
-  fbCall(2) // __print_char__ (import 2)
-  fbLocalGet(p)
-  fbI32Const(10)
-  fbI32Bin(110) // 0x6e i32.div_u
-  fbLocalTee(p)
-  fbBrIf(0)
-  fbEnd()
-  return 0
-}
-
-// `__as_fail__(line, colRow)`: prints "as! <domain> at <line>:<col>: not exact" and returns;
-// each site then traps, so a reason costs a site one call rather than a call per character.
-function emitAsFailFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // one locals run
-  wULEB(1) // p
-  wU8(127) // 0x7f i32
-  emitInitFailText("as! ")
-  let k = 0
-  while k < AS_FAIL_DOMS.length {
-    fbLocalGet(1)
-    fbI32Const(7)
-    fbI32Bin(113) // 0x71 i32.and
-    fbI32Const(k)
-    fbI32Bin(70) // 0x46 i32.eq
-    fbIf(64)
-    emitInitFailText(AS_FAIL_DOMS[k])
-    fbEnd()
-    k = k + 1
-  }
-  fbLocalGet(0)
-  fbIf(64)
-  emitInitFailText(" at ")
-  emitAsFailDecimal(0, 2)
-  emitInitFailText(":")
-  fbLocalGet(1)
-  fbI32Const(3)
-  fbI32Bin(118) // 0x76 i32.shr_u
-  fbLocalSet(1)
-  emitAsFailDecimal(1, 2)
-  fbEnd()
-  emitInitFailText(": not exact")
-  fbCall(3) // __print_str_flush__ (import 3)
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
 }
 
 // —— scalar list views (D3028) ——
@@ -5640,118 +3676,6 @@ function rvLenFnCode(out: u8[]) {
   return helpFrameBody(out, body)
 }
 
-// `__f64_rem__(x, y) -> f64`: the truncated remainder — `x - y * trunc(x / y)` in value, with
-// the sign of the dividend (Rust's `f64::rem`, JS's `%`, C's `fmod`; wasm has no instruction
-// for it, D1586). Not that identity evaluated directly — it is off by an ulp once the
-// quotient passes 2^53 — but a scaled repeated-subtraction form: double `b` to the largest `b * 2^k <= a`, then halve back down subtracting where it fits, each step exact in Sterbenz's range.
-function emitF64RemFnCode(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(1) // one locals run
-  wULEB(4) // four of them
-  wU8(124) // 0x7c f64 — a, b, t, s
-  // x not finite (NaN or ±inf) → NaN. `v - v` is NaN for both and 0 for every finite v, which is
-  // the whole finiteness test and needs no `inf` constant to compare against.
-  fbLocalGet(0)
-  fbLocalGet(0)
-  fbI32Bin(161) // 0xa1 f64.sub
-  fbLocalTee(5)
-  fbLocalGet(5)
-  fbI32Bin(98) // 0x62 f64.ne
-  fbIf(64)
-  fbF64Const("0.0")
-  fbF64Const("0.0")
-  fbI32Bin(163) // 0xa3 f64.div — 0/0 is the NaN this returns
-  fbReturn()
-  fbEnd()
-  // b = |y|; y NaN, or y zero → NaN. The NaN arm is separate because `|NaN| == 0.0` is FALSE.
-  fbLocalGet(1)
-  fbI32Bin(153) // 0x99 f64.abs
-  fbLocalTee(3)
-  fbF64Const("0.0")
-  fbI32Bin(97) // 0x61 f64.eq
-  fbLocalGet(1)
-  fbLocalGet(1)
-  fbI32Bin(98) // 0x62 f64.ne
-  fbI32Bin(114) // 0x72 i32.or
-  fbIf(64)
-  fbF64Const("0.0")
-  fbF64Const("0.0")
-  fbI32Bin(163) // 0xa3 f64.div
-  fbReturn()
-  fbEnd()
-  // y INFINITE → x. y is not NaN by here, so the same `v - v` test names ±inf alone.
-  fbLocalGet(1)
-  fbLocalGet(1)
-  fbI32Bin(161) // 0xa1 f64.sub
-  fbLocalTee(5)
-  fbLocalGet(5)
-  fbI32Bin(98) // 0x62 f64.ne
-  fbIf(64)
-  fbLocalGet(0)
-  fbReturn()
-  fbEnd()
-  // a = |x|; |x| < |y| → x itself, which is what carries `-0.0 % 1` through unharmed (D1586).
-  fbLocalGet(0)
-  fbI32Bin(153) // 0x99 f64.abs
-  fbLocalTee(2)
-  fbLocalGet(3)
-  fbI32Bin(99) // 0x63 f64.lt
-  fbIf(64)
-  fbLocalGet(0)
-  fbReturn()
-  fbEnd()
-  // SCALE UP: t = b, doubling while `t * 2 <= a`. A double that overflows lands on +inf,
-  // which is `> a` for every finite a, so the loop exits rather than looping forever.
-  fbLocalGet(3)
-  fbLocalSet(4)
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(4)
-  fbF64Const("2.0")
-  fbI32Bin(162) // 0xa2 f64.mul
-  fbLocalTee(5)
-  fbLocalGet(2)
-  fbI32Bin(100) // 0x64 f64.gt
-  fbBrIf(1)
-  fbLocalGet(5)
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // DESCEND: subtract t where it fits, halve, stop at t == b. `a < 2t` holds at every step,
-  // so each subtraction is exact and `a` ends in [0, b) — the remainder's magnitude.
-  fbBlock(64)
-  fbLoop(64)
-  fbLocalGet(2)
-  fbLocalGet(4)
-  fbI32Bin(102) // 0x66 f64.ge
-  fbIf(64)
-  fbLocalGet(2)
-  fbLocalGet(4)
-  fbI32Bin(161) // 0xa1 f64.sub
-  fbLocalSet(2)
-  fbEnd()
-  fbLocalGet(4)
-  fbLocalGet(3)
-  fbI32Bin(97) // 0x61 f64.eq
-  fbBrIf(1)
-  fbLocalGet(4)
-  fbF64Const("0.5")
-  fbI32Bin(162) // 0xa2 f64.mul
-  fbLocalSet(4)
-  fbBr(0)
-  fbEnd()
-  fbEnd()
-  // The sign is the dividend's, including on a zero result (`-4.0 % 2.0` is `-0.0`; D1586).
-  fbLocalGet(2)
-  fbLocalGet(0)
-  fbI32Bin(166) // 0xa6 f64.copysign
-  fbEnd() // end (function)
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
 // The start function's `@file:line`. Module 0 is the ENTRY and top-level statements live
 // there, so the frame names the entry at line 1; a single-file compile has no module key and
 // carries the line alone.
@@ -5789,6 +3713,7 @@ function nameMapCount(n: i32): i32 {
   let count = gImports + n
   if startStmts.length > 0 { count = count + 1 }
   count = count + gInitMods.length
+  if memLogUsed { count = count + 1 }
   if gHelpF64Rem >= 0 { count = count + 1 }
   if gHelpInitFail >= 0 { count = count + 1 }
   count = count + svHelperCount()
@@ -5946,26 +3871,33 @@ function nameHelpers() {
 
 // Writes shared helper `kind`'s code entry to `out`; -1 on a refusal.
 function tailHelpFnCode(out: u8[], kind: i32): i32 {
-  if kind == HELP_STR_HASH { return emitStrHashFnCode(out) }
-  if kind == HELP_STR_EQ { return emitStrEqFnCode(out) }
-  if kind == HELP_STR_CONCAT { return emitStrConcatFnCode(out) }
-  if kind == HELP_UTF8_DEC { return emitUtf8DecFnCode(out) }
-  if kind == HELP_UTF8_ENC { return emitUtf8EncFnCode(out) }
-  if kind == HELP_UTF8_CPLEN { return emitUtf8CpLenFnCode(out) }
-  if kind == HELP_STR_BYTES { return emitStrBytesFnCode(out) }
-  if kind == HELP_MAP_PROBE { return emitMapProbeFnCode(out, false) }
-  if kind == HELP_MAP_ENTRY { return emitMapProbeFnCode(out, true) }
-  if kind == HELP_MAP_ENTRY_I32 { return emitMapProbeI32FnCode(out, true) }
-  if kind == HELP_MAP_RESIZE { return emitMapResizeFnCode(out) }
-  if kind == HELP_MAP_RESYNC { return emitMapResyncFnCode(out) }
-  if kind == HELP_MAP_PROBE_I32 { return emitMapProbeI32FnCode(out, false) }
-  if kind == HELP_MAP_RESIZE_I32 { return emitMapResizeI32FnCode(out) }
-  if kind == HELP_MAP_PROBE_I64 { return emitMapProbeI64FnCode(out) }
-  if kind >= HELP_MAP_GET { return emitMapGetFnCode(out, kind - HELP_MAP_GET) }
+  if kind == HELP_STR_HASH { return irStrHashFnCode(out) }
+  if kind == HELP_STR_EQ { return irStrEqFnCode(out) }
+  if kind == HELP_STR_CONCAT { return irStrConcatFnCode(out) }
+  if kind == HELP_UTF8_DEC { return irUtf8DecFnCode(out) }
+  if kind == HELP_UTF8_ENC { return irUtf8EncFnCode(out) }
+  if kind == HELP_UTF8_CPLEN { return irUtf8CpLenFnCode(out) }
+  if kind == HELP_STR_BYTES { return irStrBytesFnCode(out) }
+  if kind == HELP_MAP_PROBE { return irMapProbeFnCode(out, false) }
+  if kind == HELP_MAP_ENTRY { return irMapProbeFnCode(out, true) }
+  if kind == HELP_MAP_ENTRY_I32 { return irMapProbeI32FnCode(out, true) }
+  if kind == HELP_MAP_RESIZE { return irMapResizeFnCode(out) }
+  if kind == HELP_MAP_RESYNC { return irMapResyncFnCode(out) }
+  if kind == HELP_MAP_PROBE_I32 { return irMapProbeI32FnCode(out, false) }
+  if kind == HELP_MAP_RESIZE_I32 { return irMapResizeI32FnCode(out) }
+  if kind == HELP_MAP_PROBE_I64 { return irMapProbeI64FnCode(out) }
+  if kind >= HELP_MAP_GET { return irMapGetFnCode(out, kind - HELP_MAP_GET) }
   if kind >= HELP_LIST_GROW {
-    return emitListGrowFnCode(out, kind - HELP_LIST_GROW)
+    return irListGrowFnCode(
+      out,
+      gGrowLTy[kind - HELP_LIST_GROW],
+      gGrowATy[kind - HELP_LIST_GROW],
+    )
   }
-  return emitMapCompactFnCode(out, mapCompactRowShape(kind - HELP_MAP_COMPACT))
+  return irMapCompactFnCode(
+    out,
+    mapCompactTysOf(mapCompactRowShape(kind - HELP_MAP_COMPACT)),
+  )
 }
 
 // The name-section name of shared helper `kind`, a `HELP_*` row.
@@ -6033,6 +3965,11 @@ function emitNameSection(n: i32) {
     wULEB(gImports + n + 1 + ik)
     wName("__start__@" + srcmapPathOf(gInitMods[ik]) + ":1")
     ik = ik + 1
+  }
+  // The `__log__` decoder, between the init functions and the helpers (D17020).
+  if memLogUsed {
+    wULEB(gMemLogIdx)
+    wName("__log__")
   }
   // The shared runtime helpers (module-tail indices — after the start fn and the
   // `__log__` decoder, so the namemap stays strictly increasing).
@@ -7751,7 +5688,6 @@ function emitProgramReset(rootIx: i32) {
   gGlobalFixedN = 0
   gGlobalRopeAt = 0
   bodyRebuiltFrom = Map()
-  typeDeclNameIxReset()
   callsByCalleeReset()
   tyRegMemoReset()
   regUnionNameReset()
@@ -10383,20 +8319,20 @@ function buildCodePayload(
   if memLogUsed {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitMemLogFnCode(entry) < 0 { return -1 }
+    if irMemLogFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__log__")
   }
   // The shared runtime helpers, each banked under the name the name section gives it — one body, one row, so a trace and a validate diagnostic cannot disagree about what to call the same function.
   if gHelpF64Rem >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitF64RemFnCode(entry) < 0 { return -1 }
+    if irF64RemFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__f64_rem__")
   }
   if gHelpInitFail >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitInitFailFnCode(entry) < 0 { return -1 }
+    if irInitFailFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__init_fail__")
   }
   svPlaceHelpers(codePayload)
@@ -10404,19 +8340,19 @@ function buildCodePayload(
   if gHelpAsFail >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitAsFailFnCode(entry) < 0 { return -1 }
+    if irAsFailFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__as_fail__")
   }
   if gHelpStrFromBytes >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitStrFromBytesFnCode(entry) < 0 { return -1 }
+    if irStrFromBytesFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_from_bytes__")
   }
   if gHelpStrFill >= 0 {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitStrFillFnCode(entry) < 0 { return -1 }
+    if irStrFillFnCode(entry, gStrFillSeg) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_fill__")
   }
   // The map store and struct compare helpers the bodies above called, in the order they first

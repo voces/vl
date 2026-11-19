@@ -1,0 +1,1394 @@
+// The shared runtime helpers, built as IR and lowered by `irLowerHelper` into the slot and name
+// the code section gives each. A helper is written against the small builder below: values are
+// operands, each operation appends its node to the body being built, and a reference the helper
+// holds is a raw rep at its wasm heap type. Each body lowers to the bytes its hand-written
+// writer wrote; a loop exit is `if c { br }`, the `br_if` form, never `if !c {} else { br }`.
+import {
+  IrFn,
+  IrNode,
+  OVar,
+  Opnd,
+  PrimOp,
+  RawEff,
+  RawOp,
+  Rhs,
+  irFnNew,
+  irNodeNew,
+  irVarNew,
+} from "./ir"
+import { irLowerHelper } from "./ir_lower"
+import { irVerify } from "./ir_verify"
+import { emitFail, mapTypeIdxOf } from "./emit_bytes"
+import { repNodeOfTy, repRawOf } from "./emit_rep"
+import { TY_BOOL, TY_F64, TY_I32, TY_I64, TY_NEVER } from "./check_types"
+import {
+  AS_FAIL_DOMS,
+  aTy,
+  ba8Ty,
+  bl8Ty,
+  gImports,
+  gInitGIdx,
+  gInitGLocs,
+  gInitGNames,
+  gInitReaders,
+  gMapDeletes,
+  gMapGetMiss,
+  gMapGetShape,
+  gMapGetStrKey,
+  helpStrEqFn,
+  helpStrHashFn,
+  helpUtf8DecFn,
+  ia64TypeIdx,
+  lTy,
+  mkArrTy,
+  mkListTy,
+  sBackTy,
+  sTy,
+} from "./emit_state"
+import { RS_GNAME, RS_GREAD, relSkew } from "./emit_reloc"
+
+let hf: IrFn = irFnNew(-1, "")
+// The bodies being built, innermost last.
+let hb: i32[][] = []
+
+function I32(): i32 { return repNodeOfTy(TY_I32) }
+function F64(): i32 { return repNodeOfTy(TY_F64) }
+function BOOL(): i32 { return repNodeOfTy(TY_BOOL) }
+function I64(): i32 { return repNodeOfTy(TY_I64) }
+
+// The VL type of scalar rep `r`, or -1 for a raw rep, which no VL type names.
+function tyOf(r: i32): i32 {
+  if r == I32() { return TY_I32 }
+  if r == F64() { return TY_F64 }
+  if r == BOOL() { return TY_BOOL }
+  if r == I64() { return TY_I64 }
+  return -1
+}
+
+function begin(ret: i32) {
+  hf = irFnNew(-1, "")
+  hb = [[]]
+  hf.irHelper = true
+  hf.irRetTy = tyOf(ret)
+  hf.irRetRep = ret
+  return 0
+}
+
+// Lowers the helper built since `begin` onto `out`; -1, with the refusal recorded, when the
+// verifier or the lowering refuses it.
+function finish(name: string, out: u8[]): i32 {
+  hf.irBody = close()
+  const vd = irVerify(hf)
+  if vd.vfRule != 0 {
+    return emitFail("emitProgram: helper " + name + ": " + vd.vfMsg)
+  }
+  const why = irLowerHelper(hf, out)
+  if why != "" { return emitFail("emitProgram: helper " + name + ": " + why) }
+  return 0
+}
+
+function node(n: IrNode, rep: i32): i32 {
+  return irNodeNew(hf, n, tyOf(rep), rep, -1)
+}
+
+function put(n: IrNode) { hb[hb.length - 1].push(node(n, I32())) }
+
+function param(rep: i32): OVar {
+  const v = irVarNew(hf, rep, tyOf(rep), "param", hf.irParams.length)
+  hf.irParams.push(v)
+  return { ov: v }
+}
+
+// A local at wasm slot `slot`; -1 for a valued block's out, which stays on the stack.
+function local(rep: i32, slot: i32): OVar {
+  return { ov: irVarNew(hf, rep, tyOf(rep), "local", slot) }
+}
+
+// A temp of rep `rep` defined by `r`, for one later use.
+function def(rep: i32, r: Rhs): Opnd {
+  const t = irVarNew(hf, rep, tyOf(rep), "temp", -1)
+  hb[hb.length - 1].push(node({ lDst: t, lRhs: r }, rep))
+  return { ov: t }
+}
+
+function op(rep: i32, o: PrimOp, a: Opnd, b: Opnd): Opnd {
+  return def(rep, { poOp: o, poArgs: [a, b] })
+}
+
+function test(o: PrimOp, a: Opnd, b: Opnd): Opnd { return op(BOOL(), o, a, b) }
+
+function add(a: Opnd, b: Opnd): Opnd { return op(I32(), "add", a, b) }
+
+function sub(a: Opnd, b: Opnd): Opnd { return op(I32(), "sub", a, b) }
+
+// The one instruction `code` over `a`, into rep `rep`.
+function instr(rep: i32, code: i32, a: Opnd[]): Opnd {
+  return def(rep, { nxArgs: a, nxOp: code, nxAt: -1 })
+}
+
+function raw(rep: i32, o: RawOp, heap: i32, a: Opnd[], imm: i32): Opnd {
+  return def(rep, { rwOp: o, rwHeap: heap, rwArgs: a, rwImm: imm })
+}
+
+function eff(o: RawEff, heap: i32, a: Opnd[], imm: i32) {
+  put({ srOp: o, srHeap: heap, srArgs: a, srImm: imm })
+}
+
+// Field `f` of struct `s` at heap type `heap`, of rep `rep`.
+function field(s: Opnd, heap: i32, f: i32, rep: i32): Opnd {
+  return raw(rep, "struct.get", heap, [s], f)
+}
+
+// `v`, written to `d` and kept: wasm's `local.tee`.
+function tee(d: OVar, v: Opnd): Opnd {
+  const r = if d.ov >= 0 && d.ov < hf.irVars.length { hf.irVars[d.ov].vRep } else { -1 }
+  return raw(r, "tee", -1, [v], d.ov)
+}
+
+function i32(x: i32): Opnd { return { oiRep: I32(), oiBits: x } }
+
+function f64(x: f64): Opnd { return { oiRep: F64(), oiBits: f64bits(x) } }
+
+function set(d: OVar, s: Opnd) { put({ asDst: d.ov, asSrc: s }) }
+
+function ret(v: Opnd) { put({ rtHas: true, rtV: v }) }
+
+// Opens a nested body, which `close` ends and returns.
+function open() { hb.push([]) }
+
+function close(): i32[] {
+  const b = hb[hb.length - 1]
+  hb.pop()
+  return b
+}
+
+function when(c: Opnd, then: i32[]) {
+  put({ siCond: c, siThen: then, siElse: [], siOut: -1, siElseKw: false })
+}
+
+// `if c {} else { b }`: the hand-written loops' own exit test.
+function unless(c: Opnd, b: i32[]) {
+  put({ siCond: c, siThen: [], siElse: b, siOut: -1, siElseKw: true })
+}
+
+function br(label: i32): i32 {
+  return node({ brLabel: label, brHas: false, brVal: i32(0) }, I32())
+}
+
+// Leaves the block labelled `label` with value `v` when `c` holds.
+function yieldIf(c: Opnd, label: i32, v: Opnd) {
+  when(c, [node({ brLabel: label, brHas: true, brVal: v }, I32())])
+}
+
+// Leaves the frame labelled `label` when `c` holds.
+function exitIf(c: Opnd, label: i32) { when(c, [br(label)]) }
+
+function loop(label: i32, b: i32[]) { put({ lpLabel: label, lpBody: b }) }
+
+// A block labelled `label` around a loop labelled `label + 1`, whose body `b` ends by looping.
+function loopIn(label: i32, b: i32[]) {
+  b.push(br(label + 1))
+  put(
+    {
+      bkLabel: label,
+      bkBody: [node({ lpLabel: label + 1, lpBody: b }, I32())],
+      bkOut: -1,
+    },
+  )
+}
+
+function returnNanIf(c: Opnd) {
+  open()
+  ret(op(F64(), "div", f64(0.0), f64(0.0)))
+  when(c, close())
+}
+
+// `v` must be a variable or an immediate: a temp would be defined outside the arm.
+function returnIf(c: Opnd, v: Opnd) {
+  open()
+  ret(v)
+  when(c, close())
+}
+
+// `__f64_rem__(x, y) -> f64`: the truncated remainder, with the dividend's sign (JS's `%`, C's
+// `fmod`). Not `x - y * trunc(x / y)`, which is off by an ulp once the quotient passes 2^53, but
+// repeated subtraction: double `b` up to the largest `b * 2^k <= a`, then halve back down,
+// subtracting where it fits, each step exact.
+export function irF64RemFnCode(out: u8[]): i32 {
+  begin(F64())
+  const x = param(F64())
+  const y = param(F64())
+  const a = local(F64(), 2)
+  const b = local(F64(), 3)
+  const t = local(F64(), 4)
+  const s = local(F64(), 5)
+  // `v - v` is NaN for a NaN or an infinity, and 0 for every finite `v`.
+  returnNanIf(test("ne", tee(s, op(F64(), "sub", x, x)), s))
+  returnNanIf(
+    test(
+      "or",
+      test("eq", tee(b, instr(F64(), 0x99, [y])), f64(0.0)),
+      test("ne", y, y),
+    ),
+  )
+  returnIf(test("ne", tee(s, op(F64(), "sub", y, y)), s), x)
+  // `|x| < |y|` gives `x` itself, which keeps a negative zero dividend negative.
+  returnIf(test("lt", tee(a, instr(F64(), 0x99, [x])), b), x)
+  // Doubling overflows to +inf, which exceeds every finite `a`, so the loop ends.
+  set(t, b)
+  open()
+  exitIf(test("gt", tee(s, op(F64(), "mul", t, f64(2.0))), a), 0)
+  set(t, s)
+  loopIn(0, close())
+  // `a < 2t` holds at every step, so each subtraction is exact and `a` ends in [0, b).
+  open()
+  const fits = test("ge", a, t)
+  open()
+  set(a, op(F64(), "sub", a, t))
+  when(fits, close())
+  exitIf(test("eq", t, b), 2)
+  set(t, op(F64(), "mul", t, f64(0.5)))
+  loopIn(2, close())
+  ret(instr(F64(), 0xa6, [a, x]))
+  return finish("__f64_rem__", out)
+}
+
+// A string header, and its backing as a local holds it.
+function str(): i32 { return repRawOf(sTy(), false) }
+function back(): i32 { return repRawOf(sBackTy(), true) }
+
+function strBack(s: Opnd): Opnd { return field(s, sTy(), 0, back()) }
+function strStart(s: Opnd): Opnd { return field(s, sTy(), 1, I32()) }
+function strLen(s: Opnd): Opnd { return field(s, sTy(), 2, I32()) }
+
+// A fresh header over `bk[0 .. n]`, its hash not yet computed.
+function strNew(bk: Opnd, n: Opnd): Opnd {
+  return raw(str(), "struct.new", sTy(), [bk, i32(0), n, i32(0)], 0)
+}
+
+// Byte `at` of backing `bk`.
+function byteAt(bk: Opnd, at: Opnd): Opnd {
+  return raw(I32(), "array.get", sBackTy(), [bk, at], 0)
+}
+
+// `i + k`, or `i` itself for `k` 0.
+function plus(i: Opnd, k: i32): Opnd {
+  return if k == 0 { i } else { add(i, i32(k)) }
+}
+
+// `__str_hash__(s) -> i32`: the masked non-negative FNV-1a hash, memoised in the header's one
+// mutable field; 0 means not yet computed, so a string whose hash is 0 walks again.
+export function irStrHashFnCode(out: u8[]): i32 {
+  begin(I32())
+  const s = param(str())
+  const h = local(I32(), 1)
+  const i = local(I32(), 2)
+  const n = local(I32(), 3)
+  const lim = local(I32(), 4)
+  const bk = local(back(), 5)
+  const o = local(I32(), -1)
+  open()
+  yieldIf(raw(BOOL(), "test", -1, [tee(h, field(s, sTy(), 3, I32()))], 0), 0, h)
+  set(h, i32(-2128831035))
+  set(bk, strBack(s))
+  set(i, strStart(s))
+  set(n, add(i, strLen(s)))
+  set(lim, sub(n, i32(4)))
+  // Four bytes a turn while a whole four remain, then one a turn.
+  let w = 4
+  while w > 0 {
+    open()
+    const done = test(
+      if w == 4 { "gt" } else { "ge" },
+      i,
+      if w == 4 { lim } else { n },
+    )
+    open()
+    let k = 0
+    while k < w {
+      set(
+        h,
+        op(
+          I32(),
+          "mul",
+          op(I32(), "xor", h, byteAt(bk, plus(i, k))),
+          i32(16777619),
+        ),
+      )
+      k = k + 1
+    }
+    set(i, add(i, i32(w)))
+    hb[hb.length - 1].push(br(1))
+    unless(done, close())
+    loop(1, close())
+    w = w - 3
+  }
+  set(h, op(I32(), "and", h, i32(2147483647)))
+  eff("struct.set", sTy(), [s, h], 3)
+  set(o, h)
+  put({ bkLabel: 0, bkBody: close(), bkOut: o.ov })
+  ret(o)
+  return finish("__str_hash__", out)
+}
+
+// `__str_eq__(a, b) -> i32`: 1 when the two strings hold the same bytes, else 0. The cursor
+// walks a's backing and reads b's at the one-time offset `d`; eight pairs a turn are xored and
+// or'd into one test while a whole eight remain, the rest one at a time.
+export function irStrEqFnCode(out: u8[]): i32 {
+  begin(I32())
+  const a = param(str())
+  const b = param(str())
+  const n = local(I32(), 2)
+  const i = local(I32(), 3)
+  const lim = local(I32(), 4)
+  const ab = local(back(), 5)
+  const bb = local(back(), 6)
+  const d = local(I32(), 7)
+  const o = local(I32(), -1)
+  open()
+  yieldIf(raw(BOOL(), "ref.eq", -1, [a, b], 0), 0, i32(1))
+  yieldIf(test("ne", strLen(a), strLen(b)), 0, i32(0))
+  set(ab, strBack(a))
+  set(bb, strBack(b))
+  set(i, strStart(a))
+  set(n, add(i, strLen(a)))
+  set(d, sub(strStart(b), i))
+  // A subtraction, so a maximal-length string cannot overflow the gate.
+  set(lim, sub(n, i32(8)))
+  const wide = test("ge", lim, i)
+  open()
+  open()
+  const done = test("gt", i, lim)
+  open()
+  let acc = op(I32(), "xor", byteAt(ab, i), byteAt(bb, add(i, d)))
+  let k = 1
+  while k < 8 {
+    const pair = op(
+      I32(),
+      "xor",
+      byteAt(ab, add(i, i32(k))),
+      byteAt(bb, add(add(i, d), i32(k))),
+    )
+    acc = op(I32(), "or", acc, pair)
+    k = k + 1
+  }
+  yieldIf(raw(BOOL(), "test", -1, [acc], 0), 0, i32(0))
+  set(i, add(i, i32(8)))
+  hb[hb.length - 1].push(br(1))
+  unless(done, close())
+  loop(1, close())
+  when(wide, close())
+  open()
+  const end = test("ge", i, n)
+  open()
+  yieldIf(test("ne", byteAt(ab, i), byteAt(bb, add(i, d))), 0, i32(0))
+  set(i, add(i, i32(1)))
+  hb[hb.length - 1].push(br(2))
+  unless(end, close())
+  loop(2, close())
+  set(o, i32(1))
+  put({ bkLabel: 0, bkBody: close(), bkOut: o.ov })
+  ret(o)
+  return finish("__str_eq__", out)
+}
+
+// `__str_concat__(a, b) -> (ref str)`: a fresh exact-fit backing holding a's bytes then b's,
+// each copied from its own `start`.
+export function irStrConcatFnCode(out: u8[]): i32 {
+  begin(str())
+  const a = param(str())
+  const b = param(str())
+  const la = local(I32(), 2)
+  const lb = local(I32(), 3)
+  const bk = local(repRawOf(sBackTy(), false), 4)
+  set(la, strLen(a))
+  set(lb, strLen(b))
+  set(
+    bk,
+    raw(
+      repRawOf(sBackTy(), false),
+      "array.new_default",
+      sBackTy(),
+      [add(la, lb)],
+      0,
+    ),
+  )
+  eff(
+    "array.copy",
+    sBackTy(),
+    [bk, i32(0), strBack(a), strStart(a), la],
+    sBackTy(),
+  )
+  eff("array.copy", sBackTy(), [bk, la, strBack(b), strStart(b), lb], sBackTy())
+  ret(strNew(bk, add(la, lb)))
+  return finish("__str_concat__", out)
+}
+
+// `__str_bytes__(s) -> u8[]`: a copy of the string's bytes in an exact-fit list. A copy, not a
+// view: a `u8[]` has no `start` to carry a slice's offset.
+export function irStrBytesFnCode(out: u8[]): i32 {
+  begin(repRawOf(bl8Ty(), false))
+  const s = param(str())
+  const bk = local(repRawOf(ba8Ty(), false), 1)
+  set(
+    bk,
+    raw(repRawOf(ba8Ty(), false), "array.new_default", ba8Ty(), [strLen(s)], 0),
+  )
+  eff(
+    "array.copy",
+    ba8Ty(),
+    [bk, i32(0), strBack(s), strStart(s), strLen(s)],
+    sBackTy(),
+  )
+  ret(
+    raw(
+      repRawOf(bl8Ty(), false),
+      "struct.new",
+      bl8Ty(),
+      [bk, strLen(s), strLen(s)],
+      0,
+    ),
+  )
+  return finish("__str_bytes__", out)
+}
+
+// `__str_from_bytes__(src, at, count) -> (ref str)`: a fresh string over `src[at .. at + count]`,
+// which the caller guarantees is UTF-8. A range outside `src`'s live length traps.
+export function irStrFromBytesFnCode(out: u8[]): i32 {
+  begin(str())
+  const src = param(repRawOf(bl8Ty(), false))
+  const at = param(I32())
+  const count = param(I32())
+  const bk = local(repRawOf(sBackTy(), false), 3)
+  // Both are non-negative past the first two tests, so their sum cannot wrap unsigned.
+  const neg = test("or", test("lt", at, i32(0)), test("lt", count, i32(0)))
+  const over = instr(
+    BOOL(),
+    0x4b,
+    [add(at, count), field(src, bl8Ty(), 1, I32())],
+  )
+  const bad = test("or", neg, over)
+  open()
+  put({ tpWhy: 0 })
+  when(bad, close())
+  set(
+    bk,
+    raw(repRawOf(sBackTy(), false), "array.new_default", sBackTy(), [count], 0),
+  )
+  const from = field(src, bl8Ty(), 0, repRawOf(ba8Ty(), true))
+  eff("array.copy", sBackTy(), [bk, i32(0), from, at, count], ba8Ty())
+  ret(strNew(bk, count))
+  return finish("__str_from_bytes__", out)
+}
+
+// `__str_fill__(at, s) -> i32`: fills pool string `s`'s backing from the pool segment at offset
+// `at`, and answers the offset past it.
+export function irStrFillFnCode(out: u8[], seg: i32): i32 {
+  begin(I32())
+  const at = param(I32())
+  const s = param(str())
+  eff("array.init_data", sBackTy(), [strBack(s), i32(0), at, strLen(s)], seg)
+  ret(add(at, strLen(s)))
+  return finish("__str_fill__", out)
+}
+
+function shru(a: Opnd, k: i32): Opnd { return op(I32(), "shru", a, i32(k)) }
+
+function or(a: Opnd, b: Opnd): Opnd { return op(I32(), "or", a, b) }
+
+function and(a: Opnd, k: i32): Opnd { return op(I32(), "and", a, i32(k)) }
+
+// `cp = U+FFFD` when `cp` is below `lo`, past U+10FFFF, or a UTF-16 surrogate.
+function sanitize(cp: OVar, lo: Opnd) {
+  const out = test("or", test("lt", cp, lo), test("gt", cp, i32(1114111)))
+  const sur = test(
+    "and",
+    test("ge", cp, i32(55296)),
+    test("le", cp, i32(57343)),
+  )
+  const bad = test("or", out, sur)
+  open()
+  set(cp, i32(65533))
+  when(bad, close())
+}
+
+// Returns U+FFFD after one consumed byte when `c` holds: a width of 0 would never advance.
+function decBadIf(c: Opnd) { returnIf(c, i32(16842749)) }
+
+// The UTF-8 codec is a loop with a variable stride, so it is one helper, not inlined. Its
+// encoder has a twin in VL, `emit_base.cpsToUtf8`, which must agree with it byte for byte.
+
+// `__utf8_dec__(back, i, end) -> i32`: decodes the sequence at backing offset `i`, reading
+// nothing at or past `end`, as `(width << 24) | codepoint` with `width` at least 1. A malformed
+// sequence decodes to U+FFFD: a stray continuation, a bad lead, a truncation one byte, an
+// overlong, surrogate or out-of-range value its whole width.
+export function irUtf8DecFnCode(out: u8[]): i32 {
+  begin(I32())
+  const bk = param(repRawOf(sBackTy(), false))
+  const i = param(I32())
+  const end = param(I32())
+  const b = local(I32(), 3)
+  const n = local(I32(), 4)
+  const cp = local(I32(), 5)
+  const k = local(I32(), 6)
+  const c = local(I32(), 7)
+  const lo = local(I32(), 8)
+  set(b, byteAt(bk, i))
+  const ascii = test("lt", b, i32(128))
+  open()
+  ret(or(i32(16777216), b))
+  when(ascii, close())
+  decBadIf(test("lt", b, i32(194)))
+  set(n, i32(2))
+  const three = test("ge", b, i32(224))
+  open()
+  set(n, i32(3))
+  const four = test("ge", b, i32(240))
+  open()
+  set(n, i32(4))
+  decBadIf(test("ge", b, i32(245)))
+  when(four, close())
+  when(three, close())
+  decBadIf(test("gt", add(i, n), end))
+  set(cp, op(I32(), "and", b, op(I32(), "shru", i32(127), n)))
+  set(k, i32(1))
+  open()
+  exitIf(test("ge", k, n), 0)
+  set(c, byteAt(bk, add(i, k)))
+  decBadIf(test("ne", and(c, 192), i32(128)))
+  set(cp, or(op(I32(), "shl", cp, i32(6)), and(c, 63)))
+  set(k, add(k, i32(1)))
+  loopIn(0, close())
+  // The smallest code point each width may encode: below it is an overlong form.
+  set(lo, i32(128))
+  const w3 = test("eq", n, i32(3))
+  open()
+  set(lo, i32(2048))
+  when(w3, close())
+  const w4 = test("eq", n, i32(4))
+  open()
+  set(lo, i32(65536))
+  when(w4, close())
+  sanitize(cp, lo)
+  ret(or(op(I32(), "shl", n, i32(24)), cp))
+  return finish("__utf8_dec__", out)
+}
+
+// Code point `i` of `__utf8_enc__`'s source, sanitized, into `cp`.
+function encRead(bk: Opnd, start: Opnd, i: OVar, cp: OVar) {
+  set(cp, raw(I32(), "array.get", aTy(), [bk, add(start, i)], 0))
+  sanitize(cp, i32(0))
+}
+
+// The bytes of a `width`-byte sequence for `cp` at `o[w ..]`: a lead byte, then six bits a
+// continuation; then `w` moves past them.
+function encBytes(o: Opnd, w: OVar, cp: OVar, width: i32) {
+  let b = 0
+  while b < width {
+    const at = plus(w, b)
+    const sh = 6 * (width - 1 - b)
+    let v: Opnd = cp
+    if b == 0 && width > 1 {
+      v = or(
+        i32(if width == 2 { 192 } else if width == 3 { 224 } else { 240 }),
+        shru(cp, sh),
+      )
+    } else if b > 0 {
+      v = or(i32(128), and(if sh == 0 { cp } else { shru(cp, sh) }, 63))
+    }
+    eff("array.set", sBackTy(), [o, at, v], 0)
+    b = b + 1
+  }
+  set(w, add(w, i32(width)))
+}
+
+// `if cp < 0x80 { 1 byte } else { if cp < 0x800 { 2 } else { ... } }`, from `width` on.
+function encArms(o: Opnd, w: OVar, cp: OVar, width: i32) {
+  if width == 4 {
+    encBytes(o, w, cp, 4)
+    return 0
+  }
+  const fits = test(
+    "lt",
+    cp,
+    i32(
+      if width == 1 { 128 } else if width == 2 { 2048 } else { 65536 },
+    ),
+  )
+  open()
+  encBytes(o, w, cp, width)
+  const one = close()
+  open()
+  encArms(o, w, cp, width + 1)
+  put({ siCond: fits, siThen: one, siElse: close(), siOut: -1, siElseKw: true })
+  return 0
+}
+
+// `__utf8_enc__(back, start, len) -> (ref str)`: the UTF-8 encoding of the `len` code points at
+// `back[start ..]`, in a fresh exact-fit string. A wasm array is fixed-length, so one pass sums
+// the widths and a second writes; both read through `encRead`, so they agree on each width.
+export function irUtf8EncFnCode(out: u8[]): i32 {
+  begin(str())
+  const bk = param(repRawOf(aTy(), false))
+  const start = param(I32())
+  const len = param(I32())
+  const n = local(I32(), 3)
+  const i = local(I32(), 4)
+  const cp = local(I32(), 5)
+  const o = local(repRawOf(sBackTy(), false), 6)
+  const w = local(I32(), 7)
+  set(n, i32(0))
+  set(i, i32(0))
+  open()
+  exitIf(test("ge", i, len), 0)
+  encRead(bk, start, i, cp)
+  set(n, add(n, i32(1)))
+  // One more byte past each of 0x80, 0x800 and 0x10000.
+  for bound in [128, 2048, 65536] {
+    const wider = test("ge", cp, i32(bound))
+    open()
+    set(n, add(n, i32(1)))
+    when(wider, close())
+  }
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  set(
+    o,
+    raw(repRawOf(sBackTy(), false), "array.new_default", sBackTy(), [n], 0),
+  )
+  set(w, i32(0))
+  set(i, i32(0))
+  open()
+  exitIf(test("ge", i, len), 0)
+  encRead(bk, start, i, cp)
+  encArms(o, w, cp, 1)
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  ret(strNew(o, n))
+  return finish("__utf8_enc__", out)
+}
+
+// `__utf8_cplen__(s) -> i32`: the code point count of a string, driven by `__utf8_dec__`'s width,
+// so malformed input counts as the decoder walks it.
+export function irUtf8CpLenFnCode(out: u8[]): i32 {
+  begin(I32())
+  const s = param(str())
+  const bk = local(back(), 1)
+  const i = local(I32(), 2)
+  const end = local(I32(), 3)
+  const n = local(I32(), 4)
+  set(bk, strBack(s))
+  set(i, strStart(s))
+  set(end, add(i, strLen(s)))
+  set(n, i32(0))
+  open()
+  exitIf(test("ge", i, end), 0)
+  set(n, add(n, i32(1)))
+  const nn = raw(
+    repRawOf(sBackTy(), false),
+    "ref.as_non_null",
+    sBackTy(),
+    [bk],
+    0,
+  )
+  set(
+    i,
+    add(i, shru(raw(I32(), "call", -1, [nn, i, end], helpUtf8DecFn()), 24)),
+  )
+  loopIn(0, close())
+  ret(n)
+  return finish("__utf8_cplen__", out)
+}
+
+// Nonzero `v` read as the bool an `if` takes.
+function truthy(v: Opnd): Opnd { return raw(BOOL(), "test", -1, [v], 0) }
+
+function trapIf(c: Opnd) {
+  open()
+  put({ tpWhy: 0 })
+  when(c, close())
+}
+
+// `text` streamed through `__print_char__` (import 2), unflushed.
+function printText(text: string) {
+  for cp in text { eff("call", -1, [i32(cp)], 2) }
+}
+
+// `__log__(offset, length)`: prints each tag/value pair of the linear-memory log, as the host's
+// `__log__` import would. A nonzero tag traps: only plain i32 values are decoded.
+export function irMemLogFnCode(out: u8[]): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const off = param(I32())
+  const len = param(I32())
+  const cur = local(I32(), 2)
+  set(cur, off)
+  open()
+  exitIf(test("ge", cur, add(off, len)), 0)
+  trapIf(truthy(raw(I32(), "load", -1, [cur], 0)))
+  eff("call", -1, [raw(I32(), "load", -1, [add(cur, i32(4))], 0)], 0)
+  set(cur, add(cur, i32(8)))
+  loopIn(0, close())
+  return finish("__log__", out)
+}
+
+// Prints `strs[k]` when parameter `p` is row `k` of relocation space `sp`, named from `subs[k]`.
+function printPick(p: Opnd, strs: string[], sp: i32, subs: i32[]) {
+  let k = 0
+  while k < strs.length {
+    const c = test(
+      "eq",
+      p,
+      def(I32(), { rlSp: sp, rlSub: subs[k], rlVal: k + relSkew(sp) }),
+    )
+    open()
+    printText(strs[k])
+    when(c, close())
+    k = k + 1
+  }
+}
+
+// `__init_fail__(g, verb, r)`: prints "`name` read|written before its initializer ran (place),
+// via reader" from the guard rows, then traps. Each row's text is here once, however many sites
+// name it.
+export function irInitFailFnCode(out: u8[]): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const g = param(I32())
+  const verb = param(I32())
+  const r = param(I32())
+  printPick(g, gInitGNames, RS_GNAME, gInitGIdx)
+  const written = truthy(verb)
+  open()
+  printText("written")
+  const w = close()
+  open()
+  printText("read")
+  put(
+    { siCond: written, siThen: w, siElse: close(), siOut: -1, siElseKw: true },
+  )
+  printText(" before its initializer ran")
+  printPick(g, gInitGLocs, RS_GNAME, gInitGIdx)
+  const readers: i32[] = []
+  while readers.length < gInitReaders.length { readers.push(readers.length) }
+  printPick(r, gInitReaders, RS_GREAD, readers)
+  eff("call", -1, [], 3)
+  put({ tpWhy: 0 })
+  return finish("__init_fail__", out)
+}
+
+function divu(a: Opnd, b: Opnd): Opnd { return instr(I32(), 0x6e, [a, b]) }
+
+// Prints `x`, a non-negative i32, in decimal: `p` climbs to x's leading power of ten, then each
+// digit is `x / p % 10` as `p` falls to zero.
+function printDecimal(x: Opnd, p: OVar) {
+  set(p, i32(1))
+  open()
+  const grow = instr(BOOL(), 0x4f, [divu(x, p), i32(10)])
+  open()
+  set(p, op(I32(), "mul", p, i32(10)))
+  hb[hb.length - 1].push(br(0))
+  when(grow, close())
+  loop(0, close())
+  open()
+  eff("call", -1, [add(instr(I32(), 0x70, [divu(x, p), i32(10)]), i32(48))], 2)
+  exitIf(truthy(tee(p, divu(p, i32(10)))), 1)
+  loop(1, close())
+}
+
+// `__as_fail__(line, colRow)`: prints "as! <domain> at <line>:<col>: not exact" and returns; each
+// site traps after it, so a reason costs a site one call.
+export function irAsFailFnCode(out: u8[]): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const line = param(I32())
+  const colRow = param(I32())
+  const p = local(I32(), 2)
+  printText("as! ")
+  let k = 0
+  while k < AS_FAIL_DOMS.length {
+    const c = test("eq", op(I32(), "and", colRow, i32(7)), i32(k))
+    open()
+    printText(AS_FAIL_DOMS[k])
+    when(c, close())
+    k = k + 1
+  }
+  const placed = truthy(line)
+  open()
+  printText(" at ")
+  printDecimal(line, p)
+  printText(":")
+  if colRow is OVar { set(colRow, shru(colRow, 3)) }
+  printDecimal(colRow, p)
+  when(placed, close())
+  printText(": not exact")
+  eff("call", -1, [], 3)
+  return finish("__as_fail__", out)
+}
+
+// —— the map index: probes, get, resize, resync ——
+
+function arr(heap: i32, nul: boolean): i32 { return repRawOf(heap, nul) }
+
+function eqz(x: Opnd): Opnd { return instr(BOOL(), 0x45, [x]) }
+
+function shl(x: Opnd, k: i32): Opnd { return op(I32(), "shl", x, i32(k)) }
+
+function alen(a: Opnd): Opnd { return raw(I32(), "array.len", aTy(), [a], 0) }
+
+function aget(heap: i32, a: Opnd, i: Opnd): Opnd {
+  return raw(I32(), "array.get", heap, [a, i], 0)
+}
+
+// Index `i`'s pair slot: `2i + 1` for the entry, `2i` for the tag.
+function pairEnt(i: Opnd): Opnd { return op(I32(), "or", shl(i, 1), i32(1)) }
+
+// The i32 tag `tag`'s first slot under `mask`: the top `log2(mask + 1)` bits of `tag * 2^32/phi`.
+function slotOf(tag: Opnd, mask: Opnd): Opnd {
+  return op(
+    I32(),
+    "shru",
+    op(I32(), "mul", tag, i32(0x9e3779b9)),
+    instr(I32(), 0x67, [mask]),
+  )
+}
+
+// A block labelled `label` around a loop labelled `label + 1` that runs `b` and does not loop
+// back on its own.
+function blockLoop(label: i32, b: i32[]) {
+  put(
+    {
+      bkLabel: label,
+      bkBody: [node({ lpLabel: label + 1, lpBody: b }, I32())],
+      bkOut: -1,
+    },
+  )
+}
+
+// A valued `if c { a } else { b }` whose arms the caller built into `a` and `b`, each ending by
+// writing `o`, a slotless local the value stays on the stack in.
+function ifValue(c: Opnd, o: OVar, a: i32[], b: i32[]): Opnd {
+  put({ siCond: c, siThen: a, siElse: b, siOut: o.ov, siElseKw: true })
+  return o
+}
+
+// The probe's back edge: the advanced slot, unless it wrapped to `start`, loops; a probe that
+// saw every slot traps, with a reason when the module reserves the print pair (D2290).
+function probeBackEdge(slot: OVar, mask: OVar, start: OVar, loopLabel: i32) {
+  exitIf(
+    test("ne", tee(slot, op(I32(), "and", add(slot, i32(1)), mask)), start),
+    loopLabel,
+  )
+  if gImports >= 4 {
+    printText("map probe found no free slot (internal invariant)")
+    eff("call", -1, [], 3)
+  }
+  put({ tpWhy: 0 })
+}
+
+// The string-keyed probe over the index `ix`, stored hashes `hs`, live flags `lv` and keys `kb`
+// for `key` of hash `h`: leaves `slot` at the key's slot or the free one ending its chain, and
+// `ent` at its entry (0 free, else position + 1). A dead entry is a marker, never a hit.
+function probeStr(
+  h: Opnd,
+  ix: Opnd,
+  hs: Opnd,
+  lv: Opnd,
+  kb: Opnd,
+  key: Opnd,
+  mask: OVar,
+  slot: OVar,
+  ent: OVar,
+  start: OVar,
+) {
+  set(mask, sub(alen(ix), i32(1)))
+  set(start, tee(slot, op(I32(), "and", h, mask)))
+  open()
+  exitIf(eqz(tee(ent, aget(aTy(), ix, slot))), 0)
+  let c = test("eq", aget(aTy(), hs, sub(ent, i32(1))), h)
+  if gMapDeletes {
+    c = test("and", c, test("ne", aget(aTy(), lv, sub(ent, i32(1))), i32(0)))
+  }
+  const o = local(I32(), -1)
+  open()
+  const k = raw(
+    arr(sTy(), true),
+    "array.get",
+    mkArrTy(),
+    [kb, sub(ent, i32(1))],
+    0,
+  )
+  const kn = raw(str(), "ref.as_non_null", sTy(), [k], 0)
+  set(o, raw(I32(), "call", -1, [kn, key], helpStrEqFn()))
+  const a = close()
+  open()
+  set(o, i32(0))
+  exitIf(truthy(ifValue(c, o, a, close())), 0)
+  probeBackEdge(slot, mask, start, 1)
+  blockLoop(0, close())
+}
+
+// The i32-keyed probe over the (tag, entry) pair index `ix`; leaves `slot` and `ent` as
+// `probeStr` does. A deleted pair (entry -1) is a marker, never a hit.
+function probeI32(
+  ix: Opnd,
+  key: Opnd,
+  mask: OVar,
+  slot: OVar,
+  ent: OVar,
+  start: OVar,
+) {
+  set(mask, sub(op(I32(), "shru", alen(ix), i32(1)), i32(1)))
+  set(start, tee(slot, slotOf(key, mask)))
+  open()
+  exitIf(eqz(tee(ent, aget(aTy(), ix, pairEnt(slot)))), 0)
+  let c = test("eq", aget(aTy(), ix, shl(slot, 1)), key)
+  if gMapDeletes { c = test("and", c, test("gt", ent, i32(0))) }
+  exitIf(c, 0)
+  probeBackEdge(slot, mask, start, 1)
+  blockLoop(0, close())
+}
+
+// `__map_probe__(hash, index, hashes, live, keys, key)`: the string-keyed probe, answering the
+// slot, or with `entry` the slot's entry (`__map_entry__`).
+export function irMapProbeFnCode(out: u8[], entry: boolean): i32 {
+  begin(I32())
+  const h = param(I32())
+  const ix = param(arr(aTy(), false))
+  const hs = param(arr(aTy(), false))
+  const lv = param(arr(aTy(), false))
+  const kb = param(arr(mkArrTy(), false))
+  const key = param(str())
+  const mask = local(I32(), 6)
+  const slot = local(I32(), 7)
+  const ent = local(I32(), 8)
+  probeStr(h, ix, hs, lv, kb, key, mask, slot, ent, local(I32(), 9))
+  ret(if entry { ent } else { slot })
+  return finish("__map_probe__", out)
+}
+
+// `__map_probe_i32__(index, key)`: the i32-keyed probe, answering the slot, or with `entry` the
+// pair's entry (`__map_entry_i32__`).
+export function irMapProbeI32FnCode(out: u8[], entry: boolean): i32 {
+  begin(I32())
+  const ix = param(arr(aTy(), false))
+  const key = param(I32())
+  const mask = local(I32(), 2)
+  const slot = local(I32(), 3)
+  const ent = local(I32(), 4)
+  probeI32(ix, key, mask, slot, ent, local(I32(), 5))
+  ret(if entry { ent } else { slot })
+  return finish("__map_probe_i32__", out)
+}
+
+// `__map_probe_i64__(index, key, keys)`: the i64-keyed probe over the pair layout. The pair's tag
+// is the top 32 bits of `key * 2^64/phi`, so a tag match is confirmed against the keys.
+export function irMapProbeI64FnCode(out: u8[]): i32 {
+  begin(I32())
+  const ix = param(arr(aTy(), false))
+  const key = param(I64())
+  const kb = param(arr(ia64TypeIdx, false))
+  const mask = local(I32(), 3)
+  const slot = local(I32(), 4)
+  const ent = local(I32(), 5)
+  const start = local(I32(), 6)
+  const tag = local(I32(), 7)
+  set(mask, sub(op(I32(), "shru", alen(ix), i32(1)), i32(1)))
+  set(tag, tagOfI64(key))
+  set(start, tee(slot, slotOf(tag, mask)))
+  open()
+  exitIf(eqz(tee(ent, aget(aTy(), ix, pairEnt(slot)))), 0)
+  let c = test("eq", aget(aTy(), ix, shl(slot, 1)), tag)
+  if gMapDeletes { c = test("and", c, test("gt", ent, i32(0))) }
+  const o = local(BOOL(), -1)
+  open()
+  set(
+    o,
+    test(
+      "eq",
+      raw(I64(), "array.get", ia64TypeIdx, [kb, sub(ent, i32(1))], 0),
+      key,
+    ),
+  )
+  const a = close()
+  open()
+  set(o, { oiRep: BOOL(), oiBits: 0 })
+  exitIf(ifValue(c, o, a, close()), 0)
+  probeBackEdge(slot, mask, start, 1)
+  blockLoop(0, close())
+  ret(slot)
+  return finish("__map_probe_i64__", out)
+}
+
+// An i64 key variable's pair tag, through `fbMapTagOfI64`, which the inline map append also uses.
+function tagOfI64(key: OVar): Opnd { return raw(I32(), "tag64", -1, [key], 0) }
+
+// `__map_get_<row>__(m, key)`: the probe into locals, then the i32 value of the key's entry, or
+// the row's miss value when it has none.
+export function irMapGetFnCode(out: u8[], row: i32): i32 {
+  const mTy = mapTypeIdxOf(gMapGetShape[row])
+  begin(I32())
+  const m = param(arr(mTy, true))
+  let ent: OVar = { ov: -1 }
+  if gMapGetStrKey[row] {
+    const key = param(str())
+    const h = local(I32(), 2)
+    const ix = local(arr(aTy(), true), 3)
+    const hs = local(arr(aTy(), true), 4)
+    const lv = local(arr(aTy(), true), 5)
+    const kb = local(arr(mkArrTy(), true), 6)
+    const mask = local(I32(), 7)
+    const slot = local(I32(), 8)
+    ent = local(I32(), 9)
+    const start = local(I32(), 10)
+    set(h, raw(I32(), "call", -1, [key], helpStrHashFn()))
+    set(ix, field(m, mTy, 3, arr(aTy(), true)))
+    set(hs, field(m, mTy, 6, arr(aTy(), true)))
+    set(lv, field(m, mTy, 2, arr(aTy(), true)))
+    set(
+      kb,
+      field(
+        field(m, mTy, 0, arr(mkListTy(), true)),
+        mkListTy(),
+        0,
+        arr(mkArrTy(), true),
+      ),
+    )
+    probeStr(h, ix, hs, lv, kb, key, mask, slot, ent, start)
+  } else {
+    const key = param(I32())
+    const ix = local(arr(aTy(), true), 2)
+    const mask = local(I32(), 3)
+    const slot = local(I32(), 4)
+    ent = local(I32(), 5)
+    const start = local(I32(), 6)
+    set(ix, field(m, mTy, 3, arr(aTy(), true)))
+    probeI32(ix, key, mask, slot, ent, start)
+  }
+  const o = local(I32(), -1)
+  const has = truthy(ent)
+  open()
+  const vals = field(
+    field(m, mTy, 1, arr(lTy(), true)),
+    lTy(),
+    0,
+    arr(aTy(), true),
+  )
+  set(o, aget(aTy(), vals, sub(ent, i32(1))))
+  const a = close()
+  open()
+  set(o, i32(gMapGetMiss[row]))
+  ret(ifValue(has, o, a, close()))
+  return finish("__map_get__", out)
+}
+
+// Stores `entry` at the first free slot of index `idx` from `slot`, advancing `slot`; with a
+// `tag` the index is the pair layout and the tag goes beside the entry.
+function placeEntry(
+  idx: Opnd,
+  mask: Opnd,
+  tag: Opnd | null,
+  entry: Opnd,
+  slot: OVar,
+) {
+  open()
+  exitIf(
+    eqz(aget(aTy(), idx, if tag == null { slot } else { pairEnt(slot) })),
+    2,
+  )
+  set(slot, op(I32(), "and", add(slot, i32(1)), mask))
+  loopIn(2, close())
+  if tag != null { eff("array.set", aTy(), [idx, shl(slot, 1), tag], 0) }
+  eff(
+    "array.set",
+    aTy(),
+    [idx, if tag == null { slot } else { pairEnt(slot) }, entry],
+    0,
+  )
+}
+
+// `__map_resize__(index, hashes, live, count, size)`: when a string-keyed map's occupancy reaches
+// half (`count * 2 >= len(index)`), a doubled index with every live entry placed again from its
+// stored hash; else `index` itself. The gate is `count`: a dead entry stays a probe marker.
+export function irMapResizeFnCode(out: u8[]): i32 {
+  begin(arr(aTy(), false))
+  const ix = param(arr(aTy(), false))
+  const hs = param(arr(aTy(), false))
+  const lv = param(arr(aTy(), false))
+  const count = param(I32())
+  param(I32())
+  const mask = local(I32(), 5)
+  const i = local(I32(), 6)
+  const rslot = local(I32(), 7)
+  const entry = local(I32(), 8)
+  const nx = local(arr(aTy(), false), 9)
+  const grow = instr(BOOL(), 0x4f, [shl(count, 1), alen(ix)])
+  open()
+  set(
+    nx,
+    raw(arr(aTy(), false), "array.new_default", aTy(), [shl(alen(ix), 1)], 0),
+  )
+  set(mask, sub(shl(alen(ix), 1), i32(1)))
+  open()
+  exitIf(test("ge", i, count), 0)
+  set(entry, add(i, i32(1)))
+  const live = truthy(if gMapDeletes { aget(aTy(), lv, i) } else { i32(1) })
+  open()
+  set(rslot, op(I32(), "and", aget(aTy(), hs, i), mask))
+  placeEntry(nx, mask, null, entry, rslot)
+  when(live, close())
+  set(i, entry)
+  loopIn(0, close())
+  ret(nx)
+  when(grow, close())
+  ret(ix)
+  return finish("__map_resize__", out)
+}
+
+// `__map_resize_i32__(index, count)`: the pair-index twin: when `count * 4 >= len(index)`, twice
+// the slots with every pair that is not a deleted marker placed again; else `index` itself.
+export function irMapResizeI32FnCode(out: u8[]): i32 {
+  begin(arr(aTy(), false))
+  const ix = param(arr(aTy(), false))
+  const count = param(I32())
+  const old = local(I32(), 2)
+  const mask = local(I32(), 3)
+  const i = local(I32(), 4)
+  const tag = local(I32(), 5)
+  const entry = local(I32(), 6)
+  const rslot = local(I32(), 7)
+  const nx = local(arr(aTy(), false), 8)
+  const grow = instr(BOOL(), 0x4f, [shl(count, 2), tee(old, alen(ix))])
+  open()
+  set(nx, raw(arr(aTy(), false), "array.new_default", aTy(), [shl(old, 1)], 0))
+  set(mask, sub(old, i32(1)))
+  open()
+  exitIf(instr(BOOL(), 0x4f, [i, old]), 0)
+  const used = test(
+    "gt",
+    tee(entry, aget(aTy(), ix, op(I32(), "or", i, i32(1)))),
+    i32(0),
+  )
+  open()
+  set(tag, aget(aTy(), ix, i))
+  set(rslot, slotOf(tag, mask))
+  placeEntry(nx, mask, tag, entry, rslot)
+  when(used, close())
+  set(i, add(i, i32(2)))
+  loopIn(0, close())
+  ret(nx)
+  when(grow, close())
+  ret(ix)
+  return finish("__map_resize_i32__", out)
+}
+
+// `__map_resync__(seqs, count, seq)`: one before the first entry whose sequence is later than
+// `seq`, or `count - 1`, for a map walk whose entry a compaction moved.
+export function irMapResyncFnCode(out: u8[]): i32 {
+  begin(I32())
+  const seqs = param(arr(ia64TypeIdx, false))
+  const count = param(I32())
+  const seq = param(I64())
+  const i = local(I32(), 3)
+  open()
+  exitIf(test("ge", i, count), 0)
+  exitIf(test("gt", raw(I64(), "array.get", ia64TypeIdx, [seqs, i], 0), seq), 0)
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  ret(sub(i, i32(1)))
+  return finish("__map_resync__", out)
+}
+
+// —— map compaction and list growth ——
+
+// The heap types `__map_compact__` reads for one map shape: the map, its key kind, the keys' and
+// values' list wrappers and backings, and the value element's heap type when a vacated value
+// slot is cleared to null (-1 for a numeric value). A Set's `vals` is never written.
+export type MapCompactTys = {
+  mapTy: i32,
+  keyStr: boolean,
+  keyI64: boolean,
+  keysWrap: i32,
+  keysBack: i32,
+  valsWrap: i32,
+  valsBack: i32,
+  valNull: i32,
+  isSet: boolean,
+}
+
+// Map field `f`, read through list wrapper `wrap` when `wrap >= 0`: an entry-parallel array.
+function entryArr(m: Opnd, mapTy: i32, f: i32, wrap: i32, back: i32): Opnd {
+  if wrap < 0 { return field(m, mapTy, f, arr(back, true)) }
+  return field(field(m, mapTy, f, arr(wrap, true)), wrap, 0, arr(back, true))
+}
+
+// `arr[j] = arr[i]` for one entry-parallel array. The moved element's rep is not tracked: it
+// passes from `array.get` to `array.set` of the same heap type.
+function compactMove(
+  m: Opnd,
+  mapTy: i32,
+  f: i32,
+  wrap: i32,
+  back: i32,
+  i: Opnd,
+  j: Opnd,
+) {
+  const dst = entryArr(m, mapTy, f, wrap, back)
+  const v = raw(
+    I32(),
+    "array.get",
+    back,
+    [entryArr(m, mapTy, f, wrap, back), i],
+    0,
+  )
+  eff("array.set", back, [dst, j, v], 0)
+}
+
+// `__map_compact__(m)`: slides the live entries down in place, in order and with their
+// sequences; clears the vacated tail (refs to null, `seqs` to -1, which no entry holds); then
+// rebuilds the index at the next power of two above `4 * size + 2 * INITIAL_CAP`.
+export function irMapCompactFnCode(out: u8[], t: MapCompactTys): i32 {
+  const mapTy = t.mapTy
+  begin(repNodeOfTy(TY_NEVER))
+  const m = param(arr(mapTy, false))
+  const i = local(I32(), 1)
+  const j = local(I32(), 2)
+  const count = local(I32(), 3)
+  const cap = local(I32(), 4)
+  const rslot = local(I32(), 5)
+  const mask = local(I32(), 6)
+  const tag = local(I32(), 7)
+  const entry = local(I32(), 8)
+  const idx = local(arr(aTy(), true), 9)
+  const k64 = if t.keyI64 { local(I64(), 10) } else { idx }
+  set(count, field(m, mapTy, 4, I32()))
+  open()
+  exitIf(test("ge", i, count), 0)
+  const live = truthy(aget(aTy(), field(m, mapTy, 2, arr(aTy(), true)), i))
+  open()
+  compactMove(m, mapTy, 0, t.keysWrap, t.keysBack, i, j)
+  if !t.isSet { compactMove(m, mapTy, 1, t.valsWrap, t.valsBack, i, j) }
+  compactMove(m, mapTy, 2, -1, aTy(), i, j)
+  if t.keyStr { compactMove(m, mapTy, 6, -1, aTy(), i, j) }
+  compactMove(m, mapTy, 7, -1, ia64TypeIdx, i, j)
+  set(j, add(j, i32(1)))
+  when(live, close())
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  set(i, j)
+  open()
+  exitIf(test("ge", i, count), 0)
+  eff("array.set", aTy(), [field(m, mapTy, 2, arr(aTy(), true)), i, i32(0)], 0)
+  const seqs = field(m, mapTy, 7, arr(ia64TypeIdx, true))
+  eff("array.set", ia64TypeIdx, [seqs, i, { oiRep: I64(), oiBits: -1 }], 0)
+  if t.keyStr {
+    const kb = entryArr(m, mapTy, 0, t.keysWrap, t.keysBack)
+    eff(
+      "array.set",
+      t.keysBack,
+      [kb, i, raw(arr(sTy(), true), "ref.null", sTy(), [], 0)],
+      0,
+    )
+  }
+  if t.valNull >= 0 {
+    const vb = entryArr(m, mapTy, 1, t.valsWrap, t.valsBack)
+    const nul = raw(arr(t.valNull, true), "ref.null", t.valNull, [], 0)
+    eff("array.set", t.valsBack, [vb, i, nul], 0)
+  }
+  set(i, add(i, i32(1)))
+  loopIn(0, close())
+  eff(
+    "struct.set",
+    t.keysWrap,
+    [field(m, mapTy, 0, arr(t.keysWrap, true)), j],
+    1,
+  )
+  if !t.isSet {
+    eff(
+      "struct.set",
+      t.valsWrap,
+      [field(m, mapTy, 1, arr(t.valsWrap, true)), j],
+      1,
+    )
+  }
+  eff("struct.set", mapTy, [m, j], 4)
+  // The new cap: 16, doubled while it is at most `4 * size + 18`.
+  set(cap, i32(16))
+  open()
+  const room = add(op(I32(), "mul", field(m, mapTy, 5, I32()), i32(4)), i32(18))
+  exitIf(instr(BOOL(), 0x4b, [cap, room]), 0)
+  set(cap, op(I32(), "mul", cap, i32(2)))
+  loopIn(0, close())
+  // The index is cleared in place when it already has `cap` slots, else made fresh; each entry is
+  // then placed again from the entries, never from the old index.
+  const ps = if t.keyStr { 0 } else { 1 }
+  const same = test(
+    "eq",
+    alen(tee(idx, field(m, mapTy, 3, arr(aTy(), true)))),
+    shl(cap, ps),
+  )
+  open()
+  eff("array.fill", aTy(), [idx, i32(0), i32(0), alen(idx)], 0)
+  const clear = close()
+  open()
+  set(idx, raw(arr(aTy(), true), "array.new_default", aTy(), [shl(cap, ps)], 0))
+  put(
+    { siCond: same, siThen: clear, siElse: close(), siOut: -1, siElseKw: true },
+  )
+  set(mask, sub(cap, i32(1)))
+  set(i, i32(0))
+  open()
+  exitIf(test("ge", i, j), 0)
+  set(entry, add(i, i32(1)))
+  if t.keyStr {
+    set(
+      rslot,
+      op(I32(), "and", aget(aTy(), field(m, mapTy, 6, arr(aTy(), true)), i), mask),
+    )
+    placeEntry(idx, mask, null, entry, rslot)
+  } else {
+    const kb = entryArr(m, mapTy, 0, t.keysWrap, t.keysBack)
+    if t.keyI64 {
+      set(k64, raw(I64(), "array.get", t.keysBack, [kb, i], 0))
+      set(tag, tagOfI64(k64))
+    } else {
+      set(tag, aget(t.keysBack, kb, i))
+    }
+    set(rslot, slotOf(tag, mask))
+    placeEntry(idx, mask, tag, entry, rslot)
+  }
+  set(i, entry)
+  loopIn(0, close())
+  eff(
+    "struct.set",
+    mapTy,
+    [m, raw(arr(aTy(), false), "ref.as_non_null", aTy(), [idx], 0)],
+    3,
+  )
+  return finish("__map_compact__", out)
+}
+
+// `__grow_<row>__(L)`: the backing a `push` at full capacity replaces: 4 slots when the list has
+// none, else twice its capacity, with the live prefix copied over.
+export function irListGrowFnCode(out: u8[], lTy: i32, bTy: i32): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const l = param(arr(lTy, true))
+  const cap = local(I32(), 1)
+  const bk = local(arr(bTy, false), 2)
+  const o = local(I32(), -1)
+  const none = eqz(field(l, lTy, 2, I32()))
+  open()
+  set(o, i32(4))
+  const a = close()
+  open()
+  set(o, op(I32(), "mul", field(l, lTy, 2, I32()), i32(2)))
+  set(cap, ifValue(none, o, a, close()))
+  set(bk, raw(arr(bTy, false), "array.new_default", bTy, [cap], 0))
+  const from = field(l, lTy, 0, arr(bTy, true))
+  eff(
+    "array.copy",
+    bTy,
+    [bk, i32(0), from, i32(0), field(l, lTy, 1, I32())],
+    bTy,
+  )
+  eff("struct.set", lTy, [l, bk], 0)
+  eff("struct.set", lTy, [l, cap], 2)
+  return finish("__grow__", out)
+}

@@ -741,11 +741,9 @@ armed shadow still checks the unclaimed functions. The blocking unarmed `ir clai
 fallback counted as a hard failure, so a lowering regression cannot hide behind legacy's bytes.
 A coverage step now widens what ships; it quotes the claimed counts beside its coverage.
 Op-seam slices still delete legacy ladders, starting with C1, the shared scalar opcode table.
-The builder leaves a construct nested deeper than `IR_NEST_MAX` (200) to legacy, because the
-IR's builder, verifier and lowering recurse where legacy loops along a chain's spine (D1990).
-**This is a prerequisite for I8:** before legacy's statement lowering deletes, the IR's passes must loop along
-`siElse` and the `match` and if-expression spine, `IR_NEST_MAX` must be deleted, and `ir_build.vl`'s
-`walk-limit` baseline must go back to 0.
+The IR's builder, verifier and lowering loop along an `if`'s `siElse` spine and the value-`if`
+spine, as legacy's passes do (D1990), so a chain's length costs no stack and the builder has no
+nesting cap. This was a prerequisite for I8, before legacy's statement lowering deletes.
 
 **A coverage step is graded on coverage, not lines.** Some steps widen what the builder covers
 where legacy has no IR duplicate to delete, so they cannot be net-negative in lines. An example is
