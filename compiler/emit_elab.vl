@@ -13799,7 +13799,7 @@ function elabHeldClosedGo(
     TyArray => {
       const ev: i32[] = []
       for v in vals {
-        const x = parenPeelIx(v)
+        const x = elabHeldValPeel(v)
         const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
         if !(xn is ArrayLit) { return -1 }
         for e in xn.arrElems { ev.push(e) }
@@ -13820,7 +13820,7 @@ function elabHeldClosedGo(
       while i < o.objFieldNames.length {
         const fv: i32[] = []
         for v in vals {
-          const x = parenPeelIx(v)
+          const x = elabHeldValPeel(v)
           const xn = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
           if !(xn is ObjLit) { return -1 }
           for fx in xn.objFields {
@@ -17525,7 +17525,7 @@ export function litRepTyOneClosed(ix: i32): i32 {
 export function elabLitBindingFact(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is ObjLit) { return -1 }
   const own = nodeTyIxOf(ix)
-  if own < 0 || own >= T.tys.length || !tyHasTyVar(own) { return -1 }
+  if own < 0 || own >= T.tys.length { return -1 }
   cwIxWant()
   // A literal nested as a field of the initialiser is that field's slot of the binding.
   const steps: string[] = []
@@ -17537,7 +17537,13 @@ export function elabLitBindingFact(ix: i32): i32 {
     u = cwIxUp[u]
     if u < 0 || u >= P.nodes.length || !(nodeAt(u) is ObjLit) { return -1 }
   }
-  if !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_LETINIT { return -1 }
+  // A literal a function returns, called once to initialise a binding, is that binding's value.
+  if cwIxCovers(u) && (cwIxUpKind[u] == CW_UP_RET || cwIxUpKind[u] == CW_UP_TAIL) {
+    u = elabLitRetCallOf(u)
+  } else if !tyHasTyVar(own) {
+    return -1
+  }
+  if u < 0 || !cwIxCovers(u) || cwIxUpKind[u] != CW_UP_LETINIT { return -1 }
   const d = cwIxUp[u]
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
@@ -17559,6 +17565,89 @@ export function elabLitBindingFact(ix: i32): i32 {
     return -1
   }
   return t
+}
+
+// The record the slot fact of a `const` binding a once-called function returned gives record
+// literal `ix` stored into a container in one of its fields; -1 for none.
+function elabStoredLitSlotTy(ix: i32): i32 {
+  if !(nodeAt(ix) is ObjLit) || !cwIxCovers(ix) || cwIxUpKind[ix] != CW_UP_ASG_RHS { return -1 }
+  const bn = nodeAt(cwIxUp[ix])
+  if !(bn is BinExpr) { return -1 }
+  const steps: string[] = []
+  let x = parenPeelIx(bn.binLeft)
+  let fields = 0
+  while x >= 0 && x < P.nodes.length && !(nodeAt(x) is Ident) {
+    const n = nodeAt(x)
+    if n is Index {
+      const at = nodeTyIxOf(n.idxArr)
+      steps.push(if at >= 0 && tyAt(at) is TyMap { "v" } else { "e" })
+      x = parenPeelIx(n.idxArr)
+    } else if n is Member {
+      steps.push("f." + n.memProp)
+      fields = fields + 1
+      x = parenPeelIx(n.memObj)
+    } else {
+      return -1
+    }
+  }
+  if fields == 0 || steps.length < 2 || x < 0 || x >= P.nodes.length { return -1 }
+  const d = identDeclOf(x)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  if elabHeldValPeel(dn.letInit) == parenPeelIx(dn.letInit) { return -1 }
+  const path: string[] = []
+  let j = steps.length - 1
+  while j >= 0 {
+    path.push(steps[j])
+    j = j - 1
+  }
+  const t = elabSlotTyAt(d, path, -1)
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyObj) || tyHasTyVar(t) || fnTagHoldsTy(t) {
+    return -1
+  }
+  return t
+}
+
+// The type field value `ix` of a record literal takes in that literal's binding fact; -1 for none.
+function elabLitFieldFactTy(ix: i32): i32 {
+  if !cwIxCovers(ix) || cwIxUpKind[ix] != CW_UP_FIELD { return -1 }
+  const fi = nodeAt(cwIxUpAux[ix])
+  const ft = elabLitBindingFact(cwIxUp[ix])
+  const o = if ft >= 0 { tyAt(ft) } else { null }
+  if !(fi is FieldInit) || !(o is TyObj) { return -1 }
+  const at = strListIndexOf(o.objFieldNames, fi.fiName)
+  return if at >= 0 { o.objFieldTypes[at] } else { -1 }
+}
+
+// Value `v`, or the one value the function a call `v` makes returns, where `v` is its one call.
+function elabHeldValPeel(v: i32): i32 {
+  const x = parenPeelIx(v)
+  const c = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(c is Call) { return x }
+  const fd = identFnDeclOf(parenPeelIx(c.callFn))
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 { return x }
+  const rets: i32[] = []
+  collectRetValues(f.fnBody, rets)
+  if rets.length != 1 { return x }
+  const r = parenPeelIx(rets[0])
+  return if elabLitRetCallOf(r) == x { r } else { x }
+}
+
+// The one call of the un-annotated function returning only value `v`, where one call is; -1 otherwise.
+function elabLitRetCallOf(v: i32): i32 {
+  let fd = cwIxParent[v]
+  while fd >= 0 && fd < P.nodes.length && cwIxCovers(fd) && !(nodeAt(fd) is FuncDecl) {
+    fd = cwIxParent[fd]
+  }
+  const f = if fd >= 0 && fd < P.nodes.length { nodeAt(fd) } else { null }
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnName == "" { return -1 }
+  const rets: i32[] = []
+  collectRetValues(f.fnBody, rets)
+  if rets.length != 1 || parenPeelIx(rets[0]) != v { return -1 }
+  const calls: i32[] = []
+  cwFnCalls(fd, calls)
+  return if calls.length == 1 { calls[0] } else { -1 }
 }
 
 // Whether record type `t` holds a map in a field, through nested records; each record type is
@@ -17649,6 +17738,11 @@ export function litRepTyAt(ix: i32, fnIx: i32): i32 {
     const ie = elabNodeTyAt(ix, fnIx)
     if ie >= 0 && !tyHasTyVar(ie) && !tyHasInferHole(ie) { return ie }
   }
+  // One a record literal's field holds is built at that field of the literal's binding fact.
+  const ff = if litIsEmptyCtor(ix) { elabLitFieldFactTy(ix) } else { -1 }
+  if ff >= 0 { return ff }
+  const sf = elabStoredLitSlotTy(ix)
+  if sf >= 0 { return sf }
   // The record solve's closed stamp is where the literal is built; the parameter its call
   // closes is only where it is delivered (D15288).
   if nodeRepStamped(ix) && !tyHasTyVar(nodeRepTyIx[ix]) {
