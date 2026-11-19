@@ -2,7 +2,7 @@
 // string, a list or record copy, a closure wrap or a map retag. Legacy's writers and the IR's
 // lowering read the same answer.
 // The seats (`boxSeat`, `armSeat`, `atomSeat`) are legacy's delivery marks: legacy sets them
-// around one delivery, and they are -1 wherever the IR asks.
+// around one delivery, and they are -1 wherever the IR lowers a whole function.
 // It writes no bytes and imports nothing from `wasmEmit.vl` or `ir_*.vl`.
 
 import {
@@ -16,7 +16,15 @@ import { primTyIxOfName } from "./check_decl_scan"
 import { nodeTyIxOf } from "./check_node_tys"
 import { deliveryRetagHas } from "./check_retag_rows"
 import { mapDeliveryRecorded } from "./check_side_rows"
-import { TyFunc, TyNullable, mkNullableTyOf, tyAt } from "./check_types"
+import {
+  T,
+  TyFunc,
+  TyNullable,
+  TyUnion,
+  mkNullableTyOf,
+  tyAt,
+  tyIsRecord,
+} from "./check_types"
 import { structIndexOfTy } from "./emit_atom_kinds"
 import { unwrapParen } from "./emit_base"
 import { boxDstTyAt, nodeTyAt } from "./emit_capture_frames"
@@ -27,8 +35,9 @@ import {
   unionBoxStoreTyOf,
 } from "./emit_classify"
 import { elabInstTyAt } from "./emit_elab"
+import { narrowedStructArmVi } from "./emit_local_scope"
 import { repOfTy, repVariantShapeRowOf, valueBoxOfTy } from "./emit_rep"
-import { structRowOfAnnTy } from "./emit_shape_rows"
+import { narrowedNulStructArm, structRowOfAnnTy } from "./emit_shape_rows"
 import {
   sHeapIdx,
   uVarRow,
@@ -46,7 +55,7 @@ import {
 } from "./emit_union_atoms"
 import { unRowOfTyKey } from "./emit_union_tykey"
 import { nodeSrc } from "./symbols"
-import { tyHasTyVar } from "./tyquery"
+import { flattenVariantsInto, nullableInnerOrNone, tyHasTyVar } from "./tyquery"
 
 // The row a delivery of `exprIx` copies its record into (`recCopyTyOf`): a struct row, `-2 - vi`
 // for the variant row `vi` of an arm type, or -1 when the record is already built there or no
@@ -258,3 +267,47 @@ export function instTyOrSelf(t: i32, fnIx: i32): i32 {
 
 // The node whose next emission the table decodes to a string at its recorded set, or -1.
 export let atomSeat = -1
+
+// The cast target is the destination's heap and not `variantHeap(vi)`: the slot is what the store
+// must satisfy, and where the arm is merged with a declared twin the indices are the same
+// anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
+export function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
+  if (
+    narrowedStructArmVi(exprIx, fnIx) < 0
+    && !narrowedNulStructArm(exprIx, fnIx)
+    && !exprTyIsRecord(exprIx, false, fnIx)
+    && !exprTyIsRecord(exprIx, true, fnIx)
+    && exprRecordArmsTy(exprIx, fnIx) < 0
+  ) {
+    return false
+  }
+  return exprUnion(exprIx, fnIx)
+}
+
+// The checker's union type of `exprIx` where every member is a record, which the checker let a
+// record slot take because each member fits it (D16321); -1 otherwise.
+export function exprRecordArmsTy(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const ty = nodeTyAt(unwrapParen(exprIx), fnIx)
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyUnion) { return -1 }
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  for m in ms {
+    if !tyIsRecord(m) { return -1 }
+  }
+  return ty
+}
+
+// Whether the checker typed `exprIx` as one record, or as `record | null` when `nullable`.
+// A box of that type is a union of same-shape records collapsed to the record (D4989), so
+// its payload is the record itself.
+export function exprTyIsRecord(
+  exprIx: i32,
+  nullable: boolean,
+  fnIx: i32,
+): boolean {
+  if exprIx < 0 { return false }
+  const ty = nodeTyAt(unwrapParen(exprIx), fnIx)
+  if nullable { return ty >= 0 && tyIsRecord(nullableInnerOrNone(ty)) }
+  return tyIsRecord(ty)
+}
