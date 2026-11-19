@@ -45,7 +45,7 @@ import {
   sBackTy,
   sTy,
 } from "./emit_state"
-import { RS_GNAME, RS_GREAD, relSkew } from "./emit_reloc"
+import { RS_GNAME, RS_GREAD, RS_TAG, relSkew } from "./emit_reloc"
 
 let hf: IrFn = irFnNew(-1, "")
 // The bodies being built, innermost last.
@@ -1391,4 +1391,274 @@ export function irListGrowFnCode(out: u8[], lTy: i32, bTy: i32): i32 {
   eff("struct.set", lTy, [l, bk], 0)
   eff("struct.set", lTy, [l, cap], 2)
   return finish("__grow__", out)
+}
+
+// —— scalar and record list views ——
+
+// A view list: its wrapper and backing; the box struct a record element is boxed into (-1 for a
+// scalar list, whose elements are `f64` when `vlF64`, else `i64`); the null box tag; and whether
+// its rows resolved (when not, each helper is unreachable).
+export type ViewList = {
+  vlWrap: i32,
+  vlBack: i32,
+  vlBox: i32,
+  vlF64: boolean,
+  vlNullTag: i32,
+  vlBuilt: boolean,
+}
+
+// One view row: the view type, its source list's wrapper and backing, then the convert from a
+// scalar source element (`i64.extend_i32_s`, `f64.convert_i32_s`, `f64.promote_f32`), or for a
+// record row the tag its records box under and whether they may be null.
+export type ViewRow = {
+  vrVt: i32,
+  vrSrcWrap: i32,
+  vrSrcBack: i32,
+  vrConv: i32,
+  vrTag: i32,
+  vrNul: boolean,
+}
+
+// `idx` when it is below the length of list `recv` (wrapper `wrap`), else -1, so an out-of-range
+// read traps as an inline guarded read does.
+function guardedIdx(idx: Opnd, recv: Opnd, wrap: i32): Opnd {
+  const inRange = instr(BOOL(), 0x49, [idx, field(recv, wrap, 1, I32())])
+  return raw(I32(), "select", -1, [idx, i32(-1), inRange], 0)
+}
+
+function isView(x: Opnd, vt: i32): Opnd {
+  return raw(BOOL(), "ref.test", vt, [x], 0)
+}
+
+function viewOf(x: Opnd, vt: i32): Opnd {
+  return raw(arr(vt, true), "ref.cast", vt, [x], 0)
+}
+
+// The rep of a list `l` element as its helpers yield it.
+function viewElem(l: ViewList): i32 {
+  if l.vlBox >= 0 { return arr(l.vlBox, false) }
+  return if l.vlF64 { F64() } else { I64() }
+}
+
+// `__sv_mk_p__(src)`: a view of `src` over destination wrapper `dstWrap`, synced by `sync`.
+export function irSvMkFnCode(
+  out: u8[],
+  l: ViewList,
+  r: ViewRow,
+  sync: i32,
+): i32 {
+  begin(arr(l.vlWrap, false))
+  const src = param(arr(r.vrSrcWrap, true))
+  const bk = raw(
+    arr(l.vlBack, false),
+    "array.new_default",
+    l.vlBack,
+    [i32(0)],
+    0,
+  )
+  const s = raw(
+    arr(r.vrSrcWrap, false),
+    "ref.as_non_null",
+    r.vrSrcWrap,
+    [src],
+    0,
+  )
+  const v = raw(
+    arr(r.vrVt, false),
+    "struct.new",
+    r.vrVt,
+    [bk, i32(0), i32(0), s],
+    0,
+  )
+  ret(raw(arr(l.vlWrap, false), "call", -1, [v], sync))
+  return finish("__sv_mk__", out)
+}
+
+function tagOf(t: i32): Opnd {
+  return def(I32(), { rlSp: RS_TAG, rlSub: t, rlVal: t })
+}
+
+// Element `ix` of row `r`'s source list `s`, with `guard` bounded against that list's length:
+// converted for a scalar row; for a record row boxed under the row's tag, and a `null` element of
+// a nullable row under the null tag.
+function sourceElem(
+  l: ViewList,
+  r: ViewRow,
+  s: Opnd,
+  ix: OVar,
+  guard: boolean,
+): Opnd {
+  if r.vrConv >= 0 {
+    const src = field(s, r.vrSrcWrap, 0, arr(r.vrSrcBack, true))
+    const at: Opnd = if guard { guardedIdx(ix, s, r.vrSrcWrap) } else { ix }
+    return instr(viewElem(l), r.vrConv, [aget(r.vrSrcBack, src, at)])
+  }
+  const box = viewElem(l)
+  if !r.vrNul { return boxedRec(l, r, s, ix, guard) }
+  const isNul = raw(BOOL(), "ref.is_null", -1, [sourceRec(r, s, ix, guard)], 0)
+  const o = local(box, -1)
+  open()
+  const nt = tagOf(l.vlNullTag)
+  set(
+    o,
+    raw(
+      box,
+      "struct.new",
+      l.vlBox,
+      [nt, raw(arr(-15, true), "ref.null", -15, [], 0)],
+      0,
+    ),
+  )
+  const a = close()
+  open()
+  set(o, boxedRec(l, r, s, ix, guard))
+  return ifValue(isNul, o, a, close())
+}
+
+function sourceRec(r: ViewRow, s: Opnd, ix: OVar, guard: boolean): Opnd {
+  const src = field(s, r.vrSrcWrap, 0, arr(r.vrSrcBack, true))
+  const at: Opnd = if guard { guardedIdx(ix, s, r.vrSrcWrap) } else { ix }
+  return raw(arr(-1, true), "array.get", r.vrSrcBack, [src, at], 0)
+}
+
+// Row `r`'s record `ix` boxed under its tag; the tag is written first, as the box's field 0.
+function boxedRec(
+  l: ViewList,
+  r: ViewRow,
+  s: Opnd,
+  ix: OVar,
+  guard: boolean,
+): Opnd {
+  const t = tagOf(r.vrTag)
+  return raw(
+    viewElem(l),
+    "struct.new",
+    l.vlBox,
+    [t, sourceRec(r, s, ix, guard)],
+    0,
+  )
+}
+
+// `__sv_sync_d__(x)` / `__rv_sync__(x)` -> x: when `x` is a view, its snapshot refilled from its
+// source: the backing grown to the source's length when short, each element written, the length.
+export function irViewSyncFnCode(
+  out: u8[],
+  l: ViewList,
+  rows: ViewRow[],
+  name: string,
+): i32 {
+  if !l.vlBuilt { return unreachableHelper(out, name) }
+  begin(arr(l.vlWrap, false))
+  const x = param(arr(l.vlWrap, true))
+  const n = local(I32(), 1)
+  const i = local(I32(), 2)
+  const bk = local(arr(l.vlBack, true), 3)
+  let j = 0
+  while j < rows.length {
+    const r = rows[j]
+    const vt = r.vrVt
+    const v = local(arr(vt, true), 4 + 2 * j)
+    const s = local(arr(r.vrSrcWrap, true), 5 + 2 * j)
+    const c = isView(x, vt)
+    open()
+    set(v, viewOf(x, vt))
+    set(s, field(v, vt, 3, arr(r.vrSrcWrap, true)))
+    set(n, field(s, r.vrSrcWrap, 1, I32()))
+    const short = test("lt", field(v, vt, 2, I32()), n)
+    open()
+    eff(
+      "struct.set",
+      vt,
+      [v, raw(arr(l.vlBack, false), "array.new_default", l.vlBack, [n], 0)],
+      0,
+    )
+    eff("struct.set", vt, [v, n], 2)
+    when(short, close())
+    set(bk, field(v, vt, 0, arr(l.vlBack, true)))
+    set(i, i32(0))
+    open()
+    exitIf(test("ge", i, n), 0)
+    // A nullable record row's box is a valued `if`, so the store's leading operands go first.
+    if r.vrConv < 0 && r.vrNul {
+      const pb = raw(arr(l.vlBack, true), "push", -1, [bk], 0)
+      const pi = raw(I32(), "push", -1, [i], 0)
+      eff("array.set", l.vlBack, [pb, pi, sourceElem(l, r, s, i, false)], 0)
+    } else {
+      eff("array.set", l.vlBack, [bk, i, sourceElem(l, r, s, i, false)], 0)
+    }
+    set(i, add(i, i32(1)))
+    loopIn(0, close())
+    eff("struct.set", vt, [v, n], 1)
+    when(c, close())
+    j = j + 1
+  }
+  ret(raw(arr(l.vlWrap, false), "ref.as_non_null", l.vlWrap, [x], 0))
+  return finish(name, out)
+}
+
+// `__sv_get_d__(x, i)` / `__rv_get__(x, i)`: element `i` of `x`, from the source when `x` is a view.
+export function irViewGetFnCode(
+  out: u8[],
+  l: ViewList,
+  rows: ViewRow[],
+  name: string,
+): i32 {
+  if !l.vlBuilt { return unreachableHelper(out, name) }
+  begin(viewElem(l))
+  const x = param(arr(l.vlWrap, true))
+  const ix = param(I32())
+  let j = 0
+  while j < rows.length {
+    const r = rows[j]
+    const s = local(arr(r.vrSrcWrap, true), 2 + j)
+    const c = isView(x, r.vrVt)
+    open()
+    set(s, field(viewOf(x, r.vrVt), r.vrVt, 3, arr(r.vrSrcWrap, true)))
+    ret(sourceElem(l, r, s, ix, true))
+    when(c, close())
+    j = j + 1
+  }
+  const own = field(x, l.vlWrap, 0, arr(l.vlBack, true))
+  const at = guardedIdx(ix, x, l.vlWrap)
+  if l.vlBox < 0 {
+    ret(raw(viewElem(l), "array.get", l.vlBack, [own, at], 0))
+  } else {
+    const e = raw(arr(l.vlBox, true), "array.get", l.vlBack, [own, at], 0)
+    ret(raw(viewElem(l), "ref.as_non_null", l.vlBox, [e], 0))
+  }
+  return finish(name, out)
+}
+
+// `__sv_len_d__(x)` / `__rv_len__(x) -> i32`: the length of `x`, its source's when it is a view.
+export function irViewLenFnCode(
+  out: u8[],
+  l: ViewList,
+  rows: ViewRow[],
+  name: string,
+): i32 {
+  if !l.vlBuilt { return unreachableHelper(out, name) }
+  begin(I32())
+  const x = param(arr(l.vlWrap, true))
+  for r in rows {
+    const c = isView(x, r.vrVt)
+    open()
+    ret(
+      field(
+        field(viewOf(x, r.vrVt), r.vrVt, 3, arr(r.vrSrcWrap, true)),
+        r.vrSrcWrap,
+        1,
+        I32(),
+      ),
+    )
+    when(c, close())
+  }
+  ret(field(x, l.vlWrap, 1, I32()))
+  return finish(name, out)
+}
+
+// A helper body that is never called: a module whose view rows did not resolve still declares it.
+function unreachableHelper(out: u8[], name: string): i32 {
+  begin(I32())
+  put({ tpWhy: 0 })
+  return finish(name, out)
 }

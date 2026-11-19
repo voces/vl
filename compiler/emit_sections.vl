@@ -50,6 +50,8 @@ import {
 import { irStartPrologueHook } from "./ir_lower"
 import {
   MapCompactTys,
+  ViewList,
+  ViewRow,
   irAsFailFnCode,
   irF64RemFnCode,
   irInitFailFnCode,
@@ -69,9 +71,13 @@ import {
   irStrFillFnCode,
   irStrFromBytesFnCode,
   irStrHashFnCode,
+  irSvMkFnCode,
   irUtf8CpLenFnCode,
   irUtf8DecFnCode,
   irUtf8EncFnCode,
+  irViewGetFnCode,
+  irViewLenFnCode,
+  irViewSyncFnCode,
 } from "./ir_helper"
 import { irRefInstall } from "./ir_build_ref"
 import { canonShowCanon, canonShowWritten } from "./check_canon_raw"
@@ -649,17 +655,12 @@ import {
 } from "./emit_state"
 import {
   emitFail,
-  fbArrayGet,
   fbArrayNewDefault,
   fbArrayNewFixed,
-  fbArraySet,
   fbBeginFunc,
   fbBlock,
-  fbBr,
-  fbBrIf,
   fbCall,
   fbDrop,
-  fbElse,
   fbEmitLocalsVec,
   fbEnd,
   fbEndFunc,
@@ -667,35 +668,22 @@ import {
   fbF64Const,
   fbGlobalGet,
   fbGlobalSet,
-  fbI32Bin,
   fbI32Const,
-  fbI32Rel,
   fbI32RelOf,
   fbI64Const,
-  fbIf,
-  fbIfRefNul,
   fbImmutI32Field,
   fbLocalGet,
-  fbLocalSet,
-  fbLoop,
   fbMutRefNullField,
   fbPushRetExtra,
-  fbRefAsNonNull,
-  fbRefCast,
   fbRefNull,
   fbRefNullForKind,
-  fbRefNullNone,
   fbRefNullStruct,
   fbRefNullValtype,
   fbRefValtype,
   fbRetExtra,
-  fbReturn,
   fbReturnCall,
-  fbSelect,
   fbStrNew,
-  fbStructGet,
   fbStructNew,
-  fbStructSet,
   fbStructTypeHead,
   fbUnreachable,
   fbV128ConstZero,
@@ -733,7 +721,6 @@ import {
   RELOC_VERSION,
   RS_GUARD,
   RS_SLOT,
-  RS_TAG,
   relCopy,
   relCount,
   relFoldBank,
@@ -3002,14 +2989,6 @@ function svConvOp(p: i32): i32 {
   return 187
 }
 
-// `ref.test` of a reference against heap type `ty`.
-function svRefTest(ty: i32) {
-  wU8(251) // 0xfb GC prefix
-  wU8(20)  // 0x14 ref.test
-  wSLEB(ty)
-  return 0
-}
-
 function svHelperCount(): i32 {
   let c = 0
   let p = 0
@@ -3104,7 +3083,10 @@ function svPlaceHelpers(codePayload: ByteRope) {
     if svPairOn(p) {
       const rows = emitFnSpanStart.length
       const entry: u8[] = []
-      svMkFnCode(entry, p)
+      const d = svDstOf(p)
+      if d < gHelpSvSync.length {
+        irSvMkFnCode(entry, svList(d), svRow(p), gHelpSvSync[d])
+      }
       placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__sv_mk__")
     }
     p = p + 1
@@ -3114,15 +3096,15 @@ function svPlaceHelpers(codePayload: ByteRope) {
     if svDstOn(d) {
       let rows = emitFnSpanStart.length
       const sync: u8[] = []
-      svSyncFnCode(sync, d)
+      irViewSyncFnCode(sync, svList(d), svRows(d), "__sv_sync__")
       placeCodeEntry(codePayload, sync, rows, -1, -1, 3, "__sv_sync__")
       rows = emitFnSpanStart.length
       const get: u8[] = []
-      svGetFnCode(get, d)
+      irViewGetFnCode(get, svList(d), svRows(d), "__sv_get__")
       placeCodeEntry(codePayload, get, rows, -1, -1, 3, "__sv_get__")
       rows = emitFnSpanStart.length
       const len: u8[] = []
-      svLenFnCode(len, d)
+      irViewLenFnCode(len, svList(d), svRows(d), "__sv_len__")
       placeCodeEntry(codePayload, len, rows, -1, -1, 3, "__sv_len__")
     }
     d = d + 1
@@ -3160,26 +3142,6 @@ function tsSvView(p: i32) {
   return 0
 }
 
-// `__sv_mk_p__(src) -> (ref $dst)`: a view of `src`, synced.
-function svMkFnCode(out: u8[], p: i32) {
-  const d = svDstOf(p)
-  if p < 0 || p >= svViewTy.length || d >= gHelpSvSync.length { return 0 }
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0)
-  fbI32Const(0)
-  fbArrayNewDefault(svDstBack(d))
-  fbI32Const(0)
-  fbI32Const(0)
-  fbLocalGet(0)
-  fbRefAsNonNull()
-  fbStructNew(svViewTy[p])
-  fbCall(gHelpSvSync[d])
-  fbEnd()
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
 // The pairs that read as destination `d`, in pair order.
 function svPairsOf(d: i32, out: i32[]) {
   let p = 0
@@ -3190,184 +3152,37 @@ function svPairsOf(d: i32, out: i32[]) {
   return 0
 }
 
-// `__sv_sync_d__(x) -> x`: when `x` is a view, refill its snapshot from its source, converted.
-// `x` is never null here: a narrowed `| null` list arrives still typed nullable.
-// Locals: 1 `n`, 2 `i`, 3 the backing, then a view and a source local per pair.
-function svSyncFnCode(out: u8[], d: i32) {
-  const ps: i32[] = []
-  svPairsOf(d, ps)
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2 + 2 * ps.length)
-  wULEB(2)
-  wU8(127)
-  wULEB(1)
-  wU8(99) // 0x63 (ref null ht)
-  wSLEB(svDstBack(d))
-  let j = 0
-  while j < ps.length {
-    wULEB(1)
-    wU8(99)
-    wSLEB(svViewTy[ps[j]])
-    wULEB(1)
-    wU8(99)
-    wSLEB(svSrcWrap(ps[j]))
-    j = j + 1
+// Destination `d`'s scalar view list, and pair `p` and destination `d`'s pairs as view rows.
+function svList(d: i32): ViewList {
+  const l: ViewList = {
+    vlWrap: svDstWrap(d),
+    vlBack: svDstBack(d),
+    vlBox: -1,
+    vlF64: d == 1,
+    vlNullTag: -1,
+    vlBuilt: true,
   }
-  j = 0
-  while j < ps.length {
-    const p = ps[j]
-    const vt = svViewTy[p]
-    const vL = 4 + 2 * j
-    const sL = 5 + 2 * j
-    fbLocalGet(0)
-    svRefTest(vt)
-    fbIf(64)
-    fbLocalGet(0)
-    fbRefCast(vt)
-    fbLocalSet(vL)
-    fbLocalGet(vL)
-    fbStructGet(vt, 3)
-    fbLocalSet(sL)
-    fbLocalGet(sL)
-    fbStructGet(svSrcWrap(p), 1)
-    fbLocalSet(1)
-    fbLocalGet(vL)
-    fbStructGet(vt, 2)
-    fbLocalGet(1)
-    fbI32Bin(72) // 0x48 i32.lt_s
-    fbIf(64)
-    fbLocalGet(vL)
-    fbLocalGet(1)
-    fbArrayNewDefault(svDstBack(d))
-    fbStructSet(vt, 0)
-    fbLocalGet(vL)
-    fbLocalGet(1)
-    fbStructSet(vt, 2)
-    fbEnd()
-    fbLocalGet(vL)
-    fbStructGet(vt, 0)
-    fbLocalSet(3)
-    fbI32Const(0)
-    fbLocalSet(2)
-    fbBlock(64)
-    fbLoop(64)
-    fbLocalGet(2)
-    fbLocalGet(1)
-    fbI32Bin(78) // 0x4e i32.ge_s
-    fbBrIf(1)
-    fbLocalGet(3)
-    fbLocalGet(2)
-    fbLocalGet(sL)
-    fbStructGet(svSrcWrap(p), 0)
-    fbLocalGet(2)
-    fbArrayGet(svSrcBack(p))
-    wU8(svConvOp(p))
-    fbArraySet(svDstBack(d))
-    fbLocalGet(2)
-    fbI32Const(1)
-    fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(2)
-    fbBr(0)
-    fbEnd()
-    fbEnd()
-    fbLocalGet(vL)
-    fbLocalGet(1)
-    fbStructSet(vt, 1)
-    fbEnd()
-    j = j + 1
-  }
-  fbLocalGet(0)
-  fbRefAsNonNull()
-  fbEnd()
-  wTarget(prev)
-  helpFrameBody(out, body)
+  return l
 }
 
-// Push local `idxL` when it is below the length of the wrapper in local `recv` (type `wrap`),
-// else -1, so an out-of-range read traps as `emitListIdxGuard`'s does.
-function svGuardedIdx(idxL: i32, recv: i32, wrap: i32) {
-  fbLocalGet(idxL)
-  fbI32Const(-1)
-  fbLocalGet(idxL)
-  fbLocalGet(recv)
-  fbStructGet(wrap, 1)
-  fbI32Bin(73) // 0x49 i32.lt_u
-  fbSelect()
-  return 0
+function svRow(p: i32): ViewRow {
+  const r: ViewRow = {
+    vrVt: svViewTy[p],
+    vrSrcWrap: svSrcWrap(p),
+    vrSrcBack: svSrcBack(p),
+    vrConv: svConvOp(p),
+    vrTag: -1,
+    vrNul: false,
+  }
+  return r
 }
 
-// `__sv_get_d__(x, i)`: element `i` of `x`, read through the source when `x` is a view.
-function svGetFnCode(out: u8[], d: i32) {
+function svRows(d: i32): ViewRow[] {
   const ps: i32[] = []
   svPairsOf(d, ps)
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(ps.length)
-  let j = 0
-  while j < ps.length {
-    wULEB(1)
-    wU8(99)
-    wSLEB(svSrcWrap(ps[j]))
-    j = j + 1
-  }
-  j = 0
-  while j < ps.length {
-    const p = ps[j]
-    const vt = svViewTy[p]
-    const sL = 2 + j
-    fbLocalGet(0)
-    svRefTest(vt)
-    fbIf(64)
-    fbLocalGet(0)
-    fbRefCast(vt)
-    fbStructGet(vt, 3)
-    fbLocalSet(sL)
-    fbLocalGet(sL)
-    fbStructGet(svSrcWrap(p), 0)
-    svGuardedIdx(1, sL, svSrcWrap(p))
-    fbArrayGet(svSrcBack(p))
-    wU8(svConvOp(p))
-    fbReturn()
-    fbEnd()
-    j = j + 1
-  }
-  fbLocalGet(0)
-  fbStructGet(svDstWrap(d), 0)
-  svGuardedIdx(1, 0, svDstWrap(d))
-  fbArrayGet(svDstBack(d))
-  fbEnd()
-  wTarget(prev)
-  helpFrameBody(out, body)
-}
-
-// `__sv_len_d__(x) -> i32`: the length of `x`, its source's when `x` is a view.
-function svLenFnCode(out: u8[], d: i32) {
-  const ps: i32[] = []
-  svPairsOf(d, ps)
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0)
-  let j = 0
-  while j < ps.length {
-    const p = ps[j]
-    const vt = svViewTy[p]
-    fbLocalGet(0)
-    svRefTest(vt)
-    fbIf(64)
-    fbLocalGet(0)
-    fbRefCast(vt)
-    fbStructGet(vt, 3)
-    fbStructGet(svSrcWrap(p), 1)
-    fbReturn()
-    fbEnd()
-    j = j + 1
-  }
-  fbLocalGet(0)
-  fbStructGet(svDstWrap(d), 1)
-  fbEnd()
-  wTarget(prev)
-  helpFrameBody(out, body)
+  const out: ViewRow[] = []
+  for p in ps { out.push(svRow(p)) }
+  return out
 }
 
 // —— record-list views (D3041) ——
@@ -3403,6 +3218,38 @@ function rvBuilt(): boolean {
     && rvUnionSlot >= 0
     && rvUnionSlot < rlWrapIdx.length
     && rvUnionSlot < rlBackIdx.length
+}
+
+// The union-box list the record views subtype, and its rows; none when the views did not resolve.
+function rvList(): ViewList {
+  const built = rvBuilt()
+  const l: ViewList = {
+    vlWrap: if built { rvWrap() } else { -1 },
+    vlBack: if built { rvBack() } else { -1 },
+    vlBox: uBoxIdx,
+    vlF64: false,
+    vlNullTag: nullBoxTag(),
+    vlBuilt: built,
+  }
+  return l
+}
+
+function rvRows(): ViewRow[] {
+  const out: ViewRow[] = []
+  let j = 0
+  while rvBuilt() && j < rvViewTy.length {
+    const r: ViewRow = {
+      vrVt: rvViewTy[j],
+      vrSrcWrap: rvSrcWrap(j),
+      vrSrcBack: rvSrcBack(j),
+      vrConv: -1,
+      vrTag: rvTag[j],
+      vrNul: rvNul[j] == 1,
+    }
+    out.push(r)
+    j = j + 1
+  }
+  return out
 }
 
 function rvHelperCount(): i32 {
@@ -3441,28 +3288,17 @@ function rvPlaceHelpers(codePayload: ByteRope) {
   if gHelpRvSync < 0 { return 0 }
   let rows = emitFnSpanStart.length
   const sync: u8[] = []
-  rvSyncFnCode(sync)
+  irViewSyncFnCode(sync, rvList(), rvRows(), "__rv_sync__")
   placeCodeEntry(codePayload, sync, rows, -1, -1, 3, "__rv_sync__")
   rows = emitFnSpanStart.length
   const get: u8[] = []
-  rvGetFnCode(get)
+  irViewGetFnCode(get, rvList(), rvRows(), "__rv_get__")
   placeCodeEntry(codePayload, get, rows, -1, -1, 3, "__rv_get__")
   rows = emitFnSpanStart.length
   const len: u8[] = []
-  rvLenFnCode(len)
+  irViewLenFnCode(len, rvList(), rvRows(), "__rv_len__")
   placeCodeEntry(codePayload, len, rows, -1, -1, 3, "__rv_len__")
   return 0
-}
-
-// A helper body for a module whose view rows did not resolve: never called.
-function rvUnreachableBody(out: u8[]) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0)
-  wU8(0) // unreachable
-  fbEnd()
-  wTarget(prev)
-  return helpFrameBody(out, body)
 }
 
 // Open the union-box list's wrapper, at ref-list row `slot`, as a type a view may subtype.
@@ -3492,192 +3328,6 @@ function tsRvView(p: i32) {
   wSLEB(rvSrcWrap(p))
   wU8(0)
   return 0
-}
-
-// Push element `idx` of the record list in local `sL`, for view row `p`: `idx` a local, or with
-// `guard` the index in local 1 bounded against that list's length.
-function rvSrcElem(p: i32, sL: i32, idx: i32, guard: boolean) {
-  fbLocalGet(sL)
-  fbStructGet(rvSrcWrap(p), 0)
-  if guard { svGuardedIdx(idx, sL, rvSrcWrap(p)) } else { fbLocalGet(idx) }
-  fbArrayGet(rvSrcBack(p))
-  return 0
-}
-
-// Box that element under view row `p`'s tag, `{tag, record}`; a `null` element of a
-// nullable record row boxes under the null tag, as the element-converting copy does.
-function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
-  if rvNul[p] == 1 {
-    rvSrcElem(p, sL, idx, guard)
-    wU8(209) // 0xd1 ref.is_null
-    fbIfRefNul(uBoxIdx, false)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    fbElse()
-    fbI32Rel(RS_TAG, rvTag[p])
-    rvSrcElem(p, sL, idx, guard)
-    fbStructNew(uBoxIdx)
-    fbEnd()
-    return 0
-  }
-  fbI32Rel(RS_TAG, rvTag[p])
-  rvSrcElem(p, sL, idx, guard)
-  fbStructNew(uBoxIdx)
-  return 0
-}
-
-// `__rv_sync__(x) -> x`: when `x` is a view, refill its snapshot from its source, each record
-// boxed. Locals: 1 `n`, 2 `i`, 3 the backing, then a view and a source local per row.
-function rvSyncFnCode(out: u8[]) {
-  if !rvBuilt() { return rvUnreachableBody(out) }
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(2 + 2 * rvViewTy.length)
-  wULEB(2)
-  wU8(127)
-  wULEB(1)
-  wU8(99) // 0x63 (ref null ht)
-  wSLEB(rvBack())
-  let j = 0
-  while j < rvViewTy.length {
-    wULEB(1)
-    wU8(99)
-    wSLEB(rvViewTy[j])
-    wULEB(1)
-    wU8(99)
-    wSLEB(rvSrcWrap(j))
-    j = j + 1
-  }
-  j = 0
-  while j < rvViewTy.length {
-    const vt = rvViewTy[j]
-    const vL = 4 + 2 * j
-    const sL = 5 + 2 * j
-    fbLocalGet(0)
-    svRefTest(vt)
-    fbIf(64)
-    fbLocalGet(0)
-    fbRefCast(vt)
-    fbLocalSet(vL)
-    fbLocalGet(vL)
-    fbStructGet(vt, 3)
-    fbLocalSet(sL)
-    fbLocalGet(sL)
-    fbStructGet(rvSrcWrap(j), 1)
-    fbLocalSet(1)
-    fbLocalGet(vL)
-    fbStructGet(vt, 2)
-    fbLocalGet(1)
-    fbI32Bin(72) // 0x48 i32.lt_s
-    fbIf(64)
-    fbLocalGet(vL)
-    fbLocalGet(1)
-    fbArrayNewDefault(rvBack())
-    fbStructSet(vt, 0)
-    fbLocalGet(vL)
-    fbLocalGet(1)
-    fbStructSet(vt, 2)
-    fbEnd()
-    fbLocalGet(vL)
-    fbStructGet(vt, 0)
-    fbLocalSet(3)
-    fbI32Const(0)
-    fbLocalSet(2)
-    fbBlock(64)
-    fbLoop(64)
-    fbLocalGet(2)
-    fbLocalGet(1)
-    fbI32Bin(78) // 0x4e i32.ge_s
-    fbBrIf(1)
-    fbLocalGet(3)
-    fbLocalGet(2)
-    rvBoxElem(j, sL, 2, false)
-    fbArraySet(rvBack())
-    fbLocalGet(2)
-    fbI32Const(1)
-    fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(2)
-    fbBr(0)
-    fbEnd()
-    fbEnd()
-    fbLocalGet(vL)
-    fbLocalGet(1)
-    fbStructSet(vt, 1)
-    fbEnd()
-    j = j + 1
-  }
-  fbLocalGet(0)
-  fbRefAsNonNull()
-  fbEnd()
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__rv_get__(x, i)`: element `i` of `x`, boxed from the source when `x` is a view.
-function rvGetFnCode(out: u8[]) {
-  if !rvBuilt() { return rvUnreachableBody(out) }
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(rvViewTy.length)
-  let j = 0
-  while j < rvViewTy.length {
-    wULEB(1)
-    wU8(99)
-    wSLEB(rvSrcWrap(j))
-    j = j + 1
-  }
-  j = 0
-  while j < rvViewTy.length {
-    const vt = rvViewTy[j]
-    const sL = 2 + j
-    fbLocalGet(0)
-    svRefTest(vt)
-    fbIf(64)
-    fbLocalGet(0)
-    fbRefCast(vt)
-    fbStructGet(vt, 3)
-    fbLocalSet(sL)
-    rvBoxElem(j, sL, 1, true)
-    fbReturn()
-    fbEnd()
-    j = j + 1
-  }
-  fbLocalGet(0)
-  fbStructGet(rvWrap(), 0)
-  svGuardedIdx(1, 0, rvWrap())
-  fbArrayGet(rvBack())
-  fbRefAsNonNull()
-  fbEnd()
-  wTarget(prev)
-  return helpFrameBody(out, body)
-}
-
-// `__rv_len__(x) -> i32`: the length of `x`, its source's when `x` is a view.
-function rvLenFnCode(out: u8[]) {
-  if !rvBuilt() { return rvUnreachableBody(out) }
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0)
-  let j = 0
-  while j < rvViewTy.length {
-    const vt = rvViewTy[j]
-    fbLocalGet(0)
-    svRefTest(vt)
-    fbIf(64)
-    fbLocalGet(0)
-    fbRefCast(vt)
-    fbStructGet(vt, 3)
-    fbStructGet(rvSrcWrap(j), 1)
-    fbReturn()
-    fbEnd()
-    j = j + 1
-  }
-  fbLocalGet(0)
-  fbStructGet(rvWrap(), 1)
-  fbEnd()
-  wTarget(prev)
-  return helpFrameBody(out, body)
 }
 
 // The start function's `@file:line`. Module 0 is the ENTRY and top-level statements live
