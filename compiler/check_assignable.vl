@@ -151,6 +151,7 @@ import {
   nolNoteDelivery,
 } from "./check_bind_rows"
 import {
+  ambientCtorCalls,
   bareBraceSpec,
   bareBraceSpecSet,
   cbSeedUsed,
@@ -505,6 +506,7 @@ import {
   TyVar,
   mkArrayTy,
   mkFuncTy,
+  mkMapTy,
   nestParentOf,
   nwTyIxs,
   objFieldType,
@@ -526,6 +528,7 @@ import {
   tyIsNewtypeBrand,
   tyIsNicheNulScalarElem,
   tyIxIsView,
+  tyKeyOpen,
   tyMayHoldFn,
   tyMentionsErr,
   tyMentionsTyVarNamed,
@@ -538,6 +541,7 @@ import {
   tySame,
   tyToStr,
   tyValOf,
+  tyValOpen,
   tyWideUnionMinted,
 } from "./check_types"
 import { mkUnionTy, numUnionConverts, numUnionMinted } from "./check_union_mint"
@@ -1439,15 +1443,15 @@ function instFreshOf(fn: i32, ix: i32): Map<i32, i32> {
   const had = instFreshByCall.get(ix)
   if had != null { return had }
   const m: Map<i32, i32> = Map()
-  for t in a.tys { m.set(t, mkArrayTy(TY_OPEN)) }
+  for t in a.tys { m.set(t, instFreshTy(t)) }
   instFreshByCall.set(ix, m)
   return m
 }
 
-// Every empty `[]` allocated in `fn`'s body, element still open, that reaches only direct arguments
-// of calls through `fn`'s own parameters: the literal itself, or an un-annotated binding of it read
-// nowhere else. The other conditions exist only because the elaboration types a nested, relayed or
-// `Map()` allocation from the template (D16976); they stay shared until it builds them per instance.
+// Every empty `[]`, `Map()` or `Set()` allocated in `fn`'s body, still open, that reaches only
+// direct arguments of calls through `fn`'s own parameters: the allocation itself, or an un-annotated
+// binding of it read nowhere else. The other conditions exist only because the elaboration types a
+// nested or relayed allocation from the template (D16976); they stay shared until it builds them.
 function instAllocsOf(fn: i32, first: i32): InstAllocs {
   const r: InstAllocs = { first: first, tys: [] }
   const f = nodeAt(fn)
@@ -1530,16 +1534,32 @@ function instFrameCollect(ix: i32, out: i32[]) {
   return 0
 }
 
-// Whether `ix` is an empty `[]` whose element type is still open.
+// Whether `ix` is an empty `[]`, `Map()` or `Set()` whose element, key or value is still open.
 function instOpenEmptyList(ix: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const n = nodeAt(ix)
   const t = nodeTyIxOf(ix)
-  if !(n is ArrayLit) || n.arrElems.length != 0 || t < 0 || t >= T.tys.length {
-    return false
-  }
+  if t < 0 || t >= T.tys.length { return false }
   const tt = tyAt(t)
-  return tt is TyArray && tyOpen(tyElemOf(tt))
+  if n is ArrayLit {
+    return n.arrElems.length == 0 && tt is TyArray && tyOpen(tyElemOf(tt))
+  }
+  return instOpenEmptyCtor(ix, t)
+}
+
+// Whether `ix` is a `Map()` or `Set()` call of type `t` whose key or value is still open.
+function instOpenEmptyCtor(ix: i32, t: i32): boolean {
+  if !ambientCtorCalls.has(ix) { return false }
+  const tt = tyAt(t)
+  if tt is TyMap { return tyKeyOpen(tt) || tyValOpen(tt) }
+  return false
+}
+
+// A fresh open copy of the container type `t` one of `instAllocsOf`'s allocations has.
+function instFreshTy(t: i32): i32 {
+  const tt = tyAt(t)
+  if tt is TyMap { return mkMapTy(TY_OPEN, TY_OPEN, tt.mSet) }
+  return mkArrayTy(TY_OPEN)
 }
 
 // Whether declaration `d` is an un-annotated binding initialised by an open empty `[]`.
