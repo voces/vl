@@ -40,21 +40,28 @@
   `HOLE_STALE` and `irHoleClosed`; `emitExpr`'s hole branch; `emitFuncCode`'s hole check;
   `irLowerHoleWrite`, `lwHoleBox`, and the hook's install in `ir_build_ref.vl`.
 
+**The box-dst shadow.** Legacy reached the plan's value rungs through `emitUnionCoerce`, which
+records a nested `coerce` note for the box-dst shadow (`tests/vl_box_dst_shadow_test.ts`). The
+plan's path records the same note inside its own enter and leave, for every arm the ladder reached
+that way, which is all but a null-typed value. Without it, the shadow lost those notes.
+
 ## Measured
 
-Fixpoint seeds on both sides, master 6af1fed0c against this branch merged with it.
+Fixpoint seeds on both sides, master 55155fe2e against this branch merged with it.
 
 | bar | result |
 |---|---|
 | `ir-identity.sh` plain | identical 9,034, fail under both 3,267, differ 0; self-compile identical |
 | `ir-identity.sh --names` | identical 9,034, differ 0; self-compile identical |
-| `ir-identity.sh --cases` | identical 7,508, fail under both 68, differ 0 |
-| armed shadow | 30,648 covered = verified = matched (master 30,648) |
-| `--claims` | 30,648 emitted by the IR, ok |
-| mode 3 self | byte-identical, 0 fell back, 12,665 claimed |
+| `ir-identity.sh --cases` | identical 7,511, fail under both 68, differ 0 |
+| armed shadow | 30,652 covered = verified = matched |
+| `--claims` | 30,652 emitted by the IR, ok |
+| mode 3 self | byte-identical, 0 fell back, 12,663 claimed |
 | pin helpers, `emit_mono.vl` | 905 |
-| L2 fuel | 98,791,652,397: master 98,981,064,907, so −0.19% (+0.7% on the committed baseline, which master is +0.9% on) |
+| L2 fuel | 99,066,134,116 against master's 99,245,408,430: −0.18% |
 | lint-self, phase state, late demands | clean; ok (not rising); 9 = baseline 9, late tag rows 307 = 307 |
+| `deno task test` | 9,561 passed, 0 failed |
+| `ladder-sets.vl` | 56 closed sets match (`HoleBoxArm` added to the lint's mirrors) |
 
 **Driver census** (`ir-driver-census.sh`, `.reentry`):
 
