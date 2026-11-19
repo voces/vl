@@ -1742,6 +1742,7 @@ import {
   ArrLitArm,
   ForInLoop,
   IdxStore,
+  PopPlan,
   PushPlan,
   PushSlot,
   PushValKinds,
@@ -28673,7 +28674,16 @@ function emitCallCoreTrap(c: Call, fnIx: i32) {
   // (the same `__print_char__`/`__print_str_flush__` path `print(<string>)`
   // uses), so an abort carries a human-readable reason, THEN `unreachable`.
   if c.callArgs.length == 1 {
-    if emitPrintStrExpr(c.callArgs[0], fnIx) < 0 { return -1 }
+    // An atom message is an interned id, not a string ref; it decodes as `print(atom)` does.
+    const msg = c.callArgs[0]
+    if exprIsLitAtom(msg, fnIx) {
+      if emitStashAtomId(msg, fnIx) < 0 { return -1 }
+      if printAtomStashed(printAtomTexts("atom", msg, fnIx), false) < 0 {
+        return -1
+      }
+    } else if emitPrintStrExpr(msg, fnIx) < 0 {
+      return -1
+    }
   }
   fbUnreachable()
   return 0
@@ -30643,7 +30653,7 @@ function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
 // resolved; `refSlot >= 0` defers the ref family's per-element-type frame to here, the one
 // point that knows staging is happening. A `.pop`/`.clear` stages only a receiver it cannot
 // read in place; a `.push` reads `base`..`base+2` regardless, so the ref frame is reserved for the first group only.
-function listOpStageBase(base: i32, refSlot: i32): i32 {
+export function listOpStageBase(base: i32, refSlot: i32): i32 {
   if refSlot < 0 { return base }
   return refPushScratchBaseFor(refSlot)
 }
@@ -31203,7 +31213,6 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
         listGetStageMark(callIx)
       }
       const isRef = exprRefArray(callee.memObj, fnIx)
-      const isStr = exprStringArray(callee.memObj, fnIx)
       // D977 — the scalar-list family had no arm here: `exprArray` claims only an
       // i32-element list, so `i64[]`/`f64[]`/`f32[]`/`u8[]` fell to a refusal that
       // `emitFail`'s non-halting let reach check-clean invalid wasm instead. The wrapper
@@ -31213,109 +31222,169 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
       if !popRecvIsList(callee.memObj, fnIx) {
         return emitFail("emitProgram: " + opNm + " receiver is not a list")
       }
-      // The popped element is a REF (struct / union box / map struct / string) for a
-      // ref or string list — surface it non-null; an i32 list yields a raw i32. `base` is
-      // the scratch frame whose `+3` `recvRef` slot holds a struct-FIELD receiver's wrapper
-      // ref (same frame `.push` uses) — used only for a Member receiver.
-      let wrapTy = -1
-      let popBack = -1
-      let base = pushScratchBase
-      // The ref-list table slot whose scratch frame a STAGING receiver would use, or -1
-      // for every other family. Handed to `listOpRecvLocal` so the frame is resolved only
-      // where staging happens — see `listOpStageBase`.
-      let popRefSlot = -1
-      let elemIsRef = false
-      if isRef {
-        if !rlRowsMinted() {
+      // The wrapper, backing, scratch base and ref row `popAnyPlanOf` lays out; a ref row's
+      // staging frame is resolved only where staging happens (`listOpStageBase`). No plan is a
+      // ref or scalar list type not collected.
+      const pq = popAnyPlanOf(callIx, fnIx)
+      if pq == null {
+        if isRef && !rlRowsMinted() {
           return emitFail(
             "emitProgram: ref " + opNm + " but ref list type not collected",
           )
         }
-        const rslot = refListSlotOfExpr(callee.memObj, fnIx)
-        if rslot < 0 { return refListRowRefused(callee.memObj) }
-        wrapTy = rlWrapIdx[rslot]
-        popBack = rlBackIdx[rslot]
-        popRefSlot = rslot
-        elemIsRef = true
-      } else if popEk == null && isStr {
-        wrapTy = mkListTy()
-        popBack = mkArrTy()
-        base = strPushScratchBase
-        elemIsRef = true
-      } else {
-        // An i32 or scalar list: the wrapper, backing and scratch base `popPlanOf` lays out.
-        const pq = popPlanOf(callIx, fnIx)
-        if pq == null {
-          return emitFail(
-            "emitProgram: " + opNm + " but list type not collected",
-          )
-        }
-        wrapTy = pq.pqWrap
-        popBack = pq.pqBack
-        base = pq.pqBase
+        if isRef { return refListRowRefused(callee.memObj) }
+        return emitFail("emitProgram: " + opNm + " but list type not collected")
       }
+      const wrapTy = pq.pqWrap
+      const popBack = pq.pqBack
+      const base = pq.pqBase
+      const popRefSlot = pq.pqRefSlot
+      const elemIsRef = pq.pqElemRef
       // Receiver resolution — `listOpRecvLocal`, shared with `.push`/`.clear`/`.pop() ?? d`.
       const lIdx = listOpRecvLocal(callee.memObj, fnIx, base, popRefSlot, opNm)
       if lIdx < 0 { return -1 }
       if getIdx >= 0 { emitListGetViewSync(lIdx, popEk, callee.memObj, fnIx) }
-      // A pop the checker typed as the element itself, under a `.length` test of its receiver
-      // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
-      if getIdx < 0 && nodeTyExcludesNull(callIx) {
-        if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
-        if elemIsRef {
-          fbRefAsNonNull()
-          if popUnionBoxElem(popRefSlot) {
-            if emitStaleBoxRetag(popRefSlot, callIx) < 0 { return -1 }
-          }
-        }
-        return 0
-      }
       if !elemIsRef {
-        // A BOOLEAN-element list pops CHECKED: `boolean | null` rides the i32
-        // niche (true=1 / false=0 / null=2), so an empty pop yields the sentinel
-        // 2 instead of trapping — mirroring the host's nullable `.pop()` (B6).
-        if listElemIsBool(callee.memObj, fnIx) {
-          return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 2)
-        }
-        // the reps with no niche of their own, at a value position (`nulBox`): i32/i64/
-        // f64/f32 have no spare bit pattern for absence, so their `T | null` is the
-        // shared value box, built here. The statement caller passes `false` and keeps
-        // the raw form, since boxing there would allocate for a value no one reads.
-        if nulBox {
-          // A tagged set's member id is an `i32`, boxed as one.
-          const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
-          if pnk >= 0 {
-            return emitPopNulBox(lIdx, wrapTy, popBack, pnk, getIdx, fnIx)
-          }
-        }
-        // a `K[]` atom list reads checked too, on the `-1` sentinel below every interned
-        // atom id — the boolean arm's shape at the one other niche rep, applying at a
-        // statement `.pop()` too since the read itself traps, not the boxing (D1281).
-        if tyNulLitUnionInner(nodeTyIxOf(callIx)) {
-          return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 0 - 1)
-        }
-      }
-      if elemIsRef {
-        return emitPopRefChecked(
+        return popScalarTail(
           callIx,
+          callee.memObj,
           lIdx,
           wrapTy,
           popBack,
           getIdx,
+          nulBox,
           fnIx,
-          popRefSlot,
-          opNm,
         )
       }
-      // A numeric `.pop` statement has no null cell to answer with, so it pops under the
-      // length test and drops the element itself: an empty list is left as it is (D8360).
-      if !nulBox && getIdx < 0 { return popDropTail(lIdx, wrapTy, popBack) }
-      // the unchecked tail: the reps with no `T | null` cell of their own.
-      if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
-      return 0
+      return popRefTail(callIx, lIdx, wrapTy, popBack, getIdx, popRefSlot, fnIx)
     }
   }
   return emitFail("emitProgram: expected a .pop or .get call")
+}
+
+// The plan of `.pop()` call `callIx` over a ref or string list, as `emitPopGo` lays it out; null for
+// any other list or an uncollected ref row. A staged receiver takes `listOpStageBase`'s frame.
+export function popRefPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 { return null }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return null }
+  const o = callee.memObj
+  if !popRecvIsList(o, fnIx) { return null }
+  if exprRefArray(o, fnIx) {
+    if !rlRowsMinted() { return null }
+    const rslot = refListSlotOfExpr(o, fnIx)
+    if rslot < 0 { return null }
+    const p: PopPlan = {
+      pqRecv: o,
+      pqEk: null,
+      pqWrap: rlWrapIdx[rslot],
+      pqBack: rlBackIdx[rslot],
+      pqBase: pushScratchBase,
+      pqRefSlot: rslot,
+      pqElemRef: true,
+    }
+    return p
+  }
+  const ek = scalarListElemKind(o, fnIx)
+  if !exprStringArray(o, fnIx) || !(ek == null || ek == "i32") { return null }
+  const sp: PopPlan = {
+    pqRecv: o,
+    pqEk: null,
+    pqWrap: mkListTy(),
+    pqBack: mkArrTy(),
+    pqBase: strPushScratchBase,
+    pqRefSlot: -1,
+    pqElemRef: true,
+  }
+  return sp
+}
+
+// The plan of `.pop()` call `callIx` over any list `emitPopGo` pops: a scalar plan, else a ref one.
+export function popAnyPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
+  const pq = popPlanOf(callIx, fnIx)
+  if pq != null { return pq }
+  return popRefPlanOf(callIx, fnIx)
+}
+
+// After a ref or string list's receiver is in local `lIdx`: `.pop()` or `.get` call `callIx`
+// leaves its element, non-null when the checker typed it so, else its checked nullable read.
+// `refSlot` is the ref list's row, -1 for a string list.
+export function popRefTail(
+  callIx: i32,
+  lIdx: i32,
+  wrapTy: i32,
+  popBack: i32,
+  getIdx: i32,
+  refSlot: i32,
+  fnIx: i32,
+) {
+  const opNm = if getIdx < 0 { ".pop" } else { ".get" }
+  // A pop the checker typed as the element itself, under a `.length` test of its receiver
+  // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
+  if getIdx < 0 && nodeTyExcludesNull(callIx) {
+    if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+    fbRefAsNonNull()
+    if popUnionBoxElem(refSlot) {
+      if emitStaleBoxRetag(refSlot, callIx) < 0 { return -1 }
+    }
+    return 0
+  }
+  return emitPopRefChecked(
+    callIx,
+    lIdx,
+    wrapTy,
+    popBack,
+    getIdx,
+    fnIx,
+    refSlot,
+    opNm,
+  )
+}
+
+// After an i32 or scalar list's receiver is in local `lIdx`: `.pop()` or `.get` call `callIx`
+// (`getIdx` the index, or -1). Returns 0 with the element, its niche or its null box (`nulBox`, a
+// value position) on the stack; 1 when a statement pop left none; or -1.
+export function popScalarTail(
+  callIx: i32,
+  recvIx: i32,
+  lIdx: i32,
+  wrapTy: i32,
+  popBack: i32,
+  getIdx: i32,
+  nulBox: boolean,
+  fnIx: i32,
+) {
+  // A pop the checker typed as the element itself, under a `.length` test of its receiver
+  // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
+  if getIdx < 0 && nodeTyExcludesNull(callIx) {
+    if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+    return 0
+  }
+  // A boolean list pops checked on its i32 niche (null is 2), so an empty pop yields the
+  // sentinel instead of trapping.
+  if listElemIsBool(recvIx, fnIx) {
+    return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 2)
+  }
+  // i32/i64/f64/f32 have no spare bit pattern for absence, so at a value position their
+  // `T | null` is the shared value box; a statement keeps the raw form. A tagged set's member id
+  // is an `i32`, boxed as one.
+  if nulBox {
+    const pnk = if popNulTagId(nodeTyIxOf(callIx)) { 0 } else { tyNulNumScalarValKind(nodeTyIxOf(callIx)) }
+    if pnk >= 0 {
+      return emitPopNulBox(lIdx, wrapTy, popBack, pnk, getIdx, fnIx)
+    }
+  }
+  // An atom list reads checked on the -1 sentinel below every interned id, at a statement too,
+  // since the read itself traps (D1281).
+  if tyNulLitUnionInner(nodeTyIxOf(callIx)) {
+    return emitPopNicheChecked(lIdx, wrapTy, popBack, getIdx, fnIx, 0 - 1)
+  }
+  // A number statement pop has no null cell to answer with: it pops under the length test and
+  // drops the element itself, leaving an empty list as it is (D8360).
+  if !nulBox && getIdx < 0 { return popDropTail(lIdx, wrapTy, popBack) }
+  if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+  return 0
 }
 
 // A `.get` of a view reads its refreshed snapshot (D3028, D3041): sync the scalar view of
@@ -33045,130 +33114,179 @@ export function listElemStaysNullable(exprIx: i32, fnIx: i32) {
   return false
 }
 
+// The plan list `.slice` call `callIx` is lowered by: its receiver and bound nodes, the receiver's
+// wrapper and backing heap types, and the `.map`/`.filter` frame's source and result locals.
+// `slFail` is the refusal to raise, or "row" where the receiver's ref-list row does not resolve.
+export type SlicePlan = {
+  slFail: string,
+  slRecv: i32,
+  slWrap: i32,
+  slBack: i32,
+  slSrcL: i32,
+  slDstL: i32,
+  slArgs: i32[],
+  slTwo: boolean,
+}
+
+function slRefused(why: string): SlicePlan {
+  const p: SlicePlan = {
+    slFail: why,
+    slRecv: -1,
+    slWrap: -1,
+    slBack: -1,
+    slSrcL: -1,
+    slDstL: -1,
+    slArgs: [],
+    slTwo: false,
+  }
+  return p
+}
+
+// The plan of list `.slice` call `callIx`, asked where legacy's arm asks it; it mints nothing.
+export function arrSlicePlanOf(callIx: i32, fnIx: i32): SlicePlan {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 {
+    return slRefused("emitProgram: expected an array slice call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) {
+    return slRefused("emitProgram: .slice receiver is not a member access")
+  }
+  const recvK = mfRecvKindOf(callee.memObj, fnIx)
+  if recvK == null {
+    return slRefused("emitProgram: .slice receiver is not a supported list")
+  }
+  let srcSlot = -1
+  if recvK == "reflist" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
+  // A packed receiver's slot is its row, which keys its scratch frames.
+  if recvK == "u8list" { srcSlot = exprPackedRow(callee.memObj, fnIx) }
+  const p = slRefused("")
+  // The element kind's wrapper + backing heap types.
+  const rek = numListElemOf(recvK)
+  if rek != null {
+    p.slWrap = scalarListWrap(rek, 0)
+    p.slBack = scalarListBack(rek, 0)
+  } else if recvK == "reflist" {
+    if !rlRowsMinted() {
+      return slRefused(
+        "emitProgram: .slice over a ref list but ref list type not collected",
+      )
+    }
+    if srcSlot < 0 { return slRefused("row") }
+    p.slWrap = rlWrapIdx[srcSlot]
+    p.slBack = rlBackIdx[srcSlot]
+  } else if recvK == "strlist" {
+    p.slWrap = mkListTy()
+    p.slBack = mkArrTy()
+  } else if recvK == "u8list" {
+    // the packed byte list (D1141): a `(array (mut i8))` backing under the `$bl8`
+    // wrapper, the arm this ladder needs since `mfRecvKindOf` would otherwise answer
+    // `"list"` for a `u8[]` receiver and mint the new list over the wrong 4-byte
+    // backing. `array.copy` below is i8-to-i8, so the elements survive the copy.
+    p.slWrap = pkWrapAt(srcSlot)
+    p.slBack = pkBackAt(srcSlot)
+  } else {
+    p.slWrap = lTy()
+    p.slBack = aTy()
+  }
+  p.slSrcL = mfSrcLocalFor(recvK, srcSlot)
+  p.slDstL = mfDstLocalFor(recvK, srcSlot)
+  if !fnUses.mapFilter || p.slSrcL < 0 || p.slDstL < 0 {
+    return slRefused("emitProgram: .slice scratch frame not reserved")
+  }
+  p.slRecv = callee.memObj
+  p.slArgs = c.callArgs
+  p.slTwo = c.callArgs.length == 2
+  return p
+}
+
 // Lower an array `xs.slice(start, end?)` onto `body`, leaving a new list wrapper of the
 // same element kind over the half-open clamped range `[start, end)` (JS semantics). Rides
 // the `.map`/`.filter` scratch frame (`srcL`/`dstL` plus four i32 temps), evaluating the
 // receiver once into `srcL`; works across i32/boolean, f64, ref and string lists.
 function emitArrSlice(callIx: i32, fnIx: i32) {
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      const recvK = mfRecvKindOf(callee.memObj, fnIx)
-      if recvK == null {
-        return emitFail("emitProgram: .slice receiver is not a supported list")
-      }
-      let srcSlot = -1
-      if recvK == "reflist" { srcSlot = refListSlotOfExpr(callee.memObj, fnIx) }
-      // A packed receiver's slot is its row, which keys its scratch frames.
-      if recvK == "u8list" { srcSlot = exprPackedRow(callee.memObj, fnIx) }
-      // The element kind's wrapper + backing heap types.
-      let wrap = -1
-      let back = -1
-      const rek = numListElemOf(recvK)
-      if rek != null {
-        wrap = scalarListWrap(rek, 0)
-        back = scalarListBack(rek, 0)
-      } else if recvK == "reflist" {
-        if !rlRowsMinted() {
-          return emitFail(
-            "emitProgram: .slice over a ref list but ref list type not collected",
-          )
-        }
-        if srcSlot < 0 { return refListRowRefused(callee.memObj) }
-        wrap = rlWrapIdx[srcSlot]
-        back = rlBackIdx[srcSlot]
-      } else if recvK == "strlist" {
-        wrap = mkListTy()
-        back = mkArrTy()
-      } else if recvK == "u8list" {
-        // the packed byte list (D1141): a `(array (mut i8))` backing under the `$bl8`
-        // wrapper, the arm this ladder needs since `mfRecvKindOf` would otherwise answer
-        // `"list"` for a `u8[]` receiver and mint the new list over the wrong 4-byte
-        // backing. `array.copy` below is i8-to-i8, so the elements survive the copy.
-        const sr = exprPackedRow(callee.memObj, fnIx)
-        wrap = pkWrapAt(sr)
-        back = pkBackAt(sr)
-      } else {
-        wrap = lTy()
-        back = aTy()
-      }
-      const srcL = mfSrcLocalFor(recvK, srcSlot)
-      const dstL = mfDstLocalFor(recvK, srcSlot)
-      if !fnUses.mapFilter || srcL < 0 || dstL < 0 {
-        return emitFail("emitProgram: .slice scratch frame not reserved")
-      }
-      // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
-      // closure ref. So slice has THREE i32 temps: `startL`, `endL`, and `auxL` which
-      // holds the length during clamping then is reused for the out length.
-      const startL = mfScratchBase + 0
-      const endL = mfScratchBase + 1
-      const auxL = mfScratchBase + 2
-      // src = <receiver>, evaluated ONCE. A NARROWED nullable list recovers non-null at
-      // EVERY element kind (`srcL` is declared non-null and `struct.get wrap` demands it),
-      // not just the i32 one — see `nulRecvNeedsRecover`.
-      if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
-      svSyncRecv(callee.memObj, fnIx)
-      // The receiver and both bounds reach the stack before the frame is written: the frame
-      // is shared, so a slice, `.map` or `.filter` in an argument would overwrite it (D2332).
-      if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      if c.callArgs.length == 2 {
-        if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
-        fbLocalSet(endL)
-      }
-      fbLocalSet(startL)
-      fbLocalSet(srcL)
-      // auxL = src.len (the wrapper's logical length, field 1)
-      fbLocalGet(srcL)
-      fbStructGet(wrap, 1)
-      fbLocalSet(auxL)
-      // start = clamp(rawStart, len)
-      emitClampLocal(startL, auxL)
-      fbLocalSet(startL)
-      // end = clamp(rawEnd, len), or len when omitted (the 1-arg form slices to the end)
-      if c.callArgs.length == 2 {
-        emitClampLocal(endL, auxL)
-        fbLocalSet(endL)
-      } else {
-        fbLocalGet(auxL)
-        fbLocalSet(endL)
-      }
-      // auxL (len now dead) = outLen = max(end - start, 0) = select(end-start, 0, end>start)
-      fbLocalGet(endL)
-      fbLocalGet(startL)
-      fbI32Bin(107) // i32.sub → end - start  [a]
-      fbI32Const(0) // [b]
-      fbLocalGet(endL)
-      fbLocalGet(startL)
-      fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
-      fbSelect()
-      fbLocalSet(auxL)
-      // dst backing = array.new_default <back> outLen
-      fbLocalGet(auxL)
-      fbArrayNewDefault(back)
-      fbLocalSet(dstL)
-      // result wrapper = struct.new <wrap> (dstBacking, outLen, outLen) — pushed FIRST so
-      // it remains on the stack after the trailing `array.copy` consumes its own operands.
-      fbLocalGet(dstL)
-      fbLocalGet(auxL)
-      fbLocalGet(auxL)
-      fbStructNew(wrap)
-      // array.copy dst 0 src.backing start outLen
-      fbLocalGet(dstL)        // dest backing
-      fbI32Const(0)           // dest offset
-      fbLocalGet(srcL)
-      fbStructGet(wrap, 0)    // src backing
-      fbLocalGet(startL)      // src offset
-      fbLocalGet(auxL)        // count
-      fbArrayCopy(back, back) // array.copy (dest type, src type)
-      // The result wrapper from `struct.new` above is the value left on the stack.
-      return 0
-    }
-    return emitFail("emitProgram: .slice receiver is not a member access")
+  const p = arrSlicePlanOf(callIx, fnIx)
+  if p.slFail == "row" { return refListRowRefused(p.slRecv) }
+  if p.slFail != "" { return emitFail(p.slFail) }
+  // The receiver and both bounds reach the stack before the frame is written: the frame
+  // is shared, so a slice, `.map` or `.filter` in an argument would overwrite it (D2332).
+  if emitExpr(p.slRecv, fnIx) < 0 { return -1 }
+  sliceRecvTail(p, fnIx)
+  for a in p.slArgs {
+    if emitExpr(a, fnIx) < 0 { return -1 }
   }
-  return emitFail("emitProgram: expected an array slice call")
+  return arrSliceTail(p)
+}
+
+// After a list `.slice` receiver: its recovery, non-null at every element kind (`srcL` is declared
+// non-null; `nulRecvNeedsRecover`), and the scalar-view sync.
+export function sliceRecvTail(p: SlicePlan, fnIx: i32) {
+  if nulRecvNeedsRecover(p.slRecv, fnIx) { fbRefAsNonNull() }
+  svSyncRecv(p.slRecv, fnIx)
+  return 0
+}
+
+// A list `.slice` over its receiver and bounds on the stack: the clamped range copied into a new
+// list of the receiver's kind, left on the stack.
+export function arrSliceTail(p: SlicePlan): i32 {
+  const wrap = p.slWrap
+  const back = p.slBack
+  const srcL = p.slSrcL
+  const dstL = p.slDstL
+  // The `.map`/`.filter` frame's first 3 slots are i32 (i, n, j); slot +3 is a
+  // closure ref. So slice has THREE i32 temps: `startL`, `endL`, and `auxL` which
+  // holds the length during clamping then is reused for the out length.
+  const startL = mfScratchBase + 0
+  const endL = mfScratchBase + 1
+  const auxL = mfScratchBase + 2
+  if p.slTwo { fbLocalSet(endL) }
+  fbLocalSet(startL)
+  fbLocalSet(srcL)
+  // auxL = src.len (the wrapper's logical length, field 1)
+  fbLocalGet(srcL)
+  fbStructGet(wrap, 1)
+  fbLocalSet(auxL)
+  // start = clamp(rawStart, len)
+  emitClampLocal(startL, auxL)
+  fbLocalSet(startL)
+  // end = clamp(rawEnd, len), or len when omitted (the 1-arg form slices to the end)
+  if p.slTwo {
+    emitClampLocal(endL, auxL)
+    fbLocalSet(endL)
+  } else {
+    fbLocalGet(auxL)
+    fbLocalSet(endL)
+  }
+  // auxL (len now dead) = outLen = max(end - start, 0) = select(end-start, 0, end>start)
+  fbLocalGet(endL)
+  fbLocalGet(startL)
+  fbI32Bin(107) // i32.sub → end - start  [a]
+  fbI32Const(0) // [b]
+  fbLocalGet(endL)
+  fbLocalGet(startL)
+  fbI32Bin(74)  // 0x4a i32.gt_s → end > start  [cond]
+  fbSelect()
+  fbLocalSet(auxL)
+  // dst backing = array.new_default <back> outLen
+  fbLocalGet(auxL)
+  fbArrayNewDefault(back)
+  fbLocalSet(dstL)
+  // result wrapper = struct.new <wrap> (dstBacking, outLen, outLen) — pushed FIRST so
+  // it remains on the stack after the trailing `array.copy` consumes its own operands.
+  fbLocalGet(dstL)
+  fbLocalGet(auxL)
+  fbLocalGet(auxL)
+  fbStructNew(wrap)
+  // array.copy dst 0 src.backing start outLen
+  fbLocalGet(dstL)        // dest backing
+  fbI32Const(0)           // dest offset
+  fbLocalGet(srcL)
+  fbStructGet(wrap, 0)    // src backing
+  fbLocalGet(startL)      // src offset
+  fbLocalGet(auxL)        // count
+  fbArrayCopy(back, back) // array.copy (dest type, src type)
+  // The result wrapper from `struct.new` above is the value left on the stack.
+  return 0
 }
 
 // Push `elem(i)` — `src.backing[i]` — onto the stack (`ref.as_non_null` for a ref
