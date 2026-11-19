@@ -50,7 +50,7 @@ VL=${VL:-$PWD/scripts/vl-host/target/release/vl}
 JOBS=${JOBS:-4}
 # The IR's re-entries into legacy's expression writer (ir-design-2026-11.md §10.1), each tagged
 # `@re:<name>` where the IR's lowering reaches a driver through it; REENTRY="" tags none.
-REENTRY=${REENTRY-emitBoxAroundHole emitStaticLitAtom loopHoistOpen forInLoopOpen mapGetOrHelperRoute strEqTail popDropTail}
+REENTRY=${REENTRY-emitStaticLitAtom loopHoistOpen forInLoopOpen mapGetOrHelperRoute strEqTail popDropTail}
 T=$(mktemp -d)
 trap '[ -n "${KEEP:-}" ] && echo "kept $T" >&2 || rm -rf "${T:?}"' EXIT
 cp -r compiler "$T/probe"
