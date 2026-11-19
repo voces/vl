@@ -1,0 +1,260 @@
+// Which coercion is recorded at a node where it is delivered: a box, an arm unbox, an atom's
+// string, a list or record copy, a closure wrap or a map retag. Legacy's writers and the IR's
+// lowering read the same answer.
+// The seats (`boxSeat`, `armSeat`, `atomSeat`) are legacy's delivery marks: legacy sets them
+// around one delivery, and they are -1 wherever the IR asks.
+// It writes no bytes and imports nothing from `wasmEmit.vl` or `ir_*.vl`.
+
+import {
+  fnCloCoerceTyOf,
+  listCopyTyOf,
+  mapUnboxTyOf,
+  recCopyFromOf,
+  recCopyTyOf,
+} from "./check_core_state"
+import { primTyIxOfName } from "./check_decl_scan"
+import { nodeTyIxOf } from "./check_node_tys"
+import { deliveryRetagHas } from "./check_retag_rows"
+import { mapDeliveryRecorded } from "./check_side_rows"
+import { TyFunc, TyNullable, mkNullableTyOf, tyAt } from "./check_types"
+import { structIndexOfTy } from "./emit_atom_kinds"
+import { unwrapParen } from "./emit_base"
+import { boxDstTyAt, nodeTyAt } from "./emit_capture_frames"
+import {
+  exprStruct,
+  exprUnion,
+  structIndexOfExpr,
+  unionBoxStoreTyOf,
+} from "./emit_classify"
+import { elabInstTyAt } from "./emit_elab"
+import { repOfTy, repVariantShapeRowOf, valueBoxOfTy } from "./emit_rep"
+import { structRowOfAnnTy } from "./emit_shape_rows"
+import {
+  sHeapIdx,
+  uVarRow,
+  unNames,
+  unTyIx,
+  variantHeap,
+  variantRowOf,
+} from "./emit_state"
+import { nodeTyInOf } from "./emit_ty_canon"
+import {
+  UNION_SPELLING_DECLINE,
+  unRowOfRecordTy,
+  unionSpellingOfTy,
+  valueUnionKeyTextOfTy,
+} from "./emit_union_atoms"
+import { unRowOfTyKey } from "./emit_union_tykey"
+import { nodeSrc } from "./symbols"
+import { tyHasTyVar } from "./tyquery"
+
+// The row a delivery of `exprIx` copies its record into (`recCopyTyOf`): a struct row, `-2 - vi`
+// for the variant row `vi` of an arm type, or -1 when the record is already built there or no
+// copy is recorded.
+export function recCopyRowAt(exprIx: i32, fnIx: i32): i32 {
+  const dst = recCopyTyOf(exprIx)
+  if dst < 0 { return -1 }
+  // A call copied back to its own record lands in that record's row, read off its function's
+  // build at `recCopyFromOf` (D15246).
+  if recCopyFromOf(exprIx) >= 0 {
+    let dsi = structIndexOfTy(dst)
+    if dsi < 0 { dsi = structRowOfAnnTy(dst, dst) }
+    if dsi < 0 || dsi >= sHeapIdx.length { return -1 }
+    return dsi
+  }
+  if !exprStruct(exprIx, fnIx) { return -1 }
+  let ssi = structIndexOfExpr(exprIx, fnIx)
+  // A record that is also a union's arm answers no struct row by expression; its type names one.
+  if ssi < 0 { ssi = copyArmRowOf(exprIx) }
+  if ssi < 0 || ssi >= sHeapIdx.length { return -1 }
+  const vi = repVariantShapeRowOf(dst)
+  if vi >= 0 && vi < uVarRow.length {
+    if variantHeap(vi) == sHeapIdx[ssi] { return -1 }
+    return -2 - vi
+  }
+  let dsi = structIndexOfTy(dst)
+  if dsi < 0 { dsi = structRowOfAnnTy(dst, dst) }
+  if dsi < 0 || dsi >= sHeapIdx.length || sHeapIdx[dsi] == sHeapIdx[ssi] {
+    return -1
+  }
+  return dsi
+}
+
+// The struct row of a copied call's own record when that record is also a union's arm, or -1.
+export function copyArmRowOf(exprIx: i32): i32 {
+  const own = nodeTyIxOf(exprIx)
+  const vi = if own >= 0 { repVariantShapeRowOf(own) } else { -1 }
+  if vi < 0 { return -1 }
+  const r = structRowOfAnnTy(own, own)
+  // An arm with no annotated row is laid out at its variant's own row.
+  return if r >= 0 { r } else { variantRowOf(vi) }
+}
+
+// The union the checker records value `ix` delivered into inside `fnIx`, closed at that instance
+// where the record still names its type parameters; -1 for none.
+export function boxRecordTyAt(ix: i32, fnIx: i32): i32 {
+  let r = boxDstTyAt(ix, fnIx)
+  if r < 0 { r = boxDstTyAt(unwrapParen(ix), fnIx) }
+  // A node a rewrite or mono copy minted reads the record of its source node.
+  if r < 0 { r = boxDstTyAt(nodeSrc[ix] ?? -1, fnIx) }
+  return instTyOrSelf(r, fnIx)
+}
+
+// The union recorded type `ty` boxes as: `i32 | null` for a nullable function set, whose value is
+// its member tag, else `ty`.
+export function boxRecordUnionTyOf(ty: i32): i32 {
+  if ty < 0 || unRowOfRecordTy(ty) >= 0 || !boxRecordIsTagSet(ty) { return ty }
+  return mkNullableTyOf(primTyIxOfName("i32"))
+}
+
+// Whether `ty` is a nullable function set whose value is its member tag.
+function boxRecordIsTagSet(ty: i32): boolean {
+  const d = tyAt(ty)
+  if d is TyNullable && d.nInner >= 0 && tyAt(d.nInner) is TyFunc {
+    return repOfTy(d.nInner).rdKind == "i32"
+  }
+  return false
+}
+
+// Whether `valIx` is boxed into a union at its delivery: its record is stored as a box and reaches
+// a registry row, or it is already a box of its own union (`emitUnionBoxAtRecord`'s rungs).
+export function boxOwedAtRecord(valIx: i32, fnIx: i32): boolean {
+  if boxOwedAt(valIx, fnIx) { return true }
+  // An already-boxed value is delivered as its own union only where no other coercion is
+  // recorded at it: a union of maps read as its one map unboxes (`mapUnbox`).
+  return exprUnion(valIx, fnIx)
+    && coerceKindAt(valIx, fnIx) == "none"
+    && boxTyName(nodeTyAt(valIx, fnIx)) != ""
+}
+
+// The registry name of the union `valIx` is boxed into at its delivery (`boxDstTyOf`); "" where
+// it is boxed into none.
+export function boxDstNameAt(valIx: i32, fnIx: i32): string {
+  return boxTyName(boxDstTyOf(valIx, fnIx))
+}
+
+// Whether recorded type `r` is stored as a box of a union its type names.
+function boxRecordOwed(r: i32): boolean {
+  return r >= 0
+    && repOfTy(r).rdKind == "union"
+    && boxTyName(boxRecordUnionTyOf(r)) != ""
+}
+
+// The union `valIx` is boxed into at its delivery: the type of the row its record names where it
+// is stored as a box, else, for a value already a box with no other coercion recorded, its own
+// union; -1 where it names none.
+export function boxDstTyOf(valIx: i32, fnIx: i32): i32 {
+  const r = boxRecordTyAt(valIx, fnIx)
+  if boxRecordOwed(r) {
+    const u = unRowOfRecordTy(r)
+    if u >= 0 && u < unTyIx.length && unTyIx[u] >= 0 { return unTyIx[u] }
+    return boxRecordUnionTyOf(r)
+  }
+  if exprUnion(valIx, fnIx) && coerceKindAt(valIx, fnIx) == "none" {
+    return unionBoxTyOfRead(valIx, fnIx)
+  }
+  return -1
+}
+
+// The union a box is built into, from its type `ty`: the row `ty` keys to, named as registered;
+// a value union keyed by no row, by its spelling. `name` only where `ty` gives neither.
+export function boxDstName(name: string, ty: i32): string {
+  if ty < 0 { return name }
+  const r = unRowOfTyKey(ty)
+  if r >= 0 { return unNames[r] }
+  const vt = valueUnionKeyTextOfTy(ty)
+  if vt != "" { return vt }
+  const sp = unionSpellingOfTy(ty, 8)
+  if sp != UNION_SPELLING_DECLINE && valueBoxOfTy(ty) { return sp }
+  return name
+}
+
+// The union a box of type `ty` is built into, by `boxDstName`'s rungs; "" where `ty` names none.
+export function boxTyName(ty: i32): string { return boxDstName("", ty) }
+
+// The node whose next emission the table unboxes to its recorded arm (`armOpen`), or -1.
+export let armSeat = -1
+
+// The union `unionNameOfExpr` names for a read of a box (`unionBoxStoreTyOf`), else the read's
+// own type.
+export function unionBoxTyOfRead(ix: i32, fnIx: i32): i32 {
+  const st = unionBoxStoreTyOf(ix, fnIx)
+  return if st >= 0 { st } else { nodeTyInOf(unwrapParen(ix), fnIx) }
+}
+
+// The list type the delivery of node `ix` copies its list into (`recordListCopy`), or the one
+// recorded at the node a rewrite or mono copy made `ix` from; -1 for none.
+export function listCopyAtNode(ix: i32): i32 {
+  const t = listCopyTyOf(ix)
+  if t >= 0 { return t }
+  const o = nodeSrc[ix] ?? -1
+  if o < 0 { return -1 }
+  return listCopyTyOf(o)
+}
+
+// The coercion a delivery's checker record owes at its node: a list copy into another
+// element's list, a tagged one-member set's closure at a declared function type, a union of maps
+// read as its one map, a union box retagged for a union lacking a member, a record copied
+// into another row, or a value boxed into the union the checker records it delivered into.
+export type CoerceKind = "none"
+  | "listCopy"
+  | "fnClo"
+  | "mapUnbox"
+  | "mapRetag"
+  | "recCopy"
+  | "box"
+  | "unbox"
+  | "atomstr"
+
+// The coercion recorded at `ix` in instance `fnIx`. A box is the outer one: any other record
+// at the node converts the value inside it. Otherwise each record is of one value type (a list,
+// a function, a union box, a record), so at most one holds; a union of maps is read first.
+export function coerceKindAt(ix: i32, fnIx: i32): CoerceKind {
+  if boxAtTable(ix, fnIx) { return "box" }
+  if armSeat >= 0 && ix == armSeat { return "unbox" }
+  if atomSeat >= 0 && ix == atomSeat { return "atomstr" }
+  if listCopyAtNode(ix) >= 0 { return "listCopy" }
+  if fnCloCoerceAtNode(ix) >= 0 { return "fnClo" }
+  if mapDeliveryRecorded {
+    if mapUnboxTyOf(ix) >= 0 { return "mapUnbox" }
+    if deliveryRetagHas(ix) { return "mapRetag" }
+  }
+  if recCopyRowAt(ix, fnIx) != -1 { return "recCopy" }
+  return "none"
+}
+
+// The node a delivery position hands the table (`emitDelivered`), or -1. A box is owed only
+// there: a node beneath it, or one a position emits for its own lowering, is emitted as built.
+export let boxSeat = -1
+
+// Whether the table boxes `ix`: it is the delivery seat and its record owes a box.
+function boxAtTable(ix: i32, fnIx: i32): boolean {
+  return boxSeat >= 0 && ix == boxSeat && boxOwedAt(ix, fnIx)
+}
+
+// Whether the checker records `ix` delivered into a union box a registry row names.
+export function boxOwedAt(ix: i32, fnIx: i32): boolean {
+  // A literal set or a nullable niche is no box, whatever row its union keys.
+  return boxRecordOwed(boxRecordTyAt(ix, fnIx))
+}
+
+// The closed function type the tag decision recorded at `ix`, or at the node `ix` stands in for
+// (`nodeSrc`), or -1.
+export function fnCloCoerceAtNode(ix: i32): i32 {
+  const t = fnCloCoerceTyOf(ix)
+  if t >= 0 { return t }
+  const o = nodeSrc[ix] ?? -1
+  if o < 0 { return -1 }
+  return fnCloCoerceTyOf(o)
+}
+
+// Type `t` at the instance `fnIx` emits, or `t` itself where that instance binds none of it.
+export function instTyOrSelf(t: i32, fnIx: i32): i32 {
+  if t < 0 || !tyHasTyVar(t) { return t }
+  const it = elabInstTyAt(t, fnIx)
+  if it >= 0 { return it }
+  return t
+}
+
+// The node whose next emission the table decodes to a string at its recorded set, or -1.
+export let atomSeat = -1

@@ -3,8 +3,10 @@
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+import { numUnionMinted } from "./check_union_mint"
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   BoolLit,
@@ -76,29 +78,18 @@ import {
   irLoweredEntry,
 } from "./ir_lower"
 import {
-  BinNulTest,
   GlobalCtx,
   HoleBox,
   IsArm,
   ObjLitArm,
   PrintArm,
   TagIsArm,
-  arrLitArmOf,
-  arrLitBuildOf,
-  arrLitRefPlainSlot,
   arrLitShort,
   atomEqPlanOf,
-  binNulTestOf,
+  atomStrPlanOf,
   binNumWidth,
-  boxOwedAt,
   callEndsNever,
   closureValueWhy,
-  coalArmOf,
-  coalNicheArmOf,
-  coalNulStrBlockPlain,
-  coalResultKindOf,
-  coalesceNulStrStaysNullable,
-  deadNullTestOperand,
   exprPrePathWhy,
   fnValueArmOf,
   fnValueFeOf,
@@ -108,9 +99,7 @@ import {
   holeBoxPlanOf,
   holeBoxTyAt,
   identReadArmOf,
-  identReadIsList,
   idxStorePlainWhy,
-  idxStorePlanOf,
   ifExprPlainKind,
   ifWritesElse,
   isArmOf,
@@ -121,7 +110,6 @@ import {
   isTestsStorage,
   isVariantTagPlain,
   keptDeclStoresNothing,
-  listReserveScan,
   lowMemFoldsCallee,
   mapGetOrHelperRoute,
   mapKeyArmOf,
@@ -131,13 +119,11 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
-  narrowedArmNeedsUnbox,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
-  nulNoneEqSides,
-  nulTestArmOf,
-  nullOwnIsAtom,
-  nullOwnIsStr,
+  njDispatches,
+  numCastKindOf,
+  numCastKindTy,
   numIntrCallReached,
   numIntrPlanOf,
   numLitAsApplies,
@@ -145,11 +131,8 @@ import {
   objLitArmOf,
   objLitLayoutRowOf,
   objLitVariantLayoutOf,
-  popPlanOf,
-  popStmtPlainWhy,
   printArmOf,
   pushPlainWhy,
-  pushPlanOf,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
@@ -162,6 +145,34 @@ import {
   variantFieldArmOf,
   widenPlanOf,
 } from "./wasmEmit"
+import { arrLitRefPlainSlot } from "./emit_plan_list"
+import { narrowedArmNeedsUnbox } from "./emit_plan_union"
+import {
+  BinNulTest,
+  NULL_OWN_ATOM,
+  NULL_OWN_STR,
+  binNulTestOf,
+  coalArmOf,
+  coalNicheArmOf,
+  coalNulRefArmOf,
+  coalResultKindOf,
+  coalesceNulStrStaysNullable,
+  deadNullTestOperand,
+  nulNoneEqSides,
+  nulTestArmOf,
+  nullOwnAt,
+} from "./emit_plan_null"
+import { boxOwedAt } from "./emit_plan_coerce"
+import {
+  arrLitArmOf,
+  arrLitListBuild,
+  identReadIsList,
+  idxStorePlanOf,
+  listReserveScan,
+  popPlanOf,
+  popStmtPlainWhy,
+  pushPlanOf,
+} from "./emit_plan_list"
 import {
   RAtom,
   RBox,
@@ -177,18 +188,29 @@ import {
   repRecordKidOf,
   repTyOf,
 } from "./emit_rep"
-import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
+import {
+  ctxTyAt,
+  fnEnvIdxOf,
+  nodeTyAt,
+  numLitWidth,
+  scopeTyAt,
+} from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
-import { nulNicheRecoverOwed } from "./emit_value_sites"
+import {
+  narrowedNulLitPinBoxKey,
+  nulNicheRecoverOwed,
+} from "./emit_value_sites"
 import {
   declaredIndexAt,
   envSlotShift,
+  exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
   fnIndexOfNode,
   globalCellKind,
   localIndexOf,
+  nulLitAtomTexts,
   sFieldStoreKind,
 } from "./emit_classify"
 import { declaredSlotOfDecl } from "./emit_struct_order"
@@ -222,7 +244,13 @@ import { memOffsetLexValue } from "./check_intrinsics"
 import { charLitCp, objFieldVal, unwrapParen } from "./emit_base"
 import { ifArmValueExpr } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
-import { f32Bytes, f64Bytes, numLexIsFloat } from "./emit_bignum"
+import {
+  f32Bytes,
+  f64Bytes,
+  numLexIsFloat,
+  parseI32,
+  parseI64Pair,
+} from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
@@ -931,9 +959,24 @@ function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
   }
   if numLexIsFloat(n.numText) { return irBMiss("float literal at an integer") }
   const v = memOffsetLexValue(n.numText)
-  if v < 0 || k == "i32" && v > 2147483647 { return irBMiss("wide literal") }
-  const o: Opnd = { oiRep: rep, oiBits: v }
-  return o
+  if v >= 0 && (k != "i32" || v <= 2147483647) {
+    const o: Opnd = { oiRep: rep, oiBits: v }
+    return o
+  }
+  // Past the narrow reading, the bits legacy's literal writer spells at its own width: the lexeme
+  // split into halves at `i64`, wrapped at `i32` (`emitNumLexAt`).
+  if numLitWidth(ix, ibFnIx) != k { return irBMiss("wide literal width") }
+  let bits: i64 = 0
+  if k == "i64" {
+    const pr = parseI64Pair(n.numText)
+    bits = ((pr[0] as i64) << 32) | ((pr[1] as i64) & 4294967295)
+  } else if k == "i32" {
+    bits = parseI32(n.numText) as i64
+  } else {
+    return irBMiss("wide literal")
+  }
+  const w: Opnd = { oiRep: rep, oiBits: bits }
+  return w
 }
 
 function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
@@ -1277,11 +1320,18 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   const arm = printArmOf(c.callArgs[0], ibFnIx)
   const want = printArmRep(arm)
   if want == "" { return skip("print " + arm) }
+  // A `K | null` read out of a wider box converts to the niche first, which the IR does not build.
+  if arm == "nulAtom" && narrowedNulLitPinBoxKey(c.callArgs[0], ibFnIx) != "" {
+    return skip("print nulAtom from a box")
+  }
   const v = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return 0 }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
-  const ok = if want == "nulStr" { strNullable(vr) } else { p != null && p == want }
+  let ok = p != null && p == want
+  if want == "nulStr" { ok = strNullable(vr) }
+  if want == "atom" { ok = repNodeAt(vr) is RAtom }
+  if want == "nulAtom" { ok = atomNullable(vr) }
   if !ok { return skip("print operand rep") }
   irBNode(b, { efRhs: { pnV: v, pnAt: ix } }, -1, ibNoValue, ix)
   return 0
@@ -1297,7 +1347,9 @@ function printArmRep(arm: PrintArm): string {
     "bool" => "bool"
     "i32" => "i32"
     "nulStr" => "nulStr"
-    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulAtom" | "atom" | "nulBool" | "union" | "unrenderable" => ""
+    "atom" => "atom"
+    "nulAtom" => "nulAtom"
+    "nulNone" | "nulRefNiche" | "boxNull" | "mapScalar" | "nulLitPin" | "nulBool" | "union" | "unrenderable" => ""
   }
 }
 
@@ -1446,14 +1498,13 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
-  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`emitNullAt`):
+  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`nullOwnAt`):
   // the sentinel, or the string's typed null ref.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
-    if (
-      atomNullable(dst) && nullOwnIsAtom(ix, ibFnIx)
-      || strNullable(dst) && nullOwnIsStr(ix, ibFnIx)
-    ) {
-      return repTemp(b, { nuAt: ix }, ix, dst)
+    const atom = atomNullable(dst)
+    const own = if atom || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
+    if own == (if atom { NULL_OWN_ATOM } else { NULL_OWN_STR }) {
+      return repTemp(b, { nuAt: ix, nuOwn: own }, ix, dst)
     }
   }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
@@ -1523,6 +1574,19 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   ) {
     if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
   }
+  // An atom at a string, or its `K | null` at a `string | null`, is legacy's atom decode.
+  const sr = irBOpRep(v)
+  if (
+    repNodeAt(sr) is RAtom && (repPrim(dst) == "str" || strNullable(dst))
+    || atomNullable(sr) && strNullable(dst)
+  ) {
+    if !exprIsLitAtom(ix, ibFnIx) { return irBMiss("atom string source") }
+    // The decode's `null` comes from the plan, which the verifier cannot see.
+    if atomStrPlanOf(ix, ibFnIx, false).apNul && !strNullable(dst) {
+      return irBMiss("atom decode nullable into a non-null string")
+    }
+    return repTemp(b, { sxV: v, sxAt: ix }, ix, dst)
+  }
   const sk = numKindOf(irBOpRep(v))
   const dk = numKindOf(dst)
   if sk < 0 || dk < 3 { return v }
@@ -1582,8 +1646,8 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 
 // Whether operand `ix` is typed at a literal union delivered as an interned atom.
 // An `==`/`!=` with an atom operand, by legacy's own arm (`atomEqPlanOf`). A side typed as one
-// string literal is written by legacy's literal writer (an unread immediate here); only a `StrLit`
-// spelling is taken, since anything else it would evaluate with legacy's expression writer.
+// string literal is its member's id: a `StrLit` spelling is an unread immediate here, anything
+// else is built and dropped by the lowering, in source order.
 function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const p = atomEqPlanOf(n, ibFnIx)
   const ne = n.binOp == "!="
@@ -1592,15 +1656,16 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if p.aqArm == "fold" { return irBMiss("atom compare fold") }
   if p.aqArm == "static" {
     const sIx = if p.aqStaticLeft { n.binLeft } else { n.binRight }
-    if !(nodeAt(unwrapParen(sIx)) is StrLit) {
-      return irBMiss("atom compare static operand")
-    }
     const aIx = if p.aqStaticLeft { n.binRight } else { n.binLeft }
+    const sl = if p.aqStaticLeft { staticSideOf(b, sIx) } else { none }
+    if ibMiss != "" { return sl }
     const a = atomSide(b, aIx)
     if ibMiss != "" { return a }
+    const sr = if p.aqStaticLeft { none } else { staticSideOf(b, sIx) }
+    if ibMiss != "" { return sr }
     const st = if p.aqStaticLeft { 1 } else { 2 }
-    const l = if p.aqStaticLeft { none } else { a }
-    const r = if p.aqStaticLeft { a } else { none }
+    const l = if p.aqStaticLeft { sl } else { a }
+    const r = if p.aqStaticLeft { a } else { sr }
     return irBLetTemp(
       b,
       { aeL: l, aeR: r, aeStatic: st, aeNe: ne, aeAt: ix },
@@ -1621,6 +1686,19 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   )
 }
 
+// The operand of static side `ix`: the unread immediate of a `StrLit`, else its value, which the
+// lowering drops.
+function staticSideOf(b: i32[], ix: i32): Opnd {
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if nodeAt(unwrapParen(ix)) is StrLit { return none }
+  const v = irBExpr(b, ix)
+  if ibMiss != "" { return v }
+  if v is OImm || irBOpRep(v) == ibNoValue {
+    return irBMiss("atom compare static operand")
+  }
+  return v
+}
+
 // The value of atom operand `ix`, which must build at an atom rep or its `K | null`.
 function atomSide(b: i32[], ix: i32): Opnd {
   const v = irBExpr(b, ix)
@@ -1637,9 +1715,10 @@ function atomOperand(ix: i32): boolean {
   return repNodeAt(r) is RAtom || atomNullable(r)
 }
 
-// A `==`/`!=` against a `null` literal, by legacy's own route: no dead test and no `null`-typed
-// pair (`deadNullTestOperand`, `nulNoneEqSides`), then the null test's arm (`nulTestArmOf`) with
-// the direction the dispatch hands it. Only a `K | null`'s sentinel compare is built.
+// A `==`/`!=` against a `null` literal, by legacy's own route: a dead test is its constant
+// (`deadNulTest`); a `null`-typed pair (`nulNoneEqSides`) misses; then the null test's arm
+// (`nulTestArmOf`) with the direction the dispatch hands it. Only a `K | null`'s sentinel compare
+// and a string's typed null test are built.
 function nulTest(
   b: i32[],
   n: BinExpr,
@@ -1647,7 +1726,8 @@ function nulTest(
   ix: i32,
   rep: i32,
 ): Opnd {
-  if deadNullTestOperand(n, ibFnIx) >= 0 { return irBMiss("null test dead") }
+  const dn = deadNullTestOperand(n, ibFnIx)
+  if dn >= 0 { return deadNulTest(b, n, dn, ix, rep) }
   if nulNoneEqSides(n.binLeft, n.binRight, ibFnIx) {
     return irBMiss("null test of null")
   }
@@ -1664,11 +1744,28 @@ function nulTest(
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
 }
 
+// A null test the checker proved dead (`deadNullTestOperand`), as legacy's `emitDeadNullTest`
+// writes it: the operand for its effects and dropped, unless it is a bare name, then the constant.
+// A numeric union's per-member compare takes the node first in legacy (`njDispatches`).
+function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
+  if numUnionMinted && njDispatches(n, ibFnIx) {
+    return irBMiss("null test numeric union")
+  }
+  if !(nodeAt(opIx) is Ident) {
+    const v = irBExpr(b, opIx)
+    if ibMiss != "" { return v }
+    irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  }
+  const bits: i64 = if n.binOp == "!=" { 1 } else { 0 }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
+  return o
+}
+
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32,
-// string or plain ref list, each element delivered at the list's element rep. Every other arm is a
-// named miss.
+// string, packed or plain ref list, each element delivered at the list's element rep. Every other
+// arm is a named miss.
 function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
-  const lb = arrLitBuildOf(ix, ibFnIx)
+  const lb = arrLitListBuild(ix, ibFnIx)
   const arm = arrLitArmOf(ix, ibFnIx, lb)
   // A ref list builds along `emitArrRef`'s plain arm (`arrLitRefPlainSlot`) or not at all.
   if arm == "ref" && arrLitRefPlainSlot(ix, ibFnIx, lb) < 0 {
@@ -1681,6 +1778,7 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     && arm != "f32"
     && arm != "str"
     && arm != "ref"
+    && arm != "u8"
   ) {
     return irBMiss("array " + arm)
   }
@@ -1689,7 +1787,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   }
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array rep") }
-  const er = ln.rlsElem
+  // A packed list's elements are built as plain i32s, which its backing truncates.
+  const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   for e in n.arrElems {
     const v = deliver(b, e, er)
@@ -1709,14 +1808,15 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return mapGetOr(b, n, ix, rep)
 }
 
-// `l ?? d` over a `string | null` along legacy's plain block (`coalNulStrBlockPlain`), its default
+// `l ?? d` over a `string | null` along legacy's plain block (`coalNulRefArmOf`), its default
 // a string literal and its result the block's own rep. Every other niche arm is a named miss.
 function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("coalesce operand") }
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
+  if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
-  if !coalNulStrBlockPlain(n, ix, ibFnIx) {
+  if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
   }
   const dIx = unwrapParen(n.binRight)
@@ -1733,6 +1833,35 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return d }
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
+// plain string literal, which the null branch writes as itself.
+function coalAtomStr(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const dIx = unwrapParen(n.binRight)
+  if dIx < 0 || !(nodeAt(dIx) is StrLit) || exprIsLitAtom(dIx, ibFnIx) {
+    return irBMiss("coalesce atom default")
+  }
+  if nulLitAtomTexts(lhsIx, ibFnIx).length == 0 {
+    return irBMiss("coalesce atom members")
+  }
+  if repPrim(rep) != "str" { return irBMiss("coalesce result rep") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !atomNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const d = irBExpr(b, n.binRight)
+  if ibMiss != "" { return d }
+  if !(d is OStr) || irBOpRep(d) != rep {
+    return irBMiss("coalesce atom default")
+  }
+  const r: Rhs = { zaL: l, zaD: d, zaAt: ix }
   return irBLetTemp(b, r, ix, rep)
 }
 
@@ -1931,16 +2060,42 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   }
   if n is IsExpr { return boxTest(b, n, ix, rep) }
   if n is IfStmt { return ifExpr(b, n, ix, rep) }
+  if n is AsExpr { return numCast(b, n, ix, rep) }
   if n is ObjLit { return objLit(b, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
+}
+
+// A numeric `as` whose arm legacy writes as its operand at one kind then a tail
+// (`numCastKindOf`): the operand is built and widened to that kind as `emitExprAsKind` builds it.
+function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const k = numCastKindOf(ix, ibFnIx)
+  if k < 0 { return irBMiss("expression as") }
+  const ow = operandWhy(n.asObj)
+  if ow != "" { return irBMiss(ow) }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  const dst = if k == 0 { irBOpRep(v) } else { repNodeOfTy(numCastKindTy(k)) }
+  if k != 0 {
+    const p = widenPlanOf(n.asObj, k, ibFnIx)
+    if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
+  }
+  const o = widenTo(b, v, n.asObj, dst)
+  if ibMiss != "" { return o }
+  if irBOpRep(o) != dst || !repIsScalar(dst) {
+    return irBMiss("as operand coercion")
+  }
+  return irBLetTemp(b, { ncV: o, ncAt: ix }, ix, rep)
 }
 
 // A string literal at the `str` rep, or delivered as its destination's interned atom.
 function strLit(ix: i32, rep: i32): Opnd {
   if strLitTakesAtom(ix, ibFnIx) {
     const ar = repNodeOfTy(ctxTyAt(ix, ibFnIx))
-    if !(repNodeAt(ar) is RAtom) { return irBMiss("string atom") }
-    const a: Opnd = { osAt: ix, osRep: ar }
+    // At a `K | null` the literal is its member's id, which the niche holds as is (`RRetag`).
+    const an = repNodeAt(ar)
+    const at = if an is RNullable && an.rnDisc == 3 { an.rnInner } else { ar }
+    if !(repNodeAt(at) is RAtom) { return irBMiss("string atom") }
+    const a: Opnd = { osAt: ix, osRep: at }
     return a
   }
   if repPrim(rep) != "str" { return irBMiss("string literal rep") }
@@ -2019,25 +2174,11 @@ function loopIx(label: string): i32 {
   return -1
 }
 
-// The label a plain walk holds on the loop stack: legacy's loop owns its branches, so none
-// the IR builds may target it or cross it.
-const WALK_LABEL = -2
-
-// Whether a branch to loop stack entry `l` targets a walk or crosses one.
-function crossesWalk(l: i32): boolean {
-  let i = l
-  while i < ibLoopBrk.length {
-    if ibLoopBrk[i] == WALK_LABEL { return true }
-    i = i + 1
-  }
-  return false
-}
-
-// A `for` statement along legacy's plain walk (`forInPlainWhy`): the list once, its element
-// variable at the declared slot, and the body. Every other walk is a named miss.
+// A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
+// once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
   const why = forInPlainWhy(n, ix, ibFnIx)
-  if why != "" { return skip("for in " + why) }
+  if why != "" && why != "hoisted" { return skip("for in " + why) }
   const l = irBExpr(b, n.fiIter)
   if ibMiss != "" { return 0 }
   // A list walks its elements; a string its code points, each an i32.
@@ -2050,9 +2191,11 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if er < 0 { return skip("for in operand coercion") }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
+  const brk = labelNew()
+  const cont = labelNew()
   ibLoopName.push(n.fiLabel)
-  ibLoopBrk.push(WALK_LABEL)
-  ibLoopCont.push(WALK_LABEL)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(cont)
   const fb: i32[] = []
   const body = nodeAt(n.fiBody)
   if body is Block {
@@ -2064,7 +2207,13 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   ibLoopBrk.pop()
   ibLoopCont.pop()
   if ibMiss != "" { return 0 }
-  irBNode(b, { xfList: l, xfVar: v, xfBody: fb, xfAt: ix }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { xfList: l, xfVar: v, xfBody: fb, xfAt: ix, xfBrk: brk, xfCont: cont },
+    -1,
+    ibNoValue,
+    ix,
+  )
   return 0
 }
 
@@ -2241,7 +2390,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
     if l < 0 || n.brkHasVal != 0 { return skip("break") }
-    if crossesWalk(l) { return skip("for in break") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,
@@ -2255,7 +2403,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is ContinueStmt {
     const l = loopIx(n.contLabel)
     if l < 0 { return skip("continue") }
-    if crossesWalk(l) { return skip("for in continue") }
     const z: Opnd = { ov: -1 }
     irBNode(
       b,

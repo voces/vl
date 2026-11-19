@@ -15,6 +15,7 @@ import {
   OVar,
   Opnd,
   RAtomEq,
+  RAtomStr,
   RBoxField,
   RBoxNarrow,
   RCall,
@@ -23,6 +24,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RCoalAtomStr,
   RCoalStr,
   RFnId,
   RGetField,
@@ -42,6 +44,7 @@ import {
   RMapSet,
   RNulTest,
   RNullOf,
+  RNumCast,
   RNumIntr,
   RNumWiden,
   RPrimOp,
@@ -80,6 +83,7 @@ import {
   irSigOf,
 } from "./ir"
 import {
+  RAtom,
   RBox,
   RClosure,
   RList,
@@ -474,6 +478,25 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RAtomStr => {
+      use(r.sxV, at)
+      // An atom decodes to a string, which a `string | null` also holds; only a `K | null`
+      // carries the null its destination must hold.
+      const s = repNodeAt(opRep(r.sxV))
+      const d = repNodeAt(dst)
+      const nulSrc = s is RNullable
+        && s.rnDisc == 3
+        && repNodeAt(s.rnInner) is RAtom
+      const nulDst = d is RNullable && d.rnDisc == 1 && d.rnInner == vfStr
+      if (
+        !(s is RAtom || nulSrc)
+        || !(dst == vfStr || nulDst)
+        || nulSrc && !nulDst
+      ) {
+        return fail(2, at, "an atom decode is not of an atom into a string")
+      }
+      0
+    }
     RNullOf => {
       const d = repNodeAt(dst)
       if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
@@ -498,15 +521,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RAtomEq => {
-      // A static side is written by legacy's literal writer, so its operand is an unread immediate.
-      if r.aeStatic != 1 { use(r.aeL, at) }
-      if r.aeStatic != 2 { use(r.aeR, at) }
-      if (
-        r.aeStatic == 1 && !(r.aeL is OImm)
-        || r.aeStatic == 2 && !(r.aeR is OImm)
-      ) {
-        return fail(2, at, "an atom compare's static side is not an immediate")
-      }
+      // A static side's immediate is unread; any other static operand is evaluated and dropped.
+      if !(r.aeStatic == 1 && r.aeL is OImm) { use(r.aeL, at) }
+      if !(r.aeStatic == 2 && r.aeR is OImm) { use(r.aeR, at) }
       0
     }
     RUnionEq => {
@@ -566,6 +583,26 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMapOp => uses(r.mpArgs, at)
+    RCoalAtomStr => {
+      use(r.zaL, at)
+      use(r.zaD, at)
+      const l = repNodeAt(opRep(r.zaL))
+      if (
+        !(l is RNullable)
+        || l.rnDisc != 3
+        || !(repNodeAt(l.rnInner) is RAtom)
+      ) {
+        return fail(2, at, "an atom coalesce of a non-`K | null`")
+      }
+      if !(r.zaD is OStr) || opRep(r.zaD) != vfStr || dst != vfStr {
+        return fail(
+          2,
+          at,
+          "an atom coalesce's default and result are not strings",
+        )
+      }
+      0
+    }
     RCoalStr => {
       use(r.czL, at)
       use(r.czD, at)
@@ -590,6 +627,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           at,
           "a string coalesce yields a string or a string | null",
         )
+      }
+      0
+    }
+    RNumCast => {
+      use(r.ncV, at)
+      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) {
+        return fail(2, at, "a numeric cast is between scalars")
       }
       0
     }
@@ -985,7 +1029,11 @@ function stmt(id: i32) {
           "a walk's variable is not a local of its element rep",
         )
       }
-      nested(n.xfBody)
+      vfLabels.push(n.xfBrk)
+      vfLabelOut.push(-1)
+      labelled(n.xfCont, -1, n.xfBody)
+      vfLabels.pop()
+      vfLabelOut.pop()
     }
     SIf => ifSpine(id)
     SSwitch => switchCheck(n, id)
@@ -1121,7 +1169,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapNew | RMapSet | RMapGetOr | RPrint | RNumIntr | RCoalStr | RStrOp | RNumWiden | RToBox | RRetag | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapNew | RMapSet | RMapGetOr | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
   }
 }
 
