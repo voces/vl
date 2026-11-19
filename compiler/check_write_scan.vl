@@ -3946,13 +3946,89 @@ function cwLoopVarReadTyped(lp: i32): boolean {
 
 // The first annotated `let` the `for` loop at `lp` reads its element variable into whole, or -1.
 export function cwLoopVarTypedLet(lp: i32): i32 {
+  return cwLoopSlotTypedLet(lp, 0)
+}
+
+// The first annotated `let` the `for` loop at `lp` reads its first (`slot` 0) or second loop
+// variable into whole, or -1.
+function cwLoopSlotTypedLet(lp: i32, slot: i32): i32 {
   if lp < 0 || lp >= P.nodes.length { return -1 }
   const l = nodeAt(lp)
-  if !(l is ForIn) || l.fiVar == "" { return -1 }
-  const r = cwNameReadTypedUnder(l.fiBody, l.fiVar)
+  if !(l is ForIn) { return -1 }
+  const name = if slot == 0 { l.fiVar } else { l.fiVar2 }
+  if name == "" { return -1 }
+  const r = cwNameReadTypedUnder(l.fiBody, name)
   if r < 0 || r >= cwIxParent.length { return -1 }
   const q = cwIxParent[r]
   return if q >= 0 && q < P.nodes.length && nodeAt(q) is LetDecl { q } else { -1 }
+}
+
+// The first annotated `let` a read of map or set binding `bd`'s keys (`slot` 0) or values
+// (`slot` 1) is delivered whole to, or -1: a loop variable over it, over its `keys()` or
+// `values()`, or a `m[k] ?? d` / `m.get(k) ?? d` initializer. The first such `let` fixes the type.
+export function cwMapReadTypedLet(bd: i32, slot: i32): i32 {
+  if bd < 0 || bd >= P.nodes.length || !(nodeAt(bd) is LetDecl) { return -1 }
+  let first = -1
+  const ow = cwOccWalk(bd)
+  while cwOccNext(ow) {
+    const r = ow.row
+    const u = cwIxNode[r]
+    if cwIxKind[r] == CW_OCC_USE && u >= 0 && u < cwIxParent.length {
+      const d = cwMapUseTypedLet(u, slot)
+      if d >= 0 && (first < 0 || d < first) { first = d }
+    }
+  }
+  return first
+}
+
+// `cwMapReadTypedLet` for one use `u` of the binding.
+function cwMapUseTypedLet(u: i32, slot: i32): i32 {
+  if u < 0 || u >= cwIxParent.length || u >= cwIxUpKind.length { return -1 }
+  const p = cwIxParent[u]
+  if p < 0 || p >= P.nodes.length { return -1 }
+  if cwIxUpKind[u] == CW_UP_ITER { return cwLoopSlotTypedLet(p, slot) }
+  const pn = nodeAt(p)
+  if pn is Member && pn.memObj == u {
+    return cwMapMethodTypedLet(p, pn.memProp, slot)
+  }
+  return cwMapIndexTypedLet(p, u, slot)
+}
+
+// The typed `let` a value read `m[k] ?? d` at parent `p` of use `u` reaches; any other parent
+// reads no key or value whole, and answers -1.
+function cwMapIndexTypedLet(p: i32, u: i32, slot: i32): i32 {
+  const pn = nodeAt(p)
+  if pn is Index && pn.idxArr == u && slot == 1 { return cwCoalTypedLet(p) }
+  return -1
+}
+
+// The typed `let` a `keys()`, `values()` or `get(k)` call through member `mem` reaches, or -1.
+function cwMapMethodTypedLet(mem: i32, prop: string, slot: i32): i32 {
+  if mem >= cwIxParent.length { return -1 }
+  const c = cwIxParent[mem]
+  if c < 0 || c >= P.nodes.length || c >= cwIxParent.length { return -1 }
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn != mem { return -1 }
+  if prop == "get" { return if slot == 1 { cwCoalTypedLet(c) } else { -1 } }
+  const lp = cwIxParent[c]
+  if lp < 0 || lp >= P.nodes.length { return -1 }
+  const ln = nodeAt(lp)
+  if !(ln is ForIn) || ln.fiIter != c { return -1 }
+  const want = if prop == "keys" { 0 } else if prop == "values" { 1 } else { -1 }
+  return if want == slot { cwLoopSlotTypedLet(lp, 0) } else { -1 }
+}
+
+// The annotated `let` whose whole initializer is `x ?? d`, or -1.
+function cwCoalTypedLet(x: i32): i32 {
+  if x >= cwIxParent.length { return -1 }
+  const q = cwIxParent[x]
+  if q < 0 || q >= P.nodes.length || q >= cwIxParent.length { return -1 }
+  const qn = nodeAt(q)
+  if !(qn is BinExpr) || qn.binOp != "??" || qn.binLeft != x { return -1 }
+  const d = cwIxParent[q]
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  return if dn is LetDecl && dn.letType >= 0 && dn.letInit == q { d } else { -1 }
 }
 
 // The first read of `name` under `ix` delivered whole to a typed destination, or -1.
