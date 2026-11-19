@@ -41100,6 +41100,35 @@ function emitBinExprInRegion(e: BinExpr, exprIx: i32, fnIx: i32) {
   return rc
 }
 
+// How assignment `asgIx` yields its value, in the order legacy tries them: its literal built at its
+// width, the `null` it writes, a re-read of its target, the cell or box its store parks, a
+// non-null cell re-read or parked, a record its wider row extends, or "none".
+export type AsgValueArm = "lit"
+  | "nullLit"
+  | "reRead"
+  | "parked"
+  | "nonNullRead"
+  | "nonNullPark"
+  | "boxedArm"
+  | "widerRow"
+  | "none"
+
+export function asgValueArmOf(asgIx: i32, fnIx: i32): AsgValueArm {
+  if asgLitWidth(unwrapParen(asgIx), fnIx) != "" { return "lit" }
+  if asgYieldsNullLit(asgIx) { return "nullLit" }
+  // A byte-list cell holds the low byte, so its re-read is not the value; its store parks it.
+  if !asgIsByteElem(asgIx, fnIx) && assignTargetReReads(asgIx, fnIx) {
+    return "reRead"
+  }
+  if asgYieldsParkedCell(asgIx, fnIx) { return "parked" }
+  const nnc = asgNonNullCell(asgIx, fnIx)
+  if nnc == 1 { return "nonNullRead" }
+  if nnc == 2 { return "nonNullPark" }
+  if asgYieldsBoxedArm(asgIx, fnIx) { return "boxedArm" }
+  if asgNameWiderRow(asgIx, fnIx) >= 0 { return "widerRow" }
+  return "none"
+}
+
 // Store the assignment at `asgIx` and re-read its target cell, then apply `unwidenOp` (an
 // opcode, or -1 for none) to take the cell's rep back to the value's (D2512).
 function emitAsgValue(asgIx: i32, fnIx: i32, unwidenOp: i32): i32 {
@@ -41115,6 +41144,82 @@ function emitAsgValue(asgIx: i32, fnIx: i32, unwidenOp: i32): i32 {
   initGuardOff = savedGuardOff
   if asgRc >= 0 && unwidenOp >= 0 { wU8(unwidenOp) }
   return asgRc
+}
+
+// Assignment `exprIx` as a value, on its arm (`asgValueArmOf`).
+function emitAsgValueOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  return match asgValueArmOf(exprIx, fnIx) {
+    "lit" => emitAsgLitAs(exprIx, asgLitWidth(exprIx, fnIx), fnIx)
+    "nullLit" => {
+      if emitAssign(exprIx, fnIx) < 0 { return -1 }
+      emitExpr(e.binRight, fnIx)
+    }
+    "reRead" => emitAsgValue(exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
+    "parked" => {
+      const savedWant = asgParkWanted
+      asgParkWanted = true
+      const pRc = emitAssign(exprIx, fnIx)
+      asgParkWanted = savedWant
+      if pRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      if asgParkedRef && !tyBearsNull(nodeTyAt(exprIx, fnIx)) {
+        fbRefAsNonNull()
+      }
+      const pOp = asgReadUnwidenOp(exprIx, fnIx)
+      if pOp >= 0 { wU8(pOp) }
+      0
+    }
+    "nonNullRead" => {
+      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
+      fbRefAsNonNull()
+      0
+    }
+    "nonNullPark" => {
+      const nnWant = asgParkWanted
+      asgParkWanted = true
+      const nnRc = emitAssign(exprIx, fnIx)
+      asgParkWanted = nnWant
+      if nnRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      fbRefAsNonNull()
+      0
+    }
+    "boxedArm" => {
+      const savedWant = asgParkWanted
+      asgParkWanted = true
+      const bRc = emitAssign(exprIx, fnIx)
+      asgParkWanted = savedWant
+      if bRc < 0 { return -1 }
+      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft || !asgParkedRef {
+        return emitFail(
+          "emitProgram: an assignment used as a value stores a box no local can hold its value from",
+        )
+      }
+      fbLocalGet(asgParkedSlot)
+      fbRefAsNonNull()
+      emitUnionUnboxTail(boxTagOfTy(nodeTyAt(exprIx, fnIx)))
+    }
+    // A name whose record the right side's wider record extends by its row's `sub` chain stores
+    // that record itself, so the re-read cast back to its row is the value (D16105).
+    "widerRow" => {
+      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
+      fbRefCast(sHeapIdx[asgNameWiderRow(exprIx, fnIx)])
+      0
+    }
+    "none" => emitFail(
+      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
+    )
+  }
 }
 
 // Emit the assignment at `exprIx`, whose right side is built at the wide primitive `wp`
@@ -41233,83 +41338,7 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
     // assignment-as-expression), lowered as store-then-re-read — `emitAssign` stores, then
     // the target re-reads through the Ident path (a local or module global). The functype
     // reads the checker's type of the assignment; D29 is the `string | null` half.
-    const asgLit = emitAsgLitAs(exprIx, asgLitWidth(exprIx, fnIx), fnIx)
-    if asgLit != -2 { return asgLit }
-    if asgYieldsNullLit(exprIx) {
-      if emitAssign(exprIx, fnIx) < 0 { return -1 }
-      return emitExpr(e.binRight, fnIx)
-    }
-    // A byte-list cell holds the low byte, so its re-read is not the right-hand side the
-    // assignment yields; the value its store parks is.
-    if !asgIsByteElem(exprIx, fnIx) && assignTargetReReads(exprIx, fnIx) {
-      return emitAsgValue(exprIx, fnIx, asgReadUnwidenOp(exprIx, fnIx))
-    }
-    if asgYieldsParkedCell(exprIx, fnIx) {
-      const savedWant = asgParkWanted
-      asgParkWanted = true
-      const pRc = emitAssign(exprIx, fnIx)
-      asgParkWanted = savedWant
-      if pRc < 0 { return -1 }
-      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
-        return emitFail(
-          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
-        )
-      }
-      fbLocalGet(asgParkedSlot)
-      if asgParkedRef && !tyBearsNull(nodeTyAt(exprIx, fnIx)) {
-        fbRefAsNonNull()
-      }
-      const pOp = asgReadUnwidenOp(exprIx, fnIx)
-      if pOp >= 0 { wU8(pOp) }
-      return 0
-    }
-    const nnc = asgNonNullCell(exprIx, fnIx)
-    if nnc == 1 {
-      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
-      fbRefAsNonNull()
-      return 0
-    }
-    if nnc == 2 {
-      const nnWant = asgParkWanted
-      asgParkWanted = true
-      const nnRc = emitAssign(exprIx, fnIx)
-      asgParkWanted = nnWant
-      if nnRc < 0 { return -1 }
-      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft {
-        return emitFail(
-          "emitProgram: an assignment used as a value stores a cell no local can hold its value from",
-        )
-      }
-      fbLocalGet(asgParkedSlot)
-      fbRefAsNonNull()
-      return 0
-    }
-    if asgYieldsBoxedArm(exprIx, fnIx) {
-      const savedWant = asgParkWanted
-      asgParkWanted = true
-      const bRc = emitAssign(exprIx, fnIx)
-      asgParkWanted = savedWant
-      if bRc < 0 { return -1 }
-      if asgParkedSlot < 0 || asgParkedOwner != e.binLeft || !asgParkedRef {
-        return emitFail(
-          "emitProgram: an assignment used as a value stores a box no local can hold its value from",
-        )
-      }
-      fbLocalGet(asgParkedSlot)
-      fbRefAsNonNull()
-      return emitUnionUnboxTail(boxTagOfTy(nodeTyAt(exprIx, fnIx)))
-    }
-    // A name whose record the right side's wider record extends by its row's `sub` chain stores
-    // that record itself, so the re-read cast back to its row is the value (D16105).
-    const wsr = asgNameWiderRow(exprIx, fnIx)
-    if wsr >= 0 {
-      if emitAsgValue(exprIx, fnIx, -1) < 0 { return -1 }
-      fbRefCast(sHeapIdx[wsr])
-      return 0
-    }
-    return emitFail(
-      "emitProgram: an assignment used as a value whose type is not its target's has no value lowering",
-    )
+    return emitAsgValueOf(e, exprIx, fnIx)
   }
   // G8: nullish-coalescing `m[k] ?? d` — a FUSED map get-with-default: scan `m` for
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
