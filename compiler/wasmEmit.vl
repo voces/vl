@@ -8332,7 +8332,8 @@ export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   const vi = exprVariantIndex(m.memObj, fnIx)
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const idx = variantFieldIndex(vi, m.memProp)
-  if idx < 0 || fieldRowIsUnionBox(uFieldStart[vi] + idx) { return -1 }
+  if idx < 0 { return -1 }
+  if fieldRowIsUnionBox(uFieldStart[vi] + idx) { return idx }
   return if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { idx } else { -1 }
 }
 
@@ -8364,8 +8365,10 @@ export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   const si = structIndexOfExpr(o, fnIx)
   if si < 0 || si >= sHeapIdx.length { return -1 }
   const idx = sFieldIndex(si, m.memProp)
-  if idx < 0 || memReadNarrowOp(memIx, fnIx) >= 0 || sFieldIsUnionBox(si, idx) {
-    return -1
+  if idx < 0 || memReadNarrowOp(memIx, fnIx) >= 0 { return -1 }
+  // A union-box field's tail unboxes to the read's own type, but never an ambiguous box.
+  if sFieldIsUnionBox(si, idx) {
+    return if memReadBoxAmbiguous(memIx, fnIx) { -1 } else { idx }
   }
   return if fieldStoresRead(sFieldStart[si] + idx, memIx, fnIx) { idx } else { -1 }
 }
@@ -13869,14 +13872,9 @@ function emitMemVariantRead(memIx: i32, fnIx: i32): i32 {
       }
       if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
       variantFieldTail(pvi, pvfi, memIx, fnIx)
-      // A code-16 (value-union box) field of the arm, read while its member PATH is
-      // narrowed, unboxes to the narrowed atom — the arm-for-arm twin of the plain
-      // struct read below and of `emitNarrowedMem`'s. Without it the box flowed into an
-      // i32 consumer: check-clean INVALID WASM (silent-class-inventory D219).
-      if fieldRowIsUnionBox(uFieldStart[pvi] + pvfi) {
-        if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-      }
-      return 0
+      // A code-16 (value-union box) field of the arm, read while its member path is narrowed,
+      // unboxes to the narrowed atom, the arm-for-arm twin of the plain struct read (D219).
+      return variantUnionBoxTail(pvi, pvfi, memIx, fnIx)
     }
     // The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch).
     // Identical `struct.get`, one `ref.as_non_null` ahead of it: the cell is a
@@ -14060,34 +14058,68 @@ function emitMemStructRead(memIx: i32, fnIx: i32): i32 {
     } else {
       structFieldTail(si, idx, memIx, fnIx)
     }
-    // A union-typed field (code 16) read while the member path is narrowed to one scalar atom
-    // (`if o.y is i32 { … o.y … }`) unboxes the payload — the same recovery as a narrowed union
-    // ident read, at the atom the checker typed the read as; an un-narrowed read is the box.
-    if sFieldIsUnionBox(si, idx) {
-      // A record read at its own type out of the union of records it is built into is that
-      // member's record (`boxedArmOfMember`).
-      const avi = boxedArmOfMember(memIx, fnIx)
-      if avi >= 0 { return emitArmUnboxCast(variantHeap(avi), false) }
-      if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
-      const own = memReadBoxNarrowTy(memIx, fnIx)
-      // A read at one scalar of a box holding one wider scalar unboxes and converts it, with no
-      // box rebuilt at the scalar's own set.
-      if own >= 0 {
-        const sc = boxNarrowScalarKinds(sFieldElemTyIxAt(si, idx), own)
-        if sc.length == 2 {
-          if emitUnionUnboxTail(sc[0]) < 0 { return -1 }
-          wU8(atomConvOp(sc[0], sc[1]))
-          return 0
-        }
-        if emitBoxAtomRetagTys(sFieldElemTyIxAt(si, idx), own, memIx) < 0 {
-          return -1
-        }
-      }
-      if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-    }
-    return 0
+    return structUnionBoxTail(si, idx, memIx, fnIx)
   }
   return emitFail("emitProgram: expected a field access")
+}
+
+// After struct `si`'s field `idx` is read at member read `memIx`: a union-typed field (code 16)
+// read while its member path is narrowed unboxes to the read's own type, as a narrowed union ident
+// read does; an un-narrowed read is the box. Returns 0, or -1.
+export function structUnionBoxTail(
+  si: i32,
+  idx: i32,
+  memIx: i32,
+  fnIx: i32,
+): i32 {
+  if !sFieldIsUnionBox(si, idx) { return 0 }
+  // A record read at its own type out of the union of records it is built into is that
+  // member's record (`boxedArmOfMember`).
+  const avi = boxedArmOfMember(memIx, fnIx)
+  if avi >= 0 { return emitArmUnboxCast(variantHeap(avi), false) }
+  if memReadBoxAmbiguous(memIx, fnIx) { return emitBoxAmbiguousFail(memIx) }
+  const own = memReadBoxNarrowTy(memIx, fnIx)
+  // A read at one scalar of a box holding one wider scalar unboxes and converts it, with no
+  // box rebuilt at the scalar's own set.
+  if own >= 0 {
+    const sc = boxNarrowScalarKinds(sFieldElemTyIxAt(si, idx), own)
+    if sc.length == 2 {
+      if emitUnionUnboxTail(sc[0]) < 0 { return -1 }
+      wU8(atomConvOp(sc[0], sc[1]))
+      return 0
+    }
+    if emitBoxAtomRetagTys(sFieldElemTyIxAt(si, idx), own, memIx) < 0 {
+      return -1
+    }
+  }
+  return emitUnionFieldNarrowUnbox(memIx, fnIx)
+}
+
+// Whether plain member read `memIx` reads a union-box field, whose tail delivers the read's own rep.
+export function memFieldUnionBox(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const vi = exprVariantIndex(m.memObj, fnIx)
+  if vi >= 0 {
+    const vf = variantFieldIndex(vi, m.memProp)
+    return vf >= 0 && fieldRowIsUnionBox(uFieldStart[vi] + vf)
+  }
+  const si = structIndexOfExpr(m.memObj, fnIx)
+  if si < 0 || si >= sHeapIdx.length { return false }
+  const sf = sFieldIndex(si, m.memProp)
+  return sf >= 0 && sFieldIsUnionBox(si, sf)
+}
+
+// After variant `vi`'s field `idx` is read at member read `memIx`: a union-typed field read while
+// its member path is narrowed unboxes to the narrowed atom. Returns 0, or -1.
+export function variantUnionBoxTail(
+  vi: i32,
+  idx: i32,
+  memIx: i32,
+  fnIx: i32,
+): i32 {
+  if !fieldRowIsUnionBox(uFieldStart[vi] + idx) { return 0 }
+  return emitUnionFieldNarrowUnbox(memIx, fnIx)
 }
 
 // ── string-literal decoding ─────────────────────────────────────────────────
@@ -39704,6 +39736,8 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
   // length field — the list wrapper's `len` (field 1) or the string header's `len`
   // (field 2), a code-point count. `length` over any other receiver falls through to the struct path.
   if e.memProp == "length" {
+    // A record's own `length` field is any field; the IR's plain read takes the same decision.
+    if lengthIsField(e, exprIx, fnIx) { return emitMem(exprIx, fnIx) }
     const growLen = emitListFitGrowLen(e, exprIx, fnIx)
     if growLen != 0 { return if growLen < 0 { -1 } else { 0 } }
     const armLen = emitArmSite(exprIx, fnIx)
