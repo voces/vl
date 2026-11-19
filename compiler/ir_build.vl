@@ -3,6 +3,10 @@
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
 // globals); any other construct leaves the function uncovered, a counted reason, not an error.
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
+import { emitFail } from "./emit_bytes"
+import { cloLiftLetFe, cloLifted } from "./emit_lift"
+import { sigParamKindAt } from "./emit_closure_callee"
+import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { numUnionMinted } from "./check_union_mint"
 import {
   ArrayLit,
@@ -89,7 +93,12 @@ import {
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
+  callRefLegacyPlainKey,
+  callRefPlainKey,
+  callRefPlainVoid,
+  cloLiftCalleeOf,
   closureValueWhy,
+  directCallInstanceArgMisfit,
   exprPrePathWhy,
   fnTagLeafEmitted,
   fnValueArmOf,
@@ -105,6 +114,7 @@ import {
   ifExprPlainKind,
   ifWritesElse,
   intSwitchMayLower,
+  irEnvCached,
   isArmOf,
   isArmTagOf,
   isBoxGuardPlain,
@@ -114,6 +124,7 @@ import {
   isVariantTagPlain,
   keptDeclStoresNothing,
   lowMemFoldsCallee,
+  mapFilterWhy,
   mapGetOrHelperRoute,
   mapKeyArmOf,
   mapRecvIsSet,
@@ -136,6 +147,7 @@ import {
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
+  stmtIsBareFnName,
   strLitTakesAtom,
   tagIsArmOf,
   tailIfPlainWhy,
@@ -195,6 +207,10 @@ import { wTarget } from "./emit_bytes"
 import { narrowedNulLitPinBoxKey } from "./emit_value_sites"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
+  capCellTargetOf,
+  captureCountOf,
+  captureNamesOf,
+  cbIdentNamesFn,
   declaredIndexAt,
   envSlotShift,
   exprIsLitAtom,
@@ -212,6 +228,7 @@ import {
   lastStmtIsValueIf,
 } from "./emit_fn_scans"
 import {
+  cloLiftWriteCount,
   fRecRetTy,
   fRetVoid,
   fnStmts,
@@ -225,11 +242,16 @@ import {
   setIrShadowOn,
   uTags,
 } from "./emit_state"
-import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
+import {
+  cloSigPosOfKey,
+  cloSigTypeIdxAt,
+  fnCheckedRetTy,
+  globalIndexOfSid,
+} from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import { charLitCp, unwrapParen } from "./emit_base"
-import { ifArmValueExpr } from "./emit_query"
+import { ifArmValueExpr, paramIndexOf } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
 import {
   f32Bytes,
@@ -434,6 +456,7 @@ function valueRep(r: i32, ty: i32): boolean {
     || repNodeAt(r) is RAtom
     || repNodeAt(r) is RBox
     || repNodeAt(r) is RRecord
+    || repNodeAt(r) is RClosure
     || boxedNullable(r)
     || atomNullable(r)
     || strNullable(r)
@@ -969,7 +992,20 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     ib.irReadAgain[ix] = gr
     return irBLetTemp(b, gr, ix, rep)
   }
+  if dn is FuncDecl && repNodeAt(rep) is RClosure {
+    return cloValue(b, ix, rep)
+  }
   return irBMiss("read of " + n.identName)
+}
+
+// A function name or literal `ix` read as a capture-free closure value, as a global's initializer
+// reads one.
+function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
+  const fe = cloValueFeOf(ix)
+  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
+  if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
+  if fnEnvIdxOf(fe) >= 0 { return irBMiss("closure env") }
+  return irBLetTemp(b, { mcFn: fe, mcEnv: [], mcAt: ix }, ix, rep)
 }
 
 // Local `v` read at `rep`, which its narrowing gives it, not its own: a box at the variant a
@@ -1102,18 +1138,38 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     return numIntrRhs(b, c, cf, ix)
   }
-  if d < 0 || !(nodeAt(d) is FuncDecl) {
+  // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
+  const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
+  if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
+    return closureCallRhs(b, c, ix)
+  }
+  if lf < 0 && (d < 0 || !(nodeAt(d) is FuncDecl)) {
     return missRhs("call of a non-declaration")
   }
-  const pos = fnIndexOfNode(c.callFn)
-  if pos < 0 || pos >= fnStmts.length || !callTargetIs(pos, d) {
+  const pos = if lf >= 0 { lf } else { fnIndexOfNode(c.callFn) }
+  if pos < 0 || pos >= fnStmts.length || lf < 0 && !callTargetIs(pos, d) {
     return missRhs("call target")
+  }
+  if lf >= 0 && directCallInstanceArgMisfit(c.callArgs, lf, ibFnIx) >= 0 {
+    return missRhs("binding call misfit")
   }
   const inst = fnStmts[pos]
   if !calleeSig(pos) { return missRhs("callee signature") }
-  // A callee with a hidden environment parameter takes it before its arguments; the IR's call
-  // passes none, so such a call stays legacy's.
-  if envSlotShift(inst) > 0 { return missRhs("callee environment") }
+  // A callee with a hidden environment parameter takes a null one before its arguments, and a
+  // lifted one its captures next; one that captures through its environment stays legacy's.
+  const env = envSlotShift(inst) > 0
+  const caps = if cloLifted(pos) { liftCaps(pos) } else { [] }
+  if ibMiss != "" { return missRhs("callee captures") }
+  // A lifted callee that assigns a capture hands it back after its result (D3664).
+  if cloLiftWriteCount(pos) > 0 {
+    return missRhs("callee writes back captures")
+  }
+  if (
+    envSlotShift(inst) > 1 + caps.length
+    || env && !cloLifted(pos) && captureCountOf(pos) > 0
+  ) {
+    return missRhs("callee environment")
+  }
   if lowMemFoldsCallee(pos) { return missRhs("low-memory accessor") }
   const callee = nodeAt(inst)
   const args: Opnd[] = []
@@ -1136,7 +1192,74 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
       i = i + 1
     }
   }
-  const r: Rhs = { caCallee: pos, caArgs: args, caNever: callEndsNever(ix) }
+  const r: Rhs = {
+    caCallee: pos,
+    caArgs: args,
+    caNever: callEndsNever(ix),
+    caEnv: env,
+    caCaps: caps,
+  }
+  return r
+}
+
+// The captures lifted function `pos` takes after its environment, each a parameter of the
+// function being built, read in order; a miss names any other.
+function liftCaps(pos: i32): Opnd[] {
+  const out: Opnd[] = []
+  for name in captureNamesOf(pos) {
+    const p = paramIndexOf(ibFnIx, name)
+    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+    if v < 0 || capCellTargetOf(name) >= 0 {
+      irBMiss("callee captures")
+      return out
+    }
+    const o: Opnd = { ov: v }
+    out.push(o)
+  }
+  return out
+}
+
+// A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
+// closure, then each argument at its parameter's scalar rep.
+function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const key = callRefPlainKey(ix, ibFnIx)
+  if key == "" { return missRhs("call of a non-declaration") }
+  // Armed, legacy has written this call already, and must have taken the plain path at this key.
+  if ibArmed && callRefLegacyPlainKey(ix) != key {
+    emitFail(
+      "emitProgram: internal: the IR's plain closure call disagrees with legacy's",
+    )
+    return missRhs("closure call plan disagrees")
+  }
+  const f = irBExpr(b, c.callFn)
+  if ibMiss != "" { return missRhs("closure callee") }
+  if !(repNodeAt(irBOpRep(f)) is RClosure) {
+    return missRhs("closure callee rep")
+  }
+  const args: Opnd[] = []
+  let i = 0
+  while i < c.callArgs.length {
+    const at = b.length
+    const a = irBExpr(b, c.callArgs[i])
+    if ibMiss != "" { return missRhs("argument") }
+    if ifBelowLead(b, at, "short-circuit closure argument") {
+      return missRhs("short-circuit closure argument")
+    }
+    const ap = repPrim(irBOpRep(a))
+    const pk = sigParamKindAt(key, i)
+    const aps: string = if ap == null { "" } else { ap }
+    const pks: string = if pk == null { "-" } else { pk }
+    if aps != pks { return missRhs("closure argument coercion") }
+    args.push(a)
+    i = i + 1
+  }
+  const r: Rhs = {
+    crFn: f,
+    crSig: cloSigTypeIdxAt(cloSigPosOfKey(key)),
+    crArgs: args,
+    crVoid: sigKeyRetIsVoid(key),
+    crDrop: !callRefPlainVoid(ix, ibFnIx),
+  }
   return r
 }
 
@@ -1225,6 +1348,29 @@ function numKindPrim(k: i32): string {
   return ""
 }
 
+// `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding as
+// the callback's value, or the `null` immediate for a capture-free function the lowering builds.
+function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const why = mapFilterWhy(ix, ibFnIx)
+  if why != "" { return missRhs(why) }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("map receiver rep") }
+  const at = b.length
+  const cb = unwrapParen(c.callArgs[0])
+  if cb < 0 || cb >= P.nodes.length { return missRhs("map callback") }
+  let f: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if !(nodeAt(cb) is FuncDecl || cbIdentNamesFn(c.callArgs[0], ibFnIx)) {
+    f = irBExpr(b, cb)
+    if ibMiss != "" { return missRhs("method operand") }
+    if ifBelowLead(b, at, "map short-circuit operand") {
+      return missRhs("map short-circuit operand")
+    }
+  }
+  const r: Rhs = { hfV: v, hfC: f, hfAt: ix }
+  return r
+}
+
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -1234,6 +1380,9 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
     return pushRhs(b, c, m, ix)
+  }
+  if m.memProp == "map" || m.memProp == "filter" {
+    return mapFilterRhs(b, c, m, ix)
   }
   let op: StrOp = "slice"
   if exprIsStrMethod(ix, ibFnIx, "cpLen") {
@@ -2035,6 +2184,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   }
   if n is IsExpr { return boxTest(b, n, ix, rep) }
   if n is IfStmt { return ifExpr(b, n, ix, rep) }
+  if n is FuncDecl && repNodeAt(rep) is RClosure { return cloValue(b, ix, rep) }
   if n is AsExpr { return numCast(b, n, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
@@ -2364,7 +2514,19 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     stmtRun(b, n.blkStmts)
     return 0
   }
+  // A nested function declaration is lifted, and writes nothing where it stands, unless it
+  // drops a cached environment.
+  if n is FuncDecl {
+    if irEnvCached(fnStmtsPosOf(ix)) {
+      return skip("nested function env cache")
+    }
+    return 0
+  }
   if n is LetDecl {
+    // A `const` bound to a lambda-lifted function holds no value: every use calls it directly.
+    if n.letInit >= 0 && cloLiftLetFe(fnStmtsPosOf(ibFnIx), ix) >= 0 {
+      return 0
+    }
     const v = irBDeclVar(ix)
     // A `const` every read copied the tree of computes nothing, as legacy writes it (D15001).
     if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
@@ -2470,6 +2632,8 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     || n is Unary
     || n is BinExpr
   ) {
+    // A function's bare name has no effect: legacy writes nothing for it (D6980).
+    if stmtIsBareFnName(ix) { return 0 }
     // Legacy evaluates a bare value and drops it.
     const v = irBExpr(b, ix)
     if ibMiss != "" { return 0 }
@@ -3116,12 +3280,9 @@ function cloInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   if repNodeOfTy(nodeTyAt(ix, ibFnIx)) != rep {
     return irBMiss("global initializer coercion")
   }
-  const fe = cloValueFeOf(ix)
-  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
-  if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
-  if fnEnvIdxOf(fe) >= 0 { return irBMiss("closure env") }
-  irGlobalNote(ib, gi, rep)
-  return irBLetTemp(b, { mcFn: fe, mcEnv: [], mcAt: ix }, ix, rep)
+  const v = cloValue(b, ix, rep)
+  if ibMiss == "" { irGlobalNote(ib, gi, rep) }
+  return v
 }
 
 // The function closure value `ix` names: a lifted function literal, or a bare name the read

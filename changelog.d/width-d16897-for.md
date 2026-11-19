@@ -1,4 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **D16897 closed (step 2b):** a `for` over a union of lists read through an un-annotated parameter now runs. Each pin binds the loop variable at the element union and the pair index at `i32`, without rewriting the shared body. The instance walks whichever list arm the box holds: it reads the length per arm, reads each element per arm, and delivers the element into the element union. A record element keeps its refusal (D16930).
-- **Element union that is a string.** The element read (`a[i]`) and the `for` also deliver into an element union that is a string rather than a box. A `K[] | string[]` join, where `K` is a literal union, now runs: a literal-union element widens to its member string. Before this, six named `ug_k_s` cells were an emit refusal after step 2a. A `for` over a local that joins two holes is filed as D16931.

@@ -2519,6 +2519,11 @@ function cloDeclOf(fe: i32): i32 {
 
 // The local holding the env of capturing function `fe` in the frame being emitted, or -1 when
 // that frame does not declare `fe` (`envCacheFes`).
+// Whether nested function `fe`'s declaration drops a cached environment where it stands.
+export function irEnvCached(fe: i32): boolean {
+  return envCacheFes.length > 0 && envCacheSlotOf(fe) >= 0
+}
+
 function envCacheSlotOf(fe: i32): i32 {
   let k = 0
   while k < envCacheFes.length {
@@ -28850,7 +28855,7 @@ function cloArgIsArmHeapTwin(argIx: i32, vi: i32, fnIx: i32): boolean {
 
 // The lifted slot the callee `calleeIx` names when it reads a `const` bound to a
 // lambda-lifted function in frame `fnIx`, else -1.
-function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
+export function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
   if fnIx < 0 || calleeIx < 0 || calleeIx >= P.nodes.length { return -1 }
   const callee = nodeAt(calleeIx)
   if !(callee is Ident) { return -1 }
@@ -28894,7 +28899,8 @@ function emitCallRef(callIx: i32, fnIx: i32) {
 }
 
 // One argument of a function-value call: applies `argBase` with the seeds of parameter `i`
-// of `ckey`, then lowers `args[i]` coerced to that parameter. Returns -1 on a failure, else 0.
+// of `ckey`, then lowers `args[i]` coerced to that parameter. Returns -1 on a failure, 1 when it
+// took the general arm with nothing owed, else 0.
 function emitCallRefArg(
   callIx: i32,
   fnIx: i32,
@@ -28902,6 +28908,8 @@ function emitCallRefArg(
   args: i32[],
   i: i32,
 ) {
+  // Whether the argument takes the general arm with nothing owed (`callRefPlainKey`'s plain path).
+  let argPlainArm = false
   // D940 — the struct row the functype declares, seeded exactly as the direct call
   // seeds it from `paramStructIdxOf`: an object-literal argument otherwise resolves
   // its own row by field set, the pre-merge row wherever the callee's parameter row
@@ -29026,6 +29034,13 @@ function emitCallRefArg(
       // recover a `null` argument into a nullable parameter, a trap (D2552).
       // A narrowed struct argument is unboxed at the key's slot, as a direct call does (D1723).
       const pkOwed = pkk != null && narrowedArmNeedsUnbox(args[i], fnIx)
+      argPlainArm = !pkOwed
+        && (pkk == "i32"
+        || pkk == "i64"
+        || pkk == "f64"
+        || pkk == "f32"
+        || pkk == "str"
+        || pkk == "struct" && !exprNullableRecord(args[i], fnIx))
       const pkHeap = if pkk != null { armDestHeapOf(pkk, sigParamSlotAt(ckey, i)) } else { -1 }
       const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
@@ -29036,12 +29051,16 @@ function emitCallRefArg(
     // The same boundary as a direct call's, keyed off the `$fnsig` param (D2537).
     emitNonNullParamRecover(pkk, args[i], fnIx)
   }
-  return 0
+  return if argPlainArm { 1 } else { 0 }
 }
 
 // The first argument whose type at frame `fnIx` is a scalar or string other than the one
 // parameter `i` of function `fe` takes, which no coercion bridges; -1 when every argument fits.
-function directCallInstanceArgMisfit(args: i32[], fe: i32, fnIx: i32): i32 {
+export function directCallInstanceArgMisfit(
+  args: i32[],
+  fe: i32,
+  fnIx: i32,
+): i32 {
   if fe < 0 || fe >= fnStmts.length { return -1 }
   const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
@@ -29106,6 +29125,7 @@ function emitCallRefUnder(callIx: i32, fnIx: i32) {
     if bun != 1 { return bun }
     const hcall = emitHolderCall(callIx, c, fnIx)
     if hcall != 1 { return hcall }
+    if irShadowOn { callRefLegacyPlain[callIx] = "" }
     // Evaluate the closure once into the call-ref scratch local (`callRefNestSlot`).
     if emitExpr(c.callFn, fnIx) < 0 { return -1 }
     // A NULLABLE function value (`fn | null`, kind 19) loads as `(ref null $cloStruct)`;
@@ -29113,8 +29133,7 @@ function emitCallRefUnder(callIx: i32, fnIx: i32) {
     // null` narrowing), so recover to non-null.
     if exprNulClosure(c.callFn, fnIx) { fbRefAsNonNull() }
     const crDepth = callRefDepth
-    const crSlot = callRefNestSlot(callRefDepth)
-    fbLocalSet(crSlot)
+    const crSlot = callRefStash()
     // the callee's interned `$fnsig` key — from a function-typed annotation, an inferred
     // binding's sig, a field closure's, or a closure-array element's. Its tokens drive
     // argument coercion below and resolve the functype `ref.cast`s to; "" falls back to
@@ -29153,6 +29172,9 @@ function emitCallRefUnder(callIx: i32, fnIx: i32) {
     // A top-level lambda's returned record: the member its use takes, as for a direct call.
     const tfe = topLambdaRecordFe(unwrapParen(c.callFn))
     if tfe >= 0 { return emitBundleResultPick(callIx, tfe, fnIx) }
+    if irShadowOn && callRefLastPlain && !exprNulClosure(c.callFn, fnIx) {
+      callRefLegacyPlain[callIx] = ckey
+    }
     return 0
   }
   return emitFail("emitProgram: expected a call expression")
@@ -29168,10 +29190,8 @@ function emitCallRefAt(
   crDepth: i32,
   crSlot: i32,
 ): i32 {
-  // env = closure.env (field 0).
-  fbLocalGet(crSlot)
-  fbStructGet(cloStructIdx, 0)
-  callRefDepth = crDepth + 1
+  callRefEnvOpen(crSlot, crDepth)
+  let argsPlain = true
   // args, each COERCED to its parameter's scalar valtype (an i32 literal widened into an i64 / f64
   // / f32 param) — the `call_ref` functype demands the exact valtype, exactly as a direct call.
   const args = c.callArgs
@@ -29183,6 +29203,9 @@ function emitCallRefAt(
     const bty: i32[] = [0 - 1]
     const bsigs = bundleCallArgSigs(c.callFn, fnIx, i, bty)
     const kt = if bsigs.length > 0 { -1 } else { bundleKeyParamTy(ckey, i, args[i]) }
+    if bsigs.length > 0 || kt >= 0 || emitBundleRecordRead(args[i], fnIx) {
+      argsPlain = false
+    }
     if bsigs.length > 0 {
       if emitBundleReadArg(args[i], bty[0], bsigs, fnIx) < 0 { return -1 }
     } else if kt >= 0 {
@@ -29197,8 +29220,10 @@ function emitCallRefAt(
       && !bundleSlotTakesRecord(ckey, i, args[i], fnIx)
     ) {
       if emitBundleMemberArg(args[i], fnIx) < 0 { return -1 }
-    } else if emitCallRefArg(callIx, fnIx, ckey, args, i) < 0 {
-      return -1
+    } else {
+      const ra = emitCallRefArg(callIx, fnIx, ckey, args, i)
+      if ra < 0 { return -1 }
+      if ra == 0 { argsPlain = false }
     }
     i = i + 1
   }
@@ -29253,11 +29278,140 @@ function emitCallRefAt(
       "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call reads an `i32` result from a wider one",
     )
   }
-  fbLocalGet(crSlot)
-  fbStructGet(cloStructIdx, 1)     // the callee's wasm function index
-  fbCallIndirect(sig, gFnTableIdx) // 0x11 <fnsig> <table>
+  callRefCallTail(crSlot, sig, false)
   armTailCallIndirect(sig, sigKeyRetVoid(ckey))
+  callRefLastPlain = argsPlain
   return 0
+}
+
+// A closure call's head and tail, which legacy and the IR both write: the closure on the stack
+// into the stash of the current nesting depth, which `callRefStash` returns.
+export function callRefStash(): i32 {
+  const s = callRefNestSlot(callRefDepth)
+  fbLocalSet(s)
+  return s
+}
+
+// The stashed closure's env, the call's first operand; its arguments are written one nesting
+// depth below `depth`.
+export function callRefEnvOpen(crSlot: i32, depth: i32) {
+  fbLocalGet(crSlot)
+  fbStructGet(cloStructIdx, 0)
+  callRefDepth = depth + 1
+  return 0
+}
+
+// After the arguments: the stashed closure's function index, called at `$fnsig` type `sig`, in
+// its tail form when `tail`.
+export function callRefCallTail(crSlot: i32, sig: i32, tail: boolean) {
+  fbLocalGet(crSlot)
+  fbStructGet(cloStructIdx, 1)
+  if tail {
+    fbReturnCallIndirect(sig, gFnTableIdx)
+  } else {
+    fbCallIndirect(sig, gFnTableIdx)
+  }
+  return 0
+}
+
+// Under the IR shadow, by call, the `$fnsig` key legacy wrote a closure call at with no bundle,
+// coercion or narrowing arm on the way; "" for any other. `callRefPlainKey` must agree.
+let callRefLegacyPlain: {[i32]: string} = Map()
+// Whether the closure call last written took only plain arms for its arguments.
+let callRefLastPlain = false
+
+// The key legacy wrote closure call `ix` at plainly, under the IR shadow; "" otherwise.
+export function callRefLegacyPlainKey(ix: i32): string {
+  return callRefLegacyPlain[ix] ?? ""
+}
+
+// The `$fnsig` key of call `callIx` in function `fnIx` where legacy writes it as a plain call through
+// a closure binding: a name no builtin or function owns, no dispatch, lift, bundle or holder, each
+// argument a scalar at its parameter's own valtype, and no refusal on the way; "" for any other.
+export function callRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Ident) { return "" }
+  const nm = callee.identName
+  const d = identDeclOf(c.callFn)
+  const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  if (
+    !(dn is LetDecl || dn is Param)
+    || nm.length < 1
+    || nm.length >= 2 && nm.slice(0, 2) == "__"
+  ) {
+    return ""
+  }
+  if nm == "print" || nm == "fromCodePoint" || nm == "fromCodePoints" {
+    return ""
+  }
+  if fsIntrinsicSlot(nm) >= 0 || externLinkOf(nm) >= 0 { return "" }
+  if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
+  if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
+  if holderRecordSigs(d, fnIx).length > 0 { return "" }
+  // A function of the name in scope makes legacy ask its live scope which one the name means.
+  if fnIndexOfInScopeChainAt(sidOfNode(c.callFn), nm, fnIx, c.callFn) >= 0 {
+    return ""
+  }
+  if (
+    !unknownCallRoutesRef(c, callee, fnIx)
+    || bundleParamOfRead(c.callFn, fnIx) >= 0
+  ) {
+    return ""
+  }
+  if cloLiftCalleeOf(c.callFn, fnIx) >= 0 || exprNulClosure(c.callFn, fnIx) {
+    return ""
+  }
+  if topLambdaRecordFe(c.callFn) >= 0 { return "" }
+  const ckey = cloCallSigKey(callIx, fnIx)
+  if ckey == "" || cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
+  const n = c.callArgs.length
+  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if (
+    cloCallUnionResultUnrepresentable(callIx, fnIx)
+    || cloCallReflistElemTwin(callIx, fnIx)
+    || fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
+    || closureCallSetSplits(nodeTyAt(c.callFn, fnIx), elabSrcDecl(fnIx))
+  ) {
+    return ""
+  }
+  let i = 0
+  while i < n {
+    const a = c.callArgs[i]
+    const k = sigParamKindAt(ckey, i)
+    const bty: i32[] = [0 - 1]
+    if (
+      !(k == "i32" || k == "i64" || k == "f64" || k == "f32")
+      || sigParamCoerceKind(ckey, i) != null
+      || bundleCallArgSigs(c.callFn, fnIx, i, bty).length > 0
+      || bundleKeyParamTy(ckey, i, a) >= 0
+      || emitBundleRecordRead(a, fnIx)
+      || cloCallParamLitUnion(callIx, i, fnIx) != 0
+      || tyIsLitUnion(nodeTyAt(a, fnIx))
+      || exprScalarWidth(a, fnIx) != k
+    ) {
+      return ""
+    }
+    i = i + 1
+  }
+  const rk = sigKeyRetKind(ckey)
+  if (
+    (rk == "f64" || rk == "i64" || rk == "f32")
+    && exprScalarWidth(callIx, fnIx) == "i32"
+  ) {
+    return ""
+  }
+  return ckey
+}
+
+// Whether a statement of plain closure call `ix` (`callRefPlainKey`) leaves nothing to drop: its
+// key or its callee's read returns nothing, as `emitCallStmtIdent` asks.
+export function callRefPlainVoid(ix: i32, fnIx: i32): boolean {
+  const c = nodeAt(ix)
+  if !(c is Call) { return false }
+  return sigKeyRetVoid(cloCallSigKey(ix, fnIx))
+    || calleeReturnsVoidOfRead(unwrapParen(c.callFn), fnIx)
 }
 
 // Whether parameter `par` takes the lambda literal `arg` as a bundle.
@@ -31310,173 +31464,265 @@ function emitMfCallbackValue(argIx: i32, cbFe: i32, fnIx: i32) {
   return 0
 }
 
-function emitMapFilter(callIx: i32, fnIx: i32) {
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      const isMap = callee.memProp == "map"
-      if c.callArgs.length != 1 {
-        return emitFail(
-          "emitProgram: internal: .map/.filter reached with the wrong argument count — the checker's arity rule refuses it",
-        )
-      }
-      const recvK = mfRecvKindOf(callee.memObj, fnIx)
-      if recvK == null {
-        return emitFail(
-          "emitProgram: .map/.filter receiver is not a supported list",
-        )
-      }
-      const resK = mfResultKindOf(callIx, fnIx)
-      if resK == null {
-        return emitFail("emitProgram: unsupported .map/.filter element type")
-      }
-      // The ref-list slot for a kind-2 result (`.filter` over a struct array) — picks the
-      // result backing/wrapper + the matching dst scratch local. -1 for a non-ref result.
-      const dstSlot = mfResultSlotOf(callIx, fnIx)
-      const cbFe = mfCallbackFe(c.callArgs[0], fnIx)
-      const sig = mfCallbackSigOf(c.callArgs[0], cbFe, fnIx)
-      if sig < 0 {
-        return emitFail(
-          "emitProgram: .map/.filter callback signature is not interned",
-        )
-      }
-      const src: MfSrcTys = {
-        srcWrap: -1,
-        srcBack: -1,
-        srcElemRef: false,
-        srcSlot: -1,
-      }
-      if mfSrcTysOf(recvK, callee.memObj, fnIx, src) < 0 { return -1 }
-      const srcWrap = src.srcWrap
-      const srcBack = src.srcBack
-      const srcElemRef = src.srcElemRef
-      const srcSlot = src.srcSlot
-      // The RESULT wrapper/backing heap types.
-      const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
-      if mfDstTysOf(resK, dstSlot, callIx, dst) < 0 { return -1 }
-      const dstWrap = dst.dstWrap
-      const dstBack = dst.dstBack
-      const srcL = mfSrcLocalFor(recvK, srcSlot)
-      const dstL = mfDstLocalFor(resK, dstSlot)
-      if !fnUses.mapFilter || srcL < 0 || dstL < 0 {
-        return emitFail("emitProgram: .map/.filter scratch frame not reserved")
-      }
-      const iL = mfScratchBase
-      const nL = mfScratchBase + 1
-      const jL = mfScratchBase + 2
-      const cL = mfCallbackLocal()
-      // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
-      // receiver chain completes — including its result wrapper — before this store,
-      // so the shared frame slots are free to reuse.)
-      if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
-      // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
-      // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
-      if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
-      svSyncRecv(callee.memObj, fnIx)
-      fbLocalSet(srcL)
-      mfSrcSlot = -1
-      if srcElemRef { mfSrcSlot = srcSlot }
-      mfSvDst = svDstOfKind(scalarListElemKind(callee.memObj, fnIx))
-      mfRv = rvRecvMayView(callee.memObj, fnIx)
-      // clo = the callback's closure value, built ONCE before the loop. An inline
-      // literal / named function constructs it directly; a let-bound value reads its
-      // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
-      // slots written above stay live).
-      if emitMfCallbackValue(c.callArgs[0], cbFe, fnIx) < 0 { return -1 }
-      fbLocalSet(cL)
-      // n = src.len
-      fbLocalGet(srcL)
-      fbStructGet(srcWrap, 1) // field 1: len
-      fbLocalSet(nL)
-      // back = array.new_default <dstBack> n
-      fbLocalGet(nL)
-      fbArrayNewDefault(dstBack)
-      fbLocalSet(dstL)
-      // i = 0 (and j = 0 for filter)
-      fbI32Const(0)
-      fbLocalSet(iL)
-      if !isMap {
-        fbI32Const(0)
-        fbLocalSet(jL)
-      }
-      // block { loop { if i >= n br 1; <element step>; i++; br 0 } }
-      fbBlock(64)  // 0x02 block (void)
-      fbLoop(64)   // 0x03 loop (void)
-      fbLocalGet(iL)
-      fbLocalGet(nL)
-      fbI32Bin(78) // 0x4e i32.ge_s — i >= n?
-      fbBrIf(1)    // exit the block
-      // The length is fixed at entry; an index the callback has since cut off ends a map with
-      // the trap an `xs[i]` read raises, and is skipped by a filter (D3068).
-      fbLocalGet(iL)
-      fbLocalGet(srcL)
-      fbStructGet(srcWrap, 1)
-      fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
-      if isMap {
-        fbIf(64)
-        emitListIdxTrapOf(srcBack, srcL, srcWrap, -1)
-        fbEnd()
-      } else {
-        fbI32Eqz()
-        fbIf(64) // the filter's step, closed after it
-      }
-      if isMap {
-        // back[i] = call_ref(clo, [elem(i)])
-        fbLocalGet(dstL)
-        fbLocalGet(iL)
-        if (emitMfInvoke(cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig) < 0) {
-          return -1
-        }
-        fbArraySet(dstBack) // 0xfb 0x0e <dstBack>
-      } else {
-        // e = elem(i); if call_ref(clo, [e]): back[j] = e; j++. The element is read once, so
-        // the kept value is the one the callback tested, whatever it writes (D3060).
-        let eSlot = 0
-        if resK == "reflist" { eSlot = dstSlot }
-        const eL = listIdxValSlot(resK, eSlot)
-        if emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef) < 0 { return -1 }
-        fbLocalSet(eL)
-        fbLocalGet(cL)
-        fbStructGet(cloStructIdx, 0) // env
-        fbLocalGet(eL)
-        if srcElemRef { fbRefAsNonNull() }
-        fbLocalGet(cL)
-        fbStructGet(cloStructIdx, 1) // the callee's wasm function index
-        fbCallIndirect(sig, gFnTableIdx)
-        fbIf(64)                     // 0x04 if (void)
-        fbLocalGet(dstL)
-        fbLocalGet(jL)
-        fbLocalGet(eL)
-        fbArraySet(dstBack)
-        fbLocalGet(jL)
-        fbI32Const(1)
-        fbI32Bin(106)                // 0x6a i32.add
-        fbLocalSet(jL)
-        fbEnd()
-        fbEnd()                      // the current-length test
-      }
-      fbLocalGet(iL)
-      fbI32Const(1)
-      fbI32Bin(106) // 0x6a i32.add
-      fbLocalSet(iL)
-      fbBr(0)       // continue the loop
-      fbEnd()       // end loop
-      fbEnd()       // end block
-      mfSrcSlot = -1
-      mfSvDst = -1
-      mfRv = false
-      // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
-      fbLocalGet(dstL)
-      if isMap { fbLocalGet(nL) } else { fbLocalGet(jL) }
-      fbLocalGet(nL)
-      fbStructNew(dstWrap)
-      return 0
-    }
+// The plan `.map`/`.filter` call `callIx` is lowered by: what legacy's arm computed before it wrote
+// the receiver. `mfFail` is the refusal to raise, or "-" where a type lookup already raised one.
+export type MfPlan = {
+  mfFail: string,
+  mfIsMap: boolean,
+  mfRecv: i32,
+  mfCb: i32,
+  mfCbFe: i32,
+  mfSig: i32,
+  mfResK: ListKind,
+  mfDstSlot: i32,
+  mfSrc: MfSrcTys,
+  mfDst: MfDstTys,
+  mfSrcL: i32,
+  mfDstL: i32,
+}
+
+function mfRefused(why: string): MfPlan {
+  const src: MfSrcTys = {
+    srcWrap: -1,
+    srcBack: -1,
+    srcElemRef: false,
+    srcSlot: -1,
   }
-  return emitFail("emitProgram: expected a .map/.filter call")
+  const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
+  const p: MfPlan = {
+    mfFail: why,
+    mfIsMap: false,
+    mfRecv: -1,
+    mfCb: -1,
+    mfCbFe: -1,
+    mfSig: -1,
+    mfResK: "list",
+    mfDstSlot: -1,
+    mfSrc: src,
+    mfDst: dst,
+    mfSrcL: -1,
+    mfDstL: -1,
+  }
+  return p
+}
+
+// Why the IR does not lower `.map`/`.filter` call `callIx`, or "": its receiver and result are
+// lists legacy's arm takes, and its callback a capture-free function or a function-typed binding.
+// It mints nothing, so the builder may ask it ahead of the lowering.
+export function mapFilterWhy(callIx: i32, fnIx: i32): string {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 {
+    return "map call"
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return "map call" }
+  if mfRecvKindOf(callee.memObj, fnIx) == null { return "map receiver kind" }
+  if mfResultKindOf(callIx, fnIx) == null { return "map result kind" }
+  const cb = unwrapParen(c.callArgs[0])
+  if cb < 0 { return "map callback" }
+  const cbn = nodeAt(cb)
+  const fe = mfCallbackFe(c.callArgs[0], fnIx)
+  if cbn is FuncDecl || cbn is Ident && cbIdentNamesFn(c.callArgs[0], fnIx) {
+    if fe < 0 || fnEnvIdxOf(fe) >= 0 { return "map callback env" }
+    return ""
+  }
+  if cbn is Ident { return "" }
+  return "map callback expression"
+}
+
+// The plan of `.map`/`.filter` call `callIx`, asked where legacy's arm asks it.
+export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 {
+    return mfRefused("emitProgram: expected a .map/.filter call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) {
+    return mfRefused("emitProgram: expected a .map/.filter call")
+  }
+  if c.callArgs.length != 1 {
+    return mfRefused(
+      "emitProgram: internal: .map/.filter reached with the wrong argument count — the checker's arity rule refuses it",
+    )
+  }
+  const recvK = mfRecvKindOf(callee.memObj, fnIx)
+  if recvK == null {
+    return mfRefused(
+      "emitProgram: .map/.filter receiver is not a supported list",
+    )
+  }
+  const resK = mfResultKindOf(callIx, fnIx)
+  if resK == null {
+    return mfRefused("emitProgram: unsupported .map/.filter element type")
+  }
+  // The ref-list slot for a kind-2 result (`.filter` over a struct array) — picks the
+  // result backing/wrapper + the matching dst scratch local. -1 for a non-ref result.
+  const dstSlot = mfResultSlotOf(callIx, fnIx)
+  const cbFe = mfCallbackFe(c.callArgs[0], fnIx)
+  const sig = mfCallbackSigOf(c.callArgs[0], cbFe, fnIx)
+  if sig < 0 {
+    return mfRefused(
+      "emitProgram: .map/.filter callback signature is not interned",
+    )
+  }
+  const p = mfRefused("")
+  if mfSrcTysOf(recvK, callee.memObj, fnIx, p.mfSrc) < 0 {
+    return mfRefused("-")
+  }
+  // The RESULT wrapper/backing heap types.
+  if mfDstTysOf(resK, dstSlot, callIx, p.mfDst) < 0 { return mfRefused("-") }
+  p.mfSrcL = mfSrcLocalFor(recvK, p.mfSrc.srcSlot)
+  p.mfDstL = mfDstLocalFor(resK, dstSlot)
+  if !fnUses.mapFilter || p.mfSrcL < 0 || p.mfDstL < 0 {
+    return mfRefused("emitProgram: .map/.filter scratch frame not reserved")
+  }
+  p.mfIsMap = callee.memProp == "map"
+  p.mfRecv = callee.memObj
+  p.mfCb = c.callArgs[0]
+  p.mfCbFe = cbFe
+  p.mfSig = sig
+  p.mfResK = resK
+  p.mfDstSlot = dstSlot
+  return p
+}
+
+function emitMapFilter(callIx: i32, fnIx: i32) {
+  const p = mapFilterPlanOf(callIx, fnIx)
+  if p.mfFail == "-" { return -1 }
+  if p.mfFail != "" { return emitFail(p.mfFail) }
+  const cL = mfCallbackLocal()
+  // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
+  // receiver chain completes — including its result wrapper — before this store,
+  // so the shared frame slots are free to reuse.)
+  if emitExpr(p.mfRecv, fnIx) < 0 { return -1 }
+  mfRecvTail(p, fnIx)
+  // clo = the callback's closure value, built ONCE before the loop. An inline
+  // literal / named function constructs it directly; a let-bound value reads its
+  // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
+  // slots written above stay live).
+  if emitMfCallbackValue(p.mfCb, p.mfCbFe, fnIx) < 0 { return -1 }
+  return mfLoopTail(p, cL)
+}
+
+// After a `.map`/`.filter` receiver: its recovery and store, and the element seats the loop reads.
+export function mfRecvTail(p: MfPlan, fnIx: i32) {
+  // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
+  // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
+  // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
+  if nulRecvNeedsRecover(p.mfRecv, fnIx) { fbRefAsNonNull() }
+  svSyncRecv(p.mfRecv, fnIx)
+  fbLocalSet(p.mfSrcL)
+  mfSrcSlot = -1
+  if p.mfSrc.srcElemRef { mfSrcSlot = p.mfSrc.srcSlot }
+  mfSvDst = svDstOfKind(scalarListElemKind(p.mfRecv, fnIx))
+  mfRv = rvRecvMayView(p.mfRecv, fnIx)
+  return 0
+}
+
+// After a `.map`/`.filter` callback's closure value: its store in `cL`, the loop and the result.
+export function mfLoopTail(p: MfPlan, cL: i32) {
+  const srcWrap = p.mfSrc.srcWrap
+  const srcBack = p.mfSrc.srcBack
+  const srcElemRef = p.mfSrc.srcElemRef
+  const dstWrap = p.mfDst.dstWrap
+  const dstBack = p.mfDst.dstBack
+  const srcL = p.mfSrcL
+  const dstL = p.mfDstL
+  const isMap = p.mfIsMap
+  const resK = p.mfResK
+  const dstSlot = p.mfDstSlot
+  const sig = p.mfSig
+  const iL = mfScratchBase
+  const nL = mfScratchBase + 1
+  const jL = mfScratchBase + 2
+  fbLocalSet(cL)
+  // n = src.len
+  fbLocalGet(srcL)
+  fbStructGet(srcWrap, 1) // field 1: len
+  fbLocalSet(nL)
+  // back = array.new_default <dstBack> n
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dstL)
+  // i = 0 (and j = 0 for filter)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  if !isMap {
+    fbI32Const(0)
+    fbLocalSet(jL)
+  }
+  // block { loop { if i >= n br 1; <element step>; i++; br 0 } }
+  fbBlock(64)  // 0x02 block (void)
+  fbLoop(64)   // 0x03 loop (void)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s — i >= n?
+  fbBrIf(1)    // exit the block
+  // The length is fixed at entry; an index the callback has since cut off ends a map with
+  // the trap an `xs[i]` read raises, and is skipped by a filter (D3068).
+  fbLocalGet(iL)
+  fbLocalGet(srcL)
+  fbStructGet(srcWrap, 1)
+  fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
+  if isMap {
+    fbIf(64)
+    emitListIdxTrapOf(srcBack, srcL, srcWrap, -1)
+    fbEnd()
+  } else {
+    fbI32Eqz()
+    fbIf(64) // the filter's step, closed after it
+  }
+  if isMap {
+    // back[i] = call_ref(clo, [elem(i)])
+    fbLocalGet(dstL)
+    fbLocalGet(iL)
+    if (emitMfInvoke(cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig) < 0) {
+      return -1
+    }
+    fbArraySet(dstBack) // 0xfb 0x0e <dstBack>
+  } else {
+    // e = elem(i); if call_ref(clo, [e]): back[j] = e; j++. The element is read once, so
+    // the kept value is the one the callback tested, whatever it writes (D3060).
+    let eSlot = 0
+    if resK == "reflist" { eSlot = dstSlot }
+    const eL = listIdxValSlot(resK, eSlot)
+    if emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef) < 0 { return -1 }
+    fbLocalSet(eL)
+    fbLocalGet(cL)
+    fbStructGet(cloStructIdx, 0) // env
+    fbLocalGet(eL)
+    if srcElemRef { fbRefAsNonNull() }
+    fbLocalGet(cL)
+    fbStructGet(cloStructIdx, 1) // the callee's wasm function index
+    fbCallIndirect(sig, gFnTableIdx)
+    fbIf(64)                     // 0x04 if (void)
+    fbLocalGet(dstL)
+    fbLocalGet(jL)
+    fbLocalGet(eL)
+    fbArraySet(dstBack)
+    fbLocalGet(jL)
+    fbI32Const(1)
+    fbI32Bin(106)                // 0x6a i32.add
+    fbLocalSet(jL)
+    fbEnd()
+    fbEnd()                      // the current-length test
+  }
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)       // continue the loop
+  fbEnd()       // end loop
+  fbEnd()       // end block
+  mfSrcSlot = -1
+  mfSvDst = -1
+  mfRv = false
+  // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
+  fbLocalGet(dstL)
+  if isMap { fbLocalGet(nL) } else { fbLocalGet(jL) }
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  return 0
 }
 
 // The wrapper and backing heap types of a `.map`/`.filter` result list.
@@ -34038,7 +34284,7 @@ function inertLitPart(ix: i32): boolean {
 // Whether discarded statement `stmtIx` is a function's bare name, through parentheses: its
 // closure has no effect, so it emits nothing and needs no closure type (D6980). A hole
 // function's name counts only once the prune noted it inert, so a refused one still refuses (D6960).
-function stmtIsBareFnName(stmtIx: i32): boolean {
+export function stmtIsBareFnName(stmtIx: i32): boolean {
   const x = unwrapParen(stmtIx)
   if x < 0 || !(nodeAt(x) is Ident) { return false }
   if vrValueInert(x) || elabValueSlotUncalled(x) { return true }
@@ -37794,6 +38040,8 @@ export function initBitOf(gi: i32): i32 {
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
+  callRefLegacyPlain = Map()
+  callRefLastPlain = false
   luOvLocNodes = []
   knownArmDecl = []
   knownArmIdx = []
