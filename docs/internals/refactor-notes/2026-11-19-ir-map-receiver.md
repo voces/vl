@@ -12,8 +12,11 @@ named miss (`map read receiver`, `map has receiver`, `map store receiver`). With
   writes it where it writes a global's read, then legacy's own `mapRecvRefTail`, key and tail,
   and `mapRecvShapeOf` still decides the op context from the receiver node, as legacy's does.
 - **Order.** Legacy writes the receiver before the key. A receiver variable that a node built for
-  the key or value assigns is a named miss (`map receiver reassigned`); a receiver temp is
-  written in place.
+  the key or value assigns, at any depth (an `if` arm, a short-circuit's `SIf`, a block, loop,
+  `for` or switch body), is a named miss (`map receiver reassigned`); a receiver temp is written
+  in place. The witness is `m[if c && nonEmpty(m = n2) { 1 } else { 2 }] ?? -1`, which reads the
+  old map in every mode; without the walk the lowering refused it as an operand above a valued
+  `if`, and the claim fell back.
 - **The verifier** holds the receiver at a map rep and reads it as a use.
 
 ## Measured on fixpoint seeds: the previous step (#9181, `fa8234519`) against this branch
