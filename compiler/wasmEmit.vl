@@ -1677,6 +1677,7 @@ import {
 } from "./listutil"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import {
+  RNullable,
   RpPrim,
   boxAtomKindOfMemberTy,
   boxTagOfPrim,
@@ -1697,6 +1698,7 @@ import {
   nodeTyMapKeyIsLitUnion,
   nullBoxTag,
   nullValKind,
+  repNodeAt,
   repNodeOfTy,
   repOfNode,
   repOfNodeAt,
@@ -10101,70 +10103,10 @@ function emitUnionCoerceValueAtom(
     // under the string tag; the id is read once (D3347).
     const nlTexts = nulAtomWidenTexts(exprIx, fnIx)
     if nlTexts.length > 0 {
-      // Beside a plain `string` arm the join is `string | null`, not this box.
-      const nlStrArm = msHasPlainValKind(msSetOfTyAny(uTy), 2)
-      // A binding typed `K | null` holds the atom at every spelling; a parameter does too, unless
-      // its function's declared return reads the box at the declaration's rep.
-      const nlArg = nodeAt(unwrapParen(exprIx))
-      let nlParam = false
-      if (nlArg is Ident && (fnIx < 0 || paramPosOfRead(fnIx, exprIx) < 0)) {
-        nlParam = true
-      }
-      if nlArg is Ident && fnIx >= 0 {
-        const nlFn = nodeAt(fnIx)
-        // A pinned instance's parameter holds the atom too: the instance reads it at its own rep.
-        if nlFn is FuncDecl && (nlFn.fnRet < 0 || fnInPinnedInstance(fnIx)) {
-          if paramPosOfRead(fnIx, exprIx) >= 0 { nlParam = true }
-        }
-        // A `K | null` niche parameter holds the atom id whatever the function's return (D4041).
-        if (
-          paramPosOfRead(fnIx, exprIx) >= 0
-          && exprNulLitUnion(exprIx, fnIx)
-        ) {
-          nlParam = true
-        }
-        // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
-        if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
-      }
-      // A declared `K | null` field or an atom-valued map read is the niche, outside an instance
-      // or where the instance's own type for the read is that niche.
-      if (
-        (nlArg is Member || nlArg is Index)
-        && ((!fnInPinnedInstance(fnIx) && !nodeTyHasTyVar(unwrapParen(exprIx)))
-          || tyIsNulLitUnionNiche(holeOperandTyOf(exprIx, fnIx)))
-        && exprNulLitUnion(exprIx, fnIx)
-      ) {
-        nlParam = true
-      }
-      if nlArg is Index && fnInPinnedInstance(fnIx) {
-        if tyIsLitUnion(tyMapValOf(mapRecvTyIn(nlArg.idxArr, fnIx))) {
-          nlParam = true
-        }
-      }
-      // A call whose callee hands its result back as the niche holds the atom (D12466).
-      if nlArg is Call && exprNulLitUnion(exprIx, fnIx) { nlParam = true }
-      if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
-        return emitFail(
-          "emitProgram: literal-union string widening with no members",
-        )
-      }
-      if emitStashAtomId(exprIx, fnIx) < 0 { return -1 }
-      fbI32Rel(RS_TAG, nullBoxTag())
-      fbI32Rel(RS_TAG, scalarTagOfKind(2))
-      pushStrScrI(0)
-      fbI32Const(-1)
-      fbI32Bin(70) // i32.eq
-      fbSelect() // the null tag if the id is -1
-      pushStrScrI(0)
-      fbI32Const(-1)
-      fbI32Bin(70)
-      fbIfRefNul(sTy(), true)
-      fbRefNull(sTy())
-      fbElse()
-      if emitAtomToStrChain(nlTexts, 0, strScratchBase + 3) < 0 { return -1 }
-      fbEnd()
-      fbStructNew(uBoxIdx)
-      return 0
+      const nlWhy = atomNulStrWhy(unionName, uSet, uTy, exprIx, fnIx)
+      if nlWhy != "" { return emitFail(nlWhy) }
+      if emitExpr(exprIx, fnIx) < 0 { return -1 }
+      return atomNulStrTail(nlTexts)
     }
     fbI32Rel(RS_TAG, scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
     if emitAtomToStr(exprIx, fnIx) < 0 { return -1 }
@@ -10172,6 +10114,83 @@ function emitUnionCoerceValueAtom(
     return 0
   }
   return emitUnionCoerceAtomBox(uSet, uTy, exprIx, bareIx, fnIx)
+}
+
+// Why a `K | null` atom `exprIx` does not box into set `uSet` (type `uTy`) as its member string,
+// or "": the union holds `null` and no plain `string` arm, and every spelling of the read holds
+// the atom (a binding, a parameter, a capture, a niche field or map read, a niche call).
+function atomNulStrWhy(
+  unionName: string,
+  uSet: i32,
+  uTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): string {
+  // Beside a plain `string` arm the join is `string | null`, not this box.
+  const nlStrArm = msHasPlainValKind(msSetOfTyAny(uTy), 2)
+  // A binding typed `K | null` holds the atom at every spelling; a parameter does too, unless
+  // its function's declared return reads the box at the declaration's rep.
+  const nlArg = nodeAt(unwrapParen(exprIx))
+  let nlParam = false
+  if (nlArg is Ident && (fnIx < 0 || paramPosOfRead(fnIx, exprIx) < 0)) {
+    nlParam = true
+  }
+  if nlArg is Ident && fnIx >= 0 {
+    const nlFn = nodeAt(fnIx)
+    // A pinned instance's parameter holds the atom too: the instance reads it at its own rep.
+    if nlFn is FuncDecl && (nlFn.fnRet < 0 || fnInPinnedInstance(fnIx)) {
+      if paramPosOfRead(fnIx, exprIx) >= 0 { nlParam = true }
+    }
+    // A `K | null` niche parameter holds the atom id whatever the function's return (D4041).
+    if (paramPosOfRead(fnIx, exprIx) >= 0 && exprNulLitUnion(exprIx, fnIx)) {
+      nlParam = true
+    }
+    // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
+    if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
+  }
+  // A declared `K | null` field or an atom-valued map read is the niche, outside an instance
+  // or where the instance's own type for the read is that niche.
+  if (
+    (nlArg is Member || nlArg is Index)
+    && ((!fnInPinnedInstance(fnIx) && !nodeTyHasTyVar(unwrapParen(exprIx)))
+      || tyIsNulLitUnionNiche(holeOperandTyOf(exprIx, fnIx)))
+    && exprNulLitUnion(exprIx, fnIx)
+  ) {
+    nlParam = true
+  }
+  if nlArg is Index && fnInPinnedInstance(fnIx) {
+    if tyIsLitUnion(tyMapValOf(mapRecvTyIn(nlArg.idxArr, fnIx))) {
+      nlParam = true
+    }
+  }
+  // A call whose callee hands its result back as the niche holds the atom (D12466).
+  if nlArg is Call && exprNulLitUnion(exprIx, fnIx) { nlParam = true }
+  if !coerceSetHasNull(uSet, unionName, uTy) || nlStrArm || !nlParam {
+    return "emitProgram: literal-union string widening with no members"
+  }
+  return ""
+}
+
+// After a `K | null` atom's id: the null tag if the id is -1, else its member string among
+// `nlTexts` under the string tag, boxed.
+function atomNulStrTail(nlTexts: string[]): i32 {
+  setStrScrI(0)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Rel(RS_TAG, scalarTagOfKind(2))
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(70) // i32.eq
+  fbSelect() // the null tag if the id is -1
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(70)
+  fbIfRefNul(sTy(), true)
+  fbRefNull(sTy())
+  fbElse()
+  if emitAtomToStrChain(nlTexts, 0, strScratchBase + 3) < 0 { return -1 }
+  fbEnd()
+  fbStructNew(uBoxIdx)
+  return 0
 }
 
 // The value-atom box `{ tag, payload }` for `exprIx` entering set `uSet`: the atom ladder
@@ -10200,12 +10219,16 @@ function emitUnionCoerceAtomBox(
     fbI32Rel(RS_TAG, scalarTagOfKind(cak))
   }
   if emitCoerceAtomPayload(cak, exprIx, fnIx) < 0 { return -1 }
-  // A `string` / list member is a REF and rides the box's anyref `value` directly; only a
-  // SCALAR atom wraps in its per-rep value box.
+  return atomBoxTail(cak)
+}
+
+// After a value-atom box's tag and payload of kind `cak`: a scalar wraps in its value box (a
+// string or list rides the anyref as itself), then the box.
+function atomBoxTail(cak: i32): i32 {
   if !atomIsRefKind(cak) {
     const vb = vbHeapIdxOfKind(cak)
     if vb < 0 { return emitFail("emitProgram: union atom has no value box") }
-    fbStructNew(vb) // wrap the scalar payload
+    fbStructNew(vb)
   }
   fbStructNew(uBoxIdx) // { tag, payload }
   return 0
@@ -10888,37 +10911,156 @@ function emitArmForEffect(blockIx: i32, fnIx: i32) {
   return emitIfArmClose(emitNulNoneForEffect(ifArmValueExpr(blockIx), fnIx))
 }
 
-// The node whose value the IR writes itself while one of legacy's writers runs around it, or -1,
-// and how many times that writer asked for it. `emitBoxAroundHole` is the one setter: a temporary
-// seam of `isRecvStagedIx`'s kind, deleted when the box writer moves to the IR.
-let irHoleIx = -1
-let irHoleUses = 0
-// Writes the open hole's value; `irRefInstall` installs the IR's. A hook, not a parameter: a
-// closure parameter would make the compiler a higher-order program the mono pass specializes.
-export let irHoleWrite: () => i32 = holeUnset
+// How a value is boxed into its recorded `T | null` box: the null tag (`null`), a box as itself
+// (`pass`), a value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over
+// a literal at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), or
+// the box writer's own ladder (`ladder`).
+export type HoleBoxArm = "null" | "pass" | "atom" | "lit" | "atomStr" | "ladder"
+export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
 
-const HOLE_STALE = "emitProgram: a value hole is open where no writer runs"
+function holeBox(arm: HoleBoxArm, kind: i32, src: i32): HoleBox {
+  const p: HoleBox = { hbArm: arm, hbKind: kind, hbSrc: src }
+  return p
+}
 
-function holeUnset(): i32 { return emitFail(HOLE_STALE) }
+// The box value `exprIx` takes into the union the checker records it delivered into, or -1.
+export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
+  return boxRecordUnionTyOf(boxRecordTyAt(exprIx, fnIx))
+}
 
-// Whether no value hole is open, as holds between any two functions.
-export function irHoleClosed(): boolean { return irHoleIx == -1 }
-
-// Legacy's box of the value at `exprIx` into the union the checker records it delivered into,
-// the value written by `irHoleWrite`. Returns how many times the box wrote the value, or -1.
-export function emitBoxAroundHole(exprIx: i32, fnIx: i32): i32 {
-  if irHoleIx != -1 { return emitFail(HOLE_STALE) }
-  irHoleIx = exprIx
-  irHoleUses = 0
-  const r = emitUnionBoxArg(
-    "",
-    boxRecordUnionTyOf(boxRecordTyAt(exprIx, fnIx)),
-    exprIx,
+// The plan for boxing `exprIx` into `unionTy`, shared by the IR and `emitUnionBoxArg`: it decides
+// only the `T | null` boxes, and every rung of the ladder it skips declines the values it takes.
+export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
+  const ladder = holeBox("ladder", -1, -1)
+  const ur = repNodeAt(repNodeOfTy(unionTy))
+  if !(ur is RNullable) || ur.rnDisc != 4 || mapTwinUnionMember(unionTy) >= 0 {
+    return ladder
+  }
+  if boxDstName("", unionTy) == "" || unionArmTagClash(unionTy) != "" {
+    return ladder
+  }
+  const bareIx = unwrapParen(exprIx)
+  if bareIx < 0 { return ladder }
+  const bare = nodeAt(bareIx)
+  if bare is IfStmt || bare is Index || callIsNever(bareIx) { return ladder }
+  if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
+  // Every rung below takes a value the record, niche and map rungs above it decline.
+  if (
+    nulVariantIdxOfExpr(exprIx, fnIx) >= 0
+    || exprVariantIndex(exprIx, fnIx) >= 0
+    || structIndexOfExpr(exprIx, fnIx) >= 0
+    || exprNulBool(bareIx, fnIx)
+    || coalesceNulRefNicheOperand(bareIx, fnIx)
+    || mapReadScalarBoxKind(exprIx, fnIx) >= 0
+  ) {
+    return ladder
+  }
+  // `emitUnionCoerceUnder`'s literal rung, or the null-typed value's.
+  if bare is NullLit { return holeBox("null", -1, -1) }
+  if exprIsNulNone(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
+    return ladder
+  }
+  const uSet = msSetOfRow(unRowOfTyKey(unionTy))
+  if exprIsLitAtom(exprIx, fnIx) {
+    const ur2 = unRowOfTyKey(unionTy)
+    const ums = unionMemberSetOfRow(ur2, boxDstName("", unionTy))
+    const un = if ums != "" { ums } else { boxDstName("", unionTy) }
+    const ok = coerceTakesAtomAsStr(uSet, unionTy)
+      && nulAtomWidenTexts(exprIx, fnIx).length > 0
+      && atomNulStrWhy(un, uSet, unionTy, exprIx, fnIx) == ""
+    return if ok { holeBox("atomStr", 2, -1) } else { ladder }
+  }
+  const pn = tyPrimNameOf(nodeTyAt(bareIx, fnIx))
+  if pn == null { return ladder }
+  const pk = holePrimKind(pn)
+  if pk < 0 { return ladder }
+  const k = coerceListAtomOf(
+    coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
+    unionTy,
+    bareIx,
     fnIx,
   )
-  irHoleIx = -1
-  if r < 0 { return -1 }
-  return irHoleUses
+  if k < 0 || k > 5 { return ladder }
+  if k < 3 { return if k == pk { holeBox("atom", k, -1) } else { ladder } }
+  const w = widenPlanOf(exprIx, k, fnIx)
+  return match w.wpArm {
+    "plain" => holeBox("atom", k, w.wpSrc)
+    "instLit" | "floatLit" => holeBox("lit", k, -1)
+    "asgLit" | "radix" | "convert" => ladder
+  }
+}
+
+// The value-atom kind of primitive `pn`, -1 for one that is no value atom here.
+function holePrimKind(pn: PrimName): i32 {
+  return match pn {
+    "i32" => 0
+    "boolean" => 1
+    "string" => 2
+    "i64" => 3
+    "f64" => 4
+    "f32" => 5
+    "void" | "null" | "never" | "u8" | "i8" | "u16" | "i16" | "v128" => -1
+  }
+}
+
+// `pass` for a box `exprIx` delivered into `unionTy` as it stands: no member re-tagged, re-boxed
+// or rebuilt on the way, else `ladder`.
+function holePassPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
+  const ladder = holeBox("ladder", -1, -1)
+  if exprNullableMap(exprIx, fnIx) || nodeIsNumUnion(exprIx, fnIx) {
+    return ladder
+  }
+  const vty = nodeTyAt(unwrapParen(exprIx), fnIx)
+  if vty >= 0 && tyAt(vty) is TyObj { return ladder }
+  const ft: i32[] = []
+  const tt: i32[] = []
+  wideRetagPairs(exprIx, fnIx, unionTy, ft, tt)
+  if ft.length > 0 { return ladder }
+  if (
+    !deliveryRetagHas(exprIx)
+    && boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, [], [])
+  ) {
+    return ladder
+  }
+  return holeBox("pass", -1, -1)
+}
+
+// What plan `p` writes ahead of its value; a `lit` plan writes its literal too.
+export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
+  return match p.hbArm {
+    "null" => {
+      fbI32Rel(RS_TAG, nullBoxTag())
+      fbRefNullNone() // the payload slot is unread under the null tag
+    }
+    "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "lit" => {
+      fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+      widenLitAt(exprIx, p.hbKind, fnIx)
+    }
+    "pass" | "atomStr" => 0
+    "ladder" => emitFail("emitProgram: a box plan with no arm was written")
+  }
+}
+
+// What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
+export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
+  return match p.hbArm {
+    "null" => fbStructNew(uBoxIdx)
+    "atom" | "lit" => atomBoxTail(p.hbKind)
+    "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
+    "pass" | "ladder" => 0
+  }
+}
+
+// `emitUnionBoxArg` for a value plan `p` decides.
+function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
+  if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
+  if p.hbArm == "atom" {
+    if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
+  } else if p.hbArm == "pass" || p.hbArm == "atomStr" {
+    if emitExpr(exprIx, fnIx) < 0 { return -1 }
+  }
+  return holeBoxTail(p, exprIx, fnIx)
 }
 
 // The value at `exprIx` boxed into the union `unionName`. A box of a member set holding a member
@@ -10942,6 +11084,26 @@ function emitUnionBoxArg(
     )
   }
   boxDstShadowEnter()
+  const hp = holeBoxPlanOf(exprIx, unionTy, fnIx)
+  if hp.hbArm != "ladder" {
+    // The shadow notes the coerce the ladder's value rungs are reached through, as legacy did.
+    const viaCoerce = !exprIsNulNone(exprIx, fnIx)
+    if viaCoerce && boxDstShadowArmed() {
+      boxDstShadowNote(
+        "coerce",
+        unionName,
+        unionTy,
+        exprIx,
+        fnIx,
+        boxDstFormOf(exprIx, fnIx),
+      )
+    }
+    if viaCoerce { boxDstShadowEnter() }
+    const hr = emitHoleBox(hp, exprIx, fnIx)
+    if viaCoerce { boxDstShadowLeave() }
+    boxDstShadowLeave()
+    return hr
+  }
   // Maps nothing can tell apart are their one map, so delivering into them boxes nothing.
   const go = if mapTwinUnionMember(unionTy) >= 0 { emitExpr(exprIx, fnIx) } else { emitUnionBoxArgGo(unionName, unionTy, exprIx, fnIx) }
   boxDstShadowLeave()
@@ -10961,6 +11123,9 @@ function emitUnionBoxArgGo(
   exprIx: i32,
   fnIx: i32,
 ) {
+  // `holeBoxPlanOf` takes its values ahead of this ladder: a rung added above the value-atom rungs
+  // must decline there too.
+
   // D1567 — a `null`-typed value at a box destination is the null-tagged box. `i32 | null` and
   // every other value union reps as `{tag, anyref}`, so a `nullref` result cannot ride the cell
   // raw and must not be boxed as its own arm either — the classifier below reads a Call's kind,
@@ -15212,6 +15377,14 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   // row, else element 0's.
   const rslot = arrRefSlotOf(arrIx, elems, fnIx, lb)
   if rslot < 0 { return -1 }
+  // A literal whose elements each build as themselves takes the one decision the IR reads, and
+  // its tail.
+  if arrLitRefPlainSlot(arrIx, fnIx, lb) == rslot {
+    for e in elems {
+      if emitExpr(e, fnIx) < 0 { return -1 }
+    }
+    return arrLitRefShortTail(rslot, elems.length)
+  }
   // A concrete-VARIANT element list (`Cat[]`) has no `sNames` entry: each element is coerced
   // into the arm read off the slot's element type, any `| null` peeled.
   let elemVariantIdx = -1
@@ -15291,32 +15464,65 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   if dstRef >= 0 {
     fbLocalGet(dstRef)
     fbRefAsNonNull() // the chunk-built ref backing
-  } else {
-    fbBacking(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
+    return arrLitLenCap(elems.length, rlWrapIdx[rslot])
   }
-  fbI32Const(elems.length)      // 0x41 i32.const (len)
-  fbI32Const(elems.length)      // 0x41 i32.const (cap)
-  fbStructNew(rlWrapIdx[rslot]) // 0xfb 0x00 <this slot's ref-list wrapper>
-  return 0
+  return arrLitRefShortTail(rslot, elems.length)
+}
+
+// After a short ref-list literal's `n` elements at slot `rslot`: the backing, its length and
+// capacity, and the slot's wrapper.
+export function arrLitRefShortTail(rslot: i32, n: i32): i32 {
+  fbBacking(rlBackIdx[rslot], n)
+  return arrLitLenCap(n, rlWrapIdx[rslot])
+}
+
+// The ref-list slot list literal `arrIx` builds at as a short list of elements each built as is
+// in `fnIx`: within the chunk cap, at a slot whose element is no union box and no non-null variant,
+// and no element a record twin, a narrowed unbox or a list the slot does not hold; -1 otherwise.
+export function arrLitRefPlainSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
+  const a = nodeAt(arrIx)
+  if (
+    !(a is ArrayLit)
+    || !rlRowsMinted()
+    || a.arrElems.length > allocLitChunk()
+  ) {
+    return -1
+  }
+  const rslot = arrRefSlotPlain(arrIx, a.arrElems, fnIx, lb)
+  if rslot < 0 { return -1 }
+  const k = rlElemKindAt(rslot)
+  if k == RLK_UNION { return -1 }
+  if (
+    k == RLK_STRUCT
+    && rlElemVariantRow(rslot) >= 0
+    && rlElemNullable[rslot] != 1
+  ) {
+    return -1
+  }
+  const nests = k == RLK_I32_LIST
+    || k == RLK_STR_LIST
+    || k == RLK_F64_LIST
+    || k == RLK_I64_LIST
+    || k == RLK_REF_LIST
+    || k == RLK_F32_LIST
+    || k == RLK_V128_LIST
+    || k == RLK_U8_LIST
+  for e in a.arrElems {
+    if !nests && (exprArray(e, fnIx) || exprRefArray(e, fnIx)) { return -1 }
+    if (
+      arrRefElemTwinRow(e, fnIx, rslot) >= 0
+      || narrowedArmNeedsUnbox(e, fnIx)
+    ) {
+      return -1
+    }
+  }
+  return rslot
 }
 
 // `emitArrRef`'s ref-list slot: a ref build pair's row, else element 0's, else
 // slot 0 when the literal names none. -1 when no element type is interned at all.
 function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
-  const annKind = lb.lbKind
-  const annSlot = lb.lbSlot
-  let rslot = 0
-  if (
-    annKind == LBK_REF
-    || annKind == LBK_UNION
-    || annKind == LBK_REF_AT_SLOT
-  ) {
-    rslot = annSlot
-  } else if elems.length >= 1 {
-    rslot = arrLitRowSlotIn(arrIx, fnIx)
-  } else {
-    rslot = annSlot
-  }
+  const rslot = arrRefSlotPlain(arrIx, elems, fnIx, lb)
   if rslot < 0 {
     if rlElemName.length < 1 {
       return emitFail(
@@ -15331,9 +15537,27 @@ function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
         arrIx,
       )
     }
-    rslot = 0
+    return 0
   }
   return rslot
+}
+
+// `arrRefSlotOf`'s slot where it finds one, -1 where it would fall back or refuse.
+function arrRefSlotPlain(
+  arrIx: i32,
+  elems: i32[],
+  fnIx: i32,
+  lb: ListBuild,
+): i32 {
+  if (
+    lb.lbKind == LBK_REF
+    || lb.lbKind == LBK_UNION
+    || lb.lbKind == LBK_REF_AT_SLOT
+  ) {
+    return lb.lbSlot
+  }
+  if elems.length >= 1 { return arrLitRowSlotIn(arrIx, fnIx) }
+  return lb.lbSlot
 }
 
 // One non-union element `e` of `emitArrRef`'s list at slot `rslot`, built as is or coerced
@@ -23931,10 +24155,6 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
-  if exprIx == irHoleIx {
-    irHoleUses = irHoleUses + 1
-    return irHoleWrite()
-  }
   // A dead arm's operand reads as `never`, and so does what it feeds: no value reaches here (D16006).
   if exprReadsDeadNever(exprIx, fnIx) {
     fbUnreachable()
@@ -25296,9 +25516,7 @@ export function emitWidened(ix: i32, dst: i32, fnIx: i32): i32 {
   const p = widenPlanOf(ix, dst, fnIx)
   const w = if dst == 3 { "i64" } else if dst == 4 { "f64" } else { "f32" }
   return match p.wpArm {
-    "instLit" | "floatLit" => {
-      numNoted(emitSignedNumLitAt(unwrapParen(ix), w), -1, dst, ix, fnIx)
-    }
+    "instLit" | "floatLit" => widenLitAt(ix, dst, fnIx)
     "asgLit" => numNoted(emitAsgLitAs(ix, w, fnIx), -1, dst, ix, fnIx)
     "radix" => {
       const at = if dst == 3 { unwrapParen(ix) } else { ix }
@@ -25307,6 +25525,12 @@ export function emitWidened(ix: i32, dst: i32, fnIx: i32): i32 {
     "convert" => numNoted(emitNumUnionConvert(ix, dst, fnIx), 6, dst, ix, fnIx)
     "plain" => emitNumPlain(p.wpSrc, dst, ix, fnIx)
   }
+}
+
+// The literal `ix` written at number kind `dst` (3 i64, 4 f64, 5 f32).
+function widenLitAt(ix: i32, dst: i32, fnIx: i32): i32 {
+  const w = if dst == 3 { "i64" } else if dst == 4 { "f64" } else { "f32" }
+  return numNoted(emitSignedNumLitAt(unwrapParen(ix), w), -1, dst, ix, fnIx)
 }
 
 // Lower `exprIx` in the rep of a value atom of kind `k` — the emit half of
@@ -39090,8 +39314,6 @@ export function wasmEmitStateReset() {
   forInPairBox = null
   luOvLocSlots = []
   coerceHeld = -1
-  irHoleIx = -1
-  irHoleUses = 0
   asgParkedSlot = -1
   asgParkedRef = false
   asgParkWanted = false

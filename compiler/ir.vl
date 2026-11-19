@@ -145,10 +145,11 @@ export type RCellGet = { cgCell: Opnd }
 export type RGlobalGet = { ggSym: i32, ggNonNull: boolean }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
-// reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing.
+// reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
+// is an i64 key variable's map pair tag, through the one writer every map tag comes from.
 export type RawOp = "struct.get" | "struct.new" | "array.get" | "array.new_default" | "array.len"
   | "ref.eq" | "ref.cast" | "ref.as_non_null" | "ref.null" | "ref.is_null" | "call" | "tee" | "test"
-  | "load"
+  | "load" | "tag64" | "ref.test" | "select" | "push"
 export type RRawOp = { rwOp: RawOp, rwHeap: i32, rwArgs: Opnd[], rwImm: i32 }
 // A helper's i32 constant `rlVal` that the relocation table names in space `rlSp` from `rlSub`.
 export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
@@ -196,6 +197,7 @@ export type RawEff = "struct.set"
   | "array.set"
   | "array.copy"
   | "array.init_data"
+  | "array.fill"
   | "call"
 export type SRawOp = { srOp: RawEff, srHeap: i32, srArgs: Opnd[], srImm: i32 }
 export type IrNode = SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet
@@ -369,16 +371,27 @@ export function irGlobalNote(f: IrFn, sym: i32, rep: i32) {
 }
 
 // Whether `body` leaves on every path: it ends in a branch, a return or a trap, or in an `if`
-// both of whose arms leave. A loop is never counted as leaving.
+// both of whose arms leave. A loop is never counted as leaving. An `else` is followed along the
+// spine, not recursed into (D1990).
 export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
-  if body.length == 0 { return false }
-  const last = body[body.length - 1]
-  if last < 0 || last >= f.irNodes.length { return false }
-  const n = f.irNodes[last]
-  return match n {
-    SBr | SReturn | STrap => true
-    SIf => irBodyLeaves(f, n.siThen) && irBodyLeaves(f, n.siElse)
-    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SSwitch | SDrop | SRawOp => false
+  let cur = body
+  while true {
+    if cur.length == 0 { return false }
+    const last = cur[cur.length - 1]
+    if last < 0 || last >= f.irNodes.length { return false }
+    const n = f.irNodes[last]
+    match n {
+      SBr | SReturn | STrap => {
+        return true
+      }
+      SIf => {
+        if !irBodyLeaves(f, n.siThen) { return false }
+        cur = n.siElse
+      }
+      SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SSwitch | SDrop | SRawOp => {
+        return false
+      }
+    }
   }
 }
 
