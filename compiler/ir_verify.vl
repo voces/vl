@@ -706,6 +706,7 @@ function rawRhs(r: RRawOp, dst: i32, at: i32) {
     "call" => true
     "test" => n == 1 && opRep(a[0]) == vfI32 && dst == vfBool
     "load" => n == 1 && opRep(a[0]) == vfI32 && dst == vfI32
+    "tag64" => n == 1 && a[0] is OVar && repPrim(opRep(a[0])) == "i64" && dst == vfI32
     "tee" => n == 1
       && r.rwImm >= 0
       && r.rwImm < vf.irVars.length
@@ -729,7 +730,7 @@ function rawEff(e: SRawOp, at: i32) {
     "struct.set" => n == 2 && ref0
     "array.set" => n == 3 && ref0 && opRep(a[1]) == vfI32
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
-    "array.init_data" => n == 4 && ref0
+    "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
   }
   if !ok {
@@ -767,6 +768,64 @@ function nested(body: i32[]) {
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
   }
   return 0
+}
+
+// An `if` and every `if` its `else` bodies hold, checked along the spine with one frame per open
+// `else` rather than by recursing (D1990): a link's test and `then`, its `else` in order, then its
+// arms' writes, as `nested` would order them.
+function ifSpine(id0: i32) {
+  const links: i32[] = []
+  const pos: i32[] = []
+  const defs: i32[] = []
+  let next = id0
+  while true {
+    if next >= 0 {
+      const h = vf.irNodes[next]
+      if h is SIf {
+        use(h.siCond, next)
+        if opRep(h.siCond) != vfBool {
+          fail(2, next, "an `if` tests a bool")
+        } else {
+          nested(h.siThen)
+          links.push(next)
+          pos.push(0)
+          defs.push(vfDefLog.length)
+        }
+      }
+    }
+    next = -1
+    if links.length == 0 { return 0 }
+    const top = links.length - 1
+    const ln = vf.irNodes[links[top]]
+    if !(ln is SIf) {
+      return fail(5, links[top], "a spine link is not an `if`")
+    }
+    if pos[top] < ln.siElse.length {
+      const c = ln.siElse[pos[top]]
+      pos[top] = pos[top] + 1
+      if (
+        vfRule == 0
+        && c >= 0
+        && c < vf.irNodes.length
+        && vf.irNodes[c] is SIf
+      ) {
+        nodeRepClosed(c)
+        next = c
+      } else {
+        stmt(c)
+      }
+    } else {
+      while vfDefLog.length > defs[top] {
+        const d = vfDefLog.pop() ?? -1
+        if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+      }
+      endsWriting(ln.siThen, ln.siOut, links[top])
+      endsWriting(ln.siElse, ln.siOut, links[top])
+      links.pop()
+      pos.pop()
+      defs.pop()
+    }
+  }
 }
 
 function labelled(label: i32, out: i32, body: i32[]) {
@@ -890,16 +949,7 @@ function stmt(id: i32) {
       }
       nested(n.xfBody)
     }
-    SIf => {
-      use(n.siCond, id)
-      if opRep(n.siCond) != vfBool {
-        return fail(2, id, "an `if` tests a bool")
-      }
-      nested(n.siThen)
-      nested(n.siElse)
-      endsWriting(n.siThen, n.siOut, id)
-      endsWriting(n.siElse, n.siOut, id)
-    }
+    SIf => ifSpine(id)
     SSwitch => switchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
