@@ -18,15 +18,19 @@ door calls. It answers `""` at rest, and otherwise names the first live entry:
 | `isRecvStagedIx` | ≥ 0 | the staged `is` receiver, the same frame's other half |
 | `listGetIdxStagedIx`, `listGetRecvStagedIx`, `listFitStoodIn` | ≥ 0 | the lazy list frame's operand staging |
 | `lbEnd[r]` | some region ≥ 0 | the lazy list frame's open build regions (a count held in a local, not in the header) |
+| `listCastForPush` | true | the push receiver cast (IR-REV, on #9159) |
 | `lhOpen` | non-empty | the loop-hoist frames |
-| `uBoxNewEnd` | `== wLen()` | the union-sink pair: a box construction the sink's peephole could still take |
 
-The union-sink pair's two slots are per-function frame slots and are never "held". A fragment
-carries no `return`, so it never writes them. What is ambient is the peephole cursor, so the
-guard checks that cursor.
+The union-sink pair is not on the list, and §10.2 now says so. Its two locals are per-function
+frame slots, and a fragment carries no `return`, so it never writes them. Its peephole cursor
+(`uBoxNewEnd`) is a fact about bytes, not a plan input. A fragment's bytes either move the write
+head past a stale cursor, which costs the peephole but is still correct, or end in the fragment's
+own box construction, which really is last. A first draft guarded the cursor and fired at 24
+shadow sites. The shadow reads after legacy has written the node, so those 24 are not evidence of
+a hazard either way. The check was dropped with the doc's item.
 
-The box-dst shadow depth (`bdsDepth`) is not on the list. It is instrument state and only acts
-while that shadow is armed.
+The box-dst shadow depth (`bdsDepth`) is instrument state. It acts only while that shadow is
+armed.
 
 `irLowerNodeIn` runs the guard first when `probe` is false and misses
 `legacy context live: <entry>`. The probe at `emitArr` (`irNodeInShadow`) remains exempt, as
@@ -35,27 +39,21 @@ site it finds live, so the gap a shipping caller will face is measured where it 
 
 ## Failing control
 
-A throwaway seed, built in the scratchpad and never refreshed into `build/`, has the armed
-probe call the door non-probe at each site where the guard is live. It was run over the 64
-corpus cells where the armed shadow reported a live context:
+A throwaway seed, built in the scratchpad and never refreshed into `build/`, has the armed probe
+call the door non-probe wherever the guard is live. Over all of `cells/` and `named/` (12,304
+cells, 14,743 list-literal sites):
 
 ```
-38	node-in control: legacy context live: coerceHeld
+7041	node-in array: matched
 38	node-in context live: coerceHeld
-24	node-in control: legacy context live: union sink cursor
-24	node-in context live: union sink cursor
-1	node-in control: legacy context live: list build region
+38	node-in control: legacy context live: coerceHeld
 1	node-in context live: list build region
+1	node-in control: legacy context live: list build region
 ```
 
-The `coerceHeld` rows are §10.2's own example. A list literal inside a held coercion, for
-example `named/d1629_literal_fill_annotated.vl`, misses at the door. The guard does not fire at
-ordinary sites. A two-loop program with four list literals counts four `matched` and one
-`context live` (the literal inside an open `push` region).
-
-The shadow takes its reading after legacy has written the node, so its `union sink cursor` count
-can include legacy's own construction. A shipping caller asks before writing, so the count is an
-upper bound for one.
+The `coerceHeld` rows are §10.2's own example: a list literal inside a held coercion, such as
+`named/d1629_literal_fill_annotated.vl`, misses at the door. At every other site the guard stays
+quiet. So 39 of the 14,743 sites are the gap a shipping list-literal caller would face.
 
 ## Measured
 
