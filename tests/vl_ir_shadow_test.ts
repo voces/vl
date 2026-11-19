@@ -426,6 +426,56 @@ print(k(2, true, false) + f(true, false) + f2(false, true))
   },
 });
 
+// Every node that writes a receiver or an earlier operand before a later one names a valued `if`
+// in that later operand; one in the first operand written stays covered.
+Deno.test({
+  name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
+  ignore,
+  fn: () => {
+    const src = `let m: Map<i32, boolean> = Map()
+let g: boolean[] = [true]
+function st(a: boolean, b: boolean, x: i32): boolean {
+  const xs: boolean[] = [false, false]
+  xs[x] = a && b
+  return xs[x]
+}
+function stIx(a: boolean, x: i32): i32 {
+  const xs: i32[] = [0, 0]
+  xs[if a { 0 } else { 1 }] = x
+  return xs[0]
+}
+function bin(a: boolean, x: i32): i32 { return x + (if a { 1 } else { 2 }) }
+function eq(a: boolean, b: boolean): boolean { return a == (b || a) }
+function meth(a: boolean, s: string): string { return s.slice(0, if a { 1 } else { 2 }) }
+function intr(a: boolean, x: f64): f64 { return max(x, if a { 1.0 } else { 2.0 }) }
+function push(a: boolean, b: boolean): i32 {
+  g.push(a && b)
+  return g.length
+}
+function first(a: boolean, b: boolean, x: i32): i32 { return (if a && b { 1 } else { 2 }) + x }
+m[1] = st(true, true, 0) || stIx(true, 5) > 0
+print(bin(true, 1) + push(true, false) + first(true, true, 3))
+print(eq(true, false))
+print(meth(true, "hello"))
+print(intr(true, 0.5))
+`;
+    const { rows } = run(src, true);
+    const want: [string, number][] = [
+      ["uncovered store short-circuit operand", 2],
+      ["uncovered short-circuit right operand", 2],
+      ["uncovered method short-circuit operand", 1],
+      ["uncovered short-circuit argument after another", 1],
+      ["uncovered push short-circuit operand", 1],
+      ["start uncovered map store short-circuit operand", 1],
+    ];
+    for (const [k, n] of want) {
+      if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want \`first\` matched, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
 // (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
 // the result's `null`.

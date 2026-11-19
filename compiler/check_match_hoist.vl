@@ -3,8 +3,9 @@
 // place to `const $scrut<match>` ahead of the statement holding the match, or where the match
 // stands when that would reorder or skip an evaluation (D2038). A computed `?.` receiver is
 // bound the same way, to `const $om<read>`, so the emitter may test it and read it again
-// (D5300). It rewrites the node arena before the checker walks it and reads no type, so it
-// imports only `./ast`, `./fmt_util`, `./check_places` and `./symbols`.
+// (D5300). A record literal's un-annotated field lambda is bound to `const $rf<lambda>`, as a
+// bare binding of it is. It rewrites the node arena before the checker walks it and reads no
+// type, so it imports only `./ast`, `./fmt_util`, `./check_places` and `./symbols`.
 import {
   ArrayLit,
   AsExpr,
@@ -795,4 +796,81 @@ function hmsCopyLeaf(ix: i32): i32 {
   const c = addNode(n)
   adoptNodeTok(c, ix)
   return c
+}
+
+// A lambda with an un-annotated parameter written as a field of an un-annotated binding's record
+// literal is bound to `const $rf<lambda>` just ahead of that binding, in its block, as a bare
+// binding of it is: its parameters are then inference holes and a call through the field
+// reaches it by name (D17009). Returns the count bound.
+export function hoistRecFieldLambdas() {
+  let done = 0
+  const n0 = P.nodes.length
+  let i = 0
+  while i < n0 {
+    const n = nodeAt(i)
+    if n is Program || n is Block { done = done + hrfBlock(i) }
+    i = i + 1
+  }
+  return done
+}
+
+// Binds the field lambdas of block `bIx`'s un-annotated record bindings ahead of each binding.
+function hrfBlock(bIx: i32): i32 {
+  const out: i32[] = []
+  let moved = 0
+  for s in nodeValueChildren(bIx) {
+    const d = nodeAt(s)
+    const li = if d is LetDecl && d.letType < 0 { hrfPeel(d.letInit) } else { -1 }
+    const o = if li >= 0 { nodeAt(li) } else { null }
+    if o is ObjLit {
+      for fx in o.objFields {
+        const f = nodeAt(fx)
+        const v = if f is FieldInit { hrfPeel(f.fiValue) } else { -1 }
+        if f is FieldInit && hrfHoleLambda(v) {
+          const name = "$rf" + i32ToStr(v)
+          const decl = mkLet("const", name, -1, v, nodePos(v))
+          adoptNodeTok(decl, v)
+          const ref = mkIdent(name, nodePos(v))
+          adoptNodeTok(ref, v)
+          const nf: Node = { fiName: f.fiName, fiValue: ref, pos: f.pos }
+          arenaSetNode(fx, nf)
+          out.push(decl)
+          moved = moved + 1
+        }
+      }
+    }
+    out.push(s)
+  }
+  if moved == 0 { return 0 }
+  const b = nodeAt(bIx)
+  if b is Program {
+    const np: Node = { progStmts: out, pos: b.pos }
+    arenaSetNode(bIx, np)
+  } else {
+    const nb: Node = { blkStmts: out, pos: nodePos(bIx) }
+    arenaSetNode(bIx, nb)
+  }
+  return moved
+}
+
+// `ix` with its parentheses peeled, or -1.
+function hrfPeel(ix: i32): i32 {
+  let x = ix
+  while x >= 0 && x < P.nodes.length {
+    const n = nodeAt(x)
+    if !(n is Paren) { return x }
+    x = n.parInner
+  }
+  return -1
+}
+
+// Whether `ix` is an anonymous lambda with a parameter that has no annotation.
+function hrfHoleLambda(ix: i32): boolean {
+  const f = if ix >= 0 && ix < P.nodes.length { nodeAt(ix) } else { null }
+  if !(f is FuncDecl) || f.fnName != "" { return false }
+  for px in f.fnParams {
+    const pn = nodeAt(px)
+    if pn is Param && pn.parType < 0 { return true }
+  }
+  return false
 }
