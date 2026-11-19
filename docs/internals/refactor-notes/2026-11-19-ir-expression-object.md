@@ -22,11 +22,11 @@ Covering record literals exposed one divergence the armed shadow caught: a void 
 `({ r: 7 })` tail. Legacy writes nothing for a discarded inert literal or bare function name; that
 rule is now `stmtWritesNothing`, consumed by `emitStmt` and asked by the builder.
 
-Measured on fixpoint seeds against master (functions with no blocker, blocker census):
-see the PR for the final base; on master 93c5fe0f with #9132's stack, self-compile 13,327 → 13,402
-and corpus 31,207 → 31,558. Remaining classes alone: `object field armDelivery` 82,
-`explicitNull` 41, `union` 24, `f64` 22 (corpus); `object layout` 34, `variant field box` 12
-(self-compile).
+Measured on fixpoint seeds against master `41fadc2e` (m46; functions with no blocker, blocker
+census): self-compile 13,593 of 18,965 → 13,673 of 18,977, corpus 32,946 → 33,770 of 45,675;
+combined 71.99% → 73.38%. Remaining object classes alone, self-compile: `object layout` 34,
+`object variant field box` 14, `object field i64` 4. Corpus, on the earlier base: `object field
+armDelivery` 82, `explicitNull` 41, `union` 24, `f64` 22.
 
 Legacy lines deleted: 0. Moved to `@ir`: 727, the decisions the IR now asks
 (`objMatchesVariantIdxOmit` 68, `objVariantRowCtx` 52, `variantFieldKindFits` 51, …).
