@@ -407,6 +407,7 @@ export function fnTagDecide(rootIx: i32) {
   fnTagUndecide()
   ftNestedJoinsFollow()
   ftLeafTys = Map()
+  ftShapeBuilt = false
   const calls = fnTagCalls()
   const mint = mintFactRows()
   const sbTry = if ftLate { [] } else { setBindTrySets(P.nodes.length) }
@@ -4970,12 +4971,71 @@ function ftRecHolds(x: i32, s: i32): boolean {
   return x >= 0 && ftTyHoldsDecided(nodeRepTyIxOf(x), s)
 }
 
+// Whether the other record literals of `x`'s field names can be decided with set `s` at field
+// `name`: they share one row, whose rep holds ids at that field for all of them or none (D15641),
+// so each set they hold there is decided with `s`. An open field is bound per instance, after the
+// elaboration, so none is decided before it.
+function ftShapeFieldDecidedWith(x: i32, name: string, s: i32): boolean {
+  for l in ftShapeLitsOf(x) {
+    const ft = if l != x { tyFieldTyOf(nodeTyIxOf(l), name) } else { -1 }
+    if ft >= 0 && ft < T.tys.length && tyAt(ft) is TyVar { return false }
+    const o = fnTagSetOfTy(ft)
+    if (
+      o >= 0
+      && o != s
+      && !fnTagSetIsTagged(o)
+      && !i32ListHas(ftAssume, o)
+      && !i32ListHas(ftSubNeed, o)
+    ) {
+      ftSubNeed.push(o)
+    }
+  }
+  return true
+}
+
+// The record literals sharing record literal `x`'s field names, `x` included.
+function ftShapeLitsOf(x: i32): i32[] {
+  if !ftShapeBuilt {
+    ftShapeBuilt = true
+    ftShapeLits = Map()
+    let i = 0
+    while i < P.nodes.length {
+      if nodeAt(i) is ObjLit {
+        const k = ftLitShapeKey(i)
+        const was = ftShapeLits[k] ?? []
+        was.push(i)
+        ftShapeLits[k] = was
+      }
+      i = i + 1
+    }
+  }
+  return ftShapeLits[ftLitShapeKey(x)] ?? []
+}
+
+// Record literal `x`'s field names, in order, joined by commas.
+function ftLitShapeKey(x: i32): string {
+  const n = nodeAt(x)
+  let k = ""
+  if n is ObjLit {
+    for f in n.objFields {
+      const fn = nodeAt(f)
+      k = k + "," + (if fn is FieldInit { fn.fiName } else { "?" })
+    }
+  }
+  return k
+}
+
+// Per field-name key, the record literals of the tree the current decision reads.
+let ftShapeLits: {[string]: i32[]} = Map()
+let ftShapeBuilt = false
+
 // Whether field `name` of record literal `x`, adopted at a hole parameter's record whose field is
 // open, holds set `s` in the literal's own type: after the elaboration the literal is built at
 // that type, which the instance binds the parameter to. Its other fields' sets are decided with
 // `s`, since the record's rep holds ids at all of them or none (D15641).
 function ftOpenFieldHolds(x: i32, name: string, s: i32): boolean {
-  if !ftLate || x < 0 { return false }
+  if !(ftLate || ftUseArrow) || x < 0 { return false }
+  if !ftLate && !ftShapeFieldDecidedWith(x, name, s) { return false }
   const ft = tyFieldTyOf(nodeRepTyIxOf(x), name)
   const lt = nodeTyIxOf(x)
   if (
