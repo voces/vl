@@ -14318,26 +14318,47 @@ function monoPinNestedListElems(
     nodeTyRecord(d.letInit, blt)
     return 1
   }
-  // A list three or more deep nothing calls through is pinned level by level (D16921).
-  const depth = monoNestDepth(d.letInit)
+  // A list three or more deep is pinned level by level, and only where nothing calls its slot
+  // (D16921).
+  let depth = monoNestDepth(d.letInit)
   if depth > 2 {
     const dpath: string[] = []
     while dpath.length < depth { dpath.push("e") }
     if !elabSlotUncalled(at, dpath) { return 0 }
-    return monoPinDeepListElems(d, lf, repoints, depth)
-  }
-  const inner: i32[] = []
-  const vals: i32[] = []
-  for e in lit.arrElems {
-    const x = unwrapParen(e)
-    if x < 0 || x >= P.nodes.length { return 0 }
-    const il = nodeAt(x)
-    if !(il is ArrayLit) || il.arrElems.length == 0 { return 0 }
-    inner.push(x)
-    for v in il.arrElems { vals.push(v) }
-  }
-  const pins = monoDeclPathPins(lf, ["e", "e"])
-  if pins.length != 1 || repoints.length > 0 {
+  } else {
+    depth = 2
+    const inner: i32[] = []
+    const vals: i32[] = []
+    for e in lit.arrElems {
+      const x = unwrapParen(e)
+      if x < 0 || x >= P.nodes.length { return 0 }
+      const il = nodeAt(x)
+      if !(il is ArrayLit) || il.arrElems.length == 0 { return 0 }
+      inner.push(x)
+      for v in il.arrElems { vals.push(v) }
+    }
+    const pins = monoDeclPathPins(lf, ["e", "e"])
+    if pins.length == 1 && repoints.length == 0 {
+      const dTys: i32[] = []
+      // The inner element's type is the elaboration's slot fact, at this frame's instance.
+      const ft = elabSlotTyAt(at, ["e", "e"], ctx)
+      if ft < 0 || ft >= T.tys.length || !monoTyClosedFn(ft) { return 0 }
+      for v in vals {
+        if monoCoerceFnValueTys(v, ctx, -1, dTys, ft) < 0 { return -1 }
+      }
+      const fty = tyAt(ft)
+      if !(fty is TyFunc) { return 0 }
+      const it = mkArrayTy(ft)
+      const lt = mkArrayTy(it)
+      d.letType = synthTypeRefOfTy(lt, -1)
+      nodeTyRecord(d.letInit, lt)
+      for x in inner { nodeTyRecord(x, it) }
+      for v in vals {
+        const et = nodeTyIxOf(v)
+        if et < 0 || tyHasTyVar(et) { nodeTyRecord(v, ft) }
+      }
+      return 1
+    }
     // A slot nothing calls, or one whose every read now names its generic (D9711), takes the
     // type its functions hold at no call, as the flat list does.
     if pins.length == 0 && !elabSlotUncalled(at, ["e", "e"]) { return 0 }
@@ -14347,27 +14368,35 @@ function monoPinNestedListElems(
     ) {
       return 0
     }
-    // It is annotated at the type `monoUncalledSlotFnTy` gives the functions it holds.
-    return monoPinDeepListElems(d, lf, repoints, 2)
   }
-  const dTys: i32[] = []
-  // The inner element's type is the elaboration's slot fact, at this frame's instance.
-  const ft = elabSlotTyAt(at, ["e", "e"], ctx)
-  if ft < 0 || ft >= T.tys.length || !monoTyClosedFn(ft) { return 0 }
-  for v in vals {
-    if monoCoerceFnValueTys(v, ctx, -1, dTys, ft) < 0 { return -1 }
+  // It and its re-points take the type `monoUncalledSlotFnTy` gives the functions they hold.
+  const path: string[] = []
+  while path.length < depth { path.push("e") }
+  const nlits: i32[] = []
+  const lvls: i32[] = []
+  const held: i32[][] = []
+  if !monoNestCollect(d.letInit, 0, depth, ctx, nlits, lvls, held) { return 0 }
+  let ri = 0
+  while ri + 1 < repoints.length {
+    if monoNestDepth(repoints[ri]) != depth { return 0 }
+    if (
+      !monoNestCollect(
+        repoints[ri],
+        0,
+        depth,
+        repoints[ri + 1],
+        nlits,
+        lvls,
+        held,
+      )
+    ) {
+      return 0
+    }
+    ri = ri + 2
   }
-  const fty = tyAt(ft)
-  if !(fty is TyFunc) { return 0 }
-  const it = mkArrayTy(ft)
-  const lt = mkArrayTy(it)
-  d.letType = synthTypeRefOfTy(lt, -1)
-  nodeTyRecord(d.letInit, lt)
-  for x in inner { nodeTyRecord(x, it) }
-  for v in vals {
-    const et = nodeTyIxOf(v)
-    if et < 0 || tyHasTyVar(et) { nodeTyRecord(v, ft) }
-  }
+  const ult = monoNestUncalledTy(at, path, depth, nlits, lvls, held)
+  if ult < 0 { return 0 }
+  d.letType = synthTypeRefOfTy(ult, -1)
   return 1
 }
 
@@ -14407,45 +14436,6 @@ function monoNestCollect(
     }
   }
   return true
-}
-
-// `monoPinNestedListElems` for a binding `depth` lists deep whose slot nothing calls: it and its
-// `repoints` take the type their functions hold at no call, each level a list of the next.
-function monoPinDeepListElems(
-  d: LetDecl,
-  lf: i32[],
-  repoints: i32[],
-  depth: i32,
-): i32 {
-  const at = lf[1]
-  const path: string[] = []
-  while path.length < depth { path.push("e") }
-  const lits: i32[] = []
-  const lvls: i32[] = []
-  const held: i32[][] = []
-  if !monoNestCollect(d.letInit, 0, depth, lf[0], lits, lvls, held) { return 0 }
-  let ri = 0
-  while ri + 1 < repoints.length {
-    if monoNestDepth(repoints[ri]) != depth { return 0 }
-    if (
-      !monoNestCollect(
-        repoints[ri],
-        0,
-        depth,
-        repoints[ri + 1],
-        lits,
-        lvls,
-        held,
-      )
-    ) {
-      return 0
-    }
-    ri = ri + 2
-  }
-  const lt = monoNestUncalledTy(at, path, depth, lits, lvls, held)
-  if lt < 0 { return 0 }
-  d.letType = synthTypeRefOfTy(lt, -1)
-  return 1
 }
 
 // Types the list literals `lits` (each at its level `lvls` below the top) and the functions
