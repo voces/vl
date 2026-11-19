@@ -1303,7 +1303,11 @@ import {
   widenSrcWrapSlot,
   widenTmpSlot,
 } from "./emit_if_arm_values"
-import { isScalarBackedListRep, nulListBase } from "./emit_list_rep"
+import {
+  isScalarBackedListRep,
+  nulListBase,
+  vkNonNullRefTwin,
+} from "./emit_list_rep"
 import {
   arrElemIsNulBoolAt,
   arrElemIsNullUnitAt,
@@ -8290,14 +8294,27 @@ export function variantFieldTail(vi: i32, idx: i32, memIx: i32, fnIx: i32) {
 }
 
 // Whether `emitExpr` reads member `memIx` through `emitMem`'s plain arms: no null-unit or niche
-// read, no `length`, no two-list use, and a receiver read raw.
+// read, no `length` but a record's own field, no two-list use, and a receiver read raw unless it is
+// a field read, which recovers itself.
 function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   const m = nodeAt(memIx)
-  if !(m is Member) || m.memProp == "length" { return false }
+  if !(m is Member) { return false }
+  if m.memProp == "length" && !lengthIsField(m, memIx, fnIx) { return false }
   if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
+  // A field read's receiver recovers in its own read; any other receiver owing one is not plain.
   return twoListUseMsg(m.memObj, m.memProp, fnIx) == ""
-    && !readOwesNonNullRecover(m.memObj, fnIx)
+    && (nodeAt(m.memObj) is Member || !readOwesNonNullRecover(m.memObj, fnIx))
+}
+
+// Whether `.length` read `m` at `memIx` is a record's own field, which `emitMemberNode` reads as
+// any field: a struct or variant receiver, with no list-fit grow row and no union-of-containers arm.
+function lengthIsField(m: Member, memIx: i32, fnIx: i32): boolean {
+  const o = m.memObj
+  if structIndexOfExpr(o, fnIx) < 0 && exprVariantIndex(o, fnIx) < 0 {
+    return false
+  }
+  return listFitGrowRow(o, -1, fnIx) < 0 && !armSiteReads(memIx, fnIx)
 }
 
 // The field `emitExpr` reads off a bare variant receiver in `emitMemVariantRead`'s plain form,
@@ -8315,12 +8332,14 @@ export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   return if fieldStoresRead(uFieldStart[vi] + idx, memIx, fnIx) { idx } else { -1 }
 }
 
-// Whether flat field row `row` stores the kind member read `memIx` records, or its nullable
-// string twin the field read recovers: a row adopted at another kind converts at the delivery.
+// Whether flat field row `row` stores the kind member read `memIx` records, or its nullable twin
+// the read recovers (`emitReadRecover`): a row adopted at another kind converts at the delivery.
 function fieldStoresRead(row: i32, memIx: i32, fnIx: i32): boolean {
   const sk = fieldRowStorageKind(row)
   const rk = repOfNode(memIx, fnIx).rdKind
-  return sk != null && (sk == rk || sk == "nulstr" && rk == "str")
+  if sk == null { return false }
+  if sk == rk || sk == "nulstr" && rk == "str" { return true }
+  return vkNonNullRefTwin(sk) == rk && readOwesNonNullRecover(memIx, fnIx)
 }
 
 // The field `emitExpr` reads off a plain struct receiver in `emitMemStructRead`'s plain form, or
@@ -23433,10 +23452,7 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   const prim = nodeTyPrimName(w)
   if prim != "" && prim != "string" { return placePrePathWhy(w, fnIx) }
   if coerceKindAt(ix, fnIx) != "none" { return "pre-path coercion" }
-  const tagLeaf = fnTagLeafId(ix)
-  if tagLeaf >= 0 && monoTokenReturnedFe(ix, fnIx) < 0 {
-    return "pre-path tag leaf"
-  }
+  if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
   if hookTakesAtom(ix, fnIx) && !(nodeAt(w) is StrLit) {
@@ -23458,6 +23474,14 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
     }
   }
   return placePrePathWhy(ix, fnIx)
+}
+
+// The member id node `ix` is written as, a tagged function set's value, or -1. A maker twin's
+// returned member is the closure its token names, not the id (D14825). Legacy and the IR share it.
+export function fnTagLeafEmitted(ix: i32, fnIx: i32): i32 {
+  const id = fnTagLeafId(ix)
+  if id < 0 || monoTokenReturnedFe(ix, fnIx) >= 0 { return -1 }
+  return id
 }
 
 // `emitExpr`'s null-unit and niche reads of a place or method call `ix`, or "".
@@ -23497,9 +23521,8 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
     return 0
   }
   // A tagged function set's value is its member's id, and a call through one dispatches on it.
-  // A maker twin's returned member is the closure its token names, not the id (D14825).
-  const tagLeaf = fnTagLeafId(exprIx)
-  if tagLeaf >= 0 && monoTokenReturnedFe(exprIx, fnIx) < 0 {
+  const tagLeaf = fnTagLeafEmitted(exprIx, fnIx)
+  if tagLeaf >= 0 {
     fbI32Const(tagLeaf)
     return 0
   }
