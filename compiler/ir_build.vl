@@ -114,7 +114,7 @@ import {
   holeBoxTyAt,
   identReadArmOf,
   idxStorePlainWhy,
-  ifExprPlainKind,
+  ifExprPlainWhy,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -129,7 +129,8 @@ import {
   legacyContextLiveWhy,
   lowMemFoldsCallee,
   mapFilterWhy,
-  mapGetOrHelperRoute,
+  mapGetOrArmOf,
+  mapGetOrMvPlain,
   mapKeyArmOf,
   mapRecvIsSet,
   mapRecvShapeOf,
@@ -246,6 +247,7 @@ import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
   callSpillsFcpArg,
   elseLessNullableTail,
+  exprIsStrIndexOf,
   lastStmtIsValueIf,
 } from "./emit_fn_scans"
 import {
@@ -865,7 +867,16 @@ function localVarAt(w: i32): i32 {
   return ib.irLocalAt[w] ?? -1
 }
 
-// A value `if` on legacy's plain scalar path (`ifExprPlainKind`): a slotless out each arm's one
+// Whether condition `ix` is an `is` test or its negation, the shapes `staticIsGuard` reads back.
+function condIsTest(ix: i32): boolean {
+  const c = nodeAt(unwrapParen(ix))
+  if c is Unary {
+    return c.unOp == "!" && nodeAt(unwrapParen(c.unArg)) is IsExpr
+  }
+  return c is IsExpr
+}
+
+// A value `if` on legacy's plain scalar path (`ifExprPlainWhy`): a slotless out each arm's one
 // value writes, as `&&` and `||` build it. An `else` arm whose value is itself a value `if` is the
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
@@ -883,11 +894,16 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   let cix = ix0
   let crep = rep0
   while true {
-    if ifExprPlainKind(cix, ibFnIx) < 0 { return irBMiss("expression if") }
+    const pw = ifExprPlainWhy(cix, ibFnIx)
+    if pw != "" { return irBMiss("expression if " + pw) }
     // Its value stays on the stack from here, so no temp an operand before it built may wait.
     if endsInTemp(cb) { return irBMiss("if after an operand") }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+    // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
+    if c is OImm && condIsTest(n.ifCond) {
+      return irBMiss("decided is condition")
+    }
     const ty = nodeTyAt(cix, ibFnIx)
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
@@ -1495,6 +1511,8 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   let op: StrOp = "slice"
   if exprIsStrMethod(ix, ibFnIx, "cpLen") {
     op = "cplen"
+  } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
+    op = if m.memProp == "includes" { "includes" } else { "indexof" }
   } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
     return missRhs("method " + m.memProp)
   }
@@ -1505,11 +1523,12 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if ifBelowLead(b, at, "method short-circuit operand") {
     return missRhs("method short-circuit operand")
   }
-  // The receiver is a string and every argument an i32.
+  // The receiver is a string, a needle a string, and every other argument an i32.
+  const argPrim = if op == "indexof" || op == "includes" { "str" } else { "i32" }
   let i = 0
   while i < args.length {
     const p = repPrim(irBOpRep(args[i]))
-    if p == null || (if i == 0 { p != "str" } else { p != "i32" }) {
+    if p == null || (if i == 0 { p != "str" } else { p != argPrim }) {
       return missRhs("method operand coercion")
     }
     i = i + 1
@@ -2094,17 +2113,22 @@ function strInnerOf(r: i32): i32 {
   return -1
 }
 
-// `g[k] ?? d` along legacy's helper route only (`mapGetOrHelperRoute`): a map global read
-// plainly, a key written as itself (`mapKeyArmOf`), and an i32 default the helper's miss holds.
+// `g[k] ?? d` along legacy's helper route, its plain `i32` read or its plain mv slot read
+// (`mapGetOrArmOf`, `mapGetOrMvPlain`): a map global read plainly and a key written as itself
+// (`mapKeyArmOf`); the helper's miss holds an i32 default, and a plain read's miss arm a default
+// that computes nothing ahead of the read.
 function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const lhsIx = unwrapParen(n.binLeft)
   if lhsIx < 0 { return irBMiss("map read") }
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return irBMiss("map read") }
   const rk = coalResultKindOf(ix, ibFnIx)
-  if mapGetOrHelperRoute(rd.idxArr, n.binRight, ibFnIx, rk).length != 1 {
-    return irBMiss("map read inline")
+  const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
+  const mv = arm == "mv" && mapGetOrMvPlain(rd.idxArr, n.binRight, ibFnIx)
+  if arm != "helper" && arm != "i32" && !mv {
+    return irBMiss("map read " + arm)
   }
+  const inline = arm != "helper"
   const ka = mapKeyArmOf(
     rd.idxArr,
     rd.idxIndex,
@@ -2112,19 +2136,46 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     mapRecvShapeOf(rd.idxArr, ibFnIx),
   )
   if ka != "plain" { return irBMiss("map key " + ka) }
-  if repPrim(rep) != "i32" { return irBMiss("map read rep") }
+  const rp = repPrim(rep)
+  if !(rp == "i32" || arm == "i32" && rp == "bool" || mv) {
+    return irBMiss("map read rep")
+  }
   const g = mapGlobalOf(rd.idxArr)
   if g < 0 { return irBMiss("map read receiver") }
   const k = irBExpr(b, rd.idxIndex)
   if ibMiss != "" { return k }
+  // The default is written in the miss arm, so it may compute nothing ahead of the read.
+  const at = b.length
+  const dv: Opnd = if inline { irBExpr(b, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
+  if ibMiss != "" { return dv }
+  if !defaultSelfContained(b, at, dv) {
+    return irBMiss("map read default computes")
+  }
+  if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
   const sid = sidOfNode(rd.idxArr)
   const r: Rhs = {
     mgSym: g,
     mgNonNull: globalReadRecovers(sid, rd.idxArr, ibFnIx),
     mgKey: k,
     mgAt: ix,
+    mgForm: if mv { 2 } else if inline { 1 } else { 0 },
+    mgDef: dv,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// Whether operand `o`, built into `b` from `at` on, computes nothing ahead of its use: a variable or
+// an immediate, or the temp of the one node built, which its use writes in place.
+function defaultSelfContained(b: i32[], at: i32, o: Opnd): boolean {
+  if b.length == at {
+    return !(o is OVar
+      && o.ov >= 0
+      && o.ov < ib.irVars.length
+      && ib.irVars[o.ov].vKind == "temp")
+  }
+  if b.length != at + 1 || !(o is OVar) { return false }
+  const n = ib.irNodes[b[at]]
+  return n is SLet && n.lDst == o.ov
 }
 
 // The module global map read `recvIx` names, its rep noted in `ib`; -1 for any other receiver.
@@ -2873,9 +2924,16 @@ function tailIf(b: i32[], ix: i32) {
   if !(n is IfStmt) { return skip("tail if node") }
   const why = tailIfPlainWhy(ix)
   if why != "" { return skip(why) }
-  const c = irBExpr(b, n.ifCond)
+  // A decided `false` `is` writes no then arm (`emitGuardCond`); another constant `is` is one
+  // legacy decides off its bytes, so it is a miss.
+  const decided = isDecidedFalse(n.ifCond, ibFnIx)
+  const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+  const c = if decided { no } else { irBExpr(b, n.ifCond) }
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-  const thenB = tailArm(n.ifThen)
+  if !decided && c is OImm && condIsTest(n.ifCond) {
+    return skip("decided is condition")
+  }
+  const thenB = if decided { [] } else { tailArm(n.ifThen) }
   const elseB: i32[] = []
   if n.ifElse >= 0 && n.ifElse < P.nodes.length && nodeAt(n.ifElse) is IfStmt {
     tailIf(elseB, n.ifElse)

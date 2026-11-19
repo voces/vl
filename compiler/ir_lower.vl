@@ -252,8 +252,15 @@ import {
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
+  mapGetOrArmOf,
   mapGetOrHelperRoute,
+  mapGetOrI32Head,
+  mapGetOrI32Tail,
+  mapGetOrMvHead,
+  mapGetOrMvPlain,
+  mapGetOrMvTail,
   mapHasTail,
+  mapPrepProbeTail,
   mapRecvIsSet,
   mapRecvKeyTail,
   mapRecvRefTail,
@@ -1055,7 +1062,9 @@ function printOp(r: RPrint) {
   return printScalarTail(arm)
 }
 
-// `RMapGetOr`: legacy's `__map_get_<row>__` helper minted first, then the global, its recovery,
+// `RMapGetOr`, inline: the global, its recovery, the key and the op context, then legacy's probe,
+// its plain read's head, the default and the tail. Otherwise legacy's `__map_get_<row>__` helper
+// minted first, then the global, its recovery,
 // the key and the op context, then the call, as `emitMapGetCall` writes them.
 function mapGetOr(r: RMapGetOr) {
   const fnIx = lw.irAt
@@ -1067,11 +1076,29 @@ function mapGetOr(r: RMapGetOr) {
   const rd = nodeAt(lhsIx)
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
-  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
-  if miss.length != 1 { return irLMiss("map read route") }
+  const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
+  const want = if r.mgForm == 1 { "i32" } else if r.mgForm == 2 { "mv" } else { "helper" }
+  if (
+    arm != want
+    || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+  ) {
+    return irLMiss("map read route")
+  }
   if userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
     return irLMiss("map read of a global not read plainly")
   }
+  if r.mgForm > 0 {
+    const sh = mapRecvShapeOf(rd.idxArr, fnIx)
+    globalRead(r.mgSym, r.mgNonNull)
+    mapRecvRefTail(rd.idxArr, fnIx)
+    irLOpnd(r.mgKey)
+    mapRecvKeyTail(sh)
+    mapPrepProbeTail()
+    if r.mgForm == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+    irLOpnd(r.mgDef)
+    return if r.mgForm == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+  }
+  const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
   globalRead(r.mgSym, r.mgNonNull)
   mapRecvRefTail(rd.idxArr, fnIx)

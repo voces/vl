@@ -974,3 +974,21 @@ Deno.test({
     }
   },
 });
+
+// A value `if` and a returned `if` whose condition is an `is` tag test: legacy writes the test
+// and both arms as they are, so each function builds and matches legacy's bytes.
+const IS_COND_IF =
+  `function f(v: i32 | string): i32 {\n  const w = if v is i32 { 1 } else { 2 }\n  return w + 1\n}\nfunction g(v: i32 | string): i32 {\n  return if v is string { 3 } else { 4 }\n}\nprint(f(5))\nprint(f("x"))\nprint(g(5))\nprint(g("x"))\n`;
+Deno.test({
+  name: "ir shadow: an if on an is condition, valued or returned, builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(IS_COND_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
