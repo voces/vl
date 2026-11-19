@@ -20,8 +20,21 @@ import { irLowerHelper } from "./ir_lower"
 import { irVerify } from "./ir_verify"
 import { emitFail } from "./emit_bytes"
 import { repNodeOfTy, repRawOf } from "./emit_rep"
-import { TY_BOOL, TY_F64, TY_I32 } from "./check_types"
-import { aTy, ba8Ty, bl8Ty, helpUtf8DecFn, sBackTy, sTy } from "./emit_state"
+import { TY_BOOL, TY_F64, TY_I32, TY_NEVER } from "./check_types"
+import {
+  AS_FAIL_DOMS,
+  aTy,
+  ba8Ty,
+  bl8Ty,
+  gInitGIdx,
+  gInitGLocs,
+  gInitGNames,
+  gInitReaders,
+  helpUtf8DecFn,
+  sBackTy,
+  sTy,
+} from "./emit_state"
+import { RS_GNAME, RS_GREAD, relSkew } from "./emit_reloc"
 
 let hf: IrFn = irFnNew(-1, "")
 // The bodies being built, innermost last.
@@ -672,4 +685,127 @@ export function irUtf8CpLenFnCode(out: u8[]): i32 {
   loopIn(0, close())
   ret(n)
   return finish("__utf8_cplen__", out)
+}
+
+// Nonzero `v` read as the bool an `if` takes.
+function truthy(v: Opnd): Opnd { return raw(BOOL(), "test", -1, [v], 0) }
+
+function trapIf(c: Opnd) {
+  open()
+  put({ tpWhy: 0 })
+  when(c, close())
+}
+
+// `text` streamed through `__print_char__` (import 2), unflushed.
+function printText(text: string) {
+  for cp in text { eff("call", -1, [i32(cp)], 2) }
+}
+
+// `__log__(offset, length)`: prints each tag/value pair of the linear-memory log, as the host's
+// `__log__` import would. A nonzero tag traps: only plain i32 values are decoded.
+export function irMemLogFnCode(out: u8[]): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const off = param(I32())
+  const len = param(I32())
+  const cur = local(I32(), 2)
+  set(cur, off)
+  open()
+  exitIf(test("ge", cur, add(off, len)), 0)
+  trapIf(truthy(raw(I32(), "load", -1, [cur], 0)))
+  eff("call", -1, [raw(I32(), "load", -1, [add(cur, i32(4))], 0)], 0)
+  set(cur, add(cur, i32(8)))
+  loopIn(0, close())
+  return finish("__log__", out)
+}
+
+// Prints `strs[k]` when parameter `p` is row `k` of relocation space `sp`, named from `subs[k]`.
+function printPick(p: Opnd, strs: string[], sp: i32, subs: i32[]) {
+  let k = 0
+  while k < strs.length {
+    const c = test(
+      "eq",
+      p,
+      def(I32(), { rlSp: sp, rlSub: subs[k], rlVal: k + relSkew(sp) }),
+    )
+    open()
+    printText(strs[k])
+    when(c, close())
+    k = k + 1
+  }
+}
+
+// `__init_fail__(g, verb, r)`: prints "`name` read|written before its initializer ran (place),
+// via reader" from the guard rows, then traps. Each row's text is here once, however many sites
+// name it.
+export function irInitFailFnCode(out: u8[]): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const g = param(I32())
+  const verb = param(I32())
+  const r = param(I32())
+  printPick(g, gInitGNames, RS_GNAME, gInitGIdx)
+  const written = truthy(verb)
+  open()
+  printText("written")
+  const w = close()
+  open()
+  printText("read")
+  put(
+    { siCond: written, siThen: w, siElse: close(), siOut: -1, siElseKw: true },
+  )
+  printText(" before its initializer ran")
+  printPick(g, gInitGLocs, RS_GNAME, gInitGIdx)
+  const readers: i32[] = []
+  while readers.length < gInitReaders.length { readers.push(readers.length) }
+  printPick(r, gInitReaders, RS_GREAD, readers)
+  eff("call", -1, [], 3)
+  put({ tpWhy: 0 })
+  return finish("__init_fail__", out)
+}
+
+function divu(a: Opnd, b: Opnd): Opnd { return instr(I32(), 0x6e, [a, b]) }
+
+// Prints `x`, a non-negative i32, in decimal: `p` climbs to x's leading power of ten, then each
+// digit is `x / p % 10` as `p` falls to zero.
+function printDecimal(x: Opnd, p: OVar) {
+  set(p, i32(1))
+  open()
+  const grow = instr(BOOL(), 0x4f, [divu(x, p), i32(10)])
+  open()
+  set(p, op(I32(), "mul", p, i32(10)))
+  hb[hb.length - 1].push(br(0))
+  when(grow, close())
+  loop(0, close())
+  open()
+  eff("call", -1, [add(instr(I32(), 0x70, [divu(x, p), i32(10)]), i32(48))], 2)
+  exitIf(truthy(tee(p, divu(p, i32(10)))), 1)
+  loop(1, close())
+}
+
+// `__as_fail__(line, colRow)`: prints "as! <domain> at <line>:<col>: not exact" and returns; each
+// site traps after it, so a reason costs a site one call.
+export function irAsFailFnCode(out: u8[]): i32 {
+  begin(repNodeOfTy(TY_NEVER))
+  const line = param(I32())
+  const colRow = param(I32())
+  const p = local(I32(), 2)
+  printText("as! ")
+  let k = 0
+  while k < AS_FAIL_DOMS.length {
+    const c = test("eq", op(I32(), "and", colRow, i32(7)), i32(k))
+    open()
+    printText(AS_FAIL_DOMS[k])
+    when(c, close())
+    k = k + 1
+  }
+  const placed = truthy(line)
+  open()
+  printText(" at ")
+  printDecimal(line, p)
+  printText(":")
+  if colRow is OVar { set(colRow, shru(colRow, 3)) }
+  printDecimal(colRow, p)
+  when(placed, close())
+  printText(": not exact")
+  eff("call", -1, [], 3)
+  return finish("__as_fail__", out)
 }
