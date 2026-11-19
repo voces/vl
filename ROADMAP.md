@@ -78,6 +78,10 @@ that owns each one. The detail lives in that doc, and each fact has one home.
   narrowing ends at any write the checker cannot rule out, including writes through aliases and
   callees it cannot see into. Tracking indirect writes precisely (alias and effect summaries) keeps
   more narrowings alive. DECISIONS.md §"`is K[]` tests a list's contents".
+- **Handing a narrowed list on when it cannot escape** (owner ruling 2026-11-19). A list
+  narrowed by `is K[]` is not delivered as `K[]`. A purity or escape analysis could allow the
+  delivery where the receiver provably neither keeps nor writes it. DECISIONS.md §"A narrowed list
+  is not handed on as `K[]`".
 - **Flow-sensitive reads of a `let`** (owner ruling B, 2026-11-02). A read of a `let` takes
   the type of the most recent write in scope, not the join of every write. DECISIONS.md §"A
   read of a `let` takes its most recent write's type". The `let x = null`, annotated-union and
