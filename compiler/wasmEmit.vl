@@ -31464,173 +31464,265 @@ function emitMfCallbackValue(argIx: i32, cbFe: i32, fnIx: i32) {
   return 0
 }
 
-function emitMapFilter(callIx: i32, fnIx: i32) {
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      const isMap = callee.memProp == "map"
-      if c.callArgs.length != 1 {
-        return emitFail(
-          "emitProgram: internal: .map/.filter reached with the wrong argument count — the checker's arity rule refuses it",
-        )
-      }
-      const recvK = mfRecvKindOf(callee.memObj, fnIx)
-      if recvK == null {
-        return emitFail(
-          "emitProgram: .map/.filter receiver is not a supported list",
-        )
-      }
-      const resK = mfResultKindOf(callIx, fnIx)
-      if resK == null {
-        return emitFail("emitProgram: unsupported .map/.filter element type")
-      }
-      // The ref-list slot for a kind-2 result (`.filter` over a struct array) — picks the
-      // result backing/wrapper + the matching dst scratch local. -1 for a non-ref result.
-      const dstSlot = mfResultSlotOf(callIx, fnIx)
-      const cbFe = mfCallbackFe(c.callArgs[0], fnIx)
-      const sig = mfCallbackSigOf(c.callArgs[0], cbFe, fnIx)
-      if sig < 0 {
-        return emitFail(
-          "emitProgram: .map/.filter callback signature is not interned",
-        )
-      }
-      const src: MfSrcTys = {
-        srcWrap: -1,
-        srcBack: -1,
-        srcElemRef: false,
-        srcSlot: -1,
-      }
-      if mfSrcTysOf(recvK, callee.memObj, fnIx, src) < 0 { return -1 }
-      const srcWrap = src.srcWrap
-      const srcBack = src.srcBack
-      const srcElemRef = src.srcElemRef
-      const srcSlot = src.srcSlot
-      // The RESULT wrapper/backing heap types.
-      const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
-      if mfDstTysOf(resK, dstSlot, callIx, dst) < 0 { return -1 }
-      const dstWrap = dst.dstWrap
-      const dstBack = dst.dstBack
-      const srcL = mfSrcLocalFor(recvK, srcSlot)
-      const dstL = mfDstLocalFor(resK, dstSlot)
-      if !fnUses.mapFilter || srcL < 0 || dstL < 0 {
-        return emitFail("emitProgram: .map/.filter scratch frame not reserved")
-      }
-      const iL = mfScratchBase
-      const nL = mfScratchBase + 1
-      const jL = mfScratchBase + 2
-      const cL = mfCallbackLocal()
-      // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
-      // receiver chain completes — including its result wrapper — before this store,
-      // so the shared frame slots are free to reuse.)
-      if emitExpr(callee.memObj, fnIx) < 0 { return -1 }
-      // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
-      // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
-      // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
-      if nulRecvNeedsRecover(callee.memObj, fnIx) { fbRefAsNonNull() }
-      svSyncRecv(callee.memObj, fnIx)
-      fbLocalSet(srcL)
-      mfSrcSlot = -1
-      if srcElemRef { mfSrcSlot = srcSlot }
-      mfSvDst = svDstOfKind(scalarListElemKind(callee.memObj, fnIx))
-      mfRv = rvRecvMayView(callee.memObj, fnIx)
-      // clo = the callback's closure value, built ONCE before the loop. An inline
-      // literal / named function constructs it directly; a let-bound value reads its
-      // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
-      // slots written above stay live).
-      if emitMfCallbackValue(c.callArgs[0], cbFe, fnIx) < 0 { return -1 }
-      fbLocalSet(cL)
-      // n = src.len
-      fbLocalGet(srcL)
-      fbStructGet(srcWrap, 1) // field 1: len
-      fbLocalSet(nL)
-      // back = array.new_default <dstBack> n
-      fbLocalGet(nL)
-      fbArrayNewDefault(dstBack)
-      fbLocalSet(dstL)
-      // i = 0 (and j = 0 for filter)
-      fbI32Const(0)
-      fbLocalSet(iL)
-      if !isMap {
-        fbI32Const(0)
-        fbLocalSet(jL)
-      }
-      // block { loop { if i >= n br 1; <element step>; i++; br 0 } }
-      fbBlock(64)  // 0x02 block (void)
-      fbLoop(64)   // 0x03 loop (void)
-      fbLocalGet(iL)
-      fbLocalGet(nL)
-      fbI32Bin(78) // 0x4e i32.ge_s — i >= n?
-      fbBrIf(1)    // exit the block
-      // The length is fixed at entry; an index the callback has since cut off ends a map with
-      // the trap an `xs[i]` read raises, and is skipped by a filter (D3068).
-      fbLocalGet(iL)
-      fbLocalGet(srcL)
-      fbStructGet(srcWrap, 1)
-      fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
-      if isMap {
-        fbIf(64)
-        emitListIdxTrapOf(srcBack, srcL, srcWrap, -1)
-        fbEnd()
-      } else {
-        fbI32Eqz()
-        fbIf(64) // the filter's step, closed after it
-      }
-      if isMap {
-        // back[i] = call_ref(clo, [elem(i)])
-        fbLocalGet(dstL)
-        fbLocalGet(iL)
-        if (emitMfInvoke(cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig) < 0) {
-          return -1
-        }
-        fbArraySet(dstBack) // 0xfb 0x0e <dstBack>
-      } else {
-        // e = elem(i); if call_ref(clo, [e]): back[j] = e; j++. The element is read once, so
-        // the kept value is the one the callback tested, whatever it writes (D3060).
-        let eSlot = 0
-        if resK == "reflist" { eSlot = dstSlot }
-        const eL = listIdxValSlot(resK, eSlot)
-        if emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef) < 0 { return -1 }
-        fbLocalSet(eL)
-        fbLocalGet(cL)
-        fbStructGet(cloStructIdx, 0) // env
-        fbLocalGet(eL)
-        if srcElemRef { fbRefAsNonNull() }
-        fbLocalGet(cL)
-        fbStructGet(cloStructIdx, 1) // the callee's wasm function index
-        fbCallIndirect(sig, gFnTableIdx)
-        fbIf(64)                     // 0x04 if (void)
-        fbLocalGet(dstL)
-        fbLocalGet(jL)
-        fbLocalGet(eL)
-        fbArraySet(dstBack)
-        fbLocalGet(jL)
-        fbI32Const(1)
-        fbI32Bin(106)                // 0x6a i32.add
-        fbLocalSet(jL)
-        fbEnd()
-        fbEnd()                      // the current-length test
-      }
-      fbLocalGet(iL)
-      fbI32Const(1)
-      fbI32Bin(106) // 0x6a i32.add
-      fbLocalSet(iL)
-      fbBr(0)       // continue the loop
-      fbEnd()       // end loop
-      fbEnd()       // end block
-      mfSrcSlot = -1
-      mfSvDst = -1
-      mfRv = false
-      // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
-      fbLocalGet(dstL)
-      if isMap { fbLocalGet(nL) } else { fbLocalGet(jL) }
-      fbLocalGet(nL)
-      fbStructNew(dstWrap)
-      return 0
-    }
+// The plan `.map`/`.filter` call `callIx` is lowered by: what legacy's arm computed before it wrote
+// the receiver. `mfFail` is the refusal to raise, or "-" where a type lookup already raised one.
+export type MfPlan = {
+  mfFail: string,
+  mfIsMap: boolean,
+  mfRecv: i32,
+  mfCb: i32,
+  mfCbFe: i32,
+  mfSig: i32,
+  mfResK: ListKind,
+  mfDstSlot: i32,
+  mfSrc: MfSrcTys,
+  mfDst: MfDstTys,
+  mfSrcL: i32,
+  mfDstL: i32,
+}
+
+function mfRefused(why: string): MfPlan {
+  const src: MfSrcTys = {
+    srcWrap: -1,
+    srcBack: -1,
+    srcElemRef: false,
+    srcSlot: -1,
   }
-  return emitFail("emitProgram: expected a .map/.filter call")
+  const dst: MfDstTys = { dstWrap: -1, dstBack: -1 }
+  const p: MfPlan = {
+    mfFail: why,
+    mfIsMap: false,
+    mfRecv: -1,
+    mfCb: -1,
+    mfCbFe: -1,
+    mfSig: -1,
+    mfResK: "list",
+    mfDstSlot: -1,
+    mfSrc: src,
+    mfDst: dst,
+    mfSrcL: -1,
+    mfDstL: -1,
+  }
+  return p
+}
+
+// Why the IR does not lower `.map`/`.filter` call `callIx`, or "": its receiver and result are
+// lists legacy's arm takes, and its callback a capture-free function or a function-typed binding.
+// It mints nothing, so the builder may ask it ahead of the lowering.
+export function mapFilterWhy(callIx: i32, fnIx: i32): string {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 1 {
+    return "map call"
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return "map call" }
+  if mfRecvKindOf(callee.memObj, fnIx) == null { return "map receiver kind" }
+  if mfResultKindOf(callIx, fnIx) == null { return "map result kind" }
+  const cb = unwrapParen(c.callArgs[0])
+  if cb < 0 { return "map callback" }
+  const cbn = nodeAt(cb)
+  const fe = mfCallbackFe(c.callArgs[0], fnIx)
+  if cbn is FuncDecl || cbn is Ident && cbIdentNamesFn(c.callArgs[0], fnIx) {
+    if fe < 0 || fnEnvIdxOf(fe) >= 0 { return "map callback env" }
+    return ""
+  }
+  if cbn is Ident { return "" }
+  return "map callback expression"
+}
+
+// The plan of `.map`/`.filter` call `callIx`, asked where legacy's arm asks it.
+export function mapFilterPlanOf(callIx: i32, fnIx: i32): MfPlan {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 {
+    return mfRefused("emitProgram: expected a .map/.filter call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) {
+    return mfRefused("emitProgram: expected a .map/.filter call")
+  }
+  if c.callArgs.length != 1 {
+    return mfRefused(
+      "emitProgram: internal: .map/.filter reached with the wrong argument count — the checker's arity rule refuses it",
+    )
+  }
+  const recvK = mfRecvKindOf(callee.memObj, fnIx)
+  if recvK == null {
+    return mfRefused(
+      "emitProgram: .map/.filter receiver is not a supported list",
+    )
+  }
+  const resK = mfResultKindOf(callIx, fnIx)
+  if resK == null {
+    return mfRefused("emitProgram: unsupported .map/.filter element type")
+  }
+  // The ref-list slot for a kind-2 result (`.filter` over a struct array) — picks the
+  // result backing/wrapper + the matching dst scratch local. -1 for a non-ref result.
+  const dstSlot = mfResultSlotOf(callIx, fnIx)
+  const cbFe = mfCallbackFe(c.callArgs[0], fnIx)
+  const sig = mfCallbackSigOf(c.callArgs[0], cbFe, fnIx)
+  if sig < 0 {
+    return mfRefused(
+      "emitProgram: .map/.filter callback signature is not interned",
+    )
+  }
+  const p = mfRefused("")
+  if mfSrcTysOf(recvK, callee.memObj, fnIx, p.mfSrc) < 0 {
+    return mfRefused("-")
+  }
+  // The RESULT wrapper/backing heap types.
+  if mfDstTysOf(resK, dstSlot, callIx, p.mfDst) < 0 { return mfRefused("-") }
+  p.mfSrcL = mfSrcLocalFor(recvK, p.mfSrc.srcSlot)
+  p.mfDstL = mfDstLocalFor(resK, dstSlot)
+  if !fnUses.mapFilter || p.mfSrcL < 0 || p.mfDstL < 0 {
+    return mfRefused("emitProgram: .map/.filter scratch frame not reserved")
+  }
+  p.mfIsMap = callee.memProp == "map"
+  p.mfRecv = callee.memObj
+  p.mfCb = c.callArgs[0]
+  p.mfCbFe = cbFe
+  p.mfSig = sig
+  p.mfResK = resK
+  p.mfDstSlot = dstSlot
+  return p
+}
+
+function emitMapFilter(callIx: i32, fnIx: i32) {
+  const p = mapFilterPlanOf(callIx, fnIx)
+  if p.mfFail == "-" { return -1 }
+  if p.mfFail != "" { return emitFail(p.mfFail) }
+  const cL = mfCallbackLocal()
+  // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
+  // receiver chain completes — including its result wrapper — before this store,
+  // so the shared frame slots are free to reuse.)
+  if emitExpr(p.mfRecv, fnIx) < 0 { return -1 }
+  mfRecvTail(p, fnIx)
+  // clo = the callback's closure value, built ONCE before the loop. An inline
+  // literal / named function constructs it directly; a let-bound value reads its
+  // binding (an `Ident` read — it cannot itself contain a HOF site, so the frame
+  // slots written above stay live).
+  if emitMfCallbackValue(p.mfCb, p.mfCbFe, fnIx) < 0 { return -1 }
+  return mfLoopTail(p, cL)
+}
+
+// After a `.map`/`.filter` receiver: its recovery and store, and the element seats the loop reads.
+export function mfRecvTail(p: MfPlan, fnIx: i32) {
+  // A NARROWED nullable-list receiver keeps its nullable slot at EVERY element kind;
+  // the src scratch slot is declared non-null (`fbRefRun` writes `0x64`), so recover
+  // first (checker-guarded, never traps). See `nulRecvNeedsRecover`.
+  if nulRecvNeedsRecover(p.mfRecv, fnIx) { fbRefAsNonNull() }
+  svSyncRecv(p.mfRecv, fnIx)
+  fbLocalSet(p.mfSrcL)
+  mfSrcSlot = -1
+  if p.mfSrc.srcElemRef { mfSrcSlot = p.mfSrc.srcSlot }
+  mfSvDst = svDstOfKind(scalarListElemKind(p.mfRecv, fnIx))
+  mfRv = rvRecvMayView(p.mfRecv, fnIx)
+  return 0
+}
+
+// After a `.map`/`.filter` callback's closure value: its store in `cL`, the loop and the result.
+export function mfLoopTail(p: MfPlan, cL: i32) {
+  const srcWrap = p.mfSrc.srcWrap
+  const srcBack = p.mfSrc.srcBack
+  const srcElemRef = p.mfSrc.srcElemRef
+  const dstWrap = p.mfDst.dstWrap
+  const dstBack = p.mfDst.dstBack
+  const srcL = p.mfSrcL
+  const dstL = p.mfDstL
+  const isMap = p.mfIsMap
+  const resK = p.mfResK
+  const dstSlot = p.mfDstSlot
+  const sig = p.mfSig
+  const iL = mfScratchBase
+  const nL = mfScratchBase + 1
+  const jL = mfScratchBase + 2
+  fbLocalSet(cL)
+  // n = src.len
+  fbLocalGet(srcL)
+  fbStructGet(srcWrap, 1) // field 1: len
+  fbLocalSet(nL)
+  // back = array.new_default <dstBack> n
+  fbLocalGet(nL)
+  fbArrayNewDefault(dstBack)
+  fbLocalSet(dstL)
+  // i = 0 (and j = 0 for filter)
+  fbI32Const(0)
+  fbLocalSet(iL)
+  if !isMap {
+    fbI32Const(0)
+    fbLocalSet(jL)
+  }
+  // block { loop { if i >= n br 1; <element step>; i++; br 0 } }
+  fbBlock(64)  // 0x02 block (void)
+  fbLoop(64)   // 0x03 loop (void)
+  fbLocalGet(iL)
+  fbLocalGet(nL)
+  fbI32Bin(78) // 0x4e i32.ge_s — i >= n?
+  fbBrIf(1)    // exit the block
+  // The length is fixed at entry; an index the callback has since cut off ends a map with
+  // the trap an `xs[i]` read raises, and is skipped by a filter (D3068).
+  fbLocalGet(iL)
+  fbLocalGet(srcL)
+  fbStructGet(srcWrap, 1)
+  fbI32Bin(78) // 0x4e i32.ge_s — i >= the current length?
+  if isMap {
+    fbIf(64)
+    emitListIdxTrapOf(srcBack, srcL, srcWrap, -1)
+    fbEnd()
+  } else {
+    fbI32Eqz()
+    fbIf(64) // the filter's step, closed after it
+  }
+  if isMap {
+    // back[i] = call_ref(clo, [elem(i)])
+    fbLocalGet(dstL)
+    fbLocalGet(iL)
+    if (emitMfInvoke(cL, srcL, iL, srcWrap, srcBack, srcElemRef, sig) < 0) {
+      return -1
+    }
+    fbArraySet(dstBack) // 0xfb 0x0e <dstBack>
+  } else {
+    // e = elem(i); if call_ref(clo, [e]): back[j] = e; j++. The element is read once, so
+    // the kept value is the one the callback tested, whatever it writes (D3060).
+    let eSlot = 0
+    if resK == "reflist" { eSlot = dstSlot }
+    const eL = listIdxValSlot(resK, eSlot)
+    if emitMfElem(srcL, iL, srcWrap, srcBack, srcElemRef) < 0 { return -1 }
+    fbLocalSet(eL)
+    fbLocalGet(cL)
+    fbStructGet(cloStructIdx, 0) // env
+    fbLocalGet(eL)
+    if srcElemRef { fbRefAsNonNull() }
+    fbLocalGet(cL)
+    fbStructGet(cloStructIdx, 1) // the callee's wasm function index
+    fbCallIndirect(sig, gFnTableIdx)
+    fbIf(64)                     // 0x04 if (void)
+    fbLocalGet(dstL)
+    fbLocalGet(jL)
+    fbLocalGet(eL)
+    fbArraySet(dstBack)
+    fbLocalGet(jL)
+    fbI32Const(1)
+    fbI32Bin(106)                // 0x6a i32.add
+    fbLocalSet(jL)
+    fbEnd()
+    fbEnd()                      // the current-length test
+  }
+  fbLocalGet(iL)
+  fbI32Const(1)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iL)
+  fbBr(0)       // continue the loop
+  fbEnd()       // end loop
+  fbEnd()       // end block
+  mfSrcSlot = -1
+  mfSvDst = -1
+  mfRv = false
+  // result = wrapper{ back, len, cap }: len = n (map) / j (filter), cap = n.
+  fbLocalGet(dstL)
+  if isMap { fbLocalGet(nL) } else { fbLocalGet(jL) }
+  fbLocalGet(nL)
+  fbStructNew(dstWrap)
+  return 0
 }
 
 // The wrapper and backing heap types of a `.map`/`.filter` result list.
