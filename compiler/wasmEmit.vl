@@ -20593,9 +20593,12 @@ export function strEqTail(e: BinExpr, binIx: i32, lit: i32, fnIx: i32) {
   } else if emitEqNonNullCore(binIx, fnIx) < 0 {
     return -1
   }
-  if e.binOp == "!=" {
-    fbI32Eqz() // 0x45 i32.eqz  (`!=` negates value-equality)
-  }
+  return strEqNegTail(e)
+}
+
+// `!=` negates value-equality: `i32.eqz` after the 0/1 a string `==` left.
+export function strEqNegTail(e: BinExpr) {
+  if e.binOp == "!=" { fbI32Eqz() }
   return 0
 }
 
@@ -20758,42 +20761,62 @@ function emitStrBytesEq(bytes: i32[]) {
   return 0
 }
 
-// Compare the string on the stack with literal node `litIx`, leaving the 0/1 result: a length
-// other than the literal's answers 0 without evaluating the literal or calling `__str_eq__`,
-// and an empty or short literal is compared in place without the call either.
-// The operand waits in the string-op frame's last slot; without that frame it is the bare call.
-function emitStrEqLit(litIx: i32, fnIx: i32) {
+// The form a string compare with quoted literal `litIx` takes: 0 the core over the pushed
+// literal; 1 an empty literal, a length test alone; 2 a short literal compared in place; 3 the
+// `__str_eq__` call under the length test. Forms 0 and 3 write the literal, 1 and 2 never do.
+// Forms 1 to 3 hold the other operand in the string-op frame's last slot.
+export function strEqLitForm(litIx: i32): i32 {
   const n = strLitLenOf(litIx)
-  if n < 0 || !fnUses.strOp {
-    if emitStrValue(litIx, fnIx) < 0 { return -1 }
-    return emitStrEqCore()
+  if n < 0 || !fnUses.strOp { return 0 }
+  if n == 0 { return 1 }
+  if (
+    n <= STR_EQ_INLINE_BYTES
+    && litIx < P.nodes.length
+    && nodeAt(litIx) is StrLit
+  ) {
+    return 2
   }
+  return 3
+}
+
+// Writes form `f`'s code before its literal: forms 1 and 2 whole, form 3 the length test and the
+// held operand's read. A length other than the literal's answers 0 without the literal.
+export function strEqLitHead(litIx: i32, f: i32) {
+  if f == 0 { return 0 }
   fbLocalTee(strScratchBase + 11)
   fbStrLen()
-  if n == 0 {
-    fbI32Eqz()
-    return 0
-  }
-  fbI32Const(n)
+  if f == 1 { return fbI32Eqz() }
+  fbI32Const(strLitLenOf(litIx))
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(127)    // if (result i32)
-  if n <= STR_EQ_INLINE_BYTES && litIx < P.nodes.length {
-    const lit = nodeAt(litIx)
-    if lit is StrLit {
-      emitStrBytesEq(cpsToUtf8(decodeStr(strToCps(lit.strText))))
-      fbElse()
-      fbI32Const(0)
-      fbEnd()
-      return 0
-    }
+  if f == 3 { return fbLocalGet(strScratchBase + 11) }
+  const lit = nodeAt(litIx)
+  if lit is StrLit {
+    emitStrBytesEq(cpsToUtf8(decodeStr(strToCps(lit.strText))))
   }
-  fbLocalGet(strScratchBase + 11)
-  if emitStrValue(litIx, fnIx) < 0 { return -1 }
+  fbElse()
+  fbI32Const(0)
+  return fbEnd()
+}
+
+// Writes form `f`'s code after its literal.
+export function strEqLitTail(f: i32) {
+  if f == 0 { return emitStrEqCore() }
+  if f != 3 { return 0 }
   fbCall(helpStrEqFn())
   fbElse()
   fbI32Const(0)
-  fbEnd()
-  return 0
+  return fbEnd()
+}
+
+// Compares the string on the stack with literal node `litIx`, leaving the 0/1 result.
+function emitStrEqLit(litIx: i32, fnIx: i32) {
+  const f = strEqLitForm(litIx)
+  strEqLitHead(litIx, f)
+  if f == 0 || f == 3 {
+    if emitStrValue(litIx, fnIx) < 0 { return -1 }
+  }
+  return strEqLitTail(f)
 }
 
 // ── list value-equality + concat cores (collections-design §VL.4/§VL.6) ───────
@@ -21762,7 +21785,7 @@ function emitCloEqCore() {
 // stack as non-null refs. Leaves the 0/1 equality answer, never the negation — `!=`
 // belongs to the caller. Shared by the plain compare paths and `emitNulNicheEq`, so a rep
 // the plain compare handles is a rep the nullable form handles by construction — two ladders is how the two drift apart.
-function emitEqNonNullCore(binIx: i32, fnIx: i32) {
+export function emitEqNonNullCore(binIx: i32, fnIx: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
     // One ask, threaded into both users below — the `coreK == 7` arm's own generic-rep
@@ -25020,27 +25043,42 @@ function emitNumExactCastFrom(
   srcIn: string,
   fnIx: i32,
 ) {
-  const tgt = asExprNumTgtName(exprIx)
-  // The domain and the target are two names (D1587): the domain decides the range test and
-  // the `as!` message, the target decides the conversion opcode and the box row. At `u8`
-  // they differ; everywhere else they are the same string.
-  const dom = asExprNumCastDomain(exprIx)
-  // An i32 source exists only at the `u8` domain, and rides the i64 path rather than a
-  // fourth scratch slot: `i64.extend_i32_s` is exact for every i32, the range test is the
-  // same two compares, and `i32.wrap_i64` brings the proven 0..255 value back unchanged.
-  let src = srcIn
-  if src == "i32" { src = "i64" }
-  // Stage the operand ONCE — the test reads it up to three times and it is typically a call.
-  if src == "i64" {
-    if emitExprAsKind(e.asObj, 3, fnIx) < 0 { return -1 }
-    fbLocalSet(numCastStashSlot(2))
-  } else if src == "f32" {
-    if emitExprAsKind(e.asObj, 5, fnIx) < 0 { return -1 }
-    fbLocalSet(numCastStashSlot(1))
-  } else {
-    if emitExprAsKind(e.asObj, 4, fnIx) < 0 { return -1 }
-    fbLocalSet(numCastStashSlot(0))
+  if emitExprAsKind(e.asObj, numExactCastKind(srcIn), fnIx) < 0 { return -1 }
+  return numExactCastTail(exprIx, srcIn, fnIx)
+}
+
+// The value kind `emitNumExactCastFrom` builds a `src` operand at: i64, f32, else f64. An i32
+// source exists only at the `u8` domain and rides the i64 path rather than a fourth scratch
+// slot: `i64.extend_i32_s` is exact, and `i32.wrap_i64` brings the proven 0..255 value back.
+export function numExactCastKind(src: string): i32 {
+  if src == "i32" || src == "i64" { return 3 }
+  if src == "f32" { return 5 }
+  if src == "f64" { return 4 }
+  return numCastSrcFail(src)
+}
+
+// A numeric cast whose source is no number, which `numCastCanFail` and `numCastSrcRepOf` never
+// hand the kinds above.
+function numCastSrcFail(src: string): i32 {
+  return emitFail(
+    "emitProgram: a numeric cast's source `" + src + "` is not a number",
+  )
+}
+
+// After `numExactCastKind`'s operand: staged once, since the test reads it up to three times,
+// then the test, the mode's sad path and the conversion.
+export function numExactCastTail(exprIx: i32, srcIn: string, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) {
+    return emitFail("emitProgram: a numeric cast's tail lost its cast")
   }
+  // The domain decides the range test and the `as!` message, the target the conversion opcode
+  // and the box row; they differ only at `u8` (D1587).
+  const tgt = asExprNumTgtName(exprIx)
+  const dom = asExprNumCastDomain(exprIx)
+  const k = numExactCastKind(srcIn)
+  const src = if srcIn == "i32" { "i64" } else { srcIn }
+  fbLocalSet(numCastStashSlot(if k == 3 { 2 } else if k == 5 { 1 } else { 0 }))
   const integral = src != "i64" && exprIsIntegralFloat(e.asObj, fnIx)
   if emitNumExactTest(src, dom, integral) < 0 { return -1 }
   if e.asMode == "null" {
@@ -25112,53 +25150,98 @@ function emitHoleNumCastMiss(e: AsExpr, exprIx: i32, fnIx: i32) {
 // consumer write a 32-bit bit pattern.
 function emitNumWrapCast(e: AsExpr, exprIx: i32, fnIx: i32) {
   const obj = e.asObj
-  const dom = asExprNumCastDomain(exprIx)
-  let tgt = asExprNumTgtName(exprIx)
-  if tgt == "" { tgt = e.asTy }
-  // A float on either side and a union operand are both refused at check; these are the
-  // floors for an operand whose width only the emitted rep knows.
+  return match asWrapArmOf(exprIx, fnIx) {
+    "floatFloor" => emitFail(
+      "emitProgram: `as% "
+        + e.asTy
+        + "` wraps between integer widths, and this cast names a float — use `as!` or `as?`",
+    )
+    "unionFloor" => emitFail(
+      "emitProgram: `as% "
+        + e.asTy
+        + "` wraps a number, and this operand is a union — take the numeric arm first",
+    )
+    "narrowMask" => srEmitNarrowed(srWrappedMask(exprIx, fnIx), fnIx)
+    "litFold" => emitNumWrapLit(obj, exprIx)
+    "plain" => emitNumWrapPlain(obj, exprIx, fnIx)
+  }
+}
+
+function emitNumWrapPlain(obj: i32, exprIx: i32, fnIx: i32) {
+  if emitExprAsKind(obj, numWrapCastKind(exprIx, fnIx), fnIx) < 0 { return -1 }
+  return numWrapCastTail(exprIx, fnIx)
+}
+
+// The arm `emitNumWrapCast` takes: a float or union operand, both refused at check, is a floor
+// for an operand whose width only the emitted rep knows; `((y >>> k) & m) as% i32` narrows to
+// i32 ops when the mask stays in the low word; an integer literal folds to its constant.
+export type AsWrapArm = "floatFloor"
+  | "unionFloor"
+  | "narrowMask"
+  | "litFold"
+  | "plain"
+
+export function asWrapArmOf(exprIx: i32, fnIx: i32): AsWrapArm {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "unionFloor" }
+  const obj = e.asObj
+  const tgt = wrapCastTgt(exprIx)
   if (
     exprIsF32(obj, fnIx)
     || exprIsF64(obj, fnIx)
     || tgt == "f32"
     || tgt == "f64"
   ) {
-    return emitFail(
-      "emitProgram: `as% "
-        + e.asTy
-        + "` wraps between integer widths, and this cast names a float — use `as!` or `as?`",
-    )
+    return "floatFloor"
   }
-  if asExprIsUnionCastIn(exprIx, fnIx) {
-    return emitFail(
-      "emitProgram: `as% "
-        + e.asTy
-        + "` wraps a number, and this operand is a union — take the numeric arm first",
-    )
-  }
-  // An i64 target is the sign-extend, which the i64 helper already is for both sources.
-  if tgt == "i64" { return emitExprAsKind(obj, 3, fnIx) }
-  // `((y >>> k) & m) as% i32` narrows to i32 ops when the mask stays in the low word.
-  const nsrc = srWrappedMask(exprIx, fnIx)
-  if nsrc.length > 0 { return srEmitNarrowed(nsrc, fnIx) }
+  if asExprIsUnionCastIn(exprIx, fnIx) { return "unionFloor" }
+  if tgt == "i64" { return "plain" }
+  if srWrappedMask(exprIx, fnIx).length > 0 { return "narrowMask" }
   const lit = nodeAt(unwrapParen(obj))
-  let folded = false
   if lit is NumLit {
-    if !numLexIsFloat(lit.numText) {
-      const pr = parseI64Pair(lit.numText)
-      fbI32Const(pr[1])
-      folded = true
-    }
+    if !numLexIsFloat(lit.numText) { return "litFold" }
   }
-  if !folded {
-    if exprIsI64(obj, fnIx) {
-      if emitExprAsKind(obj, 3, fnIx) < 0 { return -1 }
-      fbI32WrapI64()
-    } else if emitExprAsKind(obj, 0, fnIx) < 0 {
-      return -1
-    }
+  return "plain"
+}
+
+// The wrap cast's target: the node's numeric target, else its spelling.
+function wrapCastTgt(exprIx: i32): string {
+  const tgt = asExprNumTgtName(exprIx)
+  if tgt != "" { return tgt }
+  const e = nodeAt(exprIx)
+  return if e is AsExpr { e.asTy } else { "" }
+}
+
+// The wrap cast's integer literal operand as the 32-bit constant it denotes, masked at `u8`.
+function emitNumWrapLit(obj: i32, exprIx: i32) {
+  const lit = nodeAt(unwrapParen(obj))
+  if lit is NumLit {
+    const pr = parseI64Pair(lit.numText)
+    fbI32Const(pr[1])
   }
-  if dom == "u8" {
+  return numWrapDomainMask(exprIx)
+}
+
+// The value kind `asWrapArmOf`'s `plain` arm builds its operand at: i64 for an i64 target (the
+// sign-extend is the whole cast) or an i64 operand, else the operand as itself.
+export function numWrapCastKind(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if wrapCastTgt(exprIx) == "i64" { return 3 }
+  if e is AsExpr {
+    if exprIsI64(e.asObj, fnIx) { return 3 }
+  }
+  return 0
+}
+
+// After `numWrapCastKind`'s operand: the i64 wrap to i32, then the byte mask at `u8`.
+export function numWrapCastTail(exprIx: i32, fnIx: i32): i32 {
+  if wrapCastTgt(exprIx) == "i64" { return 0 }
+  if numWrapCastKind(exprIx, fnIx) == 3 { fbI32WrapI64() }
+  return numWrapDomainMask(exprIx)
+}
+
+function numWrapDomainMask(exprIx: i32) {
+  if asExprNumCastDomain(exprIx) == "u8" {
     fbI32Const(255)
     fbI32Bin(113) // 0x71 i32.and
   }
@@ -25856,82 +25939,111 @@ function emitAsNumLitScalar(e: AsExpr, exprIx: i32, fnIx: i32) {
   return 0
 }
 
-function emitAsCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
+// The arm `emitAsCast` takes for the cast at `exprIx`, decided once for legacy and the IR (whose
+// numeric arms are `plain`, `wrap` and `exact`).
+export type AsCastArm = "zextLoad"
+  | "v128"
+  | "wrap"
+  | "instMiss"
+  | "litAtom"
+  | "numLitScalar"
+  | "numUnion"
+  | "mapProbeTrap"
+  | "mapOptBox"
+  | "mapOptRead"
+  | "holeMiss"
+  | "holeExact"
+  | "holeOpt"
+  | "exact"
+  | "union"
+  | "plain"
+
+// An unsigned narrow load widened to i64 is the zero-extending i64 load (`zextLoadOf`). A `new
+// v128` brand cast re-brands the same 128 bits; a boxed `v128 | null` or union operand takes the
+// union arm. A union operand's `as` propagates (`error-handling-design.md` §Trio), and a numeric
+// exact-or-fail (D1041) is checked ahead of it and disjoint from it by operand.
+export function asCastArmOf(exprIx: i32, fnIx: i32): AsCastArm {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "union" }
   const obj = e.asObj
-  const tgt = e.asTy
-  // An unsigned narrow load widened to i64 is the zero-extending i64 load (`zextLoadOf`).
-  if tgt == "i64" {
-    const zlAs = zextLoadOf(_exprIx, fnIx)
-    if zlAs >= 0 { return emitZextLoad(zlAs, fnIx) }
-  }
-  // A `new v128` brand cast (`x as F32x4`, `v as! v128`) re-brands the same 128 bits — the
-  // checker admitted it only between two v128s, and the canon pass spelled the brand as its base.
-  // A boxed `v128 | null` or union operand takes the union arm below instead.
-  if tgt == "v128" && !exprUnion(obj, fnIx) { return emitExpr(obj, fnIx) }
-  if e.asMode == "wrap" { return emitNumWrapCast(e, _exprIx, fnIx) }
+  if e.asTy == "i64" && zextLoadOf(exprIx, fnIx) >= 0 { return "zextLoad" }
+  if e.asTy == "v128" && !exprUnion(obj, fnIx) { return "v128" }
+  if e.asMode == "wrap" { return "wrap" }
   // A cast this instance's operand can never hit misses, as the instance's re-check found.
-  if asInstMisses(asCastRoot(_exprIx), elabKeyAt(fnIx)) {
-    return emitAsInstMiss(e, _exprIx, fnIx)
-  }
-  if asExprLitAtomCast(_exprIx, fnIx) { return emitAsLitAtom(e, _exprIx, fnIx) }
-  if asExprNumLitScalarCast(_exprIx, fnIx) {
-    return emitAsNumLitScalar(e, _exprIx, fnIx)
-  }
+  if asInstMisses(asCastRoot(exprIx), elabKeyAt(fnIx)) { return "instMiss" }
+  if asExprLitAtomCast(exprIx, fnIx) { return "litAtom" }
+  if asExprNumLitScalarCast(exprIx, fnIx) { return "numLitScalar" }
   // A numeric union converts at whichever member it holds when no member's conversion fails.
   if numUnionMinted && nodeIsNumUnion(obj, fnIx) {
-    const nuTo = njKindOfTy(nodeTyIxOf(_exprIx))
+    const nuTo = njKindOfTy(nodeTyIxOf(exprIx))
     if nuTo >= 0 && njAsConverts(njMembersOf(obj, fnIx), nuTo) {
-      return emitNumUnionConvert(obj, nuTo, fnIx)
+      return "numUnion"
     }
   }
-  // union-operand `as` is the propagating cast (`error-handling-design.md` §Trio): evaluate
-  // the box once into `$unionAs`, compare its tag against T's, and on a miss `return` the
-  // box unchanged — one box struct and a global tag registry make it already a value of
-  // the enclosing function's union return type. `m[k] as! V` fuses the map probe instead.
-  if e.asMode == "trap" {
-    const amk = mapReadScalarBoxKindIn(obj, fnIx)
-    if amk >= 0 {
-      const amRef = nodeAt(unwrapParen(obj))
-      if amRef is Index { return emitAsMapProbeTrap(amRef, fnIx) }
-    }
+  // `m[k] as! V` fuses the map probe; `m[k] as? V` over a scalar map's `V | null` read is the
+  // read itself, boxed as a consumed read is (D2467), and a niche-bearing read carries its null.
+  const ref = nodeAt(unwrapParen(obj))
+  if (
+    e.asMode == "trap"
+    && mapReadScalarBoxKindIn(obj, fnIx) >= 0
+    && ref is Index
+  ) {
+    return "mapProbeTrap"
   }
-  // `m[k] as? V` over a scalar map's `V | null` read is the read itself, boxed as a consumed
-  // read is (D2467).
-  const aok = if e.asMode == "null" { mapReadScalarBoxKindIn(obj, fnIx) } else { -1 }
-  const aoRef = nodeAt(unwrapParen(obj))
   if (
     e.asMode == "null"
-    && aoRef is Index
-    && exprMap(aoRef.idxArr, fnIx)
-    && tySame(nodeTyAt(_exprIx, fnIx), nodeTyAt(obj, fnIx))
+    && ref is Index
+    && exprMap(ref.idxArr, fnIx)
+    && tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(obj, fnIx))
   ) {
-    if aok >= 0 {
-      return emitMapGetScalarBox(aoRef.idxArr, aoRef.idxIndex, aok, fnIx)
-    }
-    // A niche-bearing value's read already carries its `null`.
-    return emitExpr(obj, fnIx)
+    if mapReadScalarBoxKindIn(obj, fnIx) >= 0 { return "mapOptBox" }
+    return "mapOptRead"
   }
   // A type-parameter operand fails as the direct spelling does at this instance's pin (D2791).
-  if asExprHoleNumSad(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
-    const hps = asExprHolePinSrc(_exprIx, fnIx)
-    if hps == "-" { return emitHoleNumCastMiss(e, _exprIx, fnIx) }
-    if hps != "" { return emitNumExactCastFrom(e, _exprIx, hps, fnIx) }
+  if asExprHoleNumSad(exprIx) && !asExprIsUnionCastIn(exprIx, fnIx) {
+    const hps = asExprHolePinSrc(exprIx, fnIx)
+    if hps == "-" { return "holeMiss" }
+    if hps != "" { return "holeExact" }
   }
-  // numeric exact-or-fail (D1041) is checked ahead of the union arm and disjoint from it by
-  // operand; only a cast that can fail comes here, the rest fall through to the plain ladder.
-  if asExprHoleNumOpt(_exprIx) && !asExprIsUnionCastIn(_exprIx, fnIx) {
-    return emitHoleNumAsOpt(e, _exprIx, fnIx)
+  if asExprHoleNumOpt(exprIx) && !asExprIsUnionCastIn(exprIx, fnIx) {
+    return "holeOpt"
   }
-  if asExprNumFallible(_exprIx) { return emitNumExactCast(e, _exprIx, fnIx) }
-  if asExprIsUnionCastIn(_exprIx, fnIx) {
-    return emitAsUnionCast(e, _exprIx, fnIx)
+  if asExprNumFallible(exprIx) { return "exact" }
+  if asExprIsUnionCastIn(exprIx, fnIx) { return "union" }
+  return "plain"
+}
+
+function emitAsCast(e: AsExpr, exprIx: i32, fnIx: i32) {
+  const obj = e.asObj
+  const ref = nodeAt(unwrapParen(obj))
+  return match asCastArmOf(exprIx, fnIx) {
+    "zextLoad" => emitZextLoad(zextLoadOf(exprIx, fnIx), fnIx)
+    "v128" => emitExpr(obj, fnIx)
+    "wrap" => emitNumWrapCast(e, exprIx, fnIx)
+    "instMiss" => emitAsInstMiss(e, exprIx, fnIx)
+    "litAtom" => emitAsLitAtom(e, exprIx, fnIx)
+    "numLitScalar" => emitAsNumLitScalar(e, exprIx, fnIx)
+    "numUnion" => emitNumUnionConvert(obj, njKindOfTy(nodeTyIxOf(exprIx)), fnIx)
+    "mapProbeTrap" => if ref is Index { emitAsMapProbeTrap(ref, fnIx) } else { -1 }
+    "mapOptBox" => if ref is Index { emitMapGetScalarBox(
+      ref.idxArr,
+      ref.idxIndex,
+      mapReadScalarBoxKindIn(obj, fnIx),
+      fnIx,
+    ) } else { -1 }
+    "mapOptRead" => emitExpr(obj, fnIx)
+    "holeMiss" => emitHoleNumCastMiss(e, exprIx, fnIx)
+    "holeExact" => emitNumExactCastFrom(e, exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
+    "holeOpt" => emitHoleNumAsOpt(e, exprIx, fnIx)
+    "exact" => emitNumExactCast(e, exprIx, fnIx)
+    "union" => emitAsUnionCast(e, exprIx, fnIx)
+    "plain" => emitNumPlainCast(obj, e.asTy, fnIx)
   }
-  return emitNumPlainCast(obj, tgt, fnIx)
 }
 
 // The source rep of numeric operand `obj` as this instance emits it: f32 first, since
 // `exprIsF64` over-claims an f32 literal.
-function numCastSrcRepOf(obj: i32, fnIx: i32): string {
+export function numCastSrcRepOf(obj: i32, fnIx: i32): string {
   if exprIsF32(obj, fnIx) { return "f32" }
   if exprIsI64(obj, fnIx) { return "i64" }
   if exprIsF64(obj, fnIx) { return "f64" }
@@ -25986,59 +26098,98 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
   return 0
 }
 
-// The numeric `x as T` lowering: the operand goes out in its own source rep through the
-// `emitExprAs*` helpers, then one wasm conversion opcode for the pair (float-to-int traps
-// rather than wraps).
+// The value kind the cast at `exprIx` builds its operand at, where its arm is an operand and a
+// tail (`numCastTail`): the plain conversion, the wrap that is neither a literal fold nor a
+// narrowed mask, and `as!`. -1 for every other arm, which writes its operand its own way.
+export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return -1 }
+  return match asCastArmOf(exprIx, fnIx) {
+    "plain" => numPlainCastKind(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
+    "wrap" => if asWrapArmOf(exprIx, fnIx) == "plain" { numWrapCastKind(exprIx, fnIx) } else { -1 }
+    "exact" => if e.asMode == "trap" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
+    "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => -1
+    "union" => -1
+  }
+}
+
+// The primitive type of value kind `k` (3 i64, 4 f64, 5 f32) that `numCastKindOf` builds an
+// operand at, or -1 for kind 0, the operand as itself.
+export function numCastKindTy(k: i32): i32 {
+  if k == 3 { return TY_I64 }
+  if k == 4 { return TY_F64 }
+  if k == 5 { return TY_F32 }
+  return -1
+}
+
+// After `numCastKindOf`'s operand: the cast's tail, for an arm that kind answers.
+export function numCastTail(exprIx: i32, fnIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) || numCastKindOf(exprIx, fnIx) < 0 {
+    return numCastNoTail()
+  }
+  return match asCastArmOf(exprIx, fnIx) {
+    "plain" => numPlainCastTail(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
+    "wrap" => numWrapCastTail(exprIx, fnIx)
+    "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
+    "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => numCastNoTail()
+    "union" => numCastNoTail()
+  }
+}
+
+function numCastNoTail() {
+  return emitFail(
+    "emitProgram: a numeric cast's tail has no operand-and-tail arm",
+  )
+}
+
+// The numeric `x as T` lowering: the operand goes out at `numPlainCastKind` through the
+// `emitExprAs*` helpers, then `numPlainCastTail`'s one conversion opcode for the pair (float to
+// int traps rather than wraps). `src` is `numCastSrcRepOf`'s.
 function emitNumPlainCast(obj: i32, tgt: string, fnIx: i32) {
-  if tgt == "f64" { return emitExprAsKind(obj, 4, fnIx) }
   const src = numCastSrcRepOf(obj, fnIx)
+  if emitExprAsKind(obj, numPlainCastKind(src, tgt), fnIx) < 0 { return -1 }
+  return numPlainCastTail(src, tgt)
+}
+
+// The value kind `emitNumPlainCast` builds a `src` operand at for target `tgt` (0 as itself, 3
+// i64, 4 f64, 5 f32): the target's own kind where the helper widens to it, else the source's.
+export function numPlainCastKind(src: string, tgt: string): i32 {
+  if tgt == "f64" { return 4 }
+  const own = numPlainSrcKind(src)
+  if tgt == "i64" { return if own == 0 { 3 } else { own } }
+  if tgt == "f32" { return if own == 0 { 5 } else { own } }
+  return own
+}
+
+// A plain cast's source at its own kind: 0 for an i32, built as itself.
+function numPlainSrcKind(src: string): i32 {
+  if src == "i32" { return 0 }
+  if src == "i64" { return 3 }
+  if src == "f32" { return 5 }
+  if src == "f64" { return 4 }
+  return numCastSrcFail(src)
+}
+
+// After `numPlainCastKind`'s operand: the conversion from it to `tgt`, any non-float, non-i64
+// target being i32. Nothing where the widening helper already reached the target.
+export function numPlainCastTail(src: string, tgt: string): i32 {
+  if tgt == "f64" { return 0 }
   if tgt == "i64" {
-    // i32→i64 widening (and i64→i64 no-op) via the existing helper.
-    if src == "i32" || src == "i64" { return emitExprAsKind(obj, 3, fnIx) }
-    // float→i64: TRAPPING truncation toward zero.
-    if src == "f32" {
-      if emitExprAsKind(obj, 5, fnIx) < 0 { return -1 }
-      fbI64TruncF32S()
-      return 0
-    }
-    if emitExprAsKind(obj, 4, fnIx) < 0 {
-      return -1 // f64 → i64
-    }
-    fbI64TruncF64S()
+    if src == "f32" { fbI64TruncF32S() }
+    else if src == "f64" { fbI64TruncF64S() }
     return 0
   }
   if tgt == "f32" {
-    // i32→f32 (and f32→f32 no-op) via the existing helper (handles literals).
-    if src == "i32" || src == "f32" { return emitExprAsKind(obj, 5, fnIx) }
-    if src == "i64" {
-      if emitExprAsKind(obj, 3, fnIx) < 0 { return -1 }
-      fbF32ConvertI64S()
-      return 0
-    }
-    if emitExprAsKind(obj, 4, fnIx) < 0 {
-      return -1 // f64 → f32 demote
-    }
-    fbF32DemoteF64()
+    if src == "i64" { fbF32ConvertI64S() }
+    else if src == "f64" { fbF32DemoteF64() }
     return 0
   }
-  // tgt == "i32".
-  if src == "i32" {
-    return emitExprAsKind(obj, 0, fnIx) // no-op (plain `emitExpr` at kind 0)
-  }
-  if src == "i64" {
-    if emitExprAsKind(obj, 3, fnIx) < 0 { return -1 }
-    fbI32WrapI64()
-    return 0
-  }
-  if src == "f32" {
-    if emitExprAsKind(obj, 5, fnIx) < 0 { return -1 }
-    fbI32TruncF32S()
-    return 0
-  }
-  if emitExprAsKind(obj, 4, fnIx) < 0 {
-    return -1 // f64 → i32 trunc
-  }
-  fbI32TruncF64S()
+  if src == "i64" { fbI32WrapI64() }
+  else if src == "f32" { fbI32TruncF32S() }
+  else if src == "f64" { fbI32TruncF64S() }
   return 0
 }
 
@@ -30551,30 +30702,34 @@ function pushTakeElem(
   idxIx: i32,
   fnIx: i32,
 ): i32 {
-  if idxIx < 0 {
-    fbLocalGet(lIdx)    // L.len = len - 1
-    pushListLen(lIdx, lTy)
-    fbI32Const(1)
-    fbI32Bin(107)       // 0x6b i32.sub
-    fbStructSet(lTy, 1) // field 1: len
-    pushListBacking(lIdx, lTy)
-    pushListLen(lIdx, lTy)
-    fbArrayGet(aTy)     // backing[len] — the popped element
-    return 0
-  }
+  if idxIx < 0 { return pushPopElem(lIdx, lTy, aTy) }
   pushListBacking(lIdx, lTy)
   if emitListGetIdx(idxIx, fnIx) < 0 { return -1 }
   fbArrayGet(aTy) // backing[i] — the read element
   return 0
 }
 
+// `.pop`'s element read over the list in local `lIdx`: the length decremented first, so the new
+// length is the removed element's index. Reads no expression. Returns 0.
+function pushPopElem(lIdx: i32, lTy: i32, aTy: i32) {
+  fbLocalGet(lIdx)    // L.len = len - 1
+  pushListLen(lIdx, lTy)
+  fbI32Const(1)
+  fbI32Bin(107)       // 0x6b i32.sub
+  fbStructSet(lTy, 1) // field 1: len
+  pushListBacking(lIdx, lTy)
+  pushListLen(lIdx, lTy)
+  fbArrayGet(aTy)     // backing[len], the popped element
+  return 0
+}
+
 // A numeric `.pop()` statement whose receiver is in local `lIdx`: under the length test, the
-// element taken and dropped, so an empty list is left as it is (D8360). Returns 1 (nothing left
-// on the stack), or -1.
-export function popDropTail(lIdx: i32, wrapTy: i32, popBack: i32, fnIx: i32) {
-  if pushTakeCond(lIdx, wrapTy, -1, fnIx) < 0 { return -1 }
+// element taken and dropped, so an empty list is left as it is (D8360). Reads no expression.
+// Returns 1 (nothing left on the stack).
+export function popDropTail(lIdx: i32, wrapTy: i32, popBack: i32) {
+  pushListLen(lIdx, wrapTy)
   fbIf(64) // 0x40 void
-  if pushTakeElem(lIdx, wrapTy, popBack, -1, fnIx) < 0 { return -1 }
+  pushPopElem(lIdx, wrapTy, popBack)
   fbDrop() // 0x1a drop
   fbEnd()  // 0x0b end
   return 1
@@ -30715,9 +30870,7 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
       }
       // A numeric `.pop` statement has no null cell to answer with, so it pops under the
       // length test and drops the element itself: an empty list is left as it is (D8360).
-      if !nulBox && getIdx < 0 {
-        return popDropTail(lIdx, wrapTy, popBack, fnIx)
-      }
+      if !nulBox && getIdx < 0 { return popDropTail(lIdx, wrapTy, popBack) }
       // the unchecked tail: the reps with no `T | null` cell of their own.
       if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
       return 0
@@ -38343,6 +38496,11 @@ export function emitStaticLitAtom(ix: i32, lex: string, fnIx: i32) {
     if rc < 0 { return -1 }
     fbDrop()
   }
+  return staticAtomId(lex)
+}
+
+// Pushes the interned atom id of lexeme `lex`, the half of a static operand after its effects.
+export function staticAtomId(lex: string) {
   fbI32Rel(RS_ATOM, internAtom(lex))
   return 0
 }
