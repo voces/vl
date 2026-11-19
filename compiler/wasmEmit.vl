@@ -16060,6 +16060,14 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     fbEnd()
     return 0
   }
+  if arm == "mv" && mapGetOrMvPlain(recvIx, defIx, fnIx) {
+    const pslot = cmSlot
+    mapGetOrMvHead(pslot)
+    if emitMapValDefault(pslot, mvScalarValKind(pslot), defIx, fnIx) < 0 {
+      return -1
+    }
+    return mapGetOrMvTail(pslot)
+  }
   if arm == "mv" {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
@@ -16203,6 +16211,44 @@ export function mapGetOrArmOf(
     }
   }
   return "i32"
+}
+
+// Whether `recvIx[k] ?? defIx` at an mv slot takes its plain arm: a value that is neither a union
+// nor a nullable niche, and a default that is not nullable, written in the value's own rep.
+export function mapGetOrMvPlain(recvIx: i32, defIx: i32, fnIx: i32): boolean {
+  const ms = mapRecvShapeOf(recvIx, fnIx)
+  if ms < 0 || mvValKindAt(ms) == "union" || defExprNullable(defIx) {
+    return false
+  }
+  return mvScalarValKind(ms) != null || !mvSlotNullable(ms)
+}
+
+// The mv plain arm's head after the probe: `if entry != 0 { stash = vals.backing[entry-1] } else`,
+// a void `if`; the default follows, then `mapGetOrMvTail`.
+export function mapGetOrMvHead(mslot: i32) {
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)                // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // scalar (f64/i64) / (ref null <elem>) slot read
+  fbLocalSet(fnMvValStashLocal(mslot))
+  fbElse()                     // else — a MISS
+  return 0
+}
+
+// After the default: the stash set from it, the `if` closed, the stash read, and a ref value
+// recovered to non-null (a live entry's slot is never null, nor is the default).
+export function mapGetOrMvTail(mslot: i32) {
+  cmSlot = mslot
+  const stashL = fnMvValStashLocal(mslot)
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  if mvScalarValKind(mslot) == null { fbRefAsNonNull() }
+  return 0
 }
 
 // The i32 a mono map of type `mt` stores for a null value: `-1` for a nullable literal union, `2`
