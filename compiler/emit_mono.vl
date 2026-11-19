@@ -6411,6 +6411,9 @@ function monoTagSetAt(ix: i32, callFn: i32): i32 {
   if own >= 0 && fnTagSetIsTagged(own) && fnTagArmsAt(ix, own).length > 0 {
     return own
   }
+  // A clone of such a call already carries the set and arms it was copied with.
+  const copied = if monoCallTpl.has(ix) { fnTagCallSetOf(ix) } else { -1 }
+  if fnTagSetIsTagged(copied) && fnTagArmsAt(ix, copied).length > 0 { return copied }
   const t = elabWalkTy(callFn)
   if t < 0 {
     const noted = fnTagCallSetOf(ix)
@@ -8716,6 +8719,10 @@ function monoPinRepTyOf(pt: i32): i32 {
   if pt < 0 || pt >= T.tys.length { return -1 }
   if fnTagTyIsTagged(pt) || fnTagListTy(pt) { return fnTagRepTyOf(pt) }
   if monoTagMapTy(pt) { return monoTagMapRepTy(pt, [], []) }
+  const pa = tyAt(pt)
+  if pa is TyArray && monoTagRecListTy(pt) {
+    return mkArrayTy(monoTagMapRepTy(tyElemOf(pa), [], []))
+  }
   return -1
 }
 
@@ -8804,9 +8811,10 @@ function monoMakeInstanceParams(
           && pinTys[pj] < T.tys.length
           && tyAt(pinTys[pj]) is TyObj
           && monoTagMapRepTy(pinTys[pj], [], []) >= 0
+        || monoTagRecListTy(pinTys[pj])
       ) {
         // A tagged set's parameter is the set itself, not a closure of its signature; a map or
-        // record of its ids is that map or record.
+        // record of its ids, or a list of such records, is that map, record or list.
         nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
         synthed = true
       } else if annotateI32 || pinned[pj] != "i32" {
@@ -21028,7 +21036,7 @@ function monoPinHoleParam(
   ) {
     const held0 = elabNodeTyAt(bx, ctx)
     const held = if held0 >= 0 { held0 } else { nodeTyIxOf(bx) }
-    if fnTagListTy(held) { bound = held }
+    if fnTagListTy(held) || monoTagRecListTy(held) { bound = held }
   }
   const setTy = if fnTagTyIsTagged(bound) || fnTagListTy(bound) || monoTagMapTy(bound) { bound } else { 0 - 1 }
   if setTy >= 0 {
@@ -21036,6 +21044,16 @@ function monoPinHoleParam(
     pinned.push(if rn != "" { rn } else { tyToStr(setTy) })
     pinTys.push(setTy)
     return 0
+  }
+  // A list of records holding one is the list of those records' stored rows.
+  const bl = if bound >= 0 && bound < T.tys.length { tyAt(bound) } else { null }
+  if bl is TyArray && monoTagRecListTy(bound) {
+    const lrn = monoPinSpellShaped(mkArrayTy(monoTagMapRepTy(tyElemOf(bl), [], [])))
+    if lrn != "" {
+      pinned.push(lrn)
+      pinTys.push(bound)
+      return 0
+    }
   }
   // A record holding one is the record the elaboration binds, keyed by its sets (D15638).
   const trn = if bound >= 0 && bound < T.tys.length && tyAt(bound) is TyObj { monoPinSpellShaped(monoTagMapRepTy(bound, [], [])) } else { "" }
@@ -27621,4 +27639,13 @@ function monoRetListRowName(ty: i32): string {
   const rn = monoRetRowName(t)
   if rn == "" { return "" }
   return rn + suffix
+}
+
+// Whether `t` is a list whose element is a record holding a tagged set's ids.
+function monoTagRecListTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const a = tyAt(t)
+  if !(a is TyArray) { return false }
+  const e = tyElemOf(a)
+  return e >= 0 && e < T.tys.length && tyAt(e) is TyObj && monoTagMapRepTy(e, [], []) >= 0
 }
