@@ -56,17 +56,20 @@ import { nodeTyAt } from "./emit_capture_frames"
 import {
   irNodeInShadowHook,
   listEqRouteOf,
-  narrowedFieldPlain,
   strCatPartsOf,
   strEqFirstOf,
   strEqLitOf,
   strInPlaceMode,
   strOrderSwaps,
   strSiteOfRhs,
+} from "./wasmEmit"
+import { memFieldUnionBox } from "./emit_plan_union"
+import {
+  narrowedFieldPlain,
   structFieldPlain,
   unionUnionEqStagedOf,
   variantFieldPlain,
-} from "./wasmEmit"
+} from "./emit_plan_union"
 import { exprIsLitAtom, exprIsStrConcat } from "./emit_classify"
 import { exprIsStrEq, exprIsStrOrder } from "./emit_fn_scans"
 
@@ -100,11 +103,12 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   if missed(v) || missed(i) { return irBMiss("index operand") }
   if !(v is OVar) { return irBMiss("index receiver") }
   const vr = repNodeAt(irBOpRep(v))
-  if vr is RList && repPrim(vr.rlsElem) == "u8" {
-    return irBMiss("index packed element")
-  }
-  // A read narrowed past its element's rep (an atom read as its string) converts on legacy's side.
-  if vr is RList && vr.rlsElem != rep {
+  // A read narrowed past its element's rep (an atom read as its string) converts on legacy's side;
+  // a packed byte reads unsigned into an i32.
+  const packed = vr is RList
+    && repPrim(vr.rlsElem) == "u8"
+    && repPrim(rep) == "i32"
+  if vr is RList && vr.rlsElem != rep && !packed {
     return irBMiss("index element coercion")
   }
   const ixTy = nodeTyAt(n.idxIndex, fnIx)
@@ -141,7 +145,12 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   if repNodeAt(r) is RRecord && plain {
     const k = repRecordKidOf(r, nodeTyAt(n.memObj, fnIx), n.memProp)
     if k < 0 { return irBMiss("field kid") }
-    if repNodeKids(r)[k] != rep { return irBMiss("field read coercion") }
+    // A union-box field's tail unboxes it to the read's own rep.
+    const own = memFieldUnionBox(ix, fnIx)
+      && rep == repNodeOfTy(nodeTyAt(ix, fnIx))
+    if repNodeKids(r)[k] != rep && !own {
+      return irBMiss("field read coercion")
+    }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
     irBNoteFieldReread(ix, k)

@@ -35,10 +35,13 @@ import {
   RListNew,
   RListPop,
   RListPush,
+  RListSlice,
   RMakeClo,
   RMakeList,
   RMakeRec,
+  RMapFilter,
   RMapGetOr,
+  RMapHas,
   RMapNew,
   RMapOp,
   RMapSet,
@@ -101,6 +104,7 @@ import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 import { exprEffectFree } from "./emit_base"
+import { nodeTyAt } from "./emit_capture_frames"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -394,6 +398,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         }
         i = i + 1
       }
+      // The layout writes each kid exactly once.
+      if r.mrLayout.length != ks.length {
+        return fail(2, at, "a record's layout length")
+      }
+      const seen: boolean[] = []
+      for _k in ks { seen.push(false) }
+      for k in r.mrLayout {
+        if k < 0 || k >= seen.length || seen[k] {
+          return fail(2, at, "a record's layout repeats")
+        }
+        seen[k] = true
+      }
       0
     }
     RGetField => {
@@ -402,7 +418,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(repNodeAt(v) is RRecord) {
         return fail(2, at, "a field read of a non-record")
       }
-      if dst >= 0 && kidAt(v, r.gfIx) != dst {
+      // A union-box field's read unboxes to the read's own rep (`structUnionBoxTail`).
+      const k = kidAt(v, r.gfIx)
+      const unboxed = repNodeAt(k) is RBox
+        && dst == repNodeOfTy(nodeTyAt(r.gfAt, vf.irAt))
+      if dst >= 0 && k != dst && !unboxed {
         return fail(2, at, "a field's rep is not its destination's")
       }
       0
@@ -446,7 +466,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if l == vfStr && dst >= 0 && dst != vfI32 {
         return fail(2, at, "a string's element is an i32")
       }
-      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst {
+      // A packed byte reads unsigned into an i32.
+      const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
+      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed {
         return fail(2, at, "an element's rep is not its destination's")
       }
       0
@@ -555,12 +577,38 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RMapFilter => {
+      use(r.hfV, at)
+      if !(repNodeAt(opRep(r.hfV)) is RList) {
+        return fail(2, at, "a map or filter of a non-list")
+      }
+      if !(r.hfC is OImm) { use(r.hfC, at) }
+      0
+    }
+    RListSlice => {
+      use(r.scV, at)
+      uses(r.scArgs, at)
+      if !(repNodeAt(opRep(r.scV)) is RList) {
+        return fail(2, at, "a slice of a non-list")
+      }
+      for a in r.scArgs {
+        if opRep(a) != vfI32 { return fail(2, at, "a slice bound is an i32") }
+      }
+      if dst >= 0 && dst != opRep(r.scV) {
+        return fail(2, at, "a slice is a list of its receiver's rep")
+      }
+      0
+    }
     RListPop => {
       use(r.lqV, at)
       if !(repNodeAt(opRep(r.lqV)) is RList) {
         return fail(2, at, "a pop of a non-list")
       }
-      if dst >= 0 { return fail(2, at, "a pop statement has no value") }
+      // A value pop leaves the element, its i32 niche, or its null box.
+      const el = kidAt(opRep(r.lqV), 0)
+      if dst >= 0 && dst != el && dst != vfI32 && repIsScalar(dst) {
+        return fail(2, at, "a pop's value is its element, a niche or a box")
+      }
       0
     }
     RListLen => {
@@ -653,20 +701,35 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 { return fail(2, at, "a map set has no value") }
       0
     }
+    RMapHas => {
+      use(r.mhKey, at)
+      if !(repNodeAt(irGlobalRepOf(vf, r.mhSym)) is RMap) {
+        return fail(2, at, "a map has of a global that is no map")
+      }
+      if dst >= 0 && dst != vfBool && dst != vfI32 {
+        return fail(2, at, "a map has is a boolean")
+      }
+      0
+    }
     RMapGetOr => {
       use(r.mgKey, at)
+      if r.mgForm > 0 { use(r.mgDef, at) }
       if !(repNodeAt(irGlobalRepOf(vf, r.mgSym)) is RMap) {
         return fail(2, at, "a map read of a global that is no map")
       }
-      if dst >= 0 && dst != vfI32 {
+      if dst >= 0 && r.mgForm == 0 && dst != vfI32 {
         return fail(2, at, "a map read through a helper is an i32")
+      }
+      // The miss arm's default is the read's value, so it is at the read's rep.
+      if dst >= 0 && r.mgForm > 0 && opRep(r.mgDef) != dst {
+        return fail(2, at, "a map read's default is not at its rep")
       }
       0
     }
     RStrOp => {
       uses(r.soArgs, at)
-      // A code point is an i32 and a code-point list a list of them; a slice's bounds are i32s;
-      // every other operand is a string.
+      // A code point is an i32 and a code-point list a list of them; a slice's bounds and a
+      // char-code index are i32s; every other operand is a string.
       if r.soOp == "fromcps" {
         const ln = repNodeAt(opRep(r.soArgs[0]))
         if !(ln is RList) || ln.rlsElem != vfI32 {
@@ -676,7 +739,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       let i = 0
       while i < r.soArgs.length {
-        const want = if r.soOp == "fromcp" || r.soOp == "slice" && i > 0 { vfI32 } else { vfStr }
+        const idx = (r.soOp == "slice" || r.soOp == "charcode") && i > 0
+        const want = if r.soOp == "fromcp" || idx { vfI32 } else { vfStr }
         if opRep(r.soArgs[i]) != want {
           return fail(2, at, "a string operator's operand rep")
         }
@@ -998,12 +1062,18 @@ function stmt(id: i32) {
     }
     SLoop => labelled(n.lpLabel, -1, n.lpBody)
     SForIn => {
-      use(n.xfList, id)
+      // A map walk's list is an unread immediate; its map is a global the lowering reads.
+      if n.xfMap < 0 { use(n.xfList, id) }
       const ln = repNodeAt(opRep(n.xfList))
       // A list walks its elements, a string its code points, each an i32.
       let er = -1
       if ln is RList { er = ln.rlsElem }
       if opRep(n.xfList) == vfStr { er = vfI32 }
+      // A map walks its keys or values, each an i32 or a string.
+      if n.xfMap >= 0 && n.xfVar >= 0 && n.xfVar < vf.irVars.length {
+        const vr = vf.irVars[n.xfVar].vRep
+        if vr == vfI32 || vr == vfStr { er = vr }
+      }
       if n.xfVar < 0 || n.xfVar >= vf.irVars.length || er < 0 {
         return fail(
           2,
@@ -1158,7 +1228,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapOp | RMapNew | RMapSet | RMapGetOr | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
   }
 }
 
