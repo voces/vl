@@ -15202,6 +15202,14 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   // row, else element 0's.
   const rslot = arrRefSlotOf(arrIx, elems, fnIx, lb)
   if rslot < 0 { return -1 }
+  // A literal whose elements each build as themselves takes the one decision the IR reads, and
+  // its tail.
+  if arrLitRefPlainSlot(arrIx, fnIx, lb) == rslot {
+    for e in elems {
+      if emitExpr(e, fnIx) < 0 { return -1 }
+    }
+    return arrLitRefShortTail(rslot, elems.length)
+  }
   // A concrete-VARIANT element list (`Cat[]`) has no `sNames` entry: each element is coerced
   // into the arm read off the slot's element type, any `| null` peeled.
   let elemVariantIdx = -1
@@ -15281,32 +15289,65 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   if dstRef >= 0 {
     fbLocalGet(dstRef)
     fbRefAsNonNull() // the chunk-built ref backing
-  } else {
-    fbBacking(rlBackIdx[rslot], elems.length) // 0xfb 0x08; builds the ref backing
+    return arrLitLenCap(elems.length, rlWrapIdx[rslot])
   }
-  fbI32Const(elems.length)      // 0x41 i32.const (len)
-  fbI32Const(elems.length)      // 0x41 i32.const (cap)
-  fbStructNew(rlWrapIdx[rslot]) // 0xfb 0x00 <this slot's ref-list wrapper>
-  return 0
+  return arrLitRefShortTail(rslot, elems.length)
+}
+
+// After a short ref-list literal's `n` elements at slot `rslot`: the backing, its length and
+// capacity, and the slot's wrapper.
+export function arrLitRefShortTail(rslot: i32, n: i32): i32 {
+  fbBacking(rlBackIdx[rslot], n)
+  return arrLitLenCap(n, rlWrapIdx[rslot])
+}
+
+// The ref-list slot list literal `arrIx` builds at as a short list of elements each built as is
+// in `fnIx`: within the chunk cap, at a slot whose element is no union box and no non-null variant,
+// and no element a record twin, a narrowed unbox or a list the slot does not hold; -1 otherwise.
+export function arrLitRefPlainSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
+  const a = nodeAt(arrIx)
+  if (
+    !(a is ArrayLit)
+    || !rlRowsMinted()
+    || a.arrElems.length > allocLitChunk()
+  ) {
+    return -1
+  }
+  const rslot = arrRefSlotPlain(arrIx, a.arrElems, fnIx, lb)
+  if rslot < 0 { return -1 }
+  const k = rlElemKindAt(rslot)
+  if k == RLK_UNION { return -1 }
+  if (
+    k == RLK_STRUCT
+    && rlElemVariantRow(rslot) >= 0
+    && rlElemNullable[rslot] != 1
+  ) {
+    return -1
+  }
+  const nests = k == RLK_I32_LIST
+    || k == RLK_STR_LIST
+    || k == RLK_F64_LIST
+    || k == RLK_I64_LIST
+    || k == RLK_REF_LIST
+    || k == RLK_F32_LIST
+    || k == RLK_V128_LIST
+    || k == RLK_U8_LIST
+  for e in a.arrElems {
+    if !nests && (exprArray(e, fnIx) || exprRefArray(e, fnIx)) { return -1 }
+    if (
+      arrRefElemTwinRow(e, fnIx, rslot) >= 0
+      || narrowedArmNeedsUnbox(e, fnIx)
+    ) {
+      return -1
+    }
+  }
+  return rslot
 }
 
 // `emitArrRef`'s ref-list slot: a ref build pair's row, else element 0's, else
 // slot 0 when the literal names none. -1 when no element type is interned at all.
 function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
-  const annKind = lb.lbKind
-  const annSlot = lb.lbSlot
-  let rslot = 0
-  if (
-    annKind == LBK_REF
-    || annKind == LBK_UNION
-    || annKind == LBK_REF_AT_SLOT
-  ) {
-    rslot = annSlot
-  } else if elems.length >= 1 {
-    rslot = arrLitRowSlotIn(arrIx, fnIx)
-  } else {
-    rslot = annSlot
-  }
+  const rslot = arrRefSlotPlain(arrIx, elems, fnIx, lb)
   if rslot < 0 {
     if rlElemName.length < 1 {
       return emitFail(
@@ -15321,9 +15362,27 @@ function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
         arrIx,
       )
     }
-    rslot = 0
+    return 0
   }
   return rslot
+}
+
+// `arrRefSlotOf`'s slot where it finds one, -1 where it would fall back or refuse.
+function arrRefSlotPlain(
+  arrIx: i32,
+  elems: i32[],
+  fnIx: i32,
+  lb: ListBuild,
+): i32 {
+  if (
+    lb.lbKind == LBK_REF
+    || lb.lbKind == LBK_UNION
+    || lb.lbKind == LBK_REF_AT_SLOT
+  ) {
+    return lb.lbSlot
+  }
+  if elems.length >= 1 { return arrLitRowSlotIn(arrIx, fnIx) }
+  return lb.lbSlot
 }
 
 // One non-union element `e` of `emitArrRef`'s list at slot `rslot`, built as is or coerced
