@@ -86,14 +86,10 @@ import {
 } from "./ir_lower"
 import {
   GlobalCtx,
-  HoleBox,
-  IsArm,
   ObjLitArm,
   PrintArm,
-  TagIsArm,
   arrLitShort,
   asgValueArmOf,
-  atomEqPlanOf,
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
@@ -111,21 +107,14 @@ import {
   globalCtxNow,
   globalInitArmUnboxes,
   globalReadRecovers,
-  holeBoxPlanOf,
   holeBoxTyAt,
-  identReadArmOf,
   idxStorePlainWhy,
   ifExprPlainWhy,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
-  isArmOf,
   isArmTagOf,
-  isBoxGuardPlain,
   isDecidedFalse,
-  isRecvStageRep,
-  isTestsStorage,
-  isVariantTagPlain,
   keptDeclStoresNothing,
   legacyContextLiveWhy,
   lowMemFoldsCallee,
@@ -139,9 +128,6 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
-  narrowedBoxVariantPlain,
-  narrowedVariantRepIs,
-  njDispatches,
   numCastKindOf,
   numCastKindTy,
   numIntrCallReached,
@@ -151,6 +137,7 @@ import {
   objLitArmOf,
   objLitLayoutRowOf,
   objLitVariantLayoutOf,
+  popAnyPlanOf,
   printArmOf,
   pushPlainWhy,
   shiftMaskFoldOf,
@@ -160,14 +147,29 @@ import {
   strCatPartsOf,
   strLitTakesAtom,
   structFieldArmOf,
-  tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
   variantFieldArmOf,
-  widenPlanOf,
 } from "./wasmEmit"
+import {
+  HoleBox,
+  IsArm,
+  TagIsArm,
+  atomEqPlanOf,
+  holeBoxPlanOf,
+  identReadArmOf,
+  isArmOf,
+  isBoxGuardPlain,
+  isRecvStageRep,
+  isTestsStorage,
+  isVariantTagPlain,
+  narrowedBoxVariantPlain,
+  narrowedVariantRepIs,
+  njDispatches,
+  tagIsArmOf,
+  widenPlanOf,
+} from "./emit_plan_union"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
-import { narrowedArmNeedsUnbox } from "./emit_plan_union"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
@@ -183,15 +185,13 @@ import {
   nulTestArmOf,
   nullOwnAt,
 } from "./emit_plan_null"
-import { boxOwedAt } from "./emit_plan_coerce"
+import { boxOwedAt, narrowedArmNeedsUnbox } from "./emit_plan_coerce"
 import {
   arrLitArmOf,
   arrLitListBuild,
   identReadIsList,
   idxStorePlanOf,
   listReserveScan,
-  popPlanOf,
-  popStmtPlainWhy,
   pushPlanOf,
 } from "./emit_plan_list"
 import {
@@ -227,6 +227,7 @@ import {
   asgReReadEnter,
   asgReReadLeave,
   asgReadUnwidenOp,
+  callIsArrSlice,
   capCellTargetOf,
   captureCountOf,
   captureNamesOf,
@@ -290,7 +291,6 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
-import { strListHas } from "./listutil"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
 let ibArmed = false
@@ -744,15 +744,11 @@ function primRepOfTy(t: i32): i32 {
 }
 
 // `primRepOf` at `exprTyOf`'s type.
-function exprRepOf(ix: i32): i32 {
-  if untypedBoolOp(ix) { return ibBool }
-  return primRepOfTy(exprTyOf(ix))
-}
+function exprRepOf(ix: i32): i32 { return primRepOfTy(exprTyOf(ix)) }
 
-// `ix`'s type: `boolean` for an untyped boolean operator (`untypedBoolOp`), its callee's result
-// for an untyped call of a declaration (an operator a generic instance rewrote to its overload).
+// `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
+// instance rewrote to its overload), else its recorded type.
 function exprTyOf(ix: i32): i32 {
-  if untypedBoolOp(ix) { return TY_BOOL }
   const t = nodeTyAt(ix, ibFnIx)
   if t >= 0 { return t }
   const n = nodeAt(ix)
@@ -768,17 +764,6 @@ function exprTyOf(ix: i32): i32 {
   }
   return t
 }
-
-// Whether `ix` is a compare or a logical operator no check recorded a type for: the `match`
-// lowering writes its arm tests (`==`, joined by `||`) after the check.
-function untypedBoolOp(ix: i32): boolean {
-  if nodeTyAt(ix, ibFnIx) >= 0 { return false }
-  const n = nodeAt(ix)
-  if n is BinExpr { return strListHas(BOOL_OPS, n.binOp) }
-  return false
-}
-
-const BOOL_OPS = ["==", "!=", "<", "<=", ">", ">=", "&&", "||"]
 
 export function irBOpRep(o: Opnd): i32 {
   return match o {
@@ -1282,14 +1267,14 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     let i = 0
     while i < c.callArgs.length {
       const at = b.length
-      const a = irBExpr(b, c.callArgs[i])
+      // An argument is delivered at its parameter's rep, as a returned or declared value is.
+      const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
+      const a = deliver(b, c.callArgs[i], pr)
       if ibMiss != "" { return missRhs("argument") }
       if i > 0 && ifBelowLead(b, at, "short-circuit argument after another") {
         return missRhs("short-circuit argument after another")
       }
-      if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], inst)) {
-        return missRhs("argument coercion")
-      }
+      if irBOpRep(a) != pr { return missRhs("argument coercion") }
       args.push(a)
       i = i + 1
     }
@@ -1499,6 +1484,25 @@ function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   return r
 }
 
+// A list `.slice` on legacy's arm (`callIsArrSlice`): the receiver, then its i32 bounds.
+function listSliceRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("slice receiver rep") }
+  const at = b.length
+  const args: Opnd[] = []
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("method operand") }
+  if ifBelowLead(b, at, "slice short-circuit operand") {
+    return missRhs("slice short-circuit operand")
+  }
+  for a in args {
+    if repPrim(irBOpRep(a)) != "i32" { return missRhs("slice bound coercion") }
+  }
+  const r: Rhs = { scV: v, scArgs: args, scAt: ix }
+  return r
+}
+
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -1509,15 +1513,26 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   ) {
     return pushRhs(b, c, m, ix)
   }
+  if m.memProp == "pop" && c.callArgs.length == 0 {
+    return popValueRhs(b, m, ix)
+  }
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
     return mapHasRhs(b, c, m, ix)
   }
   if m.memProp == "map" || m.memProp == "filter" {
     return mapFilterRhs(b, c, m, ix)
   }
+  if !exprIsStrMethod(ix, ibFnIx, "slice") && callIsArrSlice(ix, ibFnIx) {
+    return listSliceRhs(b, c, m, ix)
+  }
   let op: StrOp = "slice"
   if exprIsStrMethod(ix, ibFnIx, "cpLen") {
     op = "cplen"
+  } else if (
+    exprIsStrMethod(ix, ibFnIx, "charCodeAt")
+    && c.callArgs.length == 1
+  ) {
+    op = "charcode"
   } else if exprIsStrIndexOf(ix, ibFnIx) && c.callArgs.length == 1 {
     op = if m.memProp == "includes" { "includes" } else { "indexof" }
   } else if !exprIsStrMethod(ix, ibFnIx, "slice") {
@@ -1664,13 +1679,24 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   return 0
 }
 
-// A `.pop()` statement legacy writes as its checked take-and-drop (`popStmtPlainWhy`).
+// A `.pop()` at a value position over any list legacy pops (`popAnyPlanOf`): its receiver, then
+// legacy's scalar pop tail (`popScalarTail`). A ref or string list is legacy's.
+function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
+  if popAnyPlanOf(ix, ibFnIx) == null { return missRhs("method pop") }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return missRhs("pop operand coercion")
+  }
+  const r: Rhs = { lqV: v, lqAt: ix }
+  return r
+}
+
+// A `.pop()` statement over any list legacy pops (`popAnyPlanOf`), through legacy's pop tail.
 function popStmt(b: i32[], c: Call, ix: i32) {
-  const pq = popPlanOf(ix, ibFnIx)
-  // No plan is a ref or string list, which legacy pops checked as a ref.
+  const pq = popAnyPlanOf(ix, ibFnIx)
+  // No plan is a ref list whose row is not collected.
   if pq == null { return skip("pop ref element") }
-  const why = popStmtPlainWhy(pq, ix, ibFnIx)
-  if why != "" { return skip(why) }
   if c.callFn < 0 || c.callFn >= P.nodes.length { return skip("pop callee") }
   const f = nodeAt(c.callFn)
   if !(f is Member) { return skip("pop callee") }
