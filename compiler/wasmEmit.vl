@@ -1744,6 +1744,7 @@ import {
   allocLitChunk,
   arrLitArmOf,
   arrLitBuild,
+  arrLitBuildTyOf,
   arrLitListBuild,
   arrLitRefPlainSlot,
   arrLitTakesAtom,
@@ -14708,7 +14709,20 @@ function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
 // `struct.new` for the wrapper; an empty `[]` shares its type's empty backing. Built at the
 // checker's type for it unless it has none; context restored on exit.
 function emitArr(arrIx: i32, fnIx: i32) {
-  return emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
+  const from = wLen()
+  const r = emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
+  if r >= 0 && irShadowOn {
+    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from)
+  }
+  return r
+}
+
+// The armed shadow's per-occurrence count of a legacy site (`irNodeInShadow`); a hook, since the
+// IR's builder imports this module.
+export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32) => i32 = nodeInShadowNone
+
+function nodeInShadowNone(_ix: i32, _fnIx: i32, _ty: i32, _from: i32): i32 {
+  return 0
 }
 
 // `emitArr` at the build pair `lb`: the literal's own, or the one a spread literal builds each
@@ -20121,15 +20135,33 @@ function strSiteArmsAt(binIx: i32, fnIx: i32): i32 {
   return mode
 }
 
-// Whether assignment `binIx` writes its string right side in place, as the loop accumulator or
-// an append site, rather than evaluating it as a value.
+// How assignment `binIx` writes its string right side in place: -1 as the loop accumulator, the
+// site mode its chain lowers under (`strSiteCatTail`), or 0 as a plain value.
 // A function legacy does not lower is scanned here, as its body lowering would scan it.
-export function strAssignInPlace(binIx: i32, fnIx: i32): boolean {
+export function strInPlaceMode(binIx: i32, fnIx: i32): i32 {
   if saFnIx != fnIx {
     const fn = nodeAt(fnIx)
     if fn is FuncDecl { strAccScan(fn.fnBody, fnIx) }
   }
-  return strAccAppendOk(binIx, fnIx) || strSiteArmsAt(binIx, fnIx) != 0
+  if strAccAppendOk(binIx, fnIx) { return -1 }
+  return strSiteArmsAt(binIx, fnIx)
+}
+
+// The armed site assignment whose right side is the chain at `rhsIx`, or -1.
+export function strSiteOfRhs(rhsIx: i32, fnIx: i32): i32 {
+  let i = 0
+  while i < saSites.length {
+    const a = nodeAt(saSites[i])
+    if (
+      a is BinExpr
+      && a.binRight == rhsIx
+      && strSiteArmsAt(saSites[i], fnIx) > 0
+    ) {
+      return saSites[i]
+    }
+    i = i + 1
+  }
+  return -1
 }
 
 // Arm the site lowering for the assignment at `binIx`, or disarm it.
@@ -20179,12 +20211,16 @@ function siteSet(i: i32, glob: boolean) {
 // extends what part 0 read, 2 what the last part read. A miss allocates exact-fit, so a one-off
 // append keeps no slack; a full hit doubles, so a loop pays one extra copy and stays linear.
 function emitStrSiteCat(parts: i32[], mode: i32, binIx: i32, fnIx: i32) {
-  const n = parts.length
   let i = 0
-  while i < n {
+  while i < parts.length {
     if emitStrValue(parts[i], fnIx) < 0 { return -1 }
     i = i + 1
   }
+  return strSiteCatTail(parts.length, mode, binIx)
+}
+
+// Joins the `n` string parts on the stack into site `binIx`'s buffer under `mode`.
+export function strSiteCatTail(n: i32, mode: i32, binIx: i32) {
   let j = n - 1
   while j >= 0 {
     fbLocalSet(strCatSlot(j))
@@ -37448,7 +37484,7 @@ export type GlobalCtx = {
 }
 
 // The context of the access legacy's emitter is writing now.
-function globalCtxNow(): GlobalCtx {
+export function globalCtxNow(): GlobalCtx {
   const c: GlobalCtx = {
     gcInStart: gPromoInStart,
     gcFnPos: emitCurFnPos,
