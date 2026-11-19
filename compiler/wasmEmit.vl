@@ -17261,10 +17261,6 @@ function emitMapDelete(recvIx: i32, keyIx: i32, fnIx: i32) {
   return 0
 }
 
-// Emit a map set's value expr in the map's value rep — scalar coercion, union boxing,
-// list-kind / ref-list-slot / struct-index hints, and the atom-id context an overwrite
-// or append needs. One evaluation, shared by both arms of `emitMapSetV`. Leaves the
-// value on the stack; `cmSlot` may be clobbered by inner map ops, so callers re-pin.
 // How a map set writes its value `valIx` into the vals of mv slot `mslot` (atom-valued `atomVal`,
 // `boolean | null`-valued `nulBoolVal`): coerced to a scalar element, boxed into a union, coerced
 // to a record arm, a `null` as its sentinel, an atom widened to its text, or `plain` as itself.
@@ -17302,8 +17298,9 @@ export function mapSetValArmOf(
   return "plain"
 }
 
-// The value of a map set at its vals element, by `mapSetValArmOf`. A `null` into an atom-valued
-// map is the `-1` sentinel and into a `boolean | null`-valued one the `2`.
+// The value of a map set at its vals element, by `mapSetValArmOf`, evaluated once and left on the
+// stack: a `null` into an atom-valued map is the `-1` sentinel, into a `boolean | null` one the `2`.
+// An inner map op clobbers `cmSlot`, so callers re-pin it.
 function emitMapSetValExpr(
   valIx: i32,
   fnIx: i32,
@@ -17314,10 +17311,19 @@ function emitMapSetValExpr(
   return match mapSetValArmOf(valIx, fnIx, mslot, atomVal, nulBoolVal) {
     "scalar" => {
       const svk = mvScalarValKind(mslot)
-      if svk == null { return emitFail("emitProgram: internal: scalar map value with no kind") }
+      if svk == null {
+        return emitFail("emitProgram: internal: scalar map value with no kind")
+      }
       emitScalarValue(valIx, fnIx, svk)
     }
-    "union" => emitUnionBoxOwed(mvValName[mslot], mvValTyIxAt(mslot), valIx, fnIx)
+    "union" => {
+      if mslot < 0 || mslot >= mvValName.length {
+        return emitFail(
+          "emitProgram: internal: union map value with no mv slot",
+        )
+      }
+      emitUnionBoxOwed(mvValName[mslot], mvValTyIxAt(mslot), valIx, fnIx)
+    }
     "variant" => emitVariantCoerce(mvValVariantOf(mslot), valIx, fnIx)
     "atomNull" => {
       fbI32Const(0 - 1)
@@ -17446,7 +17452,9 @@ export function mapSetNulBoolVal(recvIx: i32, fnIx: i32): boolean {
 // Whether a set of `valIx` into receiver `recvIx` would store a reference into a mono map's i32
 // vals, which no wasm validates: such a set is refused, never written.
 export function mapSetRefIntoMono(recvIx: i32, valIx: i32, fnIx: i32): boolean {
-  if mapSetAtomVal(recvIx, fnIx) || mapShapeOfExpr(recvIx, fnIx) >= 0 { return false }
+  if mapSetAtomVal(recvIx, fnIx) || mapShapeOfExpr(recvIx, fnIx) >= 0 {
+    return false
+  }
   return exprString(valIx, fnIx)
     || exprStruct(valIx, fnIx)
     || exprArray(valIx, fnIx)
