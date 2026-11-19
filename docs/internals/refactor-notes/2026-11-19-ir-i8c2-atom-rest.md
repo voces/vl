@@ -27,7 +27,9 @@ Most of the pairs were two of these together, from `d3290`.
 - **`k ?? "s"` over a `K | null`** at a `string` is `RCoalAtomStr { zaL, zaD, zaAt }`, for a
   plain string-literal default. Legacy's arm is split into `coalAtomStrReserve` (its scratch
   slot, taken before `k` as it was), `coalAtomStrOpen` and `coalAtomStrClose`. Legacy and the
-  IR's lowering both call them.
+  IR's lowering both call them. The reserve-first order matches legacy only for a `k` the IR
+  lowers in place; a `k` that is a pending temp minting its own slot would order the two slots
+  differently, which the armed shadow reports as a byte mismatch.
 
 Compiler lines are +171 −55, 116 net. No legacy line is deleted; legacy's print-atom and
 `??`-atom arms now delegate to the shared pieces.
