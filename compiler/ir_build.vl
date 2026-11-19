@@ -111,6 +111,12 @@ import {
   lowMemFoldsCallee,
   mapGetOrHelperRoute,
   mapKeyArmOf,
+  mapRecvIsSet,
+  mapSetAtomVal,
+  mapSetNulBoolVal,
+  mapSetRefIntoMono,
+  mapSetValArmOf,
+  narrowedArmNeedsUnbox,
   mapRecvShapeOf,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
@@ -1045,6 +1051,58 @@ function printArmRep(arm: PrintArm): string {
   }
 }
 
+// Whether call statement `c` is legacy's map store by method: 2 for `m.set(k, v)`, 1 for a Set's
+// `s.add(k)`, -1 for any other call.
+function mapSetCallOf(c: Call): i32 {
+  if c.callFn < 0 { return -1 }
+  const f = nodeAt(c.callFn)
+  if !(f is Member) || !exprMap(f.memObj, ibFnIx) { return -1 }
+  if f.memProp == "set" && c.callArgs.length == 2 { return 2 }
+  if f.memProp == "add" && c.callArgs.length == 1 { return 1 }
+  return -1
+}
+
+// A map store `recv[key] = val` (or `.set`, or a Set's `.add` with `val` -1) along legacy's
+// plain arms: a map global read plainly, a key written as itself, and a value written as itself
+// (`mapSetValArmOf`); the store is legacy's tail.
+function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
+  const g = mapGlobalOf(recv)
+  if g < 0 { return skip("map store receiver") }
+  const sh = mapRecvShapeOf(recv, ibFnIx)
+  if sh == -3 { return skip("map store value type") }
+  const ka = mapKeyArmOf(recv, key, ibFnIx, sh)
+  if ka != "plain" { return skip("map key " + ka) }
+  if val >= 0 {
+    if mapSetRefIntoMono(recv, val, ibFnIx) { return skip("map store ref into a mono map") }
+    const arm = mapSetValArmOf(
+      val,
+      ibFnIx,
+      sh,
+      mapSetAtomVal(recv, ibFnIx),
+      mapSetNulBoolVal(recv, ibFnIx),
+    )
+    if arm != "plain" { return skip("map store value " + arm) }
+    if narrowedArmNeedsUnbox(val, ibFnIx) { return skip("map store value unbox") }
+  } else if !mapRecvIsSet(recv, ibFnIx) {
+    return skip("map add of a non-set")
+  }
+  const k = irBExpr(b, key)
+  if ibMiss != "" { return 0 }
+  const one: Opnd = { oiRep: ibBool, oiBits: 1 }
+  const v = if val >= 0 { irBExpr(b, val) } else { one }
+  if ibMiss != "" { return 0 }
+  const r: Rhs = {
+    msSym: g,
+    msNonNull: globalReadRecovers(sidOfNode(recv), recv, ibFnIx),
+    msRecv: recv,
+    msKey: k,
+    msVal: v,
+    msAdd: val < 0,
+  }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, ix)
+  return 0
+}
+
 // A `.pop()` statement legacy writes as its checked take-and-drop (`popStmtPlainWhy`).
 function popStmt(b: i32[], c: Call, ix: i32) {
   const pq = popPlanOf(ix, ibFnIx)
@@ -1626,7 +1684,9 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
 // value in source order, then the store, whose guard runs after the value.
 function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // Legacy takes a map store before it plans an element store.
-  if exprMap(t.idxArr, ibFnIx) { return skip("map store") }
+  if exprMap(t.idxArr, ibFnIx) {
+    return mapSet(b, t.idxArr, t.idxIndex, n.binRight, ix)
+  }
   const st = idxStorePlanOf(t, ibFnIx)
   if st == null { return skip("store plan") }
   const why = idxStorePlainWhy(st, t.idxArr, n.binRight, ibFnIx)
@@ -1928,6 +1988,13 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   }
   if n is Call {
     if isPopStmt(n) { return popStmt(b, n, ix) }
+    const ms = mapSetCallOf(n)
+    if ms >= 0 {
+      const mf = nodeAt(n.callFn)
+      if !(mf is Member) { return skip("map store callee") }
+      if ms == 1 { return mapSet(b, mf.memObj, n.callArgs[0], -1, ix) }
+      return mapSet(b, mf.memObj, n.callArgs[0], n.callArgs[1], ix)
+    }
     if isPrintStmt(n) { return printStmt(b, n, ix) }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }

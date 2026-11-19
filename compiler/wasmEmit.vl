@@ -11269,7 +11269,7 @@ function emitUnionIfArm(
 // The cast target is the destination's heap and not `variantHeap(vi)`: the slot is what the store
 // must satisfy, and where the arm is merged with a declared twin the indices are the same
 // anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
-function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
+export function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
   if (
     narrowedStructArmVi(exprIx, fnIx) < 0
     && !narrowedNulStructArm(exprIx, fnIx)
@@ -17265,6 +17265,45 @@ function emitMapDelete(recvIx: i32, keyIx: i32, fnIx: i32) {
 // list-kind / ref-list-slot / struct-index hints, and the atom-id context an overwrite
 // or append needs. One evaluation, shared by both arms of `emitMapSetV`. Leaves the
 // value on the stack; `cmSlot` may be clobbered by inner map ops, so callers re-pin.
+// How a map set writes its value `valIx` into the vals of mv slot `mslot` (atom-valued `atomVal`,
+// `boolean | null`-valued `nulBoolVal`): coerced to a scalar element, boxed into a union, coerced
+// to a record arm, a `null` as its sentinel, an atom widened to its text, or `plain` as itself.
+export type MapSetValArm = "scalar"
+  | "union"
+  | "variant"
+  | "atomNull"
+  | "boolNull"
+  | "boolNulNone"
+  | "atomStr"
+  | "plain"
+export function mapSetValArmOf(
+  valIx: i32,
+  fnIx: i32,
+  mslot: i32,
+  atomVal: boolean,
+  nulBoolVal: boolean,
+): MapSetValArm {
+  if mvScalarValKind(mslot) != null { return "scalar" }
+  if mslot >= 0 && mvValKindAt(mslot) == "union" { return "union" }
+  // A non-null arm-valued map takes every value through `emitVariantCoerce`, a join included,
+  // as an arm-typed local does; the coerce owns the narrowed unbox (D4639).
+  if mslot >= 0 && mvValIsRecord(mslot) && !mvSlotNullable(mslot) {
+    if mvValVariantOf(mslot) >= 0 { return "variant" }
+  }
+  const vn = nodeAt(unwrapParen(valIx))
+  if atomVal && vn is NullLit { return "atomNull" }
+  if nulBoolVal {
+    if vn is NullLit { return "boolNull" }
+    if exprIsNulNone(valIx, fnIx) { return "boolNulNone" }
+  }
+  // A literal-union atom into a string-valued map widens to its member string: the vals element
+  // is a string ref while the atom's rep is an i32 id.
+  if !atomVal && exprIsLitAtom(valIx, fnIx) { return "atomStr" }
+  return "plain"
+}
+
+// The value of a map set at its vals element, by `mapSetValArmOf`. A `null` into an atom-valued
+// map is the `-1` sentinel and into a `boolean | null`-valued one the `2`.
 function emitMapSetValExpr(
   valIx: i32,
   fnIx: i32,
@@ -17272,70 +17311,39 @@ function emitMapSetValExpr(
   atomVal: boolean,
   nulBoolVal: boolean,
 ) {
-  const svk = mvScalarValKind(mslot)
-  if svk != null {
-    // A SCALAR-valued map (f64/i64): emit the value coerced to the element rep.
-    return emitScalarValue(valIx, fnIx, svk)
-  }
-  if mslot >= 0 && mvValKindAt(mslot) == "union" {
-    // A UNION-valued map: box the stored value into the shared union box (a concrete
-    // VARIANT value boxes via `emitUnionBoxArg`, like a call arg / return).
-    return emitUnionBoxOwed(mvValName[mslot], mvValTyIxAt(mslot), valIx, fnIx)
-  }
-  // A non-null ARM-valued map takes every value through `emitVariantCoerce`, a join included,
-  // as an arm-typed local does; the coerce owns the narrowed unbox (D4639).
-  if mslot >= 0 && mvValIsRecord(mslot) && !mvSlotNullable(mslot) {
-    const svArmVi = mvValVariantOf(mslot)
-    if svArmVi >= 0 { return emitVariantCoerce(svArmVi, valIx, fnIx) }
-  }
-  // An atom-valued mono map's member-literal value lowers as its interned atom id; a
-  // NULLABLE-atom value (`{[string]: K | null}`) stores a bare `null` as the `-1` sentinel.
-  if atomVal {
-    const vnul = nodeAt(unwrapParen(valIx))
-    if vnul is NullLit {
+  return match mapSetValArmOf(valIx, fnIx, mslot, atomVal, nulBoolVal) {
+    "scalar" => {
+      const svk = mvScalarValKind(mslot)
+      if svk == null { return emitFail("emitProgram: internal: scalar map value with no kind") }
+      emitScalarValue(valIx, fnIx, svk)
+    }
+    "union" => emitUnionBoxOwed(mvValName[mslot], mvValTyIxAt(mslot), valIx, fnIx)
+    "variant" => emitVariantCoerce(mvValVariantOf(mslot), valIx, fnIx)
+    "atomNull" => {
       fbI32Const(0 - 1)
-      return 0
+      0
     }
-    // A nullable value can only reach the nullable-atom map, whose null is the `-1` (D5330).
-    if nodeTyIsNulLitUnion(valIx) || nodeTyIsNulString(valIx) {}
-  }
-  // A `boolean | null`-valued MONO map (i32 niche) stores a bare `null` as the `2` sentinel —
-  // the store-side dual of the read's `mapTyValIsNulBool` coalesce (sentinel 2). A non-null
-  // boolean value (true/false) falls through and emits as a plain i32.
-  if nulBoolVal {
-    const vnb = nodeAt(unwrapParen(valIx))
-    if vnb is NullLit {
+    "boolNull" => {
       fbI32Const(2)
-      return 0
+      0
     }
-    // A `null`-typed value is that `null` too, its effects run first.
-    if exprIsNulNone(valIx, fnIx) {
+    "boolNulNone" => {
       if emitNulNoneForEffect(valIx, fnIx) < 0 { return -1 }
       fbI32Const(2)
-      return 0
+      0
+    }
+    "atomStr" => emitStrValue(valIx, fnIx)
+    "plain" => {
+      const mvArmOwed = narrowedArmNeedsUnbox(valIx, fnIx)
+      if emitExpr(valIx, fnIx) < 0 { return -1 }
+      // The narrowed-arm unbox at the map-value boundary (D1031) targets the vals element's own
+      // heap, the one a nullable slot's `ref.null` seed reads.
+      if mvArmOwed && mslot >= 0 {
+        emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot), valIx, fnIx)
+      }
+      0
     }
   }
-  // A NULLABLE-value slot (`{[string]: S | null}` / `{[string]: map | null}`) stores a bare
-  // `null` as `ref.null <elem>` — the vals element carries it directly and the fused read
-  // preserves it. A non-null value ignores the seed. A `string | null` value read stays the
-  // raw nullable ref the element holds rather than recovering non-null, which traps (D2596).
-  if mvSlotNullable(mslot) {}
-  // A literal-union atom stored into a string-valued map widens to its member string: the
-  // vals element is `(ref null $aTypeIdx)` while the atom's rep is an i32 id, so without
-  // this the store is a type mismatch — invalid wasm. Gated on `!atomVal`, since an
-  // atom-valued map wants the raw id instead (`svCtx.litUnion`, set above).
-  if !atomVal {
-    if exprIsLitAtom(valIx, fnIx) { return emitStrValue(valIx, fnIx) }
-  }
-  const mvArmOwed = narrowedArmNeedsUnbox(valIx, fnIx)
-  if emitExpr(valIx, fnIx) < 0 { return -1 }
-  // The narrowed-arm unbox at the map-value boundary (D1031) — `m[k] = s` under `if s is
-  // Circle` over a `{[string]: Circle}` — targets the vals element's own heap, the same
-  // one `mvSlotNullable`'s `ref.null` seed above reads.
-  if mvArmOwed && mslot >= 0 {
-    emitNarrowedArmUnboxTo(mvValElemHeapOf(mslot), valIx, fnIx)
-  }
-  return 0
 }
 
 // `local.set` / `local.get` of the set-value stash: the mv slot's typed valStash, or the
@@ -17378,36 +17386,12 @@ function emitMapSetV(
   fnIx: i32,
   valConst1: boolean,
 ) {
-  // An ATOM-valued map (`{[string]: K}`, `K` a literal union) rides the MONO map: each
-  // value is the interned atom id (a plain i32). Its member-literal value is a StrLit
-  // syntactically — it must BYPASS the mono string guard below and emit as its atom id,
-  // so resolve the receiver's value type up front.
-  const svMt = mapRecvTyIn(recvIx, fnIx)
-  let atomVal = mapTyValIsLitUnion(svMt)
-  if mapTyValIsNulLitUnion(svMt) { atomVal = true }
-  // A `boolean | null`-valued map is the MONO i32 niche too — a bare `null` store lowers as the
-  // `2` sentinel (the store-side dual of the read's `mapTyValIsNulBool` coalesce).
-  // A `null`-valued map stores the same sentinel, the only value it holds (D4671).
-  const nulBoolVal = mapTyValIsNulBool(svMt) || mapTyValIsNullUnit(svMt)
-  // A mono (i32/boolean-valued) map cannot store a ref value — a string / struct / list
-  // ref into an i32 array is invalid wasm — so fail loudly; an mv-slot map stores such
-  // values through its own typed vals list, and a constant-true Set value is always a
-  // valid i32 boolean. Resolved here only for the gate; `emitMapRecvKey` re-resolves it.
-  if valConst1 == false && !atomVal {
-    if mapShapeOfExpr(recvIx, fnIx) < 0 {
-      if (
-        exprString(valIx, fnIx)
-        || exprStruct(valIx, fnIx)
-        || exprArray(valIx, fnIx)
-        || exprRefArray(valIx, fnIx)
-        || exprStringArray(valIx, fnIx)
-      ) {
-        return emitFail("emitProgram: map values must be i32 / boolean")
-      }
-    }
+  const atomVal = mapSetAtomVal(recvIx, fnIx)
+  const nulBoolVal = mapSetNulBoolVal(recvIx, fnIx)
+  if !valConst1 && mapSetRefIntoMono(recvIx, valIx, fnIx) {
+    return emitFail("emitProgram: map values must be i32 / boolean")
   }
-  // A Set's store leaves its never-read `vals` alone, on helper rows of its own.
-  const mset = mapShapeIsSet(mapShapeOfExpr(recvIx, fnIx))
+  const mset = mapRecvIsSet(recvIx, fnIx)
   // Receiver + key onto the operand stack; `cmSlot` pinned to the shape.
   if emitMapRecvKey(recvIx, keyIx, fnIx) < 0 { return -1 }
   const mslot = cmSlot
@@ -17420,9 +17404,15 @@ function emitMapSetV(
       return -1
     }
   }
-  cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
   // A set whose value the assignment yields keeps it in the value stash.
-  const park = asgParkWanted && !valConst1 && !msHelp
+  return mapSetTail(mslot, mset, asgParkWanted && !valConst1 && !msHelp)
+}
+
+// After a map set's receiver, key and value: the op context re-pinned to folded shape `mslot`
+// (an inner map op in the value clobbers it), then the store, through the shape's helper where
+// its row reserved one. `mset` a Set's store; `park` keeps the value for the assignment.
+export function mapSetTail(mslot: i32, mset: boolean, park: boolean): i32 {
+  cmSlot = mslot
   // [mapRef, key, value] are the shape's store helper's params, in order; a Set has its own.
   const setFn = mapSetFnOf(if mset { mapShapeOfSet(mslot) } else { mslot })
   if setFn >= 0 {
@@ -17437,6 +17427,37 @@ function emitMapSetV(
   const stRc = emitMapSetStore(mslot, mset)
   if park { mapSetParked(mslot) }
   return stRc
+}
+
+// Whether map receiver `recvIx` holds atoms (`{[string]: K}`, `K` a literal union, or `K | null`),
+// each value its interned id on the mono map.
+export function mapSetAtomVal(recvIx: i32, fnIx: i32): boolean {
+  const mt = mapRecvTyIn(recvIx, fnIx)
+  return mapTyValIsLitUnion(mt) || mapTyValIsNulLitUnion(mt)
+}
+
+// Whether map receiver `recvIx` holds `boolean | null` or `null` on the mono i32 niche, whose
+// `null` is the `2` sentinel (D4671).
+export function mapSetNulBoolVal(recvIx: i32, fnIx: i32): boolean {
+  const mt = mapRecvTyIn(recvIx, fnIx)
+  return mapTyValIsNulBool(mt) || mapTyValIsNullUnit(mt)
+}
+
+// Whether a set of `valIx` into receiver `recvIx` would store a reference into a mono map's i32
+// vals, which no wasm validates: such a set is refused, never written.
+export function mapSetRefIntoMono(recvIx: i32, valIx: i32, fnIx: i32): boolean {
+  if mapSetAtomVal(recvIx, fnIx) || mapShapeOfExpr(recvIx, fnIx) >= 0 { return false }
+  return exprString(valIx, fnIx)
+    || exprStruct(valIx, fnIx)
+    || exprArray(valIx, fnIx)
+    || exprRefArray(valIx, fnIx)
+    || exprStringArray(valIx, fnIx)
+}
+
+// Whether map receiver `recvIx` is a Set, whose store leaves its never-read `vals` alone on
+// helper rows of its own.
+export function mapRecvIsSet(recvIx: i32, fnIx: i32): boolean {
+  return mapShapeIsSet(mapShapeOfExpr(recvIx, fnIx))
 }
 
 // The local a set's value stash is, outside a store helper: an mv slot's own, else the map
