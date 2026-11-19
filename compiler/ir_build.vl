@@ -113,7 +113,7 @@ import {
   holeBoxTyAt,
   identReadArmOf,
   idxStorePlainWhy,
-  ifExprPlainKind,
+  ifExprPlainWhy,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -864,7 +864,16 @@ function localVarAt(w: i32): i32 {
   return ib.irLocalAt[w] ?? -1
 }
 
-// A value `if` on legacy's plain scalar path (`ifExprPlainKind`): a slotless out each arm's one
+// Whether condition `ix` is an `is` test or its negation, the shapes `staticIsGuard` reads back.
+function condIsTest(ix: i32): boolean {
+  const c = nodeAt(unwrapParen(ix))
+  if c is Unary {
+    return c.unOp == "!" && nodeAt(unwrapParen(c.unArg)) is IsExpr
+  }
+  return c is IsExpr
+}
+
+// A value `if` on legacy's plain scalar path (`ifExprPlainWhy`): a slotless out each arm's one
 // value writes, as `&&` and `||` build it. An `else` arm whose value is itself a value `if` is the
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
@@ -882,11 +891,16 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   let cix = ix0
   let crep = rep0
   while true {
-    if ifExprPlainKind(cix, ibFnIx) < 0 { return irBMiss("expression if") }
+    const pw = ifExprPlainWhy(cix, ibFnIx)
+    if pw != "" { return irBMiss("expression if " + pw) }
     // Its value stays on the stack from here, so no temp an operand before it built may wait.
     if endsInTemp(cb) { return irBMiss("if after an operand") }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+    // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
+    if c is OImm && condIsTest(n.ifCond) {
+      return irBMiss("decided is condition")
+    }
     const ty = nodeTyAt(cix, ibFnIx)
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
@@ -2855,9 +2869,16 @@ function tailIf(b: i32[], ix: i32) {
   if !(n is IfStmt) { return skip("tail if node") }
   const why = tailIfPlainWhy(ix)
   if why != "" { return skip(why) }
-  const c = irBExpr(b, n.ifCond)
+  // A decided `false` `is` writes no then arm (`emitGuardCond`); another constant `is` is one
+  // legacy decides off its bytes, so it is a miss.
+  const decided = isDecidedFalse(n.ifCond, ibFnIx)
+  const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+  const c = if decided { no } else { irBExpr(b, n.ifCond) }
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-  const thenB = tailArm(n.ifThen)
+  if !decided && c is OImm && condIsTest(n.ifCond) {
+    return skip("decided is condition")
+  }
+  const thenB = if decided { [] } else { tailArm(n.ifThen) }
   const elseB: i32[] = []
   if n.ifElse >= 0 && n.ifElse < P.nodes.length && nodeAt(n.ifElse) is IfStmt {
     tailIf(elseB, n.ifElse)
