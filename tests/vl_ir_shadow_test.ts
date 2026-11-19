@@ -332,10 +332,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals, and a list literal whose elements box into a union is a ref list legacy coerces: each a
-// named miss, never a byte mismatch.
+// locals and closed after its last push: covered and matched. A list literal whose elements box
+// into a union is a ref list legacy coerces: a named miss, never a byte mismatch.
 Deno.test({
-  name: "ir shadow: a reserved list binding and a union-element list literal are named misses",
+  name: "ir shadow: a reserved list binding matches, a union-element list literal misses by name",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -347,7 +347,10 @@ function ln(x: i32): (i32 | string)[] { return [x, "s"] }
 print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
-    for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the reserved binding covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    for (const want of ["uncovered array ref"]) {
       if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);

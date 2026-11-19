@@ -470,6 +470,8 @@ let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
 let ibLoopCont: i32[] = []
 let ibLabelN = 0
+// The statements whose end closes a list reserve region the body opened (`reserve.open`).
+let ibReserveEnd: i32[] = []
 let ibBool = -1
 let ibNoValue = -1
 
@@ -2734,8 +2736,33 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
   stmtNode(b, ix, sibs, pos)
   if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
+  // Legacy writes back a region's length after its last statement, inside that statement's
+  // span (`emitStmtIn`).
+  if reserveEnds(ix) {
+    irBNode(
+      b,
+      { srOp: "reserve.close", srHeap: -1, srArgs: [], srImm: ix },
+      -1,
+      ibNoValue,
+      ix,
+    )
+  }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
   return 0
+}
+
+// Whether statement `ix` ends a reserve region the body opened; it is taken off the list.
+function reserveEnds(ix: i32): boolean {
+  let i = 0
+  let hit = false
+  while i < ibReserveEnd.length {
+    if ibReserveEnd[i] == ix {
+      ibReserveEnd[i] = -1
+      hit = true
+    }
+    i = i + 1
+  }
+  return hit
 }
 
 function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
@@ -2763,15 +2790,23 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
     if v < 0 || n.letInit < 0 { return skip("declaration") }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
-    if pos >= 0 && listReserveScan(n, sibs, pos, ibFnIx) != null {
-      return skip("declaration list reserve")
-    }
+    const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep {
       return skip("declaration coercion")
     }
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
+    if lr != null {
+      irBNode(
+        b,
+        { srOp: "reserve.open", srHeap: pos, srArgs: [], srImm: v },
+        -1,
+        ibNoValue,
+        ix,
+      )
+      ibReserveEnd.push(sibs[lr.lrLast])
+    }
     return 0
   }
   if n is IfStmt { return ifChain(b, ix) }
@@ -3051,6 +3086,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibFnPos = fnPos
   ibMiss = ""
   ibMisses = []
+  ibReserveEnd = []
   ibDeclVar = Map()
   ibLoopName = []
   ibLoopBrk = []
