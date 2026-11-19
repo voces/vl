@@ -953,8 +953,9 @@ Deno.test({
 
 // The start body under the shadow (stage 1, S1a): a top-level statement, a global's plain
 // initializer and a promoted global each build and match legacy's entry, counted under `start `
-// rows; a start owing the string accumulator scan and a widened initializer are named misses.
+// rows, a top-level string accumulator among them; a widened initializer is a named miss.
 const START_MATCHED = [
+  `let s = ""\nlet i = 0\nwhile i < 3 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\n`,
   `let i = 0\nwhile i < 3 { i = i + 1 }\nprint(i)\n`,
   `function sq(x: i32): i32 { return x * x }\nconst k = sq(3)\nprint(k + 1)\n`,
   `let n = 2\nn = n + 3\nprint(n)\n`,
@@ -974,11 +975,10 @@ Deno.test({
   },
 });
 Deno.test({
-  name: "ir shadow: a start owing the string accumulator, or widening an initializer, misses by name",
+  name: "ir shadow: a start widening an initializer misses by name",
   ignore,
   fn: () => {
     const cases: [string, string][] = [
-      [`let s = ""\nlet i = 0\nwhile i < 3 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\n`, "string accumulator"],
       [`const w: f64 = 3\nprint(w)\n`, "global initializer widen"],
     ];
     for (const [src, why] of cases) {
@@ -992,7 +992,7 @@ Deno.test({
 
 // The start body's claim (`irClaimStart`, family `start`, stage 1 S1b): a start inside the set is
 // claimed and ships legacy's bytes; under the verifier control the claim falls back to legacy,
-// loudly. A start owing the string accumulator stays legacy's.
+// loudly. A start appending to a top-level string accumulator is claimed and ships legacy's bytes.
 const START_CLAIMED = `function note(s: string, v: i32): i32 {
   print(s)
   return v
@@ -1024,9 +1024,32 @@ Deno.test({
     if (broken.out.length !== legacy.out.length || broken.out.some((b, i) => b !== legacy.out[i])) {
       throw new Error(`want a fallen-back start claim to ship legacy's bytes`);
     }
-    const acc = run(`let s = ""\nlet i = 0\nwhile i < 3 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\n`, 5);
-    if (acc.rows.has("claimed start")) {
-      throw new Error(`want a start owing the string accumulator left to legacy, got ${JSON.stringify([...acc.rows])}`);
+    const accSrc = `let s = ""\nlet i = 0\nwhile i < 3 {\n  s = s + "x"\n  i = i + 1\n}\nprint(s)\n`;
+    const acc = run(accSrc, 5);
+    const accLegacy = run(accSrc, 1);
+    if (!acc.rows.has("claimed start")) {
+      throw new Error(`want a start owing the string accumulator claimed, got ${JSON.stringify([...acc.rows])}`);
+    }
+    if (acc.out.length !== accLegacy.out.length || acc.out.some((b, i) => b !== accLegacy.out[i])) {
+      throw new Error(`want the claimed accumulator start byte-identical to legacy`);
+    }
+  },
+});
+
+// A value `if` and a returned `if` whose condition is an `is` tag test: legacy writes the test
+// and both arms as they are, so each function builds and matches legacy's bytes.
+const IS_COND_IF =
+  `function f(v: i32 | string): i32 {\n  const w = if v is i32 { 1 } else { 2 }\n  return w + 1\n}\nfunction g(v: i32 | string): i32 {\n  return if v is string { 3 } else { 4 }\n}\nprint(f(5))\nprint(f("x"))\nprint(g(5))\nprint(g("x"))\n`;
+Deno.test({
+  name: "ir shadow: an if on an is condition, valued or returned, builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(IS_COND_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
