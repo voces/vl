@@ -1741,6 +1741,7 @@ import {
   ArrLitArm,
   ForInLoop,
   IdxStore,
+  PopPlan,
   PushPlan,
   PushSlot,
   PushValKinds,
@@ -30450,7 +30451,7 @@ function listOpRecvNarrowedUnion(objIx: i32, name: string, fnIx: i32) {
 // resolved; `refSlot >= 0` defers the ref family's per-element-type frame to here, the one
 // point that knows staging is happening. A `.pop`/`.clear` stages only a receiver it cannot
 // read in place; a `.push` reads `base`..`base+2` regardless, so the ref frame is reserved for the first group only.
-function listOpStageBase(base: i32, refSlot: i32): i32 {
+export function listOpStageBase(base: i32, refSlot: i32): i32 {
   if refSlot < 0 { return base }
   return refPushScratchBaseFor(refSlot)
 }
@@ -31077,29 +31078,90 @@ function emitPopGo(callIx: i32, fnIx: i32, nulBox: boolean, getIdx: i32) {
           fnIx,
         )
       }
-      // A pop the checker typed as the element itself, under a `.length` test of its receiver
-      // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
-      if getIdx < 0 && nodeTyExcludesNull(callIx) {
-        if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
-        fbRefAsNonNull()
-        if popUnionBoxElem(popRefSlot) {
-          if emitStaleBoxRetag(popRefSlot, callIx) < 0 { return -1 }
-        }
-        return 0
-      }
-      return emitPopRefChecked(
-        callIx,
-        lIdx,
-        wrapTy,
-        popBack,
-        getIdx,
-        fnIx,
-        popRefSlot,
-        opNm,
-      )
+      return popRefTail(callIx, lIdx, wrapTy, popBack, getIdx, popRefSlot, fnIx)
     }
   }
   return emitFail("emitProgram: expected a .pop or .get call")
+}
+
+// The plan of `.pop()` call `callIx` over a ref or string list, as `emitPopGo` lays it out; null for
+// any other list or an uncollected ref row. A staged receiver takes `listOpStageBase`'s frame.
+export function popRefPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 { return null }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return null }
+  const o = callee.memObj
+  if !popRecvIsList(o, fnIx) { return null }
+  if exprRefArray(o, fnIx) {
+    if !rlRowsMinted() { return null }
+    const rslot = refListSlotOfExpr(o, fnIx)
+    if rslot < 0 { return null }
+    const p: PopPlan = {
+      pqRecv: o,
+      pqEk: null,
+      pqWrap: rlWrapIdx[rslot],
+      pqBack: rlBackIdx[rslot],
+      pqBase: pushScratchBase,
+      pqRefSlot: rslot,
+      pqElemRef: true,
+    }
+    return p
+  }
+  const ek = scalarListElemKind(o, fnIx)
+  if !exprStringArray(o, fnIx) || !(ek == null || ek == "i32") { return null }
+  const sp: PopPlan = {
+    pqRecv: o,
+    pqEk: null,
+    pqWrap: mkListTy(),
+    pqBack: mkArrTy(),
+    pqBase: strPushScratchBase,
+    pqRefSlot: -1,
+    pqElemRef: true,
+  }
+  return sp
+}
+
+// The plan of `.pop()` call `callIx` over any list `emitPopGo` pops: a scalar plan, else a ref one.
+export function popAnyPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
+  const pq = popPlanOf(callIx, fnIx)
+  if pq != null { return pq }
+  return popRefPlanOf(callIx, fnIx)
+}
+
+// After a ref or string list's receiver is in local `lIdx`: `.pop()` or `.get` call `callIx`
+// leaves its element, non-null when the checker typed it so, else its checked nullable read.
+// `refSlot` is the ref list's row, -1 for a string list.
+export function popRefTail(
+  callIx: i32,
+  lIdx: i32,
+  wrapTy: i32,
+  popBack: i32,
+  getIdx: i32,
+  refSlot: i32,
+  fnIx: i32,
+) {
+  const opNm = if getIdx < 0 { ".pop" } else { ".get" }
+  // A pop the checker typed as the element itself, under a `.length` test of its receiver
+  // (D3558): the list is non-empty, so the element is read unchecked in its own rep.
+  if getIdx < 0 && nodeTyExcludesNull(callIx) {
+    if pushTakeElem(lIdx, wrapTy, popBack, getIdx, fnIx) < 0 { return -1 }
+    fbRefAsNonNull()
+    if popUnionBoxElem(refSlot) {
+      if emitStaleBoxRetag(refSlot, callIx) < 0 { return -1 }
+    }
+    return 0
+  }
+  return emitPopRefChecked(
+    callIx,
+    lIdx,
+    wrapTy,
+    popBack,
+    getIdx,
+    fnIx,
+    refSlot,
+    opNm,
+  )
 }
 
 // After an i32 or scalar list's receiver is in local `lIdx`: `.pop()` or `.get` call `callIx`

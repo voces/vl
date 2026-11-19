@@ -510,6 +510,35 @@ print(acc(["p", "q"]) + g)
   },
 });
 
+// A `.pop()` over a record or string list, at a value position or as a statement, along legacy's
+// ref pop tail: the element when the checker proved it, else the checked nullable read.
+Deno.test({
+  name: "ir shadow: a ref or string list pop is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type P = { x: i32 }
+function a(ps: P[]): i32 {
+  if ps.length > 0 {
+    const p = ps.pop()
+    return p.x
+  }
+  return -1
+}
+function b(ss: string[]): i32 {
+  ss.pop()
+  return ss.length
+}
+print(a([{ x: 3 }]))
+print(b(["p", "q"]))
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
