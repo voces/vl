@@ -27,7 +27,7 @@ built by the rep pass, at `i32[][]`.
   including three deep, which master refused too) runs.
 - `check-filed-witnesses --strict`: 5,519 graded, 0 moved; D16920 runs as filed, D17008 refuses as
   filed.
-- Full @run A/B: see the PR.
+- Full @run A/B over 6,763 programs: 1 mover, the new fixture (RC 1 → 0); 0 wasm or output movers.
 
 ## Left
 D17008: the nested-record spelling `{ a: { f: [inc0, dbl] } }` → `{ a: { f: [dbl] } }`.
