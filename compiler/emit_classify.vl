@@ -390,6 +390,8 @@ import {
   isStorageRead,
   litRepTyAt,
   litRepUnionAt,
+  luOvOn,
+  luOvTyOf,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -5887,6 +5889,11 @@ export function forInWalkKind(iterIx: i32, fnIx: i32): VKind | null {
 // that instance reads it unnarrowed, else the storage `readContainerTyAt` reads.
 function forInIterTyAt(iterIx: i32, fnIx: i32): i32 {
   const r = unwrapParen(iterIx)
+  // A union walk's arm reads the iterable at that arm.
+  if luOvOn != 0 {
+    const ov = luOvTyOf(r)
+    if ov >= 0 { return ov }
+  }
   const el = elabClosedTyAt(r, fnIx)
   if el >= 0 && elabNarrowedFromAt(r, fnIx) == -1 { return el }
   return readContainerTyAt(iterIx, fnIx)
@@ -10132,7 +10139,8 @@ export function ctnArmsAt(ty: i32): i32[] {
 }
 
 // The receiver of a read at `ix` that a pin typed over a union of containers and its instance
-// lowers per arm (D16897): an index, `.length`, or a map's `.has` / `.get`; -1 for none.
+// lowers per arm (D16897): an index, `.length`, or a map's `.has` / `.get` / `.keys()` /
+// `.values()`; -1 for none.
 export function armSiteRecv(ix: i32): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = nodeAt(ix)
@@ -10144,9 +10152,15 @@ export function armSiteRecv(ix: i32): i32 {
       if n.memProp == "length" { return unwrapParen(n.memObj) }
     }
     Call => {
-      if n.callArgs.length == 1 && n.callFn >= 0 && n.callFn < P.nodes.length {
+      if n.callFn >= 0 && n.callFn < P.nodes.length {
         const f = nodeAt(n.callFn)
-        if f is Member && (f.memProp == "has" || f.memProp == "get") {
+        const one = f is Member && (f.memProp == "has" || f.memProp == "get")
+        const none = f is Member
+          && (f.memProp == "keys" || f.memProp == "values")
+        if (
+          f is Member
+          && (one && n.callArgs.length == 1 || none && n.callArgs.length == 0)
+        ) {
           return unwrapParen(f.memObj)
         }
       }
@@ -10155,6 +10169,25 @@ export function armSiteRecv(ix: i32): i32 {
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => {}
   }
   return -1
+}
+
+// The map arms of a `for` over `iter` that a pin typed over a union of maps, which its instance
+// walks per arm (`emitMapUnionFor`); empty for any other loop or inside one arm's walk.
+export function lmForUnionArms(iter: i32, fnIx: i32): i32[] {
+  const none: i32[] = []
+  if (
+    fnIx < 0
+    || iter < 0
+    || iter >= P.nodes.length
+    || !(nodeAt(iter) is Ident)
+  ) {
+    return none
+  }
+  if luOvOn != 0 && luOvTyOf(iter) >= 0 { return none }
+  if !exprUnion(iter, fnIx) { return none }
+  const arms = ctnArmsAt(nodeTyAt(iter, fnIx))
+  if arms.length == 0 || !(tyAt(arms[0]) is TyMap) { return none }
+  return arms
 }
 
 // Whether `ix` is an element read of a union-of-containers box that a pin typed and its
@@ -10170,9 +10203,9 @@ export function armSiteReads(ix: i32, fnIx: i32): boolean {
   if recv < 0 { return false }
   // The receiver is a name, or (for `.length`) an element read that is itself such a box.
   const named = nodeAt(recv) is Ident && exprUnion(recv, fnIx)
-  if !named && !(nodeAt(ix) is Member && luArmIndexBoxes(recv, fnIx)) {
-    return false
-  }
+  const boxes = armSiteReads(recv, fnIx)
+    && repSigKindOfTy(nodeTyAt(recv, fnIx)) == "union"
+  if !named && !(nodeAt(ix) is Member && boxes) { return false }
   return ctnArmsAt(nodeTyAt(recv, fnIx)).length > 0
 }
 
