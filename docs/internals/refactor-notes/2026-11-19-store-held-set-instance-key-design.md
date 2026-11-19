@@ -59,3 +59,16 @@ master), not handed on, and handed a scalar. Bars:
 - no new A0 elab-only keys (`VL_INST_KEYS`);
 - late rows do not rise;
 - a full @run A/B.
+
+## Progress (WIP commit on this branch, not for merge)
+- `elabCallArgSetTy` now keys a call argument holding a tagged set at any depth (`fnTagHoldsTy`:
+  list, record, map), replacing the list-only `fnTagListTy`. This is the one function F2's D14433
+  map arm will use too.
+- `ftHandedRecHolds` (the decision half) is in.
+- D15900 is still an invalid module. The handed literal is built as `array.new_fixed $0 1
+  (struct.new $9 (i32.const 4))`, where `$9 = struct {ref $5}` is a closure record, and `take`'s
+  parameter `$8` is that closure-record list. So `take`'s instance is still not keyed at the set.
+- Next to establish: whether `elabCallTaggedArgs` sees the handed literal as holding the tagged set.
+  Is `nodeTyIxOf` of the literal its set-typed record list, or the type closed at `take`'s pin? If it
+  is the pin's, the key must read the literal's identity (each leaf's `idSetOf`, as `ikIdTy` does
+  for a bare function value) rather than its node type.
