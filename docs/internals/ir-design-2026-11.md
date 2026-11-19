@@ -866,6 +866,29 @@ Function coverage continues alongside: the next doors are `is guard`, `map read 
 `index ref`. The driver census (`scripts/ir-driver-census.sh`) is the measure of each stage, by
 the drivers it moves from hit-with-claiming-off to hit-with-claiming-on 0.
 
+### 10.2 The legacy-to-IR door: a precondition for shipping through it (2026-11-19)
+
+`irLowerNodeIn` (#9134) lowers one node as an IR fragment inside a function legacy is writing.
+Whole-function IR assumes legacy's lowering context is at rest, and asks the shared plans
+accordingly: `atomStrPlanOf(…, held: false)` (#9127), `fnValueArmOf(…, stubRhs: -1)`. Inside a legacy
+body that assumption can be false, and a plan the IR asks as "fresh delivery" can then disagree
+with what legacy decides at the same node.
+
+**Before the first non-shadow caller of `irLowerNodeIn`, the door must miss ("legacy context
+live") unless each of these is at its resting value:**
+- the coercion seats: `coerceHeld`, `atomSeat`;
+- storage-read mode (`storageReadEnter` without its `storageReadLeave`);
+- the narrowing frames legacy pushes around a guarded arm;
+- the loop-hoist frames (`lhOpen`) and the lazy list frame;
+- the union-sink pair.
+
+The list lives in one function the door calls, so a new context global is added in one place.
+The PR that adds it carries a **failing control**: a fragment requested under a live context
+(e.g. inside a held coercion) must miss, and the PR quotes that miss. A context the door is
+meant to run under instead becomes an explicit parameter of the shared plan (as `held` did), not
+an ambient read. The shadow-only probe (`irNodeInShadow`) is exempt: it writes into a scratch
+buffer and ships nothing.
+
 ## A. Commands
 
 Run from the checkout root, with `PATH=$PWD/scripts/vl-host/target/release:$PATH`.
