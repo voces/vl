@@ -21,14 +21,14 @@ back off its own bytes (`staticIsGuard`) to drop the guarded arm (D932). So a st
 asks `decidedFalseGuard` and builds no then arm; anywhere else (`!`, `&&`, a value `if`) legacy
 folds the constant, so `tagAbsent` there stays the named miss `is arm tag tagAbsent`.
 
-Measured on fixpoint seeds (master 2a556289 against the branch before its last merge):
+Measured on fixpoint seeds, master d1de0b7d against this branch:
 
 | | master | this branch |
 |---|---|---|
-| corpus functions with no blocker (blocker census, of 45,675) | 30,652 | 31,156 |
-| armed sweep: functions covered = verified = matched | 67,061 | 67,676 |
+| corpus functions with no blocker (blocker census, of 45,675) | 30,703 (67.2%) | 31,207 (68.3%) |
+| armed sweep: functions covered = verified = matched | 67,239 | 67,854 |
 | mismatch / fail | 0 / 0 | 0 / 0 |
-| corpus mode-3 claimed | | 31,156 |
+| corpus mode-3 claimed | | 31,207 |
 
 Legacy lines deleted: 0. Moved to `@ir`: 79, the decisions and tail the IR now asks
 (`exprUnionIdent` 45, `repNarrowedArm` 17, `boxTagIsTail` 6, `paramUnion` 6, `storageReadEnter` 5).
