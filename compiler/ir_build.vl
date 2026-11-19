@@ -111,6 +111,7 @@ import {
   isVariantTagPlain,
   keptDeclStoresNothing,
   lowMemFoldsCallee,
+  mapFilterWhy,
   mapGetOrHelperRoute,
   mapKeyArmOf,
   mapRecvIsSet,
@@ -167,6 +168,7 @@ import {
 import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import {
+  cbIdentNamesFn,
   declaredIndexAt,
   envSlotShift,
   exprIsLitAtom,
@@ -1067,6 +1069,28 @@ function numKindPrim(k: i32): string {
   return ""
 }
 
+// `.map`/`.filter` on legacy's arm (`mapFilterWhy`): the receiver, then a function-typed binding as
+// the callback's value, or the `null` immediate for a capture-free function the lowering builds.
+function mapFilterRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  const why = mapFilterWhy(ix, ibFnIx)
+  if why != "" { return missRhs(why) }
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" { return missRhs("method operand") }
+  if !(repNodeAt(irBOpRep(v)) is RList) { return missRhs("map receiver rep") }
+  const at = b.length
+  const cb = unwrapParen(c.callArgs[0])
+  let f: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if !(nodeAt(cb) is FuncDecl || cbIdentNamesFn(c.callArgs[0], ibFnIx)) {
+    f = irBExpr(b, cb)
+    if ibMiss != "" { return missRhs("method operand") }
+    if ifBelowLead(b, at, "map short-circuit operand") {
+      return missRhs("map short-circuit operand")
+    }
+  }
+  const r: Rhs = { hfV: v, hfC: f, hfAt: ix }
+  return r
+}
+
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -1076,6 +1100,9 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     && !(nodeAt(c.callArgs[0]) is Spread)
   ) {
     return pushRhs(b, c, m, ix)
+  }
+  if m.memProp == "map" || m.memProp == "filter" {
+    return mapFilterRhs(b, c, m, ix)
   }
   let op: StrOp = "slice"
   if exprIsStrMethod(ix, ibFnIx, "cpLen") {
