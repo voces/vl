@@ -27077,15 +27077,21 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
     const a = c.callArgs[i]
     const k = sigParamKindAt(ckey, i)
     const bty: i32[] = [0 - 1]
+    // A string or record argument is legacy's plain arm only unread as an atom, unboxed from a
+    // narrowing or recovered from a nullable.
+    const heap = k == "str" && !exprIsLitAtom(a, fnIx)
+      || k == "struct"
+      && !narrowedArmNeedsUnbox(a, fnIx)
+      && !exprNullableRecord(a, fnIx)
     if (
-      !(k == "i32" || k == "i64" || k == "f64" || k == "f32")
+      !(k == "i32" || k == "i64" || k == "f64" || k == "f32" || heap)
       || sigParamCoerceKind(ckey, i) != null
       || bundleCallArgSigs(c.callFn, fnIx, i, bty).length > 0
       || bundleKeyParamTy(ckey, i, a) >= 0
       || emitBundleRecordRead(a, fnIx)
       || cloCallParamLitUnion(callIx, i, fnIx) != 0
       || tyIsLitUnion(nodeTyAt(a, fnIx))
-      || exprScalarWidth(a, fnIx) != k
+      || !heap && exprScalarWidth(a, fnIx) != k
     ) {
       return ""
     }
@@ -28927,83 +28933,120 @@ function emitPopRefChecked(
   return 0
 }
 
+// Whether `.clear()` on `recvIx` is a list's (legacy's statement ladder; a map clears otherwise).
+export function clearRecvIsList(recvIx: i32, fnIx: i32): boolean {
+  return exprArray(recvIx, fnIx)
+    || exprRefArray(recvIx, fnIx)
+    || exprStringArray(recvIx, fnIx)
+    || scalarListElemKind(recvIx, fnIx) != null
+}
+
+// The plan a list `.clear()` call is lowered by: its receiver, the wrapper whose length it zeroes,
+// and the push scratch base and ref-list slot its receiver stages at. `clFail` is the refusal to
+// raise, or "row" where the receiver's ref-list row does not resolve.
+export type ClearPlan = {
+  clFail: string,
+  clRecv: i32,
+  clWrap: i32,
+  clBase: i32,
+  clRefSlot: i32,
+}
+
+function clRefused(why: string): ClearPlan {
+  const p: ClearPlan = {
+    clFail: why,
+    clRecv: -1,
+    clWrap: -1,
+    clBase: -1,
+    clRefSlot: -1,
+  }
+  return p
+}
+
+// The plan of list `.clear()` call `callIx`, asked where legacy's arm asks it; it mints nothing.
+export function clearPlanOf(callIx: i32, fnIx: i32): ClearPlan {
+  if callIx < 0 || callIx >= P.nodes.length {
+    return clRefused("emitProgram: expected a .clear call")
+  }
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callFn < 0 {
+    return clRefused("emitProgram: expected a .clear call")
+  }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) {
+    return clRefused("emitProgram: expected a .clear call")
+  }
+  if c.callArgs.length != 0 {
+    return clRefused(
+      "emitProgram: internal: .clear reached with the wrong argument count — the checker's arity rule refuses it",
+    )
+  }
+  const isRef = exprRefArray(callee.memObj, fnIx)
+  const isStr = exprStringArray(callee.memObj, fnIx)
+  // the scalar-list family, the arm `emitPop` grew at D977 and this one did not:
+  // `exprArray` claims only an i32-element list, so `i64[]`/`f64[]`/`f32[]`/`u8[]`
+  // either failed the receiver test or reset the length through the wrong wrapper
+  // type wherever an i32 list happened to be collected too — invalid wasm.
+  let clearEk = scalarListElemKind(callee.memObj, fnIx)
+  if clearEk == "i32" { clearEk = null }
+  if !isRef && !isStr && clearEk == null && !exprArray(callee.memObj, fnIx) {
+    return clRefused("emitProgram: .clear receiver is not a list")
+  }
+  const p = clRefused("")
+  p.clRecv = callee.memObj
+  p.clBase = pushScratchBase
+  if isRef {
+    if !rlRowsMinted() {
+      return clRefused(
+        "emitProgram: ref .clear but ref list type not collected",
+      )
+    }
+    // See `emitPop`'s `popRefSlot`.
+    const rslot = refListSlotOfExpr(callee.memObj, fnIx)
+    if rslot < 0 {
+      p.clFail = "row"
+      return p
+    }
+    p.clWrap = rlWrapIdx[rslot]
+    p.clRefSlot = rslot
+  } else if clearEk != null {
+    // The scalar sibling of the i32 default below, and `emitPop`'s arm minus the
+    // backing (a `.clear` writes only the length field, so no `aTy`).
+    if !scalarListUsedOf(clearEk) {
+      return clRefused("emitProgram: .clear but list type not collected")
+    }
+    p.clWrap = scalarListWrap(clearEk, exprPackedRow(callee.memObj, fnIx))
+    p.clBase = scalarPushScratchBaseOf(
+      clearEk,
+      exprPackedRow(callee.memObj, fnIx),
+    )
+  } else if isStr {
+    p.clWrap = mkListTy()
+    p.clBase = strPushScratchBase
+  } else {
+    p.clWrap = lTy()
+  }
+  return p
+}
+
 // Lower a `.clear()` statement onto `body`: reset the list's logical length to 0,
 // retaining the backing. Generic over the list kind, with `emitPop`'s receiver
 // resolution (bare local, module global, or struct field via the `recvRef` scratch).
 function emitClear(callIx: i32, fnIx: i32) {
-  const c = nodeAt(callIx)
-  if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Member {
-      if c.callArgs.length != 0 {
-        return emitFail(
-          "emitProgram: internal: .clear reached with the wrong argument count — the checker's arity rule refuses it",
-        )
-      }
-      const isRef = exprRefArray(callee.memObj, fnIx)
-      const isStr = exprStringArray(callee.memObj, fnIx)
-      // the scalar-list family, the arm `emitPop` grew at D977 and this one did not:
-      // `exprArray` claims only an i32-element list, so `i64[]`/`f64[]`/`f32[]`/`u8[]`
-      // either failed the receiver test or reset the length through the wrong wrapper
-      // type wherever an i32 list happened to be collected too — invalid wasm.
-      let clearEk = scalarListElemKind(callee.memObj, fnIx)
-      if clearEk == "i32" { clearEk = null }
-      if (
-        !isRef
-        && !isStr
-        && clearEk == null
-        && !exprArray(callee.memObj, fnIx)
-      ) {
-        return emitFail("emitProgram: .clear receiver is not a list")
-      }
-      let wrapTy = -1
-      let base = pushScratchBase
-      // See `emitPop`'s `popRefSlot`.
-      let clearRefSlot = -1
-      if isRef {
-        if !rlRowsMinted() {
-          return emitFail(
-            "emitProgram: ref .clear but ref list type not collected",
-          )
-        }
-        const rslot = refListSlotOfExpr(callee.memObj, fnIx)
-        if rslot < 0 { return refListRowRefused(callee.memObj) }
-        wrapTy = rlWrapIdx[rslot]
-        clearRefSlot = rslot
-      } else if clearEk != null {
-        // The scalar sibling of the i32 default below, and `emitPop`'s arm minus the
-        // backing (a `.clear` writes only the length field, so no `aTy`).
-        if !scalarListUsedOf(clearEk) {
-          return emitFail("emitProgram: .clear but list type not collected")
-        }
-        wrapTy = scalarListWrap(clearEk, exprPackedRow(callee.memObj, fnIx))
-        base = scalarPushScratchBaseOf(
-          clearEk,
-          exprPackedRow(callee.memObj, fnIx),
-        )
-      } else if isStr {
-        wrapTy = mkListTy()
-        base = strPushScratchBase
-      } else {
-        wrapTy = lTy()
-      }
-      const lIdx = listOpRecvLocal(
-        callee.memObj,
-        fnIx,
-        base,
-        clearRefSlot,
-        ".clear",
-      )
-      if lIdx < 0 { return -1 }
-      // L.len = 0
-      fbLocalGet(lIdx)
-      fbI32Const(0)
-      fbStructSet(wrapTy, 1) // 0xfb 0x05 <wrapTy> field 1: len
-      return 0
-    }
-  }
-  return emitFail("emitProgram: expected a .clear call")
+  const p = clearPlanOf(callIx, fnIx)
+  if p.clFail == "row" { return refListRowRefused(p.clRecv) }
+  if p.clFail != "" { return emitFail(p.clFail) }
+  const lIdx = listOpRecvLocal(p.clRecv, fnIx, p.clBase, p.clRefSlot, ".clear")
+  if lIdx < 0 { return -1 }
+  return clearLenTail(p, lIdx)
+}
+
+// A list `.clear()` over its receiver held in local `lIdx`: `L.len = 0`, the backing kept.
+export function clearLenTail(p: ClearPlan, lIdx: i32): i32 {
+  fbLocalGet(lIdx)
+  fbI32Const(0)
+  fbStructSet(p.clWrap, 1) // 0xfb 0x05 <wrapTy> field 1: len
+  return 0
 }
 
 // Lower a fused `xs.get(i) ?? d` over a scalar-element list (i32/boolean/f64) onto
@@ -32676,14 +32719,7 @@ function emitCallStmt(s: Call, stmtIx: i32, fnIx: i32) {
     // carries the scalar reps alongside the i32/ref/string ones, so a `u8[]`/`i64[]`/
     // `f64[]`/`f32[]` receiver reaches `emitClear` too, matching `.pop`'s coverage via `emitPop`.
     if callee.memProp == "clear" {
-      if (
-        exprArray(callee.memObj, fnIx)
-        || exprRefArray(callee.memObj, fnIx)
-        || exprStringArray(callee.memObj, fnIx)
-        || scalarListElemKind(callee.memObj, fnIx) != null
-      ) {
-        return emitClear(stmtIx, fnIx)
-      }
+      if clearRecvIsList(callee.memObj, fnIx) { return emitClear(stmtIx, fnIx) }
       if exprMap(callee.memObj, fnIx) {
         if s.callArgs.length != 0 {
           return emitFail(
