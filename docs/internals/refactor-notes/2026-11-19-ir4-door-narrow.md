@@ -65,4 +65,19 @@ builds. The branch `ir4-door-ship` keeps the attempt.
 
 ## Measured bars
 
-BARS
+Fixpoint seeds: master 9ba5add8c against this branch on the same base.
+
+| bar | result |
+|---|---|
+| `ir-identity.sh --names` | identical 9,037, differ 0; self-compile identical |
+| `ir-identity.sh --cases` | identical 7,516, differ 0 |
+| `--claims` / mode 3 | ok / identical |
+| armed shadow | 35,543 covered = verified = matched; ok |
+| L2 fuel | 100,608,023,712: flat on master (100,608,068,596) |
+| pin helpers, `emit_mono.vl` | 905 |
+| lint-self, `deno lint`, ladder-sets, dead exports, comment budget | clean |
+| phase state, late demands | ok / 9 of baseline 9, 307 tag rows |
+| `deno task test` | 9,582 passed, 0 failed |
+
+**Lines: compiler +53 / −25 (net +28), tests +129.** `storageReadOpen` is deleted. The guard's rules
+replace the old flat list.
