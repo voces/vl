@@ -104,6 +104,7 @@ import {
   idxStorePlainWhy,
   ifExprPlainKind,
   ifWritesElse,
+  intSwitchMayLower,
   isArmOf,
   isArmTagOf,
   isBoxGuardPlain,
@@ -240,6 +241,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
+import { strListHas } from "./listutil"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
 let ibArmed = false
@@ -623,13 +625,51 @@ function bodyOf(stmts: i32[]): i32[] {
 }
 
 // The rep of node `ix`'s checked type in this instance when it is a primitive one, else -1.
-function primRepOf(ix: i32): i32 {
+function primRepOf(ix: i32): i32 { return primRepOfTy(nodeTyAt(ix, ibFnIx)) }
+
+function primRepOfTy(t: i32): i32 {
   // The tree gives `void` an i32 leaf for the flat kinds; it is no value here.
-  const t = nodeTyAt(ix, ibFnIx)
   const r = repNodeOfTy(t)
   if isVoidTy(t) || !valueRep(r, t) { return -1 }
   return r
 }
+
+// `primRepOf` at `exprTyOf`'s type.
+function exprRepOf(ix: i32): i32 {
+  if untypedBoolOp(ix) { return ibBool }
+  return primRepOfTy(exprTyOf(ix))
+}
+
+// `ix`'s type: `boolean` for an untyped boolean operator (`untypedBoolOp`), its callee's result
+// for an untyped call of a declaration (an operator a generic instance rewrote to its overload).
+function exprTyOf(ix: i32): i32 {
+  if untypedBoolOp(ix) { return TY_BOOL }
+  const t = nodeTyAt(ix, ibFnIx)
+  if t >= 0 { return t }
+  const n = nodeAt(ix)
+  if n is Call {
+    if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return t }
+    const d = identDeclOf(n.callFn)
+    const pos = fnIndexOfNode(n.callFn)
+    if d < 0 || pos < 0 || pos >= fnStmts.length || !callTargetIs(pos, d) {
+      return t
+    }
+    const fn = nodeAt(fnStmts[pos])
+    if fn is FuncDecl { return resultTy(pos, fn.fnRet, fnStmts[pos]) }
+  }
+  return t
+}
+
+// Whether `ix` is a compare or a logical operator no check recorded a type for: the `match`
+// lowering writes its arm tests (`==`, joined by `||`) after the check.
+function untypedBoolOp(ix: i32): boolean {
+  if nodeTyAt(ix, ibFnIx) >= 0 { return false }
+  const n = nodeAt(ix)
+  if n is BinExpr { return strListHas(BOOL_OPS, n.binOp) }
+  return false
+}
+
+const BOOL_OPS = ["==", "!=", "<", "<=", ">", ">=", "&&", "||"]
 
 export function irBOpRep(o: Opnd): i32 {
   return match o {
@@ -641,7 +681,7 @@ export function irBOpRep(o: Opnd): i32 {
 
 // A fresh temp of `ix`'s type, defined by `rhs`.
 export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
-  const ty = nodeTyAt(ix, irBFnIx())
+  const ty = exprTyOf(ix)
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyOpen(ty) { return irBMiss("open temp type") }
@@ -838,7 +878,7 @@ function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
 function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
-  const ty = nodeTyAt(ix, ibFnIx)
+  const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const rhsBody: i32[] = []
@@ -1879,7 +1919,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return irBExpr(b, n.parInner) }
-  const rep = primRepOf(ix)
+  const rep = exprRepOf(ix)
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
   }
@@ -2255,6 +2295,7 @@ function ifChain(b: i32[], ix: i32) {
   while true {
     const n = nodeAt(cur)
     if !(n is IfStmt) { return skip("condition") }
+    if intSwitchMayLower(cur) { return skip("if switch") }
     // A decided `is` guard: legacy reads its constant back and writes no then arm (D932). A
     // tag the box lacks is never a covering test, so the arm is not one legacy writes dead.
     const decided = isDecidedFalse(n.ifCond, ibFnIx)
