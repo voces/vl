@@ -18,7 +18,10 @@ emitted. The writers and their sub-writers (`svGuardedIdx`, `svRefTest`, `rvSrcE
   next. The nullable record row's store is `array.set backing i <valued if>`, and the IR places a
   valued `if` at its statement position, so the store's two leading operands are pushed first. The
   lowering keeps pushes off the pending order and checks that the next effect consumes every
-  outstanding push as its leading operands, in push order; a push left unconsumed is a miss.
+  outstanding push as its leading operands, in push order; a push left unconsumed is a miss. Rule
+  10 states the same invariant: a push read anywhere else, a raw effect whose leading operands are
+  not the outstanding pushes in order, or a push no effect consumes is refused. Its control (the
+  store's two pushes swapped) fails the build with `a push is not its store's leading operand`.
 - An element whose heap type no table keeps is untracked: a raw rep at heap -1. That covers the
   record views' element between its `array.get` and its box or null test, and step 3's compaction
   move between `array.get` and `array.set`, which was an i32 rep. Rule 10 now refuses an untracked
