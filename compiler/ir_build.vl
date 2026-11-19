@@ -86,6 +86,7 @@ import {
   binNumWidth,
   boxOwedAt,
   callEndsNever,
+  closureValueWhy,
   coalArmOf,
   coalNicheArmOf,
   coalNulStrBlockPlain,
@@ -93,6 +94,8 @@ import {
   coalesceNulStrStaysNullable,
   deadNullTestOperand,
   exprPrePathWhy,
+  fnValueArmOf,
+  fnValueFeOf,
   forInPlainWhy,
   globalInitArmUnboxes,
   globalReadRecovers,
@@ -144,6 +147,7 @@ import {
 import {
   RAtom,
   RBox,
+  RClosure,
   RList,
   RMap,
   RNullable,
@@ -153,7 +157,7 @@ import {
   repNodeOfTy,
   repTyOf,
 } from "./emit_rep"
-import { ctxTyAt, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
+import { ctxTyAt, fnEnvIdxOf, nodeTyAt, scopeTyAt } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import {
   declaredIndexAt,
@@ -174,6 +178,7 @@ import {
   fRecRetTy,
   fRetVoid,
   fnStmts,
+  fnStmtsPosOf,
   gInitProgIdx,
   gPromoInStart,
   monoGen,
@@ -231,7 +236,7 @@ function censusGoesOn(why: string): boolean {
 // ships the IR's bytes and legacy does not run for it (design §10). A slice adds its family here.
 const CLAIMED: IrFamily[] = [
   "scalar", "control", "call", "global", "map", "list", "box", "record",
-  "start",
+  "closure", "start",
 ]
 let ibClaimAll = false
 // Set while `irClaimFn` builds, never under the shadow, which builds every function whole.
@@ -2490,7 +2495,7 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if globalInitArmUnboxes(gck, g.letInit) {
     return skip("global initializer arm unbox")
   }
-  const src = if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }
+  const src = if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else if gck == "closure" { cloInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }
   if ibMiss != "" { return 0 }
   const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
   if gm != "" { return skip(gm) }
@@ -2537,6 +2542,52 @@ function mapNewInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   }
   irGlobalNote(ib, gi, rep)
   return irBLetTemp(b, { mnAt: ix }, ix, rep)
+}
+
+// The closure global `gi` starts as: a capture-free function literal, or a function name read as
+// a value on legacy's checked arm (`fnValueArmOf`), written by legacy's `emitClosureValue`.
+function cloInit(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
+  const rep = repNodeOfTy(scopeTyAt(gst, -1))
+  if !(repNodeAt(rep) is RClosure) { return irBMiss("global initializer rep") }
+  const ix = unwrapParen(init)
+  const pre = exprPrePathWhy(ix, ibFnIx)
+  if pre != "" { return irBMiss(pre) }
+  if repNodeOfTy(nodeTyAt(ix, ibFnIx)) != rep {
+    return irBMiss("global initializer coercion")
+  }
+  const fe = cloValueFeOf(ix)
+  if fe < 0 { return irBMiss(cloValueWhy(ix)) }
+  if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
+  if fnEnvIdxOf(fe) >= 0 { return irBMiss("closure env") }
+  irGlobalNote(ib, gi, rep)
+  return irBLetTemp(b, { mcFn: fe, mcEnv: [], mcAt: ix }, ix, rep)
+}
+
+// The function closure value `ix` names: a lifted function literal, or a bare name the read
+// ladder sends to `emitIdentNonLocalRead`'s checked arm; -1 for any other spelling. A global's
+// initializer is never the stubbed write's right side, so no `stubRhs` exempts it.
+function cloValueFeOf(ix: i32): i32 {
+  const n = nodeAt(ix)
+  if n is FuncDecl { return fnStmtsPosOf(ix) }
+  if !(n is Ident) || identReadArmOf(n, ix, ibFnIx, false) != "nonlocal" {
+    return -1
+  }
+  const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
+  if fe < 0 || fnValueArmOf(fe, ix, -1) != "checked" { return -1 }
+  return fe
+}
+
+// Why `cloValueFeOf` found no function for closure value `ix`.
+function cloValueWhy(ix: i32): string {
+  const n = nodeAt(ix)
+  if n is FuncDecl { return "closure literal not lifted" }
+  if n is Call { return "closure value of a call" }
+  if !(n is Ident) { return "closure value expression" }
+  const arm = identReadArmOf(n, ix, ibFnIx, false)
+  if arm != "nonlocal" { return "closure name read " + arm }
+  const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
+  if fe < 0 { return "closure name of a global" }
+  return "closure value " + fnValueArmOf(fe, ix, -1)
 }
 
 // The census row of the function just built: its blocker classes, sorted, or none.
