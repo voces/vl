@@ -389,10 +389,10 @@ print(e().length)
   },
 });
 
-// A walk's own `break` and `continue` branch to the frames legacy's loop opens: covered and
-// matched. A walk whose body is hoist-safe reads its header once and may unroll: a named miss.
+// A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
+// body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
-  name: "ir shadow: a walk's own branch is matched, a hoisted walk a named miss",
+  name: "ir shadow: a walk's own branch and a hoisted walk are matched",
   ignore,
   fn: () => {
     const src = `function fb(xs: i32[]): i32 {
@@ -417,11 +417,8 @@ function fh(xs: i32[]): i32 {
 print(fb([1, 2, 3]) + fc([1, 2]) + fh([4]))
 `;
     const { rows } = run(src, true);
-    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
-      throw new Error(`want the two branching walks covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered for in hoisted") !== 1) {
-      throw new Error(`want one "uncovered for in hoisted" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want the three walks covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -511,6 +508,36 @@ print(intr(true, 0.5))
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (!(rows.get("matched")! >= 1)) throw new Error(`want \`first\` matched, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// An instance's `is` test over a box: a tag the box holds is compared off the raw slot, even
+// narrowed, and a tag it lacks is a decided guard whose then arm is not written. Elsewhere the
+// decided constant stays a named miss.
+Deno.test({
+  name: "ir shadow: an instance's arm-tag and decided `is` guards build; a decided test elsewhere misses",
+  ignore,
+  fn: () => {
+    const src = `function kind<T>(v: T): string {
+  if v is i32 { return "i32" }
+  if v is f32 { return "f32" }
+  if v is f64 { return "f64" }
+  return "other"
+}
+function neg<T>(v: T): boolean { return !(v is i32) }
+function run(q: f32 | f64) {
+  print(kind(q))
+  print(neg(q))
+}
+run(1.5 as f32)
+run(2.5)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered is arm tag tagAbsent") !== 1) {
+      throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
+    }
+    if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
   },
 });
 

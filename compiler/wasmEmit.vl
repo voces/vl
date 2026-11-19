@@ -6718,7 +6718,7 @@ function isPinUnrelated(op: i32, t: i32): boolean {
 
 // Whether `emitIs` tests operand `recvIx` at its storage: a read the checker narrowed, unless
 // the storage itself holds the narrowed rep (a capture whose env field is not the union box).
-function isTestsStorage(recvIx: i32, fnIx: i32): boolean {
+export function isTestsStorage(recvIx: i32, fnIx: i32): boolean {
   if readNarrowedTyAt(recvIx, fnIx) < 0 { return false }
   const r = nodeAt(unwrapParen(recvIx))
   if r is Ident {
@@ -7303,7 +7303,7 @@ export type TagIsArm = "boxLitSet"
 
 // The box-tag arm of `is` test `isIx`: a literal set over a box's string payload, a map the
 // box cannot hold, or the arm's tag read off the box wherever the receiver keeps it.
-function tagIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): TagIsArm {
+export function tagIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): TagIsArm {
   const t = isVarTyIxOf(isIx)
   const box = exprUnion(nd.isObj, fnIx)
   // A literal union tested against a box whose string arm is a plain `string` is membership
@@ -7372,17 +7372,22 @@ function tagIsValueArm(nd: IsExpr, fnIx: i32): TagIsArm {
 }
 
 // After a box: its tag compared with `tag`.
-function boxTagIsTail(tag: i32) {
+export function boxTagIsTail(tag: i32) {
   fbStructGet(uBoxIdx, 0)
   fbI32Rel(RS_TAG, tag)
   fbI32Bin(70)
   return 1
 }
 
+// The tag box-tag `is` test `isIx` compares: its pattern's arm tag at the receiver, or -1.
+export function isArmTagOf(isIx: i32, nd: IsExpr, fnIx: i32): i32 {
+  return isArmTagOfTyAt(isArmPatTy(isIx, nd, fnIx), nd.isObj, fnIx)
+}
+
 // The box-tag arm `arm` of `is` test `isIx`; 1 once written, -1 on failure.
 function emitIsTestArmTag(isIx: i32, ndv: IsExpr, fnIx: i32, arm: TagIsArm) {
   const patTy = isArmPatTy(isIx, ndv, fnIx)
-  const armTag = isArmTagOfTyAt(patTy, ndv.isObj, fnIx)
+  const armTag = isArmTagOf(isIx, ndv, fnIx)
   const r = unwrapParen(ndv.isObj)
   const vrecv = nodeAt(unwrapParen(ndv.isObj))
   return match arm {
@@ -28371,21 +28376,11 @@ function emitCallCorePrint(callIx: i32, c: Call, fnIx: i32) {
     )
   }
   if arm == "nulAtom" {
-    return emitPrintNulLitUnion(arg, nulLitAtomTexts(arg, fnIx), fnIx)
+    return emitPrintNulLitUnion(arg, printAtomTexts(arm, arg, fnIx), fnIx)
   }
   if arm == "atom" {
-    // `litAtomWidenTexts` is `emitAtomToStr`'s shared ladder; its declaration rung is
-    // what a monomorphized instance needs, since the instance's leaf nodes share the
-    // generic body and record the generic's own type parameter instead.
-    const lpTexts = litAtomWidenTexts(arg, fnIx)
-    // A claim with no texts means the rep and the recorded type disagree: the chain would
-    // match nothing, rc 0 with no output.
-    if lpTexts.length == 0 {
-      return emitFail(
-        "emitProgram: print of a literal-union atom whose type carries no member texts",
-      )
-    }
-    return emitPrintAtomStr(arg, lpTexts, fnIx)
+    if emitStashAtomId(arg, fnIx) < 0 { return -1 }
+    return printAtomStashed(printAtomTexts(arm, arg, fnIx), false)
   }
   if arm == "nulStr" { return emitPrintNulString(arg, fnIx) }
   if arm == "nulBool" { return emitPrintNulBool(arg, fnIx) }
@@ -35415,6 +35410,35 @@ function emittedCondConst(condStart: i32): i32 {
   return -1
 }
 
+// Whether statement condition `condIx` is a box `is` test `tagIsArmOf` answers `tagAbsent`, a
+// decided `false` that reads nothing: asked in storage mode when its receiver is narrowed, past
+// the checks `emitIs` makes first. The IR's builder asks the same.
+export function isDecidedFalse(condIx: i32, fnIx: i32): boolean {
+  const ix = unwrapParen(condIx)
+  const n = if ix >= 0 { nodeAt(ix) } else { null }
+  if !(n is IsExpr) || n.isFit >= 0 { return false }
+  const stored = isTestsStorage(n.isObj, fnIx)
+  if !stored && !isBoxGuardPlain(ix, fnIx) { return false }
+  const mark = if stored { storageReadEnter(n.isObj) } else { -1 }
+  const r = isRecvStageRep(ix, fnIx) < 0
+    && isArmOf(ix, fnIx, 0, false) == "armTag"
+    && tagIsArmOf(ix, n, fnIx) == "tagAbsent"
+  if stored { storageReadLeave(mark) }
+  return r
+}
+
+// A statement `if`'s condition `condIx` written, and its decided constant (`staticIsGuard`), or
+// -2 once failed. A decided `false` (`isDecidedFalse`) is written as itself, `i32.const 0`.
+function emitGuardCond(condIx: i32, fnIx: i32): i32 {
+  if isDecidedFalse(condIx, fnIx) {
+    fbI32Const(0)
+    return 0
+  }
+  const condStart = wLen()
+  if emitCondExpr(condIx, fnIx) < 0 { return -2 }
+  return staticIsGuard(condIx, condStart)
+}
+
 // `emittedCondConst` of an `is` test `condIx`, or its `!`, emitted since `condStart`, or -1 for
 // any other condition: an instance decides its own `is` tests, so one arm can be dead there.
 function staticIsGuard(condIx: i32, condStart: i32): i32 {
@@ -35789,11 +35813,9 @@ function emitIfLinkStmt(s: IfStmt, fnIx: i32, open: i32[], tail: boolean) {
   }
   // structured void `if`: push the i32 condition, then `if`/`else`/`end`. A
   // monomorphized-instance `is` guard is decided at compile time, so one arm can be
-  // provably unreachable in this instance and is emitted empty instead (D932) — read
-  // off the emitted condition itself (`emittedCondConst`), not a parallel predicate.
-  const condStart = wLen()
-  if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-  const staticGuard = staticIsGuard(s.ifCond, condStart)
+  // provably unreachable in this instance and is emitted empty instead (D932).
+  const staticGuard = emitGuardCond(s.ifCond, fnIx)
+  if staticGuard == -2 { return -1 }
   negGuardFn = fnIx
   negGuardCond = s.ifCond
   negGuardVal = staticGuard
@@ -36716,7 +36738,6 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   const lp = forInLoopAt(s, fnIx, vSlot, ek, strSrc, u8Src)
   if lp == null { return -1 }
   const mapRecv = lp.mapRecv
-  const pairValsSlot = forInPairValsSlot(s.fiIter, fnIx)
   const pairIsVal = lp.pairIsVal
   const pIdx = lp.pIdx
   const pSlot = vSlot + 3
@@ -36726,23 +36747,7 @@ function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   // list = <iter> (evaluated once); cursor = 0
   if emitForInList(s.fiIter, fnIx, mapRecv, lp.mwShape) < 0 { return -1 }
   forInListStore(s.fiIter, fnIx, lp)
-  // A body that cannot reallocate a list (`hoistSafeBlock`: no call, so no push/pop through
-  // any alias) sees one backing and one `len` throughout, so both are read once here. Any
-  // other body re-reads the header per step, so an element pushed mid-walk is visited.
-  if (
-    lp.fiHOk
-    && !strSrc
-    && mapRecv < 0
-    && pairValsSlot < 0
-    && hoistSafeBlock(s.fiBody, fnIx)
-    && !svHoistBlocked(s.fiIter, fnIx, -1, s.fiBody)
-  ) {
-    emitForInHoistHeader(lp)
-  }
-  // A walk whose body may write reads a view's length and elements through its source at every
-  // step, as it re-reads a shared list's header (D3028).
-  if lp.fiHLen < 0 && (ek == "f64" || ek == "i64") { lp.fiSv = svDstOfKind(ek) }
-  lp.fiRv = lp.fiHLen < 0 && lp.hKind == "reflist" && rvMayView(lp.hSlot)
+  forInHeaderHoist(s, fnIx, lp)
   emitForInCursorInit(lp)
   // A body that writes the index gets a hidden counter, and the index is a fresh copy of it
   // each iteration, so the write never moves the walk (D2342).
@@ -36780,6 +36785,27 @@ function emitForInMapStash(fnIx: i32, lp: ForInLoop): i32 {
   lp.fiMap = forInMapStashSlot(cmMapTy())
   pushMapRef()
   fbLocalSet(lp.fiMap)
+  return 0
+}
+
+// A walk's header after its list is stored. A body that cannot reallocate a list (no call, so no
+// push or pop through any alias) sees one backing and one `len`, read once here; any other body
+// re-reads the header per step, and a view is then read through its source each step (D3028).
+export function forInHeaderHoist(s: ForIn, fnIx: i32, lp: ForInLoop) {
+  if (
+    lp.fiHOk
+    && !lp.strSrc
+    && lp.mapRecv < 0
+    && forInPairValsSlot(s.fiIter, fnIx) < 0
+    && hoistSafeBlock(s.fiBody, fnIx)
+    && !svHoistBlocked(s.fiIter, fnIx, -1, s.fiBody)
+  ) {
+    emitForInHoistHeader(lp)
+  }
+  if lp.fiHLen < 0 && (lp.ek == "f64" || lp.ek == "i64") {
+    lp.fiSv = svDstOfKind(lp.ek)
+  }
+  lp.fiRv = lp.fiHLen < 0 && lp.hKind == "reflist" && rvMayView(lp.hSlot)
   return 0
 }
 
@@ -36993,26 +37019,23 @@ function emitForInLoop(s: ForIn, fnIx: i32, lp: ForInLoop) {
 // and the continue block when the body continues. Returns the skip's sequence local, -1 for
 // none, -2 on failure.
 export function forInLoopOpen(s: ForIn, fnIx: i32, lp: ForInLoop): i32 {
-  const elemRecover = forInElemRecovers(lp.ek)
+  forInBreakOpen(s)
+  const c = forInCopiesOf(s, fnIx, lp)
+  if c != null && emitForInCopies(s, fnIx, c) < 0 { return -2 }
+  return forInRolledOpen(s, lp)
+}
+
+// A walk's break block, which every `break` out of it targets.
+export function forInBreakOpen(s: ForIn) {
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.fiLabel)
-  if (
-    lp.fiHBack >= 0
-    && !lp.hasPair
-    && lp.ek != "nulnone"
-    && partialUnrollCost(s.fiBody, fnIx) >= 0
-  ) {
-    const fiCopies: ForInCopies = {
-      back: lp.fiHBack,
-      len: lp.fiHLen,
-      cursor: lp.iIdx,
-      v: lp.vIdx,
-      backTy: lp.backTy,
-      recover: elemRecover,
-    }
-    if emitForInCopies(s, fnIx, fiCopies) < 0 { return -2 }
-  }
+  return 0
+}
+
+// A walk's rolled loop up to its body, after any unrolled copies (`forInLoopOpen`).
+export function forInRolledOpen(s: ForIn, lp: ForInLoop): i32 {
+  const elemRecover = forInElemRecovers(lp.ek)
   fbLoop(64) // 0x03 loop, void
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
@@ -37501,15 +37524,45 @@ function emitListUnionForRead(box: i32, cur: i32, heap: i32) {
 }
 
 // The locals and types a `for`-in walk's unrolled copies read: the hoisted backing and `len`,
-// the cursor, the loop var, the backing's array type, and whether an element is recovered
-// non-null (`ref.as_non_null`) as the rolled walk recovers it.
-type ForInCopies = {
+// the cursor, the loop var, the backing's array type, whether an element is recovered non-null
+// (`ref.as_non_null`) as the rolled walk recovers it, whether a copy has a continue block, and
+// the `let` cursor each copy starts from (set by `forInCopiesHead`).
+export type ForInCopies = {
   back: i32,
   len: i32,
   cursor: i32,
   v: i32,
   backTy: i32,
   recover: boolean,
+  hasCont: boolean,
+  cur0: i32,
+}
+
+// The unrolled copies ahead of a hoisted list walk's rolled loop, or null for none.
+export function forInCopiesOf(
+  s: ForIn,
+  fnIx: i32,
+  lp: ForInLoop,
+): ForInCopies | null {
+  if (
+    lp.fiHBack < 0
+    || lp.hasPair
+    || lp.ek == "nulnone"
+    || partialUnrollCost(s.fiBody, fnIx) < 0
+  ) {
+    return null
+  }
+  const c: ForInCopies = {
+    back: lp.fiHBack,
+    len: lp.fiHLen,
+    cursor: lp.iIdx,
+    v: lp.vIdx,
+    backTy: lp.backTy,
+    recover: forInElemRecovers(lp.ek),
+    hasCont: blockHasContinueFor(s.fiBody, s.fiLabel, false),
+    cur0: 0,
+  }
+  return c
 }
 
 // Ahead of a hoisted list walk's rolled loop, the walk with its body copied
@@ -37517,6 +37570,23 @@ type ForInCopies = {
 // element at `cursor + k`. The rolled loop then walks the rest from the cursor this leaves.
 // Emitted inside the walk's `break` block; `continue` ends its own copy.
 function emitForInCopies(s: ForIn, fnIx: i32, c: ForInCopies) {
+  forInCopiesHead(c)
+  let k = 0
+  while k < PARTIAL_UNROLL_COPIES {
+    forInCopyOpen(s, c, k)
+    const rc = emitStmts(s.fiBody, fnIx)
+    forInCopyClose(c)
+    if rc < 0 { return -1 }
+    k = k + 1
+  }
+  return forInCopiesTail(c)
+}
+
+// The number of body copies per unrolled trip.
+export function forInCopyCount(): i32 { return PARTIAL_UNROLL_COPIES }
+
+// The unrolled trips' loop up to the first copy: its exit while fewer than a trip's elements remain.
+export function forInCopiesHead(c: ForInCopies) {
   const limSlot = strI32Slot()
   fbLocalGet(c.len)
   fbI32Const(PARTIAL_UNROLL_COPIES - 1)
@@ -37528,35 +37598,43 @@ function emitForInCopies(s: ForIn, fnIx: i32, c: ForInCopies) {
   fbLocalGet(limSlot)
   fbI32Bin(78)  // 0x4e i32.ge_s
   fbBrIf(1)     // leave the main loop
-  const hasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
-  const cursor0 = emitLetCursor
-  let k = 0
-  while k < PARTIAL_UNROLL_COPIES {
-    emitLetCursor = cursor0
-    fbLocalGet(c.back)
-    fbLocalGet(c.cursor)
-    if k > 0 {
-      fbI32Const(k)
-      fbI32Bin(106) // 0x6a i32.add
-    }
-    fbArrayGet(c.backTy)
-    if c.recover { fbRefAsNonNull() }
-    fbLocalSet(c.v)
-    if hasCont {
-      fbBlock(64) // this copy's continue block
-      loopContDepth.push(ctrlDepth)
-      loopContLabel.push(s.fiLabel)
-    }
-    const rc = emitStmts(s.fiBody, fnIx)
-    if hasCont {
-      fbEnd()
-      loopContDepth.pop()
-      loopContLabel.pop()
-    }
-    if rc < 0 { return -1 }
-    k = k + 1
+  c.cur0 = emitLetCursor
+  return 0
+}
+
+// Copy `k` up to its body: the element at `cursor + k` bound, then its continue block if any.
+export function forInCopyOpen(s: ForIn, c: ForInCopies, k: i32) {
+  emitLetCursor = c.cur0
+  fbLocalGet(c.back)
+  fbLocalGet(c.cursor)
+  if k > 0 {
+    fbI32Const(k)
+    fbI32Bin(106) // 0x6a i32.add
   }
-  emitLetCursor = cursor0
+  fbArrayGet(c.backTy)
+  if c.recover { fbRefAsNonNull() }
+  fbLocalSet(c.v)
+  if c.hasCont {
+    fbBlock(64) // this copy's continue block
+    loopContDepth.push(ctrlDepth)
+    loopContLabel.push(s.fiLabel)
+  }
+  return 0
+}
+
+// A copy after its body: its continue block's end.
+export function forInCopyClose(c: ForInCopies) {
+  if c.hasCont {
+    fbEnd()
+    loopContDepth.pop()
+    loopContLabel.pop()
+  }
+  return 0
+}
+
+// The unrolled trips' loop after the last copy: the cursor stepped a trip, the back-branch, ends.
+export function forInCopiesTail(c: ForInCopies) {
+  emitLetCursor = c.cur0
   fbLocalGet(c.cursor)
   fbI32Const(PARTIAL_UNROLL_COPIES)
   fbI32Bin(106) // 0x6a i32.add
@@ -37938,9 +38016,8 @@ function emitIfLinkTail(s: IfStmt, fnIx: i32, open: i32[]) {
   // gate (`emittedCondConst`), same slot accounting (`cursorSlotsUnder`). The tail form
   // is the same defect one position over: `function f(v) { if v is string { "\"" + v }
   // else { "o" } }` emitted the statically-false arm's narrowed use in the i32 instance.
-  const condStart = wLen()
-  if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
-  const staticGuard = staticIsGuard(s.ifCond, condStart)
+  const staticGuard = emitGuardCond(s.ifCond, fnIx)
+  if staticGuard == -2 { return -1 }
   fbIf(64) // 0x04 if, 0x40 void blocktype
   if staticGuard != 0 {
     if emitStmtsTail(s.ifThen, fnIx) < 0 { return -1 }
@@ -38478,13 +38555,46 @@ function emitPrintNulBool(argIx: i32, fnIx: i32) {
   return 0
 }
 
-// `print(<literal-union atom>)` — widen the atom to its member string through the shared
-// `emitAtomToStrChain` tower, then stream it. Shared rather than re-spelled, since a
-// per-member `if id == <id> { print "<member>" }` chain re-reads the receiver once per
-// member — free for a place, but another call each time for `print(f())`.
-function emitPrintAtomStr(argIx: i32, texts: string[], fnIx: i32) {
-  if emitStashAtomId(argIx, fnIx) < 0 { return -1 }
-  return emitPrintAtomFromStash(texts)
+// The members a `print` of the atom `argIx` (arm `atom` or `nulAtom`) decodes at, which legacy's
+// print and the IR's both spend. `litAtomWidenTexts` is `emitAtomToStr`'s ladder; its declaration
+// rung is what a monomorphized instance needs, its leaves recording the generic's parameter.
+export function printAtomTexts(arm: PrintArm, argIx: i32, fnIx: i32): string[] {
+  if arm == "nulAtom" { return nulLitAtomTexts(argIx, fnIx) }
+  return litAtomWidenTexts(argIx, fnIx)
+}
+
+// The print of the atom id stashed in str-op scratch i32 slot 0: its decode at `texts` through the
+// shared tower, which reads the id once where a per-member chain would re-run `print(f())`'s call,
+// then the stream; behind the `-1` null word where `nul`. Returns 0, or -1 failed.
+function printAtomStashed(texts: string[], nul: boolean): i32 {
+  if !nul {
+    // No texts means the rep and the recorded type disagree: the chain would match nothing.
+    if texts.length == 0 {
+      return emitFail(
+        "emitProgram: print of a literal-union atom whose type carries no member texts",
+      )
+    }
+    return emitPrintAtomFromStash(texts)
+  }
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq
+  fbIf(64)     // if (void)
+  emitPrintNullWord()
+  fbEnd()
+  pushStrScrI(0)
+  fbI32Const(-1)
+  fbI32Bin(71) // 0x47 i32.ne
+  fbIf(64)     // if (void)
+  if emitPrintAtomFromStash(texts) < 0 { return -1 }
+  fbEnd()
+  return 0
+}
+
+// A `print` of an atom or its `K | null` after its operand, the id on the stack: the IR's tail.
+export function printAtomTail(arm: PrintArm, argIx: i32, fnIx: i32): i32 {
+  setStrScrI(0)
+  return printAtomStashed(printAtomTexts(arm, argIx, fnIx), arm == "nulAtom")
 }
 
 // The stashed-id half of the atom print: the shared widen tower over str-op scratch i32 slot 0,
@@ -38509,19 +38619,7 @@ function emitPrintNulLitUnion(argIx: i32, texts: string[], fnIx: i32) {
   } else if emitStashAtomId(argIx, fnIx) < 0 {
     return -1
   }
-  pushStrScrI(0)
-  fbI32Const(-1)
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(64)     // if (void)
-  emitPrintNullWord()
-  fbEnd()
-  pushStrScrI(0)
-  fbI32Const(-1)
-  fbI32Bin(71) // 0x47 i32.ne
-  fbIf(64)     // if (void)
-  if emitPrintAtomFromStash(texts) < 0 { return -1 }
-  fbEnd()
-  return 0
+  return printAtomStashed(texts, true)
 }
 
 // one arm of the value-union print: the box is already stashed in `slot`, so recover this
@@ -43031,27 +43129,47 @@ function emitCoalesceNulBoolJoin(e: BinExpr, exprIx: i32, fnIx: i32) {
 // `k ?? d` at a `string` result over the `K | null` atom niche: `-1` takes the default as a
 // string, any other id widens through the member tower `emitAtomToStr` uses.
 function emitCoalesceNulAtomStr(e: BinExpr, fnIx: i32) {
-  const texts = nulLitAtomTexts(e.binLeft, fnIx)
-  if texts.length == 0 {
+  if nulLitAtomTexts(e.binLeft, fnIx).length == 0 {
     return emitFail(
       "emitProgram: `??` over a nullable literal union has no member strings",
     )
   }
-  const slot = widenTmpSlot(4001)
+  coalAtomStrReserve()
   if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalTee(slot)
-  fbI32Const(-1)
-  fbI32Bin(70) // 0x46 i32.eq → null?
-  fbIfRefNul(sTy(), defExprNullable(e.binRight))
+  coalAtomStrOpen(e)
   if exprIsLitAtom(e.binRight, fnIx) {
     if emitAtomToStr(e.binRight, fnIx) < 0 { return -1 }
   } else {
     if emitExpr(e.binRight, fnIx) < 0 { return -1 }
   }
-  fbElse() // present → the id's member string
-  fbLocalGet(slot)
+  return coalAtomStrClose(e, fnIx)
+}
+
+// Takes the slot `coalAtomStrOpen` keeps the id in, before `l` is written, as its first use
+// numbers it.
+export function coalAtomStrReserve(): i32 { return widenTmpSlot(4001) }
+
+// `l ?? d` over a `K | null`, after `l`'s id: keep it, and open the `null` branch the default
+// fills, typed by whether the default may be null.
+export function coalAtomStrOpen(e: BinExpr): i32 {
+  fbLocalTee(widenTmpSlot(4001))
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq → null?
+  fbIfRefNul(sTy(), defExprNullable(e.binRight))
+  return 0
+}
+
+// After the default: the present branch, the kept id's member string at `l`'s members.
+export function coalAtomStrClose(e: BinExpr, fnIx: i32): i32 {
+  fbElse()
+  fbLocalGet(widenTmpSlot(4001))
   setStrScrI(0)
-  if emitAtomToStrChain(texts, 0, strScratchBase + 3) < 0 { return -1 }
+  if (
+    emitAtomToStrChain(nulLitAtomTexts(e.binLeft, fnIx), 0, strScratchBase + 3)
+    < 0
+  ) {
+    return -1
+  }
   fbEnd()
   return 0
 }
