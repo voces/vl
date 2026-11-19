@@ -24,12 +24,15 @@ print(ap(fw(lam), 3))
    dropped too. A method callee still stands.
 3. **`arrowRowFacts`:** a row's per-call facts are built for a lambda set where its body types at
    the call's arguments (`setMemberRetsQuiet`), as the main loop does (B3.2a); before, they were
-   built for named members only.
+   built for named members only. A lambda fact also requires every result to be closed
+   (`arrowLamRsAt`). Without that, D16131's `const m = () => inc` (a result whose parameter stays
+   `_`) gave a fact no instance key matched. The check decided the set, and emit hit net 40 ("meets
+   a key those facts lacked"). The gate's filed-witnesses row caught it as emit_reject → check_reject.
 
 ## Measured (master de44e8985 fixpoint vs this branch's fixpoint)
 - Late tag rows: 1 gone, 0 new.
 - `VL_LATE_DEMANDS=1 vl check --codegen tests`: diagnostics byte-identical.
-- Full @run A/B over 6,757 programs: 0 RC or output movers; 1 wasm mover,
+- Full @run A/B (before the closed-result guard) over 6,757 programs: 0 RC or output movers; 1 wasm mover,
   `closures/written-let-in-list-arg-called-beside-generic-first.vl`. It drops from 754 to 693 bytes and
   loses its closure table, with output the same and matching `@log`. The lambda set handed in `run([k])` now
   stands as an id.
