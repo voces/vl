@@ -2761,56 +2761,85 @@ function fieldKindTakesClosure(k: VKind): boolean {
   return k == "closure" || k == "nulclosure" || k == "union"
 }
 
-// `emitVariantFieldValue`'s body: it applies the field's context and leaves it for the
-// wrapper's exit to undo.
-function emitVariantFieldValueUnder(vi: i32, fj: i32, valIx: i32, fnIx: i32) {
+// The arm variant row `vi`'s field `fj` takes value `valIx` at, in `emitVariantFieldValueUnder`'s
+// order: a refusal, a conversion, or `plain`, the value as itself.
+export type VariantFieldArm = "noKind" | "lambda" | "f64" | "i64" | "f32" | "nulnone" | "box"
+  | "strAtom" | "plain"
+export function variantFieldArmOf(
+  vi: i32,
+  fj: i32,
+  valIx: i32,
+  fnIx: i32,
+): VariantFieldArm {
   const vk = eqRowFieldKind(-1 - vi, fj)
-  if vk == null {
-    return emitFail("emitProgram: union variant field has no storage kind")
+  if vk == null { return "noKind" }
+  if nodeAt(unwrapParen(valIx)) is FuncDecl && !fieldKindTakesClosure(vk) {
+    return "lambda"
   }
-
-  const vcfv = nodeAt(unwrapParen(valIx))
-  if vcfv is FuncDecl {
-    if !fieldKindTakesClosure(vk) {
-      return emitFail(
-        "emitProgram: a lambda field value resolved to a non-closure variant field slot",
-      )
-    }
+  return match vk {
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "nulnone" => "nulnone"
+    "union" => if variantFieldIsLitUnionArray(vi, fj) { "plain" } else { "box" }
+    // A literal-union atom widens to its member string here.
+    "str" => if !variantFieldIsLitUnionArray(vi, fj) && exprIsLitAtom(valIx, fnIx) { "strAtom" } else { "plain" }
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "plain"
   }
+}
 
-  match vk {
-    "f64" => {
-      if emitWidened(valIx, 4, fnIx) < 0 { return -1 }
-    }
-    "i64" => {
-      if emitWidened(valIx, 3, fnIx) < 0 { return -1 }
-    }
-    "f32" => {
-      if emitWidened(valIx, 5, fnIx) < 0 { return -1 }
-    }
+// `emitVariantFieldValue`'s body, through the arm `variantFieldArmOf` names.
+function emitVariantFieldValueUnder(vi: i32, fj: i32, valIx: i32, fnIx: i32) {
+  const rc = match variantFieldArmOf(vi, fj, valIx, fnIx) {
+    "noKind" => emitFail("emitProgram: union variant field has no storage kind")
+    "lambda" => emitFail(
+      "emitProgram: a lambda field value resolved to a non-closure variant field slot",
+    )
+    "f64" => emitWidened(valIx, 4, fnIx)
+    "i64" => emitWidened(valIx, 3, fnIx)
+    "f32" => emitWidened(valIx, 5, fnIx)
     "nulnone" => {
       if emitNulNoneForEffect(valIx, fnIx) < 0 { return -1 }
       fbRefNullNone()
     }
-    "union" => {
-      if variantFieldIsLitUnionArray(vi, fj) {
-        if emitExpr(valIx, fnIx) < 0 { return -1 }
-      } else if emitVariantFieldBox(vi, fj, valIx, fnIx) < 0 {
-        return -1
-      }
-    }
-    "str" => {
-      // a literal-union atom widens to its member string here.
-      if !variantFieldIsLitUnionArray(vi, fj) && exprIsLitAtom(valIx, fnIx) {
-        if emitStrValue(valIx, fnIx) < 0 { return -1 }
-      } else if emitExpr(valIx, fnIx) < 0 {
-        return -1
-      }
-    }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      if emitExpr(valIx, fnIx) < 0 { return -1 }
-    }
+    "box" => emitVariantFieldBox(vi, fj, valIx, fnIx)
+    "strAtom" => emitStrValue(valIx, fnIx)
+    "plain" => emitExpr(valIx, fnIx)
   }
+  return if rc < 0 { -1 } else { 0 }
+}
+
+// Whether variant literal `objIx` at row `vi` drops fields a wider record wrote, running each
+// dropped initialiser for its effect in source order (D1696, D15093).
+function variantLitDrops(objIx: i32, vi: i32, fnIx: i32): boolean {
+  return objLitHasFieldOutside(objIx, uFieldStart[vi], uFieldCount[vi])
+    && objLitBuildVariantRow(objIx, fnIx) == vi
+    && nodeRepTyAt(objIx, fnIx) != nodeTyAt(objIx, fnIx)
+}
+
+// The variant row object literal `objIx` is built at by `emitVariantStruct`'s layout loop alone:
+// its span sound, every field written, none outside the row, no stash; -1 otherwise.
+export function objLitVariantLayoutOf(objIx: i32, fnIx: i32): i32 {
+  const vi = objLitBuildVariantRow(objIx, fnIx)
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return -1
+  }
+  const start = uFieldStart[vi]
+  const cnt = uFieldCount[vi]
+  if start < 0 || cnt < 0 || start + cnt > sFieldNames.length { return -1 }
+  if objLitHasFieldOutside(objIx, start, cnt) { return -1 }
+  if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
+  let fj = 0
+  while fj < cnt {
+    if objFieldVal(objIx, sFieldNames[start + fj]) < 0 { return -1 }
+    fj = fj + 1
+  }
+  return vi
+}
+
+// After a variant literal's fields in layout order: `struct.new` of row `vi`'s heap type.
+export function variantStructNewTail(vi: i32): i32 {
+  fbStructNew(variantHeap(vi))
   return 0
 }
 
@@ -2825,9 +2854,7 @@ function emitVariantStruct(objIx: i32, vi: i32, fnIx: i32) {
   const stash: i32[] = []
   // A literal the checker built at this arm from a wider record runs each initialiser the arm
   // drops for its effect, in source order, as `emitObj` does (D1696, D15093).
-  const drops = objLitHasFieldOutside(objIx, start, cnt)
-    && objLitBuildVariantRow(objIx, fnIx) == vi
-    && nodeRepTyAt(objIx, fnIx) != nodeTyAt(objIx, fnIx)
+  const drops = variantLitDrops(objIx, vi, fnIx)
   // A constant dropped initialiser cannot be observed, so it is skipped (D5342).
   if drops && objLitDropsField(objIx, sFieldNames, start, cnt) {
     let pj = 0
@@ -2913,8 +2940,7 @@ function emitVariantStruct(objIx: i32, vi: i32, fnIx: i32) {
       objIx,
     )
   }
-  fbStructNew(variantHeap(vi))
-  return 0
+  return variantStructNewTail(vi)
 }
 
 // Whether the literal at `objIx` writes a field outside `armFieldNames[start..start+cnt)`. Such

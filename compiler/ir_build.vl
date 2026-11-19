@@ -80,6 +80,7 @@ import {
   GlobalCtx,
   HoleBox,
   IsArm,
+  ObjLitArm,
   PrintArm,
   TagIsArm,
   arrLitArmOf,
@@ -142,6 +143,7 @@ import {
   numLitLexAt,
   objLitArmOf,
   objLitLayoutRowOf,
+  objLitVariantLayoutOf,
   popPlanOf,
   popStmtPlainWhy,
   printArmOf,
@@ -155,6 +157,7 @@ import {
   tagIsArmOf,
   tailIfPlainWhy,
   tplStrHoleOf,
+  variantFieldArmOf,
   widenPlanOf,
 } from "./wasmEmit"
 import {
@@ -207,6 +210,8 @@ import {
   sFieldNames,
   sFieldStart,
   setIrShadowOn,
+  uFieldCount,
+  uFieldStart,
   uTags,
 } from "./emit_state"
 import { fnCheckedRetTy, globalIndexOfSid } from "./emit_fn_ret_kinds"
@@ -438,44 +443,65 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
 }
 
-// An object literal on legacy's struct layout path (`objLitArmOf`, `objLitLayoutRowOf`): each
-// field in layout order at its `plain` arm (`structFieldArmOf`), owing no recovery, then the row's
-// `struct.new`. The record rep's kids must sit in that order.
+// An object literal on a layout path legacy builds it by alone (`objLitArmOf`: a struct's
+// `objLitLayoutRowOf`, a variant's `objLitVariantLayoutOf`): each field in layout order at its
+// `plain` arm, owing no recovery, kept at its kid of the record rep, then the row's `struct.new`.
 function objLit(b: i32[], ix: i32, rep: i32): Opnd {
   const arm = objLitArmOf(ix, ibFnIx)
-  if arm != "struct" { return irBMiss("object " + arm) }
-  const si = objLitLayoutRowOf(ix, ibFnIx)
-  if si < 0 || si >= sFieldCount.length { return irBMiss("object layout") }
+  if arm == "unionBox" { return irBMiss("object " + arm) }
+  const row = if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
+  if row < 0 { return irBMiss("object layout") }
+  const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
+  const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
   const ty = nodeTyAt(ix, ibFnIx)
   if !(repNodeAt(rep) is RRecord) || repNodeOfTy(ty) != rep {
     return irBMiss("object rep")
   }
   const ks = repNodeKids(rep)
-  if ks.length != sFieldCount[si] { return irBMiss("object field count") }
+  if ks.length != cnt { return irBMiss("object field count") }
   const fields: Opnd[] = []
+  const layout: i32[] = []
+  const none: Opnd = { ov: -1 }
+  for _k in ks { fields.push(none) }
   let fi = 0
-  while fi < ks.length {
-    const name = sFieldNames[sFieldStart[si] + fi]
-    if repRecordKidOf(rep, ty, name) != fi {
-      return irBMiss("object field order")
-    }
+  while fi < cnt {
+    const name = sFieldNames[start + fi]
+    const k = repRecordKidOf(rep, ty, name)
+    if k < 0 || k >= ks.length { return irBMiss("object field kid") }
     const valIx = objFieldVal(ix, name)
-    const fa = structFieldArmOf(si, fi, valIx, ibFnIx, false)
-    if fa != "plain" { return irBMiss("object field " + fa) }
-    if nulNicheRecoverOwed(sFieldStoreKind(si, fi), valIx, ibFnIx) {
-      return irBMiss("object field recovery")
-    }
+    const why = fieldPlainWhy(arm, row, fi, valIx)
+    if why != "" { return irBMiss(why) }
     const at = b.length
-    const v = deliver(b, valIx, ks[fi])
+    const v = deliver(b, valIx, ks[k])
     if ibMiss != "" { return v }
-    if irBOpRep(v) != ks[fi] { return irBMiss("object field coercion") }
+    if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
     if fi > 0 && ifBelowLead(b, at, "short-circuit field after another") {
       return v
     }
-    fields.push(v)
+    fields[k] = v
+    layout.push(k)
     fi = fi + 1
   }
-  return irBLetTemp(b, { mrFields: fields, mrAt: ix }, ix, rep)
+  return irBLetTemp(
+    b,
+    { mrFields: fields, mrLayout: layout, mrAt: ix },
+    ix,
+    rep,
+  )
+}
+
+// Why field `fi` of literal row `row` at arm `arm` is not written as its value alone, or "".
+function fieldPlainWhy(arm: ObjLitArm, row: i32, fi: i32, valIx: i32): string {
+  if arm == "variant" {
+    const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
+    return if va == "plain" { "" } else { "object variant field " + va }
+  }
+  const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
+  if fa != "plain" { return "object field " + fa }
+  if nulNicheRecoverOwed(sFieldStoreKind(row, fi), valIx, ibFnIx) {
+    return "object field recovery"
+  }
+  return ""
 }
 
 // Whether condition `ix` is a box `is` test at `tagIsArmOf`'s `tagAbsent`: decided false with no
