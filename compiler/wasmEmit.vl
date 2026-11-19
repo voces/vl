@@ -94,6 +94,7 @@ import {
   elabInstTyAt,
   elabIsTyIn,
   elabKeyAt,
+  elabLetAssigned,
   elabNestedCopyOnChain,
   elabNodeRepAt,
   elabSlotRecordListSigs,
@@ -1153,6 +1154,7 @@ import {
   listElemRepIsRow,
   listIsRecvTyOf,
   litArmRowOf,
+  lmForUnionArms,
   localIndexOf,
   luForElemKind,
   luForUnionIter,
@@ -37259,6 +37261,8 @@ export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
 function emitForInStmt(s: ForIn, stmtIx: i32, fnIx: i32) {
   const luf = emitListUnionFor(s, stmtIx, fnIx)
   if luf != 0 { return if luf < 0 { -1 } else { 0 } }
+  const lmf = emitMapUnionFor(s, stmtIx, fnIx)
+  if lmf != 0 { return if lmf < 0 { -1 } else { 0 } }
   // `for v[, w] in <list> { body }` — iterate an i32 list, a string list, a struct ref list,
   // or a map's ordered keys/values list. Cursor slots in collect pre-order: the element var
   // `v`, a hidden cursor `v#i`, a hidden list temp `v#l` (the iterable evaluates once), and
@@ -37646,7 +37650,10 @@ function emitForInBind(s: ForIn, lp: ForInLoop, elemRecover: boolean): i32 {
   if ek != "nulnone" { fbLocalSet(lp.vIdx) }
   if lp.pairIsVal && lp.pairEk != "nulnone" {
     // `v = M.vals.backing[cursor]` — the value beside the key just bound, off the walk's
-    // stash the tombstone skip already reads, so the receiver is evaluated once.
+    // stash the tombstone skip already reads, so the receiver is evaluated once. A union-of-maps
+    // arm's walk boxes it into the value union at that arm's row.
+    const pb = forInPairBox
+    if pb != null { armRowBoxOpen(pb) }
     cmSlot = lp.mwShape
     fbLocalGet(lp.fiMap)
     fbStructGet(cmMapTy(), 1) // M.vals
@@ -37656,6 +37663,7 @@ function emitForInBind(s: ForIn, lp: ForInLoop, elemRecover: boolean): i32 {
     if lp.pairRecover {
       fbRefAsNonNull() // a non-null value kind off a nullable element slot
     }
+    if pb != null { armRowBoxClose(pb) }
     fbLocalSet(lp.pIdx)
   }
   if lp.pCtr >= 0 {
@@ -37761,8 +37769,8 @@ export function forInLoopClose(s: ForIn, lp: ForInLoop, fiSeq: i32): i32 {
 }
 
 // `for v[, i] in recv` over a union-of-lists box a pin left unrewritten (D16897): the box is
-// held in the loop's `#l` slot, its length read per arm (`emitListUnionForLen`), and each
-// element read per arm and boxed into the element union `v` holds. 0 when `s` is no such loop.
+// held in the loop's `#l` slot, one tag test picks the arm, and that arm's walk boxes each
+// element into the element union `v` holds. 0 when `s` is no such loop.
 function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   if !luForUnionIter(s.fiIter, fnIx) { return 0 }
   const arms = luMembersAt(nodeTyAt(s.fiIter, fnIx))
@@ -37778,25 +37786,8 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   for m in arms {
     const t = listIsArmTag(m)
     const h = listArmHeapOf(m)
-    const e = tyArrayElemIx(m)
-    // A numeric literal-union element is boxed at its base scalar's tag (D4770).
-    const en0 = if e >= 0 { nonNullTy(e) } else { -1 }
-    const nb = if en0 >= 0 { numLitUnionBaseTy(en0) } else { -1 }
-    const en = if nb >= 0 { nb } else { en0 }
-    const ek = if en >= 0 { boxTagOfTy(en) } else { -1 }
-    const scalar = ek >= 0 && !atomIsRefKind(ek)
-    // An element that is itself a value box is stored as one and read as it is.
-    const boxed = e >= 0 && valueBoxOfTy(e)
-    const nul = !boxed && en0 != e
-    let et = -2
-    if !boxed { et = if en >= 0 { isArmTagOfTy(en) } else { -1 } }
-    if (
-      t < 0
-      || h < 0
-      || listBackOfWrap(h) < 0
-      || et == -1
-      || (!boxed && scalar && nul)
-    ) {
+    const row = armElemRowOf(tyArrayElemIx(m))
+    if t < 0 || h < 0 || listBackOfWrap(h) < 0 || row.et == -1 {
       return emitFail(
         "emitProgram: a union-of-lists `for` arm has no tag, wrapper or element box",
       )
@@ -37808,9 +37799,9 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
     }
     tags.push(t)
     heaps.push(h)
-    eTags.push(et)
-    eBoxes.push(if scalar && !boxed { vbHeapIdxOfKind(ek) } else { -1 })
-    eNul.push(nul)
+    eTags.push(row.et)
+    eBoxes.push(row.ebox)
+    eNul.push(row.nul)
   }
   if u < 0 {
     return emitFail("emitProgram: a union-of-lists `for` has no element union")
@@ -37826,6 +37817,166 @@ function emitListUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
   }
   return emitListUnionForLoop(s, stmtIx, fnIx, plan)
 }
+
+// How an arm's element (or map value) `e` enters the element union: its box tag (`et`, -2 for an
+// element that is itself a value box, -1 for none), the value box a scalar is wrapped in
+// (`ebox`, -1 for none), and whether a `null` rides beside it (`nul`).
+type ArmElemRow = { et: i32, ebox: i32, nul: boolean }
+function armElemRowOf(e: i32): ArmElemRow {
+  // A numeric literal-union element is boxed at its base scalar's tag (D4770).
+  const en0 = if e >= 0 { nonNullTy(e) } else { -1 }
+  const nb = if en0 >= 0 { numLitUnionBaseTy(en0) } else { -1 }
+  const en = if nb >= 0 { nb } else { en0 }
+  const ek = if en >= 0 { boxTagOfTy(en) } else { -1 }
+  const scalar = ek >= 0 && !atomIsRefKind(ek)
+  // An element that is itself a value box is stored as one and read as it is.
+  const boxed = e >= 0 && valueBoxOfTy(e)
+  const nul = !boxed && en0 != e
+  let et = -2
+  if !boxed { et = if en >= 0 { isArmTagOfTy(en) } else { -1 } }
+  if !boxed && scalar && nul { et = -1 }
+  return {
+    et: et,
+    ebox: if scalar && !boxed { vbHeapIdxOfKind(ek) } else { -1 },
+    nul: nul,
+  }
+}
+
+// The two halves of boxing a value read between them at `row`: the tag below the value, then its
+// scalar value box and the union box over both; a stored box is only recovered non-null.
+function armRowBoxOpen(row: ArmElemRow) {
+  if row.et >= 0 { fbI32Rel(RS_TAG, row.et) }
+  return 0
+}
+
+function armRowBoxClose(row: ArmElemRow) {
+  if row.et == -2 {
+    fbRefAsNonNull()
+    return 0
+  }
+  if row.ebox >= 0 { fbStructNew(row.ebox) }
+  fbStructNew(uBoxIdx)
+  return 0
+}
+
+// `for k, v in recv` over a union-of-maps box a pin left unrewritten: one tag test picks the
+// arm, and the map walk re-lowers under that arm, its value boxed into the value union `v`
+// holds (`forInPairBox`). 0 when `s` is no such loop.
+function emitMapUnionFor(s: ForIn, stmtIx: i32, fnIx: i32): i32 {
+  const arms = lmForUnionArms(s.fiIter, fnIx)
+  if arms.length == 0 { return 0 }
+  // Inside an enclosing walk of the same binding the arm is known: its walk alone is emitted.
+  const ka = knownArmOf(s.fiIter)
+  const from = if ka >= 0 { ka } else { 0 }
+  return emitMapUnionForArm(s, stmtIx, fnIx, arms, emitLetCursor, from, ka >= 0)
+}
+
+// Arm `i` onward of `emitMapUnionFor`'s tag chain.
+function emitMapUnionForArm(
+  s: ForIn,
+  stmtIx: i32,
+  fnIx: i32,
+  arms: i32[],
+  cur0: i32,
+  i: i32,
+  only: boolean,
+): i32 {
+  if i >= arms.length {
+    fbUnreachable()
+    return 1
+  }
+  const m = arms[i]
+  const t = listIsArmTag(m)
+  const heap = armHeapOf(m)
+  const loc = armWrapLocal(m)
+  // The pair's value enters the value union at this arm's row, unless the union is no box.
+  const mt = tyAt(m)
+  const isMap = mt is TyMap && mt.mSet == 0
+  const boxV = s.fiVar2 != "" && isMap && boxTyName(luElemTy(arms)) != ""
+  const row = armElemRowOf(tyMapValOf(m))
+  if t < 0 || heap < 0 || loc < 0 || boxV && (row.et == -1 || row.nul) {
+    return emitFail(
+      "emitProgram: a union-of-maps `for` arm has no tag, map or value box",
+    )
+  }
+  if !only {
+    if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, t)
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+  }
+  if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(heap)
+  fbLocalSet(loc)
+  // The arms exclude each other, so each walk takes the same slots as the first's.
+  emitLetCursor = cur0
+  const mark = luOvEnter(s.fiIter, m)
+  const lmark = luOvLocalEnter(s.fiIter, loc)
+  const known = knownArmEnter(s.fiIter, i)
+  forInPairBox = if boxV { row } else { null }
+  const r = emitForInStmt(s, stmtIx, fnIx)
+  forInPairBox = null
+  knownArmLeave(known)
+  luOvLocalLeave(lmark)
+  luOvLeave(mark)
+  if r < 0 { return -1 }
+  if only { return 1 }
+  fbElse()
+  if emitMapUnionForArm(s, stmtIx, fnIx, arms, cur0, i + 1, false) < 0 {
+    return -1
+  }
+  fbEnd()
+  return 1
+}
+
+// The bindings a per-arm walk knows the arm of, innermost last: inside arm `knownArmIdx[k]`'s
+// walk of binding `knownArmDecl[k]`, a walk of the same binding takes that arm alone.
+let knownArmDecl: i32[] = []
+let knownArmIdx: i32[] = []
+
+// Records, for the walk of `iter` at arm `i`, that its binding holds that arm throughout, when
+// nothing can rebind it: no assignment anywhere writes that binding, a closure's included.
+// Returns the mark `knownArmLeave` restores.
+function knownArmEnter(iter: i32, i: i32): i32 {
+  const mark = knownArmDecl.length
+  if iter < 0 || iter >= P.nodes.length { return mark }
+  const n = nodeAt(iter)
+  if !(n is Ident) { return mark }
+  const d = identDeclOf(iter)
+  if d < 0 || elabLetAssigned(d) { return mark }
+  knownArmDecl.push(d)
+  knownArmIdx.push(i)
+  return mark
+}
+
+function knownArmLeave(mark: i32) {
+  while knownArmDecl.length > mark {
+    knownArmDecl.pop()
+    knownArmIdx.pop()
+  }
+  return 0
+}
+
+// The arm an enclosing walk knows `iter`'s binding holds, or -1.
+function knownArmOf(iter: i32): i32 {
+  if knownArmDecl.length == 0 || iter < 0 || iter >= P.nodes.length {
+    return -1
+  }
+  if !(nodeAt(iter) is Ident) { return -1 }
+  const d = identDeclOf(iter)
+  let k = knownArmDecl.length - 1
+  while k >= 0 {
+    if knownArmDecl[k] == d { return knownArmIdx[k] }
+    k = k - 1
+  }
+  return -1
+}
+
+// The row a union-of-maps walk's arm boxes the pair's value at, read by `emitForInBind`; null
+// outside such a walk.
+let forInPairBox: ArmElemRow | null = null
 
 // A per-arm `for` walk's arms: each list arm's tag and wrapper heap, then how its element enters
 // the element union (`eTags`: a box tag, -2 a stored box, -3 an atom widened by `eTexts`, -4 as
@@ -37884,8 +38035,8 @@ function emitListUnionForFlat(
   return emitListUnionForLoop(s, stmtIx, fnIx, plan)
 }
 
-// The loop of `emitListUnionFor`: the box held in `#l`, the length per arm, each element per
-// arm by `plan`, then the body under the loop's names.
+// The loop of `emitListUnionFor`: the box held in `#l`, one tag test, then per arm its own walk
+// (`emitListUnionForArm`), the body emitted under each.
 function emitListUnionForLoop(
   s: ForIn,
   stmtIx: i32,
@@ -37900,12 +38051,61 @@ function emitListUnionForLoop(
     if fn is FuncDecl { paramN = fn.fnParams.length + envSlotShift(fnIx) }
   }
   const vIdx = paramN + vSlot
+  if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
+  fbLocalSet(vIdx + 2)
+  // Inside an enclosing walk of the same binding the arm is known: its loop alone is emitted.
+  const ka = knownArmOf(s.fiIter)
+  const from = if ka >= 0 { ka } else { 0 }
+  if (
+    emitListUnionForArm(
+      s,
+      fnIx,
+      plan,
+      vSlot,
+      vIdx,
+      emitLetCursor,
+      from,
+      ka >= 0,
+    )
+    < 0
+  ) {
+    return -1
+  }
+  return 1
+}
+
+// Arm `i` onward of the loop's tag chain over the box in `#l`: under arm `i`'s tag, a walk of
+// that arm's list, each element entering the element union at a known arm; past the last arm the
+// box holds no list the union names, which a checked walk never reaches.
+function emitListUnionForArm(
+  s: ForIn,
+  fnIx: i32,
+  plan: LuForPlan,
+  vSlot: i32,
+  vIdx: i32,
+  cur0: i32,
+  i: i32,
+  only: boolean,
+): i32 {
+  if i >= plan.tags.length {
+    fbUnreachable()
+    return 0
+  }
   const iIdx = vIdx + 1
   const lIdx = vIdx + 2
-  if emitExpr(s.fiIter, fnIx) < 0 { return -1 }
-  fbLocalSet(lIdx)
+  const hasPair = s.fiVar2 != ""
+  if !only {
+    fbLocalGet(lIdx)
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, plan.tags[i])
+    fbI32Bin(70) // 0x46 i32.eq
+    fbIf(64)
+  }
   fbI32Const(0)
   fbLocalSet(iIdx)
+  // The arms exclude each other, so each walk's body takes the same slots as the first's.
+  emitLetCursor = cur0
+  const known = knownArmEnter(s.fiIter, i)
   const hoist = loopHoistOpen(-1, s.fiBody, fnIx, s.fiDecl1, s.fiDecl2)
   if hoist < 0 { return -1 }
   fbBlock(64)
@@ -37915,10 +38115,13 @@ function emitListUnionForLoop(
   loopContDepth.push(ctrlDepth)
   loopContLabel.push(s.fiLabel)
   fbLocalGet(iIdx)
-  if emitListUnionForLen(lIdx, plan, 0) < 0 { return -1 }
+  fbLocalGet(lIdx)
+  fbStructGet(uBoxIdx, 1)
+  fbRefCast(plan.heaps[i])
+  fbStructGet(plan.heaps[i], 1) // field 1: len
   fbI32Bin(78) // 0x4e i32.ge_s
   fbBrIf(1)
-  if emitListUnionForElem(lIdx, iIdx, plan, 0) < 0 { return -1 }
+  if emitListUnionForElem(lIdx, iIdx, plan, i) < 0 { return -1 }
   fbLocalSet(vIdx)
   if hasPair {
     fbLocalGet(iIdx)
@@ -37941,32 +38144,25 @@ function emitListUnionForLoop(
   loopBrkDepth.pop()
   loopBrkLabel.pop()
   loopHoistClose(hoist)
-  return 1
+  knownArmLeave(known)
+  if only { return 0 }
+  fbElse()
+  if emitListUnionForArm(s, fnIx, plan, vSlot, vIdx, cur0, i + 1, false) < 0 {
+    return -1
+  }
+  fbEnd()
+  return 0
 }
 
-// Arm `i` onward of `emitListUnionFor`'s element read over the box in local `box` at cursor
-// `cur`, at the element union's rep: a boxed element as stored, a scalar wrapped in its value
-// box, a `null` off a nullable element under the null tag, an atom widened to its string.
+// Arm `i`'s element read over the box in local `box` at cursor `cur`, at the element union's
+// rep: a boxed element as stored, a scalar wrapped in its value box, a `null` off a nullable
+// element under the null tag, an atom widened to its string.
 function emitListUnionForElem(
   box: i32,
   cur: i32,
   plan: LuForPlan,
   i: i32,
 ): i32 {
-  if i >= plan.tags.length {
-    fbUnreachable()
-    return 0
-  }
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, plan.tags[i])
-  fbI32Bin(70) // 0x46 i32.eq
-  if plan.destKind == "union" {
-    fbIfRef(uBoxIdx)
-  } else {
-    fbOpenIf()
-    fbValtype(plan.destKind, -1)
-  }
   const heap = plan.heaps[i]
   const et = plan.eTags[i]
   if plan.eNul[i] {
@@ -37978,7 +38174,7 @@ function emitListUnionForElem(
     fbStructNew(uBoxIdx)
     fbElse()
   }
-  if et == -2 || (et == -4 && plan.destKind == "str") {
+  if et == -4 && plan.destKind == "str" {
     emitListUnionForRead(box, cur, heap)
     fbRefAsNonNull()
   } else if et == -4 {
@@ -37990,37 +38186,12 @@ function emitListUnionForElem(
       return -1
     }
   } else {
-    fbI32Rel(RS_TAG, et)
+    const row: ArmElemRow = { et: et, ebox: plan.eBoxes[i], nul: false }
+    armRowBoxOpen(row)
     emitListUnionForRead(box, cur, heap)
-    if plan.eBoxes[i] >= 0 { fbStructNew(plan.eBoxes[i]) }
-    fbStructNew(uBoxIdx)
+    armRowBoxClose(row)
   }
   if plan.eNul[i] { fbEnd() }
-  fbElse()
-  if emitListUnionForElem(box, cur, plan, i + 1) < 0 { return -1 }
-  fbEnd()
-  return 0
-}
-
-// Arm `i` onward of the loop's length read over the box in local `box`; past the last arm the
-// box holds no list the union names, which a checked walk never reaches.
-function emitListUnionForLen(box: i32, plan: LuForPlan, i: i32): i32 {
-  if i >= plan.tags.length {
-    fbUnreachable()
-    return 0
-  }
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 0)
-  fbI32Rel(RS_TAG, plan.tags[i])
-  fbI32Bin(70) // 0x46 i32.eq
-  fbIf(127)
-  fbLocalGet(box)
-  fbStructGet(uBoxIdx, 1)
-  fbRefCast(plan.heaps[i])
-  fbStructGet(plan.heaps[i], 1) // field 1: len
-  fbElse()
-  if emitListUnionForLen(box, plan, i + 1) < 0 { return -1 }
-  fbEnd()
   return 0
 }
 
@@ -38843,6 +39014,9 @@ export function initBitOf(gi: i32): i32 {
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
   luOvLocNodes = []
+  knownArmDecl = []
+  knownArmIdx = []
+  forInPairBox = null
   luOvLocSlots = []
   coerceHeld = -1
   irHoleIx = -1
