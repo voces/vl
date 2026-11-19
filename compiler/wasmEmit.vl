@@ -2038,6 +2038,18 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
 // stash pass (D1510) can run exactly the same lowering, once per field. The caller has
 // resolved `valIx` and consumed the struct seed; its context is restored on every exit.
 function emitStructFieldValue(si: i32, fi: i32, valIx: i32, fnIx: i32) {
+  // A fresh `Map()` the field's row stores at another map struct than the call builds would not
+  // validate: the row and the call took the value's functions at different reps (D17015).
+  if fieldRowKind(sFieldStart[si] + fi) == "map" && mapNewCallAt(valIx) {
+    const built = mapNewShapeOf(unwrapParen(valIx), fnIx)
+    const held = sFieldMapShape(si, fi)
+    if built != -3 && held != -3 && mapTypeIdxOf(built) != mapTypeIdxOf(held) {
+      return emitFailAt(
+        "emitProgram: a record field holds a fresh `Map()` whose values store functions at one rep while the record's row stores them at another, so the two map types differ; building it at one rep is not done yet",
+        valIx,
+      )
+    }
+  }
   // A holder stored into a field of one closure type stores its record's member of that type.
   const sm = elabStoreMemberOf(nodeSrc[valIx] ?? valIx)
   if sm >= 0 && emitHolderRead(valIx, fnIx) {
@@ -15988,18 +16000,32 @@ function failMapValueType() {
   )
 }
 
+// Whether `ix` is a `Map()` call with no arguments that no user function named `Map` serves.
+function mapNewCallAt(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  const n = if x >= 0 && x < P.nodes.length { nodeAt(x) } else { null }
+  if !(n is Call) || n.callArgs.length != 0 { return false }
+  const f = nodeAt(n.callFn)
+  return f is Ident && f.identName == "Map" && fnIndexOfNode(n.callFn) < 0
+}
+
 // Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
 // count 0, wrapped `{ backing, len=0, cap=0 }`), boxed into the map struct.
-export function emitMapNew(exprIx: i32, fnIx: i32) {
-  // The shape of the map type the call is stamped with (D14226), keyed as its receivers key it
-  // (D14229): -1/-2 the mono map, an mv slot >= 0 THIS value type's map struct. A call whose
-  // type still holds a hole has no stamp, and builds as its binding's receivers read it.
+// The map shape `Map()` call `exprIx` builds in `fnIx`: its stamp's shape (D14226), keyed as its
+// receivers key it (D14229), or for a call whose type still holds a hole its binding's receivers'.
+// -1/-4/-6 the mono map by key, an mv slot >= 0 that value type's map struct, -3 none.
+function mapNewShapeOf(exprIx: i32, fnIx: i32): i32 {
   const mt = litRepTyAt(exprIx, fnIx)
   let slot = if mt >= 0 { mapCtorShapeOf(exprIx, mt) } else { mapShapeOfExpr(exprIx, fnIx) }
-  if slot == -3 { return failMapValueType() }
   if slot == -2 { slot = -1 }
   if slot == -5 { slot = -4 }
   if slot == -7 { slot = -6 }
+  return slot
+}
+
+export function emitMapNew(exprIx: i32, fnIx: i32) {
+  let slot = mapNewShapeOf(exprIx, fnIx)
+  if slot == -3 { return failMapValueType() }
   // The keys/vals accessors below read the op context, so pin it to the shape being
   // constructed (a `Map()` is not reached through `emitMapRecvKey`).
   const savedCm = cmSlot
