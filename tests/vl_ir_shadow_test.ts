@@ -716,16 +716,12 @@ print(two("a", "b"))
 });
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom, a function-tag leaf, a tagged call's dispatch, and a
-// delivery `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+// bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
+// `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
-  ],
-  [
-    "tag leaf",
-    `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`,
   ],
   [
     "tag dispatch",
@@ -755,6 +751,28 @@ Deno.test({
           }`,
         );
       }
+    }
+  },
+});
+
+// A function-tag leaf is its member's id (`fnTagLeafEmitted`), which the IR builds as an i32
+// immediate: no node misses at the leaf, and every function built matches legacy's bytes.
+const TAG_LEAF =
+  `function inc0(a) { return a + 1 }\nfunction dbl(a) { return a * 2 }\nfunction half(a) { return a / 2.0 }\nfunction pick(b: boolean) { if b { return [inc0] } return [dbl] }\nprint(pick(true)[0](3))\nprint(pick(false)[0](3))\n`;
+Deno.test({
+  name: "ir shadow: a function-tag leaf builds as its member's id and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_LEAF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path tag leaf")) {
+      throw new Error(`want no tag-leaf miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
