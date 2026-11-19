@@ -10,7 +10,7 @@ generic's still-open parameter.
 - **Shared tails** (`wasmEmit.vl`), spent by `emitFnTagDispatch` and the IR lowering alike:
   `tagStashTail` (the set id into `fnTagIdSlot`), `tagIsTail` (`local.get`, `i32.const`,
   `i32.eq`), and the decisions `tagDispatchTy`, `tagDispatchArms`, `tagDispatchIds`,
-  `tagArmStaged`.
+  `tagArmLambdaCallee` (which `emitArmRowFe` also opens with).
 - **IR rows:** `RTagStash` (an effect) and `RTagIs` (a `bool` temp). The builder (`tagDispatch`)
   stashes the callee, then builds a valued-`if` chain, innermost first, with each arm delivered at
   the call's rep. A lambda arm (legacy stages its instance) and a result outside
