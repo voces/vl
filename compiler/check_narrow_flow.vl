@@ -83,6 +83,7 @@ import {
   nodeAt,
   nodeSpineChildren,
   spreadArgOf,
+  tailValueLeaves,
 } from "./ast"
 import {
   recPartFitArm,
@@ -202,6 +203,7 @@ import {
   inferRetJoin,
   isTypeTyRead,
   listEveryTags,
+  listIsFitsAcrossRecs,
   listLeafFits,
   listNarrowsElemsOnly,
   listUnionWidest,
@@ -3361,6 +3363,16 @@ export function narListDeliveryErr(
   if srcExpr < 0 || dstTy < 0 { return false }
   const ix = peelParenIx(srcExpr)
   if ix < 0 || ix >= P.nodes.length { return false }
+  // An `if` or `match` delivers each arm's value.
+  const leaves: i32[] = []
+  if narListEveryLive() { tailValueLeaves(ix, leaves) }
+  if leaves.length > 1 || (leaves.length == 1 && leaves[0] != ix) {
+    let hitArm = false
+    for l in leaves {
+      if narListDeliveryErr(l, nodeTyOf(l), dstTy) { hitArm = true }
+    }
+    return hitArm
+  }
   const s = nodeAt(ix)
   if s is ObjLit { return narListDeliveryFields(s, nonNullTy(dstTy)) }
   if s is ArrayLit {
@@ -3391,23 +3403,24 @@ export function narListDeliveryErr(
   const byName = narFitNameOf(slot) != ""
   if byName && !assignable(srcTy, dstTy) { return false }
   if !byName && !listLeafFits(leaf, dstTy, depth) { return false }
-  // A field or subscript place is typed as declared, the narrowing being on its elements alone.
-  let decl = srcTy
-  if !isPathKey(name) {
-    const ns = slotVisibleOf(placeDecl(npPlace[slot]))
-    decl = narDeclaredTy(ns, -1)
-    if decl < 0 { decl = declTyOf(ns) }
-    let r = 0
-    while r < rows && decl >= 0 {
-      decl = placeElemTy(listUnionWidest(nonNullTy(decl)))
-      r = r + 1
-    }
-  }
+  const decl = narListSlotDecl(slot, name, rows, srcTy)
   if decl < 0 { return false }
   if narDeclFitsDst(decl, dstTy) {
     narListDeclReads[ix] = true
     return false
   }
+  return narListDeliveryRefuse(ix, decl, dstTy, depth)
+}
+
+// The refusal of a list narrowed by `is K[]`, declared `decl`, read whole at `ix` and handed on
+// as `dstTy` (DECISIONS.md "A narrowed list is not handed on as `K[]`"); `depth` list levels the
+// narrowing covers, for the copy it suggests.
+function narListDeliveryRefuse(
+  ix: i32,
+  decl: i32,
+  dstTy: i32,
+  depth: i32,
+): boolean {
   const text = narRowText(ix)
   const dn = nonNullTy(decl)
   const isMap = dn >= 0 && tyAt(dn) is TyMap
@@ -3426,6 +3439,110 @@ export function narListDeliveryErr(
     ix,
   )
   return true
+}
+
+// The declared type of the list narrowing `slot` names, `rows` rows down `name`: a field or
+// subscript place is typed as declared, the narrowing being on its elements alone (`srcTy`).
+function narListSlotDecl(slot: i32, name: string, rows: i32, srcTy: i32): i32 {
+  if isPathKey(name) { return srcTy }
+  const ns = slotVisibleOf(placeDecl(npPlace[slot]))
+  let decl = narDeclaredTy(ns, -1)
+  if decl < 0 { decl = declTyOf(ns) }
+  let r = 0
+  while r < rows && decl >= 0 {
+    decl = placeElemTy(listUnionWidest(nonNullTy(decl)))
+    r = r + 1
+  }
+  return decl
+}
+
+// The declared type of the list narrowed by `is K[]` that `ix` reads whole, where that type does
+// not fit the narrowed one, else -1. A generic one is its instance's (`narConvListDelivery`).
+function narListWholeDecl(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  const pfx = elemRecvPrefix(ix)
+  if pfx == "" { return -1 }
+  const name = elemKeyBase(pfx)
+  const rows = elemKeyDepth(pfx)
+  const slot = elemEverySlotOf(name)
+  if slot < 0 || npInvBy[slot] >= 0 || elemKeyDepth(npKeys[slot]) - rows <= 0 {
+    return -1
+  }
+  const srcTy = nodeTyOf(ix)
+  const decl = narListSlotDecl(slot, name, rows, srcTy)
+  if decl < 0 || srcTy < 0 || tyHasTyVar(decl) || narDeclFitsDst(decl, srcTy) {
+    return -1
+  }
+  return decl
+}
+
+// A list narrowed by `is K[]` read whole where no type checks it (an un-annotated binding or
+// inferred return) reads at its declared type, returned, else -1 (DECISIONS.md "A narrowed list
+// is not handed on as `K[]`"); as an arm or a literal's member it is refused instead.
+export function narListUntypedDelivery(srcExpr: i32): i32 {
+  if !narListEveryLive() { return -1 }
+  const ix = peelParenIx(srcExpr)
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const decl = narListWholeDecl(ix)
+  if decl >= 0 {
+    narListDeclReads[ix] = true
+    return decl
+  }
+  narListHandOnErrs(ix, true)
+  return -1
+}
+
+// Whether some live narrowing is a list's `is K[]` over its elements.
+function narListEveryLive(): boolean {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if npInvBy[i] < 0 && keyIsListEvery(npKeys[i]) { return true }
+    i = i - 1
+  }
+  return false
+}
+
+// Refuse each narrowed list read whole under `ix` that an arm (`top` false) or a literal member
+// hands on at its narrowed type.
+function narListHandOnErrs(ix: i32, top: boolean) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const leaves: i32[] = []
+  tailValueLeaves(ix, leaves)
+  for l in leaves {
+    if !top || l != ix { narListHandOnErr(l) }
+    narListMemberErrs(l)
+  }
+  return 0
+}
+
+// `narListHandOnErrs` over the members of record or list literal `ix`; a spread member is a copy.
+function narListMemberErrs(ix: i32) {
+  const n = nodeAt(ix)
+  if n is ObjLit {
+    for f in n.objFields {
+      const fn = nodeAt(f)
+      if fn is FieldInit { narListHandOnErrs(peelParenIx(fn.fiValue), false) }
+    }
+  } else if n is ArrayLit {
+    for e in n.arrElems { narListHandOnErrs(peelParenIx(e), false) }
+  }
+  return 0
+}
+
+// Refuse `ix` when it reads a narrowed list whole at its narrowed type.
+function narListHandOnErr(ix: i32) {
+  const d = narListWholeDecl(ix)
+  if d < 0 { return 0 }
+  const pfx = elemRecvPrefix(ix)
+  const slot = elemEverySlotOf(elemKeyBase(pfx))
+  if slot < 0 || slot >= npKeys.length { return 0 }
+  narListDeliveryRefuse(
+    ix,
+    d,
+    nodeTyOf(ix),
+    elemKeyDepth(npKeys[slot]) - elemKeyDepth(pfx),
+  )
+  return 0
 }
 
 // A record narrowed by `is` to a record its declared type stores wider fits it only by its fields'
@@ -4972,7 +5089,9 @@ function collectThenNarrowsRaw(condIx: i32, places: i32[], tys: i32[]) {
           pushNarrowFact(isPl, tIdx, places, tys)
         } else if (
           tIdx >= 0
-          && (recIsFitsAcrossTags(isCur, tIdx) || listIsFitsAcrossReps(isCur, tIdx))
+          && (recIsFitsAcrossTags(isCur, tIdx)
+            || listIsFitsAcrossReps(isCur, tIdx)
+            || listIsFitsAcrossRecs(isCur, tIdx))
         ) {
           const nn = nonNullNarrowTy(isCur)
           if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, places, tys) }
@@ -5169,7 +5288,13 @@ function isTestMemberAnswer(m: i32, t: i32, depth: i32): i32 {
   if mt is TyPrim && tt is TyPrim {
     return if mt.primName == tt.primName { 1 } else { 0 }
   }
-  if recIsFitsAcrossTags(m, t) || listIsFitsAcrossReps(m, t) { return -1 }
+  if (
+    recIsFitsAcrossTags(m, t)
+    || listIsFitsAcrossReps(m, t)
+    || listIsFitsAcrossRecs(m, t)
+  ) {
+    return -1
+  }
   if mt is TyObj && tt is TyObj {
     if !objSigSame(mt, tt) || !objSigSame(tt, mt) { return 0 }
     const k = recArmFitKind(t, m)
