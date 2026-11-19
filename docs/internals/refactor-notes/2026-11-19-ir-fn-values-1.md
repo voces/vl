@@ -19,11 +19,23 @@ STORE's IR coverage track takes the function-value blocker classes. The blocker 
   where legacy writes the plain call. That decision is one function in `wasmEmit.vl`,
   `callRefPlainKey`. It returns the `$fnsig` key when the callee is a binding no builtin or
   function owns, there is no tagged dispatch, lift, bundle or holder, every argument is a scalar
-  at its parameter's own valtype, and no refusal fires on the way; otherwise it returns "". The
-  lowering is `emitCallRefAt`'s plain bytes: the closure into the depth-keyed stash
-  (`callRefNestSlot`), its env, the arguments, then the function index and `call_indirect`, or
-  the tail form. A statement drops the result as `emitCallStmtIdent` does (`callRefPlainVoid`).
-  `RCallRef` joins the claimed `closure` family.
+  at its parameter's own valtype, and no refusal fires on the way; otherwise it returns "". A
+  function of the same name in scope makes it decline: legacy then asks its live scope
+  (`identNameIsLiveBound`) which one the name means, and the plan reads no ambient state.
+  - **Legacy agrees, armed (option (b) of the review).** Under the IR shadow, legacy records the
+    key it wrote each closure call at with no bundle, coercion or narrowing arm on the way
+    (`callRefLegacyPlainKey`): `emitCallRefArg` returns 1 only from its general arm with nothing
+    owed. The IR build, which runs after legacy, fails the build when its key is not the one
+    legacy recorded. Control: a scratch predicate that ignored the coercion test failed
+    `(a: f64) => f64` called with `3` with "the IR's plain closure call disagrees with legacy's",
+    and built unchanged unarmed. Option (a), legacy consuming the predicate, needs the route's
+    25 conditions to become one ladder; that is a later step.
+  - **One writer for the bytes.** Legacy and the IR write the call through the same head and tail:
+    `callRefStash` (the closure into the depth-keyed stash), `callRefEnvOpen` (its env, one depth
+    down for the arguments) and `callRefCallTail` (the function index, then `call_indirect` or its
+    tail form).
+  - A statement drops the result as `emitCallStmtIdent` does (`callRefPlainVoid`). `RCallRef` joins
+    the claimed `closure` family.
 - **A direct call into a nested or lifted function.**
   - A callee with the hidden environment parameter gets `ref.null struct` before its arguments
     (`caEnv`).
@@ -31,6 +43,8 @@ STORE's IR coverage track takes the function-value blocker classes. The blocker 
     being built. That lookup is pure (`paramIndexOf`). `captureHomeOf` reads legacy's live scope,
     which a claim would see empty, so it is not used.
   - A binding holding a lifted lambda is a direct call of it (`cloLiftCalleeOf`).
+  - A lifted callee that assigns a capture hands it back after its result (`cloLiftWriteCount`),
+    so it stays legacy's.
 - **Statements that write nothing:** a `const` bound to a lifted lambda, a nested function
   declaration (unless it drops a cached env), and a bare function name (`stmtIsBareFnName`, D6980).
 
@@ -38,13 +52,12 @@ Found while gating: `irGlobalRepOf` scanned the function's noted globals linearl
 now builds past 3,000 closure-global reads, so the `closures` scaling axis read 2.97 against its
 2.5 bar. It is now a map lookup.
 
-## Measured on fixpoint seeds: master `d1de0b7d4` against this branch
+## Measured on fixpoint seeds: master `a37ca941e` against this branch
 
 | | master | this branch |
 |---|---|---|
-| distilled functions covered = verified = matched | 30,703 | 31,165 |
-| distilled functions claimed (`--claims`, 0 fell back) | 30,703 | 31,165 |
-| self-compile functions claimed, of 18,895 | 12,662 (67.0%) | 12,699 (67.2%) |
+| distilled functions claimed (`--claims`, 0 fell back), all matched armed | 30,836 | 31,304 |
+| self-compile functions claimed, of 18,895 | 12,727 | 12,764 |
 | `call of a non-declaration` + `local rep closure` | 233 | 0 |
 | `callee environment` + `statement` | 203 | 0 |
 | `call of a non-declaration` + `parameter rep closure` | 61 | 0 |
@@ -54,11 +67,11 @@ now builds past 3,000 closure-global reads, so the `closures` scaling axis read 
 - **Mode 3** (claim everything): 19,079 cells and run cases byte-identical, and the self-compile
   identical.
 - **Cost:**
-  - L2 self-compile fuel +0.4%;
-  - plumb-shape main +2.9% and tail +2.6% (bar +5%);
+  - L2 self-compile fuel, same box against master's seed: 99,541,376,265 → 99,766,184,054
+    (+0.23%);
   - scaling axes green.
-- **Lines:** +333 / −52 in `compiler/`; `lint.vl`'s 40 are the field table's reflow. A coverage
-  step, so the bar is functions per line: 462 distilled and 37 self-compile functions for +281.
+- **Lines:** +408 / −65 in `compiler/`, the field table's reflow in `lint.vl` among them. A coverage step, so the bar
+  is functions per line: 468 distilled and 37 self-compile functions.
 
 ## What is left in these classes
 - `call of a non-declaration` alone: 46. A callee `callRefPlainKey` declines: a wide or coerced

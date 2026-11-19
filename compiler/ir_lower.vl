@@ -4,7 +4,6 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
-import { callRefNestSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { RRaw, repNodeAt } from "./emit_rep"
 import {
@@ -67,6 +66,7 @@ import {
   OVar,
   Opnd,
   RAtomEq,
+  RAtomStr,
   RBoxField,
   RBoxNarrow,
   RCall,
@@ -144,7 +144,6 @@ import {
   fbBr,
   fbBrIf,
   fbCall,
-  fbCallIndirect,
   fbDrop,
   fbElse,
   fbEmitLocalsVec,
@@ -178,7 +177,6 @@ import {
   fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
-  fbReturnCallIndirect,
   fbSelect,
   fbStructGet,
   fbStructNew,
@@ -192,15 +190,18 @@ import {
 } from "./emit_bytes"
 import {
   GlobalCtx,
-  arrLitArmOf,
-  arrLitBuildOf,
+  arrLitPackedShortTail,
   arrLitPrologue,
-  arrLitRefPlainSlot,
   arrLitRefShortTail,
   arrLitShortTail,
   atomEqPlanOf,
   atomEqTail,
+  atomStrPlanOf,
+  atomStrTail,
   binNulTestOf,
+  callRefCallTail,
+  callRefEnvOpen,
+  callRefStash,
   coalNulRefBranch,
   coalNulRefOpen,
   coalResultKindOf,
@@ -219,7 +220,6 @@ import {
   fallThroughPadOf,
   forInListStore,
   forInListSync,
-  forInLoopAt,
   forInLoopClose,
   forInLoopOpen,
   hoistCandRow,
@@ -271,10 +271,11 @@ import {
   variantTagTail,
   voidTailCallee,
 } from "./wasmEmit"
+import { arrLitRefPlainSlot } from "./emit_plan_list"
+import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
-  cloStructIdx,
   ctrlDepth,
   dfeCallee,
   emitFnSpanEnd,
@@ -286,7 +287,6 @@ import {
   fnStmts,
   fnUses,
   gCellIdx,
-  gFnTableIdx,
   gHelpF64Rem,
   gImports,
   listIdxScratchBase,
@@ -520,26 +520,16 @@ function call(c: RCall, tail: boolean) {
   }
 }
 
-// `RCallRef`: the closure into the call stash of its nesting depth, its env, the arguments, then
-// the closure's function index called at the key's type, or its tail form, as `emitCallRefAt`.
+// `RCallRef`: the closure, then legacy's shared head and tail around the arguments
+// (`callRefStash`, `callRefEnvOpen`, `callRefCallTail`).
 function callRef(r: RCallRef, tail: boolean) {
   irLOpnd(r.crFn)
   const d = callRefDepth
-  const s = callRefNestSlot(d)
-  fbLocalSet(s)
-  fbLocalGet(s)
-  fbStructGet(cloStructIdx, 0)
-  callRefDepth = d + 1
+  const s = callRefStash()
+  callRefEnvOpen(s, d)
   for a in r.crArgs { irLOpnd(a) }
   callRefDepth = d
-  fbLocalGet(s)
-  fbStructGet(cloStructIdx, 1)
-  if tail {
-    fbReturnCallIndirect(r.crSig, gFnTableIdx)
-  } else {
-    fbCallIndirect(r.crSig, gFnTableIdx)
-  }
-  return 0
+  return callRefCallTail(s, r.crSig, tail)
 }
 
 function rhs(r: Rhs, tail: boolean) {
@@ -567,6 +557,10 @@ function rhs(r: Rhs, tail: boolean) {
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
     }
     RToBox => boxOp(r)
+    RAtomStr => {
+      irLOpnd(r.sxV)
+      atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
+    }
     RAtomEq => atomEq(r)
     RUnionEq => unionEq(r)
     RRetag => irLOpnd(r.rgV)
@@ -827,7 +821,7 @@ function recoverRead(r: RRecover) {
 // arm `arrLitArmOf` names, in `emitArr`'s order.
 function makeList(r: RMakeList) {
   const fnIx = lw.irAt
-  const lb = arrLitBuildOf(r.mlAt, fnIx)
+  const lb = arrLitListBuild(r.mlAt, fnIx)
   arrLitPrologue(r.mlAt)
   const arm = arrLitArmOf(r.mlAt, fnIx, lb)
   for e in r.mlElems { irLOpnd(e) }
@@ -837,6 +831,7 @@ function makeList(r: RMakeList) {
       r.mlElems.length,
     )
   }
+  if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
 }
 

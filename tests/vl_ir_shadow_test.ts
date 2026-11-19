@@ -372,6 +372,23 @@ print(ln(2)[1].length)
   },
 });
 
+// A short packed list literal builds along `emitArrU8`'s shared tail and matches legacy's bytes;
+// an empty one returned at its destination is the self-compile's common spelling.
+Deno.test({
+  name: "ir shadow: a short u8 list literal is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function e(): u8[] { return [] }
+print(e().length)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the one function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A walk's own `break` and `continue` are legacy's branches, and a walk whose body is hoist-safe
 // reads its header once and may unroll: each a named miss, never a byte mismatch.
 Deno.test({
