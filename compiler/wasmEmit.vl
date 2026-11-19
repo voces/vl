@@ -1794,6 +1794,7 @@ import {
   listWrapHeapOfKind,
   litIsArmOf,
   mapSoftTwinClashOf,
+  memReadArmOf,
   monoStaticIsResult,
   msSetOfUnionBox,
   njDispatches,
@@ -11479,59 +11480,56 @@ function memFloorMsg(memIx: i32, dflt: string): string {
   return "emitProgram: " + dflt
 }
 
+// A member read, by the arm `memReadArmOf` names: a narrowed box, a bare or nullable variant
+// receiver, or the shared-field dispatch over the struct read.
 function emitMem(memIx: i32, fnIx: i32) {
-  // A field read on a receiver narrowed to one variant downcasts through the box, only where the
-  // receiver IS a box: a place declared at the arm itself carries the bare ref, and unwrapping
-  // would read a box the module never built. `narrowedArmNeedsUnbox` pairs them alike (D1734).
-  const m0n = nodeAt(memIx)
-  if m0n is Member && memNarrowVariantIndex(memIx, fnIx) >= 0 {
-    if exprUnion(m0n.memObj, fnIx) { return emitNarrowedMem(memIx, fnIx) }
+  return match memReadArmOf(memIx, fnIx) {
+    "narrowed" => emitNarrowedMem(memIx, fnIx)
+    "variant" => emitMemVariantRead(memIx, fnIx)
+    "nulVariant" => emitMemNulVariantRead(memIx, fnIx)
+    "shared" => emitMemSharedRead(memIx, fnIx)
   }
-  return emitMemVariantRead(memIx, fnIx)
 }
 
-// `emitMem`'s read of a field off a bare or nullable VARIANT receiver; any other receiver
-// falls through to the shared-field dispatch. Returns 0, or -1 failed.
+// `emitMem`'s read of a field off a bare VARIANT receiver, the unboxed variant ref itself: the
+// receiver, then `struct.get` at the variant's field. Returns 0, or -1 failed.
 function emitMemVariantRead(memIx: i32, fnIx: i32): i32 {
-  // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
-  // struct directly — the param already IS the unboxed variant ref, so there is NO box
-  // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
-  // $<variantHeap(vi)> <fieldIdx>`.
   const m0 = nodeAt(memIx)
-  if m0 is Member {
-    const pvi = exprVariantIndex(m0.memObj, fnIx)
-    if pvi >= 0 {
-      const pvfi = variantFieldIndex(pvi, m0.memProp)
-      if pvfi < 0 {
-        return emitFail("emitProgram: unknown variant field in field access")
-      }
-      if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
-      variantFieldTail(pvi, pvfi, memIx, fnIx)
-      // A code-16 (value-union box) field of the arm, read while its member path is narrowed,
-      // unboxes to the narrowed atom, the arm-for-arm twin of the plain struct read (D219).
-      return variantUnionBoxTail(pvi, pvfi, memIx, fnIx)
-    }
-    // The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch).
-    // Identical `struct.get`, one `ref.as_non_null` ahead of it: the cell is a
-    // `(ref null $variantHeap(vi))` and `struct.get` takes a non-null ref. The assertion cannot trap
-    // where the checker admits the read — such an access is only reachable through a null test.
-    const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
-    if nvi >= 0 {
-      const nvfi = variantFieldIndex(nvi, m0.memProp)
-      if nvfi < 0 {
-        return emitFail("emitProgram: unknown variant field in field access")
-      }
-      if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
-      fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-      fbStructGet(variantHeap(nvi), nvfi)
-      emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
-      if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
-        if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-      }
-      return 0
-    }
+  if !(m0 is Member) { return emitFail("emitProgram: expected a member read") }
+  const pvi = exprVariantIndex(m0.memObj, fnIx)
+  const pvfi = variantFieldIndex(pvi, m0.memProp)
+  if pvfi < 0 {
+    return emitFail("emitProgram: unknown variant field in field access")
   }
-  return emitMemSharedRead(memIx, fnIx)
+  if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
+  variantFieldTail(pvi, pvfi, memIx, fnIx)
+  // A code-16 (value-union box) field of the arm, read while its member path is narrowed,
+  // unboxes to the narrowed atom, the arm-for-arm twin of the plain struct read (D219).
+  return variantUnionBoxTail(pvi, pvfi, memIx, fnIx)
+}
+
+// The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch): one
+// `ref.as_non_null` ahead of the `struct.get`, which cannot trap where the checker admits the
+// read, as only a null test reaches it. Returns 0, or -1 failed.
+function emitMemNulVariantRead(memIx: i32, fnIx: i32): i32 {
+  const m0 = nodeAt(memIx)
+  if !(m0 is Member) { return emitFail("emitProgram: expected a member read") }
+  const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
+  if nvi < 0 || nvi >= uFieldStart.length {
+    return emitFail("emitProgram: expected a nullable variant receiver")
+  }
+  const nvfi = variantFieldIndex(nvi, m0.memProp)
+  if nvfi < 0 {
+    return emitFail("emitProgram: unknown variant field in field access")
+  }
+  if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
+  fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+  fbStructGet(variantHeap(nvi), nvfi)
+  emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
+  if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
+    if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
+  }
+  return 0
 }
 
 // `emitMem`'s shared-field read over a struct union, dispatched on the box tag; a plan that
