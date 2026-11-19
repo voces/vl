@@ -31,9 +31,12 @@ pop's own refusals (`pop typed element`, `pop niche`, `pop element`) held 25 mor
 | self-compile functions covered (18,993) | 14,112 | 14,224 |
 | self-compile first-miss `method pop` | 142 | 9 |
 | self-compile first-miss `pop typed element` + `pop niche` + `pop element` | 25 | 0 |
-| corpus functions covered (45,678) | 33,583 | CORPUSA |
+| corpus functions covered (45,678) | 33,583 | 33,583 |
 
 All covered functions verified and matched (shadow mode 1). A probe of value and statement pops
 over i32, f64, boolean, i64 and u8 lists prints the same under mode 3 as shipped, with an identical
 module. Functions gained per compiler line: 112 self-compile over +31 net compiler lines (111 added,
 80 deleted, `popStmtPlainWhy` among them); legacy's scalar pop lines are moved into the tail.
+
+`ir-identity.sh --names` against master's seed: identical 9,037, differ 0, self-compile identical;
+`--cases`: identical 7,513, differ 0. L2 fuel +0.3% on the baseline.
