@@ -66,6 +66,7 @@ import {
   OVar,
   Opnd,
   RAtomEq,
+  RAtomStr,
   RBoxField,
   RBoxNarrow,
   RCall,
@@ -158,6 +159,7 @@ import {
   fbI32RelOf,
   fbI64Const,
   fbIf,
+  fbIfRefNul,
   fbLocalGet,
   fbLocalIsUnsetRef,
   fbLocalRun,
@@ -170,9 +172,11 @@ import {
   fbRefEq,
   fbRefIsNull,
   fbRefNull,
+  fbRefTest,
   fbResetLazyFrame,
   fbReturn,
   fbReturnCall,
+  fbSelect,
   fbStructGet,
   fbStructNew,
   fbStructSet,
@@ -185,14 +189,16 @@ import {
 } from "./emit_bytes"
 import {
   GlobalCtx,
+  arrLitPackedShortTail,
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
   atomEqPlanOf,
   atomEqTail,
+  atomStrPlanOf,
+  atomStrTail,
   coalNulRefBranch,
   coalNulRefOpen,
-  emitBoxAroundHole,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
@@ -213,6 +219,10 @@ import {
   hoistReadTail,
   hoistRowMark,
   hoistRowReads,
+  holeBoxHead,
+  holeBoxPlanOf,
+  holeBoxTail,
+  holeBoxTyAt,
   idxRowsOn,
   initBitOf,
   loopHoistCands,
@@ -405,7 +415,9 @@ export function irLOpnd(o: Opnd) {
 // Before a value that reads no operand: one written while a valued `if`'s value waits on the
 // stack lands above it, out of order.
 function leaf() {
-  if lwStackLive > 0 { irLMiss("operand above a valued if's value") }
+  if lwStackLive > 0 && !lwPushing {
+    irLMiss("operand above a valued if's value")
+  }
 }
 
 function imm(o: OImm) {
@@ -529,6 +541,10 @@ function rhs(r: Rhs, tail: boolean) {
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
     }
     RToBox => boxOp(r)
+    RAtomStr => {
+      irLOpnd(r.sxV)
+      atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
+    }
     RAtomEq => atomEq(r)
     RUnionEq => unionEq(r)
     RRetag => irLOpnd(r.rgV)
@@ -587,6 +603,9 @@ function rawOp(r: RRawOp) {
     "test" => 0
     "load" => fbI32Load()
     "tag64" => 0
+    "push" => irLMiss("push read as an operand")
+    "ref.test" => fbRefTest(h)
+    "select" => fbSelect()
     "tee" => {
       const s = varSlot(r.rwImm)
       if s < 0 { return irLMiss("unmapped slot") }
@@ -596,10 +615,42 @@ function rawOp(r: RRawOp) {
   return 0
 }
 
-// A helper's raw instruction that yields nothing; `array.copy`'s source heap is its `srImm`.
+// A helper's `push`: its variable or immediate written where it is defined, kept on the stack
+// below whatever the body computes next, for a later effect whose leading operands the pushes are.
+function pushNow(dst: i32, r: RRawOp) {
+  if !lw.irHelper || r.rwArgs.length != 1 || r.rwArgs[0] is OStr {
+    return irLMiss("push")
+  }
+  lwPushing = true
+  irLOpnd(r.rwArgs[0])
+  lwPushing = false
+  lwPushed.push(dst)
+  return 0
+}
+
+// The temps `push` wrote and no effect has consumed yet, in push order, and whether a push is
+// being written, which may sit above a valued `if`'s value by design.
+let lwPushed: i32[] = []
+let lwPushing = false
+
+// A helper's raw instruction that yields nothing; `array.copy`'s source heap is its `srImm`. Its
+// pushed operands, if any, are its leading ones, in push order.
 function rawEff(n: SRawOp, pending: i32[]) {
   lwSeq = []
-  for a in n.srArgs { irLOpnd(a) }
+  let k = 0
+  const queued = lwPushed.length
+  while k < n.srArgs.length && k < queued {
+    const a = n.srArgs[k]
+    if !(a is OVar) || a.ov != lwPushed[k] { break }
+    takeUse(a.ov)
+    k = k + 1
+  }
+  if k < queued { return irLMiss("push not consumed first") }
+  lwPushed = []
+  while k < n.srArgs.length {
+    irLOpnd(n.srArgs[k])
+    k = k + 1
+  }
   irLSettle(pending)
   const h = n.srHeap
   match n.srOp {
@@ -763,6 +814,7 @@ function makeList(r: RMakeList) {
       r.mlElems.length,
     )
   }
+  if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
 }
 
@@ -913,32 +965,21 @@ function unionEq(r: RUnionEq) {
   return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
 }
 
-// The `RToBox` whose operand legacy's box writer asks for through the value hole, while one is
-// open. Held as an `Rhs`: an `Opnd` global costs the self-compile's mono pass.
-let lwHoleBox: Rhs[] = []
-
-// The value hole's writer (`irHoleWrite`): the open box's operand.
-export function irLowerHoleWrite(): i32 {
-  if lwHoleBox.length != 1 {
-    return irLMiss("value hole read with no box open")
-  }
-  const r = lwHoleBox[0]
-  if r is RToBox { irLOpnd(r.bxV) } else { irLMiss("value hole holds no box") }
-  return 0
-}
-
-// `RToBox`: legacy's own box writer, its value the operand, written where the writer asks for it.
-// The writer asks once; an immediate (a literal it writes itself, or `null`) it may leave unread.
-// Any other count leaves the function unlowered.
+// `RToBox`: the shared box plan's head, the value (a `null` or a literal leaves its immediate
+// unread), an atom box's widening, and the plan's tail.
 function boxOp(r: RToBox) {
-  lwHoleBox = [r]
-  const uses = emitBoxAroundHole(r.bxAt, lw.irAt)
-  lwHoleBox = []
-  const unreadOk = uses == 0 && (r.bxV is OImm || r.bxV is OStr)
-  if uses != 1 && !unreadOk {
-    irLMiss("box value written " + i32ToStr(uses) + " times")
+  const fnIx = lw.irAt
+  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
+  if p.hbArm == "ladder" { return irLMiss("box plan") }
+  leaf()
+  holeBoxHead(p, r.bxAt, fnIx)
+  if p.hbArm == "pass" || p.hbArm == "atom" || p.hbArm == "atomStr" {
+    irLOpnd(r.bxV)
+  } else {
+    irLSkip(r.bxV)
   }
-  return 0
+  if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  return holeBoxTail(p, r.bxAt, fnIx)
 }
 
 // Opens legacy's header hoists for the loop over `condIx` and `bodyIx`, its rows and header
@@ -1149,6 +1190,12 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       lwTempRhs[n.lDst] = n.lRhs
       lwTempDef[n.lDst] = true
       pending.push(n.lDst)
+      // A push is consumed through `lwPushed`, not the pending order of the next node.
+      const r = n.lRhs
+      if r is RRawOp && r.rwOp == "push" {
+        pending.pop()
+        return pushNow(n.lDst, r)
+      }
     }
     SAssign => {
       cond(n.asSrc, pending)
@@ -1348,12 +1395,15 @@ function valuedIfOpen(n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = valtypeOf(lw.irVars[t].vRep)
-  if vt < 0 {
+  // A helper's `if` may yield a raw reference, as its hand-written body's did.
+  const rr = repNodeAt(lw.irVars[t].vRep)
+  const refOut = lw.irHelper && rr is RRaw
+  if vt < 0 && !refOut {
     irLMiss("valued if rep")
     return IF_DONE
   }
   cond(n.siCond, pending)
-  fbIf(vt)
+  if rr is RRaw && refOut { fbIfRefNul(rr.rwHeap, rr.rwNull) } else { fbIf(vt) }
   lwFrames.push(-1)
   body(n.siThen, false, t)
   fbElse()
@@ -1579,6 +1629,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   lwRowKind = []
   lwBuf = []
   lwSinkFired = 0
+  lwPushed = []
   uBoxNewEnd = -1
   // The builders keep the emitter's control depth; it goes back as found.
   const prev = wTarget(lwBuf)
@@ -1693,6 +1744,7 @@ export function irLowerHelper(f: IrFn, out: u8[]): string {
       }
     }
   }
+  if lwPushed.length > 0 { irLMiss("push never consumed") }
   if lwMiss != "" { return lwMiss }
   const locals: u8[] = []
   const prev = wTarget(locals)
