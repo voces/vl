@@ -1013,8 +1013,9 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
 // in that later operand; one in the first operand written stays covered, and an intrinsic's
-// earlier argument, or an element store's receiver and index, is staged below the `if` (`intr`,
-// `st`), so only `stIx`'s `if` in the index is a store miss.
+// earlier argument, an operator's left operand, or an element store's receiver and index, is
+// staged below the `if` (`intr`, `bin`, `eq`, `st`), so only `stIx`'s `if` in the index is a
+// store miss.
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -1049,7 +1050,6 @@ print(intr(true, 0.5))
     const { rows } = run(src, true);
     const want: [string, number][] = [
       ["uncovered store short-circuit operand", 1],
-      ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
@@ -1059,7 +1059,10 @@ print(intr(true, 0.5))
     if (rows.has("uncovered short-circuit argument after another")) {
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
-    if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered short-circuit right operand")) {
+      throw new Error(`want \`bin\` and \`eq\` staged, got ${JSON.stringify([...rows])}`);
+    }
+    if (!(rows.get("matched")! >= 4)) throw new Error(`want \`first\`, \`intr\`, \`bin\` and \`eq\` matched, got ${JSON.stringify([...rows])}`);
     // The start's map store stages its global receiver and key below the value's `if`.
     if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
@@ -2357,6 +2360,24 @@ print(elseIfWiden(3) + elseIfWiden(2))
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
       throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A binary operator whose right operand is a valued `if` stages a left variable or immediate
+// below the `if`, as legacy writes it first: a local, a literal, a widened i64 and a float match.
+const BIN_RIGHT_IF =
+  `function a(x: i32, k: boolean): i32 { return x + (if k { 1 } else { 2 }) }\nfunction c(x: i32, k: boolean): boolean { return x < (if k { 1 } else { x * 2 }) }\nfunction m(x: i32, k: boolean): i64 { const y: i64 = 7; return y - (if k { 1 } else { 2 }) }\nfunction lit(k: boolean): i32 { return 5 + (if k { 1 } else { 2 }) }\nfunction f(x: f64, k: boolean): f64 { return x / (if k { 2.0 } else { 4.0 }) }\nprint(a(1, true))\nprint(c(3, false))\nprint(m(1, true))\nprint(lit(false))\nprint(f(8.0, true))\n`;
+Deno.test({
+  name: "ir shadow: an operator's left variable or literal is staged below a valued right if and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(BIN_RIGHT_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
