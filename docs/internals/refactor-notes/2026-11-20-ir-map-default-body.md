@@ -1,24 +1,29 @@
-# IR: a map read's computing default as its miss arm's body (2026-11-20)
+# IR: a map read's computing default as SCoalBox's fused map-read arm (2026-11-20)
 
-`mapGetOr` built `m[k] ?? d`'s default into the enclosing body, ahead of the read, and so refused
-any default that built a node it could not write in place (`map read default computes`). Legacy
-writes the default inside the probe's miss arm (`mapGetOrI32Head` or `mapGetOrMvHead`, the
-default, then the tail). Of the 40 misses in the armed self-compile, 27 were the narrowing
-rewrite's `if true { … }` default (`const hit = m[k]; if hit is i32 …`), and the rest calls,
-index reads and nested `??`.
+`mapGetOr` built `m[k] ?? d`'s default ahead of the read. So it refused any default that built a
+node it could not write in place (`map read default computes`). Legacy writes the default inside
+the probe's miss arm: `mapGetOrI32Head` or `mapGetOrMvHead`, then the default, then the tail. Of
+the 40 misses in the armed self-compile, 27 were the narrowing rewrite's `if true { … }`
+default (`const hit = m[k]; if hit is i32 …`). The rest were calls, index reads and nested `??`.
 
-`RMapGetOr` now carries `mgDefBody`. A default that computes is built into it, ending by writing a
-fresh slotless out, which `mgDef` names. The lowering writes the body in the miss arm under its
-own stack floor, as a valued `if`'s arm is written. Its nodes' settles must not drop the temps the
-read's own operands consumed, so the lowering saves `lwSeq` around it. A key that is itself a
-temp (`m[s.slice(a, b)]`) is the case that needs it. A default with no node keeps today's in-place
-operand, so no existing claim moves.
+To IR-REV's design, a read whose default computes is `SCoalBox` on a new `CoalValArm` member,
+`mapIndexGetOr`. That fits `SCoalBox`'s contract: legacy's shared head and present arm, a lazy
+default body, a valued out.
 
-This is the first right-hand side that holds a body. `irRhsBody` names it for the walkers that
-enumerate bodies: the printer, `nodeAssigns`, rule 5 (`endsWriting`) with `nested` in the
-verifier, and the bounds rule's walk.
+- **Node:** `cbL` is the receiver. `cbMap`, a `MapProbe`, holds the global, its recovery, the
+  key and the inline form. It is null on every other arm.
+- **Lowering:** the same inline head `RMapGetOr` writes (`mapGetOrInlineHead`, now shared), the
+  default body into the slotless out, then the tail.
+- **Verifier:** a probe only on its arm; a map receiver; an inline form; at the `i32` form, an
+  `i32` or `bool` out; a default that ends by writing the out. Selftest cases 15 to 17 break each.
+- **Unchanged:** a default that builds no node keeps `RMapGetOr` as it was.
+
+Measured on the armed self-compile (a single build, not a fixpoint): all 40 build; none is an
+operand after another (`map read default after an operand`). The default stays lazy, and a
+default that assigns the key or the map variable is read afterwards as legacy reads it. Both
+are pinned by `tests/cases/maps/get-or-computing-default-runs-only-on-a-miss.vl`.
 
 Writing the lowering found D17025. A narrowed read of a union field off a record that is a union
-member emits invalid wasm, so the lowering binds `r.mgDef` to a local.
+member emits invalid wasm, so the new code binds such fields to locals first.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
