@@ -792,6 +792,10 @@ print(l1(null, [5, 6]).length)
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
       throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // An element store into a packed `u8` list takes its value as a plain i32, which the backing
 // truncates (300 reads back as 44), as a push onto one does.
 Deno.test({
@@ -810,6 +814,47 @@ print(bs[1])
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (!(rows.get("matched")! >= 2) || rows.get("matched") !== rows.get("covered")) {
       throw new Error(`want both stores covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `l ?? d` whose default joins a nullable union arm into the union's box (legacy's staged `if`):
+// a name and a call operand (the call default runs once: `calls` prints 1), and a join nested in
+// the default, which re-stages the shared `?.` slot only on the outer null path. Each `??` function
+// is covered and matches legacy's bytes; `show` and the start are other classes.
+Deno.test({
+  name: "ir shadow: a nullable reference joined into a union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type C = { k: "c", r: i32 }
+type Q = { k: "q", s: i32 }
+type U = C | Q
+let calls = 0
+function mkq(): Q {
+  calls = calls + 1
+  return { k: "q", s: 7 }
+}
+function getc(b: boolean): C | null {
+  if b { return { k: "c", r: 3 } }
+  return null
+}
+function name(x: C | null, d: Q): U { return x ?? d }
+function call(b: boolean): U { return getc(b) ?? mkq() }
+function nested(x: C | null, y: C | null, d: Q): U { return x ?? (y ?? d) }
+function show(u: U): i32 {
+  if u is C { return u.r }
+  return u.s * 10
+}
+const q: Q = { k: "q", s: 5 }
+print(show(name(null, q)) + show(name({ k: "c", r: 2 }, q)))
+print(show(call(true)) + show(call(false)))
+print(calls)
+print(show(nested(null, null, q)) + show(nested(null, { k: "c", r: 4 }, q)) + show(nested({ k: "c", r: 1 }, null, q)))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+      throw new Error(`want the four coalescing functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1148,9 +1193,10 @@ Deno.test({
     // case 11 a box whose immediate stands for a call (rule 2).
     // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
     // (rule 2), and a default that leaves the out unwritten (rule 5). Case 15 is a stashed
-    // record whose source order evaluates one field twice (rule 2). Cases 16 and 17 break a
-    // nullable reference's `??`: an `i32` and a non-null list operand (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2];
+    // record whose source order evaluates one field twice (rule 2). Cases 16 to 18 break a
+    // nullable reference's `??`: an `i32` and a non-null list operand, and a nullable list into an
+    // `i32` out (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);

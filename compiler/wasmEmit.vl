@@ -1711,6 +1711,7 @@ import {
 import {
   CoalArm,
   CoalBoxArm,
+  CoalNulRefArm,
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
   NULL_OWN_BOX,
@@ -40412,48 +40413,64 @@ function emitCoalesceNulRefJoin(
   heapIx: i32,
   fnIx: i32,
 ) {
-  // The union the join's result boxes into is the one its default is delivered into
-  // (`boxDstNameAt`).
-  const joinN = boxDstNameAt(e.binRight, fnIx)
-  if joinN == "" {
-    return emitFailAt(
-      "emitProgram: `??` joins a nullable value into a union the checker recorded no row for",
-      exprIx,
-    )
-  }
-  const joinTy = boxDstTyOf(e.binRight, fnIx)
-  const tag = coalNicheBoxTag(joinTy, unwrapParen(e.binLeft), heapIx, fnIx)
-  if tag < 0 {
-    return emitFailAt(
-      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
-      exprIx,
-    )
-  }
-  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
-    return emitFailAt(
-      "emitProgram: `??` default names no arm of the union its result is",
-      exprIx,
-    )
-  }
-  if !fnUses.optRecv {
-    return emitFailAt("emitProgram: `??` operand stash not reserved", exprIx)
-  }
+  const why = coalNulRefJoinWhy(e, heapIx, fnIx)
+  if why != "" { return emitFailAt(why, exprIx) }
   if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
-  fbLocalTee(optRecvSlot)
-  fbRefIsNull()
-  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  coalNulRefJoinOpen()
   // Through `emitUnionBoxArg`, not `emitUnionCoerce`: a struct default that is already a
   // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
   // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
   if (emitUnionBoxAtRecord("", -1, e.binRight, fnIx) < 0) { return -1 }
-  fbElse()             // 0x05 else — present → the staged ref, boxed under its own arm's tag
+  coalNulRefJoinPresent(coalNulRefJoinTag(e, heapIx, fnIx))
+  fbEnd() // 0x0b end
+  return 0
+}
+
+// Why the joining `l ?? d` over a nullable reference of heap `heapIx` is refused, or "": its union
+// has no row, no arm for the value's own type, or no arm for the default, or the operand's stash
+// was not reserved.
+export function coalNulRefJoinWhy(e: BinExpr, heapIx: i32, fnIx: i32): string {
+  // The union the join's result boxes into is the one its default is delivered into
+  // (`boxDstNameAt`).
+  if boxDstNameAt(e.binRight, fnIx) == "" {
+    return "emitProgram: `??` joins a nullable value into a union the checker recorded no row for"
+  }
+  if coalNulRefJoinTag(e, heapIx, fnIx) < 0 {
+    return "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type"
+  }
+  if !coalJoinDefaultBoxes(boxDstTyOf(e.binRight, fnIx), e.binRight, fnIx) {
+    return "emitProgram: `??` default names no arm of the union its result is"
+  }
+  if !fnUses.optRecv { return "emitProgram: `??` operand stash not reserved" }
+  return ""
+}
+
+// The tag the present arm of a joining `l ?? d` boxes the operand of heap `heapIx` under.
+export function coalNulRefJoinTag(e: BinExpr, heapIx: i32, fnIx: i32): i32 {
+  return coalNicheBoxTag(
+    boxDstTyOf(e.binRight, fnIx),
+    unwrapParen(e.binLeft),
+    heapIx,
+    fnIx,
+  )
+}
+
+// The head of a joining `l ?? d` once the operand is on the stack: staged in the `?.` receiver
+// slot, which the box arm reads back (D1714), its null test, and the `if` at the box.
+export function coalNulRefJoinOpen() {
+  fbLocalTee(optRecvSlot)
+  fbRefIsNull()
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+}
+
+// The present arm of a joining `l ?? d`: the staged reference boxed under tag `tag`.
+export function coalNulRefJoinPresent(tag: i32) {
+  fbElse() // 0x05 else — present → the staged ref, boxed under its own arm's tag
   fbI32Rel(RS_TAG, tag)
   fbLocalGet(optRecvSlot)
   fbStructNew(uBoxIdx) // { tag, the niche's own ref }
-  fbEnd()              // 0x0b end
-  return 0
 }
 
 // The boxed `??` over the `boolean | null` i32 niche, for a default that joins rather than
@@ -40633,6 +40650,28 @@ export function coalNulRefHeapOf(
       coalNulRefTailHeap(e, fnIx)
     }
   }
+}
+
+// The `br_on_non_null` core of `l ?? d` along `coalNulRefHeapOf`'s heap `nrHeap`, its block shape
+// `nrArm`, and, for a default that joins into a union, the tag `nrTag` the present arm boxes under.
+export type CoalNulRefPlan = { nrHeap: i32, nrArm: CoalNulRefArm, nrTag: i32 }
+
+// The nullable-reference plan of `l ?? d`, or null when `l` reaches no such core.
+export function coalNulRefPlanOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNulRefPlan | null {
+  const h = coalNulRefHeapOf(e, lhsIx, exprIx, fnIx)
+  if h < 0 { return null }
+  const a = coalNulRefArmOf(e, exprIx, fnIx)
+  const tag = match a {
+    "join" => coalNulRefJoinTag(e, h, fnIx)
+    "noBox" | "listClash" | "litAtom" | "plain" => -1
+  }
+  const p: CoalNulRefPlan = { nrHeap: h, nrArm: a, nrTag: tag }
+  return p
 }
 
 // The nullable union arm's variant heap or the nullable record's struct heap `l` of `l ?? d`

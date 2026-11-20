@@ -122,7 +122,8 @@ import {
   cloLiftCalleeOf,
   closureValueWhy,
   coalClosedWidensAtom,
-  coalNulRefHeapOf,
+  coalNulRefJoinWhy,
+  coalNulRefPlanOf,
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
@@ -304,6 +305,8 @@ import {
   exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
+  exprNulBool,
+  exprNullableString,
   exprUnion,
   fnIndexOfNode,
   forInElemTyOf,
@@ -2912,8 +2915,9 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // re-reads its box, so its operand is a plain variable; a stashed one is a call.
 function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const arm = coalBoxArmOf(n, lhsIx, ix, ibFnIx)
-  // A name past the boxed arms reaches legacy's nullable-reference rungs directly.
-  if arm == "next" && nodeAt(lhsIx) is Ident {
+  // A name past the boxed arms reaches legacy's nullable-reference rungs directly, and a call does
+  // once it is neither of the call niches (`emitCoalesceCallNiche`).
+  if arm == "next" && nulRefRungReached(n, lhsIx) {
     return coalNulRef(b, n, lhsIx, ix, rep)
   }
   const built = match arm {
@@ -2955,34 +2959,55 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   return o
 }
 
-// `l ?? d` over a nullable reference (legacy's `emitCoalesceNulRef`): the block at the heap
-// `coalNulRefHeapOf` names, the operand once, and the default built into the block's fall-through
-// so it runs only on `null`. Legacy writes the default as itself, so it must sit at the result.
+// Whether `l ?? d` past `coalBoxArmOf`'s boxed arms reaches legacy's nullable-reference rungs with
+// no arm between: a name, or a call that is no `boolean | null` or `string | null` niche.
+function nulRefRungReached(n: BinExpr, lhsIx: i32): boolean {
+  const l = nodeAt(lhsIx)
+  if l is Ident { return true }
+  return l is Call
+    && !exprNulBool(n.binLeft, ibFnIx)
+    && !exprNullableString(n.binLeft, ibFnIx)
+}
+
+// `l ?? d` over a nullable reference (legacy's `emitCoalesceNulRef`) along `coalNulRefPlanOf`: the
+// plain block, or a join's staged `if`, with the default built where it runs only on `null`. A plain
+// default is written as itself; a join's only on the recorded-box branch `deliver` shares.
 function coalNulRef(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
-  if coalNulRefHeapOf(n, lhsIx, ix, ibFnIx) < 0 {
-    return irBMiss("coalesce nulRef heap")
+  const p = coalNulRefPlanOf(n, lhsIx, ix, ibFnIx)
+  if p == null { return irBMiss("coalesce nulRef heap") }
+  const join = p.nrArm == "join"
+  if !join && p.nrArm != "plain" {
+    return irBMiss("coalesce nulRef " + p.nrArm)
   }
-  const ra = coalNulRefArmOf(n, ix, ibFnIx)
-  if ra != "plain" { return irBMiss("coalesce nulRef " + ra) }
+  if join && coalNulRefJoinWhy(n, p.nrHeap, ibFnIx) != "" {
+    return irBMiss("coalesce nulRef join refused")
+  }
+  if join && !boxOwedAt(n.binRight, ibFnIx) {
+    return irBMiss("coalesce nulRef join default")
+  }
   const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce nulRef after an operand") }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
-  // The block opens before the operand, so a temp written ahead of it would sit below the block.
-  if !(l is OVar) || l.ov < 0 || ib.irVars[l.ov].vKind == "temp" {
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce nulRef operand") }
+  // A plain block opens before its operand, so a temp written ahead of it would sit below it.
+  if !join && ib.irVars[l.ov].vKind == "temp" {
     return irBMiss("coalesce nulRef operand temp")
   }
   const ln = repNodeAt(irBOpRep(l))
   if !(ln is RNullable) || ln.rnDisc == 4 {
     return irBMiss("coalesce nulRef operand rep")
   }
-  const want = if coalesceDefaultNullable(n.binRight, ibFnIx) { irBOpRep(l) } else { ln.rnInner }
-  if rep != want { return irBMiss("coalesce nulRef result rep") }
+  const nul = coalesceDefaultNullable(n.binRight, ibFnIx)
+  const want = if join { rep } else if nul { irBOpRep(l) } else { ln.rnInner }
+  if rep != want || join && !heldAsBox(rep) {
+    return irBMiss("coalesce nulRef result rep")
+  }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const nb: i32[] = []
-  const d = irBExpr(nb, n.binRight)
+  const d = if join { deliver(nb, n.binRight, rep) } else { irBExpr(nb, n.binRight) }
   if ibMiss != "" { return d }
   if irBOpRep(d) != rep { return irBMiss("coalesce nulRef default rep") }
   irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
