@@ -2378,3 +2378,21 @@ Deno.test({
     }
   },
 });
+
+// A closure over a fresh environment builds in the IR: its captures as the maker holds them, read
+// back from the environment in the closure's body, and copied env to env into a nested closure.
+const ENV_CAPTURE =
+  `function mk(n: i32, s: string): (k: i32) => i32 {\n  return (k: i32): i32 => {\n    print(s)\n    return n + k\n  }\n}\nfunction mk2(n: i32): () => (k: i32) => i32 {\n  return (): (k: i32) => i32 => (k: i32): i32 => n * k\n}\nconst f = mk(3, "a")\nprint(f(4))\nprint(mk2(5)()(2))\n`;
+Deno.test({
+  name: "ir shadow: a closure environment, its field reads and an env-to-env copy build and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ENV_CAPTURE, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});

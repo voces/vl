@@ -4,6 +4,7 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import { fnEnvIdxOf } from "./emit_capture_frames"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
@@ -65,6 +66,7 @@ import {
 import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
+  captureNamesOf,
   coalesceDefaultNullable,
   declaredIndexAt,
   exprVariantIndex,
@@ -97,6 +99,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvGet,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -260,6 +263,8 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitCapturedRead,
+  emitClosureIds,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
@@ -431,6 +436,7 @@ import {
   fbEagerScratch,
   fbFrameParams,
   fnStmts,
+  fnStmtsPosOf,
   fnUses,
   gCellIdx,
   gHelpF64Rem,
@@ -816,6 +822,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListCopy => irLMiss("list copy value")
     RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
+    REnvGet => envGet(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1008,11 +1015,30 @@ function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 function makeClo(r: RMakeClo) {
-  if r.mcEnv.length > 0 { return irLMiss("closure env") }
-  leaf()
-  emitClosureValue(r.mcFn, lw.irAt)
+  if r.mcEnv.length > 0 {
+    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
+    const envIdx = fnEnvIdxOf(r.mcFn)
+    if envIdx < 0 { return irLMiss("closure env") }
+    for o in r.mcEnv { irLOpnd(o) }
+    fbStructNew(envIdx)
+    emitClosureIds(r.mcFn)
+  } else {
+    leaf()
+    emitClosureValue(r.mcFn, lw.irAt)
+  }
   if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
     fbRefAsNonNull()
+  }
+  return 0
+}
+
+// `REnvGet`: legacy's read of a capture from the function's environment, recovered at the read.
+function envGet(r: REnvGet) {
+  leaf()
+  const caps = captureNamesOf(fnStmtsPosOf(lw.irAt))
+  if r.evSlot < 0 || r.evSlot >= caps.length { return irLMiss("env slot") }
+  if emitCapturedRead(caps[r.evSlot], lw.irAt, r.evAt) != 1 {
+    return irLMiss("env read")
   }
   return 0
 }
