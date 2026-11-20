@@ -323,8 +323,8 @@ reported, so `kind-ladder-incomplete` stays at 398 and `kind-ladder-split` at 8 
 A parameter's set is in the signature the lint is handed; a field's is in `type X = { f: T }`,
 which lives in another module the lint cannot see. So the census derives a `{field -> set}`
 index from every such declaration in the tree (`field_set_index`), keeping only a field whose
-type is exactly one closed set, and the lint carries the same table as two parallel arrays
-(`klFieldNames` / `klFieldSetNames`) consulted by `klFieldSetOf`. `scripts/ladder-sets.vl`
+type is exactly one closed set, and the lint carries the same table as one row per field
+(`klFields`) consulted by `klFieldSetOf`. `scripts/ladder-sets.vl`
 compares the lint's field copy to the tree the same way it compares the closed-set copy, so the hardcoded table cannot drift from the declarations. Eight fields
 resolve: `primName -> PrimName`, `kind -> TokKind`, `litKind -> LitKind`, `next`/`nodes ->
 Node`, `rdKind -> VKind`, `asMode -> AsMode`, `tys -> Ty`.
