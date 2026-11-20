@@ -1051,8 +1051,6 @@ import {
   identReadAtomKindAt,
   identReadContainerAt,
   idxNarrowAtomKind,
-  ifExprRefKind,
-  ifExprRefSlot,
   indexElemUnionName,
   instanceOperandTyOf,
   instanceReadTyOf,
@@ -1151,7 +1149,6 @@ import {
   exprIsBool,
   fnSigIdxOfFn,
   identNullableBoolPop,
-  ifExprValtype,
   listElemIsBool,
   refArrBoxTagOf,
   unionEqAtomKindOf,
@@ -1229,9 +1226,7 @@ import {
   exprIsNullLike,
   exprIsNullLit,
   fnTagIdSlot,
-  ifChainAllBareNull,
   ifLinkYieldsNull,
-  ifListArmValueIx,
   isRecvStashSlot,
   listPayloadStashSlot,
   litAtomCastSlot,
@@ -1305,7 +1300,6 @@ import {
   globalLetOfSid,
   ifJoinArmsAllStrLit,
   ifJoinNarrowsPerArm,
-  ifJoinTypedAtom,
 } from "./emit_local_slots"
 import {
   annNulVariantRowOf,
@@ -1377,7 +1371,6 @@ import {
   RC_MAP,
   RC_REF_LIST,
   coalesceResultIsBox,
-  ifJoinUnionNameIn,
   letBindingUnionTy,
   letUnionTyIxOf,
   nicheReadStashSlot,
@@ -1550,6 +1543,7 @@ import {
   msSoloValKind,
   nodeTyIsNulScalarBox,
   nodeTyMapKeyIsLitUnion,
+  nulAtomTyMemoReset,
   nullBoxTag,
   nullValKind,
   repOfNode,
@@ -1564,6 +1558,7 @@ import {
   scalarTagOfKind,
   tyMapKeyOf,
   tyPackedRow,
+  tyRepsAsNulAtom,
   valBlockTypeOfKind,
   valueBoxOfTy,
   vbHeapIdxOfKind,
@@ -1827,6 +1822,15 @@ import {
   wideRetagPairs,
   widenPlanOf,
 } from "./emit_plan_union"
+import {
+  RefJoin,
+  deliveredAsNulAtom,
+  ifJoinDropsNulAtom,
+  ifJoinPlanOf,
+  nulStrReppedNulLitPlace,
+  strJoinDropsNulAtom,
+  strReppedLitUnionAt,
+} from "./emit_plan_if_join"
 
 export function capCacheBuild() {
   capStartTbl = []
@@ -21326,25 +21330,6 @@ function emitCondExpr(ix: i32, fnIx: i32) {
   return rc
 }
 
-// The struct row of an if-expression's recorded type, any `| null` peeled: its destination's
-// record when the checker adopted one, -1 for a join that is no record.
-function ifTypedStructRow(ifIx: i32, fnIx: i32): i32 {
-  let t = nodeRepTyAt(ifIx, fnIx)
-  if t < 0 { t = nodeTyAt(ifIx, fnIx) }
-  if t < 0 { return -1 }
-  return repRowOfTyStruct(tyPeelNul(t), repScanLim())
-}
-
-// `ifExprRefKind` at a destination record `destStruct` (-1 for none): an object-literal then
-// arm has no struct row of its own, so it builds at the destination's.
-function ifExprRefKindAt(ifIx: i32, fnIx: i32, destStruct: i32): VKind | null {
-  const rk = ifExprRefKind(ifIx, fnIx)
-  if rk != null || destStruct < 0 { return rk }
-  const tv = ifListArmValueIx(ifIx)
-  if tv >= 0 && nodeAt(tv) is ObjLit { return "struct" }
-  return null
-}
-
 // The call of an optional call's guard (`drwOptGuard`: `if r != null { call } else { null }`)
 // whose receiver `r` this instance closes with no `null`: the guard is then the call,
 // and its `null` arm has no rep (D16333). -1 for any other `if`.
@@ -21386,78 +21371,34 @@ function optGuardCallOf(ifIx: i32, fnIx: i32): i32 {
 // recurses). Both arms are coerced to the branch-join's scalar rep (a mixed `then 1 else
 // 2.5` widens to f64); a ref-typed join (string/struct/array) routes to `emitIfExprRef` instead, for the multi-byte `(ref $ht)` blocktype a single numeric byte cannot spell.
 function emitIfExpr(ifIx: i32, fnIx: i32) {
-  // The IR claims an `if` by `ifExprPlainKind`; under the armed shadow, where legacy emits every
-  // function, every exit here proves that decision agrees. Its exclusions keep this `if` off the
-  // link's int-switch and literal-`true` exits.
-  const pk = if irShadowOn { ifExprPlainKind(ifIx, fnIx) } else { -1 }
   const gv = optGuardCallOf(ifIx, fnIx)
-  if gv >= 0 {
-    return if pk >= 0 { ifPlainDisagrees(ifIx) } else { emitExpr(gv, fnIx) }
-  }
+  if gv >= 0 { return emitExpr(gv, fnIx) }
   // The join is classified from its arms' tail values, and a tail naming its own prelude's
   // local reads that local's slot, bound for the classification alone and popped before any
   // arm lowers: in a generic instance the checker's type of such a tail is the type parameter.
   const scoped = armPreludeScopeOpen(ifIx)
-  let how = 0
-  let vt = 127
-  let iun = ""
-  let rk: VKind | null = null
-  let rslot = -1
-  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) {
-    how = 1
-  } else if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
-    // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
-    how = 2
-  } else {
-    // A union-valued join is the box whatever reads it, so it takes the box blocktype here and
-    // not only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
-    if exprUnion(ifIx, fnIx) { iun = ifJoinUnionNameIn(ifIx, fnIx) }
-    if iun != "" {
-      how = 3
-    } else {
-      const rj = ifRefJoinOf(ifIx, fnIx)
-      rk = rj.rjKind
-      if rk != null {
-        how = 4
-        rslot = rj.rjSlot
-      } else {
-        vt = ifExprValtype(ifIx, fnIx)
-      }
-    }
-  }
+  const p = ifJoinPlanOf(ifIx, fnIx)
   if scoped { scopePop() }
-  // The same dropped null when a member `??` default keeps the join an atom, typed at the union
-  // or, with no pin, at a bare valtype (D3290).
-  const jpin = nodeTyInOf(ifIx, fnIx)
-  const atomJoin = tyIsLitUnion(jpin) || (how == 0 && jpin < 0)
-  if how != 1 && atomJoin && strJoinDropsNulAtom(ifIx, fnIx) {
-    return if pk >= 0 { ifPlainDisagrees(ifIx) } else { refuseJoinDropsNul(ifIx) }
+  if ifJoinDropsNulAtom(ifIx, fnIx, p.ijArm) { return refuseJoinDropsNul(ifIx) }
+  return match p.ijArm {
+    "null" => emitAllNullIf(ifIx, fnIx)
+    "atom" => emitIfExprAs(ifIx, fnIx, 127)
+    "union" => emitUnionIfValue(p.ijUnion, nodeTyInOf(ifIx, fnIx), ifIx, fnIx)
+    "ref" => emitIfExprRefJoin(ifIx, fnIx, p.ijRef)
+    "scalar" => emitIfExprAs(ifIx, fnIx, p.ijVt)
   }
-  if pk >= 0 && (how != 0 || rk != null || vt != pk) {
-    return ifPlainDisagrees(ifIx)
-  }
-  if how == 1 { return emitAllNullIf(ifIx, fnIx) }
-  if how == 2 {
-    const rcA = emitIfExprAs(ifIx, fnIx, 127)
-    return rcA
-  }
-  if how == 3 { return emitUnionIfValue(iun, jpin, ifIx, fnIx) }
-  if rk != null { return emitIfExprRef(ifIx, fnIx, rk, rslot) }
-  return emitIfExprAs(ifIx, fnIx, vt)
 }
 
-// The ref kind and table slot a value `if` at `ifIx` joins at (`emitIfExprRef`), or a null kind
-// for a join that is not a reference.
-export type RefJoin = { rjKind: VKind | null, rjSlot: i32 }
-
-// The `RefJoin` of a join that is not a reference.
-export function noRefJoin(): RefJoin { return { rjKind: null, rjSlot: -1 } }
-
-export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
-  const destStruct = ifTypedStructRow(ifIx, fnIx)
-  const rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
-  const slot = if rk != null { ifExprRefSlot(ifIx, fnIx, rk, destStruct) } else { -1 }
-  return { rjKind: rk, rjSlot: slot }
+// A value `if` on `ifJoinPlanOf`'s `ref` rung, whose join always names a kind.
+function emitIfExprRefJoin(ifIx: i32, fnIx: i32, rj: RefJoin) {
+  const rk = rj.rjKind
+  if rk == null {
+    return emitFailAt(
+      "emitProgram: internal: a reference join with no kind",
+      ifIx,
+    )
+  }
+  return emitIfExprRef(ifIx, fnIx, rk, rj.rjSlot)
 }
 
 // The result blocktype of a ref join's `if`, after its opcode: `(ref null $ht)` when the join
@@ -21467,23 +21408,9 @@ export function fbRefIfOpenType(kind: VKind, slot: i32, nul: boolean) {
   return fbValtype(kind, slot)
 }
 
-// The internal failure where `ifExprPlainKind` and `emitIfExpr`'s ladder part ways.
-function ifPlainDisagrees(ifIx: i32) {
-  return emitFailAt(
-    "emitProgram: internal: ifExprPlainKind disagrees with emitIfExpr",
-    ifIx,
-  )
-}
-
-// The blocktype byte `emitIfExpr` gives `ifIx` when it takes the plain scalar path with one
-// value per arm and no `else if`, or -1: no guard call, null, atom, union or ref join, integer
-// switch, static `is` or literal-true condition, prelude, or v128.
-export function ifExprPlainKind(ifIx: i32, fnIx: i32): i32 {
-  if ifExprPlainWhy(ifIx, fnIx) != "" { return -1 }
-  return ifExprValtype(ifIx, fnIx)
-}
-
-// Why the value `if` at `ifIx` is not on the plain scalar path `ifExprPlainKind` names, or "".
+// Why the value `if` at `ifIx` is not on `emitIfExpr`'s plain scalar path with one value per arm
+// and no `else if`, or "": a guard call, a null, atom, union or reference join, an integer switch,
+// a static `is` or literal-true condition, a prelude, or v128.
 export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
@@ -21495,18 +21422,23 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if c is BoolLit { return "constant condition" }
   if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
   if intMatchHeadAt(ifIx) { return "int match" }
-  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) { return "null join" }
-  if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
-    return "atom join"
+  const p = ifJoinPlanOf(ifIx, fnIx)
+  const rung = match p.ijArm {
+    "null" => "null join"
+    "atom" => "atom join"
+    "union" => "union"
+    "ref" => ""
+    "scalar" => ""
   }
+  if rung != "" { return rung }
+  // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = ifRefJoinOf(ifIx, fnIx).rjKind
+  const rk = p.ijRef.rjKind
   if rk != null { return "ref " + rk }
-  const jpin = nodeTyInOf(ifIx, fnIx)
-  if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
+  if ifJoinDropsNulAtom(ifIx, fnIx, "scalar") {
     return "string drops null atom"
   }
-  if ifExprValtype(ifIx, fnIx) == 123 { return "valtype" }
+  if p.ijVt == 123 { return "valtype" }
   return ""
 }
 
@@ -21515,43 +21447,6 @@ function ifArmIsLone(blockIx: i32): boolean {
   if blockIx < 0 || blockIx >= P.nodes.length { return false }
   const b = nodeAt(blockIx)
   return b is Block && b.blkStmts.length == 1 && ifArmValueExpr(blockIx) >= 0
-}
-
-// Whether the `if` join at `ifIx`, typed `string | null` or `K | null`, is delivered into the
-// `K | null` atom niche and every leaf is `null`, a string literal or literal-union typed, so
-// each arm lowers in the atom context, as a return does (D5330).
-function nulStrJoinTakesAtom(ifIx: i32, fnIx: i32): boolean {
-  if !deliveredAsNulAtom(ifIx, fnIx) { return false }
-  if !nodeTyIsNulString(ifIx) && !nodeTyIsNulLitUnion(ifIx) { return false }
-  return ifJoinLeavesAtomic(ifIx, fnIx)
-}
-
-// Whether every arm value along the `if` chain at `ix`, which has an `else`, is `null`, a string
-// literal, or a value of literal-union type.
-function ifJoinLeavesAtomic(ix: i32, fnIx: i32): boolean {
-  if !ifJoinNarrowsPerArm(ix) { return false }
-  const s = nodeAt(ix)
-  if s is IfStmt {
-    if s.ifElse < 0 || !atomicJoinLeaf(ifArmValueExpr(s.ifThen), fnIx) {
-      return false
-    }
-    if nodeAt(s.ifElse) is IfStmt { return ifJoinLeavesAtomic(s.ifElse, fnIx) }
-    return atomicJoinLeaf(ifArmValueExpr(s.ifElse), fnIx)
-  }
-  return false
-}
-
-// Whether arm value `ix` is `null`, a string literal, of literal-union type, or a nullable string
-// typed `K | null`, which converts to the niche; an arm whose value is another `if` is one when
-// that join's leaves are.
-function atomicJoinLeaf(ix: i32, fnIx: i32): boolean {
-  const u = unwrapParen(ix)
-  if u < 0 { return false }
-  if exprIsNullLike(u) || nodeAt(u) is StrLit { return true }
-  if nodeAt(u) is IfStmt { return ifJoinLeavesAtomic(u, fnIx) }
-  return exprIsLitAtom(u, fnIx)
-    || strReppedLitUnionAt(u, fnIx)
-    || nulStrReppedNulLitPlace(u, fnIx)
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -21663,14 +21558,6 @@ function joinCloSigSplitField(ifIx: i32, fnIx: i32): i32 {
   return -1
 }
 
-// Whether join arm `armIx` holds a `K | null` atom at this instance: by its pin, or, for a hole
-// operand whose arm records no pin of its own, by the operand's pinned type.
-function joinArmHoldsNulAtom(armIx: i32, fnIx: i32): boolean {
-  if armIx < 0 { return false }
-  if nulAtomWidenTexts(armIx, fnIx).length > 0 { return true }
-  return tyNulLitUnionMemberTexts(holeOperandTyOf(armIx, fnIx)).length > 0
-}
-
 // Refuses the join at `ifIx` that `strJoinDropsNulAtom` names, anchored at its condition, which
 // an instance shares with the source: a rebuilt `if` has no token of its own.
 function refuseJoinDropsNul(ifIx: i32): i32 {
@@ -21681,32 +21568,6 @@ function refuseJoinDropsNul(ifIx: i32): i32 {
     "emitProgram: a string join whose arm is a nullable literal union was typed non-null here",
     at,
   )
-}
-
-// Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
-// `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
-// as a generic's `??` joined with a nullable pin's other side does (D3290).
-export function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
-  let cur = ifIx
-  let widens = false
-  while cur >= 0 {
-    if ifLinkYieldsNull(cur, fnIx) { return false }
-    const s = nodeAt(unwrapParen(cur))
-    cur = -1
-    if s is IfStmt {
-      if joinArmHoldsNulAtom(ifArmValueExpr(s.ifThen), fnIx) { widens = true }
-      if s.ifElse >= 0 {
-        if nodeAt(s.ifElse) is IfStmt {
-          cur = s.ifElse
-        } else {
-          if joinArmHoldsNulAtom(ifArmValueExpr(s.ifElse), fnIx) {
-            widens = true
-          }
-        }
-      }
-    }
-  }
-  return widens
 }
 
 // One link of `emitIfExprRef`: 0 or -1 as that function returns, or 1 when the else is another `if`
@@ -36138,7 +35999,7 @@ export function wasmEmitStateReset() {
   njRTys = []
   njRUnion = false
   njResBox = false
-  nulAtomTyMemo = Map()
+  nulAtomTyMemoReset()
   saFnIx = 0 - 2
   ssArmBin = -1
   ssArmMode = 0
@@ -36775,17 +36636,6 @@ function emitStrToAtomChain(ix: i32, texts: string[], i: i32, fnIx: i32) {
   return 0
 }
 
-// Whether `ix` is a re-readable place typed `K | null`, for string literals `K`, whose value
-// is held as a nullable string rather than the atom niche.
-function nulStrReppedNulLitPlace(ix: i32, fnIx: i32): boolean {
-  const u = unwrapParen(ix)
-  if u < 0 || !unionEqOperandOk(u) { return false }
-  if nodeAt(u) is StrLit || exprIsLitAtom(u, fnIx) { return false }
-  if !tyIsNullableLitUnion(nodeUnwidenedTyOf(u)) { return false }
-  if exprNulLitUnion(u, fnIx) { return false }
-  return exprNullableString(u, fnIx)
-}
-
 // The `K | null` niche of nullable-string place `ix`: `-1` when it is null, else the id of the
 // member it string-equals, the last member the default.
 function emitNulStrToNulAtom(ix: i32, fnIx: i32) {
@@ -36877,19 +36727,6 @@ function litPushNeedsDestNarrow(valIx: i32, fnIx: i32) {
     if unionEqOperandOk(valIx) { return false }
   }
   return true
-}
-
-// True when `ix` is a literal-union value whose rep is its member string rather than the
-// interned i32 atom — the un-named flattened and inline spellings. Declines an atom-repped
-// expression and a member string literal, both already atoms in atom context; the member
-// set may be a singleton (`tyIsLitUnionOrLit`), same bare `TyLit` a plain literal produces.
-function strReppedLitUnionAt(ix: i32, fnIx: i32) {
-  if exprIsLitAtom(ix, fnIx) { return false }
-  const av = unwrapParen(ix)
-  if av < 0 { return false }
-  const e = nodeAt(av)
-  if e is StrLit { return false }
-  return tyIsLitUnionOrLit(nodeUnwidenedTyOf(av))
 }
 
 // Pushes the interned atom id of statically-known operand `ix` (lexeme `lex`): a literal is its
@@ -37480,30 +37317,6 @@ function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
 // `string | null`'s typed null, else the bottom ref.
 export function emitNullAt(exprIx: i32, fnIx: i32) {
   return emitNullOwn(nullOwnAt(exprIx, fnIx))
-}
-
-// Type -> whether it reps as the `K | null` atom niche, for the program being emitted.
-let nulAtomTyMemo: {[i32]: boolean} = Map()
-
-// Whether type `t` reps as the `K | null` atom niche. Asked of every expression's delivered
-// and contextual types, so the answer is kept per type rather than rebuilt from the rep tree.
-function tyRepsAsNulAtom(t: i32): boolean {
-  const m = nulAtomTyMemo.get(t)
-  if m != null { return m }
-  // A template's own type parameter has no rep, so it is no niche.
-  if t >= 0 && t < T.tys.length && tyAt(t) is TyVar { return false }
-  const d = repOfTy(t)
-  const r = d.rdNul == 3
-  nulAtomTyMemo[t] = r
-  return r
-}
-
-// Whether node `ix` is delivered into the `K | null` atom niche: the type the checker stamped
-// it with where it is delivered reps as that niche.
-function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
-  const st = nodeRepTyAt(unwrapParen(ix), fnIx)
-  if st < 0 { return false }
-  return tyRepsAsNulAtom(st)
 }
 
 // String literal `ix`: delivered to a destination whose type reps as the atom, its interned id;
