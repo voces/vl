@@ -194,6 +194,7 @@ import {
   strFromBytesCallNamed,
   strLitTakesAtom,
   structFieldArmOf,
+  structFieldBoxTy,
   tagArmLambdaCallee,
   tagDispatchArms,
   tagDispatchIds,
@@ -203,6 +204,7 @@ import {
   trapCallNamed,
   valueIfLitTrue,
   variantFieldArmOf,
+  variantFieldBoxTy,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
 import { identUnboxAtomOf, variantCoerceArmOf } from "./emit_plan_union"
@@ -678,7 +680,7 @@ function objLitAt(
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
     if why != "" { return irBMiss(why) }
     const mark = b.length
-    const v = deliver(b, valIx, ks[k], -1)
+    const v = deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi))
     if ibMiss != "" { return v }
     if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
     if oi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
@@ -754,8 +756,12 @@ function fieldPlainWhy(
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
     if !variantArmFits(va, dst) { return "object variant field " + va }
-    // A box into another union's box converts its members on legacy's side (`emitDelivered`).
-    if va == "box" && exprUnion(valIx, ibFnIx) {
+    // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
+    if (
+      va == "box"
+      && exprUnion(valIx, ibFnIx)
+      && boxIntoOtherUnion(valIx, dst, fieldSiteTy(arm, row, fi))
+    ) {
       return "object variant field box from a box"
     }
     return ""
@@ -763,8 +769,12 @@ function fieldPlainWhy(
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
   if !fieldArmDelivers(fa) { return "object field " + fa }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
-  // A box into another union's box converts its members on legacy's side (`emitDelivered`).
-  if fa == "union" && exprUnion(valIx, ibFnIx) {
+  // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
+  if (
+    fa == "union"
+    && exprUnion(valIx, ibFnIx)
+    && boxIntoOtherUnion(valIx, dst, fieldSiteTy(arm, row, fi))
+  ) {
     return "object field box from a box"
   }
   if nulNicheRecoverOwed(sFieldStoreKind(row, fi), valIx, ibFnIx) {
@@ -2631,8 +2641,12 @@ function repTemp(b: i32[], r: Rhs, ix: i32, dst: i32): Opnd {
 function boxIntoOtherUnion(ix: i32, dst: i32, dstTy: i32): boolean {
   if !(repNodeAt(dst) is RBox) && !boxedNullable(dst) { return false }
   if boxOwedAt(ix, ibFnIx) { return false }
-  if dstTy < 0 { return true }
-  return holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
+  return dstTy < 0 || holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
+}
+
+// The union legacy's field writer boxes literal row `row`'s field `fi` at.
+function fieldSiteTy(arm: ObjLitArm, row: i32, fi: i32): i32 {
+  return if arm == "variant" { variantFieldBoxTy(row, fi) } else { structFieldBoxTy(row, fi) }
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
