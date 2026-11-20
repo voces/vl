@@ -1788,6 +1788,59 @@ Deno.test({
   },
 });
 
+// A returned value `if` in a function taking the union return sink builds one return per arm,
+// each arm's box written to the sink pair: an `i32 | string` and an `i32 | boolean` result match.
+const UNION_SINK_RET =
+  `function u2(n: i32): i32 | string {\n  return if n > 0 { n } else { "neg" }\n}\nfunction u4(n: i32): i32 | boolean {\n  return if n > 0 { n } else { false }\n}\nprint(u2(3))\nprint(u4(-3))\n`;
+Deno.test({
+  name: "ir shadow: a returned value if under the union return sink builds per-arm returns and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_RET, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want u2 and u4 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
+// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+const UNION_SINK_ONE_NUMBER =
+  `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
+Deno.test({
+  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// The statement spelling of an else-less chain of returns falls through to the body's own tail.
+const RET_CHAIN_ELSELESS =
+  `function c3(n: i32, a: string): string {\n  if n > 0 { return a } else if n < 0 { return "neg" }\n  return "zero"\n}\nprint(c3(0, "p"))\nprint(c3(-1, "p"))\n`;
+Deno.test({
+  name: "ir shadow: an else-less chain of statement returns builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_CHAIN_ELSELESS, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want c3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A value `if` joined at an atom (a literal union, or one nullable at the `-1` niche) is an `i32`
 // `if`, each arm its atom: a plain, a nullable and an `else if` chain join build and match.
 const ATOM_JOIN =

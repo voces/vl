@@ -159,6 +159,7 @@ import {
   idxStorePlainWhy,
   ifExprJoinVt,
   ifExprPlainWhy,
+  ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -1999,8 +2000,13 @@ export function irBStageLeads(
     const held = a is OVar
       && (ib.irVars[a.ov].vKind == "temp" || valuedIfOut(b, a.ov))
     if !held {
+      const ty = stageTyOf(a, argIxs[j])
+      if ty < 0 {
+        irBMiss("staged literal type")
+        return false
+      }
       const one: i32[] = []
-      const t = irBLetTemp(one, { sgV: a }, argIxs[j], irBOpRep(a))
+      const t = irBLetTempTy(one, { sgV: a }, argIxs[j], irBOpRep(a), ty)
       if ibMiss != "" || one.length != 1 { return false }
       insertAt(b, starts[j], one[0])
       let k = j + 1
@@ -2013,6 +2019,16 @@ export function irBStageLeads(
     j = j + 1
   }
   return true
+}
+
+// The type a staged operand `a` built for node `ix` is held at: its node's, or for a literal its
+// delivery's when it is built at that rep (a literal at an atom parameter is the atom's id); -1
+// for a literal at neither.
+function stageTyOf(a: Opnd, ix: i32): i32 {
+  const own = heldTy(exprTyOf(ix))
+  if !(a is OStr) || repNodeOfTy(own) == irBOpRep(a) { return own }
+  const ctx = heldTy(ctxTyAt(ix, ibFnIx))
+  return if repNodeOfTy(ctx) == irBOpRep(a) { ctx } else { -1 }
 }
 
 // Inserts node `id` into body `b` at position `at`.
@@ -4472,13 +4488,22 @@ function ifChain(b: i32[], ix: i32) {
     const c = if decided { no } else { irBExpr(out, n.ifCond) }
     if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
     const th = nodeAt(n.ifThen)
-    const thenB = if decided { [] } else if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) }
+    const thenB: i32[] = []
+    if ifThenIsDead(n) {
+      // A covering test's dead `then` is uncollected; legacy writes `unreachable` (D16006).
+      irBNode(thenB, { tpWhy: 0 }, -1, ibNoValue, n.ifThen)
+    } else if !decided {
+      for x in if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) } {
+        thenB.push(x)
+      }
+    }
     links.push(cur)
     outs.push(out)
     conds.push(c)
     thens.push(thenB)
-    lastElse = n.ifElse
-    if n.ifElse < 0 || !(nodeAt(n.ifElse) is IfStmt) { break }
+    // A dead `else` (`ifWritesElse`) is uncollected: legacy writes none of it (D16006).
+    lastElse = if ifWritesElse(n) { n.ifElse } else { -1 }
+    if lastElse < 0 || !(nodeAt(lastElse) is IfStmt) { break }
     const nb: i32[] = []
     out = nb
     cur = n.ifElse
@@ -4808,7 +4833,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
 function tailIf(b: i32[], ix: i32) {
   const n = nodeAt(ix)
   if !(n is IfStmt) { return skip("tail if node") }
-  const why = tailIfPlainWhy(ix)
+  const why = tailIfPlainWhy(ix, ibFnIx)
   if why != "" { return skip(why) }
   // A decided `false` `is` writes no then arm (`emitGuardCond`); another constant `is` is one
   // legacy decides off its bytes, so it is a miss.
