@@ -1116,8 +1116,9 @@ Deno.test({
     // (rule 2), and a default that leaves the out unwritten (rule 5). Case 15 is a stashed
     // record whose source order evaluates one field twice (rule 2). Cases 16 to 18 break a fused
     // map read: a probe of an i32, a probe on the pop's arm (rule 2), an unwritten out (rule 5).
-    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2];
+    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2), and case 20
+    // a fused map read's mv slot read into an out that is not its map's value (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
