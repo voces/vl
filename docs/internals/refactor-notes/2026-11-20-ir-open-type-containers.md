@@ -40,15 +40,16 @@ function as its tagged set's `i32` id. The container's rep is therefore closed.
 Compiler lines: +88 −31, 57 net (`emit_classify.vl` +36, `ir_verify.vl` +17, `ir_build.vl` +6,
 `wasmEmit.vl` −2, the refusals folded into one), about 4.7 corpus functions per net line.
 
-## Readings (fixpoint seeds, master `7a7482cef` against this change)
+## Readings (fixpoint seeds, master `e26a31b8d` against this change)
 
 | reading | master | this change |
 | --- | ---: | ---: |
-| corpus functions with no blocker (census) | 38,985 | 39,252 (+267) |
+| corpus functions with no blocker (census) | 39,312 | 39,579 (+267) |
 | `open local type` alone | 256 | 22 |
 | `open temp type` alone | 183 | 40 |
-| `open parameter type` alone | 28 | 1 |
-| corpus covered = verified = matched (shadow) | | 39,252 |
+| `open parameter type` alone | 28 | 0 |
+| corpus covered = verified = matched (shadow) | | 39,579 |
+| L2 self-compile fuel (one box) | 101,350,104,966 | 101,516,254,868 (+0.16%) |
 
 Remaining: `method f + open temp type` 40 (d15113, `{ f: g }.f(true)`), a method call through a
 record field holding a set.
