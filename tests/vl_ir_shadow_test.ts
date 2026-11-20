@@ -2390,12 +2390,36 @@ const ps: P[] = [{ name: "i32", n: 1 }, { name: "str", n: 2 }]
 print(names(ps)[1])
 print(opt(ps[0]).length)
 print(lit()[0])
+// `fromCodePoints(xs)` reads its list twice by name: a global's read is written again, a
+// local's variable read again, as legacy writes both.
+Deno.test({
+  name: "ir shadow: fromCodePoints over a global list re-reads the global and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`let acc: i32[] = []
+let names: string[] = []
+function commit(): i32 {
+  names.push(fromCodePoints(acc))
+  acc = []
+  return 0
+}
+function local(): string {
+  const xs: i32[] = [104, 105]
+  return fromCodePoints(xs)
+}
+acc.push(111)
+acc.push(107)
+commit()
+print(names[0])
+print(local())
 `, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
       throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want both covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
