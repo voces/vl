@@ -941,14 +941,14 @@ would meet the storage-read and staging marks, which a list literal never is.
 |---:|---|---|---|---|
 | 1 | `coerceHeld` | node mark | **dropped when the mark is an ancestor**. On the root it becomes the `held` parameter: the fragment builds `N` without `N`'s own recorded coercion, and asks `atomStrPlanOf(…, held: true)` and `numFloorWhy`'s held floor for the root only | legacy is emitting `N`'s inner value for a conversion it applies after. An ancestor's hold is never read below it. All 86 measured hits are ancestors |
 | 2 | open list-build region | node mark (its counted pushes, `lbPush`) | **dropped unless the fragment contains a counted push** of an open region; a fragment that does misses | the region's state is keyed on its push calls and its deferred length write. `listReserveScan` admits no other use of the list inside the region, so a fragment cannot read the stale length |
-| 3 | `listCastForPush` | mode | the **`strictCast` parameter** of `emitListPayloadCast` (`listPayloadCastTail(wrap, strict)`): legacy passes its flag, and the door passes the parameter | the flag changes the bytes of a narrowed union-list read in a push receiver (a strict `ref.cast`, not the empty-list stand-in). That makes it a plan input, so it must be explicit (#9159) |
+| 3 | `listCastForPush` | mode | **dropped at the door** (#9199). The payload cast takes it as an argument (`listPayloadCastTail(wrap, strict)`), and its three legacy callers pass the live flag | the shared tails a fragment calls (`refListGetTail`, `structUnionBoxTail`, `printUnionTail`) read the flag live, as legacy does, so a fragment inside legacy's push receiver gets legacy's strict cast. The hazard is whole-function IR, whose receiver is read with the flag at rest: `pushRhs` misses `push receiver payload cast` when `recvReadsListPayload` holds (#9159) |
 | 4 | `boxSeat`, `armSeat`, `atomSeat` | node mark | **dropped** | spent or inert by the time any node writer runs (above) |
 | 4 | `armServed` | handshake inside legacy | **dropped** | written by `emitCoerced` after the value and read only by `armClose` against its own node. No fragment reads or writes it |
 | 4 | storage-read mode (`storageReadIx`) | node mark | the **`atStorage` parameter** for a root that is the marked operand: the builder reads it as `storedBoxTest` and `rawBoxVar` already do. Otherwise dropped | the classifiers ask `isStorageRead(ix)` of that node alone |
 | 4 | `isRecvStagedIx`, `listGetIdxStagedIx`, `listGetRecvStagedIx` | staging mark | a **substitution parameter**, node → (legacy slot, non-null): the builder takes that node as a variable on legacy's live slot, as `rawBoxVar` takes a box local | `emitExpr` and `emitListGet*` read the node off the slot. This is the one mark that can sit strictly inside `N`, so it is checked over the subtree, not only at the root |
 | 4 | `listFitStoodIn` | handshake **output** | an **output of the door**: a fragment whose root is a capture stand-in read reports it, and the door writes `listFitStoodIn` as `emitIdentNode` does. As an input it is dropped | the parent's `emitScalarListCopy` consumes it. It is a result of emitting `N`, not a fact about emitting it |
 | 4 | `knownArmDecl` | lexical environment | **dropped at an expression door**. At a statement door it becomes a frame parameter | it is read only by a per-arm `for` walk (`knownArmOf`), and an expression fragment holds no `for` |
-| 4 | `lhOpen` | lexical environment | **dropped at an expression door**, given the failing control below. At a statement door it is the IR frame model of §10.1(a) | the IR lowering reads hoisted headers through the same live rows legacy reads (`liveHoistRow` via `rawStrHoistOf`, `arrLenHoistOf`, `refListHoistOf`), at the same moment. A fragment that opens no loop reads them as legacy does |
+| 4 | `lhOpen` | lexical environment | **dropped at an expression door**, given the failing control below. At a statement door it is the IR frame model of §10.1(a) | the IR lowering reads hoisted headers through the same live rows legacy reads (`liveHoistRow` via `rawStrHoistOf`, `arrLenHoistOf`, `refListHoistOf`), at the same moment. A fragment that opens no loop reads them as legacy does. At a list-literal door the context cannot be live: `hoistSafeExpr` declines a loop body that holds a literal, so the failing control is owed at the first door hoisting admits |
 
 **What cannot become a parameter:**
 - `listFitStoodIn` and `armServed` are results, not inputs. The first becomes a door output; the
@@ -958,13 +958,20 @@ would meet the storage-read and staging marks, which a list literal never is.
   and there they are §10.1(a)'s IR frame model, not a plan input.
 
 **Order of work:**
-1. Narrow `legacyContextLiveWhy` to take the root and test each mark by the rule above, dropping
+1. Done (#9196). `legacyContextLiveWhy` takes the root and tests each mark by the rule above, dropping
    rows 1, 2 and 4 as stated. Over the 118 measured hits (corpus and self-compile) that lifts the
    guard on 115. Of those, 88 already match legacy byte for byte, and 27 miss for reasons of their
-   own.
-2. Thread `strictCast` through `emitListPayloadCast`. That lifts the last 3, which already match.
+   own. An identifier root misses until `listFitStoodIn` becomes a door output.
+2. Done (#9199). Row 3 is dropped as stated, which lifts the last 3.
 3. Add `held`, `atStorage` and the substitution map as door parameters the first time a door meets
    them (an identifier or member door).
+
+**A variable the fragment did not declare** takes its rep from the type, while legacy's slot holds
+the frame's rep (an atom cell, a niche). So every `local` variable of a fragment must agree with
+legacy's declared slot run (`irSlotRunAgrees`, #9202): a scalar rep at the slot's valtype, and no
+reference rep on a scalar run. A disagreement misses as `local cell rep`. The reference half
+accepts any reference run; making it exact (the heap index too) is owed when a door first reads a
+reference-typed local.
 
 Each step carries:
 - a **failing control** per dropped context, shipped as a shadow test: a fragment built under that
