@@ -9,7 +9,7 @@
 # compiler/ adds one row per function (`fnc <name>` claimed, `fnu <name> | <miss>` not); it is
 # built with <seed> in a temp dir, never into build/. A function's name carries its module
 # (`$m<id>`) when it is not the entry's, so std functions count once across files.
-# Writes <out-dir>/<pop>.rows (file, count, row) and <out-dir>/summary.txt. Run from the checkout
+# Writes <out-dir>/<pop>.rows (file, count, row) and <out-dir>/summary.txt (summary.sh). Run from the checkout
 # root; $VL names the host, $JOBS the fan-out (default 4).
 set -euo pipefail
 SEED=${1:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
@@ -58,32 +58,4 @@ for pop in distilled cases probes witnesses; do
 done
 echo 1 > "$OUT/self.programs"
 
-# Per population: programs, functions claimed / total (per file and per distinct function), start
-# bodies claimed, and the first misses ranked by the distinct functions they keep.
-for pop in self distilled cases probes witnesses; do
-  awk -F'\t' -v pop="$pop" -v progs="$(cat "$OUT/$pop.programs")" '
-    function key(f, nm) { return (nm ~ /\$m/) ? nm : f "::" nm }
-    $3 ~ /^fnc / { nm = substr($3, 5); fc++; k = key($1, nm); if (!(k in st)) st[k] = "c"; files[$1] = 1; next }
-    $3 ~ /^fnu / {
-      r = substr($3, 5); i = index(r, " | "); nm = substr(r, 1, i - 1); why = substr(r, i + 3)
-      fu++; mf[why]++; k = key($1, nm); st[k] = "u"; dw[k] = why; files[$1] = 1; next
-    }
-    $3 == "claimed start" { sc += $2; files[$1] = 1; next }
-    $3 ~ /^start uncovered / { su += $2; sm[substr($3, 17)] += $2; files[$1] = 1; next }
-    END {
-      for (k in st) { d++; if (st[k] == "c") dc++; else dm[dw[k]]++ }
-      nf = 0; for (f in files) nf++
-      printf "== %s: %d programs (%d with rows)\n", pop, progs, nf
-      printf "functions per file: %d claimed of %d (%.1f%%)\n", fc, fc + fu, (fc + fu) ? 100 * fc / (fc + fu) : 0
-      printf "distinct functions: %d claimed of %d (%.1f%%)\n", dc, d, d ? 100 * dc / d : 0
-      printf "start bodies: %d claimed of %d\n", sc, sc + su
-      print "first misses (distinct functions kept, then per-file count):"
-      for (w in dm) printf "  %6d %6d  %s\n", dm[w], mf[w], w | "sort -rn | head -25"
-      close("sort -rn | head -25")
-      print "start misses:"
-      for (w in sm) printf "  %6d  %s\n", sm[w], w | "sort -rn | head -10"
-      close("sort -rn | head -10")
-      print ""
-    }' "$OUT/$pop.rows"
-done > "$OUT/summary.txt"
-cat "$OUT/summary.txt"
+scripts/ir-i8-census/summary.sh "$OUT" | tee "$OUT/summary.txt"
