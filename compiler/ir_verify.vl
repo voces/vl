@@ -367,7 +367,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.bnV, at)
       const bn = repNodeAt(opRep(r.bnV))
       const boxed = bn is RBox
-        || r.bnAtom >= 0 && bn is RNullable && bn.rnDisc == 4
+        || bn is RNullable
+        && bn.rnDisc == 4
+        && (r.bnAtom >= 0 || repNodeAt(dst) is RRecord)
       if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
       }
@@ -957,6 +959,34 @@ function endsWriting(body: i32[], out: i32, at: i32) {
 }
 
 // Walks a nested body: the temps it defines are out of scope after it.
+// Why a boxed operand's `??` is ill-formed, or "": it reads a union box, or a nullable boxed as a
+// union is (discipline 4).
+function coalBoxWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if lr is RBox || lr is RNullable && lr.rnDisc == 4 { return "" }
+  return "a boxed `??` reads no box"
+}
+
+// Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
+// at that element's rep.
+function coalPopOrWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RList) { return "a `pop ?? d` pops no list" }
+  const p = repPrim(lr.rlsElem)
+  const scalar = p != null
+    && (p == "i32"
+    || p == "i64"
+    || p == "f64"
+    || p == "f32"
+    || p == "bool")
+  if !scalar { return "a `pop ?? d` pops a list of no scalar element" }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length || vf.irVars[o].vRep != lr.rlsElem {
+    return "a `pop ?? d` yields no element"
+  }
+  return ""
+}
+
 function nested(body: i32[]) {
   const nDefs = vfDefLog.length
   for id in body { stmt(id) }
@@ -1163,14 +1193,14 @@ function stmt(id: i32) {
     SIf => ifSpine(id)
     SCoalBox => {
       use(n.cbL, id)
-      // A union box, or a nullable boxed as a union is (discipline 4).
-      const lr = repNodeAt(opRep(n.cbL))
-      if !(lr is RBox || lr is RNullable && lr.rnDisc == 4) {
-        return fail(2, id, "a boxed `??` reads no box")
-      }
       if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
         return fail(4, id, "a boxed `??` writes no variable")
       }
+      const why = match n.cbArm {
+        "popOr" => coalPopOrWhy(n)
+        "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
+      }
+      if why != "" { return fail(2, id, why) }
       nested(n.cbNull)
       endsWriting(n.cbNull, n.cbOut, id)
     }
