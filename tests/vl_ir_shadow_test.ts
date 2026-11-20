@@ -332,10 +332,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals and closed after its last push: covered and matched. A list literal whose elements box
-// into a union is a ref list legacy coerces: a named miss, never a byte mismatch.
+// locals and closed after its last push. A list literal whose elements each box into its union by
+// their own record (`arrLitUnionBoxSlot`) is built at the box rep. Both are covered and matched.
 Deno.test({
-  name: "ir shadow: a reserved list binding matches, a union-element list literal misses by name",
+  name: "ir shadow: a reserved list binding and a union-element list literal are built and matched",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -347,11 +347,11 @@ function ln(x: i32): (i32 | string)[] { return [x, "s"] }
 print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
-    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
-      throw new Error(`want the reserved binding covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered array ref")) {
+      throw new Error(`want the union-element list built, got ${JSON.stringify([...rows])}`);
     }
-    for (const want of ["uncovered array ref"]) {
-      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 2 || rows.get("matched") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -556,6 +556,63 @@ opt(null)
     const { rows } = run(src, true);
     if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
       throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A `??` over a boxed operand along each arm the IR builds (a binding at a scalar or a box result,
+// a list element, a call at a scalar or a box result) and a nested `??` in a default: each default
+// is built into the null arm, so it runs only there, and every function matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a boxed coalesce on each built arm is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let calls = 0
+function d(): i32 {
+  calls = calls + 1
+  return 7
+}
+function db(): i32 | null {
+  calls = calls + 1
+  return 9
+}
+function mk(n: i32): i32 | null {
+  if n > 0 { return n }
+  return null
+}
+function valScalar(x: i32 | null): i32 { return x ?? d() }
+function valBox(x: i32 | null): i32 | null { return x ?? db() }
+function elem(xs: (i32 | null)[], i: i32): i32 { return xs[i] ?? d() }
+function callScalar(n: i32): i32 { return mk(n) ?? d() }
+function callBox(n: i32): i32 | null { return mk(n) ?? db() }
+function nested(x: i32 | null, y: i32 | null): i32 { return x ?? (y ?? d()) }
+print(valScalar(null) + elem([null], 0) + callScalar(0) + nested(null, null))
+print(valBox(null) ?? 0)
+print(callBox(0) ?? 0)
+print(calls)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    const miss = [...rows.keys()].filter((k) => k.includes("coalesce"));
+    if (miss.length > 0) throw new Error(`want no coalesce miss, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 9) || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A `??` whose left operand an instance closed to a type with no `null` writes the left operand.
+Deno.test({
+  name: "ir shadow: a closed coalesce is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function orD<T>(x: T, d: T): T { return x ?? d }
+print(orD(3, 4))
+`;
+    const { rows } = run(src, true);
+    if ((rows.get("matched") ?? 0) < 1 || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want the instance covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -1224,6 +1281,22 @@ Deno.test({
     }
     if (!rows.has("uncovered declaration if per arm rep")) {
       throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
+// verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a packed list literal's i32 elements verify at its u8 element rep",
+  ignore,
+  fn: () => {
+    const { rows } = run(`const lit: u8[] | i32 = [1, 2, 255]
+if lit is u8[] { print(lit[2]) }
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

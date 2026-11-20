@@ -346,6 +346,7 @@ import {
   mapExactHeldTyOf,
   mapReadScalarBoxKind,
   memReadBoxAmbiguous,
+  unionArmVariantForObj,
 } from "./emit_value_sites"
 import {
   crossTagFitRows,
@@ -1926,16 +1927,17 @@ export function coerceListAtomOf(
   return cak
 }
 
-// How a value is boxed into its recorded box: the null tag (`null`), a box as itself (`pass`), a
-// value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal
-// at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), a record as
-// itself under arm `hbKind`'s tag (`rec`), or the box writer's own ladder (`ladder`).
+// How a value is boxed: the null tag (`null`), a box as itself (`pass`), a value-atom box of kind
+// `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal (`lit`), a `K | null`
+// atom as its member string (`atomStr`), a record under arm `hbKind`'s tag (`rec`), an object
+// literal built as that arm (`obj`), or the box writer's own ladder (`ladder`).
 export type HoleBoxArm = "null"
   | "pass"
   | "atom"
   | "lit"
   | "atomStr"
   | "rec"
+  | "obj"
   | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
@@ -1972,6 +1974,17 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   ) {
     const rv = armValuePlainOf(unionTy, exprIx, fnIx)
     if rv >= 0 { return holeBox("rec", rv, -1) }
+  }
+  // `emitUnionCoerceRecord`'s literal rung: an object literal built as the arm the union's
+  // context picks for it (`emitUnionBoxAs`).
+  // Reached only where `emitUnionArmValueBox` declines: a literal with no variant of its own.
+  if (
+    bare is ObjLit
+    && exprVariantIndex(exprIx, fnIx) < 0
+    && !tyBearsNull(nodeTyAt(bareIx, fnIx))
+  ) {
+    const cv = unionArmVariantForObj(unionTy, bareIx, fnIx)
+    if cv >= 0 && cv < uTags.length { return holeBox("obj", cv, -1) }
   }
   // Every rung below takes a value the record, niche and map rungs above it decline.
   if (
@@ -2811,16 +2824,43 @@ export function narrowedVariantRepIs(vi: i32, rep: i32): boolean {
   return vi >= 0 && vi < uVarTyIx.length && repNodeOfTy(uVarTyIx[vi]) == rep
 }
 
+// How `emitVariantCoerce` delivers `exprIx` to variant `vi`: no expression, a `never` call, a
+// value `if`, an object literal built as the variant, a bare variant passed through, a union box
+// unboxed, or a box whose cross-tag fit owes a refusal; anything else passes through.
+export type VariantCoerceArm = "none"
+  | "never"
+  | "ifValue"
+  | "struct"
+  | "bare"
+  | "box"
+  | "crossTag"
+  | "pass"
+
+export function variantCoerceArmOf(
+  vi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): VariantCoerceArm {
+  const bareIx = unwrapParen(exprIx)
+  if bareIx < 0 || bareIx >= P.nodes.length { return "none" }
+  if callIsNever(bareIx) { return "never" }
+  const bare = nodeAt(bareIx)
+  if bare is IfStmt { return "ifValue" }
+  if bare is ObjLit { return "struct" }
+  if exprVariantIndex(exprIx, fnIx) >= 0 { return "bare" }
+  if !exprUnion(exprIx, fnIx) { return "pass" }
+  return if variantHasCrossTagFits(vi, exprIx, fnIx) { "crossTag" } else { "box" }
+}
+
 // The variant a box local's plain read `ix` unboxes to at a destination of that variant
-// (`emitVariantCoerce`'s box arm), or -1; a cross-tag fit owes a refusal there.
+// (`variantCoerceArmOf`'s `box`), or -1.
 export function narrowedBoxVariantPlain(ix: i32, fnIx: i32): i32 {
   const n = nodeAt(ix)
   if !(n is Ident) || identReadArmOf(n, ix, fnIx, false) != "local" {
     return -1
   }
-  if exprVariantIndex(ix, fnIx) >= 0 || !exprUnion(ix, fnIx) { return -1 }
   const vi = narrowedStructArmVi(ix, fnIx)
-  if vi < 0 || variantHasCrossTagFits(vi, ix, fnIx) { return -1 }
+  if vi < 0 || variantCoerceArmOf(vi, ix, fnIx) != "box" { return -1 }
   return vi
 }
 
