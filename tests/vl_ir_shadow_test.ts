@@ -678,10 +678,10 @@ print(q.length)
 });
 
 // A `.push` of a short-circuit value onto a list held in its own local reads the receiver by index
-// after the value, as legacy does, so it is covered; a staged receiver (a global) is written
-// ahead of the value and stays a named miss.
+// after the value, as legacy does; a staged receiver (a global) is staged by its own
+// `RListStage` ahead of the value. All three are covered.
 Deno.test({
-  name: "ir shadow: a short-circuit push onto a held list is covered, a staged one a miss",
+  name: "ir shadow: a short-circuit push onto a held or a staged list is covered",
   ignore,
   fn: () => {
     const src = `let xs: boolean[] = []
@@ -696,11 +696,8 @@ print(o.length + xs.length)
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
-      throw new Error(`want both held pushes covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered push short-circuit operand") !== 1) {
-      throw new Error(`want the staged push a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want the held and staged pushes covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -928,7 +925,6 @@ print(intr(true, 0.5))
       ["uncovered store short-circuit operand", 2],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["uncovered push short-circuit operand", 1],
       ["start uncovered map store short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
