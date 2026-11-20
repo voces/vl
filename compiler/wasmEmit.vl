@@ -17362,8 +17362,9 @@ function emitStrCatN(n: i32) {
 // counts the `let`s noted against a row; a body holding two clones of one declaration is two.
 let saKeys: i32[] = []
 
-// Whether the last accumulator scan (`strAccScanStart` for the start) marked any binding.
-export function startStrAccMarked(): boolean { return saKeys.length > 0 }
+// Whether the accumulator rows are body `fnIx`'s (-1 the start), so a read of them during that
+// body's emit, as `strInPlaceMode`'s, answers for it without a rescan.
+export function strAccRowsAre(fnIx: i32): boolean { return saFnIx == fnIx }
 let saRowOf: Map<i32, i32> = Map()
 let saDecls: i32[] = []
 let saApps: i32[] = []
@@ -27683,16 +27684,15 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
 }
 
 // Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32,
-// string or scalar-width list whose value builds as itself or widens, with no arm unbox.
+// string, scalar-width or plain reference list whose value builds as itself or widens, with no
+// arm unbox.
 export function idxStorePlainWhy(
   st: IdxStore,
   arrIx: i32,
   rhs: i32,
   fnIx: i32,
 ): string {
-  if st.isRef || st.isU8 || st.nestSlot >= 0 || st.unionNm != "" {
-    return "store element"
-  }
+  if st.isU8 || st.nestSlot >= 0 || st.unionNm != "" { return "store element" }
   if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
     return "store element seed"
   }
@@ -29151,10 +29151,57 @@ function emitListGetOrGo(getIx: i32, defIx: i32, fnIx: i32) {
   return emitFail("emitProgram: expected a list .get call")
 }
 
-// Lower a FUSED `xs.pop() ?? d` over a SCALAR-element list (i32 / boolean, and f64 / i64 / f32)
-// onto `body`: `len != 0` selects the decrement-and-read (the popped element) or the
-// default. The receiver resolves like `emitPop` (bare local, module global, or
-// struct field — the latter two staged into the push frame's `recvRef` scratch).
+// The list a fused `xs.pop() ?? d` reads: its element kind, wrapper and backing heap types, and
+// the scratch base a staged receiver parks in. Null when `popIx` is no zero-argument `.pop` on a
+// collected i32, f64, i64 or f32 list, which `emitPopOr` refuses by name.
+export type PopOrPlan = {
+  poEk: VKind,
+  poWrap: i32,
+  poBack: i32,
+  poBase: i32,
+  poRecv: i32,
+}
+
+export function popOrPlanOf(popIx: i32, fnIx: i32): PopOrPlan | null {
+  const c = nodeAt(popIx)
+  if !(c is Call) || c.callFn < 0 || c.callArgs.length != 0 { return null }
+  const callee = nodeAt(c.callFn)
+  if !(callee is Member) { return null }
+  const ek0 = scalarListElemKind(callee.memObj, fnIx)
+  if ek0 == null || ek0 == "u8list" || !scalarListUsed(ek0) { return null }
+  const row = exprPackedRow(callee.memObj, fnIx)
+  const p: PopOrPlan = {
+    poEk: ek0,
+    poWrap: scalarListWrap(ek0, row),
+    poBack: scalarListBack(ek0, row),
+    poBase: scalarPushScratchBaseOf(ek0, row),
+    poRecv: callee.memObj,
+  }
+  return p
+}
+
+// The head of a fused `pop ?? d` once its receiver is in local `lIdx`: `len != 0` opens an `if`
+// at the element's own rep whose arm decrements `len` and reads the popped element, then the
+// `else` the default fills.
+export function popOrOpen(p: PopOrPlan, lIdx: i32) {
+  pushListLen(lIdx, p.poWrap)
+  fbIfForScalarListElem(p.poEk) // 0x04 if, the element's own result rep
+  fbLocalGet(lIdx)
+  pushListLen(lIdx, p.poWrap)
+  fbI32Const(1)
+  fbI32Bin(107)                 // 0x6b i32.sub
+  fbStructSet(p.poWrap, 1)      // field 1: len
+  pushListBacking(lIdx, p.poWrap)
+  pushListLen(lIdx, p.poWrap)
+  fbArrayGet(p.poBack)          // the popped element
+  fbElse()                      // 0x05 else — empty list → the default
+  return 0
+}
+
+// Lower a FUSED `xs.pop() ?? d` over a SCALAR-element list (i32 / boolean, and f64 / i64 / f32):
+// `len != 0` selects the decrement-and-read (the popped element) or the default. The receiver
+// resolves like `emitPop` (bare local, module global, or struct field — the latter two staged
+// into the push frame's `recvRef` scratch).
 function emitPopOr(popIx: i32, defIx: i32, fnIx: i32) {
   const c = nodeAt(popIx)
   if c is Call {
@@ -29172,34 +29219,17 @@ function emitPopOr(popIx: i32, defIx: i32, fnIx: i32) {
           "emitProgram: fused .pop ?? d receiver is not an i32/f64/i64/f32 list",
         )
       }
-      const ek: VKind = ek0
-      if !scalarListUsed(ek) {
+      if !scalarListUsed(ek0) {
         return emitFail("emitProgram: .pop but list type not collected")
       }
-      const lTy = scalarListWrap(ek, exprPackedRow(callee.memObj, fnIx))
-      const aTy = scalarListBack(ek, exprPackedRow(callee.memObj, fnIx))
-      const base = scalarPushScratchBaseOf(
-        ek,
-        exprPackedRow(callee.memObj, fnIx),
-      )
+      const p = popOrPlanOf(popIx, fnIx)
+      if p == null { return emitFail("emitProgram: expected a list .pop call") }
       // the fused `pop ?? d` is scalar-only; no ref frame to defer
-      const lIdx = listOpRecvLocal(callee.memObj, fnIx, base, -1, ".pop")
+      const lIdx = listOpRecvLocal(callee.memObj, fnIx, p.poBase, -1, ".pop")
       if lIdx < 0 { return -1 }
-      // cond: len != 0 (len is never negative)
-      pushListLen(lIdx, lTy)
-      fbIfForScalarListElem(ek) // 0x04 if, the element's own result rep
-      // L.len = len - 1; backing[L.len]
-      fbLocalGet(lIdx)
-      pushListLen(lIdx, lTy)
-      fbI32Const(1)
-      fbI32Bin(107)       // 0x6b i32.sub
-      fbStructSet(lTy, 1) // field 1: len
-      pushListBacking(lIdx, lTy)
-      pushListLen(lIdx, lTy)
-      fbArrayGet(aTy)     // the popped element
-      fbElse()            // 0x05 else — empty list → the default
-      if emitScalarValue(defIx, fnIx, ek) < 0 { return -1 }
-      fbEnd()             // 0x0b end
+      popOrOpen(p, lIdx)
+      if emitScalarValue(defIx, fnIx, p.poEk) < 0 { return -1 }
+      fbEnd() // 0x0b end
       return 0
     }
   }
