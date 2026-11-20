@@ -1268,3 +1268,21 @@ if lit is u8[] { print(lit[2]) }
     }
   },
 });
+
+// A nullable union (`A | B | null`, discipline 4) is held in the value union's box, so a field
+// read off it once `is A` narrows it is a narrowed box read that builds and matches.
+const NUL_UNION_FIELD =
+  `type A = { kind: "a", x: i32 }\ntype B = { kind: "b", y: i32 }\nfunction r(u: A | B | null): i32 {\n  if u is A { return u.x }\n  return 0\n}\nconst a: A | B | null = { kind: "a", x: 7 }\nconst n: A | B | null = null\nprint(r(a))\nprint(r(n))\n`;
+Deno.test({
+  name: "ir shadow: a narrowed field read off a nullable union's box builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(NUL_UNION_FIELD, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want r covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
