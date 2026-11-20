@@ -966,8 +966,6 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   while true {
     const pw = ifExprPlainWhy(cix, ibFnIx)
     if pw != "" { return irBMiss("expression if " + pw) }
-    // Its value stays on the stack from here, so no temp an operand before it built may wait.
-    if endsInTemp(cb) { return irBMiss("if after an operand") }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
     // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
@@ -1058,7 +1056,6 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
     return irBMiss("ref if drops null atom")
   }
-  if endsInTemp(b) { return irBMiss("if after an operand") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
   if c is OImm && condIsTest(n.ifCond) {
@@ -1494,7 +1491,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr)
       if ibMiss != "" { return missRhs("argument") }
-      if i > 0 && ifBelowLead(b, at, "short-circuit argument after another") {
+      if (
+        i > 0
+        && ifBelowLeadOf(b, at, "short-circuit argument after another", args)
+      ) {
         return missRhs("short-circuit argument after another")
       }
       if irBOpRep(a) != pr { return missRhs("argument coercion") }
@@ -1623,6 +1623,28 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
+// Whether every operand in `os` is a temp, which the lowering writes below a later valued `if`
+// in its order (`stageLead`); a variable or an immediate is written at its reader instead.
+function opndsAreTemps(os: Opnd[]): boolean {
+  for o in os {
+    if !(o is OVar) || o.ov < 0 || o.ov >= ib.irVars.length { return false }
+    if ib.irVars[o.ov].vKind != "temp" { return false }
+  }
+  return true
+}
+
+// `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
+// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss.
+export function ifBelowLeadOf(
+  b: i32[],
+  at: i32,
+  why: string,
+  leads: Opnd[],
+): boolean {
+  if opndsAreTemps(leads) { return false }
+  return ifBelowLead(b, at, why)
+}
+
 // Whether operands built into `b` from `at` on hold a valued `if` below a part their node writes
 // first (a receiver or an earlier operand, read at its use), naming `why` as the miss. Legacy
 // writes such an `if` in place, which the IR's statement-level `if` cannot reorder.
@@ -1686,7 +1708,7 @@ function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
     if ibMiss != "" { return missRhs("argument") }
     if (
       args.length > 0
-      && ifBelowLead(b, at, "short-circuit argument after another")
+      && ifBelowLeadOf(b, at, "short-circuit argument after another", args)
     ) {
       return missRhs("short-circuit argument after another")
     }
@@ -2241,7 +2263,7 @@ function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLead(b, at, "short-circuit right operand") { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
   if (
     !(repNodeAt(irBOpRep(l)) is RList)
     || !(repNodeAt(irBOpRep(r)) is RList)
@@ -2258,7 +2280,7 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLead(b, at, "short-circuit right operand") { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
   // A boxed nullable is held as the box the staged compare reads.
   if !heldAsBox(irBOpRep(l)) || !heldAsBox(irBOpRep(r)) {
     return irBMiss("union compare operand rep")
@@ -2899,7 +2921,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     const at = b.length
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst)
     if ibMiss != "" { return l }
-    if ifBelowLead(b, at, "short-circuit right operand") { return l }
+    if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return l }
     if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
   }
@@ -2998,7 +3020,10 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
     const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
-    if args.length > 0 && ifBelowLead(b, from, "string operand after another") {
+    if (
+      args.length > 0
+      && ifBelowLeadOf(b, from, "string operand after another", args)
+    ) {
       return 0
     }
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
