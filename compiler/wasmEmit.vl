@@ -1794,6 +1794,8 @@ import {
   memRecvOwesNonNull,
   monoStaticIsResult,
   msSetOfUnionBox,
+  arrLitRefSlotAtTy,
+  listLitRefArmSlotOf,
   narrowBoxWideArmOf,
   njDispatches,
   njLitBasesOf,
@@ -7756,82 +7758,18 @@ function emitUnionListLitViaRefArm(
   fnIx: i32,
 ) {
   if unionName == "" { return 0 }
-  const bare = nodeAt(unwrapParen(exprIx))
-  if bare is ArrayLit {
-    // Classify the FIRST element's member ATOM (the arm-choice key; each element still
-    // coerces independently inside the build). An element this static probe cannot name
-    // (a nested list / map) bails to the caller's existing paths.
-    let elemAtom = ""
-    // Hoisted: the empty-`[]` branch below shares the arm-slot resolution at the bottom.
-    let selfArm = false
-    let selfSlot = 0 - 1
-    if bare.arrElems.length >= 1 {
-      const e0 = bare.arrElems[0]
-      // D1016 — a nested list or map element is unnameable by the probe above, and a
-      // self-referential union has exactly the arm that admits it: `Json[]`'s element type is
-      // `Json` itself, so every element is a legal member and the arm's build boxes it as
-      // one, the same recursive step the annotated binding performs. No such arm: bail.
-      if exprArray(e0, fnIx) || exprRefArray(e0, fnIx) || exprMap(e0, fnIx) {
-        selfSlot = unionRefArrayArmSlotForNestedElem(
-          unRowOfTyKey(unionTy),
-          exprMap(e0, fnIx),
-        )
-        if selfSlot < 0 { return 0 }
-        selfArm = true
-      }
-      if selfArm {
-        // the arm is already chosen — the value-atom ladder below must not reclaim it
-      } else if exprString(e0, fnIx) {
-        elemAtom = "string"
-      } else if exprIsBool(e0, fnIx) {
-        elemAtom = "boolean"
-      } else if exprIsF64(e0, fnIx) {
-        elemAtom = "f64"
-      } else if exprIsI64(e0, fnIx) {
-        elemAtom = "i64"
-      } else {
-        const e0b = nodeAt(unwrapParen(e0))
-        if e0b is ObjLit {
-          elemAtom = objVariantName(unwrapParen(e0))
-          if elemAtom == "" { return 0 }
-        } else {
-          elemAtom = "i32" // the ladder's own integer default
-        }
-      }
-      // The union's own value-atom LIST arm is the exact match — let the ladder box it.
-      // Not for the self-referential arm: `Json` names the union, and asking whether it has
-      // a `Json[]` value atom is asking about the arm we just picked.
-      if !selfArm {
-        if unionHasAtomOfTy(unionTy, elemAtom, true) { return 0 }
-      }
-    } else {
-      // An EMPTY `[]`: only route when NO value-atom list arm could claim it.
-      if (
-        unionHasAtomOfTy(unionTy, "i32", true)
-        || unionHasAtomOfTy(unionTy, "boolean", true)
-        || unionHasAtomOfTy(unionTy, "string", true)
-        || unionHasAtomOfTy(unionTy, "f64", true)
-        || unionHasAtomOfTy(unionTy, "i64", true)
-        || unionHasAtomOfTy(unionTy, "f32", true)
-      ) {
-        return 0
-      }
-    }
-    let armSlot = unionRefArrayArmSlotForElem(unRowOfTyKey(unionTy), elemAtom)
-    if selfArm { armSlot = selfSlot }
-    if armSlot < 0 { return 0 }
-    const armTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionTy)
-    if armTag < 0 {
-      return emitFail("emitProgram: boolean list arm has no tag")
-    }
-    fbI32Rel(RS_TAG, armTag)
-    const armBuild: ListBuild = { lbKind: LBK_UNION, lbSlot: armSlot }
-    const rc = emitArrAt(unwrapParen(exprIx), fnIx, armBuild)
-    if rc < 0 { return -1 }
-    fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
-    return 1
+  const armSlot = listLitRefArmSlotOf(unionTy, exprIx, fnIx)
+  if armSlot < 0 { return 0 }
+  const armTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionTy)
+  if armTag < 0 {
+    return emitFail("emitProgram: boolean list arm has no tag")
   }
-  return 0
+  fbI32Rel(RS_TAG, armTag)
+  const armBuild: ListBuild = { lbKind: LBK_UNION, lbSlot: armSlot }
+  const rc = emitArrAt(unwrapParen(exprIx), fnIx, armBuild)
+  if rc < 0 { return -1 }
+  fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+  return 1
 }
 
 // Route an array-literal union carrier into the union's single nested-array arm
@@ -12246,17 +12184,6 @@ function emitArrAt(arrIx: i32, fnIx: i32, lb: ListBuild) {
   elabSpreadNote(arrIx)
   const r = emitArrUnder(arrIx, fnIx, lb)
   return r
-}
-
-// The ref-list row list literal `arrIx` builds at its checker type, -1 where it is no literal
-// or its type names no ref-list row.
-function arrLitRefSlotAtTy(arrIx: i32, fnIx: i32): i32 {
-  if !(nodeAt(arrIx) is ArrayLit) { return -1 }
-  const ty = arrLitTyAt(arrIx, fnIx)
-  const tb = arrLitBuild(arrIx, ty, fnIx)
-  if tb == null { return -1 }
-  if tb.lbKind != LBK_REF && tb.lbKind != LBK_UNION { return -1 }
-  return tb.lbSlot
 }
 
 // The packed `u8[]` arm of `emitArrUnder`: each element as a plain i32 truncated into the
