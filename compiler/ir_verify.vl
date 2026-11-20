@@ -58,6 +58,7 @@ import {
   RRecover,
   RRel,
   RRetag,
+  RStage,
   RStrOp,
   RTagIs,
   RTagOf,
@@ -110,8 +111,7 @@ import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
-import { tyIsFnValue, tyOpenOutsideFns } from "./emit_classify"
-import { i32ListHas } from "./listutil"
+import { tyOpenHeldAsIds } from "./emit_classify"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -659,7 +659,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && dst != vfI32 { return fail(2, at, "a length is an i32") }
       0
     }
-    RMapOp => uses(r.mpArgs, at)
+    RMapOp => {
+      uses(r.mpArgs, at)
+      if r.mpOp == "size" {
+        if r.mpArgs.length != 1 || !(repNodeAt(opRep(r.mpArgs[0])) is RMap) {
+          return fail(2, at, "a map size of no map")
+        }
+        if dst >= 0 && dst != vfI32 {
+          return fail(2, at, "a map size is an i32")
+        }
+      }
+      0
+    }
     RTagStash => {
       use(r.tgsV, at)
       if opRep(r.tgsV) != vfI32 {
@@ -817,6 +828,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && dst != vfI32 {
         return fail(2, at, "a relocated constant is an i32")
+      }
+      0
+    }
+    RStage => {
+      use(r.sgV, at)
+      if r.sgV is OStr || dst >= 0 && dst != opRep(r.sgV) {
+        return fail(2, at, "a staged operand is a value at its own rep")
       }
       0
     }
@@ -1290,7 +1308,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
   }
 }
 
@@ -1301,28 +1319,10 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 // parameter. The builder asks it first, so such a function is uncovered rather than refused.
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 
-// Whether a variable of type `ty` at rep `rep` is open (rule 1): a tagged set's polymorphic
-// function type is not, being held as the set's i32 id whatever its variables, and neither is a
-// container whose only open parts are such functions, at a rep holding no closure.
+// Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
+// a tagged set's function, held at the set's `i32` id, is not (`tyOpenHeldAsIds`).
 export function irTyHeldOpen(ty: i32, rep: i32): boolean {
-  if !irTyOpen(ty) { return false }
-  const p = repPrim(rep)
-  if tyIsFnValue(ty) { return !(p != null && p == "i32") }
-  return tyOpenOutsideFns(ty, []) || repHoldsClosure(rep, [])
-}
-
-// Whether rep `r`, or a rep it holds, is a closure. `path` is the walk's open reps: a revisit is a
-// cycle and adds nothing.
-function repHoldsClosure(r: i32, path: i32[]): boolean {
-  if repNodeAt(r) is RClosure { return true }
-  if i32ListHas(path, r) { return false }
-  path.push(r)
-  let found = false
-  for k in repNodeKids(r) {
-    if !found && repHoldsClosure(k, path) { found = true }
-  }
-  path.pop()
-  return found
+  return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
 }
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
