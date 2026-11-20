@@ -11,7 +11,10 @@ into an exact-fit string.
 - `strFromBytesCallNamed` (wasmEmit.vl) is the routing legacy's `emitCallCore` now dispatches on:
   the spelling, with no binding owning the name. The builder asks it ahead of the numeric
   intrinsics.
-- `strFromBytesTail` is the helper call, which legacy's arm and the IR's both write.
+- `strFromBytesTail` is the helper call, which legacy's arm and the IR's both write. Its
+  `emitFail` is internal, not a refusal: the pre-scan reserves the helper for every call it sees
+  spelled (`gNeedsStrFromBytes`), so an unreserved helper is a pre-scan miss. Master's arm made
+  the same check, before its operands rather than after.
 - The builder builds an `RStrOp` `frombytes` (a new `StrOp` member, lint set updated) over the three
   operands: a `u8` list, then two `i32`s, each refused by name at any other rep. `lowerStr` writes
   the operands, as for every string op, and the arm writes the tail. The verifier holds the operand
