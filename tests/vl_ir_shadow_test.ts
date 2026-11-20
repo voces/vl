@@ -1005,6 +1005,10 @@ Deno.test({
     const covered = rows.get("covered") ?? 0;
     if (covered < 15 || (rows.get("matched") ?? 0) !== covered) {
       throw new Error(`want 15 or more covered, every one matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A list delivery whose copy owes nothing past the value (`listCopyOwesNothing`) is the value as
 // built, so the builder takes it as a plain node: no coercion miss, and every covered function
 // matches legacy's bytes. The program is distilled cell b004880.
