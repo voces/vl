@@ -332,10 +332,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals and closed after its last push: covered and matched. A list literal whose elements box
-// into a union is a ref list legacy coerces: a named miss, never a byte mismatch.
+// locals and closed after its last push. A list literal whose elements each box into its union by
+// their own record (`arrLitUnionBoxSlot`) is built at the box rep. Both are covered and matched.
 Deno.test({
-  name: "ir shadow: a reserved list binding matches, a union-element list literal misses by name",
+  name: "ir shadow: a reserved list binding and a union-element list literal are built and matched",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -347,11 +347,11 @@ function ln(x: i32): (i32 | string)[] { return [x, "s"] }
 print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
-    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
-      throw new Error(`want the reserved binding covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered array ref")) {
+      throw new Error(`want the union-element list built, got ${JSON.stringify([...rows])}`);
     }
-    for (const want of ["uncovered array ref"]) {
-      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 2 || rows.get("matched") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -556,6 +556,22 @@ opt(null)
     const { rows } = run(src, true);
     if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
       throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A `??` whose left operand an instance closed to a type with no `null` writes the left operand.
+Deno.test({
+  name: "ir shadow: a closed coalesce is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function orD<T>(x: T, d: T): T { return x ?? d }
+print(orD(3, 4))
+`;
+    const { rows } = run(src, true);
+    if ((rows.get("matched") ?? 0) < 1 || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want the instance covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
@@ -782,10 +798,10 @@ print(f(false) ?? 5)
   },
 });
 
-// An unannotated parameter's type stays open until a call instances it: the builder leaves that
-// function uncovered rather than handing the verifier an open-typed variable (rule 1).
+// An unannotated parameter's type stays open until a call instances it. One holding a function
+// set's i32 id builds at that rep; the builder never hands the verifier an open-typed variable.
 Deno.test({
-  name: "ir shadow: an open-typed parameter is uncovered, never a verifier failure",
+  name: "ir shadow: an open-typed parameter at a function set's id builds, never a verifier failure",
   ignore,
   fn: () => {
     const src = `function k<T>(x: T): T { return x }
@@ -793,6 +809,7 @@ function fw(f) { return f }
 function main() {
   const o = fw(k)
   print(o(6))
+  print(o("s"))
 }
 main()
 `;
@@ -800,8 +817,9 @@ main()
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    if (!rows.has("uncovered open parameter type")) {
-      throw new Error(`want an "uncovered open parameter type" row, got ${JSON.stringify([...rows])}`);
+    const covered = rows.get("covered") ?? 0;
+    if (rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -912,17 +930,13 @@ print(two("a", "b"))
 });
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
-// `coerceKindAt` converts (a record copy into an `i64` field's row; a list copy that owes
-// nothing is the value). Each program is the smallest the corpus has for its row.
+// bound to a literal delivered to an atom and a delivery `coerceKindAt` converts (a record copy
+// into an `i64` field's row; a list copy that owes nothing is the value). Each program is the
+// smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
-  ],
-  [
-    "tag dispatch",
-    `function inc0(a) { return a + 1 }\nfunction half(a) { return a / 2.0 }\nconst r = { fs: [inc0] }\nconst a = r.fs\nconst v: readonly ((x: i32) => i32 | f64)[] = r.fs\nprint(v[0](3))\n`,
   ],
   [
     "coercion",
@@ -970,6 +984,46 @@ Deno.test({
     const covered = rows.get("covered") ?? 0;
     if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
       throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A call through a function set dispatches on the stashed id (`tagIsTail`) over its arms: several
+// arms at i32, f64, bool and string results, and one arm, whose call legacy never tail-calls.
+const TAG_DISPATCH = `let f = inc0
+f = dbl
+print(w(f, 3))
+print(w(f, 3.5))
+let fi = idg
+fi = kg
+print(w(fi, 2.5))
+print(w(fi, true))
+let fg = idg
+fg = idh
+print(fg(3))
+print(app(fg, "s"))
+function inc0(a) { return a + 1 }
+function dbl(a) { return a * 2 }
+function w(h, x) { return h(x) }
+function idg<T>(t: T): T { return t }
+function kg<T>(t: T): T { return t }
+function idh<T>(t: T): T { return t }
+function app(g, v) { return g(v) }
+`;
+Deno.test({
+  name: "ir shadow: a call through a function set builds as its dispatch and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_DISPATCH, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path tag dispatch")) {
+      throw new Error(`want no tag-dispatch pre-path miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered < 15 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want 15 or more covered, every one matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1153,6 +1207,22 @@ Deno.test({
     }
     if (!rows.has("uncovered declaration if per arm rep")) {
       throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
+// verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a packed list literal's i32 elements verify at its u8 element rep",
+  ignore,
+  fn: () => {
+    const { rows } = run(`const lit: u8[] | i32 = [1, 2, 255]
+if lit is u8[] { print(lit[2]) }
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
