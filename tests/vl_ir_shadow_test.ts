@@ -220,7 +220,7 @@ print(cv(3.0))
 // field's length (B3); a narrowed box read whole at its variant, and a `string | null`
 // parameter read at its string (narrowed read); a value `if` bound and one widened into an
 // `f64` binding (B4a).
-// Each witness is one covered function that must match legacy's bytes.
+// Each witness holds a covered function that must match legacy's bytes, as must a covered helper.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
   `function stop(code: i32): never { return __trap__() }
@@ -309,8 +309,10 @@ Deno.test({
     for (const src of SHARED) {
       const { rc, rows } = run(src, true);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
-        throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
+      // A helper the witness calls may be covered too; every covered function must match.
+      const covered = rows.get("covered") ?? 0;
+      if (covered < 1 || (rows.get("matched") ?? 0) !== covered) {
+        throw new Error(`want the witness covered and matched, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
   },
@@ -615,6 +617,78 @@ print(orD(3, 4))
       throw new Error(`want the instance covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
+// A `.push` onto a packed `u8` list takes its value as a plain i32, which the backing truncates,
+// as a packed list literal's elements do.
+Deno.test({
+  name: "ir shadow: a push of an i32 onto a u8 list is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function put(out: u8[], b: i32) { out.push(b) }
+function put2(out: u8[], b: i32) { out.push(b & 255) }
+const bs: u8[] = []
+put(bs, 300)
+put2(bs, 7)
+print(bs.length)
+print(bs[0])
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 2) || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want both pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A `.push` of a short-circuit value onto a list held in its own local reads the receiver by index
+// after the value, as legacy does, so it is covered; a staged receiver (a global) is written
+// ahead of the value and stays a named miss.
+Deno.test({
+  name: "ir shadow: a short-circuit push onto a held list is covered, a staged one a miss",
+  ignore,
+  fn: () => {
+    const src = `let xs: boolean[] = []
+function a(out: boolean[], p: boolean, q: boolean) { out.push(p && q) }
+function b(out: boolean[], p: boolean, q: boolean, r: boolean) { out.push(p && (q || r)) }
+function c(p: boolean, q: boolean) { xs.push(p && q) }
+const o: boolean[] = []
+a(o, true, false)
+b(o, true, false, true)
+c(true, true)
+print(o.length + xs.length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both held pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered push short-circuit operand") !== 1) {
+      throw new Error(`want the staged push a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A short-circuit arm that reassigns the held receiver: both sides read the local after the value,
+// so the push lands on the list the arm assigned, and the IR matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a held push whose value reassigns the receiver reads it after the value",
+  ignore,
+  fn: () => {
+    const src = `function h(p: boolean): i32 {
+  let xs: boolean[] = []
+  const other: boolean[] = []
+  xs.push(p && (xs = other).length == 0)
+  return xs.length * 10 + other.length
+}
+print(h(true))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -1265,9 +1339,10 @@ Deno.test({
 });
 
 // A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
-// builds and matches, a literal arm included; a nullable union binding is a named miss.
+// builds and matches, a nullable union binding included; one legacy writes through its binding
+// sink (every arm a construction) is a named miss.
 const LET_IF_BOX =
-  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction h(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string = if b { v } else { "x" }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(f(false, 1, "y"))\nprint(h(true, 1))\nprint(g(false, 1))\n`;
+  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nfunction s(b: boolean): boolean {\n  const u: i32 | string = if b { 1 } else { "x" }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(g(false, 1))\nprint(s(true))\n`;
 Deno.test({
   name: "ir shadow: a union binding's if initializer builds into a seeded box and matches legacy",
   ignore,
@@ -1277,10 +1352,10 @@ Deno.test({
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
-      throw new Error(`want f and h covered and matched, got ${JSON.stringify([...rows])}`);
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!rows.has("uncovered declaration if per arm rep")) {
-      throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
+    if (!rows.has("uncovered declaration if per arm sink")) {
+      throw new Error(`want s a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1297,6 +1372,43 @@ if lit is u8[] { print(lit[2]) }
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A nullable union (`A | B | null`, discipline 4) is held in the value union's box, so a field
+// read off it once `is A` narrows it is a narrowed box read that builds and matches.
+const NUL_UNION_FIELD =
+  `type A = { kind: "a", x: i32 }\ntype B = { kind: "b", y: i32 }\nfunction r(u: A | B | null): i32 {\n  if u is A { return u.x }\n  return 0\n}\nconst a: A | B | null = { kind: "a", x: 7 }\nconst n: A | B | null = null\nprint(r(a))\nprint(r(n))\n`;
+Deno.test({
+  name: "ir shadow: a narrowed field read off a nullable union's box builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(NUL_UNION_FIELD, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want r covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A literal-union list's elements are its interned atoms, which the IR delivers itself: the
+// literal takes the short build and its fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal-union list literal builds at the short tail and matches",
+  ignore,
+  fn: () => {
+    const { rows } = run(`function pick(i: i32): string {
+  const xs: ("a" | "b")[] = ["a", "b", "a"]
+  return xs[i]
+}
+print(pick(1))
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
