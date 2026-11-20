@@ -1114,7 +1114,8 @@ Deno.test({
     // case 11 a box whose immediate stands for a call (rule 2).
     // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
     // (rule 2), and a default that leaves the out unwritten (rule 5).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
+    // Case 16 is a shared read over a temp, which its arms would read twice (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 0, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
