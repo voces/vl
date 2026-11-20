@@ -1,7 +1,8 @@
 # IR coverage step: a map store's receiver and key staged below a short-circuit value, 2026-11-20
 
 Lane F2, to IR-REV's design check (part C of the short-circuit operand family). Measured on fixpoint
-seeds of this branch and of its merge base, master `d37f9c1c2`, each building this branch's source.
+seeds of this branch and of its merge base, master `de317fa31`, each building this branch's source. The
+breakdown below was probed on master `d37f9c1c2`.
 
 ## Why this class
 
@@ -36,21 +37,23 @@ this is part A's shape (`irBStageLeads`).
 
 | population | master | this branch |
 | --- | ---: | ---: |
-| self-compile functions covered | 18,890 | 18,905 (+15) |
+| self-compile functions covered | 19,019 | 19,034 (+15) |
+| self-compile functions matched | 19,018 | 19,033 (+15) |
 | corpus functions matched | 41,774 | 41,774 |
 
-Mode 3 byte-identical; identity 9,037 cells identical, 0 differ, self-compile identical; cases 7,533
-identical, 0 differ; witnesses 59 same; cases A/B 7,247 same, 0 differ. Late demands 9 (baseline 9),
-late tag rows 307 (baseline 307), seed +0.4% on baseline.
+The one covered, unmatched function is on master too: `encArms` fails verifier rule 3 (`v12's rep is
+not its type's`) under both seeds. Mode 3 byte-identical; identity 9,037 cells identical, 0 differ,
+self-compile identical; cases 7,540 identical, 0 differ; witnesses 59 same; cases A/B 7,254 same,
+0 differ. Late demands 9 (baseline 9), late tag rows 307 (baseline 307), seed +0.5% on baseline.
 
-L2 fuel: this branch 104,502,957,141 against master's 104,470,857,133, +32M (+0.03%). This branch's
-seed compiling master's source reads 104,461,767,755, 9M under master's own seed.
+L2 fuel: this branch 104,628,335,422 against master's 104,598,529,665, +29.8M (+0.03%). This
+branch's seed compiling master's source reads 104,589,438,131, 9.1M under master's own seed.
 
 Matrix: global, local, parameter and field receivers × `&&`, `||`, `??`, an inner map op of the same
 shape and one of another shape × a variable, a call-result and a literal key, plus a nullable field
-(61 cells). All 61 print the same output under both seeds, and each builds byte-identical under
-claim-all; 0 runs → not-runs, 0 silent, 0 fail rows. 32 cells are newly matched; the `??` cells miss
-as a boxed coalesce and the literal-key cells as `map store short-circuit operand`.
+(61 cells), graded against `de317fa31`. All 61 print the same output under both seeds, and each
+builds byte-identical under claim-all; 0 runs → not-runs, 0 silent, 0 fail rows. 49 cells are
+matched; the 12 `??` cells miss as a boxed coalesce.
 
 Witness: `vl_ir_shadow_test` "a map store of a short-circuit value stages its receiver and key below
 the if".
