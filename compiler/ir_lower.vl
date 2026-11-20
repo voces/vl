@@ -101,6 +101,7 @@ import {
   RGlobalGet,
   RListClear,
   RListCopy,
+  RMemAccess,
   RListEq,
   RListGet,
   RListLen,
@@ -326,6 +327,9 @@ import {
   mapRecvShapeOf,
   mapSetTail,
   mapSizeTail,
+  memAccessPlanOf,
+  memAccessTail,
+  memAddrPlanOf,
   narrowedFieldTail,
   narrowedVariantTail,
   nulTestAtomTail,
@@ -810,6 +814,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapOp => mapOp(r)
     RListNew => listNew(r)
     RListCopy => irLMiss("list copy value")
+    RMemAccess => memAccess(r)
     RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
@@ -1262,6 +1267,24 @@ function listNew(r: RListNew) {
   irLOpnd(r.lnFill)
   arrNewFillStep(-1)
   return arrNewTail(pl, slot)
+}
+
+// `RMemAccess`: legacy's load or store arm in `emitCallCoreMemAccess`'s order: the address the
+// builder took along `memAddrPlanOf`'s arm, a store's value, then the access at the plan's offset.
+function memAccess(r: RMemAccess) {
+  const c = nodeAt(r.mmAt)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length {
+    return irLMiss("memory access node")
+  }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return irLMiss("memory access node") }
+  const p = memAccessPlanOf(f.identName)
+  const ap = memAddrPlanOf(c, p.mxBase, lw.irAt)
+  if p.mxOp < 0 || (ap.maArm != "const" && ap.maArm != "rest") {
+    return irLMiss("memory access plan")
+  }
+  for o in r.mmArgs { irLOpnd(o) }
+  return memAccessTail(p, ap.maOff)
 }
 
 // `RListCopy`: legacy's `__array_copy__` arm in `emitArrayCopyIntr`'s order, each list operand
@@ -2112,6 +2135,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if r is RListCopy {
         listCopy(r)
         irLSettle(pending)
+        return 0
+      }
+      // A store leaves nothing; a discarded load leaves its value, which legacy drops.
+      if r is RMemAccess {
+        memAccess(r)
+        irLSettle(pending)
+        if r.mmArgs.length == 1 { fbDrop() }
         return 0
       }
       if r is RTagStash {
