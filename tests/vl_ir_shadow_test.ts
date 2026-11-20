@@ -758,6 +758,44 @@ print(c([]))
   },
 });
 
+// `l ?? d` over a nullable reference along legacy's `br_on_non_null` block: a record with a name
+// default and with a nullable one, a call default that runs only on `null` (`calls` prints 1), a
+// union arm's variant, and a nullable list: every function covered and matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a nullable reference's coalesce is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type S = { a: i32 }
+type C = { k: "c", r: i32 }
+type Q = { k: "q", s: i32 }
+type U = C | Q
+let calls = 0
+function mk(): S {
+  calls = calls + 1
+  return { a: 9 }
+}
+function s2(x: S | null, d: S): S { return x ?? d }
+function n1(x: S | null, d: S | null): S | null { return x ?? d }
+function e1(x: S | null): S { return x ?? mk() }
+function v1(x: C | null, d: C): C { return x ?? d }
+function l1(xs: i32[] | null, d: i32[]): i32[] { return xs ?? d }
+const u: U = { k: "q", s: 1 }
+const one: S = { a: 1 }
+print(s2(null, one).a + s2({ a: 2 }, one).a)
+print(n1(null, null) == null)
+print(e1({ a: 3 }).a + e1(null).a)
+print(calls)
+print(v1(null, { k: "c", r: 4 }).r)
+print(l1(null, [5, 6]).length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
