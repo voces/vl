@@ -116,7 +116,9 @@ import {
   RRel,
   RRetag,
   RStrOp,
+  RTagIs,
   RTagOf,
+  RTagStash,
   RTest,
   RToBox,
   RUnionEq,
@@ -140,6 +142,7 @@ import {
   SSwitch,
   STrap,
   irFnNew,
+  irNoTailHas,
   irSigOf,
   primOpcode,
   repIsNoValue,
@@ -226,6 +229,7 @@ import {
   emitNullOwn,
   emitNullRetTail,
   emitStrLitAt,
+  emitUnionUnboxTail,
   f64RemCallTail,
   f64RemOperandTail,
   fallThroughPadOf,
@@ -299,6 +303,9 @@ import {
   staticAtomId,
   structFieldTail,
   structUnionBoxTail,
+  tagDispatchIfOf,
+  tagIsTail,
+  tagStashTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionUnionEqTail,
@@ -604,6 +611,11 @@ function rhs(r: Rhs, tail: boolean) {
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
+    }
+    RTagStash => irLMiss("tag stash as a value")
+    RTagIs => {
+      leaf()
+      tagIsTail(r.tgiId)
     }
     RCoalAtomStr => {
       const e = nodeAt(r.zaAt)
@@ -955,6 +967,10 @@ function fieldTail(at: i32, m: Member) {
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
 // `emitVariantCoerce`'s box arm writes a narrowed read at a variant destination.
 function boxNarrow(r: RBoxNarrow) {
+  if r.bnAtom >= 0 {
+    irLOpnd(r.bnV)
+    return emitUnionUnboxTail(r.bnAtom)
+  }
   const vi = narrowedBoxVariantPlain(r.bnAt, lw.irAt)
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
   irLOpnd(r.bnV)
@@ -1598,6 +1614,12 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      if r is RTagStash {
+        irLOpnd(r.tgsV)
+        tagStashTail()
+        irLSettle(pending)
+        return 0
+      }
       irLMiss("effect outside I1")
     }
     SBlock => {
@@ -1751,15 +1773,21 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   const refOut = lw.irHelper && rr is RRaw
   // A reference join takes legacy's blocktype for the `if` at its node (`emitIfExprRef`).
   const at = lw.irNodeAt[id] ?? -1
-  const rj = if vt < 0 && !refOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
+  // A string out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
+  const strOut = repPrim(lw.irVars[t].vRep) == "str"
+    && at >= 0
+    && nodeAt(unwrapParen(at)) is Call
+  const rj = if vt < 0 && !refOut && !strOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
   const rk = rj.rjKind
-  if vt < 0 && !refOut && rk == null {
+  if vt < 0 && !refOut && !strOut && rk == null {
     irLMiss("valued if rep")
     return IF_DONE
   }
   cond(n.siCond, pending)
   if rr is RRaw && refOut {
     fbIfRefNul(rr.rwHeap, rr.rwNull)
+  } else if strOut {
+    if tagDispatchIfOf(lw.irVars[t].vTy) < 0 { irLMiss("valued if rep") }
   } else if rk != null {
     fbOpenIf()
     fbRefIfOpenType(rk, rj.rjSlot, ifLinkYieldsNull(at, lw.irAt))
@@ -1824,7 +1852,7 @@ function ret(n: SReturn, pending: i32[]) {
   const outer = retagOf(n.rtV)
   const inner = if outer >= 0 { retagOperand(outer) } else { n.rtV }
   const callee = callTemp(inner)
-  if callee >= 0 {
+  if callee >= 0 && !(inner is OVar && irNoTailHas(lw, inner.ov)) {
     const t = inner
     if t is OVar {
       if outer >= 0 { takeUse(outer) }
@@ -1949,6 +1977,22 @@ function framedLocals(): u8[] {
   const out: u8[] = []
   fbEmitLocalsVec(out, nLocals)
   return out
+}
+
+// Whether wasm local `slot` of the frame legacy is writing holds rep `rep`: a scalar's valtype, or
+// a reference run for a reference rep. A parameter's slot is the signature's.
+export function irSlotRunAgrees(rep: i32, slot: i32): boolean {
+  const li = slot - fbFrameParams
+  if li < 0 { return true }
+  if li >= localIsRef.length || fbLocalIsUnsetRef(li) { return false }
+  const b: u8[] = []
+  const prev = wTarget(b)
+  fbLocalRun(localIsRef[li], localStructIdx[li])
+  wTarget(prev)
+  if b.length < 2 { return false }
+  const t = valtypeOf(rep)
+  const scalarRun = b[1] == 0x7f || b[1] == 0x7e || b[1] == 0x7d || b[1] == 0x7c
+  return if t >= 0 { b.length == 2 && b[1] == t } else { !scalarRun }
 }
 
 // Whether declared local `li`'s run is scalar rep `rep`'s valtype; a reference rep takes the run
