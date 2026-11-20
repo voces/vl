@@ -2390,6 +2390,16 @@ const ps: P[] = [{ name: "i32", n: 1 }, { name: "str", n: 2 }]
 print(names(ps)[1])
 print(opt(ps[0]).length)
 print(lit()[0])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // `fromCodePoints(xs)` reads its list twice by name: a global's read is written again, a
 // local's variable read again, as legacy writes both.
 Deno.test({
@@ -2416,8 +2426,6 @@ print(local())
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
-      throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
     if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
       throw new Error(`want both covered and matched, got ${JSON.stringify([...rows])}`);
     }
