@@ -855,6 +855,10 @@ print(show(nested(null, null, q)) + show(nested(null, { k: "c", r: 4 }, q)) + sh
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
       throw new Error(`want the four coalescing functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // `n is A` over a local `U | null` box, a valued `if` joining an arm with `null`: the same box
 // legacy tests by its tag, `null` one more tag, read raw past the narrowing. Covered and matched.
 Deno.test({
