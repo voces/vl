@@ -782,10 +782,10 @@ print(f(false) ?? 5)
   },
 });
 
-// An unannotated parameter's type stays open until a call instances it: the builder leaves that
-// function uncovered rather than handing the verifier an open-typed variable (rule 1).
+// An unannotated parameter's type stays open until a call instances it. One holding a function
+// set's i32 id builds at that rep; the builder never hands the verifier an open-typed variable.
 Deno.test({
-  name: "ir shadow: an open-typed parameter is uncovered, never a verifier failure",
+  name: "ir shadow: an open-typed parameter at a function set's id builds, never a verifier failure",
   ignore,
   fn: () => {
     const src = `function k<T>(x: T): T { return x }
@@ -793,6 +793,7 @@ function fw(f) { return f }
 function main() {
   const o = fw(k)
   print(o(6))
+  print(o("s"))
 }
 main()
 `;
@@ -800,8 +801,9 @@ main()
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no verifier failure, got:\n${fails.join("\n")}`);
-    if (!rows.has("uncovered open parameter type")) {
-      throw new Error(`want an "uncovered open parameter type" row, got ${JSON.stringify([...rows])}`);
+    const covered = rows.get("covered") ?? 0;
+    if (rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -912,17 +914,13 @@ print(two("a", "b"))
 });
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
-// bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
-// `coerceKindAt` converts (a record copy into an `i64` field's row; a list copy that owes
-// nothing is the value). Each program is the smallest the corpus has for its row.
+// bound to a literal delivered to an atom and a delivery `coerceKindAt` converts (a record copy
+// into an `i64` field's row; a list copy that owes nothing is the value). Each program is the
+// smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
-  ],
-  [
-    "tag dispatch",
-    `function inc0(a) { return a + 1 }\nfunction half(a) { return a / 2.0 }\nconst r = { fs: [inc0] }\nconst a = r.fs\nconst v: readonly ((x: i32) => i32 | f64)[] = r.fs\nprint(v[0](3))\n`,
   ],
   [
     "coercion",
@@ -970,6 +968,46 @@ Deno.test({
     const covered = rows.get("covered") ?? 0;
     if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
       throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A call through a function set dispatches on the stashed id (`tagIsTail`) over its arms: several
+// arms at i32, f64, bool and string results, and one arm, whose call legacy never tail-calls.
+const TAG_DISPATCH = `let f = inc0
+f = dbl
+print(w(f, 3))
+print(w(f, 3.5))
+let fi = idg
+fi = kg
+print(w(fi, 2.5))
+print(w(fi, true))
+let fg = idg
+fg = idh
+print(fg(3))
+print(app(fg, "s"))
+function inc0(a) { return a + 1 }
+function dbl(a) { return a * 2 }
+function w(h, x) { return h(x) }
+function idg<T>(t: T): T { return t }
+function kg<T>(t: T): T { return t }
+function idh<T>(t: T): T { return t }
+function app(g, v) { return g(v) }
+`;
+Deno.test({
+  name: "ir shadow: a call through a function set builds as its dispatch and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_DISPATCH, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path tag dispatch")) {
+      throw new Error(`want no tag-dispatch pre-path miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered < 15 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want 15 or more covered, every one matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
