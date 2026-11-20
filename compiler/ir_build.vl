@@ -190,6 +190,7 @@ import {
   stmtWritesNothing,
   strAccRowsAre,
   strCatPartsOf,
+  strFromBytesCallNamed,
   strLitTakesAtom,
   structFieldArmOf,
   tagArmLambdaCallee,
@@ -222,7 +223,11 @@ import {
   tagIsArmOf,
   widenPlanOf,
 } from "./emit_plan_union"
-import { arrLitRefShortSlot, arrLitUnionBoxSlot } from "./emit_plan_list"
+import {
+  arrLitBuiltTyOf,
+  arrLitRefShortSlot,
+  arrLitUnionBoxSlot,
+} from "./emit_plan_list"
 import { mvValVariantOf } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
@@ -984,7 +989,11 @@ function heldTy(ty: i32): i32 {
 
 // A fresh temp of `ix`'s type, defined by `rhs`.
 export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
-  const ty = heldTy(exprTyOf(ix))
+  return irBLetTempTy(b, rhs, ix, rep, heldTy(exprTyOf(ix)))
+}
+
+// `irBLetTemp` at type `ty`, where the value is built at another type than its node's.
+function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty: i32): Opnd {
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
@@ -1018,6 +1027,19 @@ export function irBDeclVar(d: i32): i32 {
     irBMiss("local rep " + repWhat(rep))
     return -1
   }
+  if irTyHeldOpen(ty, rep) {
+    irBMiss("open local type")
+    return -1
+  }
+  return declVarAt(d, rep, ty)
+}
+
+// Loop variable `d` read at `ix`: the walk's variable, or in a fragment the element's slot at the
+// read's own rep and type, which `irSlotRunAgrees` then holds to legacy's cell.
+function fragLoopVar(d: i32, ix: i32, rep: i32): i32 {
+  const known = ibDeclVar[d] ?? -1
+  if known >= 0 { return known }
+  const ty = heldTy(exprTyOf(ix))
   if irTyHeldOpen(ty, rep) {
     irBMiss("open local type")
     return -1
@@ -1445,10 +1467,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
   const w = localIndexOf(ibFnIx, ix)
-  const walkVar = dn is LoopVar && (ibDeclVar[d] ?? -1) >= 0
+  // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
+  // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
+  const walkVar = dn is LoopVar && ((ibDeclVar[d] ?? -1) >= 0 || ib.irFragment)
   if (dn is LetDecl || dn is Param || walkVar) && w >= 0 {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
-    const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+    const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
     if ib.irVars[v].vRep != rep { return narrowedLocalRead(b, n, ix, v, rep) }
     ib.irReadVar[ix] = v
@@ -1623,6 +1647,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if cf is Member { return methodRhs(b, c, cf, ix) }
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
+  if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
+    return strFromBytesRhs(b, c, ix)
+  }
   if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
     if cf.identName == "fromCodePoint" || cf.identName == "fromCodePoints" {
       return fromCpRhs(b, c, cf, ix)
@@ -1953,6 +1980,31 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const op: StrOp = if many { "fromcps" } else { "fromcp" }
   const r: Rhs = { soOp: op, soArgs: [a], soAt: ix }
+  return r
+}
+
+// `__str_from_bytes__(src, at, count)` as legacy's arm writes it: the three operands as they stand
+// (a byte list, then two i32s), then the helper call (`strFromBytesTail`).
+function strFromBytesRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callArgs.length != 3 { return missRhs("byte string arguments") }
+  const at = b.length
+  const args: Opnd[] = []
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("byte string operand") }
+  if ifBelowLead(b, at, "byte string short-circuit operand") {
+    return missRhs("byte string short-circuit operand")
+  }
+  const sl = repNodeAt(irBOpRep(args[0]))
+  if !(sl is RList) || repPrim(sl.rlsElem) != "u8" {
+    return missRhs("byte string source rep")
+  }
+  if (
+    repPrim(irBOpRep(args[1])) != "i32"
+    || repPrim(irBOpRep(args[2])) != "i32"
+  ) {
+    return missRhs("byte string operand coercion")
+  }
+  const r: Rhs = { soOp: "frombytes", soArgs: args, soAt: ix }
   return r
 }
 
@@ -2819,7 +2871,12 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   }
   const sw = if arm == "ref" { "" } else { arrLitShortWhy(ix, ibFnIx, arm, n.arrElems.length) }
   if sw != "" { return irBMiss("array " + sw) }
-  const ln = repNodeAt(rep)
+  // Typed at the type legacy's build decision takes (`arrLitBuiltTyOf`): an instance's `[1.5]` at
+  // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp.
+  const bt = arrLitBuiltTyOf(ix, ibFnIx)
+  const atBt = bt >= 0 && repNodeAt(repNodeOfTy(bt)) is RList
+  const lrep = if atBt { repNodeOfTy(bt) } else { rep }
+  const ln = repNodeAt(lrep)
   if !(ln is RList) { return irBMiss("array rep") }
   // A union-box slot's elements are boxes: a list the instance reps at its bound member is not one.
   if (
@@ -2839,7 +2896,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     elems.push(v)
   }
   const r: Rhs = { mlElems: elems, mlAt: ix }
-  return irBLetTemp(b, r, ix, rep)
+  if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
+  return irBLetTemp(b, r, ix, lrep)
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
@@ -4423,6 +4481,7 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
     ibReset(fnIx, fn.fnName, fnPos)
     buildParams(fn, fnIx, false)
   }
+  ib.irFragment = true
   ibNoValue = repNodeOfTy(TY_NEVER)
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
