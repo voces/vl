@@ -2360,3 +2360,21 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// A null test over a `U | null` union box (a call's result and a local, `==` and `!=`) reads its
+// null tag; over a scalar map read (a global and a local map) it is the has probe.
+const NULL_TEST_BOX_MAP =
+  `type A = { a: i32 }\ntype B = { b: string }\nfunction pick(k: i32): A | B | null {\n  return if k == 1 { { a: 1 } } else if k == 2 { { b: "x" } } else { null }\n}\nfunction isNul(k: i32) { return if pick(k) == null { 1 } else { 0 } }\nfunction notNul(k: i32) {\n  const u = pick(k)\n  return if u != null { 1 } else { 0 }\n}\nconst m: {[string]: i32} = Map()\nm["here"] = 4\nfunction miss(k: string) { return if m[k] == null { 1 } else { 0 } }\nfunction hit(k: string) {\n  const l: {[string]: i32} = Map()\n  l["here"] = 5\n  return if l[k] != null { 1 } else { 0 }\n}\nprint(isNul(3) + notNul(2) + miss("gone") + hit("here"))\n`;
+Deno.test({
+  name: "ir shadow: a null test of a union box or a scalar map read is covered and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(NULL_TEST_BOX_MAP, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
