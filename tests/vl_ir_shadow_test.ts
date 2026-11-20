@@ -678,10 +678,10 @@ print(q.length)
 });
 
 // A `.push` of a short-circuit value onto a list held in its own local reads the receiver by index
-// after the value, as legacy does, so it is covered; a staged receiver (a global) is written
-// ahead of the value and stays a named miss.
+// after the value, as legacy does; a staged receiver (a global) is staged by its own
+// `RListStage` ahead of the value. All three are covered.
 Deno.test({
-  name: "ir shadow: a short-circuit push onto a held list is covered, a staged one a miss",
+  name: "ir shadow: a short-circuit push onto a held or a staged list is covered",
   ignore,
   fn: () => {
     const src = `let xs: boolean[] = []
@@ -696,11 +696,8 @@ print(o.length + xs.length)
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
-      throw new Error(`want both held pushes covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered push short-circuit operand") !== 1) {
-      throw new Error(`want the staged push a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want the held and staged pushes covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1016,7 +1013,8 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
 // in that later operand; one in the first operand written stays covered, and an intrinsic's
-// earlier argument is staged below the `if` (`intr`).
+// earlier argument, or an element store's receiver and index, is staged below the `if` (`intr`,
+// `st`), so only `stIx`'s `if` in the index is a store miss.
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -1050,10 +1048,9 @@ print(intr(true, 0.5))
 `;
     const { rows } = run(src, true);
     const want: [string, number][] = [
-      ["uncovered store short-circuit operand", 2],
+      ["uncovered store short-circuit operand", 1],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["uncovered push short-circuit operand", 1],
       ["start uncovered map store short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
@@ -1754,6 +1751,42 @@ Deno.test({
   },
 });
 
+// An else-less tail `if` writes no `else`, its fall-through padded by the caller: a returned
+// `if` with no `else` and a chain ending in one, each at a nullable result, build and match.
+const ELSE_LESS_TAIL_IF =
+  `type P = { v: i32 }\nfunction f(c: boolean, p: P): P | null {\n  return if c { p }\n}\nfunction g(n: i32): string | null {\n  return if n > 0 { "pos" } else if n < 0 { "neg" }\n}\nconst p: P = { v: 4 }\nconst a = f(true, p)\nif a != null { print(a.v) }\nprint(g(0) ?? "z")\n`;
+Deno.test({
+  name: "ir shadow: an else-less tail if writes no else and its caller pads the fall-through",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ELSE_LESS_TAIL_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A reference join's `else if` chain is built link by link into each link's `else`, at the head's
+// rep: a string chain and a list chain build and match legacy.
+const REF_IF_CHAIN =
+  `function s3(n: i32, a: string): string {\n  const r = if n > 0 { a } else if n < 0 { "neg" } else { "zero" }\n  return r\n}\nfunction l3(n: i32, xs: i32[]): i32[] {\n  const r = if n > 1 { xs } else if n == 1 { [1] } else { [] }\n  return r\n}\nprint(s3(-1, "pos"))\nprint(l3(1, []).length)\n`;
+Deno.test({
+  name: "ir shadow: a reference join's else-if chain builds link by link and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF_CHAIN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want s3 and l3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
@@ -1833,6 +1866,61 @@ print(f([1, 2], [3]) + g([4]))
     }
     if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
       throw new Error(`want g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A push whose value is a short-circuit (a valued `if`): legacy stages a non-local receiver, then
+// writes the value. A global, a field and an index receiver, at statement and value position, are
+// staged by their own `RListStage` ahead of the `if`, covered and matched. A push whose value
+// pushes (D1280's late receiver) and one in a later call argument stay legacy's, by name.
+Deno.test({
+  name: "ir shadow: a push of a short-circuit value stages its receiver ahead of the if",
+  ignore,
+  fn: () => {
+    const src = `type Box = { bs: boolean[] }
+let gb: boolean[] = []
+let gn: i32[] = []
+let gm: i32[] = []
+function two(a: i32, b: i32): i32 { return a * 10 + b }
+function glob(a: boolean, c: boolean) {
+  gb.push(a && c)
+}
+function field(x: Box, a: boolean, c: boolean) {
+  x.bs.push(c || a)
+}
+function index(rs: boolean[][], a: boolean, c: boolean): i32 {
+  return rs[0].push(a && c)
+}
+function nest() {
+  gn.push(gm.push(4))
+}
+function arg(a: boolean, c: boolean) {
+  print(two(7, gb.push(a || c)))
+}
+const x: Box = { bs: [] }
+const rs: boolean[][] = [[]]
+glob(true, false)
+field(x, false, true)
+print(index(rs, true, true))
+nest()
+arg(false, false)
+print(gb[0])
+print(x.bs[0])
+print(gn[0])
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+      throw new Error(`want two, glob, field, index covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (
+      rows.get("uncovered push late receiver") !== 1 ||
+      rows.get("uncovered short-circuit argument after another") !== 1
+    ) {
+      throw new Error(`want nest and arg left to legacy by name, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2033,6 +2121,77 @@ print(nullable(null))
   },
 });
 
+// `__array_copy__` is written as legacy's arm writes it: each list operand followed by its backing,
+// then the copy. An i32, a string, an f64 and a record list each match byte for byte.
+Deno.test({
+  name: "ir shadow: an __array_copy__ statement matches over each list kind",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function grow(xs: i32[], n: i32): i32[] {
+  const out: i32[] = __array_new__(n, 0)
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+function tail(xs: string[], from: i32): string[] {
+  const out: string[] = __array_new__(xs.length - from, "")
+  __array_copy__(out, 0, xs, from, xs.length - from)
+  return out
+}
+function fl(xs: f64[]): f64[] {
+  const out: f64[] = __array_new__(xs.length * 2, 0.0)
+  __array_copy__(out, xs.length, xs, 0, xs.length)
+  return out
+}
+type P = { x: i32 }
+function rs(xs: P[]): P[] {
+  const out: P[] = __array_new__(xs.length, { x: 0 })
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+print(grow([1, 2, 3], 5)[2] + rs([{ x: 4 }, { x: 5 }])[1].x)
+print(tail(["a", "b", "c"], 1)[1])
+print(fl([1.5, 2.5])[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `__array_copy__`'s operands are each written in place at its use, between the backing reads:
+// computed offsets and counts, a call as the count and a call as the source list all match.
+Deno.test({
+  name: "ir shadow: an __array_copy__ over computed and called operands matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function cnt(n: i32): i32 { return n - 1 }
+function pick(xs: i32[]): i32[] { return xs }
+function comp(d: i32[], s: i32[], i: i32, j: i32, n: i32) { __array_copy__(d, i + 1, s, j * 2, n - 1) }
+function callCount(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, s, 0, cnt(n)) }
+function callSrc(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, pick(s), 0, n) }
+function mixed(d: i32[], s: i32[], i: i32, n: i32) {
+  __array_copy__(d, i + i * 2, pick(s), cnt(i) + 1, cnt(n))
+}
+const d: i32[] = __array_new__(8, 0)
+const s = [1, 2, 3, 4, 5, 6]
+comp(d, s, 0, 1, 3)
+callCount(d, s, 3)
+callSrc(d, s, 2)
+mixed(d, s, 1, 3)
+print(d[0] + d[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A valued `match` lowers to an if chain whose later links the checker never types: every link
 // takes the head's rep, as legacy writes every link at the head's kind, and a lowered `is` or
 // wildcard test is boolean. A literal-union chain, a type-pattern chain, a wildcard arm and two
@@ -2097,4 +2256,3 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
-
