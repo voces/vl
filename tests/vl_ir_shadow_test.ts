@@ -2360,3 +2360,22 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// A value `if` joined at a record or a map reference takes legacy's reference join, its blocktype
+// from `ifRefJoinOf`: a returned pick, an `else if` chain, a record-literal join, a nullable
+// record join and a map join all cover and match.
+const REF_IF_RECORD_MAP =
+  `type P = { x: i32, y: i32 }\nfunction pick(k: boolean, a: P, b: P): P { return if k { a } else { b } }\nfunction chain(k: i32, a: P, b: P, c: P): P { return if k == 0 { a } else if k == 1 { b } else { c } }\nfunction mkp(k: boolean): P {\n  const p = if k { { x: 1, y: 2 } } else { { x: 3, y: 4 } }\n  return p\n}\nfunction mp(k: boolean, a: Map<string, i32>, b: Map<string, i32>): Map<string, i32> {\n  return if k { a } else { b }\n}\nfunction np(k: boolean, a: P): P | null { return if k { a } else { null } }\nconst a: P = { x: 1, y: 2 }\nconst b: P = { x: 5, y: 6 }\nprint(pick(false, a, b).x)\nprint(chain(2, a, b, a).y)\nprint(mkp(false).y)\nconst m1: Map<string, i32> = Map()\nm1["q"] = 4\nprint(mp(true, m1, m1)["q"] ?? 0)\nprint(np(true, a)?.x ?? 0)\n`;
+Deno.test({
+  name: "ir shadow: a value if joined at a record or map reference builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF_RECORD_MAP, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
