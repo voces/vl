@@ -28,8 +28,8 @@
 Of the 29 functions blocked by `index none` alone, 25 are now built by the IR. The self-compile's
 remaining bare-read blocker is `map get rep` in 2 functions. Both are mv slots whose list value's
 nullable inner rep is not the stored value rep, so the read would owe a conversion legacy does not
-write. The other 2 of the 29 now stop at a blocker that is not a map read (`for in map receiver`
-rose 19 → 20).
+write. The rest now stop at blockers that are not a bare map read; one is `for in map receiver`
+(19 → 20).
 
 ## Measured on fixpoint seeds: merge-base `ea0a93deb` (#9267) against this branch
 
