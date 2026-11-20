@@ -946,10 +946,10 @@ run(2.5)
 });
 
 // A record literal on legacy's layout path builds field by field and matches, a widened `f64`
-// field included; a box handed to another union's box field (legacy converts its members) stays a
+// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) stays a
 // named miss.
 Deno.test({
-  name: "ir shadow: a record literal builds, a widened field too; a box from a box is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union is a named miss",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
@@ -970,8 +970,8 @@ if d.v is f64 { print(d.v) }
     if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
       throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (rows.get("uncovered object field box from a box") !== 1) {
-      throw new Error(`want mkd a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered pre-path coercion") !== 1) {
+      throw new Error(`want mkd's i32-to-f64 retag a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
