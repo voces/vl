@@ -1805,6 +1805,24 @@ Deno.test({
   },
 });
 
+// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
+// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+const UNION_SINK_ONE_NUMBER =
+  `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
+Deno.test({
+  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The statement spelling of an else-less chain of returns falls through to the body's own tail.
 const RET_CHAIN_ELSELESS =
   `function c3(n: i32, a: string): string {\n  if n > 0 { return a } else if n < 0 { return "neg" }\n  return "zero"\n}\nprint(c3(0, "p"))\nprint(c3(-1, "p"))\n`;
