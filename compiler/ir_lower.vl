@@ -1360,15 +1360,16 @@ function mapGetOr(r: RMapGetOr) {
     return irLMiss("map read of a global not read plainly")
   }
   if r.mgForm > 0 {
-    const sh = mapRecvShapeOf(rd.idxArr, fnIx)
-    mapRecvRead(r.mgSym, r.mgNonNull, r.mgLoc)
-    mapRecvRefTail(rd.idxArr, fnIx)
-    irLOpnd(r.mgKey)
-    mapRecvKeyTail(sh)
-    mapPrepProbeTail()
-    if r.mgForm == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+    const sh = mapGetOrInlineHead(
+      rd.idxArr,
+      r.mgForm,
+      r.mgSym,
+      r.mgNonNull,
+      r.mgLoc,
+      r.mgKey,
+    )
     irLOpnd(r.mgDef)
-    return if r.mgForm == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+    return mapGetOrInlineTail(r.mgForm, sh)
   }
   const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
@@ -1377,6 +1378,84 @@ function mapGetOr(r: RMapGetOr) {
   irLOpnd(r.mgKey)
   mapRecvKeyTail(mapRecvShapeOf(rd.idxArr, fnIx))
   fbCall(fi)
+  return 0
+}
+
+// A map read's probe: global `sym` or receiver `loc`, its ref tail, key `key`, and the probe that
+// leaves the entry, as `emitMapPrep` writes them. Returns the receiver's shape.
+function mapProbeHead(
+  recvIx: i32,
+  sym: i32,
+  nonNull: boolean,
+  loc: Opnd,
+  key: Opnd,
+): i32 {
+  const fnIx = lw.irAt
+  const sh = mapRecvShapeOf(recvIx, fnIx)
+  mapRecvRead(sym, nonNull, loc)
+  mapRecvRefTail(recvIx, fnIx)
+  irLOpnd(key)
+  mapRecvKeyTail(sh)
+  mapPrepProbeTail()
+  return sh
+}
+
+// An inline `??` map read's head, up to the miss arm's `else`: the probe, then the `i32` read's
+// or mv slot read's open by `form`. Returns the receiver's shape for the tail.
+function mapGetOrInlineHead(
+  recvIx: i32,
+  form: i32,
+  sym: i32,
+  nonNull: boolean,
+  loc: Opnd,
+  key: Opnd,
+): i32 {
+  const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
+  if form == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+  return sh
+}
+
+// An inline map read's tail after its default, by `form`.
+function mapGetOrInlineTail(form: i32, sh: i32) {
+  return if form == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+}
+
+// The fused map read whose default computes: the route `mapGetOr` checks, the shared head, the
+// default body writing the slotless out in the miss arm, and the tail.
+function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const mp = n.cbMap
+  if mp == null { return irLMiss("map read probe") }
+  const fnIx = lw.irAt
+  const lhsIx = unwrapParen(e.binLeft)
+  const rd = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
+  if !(rd is Index) { return irLMiss("map read node") }
+  const rk = coalResultKindOf(n.cbAt, fnIx)
+  const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
+  const want = if mp.prForm == 1 { "i32" } else if mp.prForm == 2 { "mv" } else { "helper" }
+  if (
+    arm != want
+    || want == "helper"
+    || mp.prForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+  ) {
+    return irLMiss("map read route")
+  }
+  if mp.prSym >= 0 && userGlobalReadClass(mp.prSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map read of a global not read plainly")
+  }
+  lwSeq = []
+  const sh = mapGetOrInlineHead(
+    rd.idxArr,
+    mp.prForm,
+    mp.prSym,
+    mp.prNonNull,
+    n.cbL,
+    mp.prKey,
+  )
+  irLSettle(pending)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  mapGetOrInlineTail(mp.prForm, sh)
   return 0
 }
 
@@ -2106,7 +2185,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba == null { coalPopOr(n, e, pending) } else { coalBoxArm(n, ba, e, pending) }
+  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else if n.cbArm == "mapIndexGetOr" { coalMapGetOr(n, e, pending) } else { coalPopOr(n, e, pending) }
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
