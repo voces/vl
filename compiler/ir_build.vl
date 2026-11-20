@@ -1484,17 +1484,16 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     if callee.fnParams.length != c.callArgs.length {
       return missRhs("argument count")
     }
+    const starts: i32[] = []
     let i = 0
     while i < c.callArgs.length {
       const at = b.length
+      starts.push(at)
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr)
       if ibMiss != "" { return missRhs("argument") }
-      if (
-        i > 0
-        && ifBelowLeadOf(b, at, "short-circuit argument after another", args)
-      ) {
+      if i > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
       if irBOpRep(a) != pr { return missRhs("argument coercion") }
@@ -1633,6 +1632,73 @@ function opndsAreTemps(os: Opnd[]): boolean {
   return true
 }
 
+// For an argument built into `b` from `at` on that holds a valued `if`: makes each earlier
+// argument in `args` that is a variable or immediate a staged temp where it was read (`starts`),
+// so the lowering writes them all below the `if` in order. False when one cannot be.
+function stageLeadArgs(
+  b: i32[],
+  at: i32,
+  starts: i32[],
+  args: Opnd[],
+  argIxs: i32[],
+): boolean {
+  if !valuedIfFrom(b, at) || opndsAreTemps(args) { return true }
+  let j = 0
+  while j < args.length {
+    const a = args[j]
+    if a is OStr { return false }
+    // A valued `if`'s out is already on the stack where it was written, in its order.
+    const held = a is OVar
+      && (ib.irVars[a.ov].vKind == "temp" || valuedIfOut(b, a.ov))
+    if !held {
+      const one: i32[] = []
+      const t = irBLetTemp(one, { sgV: a }, argIxs[j], irBOpRep(a))
+      if ibMiss != "" || one.length != 1 { return false }
+      insertAt(b, starts[j], one[0])
+      let k = j + 1
+      while k < starts.length {
+        starts[k] = starts[k] + 1
+        k = k + 1
+      }
+      args[j] = t
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Inserts node `id` into body `b` at position `at`.
+function insertAt(b: i32[], at: i32, id: i32) {
+  b.push(id)
+  let i = b.length - 1
+  while i > at {
+    b[i] = b[i - 1]
+    i = i - 1
+  }
+  b[at] = id
+  return 0
+}
+
+// Whether variable `v` is the out of a valued `if` in body `b`.
+function valuedIfOut(b: i32[], v: i32): boolean {
+  for id in b {
+    const n = ib.irNodes[id]
+    if n is SIf && n.siOut == v { return true }
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on hold a valued `if`.
+function valuedIfFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SIf && n.siOut >= 0 { return true }
+    i = i + 1
+  }
+  return false
+}
+
 // `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
 // temps the lowering stages below the `if` (`opndsAreTemps`): then no miss.
 export function ifBelowLeadOf(
@@ -1702,14 +1768,13 @@ function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const want = numKindPrim(pl.niKind)
   const args: Opnd[] = []
+  const starts: i32[] = []
   for a in c.callArgs {
     const at = b.length
+    starts.push(at)
     const v = irBExpr(b, a)
     if ibMiss != "" { return missRhs("argument") }
-    if (
-      args.length > 0
-      && ifBelowLeadOf(b, at, "short-circuit argument after another", args)
-    ) {
+    if args.length > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
       return missRhs("short-circuit argument after another")
     }
     const p = repPrim(irBOpRep(v))
