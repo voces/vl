@@ -35,10 +35,13 @@ an i32-typed `if` whose arms take the atom destination, so each literal is its i
   names, requires `atomHookIfJoin(…, true)` and opens at blocktype 127, the type the hook passes.
   Otherwise it misses `atom if join raw read`.
 
-**`rawReadNode` at these sites.** `emitExprRaw` sets it only around a raw read: a compare,
-`print` or `as` reading a literal-union place as its string. None of those is a delivery into an
-atom, so it is -1 wherever the builder takes this arm. The re-ask keeps a door fragment honest
-if one is ever entered under a raw read.
+**`rawReadNode` at these sites.** `emitExprRaw` sets it to one node while that node is read as
+the string it is stored as. Its callers are a condition (`emitCondExpr`), `as` to a literal union
+(`emitAsBoxToLitUnion`), the string-to-atom writers (`emitStrToAtom`, its chain,
+`emitDestStrToAtom`) and `emitStaticLitAtom`. The hook compares only that node. A builder delivery
+of the same node never runs inside such a read, so the pure half and the live one agree wherever
+the builder takes this arm. The lowering's re-ask covers a door fragment rooted at a node a raw
+read is in progress for: there the live answer is false, and the fragment misses.
 
 ## Grading
 
