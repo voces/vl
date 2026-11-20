@@ -2431,3 +2431,30 @@ print(local())
     }
   },
 });
+
+// `__array_new_default__(n)` builds its length, then legacy's zeroed allocation at the list's
+// pair, for an i32, f64 and byte list alike.
+Deno.test({
+  name: "ir shadow: __array_new_default__ is covered and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function zeros(n: i32): i32[] { return __array_new_default__(n) }
+function fzeros(n: i32): f64[] { return __array_new_default__(n) }
+function bytes(n: i32): u8[] { return __array_new_default__(n) }
+function strs(n: i32): string[] {
+  const out: string[] = __array_new__(n, "")
+  return out
+}
+print(zeros(3).length)
+print(fzeros(2)[1])
+print(bytes(4).length)
+print(strs(2).length)
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
