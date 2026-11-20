@@ -12231,37 +12231,6 @@ export function arrLitPackedShortTail(row: i32, n: i32): i32 {
   return arrLitLenCap(n, pkWrapAt(row))
 }
 
-// The f32-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
-function emitArrF32(elems: i32[], fnIx: i32) {
-  let dstF32 = -1
-  let coffF32 = 0
-  if elems.length > NEW_FIXED_MAX {
-    const dF32 = arrLitDataBuild(elems, fnIx, ALD_F32, fa32Ty())
-    if dF32 < 0 { return -1 }
-    if dF32 == 1 { return arrLitWrap(elems.length, fl32Ty()) }
-    dstF32 = arrLitChunkStart("f32list", 0, fa32Ty(), elems.length, false)
-  }
-  let i32f = 0
-  while i32f < elems.length {
-    if exprArray(elems[i32f], fnIx) || exprRefArray(elems[i32f], fnIx) {
-      return emitFail("emitProgram: nested arrays are not supported")
-    }
-    // Each element lowered as f32 (a float literal re-encoded; an i32 operand converted
-    // via `f32.convert_i32_s`) so the backing's element type matches.
-    if emitWidened(elems[i32f], 5, fnIx) < 0 { return -1 }
-    i32f = i32f + 1
-    if dstF32 >= 0 {
-      coffF32 = arrLitChunkFlush(dstF32, fa32Ty(), coffF32, i32f, elems.length)
-    }
-  }
-  if dstF32 >= 0 {
-    fbLocalGet(dstF32)
-    fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, fl32Ty())
-  }
-  return arrLitShortTail("f32", elems.length)
-}
-
 // The v128-list arm of `emitArrUnder`: each element is a vector already, so it lowers as itself.
 function emitArrV128(elems: i32[], fnIx: i32) {
   let dst = -1
@@ -12289,72 +12258,81 @@ function emitArrV128(elems: i32[], fnIx: i32) {
   return 0
 }
 
-// The f64-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
-function emitArrF64(arrIx: i32, elems: i32[], fnIx: i32) {
-  const hF64 = arrLitHoistGlobal(arrIx, fnIx, "f64")
-  if hF64 == -2 { return -1 }
-  if hF64 >= 0 {
-    fbGlobalGet(hF64)
-    return 0
-  }
-  let dstF64 = -1
-  let coffF64 = 0
-  if elems.length > NEW_FIXED_MAX {
-    const dF64 = arrLitDataBuild(elems, fnIx, ALD_F64, fa64Ty())
-    if dF64 < 0 { return -1 }
-    if dF64 == 1 { return arrLitWrap(elems.length, fl64Ty()) }
-    dstF64 = arrLitChunkStart("f64list", 0, fa64Ty(), elems.length, false)
-  }
-  let i = 0
-  while i < elems.length {
-    if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
-      return emitFail("emitProgram: nested arrays are not supported")
-    }
-    // Each element is lowered as an f64 (a float literal → `f64.const`; an i32
-    // operand widened via `f64.convert_i32_s`) so the backing's element type matches.
-    if emitWidened(elems[i], 4, fnIx) < 0 { return -1 }
-    i = i + 1
-    if dstF64 >= 0 {
-      coffF64 = arrLitChunkFlush(dstF64, fa64Ty(), coffF64, i, elems.length)
-    }
-  }
-  if dstF64 >= 0 {
-    fbLocalGet(dstF64)
-    fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, fl64Ty())
-  }
-  return arrLitShortTail("f64", elems.length)
+// A scalar list arm whose elements widen to one width: f32, f64 or i64.
+type WideArm = "f32" | "f64" | "i64"
+
+// Arm `w`'s element form (`ALD_*`), backing and wrapper heap types, `emitWidened` kind, and
+// chunked-build name.
+type WidePlan = {
+  wpForm: i32,
+  wpBack: i32,
+  wpWrap: i32,
+  wpWiden: i32,
+  wpChunk: ListKind,
 }
 
-// The i64-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
-function emitArrI64(elems: i32[], fnIx: i32) {
-  let dstI64 = -1
-  let coffI64 = 0
+function widePlanOf(w: WideArm): WidePlan {
+  return match w {
+    "f32" => {
+      wpForm: ALD_F32,
+      wpBack: fa32Ty(),
+      wpWrap: fl32Ty(),
+      wpWiden: 5,
+      wpChunk: "f32list",
+    }
+    "f64" => {
+      wpForm: ALD_F64,
+      wpBack: fa64Ty(),
+      wpWrap: fl64Ty(),
+      wpWiden: 4,
+      wpChunk: "f64list",
+    }
+    "i64" => {
+      wpForm: ALD_I64,
+      wpBack: ia64Ty(),
+      wpWrap: il64Ty(),
+      wpWiden: 3,
+      wpChunk: "i64list",
+    }
+  }
+}
+
+// The f32, f64 and i64 arms of `emitArrUnder`: a hoisted `for` iterable's module list; past the
+// chunk cap, one data segment or a chunked build; else each element widened to the arm's width
+// (a literal re-encoded, an i32 operand converted) and the short tail. 0 on the stack, -1 failed.
+function emitArrWide(arrIx: i32, elems: i32[], fnIx: i32, w: WideArm) {
+  const h = arrLitHoistGlobal(arrIx, fnIx, w)
+  if h == -2 { return -1 }
+  if h >= 0 {
+    fbGlobalGet(h)
+    return 0
+  }
+  const pl = widePlanOf(w)
+  let dst = -1
+  let coff = 0
   if elems.length > NEW_FIXED_MAX {
-    const dI64 = arrLitDataBuild(elems, fnIx, ALD_I64, ia64Ty())
-    if dI64 < 0 { return -1 }
-    if dI64 == 1 { return arrLitWrap(elems.length, il64Ty()) }
-    dstI64 = arrLitChunkStart("i64list", 0, ia64Ty(), elems.length, false)
+    const d = arrLitDataBuild(elems, fnIx, pl.wpForm, pl.wpBack)
+    if d < 0 { return -1 }
+    if d == 1 { return arrLitWrap(elems.length, pl.wpWrap) }
+    dst = arrLitChunkStart(pl.wpChunk, 0, pl.wpBack, elems.length, false)
   }
   let i = 0
   while i < elems.length {
     if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
       return emitFail("emitProgram: nested arrays are not supported")
     }
-    // Each element lowered as i64 (an i64 literal directly; an i32 operand sign-
-    // extended via `i64.extend_i32_s`) so the backing's element type matches.
-    if emitWidened(elems[i], 3, fnIx) < 0 { return -1 }
+    if emitWidened(elems[i], pl.wpWiden, fnIx) < 0 { return -1 }
     i = i + 1
-    if dstI64 >= 0 {
-      coffI64 = arrLitChunkFlush(dstI64, ia64Ty(), coffI64, i, elems.length)
+    if dst >= 0 {
+      coff = arrLitChunkFlush(dst, pl.wpBack, coff, i, elems.length)
     }
   }
-  if dstI64 >= 0 {
-    fbLocalGet(dstI64)
+  if dst >= 0 {
+    fbLocalGet(dst)
     fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, il64Ty())
+    return arrLitLenCap(elems.length, pl.wpWrap)
   }
-  return arrLitShortTail("i64", elems.length)
+  return arrLitShortTail(w, elems.length)
 }
 
 // The string-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on
@@ -12684,9 +12662,9 @@ function emitArrUnder(arrIx: i32, fnIx: i32, lb: ListBuild) {
   }
   if arm == "v128" { return emitArrV128(elems, fnIx) }
   if arm == "u8" { return emitArrU8(elems, fnIx, lb.lbSlot) }
-  if arm == "f32" { return emitArrF32(elems, fnIx) }
-  if arm == "f64" { return emitArrF64(arrIx, elems, fnIx) }
-  if arm == "i64" { return emitArrI64(elems, fnIx) }
+  if arm == "f32" { return emitArrWide(arrIx, elems, fnIx, "f32") }
+  if arm == "f64" { return emitArrWide(arrIx, elems, fnIx, "f64") }
+  if arm == "i64" { return emitArrWide(arrIx, elems, fnIx, "i64") }
   if arm == "str" { return emitArrStr(arrIx, elems, fnIx) }
   if arm == "ref" { return emitArrRef(arrIx, elems, fnIx, lb) }
   return emitArrI32(arrIx, elems, fnIx, lb.lbKind)
