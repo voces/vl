@@ -220,7 +220,7 @@ print(cv(3.0))
 // field's length (B3); a narrowed box read whole at its variant, and a `string | null`
 // parameter read at its string (narrowed read); a value `if` bound and one widened into an
 // `f64` binding (B4a).
-// Each witness is one covered function that must match legacy's bytes.
+// Each witness holds a covered function that must match legacy's bytes, as must a covered helper.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
   `function stop(code: i32): never { return __trap__() }
@@ -309,8 +309,10 @@ Deno.test({
     for (const src of SHARED) {
       const { rc, rows } = run(src, true);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
-        throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
+      // A helper the witness calls may be covered too; every covered function must match.
+      const covered = rows.get("covered") ?? 0;
+      if (covered < 1 || (rows.get("matched") ?? 0) !== covered) {
+        throw new Error(`want the witness covered and matched, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
   },
@@ -1223,6 +1225,25 @@ if lit is u8[] { print(lit[2]) }
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A literal-union list's elements are its interned atoms, which the IR delivers itself: the
+// literal takes the short build and its fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal-union list literal builds at the short tail and matches",
+  ignore,
+  fn: () => {
+    const { rows } = run(`function pick(i: i32): string {
+  const xs: ("a" | "b")[] = ["a", "b", "a"]
+  return xs[i]
+}
+print(pick(1))
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
