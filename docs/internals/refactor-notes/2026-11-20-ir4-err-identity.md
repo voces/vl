@@ -14,8 +14,10 @@ it.
 - **Every filed witness whose outcome is an emit reject** (59 today) is now built under both
   seeds. `scripts/inventory/witnesses.vl` writes the witnesses out, reading the same row grammar
   as `ls.vl --status`. Each is compared on its exit code and its first diagnostic line, or on its
-  wasm when both seeds build it (`witnesses: same N, differ N`). Of the 59, 56 are emit refusals
-  today and 3 build (D15155, D15157, D15158).
+  wasm when both seeds build it (`witnesses: same N, differ N`). Every one is an emit refusal
+  today. Three of them (D15155, D15157, D15158) refuse only through the test-only hook
+  `__vl_test_emit_refusal__`, so the leg builds with `--test-emit-refusal`, as
+  `check-filed-witnesses` does. Without the flag those three build.
 - The two-seed mode (`<seed-a> <seed-b>`) still compares exit codes only. There a PR may reword
   a refusal on purpose.
 

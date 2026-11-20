@@ -109,8 +109,9 @@ if [ "${1:-}" = "--cases" ]; then
   compare_all "$T/list" "$T/a" "$T/b"
   echo "cases: identical $same, fail under both $both, differ $diff"
   "$VL" run scripts/inventory/witnesses.vl --compiler "$SEED" -- --outcome emit_reject --out "$T/w" > "$T/errs"
-  build_all "$T/errs" "$SEED" "$T/ea"
-  build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
+  # A witness of the test-only refusal hook refuses only under the flag `check-filed-witnesses` passes.
+  FLAGS=--test-emit-refusal build_all "$T/errs" "$SEED" "$T/ea"
+  FLAGS=--test-emit-refusal build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
   compare_errors "$T/errs" "$T/ea" "$T/eb"
   echo "witnesses: same $esame, differ $ediff"
   [ "$diff" -eq 0 ] && [ "$ediff" -eq 0 ]
