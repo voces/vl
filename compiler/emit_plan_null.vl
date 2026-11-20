@@ -4,10 +4,12 @@
 
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
   Call,
   FuncDecl,
+  Ident,
   IfStmt,
   Index,
   Member,
@@ -38,6 +40,7 @@ import {
   tyElemOf,
   tyElemOpen,
   tyIsLitUnion,
+  tyIsNulValueUnionBox,
   tyIsStructBearingUnion,
   tyPrimNameOf,
 } from "./check_types"
@@ -59,6 +62,7 @@ import {
   nodeRepTyAt,
   nodeTyAt,
   readNarrowedBoxToNull,
+  readNarrowedTyAt,
 } from "./emit_capture_frames"
 import {
   asgReReadOf,
@@ -90,11 +94,14 @@ import {
   exprUnion,
   inferredRetMapSlot,
   mapShapeOfExpr,
+  nulTagIdRepTy,
   readOfOpenBinding,
   refListSlotOfExpr,
   structIndexOfExpr,
   tyListRep,
+  unionNameOfRead,
 } from "./emit_classify"
+import { identNullableBoolPop } from "./emit_closure_sites"
 import { elabNodeRepAt, readNarrowedStoreAt } from "./emit_elab"
 import { popTakesElem } from "./emit_list_rep"
 import { declaredNulString } from "./emit_local_scope"
@@ -108,19 +115,28 @@ import {
   vtKindOfType,
 } from "./emit_nullable_rets"
 import { exprReReadable } from "./emit_obj_lit_fits"
-import { boxDstNameAt } from "./emit_plan_coerce"
+import { boxDstNameAt, boxTyName } from "./emit_plan_coerce"
 import { arrLitTyAt, tyAtInstance } from "./emit_plan_list"
 import { paramNulString } from "./emit_query"
 import {
   boxTagOfTy,
   msIsValueUnion,
+  msSoloValKind,
   nodeRepIsNullRef,
+  nodeTyIsNulScalarBox,
   nullValKind,
+  repOfNode,
   repOfNodeAt,
   repOfTy,
   tyPackedRow,
+  vbHeapIdxOfKind,
 } from "./emit_rep"
-import { coalesceResultIsBox } from "./emit_start_block"
+import {
+  coalesceResultIsBox,
+  nodeJoinRowName,
+  nodeMixedUnionName,
+  unionDeclTyIxOfExpr,
+} from "./emit_start_block"
 import {
   cboxReadTy,
   cloStructIdx,
@@ -143,11 +159,13 @@ import {
   mapRecvTyIn,
   nodeTyInOf,
 } from "./emit_ty_canon"
-import { unionHasMapArmSlot } from "./emit_union_atoms"
-import { msSetOfTy, msSetOfTyAny } from "./emit_union_registry"
+import { unionHasMapArmSlot, valueUnionNameOfTy } from "./emit_union_atoms"
+import { unionHasAtomK } from "./emit_union_casts"
+import { msSetOfTy, msSetOfTyAny, msSubNull } from "./emit_union_registry"
 import { holeBindsFunc, scalarListElemKind } from "./emit_value_sites"
 import {
   isNullTy,
+  nonNullTy,
   tyAdmitsNull,
   tyExcludesNull,
   tyHasTyVar,
@@ -754,6 +772,205 @@ export function coalNicheArmOf(
 // Whether node `ix` is a call.
 function coalLhsIsCall(ix: i32): boolean {
   return ix >= 0 && nodeAt(ix) is Call
+}
+
+// The boxed-operand arm of `l ?? d` once `coalNicheArmOf` names `identBox`, in legacy's order: a
+// boolean-pop binding, a nullable value-union binding kept as a box or unboxed, a nullable
+// value-union list element, a call, `as?` or `if` operand's box stashed once (kept or unboxed),
+// and `next`, the rest of the ladder. A `NoKind` arm is a value union whose set is not banked.
+export type CoalBoxArm = "boolPop"
+  | "valBox"
+  | "valScalar"
+  | "valNoKind"
+  | "elem"
+  | "callBox"
+  | "callScalar"
+  | "callNoKind"
+  | "next"
+
+export function coalBoxArmOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalBoxArm {
+  if nodeAt(lhsIx) is Ident {
+    if identNullableBoolPop(lhsIx, fnIx) { return "boolPop" }
+    if unionNameOfRead(lhsIx, fnIx) != "" {
+      const cak = coalValUnionResidualKind(lhsIx, fnIx)
+      if cak == -2 { return "valNoKind" }
+      if cak >= 0 && cak != nullValKind() {
+        return if coalKeepsBox(e, exprIx, fnIx) { "valBox" } else { "valScalar" }
+      }
+    }
+  }
+  if coalElemBoxFits(e, exprIx, fnIx) { return "elem" }
+  const kak = coalStashResidualKind(lhsIx)
+  if kak == -2 { return "callNoKind" }
+  if kak >= 0 && kak != nullValKind() {
+    return if coalKeepsBox(e, exprIx, fnIx) { "callBox" } else { "callScalar" }
+  }
+  return "next"
+}
+
+// Whether the `??` at `exprIx` over a box keeps the box: the checker typed it a union, or its
+// default is nullable.
+export function coalKeepsBox(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
+  return coalResultBoxName(exprIx, fnIx) != ""
+    || coalesceDefaultNullable(e.binRight, fnIx)
+}
+
+// Whether `e.binLeft` is a nullable value-union list element whose atom and the `??`'s result are
+// numeric scalars, the element's widening to the result's.
+function coalElemBoxFits(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
+  // A struct field's rep can come from a row its literal merged onto, which the storage does
+  // not honour, so the arm is bounded to a list element read (D1411).
+  const nbRep = repOfNode(e.binLeft, fnIx)
+  if (
+    !isListElementRead(e.binLeft, fnIx)
+    || nbRep.rdKind != "union"
+    || nbRep.rdNul != 4
+  ) {
+    return false
+  }
+  const nbKind = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
+  const nbElem = boxTagOfTy(nonNullTy(nodeTyIxOf(e.binLeft)))
+  return nulBoxScalarValtype(nbKind) >= 0
+    && vbHeapIdxOfKind(nbElem) >= 0
+    && nulBoxScalarValtype(nbElem) >= 0
+    && scalarKindWidens(nbElem, nbKind)
+}
+
+// The box type of an operand of `??` that cannot be re-read, a tagged set's nullable id read as
+// the `i32 | null` box it is stored as.
+export function coalStashTy(lhsIx: i32): i32 {
+  return nulTagIdRepTy(nodeTyIxOf(lhsIx))
+}
+
+// The residual kind of the nullable value-union box a call, `as?` or `if` operand `lhsIx` yields,
+// -1 when it yields no such box, and -2 when its set is not banked.
+export function coalStashResidualKind(lhsIx: i32): i32 {
+  const lhs = nodeAt(lhsIx)
+  const cTy = coalStashTy(lhsIx)
+  if (
+    !(lhs is Call
+      || ((lhs is AsExpr || lhs is IfStmt)
+      && (tyIsNulValueUnionBox(cTy) || nodeTyIsNulScalarBox(lhsIx))))
+  ) {
+    return -1
+  }
+  if boxTyName(cTy) == "" { return -1 }
+  const ksid = msSetOfTy(cTy)
+  if !(isValueUnionOfSet(ksid, cTy) && setHasNullAtom(ksid)) { return -1 }
+  return unionResidualSoloKindOfSet(ksid)
+}
+
+// Whether the member set `s` holds `null`. An unresolved set (a pinned `V | null` instance
+// records none) answers false, so the `??` arm gating on it declines to a later arm.
+export function setHasNullAtom(s: i32): boolean {
+  if s < 0 { return false }
+  return unionHasAtomK(s, "null", nullValKind())
+}
+
+// The banked kind of the one member left when `null` is removed from member set `s`: -1 for
+// more than one, -2 when the pool does not cover the set (a narrowed subset spelling it never
+// interned), which each caller refuses loudly. Takes a set id, never a text.
+export function unionResidualSoloKindOfSet(s: i32) {
+  if s < 0 { return -2 }
+  return msSoloValKind(msSubNull(s))
+}
+
+// The banked ABI code of the one member left when `null` is removed from the read `lhsIx`'s
+// value union: -1 when its type is no value union holding `null`, -2 when the declared union's
+// set is not banked. Never the string kind: `string | null` is a niche, not a box, and a
+// narrowed string read takes the `nulstr` arm before this one.
+export function coalValUnionResidualKind(lhsIx: i32, fnIx: i32): i32 {
+  // D-VALUNION resolves the declared union's set; the narrowing table's id below answers a
+  // different question (the set surviving the narrow), so both stay resolved, and the null
+  // test is a kind test over the banked codes.
+  const csid = msSetOfTy(nodeTyAt(lhsIx, fnIx))
+  if (
+    !isValueUnionOfSet(csid, nodeTyAt(lhsIx, fnIx))
+    || !setHasNullAtom(csid)
+  ) {
+    return -1
+  }
+  // A read the checker narrowed is the set of its narrowed type; an unnarrowed one the declared
+  // union's. The rendered residual is built only where the pool covers no set.
+  const nt = readNarrowedTyAt(lhsIx, fnIx)
+  // A narrowed set the pool does not cover declines to a later arm.
+  if nt >= 0 {
+    const nk = unionResidualSoloKindOfSet(msSetOfTyAny(nt))
+    return if nk == -2 { -1 } else { nk }
+  }
+  return unionResidualSoloKindOfSet(msSetOfTy(unionDeclTyIxOfExpr(lhsIx, fnIx)))
+}
+
+// The union the `??` at `exprIx` boxes its result as, or "" when the checker typed it a scalar.
+// A MIXED union (`i32 | A`) and a scalar joined to a literal union (`i32 | "a" | "b"`) are boxes
+// too, named off the registry since their render is no value-union name. Tags are
+// program-global, so a box operand stands in the join unchanged (D1703).
+export function coalResultBoxName(exprIx: i32, fnIx: i32): string {
+  const rt = coalResultTyOf(exprIx, fnIx)
+  const rn = valueUnionNameOfTy(rt)
+  if rn != "" { return rn }
+  const mn = nodeMixedUnionName(exprIx, fnIx)
+  if mn != "" { return mn }
+  return nodeJoinRowName(exprIx, fnIx)
+}
+
+// Is `exprIx` a list ELEMENT read — a subscript `a[i]`, or the `.get(i)` spelling of one? The
+// `??` box-unbox arm's bound: an element's rep comes from its list's element slot, where a
+// struct field's can come from a row the literal merged onto (D1411). A map `.get` is claimed
+// by the fused map arm long before this and is excluded by name, not by arrival order.
+export function isListElementRead(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if e is Index { return true }
+  return isListGetCall(exprIx, fnIx)
+}
+
+// The `.get(i)` half of `isListElementRead`, asked on its own because a `.get` is the CHECKED
+// read: an out-of-range index yields NO box, where a subscript traps. That is a second null
+// channel the present-test has to cover, and only for this spelling.
+export function isListGetCall(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if e is Call {
+    if e.callFn < 0 { return false }
+    const geCallee = nodeAt(e.callFn)
+    if geCallee is Member {
+      if geCallee.memProp == "get" && e.callArgs.length == 1 {
+        return !exprMap(geCallee.memObj, fnIx)
+      }
+    }
+  }
+  return false
+}
+
+// The wasm result byte a value-box atom kind unboxes to, or -1 when the kind is not a
+// numeric scalar. `boolean` and `string` never reach the caller — each has its own niche —
+// and a ref atom rides the box's anyref rather than a per-rep value box (D1828).
+export function nulBoxScalarValtype(kind: i32) {
+  if kind == 0 {
+    return 127 // i32
+  }
+  if kind == 3 {
+    return 126 // i64
+  }
+  if kind == 4 {
+    return 124 // f64
+  }
+  if kind == 5 {
+    return 125 // f32
+  }
+  return -1
+}
+
+// Whether a scalar of value-atom kind `from` (0 i32, 3 i64, 4 f64, 5 f32) widens losslessly
+// to kind `to`: itself, i32 to i64 or f64, or f32 to f64.
+export function scalarKindWidens(from: i32, to: i32): boolean {
+  if from == to { return true }
+  if from == 0 { return to == 3 || to == 4 }
+  return from == 5 && to == 4
 }
 
 // Whether `??` operand `e.binLeft` is an `if` with an `else` whose arms are each one value,
