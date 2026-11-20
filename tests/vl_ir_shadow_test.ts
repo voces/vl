@@ -855,8 +855,9 @@ print(coal({ a: false, n: 0 }, null) + coal({ a: false, n: 0 }, 2))
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
-      throw new Error(`want five covered and matched, got ${JSON.stringify([...rows])}`);
+    // `coal`'s `x != null` over `i32 | null` is a union box's null tag test.
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
