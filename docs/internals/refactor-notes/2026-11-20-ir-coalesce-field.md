@@ -62,13 +62,20 @@ That is `SCoalBox`'s shape: a legacy-written head and present arm, a lazy defaul
 
 ## Coverage
 
-| population | before | after |
-| --- | ---: | ---: |
-| self-compile functions covered | 17,892 | 18,202 |
-| corpus functions covered (45,678) | 39,986 | 39,986 |
+The arm has no population today. On the same source (this branch merged with master `89210abc4`),
+the fixpoint master seed and this branch's seed cover the same functions, and the blocker census
+(mode 4) names no `coalesce box next` or `coalesce field` blocker under either:
 
-The corpus does not move: its `coalesce box next` population is call and name operands, not
-record fields. Blocker census on this branch's seed, functions whose blockers name the residue:
+| population | master seed | this branch |
+| --- | ---: | ---: |
+| self-compile functions covered | 18,353 | 18,353 |
+| corpus functions covered (45,678) | 40,503 | 40,503 |
+
+An earlier reading of +306 compared this branch's seed against #9236's pre-merge figure, not a seed
+built from the same source; it measured master drift. The arm's value is the capability its
+witnesses show and the legacy split.
+
+The corpus's `coalesce box next` population is call and name operands, not record fields:
 
 | operand | alone | with other blockers |
 | --- | ---: | ---: |
@@ -86,8 +93,7 @@ record fields. Blocker census on this branch's seed, functions whose blockers na
   default, a box kept for a nullable default, a default that reassigns the receiver the present arm
   re-reads (`r.v ?? (r = q2).w`, prints 64 as legacy does), and a loop variable narrowed by `is` to
   one arm.
-- **L2 fuel:** 103,368,054,977 against #9236's 103,307,117,294 on the same master, +0.06% own;
-  +1.0% on the shared 102.31G baseline, the rest being #9236 and master drift.
+- **L2 fuel:** 103,368,054,977 against #9236's 103,307,117,294 on the same master, +0.06% own.
 
 ## Open
 
