@@ -17,6 +17,9 @@ after another` (56).
   `lwFloor`, and only when nothing was written since the top value ended; else it misses
   (`stack value read out of order`). A consumer that writes bytes between its operands (a push's
   receiver staging) so misses rather than writing a module that does not validate.
+  Lowest-first assumes a reader takes its stack operands bottom-up and contiguously; a reader
+  deeper in an operand tree than the staged root's own (`c(a, g(p && q))`, where `g` takes a
+  value with `a` beneath it) misses, a coverage loss chosen over reordering.
 - **The floor.** The `if`'s condition may read values already on the stack; its arms read none
   beneath the `if` (`lwFloors`).
 - **A staged temp is a value.** `tempRhs` answers no definition for it, and `irLSkip` misses on it,
