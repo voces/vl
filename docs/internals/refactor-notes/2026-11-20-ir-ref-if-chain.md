@@ -21,3 +21,6 @@ Measured on fixpoint seeds at merge-base `b0da3ce35` (functions with no blocker)
 `object variant field i64`, `coalesce chain`).
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
+
+`ifRefExpr` admits the str, list, strlist and reflist kinds. A step that admits `struct` must
+honour `joinCloSigSplitField`, which legacy's `emitIfExprRef` reads for a closure-signature split.
