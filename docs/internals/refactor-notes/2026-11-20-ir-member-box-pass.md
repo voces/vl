@@ -31,7 +31,19 @@ names `uBoxIdx`.
 
 ## Readings
 
-To fill at the merge-base fixpoint. A representative moved hunk, the argument position of
+Both seeds fixpoints, master at merge-base `056fd4af8`:
+
+| reading | master | this branch |
+|---|---:|---:|
+| distilled cells identical (`ir-identity.sh`, plain and `--names`) | | 9,037 of 9,037, 0 differ |
+| `tests/cases` moved (A/B) | | 3 of 7,247, each the re-box collapsing to the box, output equal |
+| corpus functions claimed / self-compile | 40,892 / 18,525 | 40,892 / 18,525 |
+| `plumb-shape` main guest fuel | 9,733,421,439 | 9,734,404,512 (+0.01%) |
+| seed bytes | 6,898,263 | 6,899,611 (+0.02%) |
+| a loop of 20M deliveries `showU(q.h)` (wall) | ~0.35 s | ~0.07 s |
+| matrices (struct, variant, nullable receivers) | 84 / 84 each | 84 / 84 each, 0 runs → not-runs |
+
+A representative moved hunk, the argument position of
 `tests/cases/narrowing/narrowed-field-record-delivered-to-its-union.vl` (same output):
 
     -      (struct.new $11
