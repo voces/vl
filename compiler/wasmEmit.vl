@@ -20866,14 +20866,12 @@ function boxNarrowScalarKinds(phys: i32, own: i32): i32[] {
 
 // The refusal of a field read at `memIx` whose wider record stores two of its own members as one.
 function emitBoxAmbiguousFail(memIx: i32) {
-  return emitFailAt(boxAmbiguousWhy(), memIx)
-}
-
-// The refusal of a field read stored at a wider record two of its own members widen to.
-function boxAmbiguousWhy(): string {
-  return "emitProgram: this field is stored at a wider record whose member two of its own members "
-    + "widen to, so a read at its own type cannot tell which one it held. Annotate the "
-    + "binding with the wider record's type, or build a second literal"
+  return emitFailAt(
+    "emitProgram: this field is stored at a wider record whose member two of its own members "
+      + "widen to, so a read at its own type cannot tell which one it held. Annotate the "
+      + "binding with the wider record's type, or build a second literal",
+    memIx,
+  )
 }
 
 // One arm of `emitMapRetag`'s chain for a scalar member `fromTy` the destination holds widened
@@ -27669,15 +27667,15 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
 }
 
 // Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32,
-// string, scalar-width or plain reference list whose value builds as itself or widens, with no
-// arm unbox.
+// string, scalar-width, byte or plain reference list whose value builds as itself or widens, with
+// no arm unbox.
 export function idxStorePlainWhy(
   st: IdxStore,
   arrIx: i32,
   rhs: i32,
   fnIx: i32,
 ): string {
-  if st.isU8 || st.nestSlot >= 0 || st.unionNm != "" { return "store element" }
+  if st.nestSlot >= 0 || st.unionNm != "" { return "store element" }
   if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
     return "store element seed"
   }
@@ -40697,6 +40695,18 @@ function emitScalarWiden(from: i32, to: i32) {
   return fbF64ConvertI32S()
 }
 
+// The receiver of a `??` field read: `cast` is the arm heap a one-arm-narrowed union box is
+// cast to, -2 a null-tested nullable arm asserted non-null, -1 the receiver read as it is.
+function emitCoalArmRecv(recvIx: i32, cast: i32, fnIx: i32) {
+  if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  if cast >= 0 {
+    fbStructGet(uBoxIdx, 1)
+    fbRefCast(cast)
+  }
+  if cast == -2 { fbRefAsNonNull() }
+  return 0
+}
+
 // The `if lhs != null { lhs } else { d }` node for a hole's map read `lhs ?? d` whose value type
 // `coalHoleMapReadValTy` gave as `vt`. The node carries the `??`'s type.
 function coalHoleMapReadNullTest(
@@ -41402,199 +41412,132 @@ function coalNarrowedBoxArm(memIx: i32, fnIx: i32): i32 {
   return vi
 }
 
-// Where the value-union box of field read `o.v` lives: the receiver `cfRecv`, cast by `cfCast`
-// (a box arm's heap, -2 to assert a nullable row non-null, -1 for none), the field `cfFi` of heap
-// `cfHeap`, and the field's box `cfPhysN` of type `cfPhysTy`.
-type CoalFieldPlan = {
-  cfRecv: i32,
-  cfCast: i32,
-  cfHeap: i32,
-  cfFi: i32,
-  cfPhysN: string,
-  cfPhysTy: i32,
-}
-
-// The box location of member read `lhsIx` when its field is a value-union box, else null.
-function coalFieldPlanOf(lhsIx: i32, fnIx: i32): CoalFieldPlan | null {
-  const lhs = nodeAt(lhsIx)
-  if !(lhs is Member) { return null }
-  // The receiver is a struct row or a union arm; an arm's field reads off its own heap
-  // type exactly as a row's does (D4667).
-  let mHeap = -1
-  let mfi = -1
-  let mphys = ""
-  let mphysTy = -1
-  let mCast = -1
-  // A box receiver narrowed to one arm is unwrapped to that arm, asked ahead of the row as
-  // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
-  // for a ref it does not hold (D8145). A null-tested nullable arm is asserted non-null.
-  let mvi = coalNarrowedBoxArm(lhsIx, fnIx)
-  if mvi >= 0 { mCast = variantHeap(mvi) }
-  const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
-  if msi >= 0 {
-    mfi = sFieldIndex(msi, lhs.memProp)
-    if mfi >= 0 && sFieldIsUnionBox(msi, mfi) {
-      mHeap = sHeapIdx[msi]
-      mphys = sFieldElemNameAt(msi, mfi)
-      mphysTy = sFieldElemTyIxAt(msi, mfi)
-    }
-  } else {
-    if mvi < 0 { mvi = exprVariantIndex(lhs.memObj, fnIx) }
-    if mvi < 0 {
-      mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
-      if mvi >= 0 { mCast = -2 }
-    }
-    if mvi >= 0 {
-      mfi = variantFieldIndex(mvi, lhs.memProp)
-      if mfi >= 0 && fieldRowIsUnionBox(uFieldStart[mvi] + mfi) {
-        mHeap = variantHeap(mvi)
-        mphys = variantFieldElemName(mvi, mfi)
-        mphysTy = uFieldElemTyIxAt(mvi, mfi)
-      }
-    }
-  }
-  if mHeap < 0 { return null }
-  const p: CoalFieldPlan = {
-    cfRecv: lhs.memObj,
-    cfCast: mCast,
-    cfHeap: mHeap,
-    cfFi: mfi,
-    cfPhysN: mphys,
-    cfPhysTy: mphysTy,
-  }
-  return p
-}
-
-// The one residual atom kind of plan `p`'s box when it is a nullable value union, -2 when its set
-// is not banked, and -1 when the box is no nullable value union or holds only `null`.
-function coalFieldResidualKind(p: CoalFieldPlan): i32 {
-  const msid = msSetOfTy(p.cfPhysTy)
-  if !(isValueUnionOfSet(msid, p.cfPhysTy) && setHasNullAtom(msid)) {
-    return -1
-  }
-  const mak = unionResidualSoloKindOfSet(msid)
-  if mak == nullValKind() { return -1 }
-  return mak
-}
-
-// Why `o.v ?? d` over plan `p` of member read `lhsIx` is refused, or "": the one decision legacy's
-// arm and the IR's builder read, ahead of any byte. The box sits at a wider record two members
-// widen to, is rebuilt at a narrower union, or holds a set that banks no residual kind.
-function coalFieldRefusedWhy(p: CoalFieldPlan, lhsIx: i32, fnIx: i32): string {
-  if memReadBoxAmbiguous(lhsIx, fnIx) { return boxAmbiguousWhy() }
-  if memReadBoxNarrowTy(lhsIx, fnIx) >= 0 {
-    return "emitProgram: `??` over a narrowed union-box field read"
-  }
-  if coalFieldResidualKind(p) == -2 {
-    return "emitProgram: `??` over a union field has no banked residual kind"
-  }
-  return ""
-}
-
-// Why the present arm cannot unbox atom kind `ak` of a union field's box, or "".
-function coalFieldUnboxWhy(ak: i32): string {
-  if vbHeapIdxOfKind(ak) < 0 {
-    return "emitProgram: union field atom has no value box"
-  }
-  return ""
-}
-
-// The open of `o.v ?? d` along plan `p` once its receiver is on the stack: the cast, the box, its
-// null test and the `if`, at the box when `rk` is -1, else at the value type of kind `rk`.
-function coalFieldOpen(p: CoalFieldPlan, rk: i32) {
-  coalFieldOff(p)
-  coalTagIsNull()
-  if rk < 0 {
-    fbIfRef(uBoxIdx) // 0x04 if, (ref $uBoxIdx) blocktype
-  } else {
-    fbIf(valBlockTypeOfKind(rk)) // 0x04 if, value blocktype
-  }
-}
-
-// The present arm of `o.v ?? d` along plan `p` once its re-read receiver is on the stack: the
-// box kept when `rk` is -1, else its atom of kind `ak` widened to kind `rk`. Returns 0, or -1.
-function coalFieldPresent(p: CoalFieldPlan, ak: i32, rk: i32): i32 {
-  coalFieldOff(p)
-  if rk < 0 { return 0 }
-  const why = coalFieldUnboxWhy(ak)
-  if why != "" { return emitFail(why) }
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  const mvb = vbHeapIdxOfKind(ak)
-  fbRefCast(mvb)
-  fbStructGet(mvb, 0) // the scalar payload
-  return coalWidenUnboxed(ak, rk)
-}
-
-// The cast receiver's box along plan `p`.
-function coalFieldOff(p: CoalFieldPlan) {
-  if p.cfCast >= 0 {
-    fbStructGet(uBoxIdx, 1)
-    fbRefCast(p.cfCast)
-  }
-  if p.cfCast == -2 { fbRefAsNonNull() }
-  fbStructGet(p.cfHeap, p.cfFi)
-}
-
-// The result kind of `o.v ?? d` unboxing atom kind `ak`: the checker's, as at the ident and call
-// arms, so a wider default widens the whole `??` (D1699, D10060).
-function coalFieldResultKind(ak: i32, exprIx: i32, fnIx: i32): i32 {
-  const rk = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
-  if rk >= 0 && rk != nullValKind() { return rk }
-  return ak
-}
-
 // The `emitCoalesceGo` arm over a value-union record field `o.v ?? d`, then the rest of the
-// ladder: the field's box tested for `null`, the default, or the receiver re-read (a name/field
-// chain) for the box kept or its one scalar atom. Returns what `emitCoalesceGo` returns.
+// ladder. Returns what `emitCoalesceGo` returns.
 function emitCoalesceUnionField(
   e: BinExpr,
   lhsIx: i32,
   exprIx: i32,
   fnIx: i32,
 ) {
-  const p = coalFieldPlanOf(lhsIx, fnIx)
-  if p != null {
-    // A wider record's box is read at the receiver's own member set (D3006), anchored at the
-    // read as every such refusal is.
-    const why = coalFieldRefusedWhy(p, lhsIx, fnIx)
-    if why == boxAmbiguousWhy() { return emitFailAt(why, lhsIx) }
-    if why != "" { return emitFail(why) }
-    // D-VALUNION + D-SETONCE + D-union-atom-kind — see `unionResidualSoloKindOfSet`.
-    const mak = coalFieldResidualKind(p)
-    if mak >= 0 {
-      // A union result or a NULLABLE default keeps the result boxed — the SAME decision
-      // the ident and call arms make; the else arm re-reads the field's own box rather
-      // than unboxing it, and the default is coerced into the result's union.
-      const mResN = coalResultBoxName(exprIx, fnIx)
-      if mResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
-        let mCoerceN = mResN
-        let mCoerceTy = coalResultTyOf(exprIx, fnIx)
-        if mCoerceN == "" {
-          mCoerceN = p.cfPhysN
-          mCoerceTy = nodeTyIxOf(lhsIx)
-        }
-        if emitExpr(p.cfRecv, fnIx) < 0 { return -1 }
-        coalFieldOpen(p, -1)
-        // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
-        // boxed-union `??` spellings that share this lowering.
-        if (emitUnionBoxOwed(mCoerceN, mCoerceTy, e.binRight, fnIx) < 0) {
-          return -1 // d, its own box
-        }
-        fbElse() // 0x05 else — present → re-read the field
-        if emitExpr(p.cfRecv, fnIx) < 0 { return -1 }
-        coalFieldPresent(p, mak, -1)
-        fbEnd() // 0x0b end
-        return 0
+  const lhs = nodeAt(lhsIx)
+  // `o.v ?? d` over a value-union struct field (`v: i32 | null`, code 16): the field-read dual
+  // of the boxed-union name path above — read the box off the field, test its tag for `null`,
+  // and select the default or the unboxed single remaining scalar atom. The receiver re-reads
+  // in the non-null arm (a name/field chain, like the nullable-struct `?.` path).
+  if lhs is Member {
+    // The receiver is a struct row or a union arm; an arm's field reads off its own heap
+    // type exactly as a row's does (D4667).
+    let mHeap = -1
+    let mfi = -1
+    let mphys = ""
+    let mphysTy = -1
+    let mCast = -1
+    // A box receiver narrowed to one arm is unwrapped to that arm, asked ahead of the row as
+    // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
+    // for a ref it does not hold (D8145). A null-tested nullable arm is asserted non-null.
+    let mvi = coalNarrowedBoxArm(lhsIx, fnIx)
+    if mvi >= 0 { mCast = variantHeap(mvi) }
+    const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
+    if msi >= 0 {
+      mfi = sFieldIndex(msi, lhs.memProp)
+      if mfi >= 0 && sFieldIsUnionBox(msi, mfi) {
+        mHeap = sHeapIdx[msi]
+        mphys = sFieldElemNameAt(msi, mfi)
+        mphysTy = sFieldElemTyIxAt(msi, mfi)
       }
-      const mRk = coalFieldResultKind(mak, exprIx, fnIx)
-      if emitExpr(p.cfRecv, fnIx) < 0 { return -1 }
-      coalFieldOpen(p, mRk)
-      if emitExprAsKind(e.binRight, mRk, fnIx) < 0 { return -1 }
-      fbElse() // 0x05 else — present → unbox
-      if emitExpr(p.cfRecv, fnIx) < 0 { return -1 }
-      if coalFieldPresent(p, mak, mRk) < 0 { return -1 }
-      fbEnd() // 0x0b end
-      return 0
+    } else {
+      if mvi < 0 { mvi = exprVariantIndex(lhs.memObj, fnIx) }
+      if mvi < 0 {
+        mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
+        if mvi >= 0 { mCast = -2 }
+      }
+      if mvi >= 0 {
+        mfi = variantFieldIndex(mvi, lhs.memProp)
+        if mfi >= 0 && fieldRowIsUnionBox(uFieldStart[mvi] + mfi) {
+          mHeap = variantHeap(mvi)
+          mphys = variantFieldElemName(mvi, mfi)
+          mphysTy = uFieldElemTyIxAt(mvi, mfi)
+        }
+      }
+    }
+    if mHeap >= 0 {
+      // A wider record's box is read at the receiver's own member set (D3006).
+      if memReadBoxAmbiguous(lhsIx, fnIx) { return emitBoxAmbiguousFail(lhsIx) }
+      // A box rebuilt at a narrower union has no `??` lowering; the field's own box is read.
+      if memReadBoxNarrowTy(lhsIx, fnIx) >= 0 {
+        return emitFail(
+          "emitProgram: `??` over a narrowed union-box field read",
+        )
+      }
+      const munm = mphys
+      const munTy = mphysTy
+      // D-VALUNION + D-SETONCE — see the call arm above.
+      const msid = msSetOfTy(munTy)
+      if (isValueUnionOfSet(msid, munTy) && setHasNullAtom(msid)) {
+        // D-union-atom-kind — see `unionResidualSoloKindOfSet`.
+        const mak = unionResidualSoloKindOfSet(msid)
+        if mak == -2 {
+          return emitFail(
+            "emitProgram: `??` over a union field has no banked residual kind",
+          )
+        }
+        if mak >= 0 && mak != nullValKind() {
+          // A union result or a NULLABLE default keeps the result boxed — the SAME decision
+          // the ident and call arms make; the else arm re-reads the field's own box rather
+          // than unboxing it, and the default is coerced into the result's union.
+          const mResN = coalResultBoxName(exprIx, fnIx)
+          if mResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
+            let mCoerceN = mResN
+            let mCoerceTy = coalResultTyOf(exprIx, fnIx)
+            if mCoerceN == "" {
+              mCoerceN = munm
+              mCoerceTy = nodeTyIxOf(lhsIx)
+            }
+            if emitCoalArmRecv(lhs.memObj, mCast, fnIx) < 0 { return -1 }
+            fbStructGet(mHeap, mfi) // the union box
+            fbStructGet(uBoxIdx, 0) // field 0: tag
+            fbI32Rel(RS_TAG, nullBoxTag())
+            fbI32Bin(70)            // 0x46 i32.eq → null?
+            fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
+            // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
+            // boxed-union `??` spellings that share this lowering.
+            if (emitUnionBoxOwed(mCoerceN, mCoerceTy, e.binRight, fnIx) < 0) {
+              return -1 // d, its own box
+            }
+            fbElse() // 0x05 else — present → re-read the field
+            if emitCoalArmRecv(lhs.memObj, mCast, fnIx) < 0 { return -1 }
+            fbStructGet(mHeap, mfi)
+            fbEnd() // 0x0b end
+            return 0
+          }
+          // The result kind is the checker's, as at the ident and call arms: a wider default
+          // widens the whole `??` (D1699, D10060).
+          let mRk = mak
+          const mRkN = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
+          if mRkN >= 0 && mRkN != nullValKind() { mRk = mRkN }
+          if emitCoalArmRecv(lhs.memObj, mCast, fnIx) < 0 { return -1 }
+          fbStructGet(mHeap, mfi)       // the union box
+          fbStructGet(uBoxIdx, 0)       // field 0: tag
+          fbI32Rel(RS_TAG, nullBoxTag())
+          fbI32Bin(70)                  // 0x46 i32.eq → null?
+          fbIf(valBlockTypeOfKind(mRk)) // 0x04 if, value blocktype
+          if emitExprAsKind(e.binRight, mRk, fnIx) < 0 { return -1 }
+          fbElse()                      // 0x05 else — present → unbox
+          if emitCoalArmRecv(lhs.memObj, mCast, fnIx) < 0 { return -1 }
+          fbStructGet(mHeap, mfi)
+          fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+          const mvb = vbHeapIdxOfKind(mak)
+          if mvb < 0 {
+            return emitFail("emitProgram: union field atom has no value box")
+          }
+          fbRefCast(mvb)
+          fbStructGet(mvb, 0) // the scalar payload
+          if coalWidenUnboxed(mak, mRk) < 0 { return -1 }
+          fbEnd()             // 0x0b end
+          return 0
+        }
+      }
     }
   }
   return emitCoalesceOptMember(e, lhsIx, exprIx, fnIx)
