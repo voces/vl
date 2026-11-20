@@ -14,6 +14,10 @@ one is a named miss (`ref if chain null inward`), as is a link whose join differ
 (`ref if chain join`). An else-less link is named apart (`ref if else-less`); the self-compile has
 none.
 
-Measured at the merge-base in the PR.
+Measured on fixpoint seeds at merge-base `b0da3ce35` (functions with no blocker): self-compile
+18,828 → 18,846 of 19,343; corpus 41,682 flat. `ref if chain` 20 → 0 alone, plus 7 in combinations.
+18 build, 2 stop at `ref if chain join`, and the rest at their other blockers
+(`string operand after another`, `if into an element store`, `rep novalue`,
+`object variant field i64`, `coalesce chain`).
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
