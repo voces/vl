@@ -2401,3 +2401,22 @@ Deno.test({
     }
   },
 });
+
+// D17038: a block body's last `if` is a statement, so an `else` arm ending in an assignment falls
+// off to the result's `null` (prints `null 1 2`), as legacy writes it; the IR once returned the
+// assignment's value. Both functions cover and match.
+const BLOCK_TAIL_IF_STMT =
+  `let n = 0\nfunction tl(a: i32) {\n  if a > 5 {\n    return 1\n  } else {\n    n = n + a\n  }\n}\nfunction te(a: i32) {\n  if a > 0 { return a } else { a * 2 }\n}\nprint(tl(2))\nprint(tl(9))\nprint(te(-1))\nprint(n)\n`;
+Deno.test({
+  name: "ir shadow: a block body's last if is a statement whose falling arm pads null (D17038)",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(BLOCK_TAIL_IF_STMT, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want tl and te covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
