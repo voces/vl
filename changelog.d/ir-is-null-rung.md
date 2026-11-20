@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: an `is` test at the null-test rung, or with a static answer.** `recv is null` / `recv is <member>` over a nullable niche (a string, a boolean, a literal union) lowers as the niche's own null test (`RNulTest`, its arm `nulTestArmOf` asks niche-only, as `emitIsArm` does). An `is` test at the `never` or `pinNever` rung, or a static `true`, is its constant after a receiver that is no re-readable place is evaluated and dropped, as `isConstAfterRecv` writes it; a static `false` stays a named miss (`is static empty fit`), since legacy first tries its empty-list fit there.
