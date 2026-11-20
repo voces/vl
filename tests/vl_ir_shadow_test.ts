@@ -561,6 +561,22 @@ opt(null)
   },
 });
 
+// A `??` whose left operand an instance closed to a type with no `null` writes the left operand.
+Deno.test({
+  name: "ir shadow: a closed coalesce is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function orD<T>(x: T, d: T): T { return x ?? d }
+print(orD(3, 4))
+`;
+    const { rows } = run(src, true);
+    if ((rows.get("matched") ?? 0) < 1 || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want the instance covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
