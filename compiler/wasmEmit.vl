@@ -174,7 +174,6 @@ import {
   eqCoreKindOfTyToken,
 } from "./check_ty_relate"
 import {
-  PrimName,
   T,
   TY_ERR,
   TY_F32,
@@ -1777,6 +1776,7 @@ import {
   eqOperandRecovers,
   holeBoxPlanOf,
   identReadArmOf,
+  identUnboxAtomOf,
   isArmOf,
   isArmPatTy,
   isArmTagOfTyAt,
@@ -1796,6 +1796,7 @@ import {
   litIsArmOf,
   mapSoftTwinClashOf,
   memReadArmOf,
+  memRecvOwesNonNull,
   monoStaticIsResult,
   msSetOfUnionBox,
   njDispatches,
@@ -1828,6 +1829,7 @@ import {
   variantNestedRow,
   variantRefListFieldSlot,
   wideArmOfRow,
+  wideArmPlainOf,
   wideRetagPairs,
   widenPlanOf,
 } from "./emit_plan_union"
@@ -4027,6 +4029,13 @@ function emitDeadNullTest(opIx: i32, isNe: boolean, fnIx: i32) {
   return 0
 }
 
+// After a `boolean | null`'s i32: its null is the sentinel 2. Returns 1, the ladder's "claimed".
+export function nulTestBoolTail(invert: boolean): i32 {
+  fbI32Const(2)
+  if invert { fbI32Bin(71) } else { fbI32Bin(70) }
+  return 1
+}
+
 // After a `K | null` value: its compare with the sentinel below every atom id, `i32.ne` for
 // `invert`. Returns 1, the ladder's "claimed".
 export function nulTestAtomTail(invert: boolean): i32 {
@@ -4060,9 +4069,7 @@ function emitNulIsNullTest(
   }
   if arm == "bool" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
-    fbI32Const(2)
-    if invert { fbI32Bin(71) } else { fbI32Bin(70) }
-    return 1
+    return nulTestBoolTail(invert)
   }
   if arm == "atom" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
@@ -7416,30 +7423,6 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
   )
 }
 
-// Does the function being emitted declare type parameters? The dead-atom elision is
-// bounded to these: only a generic instance can carry an `is` arm the instantiation makes
-// constant-false, and only there is the name-keyed union lookup single-valued.
-function fnHasTyParams(fnIx: i32): boolean {
-  const fp = fnStmtsPosOf(fnIx)
-  if fp < 0 { return false }
-  if fp >= fnStmts.length { return false }
-  const f = nodeAt(fnStmts[fp])
-  if f is FuncDecl {
-    if f.fnTyParams.length > 0 { return true }
-  }
-  // A monomorphized instance has no type params of its own — `mkFunc(instName, noTyParams, …)`
-  // strips them — so the instance must be recognised through its template. Without this the
-  // bound never fires for the very shape it exists to admit.
-  if fp < monoOrigNode.length {
-    const o = monoOrigNode[fp]
-    if o >= 0 {
-      const of = nodeAt(o)
-      if of is FuncDecl { return of.fnTyParams.length > 0 }
-    }
-  }
-  return false
-}
-
 // Push the raw union box ref of the binding the `Ident` read at `ix` denotes (a local, param,
 // capture or module global), bypassing
 // the narrowed-unbox Ident path so a tag read works even while the binding is narrowed to a
@@ -7580,7 +7563,7 @@ function emitBoxToNulStr() {
 // The atom's ABI code decides all four arms (the `string` compare, the closure test, the
 // list-wrapper ladder, `vbHeapIdxOfKind`), so `ak` arrives as the code: `emitCoalesce` holds it
 // out of the bank rather than rendering a set to be re-parsed here.
-function emitUnionUnboxTail(ak: i32) {
+export function emitUnionUnboxTail(ak: i32) {
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if ak == 2 {
     fbRefCast(sTy()) // the payload IS the string array ref
@@ -7593,7 +7576,7 @@ function emitUnionUnboxTail(ak: i32) {
     return 0
   }
   const lw = listWrapHeapOfKind(ak)
-  if lw >= 0 { return emitListPayloadCast(lw) }
+  if lw >= 0 { return listPayloadCastTail(lw, listCastForPush) }
   const vb = vbHeapIdxOfKind(ak)
   if vb < 0 {
     return emitFail("emitProgram: narrowed union atom has no value box")
@@ -7622,7 +7605,7 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
       )
     }
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-    emitListPayloadCast(rlWrapIdx[slot])
+    listPayloadCastTail(rlWrapIdx[slot], listCastForPush)
     return 1
   }
   if con == RC_MAP {
@@ -7646,19 +7629,47 @@ function emitRefArrayUnionUnboxRead(exprIx: i32, fnIx: i32) {
   if slot < 0 || slot >= rlWrapIdx.length {
     return emitFail("emitProgram: narrowed ref-array arm has no reflist slot")
   }
-  return emitListPayloadCast(rlWrapIdx[slot])
+  return listPayloadCastTail(rlWrapIdx[slot], listCastForPush)
 }
 
 // Set while a `.push` receiver is emitted: an append into a stand-in empty list would be lost,
 // so a push keeps the plain cast and traps loudly instead (D4949).
 let listCastForPush = false
 
+// Whether reading receiver `recvIx` unboxes a list arm, the read `listPayloadCastTail` casts and
+// `listCastForPush` makes strict: a narrowed binding, field or element. Any other shape answers
+// true, so a caller that cannot hold the flag misses rather than casting leniently.
+export function recvReadsListPayload(recvIx: i32, fnIx: i32): boolean {
+  const rx = unwrapParen(recvIx)
+  if rx < 0 || rx >= P.nodes.length { return true }
+  const e = nodeAt(rx)
+  return match e {
+    Ident => {
+      const k = identReadAtomKindAt(rx, fnIx)
+      k >= 0 && listWrapHeapOfKind(k) >= 0
+        || identReadContainerAt(rx, fnIx) == RC_REF_LIST
+    }
+    Member => {
+      const k = memNarrowAtomKind(rx, fnIx)
+      placeReadContainerAt(rx, fnIx) == RC_REF_LIST
+        || k >= 0 && listWrapHeapOfKind(k) >= 0
+    }
+    Index => {
+      const k = if indexElemUnionName(rx, fnIx) != "" { idxNarrowAtomKind(rx, fnIx) } else { -1 }
+      placeReadContainerAt(rx, fnIx) == RC_REF_LIST
+        || k >= 0 && listWrapHeapOfKind(k) >= 0
+    }
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread | LoopVar => true
+  }
+}
+
 // The box's `anyref` payload on the stack, as the list wrapper `wrap` a narrowed read expects.
 // An `is L` fits an empty list of another list arm (D4771), and a capture, field or element
 // cannot be re-boxed as `L`, so a payload of another wrapper reads as an empty `L` (D4939).
-function emitListPayloadCast(wrap: i32) {
+// A `strict` cast (a push receiver's) traps on another wrapper instead.
+function listPayloadCastTail(wrap: i32, strict: boolean) {
   const back = listBackOfWrap(wrap)
-  if back < 0 || listCastForPush {
+  if back < 0 || strict {
     fbRefCast(wrap)
     return 0
   }
@@ -8664,30 +8675,6 @@ function plainCoalesceAt(exprIx: i32): BinExpr | null {
   return null
 }
 
-// Whether union type `ty` has an arm of value kind `vak`, by its member set's banked kinds: 0 only
-// when every member is a bare primitive or `null` and none is `vak`. A set the bank does not
-// cover, or a member a kind cannot rule out (a record, list, closure or nested union), answers 1.
-function unionTyHasValueKind(ty: i32, vak: i32): i32 {
-  const ks: i32[] = []
-  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) || ks.length < 2 { return 1 }
-  for k in ks {
-    if k == vak || !valueKindIsPlainScalar(k) { return 1 }
-  }
-  return 0
-}
-
-// Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
-function valueKindIsPlainScalar(k: i32): boolean {
-  if k < 0 { return false }
-  const ps: PrimName[] = [
-    "i32", "i64", "f32", "f64", "boolean", "string", "null",
-  ]
-  for p in ps {
-    if boxTagOfPrim(p) == k { return true }
-  }
-  return false
-}
-
 // Evaluate a `null`-typed operand for its effects and drop it, where the answer is already
 // decided. A call and an if-expression have effects; an ident read has none, and emitting one
 // would be dead code. Shared by `??`, the folded null compare, and `print`.
@@ -8763,6 +8750,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbRefNullNone() // the payload slot is unread under the null tag
     }
     "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "rec" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "lit" => {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
@@ -8775,7 +8763,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" => fbStructNew(uBoxIdx)
+    "null" | "rec" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "ladder" => 0
@@ -8787,7 +8775,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
   if p.hbArm == "atom" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
-  } else if p.hbArm == "pass" || p.hbArm == "atomStr" {
+  } else if p.hbArm == "pass" || p.hbArm == "atomStr" || p.hbArm == "rec" {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
   return holeBoxTail(p, exprIx, fnIx)
@@ -8945,16 +8933,8 @@ function emitUnionWideArmBox(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
     fbStructNew(uBoxIdx)
     return 1
   }
-  const svi = exprVariantIndex(exprIx, fnIx)
-  let row = -1
-  if svi >= 0 {
-    if armsHoldHeap(atoms, variantHeap(svi)) { return 0 }
-    row = variantRowOf(svi)
-  } else {
-    row = structIndexOfExpr(exprIx, fnIx)
-  }
-  const vi = wideArmOfRow(row, atoms)
-  if vi < 0 || vi >= uTags.length { return 0 }
+  const vi = wideArmPlainOf(unionTy, exprIx, fnIx)
+  if vi < 0 { return 0 }
   fbI32Rel(RS_TAG, uTags[vi])
   if emitExpr(exprIx, fnIx) < 0 { return -1 }
   fbStructNew(uBoxIdx)
@@ -11608,12 +11588,7 @@ function emitMemStructRead(memIx: i32, fnIx: i32): i32 {
     // A NULLABLE-struct receiver (`S | null`) recovers its non-null ref before the
     // field read — the checker proved every such access guarded, so the cast can
     // never trap on a checked program.
-    if (
-      exprNullableStruct(m.memObj, fnIx)
-      && !readOwesNonNullRecover(m.memObj, fnIx)
-    ) {
-      fbRefAsNonNull()
-    }
+    if memRecvOwesNonNull(memIx, fnIx) { fbRefAsNonNull() }
     const narrowOp = memReadNarrowOp(memIx, fnIx)
     if narrowOp >= 0 {
       fbStructGet(sHeapIdx[si], idx)
@@ -25528,14 +25503,8 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
     return emitFail("emitProgram: a dispatch lost a member")
   }
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
-  const slot = fnTagIdSlot()
-  fbLocalSet(slot)
-  let ty = nodeTyAt(callIx, fnIx)
-  // A call through a list element the instance leaves untyped takes its members' one result.
-  if !isVoidTy(ty) && repSigKindOfTy(ty) == null {
-    const at = fnTagArmsOneTy(arms, fnIx)
-    if at >= 0 { ty = at }
-  }
+  tagStashTail()
+  const ty = tagDispatchTy(callIx, arms, fnIx)
   // A call through a set of void members leaves no value, and answers 1; so does one where some
   // member returns nothing (`void | i32`), whose value no slot can take, each result dropped.
   const isVoid = isVoidTy(ty) || tyMentionsVoid(ty, 4)
@@ -25547,25 +25516,13 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
     )
   }
   const boxed = kind == "union"
-  let rslot = -1
-  if kind == "struct" || kind == "nulstruct" { rslot = repSlotOfKind(kind, ty) }
-  if kind == "reflist" || kind == "nulreflist" {
-    rslot = rlSlotOfTy(tyRefArrElemOf(ty))
-  }
   const un = if boxed { boxTyName(ty) } else { "" }
   let k = 0
   while k < arms.length {
     const last = k == arms.length - 1
     if !last {
-      fbLocalGet(slot)
-      fbI32Const(ds[k])
-      fbI32Bin(70) // 0x46 i32.eq
-      if isVoid {
-        fbIf(64)
-      } else {
-        fbOpenIf()
-        fbValtype(kind, rslot)
-      }
+      tagIsTail(ds[k])
+      tagDispatchIfOf(ty)
     }
     let rc = 0
     const armFe = emitArmRowFe(arms[k], fnIx)
@@ -25594,20 +25551,83 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
     fbEnd()
     k = k + 1
   }
-  tailCallIdx = -1
+  if dispatchDeclinesTail() { tailCallIdx = -1 }
   return if isVoid { 1 } else { 0 }
 }
 
-// The lambda instance the row records for dispatch arm call `a`'s callee in function `fnIx`; -1
-// for an arm whose member is named or a lambda mono does not instance, which resolve by name.
-function emitArmRowFe(a: i32, fnIx: i32): i32 {
+// Whether a return of a dispatch's value declines the tail form: the cursor its last arm's call
+// armed is not the dispatch's own call, so legacy and the IR both keep `call; return`.
+export function dispatchDeclinesTail(): boolean { return true }
+
+// The arm `if` of a dispatch whose result type is `ty`, as legacy's writer opens it; -1 when
+// `ty` has no rep a dispatch's value takes. Only a struct or ref-list result names a table row.
+export function tagDispatchIfOf(ty: i32): i32 {
+  const isVoid = isVoidTy(ty) || tyMentionsVoid(ty, 4)
+  if isVoid { return fbIf(64) }
+  const kind = repSigKindOfTy(ty)
+  if kind == null { return -1 }
+  let rslot = -1
+  if kind == "struct" || kind == "nulstruct" { rslot = repSlotOfKind(kind, ty) }
+  if kind == "reflist" || kind == "nulreflist" {
+    rslot = rlSlotOfTy(tyRefArrElemOf(ty))
+  }
+  fbOpenIf()
+  return fbValtype(kind, rslot)
+}
+
+// The result type of call `callIx` through a tagged set with arms `arms`: the call's own, or, where
+// a list element the instance leaves untyped names no rep, its members' one result.
+export function tagDispatchTy(callIx: i32, arms: i32[], fnIx: i32): i32 {
+  const ty = nodeTyAt(callIx, fnIx)
+  if !isVoidTy(ty) && repSigKindOfTy(ty) == null {
+    const at = fnTagArmsOneTy(arms, fnIx)
+    if at >= 0 { return at }
+  }
+  return ty
+}
+
+// The arm calls of call `callIx` through its tagged set, in member order, or none.
+export function tagDispatchArms(callIx: i32, fnIx: i32): i32[] {
+  return fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx))
+}
+
+// The member ids of call `callIx`'s tagged set, one per arm.
+export function tagDispatchIds(callIx: i32, fnIx: i32): i32[] {
+  return fnTagMembers(emitTagSetAt(callIx, fnIx))
+}
+
+// The lambda callee of dispatch arm `a`, the arms legacy stages at their instance
+// (`emitArmRowFe`), or -1 for a named member's arm.
+export function tagArmLambdaCallee(a: i32): i32 {
   const c = nodeAt(a)
   if !(c is Call) || c.callFn < 0 { return -1 }
   const cn = nodeAt(c.callFn)
   if !(cn is Ident) || cn.identName != "" { return -1 }
   const d = identDeclOf(c.callFn)
-  if d < 0 || !(nodeAt(d) is FuncDecl) { return -1 }
-  const fe = monoBundleReadFe(c.callFn, fnIx, elabArmSigAt(a, fnIx))
+  return if d >= 0 && nodeAt(d) is FuncDecl { c.callFn } else { -1 }
+}
+
+// After a tagged call's set id: keep it in the dispatch slot, which each arm's test reads.
+export function tagStashTail(): i32 {
+  fbLocalSet(fnTagIdSlot())
+  return 0
+}
+
+// One arm's test: the kept set id against member id `id`.
+export function tagIsTail(id: i32): i32 {
+  fbLocalGet(fnTagIdSlot())
+  fbI32Const(id)
+  fbI32Bin(70) // 0x46 i32.eq
+  return 0
+}
+
+// The lambda instance the row records for dispatch arm call `a`'s callee in function `fnIx`; -1
+// for an arm whose member is named or a lambda mono does not instance, which resolve by name.
+function emitArmRowFe(a: i32, fnIx: i32): i32 {
+  const f = tagArmLambdaCallee(a)
+  if f < 0 { return -1 }
+  const d = identDeclOf(f)
+  const fe = monoBundleReadFe(f, fnIx, elabArmSigAt(a, fnIx))
   if fe < 0 && monoIsGenericDecl(d) {
     return emitFailAt(
       "emitProgram: a lambda's dispatch arm has no instance built for this call's signature",
@@ -26566,82 +26586,41 @@ function emitCallRefArg(
   // its own row by field set, the pre-merge row wherever the callee's parameter row
   // moved. The seed is the key's, so it agrees with the functype by construction.
   const pkk = sigParamKindAt(ckey, i)
-  // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
-  const pck = sigParamCoerceKind(ckey, i)
-  if pck == "i64" {
-    if emitWidened(args[i], 3, fnIx) < 0 { return -1 }
-  } else if pck == "f64" {
-    if emitWidened(args[i], 4, fnIx) < 0 { return -1 }
-  } else if pck == "f32" {
-    if emitWidened(args[i], 5, fnIx) < 0 { return -1 }
-  } else {
-    // A wide number has no conversion into an `i32` parameter: the value's set is one closure
-    // whose calls disagree on a signature (D15062).
-    const aw = if pkk == "i32" { exprScalarWidth(args[i], fnIx) } else { "" }
-    if aw == "f64" || aw == "i64" || aw == "f32" {
+  const arm = callRefArgArmOf(callIx, fnIx, ckey, args[i], i)
+  match arm {
+    "widenI64" => {
+      if emitWidened(args[i], 3, fnIx) < 0 { return -1 }
+    }
+    "widenF64" => {
+      if emitWidened(args[i], 4, fnIx) < 0 { return -1 }
+    }
+    "widenF32" => {
+      if emitWidened(args[i], 5, fnIx) < 0 { return -1 }
+    }
+    "wideIntoI32" => {
       return emitFail(
         "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call passes a wider number than its `i32` parameter",
       )
     }
-    // the literal-union param positions: a member-literal argument lowers as its
-    // interned i32 atom id, and a `null` argument into a `K | null` param as the
-    // sentinel `-1` — without them a string ref reached an i32 param slot, invalid
-    // wasm with `vl check` clean, in every function-value shape.
-    let clu = cloCallParamLitUnion(callIx, i, fnIx)
-    // An un-annotated parameter pinned at a literal union has a hole in the callee's type,
-    // so the `i` token is the only word, and an atom argument makes it the atom (D3076).
-    if clu == 0 && (pkk == "i32" || pkk == null) {
-      if tyIsLitUnion(nodeTyAt(args[i], fnIx)) { clu = 1 }
-    }
-    // Nor has a string or a heap value, outside a literal union's atom, where the call has an
-    // interned signature; with none, the signature refusal names the gap (D15338, D15011).
-    if (
-      clu == 0
-      && pkk == "i32"
-      && cloSigTypeIdxAt(cloSigPosOfKey(ckey)) >= 0
-      && (exprString(args[i], fnIx)
-        || exprStruct(args[i], fnIx)
-        || exprArray(args[i], fnIx)
-        || exprMap(args[i], fnIx))
-    ) {
+    "heapIntoI32" => {
       return emitFail(
         "emitProgram: a function value is called at two signatures, and the closure it holds was built for one: this call passes a string or a heap value to its `i32` parameter",
       )
     }
-    // the value-union param position (the box `u`): the kind comes off the resolved
-    // `$fnsig` key so the coercion cannot disagree with the bytes; the box's own
-    // identity comes from the checker type instead, since it is slot-free in the ABI —
-    // else a raw member argument pushes a string ref where the box is needed.
-    const cuBox = sigParamKindAt(ckey, i) == "union"
-    if cuBox && !boxOwedAtRecord(args[i], fnIx) {
+    "boxUnrecorded" => {
       // The key says box and the checker records no union for the argument: a producer
       // disagreement. Refuse loudly rather than push the un-boxed operand.
       return emitFail(
         "emitProgram: value-call union parameter has no recorded union for its argument",
       )
     }
-    // the arm-parameter arm (D269, direction 2 of D200): a `variant` parameter demands
-    // one heap type (`variantHeap(vi)`), so a raw push stays a floor except where it is
-    // provably safe. The slot comes off the resolved `$fnsig` key, so the cast target
-    // cannot disagree with the bytes.
-    let cvSlot = -1
-    if sigParamKindAt(ckey, i) == "variant" {
-      cvSlot = sigParamSlotAt(ckey, i)
-      const cvArg = nodeAt(unwrapParen(args[i]))
-      // the layout-twin argument (D732): with a twin declared, the arm and the struct
-      // share one heap type in the emitted module (`uVarSTwin`), so the raw push the
-      // direct call already performs is valid by construction (asked of the heaps,
-      // not the tables — `emitUnionBoxArg`'s discipline at the same seam).
-      const cvTwin = cloArgIsArmHeapTwin(args[i], cvSlot, fnIx)
-      const cvBuildable = cvSlot >= 0
-        && (exprUnion(args[i], fnIx) || cvArg is ObjLit || cvTwin)
-      if exprVariantIndex(args[i], fnIx) < 0 && !cvBuildable {
-        return emitFail(
-          "emitProgram: value-call union-ARM parameter given a value that is not that arm — a value call does not yet build one (annotate the binding as the arm, or call it as a named function)",
-        )
-      }
+    "armNotBuilt" => {
+      return emitFail(
+        "emitProgram: value-call union-ARM parameter given a value that is not that arm — a value call does not yet build one (annotate the binding as the arm, or call it as a named function)",
+      )
     }
-    if cvSlot >= 0 && exprVariantIndex(args[i], fnIx) < 0 {
+    "armUnbox" => {
+      const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
       if exprUnion(args[i], fnIx) {
         if variantHasCrossTagFits(cvSlot, args[i], fnIx) {
@@ -26650,7 +26629,8 @@ function emitCallRefArg(
         fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
         fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
       }
-    } else if pkk == "nulvariant" {
+    }
+    "nulArm" => {
       // The niche parameter (D3074), as the direct call's argument rung builds it: an object
       // literal builds the arm, and a value narrowed out of a box is unboxed to the arm.
       const cnvSlot = sigParamSlotAt(ckey, i)
@@ -26664,22 +26644,19 @@ function emitCallRefArg(
       const cnvSeat = armOpen(cnvOwed, cnvHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
       armClose(cnvSeat, cnvOwed, cnvHeap, args[i], fnIx)
-    } else if cuBox {
+    }
+    "box" => {
       if emitUnionBoxAtRecord("", -1, args[i], fnIx) < 0 { return -1 }
-    } else if (
-      (pkk == "str" || pkk == "nulstr")
-      && exprIsLitAtom(args[i], fnIx)
-    ) {
-      // the mirror of `clu`: a literal-union atom argument flowing into a `string` or
-      // `string | null` parameter widens to its member string, since the functype declares
-      // a string ref there and the atom local holds an i32 id (D3189).
+    }
+    "atomToStr" => {
+      // A literal-union atom into a `string` parameter widens to its member string, since the
+      // functype declares a string ref there and the atom local holds an i32 id (D3189).
       if emitAtomToStr(args[i], fnIx) < 0 { return -1 }
-    } else if (
-      clu == 0
-      && (isScalarBackedListRep(pkk) || isNulScalarListKind(pkk))
-    ) {
+    }
+    "scalarList" | "atom" => {
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-    } else if clu == 0 {
+    }
+    "general" => {
       // The parameter's nullability is assigned from the key, as a direct call assigns it
       // from the declaration: an enclosing position's non-null expectation would otherwise
       // recover a `null` argument into a nullable parameter, a trap (D2552).
@@ -26696,15 +26673,117 @@ function emitCallRefArg(
       const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
       armClose(pkSeat, pkOwed, pkHeap, args[i], fnIx)
-    } else {
-      if emitExpr(args[i], fnIx) < 0 { return -1 }
     }
-    // The same boundary as a direct call's, keyed off the `$fnsig` param (D2537).
-    emitNonNullParamRecover(pkk, args[i], fnIx)
   }
+  // The same boundary as a direct call's, keyed off the `$fnsig` param (D2537).
+  emitNonNullParamRecover(pkk, args[i], fnIx)
   return if argPlainArm { 1 } else { 0 }
 }
 
+// Whether argument `a` takes `emitCallRefArg`'s general arm with nothing owed: a scalar of its
+// parameter's own width, a string, or a record neither unboxed from a narrowing nor nullable.
+function callRefArgPlain(
+  callIx: i32,
+  fnIx: i32,
+  ckey: string,
+  a: i32,
+  i: i32,
+): boolean {
+  if callRefArgArmOf(callIx, fnIx, ckey, a, i) != "general" { return false }
+  if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
+  const k = sigParamKindAt(ckey, i)
+  if k == "str" { return true }
+  if k == "struct" {
+    return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
+  }
+  return (k == "i32" || k == "i64" || k == "f64" || k == "f32")
+    && exprScalarWidth(a, fnIx) == k
+}
+
+// How a function-value call writes argument `a`, parameter `i` of key `ckey`, in
+// `emitCallRefArg`'s order: a widening, a refusal, the union-arm or box arms, an atom's string,
+// or the general arm. The IR asks it too, and builds only the general arm.
+export type CallRefArgArm = "widenI64"
+  | "widenF64"
+  | "widenF32"
+  | "wideIntoI32"
+  | "heapIntoI32"
+  | "boxUnrecorded"
+  | "armNotBuilt"
+  | "armUnbox"
+  | "nulArm"
+  | "box"
+  | "atomToStr"
+  | "scalarList"
+  | "general"
+  | "atom"
+
+// The arm `emitCallRefArg` takes for argument `a` (parameter `i` of key `ckey`) of call `callIx`.
+export function callRefArgArmOf(
+  callIx: i32,
+  fnIx: i32,
+  ckey: string,
+  a: i32,
+  i: i32,
+): CallRefArgArm {
+  const pkk = sigParamKindAt(ckey, i)
+  // An argument's raw-read seeds are its parameter's alone, as at a direct call (D3816).
+  const pck = sigParamCoerceKind(ckey, i)
+  if pck == "i64" { return "widenI64" }
+  if pck == "f64" { return "widenF64" }
+  if pck == "f32" { return "widenF32" }
+  // A wide number has no conversion into an `i32` parameter: the value's set is one closure
+  // whose calls disagree on a signature (D15062).
+  const aw = if pkk == "i32" { exprScalarWidth(a, fnIx) } else { "" }
+  if aw == "f64" || aw == "i64" || aw == "f32" { return "wideIntoI32" }
+  // A member-literal argument into a literal-union parameter lowers as its interned atom id, and
+  // `null` into a `K | null` one as the sentinel; an un-annotated parameter pinned at a literal
+  // union has only the `i` token, so an atom argument makes it the atom (D3076).
+  let clu = cloCallParamLitUnion(callIx, i, fnIx)
+  if clu == 0 && (pkk == "i32" || pkk == null) {
+    if tyIsLitUnion(nodeTyAt(a, fnIx)) { clu = 1 }
+  }
+  // Nor has a string or a heap value, outside a literal union's atom, where the call has an
+  // interned signature; with none, the signature refusal names the gap (D15338, D15011).
+  if (
+    clu == 0
+    && pkk == "i32"
+    && cloSigTypeIdxAt(cloSigPosOfKey(ckey)) >= 0
+    && (exprString(a, fnIx)
+      || exprStruct(a, fnIx)
+      || exprArray(a, fnIx)
+      || exprMap(a, fnIx))
+  ) {
+    return "heapIntoI32"
+  }
+  // The value-union parameter takes the box, whose kind comes off the key (D712).
+  const cuBox = pkk == "union"
+  if cuBox && !boxOwedAtRecord(a, fnIx) { return "boxUnrecorded" }
+  // An arm parameter demands one heap type, so a raw push is a floor except where it is
+  // provably safe: a box narrowed to the arm, an object literal, or a layout twin (D269, D732).
+  if pkk == "variant" {
+    const cvSlot = sigParamSlotAt(ckey, i)
+    const cvArg = nodeAt(unwrapParen(a))
+    const cvBuildable = cvSlot >= 0
+      && (exprUnion(a, fnIx)
+      || cvArg is ObjLit
+      || cloArgIsArmHeapTwin(a, cvSlot, fnIx))
+    if exprVariantIndex(a, fnIx) < 0 {
+      if !cvBuildable { return "armNotBuilt" }
+      if cvSlot >= 0 { return "armUnbox" }
+    }
+  }
+  if pkk == "nulvariant" { return "nulArm" }
+  if cuBox { return "box" }
+  if (pkk == "str" || pkk == "nulstr") && exprIsLitAtom(a, fnIx) {
+    return "atomToStr"
+  }
+  if clu == 0 && (isScalarBackedListRep(pkk) || isNulScalarListKind(pkk)) {
+    return "scalarList"
+  }
+  if clu == 0 { return "general" }
+  return "atom"
+}
 // The first argument whose type at frame `fnIx` is a scalar or string other than the one
 // parameter `i` of function `fe` takes, which no coercion bridges; -1 when every argument fits.
 export function directCallInstanceArgMisfit(
@@ -26983,6 +27062,10 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
   if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
   const callee = nodeAt(c.callFn)
+  if callee is Member {
+    if !fieldCallRefPlainHead(callIx, c, callee, fnIx) { return "" }
+    return callRefPlainTail(callIx, c, fnIx)
+  }
   if !(callee is Ident) { return "" }
   const nm = callee.identName
   const d = identDeclOf(c.callFn)
@@ -27011,6 +27094,27 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   ) {
     return ""
   }
+  return callRefPlainTail(callIx, c, fnIx)
+}
+
+// `callRefPlainKey`'s head for a function-valued field of a record, `o.f(…)`, which legacy's
+// `emitCallCore` sends to `emitCallRef` with no name dispatch: no bundle and no held record.
+function fieldCallRefPlainHead(
+  callIx: i32,
+  c: Call,
+  m: Member,
+  fnIx: i32,
+): boolean {
+  return exprIsClosure(c.callFn, fnIx)
+    && exprStruct(m.memObj, fnIx)
+    && bundleParamOfRead(c.callFn, fnIx) < 0
+    && placeRecordSigs(callIx, fnIx).length == 0
+}
+
+// The part of `callRefPlainKey` every callee shares: no lift, nullable value or top-level
+// lambda's record, an interned key, no refusal, and each argument a scalar at its parameter's
+// own valtype.
+function callRefPlainTail(callIx: i32, c: Call, fnIx: i32): string {
   if cloLiftCalleeOf(c.callFn, fnIx) >= 0 || exprNulClosure(c.callFn, fnIx) {
     return ""
   }
@@ -27030,23 +27134,12 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   let i = 0
   while i < n {
     const a = c.callArgs[i]
-    const k = sigParamKindAt(ckey, i)
     const bty: i32[] = [0 - 1]
-    // A string or record argument is legacy's plain arm only unread as an atom, unboxed from a
-    // narrowing or recovered from a nullable.
-    const heap = k == "str" && !exprIsLitAtom(a, fnIx)
-      || k == "struct"
-      && !narrowedArmNeedsUnbox(a, fnIx)
-      && !exprNullableRecord(a, fnIx)
     if (
-      !(k == "i32" || k == "i64" || k == "f64" || k == "f32" || heap)
-      || sigParamCoerceKind(ckey, i) != null
-      || bundleCallArgSigs(c.callFn, fnIx, i, bty).length > 0
+      bundleCallArgSigs(c.callFn, fnIx, i, bty).length > 0
       || bundleKeyParamTy(ckey, i, a) >= 0
       || emitBundleRecordRead(a, fnIx)
-      || cloCallParamLitUnion(callIx, i, fnIx) != 0
-      || tyIsLitUnion(nodeTyAt(a, fnIx))
-      || !heap && exprScalarWidth(a, fnIx) != k
+      || !callRefArgPlain(callIx, fnIx, ckey, a, i)
     ) {
       return ""
     }
@@ -27062,11 +27155,22 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   return ckey
 }
 
+// Whether a statement calling function-valued field `m` (call `ix`) leaves nothing to drop: the
+// call's key returns nothing, or, unless the call's type is closed, the field's function is void.
+function fieldCallStmtVoid(ix: i32, m: Member, fnIx: i32): boolean {
+  if sigKeyRetIsVoid(cloCallSigKey(ix, fnIx)) { return true }
+  if callTyClosedIn(ix, fnIx) { return false }
+  const fe = fieldClosureFeOfRecv(m.memObj, m.memProp, fnIx)
+  return fe >= 0 && fRetVoid[fe] == 1
+}
+
 // Whether a statement of plain closure call `ix` (`callRefPlainKey`) leaves nothing to drop: its
 // key or its callee's read returns nothing, as `emitCallStmtIdent` asks.
 export function callRefPlainVoid(ix: i32, fnIx: i32): boolean {
   const c = nodeAt(ix)
   if !(c is Call) { return false }
+  const f = if c.callFn >= 0 { nodeAt(c.callFn) } else { null }
+  if f is Member { return fieldCallStmtVoid(ix, f, fnIx) }
   return sigKeyRetVoid(cloCallSigKey(ix, fnIx))
     || calleeReturnsVoidOfRead(unwrapParen(c.callFn), fnIx)
 }
@@ -32898,14 +33002,7 @@ function emitCallStmt(s: Call, stmtIx: i32, fnIx: i32) {
       // key leaves nothing on the stack, so dropping is invalid wasm regardless of the
       // field's rep function. Asked first, since the rep-function fallback is wrong
       // exactly when the two disagree.
-      let mcVoid = sigKeyRetIsVoid(cloCallSigKey(stmtIx, fnIx))
-      if !mcVoid && !callTyClosedIn(stmtIx, fnIx) {
-        const mcFe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-        if mcFe >= 0 {
-          if fRetVoid[mcFe] == 1 { mcVoid = true }
-        }
-      }
-      if !mcVoid {
+      if !fieldCallStmtVoid(stmtIx, callee, fnIx) {
         fbDrop() // 0x1a drop (discard the unused result)
       }
       return 0
@@ -35758,9 +35855,9 @@ export function coerceHeldSwap(ix: i32): i32 {
 }
 
 // The legacy context an expression fragment rooted at `root` would read, or "": ir-design §10.2.1.
-// A node mark reaches the fragment only on its root (a held coercion, a storage read) or, for a
-// staged operand, inside it; an open list-build region only through a counted push inside it. The
-// seats are spent or inert below `coerceKindAt`, and the two lexical frames hold no `for` here.
+// A held coercion or storage read reaches it only on its root, a staged operand only inside it, an
+// open list-build region only through a counted push inside it. The seats are spent or inert, the
+// lexical frames hold no `for`, and the shared tails read `listCastForPush` live as legacy does.
 export function legacyContextLiveWhy(root: i32): string {
   if coerceHeld >= 0 && coerceHeld == root { return "coerceHeld on the root" }
   if isStorageRead(root) { return "storage read of the root" }
@@ -35773,7 +35870,6 @@ export function legacyContextLiveWhy(root: i32): string {
   if listGetRecvStagedIx >= 0 && nodeContains(root, listGetRecvStagedIx) {
     return "staged list get"
   }
-  if listCastForPush { return "push receiver cast" }
   // A root reading a capture stand-in would owe `listFitStoodIn` as the door's output.
   if root >= 0 && root < P.nodes.length && nodeAt(root) is Ident {
     return "identifier root"
@@ -37041,14 +37137,10 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
     // A union-box cell the checker typed this read as one atom of reads unboxed, through
     // `emitUnionBoxPush`: `if u is i32 { print(u) }` yields the raw i32.
     "unbox" => {
-      const vak = identReadAtomKindAt(exprIx, fnIx)
-      // D947 — a dead generic narrow reads `unreachable`: a type parameter narrowed to an
-      // impossible arm type-checks, and its arm is constant-false there.
-      if fnHasTyParams(fnIx) {
-        if unionTyHasValueKind(unionBoxTyOfRead(exprIx, fnIx), vak) == 0 {
-          fbUnreachable()
-          return 0
-        }
+      const vak = identUnboxAtomOf(exprIx, fnIx)
+      if vak < 0 {
+        fbUnreachable()
+        return 0
       }
       return emitValueUnionUnboxRead(exprIx, vak, fnIx)
     }

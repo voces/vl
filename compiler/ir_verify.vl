@@ -59,7 +59,9 @@ import {
   RRel,
   RRetag,
   RStrOp,
+  RTagIs,
   RTagOf,
+  RTagStash,
   RTest,
   RToBox,
   RUnionEq,
@@ -108,6 +110,7 @@ import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
+import { tyIsFnValue } from "./emit_classify"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -360,7 +363,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RBoxNarrow => {
       use(r.bnV, at)
-      if !(repNodeAt(opRep(r.bnV)) is RBox) {
+      const bn = repNodeAt(opRep(r.bnV))
+      const boxed = bn is RBox
+        || r.bnAtom >= 0 && bn is RNullable && bn.rnDisc == 4
+      if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
       }
       0
@@ -530,7 +536,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(
           2,
           at,
-          "a null is not delivered into a K | null or a string | null",
+          "a null is not delivered into a K | null or a nullable reference",
         )
       }
       0
@@ -542,7 +548,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(
           2,
           at,
-          "a null test of neither a K | null nor a string | null",
+          "a null test of neither a K | null nor a nullable reference",
         )
       }
       0
@@ -644,6 +650,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMapOp => uses(r.mpArgs, at)
+    RTagStash => {
+      use(r.tgsV, at)
+      if opRep(r.tgsV) != vfI32 {
+        return fail(2, at, "a tag stash keeps an i32 set id")
+      }
+      0
+    }
+    RTagIs => if dst != vfBool { fail(2, at, "a tag test is a bool") } else { 0 }
     RCoalAtomStr => {
       use(r.zaL, at)
       use(r.zaD, at)
@@ -668,11 +682,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.czL, at)
       use(r.czD, at)
       const l = repNodeAt(opRep(r.czL))
-      if (
-        !(l is RNullable)
-        || !nicheRetag(l.rnDisc, l.rnInner)
-        || l.rnDisc != 1
-      ) {
+      if (!(l is RNullable) || l.rnDisc != 1 || repPrim(l.rnInner) != "str") {
         return fail(2, at, "a string coalesce of a non-string | null")
       }
       if !(r.czD is OStr) {
@@ -1270,7 +1280,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
   }
 }
 
@@ -1280,6 +1290,14 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 // Whether type `ty` is no closed type a variable can have (rule 1): absent, or open in a type
 // parameter. The builder asks it first, so such a function is uncovered rather than refused.
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
+
+// Whether a variable of type `ty` at rep `rep` is open (rule 1): a tagged set's polymorphic
+// function type is not, being held as the set's i32 id whatever its variables.
+export function irTyHeldOpen(ty: i32, rep: i32): boolean {
+  if !irTyOpen(ty) { return false }
+  const p = repPrim(rep)
+  return !(tyIsFnValue(ty) && p != null && p == "i32")
+}
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
 export function irVerify(f: IrFn): IrVerdict {
@@ -1322,7 +1340,7 @@ export function irVerify(f: IrFn): IrVerdict {
         -1,
         "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
       )
-    } else if irTyOpen(v.vTy) {
+    } else if irTyHeldOpen(v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
     } else if repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
@@ -1354,9 +1372,14 @@ export function irVerify(f: IrFn): IrVerdict {
 }
 
 // Whether a nullable of discipline `disc` over rep `inner` is a niche that holds its inner value
-// unchanged: a `K | null` atom (3), or a `string | null` ref (1 over the string).
+// unchanged: a `K | null` atom (3), a `boolean | null` (2, its null the sentinel 2), or a nullable
+// ref (1) over a string, record, list, map or closure.
 function nicheRetag(disc: i32, inner: i32): boolean {
   if disc == 3 { return true }
+  if disc == 2 { return repPrim(inner) == "bool" }
+  if disc != 1 { return false }
   const p = repPrim(inner)
-  return disc == 1 && p != null && p == "str"
+  if p != null { return p == "str" }
+  const n = repNodeAt(inner)
+  return n is RRecord || n is RList || n is RMap || n is RClosure
 }
