@@ -10856,9 +10856,7 @@ function emitSharedFieldArm(
     fbI32Rel(RS_TAG, scalarTagOfKind(bk))
   }
   if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  fbRefCast(variantHeap(vi))
-  fbStructGet(variantHeap(vi), fi)
+  sharedArmPayloadRead(vi, fi)
   if setStr {
     if texts.length == 0 {
       return emitFail(
@@ -10898,11 +10896,88 @@ function emitSharedFieldArm(
     if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
     fbStructNew(uBoxIdx)
   }
-  // A `string | null` member read where a narrowing excluded `null` holds a string.
+  return sharedArmStrRecover(code, vi, fi)
+}
+
+// After the receiver box: its payload cast to member `vi`, read at field `fi`.
+function sharedArmPayloadRead(vi: i32, fi: i32) {
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
+}
+
+// A `string | null` member read where a narrowing excluded `null` holds a string.
+function sharedArmStrRecover(code: i32, vi: i32, fi: i32): i32 {
   if code == FC_STR && fieldRowIsStr(uFieldStart[vi] + fi, true) {
     fbRefAsNonNull()
   }
   return 0
+}
+
+// Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as the plain read alone:
+// no `null` member, no atom or string conversion, no box.
+function sharedArmIsPlain(code: i32, vi: i32, fi: i32): boolean {
+  if vi < 0 || vi >= uVarRow.length || sharedFieldArmNull(vi, fi) {
+    return false
+  }
+  const own = variantFieldTypeAt(vi, fi)
+  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
+    return false
+  }
+  if code == FC_STR && own == FC_NUL_LIT_UNION { return false }
+  return !sharedFieldArmConverts(code, vi, fi)
+    && !sharedFieldReadBoxes(code, vi, fi)
+}
+
+// After the receiver box: a plain arm of plan `code` for member `vi`, field `fi`.
+export function sharedArmPlainTail(code: i32, vi: i32, fi: i32): i32 {
+  sharedArmPayloadRead(vi, fi)
+  return sharedArmStrRecover(code, vi, fi)
+}
+
+// After the receiver box: arm `i`'s tag test of plan `code` over members `vis`, then the open of
+// the `if` whose result is the field's rep.
+export function sharedArmTestTail(code: i32, vis: i32[], fis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Bin(70) // 0x46 i32.eq
+  const a = sharedFieldValueArm(vis, fis)
+  return fbIfForSharedPlan(code, vis[a], fis[a])
+}
+
+// The plan `emitMemSharedRead` dispatches member read `memIx` on, its members into `vis` and their
+// fields into `fis`, or -1 where it reads the plain struct instead.
+export function sharedReadPlanOf(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return -1 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return if code >= 0 && sharedFieldPlanDispatchable(code, vis, fis) { code } else { -1 }
+}
+
+// Whether `emitMemSharedRead` writes read `memIx` as its plain dispatch: an ident receiver read
+// again per arm, every arm plain, and no unbox or recover after the dispatch.
+export function sharedReadPlainOf(memIx: i32, fnIx: i32): boolean {
+  if memReadArmOf(memIx, fnIx) != "shared" { return false }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedReadPlanOf(memIx, fnIx, vis, fis)
+  if code < 0 || vis.length < 1 || fis.length != vis.length { return false }
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const r = unwrapParen(m.memObj)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return false }
+  let i = 0
+  while i < vis.length {
+    if !sharedArmIsPlain(code, vis[i], fis[i]) { return false }
+    i = i + 1
+  }
+  if code == FC_UNION && pathReadAtomKind(memIx, fnIx) >= 0 { return false }
+  return !(code == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx))
 }
 
 // A string literal set stored at the atom (`own`, `FC_I32` or its `-1` niche) read as the
@@ -11444,15 +11519,8 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
     // stays here, being a question about spelling a blocktype rather than about typing a read.
     const shVis: i32[] = []
     const shFis: i32[] = []
-    const shCode = sharedUnionFieldPlan(
-      mS.memObj,
-      mS.memProp,
-      memIx,
-      fnIx,
-      shVis,
-      shFis,
-    )
-    if shCode >= 0 && sharedFieldPlanDispatchable(shCode, shVis, shFis) {
+    const shCode = sharedReadPlanOf(memIx, fnIx, shVis, shFis)
+    if shCode >= 0 {
       // The receiver is evaluated once unless re-emitting it is free. The arms below read it
       // twice each — the tag test, then the payload cast — which is why an ident receiver, whose
       // `local.get` re-emits for nothing, needs no slot. A call does not: `g(true).v` would call
@@ -11472,11 +11540,7 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
       let si2 = 0
       while si2 < shVis.length - 1 {
         if emitSharedFieldRecv(mS.memObj, fnIx, shSlot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0)                           // field 0: tag
-        fbI32Rel(RS_TAG, uTags[shVis[si2]])
-        fbI32Bin(70)                                      // 0x46 i32.eq
-        const shA = sharedFieldValueArm(shVis, shFis)
-        fbIfForSharedPlan(shCode, shVis[shA], shFis[shA]) // if (result <the field's own rep>)
+        sharedArmTestTail(shCode, shVis, shFis, si2)
         const shArm = emitSharedFieldArm(
           shCode,
           shVis[si2],
