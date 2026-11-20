@@ -384,6 +384,7 @@ import {
   uFieldCount,
   uFieldStart,
   uTags,
+  uVarTyIx,
 } from "./emit_state"
 import {
   cloSigPosOfKey,
@@ -1834,7 +1835,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr, -1)
       if ibMiss != "" { return missRhs("argument") }
-      if i > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
+      if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
       if irBOpRep(a) != pr { return missRhs("argument coercion") }
@@ -1976,7 +1977,7 @@ function opndsAreTemps(os: Opnd[]): boolean {
 // For an argument built into `b` from `at` on that holds a valued `if`: makes each earlier
 // argument in `args` that is a variable or immediate a staged temp at its own start (`starts`),
 // so the lowering writes them all below the `if` in order. False when one cannot be.
-function stageLeadArgs(
+export function irBStageLeads(
   b: i32[],
   at: i32,
   starts: i32[],
@@ -1989,7 +1990,6 @@ function stageLeadArgs(
   let j = 0
   while j < args.length {
     const a = args[j]
-    if a is OStr { return false }
     // A valued `if`'s out is already on the stack, in its order.
     if a is OVar && (a.ov < 0 || a.ov >= ib.irVars.length) { return false }
     const held = a is OVar
@@ -2161,7 +2161,7 @@ function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
     starts.push(at)
     const v = irBExpr(b, a)
     if ibMiss != "" { return missRhs("argument") }
-    if args.length > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
+    if args.length > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
       return missRhs("short-circuit argument after another")
     }
     const p = repPrim(irBOpRep(v))
@@ -2786,6 +2786,12 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   ) {
     return boxTemp(b, irBBoxLocal(bx), ix, dst)
   }
+  // A literal the box plan boxes as another variant arm is built at that arm's row, as legacy's
+  // `emitVariantStruct` builds it.
+  if ibMiss == "" && dst >= 0 && heldAsBox(dst) && boxOwedAt(ix, ibFnIx) {
+    const vi = boxLitArmRow(ix)
+    if vi >= 0 { return boxTempAt(b, armLit(b, ix, vi), ix, dst, vi) }
+  }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
     return memberBoxTemp(b, ix, dst)
@@ -2812,18 +2818,46 @@ function memberBoxTemp(b: i32[], ix: i32, dst: i32): Opnd {
   return boxTemp(b, v, ix, dst)
 }
 
+// The variant row the box plan builds object literal `ix` at where that is not the literal's own
+// layout (`obj` arm), or -1.
+function boxLitArmRow(ix: i32): i32 {
+  const lit = unwrapParen(ix)
+  if lit < 0 || lit >= P.nodes.length || !(nodeAt(lit) is ObjLit) { return -1 }
+  const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
+  if p.hbArm != "obj" || objLitVariantLayoutOf(lit, ibFnIx) == p.hbKind {
+    return -1
+  }
+  return p.hbKind
+}
+
+// Object literal `ix` built at variant row `vi`, at the row's own type.
+function armLit(b: i32[], ix: i32, vi: i32): Opnd {
+  const pre = exprPrePathWhy(ix, ibFnIx)
+  if pre != "" { return irBMiss(pre) }
+  const ty = if vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 }
+  if ty < 0 { return irBMiss("box literal arm type") }
+  // In a generic instance the row's registered type may still carry a variable.
+  const rep = repNodeOfTy(ty)
+  if irTyOpen(ty) || irTyHeldOpen(ty, rep) {
+    return irBMiss("open box literal arm type")
+  }
+  return objLitAt(b, unwrapParen(ix), rep, ty, vi, true)
+}
+
 // `v`, built from `ix`, boxed into boxed nullable `dst` by the shared box plan.
 function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
+  return boxTempAt(b, v, ix, dst, -1)
+}
+
+// `boxTemp` for `v` built at variant row `at`, or at its own layout where `at` is -1.
+function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
+  if ibMiss != "" { return v }
   const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
   const why = boxPlanWhy(p, v)
   if why != "" { return irBMiss(why) }
   // A literal boxed as its context arm is the IR's record only when it is built at that arm.
-  if (
-    p.hbArm == "obj"
-    && objLitVariantLayoutOf(unwrapParen(ix), ibFnIx) != p.hbKind
-  ) {
-    return irBMiss("box literal arm")
-  }
+  const row = if at >= 0 { at } else { objLitVariantLayoutOf(unwrapParen(ix), ibFnIx) }
+  if p.hbArm == "obj" && row != p.hbKind { return irBMiss("box literal arm") }
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
 }
 
@@ -4109,17 +4143,18 @@ function assign(b: i32[], n: BinExpr, ix: i32) {
 function accAppend(b: i32[], n: BinExpr, ix: i32) {
   const parts = strCatPartsOf(n.binRight, ibFnIx)
   const args: Opnd[] = []
+  const starts: i32[] = []
+  const ixs: i32[] = []
   let i = 1
   while i < parts.length {
     const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
-    if (
-      args.length > 0
-      && ifBelowLeadOf(b, from, "string operand after another", args)
-    ) {
-      return 0
+    if args.length > 0 && !irBStageLeads(b, from, starts, args, ixs) {
+      return skip("string operand after another")
     }
+    starts.push(from)
+    ixs.push(parts[i])
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
     args.push(a)
     i = i + 1
@@ -4217,7 +4252,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   // A valued `if` is written in place after the receiver and index, which are staged below it;
   // the store's tail is their one consumer (a hoisted receiver's skip misses at the lowering).
   const lead = [v, i]
-  if !stageLeadArgs(b, xat, [vat, at], lead, [t.idxArr, t.idxIndex]) {
+  if !irBStageLeads(b, xat, [vat, at], lead, [t.idxArr, t.idxIndex]) {
     return skip("if into an element store")
   }
   irBNode(b, { bcV: lead[0], bcIx: lead[1] }, -1, ibNoValue, ix)
@@ -4260,7 +4295,7 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const leads: Opnd[] = [v0]
   const starts: i32[] = [vAt]
   const why = "field store short-circuit operand"
-  if !stageLeadArgs(b, at, starts, leads, [t.memObj]) {
+  if !irBStageLeads(b, at, starts, leads, [t.memObj]) {
     if ibMiss == "" { ifBelowLead(b, at, why) }
     return 0
   }
