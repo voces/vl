@@ -2573,3 +2573,37 @@ print(q.o?.n ?? 0)
     }
   },
 });
+
+// A plain value stored into a nullable field is delivered at the field's rep, which legacy's bare
+// value already is: a string, an atom and a boolean into their `| null` fields, and a generic's.
+Deno.test({
+  name: "ir shadow: a field store's plain value at a nullable field matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type K = "a" | "b"
+type R = { s: string | null, k: K | null, f: boolean | null, n: i32 }
+function setS(r: R) { r.s = "z" }
+function setK(r: R, k: K) { r.k = k }
+function setF(r: R, f: boolean) { r.f = f }
+function setG<T>(r: R, x: T) { r.s = x }
+const r: R = { s: null, k: null, f: null, n: 0 }
+setS(r)
+setK(r, "b")
+setF(r, true)
+print(
+  (r.s ?? "-")
+    + (if r.k == null { "-" } else { "k" })
+    + (if r.f == null { "-" } else { "f" }),
+)
+const v: string | null = "y"
+setG(r, v)
+print(r.s ?? "-")
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
