@@ -692,6 +692,35 @@ print(h(true))
   },
 });
 
+// A fused `xs.pop() ?? d` on a held, a staged (global) and an f64 receiver, with a variable default,
+// and a default that reassigns the receiver: legacy's shared open, then its default in the empty
+// arm, every function matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a fused pop with a default is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let g: i32[] = [1, 2]
+function a(xs: i32[]): i32 { return xs.pop() ?? -1 }
+function b(): i32 { return g.pop() ?? 0 }
+function c(xs: f64[]): f64 { return xs.pop() ?? 0.5 }
+function d(xs: i32[], k: i32): i32 { return xs.pop() ?? k }
+function e(p: i32): i32 {
+  let xs: i32[] = []
+  const other: i32[] = [7, 8, 9]
+  const v = xs.pop() ?? (xs = other).length
+  return v * 10 + xs.length
+}
+print(a([3]) + b() + d([], 6) + e(1))
+print(c([]))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -1004,7 +1033,9 @@ Deno.test({
     // case 9 stores an i32 into a bool global (rule 2).
     // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
     // case 11 a box whose immediate stands for a call (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2];
+    // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
+    // (rule 2), and a default that leaves the out unwritten (rule 5).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);

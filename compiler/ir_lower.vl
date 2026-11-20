@@ -268,6 +268,8 @@ import {
   idxSpanOn,
   initBitOf,
   listBuildClose,
+  listOpRecvHeld,
+  listOpStageBase,
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
@@ -300,6 +302,8 @@ import {
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
   objStructNewTail,
+  popOrOpen,
+  popOrPlanOf,
   printArmOf,
   printAtomTail,
   printNulStrOpen,
@@ -308,6 +312,7 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  stageListRecvTail,
   staticAtomId,
   structFieldTail,
   structUnionBoxTail,
@@ -335,7 +340,7 @@ import {
   structFieldPlain,
   variantFieldPlain,
 } from "./emit_plan_union"
-import { nullRetPlanOf } from "./emit_plan_null"
+import { CoalBoxArm, coalValBoxArm, nullRetPlanOf } from "./emit_plan_null"
 import {
   binNulTestOf,
   coalResultKindOf,
@@ -1818,9 +1823,8 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   return IF_VALUED
 }
 
-// A `??` over a boxed operand through legacy's shared tails: the stash slot taken before the box,
-// the box, the open, the default writing the slotless out, the else, a binding's re-read box, and
-// the end. The out stays on the stack for its one later read, as a valued `if`'s does.
+// A `??` through legacy's shared tails, along its arm: a boxed operand's, or the fused pop's. The
+// out stays on the stack for its one later read, as a valued `if`'s does.
 function coalBox(n: SCoalBox, pending: i32[]) {
   const t = n.cbOut
   if varSlot(t) >= 0 { return irLMiss("coalesce box into a slot") }
@@ -1829,20 +1833,63 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   }
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
-  const lhsIx = unwrapParen(e.binLeft)
-  const fnIx = lw.irAt
-  const slot = coalBoxSlot(n.cbArm)
-  cond(n.cbL, pending)
-  if coalBoxOpen(n.cbArm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
-  lwFrames.push(-1)
-  body(n.cbNull, false, t)
-  if coalBoxElse(n.cbArm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
-  if n.cbArm == "valBox" || n.cbArm == "valScalar" { irLOpnd(n.cbL) }
-  lwFrames.pop()
-  if coalBoxEnd(n.cbArm, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
+  const ba = coalValBoxArm(n.cbArm)
+  const got = if ba == null { coalPopOr(n, e, pending) } else { coalBoxArm(n, ba, e, pending) }
+  if got < 0 { return -1 }
   lwStackVal[t] = true
   lwStackLive = lwStackLive + 1
   pending.push(t)
+  return 0
+}
+
+// A boxed operand's arm: the stash slot taken before the box, the box, the open, the default
+// writing the slotless out, the else, a binding's re-read box, and the end.
+function coalBoxArm(
+  n: SCoalBox,
+  arm: CoalBoxArm,
+  e: BinExpr,
+  pending: i32[],
+): i32 {
+  const lhsIx = unwrapParen(e.binLeft)
+  const fnIx = lw.irAt
+  const slot = coalBoxSlot(arm)
+  cond(n.cbL, pending)
+  if coalBoxOpen(arm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut)
+  if coalBoxElse(arm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
+  const reread = match arm {
+    "valBox" | "valScalar" => true
+    "elem" | "callBox" | "callScalar" | "boolPop" | "valNoKind" | "callNoKind" | "next" => false
+  }
+  if reread { irLOpnd(n.cbL) }
+  lwFrames.pop()
+  return coalBoxEnd(arm, e, lhsIx, n.cbAt, fnIx)
+}
+
+// The fused `xs.pop() ?? d`: the receiver held in its local or staged as legacy stages it, the
+// shared open, then the default writing the slotless out, and the end.
+function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const fnIx = lw.irAt
+  const p = popOrPlanOf(unwrapParen(e.binLeft), fnIx)
+  if p == null { return irLMiss("popOr plan") }
+  let lIdx = listOpRecvHeld(p.poRecv, fnIx, ".pop")
+  if lIdx == -2 { return irLMiss("popOr receiver") }
+  lwSeq = []
+  if lIdx >= 0 {
+    irLSkip(n.cbL)
+  } else {
+    irLOpnd(n.cbL)
+    const sb = listOpStageBase(p.poBase, -1)
+    stageListRecvTail(p.poRecv, fnIx, sb)
+    lIdx = sb + 3
+  }
+  irLSettle(pending)
+  popOrOpen(p, lIdx)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut)
+  lwFrames.pop()
+  fbEnd()
   return 0
 }
 
