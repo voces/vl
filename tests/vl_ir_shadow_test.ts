@@ -1012,6 +1012,39 @@ Deno.test({
   },
 });
 
+// A record whose field holds a generic function is typed open, but legacy holds the function as
+// its tagged set's id, so the record's rep is closed (`irTyHeldOpen`): the local builds and every
+// covered function matches. The program is distilled cell d15117_fw_alias_one_f64_str_ab_fn_bound.
+const OPEN_CONTAINER = `function id0(a) { return a }
+function id1(a) { return a }
+function run() {
+  const r = { f: id0 }
+  const q = r
+  q.f = id0
+  const g = r.f
+  print(g(2.5))
+  print(g("s"))
+}
+run()
+`;
+Deno.test({
+  name: "ir shadow: a record of a tagged set's function is held open and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(OPEN_CONTAINER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered open local type")) {
+      throw new Error(`want no open-local miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A list delivery whose copy owes nothing past the value (`listCopyOwesNothing`) is the value as
 // built, so the builder takes it as a plain node: no coercion miss, and every covered function
 // matches legacy's bytes. The program is distilled cell b004880.
