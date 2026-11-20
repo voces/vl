@@ -2379,3 +2379,21 @@ Deno.test({
     }
   },
 });
+
+// `recv is null` and `recv is <member>` over a nullable niche (a string, a boolean and a
+// literal union) take `isArmOf`'s null-test rung: the niche's own null test, covered and matched.
+const IS_NULL_TEST_RUNG =
+  `type K = "a" | "b"\nfunction sNul(s: string | null) { return if s is null { 1 } else { 0 } }\nfunction sSome(s: string | null) { return if s is string { 1 } else { 0 } }\nfunction bNul(b: boolean | null) { return if b is null { 1 } else { 0 } }\nfunction bSome(b: boolean | null) { return if b is boolean { 1 } else { 0 } }\nfunction kNul(k: K | null) { return if k is null { 1 } else { 0 } }\nprint(sNul(null) + sSome("x") + bNul(false) + bSome(null) + kNul("b"))\n`;
+Deno.test({
+  name: "ir shadow: an is test at the null-test rung over a nullable niche is covered and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(IS_NULL_TEST_RUNG, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});

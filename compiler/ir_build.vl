@@ -242,6 +242,7 @@ import {
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
   njDispatches,
+  nulNicheIsTestImpossible,
   tagIsArmOf,
   widenPlanOf,
 } from "./emit_plan_union"
@@ -265,6 +266,7 @@ import {
   NULL_OWN_BOX,
   NULL_OWN_NONE,
   NULL_OWN_STR,
+  NulTestArm,
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
@@ -397,8 +399,10 @@ import {
 } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
+import { isVarTyIxOf } from "./check_list_union"
 import {
   charLitCp,
+  isTestsNull,
   objFieldSrcOrder,
   objFieldVal,
   unwrapParen,
@@ -633,6 +637,7 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is staged")
   }
   const arm = isArmOf(ix, ibFnIx, 0, false)
+  if arm == "nulTest" { return isNulTest(b, n, ix, rep) }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
   if rep != ibBool { return irBMiss("is result rep") }
@@ -644,6 +649,24 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is operand rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// `recv is X` over a nullable niche at `isArmOf`'s null-test rung: the niche's own null test
+// (`nulTestArmOf`, niche only), true for present unless `X` is `null`. An impossible test misses.
+function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if nulNicheIsTestImpossible(n.isObj, isVarTyIxOf(ix), ibFnIx) {
+    return irBMiss("is impossible null test")
+  }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const invert = !isTestsNull(ix)
+  const arm = nulTestArmOf(n.isObj, ibFnIx, invert, true)
+  if arm != "atom" && arm != "bool" && arm != "nullRef" && arm != "nulStr" {
+    return irBMiss("is null test " + arm)
+  }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if !nulTestOperandOk(arm, irBOpRep(v)) { return irBMiss("null test operand") }
+  return irBLetTemp(b, { ntV: v, ntInvert: invert, ntAt: ix }, ix, rep)
 }
 
 // `0, 1, ..., n - 1`.
@@ -3129,17 +3152,21 @@ function nulTest(
   }
   const v = irBExpr(b, bt.bnRef)
   if ibMiss != "" { return v }
-  const vr = irBOpRep(v)
-  if (
-    !(arm == "atom" && atomNullable(vr)
-      || arm == "bool" && boolNullable(vr)
-      || arm == "nulStr" && strNullable(vr)
-      || arm == "nullRef" && (strNullable(vr) || refNullable(vr))
-      || arm == "boxTag" && heldAsBox(vr))
-  ) {
-    return irBMiss("null test operand")
-  }
+  if !nulTestOperandOk(arm, irBOpRep(v)) { return irBMiss("null test operand") }
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
+}
+
+// Whether operand rep `vr` is the one null-test arm `arm` reads; an arm `RNulTest` does not
+// build reads none.
+function nulTestOperandOk(arm: NulTestArm, vr: i32): boolean {
+  return match arm {
+    "atom" => atomNullable(vr)
+    "bool" => boolNullable(vr)
+    "nulStr" => strNullable(vr)
+    "nullRef" => strNullable(vr) || refNullable(vr)
+    "boxTag" => heldAsBox(vr)
+    "nnfold" | "nulfold" | "nullty" | "optChain" | "mapHas" | "instMap" | "none" => false
+  }
 }
 
 // `m[k] == null` over a scalar map read, as legacy writes it: the map's has probe, then
