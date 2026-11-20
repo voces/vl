@@ -25489,14 +25489,8 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
     return emitFail("emitProgram: a dispatch lost a member")
   }
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
-  const slot = fnTagIdSlot()
-  fbLocalSet(slot)
-  let ty = nodeTyAt(callIx, fnIx)
-  // A call through a list element the instance leaves untyped takes its members' one result.
-  if !isVoidTy(ty) && repSigKindOfTy(ty) == null {
-    const at = fnTagArmsOneTy(arms, fnIx)
-    if at >= 0 { ty = at }
-  }
+  tagStashTail()
+  const ty = tagDispatchTy(callIx, arms, fnIx)
   // A call through a set of void members leaves no value, and answers 1; so does one where some
   // member returns nothing (`void | i32`), whose value no slot can take, each result dropped.
   const isVoid = isVoidTy(ty) || tyMentionsVoid(ty, 4)
@@ -25508,25 +25502,13 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
     )
   }
   const boxed = kind == "union"
-  let rslot = -1
-  if kind == "struct" || kind == "nulstruct" { rslot = repSlotOfKind(kind, ty) }
-  if kind == "reflist" || kind == "nulreflist" {
-    rslot = rlSlotOfTy(tyRefArrElemOf(ty))
-  }
   const un = if boxed { boxTyName(ty) } else { "" }
   let k = 0
   while k < arms.length {
     const last = k == arms.length - 1
     if !last {
-      fbLocalGet(slot)
-      fbI32Const(ds[k])
-      fbI32Bin(70) // 0x46 i32.eq
-      if isVoid {
-        fbIf(64)
-      } else {
-        fbOpenIf()
-        fbValtype(kind, rslot)
-      }
+      tagIsTail(ds[k])
+      tagDispatchIfOf(ty)
     }
     let rc = 0
     const armFe = emitArmRowFe(arms[k], fnIx)
@@ -25555,20 +25537,83 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
     fbEnd()
     k = k + 1
   }
-  tailCallIdx = -1
+  if dispatchDeclinesTail() { tailCallIdx = -1 }
   return if isVoid { 1 } else { 0 }
 }
 
-// The lambda instance the row records for dispatch arm call `a`'s callee in function `fnIx`; -1
-// for an arm whose member is named or a lambda mono does not instance, which resolve by name.
-function emitArmRowFe(a: i32, fnIx: i32): i32 {
+// Whether a return of a dispatch's value declines the tail form: the cursor its last arm's call
+// armed is not the dispatch's own call, so legacy and the IR both keep `call; return`.
+export function dispatchDeclinesTail(): boolean { return true }
+
+// The arm `if` of a dispatch whose result type is `ty`, as legacy's writer opens it; -1 when
+// `ty` has no rep a dispatch's value takes. Only a struct or ref-list result names a table row.
+export function tagDispatchIfOf(ty: i32): i32 {
+  const isVoid = isVoidTy(ty) || tyMentionsVoid(ty, 4)
+  if isVoid { return fbIf(64) }
+  const kind = repSigKindOfTy(ty)
+  if kind == null { return -1 }
+  let rslot = -1
+  if kind == "struct" || kind == "nulstruct" { rslot = repSlotOfKind(kind, ty) }
+  if kind == "reflist" || kind == "nulreflist" {
+    rslot = rlSlotOfTy(tyRefArrElemOf(ty))
+  }
+  fbOpenIf()
+  return fbValtype(kind, rslot)
+}
+
+// The result type of call `callIx` through a tagged set with arms `arms`: the call's own, or, where
+// a list element the instance leaves untyped names no rep, its members' one result.
+export function tagDispatchTy(callIx: i32, arms: i32[], fnIx: i32): i32 {
+  const ty = nodeTyAt(callIx, fnIx)
+  if !isVoidTy(ty) && repSigKindOfTy(ty) == null {
+    const at = fnTagArmsOneTy(arms, fnIx)
+    if at >= 0 { return at }
+  }
+  return ty
+}
+
+// The arm calls of call `callIx` through its tagged set, in member order, or none.
+export function tagDispatchArms(callIx: i32, fnIx: i32): i32[] {
+  return fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx))
+}
+
+// The member ids of call `callIx`'s tagged set, one per arm.
+export function tagDispatchIds(callIx: i32, fnIx: i32): i32[] {
+  return fnTagMembers(emitTagSetAt(callIx, fnIx))
+}
+
+// The lambda callee of dispatch arm `a`, the arms legacy stages at their instance
+// (`emitArmRowFe`), or -1 for a named member's arm.
+export function tagArmLambdaCallee(a: i32): i32 {
   const c = nodeAt(a)
   if !(c is Call) || c.callFn < 0 { return -1 }
   const cn = nodeAt(c.callFn)
   if !(cn is Ident) || cn.identName != "" { return -1 }
   const d = identDeclOf(c.callFn)
-  if d < 0 || !(nodeAt(d) is FuncDecl) { return -1 }
-  const fe = monoBundleReadFe(c.callFn, fnIx, elabArmSigAt(a, fnIx))
+  return if d >= 0 && nodeAt(d) is FuncDecl { c.callFn } else { -1 }
+}
+
+// After a tagged call's set id: keep it in the dispatch slot, which each arm's test reads.
+export function tagStashTail(): i32 {
+  fbLocalSet(fnTagIdSlot())
+  return 0
+}
+
+// One arm's test: the kept set id against member id `id`.
+export function tagIsTail(id: i32): i32 {
+  fbLocalGet(fnTagIdSlot())
+  fbI32Const(id)
+  fbI32Bin(70) // 0x46 i32.eq
+  return 0
+}
+
+// The lambda instance the row records for dispatch arm call `a`'s callee in function `fnIx`; -1
+// for an arm whose member is named or a lambda mono does not instance, which resolve by name.
+function emitArmRowFe(a: i32, fnIx: i32): i32 {
+  const f = tagArmLambdaCallee(a)
+  if f < 0 { return -1 }
+  const d = identDeclOf(f)
+  const fe = monoBundleReadFe(f, fnIx, elabArmSigAt(a, fnIx))
   if fe < 0 && monoIsGenericDecl(d) {
     return emitFailAt(
       "emitProgram: a lambda's dispatch arm has no instance built for this call's signature",
