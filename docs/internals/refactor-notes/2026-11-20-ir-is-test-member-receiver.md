@@ -16,15 +16,31 @@ the storage-sensitive classifiers consult, bypasses its memo for a storage read.
 answers a storage read's store type (memberBox), so a receiver narrowed by an earlier test builds
 at the field's declared union.
 
+## Lowered at its storage too
+
+The builder's mark covers the build only. The receiver's `RGetField` is lowered later, by
+`getField` → `fieldTail`, and on that path three readers ask the mark: `readOwesNonNullRecover`,
+and `emitUnionFieldNarrowUnbox`'s `emitPlaceNarrowContainerUnbox` (`placeReadContainerAt`) and
+`memNarrowAtomKind` (`pathReadAtomKind`). Outside the mark a receiver narrowed to an atom or a
+container arm would be lowered as that unbox where the builder typed the box, and a mode-3 claim
+would carry it. So the builder records its fact on the node (`RGetField.gfStored`, from
+`isStorageRead` at the one constructor), `getField` re-enters the plain mark for it, the builder
+requires the operand at the storage's declared box rep (`readNarrowedStoreAt`), and the verifier
+holds `gfStored` to that box. The corpus's 90 are record-member narrowings, where those readers
+answer alike in and out of the mark.
+
 ## Witness
 
 `tests/cases/narrowing/is-test-at-storage-of-a-member-receiver.vl`: the same `z.h` read plainly
 before the test, at its storage under two `is` tests, narrowed after an early return, and bound
 then re-tested, off a generic and a declared receiver.
+`tests/cases/narrowing/is-test-at-storage-of-a-member-receiver-other-arms.vl`: a record test over a
+receiver narrowed beside a map arm, which the IR builds; beside an atom or a list, which no member
+receiver reaches today (`tagIsArmOf` answers `memStruct`, and `storedBoxTest` takes `identBox`).
 
 ## Readings
 
-Both seeds fixpoints, master at merge-base `a42095870`:
+Before `gfStored`; the final readings are in the PR. Both seeds fixpoints, master at merge-base `a42095870`:
 
 | reading | master | this branch |
 |---|---:|---:|
