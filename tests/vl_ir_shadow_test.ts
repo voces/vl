@@ -1127,10 +1127,10 @@ if d.v is f64 { print(d.v) }
 });
 
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
-// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
-// the result's `null`.
+// (prints 5). The IR once returned `put(9)`'s value there; it now builds `put(9)` as a statement
+// and falls into the lowering's `null` pad, matching legacy.
 Deno.test({
-  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  name: "ir shadow: a block body that runs past its last statement pads its null and matches",
   ignore,
   fn: () => {
     const src = `function put(x: i32) { return x * 2 }
@@ -1141,9 +1141,13 @@ function f(b: i32) {
 print(f(-1) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered block body falls off";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered block body falls off")) {
+      throw new Error(`want no falls-off miss, got ${JSON.stringify([...rows])}`);
+    }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 2 || rows.get("matched") !== 2) {
+      throw new Error(`want put and f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -2357,6 +2361,25 @@ print(elseIfWiden(3) + elseIfWiden(2))
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
       throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A block body that ends in a statement other than `return` builds that statement and falls into
+// legacy's pad (`fallThroughPadOf`): an assignment, a void call, a push and a declaration, each
+// after a returning `if`, cover and match.
+const BODY_FALLS_OFF =
+  `let n = 0\nconst xs: i32[] = []\nfunction bump(k: i32) { n = n + k }\nfunction a(x: i32) {\n  if x > 2 { return 1 }\n  n = n + x\n}\nfunction s(x: i32) {\n  if x > 2 { return "big" }\n  bump(x)\n}\nfunction c(x: i32) {\n  if x > 0 { return x * 2 }\n  xs.push(x)\n}\nfunction d(x: i32) {\n  if x > 0 { return true }\n  const y = x + 1\n}\nprint(a(1))\nprint(s(4))\nprint(c(-4))\nprint(d(0))\n`;
+Deno.test({
+  name: "ir shadow: a block body that falls off its last statement builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(BODY_FALLS_OFF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
