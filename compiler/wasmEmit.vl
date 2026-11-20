@@ -10961,18 +10961,23 @@ export function sharedReadPlanOf(
   return if code >= 0 && sharedFieldPlanDispatchable(code, vis, fis) { code } else { -1 }
 }
 
-// Whether `emitMemSharedRead` writes read `memIx` as its plain dispatch: an ident receiver read
-// again per arm, every arm plain, and no unbox or recover after the dispatch.
+// Whether `emitMemSharedRead` evaluates read `memIx`'s receiver once into its stash slot: anything
+// but an ident, whose `local.get` re-emits per arm for nothing.
+export function sharedReadStashes(memIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const r = unwrapParen(m.memObj)
+  return !(r >= 0 && r < P.nodes.length && nodeAt(r) is Ident)
+}
+
+// Whether `emitMemSharedRead` writes read `memIx` as its plain dispatch: every arm plain, and no
+// unbox or recover after the dispatch; the receiver re-read per arm or stashed.
 export function sharedReadPlainOf(memIx: i32, fnIx: i32): boolean {
   if memReadArmOf(memIx, fnIx) != "shared" { return false }
   const vis: i32[] = []
   const fis: i32[] = []
   const code = sharedReadPlanOf(memIx, fnIx, vis, fis)
   if code < 0 || vis.length < 1 || fis.length != vis.length { return false }
-  const m = nodeAt(memIx)
-  if !(m is Member) { return false }
-  const r = unwrapParen(m.memObj)
-  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return false }
   let i = 0
   while i < vis.length {
     if !sharedArmIsPlain(code, vis[i], fis[i]) { return false }
@@ -11244,15 +11249,16 @@ function fbIfForSharedPlan(code: i32, vi: i32, fi: i32) {
 // is evaluated once (`slot >= 0`), else a fresh emission of the place — an ident, effect-free.
 // One function so the tag test and the payload read cannot pick different halves.
 function emitSharedFieldRecv(recvIx: i32, fnIx: i32, slot: i32) {
-  if slot >= 0 {
-    fbLocalGet(slot)
-    // The lazy frame's ref slots are NULLABLE (they must be defaultable), and `struct.get`
-    // takes a non-null ref. The value stored is the receiver's own box, so this recovers a
-    // nullness the store never had; it cannot trap on a checked program (the checker
-    // refuses a shared read through a nullable receiver outright).
-    return fbRefAsNonNull() // 0xd4
-  }
+  if slot >= 0 { return sharedRecvSlotGet(slot) }
   return emitExpr(recvIx, fnIx)
+}
+
+// The stashed receiver box out of `slot`. The lazy frame's ref slots are nullable (they must be
+// defaultable) and `struct.get` takes a non-null ref; the value stored is the receiver's own box,
+// and the checker refuses a shared read through a nullable receiver, so the recover cannot trap.
+export function sharedRecvSlotGet(slot: i32) {
+  fbLocalGet(slot)
+  return fbRefAsNonNull() // 0xd4
 }
 
 // The one home for "a code-16 value-union-box field read whose member path is narrowed to a
@@ -11532,9 +11538,8 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
       // frame), not reserved by a pre-pass: a pre-pass runs before any `is`-narrowing is active
       // and this question consults narrowing, so the two answers differ in both directions. An
       // ident receiver takes no slot and re-emits, so existing programs emit the same bytes.
-      const shRecv = nodeAt(unwrapParen(mS.memObj))
       let shSlot = -1
-      if !(shRecv is Ident) {
+      if sharedReadStashes(memIx) {
         shSlot = sharedFieldRecvSlot()
         if emitExpr(mS.memObj, fnIx) < 0 { return -1 }
         fbLocalSet(shSlot)
