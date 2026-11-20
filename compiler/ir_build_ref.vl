@@ -8,7 +8,10 @@ import { BinExpr, Index, Member, nodeAt } from "./ast"
 import { OStr, OVar, Opnd, StrOp, repPrim, repWhat } from "./ir"
 import { isStorageRead } from "./emit_elab"
 import {
+  atomNullable,
+  deliverStr,
   ifBelowLeadOf,
+  irBAtomKindRep,
   irBBoxLocal,
   irBExpr,
   irBFnIx,
@@ -26,6 +29,7 @@ import {
   irStrBinHook,
   irUnionEqHook,
   irVarRepOkHook,
+  mapGetBare,
 } from "./ir_build"
 import {
   irLoopCloseHook,
@@ -47,9 +51,11 @@ import {
 } from "./ir_lower_ref"
 import { irBoundsRule } from "./ir_verify_bounds"
 import {
+  RAtom,
   RBox,
   RList,
   RMap,
+  RNullable,
   RRecord,
   repNodeAt,
   repNodeKids,
@@ -58,12 +64,15 @@ import {
 } from "./emit_rep"
 import { nodeTyAt } from "./emit_capture_frames"
 import {
+  SRT_NARROW,
   idxArmOf,
   irNodeInShadowHook,
   listEqRouteOf,
   mapLengthPlain,
   sharedReadPlainOf,
+  sharedReadPlanOf,
   sharedReadStashes,
+  sharedReadTailOf,
   strCatPartsOf,
   strEqFirstOf,
   strEqLitOf,
@@ -78,7 +87,7 @@ import {
   unionUnionEqStagedOf,
   variantFieldPlain,
 } from "./emit_plan_union"
-import { exprIsLitAtom, exprIsStrConcat } from "./emit_classify"
+import { exprIsLitAtom, exprIsStrConcat, exprMap } from "./emit_classify"
 import { exprIsStrEq, exprIsStrOrder } from "./emit_fn_scans"
 
 // The corrupt mode that drops every bounds check, rule 8's failing control, and the mode armed.
@@ -104,6 +113,7 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   const n = nodeAt(ix)
   if !(n is Index) { return irBMiss("expression") }
   const fnIx = irBFnIx()
+  if exprMap(n.idxArr, fnIx) { return mapGetBare(b, ix, rep) }
   const why = listIdxPlainWhy(ix, fnIx)
   if why != "" { return irBMiss(why) }
   const v = irBExpr(b, n.idxArr)
@@ -164,9 +174,12 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     // A union-box field's tail unboxes it to the read's own rep.
     const own = memFieldUnionBox(ix, fnIx)
       && rep == repNodeOfTy(nodeTyAt(ix, fnIx))
-    if repNodeKids(r)[k] != rep && !own {
-      return irBMiss("field read coercion")
-    }
+    const kr = repNodeKids(r)[k]
+    // A nullable field the checker narrowed past its null reads at its inner rep: legacy's field
+    // tail writes the read's recover (`readOwesNonNullRecover`), as for any member read.
+    const kn = repNodeAt(kr)
+    const narrowed = kn is RNullable && kn.rnInner == rep
+    if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
     irBNoteFieldReread(ix, k)
@@ -188,6 +201,15 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
   if repNodeAt(r) is RBox && sharedReadPlainOf(ix, irBFnIx()) {
     if rep != repNodeOfTy(nodeTyAt(ix, irBFnIx())) {
       return irBMiss("shared read rep")
+    }
+    // The tail decides the read's rep: an unbox leaves its atom's, nothing else changes the box.
+    const vis: i32[] = []
+    const fis: i32[] = []
+    const code = sharedReadPlanOf(ix, irBFnIx(), vis, fis)
+    const tail = sharedReadTailOf(code, vis, fis, ix, irBFnIx())
+    if tail == SRT_NARROW { return irBMiss("shared read narrow unbox") }
+    if tail >= 0 && !irBAtomKindRep(tail, rep) {
+      return irBMiss("shared read tail rep")
     }
     const stash = sharedReadStashes(ix)
     const sv = if stash { irBExpr(b, n.memObj) } else { irBBoxLocal(n.memObj) }
@@ -236,7 +258,15 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
   const args: Opnd[] = []
   for p in parts {
     const from = b.length
-    const a = irBExpr(b, p)
+    // A literal-union atom part decodes to its member string, as legacy's `emitStrValue` widens
+    // it (`exprIsLitAtom`), through the delivery's atom decode, which names a `K | null` part's
+    // miss; its rep must agree.
+    const litAtom = exprIsLitAtom(p, fnIx)
+    const pr = repNodeOfTy(nodeTyAt(p, fnIx))
+    if litAtom != (repNodeAt(pr) is RAtom || atomNullable(pr)) {
+      return irBMiss("string atom part route")
+    }
+    const a = if litAtom { deliverStr(b, p) } else { irBExpr(b, p) }
     if missed(a) { return a }
     // Legacy writes every operand in place, so a valued `if` past the first sits above the others.
     if (

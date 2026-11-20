@@ -84,6 +84,7 @@ import {
   irFnNew,
   irFnText,
   irGlobalNote,
+  irGlobalRepOf,
   irNodeFamily,
   irNodeNew,
   irSigNote,
@@ -104,6 +105,7 @@ import {
   irLowerFragment,
   irLoweredEntry,
   irSlotRunAgrees,
+  mapRecvGlobalIx,
 } from "./ir_lower"
 import {
   GlobalCtx,
@@ -112,6 +114,9 @@ import {
   StructFieldArm,
   VariantFieldArm,
   arrLitShortWhy,
+  arrNewCallNamed,
+  arrNewFillBoxTy,
+  arrNewPlanOf,
   asgValueArmOf,
   atomStrPlanOf,
   binNumWidth,
@@ -124,6 +129,9 @@ import {
   cloLiftCalleeOf,
   closureValueWhy,
   coalClosedWidensAtom,
+  coalNulRefJoinWhy,
+  coalNulRefPlanOf,
+  coalNulRefRungReached,
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
@@ -155,6 +163,8 @@ import {
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
   mapFilterWhy,
+  mapGetArmOf,
+  mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrMvPlain,
   mapKeyArmOf,
@@ -321,11 +331,13 @@ import {
   captureCountOf,
   captureNamesOf,
   cbIdentNamesFn,
+  coalesceDefaultNullable,
   declaredIndexAt,
   envSlotShift,
   exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
+  exprNullableMap,
   exprUnion,
   fnIndexOfNode,
   forInElemTyOf,
@@ -360,6 +372,7 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  mvValKindAt,
   sFieldCount,
   sFieldNames,
   sFieldStart,
@@ -395,7 +408,13 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
-import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
+import {
+  TY_BOOL,
+  TY_I32,
+  TY_NEVER,
+  TY_STR,
+  tyScalarBasePrim,
+} from "./check_types"
 import { spreadSlotIdOf } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
@@ -923,7 +942,7 @@ function boxTestTagOf(n: IsExpr, ix: i32, arm: IsArm): i32 {
 }
 
 // Whether rep `r` is a literal-union atom's `K | null` (discipline 3): the id, or a sentinel.
-function atomNullable(r: i32): boolean {
+export function atomNullable(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 3
 }
@@ -2154,20 +2173,14 @@ function mapHasRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if sh == -3 { return missRhs("map has value type") }
   const ka = mapKeyArmOf(m.memObj, c.callArgs[0], ibFnIx, sh)
   if ka != "plain" { return missRhs("map key " + ka) }
-  const g = mapGlobalOf(m.memObj)
-  const loc = mapRecvLoc(b, m.memObj, g, "map has receiver")
-  if ibMiss != "" { return missRhs(ibMiss) }
-  const at = b.length
-  const k = irBExpr(b, c.callArgs[0])
-  if ibMiss != "" { return missRhs("method operand") }
-  if mapRecvReassigned(b, at, loc) { return missRhs("map receiver reassigned") }
+  const rk = mapRecvKeyOf(b, m.memObj, c.callArgs[0], "map has receiver")
+  if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
-    mhSym: g,
-    mhNonNull: g >= 0
-      && globalReadRecovers(sidOfNode(m.memObj), m.memObj, ibFnIx),
-    mhLoc: loc,
+    mhSym: rk.mkSym,
+    mhNonNull: rk.mkNonNull,
+    mhLoc: rk.mkLoc,
     mhRecv: m.memObj,
-    mhKey: k,
+    mhKey: rk.mkKey,
     mhAt: ix,
   }
   return r
@@ -2609,6 +2622,11 @@ function binWidthRep(n: BinExpr): i32 {
 
 function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 
+// The value of `ix` delivered at a plain string: an atom decodes to its member string.
+export function deliverStr(b: i32[], ix: i32): Opnd {
+  return deliver(b, ix, repNodeOfTy(TY_STR), TY_STR)
+}
+
 // The value of `ix` delivered at rep `dst`: as built, or widened where legacy widens it, through
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
@@ -2725,6 +2743,12 @@ function holeKindRep(k: i32, r: i32): boolean {
   const p = repPrim(r)
   if p == null { return false }
   return k == 0 && p == "i32" || k == 1 && p == "bool" || k == 2 && p == "str"
+}
+
+// Whether rep `r` is the one an unbox to value-atom kind `k` leaves: `holeKindRep`'s, or a widened
+// number's.
+export function irBAtomKindRep(k: i32, r: i32): boolean {
+  return holeKindRep(k, r) || k >= 3 && k <= 5 && numKindOf(r) == k
 }
 
 // A temp at destination rep `dst`, typed at it, holding `r` for delivery node `ix`.
@@ -2963,6 +2987,38 @@ function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// `__array_new__(n, fill)` as legacy's arm writes it (`arrNewPlanOf`): the length, the fill at the
+// list's element rep, then the allocation. `__array_new_default__`, a refused site and a fill
+// legacy boxes into a union element (`arrNewFillBoxTy`) are named misses.
+function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
+  if n.callFn < 0 || n.callFn >= P.nodes.length {
+    return irBMiss("array new callee")
+  }
+  const f = nodeAt(n.callFn)
+  if !(f is Ident) || f.identName != "__array_new__" || n.callArgs.length != 2 {
+    return irBMiss("array new default")
+  }
+  const fill = n.callArgs[1]
+  if arrNewPlanOf(ix, fill, ibFnIx).anWhy != "" {
+    return irBMiss("array new refused")
+  }
+  if arrNewFillBoxTy(ix, fill, ibFnIx) >= 0 {
+    return irBMiss("array new fill box")
+  }
+  const ln = repNodeAt(rep)
+  if !(ln is RList) { return irBMiss("array new rep") }
+  const at = b.length
+  const len = irBExpr(b, n.callArgs[0])
+  const v = irBExpr(b, fill)
+  if ibMiss != "" { return v }
+  if ifBelowLead(b, at, "array new short-circuit operand") { return v }
+  if repPrim(irBOpRep(len)) != "i32" {
+    return irBMiss("array new length coercion")
+  }
+  if irBOpRep(v) != ln.rlsElem { return irBMiss("array new fill coercion") }
+  return irBLetTemp(b, { lnLen: len, lnFill: v, lnAt: ix }, ix, rep)
+}
+
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShortWhy`): an i32, f64, i64, f32,
 // string, packed or plain ref list, each element delivered at the list's element rep. Every other
 // arm is a named miss.
@@ -3151,6 +3207,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
   if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
   if na == "identBox" { return coalBox(b, n, lhsIx, ix, rep) }
+  if na == "coll" || na == "clo" { return coalNulRef(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
@@ -3177,6 +3234,11 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // re-reads its box, so its operand is a plain variable; a stashed one is a call.
 function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const arm = coalBoxArmOf(n, lhsIx, ix, ibFnIx)
+  // A name past the boxed arms reaches legacy's nullable-reference rungs directly, and a call does
+  // once it is neither of the call niches (`emitCoalesceCallNiche`).
+  if arm == "next" && coalNulRefRungReached(n, lhsIx, ibFnIx) {
+    return coalNulRef(b, n, lhsIx, ix, rep)
+  }
   const built = match arm {
     "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => true
     "boolPop" | "valNoKind" | "callNoKind" | "next" => false
@@ -3208,6 +3270,59 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   irBNode(
     b,
     { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `l ?? d` over a nullable reference (legacy's `emitCoalesceNulRef`) along `coalNulRefPlanOf`: the
+// plain block, or a join's staged `if`, with the default built where it runs only on `null`. A plain
+// default is written as itself; a join's only on the recorded-box branch `deliver` shares.
+function coalNulRef(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  const p = coalNulRefPlanOf(n, lhsIx, ix, ibFnIx)
+  if p == null { return irBMiss("coalesce nulRef heap") }
+  const join = p.nrArm == "join"
+  if !join && p.nrArm != "plain" {
+    return irBMiss("coalesce nulRef " + p.nrArm)
+  }
+  if join && coalNulRefJoinWhy(n, p.nrHeap, ibFnIx) != "" {
+    return irBMiss("coalesce nulRef join refused")
+  }
+  if join && !boxOwedAt(n.binRight, ibFnIx) {
+    return irBMiss("coalesce nulRef join default")
+  }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce nulRef after an operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce nulRef operand") }
+  // A plain block opens before its operand, so a temp written ahead of it would sit below it.
+  if !join && ib.irVars[l.ov].vKind == "temp" {
+    return irBMiss("coalesce nulRef operand temp")
+  }
+  const ln = repNodeAt(irBOpRep(l))
+  if !(ln is RNullable) || ln.rnDisc == 4 {
+    return irBMiss("coalesce nulRef operand rep")
+  }
+  const nul = coalesceDefaultNullable(n.binRight, ibFnIx)
+  const want = if join { rep } else if nul { irBOpRep(l) } else { ln.rnInner }
+  if rep != want || join && !heldAsBox(rep) {
+    return irBMiss("coalesce nulRef result rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = if join { deliver(nb, n.binRight, rep, -1) } else { irBExpr(nb, n.binRight) }
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce nulRef default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: "nulRef", cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
     ty,
     rep,
     ix,
@@ -3281,22 +3396,13 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   // A default the miss arm writes as a body leaves the read's value on the stack from here.
   const clear = !endsInTemp(b)
-  const g = mapGlobalOf(rd.idxArr)
-  const loc = mapRecvLoc(b, rd.idxArr, g, "map read receiver")
-  if ibMiss != "" { return loc }
-  const kat = b.length
-  const k = irBExpr(b, rd.idxIndex)
-  if ibMiss != "" { return k }
+  const rcv = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map read receiver")
+  if rcv == null { return irBMiss(ibMiss) }
   // The default is written in the miss arm: in place there, or as the body a fused read's arm holds.
   const db: i32[] = []
   const dv: Opnd = if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
-  if mapRecvReassigned(b, kat, loc) {
-    return irBMiss("map receiver reassigned")
-  }
-  const sid = sidOfNode(rd.idxArr)
-  const nonNull = g >= 0 && globalReadRecovers(sid, rd.idxArr, ibFnIx)
   const form = if mv { 2 } else if inline { 1 } else { 0 }
   if !defaultSelfContained(db, 0, dv) {
     if !clear { return irBMiss("map read default after an operand") }
@@ -3306,21 +3412,81 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
       dv,
       ix,
       rep,
-      { prSym: g, prNonNull: nonNull, prKey: k, prForm: form },
-      loc,
+      {
+        prSym: rcv.mkSym,
+        prNonNull: rcv.mkNonNull,
+        prKey: rcv.mkKey,
+        prForm: form,
+      },
+      rcv.mkLoc,
     )
   }
   for id in db { b.push(id) }
   const r: Rhs = {
-    mgSym: g,
-    mgNonNull: nonNull,
-    mgLoc: loc,
-    mgKey: k,
+    mgSym: rcv.mkSym,
+    mgNonNull: rcv.mkNonNull,
+    mgLoc: rcv.mkLoc,
+    mgKey: rcv.mkKey,
     mgAt: ix,
     mgForm: form,
     mgDef: dv,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
+// ref value at its niche, or a mono-valued map read at the value's own rep.
+export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
+  const rd = nodeAt(ix)
+  if !(rd is Index) { return irBMiss("map get") }
+  const arm = mapGetArmOf(ix, ibFnIx)
+  if arm == "unionBox" { return irBMiss("map get union box") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" { return irBMiss("map key " + ka) }
+  const rk = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map get receiver")
+  if rk == null { return irBMiss(ibMiss) }
+  const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
+  const m = repNodeAt(mr)
+  if !(m is RMap) { return irBMiss("map get receiver rep") }
+  if !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) { return irBMiss("map get rep") }
+  const r: Rhs = {
+    mtSym: rk.mkSym,
+    mtNonNull: rk.mkNonNull,
+    mtLoc: rk.mkLoc,
+    mtKey: rk.mkKey,
+    mtAt: ix,
+  }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// Whether a bare map read of `recvIx` (value rep `val`, shape `sh`) leaves rep `rep`: an mv
+// slot's ref value at its null niche, or recovered when the read is narrowed; a mono-valued map's
+// value as itself, or a `boolean` value at its nullable.
+function mapGetRepOk(sh: i32, val: i32, rep: i32, recvIx: i32): boolean {
+  // A `boolean`-valued map's miss reads `2`, the `boolean | null` sentinel (`mapGetMissOf`).
+  if sh < 0 {
+    if rep == val { return true }
+    const bn = repNodeAt(rep)
+    return boolNullable(rep)
+      && bn is RNullable
+      && bn.rnInner == val
+      && mapGetMissOf(recvIx, ibFnIx) == 2
+  }
+  const k = mvValKindAt(sh)
+  if (
+    k == null
+    || k == "f64"
+    || k == "i64"
+    || k == "f32"
+    || k == "v128"
+    || k == "union"
+  ) {
+    return false
+  }
+  const n = repNodeAt(rep)
+  if !(n is RNullable) { return rep == val }
+  return n.rnDisc == 1 && n.rnInner == val
 }
 
 // A map read whose default computes, as `SCoalBox`'s fused map-read arm: the probe's shared head
@@ -3368,6 +3534,31 @@ function defaultSelfContained(b: i32[], at: i32, o: Opnd): boolean {
   if b.length != at + 1 || !(o is OVar) { return false }
   const n = ib.irNodes[b[at]]
   return n is SLet && n.lDst == o.ov
+}
+
+// A map operation's receiver then key, as legacy reads them: map global `mkSym` (recovered for
+// `mkNonNull`), or where it is -1 receiver operand `mkLoc`; then key `mkKey`, which must not
+// reassign the receiver. Null on a miss.
+type MapRecvKey = { mkSym: i32, mkNonNull: boolean, mkLoc: Opnd, mkKey: Opnd }
+function mapRecvKeyOf(
+  b: i32[],
+  recvIx: i32,
+  keyIx: i32,
+  why: string,
+): MapRecvKey | null {
+  const g = mapGlobalOf(recvIx)
+  const loc = mapRecvLoc(b, recvIx, g, why)
+  if ibMiss != "" { return null }
+  const at = b.length
+  const k = irBExpr(b, keyIx)
+  if ibMiss != "" { return null }
+  if mapRecvReassigned(b, at, loc) {
+    irBMiss("map receiver reassigned")
+    return null
+  }
+  const nonNull = g >= 0
+    && globalReadRecovers(sidOfNode(recvIx), recvIx, ibFnIx)
+  return { mkSym: g, mkNonNull: nonNull, mkLoc: loc, mkKey: k }
 }
 
 // A map operation's receiver other than global `g`: any expression read as a map, in place (a
@@ -3432,12 +3623,9 @@ function bodyAssigns(body: i32[], v: i32): boolean {
 
 // The module global map read `recvIx` names, its rep noted in `ib`; -1 for any other receiver.
 function mapGlobalOf(recvIx: i32): i32 {
-  if recvIx < 0 || !(nodeAt(recvIx) is Ident) { return -1 }
-  const d = identDeclOf(recvIx)
-  if d < 0 || localIndexOf(ibFnIx, recvIx) >= 0 { return -1 }
-  if !(nodeAt(d) is LetDecl) { return -1 }
-  const g = globalIndexOfSid(sidOfNode(recvIx))
+  const g = mapRecvGlobalIx(recvIx, ibFnIx)
   if g < 0 { return -1 }
+  const d = identDeclOf(recvIx)
   const r = repNodeOfTy(scopeTyAt(d, -1))
   if !(repNodeAt(r) is RMap) { return -1 }
   irGlobalNote(ib, g, r)
@@ -3621,7 +3809,12 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     ) {
       return irBMiss("atom compare fold")
     }
-    if atomOperand(n.binLeft) || atomOperand(n.binRight) {
+    // An atom operand of no atom compare (a `+`, or `==` against a plain string) is the string
+    // op's, which decodes the atom to its member string, as legacy's dispatch routes it.
+    if (
+      (atomOperand(n.binLeft) || atomOperand(n.binRight))
+      && atomEqPlanOf(n, ibFnIx).aqArm != "none"
+    ) {
       return atomCompare(b, n, ix, rep)
     }
     if (
@@ -3684,6 +3877,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
       if !(repNodeAt(rep) is RMap) { return irBMiss("map new rep") }
       return irBLetTemp(b, { mnAt: ix }, ix, rep)
     }
+    if arrNewCallNamed(n, ibFnIx) { return arrNew(b, n, ix, rep) }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return irBMiss("call") }
     // A call typed past its callee's result (a joined result legacy widens) is legacy's.
@@ -3915,11 +4109,22 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   if !(repNodeAt(r) is RRecord) { return skip("field store receiver") }
   const k = repRecordKidOf(r, rt, t.memProp)
   if k < 0 { return skip("field kid") }
-  const v = irBExpr(b, t.memObj)
+  const vAt = b.length
+  const v0 = irBExpr(b, t.memObj)
   const at = b.length
   const x = irBExpr(b, n.binRight)
   if ibMiss != "" { return 0 }
-  if ifBelowLead(b, at, "field store short-circuit operand") { return 0 }
+  // Legacy reads the receiver, then the value: a receiver variable is staged at its own start, so
+  // the lowering writes it below a valued `if` the value wrote ahead of the store.
+  const leads: Opnd[] = [v0]
+  const starts: i32[] = [vAt]
+  const why = "field store short-circuit operand"
+  if !stageLeadArgs(b, at, starts, leads, [t.memObj]) {
+    if ibMiss == "" { ifBelowLead(b, at, why) }
+    return 0
+  }
+  if ibMiss != "" || ifBelowLeadOf(b, at, why, leads) { return 0 }
+  const v = leads[0]
   if irBOpRep(v) != r || irBOpRep(x) != repNodeKids(r)[k] {
     return skip("field store coercion")
   }
@@ -3936,6 +4141,16 @@ function loopIx(label: string): i32 {
   return -1
 }
 
+// Whether map walk receiver `mr`'s operand rep `r` is one the walk's stash takes: a map, or a
+// nullable map the shared `mapRecvRefTail` recovers.
+function mapRecvRepOk(r: i32, mr: i32): boolean {
+  const n = repNodeAt(r)
+  if n is RMap { return true }
+  return n is RNullable
+    && repNodeAt(n.rnInner) is RMap
+    && exprNullableMap(mr, ibFnIx)
+}
+
 // A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
 // once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
@@ -3944,10 +4159,18 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   // A map walk's operand is its receiver, whose keys or values list the lowering reads.
   const mr = forInMapRecv(n.fiIter, ibFnIx)
   const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
-  if mr >= 0 && g < 0 { return skip("for in map receiver") }
+  // A global receiver is read as one, never as an operand; any other is built raw, as legacy's
+  // stash writes it, at a map rep its shared recovery owns.
+  if mr >= 0 && g < 0 && mapRecvGlobalIx(mr, ibFnIx) >= 0 {
+    return skip("for in map receiver")
+  }
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
-  const l = if mr >= 0 { none } else { irBExpr(b, n.fiIter) }
+  const src = if mr >= 0 { mr } else { n.fiIter }
+  const l = if g >= 0 { none } else { irBExpr(b, src) }
   if ibMiss != "" { return 0 }
+  if mr >= 0 && g < 0 && !mapRecvRepOk(irBOpRep(l), mr) {
+    return skip("for in map receiver rep")
+  }
   // A list walks its elements; a string its code points, each an i32; a map its keys or values.
   const lr = irBOpRep(l)
   const ln = repNodeAt(lr)
@@ -3957,6 +4180,11 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if lpr != null && lpr == "str" { er = repNodeOfTy(TY_I32) }
   if mr >= 0 { er = repNodeOfTy(forInElemTyOf(n.fiIter, ibFnIx)) }
   if er < 0 { return skip("for in operand coercion") }
+  // A map walks its keys or values into an i32 or a string, the verifier's rule; any other is
+  // legacy's.
+  if mr >= 0 && er != repNodeOfTy(TY_I32) && repPrim(er) != "str" {
+    return skip("for in map element")
+  }
   const v = irBLoopVar(n.fiDecl1, er, repTyOf(er))
   if v < 0 || ib.irVars[v].vRep != er { return skip("for in variable rep") }
   const brk = labelNew()
@@ -4411,17 +4639,19 @@ function tailIf(b: i32[], ix: i32) {
     return skip("decided is condition")
   }
   const thenB = if decided { [] } else { tailArm(n.ifThen) }
+  // An else-less link writes no `else` (`emitIfLinkTail`); what falls through is its caller's pad.
   const elseB: i32[] = []
-  if n.ifElse >= 0 && n.ifElse < P.nodes.length && nodeAt(n.ifElse) is IfStmt {
+  const hasElse = n.ifElse >= 0
+  if hasElse && n.ifElse < P.nodes.length && nodeAt(n.ifElse) is IfStmt {
     tailIf(elseB, n.ifElse)
-  } else {
+  } else if hasElse {
     const eb = tailArm(n.ifElse)
     for x in eb { elseB.push(x) }
   }
   if ibMiss != "" { return 0 }
   irBNode(
     b,
-    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: true },
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: hasElse },
     -1,
     ibNoValue,
     ix,

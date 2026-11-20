@@ -42,6 +42,7 @@ import {
   RMakeList,
   RMakeRec,
   RMapFilter,
+  RMapGet,
   RMapGetOr,
   RMapHas,
   RMapNew,
@@ -174,6 +175,11 @@ function opRep(o: Opnd): i32 {
 
 // A map operation's receiver: global `sym` of a map rep, or, where `sym` is -1, a variable `loc`
 // of one, read as a use.
+// The rep of a map receiver: global `sym`'s noted rep, or operand `loc`'s.
+function mapRecvRep(sym: i32, loc: Opnd): i32 {
+  return if sym >= 0 { irGlobalRepOf(vf, sym) } else { opRep(loc) }
+}
+
 function mapRecvOk(sym: i32, loc: Opnd, at: i32): boolean {
   if sym >= 0 { return repNodeAt(irGlobalRepOf(vf, sym)) is RMap }
   if !(loc is OVar) || loc.ov < 0 || loc.ov >= vf.irVars.length { return false }
@@ -210,6 +216,7 @@ function use(o: Opnd, at: i32) {
     }
     OImm | OStr => 0
   }
+  return 0
 }
 
 function uses(os: Opnd[], at: i32) {
@@ -483,7 +490,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const k = kidAt(v, r.gfIx)
       const unboxed = repNodeAt(k) is RBox
         && dst == repNodeOfTy(nodeTyAt(r.gfAt, vf.irAt))
-      if dst >= 0 && k != dst && !unboxed {
+      // A nullable field the checker narrowed past its null reads at its inner rep.
+      const kn = repNodeAt(k)
+      const narrowed = kn is RNullable && kn.rnInner == dst
+      if dst >= 0 && k != dst && !unboxed && !narrowed {
         return fail(2, at, "a field's rep is not its destination's")
       }
       // A read at its storage is the field's own box, unboxed nowhere.
@@ -827,6 +837,21 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 { return fail(2, at, "a map set has no value") }
       0
     }
+    RMapGet => {
+      use(r.mtKey, at)
+      if !mapRecvOk(r.mtSym, r.mtLoc, at) {
+        return fail(2, at, "a map get of a receiver that is no map")
+      }
+      const m = repNodeAt(mapRecvRep(r.mtSym, r.mtLoc))
+      if dst >= 0 && m is RMap && !mapGetDstOk(m.rmVal, dst) {
+        return fail(
+          2,
+          at,
+          "a map get yields its value, or that value's nullable",
+        )
+      }
+      0
+    }
     RMapHas => {
       use(r.mhKey, at)
       if !mapRecvOk(r.mhSym, r.mhLoc, at) {
@@ -922,6 +947,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
   }
+  return 0
 }
 
 // Whether rep `r` is raw, at heap `heap` unless that is -1.
@@ -1046,6 +1072,26 @@ function coalBoxWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if lr is RBox || lr is RNullable && lr.rnDisc == 4 { return "" }
   return "a boxed `??` reads no box"
+}
+
+// Why a nullable reference's `??` is ill-formed, or "": it reads a nullable reference, and its out
+// is that reference, its non-null inner, or a join's box.
+function coalNulRefWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc == 4 || lr.rnInner < 0 {
+    return "a nullable-reference `??` reads no nullable reference"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a nullable-reference `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  const on = repNodeAt(or)
+  const boxed = on is RBox || on is RNullable && on.rnDisc == 4
+  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a nullable-reference `??` yields neither the reference, its inner, nor a box"
+  }
+  return ""
 }
 
 // Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
@@ -1269,15 +1315,21 @@ function stmt(id: i32) {
     }
     SLoop => labelled(n.lpLabel, -1, n.lpBody)
     SForIn => {
-      // A map walk's list is an unread immediate; its map is a global the lowering reads.
+      // A map walk's list is an unread immediate when its map is a global the lowering reads,
+      // else its receiver at a map rep.
       if n.xfMap < 0 { use(n.xfList, id) }
       const ln = repNodeAt(opRep(n.xfList))
+      const recvMap = n.xfMap < 0 && mapRepOrNullable(opRep(n.xfList))
       // A list walks its elements, a string its code points, each an i32.
       let er = -1
       if ln is RList { er = ln.rlsElem }
       if opRep(n.xfList) == vfStr { er = vfI32 }
       // A map walks its keys or values, each an i32 or a string.
-      if n.xfMap >= 0 && n.xfVar >= 0 && n.xfVar < vf.irVars.length {
+      if (
+        (n.xfMap >= 0 || recvMap)
+        && n.xfVar >= 0
+        && n.xfVar < vf.irVars.length
+      ) {
         const vr = vf.irVars[n.xfVar].vRep
         if vr == vfI32 || vr == vfStr { er = vr }
       }
@@ -1315,6 +1367,7 @@ function stmt(id: i32) {
       const why = match n.cbArm {
         "popOr" => coalPopOrWhy(n)
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+        "nulRef" => coalNulRefWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1377,6 +1430,7 @@ function stmt(id: i32) {
     SDrop => use(n.dpV, id)
     SRawOp => rawEff(n, id)
   }
+  return 0
 }
 
 // Rule 7: each arm of the scrutinee's box is covered once, or a default names what it excludes.
@@ -1454,11 +1508,18 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
   }
 }
 
 // The bounds rule, installed with the list builder; it answers "" or what broke, naming the node.
+// Whether a map get of value rep `val` may deliver into `dst`: the value itself, or it nullable.
+function mapGetDstOk(val: i32, dst: i32): boolean {
+  if dst == val { return true }
+  const n = repNodeAt(dst)
+  return n is RNullable && n.rnInner == val
+}
+
 export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 
 // Whether type `ty` is no closed type a variable can have (rule 1): absent, or open in a type
@@ -1554,4 +1615,11 @@ function nicheRetag(disc: i32, inner: i32): boolean {
   if p != null { return p == "str" }
   const n = repNodeAt(inner)
   return n is RRecord || n is RList || n is RMap || n is RClosure
+}
+
+// Whether rep `r` is a map, or a nullable one whose receiver a map walk recovers.
+function mapRepOrNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  if n is RMap { return true }
+  return n is RNullable && repNodeAt(n.rnInner) is RMap
 }
