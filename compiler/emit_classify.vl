@@ -614,6 +614,11 @@ import {
   tyKindOf,
 } from "./emit_ref_list_kinds"
 import {
+  RList,
+  RMap,
+  RNullable,
+  RPrim,
+  RRecord,
   RepDesc,
   boxAtomKindOfMemberTy,
   boxTagOfTy,
@@ -626,6 +631,8 @@ import {
   nodeRepIsNulAtom,
   repAtomMk,
   repDescNone,
+  repNodeAt,
+  repNodeKids,
   repOfNode,
   repOfNodeAt,
   repOfTy,
@@ -935,7 +942,7 @@ import {
   unionRowKeyAB,
 } from "./emit_union_registry"
 import { variantFieldIndex } from "./emit_variant_sig"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import {
   emitPassGen,
   memoGenAdvance,
@@ -15846,5 +15853,48 @@ function readMapValTyAt(e: Index, fnIx: i32): i32 {
   return tyMapValOf(rt)
 }
 
-// Whether `ty` is a function type: one a call steps to a result of, however open its variables.
-export function tyIsFnValue(ty: i32): boolean { return tyStepRet(ty) >= 0 }
+// Whether every open part of type `ty` is held at rep `rep` as a tagged set's id: a function type
+// at an `i32` (or its nullable), each record field, list element and map value at its own kid. A
+// closed part holds at any rep. `path` is the walk's open parts: a revisit adds nothing.
+export function tyOpenHeldAsIds(ty: i32, rep: i32, path: i32[]): boolean {
+  if ty < 0 { return false }
+  if !tyHasTyVar(ty) || i32ListHas(path, ty) { return true }
+  path.push(ty)
+  const r = tyOpenHeldAt(ty, rep, path)
+  path.pop()
+  return r
+}
+
+function tyOpenHeldAt(ty: i32, rep: i32, path: i32[]): boolean {
+  const t = tyAt(ty)
+  const n = repNodeAt(rep)
+  return match t {
+    TyFunc => repIsI32(rep) || n is RNullable && repIsI32(n.rnInner)
+    TyNullable => {
+      if n is RNullable { return tyOpenHeldAsIds(t.nInner, n.rnInner, path) }
+      tyOpenHeldAsIds(t.nInner, rep, path)
+    }
+    TyArray => n is RList && tyOpenHeldAsIds(tyElemOf(t), n.rlsElem, path)
+    TyMap => n is RMap
+      && !tyHasTyVar(tyKeyOf(t))
+      && tyOpenHeldAsIds(tyValOf(t), n.rmVal, path)
+    TyObj => {
+      const ks = repNodeKids(rep)
+      if !(n is RRecord) || ks.length != t.objFieldTypes.length { return false }
+      let k = 0
+      while k < ks.length {
+        if !tyOpenHeldAsIds(t.objFieldTypes[k], ks[k], path) { return false }
+        k = k + 1
+      }
+      true
+    }
+    TyVar | TyUnion | TyNeg => false
+    TyPrim | TyLit | TyErr => true
+  }
+}
+
+// Whether rep `r` is the plain `i32` a tagged set's id is held at.
+function repIsI32(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RPrim && n.rpK == "i32"
+}

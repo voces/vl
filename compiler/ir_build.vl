@@ -55,12 +55,14 @@ import {
   PrimOp,
   RCall,
   RStrOp,
+  RToBox,
   Rhs,
   SAssign,
   SBlock,
   SBoundsCheck,
   SBr,
   SCellSet,
+  SCoalBox,
   SDrop,
   SEffect,
   SForIn,
@@ -105,10 +107,9 @@ import {
   GlobalCtx,
   ObjLitArm,
   PrintArm,
-  RefJoin,
   StructFieldArm,
   VariantFieldArm,
-  arrLitShort,
+  arrLitShortWhy,
   asgValueArmOf,
   atomStrPlanOf,
   binNumWidth,
@@ -126,6 +127,7 @@ import {
   dispatchDeclinesTail,
   exprPrePathWhy,
   fieldStoreArmOf,
+  fieldStoreNarrowedAt,
   fieldStoreStructAt,
   fieldStoreValuePlain,
   fieldStoreVariantAt,
@@ -140,7 +142,6 @@ import {
   holeBoxTyAt,
   idxStorePlainWhy,
   ifExprPlainWhy,
-  ifRefJoinOf,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -149,6 +150,7 @@ import {
   keptDeclStoresNothing,
   legacyContextLiveWhy,
   letIfInitPerArmRep,
+  listOpRecvHeldPlan,
   lowMemFoldsCallee,
   mapFilterWhy,
   mapGetOrArmOf,
@@ -182,7 +184,6 @@ import {
   startStrAccMarked,
   stmtWritesNothing,
   strCatPartsOf,
-  strJoinDropsNulAtom,
   strLitTakesAtom,
   structFieldArmOf,
   tagArmLambdaCallee,
@@ -192,8 +193,10 @@ import {
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
+  valueIfLitTrue,
   variantFieldArmOf,
 } from "./wasmEmit"
+import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
 import { identUnboxAtomOf, variantCoerceArmOf } from "./emit_plan_union"
 import {
   HoleBox,
@@ -225,6 +228,7 @@ import {
   NULL_OWN_STR,
   binNulTestOf,
   coalArmOf,
+  coalBoxArmOf,
   coalNicheArmOf,
   coalNulRefArmOf,
   coalResultKindOf,
@@ -239,7 +243,7 @@ import {
   instTyOrSelf,
   narrowedArmNeedsUnbox,
 } from "./emit_plan_coerce"
-import { ifJoinAdaptsScalar, letIfInitSinks } from "./wasmEmit"
+import { ifJoinAdaptsScalar, letIfInitSinks, retRefusedWhy } from "./wasmEmit"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -268,6 +272,7 @@ import {
   fnEnvIdxOf,
   nodeTyAt,
   numLitWidth,
+  readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
@@ -297,11 +302,12 @@ import {
   forInElemTyOf,
   forInMapRecv,
   globalCellKind,
+  identIsEnvCapture,
   localIndexOf,
   nulLitAtomTexts,
   sFieldStoreKind,
 } from "./emit_classify"
-import { declaredSlotOfDecl } from "./emit_struct_order"
+import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
 import {
   callSpillsFcpArg,
   elseLessNullableTail,
@@ -961,9 +967,8 @@ export function irBBoxLocal(ix: i32): Opnd {
   const dn = nodeAt(d)
   if !(dn is LetDecl || dn is Param) { return irBMiss("box receiver") }
   const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
-  if v < 0 || !(repNodeAt(ib.irVars[v].vRep) is RBox) {
-    return irBMiss("box receiver")
-  }
+  // A nullable union (discipline 4) is held in the same `{tag, payload}` box.
+  if v < 0 || !heldAsBox(ib.irVars[v].vRep) { return irBMiss("box receiver") }
   const o: Opnd = { ov: v }
   return o
 }
@@ -1056,8 +1061,6 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   while true {
     const pw = ifExprPlainWhy(cix, ibFnIx)
     if pw != "" { return irBMiss("expression if " + pw) }
-    // Its value stays on the stack from here, so no temp an operand before it built may wait.
-    if endsInTemp(cb) { return irBMiss("if after an operand") }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
     // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
@@ -1077,10 +1080,20 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     outs.push(t)
     thens.push(thenB)
     elses.push(n.ifElse)
-    const tv = ifArmValueExpr(n.ifElse)
+    // The next link: a direct `else if`, or an `else` block whose one statement is an `if`. A
+    // literal `true` decides a block `else` dead, so the chain ends there.
+    const direct = n.ifElse >= 0
+      && n.ifElse < P.nodes.length
+      && nodeAt(n.ifElse) is IfStmt
+    if !direct && valueIfLitTrue(n.ifCond) { break }
+    const tv = if direct { n.ifElse } else { ifArmValueExpr(n.ifElse) }
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
+    // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
+    if !direct && armHasPrelude(n.ifElse) {
+      return irBMiss("expression if else prelude")
+    }
     // `irBExpr`'s own prelude for the link it would reach.
     const pre = exprPrePathWhy(tv, ibFnIx)
     if pre != "" { return irBMiss(pre) }
@@ -1095,7 +1108,13 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     crep = r
   }
   let k = bs.length - 1
-  let elseB = ifArm(elses[k], outs[k], reps[k])
+  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
+  let elseB: i32[] = []
+  if valueIfLitTrue(n.ifCond) {
+    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, elses[k])
+  } else {
+    elseB = ifArm(elses[k], outs[k], reps[k])
+  }
   if ibMiss != "" { return irBMiss("if arm") }
   while k >= 0 {
     irBNode(
@@ -1148,7 +1167,6 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
     return irBMiss("ref if drops null atom")
   }
-  if endsInTemp(b) { return irBMiss("if after an operand") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
   if c is OImm && condIsTest(n.ifCond) {
@@ -1160,7 +1178,13 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   const nul = ifLinkYieldsNull(ix, ibFnIx)
   const thenB = refIfArm(n.ifThen, t, rep, kind, rj.rjSlot, nul)
   if ibMiss != "" { return irBMiss("ref if arm") }
-  const elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
+  let elseB: i32[] = []
+  if valueIfLitTrue(n.ifCond) {
+    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, n.ifElse)
+  } else {
+    elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+  }
   if ibMiss != "" { return irBMiss("ref if arm") }
   irBNode(
     b,
@@ -1188,6 +1212,8 @@ function refIfArm(
     irBMiss("ref if arm " + arm)
     return body
   }
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
   const v = irBExpr(body, ifArmValueExpr(blockIx))
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
@@ -1201,7 +1227,8 @@ function refIfArm(
 // whose missing `else` writes the null box again.
 function letIfArms(b: i32[], ifIx: i32, v: i32) {
   const vr = ib.irVars[v].vRep
-  if !(repNodeAt(vr) is RBox) { return skip("declaration if per arm rep") }
+  // A union binding is its box, a nullable one (discipline 4) the same `{tag, payload}`.
+  if !heldAsBox(vr) { return skip("declaration if per arm rep") }
   nullBoxInto(b, ifIx, v, vr)
   return letIfArmLink(b, ifIx, v, vr)
 }
@@ -1275,6 +1302,8 @@ function endsInTemp(b: i32[]): boolean {
 // The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`.
 function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
   const body: i32[] = []
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
   const tv = ifArmValueExpr(blockIx)
   const v = deliver(body, tv, rep)
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
@@ -1282,6 +1311,26 @@ function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
   }
   return body
+}
+
+// A value `if` arm's prelude, every statement before its value, as legacy's `emitIfArmOpen` lowers
+// them (`emitStmtIn`, which banks no row of its own).
+function armPrelude(body: i32[], blockIx: i32) {
+  const blk = nodeAt(blockIx)
+  if !(blk is Block) { return 0 }
+  const stmts = blk.blkStmts
+  let i = 0
+  while i + 1 < stmts.length && ibMiss == "" {
+    stmtNode(body, stmts[i], stmts, i)
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether value-`if` arm `blockIx` is a block with statements before its value.
+function armHasPrelude(blockIx: i32): boolean {
+  const blk = nodeAt(blockIx)
+  return blk is Block && blk.blkStmts.length > 1
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
@@ -1408,8 +1457,9 @@ function narrowedLocalRead(
 ): Opnd {
   const own = repNodeAt(ib.irVars[v].vRep)
   const o: Opnd = { ov: v }
+  // A boxed `U | null` (disc 4) narrowed past its null reads as the box it holds.
   if (
-    own is RBox
+    (own is RBox || own is RNullable && own.rnDisc == 4)
     && repNodeAt(rep) is RRecord
     && narrowedVariantRepIs(narrowedBoxVariantPlain(ix, ibFnIx), rep)
   ) {
@@ -1577,14 +1627,16 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     if callee.fnParams.length != c.callArgs.length {
       return missRhs("argument count")
     }
+    const starts: i32[] = []
     let i = 0
     while i < c.callArgs.length {
       const at = b.length
+      starts.push(at)
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr)
       if ibMiss != "" { return missRhs("argument") }
-      if i > 0 && ifBelowLead(b, at, "short-circuit argument after another") {
+      if i > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
       if irBOpRep(a) != pr { return missRhs("argument coercion") }
@@ -1713,14 +1765,117 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
-// Whether operands built into `b` from `at` on hold a valued `if` below a part their node writes
-// first (a receiver or an earlier operand, read at its use), naming `why` as the miss. Legacy
-// writes such an `if` in place, which the IR's statement-level `if` cannot reorder.
+// Whether every operand in `os` is a temp, which the lowering writes below a later valued `if`
+// in its order (`stageLead`); a variable or an immediate is written at its reader instead.
+function opndsAreTemps(os: Opnd[]): boolean {
+  for o in os {
+    if !(o is OVar) || o.ov < 0 || o.ov >= ib.irVars.length { return false }
+    if ib.irVars[o.ov].vKind != "temp" { return false }
+  }
+  return true
+}
+
+// For an argument built into `b` from `at` on that holds a valued `if`: makes each earlier
+// argument in `args` that is a variable or immediate a staged temp at its own start (`starts`),
+// so the lowering writes them all below the `if` in order. False when one cannot be.
+function stageLeadArgs(
+  b: i32[],
+  at: i32,
+  starts: i32[],
+  args: Opnd[],
+  argIxs: i32[],
+): boolean {
+  // A boxed `??` writes its operand in place, below which the lowering stages nothing.
+  if coalBoxFrom(b, at) { return false }
+  if !valuedIfFrom(b, at) || opndsAreTemps(args) { return true }
+  let j = 0
+  while j < args.length {
+    const a = args[j]
+    if a is OStr { return false }
+    // A valued `if`'s out is already on the stack, in its order.
+    if a is OVar && (a.ov < 0 || a.ov >= ib.irVars.length) { return false }
+    const held = a is OVar
+      && (ib.irVars[a.ov].vKind == "temp" || valuedIfOut(b, a.ov))
+    if !held {
+      const one: i32[] = []
+      const t = irBLetTemp(one, { sgV: a }, argIxs[j], irBOpRep(a))
+      if ibMiss != "" || one.length != 1 { return false }
+      insertAt(b, starts[j], one[0])
+      let k = j + 1
+      while k < starts.length {
+        starts[k] = starts[k] + 1
+        k = k + 1
+      }
+      args[j] = t
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Inserts node `id` into body `b` at position `at`.
+function insertAt(b: i32[], at: i32, id: i32) {
+  b.push(id)
+  let i = b.length - 1
+  while i > at {
+    b[i] = b[i - 1]
+    i = i - 1
+  }
+  b[at] = id
+  return 0
+}
+
+// Whether operands built into `b` from `at` on hold a boxed `??`.
+function coalBoxFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    if ib.irNodes[b[i]] is SCoalBox { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether variable `v` is the out of a valued `if` in body `b`.
+function valuedIfOut(b: i32[], v: i32): boolean {
+  for id in b {
+    const n = ib.irNodes[id]
+    if n is SIf && n.siOut == v { return true }
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on hold a valued `if`.
+function valuedIfFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SIf && n.siOut >= 0 { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
+// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss.
+export function ifBelowLeadOf(
+  b: i32[],
+  at: i32,
+  why: string,
+  leads: Opnd[],
+): boolean {
+  if opndsAreTemps(leads) && !coalBoxFrom(b, at) { return false }
+  return ifBelowLead(b, at, why)
+}
+
+// Whether operands built into `b` from `at` on hold a valued `if` (a boxed `??` is one) below a
+// part their node writes first (a receiver or an earlier operand, read at its use), naming `why`
+// as the miss. Legacy writes such an `if` in place, which the IR's statement-level `if` cannot
+// reorder.
 export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 {
+    if n is SIf && n.siOut >= 0 || n is SCoalBox {
       irBMiss(why)
       return true
     }
@@ -1770,14 +1925,13 @@ function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const want = numKindPrim(pl.niKind)
   const args: Opnd[] = []
+  const starts: i32[] = []
   for a in c.callArgs {
     const at = b.length
+    starts.push(at)
     const v = irBExpr(b, a)
     if ibMiss != "" { return missRhs("argument") }
-    if (
-      args.length > 0
-      && ifBelowLead(b, at, "short-circuit argument after another")
-    ) {
+    if args.length > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
       return missRhs("short-circuit argument after another")
     }
     const p = repPrim(irBOpRep(v))
@@ -2168,6 +2322,25 @@ function clearStmt(b: i32[], c: Call, ix: i32) {
   return 0
 }
 
+// Whether push receiver `recvIx` is a list held in its own local, so no input of
+// `listOpRecvHeldPlan` it reaches is emit-time state: a declared local or parameter excludes the
+// scope stack and a lifted closure's write slots, an unnarrowed read the fit regions and the
+// narrowed union, and an uncaptured one the capture stand-in.
+function pushRecvHeldAtRest(recvIx: i32): boolean {
+  const n = nodeAt(recvIx)
+  if !(n is Ident) || identDeclOf(recvIx) < 0 { return false }
+  if declaredSlotOf(recvIx) < 0 && paramIndexOf(ibFnIx, n.identName) < 0 {
+    return false
+  }
+  if (
+    readNarrowedTyAt(recvIx, ibFnIx) >= 0
+    || identIsEnvCapture(ibFnIx, n.identName)
+  ) {
+    return false
+  }
+  return listOpRecvHeldPlan(recvIx, ibFnIx, ".push") >= 0
+}
+
 // A one-argument `.push` legacy writes as the plain append (`pushPlainWhy`): its receiver, then
 // its value at the list's element rep.
 function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -2188,15 +2361,19 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const v = irBExpr(b, m.memObj)
   const ln = repNodeAt(irBOpRep(v))
   if ibMiss != "" || !(ln is RList) { return missRhs("push operand coercion") }
-  const x = deliver(b, c.callArgs[0], ln.rlsElem)
+  // A packed list's element is pushed as a plain i32, which its backing truncates.
+  const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  const x = deliver(b, c.callArgs[0], er)
   if ibMiss != "" { return missRhs("method operand") }
-  // The receiver is written at its use, above a valued `if` the value wrote ahead of the node.
-  if ifBelowLead(b, at, "push short-circuit operand") {
+  // A staged receiver is written at its use, above a valued `if` the value wrote ahead of the
+  // node. A receiver held in its own local is read by index after the value, as legacy reads it.
+  if (
+    !pushRecvHeldAtRest(pp.ppRecv)
+    && ifBelowLead(b, at, "push short-circuit operand")
+  ) {
     return missRhs("push short-circuit operand")
   }
-  if !(ln is RList) || irBOpRep(x) != ln.rlsElem {
-    return missRhs("push operand coercion")
-  }
+  if irBOpRep(x) != er { return missRhs("push operand coercion") }
   const r: Rhs = { lpV: v, lpX: x, lpAt: ix }
   return r
 }
@@ -2259,7 +2436,27 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
       return boxTemp(b, none, ix, dst)
     }
   }
-  return widenTo(b, irBExpr(b, ix), ix, dst)
+  // A box local narrowed to a record arm, delivered as it stands: legacy reads the box itself,
+  // not the record its narrowing unboxes to at a record destination.
+  const bx = unwrapParen(ix)
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && bx >= 0
+    && bx < P.nodes.length
+    && heldAsBox(dst)
+    && boxOwedAt(ix, ibFnIx)
+    && narrowedBoxVariantPlain(bx, ibFnIx) >= 0
+    && holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx).hbArm == "pass"
+  ) {
+    return boxTemp(b, irBBoxLocal(bx), ix, dst)
+  }
+  const at = b.length
+  const v = widenTo(b, irBExpr(b, ix), ix, dst)
+  if ibMiss == "" && boxLeadsAt(b, at) {
+    ifBelowLead(b, at, "box of a valued if")
+  }
+  return v
 }
 
 // `v`, built from `ix`, boxed into boxed nullable `dst` by the shared box plan.
@@ -2277,6 +2474,18 @@ function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
 }
 
+// Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
+// its value: a valued node built since then has its value written already, under that tag.
+function boxLeadsAt(b: i32[], at: i32): boolean {
+  if b.length <= at { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) { return false }
+  const r = n.lRhs
+  if !(r is RToBox) { return false }
+  return holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, ibFnIx), ibFnIx).hbArm
+    != "pass"
+}
+
 // Why box plan `p` does not take operand `v`, or "": a `null` and a literal leave an immediate
 // unread, an atom box takes the value at its kind (or at the kind its widening starts from), a
 // `K | null` atom its id, and a box passes a box.
@@ -2288,6 +2497,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd): string {
     "pass" => repNodeAt(r) is RBox || boxedNullable(r)
     "atomStr" => atomNullable(r)
     "rec" | "obj" => repNodeAt(r) is RRecord
+    "refList" => repNodeAt(r) is RList
     "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else { holeKindRep(p.hbKind, r) }
     "ladder" => false
   }
@@ -2368,7 +2578,7 @@ function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLead(b, at, "short-circuit right operand") { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
   if (
     !(repNodeAt(irBOpRep(l)) is RList)
     || !(repNodeAt(irBOpRep(r)) is RList)
@@ -2385,7 +2595,7 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLead(b, at, "short-circuit right operand") { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
   // A boxed nullable is held as the box the staged compare reads.
   if !heldAsBox(irBOpRep(l)) || !heldAsBox(irBOpRep(r)) {
     return irBMiss("union compare operand rep")
@@ -2520,7 +2730,7 @@ function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
   return o
 }
 
-// A list literal along legacy's short build (`arrLitArmOf`, `arrLitShort`): an i32, f64, i64, f32,
+// A list literal along legacy's short build (`arrLitArmOf`, `arrLitShortWhy`): an i32, f64, i64, f32,
 // string, packed or plain ref list, each element delivered at the list's element rep. Every other
 // arm is a named miss.
 function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
@@ -2542,9 +2752,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   ) {
     return irBMiss("array " + arm)
   }
-  if arm != "ref" && !arrLitShort(ix, ibFnIx, arm, n.arrElems.length) {
-    return irBMiss("array long or seeded")
-  }
+  const sw = if arm == "ref" { "" } else { arrLitShortWhy(ix, ibFnIx, arm, n.arrElems.length) }
+  if sw != "" { return irBMiss("array " + sw) }
   const ln = repNodeAt(rep)
   if !(ln is RList) { return irBMiss("array rep") }
   // A union-box slot's elements are boxes: a list the instance reps at its bound member is not one.
@@ -2596,6 +2805,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if lhsIx < 0 { return irBMiss("coalesce operand") }
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
   if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
+  if na == "identBox" { return coalBox(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
@@ -2615,6 +2825,50 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a boxed operand along `coalBoxArmOf`'s arm: the operand's box, then legacy's
+// shared `if` on it, the default built into its null arm so it runs only there. A binding arm
+// re-reads its box, so its operand is a plain variable; a stashed one is a call.
+function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  const arm = coalBoxArmOf(n, lhsIx, ix, ibFnIx)
+  const built = match arm {
+    "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => true
+    "boolPop" | "valNoKind" | "callNoKind" | "next" => false
+  }
+  if !built { return irBMiss("coalesce box " + arm) }
+  if (arm == "callBox" || arm == "callScalar") && !(nodeAt(lhsIx) is Call) {
+    return irBMiss("coalesce box stash operand")
+  }
+  const boxOut = arm == "valBox" || arm == "callBox"
+  if boxOut != heldAsBox(rep) { return irBMiss("coalesce box result rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
+  if arm == "valBox" || arm == "valScalar" {
+    if !(l is OVar) || l.ov < 0 || ib.irVars[l.ov].vKind == "temp" {
+      return irBMiss("coalesce box place")
+    }
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce box default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
@@ -2763,6 +3017,7 @@ function nodeAssigns(ni: i32, v: i32): boolean {
   return match n {
     SAssign => n.asDst == v
     SIf => bodyAssigns(n.siThen, v) || bodyAssigns(n.siElse, v)
+    SCoalBox => bodyAssigns(n.cbNull, v)
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
     SForIn => n.xfVar == v || bodyAssigns(n.xfBody, v)
@@ -3026,7 +3281,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     const at = b.length
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst)
     if ibMiss != "" { return l }
-    if ifBelowLead(b, at, "short-circuit right operand") { return l }
+    if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return l }
     if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
   }
@@ -3125,7 +3380,10 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
     const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
-    if args.length > 0 && ifBelowLead(b, from, "string operand after another") {
+    if (
+      args.length > 0
+      && ifBelowLeadOf(b, from, "string operand after another", args)
+    ) {
       return 0
     }
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
@@ -3232,14 +3490,23 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
 }
 
 // A struct field store `o.f = v` that legacy writes as the record, the bare value and its
-// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValuePlain`).
+// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValuePlain`); a variant's, the record
+// a variant receiver is or a box narrowed to one yields (`variantParam`, `narrowVariant`).
 function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const arm = fieldStoreArmOf(n.binLeft, ibFnIx)
-  if arm != "struct" && arm != "variantParam" {
+  if arm != "struct" && arm != "variantParam" && arm != "narrowVariant" {
     return skip("field store " + arm)
   }
-  const sf = if arm == "struct" { fieldStoreStructAt(n.binLeft, ibFnIx) } else { fieldStoreVariantAt(n.binLeft, ibFnIx) }
+  const sf = if arm == "struct" { fieldStoreStructAt(n.binLeft, ibFnIx) } else if arm == "variantParam" { fieldStoreVariantAt(n.binLeft, ibFnIx) } else { fieldStoreNarrowedAt(n.binLeft, ibFnIx) }
   if sf.length != 2 { return skip("field store shape") }
+  // The receiver's narrowed read casts to the variant its own read picks; the store's `struct.set`
+  // writes `sf[0]`'s heap, so the two must name one variant.
+  if (
+    arm == "narrowVariant"
+    && narrowedBoxVariantPlain(t.memObj, ibFnIx) != sf[0]
+  ) {
+    return skip("field store narrowed variant")
+  }
   const plain = if arm == "struct" { fieldStoreValuePlain(sf[0], sf[1], n.binRight, ibFnIx) } else { fieldStoreVariantValuePlain(sf[0], sf[1], n.binRight, ibFnIx) }
   if !plain { return skip("field store value") }
   const rt = nodeTyAt(t.memObj, ibFnIx)
@@ -3585,6 +3852,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     }
     if none { return skip("void return value") }
     if retBoxesCall(n.retArg) { return skip("return of a boxed call") }
+    if retRefusedWhy(n.retArg, ibFnIx) != "" { return skip("return refused") }
     // A returned value `if` is legacy's tail `if`, each arm's value its own exit.
     if retIsValueIf(n.retArg) {
       // `end` is followed by the result's `null` where it bears one (`emitNullForRet`).
@@ -3707,6 +3975,7 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   }
   const n0 = b.length
   if retBoxesCall(last) { return skip("return of a boxed call") }
+  if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
   const v = deliver(b, last, ib.irRetRep)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
@@ -3776,6 +4045,10 @@ function tailArm(blockIx: i32): i32[] {
   }
   if retBoxesCall(last) {
     skip("return of a boxed call")
+    return body
+  }
+  if retRefusedWhy(last, ibFnIx) != "" {
+    skip("return refused")
     return body
   }
   const v = deliver(body, last, ib.irRetRep)

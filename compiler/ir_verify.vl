@@ -58,6 +58,7 @@ import {
   RRecover,
   RRel,
   RRetag,
+  RStage,
   RStrOp,
   RTagIs,
   RTagOf,
@@ -71,6 +72,7 @@ import {
   SBoundsCheck,
   SBr,
   SCellSet,
+  SCoalBox,
   SDrop,
   SEffect,
   SForIn,
@@ -109,7 +111,7 @@ import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
-import { tyIsFnValue } from "./emit_classify"
+import { tyOpenHeldAsIds } from "./emit_classify"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -355,7 +357,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCallHost => uses(r.chArgs, at)
     RBoxField => {
       use(r.bfV, at)
-      if !(repNodeAt(opRep(r.bfV)) is RBox) {
+      const bf = repNodeAt(opRep(r.bfV))
+      if !(bf is RBox) && !(bf is RNullable && bf.rnDisc == 4) {
         return fail(2, at, "a narrowed field's receiver is a box")
       }
       0
@@ -364,7 +367,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.bnV, at)
       const bn = repNodeAt(opRep(r.bnV))
       const boxed = bn is RBox
-        || r.bnAtom >= 0 && bn is RNullable && bn.rnDisc == 4
+        || bn is RNullable
+        && bn.rnDisc == 4
+        && (r.bnAtom >= 0 || repNodeAt(dst) is RRecord)
       if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
       }
@@ -531,7 +536,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RNullOf => {
       const d = repNodeAt(dst)
       if r.nuOwn == NULL_OWN_BOX {
-        if !(d is RBox) {
+        if !(d is RBox) && !(d is RNullable && d.rnDisc == 4) {
           return fail(2, at, "a null box is not delivered into a union box")
         }
       } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
@@ -593,7 +598,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.lpV, at)
       use(r.lpX, at)
       const ln = repNodeAt(opRep(r.lpV))
-      if !(ln is RList) || ln.rlsElem != opRep(r.lpX) {
+      if !(ln is RList) {
+        return fail(2, at, "a push of a non-element onto a non-list")
+      }
+      // A packed list's element is pushed as a plain i32, which its backing truncates.
+      const want = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
+      if opRep(r.lpX) != want {
         return fail(2, at, "a push of a non-element onto a non-list")
       }
       if dst >= 0 && dst != vfI32 {
@@ -651,7 +661,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if dst >= 0 && dst != vfI32 { return fail(2, at, "a length is an i32") }
       0
     }
-    RMapOp => uses(r.mpArgs, at)
+    RMapOp => {
+      uses(r.mpArgs, at)
+      if r.mpOp == "size" {
+        if r.mpArgs.length != 1 || !(repNodeAt(opRep(r.mpArgs[0])) is RMap) {
+          return fail(2, at, "a map size of no map")
+        }
+        if dst >= 0 && dst != vfI32 {
+          return fail(2, at, "a map size is an i32")
+        }
+      }
+      0
+    }
     RTagStash => {
       use(r.tgsV, at)
       if opRep(r.tgsV) != vfI32 {
@@ -809,6 +830,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && dst != vfI32 {
         return fail(2, at, "a relocated constant is an i32")
+      }
+      0
+    }
+    RStage => {
+      use(r.sgV, at)
+      if r.sgV is OStr || dst >= 0 && dst != opRep(r.sgV) {
+        return fail(2, at, "a staged operand is a value at its own rep")
       }
       0
     }
@@ -1136,6 +1164,19 @@ function stmt(id: i32) {
       vfLabelOut.pop()
     }
     SIf => ifSpine(id)
+    SCoalBox => {
+      use(n.cbL, id)
+      // A union box, or a nullable boxed as a union is (discipline 4).
+      const lr = repNodeAt(opRep(n.cbL))
+      if !(lr is RBox || lr is RNullable && lr.rnDisc == 4) {
+        return fail(2, id, "a boxed `??` reads no box")
+      }
+      if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
+        return fail(4, id, "a boxed `??` writes no variable")
+      }
+      nested(n.cbNull)
+      endsWriting(n.cbNull, n.cbOut, id)
+    }
     SSwitch => switchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
@@ -1262,14 +1303,14 @@ function touchesList(n: IrNode): boolean {
     SListSet | SBoundsCheck => true
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
-    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SForIn | SIf | SSwitch | SBr | SReturn | STrap | SDrop | SRawOp => false
+    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SForIn | SIf | SSwitch | SCoalBox | SBr | SReturn | STrap | SDrop | SRawOp => false
   }
 }
 
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
   }
 }
 
@@ -1280,12 +1321,10 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 // parameter. The builder asks it first, so such a function is uncovered rather than refused.
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 
-// Whether a variable of type `ty` at rep `rep` is open (rule 1): a tagged set's polymorphic
-// function type is not, being held as the set's i32 id whatever its variables.
+// Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
+// a tagged set's function, held at the set's `i32` id, is not (`tyOpenHeldAsIds`).
 export function irTyHeldOpen(ty: i32, rep: i32): boolean {
-  if !irTyOpen(ty) { return false }
-  const p = repPrim(rep)
-  return !(tyIsFnValue(ty) && p != null && p == "i32")
+  return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
 }
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
