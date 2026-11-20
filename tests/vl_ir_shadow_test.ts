@@ -220,7 +220,7 @@ print(cv(3.0))
 // field's length (B3); a narrowed box read whole at its variant, and a `string | null`
 // parameter read at its string (narrowed read); a value `if` bound and one widened into an
 // `f64` binding (B4a).
-// Each witness is one covered function that must match legacy's bytes.
+// Each witness holds a covered function that must match legacy's bytes, as must a covered helper.
 const SHARED = [
   `let name = "vl"\nfunction who(): string { return name }\nprint(who())\n`,
   `function stop(code: i32): never { return __trap__() }
@@ -309,8 +309,10 @@ Deno.test({
     for (const src of SHARED) {
       const { rc, rows } = run(src, true);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
-        throw new Error(`want one covered, matched function, got ${JSON.stringify([...rows])}\n${src}`);
+      // A helper the witness calls may be covered too; every covered function must match.
+      const covered = rows.get("covered") ?? 0;
+      if (covered < 1 || (rows.get("matched") ?? 0) !== covered) {
+        throw new Error(`want the witness covered and matched, got ${JSON.stringify([...rows])}\n${src}`);
       }
     }
   },
@@ -636,6 +638,91 @@ print(bs[0])
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (!(rows.get("matched")! >= 2) || rows.get("matched") !== rows.get("covered")) {
       throw new Error(`want both pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A `.push` onto a literal-union, `(boolean | null)`, `(string | null)` or union-box list, and of a
+// narrowed arm onto its own record list, delivers the value at the element rep as legacy writes it.
+Deno.test({
+  name: "ir shadow: a push onto each element arm legacy writes as itself is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type Dir = "n" | "s"
+type Sq = { k: "sq", w: i32 }
+type Ci = { k: "ci", r: i32 }
+type Sh = Sq | Ci
+function lit(xs: Dir[], d: Dir) { xs.push(d) }
+function nb(xs: (boolean | null)[], b: boolean | null) { xs.push(b) }
+function ns(xs: (string | null)[], s: string | null) { xs.push(s) }
+function bx(xs: (i32 | string)[], v: i32) { xs.push(v) }
+function arm(xs: Sq[], s: Sh) { if s is Sq { xs.push(s) } }
+const a: Dir[] = []
+lit(a, "s")
+const b: (boolean | null)[] = []
+nb(b, null)
+const c: (string | null)[] = []
+ns(c, "x")
+const u: (i32 | string)[] = []
+bx(u, 4)
+const q: Sq[] = []
+arm(q, { k: "sq", w: 3 })
+print(q.length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want all five pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A `.push` of a short-circuit value onto a list held in its own local reads the receiver by index
+// after the value, as legacy does, so it is covered; a staged receiver (a global) is written
+// ahead of the value and stays a named miss.
+Deno.test({
+  name: "ir shadow: a short-circuit push onto a held list is covered, a staged one a miss",
+  ignore,
+  fn: () => {
+    const src = `let xs: boolean[] = []
+function a(out: boolean[], p: boolean, q: boolean) { out.push(p && q) }
+function b(out: boolean[], p: boolean, q: boolean, r: boolean) { out.push(p && (q || r)) }
+function c(p: boolean, q: boolean) { xs.push(p && q) }
+const o: boolean[] = []
+a(o, true, false)
+b(o, true, false, true)
+c(true, true)
+print(o.length + xs.length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both held pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered push short-circuit operand") !== 1) {
+      throw new Error(`want the staged push a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A short-circuit arm that reassigns the held receiver: both sides read the local after the value,
+// so the push lands on the list the arm assigned, and the IR matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a held push whose value reassigns the receiver reads it after the value",
+  ignore,
+  fn: () => {
+    const src = `function h(p: boolean): i32 {
+  let xs: boolean[] = []
+  const other: boolean[] = []
+  xs.push(p && (xs = other).length == 0)
+  return xs.length * 10 + other.length
+}
+print(h(true))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the function covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1091,6 +1178,39 @@ Deno.test({
   },
 });
 
+// A record whose field holds a generic function is typed open, but legacy holds the function as
+// its tagged set's id, so the record's rep is closed (`irTyHeldOpen`): the local builds and every
+// covered function matches. The program is distilled cell d15117_fw_alias_one_f64_str_ab_fn_bound.
+const OPEN_CONTAINER = `function id0(a) { return a }
+function id1(a) { return a }
+function run() {
+  const r = { f: id0 }
+  const q = r
+  q.f = id0
+  const g = r.f
+  print(g(2.5))
+  print(g("s"))
+}
+run()
+`;
+Deno.test({
+  name: "ir shadow: a record of a tagged set's function is held open and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(OPEN_CONTAINER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered open local type")) {
+      throw new Error(`want no open-local miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A list delivery whose copy owes nothing past the value (`listCopyOwesNothing`) is the value as
 // built, so the builder takes it as a plain node: no coercion miss, and every covered function
 // matches legacy's bytes. The program is distilled cell b004880.
@@ -1305,6 +1425,25 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
       throw new Error(`want r covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A literal-union list's elements are its interned atoms, which the IR delivers itself: the
+// literal takes the short build and its fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal-union list literal builds at the short tail and matches",
+  ignore,
+  fn: () => {
+    const { rows } = run(`function pick(i: i32): string {
+  const xs: ("a" | "b")[] = ["a", "b", "a"]
+  return xs[i]
+}
+print(pick(1))
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
