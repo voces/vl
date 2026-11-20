@@ -216,7 +216,7 @@ function main(c: boolean) {
 }
 main(true)
 `);
-    if ((r.get("node-in array: miss local cell rep") ?? 0) < 1) {
+    if ((r.get("node-in array: miss atom cell local rep") ?? 0) < 1) {
       throw new Error(`want the atom cell's read to miss, got ${show(r)}`);
     }
     const differ = [...r.keys()].filter((k) => k.startsWith("node-in array: differ"));
