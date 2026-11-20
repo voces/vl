@@ -11,4 +11,4 @@ shadow matches every function it covers.
 
 | | lines |
 |---|---|
-| compiler | +9, −1 |
+| compiler | +10, −1 |
