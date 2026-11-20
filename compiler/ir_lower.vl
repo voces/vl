@@ -110,6 +110,7 @@ import {
   RMakeList,
   RMakeRec,
   RMapFilter,
+  RMapGet,
   RMapGetOr,
   RMapHas,
   RMapNew,
@@ -251,7 +252,9 @@ import {
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
+  emitMapGetTail,
   emitMapNew,
+  emitNarrowedMapReadTail,
   emitNullOwn,
   emitNullRetTail,
   emitStrLitAt,
@@ -295,7 +298,9 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  mapGetArmOf,
   mapGetHelperFnOf,
+  mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrHelperRoute,
   mapGetOrI32Head,
@@ -708,6 +713,12 @@ function rhs(r: Rhs, tail: boolean) {
     RCall => call(r, tail)
     RGlobalGet => globalRead(r.ggSym, r.ggNonNull)
     RMapGetOr => mapGetOr(r)
+    RMapGet => {
+      const from = irLAt()
+      const got = mapGet(r)
+      irLIndexRow(r.mtAt, from)
+      got
+    }
     RMapHas => mapHas(r)
     RPrint => irLMiss("print value")
     RNumIntr => {
@@ -1476,6 +1487,41 @@ function mapProbeHead(
   return sh
 }
 
+// `RMapGet`, a bare `m[k]` by legacy's arm (`mapGetArmOf`): the global or receiver and the key
+// into `__map_get_<row>__` with the read's miss value, or the probe and its value tail; then the
+// narrowed read's tail.
+function mapGet(r: RMapGet) {
+  const fnIx = lw.irAt
+  const nd = nodeAt(r.mtAt)
+  if !(nd is Index) { return irLMiss("map get node") }
+  if r.mtSym >= 0 && userGlobalReadClass(r.mtSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map get of a global not read plainly")
+  }
+  const arm = mapGetArmOf(r.mtAt, fnIx)
+  match arm {
+    "unionBox" => {
+      return irLMiss("map get route")
+    }
+    "helper" => {
+      const fi = mapGetHelperFnOf(
+        nd.idxArr,
+        fnIx,
+        mapGetMissOf(nd.idxArr, fnIx),
+      )
+      mapRecvRead(r.mtSym, r.mtNonNull, r.mtLoc)
+      mapRecvRefTail(nd.idxArr, fnIx)
+      irLOpnd(r.mtKey)
+      mapRecvKeyTail(mapRecvShapeOf(nd.idxArr, fnIx))
+      fbCall(fi)
+    }
+    "inline" => {
+      mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
+      emitMapGetTail(nd.idxArr, fnIx)
+    }
+  }
+  return emitNarrowedMapReadTail(r.mtAt, fnIx)
+}
+
 // An inline `??` map read's head, up to the miss arm's `else`: the probe, then the `i32` read's
 // or mv slot read's open by `form`. Returns the receiver's shape for the tail.
 function mapGetOrInlineHead(
@@ -1555,7 +1601,7 @@ function mapOp(r: RMapOp) {
       irLOpnd(r.mpArgs[0])
       mapSizeTail(m.memObj, lw.irAt)
     }
-    "get" | "has" | "set" | "delete" | "keys" => irLMiss("map op " + r.mpOp)
+    "has" | "set" | "delete" | "keys" => irLMiss("map op " + r.mpOp)
   }
 }
 

@@ -84,6 +84,7 @@ import {
   irFnNew,
   irFnText,
   irGlobalNote,
+  irGlobalRepOf,
   irNodeFamily,
   irNodeNew,
   irSigNote,
@@ -158,6 +159,8 @@ import {
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
   mapFilterWhy,
+  mapGetArmOf,
+  mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrMvPlain,
   mapKeyArmOf,
@@ -362,6 +365,7 @@ import {
   monoInstFe,
   monoInstOrig,
   monoOrigNode,
+  mvValKindAt,
   sFieldCount,
   sFieldNames,
   sFieldStart,
@@ -2090,20 +2094,14 @@ function mapHasRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if sh == -3 { return missRhs("map has value type") }
   const ka = mapKeyArmOf(m.memObj, c.callArgs[0], ibFnIx, sh)
   if ka != "plain" { return missRhs("map key " + ka) }
-  const g = mapGlobalOf(m.memObj)
-  const loc = mapRecvLoc(b, m.memObj, g, "map has receiver")
-  if ibMiss != "" { return missRhs(ibMiss) }
-  const at = b.length
-  const k = irBExpr(b, c.callArgs[0])
-  if ibMiss != "" { return missRhs("method operand") }
-  if mapRecvReassigned(b, at, loc) { return missRhs("map receiver reassigned") }
+  const rk = mapRecvKeyOf(b, m.memObj, c.callArgs[0], "map has receiver")
+  if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
-    mhSym: g,
-    mhNonNull: g >= 0
-      && globalReadRecovers(sidOfNode(m.memObj), m.memObj, ibFnIx),
-    mhLoc: loc,
+    mhSym: rk.mkSym,
+    mhNonNull: rk.mkNonNull,
+    mhLoc: rk.mkLoc,
     mhRecv: m.memObj,
-    mhKey: k,
+    mhKey: rk.mkKey,
     mhAt: ix,
   }
   return r
@@ -3276,22 +3274,13 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   }
   // A default the miss arm writes as a body leaves the read's value on the stack from here.
   const clear = !endsInTemp(b)
-  const g = mapGlobalOf(rd.idxArr)
-  const loc = mapRecvLoc(b, rd.idxArr, g, "map read receiver")
-  if ibMiss != "" { return loc }
-  const kat = b.length
-  const k = irBExpr(b, rd.idxIndex)
-  if ibMiss != "" { return k }
+  const rcv = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map read receiver")
+  if rcv == null { return irBMiss(ibMiss) }
   // The default is written in the miss arm: in place there, or as the body a fused read's arm holds.
   const db: i32[] = []
   const dv: Opnd = if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
-  if mapRecvReassigned(b, kat, loc) {
-    return irBMiss("map receiver reassigned")
-  }
-  const sid = sidOfNode(rd.idxArr)
-  const nonNull = g >= 0 && globalReadRecovers(sid, rd.idxArr, ibFnIx)
   const form = if mv { 2 } else if inline { 1 } else { 0 }
   if !defaultSelfContained(db, 0, dv) {
     if !clear { return irBMiss("map read default after an operand") }
@@ -3301,21 +3290,81 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
       dv,
       ix,
       rep,
-      { prSym: g, prNonNull: nonNull, prKey: k, prForm: form },
-      loc,
+      {
+        prSym: rcv.mkSym,
+        prNonNull: rcv.mkNonNull,
+        prKey: rcv.mkKey,
+        prForm: form,
+      },
+      rcv.mkLoc,
     )
   }
   for id in db { b.push(id) }
   const r: Rhs = {
-    mgSym: g,
-    mgNonNull: nonNull,
-    mgLoc: loc,
-    mgKey: k,
+    mgSym: rcv.mkSym,
+    mgNonNull: rcv.mkNonNull,
+    mgLoc: rcv.mkLoc,
+    mgKey: rcv.mkKey,
     mgAt: ix,
     mgForm: form,
     mgDef: dv,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
+// ref value at its niche, or a mono-valued map read at the value's own rep.
+export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
+  const rd = nodeAt(ix)
+  if !(rd is Index) { return irBMiss("map get") }
+  const arm = mapGetArmOf(ix, ibFnIx)
+  if arm == "unionBox" { return irBMiss("map get union box") }
+  const sh = mapRecvShapeOf(rd.idxArr, ibFnIx)
+  const ka = mapKeyArmOf(rd.idxArr, rd.idxIndex, ibFnIx, sh)
+  if ka != "plain" { return irBMiss("map key " + ka) }
+  const rk = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map get receiver")
+  if rk == null { return irBMiss(ibMiss) }
+  const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
+  const m = repNodeAt(mr)
+  if !(m is RMap) { return irBMiss("map get receiver rep") }
+  if !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) { return irBMiss("map get rep") }
+  const r: Rhs = {
+    mtSym: rk.mkSym,
+    mtNonNull: rk.mkNonNull,
+    mtLoc: rk.mkLoc,
+    mtKey: rk.mkKey,
+    mtAt: ix,
+  }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// Whether a bare map read of `recvIx` (value rep `val`, shape `sh`) leaves rep `rep`: an mv
+// slot's ref value at its null niche, or recovered when the read is narrowed; a mono-valued map's
+// value as itself, or a `boolean` value at its nullable.
+function mapGetRepOk(sh: i32, val: i32, rep: i32, recvIx: i32): boolean {
+  // A `boolean`-valued map's miss reads `2`, the `boolean | null` sentinel (`mapGetMissOf`).
+  if sh < 0 {
+    if rep == val { return true }
+    const bn = repNodeAt(rep)
+    return boolNullable(rep)
+      && bn is RNullable
+      && bn.rnInner == val
+      && mapGetMissOf(recvIx, ibFnIx) == 2
+  }
+  const k = mvValKindAt(sh)
+  if (
+    k == null
+    || k == "f64"
+    || k == "i64"
+    || k == "f32"
+    || k == "v128"
+    || k == "union"
+  ) {
+    return false
+  }
+  const n = repNodeAt(rep)
+  if !(n is RNullable) { return rep == val }
+  return n.rnDisc == 1 && n.rnInner == val
 }
 
 // A map read whose default computes, as `SCoalBox`'s fused map-read arm: the probe's shared head
@@ -3363,6 +3412,31 @@ function defaultSelfContained(b: i32[], at: i32, o: Opnd): boolean {
   if b.length != at + 1 || !(o is OVar) { return false }
   const n = ib.irNodes[b[at]]
   return n is SLet && n.lDst == o.ov
+}
+
+// A map operation's receiver then key, as legacy reads them: map global `mkSym` (recovered for
+// `mkNonNull`), or where it is -1 receiver operand `mkLoc`; then key `mkKey`, which must not
+// reassign the receiver. Null on a miss.
+type MapRecvKey = { mkSym: i32, mkNonNull: boolean, mkLoc: Opnd, mkKey: Opnd }
+function mapRecvKeyOf(
+  b: i32[],
+  recvIx: i32,
+  keyIx: i32,
+  why: string,
+): MapRecvKey | null {
+  const g = mapGlobalOf(recvIx)
+  const loc = mapRecvLoc(b, recvIx, g, why)
+  if ibMiss != "" { return null }
+  const at = b.length
+  const k = irBExpr(b, keyIx)
+  if ibMiss != "" { return null }
+  if mapRecvReassigned(b, at, loc) {
+    irBMiss("map receiver reassigned")
+    return null
+  }
+  const nonNull = g >= 0
+    && globalReadRecovers(sidOfNode(recvIx), recvIx, ibFnIx)
+  return { mkSym: g, mkNonNull: nonNull, mkLoc: loc, mkKey: k }
 }
 
 // A map operation's receiver other than global `g`: any expression read as a map, in place (a
