@@ -57,7 +57,7 @@ The stage-pair walk, first run over every IR function (about 237M), is gated on 
 Matrix: global, field and index receivers × `&&`, `||`, two `??` spellings, a nested global and a
 nested field push × statement, value and call-argument position (54 cells). All 54 print the same
 output under the merge-base seed and under this branch claiming every family; 0 runs → not-runs,
-0 silent, 0 fail rows. 18 cells are newly matched (`&&`/`||` at statement and value position); the
+0 silent, 0 fail rows. 12 cells are newly matched (`&&`/`||` at statement and value position); the
 argument cells miss as `short-circuit argument after another`, the `??` cells as `coalesce box after
 an operand`, and the nested cells as `push late receiver`.
 
