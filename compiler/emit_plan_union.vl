@@ -116,6 +116,8 @@ import {
   armSiteReads,
   asgLitWidth,
   asgReadNode,
+  boxedArmOfMember,
+  boxedFieldUnionTyOf,
   captureNamesOf,
   capturedKindOf,
   coalesceNulRefNicheOperand,
@@ -213,7 +215,14 @@ import {
   isArmTagOfTy,
   isTestedRowOf,
 } from "./emit_obj_lit_fits"
-import { boxDstName, boxTyName, unionBoxTyOfRead } from "./emit_plan_coerce"
+import {
+  boxDstName,
+  boxOwedAt,
+  boxRecordTyAt,
+  boxRecordUnionTyOf,
+  boxTyName,
+  unionBoxTyOfRead,
+} from "./emit_plan_coerce"
 import { arrLitBuild, arrLitTyAt, listFitGrowRow } from "./emit_plan_list"
 import {
   isValueUnionOfSet,
@@ -1937,12 +1946,13 @@ export function coerceListAtomOf(
   return cak
 }
 
-// How a value is boxed: the null tag (`null`), a box as itself (`pass`), a value-atom box of kind
-// `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal (`lit`), a `K | null`
-// atom as its member string (`atomStr`), a record under arm `hbKind`'s tag (`rec`), an object
-// literal built as that arm (`obj`), a ref list under tag `hbKind` (`refList`), or the ladder.
+// How a value is boxed: the null tag (`null`), a box as itself (`pass`), a member record read as its
+// field's box (`memberBox`), a value-atom box of kind `hbKind` widened from `hbSrc` (`atom`), that
+// box over a literal (`lit`), a `K | null` atom as its string (`atomStr`), a record or object literal
+// under arm `hbKind` (`rec`, `obj`), a ref list under tag `hbKind` (`refList`), or the ladder.
 export type HoleBoxArm = "null"
   | "pass"
+  | "memberBox"
   | "atom"
   | "lit"
   | "atomStr"
@@ -1980,6 +1990,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box.
   if bare is Index && exprMap(bare.idxArr, fnIx) { return ladder }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
+  if memberBoxPasses(exprIx, unionTy, fnIx) {
+    return holeBox("memberBox", -1, -1)
+  }
   // `emitUnionArmValueBox`'s two plain rungs: a record boxed as itself under its arm.
   if (
     exprVariantIndex(exprIx, fnIx) >= 0
@@ -2218,7 +2231,10 @@ export function armValuePlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   }
   const wv = wideArmPlainOf(unionTy, exprIx, fnIx)
   if wv >= 0 { return wv }
-  const svi = exprVariantIndex(exprIx, fnIx)
+  // A record read out of the union box it is held in is cast to its member's record
+  // (`boxedArmOfMember`), and boxes as that member.
+  const ovi = exprVariantIndex(exprIx, fnIx)
+  const svi = if ovi >= 0 { ovi } else { boxedArmOfMember(exprIx, fnIx) }
   if svi < 0 || svi >= uTags.length { return -1 }
   const si = structIndexOfExpr(exprIx, fnIx)
   if si >= 0 && si < sHeapIdx.length && sHeapIdx[si] != variantHeap(svi) {
@@ -2248,17 +2264,47 @@ function holePassPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     return ladder
   }
   if narrowBoxWideArmOf(unionTy, exprIx, fnIx) >= 0 { return ladder }
-  const ft: i32[] = []
-  const tt: i32[] = []
-  wideRetagPairs(exprIx, fnIx, unionTy, ft, tt)
-  if ft.length > 0 { return ladder }
-  if (
-    !deliveryRetagHas(exprIx)
-    && boxRetagArmsOfTys(unionBoxTyIxOfExpr(exprIx, fnIx), unionTy, [], [])
-  ) {
+  if !boxPassesAsTy(unionBoxTyIxOfExpr(exprIx, fnIx), exprIx, unionTy) {
     return ladder
   }
   return holeBox("pass", -1, -1)
+}
+
+// Whether a box of union `sty`, delivered at `exprIx` into `unionTy`, keeps every member's tag: no
+// arm re-tagged to a wider one, and no retag the boxes' member sets owe unless the checker records
+// one at the delivery.
+function boxPassesAsTy(sty: i32, exprIx: i32, unionTy: i32): boolean {
+  const ft: i32[] = []
+  wideRetagPairsOfTy(sty, unionTy, ft, [])
+  if ft.length > 0 { return false }
+  return deliveryRetagHas(exprIx) || !boxRetagArmsOfTys(sty, unionTy, [], [])
+}
+
+// Whether delivery `ix` is a member record read the box plan passes as its field's box
+// (`memberBox`), so the read itself is written at its storage (`storageReadEnter`).
+export function memberBoxReadAt(ix: i32, fnIx: i32): boolean {
+  // Asked first: the plan is asked of no delivery but a member record read, so no other
+  // delivery's rows move.
+  if boxedArmOfMember(ix, fnIx) < 0 || !boxOwedAt(ix, fnIx) { return false }
+  const ut = boxRecordUnionTyOf(boxRecordTyAt(ix, fnIx))
+  return holeBoxPlanOf(ix, ut, fnIx).hbArm == "memberBox"
+}
+
+// Whether member record read `exprIx` is delivered into `unionTy` as the box its field holds: every
+// record arm of the field's union is an arm of `unionTy`, and that box passes into it whole.
+function memberBoxPasses(exprIx: i32, unionTy: i32, fnIx: i32): boolean {
+  const fty = boxedFieldUnionTyOf(exprIx, fnIx)
+  if fty < 0 || unionTy < 0 { return false }
+  const fa: i32[] = []
+  const ta: i32[] = []
+  unionArmRowsOfTy(fty, fa)
+  unionArmRowsOfTy(unionTy, ta)
+  for vi in fa {
+    if vi < 0 || vi >= uTags.length || !armsHoldHeap(ta, variantHeap(vi)) {
+      return false
+    }
+  }
+  return boxPassesAsTy(fty, exprIx, unionTy)
 }
 
 // The tags of `exprIx`'s union whose arm is wider than an arm of `unionTy` into `fromTags`,
@@ -2270,8 +2316,22 @@ export function wideRetagPairs(
   fromTags: i32[],
   toTags: i32[],
 ) {
+  return wideRetagPairsOfTy(
+    unionBoxTyIxOfExpr(exprIx, fnIx),
+    unionTy,
+    fromTags,
+    toTags,
+  )
+}
+
+// `wideRetagPairs` for a box of union `sty`.
+function wideRetagPairsOfTy(
+  sty: i32,
+  unionTy: i32,
+  fromTags: i32[],
+  toTags: i32[],
+) {
   const fa: i32[] = []
-  const sty = unionBoxTyIxOfExpr(exprIx, fnIx)
   if sty >= 0 && armRowsOfUnionTy(sty, fa) {
     if tySame(sty, unionTy) { return 0 }
   } else {

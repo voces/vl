@@ -298,3 +298,84 @@ print(ys[0])
     }
   },
 });
+
+// A list literal builds at legacy's build type, which reads a type parameter at the instance:
+// `gt<f32>`'s `[1.5]` at `T[]` is an f32 list, where the literal's own stamp says f64.
+Deno.test({
+  name: "ir door: a generic instance's list literal builds at the instance's list",
+  ignore,
+  fn: () => {
+    const r = rows(`function gt<T>(xs: T[] | null) { return xs ?? [1.5] }
+print(gt<f32>(null)[0])
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 1 || off.length > 0) {
+      throw new Error(`want the instance's literal matched, got ${show(r)}`);
+    }
+  },
+});
+
+// A sub-word list's elements are plain i32s its backing truncates, as a `u8` list's are.
+Deno.test({
+  name: "ir door: a sub-word list literal's i32 elements verify and match",
+  ignore,
+  fn: () => {
+    const r = rows(`const c: i8[] = [-6, 7]
+const d: u16[] = [65000, 7]
+print(c[0] + d[0])
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 2 || off.length > 0) {
+      throw new Error(`want both sub-word literals matched, got ${show(r)}`);
+    }
+  },
+});
+
+// A fragment inside a walk it did not build reads the loop variable's legacy slot, held to
+// legacy's cell: a string's code unit, a packed byte, a map's key and value, an index, a variable
+// a closure captures, and an outer walk's variable. Each literal matches or misses by name.
+Deno.test({
+  name: "ir door: a list literal reading a loop variable matches or names its miss",
+  ignore,
+  fn: () => {
+    const r = rows(`function w1(s: string): i32 {
+  let t = 0
+  for ch in s { const ys = [ch, 1]; t = t + ys[0] }
+  return t
+}
+function w2(bs: u8[]): i32 {
+  let t = 0
+  for b in bs { const ys = [b, 1]; t = t + ys[0] }
+  return t
+}
+function w3(m: {[string]: i32}): i32 {
+  let t = 0
+  for k, v in m { const ks = [k, "z"]; const vs = [v, 1]; t = t + vs[0] + ks.length }
+  return t
+}
+function w4(xs: i32[]): i32 {
+  let t = 0
+  for i, x in xs { const ys = [i, x]; t = t + ys[0] + ys[1] }
+  return t
+}
+function w5(xs: i32[]): i32 {
+  let t = 0
+  for x in xs { const g = () => x + 1; const ys = [x, g()]; t = t + ys[0] + ys[1] }
+  return t
+}
+function w6(xs: i32[], zs: i32[]): i32 {
+  let t = 0
+  for x in xs { for z in zs { const ys = [x, z]; t = t + ys[0] * ys[1] } }
+  return t
+}
+const bs: u8[] = [200, 7]
+const m: {[string]: i32} = Map()
+m["a"] = 3
+print(w1("ab") + w2(bs) + w3(m) + w4([5, 6]) + w5([5, 6]) + w6([2, 3], [4, 5]))
+`);
+    const bad = [...r.keys()].filter((k) => k.startsWith("node-in") && (k.includes("read of") || k.includes("differ")));
+    if (bad.length > 0 || (r.get("node-in array: matched") ?? 0) < 7) {
+      throw new Error(`want every loop-variable literal matched or a named miss, got ${show(r)}`);
+    }
+  },
+});

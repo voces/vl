@@ -993,7 +993,7 @@ every miss it covered becomes a refusal: a clause-2 violation, whatever the corp
   shared arm (§10's two seams) and the driver census to show it unhit with claiming on. §5.2's
   deletion rule applies unchanged.
 - **An emitter whose operands are arbitrary expressions deletes only at I8.** It calls `emitExpr`
-  (or kin) on a child expression, which is role `ast` in the census: `emitArrF32`, `emitIfExpr`,
+  (or kin) on a child expression, which is role `ast` in the census: `emitArrWide`, `emitIfExpr`,
   `emitPush` and the like. The IR handles the construct only as far as `irBExpr` handles each
   operand, and no operand-kind probe set proves that total. Before I8 such an emitter is collapsed,
   not deleted: its decisions become the shared plan, its bytes the shared tails, and what remains

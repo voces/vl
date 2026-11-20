@@ -780,6 +780,33 @@ print(bs[1])
   },
 });
 
+// `n is A` over a local `U | null` box, a valued `if` joining an arm with `null`: the same box
+// legacy tests by its tag, `null` one more tag, read raw past the narrowing. Covered and matched.
+Deno.test({
+  name: "ir shadow: an is test over a local nullable union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type A = { k: "a", v: i32 }
+type B = { k: "b", w: i32 }
+type U = A | B
+const us: U[] = [{ k: "a", v: 3 }, { k: "b", w: 4 }]
+function at(i: i32): U { return us[i] }
+function f(x: i32): i32 {
+  const n = if x >= 0 && x < us.length { at(x) } else { null }
+  if !(n is A) && !(n is B) { return -1 }
+  if n is A { return n.v }
+  return 0
+}
+print(f(0) + f(1) + f(9))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -946,10 +973,10 @@ run(2.5)
 });
 
 // A record literal on legacy's layout path builds field by field and matches, a widened `f64`
-// field included; a box handed to another union's box field (legacy converts its members) stays a
+// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) stays a
 // named miss.
 Deno.test({
-  name: "ir shadow: a record literal builds, a widened field too; a box from a box is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union is a named miss",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
@@ -970,8 +997,8 @@ if d.v is f64 { print(d.v) }
     if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
       throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (rows.get("uncovered object field box from a box") !== 1) {
-      throw new Error(`want mkd a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered pre-path coercion") !== 1) {
+      throw new Error(`want mkd's i32-to-f64 retag a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1113,12 +1140,19 @@ Deno.test({
     // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
     // case 11 a box whose immediate stands for a call (rule 2).
     // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
-    // (rule 2), and a default that leaves the out unwritten (rule 5).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
+    // (rule 2), and a default that leaves the out unwritten (rule 5). Case 15 is a stashed
+    // record whose source order evaluates one field twice (rule 2). Cases 16 to 18 break a fused
+    // map read: a probe of an i32, a probe on the pop's arm (rule 2), an unwritten out (rule 5).
+    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2), and case 20
+    // a fused map read's mv slot read into an out that is not its map's value (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
     }
+    // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
+    if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
+    if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
   },
 });
 
@@ -1539,6 +1573,42 @@ Deno.test({
   },
 });
 
+// A map read's default that computes is a body the probe's miss arm writes: a call, a nested
+// read, and the narrowing rewrite's `if true` default, with a key that is itself a temp.
+const MAP_DEFAULT_BODY =
+  `let m: {[string]: i32} = Map()\nfunction g(k: string): i32 { return k.length }\nfunction f(k: string): i32 { return m[k] ?? g(k) }\nfunction n2(k: string, j: string): i32 { return m[k] ?? (m[j] ?? 7) }\nfunction h(k: string): i32 {\n  const hit = m[k]\n  if hit is i32 { return hit }\n  return 0\n}\nfunction h2(s: string, a: i32, b: i32): i32 {\n  const hit = m[s.slice(a, b)]\n  if hit is i32 { return hit }\n  return 0\n}\nm["a"] = 1\nprint(f("a"))\nprint(f("bcd"))\nprint(n2("x", "a"))\nprint(h("q"))\nprint(h2("xa", 1, 2))\n`;
+Deno.test({
+  name: "ir shadow: a map read's computing default builds as its miss arm's body and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(MAP_DEFAULT_BODY, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want g, f, n2, h and h2 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned value `if` whose result bears a `null` pads its `end` with the function's own null,
+// returned (`emitNullForRet`): a record and a string result build and match legacy.
+const RET_IF_NULL_PAD =
+  `type P = { v: i32 }\nfunction f(c: boolean, p: P): P | null {\n  return if c { p } else { null }\n}\nfunction g(n: i32): string | null {\n  return if n > 0 { "pos" } else if n < 0 { "neg" } else { null }\n}\nconst p: P = { v: 4 }\nconst a = f(true, p)\nif a != null { print(a.v) }\nprint(g(0) ?? "z")\n`;
+Deno.test({
+  name: "ir shadow: a returned value if's null pad returns the function's own null and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_IF_NULL_PAD, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
@@ -1588,6 +1658,36 @@ print(pick(1))
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// Two spread literals in one function: the IR builds the one-group `[...a]` along the shared
+// spread plan while legacy keeps the many-group one, each in its own recorded slots, and a
+// function of the one-group form alone is covered and matched.
+Deno.test({
+  name: "ir shadow: a one-group spread matches beside a many-group one legacy keeps",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function f(a: i32[], b: i32[]): i32 {
+  const x = [...a]
+  const y = [...a, 1, ...b]
+  return x.length + y.length
+}
+function g(a: i32[]): i32 {
+  const x = [...a]
+  return x.length
+}
+print(f([1, 2], [3]) + g([4]))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("node-in array: miss array spread groups") ?? 0) !== 1) {
+      throw new Error(`want the many-group spread left to legacy, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want g covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

@@ -29,6 +29,7 @@ import {
   nodeAt,
   nodeChildren,
   nodeSpineChildren,
+  spreadArgOf,
 } from "./ast"
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
 import { nodeCtxTyIxOf } from "./check_core_state"
@@ -93,10 +94,18 @@ import {
   listIsRecvTyOf,
   litArmRowOf,
   localIndexOf,
+  mfRecvKindOf,
   objLitVariantIdxNoStructRow,
   recBuildRowOf,
   refListElemIsUnion,
   refListSlotOfExpr,
+  sTwinRepOf,
+  spreadDestKind,
+  spreadDestRow,
+  spreadSourcesStrOrAtoms,
+  spreadSourcesWidenTo,
+  spreadSrcAtomTexts,
+  spreadSrcBoxes,
   structIndexOfObjCtx,
 } from "./emit_classify"
 import {
@@ -113,10 +122,15 @@ import {
 } from "./emit_lit_atoms"
 import { monoIsClashLit } from "./emit_mono"
 import { refPushScratchBaseFor } from "./emit_mv_slots"
-import { boxOwedAt, narrowedArmNeedsUnbox } from "./emit_plan_coerce"
+import {
+  boxOwedAt,
+  listCopyAtNode,
+  narrowedArmNeedsUnbox,
+} from "./emit_plan_coerce"
 import {
   ListBuild,
   emptyArrHoleBuildKind,
+  listBuildKindOfVKind,
   listBuildOfTy,
   listBuildOfTyHeld,
 } from "./emit_ref_list_kinds"
@@ -126,6 +140,7 @@ import {
   ALK_I64,
   rlElemStructRow,
   rlElemVariantRow,
+  rlSlotOfTyOrTwin,
 } from "./emit_shape_rows"
 import {
   LBK_F32_LIST,
@@ -142,6 +157,7 @@ import {
   LBK_UNION,
   LBK_V128_LIST,
   ListKind,
+  RLK_CLOSURE,
   RLK_F32_LIST,
   RLK_F64_LIST,
   RLK_I32_LIST,
@@ -165,30 +181,37 @@ import {
   fitGrowTy,
   fl128Ty,
   fl32Ty,
+  fl32TypeIdx,
   fl64Ty,
+  fl64TypeIdx,
   gConstExprEmit,
   heldRepOf,
   i64PushScratchBase,
   ia64Ty,
   il64Ty,
+  il64TypeIdx,
   lTy,
+  lTypeIdx,
   liBack,
   liKinds,
   liSlots,
   listIdxScratchBase,
   mkArrTy,
+  mkListIdx,
   mkListTy,
   pkPushBase,
   pkRowOfPrim,
   pushScratchBase,
   rlBackIdx,
   rlElemHeap,
+  rlElemName,
   rlElemNullable,
   rlElemTyIx,
   rlRowMint,
   rlRowsMinted,
   rlWrapIdx,
   sHeapIdx,
+  sSuperAt,
   strPushScratchBase,
   uVariants,
   v128PushScratchBase,
@@ -205,6 +228,9 @@ import {
   scalarListElemOfListKind,
 } from "./emit_value_sites"
 import { nonNullTy, primIsSubWord, primNameOf, tyHasTyVar } from "./tyquery"
+import { spreadElemWidens, spreadLitElemRow } from "./emit_if_arm_values"
+import { rlElemIsNulNiche, tyRefArrElemOf } from "./emit_map_value_slots"
+import { i32ListHas } from "./listutil"
 
 // Every `VKind` the four scalar-list descriptors below do not name, as one answer: a
 // recorded failure plus the i32 list's own index, so the module stays well-formed while the
@@ -290,10 +316,13 @@ export function tyAtInstance(ty: i32, fnIx: i32): i32 {
   return ty
 }
 
-// The build pair list literal `arrIx` of type `ty` takes: its type's, else that of the list type
-// its destinations agree on; null, for its own shape's, when the record solve builds its
-// elements at another record (`recBuildRowOf`).
-export function arrLitBuild(arrIx: i32, ty: i32, fnIx: i32): ListBuild | null {
+// Where list literal `arrIx` of type `ty` is built: `baBuild` the build pair of type `baTy`, its
+// own type's else that of the list type its destinations agree on; null and -1 for its own
+// shape's (the record solve builds its elements at another record, `recBuildRowOf`, or no type
+// gives a pair).
+export type ArrLitBuildAt = { baBuild: ListBuild | null, baTy: i32 }
+
+export function arrLitBuildAt(arrIx: i32, ty: i32, fnIx: i32): ArrLitBuildAt {
   const a = nodeAt(arrIx)
   // Kept until the checker records the list type such elements make (D14381).
   if (
@@ -302,23 +331,39 @@ export function arrLitBuild(arrIx: i32, ty: i32, fnIx: i32): ListBuild | null {
     && nodeAt(a.arrElems[0]) is ObjLit
     && recBuildRowOf(a.arrElems[0]) >= 0
   ) {
-    return null
+    return { baBuild: null, baTy: -1 }
   }
   // A destination's union element boxes the elements, so the list is built at it (D4635).
   if arrLitUnionDestTaken(arrIx) {
-    const db = listBuildOfTy(tyAtInstance(arrLitDestTy(arrIx), fnIx))
-    if db != null { return db }
+    const ut = tyAtInstance(arrLitDestTy(arrIx), fnIx)
+    const db = listBuildOfTy(ut)
+    if db != null { return { baBuild: db, baTy: ut } }
   }
   // An empty literal's row is its destination's, so its type reads a row and mints none.
   const dt = tyAtInstance(arrLitDestTy(arrIx), fnIx)
   if a is ArrayLit && a.arrElems.length == 0 {
     const hb = listBuildOfTyHeld(ty)
-    if hb != null { return hb }
-    return listBuildOfTyHeld(dt)
+    if hb != null { return { baBuild: hb, baTy: ty } }
+    const hd = listBuildOfTyHeld(dt)
+    if hd != null { return { baBuild: hd, baTy: dt } }
+    return { baBuild: null, baTy: -1 }
   }
   const tb = listBuildOfTy(ty)
-  if tb != null { return tb }
-  return listBuildOfTy(dt)
+  if tb != null { return { baBuild: tb, baTy: ty } }
+  const tdb = listBuildOfTy(dt)
+  if tdb != null { return { baBuild: tdb, baTy: dt } }
+  return { baBuild: null, baTy: -1 }
+}
+
+// The build pair list literal `arrIx` of type `ty` takes (`arrLitBuildAt`); null for its own
+// shape's.
+export function arrLitBuild(arrIx: i32, ty: i32, fnIx: i32): ListBuild | null {
+  return arrLitBuildAt(arrIx, ty, fnIx).baBuild
+}
+
+// The type `arrLitListBuild` builds list literal `arrIx` at in `fnIx`, or -1 for its own shape's.
+export function arrLitBuiltTyOf(arrIx: i32, fnIx: i32): i32 {
+  return arrLitBuildAt(arrIx, arrLitBuildTyOf(arrIx, fnIx), fnIx).baTy
 }
 
 // Whether a non-empty literal's elements are all bare `null`s, so name no element kind.
@@ -1813,6 +1858,328 @@ export function spreadBackIdx(k: ListKind, row: i32) {
     }
     "list" => {
       return aTy()
+    }
+  }
+}
+
+// The ref-list row spread source `src` is read at: the row of the list its delivery copies it
+// into (`recSpreadCallCopy`, D16444), else its own.
+export function spreadSrcRow(src: i32, fnIx: i32): i32 {
+  const ct = listCopyAtNode(src)
+  const r = if ct >= 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
+  return if r >= 0 { r } else { refListSlotOfExpr(src, fnIx) }
+}
+
+// `spreadDestRow`, its first source read at the row its delivery copies it into.
+export function spreadOwnRow(elems: i32[], fnIx: i32): i32 {
+  const r = spreadDestRow(elems, fnIx)
+  for el in elems {
+    const src = spreadArgOf(el)
+    if src >= 0 {
+      const ct = listCopyAtNode(src)
+      const rl = ct >= 0 && mfRecvKindOf(src, fnIx) == "reflist"
+      const c = if rl { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
+      return if c >= 0 { c } else { r }
+    }
+  }
+  return r
+}
+
+// The row spread group `grp` of a literal built at ref-list row `row` is read at: the group's
+// own row where it is an existing list whose element is a subtype of the row's, else `row`.
+export function spreadGroupSubRow(
+  grp: i32,
+  kk: ListKind,
+  row: i32,
+  fnIx: i32,
+): i32 {
+  if kk != "reflist" { return row }
+  const lit = unwrapParen(grp)
+  if lit < 0 || nodeAt(lit) is ArrayLit { return row }
+  const s = spreadSrcRow(grp, fnIx)
+  if rlRowElemSubOf(s, row) { return s }
+  return row
+}
+
+// The ref-list row spread literal `arrIx` of kind `kk` builds at: the threaded destination's
+// row, else the literal's own typed element's, when every source of another row is itself a
+// list literal, built there as any literal is (D4871); else `own`, the first source's.
+export function spreadFreshDestRow(
+  arrIx: i32,
+  kk: ListKind,
+  own: i32,
+  fnIx: i32,
+  lb: ListBuild,
+): i32 {
+  const a = nodeAt(arrIx)
+  // A packed destination builds at its own row: the build's slot, else the literal's type.
+  if kk == "u8list" {
+    if lb.lbKind == LBK_U8_LIST || lb.lbKind == LBK_NUL_U8_LIST {
+      return lb.lbSlot
+    }
+    return exprPackedRow(arrIx, fnIx)
+  }
+  if kk != "reflist" || !(a is ArrayLit) { return own }
+  let want = spreadLitElemRow(arrIx, fnIx)
+  // A union build's row is the destination's too: its literal sources are built there (D16702).
+  if (
+    lb.lbKind == LBK_REF
+    || lb.lbKind == LBK_REF_AT_SLOT
+    || lb.lbKind == LBK_UNION
+  ) {
+    want = lb.lbSlot
+  }
+  if want == own || want < 0 || want >= rlElemName.length { return own }
+  const elems = a.arrElems
+  for el in elems {
+    const src = spreadArgOf(el)
+    if src >= 0 {
+      const lit = unwrapParen(src)
+      const isLit = lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ArrayLit
+      if !isLit {
+        const ss = spreadSrcRow(src, fnIx)
+        if ss != want && !rlRowElemSubOf(ss, want) { return own }
+      }
+    }
+  }
+  return want
+}
+
+// Whether ref-list row `s`'s element is a declared wasm subtype of row `d`'s, so a backing of
+// `s` copies into one of `d` as it is: both record rows, the first reaching the second's heap
+// through its `sub` chain, and a nullable element never into a non-null one.
+export function rlRowElemSubOf(s: i32, d: i32): boolean {
+  if s < 0 || d < 0 || s == d { return false }
+  if rlElemIsNulNiche(s) && !rlElemIsNulNiche(d) { return false }
+  const sr = rlElemStructRow(s)
+  const dr = rlElemStructRow(d)
+  if sr < 0 || dr < 0 { return false }
+  const dh = sTwinRepOf(dr)
+  const seen: i32[] = []
+  let x = sTwinRepOf(sr)
+  while x >= 0 && !i32ListHas(seen, x) {
+    if x == dh { return true }
+    seen.push(x)
+    x = sTwinRepOf(sSuperAt(x))
+  }
+  return false
+}
+
+// The union-box list row a spread literal builds at when its destination threaded one
+// (`const q: (i32 | null)[] = [...ints]`, or the row an outer literal, `push` or cell write
+// names as `LBK_REF_AT_SLOT`) and some spread source is another list, whose elements are then
+// each boxed; -1 otherwise, including when nothing threaded (D2869, D2883).
+export function spreadBoxDestRow(elems: i32[], fnIx: i32, lb: ListBuild): i32 {
+  if (
+    lb.lbKind != LBK_UNION
+    && lb.lbKind != LBK_REF_AT_SLOT
+    && lb.lbKind != LBK_REF
+  ) {
+    return -1
+  }
+  const row = lb.lbSlot
+  if row < 0 || row >= rlElemTyIx.length || row >= rlElemName.length {
+    return -1
+  }
+  if rlElemKindAt(row) != RLK_UNION { return -1 }
+  let boxes = false
+  let i = 0
+  while i < elems.length {
+    const src = spreadArgOf(elems[i])
+    if src >= 0 {
+      const sb = spreadSrcBoxes(src, row, fnIx)
+      if sb < 0 { return -1 }
+      if sb == 1 { boxes = true }
+    }
+    i = i + 1
+  }
+  if boxes { return row }
+  return -1
+}
+
+// The element kind group `g` of a spread literal building at `kk` is emitted at: a spread
+// source's own kind where it widens to `kk`, else `kk` itself (a plain run, or a same-kind source).
+export function spreadGroupSrcKind(
+  g: i32,
+  elems: i32[],
+  kk: ListKind,
+  fnIx: i32,
+): ListKind {
+  let i = 0
+  while i < elems.length {
+    if spreadArgOf(elems[i]) == g {
+      const sk = mfRecvKindOf(g, fnIx)
+      if sk != null && spreadElemWidens(sk, kk) { return sk }
+      if kk == "strlist" && spreadSrcAtomTexts(g, fnIx).length > 0 {
+        return "list"
+      }
+      return kk
+    }
+    i = i + 1
+  }
+  return kk
+}
+
+// The wider scalar list build code `pk` names, by asking `pendingKindOfList`, or null.
+export function spreadPendingScalar(pk: i32): ListKind | null {
+  const ks: ListKind[] = ["f64list", "i64list", "f32list"]
+  for k in ks {
+    if pendingKindOfList(k, 0) == pk { return k }
+  }
+  return null
+}
+
+// The build code a list of element kind `k` is built at — the mapping `emitArr`'s own
+// arms read, so a synthesized literal lands on the same backing the receiver already has.
+export function pendingKindOfList(k: ListKind, row: i32) {
+  // The spread's own answer for a closure row is the plain ref build, where a hole's is the
+  // at-slot one; aligning the two would move output, so it stays an arm.
+  if k == "reflist" && rlElemKindAt(row) == RLK_CLOSURE { return LBK_REF }
+  return listBuildKindOfVKind(k, row)
+}
+
+// A plain spread literal's build (`emitArrSpread`'s arm past the boxing ones), decided without
+// writing a byte or minting a type: the destination kind and row, and per item group its source
+// (-1 for a run of plain elements), the build code and row it is built at, and the kind it is
+// built at before its copy converts it. `spWhy` names a literal no arm builds.
+export type SpreadPlan = {
+  spWhy: string,
+  spKind: ListKind,
+  spRow: i32,
+  spSrcs: i32[],
+  spGroupKinds: i32[],
+  spGroupRows: i32[],
+  spSrcKinds: ListKind[],
+}
+
+function spreadPlanRefused(why: string): SpreadPlan {
+  const p: SpreadPlan = {
+    spWhy: why,
+    spKind: "list",
+    spRow: -1,
+    spSrcs: [],
+    spGroupKinds: [],
+    spGroupRows: [],
+    spSrcKinds: [],
+  }
+  return p
+}
+
+// Spread literal `arrIx`'s plain build under list build `lb`, read by legacy and the IR alike.
+export function spreadPlanOf(arrIx: i32, fnIx: i32, lb: ListBuild): SpreadPlan {
+  const a = nodeAt(arrIx)
+  if !(a is ArrayLit) {
+    return spreadPlanRefused("emitProgram: expected an array literal")
+  }
+  const elems = a.arrElems
+  let kk = spreadDestKind(arrIx, fnIx)
+  // A destination that threaded a wider scalar list (`const q: f64[] = [...ints]`) is
+  // built at, since the literal is built at the type it flows into.
+  const pdk = spreadPendingScalar(lb.lbKind)
+  if (
+    kk != null
+    && pdk != null
+    && pdk != kk
+    && spreadSourcesWidenTo(elems, pdk, fnIx)
+  ) {
+    kk = pdk
+  }
+  // A `string[]` destination builds a literal-union atom source's strings (D2868).
+  if (
+    kk == "list"
+    && lb.lbKind == LBK_STR_LIST
+    && spreadSourcesStrOrAtoms(elems, fnIx)
+  ) {
+    kk = "strlist"
+  }
+  if kk == null {
+    return spreadPlanRefused(
+      "emitProgram: a spread's source is not a list this rep knows",
+    )
+  }
+  const ownRow = spreadOwnRow(elems, fnIx)
+  const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx, lb)
+  // The item groups in source order: a spread contributes its source, a run of plain elements
+  // one group.
+  const srcs: i32[] = []
+  let inRun = false
+  for e in elems {
+    const src = spreadArgOf(e)
+    if src >= 0 {
+      srcs.push(src)
+      inRun = false
+    } else if !inRun {
+      srcs.push(-1)
+      inRun = true
+    }
+  }
+  // Every group builds at the destination's rep, threaded from the kind this literal resolved
+  // at: an un-annotated binding threads nothing, so a plain run would build at the i32 default.
+  const pk = pendingKindOfList(kk, row)
+  const kinds: i32[] = []
+  const rows: i32[] = []
+  const srcKinds: ListKind[] = []
+  for src in srcs {
+    // A source of another scalar element builds at its own rep, then copies converting.
+    const gk = if src >= 0 { spreadGroupSrcKind(src, elems, kk, fnIx) } else { kk }
+    let groupKind = pk
+    if gk != kk { groupKind = pendingKindOfList(gk, 0) }
+    // A source list whose record element is a subtype of the row's is read at its own row
+    // and copied as it is (D14960).
+    const gRow = if src >= 0 { spreadGroupSubRow(src, kk, row, fnIx) } else { row }
+    // A fresh source built at a row no source has is built at exactly that row (D4871).
+    if gRow == row && row != ownRow && groupKind == LBK_REF {
+      groupKind = LBK_REF_AT_SLOT
+    }
+    kinds.push(groupKind)
+    rows.push(gRow)
+    srcKinds.push(gk)
+  }
+  const p: SpreadPlan = {
+    spWhy: "",
+    spKind: kk,
+    spRow: row,
+    spSrcs: srcs,
+    spGroupKinds: kinds,
+    spGroupRows: rows,
+    spSrcKinds: srcKinds,
+  }
+  return p
+}
+
+// Whether the (wrapper, backing) pair spread plan `p` joins into is already a known heap pair,
+// asked without minting one: a ref-list row's, or a scalar or string list's minted pair. The IR's
+// builder asks this where legacy's arm asks `spreadWrapIdx`, which mints on first ask.
+export function spreadPairKnown(p: SpreadPlan): boolean {
+  const row = p.spRow
+  match p.spKind {
+    "reflist" => {
+      return row >= 0
+        && row < rlWrapIdx.length
+        && row < rlBackIdx.length
+        && rlWrapIdx[row] >= 0
+        && rlBackIdx[row] >= 0
+    }
+    "u8list" => {
+      return false
+    }
+    "f64list" => {
+      return fl64TypeIdx >= 0
+    }
+    "i64list" => {
+      return il64TypeIdx >= 0
+    }
+    "f32list" => {
+      return fl32TypeIdx >= 0
+    }
+    "v128list" => {
+      return false
+    }
+    "strlist" => {
+      return mkListIdx >= 0
+    }
+    "list" => {
+      return lTypeIdx >= 0
     }
   }
 }

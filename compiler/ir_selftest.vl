@@ -1,10 +1,12 @@
 // The verifier's own cases: hand-built IR breaking each of rules 1-7, more for rules 5, 2 and 8,
-// the fused `pop ?? d`'s three, and one function that holds.
+// the fused `pop ?? d`'s three, a stashed record's source order, the fused map read's four, and
+// one function that holds.
 // A host test calls `irVerifySelfTest(k)` once the checker's primitives exist (after any
 // compile) and compares the rule the verifier names with `k`.
 import {
   IrFn,
   IrNode,
+  MapProbe,
   Opnd,
   Rhs,
   irFnNew,
@@ -15,8 +17,17 @@ import {
 } from "./ir"
 import { irVerify } from "./ir_verify"
 import { repNodeOfTy } from "./emit_rep"
-import { TY_BOOL, TY_I32, TY_NEVER, mkArrayTy } from "./check_types"
-import { Call, addNode } from "./ast"
+import {
+  TY_BOOL,
+  TY_I32,
+  TY_NEVER,
+  mkArrayTy,
+  mkMapTy,
+  mkObjTy,
+} from "./check_types"
+import { CoalValArm } from "./emit_plan_null"
+import { Call, StrLit, addNode } from "./ast"
+import { irBoundsRule } from "./ir_verify_bounds"
 
 function node(f: IrFn, n: IrNode, rep: i32): i32 {
   return irNodeNew(f, n, -1, rep, -1)
@@ -117,7 +128,82 @@ function caseFn(k: i32): IrFn {
     if k != 14 { d.push(node(f, { asDst: o, asSrc: imm(or, 0) }, none)) }
     const from = if k == 12 { v(p) } else { v(l) }
     f.irBody.push(
-      node(f, { cbL: from, cbArm: "popOr", cbNull: d, cbOut: o, cbAt: -1 }, or),
+      node(
+        f,
+        { cbL: from, cbArm: "popOr", cbNull: d, cbOut: o, cbAt: -1, cbMap: null },
+        or,
+      ),
+    )
+  }
+  // Rules for a fused map read: case 16 probes an i32, case 17 holds a probe on the pop's arm, and
+  // case 18's default never writes the out.
+  if k >= 16 && k <= 18 {
+    const mt = mkMapTy(TY_I32, TY_I32, 0)
+    const mv = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const o = irVarNew(f, i32r, TY_I32, "local", 2)
+    const d: i32[] = []
+    if k != 18 { d.push(node(f, { asDst: o, asSrc: imm(i32r, 0) }, none)) }
+    const mp: MapProbe = { prSym: -1, prNonNull: false, prKey: v(p), prForm: 1 }
+    const arm: CoalValArm = if k == 17 { "popOr" } else { "mapIndexGetOr" }
+    const from = if k == 16 { v(p) } else { v(mv) }
+    f.irBody.push(
+      node(
+        f,
+        { cbL: from, cbArm: arm, cbNull: d, cbOut: o, cbAt: -1, cbMap: mp },
+        i32r,
+      ),
+    )
+  }
+  // Rule 2 again: a fused map read's mv slot read into an out that is not the map's value.
+  if k == 20 {
+    const mt = mkMapTy(TY_I32, TY_I32, 0)
+    const mv = irVarNew(f, repNodeOfTy(mt), mt, "local", 1)
+    const o = irVarNew(f, boolr, TY_BOOL, "local", 2)
+    const d: i32[] = [node(f, { asDst: o, asSrc: imm(boolr, 0) }, none)]
+    const mp: MapProbe = { prSym: -1, prNonNull: false, prKey: v(p), prForm: 2 }
+    f.irBody.push(
+      node(
+        f,
+        {
+          cbL: v(mv),
+          cbArm: "mapIndexGetOr",
+          cbNull: d,
+          cbOut: o,
+          cbAt: -1,
+          cbMap: mp,
+        },
+        boolr,
+      ),
+    )
+  }
+  // Rule 2 again: an order-stashed record whose source order evaluates one field twice.
+  if k == 15 {
+    const ot = mkObjTy(["a", "b"], [TY_I32, TY_I32])
+    const orep = repNodeOfTy(ot)
+    const rt = irVarNew(f, orep, ot, "temp", -1)
+    const mr: Rhs = {
+      mrFields: [v(p), v(p)],
+      mrLayout: [0, 1],
+      mrSrc: [0, 0],
+      mrAt: -1,
+      mrRow: -1,
+      mrVariant: false,
+    }
+    f.irBody.push(node(f, { lDst: rt, lRhs: mr }, orep))
+  }
+  // Rule 2 again: a shared read whose receiver is a temp, which its arms would read twice.
+  if k == 19 {
+    const st = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(
+        f,
+        { lDst: st, lRhs: { poOp: "add", poArgs: [v(p), imm(i32r, 1)] } },
+        i32r,
+      ),
+    )
+    const so = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: so, lRhs: { srV: v(st), srAt: -1, srStash: false } }, i32r),
     )
   }
   f.irBody.push(node(f, { rtHas: true, rtV: v(t) }, none))
@@ -130,10 +216,40 @@ function callNode(): i32 {
   return addNode(c)
 }
 
-// The rule the verifier names for case `k`: 0 for the function that holds, `k` for cases 1 to 7,
-// 5 for case 8 (a fall-through), 2 for cases 9, 11, 12 and 13 (a global store, a box's effectful
-// immediate, a pop of no list or at no element), 8 for case 10 (a bounds check with no bounds
-// rule installed) and 5 for case 14 (a default that leaves the out unwritten).
+// The rule the verifier names for case `k`: 0 for the function that holds, `k` for 1 to 7, 8 for
+// 10 (no bounds rule), 5 for 8, 14 and 18 (a fall-through, an out left unwritten), and 2 for the
+// rest (a global store, an effectful immediate, a pop or map read of the wrong receiver or out, a
+// stashed record's order, a probe off its arm, a temp shared read).
 export function irVerifySelfTest(k: i32): i32 {
   return irVerify(caseFn(k)).vfRule
+}
+
+// Rule 8 over a string-literal receiver: case 0 checks and reads the same literal node and holds;
+// case 1 checks one literal and reads another of equal text, and must not pair. The rule
+// compares nodes and reps only, so the literal's rep is any fixed one.
+export function irBoundsStrSelfTest(k: i32): boolean {
+  const i32r = repNodeOfTy(TY_I32)
+  const none = repNodeOfTy(TY_NEVER)
+  const f = irFnNew(-1, "selftest")
+  f.irRetRep = i32r
+  f.irRetTy = TY_I32
+  const p = irVarNew(f, i32r, TY_I32, "param", 0)
+  f.irParams.push(p)
+  const t = irVarNew(f, i32r, TY_I32, "temp", -1)
+  const a = strNode()
+  const b = if k == 1 { strNode() } else { a }
+  const ca: Opnd = { osAt: a, osRep: i32r }
+  const cb: Opnd = { osAt: b, osRep: i32r }
+  f.irBody.push(node(f, { bcV: ca, bcIx: v(p) }, none))
+  f.irBody.push(
+    node(f, { lDst: t, lRhs: { lgV: cb, lgIx: v(p), lgAt: -1 } }, i32r),
+  )
+  f.irBody.push(node(f, { rtHas: true, rtV: v(t) }, none))
+  return irBoundsRule(f) == ""
+}
+
+// A synthesized string literal node "s".
+function strNode(): i32 {
+  const s: StrLit = { strText: "s", pos: -1 }
+  return addNode(s)
 }

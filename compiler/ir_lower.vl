@@ -55,11 +55,21 @@ import {
   nodeChildren,
 } from "./ast"
 import { unwrapParen } from "./emit_base"
+import {
+  fieldRowStorageKind,
+  sFieldFlatRow,
+  sFieldTypeAt,
+  variantFieldStorageKind,
+  variantFieldTypeAt,
+} from "./emit_atom_kinds"
+import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
   declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
+  memberBoxReadEnter,
+  memberBoxReadLeave,
   readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
@@ -114,7 +124,10 @@ import {
   RRawOp,
   RRecover,
   RRel,
+  RRetNull,
   RRetag,
+  RSharedRead,
+  RSpread,
   RStage,
   RStrOp,
   RTagIs,
@@ -306,8 +319,12 @@ import {
   objLitArmOf,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
+  objLitStashRowAt,
+  objLitStashRowOf,
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
+  objLitVariantStashAt,
+  objLitVariantStashOf,
   objStructNewTail,
   popOrOpen,
   popOrPlanOf,
@@ -319,6 +336,15 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  sFieldStorageSlot,
+  sharedArmPlainTail,
+  sharedArmTestTail,
+  sharedReadPlainOf,
+  sharedReadPlanOf,
+  sharedReadStashes,
+  sharedRecvSlotGet,
+  spreadGroupStash,
+  spreadJoinGroups,
   stageListRecvTail,
   staticAtomId,
   structFieldTail,
@@ -341,6 +367,7 @@ import {
   atomEqPlanOf,
   holeBoxPlanOf,
   memRecvOwesNonNull,
+  memberBoxReadAt,
   narrowedBoxVariantPlain,
   narrowedFieldPlain,
   narrowedVariantRepIs,
@@ -355,12 +382,17 @@ import {
   localNulStrRecovers,
   nulTestArmOf,
 } from "./emit_plan_null"
-import { arrLitRefShortSlot } from "./emit_plan_list"
+import {
+  arrLitRefShortSlot,
+  spreadBackIdx,
+  spreadPlanOf,
+  spreadWrapIdx,
+} from "./emit_plan_list"
 import { fbOpenIf } from "./emit_bytes"
 import { fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
-import { ifLinkYieldsNull } from "./emit_if_arm_values"
-import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
+import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
+import { arrLitArmOf, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -377,6 +409,7 @@ import {
   gCellIdx,
   gHelpF64Rem,
   gImports,
+  liKinds,
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
@@ -390,6 +423,7 @@ import {
   uBoxNewEnd,
   unionSinkBase,
 } from "./emit_state"
+import { ListBuild } from "./emit_ref_list_kinds"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -721,11 +755,16 @@ function rhs(r: Rhs, tail: boolean) {
       leaf()
       emitNullOwn(r.nuOwn)
     }
+    RRetNull => {
+      leaf()
+      emitNullRetTail(nullRetPlanOf(lw.irAt))
+    }
     RTest => {
       irLOpnd(r.teV)
       boxTagIsTail(r.teTag)
     }
     RBoxField => boxField(r)
+    RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RRecover => recoverRead(r)
     RGetField => getField(r)
@@ -735,6 +774,7 @@ function rhs(r: Rhs, tail: boolean) {
     RCallHost | RCast | RTagOf | RListNew | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
+    RSpread => spreadList(r)
     RMapNew => {
       leaf()
       emitMapNew(r.mnAt, lw.irAt)
@@ -872,16 +912,51 @@ function stmtsHolding(root: i32, ix: i32, pos: i32): i32[] {
   return []
 }
 
-// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row.
+// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row. Under
+// the order stash, each field in source order into its scratch slot first, read back in layout.
 function makeRec(r: RMakeRec) {
   const fnIx = lw.irAt
   const variant = if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, fnIx) == "variant" }
-  const row = if r.mrRow >= 0 && variant { objLitVariantLayoutAt(r.mrAt, r.mrRow) } else if r.mrRow >= 0 { objLitLayoutRowAt(r.mrAt, r.mrRow) } else if variant { objLitVariantLayoutOf(r.mrAt, fnIx) } else { objLitLayoutRowOf(r.mrAt, fnIx) }
+  const stash = r.mrSrc.length > 0
+  const row = if r.mrRow >= 0 && variant { if stash { objLitVariantStashAt(r.mrAt, r.mrRow) } else { objLitVariantLayoutAt(r.mrAt, r.mrRow) } } else if r.mrRow >= 0 { if stash { objLitStashRowAt(r.mrAt, r.mrRow) } else { objLitLayoutRowAt(r.mrAt, r.mrRow) } } else if variant { if stash { objLitVariantStashOf(r.mrAt, fnIx) } else { objLitVariantLayoutOf(r.mrAt, fnIx) } } else if stash { objLitStashRowOf(r.mrAt, fnIx) } else { objLitLayoutRowOf(r.mrAt, fnIx) }
   if row < 0 { return irLMiss("record row") }
   if r.mrFields.length == 0 { leaf() }
+  if stash { return makeRecStashed(r, row, variant) }
   for k in r.mrLayout {
     if k < 0 || k >= r.mrFields.length { return irLMiss("record layout") }
     irLOpnd(r.mrFields[k])
+  }
+  return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
+}
+
+// `emitObj`'s and `emitVariantStruct`'s order stash for `r` at `row`: each field in source order
+// set into the slot `objOrderStashSlot` opens for it, then every slot read in layout order.
+function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
+  const slots: i32[] = []
+  for _k in r.mrLayout { slots.push(-1) }
+  for k in r.mrSrc {
+    let fi = 0
+    while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
+    if fi >= r.mrLayout.length { fi = -1 }
+    if fi < 0 || k < 0 || k >= r.mrFields.length {
+      return irLMiss("record stash")
+    }
+    irLOpnd(r.mrFields[k])
+    const slot = if variant { objOrderStashSlot(
+      variantFieldStorageKind(row, fi),
+      variantFieldTypeAt(row, fi),
+      uFieldStorageSlot(row, fi),
+    ) } else { objOrderStashSlot(
+      fieldRowStorageKind(sFieldFlatRow(row, fi)),
+      sFieldTypeAt(row, fi),
+      sFieldStorageSlot(row, fi),
+    ) }
+    slots[fi] = slot
+    fbLocalSet(slot)
+  }
+  for s in slots {
+    if s < 0 { return irLMiss("record stash") }
+    fbLocalGet(s)
   }
   return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
 }
@@ -982,6 +1057,57 @@ function boxField(r: RBoxField) {
   return 0
 }
 
+// `RSharedRead`: legacy's shared-field dispatch over the box local, each arm but the last its tag
+// test then its plain read, each read in its own frame, and the read's own recover, as `emitMem`
+// writes it through `emitMemSharedRead`.
+function sharedRead(r: RSharedRead) {
+  const fnIx = lw.irAt
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedReadPlanOf(r.srAt, fnIx, vis, fis)
+  if code < 0 || !sharedReadPlainOf(r.srAt, fnIx) {
+    return irLMiss("shared read plan")
+  }
+  if sharedReadStashes(r.srAt) != r.srStash {
+    return irLMiss("shared read stash")
+  }
+  // The stash is asked for where legacy asks, before the receiver; between its set and the last
+  // get, the plain arms and tail evaluate nothing that could stash again.
+  const slot = if r.srStash { sharedFieldRecvSlot() } else { -1 }
+  if r.srStash && slot < 0 { return irLMiss("shared read stash slot") }
+  if r.srStash {
+    irLOpnd(r.srV)
+    fbLocalSet(slot)
+  }
+  const last = vis.length - 1
+  let i = 0
+  while i < last {
+    sharedReadRecv(r, slot)
+    sharedArmTestTail(code, vis, fis, i)
+    lwFrames.push(-1)
+    sharedReadRecv(r, slot)
+    if sharedArmPlainTail(code, vis[i], fis[i]) < 0 { return -1 }
+    fbElse()
+    i = i + 1
+  }
+  sharedReadRecv(r, slot)
+  if sharedArmPlainTail(code, vis[last], fis[last]) < 0 { return -1 }
+  let e = 0
+  while e < last {
+    fbEnd()
+    lwFrames.pop()
+    e = e + 1
+  }
+  if readOwesNonNullRecover(r.srAt, fnIx) { fbRefAsNonNull() }
+  return 0
+}
+
+// One receiver push of shared read `r`: its stash slot's box, else the box local again.
+function sharedReadRecv(r: RSharedRead, slot: i32) {
+  if r.srStash { return sharedRecvSlotGet(slot) }
+  return irLOpnd(r.srV)
+}
+
 // `SSetField`: the record, the value, then legacy's struct-store tail (`fieldStoreTail`).
 function setField(n: SSetField, at: i32) {
   const a = nodeAt(at)
@@ -1003,7 +1129,13 @@ function getField(r: RGetField) {
   if !(m is Member) { return irLMiss("field node") }
   if fieldIdxAt(r.gfAt, m) < 0 { return irLMiss("field shape") }
   irLOpnd(r.gfV)
-  return fieldTail(r.gfAt, m)
+  // A member record read the box plan passes as its field's box is lowered at its storage, as
+  // the builder built it (`memberBoxTemp`).
+  if !memberBoxReadAt(r.gfAt, lw.irAt) { return fieldTail(r.gfAt, m) }
+  const marks = memberBoxReadEnter(r.gfAt)
+  const rc = fieldTail(r.gfAt, m)
+  memberBoxReadLeave(marks)
+  return rc
 }
 
 // The plain field index member read `at` reads, or -1.
@@ -1062,7 +1194,7 @@ function recoverRead(r: RRecover) {
 // arm `arrLitArmOf` names, in `emitArr`'s order.
 function makeList(r: RMakeList) {
   const fnIx = lw.irAt
-  const lb = arrLitListBuild(r.mlAt, fnIx)
+  const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
   const arm = arrLitArmOf(r.mlAt, fnIx, lb)
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
@@ -1087,6 +1219,34 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
+// arm writes, read off the same plan, so its slots are the literal's recorded ones.
+function spreadList(r: RSpread) {
+  const fnIx = lw.irAt
+  const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
+  arrLitPrologue(r.spAt)
+  const p = spreadPlanOf(r.spAt, fnIx, lb)
+  if p.spWhy != "" || p.spSrcs.length != 1 { return irLMiss("spread plan") }
+  // The pair is asked where legacy's arm asks it, before the group, so a first ask mints in order.
+  const wrap = spreadWrapIdx(p.spKind, p.spRow)
+  const back = spreadBackIdx(p.spKind, p.spRow)
+  if wrap < 0 || back < 0 { return irLMiss("spread pair") }
+  irLOpnd(r.spSrc)
+  const seq = liKinds.length
+  const gs = spreadGroupStash(p, r.spAt, 0, p.spSrcs[0], fnIx, seq)
+  if gs < 0 { return -1 }
+  return spreadJoinGroups(
+    r.spAt,
+    [gs],
+    [p.spGroupRows[0]],
+    wrap,
+    back,
+    p.spKind,
+    p.spRow,
+    seq,
+  )
 }
 
 // `SForIn`: legacy's walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at the
@@ -1144,7 +1304,7 @@ function forIn(n: SForIn, pending: i32[]) {
       forInCopyOpen(s, c, k)
       const kc = walkFrames(n, d0)
       tempMarksRestore(marks)
-      body(n.xfBody, false, -1)
+      body(n.xfBody, false, -1, false)
       framesPop(kc)
       forInCopyClose(c)
       k = k + 1
@@ -1157,7 +1317,7 @@ function forIn(n: SForIn, pending: i32[]) {
   if seq == -2 { return irLMiss("walk loop") }
   const kr = walkFrames(n, d0)
   tempMarksRestore(marks)
-  body(n.xfBody, false, -1)
+  body(n.xfBody, false, -1, false)
   framesPop(kr)
   framesPop(kb)
   forInLoopClose(s, lp, seq)
@@ -1272,15 +1432,16 @@ function mapGetOr(r: RMapGetOr) {
     return irLMiss("map read of a global not read plainly")
   }
   if r.mgForm > 0 {
-    const sh = mapRecvShapeOf(rd.idxArr, fnIx)
-    mapRecvRead(r.mgSym, r.mgNonNull, r.mgLoc)
-    mapRecvRefTail(rd.idxArr, fnIx)
-    irLOpnd(r.mgKey)
-    mapRecvKeyTail(sh)
-    mapPrepProbeTail()
-    if r.mgForm == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+    const sh = mapGetOrInlineHead(
+      rd.idxArr,
+      r.mgForm,
+      r.mgSym,
+      r.mgNonNull,
+      r.mgLoc,
+      r.mgKey,
+    )
     irLOpnd(r.mgDef)
-    return if r.mgForm == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+    return mapGetOrInlineTail(r.mgForm, sh)
   }
   const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
@@ -1289,6 +1450,84 @@ function mapGetOr(r: RMapGetOr) {
   irLOpnd(r.mgKey)
   mapRecvKeyTail(mapRecvShapeOf(rd.idxArr, fnIx))
   fbCall(fi)
+  return 0
+}
+
+// A map read's probe: global `sym` or receiver `loc`, its ref tail, key `key`, and the probe that
+// leaves the entry, as `emitMapPrep` writes them. Returns the receiver's shape.
+function mapProbeHead(
+  recvIx: i32,
+  sym: i32,
+  nonNull: boolean,
+  loc: Opnd,
+  key: Opnd,
+): i32 {
+  const fnIx = lw.irAt
+  const sh = mapRecvShapeOf(recvIx, fnIx)
+  mapRecvRead(sym, nonNull, loc)
+  mapRecvRefTail(recvIx, fnIx)
+  irLOpnd(key)
+  mapRecvKeyTail(sh)
+  mapPrepProbeTail()
+  return sh
+}
+
+// An inline `??` map read's head, up to the miss arm's `else`: the probe, then the `i32` read's
+// or mv slot read's open by `form`. Returns the receiver's shape for the tail.
+function mapGetOrInlineHead(
+  recvIx: i32,
+  form: i32,
+  sym: i32,
+  nonNull: boolean,
+  loc: Opnd,
+  key: Opnd,
+): i32 {
+  const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
+  if form == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+  return sh
+}
+
+// An inline map read's tail after its default, by `form`.
+function mapGetOrInlineTail(form: i32, sh: i32) {
+  return if form == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+}
+
+// The fused map read whose default computes: the route `mapGetOr` checks, the shared head, the
+// default body writing the slotless out in the miss arm, and the tail.
+function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const mp = n.cbMap
+  if mp == null { return irLMiss("map read probe") }
+  const fnIx = lw.irAt
+  const lhsIx = unwrapParen(e.binLeft)
+  const rd = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
+  if !(rd is Index) { return irLMiss("map read node") }
+  const rk = coalResultKindOf(n.cbAt, fnIx)
+  const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
+  const want = if mp.prForm == 1 { "i32" } else if mp.prForm == 2 { "mv" } else { "helper" }
+  if (
+    arm != want
+    || want == "helper"
+    || mp.prForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+  ) {
+    return irLMiss("map read route")
+  }
+  if mp.prSym >= 0 && userGlobalReadClass(mp.prSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map read of a global not read plainly")
+  }
+  lwSeq = []
+  const sh = mapGetOrInlineHead(
+    rd.idxArr,
+    mp.prForm,
+    mp.prSym,
+    mp.prNonNull,
+    n.cbL,
+    mp.prKey,
+  )
+  irLSettle(pending)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  mapGetOrInlineTail(mp.prForm, sh)
   return 0
 }
 
@@ -1397,6 +1636,7 @@ function boxOp(r: RToBox) {
   holeBoxHead(p, r.bxAt, fnIx)
   if (
     p.hbArm == "pass"
+    || p.hbArm == "memberBox"
     || p.hbArm == "atom"
     || p.hbArm == "atomStr"
     || p.hbArm == "rec"
@@ -1526,7 +1766,7 @@ function passBoxOf(t: i32): i32 {
   const r = tempRhs(t)
   if !(r is RToBox) { return -1 }
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, lw.irAt), lw.irAt)
-  return if p.hbArm == "pass" { t } else { -1 }
+  return if p.hbArm == "pass" || p.hbArm == "memberBox" { t } else { -1 }
 }
 
 // The operand a pass box temp `t` holds.
@@ -1560,19 +1800,12 @@ function callTemp(o: Opnd): i32 {
   }
 }
 
-// Writes body `b`; `tail` when its last node ends a void function, and `out` the slotless
-// variable its valued `if`'s arm ends by writing (-1 for none). An `if` opens a frame for its
-// `else` and closes when that frame does, so an `else if` chain's length costs no stack (D1990).
-function body(b0: i32[], tail0: boolean, out0: i32) {
+// Writes body `b`; `tail` when its last node ends a void function, `out` the slotless variable
+// its valued `if`'s arm writes (-1 for none). An `else` is a frame, so an `else if` chain costs no
+// stack (D1990); one walk, not a wrapper, so nesting costs one frame per level. Returns the top
+// frame's stack temps, required consumed unless `keepTop` (a fragment's value reads them).
+function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
   const p0: i32[] = []
-  bodyOnto(b0, tail0, out0, p0)
-  if lwMiss == "" && p0.length > 0 { irLMiss("non-stack temp: unconsumed") }
-  return 0
-}
-
-// `body`, its own nodes' stack temps left in `p0` for the caller's next read (a fragment's value)
-// rather than required consumed.
-function bodyOnto(b0: i32[], tail0: boolean, out0: i32, p0: i32[]) {
   const fb: i32[][] = [b0]
   const fi: i32[] = [0]
   const fp: i32[][] = [p0]
@@ -1615,7 +1848,7 @@ function bodyOnto(b0: i32[], tail0: boolean, out0: i32, p0: i32[]) {
       fi[top] = i + 1
       continue
     }
-    if lwMiss == "" && pending.length > 0 && top > 0 {
+    if lwMiss == "" && pending.length > 0 && !(keepTop && top == 0) {
       irLMiss("non-stack temp: unconsumed")
     }
     const ifId = fif[top]
@@ -1633,7 +1866,7 @@ function bodyOnto(b0: i32[], tail0: boolean, out0: i32, p0: i32[]) {
       fi[top - 1] = fi[top - 1] + 1
     }
   }
-  return 0
+  return p0
 }
 
 // Whether node `i` of `b` is a void call a valueless `return` follows, so the call returns.
@@ -1744,7 +1977,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if hoists < 0 { return irLMiss("loop hoist prologue") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
-      body(n.bkBody, false, -1)
+      body(n.bkBody, false, -1, false)
       lwFrames.pop()
       fbEnd()
       irLoopCloseHook(hoists)
@@ -1753,7 +1986,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLSettle(pending)
       fbLoop(64)
       lwFrames.push(n.lpLabel)
-      body(n.lpBody, false, -1)
+      body(n.lpBody, false, -1, false)
       lwFrames.pop()
       fbEnd()
     }
@@ -1821,7 +2054,7 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   const litTrue = isTrue(n.siCond) && testIsLitTrue(lw.irNodeAt[id])
   if litTrue && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
-    if !exitBr { body(n.siThen, tail, -1) }
+    if !exitBr { body(n.siThen, tail, -1, false) }
     return IF_DONE
   }
   // A helper's `if c { br L }` is the hand-written bodies' `br_if`.
@@ -1859,7 +2092,7 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   }
   fbIf(64)
   lwFrames.push(-1)
-  body(n.siThen, tail, -1)
+  body(n.siThen, tail, -1, false)
   if n.siElse.length > 0 || n.siElseKw {
     fbElse()
     return IF_ELSE
@@ -2009,7 +2242,7 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     fbIf(vt)
   }
   lwFrames.push(-1)
-  body(n.siThen, false, t)
+  body(n.siThen, false, t, false)
   fbElse()
   return IF_VALUED
 }
@@ -2025,7 +2258,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba == null { coalPopOr(n, e, pending) } else { coalBoxArm(n, ba, e, pending) }
+  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else if n.cbArm == "mapIndexGetOr" { coalMapGetOr(n, e, pending) } else { coalPopOr(n, e, pending) }
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
@@ -2046,7 +2279,7 @@ function coalBoxArm(
   cond(n.cbL, pending)
   if coalBoxOpen(arm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
   lwFrames.push(-1)
-  body(n.cbNull, false, n.cbOut)
+  body(n.cbNull, false, n.cbOut, false)
   if coalBoxElse(arm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
   const reread = match arm {
     "valBox" | "valScalar" => true
@@ -2077,7 +2310,7 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   irLSettle(pending)
   popOrOpen(p, lIdx)
   lwFrames.push(-1)
-  body(n.cbNull, false, n.cbOut)
+  body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
   fbEnd()
   return 0
@@ -2112,7 +2345,7 @@ function valuedBlock(n: SBlock, pending: i32[]) {
   irLSettle(pending)
   fbBlock(vt)
   lwFrames.push(n.bkLabel)
-  body(n.bkBody, false, t)
+  body(n.bkBody, false, t, false)
   lwFrames.pop()
   fbEnd()
   livePush(t)
@@ -2302,7 +2535,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && f.irAt >= 0, -1)
+  body(f.irBody, !valued && f.irAt >= 0, -1, false)
   const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
   const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
   if pad == "null" {
@@ -2483,8 +2716,7 @@ export function irLowerFragment(
 // Writes fragment body `b`, then its value `out`, which consumes what the body left pending as a
 // `return`'s value does.
 function fragmentBody(b: i32[], out: Opnd) {
-  const pending: i32[] = []
-  bodyOnto(b, false, -1, pending)
+  const pending = body(b, false, -1, true)
   if lwMiss != "" { return 0 }
   cond(out, pending)
   if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
