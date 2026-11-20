@@ -1706,3 +1706,87 @@ print(strs())
     }
   },
 });
+
+// A map walk over a receiver that is no global builds the receiver as its operand, written where
+// legacy's stash writes it: a local, a parameter, a field read, a call (run once), nested walks
+// over two maps, a body writing another map, and a narrowed nullable parameter. Every function is
+// covered and matched.
+Deno.test({
+  name: "ir shadow: a map walk over a non-global receiver is covered and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type O = { m: {[string]: i32} }
+let calls = 0
+function mk(): {[string]: i32} {
+  calls = calls + 1
+  const m: {[string]: i32} = Map()
+  m["a"] = 1
+  m["b"] = 2
+  return m
+}
+function local(): i32 {
+  const m: {[string]: i32} = Map()
+  m["x"] = 3
+  m["y"] = 4
+  let s = 0
+  for k in m.keys() { s = s + (m[k] ?? 0) }
+  return s
+}
+function param(m: {[string]: i32}): i32 {
+  let s = 0
+  for v in m.values() { s = s + v }
+  return s
+}
+function field(o: O): i32 {
+  let n = 0
+  for k in o.m.keys() { n = n + k.length }
+  return n
+}
+function call(): i32 {
+  let s = 0
+  for v in mk().values() { s = s + v }
+  return s + calls * 100
+}
+function nested(a: {[string]: i32}, b: {[string]: i32}): i32 {
+  let s = 0
+  for x in a.values() {
+    for y in b.values() { s = s + x * y }
+  }
+  return s
+}
+function mutates(a: {[string]: i32}): i32 {
+  const other: {[string]: i32} = Map()
+  let n = 0
+  for k in a.keys() {
+    other[k] = n
+    n = n + 1
+  }
+  return n + other.length
+}
+function nullable(m: {[string]: i32} | null): i32 {
+  let s = 0
+  if m != null {
+    for v in m.values() { s = s + v }
+  }
+  return s
+}
+const g: {[string]: i32} = Map()
+g["p"] = 5
+print(local())
+print(param(g))
+print(field({ m: g }))
+print(call())
+print(nested(g, mk()))
+print(mutates(mk()))
+print(nullable(g))
+print(nullable(null))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 8 || (rows.get("matched") ?? 0) !== 8) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
