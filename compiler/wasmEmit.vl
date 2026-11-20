@@ -1743,6 +1743,7 @@ import {
   unionResidualSoloKindOfSet,
 } from "./emit_plan_null"
 import {
+  AtomEqArm,
   HoleBox,
   IdentReadArm,
   IsArm,
@@ -4166,6 +4167,16 @@ export function nulTestRefTail(invert: boolean): i32 {
 // The null test of a map read `m[k]` / `m.get(k)` whose instance pins the map's value to a
 // scalar, which reads unboxed there: the probe's miss is the null. 0 when not this shape.
 function emitInstMapReadIsNull(refIx: i32, fnIx: i32, invert: boolean) {
+  const rk = instMapIsNullReadOf(refIx, fnIx)
+  if rk.length != 2 { return 0 }
+  if emitMapHas(rk[0], rk[1], fnIx) < 0 { return -1 }
+  if !invert { fbI32Eqz() }
+  return 1
+}
+
+// The receiver and key of `emitInstMapReadIsNull`'s map read `refIx`, or `[]` when it is not that
+// shape: a scalar-pinned map, read by index or `.get`, whose value type bears no stored `null`.
+function instMapIsNullReadOf(refIx: i32, fnIx: i32): i32[] {
   const r = nodeAt(unwrapParen(refIx))
   let recvIx = -1
   let keyIx = -1
@@ -4173,7 +4184,7 @@ function emitInstMapReadIsNull(refIx: i32, fnIx: i32, invert: boolean) {
     recvIx = r.idxArr
     keyIx = r.idxIndex
   } else if r is Call {
-    if r.callFn < 0 || r.callArgs.length != 1 { return 0 }
+    if r.callFn < 0 || r.callArgs.length != 1 { return [] }
     const callee = nodeAt(r.callFn)
     if callee is Member {
       if callee.memProp == "get" {
@@ -4182,13 +4193,11 @@ function emitInstMapReadIsNull(refIx: i32, fnIx: i32, invert: boolean) {
       }
     }
   }
-  if recvIx < 0 || !exprMap(recvIx, fnIx) { return 0 }
-  if mapRecvScalarKindInst(recvIx, fnIx) < 0 { return 0 }
+  if recvIx < 0 || !exprMap(recvIx, fnIx) { return [] }
+  if mapRecvScalarKindInst(recvIx, fnIx) < 0 { return [] }
   // A stored `null` is a hit the probe cannot tell from a value.
-  if tyBearsNull(tyMapValOf(mapRecvTyIn(recvIx, fnIx))) { return 0 }
-  if emitMapHas(recvIx, keyIx, fnIx) < 0 { return -1 }
-  if !invert { fbI32Eqz() }
-  return 1
+  if tyBearsNull(tyMapValOf(mapRecvTyIn(recvIx, fnIx))) { return [] }
+  return [recvIx, keyIx]
 }
 
 // True when `recvIx`'s storage is the `string | null` niche and it is still nullable here:
@@ -6910,6 +6919,18 @@ export function structFieldTail(si: i32, idx: i32, memIx: i32, fnIx: i32) {
   return emitNulStrFieldRecover(sFieldStart[si] + idx, memIx, fnIx)
 }
 
+// After a narrowed box's receiver: variant `vi`'s field `idx` (`narrowedFieldTail`), then a
+// union-box field's unbox (`unionFieldNarrowUnboxOf`). A value-union field read while the checker
+// types it as one atom unboxes to that atom, through the home the bare-arm twin uses: an
+// index-rooted path has no member key, so only that home's arm sees `xs[0].r` (D8145).
+export function narrowedMemTail(vi: i32, idx: i32, memIx: i32, fnIx: i32) {
+  narrowedFieldTail(vi, idx, memIx, fnIx)
+  if fieldRowIsUnionBox(uFieldStart[vi] + idx) {
+    return emitUnionFieldNarrowUnbox(memIx, fnIx)
+  }
+  return 0
+}
+
 // Lower a narrowed field read `recv.field` where `recv` is narrowed to `narrowVariant` by
 // an enclosing `if recv is Variant`: evaluate the box, `struct.get $box 1`, `ref.cast (ref
 // $variant)` (non-null: a box never is), then `struct.get` the field. Resolves the variant
@@ -6928,15 +6949,7 @@ function emitNarrowedMem(memIx: i32, fnIx: i32) {
       )
     }
     if emitExpr(m.memObj, fnIx) < 0 { return -1 }
-    narrowedFieldTail(vi, idx, memIx, fnIx)
-
-    // A value-union field read while the checker types it as one atom unboxes to that atom,
-    // through the home the bare-arm twin uses: an index-rooted path has no member key, so
-    // only that home's checker-typed arm sees `xs[0].r` under `!= null` (D8145).
-    if fieldRowIsUnionBox(uFieldStart[vi] + idx) {
-      return emitUnionFieldNarrowUnbox(memIx, fnIx)
-    }
-    return 0
+    return narrowedMemTail(vi, idx, memIx, fnIx)
   }
   return emitFail("emitProgram: expected a field access")
 }
@@ -14087,112 +14100,153 @@ function emitPrintScalarMapRead(argIx: i32, k: i32, fnIx: i32) {
   )
 }
 
-// `==` / `!=` with a bare scalar-valued map read on either side (D2466). A miss is `null`, so
-// it equals only a `null`: the payload compare is `and`ed with the probe's hit flag, and both
-// operands evaluate once, left to right. 1 when lowered, 0 to decline to the caller's ladder
-// (null literals, a kind mismatch, a union operand that cannot be re-read), -1 on failure.
-function emitScalarMapReadEq(e: BinExpr, fnIx: i32): i32 {
+// How `==`/`!=` node `e` compares a bare scalar-valued map read (D2466): both reads of one kind
+// (`pair`), the read against a plain scalar (`read`) or against a value-union box holding `null`
+// (`box`), or `none`. `smRead` is the read's side, `smKind` its kind. No operand is a `null` literal.
+export type ScalarMapEqArm = "none" | "pair" | "read" | "box"
+
+export type ScalarMapEqPlan = {
+  smArm: ScalarMapEqArm,
+  smKind: i32,
+  smRead: i32,
+  smOther: i32,
+}
+
+export function scalarMapEqPlanOf(e: BinExpr, fnIx: i32): ScalarMapEqPlan {
+  const none: ScalarMapEqPlan = {
+    smArm: "none",
+    smKind: -1,
+    smRead: -1,
+    smOther: -1,
+  }
   const kl = mapReadScalarBoxKind(e.binLeft, fnIx)
   const kr = mapReadScalarBoxKind(e.binRight, fnIx)
-  if kl < 0 && kr < 0 { return 0 }
-  const ln = nodeAt(unwrapParen(e.binLeft))
-  const rn = nodeAt(unwrapParen(e.binRight))
-  if ln is NullLit { return 0 }
-  if rn is NullLit { return 0 }
-  let rc = 0
+  if kl < 0 && kr < 0 { return none }
+  if nodeAt(unwrapParen(e.binLeft)) is NullLit { return none }
+  if nodeAt(unwrapParen(e.binRight)) is NullLit { return none }
   if kl >= 0 && kr >= 0 {
-    if kl != kr { return 0 }
-    rc = emitScalarMapReadPairEq(e.binLeft, e.binRight, kl, fnIx)
-  } else if kl >= 0 {
-    rc = emitScalarMapReadOtherEq(e.binLeft, e.binRight, kl, true, fnIx)
-  } else {
-    rc = emitScalarMapReadOtherEq(e.binRight, e.binLeft, kr, false, fnIx)
+    if kl != kr { return none }
+    const l = nodeAt(unwrapParen(e.binLeft))
+    const r = nodeAt(unwrapParen(e.binRight))
+    if !(l is Index) || !(r is Index) { return none }
+    return { smArm: "pair", smKind: kl, smRead: e.binLeft, smOther: e.binRight }
   }
-  if rc <= 0 { return rc }
+  const readIx = if kl >= 0 { e.binLeft } else { e.binRight }
+  const otherIx = if kl >= 0 { e.binRight } else { e.binLeft }
+  const k = if kl >= 0 { kl } else { kr }
+  if !(nodeAt(unwrapParen(readIx)) is Index) { return none }
+  const plan: ScalarMapEqPlan = {
+    smArm: "read",
+    smKind: k,
+    smRead: readIx,
+    smOther: otherIx,
+  }
+  if exprUnion(otherIx, fnIx) && !eqAtomOperandOk(otherIx, fnIx) {
+    if !scalarMapBoxEqOk(otherIx, k, fnIx) { return none }
+    return { smArm: "box", smKind: k, smRead: readIx, smOther: otherIx }
+  }
+  // A numeric literal widens to a wide read's own width (`emitUnionEqOther`); any other
+  // operand must already have the read's atom kind.
+  const atom = scalarAtomNameOfKind(k)
+  const ok = unionEqAtomKindOf(
+    otherIx,
+    -1,
+    mkNullableTyOf(primTyIxOfName(atom)),
+    fnIx,
+  )
+    == k
+  if ok || k >= 3 && nodeAt(unwrapParen(otherIx)) is NumLit { return plan }
+  return none
+}
+
+// Whether value-union box `boxIx` meets a scalar map read of kind `k`: re-readable, no map read
+// of its own (its probe would overwrite this one's entry), and holding `null` and the kind.
+function scalarMapBoxEqOk(boxIx: i32, k: i32, fnIx: i32): boolean {
+  if !unionEqOperandOk(boxIx) { return false }
+  if nodeAt(unwrapParen(boxIx)) is Index { return false }
+  const bxs = msSetOfTy(unionBoxTyOfRead(boxIx, fnIx))
+  if !exprUnion(boxIx, fnIx) || bxs < 0 || !msHasNull(bxs) { return false }
+  return scalarAtomNameOfKind(k) != "" && msSetHasPrimKind(bxs, k)
+}
+
+// `==`/`!=` node `e` by its scalar map read plan `p`: a miss is `null`, so it equals only a
+// `null`; the payload compare is `and`ed with the probe's hit flag, and both operands evaluate
+// once, left to right. 0, or -1 failed.
+function emitScalarMapReadEq(e: BinExpr, p: ScalarMapEqPlan, fnIx: i32): i32 {
+  const rd = nodeAt(unwrapParen(p.smRead))
+  if !(rd is Index) {
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (map read is no index read)",
+    )
+  }
+  const rc = match p.smArm {
+    "pair" => emitScalarMapReadPairEq(rd, p.smOther, p.smKind, fnIx)
+    "read" => emitScalarMapReadOtherEq(rd, p.smOther, p.smKind, p.smRead == e.binLeft, fnIx)
+    "box" => emitScalarMapReadBoxEq(rd.idxArr, rd.idxIndex, p.smOther, p.smKind, fnIx)
+    "none" => emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (scalar map plan none)",
+    )
+  }
+  if rc < 0 { return -1 }
   if e.binOp == "!=" { fbI32Eqz() }
-  return 1
+  return 0
 }
 
 // Both operands are scalar map reads of kind `k`: equal when both miss, or both hit with equal
 // values. The right read's probe is emitted once per arm of the left's hit test.
-function emitScalarMapReadPairEq(lIx: i32, rIx: i32, k: i32, fnIx: i32): i32 {
-  const l = nodeAt(unwrapParen(lIx))
+function emitScalarMapReadPairEq(l: Index, rIx: i32, k: i32, fnIx: i32): i32 {
   const r = nodeAt(unwrapParen(rIx))
-  if l is Index {
-    if r is Index {
-      if emitMapPrep(l.idxArr, l.idxIndex, fnIx) < 0 { return -1 }
-      pushMapScr(5) // left entry
-      fbIf(127)     // i32 result
-      pushMapScalarHit()
-      if emitMapPrep(r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
-      if emitMapGetTail(r.idxArr, fnIx) < 0 { return -1 }
-      fbI32Bin(atomEqOpcodeOfKind(k))
-      pushMapHitFlag()
-      fbI32Bin(113) // 0x71 i32.and
-      fbElse()
-      if emitMapPrep(r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
-      pushMapHitFlag()
-      fbI32Eqz()
-      fbEnd()
-      return 1
-    }
+  if !(r is Index) {
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (map pair right is no index read)",
+    )
   }
+  if emitMapPrep(l.idxArr, l.idxIndex, fnIx) < 0 { return -1 }
+  pushMapScr(5) // left entry
+  fbIf(127)     // i32 result
+  pushMapScalarHit()
+  if emitMapPrep(r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
+  if emitMapGetTail(r.idxArr, fnIx) < 0 { return -1 }
+  fbI32Bin(atomEqOpcodeOfKind(k))
+  pushMapHitFlag()
+  fbI32Bin(113) // 0x71 i32.and
+  fbElse()
+  if emitMapPrep(r.idxArr, r.idxIndex, fnIx) < 0 { return -1 }
+  pushMapHitFlag()
+  fbI32Eqz()
+  fbEnd()
   return 0
 }
 
-// One operand is a scalar map read of kind `k` (`readLeft` says which side), the other is not.
-// A plain scalar compares against the hit value; a value-union box compares by tag, its `null`
-// arm matching a miss.
+// Map read `rd` of kind `k` against plain scalar `otherIx`, the read written first where
+// `readLeft`.
 function emitScalarMapReadOtherEq(
-  readIx: i32,
+  rd: Index,
   otherIx: i32,
   k: i32,
   readLeft: boolean,
   fnIx: i32,
 ): i32 {
-  const rd = nodeAt(unwrapParen(readIx))
-  if rd is Index {
-    if exprUnion(otherIx, fnIx) && !eqAtomOperandOk(otherIx, fnIx) {
-      return emitScalarMapReadBoxEq(rd.idxArr, rd.idxIndex, otherIx, k, fnIx)
-    }
-    const atom = scalarAtomNameOfKind(k)
-    // A numeric literal widens to a wide read's own width (`emitUnionEqOther`); any other
-    // operand must already have the read's atom kind.
-    const olit = nodeAt(unwrapParen(otherIx))
-    let oOk = unionEqAtomKindOf(
-      otherIx,
-      -1,
-      mkNullableTyOf(primTyIxOfName(atom)),
-      fnIx,
-    )
-      == k
-    if olit is NumLit {
-      if k >= 3 { oOk = true }
-    }
-    if !oOk { return 0 }
-    if readLeft {
-      if emitMapPrep(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-      pushMapHitFlag()
-      if emitMapGetTail(rd.idxArr, fnIx) < 0 { return -1 }
-      if emitUnionEqOther(otherIx, k, fnIx) < 0 { return -1 }
-      fbI32Bin(atomEqOpcodeOfKind(k))
-      fbI32Bin(113) // 0x71 i32.and
-      return 1
-    }
-    if emitUnionEqOther(otherIx, k, fnIx) < 0 { return -1 }
+  if readLeft {
     if emitMapPrep(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
-    if emitMapGetTail(rd.idxArr, fnIx) < 0 { return -1 }
-    fbI32Bin(atomEqOpcodeOfKind(k))
     pushMapHitFlag()
+    if emitMapGetTail(rd.idxArr, fnIx) < 0 { return -1 }
+    if emitUnionEqOther(otherIx, k, fnIx) < 0 { return -1 }
+    fbI32Bin(atomEqOpcodeOfKind(k))
     fbI32Bin(113) // 0x71 i32.and
-    return 1
+    return 0
   }
+  if emitUnionEqOther(otherIx, k, fnIx) < 0 { return -1 }
+  if emitMapPrep(rd.idxArr, rd.idxIndex, fnIx) < 0 { return -1 }
+  if emitMapGetTail(rd.idxArr, fnIx) < 0 { return -1 }
+  fbI32Bin(atomEqOpcodeOfKind(k))
+  pushMapHitFlag()
+  fbI32Bin(113) // 0x71 i32.and
   return 0
 }
 
-// The read against a value-union box `u`: a hit equals `u` holding the same scalar, a miss
-// equals `u` holding `null`. `u` is re-read per arm, so it must be re-readable and must not be
-// a map read of its own (its probe would overwrite this one's entry).
+// The read against a value-union box `u` (`scalarMapBoxEqOk`): a hit equals `u` holding the same
+// scalar, a miss equals `u` holding `null`. `u` is re-read per arm.
 function emitScalarMapReadBoxEq(
   recvIx: i32,
   keyIx: i32,
@@ -14200,12 +14254,6 @@ function emitScalarMapReadBoxEq(
   k: i32,
   fnIx: i32,
 ): i32 {
-  if !unionEqOperandOk(boxIx) { return 0 }
-  const bn = nodeAt(unwrapParen(boxIx))
-  if bn is Index { return 0 }
-  const bxs = msSetOfTy(unionBoxTyOfRead(boxIx, fnIx))
-  if !exprUnion(boxIx, fnIx) || bxs < 0 || !msHasNull(bxs) { return 0 }
-  if scalarAtomNameOfKind(k) == "" || !msSetHasPrimKind(bxs, k) { return 0 }
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
   pushMapScr(5)           // entry
   fbIf(127)               // i32 result
@@ -14228,7 +14276,7 @@ function emitScalarMapReadBoxEq(
   fbI32Rel(RS_TAG, nullBoxTag())
   fbI32Bin(70)            // 0x46 i32.eq
   fbEnd()
-  return 1
+  return 0
 }
 
 // Push whether entry `iL` of the `live` array in `liveL` is live: `live[i] != 0` in a module
@@ -39097,12 +39145,7 @@ function emitIdentityMixed(e: BinExpr, fnIx: i32) {
 }
 
 function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
-  if e.binIdent != 0 && identityBinIsMixed(e, fnIx) {
-    return emitIdentityMixed(e, fnIx)
-  }
-  if e.binIdent != 0 && emitIdentityIsRefEq(e, fnIx) {
-    return emitIdentityBin(e, exprIx, fnIx)
-  }
+  if e.binOp == "==" || e.binOp == "!=" { return emitEqRoute(e, exprIx, fnIx) }
   // A mask that only zero-extends a load is the zero-extending load itself (`zextLoadOf`).
   if e.binOp == "&" {
     const zlAnd = zextLoadOf(exprIx, fnIx)
@@ -39122,16 +39165,6 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
   // `k`, push `vals[hit]` on a hit else the default `d`. The self-host checker reads
   // every scope map through `?? -1`. The LHS must be a map index in this slice.
   if e.binOp == "??" { return emitCoalesce(e, exprIx, fnIx) }
-  // A numeric union beside a number compares per member, ahead of the box's tag compare; a
-  // `null` test of one keeps the box's own test.
-  if numUnionMinted && (e.binOp == "==" || e.binOp == "!=") {
-    if njDispatches(e, fnIx) { return emitNumUnionBin(e, exprIx, fnIx) }
-  }
-  // A null test of a value the checker proved non-null is dead: its answer is a constant.
-  if e.binOp == "==" || e.binOp == "!=" {
-    const dnIx = deadNullTestOperand(e, fnIx)
-    if dnIx >= 0 { return emitDeadNullTest(dnIx, e.binOp == "!=", fnIx) }
-  }
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
   // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`.
   if e.binOp == "&&" || e.binOp == "||" {
@@ -39159,51 +39192,231 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
     fbEnd() // 0x0b end
     return 0
   }
-  // Structural `==`/`!=` with a still-boxed value-union operand (either side, or both).
-  // Checked before the string-eq routing, which would otherwise misclassify a union box
-  // compared against a string as a bare string compare, and skips `null` literals — the
-  // box-tag null compare below owns `v == null` (the host's `variantTag(info, null)` path).
-  if e.binOp == "==" || e.binOp == "!=" {
-    const uql = nodeAt(unwrapParen(e.binLeft))
-    const uqr = nodeAt(unwrapParen(e.binRight))
-    // Both sides bare `null` is static — true by the type alone, no rep needed (D1018).
+  return emitBinRefOps(e, exprIx, fnIx)
+}
 
-    // Distinct from D20's family, which has a `T | null` and asks about that niche. Here there
-    // is no `T`: an unconstrained hole resolves to bare `null`, and `null == null` is true by
-    // the type alone.
-    if uql is NullLit {
-      if uqr is NullLit {
-        if e.binOp == "==" { fbI32Const(1) } else { fbI32Const(0) }
-        return 0
-      }
-    }
-    const smq = emitScalarMapReadEq(e, fnIx)
-    if smq < 0 { return -1 }
-    if smq > 0 { return 0 }
-    let uqNull = false
-    if uql is NullLit { uqNull = true }
-    if uqr is NullLit { uqNull = true }
-    // The litunion exclusion is per-operand, not per-compare — `exprUnion` also claims a
-    // `K`-annotated binding, so this arm disqualifies the litunion operand rather than the
-    // whole compare. Disqualifying the whole compare let `boxU == k` skip the union path when
-    // one side is an atom, pushing the box ref under an `i32.eq`: `vl check` rc 0, invalid wasm.
-    if !uqNull {
-      const uqL = exprUnion(e.binLeft, fnIx)
-        && !eqAtomOperandOk(e.binLeft, fnIx)
-      const uqR = exprUnion(e.binRight, fnIx)
-        && !eqAtomOperandOk(e.binRight, fnIx)
-      if uqL && uqR {
-        return emitUnionUnionEq(e.binLeft, e.binRight, e.binOp == "!=", fnIx)
-      }
-      if uqL {
-        return emitUnionConcreteEq(e.binLeft, e.binRight, e.binOp == "!=", fnIx)
-      }
-      if uqR {
-        return emitUnionConcreteEq(e.binRight, e.binLeft, e.binOp == "!=", fnIx)
-      }
-    }
+// The arm legacy writes a `==`/`!=` by, in its dispatch order: identity, the numeric union, a dead
+// or static `null` test, the scalar map read, the union, atom and nul-none compares, the floors
+// with no lowering, the two-rep and niche compares, string, list, `null` test, struct and closure
+// compares, and the numeric tail. Every reader of the dispatch asks this one decision.
+export type EqRoute = "identMixed"
+  | "identRef"
+  | "numUnion"
+  | "deadNull"
+  | "nullNull"
+  | "scalarMap"
+  | "unionUnion"
+  | "unionLeft"
+  | "unionRight"
+  | "atomFold"
+  | "atomStatic"
+  | "atomIds"
+  | "nulNone"
+  | "noLowering"
+  | "gRepUnresolved"
+  | "xrep"
+  | "nulNiche"
+  | "str"
+  | "list"
+  | "nulTest"
+  | "variantEq"
+  | "structEq"
+  | "recordRefused"
+  | "closure"
+  | "numeric"
+
+// The arm `==`/`!=` node `e` at `exprIx` takes (`EqRoute`), each by the predicate its writer reads.
+export function eqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): EqRoute {
+  const l = e.binLeft
+  const r = e.binRight
+  if e.binIdent != 0 && identityBinIsMixed(e, fnIx) { return "identMixed" }
+  if e.binIdent != 0 && emitIdentityIsRefEq(e, fnIx) { return "identRef" }
+  if numUnionMinted && njDispatches(e, fnIx) { return "numUnion" }
+  if deadNullTestOperand(e, fnIx) >= 0 { return "deadNull" }
+  const lNull = nodeAt(unwrapParen(l)) is NullLit
+  const rNull = nodeAt(unwrapParen(r)) is NullLit
+  if lNull && rNull { return "nullNull" }
+  if scalarMapEqPlanOf(e, fnIx).smArm != "none" { return "scalarMap" }
+  // A literal-union operand is no union box here: `exprUnion` also claims a `K`-annotated binding.
+  if !lNull && !rNull {
+    const uqL = exprUnion(l, fnIx) && !eqAtomOperandOk(l, fnIx)
+    const uqR = exprUnion(r, fnIx) && !eqAtomOperandOk(r, fnIx)
+    if uqL && uqR { return "unionUnion" }
+    if uqL { return "unionLeft" }
+    if uqR { return "unionRight" }
   }
-  return emitBinLitEq(e, exprIx, fnIx)
+  const aq = atomEqRouteOf(atomEqPlanOf(e, fnIx).aqArm)
+  if aq != null { return aq }
+  if nulNoneEqSides(l, r, fnIx) { return "nulNone" }
+  if binEqHasNoLowering(exprIx) { return "noLowering" }
+  const xrep = xrepEmitPair(e, fnIx)
+  if !xrep && binEqGRepUnresolved(exprIx, fnIx) { return "gRepUnresolved" }
+  if xrep { return "xrep" }
+  if binEqNulNiche(exprIx, fnIx) != "" { return "nulNiche" }
+  if exprIsStrEq(exprIx, fnIx) { return "str" }
+  if listEqArmOf(e, exprIx, fnIx, listOpKindOfBin(exprIx, fnIx)) != "" {
+    return "list"
+  }
+  if nulTestClaims(e, fnIx) { return "nulTest" }
+  if binEqVariantRow(exprIx, fnIx) >= 0 { return "variantEq" }
+  if binEqStructRow(exprIx, fnIx) >= 0 { return "structEq" }
+  if structIndexOfExpr(l, fnIx) >= 0 || structIndexOfExpr(r, fnIx) >= 0 {
+    return "recordRefused"
+  }
+  if exprVariantIndex(l, fnIx) >= 0 || exprVariantIndex(r, fnIx) >= 0 {
+    return "recordRefused"
+  }
+  if exprIsClosure(l, fnIx) || exprIsClosure(r, fnIx) { return "closure" }
+  return "numeric"
+}
+
+// The route an atom compare plan's arm takes, or null for `none`: the compare is a later arm's.
+function atomEqRouteOf(arm: AtomEqArm): EqRoute | null {
+  return match arm {
+    "fold" => "atomFold"
+    "static" => "atomStatic"
+    "ids" => "atomIds"
+    "none" => null
+  }
+}
+
+// Whether `x == null` / `x != null` node `e` takes its rep's own null test (`emitNulIsNullTest`
+// claims it).
+function nulTestClaims(e: BinExpr, fnIx: i32): boolean {
+  const bt = binNulTestOf(e)
+  if bt == null { return false }
+  return match nulTestArmOf(bt.bnRef, fnIx, bt.bnInvert, false) {
+    "none" => false
+    "instMap" => instMapIsNullReadOf(bt.bnRef, fnIx).length == 2
+    "nnfold" | "nulfold" | "nullty" | "bool" | "atom" | "optChain" | "mapHas" | "boxTag" | "nullRef" | "nulStr" => true
+  }
+}
+
+// `==`/`!=` node `e` at `exprIx` by its route (`eqRouteOf`). 0, or -1 failed.
+function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  const l = e.binLeft
+  const r = e.binRight
+  const ne = e.binOp == "!="
+  return match eqRouteOf(e, exprIx, fnIx) {
+    "identMixed" => emitIdentityMixed(e, fnIx)
+    "identRef" => emitIdentityBin(e, exprIx, fnIx)
+    "numUnion" => emitNumUnionBin(e, exprIx, fnIx)
+    "deadNull" => emitDeadNullTest(deadNullTestOperand(e, fnIx), ne, fnIx)
+    // Both sides bare `null` is static — true by the type alone, no rep needed (D1018).
+    "nullNull" => if ne { fbI32Const(0) } else { fbI32Const(1) }
+    "scalarMap" => emitScalarMapReadEq(e, scalarMapEqPlanOf(e, fnIx), fnIx)
+    "unionUnion" => emitUnionUnionEq(l, r, ne, fnIx)
+    "unionLeft" => emitUnionConcreteEq(l, r, ne, fnIx)
+    "unionRight" => emitUnionConcreteEq(r, l, ne, fnIx)
+    "atomFold" | "atomStatic" | "atomIds" => emitAtomEqByPlan(e, fnIx)
+    "nulNone" => emitNulNoneEq(e, fnIx)
+    "noLowering" => emitFail("emitProgram: `" + e.binOp + "` over this operand rep has no lowering")
+    "gRepUnresolved" => emitFail(
+      "emitProgram: the two operands of this list `"
+        + e.binOp
+        + "` do not resolve to one comparable list rep",
+    )
+    // Two number lists stored apart compare across their reps (D15055).
+    "xrep" => emitListEqXBin(e, fnIx)
+    "nulNiche" => emitNulNicheEqBin(e, exprIx, fnIx)
+    "str" => emitStrEq(exprIx, fnIx)
+    "list" => emitListEqBin(e, exprIx, fnIx)
+    "nulTest" => emitNulTestBin(e, fnIx)
+    "variantEq" => emitStructEq(exprIx, fnIx, eqRowOfVariant(binEqVariantRow(exprIx, fnIx)))
+    "structEq" => emitStructEq(exprIx, fnIx, binEqStructRow(exprIx, fnIx))
+    // Either side naming a layout without the two agreeing is a compare this emitter refuses
+    // rather than guesses at (D57).
+    "recordRefused" => emitFail("emitProgram: struct equality is not supported yet")
+    "closure" => emitClosureEq(e, exprIx, fnIx)
+    "numeric" => emitBinNumeric(e, exprIx, fnIx)
+  }
+}
+
+// An atom compare by its plan (`atomEqPlanOf`): two string-literal types fold, a literal beside
+// an atom is its interned id, two atoms compare their ids. Both operands evaluate (D2156).
+function emitAtomEqByPlan(e: BinExpr, fnIx: i32): i32 {
+  const aq = atomEqPlanOf(e, fnIx)
+  if aq.aqArm == "fold" {
+    if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
+    fbDrop()
+    if emitStaticLitAtom(e.binRight, aq.aqLexR, fnIx) < 0 { return -1 }
+    fbDrop()
+    if strLexSameValue(aq.aqLex, aq.aqLexR) == (e.binOp == "==") {
+      fbI32Const(1)
+    } else {
+      fbI32Const(0)
+    }
+    return 0
+  }
+  if aq.aqArm == "static" {
+    if aq.aqStaticLeft {
+      if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
+      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+    } else {
+      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+      if emitStaticLitAtom(e.binRight, aq.aqLex, fnIx) < 0 { return -1 }
+    }
+    return atomEqTail(e.binOp == "!=")
+  }
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+  return atomEqTail(e.binOp == "!=")
+}
+
+// D1576 — `x == null` where `x` is the `null` type is statically true (`!=` false): the
+// non-literal side evaluates for its effect (`nulNoneEqSides`).
+function emitNulNoneEq(e: BinExpr, fnIx: i32): i32 {
+  if emitNulNoneForEffect(e.binLeft, fnIx) < 0 { return -1 }
+  if emitNulNoneForEffect(e.binRight, fnIx) < 0 { return -1 }
+  if e.binOp == "==" { fbI32Const(1) } else { fbI32Const(0) }
+  return 0
+}
+
+// A `==`/`!=` over a nullable ref niche (`binEqNulNiche`), the wrapper's `==` answer negated for
+// `!=`.
+function emitNulNicheEqBin(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  if emitNulNicheEq(exprIx, fnIx, binEqNulNiche(exprIx, fnIx)) < 0 { return -1 }
+  if e.binOp == "!=" { fbI32Eqz() }
+  return 0
+}
+
+// A list `==`/`!=`: length and element value-compare, each operand recovered and synced.
+function emitListEqBin(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  if listEqOperandTail(e.binLeft, fnIx) < 0 { return -1 }
+  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+  if listEqOperandTail(e.binRight, fnIx) < 0 { return -1 }
+  return listEqTail(e, exprIx, fnIx)
+}
+
+// `x == null` / `x != null` by the rep's own null test, the ladder the `is null` guard shares;
+// `!=` is the inverted direction the ladder writes itself.
+function emitNulTestBin(e: BinExpr, fnIx: i32): i32 {
+  const bt = binNulTestOf(e)
+  if bt == null {
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (null test with no operand)",
+    )
+  }
+  const bnt = emitNulIsNullTest(bt.bnRef, fnIx, bt.bnInvert, false)
+  if bnt < 0 { return -1 }
+  if bnt == 0 {
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (null test ladder declined)",
+    )
+  }
+  return 0
+}
+
+// Function-value `==`/`!=`: identity, the same lifted function and the same captured env.
+function emitClosureEq(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
+  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+  if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
+  if emitEqNonNullCore(exprIx, fnIx) < 0 { return -1 }
+  if e.binOp == "!=" { fbI32Eqz() }
+  return 0
 }
 
 // The compare after an atom `==`/`!=`'s two ids: `i32.eq`, and `i32.eqz` for `!=` (never
@@ -39212,89 +39425,6 @@ export function atomEqTail(ne: boolean): i32 {
   fbI32Bin(70) // 0x46 i32.eq
   if ne { fbI32Eqz() }
   return 0
-}
-
-// `emitBinExprNode` past its union compares: the string-literal and atom compares, and the
-// `==` floors and nullable niches every later compare would misread.
-function emitBinLitEq(e: BinExpr, exprIx: i32, fnIx: i32) {
-  // Two string-literal types compare in O(1): an operand typed as one string literal is that
-  // literal whatever it reads, so beside another such operand the compare folds, and beside an
-  // atom it is its interned id. Both operands still evaluate, for their effects (D2156).
-  if e.binOp == "==" || e.binOp == "!=" {
-    const aq = atomEqPlanOf(e, fnIx)
-    if aq.aqArm == "fold" {
-      if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
-      fbDrop()
-      if emitStaticLitAtom(e.binRight, aq.aqLexR, fnIx) < 0 { return -1 }
-      fbDrop()
-      if strLexSameValue(aq.aqLex, aq.aqLexR) == (e.binOp == "==") {
-        fbI32Const(1)
-      } else {
-        fbI32Const(0)
-      }
-      return 0
-    }
-    if aq.aqArm == "static" {
-      if aq.aqStaticLeft {
-        if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
-        if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-      } else {
-        if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-        if emitStaticLitAtom(e.binRight, aq.aqLex, fnIx) < 0 { return -1 }
-      }
-      return atomEqTail(e.binOp == "!=")
-    }
-    if aq.aqArm == "ids" {
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-      return atomEqTail(e.binOp == "!=")
-    }
-  }
-  // A `==`/`!=` over a nullable ref niche, plus the emitter-capability floor for a rep with no
-  // compare core — both off the one comparability home (`nodeEqCmpKind`), the same function
-  // the checker's acceptance reads. Comes before the string/list/struct/closure compares
-  // below, which classify operands by their non-null rep and would ignore that the null can be there.
-
-  // D1576 — `x == null` where `x` is the `null` type is statically true (`!=` false): both
-  // operands are the value `null`, so there is no compare core to run. The niche dispatch
-  // below reads each operand at a nullable rep and has no seed for a bare `null` beside a
-  // `nulnone` value; `nulNoneEqSides` scopes it, evaluating the non-literal side for effect.
-  if e.binOp == "==" || e.binOp == "!=" {
-    if nulNoneEqSides(e.binLeft, e.binRight, fnIx) {
-      if emitNulNoneForEffect(e.binLeft, fnIx) < 0 { return -1 }
-      if emitNulNoneForEffect(e.binRight, fnIx) < 0 { return -1 }
-      if e.binOp == "==" { fbI32Const(1) } else { fbI32Const(0) }
-      return 0
-    }
-  }
-  if e.binOp == "==" || e.binOp == "!=" {
-    if binEqHasNoLowering(exprIx) {
-      return emitFail(
-        "emitProgram: `"
-          + e.binOp
-          + "` over this operand rep has no lowering",
-      )
-    }
-    // Two number lists stored apart compare across their reps, below (D15055).
-    const xrep = xrepEmitPair(e, fnIx)
-    if !xrep && binEqGRepUnresolved(exprIx, fnIx) {
-      return emitFail(
-        "emitProgram: the two operands of this list `"
-          + e.binOp
-          + "` do not resolve to one comparable list rep",
-      )
-    }
-    if xrep { return emitListEqXBin(e, fnIx) }
-    const nulNiche = binEqNulNiche(exprIx, fnIx)
-    if nulNiche != "" {
-      if emitNulNicheEq(exprIx, fnIx, nulNiche) < 0 { return -1 }
-      if e.binOp == "!=" {
-        fbI32Eqz() // 0x45 i32.eqz — the wrapper always leaves the `==` answer
-      }
-      return 0
-    }
-  }
-  return emitBinRefOps(e, exprIx, fnIx)
 }
 
 // Which list compare `emitBinRefOps` runs for `e` (its `listOpKindOfBin` is `lopK`): "any" for
@@ -39332,42 +39462,10 @@ export function listEqTail(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   return 0
 }
 
-// Whether `emitBinExprNode` routes `==`/`!=` node `e` (at `exprIx`) to the list compare
-// (`listEqTail`), past every earlier arm: identity, union, atom, `null`, niche, string and the
-// two-rep number lists, each of which takes the compare first.
+// Whether `==`/`!=` node `e` (at `exprIx`) takes the list compare (`eqRouteOf`'s `list`).
 export function listEqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
-  if e.binIdent != 0 || e.binOp != "==" && e.binOp != "!=" { return false }
-  if numUnionMinted && njDispatches(e, fnIx) { return false }
-  const l = e.binLeft
-  const r = e.binRight
-  if nodeAt(unwrapParen(l)) is NullLit || nodeAt(unwrapParen(r)) is NullLit {
-    return false
-  }
-  if mapReadScalarBoxKind(l, fnIx) >= 0 || mapReadScalarBoxKind(r, fnIx) >= 0 {
-    return false
-  }
-  if exprUnion(l, fnIx) && !eqAtomOperandOk(l, fnIx) { return false }
-  if exprUnion(r, fnIx) && !eqAtomOperandOk(r, fnIx) { return false }
-  if atomEqPlanOf(e, fnIx).aqArm != "none" || nulNoneEqSides(l, r, fnIx) {
-    return false
-  }
-  if (
-    binEqHasNoLowering(exprIx)
-    || xrepEmitPair(e, fnIx)
-    || binEqGRepUnresolved(exprIx, fnIx)
-    || binEqNulNiche(exprIx, fnIx) != ""
-    || binConcatRepUnresolved(exprIx, fnIx)
-  ) {
-    return false
-  }
-  if (
-    exprIsStrConcat(exprIx, fnIx)
-    || exprIsStrEq(exprIx, fnIx)
-    || exprIsStrOrder(exprIx, fnIx)
-  ) {
-    return false
-  }
-  return listEqArmOf(e, exprIx, fnIx, listOpKindOfBin(exprIx, fnIx)) != ""
+  if e.binOp != "==" && e.binOp != "!=" { return false }
+  return eqRouteOf(e, exprIx, fnIx) == "list"
 }
 
 // `emitBinExprNode` over reference operands: the list `+` floor, the string, list, struct
@@ -39408,10 +39506,6 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   // Asked once and threaded into the concat and compare arms below, one node's answer.
   const lopK = listOpKindOfBin(exprIx, fnIx)
-  if e.binOp == "==" || e.binOp == "!=" {
-    // Two number lists stored apart: one loop reading each side at its own rep (D15055).
-    if xrepEmitPair(e, fnIx) { return emitListEqXBin(e, fnIx) }
-  }
   if lopK != "none" && e.binOp == "+" {
     if lopK != "i32list" {
       return emitFail(
@@ -39426,55 +39520,6 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
     if emitExpr(e.binRight, fnIx) < 0 { return -1 }
     if listEqOperandTail(e.binRight, fnIx) < 0 { return -1 }
     return listEqTail(e, exprIx, fnIx)
-  }
-  // `x == null` / `x != null` over any NULLABLE value — the rep's own null test, never the
-  // i32 compare. Checked before the structural string / struct / closure equality below,
-  // each of which would compare a value against the `null` literal.
-  if e.binOp == "==" || e.binOp == "!=" {
-    const bt = binNulTestOf(e)
-    if bt != null {
-      // The ladder is shared with the `is null` guard — the two spellings ask the same
-      // question of the same rep, and `emitNulIsNullTest`'s header carries why they must
-      // not be answered in only one place. `!=` is the INVERTED direction, which the ladder
-      // emits directly (`i32.ne`) rather than leaving a caller to negate an `i32.eq`.
-      const bnt = emitNulIsNullTest(bt.bnRef, fnIx, bt.bnInvert, false)
-      if bnt < 0 { return -1 }
-      if bnt > 0 { return 0 }
-    }
-    // Structural struct equality compares field-wise (`emitStructEq`), asked via
-    // `structIndexOfExpr` and the variant twin `exprVariantIndex` — kind-gated storage-class
-    // legs over the same nine, tried variant-first because two of `structIndexOfExpr`'s legs
-    // are not kind-gated. Both declining falls to the i32 tail, an unreserved-field-slot risk (D57).
-    const eqVi = binEqVariantRow(exprIx, fnIx)
-    if eqVi >= 0 { return emitStructEq(exprIx, fnIx, eqRowOfVariant(eqVi)) }
-    const eqSi = binEqStructRow(exprIx, fnIx)
-    if eqSi >= 0 { return emitStructEq(exprIx, fnIx, eqSi) }
-    // The refusal spans both tables — either side naming a layout without the two agreeing is
-    // a compare this emitter refuses rather than guesses at, matching D57 (an operand reaching
-    // the i32 tail as a `(ref $variantHeap(vi))`). Two arms of one union sharing a layout resolve
-    // to different variant rows and fall to this same refusal, exactly as two disagreeing structs would.
-    if (
-      structIndexOfExpr(e.binLeft, fnIx) >= 0
-      || structIndexOfExpr(e.binRight, fnIx) >= 0
-      || exprVariantIndex(e.binLeft, fnIx) >= 0
-      || exprVariantIndex(e.binRight, fnIx) >= 0
-    ) {
-      return emitFail("emitProgram: struct equality is not supported yet")
-    }
-    // Function-value `==`/`!=`: IDENTITY — the same lifted function (the id
-    // field) AND the same captured env (`ref.eq`). Mirrors the host (same
-    // table index AND same env; null == null envs are equal).
-    if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-      if emitEqRecoverNarrowed(e.binLeft, fnIx) < 0 { return -1 }
-      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-      if emitEqRecoverNarrowed(e.binRight, fnIx) < 0 { return -1 }
-      if emitEqNonNullCore(exprIx, fnIx) < 0 { return -1 }
-      if e.binOp == "!=" {
-        fbI32Eqz() // 0x45 i32.eqz — negate identity-equality
-      }
-      return 0
-    }
   }
   return emitBinNumeric(e, exprIx, fnIx)
 }
