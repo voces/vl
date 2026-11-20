@@ -165,6 +165,7 @@ import {
   numLitLexAt,
   objLitArmOf,
   objLitLayoutRowOf,
+  objLitVariantLayoutAt,
   objLitVariantLayoutOf,
   popAnyPlanOf,
   printArmOf,
@@ -181,6 +182,7 @@ import {
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
+  variantCoerceArmOf,
   variantFieldArmOf,
 } from "./wasmEmit"
 import { identUnboxAtomOf } from "./emit_plan_union"
@@ -203,6 +205,8 @@ import {
   widenPlanOf,
 } from "./emit_plan_union"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
+import { mvValVariantOf } from "./emit_shape_rows"
+import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
@@ -555,13 +559,18 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 // `objLitLayoutRowOf`, a variant's `objLitVariantLayoutOf`): each field in layout order at its
 // `plain` arm, owing no recovery, kept at its kid of the record rep, then the row's `struct.new`.
 function objLit(b: i32[], ix: i32, rep: i32): Opnd {
-  const arm = objLitArmOf(ix, ibFnIx)
+  return objLitAt(b, ix, rep, nodeTyAt(ix, ibFnIx), -1)
+}
+
+// `objLit` at type `ty`, or, where `vi` is not -1, built at variant row `vi` as a coerce into that
+// variant builds it (`emitVariantStruct`).
+function objLitAt(b: i32[], ix: i32, rep: i32, ty: i32, vi: i32): Opnd {
+  const arm: ObjLitArm = if vi >= 0 { "variant" } else { objLitArmOf(ix, ibFnIx) }
   if arm == "unionBox" { return irBMiss("object " + arm) }
-  const row = if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
+  const row = if vi >= 0 { objLitVariantLayoutAt(ix, vi) } else if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
   if row < 0 { return irBMiss("object layout") }
   const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
   const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
-  const ty = nodeTyAt(ix, ibFnIx)
   if !(repNodeAt(rep) is RRecord) || repNodeOfTy(ty) != rep {
     return irBMiss("object rep")
   }
@@ -592,7 +601,7 @@ function objLit(b: i32[], ix: i32, rep: i32): Opnd {
   }
   return irBLetTemp(
     b,
-    { mrFields: fields, mrLayout: layout, mrAt: ix },
+    { mrFields: fields, mrLayout: layout, mrAt: ix, mrRow: vi },
     ix,
     rep,
   )
@@ -1917,7 +1926,14 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
       mapSetAtomVal(recv, ibFnIx),
       mapSetNulBoolVal(recv, ibFnIx),
     )
-    if arm != "plain" { return skip("map store value " + arm) }
+    // An arm-valued map's literal is built at the slot's variant row, as legacy's coerce builds it
+    // (`emitVariantStruct`).
+    if arm == "variant" {
+      const vc = variantCoerceArmOf(mvValVariantOf(sh), val, ibFnIx)
+      if vc != "objLit" { return skip("map store value variant " + vc) }
+    } else if arm != "plain" {
+      return skip("map store value " + arm)
+    }
     if narrowedArmNeedsUnbox(val, ibFnIx) {
       return skip("map store value unbox")
     }
@@ -1928,7 +1944,7 @@ function mapSet(b: i32[], recv: i32, key: i32, val: i32, ix: i32) {
   const k = irBExpr(b, key)
   if ibMiss != "" { return 0 }
   const one: Opnd = { oiRep: ibBool, oiBits: 1 }
-  const v = if val >= 0 { irBExpr(b, val) } else { one }
+  const v = if val < 0 { one } else if mapSetVariantLit(recv, val, sh) { mapVariantLit(b, val, sh) } else { irBExpr(b, val) }
   if ibMiss != "" { return 0 }
   // Legacy reads the receiver before the operands; a valued `if` the IR writes ahead of the node
   // would land below it.
@@ -1958,6 +1974,29 @@ function popValueRhs(b: i32[], m: Member, ix: i32): Rhs {
   }
   const r: Rhs = { lqV: v, lqAt: ix }
   return r
+}
+
+// Whether map store value `val` into receiver `recv`'s mv slot `sh` is an object literal legacy
+// builds at the slot's variant row (`mapSetValArmOf` `variant`, `variantCoerceArmOf` `objLit`).
+function mapSetVariantLit(recv: i32, val: i32, sh: i32): boolean {
+  const arm = mapSetValArmOf(
+    val,
+    ibFnIx,
+    sh,
+    mapSetAtomVal(recv, ibFnIx),
+    mapSetNulBoolVal(recv, ibFnIx),
+  )
+  return arm == "variant"
+    && variantCoerceArmOf(mvValVariantOf(sh), val, ibFnIx) == "objLit"
+}
+
+// Object literal `val` built at mv slot `sh`'s variant row, at the slot's value type's rep.
+function mapVariantLit(b: i32[], val: i32, sh: i32): Opnd {
+  const pre = exprPrePathWhy(val, ibFnIx)
+  if pre != "" { return irBMiss(pre) }
+  const ty = mvValTyIxAt(sh)
+  if ty < 0 { return irBMiss("map store value type") }
+  return objLitAt(b, unwrapParen(val), repNodeOfTy(ty), ty, mvValVariantOf(sh))
 }
 
 // A `.pop()` statement over any list legacy pops (`popAnyPlanOf`), through legacy's pop tail.

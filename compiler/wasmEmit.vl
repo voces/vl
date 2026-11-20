@@ -2784,7 +2784,11 @@ function variantLitDrops(objIx: i32, vi: i32, fnIx: i32): boolean {
 // The variant row object literal `objIx` is built at by `emitVariantStruct`'s layout loop alone:
 // its span sound, every field written, none outside the row, no stash; -1 otherwise.
 export function objLitVariantLayoutOf(objIx: i32, fnIx: i32): i32 {
-  const vi = objLitBuildVariantRow(objIx, fnIx)
+  return objLitVariantLayoutAt(objIx, objLitBuildVariantRow(objIx, fnIx))
+}
+
+// `objLitVariantLayoutOf` at variant row `vi`, the row a coerce builds the literal at: `vi`, or -1.
+export function objLitVariantLayoutAt(objIx: i32, vi: i32): i32 {
   if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
     return -1
   }
@@ -9404,26 +9408,52 @@ function emitFailCrossTagDelivery(exprIx: i32, vi: i32): i32 {
 // passes through, a value-`if` join recurses. The variant analogue of `emitUnionCoerce`.
 export function emitVariantCoerce(vi: i32, exprIx: i32, fnIx: i32) {
   const bareIx = unwrapParen(exprIx)
-  if bareIx < 0 { return -1 }
+  return match variantCoerceArmOf(vi, exprIx, fnIx) {
+    "none" => -1
+    "never" => emitExpr(bareIx, fnIx)
+    "if" => emitVariantIfValue(vi, bareIx, fnIx)
+    "objLit" => emitVariantStruct(bareIx, vi, fnIx)
+    "pass" => emitVariantPassThrough(exprIx, fnIx)
+    "crossTag" => emitFailCrossTagDelivery(exprIx, vi)
+    "unbox" => {
+      if emitExpr(exprIx, fnIx) < 0 { return -1 }
+      if vi < 0 { return -1 }
+      narrowedVariantTail(vi)
+    }
+  }
+}
+
+// How `emitVariantCoerce` delivers `exprIx` at variant `vi`: no node (`none`), a `never` call as
+// itself, a value `if` per arm, an object literal as the bare variant, a value already in the
+// bare variant (`pass`, recovered where its niche owes it), or a union box unboxed (`unbox`), a
+// box whose cross-tag fits it cannot tell apart refused (`crossTag`).
+export type VariantCoerceArm = "none"
+  | "never"
+  | "if"
+  | "objLit"
+  | "pass"
+  | "crossTag"
+  | "unbox"
+export function variantCoerceArmOf(
+  vi: i32,
+  exprIx: i32,
+  fnIx: i32,
+): VariantCoerceArm {
+  const bareIx = unwrapParen(exprIx)
+  if bareIx < 0 { return "none" }
   const bare = nodeAt(bareIx)
   // A `never` call enters any variant, as it enters any union box (D14086).
-  if callIsNever(bareIx) { return emitExpr(bareIx, fnIx) }
-  if bare is IfStmt { return emitVariantIfValue(vi, bareIx, fnIx) }
-  if bare is ObjLit { return emitVariantStruct(bareIx, vi, fnIx) }
+  if callIsNever(bareIx) { return "never" }
+  if bare is IfStmt { return "if" }
+  if bare is ObjLit { return "objLit" }
   // Already the bare variant struct (a variant param/local/call/index): pass through.
-  if exprVariantIndex(exprIx, fnIx) >= 0 {
-    return emitVariantPassThrough(exprIx, fnIx)
-  }
+  if exprVariantIndex(exprIx, fnIx) >= 0 { return "pass" }
   // A union BOX (a narrowed receiver still boxed at the wasm level): unbox to the variant.
   if exprUnion(exprIx, fnIx) {
-    if variantHasCrossTagFits(vi, exprIx, fnIx) {
-      return emitFailCrossTagDelivery(exprIx, vi)
-    }
-    if emitExpr(exprIx, fnIx) < 0 { return -1 }
-    if vi < 0 { return -1 }
-    return narrowedVariantTail(vi)
+    if variantHasCrossTagFits(vi, exprIx, fnIx) { return "crossTag" }
+    return "unbox"
   }
-  return emitVariantPassThrough(exprIx, fnIx)
+  return "pass"
 }
 
 // A value already in the bare variant rep, delivered to a non-null variant destination. D1115 —
