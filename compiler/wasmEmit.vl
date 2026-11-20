@@ -37059,20 +37059,35 @@ export function globalReadRecovers(isid: i32, readIx: i32, fnIx: i32): boolean {
   return globalNameIsNonConstSid(isid) && vkIsNonNullRef(gck0)
 }
 
+// Which list override takes identifier read `exprIx` in place of its binding: a union-of-lists
+// arm's unboxed list (`luOv`), an `is K[]` arm's empty-list shadow (`fitShadow`), or none. Both
+// queries are pure reads of emit state, which lets `emitIdentNode` ask ahead of its null arms.
+export type IdentListOverride = "luOv" | "fitShadow" | "none"
+export function identListOverrideOf(
+  e: Ident,
+  exprIx: i32,
+  fnIx: i32,
+): IdentListOverride {
+  if luOvLocNodes.length > 0 && luOvLocalOf(exprIx) >= 0 { return "luOv" }
+  if listFitShadowRead(e.identName, exprIx, fnIx) >= 0 { return "fitShadow" }
+  return "none"
+}
+
 // the densest single-identifier site in the compiler: one identifier read resolves
 // through seven name-keyed lookups here, each otherwise a hash plus a string probe. The
 // arena index `_exprIx`, already threaded in and unused, turns the id lookup and the
 // other six into array reads.
 function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
   let arm = identReadArmOf(e, exprIx, fnIx, false)
+  const ovr = identListOverrideOf(e, exprIx, fnIx)
   // A read a union-of-lists arm overrides is that arm's unboxed list (D16897).
-  if luOvLocNodes.length > 0 {
-    const ovl = luOvLocalOf(exprIx)
-    if ovl >= 0 {
+  match ovr {
+    "luOv" => {
       if identListArmCheck(arm, exprIx, fnIx) < 0 { return -1 }
-      fbLocalGet(ovl)
+      fbLocalGet(luOvLocalOf(exprIx))
       return 0
     }
+    "fitShadow" | "none" => {}
   }
   // D1576 — a read of a never-filled `let x = null` is the value `null`, so it takes the
   // destination's null rep from the same table a bare `null` literal does.
@@ -37085,12 +37100,14 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
   }
   // An `is K[]` arm's read of an empty list of another element (D4911), ahead of the narrowed
   // unboxes, which would cast the receiver's own list to `K[]`.
-  const fitSh = listFitShadowRead(e.identName, exprIx, fnIx)
-  if fitSh >= 0 {
-    if identListArmCheck(arm, exprIx, fnIx) < 0 { return -1 }
-    fbLocalGet(fitSh)
-    fbRefAsNonNull()
-    return 0
+  match ovr {
+    "fitShadow" => {
+      if identListArmCheck(arm, exprIx, fnIx) < 0 { return -1 }
+      fbLocalGet(listFitShadowRead(e.identName, exprIx, fnIx))
+      fbRefAsNonNull()
+      return 0
+    }
+    "luOv" | "none" => {}
   }
   // …and a closure's read of its capture there, which reads an empty `K[]` of its own (D4935).
   listFitStoodIn = -1
