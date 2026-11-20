@@ -822,6 +822,10 @@ print(coal({ a: false, n: 0 }, null) + coal({ a: false, n: 0 }, 2))
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
       throw new Error(`want five covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // `n is A` over a local `U | null` box, a valued `if` joining an arm with `null`: the same box
 // legacy tests by its tag, `null` one more tag, read raw past the narrowing. Covered and matched.
 Deno.test({
