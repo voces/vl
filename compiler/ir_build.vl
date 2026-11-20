@@ -90,7 +90,7 @@ import {
   irSpanNoteKind,
   irVarNew,
 } from "./ir"
-import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
+import { irRhsBody, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { irTyHeldOpen, irTyOpen, irVerify, numKindOf } from "./ir_verify"
 import {
   irAstKind,
@@ -2870,14 +2870,22 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const kat = b.length
   const k = irBExpr(b, rd.idxIndex)
   if ibMiss != "" { return k }
-  // The default is written in the miss arm, so it may compute nothing ahead of the read.
-  const at = b.length
-  const dv: Opnd = if inline { irBExpr(b, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
+  // The default is written in the miss arm: one in place there, or a body that arm writes.
+  const db: i32[] = []
+  let dv: Opnd = if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
-  if !defaultSelfContained(b, at, dv) {
-    return irBMiss("map read default computes")
-  }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
+  const body: i32[] = []
+  if defaultSelfContained(db, 0, dv) {
+    for id in db { b.push(id) }
+  } else {
+    const ty = exprTyOf(ix)
+    if irTyOpen(ty) { return irBMiss("open temp type") }
+    const t = irVarNew(ib, rep, ty, "local", -1)
+    irBNode(db, { asDst: t, asSrc: dv }, -1, ibNoValue, n.binRight)
+    for id in db { body.push(id) }
+    dv = { ov: t }
+  }
   if mapRecvReassigned(b, kat, loc) {
     return irBMiss("map receiver reassigned")
   }
@@ -2890,6 +2898,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     mgAt: ix,
     mgForm: if mv { 2 } else if inline { 1 } else { 0 },
     mgDef: dv,
+    mgDefBody: body,
   }
   return irBLetTemp(b, r, ix, rep)
 }
@@ -2957,7 +2966,9 @@ function nodeAssigns(ni: i32, v: i32): boolean {
       }
       false
     }
-    SLet | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBr | SReturn | STrap | SDrop | SRawOp => false
+    SLet => bodyAssigns(irRhsBody(n.lRhs), v)
+    SEffect => bodyAssigns(irRhsBody(n.efRhs), v)
+    SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SBr | SReturn | STrap | SDrop | SRawOp => false
   }
 }
 
