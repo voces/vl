@@ -38,12 +38,13 @@ sends both to the string op, which writes each operand through `emitStrValue`.
 
 ## Grading
 
-All numbers are fixpoint seeds: merge-base c2f0a972f against the head. `split` is a scratch
-variant of the head that admits only the `+` parts.
+All numbers are fixpoint seeds: merge-base c2f0a972f against the head, 871f005ba. `+` only is a
+scratch variant that admits only the `+` parts. It was measured one commit earlier, so its self
+numbers are one function lower: `deliverStr` adds one to both sides.
 
 | first-miss / count | base | `+` only | head |
 |---|---|---|---|
-| self covered = matched | 18,618 | 18,649 | 18,659 |
+| self covered = matched | 18,619 | 18,649 + 1 | 18,660 |
 | self `atom compare` | 44 | 0 | 0 |
 | self `string operand coercion` | 12 | 13 | 1 |
 | corpus covered | 94,601 | 94,644 | 94,654 |
@@ -75,6 +76,6 @@ Matrices (`capability-matrix.vl`; each runs 64/64 under both seeds):
 | `ir-identity --names` | identical 9,037, differ 0; self-compile identical |
 | `ir-identity --cases` | identical 7,528, differ 0; witnesses 59/59 |
 | master-vs-head tests/cases A/B | 7,596 programs, 7,528 built, differ 0 |
-| mode 3 | identical; 18,659 claimed (master 18,619) |
-| L2 fuel | 103,595,403,081 (+0.3% on baseline; master's run in the same box +0.2%) |
+| mode 3 | identical; 18,660 claimed (master 18,619) |
+| L2 fuel | 103,595,522,036 (+0.3% on baseline; master's run in the same box +0.2%) |
 | plumb-shape cost | ok |
