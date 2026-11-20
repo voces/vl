@@ -147,6 +147,7 @@ import {
   keptDeclStoresNothing,
   legacyContextLiveWhy,
   letIfInitPerArmRep,
+  listOpRecvHeldPlan,
   lowMemFoldsCallee,
   mapFilterWhy,
   mapGetOrArmOf,
@@ -267,6 +268,7 @@ import {
   fnEnvIdxOf,
   nodeTyAt,
   numLitWidth,
+  readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
@@ -295,11 +297,12 @@ import {
   forInElemTyOf,
   forInMapRecv,
   globalCellKind,
+  identIsEnvCapture,
   localIndexOf,
   nulLitAtomTexts,
   sFieldStoreKind,
 } from "./emit_classify"
-import { declaredSlotOfDecl } from "./emit_struct_order"
+import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
 import {
   callSpillsFcpArg,
   elseLessNullableTail,
@@ -2102,6 +2105,25 @@ function clearStmt(b: i32[], c: Call, ix: i32) {
   return 0
 }
 
+// Whether push receiver `recvIx` is a list held in its own local, so no input of
+// `listOpRecvHeldPlan` it reaches is emit-time state: a declared local or parameter excludes the
+// scope stack and a lifted closure's write slots, an unnarrowed read the fit regions and the
+// narrowed union, and an uncaptured one the capture stand-in.
+function pushRecvHeldAtRest(recvIx: i32): boolean {
+  const n = nodeAt(recvIx)
+  if !(n is Ident) || identDeclOf(recvIx) < 0 { return false }
+  if declaredSlotOf(recvIx) < 0 && paramIndexOf(ibFnIx, n.identName) < 0 {
+    return false
+  }
+  if (
+    readNarrowedTyAt(recvIx, ibFnIx) >= 0
+    || identIsEnvCapture(ibFnIx, n.identName)
+  ) {
+    return false
+  }
+  return listOpRecvHeldPlan(recvIx, ibFnIx, ".push") >= 0
+}
+
 // A one-argument `.push` legacy writes as the plain append (`pushPlainWhy`): its receiver, then
 // its value at the list's element rep.
 function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -2126,8 +2148,12 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const x = deliver(b, c.callArgs[0], er)
   if ibMiss != "" { return missRhs("method operand") }
-  // The receiver is written at its use, above a valued `if` the value wrote ahead of the node.
-  if ifBelowLead(b, at, "push short-circuit operand") {
+  // A staged receiver is written at its use, above a valued `if` the value wrote ahead of the
+  // node. A receiver held in its own local is read by index after the value, as legacy reads it.
+  if (
+    !pushRecvHeldAtRest(pp.ppRecv)
+    && ifBelowLead(b, at, "push short-circuit operand")
+  ) {
     return missRhs("push short-circuit operand")
   }
   if irBOpRep(x) != er { return missRhs("push operand coercion") }
