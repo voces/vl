@@ -52,10 +52,12 @@ import {
   condLitTrue,
   i32ToStr,
   nodeAt,
+  nodeChildren,
 } from "./ast"
 import { unwrapParen } from "./emit_base"
 import { relTrim } from "./emit_reloc"
 import {
+  declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
   readOwesNonNullRecover,
@@ -257,6 +259,8 @@ import {
   idxRowsOn,
   idxSpanOn,
   initBitOf,
+  listBuildClose,
+  listReserveOpen,
   loopHoistCands,
   loopHoistClose,
   mapGetHelperFnOf,
@@ -725,7 +729,7 @@ let lwPushing = false
 
 // A helper's raw instruction that yields nothing; `array.copy`'s source heap is its `srImm`. Its
 // pushed operands, if any, are its leading ones, in push order.
-function rawEff(n: SRawOp, pending: i32[]) {
+function rawEff(n: SRawOp, pending: i32[], at: i32) {
   lwSeq = []
   let k = 0
   const queued = lwPushed.length
@@ -750,8 +754,45 @@ function rawEff(n: SRawOp, pending: i32[]) {
     "array.init_data" => fbArrayInitData(h, n.srImm)
     "array.fill" => fbArrayFill(h)
     "call" => fbCall(n.srImm)
+    "reserve.open" => reserveOpen(n, at)
+    "reserve.close" => listBuildClose(n.srImm)
   }
   return 0
+}
+
+// `reserve.open` after `let` `at` (statement `srHeap` of its block) stored variable `srImm`:
+// legacy's reserve, over the statements that follow it.
+function reserveOpen(n: SRawOp, at: i32) {
+  const s = nodeAt(at)
+  if !(s is LetDecl) { return irLMiss("reserve node") }
+  const fnIx = lw.irAt
+  if fnIx < 0 || fnIx >= P.nodes.length { return irLMiss("reserve body") }
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return irLMiss("reserve body") }
+  const sibs = stmtsHolding(fn.fnBody, at, n.srHeap)
+  if sibs.length == 0 { return irLMiss("reserve block") }
+  // The frame's slot for the `let`, the key legacy's `emitLetDecl` passes.
+  const slot = declaredSlotOfDecl(at)
+  if slot < 0 { return irLMiss("reserve slot") }
+  const idx = varSlot(n.srImm)
+  if idx < 0 || idx != declaredIndexAt(fnIx, slot) {
+    return irLMiss("reserve slot")
+  }
+  return listReserveOpen(s, sibs, n.srHeap, idx, slot, fnIx)
+}
+
+// The statement list under `root` whose statement `pos` is `ix`, or none.
+function stmtsHolding(root: i32, ix: i32, pos: i32): i32[] {
+  if root < 0 { return [] }
+  const n = nodeAt(root)
+  if n is Block && pos < n.blkStmts.length && n.blkStmts[pos] == ix {
+    return n.blkStmts
+  }
+  for k in nodeChildren(root) {
+    const got = stmtsHolding(k, ix, pos)
+    if got.length > 0 { return got }
+  }
+  return []
 }
 
 // `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row.
@@ -1599,7 +1640,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       ret(n, pending)
     }
-    SRawOp => rawEff(n, pending)
+    SRawOp => rawEff(n, pending, lw.irNodeAt[id])
     STrap => {
       irLSettle(pending)
       fbUnreachable()
