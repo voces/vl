@@ -19,10 +19,29 @@ its decisions are unchanged. `memberBoxReadAt` asks `boxedArmOfMember` before th
 delivery's plan is asked early: asking it of every delivery moved an unrelated module's rows,
 a side effect of the plan filed as D17030.
 
+A seat, not a pure decision: a public `boxedArmOfMember` answering -1 wherever `memberBoxReadAt`
+holds would ask the plan, and the plan's own rungs (`exprUnion`, `structIndexOfMemberStore`,
+`boxedFieldUnionTyOf`) ask the public predicate back of the same node. Breaking that needs a guard
+or a raw twin threaded through every plan reader, and it would ask the plan at every field read,
+D17030 at its widest.
+
 The arm shares the field's box where `rec` built a fresh one. That is unobservable while no writer
 mutates a union box in place: no `fbStructSet` in `compiler/*.vl`, and no IR `struct.set` effect,
 names `uBoxIdx`.
 
 ## Readings
 
-To fill at the merge-base fixpoint.
+To fill at the merge-base fixpoint. A representative moved hunk, the argument position of
+`tests/cases/narrowing/narrowed-field-record-delivered-to-its-union.vl` (same output):
+
+    -      (struct.new $11
+    -       (i32.const 0)
+    -       (ref.cast (ref $1)
+    -        (struct.get $11 1
+    -         (struct.get $6 0
+    -          (local.get $0)
+    -         )
+    -        )
+    -       )
+    +      (struct.get $6 0
+    +       (local.get $0)
