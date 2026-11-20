@@ -22,7 +22,11 @@ only on `null`. The same core serves the `coll` and `clo` niche arms.
   collection wrapper at the `coll` niche arm, the closure struct at `clo`, the nullable reference's
   own heap past the boxed arms (`identBox`), and -1 for the niche arms with their own lowerings.
   Past the boxed arms it reads `nulNicheValueHeap`, the box stash's heap function, now the one
-  copy (a variant index past `uVarRow` falls through to the struct check, as the `??` rung did).
+  copy. **A deliberate legacy change:** a variant index past `uVarRow` now falls through to the
+  struct check, as the `??` rung did, where `emitUnionBoxNulNiche` answered -1. Such an index
+  cannot arise: `mAssignUnionHeaps` fills `uVarRow` with one row per variant before emit, so an
+  index past it would be a checker/emit desync. The per-file `tests/cases` A/B at differ 0 shows
+  the edge unreached on that corpus.
   Legacy's three sites read it (the `coll` and `clo` arms and `emitCoalesceNullableRefs`); the IR
   reads the same function. A `?.` chain's closure or map leaf stays its own decision: its heap is
   the field leaf's, not the operand's.
