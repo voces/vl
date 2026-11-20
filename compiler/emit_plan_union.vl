@@ -346,6 +346,7 @@ import {
   mapExactHeldTyOf,
   mapReadScalarBoxKind,
   memReadBoxAmbiguous,
+  unionArmVariantForObj,
 } from "./emit_value_sites"
 import {
   crossTagFitRows,
@@ -1926,16 +1927,17 @@ export function coerceListAtomOf(
   return cak
 }
 
-// How a value is boxed into its recorded box: the null tag (`null`), a box as itself (`pass`), a
-// value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal
-// at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), a record as
-// itself under arm `hbKind`'s tag (`rec`), or the box writer's own ladder (`ladder`).
+// How a value is boxed: the null tag (`null`), a box as itself (`pass`), a value-atom box of kind
+// `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal (`lit`), a `K | null`
+// atom as its member string (`atomStr`), a record under arm `hbKind`'s tag (`rec`), an object
+// literal built as that arm (`obj`), or the box writer's own ladder (`ladder`).
 export type HoleBoxArm = "null"
   | "pass"
   | "atom"
   | "lit"
   | "atomStr"
   | "rec"
+  | "obj"
   | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
@@ -1972,6 +1974,17 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   ) {
     const rv = armValuePlainOf(unionTy, exprIx, fnIx)
     if rv >= 0 { return holeBox("rec", rv, -1) }
+  }
+  // `emitUnionCoerceRecord`'s literal rung: an object literal built as the arm the union's
+  // context picks for it (`emitUnionBoxAs`).
+  // Reached only where `emitUnionArmValueBox` declines: a literal with no variant of its own.
+  if (
+    bare is ObjLit
+    && exprVariantIndex(exprIx, fnIx) < 0
+    && !tyBearsNull(nodeTyAt(bareIx, fnIx))
+  ) {
+    const cv = unionArmVariantForObj(unionTy, bareIx, fnIx)
+    if cv >= 0 && cv < uTags.length { return holeBox("obj", cv, -1) }
   }
   // Every rung below takes a value the record, niche and map rungs above it decline.
   if (
@@ -3090,9 +3103,11 @@ function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   if m.memProp == "length" && !lengthIsField(m, memIx, fnIx) { return false }
   if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
-  // A field read's receiver recovers in its own read; any other receiver owing one is not plain.
+  // A field read's or a name's receiver recovers in its own read (`emitReadRecover`); any other
+  // receiver owing one is not plain.
+  const o = nodeAt(m.memObj)
   return twoListUseMsg(m.memObj, m.memProp, fnIx) == ""
-    && (nodeAt(m.memObj) is Member || !readOwesNonNullRecover(m.memObj, fnIx))
+    && (o is Member || o is Ident || !readOwesNonNullRecover(m.memObj, fnIx))
 }
 
 // Whether `.length` read `m` at `memIx` is a record's own field, which `emitMemberNode` reads as
@@ -3129,15 +3144,24 @@ function fieldStoresRead(row: i32, memIx: i32, fnIx: i32): boolean {
   return vkNonNullRefTwin(sk) == rk && readOwesNonNullRecover(memIx, fnIx)
 }
 
+// Whether struct field read `memIx` recovers its receiver to its non-null ref before the field:
+// a nullable struct the checker proved guarded, whose read did not already recover it.
+export function memRecvOwesNonNull(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  return exprNullableStruct(m.memObj, fnIx)
+    && !readOwesNonNullRecover(m.memObj, fnIx)
+}
+
 // The field `emitExpr` reads off a plain struct receiver in `emitMemStructRead`'s plain form, or
-// -1: a plain member read of no variant, union or nullable struct, with no narrowing op and no
-// union-box field.
+// -1: a plain member read of no variant or union, with no narrowing op and no union-box field. A
+// nullable struct receiver recovers first (`memRecvOwesNonNull`).
 export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) || !sDeclared { return -1 }
   const o = m.memObj
   if memReadArmOf(memIx, fnIx) != "shared" || exprUnion(o, fnIx) { return -1 }
-  if nodeTyAt(o, fnIx) == TY_NEVER || exprNullableStruct(o, fnIx) { return -1 }
+  if nodeTyAt(o, fnIx) == TY_NEVER { return -1 }
   const si = structIndexOfExpr(o, fnIx)
   if si < 0 || si >= sHeapIdx.length { return -1 }
   const idx = sFieldIndex(si, m.memProp)
