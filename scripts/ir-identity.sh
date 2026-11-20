@@ -14,8 +14,9 @@
 # scripts/capability-probes program, under both, comparing the wasm and the exit code, and for a
 # program that fails under both, its first diagnostic line: a claim that turns a legacy refusal
 # into a build, or into another refusal, reds. It prints `cases: identical N, fail under both N,
-# differ N` and each that differs. It then builds every `@error` program under both, comparing
-# the exit code and the first diagnostic line, and prints `errors: same N, differ N`.
+# differ N` and each that differs. It then builds every filed inventory witness whose outcome is
+# an emit reject (`scripts/inventory/witnesses.vl`) under both, comparing the exit code and the
+# first diagnostic line, and prints `witnesses: same N, differ N`.
 # `--compare` and `--compare-errors` are those two comparisons alone, over builds `build_all`
 # left in two dirs (each file's `.rc`, `.err` and, built, `.wasm`).
 # Either exits 1 on any difference. Run from the checkout root; $VL names the host, $JOBS the
@@ -39,7 +40,7 @@ build_all() {
     rc=0
     VL_COMPILER_WASM=$2 timeout 60 "$VL" build "$1" -o "$3/$k.wasm" $FLAGS > /dev/null 2> "$3/$k.log" || rc=$?
     echo "$rc" > "$3/$k.rc"
-    first_error "$3/$k.log" > "$3/$k.err"
+    if [ "$rc" -eq 0 ]; then : > "$3/$k.err"; else first_error "$3/$k.log" > "$3/$k.err"; fi
     rm -f "$3/$k.log"
     [ "$rc" -eq 0 ] || rm -f "$3/$k.wasm"
   ' _ {} "$2" "$3" < "$1"
@@ -62,13 +63,14 @@ compare_all() {
 }
 
 # Compares the refusals of the files listed in $1 under dirs $2 and $3: the exit code and the
-# first diagnostic line; prints each that differs.
+# first diagnostic line, or the wasm when both build; prints each that differs.
 compare_errors() {
   esame=0; ediff=0
   while read -r f; do
     k=$(printf "%s" "$f" | tr "/" "_")
     ra=$(cat "$2/$k.rc"); rb=$(cat "$3/$k.rc")
     if [ "$ra" != "$rb" ]; then ediff=$((ediff + 1)); echo "DIFF $f (exit $ra vs $rb)"
+    elif [ "$ra" = 0 ] && ! cmp -s "$2/$k.wasm" "$3/$k.wasm"; then ediff=$((ediff + 1)); echo "DIFF $f"
     elif ! cmp -s "$2/$k.err" "$3/$k.err"; then
       ediff=$((ediff + 1)); echo "DIFF $f (first error: $(cat "$2/$k.err") vs $(cat "$3/$k.err"))"
     else esame=$((esame + 1)); fi
@@ -106,11 +108,11 @@ if [ "${1:-}" = "--cases" ]; then
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
   echo "cases: identical $same, fail under both $both, differ $diff"
-  grep -rl '^// @error' --include='*.vl' tests/cases | sort > "$T/errs"
+  "$VL" run scripts/inventory/witnesses.vl --compiler "$SEED" -- --outcome emit_reject --out "$T/w" > "$T/errs"
   build_all "$T/errs" "$SEED" "$T/ea"
   build_all "$T/errs" "$T/claimless.wasm" "$T/eb"
   compare_errors "$T/errs" "$T/ea" "$T/eb"
-  echo "errors: same $esame, differ $ediff"
+  echo "witnesses: same $esame, differ $ediff"
   [ "$diff" -eq 0 ] && [ "$ediff" -eq 0 ]
   exit
 fi

@@ -71,28 +71,37 @@ Deno.test("ir-identity --compare: a refusal the claims seed turns into another r
   }
 });
 
+// Two filed emit-reject witnesses legacy refuses, and one that builds today.
 const ERRORS: Record<string, Build> = {
   "t/e1.vl": { rc: 1, err: "t/e1.vl:2:3: undeclared identifier 'x'" },
   "t/e2.vl": { rc: 1, err: REFUSAL },
+  "t/e3.vl": { rc: 0, wasm: "bytes" },
 };
 
 Deno.test("ir-identity --compare-errors: the same refusals pass", () => {
   const r = compare("--compare-errors", ERRORS, ERRORS);
-  if (r.code !== 0 || !r.text.includes("errors: same 2, differ 0")) {
+  if (r.code !== 0 || !r.text.includes("errors: same 3, differ 0")) {
     throw new Error(`want a pass, got exit ${r.code}:\n${r.text}`);
   }
 });
 
-Deno.test("ir-identity --compare-errors: an @error program the claims seed builds reds", () => {
+Deno.test("ir-identity --compare-errors: a witness the claims seed builds reds", () => {
   const r = compare("--compare-errors", { ...ERRORS, "t/e2.vl": { rc: 0 } }, ERRORS);
   if (r.code !== 1 || !r.text.includes("DIFF t/e2.vl (exit 0 vs 1)")) {
     throw new Error(`want t/e2.vl to red on its exit code, got exit ${r.code}:\n${r.text}`);
   }
 });
 
-Deno.test("ir-identity --compare-errors: an @error program refused for another reason reds", () => {
+Deno.test("ir-identity --compare-errors: a witness refused for another reason reds", () => {
   const r = compare("--compare-errors", { ...ERRORS, "t/e1.vl": { rc: 1, err: "t/e1.vl:9:9: other" } }, ERRORS);
   if (r.code !== 1 || !r.text.includes("DIFF t/e1.vl (first error:")) {
     throw new Error(`want t/e1.vl to red on its first error, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test("ir-identity --compare-errors: a witness both seeds build to other bytes reds", () => {
+  const r = compare("--compare-errors", { ...ERRORS, "t/e3.vl": { rc: 0, wasm: "other" } }, ERRORS);
+  if (r.code !== 1 || !r.text.includes("DIFF t/e3.vl\n")) {
+    throw new Error(`want t/e3.vl to red on its bytes, got exit ${r.code}:\n${r.text}`);
   }
 });

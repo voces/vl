@@ -1,36 +1,36 @@
 # The claims gate compares refusals (2026-11-20, lane IR4)
 
 IR-REV's refusal-bypass census found that `ir-identity.sh --cases` could not see one class
-([D17006](../inventory/D17006.md)'s): a legacy refusal that a claim turns into a build.
+([D17006](../inventory/D17006.md)'s): a legacy refusal that a claim turns into a build. Such a
+refusal is filed as an inventory witness, not as a tests/cases program, so `--cases` never built
+it.
 
 ## What `--cases` compares now
 
 - **A program that fails under both seeds** used to count as `fail under both` on its exit code
   alone. Its first diagnostic line (`path:line:col: message`, else the log's first line) is now
-  compared as well. This costs no extra build.
-- **Every `@error` program in tests/cases** (1,327) is now built under both seeds. Each is
-  compared on its exit code and first diagnostic line (`errors: same N, differ N`).
+  compared too, at no extra build. Today 68 programs fail under both, and several are emit
+  refusals (`emitProgram: …`).
+- **Every filed witness whose outcome is an emit reject** (59 today) is now built under both
+  seeds. `scripts/inventory/witnesses.vl` writes the witnesses out, reading the same row grammar
+  as `ls.vl --status`. Each is compared on its exit code and its first diagnostic line, or on its
+  wasm when both seeds build it (`witnesses: same N, differ N`). Of the 59, 56 are emit refusals
+  today and 3 build (D15155, D15157, D15158).
 - The two-seed mode (`<seed-a> <seed-b>`) still compares exit codes only. There a PR may reword
   a refusal on purpose.
 
-## Where the guard has a population
+## Not taken: the `@error` cases
 
-- **The fail-under-both rows (68 today).** Several are emit refusals (`emitProgram: …`, for
-  example `a generic function taken as a value reaches no call that fixes its …`). This is where
-  a claim can change a refusal.
-- **The `@error` programs.** Every one of the 1,327 is refused by the checker: 0 pass
-  `vl check`. A claim acts only at emit, so on today's tree this leg guards a population that
-  claims cannot reach. It costs +1 min 28 s wall at `JOBS=4` (`--cases` went from 3 min 33 s to
-  5 min 0 s, and CPU rose by about 4 min). It earns its place only if an emit-stage `@error`
-  case is added.
-- **D17006's own repro** is an inventory row, not a tests/cases program, so `--cases` still does
-  not build it.
+An earlier version of this PR also built the 1,327 `@error` tests/cases under both seeds. The
+checker refuses every one of them: 0 pass `vl check`. A claim acts only at emit, so it cannot
+reach them. That leg cost +1 min 28 s wall and guarded nothing, so it was dropped.
 
 ## Measured
 
 | | result |
 |---|---|
-| `--cases` on master 585f51b42 | `cases: identical 7516, fail under both 68, differ 0`; `errors: same 1327, differ 0` |
-| control (`tests/vl_ir_identity_compare_test.ts`) | an injected bypass reds under `--compare` and `--compare-errors`, both a refusal that builds and a refusal that changes; the untouched builds pass |
+| `--cases` on master 585f51b42 | `cases: identical 7516, fail under both 68, differ 0`; `witnesses: same 59, differ 0` |
+| cost | 3 min 36 s → 3 min 45 s wall at `JOBS=4`, back to back |
+| control (`tests/vl_ir_identity_compare_test.ts`) | Injected bypasses red under `--compare` and `--compare-errors`: a refusal that builds, a refusal that changes, and a built witness whose bytes change. The untouched builds pass. |
 
-**Lines: scripts +55 / −5, tests +98.**
+**Lines: scripts +153 / −5, tests +107.**
