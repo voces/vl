@@ -19,17 +19,26 @@ function as its tagged set's `i32` id. The container's rep is therefore closed.
 
 ## The change
 
-- `tyOpenOutsideFns(ty, depth)` (`emit_classify.vl`, which already imports the type accessors):
-  whether a type variable occurs anywhere but under a function type. A cycle deeper than `depth`
-  answers true.
+- `tyOpenOutsideFns(ty, path)` (`emit_classify.vl`, which already imports the type accessors):
+  whether a type variable occurs anywhere but under a function type. The walk ends by its path;
+  a revisit is a cycle and adds nothing.
 - `irTyHeldOpen(ty, rep)` (`ir_verify.vl`), the one rule-1 test the builder and the verifier read:
   - a function type keeps its rule (held at `i32`);
   - any other open type is held only when no type variable sits outside a function type, and its
-    rep holds no closure (`repHoldsClosure`, over `repNodeKids`).
+    rep holds no closure (`repHoldsClosure`, over `repNodeKids`, also ending by its path).
   A closure-rep function stays STORE's, as agreed.
+- **`retRefusedWhy(retArg, fnIx)`** (`wasmEmit.vl`): the grade found D17006 moving from a loud
+  emit reject to silent invalid wasm.
+  - Its function, now held open, was claimed, and under the claim legacy's return refusals never
+    run.
+  - The three refusals in `emitReturnValue` are now one decision, which legacy raises with the
+    same messages: a `null` into a non-null record, a `.map` building another list, and a
+    container of functions at another storage.
+  - The IR's three return sites miss on it (`return refused`), so legacy refuses loudly again.
+- `tests/vl_ir_shadow_test.ts`: the d15117 witness builds and every function matches.
 
-Compiler lines: +43 −3, 40 net (`emit_classify.vl` +29, `ir_verify.vl` +11), about 6.7 corpus
-functions per net line.
+Compiler lines: +88 −31, 57 net (`emit_classify.vl` +36, `ir_verify.vl` +17, `ir_build.vl` +6,
+`wasmEmit.vl` −2, the refusals folded into one), about 4.7 corpus functions per net line.
 
 ## Readings (fixpoint seeds, master `7a7482cef` against this change)
 
