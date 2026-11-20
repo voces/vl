@@ -25,6 +25,16 @@ receiver is a `boxedArmOfMember` read, its own tail has already cast it, and the
 record. It now skips that unbox for such a receiver (the D17025 shape: the writer honours the
 shared decision). A variant global's store ran before only because D17028 named nothing there.
 
+## What the IR saw
+
+The IR never covered D17029's stores: `fieldStore` takes `narrowVariant` only where
+`narrowedBoxVariantPlain` names the receiver's variant, which it does not for a member receiver.
+D17028's deliveries it did cover: on #9255's seed the armed shadow matched none of the two
+functions that deliver a variant global's narrowed field at `B` (`inFn`, `early` in the case file),
+legacy being the invalid side, and matches all four here. No corpus cell reaches the shape, so the
+corpus shadow saw a divergence only these hand cases reach; the matrix is the witness for a
+shared-decision change.
+
 ## The one known byte movement
 
 A narrowed variant-global field delivered to its own union (`showU(z.h)`, `showU(h: A | B)`) used
