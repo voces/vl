@@ -330,6 +330,9 @@ import {
   nulTestArmOf,
 } from "./emit_plan_null"
 import { arrLitRefPlainSlot } from "./emit_plan_list"
+import { fbOpenIf } from "./emit_bytes"
+import { fbRefIfOpenType, ifRefJoinOf, noRefJoin } from "./wasmEmit"
+import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
@@ -1645,7 +1648,7 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   if id < 0 || id >= lw.irNodes.length { return IF_NOT }
   const n = lw.irNodes[id]
   if !(n is SIf) { return IF_NOT }
-  if n.siOut >= 0 { return valuedIfOpen(n, pending) }
+  if n.siOut >= 0 { return valuedIfOpen(id, n, pending) }
   const exitBr = n.siThen.length == 0
     && n.siElse.length == 1
     && isBr(n.siElse[0])
@@ -1702,7 +1705,7 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
 
 // An `if` whose arms each end by writing its slotless out: a value-typed `if` (legacy's `&&` and
 // `||`), whose result stays on the stack for the out's one later read.
-function valuedIfOpen(n: SIf, pending: i32[]): i32 {
+function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   const t = n.siOut
   if varSlot(t) >= 0 {
     irLMiss("valued if into a slot")
@@ -1716,9 +1719,15 @@ function valuedIfOpen(n: SIf, pending: i32[]): i32 {
   // A helper's `if` may yield a raw reference, as its hand-written body's did.
   const rr = repNodeAt(lw.irVars[t].vRep)
   const refOut = lw.irHelper && rr is RRaw
-  // A string out is a tag dispatch's, the only string-valued `if` the builder makes.
+  // A reference join takes legacy's blocktype for the `if` at its node (`emitIfExprRef`).
+  const at = lw.irNodeAt[id] ?? -1
+  // A string out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
   const strOut = repPrim(lw.irVars[t].vRep) == "str"
-  if vt < 0 && !refOut && !strOut {
+    && at >= 0
+    && nodeAt(unwrapParen(at)) is Call
+  const rj = if vt < 0 && !refOut && !strOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
+  const rk = rj.rjKind
+  if vt < 0 && !refOut && !strOut && rk == null {
     irLMiss("valued if rep")
     return IF_DONE
   }
@@ -1727,6 +1736,9 @@ function valuedIfOpen(n: SIf, pending: i32[]): i32 {
     fbIfRefNul(rr.rwHeap, rr.rwNull)
   } else if strOut {
     if tagDispatchIfOf(lw.irVars[t].vTy) < 0 { irLMiss("valued if rep") }
+  } else if rk != null {
+    fbOpenIf()
+    fbRefIfOpenType(rk, rj.rjSlot, ifLinkYieldsNull(at, lw.irAt))
   } else {
     fbIf(vt)
   }
