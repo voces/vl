@@ -169,5 +169,19 @@ print(f(xs))
     if ((r.get("uncovered push receiver payload cast") ?? 0) < 1) {
       throw new Error(`want the push receiver's payload cast to miss, got ${JSON.stringify([...r])}`);
     }
+    // An element narrowed to a list arm: today the `is` rung misses first; once it lands, the
+    // element's own atom unbox (`idxNarrowAtomKind`) must still make the push legacy's.
+    const el = rows(`function g(xs: (i32[] | string)[]): i32 {
+  if xs[0] is i32[] {
+    xs[0].push(1)
+  }
+  return 0
+}
+print(g([[3], "s"]))
+`);
+    const why = ["uncovered is rung", "uncovered push receiver payload cast"].filter((k) => el.has(k));
+    if (why.length < 1 || el.has("matched")) {
+      throw new Error(`want the narrowed element's push left to legacy, got ${JSON.stringify([...el])}`);
+    }
   },
 });
