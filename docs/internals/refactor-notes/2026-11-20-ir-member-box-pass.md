@@ -43,6 +43,9 @@ Both seeds fixpoints, master at merge-base `056fd4af8`:
 | a loop of 20M deliveries `showU(q.h)` (wall) | ~0.35 s | ~0.07 s |
 | matrices (struct, variant, nullable receivers) | 84 / 84 each | 84 / 84 each, 0 runs → not-runs |
 
+Against #9270 (master `c2f0a972f`), whose field-site guard asks the same plan: measured inert.
+No new IR field-site miss (`--blockers` identical), and the same 3 cases move, nothing else.
+
 A representative moved hunk, the argument position of
 `tests/cases/narrowing/narrowed-field-record-delivered-to-its-union.vl` (same output):
 
