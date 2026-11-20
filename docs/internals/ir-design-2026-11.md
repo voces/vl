@@ -980,6 +980,45 @@ Each step carries:
 - a **firing control** per kept one: a root-held fragment, and a staged receiver inside the
   fragment, still miss until their parameter lands.
 
+### 10.3 What deletes before I8, and what I8 needs (2026-11-20)
+
+The door and claiming make the IR the primary path for a construct long before it is the only one.
+Legacy is then the fallback for every miss. Deleting a legacy emitter removes that fallback, so
+every miss it covered becomes a refusal: a clause-2 violation, whatever the corpus coverage was.
+
+**The rule.** A legacy emitter deletes before I8 only if no miss can reach it once it is gone:
+- **Leaf tails, op ladders and decisions may delete early.** These write bytes from values, or
+  decide without writing, and never emit a subexpression (role `value` or `decide` in
+  `scripts/ir-driver-census.sh`). Deleting one requires every legacy caller to route through the
+  shared arm (§10's two seams) and the driver census to show it unhit with claiming on. §5.2's
+  deletion rule applies unchanged.
+- **An emitter whose operands are arbitrary expressions deletes only at I8.** It calls `emitExpr`
+  (or kin) on a child expression, which is role `ast` in the census: `emitArrF32`, `emitIfExpr`,
+  `emitPush` and the like. The IR handles the construct only as far as `irBExpr` handles each
+  operand, and no operand-kind probe set proves that total. Before I8 such an emitter is collapsed,
+  not deleted: its decisions become the shared plan, its bytes the shared tails, and what remains
+  is the operand loop plus the tail call. That removes the duplication without the refusal risk.
+- **No escape node delegates an operand back to legacy inside an IR function.** Legacy's operand
+  emission reads ambient context (seats, element seeds, cursors, fit regions) that the lowering
+  would have to recreate. §10.1(a) is removing the existing re-entries; none is added.
+
+**I8's cutover precondition.** I8 deletes the expression emitter, so after it a miss anywhere is a
+refusal. It needs zero misses, measured on fixpoint seeds:
+- **every function claimed:** the self-compile at 100%, and distilled `cells/` plus `named/` at
+  100%, with `claim fell back` at 0 (`ir-shadow.vl -- --claims`);
+- **the same on the programs the corpus leaves out:** every `tests/cases` program, every capability
+  probe and every inventory witness filed `runs` builds with claiming on and none unclaimed. The
+  blocker census (`$VL_IR_SHADOW=4`, `ir-driver-census.sh`) lists no first-miss class on any of them;
+- **every remaining builder miss is unreachable or owed by the design:** each `irBMiss` and
+  `irLMiss` message left in the tree carries a probe showing the checker refuses its program
+  first, or names a design refusal (§6). A miss that only the corpus fails to reach does not
+  pass;
+- **refusals unchanged:** `ir-identity.sh --cases` builds the filed `emit_reject` witnesses under
+  both seeds, and the delta is 0.
+
+So the target is 100% on every population, not a corpus percentage. A per-construct share below
+that is a coverage reading, and it does not license any `ast`-role deletion.
+
 ## A. Commands
 
 Run from the checkout root, with `PATH=$PWD/scripts/vl-host/target/release:$PATH`.
