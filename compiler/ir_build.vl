@@ -120,6 +120,8 @@ import {
   cloLiftCalleeOf,
   closureValueWhy,
   coalClosedWidensAtom,
+  coalFieldAtomOf,
+  coalFieldPlanOf,
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
@@ -225,9 +227,11 @@ import {
   NULL_OWN_BOX,
   NULL_OWN_NONE,
   NULL_OWN_STR,
+  CoalValArm,
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
+  coalKeepsBox,
   coalNicheArmOf,
   coalNulRefArmOf,
   coalResultKindOf,
@@ -2798,6 +2802,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // re-reads its box, so its operand is a plain variable; a stashed one is a call.
 function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const arm = coalBoxArmOf(n, lhsIx, ix, ibFnIx)
+  if arm == "next" { return coalField(b, n, lhsIx, ix, rep) }
   const built = match arm {
     "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => true
     "boolPop" | "valNoKind" | "callNoKind" | "next" => false
@@ -2826,6 +2831,42 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return d }
   if irBOpRep(d) != rep { return irBMiss("coalesce box default rep") }
   irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `o.v ?? d` over a value-union record field (legacy's `emitCoalesceUnionField`): the receiver,
+// then the shared `if` on the field's box, the default built into its null arm so it runs only
+// there. The present arm re-reads the receiver, so it is a plain variable.
+function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  const p = coalFieldPlanOf(lhsIx, ibFnIx)
+  if p == null { return irBMiss("coalesce box next") }
+  if coalFieldAtomOf(p, lhsIx, ibFnIx) < 0 { return irBMiss("coalesce field atom") }
+  const keep = coalKeepsBox(n, ix, ibFnIx)
+  if keep != heldAsBox(rep) { return irBMiss("coalesce field result rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
+  const l = irBExpr(b, p.cfRecv)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 || ib.irVars[l.ov].vKind == "temp" {
+    return irBMiss("coalesce field receiver place")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce field default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = if keep { "fieldBox" } else { "fieldScalar" }
   irBNode(
     b,
     { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix },

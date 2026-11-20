@@ -229,6 +229,11 @@ import {
   coalBoxEnd,
   coalBoxOpen,
   coalBoxSlot,
+  coalFieldAtomOf,
+  coalFieldOpen,
+  coalFieldPlanOf,
+  coalFieldPresent,
+  coalFieldResultKind,
   coalNulRefBranch,
   coalNulRefOpen,
   emitClosureValue,
@@ -2016,7 +2021,17 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba == null { coalPopOr(n, e, pending) } else { coalBoxArm(n, ba, e, pending) }
+  const got = if ba != null {
+    coalBoxArm(n, ba, e, pending)
+  } else {
+    match n.cbArm {
+      "popOr" => coalPopOr(n, e, pending)
+      "fieldBox" | "fieldScalar" => coalField(n, e, pending)
+      "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
+        irLMiss("coalesce box arm")
+      }
+    }
+  }
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
@@ -2070,6 +2085,31 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut)
   lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// A value-union record field's `??`: the receiver, the shared open on its box, the default writing
+// the slotless out, the else, the receiver re-read for the box kept or its atom, and the end.
+function coalField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const fnIx = lw.irAt
+  const lhsIx = unwrapParen(e.binLeft)
+  const p = coalFieldPlanOf(lhsIx, fnIx)
+  if p == null { return irLMiss("coalesce field plan") }
+  const ak = coalFieldAtomOf(p, lhsIx, fnIx)
+  if ak < 0 { return irLMiss("coalesce field atom") }
+  const rk = match n.cbArm {
+    "fieldScalar" => coalFieldResultKind(ak, n.cbAt, fnIx)
+    "fieldBox" | "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" => -1
+  }
+  cond(n.cbL, pending)
+  coalFieldOpen(p, rk)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut)
+  fbElse()
+  irLOpnd(n.cbL)
+  lwFrames.pop()
+  if coalFieldPresent(p, ak, rk) < 0 { return -1 }
   fbEnd()
   return 0
 }

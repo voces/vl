@@ -758,6 +758,37 @@ print(c([]))
   },
 });
 
+// `o.v ?? d` over a value-union record field, its atom unboxed, widened to a wider default, or its
+// box kept for a nullable default, and a default that reassigns the receiver the present arm
+// re-reads: legacy's shared open, every function matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a union field's coalesce is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type R = { v: i32 | null, w: i32 }
+function s(r: R): i32 { return r.v ?? 7 }
+function w(r: R): f64 { return r.v ?? 0.5 }
+function k(r: R, d: i32 | null): i32 | null { return r.v ?? d }
+function o(q: R, q2: R): i32 {
+  let r = q
+  const x = r.v ?? (r = q2).w
+  const y = r.v ?? 0
+  return x * 10 + y
+}
+const a: R = { v: null, w: 2 }
+print(s(a) + s({ v: 5, w: 2 }))
+print(w(a))
+print(k(a, null) ?? -1)
+print(o(a, { v: 4, w: 6 }))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
