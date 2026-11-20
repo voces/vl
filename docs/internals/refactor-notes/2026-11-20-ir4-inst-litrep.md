@@ -62,6 +62,11 @@ Fixpoint seeds: merge-base c34a60bfd against this branch.
 
 No row reads `fail`, `differ` or a verifier miss that the merge-base lacks.
 
+The 34 `fragment rep` misses that remain are the price of the one decision. An earlier draft
+typed every literal at `arrLitBuildTyOf` and left 6. On the pairless routes legacy builds the
+literal's own cell, so the literal keeps its stamp, and a fragment there whose door type differs
+from the stamp still misses.
+
 | bar | result |
 |---|---|
 | `ir-identity.sh --names` | identical 9,037, differ 0; self-compile identical |
