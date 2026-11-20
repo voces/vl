@@ -780,6 +780,52 @@ print(bs[1])
   },
 });
 
+// A field store whose value is a short-circuit (a valued `if`): legacy reads the receiver, then
+// the value. A local, a parameter, a global and a call result as the receiver are each staged
+// below the `if`, and every store function is covered and matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a field store of a short-circuit value is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type R = { a: boolean, n: i32 }
+let g: R = { a: false, n: 0 }
+const box: R[] = [{ a: false, n: 0 }]
+function get(): R { return box[0] }
+function loc(p: boolean, q: boolean): boolean {
+  const r: R = { a: false, n: 0 }
+  r.a = p && q
+  return r.a
+}
+function par(r: R, p: boolean, q: boolean): boolean {
+  r.a = p || q
+  return r.a
+}
+function glob(p: boolean, q: boolean): boolean {
+  g.a = p && q
+  return g.a
+}
+function tmp(p: boolean, q: boolean): boolean {
+  get().a = p || q
+  return box[0].a
+}
+function coal(r: R, x: i32 | null): i32 {
+  r.n = if x != null { x } else { 7 }
+  return r.n
+}
+print(loc(true, true))
+print(par({ a: false, n: 0 }, false, true))
+print(glob(true, false))
+print(tmp(false, false))
+print(coal({ a: false, n: 0 }, null) + coal({ a: false, n: 0 }, 2))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want five covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
