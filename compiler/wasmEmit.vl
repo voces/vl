@@ -91,13 +91,13 @@ import {
   elabStoreMemberOf,
   elabTypedReadMemberAt,
   elabValueSlotUncalled,
+  isStorageRead,
   litRepTyAt,
   luOvEnter,
   luOvLeave,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
-  storageReadOpen,
 } from "./emit_elab"
 import { canonUnionMemberTysOf } from "./check_program"
 import {
@@ -1790,6 +1790,7 @@ import {
   listWrapHeapOfKind,
   litIsArmOf,
   mapSoftTwinClashOf,
+  memReadArmOf,
   monoStaticIsResult,
   msSetOfUnionBox,
   njDispatches,
@@ -2930,6 +2931,10 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
 // stores: a box-union field boxes the right-hand side, f64 / i64 / f32 fields re-encode it,
 // and any other field emits it plainly.
 function emitVariantFieldStoreVal(vi: i32, fi: i32, valIx: i32, fnIx: i32) {
+  // The bare value's one home, which the IR's field store reads too.
+  if fieldStoreVariantValuePlain(vi, fi, valIx, fnIx) {
+    return emitExpr(valIx, fnIx)
+  }
   const k = eqRowFieldKind(-1 - vi, fi)
   if k == "union" { return emitVariantFieldBox(vi, fi, valIx, fnIx) }
   return emitScalarFieldStoreVal(valIx, fnIx, k)
@@ -11030,6 +11035,30 @@ function emitSharedFieldNulSetBox(
   return 0
 }
 
+// How `emitSharedFieldAssign` writes a shared field with plan `code` over members `vis`/`fis`: 0
+// not at all (no dispatchable plan, or members storing it at different types), 1 per arm (a
+// boxed or literal-union arm stores at its own atoms, D5158), 2 through one slot.
+function sharedFieldAssignPlanOf(code: i32, vis: i32[], fis: i32[]): i32 {
+  if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
+  if (
+    sharedFieldAnyArmBoxes(code, vis, fis)
+    || sharedFieldAnyArmLitUnion(vis, fis)
+  ) {
+    return 1
+  }
+  return if sharedFieldTysIdentical(vis, fis) { 2 } else { 0 }
+}
+
+// Whether `emitSharedFieldAssign` writes the field target `memIx`.
+function sharedFieldAssignTaken(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return sharedFieldAssignPlanOf(code, vis, fis) != 0
+}
+
 // A field write through an un-narrowed struct union (`(A | B).n = v`): the value is evaluated
 // once into a slot of the field's storage type, then each member's arm stores it at that
 // member's own index. 1 when lowered, 0 when the write is not such a read's twin (the members
@@ -11047,16 +11076,11 @@ function emitSharedFieldAssign(memIx: i32, valIx: i32, fnIx: i32) {
       vis,
       fis,
     )
-    if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
-    // A literal-union field stores at each member's own atoms, which the member's construct
-    // path already lowers (D5158).
-    if (
-      sharedFieldAnyArmBoxes(code, vis, fis)
-      || sharedFieldAnyArmLitUnion(vis, fis)
-    ) {
+    const plan = sharedFieldAssignPlanOf(code, vis, fis)
+    if plan == 0 { return 0 }
+    if plan == 1 {
       return emitSharedFieldAssignPerArm(m.memObj, valIx, fnIx, vis, fis)
     }
-    if !sharedFieldTysIdentical(vis, fis) { return 0 }
     let rslot = -1
     if !(nodeAt(unwrapParen(m.memObj)) is Ident) {
       rslot = sharedFieldRecvSlot()
@@ -11401,59 +11425,56 @@ function memFloorMsg(memIx: i32, dflt: string): string {
   return "emitProgram: " + dflt
 }
 
+// A member read, by the arm `memReadArmOf` names: a narrowed box, a bare or nullable variant
+// receiver, or the shared-field dispatch over the struct read.
 function emitMem(memIx: i32, fnIx: i32) {
-  // A field read on a receiver narrowed to one variant downcasts through the box, only where the
-  // receiver IS a box: a place declared at the arm itself carries the bare ref, and unwrapping
-  // would read a box the module never built. `narrowedArmNeedsUnbox` pairs them alike (D1734).
-  const m0n = nodeAt(memIx)
-  if m0n is Member && memNarrowVariantIndex(memIx, fnIx) >= 0 {
-    if exprUnion(m0n.memObj, fnIx) { return emitNarrowedMem(memIx, fnIx) }
+  return match memReadArmOf(memIx, fnIx) {
+    "narrowed" => emitNarrowedMem(memIx, fnIx)
+    "variant" => emitMemVariantRead(memIx, fnIx)
+    "nulVariant" => emitMemNulVariantRead(memIx, fnIx)
+    "shared" => emitMemSharedRead(memIx, fnIx)
   }
-  return emitMemVariantRead(memIx, fnIx)
 }
 
-// `emitMem`'s read of a field off a bare or nullable VARIANT receiver; any other receiver
-// falls through to the shared-field dispatch. Returns 0, or -1 failed.
+// `emitMem`'s read of a field off a bare VARIANT receiver, the unboxed variant ref itself: the
+// receiver, then `struct.get` at the variant's field. Returns 0, or -1 failed.
 function emitMemVariantRead(memIx: i32, fnIx: i32): i32 {
-  // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
-  // struct directly — the param already IS the unboxed variant ref, so there is NO box
-  // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
-  // $<variantHeap(vi)> <fieldIdx>`.
   const m0 = nodeAt(memIx)
-  if m0 is Member {
-    const pvi = exprVariantIndex(m0.memObj, fnIx)
-    if pvi >= 0 {
-      const pvfi = variantFieldIndex(pvi, m0.memProp)
-      if pvfi < 0 {
-        return emitFail("emitProgram: unknown variant field in field access")
-      }
-      if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
-      variantFieldTail(pvi, pvfi, memIx, fnIx)
-      // A code-16 (value-union box) field of the arm, read while its member path is narrowed,
-      // unboxes to the narrowed atom, the arm-for-arm twin of the plain struct read (D219).
-      return variantUnionBoxTail(pvi, pvfi, memIx, fnIx)
-    }
-    // The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch).
-    // Identical `struct.get`, one `ref.as_non_null` ahead of it: the cell is a
-    // `(ref null $variantHeap(vi))` and `struct.get` takes a non-null ref. The assertion cannot trap
-    // where the checker admits the read — such an access is only reachable through a null test.
-    const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
-    if nvi >= 0 {
-      const nvfi = variantFieldIndex(nvi, m0.memProp)
-      if nvfi < 0 {
-        return emitFail("emitProgram: unknown variant field in field access")
-      }
-      if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
-      fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-      fbStructGet(variantHeap(nvi), nvfi)
-      emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
-      if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
-        if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
-      }
-      return 0
-    }
+  if !(m0 is Member) { return emitFail("emitProgram: expected a member read") }
+  const pvi = exprVariantIndex(m0.memObj, fnIx)
+  const pvfi = variantFieldIndex(pvi, m0.memProp)
+  if pvfi < 0 {
+    return emitFail("emitProgram: unknown variant field in field access")
   }
-  return emitMemSharedRead(memIx, fnIx)
+  if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
+  variantFieldTail(pvi, pvfi, memIx, fnIx)
+  // A code-16 (value-union box) field of the arm, read while its member path is narrowed,
+  // unboxes to the narrowed atom, the arm-for-arm twin of the plain struct read (D219).
+  return variantUnionBoxTail(pvi, pvfi, memIx, fnIx)
+}
+
+// The nullable form of the same read (`c: Circle | null`, inside its `!= null` branch): one
+// `ref.as_non_null` ahead of the `struct.get`, which cannot trap where the checker admits the
+// read, as only a null test reaches it. Returns 0, or -1 failed.
+function emitMemNulVariantRead(memIx: i32, fnIx: i32): i32 {
+  const m0 = nodeAt(memIx)
+  if !(m0 is Member) { return emitFail("emitProgram: expected a member read") }
+  const nvi = nulVariantIdxOfExpr(m0.memObj, fnIx)
+  if nvi < 0 || nvi >= uFieldStart.length {
+    return emitFail("emitProgram: expected a nullable variant receiver")
+  }
+  const nvfi = variantFieldIndex(nvi, m0.memProp)
+  if nvfi < 0 {
+    return emitFail("emitProgram: unknown variant field in field access")
+  }
+  if emitExpr(m0.memObj, fnIx) < 0 { return -1 }
+  fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+  fbStructGet(variantHeap(nvi), nvfi)
+  emitNulStrFieldRecover(uFieldStart[nvi] + nvfi, memIx, fnIx)
+  if fieldRowIsUnionBox(uFieldStart[nvi] + nvfi) {
+    if emitUnionFieldNarrowUnbox(memIx, fnIx) < 0 { return -1 }
+  }
+  return 0
 }
 
 // `emitMem`'s shared-field read over a struct union, dispatched on the box tag; a plan that
@@ -13117,6 +13138,17 @@ function mapNewShapeOf(exprIx: i32, fnIx: i32): i32 {
   if slot == -5 { slot = -4 }
   if slot == -7 { slot = -6 }
   return slot
+}
+
+// Whether `e` is the `Map()` or `Set()` builtin, which builds an empty map. A user function named
+// `Map`/`Set` owns its name (D975): a real constructor resolves to no function.
+export function mapNewCall(e: Call): boolean {
+  if e.callFn < 0 { return false }
+  const f = nodeAt(e.callFn)
+  if !(f is Ident) || (f.identName != "Map" && f.identName != "Set") {
+    return false
+  }
+  return fnIndexOfNode(e.callFn) < 0
 }
 
 // Construct an EMPTY map `Map()` onto `body`: two empty lists (each `array.new_fixed`
@@ -21080,7 +21112,11 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   // primitive. The table's box seats are emit state, unset while the builder asks.
   const prim = nodeTyPrimName(w)
   if prim != "" && prim != "string" { return placePrePathWhy(w, fnIx) }
-  if coerceKindAt(ix, fnIx) != "none" { return "pre-path coercion" }
+  const ck = coerceKindAt(ix, fnIx)
+  // A list copy that owes nothing past the value is the value as built.
+  if ck != "none" && !(ck == "listCopy" && listCopyOwesNothing(ix, fnIx)) {
+    return "pre-path coercion"
+  }
   if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
@@ -21378,11 +21414,11 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
     if iun != "" {
       how = 3
     } else {
-      const destStruct = ifTypedStructRow(ifIx, fnIx)
-      rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+      const rj = ifRefJoinOf(ifIx, fnIx)
+      rk = rj.rjKind
       if rk != null {
         how = 4
-        rslot = ifExprRefSlot(ifIx, fnIx, rk, destStruct)
+        rslot = rj.rjSlot
       } else {
         vt = ifExprValtype(ifIx, fnIx)
       }
@@ -21407,6 +21443,27 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   if how == 3 { return emitUnionIfValue(iun, jpin, ifIx, fnIx) }
   if rk != null { return emitIfExprRef(ifIx, fnIx, rk, rslot) }
   return emitIfExprAs(ifIx, fnIx, vt)
+}
+
+// The ref kind and table slot a value `if` at `ifIx` joins at (`emitIfExprRef`), or a null kind
+// for a join that is not a reference.
+export type RefJoin = { rjKind: VKind | null, rjSlot: i32 }
+
+// The `RefJoin` of a join that is not a reference.
+export function noRefJoin(): RefJoin { return { rjKind: null, rjSlot: -1 } }
+
+export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
+  const destStruct = ifTypedStructRow(ifIx, fnIx)
+  const rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+  const slot = if rk != null { ifExprRefSlot(ifIx, fnIx, rk, destStruct) } else { -1 }
+  return { rjKind: rk, rjSlot: slot }
+}
+
+// The result blocktype of a ref join's `if`, after its opcode: `(ref null $ht)` when the join
+// can yield `null`, else `(ref $ht)`.
+export function fbRefIfOpenType(kind: VKind, slot: i32, nul: boolean) {
+  if nul { return fbValtypeNullable(kind, slot) }
+  return fbValtype(kind, slot)
 }
 
 // The internal failure where `ifExprPlainKind` and `emitIfExpr`'s ladder part ways.
@@ -21442,7 +21499,7 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
     return "atom join"
   }
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx))
+  const rk = ifRefJoinOf(ifIx, fnIx).rjKind
   if rk != null { return "ref " + rk }
   const jpin = nodeTyInOf(ifIx, fnIx)
   if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
@@ -21628,7 +21685,7 @@ function refuseJoinDropsNul(ifIx: i32): i32 {
 // Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
 // `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
 // as a generic's `??` joined with a nullable pin's other side does (D3290).
-function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
+export function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
   let cur = ifIx
   let widens = false
   while cur >= 0 {
@@ -21683,11 +21740,7 @@ function emitIfExprRefLink(
     // needs a nullable blocktype, else a `(ref null $ht)` arm mismatches the non-null result.
     // A non-nullable join, or a binding whose arms are both non-null, stays non-null and widens on store.
     const nulJoin = chainNul
-    if nulJoin {
-      fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
-    } else {
-      fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
-    }
+    fbRefIfOpenType(kind, slot, nulJoin)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
@@ -21796,6 +21849,49 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
   )
 }
 
+// How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
+// itself, `recover` the same under `ref.as_non_null`, `nestedIf` an `if` value joined at this
+// rep; `null`, `atomStr` and `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
+export type RefIfArm = "plain"
+  | "recover"
+  | "null"
+  | "atomStr"
+  | "recordCopy"
+  | "nestedIf"
+  | "noValue"
+
+// `emitRefIfArm`'s ladder for arm `blockIx` (D1577, D1560, D2100).
+export function refIfArmOf(
+  blockIx: i32,
+  fnIx: i32,
+  kind: VKind,
+  slot: i32,
+  nulJoin: boolean,
+): RefIfArm {
+  const b = nodeAt(blockIx)
+  if !(b is Block) { return "noValue" }
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 { return "noValue" }
+  if ifArmIsValue(tv, fnIx) {
+    if nodeAt(unwrapParen(tv)) is NullLit { return "null" }
+    if kind == "struct" && refIfArmNeedsRecordCopy(tv, slot, fnIx) {
+      return "recordCopy"
+    }
+    if kind == "str" && exprIsLitAtom(tv, fnIx) { return "atomStr" }
+    if !nulJoin && nulNicheRecoverOwed(kind, tv, fnIx) { return "recover" }
+    return "plain"
+  }
+  const inner = unwrapParen(tv)
+  if (
+    inner >= 0
+    && nodeAt(inner) is IfStmt
+    && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
+  ) {
+    return "nestedIf"
+  }
+  return "noValue"
+}
+
 // One arm of a ref-typed if-expression: its prelude, then its tail-value statement emitted
 // in the join rep. `nulJoin` is threaded from the caller rather than re-derived, so the
 // declaration and the arm's recover cannot disagree about nullness (D1577).
@@ -21807,61 +21903,38 @@ function emitRefIfArm(
   nulJoin: boolean,
 ) {
   const b = nodeAt(blockIx)
-  if b is Block {
-    const tv = ifArmValueExpr(blockIx)
-    if tv >= 0 {
-      if ifArmIsValue(tv, fnIx) {
-        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        // A bare `null` arm lowers as the join's own null, not through `emitNullLitNode`'s
-        // seed ladder: `fbRefNullOfKind` is `fbValtypeNullable`'s value twin, so the arm and
-        // the blocktype cannot name different heap types. Without it an explicit
-        // `else { null }` refuses at every ref kind whose null no boundary seed carries (D1560), while the else-less spelling of the same value keeps working.
-        if nodeAt(unwrapParen(tv)) is NullLit {
-          return emitIfArmClose(fbRefNullOfKind(kind, slot))
-        }
-        if kind == "struct" {
-          // A record value, not a literal, joined into a wider record would need a converting
-          // copy, which a delivery of it has nowhere else either (D2100).
-          if refIfArmNeedsRecordCopy(tv, slot, fnIx) {
-            return emitIfArmClose(
-              emitFailAt(
-                "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared",
-                tv,
-              ),
-            )
-          }
-        }
-        // An ATOM arm in a `string` join widens to its member string (the atom is a
-        // bare i32 id; the join blocktype is the string ref) — the if-expression seam
-        // of the atom-as-string-subtype widen (`retStrWiden` at returns).
-        if kind == "str" && exprIsLitAtom(tv, fnIx) {
-          return emitIfArmClose(emitAtomToStr(tv, fnIx))
-        }
-        // A non-null blocktype is a delivery (D1577), so an arm whose rep is the join
-        // kind's nullable niche owes the same `ref.as_non_null` the return / argument /
-        // binding boundaries make (`nulNicheRecoverOwed`) — a nested-struct field stores
-        // `(ref null $S)` though its type is not nullable, so an unrecovered arm pushes that under a `(ref $S)` result: invalid wasm. Under a nullable blocktype nothing is owed.
-        const rcV = emitExpr(tv, fnIx)
-        if rcV >= 0 && !nulJoin {
-          if nulNicheRecoverOwed(kind, tv, fnIx) { fbRefAsNonNull() }
-        }
-        return emitIfArmClose(rcV)
-      }
-      // An arm ending in an if-expression the value test declines (an else-less one yields
-      // `null` on its missing path) joins at this rep too, once this frame can hold its null.
-      const inner = unwrapParen(tv)
-      if (
-        inner >= 0
-        && nodeAt(inner) is IfStmt
-        && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
-      ) {
-        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        return emitIfArmClose(emitIfExprRef(inner, fnIx, kind, slot))
-      }
-    }
-    return ifArmNoValueFail("if-expression arm", blockIx)
+  if !(b is Block) {
+    return emitFail("emitProgram: if-expression arm is not a block")
   }
-  return emitFail("emitProgram: if-expression arm is not a block")
+  const arm = refIfArmOf(blockIx, fnIx, kind, slot, nulJoin)
+  const tv = ifArmValueExpr(blockIx)
+  match arm {
+    "noValue" => {
+      return ifArmNoValueFail("if-expression arm", blockIx)
+    }
+    "nestedIf" => {
+      if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+      return emitIfArmClose(emitIfExprRef(unwrapParen(tv), fnIx, kind, slot))
+    }
+    "null" | "atomStr" | "recover" | "plain" | "recordCopy" => {}
+  }
+  if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+  // A record joined into a wider record would need a converting copy (D2100).
+  if arm == "recordCopy" {
+    return emitIfArmClose(
+      emitFailAt(
+        "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared",
+        tv,
+      ),
+    )
+  }
+  // A bare `null` arm is the join's own null (`fbRefNullOfKind`, `fbValtypeNullable`'s value twin).
+  if arm == "null" { return emitIfArmClose(fbRefNullOfKind(kind, slot)) }
+  // An atom arm in a `string` join widens to its member string.
+  if arm == "atomStr" { return emitIfArmClose(emitAtomToStr(tv, fnIx)) }
+  const rcV = emitExpr(tv, fnIx)
+  if rcV >= 0 && arm == "recover" { fbRefAsNonNull() }
+  return emitIfArmClose(rcV)
 }
 
 // Lower the if-expression at `ifIx` with a known blocktype byte `kind`, threading it
@@ -26000,6 +26073,15 @@ function emitCallCoreExtern(c: Call, callee: Ident, exK: i32, fnIx: i32) {
   return 0
 }
 
+// Whether call `c` names the `__trap__` intrinsic: the spelling, with no binding in scope owning
+// the name (`identNameIsUserBound`), as every dunder arm of `emitCallCoreIdent` asks.
+export function trapCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || f.identName != "__trap__" { return false }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
 // The `__trap__(msg?)` arm of `emitCallCore`. Returns 0 once emitted, -1 on failure.
 function emitCallCoreTrap(c: Call, fnIx: i32) {
   if c.callArgs.length > 1 {
@@ -26313,9 +26395,7 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // lowered INLINE to single WasmGC instructions (array.new /
   // array.new_default / array.copy / unreachable). `__trap__()` is the
   // deliberate abort primitive.
-  if !userBindsName && callee.identName == "__trap__" {
-    return emitCallCoreTrap(c, fnIx)
-  }
+  if trapCallNamed(c, fnIx) { return emitCallCoreTrap(c, fnIx) }
   // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
   // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both yield the
   // `{backing, len: n, cap: n}` list wrapper, staging the length in the 1-slot arrNew
@@ -27702,9 +27782,7 @@ export function idxStoreTail(target: Index, st: IdxStore, stHz: i32): i32 {
 // then `struct.set`s field `fi` of variant `vi`. Returns 0, or -1 failed.
 function emitVariantFieldWrite(vi: i32, fi: i32, rhs: i32, fnIx: i32): i32 {
   if emitVariantFieldStoreVal(vi, fi, rhs, fnIx) < 0 { return -1 }
-  if vi < 0 { return -1 }
-  fbStructSet(variantHeap(vi), fi)
-  return 0
+  return fieldStoreVariantTail(vi, fi)
 }
 
 // `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its
@@ -27720,12 +27798,10 @@ function emitStructFieldStoreValue(
   if k == null {
     return emitFail("emitProgram: struct field has no storage kind")
   }
-  // An atom or atom-array field takes its RHS as interned atom ids, the construct's rule.
-  const atoms = k != "union"
-    && k != "str"
-    && k != "nulstr"
-    && (sFieldIsLitUnion(si, fieldIdx)
-    || sFieldIsLitUnionArray(si, fieldIdx))
+  // The bare value's one home, which the IR's field store reads too.
+  if fieldStoreValuePlain(si, fieldIdx, rhs, fnIx) {
+    return if emitExpr(rhs, fnIx) < 0 { -1 } else { 0 }
+  }
   match k {
     "union" => {
       // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
@@ -27735,143 +27811,251 @@ function emitStructFieldStoreValue(
     }
     "str" => {
       // A literal-union atom assigned to a `string` field widens to its member string.
-      if exprIsLitAtom(rhs, fnIx) {
-        if emitAtomToStr(rhs, fnIx) < 0 { return -1 }
-      } else if emitExpr(rhs, fnIx) < 0 {
-        return -1
-      }
+      if emitAtomToStr(rhs, fnIx) < 0 { return -1 }
     }
     "nulstr" => {
       // A `string | null` slot takes the same widen; a widened member string is non-null.
-      if exprIsLitAtom(rhs, fnIx) {
-        if emitStrValue(rhs, fnIx) < 0 { return -1 }
-      } else if emitExpr(rhs, fnIx) < 0 {
-        return -1
-      }
+      if emitStrValue(rhs, fnIx) < 0 { return -1 }
     }
     "f64" | "i64" | "f32" => {
       // A wide scalar field widens its RHS at the store boundary, as the construct does.
-      if atoms {
-        if emitExpr(rhs, fnIx) < 0 { return -1 }
-      } else if emitScalarFieldStoreVal(rhs, fnIx, k) < 0 {
-        return -1
-      }
+      if emitScalarFieldStoreVal(rhs, fnIx, k) < 0 { return -1 }
     }
     "nulnone" => {
       // The `null` unit type's slot, the construct arm's twin (D4671).
-      if atoms {
-        if emitExpr(rhs, fnIx) < 0 { return -1 }
-      } else {
-        if emitNulNoneForEffect(rhs, fnIx) < 0 { return -1 }
-        fbRefNullNone()
-      }
+      if emitNulNoneForEffect(rhs, fnIx) < 0 { return -1 }
+      fbRefNullNone()
     }
     "nulstruct" | "nulvariant" => {
       // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
       // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
-      if atoms {
-        if emitExpr(rhs, fnIx) < 0 { return -1 }
-      } else if (
-        emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx))
-        < 0
-      ) {
+      if emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx)) < 0 {
         return -1
       }
     }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      // A `K | null` niche field takes a member as its atom id and `null` as -1.
-      if emitExpr(rhs, fnIx) < 0 { return -1 }
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" => {
+      return fieldStorePlainMissed()
+    }
+    "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" => {
+      return fieldStorePlainMissed()
+    }
+    "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" => {
+      return fieldStorePlainMissed()
+    }
+    "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return fieldStorePlainMissed()
     }
   }
   return 0
+}
+
+// A field kind `fieldStoreValuePlain` always answers plain, reaching the non-plain ladder.
+function fieldStorePlainMissed() {
+  return emitFail(
+    "emitProgram: a plain field value reached the field store's re-encode ladder",
+  )
 }
 
 // `emitAssignUnder`'s arm over a field target `o.f = v`: through a narrowed union box, into
 // a variant receiver, or straight into the record. `target` is `P.nodes[lhsIx]`. Returns 0
 // lowered, -1 failed.
 function emitAssignMember(fnIx: i32, a: BinExpr, lhsIx: i32, target: Member) {
-  // a field write on a narrowed union identifier (`if v is M { v.field = x }`)
-  // downcasts through the box like the read path: push the box ref, unbox to the
-  // variant struct, push the value, then `struct.set` — mutating the shared arena object.
-  const nvi = memNarrowVariantIndex(lhsIx, fnIx)
-  if nvi >= 0 {
-    if lhsIx < 0 { return -1 }
-    const nm = nodeAt(lhsIx)
-    if nm is Member {
-      const nfi = variantFieldIndex(nvi, nm.memProp)
-      if nfi < 0 {
-        return emitFail(
-          "emitProgram: unknown variant field in narrowed field assignment",
-        )
-      }
-      if emitExpr(nm.memObj, fnIx) < 0 { return -1 }
-      fbStructGet(uBoxIdx, 1)     // box field 1: value (anyref)
-      fbRefCast(variantHeap(nvi)) // ref.cast to the variant struct
-      // The field's context is taken AFTER the receiver's own emit, which may leave seeds
-      // of its own behind.
-      return emitVariantFieldWrite(nvi, nfi, a.binRight, fnIx)
-    }
+  return match fieldStoreArmOf(lhsIx, fnIx) {
+    "narrowVariant" => emitFieldStoreNarrowed(fnIx, a, lhsIx)
+    "variantParam" => emitFieldStoreVariant(fnIx, a, lhsIx, target)
+    "nulVariant" => emitFieldStoreNulVariant(fnIx, a, target)
+    "shared" => if emitSharedFieldAssign(lhsIx, a.binRight, fnIx) < 0 { -1 } else { 0 }
+    "struct" => emitFieldStoreStruct(fnIx, a, lhsIx, target)
   }
+}
+
+// The arm `emitAssignMember` takes for field target `lhsIx`, decided once for legacy and the IR
+// (which covers `struct`): through a narrowed union box, into a variant receiver or a nullable
+// variant's, through an un-narrowed struct union's shared field, or straight into the record.
+export type FieldStoreArm = "narrowVariant"
+  | "variantParam"
+  | "nulVariant"
+  | "shared"
+  | "struct"
+
+export function fieldStoreArmOf(lhsIx: i32, fnIx: i32): FieldStoreArm {
+  const t = nodeAt(lhsIx)
+  if memNarrowVariantIndex(lhsIx, fnIx) >= 0 { return "narrowVariant" }
+  if t is Member {
+    if exprVariantIndex(t.memObj, fnIx) >= 0 { return "variantParam" }
+    if nulVariantIdxOfExpr(t.memObj, fnIx) >= 0 { return "nulVariant" }
+  }
+  if sharedFieldAssignTaken(lhsIx, fnIx) { return "shared" }
+  return "struct"
+}
+
+function emitFieldStoreNarrowed(fnIx: i32, a: BinExpr, lhsIx: i32) {
+  const nvi = memNarrowVariantIndex(lhsIx, fnIx)
+  if lhsIx < 0 { return -1 }
+  const nm = nodeAt(lhsIx)
+  if nm is Member {
+    const nfi = variantFieldIndex(nvi, nm.memProp)
+    if nfi < 0 {
+      return emitFail(
+        "emitProgram: unknown variant field in narrowed field assignment",
+      )
+    }
+    if emitExpr(nm.memObj, fnIx) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 1)     // box field 1: value (anyref)
+    fbRefCast(variantHeap(nvi)) // ref.cast to the variant struct
+    // The field's context is taken AFTER the receiver's own emit, which may leave seeds
+    // of its own behind.
+    return emitVariantFieldWrite(nvi, nfi, a.binRight, fnIx)
+  }
+  return -1
+}
+
+function emitFieldStoreVariant(
+  fnIx: i32,
+  a: BinExpr,
+  lhsIx: i32,
+  target: Member,
+) {
   // A field WRITE on a variant-typed param (`o: TyObj`) writes the variant struct
   // directly (the param IS the unboxed variant ref — no box unwrap).
-  const pwvi = exprVariantIndex(target.memObj, fnIx)
-  if pwvi >= 0 {
-    if lhsIx < 0 { return -1 }
-    const m1 = nodeAt(lhsIx)
-    if m1 is Member {
-      const pwfi = variantFieldIndex(pwvi, m1.memProp)
-      if pwfi < 0 {
-        return emitFail(
-          "emitProgram: unknown variant field in field assignment",
-        )
-      }
-      if emitExpr(m1.memObj, fnIx) < 0 { return -1 }
-      return emitVariantFieldWrite(pwvi, pwfi, a.binRight, fnIx)
-    }
+  const vf = fieldStoreVariantAt(lhsIx, fnIx)
+  if vf.length != 2 {
+    return emitFail("emitProgram: unknown variant field in field assignment")
   }
+  if emitExpr(target.memObj, fnIx) < 0 { return -1 }
+  return emitVariantFieldWrite(vf[0], vf[1], a.binRight, fnIx)
+}
+
+function emitFieldStoreNulVariant(fnIx: i32, a: BinExpr, target: Member) {
   // the nullable-variant receiver: a `T | null` binding whose `T` is a union arm holds
   // `(ref null $variantHeap(vi))`, so this differs from the variant-param write above only
   // by one `ref.as_non_null`, safe since the checker admits the write only inside a null test.
   const nwvi = nulVariantIdxOfExpr(target.memObj, fnIx)
-  if nwvi >= 0 {
-    const nwfi = variantFieldIndex(nwvi, target.memProp)
-    if nwfi < 0 {
-      return emitFail("emitProgram: unknown variant field in field assignment")
-    }
-    if emitExpr(target.memObj, fnIx) < 0 { return -1 }
-    fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-    return emitVariantFieldWrite(nwvi, nwfi, a.binRight, fnIx)
+  const nwfi = variantFieldIndex(nwvi, target.memProp)
+  if nwfi < 0 {
+    return emitFail("emitProgram: unknown variant field in field assignment")
   }
-  const shw = emitSharedFieldAssign(lhsIx, a.binRight, fnIx)
-  if shw < 0 { return -1 }
-  if shw == 1 { return 0 }
+  if emitExpr(target.memObj, fnIx) < 0 { return -1 }
+  fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
+  return emitVariantFieldWrite(nwvi, nwfi, a.binRight, fnIx)
+}
+
+function emitFieldStoreStruct(
+  fnIx: i32,
+  a: BinExpr,
+  lhsIx: i32,
+  target: Member,
+) {
   // field write `recv.field = v` → `struct.set $0 <fieldidx>`; the single declared
   // struct lives at WasmGC type index 0. Operand order is load-bearing: struct ref
   // first, then the value.
-  if !sDeclared {
-    return emitFail("emitProgram: field assignment but no struct type declared")
-  }
-  const si = structIndexOfExpr(target.memObj, fnIx)
-  if si < 0 {
-    return emitFail("emitProgram: field-assignment receiver is not a struct")
-  }
-  const fieldIdx = sFieldIndex(si, target.memProp)
-  if fieldIdx < 0 {
+  const sf = fieldStoreStructAt(lhsIx, fnIx)
+  if sf.length != 2 {
+    if !sDeclared {
+      return emitFail(
+        "emitProgram: field assignment but no struct type declared",
+      )
+    }
+    if structIndexOfExpr(target.memObj, fnIx) < 0 {
+      return emitFail("emitProgram: field-assignment receiver is not a struct")
+    }
     return emitFail("emitProgram: unknown struct field in field assignment")
   }
   if emitExpr(target.memObj, fnIx) < 0 {
     return -1 // struct ref first
   }
-  if (emitStructFieldStoreValue(si, fieldIdx, a.binRight, fnIx) < 0) {
+  if (emitStructFieldStoreValue(sf[0], sf[1], a.binRight, fnIx) < 0) {
     return -1
   }
-  // D1222 — the STORE half of the construct-side recover in `emitObj`; the two halves of
-  // every field code have to be wired together, as the code-20 arm above records.
-  if nulNicheRecoverOwed(sFieldStoreKind(si, fieldIdx), a.binRight, fnIx) {
+  return fieldStoreTail(sf[0], sf[1], a.binLeft, a.binRight, fnIx)
+}
+
+// The struct row and field index `emitFieldStoreStruct` stores field target `lhsIx` at, or [] when
+// it is no struct field.
+export function fieldStoreStructAt(lhsIx: i32, fnIx: i32): i32[] {
+  const t = nodeAt(lhsIx)
+  if !(t is Member) || !sDeclared { return [] }
+  const si = structIndexOfExpr(t.memObj, fnIx)
+  if si < 0 { return [] }
+  const fi = sFieldIndex(si, t.memProp)
+  if fi < 0 { return [] }
+  return [si, fi]
+}
+
+// Whether `emitStructFieldStoreValue` writes `rhs` into field `fieldIdx` of row `si` as the bare
+// value (`emitExpr`), with no box, atom widen, scalar re-encode or niche seed around it.
+export function fieldStoreValuePlain(
+  si: i32,
+  fieldIdx: i32,
+  rhs: i32,
+  fnIx: i32,
+): boolean {
+  const k = fieldRowKind(sFieldStart[si] + fieldIdx)
+  if k == null { return false }
+  const atoms = sFieldIsLitUnion(si, fieldIdx)
+    || sFieldIsLitUnionArray(si, fieldIdx)
+  return match k {
+    "union" => false
+    "str" | "nulstr" => !exprIsLitAtom(rhs, fnIx)
+    "f64" | "i64" | "f32" | "nulnone" | "nulstruct" | "nulvariant" => atoms
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" => true
+    "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" => true
+    "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" => true
+    "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => true
+  }
+}
+
+// The variant and field `emitFieldStoreVariant` stores field target `lhsIx` at, or [].
+export function fieldStoreVariantAt(lhsIx: i32, fnIx: i32): i32[] {
+  const t = nodeAt(lhsIx)
+  if !(t is Member) { return [] }
+  const vi = exprVariantIndex(t.memObj, fnIx)
+  if vi < 0 { return [] }
+  const fi = variantFieldIndex(vi, t.memProp)
+  if fi < 0 { return [] }
+  return [vi, fi]
+}
+
+// Whether `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` as the bare value
+// (`emitExpr`), with no box, scalar re-encode or atom widen around it.
+export function fieldStoreVariantValuePlain(
+  vi: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): boolean {
+  const k = eqRowFieldKind(-1 - vi, fi)
+  if k == null { return true }
+  return match k {
+    "union" | "f64" | "i64" | "f32" => false
+    "str" | "nulstr" => !exprIsLitAtom(rhs, fnIx)
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" => true
+    "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" => true
+    "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" => true
+    "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => true
+  }
+}
+
+// After a variant field store's receiver and value: `struct.set` on the variant's heap.
+export function fieldStoreVariantTail(vi: i32, fi: i32): i32 {
+  if vi < 0 { return -1 }
+  fbStructSet(variantHeap(vi), fi)
+  return 0
+}
+
+// After a struct field store's record and value: the construct-side recover's STORE half (D1222),
+// the scalar covariant copy at the field-store boundary (D2163), then `struct.set`.
+export function fieldStoreTail(
+  si: i32,
+  fieldIdx: i32,
+  lhs: i32,
+  rhs: i32,
+  fnIx: i32,
+): i32 {
+  if nulNicheRecoverOwed(sFieldStoreKind(si, fieldIdx), rhs, fnIx) {
     fbRefAsNonNull()
   }
-  // the scalar covariant copy at the field-store boundary, the construct's twin (D2163)
-  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx), a.binLeft) }
+  if asgParkWanted { asgParkField(sFieldStoreKind(si, fieldIdx), lhs) }
   fbStructSet(sHeapIdx[si], fieldIdx) // 0xfb 0x05 <struct ht> <field index>
   return 0
 }
@@ -30029,9 +30213,57 @@ function emitFnCloDispatch(exprIx: i32, fes: i32[], fnIx: i32): i32 {
   return 0
 }
 
+// Whether a `listCopy` delivery of `exprIx` owes nothing past the value as built, so the tail
+// writes no byte: no record copy, numeric convert or stand-in widen, no list-of-lists convert,
+// and a ref-list pair with no retag rows whose slots need no widen.
+export function listCopyOwesNothing(exprIx: i32, fnIx: i32): boolean {
+  const lct = listCopyAtNode(exprIx)
+  if lct < 0 { return false }
+  const st = nonNullTy(nodeTyIxOf(exprIx))
+  const dt = nonNullTy(instTyOrSelf(lct, fnIx))
+  if listRecCopies > 0 && rcRecListsApart(st, dt) { return false }
+  const ld = repOfTy(instTyOrSelf(lct, fnIx))
+  const de = if ld.rdKind != null { scalarListElemOfListKind(ld.rdKind) } else { null }
+  if de != null {
+    if listCopyStandsIn(exprIx, fnIx) { return false }
+    const sk = scalarListElemKind(exprIx, fnIx)
+    return sk == null || scalarWidenConvOp(sk, de) < 0
+  }
+  const lst = nonNullTy(instTyOrSelf(nodeTyIxOf(exprIx), fnIx))
+  if listOfListsPair(lst, dt) { return false }
+  const rtFrom: i32[] = []
+  const rtTo: i32[] = []
+  listWidenRetagRowsOf(exprIx, rtFrom, rtTo)
+  if rtFrom.length > 0 { return false }
+  const src = exprEmittedRefListSlot(exprIx, fnIx)
+  let dst = repSlotOfKind("reflist", instTyOrSelf(lct, fnIx))
+  if dst < 0 { dst = src }
+  if rlBoxIntoRowList(src, dst) && identBuiltAtUnionList(exprIx) {
+    return false
+  }
+  return rlWidenTagOf(src, dst) < 0
+}
+
+// Whether the read `exprIx` is a closure's capture stand-in (`listFitCaptureStandIn`), whose
+// list the scalar copy widens from the stand-in's type.
+function listCopyStandsIn(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is Ident) { return false }
+  const ty: i32[] = []
+  return listFitCaptureStandIn(
+    e.identName,
+    unwrapParen(exprIx),
+    fnIx,
+    false,
+    ty,
+  )
+    >= 0
+}
+
 // The conversion of a list value just emitted at its own row into the row of `lct`, the list
 // its delivery copies into, where the two storages differ. Returns 0, or -1 failed.
 function emitListCopyTail(exprIx: i32, lct: i32, fnIx: i32): i32 {
+  if listCopyOwesNothing(exprIx, fnIx) { return 0 }
   // A fresh call's list of records is copied element by element (`recFreshCallCopy`).
   if listRecCopies > 0 {
     const rc = emitRecListCopy(exprIx, lct, fnIx)
@@ -32263,26 +32495,41 @@ function emitLetInitValue(
   return 0
 }
 
+// The rep `emitLetIfInit` writes a binding's `if` initializer at, in each arm: 0 the union box
+// of `nulTy` (D969: an un-annotated binding boxes too), 1 `string | null`, 2 `boolean | null`; -1
+// when the binding takes the plain path. `slotKind` is the binding's local's kind.
+export function letIfInitRep(slotKind: VKind, nulTy: i32): i32 {
+  return match slotKind {
+    "union" => if boxTyName(nulTy) != "" { 0 } else { -1 }
+    "nulstr" => 1
+    "nulbool" => 2
+    "i32" | "struct" | "list" | "str" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => -1
+  }
+}
+
+// The type `emitLetIfInit` names a binding's union by: its annotation, else its joined `if`.
+function letIfInitTy(s: LetDecl, fnIx: i32): i32 {
+  if s.letType >= 0 { return nodeTyIxOf(s.letType) }
+  return nodeTyAt(s.letInit, fnIx)
+}
+
+// Whether the declaration at `declIx` is a binding whose `if` initializer legacy writes in each
+// arm (`emitLetIfInit`), rather than as one value.
+export function letIfInitPerArm(declIx: i32, fnIx: i32): boolean {
+  const s = nodeAt(declIx)
+  if !(s is LetDecl) || !exprIsIfStmt(s.letInit) { return false }
+  const slot = declaredSlotOfDecl(declIx)
+  if slot < 0 || slot >= localIsRef.length { return false }
+  return letIfInitRep(localIsRef[slot], letIfInitTy(s, fnIx)) >= 0
+}
+
 // A `let` whose init is an `if` over a nullable or value-union cell, written into local
 // `idx` by each arm. Returns 0 once bound, 1 when the cell's rep takes no such lowering, and
 // -1 on a failure.
 function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
-  const slotKind = localIsRef[slot]
-  let nulRep = -1
-  let nulNm = ""
-  // The binding's union type: its annotation, else the joined `if` it is initialised by.
-  let nulTy = nodeTyAt(s.letInit, fnIx)
-  if s.letType >= 0 { nulTy = nodeTyIxOf(s.letType) }
-  if slotKind == "union" {
-    // The box is named by the binding's union type, annotated or joined (D969: an
-    // un-annotated binding boxes too, rather than fall to a scalar join over two ref arms).
-    nulNm = boxTyName(nulTy)
-    if nulNm != "" { nulRep = 0 }
-  } else if slotKind == "nulstr" {
-    nulRep = 1
-  } else if slotKind == "nulbool" {
-    nulRep = 2
-  }
+  const nulTy = letIfInitTy(s, fnIx)
+  const nulRep = letIfInitRep(localIsRef[slot], nulTy)
+  const nulNm = if nulRep == 0 { boxTyName(nulTy) } else { "" }
   if nulRep >= 0 {
     // the binding sink: with every arm writing the shared pair and ONE `struct.new`
     // after the `if`, the arms' construction sites collapse to that one — and the
@@ -35491,28 +35738,46 @@ export function globalCtxNow(): GlobalCtx {
   return c
 }
 
-// The legacy lowering context a fragment the IR door builds cannot see, or "" when all of it is at
-// rest: a coercion seat, storage-read mode, a narrowing frame, a staged operand or push receiver
-// cast, an open loop hoist or list build region. The union sink is byte-level, not a plan input.
-export function legacyContextLiveWhy(): string {
-  if coerceHeld >= 0 { return "coerceHeld" }
-  if armSeat >= 0 { return "armSeat" }
-  if boxSeat >= 0 { return "boxSeat" }
-  if atomSeat >= 0 { return "atomSeat" }
-  if armServed >= 0 { return "armServed" }
-  if storageReadOpen() { return "storage read" }
-  if knownArmDecl.length > 0 { return "narrowing frame" }
-  if isRecvStagedIx >= 0 { return "staged is receiver" }
-  if listGetIdxStagedIx >= 0 || listGetRecvStagedIx >= 0 {
+// Sets the held coercion mark to `ix`, returning the one it replaces: the shadow's firing control.
+export function coerceHeldSwap(ix: i32): i32 {
+  const was = coerceHeld
+  coerceHeld = ix
+  return was
+}
+
+// The legacy context an expression fragment rooted at `root` would read, or "": ir-design §10.2.1.
+// A node mark reaches the fragment only on its root (a held coercion, a storage read) or, for a
+// staged operand, inside it; an open list-build region only through a counted push inside it. The
+// seats are spent or inert below `coerceKindAt`, and the two lexical frames hold no `for` here.
+export function legacyContextLiveWhy(root: i32): string {
+  if coerceHeld >= 0 && coerceHeld == root { return "coerceHeld on the root" }
+  if isStorageRead(root) { return "storage read of the root" }
+  if isRecvStagedIx >= 0 && nodeContains(root, isRecvStagedIx) {
+    return "staged is receiver"
+  }
+  if listGetIdxStagedIx >= 0 && nodeContains(root, listGetIdxStagedIx) {
     return "staged list get"
   }
-  if listFitStoodIn >= 0 { return "list fit stand-in" }
+  if listGetRecvStagedIx >= 0 && nodeContains(root, listGetRecvStagedIx) {
+    return "staged list get"
+  }
   if listCastForPush { return "push receiver cast" }
-  if lhOpen.length > 0 { return "loop hoist" }
-  let r = 0
-  while r < lbEnd.length {
-    if lbEnd[r] >= 0 { return "list build region" }
-    r = r + 1
+  // A root reading a capture stand-in would owe `listFitStoodIn` as the door's output.
+  if root >= 0 && root < P.nodes.length && nodeAt(root) is Ident {
+    return "identifier root"
+  }
+  let k = 0
+  while k < lbPush.length {
+    const r = lbPushOf[k]
+    if (
+      r >= 0
+      && r < lbEnd.length
+      && lbEnd[r] >= 0
+      && nodeContains(root, lbPush[k])
+    ) {
+      return "counted push"
+    }
+    k = k + 1
   }
   return ""
 }
@@ -36125,6 +36390,12 @@ function emitPrintValueUnion(argIx: i32, kinds: i32[], fnIx: i32) {
   if !puDone {
     if emitExpr(argIx, fnIx) < 0 { return -1 }
   }
+  return printUnionTail(slot, kinds)
+}
+
+// After a value-union box is on the stack: stash it once in `slot` (`sharedFieldRecvSlot`, taken
+// before the box is written) and print the arm its tag names, over `printUnionPlan`'s kinds.
+export function printUnionTail(slot: i32, kinds: i32[]) {
   fbLocalSet(slot)
   let i = 0
   while i < kinds.length - 1 {
@@ -37056,16 +37327,7 @@ function emitCallNode(e: Call, exprIx: i32, fnIx: i32) {
   // IDENTICAL empty-map construction.
   if e.callFn < 0 { return -1 }
   const callee = nodeAt(e.callFn)
-  if callee is Ident {
-    // D975 — a user function named `Map`/`Set` owns its own name here too, for the reason
-    // `emitCall`'s header gives: matching by spelling alone would build a fresh map instead
-    // of calling it. A real constructor resolves to no function, so the lookup separates them.
-    if fnIndexOfNode(e.callFn) < 0 {
-      if callee.identName == "Map" || callee.identName == "Set" {
-        return emitMapNew(exprIx, fnIx)
-      }
-    }
-  }
+  if mapNewCall(e) { return emitMapNew(exprIx, fnIx) }
   // G8: a map `m.has(k)` member-call yields a 0/1 i32 (linear scan).
   if callee is Member {
     if callee.memProp == "has" {
