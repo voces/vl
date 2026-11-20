@@ -577,6 +577,28 @@ print(orD(3, 4))
   },
 });
 
+// A `.push` onto a packed `u8` list takes its value as a plain i32, which the backing truncates,
+// as a packed list literal's elements do.
+Deno.test({
+  name: "ir shadow: a push of an i32 onto a u8 list is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function put(out: u8[], b: i32) { out.push(b) }
+function put2(out: u8[], b: i32) { out.push(b & 255) }
+const bs: u8[] = []
+put(bs, 300)
+put2(bs, 7)
+print(bs.length)
+print(bs[0])
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 2) || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want both pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
