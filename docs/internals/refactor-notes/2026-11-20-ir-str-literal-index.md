@@ -11,15 +11,15 @@ writes any string operand, and its index arm (`idxArmOf`) is `string`.
   they are the same literal node at the same rep, so a check and a read of two literals with equal
   text never pair. `irBoundsStrSelfTest` pins both faces.
 
-## Measured on fixpoint seeds: master `c4999b0b8` against this branch
+## Measured on fixpoint seeds: merge-base `f2ec7aa7c` (#9252) against this branch
 
 | | before | this branch |
 |---|---|---|
 | self-compile `blockers index receiver` | 29 | 0 |
-| self-compile functions claimed | 18,279 | 18,308 |
-| distilled functions claimed (`--claims`) | 40,547 | 40,547 |
+| self-compile functions claimed | 18,329 | 18,358 |
+| distilled functions claimed (`--claims`) | 40,548 | 40,548 |
 
 - **`ir-identity.sh`:** plain and `--names`, 9,037 identical, 0 differ, self-compile identical.
-  `--cases`: 7,516 identical, 0 differ.
+  `--cases`: 7,519 identical, 0 differ.
 - **Mode 3:** 0 differ, and the self-compile identical.
-- **L2 fuel**, same box: 103,311,615,925 → 103,295,151,900 (−0.016%).
+- **L2 fuel**, same box: 103,372,769,647 → 103,381,542,495 (+0.008%).
