@@ -24,6 +24,12 @@ where its `drop` ends (`condDeadEnd`, cleared by `condMark` as each condition st
 read-back starts there: what follows a net-zero `drop` at an instruction boundary is the
 condition's value. Witness: `tests/cases/narrowing/is-niche-never-dead-arm-of-an-instance.vl`.
 
+Debt, not built here: D932 decides a constant condition by reading the emitted bytes back, which is
+why a semantics fix (the receiver's `drop`) broke a decision. The durable fix is a pure
+decided-condition predicate (the niche and `is` arm decision itself) consulted instead of the bytes,
+by legacy and the IR alike; until it lands, any byte written ahead of a decided condition's constant
+must go through `condDeadEnd` or it silently un-decides the guard.
+
 ## The IR arms
 
 `boxTest` sends `isArmOf`'s `litArms` to `nicheIsTest`: `nicheNever` is the immediate `false` after
