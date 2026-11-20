@@ -26,8 +26,9 @@ this is part A's shape (`irBStageLeads`).
 - Verifier: that staged temp is used, at the global's rep.
 - `mapRecvKeyTail` now runs after the value's `if`. It writes no bytes and `mapSetTail` re-pins
   `cmSlot`; witnesses with an inner map op of the same and of another shape cover it.
+- A string-literal key is staged too, since #9289 let `irBStageLeads` stage a literal operand.
 - Named misses: a nullable map receiver (its `ref.as_non_null` would land above the `if`), a boxed
-  `??`, a string-literal key (`irBStageLeads` stages no `OStr`), and a reassigned receiver. The
+  `??`, and a reassigned receiver. The
   nullable guard asks the same `exprNullableMap` the receiver tail asks, so it passes exactly where
   the tail writes nothing; no matrix spelling reached it.
 

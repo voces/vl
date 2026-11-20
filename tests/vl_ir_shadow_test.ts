@@ -2124,9 +2124,9 @@ print(nullable(null))
 
 // A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
 // then the value. A global receiver (staged as its read), a local and a parameter, with a
-// variable or a call-result key, are staged below the `if`, covered and matched; so are values
-// that run a map op of the same or of another shape. A boxed `??` value and a literal key stay
-// legacy's, by name.
+// variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
+// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
+// name.
 Deno.test({
   name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
   ignore,
@@ -2163,11 +2163,11 @@ print(gi["k"] ?? 0)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
-      throw new Error(`want key, glob, loc, par and other covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (rows.get("uncovered map store short-circuit operand") !== 2) {
-      throw new Error(`want boxed and lit left to legacy by name, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered map store short-circuit operand") !== 1) {
+      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
     }
   },
 });
