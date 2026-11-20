@@ -32,4 +32,11 @@ lowers a literal of one item group, a spread source, through the IR.
 
 ## Readings
 
-READINGS
+Against a fixpoint at the merge-base c34a60bfd (candidate a fixpoint, 6,894,165 bytes):
+
+- Corpus functions with no blocker 40,615 → 40,765 (+150): every one-group spread; `array spread`
+  233 → `array spread groups` 83, the many-group literals PR 3 lowers. Shadow 40,765 covered,
+  verified and matched.
+- Corpus `ir-identity --names` 9,037 identical, 0 differ; `tests/cases` `--names` A/B 7,241
+  same, 0 differ, 1,394 fail under both; self-compile identical.
+- L2 self-compile fuel 103,413,854,970 → 103,480,022,716 (+0.06%).
