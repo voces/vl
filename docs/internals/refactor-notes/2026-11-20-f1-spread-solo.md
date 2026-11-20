@@ -39,11 +39,19 @@ lowers a literal of one item group, a spread source, through the IR.
 
 ## Readings
 
-Against a fixpoint at the merge-base c34a60bfd (candidate a fixpoint, 6,894,165 bytes):
+Against a fixpoint at the merge-base c4a2c8fdb (candidate a fixpoint, 6,901,388 bytes, and
+byte-identical to a build of `git archive HEAD`):
 
-- Corpus functions with no blocker 40,615 → 40,765 (+150): every one-group spread; `array spread`
-  233 → `array spread groups` 83, the many-group literals PR 3 lowers. Shadow 40,765 covered,
-  verified and matched.
-- Corpus `ir-identity --names` 9,037 identical, 0 differ; `tests/cases` `--names` A/B 7,241
-  same, 0 differ, 1,394 fail under both; self-compile identical.
-- L2 self-compile fuel 103,413,854,970 → 103,480,022,716 (+0.06%).
+- Corpus functions with no blocker 40,959 → 41,109 (+150): every one-group spread; `array spread`
+  233 → `array spread groups` 83, the many-group literals PR 3 lowers. Shadow 41,109 covered,
+  verified and matched. Self-compile functions covered 18,517 → 18,517 (the compiler holds no
+  spread literal).
+- Corpus `ir-identity --names` 9,037 identical, 0 differ; `tests/cases` `--names` A/B 7,244
+  same, 0 differ; `--cases` 7,524 identical, 0 differ; witnesses 59 same; mode-3 self-compile
+  identical.
+- A scratch probe seed summing every type table (`mAllocKind`, `sTyIx`, `sHeapIdx`, `rlElemTyIx`,
+  `rlWrapIdx`, `unTyIx`, `mvValTyIx`, `uVarTyIx`, `uVarRow`, `uVariants`) around `spreadLit`,
+  source build included: 0 probe rows over the corpus; its control, forcing a v128 pair mint,
+  fires. The probe seeds were discarded.
+- L2 self-compile fuel 103,357,419,293 → 103,436,743,388 (+0.08%); late demands 9 of 9, late tag
+  rows 307 of 307; seed 6,901,388 bytes, +0.1% on the baseline.
