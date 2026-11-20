@@ -96,7 +96,7 @@ import {
   irSpanNoteKind,
   irVarNew,
 } from "./ir"
-import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
+import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { irTyHeldOpen, irTyOpen, irVerify, numKindOf } from "./ir_verify"
 import {
   irAstKind,
@@ -124,6 +124,7 @@ import {
   arrNewFillBoxTy,
   arrNewPlanOf,
   asgValueArmOf,
+  atomHookArmOf,
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
@@ -141,6 +142,7 @@ import {
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
+  eqRouteOf,
   exprPrePathWhy,
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
@@ -159,6 +161,7 @@ import {
   idxStorePlainWhy,
   ifExprJoinVt,
   ifExprPlainWhy,
+  ifExprShapeWhy,
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
@@ -670,6 +673,15 @@ function objLit(b: i32[], ix: i32, rep: i32): Opnd {
       return objLitAt(b, ix, rr, rt, row, false)
     }
   }
+  // A variant literal is built at its layout row's type too, where that row's rep is another.
+  if objLitArmOf(ix, ibFnIx) == "variant" {
+    const vi = objLitVariantLayoutOf(ix, ibFnIx)
+    const vt = if vi >= 0 && vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 }
+    const vr = if vt >= 0 && !irTyOpen(vt) { repNodeOfTy(vt) } else { -1 }
+    if vr >= 0 && vr != rep && repNodeAt(vr) is RRecord {
+      return objLitAtVariantRow(b, ix, vi)
+    }
+  }
   return objLitAt(b, ix, rep, nodeTyAt(ix, ibFnIx), -1, false)
 }
 
@@ -747,13 +759,15 @@ function objLitAt(
 }
 
 // The struct field arms whose write is the value delivered at the field's rep: `plain`, the
-// widenings (`emitWidened`, `widenPlanOf`) and the box (`emitUnionBoxOwed`, the hole box plan).
+// widenings (`emitWidened`, `widenPlanOf`), the box (`emitUnionBoxOwed`, the hole box plan) and a
+// nullable record's value where `emitArmDelivery` owes no unbox (`fieldPlainWhy` checks that).
 function fieldArmDelivers(fa: StructFieldArm): boolean {
   return fa == "plain"
     || fa == "f64"
     || fa == "i64"
     || fa == "f32"
     || fa == "union"
+    || fa == "armDelivery"
 }
 
 // Whether the literal's field rep `dst` is the slot arm `fa` writes: the row a literal is built at
@@ -806,6 +820,9 @@ function fieldPlainWhy(
   }
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
   if !fieldArmDelivers(fa) { return "object field " + fa }
+  if fa == "armDelivery" && narrowedArmNeedsUnbox(valIx, ibFnIx) {
+    return "object field arm unbox"
+  }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
   // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
   if (
@@ -1197,9 +1214,15 @@ function condIsTest(ix: i32): boolean {
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
 function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
+  return ifExprAt(b, n0, ix0, rep0, -1)
+}
+
+// `ifExpr`, its first link built at type `ty0` where that is not -1: a destination's own, whose
+// rep `rep0` each arm then delivers at. Such a link ends the chain.
+function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   const rj = ifRefJoinOf(ix0, ibFnIx)
   const rk = rj.rjKind
-  if rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
+  if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
     return ifRefExpr(b, n0, ix0, rep0, rj)
   }
   // The head's rep is the one the join plan writes every link at, else the chain is legacy's.
@@ -1220,7 +1243,8 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   let cix = ix0
   const crep = rep0
   while true {
-    const pw = ifExprPlainWhy(cix, ibFnIx)
+    // A link built at a destination's type is `emitIfExprAs` at that type: its shape alone.
+    const pw = if ty0 >= 0 { ifExprShapeWhy(cix, ibFnIx) } else { ifExprPlainWhy(cix, ibFnIx) }
     if pw != "" { return irBMiss("expression if " + pw) }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
@@ -1229,8 +1253,9 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
       return irBMiss("decided is condition")
     }
     // Every link is written at the head's kind (`emitIfExprAs` asks `ifJoinPlanOf` of the head
-    // alone), so a link takes the head's rep and type, never its own.
-    const ty = if cix == ix0 { nodeTyAt(cix, ibFnIx) } else { tys[0] }
+    // alone), so a link takes the head's rep and type, never its own; a head built at a
+    // destination's type takes `ty0`.
+    const ty = if cix != ix0 { tys[0] } else if ty0 >= 0 { ty0 } else { nodeTyAt(cix, ibFnIx) }
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
     const thenB = ifArm(n.ifThen, t, crep)
@@ -1253,6 +1278,7 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
+    if ty0 >= 0 { return irBMiss("atom if join chain") }
     // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
     if !direct && armHasPrelude(n.ifElse) {
       return irBMiss("expression if else prelude")
@@ -2711,6 +2737,30 @@ function pushStage(
   return st
 }
 
+// A `==`/`!=` legacy writes on its numeric tail (`eqRouteOf`'s `numeric`) over a `boolean | null` niche and a bool or another
+// niche: each operand's i32 cell, then the plain compare.
+function nicheBoolEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const p = binPrimOp(n.binOp, false)
+  if p == null { return irBMiss("operator " + n.binOp) }
+  const l = irBExpr(b, n.binLeft)
+  const at = b.length
+  const r = irBExpr(b, n.binRight)
+  if ibMiss != "" { return l }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return l }
+  const lr = irBOpRep(l)
+  const rr = irBOpRep(r)
+  const ln = repBoolNiche(lr)
+  const rn = repBoolNiche(rr)
+  if (
+    !(ln || rn)
+    || !(ln || repPrim(lr) == "bool")
+    || !(rn || repPrim(rr) == "bool")
+  ) {
+    return irBMiss(OPERAND_TYPE)
+  }
+  return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
+}
+
 // Why operand `ix` is outside the set, or "": it must be typed at a numeric primitive or
 // `boolean`, whose signedness picks the op (`opUnsigned`).
 function operandWhy(ix: i32): string {
@@ -2810,7 +2860,24 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   // `emitVariantStruct` builds it.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && boxOwedAt(ix, ibFnIx) {
     const vi = boxLitArmRow(ix)
-    if vi >= 0 { return boxTempAt(b, armLit(b, ix, vi), ix, dst, vi) }
+    if vi >= 0 {
+      return boxTempAt(b, objLitAtVariantRow(b, ix, vi), ix, dst, vi)
+    }
+  }
+  // A join of member literals the hook takes is built at an atom destination, each arm's
+  // literal its id, as legacy's `emitIfExprAs` writes it (`atomHookArmOf`'s `litJoin`).
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && repNodeAt(dst) is RAtom
+    && exprPrePathWhy(ix, ibFnIx) == "pre-path atom hook"
+    && atomHookArmOf(ix, ibFnIx, false) == "litJoin"
+  ) {
+    const jn = nodeAt(unwrapParen(ix))
+    const jt = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+    if jn is IfStmt && jt >= 0 {
+      return ifExprAt(b, jn, unwrapParen(ix), dst, jt)
+    }
   }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
@@ -2850,16 +2917,17 @@ function boxLitArmRow(ix: i32): i32 {
   return p.hbKind
 }
 
-// Object literal `ix` built at variant row `vi`, at the row's own type.
-function armLit(b: i32[], ix: i32, vi: i32): Opnd {
+// Object literal `ix` built at variant row `vi`, at the row's own type: a box's arm and a literal
+// whose own type the row widens are both built where legacy builds them.
+function objLitAtVariantRow(b: i32[], ix: i32, vi: i32): Opnd {
   const pre = exprPrePathWhy(ix, ibFnIx)
   if pre != "" { return irBMiss(pre) }
   const ty = if vi < uVarTyIx.length { uVarTyIx[vi] } else { -1 }
-  if ty < 0 { return irBMiss("box literal arm type") }
+  if ty < 0 { return irBMiss("variant row literal type") }
   // In a generic instance the row's registered type may still carry a variable.
   const rep = repNodeOfTy(ty)
   if irTyOpen(ty) || irTyHeldOpen(ty, rep) {
-    return irBMiss("open box literal arm type")
+    return irBMiss("open variant row literal type")
   }
   return objLitAt(b, unwrapParen(ix), rep, ty, vi, true)
 }
@@ -4021,6 +4089,9 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     ) {
       if irUnionEqHook(ix, ibFnIx) { return unionEq(b, n, ix, rep) }
       if irListEqHook(ix, ibFnIx) { return listEq(b, n, ix, rep) }
+      if eqRouteOf(n, ix, ibFnIx) == "numeric" {
+        return nicheBoolEq(b, n, ix, rep)
+      }
     }
     const p = binPrimOp(n.binOp, opUnsigned(n.binLeft))
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
@@ -4508,7 +4579,10 @@ function ifChain(b: i32[], ix: i32) {
     out = nb
     cur = n.ifElse
   }
-  let elseB = bodyOf(elseStmts(lastElse))
+  // A dead `else` (`ifWritesElse`) is neither written nor counted by legacy, so it is not built.
+  const ll = nodeAt(links[links.length - 1])
+  const deadElse = ll is IfStmt && lastElse >= 0 && !ifWritesElse(ll)
+  let elseB = if deadElse { [] } else { bodyOf(elseStmts(lastElse)) }
   let k = links.length - 1
   while k >= 0 {
     const ln = nodeAt(links[k])

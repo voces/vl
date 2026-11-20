@@ -7,7 +7,7 @@
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { RAtom, RNullable, RRaw, repNodeAt } from "./emit_rep"
+import { RAtom, RNullable, RRaw, RpPrim, repNodeAt } from "./emit_rep"
 import {
   ArrayLit,
   AsExpr,
@@ -167,6 +167,7 @@ import {
   irRhsOpnds,
   irSigOf,
   primOpcode,
+  repBoolNiche,
   repIsNoValue,
   repPrim,
 } from "./ir"
@@ -329,7 +330,7 @@ import {
   mapRecvShapeOf,
   mapSetTail,
   mapSizeTail,
-  narrowedFieldTail,
+  narrowedMemTail,
   narrowedVariantTail,
   nulTestAtomTail,
   nulTestBoolTail,
@@ -415,7 +416,7 @@ import {
   spreadWrapIdx,
 } from "./emit_plan_list"
 import { fbOpenIf } from "./emit_bytes"
-import { fbRefIfOpenType } from "./wasmEmit"
+import { atomHookArmOf, fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
 import { arrLitArmOf, forInLoopAt } from "./emit_plan_list"
@@ -633,7 +634,9 @@ function imm(o: OImm) {
 function primOp(r: RPrimOp) {
   const a = r.poArgs
   if a.length == 0 { return irLMiss("operandless op") }
-  const p = repPrim(opRepOf(a[0]))
+  // A `boolean | null` niche compares at its i32 cell, as a bool does.
+  const niche: RpPrim = "bool"
+  const p = if repBoolNiche(opRepOf(a[0])) { niche } else { repPrim(opRepOf(a[0])) }
   if p == null { return irLMiss("op over a non-primitive") }
   const ps: string = p
   // A negated float literal is the literal with its sign bit flipped, as legacy writes it.
@@ -1096,7 +1099,12 @@ function boxField(r: RBoxField) {
   const idx = narrowedFieldPlain(r.bfAt, fnIx)
   if idx < 0 { return irLMiss("box field shape") }
   irLOpnd(r.bfV)
-  narrowedFieldTail(memNarrowVariantIndex(r.bfAt, fnIx), idx, r.bfAt, fnIx)
+  if (
+    narrowedMemTail(memNarrowVariantIndex(r.bfAt, fnIx), idx, r.bfAt, fnIx)
+    < 0
+  ) {
+    return irLMiss("box field unbox")
+  }
   if readOwesNonNullRecover(r.bfAt, fnIx) { fbRefAsNonNull() }
   return 0
 }
@@ -2411,10 +2419,19 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   const rr = repNodeAt(lw.irVars[t].vRep)
   // An atom join, nullable at the `-1` niche or not, is an `i32` `if` (`emitIfExprAs` at 127).
   const atomOut = rr is RAtom || rr is RNullable && rr.rnDisc == 3
-  const vt = if atomOut { 0x7f } else { valtypeOf(lw.irVars[t].vRep) }
   const refOut = lw.irHelper && rr is RRaw
   // A reference join takes legacy's blocktype for the `if` at its node (`emitIfExprRef`).
   const at = lw.irNodeAt[id] ?? -1
+  // A join the atom hook takes at an atom out is the hook's while no raw read of it runs, and
+  // opens at the i32 blocktype the hook passes `emitIfExprAs`.
+  const atomJoin = at >= 0
+    && rr is RAtom
+    && atomHookArmOf(at, lw.irAt, false) == "litJoin"
+  if atomJoin && atomHookArmOf(at, lw.irAt, true) != "litJoin" {
+    irLMiss("atom if join raw read")
+    return IF_DONE
+  }
+  const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
   // A string out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
   const strOut = repPrim(lw.irVars[t].vRep) == "str"
     && at >= 0
