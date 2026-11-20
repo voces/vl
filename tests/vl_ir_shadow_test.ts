@@ -776,9 +776,10 @@ Deno.test({
 });
 
 // Legacy writes a short-circuit argument's `if` in place, above the arguments before it, whether
-// they are locals, globals or temps: the builder names that rather than lowering it out of order.
+// they are locals, globals or temps: the lowering stages each earlier one below the `if`, in order,
+// so each function lowers and matches. `re` reads `n` before a condition that writes it.
 Deno.test({
-  name: "ir shadow: a short-circuit argument after another is a named miss, not a fallback",
+  name: "ir shadow: a short-circuit argument after another is staged below its `if` and matches",
   ignore,
   fn: () => {
     const src = `let g: i32[] = [1]
@@ -790,17 +791,27 @@ function k(a: i32, c: boolean, d: boolean): i32 {
 }
 function f(x: boolean, y: boolean): i32 { return h(g, x || y) }
 function f2(x: boolean, y: boolean): i32 { return h([1], x && y) }
-print(k(2, true, false) + f(true, false) + f2(false, true))
+let n = 1
+function bump(): boolean {
+  n = n + 1
+  return true
+}
+function re(q: boolean): i32 { return pair(n, bump() && q) }
+print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 `;
     const { rows } = run(src, true);
-    const want = "uncovered short-circuit argument after another";
-    if (rows.get(want) !== 3) throw new Error(`want three "${want}" rows, got ${JSON.stringify([...rows])}`);
+    const miss = "uncovered short-circuit argument after another";
+    if (rows.has(miss)) throw new Error(`want no "${miss}" row, got ${JSON.stringify([...rows])}`);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("fns")! >= 7) || rows.get("matched") !== rows.get("fns")) {
+      throw new Error(`want every function matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
-// in that later operand; one in the first operand written stays covered.
+// in that later operand; one in the first operand written stays covered, and an intrinsic's
+// earlier argument is staged below the `if` (`intr`).
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -837,7 +848,6 @@ print(intr(true, 0.5))
       ["uncovered store short-circuit operand", 2],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["uncovered short-circuit argument after another", 1],
       ["uncovered push short-circuit operand", 1],
       ["start uncovered map store short-circuit operand", 1],
     ];
@@ -845,7 +855,10 @@ print(intr(true, 0.5))
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (!(rows.get("matched")! >= 1)) throw new Error(`want \`first\` matched, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered short-circuit argument after another")) {
+      throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
+    }
+    if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
   },
 });
 

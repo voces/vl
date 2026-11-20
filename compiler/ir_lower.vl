@@ -115,6 +115,7 @@ import {
   RRecover,
   RRel,
   RRetag,
+  RStage,
   RStrOp,
   RTagIs,
   RTagOf,
@@ -144,6 +145,7 @@ import {
   STrap,
   irFnNew,
   irNoTailHas,
+  irRhsOpnds,
   irSigOf,
   primOpcode,
   repIsNoValue,
@@ -399,8 +401,13 @@ let lwTempDef: boolean[] = []
 let lwTempUsed: boolean[] = []
 // Locals a valued `if` left on the stack, read once as a temp is.
 let lwStackVal: boolean[] = []
-// How many of those values are on the stack, not yet read.
-let lwStackLive = 0
+// Those values on the stack, not yet read, bottom first. A reader takes the lowest above
+// `lwFloor`, the count beneath the valued `if` being written, which nothing in that `if` reads.
+let lwLive: i32[] = []
+// Where each of `lwLive` ends in the buffer: a reader writes nothing between two of them.
+let lwLiveEnd: i32[] = []
+let lwFloor = 0
+let lwFloors: i32[] = []
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -429,6 +436,11 @@ function tempDefined(v: i32): boolean {
 }
 
 function tempRhs(v: i32): Rhs {
+  // A staged temp is a value on the stack, which no reader may rewrite from its definition.
+  if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
+    const none: Rhs = { ggSym: -1, ggNonNull: false }
+    return none
+  }
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
   const none: Rhs = { ggSym: -1, ggNonNull: false }
   return none
@@ -449,6 +461,9 @@ function isTemp(v: i32): boolean {
 // a temp's one use is taken in its order and its right-hand side never written; a variable
 // reads nothing.
 export function irLSkip(o: Opnd) {
+  if o is OVar && o.ov >= 0 && o.ov < lwStackVal.length && lwStackVal[o.ov] {
+    return irLMiss("staged operand skipped")
+  }
   if o is OVar && isTemp(o.ov) {
     if !tempDefined(o.ov) { return irLMiss("temp used before its definition") }
     if !takeUse(o.ov) { return irLMiss("non-stack temp: used twice") }
@@ -468,8 +483,8 @@ export function irLOpnd(o: Opnd) {
       const v = o.ov
       if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
         if !takeUse(v) { return irLMiss("non-stack temp: used twice") }
+        if !liveTake(v) { return irLMiss("stack value read out of order") }
         lwSeq.push(v)
-        lwStackLive = lwStackLive - 1
         return 0
       }
       if isTemp(v) {
@@ -495,10 +510,39 @@ export function irLOpnd(o: Opnd) {
   }
 }
 
+// Takes stack value `v` off the live stack when it is the lowest above the floor, the next a
+// reader in order may take; false, leaving it, when it is not.
+function liveTake(v: i32): boolean {
+  if lwFloor >= lwLive.length || lwLive[lwFloor] != v { return false }
+  // A byte written since the top value ended would land above it, where legacy has it below.
+  if lwBuf.length != lwLiveEnd[lwLive.length - 1] { return false }
+  const rest: i32[] = []
+  const ends: i32[] = []
+  let i = 0
+  while i < lwLive.length {
+    if i != lwFloor {
+      rest.push(lwLive[i])
+      ends.push(lwLiveEnd[i])
+    }
+    i = i + 1
+  }
+  lwLive = rest
+  lwLiveEnd = ends
+  return true
+}
+
+// Puts value `v`, just written, on the live stack.
+function livePush(v: i32) {
+  lwStackVal[v] = true
+  lwLive.push(v)
+  lwLiveEnd.push(lwBuf.length)
+  return 0
+}
+
 // Before a value that reads no operand: one written while a valued `if`'s value waits on the
 // stack lands above it, out of order.
 function leaf() {
-  if lwStackLive > 0 && !lwPushing {
+  if lwLive.length > lwFloor && !lwPushing {
     irLMiss("operand above a valued if's value")
   }
 }
@@ -664,6 +708,7 @@ function rhs(r: Rhs, tail: boolean) {
     RAtomEq => atomEq(r)
     RUnionEq => unionEq(r)
     RRetag => irLOpnd(r.rgV)
+    RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
     RNullOf => {
       leaf()
@@ -1789,6 +1834,98 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   return IF_DONE
 }
 
+// Writes the temps an earlier operand left pending below the valued `if` about to open on `c`,
+// in definition order, as legacy writes that operand first; each root stays on the stack for its
+// one reader after the `if`, and `pending` keeps the condition's temps. Returns the roots.
+function stageLead(c: Opnd, pending: i32[]): i32[] {
+  const roots: i32[] = []
+  if pending.length == 0 { return roots }
+  // Keyed by the pending temps alone: every valued `if` of a function asks, so it costs theirs.
+  const inCond: {[i32]: boolean} = Map()
+  const readBy: {[i32]: boolean} = Map()
+  condTemps(c, inCond)
+  // A temp another pending temp's definition reads is written inside that one, not staged.
+  for v in pending {
+    if v >= 0 && v < lwStackVal.length && !lwStackVal[v] {
+      for o in irRhsOpnds(lwTempRhs[v]) {
+        if o is OVar { readBy[o.ov] = true }
+      }
+    }
+  }
+  let k = 0
+  while k < pending.length && !inCond.has(pending[k]) { k = k + 1 }
+  let i = k
+  while i < pending.length {
+    if !inCond.has(pending[i]) {
+      irLMiss("staged operand interleaves the condition")
+      return roots
+    }
+    i = i + 1
+  }
+  lwSeq = []
+  i = 0
+  while i < k {
+    const v = pending[i]
+    if !readBy.has(v) {
+      roots.push(v)
+      if !lwStackVal[v] { stageRoot(v) }
+      lwSeq.push(v)
+    }
+    i = i + 1
+  }
+  // The roots and the temps their definitions read reach the stack in definition order.
+  i = 0
+  while i < k {
+    if i >= lwSeq.length || lwSeq[i] != pending[i] {
+      irLMiss("non-stack temp: out of order")
+      return roots
+    }
+    i = i + 1
+  }
+  if lwSeq.length != k { irLMiss("non-stack temp: out of order") }
+  lwSeq = []
+  const rest: i32[] = []
+  i = k
+  while i < pending.length {
+    rest.push(pending[i])
+    i = i + 1
+  }
+  while pending.length > 0 { pending.pop() }
+  for v in rest { pending.push(v) }
+  return roots
+}
+
+// How many of `vs` are values on the stack.
+function liveCountIn(vs: i32[]): i32 {
+  let k = 0
+  for v in vs {
+    if v >= 0 && v < lwStackVal.length && lwStackVal[v] { k = k + 1 }
+  }
+  return k
+}
+
+// Writes temp `v`'s definition now and leaves its value on the stack, above any already there.
+function stageRoot(v: i32) {
+  // It lands above the roots staged before it, as legacy writes the operands in turn.
+  lwPushing = true
+  rhs(lwTempRhs[v], false)
+  lwPushing = false
+  return livePush(v)
+}
+
+// Marks in `into` the temps condition `c` consumes: its own operand, and every temp a pending
+// definition among them reads.
+function condTemps(c: Opnd, into: {[i32]: boolean}) {
+  if !(c is OVar) || c.ov < 0 || c.ov >= lw.irVars.length || into.has(c.ov) {
+    return 0
+  }
+  into[c.ov] = true
+  if c.ov < lwStackVal.length && lwStackVal[c.ov] { return 0 }
+  if !isTemp(c.ov) { return 0 }
+  for o in irRhsOpnds(lwTempRhs[c.ov]) { condTemps(o, into) }
+  return 0
+}
+
 // An `if` whose arms each end by writing its slotless out: a value-typed `if` (legacy's `&&` and
 // `||`), whose result stays on the stack for the out's one later read.
 function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
@@ -1817,7 +1954,15 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     irLMiss("valued if rep")
     return IF_DONE
   }
+  const roots = stageLead(n.siCond, pending)
+  if lwMiss != "" { return IF_DONE }
+  // The condition is written before the `if` opens and may read values already on the stack;
+  // the `if` itself reads none of the values beneath it.
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
   cond(n.siCond, pending)
+  lwFloor = lwLive.length
+  for r in roots { pending.push(r) }
   if rr is RRaw && refOut {
     fbIfRefNul(rr.rwHeap, rr.rwNull)
   } else if strOut {
@@ -1856,8 +2001,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if n.cbArm == "valBox" || n.cbArm == "valScalar" { irLOpnd(n.cbL) }
   lwFrames.pop()
   if coalBoxEnd(n.cbArm, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
-  lwStackVal[t] = true
-  lwStackLive = lwStackLive + 1
+  livePush(t)
   pending.push(t)
   return 0
 }
@@ -1867,11 +2011,12 @@ function coalBox(n: SCoalBox, pending: i32[]) {
 function ifClose(id: i32, k: i32, pending: i32[]) {
   lwFrames.pop()
   fbEnd()
-  if k != IF_VALUED || id < 0 || id >= lw.irNodes.length { return 0 }
+  if k != IF_VALUED { return 0 }
+  lwFloor = lwFloors.pop() ?? 0
+  if id < 0 || id >= lw.irNodes.length { return 0 }
   const n = lw.irNodes[id]
   if n is SIf && n.siOut >= 0 && n.siOut < lwStackVal.length {
-    lwStackVal[n.siOut] = true
-    lwStackLive = lwStackLive + 1
+    livePush(n.siOut)
     pending.push(n.siOut)
   }
   return 0
@@ -1893,8 +2038,7 @@ function valuedBlock(n: SBlock, pending: i32[]) {
   body(n.bkBody, false, t)
   lwFrames.pop()
   fbEnd()
-  lwStackVal[t] = true
-  lwStackLive = lwStackLive + 1
+  livePush(t)
   pending.push(t)
   return 0
 }
@@ -2112,7 +2256,10 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwTempDef = []
   lwTempUsed = []
   lwStackVal = []
-  lwStackLive = 0
+  lwLive = []
+  lwLiveEnd = []
+  lwFloor = 0
+  lwFloors = []
   const none: Rhs = { ggSym: -1, ggNonNull: false }
   for _v in f.irVars {
     lwTempRhs.push(none)
@@ -2144,7 +2291,10 @@ type LwFrame = {
   lfTempDef: boolean[],
   lfTempUsed: boolean[],
   lfStackVal: boolean[],
-  lfStackLive: i32,
+  lfLive: i32[],
+  lfLiveEnd: i32[],
+  lfFloor: i32,
+  lfFloors: i32[],
   lfSeq: i32[],
   lfFrames: i32[],
   lfSpanOpen: i32[],
@@ -2168,7 +2318,10 @@ function lwSave(): LwFrame {
     lfTempDef: lwTempDef,
     lfTempUsed: lwTempUsed,
     lfStackVal: lwStackVal,
-    lfStackLive: lwStackLive,
+    lfLive: lwLive,
+    lfLiveEnd: lwLiveEnd,
+    lfFloor: lwFloor,
+    lfFloors: lwFloors,
     lfSeq: lwSeq,
     lfFrames: lwFrames,
     lfSpanOpen: lwSpanOpen,
@@ -2193,7 +2346,10 @@ function lwRestore(f: LwFrame) {
   lwTempDef = f.lfTempDef
   lwTempUsed = f.lfTempUsed
   lwStackVal = f.lfStackVal
-  lwStackLive = f.lfStackLive
+  lwLive = f.lfLive
+  lwLiveEnd = f.lfLiveEnd
+  lwFloor = f.lfFloor
+  lwFloors = f.lfFloors
   lwSeq = f.lfSeq
   lwFrames = f.lfFrames
   lwSpanOpen = f.lfSpanOpen
