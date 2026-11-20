@@ -39,26 +39,33 @@ only on `null`. The same core serves the `coll` and `clo` niche arms.
 ## Coverage
 
 Fixpoint seeds of this branch and of its merge base, master `f2ec7aa7c`, each building this
-branch's source:
+branch's source (plain block, join, and call operands at the join):
 
 | population | master | this branch |
 | --- | ---: | ---: |
-| self-compile functions covered | 18,412 | 18,412 |
-| corpus functions covered (45,678) | 40,615 | 40,623 |
+| self-compile functions covered | 18,417 | 18,417 |
+| corpus functions covered (45,678) | 40,615 | 40,660 |
 
-An earlier +15 / +119 reading compared against a seed of an older master (`89210abc4`) than this
-branch's base, and so counted #9243 and #9245. The plain block's own population is small: the
-probe's name operands mostly take legacy's join shape, which this phase does not build.
+The plain block alone read +8 corpus on the same base; the join and its call operands bring the
+rest. An earlier +15 / +119 reading of the plain block compared against an older master
+(`89210abc4`) than this branch's base, and so counted #9243 and #9245.
 
-| remaining blocker (corpus, this branch) | alone | with others |
-| --- | ---: | ---: |
-| `coalesce nulRef join` (default joins into a union box) | 38 | 24 |
-| `coalesce box next` (call operands) | 50 | 129 |
+On this branch, 120 corpus functions are blocked by `member box` alone: their `??` builds, and a
+union-box member read elsewhere in the function is the last miss (IR5, #9259). Remaining `??`
+blockers: `coalesce nulRef heap` 18, `coalesce nulRef operand temp` 12 (a plain block over a call),
+`coalesce box next` 2 alone and 9 with `member box`.
 
-- **Witnesses** (`vl_ir_shadow_test`): six functions, covered and matched where master covers one: a
-  record with a name and a nullable default, a call default that runs once (`calls` prints 1), a
-  union arm's variant, and a nullable list.
+- **Join default:** legacy writes it with `emitUnionBoxAtRecord`. The IR builds only its
+  recorded-box branch (`boxOwedAt`, which `deliver` shares); a default already of a union, or one
+  boxed at no site type, misses as `coalesce nulRef join default`.
+- **The staged slot:** `optRecvSlot` is the function's reserved local (`fnUses.optRecv`). A join
+  nested in the default re-tees it only on the outer null path, where the outer present arm never
+  reads it, and a join inside the operand finishes before the outer tee.
+- **Witnesses** (`vl_ir_shadow_test`), covered and matched where master misses: the plain block
+  (six functions, a call default that runs once), and the join (a name, a call whose default runs
+  once, and a join nested in the default; prints 52, 73, 1, 55).
 - **Byte proof:** mode 3 identical; `ir-identity` corpus 9,037 identical, differ 0, self-compile
   identical; `--cases` 7,519 identical, differ 0, witnesses 59 same; per-file `tests/cases` A/B
   7,234 same, differ 0.
 - **L2 fuel:** +0.1% on the 103.31G baseline.
+- **Compiler lines:** +289 / −61.
