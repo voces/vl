@@ -727,9 +727,9 @@ print(h(true))
   },
 });
 
-// A fused `xs.pop() ?? d` on a held, a staged (global) and an f64 receiver, with a variable default,
-// and a default that reassigns the receiver: legacy's shared open, then its default in the empty
-// arm, every function matching legacy's bytes.
+// A fused `xs.pop() ?? d` on a held, a staged (global), a staged (field) and an f64 receiver, with
+// a variable default, and a default that reassigns the receiver: legacy's shared open, then its
+// default in the empty arm, every function matching legacy's bytes.
 Deno.test({
   name: "ir shadow: a fused pop with a default is covered and matched",
   ignore,
@@ -739,19 +739,21 @@ function a(xs: i32[]): i32 { return xs.pop() ?? -1 }
 function b(): i32 { return g.pop() ?? 0 }
 function c(xs: f64[]): f64 { return xs.pop() ?? 0.5 }
 function d(xs: i32[], k: i32): i32 { return xs.pop() ?? k }
+type Box = { xs: i32[] }
+function f(o: Box): i32 { return o.xs.pop() ?? 0 }
 function e(p: i32): i32 {
   let xs: i32[] = []
   const other: i32[] = [7, 8, 9]
   const v = xs.pop() ?? (xs = other).length
   return v * 10 + xs.length
 }
-print(a([3]) + b() + d([], 6) + e(1))
+print(a([3]) + b() + d([], 6) + e(1) + f({ xs: [4] }))
 print(c([]))
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
-      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
