@@ -2360,3 +2360,42 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// An atom pushed into a `string[]` or a `(string | null)[]` decodes to its member string at
+// the push, as legacy's `emitStrValue` does.
+Deno.test({
+  name: "ir shadow: an atom pushed into a string list decodes and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type K = "i32" | "f64" | "str"
+type P = { name: K, n: i32 }
+function names(ps: P[]): string[] {
+  const out: string[] = []
+  for p in ps { out.push(p.name) }
+  return out
+}
+function opt(p: P): (string | null)[] {
+  const out: (string | null)[] = []
+  out.push(p.name)
+  out.push(null)
+  return out
+}
+function lit(): string[] {
+  const out: string[] = []
+  const k: K = "f64"
+  out.push(k)
+  return out
+}
+const ps: P[] = [{ name: "i32", n: 1 }, { name: "str", n: 2 }]
+print(names(ps)[1])
+print(opt(ps[0]).length)
+print(lit()[0])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
