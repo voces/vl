@@ -5,7 +5,6 @@
 // Every other element or member read is a named miss. `irRefInstall` sets the hooks.
 
 import { BinExpr, Index, Member, nodeAt } from "./ast"
-import { T, TyObj, tyAt } from "./check_types"
 import { OStr, OVar, Opnd, StrOp, repPrim, repWhat } from "./ir"
 import {
   ifBelowLeadOf,
@@ -13,7 +12,6 @@ import {
   irBExpr,
   irBFnIx,
   irBLetTemp,
-  irBLetTempTy,
   irBMiss,
   irBNoValue,
   irBNode,
@@ -131,14 +129,6 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { lgV: v, lgIx: i, lgAt: ix }, ix, rep)
 }
 
-// The declared type of field `k` of record type `ty`, or -1.
-function fieldDeclTy(ty: i32, k: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = tyAt(ty)
-  if !(t is TyObj) || k < 0 || k >= t.objFieldTypes.length { return -1 }
-  return t.objFieldTypes[k]
-}
-
 // A member read, routed by its receiver's rep: a record's own `length` field never reaches a
 // list or string arm.
 function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
@@ -175,21 +165,14 @@ function buildMember(b: i32[], ix: i32, rep: i32): Opnd {
     const own = memFieldUnionBox(ix, fnIx)
       && rep == repNodeOfTy(nodeTyAt(ix, fnIx))
     const kr = repNodeKids(r)[k]
-    // A nullable field the checker narrowed past its null is read at its own rep and recovered
-    // to the read's, as a narrowed nullable local is (`RRecover`).
+    // A nullable field the checker narrowed past its null reads at its inner rep: legacy's field
+    // tail writes the read's recover (`readOwesNonNullRecover`), as for any member read.
     const kn = repNodeAt(kr)
-    const recover = kr != rep && !own && kn is RNullable && kn.rnInner == rep
-    if kr != rep && !own && !recover { return irBMiss("field read coercion") }
+    const narrowed = kn is RNullable && kn.rnInner == rep
+    if kr != rep && !own && !narrowed { return irBMiss("field read coercion") }
     const rv = irBExpr(b, n.memObj)
     if missed(rv) { return rv }
     irBNoteFieldReread(ix, k)
-    if recover {
-      const ft = fieldDeclTy(nodeTyAt(n.memObj, fnIx), k)
-      if ft < 0 { return irBMiss("field read type") }
-      const fv = irBLetTempTy(b, { gfV: rv, gfIx: k, gfAt: ix }, ix, kr, ft)
-      if missed(fv) { return fv }
-      return irBLetTemp(b, { rcV: fv, rcAt: ix }, ix, rep)
-    }
     return irBLetTemp(b, { gfV: rv, gfIx: k, gfAt: ix }, ix, rep)
   }
   // A field read off a box local narrowed to one variant.
