@@ -16,7 +16,8 @@ The arm's writers read the field at its storage: legacy's `emitHoleBox`, the IR 
 when it lowers) each enter `memberBoxReadEnter`, the storage mark plus a seat for that read, and
 `boxedArmAtRow` declines only for the seated read. The plain storage mark alone is `emitIs`'s, and
 its decisions are unchanged. `memberBoxReadAt` asks `boxedArmOfMember` before the plan, so no other
-delivery's plan is asked early (asking it of every delivery moved an unrelated module's rows).
+delivery's plan is asked early: asking it of every delivery moved an unrelated module's rows,
+a side effect of the plan filed as D17030.
 
 The arm shares the field's box where `rec` built a fresh one. That is unobservable while no writer
 mutates a union box in place: no `fbStructSet` in `compiler/*.vl`, and no IR `struct.set` effect,
