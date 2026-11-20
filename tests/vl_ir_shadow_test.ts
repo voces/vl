@@ -1673,3 +1673,58 @@ print(f([1, 2], [3]) + g([4]))
     }
   },
 });
+
+// A push whose value is a short-circuit (a valued `if`): legacy stages a non-local receiver, then
+// writes the value. A global, a field and an index receiver, at statement and value position, are
+// staged by their own `RListStage` ahead of the `if`, covered and matched. A push whose value
+// pushes (D1280's late receiver) and one in a later call argument stay legacy's, by name.
+Deno.test({
+  name: "ir shadow: a push of a short-circuit value stages its receiver ahead of the if",
+  ignore,
+  fn: () => {
+    const src = `type Box = { bs: boolean[] }
+let gb: boolean[] = []
+let gn: i32[] = []
+let gm: i32[] = []
+function two(a: i32, b: i32): i32 { return a * 10 + b }
+function glob(a: boolean, c: boolean) {
+  gb.push(a && c)
+}
+function field(x: Box, a: boolean, c: boolean) {
+  x.bs.push(c || a)
+}
+function index(rs: boolean[][], a: boolean, c: boolean): i32 {
+  return rs[0].push(a && c)
+}
+function nest() {
+  gn.push(gm.push(4))
+}
+function arg(a: boolean, c: boolean) {
+  print(two(7, gb.push(a || c)))
+}
+const x: Box = { bs: [] }
+const rs: boolean[][] = [[]]
+glob(true, false)
+field(x, false, true)
+print(index(rs, true, true))
+nest()
+arg(false, false)
+print(gb[0])
+print(x.bs[0])
+print(gn[0])
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+      throw new Error(`want two, glob, field, index covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (
+      rows.get("uncovered push late receiver") !== 1 ||
+      rows.get("uncovered short-circuit argument after another") !== 1
+    ) {
+      throw new Error(`want nest and arg left to legacy by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
