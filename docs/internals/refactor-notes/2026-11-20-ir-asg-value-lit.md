@@ -14,6 +14,15 @@ the immediate as `primOp` folds a `neg` of one (integer `0 - x`, float sign bit)
 literal is never a temp and can be rebuilt. `widenTo`'s `asgLit` arm rebuilds it at the
 destination's rep in place of the immediate the operand built.
 
+Two spellings stay legacy's, each a named miss. The `tests/cases` shadow found both; the distilled
+corpus holds neither.
+- `box of an effect's immediate` (`boxTempAt`): the value boxed into a union, as in
+  `return if c { x = 5 }` at an `i32 | null` result. Legacy's box writer may leave an immediate
+  unread, so the verifier's rule 2 refuses one that stands for a node with an effect.
+- `assignment value lit after an operand`: the assignment after a call operand,
+  `h(k(), f = 4)`. The store is a statement, and the call's temp cannot wait across it on the
+  stack (the lowering's `non-stack temp: out of order`), the rung the coalesce arms take.
+
 ## Measured
 
 See the PR body (fixpoint seeds on both sides, merge-base `6851d881`).

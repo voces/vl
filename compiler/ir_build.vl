@@ -399,6 +399,7 @@ import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
+  exprEffectFree,
   objFieldSrcOrder,
   objFieldVal,
   unwrapParen,
@@ -2875,6 +2876,11 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
   const why = boxPlanWhy(p, v)
   if why != "" { return irBMiss(why) }
+  // The box writer may leave an immediate unread, so one built for a node with an effect (a
+  // stored literal's value) is legacy's to box.
+  if (v is OImm || v is OStr) && !exprEffectFree(ix) {
+    return irBMiss("box of an effect's immediate")
+  }
   // A literal boxed as its context arm is the IR's record only when it is built at that arm.
   const row = if at >= 0 { at } else { objLitVariantLayoutOf(unwrapParen(ix), ibFnIx) }
   if p.hbArm == "obj" && row != p.hbKind { return irBMiss("box literal arm") }
@@ -4226,6 +4232,8 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // An assignment whose value is its right side's number literal (`asgValueArmOf` "lit"): the
 // store, then that literal built again at the assignment's rep, as `emitAsgLitAs` writes it.
 function assignValueLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  // The store is a statement, so no temp an operand before it built may wait across it.
+  if endsInTemp(b) { return irBMiss("assignment value lit after an operand") }
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   return signedLitAt(unwrapParen(n.binRight), rep)
@@ -4241,9 +4249,7 @@ function signedLitAt(lit: i32, rep: i32): Opnd {
   if !(a is OImm) { return a }
   const k: string = repPrim(rep) ?? ""
   const one: i64 = 1
-  const bits = if k == "f64" { a.oiBits ^ (one << 63) } else if k == "f32" {
-    a.oiBits ^ (one << 31)
-  } else { 0 - a.oiBits }
+  const bits = if k == "f64" { a.oiBits ^ (one << 63) } else if k == "f32" { a.oiBits ^ (one << 31) } else { 0 - a.oiBits }
   const o: Opnd = { oiRep: rep, oiBits: bits }
   return o
 }
