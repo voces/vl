@@ -47,6 +47,6 @@ The 575 split: 253 build, and the rest now stop at the class behind the read (`n
 `capture env read` (the environment spelling, behind `closure env`), 15 `capture binding`, 4
 `capture recover`.
 
-In `tests/cases` the 38 `read of` rows left are reads the `capture` arm does not take (another arm
-of `identReadArmOf` first), and 1,852 rows now name a `capture` class, nearly all `capture env
-read`.
+In `tests/cases` the 38 `read of` rows left name no capture slot: a generic function's name read
+as a value (`read of id`), and module-scope bindings a closure reads (`read of s`). 1,852 rows now
+name a `capture` class, nearly all `capture env read`.
