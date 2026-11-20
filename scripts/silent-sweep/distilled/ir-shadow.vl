@@ -15,6 +15,8 @@
 // functions a coverage step unblocks, an upper bound since a statement stops at its first miss.
 // `--claims` builds disarmed (`$VL_IR_SHADOW=5`), as shipped, and exits 1 on any `claim fell back`
 // row: a claimed function whose lowering or verifier failed would hide behind legacy's bytes.
+// `--claims` also builds the programs `claims-fallbacks.txt` names from outside the corpus, and
+// reds when one falls back more than that file says; `--write-fallbacks` rewrites the counts.
 
 import { IoError, readTextFile, writeTextFile } from "std:fs"
 import { programArgs } from "std:args"
@@ -22,12 +24,13 @@ import { Utf8Error } from "std:utf8"
 import { exit } from "std:process"
 import { parseI32, toString } from "std:fmt"
 import { join, split, startsWith, trim } from "std:str"
-import { sort } from "std:array"
+import { indexOf, sort } from "std:array"
 import { die, envOr, fanOutArgv, hasFlag } from "../../lib/common"
 import { cellsIn, makeTempDir, spawn, writeText } from "../../lib/corpus"
 
 const HERE = "scripts/silent-sweep/distilled"
 const BASELINE = "scripts/silent-sweep/distilled/ir-shadow-baseline.txt"
+const FALLBACKS = "scripts/silent-sweep/distilled/claims-fallbacks.txt"
 const PREFIX = "[ir] "
 const CHUNK = 200
 
@@ -79,9 +82,10 @@ function countOf(rows: Row[], key: string): i32 {
   return 0
 }
 
-// Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`. A verifier failure's
-// row carries its function's IR on the lines after it; only its first line is the class.
-function addRows(m: Measured, text: string) {
+// Adds the `[ir] <path>: <n>\t<row>` lines of one chunk's stderr into `m`, each class prefixed
+// by its path and a tab when `keyed`. A verifier failure's row carries its function's IR on the
+// lines after it; only its first line is the class.
+function addRows(m: Measured, text: string, keyed: boolean) {
   let last = ""
   for line in split(text, "\n") {
     if !startsWith(line, PREFIX) { continue }
@@ -95,7 +99,8 @@ function addRows(m: Measured, text: string) {
       m.cells = m.cells + 1
       last = path
     }
-    bump(m.rows, line.slice(t + 1, line.length), n ?? 0)
+    const row = line.slice(t + 1, line.length)
+    bump(m.rows, if keyed { path + "\t" + row } else { row }, n ?? 0)
   }
   return 0
 }
@@ -106,6 +111,7 @@ function measure(
   seed: string,
   jobs: string,
   mode: string,
+  keyed: boolean,
 ): Measured {
   const vl = envOr("VL", "scripts/vl-host/target/release/vl")
   const root = makeTempDir()
@@ -137,7 +143,7 @@ function measure(
     const rc = parseI32(trim(readOr(f + ".rc")))
     // 0 and 1 are `vl check` grading the chunk; anything else is the chunk not finishing.
     if rc != 0 && rc != 1 { m.broken.push(f + " (rc=\{toString(rc ?? -1)})") }
-    addRows(m, readOr(f + ".err"))
+    addRows(m, readOr(f + ".err"), keyed)
   }
   spawn("rm", ["-rf", root])
   return m
@@ -213,9 +219,60 @@ function writeBaseline(mm: Row[]) {
   return 0
 }
 
-// The shipped claim: how many functions the IR emitted, and every fallback, which reds.
-function reportClaims(m: Measured) {
-  if m.broken.length > 0 { exit(2) }
+// The expected fallbacks, one `<n>\t<path>\t<class>` line each, keyed `<path>\t<class>`.
+function loadFallbacks(): Row[] {
+  const rows: Row[] = []
+  const got = readTextFile(FALLBACKS)
+  if got is IoError {
+    die("ir-shadow: cannot read \{FALLBACKS} (\{got.msg})", 2)
+  }
+  const text = if got is IoError { "" } else { got }
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    const n = if t < 0 { null } else { parseI32(line.slice(0, t)) }
+    if n == null { die("ir-shadow: \{FALLBACKS}: no count in `\{line}`", 2) }
+    rows.push({ key: line.slice(t + 1, line.length), n: n ?? 0 })
+  }
+  return rows
+}
+
+// The paths the fallback file names, each once, in its order.
+function fallbackPaths(rows: Row[]): string[] {
+  const out: string[] = []
+  for r in rows {
+    const p = r.key.slice(0, r.key.indexOf("\t"))
+    if out.indexOf(p) < 0 { out.push(p) }
+  }
+  return out
+}
+
+function writeFallbacks(paths: string[], fell: Row[]) {
+  let text = "# Claims that fall back outside the distilled corpus, which `ir-shadow.vl -- --claims` holds\n"
+  text = text
+    + "# at these counts. A path with none left keeps a 0 row. Rewrite: -- --claims --write-fallbacks\n"
+  for p in paths {
+    let any = false
+    for r in fell {
+      if startsWith(r.key, p + "\t") {
+        text = text + "\{r.n}\t\{r.key}\n"
+        any = true
+      }
+    }
+    if !any { text = text + "0\t\{p}\tclaim fell back: none\n" }
+  }
+  const w = writeTextFile(FALLBACKS, text)
+  if w != null { die("ir-shadow: cannot write \{FALLBACKS} (\{w.msg})", 2) }
+  print(
+    "wrote \{FALLBACKS}: \{fell.length} fallback rows over \{paths.length} programs",
+  )
+  return 0
+}
+
+// The shipped claim: how many functions the IR emitted, and every fallback, which reds in the
+// corpus and above the fallback file's count in the programs it names.
+function reportClaims(m: Measured, x: Measured, want: Row[], rewrite: boolean) {
+  if m.broken.length > 0 || x.broken.length > 0 { exit(2) }
   const fell = classes(m.rows, "claim fell back")
   const n = countOf(m.rows, "claimed")
   if n == 0 {
@@ -226,10 +283,45 @@ function reportClaims(m: Measured) {
   }
   print("ir claims: \{n} functions emitted by the IR")
   for r in fell { print("  \{r.n}\t\{r.key}") }
-  if fell.length > 0 {
-    print("ir-shadow: a claimed function fell back to legacy")
-    exit(1)
+  const paths = fallbackPaths(want)
+  const xfell: Row[] = []
+  let xn = 0
+  for r in x.rows {
+    const t = r.key.indexOf("\t")
+    if t >= 0 && r.key.slice(t + 1, r.key.length) == "claimed" { xn = xn + r.n }
+    if (
+      t >= 0
+      && startsWith(r.key.slice(t + 1, r.key.length), "claim fell back")
+      && r.n > 0
+    ) {
+      xfell.push(r)
+    }
   }
+  sort(xfell, (a: Row, b: Row) => a.key < b.key)
+  if rewrite { return writeFallbacks(paths, xfell) }
+  let red = fell.length > 0
+  if red { print("ir-shadow: a claimed function fell back to legacy") }
+  for r in xfell {
+    const was = countOf(want, r.key)
+    if r.n > was {
+      print(
+        "ir-shadow: a fallback outside the corpus rose: \{r.key}: \{was} -> \{r.n}",
+      )
+      red = true
+    }
+  }
+  for w in want {
+    const now = countOf(xfell, w.key)
+    if now < w.n {
+      print(
+        "ir-shadow: \{w.key} fell: \{w.n} -> \{now} (re-run with --write-fallbacks)",
+      )
+    }
+  }
+  print(
+    "ir claims outside the corpus: \{xn} functions over \{paths.length} programs",
+  )
+  if red { exit(1) }
   print("ir-shadow: ok")
   return 0
 }
@@ -241,9 +333,14 @@ function main(args: readonly string[]) {
   const census = hasFlag(args, "--blockers")
   const claims = hasFlag(args, "--claims")
   const mode = if census { "4" } else if claims { "5" } else { "1" }
-  const m = measure(paths, seed, envOr("JOBS", "4"), mode)
+  const m = measure(paths, seed, envOr("JOBS", "4"), mode, false)
   for b in m.broken { print("ir-shadow: chunk did not finish: \{b}") }
-  if claims { return reportClaims(m) }
+  if claims {
+    const want = loadFallbacks()
+    const x = measure(fallbackPaths(want), seed, envOr("JOBS", "4"), mode, true)
+    for b in x.broken { print("ir-shadow: chunk did not finish: \{b}") }
+    return reportClaims(m, x, want, hasFlag(args, "--write-fallbacks"))
+  }
   if m.cells == 0 {
     die(
       "ir-shadow: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW`",
