@@ -24,4 +24,19 @@ two backings, which share one kind and row.
 
 ## Readings (vs merge-base `ebf4b1c17`, fixpoint seeds on both sides)
 
-READINGS
+| reading | merge-base | this change |
+| --- | ---: | ---: |
+| self-compile functions claimed (mode 5) | 18,683 | 18,690 (+7) |
+| self-compile functions with no blocker | 18,782 | 18,793 (+11) |
+| self-compile `intrinsic none`, alone | 9 | 5 |
+| corpus covered = verified = matched (shadow) | 41,682 of 45,678 | 41,682 |
+| L2 self-compile fuel | 104,021,790,789 | 104,122,716,295 (+0.097%) |
+| seed size | 6,915,397 | 6,918,317 (+2,920 bytes) |
+
+The five self-compile functions left are the linear-memory load and store intrinsics. No corpus
+function waited on `__array_copy__`. The fuel rise is spread over the phases (checking +0.05G,
+code payload +0.04G, elaboration +0.01G): a new member of the `Rhs` union every match over it
+checks, and the source the split adds. Legacy is A/B'd on its own: compilers with `CLAIMED` empty
+built from both trees give identical bytes on every tests/cases program and probe (7,530
+identical, 68 failing under both, 0 differ) and the same first diagnostic on all 59 filed
+emit-reject witnesses.
