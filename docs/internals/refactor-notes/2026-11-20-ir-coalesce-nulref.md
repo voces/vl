@@ -50,22 +50,23 @@ only on `null`. The same core serves the `coll` and `clo` niche arms.
 
 ## Coverage
 
-Fixpoint seeds of this branch and of its merge base, master `f2ec7aa7c`, each building this
-branch's source (plain block, join, and call operands at the join):
+Fixpoint seeds of this branch and of its merge base, master `5331d4690` (after #9259's shared
+member read), each building this branch's source:
 
 | population | master | this branch |
 | --- | ---: | ---: |
-| self-compile functions covered | 18,417 | 18,417 |
-| corpus functions covered (45,678) | 40,615 | 40,660 |
+| self-compile functions covered | 18,502 | 18,502 |
+| corpus functions covered (45,678) | 40,788 | 40,834 (+46) |
 
-The plain block alone read +8 corpus on the same base; the join and its call operands bring the
-rest. An earlier +15 / +119 reading of the plain block compared against an older master
-(`89210abc4`) than this branch's base, and so counted #9243 and #9245.
+On the earlier base `f2ec7aa7c` the same branch read +45; the plain block alone +8. An earlier
++15 / +119 for the plain block compared against an older master than the branch's base and is
+withdrawn.
 
-On this branch, 120 corpus functions are blocked by `member box` alone: their `??` builds, and a
-union-box member read elsewhere in the function is the last miss (IR5, #9259). Remaining `??`
-blockers: `coalesce nulRef heap` 18, `coalesce nulRef operand temp` 12 (a plain block over a call),
-`coalesce box next` 2 alone and 9 with `member box`.
+#9259 did not release the functions whose `??` this branch builds and whose last miss was
+`member box`: 118 corpus functions are still blocked by `member box` alone on this branch, the
+receiver shapes #9259 leaves for its follow-ups (stashed receivers and the unbox tails). Remaining
+`??` blockers: `coalesce nulRef heap` 18, `coalesce nulRef operand temp` 12 (a plain block over a
+call), `coalesce box next` 2 alone and 9 with `member box`.
 
 - **Join default:** legacy writes it with `emitUnionBoxAtRecord`. The IR builds only its
   recorded-box branch (`boxOwedAt`, which `deliver` shares); a default already of a union, or one
@@ -79,7 +80,10 @@ blockers: `coalesce nulRef heap` 18, `coalesce nulRef operand temp` 12 (a plain 
   (six functions, a call default that runs once), and the join (a name, a call whose default runs
   once, and a join nested in the default; prints 52, 73, 1, 55).
 - **Byte proof:** mode 3 identical; `ir-identity` corpus 9,037 identical, differ 0, self-compile
-  identical; `--cases` 7,519 identical, differ 0, witnesses 59 same; per-file `tests/cases` A/B
-  7,234 same, differ 0.
+  identical; `--cases` 7,523 identical, differ 0, witnesses 59 same; per-file `tests/cases` A/B
+  7,237 same, differ 0.
+- **Ratchets:** late demands 9 (baseline 9); late tag rows 307 (baseline 307, 0 gone); seed
+  6,900,357 bytes (+0.1% on 6,894,207; master's seed at the base is 6,896,934); phase-state
+  `ir_selftest.vl` surface 6 → 7 (`mkNullableTy`).
 - **L2 fuel:** +0.1% on the 103.31G baseline.
-- **Compiler lines:** +289 / −61.
+- **Compiler lines:** +295 / −72 against the merge base.
