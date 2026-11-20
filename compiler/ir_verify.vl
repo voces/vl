@@ -7,7 +7,7 @@
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
-import { NULL_OWN_BOX } from "./emit_plan_null"
+import { NULL_OWN_BOX, coalNicheReEval } from "./emit_plan_null"
 import {
   IrFn,
   IrNode,
@@ -117,8 +117,8 @@ import {
 import { repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { i32ToStr } from "./ast"
-import { exprEffectFree } from "./emit_base"
+import { BinExpr, i32ToStr, nodeAt } from "./ast"
+import { exprEffectFree, unwrapParen } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
 
@@ -1162,6 +1162,33 @@ function coalNulRefWhy(n: SCoalBox): string {
   return ""
 }
 
+// Why a `K | null` niche's `??` is ill-formed, or "": it reads the niche, yields its atom, and
+// re-reads in the present arm only a variable, which the default cannot have written, since the
+// present arm runs only when the default did not.
+function coalLitUnionWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc != 3 {
+    return "a `K | null` `??` reads no atom niche"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length || vf.irVars[o].vRep != lr.rnInner {
+    return "a `K | null` `??` yields no atom"
+  }
+  const e = if n.cbAt >= 0 { nodeAt(n.cbAt) } else { null }
+  if e is BinExpr && coalNicheReEval(unwrapParen(e.binLeft)) {
+    const l = n.cbL
+    if (
+      !(l is OVar)
+      || l.ov < 0
+      || l.ov >= vf.irVars.length
+      || vf.irVars[l.ov].vKind == "temp"
+    ) {
+      return "a `K | null` `??` re-reads no variable"
+    }
+  }
+  return ""
+}
+
 // Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
 // at that element's rep.
 function coalPopOrWhy(n: SCoalBox): string {
@@ -1436,6 +1463,7 @@ function stmt(id: i32) {
         "popOr" => coalPopOrWhy(n)
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "nulRef" => coalNulRefWhy(n)
+        "litUnion" => coalLitUnionWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }

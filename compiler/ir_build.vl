@@ -269,6 +269,7 @@ import {
   coalArmOf,
   coalBoxArmOf,
   coalNicheArmOf,
+  coalNicheReEval,
   coalNulRefArmOf,
   coalResultKindOf,
   coalesceNulStrStaysNullable,
@@ -3372,6 +3373,50 @@ function coalPopOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// `l ?? d` over a `K | null` niche along legacy's `litUnion` arm: the operand read once, its
+// default into the null arm at the atom's rep. A call or `if` operand is stashed by the open; any
+// other is read again in the present arm, which only a variable may be (a field read re-runs its
+// receiver).
+function coalLitUnion(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce litUnion after an operand") }
+  // A valued `if` yields no `K | null` niche the lowering writes.
+  if nodeAt(lhsIx) is IfStmt { return irBMiss("coalesce niche litUnion if operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  const lr = repNodeAt(irBOpRep(l))
+  if !(lr is RNullable) || lr.rnDisc != 3 || lr.rnInner != rep {
+    return irBMiss("coalesce litUnion operand rep")
+  }
+  if coalNicheReEval(lhsIx) {
+    const held = l is OVar && l.ov >= 0 && ib.irVars[l.ov].vKind != "temp"
+    if !held { return irBMiss("coalesce niche litUnion re-read") }
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce litUnion default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: "litUnion", cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
 // `l ?? d` over a `string | null` along legacy's plain block (`coalNulRefArmOf`), its default
 // a string literal and its result the block's own rep. Every other niche arm is a named miss.
 function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
@@ -3381,6 +3426,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
   if na == "identBox" { return coalBox(b, n, lhsIx, ix, rep) }
   if na == "coll" || na == "clo" { return coalNulRef(b, n, lhsIx, ix, rep) }
+  if na == "litUnion" { return coalLitUnion(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")

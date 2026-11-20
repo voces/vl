@@ -1716,6 +1716,7 @@ import {
   coalHoleMapReadValTy,
   coalMapRecvOf,
   coalNicheArmOf,
+  coalNicheReEval,
   coalNulRefArmOf,
   coalNullArmShaped,
   coalResultBoxName,
@@ -41242,6 +41243,26 @@ function emitCoalesceCallArm(
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
+// After a `K | null` niche operand's one read: a call or `if` operand stashed in the shared
+// slot (`coalNicheReEval`), the `-1` null test, and the `if` at the atom's `i32`.
+export function coalLitUnionOpen(reEval: boolean) {
+  if !reEval {
+    fbLocalSet(coalesceCallBoolSlot)
+    fbLocalGet(coalesceCallBoolSlot)
+  }
+  fbI32Const(-1)
+  fbI32Bin(70) // 0x46 i32.eq → x == -1 (null)
+  fbIf(127) // 0x04 if, 0x7f i32 blocktype
+  return 0
+}
+
+// The present arm of a `K | null` niche's `??` after its re-read operand, if any: a stashed
+// operand's slot read back.
+export function coalLitUnionPresent(reEval: boolean) {
+  if !reEval { fbLocalGet(coalesceCallBoolSlot) }
+  return 0
+}
+
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   const lhs = nodeAt(lhsIx)
   const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
@@ -41249,13 +41270,7 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // and in the else arm for the string), so they apply only to an effect-free place —
   // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
   // and is handled by the stash-based call path in the `lhs is Call` block below.
-  let lhsReEval = true
-  if lhs is Call { lhsReEval = false }
-  // D1250 — AN IF-expression operand IS NOT RE-READABLE. Its condition can have effects, and
-  // re-reading it re-runs them: `(if bump() { true }) ?? false` bumped TWICE. The arms below
-  // that already carry a stash leg read this flag, so they switch over; the `boolean | null`
-  // arm gained one for the same reason. `coalChainHasCallLhs` reserves the slots.
-  if lhs is IfStmt { lhsReEval = false }
+  const lhsReEval = coalNicheReEval(lhsIx)
   // `<e> ?? d` over a `boolean | null` niche (an ident binding, a `boolean | null` struct field,
   // or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the sentinel 2
   // (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers every
@@ -41304,22 +41319,15 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
     if (emitExpr(e.binLeft, fnIx) < 0) {
       return -1 // the niche i32, evaluated ONCE
     }
-    if !lhsReEval {
-      fbLocalSet(coalesceCallBoolSlot)
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbI32Const(-1)
-    fbI32Bin(70) // 0x46 i32.eq → x == -1 (null)
-    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
+    coalLitUnionOpen(lhsReEval)
     if (emitExpr(e.binRight, fnIx) < 0) {
       return -1 // d, as this niche's i32
     }
     fbElse() // 0x05 else — present → the atom id
     if lhsReEval {
       if (emitExpr(e.binLeft, fnIx) < 0) { return -1 }
-    } else {
-      fbLocalGet(coalesceCallBoolSlot)
     }
+    coalLitUnionPresent(lhsReEval)
     fbEnd() // 0x0b end
     return 0
   }
