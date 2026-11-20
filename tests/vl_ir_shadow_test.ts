@@ -1903,3 +1903,43 @@ if d0 is i32 { print(d0) }
     }
   },
 });
+
+// `__array_copy__` is written as legacy's arm writes it: each list operand followed by its backing,
+// then the copy. An i32, a string, an f64 and a record list each match byte for byte.
+Deno.test({
+  name: "ir shadow: an __array_copy__ statement matches over each list kind",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function grow(xs: i32[], n: i32): i32[] {
+  const out: i32[] = __array_new__(n, 0)
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+function tail(xs: string[], from: i32): string[] {
+  const out: string[] = __array_new__(xs.length - from, "")
+  __array_copy__(out, 0, xs, from, xs.length - from)
+  return out
+}
+function fl(xs: f64[]): f64[] {
+  const out: f64[] = __array_new__(xs.length * 2, 0.0)
+  __array_copy__(out, xs.length, xs, 0, xs.length)
+  return out
+}
+type P = { x: i32 }
+function rs(xs: P[]): P[] {
+  const out: P[] = __array_new__(xs.length, { x: 0 })
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+print(grow([1, 2, 3], 5)[2] + rs([{ x: 4 }, { x: 5 }])[1].x)
+print(tail(["a", "b", "c"], 1)[1])
+print(fl([1.5, 2.5])[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
