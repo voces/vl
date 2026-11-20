@@ -899,6 +899,80 @@ meant to run under instead becomes an explicit parameter of the shared plan (as 
 an ambient read. The shadow-only probe (`irNodeInShadow`) is exempt: it writes into a scratch
 buffer and ships nothing.
 
+#### 10.2.1 From missing to hosting: each context, and what it becomes (2026-11-19)
+
+Under the rule above, a door call misses whenever any context is live. So no legacy arm behind a
+door ever becomes unreachable, and deletion through the door is never complete. This amendment
+replaces "any context live, miss" with a rule per context. Most contexts drop out. The rest become
+explicit parameters, or outputs, of the door.
+
+**Why most contexts do not reach a fragment.** Nearly every context marks one node, and its
+readers ask "is it this node?" (`ix == coerceHeld`, `ix == boxSeat`, `parenPeelIx(ix) ==
+storageReadIx`, `unwrapParen(ix) == isRecvStagedIx`). A fragment rooted at `N` can read a mark only
+if the marked node is in `N`'s subtree. Legacy sets a seat or held mark immediately before it
+emits the marked node, so a mark live at the door is on `N` itself or on an ancestor of `N`. A mark
+on an ancestor is never read by the fragment.
+
+The door is entered from a node writer below `emitExpr`'s `coerceKindAt` dispatch (today
+`emitArr`). By then a box, arm or atom seat on `N` has already been taken by `emitCoerced`, which
+clears it, or it is inert: `boxAtTable` also requires `boxOwedAt`. Only the staging marks are set by
+an ancestor for a descendant (an operand evaluated into a slot, then re-read through `emitExpr`).
+They are the one kind that can sit strictly inside `N`.
+
+**Measured** on a fixpoint seed of master 2845744c02, at the one door that exists (`emitArr`, list
+literals). The figures are the armed shadow's `node-in context live` rows, plus a one-off
+uncommitted counter that splits each hit by whether its mark is the fragment's root or an ancestor,
+and by the probe's own outcome. The probe ignores the guard, so "matched" means legacy's bytes came
+out regardless of the context.
+
+| context | corpus hits (19,602 programs: `distilled/cells`, `distilled/named`, non-`@error` `tests/cases`) | self-compile hits (9,866 fragments matched) | mark on the root | probe outcome |
+|---|---:|---:|---:|---|
+| `coerceHeld` | 84 | 2 | 0 | 61 matched; 25 miss for reasons of their own (`array spread`, `rep nullable`, `array ref`) |
+| open list-build region (`lbEnd`) | 20 | 9 | n/a | 27 matched; 2 miss (`read of …`) |
+| `listCastForPush` | 2 | 1 | n/a (a mode) | 3 matched |
+| every other context | 0 | 0 | | |
+
+A zero here is a zero at a list-literal door only. A door at an identifier read or a member read
+would meet the storage-read and staging marks, which a list literal never is.
+
+**What each context becomes**, ranked by measured hits:
+
+| rank | context | kind | becomes | why |
+|---:|---|---|---|---|
+| 1 | `coerceHeld` | node mark | **dropped when the mark is an ancestor**. On the root it becomes the `held` parameter: the fragment builds `N` without `N`'s own recorded coercion, and asks `atomStrPlanOf(…, held: true)` and `numFloorWhy`'s held floor for the root only | legacy is emitting `N`'s inner value for a conversion it applies after. An ancestor's hold is never read below it. All 86 measured hits are ancestors |
+| 2 | open list-build region | node mark (its counted pushes, `lbPush`) | **dropped unless the fragment contains a counted push** of an open region; a fragment that does misses | the region's state is keyed on its push calls and its deferred length write. `listReserveScan` admits no other use of the list inside the region, so a fragment cannot read the stale length |
+| 3 | `listCastForPush` | mode | the **`strictCast` parameter** of `emitListPayloadCast` (`listPayloadCastTail(wrap, strict)`): legacy passes its flag, and the door passes the parameter | the flag changes the bytes of a narrowed union-list read in a push receiver (a strict `ref.cast`, not the empty-list stand-in). That makes it a plan input, so it must be explicit (#9159) |
+| 4 | `boxSeat`, `armSeat`, `atomSeat` | node mark | **dropped** | spent or inert by the time any node writer runs (above) |
+| 4 | `armServed` | handshake inside legacy | **dropped** | written by `emitCoerced` after the value and read only by `armClose` against its own node. No fragment reads or writes it |
+| 4 | storage-read mode (`storageReadIx`) | node mark | the **`atStorage` parameter** for a root that is the marked operand: the builder reads it as `storedBoxTest` and `rawBoxVar` already do. Otherwise dropped | the classifiers ask `isStorageRead(ix)` of that node alone |
+| 4 | `isRecvStagedIx`, `listGetIdxStagedIx`, `listGetRecvStagedIx` | staging mark | a **substitution parameter**, node → (legacy slot, non-null): the builder takes that node as a variable on legacy's live slot, as `rawBoxVar` takes a box local | `emitExpr` and `emitListGet*` read the node off the slot. This is the one mark that can sit strictly inside `N`, so it is checked over the subtree, not only at the root |
+| 4 | `listFitStoodIn` | handshake **output** | an **output of the door**: a fragment whose root is a capture stand-in read reports it, and the door writes `listFitStoodIn` as `emitIdentNode` does. As an input it is dropped | the parent's `emitScalarListCopy` consumes it. It is a result of emitting `N`, not a fact about emitting it |
+| 4 | `knownArmDecl` | lexical environment | **dropped at an expression door**. At a statement door it becomes a frame parameter | it is read only by a per-arm `for` walk (`knownArmOf`), and an expression fragment holds no `for` |
+| 4 | `lhOpen` | lexical environment | **dropped at an expression door**, given the failing control below. At a statement door it is the IR frame model of §10.1(a) | the IR lowering reads hoisted headers through the same live rows legacy reads (`liveHoistRow` via `rawStrHoistOf`, `arrLenHoistOf`, `refListHoistOf`), at the same moment. A fragment that opens no loop reads them as legacy does |
+
+**What cannot become a parameter:**
+- `listFitStoodIn` and `armServed` are results, not inputs. The first becomes a door output; the
+  second never leaves legacy.
+- `uBoxNewEnd` stays a byte fact, as above.
+- The two environments (`knownArmDecl`, `lhOpen`) can only become parameters at a statement door,
+  and there they are §10.1(a)'s IR frame model, not a plan input.
+
+**Order of work:**
+1. Narrow `legacyContextLiveWhy` to take the root and test each mark by the rule above, dropping
+   rows 1, 2 and 4 as stated. Over the 118 measured hits (corpus and self-compile) that lifts the
+   guard on 115. Of those, 88 already match legacy byte for byte, and 27 miss for reasons of their
+   own.
+2. Thread `strictCast` through `emitListPayloadCast`. That lifts the last 3, which already match.
+3. Add `held`, `atStorage` and the substitution map as door parameters the first time a door meets
+   them (an identifier or member door).
+
+Each step carries:
+- a **failing control** per dropped context, shipped as a shadow test: a fragment built under that
+  live context comes out byte-identical to legacy. For `lhOpen`, a list literal inside a hoisted
+  loop that reads `s.length`.
+- a **firing control** per kept one: a root-held fragment, and a staged receiver inside the
+  fragment, still miss until their parameter lands.
+
 ## A. Commands
 
 Run from the checkout root, with `PATH=$PWD/scripts/vl-host/target/release:$PATH`.
