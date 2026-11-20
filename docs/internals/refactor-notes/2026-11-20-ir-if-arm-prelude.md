@@ -18,7 +18,7 @@ shapes legacy writes on the plain path:
 Measured on fixpoint seeds against master `585f51b42` (functions with no blocker, blocker census):
 self-compile 17,778 → 17,831 of 19,194; corpus 39,659 → 39,659 of 45,678 (its 32 `arm not lone`
 rows now stop at `is rung`, `ref if chain` and `int match`). The 22 `constant condition`
-self-compile functions mostly stop at their next blocker: 19 at `map read default computes` and
+self-compile functions stop at their next blocker: 19 at `map read default computes` and
 3 at `if after an operand`. L2 fuel 102,507,434,335 → 102,548,620,137 (+0.04%).
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
