@@ -232,6 +232,7 @@ import {
   TagIsArm,
   atomEqPlanOf,
   holeBoxPlanOf,
+  captureSlotOf,
   identReadArmOf,
   isArmOf,
   isBoxGuardPlain,
@@ -276,6 +277,7 @@ import {
   nulNoneEqSides,
   nulTestArmOf,
   nullOwnAt,
+  nulStrReadRecovers,
 } from "./emit_plan_null"
 import {
   boxOwedAt,
@@ -310,11 +312,13 @@ import {
   fnEnvIdxOf,
   nodeTyAt,
   numLitWidth,
+  parentBindingFrameArenaOf,
+  parentBindingOf,
   readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
-import { wTarget } from "./emit_bytes"
+import { fbValtype, wTarget } from "./emit_bytes"
 import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
   isStorageRead,
@@ -335,6 +339,8 @@ import {
   capCellTargetOf,
   captureCountOf,
   captureNamesOf,
+  captureValKind,
+  captureValStructIdx,
   cbIdentNamesFn,
   coalesceDefaultNullable,
   declaredIndexAt,
@@ -1593,6 +1599,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
+  if captureSlotOf(n.identName, ibFnIx) >= 0 { return captureRead(n, ix, d, rep) }
   const w = localIndexOf(ibFnIx, ix)
   // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
   // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
@@ -1622,6 +1629,49 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     return cloValue(b, ix, rep)
   }
   return irBMiss("read of " + n.identName)
+}
+
+// Capture `n`, declared at `d`, read at `rep` on legacy's `capture` arm: a lifted function's own
+// parameter after its environment (`emitCaptureSlotRead`). An environment field read misses.
+function captureRead(n: Ident, ix: i32, d: i32, rep: i32): Opnd {
+  if identReadArmOf(n, ix, ibFnIx, false) != "capture" { return irBMiss("read of " + n.identName) }
+  const fe = fnStmtsPosOf(ibFnIx)
+  if !cloLifted(fe) { return irBMiss("capture env read") }
+  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
+  const name = n.identName
+  if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
+    return irBMiss("capture recover")
+  }
+  const v = liftCapVar(fe, name, d)
+  if v < 0 { return irBMiss("capture binding") }
+  if ib.irVars[v].vRep != rep { return irBMiss("capture read rep") }
+  ib.irReadVar[ix] = v
+  const o: Opnd = { ov: v }
+  return o
+}
+
+// The parameter variable of lifted function `fe`'s capture `name`, bound at `d` in its owning
+// frame and typed there, made at its first read; -1 when its rep is not the valtype legacy's
+// function type gives the capture (`captureValKind`).
+function liftCapVar(fe: i32, name: string, d: i32): i32 {
+  const w = 1 + captureSlotOf(name, ibFnIx)
+  const known = paramVarAt(w)
+  if known >= 0 { return known }
+  if parentBindingOf(fe, name) != d { return -1 }
+  const ty = heldTy(scopeTyAt(d, parentBindingFrameArenaOf(fe, name)))
+  const r = repNodeOfTy(ty)
+  if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
+  const vt: u8[] = []
+  const prev = wTarget(vt)
+  fbValtype(captureValKind(fe, name), captureValStructIdx(fe, name))
+  wTarget(prev)
+  const t = valtypeOf(r)
+  if vt.length == 0 { return -1 }
+  if t >= 0 && (vt.length != 1 || vt[0] != t) { return -1 }
+  if t < 0 && vt[0] != 0x63 && vt[0] != 0x64 { return -1 }
+  const v = irVarNew(ib, r, ty, "param", w)
+  ib.irParams.push(v)
+  return v
 }
 
 // A function name or literal `ix` read as a capture-free closure value, as a global's initializer

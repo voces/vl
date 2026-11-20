@@ -2360,3 +2360,21 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// A lambda-lifted local function reads each capture as its own parameter after the environment:
+// a parameter, a string and a record of its encloser, read where legacy's capture arm reads them.
+const LIFTED_CAPTURE_READ =
+  `type P = { x: i32 }\nfunction outer(n: i32, s: string): i32 {\n  const p: P = { x: n + 1 }\n  function inner(k: i32): i32 {\n    print(s)\n    return n + p.x + k\n  }\n  return inner(2)\n}\nprint(outer(3, "hi"))\n`;
+Deno.test({
+  name: "ir shadow: a lifted function's capture reads build as its parameters and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LIFTED_CAPTURE_READ, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want outer and inner covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
