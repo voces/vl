@@ -2397,3 +2397,24 @@ Deno.test({
     }
   },
 });
+
+// An `is` test with a static answer (the `never` rung, a static `true`) is its constant, after a
+// call receiver evaluated and dropped; a static `false` stays a named miss (legacy's empty fit).
+const IS_STATIC_ANSWER =
+  `type A = { a: i32 }\ntype B = { b: string }\ntype K = "x" | "y"\nfunction mk(): A { return { a: 1 } }\nfunction num(): i32 { return 4 }\nfunction never1(v: A | B): boolean { return v is K }\nfunction never2(v: i32): boolean { return v is string }\nfunction inst<T>(v: T): boolean { return v is i32 }\nfunction same(v: A): boolean { return v is A }\nfunction neverCall(): boolean { return num() is string }\nfunction sameCall(): boolean { return mk() is A }\nprint(never1({ a: 1 }))\nprint(never2(1) || inst(2) || inst("s") || same({ a: 1 }) || neverCall() || sameCall())\n`;
+Deno.test({
+  name: "ir shadow: an is test with a static answer is its constant after the receiver",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(IS_STATIC_ANSWER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 8 || (rows.get("matched") ?? 0) !== 8) {
+      throw new Error(`want every function but inst<string> covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered is static empty fit") ?? 0) !== 1) {
+      throw new Error(`want inst<string> a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
