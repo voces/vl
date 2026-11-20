@@ -2101,3 +2101,53 @@ print(nullable(null))
     }
   },
 });
+
+// A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
+// then the value. A global receiver (staged as its read), a local and a parameter, with a
+// variable or a call-result key, are staged below the `if`, covered and matched; so are values
+// that run a map op of the same or of another shape. A boxed `??` value and a literal key stay
+// legacy's, by name.
+Deno.test({
+  name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
+  ignore,
+  fn: () => {
+    const src = `let gb: {[string]: boolean} = Map()
+let gn: {[string]: boolean} = Map()
+let gq: {[string]: i32} = Map()
+let gi: {[string]: i32} = Map()
+function key(s: string): string { return s }
+function glob(a: boolean, c: boolean, k: string) { gb[k] = a && c }
+function loc(a: boolean, c: boolean, k: string): boolean {
+  const m: {[string]: boolean} = Map()
+  m[key(k)] = c || a
+  return m[k] ?? false
+}
+function par(m: {[string]: boolean}, a: boolean, k: string) { m[k] = gn.has(k) && a }
+function other(a: boolean, k: string) { gb[k] = gq.has(k) || a }
+function boxed(p: i32 | null, k: string) { gi[k] = p ?? 7 }
+function lit(a: boolean, c: boolean) { gb["x"] = a && c }
+gn["k"] = true
+gq["q"] = 1
+glob(true, true, "k")
+print(loc(false, true, "k"))
+par(gb, true, "p")
+other(false, "q")
+boxed(null, "k")
+lit(true, false)
+print(gb["k"] ?? false)
+print(gb["p"] ?? false)
+print(gb["q"] ?? false)
+print(gi["k"] ?? 0)
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want key, glob, loc, par and other covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered map store short-circuit operand") !== 2) {
+      throw new Error(`want boxed and lit left to legacy by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
