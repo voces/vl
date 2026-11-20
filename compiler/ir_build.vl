@@ -281,7 +281,6 @@ import { ifJoinAdaptsScalar, letIfInitSinks, retRefusedWhy } from "./wasmEmit"
 import {
   arrLitArmOf,
   arrLitListBuild,
-  identReadIsList,
   idxStorePlanOf,
   listReserveScan,
   pushPlanOf,
@@ -1606,11 +1605,10 @@ function narrowedLocalRead(
   ) {
     return irBLetTemp(b, { bnV: o, bnAt: ix, bnRep: rep, bnAtom: -1 }, ix, rep)
   }
-  // A list read is left out: the list overrides `identReadArmOf` does not decide may take it.
+  // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
   if (
     own is RNullable
     && own.rnInner == rep
-    && !identReadIsList(ix, ibFnIx)
     && identReadArmOf(n, ix, ibFnIx, false) == "local"
   ) {
     return irBLetTemp(b, { rcV: o, rcAt: ix }, ix, rep)
@@ -2026,8 +2024,13 @@ export function ifBelowLeadOf(
 // as the miss. Legacy writes such an `if` in place, which the IR's statement-level `if` cannot
 // reorder.
 export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
+  return ifBelowLeadIn(b, at, b.length, why)
+}
+
+// `ifBelowLead` over the operands built into `b` from `at` up to `to`.
+function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   let i = at
-  while i < b.length {
+  while i < to {
     const n = ib.irNodes[b[i]]
     if n is SIf && n.siOut >= 0 || n is SCoalBox {
       irBMiss(why)
@@ -4065,25 +4068,29 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   if st == null { return skip("store plan") }
   const why = idxStorePlainWhy(st, t.idxArr, n.binRight, ibFnIx)
   if why != "" { return skip(why) }
+  const vat = b.length
   const v = irBExpr(b, t.idxArr)
   const at = b.length
   const i = irBExpr(b, t.idxIndex)
   const ln = repNodeAt(irBOpRep(v))
   if !(ln is RList) { return skip("store operand coercion") }
-  // The bounds check is built after the value, which a value `if` leaves on the stack.
-  if nodeAt(unwrapParen(n.binRight)) is IfStmt {
-    return skip("if into an element store")
-  }
   // A packed list's element is stored as a plain i32, which its backing truncates.
   const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  const xat = b.length
   const x = deliver(b, n.binRight, er, -1)
   if ibMiss != "" { return 0 }
-  if ifBelowLead(b, at, "store short-circuit operand") { return 0 }
+  if ifBelowLeadIn(b, at, xat, "store short-circuit operand") { return 0 }
   if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
     return skip("store operand coercion")
   }
-  irBNode(b, { bcV: v, bcIx: i }, -1, ibNoValue, ix)
-  irBNode(b, { lsV: v, lsIx: i, lsSrc: x }, -1, ibNoValue, ix)
+  // A valued `if` is written in place after the receiver and index, which are staged below it;
+  // the store's tail is their one consumer (a hoisted receiver's skip misses at the lowering).
+  const lead = [v, i]
+  if !stageLeadArgs(b, xat, [vat, at], lead, [t.idxArr, t.idxIndex]) {
+    return skip("if into an element store")
+  }
+  irBNode(b, { bcV: lead[0], bcIx: lead[1] }, -1, ibNoValue, ix)
+  irBNode(b, { lsV: lead[0], lsIx: lead[1], lsSrc: x }, -1, ibNoValue, ix)
   return 0
 }
 
