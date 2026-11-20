@@ -2192,9 +2192,9 @@ print(d[0] + d[3])
   },
 });
 
-// A nullable record field takes its value at the field's rep where no arm unbox is owed: a
-// nullable parameter and a narrowed local, across a self-referencing row. An arm narrowed out of a
-// union of records arrives boxed, and its unbox is a named miss.
+// A nullable record field takes its value at the field's rep where no arm unbox is owed, for a
+// plain record and a union arm: a nullable parameter and a narrowed local. An arm narrowed out of
+// a union arrives boxed, and its unbox is a named miss; so is an explicit `null`.
 Deno.test({
   name: "ir shadow: a nullable record field's value matches, and an owed arm unbox is a named miss",
   ignore,
@@ -2202,9 +2202,10 @@ Deno.test({
     const { rc, rows } = run(`type Node = { v: i32, next: Node | null }
 type Pt = { x: f64, y: f64 }
 type Holder = { p: Pt | null, n: i32 }
-type A = { a: i32 }
-type B = { b: f64 }
-type Slot = { s: A | null }
+type O = { n: i32, next: O | null }
+type P = { m: i32 }
+type U = O | P
+type Q = { o: O | null }
 function cons(v: i32, rest: Node | null): Node { return { v: v, next: rest } }
 function hold(p: Pt | null, n: i32): Holder { return { p: p, n: n } }
 function moved(h: Holder): Holder {
@@ -2212,24 +2213,42 @@ function moved(h: Holder): Holder {
   if p != null { return { p: p, n: h.n + 1 } }
   return hold(null, 0)
 }
-function pick(u: A | B): Slot {
-  if u is A { return { s: u } }
-  return { s: null }
+function hbox(u: Pt | i32): Holder {
+  if u is Pt { return { p: u, n: 1 } }
+  return hold(null, u)
+}
+function hnull(n: i32): Holder { return { p: null, n: n } }
+function qplain(x: O | null): Q { return { o: x } }
+function qnarrow(u: U): Q {
+  if u is O { return { o: u } }
+  return qnull()
+}
+function qnull(): Q { return { o: null } }
+function lead(u: U) {
+  if u is P { return u.m }
+  return 0
 }
 const l = cons(1, cons(2, null))
 const g = moved(hold({ x: 1.5, y: 2.5 }, 4))
 print(l.v + (l.next?.v ?? 0) + g.n)
 print(g.p?.y ?? 0.0)
-print(pick({ a: 3 }).s?.a ?? 0)
+print(hbox({ x: 3.5, y: 0.0 }).p?.x ?? 0.0)
+print(hbox(6).n + hnull(1).n)
+const o1: O = { n: 2, next: null }
+print((qplain(o1).o?.n ?? 0) + (qnarrow(o1).o?.n ?? 0) + lead({ m: 4 }))
+print(qnull().o == null)
 `, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
-      throw new Error(`want cons, hold and moved covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field arm unbox") ?? 0) !== 1) {
-      throw new Error(`want pick a named miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
+      throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered object field explicitNull") ?? 0) !== 2) {
+      throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
