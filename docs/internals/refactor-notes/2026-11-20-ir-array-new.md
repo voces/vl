@@ -40,8 +40,8 @@ nested and union-element fills.
 | self-compile `intrinsic none`, alone | 25 | 9 |
 | corpus covered = verified = matched (shadow) | 41,296 of 45,678 | 41,314 (+18) |
 | corpus `intrinsic none`, alone (census) | 19 | 0 (1 now `array new default`) |
-| L2 self-compile fuel | 103,451,339,825 | 103,492,871,461 (+0.040%) |
-| seed size | 6,900,565 | 6,902,016 (+1,451 bytes) |
+| L2 self-compile fuel | 103,451,339,825 | 103,497,980,201 (+0.045%) |
+| seed size | 6,900,565 | 6,902,099 (+1,534 bytes) |
 
 The nine self-compile functions left are `__array_copy__` (four) and the linear-memory load and
 store intrinsics (five). Legacy is A/B'd on its own: compilers with `CLAIMED` empty built from
