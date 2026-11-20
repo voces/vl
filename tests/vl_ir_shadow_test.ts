@@ -642,6 +642,56 @@ print(bs[0])
   },
 });
 
+// A `.push` of a short-circuit value onto a list held in its own local reads the receiver by index
+// after the value, as legacy does, so it is covered; a staged receiver (a global) is written
+// ahead of the value and stays a named miss.
+Deno.test({
+  name: "ir shadow: a short-circuit push onto a held list is covered, a staged one a miss",
+  ignore,
+  fn: () => {
+    const src = `let xs: boolean[] = []
+function a(out: boolean[], p: boolean, q: boolean) { out.push(p && q) }
+function b(out: boolean[], p: boolean, q: boolean, r: boolean) { out.push(p && (q || r)) }
+function c(p: boolean, q: boolean) { xs.push(p && q) }
+const o: boolean[] = []
+a(o, true, false)
+b(o, true, false, true)
+c(true, true)
+print(o.length + xs.length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both held pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered push short-circuit operand") !== 1) {
+      throw new Error(`want the staged push a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A short-circuit arm that reassigns the held receiver: both sides read the local after the value,
+// so the push lands on the list the arm assigned, and the IR matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a held push whose value reassigns the receiver reads it after the value",
+  ignore,
+  fn: () => {
+    const src = `function h(p: boolean): i32 {
+  let xs: boolean[] = []
+  const other: boolean[] = []
+  xs.push(p && (xs = other).length == 0)
+  return xs.length * 10 + other.length
+}
+print(h(true))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -1089,6 +1139,39 @@ Deno.test({
     const covered = rows.get("covered") ?? 0;
     if (covered < 15 || (rows.get("matched") ?? 0) !== covered) {
       throw new Error(`want 15 or more covered, every one matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A record whose field holds a generic function is typed open, but legacy holds the function as
+// its tagged set's id, so the record's rep is closed (`irTyHeldOpen`): the local builds and every
+// covered function matches. The program is distilled cell d15117_fw_alias_one_f64_str_ab_fn_bound.
+const OPEN_CONTAINER = `function id0(a) { return a }
+function id1(a) { return a }
+function run() {
+  const r = { f: id0 }
+  const q = r
+  q.f = id0
+  const g = r.f
+  print(g(2.5))
+  print(g("s"))
+}
+run()
+`;
+Deno.test({
+  name: "ir shadow: a record of a tagged set's function is held open and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(OPEN_CONTAINER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered open local type")) {
+      throw new Error(`want no open-local miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

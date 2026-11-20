@@ -132,6 +132,7 @@ import {
   exprIsNulNone,
   exprIsV128,
   exprListRep,
+  exprMap,
   exprNulBool,
   exprNulClosure,
   exprNulKind,
@@ -159,6 +160,7 @@ import {
   nicheReadKindAt,
   nulScalarBoxRowOf,
   nulVariantIdxOfExpr,
+  objVariantName,
   optChainStructIdxOf,
   placeNicheAtomKind,
   readOwesNonNullRecover,
@@ -210,7 +212,7 @@ import {
   isTestedRowOf,
 } from "./emit_obj_lit_fits"
 import { boxDstName, boxTyName, unionBoxTyOfRead } from "./emit_plan_coerce"
-import { listFitGrowRow } from "./emit_plan_list"
+import { arrLitBuild, arrLitTyAt, listFitGrowRow } from "./emit_plan_list"
 import {
   isValueUnionOfSet,
   nulCollWrapHeap,
@@ -247,6 +249,8 @@ import {
 } from "./emit_shape_rows"
 import { RC_MAP, RC_REF_LIST, readAtomKindOfTy } from "./emit_start_block"
 import {
+  LBK_REF,
+  LBK_UNION,
   PK_I16,
   PK_I8,
   PK_U16,
@@ -316,6 +320,9 @@ import {
   isUnionOfTy,
   mapValueTyOf,
   unRowOfRecordTy,
+  unionHasRefArrayArmSlot,
+  unionRefArrayArmSlotForElem,
+  unionRefArrayArmSlotForNestedElem,
 } from "./emit_union_atoms"
 import {
   unionHasAtomK,
@@ -2014,12 +2021,13 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     return if ok { holeBox("atomStr", 2, -1) } else { ladder }
   }
   // A scalar list rides the box as itself under its list kind's tag (`emitUnionCoerceAtomBox`):
-  // a literal, a ref-element list, a closure and the atom list each have a rung of their own.
+  // a ref-element list, a closure, the atom list and a literal another arm builds each have a
+  // rung of their own.
   const bareTy = nodeTyAt(bareIx, fnIx)
   if (
     bareTy >= 0
     && tyAt(bareTy) is TyArray
-    && !(bare is ArrayLit)
+    && (!(bare is ArrayLit) || listLitTakesAtomBox(unionTy, exprIx, fnIx))
     && !exprRefArray(exprIx, fnIx)
     && !exprIsClosure(exprIx, fnIx)
   ) {
@@ -2052,6 +2060,78 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     "instLit" | "floatLit" => holeBox("lit", k, -1)
     "asgLit" | "radix" | "convert" => ladder
   }
+}
+
+// The ref-list row list literal `arrIx` builds at its checker type, -1 where it is no literal
+// or its type names no ref-list row.
+export function arrLitRefSlotAtTy(arrIx: i32, fnIx: i32): i32 {
+  if arrIx < 0 || arrIx >= P.nodes.length || !(nodeAt(arrIx) is ArrayLit) {
+    return -1
+  }
+  const ty = arrLitTyAt(arrIx, fnIx)
+  const tb = arrLitBuild(arrIx, ty, fnIx)
+  if tb == null { return -1 }
+  if tb.lbKind != LBK_REF && tb.lbKind != LBK_UNION { return -1 }
+  return tb.lbSlot
+}
+
+// The ref-array arm of `unionTy` list literal `exprIx` is built at, chosen by its first element's
+// member atom (a nested list or map element by the union's self arm), or -1 where the union's
+// own value-atom list arm takes it or it names no such arm. `emitUnionListLitViaRefArm`'s choice.
+export function listLitRefArmSlotOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bx = unwrapParen(exprIx)
+  if bx < 0 || bx >= P.nodes.length { return -1 }
+  const bare = nodeAt(bx)
+  if !(bare is ArrayLit) { return -1 }
+  const row = unRowOfTyKey(unionTy)
+  if bare.arrElems.length == 0 {
+    // An empty literal takes a ref-array arm only where no value-atom list arm can.
+    for a in ["i32", "boolean", "string", "f64", "i64", "f32"] {
+      if unionHasAtomOfTy(unionTy, a, true) { return -1 }
+    }
+    return unionRefArrayArmSlotForElem(row, "")
+  }
+  const e0 = bare.arrElems[0]
+  if exprArray(e0, fnIx) || exprRefArray(e0, fnIx) || exprMap(e0, fnIx) {
+    return unionRefArrayArmSlotForNestedElem(row, exprMap(e0, fnIx))
+  }
+  const ea = listLitElemAtomOf(e0, fnIx)
+  if ea == "" || unionHasAtomOfTy(unionTy, ea, true) { return -1 }
+  return unionRefArrayArmSlotForElem(row, ea)
+}
+
+// The member atom list element `e0` names, the ladder's integer default for any other scalar,
+// or "" for a record literal naming no variant.
+function listLitElemAtomOf(e0: i32, fnIx: i32): string {
+  if exprString(e0, fnIx) { return "string" }
+  if exprIsBool(e0, fnIx) { return "boolean" }
+  if exprIsF64(e0, fnIx) { return "f64" }
+  if exprIsI64(e0, fnIx) { return "i64" }
+  const b = unwrapParen(e0)
+  if b >= 0 && b < P.nodes.length && nodeAt(b) is ObjLit {
+    return objVariantName(b)
+  }
+  return "i32"
+}
+
+// Whether list literal `exprIx` reaches `unionTy`'s value-atom box, every list rung before it
+// (`emitUnionCoerceList`: the empty literal, its own ref-list arm, a map or nested element, an arm
+// built through) declining it.
+function listLitTakesAtomBox(unionTy: i32, exprIx: i32, fnIx: i32): boolean {
+  const bx = unwrapParen(exprIx)
+  if bx < 0 || bx >= P.nodes.length { return false }
+  const bare = nodeAt(bx)
+  if !(bare is ArrayLit) || bare.arrElems.length == 0 { return false }
+  if unionHasRefArrayArmSlot(unionTy, arrLitRefSlotAtTy(bx, fnIx)) {
+    return false
+  }
+  const e0 = bare.arrElems[0]
+  if exprMap(e0, fnIx) { return false }
+  const e0b = unwrapParen(e0)
+  if e0b >= 0 && e0b < P.nodes.length && nodeAt(e0b) is ArrayLit {
+    return false
+  }
+  return listLitRefArmSlotOf(unionTy, exprIx, fnIx) < 0
 }
 
 // The arm of `unionTy` whose tag box `exprIx`, narrowed to a record arm no arm of `unionTy` holds,

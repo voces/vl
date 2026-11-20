@@ -1093,7 +1093,6 @@ import {
   nulLitAtomTexts,
   nulRefStructIdxOfLet,
   nulVariantIdxOfExpr,
-  objVariantName,
   objVariantNameCtx,
   objVariantRowCtx,
   optChainStructIdxOf,
@@ -1412,7 +1411,6 @@ import {
   unionHasMapArmSlot,
   unionHasRefArrayArmSlot,
   unionNestedArrayArmSlot,
-  unionRefArrayArmSlotForElem,
   unionRefArrayArmSlotForMapElem,
   unionRefArrayArmSlotForNestedElem,
   valueUnionKeyTextOfTy,
@@ -1758,6 +1756,7 @@ import {
   LitIsArm,
   NumIsPlan,
   TagIsArm,
+  arrLitRefSlotAtTy,
   atomEqPlanOf,
   atomNulStrWhy,
   boxAtomRetagKind,
@@ -1787,6 +1786,7 @@ import {
   listIsAcrossRepsPlan,
   listIsArmTag,
   listLeafTyOf,
+  listLitRefArmSlotOf,
   listWrapHeapOfKind,
   litIsArmOf,
   mapSoftTwinClashOf,
@@ -7760,82 +7760,16 @@ function emitUnionListLitViaRefArm(
   fnIx: i32,
 ) {
   if unionName == "" { return 0 }
-  const bare = nodeAt(unwrapParen(exprIx))
-  if bare is ArrayLit {
-    // Classify the FIRST element's member ATOM (the arm-choice key; each element still
-    // coerces independently inside the build). An element this static probe cannot name
-    // (a nested list / map) bails to the caller's existing paths.
-    let elemAtom = ""
-    // Hoisted: the empty-`[]` branch below shares the arm-slot resolution at the bottom.
-    let selfArm = false
-    let selfSlot = 0 - 1
-    if bare.arrElems.length >= 1 {
-      const e0 = bare.arrElems[0]
-      // D1016 — a nested list or map element is unnameable by the probe above, and a
-      // self-referential union has exactly the arm that admits it: `Json[]`'s element type is
-      // `Json` itself, so every element is a legal member and the arm's build boxes it as
-      // one, the same recursive step the annotated binding performs. No such arm: bail.
-      if exprArray(e0, fnIx) || exprRefArray(e0, fnIx) || exprMap(e0, fnIx) {
-        selfSlot = unionRefArrayArmSlotForNestedElem(
-          unRowOfTyKey(unionTy),
-          exprMap(e0, fnIx),
-        )
-        if selfSlot < 0 { return 0 }
-        selfArm = true
-      }
-      if selfArm {
-        // the arm is already chosen — the value-atom ladder below must not reclaim it
-      } else if exprString(e0, fnIx) {
-        elemAtom = "string"
-      } else if exprIsBool(e0, fnIx) {
-        elemAtom = "boolean"
-      } else if exprIsF64(e0, fnIx) {
-        elemAtom = "f64"
-      } else if exprIsI64(e0, fnIx) {
-        elemAtom = "i64"
-      } else {
-        const e0b = nodeAt(unwrapParen(e0))
-        if e0b is ObjLit {
-          elemAtom = objVariantName(unwrapParen(e0))
-          if elemAtom == "" { return 0 }
-        } else {
-          elemAtom = "i32" // the ladder's own integer default
-        }
-      }
-      // The union's own value-atom LIST arm is the exact match — let the ladder box it.
-      // Not for the self-referential arm: `Json` names the union, and asking whether it has
-      // a `Json[]` value atom is asking about the arm we just picked.
-      if !selfArm {
-        if unionHasAtomOfTy(unionTy, elemAtom, true) { return 0 }
-      }
-    } else {
-      // An EMPTY `[]`: only route when NO value-atom list arm could claim it.
-      if (
-        unionHasAtomOfTy(unionTy, "i32", true)
-        || unionHasAtomOfTy(unionTy, "boolean", true)
-        || unionHasAtomOfTy(unionTy, "string", true)
-        || unionHasAtomOfTy(unionTy, "f64", true)
-        || unionHasAtomOfTy(unionTy, "i64", true)
-        || unionHasAtomOfTy(unionTy, "f32", true)
-      ) {
-        return 0
-      }
-    }
-    let armSlot = unionRefArrayArmSlotForElem(unRowOfTyKey(unionTy), elemAtom)
-    if selfArm { armSlot = selfSlot }
-    if armSlot < 0 { return 0 }
-    const armTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionTy)
-    if armTag < 0 {
-      return emitFail("emitProgram: boolean list arm has no tag")
-    }
-    fbI32Rel(RS_TAG, armTag)
-    const armBuild: ListBuild = { lbKind: LBK_UNION, lbSlot: armSlot }
-    const rc = emitArrAt(unwrapParen(exprIx), fnIx, armBuild)
-    if rc < 0 { return -1 }
-    fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
-    return 1
-  }
-  return 0
+  const armSlot = listLitRefArmSlotOf(unionTy, exprIx, fnIx)
+  if armSlot < 0 { return 0 }
+  const armTag = refArrBoxTagOf(exprIx, fnIx, armSlot, unionTy)
+  if armTag < 0 { return emitFail("emitProgram: boolean list arm has no tag") }
+  fbI32Rel(RS_TAG, armTag)
+  const armBuild: ListBuild = { lbKind: LBK_UNION, lbSlot: armSlot }
+  const rc = emitArrAt(unwrapParen(exprIx), fnIx, armBuild)
+  if rc < 0 { return -1 }
+  fbStructNew(uBoxIdx) // { tag, reflist-wrapper ref }
+  return 1
 }
 
 // Route an array-literal union carrier into the union's single nested-array arm
@@ -12250,17 +12184,6 @@ function emitArrAt(arrIx: i32, fnIx: i32, lb: ListBuild) {
   elabSpreadNote(arrIx)
   const r = emitArrUnder(arrIx, fnIx, lb)
   return r
-}
-
-// The ref-list row list literal `arrIx` builds at its checker type, -1 where it is no literal
-// or its type names no ref-list row.
-function arrLitRefSlotAtTy(arrIx: i32, fnIx: i32): i32 {
-  if !(nodeAt(arrIx) is ArrayLit) { return -1 }
-  const ty = arrLitTyAt(arrIx, fnIx)
-  const tb = arrLitBuild(arrIx, ty, fnIx)
-  if tb == null { return -1 }
-  if tb.lbKind != LBK_REF && tb.lbKind != LBK_UNION { return -1 }
-  return tb.lbSlot
 }
 
 // The packed `u8[]` arm of `emitArrUnder`: each element as a plain i32 truncated into the
@@ -28210,26 +28133,24 @@ function listOpRecvLocal(
   return sb + 3
 }
 
-// The local list-op receiver `objIx` already is, -1 when it is staged, or -2 after a refusal.
-export function listOpRecvHeld(objIx: i32, fnIx: i32, op: string): i32 {
+// The local list-op receiver `objIx` already is, -1 when it is staged, -3 when a push would land
+// in a fitted or captured stand-in list and be lost, and -4 when it is no list local, captured
+// list or global. It writes nothing and records no failure.
+export function listOpRecvHeldPlan(objIx: i32, fnIx: i32, op: string): i32 {
   const recv = nodeAt(objIx)
   if recv is Ident {
     if !listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
       // An `is K[]` arm's empty list of another element (D4911): an op that only reads it
       // reads the arm's own, and a push lands there when the arm keeps it (D4934).
       const fitSh = listFitShadowRead(recv.identName, objIx, fnIx)
-      if fitSh >= 0 && op == ".push" && !listFitGrowHolds(fitSh) {
-        emitFailAt(LIST_FIT_PUSH_MSG, objIx)
-        return -2
-      }
+      if fitSh >= 0 && op == ".push" && !listFitGrowHolds(fitSh) { return -3 }
       if fitSh >= 0 { return fitSh }
       // A closure's stand-in for such a list is its own, and a push into it would be lost.
       if (
         op == ".push"
         && listFitCaptureStandIn(recv.identName, objIx, fnIx, true, []) >= 0
       ) {
-        emitFailAt(LIST_FIT_PUSH_MSG, objIx)
-        return -2
+        return -3
       }
       const lIdx = localIndexOf(fnIx, objIx)
       if lIdx >= 0 { return lIdx }
@@ -28239,12 +28160,25 @@ export function listOpRecvHeld(objIx: i32, fnIx: i32, op: string): i32 {
         !identIsEnvCapture(fnIx, recv.identName)
         && globalIndexOfSid(sidOfNode(objIx)) < 0
       ) {
-        emitFail("emitProgram: " + op + " receiver is not a list local")
-        return -2
+        return -4
       }
     }
   }
   return -1
+}
+
+// The local list-op receiver `objIx` already is, -1 when it is staged, or -2 after a refusal.
+export function listOpRecvHeld(objIx: i32, fnIx: i32, op: string): i32 {
+  const h = listOpRecvHeldPlan(objIx, fnIx, op)
+  if h == -3 {
+    emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+    return -2
+  }
+  if h == -4 {
+    emitFail("emitProgram: " + op + " receiver is not a list local")
+    return -2
+  }
+  return h
 }
 
 // Lower a `recv.push(x)` member-call statement — the growable-list append, inlined rather
@@ -31596,33 +31530,9 @@ function emitReturnValue(retArg: i32, fnIx: i32) {
   if fn is FuncDecl {
     if fn.fnRet < 0 { fnPos = fnStmtsPosOf(fnIx) }
   }
-  // A `null` returned where the result is a non-null record or variant: a lambda's join of
-  // parameter holes and `null` loses the null at the pin (D3506), so refuse, not mistype.
-  if retNullIntoNonNullRef(retArg, fnIx, fnPos) {
-    return emitFailAt(
-      "emitProgram: a `null` is returned where this instantiation's result is a non-null record",
-      retArg,
-    )
-  }
-  // A union-list result over a `.map` whose callback this pin gives a niche or scalar result
-  // builds a different list than the result declares; refused rather than mistyped.
-  if retResultIsRefList(fnIx, fnPos) {
-    if retMapBuildsOtherList(retArg, fnIx) {
-      return emitFailAt(
-        "emitProgram: a returned `.map` builds a list the function's result does not name at this instantiation",
-        retArg,
-      )
-    }
-  }
+  const refused = retRefusedWhy(retArg, fnIx)
+  if refused != "" { return emitFailAt(refused, retArg) }
   if fn is FuncDecl { retArmHeap = returnArmHeapOf(fn, fnIx, fnPos) }
-  // A returned map or ref list built at another storage than the function's result is one no
-  // conversion here reconciles; refused rather than mistyped (D15753, D15755).
-  if retStorageMismatch(retArg, fnIx) {
-    return emitFailAt(
-      "emitProgram: a returned container of functions is built at another storage than this function's result",
-      retArg,
-    )
-  }
   // A `null` the row stores in a union box, returned where the result is the `null` unit, is
   // that null: the box is read for effect and dropped.
   if (
@@ -31638,6 +31548,28 @@ function emitReturnValue(retArg: i32, fnIx: i32) {
     return 0
   }
   return emitReturnValueTail(retArg, fnIx, fnPos, retArmHeap)
+}
+
+// Why returning `retArg` from `fnIx` is refused rather than mistyped, or "": the one decision
+// legacy's return and the IR's builder read. A `null` into a non-null record result, a `.map`
+// building another list than a union-list result names, or a container of functions built at
+// another storage than the result.
+export function retRefusedWhy(retArg: i32, fnIx: i32): string {
+  const fn = nodeAt(fnIx)
+  let fnPos = -1
+  if fn is FuncDecl {
+    if fn.fnRet < 0 { fnPos = fnStmtsPosOf(fnIx) }
+  }
+  if retNullIntoNonNullRef(retArg, fnIx, fnPos) {
+    return "emitProgram: a `null` is returned where this instantiation's result is a non-null record"
+  }
+  if retResultIsRefList(fnIx, fnPos) && retMapBuildsOtherList(retArg, fnIx) {
+    return "emitProgram: a returned `.map` builds a list the function's result does not name at this instantiation"
+  }
+  if retStorageMismatch(retArg, fnIx) {
+    return "emitProgram: a returned container of functions is built at another storage than this function's result"
+  }
+  return ""
 }
 
 // Whether `retArg`, returned by function `fnIx` whose result is inferred, is a map or ref list
