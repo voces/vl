@@ -9,8 +9,9 @@
 # compiler/ adds one row per function (`fnc <name>` claimed, `fnu <name> | <miss>` not); it is
 # built with <seed> in a temp dir, never into build/. A function's name carries its module
 # (`$m<id>`) when it is not the entry's, so std functions count once across files.
-# Writes <out-dir>/<pop>.rows (file, count, row) and <out-dir>/summary.txt (summary.sh). Run from the checkout
-# root; $VL names the host, $JOBS the fan-out (default 4).
+# Writes <out-dir>/<pop>.rows (file, count, row), <out-dir>/summary.txt (summary.sh), the witnesses
+# under <out-dir>/wit, and <out-dir>/programs.txt, every program, for `CENSUS_PROGRAMS=` of
+# ir-driver-census.sh. Run from the checkout root; $VL names the host, $JOBS the fan-out (default 4).
 set -euo pipefail
 SEED=${1:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
 OUT=${2:?usage: scripts/ir-i8-census/census.sh <seed> <out-dir>}
@@ -36,7 +37,8 @@ awk '
 mv "$T/ir_build.vl" "$T/probe/ir_build.vl"
 "$VL" build "$T/probe/entry.vl" -o "$T/probe.wasm" --compiler "$SEED" > /dev/null
 
-"$VL" run scripts/ir-i8-census/witnesses.vl -- "$T/wit" docs/internals/inventory docs/internals/inventory-2 > "$T/witnesses"
+rm -rf "$OUT/wit"
+"$VL" run scripts/ir-i8-census/witnesses.vl -- "$OUT/wit" docs/internals/inventory docs/internals/inventory-2 > "$T/witnesses"
 ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl > "$T/distilled"
 find tests/cases -name '*.vl' | sort > "$T/cases"
 ls scripts/capability-probes/*.vl > "$T/probes"
@@ -57,5 +59,6 @@ for pop in distilled cases probes witnesses; do
   wc -l < "$T/$pop" > "$OUT/$pop.programs"
 done
 echo 1 > "$OUT/self.programs"
+cat "$T/distilled" "$T/cases" "$T/probes" "$T/witnesses" > "$OUT/programs.txt"
 
 scripts/ir-i8-census/summary.sh "$OUT" | tee "$OUT/summary.txt"
