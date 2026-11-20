@@ -16,6 +16,9 @@ the `if`'s value.
   (if c { x } else { y })`), refused by `stageLeadArgs`'s `OStr` arm and by `RStage`'s verifier.
   IR6, who wrote #9227: the exclusion "was conservative, not a known hazard … a literal lead was
   never exercised, so I fenced it out".
+- **Every staging caller shares the literal.** The call and intrinsic arguments take it too (the
+  self-compile's 2 `short-circuit argument after another` rows went with it); #9276's field-store
+  receiver is a record, never a literal.
 - **The verifier's narrower clause.** An `OStr` stages only at its own rep (`dst ==
   opRep(sgV)`); the box-view escape is for a variable.
 
