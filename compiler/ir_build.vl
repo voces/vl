@@ -212,7 +212,9 @@ import { arrLitRefPlainSlot } from "./emit_plan_list"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
+  NULL_OWN_BOOL,
   NULL_OWN_BOX,
+  NULL_OWN_NONE,
   NULL_OWN_STR,
   binNulTestOf,
   coalArmOf,
@@ -537,6 +539,8 @@ function valueRep(r: i32, ty: i32): boolean {
     || boxedNullable(r)
     || atomNullable(r)
     || strNullable(r)
+    || refNullable(r)
+    || boolNullable(r)
     || irVarRepOkHook(r, ty)
 }
 
@@ -698,6 +702,21 @@ function strNullable(r: i32): boolean {
   if !(n is RNullable) || n.rnDisc != 1 { return false }
   const p = repPrim(n.rnInner)
   return p != null && p == "str"
+}
+
+// Whether rep `r` is a record, list, map or closure or null (discipline 1): the reference, or a
+// null reference of its type.
+function refNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  if !(n is RNullable) || n.rnDisc != 1 { return false }
+  const i = repNodeAt(n.rnInner)
+  return i is RRecord || i is RList || i is RMap || i is RClosure
+}
+
+// Whether rep `r` is `boolean | null` (discipline 2): the i32 0 or 1, or the sentinel 2.
+function boolNullable(r: i32): boolean {
+  const n = repNodeAt(r)
+  return n is RNullable && n.rnDisc == 2 && repPrim(n.rnInner) == "bool"
 }
 
 // Whether rep `r` is a nullable boxed as a union is (discipline 4): `{tag, payload}`.
@@ -2094,14 +2113,16 @@ function irRepOtherThan(ix: i32, r: i32): boolean { return primRepOf(ix) != r }
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32): Opnd {
-  // A `null` literal into a `K | null` or a `string | null` is legacy's own null (`nullOwnAt`):
-  // the sentinel, or the string's typed null ref.
+  // A `null` literal into a `K | null`, a `boolean | null`, a `string | null` or a nullable
+  // reference is legacy's own null (`nullOwnAt`): a sentinel, the string's typed null ref, or the
+  // bottom ref.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
     const atom = atomNullable(dst)
-    const own = if atom || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
-    if own == (if atom { NULL_OWN_ATOM } else { NULL_OWN_STR }) {
-      return repTemp(b, { nuAt: ix, nuOwn: own }, ix, dst)
-    }
+    const ref = refNullable(dst)
+    const bool = boolNullable(dst)
+    const own = if atom || ref || bool || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
+    const want = if atom { NULL_OWN_ATOM } else if ref { NULL_OWN_NONE } else if bool { NULL_OWN_BOOL } else { NULL_OWN_STR }
+    if own == want { return repTemp(b, { nuAt: ix, nuOwn: own }, ix, dst) }
   }
   // A `null` literal has no value of its own: the box writer writes the null tag alone.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
@@ -2169,12 +2190,12 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   if ibMiss != "" || dst < 0 || irBOpRep(v) == dst { return v }
   // The checker records the box at the node; legacy's box writer builds it around the value.
   if heldAsBox(dst) && boxOwedAt(ix, ibFnIx) { return boxTemp(b, v, ix, dst) }
-  // An atom into its `K | null` is the same i32, and a string into `string | null` the same ref:
+  // An atom into its `K | null` is the same i32, and a reference into its nullable the same ref:
   // legacy's table has no row for either, since a nullable niche is no box (`boxOwedAt`).
   const dn = repNodeAt(dst)
   if (
     dn is RNullable
-    && (dn.rnDisc == 3 || strNullable(dst))
+    && (dn.rnDisc == 3 || strNullable(dst) || refNullable(dst) || boolNullable(dst))
     && dn.rnInner == irBOpRep(v)
   ) {
     if !boxOwedAt(ix, ibFnIx) { return repTemp(b, { rgV: v }, ix, dst) }
@@ -2337,13 +2358,18 @@ function nulTest(
     return irBMiss("null test of null")
   }
   const arm = nulTestArmOf(bt.bnRef, ibFnIx, bt.bnInvert, false)
-  if arm != "atom" && arm != "nullRef" && arm != "nulStr" {
+  if arm != "atom" && arm != "bool" && arm != "nullRef" && arm != "nulStr" {
     return irBMiss("null test " + arm)
   }
   const v = irBExpr(b, bt.bnRef)
   if ibMiss != "" { return v }
   const vr = irBOpRep(v)
-  if !(arm == "atom" && atomNullable(vr) || arm != "atom" && strNullable(vr)) {
+  if (
+    !(arm == "atom" && atomNullable(vr)
+      || arm == "bool" && boolNullable(vr)
+      || arm == "nulStr" && strNullable(vr)
+      || arm == "nullRef" && (strNullable(vr) || refNullable(vr)))
+  ) {
     return irBMiss("null test operand")
   }
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
