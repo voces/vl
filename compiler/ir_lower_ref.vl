@@ -11,6 +11,7 @@ import { BinExpr, Call, Index, Member, P, WhileStmt, nodeAt } from "./ast"
 import { fbDrop } from "./emit_bytes"
 import {
   OImm,
+  PStaged,
   RListClear,
   RListEq,
   RListGet,
@@ -18,6 +19,7 @@ import {
   RListPop,
   RListPush,
   RListSlice,
+  RListStage,
   RMapFilter,
   RStrOp,
   Rhs,
@@ -63,6 +65,7 @@ import {
   popRefTail,
   popScalarTail,
   pushAppendTail,
+  pushPlainWhy,
   pushValueTail,
   rawStrGetTail,
   rawStrHoistOf,
@@ -178,24 +181,44 @@ function lowerGet(r: RListGet): i32 {
   return scalarListGetTail(nd, ek, fnIx, hz)
 }
 
-// `RListPush`: the receiver held in its local or staged as legacy stages it, then the value and
-// legacy's append; `want` leaves the new length.
+// `RListPush`: the receiver held in its local, staged as legacy stages it, or already staged by
+// its `RListStage`; then the value and legacy's append. `want` leaves the new length.
 function lowerPush(r: RListPush, want: boolean): i32 {
   const fnIx = irLFn().irAt
   const pp = pushPlanOf(r.lpAt, fnIx)
   if pp == null { return irLMiss("push plan") }
   let lIdx = listOpRecvHeld(pp.ppRecv, fnIx, ".push")
   if lIdx == -2 { return irLMiss("push receiver") }
-  if lIdx >= 0 {
-    irLSkip(r.lpV)
+  const v = r.lpV
+  if v is PStaged {
+    if lIdx >= 0 { return irLMiss("push stage disagrees") }
+    lIdx = pp.ppSlot.base + 3
+  } else if lIdx >= 0 {
+    irLSkip(v)
   } else {
-    irLOpnd(r.lpV)
+    irLOpnd(v)
     stageListRecvTail(pp.ppRecv, fnIx, pp.ppSlot.base)
     lIdx = pp.ppSlot.base + 3
   }
   irLOpnd(r.lpX)
   pushValueTail(pp, fnIx)
   return pushAppendTail(r.lpAt, pp, lIdx, want)
+}
+
+// `RListStage`: the receiver of push `rsgAt` read and staged as legacy stages it, ahead of the
+// push's value; legacy must stage this receiver early, or the push is legacy's.
+function lowerListStage(r: RListStage): i32 {
+  const fnIx = irLFn().irAt
+  const pp = pushPlanOf(r.rsgAt, fnIx)
+  if pp == null { return irLMiss("push plan") }
+  if (
+    listOpRecvHeld(pp.ppRecv, fnIx, ".push") != -1
+    || pushPlainWhy(pp, fnIx) != ""
+  ) {
+    return irLMiss("push stage disagrees")
+  }
+  irLOpnd(r.rsgV)
+  return stageListRecvTail(pp.ppRecv, fnIx, pp.ppSlot.base)
 }
 
 // `SListSet`: the receiver (or its live hoist), index and value, then legacy's park, guard and
@@ -259,6 +282,7 @@ function lowerClear(r: RListClear): i32 {
 // A list op in statement position.
 export function irLowerRefEffect(r: Rhs): i32 {
   if r is RListPush { return lowerPush(r, false) }
+  if r is RListStage { return lowerListStage(r) }
   if r is RListPop { return lowerPop(r, false) }
   if r is RListClear { return lowerClear(r) }
   if r is RStrOp && r.soOp == "acc" { return lowerStr(r) }

@@ -102,6 +102,7 @@ import {
   RGetField,
   RGlobalGet,
   RListClear,
+  RListCopy,
   RListEq,
   RListGet,
   RListLen,
@@ -109,6 +110,7 @@ import {
   RListPop,
   RListPush,
   RListSlice,
+  RListStage,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -227,6 +229,9 @@ import {
 } from "./emit_bytes"
 import {
   GlobalCtx,
+  arrCopyBacking,
+  arrCopyPlanOf,
+  arrCopyTail,
   arrLitHoistGlobal,
   arrLitIsForIter,
   arrLitPackedShortTail,
@@ -296,6 +301,7 @@ import {
   holeBoxHead,
   holeBoxTail,
   holeBoxTyAt,
+  identListOverrideOf,
   idxRowsOn,
   idxSpanOn,
   initBitOf,
@@ -765,6 +771,7 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RListGet | RListLen | RListPush | RListPop | RListEq | RStrOp | RMapFilter | RListSlice => irLowerListHook(r)
     RListClear => irLMiss("clear value")
+    RListStage => irLMiss("receiver stage value")
     RNumWiden => {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
@@ -807,6 +814,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMakeRec => makeRec(r)
     RMapOp => mapOp(r)
     RListNew => listNew(r)
+    RListCopy => irLMiss("list copy value")
     RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
@@ -1255,6 +1263,16 @@ function boxNarrow(r: RBoxNarrow) {
 // as `emitIdentLocalRead` writes it, and again where the read owes its narrowed rep, as
 // `emitReadRecover` writes it after.
 function recoverRead(r: RRecover) {
+  // A list override (`identListOverrideOf`) reads lowering state, so it is asked here.
+  const e = nodeAt(r.rcAt)
+  if e is Ident {
+    match identListOverrideOf(e, r.rcAt, lw.irAt) {
+      "luOv" | "fitShadow" => {
+        return irLMiss("list override")
+      }
+      "none" => {}
+    }
+  }
   irLOpnd(r.rcV)
   if localNulStrRecovers(r.rcAt, lw.irAt) { fbRefAsNonNull() }
   if readOwesNonNullRecover(r.rcAt, lw.irAt) { fbRefAsNonNull() }
@@ -1274,6 +1292,24 @@ function listNew(r: RListNew) {
   irLOpnd(r.lnFill)
   arrNewFillStep(-1)
   return arrNewTail(pl, slot)
+}
+
+// `RListCopy`: legacy's `__array_copy__` arm in `emitArrayCopyIntr`'s order, each list operand
+// followed by its backing read, then the copy, at `arrCopyPlanOf`'s pair.
+function listCopy(r: RListCopy) {
+  const pl = arrCopyPlanOf(r.lcAt, lw.irAt)
+  if pl.acWhy != "" || r.lcArgs.length != 5 {
+    return irLMiss("list copy refused")
+  }
+  irLOpnd(r.lcArgs[0])
+  arrCopyBacking(pl)
+  irLOpnd(r.lcArgs[1])
+  irLOpnd(r.lcArgs[2])
+  arrCopyBacking(pl)
+  irLOpnd(r.lcArgs[3])
+  irLOpnd(r.lcArgs[4])
+  arrCopyTail(pl)
+  return 0
 }
 
 // `RMakeList`: legacy's build pair and prologue, then each element, then the short tail at the
@@ -2088,7 +2124,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if !t && r.crDrop { fbDrop() }
         return 0
       }
-      if r is RListPush || r is RListPop || r is RListClear || r is RStrOp {
+      if (
+        r is RListPush
+        || r is RListStage
+        || r is RListPop
+        || r is RListClear
+        || r is RStrOp
+      ) {
         irLowerEffectHook(r)
         irLSettle(pending)
         return 0
@@ -2100,6 +2142,11 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       }
       if r is RPrint {
         printOp(r)
+        irLSettle(pending)
+        return 0
+      }
+      if r is RListCopy {
+        listCopy(r)
         irLSettle(pending)
         return 0
       }
