@@ -31,4 +31,12 @@ passes it. The test's 600 levels is unchanged.
 
 ## Measured
 
-PROOF_TABLE
+Fixpoint seeds: master c4999b0b8 against this branch.
+
+| bar | result |
+|---|---|
+| `ir-identity.sh --names` | identical 9,037, differ 0; self-compile identical |
+| `--cases` | identical 7,516, differ 0; witnesses same 59, differ 0 |
+| mode 3 | identical; 18,358 claimed |
+| L2 fuel | -0.013% on master (103,301,485,947 vs 103,314,818,009) |
+| `gate.sh --fast` | passed |
