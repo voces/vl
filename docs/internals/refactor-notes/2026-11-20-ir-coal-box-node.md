@@ -42,15 +42,31 @@ step 1's head.
 
 ## Coverage
 
+Measured on fixpoint seeds of this branch and master `9def19204`, which includes step 1.
+
 | population | before | after |
 | --- | ---: | ---: |
-| corpus functions covered (45,678) | 37,598 | 37,645 |
-| self-compile functions covered | 17,087 | 17,089 |
+| corpus functions covered (45,678) | 39,264 | 39,312 |
+| self-compile functions covered | 17,336 | 17,338 |
 
 - **Shadow mode 1:** everything covered is verified and matched.
 - **Mode-3 self-compile:** byte-identical to the shipped build.
-- **`ir-identity.sh --names` against step 1's seed:** identical 9,037, differ 0, self-compile
-  identical.
+- **Legacy bytes:**
+  - `ir-identity.sh --names` against master's seed: identical 9,037, differ 0, self-compile
+    identical.
+  - A per-file A/B over every non-`@error` `tests/cases` program, built under master's seed and this
+    branch's: same 7,231, fail under both 67, differ 0.
+  - `--cases`: identical 7,516, differ 0.
+- **Corpus blockers.** The 174 functions `coalesce niche identBox` held alone on master are now held
+  by:
+
+  | blocker | functions |
+  | --- | ---: |
+  | `coalesce box next`, the rest of the ladder (chiefly a record field `o.v ?? d`) | 92 |
+  | `box of a valued if` | 13 |
+  | `coalesce box stash operand` | 2 |
+
+  The 134 that also need `member box` now read `coalesce box next + member box`.
 - **Witness:** every built arm and a nested `??` in a default. The witness program prints correct
   values, and its call-counting defaults each run once, on their null path only.
 - **Misses that remain in the witness:**
