@@ -21019,29 +21019,35 @@ function emitExprRaw(ix: i32, fnIx: i32): i32 {
 // string-to-atom conversion never re-enters it.
 let rawReadNode = -1
 
-// Whether `emitExpr`'s string-to-atom conversion takes node `ix`: `hookTakesAtomPure`, unless a
-// raw read of it is in progress.
-function hookTakesAtom(ix: i32, fnIx: i32): boolean {
-  if unwrapParen(ix) == rawReadNode { return false }
-  return hookTakesAtomPure(ix, fnIx)
+// The arms `emitExpr`'s string-to-atom hook writes a node by: a `const` read bound to a literal
+// (`wideLit`), a string-repped literal union narrowed (`strToAtom`) or a join whose arms disagree
+// about their rep taking the destination per arm (`perArmJoin`), a join of member literals (`litJoin`).
+export type AtomHookArm = "wideLit" | "strToAtom" | "perArmJoin" | "litJoin"
+
+// The arm the hook takes node `ix` by, or null where it declines; `live` also asks whether a raw
+// read of it is in progress (`rawReadNode`), emit state a build-time ask leaves out.
+export function atomHookArmOf(
+  ix: i32,
+  fnIx: i32,
+  live: boolean,
+): AtomHookArm | null {
+  const w = unwrapParen(ix)
+  if w < 0 || w >= P.nodes.length { return null }
+  if live && w == rawReadNode { return null }
+  if !hookTakesAtomPure(ix, fnIx) { return null }
+  if nodeHasWideStrLit(w) { return "wideLit" }
+  if strReppedLitUnionAt(ix, fnIx) {
+    return if ifJoinNarrowsPerArm(w) { "perArmJoin" } else { "strToAtom" }
+  }
+  if ifJoinArmsAllStrLit(w) { return "litJoin" }
+  return null
 }
 
-// `hookTakesAtom` less the emit state it reads: node `ix`'s closed contextual type reps as the
-// atom, as `strLitTakesAtom` decides, and the hook has a conversion for it.
+// Whether `emitExpr`'s string-to-atom hook may take node `ix`, less the emit state it reads: its
+// closed contextual type reps as the atom (`strLitTakesAtom`), and the hook converts such a node.
 export function hookTakesAtomPure(ix: i32, fnIx: i32): boolean {
   if !hookMayConvert(unwrapParen(ix)) { return false }
   return strLitTakesAtom(ix, fnIx)
-}
-
-// Whether the hook takes `if` node `ix` by its third arm, the join of member literals each arm
-// delivers at the atom (`emitIfExprAs`); `live` also asks the emit state `hookTakesAtom` reads.
-export function atomHookIfJoin(ix: i32, fnIx: i32, live: boolean): boolean {
-  const w = unwrapParen(ix)
-  if w < 0 || w >= P.nodes.length { return false }
-  if live && w == rawReadNode { return false }
-  if !hookTakesAtomPure(ix, fnIx) || nodeAt(w) is StrLit { return false }
-  if nodeHasWideStrLit(w) || strReppedLitUnionAt(ix, fnIx) { return false }
-  return ifJoinArmsAllStrLit(w)
 }
 
 // Whether the hook has a conversion for node `u`: a read of a `const` bound to a literal, a
@@ -21112,14 +21118,8 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
-  if hookTakesAtom(ix, fnIx) && !(nodeAt(w) is StrLit) {
-    if (
-      nodeHasWideStrLit(w)
-      || strReppedLitUnionAt(ix, fnIx)
-      || ifJoinArmsAllStrLit(w)
-    ) {
-      return "pre-path atom hook"
-    }
+  if !(nodeAt(w) is StrLit) && atomHookArmOf(ix, fnIx, false) != null {
+    return "pre-path atom hook"
   }
   if deliveredAsNulAtom(ix, fnIx) && nulStrReppedNulLitPlace(ix, fnIx) {
     return "pre-path nul atom place"
@@ -21197,22 +21197,18 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
   // A string-repped literal union reaching an atom-typed destination narrows to its interned
   // id here, one hook rather than one per destination. Without it the store is a `local.set`
   // of a `(ref $array)` into an `i32` slot: invalid wasm at every such destination.
-  if hookTakesAtom(exprIx, fnIx) {
-    // A read of a `const` bound to a literal is that literal, whose id needs no conversion.
+  const hookArm = atomHookArmOf(exprIx, fnIx, true)
+  if hookArm != null {
     const wideIx = unwrapParen(exprIx)
-    if nodeHasWideStrLit(wideIx) {
-      const wideLex = quoteLex(nodeWideStrLitText(wideIx))
-      return emitStaticLitAtom(exprIx, wideLex, fnIx)
+    return match hookArm {
+      // A read of a `const` bound to a literal is that literal, whose id needs no conversion.
+      "wideLit" => emitStaticLitAtom(exprIx, quoteLex(nodeWideStrLitText(wideIx)), fnIx)
+      // A join whose arms disagree about their rep takes the destination into each arm, under
+      // the same context, rather than joining as a string to narrow back (D2199); so does a join
+      // of member literals the checker typed `string`, as a generic body types it (D3423).
+      "perArmJoin" | "litJoin" => emitIfExprAs(wideIx, fnIx, 127)
+      "strToAtom" => emitStrToAtom(wideIx, fnIx)
     }
-    if strReppedLitUnionAt(exprIx, fnIx) {
-      // A join whose arms disagree about their rep takes the destination into each arm,
-      // under the same context, rather than joining as a string to narrow back (D2199).
-      if ifJoinNarrowsPerArm(wideIx) { return emitIfExprAs(wideIx, fnIx, 127) }
-      return emitStrToAtom(wideIx, fnIx)
-    }
-    // A join of member literals the checker typed `string`, as a generic body types it, takes
-    // the atom destination into each arm too (D3423).
-    if ifJoinArmsAllStrLit(wideIx) { return emitIfExprAs(wideIx, fnIx, 127) }
   }
   // …and its nullable twin: a `K | null` place held as a nullable string reaches the niche as
   // `-1` or the present string's id (D5431).
