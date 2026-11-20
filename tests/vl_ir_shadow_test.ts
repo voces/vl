@@ -332,10 +332,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals, and a list literal whose elements box into a union is a ref list legacy coerces: each a
-// named miss, never a byte mismatch.
+// locals: a named miss, never a byte mismatch. A list literal whose elements each box into its union
+// by their own record (`arrLitUnionBoxSlot`) is built at the box rep and matches legacy.
 Deno.test({
-  name: "ir shadow: a reserved list binding and a union-element list literal are named misses",
+  name: "ir shadow: a reserved list binding is a named miss; a union-element list literal is built",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -347,8 +347,15 @@ function ln(x: i32): (i32 | string)[] { return [x, "s"] }
 print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
-    for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
-      if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered declaration list reserve") !== 1) {
+      throw new Error(`want one "uncovered declaration list reserve" row, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.has("uncovered array ref")) {
+      throw new Error(`want the union-element list built, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
