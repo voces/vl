@@ -258,3 +258,43 @@ print(plain() + paren() + nested() + strs())
     }
   },
 });
+
+// A value `if` element lowers through the fragment's body walk, as a function body's does.
+Deno.test({
+  name: "ir door: a list literal holding a value if matches",
+  ignore,
+  fn: () => {
+    const r = rows(`function element(x: f32): f32 {
+  const a = [if x > 0.0 { x } else { 0.75 }]
+  return a[0]
+}
+print(element(-1.0))
+`);
+    if ((r.get("node-in array: matched") ?? 0) < 1 || r.has("node-in array: miss an `if` outside a body walk")) {
+      throw new Error(`want the value-if literal matched, got ${show(r)}`);
+    }
+  },
+});
+
+// A start body with a proven string accumulator still hosts a fragment: the rows the fragment
+// would read are the start's own while legacy writes it.
+Deno.test({
+  name: "ir door: a start-body literal beside a string accumulator matches",
+  ignore,
+  fn: () => {
+    const r = rows(`let t = ""
+let k = 0
+while k < 3 {
+  t = t + "x"
+  k = k + 1
+}
+const ys = [k, 2]
+print(t)
+print(ys[0])
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 1 || off.length > 0) {
+      throw new Error(`want the start literal matched, got ${show(r)}`);
+    }
+  },
+});
