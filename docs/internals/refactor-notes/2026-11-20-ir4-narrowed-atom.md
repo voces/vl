@@ -78,7 +78,7 @@ Fixpoint seeds at merge-base b0da3ce35 (#9285 merged) against the head.
 
 | | base | head |
 |---|---|---|
-| self covered = matched | 18,830 | 18,840 |
+| self covered = matched | 18,831 | 18,841 |
 | self `narrowed read` | 31 | 21 |
 | corpus covered / matched | 95,250 / 95,236 | 95,256 / 95,242 |
 | corpus `narrowed read` | 361 | 354 |
@@ -101,3 +101,13 @@ Matrices (runs both / covered base → head):
 - **The `print` position** stays `narrowed read`, because `print` takes no delivery.
 - **The `+` part with a one-member narrowing** misses `string atom part route`: the node type says
   `str` while `exprIsLitAtom` says atom.
+
+| bar | result |
+|---|---|
+| `ir-identity --names` | identical 9,037, differ 0; self-compile identical |
+| `ir-identity --cases` | identical 7,530, differ 0; witnesses 59/59 |
+| master-vs-head tests/cases A/B | 7,598 programs, 7,530 built, differ 0 |
+| mode 3 | identical; 18,825 claimed (master 18,812) |
+| L2 fuel, candidate vs master fixpoint | +0.027% (104,109,417,040 → 104,126,203,715) |
+| phase state | ok: the cell read is `exprAt`'s parameter, not a global |
+| plumb-shape cost, `gate.sh --fast` | ok / passed |

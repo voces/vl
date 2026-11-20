@@ -4,4 +4,4 @@
   union narrowed to one member. The read takes its cell's rep where a delivery builds it, and the
   delivery decodes it or passes the id, as legacy's position does. A `let` that legacy holds as
   the atom now needs an atom rep in the IR, which closes a latent invalid-wasm gap. Self-compile
-  covered goes 18,830 → 18,840. No emitted byte moves.
+  covered goes 18,831 → 18,841. No emitted byte moves.
