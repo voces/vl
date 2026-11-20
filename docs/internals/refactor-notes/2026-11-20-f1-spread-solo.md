@@ -22,10 +22,17 @@ lowers a literal of one item group, a spread source, through the IR.
   needs no conversion and no sub row, building the source raw as `emitSpreadGroup` emits it (a
   list literal at its own typed build, else the group's; anything else as itself) and requiring
   its rep to be the literal's. The verifier checks that equality and an `RList` result.
-- The group count is read off the elements before any plan is asked: the plan's wrapper lookups
-  mint types, and asking it for a literal the IR then leaves to legacy reorders the type section.
-- `RMakeList` carries its list build (`mlKind`, `mlSlot`), so a nested literal built at a
-  spread group's build lowers at that build, not at the one its own node would ask for.
+- The plan mints nothing. Its wrapper and backing (`spreadWrapIdx`, `spreadBackIdx`, which mint
+  a pair on first ask) are asked by legacy's arm and by the lowering, each where legacy always
+  has: after the plan, before the group. The builder asks the read-only `spreadPairKnown` and
+  misses on `array spread pair unminted`. That miss reads 0 for a structural reason, and stays as
+  the guard: a claimed literal's source has the literal's own list rep, so building the source's
+  type has already minted the pair.
+- The group count is read off the elements before any plan is asked, so a literal the IR leaves
+  to legacy costs no plan call at all.
+- `RMakeList` carries its list build (`mlKind`, `mlSlot`), and `arrayLit` takes the type behind
+  that build: `arrLitBuiltTyOf` at top level, a nested source's own typed build's type, else the
+  outer literal's type for a source built at the group's build, its kind and row.
 - `svSyncRecv` reads only the source node, the function, and module tables set before any
   function is emitted (`rvSrcSlot`, `svPairs`, the sync helpers), so the IR's source build leaves
   it nothing different to read.
