@@ -193,6 +193,7 @@ import {
   stmtWritesNothing,
   strAccRowsAre,
   strCatPartsOf,
+  strFromBytesCallNamed,
   strLitTakesAtom,
   structFieldArmOf,
   tagArmLambdaCallee,
@@ -225,7 +226,11 @@ import {
   tagIsArmOf,
   widenPlanOf,
 } from "./emit_plan_union"
-import { arrLitRefShortSlot, arrLitUnionBoxSlot } from "./emit_plan_list"
+import {
+  arrLitBuiltTyOf,
+  arrLitRefShortSlot,
+  arrLitUnionBoxSlot,
+} from "./emit_plan_list"
 import { mvValVariantOf } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
@@ -988,7 +993,11 @@ function heldTy(ty: i32): i32 {
 
 // A fresh temp of `ix`'s type, defined by `rhs`.
 export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
-  const ty = heldTy(exprTyOf(ix))
+  return irBLetTempTy(b, rhs, ix, rep, heldTy(exprTyOf(ix)))
+}
+
+// `irBLetTemp` at type `ty`, where the value is built at another type than its node's.
+function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty: i32): Opnd {
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
@@ -1627,6 +1636,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if cf is Member { return methodRhs(b, c, cf, ix) }
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
+  if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
+    return strFromBytesRhs(b, c, ix)
+  }
   if d < 0 && numIntrCallReached(c, cf, ibFnIx) && tplStrHoleOf(c, ibFnIx) < 0 {
     if cf.identName == "fromCodePoint" || cf.identName == "fromCodePoints" {
       return fromCpRhs(b, c, cf, ix)
@@ -1957,6 +1969,31 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const op: StrOp = if many { "fromcps" } else { "fromcp" }
   const r: Rhs = { soOp: op, soArgs: [a], soAt: ix }
+  return r
+}
+
+// `__str_from_bytes__(src, at, count)` as legacy's arm writes it: the three operands as they stand
+// (a byte list, then two i32s), then the helper call (`strFromBytesTail`).
+function strFromBytesRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callArgs.length != 3 { return missRhs("byte string arguments") }
+  const at = b.length
+  const args: Opnd[] = []
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("byte string operand") }
+  if ifBelowLead(b, at, "byte string short-circuit operand") {
+    return missRhs("byte string short-circuit operand")
+  }
+  const sl = repNodeAt(irBOpRep(args[0]))
+  if !(sl is RList) || repPrim(sl.rlsElem) != "u8" {
+    return missRhs("byte string source rep")
+  }
+  if (
+    repPrim(irBOpRep(args[1])) != "i32"
+    || repPrim(irBOpRep(args[2])) != "i32"
+  ) {
+    return missRhs("byte string operand coercion")
+  }
+  const r: Rhs = { soOp: "frombytes", soArgs: args, soAt: ix }
   return r
 }
 
@@ -2811,7 +2848,12 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   }
   const sw = if arm == "ref" { "" } else { arrLitShortWhy(ix, ibFnIx, arm, n.arrElems.length) }
   if sw != "" { return irBMiss("array " + sw) }
-  const ln = repNodeAt(rep)
+  // Typed at the type legacy's build decision takes (`arrLitBuiltTyOf`): an instance's `[1.5]` at
+  // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp.
+  const bt = arrLitBuiltTyOf(ix, ibFnIx)
+  const atBt = bt >= 0 && repNodeAt(repNodeOfTy(bt)) is RList
+  const lrep = if atBt { repNodeOfTy(bt) } else { rep }
+  const ln = repNodeAt(lrep)
   if !(ln is RList) { return irBMiss("array rep") }
   // A union-box slot's elements are boxes: a list the instance reps at its bound member is not one.
   if (
@@ -2831,7 +2873,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     elems.push(v)
   }
   const r: Rhs = { mlElems: elems, mlAt: ix }
-  return irBLetTemp(b, r, ix, rep)
+  if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
+  return irBLetTemp(b, r, ix, lrep)
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.

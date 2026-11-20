@@ -124,6 +124,7 @@ import {
   RRecover,
   RRel,
   RRetag,
+  RSharedRead,
   RStage,
   RStrOp,
   RTagIs,
@@ -337,6 +338,12 @@ import {
   printUnionTail,
   promoSlotIn,
   sFieldStorageSlot,
+  sharedArmPlainTail,
+  sharedArmTestTail,
+  sharedReadPlainOf,
+  sharedReadPlanOf,
+  sharedReadStashes,
+  sharedRecvSlotGet,
   stageListRecvTail,
   staticAtomId,
   structFieldTail,
@@ -750,6 +757,7 @@ function rhs(r: Rhs, tail: boolean) {
       boxTagIsTail(r.teTag)
     }
     RBoxField => boxField(r)
+    RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RRecover => recoverRead(r)
     RGetField => getField(r)
@@ -1039,6 +1047,57 @@ function boxField(r: RBoxField) {
   narrowedFieldTail(memNarrowVariantIndex(r.bfAt, fnIx), idx, r.bfAt, fnIx)
   if readOwesNonNullRecover(r.bfAt, fnIx) { fbRefAsNonNull() }
   return 0
+}
+
+// `RSharedRead`: legacy's shared-field dispatch over the box local, each arm but the last its tag
+// test then its plain read, each read in its own frame, and the read's own recover, as `emitMem`
+// writes it through `emitMemSharedRead`.
+function sharedRead(r: RSharedRead) {
+  const fnIx = lw.irAt
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedReadPlanOf(r.srAt, fnIx, vis, fis)
+  if code < 0 || !sharedReadPlainOf(r.srAt, fnIx) {
+    return irLMiss("shared read plan")
+  }
+  if sharedReadStashes(r.srAt) != r.srStash {
+    return irLMiss("shared read stash")
+  }
+  // The stash is asked for where legacy asks, before the receiver; between its set and the last
+  // get, the plain arms and tail evaluate nothing that could stash again.
+  const slot = if r.srStash { sharedFieldRecvSlot() } else { -1 }
+  if r.srStash && slot < 0 { return irLMiss("shared read stash slot") }
+  if r.srStash {
+    irLOpnd(r.srV)
+    fbLocalSet(slot)
+  }
+  const last = vis.length - 1
+  let i = 0
+  while i < last {
+    sharedReadRecv(r, slot)
+    sharedArmTestTail(code, vis, fis, i)
+    lwFrames.push(-1)
+    sharedReadRecv(r, slot)
+    if sharedArmPlainTail(code, vis[i], fis[i]) < 0 { return -1 }
+    fbElse()
+    i = i + 1
+  }
+  sharedReadRecv(r, slot)
+  if sharedArmPlainTail(code, vis[last], fis[last]) < 0 { return -1 }
+  let e = 0
+  while e < last {
+    fbEnd()
+    lwFrames.pop()
+    e = e + 1
+  }
+  if readOwesNonNullRecover(r.srAt, fnIx) { fbRefAsNonNull() }
+  return 0
+}
+
+// One receiver push of shared read `r`: its stash slot's box, else the box local again.
+function sharedReadRecv(r: RSharedRead, slot: i32) {
+  if r.srStash { return sharedRecvSlotGet(slot) }
+  return irLOpnd(r.srV)
 }
 
 // `SSetField`: the record, the value, then legacy's struct-store tail (`fieldStoreTail`).
