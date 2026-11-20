@@ -9,6 +9,8 @@ builds it as an `SIf` with an empty `else` and no `else` keyword, and the existi
 This also takes IR-REV's #9274 nit: the lowering of `RRetNull` misses loudly
 (`returned null with no plan`) where `nullRetPlanOf` has no plan, beside the builder's own check.
 
-Measured at the merge-base in the PR.
+Measured on fixpoint seeds at merge-base `261d97f44` (functions with no blocker): self-compile
+18,732 → 18,738 of 19,319; corpus 41,549 flat. `else-less tail if` 7 → 0: six build, and one
+stops at its next blocker, `tail arm`.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
