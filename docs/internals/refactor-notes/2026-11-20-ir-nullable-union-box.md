@@ -11,6 +11,7 @@ discipline-4 receiver for `RBoxField` and the null box `RNullOf` at `NULL_OWN_BO
 did for `RBoxNarrow`. No lowering changed: the same box is read and written.
 
 Measured on fixpoint seeds against master `7a7482ce` (functions with no blocker, blocker census):
-MEASURE.
+self-compile 17,181 → 17,505 of 19,160, corpus 38,985 → 38,985 of 45,678. L2 fuel 101,399,566,107
+→ 101,883,583,490 (+0.48%): the IR now builds and lowers the 324 functions it claims.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
