@@ -15,6 +15,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  PStaged,
   RAtomEq,
   RAtomStr,
   RBoxField,
@@ -38,6 +39,7 @@ import {
   RListPop,
   RListPush,
   RListSlice,
+  RListStage,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -91,6 +93,7 @@ import {
   irBodyLeaves,
   irFnNew,
   irGlobalRepOf,
+  irPushBodies,
   irSigOf,
 } from "./ir"
 import {
@@ -338,6 +341,32 @@ function kidAt(r: i32, i: i32): i32 {
 }
 
 // Rule 2: `r`'s operands and its result rep against destination rep `dst` (-1 for an effect).
+// The receiver push `r` at node `at` appends to: its own operand, or the one its stage reads.
+// The stage is the receiver's one reader, so a staged push uses nothing of it.
+function pushRecvOpnd(r: RListPush, at: i32): Opnd {
+  const v = r.lpV
+  if v is PStaged {
+    const sg = stageAt(v.pstNode)
+    if sg == null || sg.rsgAt != r.lpAt {
+      fail(10, at, "a staged push names no stage of its own call")
+      const none: Opnd = { ov: -1 }
+      return none
+    }
+    return sg.rsgV
+  }
+  return v
+}
+
+// The receiver stage node `id` is, or null.
+function stageAt(id: i32): RListStage | null {
+  if id < 0 || id >= vf.irNodes.length { return null }
+  const n = vf.irNodes[id]
+  if !(n is SEffect) { return null }
+  const r = n.efRhs
+  if r is RListStage { return r }
+  return null
+}
+
 function rhsCheck(r: Rhs, dst: i32, at: i32) {
   match r {
     RPrimOp => {
@@ -646,10 +675,19 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RListStage => {
+      if dst >= 0 { return fail(2, at, "a receiver stage is a statement") }
+      if !(repNodeAt(opRep(r.rsgV)) is RList) {
+        return fail(2, at, "a receiver stage of a non-list")
+      }
+      0
+    }
     RListPush => {
-      use(r.lpV, at)
+      const rv = pushRecvOpnd(r, at)
+      if vfRule != 0 { return 0 }
+      use(rv, at)
       use(r.lpX, at)
-      const ln = repNodeAt(opRep(r.lpV))
+      const ln = repNodeAt(opRep(rv))
       if !(ln is RList) {
         return fail(2, at, "a push of a non-element onto a non-list")
       }
@@ -1437,8 +1475,63 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
   }
+}
+
+// The push a statement or temp `id` of `f` is, or null.
+function pushAt(f: IrFn, id: i32): RListPush | null {
+  if id < 0 || id >= f.irNodes.length { return null }
+  const n = f.irNodes[id]
+  const r = if n is SEffect { n.efRhs } else if n is SLet { n.lRhs } else { null }
+  if r is RListPush { return r }
+  return null
+}
+
+// The stage rule over `f`: "" when each receiver stage is named by exactly one push of its call,
+// later in the stage's own body, else what broke.
+function stagePairsWhy(f: IrFn): string {
+  const bodies: i32[][] = [f.irBody]
+  const pos: i32[] = [0]
+  const open: i32[][] = [[]]
+  while bodies.length > 0 {
+    const top = bodies.length - 1
+    const body = bodies[top]
+    const i = pos[top]
+    if i >= body.length {
+      if open[top].length > 0 {
+        return "node "
+          + i32ToStr(open[top][0])
+          + ": a receiver stage no push names"
+      }
+      bodies.pop()
+      pos.pop()
+      open.pop()
+      continue
+    }
+    pos[top] = i + 1
+    const id = body[i]
+    if stageAt(id) != null { open[top].push(id) }
+    const p = pushAt(f, id)
+    if p != null {
+      const v = p.lpV
+      if v is PStaged {
+        const rest: i32[] = []
+        for o in open[top] {
+          if o != v.pstNode { rest.push(o) }
+        }
+        if rest.length == open[top].length {
+          return "node "
+            + i32ToStr(id)
+            + ": a staged push whose stage is not open before it in its body"
+        }
+        open[top] = rest
+      }
+    }
+    irPushBodies(f, id, bodies, pos)
+    while open.length < bodies.length { open.push([]) }
+  }
+  return ""
 }
 
 // The bounds rule, installed with the list builder; it answers "" or what broke, naming the node.
@@ -1514,6 +1607,10 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 {
     const b = irBoundsRuleHook(f)
     if b != "" { fail(8, -1, b) }
+  }
+  if vfRule == 0 {
+    const sp = stagePairsWhy(f)
+    if sp != "" { fail(10, -1, sp) }
   }
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
