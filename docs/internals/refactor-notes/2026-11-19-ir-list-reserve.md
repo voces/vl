@@ -14,7 +14,8 @@ IR refused the declaration outright.
 - **The open, shared.** `listReserveOpen(s, stmts, pos, idx, slot, fnIx)` is `emitListReserve` after
   its sibling check: it sizes the backing for the pushes `listReserveScan` counts and opens the build
   region. Legacy calls it with its published siblings; the IR's `reserve.open` raw effect calls it
-  with the declaration's block, found by walking the body, and the slot `declSlotBase` gives.
+  with the declaration's block, found by walking the body, and the frame's own slot for the `let`,
+  `declaredSlotOfDecl`, whose index must be the one `varSlot` holds.
 - **The close, shared.** `listBuildClose` (exported) writes the region's length back. The IR places a
   `reserve.close` raw effect after the region's last statement, inside that statement's span, as
   legacy's `emitStmtIn` writes it inside the span `bankBodyStmtSpan` records.
