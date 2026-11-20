@@ -125,6 +125,7 @@ import {
   dispatchDeclinesTail,
   exprPrePathWhy,
   fieldStoreArmOf,
+  fieldStoreNarrowedAt,
   fieldStoreStructAt,
   fieldStoreValuePlain,
   fieldStoreVariantAt,
@@ -190,6 +191,7 @@ import {
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
+  valueIfLitTrue,
   variantFieldArmOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
@@ -991,8 +993,6 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   while true {
     const pw = ifExprPlainWhy(cix, ibFnIx)
     if pw != "" { return irBMiss("expression if " + pw) }
-    // Its value stays on the stack from here, so no temp an operand before it built may wait.
-    if endsInTemp(cb) { return irBMiss("if after an operand") }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
     // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
@@ -1012,10 +1012,20 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     outs.push(t)
     thens.push(thenB)
     elses.push(n.ifElse)
-    const tv = ifArmValueExpr(n.ifElse)
+    // The next link: a direct `else if`, or an `else` block whose one statement is an `if`. A
+    // literal `true` decides a block `else` dead, so the chain ends there.
+    const direct = n.ifElse >= 0
+      && n.ifElse < P.nodes.length
+      && nodeAt(n.ifElse) is IfStmt
+    if !direct && valueIfLitTrue(n.ifCond) { break }
+    const tv = if direct { n.ifElse } else { ifArmValueExpr(n.ifElse) }
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
+    // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
+    if !direct && armHasPrelude(n.ifElse) {
+      return irBMiss("expression if else prelude")
+    }
     // `irBExpr`'s own prelude for the link it would reach.
     const pre = exprPrePathWhy(tv, ibFnIx)
     if pre != "" { return irBMiss(pre) }
@@ -1030,7 +1040,13 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     crep = r
   }
   let k = bs.length - 1
-  let elseB = ifArm(elses[k], outs[k], reps[k])
+  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
+  let elseB: i32[] = []
+  if valueIfLitTrue(n.ifCond) {
+    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, elses[k])
+  } else {
+    elseB = ifArm(elses[k], outs[k], reps[k])
+  }
   if ibMiss != "" { return irBMiss("if arm") }
   while k >= 0 {
     irBNode(
@@ -1083,7 +1099,6 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
     return irBMiss("ref if drops null atom")
   }
-  if endsInTemp(b) { return irBMiss("if after an operand") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
   if c is OImm && condIsTest(n.ifCond) {
@@ -1095,7 +1110,13 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   const nul = ifLinkYieldsNull(ix, ibFnIx)
   const thenB = refIfArm(n.ifThen, t, rep, kind, rj.rjSlot, nul)
   if ibMiss != "" { return irBMiss("ref if arm") }
-  const elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
+  let elseB: i32[] = []
+  if valueIfLitTrue(n.ifCond) {
+    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, n.ifElse)
+  } else {
+    elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+  }
   if ibMiss != "" { return irBMiss("ref if arm") }
   irBNode(
     b,
@@ -1123,6 +1144,8 @@ function refIfArm(
     irBMiss("ref if arm " + arm)
     return body
   }
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
   const v = irBExpr(body, ifArmValueExpr(blockIx))
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
@@ -1211,6 +1234,8 @@ function endsInTemp(b: i32[]): boolean {
 // The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`.
 function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
   const body: i32[] = []
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
   const tv = ifArmValueExpr(blockIx)
   const v = deliver(body, tv, rep)
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
@@ -1218,6 +1243,26 @@ function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
   }
   return body
+}
+
+// A value `if` arm's prelude, every statement before its value, as legacy's `emitIfArmOpen` lowers
+// them (`emitStmtIn`, which banks no row of its own).
+function armPrelude(body: i32[], blockIx: i32) {
+  const blk = nodeAt(blockIx)
+  if !(blk is Block) { return 0 }
+  const stmts = blk.blkStmts
+  let i = 0
+  while i + 1 < stmts.length && ibMiss == "" {
+    stmtNode(body, stmts[i], stmts, i)
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether value-`if` arm `blockIx` is a block with statements before its value.
+function armHasPrelude(blockIx: i32): boolean {
+  const blk = nodeAt(blockIx)
+  return blk is Block && blk.blkStmts.length > 1
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
@@ -1513,14 +1558,16 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
     if callee.fnParams.length != c.callArgs.length {
       return missRhs("argument count")
     }
+    const starts: i32[] = []
     let i = 0
     while i < c.callArgs.length {
       const at = b.length
+      starts.push(at)
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr)
       if ibMiss != "" { return missRhs("argument") }
-      if i > 0 && ifBelowLead(b, at, "short-circuit argument after another") {
+      if i > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
       if irBOpRep(a) != pr { return missRhs("argument coercion") }
@@ -1649,6 +1696,108 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
+// Whether every operand in `os` is a temp, which the lowering writes below a later valued `if`
+// in its order (`stageLead`); a variable or an immediate is written at its reader instead.
+function opndsAreTemps(os: Opnd[]): boolean {
+  for o in os {
+    if !(o is OVar) || o.ov < 0 || o.ov >= ib.irVars.length { return false }
+    if ib.irVars[o.ov].vKind != "temp" { return false }
+  }
+  return true
+}
+
+// For an argument built into `b` from `at` on that holds a valued `if`: makes each earlier
+// argument in `args` that is a variable or immediate a staged temp at its own start (`starts`),
+// so the lowering writes them all below the `if` in order. False when one cannot be.
+function stageLeadArgs(
+  b: i32[],
+  at: i32,
+  starts: i32[],
+  args: Opnd[],
+  argIxs: i32[],
+): boolean {
+  // A boxed `??` writes its operand in place, below which the lowering stages nothing.
+  if coalBoxFrom(b, at) { return false }
+  if !valuedIfFrom(b, at) || opndsAreTemps(args) { return true }
+  let j = 0
+  while j < args.length {
+    const a = args[j]
+    if a is OStr { return false }
+    // A valued `if`'s out is already on the stack, in its order.
+    if a is OVar && (a.ov < 0 || a.ov >= ib.irVars.length) { return false }
+    const held = a is OVar
+      && (ib.irVars[a.ov].vKind == "temp" || valuedIfOut(b, a.ov))
+    if !held {
+      const one: i32[] = []
+      const t = irBLetTemp(one, { sgV: a }, argIxs[j], irBOpRep(a))
+      if ibMiss != "" || one.length != 1 { return false }
+      insertAt(b, starts[j], one[0])
+      let k = j + 1
+      while k < starts.length {
+        starts[k] = starts[k] + 1
+        k = k + 1
+      }
+      args[j] = t
+    }
+    j = j + 1
+  }
+  return true
+}
+
+// Inserts node `id` into body `b` at position `at`.
+function insertAt(b: i32[], at: i32, id: i32) {
+  b.push(id)
+  let i = b.length - 1
+  while i > at {
+    b[i] = b[i - 1]
+    i = i - 1
+  }
+  b[at] = id
+  return 0
+}
+
+// Whether operands built into `b` from `at` on hold a boxed `??`.
+function coalBoxFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    if ib.irNodes[b[i]] is SCoalBox { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether variable `v` is the out of a valued `if` in body `b`.
+function valuedIfOut(b: i32[], v: i32): boolean {
+  for id in b {
+    const n = ib.irNodes[id]
+    if n is SIf && n.siOut == v { return true }
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on hold a valued `if`.
+function valuedIfFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SIf && n.siOut >= 0 { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// `ifBelowLead` for a node whose operands `leads`, written before those from `at`, are all
+// temps the lowering stages below the `if` (`opndsAreTemps`): then no miss.
+export function ifBelowLeadOf(
+  b: i32[],
+  at: i32,
+  why: string,
+  leads: Opnd[],
+): boolean {
+  if opndsAreTemps(leads) && !coalBoxFrom(b, at) { return false }
+  return ifBelowLead(b, at, why)
+}
+
 // Whether operands built into `b` from `at` on hold a valued `if` (a boxed `??` is one) below a
 // part their node writes first (a receiver or an earlier operand, read at its use), naming `why`
 // as the miss. Legacy writes such an `if` in place, which the IR's statement-level `if` cannot
@@ -1707,14 +1856,13 @@ function numIntrRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const want = numKindPrim(pl.niKind)
   const args: Opnd[] = []
+  const starts: i32[] = []
   for a in c.callArgs {
     const at = b.length
+    starts.push(at)
     const v = irBExpr(b, a)
     if ibMiss != "" { return missRhs("argument") }
-    if (
-      args.length > 0
-      && ifBelowLead(b, at, "short-circuit argument after another")
-    ) {
+    if args.length > 0 && !stageLeadArgs(b, at, starts, args, c.callArgs) {
       return missRhs("short-circuit argument after another")
     }
     const p = repPrim(irBOpRep(v))
@@ -2360,7 +2508,7 @@ function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLead(b, at, "short-circuit right operand") { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
   if (
     !(repNodeAt(irBOpRep(l)) is RList)
     || !(repNodeAt(irBOpRep(r)) is RList)
@@ -2377,7 +2525,7 @@ function unionEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const at = b.length
   const r = irBExpr(b, n.binRight)
   if ibMiss != "" { return r }
-  if ifBelowLead(b, at, "short-circuit right operand") { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
   // A boxed nullable is held as the box the staged compare reads.
   if !heldAsBox(irBOpRep(l)) || !heldAsBox(irBOpRep(r)) {
     return irBMiss("union compare operand rep")
@@ -3065,7 +3213,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     const at = b.length
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst)
     if ibMiss != "" { return l }
-    if ifBelowLead(b, at, "short-circuit right operand") { return l }
+    if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return l }
     if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
     return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
   }
@@ -3164,7 +3312,10 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
     const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
-    if args.length > 0 && ifBelowLead(b, from, "string operand after another") {
+    if (
+      args.length > 0
+      && ifBelowLeadOf(b, from, "string operand after another", args)
+    ) {
       return 0
     }
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
@@ -3271,14 +3422,23 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
 }
 
 // A struct field store `o.f = v` that legacy writes as the record, the bare value and its
-// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValuePlain`).
+// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValuePlain`); a variant's, the record
+// a variant receiver is or a box narrowed to one yields (`variantParam`, `narrowVariant`).
 function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const arm = fieldStoreArmOf(n.binLeft, ibFnIx)
-  if arm != "struct" && arm != "variantParam" {
+  if arm != "struct" && arm != "variantParam" && arm != "narrowVariant" {
     return skip("field store " + arm)
   }
-  const sf = if arm == "struct" { fieldStoreStructAt(n.binLeft, ibFnIx) } else { fieldStoreVariantAt(n.binLeft, ibFnIx) }
+  const sf = if arm == "struct" { fieldStoreStructAt(n.binLeft, ibFnIx) } else if arm == "variantParam" { fieldStoreVariantAt(n.binLeft, ibFnIx) } else { fieldStoreNarrowedAt(n.binLeft, ibFnIx) }
   if sf.length != 2 { return skip("field store shape") }
+  // The receiver's narrowed read casts to the variant its own read picks; the store's `struct.set`
+  // writes `sf[0]`'s heap, so the two must name one variant.
+  if (
+    arm == "narrowVariant"
+    && narrowedBoxVariantPlain(t.memObj, ibFnIx) != sf[0]
+  ) {
+    return skip("field store narrowed variant")
+  }
   const plain = if arm == "struct" { fieldStoreValuePlain(sf[0], sf[1], n.binRight, ibFnIx) } else { fieldStoreVariantValuePlain(sf[0], sf[1], n.binRight, ibFnIx) }
   if !plain { return skip("field store value") }
   const rt = nodeTyAt(t.memObj, ibFnIx)
