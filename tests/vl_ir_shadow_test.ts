@@ -2420,3 +2420,45 @@ if u is A {
     }
   },
 });
+
+// A literal-union atom stored into a string field decodes to its member string as legacy's
+// `emitAtomToStr` writes it (`RAtomStr`), into a struct, a variant parameter and a narrowed variant.
+Deno.test({
+  name: "ir shadow: a field store's atom decoded to its string matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type K = "a" | "b"
+type R = { s: string, t: string | null, n: i32 }
+type A = { tag: i32, s: string, t: string | null }
+type B = { m: i32 }
+type U = A | B
+function setS(r: R, k: K) { r.s = k }
+function setT(r: R, k: K) { r.t = k }
+function setLit(r: R) { r.s = "b" }
+function setAs(a: A, k: K) { a.s = k }
+function setAt(a: A, k: K) { a.t = k }
+function setNarrow(u: U, k: K) {
+  if u is A { u.s = k }
+}
+const r: R = { s: "", t: null, n: 0 }
+setS(r, "a")
+setT(r, "b")
+print(r.s + (r.t ?? "-"))
+setLit(r)
+print(r.s)
+const a: A = { tag: 1, s: "", t: null }
+setAs(a, "b")
+setAt(a, "a")
+print(a.s + (a.t ?? "-"))
+const u: U = { tag: 2, s: "", t: null }
+setNarrow(u, "a")
+if u is A { print(u.s) }
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
