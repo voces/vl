@@ -2360,3 +2360,74 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// A walk over a byte list binds each byte read unsigned as an i32; one over a list of string or
+// byte lists binds each inner list; a union list's walk variable read as its box is the box. Each
+// is the plain walk legacy writes, covered and matched.
+Deno.test({
+  name: "ir shadow: byte, list-of-list and boxed-element walks are covered and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function sum(bs: u8[]): i32 {
+  let s = 0
+  for b in bs { s = s + b }
+  return s
+}
+function hex(bs: u8[]): string {
+  let out = ""
+  for b in bs {
+    out = out + "x"
+    if b > 100 { out = out + "!" }
+  }
+  return out
+}
+function flat(rows: u8[][]): i32 {
+  let n = 0
+  for r in rows { n = n + r.length }
+  return n
+}
+function has(xs: string[][], k: string): boolean {
+  for row in xs {
+    for x in row { if x == k { return true } }
+  }
+  return false
+}
+function count(xs: string[][]): i32 {
+  let n = 0
+  for row in xs { n = n + row.length }
+  return n
+}
+type A = { a: i32 }
+type B = { b: i32 }
+type U = A | B
+function allA(us: U[]): boolean {
+  for u in us {
+    if !(u is A) { return false }
+  }
+  return true
+}
+function sumA(us: U[]): i32 {
+  let s = 0
+  for u in us {
+    if u is A { s = s + u.a }
+  }
+  return s
+}
+const bs: u8[] = [1, 2, 250]
+print(sum(bs))
+print(hex(bs))
+print(flat([bs, bs]))
+print(has([["a"], ["b", "c"]], "c"))
+print(count([["a"], ["b", "c"]]))
+const us: U[] = [{ a: 1 }, { b: 2 }, { a: 3 }]
+print(allA(us))
+print(sumA(us))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 7 || (rows.get("matched") ?? 0) !== 7) {
+      throw new Error(`want all seven covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
