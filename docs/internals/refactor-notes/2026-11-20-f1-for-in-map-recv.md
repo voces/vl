@@ -32,23 +32,19 @@ covered and matched (seven were `for in map receiver` misses before), output 7 5
 
 ## Readings
 
-Against a fixpoint at the merge-base c2f0a972f (candidate a fixpoint):
+This step's own delta, against a fixpoint at the merge-base ebf4b1c17 (which holds #9280, the
+step it was stacked on; candidate a fixpoint at 05980b2cc):
 
-- Self-compile functions covered 18,622 → 18,665 (+43, every `for in map receiver` function and
-  its pairings); `for in map receiver` 19 → 0.
-- Corpus functions with no blocker 41,450 → 41,500 (+50); `for in map receiver` 4 → 0. The
-  first grade read 41,502: it counted the two `d16565_values_pinned_*` functions, which the
-  verifier then refused (a map walk into an `i32[]` value); with the `for in map element` miss
-  they stay legacy's.
-- Corpus `ir-identity --names` 9,037 identical, 0 differ, self-compile identical; `--cases` 7,530
-  identical, 0 differ; witnesses 59 same; mode-3 self-compile identical; the `tests/cases` A/B
-  7,250 same, 0 differ.
-- L2 self-compile fuel 103,511,758,090 → 103,522,294,912 (+0.010%); late demands 9 of 9, late tag
-  rows 307 of 307.
+- Self-compile functions covered 18,785 → 18,803 (+18); `for in map receiver` 0.
+- Corpus functions with no blocker 41,682 → 41,684 (+2); `for in map receiver` 4 → 0, two of them
+  now the named `for in map element`. Shadow 41,684 covered, verified and matched.
+- `--cases` 7,531 identical, 0 differ; witnesses 59 same.
 
-After merging master (merge-base 261d97f44; the one compiler conflict an import list, so
-mechanical): fixpoint 6,914,023 bytes at 95ba059bb, `--cases` 7,531 identical, 0 differ;
-`gate.sh --fast` passes every row but `ir claims`, which this container's host cannot read.
+The full grade ran against c2f0a972f, before #9280 merged, so its coverage figures (self +43,
+corpus +50) held both steps; its identity readings stand: corpus `ir-identity --names` 9,037
+identical, 0 differ, self-compile identical; mode-3 self-compile identical; the `tests/cases` A/B
+7,250 same, 0 differ; L2 self-compile fuel 103,511,758,090 → 103,522,294,912 (+0.010%); late
+demands 9 of 9, late tag rows 307 of 307.
 
 ## Next rows of the family
 
