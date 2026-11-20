@@ -36,7 +36,7 @@ export type Opnd = OVar | OImm | OStr
 export type PrimOp = "add" | "sub" | "mul" | "div" | "divu" | "rem" | "remu" | "and" | "or"
   | "xor" | "shl" | "shr" | "shru" | "eq" | "ne" | "lt" | "ltu" | "le" | "leu" | "gt" | "gtu"
   | "ge" | "geu" | "neg" | "not"
-export type MapOp = "get" | "has" | "set" | "delete" | "keys"
+export type MapOp = "get" | "has" | "set" | "delete" | "keys" | "size"
 // `site` joins an append site's chain into its buffer, `soAt` the assignment; `acc` appends
 // the parts after a proven accumulator to it, as a statement.
 // `fromcp` builds a string from one i32 code point, `fromcps` from a local i32 list it reads twice.
@@ -157,7 +157,9 @@ export type RListClear = { lkV: Opnd, lkAt: i32 }
 export type RMapFilter = { hfV: Opnd, hfC: Opnd, hfAt: i32 }
 // A list `.slice` of list `scV` at call `scAt` over its bounds `scArgs` (start, then an optional end).
 export type RListSlice = { scV: Opnd, scArgs: Opnd[], scAt: i32 }
-export type RMapOp = { mpOp: MapOp, mpArgs: Opnd[] }
+// A map operation `mpOp` at node `mpAt` over `mpArgs`, its receiver first: `size` is `m.length`,
+// legacy's live entry count (`mapLengthPlain`).
+export type RMapOp = { mpOp: MapOp, mpArgs: Opnd[], mpAt: i32 }
 // The empty map a builtin `Map()` or `Set()` call at node `mnAt` builds, by legacy's writer.
 export type RMapNew = { mnAt: i32 }
 // A set of `msVal` at key `msKey` into map global `msSym` (receiver node `msRecv`, recovered for
@@ -227,10 +229,13 @@ export type RawOp = "struct.get" | "struct.new" | "array.get" | "array.new_defau
 export type RRawOp = { rwOp: RawOp, rwHeap: i32, rwArgs: Opnd[], rwImm: i32 }
 // A helper's i32 constant `rlVal` that the relocation table names in space `rlSp` from `rlSub`.
 export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
+// An operand's own value as a temp: a variable or immediate argument before one whose valued
+// `if` the lowering writes it below, as legacy writes it first (`stageLead`).
+export type RStage = { sgV: Opnd }
 export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf
   | RMakeRec | RGetField | RMakeList | RListNew | RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
   | RMapGetOr | RMapHas | RPrint | RStrOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RTagStash | RTagIs
-  | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel
+  | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage
 
 // A `match` arm: union arm `swArm` (-1 for the default, which names what it excludes in
 // `swWhy`), and its body.
@@ -574,6 +579,72 @@ function opndsText(os: Opnd[]): string {
   return s
 }
 
+// `a` then `b`, as one list.
+function opndsCat(a: Opnd[], b: Opnd[]): Opnd[] {
+  const out: Opnd[] = []
+  for o in a { out.push(o) }
+  for o in b { out.push(o) }
+  return out
+}
+
+// The operands right-hand side `r` reads, in no promised order: what a temp's definition
+// consumes, for a pass that needs which temps another temp's value is built from.
+export function irRhsOpnds(r: Rhs): Opnd[] {
+  return match r {
+    RPrimOp => r.poArgs
+    RCall => opndsCat(r.caCaps, r.caArgs)
+    RCallRef => opndsCat([r.crFn], r.crArgs)
+    RCallHost => r.chArgs
+    RTest => [r.teV]
+    RBoxField => [r.bfV]
+    RBoxNarrow => [r.bnV]
+    RRecover => [r.rcV]
+    RCast => [r.ctV]
+    RTagOf => [r.tgV]
+    RMakeRec => r.mrFields
+    RGetField => [r.gfV]
+    RMakeList => r.mlElems
+    RListNew => [r.lnLen, r.lnFill]
+    RListGet => [r.lgV, r.lgIx]
+    RListLen => [r.llV]
+    RListPush => [r.lpV, r.lpX]
+    RListPop => [r.lqV]
+    RListClear => [r.lkV]
+    RMapFilter => [r.hfV, r.hfC]
+    RListSlice => opndsCat([r.scV], r.scArgs)
+    RMapOp => r.mpArgs
+    RMapNew => []
+    RMapSet => [r.msLoc, r.msKey, r.msVal]
+    RMapGetOr => [r.mgLoc, r.mgKey, r.mgDef]
+    RMapHas => [r.mhLoc, r.mhKey]
+    RPrint => [r.pnV]
+    RStrOp => r.soArgs
+    RNumWiden => [r.nwV]
+    RNumCast => [r.ncV]
+    RNumIntr => r.nxArgs
+    RCoalStr => [r.czL, r.czD]
+    RCoalAtomStr => [r.zaL, r.zaD]
+    RToBox => [r.bxV]
+    RRetag => [r.rgV]
+    RAtomStr => [r.sxV]
+    RNullOf => []
+    RNulTest => [r.ntV]
+    RAtomEq => [r.aeL, r.aeR]
+    RTagStash => [r.tgsV]
+    RTagIs => []
+    RUnionEq => [r.ueL, r.ueR]
+    RListEq => [r.qeL, r.qeR]
+    RMakeClo => r.mcEnv
+    RFnId => []
+    RCellNew => [r.cnInit]
+    RCellGet => [r.cgCell]
+    RGlobalGet => []
+    RRawOp => r.rwArgs
+    RRel => []
+    RStage => [r.sgV]
+  }
+}
+
 function rhsText(r: Rhs): string {
   return match r {
     RPrimOp => r.poOp + "(" + opndsText(r.poArgs) + ")"
@@ -634,6 +705,7 @@ function rhsText(r: Rhs): string {
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RCellNew => "cell " + opndText(r.cnInit)
     RCellGet => "cell_get " + opndText(r.cgCell)
+    RStage => "stage " + opndText(r.sgV)
     RRel => "rel " + i32ToStr(r.rlSp) + " " + i32ToStr(r.rlSub) + " " + i32ToStr(r.rlVal)
     RRawOp => r.rwOp
       + " h"
@@ -800,12 +872,13 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RCall | RPrint => "call"
     RGlobalGet => "global"
     RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RListEq | RStrOp | RMakeList => "list"
-    RMapGetOr | RMapHas | RMapNew | RMapSet => "map"
+    RMapGetOr | RMapHas | RMapNew | RMapSet | RMapOp => "map"
     RTest | RBoxField | RBoxNarrow => "box"
     RGetField | RMakeRec => "record"
     RMakeClo | RCallRef => "closure"
-    RCallHost | RCast | RTagOf | RListNew | RMapOp | RFnId | RCellNew | RCellGet => "other"
+    RCallHost | RCast | RTagOf | RListNew | RFnId | RCellNew | RCellGet => "other"
     RRawOp | RRel => "raw"
+    RStage => "scalar"
   }
 }
 

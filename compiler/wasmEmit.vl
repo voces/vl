@@ -8695,6 +8695,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     }
     "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
+    "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "lit" => {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
@@ -8707,7 +8708,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "refList" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "ladder" => 0
@@ -8721,7 +8722,12 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "obj" {
     if emitVariantStruct(unwrapParen(exprIx), p.hbKind, fnIx) < 0 { return -1 }
-  } else if p.hbArm == "pass" || p.hbArm == "atomStr" || p.hbArm == "rec" {
+  } else if (
+    p.hbArm == "pass"
+    || p.hbArm == "atomStr"
+    || p.hbArm == "rec"
+    || p.hbArm == "refList"
+  ) {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
   return holeBoxTail(p, exprIx, fnIx)
@@ -21351,14 +21357,24 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
   if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return "no else" }
-  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return "arm not lone" }
-  const c = nodeAt(unwrapParen(n.ifCond))
-  // A decided `is` folds its dead arm off the condition's own bytes (`staticValueIfCond`): the
-  // IR builds an `is` only as a tag compare, never that constant, and misses a constant one.
-  if c is BoolLit { return "constant condition" }
+  // An `else if` is the chain's next link, which `emitIfExprAsLink` writes into this one's frame.
+  const elseLink = nodeAt(n.ifElse) is IfStmt
+  if !ifArmHasValue(n.ifThen) || !elseLink && !ifArmHasValue(n.ifElse) {
+    return "arm not lone"
+  }
+  // A prelude local the collect pass did not allocate is legacy's refusal (`emitIfArmOpen`).
+  if (
+    armPreludeUnwalkedDecl(n.ifThen) >= 0
+    || !elseLink && armPreludeUnwalkedDecl(n.ifElse) >= 0
+  ) {
+    return "arm prelude unwalked"
+  }
   if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
   if intMatchHeadAt(ifIx) { return "int match" }
+  // Classified as `emitIfExpr` classifies it, with the arms' prelude locals bound.
+  const scoped = armPreludeScopeOpen(ifIx)
   const p = ifJoinPlanOf(ifIx, fnIx)
+  if scoped { scopePop() }
   const rung = match p.ijArm {
     "null" => "null join"
     "atom" => "atom join"
@@ -21378,11 +21394,10 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   return ""
 }
 
-// Whether `blockIx` is a block whose one statement is its value.
-function ifArmIsLone(blockIx: i32): boolean {
+// Whether `blockIx` is a block whose last statement is its value, after any prelude.
+function ifArmHasValue(blockIx: i32): boolean {
   if blockIx < 0 || blockIx >= P.nodes.length { return false }
-  const b = nodeAt(blockIx)
-  return b is Block && b.blkStmts.length == 1 && ifArmValueExpr(blockIx) >= 0
+  return nodeAt(blockIx) is Block && ifArmValueExpr(blockIx) >= 0
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -21607,7 +21622,7 @@ function emitIfArmOpen(blockIx: i32, fnIx: i32) {
 
 // The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1: an
 // arm the collect pass walked, or one whose prelude declares nothing, lowers.
-function armPreludeUnwalkedDecl(blockIx: i32): i32 {
+export function armPreludeUnwalkedDecl(blockIx: i32): i32 {
   if blockIx < 0 { return -1 }
   if armPreludeBlocks[blockIx] ?? false { return -1 }
   return firstLocalDeclIn(blockIx)
@@ -33033,9 +33048,14 @@ function staticIsGuard(condIx: i32, condStart: i32): i32 {
 // `staticIsGuard` for a value `if`, which a literal `true` also decides: its else arm is dead, so
 // a rewrite's `if true { <spills> v } else { <placeholder> }` never lowers the placeholder.
 function staticValueIfCond(condIx: i32, condStart: i32): i32 {
-  const c = if condIx >= 0 { nodeAt(unwrapParen(condIx)) } else { null }
-  if c is BoolLit && c.boolVal == 1 { return 1 }
+  if valueIfLitTrue(condIx) { return 1 }
   return staticIsGuard(condIx, condStart)
+}
+
+// Whether a value `if`'s condition is the literal `true`, which decides its block `else` dead.
+export function valueIfLitTrue(condIx: i32): boolean {
+  const c = if condIx >= 0 { nodeAt(unwrapParen(condIx)) } else { null }
+  return c is BoolLit && c.boolVal == 1
 }
 
 // A value arm this instance's `is` test proved dead: `unreachable` meets any blocktype, and
@@ -37534,6 +37554,32 @@ export function objStructNewTail(si: i32): i32 {
   return 0
 }
 
+// After map receiver `recvIx`'s value: its live entry count, field 5 (`size`) of its map struct.
+export function mapSizeTail(recvIx: i32, fnIx: i32): i32 {
+  fbStructGet(mapTypeIdxOf(mapShapeFoldSet(mapShapeOfExpr(recvIx, fnIx))), 5)
+  return 0
+}
+
+// Whether `m.length` at `memIx` reaches `emitMemberNode`'s map arm: a map receiver that no earlier
+// `length` arm takes (a record's own field, a list-fit grow row, an arm site, a list or string).
+export function mapLengthPlain(m: Member, memIx: i32, fnIx: i32): boolean {
+  if m.memProp != "length" || !exprMap(m.memObj, fnIx) { return false }
+  if twoListUseMsg(m.memObj, m.memProp, fnIx) != "" { return false }
+  if lengthIsField(m, memIx, fnIx) || armSiteReads(memIx, fnIx) { return false }
+  if (
+    listFitGrowRow(m.memObj, -1, fnIx) >= 0
+    || memberLenWidensAtom(m.memObj, fnIx)
+  ) {
+    return false
+  }
+  return !(exprArray(m.memObj, fnIx)
+    || exprString(m.memObj, fnIx)
+    || exprRefArray(m.memObj, fnIx)
+    || exprStringArray(m.memObj, fnIx)
+    || numListElemOf(exprListRep(m.memObj, fnIx)) != null
+    || exprU8Array(m.memObj, fnIx))
+}
+
 function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
   const tlm = twoListUseMsg(e.memObj, e.memProp, fnIx)
   if tlm != "" { return emitFailAt(tlm, exprIx) }
@@ -37567,10 +37613,7 @@ function emitMemberNode(e: Member, exprIx: i32, fnIx: i32) {
     // maintained by set/delete (NOT `count`, which includes tombstones).
     if exprMap(e.memObj, fnIx) {
       if emitExpr(e.memObj, fnIx) < 0 { return -1 }
-      let lsl = mapShapeOfExpr(e.memObj, fnIx)
-      lsl = mapShapeFoldSet(lsl)
-      fbStructGet(mapTypeIdxOf(lsl), 5) // 0xfb 0x02: field 5 `size`
-      return 0
+      return mapSizeTail(e.memObj, fnIx)
     }
   }
   return emitMem(exprIx, fnIx)
