@@ -1072,3 +1072,24 @@ Deno.test({
     }
   },
 });
+
+// A value `if` joined at a string or a list builds under legacy's ref blocktype and matches; one
+// that is a later operand of a string `+` sits above the earlier ones, a named miss.
+const REF_IF =
+  `function s(b: boolean, x: string, y: string): string {\n  const r = if b { x } else { y }\n  return r\n}\nfunction t(b: boolean, x: string): string {\n  return x + (if b { x } else { "no" })\n}\nfunction l(b: boolean, xs: i32[], ys: i32[]): i32 {\n  const r = if b { xs } else { ys }\n  return r.length\n}\nprint(s(true, "a", "b"))\nprint(s(false, "a", "b"))\nprint(t(false, "a"))\nprint(l(true, [1, 2], [3]))\n`;
+Deno.test({
+  name: "ir shadow: a value if joined at a string or a list builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want s and l covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (!rows.has("uncovered string operand after another")) {
+      throw new Error(`want t a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
