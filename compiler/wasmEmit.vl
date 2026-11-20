@@ -21662,10 +21662,12 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
 }
 
 // How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
-// itself, `recover` the same under `ref.as_non_null`, `nestedIf` an `if` value joined at this
-// rep; `null`, `atomStr` and `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
+// itself, `recover` the same under `ref.as_non_null`, `unbox` a box narrowed to a variant join's
+// variant, unboxed to its row, `nestedIf` an `if` value joined at this rep; `null`, `atomStr` and
+// `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
 export type RefIfArm = "plain"
   | "recover"
+  | "unbox"
   | "null"
   | "atomStr"
   | "recordCopy"
@@ -21690,6 +21692,9 @@ export function refIfArmOf(
       return "recordCopy"
     }
     if kind == "str" && exprIsLitAtom(tv, fnIx) { return "atomStr" }
+    if kind == "variant" && variantCoerceArmOf(slot, tv, fnIx) == "box" {
+      return "unbox"
+    }
     if !nulJoin && nulNicheRecoverOwed(kind, tv, fnIx) { return "recover" }
     return "plain"
   }
@@ -21728,7 +21733,7 @@ function emitRefIfArm(
       if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
       return emitIfArmClose(emitIfExprRef(unwrapParen(tv), fnIx, kind, slot))
     }
-    "null" | "atomStr" | "recover" | "plain" | "recordCopy" => {}
+    "null" | "atomStr" | "recover" | "unbox" | "plain" | "recordCopy" => {}
   }
   if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
   // A record joined into a wider record would need a converting copy (D2100).
@@ -21744,6 +21749,9 @@ function emitRefIfArm(
   if arm == "null" { return emitIfArmClose(fbRefNullOfKind(kind, slot)) }
   // An atom arm in a `string` join widens to its member string.
   if arm == "atomStr" { return emitIfArmClose(emitAtomToStr(tv, fnIx)) }
+  if arm == "unbox" {
+    return emitIfArmClose(emitVariantBoxUnbox(slot, tv, fnIx))
+  }
   const rcV = emitExpr(tv, fnIx)
   if rcV >= 0 && arm == "recover" { fbRefAsNonNull() }
   return emitIfArmClose(rcV)
@@ -32357,7 +32365,13 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   ) {
     return -1
   }
-  emitLetDelivery(s, slot, fnIx, letArmOwed, letArmCell)
+  emitLetDelivery(
+    s,
+    slot,
+    fnIx,
+    letArmOwed,
+    letArmCell || nulArmIfCell(s, slot),
+  )
   fbLocalSet(idx) // 0x21 local.set
   // Bind `name → slot` in the current emit-time frame AFTER emitting the init (so the
   // init resolved any same-named OUTER binding), making this binding live for the rest
@@ -32365,6 +32379,19 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   scopeBind(s.letName, slot)
   emitListReserve(s, stmtIx, idx, slot, fnIx)
   return 0
+}
+
+// Whether `s` binds a nullable arm cell (`nulvariant`, local `slot`) to an `if`, which joins at
+// the cell's variant and so owes no unbox at the binding boundary (unfiled: D17026).
+function nulArmIfCell(s: LetDecl, slot: i32): boolean {
+  if slot < 0 || slot >= localIsRef.length || slot >= localStructIdx.length {
+    return false
+  }
+  const vi = localStructIdx[slot]
+  return localIsRef[slot] == "nulvariant"
+    && exprIsIfStmt(s.letInit)
+    && vi >= 0
+    && vi < uVarRow.length
 }
 
 // `emitLetDeclStmt`'s init step: emits `s`'s initializer for local `slot` (kind `slotKind`,
@@ -32400,6 +32427,12 @@ function emitLetInitValue(
       return emitFail(
         "emitProgram: union-valued map read binding's init is not an index read",
       )
+    }
+  } else if nulArmIfCell(s, slot) {
+    // A nullable arm cell's `if` joins at the cell's variant, so every arm reaches its row and a
+    // `null` arm is the variant's own null (unfiled: D17026).
+    if emitIfExprRef(unwrapParen(s.letInit), fnIx, "variant", slotStruct) < 0 {
+      return -1
     }
   } else if letArmCell {
     // An arm cell takes the bare variant struct whatever builds it, as at assignment (D4639).
