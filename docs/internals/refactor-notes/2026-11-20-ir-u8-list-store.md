@@ -26,7 +26,7 @@ receiver, the index, the value as a plain i32 (`emitIdxStoreValue`'s last arm) a
   `--cases`: 7,516 identical, 0 differ.
 - **Mode 3:** cells and run cases byte-identical, and the self-compile identical.
 - **L2 fuel**, same box against the base's seed: 102,871,877,477 → 102,876,930,736 (+0.005%).
-- **Lines:** +14 / −9 in `compiler/`.
+- **Lines:** +11 / −14 in `compiler/`.
 
 An enabler: the 337 functions now wait on `__str_from_bytes__` alone (`intrinsic none`, DEAD's
 lane), and claim when it lands.
