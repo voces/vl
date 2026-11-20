@@ -84,6 +84,9 @@ export type RCallHost = { chImport: i32, chArgs: Opnd[] }
 export type RTest = { teV: Opnd, teTag: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
+// A shared field read `srAt` over un-narrowed box local `srV`, dispatched on its tag per member
+// (legacy's `emitMemSharedRead`), so `srV` is read twice an arm.
+export type RSharedRead = { srV: Opnd, srAt: i32 }
 // A box local read at the variant its narrowing names (`narrowedBoxVariantPlain`), whose record is
 // `bnRep`, the destination's; or, with `bnAtom` an atom kind (`identUnboxAtomOf`), read unboxed to
 // that atom, -1 otherwise. `bnAt` the read.
@@ -239,7 +242,7 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // argument before one whose valued `if` the lowering writes it below (`stageLead`), or a union box
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
-export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf
+export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf
   | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
   | RMapGetOr | RMapHas | RPrint | RStrOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RTagStash | RTagIs
   | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage
@@ -284,14 +287,24 @@ export type SIf = {
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // A `??` at `cbAt` whose head and present arm are legacy's shared tails along arm `cbArm`, with a
-// lazy default and a valued out: operand `cbL` (a boxed operand, or the popped list), the `if` the
-// tails open on it, and the default `cbNull`, which writes out `cbOut` on the null path.
+// lazy default and a valued out: operand `cbL` (a boxed operand, the popped list, or a map read's
+// receiver), the `if` the tails open on it, and the default `cbNull`, which writes out `cbOut` on
+// the null path. A fused map read's probe is `cbMap`, null on every other arm.
 export type SCoalBox = {
   cbL: Opnd,
   cbArm: CoalValArm,
   cbNull: i32[],
   cbOut: i32,
   cbAt: i32,
+  cbMap: MapProbe | null,
+}
+// A fused map read's probe: map global `prSym` (recovered for `prNonNull`), or where it is -1 the
+// receiver in `cbL`, key `prKey`, and `RMapGetOr`'s inline form `prForm` (1 the `i32` read, 2 mv).
+export type MapProbe = {
+  prSym: i32,
+  prNonNull: boolean,
+  prKey: Opnd,
+  prForm: i32,
 }
 export type SBr = { brLabel: i32, brHas: boolean, brVal: Opnd }
 export type SReturn = { rtHas: boolean, rtV: Opnd }
@@ -604,6 +617,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCallHost => r.chArgs
     RTest => [r.teV]
     RBoxField => [r.bfV]
+    RSharedRead => [r.srV]
     RBoxNarrow => [r.bnV]
     RRecover => [r.rcV]
     RCast => [r.ctV]
@@ -666,6 +680,7 @@ function rhsText(r: Rhs): string {
     RCallHost => "call_host " + i32ToStr(r.chImport) + "(" + opndsText(r.chArgs) + ")"
     RTest => "is " + opndText(r.teV) + " tag " + i32ToStr(r.teTag)
     RBoxField => "box_field " + opndText(r.bfV) + " @" + i32ToStr(r.bfAt)
+    RSharedRead => "shared_read " + opndText(r.srV) + " @" + i32ToStr(r.srAt)
     RBoxNarrow => "box_narrow " + opndText(r.bnV) + " @" + i32ToStr(r.bnAt)
     RRecover => "recover " + opndText(r.rcV) + " @" + i32ToStr(r.rcAt)
     RCast => "as " + opndText(r.ctV) + " " + repText(r.ctTarget) + " " + r.ctOnFail
@@ -744,6 +759,13 @@ function bodyText(f: IrFn, body: i32[], d: i32): string {
   return s
 }
 
+// A fused map read's probe as text: its global and key, or nothing on another arm.
+function mapProbeText(mp: MapProbe | null): string {
+  if mp == null { return "" }
+  const g = if mp.prSym >= 0 { " g" + i32ToStr(mp.prSym) } else { "" }
+  return g + "[" + opndText(mp.prKey) + "]"
+}
+
 function outText(v: i32): string {
   if v < 0 { return "" }
   return " -> v" + i32ToStr(v)
@@ -808,6 +830,7 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       + n.cbArm
       + " "
       + opndText(n.cbL)
+      + mapProbeText(n.cbMap)
       + outText(n.cbOut)
       + "\n"
       + bodyText(f, n.cbNull, d + 1)
@@ -868,6 +891,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SAssign | SBlock | SLoop | SForIn | SIf | SBr | SReturn | STrap | SDrop => "control"
     SCoalBox => match n.cbArm {
       "popOr" => "list"
+      "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
     }
     SGlobalSet => "global"
@@ -885,7 +909,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RGlobalGet => "global"
     RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RListEq | RStrOp | RMakeList | RSpread => "list"
     RMapGetOr | RMapHas | RMapNew | RMapSet | RMapOp => "map"
-    RTest | RBoxField | RBoxNarrow => "box"
+    RTest | RBoxField | RSharedRead | RBoxNarrow => "box"
     RGetField | RMakeRec => "record"
     RMakeClo | RCallRef => "closure"
     RCallHost | RCast | RTagOf | RListNew | RFnId | RCellNew | RCellGet => "other"
