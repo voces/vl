@@ -642,6 +642,41 @@ print(bs[0])
   },
 });
 
+// A `.push` onto a literal-union, `(boolean | null)`, `(string | null)` or union-box list, and of a
+// narrowed arm onto its own record list, delivers the value at the element rep as legacy writes it.
+Deno.test({
+  name: "ir shadow: a push onto each element arm legacy writes as itself is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type Dir = "n" | "s"
+type Sq = { k: "sq", w: i32 }
+type Ci = { k: "ci", r: i32 }
+type Sh = Sq | Ci
+function lit(xs: Dir[], d: Dir) { xs.push(d) }
+function nb(xs: (boolean | null)[], b: boolean | null) { xs.push(b) }
+function ns(xs: (string | null)[], s: string | null) { xs.push(s) }
+function bx(xs: (i32 | string)[], v: i32) { xs.push(v) }
+function arm(xs: Sq[], s: Sh) { if s is Sq { xs.push(s) } }
+const a: Dir[] = []
+lit(a, "s")
+const b: (boolean | null)[] = []
+nb(b, null)
+const c: (string | null)[] = []
+ns(c, "x")
+const u: (i32 | string)[] = []
+bx(u, 4)
+const q: Sq[] = []
+arm(q, { k: "sq", w: 3 })
+print(q.length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want all five pushes covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A `.push` of a short-circuit value onto a list held in its own local reads the receiver by index
 // after the value, as legacy does, so it is covered; a staged receiver (a global) is written
 // ahead of the value and stays a named miss.
