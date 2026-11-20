@@ -366,6 +366,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
+import { sFieldRowTyAt, uFieldElemTyIxAt } from "./emit_atom_kinds"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
 
 let ibArmed = false
@@ -662,7 +663,7 @@ function objLitAt(
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
     if why != "" { return irBMiss(why) }
     const mark = b.length
-    const v = deliver(b, valIx, ks[k], -1)
+    const v = deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi))
     if ibMiss != "" { return v }
     if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
     if oi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
@@ -738,8 +739,12 @@ function fieldPlainWhy(
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
     if !variantArmFits(va, dst) { return "object variant field " + va }
-    // A box into another union's box converts its members on legacy's side (`emitDelivered`).
-    if va == "box" && exprUnion(valIx, ibFnIx) {
+    // A box goes in whole only where legacy's box plan into the field's union passes it.
+    if (
+      va == "box"
+      && exprUnion(valIx, ibFnIx)
+      && !boxPassesWhole(valIx, fieldSiteTy(arm, row, fi))
+    ) {
       return "object variant field box from a box"
     }
     return ""
@@ -747,8 +752,12 @@ function fieldPlainWhy(
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
   if !fieldArmDelivers(fa) { return "object field " + fa }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
-  // A box into another union's box converts its members on legacy's side (`emitDelivered`).
-  if fa == "union" && exprUnion(valIx, ibFnIx) {
+  // A box goes in whole only where legacy's box plan into the field's union passes it.
+  if (
+    fa == "union"
+    && exprUnion(valIx, ibFnIx)
+    && !boxPassesWhole(valIx, fieldSiteTy(arm, row, fi))
+  ) {
     return "object field box from a box"
   }
   if nulNicheRecoverOwed(sFieldStoreKind(row, fi), valIx, ibFnIx) {
@@ -2571,8 +2580,19 @@ function repTemp(b: i32[], r: Rhs, ix: i32, dst: i32): Opnd {
 function boxIntoOtherUnion(ix: i32, dst: i32, dstTy: i32): boolean {
   if !(repNodeAt(dst) is RBox) && !boxedNullable(dst) { return false }
   if boxOwedAt(ix, ibFnIx) { return false }
-  if dstTy < 0 { return true }
-  return holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
+  return !boxPassesWhole(ix, dstTy)
+}
+
+// Whether the box `ix` builds goes into union type `ty` as it stands: legacy's box plan into it
+// passes it whole (`holeBoxPlanOf` `pass`). An unknown `ty` (-1) cannot be shown to.
+function boxPassesWhole(ix: i32, ty: i32): boolean {
+  return ty >= 0 && holeBoxPlanOf(ix, ty, ibFnIx).hbArm == "pass"
+}
+
+// The type legacy's field writer boxes literal row `row`'s field `fi` at: a variant's own field
+// union (`emitVariantFieldBox`), else the struct row's field type (`emitStructFieldValue`).
+function fieldSiteTy(arm: ObjLitArm, row: i32, fi: i32): i32 {
+  return if arm == "variant" { uFieldElemTyIxAt(row, fi) } else { sFieldRowTyAt(row, fi) }
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
