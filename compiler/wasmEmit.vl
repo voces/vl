@@ -91,13 +91,13 @@ import {
   elabStoreMemberOf,
   elabTypedReadMemberAt,
   elabValueSlotUncalled,
+  isStorageRead,
   litRepTyAt,
   luOvEnter,
   luOvLeave,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
-  storageReadOpen,
 } from "./emit_elab"
 import { canonUnionMemberTysOf } from "./check_program"
 import {
@@ -35705,28 +35705,46 @@ export function globalCtxNow(): GlobalCtx {
   return c
 }
 
-// The legacy lowering context a fragment the IR door builds cannot see, or "" when all of it is at
-// rest: a coercion seat, storage-read mode, a narrowing frame, a staged operand or push receiver
-// cast, an open loop hoist or list build region. The union sink is byte-level, not a plan input.
-export function legacyContextLiveWhy(): string {
-  if coerceHeld >= 0 { return "coerceHeld" }
-  if armSeat >= 0 { return "armSeat" }
-  if boxSeat >= 0 { return "boxSeat" }
-  if atomSeat >= 0 { return "atomSeat" }
-  if armServed >= 0 { return "armServed" }
-  if storageReadOpen() { return "storage read" }
-  if knownArmDecl.length > 0 { return "narrowing frame" }
-  if isRecvStagedIx >= 0 { return "staged is receiver" }
-  if listGetIdxStagedIx >= 0 || listGetRecvStagedIx >= 0 {
+// Sets the held coercion mark to `ix`, returning the one it replaces: the shadow's firing control.
+export function coerceHeldSwap(ix: i32): i32 {
+  const was = coerceHeld
+  coerceHeld = ix
+  return was
+}
+
+// The legacy context an expression fragment rooted at `root` would read, or "": ir-design §10.2.1.
+// A node mark reaches the fragment only on its root (a held coercion, a storage read) or, for a
+// staged operand, inside it; an open list-build region only through a counted push inside it. The
+// seats are spent or inert below `coerceKindAt`, and the two lexical frames hold no `for` here.
+export function legacyContextLiveWhy(root: i32): string {
+  if coerceHeld >= 0 && coerceHeld == root { return "coerceHeld on the root" }
+  if isStorageRead(root) { return "storage read of the root" }
+  if isRecvStagedIx >= 0 && nodeContains(root, isRecvStagedIx) {
+    return "staged is receiver"
+  }
+  if listGetIdxStagedIx >= 0 && nodeContains(root, listGetIdxStagedIx) {
     return "staged list get"
   }
-  if listFitStoodIn >= 0 { return "list fit stand-in" }
+  if listGetRecvStagedIx >= 0 && nodeContains(root, listGetRecvStagedIx) {
+    return "staged list get"
+  }
   if listCastForPush { return "push receiver cast" }
-  if lhOpen.length > 0 { return "loop hoist" }
-  let r = 0
-  while r < lbEnd.length {
-    if lbEnd[r] >= 0 { return "list build region" }
-    r = r + 1
+  // A root reading a capture stand-in would owe `listFitStoodIn` as the door's output.
+  if root >= 0 && root < P.nodes.length && nodeAt(root) is Ident {
+    return "identifier root"
+  }
+  let k = 0
+  while k < lbPush.length {
+    const r = lbPushOf[k]
+    if (
+      r >= 0
+      && r < lbEnd.length
+      && lbEnd[r] >= 0
+      && nodeContains(root, lbPush[k])
+    ) {
+      return "counted push"
+    }
+    k = k + 1
   }
   return ""
 }
