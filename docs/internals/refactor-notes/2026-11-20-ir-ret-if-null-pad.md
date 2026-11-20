@@ -13,6 +13,9 @@ return lowering: the union sink's peephole where it fires, else `return`, as `em
 does. The verifier requires `RRetNull` at the function's own return rep, a nullable one or a box.
 A function with no null plan is the named miss `returned if null plan`.
 
-Measured at the merge-base in the PR.
+Measured on fixpoint seeds at merge-base `34d192f84` (functions with no blocker): self-compile
+18,519 → 18,527 of 19,277; corpus 41,296 → 41,298 of 45,678. Of the 23 self-compile functions the
+row blocked, 8 build. The rest stop at their next blocker: `else-less tail if` 7,
+`tail if union sink` 5, `field read coercion` 2 and `null test boxTag` 1.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
