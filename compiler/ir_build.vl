@@ -216,7 +216,12 @@ import {
   tagIsArmOf,
   widenPlanOf,
 } from "./emit_plan_union"
-import { arrLitRefShortSlot, arrLitUnionBoxSlot } from "./emit_plan_list"
+import {
+  arrLitRefShortSlot,
+  arrLitUnionBoxSlot,
+  spreadBoxDestRow,
+  spreadPlanOf,
+} from "./emit_plan_list"
 import { mvValVariantOf } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
@@ -306,6 +311,7 @@ import {
   localIndexOf,
   nulLitAtomTexts,
   sFieldStoreKind,
+  spreadBoxingSource,
 } from "./emit_classify"
 import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -357,6 +363,8 @@ import {
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
+import { spreadSlotIdOf } from "./emit_collect"
+import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
 let ibDetail = false
@@ -2717,6 +2725,7 @@ function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
 function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   const lb = arrLitListBuild(ix, ibFnIx)
   const arm = arrLitArmOf(ix, ibFnIx, lb)
+  if arm == "spread" { return spreadLit(b, n, ix, rep, lb) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
   if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 {
@@ -2755,6 +2764,44 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     elems.push(v)
   }
   const r: Rhs = { mlElems: elems, mlAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// A spread literal of one item group, a spread source, along legacy's plain arm (`spreadPlanOf`):
+// the source built raw, as legacy emits it, at the literal's own list rep and row, into slots its
+// recorded ordinal keys. A boxing, converting or many-group literal is a named miss.
+function spreadLit(
+  b: i32[],
+  n: ArrayLit,
+  ix: i32,
+  rep: i32,
+  lb: ListBuild,
+): Opnd {
+  if (
+    spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
+    || spreadBoxingSource(ix, ibFnIx) >= 0
+  ) {
+    return irBMiss("array spread boxed")
+  }
+  if spreadSlotIdOf(ix) < 0 { return irBMiss("array spread unrecorded") }
+  const p = spreadPlanOf(ix, ibFnIx, lb)
+  if p.spWhy != "" { return irBMiss("array spread plan") }
+  if p.spSrcs.length != 1 || p.spSrcs[0] < 0 {
+    return irBMiss("array spread groups")
+  }
+  if p.spSrcKinds[0] != p.spKind { return irBMiss("array spread conversion") }
+  if p.spGroupRows[0] != p.spRow { return irBMiss("array spread sub row") }
+  // A list literal source is built at the group's own build (`emitSpreadGroup`), not its own.
+  const src = p.spSrcs[0]
+  const lit = unwrapParen(src)
+  if lit >= 0 && nodeAt(lit) is ArrayLit {
+    return irBMiss("array spread literal source")
+  }
+  if !(repNodeAt(rep) is RList) { return irBMiss("array rep") }
+  const v = irBExpr(b, src)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
+  const r: Rhs = { spSrc: v, spKind: lb.lbKind, spSlot: lb.lbSlot, spAt: ix }
   return irBLetTemp(b, r, ix, rep)
 }
 
