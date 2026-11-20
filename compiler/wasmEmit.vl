@@ -1232,8 +1232,11 @@ import {
   numLitCastSlot,
   objOrderStashSlot,
   spreadDstBackSlot,
+  spreadDstIdSlot,
   spreadElemWidens,
+  spreadGroupIdSlot,
   spreadGroupWrapSlot,
+  spreadJoinTmpSlot,
   spreadLitElemRow,
   spreadSrcBoxAtom,
   spreadSrcNulMode,
@@ -1577,6 +1580,8 @@ import {
   declSlotPinned,
   firstLocalDeclIn,
   rvPairOf,
+  spreadGroupSlotIdOf,
+  spreadSlotIdOf,
   stmtArmScopeClose,
   stmtArmScopeOpen,
 } from "./emit_collect"
@@ -2808,6 +2813,30 @@ export function objLitVariantLayoutAt(objIx: i32, vi: i32): i32 {
   if start < 0 || cnt < 0 || start + cnt > sFieldNames.length { return -1 }
   if objLitHasFieldOutside(objIx, start, cnt) { return -1 }
   if objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
+  let fj = 0
+  while fj < cnt {
+    if objFieldVal(objIx, sFieldNames[start + fj]) < 0 { return -1 }
+    fj = fj + 1
+  }
+  return vi
+}
+
+// The variant row object literal `objIx` is built at by `emitVariantStruct`'s order stash: as
+// `objLitVariantLayoutOf`, but its source order observable; -1 otherwise.
+export function objLitVariantStashOf(objIx: i32, fnIx: i32): i32 {
+  return objLitVariantStashAt(objIx, objLitBuildVariantRow(objIx, fnIx))
+}
+
+// `objLitVariantStashOf` at variant row `vi`: `vi`, or -1.
+export function objLitVariantStashAt(objIx: i32, vi: i32): i32 {
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return -1
+  }
+  const start = uFieldStart[vi]
+  const cnt = uFieldCount[vi]
+  if start < 0 || cnt < 0 || start + cnt > sFieldNames.length { return -1 }
+  if objLitHasFieldOutside(objIx, start, cnt) { return -1 }
+  if !objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
   let fj = 0
   while fj < cnt {
     if objFieldVal(objIx, sFieldNames[start + fj]) < 0 { return -1 }
@@ -11590,6 +11619,10 @@ export function variantUnionBoxTail(
   fnIx: i32,
 ): i32 {
   if !fieldRowIsUnionBox(uFieldStart[vi] + idx) { return 0 }
+  // A record read at its own type out of the union of records it is built into is that member's
+  // record, as `structUnionBoxTail` writes it off a struct receiver (D17025).
+  const avi = boxedArmOfMember(memIx, fnIx)
+  if avi >= 0 { return emitArmUnboxCast(variantHeap(avi), false) }
   return emitUnionFieldNarrowUnbox(memIx, fnIx)
 }
 
@@ -11774,13 +11807,14 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
           return -1
         }
       }
-      const gs = spreadGroupWrapSlot(kk, gRow, seq + g)
+      const gs = spreadGroupSlotAt(arrIx, g, kk, gRow, seq)
+      if gs < 0 { return -1 }
       slots.push(gs)
       groupRows.push(gRow)
       fbLocalSet(gs)
       g = g + 1
     }
-    return spreadJoinGroups(slots, groupRows, wrap, back, kk, row, seq)
+    return spreadJoinGroups(arrIx, slots, groupRows, wrap, back, kk, row, seq)
   }
   return emitFail("emitProgram: expected an array literal")
 }
@@ -11883,10 +11917,34 @@ function rlRowElemSubOf(s: i32, d: i32): boolean {
   return false
 }
 
+// A slot key packs a ref-list row under 4096 with `4096 * ordinal`, so an ordinal must stay
+// under the `i32` key's room for it.
+const SPREAD_ORDINAL_CAP = 524000
+
+// Spread literal `arrIx`'s frame slot for item group `g`: keyed by its recorded ordinal, else,
+// for a literal no collect walk met, by the emission sequence `seq`.
+function spreadGroupSlotAt(
+  arrIx: i32,
+  g: i32,
+  kk: ListKind,
+  row: i32,
+  seq: i32,
+): i32 {
+  const gid = spreadGroupSlotIdOf(arrIx, g)
+  if gid < 0 { return spreadGroupWrapSlot(kk, row, seq + g) }
+  if gid >= SPREAD_ORDINAL_CAP {
+    return emitFail(
+      "emitProgram: a spread group's slot ordinal overflows its slot key",
+    )
+  }
+  return spreadGroupIdSlot(kk, row, gid)
+}
+
 // Join a spread literal's item groups, each a list in its own frame slot, of (`kk`, `row`) or,
 // for a source whose element is a subtype of the row's, of that source's own row
 // (`groupRows`): allocate the destination once, then one `array.copy` per group in source order.
 function spreadJoinGroups(
+  arrIx: i32,
   slots: i32[],
   groupRows: i32[],
   wrap: i32,
@@ -11895,9 +11953,15 @@ function spreadJoinGroups(
   row: i32,
   seq: i32,
 ) {
-  const totL = widenTmpSlot(2000 + 2 * seq)
-  const offL = widenTmpSlot(2001 + 2 * seq)
-  const dstL = spreadDstBackSlot(kk, row, seq)
+  const sid = spreadSlotIdOf(arrIx)
+  if sid >= SPREAD_ORDINAL_CAP {
+    return emitFail(
+      "emitProgram: a spread literal's slot ordinal overflows its slot key",
+    )
+  }
+  const totL = if sid >= 0 { spreadJoinTmpSlot(2 * sid) } else { widenTmpSlot(2000 + 2 * seq) }
+  const offL = if sid >= 0 { spreadJoinTmpSlot(2 * sid + 1) } else { widenTmpSlot(2001 + 2 * seq) }
+  const dstL = if sid >= 0 { spreadDstIdSlot(kk, row, sid) } else { spreadDstBackSlot(kk, row, seq) }
   fbI32Const(0)
   fbLocalSet(totL)
   let t = 0
@@ -12020,13 +12084,14 @@ function emitArrSpreadBoxed(arrIx: i32, row: i32, fnIx: i32) {
   let g = 0
   while g < groups.length {
     if emitSpreadGroupBoxed(groups[g], isSrc[g], row, fnIx) < 0 { return -1 }
-    const gs = spreadGroupWrapSlot(kk, row, seq + g)
+    const gs = spreadGroupSlotAt(arrIx, g, kk, row, seq)
+    if gs < 0 { return -1 }
     slots.push(gs)
     groupRows.push(row)
     fbLocalSet(gs)
     g = g + 1
   }
-  return spreadJoinGroups(slots, groupRows, wrap, back, kk, row, seq)
+  return spreadJoinGroups(arrIx, slots, groupRows, wrap, back, kk, row, seq)
 }
 
 // One group of `emitArrSpreadBoxed`, left on the stack as a list at union-box row `row`. A list
@@ -37551,6 +37616,28 @@ export function objLitLayoutRowAt(objIx: i32, si: i32): i32 {
   let fi = 0
   while fi < cnt {
     if objFieldVal(objIx, sFieldNames[sFieldStart[si] + fi]) < 0 { return -1 }
+    fi = fi + 1
+  }
+  return si
+}
+
+// The struct row object literal `objIx` is built at by `emitObj`'s order stash with nothing
+// dropped: every field present, its source order observable; -1 otherwise.
+export function objLitStashRowOf(objIx: i32, fnIx: i32): i32 {
+  if !sDeclared { return -1 }
+  return objLitStashRowAt(objIx, structIndexOfObjCtx(objIx, fnIx))
+}
+
+// `objLitStashRowOf` at struct row `si`, the row a destination builds the literal at: `si`, or -1.
+export function objLitStashRowAt(objIx: i32, si: i32): i32 {
+  if !sDeclared || si < 0 || si >= sFieldCount.length { return -1 }
+  const start = sFieldStart[si]
+  const cnt = sFieldCount[si]
+  if objLitDropsField(objIx, sFieldNames, start, cnt) { return -1 }
+  if !objLitNeedsOrderStash(objIx, sFieldNames, start, cnt) { return -1 }
+  let fi = 0
+  while fi < cnt {
+    if objFieldVal(objIx, sFieldNames[start + fi]) < 0 { return -1 }
     fi = fi + 1
   }
   return si
