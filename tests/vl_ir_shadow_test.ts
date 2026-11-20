@@ -2090,3 +2090,34 @@ print(fl([1.5, 2.5])[3])
     }
   },
 });
+
+// `__array_copy__`'s operands are each written in place at its use, between the backing reads:
+// computed offsets and counts, a call as the count and a call as the source list all match.
+Deno.test({
+  name: "ir shadow: an __array_copy__ over computed and called operands matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function cnt(n: i32): i32 { return n - 1 }
+function pick(xs: i32[]): i32[] { return xs }
+function comp(d: i32[], s: i32[], i: i32, j: i32, n: i32) { __array_copy__(d, i + 1, s, j * 2, n - 1) }
+function callCount(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, s, 0, cnt(n)) }
+function callSrc(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, pick(s), 0, n) }
+function mixed(d: i32[], s: i32[], i: i32, n: i32) {
+  __array_copy__(d, i + i * 2, pick(s), cnt(i) + 1, cnt(n))
+}
+const d: i32[] = __array_new__(8, 0)
+const s = [1, 2, 3, 4, 5, 6]
+comp(d, s, 0, 1, 3)
+callCount(d, s, 3)
+callSrc(d, s, 2)
+mixed(d, s, 1, 3)
+print(d[0] + d[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});

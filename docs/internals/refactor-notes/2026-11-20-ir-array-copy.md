@@ -21,6 +21,9 @@ two backings, which share one kind and row.
   `__array_copy__` in value position.
 
 `vl_ir_shadow_test.ts` holds an i32, a string, an f64 and a record list copy covered and matched.
+The interleaved backing reads are right because each operand is written in place at its use: the
+same test file holds computed offsets and counts, a call as the count and a call as the source
+list, every function matched.
 
 ## Readings (vs merge-base `ebf4b1c17`, fixpoint seeds on both sides)
 
