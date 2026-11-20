@@ -1013,7 +1013,8 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
 // in that later operand; one in the first operand written stays covered, and an intrinsic's
-// earlier argument is staged below the `if` (`intr`).
+// earlier argument, or an element store's receiver and index, is staged below the `if` (`intr`,
+// `st`), so only `stIx`'s `if` in the index is a store miss.
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -1047,10 +1048,9 @@ print(intr(true, 0.5))
 `;
     const { rows } = run(src, true);
     const want: [string, number][] = [
-      ["uncovered store short-circuit operand", 2],
+      ["uncovered store short-circuit operand", 1],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["start uncovered map store short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
@@ -1060,6 +1060,8 @@ print(intr(true, 0.5))
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    // The start's map store stages its global receiver and key below the value's `if`.
+    if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -1618,7 +1620,7 @@ Deno.test({
 });
 
 // A value `if` joined at a string or a list builds under legacy's ref blocktype and matches; one
-// that is a later operand of a string `+` sits above the earlier ones, a named miss.
+// that is a later operand of a string `+` stages the earlier operand below it, and matches too.
 const REF_IF =
   `function s(b: boolean, x: string, y: string): string {\n  const r = if b { x } else { y }\n  return r\n}\nfunction t(b: boolean, x: string): string {\n  return x + (if b { x } else { "no" })\n}\nfunction l(b: boolean, xs: i32[], ys: i32[]): i32 {\n  const r = if b { xs } else { ys }\n  return r.length\n}\nprint(s(true, "a", "b"))\nprint(s(false, "a", "b"))\nprint(t(false, "a"))\nprint(l(true, [1, 2], [3]))\n`;
 Deno.test({
@@ -1629,11 +1631,11 @@ Deno.test({
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
-      throw new Error(`want s and l covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want s, t and l covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!rows.has("uncovered string operand after another")) {
-      throw new Error(`want t a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered string operand after another")) {
+      throw new Error(`want t's earlier operand staged, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1764,6 +1766,77 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
       throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A reference join's `else if` chain is built link by link into each link's `else`, at the head's
+// rep: a string chain and a list chain build and match legacy.
+const REF_IF_CHAIN =
+  `function s3(n: i32, a: string): string {\n  const r = if n > 0 { a } else if n < 0 { "neg" } else { "zero" }\n  return r\n}\nfunction l3(n: i32, xs: i32[]): i32[] {\n  const r = if n > 1 { xs } else if n == 1 { [1] } else { [] }\n  return r\n}\nprint(s3(-1, "pos"))\nprint(l3(1, []).length)\n`;
+Deno.test({
+  name: "ir shadow: a reference join's else-if chain builds link by link and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF_CHAIN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want s3 and l3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned value `if` in a function taking the union return sink builds one return per arm,
+// each arm's box written to the sink pair: an `i32 | string` and an `i32 | boolean` result match.
+const UNION_SINK_RET =
+  `function u2(n: i32): i32 | string {\n  return if n > 0 { n } else { "neg" }\n}\nfunction u4(n: i32): i32 | boolean {\n  return if n > 0 { n } else { false }\n}\nprint(u2(3))\nprint(u4(-3))\n`;
+Deno.test({
+  name: "ir shadow: a returned value if under the union return sink builds per-arm returns and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_RET, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want u2 and u4 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
+// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+const UNION_SINK_ONE_NUMBER =
+  `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
+Deno.test({
+  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// The statement spelling of an else-less chain of returns falls through to the body's own tail.
+const RET_CHAIN_ELSELESS =
+  `function c3(n: i32, a: string): string {\n  if n > 0 { return a } else if n < 0 { return "neg" }\n  return "zero"\n}\nprint(c3(0, "p"))\nprint(c3(-1, "p"))\n`;
+Deno.test({
+  name: "ir shadow: an else-less chain of statement returns builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_CHAIN_ELSELESS, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want c3 covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2097,6 +2170,192 @@ print(nullable(null))
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 8 || (rows.get("matched") ?? 0) !== 8) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
+// then the value. A global receiver (staged as its read), a local and a parameter, with a
+// variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
+// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
+// name.
+Deno.test({
+  name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
+  ignore,
+  fn: () => {
+    const src = `let gb: {[string]: boolean} = Map()
+let gn: {[string]: boolean} = Map()
+let gq: {[string]: i32} = Map()
+let gi: {[string]: i32} = Map()
+function key(s: string): string { return s }
+function glob(a: boolean, c: boolean, k: string) { gb[k] = a && c }
+function loc(a: boolean, c: boolean, k: string): boolean {
+  const m: {[string]: boolean} = Map()
+  m[key(k)] = c || a
+  return m[k] ?? false
+}
+function par(m: {[string]: boolean}, a: boolean, k: string) { m[k] = gn.has(k) && a }
+function other(a: boolean, k: string) { gb[k] = gq.has(k) || a }
+function boxed(p: i32 | null, k: string) { gi[k] = p ?? 7 }
+function lit(a: boolean, c: boolean) { gb["x"] = a && c }
+gn["k"] = true
+gq["q"] = 1
+glob(true, true, "k")
+print(loc(false, true, "k"))
+par(gb, true, "p")
+other(false, "q")
+boxed(null, "k")
+lit(true, false)
+print(gb["k"] ?? false)
+print(gb["p"] ?? false)
+print(gb["q"] ?? false)
+print(gi["k"] ?? 0)
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered map store short-circuit operand") !== 1) {
+      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `__array_copy__` is written as legacy's arm writes it: each list operand followed by its backing,
+// then the copy. An i32, a string, an f64 and a record list each match byte for byte.
+Deno.test({
+  name: "ir shadow: an __array_copy__ statement matches over each list kind",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function grow(xs: i32[], n: i32): i32[] {
+  const out: i32[] = __array_new__(n, 0)
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+function tail(xs: string[], from: i32): string[] {
+  const out: string[] = __array_new__(xs.length - from, "")
+  __array_copy__(out, 0, xs, from, xs.length - from)
+  return out
+}
+function fl(xs: f64[]): f64[] {
+  const out: f64[] = __array_new__(xs.length * 2, 0.0)
+  __array_copy__(out, xs.length, xs, 0, xs.length)
+  return out
+}
+type P = { x: i32 }
+function rs(xs: P[]): P[] {
+  const out: P[] = __array_new__(xs.length, { x: 0 })
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+print(grow([1, 2, 3], 5)[2] + rs([{ x: 4 }, { x: 5 }])[1].x)
+print(tail(["a", "b", "c"], 1)[1])
+print(fl([1.5, 2.5])[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `__array_copy__`'s operands are each written in place at its use, between the backing reads:
+// computed offsets and counts, a call as the count and a call as the source list all match.
+Deno.test({
+  name: "ir shadow: an __array_copy__ over computed and called operands matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function cnt(n: i32): i32 { return n - 1 }
+function pick(xs: i32[]): i32[] { return xs }
+function comp(d: i32[], s: i32[], i: i32, j: i32, n: i32) { __array_copy__(d, i + 1, s, j * 2, n - 1) }
+function callCount(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, s, 0, cnt(n)) }
+function callSrc(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, pick(s), 0, n) }
+function mixed(d: i32[], s: i32[], i: i32, n: i32) {
+  __array_copy__(d, i + i * 2, pick(s), cnt(i) + 1, cnt(n))
+}
+const d: i32[] = __array_new__(8, 0)
+const s = [1, 2, 3, 4, 5, 6]
+comp(d, s, 0, 1, 3)
+callCount(d, s, 3)
+callSrc(d, s, 2)
+mixed(d, s, 1, 3)
+print(d[0] + d[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A valued `match` lowers to an if chain whose later links the checker never types: every link
+// takes the head's rep, as legacy writes every link at the head's kind, and a lowered `is` or
+// wildcard test is boolean. A literal-union chain, a type-pattern chain, a wildcard arm and two
+// widening chains are each covered and matched.
+Deno.test({
+  name: "ir shadow: a valued match chain's links take the head's rep and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type A = { a: i32 }
+type B = { b: i32 }
+type C = { c: i32 }
+type U = A | B | C
+type Op = "add" | "sub" | "neg" | "divide"
+function linkKind(op: Op, n: i32): boolean {
+  const ok = match op {
+    "add" | "sub" => true
+    "neg" => false
+    "divide" => n > 3
+  }
+  return ok
+}
+function isArm(u: U): i32 {
+  const v = match u {
+    A => u.a
+    B => u.b * 2
+    C => u.c * 3
+  }
+  return v
+}
+function wildArm(u: U): i32 {
+  const v = match u {
+    A => u.a
+    _ => 7
+  }
+  return v
+}
+print(linkKind("sub", 0))
+print(linkKind("divide", 5))
+print(isArm({ b: 4 }))
+print(wildArm({ c: 1 }))
+type W = "i" | "f" | "z"
+function widen(w: W, n: i32): f64 {
+  const v: f64 = match w {
+    "i" => n
+    "f" => 2.5
+    "z" => 0
+  }
+  return v
+}
+function elseIfWiden(n: i32): f64 {
+  const v: f64 = if n > 2 { n } else if n > 1 { 1.5 } else { 0 }
+  return v
+}
+print(widen("i", 3) + widen("f", 0))
+print(elseIfWiden(3) + elseIfWiden(2))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
       throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
