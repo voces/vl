@@ -24,6 +24,13 @@ union, unboxed at the push. That refusal goes too.
 
   Every other value the IR delivers at the element rep through `deliver`, as itself, boxed through
   the shared box plan, or unboxed from its narrowed arm. The legacy emitters are unchanged.
+- **Why the arm unbox needs no shared tail.** Legacy casts a narrowed arm at the site's own heap.
+  `pushRhs` requires the delivered value's rep to equal the element rep, and the element rep fixes
+  that heap. So the IR's narrowing cast is accepted only at the heap legacy casts to. Any difference
+  between the two sides is a rep mismatch, and so a named miss, never a silently misplaced cast.
+- **Why a box value needs no shared tail.** `boxOwedAtRecord`'s case beyond `boxOwedAt` is an
+  already-boxed value with no coercion recorded. Legacy writes it as a pass of its own union, which
+  is what `deliver` writes when the value's rep is already the element's.
 
 ## Coverage
 
