@@ -923,26 +923,33 @@ run(2.5)
   },
 });
 
-// A record literal on legacy's layout path builds field by field and matches; a field at another
-// arm (here a widened `f64`) stays a named miss.
+// A record literal on legacy's layout path builds field by field and matches, a widened `f64`
+// field included; a box handed to another union's box field (legacy converts its members) stays a
+// named miss.
 Deno.test({
-  name: "ir shadow: a plain record literal builds; a field at a converting arm is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box from a box is a named miss",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
 type Q = { w: f64 }
+type D = { v: f64 | string }
 function mk(a: i32, s: string): P { return { x: a + 1, y: s } }
 function mkq(a: i32): Q { return { w: a } }
+function mkd(u: i32 | string): D { return { v: u } }
 const p = mk(2, "k")
 print(p.x)
 print(p.y)
 print(mkq(3).w)
+const d = mkd(4)
+if d.v is f64 { print(d.v) }
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (!(rows.get("matched")! >= 1)) throw new Error(`want mk matched, got ${JSON.stringify([...rows])}`);
-    if (rows.get("uncovered object field f64") !== 1) {
-      throw new Error(`want mkq a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered object field box from a box") !== 1) {
+      throw new Error(`want mkd a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1250,6 +1257,39 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (rows.has("uncovered open local type")) {
       throw new Error(`want no open-local miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A generic function used as a value inside a returned record is typed at its open function type,
+// but legacy writes the member's id there as an `i32.const`: the leaf builds at `i32` and every
+// function matches. The program is distilled cell d15119_fw_ret_two_fn.
+const TAG_LEAF_OPEN = `function id0(a) { return a }
+function id1(a) { return a }
+function mk() { return { f: id1 } }
+function run() {
+  const r = mk()
+  r.f = id0
+  const g = r.f
+  print(g(2))
+  print(g(2.5))
+}
+run()
+`;
+Deno.test({
+  name: "ir shadow: a tag leaf at an open function type builds at the set's id and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_LEAF_OPEN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered tag leaf rep")) {
+      throw new Error(`want no tag-leaf-rep miss, got ${JSON.stringify([...rows])}`);
     }
     const covered = rows.get("covered") ?? 0;
     if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
