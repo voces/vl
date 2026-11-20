@@ -108,6 +108,7 @@ import {
   ObjLitArm,
   PrintArm,
   StructFieldArm,
+  VariantFieldArm,
   arrLitShortWhy,
   asgValueArmOf,
   atomStrPlanOf,
@@ -181,8 +182,8 @@ import {
   refIfArmOf,
   shiftMaskFoldOf,
   startInitArmOf,
-  startStrAccMarked,
   stmtWritesNothing,
+  strAccRowsAre,
   strCatPartsOf,
   strLitTakesAtom,
   structFieldArmOf,
@@ -679,6 +680,20 @@ function fieldArmRepFits(fa: StructFieldArm, dst: i32): boolean {
   }
 }
 
+// Whether variant field arm `va` is the value delivered at the literal's field rep `dst`: `plain`,
+// a widening into a slot of its width, or the box (`emitVariantFieldBox`, the hole box plan) into
+// a box slot.
+function variantArmFits(va: VariantFieldArm, dst: i32): boolean {
+  return match va {
+    "plain" => true
+    "box" => repNodeAt(dst) is RBox || boxedNullable(dst)
+    "f64" => repPrim(dst) == "f64"
+    "i64" => repPrim(dst) == "i64"
+    "f32" => repPrim(dst) == "f32"
+    "noKind" | "lambda" | "nulnone" | "strAtom" => false
+  }
+}
+
 // Why field `fi` of literal row `row` at arm `arm` is not written as its value alone, or "".
 function fieldPlainWhy(
   arm: ObjLitArm,
@@ -689,7 +704,12 @@ function fieldPlainWhy(
 ): string {
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
-    return if va == "plain" { "" } else { "object variant field " + va }
+    if !variantArmFits(va, dst) { return "object variant field " + va }
+    // A box into another union's box converts its members on legacy's side (`emitDelivered`).
+    if va == "box" && exprUnion(valIx, ibFnIx) {
+      return "object variant field box from a box"
+    }
+    return ""
   }
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
   if !fieldArmDelivers(fa) { return "object field " + fa }
@@ -1463,6 +1483,14 @@ function narrowedLocalRead(
     const ak = identUnboxAtomOf(ix, ibFnIx)
     if ak < 0 { return irBMiss("narrowed read dead") }
     return irBLetTemp(b, { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak }, ix, rep)
+  }
+  // A union box narrowed to a smaller union is the same box, read at that union's box rep.
+  if (
+    own is RBox
+    && repNodeAt(rep) is RBox
+    && identReadArmOf(n, ix, ibFnIx, false) == "local"
+  ) {
+    return irBLetTemp(b, { sgV: o }, ix, rep)
   }
   return irBMiss("narrowed read")
 }
@@ -3103,9 +3131,11 @@ function opUnsigned(ix: i32): boolean {
 
 // A tagged function set's value: its member's id, an i32 immediate as legacy writes it.
 function tagLeaf(ix: i32): Opnd {
-  const rep = primRepOf(ix)
-  const p = repPrim(rep)
-  if p == null || p != "i32" { return irBMiss("tag leaf rep") }
+  // Legacy writes the member's id as an `i32.const` whatever rep the node's own open type names;
+  // a destination that is not the set's `i32` misses at its own rep check.
+  const own = primRepOf(ix)
+  const p = repPrim(own)
+  const rep = if p != null && p == "i32" { own } else { repNodeOfTy(TY_I32) }
   const o: Opnd = { oiRep: rep, oiBits: fnTagLeafEmitted(ix, ibFnIx) as i64 }
   return o
 }
@@ -4287,12 +4317,16 @@ function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
 
 function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
   const gen = repNodeGen()
+  // An append the fragment holds reads the accumulator rows, which a rescan would rewrite under
+  // legacy's own emit of this body. A constant initializer holds no assignment.
+  if !gConstExprEmit && !strAccRowsAre(fnIx) {
+    return "string accumulator rows"
+  }
   let fnPos = -1
   if fnIx < 0 {
     // A start body's top-level code, under the guards its whole build takes (`buildStart`).
     // A const cell's constant initializer hosts one too: it has no frame, so no variable.
     if !gPromoInStart && !gConstExprEmit { return "fragment outside a body" }
-    if startStrAccMarked() { return "string accumulator" }
     if gInitProgIdx >= 0 { return "progress cell" }
     ibReset(-1, "@fragment", -1)
   } else {

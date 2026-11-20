@@ -1264,6 +1264,39 @@ Deno.test({
   },
 });
 
+// A generic function used as a value inside a returned record is typed at its open function type,
+// but legacy writes the member's id there as an `i32.const`: the leaf builds at `i32` and every
+// function matches. The program is distilled cell d15119_fw_ret_two_fn.
+const TAG_LEAF_OPEN = `function id0(a) { return a }
+function id1(a) { return a }
+function mk() { return { f: id1 } }
+function run() {
+  const r = mk()
+  r.f = id0
+  const g = r.f
+  print(g(2))
+  print(g(2.5))
+}
+run()
+`;
+Deno.test({
+  name: "ir shadow: a tag leaf at an open function type builds at the set's id and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_LEAF_OPEN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered tag leaf rep")) {
+      throw new Error(`want no tag-leaf-rep miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A list delivery whose copy owes nothing past the value (`listCopyOwesNothing`) is the value as
 // built, so the builder takes it as a plain node: no coercion miss, and every covered function
 // matches legacy's bytes. The program is distilled cell b004880.
