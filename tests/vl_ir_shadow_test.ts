@@ -2191,3 +2191,68 @@ print(d[0] + d[3])
     }
   },
 });
+
+// A valued `match` lowers to an if chain whose later links the checker never types: every link
+// takes the head's rep, as legacy writes every link at the head's kind, and a lowered `is` or
+// wildcard test is boolean. A literal-union chain, a type-pattern chain, a wildcard arm and two
+// widening chains are each covered and matched.
+Deno.test({
+  name: "ir shadow: a valued match chain's links take the head's rep and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type A = { a: i32 }
+type B = { b: i32 }
+type C = { c: i32 }
+type U = A | B | C
+type Op = "add" | "sub" | "neg" | "divide"
+function linkKind(op: Op, n: i32): boolean {
+  const ok = match op {
+    "add" | "sub" => true
+    "neg" => false
+    "divide" => n > 3
+  }
+  return ok
+}
+function isArm(u: U): i32 {
+  const v = match u {
+    A => u.a
+    B => u.b * 2
+    C => u.c * 3
+  }
+  return v
+}
+function wildArm(u: U): i32 {
+  const v = match u {
+    A => u.a
+    _ => 7
+  }
+  return v
+}
+print(linkKind("sub", 0))
+print(linkKind("divide", 5))
+print(isArm({ b: 4 }))
+print(wildArm({ c: 1 }))
+type W = "i" | "f" | "z"
+function widen(w: W, n: i32): f64 {
+  const v: f64 = match w {
+    "i" => n
+    "f" => 2.5
+    "z" => 0
+  }
+  return v
+}
+function elseIfWiden(n: i32): f64 {
+  const v: f64 = if n > 2 { n } else if n > 1 { 1.5 } else { 0 }
+  return v
+}
+print(widen("i", 3) + widen("f", 0))
+print(elseIfWiden(3) + elseIfWiden(2))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
