@@ -727,6 +727,37 @@ print(h(true))
   },
 });
 
+// A fused `xs.pop() ?? d` on a held, a staged (global), a staged (field) and an f64 receiver, with
+// a variable default, and a default that reassigns the receiver: legacy's shared open, then its
+// default in the empty arm, every function matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a fused pop with a default is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let g: i32[] = [1, 2]
+function a(xs: i32[]): i32 { return xs.pop() ?? -1 }
+function b(): i32 { return g.pop() ?? 0 }
+function c(xs: f64[]): f64 { return xs.pop() ?? 0.5 }
+function d(xs: i32[], k: i32): i32 { return xs.pop() ?? k }
+type Box = { xs: i32[] }
+function f(o: Box): i32 { return o.xs.pop() ?? 0 }
+function e(p: i32): i32 {
+  let xs: i32[] = []
+  const other: i32[] = [7, 8, 9]
+  const v = xs.pop() ?? (xs = other).length
+  return v * 10 + xs.length
+}
+print(a([3]) + b() + d([], 6) + e(1) + f({ xs: [4] }))
+print(c([]))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -892,26 +923,33 @@ run(2.5)
   },
 });
 
-// A record literal on legacy's layout path builds field by field and matches; a field at another
-// arm (here a widened `f64`) stays a named miss.
+// A record literal on legacy's layout path builds field by field and matches, a widened `f64`
+// field included; a box handed to another union's box field (legacy converts its members) stays a
+// named miss.
 Deno.test({
-  name: "ir shadow: a plain record literal builds; a field at a converting arm is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box from a box is a named miss",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
 type Q = { w: f64 }
+type D = { v: f64 | string }
 function mk(a: i32, s: string): P { return { x: a + 1, y: s } }
 function mkq(a: i32): Q { return { w: a } }
+function mkd(u: i32 | string): D { return { v: u } }
 const p = mk(2, "k")
 print(p.x)
 print(p.y)
 print(mkq(3).w)
+const d = mkd(4)
+if d.v is f64 { print(d.v) }
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (!(rows.get("matched")! >= 1)) throw new Error(`want mk matched, got ${JSON.stringify([...rows])}`);
-    if (rows.get("uncovered object field f64") !== 1) {
-      throw new Error(`want mkq a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered object field box from a box") !== 1) {
+      throw new Error(`want mkd a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1052,7 +1090,9 @@ Deno.test({
     // case 9 stores an i32 into a bool global (rule 2).
     // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
     // case 11 a box whose immediate stands for a call (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2];
+    // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
+    // (rule 2), and a default that leaves the out unwritten (rule 5).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);

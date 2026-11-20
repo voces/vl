@@ -164,6 +164,7 @@ import {
   optChainStructIdxOf,
   placeNicheAtomKind,
   readOwesNonNullRecover,
+  refListSlotOfExpr,
   sFieldIsUnionBox,
   structIndexOfExpr,
   unionBoxStoreTyOf,
@@ -175,6 +176,7 @@ import {
   exprBoolListCode,
   exprIsBool,
   exprIsBoolList,
+  refArrBoxTagOf,
 } from "./emit_closure_sites"
 import { elabIsTyIn, elabKeyAt, readNarrowedStoreAt } from "./emit_elab"
 import {
@@ -1938,7 +1940,7 @@ export function coerceListAtomOf(
 // How a value is boxed: the null tag (`null`), a box as itself (`pass`), a value-atom box of kind
 // `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal (`lit`), a `K | null`
 // atom as its member string (`atomStr`), a record under arm `hbKind`'s tag (`rec`), an object
-// literal built as that arm (`obj`), or the box writer's own ladder (`ladder`).
+// literal built as that arm (`obj`), a ref list under tag `hbKind` (`refList`), or the ladder.
 export type HoleBoxArm = "null"
   | "pass"
   | "atom"
@@ -1946,6 +1948,7 @@ export type HoleBoxArm = "null"
   | "atomStr"
   | "rec"
   | "obj"
+  | "refList"
   | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
@@ -1973,7 +1976,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const bareIx = unwrapParen(exprIx)
   if bareIx < 0 { return ladder }
   const bare = nodeAt(bareIx)
-  if bare is IfStmt || bare is Index || callIsNever(bareIx) { return ladder }
+  if bare is IfStmt || callIsNever(bareIx) { return ladder }
+  // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box.
+  if bare is Index && exprMap(bare.idxArr, fnIx) { return ladder }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
   // `emitUnionArmValueBox`'s two plain rungs: a record boxed as itself under its arm.
   if (
@@ -2007,6 +2012,12 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   }
   // `emitUnionCoerceUnder`'s literal rung, or the null-typed value's.
   if bare is NullLit { return holeBox("null", -1, -1) }
+  // `emitUnionCoerceRefArray`'s first rung: a ref-element list under its own ref-list arm's tag.
+  const rs = refArrCarrierSlotOf(unionTy, exprIx, bareIx, fnIx)
+  if rs >= 0 {
+    const rt = refArrBoxTagOf(exprIx, fnIx, rs, unionTy)
+    return if rt >= 0 { holeBox("refList", rt, -1) } else { ladder }
+  }
   if exprIsNulNone(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
     return ladder
   }
@@ -2112,6 +2123,24 @@ function listLitElemAtomOf(e0: i32, fnIx: i32): string {
     return objVariantName(b)
   }
   return "i32"
+}
+
+// The ref-list arm of `unionTy` that non-null ref-element list `exprIx` (bare `bareIx`) holds,
+// or -1. An empty literal takes the empty literal's rung, and a nullable list the niche's.
+function refArrCarrierSlotOf(
+  unionTy: i32,
+  exprIx: i32,
+  bareIx: i32,
+  fnIx: i32,
+): i32 {
+  if bareIx < 0 || bareIx >= P.nodes.length || !exprRefArray(exprIx, fnIx) {
+    return -1
+  }
+  if tyBearsNull(nodeTyAt(bareIx, fnIx)) { return -1 }
+  const bare = nodeAt(bareIx)
+  if bare is ArrayLit && bare.arrElems.length == 0 { return -1 }
+  const slot = refListSlotOfExpr(exprIx, fnIx)
+  return if unionHasRefArrayArmSlot(unionTy, slot) { slot } else { -1 }
 }
 
 // Whether list literal `exprIx` reaches `unionTy`'s value-atom box, every list rung before it
