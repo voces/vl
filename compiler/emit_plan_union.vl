@@ -214,6 +214,7 @@ import {
 } from "./emit_plan_null"
 import { paramPosOfRead } from "./emit_query"
 import {
+  RBox,
   RNullable,
   RpPrim,
   boxAtomKindOfMemberTy,
@@ -1237,9 +1238,7 @@ export function tagIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): TagIsArm {
       }
     }
     if vrecv is Member && memberUnionFieldNameRead(r, fnIx) != "" {
-      if memNarrowVariantIndex(r, fnIx) >= 0 && exprUnion(vrecv.memObj, fnIx) {
-        return "memNarrow"
-      }
+      if memReadArmOf(r, fnIx) == "narrowed" { return "memNarrow" }
       const msi = structIndexOfExpr(vrecv.memObj, fnIx)
       if msi >= 0 && sFieldIndex(msi, vrecv.memProp) >= 0 { return "memStruct" }
       const vi = exprVariantIndex(vrecv.memObj, fnIx)
@@ -1541,13 +1540,31 @@ function isNoMembershipRecv(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
     && !tyIsTpJoinUnion(msObj)
 }
 
+// Which arm of `emitMem` reads member `memIx`: `narrowed`, a box receiver narrowed to one
+// variant (`emitNarrowedMem`); `variant` or `nulVariant`, a bare or nullable variant receiver;
+// `shared`, the shared-field dispatch and the struct read under it, and any non-member node.
+export type MemReadArm = "narrowed" | "variant" | "nulVariant" | "shared"
+
+// The arm `emitMem` and the IR's member reads take for `memIx`, in `emitMem`'s order.
+export function memReadArmOf(memIx: i32, fnIx: i32): MemReadArm {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return "shared" }
+  if memNarrowVariantIndex(memIx, fnIx) >= 0 && exprUnion(m.memObj, fnIx) {
+    return "narrowed"
+  }
+  if exprVariantIndex(m.memObj, fnIx) >= 0 { return "variant" }
+  return if nulVariantIdxOfExpr(m.memObj, fnIx) >= 0 { "nulVariant" } else { "shared" }
+}
+
 // The variant field `emitExpr` reads off a narrowed box local in `emitNarrowedMem`'s plain form,
 // or -1: no null-unit or niche read, no `length`, a box receiver read raw, and no union-box field
 // to unbox.
 export function narrowedFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
-  if !(nodeAt(m.memObj) is Ident) || !exprUnion(m.memObj, fnIx) { return -1 }
+  if !(nodeAt(m.memObj) is Ident) || memReadArmOf(memIx, fnIx) != "narrowed" {
+    return -1
+  }
   const vi = memNarrowVariantIndex(memIx, fnIx)
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const idx = variantFieldIndex(vi, m.memProp)
@@ -1923,7 +1940,11 @@ function holeBox(arm: HoleBoxArm, kind: i32, src: i32): HoleBox {
 export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const ladder = holeBox("ladder", -1, -1)
   const ur = repNodeAt(repNodeOfTy(unionTy))
-  if !(ur is RNullable) || ur.rnDisc != 4 || mapTwinUnionMember(unionTy) >= 0 {
+  // A non-null value union's box and a boxed `T | null` share the box's tag and payload.
+  if (
+    !(ur is RBox || ur is RNullable && ur.rnDisc == 4)
+    || mapTwinUnionMember(unionTy) >= 0
+  ) {
     return ladder
   }
   if boxDstName("", unionTy) == "" || unionArmTagClash(unionTy) != "" {
@@ -3001,11 +3022,9 @@ export function lengthIsField(m: Member, memIx: i32, fnIx: i32): boolean {
 export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
-  if memNarrowVariantIndex(memIx, fnIx) >= 0 && exprUnion(m.memObj, fnIx) {
-    return -1
-  }
+  if memReadArmOf(memIx, fnIx) != "variant" { return -1 }
   const vi = exprVariantIndex(m.memObj, fnIx)
-  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  if vi >= uFieldStart.length { return -1 }
   const idx = variantFieldIndex(vi, m.memProp)
   if idx < 0 { return -1 }
   if fieldRowIsUnionBox(uFieldStart[vi] + idx) { return idx }
@@ -3029,13 +3048,7 @@ export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) || !sDeclared { return -1 }
   const o = m.memObj
-  if (
-    exprUnion(o, fnIx)
-    || exprVariantIndex(o, fnIx) >= 0
-    || nulVariantIdxOfExpr(o, fnIx) >= 0
-  ) {
-    return -1
-  }
+  if memReadArmOf(memIx, fnIx) != "shared" || exprUnion(o, fnIx) { return -1 }
   if nodeTyAt(o, fnIx) == TY_NEVER || exprNullableStruct(o, fnIx) { return -1 }
   const si = structIndexOfExpr(o, fnIx)
   if si < 0 || si >= sHeapIdx.length { return -1 }
