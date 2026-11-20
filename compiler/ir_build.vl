@@ -48,6 +48,7 @@ import {
   IrFamily,
   IrFn,
   IrNode,
+  MapProbe,
   OImm,
   OStr,
   OVar,
@@ -2882,7 +2883,7 @@ function coalPopOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
   irBNode(
     b,
-    { cbL: l, cbArm: "popOr", cbNull: nb, cbOut: t, cbAt: ix },
+    { cbL: l, cbArm: "popOr", cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
     ty,
     rep,
     ix,
@@ -2955,7 +2956,7 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
   irBNode(
     b,
-    { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix },
+    { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
     ty,
     rep,
     ix,
@@ -3027,34 +3028,81 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(rp == "i32" || arm == "i32" && rp == "bool" || mv) {
     return irBMiss("map read rep")
   }
+  // A default the miss arm writes as a body leaves the read's value on the stack from here.
+  const clear = !endsInTemp(b)
   const g = mapGlobalOf(rd.idxArr)
   const loc = mapRecvLoc(b, rd.idxArr, g, "map read receiver")
   if ibMiss != "" { return loc }
   const kat = b.length
   const k = irBExpr(b, rd.idxIndex)
   if ibMiss != "" { return k }
-  // The default is written in the miss arm, so it may compute nothing ahead of the read.
-  const at = b.length
-  const dv: Opnd = if inline { irBExpr(b, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
+  // The default is written in the miss arm: in place there, or as the body a fused read's arm holds.
+  const db: i32[] = []
+  const dv: Opnd = if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
-  if !defaultSelfContained(b, at, dv) {
-    return irBMiss("map read default computes")
-  }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
   if mapRecvReassigned(b, kat, loc) {
     return irBMiss("map receiver reassigned")
   }
   const sid = sidOfNode(rd.idxArr)
+  const nonNull = g >= 0 && globalReadRecovers(sid, rd.idxArr, ibFnIx)
+  const form = if mv { 2 } else if inline { 1 } else { 0 }
+  if !defaultSelfContained(db, 0, dv) {
+    if !clear { return irBMiss("map read default after an operand") }
+    return mapGetOrBox(
+      b,
+      db,
+      dv,
+      ix,
+      rep,
+      { prSym: g, prNonNull: nonNull, prKey: k, prForm: form },
+      loc,
+    )
+  }
+  for id in db { b.push(id) }
   const r: Rhs = {
     mgSym: g,
-    mgNonNull: g >= 0 && globalReadRecovers(sid, rd.idxArr, ibFnIx),
+    mgNonNull: nonNull,
     mgLoc: loc,
     mgKey: k,
     mgAt: ix,
-    mgForm: if mv { 2 } else if inline { 1 } else { 0 },
+    mgForm: form,
     mgDef: dv,
   }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// A map read whose default computes, as `SCoalBox`'s fused map-read arm: the probe's shared head
+// and tail around the default body `db`, which writes the slotless out on the miss path.
+function mapGetOrBox(
+  b: i32[],
+  db: i32[],
+  dv: Opnd,
+  ix: i32,
+  rep: i32,
+  mp: MapProbe,
+  loc: Opnd,
+): Opnd {
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  irBNode(db, { asDst: t, asSrc: dv }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    {
+      cbL: loc,
+      cbArm: "mapIndexGetOr",
+      cbNull: db,
+      cbOut: t,
+      cbAt: ix,
+      cbMap: mp,
+    },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // Whether operand `o`, built into `b` from `at` on, computes nothing ahead of its use: a variable or
