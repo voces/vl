@@ -50,14 +50,14 @@ Fixpoint seeds: merge-base c34a60bfd against this branch.
 
 | | merge-base | this branch |
 |---|---:|---:|
-| corpus + cases covered = matched functions | 93,025 | 93,420 (+395) |
+| corpus + cases matched functions | 93,025 | 93,446 (+421) |
 | start bodies matched | 10,281 | 10,347 (+66) |
-| door literals matched | 33,193 | 35,688 (+2,495) |
-| door `fragment rep` | 618 | 6 |
-| door `array union element rep` | 900 | 2 |
-| door `array element coercion` | 984 | 108 |
+| door literals matched | 33,193 | 35,686 (+2,493) |
+| door `fragment rep` | 618 | 34 |
+| door `array union element rep` | 900 | 0 |
+| door `array element coercion` | 984 | 84 |
 | door `rep null` | 181 | 1 |
-| self-compile covered = matched | 18,410 | 18,425 (+15) |
+| self-compile covered = matched | 18,411 | 18,426 (+15) |
 | self-compile door matched | 13,584 | 13,625 (+41) |
 
 No row reads `fail`, `differ` or a verifier miss that the merge-base lacks.
@@ -66,8 +66,9 @@ No row reads `fail`, `differ` or a verifier miss that the merge-base lacks.
 |---|---|
 | `ir-identity.sh --names` | identical 9,037, differ 0; self-compile identical |
 | `--cases` | identical 7,520, differ 0; witnesses same 59, differ 0 |
-| mode 3 | identical; claimed 18,425 (merge-base 18,409) |
-| L2 fuel | +0.019% on the merge-base (103,435,399,528 vs 103,415,721,516) |
+| master-vs-head A/B, 7,588 tests/cases and probes (covers `arrLitBuild`, now legacy code shared by both) | built 7,520, differ 0 |
+| mode 3 | identical; claimed 18,426 (merge-base 18,409) |
+| L2 fuel | +0.044% on the merge-base (103,461,367,527 vs 103,415,721,516) |
 | `gate.sh --fast` | passed |
 
 **Controls** (`tests/vl_ir_door_guard_test.ts`):
@@ -76,4 +77,4 @@ No row reads `fail`, `differ` or a verifier miss that the merge-base lacks.
 
 Each fails on the merge-base seed with `fragment rep`.
 
-**Lines: compiler +24 / −6, tests +32.**
+**Lines: compiler +54 / −17, tests +32.**

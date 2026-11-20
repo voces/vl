@@ -4,5 +4,5 @@
   type legacy builds it at (`arrLitBuildTyOf`), not at the literal's own stamp. A generic
   instance's literal is therefore the instance's list, a literal whose destinations agree on
   another list is that list, and a sub-word list's elements verify as the plain i32s its backing
-  truncates. That covers 395 more corpus functions and 15 more in the self-compile. No emitted
+  truncates. That covers 421 more corpus functions and 15 more in the self-compile. No emitted
   byte moves.
