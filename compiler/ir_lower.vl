@@ -75,6 +75,7 @@ import {
   readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
+import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { declaredSlotOfDecl } from "./emit_struct_order"
@@ -108,6 +109,7 @@ import {
   RListPop,
   RListPush,
   RListSlice,
+  RListStage,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -767,6 +769,7 @@ function rhs(r: Rhs, tail: boolean) {
     }
     RListGet | RListLen | RListPush | RListPop | RListEq | RStrOp | RMapFilter | RListSlice => irLowerListHook(r)
     RListClear => irLMiss("clear value")
+    RListStage => irLMiss("receiver stage value")
     RNumWiden => {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
@@ -1190,11 +1193,18 @@ function getField(r: RGetField) {
   irLOpnd(r.gfV)
   // A member record read the box plan passes as its field's box is lowered at its storage, as
   // the builder built it (`memberBoxTemp`).
-  if !memberBoxReadAt(r.gfAt, lw.irAt) { return fieldTail(r.gfAt, m) }
-  const marks = memberBoxReadEnter(r.gfAt)
-  const rc = fieldTail(r.gfAt, m)
-  memberBoxReadLeave(marks)
-  return rc
+  if memberBoxReadAt(r.gfAt, lw.irAt) {
+    const marks = memberBoxReadEnter(r.gfAt)
+    const rc = fieldTail(r.gfAt, m)
+    memberBoxReadLeave(marks)
+    return rc
+  }
+  // A read the builder built at its storage (an `is` receiver's) is lowered at it too.
+  if !r.gfStored { return fieldTail(r.gfAt, m) }
+  const mark = storageReadEnter(r.gfAt)
+  const rs = fieldTail(r.gfAt, m)
+  storageReadLeave(mark)
+  return rs
 }
 
 // The plain field index member read `at` reads, or -1.
@@ -2094,7 +2104,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if !t && r.crDrop { fbDrop() }
         return 0
       }
-      if r is RListPush || r is RListPop || r is RListClear || r is RStrOp {
+      if (
+        r is RListPush
+        || r is RListStage
+        || r is RListPop
+        || r is RListClear
+        || r is RStrOp
+      ) {
         irLowerEffectHook(r)
         irLSettle(pending)
         return 0

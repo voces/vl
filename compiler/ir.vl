@@ -109,7 +109,9 @@ export type RMakeRec = {
   mrRow: i32,
   mrVariant: boolean,
 }
-export type RGetField = { gfV: Opnd, gfIx: i32, gfAt: i32 }
+// A field read at node `gfAt`, kid `gfIx` of `gfV`'s record; `gfStored` where the builder built it
+// at its storage (an `is` receiver's), so it is lowered under the same mark.
+export type RGetField = { gfV: Opnd, gfIx: i32, gfAt: i32, gfStored: boolean }
 // A list literal at node `mlAt` of elements `mlElems`, built under the list build (`mlKind`,
 // `mlSlot`) its delivery threaded, by legacy's short tail.
 export type RMakeList = { mlElems: Opnd[], mlKind: i32, mlSlot: i32, mlAt: i32 }
@@ -162,8 +164,15 @@ export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
 // The `==` (or `!=`) of two lists at compare node `qeAt`, written by legacy's list compare
 // (`listEqTail`) after each operand's own recovery (`listEqOperandTail`).
 export type RListEq = { qeL: Opnd, qeR: Opnd, qeAt: i32 }
+// A push's receiver already staged by the `RListStage` statement at node `pstNode`.
+export type PStaged = { pstNode: i32 }
+// A push's receiver: an operand it reads, or the stage that holds it.
+export type PushRecv = OVar | OImm | OStr | PStaged
 // A one-argument `.push` of `lpX` onto list `lpV`, its call `lpAt`; as a value, the new length.
-export type RListPush = { lpV: Opnd, lpX: Opnd, lpAt: i32 }
+export type RListPush = { lpV: PushRecv, lpX: Opnd, lpAt: i32 }
+// The receiver `rsgV` of push call `rsgAt`, staged into that push's frame slot ahead of a value
+// that writes a valued `if`; a statement, named by exactly one later push.
+export type RListStage = { rsgV: Opnd, rsgAt: i32 }
 // A `.pop()` statement on list `lqV`, its call `lqAt`: the element is taken and dropped, and an
 // empty list is left as it is. A statement only: as a value a pop is `T | null`.
 export type RListPop = { lqV: Opnd, lqAt: i32 }
@@ -260,7 +269,7 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
 export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf
-  | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
+  | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListGet | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
   | RMapGetOr | RMapGet | RMapHas | RPrint | RStrOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RTagStash | RTagIs
   | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage
 
@@ -596,6 +605,62 @@ function mapRecvText(sym: i32, loc: Opnd): string {
   return opndText(loc)
 }
 
+// Pushes the bodies node `id` holds onto the walk, last first, so they are walked in order.
+export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
+  if id < 0 || id >= f.irNodes.length { return 0 }
+  const n = f.irNodes[id]
+  match n {
+    SBlock => {
+      bodies.push(n.bkBody)
+      pos.push(0)
+    }
+    SLoop => {
+      bodies.push(n.lpBody)
+      pos.push(0)
+    }
+    SForIn => {
+      bodies.push(n.xfBody)
+      pos.push(0)
+    }
+    SIf => {
+      bodies.push(n.siElse)
+      pos.push(0)
+      bodies.push(n.siThen)
+      pos.push(0)
+    }
+    SCoalBox => {
+      bodies.push(n.cbNull)
+      pos.push(0)
+    }
+    SSwitch => {
+      let k = n.swArms.length - 1
+      while k >= 0 {
+        bodies.push(n.swArms[k].swBody)
+        pos.push(0)
+        k = k - 1
+      }
+    }
+    SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBr | SReturn | STrap | SDrop | SRawOp => {}
+  }
+  return 0
+}
+
+// A push's operands: its value, and its receiver unless a stage holds it.
+function pushOpnds(r: RListPush): Opnd[] {
+  const v = r.lpV
+  return match v {
+    PStaged => [r.lpX]
+    OVar | OImm | OStr => [v, r.lpX]
+  }
+}
+
+function pushRecvText(v: PushRecv): string {
+  return match v {
+    PStaged => "staged@" + i32ToStr(v.pstNode)
+    OVar | OImm | OStr => opndText(v)
+  }
+}
+
 function opndText(o: Opnd): string {
   return match o {
     OVar => "v" + i32ToStr(o.ov)
@@ -650,7 +715,8 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListCopy => r.lcArgs
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
-    RListPush => [r.lpV, r.lpX]
+    RListPush => pushOpnds(r)
+    RListStage => [r.rsgV]
     RListPop => [r.lqV]
     RListClear => [r.lkV]
     RMapFilter => [r.hfV, r.hfC]
@@ -720,7 +786,8 @@ function rhsText(r: Rhs): string {
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
-    RListPush => "push " + opndText(r.lpV) + " " + opndText(r.lpX)
+    RListPush => "push " + pushRecvText(r.lpV) + " " + opndText(r.lpX)
+    RListStage => "stage_recv " + opndText(r.rsgV)
     RListPop => "pop " + opndText(r.lqV)
     RListClear => "clear " + opndText(r.lkV)
     RMapFilter => "mapfilter " + opndText(r.hfV) + ", " + opndText(r.hfC)
@@ -938,7 +1005,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RPrimOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RRecover | RTagStash | RTagIs => "scalar"
     RCall | RPrint => "call"
     RGlobalGet => "global"
-    RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RListEq | RStrOp | RMakeList | RSpread => "list"
+    RListGet | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RListEq | RStrOp | RMakeList | RSpread => "list"
     RMapGetOr | RMapGet | RMapHas | RMapNew | RMapSet | RMapOp => "map"
     RTest | RBoxField | RSharedRead | RBoxNarrow => "box"
     RGetField | RMakeRec => "record"
