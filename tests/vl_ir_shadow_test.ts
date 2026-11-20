@@ -727,6 +727,37 @@ print(h(true))
   },
 });
 
+// A fused `xs.pop() ?? d` on a held, a staged (global), a staged (field) and an f64 receiver, with
+// a variable default, and a default that reassigns the receiver: legacy's shared open, then its
+// default in the empty arm, every function matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a fused pop with a default is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let g: i32[] = [1, 2]
+function a(xs: i32[]): i32 { return xs.pop() ?? -1 }
+function b(): i32 { return g.pop() ?? 0 }
+function c(xs: f64[]): f64 { return xs.pop() ?? 0.5 }
+function d(xs: i32[], k: i32): i32 { return xs.pop() ?? k }
+type Box = { xs: i32[] }
+function f(o: Box): i32 { return o.xs.pop() ?? 0 }
+function e(p: i32): i32 {
+  let xs: i32[] = []
+  const other: i32[] = [7, 8, 9]
+  const v = xs.pop() ?? (xs = other).length
+  return v * 10 + xs.length
+}
+print(a([3]) + b() + d([], 6) + e(1) + f({ xs: [4] }))
+print(c([]))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -1059,7 +1090,9 @@ Deno.test({
     // case 9 stores an i32 into a bool global (rule 2).
     // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
     // case 11 a box whose immediate stands for a call (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2];
+    // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
+    // (rule 2), and a default that leaves the out unwritten (rule 5).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
@@ -1223,6 +1256,39 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (rows.has("uncovered open local type")) {
       throw new Error(`want no open-local miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A generic function used as a value inside a returned record is typed at its open function type,
+// but legacy writes the member's id there as an `i32.const`: the leaf builds at `i32` and every
+// function matches. The program is distilled cell d15119_fw_ret_two_fn.
+const TAG_LEAF_OPEN = `function id0(a) { return a }
+function id1(a) { return a }
+function mk() { return { f: id1 } }
+function run() {
+  const r = mk()
+  r.f = id0
+  const g = r.f
+  print(g(2))
+  print(g(2.5))
+}
+run()
+`;
+Deno.test({
+  name: "ir shadow: a tag leaf at an open function type builds at the set's id and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAG_LEAF_OPEN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered tag leaf rep")) {
+      throw new Error(`want no tag-leaf-rep miss, got ${JSON.stringify([...rows])}`);
     }
     const covered = rows.get("covered") ?? 0;
     if (covered === 0 || rows.get("fns") !== covered || (rows.get("matched") ?? 0) !== covered) {
