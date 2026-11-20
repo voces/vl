@@ -265,6 +265,7 @@ import {
   nameIsMemLoadIntrinsic,
   nameIsMemStoreIntrinsic,
   nameIsSimdIntrinsic,
+  simdOperandPrim,
   simdRow,
   simdRowLaneMax,
   simdRowOp,
@@ -25081,20 +25082,14 @@ function simdLaneImm(argIx: i32, max: i32): i32 {
 }
 
 // The SIMD lowering (`simd-design.md` §D6): push the row's operands in order, each at the width
-// its operand shape names, then write the one
-// 0xFD-prefix instruction with the row's immediates. Lane and shuffle indices are the literals
-// the checker pinned; a drift between the two is a loud emit failure, never a wrong byte.
+// `simdOperandPrim` names, then `simdTail`'s one 0xFD-prefix instruction. A load or store takes
+// its address through `emitMemAddr` instead.
 function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
   const row = simdRow(name)
   if row < 0 {
     return emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
   }
-  const op = simdRowOp(row)
   const sig = simdRowSig(row)
-  const args = c.callArgs
-  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
-    return emitSimdShuffle(c, name, fnIx, sig, simdRowLaneMax(row))
-  }
   if sig == SIMD_SIG_LOAD || sig == SIMD_SIG_STORE {
     let base = 1
     if sig == SIMD_SIG_STORE { base = 2 }
@@ -25103,52 +25098,56 @@ function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
     if sig == SIMD_SIG_STORE {
       if emitExpr(memCallArg(c, base, 1), fnIx) < 0 { return -1 }
     }
-    fbSimdMem(op, off)
+    fbSimdMem(simdRowOp(row), off)
     return 0
   }
-  if sig == SIMD_SIG_I_V {
-    if emitExpr(args[0], fnIx) < 0 { return -1 }
+  let i = 0
+  while i < c.callArgs.length {
+    const p = simdOperandPrim(sig, i)
+    let rc = 0
+    if p == "i64" { rc = emitExprAsKind(c.callArgs[i], 3, fnIx) }
+    else if p == "f32" { rc = emitWidened(c.callArgs[i], 5, fnIx) }
+    else if p != "" { rc = emitExpr(c.callArgs[i], fnIx) }
+    if rc < 0 { return -1 }
+    i = i + 1
+  }
+  return simdTail(c, name, row)
+}
+
+// Whether call `c` is a SIMD intrinsic: the spelling, with no binding owning the name. Legacy's
+// `emitCallCore` and the IR's builder route on it.
+export function simdCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || !nameIsSimdIntrinsic(f.identName) { return false }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// After a non-memory SIMD row's operands: its instruction, with the lane or shuffle immediates
+// the checker pinned. A drift between the two is a loud emit failure, never a wrong byte.
+export function simdTail(c: Call, name: string, row: i32): i32 {
+  const op = simdRowOp(row)
+  const sig = simdRowSig(row)
+  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
+    return simdShuffleTail(c, name, sig, simdRowLaneMax(row))
+  }
+  if (
+    sig == SIMD_SIG_V_V
+    || sig == SIMD_SIG_V_I
+    || sig == SIMD_SIG_VV_V
+    || sig == SIMD_SIG_VVV_V
+    || sig == SIMD_SIG_VI_V
+    || sig == SIMD_SIG_I_V
+    || sig == SIMD_SIG_L_V
+    || sig == SIMD_SIG_F_V
+  ) {
     return fbSimdOp(op)
   }
-  if sig == SIMD_SIG_L_V {
-    if emitExprAsKind(args[0], 3, fnIx) < 0 { return -1 }
-    return fbSimdOp(op)
-  }
-  if sig == SIMD_SIG_F_V {
-    if emitWidened(args[0], 5, fnIx) < 0 { return -1 }
-    return fbSimdOp(op)
-  }
-  if emitExpr(args[0], fnIx) < 0 { return -1 }
-  if sig == SIMD_SIG_V_V || sig == SIMD_SIG_V_I { return fbSimdOp(op) }
-  if sig == SIMD_SIG_VV_V || sig == SIMD_SIG_VVV_V {
-    if emitExpr(args[1], fnIx) < 0 { return -1 }
-    if sig == SIMD_SIG_VVV_V {
-      if emitExpr(args[2], fnIx) < 0 { return -1 }
-    }
-    return fbSimdOp(op)
-  }
-  if sig == SIMD_SIG_VI_V {
-    if emitExpr(args[1], fnIx) < 0 { return -1 }
-    return fbSimdOp(op)
-  }
-  const max = simdRowLaneMax(row)
-  const lane = simdLaneImm(args[1], max)
-  if lane < 0 {
-    return emitFail(
-      "emitProgram: "
-        + name
-        + " lane index is not a compile-time literal in 0.."
-        + i32ToStr(max),
-    )
-  }
-  if sig == SIMD_SIG_REPL_I {
-    if emitExpr(args[2], fnIx) < 0 { return -1 }
-  } else if sig == SIMD_SIG_REPL_L {
-    if emitExprAsKind(args[2], 3, fnIx) < 0 { return -1 }
-  } else if sig == SIMD_SIG_REPL_F {
-    if emitWidened(args[2], 5, fnIx) < 0 { return -1 }
-  } else if (
-    sig != SIMD_SIG_LANE_I
+  if (
+    sig != SIMD_SIG_REPL_I
+    && sig != SIMD_SIG_REPL_L
+    && sig != SIMD_SIG_REPL_F
+    && sig != SIMD_SIG_LANE_I
     && sig != SIMD_SIG_LANE_L
     && sig != SIMD_SIG_LANE_F
   ) {
@@ -25158,31 +25157,34 @@ function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
         + "' has an operand shape with no lowering",
     )
   }
+  const max = simdRowLaneMax(row)
+  const lane = if c.callArgs.length > 1 { simdLaneImm(c.callArgs[1], max) } else { -1 }
+  if lane < 0 { return simdLaneFail(name, max) }
   fbSimdLane(op, lane)
   return 0
 }
 
-// `i8x16.shuffle` over two vectors: sixteen byte-lane immediates, each in 0..31. The 16-lane
+function simdLaneFail(name: string, max: i32): i32 {
+  return emitFail(
+    "emitProgram: "
+      + name
+      + " lane index is not a compile-time literal in 0.."
+      + i32ToStr(max),
+  )
+}
+
+// `i8x16.shuffle` after its two vectors: sixteen byte-lane immediates, each in 0..31. The 16-lane
 // form writes its literals as given; the 4-lane form (`__shuffle_f32x4__`) picks 32-bit lanes
 // in 0..7 and writes each one's four bytes.
-function emitSimdShuffle(c: Call, name: string, fnIx: i32, sig: i32, max: i32) {
+function simdShuffleTail(c: Call, name: string, sig: i32, max: i32): i32 {
   const lanes: i32[] = []
   let si = 2
   while si < c.callArgs.length {
     const l = simdLaneImm(c.callArgs[si], max)
-    if l < 0 {
-      return emitFail(
-        "emitProgram: "
-          + name
-          + " lane index is not a compile-time literal in 0.."
-          + i32ToStr(max),
-      )
-    }
+    if l < 0 { return simdLaneFail(name, max) }
     lanes.push(l)
     si = si + 1
   }
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
   wU8(OP_SIMD_PREFIX)
   wULEB(SIMD_I8X16_SHUFFLE)
   let i = 0
@@ -26273,7 +26275,7 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
   // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
   // Dispatched by name like the memory intrinsics above it.
-  if !userBindsName && nameIsSimdIntrinsic(callee.identName) {
+  if simdCallNamed(c, fnIx) {
     return emitSimdIntrinsic(c, callee.identName, fnIx)
   }
   // The threads-proposal atomics (`simd-design.md` §G1), the 0xFE-prefix family.
