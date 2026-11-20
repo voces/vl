@@ -20,11 +20,14 @@ Fixpoint seeds, `deno test --v8-flags=--stack-size=N`, the labelled-while case (
 
 ## Fix
 
-`body` is the single walk again. `fragmentBody` sets a one-shot module flag, `bodyTopKeep`, for
-the one `body` call it makes. That call reads the flag and clears it on entry, so a nested walk
-never sees it. It skips the consumed check on its own top frame and leaves the temps in
-`bodyTopKept` for the fragment's value. The flag is ambient state, chosen so that the recursion
-pays no extra frame per level. The test's 600 levels is unchanged.
+`body` is the single walk again, now `body(b, tail, out, keepTop): i32[]`. It returns its top
+frame's stack temps, which it requires consumed unless `keepTop` is set. `fragmentBody` is the one
+caller that passes `true`, and reads the temps back for the fragment's value. A parameter costs no
+frame, and the threshold is the same as before #9241.
+
+**Guard** (`tests/vl_deep_nesting_test.ts`, linux): the labelled-loop case re-runs in a child
+`deno` under a 940 KB stack, about 5% below V8's default. #9241's seed fails it, and this branch
+passes it. The test's 600 levels is unchanged.
 
 ## Measured
 

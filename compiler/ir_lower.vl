@@ -1144,7 +1144,7 @@ function forIn(n: SForIn, pending: i32[]) {
       forInCopyOpen(s, c, k)
       const kc = walkFrames(n, d0)
       tempMarksRestore(marks)
-      body(n.xfBody, false, -1)
+      body(n.xfBody, false, -1, false)
       framesPop(kc)
       forInCopyClose(c)
       k = k + 1
@@ -1157,7 +1157,7 @@ function forIn(n: SForIn, pending: i32[]) {
   if seq == -2 { return irLMiss("walk loop") }
   const kr = walkFrames(n, d0)
   tempMarksRestore(marks)
-  body(n.xfBody, false, -1)
+  body(n.xfBody, false, -1, false)
   framesPop(kr)
   framesPop(kb)
   forInLoopClose(s, lp, seq)
@@ -1560,18 +1560,12 @@ function callTemp(o: Opnd): i32 {
   }
 }
 
-// Set by `fragmentBody` for the one `body` call it makes: that call leaves its top frame's stack
-// temps in `bodyTopKept` for the fragment's value instead of requiring them consumed. A flag, not
-// a parameter or wrapper, so a nested walk pays no extra frame per level.
-let bodyTopKeep = false
-let bodyTopKept: i32[] = []
-
 // Writes body `b`; `tail` when its last node ends a void function, and `out` the slotless
 // variable its valued `if`'s arm ends by writing (-1 for none). An `if` opens a frame for its
 // `else` and closes when that frame does, so an `else if` chain's length costs no stack (D1990).
-function body(b0: i32[], tail0: boolean, out0: i32) {
-  const keep = bodyTopKeep
-  bodyTopKeep = false
+// Returns the top frame's stack temps, which must be consumed unless `keepTop` (a fragment's
+// value reads them); one walk, not a wrapper, so a nested body costs one frame per level.
+function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
   const p0: i32[] = []
   const fb: i32[][] = [b0]
   const fi: i32[] = [0]
@@ -1615,7 +1609,7 @@ function body(b0: i32[], tail0: boolean, out0: i32) {
       fi[top] = i + 1
       continue
     }
-    if lwMiss == "" && pending.length > 0 && !(keep && top == 0) {
+    if lwMiss == "" && pending.length > 0 && !(keepTop && top == 0) {
       irLMiss("non-stack temp: unconsumed")
     }
     const ifId = fif[top]
@@ -1633,8 +1627,7 @@ function body(b0: i32[], tail0: boolean, out0: i32) {
       fi[top - 1] = fi[top - 1] + 1
     }
   }
-  if keep { bodyTopKept = p0 }
-  return 0
+  return p0
 }
 
 // Whether node `i` of `b` is a void call a valueless `return` follows, so the call returns.
@@ -1745,7 +1738,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if hoists < 0 { return irLMiss("loop hoist prologue") }
       fbBlock(64)
       lwFrames.push(n.bkLabel)
-      body(n.bkBody, false, -1)
+      body(n.bkBody, false, -1, false)
       lwFrames.pop()
       fbEnd()
       irLoopCloseHook(hoists)
@@ -1754,7 +1747,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLSettle(pending)
       fbLoop(64)
       lwFrames.push(n.lpLabel)
-      body(n.lpBody, false, -1)
+      body(n.lpBody, false, -1, false)
       lwFrames.pop()
       fbEnd()
     }
@@ -1822,7 +1815,7 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   const litTrue = isTrue(n.siCond) && testIsLitTrue(lw.irNodeAt[id])
   if litTrue && (exitBr || n.siElse.length == 0 && !n.siElseKw) {
     irLSettle(pending)
-    if !exitBr { body(n.siThen, tail, -1) }
+    if !exitBr { body(n.siThen, tail, -1, false) }
     return IF_DONE
   }
   // A helper's `if c { br L }` is the hand-written bodies' `br_if`.
@@ -1860,7 +1853,7 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   }
   fbIf(64)
   lwFrames.push(-1)
-  body(n.siThen, tail, -1)
+  body(n.siThen, tail, -1, false)
   if n.siElse.length > 0 || n.siElseKw {
     fbElse()
     return IF_ELSE
@@ -2010,7 +2003,7 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     fbIf(vt)
   }
   lwFrames.push(-1)
-  body(n.siThen, false, t)
+  body(n.siThen, false, t, false)
   fbElse()
   return IF_VALUED
 }
@@ -2047,7 +2040,7 @@ function coalBoxArm(
   cond(n.cbL, pending)
   if coalBoxOpen(arm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
   lwFrames.push(-1)
-  body(n.cbNull, false, n.cbOut)
+  body(n.cbNull, false, n.cbOut, false)
   if coalBoxElse(arm, slot, e, lhsIx, n.cbAt, fnIx) < 0 { return -1 }
   const reread = match arm {
     "valBox" | "valScalar" => true
@@ -2078,7 +2071,7 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   irLSettle(pending)
   popOrOpen(p, lIdx)
   lwFrames.push(-1)
-  body(n.cbNull, false, n.cbOut)
+  body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
   fbEnd()
   return 0
@@ -2113,7 +2106,7 @@ function valuedBlock(n: SBlock, pending: i32[]) {
   irLSettle(pending)
   fbBlock(vt)
   lwFrames.push(n.bkLabel)
-  body(n.bkBody, false, t)
+  body(n.bkBody, false, t, false)
   lwFrames.pop()
   fbEnd()
   livePush(t)
@@ -2303,7 +2296,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && f.irAt >= 0, -1)
+  body(f.irBody, !valued && f.irAt >= 0, -1, false)
   const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
   const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
   if pad == "null" {
@@ -2484,10 +2477,7 @@ export function irLowerFragment(
 // Writes fragment body `b`, then its value `out`, which consumes what the body left pending as a
 // `return`'s value does.
 function fragmentBody(b: i32[], out: Opnd) {
-  bodyTopKeep = true
-  body(b, false, -1)
-  const pending = bodyTopKept
-  bodyTopKept = []
+  const pending = body(b, false, -1, true)
   if lwMiss != "" { return 0 }
   cond(out, pending)
   if pending.length > 0 { irLMiss("non-stack temp: unconsumed") }
