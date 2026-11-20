@@ -2523,3 +2523,53 @@ if u is A { print(u.s) }
     }
   },
 });
+
+// A nullable record field stores its value at the field's rep where `emitArmDelivery` owes no
+// unbox: a nullable parameter and a narrowed local. An arm narrowed out of a union arrives boxed,
+// and its unbox is a named miss.
+Deno.test({
+  name: "ir shadow: a field store's nullable record matches, and an owed arm unbox is a named miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type Pt = { x: f64, y: f64 }
+type Holder = { p: Pt | null, n: i32 }
+type O = { n: i32, next: O | null }
+type P = { m: i32 }
+type U = O | P
+type Q = { o: O | null }
+function setP(h: Holder, p: Pt | null) { h.p = p }
+function setNarrow(h: Holder, p: Pt | null) {
+  if p != null { h.p = p }
+}
+function setBoxed(h: Holder, u: Pt | i32) {
+  if u is Pt { h.p = u }
+}
+function setO(q: Q, x: O | null) { q.o = x }
+function setArm(q: Q, u: U) {
+  if u is O { q.o = u }
+}
+const h: Holder = { p: null, n: 0 }
+setP(h, { x: 1.5, y: 2.5 })
+print(h.p?.y ?? 0.0)
+setNarrow(h, { x: 3.5, y: 0.0 })
+print(h.p?.x ?? 0.0)
+setBoxed(h, { x: 4.5, y: 0.0 })
+print(h.p?.x ?? 0.0)
+const q: Q = { o: null }
+const o1: O = { n: 2, next: null }
+setO(q, o1)
+print(q.o?.n ?? 0)
+setArm(q, { n: 5, next: null })
+print(q.o?.n ?? 0)
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want setP, setNarrow and setO covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered field store arm unbox") ?? 0) !== 2) {
+      throw new Error(`want setBoxed and setArm a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
