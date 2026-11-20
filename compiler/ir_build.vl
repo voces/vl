@@ -415,8 +415,6 @@ import { spreadSlotIdOf } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
-// The read node a delivery is building, which may read at an atom cell's rep (`narrowedLocalRead`).
-let ibCellSeat = -1
 let ibDetail = false
 let ibCorrupt = 0
 let ibRowKey: string[] = []
@@ -1085,7 +1083,9 @@ export function irBDeclVar(d: i32): i32 {
   }
   // Legacy's cell for a binding it holds as the atom is the id, whatever its type's own rep.
   if (
-    nodeAt(d) is LetDecl
+    d >= 0
+    && d < P.nodes.length
+    && nodeAt(d) is LetDecl
     && letBindIsAtom(d, ibFnIx)
     && !(repNodeAt(rep) is RAtom || atomNullable(rep))
   ) {
@@ -1523,7 +1523,7 @@ function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
   return w
 }
 
-function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
+function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
@@ -1535,7 +1535,9 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
     const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
-    if ib.irVars[v].vRep != rep { return narrowedLocalRead(b, n, ix, v, rep) }
+    if ib.irVars[v].vRep != rep {
+      return narrowedLocalRead(b, n, ix, v, rep, cell)
+    }
     ib.irReadVar[ix] = v
     const o: Opnd = { ov: v }
     return o
@@ -1567,13 +1569,14 @@ function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
 }
 
 // Local `v` read at `rep`, which its narrowing gives it, not its own: a box at the variant a
-// destination unboxes it to, or a nullable at its inner rep.
+// destination unboxes it to, or a nullable at its inner rep; `cell` as `exprAt` passes it.
 function narrowedLocalRead(
   b: i32[],
   n: Ident,
   ix: i32,
   v: i32,
   rep: i32,
+  cell: boolean,
 ): Opnd {
   const own = repNodeAt(ib.irVars[v].vRep)
   const o: Opnd = { ov: v }
@@ -1613,8 +1616,8 @@ function narrowedLocalRead(
   }
   // A read's operand rep is its cell's, which for an atom cell the checker types at a string (a
   // D1752 binding, or a narrowing to one member) differs from the node's. Only a delivery's seated
-  // read takes it: its atom arm decodes it, or the id passes to an atom destination.
-  if ix == ibCellSeat && atomAtStr(ib.irVars[v].vRep, rep) { return o }
+  // read (`cell`) takes it: its atom arm decodes it, or the id passes to an atom destination.
+  if cell && atomAtStr(ib.irVars[v].vRep, rep) { return o }
   return irBMiss("narrowed read")
 }
 
@@ -2632,11 +2635,7 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     return memberBoxTemp(b, ix, dst)
   }
   const at = b.length
-  const seat = ibCellSeat
-  ibCellSeat = unwrapParen(ix)
-  const built = irBExpr(b, ix)
-  ibCellSeat = seat
-  const v = widenTo(b, built, ix, dst, dstTy)
+  const v = widenTo(b, exprAt(b, ix, true), ix, dst, dstTy)
   if ibMiss == "" && boxLeadsAt(b, at) {
     ifBelowLead(b, at, "box of a valued if")
   }
@@ -3725,14 +3724,17 @@ function tagArm(b: i32[], a: i32, rep: i32): Opnd {
   return v
 }
 
-export function irBExpr(b: i32[], ix: i32): Opnd {
+export function irBExpr(b: i32[], ix: i32): Opnd { return exprAt(b, ix, false) }
+
+// The value of `ix`; `cell` where a delivery builds it, so a local read may take its cell's rep.
+function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const pre = exprPrePathWhy(ix, ibFnIx)
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
   if pre == "pre-path tag dispatch" { return tagDispatch(b, ix) }
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
-  if n is Paren { return irBExpr(b, n.parInner) }
+  if n is Paren { return exprAt(b, n.parInner, cell) }
   const rep = exprRepOf(ix)
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
@@ -3743,7 +3745,7 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
     const o: Opnd = { oiRep: rep, oiBits: bits }
     return o
   }
-  if n is Ident { return identRead(b, n, ix, rep) }
+  if n is Ident { return identRead(b, n, ix, rep, cell) }
   if n is Unary {
     if n.unOp != "-" && n.unOp != "!" { return irBMiss("unary " + n.unOp) }
     const uw = operandWhy(n.unArg)
@@ -3978,7 +3980,7 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   assignTo(b, n, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   const m = asgReReadEnter(ix)
-  const o = identRead(b, t, n.binLeft, rep)
+  const o = identRead(b, t, n.binLeft, rep, false)
   asgReReadLeave(m)
   return o
 }
