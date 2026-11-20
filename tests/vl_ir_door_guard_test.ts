@@ -376,6 +376,9 @@ print(w1("ab") + w2(bs) + w3(m) + w4([5, 6]) + w5([5, 6]) + w6([2, 3], [4, 5]))
     const bad = [...r.keys()].filter((k) => k.startsWith("node-in") && (k.includes("read of") || k.includes("differ")));
     if (bad.length > 0 || (r.get("node-in array: matched") ?? 0) < 7) {
       throw new Error(`want every loop-variable literal matched or a named miss, got ${show(r)}`);
+    }
+  },
+});
 
 // A literal past the operand cap whose elements are constants builds from one data segment, as
 // legacy's does; inside an operand under a live value as well. 10,001 elements, one past the cap.
