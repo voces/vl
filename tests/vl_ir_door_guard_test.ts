@@ -298,3 +298,35 @@ print(ys[0])
     }
   },
 });
+
+// A list literal builds at legacy's build type, which reads a type parameter at the instance:
+// `gt<f32>`'s `[1.5]` at `T[]` is an f32 list, where the literal's own stamp says f64.
+Deno.test({
+  name: "ir door: a generic instance's list literal builds at the instance's list",
+  ignore,
+  fn: () => {
+    const r = rows(`function gt<T>(xs: T[] | null) { return xs ?? [1.5] }
+print(gt<f32>(null)[0])
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 1 || off.length > 0) {
+      throw new Error(`want the instance's literal matched, got ${show(r)}`);
+    }
+  },
+});
+
+// A sub-word list's elements are plain i32s its backing truncates, as a `u8` list's are.
+Deno.test({
+  name: "ir door: a sub-word list literal's i32 elements verify and match",
+  ignore,
+  fn: () => {
+    const r = rows(`const c: i8[] = [-6, 7]
+const d: u16[] = [65000, 7]
+print(c[0] + d[0])
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 2 || off.length > 0) {
+      throw new Error(`want both sub-word literals matched, got ${show(r)}`);
+    }
+  },
+});
