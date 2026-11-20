@@ -7,7 +7,11 @@
 //           fragment matches legacy byte for byte under it.
 //   fires — a context it can read still misses, by name, until it becomes a door parameter.
 //
-// Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
+//   push  — the push receiver's strict cast is dropped at the door because the shared tails a
+//           fragment calls read the flag live; a whole-function push whose receiver unboxes a
+//           list arm misses instead (`recvReadsListPayload`), since its receiver is read earlier.
+//
+// Loads the real seed (`build/vl-compiler.wasm`); absent, the seed halves self-ignore.
 //
 // Run with:  deno test -A tests/vl_ir_door_guard_test.ts
 
@@ -79,11 +83,16 @@ const LOOP = `function walk(s: string): i32 {
 print(walk("ab"))
 `;
 
+// A push receiver read through a list literal: legacy casts its payload strictly here.
+const PUSH_CAST = `[[]][0].push(2.5)
+print(1)
+`;
+
 Deno.test({
   name: "ir door guard: a context the fragment cannot read leaves no row, and the fragment matches",
   ignore,
   fn: () => {
-    for (const [what, src] of [["held ancestor", HELD_ANCESTOR], ["build region", BUILD_REGION], ["loop", LOOP]]) {
+    for (const [what, src] of [["held ancestor", HELD_ANCESTOR], ["build region", BUILD_REGION], ["loop", LOOP], ["push cast", PUSH_CAST]]) {
       const r = rows(src);
       const live = [...r.keys()].filter((k) => k.startsWith("node-in context live"));
       if (live.length > 0) throw new Error(`${what}: want no live context, got ${show(r)}`);
@@ -97,7 +106,7 @@ Deno.test({
 });
 
 Deno.test({
-  name: "ir door guard: a staged receiver inside the fragment, and the push receiver cast, still miss",
+  name: "ir door guard: a staged receiver inside the fragment still misses",
   ignore,
   fn: () => {
     const staged = rows(`function f(): i32 { return 3 }
@@ -106,10 +115,6 @@ print(at(1))
 `);
     if ((staged.get("node-in context live: staged list get") ?? 0) < 1) {
       throw new Error(`want the staged receiver named, got ${show(staged)}`);
-    }
-    const cast = rows(`[[]][0].push(2.5)\nprint(1)\n`);
-    if ((cast.get("node-in context live: push receiver cast") ?? 0) < 1) {
-      throw new Error(`want the push receiver cast named, got ${show(cast)}`);
     }
   },
 });
@@ -125,5 +130,96 @@ Deno.test({
     if ((r.get("node-in held ancestor: ") ?? 0) < 1) {
       throw new Error(`want the ancestor-held fragment clean, got ${show(r)}`);
     }
+  },
+});
+
+Deno.test({
+  name: "ir door guard: a list-arm narrowing in a push receiver is not the IR's yet",
+  ignore,
+  fn: () => {
+    const r = rows(`function f(u: i32[] | string): i32 {
+  if u is i32[] {
+    u.push(1)
+    return u.length
+  }
+  return 0
+}
+print(f([3]))
+print(f("s"))
+`);
+    if ((r.get("uncovered is rung") ?? 0) < 1) {
+      throw new Error(`want the list-arm narrowing uncovered at \`is rung\`, got ${JSON.stringify([...r])}`);
+    }
+  },
+});
+
+// A whole-function push reads its receiver before the push, where legacy's strict cast is not
+// set, so a receiver that unboxes a list arm misses (`recvReadsListPayload`).
+Deno.test({
+  name: "ir: a push whose receiver unboxes a list arm is legacy's",
+  ignore,
+  fn: () => {
+    const r = rows(`function f(u: i32[] | string): i32 {
+  (u as! i32[]).push(1)
+  return 0
+}
+const xs: i32[] = [3]
+print(f(xs))
+`);
+    if ((r.get("uncovered push receiver payload cast") ?? 0) < 1) {
+      throw new Error(`want the push receiver's payload cast to miss, got ${JSON.stringify([...r])}`);
+    }
+    // An element narrowed to a list arm: today the `is` rung misses first; once it lands, the
+    // element's own atom unbox (`idxNarrowAtomKind`) must still make the push legacy's.
+    const el = rows(`function g(xs: (i32[] | string)[]): i32 {
+  if xs[0] is i32[] {
+    xs[0].push(1)
+  }
+  return 0
+}
+print(g([[3], "s"]))
+`);
+    const why = ["uncovered is rung", "uncovered push receiver payload cast"].filter((k) => el.has(k));
+    if (why.length < 1 || el.has("matched")) {
+      throw new Error(`want the narrowed element's push left to legacy, got ${JSON.stringify([...el])}`);
+    }
+  },
+});
+
+// A const cell's constant initializer hosts a fragment: a literal there matches legacy's bytes.
+Deno.test({
+  name: "ir door: a list literal in a const cell's initializer is hosted and matches",
+  ignore,
+  fn: () => {
+    const r = rows(`const T: i32[] = [1, 2, 3]
+function f(): i32 { return T[1] }
+print(f())
+`);
+    if ((r.get("node-in array: matched") ?? 0) < 1 || r.has("node-in array: miss fragment outside a body")) {
+      throw new Error(`want the initializer's literal hosted and matched, got ${show(r)}`);
+    }
+  },
+});
+
+// A local the fragment never declared takes its rep from the type; legacy's cell here is the
+// literal set's atom (D14757). The fragment must miss, not write the atom into a string list.
+Deno.test({
+  name: "ir door: a local whose legacy cell is not its type's rep misses",
+  ignore,
+  fn: () => {
+    const r = rows(`const A = "x"
+const B = "y"
+function main(c: boolean) {
+  const M = if c { A } else { B }
+  const xs = [M, "z"]
+  print(xs[0])
+}
+main(true)
+`);
+    if ((r.get("node-in array: miss local cell rep") ?? 0) < 1) {
+      throw new Error(`want the atom cell's read to miss, got ${show(r)}`);
+    }
+    const differ = [...r.keys()].filter((k) => k.startsWith("node-in array: differ"));
+    if (differ.length > 0) throw new Error(`want no differ, got ${show(r)}`);
   },
 });

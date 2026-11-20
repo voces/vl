@@ -7,6 +7,7 @@
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
+import { NULL_OWN_BOX } from "./emit_plan_null"
 import {
   IrFn,
   IrNode,
@@ -58,7 +59,9 @@ import {
   RRel,
   RRetag,
   RStrOp,
+  RTagIs,
   RTagOf,
+  RTagStash,
   RTest,
   RToBox,
   RUnionEq,
@@ -106,6 +109,7 @@ import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { i32ToStr } from "./ast"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
+import { tyIsFnValue } from "./emit_classify"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -358,7 +362,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RBoxNarrow => {
       use(r.bnV, at)
-      if !(repNodeAt(opRep(r.bnV)) is RBox) {
+      const bn = repNodeAt(opRep(r.bnV))
+      const boxed = bn is RBox
+        || r.bnAtom >= 0 && bn is RNullable && bn.rnDisc == 4
+      if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
       }
       0
@@ -520,7 +527,11 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNullOf => {
       const d = repNodeAt(dst)
-      if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
+      if r.nuOwn == NULL_OWN_BOX {
+        if !(d is RBox) {
+          return fail(2, at, "a null box is not delivered into a union box")
+        }
+      } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
         return fail(
           2,
           at,
@@ -638,6 +649,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMapOp => uses(r.mpArgs, at)
+    RTagStash => {
+      use(r.tgsV, at)
+      if opRep(r.tgsV) != vfI32 {
+        return fail(2, at, "a tag stash keeps an i32 set id")
+      }
+      0
+    }
+    RTagIs => if dst != vfBool { fail(2, at, "a tag test is a bool") } else { 0 }
     RCoalAtomStr => {
       use(r.zaL, at)
       use(r.zaD, at)
@@ -854,6 +873,10 @@ function rawRhs(r: RRawOp, dst: i32, at: i32) {
 
 // Rule 10 for a raw effect: `array.copy`'s source is at heap `srImm`.
 function rawEff(e: SRawOp, at: i32) {
+  // A list reserve's open and close are legacy's own calls, written in any body.
+  if e.srOp == "reserve.open" || e.srOp == "reserve.close" {
+    return if e.srArgs.length == 0 { 0 } else { fail(10, at, e.srOp + " takes no operand") }
+  }
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
   // Every outstanding push is this effect's leading operands, in push order.
   let k = 0
@@ -880,6 +903,7 @@ function rawEff(e: SRawOp, at: i32) {
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
     "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
+    "reserve.open" | "reserve.close" => false
   }
   if !ok {
     return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
@@ -1246,7 +1270,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel => false
   }
 }
 
@@ -1256,6 +1280,14 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 // Whether type `ty` is no closed type a variable can have (rule 1): absent, or open in a type
 // parameter. The builder asks it first, so such a function is uncovered rather than refused.
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
+
+// Whether a variable of type `ty` at rep `rep` is open (rule 1): a tagged set's polymorphic
+// function type is not, being held as the set's i32 id whatever its variables.
+export function irTyHeldOpen(ty: i32, rep: i32): boolean {
+  if !irTyOpen(ty) { return false }
+  const p = repPrim(rep)
+  return !(tyIsFnValue(ty) && p != null && p == "i32")
+}
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
 export function irVerify(f: IrFn): IrVerdict {
@@ -1298,7 +1330,7 @@ export function irVerify(f: IrFn): IrVerdict {
         -1,
         "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
       )
-    } else if irTyOpen(v.vTy) {
+    } else if irTyHeldOpen(v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
     } else if repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
