@@ -17,12 +17,31 @@ the IR an f64 one.
 
 ## The change
 
-- **`arrayLit`** takes the list rep from `arrLitBuildTyOf` when that is a list rep. It delivers
-  each element at that list's element rep and types its temp at the build type, through the new
-  `irBLetTempTy`, which `irBLetTemp` now delegates to.
+- **One build decision.** `arrLitBuild` was split into a decision and a build:
+  - `arrLitBuildAt(arrIx, ty, fnIx)` is the decision. It returns the type the list is built at
+    (`baTy`) and whether that type's row is only read (`baHeld`):
+    - -1 for the record-solve own-shape route;
+    - a taken union destination's type (D4635);
+    - for an empty literal, `ty` or the destination, held;
+    - otherwise `ty`, then the destination.
+  - `arrLitBuild` maps that decision to its `ListBuild`, so `arrLitListBuild` goes through it.
+  - `arrLitBuiltTyOf(ix, fnIx)` reads the decision's type at `arrLitBuildTyOf`.
+- **`arrayLit`** types the list at `arrLitBuiltTyOf` when that is a list rep. It delivers each
+  element at that list's element rep and types its temp through the new `irBLetTempTy`, which
+  `irBLetTemp` now delegates to. On the own-shape route it keeps the stamp.
 - **The verifier's `RMakeList` rule.** A sub-word packed list's elements are plain i32s, as a
   `u8` list's are, which matches what `emitArrU8` writes. Building at the build type exposed
   `i8` and `u16` literals that the old stamp had kept away from the packed rule.
+
+**Who could read a literal's list off its stamp.** I grepped the IR builder and lowering for
+decisions taken off an expression's AST index:
+- `boxDstNameAt`, `exprListCellBuildSlot` and `exprListCellBuildKind` have no IR caller.
+- `refListSlotOfExpr` reads an index expression's receiver, never a literal.
+- `holeBoxPlanOf` is the only one a literal reaches (`boxTemp`, `widenTo`, `boxIntoOtherUnion`).
+  Its list arm, `refList`, takes legacy's own carrier slot and tag (`refArrCarrierSlotOf`,
+  `refArrBoxTagOf`), so the tag and the list inside the box are both legacy's decisions. Its other
+  arms do not depend on a list's element width.
+- `deliver` delivers elements at the operand list's own element rep.
 
 ## Measured
 
