@@ -55,12 +55,14 @@ import {
   PrimOp,
   RCall,
   RStrOp,
+  RToBox,
   Rhs,
   SAssign,
   SBlock,
   SBoundsCheck,
   SBr,
   SCellSet,
+  SCoalBox,
   SDrop,
   SEffect,
   SForIn,
@@ -217,6 +219,7 @@ import {
   NULL_OWN_STR,
   binNulTestOf,
   coalArmOf,
+  coalBoxArmOf,
   coalNicheArmOf,
   coalNulRefArmOf,
   coalResultKindOf,
@@ -1621,14 +1624,15 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   return r
 }
 
-// Whether operands built into `b` from `at` on hold a valued `if` below a part their node writes
-// first (a receiver or an earlier operand, read at its use), naming `why` as the miss. Legacy
-// writes such an `if` in place, which the IR's statement-level `if` cannot reorder.
+// Whether operands built into `b` from `at` on hold a valued `if` (a boxed `??` is one) below a
+// part their node writes first (a receiver or an earlier operand, read at its use), naming `why`
+// as the miss. Legacy writes such an `if` in place, which the IR's statement-level `if` cannot
+// reorder.
 export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 {
+    if n is SIf && n.siOut >= 0 || n is SCoalBox {
       irBMiss(why)
       return true
     }
@@ -2130,7 +2134,12 @@ function deliver(b: i32[], ix: i32, dst: i32): Opnd {
       return boxTemp(b, none, ix, dst)
     }
   }
-  return widenTo(b, irBExpr(b, ix), ix, dst)
+  const at = b.length
+  const v = widenTo(b, irBExpr(b, ix), ix, dst)
+  if ibMiss == "" && boxLeadsAt(b, at) {
+    ifBelowLead(b, at, "box of a valued if")
+  }
+  return v
 }
 
 // `v`, built from `ix`, boxed into boxed nullable `dst` by the shared box plan.
@@ -2146,6 +2155,18 @@ function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
     return irBMiss("box literal arm")
   }
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+}
+
+// Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
+// its value: a valued node built since then has its value written already, under that tag.
+function boxLeadsAt(b: i32[], at: i32): boolean {
+  if b.length <= at { return false }
+  const n = ib.irNodes[b[b.length - 1]]
+  if !(n is SLet) { return false }
+  const r = n.lRhs
+  if !(r is RToBox) { return false }
+  return holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, ibFnIx), ibFnIx).hbArm
+    != "pass"
 }
 
 // Why box plan `p` does not take operand `v`, or "": a `null` and a literal leave an immediate
@@ -2467,6 +2488,7 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if lhsIx < 0 { return irBMiss("coalesce operand") }
   const na = coalNicheArmOf(n, lhsIx, ix, ibFnIx)
   if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
+  if na == "identBox" { return coalBox(b, n, lhsIx, ix, rep) }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
@@ -2486,6 +2508,50 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a boxed operand along `coalBoxArmOf`'s arm: the operand's box, then legacy's
+// shared `if` on it, the default built into its null arm so it runs only there. A binding arm
+// re-reads its box, so its operand is a plain variable; a stashed one is a call.
+function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  const arm = coalBoxArmOf(n, lhsIx, ix, ibFnIx)
+  const built = match arm {
+    "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => true
+    "boolPop" | "valNoKind" | "callNoKind" | "next" => false
+  }
+  if !built { return irBMiss("coalesce box " + arm) }
+  if (arm == "callBox" || arm == "callScalar") && !(nodeAt(lhsIx) is Call) {
+    return irBMiss("coalesce box stash operand")
+  }
+  const boxOut = arm == "valBox" || arm == "callBox"
+  if boxOut != heldAsBox(rep) { return irBMiss("coalesce box result rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce box after an operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !heldAsBox(irBOpRep(l)) { return irBMiss("coalesce box operand rep") }
+  if arm == "valBox" || arm == "valScalar" {
+    if !(l is OVar) || l.ov < 0 || ib.irVars[l.ov].vKind == "temp" {
+      return irBMiss("coalesce box place")
+    }
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce box default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // `l ?? d` over a `K | null` at a `string` (legacy's `emitCoalesceNulAtomStr`), its default a
@@ -2634,6 +2700,7 @@ function nodeAssigns(ni: i32, v: i32): boolean {
   return match n {
     SAssign => n.asDst == v
     SIf => bodyAssigns(n.siThen, v) || bodyAssigns(n.siElse, v)
+    SCoalBox => bodyAssigns(n.cbNull, v)
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
     SForIn => n.xfVar == v || bodyAssigns(n.xfBody, v)

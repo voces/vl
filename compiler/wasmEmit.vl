@@ -1707,6 +1707,7 @@ import {
 } from "./emit_plan_coerce"
 import {
   CoalArm,
+  CoalBoxArm,
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
   NULL_OWN_BOX,
@@ -41011,16 +41012,15 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
 // The `emitCoalesceGo` arms over a boxed operand, by `coalBoxArmOf`. Returns what
 // `emitCoalesceGo` returns.
 function emitCoalesceIdentBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
-  return match coalBoxArmOf(e, lhsIx, exprIx, fnIx) {
+  const arm = coalBoxArmOf(e, lhsIx, exprIx, fnIx)
+  return match arm {
     "boolPop" => emitCoalesceBoolPop(e, fnIx)
-    "valBox" => emitCoalesceValUnionBox(e, lhsIx, exprIx, fnIx)
-    "valScalar" => emitCoalesceValUnionScalar(e, lhsIx, exprIx, fnIx)
+    "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => {
+      emitCoalesceBoxArm(arm, e, lhsIx, exprIx, fnIx)
+    }
     "valNoKind" => emitFail(
       "emitProgram: `??` over a nullable value union has no banked residual kind",
     )
-    "elem" => emitCoalesceElemBox(e, exprIx, fnIx)
-    "callBox" => emitCoalesceCallBox(e, lhsIx, exprIx, fnIx)
-    "callScalar" => emitCoalesceCallScalar(e, lhsIx, exprIx, fnIx)
     "callNoKind" => emitFail("emitProgram: `??` over a call result has no banked residual kind")
     "next" => emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
   }
@@ -41045,192 +41045,246 @@ function emitCoalesceBoolPop(e: BinExpr, fnIx: i32): i32 {
   return 0
 }
 
-// `x ?? d` over a boxed value-union binding holding `null`, kept as a box: the tag test selects
-// the default coerced into the result union, or the re-read box. The receiver is a pure name.
+// `x ?? d` over a boxed operand along arm `arm` of `coalBoxArmOf`: the operand's box, the shared
+// open, the default, then the shared else and end, between which a binding arm re-reads its box.
 // Returns 0, or -1 when an operand fails.
-function emitCoalesceValUnionBox(
+function emitCoalesceBoxArm(
+  arm: CoalBoxArm,
   e: BinExpr,
   lhsIx: i32,
   exprIx: i32,
   fnIx: i32,
 ): i32 {
-  // The default is coerced into the RESULT union, not the operand's, which has no tag for it;
-  // the operand's own box needs none, tags being global atom codes (D1699).
-  let cCoerceN = coalResultBoxName(exprIx, fnIx)
-  let cCoerceTy = coalResultTyOf(exprIx, fnIx)
-  if cCoerceN == "" {
-    cCoerceN = unionNameOfRead(lhsIx, fnIx)
-    cCoerceTy = nodeTyIxOf(unwrapParen(e.binLeft))
-  }
-  if emitExpr(e.binLeft, fnIx) < 0 {
+  const slot = coalBoxSlot(arm)
+  if coalBoxStashes(arm) && !(arm == "elem") {
+    // D1250 — an if-expression operand arrives through `emitUnionCoerce`, not `emitExpr`, whose
+    // `IfStmt` arm (`emitUnionIfValue`) makes the blocktype the box, a missing else null-tagged.
+    const cTy = coalStashTy(lhsIx)
+    if (emitUnionBoxOwed(boxTyName(cTy), cTy, e.binLeft, fnIx) < 0) {
+      return -1 // the box, evaluated ONCE
+    }
+  } else if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the box
   }
+  if coalBoxOpen(arm, slot, e, lhsIx, exprIx, fnIx) < 0 { return -1 }
+  if emitCoalesceBoxDefault(arm, e, lhsIx, exprIx, fnIx) < 0 { return -1 }
+  if coalBoxElse(arm, slot, e, lhsIx, exprIx, fnIx) < 0 { return -1 }
+  if arm == "valBox" {
+    if emitExpr(e.binLeft, fnIx) < 0 {
+      return -1 // the LHS box, re-read
+    }
+  } else if arm == "valScalar" {
+    if emitUnionBoxPush(lhsIx, fnIx) < 0 { return -1 }
+  }
+  return coalBoxEnd(arm, e, lhsIx, exprIx, fnIx)
+}
+
+// Legacy's default of boxed `??` arm `arm`: a box arm coerces it into the RESULT union, not the
+// operand's, which has no tag for it, since tags are global atom codes (D1699); a scalar arm reads
+// it at `coalBoxValueKind`. Through `emitUnionCoerce` (D801), so a bare `null` default is the
+// null-tagged box at every spelling.
+function emitCoalesceBoxDefault(
+  arm: CoalBoxArm,
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if arm == "valBox" || arm == "callBox" {
+    let cN = coalResultBoxName(exprIx, fnIx)
+    let cTy = coalResultTyOf(exprIx, fnIx)
+    if cN == "" && arm == "valBox" {
+      cN = unionNameOfRead(lhsIx, fnIx)
+      cTy = nodeTyIxOf(unwrapParen(e.binLeft))
+    } else if cN == "" {
+      cTy = coalStashTy(lhsIx)
+      cN = boxTyName(cTy)
+    }
+    return emitUnionBoxOwed(cN, cTy, e.binRight, fnIx)
+  }
+  const k = coalBoxValueKind(arm, e, lhsIx, exprIx, fnIx)
+  if k < 0 { return -1 }
+  return emitExprAsKind(e.binRight, k, fnIx)
+}
+
+// The local boxed `??` arm `arm` stashes its operand's box in, taken before the box is written,
+// as legacy takes it: the shared field-receiver slot for a list element, the coalesce-call slot
+// for an operand that cannot be re-read, and -1 for a binding, re-read in place.
+export function coalBoxSlot(arm: CoalBoxArm): i32 {
+  if arm == "elem" { return sharedFieldRecvSlot() }
+  if arm == "callBox" || arm == "callScalar" { return coalesceCallSlot }
+  if arm == "valBox" || arm == "valScalar" { return -1 }
+  // `boolPop`, `valNoKind`, `callNoKind` and `next` are no boxed arm.
+  return emitFail("coalBoxSlot: `??` arm " + arm + " reads no box")
+}
+
+// Whether boxed `??` arm `arm` reads its operand once into `coalBoxSlot`.
+export function coalBoxStashes(arm: CoalBoxArm): boolean {
+  return arm == "elem" || arm == "callBox" || arm == "callScalar"
+}
+
+// The atom kind boxed `??` arm `arm` reads its default and its unboxed result at: the checker's
+// result kind, or the operand's residual atom where the result names no other. -1 for a box arm,
+// whose default is the result union's box.
+export function coalBoxValueKind(
+  arm: CoalBoxArm,
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if arm == "elem" { return boxTagOfTy(coalResultTyOf(exprIx, fnIx)) }
+  const ak = coalBoxAtomKind(arm, e, lhsIx, fnIx)
+  if !(arm == "valScalar" || arm == "callScalar") { return -1 }
+  let rk = ak
+  const rn = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
+  if rn >= 0 && rn != nullValKind() { rk = rn }
+  return rk
+}
+
+// The atom kind the box of boxed `??` arm `arm` holds: the element's own, or the operand's one
+// residual member. -1 for an arm that does not unbox.
+function coalBoxAtomKind(
+  arm: CoalBoxArm,
+  e: BinExpr,
+  lhsIx: i32,
+  fnIx: i32,
+): i32 {
+  return match arm {
+    "elem" => boxTagOfTy(nonNullTy(nodeTyIxOf(e.binLeft)))
+    "valScalar" => coalValUnionResidualKind(lhsIx, fnIx)
+    "callScalar" => coalStashResidualKind(lhsIx)
+    "valBox" | "callBox" | "boolPop" | "valNoKind" | "callNoKind" | "next" => -1
+  }
+}
+
+// The null test on the box on the stack: its tag is the null tag.
+function coalTagIsNull() {
   fbStructGet(uBoxIdx, 0) // field 0: tag
   fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(70)            // 0x46 i32.eq → null?
-  fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
-  // Through `emitUnionCoerce`, not `emitExpr` (D801): the block type is the box, so a bare
-  // `null` default, which has no rep of its own, arrives as the null-tagged box the coerce's
-  // `NullLit` arm builds; every non-null default passes through unchanged.
-  if emitUnionBoxOwed(cCoerceN, cCoerceTy, e.binRight, fnIx) < 0 {
-    return -1 // d, its own box
-  }
-  fbElse() // 0x05 else — present → the LHS box, re-read
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbEnd()  // 0x0b end
-  return 0
+  fbI32Bin(70) // 0x46 i32.eq → null?
 }
 
-// `x ?? d` over a boxed value-union binding holding `null`, unboxed: the tag test selects the
-// default or the one remaining atom, at the result's kind. Returns 0, or -1 when an operand fails.
-function emitCoalesceValUnionScalar(
+// The open of boxed `??` arm `arm` once its operand's box is on the stack: the stash into `slot`,
+// the tag test and the `if` at the result's block type. A list element tests presence and writes
+// its unboxed present arm first, then the `else`. Returns 0, or -1.
+export function coalBoxOpen(
+  arm: CoalBoxArm,
+  slot: i32,
   e: BinExpr,
   lhsIx: i32,
   exprIx: i32,
   fnIx: i32,
 ): i32 {
-  // The result kind is the CHECKER's: a wider default widens the whole `??` (`i32 | null ??
-  // 1.5` is an f64). The box holds the operand's own atom `cak`, widened to it (D1699).
-  const cak = coalValUnionResidualKind(lhsIx, fnIx)
-  let cRk = cak
-  const cRkN = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
-  if cRkN >= 0 && cRkN != nullValKind() { cRk = cRkN }
-  if emitExpr(e.binLeft, fnIx) < 0 {
-    return -1 // the box
+  if arm == "elem" { return coalElemOpen(slot, e, lhsIx, exprIx, fnIx) }
+  if coalBoxStashes(arm) {
+    fbLocalSet(slot)
+    fbLocalGet(slot)
   }
-  fbStructGet(uBoxIdx, 0)       // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(70)                  // 0x46 i32.eq → null?
-  fbIf(valBlockTypeOfKind(cRk)) // 0x04 if, value blocktype
-  if emitExprAsKind(e.binRight, cRk, fnIx) < 0 { return -1 }
-  fbElse()                      // 0x05 else — present → unbox at the banked code `cak`
-  if emitValueUnionUnboxRead(lhsIx, cak, fnIx) < 0 { return -1 }
-  if coalWidenUnboxed(cak, cRk) < 0 { return -1 }
-  fbEnd()                       // 0x0b end
+  coalTagIsNull()
+  if arm == "valBox" || arm == "callBox" {
+    fbIfRef(uBoxIdx) // 0x04 if, (ref $uBoxIdx) blocktype
+    return 0
+  }
+  const k = coalBoxValueKind(arm, e, lhsIx, exprIx, fnIx)
+  if k < 0 {
+    return emitFail("coalBoxOpen: `??` arm " + arm + " has no result kind")
+  }
+  fbIf(valBlockTypeOfKind(k)) // 0x04 if, value blocktype
   return 0
 }
 
-// `l ?? d` over a nullable value-union list ELEMENT, its result the bare scalar: stash the box
-// once, test the tag, unbox on the present arm (D1828). Returns 0, or -1 when an operand fails.
-function emitCoalesceElemBox(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
-  // The box holds the element's own atom, unboxed at that kind and widened to the result's,
-  // which a wider default makes wider (D3795). The result is read at the instance's pin,
-  // since a generic body records its `??` at the hole (D3744).
-  const nbKind = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
-  const nbElem = boxTagOfTy(nonNullTy(nodeTyIxOf(e.binLeft)))
-  const nbVb = vbHeapIdxOfKind(nbElem)
-  const nbSlot = sharedFieldRecvSlot()
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-  fbLocalSet(nbSlot)
-  // Present = a box is there AND its tag is not the null tag. A `.get` miss yields no box
-  // at all, so its test short-circuits on `ref.is_null` and the tag read never runs on a
-  // null; a subscript traps out of range and keeps the one-test shape it always had.
+// A list element's open: stash the box, then present is a box there whose tag is not the null
+// tag. A `.get` miss yields no box at all, so its test short-circuits on `ref.is_null`; a
+// subscript traps out of range and keeps the one test. The present arm unboxes the element's
+// own atom and widens it to the result's, which a wider default makes wider (D3795).
+function coalElemOpen(
+  slot: i32,
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  fbLocalSet(slot)
   if isListGetCall(e.binLeft, fnIx) {
-    fbLocalGet(nbSlot)
+    fbLocalGet(slot)
     fbRefIsNull()
     fbIf(127)
     fbI32Const(0)
     fbElse()
-    fbLocalGet(nbSlot)
+    fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0) // field 0: tag
     fbI32Rel(RS_TAG, nullBoxTag())
     fbI32Bin(71) // 0x47 i32.ne
     fbEnd()
   } else {
-    fbLocalGet(nbSlot)
+    fbLocalGet(slot)
     fbStructGet(uBoxIdx, 0) // field 0: tag
     fbI32Rel(RS_TAG, nullBoxTag())
     fbI32Bin(71) // 0x47 i32.ne — present?
   }
-  fbIf(nulBoxScalarValtype(nbKind))
-  fbLocalGet(nbSlot)
+  // The result is read at the instance's pin, since a generic body records its `??` at the hole
+  // (D3744).
+  const k = coalBoxValueKind("elem", e, lhsIx, exprIx, fnIx)
+  const ak = coalBoxAtomKind("elem", e, lhsIx, fnIx)
+  const vb = vbHeapIdxOfKind(ak)
+  fbIf(nulBoxScalarValtype(k))
+  fbLocalGet(slot)
   fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-  fbRefCast(nbVb)
-  fbStructGet(nbVb, 0)
-  emitScalarWiden(nbElem, nbKind)
+  fbRefCast(vb)
+  fbStructGet(vb, 0)
+  emitScalarWiden(ak, k)
   fbElse()
-  if emitExprAsKind(e.binRight, nbKind, fnIx) < 0 { return -1 }
-  fbEnd()
   return 0
 }
 
-// The box of a call, `as?` or if-expression operand, evaluated once into the coalesce-call slot:
-// none can be re-read (effects, cost, or a re-run exactness test). One slot is sound across
-// nesting since each `??` sets, tests and uses it within its own evaluation. Returns 0 or -1.
-function emitCoalesceStashBox(e: BinExpr, lhsIx: i32, fnIx: i32): i32 {
-  const cTy = coalStashTy(lhsIx)
-  // D1250 — an if-expression operand arrives through `emitUnionCoerce`, not `emitExpr`, whose
-  // `IfStmt` arm (`emitUnionIfValue`) makes the blocktype the box, a missing else null-tagged.
-  if (emitUnionBoxOwed(boxTyName(cTy), cTy, e.binLeft, fnIx) < 0) {
-    return -1 // the box, evaluated ONCE
-  }
-  fbLocalSet(coalesceCallSlot)
-  return 0
-}
-
-// `f(x) ?? d` over an operand that cannot be re-read yielding a nullable value-union box, kept as
-// a box: the default is coerced into the RESULT union, the stash already holding the operand's,
-// whose tags are program-global. Returns 0, or -1 when an operand fails.
-function emitCoalesceCallBox(
+// The `else` of boxed `??` arm `arm` after its default: the stashed box, or for a scalar result
+// the stash unboxed and widened. A binding re-reads its box after this; a list element's present
+// arm came first. Returns 0, or -1.
+export function coalBoxElse(
+  arm: CoalBoxArm,
+  slot: i32,
   e: BinExpr,
   lhsIx: i32,
   exprIx: i32,
   fnIx: i32,
 ): i32 {
-  if emitCoalesceStashBox(e, lhsIx, fnIx) < 0 { return -1 }
-  let kCoerceN = coalResultBoxName(exprIx, fnIx)
-  let kCoerceTy = coalResultTyOf(exprIx, fnIx)
-  if kCoerceN == "" {
-    kCoerceTy = coalStashTy(lhsIx)
-    kCoerceN = boxTyName(kCoerceTy)
+  if arm == "elem" { return 0 }
+  fbElse() // 0x05 else — present
+  if arm == "callBox" {
+    fbLocalGet(slot)
+    return 0
   }
-  fbLocalGet(coalesceCallSlot)
-  fbStructGet(uBoxIdx, 0) // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(70)            // 0x46 i32.eq → null?
-  fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
-  // Through `emitUnionCoerce`, as the ident arm's default (D801), so a bare `null` default
-  // boxes identically at both spellings.
-  if (emitUnionBoxOwed(kCoerceN, kCoerceTy, e.binRight, fnIx) < 0) {
-    return -1 // d, its own box
-  }
-  fbElse() // 0x05 else — present → the stashed box
-  fbLocalGet(coalesceCallSlot)
-  fbEnd()  // 0x0b end
-  return 0
-}
-
-// `f(x) ?? d` over an operand that cannot be re-read yielding a nullable value-union box,
-// unboxed: the result kind is the checker's, read as the ident arm reads it, so both arms decide
-// alike (D1701). Returns 0, or -1 when an operand fails.
-function emitCoalesceCallScalar(
-  e: BinExpr,
-  lhsIx: i32,
-  exprIx: i32,
-  fnIx: i32,
-): i32 {
-  if emitCoalesceStashBox(e, lhsIx, fnIx) < 0 { return -1 }
-  const kak = coalStashResidualKind(lhsIx)
-  let kRk = kak
-  const kRkN = boxTagOfTy(coalResultTyOf(exprIx, fnIx))
-  if kRkN >= 0 && kRkN != nullValKind() { kRk = kRkN }
-  fbLocalGet(coalesceCallSlot)
-  fbStructGet(uBoxIdx, 0)       // field 0: tag
-  fbI32Rel(RS_TAG, nullBoxTag())
-  fbI32Bin(70)                  // 0x46 i32.eq → null?
-  fbIf(valBlockTypeOfKind(kRk)) // 0x04 if, value blocktype
-  if emitExprAsKind(e.binRight, kRk, fnIx) < 0 { return -1 }
-  fbElse()                      // 0x05 else — present → unbox the stash
-  fbLocalGet(coalesceCallSlot)
-  fbStructGet(uBoxIdx, 1)       // field 1: value (anyref)
-  const kvb = vbHeapIdxOfKind(kak)
+  if arm != "callScalar" { return 0 }
+  fbLocalGet(slot)
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  const ak = coalBoxAtomKind(arm, e, lhsIx, fnIx)
+  const kvb = vbHeapIdxOfKind(ak)
   if kvb < 0 {
     return emitFail("emitProgram: union call atom has no value box")
   }
   fbRefCast(kvb)
   fbStructGet(kvb, 0) // the scalar payload
-  if coalWidenUnboxed(kak, kRk) < 0 { return -1 }
-  fbEnd()             // 0x0b end
+  return coalWidenUnboxed(ak, coalBoxValueKind(arm, e, lhsIx, exprIx, fnIx))
+}
+
+// The end of boxed `??` arm `arm`: a binding's re-read box unboxed at its residual atom and
+// widened to the result's kind when the result is a scalar, then the `if`'s end. Returns 0, or -1.
+export function coalBoxEnd(
+  arm: CoalBoxArm,
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if arm == "valScalar" {
+    const ak = coalBoxAtomKind(arm, e, lhsIx, fnIx)
+    if emitUnionUnboxTail(ak) < 0 { return -1 }
+    if coalWidenUnboxed(ak, coalBoxValueKind(arm, e, lhsIx, exprIx, fnIx)) < 0 {
+      return -1
+    }
+  }
+  fbEnd() // 0x0b end
   return 0
 }
 
