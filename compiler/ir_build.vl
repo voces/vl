@@ -108,6 +108,7 @@ import {
   ObjLitArm,
   PrintArm,
   StructFieldArm,
+  VariantFieldArm,
   arrLitShortWhy,
   asgValueArmOf,
   atomStrPlanOf,
@@ -178,14 +179,15 @@ import {
   objLitVariantStashAt,
   objLitVariantStashOf,
   popAnyPlanOf,
+  popOrPlanOf,
   printArmOf,
   pushPlainWhy,
   recvReadsListPayload,
   refIfArmOf,
   shiftMaskFoldOf,
   startInitArmOf,
-  startStrAccMarked,
   stmtWritesNothing,
+  strAccRowsAre,
   strCatPartsOf,
   strLitTakesAtom,
   structFieldArmOf,
@@ -711,6 +713,20 @@ function fieldArmRepFits(fa: StructFieldArm, dst: i32): boolean {
   }
 }
 
+// Whether variant field arm `va` is the value delivered at the literal's field rep `dst`: `plain`,
+// a widening into a slot of its width, or the box (`emitVariantFieldBox`, the hole box plan) into
+// a box slot.
+function variantArmFits(va: VariantFieldArm, dst: i32): boolean {
+  return match va {
+    "plain" => true
+    "box" => repNodeAt(dst) is RBox || boxedNullable(dst)
+    "f64" => repPrim(dst) == "f64"
+    "i64" => repPrim(dst) == "i64"
+    "f32" => repPrim(dst) == "f32"
+    "noKind" | "lambda" | "nulnone" | "strAtom" => false
+  }
+}
+
 // Why field `fi` of literal row `row` at arm `arm` is not written as its value alone, or "".
 function fieldPlainWhy(
   arm: ObjLitArm,
@@ -721,7 +737,12 @@ function fieldPlainWhy(
 ): string {
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
-    return if va == "plain" { "" } else { "object variant field " + va }
+    if !variantArmFits(va, dst) { return "object variant field " + va }
+    // A box into another union's box converts its members on legacy's side (`emitDelivered`).
+    if va == "box" && exprUnion(valIx, ibFnIx) {
+      return "object variant field box from a box"
+    }
+    return ""
   }
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
   if !fieldArmDelivers(fa) { return "object field " + fa }
@@ -2795,6 +2816,7 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = coalArmOf(n, ix, ibFnIx)
   if arm == "closed" { return coalClosed(b, n, ix, rep) }
   if arm == "niche" { return coalNiche(b, n, ix, rep) }
+  if arm == "popOr" { return coalPopOr(b, n, ix, rep) }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
 }
@@ -2809,6 +2831,40 @@ function coalClosed(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return l }
   if irBOpRep(l) != rep { return irBMiss("coalesce closed coercion") }
   return l
+}
+
+// The fused `xs.pop() ?? d` over a scalar list (legacy's `emitPopOr`): the receiver, then the
+// shared `if` on its length, the default built into its empty arm so it runs only there. The
+// default must already sit at the element rep, the one `emitScalarValue` writes it at.
+function coalPopOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lhsIx = unwrapParen(n.binLeft)
+  const p = popOrPlanOf(lhsIx, ibFnIx)
+  if p == null { return irBMiss("coalesce popOr plan") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce popOr after an operand") }
+  const l = irBExpr(b, p.poRecv)
+  if ibMiss != "" { return l }
+  const ln = repNodeAt(irBOpRep(l))
+  if !(ln is RList) || ln.rlsElem != rep {
+    return irBMiss("coalesce popOr result rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = irBExpr(nb, n.binRight)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("popOr default conversion") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: "popOr", cbNull: nb, cbOut: t, cbAt: ix },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // `l ?? d` over a `string | null` along legacy's plain block (`coalNulRefArmOf`), its default
@@ -4268,12 +4324,16 @@ function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
 
 function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
   const gen = repNodeGen()
+  // An append the fragment holds reads the accumulator rows, which a rescan would rewrite under
+  // legacy's own emit of this body. A constant initializer holds no assignment.
+  if !gConstExprEmit && !strAccRowsAre(fnIx) {
+    return "string accumulator rows"
+  }
   let fnPos = -1
   if fnIx < 0 {
     // A start body's top-level code, under the guards its whole build takes (`buildStart`).
     // A const cell's constant initializer hosts one too: it has no frame, so no variable.
     if !gPromoInStart && !gConstExprEmit { return "fragment outside a body" }
-    if startStrAccMarked() { return "string accumulator" }
     if gInitProgIdx >= 0 { return "progress cell" }
     ibReset(-1, "@fragment", -1)
   } else {
