@@ -21190,7 +21190,11 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   // primitive. The table's box seats are emit state, unset while the builder asks.
   const prim = nodeTyPrimName(w)
   if prim != "" && prim != "string" { return placePrePathWhy(w, fnIx) }
-  if coerceKindAt(ix, fnIx) != "none" { return "pre-path coercion" }
+  const ck = coerceKindAt(ix, fnIx)
+  // A list copy that owes nothing past the value is the value as built.
+  if ck != "none" && !(ck == "listCopy" && listCopyOwesNothing(ix, fnIx)) {
+    return "pre-path coercion"
+  }
   if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
@@ -30287,9 +30291,57 @@ function emitFnCloDispatch(exprIx: i32, fes: i32[], fnIx: i32): i32 {
   return 0
 }
 
+// Whether a `listCopy` delivery of `exprIx` owes nothing past the value as built, so the tail
+// writes no byte: no record copy, numeric convert or stand-in widen, no list-of-lists convert,
+// and a ref-list pair with no retag rows whose slots need no widen.
+export function listCopyOwesNothing(exprIx: i32, fnIx: i32): boolean {
+  const lct = listCopyAtNode(exprIx)
+  if lct < 0 { return false }
+  const st = nonNullTy(nodeTyIxOf(exprIx))
+  const dt = nonNullTy(instTyOrSelf(lct, fnIx))
+  if listRecCopies > 0 && rcRecListsApart(st, dt) { return false }
+  const ld = repOfTy(instTyOrSelf(lct, fnIx))
+  const de = if ld.rdKind != null { scalarListElemOfListKind(ld.rdKind) } else { null }
+  if de != null {
+    if listCopyStandsIn(exprIx, fnIx) { return false }
+    const sk = scalarListElemKind(exprIx, fnIx)
+    return sk == null || scalarWidenConvOp(sk, de) < 0
+  }
+  const lst = nonNullTy(instTyOrSelf(nodeTyIxOf(exprIx), fnIx))
+  if listOfListsPair(lst, dt) { return false }
+  const rtFrom: i32[] = []
+  const rtTo: i32[] = []
+  listWidenRetagRowsOf(exprIx, rtFrom, rtTo)
+  if rtFrom.length > 0 { return false }
+  const src = exprEmittedRefListSlot(exprIx, fnIx)
+  let dst = repSlotOfKind("reflist", instTyOrSelf(lct, fnIx))
+  if dst < 0 { dst = src }
+  if rlBoxIntoRowList(src, dst) && identBuiltAtUnionList(exprIx) {
+    return false
+  }
+  return rlWidenTagOf(src, dst) < 0
+}
+
+// Whether the read `exprIx` is a closure's capture stand-in (`listFitCaptureStandIn`), whose
+// list the scalar copy widens from the stand-in's type.
+function listCopyStandsIn(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is Ident) { return false }
+  const ty: i32[] = []
+  return listFitCaptureStandIn(
+    e.identName,
+    unwrapParen(exprIx),
+    fnIx,
+    false,
+    ty,
+  )
+    >= 0
+}
+
 // The conversion of a list value just emitted at its own row into the row of `lct`, the list
 // its delivery copies into, where the two storages differ. Returns 0, or -1 failed.
 function emitListCopyTail(exprIx: i32, lct: i32, fnIx: i32): i32 {
+  if listCopyOwesNothing(exprIx, fnIx) { return 0 }
   // A fresh call's list of records is copied element by element (`recFreshCallCopy`).
   if listRecCopies > 0 {
     const rc = emitRecListCopy(exprIx, lct, fnIx)
