@@ -1051,7 +1051,6 @@ print(intr(true, 0.5))
       ["uncovered store short-circuit operand", 1],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["start uncovered map store short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
@@ -1061,6 +1060,8 @@ print(intr(true, 0.5))
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    // The start's map store stages its global receiver and key below the value's `if`.
+    if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -1787,6 +1788,59 @@ Deno.test({
   },
 });
 
+// A returned value `if` in a function taking the union return sink builds one return per arm,
+// each arm's box written to the sink pair: an `i32 | string` and an `i32 | boolean` result match.
+const UNION_SINK_RET =
+  `function u2(n: i32): i32 | string {\n  return if n > 0 { n } else { "neg" }\n}\nfunction u4(n: i32): i32 | boolean {\n  return if n > 0 { n } else { false }\n}\nprint(u2(3))\nprint(u4(-3))\n`;
+Deno.test({
+  name: "ir shadow: a returned value if under the union return sink builds per-arm returns and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_RET, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want u2 and u4 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned `if` under the sink that adapts to one wider number with a literal arm is legacy's
+// box-once return (`retIfIsOneNumber`), so it stays a named miss rather than a per-arm build.
+const UNION_SINK_ONE_NUMBER =
+  `function lit<A, B>(k: i32, a: A, b: B) {\n  if k == 0 { return a }\n  return if k == 1 { b } else { 5 }\n}\nconst z: i64 = 9\nprint(lit(2, z, z) + 1)\n`;
+Deno.test({
+  name: "ir shadow: a returned if boxed once as one wider number under the sink stays a miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_ONE_NUMBER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("uncovered tail if one number") ?? 0) !== 1) {
+      throw new Error(`want lit uncovered at tail if one number, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// The statement spelling of an else-less chain of returns falls through to the body's own tail.
+const RET_CHAIN_ELSELESS =
+  `function c3(n: i32, a: string): string {\n  if n > 0 { return a } else if n < 0 { return "neg" }\n  return "zero"\n}\nprint(c3(0, "p"))\nprint(c3(-1, "p"))\n`;
+Deno.test({
+  name: "ir shadow: an else-less chain of statement returns builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_CHAIN_ELSELESS, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want c3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
@@ -2117,6 +2171,56 @@ print(nullable(null))
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 8 || (rows.get("matched") ?? 0) !== 8) {
       throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
+// then the value. A global receiver (staged as its read), a local and a parameter, with a
+// variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
+// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
+// name.
+Deno.test({
+  name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
+  ignore,
+  fn: () => {
+    const src = `let gb: {[string]: boolean} = Map()
+let gn: {[string]: boolean} = Map()
+let gq: {[string]: i32} = Map()
+let gi: {[string]: i32} = Map()
+function key(s: string): string { return s }
+function glob(a: boolean, c: boolean, k: string) { gb[k] = a && c }
+function loc(a: boolean, c: boolean, k: string): boolean {
+  const m: {[string]: boolean} = Map()
+  m[key(k)] = c || a
+  return m[k] ?? false
+}
+function par(m: {[string]: boolean}, a: boolean, k: string) { m[k] = gn.has(k) && a }
+function other(a: boolean, k: string) { gb[k] = gq.has(k) || a }
+function boxed(p: i32 | null, k: string) { gi[k] = p ?? 7 }
+function lit(a: boolean, c: boolean) { gb["x"] = a && c }
+gn["k"] = true
+gq["q"] = 1
+glob(true, true, "k")
+print(loc(false, true, "k"))
+par(gb, true, "p")
+other(false, "q")
+boxed(null, "k")
+lit(true, false)
+print(gb["k"] ?? false)
+print(gb["p"] ?? false)
+print(gb["q"] ?? false)
+print(gi["k"] ?? 0)
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered map store short-circuit operand") !== 1) {
+      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
     }
   },
 });
