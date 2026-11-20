@@ -58,6 +58,7 @@ import {
   RRecover,
   RRel,
   RRetag,
+  RSharedRead,
   RStage,
   RStrOp,
   RTagIs,
@@ -98,6 +99,7 @@ import {
   RList,
   RMap,
   RNullable,
+  RPrim,
   RRaw,
   RRecord,
   RUnsup,
@@ -363,6 +365,27 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RSharedRead => {
+      use(r.srV, at)
+      // Unstashed, every arm reads the receiver twice, and a temp is read once.
+      if (
+        !r.srStash
+        && (!(r.srV is OVar)
+          || r.srV.ov < 0
+          || r.srV.ov >= vf.irVars.length
+          || vf.irVars[r.srV.ov].vKind == "temp")
+      ) {
+        return fail(
+          2,
+          at,
+          "a shared read's receiver is a variable read more than once",
+        )
+      }
+      if !(repNodeAt(opRep(r.srV)) is RBox) {
+        return fail(2, at, "a shared read's receiver is a box")
+      }
+      0
+    }
     RBoxNarrow => {
       use(r.bnV, at)
       const bn = repNodeAt(opRep(r.bnV))
@@ -469,9 +492,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(repNodeAt(dst) is RList) {
         return fail(2, at, "a list literal of a non-list rep")
       }
-      // A packed list's elements are plain i32s, which its backing truncates (`arrayLit`).
+      // A packed list's elements (`u8`, or a sub-word row) are plain i32s, which its backing
+      // truncates (`arrayLit`).
       const el = kidAt(dst, 0)
-      const want = if repPrim(el) == "u8" { vfI32 } else { el }
+      const en = repNodeAt(el)
+      const packed = repPrim(el) == "u8" || en is RPrim && en.rpPacked != 0
+      const want = if packed { vfI32 } else { el }
       for e in r.mlElems {
         if opRep(e) != want {
           return fail(2, at, "an element's rep is not the list's")
@@ -801,6 +827,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       uses(r.soArgs, at)
       // A code point is an i32 and a code-point list a list of them; a slice's bounds and a
       // char-code index are i32s; every other operand is a string.
+      // `__str_from_bytes__`'s source is a byte list, its start and count i32s.
+      if r.soOp == "frombytes" {
+        const sl = if r.soArgs.length == 3 { repNodeAt(opRep(r.soArgs[0])) } else { null }
+        if !(sl is RList) || repPrim(sl.rlsElem) != "u8" {
+          return fail(2, at, "a byte string's source is a list of u8s")
+        }
+        if opRep(r.soArgs[1]) != vfI32 || opRep(r.soArgs[2]) != vfI32 {
+          return fail(2, at, "a byte string's start and count are i32s")
+        }
+        return 0
+      }
       if r.soOp == "fromcps" {
         const ln = repNodeAt(opRep(r.soArgs[0]))
         if !(ln is RList) || ln.rlsElem != vfI32 {
@@ -998,6 +1035,36 @@ function coalPopOrWhy(n: SCoalBox): string {
   const o = n.cbOut
   if o < 0 || o >= vf.irVars.length || vf.irVars[o].vRep != lr.rlsElem {
     return "a `pop ?? d` yields no element"
+  }
+  return ""
+}
+
+// Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
+// key along an inline form, `i32` (1) or mv (2), into an out of the read's own rep.
+function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
+  const mp = n.cbMap
+  if mp == null { return "a fused map read holds no probe" }
+  use(mp.prKey, id)
+  if !mapRecvOk(mp.prSym, n.cbL, id) {
+    return "a map read of a receiver that is no map"
+  }
+  if mp.prForm != 1 && mp.prForm != 2 {
+    return "a fused map read writes its default in no miss arm"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a fused map read writes no variable"
+  }
+  const p = repPrim(vf.irVars[o].vRep)
+  if mp.prForm == 1 && p != "i32" && p != "bool" {
+    return "a map read's plain probe yields no i32"
+  }
+  // The mv slot's read is the map's value as itself, so its out is at that value's rep.
+  const mr = repNodeAt(
+    if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+  )
+  if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
+    return "a map read's mv slot yields no value of its map"
   }
   return ""
 }
@@ -1207,12 +1274,18 @@ function stmt(id: i32) {
     }
     SIf => ifSpine(id)
     SCoalBox => {
-      use(n.cbL, id)
+      // A fused map read's receiver is read by its probe, which may name a global instead.
+      const mapArm = n.cbArm == "mapIndexGetOr"
+      if (n.cbMap != null) != mapArm {
+        return fail(2, id, "a `??` holds a map probe off the map-read arm")
+      }
+      if !mapArm { use(n.cbL, id) }
       if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
         return fail(4, id, "a boxed `??` writes no variable")
       }
       const why = match n.cbArm {
         "popOr" => coalPopOrWhy(n)
+        "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1352,7 +1425,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
   }
 }
 
