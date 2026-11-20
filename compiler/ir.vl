@@ -85,9 +85,10 @@ export type RCallHost = { chImport: i32, chArgs: Opnd[] }
 export type RTest = { teV: Opnd, teTag: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
-// A shared field read `srAt` over un-narrowed box local `srV`, dispatched on its tag per member
-// (legacy's `emitMemSharedRead`), so `srV` is read twice an arm.
-export type RSharedRead = { srV: Opnd, srAt: i32 }
+// A shared field read `srAt` over un-narrowed box `srV`, dispatched on its tag per member (legacy's
+// `emitMemSharedRead`): a box local read twice an arm, or with `srStash` a receiver read once into
+// legacy's stash slot.
+export type RSharedRead = { srV: Opnd, srAt: i32, srStash: boolean }
 // A box local read at the variant its narrowing names (`narrowedBoxVariantPlain`), whose record is
 // `bnRep`, the destination's; or, with `bnAtom` an atom kind (`identUnboxAtomOf`), read unboxed to
 // that atom, -1 otherwise. `bnAt` the read.
@@ -109,8 +110,12 @@ export type RMakeRec = {
   mrVariant: boolean,
 }
 export type RGetField = { gfV: Opnd, gfIx: i32, gfAt: i32 }
-// A list literal at node `mlAt` of elements `mlElems`, built by legacy's short tail.
-export type RMakeList = { mlElems: Opnd[], mlAt: i32 }
+// A list literal at node `mlAt` of elements `mlElems`, built under the list build (`mlKind`,
+// `mlSlot`) its delivery threaded, by legacy's short tail.
+export type RMakeList = { mlElems: Opnd[], mlKind: i32, mlSlot: i32, mlAt: i32 }
+// A spread literal at node `spAt` of one item group, source `spSrc`, built under the list build
+// (`spKind`, `spSlot`) its delivery threaded, along the spread tails legacy's own arm writes.
+export type RSpread = { spSrc: Opnd, spKind: i32, spSlot: i32, spAt: i32 }
 export type RListNew = { lnLen: Opnd, lnFill: Opnd }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
 export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32 }
@@ -243,7 +248,7 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
 export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf
-  | RMakeRec | RGetField | RMakeList | RListNew | RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
+  | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
   | RMapGetOr | RMapHas | RPrint | RStrOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RTagStash | RTagIs
   | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage
 
@@ -349,6 +354,9 @@ export type IrFn = {
   irPoolFill: boolean,
   // A runtime helper the door builds: the only function a raw rep or op may appear in.
   irHelper: boolean,
+  // A door fragment (`lowerNodeIn`): its locals are checked against legacy's cells, so a walk's
+  // element it did not build reads that element's legacy slot.
+  irFragment: boolean,
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -399,6 +407,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irName: name,
     irPoolFill: false,
     irHelper: false,
+    irFragment: false,
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -625,6 +634,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMakeRec => r.mrFields
     RGetField => [r.gfV]
     RMakeList => r.mlElems
+    RSpread => [r.spSrc]
     RListNew => [r.lnLen, r.lnFill]
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
@@ -680,7 +690,11 @@ function rhsText(r: Rhs): string {
     RCallHost => "call_host " + i32ToStr(r.chImport) + "(" + opndsText(r.chArgs) + ")"
     RTest => "is " + opndText(r.teV) + " tag " + i32ToStr(r.teTag)
     RBoxField => "box_field " + opndText(r.bfV) + " @" + i32ToStr(r.bfAt)
-    RSharedRead => "shared_read " + opndText(r.srV) + " @" + i32ToStr(r.srAt)
+    RSharedRead => "shared_read "
+      + opndText(r.srV)
+      + " @"
+      + i32ToStr(r.srAt)
+      + (if r.srStash { " stash" } else { "" })
     RBoxNarrow => "box_narrow " + opndText(r.bnV) + " @" + i32ToStr(r.bnAt)
     RRecover => "recover " + opndText(r.rcV) + " @" + i32ToStr(r.rcAt)
     RCast => "as " + opndText(r.ctV) + " " + repText(r.ctTarget) + " " + r.ctOnFail
@@ -688,6 +702,7 @@ function rhsText(r: Rhs): string {
     RMakeRec => "record(" + opndsText(r.mrFields) + ")"
     RGetField => "field " + opndText(r.gfV) + "." + i32ToStr(r.gfIx)
     RMakeList => "list(" + opndsText(r.mlElems) + ")"
+    RSpread => "spread(" + opndText(r.spSrc) + ")"
     RListNew => "list_new(" + opndText(r.lnLen) + ", " + opndText(r.lnFill) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
@@ -907,7 +922,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RPrimOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RRecover | RTagStash | RTagIs => "scalar"
     RCall | RPrint => "call"
     RGlobalGet => "global"
-    RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RListEq | RStrOp | RMakeList => "list"
+    RListGet | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RListEq | RStrOp | RMakeList | RSpread => "list"
     RMapGetOr | RMapHas | RMapNew | RMapSet | RMapOp => "map"
     RTest | RBoxField | RSharedRead | RBoxNarrow => "box"
     RGetField | RMakeRec => "record"
