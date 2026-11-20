@@ -10,7 +10,7 @@ in 2 more. A labelled probe split the 17 by receiver: 12 global, 5 local or para
 non-nullable, every key a variable or a temp, every value a valued `if`. Legacy and the IR's
 lowering both write, on the stack: the receiver read, `mapRecvRefTail`, the key, `mapRecvKeyTail`,
 the value, then `mapSetTail`. There is no `recvRef` slot, so part B's stage node does not apply;
-this is part A's shape (`stageLeadArgs`).
+this is part A's shape (`irBStageLeads`).
 
 ## What landed
 
@@ -27,7 +27,7 @@ this is part A's shape (`stageLeadArgs`).
 - `mapRecvKeyTail` now runs after the value's `if`. It writes no bytes and `mapSetTail` re-pins
   `cmSlot`; witnesses with an inner map op of the same and of another shape cover it.
 - Named misses: a nullable map receiver (its `ref.as_non_null` would land above the `if`), a boxed
-  `??`, a string-literal key (`stageLeadArgs` stages no `OStr`), and a reassigned receiver. The
+  `??`, a string-literal key (`irBStageLeads` stages no `OStr`), and a reassigned receiver. The
   nullable guard asks the same `exprNullableMap` the receiver tail asks, so it passes exactly where
   the tail writes nothing; no matrix spelling reached it.
 
