@@ -135,7 +135,6 @@ import {
   recUnionRecMember,
 } from "./check_fit_rules"
 import {
-  assignable,
   closureCallSetSplits,
   luElemTy,
   recArmFitKind,
@@ -204,7 +203,6 @@ import {
   tyBearsNull,
   tyElemOf,
   tyEq,
-  tyHasHole,
   tyIsLitUnion,
   tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
@@ -1418,7 +1416,6 @@ import {
   cloArmTagOfTy,
   identChainTyBoxedUnion,
   isUNameAnnAB,
-  isUnionOfTy,
   mapShapeOfTyPeeled,
   mapValueTyOf,
   nliNameOf,
@@ -1628,7 +1625,6 @@ import {
   tyNulLitUnionMemberTexts,
   tyNumLitMemberTexts,
   tyPeelNul,
-  tyUnionCovers,
 } from "./tyquery"
 import {
   MAP_KEY_I32,
@@ -1772,7 +1768,6 @@ import {
   coerceSetHasNull,
   coerceTakesAtomAsStr,
   coerceValueAtomKind,
-  emFloatIntLitTest,
   eqAtomOperandOk,
   eqOperandRecovers,
   holeBoxPlanOf,
@@ -1781,9 +1776,10 @@ import {
   isArmPatTy,
   isArmTagOfTyAt,
   isBoxGuardPlain,
+  isPinOwn,
+  isPreArmOf,
   isRecvStageRep,
   isTestValuePrimName,
-  isTestedEveryMember,
   isTestsStorage,
   isVariantTagPlain,
   isWholeOfOneListUnion,
@@ -5706,99 +5702,59 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
   )
 }
 
-// Lower a type guard `recv is X`: a narrowed operand's narrowing is lifted for the test, an
-// un-narrowed frame local typed as exactly `X` is a tautology, and `emitIsTest` does the rest.
+// Lower `is` test `isIx` at the rung `isPreArmOf` names: a decided constant, its operand
+// evaluated for effects where it may have any, or `emitIsTest`'s rungs.
 function emitIs(isIx: i32, fnIx: i32) {
   const nd0 = nodeAt(isIx)
-  if nd0 is IsExpr {
-    // A narrowed operand is tested at its storage, never trusted: the read is the declared
-    // box and the rungs below test its tag, so a write the narrowing does not see (an alias,
-    // an escaped closure) is answered (D2447).
-    if isTestsStorage(nd0.isObj, fnIx) {
+  if !(nd0 is IsExpr) { return emitIsTest(isIx, fnIx) }
+  const tested = isVarTyIxOf(isIx)
+  const covOp = nodeTyAt(nd0.isObj, fnIx)
+  return match isPreArmOf(isIx, fnIx) {
+    // A narrowed operand is tested at its storage, never trusted: a write the narrowing does
+    // not see (an alias, an escaped closure) is answered (D2447).
+    "storage" => {
       const sMark = storageReadEnter(nd0.isObj)
       const r = emitIsTest(isIx, fnIx)
       storageReadLeave(sMark)
-      return r
+      r
     }
-    // A frame local no narrowing binds holds its own type in its slot, so where the checker
-    // typed it as exactly the tested type the test is a tautology (`const w = v` under a
-    // narrowing of `v`).
-    const tl = nodeAt(unwrapParen(nd0.isObj))
-    if tl is Ident {
-      const isOpTy = nodeTyAt(nd0.isObj, fnIx)
-      const isTsTy = isVarTyIxOf(isIx)
-      if (
-        localIndexOf(fnIx, unwrapParen(nd0.isObj)) >= 0
-        && isOpTy >= 0
-        && isTsTy >= 0
-        && !isUnionOfTy(isOpTy)
-        && !exprUnion(nd0.isObj, fnIx)
-        && tySame(isOpTy, isTsTy)
-      ) {
-        fbI32Const(1)
-        return 0
-      }
-    }
-    // A non-union operand whose type is a member of the tested union fits it: the operand is
-    // evaluated for its effects and the test is true (D3360). So does a union operand every
-    // member of which the checker found the tested type contains (`tyTestMeet`, D4085).
-    const covOp = nodeTyAt(nd0.isObj, fnIx)
-    if (
-      exprUnion(nd0.isObj, fnIx)
-      && isTestedEveryMember(covOp, isVarTyIxOf(isIx))
-    ) {
-      if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
+    "tautology" => {
       fbI32Const(1)
-      return 0
+      0
     }
-    if (
-      covOp >= 0
-      && !isUnionOfTy(covOp)
-      && !exprUnion(nd0.isObj, fnIx)
-      && tyUnionCovers(isVarTyIxOf(isIx), covOp)
-    ) {
-      if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
-      fbI32Const(1)
-      return 0
+    "covers" | "fits" => isDecidedOperand(nd0.isObj, true, 1, fnIx)
+    // An effect-free operand answers a bare constant `staticIsGuard` reads, so the arm it
+    // guards is not lowered (D15606); any other is evaluated for its effects first (D15607).
+    "prim" => {
+      const same = tyPrimNameOf(covOp) == tyPrimNameOf(tested)
+      isDecidedOperand(
+        nd0.isObj,
+        same || !exprEffectFree(nd0.isObj),
+        if same { 1 } else { 0 },
+        fnIx,
+      )
     }
-    // A primitive operand tested against a primitive is decided, since a pin can narrow a field
-    // below its bound's union (D15544): true at its own, false at another. An effect-free operand
-    // answers a bare constant `staticIsGuard` reads, so the arm it guards is not lowered (D15606);
-    // any other is evaluated for its effects first (D15607).
-    const opPrim = tyPrimNameOf(covOp)
-    const tsPrim = tyPrimNameOf(isVarTyIxOf(isIx))
-    const same = opPrim == tsPrim
-    // A float tested against integer literals compares by value, below (D3689).
-    if emFloatIntLitTest(covOp, isVarTyIxOf(isIx)) {
-      return emitIsTest(isIx, fnIx)
+    "pin" => {
+      const own = isPinOwn(covOp, tested)
+      isDecidedOperand(
+        nd0.isObj,
+        !exprEffectFree(nd0.isObj),
+        if own { 1 } else { 0 },
+        fnIx,
+      )
     }
-    if opPrim != null && tsPrim != null && !exprUnion(nd0.isObj, fnIx) {
-      if same || !exprEffectFree(nd0.isObj) {
-        if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-        fbDrop()
-      }
-      fbI32Const(if same { 1 } else { 0 })
-      return 0
-    }
-    // Any other non-union operand the pin types at exactly the tested type passes the test, and
-    // one it types at no tested member, in either direction, fails it: the instance's re-check
-    // found it decided (D15608).
-    const pinOwn = isPinOwn(covOp, isVarTyIxOf(isIx))
-    if (
-      !exprUnion(nd0.isObj, fnIx)
-      && (pinOwn || isPinUnrelated(covOp, isVarTyIxOf(isIx)))
-    ) {
-      if !exprEffectFree(nd0.isObj) {
-        if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-        fbDrop()
-      }
-      fbI32Const(if pinOwn { 1 } else { 0 })
-      return 0
-    }
+    "test" => emitIsTest(isIx, fnIx)
   }
-  return emitIsTest(isIx, fnIx)
+}
+
+// A decided `is`: operand `opIx` evaluated and dropped when `evaluate`, then the constant `bit`.
+function isDecidedOperand(opIx: i32, evaluate: boolean, bit: i32, fnIx: i32) {
+  if evaluate {
+    if emitExpr(opIx, fnIx) < 0 { return -1 }
+    fbDrop()
+  }
+  fbI32Const(bit)
+  return 0
 }
 
 // Whether every operand arm (`opTags`/`opVis`) holding tag `tag` is among the tested `isVis`.
@@ -5812,40 +5768,6 @@ function isTagWhollyTested(
   while i < opTags.length && i < opVis.length {
     if opTags[i] == tag && !i32ListHas(isVis, opVis[i]) { return false }
     i = i + 1
-  }
-  return true
-}
-
-// Whether closed record or list type `op` is the tested type `t` itself.
-function isPinOwn(op: i32, t: i32): boolean {
-  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
-  const ot = tyAt(op)
-  if tyHasTyVar(op) || tyHasHole(op) || !(ot is TyObj || ot is TyArray) {
-    return false
-  }
-  return tySame(op, t)
-}
-
-// Whether closed non-union type `op` is related by `assignable`, in either direction, to no
-// member of tested type `t`, a list against a list excepted.
-function isPinUnrelated(op: i32, t: i32): boolean {
-  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
-  if (
-    isUnionOfTy(op)
-    || tyHasTyVar(op)
-    || tyHasHole(op)
-    || tyAt(op) is TyNullable
-  ) {
-    return false
-  }
-  const tests: i32[] = []
-  flattenVariantsInto(t, tests)
-  if tests.length == 0 { return false }
-  const opList = tyAt(op) is TyArray
-  for x in tests {
-    if x < 0 || assignable(x, op) || assignable(op, x) { return false }
-    // An empty list fits every list type, so a list tested against a list is not decided.
-    if opList && tyAt(x) is TyArray { return false }
   }
   return true
 }
