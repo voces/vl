@@ -2191,3 +2191,42 @@ print(d[0] + d[3])
     }
   },
 });
+
+// A linear-memory i32 load or store is written as legacy's arm writes it, its address along the
+// one address plan: a plain, a computed, a constant and an offset address, a byte width and a
+// discarded load all match. A widened store value stays a named miss.
+Deno.test({
+  name: "ir shadow: an i32 memory load or store matches along legacy's address plan",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function put(i: i32, w: i32) { __store_i32__(i, w) }
+function get(i: i32): i32 { return __load_i32__(i) }
+function getb(i: i32): i32 { return __load_u8__(i) }
+function putb(i: i32, w: i32) { __store_i8__(i, w) }
+function at4(i: i32): i32 { return __load_i32__(i * 4) }
+function back(i: i32, w: i32) { __store_i32__(i - 4, w) }
+function constAt(): i32 { return __load_i32__(64) }
+function off(i: i32): i32 { return __load_i32__(i, 8) }
+function wide(i: i32, x: i64) { __store_i64__(i, x) }
+function drop1(i: i32) { __load_i32__(i) }
+put(100, 7)
+print(get(100) + at4(25))
+putb(200, 300)
+print(getb(200))
+back(108, 9)
+put(64, 11)
+print(constAt() + off(100))
+wide(120, 3 as i64)
+drop1(100)
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 9 || (rows.get("matched") ?? 0) !== 9) {
+      throw new Error(`want nine covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered memory access wide value") ?? 0) !== 1) {
+      throw new Error(`want the i64 store a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
