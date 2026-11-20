@@ -2361,39 +2361,44 @@ print(elseIfWiden(3) + elseIfWiden(2))
   },
 });
 
-// An empty ref-list literal at a union variant's record row builds as the plain short list: with
-// no element to coerce into the arm, legacy writes the backing and wrapper alone.
+// A ref-list literal at a non-null variant's record row builds as the short list: empty, its
+// elements literals built at the variant's row, or values of it as they stand.
 Deno.test({
-  name: "ir shadow: an empty literal of a variant's record list is covered and matches",
+  name: "ir shadow: a variant record list literal is covered and matches",
   ignore,
   fn: () => {
     const { rc, rows } = run(`type A = { a: i32 }
 type B = { b: i32 }
 type U = A | B
-let rows: A[][] = [[{ a: 1 }]]
+let rows: A[][] = []
 function drop(ci: i32): i32 {
   const none: A[] = []
   rows[ci] = none
   return rows[ci].length
 }
-function fresh(): A[] {
-  const xs: A[] = []
-  xs.push({ a: 2 })
+function lits(n: i32): A[] {
+  const xs: A[] = [{ a: n }, { a: n + 1 }]
+  return xs
+}
+function vals(x: A, y: A): A[] {
+  const xs: A[] = [x, y]
   return xs
 }
 function pick(u: U): i32 {
   if u is A { return u.a }
   return 0
 }
+rows.push([{ a: 1 }])
 print(drop(0))
-print(fresh().length)
+print(lits(3)[1].a)
+print(vals({ a: 5 }, { a: 6 }).length)
 print(pick({ b: 3 }))
 `, true);
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
-      throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

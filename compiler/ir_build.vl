@@ -225,7 +225,11 @@ import {
   variantFieldBoxTy,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
-import { identUnboxAtomOf, variantCoerceArmOf } from "./emit_plan_union"
+import {
+  arrLitVariantSlot,
+  identUnboxAtomOf,
+  variantCoerceArmOf,
+} from "./emit_plan_union"
 import {
   HoleBox,
   IsArm,
@@ -256,7 +260,7 @@ import {
   spreadPairKnown,
   spreadPlanOf,
 } from "./emit_plan_list"
-import { mvValVariantOf } from "./emit_shape_rows"
+import { mvValVariantOf, rlElemVariantRow } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
   BinNulTest,
@@ -357,7 +361,11 @@ import {
   sFieldStoreKind,
   spreadBoxingSource,
 } from "./emit_classify"
-import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
+import {
+  declaredSlotOf,
+  declaredSlotOfDecl,
+  rlElemTyIxAt,
+} from "./emit_struct_order"
 import {
   callSpillsFcpArg,
   elseLessNullableTail,
@@ -3222,7 +3230,9 @@ function arrayLit(
   if arm == "spread" { return spreadLit(b, n, ix, rep, lb) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
-  if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 {
+  // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
+  const vslot = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
+  if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 && vslot < 0 {
     return irBMiss("array ref")
   }
   if (
@@ -3257,7 +3267,7 @@ function arrayLit(
   const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   for e in n.arrElems {
-    const v = deliver(b, e, er, -1)
+    const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
@@ -3270,6 +3280,19 @@ function arrayLit(
   }
   if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
   return irBLetTemp(b, r, ix, lrep)
+}
+
+// Element `e` of a list literal at variant slot `vslot` (`arrLitVariantSlot`), at element rep
+// `er`: an object literal built at the variant's row, as `emitVariantStruct` builds it, else the
+// value as it stands.
+function variantElem(b: i32[], e: i32, er: i32, vslot: i32): Opnd {
+  const vi = rlElemVariantRow(vslot)
+  if variantCoerceArmOf(vi, e, ibFnIx) != "struct" {
+    return deliver(b, e, er, -1)
+  }
+  const pre = exprPrePathWhy(e, ibFnIx)
+  if pre != "" { return irBMiss(pre) }
+  return objLitAt(b, unwrapParen(e), er, rlElemTyIxAt(vslot), vi, true)
 }
 
 // A spread literal of one item group, a spread source, along legacy's plain arm (`spreadPlanOf`):
