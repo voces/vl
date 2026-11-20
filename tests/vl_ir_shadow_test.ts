@@ -1194,3 +1194,22 @@ Deno.test({
     }
   },
 });
+
+// A literal-union list's elements are its interned atoms, which the IR delivers itself: the
+// literal takes the short build and its fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a literal-union list literal builds at the short tail and matches",
+  ignore,
+  fn: () => {
+    const { rows } = run(`function pick(i: i32): string {
+  const xs: ("a" | "b")[] = ["a", "b", "a"]
+  return xs[i]
+}
+print(pick(1))
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
