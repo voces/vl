@@ -219,12 +219,14 @@ import {
   elseIfLink,
   externGlobalLinkOfNode,
   funcDeclNodes,
+  hasSpreadItem,
   i32ToStr,
   isExprKid,
   nodeAt,
   nodeChildren,
   nodeChildrenPush,
   nodeSpineChildren,
+  spreadArgOf,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -1166,6 +1168,11 @@ function mapLeafValTy(ty: i32): i32 {
 // agree per slot but are called from two places, so a rung asking `parentLetOf` would answer
 // at one and decline at the other, keying one literal to two rows. Runs before `monomorphize`.
 export function scanArrLitCommit(rootIx: i32) {
+  spreadIdAt = Map()
+  spreadGroupAt = Map()
+  spreadGroupCount = Map()
+  spreadIdNext = 0
+  spreadGroupNext = 0
   let fe = 0
   while fe < fnStmts.length {
     const fnIx = fnStmts[fe]
@@ -1188,6 +1195,7 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
     if n is FuncDecl { return 0 }
   }
   if n is ArrayLit {
+    if hasSpreadItem(n.arrElems) { spreadSlotsNote(ix, n.arrElems) }
     if n.arrElems.length >= 1 {
       // Every element must commit to the same name: `const xs = [c, d]` over two arms of one
       // union is a union-box list, and reading only the first would key it under one arm. A
@@ -1218,6 +1226,60 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
     cur = elseIfLink(cur)
   }
   return 0
+}
+
+// Each spread literal's slot ordinal and its first item group's, program-wide in the walk's
+// source order: a spread's scratch slots are a function of its node, never of emission order, so
+// two distinct spreads never share one and a node emitted twice reuses its own.
+let spreadIdAt: {[i32]: i32} = Map()
+let spreadGroupAt: {[i32]: i32} = Map()
+let spreadGroupCount: {[i32]: i32} = Map()
+let spreadIdNext = 0
+let spreadGroupNext = 0
+
+// Records spread literal `ix`'s ordinal and one group ordinal per item group of `elems`: a spread
+// item, or a run of plain elements, as `emitArrSpread` groups them.
+function spreadSlotsNote(ix: i32, elems: i32[]) {
+  spreadIdAt[ix] = spreadIdNext
+  spreadIdNext = spreadIdNext + 1
+  spreadGroupAt[ix] = spreadGroupNext
+  let inRun = false
+  for e in elems {
+    if spreadArgOf(e) >= 0 {
+      spreadGroupNext = spreadGroupNext + 1
+      inRun = false
+    } else if !inRun {
+      spreadGroupNext = spreadGroupNext + 1
+      inRun = true
+    }
+  }
+  spreadGroupCount[ix] = spreadGroupNext - (spreadGroupAt[ix] ?? 0)
+}
+
+// The recorded spread literal `ix` stands for: itself, else the node it was cloned from.
+function spreadRecordedOf(ix: i32): i32 {
+  const path: i32[] = []
+  let cur = ix
+  while cur >= 0 && !i32ListHas(path, cur) {
+    if spreadIdAt.has(cur) { return cur }
+    path.push(cur)
+    cur = nodeSrc[cur] ?? -1
+  }
+  return -1
+}
+
+// Spread literal `arrIx`'s recorded slot ordinal, or -1 for one no walk met.
+export function spreadSlotIdOf(arrIx: i32): i32 {
+  const r = spreadRecordedOf(arrIx)
+  return if r >= 0 { spreadIdAt[r] ?? -1 } else { -1 }
+}
+
+// Item group `g` of spread literal `arrIx`'s recorded slot ordinal, or -1 for an unrecorded
+// literal or a group past the ones recorded.
+export function spreadGroupSlotIdOf(arrIx: i32, g: i32): i32 {
+  const r = spreadRecordedOf(arrIx)
+  if r < 0 || g < 0 || g >= (spreadGroupCount[r] ?? 0) { return -1 }
+  return (spreadGroupAt[r] ?? -1) + g
 }
 
 // Does the annotation `ann`, spelled `name`, reach a union arm — bare, or through map values at
