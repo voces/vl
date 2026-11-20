@@ -1643,3 +1643,33 @@ print(pick(1))
     }
   },
 });
+
+// Two spread literals in one function: the IR builds the one-group `[...a]` along the shared
+// spread plan while legacy keeps the many-group one, each in its own recorded slots, and a
+// function of the one-group form alone is covered and matched.
+Deno.test({
+  name: "ir shadow: a one-group spread matches beside a many-group one legacy keeps",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function f(a: i32[], b: i32[]): i32 {
+  const x = [...a]
+  const y = [...a, 1, ...b]
+  return x.length + y.length
+}
+function g(a: i32[]): i32 {
+  const x = [...a]
+  return x.length
+}
+print(f([1, 2], [3]) + g([4]))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("node-in array: miss array spread groups") ?? 0) !== 1) {
+      throw new Error(`want the many-group spread left to legacy, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});

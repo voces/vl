@@ -1,9 +1,4 @@
-import {
-  asgNameWiderRow,
-  cloRetValSlot,
-  nulTagIdRepTy,
-  sTwinRepOf,
-} from "./emit_classify"
+import { asgNameWiderRow, cloRetValSlot, nulTagIdRepTy } from "./emit_classify"
 import { isBlockBody } from "./block_body"
 import { lexOpcode, primOpcode } from "./ir"
 import { bodyEndsInReturn, identityBinIsMixed } from "./emit_fn_scans"
@@ -434,9 +429,7 @@ import {
   LBK_I64_LIST,
   LBK_NUL_BOOL_LIST,
   LBK_NUL_LIT_UNION_LIST,
-  LBK_NUL_U8_LIST,
   LBK_REF,
-  LBK_REF_AT_SLOT,
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
@@ -444,7 +437,6 @@ import {
   PK_I16,
   PK_U16,
   PK_U8,
-  RLK_CLOSURE,
   RLK_F32_LIST,
   RLK_F64_LIST,
   RLK_I32_LIST,
@@ -701,7 +693,6 @@ import {
   sFieldStart,
   sHeapIdx,
   sIsRefRow,
-  sSuperAt,
   sTy,
   shIdxFrom,
   shIdxNode,
@@ -1111,13 +1102,8 @@ import {
   sFieldStoreKind,
   sharedUnionFieldPlan,
   spreadBoxingSource,
-  spreadDestKind,
-  spreadDestRow,
   spreadOwnBoxRow,
-  spreadSourcesStrOrAtoms,
-  spreadSourcesWidenTo,
   spreadSrcAtomTexts,
-  spreadSrcBoxes,
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObjCtx,
@@ -1233,11 +1219,9 @@ import {
   objOrderStashSlot,
   spreadDstBackSlot,
   spreadDstIdSlot,
-  spreadElemWidens,
   spreadGroupIdSlot,
   spreadGroupWrapSlot,
   spreadJoinTmpSlot,
-  spreadLitElemRow,
   spreadSrcBoxAtom,
   spreadSrcNulMode,
   structEqStashSlot,
@@ -1285,7 +1269,6 @@ import {
 import {
   mvValTyIxAt,
   mvValUnionHasNull,
-  rlElemIsNulNiche,
   tyRefArrElemOf,
   unMemRefArrArmSlot,
 } from "./emit_map_value_slots"
@@ -1337,7 +1320,6 @@ import {
   emptyArrHoleBuildSlot,
   emptyArrUnionArmKind,
   emptyArrUnionArmSlot,
-  listBuildKindOfVKind,
   rlBoxIntoRowList,
   rlWidenAllowed,
   rlWidenTagOf,
@@ -1349,7 +1331,6 @@ import {
   mvValVariantOf,
   narrowedNulStructArm,
   rlElemInnerSlot,
-  rlElemStructRow,
   rlElemVariantRow,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
@@ -1645,6 +1626,7 @@ import {
   PushPlan,
   PushSlot,
   PushValKinds,
+  SpreadPlan,
   allocLitChunk,
   arrLitArmOf,
   arrLitBuild,
@@ -1666,6 +1648,7 @@ import {
   listReserveScan,
   numListElemOf,
   objLitBuildVariantRow,
+  pendingKindOfList,
   popPlanOf,
   popRecvIsList,
   pushPlanOf,
@@ -1679,6 +1662,8 @@ import {
   scalarListWrap,
   scalarPushScratchBaseOf,
   spreadBackIdx,
+  spreadBoxDestRow,
+  spreadPlanOf,
   spreadWrapIdx,
   tyElemRepsAsAtom,
   tyRepsAsAtom,
@@ -11792,35 +11777,10 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
         boxSrc,
       )
     }
-    let kk = spreadDestKind(arrIx, fnIx)
-    // A destination that threaded a wider scalar list (`const q: f64[] = [...ints]`) is
-    // built at, since the literal is built at the type it flows into.
-    const pdk = spreadPendingScalar(lb.lbKind)
-    if (
-      kk != null
-      && pdk != null
-      && pdk != kk
-      && spreadSourcesWidenTo(elems, pdk, fnIx)
-    ) {
-      kk = pdk
-    }
-    // A `string[]` destination builds a literal-union atom source's strings (D2868).
-    if (
-      kk == "list"
-      && lb.lbKind == LBK_STR_LIST
-      && spreadSourcesStrOrAtoms(elems, fnIx)
-    ) {
-      kk = "strlist"
-    }
-    if kk == null {
-      return emitFail(
-        "emitProgram: a spread's source is not a list this rep knows",
-      )
-    }
-    const ownRow = spreadOwnRow(elems, fnIx)
-    const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx, lb)
-    const wrap = spreadWrapIdx(kk, row)
-    const back = spreadBackIdx(kk, row)
+    const p = spreadPlanOf(arrIx, fnIx, lb)
+    if p.spWhy != "" { return emitFail(p.spWhy) }
+    const wrap = spreadWrapIdx(p.spKind, p.spRow)
+    const back = spreadBackIdx(p.spKind, p.spRow)
     if wrap < 0 || back < 0 {
       return emitFail("emitProgram: spread literal but list type not collected")
     }
@@ -11843,149 +11803,33 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
       i = i + 1
     }
     if run.length > 0 { groups.push(spreadRunLit(run, arrIx, arrIx, a.pos)) }
-    // Every group builds at the DESTINATION's rep, threaded from the kind this literal
-    // resolved at rather than from whatever annotation reached it: an un-annotated binding
-    // threads nothing, so a plain run would build at the i32 default while the destination
-    // is the source's own backing.
-    const pk = pendingKindOfList(kk, row)
     const seq = liKinds.length
     const slots: i32[] = []
     const groupRows: i32[] = []
     let g = 0
     while g < groups.length {
-      // A source of another scalar element builds at its own rep, then copies converting.
-      const gk = spreadGroupSrcKind(groups[g], elems, kk, fnIx)
-      let groupKind = pk
-      if gk != kk { groupKind = pendingKindOfList(gk, 0) }
-      // A source list whose record element is a subtype of the row's is read at its own row
-      // and copied as it is (D14960).
-      const gRow = spreadGroupSubRow(groups[g], kk, row, fnIx)
-      // A fresh source built at a row no source has is built at exactly that row (D4871).
-      if gRow == row && row != ownRow && groupKind == LBK_REF {
-        groupKind = LBK_REF_AT_SLOT
+      const gRow = p.spGroupRows[g]
+      if emitSpreadGroup(groups[g], fnIx, p.spGroupKinds[g], gRow) < 0 {
+        return -1
       }
-      if emitSpreadGroup(groups[g], fnIx, groupKind, gRow) < 0 { return -1 }
-      svSyncRecv(groups[g], fnIx)
-      if gk != kk && kk == "strlist" {
-        if emitAtomListToStrTop(spreadSrcAtomTexts(groups[g], fnIx)) < 0 {
-          return -1
-        }
-      } else if gk != kk {
-        if (
-          emitScalarListWidenTop(listKindElemKind(gk), listKindElemKind(kk))
-          < 0
-        ) {
-          return -1
-        }
-      }
-      const gs = spreadGroupSlotAt(arrIx, g, kk, gRow, seq)
+      const gs = spreadGroupStash(p, arrIx, g, groups[g], fnIx, seq)
       if gs < 0 { return -1 }
       slots.push(gs)
       groupRows.push(gRow)
-      fbLocalSet(gs)
       g = g + 1
     }
-    return spreadJoinGroups(arrIx, slots, groupRows, wrap, back, kk, row, seq)
+    return spreadJoinGroups(
+      arrIx,
+      slots,
+      groupRows,
+      wrap,
+      back,
+      p.spKind,
+      p.spRow,
+      seq,
+    )
   }
   return emitFail("emitProgram: expected an array literal")
-}
-
-// The ref-list row spread source `src` is read at: the row of the list its delivery copies it
-// into (`recSpreadCallCopy`, D16444), else its own.
-function spreadSrcRow(src: i32, fnIx: i32): i32 {
-  const ct = listCopyAtNode(src)
-  const r = if ct >= 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
-  return if r >= 0 { r } else { refListSlotOfExpr(src, fnIx) }
-}
-
-// `spreadDestRow`, its first source read at the row its delivery copies it into.
-function spreadOwnRow(elems: i32[], fnIx: i32): i32 {
-  const r = spreadDestRow(elems, fnIx)
-  for el in elems {
-    const src = spreadArgOf(el)
-    if src >= 0 {
-      const ct = listCopyAtNode(src)
-      const rl = ct >= 0 && mfRecvKindOf(src, fnIx) == "reflist"
-      const c = if rl { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
-      return if c >= 0 { c } else { r }
-    }
-  }
-  return r
-}
-
-// The row spread group `grp` of a literal built at ref-list row `row` is read at: the group's
-// own row where it is an existing list whose element is a subtype of the row's, else `row`.
-function spreadGroupSubRow(grp: i32, kk: ListKind, row: i32, fnIx: i32): i32 {
-  if kk != "reflist" { return row }
-  const lit = unwrapParen(grp)
-  if lit < 0 || nodeAt(lit) is ArrayLit { return row }
-  const s = spreadSrcRow(grp, fnIx)
-  if rlRowElemSubOf(s, row) { return s }
-  return row
-}
-
-// The ref-list row spread literal `arrIx` of kind `kk` builds at: the threaded destination's
-// row, else the literal's own typed element's, when every source of another row is itself a
-// list literal, built there as any literal is (D4871); else `own`, the first source's.
-function spreadFreshDestRow(
-  arrIx: i32,
-  kk: ListKind,
-  own: i32,
-  fnIx: i32,
-  lb: ListBuild,
-): i32 {
-  const a = nodeAt(arrIx)
-  // A packed destination builds at its own row: the build's slot, else the literal's type.
-  if kk == "u8list" {
-    if lb.lbKind == LBK_U8_LIST || lb.lbKind == LBK_NUL_U8_LIST {
-      return lb.lbSlot
-    }
-    return exprPackedRow(arrIx, fnIx)
-  }
-  if kk != "reflist" || !(a is ArrayLit) { return own }
-  let want = spreadLitElemRow(arrIx, fnIx)
-  // A union build's row is the destination's too: its literal sources are built there (D16702).
-  if (
-    lb.lbKind == LBK_REF
-    || lb.lbKind == LBK_REF_AT_SLOT
-    || lb.lbKind == LBK_UNION
-  ) {
-    want = lb.lbSlot
-  }
-  if want == own || want < 0 || want >= rlElemName.length { return own }
-  const elems = a.arrElems
-  for el in elems {
-    const src = spreadArgOf(el)
-    if src >= 0 {
-      const lit = unwrapParen(src)
-      const isLit = lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ArrayLit
-      if !isLit {
-        const ss = spreadSrcRow(src, fnIx)
-        if ss != want && !rlRowElemSubOf(ss, want) { return own }
-      }
-    }
-  }
-  return want
-}
-
-// Whether ref-list row `s`'s element is a declared wasm subtype of row `d`'s, so a backing of
-// `s` copies into one of `d` as it is: both record rows, the first reaching the second's heap
-// through its `sub` chain, and a nullable element never into a non-null one.
-function rlRowElemSubOf(s: i32, d: i32): boolean {
-  if s < 0 || d < 0 || s == d { return false }
-  if rlElemIsNulNiche(s) && !rlElemIsNulNiche(d) { return false }
-  const sr = rlElemStructRow(s)
-  const dr = rlElemStructRow(d)
-  if sr < 0 || dr < 0 { return false }
-  const dh = sTwinRepOf(dr)
-  let x = sTwinRepOf(sr)
-  let guard = 0
-  while x >= 0 && guard < 64 {
-    if x == dh { return true }
-    x = sTwinRepOf(sSuperAt(x))
-    guard = guard + 1
-  }
-  return false
 }
 
 // A slot key packs a ref-list row under 4096 with `4096 * ordinal`, so an ordinal must stay
@@ -12011,10 +11855,36 @@ function spreadGroupSlotAt(
   return spreadGroupIdSlot(kk, row, gid)
 }
 
+// A spread group's tail once its list `grp` is on the stack: refresh it if a view, convert it to
+// the destination's element kind, and park it in the group's frame slot; the slot, or -1.
+export function spreadGroupStash(
+  p: SpreadPlan,
+  arrIx: i32,
+  g: i32,
+  grp: i32,
+  fnIx: i32,
+  seq: i32,
+): i32 {
+  svSyncRecv(grp, fnIx)
+  const gk = p.spSrcKinds[g]
+  const kk = p.spKind
+  if gk != kk && kk == "strlist" {
+    if emitAtomListToStrTop(spreadSrcAtomTexts(grp, fnIx)) < 0 { return -1 }
+  } else if gk != kk {
+    if emitScalarListWidenTop(listKindElemKind(gk), listKindElemKind(kk)) < 0 {
+      return -1
+    }
+  }
+  const gs = spreadGroupSlotAt(arrIx, g, kk, p.spGroupRows[g], seq)
+  if gs < 0 { return -1 }
+  fbLocalSet(gs)
+  return gs
+}
+
 // Join a spread literal's item groups, each a list in its own frame slot, of (`kk`, `row`) or,
 // for a source whose element is a subtype of the row's, of that source's own row
 // (`groupRows`): allocate the destination once, then one `array.copy` per group in source order.
-function spreadJoinGroups(
+export function spreadJoinGroups(
   arrIx: i32,
   slots: i32[],
   groupRows: i32[],
@@ -12078,38 +11948,6 @@ function spreadJoinGroups(
     c = c + 1
   }
   return 0
-}
-
-// The union-box list row a spread literal builds at when its destination threaded one
-// (`const q: (i32 | null)[] = [...ints]`, or the row an outer literal, `push` or cell write
-// names as `LBK_REF_AT_SLOT`) and some spread source is another list, whose elements are then
-// each boxed; -1 otherwise, including when nothing threaded (D2869, D2883).
-function spreadBoxDestRow(elems: i32[], fnIx: i32, lb: ListBuild): i32 {
-  if (
-    lb.lbKind != LBK_UNION
-    && lb.lbKind != LBK_REF_AT_SLOT
-    && lb.lbKind != LBK_REF
-  ) {
-    return -1
-  }
-  const row = lb.lbSlot
-  if row < 0 || row >= rlElemTyIx.length || row >= rlElemName.length {
-    return -1
-  }
-  if rlElemKindAt(row) != RLK_UNION { return -1 }
-  let boxes = false
-  let i = 0
-  while i < elems.length {
-    const src = spreadArgOf(elems[i])
-    if src >= 0 {
-      const sb = spreadSrcBoxes(src, row, fnIx)
-      if sb < 0 { return -1 }
-      if sb == 1 { boxes = true }
-    }
-    i = i + 1
-  }
-  if boxes { return row }
-  return -1
 }
 
 // `emitArrSpread` for a destination list of union boxes: a same-row source copies as it is,
@@ -12223,38 +12061,6 @@ function emitSpreadGroup(g: i32, fnIx: i32, kind: i32, row: i32): i32 {
   if tb != null { return emitArrAt(lit, fnIx, tb) }
   const gb: ListBuild = { lbKind: kind, lbSlot: row }
   return emitArrAt(lit, fnIx, gb)
-}
-
-// The element kind group `g` of a spread literal building at `kk` is emitted at: a spread
-// source's own kind where it widens to `kk`, else `kk` itself (a plain run, or a same-kind source).
-function spreadGroupSrcKind(
-  g: i32,
-  elems: i32[],
-  kk: ListKind,
-  fnIx: i32,
-): ListKind {
-  let i = 0
-  while i < elems.length {
-    if spreadArgOf(elems[i]) == g {
-      const sk = mfRecvKindOf(g, fnIx)
-      if sk != null && spreadElemWidens(sk, kk) { return sk }
-      if kk == "strlist" && spreadSrcAtomTexts(g, fnIx).length > 0 {
-        return "list"
-      }
-      return kk
-    }
-    i = i + 1
-  }
-  return kk
-}
-
-// The wider scalar list build code `pk` names, by asking `pendingKindOfList`, or null.
-function spreadPendingScalar(pk: i32): ListKind | null {
-  const ks: ListKind[] = ["f64list", "i64list", "f32list"]
-  for k in ks {
-    if pendingKindOfList(k, 0) == pk { return k }
-  }
-  return null
 }
 
 // The element kind list kind `k` holds, as the converting copies take it: `listIdxKindOf`'s
@@ -28374,15 +28180,6 @@ function pushRecvLocal(objIx: i32, fnIx: i32, base: i32) {
   const r = listOpRecvLocal(objIx, fnIx, base, -1, ".push")
   listCastForPush = false
   return r
-}
-
-// The build code a list of element kind `k` is built at — the mapping `emitArr`'s own
-// arms read, so a synthesized literal lands on the same backing the receiver already has.
-function pendingKindOfList(k: ListKind, row: i32) {
-  // The spread's own answer for a closure row is the plain ref build, where a hole's is the
-  // at-slot one; aligning the two would move output, so it stays an arm.
-  if k == "reflist" && rlElemKindAt(row) == RLK_CLOSURE { return LBK_REF }
-  return listBuildKindOfVKind(k, row)
 }
 
 // The list build of the run a variadic `.push` appends: the receiver's own, since the run is
