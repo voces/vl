@@ -51,14 +51,14 @@ first.
 
 ## Readings
 
-Fixpoint seeds on both sides, master `de317fa31` against this branch.
+Fixpoint seeds on both sides, master `bbe4e7402` against this branch.
 
 | reading | master | branch |
 |---|---:|---:|
 | distilled functions claimed (`--claims`) | 41,683 | 41,697 (+14) |
 | armed shadow, distilled | | 41,788 of 41,788 matched |
-| self-compile functions claimed (mode 3) | 18,997 | 19,002 |
-| L2 self-compile fuel | 104,598,725,638 | 104,624,745,854 (+0.025%) |
+| self-compile functions claimed (mode 3) | 19,025 | 19,030 |
+| L2 self-compile fuel | 104,643,321,168 | 104,668,348,562 (+0.024%) |
 | `is-niche-never-effectful-receiver` matrix | 0 of 48 | 48 of 48 |
 
 Moved against master: the six d3204 `wr_isC_v` named cells and the two niche witness cases, each by
