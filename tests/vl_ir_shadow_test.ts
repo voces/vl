@@ -1051,7 +1051,6 @@ print(intr(true, 0.5))
       ["uncovered store short-circuit operand", 1],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["start uncovered map store short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
@@ -1061,6 +1060,8 @@ print(intr(true, 0.5))
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    // The start's map store stages its global receiver and key below the value's `if`.
+    if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -2121,6 +2122,56 @@ print(nullable(null))
   },
 });
 
+// A map store whose value is a short-circuit (a valued `if`): legacy writes the receiver and key,
+// then the value. A global receiver (staged as its read), a local and a parameter, with a
+// variable, a call-result or a literal key, are staged below the `if`, covered and matched; so are
+// values that run a map op of the same or of another shape. A boxed `??` value stays legacy's, by
+// name.
+Deno.test({
+  name: "ir shadow: a map store of a short-circuit value stages its receiver and key below the if",
+  ignore,
+  fn: () => {
+    const src = `let gb: {[string]: boolean} = Map()
+let gn: {[string]: boolean} = Map()
+let gq: {[string]: i32} = Map()
+let gi: {[string]: i32} = Map()
+function key(s: string): string { return s }
+function glob(a: boolean, c: boolean, k: string) { gb[k] = a && c }
+function loc(a: boolean, c: boolean, k: string): boolean {
+  const m: {[string]: boolean} = Map()
+  m[key(k)] = c || a
+  return m[k] ?? false
+}
+function par(m: {[string]: boolean}, a: boolean, k: string) { m[k] = gn.has(k) && a }
+function other(a: boolean, k: string) { gb[k] = gq.has(k) || a }
+function boxed(p: i32 | null, k: string) { gi[k] = p ?? 7 }
+function lit(a: boolean, c: boolean) { gb["x"] = a && c }
+gn["k"] = true
+gq["q"] = 1
+glob(true, true, "k")
+print(loc(false, true, "k"))
+par(gb, true, "p")
+other(false, "q")
+boxed(null, "k")
+lit(true, false)
+print(gb["k"] ?? false)
+print(gb["p"] ?? false)
+print(gb["q"] ?? false)
+print(gi["k"] ?? 0)
+`;
+    const { rc, rows } = run(src, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want key, glob, loc, par, other and lit covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (rows.get("uncovered map store short-circuit operand") !== 1) {
+      throw new Error(`want boxed left to legacy by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // `__array_copy__` is written as legacy's arm writes it: each list operand followed by its backing,
 // then the copy. An i32, a string, an f64 and a record list each match byte for byte.
 Deno.test({
@@ -2188,6 +2239,71 @@ print(d[0] + d[3])
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
       throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A valued `match` lowers to an if chain whose later links the checker never types: every link
+// takes the head's rep, as legacy writes every link at the head's kind, and a lowered `is` or
+// wildcard test is boolean. A literal-union chain, a type-pattern chain, a wildcard arm and two
+// widening chains are each covered and matched.
+Deno.test({
+  name: "ir shadow: a valued match chain's links take the head's rep and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type A = { a: i32 }
+type B = { b: i32 }
+type C = { c: i32 }
+type U = A | B | C
+type Op = "add" | "sub" | "neg" | "divide"
+function linkKind(op: Op, n: i32): boolean {
+  const ok = match op {
+    "add" | "sub" => true
+    "neg" => false
+    "divide" => n > 3
+  }
+  return ok
+}
+function isArm(u: U): i32 {
+  const v = match u {
+    A => u.a
+    B => u.b * 2
+    C => u.c * 3
+  }
+  return v
+}
+function wildArm(u: U): i32 {
+  const v = match u {
+    A => u.a
+    _ => 7
+  }
+  return v
+}
+print(linkKind("sub", 0))
+print(linkKind("divide", 5))
+print(isArm({ b: 4 }))
+print(wildArm({ c: 1 }))
+type W = "i" | "f" | "z"
+function widen(w: W, n: i32): f64 {
+  const v: f64 = match w {
+    "i" => n
+    "f" => 2.5
+    "z" => 0
+  }
+  return v
+}
+function elseIfWiden(n: i32): f64 {
+  const v: f64 = if n > 2 { n } else if n > 1 { 1.5 } else { 0 }
+  return v
+}
+print(widen("i", 3) + widen("f", 0))
+print(elseIfWiden(3) + elseIfWiden(2))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
