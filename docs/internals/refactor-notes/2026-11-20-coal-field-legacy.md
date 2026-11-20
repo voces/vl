@@ -30,5 +30,5 @@ comparison of one value with itself, so the retag never ran. It is deleted, and 
 ## Measured
 
 Byte-identical output, master's fixpoint seed against this branch's: see the PR for the
-`ir-identity` corpus A/B, `--cases` and the per-file `tests/cases` A/B. Compiler lines: net +42
-(`wasmEmit.vl` +202 / −160), the cost of naming the plan and the refusals.
+`ir-identity` corpus A/B, `--cases` and the per-file `tests/cases` A/B. Compiler lines: net +38
+(`wasmEmit.vl` +198 / −160), the cost of naming the plan and the refusals.
