@@ -14,6 +14,7 @@ import {
   FuncDecl,
   Ident,
   Index,
+  IsExpr,
   LetDecl,
   Member,
   NullLit,
@@ -24,14 +25,22 @@ import {
   Unary,
   elseIfLink,
   hasSpreadItem,
+  identNameAt,
   nodeAt,
+  nodeChildren,
   nodeSpineChildren,
 } from "./ast"
 import { arrLitDestTy, arrLitUnionDestTaken } from "./check_bind_rows"
 import { nodeCtxTyIxOf } from "./check_core_state"
 import { elabTyClosed } from "./check_elab_cap"
-import { nodeArrayElemIsNulLitUnion, nodeTyIxOf } from "./check_node_tys"
+import { isVarTyIxOf } from "./check_list_union"
+import {
+  nodeArrayElemIsNulLitUnion,
+  nodeTyIsNullable,
+  nodeTyIxOf,
+} from "./check_node_tys"
 import { cexLitPeel, intLitIsNegated } from "./check_num_lits"
+import { listDisjointDepth } from "./check_type_shape"
 import {
   T,
   TyArray,
@@ -39,10 +48,13 @@ import {
   mkArrayTy,
   tyAt,
   tyElemOf,
+  tyPrimNameOf,
+  tySame,
 } from "./check_types"
 import {
   ALLOC_LIT_CHUNK,
   NEW_FIXED_MAX,
+  listIsTestedIdent,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
@@ -70,6 +82,7 @@ import {
   exprRefArray,
   exprStringArray,
   exprU8Array,
+  exprUnion,
   forInMapRecv,
   forInMapValsSlot,
   forInPairElemKind,
@@ -77,7 +90,9 @@ import {
   forInPairValsSlot,
   globalLetOfRead,
   listElemRepIsRow,
+  listIsRecvTyOf,
   litArmRowOf,
+  localIndexOf,
   objLitVariantIdxNoStructRow,
   recBuildRowOf,
   refListElemIsUnion,
@@ -98,7 +113,7 @@ import {
 } from "./emit_lit_atoms"
 import { monoIsClashLit } from "./emit_mono"
 import { refPushScratchBaseFor } from "./emit_mv_slots"
-import { narrowedArmNeedsUnbox } from "./emit_plan_union"
+import { narrowedArmNeedsUnbox } from "./emit_plan_coerce"
 import {
   ListBuild,
   emptyArrHoleBuildKind,
@@ -144,6 +159,10 @@ import {
   fa128Ty,
   fa32Ty,
   fa64Ty,
+  fitGrowFn,
+  fitGrowLocal,
+  fitGrowName,
+  fitGrowTy,
   fl128Ty,
   fl32Ty,
   fl64Ty,
@@ -153,14 +172,20 @@ import {
   ia64Ty,
   il64Ty,
   lTy,
+  liBack,
+  liKinds,
+  liSlots,
+  listIdxScratchBase,
   mkArrTy,
   mkListTy,
   pkPushBase,
+  pkRowOfPrim,
   pushScratchBase,
   rlBackIdx,
   rlElemHeap,
   rlElemNullable,
   rlElemTyIx,
+  rlRowMint,
   rlRowsMinted,
   rlWrapIdx,
   sHeapIdx,
@@ -179,7 +204,7 @@ import {
   scalarListElemKind,
   scalarListElemOfListKind,
 } from "./emit_value_sites"
-import { nonNullTy, primNameOf, tyHasTyVar } from "./tyquery"
+import { nonNullTy, primIsSubWord, primNameOf, tyHasTyVar } from "./tyquery"
 
 // Every `VKind` the four scalar-list descriptors below do not name, as one answer: a
 // recorded failure plus the i32 list's own index, so the module stays well-formed while the
@@ -881,6 +906,8 @@ export type PopPlan = {
   pqWrap: i32,
   pqBack: i32,
   pqBase: i32,
+  pqRefSlot: i32,
+  pqElemRef: boolean,
 }
 
 // The plan of `.pop()`/`.get` call `callIx` over an i32 or scalar list, or null for a ref or
@@ -901,6 +928,8 @@ export function popPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
       pqWrap: lTy(),
       pqBack: aTy(),
       pqBase: pushScratchBase,
+      pqRefSlot: -1,
+      pqElemRef: false,
     }
     return p
   }
@@ -913,6 +942,8 @@ export function popPlanOf(callIx: i32, fnIx: i32): PopPlan | null {
     pqWrap: scalarListWrap(k, row),
     pqBack: scalarListBack(k, row),
     pqBase: scalarPushScratchBaseOf(k, row),
+    pqRefSlot: -1,
+    pqElemRef: false,
   }
   return sp
 }
@@ -1493,4 +1524,267 @@ export function objLitBuildVariantRow(exprIx: i32, fnIx: i32): i32 {
   const ad = nodeRepTyAt(exprIx, fnIx)
   const pvi = if ad >= 0 && ad != nodeTyAt(exprIx, fnIx) { litArmRowOf(exprIx, fnIx, ad) } else { objLitVariantIdxNoStructRow(exprIx, fnIx) }
   return if pvi >= 0 && pvi < uVariants.length { pvi } else { -1 }
+}
+
+// The frame kind of a list whose elements are `elemTy`, pushing its ref-list row (0 for a
+// scalar list), backing and wrapper heap types onto `out`; null for an element with no list row.
+export function listFitElemKind(elemTy: i32, out: i32[]): ListKind | null {
+  const en = tyPrimNameOf(elemTy)
+  let kind: ListKind = "reflist"
+  if en == "string" {
+    kind = "strlist"
+  } else if en == "f64" {
+    kind = "f64list"
+  } else if en == "i64" {
+    kind = "i64list"
+  } else if en == "f32" {
+    kind = "f32list"
+  } else if primIsSubWord(en) {
+    kind = "u8list"
+  }
+  // A `never` element reps as the default `i32` list, which no value reaches (D15530).
+  else if en == "i32" || en == "boolean" || en == "never" {
+    kind = "list"
+  }
+  if kind == "reflist" {
+    // The first reader of an `is K[]` arm's empty list: its row is minted here (D4911).
+    const slot = rlRowMint(elemTy)
+    if slot < 0 || slot >= rlWrapIdx.length { return null }
+    out.push(slot)
+    out.push(rlBackIdx[slot])
+    out.push(rlWrapIdx[slot])
+    return kind
+  }
+  // A packed list's slot is its row; every other scalar list carries 0.
+  const row = if kind == "u8list" { pkRowOfPrim(tyPrimNameOf(elemTy)) } else { 0 }
+  out.push(row)
+  out.push(spreadBackIdx(kind, row))
+  out.push(spreadWrapIdx(kind, row))
+  return kind
+}
+
+// The `fitGrow*` row of an `is K[]` arm in `fnIx` that pushes onto the receiver `Ident` `rIx`
+// reads (any `K[]` when `kTy` is -1), or -1 (D4934). Its local holds `K[]` from the first test that fits on, so
+// that list is the receiver's place: a later test fits it and a `.length` reads it.
+export function listFitGrowRow(rIx: i32, kTy: i32, fnIx: i32): i32 {
+  if !listIsTestedIdent(rIx) { return -1 }
+  const name = identNameAt(rIx)
+  if fitGrowFn != fnIx { listFitGrowScan(fnIx) }
+  let i = 0
+  while i < fitGrowName.length {
+    if fitGrowName[i] == name && (kTy < 0 || tySame(fitGrowTy[i], kTy)) {
+      return i
+    }
+    i = i + 1
+  }
+  return -1
+}
+
+// Fills the `fitGrow*` rows for `fnIx`: each `is K[]` over a local list whose elements can never
+// be `K`, whose arm pushes onto the receiver, and where every other use of the receiver is one
+// `listFitGrowUsesOk` admits. Any other use would read the receiver's own list, which the
+// pushed `K[]` has replaced, so such an arm keeps `LIST_FIT_PUSH_MSG`.
+function listFitGrowScan(fnIx: i32) {
+  fitGrowFn = fnIx
+  fitGrowName = []
+  fitGrowTy = []
+  fitGrowLocal = []
+  if fnIx < 0 { return 0 }
+  const fn = nodeAt(fnIx)
+  if !(fn is FuncDecl) { return 0 }
+  const isIxs: i32[] = []
+  const pushNames: string[] = []
+  const pushTys: i32[] = []
+  listFitGrowWalk(fn.fnBody, isIxs, pushNames, pushTys)
+  for isIx in isIxs {
+    const nd = nodeAt(isIx)
+    const kTy = isVarTyIxOf(isIx)
+    if nd is IsExpr && kTy >= 0 && kTy < T.tys.length {
+      const r = nodeAt(unwrapParen(nd.isObj))
+      const kt = tyAt(kTy)
+      if (
+        r is Ident
+        && kt is TyArray
+        && listFitGrowEligible(nd, r.identName, kTy, fnIx)
+      ) {
+        let pushed = false
+        let p = 0
+        while p < pushNames.length {
+          if pushNames[p] == r.identName && tySame(pushTys[p], kTy) {
+            pushed = true
+          }
+          p = p + 1
+        }
+        const heaps: i32[] = []
+        const kind = listFitElemKind(tyElemOf(kt), heaps)
+        if (
+          pushed
+          && kind != null
+          && listFitGrowUsesOk(fn.fnBody, -1, r.identName, kTy, false, fnIx)
+        ) {
+          fitGrowName.push(r.identName)
+          fitGrowTy.push(kTy)
+          fitGrowLocal.push(listFitSlot(kind, heaps[0], 11))
+        }
+      }
+    }
+  }
+  return 0
+}
+
+// Whether the `is K[]` `nd` over local `name` takes the shadow `listFitShadowSet` stores: no row
+// yet, a receiver that is neither a union nor nullable, and elements disjoint at the first depth.
+function listFitGrowEligible(
+  nd: IsExpr,
+  name: string,
+  kTy: i32,
+  fnIx: i32,
+): boolean {
+  let i = 0
+  while i < fitGrowName.length {
+    if fitGrowName[i] == name && tySame(fitGrowTy[i], kTy) { return false }
+    i = i + 1
+  }
+  if localIndexOf(fnIx, unwrapParen(nd.isObj)) < 0 { return false }
+  if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) { return false }
+  const recvTy = listIsRecvTyOf(nd.isObj, fnIx)
+  return recvTy >= 0 && listDisjointDepth(recvTy, kTy) == 1
+}
+
+// Collects, under `ix` and outside nested functions, each `is` testing a list type on a named
+// variable, and each `.push` onto a named variable with the type its receiver is read at.
+function listFitGrowWalk(
+  ix: i32,
+  isIxs: i32[],
+  pushNames: string[],
+  pushTys: i32[],
+) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = nodeAt(ix)
+  if n is FuncDecl { return 0 }
+  if n is IsExpr {
+    if listIsTestedIdent(unwrapParen(n.isObj)) { isIxs.push(ix) }
+  } else if n is Call {
+    if n.callFn < 0 { return 0 }
+    const cf = nodeAt(n.callFn)
+    if cf is Member && cf.memProp == "push" {
+      const o = nodeAt(cf.memObj)
+      if o is Ident {
+        pushNames.push(o.identName)
+        pushTys.push(nodeTyIxOf(cf.memObj))
+      }
+    }
+  }
+  for k in nodeChildren(ix) { listFitGrowWalk(k, isIxs, pushNames, pushTys) }
+  return 0
+}
+
+// Whether every use of `name` under `ix` (child of `par`) is one the arm's `K[]` stands in for:
+// a read typed `K[]`, the operand of another `is K[]`, or the receiver of a `.length`, none of
+// them in a nested function, which would read its own capture of the receiver.
+function listFitGrowUsesOk(
+  ix: i32,
+  par: i32,
+  name: string,
+  kTy: i32,
+  inner: boolean,
+  fnIx: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = nodeAt(ix)
+  if n is FuncDecl {
+    return listFitGrowUsesOk(n.fnBody, ix, name, kTy, true, fnIx)
+  }
+  if n is Ident && n.identName == name {
+    if inner { return false }
+    const t = nodeTyAt(ix, fnIx)
+    if t >= 0 && tySame(t, kTy) { return true }
+    if par < 0 { return false }
+    const p = nodeAt(par)
+    if p is IsExpr && p.isObj == ix {
+      const pk = isVarTyIxOf(par)
+      return pk >= 0 && tySame(pk, kTy)
+    }
+    return p is Member && p.memObj == ix && p.memProp == "length"
+  }
+  for k in nodeChildren(ix) {
+    if !listFitGrowUsesOk(k, ix, name, kTy, inner, fnIx) { return false }
+  }
+  return true
+}
+
+// A fresh lazy-frame slot of `liBack` code `code` for frame kind `kind` (ref-list row `slot`):
+// never shared, so a nested fit loop keeps its own.
+export function listFitSlot(kind: ListKind, slot: i32, code: i32): i32 {
+  liKinds.push(kind)
+  liSlots.push(slot)
+  liBack.push(code)
+  return listIdxScratchBase + liKinds.length
+}
+
+// The (wrapper, backing) heap pair a list of element kind `k` builds — `.slice`'s own ladder,
+// asked by the spread literal so the two cannot disagree about a rep. `-1` in either half when
+// the module never collected that list type, or when a `"reflist"` row is not a real one.
+export function spreadWrapIdx(k: ListKind, row: i32) {
+  // Exhaustive over `ListKind` and `_`-less: the i32-list wrapper is the fall-through, a real
+  // answer, so a new element kind must name its own wrapper (D1898).
+  match k {
+    "f64list" => {
+      return fl64Ty()
+    }
+    "i64list" => {
+      return il64Ty()
+    }
+    "f32list" => {
+      return fl32Ty()
+    }
+    "v128list" => {
+      return fl128Ty()
+    }
+    "u8list" => {
+      return pkWrapAt(row)
+    }
+    "strlist" => {
+      return mkListTy()
+    }
+    "reflist" => {
+      if row < 0 || row >= rlWrapIdx.length { return -1 }
+      return rlWrapIdx[row]
+    }
+    "list" => {
+      return lTy()
+    }
+  }
+}
+
+export function spreadBackIdx(k: ListKind, row: i32) {
+  // Exhaustive over `ListKind` and `_`-less: the i32-list backing is the fall-through, a real
+  // answer, so a new element kind must name its own backing (D1898).
+  match k {
+    "f64list" => {
+      return fa64Ty()
+    }
+    "i64list" => {
+      return ia64Ty()
+    }
+    "f32list" => {
+      return fa32Ty()
+    }
+    "v128list" => {
+      return fa128Ty()
+    }
+    "u8list" => {
+      return pkBackAt(row)
+    }
+    "strlist" => {
+      return mkArrTy()
+    }
+    "reflist" => {
+      if row < 0 || row >= rlBackIdx.length { return -1 }
+      return rlBackIdx[row]
+    }
+    "list" => {
+      return aTy()
+    }
+  }
 }
