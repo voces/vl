@@ -985,6 +985,26 @@ function coalPopOrWhy(n: SCoalBox): string {
   return ""
 }
 
+// Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
+// key along an inline form, `i32` (1) or mv (2), into an out of the read's own rep.
+function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
+  const mp = n.cbMap
+  if mp == null { return "a fused map read holds no probe" }
+  use(mp.mpKey, id)
+  if !mapRecvOk(mp.mpSym, n.cbL, id) {
+    return "a map read of a receiver that is no map"
+  }
+  if mp.mpForm != 1 && mp.mpForm != 2 {
+    return "a fused map read writes its default in no miss arm"
+  }
+  const o = n.cbOut
+  const p = repPrim(vf.irVars[o].vRep)
+  if mp.mpForm == 1 && p != "i32" && p != "bool" {
+    return "a map read's plain probe yields no i32"
+  }
+  return ""
+}
+
 function nested(body: i32[]) {
   const nDefs = vfDefLog.length
   for id in body { stmt(id) }
@@ -1191,12 +1211,18 @@ function stmt(id: i32) {
     }
     SIf => ifSpine(id)
     SCoalBox => {
-      use(n.cbL, id)
+      // A fused map read's receiver is read by its probe, which may name a global instead.
+      const mapArm = n.cbArm == "mapIndexGetOr"
+      if (n.cbMap != null) != mapArm {
+        return fail(2, id, "a `??` holds a map probe off the map-read arm")
+      }
+      if !mapArm { use(n.cbL, id) }
       if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
         return fail(4, id, "a boxed `??` writes no variable")
       }
       const why = match n.cbArm {
         "popOr" => coalPopOrWhy(n)
+        "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }

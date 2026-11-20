@@ -1084,8 +1084,9 @@ Deno.test({
     // Case 10 is a bounds check while the bounds rule is the uninstalled default (rule 8), and
     // case 11 a box whose immediate stands for a call (rule 2).
     // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
-    // (rule 2), and a default that leaves the out unwritten (rule 5).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
+    // (rule 2), and a default that leaves the out unwritten (rule 5). Cases 15 to 17 break a fused
+    // map read the same three ways: a probe of an i32, a probe on the pop's arm, an unwritten out.
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 5];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
