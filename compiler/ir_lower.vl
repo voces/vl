@@ -69,11 +69,13 @@ import {
   declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
+  localIndexOf,
   memberBoxReadEnter,
   memberBoxReadLeave,
   readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
+import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { declaredSlotOfDecl } from "./emit_struct_order"
@@ -442,6 +444,8 @@ import {
   unionSinkBase,
 } from "./emit_state"
 import { ListBuild } from "./emit_ref_list_kinds"
+import { identDeclOf, sidOfNode } from "./symbols"
+import { globalIndexOfSid } from "./emit_fn_ret_kinds"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -783,8 +787,11 @@ function rhs(r: Rhs, tail: boolean) {
       emitNullOwn(r.nuOwn)
     }
     RRetNull => {
+      // The builder misses a function with no null plan; the lowering holds the same line itself.
+      const plan = nullRetPlanOf(lw.irAt)
+      if plan == null { return irLMiss("returned null with no plan") }
       leaf()
-      emitNullRetTail(nullRetPlanOf(lw.irAt))
+      emitNullRetTail(plan)
     }
     RTest => {
       irLOpnd(r.teV)
@@ -1179,11 +1186,18 @@ function getField(r: RGetField) {
   irLOpnd(r.gfV)
   // A member record read the box plan passes as its field's box is lowered at its storage, as
   // the builder built it (`memberBoxTemp`).
-  if !memberBoxReadAt(r.gfAt, lw.irAt) { return fieldTail(r.gfAt, m) }
-  const marks = memberBoxReadEnter(r.gfAt)
-  const rc = fieldTail(r.gfAt, m)
-  memberBoxReadLeave(marks)
-  return rc
+  if memberBoxReadAt(r.gfAt, lw.irAt) {
+    const marks = memberBoxReadEnter(r.gfAt)
+    const rc = fieldTail(r.gfAt, m)
+    memberBoxReadLeave(marks)
+    return rc
+  }
+  // A read the builder built at its storage (an `is` receiver's) is lowered at it too.
+  if !r.gfStored { return fieldTail(r.gfAt, m) }
+  const mark = storageReadEnter(r.gfAt)
+  const rs = fieldTail(r.gfAt, m)
+  storageReadLeave(mark)
+  return rs
 }
 
 // The plain field index member read `at` reads, or -1.
@@ -1312,6 +1326,17 @@ function spreadList(r: RSpread) {
   )
 }
 
+// The module global map walk receiver `recvIx` names, or -1: a bare name with no local in `fnIx`
+// whose declaration is a module `let`. The builder and the lowering both decide by it, so a global
+// receiver is read as one and any other is an operand.
+export function mapRecvGlobalIx(recvIx: i32, fnIx: i32): i32 {
+  if recvIx < 0 || !(nodeAt(recvIx) is Ident) { return -1 }
+  const d = identDeclOf(recvIx)
+  if d < 0 || localIndexOf(fnIx, recvIx) >= 0 { return -1 }
+  if !(nodeAt(d) is LetDecl) { return -1 }
+  return globalIndexOfSid(sidOfNode(recvIx))
+}
+
 // `SForIn`: legacy's walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at the
 // element variable's slot, the list stored, its header hoist, the cursor, the body's index hoists,
 // the IR's body in each unrolled copy and the rolled loop, and the scope closed.
@@ -1334,9 +1359,20 @@ function forIn(n: SForIn, pending: i32[]) {
   )
   if lp == null { return irLMiss("walk backing") }
   if n.xfMap >= 0 {
-    if lp.mapRecv < 0 { return irLMiss("walk map") }
+    if lp.mapRecv < 0 || mapRecvGlobalIx(lp.mapRecv, fnIx) != n.xfMap {
+      return irLMiss("walk map")
+    }
     irLSettle(pending)
     globalRead(n.xfMap, n.xfMapNonNull)
+    mapRecvRefTail(lp.mapRecv, fnIx)
+    forInMapStash(fnIx, lp)
+    forInMapList(s.fiIter, fnIx, lp.mwShape)
+  } else if lp.mapRecv >= 0 {
+    // A receiver that is no global is written raw where legacy's stash writes it, then recovered.
+    if mapRecvGlobalIx(lp.mapRecv, fnIx) >= 0 {
+      return irLMiss("walk map receiver")
+    }
+    cond(n.xfList, pending)
     mapRecvRefTail(lp.mapRecv, fnIx)
     forInMapStash(fnIx, lp)
     forInMapList(s.fiIter, fnIx, lp.mwShape)
