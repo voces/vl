@@ -332,10 +332,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals, and a list literal whose elements box into a union is a ref list legacy coerces: each a
-// named miss, never a byte mismatch.
+// locals and closed after its last push: covered and matched. A list literal whose elements box
+// into a union is a ref list legacy coerces: a named miss, never a byte mismatch.
 Deno.test({
-  name: "ir shadow: a reserved list binding and a union-element list literal are named misses",
+  name: "ir shadow: a reserved list binding matches, a union-element list literal misses by name",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -347,7 +347,10 @@ function ln(x: i32): (i32 | string)[] { return [x, "s"] }
 print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
-    for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the reserved binding covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    for (const want of ["uncovered array ref"]) {
       if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
@@ -1129,6 +1132,27 @@ Deno.test({
     }
     if (!rows.has("uncovered string operand after another")) {
       throw new Error(`want t a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
+// builds and matches, a literal arm included; a nullable union binding is a named miss.
+const LET_IF_BOX =
+  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction h(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string = if b { v } else { "x" }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(f(false, 1, "y"))\nprint(h(true, 1))\nprint(g(false, 1))\n`;
+Deno.test({
+  name: "ir shadow: a union binding's if initializer builds into a seeded box and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LET_IF_BOX, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and h covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (!rows.has("uncovered declaration if per arm rep")) {
+      throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
