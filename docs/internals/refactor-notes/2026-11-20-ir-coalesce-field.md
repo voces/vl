@@ -71,9 +71,22 @@ the fixpoint master seed and this branch's seed cover the same functions, and th
 | self-compile functions covered | 18,353 | 18,353 |
 | corpus functions covered (45,678) | 40,503 | 40,503 |
 
-An earlier reading of +306 compared this branch's seed against #9236's pre-merge figure, not a seed
-built from the same source; it measured master drift. The arm's value is the capability its
-witnesses show and the legacy split.
+An earlier reading of +306 compared this branch's seed (18,198, on #9236's merged head) against
+#9236's figure before its master merge (17,892). #9236's merge brought master's `890abde55` to
+`50563c118`, whose coverage PRs claim +292 between them: #9226 (+53), #9227 (+84), #9229 (+41),
+#9230 (+32), #9231 (+53) and #9232 (+29). #9236's own body records 18,192 after that merge, so the
+arm's own reading then was about +6. That residue was not traced, and on master `89210abc4` it is 0.
+
+**Outcome: closed, the IR arm parked on branch `f2/ir-coal-field`** (coordinator, 2026-11-20). The
+legacy half (`coalFieldPlanOf`, the shared refusals, the dead retag's removal) lands on its own. A
+later lane picks the arm up from the branch once a population appears. Its hand witnesses, each
+covered and matched where master misses `coalesce box next`:
+
+- `r.v ?? 7`: an unboxed atom;
+- `r.v ?? 0.5` returning `f64`: a widened default;
+- `r.v ?? d` with `d: i32 | null`: the box kept;
+- `r.v ?? (r = q2).w`: a default that reassigns the receiver the present arm re-reads (prints 64);
+- `x.v ?? 1` with `x` a loop variable narrowed by `is A`: the cast receiver.
 
 The corpus's `coalesce box next` population is call and name operands, not record fields:
 
