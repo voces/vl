@@ -1708,6 +1708,24 @@ Deno.test({
   },
 });
 
+// An else-less tail `if` writes no `else`, its fall-through padded by the caller: a returned
+// `if` with no `else` and a chain ending in one, each at a nullable result, build and match.
+const ELSE_LESS_TAIL_IF =
+  `type P = { v: i32 }\nfunction f(c: boolean, p: P): P | null {\n  return if c { p }\n}\nfunction g(n: i32): string | null {\n  return if n > 0 { "pos" } else if n < 0 { "neg" }\n}\nconst p: P = { v: 4 }\nconst a = f(true, p)\nif a != null { print(a.v) }\nprint(g(0) ?? "z")\n`;
+Deno.test({
+  name: "ir shadow: an else-less tail if writes no else and its caller pads the fall-through",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ELSE_LESS_TAIL_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
