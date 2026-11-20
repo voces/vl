@@ -19,7 +19,8 @@
   `mapGetArmOf` and `userGlobalReadClass` again, and misses on any disagreement.
 - **Verifier.** An `RMap` receiver, and a result at the value's rep or at that rep's nullable.
 - **Builder reps.**
-  - An mv slot's ref value at its disc-1 niche, or as itself when the read is narrowed.
+  - An mv slot's ref value at its disc-1 niche, or as itself when the read is narrowed: the read's
+    rep, not its type, says which, so the builder asks the checker nothing.
   - A mono-valued map's value as itself.
   - A `boolean` map at `boolean | null`: its miss reads `2`, the nullable's sentinel.
   - Union and scalar (`f64`/`i64`/`f32`/`v128`) mv slots stay named misses.
@@ -45,4 +46,4 @@ write. The rest now stop at blockers that are not a bare map read; one is `for i
 - **`tests/cases` A/B, master seed against this seed, no shadow:** 7,248 identical, 0 differ. This
   covers legacy's Index arm, which now dispatches on `mapGetArmOf`.
 - **Mode 3:** 0 differ, and the self-compile identical.
-- **L2 fuel**, same box: 103,444,647,603 → 103,569,052,095 (+0.12%).
+- **L2 fuel**, same box: 103,444,647,603 → 103,571,467,087 (+0.12%).
