@@ -780,6 +780,33 @@ print(bs[1])
   },
 });
 
+// `n is A` over a local `U | null` box, a valued `if` joining an arm with `null`: the same box
+// legacy tests by its tag, `null` one more tag, read raw past the narrowing. Covered and matched.
+Deno.test({
+  name: "ir shadow: an is test over a local nullable union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type A = { k: "a", v: i32 }
+type B = { k: "b", w: i32 }
+type U = A | B
+const us: U[] = [{ k: "a", v: 3 }, { k: "b", w: 4 }]
+function at(i: i32): U { return us[i] }
+function f(x: i32): i32 {
+  const n = if x >= 0 && x < us.length { at(x) } else { null }
+  if !(n is A) && !(n is B) { return -1 }
+  if n is A { return n.v }
+  return 0
+}
+print(f(0) + f(1) + f(9))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -946,10 +973,10 @@ run(2.5)
 });
 
 // A record literal on legacy's layout path builds field by field and matches, a widened `f64`
-// field included; a box handed to another union's box field (legacy converts its members) stays a
+// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) stays a
 // named miss.
 Deno.test({
-  name: "ir shadow: a record literal builds, a widened field too; a box from a box is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union is a named miss",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
@@ -970,8 +997,8 @@ if d.v is f64 { print(d.v) }
     if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
       throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (rows.get("uncovered object field box from a box") !== 1) {
-      throw new Error(`want mkd a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered pre-path coercion") !== 1) {
+      throw new Error(`want mkd's i32-to-f64 retag a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1116,8 +1143,9 @@ Deno.test({
     // (rule 2), and a default that leaves the out unwritten (rule 5). Case 15 is a stashed
     // record whose source order evaluates one field twice (rule 2). Cases 16 to 18 break a fused
     // map read: a probe of an i32, a probe on the pop's arm (rule 2), an unwritten out (rule 5).
-    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2];
+    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2), and case 20
+    // a fused map read's mv slot read into an out that is not its map's value (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
@@ -1612,6 +1640,36 @@ print(pick(1))
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// Two spread literals in one function: the IR builds the one-group `[...a]` along the shared
+// spread plan while legacy keeps the many-group one, each in its own recorded slots, and a
+// function of the one-group form alone is covered and matched.
+Deno.test({
+  name: "ir shadow: a one-group spread matches beside a many-group one legacy keeps",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function f(a: i32[], b: i32[]): i32 {
+  const x = [...a]
+  const y = [...a, 1, ...b]
+  return x.length + y.length
+}
+function g(a: i32[]): i32 {
+  const x = [...a]
+  return x.length
+}
+print(f([1, 2], [3]) + g([4]))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("node-in array: miss array spread groups") ?? 0) !== 1) {
+      throw new Error(`want the many-group spread left to legacy, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want g covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

@@ -330,3 +330,52 @@ print(c[0] + d[0])
     }
   },
 });
+
+// A fragment inside a walk it did not build reads the loop variable's legacy slot, held to
+// legacy's cell: a string's code unit, a packed byte, a map's key and value, an index, a variable
+// a closure captures, and an outer walk's variable. Each literal matches or misses by name.
+Deno.test({
+  name: "ir door: a list literal reading a loop variable matches or names its miss",
+  ignore,
+  fn: () => {
+    const r = rows(`function w1(s: string): i32 {
+  let t = 0
+  for ch in s { const ys = [ch, 1]; t = t + ys[0] }
+  return t
+}
+function w2(bs: u8[]): i32 {
+  let t = 0
+  for b in bs { const ys = [b, 1]; t = t + ys[0] }
+  return t
+}
+function w3(m: {[string]: i32}): i32 {
+  let t = 0
+  for k, v in m { const ks = [k, "z"]; const vs = [v, 1]; t = t + vs[0] + ks.length }
+  return t
+}
+function w4(xs: i32[]): i32 {
+  let t = 0
+  for i, x in xs { const ys = [i, x]; t = t + ys[0] + ys[1] }
+  return t
+}
+function w5(xs: i32[]): i32 {
+  let t = 0
+  for x in xs { const g = () => x + 1; const ys = [x, g()]; t = t + ys[0] + ys[1] }
+  return t
+}
+function w6(xs: i32[], zs: i32[]): i32 {
+  let t = 0
+  for x in xs { for z in zs { const ys = [x, z]; t = t + ys[0] * ys[1] } }
+  return t
+}
+const bs: u8[] = [200, 7]
+const m: {[string]: i32} = Map()
+m["a"] = 3
+print(w1("ab") + w2(bs) + w3(m) + w4([5, 6]) + w5([5, 6]) + w6([2, 3], [4, 5]))
+`);
+    const bad = [...r.keys()].filter((k) => k.startsWith("node-in") && (k.includes("read of") || k.includes("differ")));
+    if (bad.length > 0 || (r.get("node-in array: matched") ?? 0) < 7) {
+      throw new Error(`want every loop-variable literal matched or a named miss, got ${show(r)}`);
+    }
+  },
+});
