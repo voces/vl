@@ -1768,6 +1768,41 @@ Deno.test({
   },
 });
 
+// A returned value `if` in a function taking the union return sink builds one return per arm,
+// each arm's box written to the sink pair: an `i32 | string` and an `i32 | boolean` result match.
+const UNION_SINK_RET =
+  `function u2(n: i32): i32 | string {\n  return if n > 0 { n } else { "neg" }\n}\nfunction u4(n: i32): i32 | boolean {\n  return if n > 0 { n } else { false }\n}\nprint(u2(3))\nprint(u4(-3))\n`;
+Deno.test({
+  name: "ir shadow: a returned value if under the union return sink builds per-arm returns and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(UNION_SINK_RET, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want u2 and u4 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// The statement spelling of an else-less chain of returns falls through to the body's own tail.
+const RET_CHAIN_ELSELESS =
+  `function c3(n: i32, a: string): string {\n  if n > 0 { return a } else if n < 0 { return "neg" }\n  return "zero"\n}\nprint(c3(0, "p"))\nprint(c3(-1, "p"))\n`;
+Deno.test({
+  name: "ir shadow: an else-less chain of statement returns builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_CHAIN_ELSELESS, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want c3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
