@@ -16,6 +16,7 @@ values as dropped statements and pads with `null`; the checker's own "this value
 warning agrees. Admitting only arms that each `return` moves none of master's 10 such functions,
 since all of them end in a value. The rung stays as it is.
 
-Measured at the merge-base in the PR.
+Measured on fixpoint seeds at merge-base `544e059a0` (functions with no blocker): self-compile
+18,529 → 18,531 of 19,282; corpus 41,296 → 41,296 of 45,678.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
