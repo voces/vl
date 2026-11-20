@@ -26,4 +26,4 @@ The other 29 are left: the box at a box rep and the atom at a string are not nar
 
 | | lines |
 |---|---|
-| compiler | +4, −2 |
+| compiler | +5, −2 |
