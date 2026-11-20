@@ -187,6 +187,7 @@ import {
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
+  valueIfLitTrue,
   variantFieldArmOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
@@ -988,10 +989,18 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     outs.push(t)
     thens.push(thenB)
     elses.push(n.ifElse)
-    const tv = ifArmValueExpr(n.ifElse)
+    // The next link: a direct `else if`, or an `else` block whose one statement is an `if`. A
+    // literal `true` decides a block `else` dead, so the chain ends there.
+    const direct = nodeAt(n.ifElse) is IfStmt
+    if !direct && valueIfLitTrue(n.ifCond) { break }
+    const tv = if direct { n.ifElse } else { ifArmValueExpr(n.ifElse) }
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
+    // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
+    if !direct && armHasPrelude(n.ifElse) {
+      return irBMiss("expression if else prelude")
+    }
     // `irBExpr`'s own prelude for the link it would reach.
     const pre = exprPrePathWhy(tv, ibFnIx)
     if pre != "" { return irBMiss(pre) }
@@ -1006,7 +1015,13 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     crep = r
   }
   let k = bs.length - 1
-  let elseB = ifArm(elses[k], outs[k], reps[k])
+  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
+  let elseB: i32[] = []
+  if valueIfLitTrue(n.ifCond) {
+    irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, elses[k])
+  } else {
+    elseB = ifArm(elses[k], outs[k], reps[k])
+  }
   if ibMiss != "" { return irBMiss("if arm") }
   while k >= 0 {
     irBNode(
@@ -1099,6 +1114,8 @@ function refIfArm(
     irBMiss("ref if arm " + arm)
     return body
   }
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
   const v = irBExpr(body, ifArmValueExpr(blockIx))
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
@@ -1186,6 +1203,8 @@ function endsInTemp(b: i32[]): boolean {
 // The body of value-`if` arm `blockIx`: its one value, delivered at `rep`, written to out `t`.
 function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
   const body: i32[] = []
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
   const tv = ifArmValueExpr(blockIx)
   const v = deliver(body, tv, rep)
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
@@ -1193,6 +1212,26 @@ function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
   }
   return body
+}
+
+// A value `if` arm's prelude, every statement before its value, as legacy's `emitIfArmOpen` lowers
+// them (`emitStmtIn`, which banks no row of its own).
+function armPrelude(body: i32[], blockIx: i32) {
+  const blk = nodeAt(blockIx)
+  if !(blk is Block) { return 0 }
+  const stmts = blk.blkStmts
+  let i = 0
+  while i + 1 < stmts.length && ibMiss == "" {
+    stmtNode(body, stmts[i], stmts, i)
+    i = i + 1
+  }
+  return 0
+}
+
+// Whether value-`if` arm `blockIx` is a block with statements before its value.
+function armHasPrelude(blockIx: i32): boolean {
+  const blk = nodeAt(blockIx)
+  return blk is Block && blk.blkStmts.length > 1
 }
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.

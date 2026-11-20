@@ -21384,14 +21384,31 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if ifIx < 0 || ifIx >= P.nodes.length { return "node" }
   const n = nodeAt(ifIx)
   if !(n is IfStmt) || n.ifElse < 0 || n.ifCond < 0 { return "no else" }
-  if !ifArmIsLone(n.ifThen) || !ifArmIsLone(n.ifElse) { return "arm not lone" }
+  // An `else if` is the chain's next link, which `emitIfExprAsLink` writes into this one's frame.
+  const elseLink = nodeAt(n.ifElse) is IfStmt
+  if !ifArmHasValue(n.ifThen) || !elseLink && !ifArmHasValue(n.ifElse) {
+    return "arm not lone"
+  }
+  // A prelude local the collect pass did not allocate is legacy's refusal (`emitIfArmOpen`).
+  if (
+    armPreludeUnwalkedDecl(n.ifThen) >= 0
+    || !elseLink && armPreludeUnwalkedDecl(n.ifElse) >= 0
+  ) {
+    return "arm prelude unwalked"
+  }
   const c = nodeAt(unwrapParen(n.ifCond))
   // A decided `is` folds its dead arm off the condition's own bytes (`staticValueIfCond`): the
-  // IR builds an `is` only as a tag compare, never that constant, and misses a constant one.
-  if c is BoolLit { return "constant condition" }
+  // IR builds an `is` only as a tag compare, never that constant, and misses a constant one. A
+  // literal `true` writes its block `else` as `unreachable`, which the IR builds (`valueIfLitTrue`).
+  if c is Unary && c.unOp == "!" && nodeAt(unwrapParen(c.unArg)) is BoolLit {
+    return "constant condition"
+  }
   if optGuardCallOf(ifIx, fnIx) >= 0 { return "optional guard" }
   if intMatchHeadAt(ifIx) { return "int match" }
+  // Classified as `emitIfExpr` classifies it, with the arms' prelude locals bound.
+  const scoped = armPreludeScopeOpen(ifIx)
   const p = ifJoinPlanOf(ifIx, fnIx)
+  if scoped { scopePop() }
   const rung = match p.ijArm {
     "null" => "null join"
     "atom" => "atom join"
@@ -21411,11 +21428,10 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   return ""
 }
 
-// Whether `blockIx` is a block whose one statement is its value.
-function ifArmIsLone(blockIx: i32): boolean {
+// Whether `blockIx` is a block whose last statement is its value, after any prelude.
+function ifArmHasValue(blockIx: i32): boolean {
   if blockIx < 0 || blockIx >= P.nodes.length { return false }
-  const b = nodeAt(blockIx)
-  return b is Block && b.blkStmts.length == 1 && ifArmValueExpr(blockIx) >= 0
+  return nodeAt(blockIx) is Block && ifArmValueExpr(blockIx) >= 0
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -21640,7 +21656,7 @@ function emitIfArmOpen(blockIx: i32, fnIx: i32) {
 
 // The first node of the arm block at `blockIx` that binds a local no pass allocated, or -1: an
 // arm the collect pass walked, or one whose prelude declares nothing, lowers.
-function armPreludeUnwalkedDecl(blockIx: i32): i32 {
+export function armPreludeUnwalkedDecl(blockIx: i32): i32 {
   if blockIx < 0 { return -1 }
   if armPreludeBlocks[blockIx] ?? false { return -1 }
   return firstLocalDeclIn(blockIx)
@@ -33045,9 +33061,14 @@ function staticIsGuard(condIx: i32, condStart: i32): i32 {
 // `staticIsGuard` for a value `if`, which a literal `true` also decides: its else arm is dead, so
 // a rewrite's `if true { <spills> v } else { <placeholder> }` never lowers the placeholder.
 function staticValueIfCond(condIx: i32, condStart: i32): i32 {
-  const c = if condIx >= 0 { nodeAt(unwrapParen(condIx)) } else { null }
-  if c is BoolLit && c.boolVal == 1 { return 1 }
+  if valueIfLitTrue(condIx) { return 1 }
   return staticIsGuard(condIx, condStart)
+}
+
+// Whether a value `if`'s condition is the literal `true`, which decides its block `else` dead.
+export function valueIfLitTrue(condIx: i32): boolean {
+  const c = if condIx >= 0 { nodeAt(unwrapParen(condIx)) } else { null }
+  return c is BoolLit && c.boolVal == 1
 }
 
 // A value arm this instance's `is` test proved dead: `unreachable` meets any blocktype, and

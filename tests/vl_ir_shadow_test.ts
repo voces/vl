@@ -1252,6 +1252,24 @@ Deno.test({
   },
 });
 
+// A valued `if` whose arms run statements before their value, a direct `else if` chain and a
+// literal `true` whose dead `else` legacy writes as `unreachable` all build and match.
+const IF_ARM_PRELUDE =
+  `function c3(a: i32): i32 {\n  const r = if a < 0 { 1 } else if a == 0 { 2 } else { 3 }\n  return r\n}\nfunction p2(a: i32): i32 {\n  const r = if a < 0 {\n    const t = a * 2\n    t + 1\n  } else {\n    a\n  }\n  return r\n}\nfunction t1(a: i32): i32 {\n  const r = if true { a + 1 } else { 0 }\n  return r\n}\nprint(c3(-1))\nprint(c3(0))\nprint(p2(-3))\nprint(t1(4))\n`;
+Deno.test({
+  name: "ir shadow: an if expression's arm prelude, else-if chain and literal true build and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(IF_ARM_PRELUDE, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want c3, p2 and t1 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
