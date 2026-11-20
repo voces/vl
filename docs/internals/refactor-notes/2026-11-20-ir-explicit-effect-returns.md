@@ -14,6 +14,9 @@ ends in `return 0`, which states the intent and takes the `null` out of its resu
 The other two, `pbNode` and `plus`, `return` a union value from a `match` or `if`. They are real
 returned values and keep the miss.
 
-Measured at the merge-base in the PR.
+Measured on fixpoint seeds at merge-base `c2f0a972f` (functions with no blocker): self-compile
+18,619 → 18,622 of 19,291; corpus 41,450 flat. `tail if union sink` falls 10 → 2. Of the eight,
+three build; the other five stop at their next blocker (`member record` and its combinations
+with `call of a non-declaration`, `ref if chain` and `store element`, and `atom compare`).
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
