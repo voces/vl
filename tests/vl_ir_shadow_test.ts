@@ -1213,6 +1213,22 @@ Deno.test({
   },
 });
 
+// A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
+// verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a packed list literal's i32 elements verify at its u8 element rep",
+  ignore,
+  fn: () => {
+    const { rows } = run(`const lit: u8[] | i32 = [1, 2, 255]
+if lit is u8[] { print(lit[2]) }
+`, true);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
+    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
+      throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A literal-union list's elements are its interned atoms, which the IR delivers itself: the
 // literal takes the short build and its fragment matches legacy's bytes.
 Deno.test({
@@ -1228,18 +1244,6 @@ print(pick(1))
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
-// A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
-// verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
-Deno.test({
-  name: "ir shadow: a packed list literal's i32 elements verify at its u8 element rep",
-  ignore,
-  fn: () => {
-    const { rows } = run(`const lit: u8[] | i32 = [1, 2, 255]
-if lit is u8[] { print(lit[2]) }
-`, true);
-    const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
-    if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
-      throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
