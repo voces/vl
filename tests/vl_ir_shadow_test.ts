@@ -1754,6 +1754,24 @@ Deno.test({
   },
 });
 
+// A reference join's `else if` chain is built link by link into each link's `else`, at the head's
+// rep: a string chain and a list chain build and match legacy.
+const REF_IF_CHAIN =
+  `function s3(n: i32, a: string): string {\n  const r = if n > 0 { a } else if n < 0 { "neg" } else { "zero" }\n  return r\n}\nfunction l3(n: i32, xs: i32[]): i32[] {\n  const r = if n > 1 { xs } else if n == 1 { [1] } else { [] }\n  return r\n}\nprint(s3(-1, "pos"))\nprint(l3(1, []).length)\n`;
+Deno.test({
+  name: "ir shadow: a reference join's else-if chain builds link by link and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF_CHAIN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want s3 and l3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
