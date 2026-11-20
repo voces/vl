@@ -4,9 +4,9 @@
 //
 // `kind-ladder-incomplete` (compiler/lint.vl) carries a copy of every closed set — each
 // `type X = a | b | c …` in compiler/ whose members are all string literals or all type
-// names — and of the field table `klFieldNames`/`klFieldSetNames`. This re-derives both
-// from compiler/*.vl and exits 1 naming whatever drifted, so a new member or a new set
-// fails here rather than moving the ladder budget for no reason a reader can find.
+// names — in the row table `klSets`, and of the field table `klFields`. This re-derives both
+// from compiler/*.vl and exits 1 naming whatever drifted or sits out of order, so a new member
+// or a new set fails here rather than moving the ladder budget for no reason a reader can find.
 // Paths resolve against the working directory; run it from the checkout root.
 
 import { programArgs } from "std:args"
@@ -26,7 +26,7 @@ import {
 const TOOL = "ladder-sets"
 
 // The quoted strings of `const NAME = [ … ]` in `src`: from the line that opens it to
-// the first line ending in `]`. Numbers are kept too, as their text, for `klSetIsType`.
+// the first line ending in `]`. Numbers are kept too, as their text.
 function constList(src: string, name: string): string[] {
   const lines = split(src, "\n")
   const open = "const \{name} = ["
@@ -60,6 +60,43 @@ function constList(src: string, name: string): string[] {
   return out
 }
 
+// The records of `const NAME: T[] = [ … ]` in `src`, each as its quoted strings and numbers in
+// order (`constList`'s scan), read brace to brace however the formatter lays them out.
+function rowList(src: string, name: string): string[][] {
+  const lines = split(src, "\n")
+  const open = "const \{name}: "
+  let i = 0
+  while i < lines.length && !startsWith(lines[i], open) { i = i + 1 }
+  if i == lines.length {
+    die("ladder-sets: compiler/lint.vl has no `\{open}`", 2)
+    return []
+  }
+  const out: string[][] = []
+  let row = ""
+  let inRow = false
+  i = i + 1
+  while i < lines.length && trimEnd(lines[i]) != "]" {
+    const ln = lines[i]
+    let a = 0
+    let k = 0
+    while k < ln.length {
+      if ln[k] == '{' {
+        inRow = true
+        row = ""
+        a = k + 1
+      } else if ln[k] == '}' {
+        row = "\{row}\{ln.slice(a, k)}"
+        out.push(constList("const r = [\{row}]", "r"))
+        inRow = false
+      }
+      k = k + 1
+    }
+    if inRow { row = "\{row}\{ln.slice(a, ln.length)} " }
+    i = i + 1
+  }
+  return out
+}
+
 function listText(xs: string[]): string {
   const q: string[] = []
   for x in xs { q.push("'\{x}'") }
@@ -80,12 +117,18 @@ function sameList(a: string[], b: string[]): boolean {
 // order is the union's box-tag order, and the lint reports `n of m` against it), and
 // the same literal/type kind.
 function checkSets(sets: ClosedSet[], lint: string, bad: string[]) {
-  const names = constList(lint, "klSetNames")
-  const isType = constList(lint, "klSetIsType")
-  if isType.length != names.length {
-    bad.push(
-      "  `klSetIsType` has \{isType.length} entries for \{names.length} sets in `klSetNames`",
-    )
+  const rows = rowList(lint, "klSets")
+  const names: string[] = []
+  const isType: string[] = []
+  for r in rows {
+    if r.length != 2 {
+      bad.push(
+        "  a `klSets` row is not `{ ksName: \"X\", ksType: 0|1, ksMembers: klX }`",
+      )
+      return 0
+    }
+    names.push(r[0])
+    isType.push(r[1])
   }
   const mine = names.slice(0, names.length)
   sort(mine, strLess)
@@ -103,11 +146,17 @@ function checkSets(sets: ClosedSet[], lint: string, bad: string[]) {
     }
   }
   let i = 0
-  while i < names.length && i < isType.length {
+  while i < names.length {
     const si = findSet(sets, names[i])
     if si >= 0 && (isType[i] == "1") != sets[si].isType {
       bad.push(
-        "  `\{names[i]}` is a set of \{kindWord(sets[si].isType)} in the tree and of \{kindWord(isType[i] == "1")} in `klSetIsType`",
+        "  `\{names[i]}` is a set of \{kindWord(sets[si].isType)} in the tree and of \{kindWord(isType[i] == "1")} in `klSets`",
+      )
+    }
+    // Rows run by member count, then name: `klSetOf` takes the first set holding every arm.
+    if i > 0 && !setRowBefore(lint, names[i - 1], names[i]) {
+      bad.push(
+        "  `\{names[i]}` (\{constList(lint, "kl\{names[i]}").length} members) sits after `\{names[i - 1]}` in `klSets`, which runs by member count, then name",
       )
     }
     i = i + 1
@@ -123,12 +172,20 @@ function checkSets(sets: ClosedSet[], lint: string, bad: string[]) {
     if !found {
       const at = sets[findSet(sets, name)].at
       bad.push(
-        "  `\{name}` (\{at}) is declared in the tree and missing from compiler/lint.vl's `klSetNames`",
+        "  `\{name}` (\{at}) is declared in the tree and missing from compiler/lint.vl's `klSets`",
       )
     }
   }
   0
 }
+// Whether set row `a` may come before row `b`: fewer members, or as many and an earlier name.
+function setRowBefore(lint: string, a: string, b: string): boolean {
+  const na = constList(lint, "kl\{a}").length
+  const nb = constList(lint, "kl\{b}").length
+  if na != nb { return na < nb }
+  return strLess(a, b)
+}
+
 function kindWord(isType: boolean): string {
   if isType { return "type names" }
   return "string literals"
@@ -144,14 +201,20 @@ function checkFields(
   const fields: string[] = []
   const setOf: string[] = []
   fieldIndex(TOOL, root, sets, fields, setOf)
-  const mineF = constList(lint, "klFieldNames")
-  const mineS = constList(lint, "klFieldSetNames")
-  if mineF.length != mineS.length {
-    die(
-      "ladder-sets: compiler/lint.vl's klFieldNames and klFieldSetNames differ in length (\{mineF.length} vs \{mineS.length})",
-      1,
-    )
-    return 0
+  const mineF: string[] = []
+  const mineS: string[] = []
+  for r in rowList(lint, "klFields") {
+    if r.length != 2 {
+      bad.push("  a `klFields` row is not `{ kfName: \"f\", kfSet: \"X\" }`")
+      return 0
+    }
+    if mineF.length > 0 && !strLess(mineF[mineF.length - 1], r[0]) {
+      bad.push(
+        "  `\{r[0]}` sits after `\{mineF[mineF.length - 1]}` in `klFields`, which runs by name",
+      )
+    }
+    mineF.push(r[0])
+    mineS.push(r[1])
   }
   const order = mineF.slice(0, mineF.length)
   sort(order, strLess)
@@ -183,7 +246,7 @@ function checkFields(
       let q = 0
       while fields[q] != f { q = q + 1 }
       bad.push(
-        "  `\{f}` (-> `\{setOf[q]}`) is a single-closed-set field in the tree and missing from compiler/lint.vl's `klFieldNames`",
+        "  `\{f}` (-> `\{setOf[q]}`) is a single-closed-set field in the tree and missing from compiler/lint.vl's `klFields`",
       )
     }
   }
@@ -221,7 +284,7 @@ function main(args: string[]) {
     )
   }
   print(
-    "ladder-sets ok — \{sets.length} closed sets and \{constList(lint, "klFieldNames").length} set-typed fields match compiler/lint.vl",
+    "ladder-sets ok — \{sets.length} closed sets and \{rowList(lint, "klFields").length} set-typed fields match compiler/lint.vl",
   )
   0
 }
