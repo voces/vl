@@ -5,6 +5,7 @@
 // and a type a checker arena index. Conversions arrive as one coercion node with `coercionAt`
 // (step I3).
 import { i32ToStr } from "./ast"
+import { CoalBoxArm } from "./emit_plan_null"
 import {
   RAtom,
   RBox,
@@ -92,8 +93,15 @@ export type RRecover = { rcV: Opnd, rcAt: i32 }
 export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
 // `mrFields` in the rep's kid order; `mrLayout[i]` the kid layout position `i` writes. `mrAt`: the
-// object literal, whose row legacy's `objLitArmOf` and layout predicates name.
-export type RMakeRec = { mrFields: Opnd[], mrLayout: i32[], mrAt: i32 }
+// object literal, whose row legacy's `objLitArmOf` and layout predicates name, or, where `mrRow`
+// is not -1, the row its destination builds it at: a variant's (`mrVariant`) or a struct's.
+export type RMakeRec = {
+  mrFields: Opnd[],
+  mrLayout: i32[],
+  mrAt: i32,
+  mrRow: i32,
+  mrVariant: boolean,
+}
 export type RGetField = { gfV: Opnd, gfIx: i32, gfAt: i32 }
 // A list literal at node `mlAt` of elements `mlElems`, built by legacy's short tail.
 export type RMakeList = { mlElems: Opnd[], mlAt: i32 }
@@ -263,6 +271,16 @@ export type SIf = {
   siElseKw: boolean,
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
+// A `??` over a boxed operand along arm `cbArm` of `coalBoxArmOf` at `cbAt`: operand `cbL`'s box,
+// the `if` legacy's shared tails open on it, and the default `cbNull`, which writes out `cbOut` on
+// the null path. The present path is the tails' own, re-reading `cbL` for a binding arm.
+export type SCoalBox = {
+  cbL: Opnd,
+  cbArm: CoalBoxArm,
+  cbNull: i32[],
+  cbOut: i32,
+  cbAt: i32,
+}
 export type SBr = { brLabel: i32, brHas: boolean, brVal: Opnd }
 export type SReturn = { rtHas: boolean, rtV: Opnd }
 export type STrap = { tpWhy: i32 }
@@ -280,7 +298,8 @@ export type RawEff = "struct.set"
   | "reserve.close"
 export type SRawOp = { srOp: RawEff, srHeap: i32, srArgs: Opnd[], srImm: i32 }
 export type IrNode = SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet
-  | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SIf | SSwitch | SBr | SReturn | STrap | SDrop | SRawOp
+  | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SIf | SSwitch | SCoalBox | SBr | SReturn | STrap
+  | SDrop | SRawOp
 
 export type VarKind = "param" | "local" | "temp"
 // A variable: its rep (fixed at its definition), type, kind and wasm local index (-1 unset).
@@ -478,7 +497,7 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         if !irBodyLeaves(f, n.siThen) { return false }
         cur = n.siElse
       }
-      SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SSwitch | SDrop | SRawOp => {
+      SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SSwitch | SCoalBox | SDrop | SRawOp => {
         return false
       }
     }
@@ -703,6 +722,14 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       }
       s
     }
+    SCoalBox => p
+      + "coalesce "
+      + n.cbArm
+      + " "
+      + opndText(n.cbL)
+      + outText(n.cbOut)
+      + "\n"
+      + bodyText(f, n.cbNull, d + 1)
     SSwitch => {
       let s = p + "switch v" + i32ToStr(n.swOn) + outText(n.swOut) + "\n"
       for a in n.swArms {
@@ -758,6 +785,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SLet => irRhsFamily(n.lRhs)
     SEffect => irRhsFamily(n.efRhs)
     SAssign | SBlock | SLoop | SForIn | SIf | SBr | SReturn | STrap | SDrop => "control"
+    SCoalBox => "box"
     SGlobalSet => "global"
     SBoundsCheck | SListSet => "list"
     SSetField => "record"

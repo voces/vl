@@ -561,6 +561,47 @@ opt(null)
   },
 });
 
+// A `??` over a boxed operand along each arm the IR builds (a binding at a scalar or a box result,
+// a list element, a call at a scalar or a box result) and a nested `??` in a default: each default
+// is built into the null arm, so it runs only there, and every function matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a boxed coalesce on each built arm is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let calls = 0
+function d(): i32 {
+  calls = calls + 1
+  return 7
+}
+function db(): i32 | null {
+  calls = calls + 1
+  return 9
+}
+function mk(n: i32): i32 | null {
+  if n > 0 { return n }
+  return null
+}
+function valScalar(x: i32 | null): i32 { return x ?? d() }
+function valBox(x: i32 | null): i32 | null { return x ?? db() }
+function elem(xs: (i32 | null)[], i: i32): i32 { return xs[i] ?? d() }
+function callScalar(n: i32): i32 { return mk(n) ?? d() }
+function callBox(n: i32): i32 | null { return mk(n) ?? db() }
+function nested(x: i32 | null, y: i32 | null): i32 { return x ?? (y ?? d()) }
+print(valScalar(null) + elem([null], 0) + callScalar(0) + nested(null, null))
+print(valBox(null) ?? 0)
+print(callBox(0) ?? 0)
+print(calls)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    const miss = [...rows.keys()].filter((k) => k.includes("coalesce"));
+    if (miss.length > 0) throw new Error(`want no coalesce miss, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 9) || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A `??` whose left operand an instance closed to a type with no `null` writes the left operand.
 Deno.test({
   name: "ir shadow: a closed coalesce is covered and matched",
@@ -1263,9 +1304,10 @@ Deno.test({
 });
 
 // A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
-// builds and matches, a literal arm included; a nullable union binding is a named miss.
+// builds and matches, a nullable union binding included; one legacy writes through its binding
+// sink (every arm a construction) is a named miss.
 const LET_IF_BOX =
-  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction h(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string = if b { v } else { "x" }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(f(false, 1, "y"))\nprint(h(true, 1))\nprint(g(false, 1))\n`;
+  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nfunction s(b: boolean): boolean {\n  const u: i32 | string = if b { 1 } else { "x" }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(g(false, 1))\nprint(s(true))\n`;
 Deno.test({
   name: "ir shadow: a union binding's if initializer builds into a seeded box and matches legacy",
   ignore,
@@ -1275,10 +1317,10 @@ Deno.test({
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
-      throw new Error(`want f and h covered and matched, got ${JSON.stringify([...rows])}`);
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!rows.has("uncovered declaration if per arm rep")) {
-      throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
+    if (!rows.has("uncovered declaration if per arm sink")) {
+      throw new Error(`want s a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1295,6 +1337,24 @@ if lit is u8[] { print(lit[2]) }
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && (k.includes("verifier") || k.includes("differ")));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the packed literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A nullable union (`A | B | null`, discipline 4) is held in the value union's box, so a field
+// read off it once `is A` narrows it is a narrowed box read that builds and matches.
+const NUL_UNION_FIELD =
+  `type A = { kind: "a", x: i32 }\ntype B = { kind: "b", y: i32 }\nfunction r(u: A | B | null): i32 {\n  if u is A { return u.x }\n  return 0\n}\nconst a: A | B | null = { kind: "a", x: 7 }\nconst n: A | B | null = null\nprint(r(a))\nprint(r(n))\n`;
+Deno.test({
+  name: "ir shadow: a narrowed field read off a nullable union's box builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(NUL_UNION_FIELD, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want r covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
