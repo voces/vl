@@ -818,6 +818,52 @@ print(bs[1])
   },
 });
 
+// A field store whose value is a short-circuit (a valued `if`): legacy reads the receiver, then
+// the value. A local, a parameter, a global and a call result as the receiver are each staged
+// below the `if`, and every store function is covered and matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a field store of a short-circuit value is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type R = { a: boolean, n: i32 }
+let g: R = { a: false, n: 0 }
+const box: R[] = [{ a: false, n: 0 }]
+function get(): R { return box[0] }
+function loc(p: boolean, q: boolean): boolean {
+  const r: R = { a: false, n: 0 }
+  r.a = p && q
+  return r.a
+}
+function par(r: R, p: boolean, q: boolean): boolean {
+  r.a = p || q
+  return r.a
+}
+function glob(p: boolean, q: boolean): boolean {
+  g.a = p && q
+  return g.a
+}
+function tmp(p: boolean, q: boolean): boolean {
+  get().a = p || q
+  return box[0].a
+}
+function coal(r: R, x: i32 | null): i32 {
+  r.n = if x != null { x } else { 7 }
+  return r.n
+}
+print(loc(true, true))
+print(par({ a: false, n: 0 }, false, true))
+print(glob(true, false))
+print(tmp(false, false))
+print(coal({ a: false, n: 0 }, null) + coal({ a: false, n: 0 }, 2))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want five covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // `l ?? d` whose default joins a nullable union arm into the union's box (legacy's staged `if`):
 // a name and a call operand (the call default runs once: `calls` prints 1), and a join nested in
 // the default, which re-stages the shared `?.` slot only on the outer null path. Each `??` function
@@ -1869,6 +1915,37 @@ print(empty() + recs() + twice() + nested() + gen(1) + gen("s"))
     }
     if ((rows.get("uncovered for in element f64") ?? 0) !== 2) {
       throw new Error(`want both instances' f64 walk named, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// An `__array_new__` inside another's fill is written inside the outer's fill bracket, so it takes
+// the stash of depth one as legacy's does: matched byte for byte, with a constant and a computed
+// inner length. A fill boxed into a union element stays a named miss.
+Deno.test({
+  name: "ir shadow: a nested __array_new__ fill matches at legacy's fill depth",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function sq(n: i32): i32[][] { return __array_new__(n, __array_new__(n, 0)) }
+function wide(n: i32, m: i32): i32[][] { return __array_new__(n, __array_new__(m + 1, m * 2)) }
+function deep(n: i32): i32[][][] { return __array_new__(n, __array_new__(n, __array_new__(n + 1, 7))) }
+function un(n: i32): (i32 | string)[] { return __array_new__(n, 5) }
+const a = sq(2)
+const b = wide(2, 3)
+const c = deep(2)
+const d = un(2)
+const d0 = d[0]
+print(a[1].length + b[1][3] + b[0].length + c[1][1][2])
+if d0 is i32 { print(d0) }
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want sq, wide and deep covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered array new fill box") ?? 0) !== 1) {
+      throw new Error(`want un a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
