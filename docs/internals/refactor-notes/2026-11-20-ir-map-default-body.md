@@ -18,6 +18,10 @@ default body, a valued out.
 - **Verifier:** a probe only on its arm; a map receiver; an inline form; at the `i32` form, an
   `i32` or `bool` out; a default that ends by writing the out. Selftest cases 16 to 18 break each.
 - **Unchanged:** a default that builds no node keeps `RMapGetOr` as it was.
+- **Chosen:** `mapRecvReassigned` no longer looks inside the default. On both routes the default
+  runs in the miss arm after the probe has read the receiver, so a default that assigns the map
+  variable cannot change which map was read (the `(mm = other).length` witness). A later rule
+  (`ir-mapgetor-mv-rule`) checks an mv read's out against its map's value rep.
 
 Measured on fixpoint seeds, merge-base `f2ec7aa7c` against this branch (functions with no
 blocker, blocker census): self-compile 18,409 → 18,453 of 19,255; corpus 40,615 → 40,787 of
