@@ -31,3 +31,10 @@ Against a fixpoint at the merge-base c2f0a972f (candidate a fixpoint, 6,905,223 
   so no A/B is owed; the `tests/cases` A/B reads 7,249 same, 0 differ.
 - L2 self-compile fuel 103,511,758,090 → 103,507,728,773 (−0.004%); late demands 9 of 9, late
   tag rows 307 of 307; seed 6,905,223 bytes.
+
+## Next rows of the family
+
+At the same merge-base, after this step: `for in element f64` keeps 6 corpus functions alone (7
+with its `array spread groups` pairing) and none in the self-compile; it is the f64 element walk
+`forInElemPlain` does not admit, the generic `[1.5]` witness above. Step 2, `for in map
+receiver` (19 self-compile, 4 corpus), is its own PR.
