@@ -17,7 +17,7 @@ into an exact-fit string.
   the operands, as for every string op, and the arm writes the tail. The verifier holds the operand
   reps.
 
-Compiler lines are about +60 −6 across `wasmEmit.vl`, `ir_build.vl`, `ir_lower_ref.vl`,
+Compiler lines are +66 −4 across `wasmEmit.vl`, `ir_build.vl`, `ir_lower_ref.vl`,
 `ir_verify.vl`, `ir.vl` and `lint.vl`. No legacy line is deleted; legacy's routing and helper call
 moved into the two shared functions.
 
