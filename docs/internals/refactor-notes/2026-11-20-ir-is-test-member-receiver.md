@@ -24,4 +24,14 @@ then re-tested, off a generic and a declared receiver.
 
 ## Readings
 
-To fill at the merge-base fixpoint.
+Both seeds fixpoints, master at merge-base `a42095870`:
+
+| reading | master | this branch |
+|---|---:|---:|
+| distilled functions claimed (`--claims`) | 41,379 | 41,469 (+90) |
+| distilled `is box not a local` (one-blocker functions, all d3204) | 90 | 0 |
+| self-compile functions claimed | 18,637 | 18,637 |
+| armed shadow, distilled | | 41,542 of 41,542 matched |
+| L2 self-compile fuel | 103,741,585,294 | 103,747,118,054 (+0.005%) |
+
+`ir-identity.sh` plain, `--names` and `--cases`, mode 3, and the `tests/cases` A/B all 0 differ.
