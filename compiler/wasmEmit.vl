@@ -568,6 +568,7 @@ import {
   gInitRank,
   gInitReaders,
   gInitStartOrd,
+  gLitSegAt,
   gLowMemUnused,
   gMapDeletes,
   gMapSetFn,
@@ -12330,10 +12331,8 @@ function emitArrU8(elems: i32[], fnIx: i32, row: i32) {
   let dstU8 = -1
   let coffU8 = 0
   if elems.length > NEW_FIXED_MAX {
-    const dForm = if row == PK_U16 || row == PK_I16 { ALD_U16 } else { ALD_U8 }
-    const dU8 = arrLitDataBuild(elems, fnIx, dForm, pkBackAt(row))
-    if dU8 < 0 { return -1 }
-    if dU8 == 1 { return arrLitWrap(elems.length, pkWrapAt(row)) }
+    const dU8 = arrLitDataTry(elems, fnIx, "u8", row)
+    if dU8 != 0 { return if dU8 < 0 { -1 } else { 0 } }
     dstU8 = arrLitChunkStart("u8list", row, pkBackAt(row), elems.length, false)
   }
   let iu8 = 0
@@ -12446,9 +12445,8 @@ function emitArrWide(arrIx: i32, elems: i32[], fnIx: i32, w: WideArm) {
   let dst = -1
   let coff = 0
   if elems.length > NEW_FIXED_MAX {
-    const d = arrLitDataBuild(elems, fnIx, pl.wpForm, back)
-    if d < 0 { return -1 }
-    if d == 1 { return arrLitWrap(elems.length, wrap) }
+    const d = arrLitDataTry(elems, fnIx, w, 0)
+    if d != 0 { return if d < 0 { -1 } else { 0 } }
     dst = wideChunkStart(w, back, elems.length)
   }
   let i = 0
@@ -12703,11 +12701,8 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
   let dstI32 = -1
   let coffI32 = 0
   if elems.length > NEW_FIXED_MAX {
-    const dI32 = arrLitDataBuild(elems, fnIx, ALD_I32, aTy())
-    if dI32 != 0 {
-      if dI32 < 0 { return -1 }
-      return arrLitWrap(elems.length, lTy())
-    }
+    const dI32 = arrLitDataTry(elems, fnIx, "i32", 0)
+    if dI32 != 0 { return if dI32 < 0 { -1 } else { 0 } }
     dstI32 = arrLitChunkStart("list", 0, aTy(), elems.length, false)
   }
   let i = 0
@@ -15387,6 +15382,85 @@ const ALD_F64 = 3
 const ALD_U8 = 4
 const ALD_U16 = 5
 
+// How a list literal past the operand cap builds at arm `arm` (packed row `row` for `u8`): one
+// data segment of constant elements, a segment with its computed elements stored after, or chunks.
+// A pure reading of what `arrLitDataBuild` partitions its elements by.
+export type LongRoute = "dataConst" | "dataComputed" | "chunk"
+
+export function arrLitLongRouteOf(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): LongRoute {
+  const form = arrLitDataFormOf(arm, row)
+  if form < 0 { return "chunk" }
+  let computed = false
+  for e in elems {
+    if !arrLitElemIsConst(e) {
+      if !arrLitDataStores(e, fnIx, form) { return "chunk" }
+      computed = true
+    }
+  }
+  return if computed { "dataComputed" } else { "dataConst" }
+}
+
+// Arm `arm`'s element form for a data segment (`ALD_*`), or -1 for an arm with none.
+function arrLitDataFormOf(arm: ArrLitArm, row: i32): i32 {
+  return match arm {
+    "i32" => ALD_I32
+    "f64" => ALD_F64
+    "f32" => ALD_F32
+    "i64" => ALD_I64
+    "u8" => if row == PK_U16 || row == PK_I16 { ALD_U16 } else { ALD_U8 }
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "str" | "ref" => -1
+  }
+}
+
+// Arm `arm`'s backing heap type for a data segment.
+function arrLitDataBackOf(arm: ArrLitArm, row: i32): i32 {
+  return match arm {
+    "i32" => aTy()
+    "f64" => fa64Ty()
+    "f32" => fa32Ty()
+    "i64" => ia64Ty()
+    "u8" => pkBackAt(row)
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "str" | "ref" => -1
+  }
+}
+
+// Arm `arm`'s list wrapper heap type for a data segment.
+function arrLitDataWrapOf(arm: ArrLitArm, row: i32): i32 {
+  return match arm {
+    "i32" => lTy()
+    "f64" => fl64Ty()
+    "f32" => fl32Ty()
+    "i64" => il64Ty()
+    "u8" => pkWrapAt(row)
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "str" | "ref" => -1
+  }
+}
+
+// Long literal `elems` of arm `arm` built from a data segment and wrapped, where its route takes
+// one: 1 once the list is on the stack, 0 for a chunked build (nothing written), -1 on failure.
+export function arrLitDataTry(
+  elems: i32[],
+  fnIx: i32,
+  arm: ArrLitArm,
+  row: i32,
+): i32 {
+  if arrLitLongRouteOf(elems, fnIx, arm, row) == "chunk" { return 0 }
+  const d = arrLitDataBuild(
+    elems,
+    fnIx,
+    arrLitDataFormOf(arm, row),
+    arrLitDataBackOf(arm, row),
+  )
+  if d <= 0 { return d }
+  arrLitWrap(elems.length, arrLitDataWrapOf(arm, row))
+  return 1
+}
+
 // Build the `backTy` backing of a literal past the `array.new_fixed` cap of number or boolean
 // literals as one passive data segment read by `array.new_data`, so its code is a few bytes
 // whatever its length (D3417). Returns 1 when the backing is on the stack, 0 when some element
@@ -15423,14 +15497,7 @@ function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
     }
     i = i + 1
   }
-  const seg = gStrDataLen.length
-  gStrDataStart.push(gStrDataParts.length)
-  gStrDataLen.push(n)
-  let k = 0
-  while k < parts.length {
-    gStrDataParts.push(parts[k])
-    k = k + 1
-  }
+  const seg = litSegOf(parts, n)
   fbI32Const(0)            // segment offset
   fbI32Const(elems.length) // element count
   fbArrayNewData(backTy, seg)
@@ -15451,6 +15518,45 @@ function arrLitDataBuild(elems: i32[], fnIx: i32, form: i32, backTy: i32): i32 {
   fbLocalGet(dst)
   fbRefAsNonNull()
   return 1
+}
+
+// The data segment holding the `n` bytes of `parts`: the one a literal of the same bytes already
+// registered, else a new one. Bytes are compared whole, a hash only finding the candidates; a
+// segment is raw bytes `array.new_data` reads at its array's type, so any element type shares it.
+function litSegOf(parts: { b: u8[] }[], n: i32): i32 {
+  let h = n
+  for p in parts {
+    for x in p.b { h = (h ^ (x as i32)) * 16777619 }
+  }
+  const cands = gLitSegAt.get(h) ?? []
+  for c in cands {
+    if gStrDataLen[c] == n && litSegBytesAre(c, parts) { return c }
+  }
+  const seg = gStrDataLen.length
+  gStrDataStart.push(gStrDataParts.length)
+  gStrDataLen.push(n)
+  for p in parts { gStrDataParts.push(p) }
+  cands.push(seg)
+  gLitSegAt.set(h, cands)
+  return seg
+}
+
+// Whether segment `seg`'s bytes begin with `parts`' bytes, byte for byte (its length is the caller's).
+function litSegBytesAre(seg: i32, parts: { b: u8[] }[]): boolean {
+  const end = if seg + 1 < gStrDataStart.length { gStrDataStart[seg + 1] } else { gStrDataParts.length }
+  let pi = gStrDataStart[seg]
+  let j = 0
+  for p in parts {
+    for x in p.b {
+      while pi < end && j >= gStrDataParts[pi].b.length {
+        pi = pi + 1
+        j = 0
+      }
+      if pi >= end || gStrDataParts[pi].b[j] != x { return false }
+      j = j + 1
+    }
+  }
+  return true
 }
 
 // Whether a non-constant element `ix` of a literal built in data form `form` may be stored into
