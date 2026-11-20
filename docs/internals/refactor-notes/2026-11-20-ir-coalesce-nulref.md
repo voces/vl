@@ -38,4 +38,27 @@ only on `null`. The same core serves the `coll` and `clo` niche arms.
 
 ## Coverage
 
-MEASUREMENTS PENDING
+Fixpoint seeds of this branch and of its merge base, master `f2ec7aa7c`, each building this
+branch's source:
+
+| population | master | this branch |
+| --- | ---: | ---: |
+| self-compile functions covered | 18,412 | 18,412 |
+| corpus functions covered (45,678) | 40,615 | 40,623 |
+
+An earlier +15 / +119 reading compared against a seed of an older master (`89210abc4`) than this
+branch's base, and so counted #9243 and #9245. The plain block's own population is small: the
+probe's name operands mostly take legacy's join shape, which this phase does not build.
+
+| remaining blocker (corpus, this branch) | alone | with others |
+| --- | ---: | ---: |
+| `coalesce nulRef join` (default joins into a union box) | 38 | 24 |
+| `coalesce box next` (call operands) | 50 | 129 |
+
+- **Witnesses** (`vl_ir_shadow_test`): six functions, covered and matched where master covers one: a
+  record with a name and a nullable default, a call default that runs once (`calls` prints 1), a
+  union arm's variant, and a nullable list.
+- **Byte proof:** mode 3 identical; `ir-identity` corpus 9,037 identical, differ 0, self-compile
+  identical; `--cases` 7,519 identical, differ 0, witnesses 59 same; per-file `tests/cases` A/B
+  7,234 same, differ 0.
+- **L2 fuel:** +0.1% on the 103.31G baseline.
