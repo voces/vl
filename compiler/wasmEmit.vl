@@ -14172,14 +14172,16 @@ function emitScalarMapReadEq(e: BinExpr, p: ScalarMapEqPlan, fnIx: i32): i32 {
   const rd = nodeAt(unwrapParen(p.smRead))
   if !(rd is Index) {
     return emitFail(
-      "emitProgram: internal: a scalar map-read compare with no index read",
+      "emitProgram: internal: eqRouteOf and its writer disagree (map read is no index read)",
     )
   }
   const rc = match p.smArm {
     "pair" => emitScalarMapReadPairEq(rd, p.smOther, p.smKind, fnIx)
     "read" => emitScalarMapReadOtherEq(rd, p.smOther, p.smKind, p.smRead == e.binLeft, fnIx)
     "box" => emitScalarMapReadBoxEq(rd.idxArr, rd.idxIndex, p.smOther, p.smKind, fnIx)
-    "none" => emitFail("emitProgram: internal: a scalar map-read compare with no plan")
+    "none" => emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (scalar map plan none)",
+    )
   }
   if rc < 0 { return -1 }
   if e.binOp == "!=" { fbI32Eqz() }
@@ -14192,7 +14194,7 @@ function emitScalarMapReadPairEq(l: Index, rIx: i32, k: i32, fnIx: i32): i32 {
   const r = nodeAt(unwrapParen(rIx))
   if !(r is Index) {
     return emitFail(
-      "emitProgram: internal: a scalar map-read pair with no right index read",
+      "emitProgram: internal: eqRouteOf and its writer disagree (map pair right is no index read)",
     )
   }
   if emitMapPrep(l.idxArr, l.idxIndex, fnIx) < 0 { return -1 }
@@ -39190,7 +39192,7 @@ export type EqRoute = "identMixed"
   | "nulTest"
   | "variantEq"
   | "structEq"
-  | "structRefused"
+  | "recordRefused"
   | "closure"
   | "numeric"
 
@@ -39215,7 +39217,7 @@ export function eqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): EqRoute {
     if uqR { return "unionRight" }
   }
   const aq = atomEqRouteOf(atomEqPlanOf(e, fnIx).aqArm)
-  if aq != "numeric" { return aq }
+  if aq != null { return aq }
   if nulNoneEqSides(l, r, fnIx) { return "nulNone" }
   if binEqHasNoLowering(exprIx) { return "noLowering" }
   const xrep = xrepEmitPair(e, fnIx)
@@ -39230,22 +39232,22 @@ export function eqRouteOf(e: BinExpr, exprIx: i32, fnIx: i32): EqRoute {
   if binEqVariantRow(exprIx, fnIx) >= 0 { return "variantEq" }
   if binEqStructRow(exprIx, fnIx) >= 0 { return "structEq" }
   if structIndexOfExpr(l, fnIx) >= 0 || structIndexOfExpr(r, fnIx) >= 0 {
-    return "structRefused"
+    return "recordRefused"
   }
   if exprVariantIndex(l, fnIx) >= 0 || exprVariantIndex(r, fnIx) >= 0 {
-    return "structRefused"
+    return "recordRefused"
   }
   if exprIsClosure(l, fnIx) || exprIsClosure(r, fnIx) { return "closure" }
   return "numeric"
 }
 
-// The route an atom compare plan's arm takes; `none` leaves the compare to the later arms.
-function atomEqRouteOf(arm: AtomEqArm): EqRoute {
+// The route an atom compare plan's arm takes, or null for `none`: the compare is a later arm's.
+function atomEqRouteOf(arm: AtomEqArm): EqRoute | null {
   return match arm {
     "fold" => "atomFold"
     "static" => "atomStatic"
     "ids" => "atomIds"
-    "none" => "numeric"
+    "none" => null
   }
 }
 
@@ -39254,10 +39256,11 @@ function atomEqRouteOf(arm: AtomEqArm): EqRoute {
 function nulTestClaims(e: BinExpr, fnIx: i32): boolean {
   const bt = binNulTestOf(e)
   if bt == null { return false }
-  const arm = nulTestArmOf(bt.bnRef, fnIx, bt.bnInvert, false)
-  if arm == "none" { return false }
-  if arm == "instMap" { return instMapIsNullReadOf(bt.bnRef, fnIx).length == 2 }
-  return true
+  return match nulTestArmOf(bt.bnRef, fnIx, bt.bnInvert, false) {
+    "none" => false
+    "instMap" => instMapIsNullReadOf(bt.bnRef, fnIx).length == 2
+    "nnfold" | "nulfold" | "nullty" | "bool" | "atom" | "optChain" | "mapHas" | "boxTag" | "nullRef" | "nulStr" => true
+  }
 }
 
 // `==`/`!=` node `e` at `exprIx` by its route (`eqRouteOf`). 0, or -1 failed.
@@ -39294,7 +39297,7 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "structEq" => emitStructEq(exprIx, fnIx, binEqStructRow(exprIx, fnIx))
     // Either side naming a layout without the two agreeing is a compare this emitter refuses
     // rather than guesses at (D57).
-    "structRefused" => emitFail("emitProgram: struct equality is not supported yet")
+    "recordRefused" => emitFail("emitProgram: struct equality is not supported yet")
     "closure" => emitClosureEq(e, exprIx, fnIx)
     "numeric" => emitBinNumeric(e, exprIx, fnIx)
   }
@@ -39362,13 +39365,15 @@ function emitListEqBin(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
 function emitNulTestBin(e: BinExpr, fnIx: i32): i32 {
   const bt = binNulTestOf(e)
   if bt == null {
-    return emitFail("emitProgram: internal: a null test route with no operand")
+    return emitFail(
+      "emitProgram: internal: eqRouteOf and its writer disagree (null test with no operand)",
+    )
   }
   const bnt = emitNulIsNullTest(bt.bnRef, fnIx, bt.bnInvert, false)
   if bnt < 0 { return -1 }
   if bnt == 0 {
     return emitFail(
-      "emitProgram: internal: a null test route its ladder declined",
+      "emitProgram: internal: eqRouteOf and its writer disagree (null test ladder declined)",
     )
   }
   return 0
