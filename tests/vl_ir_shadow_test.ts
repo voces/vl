@@ -2360,3 +2360,40 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// An empty ref-list literal at a union variant's record row builds as the plain short list: with
+// no element to coerce into the arm, legacy writes the backing and wrapper alone.
+Deno.test({
+  name: "ir shadow: an empty literal of a variant's record list is covered and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type A = { a: i32 }
+type B = { b: i32 }
+type U = A | B
+let rows: A[][] = [[{ a: 1 }]]
+function drop(ci: i32): i32 {
+  const none: A[] = []
+  rows[ci] = none
+  return rows[ci].length
+}
+function fresh(): A[] {
+  const xs: A[] = []
+  xs.push({ a: 2 })
+  return xs
+}
+function pick(u: U): i32 {
+  if u is A { return u.a }
+  return 0
+}
+print(drop(0))
+print(fresh().length)
+print(pick({ b: 3 }))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
