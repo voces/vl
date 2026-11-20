@@ -13,8 +13,8 @@ fill, then allocates the backing and the `{backing, len, cap}` wrapper.
   - `arrNewCallNamed`, the routing: the spelling, with no binding owning the name;
   - `arrNewPlanOf`, the backing and wrapper pair for the site's list kind, or the refusal legacy
     records;
-  - `arrNewLenStash`, `arrNewFillStep` and `arrNewTail`, which write the stash, the fill depth and
-    the allocation;
+  - `arrNewLenStash`, `arrNewFillStep` and `arrNewTail` (with `arrNewDefaultTail` legacy's alone),
+    which write the stash, the fill depth and the allocation;
   - `arrNewFillBoxTy`, the union element a fill is boxed into.
 
   The kind match moved out of the emitter's nesting unchanged, which is most of the diff. The fill
@@ -23,6 +23,10 @@ fill, then allocates the backing and the `{backing, len, cap}` wrapper.
   at the list's element rep.
 - The lowerer writes it in `emitArrayNewIntr`'s order: the length, the stash, the fill one fill
   depth in, then the tail.
+- A fill that is itself an `__array_new__` is a single-use temp, so the lowerer writes it in place
+  at the outer's fill operand, inside the outer's fill bracket. It takes the stash of depth one, as
+  legacy's does. `vl_ir_shadow_test.ts` holds it matched at two and three levels, with a constant
+  and a computed inner length.
 - Named misses stay for `__array_new_default__`, a refused site, a fill boxed into a union
   element, and a length or fill at another rep.
 

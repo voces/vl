@@ -1673,3 +1673,34 @@ print(f([1, 2], [3]) + g([4]))
     }
   },
 });
+
+// An `__array_new__` inside another's fill is written inside the outer's fill bracket, so it takes
+// the stash of depth one as legacy's does: matched byte for byte, with a constant and a computed
+// inner length. A fill boxed into a union element stays a named miss.
+Deno.test({
+  name: "ir shadow: a nested __array_new__ fill matches at legacy's fill depth",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function sq(n: i32): i32[][] { return __array_new__(n, __array_new__(n, 0)) }
+function wide(n: i32, m: i32): i32[][] { return __array_new__(n, __array_new__(m + 1, m * 2)) }
+function deep(n: i32): i32[][][] { return __array_new__(n, __array_new__(n, __array_new__(n + 1, 7))) }
+function un(n: i32): (i32 | string)[] { return __array_new__(n, 5) }
+const a = sq(2)
+const b = wide(2, 3)
+const c = deep(2)
+const d = un(2)
+const d0 = d[0]
+print(a[1].length + b[1][3] + b[0].length + c[1][1][2])
+if d0 is i32 { print(d0) }
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want sq, wide and deep covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered array new fill box") ?? 0) !== 1) {
+      throw new Error(`want un a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
