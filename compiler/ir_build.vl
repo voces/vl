@@ -323,6 +323,7 @@ import {
   forInMapRecv,
   globalCellKind,
   identIsEnvCapture,
+  letBindIsAtom,
   localIndexOf,
   nulLitAtomTexts,
   sFieldStoreKind,
@@ -393,6 +394,8 @@ import { spreadSlotIdOf } from "./emit_collect"
 import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
+// The read node a delivery is building, which may read at an atom cell's rep (`narrowedLocalRead`).
+let ibCellSeat = -1
 let ibDetail = false
 let ibCorrupt = 0
 let ibRowKey: string[] = []
@@ -1054,6 +1057,15 @@ export function irBDeclVar(d: i32): i32 {
     irBMiss("open local type")
     return -1
   }
+  // Legacy's cell for a binding it holds as the atom is the id, whatever its type's own rep.
+  if (
+    nodeAt(d) is LetDecl
+    && letBindIsAtom(d, ibFnIx)
+    && !(repNodeAt(rep) is RAtom || atomNullable(rep))
+  ) {
+    irBMiss("atom cell local rep")
+    return -1
+  }
   return declVarAt(d, rep, ty)
 }
 
@@ -1573,11 +1585,10 @@ function narrowedLocalRead(
   ) {
     return irBLetTemp(b, { sgV: o }, ix, rep)
   }
-  // An atom cell read at a string reads at its cell; the destination's delivery decodes it.
-  if atomAtStr(ib.irVars[v].vRep, rep) {
-    ib.irReadVar[ix] = v
-    return o
-  }
+  // A read's operand rep is its cell's, which for a D1752 atom cell differs from the node's
+  // string. Only the read a delivery seats takes it, so its own atom arm decodes it or passes the id
+  // to an atom destination, as each legacy position decides; no node table notes it.
+  if ix == ibCellSeat && atomAtStr(ib.irVars[v].vRep, rep) { return o }
   return irBMiss("narrowed read")
 }
 
@@ -2597,7 +2608,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     return boxTemp(b, irBBoxLocal(bx), ix, dst)
   }
   const at = b.length
-  const v = widenTo(b, irBExpr(b, ix), ix, dst, dstTy)
+  const seat = ibCellSeat
+  ibCellSeat = unwrapParen(ix)
+  const built = irBExpr(b, ix)
+  ibCellSeat = seat
+  const v = widenTo(b, built, ix, dst, dstTy)
   if ibMiss == "" && boxLeadsAt(b, at) {
     ifBelowLead(b, at, "box of a valued if")
   }
