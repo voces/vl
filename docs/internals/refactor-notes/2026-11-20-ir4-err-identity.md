@@ -35,4 +35,4 @@ reach them. That leg cost +1 min 28 s wall and guarded nothing, so it was droppe
 | cost | 3 min 36 s → 3 min 45 s wall at `JOBS=4`, back to back |
 | control (`tests/vl_ir_identity_compare_test.ts`) | Injected bypasses red under `--compare` and `--compare-errors`: a refusal that builds, a refusal that changes, and a built witness whose bytes change. The untouched builds pass. |
 
-**Lines: scripts +153 / −5, tests +107.**
+**Lines: scripts +154 / −5, tests +107.**
