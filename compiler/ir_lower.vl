@@ -65,6 +65,7 @@ import {
 import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
+  coalesceDefaultNullable,
   declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
@@ -229,6 +230,10 @@ import {
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
+  arrNewFillStep,
+  arrNewLenStash,
+  arrNewPlanOf,
+  arrNewTail,
   atomEqTail,
   atomStrPlanOf,
   atomStrTail,
@@ -244,7 +249,10 @@ import {
   coalBoxOpen,
   coalBoxSlot,
   coalNulRefBranch,
+  coalNulRefJoinOpen,
+  coalNulRefJoinPresent,
   coalNulRefOpen,
+  coalNulRefPlanOf,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
@@ -343,11 +351,16 @@ import {
   printUnionTail,
   promoSlotIn,
   sFieldStorageSlot,
+  sharedArmBoxBody,
+  sharedArmBoxHead,
+  sharedArmIsBox,
+  sharedArmIsPlain,
   sharedArmPlainTail,
   sharedArmTestTail,
   sharedReadPlainOf,
   sharedReadPlanOf,
   sharedReadStashes,
+  sharedReadTail,
   sharedRecvSlotGet,
   spreadGroupStash,
   spreadJoinGroups,
@@ -555,6 +568,7 @@ export function irLOpnd(o: Opnd) {
       emitStrLitAt(o.osAt, lw.irAt)
     }
   }
+  return 0
 }
 
 // Takes stack value `v` off the live stack when it is the lowest above the floor, the next a
@@ -604,6 +618,7 @@ function imm(o: OImm) {
     "f64" => fbF64ConstBits(o.oiBits)
     "str" | "u8" | "null" | "v128" => irLMiss("immediate at " + p)
   }
+  return 0
 }
 
 function primOp(r: RPrimOp) {
@@ -690,6 +705,7 @@ function call(c: RCall, tail: boolean) {
     fbCall(gImports + c.caCallee)
     if c.caNever { fbUnreachable() }
   }
+  return 0
 }
 
 // `RCallRef`: the closure, then legacy's shared head and tail around the arguments
@@ -783,7 +799,8 @@ function rhs(r: Rhs, tail: boolean) {
     RCallRef => callRef(r, tail)
     RMakeRec => makeRec(r)
     RMapOp => mapOp(r)
-    RCallHost | RCast | RTagOf | RListNew | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RListNew => listNew(r)
+    RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
@@ -797,6 +814,7 @@ function rhs(r: Rhs, tail: boolean) {
       fbI32RelOf(r.rlSp, r.rlSub, r.rlVal)
     }
   }
+  return 0
 }
 
 // A helper's raw value instruction: its operands, then the one writer it names.
@@ -1097,21 +1115,40 @@ function sharedRead(r: RSharedRead) {
     sharedReadRecv(r, slot)
     sharedArmTestTail(code, vis, fis, i)
     lwFrames.push(-1)
-    sharedReadRecv(r, slot)
-    if sharedArmPlainTail(code, vis[i], fis[i]) < 0 { return -1 }
+    if sharedReadArm(r, slot, code, vis[i], fis[i]) < 0 { return -1 }
     fbElse()
     i = i + 1
   }
-  sharedReadRecv(r, slot)
-  if sharedArmPlainTail(code, vis[last], fis[last]) < 0 { return -1 }
+  if sharedReadArm(r, slot, code, vis[last], fis[last]) < 0 { return -1 }
   let e = 0
   while e < last {
     fbEnd()
     lwFrames.pop()
     e = e + 1
   }
+  if sharedReadTail(code, vis, fis, r.srAt, fnIx) < 0 { return -1 }
   if readOwesNonNullRecover(r.srAt, fnIx) { fbRefAsNonNull() }
   return 0
+}
+
+// One member's arm of shared read `r`, in the form legacy writes it: the plain read, or its box.
+function sharedReadArm(
+  r: RSharedRead,
+  slot: i32,
+  code: i32,
+  vi: i32,
+  fi: i32,
+): i32 {
+  if sharedArmIsPlain(code, vi, fi) {
+    sharedReadRecv(r, slot)
+    return sharedArmPlainTail(code, vi, fi)
+  }
+  if !sharedArmIsBox(code, vi, fi, r.srAt, lw.irAt) {
+    return irLMiss("shared read arm")
+  }
+  sharedArmBoxHead(vi, fi, r.srAt, lw.irAt)
+  sharedReadRecv(r, slot)
+  return sharedArmBoxBody(vi, fi)
 }
 
 // One receiver push of shared read `r`: its stash slot's box, else the box local again.
@@ -1210,6 +1247,21 @@ function recoverRead(r: RRecover) {
   if localNulStrRecovers(r.rcAt, lw.irAt) { fbRefAsNonNull() }
   if readOwesNonNullRecover(r.rcAt, lw.irAt) { fbRefAsNonNull() }
   return 0
+}
+
+// `RListNew`: legacy's `__array_new__` arm in `emitArrayNewIntr`'s order: the length and its
+// stash, the fill one fill depth in, then the allocation at `arrNewPlanOf`'s pair.
+function listNew(r: RListNew) {
+  const c = nodeAt(r.lnAt)
+  if !(c is Call) || c.callArgs.length != 2 { return irLMiss("array new node") }
+  const pl = arrNewPlanOf(r.lnAt, c.callArgs[1], lw.irAt)
+  if pl.anWhy != "" { return irLMiss("array new refused") }
+  irLOpnd(r.lnLen)
+  const slot = arrNewLenStash()
+  arrNewFillStep(1)
+  irLOpnd(r.lnFill)
+  arrNewFillStep(-1)
+  return arrNewTail(pl, slot)
 }
 
 // `RMakeList`: legacy's build pair and prologue, then each element, then the short tail at the
@@ -2087,6 +2139,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
     }
     SCellSet | SSwitch => irLMiss("statement outside I1")
   }
+  return 0
 }
 
 // What `ifOpen` did with a node: not an `if`, wrote all of it, or opened its `else` (a plain or a
@@ -2315,7 +2368,14 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else if n.cbArm == "mapIndexGetOr" { coalMapGetOr(n, e, pending) } else { coalPopOr(n, e, pending) }
+  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
+    "popOr" => coalPopOr(n, e, pending)
+    "mapIndexGetOr" => coalMapGetOr(n, e, pending)
+    "nulRef" => coalNulRef(n, e, pending)
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
+      irLMiss("coalesce box arm")
+    }
+  } }
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
@@ -2369,6 +2429,39 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// A nullable reference's `??` along its plan: the plain block (the operand inside it, the branch
+// out on non-null) or a join's staged `if` (the operand ahead of it), then the shared tail.
+function coalNulRef(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const fnIx = lw.irAt
+  const p = coalNulRefPlanOf(e, unwrapParen(e.binLeft), n.cbAt, fnIx)
+  if p == null { return irLMiss("coalesce nulRef heap") }
+  return match p.nrArm {
+    "plain" => {
+      coalNulRefOpen(p.nrHeap, coalesceDefaultNullable(e.binRight, fnIx))
+      cond(n.cbL, pending)
+      coalNulRefBranch()
+      coalNulRefTail(n, -1)
+    }
+    "join" => {
+      cond(n.cbL, pending)
+      coalNulRefJoinOpen()
+      coalNulRefTail(n, p.nrTag)
+    }
+    "noBox" | "listClash" | "litAtom" => irLMiss("coalesce nulRef " + p.nrArm)
+  }
+}
+
+// The default of a nullable reference's `??` writing the slotless out, then, for a join, the
+// present arm boxing the staged reference under `tag`, and the end.
+function coalNulRefTail(n: SCoalBox, tag: i32): i32 {
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  if tag >= 0 { coalNulRefJoinPresent(tag) }
   fbEnd()
   return 0
 }
@@ -2441,15 +2534,20 @@ function ret(n: SReturn, pending: i32[]) {
     return 0
   }
   cond(n.rtV, pending)
-  // A function taking legacy's union return sink pops a box built here into the sink pair and
-  // branches to the exit block wrapped round the body, as `emitUnionRetSink` does.
+  return sinkExit()
+}
+
+// A returned value already written exits as `emitUnionRetSink` writes it: a function taking the
+// union return sink pops a box built here into the sink pair and branches to the exit block
+// wrapped round the body, and anything else returns.
+function sinkExit() {
   if fnUses.unionSink && uBoxNewIsLast() {
     uBoxSinkToPair()
     fbBr(lwFrames.length)
     lwSinkFired = lwSinkFired + 1
     return 0
   }
-  fbReturn()
+  return fbReturn()
 }
 
 function spanOpen(id: i32) {
@@ -2596,12 +2694,9 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
   const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
   if pad == "null" {
-    // Legacy sinks this `null` when the return sink fired; the IR does not build that exit.
-    if lwSinkFired > 0 {
-      irLMiss("null fall-through into the return sink")
-    } else {
-      emitNullRetTail(nullRetPlanOf(f.irAt))
-    }
+    emitNullRetTail(nullRetPlanOf(f.irAt))
+    // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
+    if lwSinkFired > 0 { sinkExit() }
   } else if pad == "unreachable" {
     fbUnreachable()
   }

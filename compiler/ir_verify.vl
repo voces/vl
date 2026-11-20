@@ -216,6 +216,7 @@ function use(o: Opnd, at: i32) {
     }
     OImm | OStr => 0
   }
+  return 0
 }
 
 function uses(os: Opnd[], at: i32) {
@@ -489,7 +490,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const k = kidAt(v, r.gfIx)
       const unboxed = repNodeAt(k) is RBox
         && dst == repNodeOfTy(nodeTyAt(r.gfAt, vf.irAt))
-      if dst >= 0 && k != dst && !unboxed {
+      // A nullable field the checker narrowed past its null reads at its inner rep.
+      const kn = repNodeAt(k)
+      const narrowed = kn is RNullable && kn.rnInner == dst
+      if dst >= 0 && k != dst && !unboxed && !narrowed {
         return fail(2, at, "a field's rep is not its destination's")
       }
       0
@@ -939,6 +943,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
   }
+  return 0
 }
 
 // Whether rep `r` is raw, at heap `heap` unless that is -1.
@@ -1063,6 +1068,26 @@ function coalBoxWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if lr is RBox || lr is RNullable && lr.rnDisc == 4 { return "" }
   return "a boxed `??` reads no box"
+}
+
+// Why a nullable reference's `??` is ill-formed, or "": it reads a nullable reference, and its out
+// is that reference, its non-null inner, or a join's box.
+function coalNulRefWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc == 4 || lr.rnInner < 0 {
+    return "a nullable-reference `??` reads no nullable reference"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a nullable-reference `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  const on = repNodeAt(or)
+  const boxed = on is RBox || on is RNullable && on.rnDisc == 4
+  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a nullable-reference `??` yields neither the reference, its inner, nor a box"
+  }
+  return ""
 }
 
 // Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
@@ -1332,6 +1357,7 @@ function stmt(id: i32) {
       const why = match n.cbArm {
         "popOr" => coalPopOrWhy(n)
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+        "nulRef" => coalNulRefWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1394,6 +1420,7 @@ function stmt(id: i32) {
     SDrop => use(n.dpV, id)
     SRawOp => rawEff(n, id)
   }
+  return 0
 }
 
 // Rule 7: each arm of the scrutinee's box is covered once, or a default names what it excludes.
