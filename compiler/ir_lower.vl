@@ -125,6 +125,7 @@ import {
   RRel,
   RRetag,
   RSharedRead,
+  RSpread,
   RStage,
   RStrOp,
   RTagIs,
@@ -344,6 +345,8 @@ import {
   sharedReadPlanOf,
   sharedReadStashes,
   sharedRecvSlotGet,
+  spreadGroupStash,
+  spreadJoinGroups,
   stageListRecvTail,
   staticAtomId,
   structFieldTail,
@@ -380,12 +383,17 @@ import {
   localNulStrRecovers,
   nulTestArmOf,
 } from "./emit_plan_null"
-import { arrLitRefShortSlot } from "./emit_plan_list"
+import {
+  arrLitRefShortSlot,
+  spreadBackIdx,
+  spreadPlanOf,
+  spreadWrapIdx,
+} from "./emit_plan_list"
 import { fbOpenIf } from "./emit_bytes"
 import { fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
-import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
+import { arrLitArmOf, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -402,6 +410,7 @@ import {
   gCellIdx,
   gHelpF64Rem,
   gImports,
+  liKinds,
   listIdxScratchBase,
   localIsRef,
   localStructIdx,
@@ -415,6 +424,7 @@ import {
   uBoxNewEnd,
   unionSinkBase,
 } from "./emit_state"
+import { ListBuild } from "./emit_ref_list_kinds"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -767,6 +777,7 @@ function rhs(r: Rhs, tail: boolean) {
     RCallHost | RCast | RTagOf | RListNew | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     RMakeList => makeList(r)
+    RSpread => spreadList(r)
     RMapNew => {
       leaf()
       emitMapNew(r.mnAt, lw.irAt)
@@ -1180,7 +1191,7 @@ function recoverRead(r: RRecover) {
 // arm `arrLitArmOf` names, in `emitArr`'s order.
 function makeList(r: RMakeList) {
   const fnIx = lw.irAt
-  const lb = arrLitListBuild(r.mlAt, fnIx)
+  const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
   const arm = arrLitArmOf(r.mlAt, fnIx, lb)
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
@@ -1205,6 +1216,34 @@ function makeList(r: RMakeList) {
   }
   if arm == "u8" { return arrLitPackedShortTail(lb.lbSlot, r.mlElems.length) }
   return arrLitShortTail(arm, r.mlElems.length)
+}
+
+// `RSpread`: legacy's prologue, the source, then the group stash and join `emitArrSpread`'s plain
+// arm writes, read off the same plan, so its slots are the literal's recorded ones.
+function spreadList(r: RSpread) {
+  const fnIx = lw.irAt
+  const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
+  arrLitPrologue(r.spAt)
+  const p = spreadPlanOf(r.spAt, fnIx, lb)
+  if p.spWhy != "" || p.spSrcs.length != 1 { return irLMiss("spread plan") }
+  // The pair is asked where legacy's arm asks it, before the group, so a first ask mints in order.
+  const wrap = spreadWrapIdx(p.spKind, p.spRow)
+  const back = spreadBackIdx(p.spKind, p.spRow)
+  if wrap < 0 || back < 0 { return irLMiss("spread pair") }
+  irLOpnd(r.spSrc)
+  const seq = liKinds.length
+  const gs = spreadGroupStash(p, r.spAt, 0, p.spSrcs[0], fnIx, seq)
+  if gs < 0 { return -1 }
+  return spreadJoinGroups(
+    r.spAt,
+    [gs],
+    [p.spGroupRows[0]],
+    wrap,
+    back,
+    p.spKind,
+    p.spRow,
+    seq,
+  )
 }
 
 // `SForIn`: legacy's walk (`forInPlainWhy`) in `emitForInStmt`'s order: its loop record at the

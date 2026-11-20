@@ -43,6 +43,7 @@ import {
   i32ToStr,
   nodeAt,
   nodeChildrenPush,
+  spreadArgOf,
 } from "./ast"
 import {
   IrFamily,
@@ -196,6 +197,7 @@ import {
   strFromBytesCallNamed,
   strLitTakesAtom,
   structFieldArmOf,
+  structFieldBoxTy,
   tagArmLambdaCallee,
   tagDispatchArms,
   tagDispatchIds,
@@ -205,6 +207,7 @@ import {
   trapCallNamed,
   valueIfLitTrue,
   variantFieldArmOf,
+  variantFieldBoxTy,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
 import { identUnboxAtomOf, variantCoerceArmOf } from "./emit_plan_union"
@@ -227,9 +230,15 @@ import {
   widenPlanOf,
 } from "./emit_plan_union"
 import {
+  SpreadPlan,
+  arrLitBuildAt,
   arrLitBuiltTyOf,
   arrLitRefShortSlot,
+  arrLitTyAt,
   arrLitUnionBoxSlot,
+  spreadBoxDestRow,
+  spreadPairKnown,
+  spreadPlanOf,
 } from "./emit_plan_list"
 import { mvValVariantOf } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
@@ -320,6 +329,7 @@ import {
   localIndexOf,
   nulLitAtomTexts,
   sFieldStoreKind,
+  spreadBoxingSource,
 } from "./emit_classify"
 import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -377,6 +387,8 @@ import {
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_NEVER, tyScalarBasePrim } from "./check_types"
+import { spreadSlotIdOf } from "./emit_collect"
+import { ListBuild } from "./emit_ref_list_kinds"
 
 let ibArmed = false
 let ibDetail = false
@@ -672,7 +684,7 @@ function objLitAt(
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
     if why != "" { return irBMiss(why) }
     const mark = b.length
-    const v = deliver(b, valIx, ks[k], -1)
+    const v = deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi))
     if ibMiss != "" { return v }
     if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
     if oi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
@@ -748,8 +760,12 @@ function fieldPlainWhy(
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
     if !variantArmFits(va, dst) { return "object variant field " + va }
-    // A box into another union's box converts its members on legacy's side (`emitDelivered`).
-    if va == "box" && exprUnion(valIx, ibFnIx) {
+    // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
+    if (
+      va == "box"
+      && exprUnion(valIx, ibFnIx)
+      && boxIntoOtherUnion(valIx, dst, fieldSiteTy(arm, row, fi))
+    ) {
       return "object variant field box from a box"
     }
     return ""
@@ -757,8 +773,12 @@ function fieldPlainWhy(
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
   if !fieldArmDelivers(fa) { return "object field " + fa }
   if !fieldArmRepFits(fa, dst) { return "object field row rep" }
-  // A box into another union's box converts its members on legacy's side (`emitDelivered`).
-  if fa == "union" && exprUnion(valIx, ibFnIx) {
+  // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
+  if (
+    fa == "union"
+    && exprUnion(valIx, ibFnIx)
+    && boxIntoOtherUnion(valIx, dst, fieldSiteTy(arm, row, fi))
+  ) {
     return "object field box from a box"
   }
   if nulNicheRecoverOwed(sFieldStoreKind(row, fi), valIx, ibFnIx) {
@@ -789,7 +809,8 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { teV: o, teTag: tag }, ix, rep)
 }
 
-// The variable holding local box `r` in legacy's live slot, read raw past any narrowing, or -1.
+// The variable holding local box `r` in legacy's live slot, read raw past any narrowing, or -1. A
+// `U | null` box is the same box, its `null` one more tag.
 function rawBoxVar(r: i32): i32 {
   const d = identDeclOf(r)
   const w = localIndexOf(ibFnIx, r)
@@ -797,11 +818,7 @@ function rawBoxVar(r: i32): i32 {
   const dn = nodeAt(d)
   if !(dn is LetDecl) && !(dn is Param) { return -1 }
   const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
-  if (
-    v < 0
-    || ib.irVars[v].vSlot != w
-    || !(repNodeAt(ib.irVars[v].vRep) is RBox)
-  ) {
+  if (v < 0 || ib.irVars[v].vSlot != w || !heldAsBox(ib.irVars[v].vRep)) {
     return -1
   }
   return v
@@ -1031,6 +1048,19 @@ export function irBDeclVar(d: i32): i32 {
     irBMiss("local rep " + repWhat(rep))
     return -1
   }
+  if irTyHeldOpen(ty, rep) {
+    irBMiss("open local type")
+    return -1
+  }
+  return declVarAt(d, rep, ty)
+}
+
+// Loop variable `d` read at `ix`: the walk's variable, or in a fragment the element's slot at the
+// read's own rep and type, which `irSlotRunAgrees` then holds to legacy's cell.
+function fragLoopVar(d: i32, ix: i32, rep: i32): i32 {
+  const known = ibDeclVar[d] ?? -1
+  if known >= 0 { return known }
+  const ty = heldTy(exprTyOf(ix))
   if irTyHeldOpen(ty, rep) {
     irBMiss("open local type")
     return -1
@@ -1458,10 +1488,12 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
   const w = localIndexOf(ibFnIx, ix)
-  const walkVar = dn is LoopVar && (ibDeclVar[d] ?? -1) >= 0
+  // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
+  // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
+  const walkVar = dn is LoopVar && ((ibDeclVar[d] ?? -1) >= 0 || ib.irFragment)
   if (dn is LetDecl || dn is Param || walkVar) && w >= 0 {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
-    const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+    const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
     if ib.irVars[v].vRep != rep { return narrowedLocalRead(b, n, ix, v, rep) }
     ib.irReadVar[ix] = v
@@ -2607,8 +2639,12 @@ function repTemp(b: i32[], r: Rhs, ix: i32, dst: i32): Opnd {
 function boxIntoOtherUnion(ix: i32, dst: i32, dstTy: i32): boolean {
   if !(repNodeAt(dst) is RBox) && !boxedNullable(dst) { return false }
   if boxOwedAt(ix, ibFnIx) { return false }
-  if dstTy < 0 { return true }
-  return holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
+  return dstTy < 0 || holeBoxPlanOf(ix, dstTy, ibFnIx).hbArm != "pass"
+}
+
+// The union legacy's field writer boxes literal row `row`'s field `fi` at.
+function fieldSiteTy(arm: ObjLitArm, row: i32, fi: i32): i32 {
+  return if arm == "variant" { variantFieldBoxTy(row, fi) } else { structFieldBoxTy(row, fi) }
 }
 
 // Operand `v`, built from `ix`, widened to rep `dst` as `deliver` widens it.
@@ -2827,9 +2863,16 @@ function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
 // A list literal along legacy's short build (`arrLitArmOf`, `arrLitShortWhy`): an i32, f64, i64, f32,
 // string, packed or plain ref list, each element delivered at the list's element rep. Every other
 // arm is a named miss.
-function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
-  const lb = arrLitListBuild(ix, ibFnIx)
+function arrayLit(
+  b: i32[],
+  n: ArrayLit,
+  ix: i32,
+  rep: i32,
+  lb: ListBuild,
+  bt: i32,
+): Opnd {
   const arm = arrLitArmOf(ix, ibFnIx, lb)
+  if arm == "spread" { return spreadLit(b, n, ix, rep, lb) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
   if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 {
@@ -2849,8 +2892,8 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   const sw = if arm == "ref" { "" } else { arrLitShortWhy(ix, ibFnIx, arm, n.arrElems.length) }
   if sw != "" { return irBMiss("array " + sw) }
   // Typed at the type legacy's build decision takes (`arrLitBuiltTyOf`): an instance's `[1.5]` at
-  // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp.
-  const bt = arrLitBuiltTyOf(ix, ibFnIx)
+  // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp. `bt` is the
+  // type behind `lb`, the build the literal's delivery threaded.
   const atBt = bt >= 0 && repNodeAt(repNodeOfTy(bt)) is RList
   const lrep = if atBt { repNodeOfTy(bt) } else { rep }
   const ln = repNodeAt(lrep)
@@ -2872,9 +2915,73 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
   }
-  const r: Rhs = { mlElems: elems, mlAt: ix }
+  const r: Rhs = {
+    mlElems: elems,
+    mlKind: lb.lbKind,
+    mlSlot: lb.lbSlot,
+    mlAt: ix,
+  }
   if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
   return irBLetTemp(b, r, ix, lrep)
+}
+
+// A spread literal of one item group, a spread source, along legacy's plain arm (`spreadPlanOf`):
+// the source built raw, as legacy emits it, at the literal's own list rep and row, into slots its
+// recorded ordinal keys. A boxing, converting or many-group literal is a named miss.
+function spreadLit(
+  b: i32[],
+  n: ArrayLit,
+  ix: i32,
+  rep: i32,
+  lb: ListBuild,
+): Opnd {
+  // Read off the elements before any plan is asked: the plan's wrapper lookups mint types.
+  if n.arrElems.length != 1 || spreadArgOf(n.arrElems[0]) < 0 {
+    return irBMiss("array spread groups")
+  }
+  if (
+    spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
+    || spreadBoxingSource(ix, ibFnIx) >= 0
+  ) {
+    return irBMiss("array spread boxed")
+  }
+  if spreadSlotIdOf(ix) < 0 { return irBMiss("array spread unrecorded") }
+  const p = spreadPlanOf(ix, ibFnIx, lb)
+  if p.spWhy != "" { return irBMiss("array spread plan") }
+  if !spreadPairKnown(p) { return irBMiss("array spread pair unminted") }
+  if p.spSrcKinds[0] != p.spKind { return irBMiss("array spread conversion") }
+  if p.spGroupRows[0] != p.spRow { return irBMiss("array spread sub row") }
+  if !(repNodeAt(rep) is RList) { return irBMiss("array rep") }
+  const v = spreadSrcBuild(b, p, p.spSrcs[0], ix, rep)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
+  const r: Rhs = { spSrc: v, spKind: lb.lbKind, spSlot: lb.lbSlot, spAt: ix }
+  return irBLetTemp(b, r, ix, rep)
+}
+
+// Spread source `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
+// literal at its own typed build, typed at that build's type, else at the group's, which is the
+// literal's own kind and row and so its type; any other source as itself, with no paren between.
+function spreadSrcBuild(
+  b: i32[],
+  p: SpreadPlan,
+  src: i32,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const lit = unwrapParen(src)
+  if lit < 0 { return irBMiss("array spread source") }
+  const ln = nodeAt(lit)
+  if !(ln is ArrayLit) { return irBExpr(b, src) }
+  const ba = arrLitBuildAt(lit, arrLitTyAt(lit, ibFnIx), ibFnIx)
+  const tb = ba.baBuild
+  if tb != null {
+    const lrep = exprRepOf(lit)
+    if lrep < 0 { return irBMiss("array spread literal source rep") }
+    return arrayLit(b, ln, lit, lrep, tb, ba.baTy)
+  }
+  const gb: ListBuild = { lbKind: p.spGroupKinds[0], lbSlot: p.spGroupRows[0] }
+  return arrayLit(b, ln, lit, rep, gb, exprTyOf(ix))
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.
@@ -3564,7 +3671,16 @@ export function irBExpr(b: i32[], ix: i32): Opnd {
   if n is Index { return irIndexHook(b, ix, rep) }
   if n is Member { return irMemberHook(b, ix, rep) }
   if n is StrLit { return strLit(ix, rep) }
-  if n is ArrayLit { return arrayLit(b, n, ix, rep) }
+  if n is ArrayLit {
+    return arrayLit(
+      b,
+      n,
+      ix,
+      rep,
+      arrLitListBuild(ix, ibFnIx),
+      arrLitBuiltTyOf(ix, ibFnIx),
+    )
+  }
   if n is CharLit {
     const cp = charLitCp(n)
     if cp < 0 || repPrim(rep) != "i32" { return irBMiss("char literal") }
@@ -4534,6 +4650,7 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
     ibReset(fnIx, fn.fnName, fnPos)
     buildParams(fn, fnIx, false)
   }
+  ib.irFragment = true
   ibNoValue = repNodeOfTy(TY_NEVER)
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
