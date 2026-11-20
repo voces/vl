@@ -57,6 +57,7 @@ import {
 import { unwrapParen } from "./emit_base"
 import { relTrim } from "./emit_reloc"
 import {
+  coalesceDefaultNullable,
   declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
@@ -230,6 +231,7 @@ import {
   coalBoxOpen,
   coalBoxSlot,
   coalNulRefBranch,
+  coalNulRefHeapOf,
   coalNulRefOpen,
   emitClosureValue,
   emitFoldedConstRead,
@@ -2025,7 +2027,17 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba == null { coalPopOr(n, e, pending) } else { coalBoxArm(n, ba, e, pending) }
+  const got = if ba != null {
+    coalBoxArm(n, ba, e, pending)
+  } else {
+    match n.cbArm {
+      "popOr" => coalPopOr(n, e, pending)
+      "nulRef" => coalNulRef(n, e, pending)
+      "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
+        irLMiss("coalesce box arm")
+      }
+    }
+  }
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
@@ -2076,6 +2088,22 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   }
   irLSettle(pending)
   popOrOpen(p, lIdx)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut)
+  lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// A nullable reference's `??`: the block at the heap its plan names, the operand, the branch out
+// on non-null, the default writing the slotless out, and the end.
+function coalNulRef(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const fnIx = lw.irAt
+  const h = coalNulRefHeapOf(e, unwrapParen(e.binLeft), n.cbAt, fnIx)
+  if h < 0 { return irLMiss("coalesce nulRef heap") }
+  coalNulRefOpen(h, coalesceDefaultNullable(e.binRight, fnIx))
+  cond(n.cbL, pending)
+  coalNulRefBranch()
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut)
   lwFrames.pop()

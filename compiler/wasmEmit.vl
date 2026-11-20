@@ -40530,6 +40530,31 @@ function emitCoalesceAtomStrDefault(defIx: i32, nulBlock: boolean, fnIx: i32) {
   return 0
 }
 
+// The heap the `br_on_non_null` core of `l ?? d` carries, -1 when `l` reaches none: a nullable
+// collection's wrapper or the closure struct at their niche arms, else, past every boxed and fused
+// arm, a nullable union arm's variant heap or a nullable record's struct heap.
+export function coalNulRefHeapOf(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32): i32 {
+  return match coalNicheArmOf(e, lhsIx, exprIx, fnIx) {
+    "coll" => nulCollWrapHeap(e.binLeft, fnIx)
+    "clo" => cloStructIdx
+    "nulBoolJoin" | "nulBool" | "litUnion" | "nulAtomStr" | "str" | "identBox" => {
+      coalNulRefTailHeap(e, fnIx)
+    }
+  }
+}
+
+// The nullable union arm's variant heap or the nullable record's struct heap `l` of `l ?? d`
+// holds, -1 for neither: the last rungs of the ladder.
+function coalNulRefTailHeap(e: BinExpr, fnIx: i32): i32 {
+  const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
+  if cvi >= 0 && cvi < uVarRow.length { return variantHeap(cvi) }
+  if exprNullableStruct(e.binLeft, fnIx) {
+    const csi = structIndexOfExpr(e.binLeft, fnIx)
+    if csi >= 0 && csi < sHeapIdx.length { return sHeapIdx[csi] }
+  }
+  return -1
+}
+
 // The core above for the nullable struct (`S | null`) and nullable collections (`i32[] |
 // null`, `string[] | null`, …): the lhs takes the ambient seeds (these reps have no
 // self-recovering read) and the block type is the default's null-ness
@@ -41054,10 +41079,12 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // cell is a `(ref null $wrapper)`, so it takes the same `br_on_non_null` lowering as the
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
   if arm == "coll" {
-    return emitCoalesceNulRef(e, exprIx, nulCollWrapHeap(e.binLeft, fnIx), fnIx)
+    return emitCoalesceNulRef(e, exprIx, coalNulRefHeapOf(e, lhsIx, exprIx, fnIx), fnIx)
   }
   // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
-  if arm == "clo" { return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx) }
+  if arm == "clo" {
+    return emitCoalesceNulRef(e, exprIx, coalNulRefHeapOf(e, lhsIx, exprIx, fnIx), fnIx)
+  }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -41897,24 +41924,8 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   // null` whose `T` is a union arm stores `(ref null $variantHeap(vi))`, and
   // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
   // niche, same `br_on_non_null` lowering, one table over.
-  const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
-  if cvi >= 0 {
-    if cvi < uVarRow.length {
-      return emitCoalesceNulRef(e, exprIx, variantHeap(cvi), fnIx)
-    }
-  }
-  // Generic nullable-struct `??`: a `S | null` value (ident/param binding, struct field, or
-  // closure/factory call) coalesced with a struct default. Evaluated once: `br_on_non_null`
-  // keeps the non-null struct or falls to the default, needing neither a re-eval nor a
-  // per-struct stash — `structIndexOfExpr` resolves the inner struct for the block's result type, including an indexed closure-array/factory call via the checker-type fallback.
-  if exprNullableStruct(e.binLeft, fnIx) {
-    const csi = structIndexOfExpr(e.binLeft, fnIx)
-    if csi >= 0 && csi < sHeapIdx.length {
-      // The block type and the one-evaluation shape are the nullable-ref-niche lowering the
-      // collections share.
-      return emitCoalesceNulRef(e, exprIx, sHeapIdx[csi], fnIx)
-    }
-  }
+  const crHeap = coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
+  if crHeap >= 0 { return emitCoalesceNulRef(e, exprIx, crHeap, fnIx) }
   // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
   // re-readable spelling never arrives here: `emit_rewrite` desugars it to an `if`, which is
   // right because a rewrite leaves no `??` node for the consumer classifiers to disagree
