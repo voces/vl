@@ -1619,7 +1619,7 @@ Deno.test({
 });
 
 // A value `if` joined at a string or a list builds under legacy's ref blocktype and matches; one
-// that is a later operand of a string `+` sits above the earlier ones, a named miss.
+// that is a later operand of a string `+` stages the earlier operand below it, and matches too.
 const REF_IF =
   `function s(b: boolean, x: string, y: string): string {\n  const r = if b { x } else { y }\n  return r\n}\nfunction t(b: boolean, x: string): string {\n  return x + (if b { x } else { "no" })\n}\nfunction l(b: boolean, xs: i32[], ys: i32[]): i32 {\n  const r = if b { xs } else { ys }\n  return r.length\n}\nprint(s(true, "a", "b"))\nprint(s(false, "a", "b"))\nprint(t(false, "a"))\nprint(l(true, [1, 2], [3]))\n`;
 Deno.test({
@@ -1630,11 +1630,11 @@ Deno.test({
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
-      throw new Error(`want s and l covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want s, t and l covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!rows.has("uncovered string operand after another")) {
-      throw new Error(`want t a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered string operand after another")) {
+      throw new Error(`want t's earlier operand staged, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1765,6 +1765,24 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
       throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A reference join's `else if` chain is built link by link into each link's `else`, at the head's
+// rep: a string chain and a list chain build and match legacy.
+const REF_IF_CHAIN =
+  `function s3(n: i32, a: string): string {\n  const r = if n > 0 { a } else if n < 0 { "neg" } else { "zero" }\n  return r\n}\nfunction l3(n: i32, xs: i32[]): i32[] {\n  const r = if n > 1 { xs } else if n == 1 { [1] } else { [] }\n  return r\n}\nprint(s3(-1, "pos"))\nprint(l3(1, []).length)\n`;
+Deno.test({
+  name: "ir shadow: a reference join's else-if chain builds link by link and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF_CHAIN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want s3 and l3 covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2099,6 +2117,77 @@ print(nullable(null))
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 8 || (rows.get("matched") ?? 0) !== 8) {
       throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `__array_copy__` is written as legacy's arm writes it: each list operand followed by its backing,
+// then the copy. An i32, a string, an f64 and a record list each match byte for byte.
+Deno.test({
+  name: "ir shadow: an __array_copy__ statement matches over each list kind",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function grow(xs: i32[], n: i32): i32[] {
+  const out: i32[] = __array_new__(n, 0)
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+function tail(xs: string[], from: i32): string[] {
+  const out: string[] = __array_new__(xs.length - from, "")
+  __array_copy__(out, 0, xs, from, xs.length - from)
+  return out
+}
+function fl(xs: f64[]): f64[] {
+  const out: f64[] = __array_new__(xs.length * 2, 0.0)
+  __array_copy__(out, xs.length, xs, 0, xs.length)
+  return out
+}
+type P = { x: i32 }
+function rs(xs: P[]): P[] {
+  const out: P[] = __array_new__(xs.length, { x: 0 })
+  __array_copy__(out, 0, xs, 0, xs.length)
+  return out
+}
+print(grow([1, 2, 3], 5)[2] + rs([{ x: 4 }, { x: 5 }])[1].x)
+print(tail(["a", "b", "c"], 1)[1])
+print(fl([1.5, 2.5])[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `__array_copy__`'s operands are each written in place at its use, between the backing reads:
+// computed offsets and counts, a call as the count and a call as the source list all match.
+Deno.test({
+  name: "ir shadow: an __array_copy__ over computed and called operands matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function cnt(n: i32): i32 { return n - 1 }
+function pick(xs: i32[]): i32[] { return xs }
+function comp(d: i32[], s: i32[], i: i32, j: i32, n: i32) { __array_copy__(d, i + 1, s, j * 2, n - 1) }
+function callCount(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, s, 0, cnt(n)) }
+function callSrc(d: i32[], s: i32[], n: i32) { __array_copy__(d, 0, pick(s), 0, n) }
+function mixed(d: i32[], s: i32[], i: i32, n: i32) {
+  __array_copy__(d, i + i * 2, pick(s), cnt(i) + 1, cnt(n))
+}
+const d: i32[] = __array_new__(8, 0)
+const s = [1, 2, 3, 4, 5, 6]
+comp(d, s, 0, 1, 3)
+callCount(d, s, 3)
+callSrc(d, s, 2)
+mixed(d, s, 1, 3)
+print(d[0] + d[3])
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
