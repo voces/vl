@@ -627,6 +627,28 @@ print(o.length + xs.length)
   },
 });
 
+// A short-circuit arm that reassigns the held receiver: both sides read the local after the value,
+// so the push lands on the list the arm assigned, and the IR matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a held push whose value reassigns the receiver reads it after the value",
+  ignore,
+  fn: () => {
+    const src = `function h(p: boolean): i32 {
+  let xs: boolean[] = []
+  const other: boolean[] = []
+  xs.push(p && (xs = other).length == 0)
+  return xs.length * 10 + other.length
+}
+print(h(true))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 1 || rows.get("covered") !== 1) {
+      throw new Error(`want the function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({

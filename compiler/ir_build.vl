@@ -261,6 +261,7 @@ import {
   fnEnvIdxOf,
   nodeTyAt,
   numLitWidth,
+  readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
@@ -289,11 +290,12 @@ import {
   forInElemTyOf,
   forInMapRecv,
   globalCellKind,
+  identIsEnvCapture,
   localIndexOf,
   nulLitAtomTexts,
   sFieldStoreKind,
 } from "./emit_classify"
-import { declaredSlotOfDecl } from "./emit_struct_order"
+import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
 import {
   callSpillsFcpArg,
   elseLessNullableTail,
@@ -2040,6 +2042,25 @@ function clearStmt(b: i32[], c: Call, ix: i32) {
   return 0
 }
 
+// Whether push receiver `recvIx` is a list held in its own local, asked only of facts settled
+// before emit: a declared local or a parameter, read unnarrowed and uncaptured. Legacy's fit and
+// capture stand-ins, the scope stack and a lifted closure's write slots are set while it emits,
+// so a receiver that could reach them stays staged here.
+function pushRecvHeldAtRest(recvIx: i32): boolean {
+  const n = nodeAt(recvIx)
+  if !(n is Ident) || identDeclOf(recvIx) < 0 { return false }
+  if declaredSlotOf(recvIx) < 0 && paramIndexOf(ibFnIx, n.identName) < 0 {
+    return false
+  }
+  if (
+    readNarrowedTyAt(recvIx, ibFnIx) >= 0
+    || identIsEnvCapture(ibFnIx, n.identName)
+  ) {
+    return false
+  }
+  return listOpRecvHeldPlan(recvIx, ibFnIx, ".push") >= 0
+}
+
 // A one-argument `.push` legacy writes as the plain append (`pushPlainWhy`): its receiver, then
 // its value at the list's element rep.
 function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
@@ -2066,8 +2087,10 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
   if ibMiss != "" { return missRhs("method operand") }
   // A staged receiver is written at its use, above a valued `if` the value wrote ahead of the
   // node. A receiver held in its own local is read by index after the value, as legacy reads it.
-  const held = listOpRecvHeldPlan(pp.ppRecv, ibFnIx, ".push") >= 0
-  if !held && ifBelowLead(b, at, "push short-circuit operand") {
+  if (
+    !pushRecvHeldAtRest(pp.ppRecv)
+    && ifBelowLead(b, at, "push short-circuit operand")
+  ) {
     return missRhs("push short-circuit operand")
   }
   if irBOpRep(x) != er { return missRhs("push operand coercion") }
