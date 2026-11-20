@@ -24,12 +24,17 @@ Compiler lines are +66 −4 across `wasmEmit.vl`, `ir_build.vl`, `ir_lower_ref.v
 `ir_verify.vl`, `ir.vl` and `lint.vl`. No legacy line is deleted; legacy's routing and helper call
 moved into the two shared functions.
 
-## Readings (vs merge-base `799e3a8d1`, fixpoint seeds on both sides)
+## Readings (vs merge-base `c34a60bfd`, fixpoint seeds on both sides)
 
 | reading | merge-base | this change |
 | --- | ---: | ---: |
-| self-compile functions claimed (mode 5) | 18,280 | 18,283 (+3) |
-| corpus covered = verified = matched (shadow) | 40,614 of 45,678 | 40,951 (+337) |
+| self-compile functions claimed (mode 5) | 18,328 | 18,331 (+3) |
+| corpus covered = verified = matched (shadow) | 40,615 of 45,678 | 40,952 (+337) |
 | corpus `intrinsic none` alone (census) | 356 | 19 |
-| L2 self-compile fuel | 103,311,866,734 | 103,366,805,283 (+0.053%) |
-| seed size | 6,886,447 | 6,887,969 (+1,522 bytes) |
+| L2 self-compile fuel | 103,413,762,266 | 103,466,430,703 (+0.051%) |
+| seed size | 6,890,795 | 6,892,324 (+1,529 bytes) |
+
+Legacy moved into the two shared functions, so legacy is A/B'd on its own: compilers with
+`CLAIMED` empty built from both trees give identical bytes on every tests/cases program and probe
+(7,520 identical, 68 failing under both, 0 differ) and the same first diagnostic on all 59 filed
+emit-reject witnesses. The shipped seeds give the same 7,520 / 68 / 0.
