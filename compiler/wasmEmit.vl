@@ -4077,6 +4077,7 @@ function emitDeadOperand(opIx: i32, fnIx: i32): i32 {
   if !deadOperandEvaluated(opIx) { return 0 }
   if emitExpr(opIx, fnIx) < 0 { return -1 }
   fbDrop()
+  condDeadEnd = wLen()
   return 0
 }
 
@@ -9114,7 +9115,7 @@ function emitUnionIfValueLink(
     // null is the null-tagged box — the same value `emitNulNullToLocal` writes for the binding
     // sink's rep 0, built here on the stack instead of into a slot.
     const noElse = s.ifElse < 0
-    const condStart = wLen()
+    const condStart = condMark()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
     const sg = staticValueIfCond(s.ifCond, condStart)
     fbOpenIf()             // 0x04 if
@@ -9483,7 +9484,7 @@ function emitVariantIfValueLink(vi: i32, ifIx: i32, fnIx: i32, open: i32[]) {
     // is `ref.null $variantHeap(vi)`, so the blocktype goes nullable with it (`fbRefNullOfKind` is
     // `fbValtypeNullable`'s value twin).
     const noElse = s.ifElse < 0
-    const condStart = wLen()
+    const condStart = condMark()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
     const sg = staticValueIfCond(s.ifCond, condStart)
     fbOpenIf() // 0x04 if
@@ -21581,7 +21582,7 @@ function emitIfExprRefLink(
     // used as a value"): the false path yields `null`, so the join is nullable and the
     // missing arm is the rep's own null. The blocktype below and the else arm at the bottom are that one fact, twice.
     const noElse = s.ifElse < 0
-    const condStart = wLen()
+    const condStart = condMark()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
     const sg = staticValueIfCond(s.ifCond, condStart)
     fbOpenIf() // 0x04 if
@@ -21845,7 +21846,7 @@ function emitIfExprAsLink(ifIx: i32, fnIx: i32, kind: i32, open: i32[]) {
         return emitFail("emitProgram: if-expression requires an else arm")
       }
     }
-    const condStart = wLen()
+    const condStart = condMark()
     if emitCondExpr(s.ifCond, fnIx) < 0 { return -1 }
     const sg = staticValueIfCond(s.ifCond, condStart)
     fbIf(kind) // 0x04 if, <kind> result blocktype
@@ -33130,7 +33131,8 @@ function cursorSlotsUnder(ix: i32): i32 {
 // predicate — a second derivation of "did it fold" is exactly the drift that let
 // `monoStaticIsResult`'s direct answer disagree with the emitted condition.
 function emittedCondConst(condStart: i32): i32 {
-  if wLen() != condStart + 2 { return -1 }
+  const start = if condDeadEnd > condStart { condDeadEnd } else { condStart }
+  if wLen() != start + 2 { return -1 }
   if wPeekBack(1) != 65 {
     return -1 // 0x41 i32.const
   }
@@ -33138,6 +33140,17 @@ function emittedCondConst(condStart: i32): i32 {
   if cb == 0 { return 0 }
   if cb == 1 { return 1 }
   return -1
+}
+
+// Where the last dead operand of the condition being emitted ends (`emitDeadOperand`), or -1: an
+// instruction boundary after a net-zero `drop`, so a constant written from there on is the
+// condition's value. `condMark` clears it as each condition starts.
+let condDeadEnd = -1
+
+// The writer's position as a condition starts, read back by `emittedCondConst`.
+function condMark(): i32 {
+  condDeadEnd = -1
+  return wLen()
 }
 
 // Whether statement condition `condIx` is a box `is` test `tagIsArmOf` answers `tagAbsent`, a
@@ -33164,7 +33177,7 @@ function emitGuardCond(condIx: i32, fnIx: i32): i32 {
     fbI32Const(0)
     return 0
   }
-  const condStart = wLen()
+  const condStart = condMark()
   if emitCondExpr(condIx, fnIx) < 0 { return -2 }
   return staticIsGuard(condIx, condStart)
 }
@@ -36242,6 +36255,7 @@ export function wasmEmitStateReset() {
   ssArmMode = 0
   ssArmRhs = -1
   voidTailAt = -1
+  condDeadEnd = -1
   return 0
 }
 
@@ -37263,7 +37277,7 @@ function emitUnaryNode(e: Unary, exprIx: i32, fnIx: i32) {
   // Logical not `!a`: a boolean rides in an i32 (0/1), so `i32.eqz` (0x45) maps
   // 0→1 and any non-zero→0 — exactly `a == 0`. Push the operand, then eqz.
   if e.unOp == "!" {
-    const ngStart = wLen()
+    const ngStart = condMark()
     if emitExpr(e.unArg, fnIx) < 0 { return -1 }
     // An instance's decided `is` stays one constant under `!`, so `staticIsGuard` reads the
     // negated test as decided too and the dead arm is not lowered (D2957).
@@ -39094,7 +39108,7 @@ function emitBinExprNode(e: BinExpr, exprIx: i32, fnIx: i32) {
   // Short-circuit `&&`/`||` lower to a value-typed `if` (blocktype 0x7f): `a && b` is `if (a)
   // { b } else { 0 }`, `a || b` is `if (a) { 1 } else { b }`.
   if e.binOp == "&&" || e.binOp == "||" {
-    const scStart = wLen()
+    const scStart = condMark()
     if emitExpr(e.binLeft, fnIx) < 0 {
       return -1 // condition `a`
     }

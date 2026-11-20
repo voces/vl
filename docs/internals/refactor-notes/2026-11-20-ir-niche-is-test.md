@@ -14,6 +14,16 @@ unless it is a bare name. That step is now one predicate, `deadOperandEvaluated`
 (`emit_plan_null`), asked by legacy's dead null test and `nicheNever` arm (through
 `emitDeadOperand`) and by the IR's `deadNulTest` and niche `is` alike.
 
+## The decided guard keeps its fold
+
+An instance reads its `is` guard's constant back off the bytes (`emittedCondConst`, D932) and does
+not lower the arm the constant kills, which reads the receiver at a type the instance's value is
+not. A dropped receiver ahead of the `i32.const 0` hid the constant, so the dead arm lowered and
+failed to emit (`if z.h is C { print(z.h.s) }` over `A | null`). `emitDeadOperand` now records
+where its `drop` ends (`condDeadEnd`, cleared by `condMark` as each condition starts) and the
+read-back starts there: what follows a net-zero `drop` at an instruction boundary is the
+condition's value. Witness: `tests/cases/narrowing/is-niche-never-dead-arm-of-an-instance.vl`.
+
 ## The IR arms
 
 `boxTest` sends `isArmOf`'s `litArms` to `nicheIsTest`: `nicheNever` is the immediate `false` after
