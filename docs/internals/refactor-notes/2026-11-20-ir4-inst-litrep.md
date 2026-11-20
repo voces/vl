@@ -17,15 +17,16 @@ the IR an f64 one.
 
 ## The change
 
-- **One build decision.** `arrLitBuild` was split into a decision and a build:
-  - `arrLitBuildAt(arrIx, ty, fnIx)` is the decision. It returns the type the list is built at
-    (`baTy`) and whether that type's row is only read (`baHeld`):
-    - -1 for the record-solve own-shape route;
-    - a taken union destination's type (D4635);
-    - for an empty literal, `ty` or the destination, held;
-    - otherwise `ty`, then the destination.
-  - `arrLitBuild` maps that decision to its `ListBuild`, so `arrLitListBuild` goes through it.
-  - `arrLitBuiltTyOf(ix, fnIx)` reads the decision's type at `arrLitBuildTyOf`.
+- **One build decision.** `arrLitBuild` is now legacy code that both sides consume, through a
+  decision that carries what it found:
+  - `arrLitBuildAt(arrIx, ty, fnIx)` returns `{ baBuild, baTy }`: the build pair and the type it
+    came from.
+  - On every route where no pair is found, it returns `null` and -1:
+    - the record solve's own-shape route;
+    - an empty literal with no held pair at its type or its destination;
+    - a literal with no pair at its type or its destination.
+  - `arrLitBuild` is `arrLitBuildAt(…).baBuild`, so nothing is mapped twice.
+  - `arrLitBuiltTyOf(ix, fnIx)` is the same decision's `baTy` at `arrLitBuildTyOf`.
 - **`arrayLit`** types the list at `arrLitBuiltTyOf` when that is a list rep. It delivers each
   element at that list's element rep and types its temp through the new `irBLetTempTy`, which
   `irBLetTemp` now delegates to. On the own-shape route it keeps the stamp.
