@@ -563,6 +563,47 @@ opt(null)
   },
 });
 
+// A `??` over a boxed operand along each arm the IR builds (a binding at a scalar or a box result,
+// a list element, a call at a scalar or a box result) and a nested `??` in a default: each default
+// is built into the null arm, so it runs only there, and every function matches legacy's bytes.
+Deno.test({
+  name: "ir shadow: a boxed coalesce on each built arm is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `let calls = 0
+function d(): i32 {
+  calls = calls + 1
+  return 7
+}
+function db(): i32 | null {
+  calls = calls + 1
+  return 9
+}
+function mk(n: i32): i32 | null {
+  if n > 0 { return n }
+  return null
+}
+function valScalar(x: i32 | null): i32 { return x ?? d() }
+function valBox(x: i32 | null): i32 | null { return x ?? db() }
+function elem(xs: (i32 | null)[], i: i32): i32 { return xs[i] ?? d() }
+function callScalar(n: i32): i32 { return mk(n) ?? d() }
+function callBox(n: i32): i32 | null { return mk(n) ?? db() }
+function nested(x: i32 | null, y: i32 | null): i32 { return x ?? (y ?? d()) }
+print(valScalar(null) + elem([null], 0) + callScalar(0) + nested(null, null))
+print(valBox(null) ?? 0)
+print(callBox(0) ?? 0)
+print(calls)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    const miss = [...rows.keys()].filter((k) => k.includes("coalesce"));
+    if (miss.length > 0) throw new Error(`want no coalesce miss, got ${JSON.stringify([...rows])}`);
+    if (!(rows.get("matched")! >= 9) || rows.get("matched") !== rows.get("covered")) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A `??` whose left operand an instance closed to a type with no `null` writes the left operand.
 Deno.test({
   name: "ir shadow: a closed coalesce is covered and matched",

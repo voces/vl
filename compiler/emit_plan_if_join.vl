@@ -1,0 +1,224 @@
+// The value-`if` join decisions both emitters read: which rung of `emitIfExpr` lowers a value
+// `if` (an all-null, atom, union box, reference or scalar join), the reference join's kind and
+// slot, and whether a string join drops a `null` atom. It writes no bytes and imports nothing
+// from `wasmEmit.vl` or `ir_*.vl`.
+
+import { IfStmt, ObjLit, StrLit, nodeAt } from "./ast"
+import { nodeTyIsNulLitUnion, nodeTyIsNulString } from "./check_node_tys"
+import { tyIsLitUnionOrLit, tyIsNullableLitUnion } from "./check_types"
+import { nodeUnwidenedTyOf } from "./check_wide_lits"
+import { unionEqOperandOk, unwrapParen } from "./emit_base"
+import { nodeRepTyAt, nodeTyAt } from "./emit_capture_frames"
+import {
+  exprIsLitAtom,
+  exprNulLitUnion,
+  exprNullableString,
+  exprUnion,
+  ifExprRefKind,
+  ifExprRefSlot,
+} from "./emit_classify"
+import {
+  exprIsNullLike,
+  ifLinkYieldsNull,
+  ifListArmValueIx,
+} from "./emit_if_arm_values"
+import { nulAtomWidenTexts } from "./emit_lit_atoms"
+import { ifJoinNarrowsPerArm } from "./emit_local_slots"
+import { ifArmValueExpr } from "./emit_query"
+import { repRowOfTyStruct, repScanLim, tyRepsAsNulAtom } from "./emit_rep"
+import { VKind } from "./emit_state"
+import { holeOperandTyOf, nodeTyInOf } from "./emit_ty_canon"
+import { ifChainAllBareNull } from "./emit_if_arm_values"
+import { nodeTyIsNullType } from "./check_node_tys"
+import { ifJoinTypedAtom } from "./emit_local_slots"
+import { ifJoinUnionNameIn } from "./emit_start_block"
+import { ifExprValtype } from "./emit_closure_sites"
+import { tyIsLitUnion } from "./check_types"
+import { tyNulLitUnionMemberTexts, tyPeelNul } from "./tyquery"
+
+// The struct row of an if-expression's recorded type, any `| null` peeled: its destination's
+// record when the checker adopted one, -1 for a join that is no record.
+function ifTypedStructRow(ifIx: i32, fnIx: i32): i32 {
+  let t = nodeRepTyAt(ifIx, fnIx)
+  if t < 0 { t = nodeTyAt(ifIx, fnIx) }
+  if t < 0 { return -1 }
+  return repRowOfTyStruct(tyPeelNul(t), repScanLim())
+}
+
+// `ifExprRefKind` at a destination record `destStruct` (-1 for none): an object-literal then
+// arm has no struct row of its own, so it builds at the destination's.
+function ifExprRefKindAt(ifIx: i32, fnIx: i32, destStruct: i32): VKind | null {
+  const rk = ifExprRefKind(ifIx, fnIx)
+  if rk != null || destStruct < 0 { return rk }
+  const tv = ifListArmValueIx(ifIx)
+  if tv >= 0 && nodeAt(tv) is ObjLit { return "struct" }
+  return null
+}
+
+// The ref kind and table slot a value `if` at `ifIx` joins at (`emitIfExprRef`), or a null kind
+// for a join that is not a reference.
+export type RefJoin = { rjKind: VKind | null, rjSlot: i32 }
+
+// The `RefJoin` of a join that is not a reference.
+export function noRefJoin(): RefJoin { return { rjKind: null, rjSlot: -1 } }
+
+export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
+  const destStruct = ifTypedStructRow(ifIx, fnIx)
+  const rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+  const slot = if rk != null { ifExprRefSlot(ifIx, fnIx, rk, destStruct) } else { -1 }
+  return { rjKind: rk, rjSlot: slot }
+}
+
+// Whether the `if` join at `ifIx`, typed `string | null` or `K | null`, is delivered into the
+// `K | null` atom niche and every leaf is `null`, a string literal or literal-union typed, so
+// each arm lowers in the atom context, as a return does (D5330).
+export function nulStrJoinTakesAtom(ifIx: i32, fnIx: i32): boolean {
+  if !deliveredAsNulAtom(ifIx, fnIx) { return false }
+  if !nodeTyIsNulString(ifIx) && !nodeTyIsNulLitUnion(ifIx) { return false }
+  return ifJoinLeavesAtomic(ifIx, fnIx)
+}
+
+// Whether every arm value along the `if` chain at `ix`, which has an `else`, is `null`, a string
+// literal, or a value of literal-union type.
+function ifJoinLeavesAtomic(ix: i32, fnIx: i32): boolean {
+  if !ifJoinNarrowsPerArm(ix) { return false }
+  const s = nodeAt(ix)
+  if s is IfStmt {
+    if s.ifElse < 0 || !atomicJoinLeaf(ifArmValueExpr(s.ifThen), fnIx) {
+      return false
+    }
+    if nodeAt(s.ifElse) is IfStmt { return ifJoinLeavesAtomic(s.ifElse, fnIx) }
+    return atomicJoinLeaf(ifArmValueExpr(s.ifElse), fnIx)
+  }
+  return false
+}
+
+// Whether arm value `ix` is `null`, a string literal, of literal-union type, or a nullable string
+// typed `K | null`, which converts to the niche; an arm whose value is another `if` is one when
+// that join's leaves are.
+function atomicJoinLeaf(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 { return false }
+  if exprIsNullLike(u) || nodeAt(u) is StrLit { return true }
+  if nodeAt(u) is IfStmt { return ifJoinLeavesAtomic(u, fnIx) }
+  return exprIsLitAtom(u, fnIx)
+    || strReppedLitUnionAt(u, fnIx)
+    || nulStrReppedNulLitPlace(u, fnIx)
+}
+
+// Whether join arm `armIx` holds a `K | null` atom at this instance: by its pin, or, for a hole
+// operand whose arm records no pin of its own, by the operand's pinned type.
+function joinArmHoldsNulAtom(armIx: i32, fnIx: i32): boolean {
+  if armIx < 0 { return false }
+  if nulAtomWidenTexts(armIx, fnIx).length > 0 { return true }
+  return tyNulLitUnionMemberTexts(holeOperandTyOf(armIx, fnIx)).length > 0
+}
+
+// Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
+// `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
+// as a generic's `??` joined with a nullable pin's other side does (D3290).
+export function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
+  let cur = ifIx
+  let widens = false
+  while cur >= 0 {
+    if ifLinkYieldsNull(cur, fnIx) { return false }
+    const s = nodeAt(unwrapParen(cur))
+    cur = -1
+    if s is IfStmt {
+      if joinArmHoldsNulAtom(ifArmValueExpr(s.ifThen), fnIx) { widens = true }
+      if s.ifElse >= 0 {
+        if nodeAt(s.ifElse) is IfStmt {
+          cur = s.ifElse
+        } else {
+          if joinArmHoldsNulAtom(ifArmValueExpr(s.ifElse), fnIx) {
+            widens = true
+          }
+        }
+      }
+    }
+  }
+  return widens
+}
+
+// Whether `ix` is a re-readable place typed `K | null`, for string literals `K`, whose value
+// is held as a nullable string rather than the atom niche.
+export function nulStrReppedNulLitPlace(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || !unionEqOperandOk(u) { return false }
+  if nodeAt(u) is StrLit || exprIsLitAtom(u, fnIx) { return false }
+  if !tyIsNullableLitUnion(nodeUnwidenedTyOf(u)) { return false }
+  if exprNulLitUnion(u, fnIx) { return false }
+  return exprNullableString(u, fnIx)
+}
+
+// True when `ix` is a literal-union value whose rep is its member string rather than the
+// interned i32 atom — the un-named flattened and inline spellings. Declines an atom-repped
+// expression and a member string literal, both already atoms in atom context; the member
+// set may be a singleton (`tyIsLitUnionOrLit`), same bare `TyLit` a plain literal produces.
+export function strReppedLitUnionAt(ix: i32, fnIx: i32) {
+  if exprIsLitAtom(ix, fnIx) { return false }
+  const av = unwrapParen(ix)
+  if av < 0 { return false }
+  const e = nodeAt(av)
+  if e is StrLit { return false }
+  return tyIsLitUnionOrLit(nodeUnwidenedTyOf(av))
+}
+
+// Whether node `ix` is delivered into the `K | null` atom niche: the type the checker stamped
+// it with where it is delivered reps as that niche.
+export function deliveredAsNulAtom(ix: i32, fnIx: i32): boolean {
+  const st = nodeRepTyAt(unwrapParen(ix), fnIx)
+  if st < 0 { return false }
+  return tyRepsAsNulAtom(st)
+}
+
+// Which rung of `emitIfExpr` lowers value `if` `ifIx` past its optional guard, in its order:
+// `null`, every arm null; `atom`, an atom join; `union`, a union box with a render name;
+// `ref`, a reference join; else `scalar`. Asked with the arms' preludes scoped, as legacy asks.
+export type IfJoinArm = "null" | "atom" | "union" | "ref" | "scalar"
+// An `IfJoinArm` with its data: the union's render name, the reference join, the scalar valtype.
+export type IfJoinPlan = {
+  ijArm: IfJoinArm,
+  ijUnion: string,
+  ijRef: RefJoin,
+  ijVt: i32,
+}
+
+export function ifJoinPlanOf(ifIx: i32, fnIx: i32): IfJoinPlan {
+  if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) {
+    return { ijArm: "null", ijUnion: "", ijRef: noRefJoin(), ijVt: 127 }
+  }
+  // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
+  if ifJoinTypedAtom(ifIx, fnIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
+    return { ijArm: "atom", ijUnion: "", ijRef: noRefJoin(), ijVt: 127 }
+  }
+  // A union-valued join is the box whatever reads it, so it takes the box blocktype here and
+  // not only at a union destination: an inline `(if c { a } else { b }) != null` reads it (D2250).
+  const iun = if exprUnion(ifIx, fnIx) { ifJoinUnionNameIn(ifIx, fnIx) } else { "" }
+  if iun != "" {
+    return { ijArm: "union", ijUnion: iun, ijRef: noRefJoin(), ijVt: 127 }
+  }
+  const rj = ifRefJoinOf(ifIx, fnIx)
+  if rj.rjKind != null {
+    return { ijArm: "ref", ijUnion: "", ijRef: rj, ijVt: 127 }
+  }
+  return {
+    ijArm: "scalar",
+    ijUnion: "",
+    ijRef: rj,
+    ijVt: ifExprValtype(ifIx, fnIx),
+  }
+}
+
+// Whether value `if` `ifIx` on rung `arm` is a string join that drops a `null` atom an arm holds,
+// which `emitIfExpr` refuses: a join typed at a literal union, or an unpinned scalar one (D3290).
+export function ifJoinDropsNulAtom(
+  ifIx: i32,
+  fnIx: i32,
+  arm: IfJoinArm,
+): boolean {
+  if arm == "null" { return false }
+  const jpin = nodeTyInOf(ifIx, fnIx)
+  const atomJoin = tyIsLitUnion(jpin) || (arm == "scalar" && jpin < 0)
+  return atomJoin && strJoinDropsNulAtom(ifIx, fnIx)
+}
