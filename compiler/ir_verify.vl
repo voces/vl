@@ -57,8 +57,10 @@ import {
   RRawOp,
   RRecover,
   RRel,
+  RRetNull,
   RRetag,
   RSharedRead,
+  RSpread,
   RStage,
   RStrOp,
   RTagIs,
@@ -481,7 +483,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const k = kidAt(v, r.gfIx)
       const unboxed = repNodeAt(k) is RBox
         && dst == repNodeOfTy(nodeTyAt(r.gfAt, vf.irAt))
-      if dst >= 0 && k != dst && !unboxed {
+      // A nullable field the checker narrowed past its null reads at its inner rep.
+      const kn = repNodeAt(k)
+      const narrowed = kn is RNullable && kn.rnInner == dst
+      if dst >= 0 && k != dst && !unboxed && !narrowed {
         return fail(2, at, "a field's rep is not its destination's")
       }
       0
@@ -502,6 +507,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         if opRep(e) != want {
           return fail(2, at, "an element's rep is not the list's")
         }
+      }
+      0
+    }
+    RSpread => {
+      use(r.spSrc, at)
+      if dst < 0 { return 0 }
+      if !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a spread literal of a non-list rep")
+      }
+      if opRep(r.spSrc) != dst {
+        return fail(2, at, "a spread's source rep is not the literal's")
       }
       0
     }
@@ -584,6 +600,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           2,
           at,
           "a null is not delivered into a K | null or a nullable reference",
+        )
+      }
+      0
+    }
+    RRetNull => {
+      // The function's own null is its result, so it is delivered at the return rep, a nullable one.
+      const d = repNodeAt(dst)
+      if dst != vf.irRetRep || !(d is RNullable || d is RBox) {
+        return fail(
+          2,
+          at,
+          "a returned null is not at the function's nullable return rep",
         )
       }
       0
@@ -1019,6 +1047,26 @@ function coalBoxWhy(n: SCoalBox): string {
   return "a boxed `??` reads no box"
 }
 
+// Why a nullable reference's `??` is ill-formed, or "": it reads a nullable reference, and its out
+// is that reference, its non-null inner, or a join's box.
+function coalNulRefWhy(n: SCoalBox): string {
+  const lr = repNodeAt(opRep(n.cbL))
+  if !(lr is RNullable) || lr.rnDisc == 4 || lr.rnInner < 0 {
+    return "a nullable-reference `??` reads no nullable reference"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a nullable-reference `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  const on = repNodeAt(or)
+  const boxed = on is RBox || on is RNullable && on.rnDisc == 4
+  if !boxed && or != opRep(n.cbL) && or != lr.rnInner {
+    return "a nullable-reference `??` yields neither the reference, its inner, nor a box"
+  }
+  return ""
+}
+
 // Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
 // at that element's rep.
 function coalPopOrWhy(n: SCoalBox): string {
@@ -1058,6 +1106,13 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const p = repPrim(vf.irVars[o].vRep)
   if mp.prForm == 1 && p != "i32" && p != "bool" {
     return "a map read's plain probe yields no i32"
+  }
+  // The mv slot's read is the map's value as itself, so its out is at that value's rep.
+  const mr = repNodeAt(
+    if mp.prSym >= 0 { irGlobalRepOf(vf, mp.prSym) } else { opRep(n.cbL) },
+  )
+  if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
+    return "a map read's mv slot yields no value of its map"
   }
   return ""
 }
@@ -1279,6 +1334,7 @@ function stmt(id: i32) {
       const why = match n.cbArm {
         "popOr" => coalPopOrWhy(n)
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+        "nulRef" => coalNulRefWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1418,7 +1474,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListLen | RListPush | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
   }
 }
 

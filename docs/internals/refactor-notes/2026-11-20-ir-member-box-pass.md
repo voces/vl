@@ -1,0 +1,62 @@
+# Perf: a member record read delivered into its field's union passes the box (2026-11-20, lane IR6)
+
+`if z.h is B { show(z.h) }`, with `z.h: A | B` and `show(h: A | B)`: the field tail cast the box's
+payload to `B` (`boxedArmOfMember`), and the box plan's `rec` arm boxed it again under `B`'s tag.
+One allocation per delivery, off every receiver kind.
+
+## The arm
+
+`holeBoxPlanOf` answers `memberBox`, ahead of `rec`, for a read `boxedArmOfMember` names whose
+field's declared union (from the row that read used, `boxedFieldUnionTyOf`) has every record arm
+held by the destination and passes into it whole by the fence's own test (`boxPassesAsTy`, factored
+out of `holePassPlanOf`). A destination narrower than the field's union stays on `rec`.
+
+The arm's writers read the field at its storage: legacy's `emitHoleBox`, the IR builder
+(`memberBoxTemp`) and the IR lowering of that read (`getField`, which re-asks the tail's decisions
+when it lowers) each enter `memberBoxReadEnter`, the storage mark plus a seat for that read, and
+`boxedArmAtRow` declines only for the seated read. The plain storage mark alone is `emitIs`'s, and
+its decisions are unchanged. `memberBoxReadAt` asks `boxedArmOfMember` before the plan, so no other
+delivery's plan is asked early: asking it of every delivery moved an unrelated module's rows,
+a side effect of the plan filed as D17030.
+
+A seat, not a pure decision: a public `boxedArmOfMember` answering -1 wherever `memberBoxReadAt`
+holds would ask the plan, and the plan's own rungs (`exprUnion`, `structIndexOfMemberStore`,
+`boxedFieldUnionTyOf`) ask the public predicate back of the same node. Breaking that needs a guard
+or a raw twin threaded through every plan reader, and it would ask the plan at every field read,
+D17030 at its widest.
+
+The arm shares the field's box where `rec` built a fresh one. That is unobservable while no writer
+mutates a union box in place: no `fbStructSet` in `compiler/*.vl`, and no IR `struct.set` effect,
+names `uBoxIdx`.
+
+## Readings
+
+Both seeds fixpoints, master at merge-base `056fd4af8`:
+
+| reading | master | this branch |
+|---|---:|---:|
+| distilled cells identical (`ir-identity.sh`, plain and `--names`) | | 9,037 of 9,037, 0 differ |
+| `tests/cases` moved (A/B) | | 3 of 7,247, each the re-box collapsing to the box, output equal |
+| corpus functions claimed / self-compile | 40,892 / 18,525 | 40,892 / 18,525 |
+| `plumb-shape` main guest fuel | 9,733,421,439 | 9,734,404,512 (+0.01%) |
+| seed bytes | 6,898,263 | 6,899,611 (+0.02%) |
+| a loop of 20M deliveries `showU(q.h)` (wall) | ~0.35 s | ~0.07 s |
+| matrices (struct, variant, nullable receivers) | 84 / 84 each | 84 / 84 each, 0 runs → not-runs |
+
+Against #9270 (master `c2f0a972f`), whose field-site guard asks the same plan: measured inert.
+No new IR field-site miss (`--blockers` identical), and the same 3 cases move, nothing else.
+
+A representative moved hunk, the argument position of
+`tests/cases/narrowing/narrowed-field-record-delivered-to-its-union.vl` (same output):
+
+    -      (struct.new $11
+    -       (i32.const 0)
+    -       (ref.cast (ref $1)
+    -        (struct.get $11 1
+    -         (struct.get $6 0
+    -          (local.get $0)
+    -         )
+    -        )
+    -       )
+    +      (struct.get $6 0
+    +       (local.get $0)

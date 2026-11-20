@@ -758,6 +758,44 @@ print(c([]))
   },
 });
 
+// `l ?? d` over a nullable reference along legacy's `br_on_non_null` block: a record with a name
+// default and with a nullable one, a call default that runs only on `null` (`calls` prints 1), a
+// union arm's variant, and a nullable list: every function covered and matching legacy's bytes.
+Deno.test({
+  name: "ir shadow: a nullable reference's coalesce is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type S = { a: i32 }
+type C = { k: "c", r: i32 }
+type Q = { k: "q", s: i32 }
+type U = C | Q
+let calls = 0
+function mk(): S {
+  calls = calls + 1
+  return { a: 9 }
+}
+function s2(x: S | null, d: S): S { return x ?? d }
+function n1(x: S | null, d: S | null): S | null { return x ?? d }
+function e1(x: S | null): S { return x ?? mk() }
+function v1(x: C | null, d: C): C { return x ?? d }
+function l1(xs: i32[] | null, d: i32[]): i32[] { return xs ?? d }
+const u: U = { k: "q", s: 1 }
+const one: S = { a: 1 }
+print(s2(null, one).a + s2({ a: 2 }, one).a)
+print(n1(null, null) == null)
+print(e1({ a: 3 }).a + e1(null).a)
+print(calls)
+print(v1(null, { k: "c", r: 4 }).r)
+print(l1(null, [5, 6]).length)
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 6 || rows.get("covered") !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // An element store into a packed `u8` list takes its value as a plain i32, which the backing
 // truncates (300 reads back as 44), as a push onto one does.
 Deno.test({
@@ -776,6 +814,74 @@ print(bs[1])
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
     if (!(rows.get("matched")! >= 2) || rows.get("matched") !== rows.get("covered")) {
       throw new Error(`want both stores covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `l ?? d` whose default joins a nullable union arm into the union's box (legacy's staged `if`):
+// a name and a call operand (the call default runs once: `calls` prints 1), and a join nested in
+// the default, which re-stages the shared `?.` slot only on the outer null path. Each `??` function
+// is covered and matches legacy's bytes; `show` and the start are other classes.
+Deno.test({
+  name: "ir shadow: a nullable reference joined into a union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type C = { k: "c", r: i32 }
+type Q = { k: "q", s: i32 }
+type U = C | Q
+let calls = 0
+function mkq(): Q {
+  calls = calls + 1
+  return { k: "q", s: 7 }
+}
+function getc(b: boolean): C | null {
+  if b { return { k: "c", r: 3 } }
+  return null
+}
+function name(x: C | null, d: Q): U { return x ?? d }
+function call(b: boolean): U { return getc(b) ?? mkq() }
+function nested(x: C | null, y: C | null, d: Q): U { return x ?? (y ?? d) }
+function show(u: U): i32 {
+  if u is C { return u.r }
+  return u.s * 10
+}
+const q: Q = { k: "q", s: 5 }
+print(show(name(null, q)) + show(name({ k: "c", r: 2 }, q)))
+print(show(call(true)) + show(call(false)))
+print(calls)
+print(show(nested(null, null, q)) + show(nested(null, { k: "c", r: 4 }, q)) + show(nested({ k: "c", r: 1 }, null, q)))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+      throw new Error(`want the four coalescing functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// `n is A` over a local `U | null` box, a valued `if` joining an arm with `null`: the same box
+// legacy tests by its tag, `null` one more tag, read raw past the narrowing. Covered and matched.
+Deno.test({
+  name: "ir shadow: an is test over a local nullable union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type A = { k: "a", v: i32 }
+type B = { k: "b", w: i32 }
+type U = A | B
+const us: U[] = [{ k: "a", v: 3 }, { k: "b", w: 4 }]
+function at(i: i32): U { return us[i] }
+function f(x: i32): i32 {
+  const n = if x >= 0 && x < us.length { at(x) } else { null }
+  if !(n is A) && !(n is B) { return -1 }
+  if n is A { return n.v }
+  return 0
+}
+print(f(0) + f(1) + f(9))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -946,10 +1052,10 @@ run(2.5)
 });
 
 // A record literal on legacy's layout path builds field by field and matches, a widened `f64`
-// field included; a box handed to another union's box field (legacy converts its members) stays a
+// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) stays a
 // named miss.
 Deno.test({
-  name: "ir shadow: a record literal builds, a widened field too; a box from a box is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union is a named miss",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
@@ -970,8 +1076,8 @@ if d.v is f64 { print(d.v) }
     if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
       throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (rows.get("uncovered object field box from a box") !== 1) {
-      throw new Error(`want mkd a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("uncovered pre-path coercion") !== 1) {
+      throw new Error(`want mkd's i32-to-f64 retag a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1116,8 +1222,11 @@ Deno.test({
     // (rule 2), and a default that leaves the out unwritten (rule 5). Case 15 is a stashed
     // record whose source order evaluates one field twice (rule 2). Cases 16 to 18 break a fused
     // map read: a probe of an i32, a probe on the pop's arm (rule 2), an unwritten out (rule 5).
-    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2];
+    // Case 19 is a shared read over a temp, which its arms would read twice (rule 2), and case 20
+    // a fused map read's mv slot read into an out that is not its map's value (rule 2). Cases 21
+    // to 23 break a nullable reference's `??`: an `i32` and a non-null list operand, and a
+    // nullable list into an `i32` out (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
@@ -1563,6 +1672,24 @@ Deno.test({
   },
 });
 
+// A returned value `if` whose result bears a `null` pads its `end` with the function's own null,
+// returned (`emitNullForRet`): a record and a string result build and match legacy.
+const RET_IF_NULL_PAD =
+  `type P = { v: i32 }\nfunction f(c: boolean, p: P): P | null {\n  return if c { p } else { null }\n}\nfunction g(n: i32): string | null {\n  return if n > 0 { "pos" } else if n < 0 { "neg" } else { null }\n}\nconst p: P = { v: 4 }\nconst a = f(true, p)\nif a != null { print(a.v) }\nprint(g(0) ?? "z")\n`;
+Deno.test({
+  name: "ir shadow: a returned value if's null pad returns the function's own null and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_IF_NULL_PAD, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
@@ -1612,6 +1739,36 @@ print(pick(1))
     const bad = [...rows.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith("matched"));
     if (bad.length > 0 || (rows.get("node-in array: matched") ?? 0) < 1) {
       throw new Error(`want the atom list literal matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// Two spread literals in one function: the IR builds the one-group `[...a]` along the shared
+// spread plan while legacy keeps the many-group one, each in its own recorded slots, and a
+// function of the one-group form alone is covered and matched.
+Deno.test({
+  name: "ir shadow: a one-group spread matches beside a many-group one legacy keeps",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function f(a: i32[], b: i32[]): i32 {
+  const x = [...a]
+  const y = [...a, 1, ...b]
+  return x.length + y.length
+}
+function g(a: i32[]): i32 {
+  const x = [...a]
+  return x.length
+}
+print(f([1, 2], [3]) + g([4]))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("node-in array: miss array spread groups") ?? 0) !== 1) {
+      throw new Error(`want the many-group spread left to legacy, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want g covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });

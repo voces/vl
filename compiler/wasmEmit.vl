@@ -1,8 +1,9 @@
 import {
   asgNameWiderRow,
   cloRetValSlot,
+  memberBoxReadEnter,
+  memberBoxReadLeave,
   nulTagIdRepTy,
-  sTwinRepOf,
 } from "./emit_classify"
 import { isBlockBody } from "./block_body"
 import { lexOpcode, primOpcode } from "./ir"
@@ -434,9 +435,7 @@ import {
   LBK_I64_LIST,
   LBK_NUL_BOOL_LIST,
   LBK_NUL_LIT_UNION_LIST,
-  LBK_NUL_U8_LIST,
   LBK_REF,
-  LBK_REF_AT_SLOT,
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
@@ -444,7 +443,6 @@ import {
   PK_I16,
   PK_U16,
   PK_U8,
-  RLK_CLOSURE,
   RLK_F32_LIST,
   RLK_F64_LIST,
   RLK_I32_LIST,
@@ -701,7 +699,6 @@ import {
   sFieldStart,
   sHeapIdx,
   sIsRefRow,
-  sSuperAt,
   sTy,
   shIdxFrom,
   shIdxNode,
@@ -1111,13 +1108,8 @@ import {
   sFieldStoreKind,
   sharedUnionFieldPlan,
   spreadBoxingSource,
-  spreadDestKind,
-  spreadDestRow,
   spreadOwnBoxRow,
-  spreadSourcesStrOrAtoms,
-  spreadSourcesWidenTo,
   spreadSrcAtomTexts,
-  spreadSrcBoxes,
   stmtIsTailValue,
   structIndexOfExpr,
   structIndexOfObjCtx,
@@ -1233,11 +1225,9 @@ import {
   objOrderStashSlot,
   spreadDstBackSlot,
   spreadDstIdSlot,
-  spreadElemWidens,
   spreadGroupIdSlot,
   spreadGroupWrapSlot,
   spreadJoinTmpSlot,
-  spreadLitElemRow,
   spreadSrcBoxAtom,
   spreadSrcNulMode,
   structEqStashSlot,
@@ -1285,7 +1275,6 @@ import {
 import {
   mvValTyIxAt,
   mvValUnionHasNull,
-  rlElemIsNulNiche,
   tyRefArrElemOf,
   unMemRefArrArmSlot,
 } from "./emit_map_value_slots"
@@ -1337,7 +1326,6 @@ import {
   emptyArrHoleBuildSlot,
   emptyArrUnionArmKind,
   emptyArrUnionArmSlot,
-  listBuildKindOfVKind,
   rlBoxIntoRowList,
   rlWidenAllowed,
   rlWidenTagOf,
@@ -1349,7 +1337,6 @@ import {
   mvValVariantOf,
   narrowedNulStructArm,
   rlElemInnerSlot,
-  rlElemStructRow,
   rlElemVariantRow,
   rlSlotOfTyOrTwin,
   sFieldMapShape,
@@ -1645,6 +1632,7 @@ import {
   PushPlan,
   PushSlot,
   PushValKinds,
+  SpreadPlan,
   allocLitChunk,
   arrLitArmOf,
   arrLitBuild,
@@ -1666,6 +1654,7 @@ import {
   listReserveScan,
   numListElemOf,
   objLitBuildVariantRow,
+  pendingKindOfList,
   popPlanOf,
   popRecvIsList,
   pushPlanOf,
@@ -1679,6 +1668,8 @@ import {
   scalarListWrap,
   scalarPushScratchBaseOf,
   spreadBackIdx,
+  spreadBoxDestRow,
+  spreadPlanOf,
   spreadWrapIdx,
   tyElemRepsAsAtom,
   tyRepsAsAtom,
@@ -1713,6 +1704,7 @@ import {
 import {
   CoalArm,
   CoalBoxArm,
+  CoalNulRefArm,
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
   NULL_OWN_BOX,
@@ -2131,7 +2123,7 @@ function emitStructFieldValue(si: i32, fi: i32, valIx: i32, fnIx: i32) {
     "refSlot" => emitFail("emitProgram: ref-list field element type is not interned")
     "explicitNull" => emitFail("emitProgram: internal: an explicit null field past its null")
     // A raw scalar, string or null goes into the box with its atom tag (`emitUnionBoxArg`).
-    "union" => emitUnionBoxOwed("", sFieldRowTyAt(si, fi), valIx, fnIx)
+    "union" => emitUnionBoxOwed("", structFieldBoxTy(si, fi), valIx, fnIx)
     "f64" => emitWidened(valIx, 4, fnIx)
     "i64" => emitWidened(valIx, 3, fnIx)
     "f32" => emitWidened(valIx, 5, fnIx)
@@ -2993,10 +2985,21 @@ function emitVariantFieldStoreVal(vi: i32, fi: i32, valIx: i32, fnIx: i32) {
 function emitVariantFieldBox(vi: i32, fi: i32, valIx: i32, fnIx: i32): i32 {
   return emitUnionBoxOwed(
     variantFieldElemName(vi, fi),
-    uFieldElemTyIxAt(vi, fi),
+    variantFieldBoxTy(vi, fi),
     valIx,
     fnIx,
   )
+}
+
+// The union a box into struct row `si`'s field `fi` is planned at: the row's field type. Legacy's
+// field writers and the IR's field deliver all box there.
+export function structFieldBoxTy(si: i32, fi: i32): i32 {
+  return sFieldRowTyAt(si, fi)
+}
+
+// The union a box into variant `vi`'s field `fi` is planned at: the field's own element union.
+export function variantFieldBoxTy(vi: i32, fi: i32): i32 {
+  return uFieldElemTyIxAt(vi, fi)
 }
 
 // `valIx` boxed at the checker's record where it owes a box (`boxOwedAt`), else into the site's
@@ -8731,7 +8734,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
     }
-    "pass" | "atomStr" => 0
+    "pass" | "memberBox" | "atomStr" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -8742,7 +8745,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "null" | "rec" | "obj" | "refList" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
-    "pass" | "ladder" => 0
+    "pass" | "memberBox" | "ladder" => 0
   }
 }
 
@@ -8753,6 +8756,12 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "obj" {
     if emitVariantStruct(unwrapParen(exprIx), p.hbKind, fnIx) < 0 { return -1 }
+  } else if p.hbArm == "memberBox" {
+    // The read at its storage: the box its field holds, which its member's tag already names.
+    const marks = memberBoxReadEnter(exprIx)
+    const rc = emitExpr(exprIx, fnIx)
+    memberBoxReadLeave(marks)
+    if rc < 0 { return -1 }
   } else if (
     p.hbArm == "pass"
     || p.hbArm == "atomStr"
@@ -11876,35 +11885,10 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
         boxSrc,
       )
     }
-    let kk = spreadDestKind(arrIx, fnIx)
-    // A destination that threaded a wider scalar list (`const q: f64[] = [...ints]`) is
-    // built at, since the literal is built at the type it flows into.
-    const pdk = spreadPendingScalar(lb.lbKind)
-    if (
-      kk != null
-      && pdk != null
-      && pdk != kk
-      && spreadSourcesWidenTo(elems, pdk, fnIx)
-    ) {
-      kk = pdk
-    }
-    // A `string[]` destination builds a literal-union atom source's strings (D2868).
-    if (
-      kk == "list"
-      && lb.lbKind == LBK_STR_LIST
-      && spreadSourcesStrOrAtoms(elems, fnIx)
-    ) {
-      kk = "strlist"
-    }
-    if kk == null {
-      return emitFail(
-        "emitProgram: a spread's source is not a list this rep knows",
-      )
-    }
-    const ownRow = spreadOwnRow(elems, fnIx)
-    const row = spreadFreshDestRow(arrIx, kk, ownRow, fnIx, lb)
-    const wrap = spreadWrapIdx(kk, row)
-    const back = spreadBackIdx(kk, row)
+    const p = spreadPlanOf(arrIx, fnIx, lb)
+    if p.spWhy != "" { return emitFail(p.spWhy) }
+    const wrap = spreadWrapIdx(p.spKind, p.spRow)
+    const back = spreadBackIdx(p.spKind, p.spRow)
     if wrap < 0 || back < 0 {
       return emitFail("emitProgram: spread literal but list type not collected")
     }
@@ -11927,149 +11911,33 @@ function emitArrSpread(arrIx: i32, fnIx: i32, lb: ListBuild) {
       i = i + 1
     }
     if run.length > 0 { groups.push(spreadRunLit(run, arrIx, arrIx, a.pos)) }
-    // Every group builds at the DESTINATION's rep, threaded from the kind this literal
-    // resolved at rather than from whatever annotation reached it: an un-annotated binding
-    // threads nothing, so a plain run would build at the i32 default while the destination
-    // is the source's own backing.
-    const pk = pendingKindOfList(kk, row)
     const seq = liKinds.length
     const slots: i32[] = []
     const groupRows: i32[] = []
     let g = 0
     while g < groups.length {
-      // A source of another scalar element builds at its own rep, then copies converting.
-      const gk = spreadGroupSrcKind(groups[g], elems, kk, fnIx)
-      let groupKind = pk
-      if gk != kk { groupKind = pendingKindOfList(gk, 0) }
-      // A source list whose record element is a subtype of the row's is read at its own row
-      // and copied as it is (D14960).
-      const gRow = spreadGroupSubRow(groups[g], kk, row, fnIx)
-      // A fresh source built at a row no source has is built at exactly that row (D4871).
-      if gRow == row && row != ownRow && groupKind == LBK_REF {
-        groupKind = LBK_REF_AT_SLOT
+      const gRow = p.spGroupRows[g]
+      if emitSpreadGroup(groups[g], fnIx, p.spGroupKinds[g], gRow) < 0 {
+        return -1
       }
-      if emitSpreadGroup(groups[g], fnIx, groupKind, gRow) < 0 { return -1 }
-      svSyncRecv(groups[g], fnIx)
-      if gk != kk && kk == "strlist" {
-        if emitAtomListToStrTop(spreadSrcAtomTexts(groups[g], fnIx)) < 0 {
-          return -1
-        }
-      } else if gk != kk {
-        if (
-          emitScalarListWidenTop(listKindElemKind(gk), listKindElemKind(kk))
-          < 0
-        ) {
-          return -1
-        }
-      }
-      const gs = spreadGroupSlotAt(arrIx, g, kk, gRow, seq)
+      const gs = spreadGroupStash(p, arrIx, g, groups[g], fnIx, seq)
       if gs < 0 { return -1 }
       slots.push(gs)
       groupRows.push(gRow)
-      fbLocalSet(gs)
       g = g + 1
     }
-    return spreadJoinGroups(arrIx, slots, groupRows, wrap, back, kk, row, seq)
+    return spreadJoinGroups(
+      arrIx,
+      slots,
+      groupRows,
+      wrap,
+      back,
+      p.spKind,
+      p.spRow,
+      seq,
+    )
   }
   return emitFail("emitProgram: expected an array literal")
-}
-
-// The ref-list row spread source `src` is read at: the row of the list its delivery copies it
-// into (`recSpreadCallCopy`, D16444), else its own.
-function spreadSrcRow(src: i32, fnIx: i32): i32 {
-  const ct = listCopyAtNode(src)
-  const r = if ct >= 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
-  return if r >= 0 { r } else { refListSlotOfExpr(src, fnIx) }
-}
-
-// `spreadDestRow`, its first source read at the row its delivery copies it into.
-function spreadOwnRow(elems: i32[], fnIx: i32): i32 {
-  const r = spreadDestRow(elems, fnIx)
-  for el in elems {
-    const src = spreadArgOf(el)
-    if src >= 0 {
-      const ct = listCopyAtNode(src)
-      const rl = ct >= 0 && mfRecvKindOf(src, fnIx) == "reflist"
-      const c = if rl { rlSlotOfTyOrTwin(tyRefArrElemOf(ct)) } else { -1 }
-      return if c >= 0 { c } else { r }
-    }
-  }
-  return r
-}
-
-// The row spread group `grp` of a literal built at ref-list row `row` is read at: the group's
-// own row where it is an existing list whose element is a subtype of the row's, else `row`.
-function spreadGroupSubRow(grp: i32, kk: ListKind, row: i32, fnIx: i32): i32 {
-  if kk != "reflist" { return row }
-  const lit = unwrapParen(grp)
-  if lit < 0 || nodeAt(lit) is ArrayLit { return row }
-  const s = spreadSrcRow(grp, fnIx)
-  if rlRowElemSubOf(s, row) { return s }
-  return row
-}
-
-// The ref-list row spread literal `arrIx` of kind `kk` builds at: the threaded destination's
-// row, else the literal's own typed element's, when every source of another row is itself a
-// list literal, built there as any literal is (D4871); else `own`, the first source's.
-function spreadFreshDestRow(
-  arrIx: i32,
-  kk: ListKind,
-  own: i32,
-  fnIx: i32,
-  lb: ListBuild,
-): i32 {
-  const a = nodeAt(arrIx)
-  // A packed destination builds at its own row: the build's slot, else the literal's type.
-  if kk == "u8list" {
-    if lb.lbKind == LBK_U8_LIST || lb.lbKind == LBK_NUL_U8_LIST {
-      return lb.lbSlot
-    }
-    return exprPackedRow(arrIx, fnIx)
-  }
-  if kk != "reflist" || !(a is ArrayLit) { return own }
-  let want = spreadLitElemRow(arrIx, fnIx)
-  // A union build's row is the destination's too: its literal sources are built there (D16702).
-  if (
-    lb.lbKind == LBK_REF
-    || lb.lbKind == LBK_REF_AT_SLOT
-    || lb.lbKind == LBK_UNION
-  ) {
-    want = lb.lbSlot
-  }
-  if want == own || want < 0 || want >= rlElemName.length { return own }
-  const elems = a.arrElems
-  for el in elems {
-    const src = spreadArgOf(el)
-    if src >= 0 {
-      const lit = unwrapParen(src)
-      const isLit = lit >= 0 && lit < P.nodes.length && nodeAt(lit) is ArrayLit
-      if !isLit {
-        const ss = spreadSrcRow(src, fnIx)
-        if ss != want && !rlRowElemSubOf(ss, want) { return own }
-      }
-    }
-  }
-  return want
-}
-
-// Whether ref-list row `s`'s element is a declared wasm subtype of row `d`'s, so a backing of
-// `s` copies into one of `d` as it is: both record rows, the first reaching the second's heap
-// through its `sub` chain, and a nullable element never into a non-null one.
-function rlRowElemSubOf(s: i32, d: i32): boolean {
-  if s < 0 || d < 0 || s == d { return false }
-  if rlElemIsNulNiche(s) && !rlElemIsNulNiche(d) { return false }
-  const sr = rlElemStructRow(s)
-  const dr = rlElemStructRow(d)
-  if sr < 0 || dr < 0 { return false }
-  const dh = sTwinRepOf(dr)
-  let x = sTwinRepOf(sr)
-  let guard = 0
-  while x >= 0 && guard < 64 {
-    if x == dh { return true }
-    x = sTwinRepOf(sSuperAt(x))
-    guard = guard + 1
-  }
-  return false
 }
 
 // A slot key packs a ref-list row under 4096 with `4096 * ordinal`, so an ordinal must stay
@@ -12095,10 +11963,36 @@ function spreadGroupSlotAt(
   return spreadGroupIdSlot(kk, row, gid)
 }
 
+// A spread group's tail once its list `grp` is on the stack: refresh it if a view, convert it to
+// the destination's element kind, and park it in the group's frame slot; the slot, or -1.
+export function spreadGroupStash(
+  p: SpreadPlan,
+  arrIx: i32,
+  g: i32,
+  grp: i32,
+  fnIx: i32,
+  seq: i32,
+): i32 {
+  svSyncRecv(grp, fnIx)
+  const gk = p.spSrcKinds[g]
+  const kk = p.spKind
+  if gk != kk && kk == "strlist" {
+    if emitAtomListToStrTop(spreadSrcAtomTexts(grp, fnIx)) < 0 { return -1 }
+  } else if gk != kk {
+    if emitScalarListWidenTop(listKindElemKind(gk), listKindElemKind(kk)) < 0 {
+      return -1
+    }
+  }
+  const gs = spreadGroupSlotAt(arrIx, g, kk, p.spGroupRows[g], seq)
+  if gs < 0 { return -1 }
+  fbLocalSet(gs)
+  return gs
+}
+
 // Join a spread literal's item groups, each a list in its own frame slot, of (`kk`, `row`) or,
 // for a source whose element is a subtype of the row's, of that source's own row
 // (`groupRows`): allocate the destination once, then one `array.copy` per group in source order.
-function spreadJoinGroups(
+export function spreadJoinGroups(
   arrIx: i32,
   slots: i32[],
   groupRows: i32[],
@@ -12162,38 +12056,6 @@ function spreadJoinGroups(
     c = c + 1
   }
   return 0
-}
-
-// The union-box list row a spread literal builds at when its destination threaded one
-// (`const q: (i32 | null)[] = [...ints]`, or the row an outer literal, `push` or cell write
-// names as `LBK_REF_AT_SLOT`) and some spread source is another list, whose elements are then
-// each boxed; -1 otherwise, including when nothing threaded (D2869, D2883).
-function spreadBoxDestRow(elems: i32[], fnIx: i32, lb: ListBuild): i32 {
-  if (
-    lb.lbKind != LBK_UNION
-    && lb.lbKind != LBK_REF_AT_SLOT
-    && lb.lbKind != LBK_REF
-  ) {
-    return -1
-  }
-  const row = lb.lbSlot
-  if row < 0 || row >= rlElemTyIx.length || row >= rlElemName.length {
-    return -1
-  }
-  if rlElemKindAt(row) != RLK_UNION { return -1 }
-  let boxes = false
-  let i = 0
-  while i < elems.length {
-    const src = spreadArgOf(elems[i])
-    if src >= 0 {
-      const sb = spreadSrcBoxes(src, row, fnIx)
-      if sb < 0 { return -1 }
-      if sb == 1 { boxes = true }
-    }
-    i = i + 1
-  }
-  if boxes { return row }
-  return -1
 }
 
 // `emitArrSpread` for a destination list of union boxes: a same-row source copies as it is,
@@ -12307,38 +12169,6 @@ function emitSpreadGroup(g: i32, fnIx: i32, kind: i32, row: i32): i32 {
   if tb != null { return emitArrAt(lit, fnIx, tb) }
   const gb: ListBuild = { lbKind: kind, lbSlot: row }
   return emitArrAt(lit, fnIx, gb)
-}
-
-// The element kind group `g` of a spread literal building at `kk` is emitted at: a spread
-// source's own kind where it widens to `kk`, else `kk` itself (a plain run, or a same-kind source).
-function spreadGroupSrcKind(
-  g: i32,
-  elems: i32[],
-  kk: ListKind,
-  fnIx: i32,
-): ListKind {
-  let i = 0
-  while i < elems.length {
-    if spreadArgOf(elems[i]) == g {
-      const sk = mfRecvKindOf(g, fnIx)
-      if sk != null && spreadElemWidens(sk, kk) { return sk }
-      if kk == "strlist" && spreadSrcAtomTexts(g, fnIx).length > 0 {
-        return "list"
-      }
-      return kk
-    }
-    i = i + 1
-  }
-  return kk
-}
-
-// The wider scalar list build code `pk` names, by asking `pendingKindOfList`, or null.
-function spreadPendingScalar(pk: i32): ListKind | null {
-  const ks: ListKind[] = ["f64list", "i64list", "f32list"]
-  for k in ks {
-    if pendingKindOfList(k, 0) == pk { return k }
-  }
-  return null
 }
 
 // The element kind list kind `k` holds, as the converting copies take it: `listIdxKindOf`'s
@@ -27976,7 +27806,7 @@ function emitStructFieldStoreValue(
   match k {
     "union" => {
       // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
-      if (emitUnionBoxOwed("", sFieldRowTyAt(si, fieldIdx), rhs, fnIx) < 0) {
+      if (emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx) < 0) {
         return -1
       }
     }
@@ -28458,15 +28288,6 @@ function pushRecvLocal(objIx: i32, fnIx: i32, base: i32) {
   const r = listOpRecvLocal(objIx, fnIx, base, -1, ".push")
   listCastForPush = false
   return r
-}
-
-// The build code a list of element kind `k` is built at — the mapping `emitArr`'s own
-// arms read, so a synthesized literal lands on the same backing the receiver already has.
-function pendingKindOfList(k: ListKind, row: i32) {
-  // The spread's own answer for a closure row is the plain ref build, where a hole's is the
-  // at-slot one; aligning the two would move output, so it stays an arm.
-  if k == "reflist" && rlElemKindAt(row) == RLK_CLOSURE { return LBK_REF }
-  return listBuildKindOfVKind(k, row)
 }
 
 // The list build of the run a variadic `.push` appends: the receiver's own, since the run is
@@ -40505,16 +40326,13 @@ function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
   return -1
 }
 
-// The heap type a nullable-ref niche carries, or -1 — the same two tables the `??` niche
-// arms read (`exprNullableVariant` then `exprNullableStruct`), so the box stash and the
-// `br_on_non_null` block cannot disagree about the value's rep. -1 for every other niche,
-// whose tag `coalNicheBoxTag` resolves from its atom code instead of from a heap.
+// The heap type a nullable-ref niche carries, or -1: a nullable union arm's variant heap, else a
+// nullable record's struct heap. The box stash and the `br_on_non_null` block both read it, so they
+// cannot disagree about the value's rep. -1 for every other niche, whose tag `coalNicheBoxTag`
+// resolves from its atom code instead of from a heap.
 function nulNicheValueHeap(exprIx: i32, fnIx: i32): i32 {
   const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-  if nvi >= 0 {
-    if nvi < uVarRow.length { return variantHeap(nvi) }
-    return -1
-  }
+  if nvi >= 0 && nvi < uVarRow.length { return variantHeap(nvi) }
   if exprNullableStruct(exprIx, fnIx) {
     const nsi = structIndexOfExpr(exprIx, fnIx)
     if nsi >= 0 && nsi < sHeapIdx.length { return sHeapIdx[nsi] }
@@ -40610,48 +40428,64 @@ function emitCoalesceNulRefJoin(
   heapIx: i32,
   fnIx: i32,
 ) {
-  // The union the join's result boxes into is the one its default is delivered into
-  // (`boxDstNameAt`).
-  const joinN = boxDstNameAt(e.binRight, fnIx)
-  if joinN == "" {
-    return emitFailAt(
-      "emitProgram: `??` joins a nullable value into a union the checker recorded no row for",
-      exprIx,
-    )
-  }
-  const joinTy = boxDstTyOf(e.binRight, fnIx)
-  const tag = coalNicheBoxTag(joinTy, unwrapParen(e.binLeft), heapIx, fnIx)
-  if tag < 0 {
-    return emitFailAt(
-      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
-      exprIx,
-    )
-  }
-  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
-    return emitFailAt(
-      "emitProgram: `??` default names no arm of the union its result is",
-      exprIx,
-    )
-  }
-  if !fnUses.optRecv {
-    return emitFailAt("emitProgram: `??` operand stash not reserved", exprIx)
-  }
+  const why = coalNulRefJoinWhy(e, heapIx, fnIx)
+  if why != "" { return emitFailAt(why, exprIx) }
   if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
-  fbLocalTee(optRecvSlot)
-  fbRefIsNull()
-  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  coalNulRefJoinOpen()
   // Through `emitUnionBoxArg`, not `emitUnionCoerce`: a struct default that is already a
   // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
   // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
   if (emitUnionBoxAtRecord("", -1, e.binRight, fnIx) < 0) { return -1 }
-  fbElse()             // 0x05 else — present → the staged ref, boxed under its own arm's tag
+  coalNulRefJoinPresent(coalNulRefJoinTag(e, heapIx, fnIx))
+  fbEnd() // 0x0b end
+  return 0
+}
+
+// Why the joining `l ?? d` over a nullable reference of heap `heapIx` is refused, or "": its union
+// has no row, no arm for the value's own type, or no arm for the default, or the function reserves
+// no stash for the operand.
+export function coalNulRefJoinWhy(e: BinExpr, heapIx: i32, fnIx: i32): string {
+  // The union the join's result boxes into is the one its default is delivered into
+  // (`boxDstNameAt`).
+  if boxDstNameAt(e.binRight, fnIx) == "" {
+    return "emitProgram: `??` joins a nullable value into a union the checker recorded no row for"
+  }
+  if coalNulRefJoinTag(e, heapIx, fnIx) < 0 {
+    return "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type"
+  }
+  if !coalJoinDefaultBoxes(boxDstTyOf(e.binRight, fnIx), e.binRight, fnIx) {
+    return "emitProgram: `??` default names no arm of the union its result is"
+  }
+  if !fnUses.optRecv { return "emitProgram: `??` operand stash not reserved" }
+  return ""
+}
+
+// The tag the present arm of a joining `l ?? d` boxes the operand of heap `heapIx` under.
+export function coalNulRefJoinTag(e: BinExpr, heapIx: i32, fnIx: i32): i32 {
+  return coalNicheBoxTag(
+    boxDstTyOf(e.binRight, fnIx),
+    unwrapParen(e.binLeft),
+    heapIx,
+    fnIx,
+  )
+}
+
+// The head of a joining `l ?? d` once the operand is on the stack: staged in the `?.` receiver
+// slot, which the box arm reads back (D1714), its null test, and the `if` at the box.
+export function coalNulRefJoinOpen() {
+  fbLocalTee(optRecvSlot)
+  fbRefIsNull()
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+}
+
+// The present arm of a joining `l ?? d`: the staged reference boxed under tag `tag`.
+export function coalNulRefJoinPresent(tag: i32) {
+  fbElse() // 0x05 else — present → the staged ref, boxed under its own arm's tag
   fbI32Rel(RS_TAG, tag)
   fbLocalGet(optRecvSlot)
   fbStructNew(uBoxIdx) // { tag, the niche's own ref }
-  fbEnd()              // 0x0b end
-  return 0
 }
 
 // The boxed `??` over the `boolean | null` i32 niche, for a default that joins rather than
@@ -40813,6 +40647,61 @@ function emitCoalesceAtomStrDefault(defIx: i32, nulBlock: boolean, fnIx: i32) {
     fbRefAsNonNull() // 0xd4 the block is non-null: the default's null is narrowed away
   }
   return 0
+}
+
+// The heap the `br_on_non_null` core of `l ?? d` carries, -1 when `l` reaches none: a nullable
+// collection's wrapper or the closure struct at their niche arms, else, past every boxed and fused
+// arm, the nullable reference's own heap (`nulNicheValueHeap`).
+export function coalNulRefHeapOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  return match coalNicheArmOf(e, lhsIx, exprIx, fnIx) {
+    "coll" => nulCollWrapHeap(e.binLeft, fnIx)
+    "clo" => cloStructIdx
+    "identBox" => nulNicheValueHeap(e.binLeft, fnIx)
+    // Their own lowerings: the `boolean | null` and atom niches, and the string core at `sTy()`.
+    "nulBoolJoin" | "nulBool" | "litUnion" | "nulAtomStr" | "str" => -1
+  }
+}
+
+// Whether `l ?? d` past `coalBoxArmOf`'s boxed arms reaches the nullable-reference rungs with no
+// arm between: a name, or a call that is no `boolean | null` or `string | null` niche
+// (`emitCoalesceCallNiche`), neither a field read nor a `?.` chain.
+export function coalNulRefRungReached(
+  e: BinExpr,
+  lhsIx: i32,
+  fnIx: i32,
+): boolean {
+  const l = nodeAt(lhsIx)
+  if l is Ident { return true }
+  return l is Call
+    && !exprNulBool(e.binLeft, fnIx)
+    && !exprNullableString(e.binLeft, fnIx)
+}
+
+// The `br_on_non_null` core of `l ?? d` along `coalNulRefHeapOf`'s heap `nrHeap`, its block shape
+// `nrArm`, and, for a default that joins into a union, the tag `nrTag` the present arm boxes under.
+export type CoalNulRefPlan = { nrHeap: i32, nrArm: CoalNulRefArm, nrTag: i32 }
+
+// The nullable-reference plan of `l ?? d`, or null when `l` reaches no such core.
+export function coalNulRefPlanOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNulRefPlan | null {
+  const h = coalNulRefHeapOf(e, lhsIx, exprIx, fnIx)
+  if h < 0 { return null }
+  const a = coalNulRefArmOf(e, exprIx, fnIx)
+  const tag = match a {
+    "join" => coalNulRefJoinTag(e, h, fnIx)
+    "noBox" | "listClash" | "litAtom" | "plain" => -1
+  }
+  const p: CoalNulRefPlan = { nrHeap: h, nrArm: a, nrTag: tag }
+  return p
 }
 
 // The core above for the nullable struct (`S | null`) and nullable collections (`i32[] |
@@ -41339,10 +41228,22 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // cell is a `(ref null $wrapper)`, so it takes the same `br_on_non_null` lowering as the
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
   if arm == "coll" {
-    return emitCoalesceNulRef(e, exprIx, nulCollWrapHeap(e.binLeft, fnIx), fnIx)
+    return emitCoalesceNulRef(
+      e,
+      exprIx,
+      coalNulRefHeapOf(e, lhsIx, exprIx, fnIx),
+      fnIx,
+    )
   }
   // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
-  if arm == "clo" { return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx) }
+  if arm == "clo" {
+    return emitCoalesceNulRef(
+      e,
+      exprIx,
+      coalNulRefHeapOf(e, lhsIx, exprIx, fnIx),
+      fnIx,
+    )
+  }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -41372,7 +41273,13 @@ function emitCoalesceIdentBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
       "emitProgram: `??` over a nullable value union has no banked residual kind",
     )
     "callNoKind" => emitFail("emitProgram: `??` over a call result has no banked residual kind")
-    "next" => emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
+    "next" => {
+      if coalNulRefRungReached(e, lhsIx, fnIx) {
+        emitCoalesceNullableRefs(e, exprIx, fnIx)
+      } else {
+        emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
+      }
+    }
   }
 }
 
@@ -42176,24 +42083,8 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   // null` whose `T` is a union arm stores `(ref null $variantHeap(vi))`, and
   // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
   // niche, same `br_on_non_null` lowering, one table over.
-  const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
-  if cvi >= 0 {
-    if cvi < uVarRow.length {
-      return emitCoalesceNulRef(e, exprIx, variantHeap(cvi), fnIx)
-    }
-  }
-  // Generic nullable-struct `??`: a `S | null` value (ident/param binding, struct field, or
-  // closure/factory call) coalesced with a struct default. Evaluated once: `br_on_non_null`
-  // keeps the non-null struct or falls to the default, needing neither a re-eval nor a
-  // per-struct stash — `structIndexOfExpr` resolves the inner struct for the block's result type, including an indexed closure-array/factory call via the checker-type fallback.
-  if exprNullableStruct(e.binLeft, fnIx) {
-    const csi = structIndexOfExpr(e.binLeft, fnIx)
-    if csi >= 0 && csi < sHeapIdx.length {
-      // The block type and the one-evaluation shape are the nullable-ref-niche lowering the
-      // collections share.
-      return emitCoalesceNulRef(e, exprIx, sHeapIdx[csi], fnIx)
-    }
-  }
+  const crHeap = coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
+  if crHeap >= 0 { return emitCoalesceNulRef(e, exprIx, crHeap, fnIx) }
   // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
   // re-readable spelling never arrives here: `emit_rewrite` desugars it to an `if`, which is
   // right because a rewrite leaves no `??` node for the consumer classifiers to disagree
