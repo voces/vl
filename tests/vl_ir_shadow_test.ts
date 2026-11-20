@@ -1293,6 +1293,24 @@ Deno.test({
   },
 });
 
+// A literal `true`'s dead `else` binds a local, and a local declared after the `if` is read: the
+// `STrap` arm must keep the slots legacy's dead arm keeps, so the function matches or misses.
+const IF_DEAD_ELSE_LOCAL =
+  `function d1(a: i32): i32 {\n  const r = if true {\n    const y = a + 1\n    y * 2\n  } else {\n    const z = a * 3\n    z\n  }\n  const w = r + a\n  return w\n}\nprint(d1(4))\n`;
+Deno.test({
+  name: "ir shadow: a literal true's dead else binding a local keeps a later local's slot",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(IF_DEAD_ELSE_LOCAL, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want d1 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
