@@ -35,11 +35,11 @@ None of `emitBinExprNode`'s earlier arms takes them:
 
 ## What changed
 
-- **`eqNumericRouteOf` (wasmEmit) answers whether legacy's ladder reaches the numeric tail for a
-  `==`/`!=` node.** It is built beside `listEqRouteOf`; the two share `binEqPastLeadArms`, which
-  is `listEqRouteOf`'s former prefix, unchanged. It adds four checks: no dead null test, no list
-  compare arm, no null test, and no struct, variant or closure compare.
-- **The builder asks that route.** `nicheBoolEq` then builds both operands and requires each to be
+- **The route is #9311's `eqRouteOf`, legacy's own `==`/`!=` decision.** The niche arm requires
+  its `numeric` arm, the one that writes `emitBinNumeric`. A first version restated legacy's ladder
+  as `eqNumericRouteOf`, which legacy did not ask; the coordinator and IR-REV vetoed it, and
+  #9311 replaced it.
+- **The builder asks `eqRouteOf(...) == "numeric"`.** `nicheBoolEq` then builds both operands and requires each to be
   `boolean` or the niche, with at least one niche. A `null` literal never reaches it, because it
   leaves the route.
 - **`primSig` admits the pair for eq/ne only.** Its rule: "eq/ne compares the i32 cells of a
