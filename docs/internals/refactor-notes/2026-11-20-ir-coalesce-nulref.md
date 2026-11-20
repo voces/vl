@@ -50,15 +50,18 @@ only on `null`. The same core serves the `coll` and `clo` niche arms.
 
 ## Coverage
 
-Fixpoint seeds of this branch and of its merge base, master `5331d4690` (after #9259's shared
-member read), each building this branch's source:
+Fixpoint seeds of this branch and of its merge base, master `938a58be3`, each building this
+branch's source:
 
 | population | master | this branch |
 | --- | ---: | ---: |
-| self-compile functions covered | 18,502 | 18,502 |
-| corpus functions covered (45,678) | 40,788 | 40,834 (+46) |
+| self-compile functions covered | 18,589 | 18,589 |
+| corpus functions covered (45,678) | 41,300 | 41,346 (+46) |
 
-On the earlier base `f2ec7aa7c` the same branch read +45; the plain block alone +8. An earlier
+With IR5's boxing arm (`ir5-sharebox`, which lands on top), the pair measured +161 corpus against
+that branch alone on a `5331d4690` base: about 115 functions need both.
+
+On the earlier bases `f2ec7aa7c` and `5331d4690` the same branch read +45 and +46; the plain block alone +8. An earlier
 +15 / +119 for the plain block compared against an older master than the branch's base and is
 withdrawn.
 
@@ -80,10 +83,10 @@ call), `coalesce box next` 2 alone and 9 with `member box`.
   (six functions, a call default that runs once), and the join (a name, a call whose default runs
   once, and a join nested in the default; prints 52, 73, 1, 55).
 - **Byte proof:** mode 3 identical; `ir-identity` corpus 9,037 identical, differ 0, self-compile
-  identical; `--cases` 7,523 identical, differ 0, witnesses 59 same; per-file `tests/cases` A/B
-  7,237 same, differ 0.
+  identical; `--cases` 7,527 identical, differ 0, witnesses 59 same; per-file `tests/cases` A/B
+  7,241 same, differ 0.
 - **Ratchets:** late demands 9 (baseline 9); late tag rows 307 (baseline 307, 0 gone); seed
-  6,900,357 bytes (+0.1% on 6,894,207; master's seed at the base is 6,896,934); phase-state
+  6,904,378 bytes (+0.1% on 6,894,207; +3,302 over master's seed at the base); phase-state
   `ir_selftest.vl` surface 6 → 7 (`mkNullableTy`).
 - **L2 fuel:** +0.1% on the 103.31G baseline.
-- **Compiler lines:** +295 / −72 against the merge base.
+- **Compiler lines:** +291 / −69 against the merge base.
