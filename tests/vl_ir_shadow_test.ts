@@ -2360,3 +2360,21 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// `~x` builds as legacy's `x ^ -1` at the operand's width: an i32, an i64, a literal, a nested
+// `~~x` and one delivered to a wider return all cover and match.
+const BIT_NOT =
+  `function k(): i32 { return ~5 }\nfunction k64(): i64 { return ~7 }\nfunction w(x: i32): i64 { return ~x }\nfunction g(x: i32): i32 { return ~~x + ~(x * 2) }\nfunction m(x: i64, n: i64): i64 { return x & ~n }\nprint(k())\nprint(k64())\nprint(w(4))\nprint(g(9))\nprint(m(255, 15))\n`;
+Deno.test({
+  name: "ir shadow: a bitwise not builds as an xor with the all-ones mask and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(BIT_NOT, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
