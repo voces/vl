@@ -1690,6 +1690,24 @@ Deno.test({
   },
 });
 
+// A union-returning function that took the return sink and falls off its end into a `null` exits
+// that `null` through the sink as any return there does (`emitFallThroughPad`), and matches.
+const SINK_NULL_FALLTHROUGH =
+  `function pk2(c: boolean, a: i32): i32 | string | null {\n  if c {\n    if a > 0 { return a } else { return "neg" }\n  } else {\n    return null\n  }\n}\nconst z = pk2(true, -1)\nif z is string { print(z) }\nprint(pk2(false, 1) == null)\n`;
+Deno.test({
+  name: "ir shadow: a null fall-through in a return-sink function exits through the sink and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(SINK_NULL_FALLTHROUGH, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want pk2 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
