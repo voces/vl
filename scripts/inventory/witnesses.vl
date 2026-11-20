@@ -1,0 +1,96 @@
+// Write the filed witness of every inventory row that files outcome `O` into `<dir>/<id>/`, one
+// file per `// file:` section, and print each entry's path, one per line, in id order.
+//
+//     vl run scripts/inventory/witnesses.vl -- --outcome O --out <dir> [<doc-or-dir>...]
+//
+// Run it from the checkout root; the targets default to both inventories. `O` is a canonical
+// outcome (`emit_reject`, `runs`, ...), read with `declaredOutcome` as `ls.vl --status` reads
+// it. A row with no `Repro:` block writes nothing. `ir-identity.sh --cases` builds the
+// `emit_reject` witnesses under the claims-on and the claimless seed.
+
+import { programArgs } from "std:args"
+import { exit } from "std:process"
+import { parseI32 } from "std:fmt"
+import { join } from "std:str"
+import { Utf8Error } from "std:utf8"
+import { die, splitLines, univNl } from "../lib/common"
+import { readText, spawn, writeText } from "../lib/corpus"
+import {
+  IdKey,
+  Row,
+  declaredOutcome,
+  idKey,
+  parseRows,
+  resolve,
+  sortKeys,
+  splitFiles,
+} from "../lib/inventory"
+
+const TARGETS = ["docs/internals/inventory", "docs/internals/inventory-2"]
+const USAGE = "usage: vl run scripts/inventory/witnesses.vl -- --outcome O --out <dir> [<doc-or-dir>...]"
+
+// Every row of every target that files `outcome` and has a witness, in id order.
+function rowsFiling(targets: string[], outcome: string): Row[] {
+  const raw: Row[] = []
+  for t in targets {
+    for doc in resolve(t) {
+      for r in parseRows(doc, splitLines(univNl(readText(doc)))) {
+        if r.repro != "" && declaredOutcome(r.status) == outcome { raw.push(r) }
+      }
+    }
+  }
+  const keys: IdKey[] = []
+  let i = 0
+  while i < raw.length {
+    keys.push(idKey(raw[i].id, "\{i}"))
+    i = i + 1
+  }
+  const out: Row[] = []
+  for k in sortKeys(keys) {
+    const at = parseI32(k.path)
+    if at is i32 { out.push(raw[at]) }
+  }
+  return out
+}
+
+function main(args: string[]): i32 {
+  let outcome = ""
+  let dir = ""
+  const targets: string[] = []
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if (a == "--outcome" || a == "--out") && i + 1 < args.length {
+      if a == "--outcome" { outcome = args[i + 1] } else { dir = args[i + 1] }
+      i = i + 2
+      continue
+    }
+    if a.length > 0 && a[0] == 45 { die(USAGE, 2) }
+    targets.push(a)
+    i = i + 1
+  }
+  if outcome == "" || dir == "" { die(USAGE, 2) }
+  const entries: string[] = []
+  for r in rowsFiling(if targets.length > 0 { targets } else { TARGETS }, outcome) {
+    const d = dir + "/" + r.id
+    if spawn("mkdir", ["-p", d]).code != 0 {
+      die("witnesses: cannot make \{d}", 1)
+    }
+    const files = splitFiles(r.repro)
+    let k = 0
+    while k < files.length {
+      writeText(d + "/" + files[k], files[k + 1])
+      k = k + 2
+    }
+    if files.length >= 2 { entries.push(d + "/" + files[files.length - 2]) }
+  }
+  if entries.length > 0 { print(join(entries, "\n")) }
+  return 0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("witnesses: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
