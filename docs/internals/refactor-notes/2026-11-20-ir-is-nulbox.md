@@ -18,6 +18,10 @@ discipline-4 operand; only `rawBoxVar` admitted `RBox` alone.
 `rawBoxVar` admits a local held as a box (`heldAsBox`: `RBox`, or the discipline-4 nullable). One
 line; the comment says why.
 
+The raw tag read is sound because discipline 4 is the tag-encoded `null`: the local is the box
+itself, never `ref.null`, so `struct.get` on its tag cannot trap. A future nullable box encoded as
+`ref.null` must not pass `heldAsBox` here.
+
 ## Coverage
 
 | population | master | this branch |
