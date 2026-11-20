@@ -174,7 +174,6 @@ import {
   eqCoreKindOfTyToken,
 } from "./check_ty_relate"
 import {
-  PrimName,
   T,
   TY_ERR,
   TY_F32,
@@ -1773,6 +1772,7 @@ import {
   eqOperandRecovers,
   holeBoxPlanOf,
   identReadArmOf,
+  identUnboxAtomOf,
   isArmOf,
   isArmPatTy,
   isArmTagOfTyAt,
@@ -1824,6 +1824,7 @@ import {
   variantNestedRow,
   variantRefListFieldSlot,
   wideArmOfRow,
+  wideArmPlainOf,
   wideRetagPairs,
   widenPlanOf,
 } from "./emit_plan_union"
@@ -7412,30 +7413,6 @@ function emitOptMemberValueGo(exprIx: i32, fnIx: i32) {
   )
 }
 
-// Does the function being emitted declare type parameters? The dead-atom elision is
-// bounded to these: only a generic instance can carry an `is` arm the instantiation makes
-// constant-false, and only there is the name-keyed union lookup single-valued.
-function fnHasTyParams(fnIx: i32): boolean {
-  const fp = fnStmtsPosOf(fnIx)
-  if fp < 0 { return false }
-  if fp >= fnStmts.length { return false }
-  const f = nodeAt(fnStmts[fp])
-  if f is FuncDecl {
-    if f.fnTyParams.length > 0 { return true }
-  }
-  // A monomorphized instance has no type params of its own — `mkFunc(instName, noTyParams, …)`
-  // strips them — so the instance must be recognised through its template. Without this the
-  // bound never fires for the very shape it exists to admit.
-  if fp < monoOrigNode.length {
-    const o = monoOrigNode[fp]
-    if o >= 0 {
-      const of = nodeAt(o)
-      if of is FuncDecl { return of.fnTyParams.length > 0 }
-    }
-  }
-  return false
-}
-
 // Push the raw union box ref of the binding the `Ident` read at `ix` denotes (a local, param,
 // capture or module global), bypassing
 // the narrowed-unbox Ident path so a tag read works even while the binding is narrowed to a
@@ -7595,7 +7572,7 @@ function emitBoxToNulStr() {
 // The atom's ABI code decides all four arms (the `string` compare, the closure test, the
 // list-wrapper ladder, `vbHeapIdxOfKind`), so `ak` arrives as the code: `emitCoalesce` holds it
 // out of the bank rather than rendering a set to be re-parsed here.
-function emitUnionUnboxTail(ak: i32) {
+export function emitUnionUnboxTail(ak: i32) {
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if ak == 2 {
     fbRefCast(sTy()) // the payload IS the string array ref
@@ -8679,30 +8656,6 @@ function plainCoalesceAt(exprIx: i32): BinExpr | null {
   return null
 }
 
-// Whether union type `ty` has an arm of value kind `vak`, by its member set's banked kinds: 0 only
-// when every member is a bare primitive or `null` and none is `vak`. A set the bank does not
-// cover, or a member a kind cannot rule out (a record, list, closure or nested union), answers 1.
-function unionTyHasValueKind(ty: i32, vak: i32): i32 {
-  const ks: i32[] = []
-  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) || ks.length < 2 { return 1 }
-  for k in ks {
-    if k == vak || !valueKindIsPlainScalar(k) { return 1 }
-  }
-  return 0
-}
-
-// Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
-function valueKindIsPlainScalar(k: i32): boolean {
-  if k < 0 { return false }
-  const ps: PrimName[] = [
-    "i32", "i64", "f32", "f64", "boolean", "string", "null",
-  ]
-  for p in ps {
-    if boxTagOfPrim(p) == k { return true }
-  }
-  return false
-}
-
 // Evaluate a `null`-typed operand for its effects and drop it, where the answer is already
 // decided. A call and an if-expression have effects; an ident read has none, and emitting one
 // would be dead code. Shared by `??`, the folded null compare, and `print`.
@@ -8778,6 +8731,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbRefNullNone() // the payload slot is unread under the null tag
     }
     "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "rec" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "lit" => {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
@@ -8790,7 +8744,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" => fbStructNew(uBoxIdx)
+    "null" | "rec" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "ladder" => 0
@@ -8802,7 +8756,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
   if p.hbArm == "atom" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
-  } else if p.hbArm == "pass" || p.hbArm == "atomStr" {
+  } else if p.hbArm == "pass" || p.hbArm == "atomStr" || p.hbArm == "rec" {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
   return holeBoxTail(p, exprIx, fnIx)
@@ -8960,16 +8914,8 @@ function emitUnionWideArmBox(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
     fbStructNew(uBoxIdx)
     return 1
   }
-  const svi = exprVariantIndex(exprIx, fnIx)
-  let row = -1
-  if svi >= 0 {
-    if armsHoldHeap(atoms, variantHeap(svi)) { return 0 }
-    row = variantRowOf(svi)
-  } else {
-    row = structIndexOfExpr(exprIx, fnIx)
-  }
-  const vi = wideArmOfRow(row, atoms)
-  if vi < 0 || vi >= uTags.length { return 0 }
+  const vi = wideArmPlainOf(unionTy, exprIx, fnIx)
+  if vi < 0 { return 0 }
   fbI32Rel(RS_TAG, uTags[vi])
   if emitExpr(exprIx, fnIx) < 0 { return -1 }
   fbStructNew(uBoxIdx)
@@ -37056,14 +37002,10 @@ function emitIdentNode(e: Ident, exprIx: i32, fnIx: i32) {
     // A union-box cell the checker typed this read as one atom of reads unboxed, through
     // `emitUnionBoxPush`: `if u is i32 { print(u) }` yields the raw i32.
     "unbox" => {
-      const vak = identReadAtomKindAt(exprIx, fnIx)
-      // D947 — a dead generic narrow reads `unreachable`: a type parameter narrowed to an
-      // impossible arm type-checks, and its arm is constant-false there.
-      if fnHasTyParams(fnIx) {
-        if unionTyHasValueKind(unionBoxTyOfRead(exprIx, fnIx), vak) == 0 {
-          fbUnreachable()
-          return 0
-        }
+      const vak = identUnboxAtomOf(exprIx, fnIx)
+      if vak < 0 {
+        fbUnreachable()
+        return 0
       }
       return emitValueUnionUnboxRead(exprIx, vak, fnIx)
     }
