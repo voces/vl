@@ -37,8 +37,22 @@ land after the value.
 | corpus functions matched | 41,450 | 41,450 |
 
 Mode 3 byte-identical; identity 9,037 cells identical, 0 differ, self-compile identical; cases 7,528
-identical, 0 differ; witnesses 59 same; cases A/B 7,242 same, 0 differ. Fuel +0.7%, seed +0.2%,
-late demands 9 (baseline 9), late tag rows 307 (baseline 307).
+identical, 0 differ; witnesses 59 same; cases A/B 7,242 same, 0 differ. Seed +0.2%, late
+demands 9 (baseline 9), late tag rows 307 (baseline 307).
+
+## L2 fuel
+
+| build | fuel | vs master |
+| --- | ---: | ---: |
+| master seed, master source | 103,511,699,729 | — |
+| branch seed, master source | 103,513,815,634 | +2.1M |
+| branch seed, branch source | 103,848,462,761 | +337M (+0.33%) |
+| branch, stage forced to miss | 103,870,671,661 | +359M |
+
+The built compiler is not slower (+0.002% on the same input), and the new coverage is net-cheap
+(the ablation reads higher). The rise is compiling the added source. That the checker's extra
+`Rhs` variant and `PushRecv` union are most of it is not ablated; raw lines explain about 44M.
+The stage-pair walk, first run over every IR function (about 237M), is gated on a stage.
 
 Matrix: global, field and index receivers × `&&`, `||`, two `??` spellings, a nested global and a
 nested field push × statement, value and call-argument position (54 cells). All 54 print the same
