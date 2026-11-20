@@ -1706,3 +1706,53 @@ print(strs())
     }
   },
 });
+
+// The walk around an empty literal, a literal of records, one literal walked twice and one inside
+// another walk are each covered and matched; a generic instance's `[1.5]` walks f64 elements,
+// which the walk names as its own miss.
+Deno.test({
+  name: "ir shadow: list-literal walks of each shape match, and an f64 walk is a named miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function empty(): i32 {
+  let s = 0
+  for y in [] { s = s + 1 }
+  return s
+}
+function recs(): i32 {
+  let s = 0
+  for p in [{ a: 1 }, { a: 2 }] { s = s + p.a }
+  return s
+}
+function twice(): i32 {
+  let s = 0
+  for x in [1, 2] { s = s + x }
+  for x in [1, 2] { s = s + x }
+  return s
+}
+function nested(): i32 {
+  let s = 0
+  for x in [1, 2] {
+    for y in [10, 20] { s = s + x * y }
+  }
+  return s
+}
+function gen<T>(_v: T): i32 {
+  let n = 0
+  for x in [1.5] { n = n + 1 }
+  return n
+}
+print(empty() + recs() + twice() + nested() + gen(1) + gen("s"))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want the four walks covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered for in element f64") ?? 0) !== 2) {
+      throw new Error(`want both instances' f64 walk named, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
