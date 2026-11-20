@@ -14,6 +14,7 @@ import {
   IsExpr,
   Member,
   NullLit,
+  ObjLit,
   OptMember,
   P,
   StrLit,
@@ -64,6 +65,7 @@ import {
   softenLitTy,
   tyArrayElemIx,
   tyAt,
+  tyBearsNull,
   tyElemOf,
   tyEq,
   tyHasHole,
@@ -122,6 +124,7 @@ import {
   exprF32Array,
   exprF64Array,
   exprI64Array,
+  exprIsClosure,
   exprIsF32,
   exprIsF64,
   exprIsI64,
@@ -138,6 +141,7 @@ import {
   exprNullableString,
   exprNullableStruct,
   exprPackedRow,
+  exprRefArray,
   exprString,
   exprStringArray,
   exprU8Array,
@@ -218,6 +222,7 @@ import {
   RNullable,
   RpPrim,
   boxAtomKindOfMemberTy,
+  boxTagOfPrim,
   boxTagOfTy,
   fieldElemTyIn,
   msHasPlainValKind,
@@ -258,9 +263,11 @@ import {
   fl32Ty,
   fl64Ty,
   fnNestUsed,
+  fnStmts,
   il64Ty,
   lTy,
   mkListTy,
+  monoOrigNode,
   pkKindOfRow,
   pkRowOfKind,
   pkTwinCodeOfRow,
@@ -1919,11 +1926,17 @@ export function coerceListAtomOf(
   return cak
 }
 
-// How a value is boxed into its recorded `T | null` box: the null tag (`null`), a box as itself
-// (`pass`), a value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over
-// a literal at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), or
-// the box writer's own ladder (`ladder`).
-export type HoleBoxArm = "null" | "pass" | "atom" | "lit" | "atomStr" | "ladder"
+// How a value is boxed into its recorded box: the null tag (`null`), a box as itself (`pass`), a
+// value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal
+// at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), a record as
+// itself under arm `hbKind`'s tag (`rec`), or the box writer's own ladder (`ladder`).
+export type HoleBoxArm = "null"
+  | "pass"
+  | "atom"
+  | "lit"
+  | "atomStr"
+  | "rec"
+  | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
 
@@ -1952,6 +1965,14 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const bare = nodeAt(bareIx)
   if bare is IfStmt || bare is Index || callIsNever(bareIx) { return ladder }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
+  // `emitUnionArmValueBox`'s two plain rungs: a record boxed as itself under its arm.
+  if (
+    exprVariantIndex(exprIx, fnIx) >= 0
+    || structIndexOfExpr(exprIx, fnIx) >= 0
+  ) {
+    const rv = armValuePlainOf(unionTy, exprIx, fnIx)
+    if rv >= 0 { return holeBox("rec", rv, -1) }
+  }
   // Every rung below takes a value the record, niche and map rungs above it decline.
   if (
     nulVariantIdxOfExpr(exprIx, fnIx) >= 0
@@ -1978,6 +1999,27 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
       && atomNulStrWhy(un, uSet, unionTy, exprIx, fnIx) == ""
     return if ok { holeBox("atomStr", 2, -1) } else { ladder }
   }
+  // A scalar list rides the box as itself under its list kind's tag (`emitUnionCoerceAtomBox`):
+  // a literal, a ref-element list, a closure and the atom list each have a rung of their own.
+  const bareTy = nodeTyAt(bareIx, fnIx)
+  if (
+    bareTy >= 0
+    && tyAt(bareTy) is TyArray
+    && !(bare is ArrayLit)
+    && !exprRefArray(exprIx, fnIx)
+    && !exprIsClosure(exprIx, fnIx)
+  ) {
+    const lk = coerceListAtomOf(
+      coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
+      unionTy,
+      bareIx,
+      fnIx,
+    )
+    if lk > 5 && listWrapHeapOfKind(lk) >= 0 {
+      if lk == 7 && exprIsAtomList(bareIx, fnIx) { return ladder }
+      return holeBox("atom", lk, -1)
+    }
+  }
   const pn = tyPrimNameOf(nodeTyAt(bareIx, fnIx))
   if pn == null { return ladder }
   const pk = holePrimKind(pn)
@@ -1996,6 +2038,55 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     "instLit" | "floatLit" => holeBox("lit", k, -1)
     "asgLit" | "radix" | "convert" => ladder
   }
+}
+
+// The arm of `unionTy` record `exprIx` boxes under as itself, or -1: a record, or a bare variant
+// whose heap no arm holds, its row a subtype of the arm's; never a literal naming an arm, a value
+// that can be null, or a box. `emitUnionWideArmBox`'s plain rung, and the box plan's `rec` arm.
+export function wideArmPlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bareIx = unwrapParen(exprIx)
+  if bareIx < 0 || bareIx >= P.nodes.length { return -1 }
+  if nodeAt(bareIx) is ObjLit && exprVariantIndex(exprIx, fnIx) >= 0 {
+    return -1
+  }
+  if tyBearsNull(nodeTyAt(bareIx, fnIx)) || exprUnion(exprIx, fnIx) {
+    return -1
+  }
+  const atoms: i32[] = []
+  unionArmRowsOfTy(unionTy, atoms)
+  const svi = exprVariantIndex(exprIx, fnIx)
+  let row = -1
+  if svi >= 0 {
+    if armsHoldHeap(atoms, variantHeap(svi)) { return -1 }
+    row = variantRowOf(svi)
+  } else {
+    row = structIndexOfExpr(exprIx, fnIx)
+  }
+  const vi = wideArmOfRow(row, atoms)
+  return if vi < 0 || vi >= uTags.length { -1 } else { vi }
+}
+
+// The arm `emitUnionArmValueBox` boxes non-null record `exprIx` under as itself, or -1: the arm
+// its row subtypes (`wideArmPlainOf`), else its own variant's arm where it is built on that
+// variant's heap. A value that may be null, a box, or a record rebuilt onto the arm is -1.
+export function armValuePlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bareIx = unwrapParen(exprIx)
+  if (
+    exprUnion(exprIx, fnIx)
+    || nodeTyIsNullable(bareIx)
+    || tyBearsNull(nodeTyAt(bareIx, fnIx))
+  ) {
+    return -1
+  }
+  const wv = wideArmPlainOf(unionTy, exprIx, fnIx)
+  if wv >= 0 { return wv }
+  const svi = exprVariantIndex(exprIx, fnIx)
+  if svi < 0 || svi >= uTags.length { return -1 }
+  const si = structIndexOfExpr(exprIx, fnIx)
+  if si >= 0 && si < sHeapIdx.length && sHeapIdx[si] != variantHeap(svi) {
+    return -1
+  }
+  return svi
 }
 
 // The value-atom kind of primitive `pn`, -1 for one that is no value atom here.
@@ -2999,9 +3090,11 @@ function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   if m.memProp == "length" && !lengthIsField(m, memIx, fnIx) { return false }
   if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
-  // A field read's receiver recovers in its own read; any other receiver owing one is not plain.
+  // A field read's or a name's receiver recovers in its own read (`emitReadRecover`); any other
+  // receiver owing one is not plain.
+  const o = nodeAt(m.memObj)
   return twoListUseMsg(m.memObj, m.memProp, fnIx) == ""
-    && (nodeAt(m.memObj) is Member || !readOwesNonNullRecover(m.memObj, fnIx))
+    && (o is Member || o is Ident || !readOwesNonNullRecover(m.memObj, fnIx))
 }
 
 // Whether `.length` read `m` at `memIx` is a record's own field, which `emitMemberNode` reads as
@@ -3038,15 +3131,24 @@ function fieldStoresRead(row: i32, memIx: i32, fnIx: i32): boolean {
   return vkNonNullRefTwin(sk) == rk && readOwesNonNullRecover(memIx, fnIx)
 }
 
+// Whether struct field read `memIx` recovers its receiver to its non-null ref before the field:
+// a nullable struct the checker proved guarded, whose read did not already recover it.
+export function memRecvOwesNonNull(memIx: i32, fnIx: i32): boolean {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  return exprNullableStruct(m.memObj, fnIx)
+    && !readOwesNonNullRecover(m.memObj, fnIx)
+}
+
 // The field `emitExpr` reads off a plain struct receiver in `emitMemStructRead`'s plain form, or
-// -1: a plain member read of no variant, union or nullable struct, with no narrowing op and no
-// union-box field.
+// -1: a plain member read of no variant or union, with no narrowing op and no union-box field. A
+// nullable struct receiver recovers first (`memRecvOwesNonNull`).
 export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) || !sDeclared { return -1 }
   const o = m.memObj
   if memReadArmOf(memIx, fnIx) != "shared" || exprUnion(o, fnIx) { return -1 }
-  if nodeTyAt(o, fnIx) == TY_NEVER || exprNullableStruct(o, fnIx) { return -1 }
+  if nodeTyAt(o, fnIx) == TY_NEVER { return -1 }
   const si = structIndexOfExpr(o, fnIx)
   if si < 0 || si >= sHeapIdx.length { return -1 }
   const idx = sFieldIndex(si, m.memProp)
@@ -3071,6 +3173,69 @@ export function memFieldUnionBox(memIx: i32, fnIx: i32): boolean {
   if si < 0 || si >= sHeapIdx.length { return false }
   const sf = sFieldIndex(si, m.memProp)
   return sf >= 0 && sFieldIsUnionBox(si, sf)
+}
+
+// Does the function being emitted declare type parameters? The dead-atom elision is
+// bounded to these: only a generic instance can carry an `is` arm the instantiation makes
+// constant-false, and only there is the name-keyed union lookup single-valued.
+function fnHasTyParams(fnIx: i32): boolean {
+  const fp = fnStmtsPosOf(fnIx)
+  if fp < 0 { return false }
+  if fp >= fnStmts.length { return false }
+  const f = nodeAt(fnStmts[fp])
+  if f is FuncDecl {
+    if f.fnTyParams.length > 0 { return true }
+  }
+  // A monomorphized instance has no type params of its own — `mkFunc(instName, noTyParams, …)`
+  // strips them — so the instance must be recognised through its template. Without this the
+  // bound never fires for the very shape it exists to admit.
+  if fp < monoOrigNode.length {
+    const o = monoOrigNode[fp]
+    if o >= 0 {
+      const of = nodeAt(o)
+      if of is FuncDecl { return of.fnTyParams.length > 0 }
+    }
+  }
+  return false
+}
+
+// The atom kind an identifier read on `identReadArmOf`'s `unbox` arm reads out of its union box,
+// or -1 for a dead generic narrow, which reads `unreachable`: a type parameter narrowed to an
+// impossible arm type-checks, and its arm is constant-false there (D947).
+export function identUnboxAtomOf(ix: i32, fnIx: i32): i32 {
+  const vak = identReadAtomKindAt(ix, fnIx)
+  if vak < 0 { return -1 }
+  if (
+    fnHasTyParams(fnIx)
+    && unionTyHasValueKind(unionBoxTyOfRead(ix, fnIx), vak) == 0
+  ) {
+    return -1
+  }
+  return vak
+}
+
+// Whether union type `ty` has an arm of value kind `vak`, by its member set's banked kinds: 0 only
+// when every member is a bare primitive or `null` and none is `vak`. A set the bank does not
+// cover, or a member a kind cannot rule out (a record, list, closure or nested union), answers 1.
+function unionTyHasValueKind(ty: i32, vak: i32): i32 {
+  const ks: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(ty), ks) || ks.length < 2 { return 1 }
+  for k in ks {
+    if k == vak || !valueKindIsPlainScalar(k) { return 1 }
+  }
+  return 0
+}
+
+// Whether value kind `k` is a bare primitive or `null`, which a kind compare can decide.
+function valueKindIsPlainScalar(k: i32): boolean {
+  if k < 0 { return false }
+  const ps: PrimName[] = [
+    "i32", "i64", "f32", "f64", "boolean", "string", "null",
+  ]
+  for p in ps {
+    if boxTagOfPrim(p) == k { return true }
+  }
+  return false
 }
 
 // Which rung of `emitIs` answers `is` test `isIx`, in its order: `storage`, tested at its storage;
