@@ -30,3 +30,24 @@ cast them, as the struct tail always did, and they met this gap: invalid wasm on
   plain record receiver, an annotated and an un-annotated spelling of the return and the binding.
 - `tests/cases/narrowing/narrowed-field-record-delivered-to-its-union-of-a-union-member.vl`: the
   same off a receiver that is a union member.
+
+## Capability matrix
+
+Three templates under `scripts/capability-probes/matrix/`, a narrowed member read off a struct,
+a union-member and a null-tested nullable union-member receiver, each over the built-in positions
+plus a record and a union parameter, an early return into either, and interpolation. Graded with
+`--before` master `f2ec7aa7c` and `--after` this branch:
+
+| template | runs before | runs after | runs → not-runs | SILENT after |
+|---|---:|---:|---:|---:|
+| `narrowed-member-record-struct-recv` | 31 of 72 | 72 of 72 | 0 | 0 |
+| `narrowed-member-record-variant-recv` | 65 of 72 | 67 of 72 | 0 | 5 |
+| `narrowed-member-record-nullable-recv` | 70 of 72 | 72 of 72 | 0 | 0 |
+
+The variant template's five SILENT cells are SILENT before as well, and before #9251: a module
+`const` receiver whose record is a union member, delivered at the member record (`record_param`
+in both faces; the un-annotated `argument`, `early_return_guard`, `fn_body_capture`). That is
+another reader, filed as unfiled: D17028. The six positions #9251 broke are read off a parameter
+receiver, which the template's module `const` does not reach; the union-member case file holds
+them.
+
