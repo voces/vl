@@ -21190,7 +21190,11 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   // primitive. The table's box seats are emit state, unset while the builder asks.
   const prim = nodeTyPrimName(w)
   if prim != "" && prim != "string" { return placePrePathWhy(w, fnIx) }
-  if coerceKindAt(ix, fnIx) != "none" { return "pre-path coercion" }
+  const ck = coerceKindAt(ix, fnIx)
+  // A list copy that owes nothing past the value is the value as built.
+  if ck != "none" && !(ck == "listCopy" && listCopyOwesNothing(ix, fnIx)) {
+    return "pre-path coercion"
+  }
   if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
@@ -21488,11 +21492,11 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
     if iun != "" {
       how = 3
     } else {
-      const destStruct = ifTypedStructRow(ifIx, fnIx)
-      rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+      const rj = ifRefJoinOf(ifIx, fnIx)
+      rk = rj.rjKind
       if rk != null {
         how = 4
-        rslot = ifExprRefSlot(ifIx, fnIx, rk, destStruct)
+        rslot = rj.rjSlot
       } else {
         vt = ifExprValtype(ifIx, fnIx)
       }
@@ -21517,6 +21521,27 @@ function emitIfExpr(ifIx: i32, fnIx: i32) {
   if how == 3 { return emitUnionIfValue(iun, jpin, ifIx, fnIx) }
   if rk != null { return emitIfExprRef(ifIx, fnIx, rk, rslot) }
   return emitIfExprAs(ifIx, fnIx, vt)
+}
+
+// The ref kind and table slot a value `if` at `ifIx` joins at (`emitIfExprRef`), or a null kind
+// for a join that is not a reference.
+export type RefJoin = { rjKind: VKind | null, rjSlot: i32 }
+
+// The `RefJoin` of a join that is not a reference.
+export function noRefJoin(): RefJoin { return { rjKind: null, rjSlot: -1 } }
+
+export function ifRefJoinOf(ifIx: i32, fnIx: i32): RefJoin {
+  const destStruct = ifTypedStructRow(ifIx, fnIx)
+  const rk = ifExprRefKindAt(ifIx, fnIx, destStruct)
+  const slot = if rk != null { ifExprRefSlot(ifIx, fnIx, rk, destStruct) } else { -1 }
+  return { rjKind: rk, rjSlot: slot }
+}
+
+// The result blocktype of a ref join's `if`, after its opcode: `(ref null $ht)` when the join
+// can yield `null`, else `(ref $ht)`.
+export function fbRefIfOpenType(kind: VKind, slot: i32, nul: boolean) {
+  if nul { return fbValtypeNullable(kind, slot) }
+  return fbValtype(kind, slot)
 }
 
 // The internal failure where `ifExprPlainKind` and `emitIfExpr`'s ladder part ways.
@@ -21552,7 +21577,7 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
     return "atom join"
   }
   if exprUnion(ifIx, fnIx) { return "union" }
-  const rk = ifExprRefKindAt(ifIx, fnIx, ifTypedStructRow(ifIx, fnIx))
+  const rk = ifRefJoinOf(ifIx, fnIx).rjKind
   if rk != null { return "ref " + rk }
   const jpin = nodeTyInOf(ifIx, fnIx)
   if (tyIsLitUnion(jpin) || jpin < 0) && strJoinDropsNulAtom(ifIx, fnIx) {
@@ -21738,7 +21763,7 @@ function refuseJoinDropsNul(ifIx: i32): i32 {
 // Whether the string join at `ifIx` is non-null along its whole chain while an arm widens a
 // `K | null` atom, whose `-1` becomes `null`: the join's type dropped a null an arm still holds,
 // as a generic's `??` joined with a nullable pin's other side does (D3290).
-function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
+export function strJoinDropsNulAtom(ifIx: i32, fnIx: i32): boolean {
   let cur = ifIx
   let widens = false
   while cur >= 0 {
@@ -21793,11 +21818,7 @@ function emitIfExprRefLink(
     // needs a nullable blocktype, else a `(ref null $ht)` arm mismatches the non-null result.
     // A non-nullable join, or a binding whose arms are both non-null, stays non-null and widens on store.
     const nulJoin = chainNul
-    if nulJoin {
-      fbValtypeNullable(kind, slot) // `(ref null $ht)` result blocktype
-    } else {
-      fbValtype(kind, slot) // ref result blocktype `(ref $ht)`
-    }
+    fbRefIfOpenType(kind, slot, nulJoin)
     let rcT = 0
     if sg == 0 {
       rcT = emitDeadValueArm(s.ifThen)
@@ -21906,6 +21927,49 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
   )
 }
 
+// How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
+// itself, `recover` the same under `ref.as_non_null`, `nestedIf` an `if` value joined at this
+// rep; `null`, `atomStr` and `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
+export type RefIfArm = "plain"
+  | "recover"
+  | "null"
+  | "atomStr"
+  | "recordCopy"
+  | "nestedIf"
+  | "noValue"
+
+// `emitRefIfArm`'s ladder for arm `blockIx` (D1577, D1560, D2100).
+export function refIfArmOf(
+  blockIx: i32,
+  fnIx: i32,
+  kind: VKind,
+  slot: i32,
+  nulJoin: boolean,
+): RefIfArm {
+  const b = nodeAt(blockIx)
+  if !(b is Block) { return "noValue" }
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 { return "noValue" }
+  if ifArmIsValue(tv, fnIx) {
+    if nodeAt(unwrapParen(tv)) is NullLit { return "null" }
+    if kind == "struct" && refIfArmNeedsRecordCopy(tv, slot, fnIx) {
+      return "recordCopy"
+    }
+    if kind == "str" && exprIsLitAtom(tv, fnIx) { return "atomStr" }
+    if !nulJoin && nulNicheRecoverOwed(kind, tv, fnIx) { return "recover" }
+    return "plain"
+  }
+  const inner = unwrapParen(tv)
+  if (
+    inner >= 0
+    && nodeAt(inner) is IfStmt
+    && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
+  ) {
+    return "nestedIf"
+  }
+  return "noValue"
+}
+
 // One arm of a ref-typed if-expression: its prelude, then its tail-value statement emitted
 // in the join rep. `nulJoin` is threaded from the caller rather than re-derived, so the
 // declaration and the arm's recover cannot disagree about nullness (D1577).
@@ -21917,61 +21981,38 @@ function emitRefIfArm(
   nulJoin: boolean,
 ) {
   const b = nodeAt(blockIx)
-  if b is Block {
-    const tv = ifArmValueExpr(blockIx)
-    if tv >= 0 {
-      if ifArmIsValue(tv, fnIx) {
-        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        // A bare `null` arm lowers as the join's own null, not through `emitNullLitNode`'s
-        // seed ladder: `fbRefNullOfKind` is `fbValtypeNullable`'s value twin, so the arm and
-        // the blocktype cannot name different heap types. Without it an explicit
-        // `else { null }` refuses at every ref kind whose null no boundary seed carries (D1560), while the else-less spelling of the same value keeps working.
-        if nodeAt(unwrapParen(tv)) is NullLit {
-          return emitIfArmClose(fbRefNullOfKind(kind, slot))
-        }
-        if kind == "struct" {
-          // A record value, not a literal, joined into a wider record would need a converting
-          // copy, which a delivery of it has nowhere else either (D2100).
-          if refIfArmNeedsRecordCopy(tv, slot, fnIx) {
-            return emitIfArmClose(
-              emitFailAt(
-                "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared",
-                tv,
-              ),
-            )
-          }
-        }
-        // An ATOM arm in a `string` join widens to its member string (the atom is a
-        // bare i32 id; the join blocktype is the string ref) — the if-expression seam
-        // of the atom-as-string-subtype widen (`retStrWiden` at returns).
-        if kind == "str" && exprIsLitAtom(tv, fnIx) {
-          return emitIfArmClose(emitAtomToStr(tv, fnIx))
-        }
-        // A non-null blocktype is a delivery (D1577), so an arm whose rep is the join
-        // kind's nullable niche owes the same `ref.as_non_null` the return / argument /
-        // binding boundaries make (`nulNicheRecoverOwed`) — a nested-struct field stores
-        // `(ref null $S)` though its type is not nullable, so an unrecovered arm pushes that under a `(ref $S)` result: invalid wasm. Under a nullable blocktype nothing is owed.
-        const rcV = emitExpr(tv, fnIx)
-        if rcV >= 0 && !nulJoin {
-          if nulNicheRecoverOwed(kind, tv, fnIx) { fbRefAsNonNull() }
-        }
-        return emitIfArmClose(rcV)
-      }
-      // An arm ending in an if-expression the value test declines (an else-less one yields
-      // `null` on its missing path) joins at this rep too, once this frame can hold its null.
-      const inner = unwrapParen(tv)
-      if (
-        inner >= 0
-        && nodeAt(inner) is IfStmt
-        && (nulJoin || !ifLinkYieldsNull(inner, fnIx))
-      ) {
-        if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        return emitIfArmClose(emitIfExprRef(inner, fnIx, kind, slot))
-      }
-    }
-    return ifArmNoValueFail("if-expression arm", blockIx)
+  if !(b is Block) {
+    return emitFail("emitProgram: if-expression arm is not a block")
   }
-  return emitFail("emitProgram: if-expression arm is not a block")
+  const arm = refIfArmOf(blockIx, fnIx, kind, slot, nulJoin)
+  const tv = ifArmValueExpr(blockIx)
+  match arm {
+    "noValue" => {
+      return ifArmNoValueFail("if-expression arm", blockIx)
+    }
+    "nestedIf" => {
+      if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+      return emitIfArmClose(emitIfExprRef(unwrapParen(tv), fnIx, kind, slot))
+    }
+    "null" | "atomStr" | "recover" | "plain" | "recordCopy" => {}
+  }
+  if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
+  // A record joined into a wider record would need a converting copy (D2100).
+  if arm == "recordCopy" {
+    return emitIfArmClose(
+      emitFailAt(
+        "emitProgram: this branch hands over a record whose field types differ from the record the branches join to, and a record is shared rather than converted — write the branch as an object literal, or give the value the joined type where it is declared",
+        tv,
+      ),
+    )
+  }
+  // A bare `null` arm is the join's own null (`fbRefNullOfKind`, `fbValtypeNullable`'s value twin).
+  if arm == "null" { return emitIfArmClose(fbRefNullOfKind(kind, slot)) }
+  // An atom arm in a `string` join widens to its member string.
+  if arm == "atomStr" { return emitIfArmClose(emitAtomToStr(tv, fnIx)) }
+  const rcV = emitExpr(tv, fnIx)
+  if rcV >= 0 && arm == "recover" { fbRefAsNonNull() }
+  return emitIfArmClose(rcV)
 }
 
 // Lower the if-expression at `ifIx` with a known blocktype byte `kind`, threading it
@@ -30250,9 +30291,57 @@ function emitFnCloDispatch(exprIx: i32, fes: i32[], fnIx: i32): i32 {
   return 0
 }
 
+// Whether a `listCopy` delivery of `exprIx` owes nothing past the value as built, so the tail
+// writes no byte: no record copy, numeric convert or stand-in widen, no list-of-lists convert,
+// and a ref-list pair with no retag rows whose slots need no widen.
+export function listCopyOwesNothing(exprIx: i32, fnIx: i32): boolean {
+  const lct = listCopyAtNode(exprIx)
+  if lct < 0 { return false }
+  const st = nonNullTy(nodeTyIxOf(exprIx))
+  const dt = nonNullTy(instTyOrSelf(lct, fnIx))
+  if listRecCopies > 0 && rcRecListsApart(st, dt) { return false }
+  const ld = repOfTy(instTyOrSelf(lct, fnIx))
+  const de = if ld.rdKind != null { scalarListElemOfListKind(ld.rdKind) } else { null }
+  if de != null {
+    if listCopyStandsIn(exprIx, fnIx) { return false }
+    const sk = scalarListElemKind(exprIx, fnIx)
+    return sk == null || scalarWidenConvOp(sk, de) < 0
+  }
+  const lst = nonNullTy(instTyOrSelf(nodeTyIxOf(exprIx), fnIx))
+  if listOfListsPair(lst, dt) { return false }
+  const rtFrom: i32[] = []
+  const rtTo: i32[] = []
+  listWidenRetagRowsOf(exprIx, rtFrom, rtTo)
+  if rtFrom.length > 0 { return false }
+  const src = exprEmittedRefListSlot(exprIx, fnIx)
+  let dst = repSlotOfKind("reflist", instTyOrSelf(lct, fnIx))
+  if dst < 0 { dst = src }
+  if rlBoxIntoRowList(src, dst) && identBuiltAtUnionList(exprIx) {
+    return false
+  }
+  return rlWidenTagOf(src, dst) < 0
+}
+
+// Whether the read `exprIx` is a closure's capture stand-in (`listFitCaptureStandIn`), whose
+// list the scalar copy widens from the stand-in's type.
+function listCopyStandsIn(exprIx: i32, fnIx: i32): boolean {
+  const e = nodeAt(unwrapParen(exprIx))
+  if !(e is Ident) { return false }
+  const ty: i32[] = []
+  return listFitCaptureStandIn(
+    e.identName,
+    unwrapParen(exprIx),
+    fnIx,
+    false,
+    ty,
+  )
+    >= 0
+}
+
 // The conversion of a list value just emitted at its own row into the row of `lct`, the list
 // its delivery copies into, where the two storages differ. Returns 0, or -1 failed.
 function emitListCopyTail(exprIx: i32, lct: i32, fnIx: i32): i32 {
+  if listCopyOwesNothing(exprIx, fnIx) { return 0 }
   // A fresh call's list of records is copied element by element (`recFreshCallCopy`).
   if listRecCopies > 0 {
     const rc = emitRecListCopy(exprIx, lct, fnIx)
@@ -32484,26 +32573,41 @@ function emitLetInitValue(
   return 0
 }
 
+// The rep `emitLetIfInit` writes a binding's `if` initializer at, in each arm: 0 the union box
+// of `nulTy` (D969: an un-annotated binding boxes too), 1 `string | null`, 2 `boolean | null`; -1
+// when the binding takes the plain path. `slotKind` is the binding's local's kind.
+export function letIfInitRep(slotKind: VKind, nulTy: i32): i32 {
+  return match slotKind {
+    "union" => if boxTyName(nulTy) != "" { 0 } else { -1 }
+    "nulstr" => 1
+    "nulbool" => 2
+    "i32" | "struct" | "list" | "str" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => -1
+  }
+}
+
+// The type `emitLetIfInit` names a binding's union by: its annotation, else its joined `if`.
+function letIfInitTy(s: LetDecl, fnIx: i32): i32 {
+  if s.letType >= 0 { return nodeTyIxOf(s.letType) }
+  return nodeTyAt(s.letInit, fnIx)
+}
+
+// Whether the declaration at `declIx` is a binding whose `if` initializer legacy writes in each
+// arm (`emitLetIfInit`), rather than as one value.
+export function letIfInitPerArm(declIx: i32, fnIx: i32): boolean {
+  const s = nodeAt(declIx)
+  if !(s is LetDecl) || !exprIsIfStmt(s.letInit) { return false }
+  const slot = declaredSlotOfDecl(declIx)
+  if slot < 0 || slot >= localIsRef.length { return false }
+  return letIfInitRep(localIsRef[slot], letIfInitTy(s, fnIx)) >= 0
+}
+
 // A `let` whose init is an `if` over a nullable or value-union cell, written into local
 // `idx` by each arm. Returns 0 once bound, 1 when the cell's rep takes no such lowering, and
 // -1 on a failure.
 function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
-  const slotKind = localIsRef[slot]
-  let nulRep = -1
-  let nulNm = ""
-  // The binding's union type: its annotation, else the joined `if` it is initialised by.
-  let nulTy = nodeTyAt(s.letInit, fnIx)
-  if s.letType >= 0 { nulTy = nodeTyIxOf(s.letType) }
-  if slotKind == "union" {
-    // The box is named by the binding's union type, annotated or joined (D969: an
-    // un-annotated binding boxes too, rather than fall to a scalar join over two ref arms).
-    nulNm = boxTyName(nulTy)
-    if nulNm != "" { nulRep = 0 }
-  } else if slotKind == "nulstr" {
-    nulRep = 1
-  } else if slotKind == "nulbool" {
-    nulRep = 2
-  }
+  const nulTy = letIfInitTy(s, fnIx)
+  const nulRep = letIfInitRep(localIsRef[slot], nulTy)
+  const nulNm = if nulRep == 0 { boxTyName(nulTy) } else { "" }
   if nulRep >= 0 {
     // the binding sink: with every arm writing the shared pair and ONE `struct.new`
     // after the `if`, the arms' construction sites collapse to that one — and the
@@ -34285,15 +34389,24 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
   return svSyncRecv(iterIx, fnIx)
 }
 
-// Why `for` statement `s` at `stmtIx` is not the plain walk, or "": an i32 or string list, a
-// string's code points, or a map's keys or values, read once into its temp, no second name, no
-// byte source, no literal iterable, no slot pinned by node, and a body that may reallocate a list,
-// so its header is re-read each step and nothing is hoisted or unrolled ("hoisted" otherwise).
+// The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
+// box, a record or an `i32` list, each read whole into the loop variable.
+function forInElemPlain(ek: VKind): boolean {
+  return match ek {
+    "i32" | "str" | "union" | "struct" | "list" => true
+    "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => false
+  }
+}
+
+// Why `for` statement `s` at `stmtIx` is not the plain walk, or "": a list of a `forInElemPlain`
+// kind, a string's code points or a map's keys or values, read once; no second name, byte source,
+// literal iterable or node-pinned slot; a body that may reallocate a list, so the header is re-read
+// each step and nothing is hoisted or unrolled ("hoisted" where it is).
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return "iterable" }
-  if ek != "i32" && ek != "str" { return "element " + ek }
+  if !forInElemPlain(ek) { return "element " + ek }
   if forInU8Src(s.fiIter, fnIx) { return "byte source" }
   if s.fiVar2 != "" { return "pair" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
