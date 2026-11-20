@@ -1114,8 +1114,9 @@ Deno.test({
     // case 11 a box whose immediate stands for a call (rule 2).
     // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
     // (rule 2), and a default that leaves the out unwritten (rule 5). Case 15 is a stashed
-    // record whose source order evaluates one field twice (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2];
+    // record whose source order evaluates one field twice (rule 2). Cases 16 to 18 break a fused
+    // map read: a probe of an i32, a probe on the pop's arm (rule 2), an unwritten out (rule 5).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
@@ -1536,6 +1537,24 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
       throw new Error(`want d1 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A map read's default that computes is a body the probe's miss arm writes: a call, a nested
+// read, and the narrowing rewrite's `if true` default, with a key that is itself a temp.
+const MAP_DEFAULT_BODY =
+  `let m: {[string]: i32} = Map()\nfunction g(k: string): i32 { return k.length }\nfunction f(k: string): i32 { return m[k] ?? g(k) }\nfunction n2(k: string, j: string): i32 { return m[k] ?? (m[j] ?? 7) }\nfunction h(k: string): i32 {\n  const hit = m[k]\n  if hit is i32 { return hit }\n  return 0\n}\nfunction h2(s: string, a: i32, b: i32): i32 {\n  const hit = m[s.slice(a, b)]\n  if hit is i32 { return hit }\n  return 0\n}\nm["a"] = 1\nprint(f("a"))\nprint(f("bcd"))\nprint(n2("x", "a"))\nprint(h("q"))\nprint(h2("xa", 1, 2))\n`;
+Deno.test({
+  name: "ir shadow: a map read's computing default builds as its miss arm's body and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(MAP_DEFAULT_BODY, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want g, f, n2, h and h2 covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
