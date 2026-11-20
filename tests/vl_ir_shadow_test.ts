@@ -1444,6 +1444,24 @@ Deno.test({
   },
 });
 
+// A map read's default that computes is a body the probe's miss arm writes: a call, a nested
+// read, and the narrowing rewrite's `if true` default, with a key that is itself a temp.
+const MAP_DEFAULT_BODY =
+  `let m: {[string]: i32} = Map()\nfunction g(k: string): i32 { return k.length }\nfunction f(k: string): i32 { return m[k] ?? g(k) }\nfunction n2(k: string, j: string): i32 { return m[k] ?? (m[j] ?? 7) }\nfunction h(k: string): i32 {\n  const hit = m[k]\n  if hit is i32 { return hit }\n  return 0\n}\nfunction h2(s: string, a: i32, b: i32): i32 {\n  const hit = m[s.slice(a, b)]\n  if hit is i32 { return hit }\n  return 0\n}\nm["a"] = 1\nprint(f("a"))\nprint(f("bcd"))\nprint(n2("x", "a"))\nprint(h("q"))\nprint(h2("xa", 1, 2))\n`;
+Deno.test({
+  name: "ir shadow: a map read's computing default builds as its miss arm's body and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(MAP_DEFAULT_BODY, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want g, f, n2, h and h2 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
