@@ -1563,6 +1563,24 @@ Deno.test({
   },
 });
 
+// A returned value `if` whose result bears a `null` pads its `end` with the function's own null,
+// returned (`emitNullForRet`): a record and a string result build and match legacy.
+const RET_IF_NULL_PAD =
+  `type P = { v: i32 }\nfunction f(c: boolean, p: P): P | null {\n  return if c { p } else { null }\n}\nfunction g(n: i32): string | null {\n  return if n > 0 { "pos" } else if n < 0 { "neg" } else { null }\n}\nconst p: P = { v: 4 }\nconst a = f(true, p)\nif a != null { print(a.v) }\nprint(g(0) ?? "z")\n`;
+Deno.test({
+  name: "ir shadow: a returned value if's null pad returns the function's own null and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RET_IF_NULL_PAD, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
