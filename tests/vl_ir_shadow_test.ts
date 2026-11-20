@@ -2383,3 +2383,21 @@ Deno.test({
     }
   },
 });
+
+// A valued block body that ends in a loop builds the loop and falls into legacy's pad: a
+// `while true` whose only exit is a `return`, and conditioned loops into `unreachable` and `null`.
+const TAIL_LOOP =
+  `function find(xs: i32[], k: i32): i32 {\n  let i = 0\n  while true {\n    if xs[i] == k { return i }\n    i = i + 1\n  }\n}\nfunction scan(n: i32) {\n  let i = 0\n  while i < n {\n    if i * i > n { return i }\n    i = i + 1\n  }\n}\nfunction lp(x: i32): boolean | null {\n  let c = x\n  while c > 0 {\n    if c == 3 { return true }\n    c = c - 1\n  }\n}\nprint(find([4, 5, 6], 6))\nprint(scan(10))\nprint(lp(5))\n`;
+Deno.test({
+  name: "ir shadow: a valued body ending in a loop falls into legacy's pad and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(TAIL_LOOP, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want all three covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
