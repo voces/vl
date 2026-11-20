@@ -43,3 +43,15 @@ member of the `Rhs` union every match over it checks. Legacy is A/B'd on its own
 `CLAIMED` empty built from both trees give identical bytes on every tests/cases program and probe
 (7,535 identical, 68 failing under both, 0 differ) and the same first diagnostic on all 59 filed
 emit-reject witnesses.
+
+## The zero-extending load fold (after the master merge at f44a504b)
+
+The queue's armed shadow over `tests/cases` found 4 byte mismatches in
+`tests/cases/memory/load-zero-extend-fold-values.vl` (`prefix or locals at 0x08 vs 0x10`, three
+times, and `vs 0x17`). Legacy folds `(__load_*__(p) as% i64) & mask`, and an unsigned load cast to
+i64, into one zero-extending i64 load (`zextLoadOf`: `asCastArmOf`'s `zextLoad` arm and
+`emitBinExprNode`'s `&` arm). The builder asked neither, and once it built the load it wrote the
+load and its widening apart. As ruled, the builder now asks legacy's decision and re-spells
+nothing: `&` with `zextLoadOf(ix) >= 0` misses as `zero-extending load mask`, and an `as` on the
+`zextLoad` arm as `expression as zextLoad`. That file reads 4 covered, 4 matched, 10 uncovered on
+those two classes, and no mismatch. The IR owning the fold as legacy writes it is a follow-up.

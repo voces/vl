@@ -2483,3 +2483,33 @@ print(ld(54, 0))
     }
   },
 });
+
+// Legacy folds a mask that only zero-extends a load, and an unsigned load cast to i64, into one
+// zero-extending i64 load (`zextLoadOf`). The builder names both a miss instead of building the
+// load and its widening apart, so no function mismatches; an i32 mask beside them still matches.
+Deno.test({
+  name: "ir shadow: a zero-extending load fold is a named miss, never a mismatch",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function wrap32(p: i32): i64 { return (__load_i32__(p, 0) as% i64) & 4294967295 }
+function u16bare(p: i32): i64 { return __load_u16__(p) as i64 }
+function low(p: i32): i32 { return __load_i32__(p) & 255 }
+__store_i32__(64, -1)
+print(wrap32(64))
+print(u16bare(64))
+print(low(64))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    const bad = [...rows.keys()].filter((k) => k.includes("mismatch"));
+    if (bad.length > 0) throw new Error(`want no mismatch, got:\n${bad.join("\n")}`);
+    if (
+      (rows.get("uncovered zero-extending load mask") ?? 0) !== 1 ||
+      (rows.get("uncovered expression as zextLoad") ?? 0) !== 1 ||
+      (rows.get("matched") ?? 0) !== 1
+    ) {
+      throw new Error(`want both folds named misses and low matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
