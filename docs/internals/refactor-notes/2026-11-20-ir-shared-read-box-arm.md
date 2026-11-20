@@ -11,10 +11,13 @@ atoms (`{v: i32} | {v: string}`), so each scalar arm is boxed under its atom's t
   `sharedArmBoxTail` (the value box and the union box), which legacy's arm writes too. The
   lowering asks each arm `sharedArmIsPlain`, then `sharedArmIsBox`, and misses on neither.
 - **Tail.** `sharedReadTailOf` is the one decision of what follows the dispatch: an atom unbox, the
-  narrow unbox, the `string | null` recover, or nothing (a narrow unbox that writes nothing,
-  `unionFieldNarrowUnboxWritesNone`, is nothing). `sharedReadTail` writes it for both emitters;
+  narrow unbox, the `string | null` recover, or nothing (a narrow unbox whose own arm,
+  `unionFieldNarrowUnboxOf`, is `none`, is nothing). `sharedReadTail` writes it for both emitters;
   the builder checks the read's rep against it (`irBAtomKindRep` for an unbox) and misses on the
   narrow unbox that writes.
+- **One narrow-unbox decision.** `unionFieldNarrowUnboxOf` (container, atom, unbox, none) is what
+  `emitUnionFieldNarrowUnbox` matches on and what `sharedReadTailOf` reads, so skipping it and
+  calling it cannot disagree.
 - **Audit.** Under `sharedReadTail` and `sharedArmBox*`: `emitUnionUnboxTail`,
   `emitUnionFieldNarrowUnbox`, `emitPlaceNarrowContainerUnbox`, `emitUnionFieldTagDispatch`,
   `emitNarrowStoredAtomKind`, `emitConvertAtomKind`, `sharedArmPayloadRead`. None calls

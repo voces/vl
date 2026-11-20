@@ -11024,19 +11024,10 @@ export function sharedReadTailOf(
   if sharedFieldAnyArmBoxes(code, vis, fis) {
     const ak = memReadCheckerAtomKind(memIx, fnIx)
     if ak >= 0 { return ak }
-    return if unionFieldNarrowUnboxWritesNone(memIx, fnIx) { SRT_NONE } else { SRT_NARROW }
+    return if unionFieldNarrowUnboxOf(memIx, fnIx) == "none" { SRT_NONE } else { SRT_NARROW }
   }
   if code == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx) { return SRT_NULSTR }
   return SRT_NONE
-}
-
-// Whether `emitUnionFieldNarrowUnbox` writes nothing for read `memIx`: no container narrow, no
-// narrowed atom, and no atom the read unboxes to.
-function unionFieldNarrowUnboxWritesNone(memIx: i32, fnIx: i32): boolean {
-  const con = placeReadContainerAt(memIx, fnIx)
-  if con == RC_REF_LIST || con == RC_MAP { return false }
-  return memNarrowAtomKind(memIx, fnIx) < 0
-    && memReadUnboxAtomKind(memIx, fnIx) < 0
 }
 
 export const SRT_NONE = -1
@@ -11376,38 +11367,43 @@ export function sharedRecvSlotGet(slot: i32) {
 // The atom is the checker's type for the read (`memNarrowAtomKind`): a litunion-alias narrow
 // unboxes as the string ref the box stores its member as, which is the ident read discipline.
 // A read typed as the field's declared type narrows nothing and yields the box unchanged.
-function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
-  // The CONTAINER arms of the same narrowing (`if n.v is K[]`, `if n.v is {[string]: K}`) —
-  // disjoint from the value atom below, which answers "" for both (D1014).
-  const mCon = emitPlaceNarrowContainerUnbox(memIx, fnIx)
-  if mCon != 0 { return mCon - 1 }
-  const mAtom = memNarrowAtomKind(memIx, fnIx)
-  if mAtom < 0 {
-    // D209 — the un-narrowed read the checker typed as a bare atom. The box is the adoption's
-    // rep, not the program's: `structIndexOfObjCtx` takes a declared row for an un-annotated
-    // literal, so the field is code 16 while the checker never widened the value. Deliver the
-    // atom the checker's consumers are typed against; `exprUnion` asks this same predicate.
+// What `emitUnionFieldNarrowUnbox` writes for read `memIx`: a container narrow's cast (`if n.v is
+// K[]`, D1014), the narrowed atom's unbox, the unbox to the atom the checker typed an un-narrowed
+// read as (D209), or nothing.
+export type NarrowUnboxArm = "container" | "atom" | "unbox" | "none"
 
-    // The payload is not always at that atom: a declared `i64 | null` member makes the store
-    // widen `7` into `$vbI64` while the checker still types the read `i32`, so cast to what the
-    // store put there and narrow back. A `??`-merged box genuinely holds two, so no single cast
-    // is right — dispatch on the tag the box carries, only where every arm reaches it.
-    const ck = memReadUnboxAtomKind(memIx, fnIx)
-    if ck < 0 { return 0 }
-    const bk = memReadBoxedAtomKind(memIx, fnIx)
-    const bks: i32[] = []
-    if memReadBoxedAtomKinds(memIx, fnIx, bks) {
-      if bks.length > 1 && atomKindsAllConvertible(bks, ck) {
-        return emitUnionFieldTagDispatch(bks, ck)
-      }
-    }
-    if emitUnionUnboxTail(bk) < 0 { return -1 }
-    return emitNarrowStoredAtomKind(bk, ck)
+export function unionFieldNarrowUnboxOf(memIx: i32, fnIx: i32): NarrowUnboxArm {
+  const con = placeReadContainerAt(memIx, fnIx)
+  if con == RC_REF_LIST || con == RC_MAP { return "container" }
+  if memNarrowAtomKind(memIx, fnIx) >= 0 { return "atom" }
+  return if memReadUnboxAtomKind(memIx, fnIx) >= 0 { "unbox" } else { "none" }
+}
+
+function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
+  return match unionFieldNarrowUnboxOf(memIx, fnIx) {
+    "container" => emitPlaceNarrowContainerUnbox(memIx, fnIx) - 1
+    // The narrowed atom's ABI code decides both arms, as at the variant-field twin of this read
+    // (`emitNarrowedMem`).
+    "atom" => emitUnionUnboxTail(memNarrowAtomKind(memIx, fnIx))
+    "unbox" => emitUnionFieldStoredUnbox(memIx, fnIx)
+    "none" => 0
   }
-  // The narrowed atom's ABI code decides both arms, exactly as it does at the variant-field twin
-  // of this read (`emitNarrowedMem`, the same three instructions and the same two arms) — one
-  // derivation, not a spelling compare beside a second `vbHeapIdxOfKind`.
-  return emitUnionUnboxTail(mAtom)
+}
+
+// The un-narrowed read the checker typed as a bare atom, its payload cast to what the store put
+// there and narrowed back (a declared `i64 | null` member widens `7` into `$vbI64`); a `??`-merged
+// box holding two dispatches on its tag, only where every arm reaches the read's atom.
+function emitUnionFieldStoredUnbox(memIx: i32, fnIx: i32) {
+  const ck = memReadUnboxAtomKind(memIx, fnIx)
+  const bk = memReadBoxedAtomKind(memIx, fnIx)
+  const bks: i32[] = []
+  if memReadBoxedAtomKinds(memIx, fnIx, bks) {
+    if bks.length > 1 && atomKindsAllConvertible(bks, ck) {
+      return emitUnionFieldTagDispatch(bks, ck)
+    }
+  }
+  if emitUnionUnboxTail(bk) < 0 { return -1 }
+  return emitNarrowStoredAtomKind(bk, ck)
 }
 
 // D927 — the tag-dispatched unbox: one arm per atom the box can hold, each converted to the
