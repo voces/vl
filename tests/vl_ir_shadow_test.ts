@@ -1097,6 +1097,9 @@ Deno.test({
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
     }
+    // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
+    if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
+    if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
   },
 });
 
