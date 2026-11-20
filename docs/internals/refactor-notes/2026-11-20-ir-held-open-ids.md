@@ -23,7 +23,10 @@ contract is positive: each function-typed part is the tagged set's `i32` id.
 
 Compiler lines: +44 −49, 5 net fewer.
 
-## Readings (fixpoint seeds, against #9223's head)
+## Readings (fixpoint seeds, master `890abde55` against this change)
 
-Coverage is unchanged: 39,579 corpus functions with no blocker; `open local type` 22 and
-`open temp type` 40 alone; covered = verified = matched.
+| reading | master | this change |
+| --- | ---: | ---: |
+| corpus functions with no blocker (census) | 39,941 | 39,941 (every row identical) |
+| corpus covered = verified = matched (shadow) | | 39,941 |
+| L2 self-compile fuel (one box) | 102,677,149,961 | 102,675,878,122 (−0.001%) |
