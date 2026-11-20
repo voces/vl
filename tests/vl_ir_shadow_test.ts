@@ -780,6 +780,33 @@ print(bs[1])
   },
 });
 
+// `n is A` over a local `U | null` box, a valued `if` joining an arm with `null`: the same box
+// legacy tests by its tag, `null` one more tag, read raw past the narrowing. Covered and matched.
+Deno.test({
+  name: "ir shadow: an is test over a local nullable union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `type A = { k: "a", v: i32 }
+type B = { k: "b", w: i32 }
+type U = A | B
+const us: U[] = [{ k: "a", v: 3 }, { k: "b", w: 4 }]
+function at(i: i32): U { return us[i] }
+function f(x: i32): i32 {
+  const n = if x >= 0 && x < us.length { at(x) } else { null }
+  if !(n is A) && !(n is B) { return -1 }
+  if n is A { return n.v }
+  return 0
+}
+print(f(0) + f(1) + f(9))
+`;
+    const { rows } = run(src, true);
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
