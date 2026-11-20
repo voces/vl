@@ -19,9 +19,17 @@ only on `null`. The same core serves the `coll` and `clo` niche arms.
 ## What landed
 
 - **One heap decision.** `coalNulRefHeapOf` names the heap the block carries, or -1: the
-  collection wrapper at the `coll` niche arm, the closure struct at `clo`, otherwise the last rungs
-  of the ladder (`coalNulRefTailHeap`: a nullable union arm's variant heap, then a nullable record's
-  struct heap). Legacy's four sites read it; the IR reads the same function.
+  collection wrapper at the `coll` niche arm, the closure struct at `clo`, the nullable reference's
+  own heap past the boxed arms (`identBox`), and -1 for the niche arms with their own lowerings.
+  Past the boxed arms it reads `nulNicheValueHeap`, the box stash's heap function, now the one
+  copy (a variant index past `uVarRow` falls through to the struct check, as the `??` rung did).
+  Legacy's three sites read it (the `coll` and `clo` arms and `emitCoalesceNullableRefs`); the IR
+  reads the same function. A `?.` chain's closure or map leaf stays its own decision: its heap is
+  the field leaf's, not the operand's.
+- **One rung decision.** `coalNulRefRungReached` (a name, or a call that is neither call niche)
+  says when `coalBoxArmOf`'s `next` reaches the nullable-reference rungs with no arm between;
+  legacy's `next` arm goes straight to `emitCoalesceNullableRefs` on it, and the IR builder reads
+  it.
 - **The node's arm.** `CoalValArm` gains `nulRef` (family `box`); `coalValBoxArm` maps it to null,
   and the lowering's dispatch is a `_`-less match.
 - **Builder.** At the `coll`/`clo` niche arms, and at `coalBoxArmOf`'s `next` when the operand is a
@@ -58,7 +66,9 @@ blockers: `coalesce nulRef heap` 18, `coalesce nulRef operand temp` 12 (a plain 
 - **Join default:** legacy writes it with `emitUnionBoxAtRecord`. The IR builds only its
   recorded-box branch (`boxOwedAt`, which `deliver` shares); a default already of a union, or one
   boxed at no site type, misses as `coalesce nulRef join default`.
-- **The staged slot:** `optRecvSlot` is the function's reserved local (`fnUses.optRecv`). A join
+- **The staged slot:** `optRecvSlot` is the function's reserved local (`fnUses.optRecv`); the
+  builder reads the function's own flags, since `irClaimFn` runs after `fnDetectScratch(fnIx)` in
+  `emitFuncCode`. A join
   nested in the default re-tees it only on the outer null path, where the outer present arm never
   reads it, and a join inside the operand finishes before the outer tee.
 - **Witnesses** (`vl_ir_shadow_test`), covered and matched where master misses: the plain block

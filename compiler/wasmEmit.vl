@@ -40308,16 +40308,13 @@ function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
   return -1
 }
 
-// The heap type a nullable-ref niche carries, or -1 — the same two tables the `??` niche
-// arms read (`exprNullableVariant` then `exprNullableStruct`), so the box stash and the
-// `br_on_non_null` block cannot disagree about the value's rep. -1 for every other niche,
-// whose tag `coalNicheBoxTag` resolves from its atom code instead of from a heap.
+// The heap type a nullable-ref niche carries, or -1: a nullable union arm's variant heap, else a
+// nullable record's struct heap. The box stash and the `br_on_non_null` block both read it, so they
+// cannot disagree about the value's rep. -1 for every other niche, whose tag `coalNicheBoxTag`
+// resolves from its atom code instead of from a heap.
 function nulNicheValueHeap(exprIx: i32, fnIx: i32): i32 {
   const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-  if nvi >= 0 {
-    if nvi < uVarRow.length { return variantHeap(nvi) }
-    return -1
-  }
+  if nvi >= 0 && nvi < uVarRow.length { return variantHeap(nvi) }
   if exprNullableStruct(exprIx, fnIx) {
     const nsi = structIndexOfExpr(exprIx, fnIx)
     if nsi >= 0 && nsi < sHeapIdx.length { return sHeapIdx[nsi] }
@@ -40636,7 +40633,7 @@ function emitCoalesceAtomStrDefault(defIx: i32, nulBlock: boolean, fnIx: i32) {
 
 // The heap the `br_on_non_null` core of `l ?? d` carries, -1 when `l` reaches none: a nullable
 // collection's wrapper or the closure struct at their niche arms, else, past every boxed and fused
-// arm, a nullable union arm's variant heap or a nullable record's struct heap.
+// arm, the nullable reference's own heap (`nulNicheValueHeap`).
 export function coalNulRefHeapOf(
   e: BinExpr,
   lhsIx: i32,
@@ -40646,10 +40643,25 @@ export function coalNulRefHeapOf(
   return match coalNicheArmOf(e, lhsIx, exprIx, fnIx) {
     "coll" => nulCollWrapHeap(e.binLeft, fnIx)
     "clo" => cloStructIdx
-    "nulBoolJoin" | "nulBool" | "litUnion" | "nulAtomStr" | "str" | "identBox" => {
-      coalNulRefTailHeap(e, fnIx)
-    }
+    "identBox" => nulNicheValueHeap(e.binLeft, fnIx)
+    // Their own lowerings: the `boolean | null` and atom niches, and the string core at `sTy()`.
+    "nulBoolJoin" | "nulBool" | "litUnion" | "nulAtomStr" | "str" => -1
   }
+}
+
+// Whether `l ?? d` past `coalBoxArmOf`'s boxed arms reaches the nullable-reference rungs with no
+// arm between: a name, or a call that is no `boolean | null` or `string | null` niche
+// (`emitCoalesceCallNiche`), neither a field read nor a `?.` chain.
+export function coalNulRefRungReached(
+  e: BinExpr,
+  lhsIx: i32,
+  fnIx: i32,
+): boolean {
+  const l = nodeAt(lhsIx)
+  if l is Ident { return true }
+  return l is Call
+    && !exprNulBool(e.binLeft, fnIx)
+    && !exprNullableString(e.binLeft, fnIx)
 }
 
 // The `br_on_non_null` core of `l ?? d` along `coalNulRefHeapOf`'s heap `nrHeap`, its block shape
@@ -40672,18 +40684,6 @@ export function coalNulRefPlanOf(
   }
   const p: CoalNulRefPlan = { nrHeap: h, nrArm: a, nrTag: tag }
   return p
-}
-
-// The nullable union arm's variant heap or the nullable record's struct heap `l` of `l ?? d`
-// holds, -1 for neither: the last rungs of the ladder.
-function coalNulRefTailHeap(e: BinExpr, fnIx: i32): i32 {
-  const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
-  if cvi >= 0 && cvi < uVarRow.length { return variantHeap(cvi) }
-  if exprNullableStruct(e.binLeft, fnIx) {
-    const csi = structIndexOfExpr(e.binLeft, fnIx)
-    if csi >= 0 && csi < sHeapIdx.length { return sHeapIdx[csi] }
-  }
-  return -1
 }
 
 // The core above for the nullable struct (`S | null`) and nullable collections (`i32[] |
@@ -41255,7 +41255,13 @@ function emitCoalesceIdentBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
       "emitProgram: `??` over a nullable value union has no banked residual kind",
     )
     "callNoKind" => emitFail("emitProgram: `??` over a call result has no banked residual kind")
-    "next" => emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
+    "next" => {
+      if coalNulRefRungReached(e, lhsIx, fnIx) {
+        emitCoalesceNullableRefs(e, exprIx, fnIx)
+      } else {
+        emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
+      }
+    }
   }
 }
 
