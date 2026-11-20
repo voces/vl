@@ -13690,7 +13690,7 @@ function emitMonoMapDefault(recvIx: i32, defIx: i32, fnIx: i32) {
 // — the map twin of `emitIndex`'s ref-list rungs. Ref-recover runs first, since
 // `emitMapGet` leaves a nullable element for every ref-valued map; a union value (kind
 // 2) then unboxes to the tested atom, unless the narrow leaves two or more atoms.
-function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
+export function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
   const mrs = mapReadNarrowableSlot(idxIx, fnIx)
   if mrs < 0 { return 0 }
   const rt = nodeTyAt(unwrapParen(idxIx), fnIx)
@@ -13712,6 +13712,17 @@ function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
   }
   fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
   return 0
+}
+
+// How a bare map read `m[k]` at Index node `idxIx` reads its map: a union value through its
+// null-tagged box, a mono-valued map through `__map_get_<row>__`, or the probe written inline.
+export type MapGetArm = "unionBox" | "helper" | "inline"
+export function mapGetArmOf(idxIx: i32, fnIx: i32): MapGetArm {
+  const ubs = mapReadNarrowableSlot(idxIx, fnIx)
+  if ubs >= 0 && mvValKindAt(ubs) == "union" { return "unionBox" }
+  const nd = nodeAt(idxIx)
+  if nd is Index && mapGetHelperShape(nd.idxArr, fnIx) != 0 { return "helper" }
+  return "inline"
 }
 
 // Lower a bare map GET `m[k]` (no `??`) onto `body`: probe, return `vals[entry-1]` or
@@ -13809,7 +13820,7 @@ function mapGetHelperShape(recvIx: i32, fnIx: i32): i32 {
 
 // The value half of `emitMapGet`, after `emitMapPrep`: the stored value on a hit, the rep's
 // empty value on a miss. Leaves the probe's `entry` scratch slot as the probe set it.
-function emitMapGetTail(recvIx: i32, fnIx: i32) {
+export function emitMapGetTail(recvIx: i32, fnIx: i32) {
   if cmSlot >= 0 {
     // REF values: yield the NULLABLE element — the (ref null <elem>) vals slot on
     // a hit, `ref.null <elem>` on a miss — via the slot's valStash (same
@@ -13854,7 +13865,7 @@ function emitMapGetTail(recvIx: i32, fnIx: i32) {
 // The i32 a mono-valued map read `recvIx[k]` yields on a miss. A niche-bearing value map (`K`/`K |
 // null` atoms, `boolean`/`boolean | null`) reads its sentinel (`-1` litunion, `2` boolean), since a
 // plain `0` would collide with a real member (atom id 0, or `false`); any other value reads 0.
-function mapGetMissOf(recvIx: i32, fnIx: i32): i32 {
+export function mapGetMissOf(recvIx: i32, fnIx: i32): i32 {
   let gtMt = mapRecvTyIn(recvIx, fnIx)
   // A type parameter's value takes its sentinel from the instance's binding of it (D10360).
   if gtMt >= 0 && tyHasTyVar(gtMt) {
@@ -21254,12 +21265,12 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
       // the `const t = m[k]` binding arm takes: a bare `ref.null` miss would leave a
       // consumer's `struct.get $uBox 0` (the tag read) reading a null reference on `m[k] is
       // T`, `!= null`, `== null` and `print(m[k])` alike. The box is the read's own null.
-      const ubs = mapReadNarrowableSlot(exprIx, fnIx)
-      if ubs >= 0 && mvValKindAt(ubs) == "union" {
-        if emitMapGetUnionBox(e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
-        return emitNarrowedMapReadTail(exprIx, fnIx)
+      const rc = match mapGetArmOf(exprIx, fnIx) {
+        "unionBox" => emitMapGetUnionBox(e.idxArr, e.idxIndex, fnIx)
+        "helper" => emitMapGetCall(e.idxArr, e.idxIndex, fnIx, mapGetMissOf(e.idxArr, fnIx))
+        "inline" => if emitMapPrep(e.idxArr, e.idxIndex, fnIx) < 0 { -1 } else { emitMapGetTail(e.idxArr, fnIx) }
       }
-      if emitMapGet(e.idxArr, e.idxIndex, fnIx) < 0 { return -1 }
+      if rc < 0 { return -1 }
       return emitNarrowedMapReadTail(exprIx, fnIx)
     }
     return emitIndex(exprIx, fnIx)
