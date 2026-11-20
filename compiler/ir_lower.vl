@@ -55,6 +55,14 @@ import {
   nodeChildren,
 } from "./ast"
 import { unwrapParen } from "./emit_base"
+import {
+  fieldRowStorageKind,
+  sFieldFlatRow,
+  sFieldTypeAt,
+  variantFieldStorageKind,
+  variantFieldTypeAt,
+} from "./emit_atom_kinds"
+import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
   declaredIndexAt,
@@ -306,8 +314,12 @@ import {
   objLitArmOf,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
+  objLitStashRowAt,
+  objLitStashRowOf,
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
+  objLitVariantStashAt,
+  objLitVariantStashOf,
   objStructNewTail,
   popOrOpen,
   popOrPlanOf,
@@ -319,6 +331,7 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  sFieldStorageSlot,
   stageListRecvTail,
   staticAtomId,
   structFieldTail,
@@ -359,7 +372,7 @@ import { arrLitRefShortSlot } from "./emit_plan_list"
 import { fbOpenIf } from "./emit_bytes"
 import { fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
-import { ifLinkYieldsNull } from "./emit_if_arm_values"
+import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
 import { arrLitArmOf, arrLitListBuild, forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
@@ -872,16 +885,51 @@ function stmtsHolding(root: i32, ix: i32, pos: i32): i32[] {
   return []
 }
 
-// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row.
+// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row. Under
+// the order stash, each field in source order into its scratch slot first, read back in layout.
 function makeRec(r: RMakeRec) {
   const fnIx = lw.irAt
   const variant = if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, fnIx) == "variant" }
-  const row = if r.mrRow >= 0 && variant { objLitVariantLayoutAt(r.mrAt, r.mrRow) } else if r.mrRow >= 0 { objLitLayoutRowAt(r.mrAt, r.mrRow) } else if variant { objLitVariantLayoutOf(r.mrAt, fnIx) } else { objLitLayoutRowOf(r.mrAt, fnIx) }
+  const stash = r.mrSrc.length > 0
+  const row = if r.mrRow >= 0 && variant { if stash { objLitVariantStashAt(r.mrAt, r.mrRow) } else { objLitVariantLayoutAt(r.mrAt, r.mrRow) } } else if r.mrRow >= 0 { if stash { objLitStashRowAt(r.mrAt, r.mrRow) } else { objLitLayoutRowAt(r.mrAt, r.mrRow) } } else if variant { if stash { objLitVariantStashOf(r.mrAt, fnIx) } else { objLitVariantLayoutOf(r.mrAt, fnIx) } } else if stash { objLitStashRowOf(r.mrAt, fnIx) } else { objLitLayoutRowOf(r.mrAt, fnIx) }
   if row < 0 { return irLMiss("record row") }
   if r.mrFields.length == 0 { leaf() }
+  if stash { return makeRecStashed(r, row, variant) }
   for k in r.mrLayout {
     if k < 0 || k >= r.mrFields.length { return irLMiss("record layout") }
     irLOpnd(r.mrFields[k])
+  }
+  return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
+}
+
+// `emitObj`'s and `emitVariantStruct`'s order stash for `r` at `row`: each field in source order
+// set into the slot `objOrderStashSlot` opens for it, then every slot read in layout order.
+function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
+  const slots: i32[] = []
+  for _k in r.mrLayout { slots.push(-1) }
+  for k in r.mrSrc {
+    let fi = 0
+    while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
+    if fi >= r.mrLayout.length { fi = -1 }
+    if fi < 0 || k < 0 || k >= r.mrFields.length {
+      return irLMiss("record stash")
+    }
+    irLOpnd(r.mrFields[k])
+    const slot = if variant { objOrderStashSlot(
+      variantFieldStorageKind(row, fi),
+      variantFieldTypeAt(row, fi),
+      uFieldStorageSlot(row, fi),
+    ) } else { objOrderStashSlot(
+      fieldRowStorageKind(sFieldFlatRow(row, fi)),
+      sFieldTypeAt(row, fi),
+      sFieldStorageSlot(row, fi),
+    ) }
+    slots[fi] = slot
+    fbLocalSet(slot)
+  }
+  for s in slots {
+    if s < 0 { return irLMiss("record stash") }
+    fbLocalGet(s)
   }
   return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
 }
