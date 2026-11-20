@@ -12,7 +12,7 @@ are named. It admits a value union's box (`union`), a record (`struct`) and an `
 beside `i32` and `str`. Each element is read whole into the loop variable, as legacy reads it. The
 builder's existing checks still hold the walk's operand and variable at the element's rep.
 
-Compiler lines are +15 −4, 11 net, all in `wasmEmit.vl`. No legacy line is deleted or moved.
+Compiler lines are +14 −5, 9 net, all in `wasmEmit.vl`. No legacy line is deleted or moved.
 
 ## Readings (base master `f2616bad8`, fixpoint seeds on both sides)
 
