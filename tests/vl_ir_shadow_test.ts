@@ -539,6 +539,25 @@ print(b(["p", "q"]))
   },
 });
 
+// `print` of a value-union box, plain or nullable, dispatches on its tag along legacy's union
+// print tail, the stash slot taken before the box is written as legacy takes it.
+Deno.test({
+  name: "ir shadow: a print of a value-union box is covered and matched",
+  ignore,
+  fn: () => {
+    const src = `function show(u: i32 | string) { print(u) }
+function opt(u: i32 | null) { print(u) }
+show(3)
+opt(null)
+`;
+    const { rows } = run(src, true);
+    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
+      throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+  },
+});
+
 // A walk's own `break` and `continue` branch to the frames legacy's loop opens, and a walk whose
 // body is hoist-safe reads its header once and may unroll its body: all covered and matched.
 Deno.test({
@@ -891,7 +910,8 @@ print(two("a", "b"))
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
 // bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
-// `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+// `coerceKindAt` converts (a record copy into an `i64` field's row; a list copy that owes
+// nothing is the value). Each program is the smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
@@ -903,7 +923,7 @@ const PRE_PATHS: [string, string][] = [
   ],
   [
     "coercion",
-    `type Box1 = {[string]: {r: string}}[]\ntype Circle = { r: string }\nfunction thru(x: {[string]: {r: string}}[]) { return x }\nconst _sp1: Box1 = []\nfunction outer() {\n  const lv1 = Map()\n  const c = [lv1]\n  function inner() {\n    const dd = thru(c)\n    const g0 = dd\n    if g0.length > 0 {\n      const g1 = (g0[0])["k0"] ?? { r: "" }\n      if (g1).r == "seven" { print(7) } else { print(0) }\n    } else { print(0) }\n  }\n  inner()\n}\nouter()\n`,
+    `type K = { f: i64 }\nfunction mk() { return { f: 4 } }\nfunction main() {\n  const k: K = mk()\n  const y = mk()\n  print(y.f)\n  print(k.f)\n}\nmain()\n`,
   ],
 ];
 Deno.test({
@@ -943,6 +963,44 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (rows.has("uncovered pre-path tag leaf")) {
       throw new Error(`want no tag-leaf miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A list delivery whose copy owes nothing past the value (`listCopyOwesNothing`) is the value as
+// built, so the builder takes it as a plain node: no coercion miss, and every covered function
+// matches legacy's bytes. The program is distilled cell b004880.
+const LIST_COPY_NONE = `function mkc(): {r: i32 | null}[][] {
+  const lv1 = [{ r: 7 }]
+  const cc = []
+  return cc
+}
+function rd() {
+  const c = mkc()
+  const g0 = c
+  if g0.length > 0 {
+    const g1 = g0[0]
+    if g1.length > 0 {
+      if (g1[0]).r != null { print(7) } else { print(0) }
+    } else { print(0) }
+  } else { print(0) }
+}
+rd()
+`;
+Deno.test({
+  name: "ir shadow: a list copy that owes nothing builds as its value and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LIST_COPY_NONE, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path coercion")) {
+      throw new Error(`want no coercion pre-path miss, got ${JSON.stringify([...rows])}`);
     }
     const covered = rows.get("covered") ?? 0;
     if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {

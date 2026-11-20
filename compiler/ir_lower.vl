@@ -4,6 +4,8 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import { printUnionPlan } from "./emit_fn_scans"
+import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { RRaw, repNodeAt } from "./emit_rep"
 import {
@@ -83,6 +85,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RListClear,
   RListEq,
   RListGet,
   RListLen,
@@ -224,6 +227,11 @@ import {
   f64RemCallTail,
   f64RemOperandTail,
   fallThroughPadOf,
+  fieldStoreArmOf,
+  fieldStoreStructAt,
+  fieldStoreTail,
+  fieldStoreVariantAt,
+  fieldStoreVariantTail,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -282,6 +290,7 @@ import {
   printNulStrTail,
   printScalarTail,
   printStrTail,
+  printUnionTail,
   promoSlotIn,
   staticAtomId,
   structFieldTail,
@@ -609,6 +618,7 @@ function rhs(r: Rhs, tail: boolean) {
       fbEnd()
     }
     RListGet | RListLen | RListPush | RListPop | RListEq | RStrOp | RMapFilter | RListSlice => irLowerListHook(r)
+    RListClear => irLMiss("clear value")
     RNumWiden => {
       irLOpnd(r.nwV)
       numWidenTail(r.nwSrc, r.nwDst, r.nwAt, lw.irAt)
@@ -849,6 +859,20 @@ function boxField(r: RBoxField) {
   return 0
 }
 
+// `SSetField`: the record, the value, then legacy's struct-store tail (`fieldStoreTail`).
+function setField(n: SSetField, at: i32) {
+  const a = nodeAt(at)
+  if !(a is BinExpr) { return irLMiss("field store node") }
+  const lhs = unwrapParen(a.binLeft)
+  const arm = fieldStoreArmOf(lhs, lw.irAt)
+  const sf = if arm == "struct" { fieldStoreStructAt(lhs, lw.irAt) } else if arm == "variantParam" { fieldStoreVariantAt(lhs, lw.irAt) } else { [] }
+  if sf.length != 2 { return irLMiss("field store shape") }
+  irLOpnd(n.sfV)
+  irLOpnd(n.sfSrc)
+  if arm == "variantParam" { return fieldStoreVariantTail(sf[0], sf[1]) }
+  return fieldStoreTail(sf[0], sf[1], a.binLeft, a.binRight, lw.irAt)
+}
+
 // `RGetField`: the record, then legacy's field read and its recover, and the read's own recover,
 // as `emitExpr` writes a member read through `emitMemVariantRead` or `emitMemStructRead`.
 function getField(r: RGetField) {
@@ -1063,6 +1087,14 @@ function printOp(r: RPrint) {
     irLOpnd(r.pnV)
     return printNulStrTail()
   }
+  if arm == "union" {
+    // Legacy reads the plan and takes the stash slot before it writes the box.
+    const kinds: i32[] = []
+    printUnionPlan(c.callArgs[0], lw.irAt, kinds)
+    const slot = sharedFieldRecvSlot()
+    irLOpnd(r.pnV)
+    return printUnionTail(slot, kinds)
+  }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
   if arm == "atom" || arm == "nulAtom" {
@@ -1093,12 +1125,12 @@ function mapGetOr(r: RMapGetOr) {
   ) {
     return irLMiss("map read route")
   }
-  if userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
+  if r.mgSym >= 0 && userGlobalReadClass(r.mgSym, lwGlobalCtx) != "plain" {
     return irLMiss("map read of a global not read plainly")
   }
   if r.mgForm > 0 {
     const sh = mapRecvShapeOf(rd.idxArr, fnIx)
-    globalRead(r.mgSym, r.mgNonNull)
+    mapRecvRead(r.mgSym, r.mgNonNull, r.mgLoc)
     mapRecvRefTail(rd.idxArr, fnIx)
     irLOpnd(r.mgKey)
     mapRecvKeyTail(sh)
@@ -1109,7 +1141,7 @@ function mapGetOr(r: RMapGetOr) {
   }
   const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
-  globalRead(r.mgSym, r.mgNonNull)
+  mapRecvRead(r.mgSym, r.mgNonNull, r.mgLoc)
   mapRecvRefTail(rd.idxArr, fnIx)
   irLOpnd(r.mgKey)
   mapRecvKeyTail(mapRecvShapeOf(rd.idxArr, fnIx))
@@ -1117,14 +1149,20 @@ function mapGetOr(r: RMapGetOr) {
   return 0
 }
 
+// A map operation's receiver: global `sym` read as legacy reads it, or receiver operand `loc`.
+function mapRecvRead(sym: i32, nonNull: boolean, loc: Opnd) {
+  if sym >= 0 { return globalRead(sym, nonNull) }
+  return irLOpnd(loc)
+}
+
 // `RMapHas`: the global, its recovery, the key and the op context, then legacy's probe and hit flag.
 function mapHas(r: RMapHas) {
   const fnIx = lw.irAt
-  if userGlobalReadClass(r.mhSym, lwGlobalCtx) != "plain" {
+  if r.mhSym >= 0 && userGlobalReadClass(r.mhSym, lwGlobalCtx) != "plain" {
     return irLMiss("map has of a global not read plainly")
   }
   const sh = mapRecvShapeOf(r.mhRecv, fnIx)
-  globalRead(r.mhSym, r.mhNonNull)
+  mapRecvRead(r.mhSym, r.mhNonNull, r.mhLoc)
   mapRecvRefTail(r.mhRecv, fnIx)
   irLOpnd(r.mhKey)
   mapRecvKeyTail(sh)
@@ -1135,11 +1173,11 @@ function mapHas(r: RMapHas) {
 // store tail, as `emitMapSetV` writes them.
 function mapSet(r: RMapSet) {
   const fnIx = lw.irAt
-  if userGlobalReadClass(r.msSym, lwGlobalCtx) != "plain" {
+  if r.msSym >= 0 && userGlobalReadClass(r.msSym, lwGlobalCtx) != "plain" {
     return irLMiss("map set of a global not read plainly")
   }
   const sh = mapRecvShapeOf(r.msRecv, fnIx)
-  globalRead(r.msSym, r.msNonNull)
+  mapRecvRead(r.msSym, r.msNonNull, r.msLoc)
   mapRecvRefTail(r.msRecv, fnIx)
   irLOpnd(r.msKey)
   mapRecvKeyTail(sh)
@@ -1311,13 +1349,31 @@ export function irLSettle(pending: i32[]) {
 // The temp operand `o` names when its definition is an `RRetag`, or -1.
 function retagOf(o: Opnd): i32 {
   if !(o is OVar) || !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
-  return if tempRhs(o.ov) is RRetag { o.ov } else { -1 }
+  return if tempRhs(o.ov) is RRetag { o.ov } else { passBoxOf(o.ov) }
 }
 
-// The operand retag temp `t` holds.
+// Temp `t` when it holds a box passed as it stands, which writes nothing around its value, so a
+// call in it is a tail call too; else -1.
+function passBoxOf(t: i32): i32 {
+  const r = tempRhs(t)
+  if !(r is RToBox) { return -1 }
+  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, lw.irAt), lw.irAt)
+  return if p.hbArm == "pass" { t } else { -1 }
+}
+
+// The operand a pass box temp `t` holds.
+function passBoxOperand(t: i32): Opnd {
+  const r = tempRhs(t)
+  if r is RToBox { return r.bxV }
+  const none: Opnd = { ov: -1 }
+  return none
+}
+
+// The operand retag (or pass box) temp `t` holds.
 function retagOperand(t: i32): Opnd {
   const r = tempRhs(t)
   if r is RRetag { return r.rgV }
+  if passBoxOf(t) >= 0 { return passBoxOperand(t) }
   const none: Opnd = { ov: -1 }
   return none
 }
@@ -1480,7 +1536,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if !t && r.crDrop { fbDrop() }
         return 0
       }
-      if r is RListPush || r is RListPop || r is RStrOp {
+      if r is RListPush || r is RListPop || r is RListClear || r is RStrOp {
         irLowerEffectHook(r)
         irLSettle(pending)
         return 0
@@ -1552,7 +1608,11 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       irLowerListSetHook(n, lw.irNodeAt[id])
       irLSettle(pending)
     }
-    SSetField | SCellSet | SSwitch => irLMiss("statement outside I1")
+    SSetField => {
+      setField(n, lw.irNodeAt[id])
+      irLSettle(pending)
+    }
+    SCellSet | SSwitch => irLMiss("statement outside I1")
   }
 }
 
