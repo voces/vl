@@ -10858,13 +10858,13 @@ function emitSharedFieldArm(
   const refTag = if boxes && bk < 0 && !setStr { sharedFieldArmTag(vi, fi, rt) } else { -1 }
   const nulRef = refTag >= 0 && sharedFieldArmNullable(vi, fi)
   if refTag >= 0 && !nulRef {
-    fbI32Rel(RS_TAG, refTag)
+    sharedArmBoxHead(vi, fi, readIx, fnIx)
   } else if nulRef {
     // The tag is chosen once the ref is read: a null ref boxes under the null tag (D16170).
   } else if setStr {
     fbI32Rel(RS_TAG, scalarTagOfKind(2))
   } else if boxes {
-    fbI32Rel(RS_TAG, scalarTagOfKind(bk))
+    sharedArmBoxHead(vi, fi, readIx, fnIx)
   }
   if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
   sharedArmPayloadRead(vi, fi)
@@ -10903,11 +10903,57 @@ function emitSharedFieldArm(
     fbStructNew(uBoxIdx)
     return 0
   }
-  if boxes {
-    if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
-    fbStructNew(uBoxIdx)
-  }
+  if boxes { sharedArmBoxTail(bk) }
   return sharedArmStrRecover(code, vi, fi)
+}
+
+// The tag a boxing arm (`sharedArmIsBox`) of member `vi`'s field `fi` boxes under: a ref field's
+// own tag in read `readIx`'s union, else its scalar atom's.
+function sharedArmBoxTagOf(vi: i32, fi: i32, readIx: i32, fnIx: i32): i32 {
+  const bk = sharedFieldArmAtomKind(vi, fi)
+  const rt = if readIx >= 0 { nodeTyAt(readIx, fnIx) } else { -1 }
+  const refTag = if bk < 0 && !sharedFieldArmBoxesAtomSet(vi, fi) { sharedFieldArmTag(vi, fi, rt) } else { -1 }
+  return if refTag >= 0 { refTag } else { scalarTagOfKind(bk) }
+}
+
+// Before the receiver: a boxing arm's tag.
+export function sharedArmBoxHead(vi: i32, fi: i32, readIx: i32, fnIx: i32) {
+  return fbI32Rel(RS_TAG, sharedArmBoxTagOf(vi, fi, readIx, fnIx))
+}
+
+// After the payload read: a boxing arm's value box, where its atom has one, and the union box.
+export function sharedArmBoxTail(bk: i32) {
+  if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
+  return fbStructNew(uBoxIdx)
+}
+
+// Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as a box over the plain
+// read alone: a scalar atom or a non-null ref, no `null` member, no atom set, no conversion.
+export function sharedArmIsBox(
+  code: i32,
+  vi: i32,
+  fi: i32,
+  readIx: i32,
+  fnIx: i32,
+): boolean {
+  if vi < 0 || vi >= uVarRow.length || !sharedFieldReadBoxes(code, vi, fi) {
+    return false
+  }
+  if sharedFieldArmNull(vi, fi) || sharedFieldArmConverts(code, vi, fi) {
+    return false
+  }
+  const own = variantFieldTypeAt(vi, fi)
+  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
+    return false
+  }
+  if code == FC_STR && own == FC_NUL_LIT_UNION { return false }
+  const bk = sharedFieldArmAtomKind(vi, fi)
+  if bk >= 0 { return true }
+  if sharedFieldArmNulSet(vi, fi) || sharedFieldArmBoxesAtomSet(vi, fi) {
+    return false
+  }
+  const rt = if readIx >= 0 { nodeTyAt(readIx, fnIx) } else { -1 }
+  return sharedFieldArmTag(vi, fi, rt) >= 0 && !sharedFieldArmNullable(vi, fi)
 }
 
 // After the receiver box: its payload cast to member `vi`, read at field `fi`.
@@ -10927,7 +10973,7 @@ function sharedArmStrRecover(code: i32, vi: i32, fi: i32): i32 {
 
 // Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as the plain read alone:
 // no `null` member, no atom or string conversion, no box.
-function sharedArmIsPlain(code: i32, vi: i32, fi: i32): boolean {
+export function sharedArmIsPlain(code: i32, vi: i32, fi: i32): boolean {
   if vi < 0 || vi >= uVarRow.length || sharedFieldArmNull(vi, fi) {
     return false
   }
@@ -10970,6 +11016,54 @@ export function sharedReadPlanOf(
   return if code >= 0 && sharedFieldPlanDispatchable(code, vis, fis) { code } else { -1 }
 }
 
+// The tail after read `memIx`'s dispatch of plan `code`: the atom kind it unboxes to (a read the
+// checker typed as one atom, of a plan that boxes or whose every arm stores the box), the narrow
+// unbox (`SRT_NARROW`), the `string | null` recover (`SRT_NULSTR`), or nothing (`SRT_NONE`).
+export function sharedReadTailOf(
+  code: i32,
+  vis: i32[],
+  fis: i32[],
+  memIx: i32,
+  fnIx: i32,
+): i32 {
+  if code == FC_UNION {
+    const k = pathReadAtomKind(memIx, fnIx)
+    if k >= 0 { return k }
+  }
+  if sharedFieldAnyArmBoxes(code, vis, fis) {
+    const ak = memReadCheckerAtomKind(memIx, fnIx)
+    if ak >= 0 { return ak }
+    return if unionFieldNarrowUnboxOf(memIx, fnIx) == "none" { SRT_NONE } else { SRT_NARROW }
+  }
+  if code == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx) { return SRT_NULSTR }
+  return SRT_NONE
+}
+
+export const SRT_NONE = -1
+export const SRT_NULSTR = -2
+export const SRT_NARROW = -3
+
+// After the dispatch: the tail `sharedReadTailOf` names, leaf bytes of `memIx` alone.
+export function sharedReadTail(
+  code: i32,
+  vis: i32[],
+  fis: i32[],
+  memIx: i32,
+  fnIx: i32,
+): i32 {
+  const t = sharedReadTailOf(code, vis, fis, memIx, fnIx)
+  if t >= 0 { return emitUnionUnboxTail(t) }
+  if t == SRT_NARROW { return emitUnionFieldNarrowUnbox(memIx, fnIx) }
+  if t == SRT_NULSTR { fbRefAsNonNull() }
+  return 0
+}
+
+// After the receiver box: a boxing arm's payload read and its box.
+export function sharedArmBoxBody(vi: i32, fi: i32) {
+  sharedArmPayloadRead(vi, fi)
+  return sharedArmBoxTail(sharedFieldArmAtomKind(vi, fi))
+}
+
 // Whether `emitMemSharedRead` evaluates read `memIx`'s receiver once into its stash slot: anything
 // but an ident, whose `local.get` re-emits per arm for nothing.
 export function sharedReadStashes(memIx: i32): boolean {
@@ -10979,8 +11073,8 @@ export function sharedReadStashes(memIx: i32): boolean {
   return !(r >= 0 && r < P.nodes.length && nodeAt(r) is Ident)
 }
 
-// Whether `emitMemSharedRead` writes read `memIx` as its plain dispatch: every arm plain, and no
-// unbox or recover after the dispatch; the receiver re-read per arm or stashed.
+// Whether `emitMemSharedRead` writes read `memIx` as the dispatch the IR writes: every arm the plain
+// read or its box, the receiver re-read per arm or stashed, then `sharedReadTail`.
 export function sharedReadPlainOf(memIx: i32, fnIx: i32): boolean {
   if memReadArmOf(memIx, fnIx) != "shared" { return false }
   const vis: i32[] = []
@@ -10989,11 +11083,15 @@ export function sharedReadPlainOf(memIx: i32, fnIx: i32): boolean {
   if code < 0 || vis.length < 1 || fis.length != vis.length { return false }
   let i = 0
   while i < vis.length {
-    if !sharedArmIsPlain(code, vis[i], fis[i]) { return false }
+    if (
+      !sharedArmIsPlain(code, vis[i], fis[i])
+      && !sharedArmIsBox(code, vis[i], fis[i], memIx, fnIx)
+    ) {
+      return false
+    }
     i = i + 1
   }
-  if code == FC_UNION && pathReadAtomKind(memIx, fnIx) >= 0 { return false }
-  return !(code == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx))
+  return true
 }
 
 // A string literal set stored at the atom (`own`, `FC_I32` or its `-1` niche) read as the
@@ -11275,41 +11373,43 @@ export function sharedRecvSlotGet(slot: i32) {
 // `struct.get` produced the box — the plain struct table, the arm's `variantHeap` row, or the
 // nullable form of the same — but the unbox after it is one sequence.
 
-// The atom is the checker's type for the read (`memNarrowAtomKind`): a litunion-alias narrow
-// unboxes as the string ref the box stores its member as, which is the ident read discipline.
-// A read typed as the field's declared type narrows nothing and yields the box unchanged.
-function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
-  // The CONTAINER arms of the same narrowing (`if n.v is K[]`, `if n.v is {[string]: K}`) —
-  // disjoint from the value atom below, which answers "" for both (D1014).
-  const mCon = emitPlaceNarrowContainerUnbox(memIx, fnIx)
-  if mCon != 0 { return mCon - 1 }
-  const mAtom = memNarrowAtomKind(memIx, fnIx)
-  if mAtom < 0 {
-    // D209 — the un-narrowed read the checker typed as a bare atom. The box is the adoption's
-    // rep, not the program's: `structIndexOfObjCtx` takes a declared row for an un-annotated
-    // literal, so the field is code 16 while the checker never widened the value. Deliver the
-    // atom the checker's consumers are typed against; `exprUnion` asks this same predicate.
+// What `emitUnionFieldNarrowUnbox` writes for read `memIx`: a container narrow's cast,
+// the checker-typed atom's unbox (a litunion-alias narrow unboxes as the stored string ref), the
+// unbox to the atom an un-narrowed read is typed as (D209), or nothing (the box unchanged).
+export type NarrowUnboxArm = "container" | "atom" | "unbox" | "none"
 
-    // The payload is not always at that atom: a declared `i64 | null` member makes the store
-    // widen `7` into `$vbI64` while the checker still types the read `i32`, so cast to what the
-    // store put there and narrow back. A `??`-merged box genuinely holds two, so no single cast
-    // is right — dispatch on the tag the box carries, only where every arm reaches it.
-    const ck = memReadUnboxAtomKind(memIx, fnIx)
-    if ck < 0 { return 0 }
-    const bk = memReadBoxedAtomKind(memIx, fnIx)
-    const bks: i32[] = []
-    if memReadBoxedAtomKinds(memIx, fnIx, bks) {
-      if bks.length > 1 && atomKindsAllConvertible(bks, ck) {
-        return emitUnionFieldTagDispatch(bks, ck)
-      }
-    }
-    if emitUnionUnboxTail(bk) < 0 { return -1 }
-    return emitNarrowStoredAtomKind(bk, ck)
+export function unionFieldNarrowUnboxOf(memIx: i32, fnIx: i32): NarrowUnboxArm {
+  const con = placeReadContainerAt(memIx, fnIx)
+  if con == RC_REF_LIST || con == RC_MAP { return "container" }
+  if memNarrowAtomKind(memIx, fnIx) >= 0 { return "atom" }
+  return if memReadUnboxAtomKind(memIx, fnIx) >= 0 { "unbox" } else { "none" }
+}
+
+function emitUnionFieldNarrowUnbox(memIx: i32, fnIx: i32) {
+  return match unionFieldNarrowUnboxOf(memIx, fnIx) {
+    "container" => emitPlaceNarrowContainerUnbox(memIx, fnIx) - 1
+    // The narrowed atom's ABI code decides both arms, as at the variant-field twin of this read
+    // (`emitNarrowedMem`).
+    "atom" => emitUnionUnboxTail(memNarrowAtomKind(memIx, fnIx))
+    "unbox" => emitUnionFieldStoredUnbox(memIx, fnIx)
+    "none" => 0
   }
-  // The narrowed atom's ABI code decides both arms, exactly as it does at the variant-field twin
-  // of this read (`emitNarrowedMem`, the same three instructions and the same two arms) — one
-  // derivation, not a spelling compare beside a second `vbHeapIdxOfKind`.
-  return emitUnionUnboxTail(mAtom)
+}
+
+// The un-narrowed read the checker typed as a bare atom, its payload cast to what the store put
+// there and narrowed back (a declared `i64 | null` member widens `7` into `$vbI64`); a `??`-merged
+// box holding two dispatches on its tag, only where every arm reaches the read's atom.
+function emitUnionFieldStoredUnbox(memIx: i32, fnIx: i32) {
+  const ck = memReadUnboxAtomKind(memIx, fnIx)
+  const bk = memReadBoxedAtomKind(memIx, fnIx)
+  const bks: i32[] = []
+  if memReadBoxedAtomKinds(memIx, fnIx, bks) {
+    if bks.length > 1 && atomKindsAllConvertible(bks, ck) {
+      return emitUnionFieldTagDispatch(bks, ck)
+    }
+  }
+  if emitUnionUnboxTail(bk) < 0 { return -1 }
+  return emitNarrowStoredAtomKind(bk, ck)
 }
 
 // D927 — the tag-dispatched unbox: one arm per atom the box can hold, each converted to the
@@ -11586,23 +11686,7 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
         fbEnd()
         se = se + 1
       }
-      // A plan that boxes, or whose every arm stores the box, delivers a box whatever the
-      // receiver's arms declare, so a read the checker typed as one atom unboxes to it.
-      if shCode == FC_UNION {
-        const shK = pathReadAtomKind(memIx, fnIx)
-        if shK >= 0 { return emitUnionUnboxTail(shK) }
-      }
-      if sharedFieldAnyArmBoxes(shCode, shVis, shFis) {
-        const shAk = memReadCheckerAtomKind(memIx, fnIx)
-        if shAk >= 0 { return emitUnionUnboxTail(shAk) }
-        return emitUnionFieldNarrowUnbox(memIx, fnIx)
-      }
-      // A `string | null` read the checker typed past `null` recovers the non-null ref, as one
-      // record's read does (`emitNulStrFieldRecover`).
-      if shCode == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx) {
-        fbRefAsNonNull()
-      }
-      return 0
+      return sharedReadTail(shCode, shVis, shFis, memIx, fnIx)
     }
   }
   return emitMemStructRead(memIx, fnIx)
@@ -25517,6 +25601,18 @@ export function strFromBytesCallNamed(c: Call, fnIx: i32): boolean {
   return !identNameIsUserBound(c.callFn, fnIx)
 }
 
+// Whether call `c` is the `__array_new__` / `__array_new_default__` intrinsic: the spelling,
+// with no binding owning the name. Legacy's `emitCallCore` and the IR's builder route on it.
+export function arrNewCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return false }
+  if f.identName != "__array_new__" && f.identName != "__array_new_default__" {
+    return false
+  }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
 // The `fromCodePoints(xs)` arm of `emitCallCore`: the list read twice by name, or once through
 // the spill slot. Returns 0 once the string is on the stack, -1 on failure.
 function emitCallCoreFromCodePoints(callIx: i32, c: Call, fnIx: i32) {
@@ -26245,13 +26341,7 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both yield the
   // `{backing, len: n, cap: n}` list wrapper, staging the length in the 1-slot arrNew
   // scratch local. Native element coverage: i32 (i32/boolean) and, for `__array_new__`, f64.
-  if (
-    !userBindsName
-    && (callee.identName == "__array_new__"
-      || callee.identName == "__array_new_default__")
-  ) {
-    return emitArrayNewIntr(callIx, fnIx)
-  }
+  if arrNewCallNamed(c, fnIx) { return emitArrayNewIntr(callIx, fnIx) }
   // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the two
   // lists' backings (memmove semantics; OOB spans trap via the instruction's own
   // check). Operand order matches the instruction's stack shape, so no scratch is needed.
@@ -39947,98 +40037,14 @@ function emitArrayNewIntr(callIx: i32, fnIx: i32) {
             + " reached with the wrong argument count — the checker's arity rule refuses it",
         )
       }
-      let anBack = -1
-      let anWrap = -1
-      const ank = arrNewIntrKind(callIx, fnIx)
-      match ank {
-        "f64list" => {
-          anBack = fa64Ty()
-          anWrap = fl64Ty()
-        }
-        "i64list" => {
-          // D963 — I64 fill → the i64 list pair.
-          anBack = ia64Ty()
-          anWrap = il64Ty()
-        }
-        "u8list" => {
-          // D1470 — the PACKED byte list. Reachable only from `__array_new_default__`
-          // (`arrNewDefaultKind`): `array.new_default` zeroes an `i8` slot exactly as it
-          // zeroes an `i32` one, so the destination's own pair is all this needs.
-          anBack = pkBackAt(exprPackedRow(callIx, fnIx))
-          anWrap = pkWrapAt(exprPackedRow(callIx, fnIx))
-        }
-        "f32list" => {
-          // D1470 — the f32 list, from `__array_new_default__`'s destination or, since D1673,
-          // from an f32 FILL. A float literal fill is not one: it types f64, and the checker
-          // refuses it against an `f32[]` destination before the emitter sees it.
-          anBack = fa32Ty()
-          anWrap = fl32Ty()
-        }
-        "v128list" => {
-          anBack = fa128Ty()
-          anWrap = fl128Ty()
-        }
-        "strlist" => {
-          // STRING fill → the string list (`array.new` of the shared string-ref
-          // backing; a non-null string ref stores into the nullable slot directly).
-          anBack = mkArrTy()
-          anWrap = mkListTy()
-        }
-        "reflist" => {
-          // STRUCT fill → the ref list of the element struct (its interned slot).
-          if !rlRowsMinted() {
-            return emitFail(
-              "emitProgram: __array_new__ struct fill but ref list types not collected",
-            )
-          }
-          // The STRICT slot: this arm picks the list's backing and wrapper heap types, so an
-          // unresolved element must refuse, not clamp. Slot 0 is a real row, and clamping to
-          // it built the module at whichever element interned first (D1605).
-          const anSlot = refListSlotOfExprStrict(callIx, fnIx)
-          const anBad = anSlot >= rlWrapIdx.length || anSlot >= rlBackIdx.length
-          if anSlot < 0 || anBad {
-            return emitFail(
-              "emitProgram: __array_new__ fill type not yet supported natively",
-            )
-          }
-          anBack = rlBackIdx[anSlot]
-          anWrap = rlWrapIdx[anSlot]
-        }
-        "list" | "none" => {
-          anWrap = lTy()
-          anBack = aTy()
-          if anIsNew {
-            const anFillObj = nodeAt(c.callArgs[1]) is ObjLit
-            if (
-              arrNewI32FillRefusal(callIx, c.callArgs[1], anFillObj, fnIx)
-              < 0
-            ) {
-              return -1
-            }
-          }
-        }
-      }
+      const fill = if anIsNew { c.callArgs[1] } else { -1 }
+      const pl = arrNewPlanOf(callIx, fill, fnIx)
+      if pl.anWhy != "" { return emitFail(pl.anWhy) }
       if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      // The length is re-read after the fill runs, so a site inside another site's fill takes
-      // a slot of its own depth; the outermost keeps the frame's one slot (D2333).
-      let anLenL = arrNewScratchBase
-      if arrNewFillDepth > 0 {
-        anLenL = widenTmpSlot(0 - 1000 - arrNewFillDepth)
-      }
-      fbLocalSet(anLenL)
-      if anIsNew {
-        const anFillRc = emitArrNewFillAt(callIx, c.callArgs[1], fnIx)
-        if anFillRc < 0 { return -1 }
-        fbLocalGet(anLenL)
-        fbArrayNew(anBack)
-      } else {
-        fbLocalGet(anLenL)
-        fbArrayNewDefault(anBack)
-      }
-      fbLocalGet(anLenL)
-      fbLocalGet(anLenL)
-      fbStructNew(anWrap)
-      return 0
+      const anLenL = arrNewLenStash()
+      if !anIsNew { return arrNewDefaultTail(pl, anLenL) }
+      if emitArrNewFillAt(callIx, fill, fnIx) < 0 { return -1 }
+      return arrNewTail(pl, anLenL)
     }
   }
   return emitFail(
@@ -40046,29 +40052,131 @@ function emitArrayNewIntr(callIx: i32, fnIx: i32) {
   )
 }
 
+// The list an `__array_new__` site (fill `fill`) or `__array_new_default__` site (`fill` -1) at
+// `callIx` builds: its backing and wrapper heap types, or the refusal `anWhy` legacy records.
+export type ArrNewPlan = { anBack: i32, anWrap: i32, anWhy: string }
+
+function arrNewRefused(why: string): ArrNewPlan {
+  return { anBack: -1, anWrap: -1, anWhy: why }
+}
+
+export function arrNewPlanOf(callIx: i32, fill: i32, fnIx: i32): ArrNewPlan {
+  let anBack = -1
+  let anWrap = -1
+  const ank = arrNewIntrKind(callIx, fnIx)
+  match ank {
+    "f64list" => {
+      anBack = fa64Ty()
+      anWrap = fl64Ty()
+    }
+    "i64list" => {
+      // D963 — I64 fill → the i64 list pair.
+      anBack = ia64Ty()
+      anWrap = il64Ty()
+    }
+    "u8list" => {
+      // D1470 — the PACKED byte list. Reachable only from `__array_new_default__`
+      // (`arrNewDefaultKind`): `array.new_default` zeroes an `i8` slot exactly as it
+      // zeroes an `i32` one, so the destination's own pair is all this needs.
+      anBack = pkBackAt(exprPackedRow(callIx, fnIx))
+      anWrap = pkWrapAt(exprPackedRow(callIx, fnIx))
+    }
+    "f32list" => {
+      // D1470 — the f32 list, from `__array_new_default__`'s destination or, since D1673,
+      // from an f32 FILL. A float literal fill is not one: it types f64, and the checker
+      // refuses it against an `f32[]` destination before the emitter sees it.
+      anBack = fa32Ty()
+      anWrap = fl32Ty()
+    }
+    "v128list" => {
+      anBack = fa128Ty()
+      anWrap = fl128Ty()
+    }
+    "strlist" => {
+      // STRING fill → the string list (`array.new` of the shared string-ref
+      // backing; a non-null string ref stores into the nullable slot directly).
+      anBack = mkArrTy()
+      anWrap = mkListTy()
+    }
+    "reflist" => {
+      // STRUCT fill → the ref list of the element struct (its interned slot).
+      if !rlRowsMinted() {
+        return arrNewRefused(
+          "emitProgram: __array_new__ struct fill but ref list types not collected",
+        )
+      }
+      // The STRICT slot: this arm picks the list's backing and wrapper heap types, so an
+      // unresolved element must refuse, not clamp. Slot 0 is a real row, and clamping to
+      // it built the module at whichever element interned first (D1605).
+      const anSlot = refListSlotOfExprStrict(callIx, fnIx)
+      const anBad = anSlot >= rlWrapIdx.length || anSlot >= rlBackIdx.length
+      if anSlot < 0 || anBad {
+        return arrNewRefused(
+          "emitProgram: __array_new__ fill type not yet supported natively",
+        )
+      }
+      anBack = rlBackIdx[anSlot]
+      anWrap = rlWrapIdx[anSlot]
+    }
+    "list" | "none" => {
+      anWrap = lTy()
+      anBack = aTy()
+      if fill >= 0 {
+        const why = arrNewI32FillWhy(callIx, fill, nodeAt(fill) is ObjLit, fnIx)
+        if why != "" { return arrNewRefused(why) }
+      }
+    }
+  }
+  return { anBack: anBack, anWrap: anWrap, anWhy: "" }
+}
+
+// After an array-intrinsic site's length: the length stashed in the site's scratch slot, which a
+// site inside another site's fill takes one of its own depth for (D2333). Returns the slot.
+export function arrNewLenStash(): i32 {
+  let slot = arrNewScratchBase
+  if arrNewFillDepth > 0 { slot = widenTmpSlot(0 - 1000 - arrNewFillDepth) }
+  fbLocalSet(slot)
+  return slot
+}
+
+// After an `__array_new__` site's fill: the backing filled at the stashed length, then the
+// `{backing, len, cap}` wrapper. Returns 0.
+export function arrNewTail(pl: ArrNewPlan, slot: i32): i32 {
+  fbLocalGet(slot)
+  fbArrayNew(pl.anBack)
+  return arrNewWrap(pl, slot)
+}
+
+// After an `__array_new_default__` site's stash: the zeroed backing, then the wrapper. Returns 0.
+function arrNewDefaultTail(pl: ArrNewPlan, slot: i32): i32 {
+  fbLocalGet(slot)
+  fbArrayNewDefault(pl.anBack)
+  return arrNewWrap(pl, slot)
+}
+
+function arrNewWrap(pl: ArrNewPlan, slot: i32): i32 {
+  fbLocalGet(slot)
+  fbLocalGet(slot)
+  fbStructNew(pl.anWrap)
+  return 0
+}
+
 // How many `__array_new__` fills enclose the site being lowered (D2333).
 let arrNewFillDepth = 0
 
 // The i32 list's fill guard for call `callIx` with fill `fill` (`fillIsObj` when it is an object
-// literal): returns -1 after recording the refusal when nothing named the element rep, or the
-// fill is a ref value, else 0.
-function arrNewI32FillRefusal(
+// literal): the refusal when nothing named the element rep or the fill is a ref value, else "".
+function arrNewI32FillWhy(
   callIx: i32,
   fill: i32,
   fillIsObj: boolean,
   fnIx: i32,
-): i32 {
-  // The i32 list is this arm's answer for an i32 or boolean fill and also
-  // `arrNewIntrKind`'s fall-through. Where nothing named the kind — not the fill, not
-  // the destination, not an instance's parameter annotation — the list is a guess,
-  // and a guess about the fill's rep is silent invalid wasm (D1630).
+): string {
+  // The i32 list is also `arrNewIntrKind`'s fall-through: where nothing named the kind, the
+  // list is a guess, and a guess about the fill's rep is invalid wasm (D1630).
   if !arrNewKindNamed(callIx, fnIx) {
-    return emitFail(
-      "emitProgram: __array_new__ fill names no element rep, and its destination names none either",
-    )
+    return "emitProgram: __array_new__ fill names no element rep, and its destination names none either"
   }
-  // The i64 and f32 guards that sat here are gone (D1673): both pairs are interned,
-  // so those fills take kinds 4 and 6 above and never reach this fall-through.
   let anFillRef = false
   if fillIsObj { anFillRef = true }
   if exprIsClosure(fill, fnIx) { anFillRef = true }
@@ -40077,37 +40185,45 @@ function arrNewI32FillRefusal(
   if exprStringArray(fill, fnIx) { anFillRef = true }
   if exprMap(fill, fnIx) { anFillRef = true }
   if anFillRef {
-    // Remaining ref-fill long tail: closures / nested arrays / maps.
-    return emitFail(
-      "emitProgram: __array_new__ fill type not yet supported natively",
-    )
+    return "emitProgram: __array_new__ fill type not yet supported natively"
   }
-  return 0
+  return ""
 }
 
-// The fill `fill` of an `__array_new__` site, at one fill depth deeper: a site inside another
-// site's fill takes a length slot of its own.
+// Enters (`d` 1) or leaves (`d` -1) an `__array_new__` site's fill: a site inside another site's
+// fill takes a length slot of its own.
+export function arrNewFillStep(d: i32) { arrNewFillDepth = arrNewFillDepth + d }
+
+// The fill `fill` of an `__array_new__` site, at one fill depth deeper.
 function emitArrNewFill(fill: i32, fnIx: i32): i32 {
-  arrNewFillDepth = arrNewFillDepth + 1
+  arrNewFillStep(1)
   const anFillRc = emitExpr(fill, fnIx)
-  arrNewFillDepth = arrNewFillDepth - 1
+  arrNewFillStep(-1)
   if anFillRc < 0 { return -1 }
   return 0
 }
 
-// `emitArrNewFill` for the `__array_new__` call `callIx`: a fill the checker built at a union
-// element of its destination is boxed into that element (D16887).
-function emitArrNewFillAt(callIx: i32, fill: i32, fnIx: i32): i32 {
+// The union element of its destination that `__array_new__` call `callIx` boxes its fill `fill`
+// into (D16887), or -1 where the fill goes in as it stands.
+export function arrNewFillBoxTy(callIx: i32, fill: i32, fnIx: i32): i32 {
   const lt = nodeTyAt(callIx, fnIx)
   const lty = if lt >= 0 && lt < T.tys.length { tyAt(lt) } else { null }
   const et = if lty is TyArray { tyElemOf(lty) } else { -1 }
   const nm = if et >= 0 { boxTyName(et) } else { "" }
   if nm == "" || exprUnion(fill, fnIx) || repOfTy(et).rdKind != "union" {
-    return emitArrNewFill(fill, fnIx)
+    return -1
   }
-  arrNewFillDepth = arrNewFillDepth + 1
-  const rc = emitUnionBoxArg(nm, et, fill, fnIx)
-  arrNewFillDepth = arrNewFillDepth - 1
+  return et
+}
+
+// `emitArrNewFill` for the `__array_new__` call `callIx`, boxing the fill where
+// `arrNewFillBoxTy` names an element.
+function emitArrNewFillAt(callIx: i32, fill: i32, fnIx: i32): i32 {
+  const et = arrNewFillBoxTy(callIx, fill, fnIx)
+  if et < 0 { return emitArrNewFill(fill, fnIx) }
+  arrNewFillStep(1)
+  const rc = emitUnionBoxArg(boxTyName(et), et, fill, fnIx)
+  arrNewFillStep(-1)
   return if rc < 0 { -1 } else { 0 }
 }
 
