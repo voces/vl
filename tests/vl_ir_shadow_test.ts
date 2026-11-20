@@ -1050,7 +1050,6 @@ print(intr(true, 0.5))
       ["uncovered store short-circuit operand", 2],
       ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
-      ["start uncovered map store short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
       if (rows.get(k) !== n) throw new Error(`want ${n} "${k}" rows, got ${JSON.stringify([...rows])}`);
@@ -1060,6 +1059,8 @@ print(intr(true, 0.5))
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
     if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    // The start's map store stages its global receiver and key below the value's `if`.
+    if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
