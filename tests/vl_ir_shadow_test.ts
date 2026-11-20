@@ -2431,3 +2431,55 @@ print(sumA(us))
     }
   },
 });
+
+// A walk over a variant's records, nullable strings or records, or f64 or i64 scalars binds each
+// element through legacy's own bind: covered and matched.
+Deno.test({
+  name: "ir shadow: variant, nullable and wide scalar walks are covered and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type C = { r: i32 }
+type Q = { s: i32 }
+type Sh = C | Q
+type P = { x: i32 }
+function sumR(cs: C[]): i32 {
+  let t = 0
+  for c in cs { t = t + c.r }
+  return t
+}
+function nonNull(xs: (string | null)[]): i32 {
+  let n = 0
+  for x in xs { if x != null { n = n + 1 } }
+  return n
+}
+function nulRec(ps: (P | null)[]): i32 {
+  let n = 0
+  for p in ps { if p != null { n = n + p.x } }
+  return n
+}
+function sumF(fs: f64[]): f64 {
+  let t = 0.0
+  for f in fs { t = t + f }
+  return t
+}
+function sumL(ls: i64[]): i64 {
+  let t: i64 = 0
+  for l in ls { t = t + l }
+  return t
+}
+function isC(s: Sh): boolean { return s is C }
+print(sumR([{ r: 1 }, { r: 2 }]))
+print(nonNull(["a", null, "b"]))
+print(nulRec([{ x: 4 }, null]))
+print(sumF([1.5, 2.0]))
+print(sumL([3, 4]))
+print(isC({ s: 1 }))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want all six covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
