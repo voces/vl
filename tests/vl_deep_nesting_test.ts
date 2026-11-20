@@ -184,3 +184,32 @@ for (const [name, pick] of SHAPES) {
     }
   });
 }
+
+// The labelled-loop shape's stack margin. The editor half re-runs that case in a child `deno`
+// under a V8 stack of MARGIN_KB, about 5% below the default 984 KB; at 600 levels it passes at 900
+// and fails at 875 on linux x86_64. A change that deepens the compiler's per-level recursion then
+// fails here, not at V8's edge on one runner. Frame sizes differ elsewhere, so linux only.
+const MARGIN_KB = 940;
+Deno.test({
+  name: "deep nesting (V8): the labelled-loop case keeps its stack margin",
+  ignore: !HAVE_SEED || Deno.build.os !== "linux" || Deno.env.get("VL_DEEP_MARGIN_INNER") === "1",
+}, async () => {
+  const out = await new Deno.Command(Deno.execPath(), {
+    args: [
+      "test",
+      "-A",
+      "--no-check",
+      `--v8-flags=--stack-size=${MARGIN_KB}`,
+      new URL(import.meta.url).pathname,
+      "--filter",
+      "labelled while loop, checks",
+    ],
+    env: { VL_DEEP_MARGIN_INNER: "1" },
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const text = new TextDecoder().decode(out.stdout) + new TextDecoder().decode(out.stderr);
+  if (out.code !== 0 || !text.includes("1 passed")) {
+    throw new Error(`want the labelled-loop case to pass under a ${MARGIN_KB} KB stack, got exit ${out.code}\n${text.slice(-800)}`);
+  }
+});

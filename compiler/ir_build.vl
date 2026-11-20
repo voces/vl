@@ -173,8 +173,12 @@ import {
   objLitArmOf,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
+  objLitStashRowAt,
+  objLitStashRowOf,
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
+  objLitVariantStashAt,
+  objLitVariantStashOf,
   popAnyPlanOf,
   popOrPlanOf,
   printArmOf,
@@ -347,7 +351,12 @@ import {
 } from "./emit_fn_ret_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
-import { charLitCp, objFieldVal, unwrapParen } from "./emit_base"
+import {
+  charLitCp,
+  objFieldSrcOrder,
+  objFieldVal,
+  unwrapParen,
+} from "./emit_base"
 import { ifArmValueExpr, paramIndexOf } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
 import {
@@ -582,6 +591,17 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
 }
 
+// `0, 1, ..., n - 1`.
+function iotaOf(n: i32): i32[] {
+  const out: i32[] = []
+  let i = 0
+  while i < n {
+    out.push(i)
+    i = i + 1
+  }
+  return out
+}
+
 // An object literal on a layout path legacy builds it by alone (`objLitArmOf`: a struct's
 // `objLitLayoutRowOf`, a variant's `objLitVariantLayoutOf`): each field in layout order at its
 // `plain` arm, owing no recovery, kept at its kid of the record rep, then the row's `struct.new`.
@@ -610,7 +630,10 @@ function objLitAt(
 ): Opnd {
   const arm: ObjLitArm = if at < 0 { objLitArmOf(ix, ibFnIx) } else if variant { "variant" } else { "struct" }
   if arm == "unionBox" { return irBMiss("object " + arm) }
-  const row = if at >= 0 && variant { objLitVariantLayoutAt(ix, at) } else if at >= 0 { objLitLayoutRowAt(ix, at) } else if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
+  const plainRow = if at >= 0 && variant { objLitVariantLayoutAt(ix, at) } else if at >= 0 { objLitLayoutRowAt(ix, at) } else if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
+  // Else legacy's order stash: each field in source order into a scratch local, then the layout.
+  const stashRow = if plainRow >= 0 { -1 } else if at >= 0 && variant { objLitVariantStashAt(ix, at) } else if at >= 0 { objLitStashRowAt(ix, at) } else if arm == "struct" { objLitStashRowOf(ix, ibFnIx) } else { objLitVariantStashOf(ix, ibFnIx) }
+  const row = if plainRow >= 0 { plainRow } else { stashRow }
   if row < 0 { return irBMiss("object layout") }
   const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
   const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
@@ -621,10 +644,18 @@ function objLitAt(
   if ks.length != cnt { return irBMiss("object field count") }
   const fields: Opnd[] = []
   const layout: i32[] = []
+  const src: i32[] = []
   const none: Opnd = { ov: -1 }
-  for _k in ks { fields.push(none) }
-  let fi = 0
-  while fi < cnt {
+  for _k in ks {
+    fields.push(none)
+    layout.push(-1)
+  }
+  const order = if stashRow >= 0 { objFieldSrcOrder(ix, sFieldNames, start, cnt) } else { iotaOf(cnt) }
+  if order.length != cnt { return irBMiss("object stash order") }
+  let oi = 0
+  while oi < cnt {
+    const fi = order[oi]
+    if fi < 0 || fi >= cnt { return irBMiss("object stash order") }
     const name = sFieldNames[start + fi]
     const k = repRecordKidOf(rep, ty, name)
     if k < 0 || k >= ks.length { return irBMiss("object field kid") }
@@ -635,16 +666,18 @@ function objLitAt(
     const v = deliver(b, valIx, ks[k])
     if ibMiss != "" { return v }
     if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
-    if fi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
+    if oi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
       return v
     }
     fields[k] = v
-    layout.push(k)
-    fi = fi + 1
+    layout[fi] = k
+    if stashRow >= 0 { src.push(k) }
+    oi = oi + 1
   }
   const rhs: Rhs = {
     mrFields: fields,
     mrLayout: layout,
+    mrSrc: src,
     mrAt: ix,
     mrRow: at,
     mrVariant: variant,
@@ -3568,14 +3601,12 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
   if nodeAt(unwrapParen(n.binRight)) is IfStmt {
     return skip("if into an element store")
   }
-  const x = deliver(b, n.binRight, ln.rlsElem)
+  // A packed list's element is stored as a plain i32, which its backing truncates.
+  const er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  const x = deliver(b, n.binRight, er)
   if ibMiss != "" { return 0 }
   if ifBelowLead(b, at, "store short-circuit operand") { return 0 }
-  if (
-    !(ln is RList)
-    || repPrim(irBOpRep(i)) != "i32"
-    || irBOpRep(x) != ln.rlsElem
-  ) {
+  if repPrim(irBOpRep(i)) != "i32" || irBOpRep(x) != er {
     return skip("store operand coercion")
   }
   irBNode(b, { bcV: v, bcIx: i }, -1, ibNoValue, ix)
