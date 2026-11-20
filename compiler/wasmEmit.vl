@@ -1697,6 +1697,7 @@ import {
   exprRecordArmsTy,
   exprTyIsRecord,
   fnCloCoerceAtNode,
+  ifJoinsAtRecord,
   instTyOrSelf,
   listCopyAtNode,
   narrowedArmNeedsUnbox,
@@ -21662,10 +21663,12 @@ function ifArmNoValueFail(what: string, blockIx: i32) {
 }
 
 // How one arm of a ref-typed join at `kind`/`slot` delivers its value: `plain` is the value as
-// itself, `recover` the same under `ref.as_non_null`, `nestedIf` an `if` value joined at this
-// rep; `null`, `atomStr` and `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
+// itself, `recover` the same under `ref.as_non_null`, `unbox` a narrowed arm's box recovered at
+// the join's heap, `nestedIf` an `if` value joined at this rep; `null`, `atomStr` and
+// `recordCopy` (refused) are written by legacy alone; `noValue` refuses.
 export type RefIfArm = "plain"
   | "recover"
+  | "unbox"
   | "null"
   | "atomStr"
   | "recordCopy"
@@ -21691,6 +21694,16 @@ export function refIfArmOf(
     }
     if kind == "str" && exprIsLitAtom(tv, fnIx) { return "atomStr" }
     if !nulJoin && nulNicheRecoverOwed(kind, tv, fnIx) { return "recover" }
+    // A narrowed read of a union still holds the box, which a record join's arm unboxes (D17026).
+    const heap = armDestHeapOf(kind, slot)
+    if (
+      heap >= 0
+      && heap != uBoxIdx
+      && narrowedArmNeedsUnbox(tv, fnIx)
+      && armUnboxCastOwed(heap, tv, fnIx)
+    ) {
+      return "unbox"
+    }
     return "plain"
   }
   const inner = unwrapParen(tv)
@@ -21728,7 +21741,7 @@ function emitRefIfArm(
       if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
       return emitIfArmClose(emitIfExprRef(unwrapParen(tv), fnIx, kind, slot))
     }
-    "null" | "atomStr" | "recover" | "plain" | "recordCopy" => {}
+    "null" | "atomStr" | "recover" | "unbox" | "plain" | "recordCopy" => {}
   }
   if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
   // A record joined into a wider record would need a converting copy (D2100).
@@ -21744,6 +21757,9 @@ function emitRefIfArm(
   if arm == "null" { return emitIfArmClose(fbRefNullOfKind(kind, slot)) }
   // An atom arm in a `string` join widens to its member string.
   if arm == "atomStr" { return emitIfArmClose(emitAtomToStr(tv, fnIx)) }
+  if arm == "unbox" {
+    return emitIfArmClose(emitArmDelivery(tv, fnIx, armDestHeapOf(kind, slot)))
+  }
   const rcV = emitExpr(tv, fnIx)
   if rcV >= 0 && arm == "recover" { fbRefAsNonNull() }
   return emitIfArmClose(rcV)
@@ -32301,9 +32317,11 @@ function emitLetDeclStmt(s: LetDecl, stmtIx: i32, fnIx: i32) {
   // Asked before the init emits, about the value the binding receives. Consumed beside
   // the two widen sites at the very bottom (D1031). The second disjunct is the cell's
   // own question, so a cell typed at the arm cannot be reached without its unbox.
-  const letArmOwed = narrowedArmNeedsUnbox(s.letInit, fnIx)
+  // An `if` joined at a record unboxes in each arm (`refIfArmOf`'s `unbox`), not here.
+  const letArmOwed = !ifJoinsAtRecord(s.letInit, fnIx)
+    && (narrowedArmNeedsUnbox(s.letInit, fnIx)
     || letInitTyIsNarrowedArm(stmtIx, fnIx)
-    || letInitTyIsNarrowedNulArm(stmtIx, fnIx)
+    || letInitTyIsNarrowedNulArm(stmtIx, fnIx))
   // A bare-arm cell's init is delivered by `emitVariantCoerce`, which owns the unbox and the
   // niche recover both, so neither bottom step runs for it.
   const letArmCell = localIsRef[slot] == "variant"
