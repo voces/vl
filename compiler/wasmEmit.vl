@@ -8764,8 +8764,8 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 }
 
 // The value at `exprIx` boxed into the union `unionName`. A box of a member set holding a member
-// `unionName` holds only widened is rebuilt there (`emitBoxAtomRetag`), so a record built or
-// written at a wider record's field reads back through every handle (D3006).
+// `unionName` holds only widened is rebuilt there (`emitBoxAtomRetagMembers`), so a record built
+// or written at a wider record's field reads back through every handle (D3006).
 function emitUnionBoxArg(
   unionNameIn: string,
   unionTy: i32,
@@ -10857,9 +10857,7 @@ function emitSharedFieldArm(
     fbI32Rel(RS_TAG, scalarTagOfKind(bk))
   }
   if emitSharedFieldRecv(recvIx, fnIx, slot) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-  fbRefCast(variantHeap(vi))
-  fbStructGet(variantHeap(vi), fi)
+  sharedArmPayloadRead(vi, fi)
   if setStr {
     if texts.length == 0 {
       return emitFail(
@@ -10899,11 +10897,88 @@ function emitSharedFieldArm(
     if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
     fbStructNew(uBoxIdx)
   }
-  // A `string | null` member read where a narrowing excluded `null` holds a string.
+  return sharedArmStrRecover(code, vi, fi)
+}
+
+// After the receiver box: its payload cast to member `vi`, read at field `fi`.
+function sharedArmPayloadRead(vi: i32, fi: i32) {
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(variantHeap(vi))
+  fbStructGet(variantHeap(vi), fi)
+}
+
+// A `string | null` member read where a narrowing excluded `null` holds a string.
+function sharedArmStrRecover(code: i32, vi: i32, fi: i32): i32 {
   if code == FC_STR && fieldRowIsStr(uFieldStart[vi] + fi, true) {
     fbRefAsNonNull()
   }
   return 0
+}
+
+// Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as the plain read alone:
+// no `null` member, no atom or string conversion, no box.
+function sharedArmIsPlain(code: i32, vi: i32, fi: i32): boolean {
+  if vi < 0 || vi >= uVarRow.length || sharedFieldArmNull(vi, fi) {
+    return false
+  }
+  const own = variantFieldTypeAt(vi, fi)
+  if code == FC_NUL_STR && (own == FC_NUL_LIT_UNION || own == FC_I32) {
+    return false
+  }
+  if code == FC_STR && own == FC_NUL_LIT_UNION { return false }
+  return !sharedFieldArmConverts(code, vi, fi)
+    && !sharedFieldReadBoxes(code, vi, fi)
+}
+
+// After the receiver box: a plain arm of plan `code` for member `vi`, field `fi`.
+export function sharedArmPlainTail(code: i32, vi: i32, fi: i32): i32 {
+  sharedArmPayloadRead(vi, fi)
+  return sharedArmStrRecover(code, vi, fi)
+}
+
+// After the receiver box: arm `i`'s tag test of plan `code` over members `vis`, then the open of
+// the `if` whose result is the field's rep.
+export function sharedArmTestTail(code: i32, vis: i32[], fis: i32[], i: i32) {
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, uTags[vis[i]])
+  fbI32Bin(70) // 0x46 i32.eq
+  const a = sharedFieldValueArm(vis, fis)
+  return fbIfForSharedPlan(code, vis[a], fis[a])
+}
+
+// The plan `emitMemSharedRead` dispatches member read `memIx` on, its members into `vis` and their
+// fields into `fis`, or -1 where it reads the plain struct instead.
+export function sharedReadPlanOf(
+  memIx: i32,
+  fnIx: i32,
+  vis: i32[],
+  fis: i32[],
+): i32 {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return -1 }
+  const code = sharedUnionFieldPlan(m.memObj, m.memProp, memIx, fnIx, vis, fis)
+  return if code >= 0 && sharedFieldPlanDispatchable(code, vis, fis) { code } else { -1 }
+}
+
+// Whether `emitMemSharedRead` writes read `memIx` as its plain dispatch: an ident receiver read
+// again per arm, every arm plain, and no unbox or recover after the dispatch.
+export function sharedReadPlainOf(memIx: i32, fnIx: i32): boolean {
+  if memReadArmOf(memIx, fnIx) != "shared" { return false }
+  const vis: i32[] = []
+  const fis: i32[] = []
+  const code = sharedReadPlanOf(memIx, fnIx, vis, fis)
+  if code < 0 || vis.length < 1 || fis.length != vis.length { return false }
+  const m = nodeAt(memIx)
+  if !(m is Member) { return false }
+  const r = unwrapParen(m.memObj)
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return false }
+  let i = 0
+  while i < vis.length {
+    if !sharedArmIsPlain(code, vis[i], fis[i]) { return false }
+    i = i + 1
+  }
+  if code == FC_UNION && pathReadAtomKind(memIx, fnIx) >= 0 { return false }
+  return !(code == FC_NUL_STR && nulStrReadRecovers(memIx, fnIx))
 }
 
 // A string literal set stored at the atom (`own`, `FC_I32` or its `-1` niche) read as the
@@ -11445,15 +11520,8 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
     // stays here, being a question about spelling a blocktype rather than about typing a read.
     const shVis: i32[] = []
     const shFis: i32[] = []
-    const shCode = sharedUnionFieldPlan(
-      mS.memObj,
-      mS.memProp,
-      memIx,
-      fnIx,
-      shVis,
-      shFis,
-    )
-    if shCode >= 0 && sharedFieldPlanDispatchable(shCode, shVis, shFis) {
+    const shCode = sharedReadPlanOf(memIx, fnIx, shVis, shFis)
+    if shCode >= 0 {
       // The receiver is evaluated once unless re-emitting it is free. The arms below read it
       // twice each — the tag test, then the payload cast — which is why an ident receiver, whose
       // `local.get` re-emits for nothing, needs no slot. A call does not: `g(true).v` would call
@@ -11473,11 +11541,7 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
       let si2 = 0
       while si2 < shVis.length - 1 {
         if emitSharedFieldRecv(mS.memObj, fnIx, shSlot) < 0 { return -1 }
-        fbStructGet(uBoxIdx, 0)                           // field 0: tag
-        fbI32Rel(RS_TAG, uTags[shVis[si2]])
-        fbI32Bin(70)                                      // 0x46 i32.eq
-        const shA = sharedFieldValueArm(shVis, shFis)
-        fbIfForSharedPlan(shCode, shVis[shA], shFis[shA]) // if (result <the field's own rep>)
+        sharedArmTestTail(shCode, shVis, shFis, si2)
         const shArm = emitSharedFieldArm(
           shCode,
           shVis[si2],
@@ -12297,37 +12361,6 @@ export function arrLitPackedShortTail(row: i32, n: i32): i32 {
   return arrLitLenCap(n, pkWrapAt(row))
 }
 
-// The f32-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
-function emitArrF32(elems: i32[], fnIx: i32) {
-  let dstF32 = -1
-  let coffF32 = 0
-  if elems.length > NEW_FIXED_MAX {
-    const dF32 = arrLitDataBuild(elems, fnIx, ALD_F32, fa32Ty())
-    if dF32 < 0 { return -1 }
-    if dF32 == 1 { return arrLitWrap(elems.length, fl32Ty()) }
-    dstF32 = arrLitChunkStart("f32list", 0, fa32Ty(), elems.length, false)
-  }
-  let i32f = 0
-  while i32f < elems.length {
-    if exprArray(elems[i32f], fnIx) || exprRefArray(elems[i32f], fnIx) {
-      return emitFail("emitProgram: nested arrays are not supported")
-    }
-    // Each element lowered as f32 (a float literal re-encoded; an i32 operand converted
-    // via `f32.convert_i32_s`) so the backing's element type matches.
-    if emitWidened(elems[i32f], 5, fnIx) < 0 { return -1 }
-    i32f = i32f + 1
-    if dstF32 >= 0 {
-      coffF32 = arrLitChunkFlush(dstF32, fa32Ty(), coffF32, i32f, elems.length)
-    }
-  }
-  if dstF32 >= 0 {
-    fbLocalGet(dstF32)
-    fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, fl32Ty())
-  }
-  return arrLitShortTail("f32", elems.length)
-}
-
 // The v128-list arm of `emitArrUnder`: each element is a vector already, so it lowers as itself.
 function emitArrV128(elems: i32[], fnIx: i32) {
   let dst = -1
@@ -12355,72 +12388,83 @@ function emitArrV128(elems: i32[], fnIx: i32) {
   return 0
 }
 
-// The f64-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
-function emitArrF64(arrIx: i32, elems: i32[], fnIx: i32) {
-  const hF64 = arrLitHoistGlobal(arrIx, fnIx, "f64")
-  if hF64 == -2 { return -1 }
-  if hF64 >= 0 {
-    fbGlobalGet(hF64)
-    return 0
+// A scalar list arm whose elements widen to one width: f32, f64 or i64.
+type WideArm = "f32" | "f64" | "i64"
+
+// Arm `w`'s element form (`ALD_*`) and `emitWidened` kind.
+type WidePlan = { wpForm: i32, wpWiden: i32 }
+
+function widePlanOf(w: WideArm): WidePlan {
+  return match w {
+    "f32" => { wpForm: ALD_F32, wpWiden: 5 }
+    "f64" => { wpForm: ALD_F64, wpWiden: 4 }
+    "i64" => { wpForm: ALD_I64, wpWiden: 3 }
   }
-  let dstF64 = -1
-  let coffF64 = 0
-  if elems.length > NEW_FIXED_MAX {
-    const dF64 = arrLitDataBuild(elems, fnIx, ALD_F64, fa64Ty())
-    if dF64 < 0 { return -1 }
-    if dF64 == 1 { return arrLitWrap(elems.length, fl64Ty()) }
-    dstF64 = arrLitChunkStart("f64list", 0, fa64Ty(), elems.length, false)
-  }
-  let i = 0
-  while i < elems.length {
-    if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
-      return emitFail("emitProgram: nested arrays are not supported")
-    }
-    // Each element is lowered as an f64 (a float literal → `f64.const`; an i32
-    // operand widened via `f64.convert_i32_s`) so the backing's element type matches.
-    if emitWidened(elems[i], 4, fnIx) < 0 { return -1 }
-    i = i + 1
-    if dstF64 >= 0 {
-      coffF64 = arrLitChunkFlush(dstF64, fa64Ty(), coffF64, i, elems.length)
-    }
-  }
-  if dstF64 >= 0 {
-    fbLocalGet(dstF64)
-    fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, fl64Ty())
-  }
-  return arrLitShortTail("f64", elems.length)
 }
 
-// The i64-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
-function emitArrI64(elems: i32[], fnIx: i32) {
-  let dstI64 = -1
-  let coffI64 = 0
+// Arm `w`'s backing array heap type.
+function wideBackTy(w: WideArm): i32 {
+  return match w {
+    "f32" => fa32Ty()
+    "f64" => fa64Ty()
+    "i64" => ia64Ty()
+  }
+}
+
+// Arm `w`'s list wrapper heap type.
+function wideWrapTy(w: WideArm): i32 {
+  return match w {
+    "f32" => fl32Ty()
+    "f64" => fl64Ty()
+    "i64" => il64Ty()
+  }
+}
+
+// Opens arm `w`'s chunked build of `n` elements into backing `back`; its scratch slot.
+function wideChunkStart(w: WideArm, back: i32, n: i32): i32 {
+  return match w {
+    "f32" => arrLitChunkStart("f32list", 0, back, n, false)
+    "f64" => arrLitChunkStart("f64list", 0, back, n, false)
+    "i64" => arrLitChunkStart("i64list", 0, back, n, false)
+  }
+}
+
+// The f32, f64 and i64 arms of `emitArrUnder`: a hoisted `for` iterable's module list; past the
+// chunk cap, one data segment or a chunked build; else each element widened to the arm's width
+// (a literal re-encoded, an i32 operand converted) and the short tail. 0 on the stack, -1 failed.
+function emitArrWide(arrIx: i32, elems: i32[], fnIx: i32, w: WideArm) {
+  const h = arrLitHoistGlobal(arrIx, fnIx, w)
+  if h == -2 { return -1 }
+  if h >= 0 {
+    fbGlobalGet(h)
+    return 0
+  }
+  const pl = widePlanOf(w)
+  const back = wideBackTy(w)
+  const wrap = wideWrapTy(w)
+  let dst = -1
+  let coff = 0
   if elems.length > NEW_FIXED_MAX {
-    const dI64 = arrLitDataBuild(elems, fnIx, ALD_I64, ia64Ty())
-    if dI64 < 0 { return -1 }
-    if dI64 == 1 { return arrLitWrap(elems.length, il64Ty()) }
-    dstI64 = arrLitChunkStart("i64list", 0, ia64Ty(), elems.length, false)
+    const d = arrLitDataBuild(elems, fnIx, pl.wpForm, back)
+    if d < 0 { return -1 }
+    if d == 1 { return arrLitWrap(elems.length, wrap) }
+    dst = wideChunkStart(w, back, elems.length)
   }
   let i = 0
   while i < elems.length {
     if exprArray(elems[i], fnIx) || exprRefArray(elems[i], fnIx) {
       return emitFail("emitProgram: nested arrays are not supported")
     }
-    // Each element lowered as i64 (an i64 literal directly; an i32 operand sign-
-    // extended via `i64.extend_i32_s`) so the backing's element type matches.
-    if emitWidened(elems[i], 3, fnIx) < 0 { return -1 }
+    if emitWidened(elems[i], pl.wpWiden, fnIx) < 0 { return -1 }
     i = i + 1
-    if dstI64 >= 0 {
-      coffI64 = arrLitChunkFlush(dstI64, ia64Ty(), coffI64, i, elems.length)
-    }
+    if dst >= 0 { coff = arrLitChunkFlush(dst, back, coff, i, elems.length) }
   }
-  if dstI64 >= 0 {
-    fbLocalGet(dstI64)
+  if dst >= 0 {
+    fbLocalGet(dst)
     fbRefAsNonNull() // the chunk-built backing
-    return arrLitLenCap(elems.length, il64Ty())
+    return arrLitLenCap(elems.length, wrap)
   }
-  return arrLitShortTail("i64", elems.length)
+  return arrLitShortTail(w, elems.length)
 }
 
 // The string-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on
@@ -12750,9 +12794,9 @@ function emitArrUnder(arrIx: i32, fnIx: i32, lb: ListBuild) {
   }
   if arm == "v128" { return emitArrV128(elems, fnIx) }
   if arm == "u8" { return emitArrU8(elems, fnIx, lb.lbSlot) }
-  if arm == "f32" { return emitArrF32(elems, fnIx) }
-  if arm == "f64" { return emitArrF64(arrIx, elems, fnIx) }
-  if arm == "i64" { return emitArrI64(elems, fnIx) }
+  if arm == "f32" { return emitArrWide(arrIx, elems, fnIx, "f32") }
+  if arm == "f64" { return emitArrWide(arrIx, elems, fnIx, "f64") }
+  if arm == "i64" { return emitArrWide(arrIx, elems, fnIx, "i64") }
   if arm == "str" { return emitArrStr(arrIx, elems, fnIx) }
   if arm == "ref" { return emitArrRef(arrIx, elems, fnIx, lb) }
   return emitArrI32(arrIx, elems, fnIx, lb.lbKind)
@@ -20968,23 +21012,8 @@ function emitWidenRetagArm(fromTy: i32, toTy: i32) {
   return 0
 }
 
-// The union box on the stack, held at the members of type `fromTy`, rebuilt at `toTy`'s: each
-// scalar member `toTy` lacks is re-boxed as the member of `toTy` it converts to exactly
-// (`boxAtomRetagKind`). A field read narrows a wider record's box back (D3006).
-function emitBoxAtomRetag(fromTy: i32, toTy: i32, at: i32) {
-  const ft: i32[] = []
-  const tt: i32[] = []
-  if (
-    !msMemberTysOfSet(msSetOfTyAny(fromTy), ft)
-    || !msMemberTysOfSet(msSetOfTyAny(toTy), tt)
-  ) {
-    return emitFailAt("emitProgram: a union box retag has no member set", at)
-  }
-  return emitBoxAtomRetagMembers(ft, tt, at)
-}
-
-// `emitBoxAtomRetag` from union type `fromTy` to `toTy`, over their canonical members, for a
-// pair `memReadBoxPlan` accepted (so both have them).
+// `emitBoxAtomRetagMembers` from union type `fromTy` to `toTy`, over their canonical members, for
+// a pair `memReadBoxPlan` accepted (so both have them).
 function emitBoxAtomRetagTys(fromTy: i32, toTy: i32, at: i32) {
   const ft: i32[] = []
   canonUnionMemberTysOf(fromTy, ft)
@@ -20993,7 +21022,9 @@ function emitBoxAtomRetagTys(fromTy: i32, toTy: i32, at: i32) {
   return emitBoxAtomRetagMembers(ft, tt, at)
 }
 
-// `emitBoxAtomRetag` over the member types `ft` of the box on the stack and `tt` of its target.
+// The union box on the stack, held at member types `ft`, rebuilt at `tt`: each scalar member `tt`
+// lacks is re-boxed as the member it converts to exactly (`boxAtomRetagKind`). A field read narrows
+// a wider record's box back (D3006).
 function emitBoxAtomRetagMembers(ft: i32[], tt: i32[], at: i32) {
   const slot = sharedFieldRecvSlot()
   fbLocalSet(slot)
@@ -41695,9 +41726,6 @@ function emitCoalesceUnionField(
             fbElse() // 0x05 else — present → re-read the field
             if emitCoalArmRecv(lhs.memObj, mCast, fnIx) < 0 { return -1 }
             fbStructGet(mHeap, mfi)
-            if msSetOfTyAny(munTy) != msSetOfTyAny(mphysTy) {
-              if emitBoxAtomRetag(mphysTy, munTy, lhsIx) < 0 { return -1 }
-            }
             fbEnd() // 0x0b end
             return 0
           }
@@ -41716,10 +41744,7 @@ function emitCoalesceUnionField(
           fbElse()                      // 0x05 else — present → unbox
           if emitCoalArmRecv(lhs.memObj, mCast, fnIx) < 0 { return -1 }
           fbStructGet(mHeap, mfi)
-          if msSetOfTyAny(munTy) != msSetOfTyAny(mphysTy) {
-            if emitBoxAtomRetag(mphysTy, munTy, lhsIx) < 0 { return -1 }
-          }
-          fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+          fbStructGet(uBoxIdx, 1)       // field 1: value (anyref)
           const mvb = vbHeapIdxOfKind(mak)
           if mvb < 0 {
             return emitFail("emitProgram: union field atom has no value box")
