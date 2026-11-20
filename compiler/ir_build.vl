@@ -112,6 +112,7 @@ import {
   valtypeOf,
 } from "./ir_lower"
 import {
+  FieldStoreValArm,
   GlobalCtx,
   ObjLitArm,
   PrintArm,
@@ -145,9 +146,8 @@ import {
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
-  fieldStoreValuePlain,
+  fieldStoreValueArmOf,
   fieldStoreVariantAt,
-  fieldStoreVariantValuePlain,
   fnTagLeafEmitted,
   fnValueArmOf,
   fnValueFeOf,
@@ -223,6 +223,7 @@ import {
   valueIfLitTrue,
   variantFieldArmOf,
   variantFieldBoxTy,
+  variantFieldStoreValueArmOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
 import { identUnboxAtomOf, variantCoerceArmOf } from "./emit_plan_union"
@@ -4281,7 +4282,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
 }
 
 // A struct field store `o.f = v` that legacy writes as the record, the bare value and its
-// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValuePlain`); a variant's, the record
+// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValueArmOf`); a variant's, the record
 // a variant receiver is or a box narrowed to one yields (`variantParam`, `narrowVariant`).
 function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const arm = fieldStoreArmOf(n.binLeft, ibFnIx)
@@ -4298,17 +4299,27 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   ) {
     return skip("field store narrowed variant")
   }
-  const plain = if arm == "struct" { fieldStoreValuePlain(sf[0], sf[1], n.binRight, ibFnIx) } else { fieldStoreVariantValuePlain(sf[0], sf[1], n.binRight, ibFnIx) }
-  if !plain { return skip("field store value") }
+  const va = if arm == "struct" { fieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) } else { variantFieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) }
+  if !fieldStoreValueDelivers(va) { return skip("field store value " + va) }
   const rt = nodeTyAt(t.memObj, ibFnIx)
   const r = repNodeOfTy(rt)
   if !(repNodeAt(r) is RRecord) { return skip("field store receiver") }
   const k = repRecordKidOf(r, rt, t.memProp)
   if k < 0 { return skip("field kid") }
+  const dst = repNodeKids(r)[k]
+  const siteTy = if arm == "struct" { structFieldBoxTy(sf[0], sf[1]) } else { variantFieldBoxTy(sf[0], sf[1]) }
+  // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
+  if (
+    va == "box"
+    && exprUnion(n.binRight, ibFnIx)
+    && boxIntoOtherUnion(n.binRight, dst, siteTy)
+  ) {
+    return skip("field store box from a box")
+  }
   const vAt = b.length
   const v0 = irBExpr(b, t.memObj)
   const at = b.length
-  const x = irBExpr(b, n.binRight)
+  const x = if va == "plain" { irBExpr(b, n.binRight) } else { deliver(b, n.binRight, dst, siteTy) }
   if ibMiss != "" { return 0 }
   // Legacy reads the receiver, then the value: a receiver variable is staged at its own start, so
   // the lowering writes it below a valued `if` the value wrote ahead of the store.
@@ -4326,6 +4337,15 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   }
   irBNode(b, { sfV: v, sfIx: k, sfSrc: x }, -1, ibNoValue, ix)
   return 0
+}
+
+// The field store value arms whose write is the value delivered at the field's rep: the bare
+// value, the box (`emitUnionBoxOwed`, the hole box plan) and the widenings (`emitWidened`).
+function fieldStoreValueDelivers(va: FieldStoreValArm): boolean {
+  return match va {
+    "plain" | "box" | "f64" | "i64" | "f32" => true
+    "noKind" | "atomToStr" | "strValue" | "nulnone" | "armDelivery" => false
+  }
 }
 
 function loopIx(label: string): i32 {

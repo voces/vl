@@ -2360,3 +2360,63 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// A field store boxes or widens its value through legacy's own value arm (`fieldStoreValueArmOf`,
+// `variantFieldStoreValueArmOf`): a union field's box, an `f64`, `i64` or `f32` widening, into a
+// struct, a variant parameter and a narrowed variant.
+Deno.test({
+  name: "ir shadow: a field store's boxed and widened values match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type R = { u: i32 | string, w: f64, l: i64, h: f32, n: i32 }
+type A = { tag: i32, v: i32 | string, d: f64 }
+type B = { m: i32 }
+type U = A | B
+function setU(r: R, n: i32) { r.u = n }
+function setUs(r: R, s: string) { r.u = s }
+function setW(r: R, n: i32) { r.w = n }
+function setL(r: R, n: i32) { r.l = n }
+function setH(r: R, n: i32) { r.h = 2.5 }
+function setAv(a: A, n: i32) { a.v = n }
+function setAd(a: A, n: i32) { a.d = n }
+function setNarrow(u: U, n: i32) {
+  if u is A {
+    u.d = n
+    u.v = "z"
+  }
+}
+function showU(x: i32 | string): string {
+  if x is string { return x }
+  return "i"
+}
+const r: R = { u: 0, w: 0.5, l: 1, h: 1.5, n: 0 }
+setU(r, 4)
+print(showU(r.u))
+setUs(r, "s")
+print(showU(r.u))
+setW(r, 3)
+setL(r, 5)
+setH(r, 6)
+print(r.w)
+print(r.l)
+print(r.h)
+const a: A = { tag: 1, v: "a", d: 0.25 }
+setAv(a, 2)
+setAd(a, 7)
+print(showU(a.v))
+print(a.d)
+const u: U = { tag: 2, v: 1, d: 0.0 }
+setNarrow(u, 9)
+if u is A {
+  print(u.d)
+  print(showU(u.v))
+}
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 9 || (rows.get("matched") ?? 0) !== 9) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
