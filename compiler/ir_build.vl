@@ -120,8 +120,10 @@ import {
   cloLiftCalleeOf,
   closureValueWhy,
   coalClosedWidensAtom,
-  coalFieldAtomOf,
   coalFieldPlanOf,
+  coalFieldRefusedWhy,
+  coalFieldResidualKind,
+  coalFieldUnboxWhy,
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
@@ -2848,14 +2850,17 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
 function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   const p = coalFieldPlanOf(lhsIx, ibFnIx)
   if p == null { return irBMiss("coalesce box next") }
-  if coalFieldAtomOf(p, lhsIx, ibFnIx) < 0 { return irBMiss("coalesce field atom") }
+  if coalFieldRefusedWhy(p, lhsIx, ibFnIx) != "" { return irBMiss("coalesce field refused") }
+  const ak = coalFieldResidualKind(p)
+  if ak < 0 { return irBMiss("coalesce box next") }
   const keep = coalKeepsBox(n, ix, ibFnIx)
+  if !keep && coalFieldUnboxWhy(ak) != "" { return irBMiss("coalesce field refused") }
   if keep != heldAsBox(rep) { return irBMiss("coalesce field result rep") }
   const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   // Its value stays on the stack from here, so no temp an operand before it built may wait.
   if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
-  const l = irBExpr(b, p.cfRecv)
+  const l = if p.cfCast == -1 { irBExpr(b, p.cfRecv) } else { castRecvRead(p.cfRecv) }
   if ibMiss != "" { return l }
   if !(l is OVar) || l.ov < 0 || ib.irVars[l.ov].vKind == "temp" {
     return irBMiss("coalesce field receiver place")
@@ -2875,6 +2880,26 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
     ix,
   )
   const o: Opnd = { ov: t }
+  return o
+}
+
+// A narrowed local `recvIx` read at its own rep, unnarrowed: legacy's field `??` reads it so and
+// writes the cast its plan names itself.
+function castRecvRead(recvIx: i32): Opnd {
+  const n = nodeAt(recvIx)
+  if !(n is Ident) { return irBMiss("coalesce field receiver place") }
+  const d = identDeclOf(recvIx)
+  if d < 0 { return irBMiss("unresolved read") }
+  const dn = nodeAt(d)
+  const w = localIndexOf(ibFnIx, recvIx)
+  const walkVar = dn is LoopVar && (ibDeclVar[d] ?? -1) >= 0
+  if !((dn is LetDecl || dn is Param || walkVar) && w >= 0) {
+    return irBMiss("coalesce field receiver place")
+  }
+  const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+  if v < 0 { return irBMiss("local rep") }
+  ib.irReadVar[recvIx] = v
+  const o: Opnd = { ov: v }
   return o
 }
 

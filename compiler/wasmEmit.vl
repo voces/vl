@@ -20859,12 +20859,14 @@ function boxNarrowScalarKinds(phys: i32, own: i32): i32[] {
 
 // The refusal of a field read at `memIx` whose wider record stores two of its own members as one.
 function emitBoxAmbiguousFail(memIx: i32) {
-  return emitFailAt(
-    "emitProgram: this field is stored at a wider record whose member two of its own members "
-      + "widen to, so a read at its own type cannot tell which one it held. Annotate the "
-      + "binding with the wider record's type, or build a second literal",
-    memIx,
-  )
+  return emitFailAt(boxAmbiguousWhy(), memIx)
+}
+
+// The refusal of a field read stored at a wider record two of its own members widen to.
+function boxAmbiguousWhy(): string {
+  return "emitProgram: this field is stored at a wider record whose member two of its own members "
+    + "widen to, so a read at its own type cannot tell which one it held. Annotate the "
+    + "binding with the wider record's type, or build a second literal"
 }
 
 // One arm of `emitMapRetag`'s chain for a scalar member `fromTy` the destination holds widened
@@ -41480,16 +41482,24 @@ export function coalFieldResidualKind(p: CoalFieldPlan): i32 {
   return mak
 }
 
-// The atom kind plan `p` of member read `lhsIx` unboxes when legacy lowers its `??` without a
-// refusal, else -1: the box is read at the receiver's own member set and holds one banked
-// residual atom that has a value box.
-export function coalFieldAtomOf(p: CoalFieldPlan, lhsIx: i32, fnIx: i32): i32 {
-  if memReadBoxAmbiguous(lhsIx, fnIx) || memReadBoxNarrowTy(lhsIx, fnIx) >= 0 {
-    return -1
+// Why `o.v ?? d` over plan `p` of member read `lhsIx` is refused, or "": the one decision legacy's
+// arm and the IR's builder read, ahead of any byte. The box sits at a wider record two members
+// widen to, is rebuilt at a narrower union, or holds a set that banks no residual kind.
+export function coalFieldRefusedWhy(p: CoalFieldPlan, lhsIx: i32, fnIx: i32): string {
+  if memReadBoxAmbiguous(lhsIx, fnIx) { return boxAmbiguousWhy() }
+  if memReadBoxNarrowTy(lhsIx, fnIx) >= 0 {
+    return "emitProgram: `??` over a narrowed union-box field read"
   }
-  const ak = coalFieldResidualKind(p)
-  if ak < 0 || vbHeapIdxOfKind(ak) < 0 { return -1 }
-  return ak
+  if coalFieldResidualKind(p) == -2 {
+    return "emitProgram: `??` over a union field has no banked residual kind"
+  }
+  return ""
+}
+
+// Why the present arm cannot unbox atom kind `ak` of a union field's box, or "".
+export function coalFieldUnboxWhy(ak: i32): string {
+  if vbHeapIdxOfKind(ak) < 0 { return "emitProgram: union field atom has no value box" }
+  return ""
 }
 
 // The open of `o.v ?? d` along plan `p` once its receiver is on the stack: the cast, the box, its
@@ -41509,11 +41519,10 @@ export function coalFieldOpen(p: CoalFieldPlan, rk: i32) {
 export function coalFieldPresent(p: CoalFieldPlan, ak: i32, rk: i32): i32 {
   coalFieldOff(p)
   if rk < 0 { return 0 }
+  const why = coalFieldUnboxWhy(ak)
+  if why != "" { return emitFail(why) }
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   const mvb = vbHeapIdxOfKind(ak)
-  if mvb < 0 {
-    return emitFail("emitProgram: union field atom has no value box")
-  }
   fbRefCast(mvb)
   fbStructGet(mvb, 0) // the scalar payload
   return coalWidenUnboxed(ak, rk)
@@ -41548,21 +41557,13 @@ function emitCoalesceUnionField(
 ) {
   const p = coalFieldPlanOf(lhsIx, fnIx)
   if p != null {
-    // A wider record's box is read at the receiver's own member set (D3006).
-    if memReadBoxAmbiguous(lhsIx, fnIx) { return emitBoxAmbiguousFail(lhsIx) }
-    // A box rebuilt at a narrower union has no `??` lowering; the field's own box is read.
-    if memReadBoxNarrowTy(lhsIx, fnIx) >= 0 {
-      return emitFail(
-        "emitProgram: `??` over a narrowed union-box field read",
-      )
-    }
+    // A wider record's box is read at the receiver's own member set (D3006), anchored at the
+    // read as every such refusal is.
+    const why = coalFieldRefusedWhy(p, lhsIx, fnIx)
+    if why == boxAmbiguousWhy() { return emitFailAt(why, lhsIx) }
+    if why != "" { return emitFail(why) }
     // D-VALUNION + D-SETONCE + D-union-atom-kind — see `unionResidualSoloKindOfSet`.
     const mak = coalFieldResidualKind(p)
-    if mak == -2 {
-      return emitFail(
-        "emitProgram: `??` over a union field has no banked residual kind",
-      )
-    }
     if mak >= 0 {
       // A union result or a NULLABLE default keeps the result boxed — the SAME decision
       // the ident and call arms make; the else arm re-reads the field's own box rather

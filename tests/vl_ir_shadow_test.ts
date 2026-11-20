@@ -759,13 +759,26 @@ print(c([]))
 });
 
 // `o.v ?? d` over a value-union record field, its atom unboxed, widened to a wider default, or its
-// box kept for a nullable default, and a default that reassigns the receiver the present arm
-// re-reads: legacy's shared open, every function matching legacy's bytes.
+// box kept for a nullable default, a default that reassigns the receiver the present arm re-reads,
+// and a loop variable narrowed by `is` to one arm, cast to that arm's heap: legacy's shared open,
+// every function matching legacy's bytes.
 Deno.test({
   name: "ir shadow: a union field's coalesce is covered and matched",
   ignore,
   fn: () => {
     const src = `type R = { v: i32 | null, w: i32 }
+type A = { k: "a", v: i32 | null }
+type B = { k: "b", w: i32 }
+function f(xs: (A | B)[]): i32 {
+  let t = 0
+  for x in xs {
+    if x is A {
+      const y = x.v ?? 1
+      t = t + y
+    }
+  }
+  return t
+}
 function s(r: R): i32 { return r.v ?? 7 }
 function w(r: R): f64 { return r.v ?? 0.5 }
 function k(r: R, d: i32 | null): i32 | null { return r.v ?? d }
@@ -780,11 +793,12 @@ print(s(a) + s({ v: 5, w: 2 }))
 print(w(a))
 print(k(a, null) ?? -1)
 print(o(a, { v: 4, w: 6 }))
+print(f([{ k: "a", v: null }, { k: "b", w: 9 }, { k: "a", v: 5 }]))
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
-      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 5 || rows.get("covered") !== 5) {
+      throw new Error(`want all five covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1116,7 +1130,9 @@ Deno.test({
     // case 11 a box whose immediate stands for a call (rule 2).
     // Cases 12 to 14 break a fused `pop ?? d`: a pop of an i32 and a bool out from an `i32[]`
     // (rule 2), and a default that leaves the out unwritten (rule 5).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5];
+    // Cases 15 and 16 break a field `??`: a kept box into an i32 out, and an immediate receiver
+    // (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
