@@ -45,18 +45,18 @@ read is in progress for: there the live answer is false, and the fragment misses
 
 ## Grading
 
-Fixpoint seeds at merge-base de317fa31 (#9294 merged) against the head.
+Fixpoint seeds at merge-base 48a54c094 against the head.
 
 | | base | head |
 |---|---|---|
-| self covered | 19,022 | 19,028 |
-| self matched | 19,021 | 19,027 |
+| self covered | 19,049 | 19,055 |
+| self matched | 19,048 | 19,054 |
 | self `pre-path atom hook` | 11 | 0 |
 | self `atom if join chain` | — | 3 |
-| corpus covered / matched | 95,640 / 95,626 | 95,640 / 95,626 |
+| corpus covered / matched | 95,643 / 95,629 | 95,643 / 95,629 |
 
-- **Self:** the one covered-but-unmatched function is the same on both sides. The verifier-fail
-  and claimable-unmatched rows in the corpus are the same 15.
+- **Self:** the one covered-but-unmatched function, and master's `encArms` rule-3 row (#9289's,
+  fixed on ir5-stagefix), are the same on both sides.
 - **Corpus:** its 33 `pre-path atom hook` rows take the hook's other two arms (the wide literal
   and the string-repped union), so they do not move.
 - **Witness: tests/cases/literal-unions/if-join-of-member-literals-into-atom.vl.**
@@ -68,9 +68,9 @@ Fixpoint seeds at merge-base de317fa31 (#9294 merged) against the head.
 | bar | result |
 |---|---|
 | `ir-identity --names` | identical 9,037, differ 0; self-compile identical |
-| `ir-identity --cases` | identical 7,541, differ 0; witnesses 59/59 |
-| base-vs-head tests/cases A/B (legacy's hook changes shape) | 7,609 programs, 7,541 built, differ 0 |
-| mode 3 | identical; 19,007 claimed (base 18,997) |
-| L2 fuel, candidate vs base fixpoint | +0.016% (104,600,523,258 → 104,616,913,421) |
+| `ir-identity --cases` | identical 7,542, differ 0; witnesses 60/60 |
+| base-vs-head tests/cases A/B (legacy's hook changes shape) | 7,610 programs, 7,542 built, differ 0 |
+| mode 3 | identical; 19,034 claimed (base 19,024) |
+| L2 fuel, candidate vs base fixpoint | +0.010% (104,625,921,038 → 104,635,932,373) |
 | matrices `atom-cell-narrowed-to-one-literal-at-atom`, `atom-in-mixed-string-eq` | 62/62 and 64/64, 0 runs → not-runs |
-| plumb-shape cost | ok |
+| plumb-shape cost, `gate.sh --fast` | ok / passed |
