@@ -99,11 +99,13 @@ import {
   irLowerClaim,
   irLowerFragment,
   irLoweredEntry,
+  irSlotRunAgrees,
 } from "./ir_lower"
 import {
   GlobalCtx,
   ObjLitArm,
   PrintArm,
+  RefJoin,
   arrLitShort,
   asgValueArmOf,
   atomStrPlanOf,
@@ -134,6 +136,7 @@ import {
   holeBoxTyAt,
   idxStorePlainWhy,
   ifExprPlainWhy,
+  ifRefJoinOf,
   ifWritesElse,
   intSwitchMayLower,
   irEnvCached,
@@ -141,6 +144,7 @@ import {
   isDecidedFalse,
   keptDeclStoresNothing,
   legacyContextLiveWhy,
+  letIfInitPerArmRep,
   lowMemFoldsCallee,
   mapFilterWhy,
   mapGetOrArmOf,
@@ -166,11 +170,13 @@ import {
   printArmOf,
   pushPlainWhy,
   recvReadsListPayload,
+  refIfArmOf,
   shiftMaskFoldOf,
   startInitArmOf,
   startStrAccMarked,
   stmtWritesNothing,
   strCatPartsOf,
+  strJoinDropsNulAtom,
   strLitTakesAtom,
   structFieldArmOf,
   tailIfPlainWhy,
@@ -200,6 +206,7 @@ import { arrLitRefPlainSlot } from "./emit_plan_list"
 import {
   BinNulTest,
   NULL_OWN_ATOM,
+  NULL_OWN_BOX,
   NULL_OWN_STR,
   binNulTestOf,
   coalArmOf,
@@ -213,6 +220,7 @@ import {
   nullOwnAt,
 } from "./emit_plan_null"
 import { boxOwedAt, narrowedArmNeedsUnbox } from "./emit_plan_coerce"
+import { ifJoinAdaptsScalar, letIfInitSinks } from "./wasmEmit"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -245,6 +253,7 @@ import {
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
 import { wTarget } from "./emit_bytes"
+import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import {
   narrowedNulLitPinBoxKey,
@@ -280,11 +289,13 @@ import {
   lastStmtIsValueIf,
 } from "./emit_fn_scans"
 import {
+  VKind,
   cloLiftWriteCount,
   fRecRetTy,
   fRetVoid,
   fnStmts,
   fnStmtsPosOf,
+  gConstExprEmit,
   gInitProgIdx,
   gPromoInStart,
   monoGen,
@@ -499,6 +510,8 @@ let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
 let ibLoopCont: i32[] = []
 let ibLabelN = 0
+// The statements whose end closes a list reserve region the body opened (`reserve.open`).
+let ibReserveEnd: i32[] = []
 let ibBool = -1
 let ibNoValue = -1
 
@@ -895,6 +908,11 @@ function condIsTest(ix: i32): boolean {
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
 function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
+  const rj = ifRefJoinOf(ix0, ibFnIx)
+  const rk = rj.rjKind
+  if rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
+    return ifRefExpr(b, n0, ix0, rep0, rj)
+  }
   const bs: i32[][] = []
   const ixs: i32[] = []
   const reps: i32[] = []
@@ -985,6 +1003,135 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   }
   const o: Opnd = { ov: outs[0] }
   return o
+}
+
+// A value `if` joined at a reference (legacy's `emitIfExprRef`): one link whose arms each write
+// their value as itself (`refIfArmOf`'s `plain`) at the join's rep, under the blocktype the
+// lowering asks `ifRefJoinOf` for. A chain's links share the head's kind, so a chain is a miss.
+function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
+  const kind = rj.rjKind ?? "struct"
+  if kind != "str" && kind != "list" && kind != "strlist" && kind != "reflist" {
+    return irBMiss("expression if ref " + kind)
+  }
+  if n.ifElse < 0 || nodeAt(n.ifElse) is IfStmt {
+    return irBMiss("ref if chain")
+  }
+  if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
+  if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
+    return irBMiss("ref if drops null atom")
+  }
+  if endsInTemp(b) { return irBMiss("if after an operand") }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  if c is OImm && condIsTest(n.ifCond) {
+    return irBMiss("decided is condition")
+  }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nul = ifLinkYieldsNull(ix, ibFnIx)
+  const thenB = refIfArm(n.ifThen, t, rep, kind, rj.rjSlot, nul)
+  if ibMiss != "" { return irBMiss("ref if arm") }
+  const elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+  if ibMiss != "" { return irBMiss("ref if arm") }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// One arm of `ifRefExpr`: its value as itself at `rep`, written to out `t`.
+function refIfArm(
+  blockIx: i32,
+  t: i32,
+  rep: i32,
+  kind: VKind,
+  slot: i32,
+  nul: boolean,
+): i32[] {
+  const body: i32[] = []
+  const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
+  if arm != "plain" {
+    irBMiss("ref if arm " + arm)
+    return body
+  }
+  const v = irBExpr(body, ifArmValueExpr(blockIx))
+  if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
+  if ibMiss == "" {
+    irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
+  }
+  return body
+}
+
+// A union binding's `if` initializer as legacy's seeded box writes it (`emitLetIfInit`): the
+// null box into `v`, then a void `if` chain whose arms each deliver their value into `v` and
+// whose missing `else` writes the null box again.
+function letIfArms(b: i32[], ifIx: i32, v: i32) {
+  const vr = ib.irVars[v].vRep
+  if !(repNodeAt(vr) is RBox) { return skip("declaration if per arm rep") }
+  nullBoxInto(b, ifIx, v, vr)
+  return letIfArmLink(b, ifIx, v, vr)
+}
+
+// The null box written into `v` at `at`.
+function nullBoxInto(b: i32[], at: i32, v: i32, vr: i32) {
+  const t = repTemp(b, { nuAt: at, nuOwn: NULL_OWN_BOX }, at, vr)
+  irBNode(b, { asDst: v, asSrc: t }, -1, ibNoValue, at)
+  return 0
+}
+
+// One link of `letIfArms` (`emitNullableIfBindingLink`).
+function letIfArmLink(b: i32[], ifIx: i32, v: i32, vr: i32) {
+  const n = nodeAt(unwrapParen(ifIx))
+  if !(n is IfStmt) { return skip("declaration if per arm node") }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+  const thenB = letIfArmBody(n.ifThen, v, vr)
+  if ibMiss != "" { return 0 }
+  const elseB: i32[] = []
+  if n.ifElse < 0 {
+    nullBoxInto(elseB, ifIx, v, vr)
+  } else if nodeAt(n.ifElse) is IfStmt {
+    if ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
+      return skip("declaration if per arm scalar link")
+    }
+    letIfArmLink(elseB, n.ifElse, v, vr)
+  } else {
+    for x in letIfArmBody(n.ifElse, v, vr) { elseB.push(x) }
+  }
+  if ibMiss != "" { return 0 }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: true },
+    -1,
+    ibNoValue,
+    ifIx,
+  )
+  return 0
+}
+
+// One arm of `letIfArmLink`: its one value delivered into `v`'s box.
+function letIfArmBody(blockIx: i32, v: i32, vr: i32): i32[] {
+  const body: i32[] = []
+  const blk = nodeAt(blockIx)
+  const tv = ifArmValueExpr(blockIx)
+  if !(blk is Block) || blk.blkStmts.length != 1 || tv < 0 {
+    skip("declaration if per arm prelude")
+    return body
+  }
+  const x = deliver(body, tv, vr)
+  if ibMiss == "" && irBOpRep(x) != vr {
+    skip("declaration if per arm coercion")
+  }
+  if ibMiss == "" {
+    irBNode(body, { asDst: v, asSrc: x }, -1, ibNoValue, blockIx)
+  }
+  return body
 }
 
 // Whether body `b` ends in a temp's definition, an operand still waiting to be read.
@@ -1432,7 +1579,7 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
 // Whether operands built into `b` from `at` on hold a valued `if` below a part their node writes
 // first (a receiver or an earlier operand, read at its use), naming `why` as the miss. Legacy
 // writes such an `if` in place, which the IR's statement-level `if` cannot reorder.
-function ifBelowLead(b: i32[], at: i32, why: string): boolean {
+export function ifBelowLead(b: i32[], at: i32, why: string): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
@@ -1670,8 +1817,14 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   if arm == "union" && nodeAt(unwrapParen(c.callArgs[0])) is IfStmt {
     return skip("print union if")
   }
+  const from = b.length
   const v = irBExpr(b, c.callArgs[0])
   if ibMiss != "" { return 0 }
+  // Legacy opens a nullable string's print blocks before its operand, so a valued `if` in it
+  // would sit above them.
+  if want == "nulStr" && ifBelowLead(b, from, "print nulStr of a valued if") {
+    return 0
+  }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
   let ok = p != null && p == want
@@ -2645,8 +2798,12 @@ function accAppend(b: i32[], n: BinExpr, ix: i32) {
   const args: Opnd[] = []
   let i = 1
   while i < parts.length {
+    const from = b.length
     const a = irBExpr(b, parts[i])
     if ibMiss != "" { return 0 }
+    if args.length > 0 && ifBelowLead(b, from, "string operand after another") {
+      return 0
+    }
     if repPrim(irBOpRep(a)) != "str" { return skip("string operand coercion") }
     args.push(a)
     i = i + 1
@@ -2982,8 +3139,33 @@ function stmt(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   const n0 = b.length
   stmtNode(b, ix, sibs, pos)
   if ibMiss != "" && censusGoesOn(ibMiss) { ibMiss = "" }
+  // Legacy writes back a region's length after its last statement, inside that statement's
+  // span (`emitStmtIn`).
+  if reserveEnds(ix) {
+    irBNode(
+      b,
+      { srOp: "reserve.close", srHeap: -1, srArgs: [], srImm: ix },
+      -1,
+      ibNoValue,
+      ix,
+    )
+  }
   if b.length > n0 { irSpanNote(ib, ix, b[n0], b[b.length - 1]) }
   return 0
+}
+
+// Whether statement `ix` ends a reserve region the body opened; it is taken off the list.
+function reserveEnds(ix: i32): boolean {
+  let i = 0
+  let hit = false
+  while i < ibReserveEnd.length {
+    if ibReserveEnd[i] == ix {
+      ibReserveEnd[i] = -1
+      hit = true
+    }
+    i = i + 1
+  }
+  return hit
 }
 
 function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
@@ -3011,15 +3193,30 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
     if v < 0 || n.letInit < 0 { return skip("declaration") }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
-    if pos >= 0 && listReserveScan(n, sibs, pos, ibFnIx) != null {
-      return skip("declaration list reserve")
+    const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
+    // Legacy writes a nullable or union binding's `if` initializer in each arm.
+    const pa = letIfInitPerArmRep(ix, ibFnIx)
+    if pa == 0 && !letIfInitSinks(n.letInit, ibFnIx) {
+      return letIfArms(b, n.letInit, v)
     }
+    if pa == 0 { return skip("declaration if per arm sink") }
+    if pa >= 0 { return skip("declaration if per arm " + i32ToStr(pa)) }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep)
     if ibMiss != "" { return 0 }
     if irBOpRep(src) != ib.irVars[v].vRep {
       return skip("declaration coercion")
     }
     irBNode(b, { asDst: v, asSrc: src }, -1, ibNoValue, ix)
+    if lr != null {
+      irBNode(
+        b,
+        { srOp: "reserve.open", srHeap: pos, srArgs: [], srImm: v },
+        -1,
+        ibNoValue,
+        ix,
+      )
+      ibReserveEnd.push(sibs[lr.lrLast])
+    }
     return 0
   }
   if n is IfStmt { return ifChain(b, ix) }
@@ -3306,6 +3503,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibFnPos = fnPos
   ibMiss = ""
   ibMisses = []
+  ibReserveEnd = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
   ibOwnDecls = Map()
@@ -3463,7 +3661,8 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
   let fnPos = -1
   if fnIx < 0 {
     // A start body's top-level code, under the guards its whole build takes (`buildStart`).
-    if !gPromoInStart { return "fragment outside a body" }
+    // A const cell's constant initializer hosts one too: it has no frame, so no variable.
+    if !gPromoInStart && !gConstExprEmit { return "fragment outside a body" }
     if startStrAccMarked() { return "string accumulator" }
     if gInitProgIdx >= 0 { return "progress cell" }
     ibReset(-1, "@fragment", -1)
@@ -3488,6 +3687,16 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
   if repNodeGen() != gen { return "rep epoch moved" }
   const v = irVerify(ib)
   if v.vfRule != 0 { return "verifier rule " + i32ToStr(v.vfRule) }
+  // A variable the fragment made for a declaration it never built took its rep from the type;
+  // legacy's slot holds the frame's rep, which may differ (an atom cell, a niche).
+  for x in ib.irVars {
+    if gConstExprEmit && x.vKind != "temp" {
+      return "constant initializer variable"
+    }
+    if x.vKind == "local" && !irSlotRunAgrees(x.vRep, x.vSlot) {
+      return "local cell rep"
+    }
+  }
   return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 

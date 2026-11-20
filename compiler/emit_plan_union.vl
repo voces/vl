@@ -305,6 +305,7 @@ import {
 } from "./emit_ty_canon"
 import {
   identChainTyBoxedUnion,
+  isUnionOfTy,
   mapValueTyOf,
   unRowOfRecordTy,
 } from "./emit_union_atoms"
@@ -361,6 +362,7 @@ import {
   tyIsUnionShaped,
   tyMapValOf,
   tyNumLitMemberTexts,
+  tyUnionCovers,
 } from "./tyquery"
 
 // The capture slot `name` reads from the env of capturing function `fnIx`, or -1.
@@ -864,14 +866,9 @@ function litIsPinNever(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
 // is not read at its storage, and the tested type does not hold every member.
 export function isBoxGuardPlain(isIx: i32, fnIx: i32): boolean {
   const nd = nodeAt(isIx)
-  if (
-    !(nd is IsExpr)
-    || !exprUnion(nd.isObj, fnIx)
-    || isTestsStorage(nd.isObj, fnIx)
-  ) {
-    return false
-  }
-  return !isTestedEveryMember(nodeTyAt(nd.isObj, fnIx), isVarTyIxOf(isIx))
+  return nd is IsExpr
+    && exprUnion(nd.isObj, fnIx)
+    && isPreArmOf(isIx, fnIx) == "test"
 }
 
 // Whether every member of union operand type `op` is a member of the tested type `t`, the
@@ -3074,4 +3071,88 @@ export function memFieldUnionBox(memIx: i32, fnIx: i32): boolean {
   if si < 0 || si >= sHeapIdx.length { return false }
   const sf = sFieldIndex(si, m.memProp)
   return sf >= 0 && sFieldIsUnionBox(si, sf)
+}
+
+// Which rung of `emitIs` answers `is` test `isIx`, in its order: `storage`, tested at its storage;
+// `tautology`, a frame local typed exactly the tested type; `covers`/`fits`, every member tested,
+// union or not; `prim`/`pin`, a non-union operand a primitive or a pin decides; else `test`,
+// `emitIsTest`'s rungs, which a float against integer literals takes too (D3689).
+export type IsPreArm = "storage"
+  | "tautology"
+  | "covers"
+  | "fits"
+  | "prim"
+  | "pin"
+  | "test"
+
+export function isPreArmOf(isIx: i32, fnIx: i32): IsPreArm {
+  const nd0 = nodeAt(isIx)
+  if !(nd0 is IsExpr) { return "test" }
+  if isTestsStorage(nd0.isObj, fnIx) { return "storage" }
+  const tested = isVarTyIxOf(isIx)
+  const covOp = nodeTyAt(nd0.isObj, fnIx)
+  const union = exprUnion(nd0.isObj, fnIx)
+  const tl = nodeAt(unwrapParen(nd0.isObj))
+  if (
+    tl is Ident
+    && localIndexOf(fnIx, unwrapParen(nd0.isObj)) >= 0
+    && covOp >= 0
+    && tested >= 0
+    && !isUnionOfTy(covOp)
+    && !union
+    && tySame(covOp, tested)
+  ) {
+    return "tautology"
+  }
+  if union && isTestedEveryMember(covOp, tested) { return "covers" }
+  if (
+    covOp >= 0
+    && !isUnionOfTy(covOp)
+    && !union
+    && tyUnionCovers(tested, covOp)
+  ) {
+    return "fits"
+  }
+  if emFloatIntLitTest(covOp, tested) { return "test" }
+  if tyPrimNameOf(covOp) != null && tyPrimNameOf(tested) != null && !union {
+    return "prim"
+  }
+  if !union && (isPinOwn(covOp, tested) || isPinUnrelated(covOp, tested)) {
+    return "pin"
+  }
+  return "test"
+}
+
+// Whether closed record or list type `op` is the tested type `t` itself.
+export function isPinOwn(op: i32, t: i32): boolean {
+  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
+  const ot = tyAt(op)
+  if tyHasTyVar(op) || tyHasHole(op) || !(ot is TyObj || ot is TyArray) {
+    return false
+  }
+  return tySame(op, t)
+}
+
+// Whether closed non-union type `op` is related by `assignable`, in either direction, to no
+// member of tested type `t`, a list against a list excepted.
+function isPinUnrelated(op: i32, t: i32): boolean {
+  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
+  if (
+    isUnionOfTy(op)
+    || tyHasTyVar(op)
+    || tyHasHole(op)
+    || tyAt(op) is TyNullable
+  ) {
+    return false
+  }
+  const tests: i32[] = []
+  flattenVariantsInto(t, tests)
+  if tests.length == 0 { return false }
+  const opList = tyAt(op) is TyArray
+  for x in tests {
+    if x < 0 || assignable(x, op) || assignable(op, x) { return false }
+    // An empty list fits every list type, so a list tested against a list is not decided.
+    if opList && tyAt(x) is TyArray { return false }
+  }
+  return true
 }

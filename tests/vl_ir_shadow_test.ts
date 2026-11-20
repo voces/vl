@@ -332,10 +332,10 @@ Deno.test({
 });
 
 // A `[]` binding its pushes follow is legacy's list reserve, built at its final size through
-// locals, and a list literal whose elements box into a union is a ref list legacy coerces: each a
-// named miss, never a byte mismatch.
+// locals and closed after its last push: covered and matched. A list literal whose elements box
+// into a union is a ref list legacy coerces: a named miss, never a byte mismatch.
 Deno.test({
-  name: "ir shadow: a reserved list binding and a union-element list literal are named misses",
+  name: "ir shadow: a reserved list binding matches, a union-element list literal misses by name",
   ignore,
   fn: () => {
     const src = `function rv(x: i32): i32 {
@@ -347,7 +347,10 @@ function ln(x: i32): (i32 | string)[] { return [x, "s"] }
 print(rv(2) + ln(2).length)
 `;
     const { rows } = run(src, true);
-    for (const want of ["uncovered declaration list reserve", "uncovered array ref"]) {
+    if (rows.get("covered") !== 1 || rows.get("matched") !== 1) {
+      throw new Error(`want the reserved binding covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    for (const want of ["uncovered array ref"]) {
       if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
     }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
@@ -910,7 +913,8 @@ print(two("a", "b"))
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
 // bound to a literal delivered to an atom, a tagged call's dispatch, and a delivery
-// `coerceKindAt` converts. Each program is the smallest the corpus has for its row.
+// `coerceKindAt` converts (a record copy into an `i64` field's row; a list copy that owes
+// nothing is the value). Each program is the smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
@@ -922,7 +926,7 @@ const PRE_PATHS: [string, string][] = [
   ],
   [
     "coercion",
-    `type Box1 = {[string]: {r: string}}[]\ntype Circle = { r: string }\nfunction thru(x: {[string]: {r: string}}[]) { return x }\nconst _sp1: Box1 = []\nfunction outer() {\n  const lv1 = Map()\n  const c = [lv1]\n  function inner() {\n    const dd = thru(c)\n    const g0 = dd\n    if g0.length > 0 {\n      const g1 = (g0[0])["k0"] ?? { r: "" }\n      if (g1).r == "seven" { print(7) } else { print(0) }\n    } else { print(0) }\n  }\n  inner()\n}\nouter()\n`,
+    `type K = { f: i64 }\nfunction mk() { return { f: 4 } }\nfunction main() {\n  const k: K = mk()\n  const y = mk()\n  print(y.f)\n  print(k.f)\n}\nmain()\n`,
   ],
 ];
 Deno.test({
@@ -962,6 +966,44 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (rows.has("uncovered pre-path tag leaf")) {
       throw new Error(`want no tag-leaf miss, got ${JSON.stringify([...rows])}`);
+    }
+    const covered = rows.get("covered") ?? 0;
+    if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A list delivery whose copy owes nothing past the value (`listCopyOwesNothing`) is the value as
+// built, so the builder takes it as a plain node: no coercion miss, and every covered function
+// matches legacy's bytes. The program is distilled cell b004880.
+const LIST_COPY_NONE = `function mkc(): {r: i32 | null}[][] {
+  const lv1 = [{ r: 7 }]
+  const cc = []
+  return cc
+}
+function rd() {
+  const c = mkc()
+  const g0 = c
+  if g0.length > 0 {
+    const g1 = g0[0]
+    if g1.length > 0 {
+      if (g1[0]).r != null { print(7) } else { print(0) }
+    } else { print(0) }
+  } else { print(0) }
+}
+rd()
+`;
+Deno.test({
+  name: "ir shadow: a list copy that owes nothing builds as its value and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LIST_COPY_NONE, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (rows.has("uncovered pre-path coercion")) {
+      throw new Error(`want no coercion pre-path miss, got ${JSON.stringify([...rows])}`);
     }
     const covered = rows.get("covered") ?? 0;
     if (covered === 0 || (rows.get("matched") ?? 0) !== covered) {
@@ -1069,6 +1111,48 @@ Deno.test({
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
       throw new Error(`want both functions covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A value `if` joined at a string or a list builds under legacy's ref blocktype and matches; one
+// that is a later operand of a string `+` sits above the earlier ones, a named miss.
+const REF_IF =
+  `function s(b: boolean, x: string, y: string): string {\n  const r = if b { x } else { y }\n  return r\n}\nfunction t(b: boolean, x: string): string {\n  return x + (if b { x } else { "no" })\n}\nfunction l(b: boolean, xs: i32[], ys: i32[]): i32 {\n  const r = if b { xs } else { ys }\n  return r.length\n}\nprint(s(true, "a", "b"))\nprint(s(false, "a", "b"))\nprint(t(false, "a"))\nprint(l(true, [1, 2], [3]))\n`;
+Deno.test({
+  name: "ir shadow: a value if joined at a string or a list builds and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(REF_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want s and l covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (!rows.has("uncovered string operand after another")) {
+      throw new Error(`want t a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
+// builds and matches, a literal arm included; a nullable union binding is a named miss.
+const LET_IF_BOX =
+  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction h(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string = if b { v } else { "x" }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(f(false, 1, "y"))\nprint(h(true, 1))\nprint(g(false, 1))\n`;
+Deno.test({
+  name: "ir shadow: a union binding's if initializer builds into a seeded box and matches legacy",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LET_IF_BOX, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and h covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if (!rows.has("uncovered declaration if per arm rep")) {
+      throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });

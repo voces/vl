@@ -185,3 +185,41 @@ print(g([[3], "s"]))
     }
   },
 });
+
+// A const cell's constant initializer hosts a fragment: a literal there matches legacy's bytes.
+Deno.test({
+  name: "ir door: a list literal in a const cell's initializer is hosted and matches",
+  ignore,
+  fn: () => {
+    const r = rows(`const T: i32[] = [1, 2, 3]
+function f(): i32 { return T[1] }
+print(f())
+`);
+    if ((r.get("node-in array: matched") ?? 0) < 1 || r.has("node-in array: miss fragment outside a body")) {
+      throw new Error(`want the initializer's literal hosted and matched, got ${show(r)}`);
+    }
+  },
+});
+
+// A local the fragment never declared takes its rep from the type; legacy's cell here is the
+// literal set's atom (D14757). The fragment must miss, not write the atom into a string list.
+Deno.test({
+  name: "ir door: a local whose legacy cell is not its type's rep misses",
+  ignore,
+  fn: () => {
+    const r = rows(`const A = "x"
+const B = "y"
+function main(c: boolean) {
+  const M = if c { A } else { B }
+  const xs = [M, "z"]
+  print(xs[0])
+}
+main(true)
+`);
+    if ((r.get("node-in array: miss local cell rep") ?? 0) < 1) {
+      throw new Error(`want the atom cell's read to miss, got ${show(r)}`);
+    }
+    const differ = [...r.keys()].filter((k) => k.startsWith("node-in array: differ"));
+    if (differ.length > 0) throw new Error(`want no differ, got ${show(r)}`);
+  },
+});
