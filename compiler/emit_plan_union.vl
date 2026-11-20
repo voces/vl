@@ -168,6 +168,7 @@ import {
   unionBoxTyIxOfExpr,
   unionNameOfRead,
   unionNameRowOfExpr,
+  exprMap,
 } from "./emit_classify"
 import {
   exprBoolListCode,
@@ -2034,6 +2035,121 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     "plain" => holeBox("atom", k, w.wpSrc)
     "instLit" | "floatLit" => holeBox("lit", k, -1)
     "asgLit" | "radix" | "convert" => ladder
+  }
+}
+
+// DIAG helpers.
+function diagKindOf(exprIx: i32, bareIx: i32, fnIx: i32): string {
+  const b = nodeAt(bareIx)
+  if b is ArrayLit { return "arraylit" }
+  if exprRefArray(exprIx, fnIx) { return "reflist" }
+  if exprIsClosure(exprIx, fnIx) { return "closure" }
+  if exprMap(exprIx, fnIx) { return "map" }
+  if tyBearsNull(nodeTyAt(bareIx, fnIx)) { return "nullable" }
+  if b is ObjLit { return "objlit" }
+  if b is Call { return "call" }
+  return "other " + tyToStr(nodeTyAt(bareIx, fnIx))
+}
+
+function diagDeclineOf(exprIx: i32, bareIx: i32, fnIx: i32): string {
+  if nulVariantIdxOfExpr(exprIx, fnIx) >= 0 { return "nulvariant" }
+  if exprVariantIndex(exprIx, fnIx) >= 0 { return "variant" }
+  if structIndexOfExpr(exprIx, fnIx) >= 0 { return "struct" }
+  if exprNulBool(bareIx, fnIx) { return "nulbool" }
+  if coalesceNulRefNicheOperand(bareIx, fnIx) { return "coalesce niche" }
+  return "map read"
+}
+
+// DIAG: why the box plan answers ladder.
+export function holeBoxPlanWhyDiag(exprIx: i32, unionTy: i32, fnIx: i32): string {
+    const ur = repNodeAt(repNodeOfTy(unionTy))
+  // A non-null value union's box and a boxed `T | null` share the box's tag and payload.
+  if (
+    !(ur is RBox || ur is RNullable && ur.rnDisc == 4)
+    || mapTwinUnionMember(unionTy) >= 0
+  ) {
+    return "L1 return ladder"
+  }
+  if boxDstName("", unionTy) == "" || unionArmTagClash(unionTy) != "" {
+    return "L2 return ladder"
+  }
+  const bareIx = unwrapParen(exprIx)
+  if bareIx < 0 { return "L3 if bareIx  0  return ladder " }
+  const bare = nodeAt(bareIx)
+  if bare is IfStmt || bare is Index || callIsNever(bareIx) { return "L4 if bare is IfStmt  bare is Index  callIsNeverbareI" }
+  if exprUnion(exprIx, fnIx) { return if holePassPlanOf(exprIx, unionTy, fnIx).hbArm == "ladder" { "pass ladder" } else { "" } }
+  // `emitUnionArmValueBox`'s two plain rungs: a record boxed as itself under its arm.
+  if (
+    exprVariantIndex(exprIx, fnIx) >= 0
+    || structIndexOfExpr(exprIx, fnIx) >= 0
+  ) {
+    const rv = armValuePlainOf(unionTy, exprIx, fnIx)
+    if rv >= 0 { return "" }
+  }
+  // Every rung below takes a value the record, niche and map rungs above it decline.
+  if (
+    nulVariantIdxOfExpr(exprIx, fnIx) >= 0
+    || exprVariantIndex(exprIx, fnIx) >= 0
+    || structIndexOfExpr(exprIx, fnIx) >= 0
+    || exprNulBool(bareIx, fnIx)
+    || coalesceNulRefNicheOperand(bareIx, fnIx)
+    || mapReadScalarBoxKind(exprIx, fnIx) >= 0
+  ) {
+    return "L5 " + diagDeclineOf(exprIx, bareIx, fnIx)
+  }
+  // `emitUnionCoerceUnder`'s literal rung, or the null-typed value's.
+  if bare is NullLit { return "" }
+  if exprIsNulNone(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
+    return "L6 return ladder"
+  }
+  const uSet = msSetOfRow(unRowOfTyKey(unionTy))
+  if exprIsLitAtom(exprIx, fnIx) {
+    const ur2 = unRowOfTyKey(unionTy)
+    const ums = unionMemberSetOfRow(ur2, boxDstName("", unionTy))
+    const un = if ums != "" { ums } else { boxDstName("", unionTy) }
+    const ok = coerceTakesAtomAsStr(uSet, unionTy)
+      && nulAtomWidenTexts(exprIx, fnIx).length > 0
+      && atomNulStrWhy(un, uSet, unionTy, exprIx, fnIx) == ""
+    return if ok { "" } else { "atomStr declined" }
+  }
+  // A scalar list rides the box as itself under its list kind's tag (`emitUnionCoerceAtomBox`):
+  // a literal, a ref-element list, a closure and the atom list each have a rung of their own.
+  const bareTy = nodeTyAt(bareIx, fnIx)
+  if (
+    bareTy >= 0
+    && tyAt(bareTy) is TyArray
+    && !(bare is ArrayLit)
+    && !exprRefArray(exprIx, fnIx)
+    && !exprIsClosure(exprIx, fnIx)
+  ) {
+    const lk = coerceListAtomOf(
+      coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
+      unionTy,
+      bareIx,
+      fnIx,
+    )
+    if lk > 5 && listWrapHeapOfKind(lk) >= 0 {
+      if lk == 7 && exprIsAtomList(bareIx, fnIx) { return "L7 if lk  7  exprIsAtomListbareIx fnIx  return ladder" }
+      return ""
+    }
+  }
+  const pn = tyPrimNameOf(nodeTyAt(bareIx, fnIx))
+  if pn == null { return "L8 nonprim " + diagKindOf(exprIx, bareIx, fnIx) }
+  const pk = holePrimKind(pn)
+  if pk < 0 { return "L9 if pk  0  return ladder " }
+  const k = coerceListAtomOf(
+    coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
+    unionTy,
+    bareIx,
+    fnIx,
+  )
+  if k < 0 || k > 5 { return "L10 if k  0  k  5  return ladder " }
+  if k < 3 { return if k == pk { "" } else { "atom kind mismatch" } }
+  const w = widenPlanOf(exprIx, k, fnIx)
+  return match w.wpArm {
+    "plain" => ""
+    "instLit" | "floatLit" => ""
+    "asgLit" | "radix" | "convert" => "widen " + w.wpArm
   }
 }
 
