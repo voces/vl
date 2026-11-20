@@ -223,3 +223,38 @@ main(true)
     if (differ.length > 0) throw new Error(`want no differ, got ${show(r)}`);
   },
 });
+
+// A `for` walk's literal iterable reads the module list legacy hoists; the fragment's read is
+// the same global, so the plain, parenthesized, nested and string spellings all match.
+Deno.test({
+  name: "ir door: a for walk's literal iterable reads the hoisted list and matches",
+  ignore,
+  fn: () => {
+    const r = rows(`function plain(): i32 {
+  let t = 0
+  for x in [1, 2, 3] { t = t + x }
+  return t
+}
+function paren(): i32 {
+  let t = 0
+  for x in ([4, 5]) { t = t + x }
+  return t
+}
+function nested(): i32 {
+  let t = 0
+  for xs in [[1, 2], [3]] { t = t + xs.length }
+  return t
+}
+function strs(): i32 {
+  let t = 0
+  for s in ["a", "bb"] { t = t + s.length }
+  return t
+}
+print(plain() + paren() + nested() + strs())
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 4 || off.length > 0) {
+      throw new Error(`want every for-walk literal matched, got ${show(r)}`);
+    }
+  },
+});

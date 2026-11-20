@@ -12285,8 +12285,12 @@ function emitArrV128(elems: i32[], fnIx: i32) {
 
 // The f64-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on failure.
 function emitArrF64(arrIx: i32, elems: i32[], fnIx: i32) {
-  const hF64 = forLitHoist(arrIx, elems, fnIx, ALD_F64, fa64Ty(), fl64Ty())
-  if hF64 != 0 { return if hF64 < 0 { -1 } else { 0 } }
+  const hF64 = arrLitHoistGlobal(arrIx, fnIx, "f64")
+  if hF64 == -2 { return -1 }
+  if hF64 >= 0 {
+    fbGlobalGet(hF64)
+    return 0
+  }
   let dstF64 = -1
   let coffF64 = 0
   if elems.length > NEW_FIXED_MAX {
@@ -12350,8 +12354,12 @@ function emitArrI64(elems: i32[], fnIx: i32) {
 // The string-list arm of `emitArrUnder`. Returns 0 once the list is on the stack, -1 on
 // failure.
 function emitArrStr(arrIx: i32, elems: i32[], fnIx: i32) {
-  const hStr = forLitHoist(arrIx, elems, fnIx, ALD_STR, mkArrTy(), mkListTy())
-  if hStr != 0 { return if hStr < 0 { -1 } else { 0 } }
+  const hStr = arrLitHoistGlobal(arrIx, fnIx, "str")
+  if hStr == -2 { return -1 }
+  if hStr >= 0 {
+    fbGlobalGet(hStr)
+    return 0
+  }
   let dstStr = -1
   let coffStr = 0
   if elems.length > allocLitChunk() {
@@ -12569,8 +12577,12 @@ function emitArrI32(arrIx: i32, elems: i32[], fnIx: i32, lbKind: i32) {
     || lbKind == LBK_NUL_LIT_UNION_LIST
   ) {
   }
-  const hI32 = forLitHoist(arrIx, elems, fnIx, ALD_I32, aTy(), lTy())
-  if hI32 != 0 { return if hI32 < 0 { -1 } else { 0 } }
+  const hI32 = arrLitHoistGlobal(arrIx, fnIx, "i32")
+  if hI32 == -2 { return -1 }
+  if hI32 >= 0 {
+    fbGlobalGet(hI32)
+    return 0
+  }
   let dstI32 = -1
   let coffI32 = 0
   if elems.length > NEW_FIXED_MAX {
@@ -12714,8 +12726,9 @@ export function arrLitPrologue(arrIx: i32): i32 {
 }
 
 // Why list literal `arrIx` of `n` elements does not build at arm `arm` with `array.new_fixed` and
-// the short tail, or "": past the chunk cap (a string list's own), the hoisted `for` iterable, or
-// an i32 list seeded with a `null` sentinel. A literal-union list's atoms are its elements' own.
+// the short tail, or "": past the chunk cap (a string list's own), or an i32 list seeded with a
+// `null` sentinel. A literal-union list's atoms are its elements' own, and a hoisted `for`
+// iterable reads its module list instead (`arrLitHoistGlobal`).
 export function arrLitShortWhy(
   arrIx: i32,
   fnIx: i32,
@@ -12724,14 +12737,24 @@ export function arrLitShortWhy(
 ): string {
   const cap = if arm == "str" { allocLitChunk() } else { NEW_FIXED_MAX }
   if n > cap { return "long" }
-  if arrLitIsForIter(arrIx) { return "for iterable" }
   if arm == "i32" && arrElemIsNullUnitAt(arrIx, fnIx) { return "null sentinel" }
   return ""
 }
 
-// Whether list literal `arrIx` is the `for` iterable whose constants hoist into a module list.
+// Whether list literal `arrIx` is a `for` walk's iterable, whose constants hoist into a module
+// list. The arena is scanned on demand, so a node an instance adds later is still seen.
 export function arrLitIsForIter(arrIx: i32): boolean {
-  return arrIx == gForIterLit
+  while forIterScanned < P.nodes.length {
+    const n = nodeAt(forIterScanned)
+    if n is ForIn {
+      const it = unwrapParen(n.fiIter)
+      if it >= 0 && it < P.nodes.length && nodeAt(it) is ArrayLit {
+        forIterLits.set(it, true)
+      }
+    }
+    forIterScanned = forIterScanned + 1
+  }
+  return forIterLits.has(arrIx)
 }
 
 // ── G8: string-keyed maps — the open-addressing hash map ─────────────────────
@@ -15356,14 +15379,30 @@ function fbBacking(ty: i32, n: i32) {
   return fbArrayNewFixed(ty, n)
 }
 
-// The list literal a `for` is iterating, while its iterable is emitted, else -1. Nothing but
-// the loop can reach that list, and the loop only reads it.
-let gForIterLit = -1
+// The list literals that are a `for` walk's own iterable (`unwrapParen(fiIter)`), scanned from the
+// arena up to `forIterScanned`. Nothing but the loop can reach such a list, and it only reads it.
+let forIterLits: {[i32]: boolean} = Map()
+let forIterScanned = 0
+
+// The module constant list `for` iterable literal `arrIx` of arm `arm` reads, minted on first ask:
+// its global, -1 when it builds as usual (another arm, or an element not one constant), -2 failed.
+// The f64, string and i32 arms hoist; legacy's arm and the IR's lowering both ask here.
+export function arrLitHoistGlobal(arrIx: i32, fnIx: i32, arm: ArrLitArm): i32 {
+  if arrIx < 0 || arrIx >= P.nodes.length { return -1 }
+  const a = nodeAt(arrIx)
+  if !(a is ArrayLit) { return -1 }
+  return match arm {
+    "f64" => forLitHoistPlan(arrIx, a.arrElems, fnIx, ALD_F64, fa64Ty(), fl64Ty())
+    "str" => forLitHoistPlan(arrIx, a.arrElems, fnIx, ALD_STR, mkArrTy(), mkListTy())
+    "i32" => forLitHoistPlan(arrIx, a.arrElems, fnIx, ALD_I32, aTy(), lTy())
+    "notLit" | "spread" | "clash" | "emptyHole" | "v128" | "u8" | "f32" | "i64" | "ref" => -1
+  }
+}
 
 // Lowers `for` iterable literal `arrIx` of constants as a read of one module constant list
 // built by the same element lowering (`form`, an `ALD_*` or `ALD_STR`) into `backTy`/`wrapTy`.
-// 1 when it did, 0 when the literal must build as usual (nothing emitted), -1 on failure.
-function forLitHoist(
+// Its global, -1 when the literal must build as usual, -2 on failure; nothing is written.
+function forLitHoistPlan(
   arrIx: i32,
   elems: i32[],
   fnIx: i32,
@@ -15371,12 +15410,16 @@ function forLitHoist(
   backTy: i32,
   wrapTy: i32,
 ): i32 {
-  if arrIx != gForIterLit || elems.length == 0 || elems.length > NEW_FIXED_MAX {
-    return 0
+  if (
+    !arrLitIsForIter(arrIx)
+    || elems.length == 0
+    || elems.length > NEW_FIXED_MAX
+  ) {
+    return -1
   }
   let i = 0
   while i < elems.length {
-    if !forLitElemIsConst(elems[i]) { return 0 }
+    if !forLitElemIsConst(elems[i]) { return -1 }
     i = i + 1
   }
   const init: u8[] = []
@@ -15391,8 +15434,8 @@ function forLitHoist(
       rc = arrLitDataElemEmit(elems[i], fnIx, form)
     }
     wTarget(prev)
-    if rc < 0 { return -1 }
-    if !isOneConstIns(one) { return 0 }
+    if rc < 0 { return -2 }
+    if !isOneConstIns(one) { return -1 }
     relCopy(one, init, init.length)
     let k = 0
     while k < one.length {
@@ -15407,9 +15450,7 @@ function forLitHoist(
   wTarget(prev)
   relHold(init)
   const g = synthConstListIdx(wrapTy, init)
-  if g < 0 { return 0 }
-  fbGlobalGet(g)
-  return 1
+  return if g < 0 { -1 } else { g }
 }
 
 // The element form `forLitHoist` lowers through `emitStrValue`.
@@ -30979,11 +31020,7 @@ function pushListBacking(lIdx: i32, lTy: i32) {
 // re-emitted, so the walked list, tombstone `live[]` and loop bound stay on one object.
 function emitForInList(iterIx: i32, fnIx: i32, mapRecv: i32, mwShape: i32) {
   if mapRecv >= 0 { return forInMapList(iterIx, fnIx, mwShape) }
-  const prevLit = gForIterLit
-  gForIterLit = unwrapParen(iterIx)
-  const rc = emitExpr(iterIx, fnIx)
-  gForIterLit = prevLit
-  if rc < 0 { return -1 }
+  if emitExpr(iterIx, fnIx) < 0 { return -1 }
   return svSyncRecv(iterIx, fnIx)
 }
 
@@ -36005,7 +36042,8 @@ export function wasmEmitStateReset() {
   arrNewFillDepth = 0
   eqStashL = -1
   eqStashR = -1
-  gForIterLit = -1
+  forIterLits = Map()
+  forIterScanned = 0
   hmFn = -2
   hmIdxSeen = 0
   idxSpanNode = -1
