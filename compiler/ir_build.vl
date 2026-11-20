@@ -180,6 +180,10 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
+  memAccessCallNamed,
+  memAccessPlanOf,
+  memAddrPlanOf,
+  memCallArg,
   numCastKindOf,
   numCastKindTy,
   numIntrCallReached,
@@ -1775,6 +1779,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
+  if memAccessCallNamed(c, ibFnIx) { return memAccessRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
   }
@@ -3076,6 +3081,40 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   }
   if irBOpRep(v) != ln.rlsElem { return irBMiss("array new fill coercion") }
   return irBLetTemp(b, { lnLen: len, lnFill: v, lnAt: ix }, ix, rep)
+}
+
+// A linear-memory load or store of an i32 as legacy's arm writes it (`memAccessPlanOf`): the
+// address along `memAddrPlanOf`'s `const` arm (an immediate 0) or `rest` arm (its node), then a
+// store's value. A widened store value and every other address arm are named misses.
+function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return missRhs("memory access callee") }
+  const p = memAccessPlanOf(f.identName)
+  if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
+  if !p.mxI32 || p.mxWiden >= 0 { return missRhs("memory access wide value") }
+  const ap = memAddrPlanOf(c, p.mxBase, ibFnIx)
+  const at = b.length
+  const args: Opnd[] = []
+  match ap.maArm {
+    "const" => {
+      const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
+      args.push(z)
+    }
+    "rest" => args.push(irBExpr(b, ap.maRest))
+    "bad" | "lma" | "fold" | "wide" => {
+      return missRhs("memory address " + ap.maArm)
+    }
+  }
+  if p.mxBase == 2 { args.push(irBExpr(b, memCallArg(c, 2, 1))) }
+  if ibMiss != "" { return missRhs("memory access operand") }
+  if ifBelowLead(b, at, "memory access short-circuit operand") {
+    return missRhs("memory access short-circuit operand")
+  }
+  for o in args {
+    if repPrim(irBOpRep(o)) != "i32" { return missRhs("memory access operand coercion") }
+  }
+  const r: Rhs = { mmArgs: args, mmAt: ix }
+  return r
 }
 
 // `__array_copy__(dst, dstAt, src, srcAt, count)` as legacy's arm writes it (`arrCopyPlanOf`): the
