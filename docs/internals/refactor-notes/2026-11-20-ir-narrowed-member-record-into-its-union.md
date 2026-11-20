@@ -47,7 +47,7 @@ plus a record and a union parameter, an early return into either, and interpolat
 The variant template's five SILENT cells are SILENT before as well, and before #9251: a module
 `const` receiver whose record is a union member, delivered at the member record (`record_param`
 in both faces; the un-annotated `argument`, `early_return_guard`, `fn_body_capture`). That is
-another reader, filed as unfiled: D17028. The six positions #9251 broke are read off a parameter
+another reader, filed as D17028. The six positions #9251 broke are read off a parameter
 receiver, which the template's module `const` does not reach; the union-member case file holds
 them.
 
