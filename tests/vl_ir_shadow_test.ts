@@ -1134,9 +1134,9 @@ Deno.test({
 });
 
 // A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
-// builds and matches; an arm the box table does not deliver is a named miss.
+// builds and matches, a literal arm included; a nullable union binding is a named miss.
 const LET_IF_BOX =
-  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction h(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string = if b { v } else { "x" }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(f(false, 1, "y"))\nprint(h(true, 1))\n`;
+  `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction h(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string = if b { v } else { "x" }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(f(false, 1, "y"))\nprint(h(true, 1))\nprint(g(false, 1))\n`;
 Deno.test({
   name: "ir shadow: a union binding's if initializer builds into a seeded box and matches legacy",
   ignore,
@@ -1145,11 +1145,11 @@ Deno.test({
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
-      throw new Error(`want f covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and h covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!rows.has("uncovered declaration if per arm coercion")) {
-      throw new Error(`want h a named miss, got ${JSON.stringify([...rows])}`);
+    if (!rows.has("uncovered declaration if per arm rep")) {
+      throw new Error(`want g a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
