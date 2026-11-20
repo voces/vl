@@ -15,8 +15,10 @@
   operand`; only census labels move.
 - **Lowering.** The helper arm calls `__map_get_<row>__` with `mapGetMissOf`'s miss. The inline arm
   runs IR2's `mapProbeHead` (#9260), then `emitMapGetTail`. Then comes the narrowed read's tail.
-  The read's `vl-src` element row is banked as `emitIndexBanked` banks it. The lowering asks
-  `mapGetArmOf` and `userGlobalReadClass` again, and misses on any disagreement.
+  Banking the read's `vl-src` element row (`irLIndexRow`) is a side effect of lowering. It mirrors
+  `emitIndexBanked` at legacy's point, around the receiver, the key and the tail. Without it,
+  `--names` differed in the section alone. The lowering asks `mapGetArmOf` and
+  `userGlobalReadClass` again, and misses on any disagreement.
 - **Verifier.** An `RMap` receiver, and a result at the value's rep or at that rep's nullable.
 - **Builder reps.**
   - An mv slot's ref value at its disc-1 niche, or as itself when the read is narrowed: the read's
