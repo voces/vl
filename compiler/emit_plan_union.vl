@@ -14,6 +14,7 @@ import {
   IsExpr,
   Member,
   NullLit,
+  ObjLit,
   OptMember,
   P,
   StrLit,
@@ -64,6 +65,7 @@ import {
   softenLitTy,
   tyArrayElemIx,
   tyAt,
+  tyBearsNull,
   tyElemOf,
   tyEq,
   tyHasHole,
@@ -122,6 +124,7 @@ import {
   exprF32Array,
   exprF64Array,
   exprI64Array,
+  exprIsClosure,
   exprIsF32,
   exprIsF64,
   exprIsI64,
@@ -138,6 +141,7 @@ import {
   exprNullableString,
   exprNullableStruct,
   exprPackedRow,
+  exprRefArray,
   exprString,
   exprStringArray,
   exprU8Array,
@@ -1919,11 +1923,17 @@ export function coerceListAtomOf(
   return cak
 }
 
-// How a value is boxed into its recorded `T | null` box: the null tag (`null`), a box as itself
-// (`pass`), a value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over
-// a literal at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), or
-// the box writer's own ladder (`ladder`).
-export type HoleBoxArm = "null" | "pass" | "atom" | "lit" | "atomStr" | "ladder"
+// How a value is boxed into its recorded box: the null tag (`null`), a box as itself (`pass`), a
+// value-atom box of kind `hbKind` widened from `hbSrc` unless -1 (`atom`), that box over a literal
+// at the payload width (`lit`), a `K | null` atom as its member string (`atomStr`), a record as
+// itself under arm `hbKind`'s tag (`rec`), or the box writer's own ladder (`ladder`).
+export type HoleBoxArm = "null"
+  | "pass"
+  | "atom"
+  | "lit"
+  | "atomStr"
+  | "rec"
+  | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
 
@@ -1952,6 +1962,14 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const bare = nodeAt(bareIx)
   if bare is IfStmt || bare is Index || callIsNever(bareIx) { return ladder }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
+  // `emitUnionArmValueBox`'s two plain rungs: a record boxed as itself under its arm.
+  if (
+    exprVariantIndex(exprIx, fnIx) >= 0
+    || structIndexOfExpr(exprIx, fnIx) >= 0
+  ) {
+    const rv = armValuePlainOf(unionTy, exprIx, fnIx)
+    if rv >= 0 { return holeBox("rec", rv, -1) }
+  }
   // Every rung below takes a value the record, niche and map rungs above it decline.
   if (
     nulVariantIdxOfExpr(exprIx, fnIx) >= 0
@@ -1978,6 +1996,27 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
       && atomNulStrWhy(un, uSet, unionTy, exprIx, fnIx) == ""
     return if ok { holeBox("atomStr", 2, -1) } else { ladder }
   }
+  // A scalar list rides the box as itself under its list kind's tag (`emitUnionCoerceAtomBox`):
+  // a literal, a ref-element list, a closure and the atom list each have a rung of their own.
+  const bareTy = nodeTyAt(bareIx, fnIx)
+  if (
+    bareTy >= 0
+    && tyAt(bareTy) is TyArray
+    && !(bare is ArrayLit)
+    && !exprRefArray(exprIx, fnIx)
+    && !exprIsClosure(exprIx, fnIx)
+  ) {
+    const lk = coerceListAtomOf(
+      coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
+      unionTy,
+      bareIx,
+      fnIx,
+    )
+    if lk > 5 && listWrapHeapOfKind(lk) >= 0 {
+      if lk == 7 && exprIsAtomList(bareIx, fnIx) { return ladder }
+      return holeBox("atom", lk, -1)
+    }
+  }
   const pn = tyPrimNameOf(nodeTyAt(bareIx, fnIx))
   if pn == null { return ladder }
   const pk = holePrimKind(pn)
@@ -1996,6 +2035,55 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     "instLit" | "floatLit" => holeBox("lit", k, -1)
     "asgLit" | "radix" | "convert" => ladder
   }
+}
+
+// The arm of `unionTy` record `exprIx` boxes under as itself, or -1: a record, or a bare variant
+// whose heap no arm holds, its row a subtype of the arm's; never a literal naming an arm, a value
+// that can be null, or a box. `emitUnionWideArmBox`'s plain rung, and the box plan's `rec` arm.
+export function wideArmPlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bareIx = unwrapParen(exprIx)
+  if bareIx < 0 || bareIx >= P.nodes.length { return -1 }
+  if nodeAt(bareIx) is ObjLit && exprVariantIndex(exprIx, fnIx) >= 0 {
+    return -1
+  }
+  if tyBearsNull(nodeTyAt(bareIx, fnIx)) || exprUnion(exprIx, fnIx) {
+    return -1
+  }
+  const atoms: i32[] = []
+  unionArmRowsOfTy(unionTy, atoms)
+  const svi = exprVariantIndex(exprIx, fnIx)
+  let row = -1
+  if svi >= 0 {
+    if armsHoldHeap(atoms, variantHeap(svi)) { return -1 }
+    row = variantRowOf(svi)
+  } else {
+    row = structIndexOfExpr(exprIx, fnIx)
+  }
+  const vi = wideArmOfRow(row, atoms)
+  return if vi < 0 || vi >= uTags.length { -1 } else { vi }
+}
+
+// The arm `emitUnionArmValueBox` boxes non-null record `exprIx` under as itself, or -1: the arm
+// its row subtypes (`wideArmPlainOf`), else its own variant's arm where it is built on that
+// variant's heap. A value that may be null, a box, or a record rebuilt onto the arm is -1.
+export function armValuePlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bareIx = unwrapParen(exprIx)
+  if (
+    exprUnion(exprIx, fnIx)
+    || nodeTyIsNullable(bareIx)
+    || tyBearsNull(nodeTyAt(bareIx, fnIx))
+  ) {
+    return -1
+  }
+  const wv = wideArmPlainOf(unionTy, exprIx, fnIx)
+  if wv >= 0 { return wv }
+  const svi = exprVariantIndex(exprIx, fnIx)
+  if svi < 0 || svi >= uTags.length { return -1 }
+  const si = structIndexOfExpr(exprIx, fnIx)
+  if si >= 0 && si < sHeapIdx.length && sHeapIdx[si] != variantHeap(svi) {
+    return -1
+  }
+  return svi
 }
 
 // The value-atom kind of primitive `pn`, -1 for one that is no value atom here.
