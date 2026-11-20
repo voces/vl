@@ -309,6 +309,7 @@ import {
 } from "./emit_ty_canon"
 import {
   identChainTyBoxedUnion,
+  isUnionOfTy,
   mapValueTyOf,
   unRowOfRecordTy,
 } from "./emit_union_atoms"
@@ -365,6 +366,7 @@ import {
   tyIsUnionShaped,
   tyMapValOf,
   tyNumLitMemberTexts,
+  tyUnionCovers,
 } from "./tyquery"
 
 // The capture slot `name` reads from the env of capturing function `fnIx`, or -1.
@@ -868,14 +870,9 @@ function litIsPinNever(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
 // is not read at its storage, and the tested type does not hold every member.
 export function isBoxGuardPlain(isIx: i32, fnIx: i32): boolean {
   const nd = nodeAt(isIx)
-  if (
-    !(nd is IsExpr)
-    || !exprUnion(nd.isObj, fnIx)
-    || isTestsStorage(nd.isObj, fnIx)
-  ) {
-    return false
-  }
-  return !isTestedEveryMember(nodeTyAt(nd.isObj, fnIx), isVarTyIxOf(isIx))
+  return nd is IsExpr
+    && exprUnion(nd.isObj, fnIx)
+    && isPreArmOf(isIx, fnIx) == "test"
 }
 
 // Whether every member of union operand type `op` is a member of the tested type `t`, the
@@ -1242,9 +1239,7 @@ export function tagIsArmOf(isIx: i32, nd: IsExpr, fnIx: i32): TagIsArm {
       }
     }
     if vrecv is Member && memberUnionFieldNameRead(r, fnIx) != "" {
-      if memNarrowVariantIndex(r, fnIx) >= 0 && exprUnion(vrecv.memObj, fnIx) {
-        return "memNarrow"
-      }
+      if memReadArmOf(r, fnIx) == "narrowed" { return "memNarrow" }
       const msi = structIndexOfExpr(vrecv.memObj, fnIx)
       if msi >= 0 && sFieldIndex(msi, vrecv.memProp) >= 0 { return "memStruct" }
       const vi = exprVariantIndex(vrecv.memObj, fnIx)
@@ -1546,13 +1541,31 @@ function isNoMembershipRecv(isIx: i32, nd: IsExpr, fnIx: i32): boolean {
     && !tyIsTpJoinUnion(msObj)
 }
 
+// Which arm of `emitMem` reads member `memIx`: `narrowed`, a box receiver narrowed to one
+// variant (`emitNarrowedMem`); `variant` or `nulVariant`, a bare or nullable variant receiver;
+// `shared`, the shared-field dispatch and the struct read under it, and any non-member node.
+export type MemReadArm = "narrowed" | "variant" | "nulVariant" | "shared"
+
+// The arm `emitMem` and the IR's member reads take for `memIx`, in `emitMem`'s order.
+export function memReadArmOf(memIx: i32, fnIx: i32): MemReadArm {
+  const m = nodeAt(memIx)
+  if !(m is Member) { return "shared" }
+  if memNarrowVariantIndex(memIx, fnIx) >= 0 && exprUnion(m.memObj, fnIx) {
+    return "narrowed"
+  }
+  if exprVariantIndex(m.memObj, fnIx) >= 0 { return "variant" }
+  return if nulVariantIdxOfExpr(m.memObj, fnIx) >= 0 { "nulVariant" } else { "shared" }
+}
+
 // The variant field `emitExpr` reads off a narrowed box local in `emitNarrowedMem`'s plain form,
 // or -1: no null-unit or niche read, no `length`, a box receiver read raw, and no union-box field
 // to unbox.
 export function narrowedFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
-  if !(nodeAt(m.memObj) is Ident) || !exprUnion(m.memObj, fnIx) { return -1 }
+  if !(nodeAt(m.memObj) is Ident) || memReadArmOf(memIx, fnIx) != "narrowed" {
+    return -1
+  }
   const vi = memNarrowVariantIndex(memIx, fnIx)
   if vi < 0 || vi >= uFieldStart.length { return -1 }
   const idx = variantFieldIndex(vi, m.memProp)
@@ -3094,11 +3107,9 @@ export function lengthIsField(m: Member, memIx: i32, fnIx: i32): boolean {
 export function variantFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) { return -1 }
-  if memNarrowVariantIndex(memIx, fnIx) >= 0 && exprUnion(m.memObj, fnIx) {
-    return -1
-  }
+  if memReadArmOf(memIx, fnIx) != "variant" { return -1 }
   const vi = exprVariantIndex(m.memObj, fnIx)
-  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  if vi >= uFieldStart.length { return -1 }
   const idx = variantFieldIndex(vi, m.memProp)
   if idx < 0 { return -1 }
   if fieldRowIsUnionBox(uFieldStart[vi] + idx) { return idx }
@@ -3122,13 +3133,7 @@ export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   const m = nodeAt(memIx)
   if !memberReadPlain(memIx, fnIx) || !(m is Member) || !sDeclared { return -1 }
   const o = m.memObj
-  if (
-    exprUnion(o, fnIx)
-    || exprVariantIndex(o, fnIx) >= 0
-    || nulVariantIdxOfExpr(o, fnIx) >= 0
-  ) {
-    return -1
-  }
+  if memReadArmOf(memIx, fnIx) != "shared" || exprUnion(o, fnIx) { return -1 }
   if nodeTyAt(o, fnIx) == TY_NEVER || exprNullableStruct(o, fnIx) { return -1 }
   const si = structIndexOfExpr(o, fnIx)
   if si < 0 || si >= sHeapIdx.length { return -1 }
@@ -3154,4 +3159,88 @@ export function memFieldUnionBox(memIx: i32, fnIx: i32): boolean {
   if si < 0 || si >= sHeapIdx.length { return false }
   const sf = sFieldIndex(si, m.memProp)
   return sf >= 0 && sFieldIsUnionBox(si, sf)
+}
+
+// Which rung of `emitIs` answers `is` test `isIx`, in its order: `storage`, tested at its storage;
+// `tautology`, a frame local typed exactly the tested type; `covers`/`fits`, every member tested,
+// union or not; `prim`/`pin`, a non-union operand a primitive or a pin decides; else `test`,
+// `emitIsTest`'s rungs, which a float against integer literals takes too (D3689).
+export type IsPreArm = "storage"
+  | "tautology"
+  | "covers"
+  | "fits"
+  | "prim"
+  | "pin"
+  | "test"
+
+export function isPreArmOf(isIx: i32, fnIx: i32): IsPreArm {
+  const nd0 = nodeAt(isIx)
+  if !(nd0 is IsExpr) { return "test" }
+  if isTestsStorage(nd0.isObj, fnIx) { return "storage" }
+  const tested = isVarTyIxOf(isIx)
+  const covOp = nodeTyAt(nd0.isObj, fnIx)
+  const union = exprUnion(nd0.isObj, fnIx)
+  const tl = nodeAt(unwrapParen(nd0.isObj))
+  if (
+    tl is Ident
+    && localIndexOf(fnIx, unwrapParen(nd0.isObj)) >= 0
+    && covOp >= 0
+    && tested >= 0
+    && !isUnionOfTy(covOp)
+    && !union
+    && tySame(covOp, tested)
+  ) {
+    return "tautology"
+  }
+  if union && isTestedEveryMember(covOp, tested) { return "covers" }
+  if (
+    covOp >= 0
+    && !isUnionOfTy(covOp)
+    && !union
+    && tyUnionCovers(tested, covOp)
+  ) {
+    return "fits"
+  }
+  if emFloatIntLitTest(covOp, tested) { return "test" }
+  if tyPrimNameOf(covOp) != null && tyPrimNameOf(tested) != null && !union {
+    return "prim"
+  }
+  if !union && (isPinOwn(covOp, tested) || isPinUnrelated(covOp, tested)) {
+    return "pin"
+  }
+  return "test"
+}
+
+// Whether closed record or list type `op` is the tested type `t` itself.
+export function isPinOwn(op: i32, t: i32): boolean {
+  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
+  const ot = tyAt(op)
+  if tyHasTyVar(op) || tyHasHole(op) || !(ot is TyObj || ot is TyArray) {
+    return false
+  }
+  return tySame(op, t)
+}
+
+// Whether closed non-union type `op` is related by `assignable`, in either direction, to no
+// member of tested type `t`, a list against a list excepted.
+function isPinUnrelated(op: i32, t: i32): boolean {
+  if op < 0 || op >= T.tys.length || t < 0 || t >= T.tys.length { return false }
+  if (
+    isUnionOfTy(op)
+    || tyHasTyVar(op)
+    || tyHasHole(op)
+    || tyAt(op) is TyNullable
+  ) {
+    return false
+  }
+  const tests: i32[] = []
+  flattenVariantsInto(t, tests)
+  if tests.length == 0 { return false }
+  const opList = tyAt(op) is TyArray
+  for x in tests {
+    if x < 0 || assignable(x, op) || assignable(op, x) { return false }
+    // An empty list fits every list type, so a list tested against a list is not decided.
+    if opList && tyAt(x) is TyArray { return false }
+  }
+  return true
 }
