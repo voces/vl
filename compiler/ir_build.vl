@@ -110,6 +110,7 @@ import {
   PrintArm,
   StructFieldArm,
   VariantFieldArm,
+  arrLitLongRouteOf,
   arrLitShortWhy,
   asgValueArmOf,
   atomStrPlanOf,
@@ -2861,7 +2862,14 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
     return irBMiss("array " + arm)
   }
   const sw = if arm == "ref" { "" } else { arrLitShortWhy(ix, ibFnIx, arm, n.arrElems.length) }
-  if sw != "" { return irBMiss("array " + sw) }
+  // A long literal of constants builds from one data segment (`arrLitLongRouteOf`); a computed
+  // element's store or a chunked build is legacy's.
+  if sw == "long" {
+    const route = arrLitLongRouteOf(n.arrElems, ibFnIx, arm, lb.lbSlot)
+    if route != "dataConst" { return irBMiss("array long " + route) }
+  } else if sw != "" {
+    return irBMiss("array " + sw)
+  }
   // Typed at the type legacy's build decision takes (`arrLitBuiltTyOf`): an instance's `[1.5]` at
   // `T[]` is an f32 list where its stamp says f64. Its own-shape route keeps the stamp.
   const bt = arrLitBuiltTyOf(ix, ibFnIx)
@@ -2880,8 +2888,9 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   // A packed list's elements are built as plain i32s, which its backing truncates.
   const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
+  const long = sw == "long"
   for e in n.arrElems {
-    const v = deliver(b, e, er, -1)
+    const v = if long { longConstElem(e, er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
@@ -2889,6 +2898,31 @@ function arrayLit(b: i32[], n: ArrayLit, ix: i32, rep: i32): Opnd {
   const r: Rhs = { mlElems: elems, mlAt: ix }
   if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
   return irBLetTemp(b, r, ix, lrep)
+}
+
+// Constant element `e` of a long literal (`arrLitElemIsConst`: a number literal, negated or not,
+// or a boolean) as one immediate at `rep`; a negation flips an integer's sign by two's
+// complement and a float's sign bit, as the literal's data segment spells it.
+function longConstElem(e: i32, rep: i32): Opnd {
+  const x = unwrapParen(e)
+  if x < 0 || x >= P.nodes.length { return irBMiss("array long element") }
+  const n = nodeAt(x)
+  if n is NumLit { return numLit(n, x, rep) }
+  if n is BoolLit {
+    const o: Opnd = { oiRep: rep, oiBits: n.boolVal as i64 }
+    return o
+  }
+  if !(n is Unary) || n.unOp != "-" { return irBMiss("array long element") }
+  const ix2 = unwrapParen(n.unArg)
+  if ix2 < 0 || ix2 >= P.nodes.length { return irBMiss("array long element") }
+  const inner = nodeAt(ix2)
+  if !(inner is NumLit) { return irBMiss("array long element") }
+  const v = numLit(inner, ix2, rep)
+  if !(v is OImm) { return v }
+  const k: string = repPrim(rep) ?? ""
+  const bits: i64 = if k == "f64" { v.oiBits ^ ((1 as i64) << 63) } else if k == "f32" { v.oiBits ^ 2147483648 } else if k == "i64" { 0 - v.oiBits } else { (0 - (v.oiBits as% i32)) as i64 }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
+  return o
 }
 
 // `l ?? d` by legacy's own ladder: the arm `coalArmOf` names. Only a fused map read is built.

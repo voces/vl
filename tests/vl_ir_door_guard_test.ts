@@ -379,3 +379,24 @@ print(w1("ab") + w2(bs) + w3(m) + w4([5, 6]) + w5([5, 6]) + w6([2, 3], [4, 5]))
     }
   },
 });
+
+// A literal past the operand cap whose elements are constants builds from one data segment, as
+// legacy's does; inside an operand under a live value as well. 10,001 elements, one past the cap.
+const LONG = Array.from({ length: 10_001 }, (_, i) => (i % 7 === 0 ? `-${i}` : `${i % 256}`)).join(", ");
+Deno.test({
+  name: "ir door: a long literal of constants builds from its data segment and matches",
+  ignore,
+  fn: () => {
+    const r = rows(`function len(xs: i64[]): i32 { return xs.length }
+function f(k: i32): i32 {
+  const xs: i64[] = [${LONG}]
+  return k * len([${LONG}]) + xs.length
+}
+print(f(2))
+`);
+    const off = [...r.keys()].filter((k) => k.startsWith("node-in") && !k.endsWith(": matched"));
+    if ((r.get("node-in array: matched") ?? 0) < 2 || off.length > 0) {
+      throw new Error(`want both long literals matched, got ${show(r)}`);
+    }
+  },
+});
