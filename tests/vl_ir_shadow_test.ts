@@ -2360,3 +2360,58 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// An explicit `null` record field is the field's own null, as legacy's `emitOmittedFieldNull`
+// writes it: a union box with a `null` member, `string | null`, `K | null`, `boolean | null` and all
+// four at once build and match. A nullable record field's typed null is a named miss.
+Deno.test({
+  name: "ir shadow: an explicit null record field is its own null; a typed ref's null is a named miss",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type K = "a" | "b"
+type R = {
+  u: i32 | string | null,
+  s: string | null,
+  k: K | null,
+  f: boolean | null,
+  n: i32,
+}
+type Pt = { x: i32 }
+type H = { p: Pt | null, n: i32 }
+function mkU(n: i32): R { return { u: null, s: "x", k: "a", f: true, n: n } }
+function mkS(n: i32): R { return { u: 1, s: null, k: "b", f: false, n: n } }
+function mkK(n: i32): R { return { u: "q", s: "y", k: null, f: true, n: n } }
+function mkF(n: i32): R { return { n: n, f: null, k: "a", s: "z", u: 2 } }
+function mkAll(n: i32): R {
+  return { u: null, s: null, k: null, f: null, n: n }
+}
+function mkH(n: i32): H { return { p: null, n: n } }
+function show(r: R): string {
+  const u = r.u
+  const us = if u == null { "nu" } else if u is string { u } else { "i" }
+  return us
+    + "/"
+    + (r.s ?? "ns")
+    + "/"
+    + (if r.k == null { "nk" } else { "k" })
+    + "/"
+    + (if r.f == null { "nf" } else { "f" })
+}
+print(show(mkU(1)))
+print(show(mkS(2)))
+print(show(mkK(3)))
+print(show(mkF(4)))
+print(show(mkAll(5)))
+print(mkH(6).p == null)
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want mkU, mkS, mkK, mkF and mkAll covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered object field explicitNull typed null") ?? 0) !== 1) {
+      throw new Error(`want mkH a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
