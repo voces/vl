@@ -26345,9 +26345,7 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the two
   // lists' backings (memmove semantics; OOB spans trap via the instruction's own
   // check). Operand order matches the instruction's stack shape, so no scratch is needed.
-  if !userBindsName && callee.identName == "__array_copy__" {
-    return emitArrayCopyIntr(callIx, fnIx)
-  }
+  if arrCopyCallNamed(c, fnIx) { return emitArrayCopyIntr(callIx, fnIx) }
   return emitCallCoreUserFn(callIx, c, callee, fnIx)
 }
 
@@ -40249,55 +40247,87 @@ function emitArrNewFillAt(callIx: i32, fill: i32, fnIx: i32): i32 {
 function emitArrayCopyIntr(callIx: i32, fnIx: i32) {
   const c = nodeAt(callIx)
   if c is Call {
-    if c.callFn < 0 { return -1 }
-    const callee = nodeAt(c.callFn)
-    if callee is Ident {
-      if c.callArgs.length != 5 {
-        return emitFail(
-          "emitProgram: internal: __array_copy__ reached with the wrong argument count — the checker's arity rule refuses it",
-        )
-      }
-      // Each list kind copies its backing with the same `array.copy` `.slice` uses (D3549).
-      const acKind = mfRecvKindOf(c.callArgs[0], fnIx)
-      const acSrcKind = mfRecvKindOf(c.callArgs[2], fnIx)
-      if acKind == null || acSrcKind == null {
-        return emitFail(
-          "emitProgram: __array_copy__ expects list (T[]) operands",
-        )
-      }
-      let acRow = 0
-      let acSrcRow = 0
-      if acKind == "reflist" {
-        acRow = refListSlotOfExpr(c.callArgs[0], fnIx)
-        acSrcRow = refListSlotOfExpr(c.callArgs[2], fnIx)
-      } else if acKind == "u8list" {
-        acRow = exprPackedRow(c.callArgs[0], fnIx)
-        acSrcRow = exprPackedRow(c.callArgs[2], fnIx)
-      }
-      if acKind != acSrcKind || acRow != acSrcRow {
-        return emitFail(
-          "emitProgram: __array_copy__ dst and src must share one element type",
-        )
-      }
-      const acWrap = spreadWrapIdx(acKind, acRow)
-      const acBack = spreadBackIdx(acKind, acRow)
-      if acWrap < 0 || acBack < 0 {
-        return emitFail("emitProgram: __array_copy__ list type not collected")
-      }
-      if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-      fbStructGet(acWrap, 0)
-      if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
-      if emitExpr(c.callArgs[2], fnIx) < 0 { return -1 }
-      fbStructGet(acWrap, 0)
-      if emitExpr(c.callArgs[3], fnIx) < 0 { return -1 }
-      if emitExpr(c.callArgs[4], fnIx) < 0 { return -1 }
-      fbArrayCopy(acBack, acBack)
-      return 0
+    if c.callArgs.length != 5 {
+      return emitFail(
+        "emitProgram: internal: __array_copy__ reached with the wrong argument count — the checker's arity rule refuses it",
+      )
     }
+    const pl = arrCopyPlanOf(callIx, fnIx)
+    if pl.acWhy != "" { return emitFail(pl.acWhy) }
+    if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
+    arrCopyBacking(pl)
+    if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
+    if emitExpr(c.callArgs[2], fnIx) < 0 { return -1 }
+    arrCopyBacking(pl)
+    if emitExpr(c.callArgs[3], fnIx) < 0 { return -1 }
+    if emitExpr(c.callArgs[4], fnIx) < 0 { return -1 }
+    arrCopyTail(pl)
+    return 0
   }
   return emitFail(
     "emitProgram: emitArrayCopyIntr expected an __array_copy__ call",
   )
+}
+
+// Whether call `c` is the `__array_copy__` intrinsic: the spelling, with no binding owning the
+// name. Legacy's `emitCallCore` and the IR's builder route on it.
+export function arrCopyCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || f.identName != "__array_copy__" { return false }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// The wrapper and backing heap types `__array_copy__` call `callIx` copies between, or the
+// refusal `acWhy` legacy records: both lists share one kind and row (D3549).
+export type ArrCopyPlan = { acWrap: i32, acBack: i32, acWhy: string }
+
+function arrCopyRefused(why: string): ArrCopyPlan {
+  return { acWrap: -1, acBack: -1, acWhy: why }
+}
+
+export function arrCopyPlanOf(callIx: i32, fnIx: i32): ArrCopyPlan {
+  const c = nodeAt(callIx)
+  if !(c is Call) || c.callArgs.length != 5 {
+    return arrCopyRefused(
+      "emitProgram: emitArrayCopyIntr expected an __array_copy__ call",
+    )
+  }
+  const acKind = mfRecvKindOf(c.callArgs[0], fnIx)
+  const acSrcKind = mfRecvKindOf(c.callArgs[2], fnIx)
+  if acKind == null || acSrcKind == null {
+    return arrCopyRefused(
+      "emitProgram: __array_copy__ expects list (T[]) operands",
+    )
+  }
+  let acRow = 0
+  let acSrcRow = 0
+  if acKind == "reflist" {
+    acRow = refListSlotOfExpr(c.callArgs[0], fnIx)
+    acSrcRow = refListSlotOfExpr(c.callArgs[2], fnIx)
+  } else if acKind == "u8list" {
+    acRow = exprPackedRow(c.callArgs[0], fnIx)
+    acSrcRow = exprPackedRow(c.callArgs[2], fnIx)
+  }
+  if acKind != acSrcKind || acRow != acSrcRow {
+    return arrCopyRefused(
+      "emitProgram: __array_copy__ dst and src must share one element type",
+    )
+  }
+  const acWrap = spreadWrapIdx(acKind, acRow)
+  const acBack = spreadBackIdx(acKind, acRow)
+  if acWrap < 0 || acBack < 0 {
+    return arrCopyRefused("emitProgram: __array_copy__ list type not collected")
+  }
+  return { acWrap: acWrap, acBack: acBack, acWhy: "" }
+}
+
+// After a list operand of `__array_copy__`: its backing, read off the wrapper.
+export function arrCopyBacking(pl: ArrCopyPlan) { fbStructGet(pl.acWrap, 0) }
+
+// After the five operands: the copy between the two backings.
+export function arrCopyTail(pl: ArrCopyPlan) {
+  fbArrayCopy(pl.acBack, pl.acBack)
 }
 
 // The fused map/list/struct nullish-coalescing lowering (`emitBinExprNode`'s `??` arm).
