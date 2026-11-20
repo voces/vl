@@ -7,14 +7,15 @@
 //           fragment matches legacy byte for byte under it.
 //   fires — a context it can read still misses, by name, until it becomes a door parameter.
 //
-//   reach — the push receiver's strict cast is dropped because no IR module reaches the list
-//           payload cast: a `compiler/ir_*.vl` importing it, or a tail that calls it, fails here.
+//   push  — the push receiver's strict cast is dropped at the door because the shared tails a
+//           fragment calls read the flag live; a whole-function push whose receiver unboxes a
+//           list arm misses instead (`recvReadsListPayload`), since its receiver is read earlier.
 //
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the seed halves self-ignore.
 //
 // Run with:  deno test -A tests/vl_ir_door_guard_test.ts
 
-import { COMPILER, exists, ROOT } from "./support/tree.ts";
+import { COMPILER, exists } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
 if (ignore) {
@@ -132,35 +133,6 @@ Deno.test({
   },
 });
 
-// The tails that reach the list payload cast, which a push receiver's strict flag changes.
-const PAYLOAD_CAST = [
-  "listPayloadCastTail",
-  "emitUnionUnboxTail",
-  "emitPlaceNarrowContainerUnbox",
-  "emitRefArrayUnionUnboxRead",
-];
-
-Deno.test({
-  name: "ir door guard: no IR module imports a tail that reaches the list payload cast",
-  fn: () => {
-    const hits: string[] = [];
-    for (const e of Deno.readDirSync(`${ROOT}/compiler`)) {
-      if (!e.name.startsWith("ir") || !e.name.endsWith(".vl")) continue;
-      const text = Deno.readTextFileSync(`${ROOT}/compiler/${e.name}`);
-      for (const m of text.matchAll(/import\s*\{([^}]*)\}/g)) {
-        for (const name of PAYLOAD_CAST) {
-          if (new RegExp(`\\b${name}\\b`).test(m[1])) hits.push(`${e.name}: ${name}`);
-        }
-      }
-    }
-    if (hits.length > 0) {
-      throw new Error(
-        `want no IR import of a payload-cast tail, got ${hits.join(", ")} — ir-design §10.2.1: thread \`strict\` through the door before importing this`,
-      );
-    }
-  },
-});
-
 Deno.test({
   name: "ir door guard: a list-arm narrowing in a push receiver is not the IR's yet",
   ignore,
@@ -177,6 +149,25 @@ print(f("s"))
 `);
     if ((r.get("uncovered is rung") ?? 0) < 1) {
       throw new Error(`want the list-arm narrowing uncovered at \`is rung\`, got ${JSON.stringify([...r])}`);
+    }
+  },
+});
+
+// A whole-function push reads its receiver before the push, where legacy's strict cast is not
+// set, so a receiver that unboxes a list arm misses (`recvReadsListPayload`).
+Deno.test({
+  name: "ir: a push whose receiver unboxes a list arm is legacy's",
+  ignore,
+  fn: () => {
+    const r = rows(`function f(u: i32[] | string): i32 {
+  (u as! i32[]).push(1)
+  return 0
+}
+const xs: i32[] = [3]
+print(f(xs))
+`);
+    if ((r.get("uncovered push receiver payload cast") ?? 0) < 1) {
+      throw new Error(`want the push receiver's payload cast to miss, got ${JSON.stringify([...r])}`);
     }
   },
 });
