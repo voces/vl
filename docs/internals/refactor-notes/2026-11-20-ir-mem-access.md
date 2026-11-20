@@ -26,6 +26,20 @@ one access at the width's natural alignment.
 `vl_ir_shadow_test.ts` holds a plain, a computed, a constant and an offset address, a byte width
 and a discarded load covered and matched.
 
-## Readings (vs merge-base, fixpoint seeds on both sides)
+## Readings (vs merge-base `6aa68d8eb`, fixpoint seeds on both sides)
 
-READINGS
+| reading | merge-base | this change |
+| --- | ---: | ---: |
+| self-compile functions claimed (mode 5) | 18,863 | 18,867 (+4) |
+| self-compile functions with no blocker | 18,967 | 18,976 (+9) |
+| self-compile `intrinsic none`, alone | 5 | 0 |
+| corpus covered = verified = matched (shadow) | 41,774 of 45,678 | 41,774 |
+| L2 self-compile fuel | 104,594,888,271 | 104,786,027,740 (+0.183%) |
+| seed size | 6,925,560 | 6,928,351 (+2,791 bytes) |
+
+No corpus function waited on a memory intrinsic alone. The fuel rise is spread over the phases
+(checking +0.10G, code payload +0.07G, emit passes +0.02G): the source the plans add and a new
+member of the `Rhs` union every match over it checks. Legacy is A/B'd on its own: compilers with
+`CLAIMED` empty built from both trees give identical bytes on every tests/cases program and probe
+(7,535 identical, 68 failing under both, 0 differ) and the same first diagnostic on all 59 filed
+emit-reject witnesses.
