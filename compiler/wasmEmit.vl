@@ -1721,6 +1721,7 @@ import {
   CoalArm,
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
+  NULL_OWN_BOX,
   NULL_OWN_STR,
   NullRet,
   binNulTestOf,
@@ -9132,7 +9133,7 @@ function emitUnionIfValue(
 // Whether the value `if` at `ifIx` is typed one number some tail is not: delivered as that
 // number, every tail is built at it, a literal included, so a nested join means what its
 // hoisted twin means (D3571; owner ruling, D3657).
-function ifJoinAdaptsScalar(ifIx: i32, fnIx: i32): boolean {
+export function ifJoinAdaptsScalar(ifIx: i32, fnIx: i32): boolean {
   const pn = tyPrimNameOf(nodeTyAt(ifIx, fnIx))
   if pn != "i64" && pn != "f64" && pn != "f32" { return false }
   let widens = false
@@ -22085,9 +22086,7 @@ function emitNulArmToLocal(
 // for a `string | null` (rep 1).
 function emitNulNullToLocal(idx: i32, rep: i32) {
   if rep == 0 {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone() // the payload slot is unread under the null tag
-    fbStructNew(uBoxIdx)
+    emitNullOwn(NULL_OWN_BOX)
   } else if rep == 1 {
     fbRefNull(sTy())
   } else {
@@ -22214,6 +22213,12 @@ function emitNullableIfBindingLink(
 // `const u: A | B = if c { a } else { b }` needs the box built once after the merge, not
 // once per arm plus a pre-seed (three allocation sites means Heap2Local can scalarize none
 // of them, so the box survives as a real heap object). The sink writes each arm's tag and payload into a shared pair and does the single `struct.new` after the `if`; gated on `unionIfBindingAllBox` since an arm that already passes a box through would otherwise be unboxed and rebuilt for nothing.
+
+// Whether a union binding's `if` initializer at `ifIx` is written through the binding sink (one
+// `struct.new` after the `if`), rather than a seeded box each arm overwrites.
+export function letIfInitSinks(ifIx: i32, fnIx: i32): boolean {
+  return fnUses.unionLetSink && unionIfBindingAllBox(ifIx, fnIx)
+}
 
 // Does every terminal arm of the union-box if-binding at `ifIx` CONSTRUCT its box? An
 // `else if` chain link recurses; an else-LESS chain contributes the rep's null box, which
@@ -32514,14 +32519,14 @@ function letIfInitTy(s: LetDecl, fnIx: i32): i32 {
   return nodeTyAt(s.letInit, fnIx)
 }
 
-// Whether the declaration at `declIx` is a binding whose `if` initializer legacy writes in each
-// arm (`emitLetIfInit`), rather than as one value.
-export function letIfInitPerArm(declIx: i32, fnIx: i32): boolean {
+// `letIfInitRep` for the declaration at `declIx`: the rep legacy writes its `if` initializer at in
+// each arm (`emitLetIfInit`), or -1 when its init is not an `if` or takes the plain path.
+export function letIfInitPerArmRep(declIx: i32, fnIx: i32): i32 {
   const s = nodeAt(declIx)
-  if !(s is LetDecl) || !exprIsIfStmt(s.letInit) { return false }
+  if !(s is LetDecl) || !exprIsIfStmt(s.letInit) { return -1 }
   const slot = declaredSlotOfDecl(declIx)
-  if slot < 0 || slot >= localIsRef.length { return false }
-  return letIfInitRep(localIsRef[slot], letIfInitTy(s, fnIx)) >= 0
+  if slot < 0 || slot >= localIsRef.length { return -1 }
+  return letIfInitRep(localIsRef[slot], letIfInitTy(s, fnIx))
 }
 
 // A `let` whose init is an `if` over a nullable or value-union cell, written into local
@@ -32535,8 +32540,8 @@ function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
     // the binding sink: with every arm writing the shared pair and ONE `struct.new`
     // after the `if`, the arms' construction sites collapse to that one — and the
     // pre-seed below goes with them, because the single store dominates every read.
-    if nulRep == 0 && fnUses.unionLetSink {
-      if unionIfBindingAllBox(s.letInit, fnIx) {
+    if nulRep == 0 {
+      if letIfInitSinks(s.letInit, fnIx) {
         if (emitUnionIfBindingSink(s.letInit, idx, nulNm, nulTy, fnIx) < 0) {
           return -1
         }
@@ -37580,6 +37585,11 @@ function ctxIsNulAtom(ix: i32, fnIx: i32): boolean {
 
 // Emits the null `own` names (`nullOwnAt`): the shared tail of every `null` value.
 export function emitNullOwn(own: i32) {
+  if own == NULL_OWN_BOX {
+    fbI32Rel(RS_TAG, nullBoxTag())
+    fbRefNullNone() // the payload slot is unread under the null tag
+    return fbStructNew(uBoxIdx)
+  }
   if own == NULL_OWN_BOOL { return fbI32Const(2) }
   if own == NULL_OWN_ATOM { return fbI32Const(-1) }
   if own == NULL_OWN_STR { return fbRefNull(sTy()) }
