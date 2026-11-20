@@ -13,6 +13,10 @@ see **`DECISIONS.md`**. A PR never edits this file: it adds a `changelog.d/` ent
 
 ## Testing
 
+- The kind-ladder lint's closed sets and set-typed fields are row tables keyed by name
+  (`klSets` and `klFields`, each ordered by name) instead of positional
+  parallel arrays, so a PR adding a set or a field adds one row and no longer renumbers others;
+  `scripts/ladder-sets.vl` checks the order.
 - **`live-sites.json` may be empty only beside an `empty` note** dating the probe runner's reading and naming each remaining GAP with the stage it refuses at; `tests/vl_live_sites_test.ts` refuses a note whose GAP count disagrees with the reading or that names a GAP at emit.
 - **D16858 closed:** a list literal of nested records of un-annotated functions stored by index into a list of lists of them (`xs[1] = [{ a: { f: inc0 } }]`) runs, as a pushed one did, and so does an element record stored by index (`xs[0][0] = { a: { f: half } }`).
 - **D16937 filed:** a record literal holding a lambda, written into a list of records of un-annotated functions with different results, is refused at emit.
@@ -2394,6 +2398,139 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **E8 The checker's INTERNAL absence marker `<none>` reached users on the diagnostic channel — and the sibling `<error>` is a MEASURED non-change, not the other half of the same fix** — `tyToStrAt`'s no-arena-entry bail-out (`ix < 0`) wrote `<none>` into user-facing messages: `unknown property \`add\` on {[<none>]: <none>}` for a bare `Map()`, `argument 1: expected string, got <none>[]` for an empty `[]`. It now writes the blank `_` — E7's token, for E7's reason: an un-annotated param and an empty literal's element are ONE sentence to a reader ("no type was determined here; say it"), and the split between them is arena bookkeeping (an unsolved entry vs no entry at all) that made the second kind look like a different, internal condition. `holeDemandStr`'s "demands nothing" answer moves with it, because it lands in the `expected …` half of a message whose `got …` half comes from that renderer. **CORPUS, re-derived on the tip rather than inherited**: 4 marker occurrences in 4 of the **300 error-producing** files (of 1,137 diagnostic-producing, of 2,004 `.vl`; 13,510 diagnostic lines) — the board's "3 named files of 240 diagnostic-producing" is stale in both terms, and its shape→file table mis-assigns two of the four (`types/unknown-type-in-map-value.vl` is an `<error>` site; the `<none>[]` site is `soundness/hole-is-guard-return-join-reject.vl`). The corpus is not the population, so the render was reached from **74 CONSTRUCTED cells** (3 waves; 2 non-reproducing probes re-shaped after VL rejected `function(){}` for arrow syntax): **`<none>` 35 of 38 cells across 12 distinct message TEMPLATES** (`argument N`, `return type mismatch`, `cannot assign … to 'x'`, `cannot assign … to T`, `comparison expects numeric operands`, `operator '+' is not defined`, `unknown property`, `no method '.p' on array`, `print of …`, `set:`, `add:`, `push:`) and every shape of it (`_[]`, `_[][]`, `{[_]: _}`, `{[_]: boolean}` for `Set()`, `{a: _}`, `(_)[]`, `() => _[]`, `_ | null`). **`<error>` reaches the user through EXACTLY ONE template — 12 of 12 hits over 36 cells, plus 2 of 2 in the corpus, all the `print of …` codegen gate, and in all 14 the errored component sits inside a FUNCTION type**; the other 24 cells report only `unknown type '…'`, because an errored type is assignable both ways and every assignability-shaped check ABSORBS it. **Three answers for `<error>` were priced and all three refuted.** `_`: collapses a distinction `soundness/hole-renders-as-blank-reject.vl` pins, and misdirects — the reader has already been told `unknown type 'nosuchtype'` by name, and `() => _` sends them after a missing annotation instead of the one they wrote. SUPPRESS the second diagnostic: refuted by a CONTROL, not by the fixture comment that claims it — `function mk(): i32 { return 0 }  print(mk)` is rejected `print of () => i32 …` identically, so the gate is not a cascade and only its RENDER is polluted. RENDER THE OFFENDING NAME (`() => nosuchtype`, strictly the most useful): impossible without a rep change — `TY_ERR` is a SINGLETON arena entry (one `mkErrTy()` call, `errKind` a constant), and `emit_rep.vl` keys `TyErr` by arena INDEX, so minting one per failure multiplies rep keys. `<error>` therefore stays, and with `<none>` gone the angle brackets become a CLEAN one-meaning vocabulary: they mark a type the reader named and the checker rejected. **BYTE-IDENTITY, the primary oracle for a text-only change: 2,004 of 2,004 corpus files produce an identical `(rc, md5)` record, all 1,640 emitted modules byte-for-byte** — the `tyToStructStr` hazard (it shares `tyToStrAt`, and its output names shapes the emitter stores) did not fire, measured rather than assumed. The diagnostic channel moves **2 of 13,510 lines**, both `<none>` → `_`. **LSP**: `ABSENT_TYPE_MARKERS` drops `"<none>"` — no producer emits it, and the blank could not replace it, being a SUBSTRING of ordinary identifiers (`{foo_bar: i32}`) in a substring sentinel test. Both `KNOWN_CLEAN_DROPS` exceptions in the corpus sweep disappear (`: _ | null`, `: () => _[]` are displayable), so **no diagnostic-free file loses a hint any more** and the clean side is now an absolute zero, with `dropsOnErrored ≥ 1` carrying non-vacuity. A `TyNullable`-arm answer of `null` for the lone-`null` case was **refuted by measurement, not scope**: 4 of 12 constructed cells reach `_ | null` and only 2 are the lone null — `function mk() { return [] }` makes `mk().pop()` one too, where the blank is honest. **Pins retargeted (4) and predictions**: `sets/error-add-non-boolean-value.vl` (`{[<none>]: <none>}` → `{[_]: _}`), `soundness/hole-is-guard-return-join-reject.vl` (`got` → `got _[]`, a pin that stopped one token BEFORE the marker and so could not see it), plus header-only retargets on `soundness/hole-renders-as-blank-reject.vl`, `generics/type-arg-inline-object-field.vl`, `types/unknown-type-in-inline-object-field.vl` and the two `tail-assign-*` files whose blocked empty-`[]` rows named the display filter as blocker (it no longer is; the checker-side half at `fnAssignRetTargetName` is untouched). Predicted 1 fixture red before retargeting — measured 1. SABOTAGE with the SAVED pre-fix artefact (`md5sum -c`, never a rebuild): predicted 3 corpus fixtures red — measured exactly 3, and the LSP suite predicted GREEN and measured 8/8, because its corpus sweep observes the FILTER and not the producer. No log-mismatch fixture is available for a diagnostic-text slice; the new file is a PIN. (`compiler/typecheck.vl`, `lsp/src/typeFeatures.ts`, `tests/cases/soundness/absence-markers-render-reject.vl`, `tests/lsp_undisplayable_type_test.ts`)
 
 ## Codegen, memory & runtime (Track B)
+- **IR: a call through a tagged function set:** the IR builds the dispatch over a set's arms (the stashed id tested against each member's, a valued `if` per arm) from the same tails legacy writes (`tagStashTail`, `tagIsTail`), and holds a local or parameter whose type is still open when its rep is a set's `i32` id; 353 more corpus functions are built by the IR.
+- **IR: a list delivery that owes no copy:** a `listCopy` delivery whose pair needs no record copy, numeric convert, retag or widen is the value as built, one decision legacy's copy tail shares (`listCopyOwesNothing`); the IR now builds those functions.
+- **IR: a union-element list literal:** a short list literal at a union-element slot whose elements each owe a box by their own record is built by the IR, each element boxed through the shared box plan, from one decision legacy's list builder shares (`arrLitUnionBoxSlot`); 204 more corpus functions are built by the IR.
+- **Compiler structure:** which lowering a `??` over a boxed operand takes (a boolean-pop binding, a nullable value-union binding or list element, or a call, `as?` or `if` operand) is one closed decision both emitters read, `coalBoxArmOf`; no program's output changes.
+- **IR coverage:** a `??` whose left operand a generic instance closed to a type with no `null` (`orD<T>(x: T, d: T) { return x ?? d }` at `i32`) is built by the IR as the left operand alone, as legacy writes it (corpus: 75 more functions covered; self-compile: 2).
+- **IR coverage:** a fresh `[]` binding its pushes follow, which legacy builds at its final size through locals, is built by the IR through legacy's own region open and close (self-compile: 61 more functions covered; corpus: 53).
+- **IR coverage:** a packed byte (`u8[]`) element read is built by the IR, read unsigned into an i32 through legacy's scalar read tail (self-compile: 32 more functions covered).
+- **IR coverage:** `.pop()` over a record, list or string list, at a value position or as a statement, is built by the IR through legacy's ref pop tail (self-compile: 66 more functions covered).
+- **IR coverage:** `.pop()` over a number, boolean, atom or packed list, at a value position or as a statement, is built by the IR through one scalar pop tail that legacy's `.pop`/`.get` also end through (self-compile: 112 more functions covered).
+- **IR coverage:** `print` of a value-union box, plain or nullable, is built by the IR through legacy's union print tail (corpus: 59 more functions covered).
+- **IR coverage:** a start body appending to a top-level string accumulator is built by the IR; the decision rescans the top level as legacy does before the start's code (self-compile: 135 of 138 start functions covered, from 0).
+- **IR coverage:** a proven string accumulator append (`s = s + parts` in a loop) is built by the IR through `emitStrAccAppend`'s shared tail (self-compile: 132 more functions covered).
+- A struct `==` or `!=` whose operand is a call (`mk() == q`, or `P | null` calls on both sides)
+  runs that call once, not once per field compared (D17022).
+- A struct `==` or `!=` with a variable or field on the left and a call on the right reads the
+  left side before the call runs, so a call that reassigns it no longer changes the answer (D17023).
+- **D17024 closed:** `__trap__` with a literal-union message (`type Why = "empty" | "full"; __trap__(w)`)
+  passed `vl check` and emitted an invalid module. The message now prints its member text the way
+  `print(atom)` does, then traps. Fixture `traps/trap-atom-message.vl`.
+- **IR: one closure-call argument decision.** `callRefArgArmOf` names the arm a function-value
+  call writes each argument by, and legacy's `emitCallRefArg` dispatches on it; the IR's plain
+  closure call asks the same arm. A call through a record's function field (`o.f(x)`) now builds
+  through the IR as a closure call. No emitted byte moves.
+- IR: a value `if` or a returned `if` whose condition is an `is` test (or its `!`) builds on the
+  IR, a decided-`false` test writing no then arm as legacy does; the value `if`'s plain-path
+  refusal now names the rung that refused it.
+- IR: a record literal (a standalone struct or a variant row) whose fields are written as
+  themselves lowers through legacy's own layout, in any field order; a discarded inert literal
+  writes nothing on both paths.
+- IR: a struct or variant-parameter field store (`o.f = v`) lowers through one arm decision (`fieldStoreArmOf`) and legacy's store tail, byte-identical; 114 self-compile and 22 corpus functions more are claimed.
+- **IR coverage, `for` over a list of boxes, records or `i32` lists:** the IR's walk now binds a
+  value union's box, a record or an `i32` list element as legacy's does (`forInElemPlain`). The
+  self-compile ships 48 more functions from the IR. No emitted byte moves.
+- IR: a value `if` joined at a string or a list (one link, each arm its value as itself) builds
+  under legacy's ref blocktype; legacy's ref-arm ladder is now one decision both read.
+- IR: a union binding whose `if` initializer legacy writes into a seeded box, one arm at a time
+  (every arm a box or on the box table), builds on the IR; the null box is one writer both use.
+- **IR, match arm tests typed at the check:** the `match` lowering now records `boolean` on the
+  `==` and `||` arm tests it writes after the check, so the IR builder reads their type like any
+  other and its private untyped-boolean rule goes. Claims and emitted bytes are unchanged.
+- **IR coverage, `Map()` and `Set()`:** an empty map's construction builds through the IR
+  (`RMapNew`), on the test legacy dispatches on (`mapNewCall`). The self-compile ships 220 more
+  functions from the IR. No emitted byte moves.
+- IR: a `__trap__` statement lowers as legacy's message stream and `unreachable`, and a return boxes a call's primitive result through the box writer, byte-identical; 685 corpus functions more are covered, among them std:fmt's `toFixed` and `parseF64`.
+- **IR coverage, a list's `.clear()`:** the IR builds a list `.clear()` statement (`RListClear`)
+  through legacy's plan (`clearPlanOf`) and length reset (`clearLenTail`). It holds or stages the
+  receiver as a `.pop()` does. Legacy's `emitClear` and its statement gate (`clearRecvIsList`) now
+  call the same plan and tail, and a map's `.clear()` stays on legacy. No emitted byte moves.
+- **IR door, const initializers and legacy's slots:**
+  - The door (`irLowerNodeIn`) now hosts a fragment in a const cell's constant initializer, where
+    it had missed with `fragment outside a body`. Such a context has no frame, so any variable
+    misses.
+  - Every local a fragment reads must agree with the slot legacy declared (`irSlotRunAgrees`), or
+    it misses with `local cell rep`. Before this, a const holding its literal set's atom was
+    pushed raw into a string list under the probe.
+
+  No emitted byte moves, since the door has no shipping caller yet.
+- **IR door context guard:** `irLowerNodeIn`, the door through which legacy lowers one node
+  through the IR, now misses `legacy context live` unless legacy's lowering context is at rest:
+  the coercion seats, storage-read mode, narrowing frames, staged operands, open list-build
+  regions and loop hoists, and the union-sink cursor (`legacyContextLiveWhy`, ir-design §10.2).
+  This is the precondition for a shipping caller. No emitted byte moves.
+- **IR door guard, per context (ir-design §10.2.1 step 1):** `legacyContextLiveWhy` takes the
+  fragment's root.
+  - A held coercion or a storage read misses only on the root.
+  - A staged operand misses only inside the root's subtree.
+  - An open list-build region misses only through a counted push inside it.
+  - The coercion seats, `armServed` and the two lexical frames no longer miss.
+
+  At the list-literal door, the remaining live hits fall to the 3 push-receiver casts. No emitted
+  byte moves.
+- **IR coverage, a list's `.slice`:** the IR builds `xs.slice(start, end?)` over every list kind
+  legacy's arm takes (`RListSlice`). It asks legacy's plan (`arrSlicePlanOf`) and calls its
+  receiver and copy tails (`sliceRecvTail`, `arrSliceTail`), which `emitArrSlice` now calls too. No
+  emitted byte moves.
+- **IR coverage, a map global's `.has`:** the IR builds `g.has(k)` on a map global read plainly
+  (`RMapHas`), through the probe and hit-flag tail it now shares with legacy's `emitMapHas`
+  (`mapHasTail`). The self-compile ships 97 more functions from the IR. No emitted byte moves.
+- **IR coverage, `.map` and `.filter`:** the IR builds a list's `.map`/`.filter` whose callback is a
+  capture-free function or a function-typed binding (`RMapFilter`), through one plan
+  (`mapFilterPlanOf`) and legacy's receiver and loop tails, which legacy's own arm now calls too.
+  The corpus ships 172 more functions from the IR. No emitted byte moves.
+- **IR coverage, a string's `.indexOf` and `.includes`:** the IR builds both as `RStrOp`s
+  (`indexof`, `includes`). It pushes the receiver and needle, then calls the search tail
+  (`strIndexOfTail`) that legacy's `emitStrIndexOf` now ends in too. No emitted byte moves.
+- **IR coverage, a push onto a ref list or a packed byte list:** `pushPlainWhy` no longer
+  refuses them, since the IR's push lowering already takes the slot's own scratch base and legacy's
+  append tail. The self-compile ships 53 more functions from the IR. No emitted byte moves.
+- **IR coverage, a string's `.charCodeAt`:** the IR builds `s.charCodeAt(i)` as an `RStrOp`
+  (`charcode`) through the same guarded read `s[i]` takes (`rawStrGetTail`), skipping a receiver a
+  live loop hoist holds. Legacy's `emitStrCharCode` now ends in that tail too, so its duplicate
+  guard-and-read is gone. No emitted byte moves.
+- **IR door guard, the push receiver's strict cast (ir-design §10.2.1 step 2):** the list payload
+  cast takes its `strict` flag as an argument (`listPayloadCastTail`). The door's guard no longer
+  misses on it, because no IR module reaches that cast. An import tripwire in
+  `tests/vl_ir_door_guard_test.ts` keeps it that way. No emitted byte moves.
+- **IR verifier, packed list literals:** a `u8[]` literal's elements are built as plain i32s, which
+  its backing truncates. The verifier now admits them at a `u8` element rep instead of rejecting the
+  fragment ("an element's rep is not the list's"). A verifier miss now names its message. No
+  emitted byte moves.
+- **IR: call arguments delivered at their parameter's rep.** An atom passed to a `K | null` parameter, a `null` literal, a numeric widen or an atom decoded to a string go through the builder's `deliver`, as a returned or declared value does; the call no longer misses `argument coercion` on them.
+- **IR: a `for` walk over a map's keys or values.** A walk over a map global (`for k in m`, `m.keys()`, `m.values()`) is claimed: the IR reads the global and legacy's stash and list halves (`forInMapStash`, `forInMapList`), which `emitForInStmt` also calls, write the rest.
+- **IR: union-box field reads.** A struct or variant field that holds a value-union box is read by the IR, its narrowed unbox written by the same tail legacy calls (`structUnionBoxTail`, `variantUnionBoxTail`); an ambiguous box stays legacy's. Legacy's `.length` block now takes `lengthIsField`'s decision, so the IR's gate and legacy's share it.
+- **IR: an object literal boxed into a union.** The shared box plan gains an `obj` arm: a literal with no variant of its own, built as the arm the union's context picks for it (`emitUnionCoerceRecord`'s literal rung, `unionArmVariantForObj`) and boxed under that arm's tag. Both emitters box through it.
+- **IR: a value boxed into a non-null value union.** A scalar, a literal or a box delivered into a non-null value-union box (an argument, a return, a declaration) takes the hole's shared box plan (`holeBoxPlanOf`), as a `T | null` box does; a returned call passed into a wider box keeps legacy's tail call, and a template hole an instance pins to a string stays legacy's.
+- **IR: a record or a scalar list boxed into a union.** The shared box plan gains a `rec` arm (a record boxed as itself under its arm's tag, `emitUnionArmValueBox`'s two plain rungs as one decision, `armValuePlainOf`) and takes a scalar list under its list kind's tag, as the value-atom box writes it; both emitters box through it.
+- **IR decision modules 3b-3, the variant coerce's arm:** `emitVariantCoerce` dispatches on one
+  shared decision, `variantCoerceArmOf` (a `never` call, a value `if`, an object literal, a bare
+  variant, a union box, a cross-tag refusal, else a pass-through), and the IR's narrowed box read
+  asks it for `box` instead of restating the arm's union and cross-tag tests. No emitted byte moves.
+- **IR decision modules 3b-2, an `is` test's rung:** `emitIs` dispatches on one shared decision,
+  `isPreArmOf` (the read at storage, a tautology, a covering or decided operand, else
+  `emitIsTest`), and the IR's `is` guard asks that rung instead of restating `emitIs`'s first
+  three. No emitted byte moves.
+- **IR decision modules 3b-1, the member read's arm:** `emitMem` dispatches on one shared
+  decision, `memReadArmOf` (a narrowed box, a bare or nullable variant, or the shared-field
+  read), and the IR's struct, variant and narrowed field reads ask that arm instead of
+  re-deriving `emitMem`'s receiver tests. No emitted byte moves.
+- **IR decision modules 3b-1b, a narrowed union-box read:** a box local the checker narrowed to
+  one atom is read unboxed through one shared decision, `identUnboxAtomOf`, which legacy's `unbox`
+  arm and the IR's narrowed local read both ask; the IR now claims those reads instead of missing.
+  No emitted byte moves.
+- **IR decision modules 3, the union plans:** the `is` rungs, narrowed reads, atom and union
+  equality and the box plan (`holeBoxPlanOf`) move out of `wasmEmit.vl` into
+  `emit_plan_union.vl`, and the narrowed-arm unbox into `emit_plan_coerce.vl`. The IR asks the
+  read and compare recover decisions itself rather than calling legacy's writers. No emitted byte
+  moves.
+- **IR: assignment as a value:** legacy's assignment in value position dispatches on one decision, `asgValueArmOf` (`lit`, `nullLit`, `reRead`, `parked`, `nonNullRead`, `nonNullPark`, `boxedArm`, `widerRow`, `none`). The IR builds the `reRead` arm with no unwidening on a name target: the store, then the target's read (the setter idiom `return g = v`). Byte-identical; the self-compile claims 204 more functions, and its `assignment as a value` blocker (208 functions alone) goes to 0.
+- **IR function values, step 2:** a lifted callee's captures may be the caller's own `let`/`const` bindings as well as its parameters (`liftCapDecl`, through the function's own-binding set built once per function), and a plain closure call takes string and record arguments (`callRefPlainKey`, with legacy's armed agreement covering the new arms). Byte-identical.
+- **IR: `m[k] ?? d` read inline:** legacy's map read with a default dispatches on one decision, `mapGetOrArmOf` (`helper`, `widen`, `mv`, `scalarBox`, `sentinel`, `atom`, `i32`). Its plain `i32` arm and plain mv slot arm (`mapGetOrMvPlain`) write through shared heads and tails around the default (`mapGetOrI32Head`/`Tail`, `mapGetOrMvHead`/`Tail`, `mapPrepProbeTail`). The IR builds those two arms for a module global map, with a default that computes nothing ahead of the read (`RMapGetOr.mgForm`). Byte-identical; the self-compile claims 385 more functions, and its `map read inline` blocker (441 functions alone) goes to 0.
+- **IR: map operations on any receiver:** `m[k] ?? d`, `m.has(k)` and `m[k] = v` now build in the IR on a parameter, local, field or element map, not only on a module global: each node carries its receiver as an operand beside the global symbol, and the lowering writes legacy's receiver tail, key and tail around it. Byte-identical; the self-compile claims 177 more functions and the distilled corpus 93, and `map read receiver` (196 distilled functions alone) goes to 0.
+- **IR: a map is a value rep:** a map parameter, local or result no longer sends its function back to legacy; the IR passes the map as the reference legacy declares. Byte-identical; the self-compile claims 108 more functions and the distilled corpus 210.
+- **IR: the nullable reps:** a nullable record, list, map or closure and `boolean | null` are IR values. One delivery writes a `null` literal as legacy's own null and passes `T` into `T | null` unchanged; null tests, narrowed reads (`readOwesNonNullRecover`) and field reads through a nullable struct (`memRecvOwesNonNull`, now shared with legacy) take them. Byte-identical; the self-compile claims 69 more functions and the distilled corpus 280, and the nullable-rep blockers go from 141 to 0 (self-compile) and 359 to 11 (distilled).
 - **The IR ships output:** a function built wholly of the scalar, control, call, global and map families is emitted by the typed IR instead of the legacy emitter (2,178 of the compiler's own functions), byte-identical to legacy; the gate's `ir claims` row reds on any claim that falls back.
 - **D12466 closed:** a `K | null` call result delivered into a box that also holds an `i32` (`(K | null | i32)[]` literal element, a scalar binding, a record field, `.push`) boxes the atom as its member string and `null` under the null tag. On master each refused at emit (`literal-union string widening with no members`).
 - **D16728 closed:** a `string | null` field shared by a record union's arms, read off the un-narrowed union after a null test of the read, is delivered non-null into a string slot (`print`, a `string` binding, `+`, a return, an early-return guard, a three-arm union, a union with `null`). On master each built invalid wasm.
@@ -4384,6 +4521,8 @@ new: the compare-frame pre-pass never recurses into a code-15 field, so a NESTED
 - **playground: code-split binaryen off the initial load** — with codegen on the seed, binaryen (~13 MB) is reached ONLY via the lazy `import("binaryen")`/`import("./toWasm.ts")` behind `wasmToWat` (the WAT renderer). `build.ts` now enables esbuild `splitting` (`outdir` + object-form `entryPoints` → `playground.js`), so binaryen lands in its own `chunk-*.js` fetched on demand when the WAT pane is first shown — not on page load. The entry `playground.js` drops from ~22 MB to ~2 MB (the rest is lazy chunks: Monaco's on-demand features + the binaryen WAT chunk). `pages.yml` ships the chunks (`dist/*.js`); `index.html` still loads only `playground.js` + `playground.css`. WAT stays a feature (binaryen disassembling the seed's bytes), just off the critical path.
 
 ## Infrastructure (Track F)
+- Refreshed the self-compile fuel baseline to 100.73G (+0.93%, accumulated drift of #9151-#9189) with its ledger line; it is the new reference for the +3% cumulative cap (owner ruling 2026-11-19).
+- **Merge-queue process documented:** `docs/internals/merge-queue.md` holds the READY format, batching, tree equality, the IR veto list, the fold cadence and the cumulative fuel-drift cap; CLAUDE.md budgets the gate in CPU-s and states who proves what; `scripts/gate.sh --fast` now runs in a worktree.
 - **Self-compile fuel baseline refreshed at 97.15G (+0.97%):** the accumulated drift of #8948-#9034, recorded in `scripts/self-compile-ledger.txt`, so each later PR grades against its own delta.
 - Refreshed the self-compile fuel baseline to 98.11G (+0.99%, accumulated drift of #9035-#9084) with its ledger line.
 - Refreshed the self-compile fuel baseline to 99.03G (+0.94%, accumulated drift of #9086-#9116) with its ledger line.
