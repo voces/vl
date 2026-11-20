@@ -1704,6 +1704,7 @@ import {
 import {
   CoalArm,
   CoalBoxArm,
+  CoalNulRefArm,
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
   NULL_OWN_BOX,
@@ -40241,16 +40242,13 @@ function coalNicheBoxTag(joinTy: i32, lhsIx: i32, heapIx: i32, fnIx: i32): i32 {
   return -1
 }
 
-// The heap type a nullable-ref niche carries, or -1 — the same two tables the `??` niche
-// arms read (`exprNullableVariant` then `exprNullableStruct`), so the box stash and the
-// `br_on_non_null` block cannot disagree about the value's rep. -1 for every other niche,
-// whose tag `coalNicheBoxTag` resolves from its atom code instead of from a heap.
+// The heap type a nullable-ref niche carries, or -1: a nullable union arm's variant heap, else a
+// nullable record's struct heap. The box stash and the `br_on_non_null` block both read it, so they
+// cannot disagree about the value's rep. -1 for every other niche, whose tag `coalNicheBoxTag`
+// resolves from its atom code instead of from a heap.
 function nulNicheValueHeap(exprIx: i32, fnIx: i32): i32 {
   const nvi = nulVariantIdxOfExpr(exprIx, fnIx)
-  if nvi >= 0 {
-    if nvi < uVarRow.length { return variantHeap(nvi) }
-    return -1
-  }
+  if nvi >= 0 && nvi < uVarRow.length { return variantHeap(nvi) }
   if exprNullableStruct(exprIx, fnIx) {
     const nsi = structIndexOfExpr(exprIx, fnIx)
     if nsi >= 0 && nsi < sHeapIdx.length { return sHeapIdx[nsi] }
@@ -40346,48 +40344,64 @@ function emitCoalesceNulRefJoin(
   heapIx: i32,
   fnIx: i32,
 ) {
-  // The union the join's result boxes into is the one its default is delivered into
-  // (`boxDstNameAt`).
-  const joinN = boxDstNameAt(e.binRight, fnIx)
-  if joinN == "" {
-    return emitFailAt(
-      "emitProgram: `??` joins a nullable value into a union the checker recorded no row for",
-      exprIx,
-    )
-  }
-  const joinTy = boxDstTyOf(e.binRight, fnIx)
-  const tag = coalNicheBoxTag(joinTy, unwrapParen(e.binLeft), heapIx, fnIx)
-  if tag < 0 {
-    return emitFailAt(
-      "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type",
-      exprIx,
-    )
-  }
-  if !coalJoinDefaultBoxes(joinTy, e.binRight, fnIx) {
-    return emitFailAt(
-      "emitProgram: `??` default names no arm of the union its result is",
-      exprIx,
-    )
-  }
-  if !fnUses.optRecv {
-    return emitFailAt("emitProgram: `??` operand stash not reserved", exprIx)
-  }
+  const why = coalNulRefJoinWhy(e, heapIx, fnIx)
+  if why != "" { return emitFailAt(why, exprIx) }
   if emitExpr(e.binLeft, fnIx) < 0 {
     return -1 // the nullable ref, evaluated ONCE
   }
-  fbLocalTee(optRecvSlot)
-  fbRefIsNull()
-  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+  coalNulRefJoinOpen()
   // Through `emitUnionBoxArg`, not `emitUnionCoerce`: a struct default that is already a
   // kind-8 VARIANT local is a raw `(ref $variant)`, which the coerce hands back unboxed, and
   // the box blocktype then holds a bare struct. The box-typed destinations share this entry.
   if (emitUnionBoxAtRecord("", -1, e.binRight, fnIx) < 0) { return -1 }
-  fbElse()             // 0x05 else — present → the staged ref, boxed under its own arm's tag
+  coalNulRefJoinPresent(coalNulRefJoinTag(e, heapIx, fnIx))
+  fbEnd() // 0x0b end
+  return 0
+}
+
+// Why the joining `l ?? d` over a nullable reference of heap `heapIx` is refused, or "": its union
+// has no row, no arm for the value's own type, or no arm for the default, or the function reserves
+// no stash for the operand.
+export function coalNulRefJoinWhy(e: BinExpr, heapIx: i32, fnIx: i32): string {
+  // The union the join's result boxes into is the one its default is delivered into
+  // (`boxDstNameAt`).
+  if boxDstNameAt(e.binRight, fnIx) == "" {
+    return "emitProgram: `??` joins a nullable value into a union the checker recorded no row for"
+  }
+  if coalNulRefJoinTag(e, heapIx, fnIx) < 0 {
+    return "emitProgram: `??` joins a nullable value into a union with no arm for the value's own type"
+  }
+  if !coalJoinDefaultBoxes(boxDstTyOf(e.binRight, fnIx), e.binRight, fnIx) {
+    return "emitProgram: `??` default names no arm of the union its result is"
+  }
+  if !fnUses.optRecv { return "emitProgram: `??` operand stash not reserved" }
+  return ""
+}
+
+// The tag the present arm of a joining `l ?? d` boxes the operand of heap `heapIx` under.
+export function coalNulRefJoinTag(e: BinExpr, heapIx: i32, fnIx: i32): i32 {
+  return coalNicheBoxTag(
+    boxDstTyOf(e.binRight, fnIx),
+    unwrapParen(e.binLeft),
+    heapIx,
+    fnIx,
+  )
+}
+
+// The head of a joining `l ?? d` once the operand is on the stack: staged in the `?.` receiver
+// slot, which the box arm reads back (D1714), its null test, and the `if` at the box.
+export function coalNulRefJoinOpen() {
+  fbLocalTee(optRecvSlot)
+  fbRefIsNull()
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the result's rep
+}
+
+// The present arm of a joining `l ?? d`: the staged reference boxed under tag `tag`.
+export function coalNulRefJoinPresent(tag: i32) {
+  fbElse() // 0x05 else — present → the staged ref, boxed under its own arm's tag
   fbI32Rel(RS_TAG, tag)
   fbLocalGet(optRecvSlot)
   fbStructNew(uBoxIdx) // { tag, the niche's own ref }
-  fbEnd()              // 0x0b end
-  return 0
 }
 
 // The boxed `??` over the `boolean | null` i32 niche, for a default that joins rather than
@@ -40549,6 +40563,61 @@ function emitCoalesceAtomStrDefault(defIx: i32, nulBlock: boolean, fnIx: i32) {
     fbRefAsNonNull() // 0xd4 the block is non-null: the default's null is narrowed away
   }
   return 0
+}
+
+// The heap the `br_on_non_null` core of `l ?? d` carries, -1 when `l` reaches none: a nullable
+// collection's wrapper or the closure struct at their niche arms, else, past every boxed and fused
+// arm, the nullable reference's own heap (`nulNicheValueHeap`).
+export function coalNulRefHeapOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  return match coalNicheArmOf(e, lhsIx, exprIx, fnIx) {
+    "coll" => nulCollWrapHeap(e.binLeft, fnIx)
+    "clo" => cloStructIdx
+    "identBox" => nulNicheValueHeap(e.binLeft, fnIx)
+    // Their own lowerings: the `boolean | null` and atom niches, and the string core at `sTy()`.
+    "nulBoolJoin" | "nulBool" | "litUnion" | "nulAtomStr" | "str" => -1
+  }
+}
+
+// Whether `l ?? d` past `coalBoxArmOf`'s boxed arms reaches the nullable-reference rungs with no
+// arm between: a name, or a call that is no `boolean | null` or `string | null` niche
+// (`emitCoalesceCallNiche`), neither a field read nor a `?.` chain.
+export function coalNulRefRungReached(
+  e: BinExpr,
+  lhsIx: i32,
+  fnIx: i32,
+): boolean {
+  const l = nodeAt(lhsIx)
+  if l is Ident { return true }
+  return l is Call
+    && !exprNulBool(e.binLeft, fnIx)
+    && !exprNullableString(e.binLeft, fnIx)
+}
+
+// The `br_on_non_null` core of `l ?? d` along `coalNulRefHeapOf`'s heap `nrHeap`, its block shape
+// `nrArm`, and, for a default that joins into a union, the tag `nrTag` the present arm boxes under.
+export type CoalNulRefPlan = { nrHeap: i32, nrArm: CoalNulRefArm, nrTag: i32 }
+
+// The nullable-reference plan of `l ?? d`, or null when `l` reaches no such core.
+export function coalNulRefPlanOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNulRefPlan | null {
+  const h = coalNulRefHeapOf(e, lhsIx, exprIx, fnIx)
+  if h < 0 { return null }
+  const a = coalNulRefArmOf(e, exprIx, fnIx)
+  const tag = match a {
+    "join" => coalNulRefJoinTag(e, h, fnIx)
+    "noBox" | "listClash" | "litAtom" | "plain" => -1
+  }
+  const p: CoalNulRefPlan = { nrHeap: h, nrArm: a, nrTag: tag }
+  return p
 }
 
 // The core above for the nullable struct (`S | null`) and nullable collections (`i32[] |
@@ -41075,10 +41144,22 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // cell is a `(ref null $wrapper)`, so it takes the same `br_on_non_null` lowering as the
   // nullable struct below — placed before the sentinel-free ref paths as `emitNulIsNullTest` orders its niches, since the wrapper heap type is what distinguishes the families.
   if arm == "coll" {
-    return emitCoalesceNulRef(e, exprIx, nulCollWrapHeap(e.binLeft, fnIx), fnIx)
+    return emitCoalesceNulRef(
+      e,
+      exprIx,
+      coalNulRefHeapOf(e, lhsIx, exprIx, fnIx),
+      fnIx,
+    )
   }
   // A nullable function value is the closure's own `(ref null $clo)`, the same core (D3373).
-  if arm == "clo" { return emitCoalesceNulRef(e, exprIx, cloStructIdx, fnIx) }
+  if arm == "clo" {
+    return emitCoalesceNulRef(
+      e,
+      exprIx,
+      coalNulRefHeapOf(e, lhsIx, exprIx, fnIx),
+      fnIx,
+    )
+  }
   // `<e> ?? d` over a `string | null` niche (an ident binding, a `string | null` struct field,
   // or a `(string | null)[]` element read): the cell is a `(ref null $sTypeIdx)`, so it takes
   // the same `br_on_non_null` core as the nullable struct/collections — one evaluation of the
@@ -41108,7 +41189,13 @@ function emitCoalesceIdentBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
       "emitProgram: `??` over a nullable value union has no banked residual kind",
     )
     "callNoKind" => emitFail("emitProgram: `??` over a call result has no banked residual kind")
-    "next" => emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
+    "next" => {
+      if coalNulRefRungReached(e, lhsIx, fnIx) {
+        emitCoalesceNullableRefs(e, exprIx, fnIx)
+      } else {
+        emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
+      }
+    }
   }
 }
 
@@ -41912,24 +41999,8 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   // null` whose `T` is a union arm stores `(ref null $variantHeap(vi))`, and
   // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
   // niche, same `br_on_non_null` lowering, one table over.
-  const cvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
-  if cvi >= 0 {
-    if cvi < uVarRow.length {
-      return emitCoalesceNulRef(e, exprIx, variantHeap(cvi), fnIx)
-    }
-  }
-  // Generic nullable-struct `??`: a `S | null` value (ident/param binding, struct field, or
-  // closure/factory call) coalesced with a struct default. Evaluated once: `br_on_non_null`
-  // keeps the non-null struct or falls to the default, needing neither a re-eval nor a
-  // per-struct stash — `structIndexOfExpr` resolves the inner struct for the block's result type, including an indexed closure-array/factory call via the checker-type fallback.
-  if exprNullableStruct(e.binLeft, fnIx) {
-    const csi = structIndexOfExpr(e.binLeft, fnIx)
-    if csi >= 0 && csi < sHeapIdx.length {
-      // The block type and the one-evaluation shape are the nullable-ref-niche lowering the
-      // collections share.
-      return emitCoalesceNulRef(e, exprIx, sHeapIdx[csi], fnIx)
-    }
-  }
+  const crHeap = coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
+  if crHeap >= 0 { return emitCoalesceNulRef(e, exprIx, crHeap, fnIx) }
   // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
   // re-readable spelling never arrives here: `emit_rewrite` desugars it to an `if`, which is
   // right because a rewrite leaves no `??` node for the consumer classifiers to disagree
