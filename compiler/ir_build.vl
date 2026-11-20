@@ -101,9 +101,10 @@ import {
   irGlobalWriteMiss,
   irHexOf,
   irLowerClaim,
-  irLowerFragment,
   irLoweredEntry,
+  irLowerFragment,
   irSlotRunAgrees,
+  mapRecvGlobalIx,
 } from "./ir_lower"
 import {
   GlobalCtx,
@@ -304,9 +305,9 @@ import {
   nulNicheRecoverOwed,
 } from "./emit_value_sites"
 import {
+  asgReadUnwidenOp,
   asgReReadEnter,
   asgReReadLeave,
-  asgReadUnwidenOp,
   callIsArrSlice,
   capCellTargetOf,
   captureCountOf,
@@ -317,6 +318,7 @@ import {
   exprIsLitAtom,
   exprIsStrMethod,
   exprMap,
+  exprNullableMap,
   exprUnion,
   fnIndexOfNode,
   forInElemTyOf,
@@ -3331,12 +3333,9 @@ function bodyAssigns(body: i32[], v: i32): boolean {
 
 // The module global map read `recvIx` names, its rep noted in `ib`; -1 for any other receiver.
 function mapGlobalOf(recvIx: i32): i32 {
-  if recvIx < 0 || !(nodeAt(recvIx) is Ident) { return -1 }
-  const d = identDeclOf(recvIx)
-  if d < 0 || localIndexOf(ibFnIx, recvIx) >= 0 { return -1 }
-  if !(nodeAt(d) is LetDecl) { return -1 }
-  const g = globalIndexOfSid(sidOfNode(recvIx))
+  const g = mapRecvGlobalIx(recvIx, ibFnIx)
   if g < 0 { return -1 }
+  const d = identDeclOf(recvIx)
   const r = repNodeOfTy(scopeTyAt(d, -1))
   if !(repNodeAt(r) is RMap) { return -1 }
   irGlobalNote(ib, g, r)
@@ -3835,6 +3834,16 @@ function loopIx(label: string): i32 {
   return -1
 }
 
+// Whether map walk receiver `mr`'s operand rep `r` is one the walk's stash takes: a map, or a
+// nullable map the shared `mapRecvRefTail` recovers.
+function mapRecvRepOk(r: i32, mr: i32): boolean {
+  const n = repNodeAt(r)
+  if n is RMap { return true }
+  return n is RNullable
+    && repNodeAt(n.rnInner) is RMap
+    && exprNullableMap(mr, ibFnIx)
+}
+
 // A `for` statement along legacy's walk (`forInPlainWhy`, a hoisted one included): the list
 // once, its element variable at the declared slot, and the body. Every other walk is a named miss.
 function forInStmt(b: i32[], n: ForIn, ix: i32) {
@@ -3843,10 +3852,18 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   // A map walk's operand is its receiver, whose keys or values list the lowering reads.
   const mr = forInMapRecv(n.fiIter, ibFnIx)
   const g = if mr >= 0 { mapGlobalOf(mr) } else { -1 }
-  if mr >= 0 && g < 0 { return skip("for in map receiver") }
+  // A global receiver is read as one, never as an operand; any other is built raw, as legacy's
+  // stash writes it, at a map rep its shared recovery owns.
+  if mr >= 0 && g < 0 && mapRecvGlobalIx(mr, ibFnIx) >= 0 {
+    return skip("for in map receiver")
+  }
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
-  const l = if mr >= 0 { none } else { irBExpr(b, n.fiIter) }
+  const src = if mr >= 0 { mr } else { n.fiIter }
+  const l = if g >= 0 { none } else { irBExpr(b, src) }
   if ibMiss != "" { return 0 }
+  if mr >= 0 && g < 0 && !mapRecvRepOk(irBOpRep(l), mr) {
+    return skip("for in map receiver rep")
+  }
   // A list walks its elements; a string its code points, each an i32; a map its keys or values.
   const lr = irBOpRep(l)
   const ln = repNodeAt(lr)
