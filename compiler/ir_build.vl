@@ -1306,36 +1306,62 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
 
 // A value `if` joined at a reference (legacy's `emitIfExprRef`): one link whose arms each write
 // their value as itself (`refIfArmOf`'s `plain`) at the join's rep, under the blocktype the
-// lowering asks `ifRefJoinOf` for. A chain's links share the head's kind, so a chain is a miss.
+// lowering asks `ifRefJoinOf` for. A chain's links share the head's kind (`refIfLink`).
 function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   const kind = rj.rjKind ?? "struct"
   if kind != "str" && kind != "list" && kind != "strlist" && kind != "reflist" {
     return irBMiss("expression if ref " + kind)
   }
-  if n.ifElse < 0 || nodeAt(n.ifElse) is IfStmt {
-    return irBMiss("ref if chain")
-  }
-  if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
     return irBMiss("ref if drops null atom")
   }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
+}
+
+// One link of a reference join's chain (`emitIfExprRefLink`), its out at the head's rep and type:
+// an `else if` is the next link, written into this link's `else` and delivered to its out. The
+// chain's blocktype is nullable from the first link that yields `null` inward, which the lowering
+// reads per link, so a link that disagrees is a miss.
+function refIfLink(
+  b: i32[],
+  n: IfStmt,
+  ix: i32,
+  rep: i32,
+  ty: i32,
+  kind: VKind,
+  slot: i32,
+  nulAcc: boolean,
+): Opnd {
+  if intSwitchMayLower(ix) { return irBMiss("ref if switch") }
+  const own = ifLinkYieldsNull(ix, ibFnIx)
+  const nul = nulAcc || own
+  if nul != own { return irBMiss("ref if chain null inward") }
+  const lj = ifRefJoinOf(ix, ibFnIx)
+  if lj.rjKind != kind || lj.rjSlot != slot {
+    return irBMiss("ref if chain join")
+  }
+  if n.ifElse < 0 { return irBMiss("ref if else-less") }
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
   if c is OImm && condIsTest(n.ifCond) {
     return irBMiss("decided is condition")
   }
-  const ty = nodeTyAt(ix, ibFnIx)
-  if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
-  const nul = ifLinkYieldsNull(ix, ibFnIx)
-  const thenB = refIfArm(n.ifThen, t, rep, kind, rj.rjSlot, nul)
+  const thenB = refIfArm(n.ifThen, t, rep, kind, slot, nul)
   if ibMiss != "" { return irBMiss("ref if arm") }
-  // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
   let elseB: i32[] = []
-  if valueIfLitTrue(n.ifCond) {
+  const en = nodeAt(n.ifElse)
+  if en is IfStmt {
+    const inner = refIfLink(elseB, en, n.ifElse, rep, ty, kind, slot, nul)
+    if ibMiss != "" { return inner }
+    irBNode(elseB, { asDst: t, asSrc: inner }, -1, ibNoValue, n.ifElse)
+  } else if valueIfLitTrue(n.ifCond) {
+    // Legacy writes a dead `else` as `unreachable` (`emitDeadValueArm`).
     irBNode(elseB, { tpWhy: 0 }, -1, ibNoValue, n.ifElse)
   } else {
-    elseB = refIfArm(n.ifElse, t, rep, kind, rj.rjSlot, nul)
+    elseB = refIfArm(n.ifElse, t, rep, kind, slot, nul)
   }
   if ibMiss != "" { return irBMiss("ref if arm") }
   irBNode(
