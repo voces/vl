@@ -2129,3 +2129,26 @@ drop1(100)
     }
   },
 });
+
+// A memory access's address and value are each written in place at their use: computed and
+// called addresses and values match.
+Deno.test({
+  name: "ir shadow: a memory access over computed and called operands matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`function k(n: i32): i32 { return n * 2 }
+function st(i: i32, j: i32) { __store_i32__(i + j * 4, k(j) + 1) }
+function stc(i: i32) { __store_i32__(k(i), k(i + 1)) }
+function ld(i: i32, j: i32): i32 { return __load_i32__(k(i) + j) + __load_u8__(i * 3) }
+st(100, 2)
+stc(60)
+print(ld(54, 0))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
