@@ -2360,3 +2360,55 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// An element store into an atom or niche list writes its value as it stands, a union list's
+// value boxed by its record or already a named union, a nested list's a non-literal row: the
+// plain store legacy writes, covered and matched.
+Deno.test({
+  name: "ir shadow: element stores into atom, niche, union and nested lists are covered and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type K = "a" | "b" | "c"
+type A = { a: i32 }
+type B = { b: string }
+type U = A | B
+let kinds: K[] = ["a", "a"]
+let opt: (K | null)[] = ["a", null]
+let flags: (boolean | null)[] = [true, null]
+let strs: (string | null)[] = ["x", null]
+let us: U[] = [{ a: 1 }]
+let rows: i32[][] = [[1], [2]]
+function setKind(i: i32, k: K): i32 {
+  kinds[i] = k
+  opt[i] = k
+  opt[1 - i] = null
+  flags[i] = null
+  strs[i] = null
+  return 0
+}
+function setU(i: i32, u: U): i32 {
+  us[i] = u
+  return us.length
+}
+function setA(i: i32, x: A): i32 {
+  us[i] = x
+  return 0
+}
+function setRow(i: i32, xs: i32[]): i32 {
+  rows[i] = xs
+  return rows[i].length
+}
+setKind(1, "c")
+print(kinds[1])
+print(setU(0, { b: "q" }))
+setA(0, { a: 5 })
+print(setRow(0, [7, 8, 9]))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want all four covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
