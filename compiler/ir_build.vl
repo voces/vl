@@ -1432,6 +1432,85 @@ function letIfArms(b: i32[], ifIx: i32, v: i32) {
   return letIfArmLink(b, ifIx, v, vr)
 }
 
+// A union binding's `if` initializer under the binding sink (`emitUnionIfBindingSink`): a void
+// `if` chain whose arms each put their box into the sink pair, a missing `else` the null, then the
+// binding's one box built from the pair into `v`.
+function letIfSinkArms(b: i32[], ifIx: i32, v: i32) {
+  const vr = ib.irVars[v].vRep
+  if !heldAsBox(vr) { return skip("declaration if per arm rep") }
+  letIfSinkLink(b, ifIx, v, vr)
+  if ibMiss != "" { return 0 }
+  irBNode(
+    b,
+    { srOp: "sink.close", srHeap: -1, srArgs: [], srImm: v },
+    -1,
+    ibNoValue,
+    ifIx,
+  )
+  return 0
+}
+
+// One link of `letIfSinkArms` (`emitUnionIfBindingSinkLink`).
+function letIfSinkLink(b: i32[], ifIx: i32, v: i32, vr: i32) {
+  const n = nodeAt(unwrapParen(ifIx))
+  if !(n is IfStmt) { return skip("declaration if per arm node") }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+  const thenB = letIfSinkBody(n.ifThen, v, vr)
+  if ibMiss != "" { return 0 }
+  const elseB: i32[] = []
+  if n.ifElse < 0 {
+    irBNode(
+      elseB,
+      { srOp: "sink.null", srHeap: -1, srArgs: [], srImm: -1 },
+      -1,
+      ibNoValue,
+      ifIx,
+    )
+  } else if nodeAt(n.ifElse) is IfStmt {
+    if ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
+      return skip("declaration if per arm scalar link")
+    }
+    letIfSinkLink(elseB, n.ifElse, v, vr)
+  } else {
+    for x in letIfSinkBody(n.ifElse, v, vr) { elseB.push(x) }
+  }
+  if ibMiss != "" { return 0 }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: -1, siElseKw: true },
+    -1,
+    ibNoValue,
+    ifIx,
+  )
+  return 0
+}
+
+// One arm of `letIfSinkLink`: its one value delivered at `v`'s box and put into the sink pair.
+function letIfSinkBody(blockIx: i32, v: i32, vr: i32): i32[] {
+  const body: i32[] = []
+  const blk = nodeAt(blockIx)
+  const tv = ifArmValueExpr(blockIx)
+  if !(blk is Block) || blk.blkStmts.length != 1 || tv < 0 {
+    skip("declaration if per arm prelude")
+    return body
+  }
+  const x = deliver(body, tv, vr, -1)
+  if ibMiss == "" && irBOpRep(x) != vr {
+    skip("declaration if per arm coercion")
+  }
+  if ibMiss == "" {
+    irBNode(
+      body,
+      { srOp: "sink.put", srHeap: -1, srArgs: [x], srImm: v },
+      -1,
+      ibNoValue,
+      blockIx,
+    )
+  }
+  return body
+}
+
 // The null box written into `v` at `at`.
 function nullBoxInto(b: i32[], at: i32, v: i32, vr: i32) {
   const t = repTemp(b, { nuAt: at, nuOwn: NULL_OWN_BOX }, at, vr)
@@ -4672,7 +4751,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pa == 0 && !letIfInitSinks(n.letInit, ibFnIx) {
       return letIfArms(b, n.letInit, v)
     }
-    if pa == 0 { return skip("declaration if per arm sink") }
+    if pa == 0 { return letIfSinkArms(b, n.letInit, v) }
     if pa >= 0 { return skip("declaration if per arm " + i32ToStr(pa)) }
     const src = deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy)
     if ibMiss != "" { return 0 }

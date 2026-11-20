@@ -2421,3 +2421,38 @@ print(qnull().o == null)
     }
   },
 });
+
+// A union binding's `if` initializer under the binding sink puts each arm's box into the sink pair
+// (`unionBoxToPairTail`), a missing `else` the null (`emitUnionNullToPair`), and builds the one box
+// after the `if` (`unionLetSinkClose`): an `else if` chain and an else-less `if`.
+Deno.test({
+  name: "ir shadow: a union binding's if under the binding sink matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(`type U = i32 | string
+function pick(c: i32): U {
+  const r: U = if c > 1 { "big" } else if c > 0 { 1 } else { 0 }
+  return r
+}
+function opt(c: boolean): U | null {
+  const r: U | null = if c { "on" }
+  return r
+}
+function show(u: U | null): string {
+  if u == null { return "null" }
+  if u is string { return u }
+  return "int"
+}
+print(show(pick(2)))
+print(show(pick(1)))
+print(show(opt(true)))
+print(show(opt(false)))
+`, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want pick and opt covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
