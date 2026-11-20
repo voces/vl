@@ -2360,3 +2360,21 @@ print(elseIfWiden(3) + elseIfWiden(2))
     }
   },
 });
+
+// An assignment whose value is its number literal (`asgValueArmOf` "lit") stores, then builds the
+// literal again at the reading position's width: negated, at i64 and f64, and widened past it.
+const ASG_VALUE_LIT =
+  `let g32 = 0\nlet g64: i64 = 0\nlet gf = 0.0\nfunction a(): i32 { return g32 = -1 }\nfunction b(): i64 { return g64 = 7 }\nfunction c(): f64 { return gf = -2.5 }\nfunction w(): f64 { return g32 = 9 }\nprint(a())\nprint(b())\nprint(c())\nprint(w())\n`;
+Deno.test({
+  name: "ir shadow: an assignment valued as its number literal builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ASG_VALUE_LIT, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want a, b, c and w covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});

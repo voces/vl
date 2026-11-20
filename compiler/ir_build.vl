@@ -2976,6 +2976,11 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
   const dk = numKindOf(dst)
   if sk < 0 || dk < 3 { return v }
   const p = widenPlanOf(ix, dk, ibFnIx)
+  // A stored literal's value is the literal again, built at the destination (`emitAsgLitAs`).
+  const asg = nodeAt(unwrapParen(ix))
+  if p.wpArm == "asgLit" && v is OImm && asg is BinExpr {
+    return signedLitAt(unwrapParen(asg.binRight), dst)
+  }
   if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
   if p.wpSrc != sk { return irBMiss("widen source") }
   // The temp is typed at the destination, whose rep it holds.
@@ -4203,6 +4208,7 @@ function siteBuilt(n0: i32, ix: i32): boolean {
 // legacy re-reads in reads it as the builder's own does.
 function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = asgValueArmOf(ix, ibFnIx)
+  if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
     return irBMiss("assignment value unwiden")
@@ -4214,6 +4220,31 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const m = asgReReadEnter(ix)
   const o = identRead(b, t, n.binLeft, rep, false)
   asgReReadLeave(m)
+  return o
+}
+
+// An assignment whose value is its right side's number literal (`asgValueArmOf` "lit"): the
+// store, then that literal built again at the assignment's rep, as `emitAsgLitAs` writes it.
+function assignValueLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  assignTo(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return signedLitAt(unwrapParen(n.binRight), rep)
+}
+
+// The number literal at `lit`, under any parentheses and minus signs, as one immediate at rep
+// `rep` (`emitSignedNumLitAt`): each minus negates it as the lowering folds a `neg` of one.
+function signedLitAt(lit: i32, rep: i32): Opnd {
+  const n = nodeAt(lit)
+  if n is NumLit { return numLit(n, lit, rep) }
+  if !(n is Unary) || n.unOp != "-" { return irBMiss("assignment value lit") }
+  const a = signedLitAt(unwrapParen(n.unArg), rep)
+  if !(a is OImm) { return a }
+  const k: string = repPrim(rep) ?? ""
+  const one: i64 = 1
+  const bits = if k == "f64" { a.oiBits ^ (one << 63) } else if k == "f32" {
+    a.oiBits ^ (one << 31)
+  } else { 0 - a.oiBits }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
   return o
 }
 
