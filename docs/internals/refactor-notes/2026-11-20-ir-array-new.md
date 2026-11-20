@@ -30,24 +30,24 @@ fill, then allocates the backing and the `{backing, len, cap}` wrapper.
 - Named misses stay for `__array_new_default__`, a refused site, a fill boxed into a union
   element, and a length or fill at another rep.
 
-Compiler lines are +206 −128 across `wasmEmit.vl`, `ir_build.vl`, `ir_lower.vl` and `ir.vl`. No
+Compiler lines are +218 −129 across `wasmEmit.vl`, `ir_build.vl`, `ir_lower.vl` and `ir.vl`. No
 legacy line is deleted; the arm's decisions moved into the shared functions. The capability
 template `matrix/array-new-delivered.matrix.vl` grades every position, plus f64, string, record,
 nested and union-element fills.
 
-## Readings (vs merge-base `6737c1aab`, fixpoint seeds on both sides)
+## Readings (vs merge-base `c2f0a972f`, fixpoint seeds on both sides)
 
 | reading | merge-base | this change |
 | --- | ---: | ---: |
-| self-compile functions claimed (mode 5) | 18,446 | 18,454 (+8) |
-| self-compile functions with no blocker | 18,529 | 18,553 (+24) |
+| self-compile functions claimed (mode 5) | 18,536 | 18,547 (+11) |
+| self-compile functions with no blocker | 18,619 | 18,646 (+27) |
 | self-compile `intrinsic none`, alone | 25 | 9 |
-| corpus covered = verified = matched (shadow) | 41,296 of 45,678 | 41,314 (+18) |
+| corpus covered = verified = matched (shadow) | 41,450 of 45,678 | 41,468 (+18) |
 | corpus `intrinsic none`, alone (census) | 19 | 0 (1 now `array new default`) |
-| L2 self-compile fuel | 103,451,339,825 | 103,497,980,201 (+0.045%) |
-| seed size | 6,900,565 | 6,902,099 (+1,534 bytes) |
+| L2 self-compile fuel | 103,511,665,386 | 103,556,896,056 (+0.044%) |
+| seed size | 6,905,248 | 6,906,817 (+1,569 bytes) |
 
 The nine self-compile functions left are `__array_copy__` (four) and the linear-memory load and
 store intrinsics (five). Legacy is A/B'd on its own: compilers with `CLAIMED` empty built from
-both trees give identical bytes on every tests/cases program and probe (7,527 identical, 68
+both trees give identical bytes on every tests/cases program and probe (7,528 identical, 68
 failing under both, 0 differ) and the same first diagnostic on all 59 filed emit-reject witnesses.
