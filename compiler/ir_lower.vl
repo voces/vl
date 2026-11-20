@@ -65,9 +65,12 @@ import {
 import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
+  coalesceDefaultNullable,
   declaredIndexAt,
   exprVariantIndex,
   forInElemKind,
+  memberBoxReadEnter,
+  memberBoxReadLeave,
   readOwesNonNullRecover,
   structIndexOfExpr,
 } from "./emit_classify"
@@ -107,6 +110,7 @@ import {
   RMakeList,
   RMakeRec,
   RMapFilter,
+  RMapGet,
   RMapGetOr,
   RMapHas,
   RMapNew,
@@ -122,6 +126,7 @@ import {
   RRawOp,
   RRecover,
   RRel,
+  RRetNull,
   RRetag,
   RSharedRead,
   RSpread,
@@ -244,11 +249,16 @@ import {
   coalBoxOpen,
   coalBoxSlot,
   coalNulRefBranch,
+  coalNulRefJoinOpen,
+  coalNulRefJoinPresent,
   coalNulRefOpen,
+  coalNulRefPlanOf,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
+  emitMapGetTail,
   emitMapNew,
+  emitNarrowedMapReadTail,
   emitNullOwn,
   emitNullRetTail,
   emitStrLitAt,
@@ -292,7 +302,9 @@ import {
   listReserveOpen,
   loopHoistCands,
   loopHoistClose,
+  mapGetArmOf,
   mapGetHelperFnOf,
+  mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrHelperRoute,
   mapGetOrI32Head,
@@ -368,6 +380,7 @@ import {
   atomEqPlanOf,
   holeBoxPlanOf,
   memRecvOwesNonNull,
+  memberBoxReadAt,
   narrowedBoxVariantPlain,
   narrowedFieldPlain,
   narrowedVariantRepIs,
@@ -704,6 +717,12 @@ function rhs(r: Rhs, tail: boolean) {
     RCall => call(r, tail)
     RGlobalGet => globalRead(r.ggSym, r.ggNonNull)
     RMapGetOr => mapGetOr(r)
+    RMapGet => {
+      const from = irLAt()
+      const got = mapGet(r)
+      irLIndexRow(r.mtAt, from)
+      got
+    }
     RMapHas => mapHas(r)
     RPrint => irLMiss("print value")
     RNumIntr => {
@@ -754,6 +773,10 @@ function rhs(r: Rhs, tail: boolean) {
     RNullOf => {
       leaf()
       emitNullOwn(r.nuOwn)
+    }
+    RRetNull => {
+      leaf()
+      emitNullRetTail(nullRetPlanOf(lw.irAt))
     }
     RTest => {
       irLOpnd(r.teV)
@@ -1126,7 +1149,13 @@ function getField(r: RGetField) {
   if !(m is Member) { return irLMiss("field node") }
   if fieldIdxAt(r.gfAt, m) < 0 { return irLMiss("field shape") }
   irLOpnd(r.gfV)
-  return fieldTail(r.gfAt, m)
+  // A member record read the box plan passes as its field's box is lowered at its storage, as
+  // the builder built it (`memberBoxTemp`).
+  if !memberBoxReadAt(r.gfAt, lw.irAt) { return fieldTail(r.gfAt, m) }
+  const marks = memberBoxReadEnter(r.gfAt)
+  const rc = fieldTail(r.gfAt, m)
+  memberBoxReadLeave(marks)
+  return rc
 }
 
 // The plain field index member read `at` reads, or -1.
@@ -1478,6 +1507,41 @@ function mapProbeHead(
   return sh
 }
 
+// `RMapGet`, a bare `m[k]` by legacy's arm (`mapGetArmOf`): the global or receiver and the key
+// into `__map_get_<row>__` with the read's miss value, or the probe and its value tail; then the
+// narrowed read's tail.
+function mapGet(r: RMapGet) {
+  const fnIx = lw.irAt
+  const nd = nodeAt(r.mtAt)
+  if !(nd is Index) { return irLMiss("map get node") }
+  if r.mtSym >= 0 && userGlobalReadClass(r.mtSym, lwGlobalCtx) != "plain" {
+    return irLMiss("map get of a global not read plainly")
+  }
+  const arm = mapGetArmOf(r.mtAt, fnIx)
+  match arm {
+    "unionBox" => {
+      return irLMiss("map get route")
+    }
+    "helper" => {
+      const fi = mapGetHelperFnOf(
+        nd.idxArr,
+        fnIx,
+        mapGetMissOf(nd.idxArr, fnIx),
+      )
+      mapRecvRead(r.mtSym, r.mtNonNull, r.mtLoc)
+      mapRecvRefTail(nd.idxArr, fnIx)
+      irLOpnd(r.mtKey)
+      mapRecvKeyTail(mapRecvShapeOf(nd.idxArr, fnIx))
+      fbCall(fi)
+    }
+    "inline" => {
+      mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
+      emitMapGetTail(nd.idxArr, fnIx)
+    }
+  }
+  return emitNarrowedMapReadTail(r.mtAt, fnIx)
+}
+
 // An inline `??` map read's head, up to the miss arm's `else`: the probe, then the `i32` read's
 // or mv slot read's open by `form`. Returns the receiver's shape for the tail.
 function mapGetOrInlineHead(
@@ -1557,7 +1621,7 @@ function mapOp(r: RMapOp) {
       irLOpnd(r.mpArgs[0])
       mapSizeTail(m.memObj, lw.irAt)
     }
-    "get" | "has" | "set" | "delete" | "keys" => irLMiss("map op " + r.mpOp)
+    "has" | "set" | "delete" | "keys" => irLMiss("map op " + r.mpOp)
   }
 }
 
@@ -1642,6 +1706,7 @@ function boxOp(r: RToBox) {
   holeBoxHead(p, r.bxAt, fnIx)
   if (
     p.hbArm == "pass"
+    || p.hbArm == "memberBox"
     || p.hbArm == "atom"
     || p.hbArm == "atomStr"
     || p.hbArm == "rec"
@@ -1771,7 +1836,7 @@ function passBoxOf(t: i32): i32 {
   const r = tempRhs(t)
   if !(r is RToBox) { return -1 }
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, lw.irAt), lw.irAt)
-  return if p.hbArm == "pass" { t } else { -1 }
+  return if p.hbArm == "pass" || p.hbArm == "memberBox" { t } else { -1 }
 }
 
 // The operand a pass box temp `t` holds.
@@ -2263,7 +2328,14 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
   const ba = coalValBoxArm(n.cbArm)
-  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else if n.cbArm == "mapIndexGetOr" { coalMapGetOr(n, e, pending) } else { coalPopOr(n, e, pending) }
+  const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
+    "popOr" => coalPopOr(n, e, pending)
+    "mapIndexGetOr" => coalMapGetOr(n, e, pending)
+    "nulRef" => coalNulRef(n, e, pending)
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
+      irLMiss("coalesce box arm")
+    }
+  } }
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
@@ -2317,6 +2389,39 @@ function coalPopOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
+  fbEnd()
+  return 0
+}
+
+// A nullable reference's `??` along its plan: the plain block (the operand inside it, the branch
+// out on non-null) or a join's staged `if` (the operand ahead of it), then the shared tail.
+function coalNulRef(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const fnIx = lw.irAt
+  const p = coalNulRefPlanOf(e, unwrapParen(e.binLeft), n.cbAt, fnIx)
+  if p == null { return irLMiss("coalesce nulRef heap") }
+  return match p.nrArm {
+    "plain" => {
+      coalNulRefOpen(p.nrHeap, coalesceDefaultNullable(e.binRight, fnIx))
+      cond(n.cbL, pending)
+      coalNulRefBranch()
+      coalNulRefTail(n, -1)
+    }
+    "join" => {
+      cond(n.cbL, pending)
+      coalNulRefJoinOpen()
+      coalNulRefTail(n, p.nrTag)
+    }
+    "noBox" | "listClash" | "litAtom" => irLMiss("coalesce nulRef " + p.nrArm)
+  }
+}
+
+// The default of a nullable reference's `??` writing the slotless out, then, for a join, the
+// present arm boxing the staged reference under `tag`, and the end.
+function coalNulRefTail(n: SCoalBox, tag: i32): i32 {
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  if tag >= 0 { coalNulRefJoinPresent(tag) }
   fbEnd()
   return 0
 }
@@ -2389,15 +2494,20 @@ function ret(n: SReturn, pending: i32[]) {
     return 0
   }
   cond(n.rtV, pending)
-  // A function taking legacy's union return sink pops a box built here into the sink pair and
-  // branches to the exit block wrapped round the body, as `emitUnionRetSink` does.
+  return sinkExit()
+}
+
+// A returned value already written exits as `emitUnionRetSink` writes it: a function taking the
+// union return sink pops a box built here into the sink pair and branches to the exit block
+// wrapped round the body, and anything else returns.
+function sinkExit() {
   if fnUses.unionSink && uBoxNewIsLast() {
     uBoxSinkToPair()
     fbBr(lwFrames.length)
     lwSinkFired = lwSinkFired + 1
     return 0
   }
-  fbReturn()
+  return fbReturn()
 }
 
 function spanOpen(id: i32) {
@@ -2544,12 +2654,9 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
   const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
   if pad == "null" {
-    // Legacy sinks this `null` when the return sink fired; the IR does not build that exit.
-    if lwSinkFired > 0 {
-      irLMiss("null fall-through into the return sink")
-    } else {
-      emitNullRetTail(nullRetPlanOf(f.irAt))
-    }
+    emitNullRetTail(nullRetPlanOf(f.irAt))
+    // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
+    if lwSinkFired > 0 { sinkExit() }
   } else if pad == "unreachable" {
     fbUnreachable()
   }
