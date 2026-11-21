@@ -640,7 +640,7 @@ Deno.test({
       "type A = { a: i32 }\n" +
       "type B = { b: i32 }\n" +
       "type C = { c: i32 }\n" +
-      "type U = A | B | C\n" +
+      "type U = A\n  | B\n  | C\n" +
       "const ks = [\n  \"A\",\n  \"B\",\n  \"C\",\n]\n" +
       "function f(u: U): i32 {\n  return match u {\n    A |\n    B => 1\n    C => 2\n  }\n}\n" +
       "function g(u: U): i32 {\n  return match u {\n    A | B => 1\n    C => 2\n  }\n}\n" +
@@ -656,8 +656,31 @@ Deno.test({
     if (!r.out.includes("    A | B => 1\n")) {
       throw new Error(`one-line or-patterns were split:\n${r.out}`);
     }
+    if (!r.out.includes("type U = A\n  | B\n  | C\n")) {
+      throw new Error(`one-per-line type union was reflowed:\n${r.out}`);
+    }
     const r2 = await run([], r.out);
     if (r2.out !== r.out) throw new Error(`one-per-line not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: the price — a list wrapped one per line for wide items keeps that layout once they shrink",
+  ignore: !ENABLED,
+  fn: async () => {
+    // Wide items fill one per line; shortening them leaves a one-per-line list, which the
+    // width-one rule keeps rather than refilling onto one line.
+    const wide = "x".repeat(50);
+    const src = `const ws = ["${wide}a", "${wide}b", "${wide}c"]\nprint(ws.length)\n`;
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes(`const ws = [\n  "${wide}a",\n  "${wide}b",\n  "${wide}c",\n]\n`)) {
+      throw new Error(`wide list did not wrap one per line:\n${r.out}`);
+    }
+    const shrunk = r.out.replaceAll(wide, "");
+    const r2 = await run([], shrunk);
+    if (r2.code !== 0) throw new Error(`fmt failed: ${r2.err}`);
+    if (r2.out !== shrunk) throw new Error(`shrunk one-per-line list was refilled:\n${r2.out}`);
   },
 });
 
