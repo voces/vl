@@ -39,7 +39,6 @@ import {
   Unary,
   WhileStmt,
   blockTailIsDead,
-  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -242,6 +241,7 @@ import {
 import {
   HoleBox,
   IsArm,
+  IsDecided,
   TagIsArm,
   atomEqPlanOf,
   captureSlotOf,
@@ -249,9 +249,9 @@ import {
   identReadArmOf,
   isArmOf,
   isBoxGuardPlain,
+  isDecidedPlanOf,
   isNulTestImpossible,
   isRecvStageRep,
-  isTestsStorage,
   isVariantTagPlain,
   litIsArmOf,
   memberBoxReadAt,
@@ -307,6 +307,7 @@ import {
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
+  guardEndsBlockWith,
   ifJoinAdaptsScalar,
   isArmRank,
   letIfInitSinks,
@@ -669,11 +670,34 @@ function valueRep(r: i32, ty: i32): boolean {
 // A box's `is` test at the variant rung legacy answers by the tag alone (`isArmOf` from rank 0,
 // no staged receiver, `isVariantTagPlain`), over a plain read (`isBoxGuardPlain`).
 function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
-  if isTestsStorage(n.isObj, ibFnIx) { return storedBoxTest(b, n, ix, rep) }
+  // `emitIs`'s pre-rungs first: a test at its storage, or one decided before any rung.
+  const d = isDecidedPlanOf(ix, ibFnIx)
+  if d.idArm == "storage" { return storedBoxTest(b, n, ix, rep) }
+  if d.idArm != "test" { return isDecidedTest(b, n, d, ix, rep) }
   if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
     return irBMiss("is staged")
   }
   return isRung(b, n, ix, rep, isArmOf(ix, ibFnIx, 0, false))
+}
+
+// An `is` decided before any rung (`isDecidedPlanOf`), as `isDecidedOperand` writes it: the operand
+// evaluated and dropped when the plan says, then the constant.
+function isDecidedTest(
+  b: i32[],
+  n: IsExpr,
+  d: IsDecided,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  if d.idEval {
+    const o = irBExpr(b, n.isObj)
+    if ibMiss != "" { return o }
+    irBNode(b, { dpV: o }, -1, ibNoValue, ix)
+  }
+  const bits: i64 = if d.idBit != 0 { 1 } else { 0 }
+  const c: Opnd = { oiRep: rep, oiBits: bits }
+  return c
 }
 
 // `is` test `ix` from rung `arm` on, as `emitIsTestRungs` takes it: a rung that declines passes
@@ -818,19 +842,10 @@ function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 // that is no re-readable place (`unionEqOperandOk`) evaluated and dropped, then the constant.
 function isConstTest(b: i32[], n: IsExpr, v: i32, ix: i32, rep: i32): Opnd {
   if rep != ibBool { return irBMiss("is result rep") }
-  // In a lambda legacy can evaluate even a plain receiver before the constant; that writer is
-  // not modelled, so the function stays legacy's.
-  const host = if ibFnIx >= 0 { nodeAt(ibFnIx) } else { null }
-  if host is FuncDecl && fnNameIsLambda(host.fnName) {
-    return irBMiss("is static in a lambda")
-  }
   if !unionEqOperandOk(n.isObj) {
     const o = irBExpr(b, n.isObj)
     if ibMiss != "" { return o }
     irBNode(b, { dpV: o }, -1, ibNoValue, ix)
-  } else if !(nodeAt(unwrapParen(n.isObj)) is Ident) {
-    // Legacy has been seen to evaluate a re-readable element read here too; only a name is built.
-    return irBMiss("is static receiver place")
   }
   const bits: i64 = if v != 0 { 1 } else { 0 }
   const o: Opnd = { oiRep: rep, oiBits: bits }
@@ -1420,6 +1435,12 @@ function localVarAt(w: i32): i32 {
   return ib.irLocalAt[w] ?? -1
 }
 
+// Whether condition `condIx`, built onto `b` from length `at`, is the bare constant `is` legacy's
+// `staticIsGuard` reads back: an immediate with nothing written before it.
+function bareConstIs(c: Opnd, condIx: i32, b: i32[], at: i32): boolean {
+  return c is OImm && b.length == at && condIsTest(condIx)
+}
+
 // Whether condition `ix` is an `is` test or its negation, the shapes `staticIsGuard` reads back.
 function condIsTest(ix: i32): boolean {
   const c = nodeAt(unwrapParen(ix))
@@ -1466,10 +1487,11 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
     // A link built at a destination's type is `emitIfExprAs` at that type: its shape alone.
     const pw = if ty0 >= 0 { ifExprShapeWhy(cix, ibFnIx) } else { ifExprPlainWhy(cix, ibFnIx) }
     if pw != "" { return irBMiss("expression if " + pw) }
+    const cat = cb.length
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
     // A constant `is` condition is one legacy decides off its bytes and writes a dead arm for.
-    if c is OImm && condIsTest(n.ifCond) {
+    if bareConstIs(c, n.ifCond, cb, cat) {
       return irBMiss("decided is condition")
     }
     // Every link is written at the head's kind (`emitIfExprAs` asks `ifJoinPlanOf` of the head
@@ -1595,11 +1617,10 @@ function refIfLink(
     return irBMiss("ref if chain join")
   }
   if n.ifElse < 0 { return irBMiss("ref if else-less") }
+  const cat = b.length
   const c = irBExpr(b, n.ifCond)
   if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
-  if c is OImm && condIsTest(n.ifCond) {
-    return irBMiss("decided is condition")
-  }
+  if bareConstIs(c, n.ifCond, b, cat) { return irBMiss("decided is condition") }
   const t = irVarNew(ib, rep, ty, "local", -1)
   const thenB = refIfArm(n.ifThen, t, rep, kind, slot, nul)
   if ibMiss != "" { return irBMiss("ref if arm") }
@@ -1765,10 +1786,11 @@ function armHasPrelude(blockIx: i32): boolean {
 
 // `a && b` / `a || b`: a local the two arms of an `if` write.
 function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const lat = b.length
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
   // Legacy reads a constant `is` back off its bytes and writes the right side as a dead arm.
-  if l is OImm && condIsTest(n.binLeft) {
+  if bareConstIs(l, n.binLeft, b, lat) {
     return irBMiss("decided is short-circuit")
   }
   const ty = exprTyOf(ix)
@@ -4525,11 +4547,12 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     }
     const uw = operandWhy(n.unArg)
     if uw != "" { return irBMiss(uw) }
+    const aat = b.length
     const a = irBExpr(b, n.unArg)
     if ibMiss != "" { return a }
     if irBOpRep(a) != rep { return irBMiss("operand coercion") }
     // A constant `is` under `!` is the one constant legacy reads back and negates (D2957).
-    if a is OImm && n.unOp == "!" && condIsTest(n.unArg) {
+    if a is OImm && n.unOp == "!" && bareConstIs(a, n.unArg, b, aat) {
       const nb: i64 = if a.oiBits != 0 { 0 } else { 1 }
       const o: Opnd = { oiRep: rep, oiBits: nb }
       return o
@@ -5071,6 +5094,7 @@ function ifChain(b: i32[], ix: i32) {
   const outs: i32[][] = []
   const conds: Opnd[] = []
   const thens: i32[][] = []
+  const kws: boolean[] = []
   let cur = ix
   let out = b
   let lastElse = -1
@@ -5082,18 +5106,21 @@ function ifChain(b: i32[], ix: i32) {
     // tag the box lacks is never a covering test, so the arm is not one legacy writes dead.
     const decided = isDecidedFalse(n.ifCond, ibFnIx)
     const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+    const cat = out.length
     const c = if decided { no } else { irBExpr(out, n.ifCond) }
     if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-    // Another constant `is` is one legacy decides off its bytes, writing its dead arm its way.
-    if !decided && c is OImm && condIsTest(n.ifCond) {
-      return skip("decided is condition")
+    // Another constant `is` legacy decides off its bytes (`staticIsGuard`): a `false` writes no
+    // then arm, a `true` no else. One that ends its block cuts the rest, which is legacy's.
+    const k = if !decided && c is OImm && bareConstIs(c, n.ifCond, out, cat) { if c.oiBits != 0 { 1 } else { 0 } } else { -1 }
+    if k == 1 && guardEndsBlockWith(cur, k, ibFnIx) {
+      return skip("decided is guard ends block")
     }
     const th = nodeAt(n.ifThen)
     const thenB: i32[] = []
     if ifThenIsDead(n) {
       // A covering test's dead `then` is uncollected; legacy writes `unreachable` (D16006).
       irBNode(thenB, { tpWhy: 0 }, -1, ibNoValue, n.ifThen)
-    } else if !decided {
+    } else if !decided && k != 0 {
       for x in if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) } {
         thenB.push(x)
       }
@@ -5102,8 +5129,11 @@ function ifChain(b: i32[], ix: i32) {
     outs.push(out)
     conds.push(c)
     thens.push(thenB)
-    // A dead `else` (`ifWritesElse`) is uncollected: legacy writes none of it (D16006).
-    lastElse = if ifWritesElse(n) { n.ifElse } else { -1 }
+    // A dead `else` (`ifWritesElse`) is uncollected: legacy writes none of it (D16006), nor of
+    // the `else` a decided-true guard leaves dead.
+    const kw = ifWritesElse(n) && k != 1
+    kws.push(kw)
+    lastElse = if kw { n.ifElse } else { -1 }
     if lastElse < 0 || !(nodeAt(lastElse) is IfStmt) { break }
     const nb: i32[] = []
     out = nb
@@ -5115,8 +5145,7 @@ function ifChain(b: i32[], ix: i32) {
   let elseB = if deadElse { [] } else { bodyOf(elseStmts(lastElse)) }
   let k = links.length - 1
   while k >= 0 {
-    const ln = nodeAt(links[k])
-    const kw = if ln is IfStmt { ifWritesElse(ln) } else { false }
+    const kw = kws[k]
     irBNode(
       outs[k],
       {
@@ -5474,9 +5503,10 @@ function tailIf(b: i32[], ix: i32) {
   // legacy decides off its bytes, so it is a miss.
   const decided = isDecidedFalse(n.ifCond, ibFnIx)
   const no: Opnd = { oiRep: ibBool, oiBits: 0 }
+  const cat = b.length
   const c = if decided { no } else { irBExpr(b, n.ifCond) }
   if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
-  if !decided && c is OImm && condIsTest(n.ifCond) {
+  if !decided && bareConstIs(c, n.ifCond, b, cat) {
     return skip("decided is condition")
   }
   const thenB = if decided { [] } else { tailArm(n.ifThen) }
