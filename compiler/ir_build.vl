@@ -349,6 +349,7 @@ import {
 import {
   EmptyFitPlan,
   arrLitIsForIter,
+  coalFieldPlanOf,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
@@ -5099,6 +5100,9 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
     "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => true
     "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
+  if !built && arm == "next" && nodeAt(lhsIx) is Member {
+    return coalField(b, n, lhsIx, ix, rep)
+  }
   if !built { return irBMiss("coalesce box " + arm) }
   if (arm == "callBox" || arm == "callScalar") && !(nodeAt(lhsIx) is Call) {
     return irBMiss("coalesce box stash operand")
@@ -5126,6 +5130,50 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   irBNode(
     b,
     { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `o.v ?? d` over a value-union record field past the boxed arms, along `coalFieldPlanOf` as
+// `emitCoalesceUnionField` writes it: the record, a variable it re-reads, then the shared null
+// test's `if`, the default built into its null arm. A receiver it unwraps is a named miss.
+function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  const p = coalFieldPlanOf(n, lhsIx, ix, ibFnIx)
+  if p.cfArm != "boxed" && p.cfArm != "unbox" {
+    return irBMiss("coalesce field " + p.cfArm)
+  }
+  if p.cfCast != -1 { return irBMiss("coalesce field cast") }
+  const boxed = p.cfArm == "boxed"
+  const repOk = if boxed { repNodeAt(rep) is RBox } else { repPrim(rep) != null }
+  if !repOk { return irBMiss("coalesce field result rep") }
+  const m = nodeAt(lhsIx)
+  if !(m is Member) { return irBMiss("coalesce field node") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
+  const r = irBExpr(b, m.memObj)
+  if ibMiss != "" { return r }
+  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+    return irBMiss("coalesce field place")
+  }
+  if !(repNodeAt(irBOpRep(r)) is RRecord) {
+    return irBMiss("coalesce field receiver rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce field default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = if boxed { "fieldBox" } else { "fieldVal" }
+  irBNode(
+    b,
+    { cbL: r, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
     ty,
     rep,
     ix,
