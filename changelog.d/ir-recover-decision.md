@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR: a recovered nullable read carries its `ref.as_non_null` count, decided where it is built.** The lowering asked `localNulStrRecovers` and `readOwesNonNullRecover` itself, outside the assignment re-read context legacy's emitter sets (`asgReReadEnter`), so a `string | null` re-read of an assignment, as in `(s = "w").length`, could not be claimed: holding it at its non-null type wrote no `ref.as_non_null` where legacy writes one. `RRecover` now carries the count the builder decides in context (`rcNn`), and the re-read is held at its non-null type for every kind, not only an atom (the claim fallback in `soundness/short-circuit-write-may-not-run.vl` closed).
