@@ -8,7 +8,17 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { RAtom, RNullable, RRaw, RpPrim, repNodeAt } from "./emit_rep"
+import {
+  RAtom,
+  RClosure,
+  RList,
+  RMap,
+  RNullable,
+  RRaw,
+  RRecord,
+  RpPrim,
+  repNodeAt,
+} from "./emit_rep"
 import {
   ArrayLit,
   AsExpr,
@@ -78,7 +88,7 @@ import {
   structIndexOfExpr,
 } from "./emit_classify"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
-import { forInStringSrc } from "./emit_value_sites"
+import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -126,6 +136,7 @@ import {
   RMapNew,
   RMapOp,
   RMapSet,
+  RMemAccess,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -344,6 +355,9 @@ import {
   mapRecvShapeOf,
   mapSetTail,
   mapSizeTail,
+  memAccessPlanOf,
+  memAccessTail,
+  memAddrPlanOf,
   narrowedMemTail,
   narrowedVariantTail,
   nulTestAtomTail,
@@ -848,6 +862,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapOp => mapOp(r)
     RListNew => listNew(r)
     RListCopy => irLMiss("list copy value")
+    RMemAccess => memAccess(r)
     RCallHost => hostCall(r)
     RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
@@ -1399,6 +1414,24 @@ function listNew(r: RListNew) {
   return arrNewTail(pl, slot)
 }
 
+// `RMemAccess`: legacy's load or store arm in `emitCallCoreMemAccess`'s order: the address the
+// builder took along `memAddrPlanOf`'s arm, a store's value, then the access at the plan's offset.
+function memAccess(r: RMemAccess) {
+  const c = nodeAt(r.mmAt)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length {
+    return irLMiss("memory access node")
+  }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return irLMiss("memory access node") }
+  const p = memAccessPlanOf(f.identName)
+  const ap = memAddrPlanOf(c, p.mxBase, lw.irAt)
+  if p.mxOp < 0 || (ap.maArm != "const" && ap.maArm != "rest") {
+    return irLMiss("memory access plan")
+  }
+  for o in r.mmArgs { irLOpnd(o) }
+  return memAccessTail(p, ap.maOff)
+}
+
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
 function hostCall(r: RCallHost) {
   for a in r.chArgs { irLOpnd(a) }
@@ -1514,7 +1547,7 @@ function forIn(n: SForIn, pending: i32[]) {
     vSlot,
     ek,
     forInStringSrc(s.fiIter, fnIx),
-    false,
+    forInU8Src(s.fiIter, fnIx),
   )
   if lp == null { return irLMiss("walk backing") }
   if n.xfMap >= 0 {
@@ -2284,6 +2317,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      // A store leaves nothing; a discarded load leaves its value, which legacy drops.
+      if r is RMemAccess {
+        memAccess(r)
+        irLSettle(pending)
+        if r.mmArgs.length == 1 { fbDrop() }
+        return 0
+      }
       if r is REnvDrop {
         emitEnvCacheDrop(r.edFn)
         irLSettle(pending)
@@ -2560,8 +2600,12 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
-  // A string out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
-  const strOut = repPrim(lw.irVars[t].vRep) == "str"
+  // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
+  const strOut = (repPrim(lw.irVars[t].vRep) == "str"
+    || rr is RRecord
+    || rr is RList
+    || rr is RMap
+    || rr is RClosure)
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
   const rj = if vt < 0 && !refOut && !strOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
@@ -2797,10 +2841,12 @@ function spanOpen(id: i32) {
 }
 
 // Closes, innermost first, every open span whose last node is `id`, banking a row for each that
-// wrote bytes.
+// wrote bytes. The scan stops once each span `id` ends (`irSpanEnds`) is closed.
 function spanClose(id: i32) {
+  let need = lw.irSpanEnds[id] ?? 0
+  if need == 0 { return 0 }
   let i = lwSpanOpen.length - 1
-  while i >= 0 {
+  while i >= 0 && need > 0 {
     const k = lwSpanOpen[i]
     if k >= 0 && lw.irSpanLast[k] == id {
       const from = lwSpanAt[i]
@@ -2812,13 +2858,14 @@ function spanClose(id: i32) {
         lwRowKind.push(lw.irSpanKind[k])
       }
       lwSpanOpen[i] = -1
+      need = need - 1
     }
     i = i - 1
   }
-  // Drop the closed rows, keeping the open ones in order.
+  // Drop the closed rows past `i`, keeping the open ones in order.
   const o2: i32[] = []
   const a2: i32[] = []
-  let j = 0
+  let j = i + 1
   while j < lwSpanOpen.length {
     if lwSpanOpen[j] >= 0 {
       o2.push(lwSpanOpen[j])
@@ -2826,8 +2873,12 @@ function spanClose(id: i32) {
     }
     j = j + 1
   }
-  lwSpanOpen = o2
-  lwSpanAt = a2
+  while lwSpanOpen.length > i + 1 {
+    lwSpanOpen.pop()
+    lwSpanAt.pop()
+  }
+  for x in o2 { lwSpanOpen.push(x) }
+  for x in a2 { lwSpanAt.push(x) }
   return 0
 }
 
