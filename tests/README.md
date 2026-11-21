@@ -27,6 +27,7 @@ of each row, backticked, `*` = any run of characters).
 | `roadmap_*_test.ts` | `ROADMAP.md` and `docs/roadmap/` stay an index of open work: no closed `D<id>`, no done marker, no effort estimate, no broken link. Reads files only | `deno task test` | `ci`, and its docs-only step |
 | `cli_*_test.ts`, `budget_*_test.ts`, `keyword_*_test.ts`, `module_*_test.ts`, `std_*_test.ts`, `tests_*_test.ts` | Single-file cross-checks of one table or one vocabulary against its twin (CLI vs host, budget targets, keywords, module gate, embedded std, this index) | `deno task test` | `ci` |
 | `oracle_*_test.ts` | The independent oracle (`scripts/oracle/`): every `docs/spec/` example that says what it prints, run in the definitional interpreter and compared, plus its verdict table. Reads files only | `deno task test` | `ci`, and its docs-only step |
+| `queue_*_test.ts` | The merge queue's own scripts (`scripts/queue-candidate.sh`) on throwaway repositories: what they resolve and what they refuse | `deno task test` | `ci` |
 | `ir_*_test.ts` | The IR kind lists (`Rhs`/`IrNode` unions, long IR match arms, the `lint.vl` sets mirrored from `ir.vl`) stay one member per line, so PRs adding nodes merge. Reads files only | `deno task test` | `ci` |
 
 `deno task test` (`deno.json`) runs every file in `tests/` that the other rows do not claim.

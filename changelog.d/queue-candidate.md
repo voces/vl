@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **`scripts/queue-candidate.sh <base> <pr-branch>...` builds a merge-queue candidate.** It merges the branches onto the base in order and resolves a conflict only when it is purely additive: the base side of the hunk is empty and both sides add only list members (string or name elements, `| X` union members, `X |` or-patterns, one-line `{ … },` rows). The union keeps sorted order where the surrounding list is sorted. Anything else is refused, naming the file and hunk, with nothing left behind; two arms that end in the same closing lines are refused, not joined. It prints the candidate sha and each hunk it resolved. `tests/queue_candidate_test.ts` pins both halves on throwaway repositories.
