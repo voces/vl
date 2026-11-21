@@ -33,6 +33,11 @@ and a later node reads it.
 the claim set do not move outside the class. The step is graded on the self-compile census, the
 armed shadow over the corpus and `tests/cases`, `--claimless`, and A/B.
 
+**Ruling and retirement.** The coordinator approved `RStashSet` as a migration node on the
+`RListStage`, `RTagStash` and `RStage` precedent; the verifier's pairing with its `RMakeRec` is
+what makes it safe. It retires at I8 with the other stage nodes, when bytes may move and the
+order stash becomes the lowering's own choice.
+
 **D17037 is a different mechanism.** In D17037's witness the IR builds the record with no stash
 (`record(v4, v5)`). The byte difference is exactly two locals-vector entries. Legacy reserves two
 order-stash scratch locals for that literal, an i32 and an i64, and still writes it plainly. The
