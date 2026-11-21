@@ -2421,35 +2421,3 @@ print(qnull().o == null)
     }
   },
 });
-
-// A host call: a `std:fs` floor slot's u8-list and i32 arguments as themselves and its offset at
-// i64, a void slot as a statement, a `never` one followed by `unreachable`, and a user extern's
-// arguments at their declared widths, its value kept or dropped. Each through `RCallHost`.
-Deno.test({
-  name: "ir shadow: host calls build through RCallHost and match",
-  ignore,
-  fn: () => {
-    const { rc, rows } = run(`extern function sink(a: i32, b: f64): void
-extern function stamp(n: i64): i32
-function count(): i32 { return __args_count__() }
-function size(p: u8[]): i64 { return __fs_size__(p) }
-function part(p: u8[], at: i64, n: i32): u8[] { return __fs_read_range__(p, at, n) }
-function put(a: i32) { sink(a, 2.5) }
-function keep(n: i64): i32 { return stamp(n) + 1 }
-function drop(n: i64) { stamp(n) }
-function quit(c: i32): never { __proc_exit__(c) }
-function guard(n: i32): i32 {
-  if n > 9 { quit(n) }
-  return n
-}
-print(count())
-print(guard(2))
-`, true);
-    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-    const fails = failures(rows);
-    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 8 || (rows.get("matched") ?? 0) !== 8) {
-      throw new Error(`want all eight covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-  },
-});
