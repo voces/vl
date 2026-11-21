@@ -8,7 +8,7 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleReadFe } from "./emit_mono"
-import { bundleParamOfRead } from "./emit_bundle"
+import { bundleParamOfRead, bundleSigsOfParam } from "./emit_bundle"
 import { irTyF64, irTyI64 } from "./ir_helper"
 import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
@@ -2032,6 +2032,11 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
+  // A bundle parameter holds a record of closures each instance types (D14841): read only at a
+  // member pick (`bundleCallRhs`).
+  if bundleParamOfRead(ix, ibFnIx) >= 0 {
+    return irBMiss("bundle parameter read")
+  }
   if captureSlotOf(n.identName, ibFnIx) >= 0 {
     return captureRead(b, n, ix, rep)
   }
@@ -2431,6 +2436,10 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     while i < c.callArgs.length {
       const at = b.length
       starts.push(at)
+      // A bundle parameter takes a record of closures, which the IR does not build.
+      if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
+        return missRhs("bundle argument")
+      }
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr, -1)
@@ -2566,6 +2575,9 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   const args: Opnd[] = []
   let i = 0
   while i < c.callArgs.length {
+    if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
+      return missRhs("bundle argument")
+    }
     if capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx) != "plain" {
       return missRhs("captured call argument coercion")
     }
@@ -2628,8 +2640,12 @@ function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("closure call plan disagrees")
   }
   const pk = bundlePickOf(ix, ibFnIx)
-  const v = irBExpr(b, c.callFn)
-  if ibMiss != "" { return missRhs("bundle callee") }
+  // The parameter's local, read only here: a bundle reached through a capture stays legacy's.
+  const cf = nodeAt(c.callFn)
+  const p = if cf is Ident { paramIndexOf(ibFnIx, cf.identName) } else { -1 }
+  const pv = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+  if pv < 0 { return missRhs("bundle callee") }
+  const v: Opnd = { ov: pv }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("bundle member rep") }
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
