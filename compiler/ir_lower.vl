@@ -279,6 +279,7 @@ import {
   emitNullOwn,
   emitNullRetTail,
   emitStrLitAt,
+  emitUnionNullToPair,
   emitUnionUnboxTail,
   envCacheSlotOfFe,
   f64RemCallTail,
@@ -393,6 +394,8 @@ import {
   tagStashTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
+  unionBoxToPairTail,
+  unionLetSinkClose,
   unionUnionEqTail,
   userGlobalIdx,
   userGlobalReadClass,
@@ -937,8 +940,19 @@ function rawEff(n: SRawOp, pending: i32[], at: i32) {
     "call" => fbCall(n.srImm)
     "reserve.open" => reserveOpen(n, at)
     "reserve.close" => listBuildClose(n.srImm)
+    "sink.put" | "sink.null" | "sink.close" => sinkPairOp(n)
   }
   return 0
+}
+
+// A union binding sink's pair write (`emitUnionIfBindingSink`): an arm's box into the pair, the
+// missing `else`'s null into it, or the binding's one box built from it into variable `srImm`.
+function sinkPairOp(n: SRawOp) {
+  if n.srOp == "sink.null" { return emitUnionNullToPair() }
+  const idx = varSlot(n.srImm)
+  if idx < 0 { return irLMiss("unmapped slot") }
+  if n.srOp == "sink.put" { return unionBoxToPairTail(idx) }
+  return unionLetSinkClose(idx)
 }
 
 // `reserve.open` after `let` `at` (statement `srHeap` of its block) stored variable `srImm`:
@@ -2744,10 +2758,12 @@ function spanOpen(id: i32) {
 }
 
 // Closes, innermost first, every open span whose last node is `id`, banking a row for each that
-// wrote bytes.
+// wrote bytes. The scan stops once each span `id` ends (`irSpanEnds`) is closed.
 function spanClose(id: i32) {
+  let need = lw.irSpanEnds[id] ?? 0
+  if need == 0 { return 0 }
   let i = lwSpanOpen.length - 1
-  while i >= 0 {
+  while i >= 0 && need > 0 {
     const k = lwSpanOpen[i]
     if k >= 0 && lw.irSpanLast[k] == id {
       const from = lwSpanAt[i]
@@ -2759,13 +2775,14 @@ function spanClose(id: i32) {
         lwRowKind.push(lw.irSpanKind[k])
       }
       lwSpanOpen[i] = -1
+      need = need - 1
     }
     i = i - 1
   }
-  // Drop the closed rows, keeping the open ones in order.
+  // Drop the closed rows past `i`, keeping the open ones in order.
   const o2: i32[] = []
   const a2: i32[] = []
-  let j = 0
+  let j = i + 1
   while j < lwSpanOpen.length {
     if lwSpanOpen[j] >= 0 {
       o2.push(lwSpanOpen[j])
@@ -2773,8 +2790,12 @@ function spanClose(id: i32) {
     }
     j = j + 1
   }
-  lwSpanOpen = o2
-  lwSpanAt = a2
+  while lwSpanOpen.length > i + 1 {
+    lwSpanOpen.pop()
+    lwSpanAt.pop()
+  }
+  for x in o2 { lwSpanOpen.push(x) }
+  for x in a2 { lwSpanAt.push(x) }
   return 0
 }
 
