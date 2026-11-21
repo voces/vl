@@ -375,7 +375,6 @@ import {
   cpsToUtf8,
   decodeStr,
   directArgsBad,
-  exprEffectFree,
   inferNicheNullByName,
   isRecvStagedIx,
   isRecvStagedNonNull,
@@ -1777,8 +1776,7 @@ import {
   isArmPatTy,
   isArmTagOfTyAt,
   isBoxGuardPlain,
-  isPinOwn,
-  isPreArmOf,
+  isDecidedPlanOf,
   isRecvStageRep,
   isTestValuePrimName,
   isTestsStorage,
@@ -5998,9 +5996,8 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
 function emitIs(isIx: i32, fnIx: i32) {
   const nd0 = nodeAt(isIx)
   if !(nd0 is IsExpr) { return emitIsTest(isIx, fnIx) }
-  const tested = isVarTyIxOf(isIx)
-  const covOp = nodeTyAt(nd0.isObj, fnIx)
-  return match isPreArmOf(isIx, fnIx) {
+  const d = isDecidedPlanOf(isIx, fnIx)
+  return match d.idArm {
     // A narrowed operand is tested at its storage, never trusted: a write the narrowing does
     // not see (an alias, an escaped closure) is answered (D2447).
     "storage" => {
@@ -6009,30 +6006,8 @@ function emitIs(isIx: i32, fnIx: i32) {
       storageReadLeave(sMark)
       r
     }
-    "tautology" => {
-      fbI32Const(1)
-      0
-    }
-    "covers" | "fits" => isDecidedOperand(nd0.isObj, true, 1, fnIx)
-    // An effect-free operand answers a bare constant `staticIsGuard` reads, so the arm it
-    // guards is not lowered (D15606); any other is evaluated for its effects first (D15607).
-    "prim" => {
-      const same = tyPrimNameOf(covOp) == tyPrimNameOf(tested)
-      isDecidedOperand(
-        nd0.isObj,
-        same || !exprEffectFree(nd0.isObj),
-        if same { 1 } else { 0 },
-        fnIx,
-      )
-    }
-    "pin" => {
-      const own = isPinOwn(covOp, tested)
-      isDecidedOperand(
-        nd0.isObj,
-        !exprEffectFree(nd0.isObj),
-        if own { 1 } else { 0 },
-        fnIx,
-      )
+    "tautology" | "covers" | "fits" | "prim" | "pin" => {
+      isDecidedOperand(nd0.isObj, d.idEval, d.idBit, fnIx)
     }
     "test" => emitIsTest(isIx, fnIx)
   }
@@ -33738,12 +33713,21 @@ function emitDeadValueArm(blockIx: i32): i32 {
 // and generally unable to lower. The caller pads with `unreachable` to stay stack-polymorphic.
 function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
   const s = nodeAt(stmtIx)
-  if s is IfStmt {
-    if negGuardDecidedTrue(s.ifCond, fnIx) { return stmtAlwaysExits(s.ifThen) }
-    if monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
-    return stmtAlwaysExits(s.ifThen)
-  }
-  return false
+  if !(s is IfStmt) { return false }
+  const k = if negGuardDecidedTrue(s.ifCond, fnIx) { 1 } else { -1 }
+  return guardEndsBlockWith(stmtIx, k, fnIx)
+}
+
+// Whether statement `if` `ifIx`, its condition written as constant `k` (-1 for none), ends its
+// block: a `!is` decided true, or a record guard the instance decides true, over an always-exiting
+// then arm. The rest of the block is then cut behind an `unreachable` (D932).
+export function guardEndsBlockWith(ifIx: i32, k: i32, fnIx: i32): boolean {
+  const s = nodeAt(ifIx)
+  if !(s is IfStmt) { return false }
+  const c = nodeAt(unwrapParen(s.ifCond))
+  const negTrue = k == 1 && c is Unary && c.unOp == "!"
+  if !negTrue && monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
+  return stmtAlwaysExits(s.ifThen)
 }
 
 // The function, condition node and emitted constant (`staticIsGuard`) of the most recently
