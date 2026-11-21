@@ -273,6 +273,7 @@ import {
   isRecvStageRep,
   isTestsStorage,
   isVariantTagPlain,
+  litIsArmOf,
   memberBoxReadAt,
   monoStaticIsResult,
   narrowedBoxVariantPlain,
@@ -322,10 +323,16 @@ import {
   narrowedArmNeedsUnbox,
 } from "./emit_plan_coerce"
 import {
+  EmptyFitPlan,
   arrLitIsForIter,
+  emptyFitArmsPlain,
+  emptyFitArmsPlanOf,
+  emptyFitPlanOf,
   ifJoinAdaptsScalar,
+  isArmRank,
   letIfInitSinks,
   retRefusedWhy,
+  spreadRunLit,
 } from "./wasmEmit"
 import {
   arrLitArmOf,
@@ -353,6 +360,7 @@ import {
   ctxTyAt,
   fnEnvIdxOf,
   nodeTyAt,
+  numLitTyWidth,
   numLitWidth,
   parentBindingFrameArenaOf,
   parentBindingOf,
@@ -364,6 +372,7 @@ import { fbValtype, wTarget } from "./emit_bytes"
 import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
   elabArmSigAt,
+  elabSpreadNote,
   isStorageRead,
   readNarrowedStoreAt,
   storageReadEnter,
@@ -697,16 +706,37 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
     return irBMiss("is staged")
   }
-  const arm = isArmOf(ix, ibFnIx, 0, false)
+  return isRung(b, n, ix, rep, isArmOf(ix, ibFnIx, 0, false))
+}
+
+// `is` test `ix` from rung `arm` on, as `emitIsTestRungs` takes it: a rung that declines passes
+// to the next (`isArmOf` from the rank after it).
+function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if arm == "nulTest" { return isNulTest(b, n, ix, rep) }
   if arm == "never" || arm == "pinNever" {
     return isConstTest(b, n, 0, ix, rep)
   }
+  if arm == "litArms" { return isLitArms(b, n, ix, rep) }
+  if arm == "emptyFit" {
+    const p = emptyFitPlanOf(ix, ibFnIx)
+    if emptyFitDeclines(p, ix) {
+      return isRung(
+        b,
+        n,
+        ix,
+        rep,
+        isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false),
+      )
+    }
+    return isEmptyFit(b, n, ix, rep, p)
+  }
   if arm == "static" {
     // A static `false` first tries legacy's empty-list fit, which may still write a test.
     const st = monoStaticIsResult(ix, ibFnIx)
-    if st != 1 { return irBMiss("is static empty fit") }
-    return isConstTest(b, n, 1, ix, rep)
+    if st == 1 { return isConstTest(b, n, 1, ix, rep) }
+    const p = emptyFitPlanOf(ix, ibFnIx)
+    if emptyFitDeclines(p, ix) { return isConstTest(b, n, 0, ix, rep) }
+    return isEmptyFit(b, n, ix, rep, p)
   }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
@@ -719,6 +749,84 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is operand rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// `xs is K[]` whose elements never meet `K`'s at some depth, along plan `p`'s walk: the list,
+// then its emptiness at every depth. A union receiver's arms and a shadowed region are misses.
+function isEmptyFit(
+  b: i32[],
+  n: IsExpr,
+  ix: i32,
+  rep: i32,
+  p: EmptyFitPlan,
+): Opnd {
+  if p.efArm == "union" { return isEmptyFitArms(b, n, ix, rep, p) }
+  if p.efArm != "loop" { return irBMiss("is empty fit " + p.efArm) }
+  if p.efRepWhy != "" { return irBMiss("is empty fit rep") }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return irBMiss("is empty fit operand rep")
+  }
+  return irBLetTemp(b, { leV: v, leAt: ix }, ix, rep)
+}
+
+// `recv is <literal type>` at the `litArms` rung, along `litIsArmOf`'s arm as `emitIsTestLitArms`
+// writes it: a scalar map read's hit or miss, a ref niche's null test, or a constant. A constant
+// is built only over a re-readable receiver, since legacy writes no receiver read before it.
+function isLitArms(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  const la = litIsArmOf(ix, n, ibFnIx)
+  return match la {
+    "mapNull" | "mapHas" => mapReadHas(b, n.isObj, la == "mapHas", ix, rep)
+    "nicheTest" => isNulTest(b, n, ix, rep)
+    "nicheNever" | "atomTrue" | "memberTrue" => {
+      if rep != ibBool { return irBMiss("is result rep") }
+      if !unionEqOperandOk(n.isObj) {
+        return irBMiss("is literal constant receiver")
+      }
+      const bits: i64 = if la == "nicheNever" { 0 } else { 1 }
+      const o: Opnd = { oiRep: rep, oiBits: bits }
+      o
+    }
+    "nicheRaw" | "atomNotNul" | "atomEq" | "boxLits" | "numBox" | "memberNoRecv" | "memberEq" | "none" => {
+      irBMiss("is rung litArms " + la)
+    }
+  }
+}
+
+// Whether `emitListEmptyFitIs` answers 0 along plan `p`, passing to the next rung.
+function emptyFitDeclines(p: EmptyFitPlan, ix: i32): boolean {
+  if p.efArm == "decline" { return true }
+  if p.efArm != "union" { return false }
+  return emptyFitArmsPlanOf(ix, ibFnIx, p.efRecvTy).eaWhy == "decline"
+}
+
+// `u is K[]` over a box variable with list arms `K[]` never meets: each arm's tag and emptiness
+// (`emptyFitArmsPlanOf`), re-reading the variable. A nullable receiver, a region that reads an
+// arm's list, and any other receiver are misses.
+function isEmptyFitArms(
+  b: i32[],
+  n: IsExpr,
+  ix: i32,
+  rep: i32,
+  p: EmptyFitPlan,
+): Opnd {
+  const ap = emptyFitArmsPlanOf(ix, ibFnIx, p.efRecvTy)
+  if !ap.eaBoxed { return irBMiss("is empty fit nullable") }
+  if !emptyFitArmsPlain(ap) { return irBMiss("is empty fit union") }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || ib.irVars[v.ov].vKind == "temp"
+    || !(repNodeAt(irBOpRep(v)) is RBox)
+  ) {
+    return irBMiss("is empty fit receiver")
+  }
+  return irBLetTemp(b, { lfV: v, lfAt: ix }, ix, rep)
 }
 
 // `recv is X` over a nullable niche at `isArmOf`'s null-test rung: the niche's own null test
@@ -1278,6 +1386,11 @@ function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty0: i32): Opnd {
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
+  // A closure read at an open type's rep (a field of a record built while a binding held a
+  // generic) is not its closed type's closure rep, which rule 3 refuses.
+  if repNodeAt(rep) is RClosure && repNodeOfTy(ty) != rep {
+    return irBMiss("closure temp at an open type's rep")
+  }
   const v = irVarNew(irBFn(), rep, ty, "temp", -1)
   irBNode(b, { lDst: v, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: v }
@@ -1858,7 +1971,30 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// Number literal `n` at `ix` as an immediate at rep `rep`, where its own width is that rep's.
 function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
+  const k: string = repPrim(rep) ?? ""
+  // Past the narrow reading, legacy spells the literal at its own width (`emitNumLexAt`).
+  if (
+    (k == "i32" || k == "i64")
+    && !numLexIsFloat(n.numText)
+    && !numLitNarrow(n, k)
+    && numLitWidth(ix, ibFnIx) != k
+  ) {
+    return irBMiss("wide literal width")
+  }
+  return numLitAt(n, ix, rep)
+}
+
+// Whether integer literal `n` reads as its narrow value at width `k`.
+function numLitNarrow(n: NumLit, k: string): boolean {
+  const v = memOffsetLexValue(n.numText)
+  return v >= 0 && (k != "i32" || v <= 2147483647)
+}
+
+// Number literal `n` at `ix` as an immediate at rep `rep`, its lexeme spelled at that rep's width
+// whatever the literal's own (`emitNumLexAt`).
+function numLitAt(n: NumLit, ix: i32, rep: i32): Opnd {
   const k: string = repPrim(rep) ?? ""
   if k == "f64" || k == "f32" {
     const text = numLitLexAt(ix, n.numText, k)
@@ -1873,14 +2009,12 @@ function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
     return f
   }
   if numLexIsFloat(n.numText) { return irBMiss("float literal at an integer") }
-  const v = memOffsetLexValue(n.numText)
-  if v >= 0 && (k != "i32" || v <= 2147483647) {
-    const o: Opnd = { oiRep: rep, oiBits: v }
+  if numLitNarrow(n, k) {
+    const o: Opnd = { oiRep: rep, oiBits: memOffsetLexValue(n.numText) }
     return o
   }
-  // Past the narrow reading, the bits legacy's literal writer spells at its own width: the lexeme
-  // split into halves at `i64`, wrapped at `i32` (`emitNumLexAt`).
-  if numLitWidth(ix, ibFnIx) != k { return irBMiss("wide literal width") }
+  // The bits legacy's literal writer spells: the lexeme split into halves at `i64`, wrapped at
+  // `i32` (`emitNumLexAt`).
   let bits: i64 = 0
   if k == "i64" {
     const pr = parseI64Pair(n.numText)
@@ -2104,6 +2238,8 @@ function narrowedLocalRead(
     ) {
       return irBLetTempTy(b, { rcV: o, rcAt: ix }, ix, rep, inner)
     }
+    // Any other recover to a rep the read's type is not would mint a temp of the nullable type.
+    if repNodeOfTy(ty) != rep { return irBMiss("nullable read recover") }
     return irBLetTemp(b, { rcV: o, rcAt: ix }, ix, rep)
   }
   // A union-box local read at one atom the checker narrowed it to, on legacy's `unbox` arm.
@@ -3589,6 +3725,17 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
   const why = boxPlanWhy(p, v)
   if why != "" { return irBMiss(why) }
+  // A box that writes its tag ahead of its value writes it ahead of an assignment's store, which
+  // the builder writes as a statement first.
+  const asg = nodeAt(unwrapParen(ix))
+  if (
+    p.hbArm != "pass"
+    && p.hbArm != "memberBox"
+    && asg is BinExpr
+    && asg.binOp == "="
+  ) {
+    return irBMiss("box of an assignment")
+  }
   // The box writer may leave an immediate unread, so one built for a node with an effect (a
   // stored literal's value) is legacy's to box.
   if (v is OImm || v is OStr) && !exprEffectFree(ix) {
@@ -3632,6 +3779,8 @@ function boxPlanWhy(p: HoleBox, v: Opnd): string {
     "atomStr" => atomNullable(r)
     "rec" | "obj" => repNodeAt(r) is RRecord
     "refList" => repNodeAt(r) is RList
+    "map" => repNodeAt(r) is RMap
+    "clo" => repNodeAt(r) is RClosure
     "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else { holeKindRep(p.hbKind, r) }
     "ladder" => false
   }
@@ -3881,13 +4030,25 @@ function nulTestOperandOk(arm: NulTestArm, vr: i32): boolean {
 // `m[k] == null` over a scalar map read, as legacy writes it: the map's has probe, then
 // `i32.eqz` for `==`.
 function nulTestMapHas(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
-  const r = nodeAt(unwrapParen(bt.bnRef))
+  return mapReadHas(b, bt.bnRef, bt.bnInvert, ix, rep)
+}
+
+// Whether scalar map read `readIx` hit, as `emitMapHas` writes it, or with `present` false that
+// it missed (`i32.eqz`): a map read's null test and its `is` literal arms.
+function mapReadHas(
+  b: i32[],
+  readIx: i32,
+  present: boolean,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const r = nodeAt(unwrapParen(readIx))
   if !(r is Index) { return irBMiss("null test map operand") }
   if rep != ibBool { return irBMiss("null test result rep") }
   const h = mapHasRhs(b, r.idxArr, r.idxIndex, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   const v = irBLetTemp(b, h, ix, rep)
-  if bt.bnInvert || ibMiss != "" { return v }
+  if present || ibMiss != "" { return v }
   return irBLetTemp(b, { poOp: "not", poArgs: [v] }, ix, rep)
 }
 
@@ -4089,9 +4250,9 @@ function variantElem(b: i32[], e: i32, er: i32, vslot: i32): Opnd {
   return objLitAt(b, unwrapParen(e), er, rlElemTyIxAt(vslot), vi, true)
 }
 
-// A spread literal of one item group, a spread source, along legacy's plain arm (`spreadPlanOf`):
-// the source built raw, as legacy emits it, at the literal's own list rep and row, into slots its
-// recorded ordinal keys. A boxing, converting or many-group literal is a named miss.
+// A spread literal along legacy's plain arm (`spreadPlanOf`): each item group, a spread source or a
+// run of plain elements as legacy's run literal, built raw as legacy emits it at the literal's own
+// list rep and row, into slots its recorded ordinal keys. A boxing or converting literal is a miss.
 function spreadLit(
   b: i32[],
   n: ArrayLit,
@@ -4099,10 +4260,6 @@ function spreadLit(
   rep: i32,
   lb: ListBuild,
 ): Opnd {
-  // Read off the elements before any plan is asked: the plan's wrapper lookups mint types.
-  if n.arrElems.length != 1 || spreadArgOf(n.arrElems[0]) < 0 {
-    return irBMiss("array spread groups")
-  }
   if (
     spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
     || spreadBoxingSource(ix, ibFnIx) >= 0
@@ -4110,25 +4267,66 @@ function spreadLit(
     return irBMiss("array spread boxed")
   }
   if spreadSlotIdOf(ix) < 0 { return irBMiss("array spread unrecorded") }
+  // Legacy notes the literals the spread holds before its plan, so each is typed at its holder's
+  // element; the plan asked without that note mints the literals' own lists. The note is idempotent.
+  elabSpreadNote(ix)
   const p = spreadPlanOf(ix, ibFnIx, lb)
   if p.spWhy != "" { return irBMiss("array spread plan") }
   if !spreadPairKnown(p) { return irBMiss("array spread pair unminted") }
-  if p.spSrcKinds[0] != p.spKind { return irBMiss("array spread conversion") }
-  if p.spGroupRows[0] != p.spRow { return irBMiss("array spread sub row") }
+  for k in p.spSrcKinds {
+    if k != p.spKind { return irBMiss("array spread conversion") }
+  }
+  for r in p.spGroupRows {
+    if r != p.spRow { return irBMiss("array spread sub row") }
+  }
   if !(repNodeAt(rep) is RList) { return irBMiss("array rep") }
-  const v = spreadSrcBuild(b, p, p.spSrcs[0], ix, rep)
-  if ibMiss != "" { return v }
-  if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
-  const r: Rhs = { spSrc: v, spKind: lb.lbKind, spSlot: lb.lbSlot, spAt: ix }
+  // The groups as legacy's arm makes them, every run literal before any group is built.
+  const grps: i32[] = []
+  let run: i32[] = []
+  for e in n.arrElems {
+    const src = spreadArgOf(e)
+    if src >= 0 {
+      if run.length > 0 {
+        grps.push(spreadRunLit(run, ix, ix, n.pos))
+        run = []
+      }
+      grps.push(src)
+    } else {
+      run.push(e)
+    }
+  }
+  if run.length > 0 { grps.push(spreadRunLit(run, ix, ix, n.pos)) }
+  if grps.length != p.spSrcs.length {
+    return irBMiss("array spread plan groups")
+  }
+  const at = b.length
+  const srcs: Opnd[] = []
+  let g = 0
+  while g < grps.length {
+    const v = spreadSrcBuild(b, p, g, grps[g], ix, rep)
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
+    srcs.push(v)
+    g = g + 1
+  }
+  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  const r: Rhs = {
+    spSrcs: srcs,
+    spGroups: grps,
+    spKind: lb.lbKind,
+    spSlot: lb.lbSlot,
+    spAt: ix,
+  }
   return irBLetTemp(b, r, ix, rep)
 }
 
-// Spread source `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
+// Group `g`'s list `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
 // literal at its own typed build, typed at that build's type, else at the group's, which is the
 // literal's own kind and row and so its type; any other source as itself, with no paren between.
 function spreadSrcBuild(
   b: i32[],
   p: SpreadPlan,
+  g: i32,
   src: i32,
   ix: i32,
   rep: i32,
@@ -4140,11 +4338,13 @@ function spreadSrcBuild(
   const ba = arrLitBuildAt(lit, arrLitTyAt(lit, ibFnIx), ibFnIx)
   const tb = ba.baBuild
   if tb != null {
-    const lrep = exprRepOf(lit)
+    // At its build's type, which a run literal legacy's arm minted is the only rep of, and which a
+    // literal its group widens differs from its own type at.
+    const lrep = if ba.baTy >= 0 { repNodeOfTy(ba.baTy) } else { exprRepOf(lit) }
     if lrep < 0 { return irBMiss("array spread literal source rep") }
     return arrayLit(b, ln, lit, lrep, tb, ba.baTy)
   }
-  const gb: ListBuild = { lbKind: p.spGroupKinds[0], lbSlot: p.spGroupRows[0] }
+  const gb: ListBuild = { lbKind: p.spGroupKinds[g], lbSlot: p.spGroupRows[g] }
   return arrayLit(b, ln, lit, rep, gb, exprTyOf(ix))
 }
 
@@ -4846,6 +5046,17 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     if n.unOp != "-" && n.unOp != "!" && n.unOp != "~" {
       return irBMiss("unary " + n.unOp)
     }
+    // A negated literal is one constant at the negation's own width, which may be narrower than
+    // its operand's: `-2147483647` over an `i64` magnitude (`emitSignedNumLitAt`).
+    const neg = if n.unOp == "-" { unwrapParen(n.unArg) } else { -1 }
+    if (
+      neg >= 0
+      && neg < P.nodes.length
+      && nodeAt(neg) is NumLit
+      && numLitTyWidth(ix, ibFnIx) != ""
+    ) {
+      return signedLitAt(ix, rep)
+    }
     const uw = operandWhy(n.unArg)
     if uw != "" { return irBMiss(uw) }
     const a = irBExpr(b, n.unArg)
@@ -5144,8 +5355,8 @@ function assignValueLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // `rep` (`emitSignedNumLitAt`): each minus negates it as the lowering folds a `neg` of one.
 function signedLitAt(lit: i32, rep: i32): Opnd {
   const n = nodeAt(lit)
-  if n is NumLit { return numLit(n, lit, rep) }
-  if !(n is Unary) || n.unOp != "-" { return irBMiss("assignment value lit") }
+  if n is NumLit { return numLitAt(n, lit, rep) }
+  if !(n is Unary) || n.unOp != "-" { return irBMiss("signed literal") }
   const a = signedLitAt(unwrapParen(n.unArg), rep)
   if !(a is OImm) { return a }
   const k: string = repPrim(rep) ?? ""
@@ -6503,7 +6714,7 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
     irBNode(b, { gsSym: gi, gsSrc: bv }, -1, ibNoValue, gst)
     return 0
   }
-  if arm != "plain" && arm != "widen" {
+  if arm != "plain" && arm != "widen" && arm != "variant" {
     return skip("global initializer " + arm)
   }
   // A widened value `if` is legacy's nested-join adoption (`numLitAdoptJoin`, D16496), which
@@ -6512,15 +6723,29 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
     return skip("global initializer widen join")
   }
   // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it.
-  if arm == "plain" && globalInitArmUnboxes(gck, g.letInit) {
+  if arm != "widen" && globalInitArmUnboxes(gck, g.letInit) {
     return skip("global initializer arm unbox")
   }
-  const src = if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else if gck == "closure" { cloInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }
+  // A bare-arm cell takes the arm's struct whatever builds it (`emitVariantCoerce`): the value is
+  // delivered at the cell's type.
+  const src = if arm == "variant" { globalInitVariant(b, gi, gst, g.letInit) } else if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else if gck == "closure" { cloInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }
   if ibMiss != "" { return 0 }
   const gm = irGlobalWriteMiss(gi, ibGlobalCtx())
   if gm != "" { return skip(gm) }
   irBNode(b, { gsSym: gi, gsSrc: src }, -1, ibNoValue, gst)
   return 0
+}
+
+// Global `gi`'s initializer `init` at its bare-arm cell, delivered at the cell's type so a
+// variant's coercion arm builds it at the arm's row.
+function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
+  const rep = globalRep(gi, gst)
+  if rep < 0 { return irBMiss("global initializer rep") }
+  const v = deliver(b, init, rep, heldTy(scopeTyAt(gst, -1)))
+  if ibMiss == "" && irBOpRep(v) != rep {
+    return irBMiss("global initializer variant coercion")
+  }
+  return v
 }
 
 // The value of global `gi`'s initializer `init`, delivered at the cell's rep with no coercion.
