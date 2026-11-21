@@ -19,9 +19,10 @@ the own-width check (`wide literal width`) for an unnegated literal.
 **A latent re-read miss.** With `nn(-1)` building, `tests/cases/soundness/short-circuit-write-may-not-run.vl`'s
 `str` reached `nn(-1) ?? (s = "w").length` and failed the verifier's rule 3. The assignment's
 re-read of `s`, a `string | null` local narrowed to `string`, recovers to the `str` rep, while the
-temp takes the target node's declared nullable type. `assignValue` now misses by name,
-`assignment value narrowed read`, where the target's own type is not held at the value's rep. Row
-file `tests/ir-shadow-rows/assignment-value-narrowed-read.vl`.
+temp takes the read's nullable type. `narrowedLocalRead` now misses by name, `nullable read
+recover`, where a nullable local's recover to a non-atom inner rep would mint a temp its type does
+not hold; the atom recover (`K | null` re-read at `K`) keeps building. Row file
+`tests/ir-shadow-rows/nullable-read-recover.vl`.
 
 ## Witness
 
