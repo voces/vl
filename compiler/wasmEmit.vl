@@ -34080,22 +34080,12 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   const frProof = rangeProofOpen(s, stmtIx, stepK, dynStep)
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
-  const aConst = rangeConstIs(s.frFrom, fnIx)
-  let aVal = 0
-  if aConst { aVal = rangeConstVal(s.frFrom, fnIx) }
-  let trips = -1
-  if aConst && bConst && !dynStep {
-    trips = rangeUnrollTrips(s, aVal, bVal, stepK, fnIx)
-  }
-  // A constant range a getter runs is always unrolled, so its lowering holds no loop (§D3a): the
-  // step budget charges a trip at least one step, which keeps it within `UNROLL_MAX_TRIPS`.
-  const gTrips = getterRangeTrips(stmtIx, fnIx)
+  // The arm is the one decision the IR reads too (`forRangeArm`).
+  const arm = forRangeArm(s, stmtIx, fnIx)
   let rc = 0
-  if gTrips >= 0 {
-    const parts = constRangeParts(stmtIx)
-    rc = emitRangeUnrolled(s, fnIx, vIdx, parts[0], parts[2], gTrips)
-  } else if trips > 0 {
-    rc = emitRangeUnrolled(s, fnIx, vIdx, aVal, stepK, trips)
+  if arm == "unrolled" {
+    const plan = forRangeUnrollPlan(s, stmtIx, fnIx)
+    rc = emitRangeUnrolled(s, fnIx, vIdx, plan[0], plan[1], plan[2])
   } else {
     const rt: RangeTest = {
       vIdx: vIdx,
@@ -34108,7 +34098,7 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
       excl: s.frExcl,
     }
     const wraps = rangeMayWrap(s, rt)
-    if rangePartialUnrollOk(s, stepK, dynStep, fnIx) {
+    if arm == "partial" {
       rc = emitRangePartial(s, fnIx, rt, wraps)
     } else {
       rc = emitRangeRolled(s, fnIx, rt, wraps)
@@ -34121,30 +34111,58 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   return rc
 }
 
-// Why range loop `s`, statement `stmtIx` of `fnIx`, is not legacy's plain rolled loop: "" for a
-// static nonzero step that never wraps, written rolled with no hoist and no range proof; else
-// the arm legacy takes instead.
-export function forRangeRolledWhy(s: ForRange, stmtIx: i32, fnIx: i32): string {
+// The arm `emitForRangeStmt` writes range loop `s` (statement `stmtIx` of `fnIx`) in, the one
+// decision legacy and the IR both read: "unrolled" for its copies (`forRangeUnrollPlan`, a
+// getter's constant range included), "partial" for the 4x main loop, else "rolled".
+export function forRangeArm(s: ForRange, stmtIx: i32, fnIx: i32): string {
+  if forRangeUnrollPlan(s, stmtIx, fnIx).length == 3 { return "unrolled" }
+  const dyn = !forRangeStepIsConst(s.frStep)
+  const k = if dyn { 1 } else { forRangeStaticStep(s) }
+  if rangePartialUnrollOk(s, k, dyn, fnIx) { return "partial" }
+  return "rolled"
+}
+
+// Legacy's full unroll of range loop `s` (statement `stmtIx` of `fnIx`): its first value, its
+// step and its trip count; none for a loop it does not unroll. A getter's constant range is
+// always unrolled, so its lowering holds no loop (§D3a).
+export function forRangeUnrollPlan(s: ForRange, stmtIx: i32, fnIx: i32): i32[] {
+  const none: i32[] = []
+  const g = getterRangeTrips(stmtIx, fnIx)
+  if g >= 0 {
+    const parts = constRangeParts(stmtIx)
+    return [parts[0], parts[2], g]
+  }
+  if !forRangeStepIsConst(s.frStep) { return none }
+  const k = forRangeStaticStep(s)
+  if k == 0 || !rangeConstIs(s.frFrom, fnIx) || !rangeConstIs(s.frTo, fnIx) {
+    return none
+  }
+  const a = rangeConstVal(s.frFrom, fnIx)
+  const t = rangeUnrollTrips(s, a, rangeConstVal(s.frTo, fnIx), k, fnIx)
+  return if t > 0 { [a, k, t] } else { none }
+}
+
+// What keeps a range loop of arm "rolled" from the IR, from the predicates legacy's writer
+// consumes: a dynamic step, a hoist (`hoistCandRow`), a range proof (`rangeProofRow`) or a wrap
+// exit (`rangeMayWrap`); "" for none.
+export function forRangeRolledBlock(
+  s: ForRange,
+  stmtIx: i32,
+  fnIx: i32,
+): string {
   if !forRangeStepIsConst(s.frStep) { return "dynamic step" }
   const k = forRangeStaticStep(s)
   if k == 0 { return "step" }
-  if getterRangeTrips(stmtIx, fnIx) >= 0 { return "getter" }
-  const bConst = rangeConstIs(s.frTo, fnIx)
-  const bVal = if bConst { rangeConstVal(s.frTo, fnIx) } else { 0 }
-  if bConst && rangeConstIs(s.frFrom, fnIx) {
-    const aVal = rangeConstVal(s.frFrom, fnIx)
-    if rangeUnrollTrips(s, aVal, bVal, k, fnIx) > 0 { return "unrolled" }
-  }
-  if rangePartialUnrollOk(s, k, false, fnIx) { return "partial" }
   for c in loopHoistCands(-1, s.frBody, fnIx, stmtIx, -1) {
     if hoistCandRow(c, -1, s.frBody, fnIx) >= 0 { return "hoisted" }
   }
   if rangeProofRow(s, stmtIx, k) >= 0 { return "proven" }
+  const bConst = rangeConstIs(s.frTo, fnIx)
   const rt: RangeTest = {
     vIdx: -1,
     bIdx: -1,
     bConst: bConst,
-    bVal: bVal,
+    bVal: if bConst { rangeConstVal(s.frTo, fnIx) } else { 0 },
     sIdx: -1,
     dynStep: false,
     stepK: k,
