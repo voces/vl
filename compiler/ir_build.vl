@@ -124,6 +124,7 @@ import {
   arrNewFillBoxTy,
   arrNewPlanOf,
   asgValueArmOf,
+  atomHookArmOf,
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
@@ -160,6 +161,7 @@ import {
   idxStorePlainWhy,
   ifExprJoinVt,
   ifExprPlainWhy,
+  ifExprShapeWhy,
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
@@ -232,6 +234,7 @@ import {
   IsArm,
   TagIsArm,
   atomEqPlanOf,
+  captureSlotOf,
   holeBoxPlanOf,
   identReadArmOf,
   isArmOf,
@@ -275,6 +278,7 @@ import {
   coalesceNulStrStaysNullable,
   deadNullTestOperand,
   nulNoneEqSides,
+  nulStrReadRecovers,
   nulTestArmOf,
   nullOwnAt,
 } from "./emit_plan_null"
@@ -311,11 +315,13 @@ import {
   fnEnvIdxOf,
   nodeTyAt,
   numLitWidth,
+  parentBindingFrameArenaOf,
+  parentBindingOf,
   readNarrowedTyAt,
   scopeTyAt,
 } from "./emit_capture_frames"
 import { isBlockBody } from "./block_body"
-import { wTarget } from "./emit_bytes"
+import { fbValtype, wTarget } from "./emit_bytes"
 import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
   isStorageRead,
@@ -336,6 +342,8 @@ import {
   capCellTargetOf,
   captureCountOf,
   captureNamesOf,
+  captureValKind,
+  captureValStructIdx,
   cbIdentNamesFn,
   coalesceDefaultNullable,
   declaredIndexAt,
@@ -400,6 +408,7 @@ import { identDeclOf, sidOfNode } from "./symbols"
 import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
+  exprEffectFree,
   objFieldSrcOrder,
   objFieldVal,
   unwrapParen,
@@ -1212,9 +1221,15 @@ function condIsTest(ix: i32): boolean {
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
 function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
+  return ifExprAt(b, n0, ix0, rep0, -1)
+}
+
+// `ifExpr`, its first link built at type `ty0` where that is not -1: a destination's own, whose
+// rep `rep0` each arm then delivers at. Such a link ends the chain.
+function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   const rj = ifRefJoinOf(ix0, ibFnIx)
   const rk = rj.rjKind
-  if rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
+  if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
     return ifRefExpr(b, n0, ix0, rep0, rj)
   }
   // The head's rep is the one the join plan writes every link at, else the chain is legacy's.
@@ -1235,7 +1250,8 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   let cix = ix0
   const crep = rep0
   while true {
-    const pw = ifExprPlainWhy(cix, ibFnIx)
+    // A link built at a destination's type is `emitIfExprAs` at that type: its shape alone.
+    const pw = if ty0 >= 0 { ifExprShapeWhy(cix, ibFnIx) } else { ifExprPlainWhy(cix, ibFnIx) }
     if pw != "" { return irBMiss("expression if " + pw) }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
@@ -1244,8 +1260,9 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
       return irBMiss("decided is condition")
     }
     // Every link is written at the head's kind (`emitIfExprAs` asks `ifJoinPlanOf` of the head
-    // alone), so a link takes the head's rep and type, never its own.
-    const ty = if cix == ix0 { nodeTyAt(cix, ibFnIx) } else { tys[0] }
+    // alone), so a link takes the head's rep and type, never its own; a head built at a
+    // destination's type takes `ty0`.
+    const ty = if cix != ix0 { tys[0] } else if ty0 >= 0 { ty0 } else { nodeTyAt(cix, ibFnIx) }
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
     const thenB = ifArm(n.ifThen, t, crep)
@@ -1268,6 +1285,7 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
+    if ty0 >= 0 { return irBMiss("atom if join chain") }
     // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
     if !direct && armHasPrelude(n.ifElse) {
       return irBMiss("expression if else prelude")
@@ -1608,6 +1626,9 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
+  if captureSlotOf(n.identName, ibFnIx) >= 0 {
+    return captureRead(n, ix, d, rep)
+  }
   const w = localIndexOf(ibFnIx, ix)
   // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
   // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
@@ -1637,6 +1658,51 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     return cloValue(b, ix, rep)
   }
   return irBMiss("read of " + n.identName)
+}
+
+// Capture `n`, declared at `d`, read at `rep` on legacy's `capture` arm: a lifted function's own
+// parameter after its environment (`emitCaptureSlotRead`). An environment field read misses.
+function captureRead(n: Ident, ix: i32, d: i32, rep: i32): Opnd {
+  if identReadArmOf(n, ix, ibFnIx, false) != "capture" {
+    return irBMiss("read of " + n.identName)
+  }
+  const fe = fnStmtsPosOf(ibFnIx)
+  if !cloLifted(fe) { return irBMiss("capture env read") }
+  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
+  const name = n.identName
+  if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
+    return irBMiss("capture recover")
+  }
+  const v = liftCapVar(fe, name, d)
+  if v < 0 { return irBMiss("capture binding") }
+  if ib.irVars[v].vRep != rep { return irBMiss("capture read rep") }
+  ib.irReadVar[ix] = v
+  const o: Opnd = { ov: v }
+  return o
+}
+
+// The parameter variable of lifted function `fe`'s capture `name`, bound at `d` in its owning
+// frame and typed there, made at its first read; -1 when its rep is not the valtype legacy's
+// function type gives the capture (`captureValKind`).
+function liftCapVar(fe: i32, name: string, d: i32): i32 {
+  const w = 1 + captureSlotOf(name, ibFnIx)
+  const known = paramVarAt(w)
+  if known >= 0 { return known }
+  if parentBindingOf(fe, name) != d { return -1 }
+  const ty = heldTy(scopeTyAt(d, parentBindingFrameArenaOf(fe, name)))
+  const r = repNodeOfTy(ty)
+  if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
+  const vt: u8[] = []
+  const prev = wTarget(vt)
+  fbValtype(captureValKind(fe, name), captureValStructIdx(fe, name))
+  wTarget(prev)
+  const t = valtypeOf(r)
+  if vt.length == 0 { return -1 }
+  if t >= 0 && (vt.length != 1 || vt[0] != t) { return -1 }
+  if t < 0 && vt[0] != 0x63 && vt[0] != 0x64 { return -1 }
+  const v = irVarNew(ib, r, ty, "param", w)
+  ib.irParams.push(v)
+  return v
 }
 
 // A function name or literal `ix` read as a capture-free closure value, as a global's initializer
@@ -2853,6 +2919,21 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       return boxTempAt(b, objLitAtVariantRow(b, ix, vi), ix, dst, vi)
     }
   }
+  // A join of member literals the hook takes is built at an atom destination, each arm's
+  // literal its id, as legacy's `emitIfExprAs` writes it (`atomHookArmOf`'s `litJoin`).
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && repNodeAt(dst) is RAtom
+    && exprPrePathWhy(ix, ibFnIx) == "pre-path atom hook"
+    && atomHookArmOf(ix, ibFnIx, false) == "litJoin"
+  ) {
+    const jn = nodeAt(unwrapParen(ix))
+    const jt = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+    if jn is IfStmt && jt >= 0 {
+      return ifExprAt(b, jn, unwrapParen(ix), dst, jt)
+    }
+  }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
     return memberBoxTemp(b, ix, dst)
@@ -2917,6 +2998,11 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
   const why = boxPlanWhy(p, v)
   if why != "" { return irBMiss(why) }
+  // The box writer may leave an immediate unread, so one built for a node with an effect (a
+  // stored literal's value) is legacy's to box.
+  if (v is OImm || v is OStr) && !exprEffectFree(ix) {
+    return irBMiss("box of an effect's immediate")
+  }
   // A literal boxed as its context arm is the IR's record only when it is built at that arm.
   const row = if at >= 0 { at } else { objLitVariantLayoutOf(unwrapParen(ix), ibFnIx) }
   if p.hbArm == "obj" && row != p.hbKind { return irBMiss("box literal arm") }
@@ -3018,6 +3104,11 @@ function widenTo(b: i32[], v: Opnd, ix: i32, dst: i32, dstTy: i32): Opnd {
   const dk = numKindOf(dst)
   if sk < 0 || dk < 3 { return v }
   const p = widenPlanOf(ix, dk, ibFnIx)
+  // A stored literal's value is the literal again, built at the destination (`emitAsgLitAs`).
+  const asg = nodeAt(unwrapParen(ix))
+  if p.wpArm == "asgLit" && v is OImm && asg is BinExpr {
+    return signedLitAt(unwrapParen(asg.binRight), dst)
+  }
   if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
   if p.wpSrc != sk { return irBMiss("widen source") }
   // The temp is typed at the destination, whose rep it holds.
@@ -4249,6 +4340,7 @@ function siteBuilt(n0: i32, ix: i32): boolean {
 // legacy re-reads in reads it as the builder's own does.
 function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const arm = asgValueArmOf(ix, ibFnIx)
+  if arm == "lit" { return assignValueLit(b, n, ix, rep) }
   if arm != "reRead" { return irBMiss("assignment value " + arm) }
   if asgReadUnwidenOp(ix, ibFnIx) >= 0 {
     return irBMiss("assignment value unwiden")
@@ -4260,6 +4352,31 @@ function assignValue(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const m = asgReReadEnter(ix)
   const o = identRead(b, t, n.binLeft, rep, false)
   asgReReadLeave(m)
+  return o
+}
+
+// An assignment whose value is its right side's number literal (`asgValueArmOf` "lit"): the
+// store, then that literal built again at the assignment's rep, as `emitAsgLitAs` writes it.
+function assignValueLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  // The store is a statement, so no temp an operand before it built may wait across it.
+  if endsInTemp(b) { return irBMiss("assignment value lit after an operand") }
+  assignTo(b, n, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return signedLitAt(unwrapParen(n.binRight), rep)
+}
+
+// The number literal at `lit`, under any parentheses and minus signs, as one immediate at rep
+// `rep` (`emitSignedNumLitAt`): each minus negates it as the lowering folds a `neg` of one.
+function signedLitAt(lit: i32, rep: i32): Opnd {
+  const n = nodeAt(lit)
+  if n is NumLit { return numLit(n, lit, rep) }
+  if !(n is Unary) || n.unOp != "-" { return irBMiss("assignment value lit") }
+  const a = signedLitAt(unwrapParen(n.unArg), rep)
+  if !(a is OImm) { return a }
+  const k: string = repPrim(rep) ?? ""
+  const one: i64 = 1
+  const bits = if k == "f64" { a.oiBits ^ (one << 63) } else if k == "f32" { a.oiBits ^ (one << 31) } else { 0 - a.oiBits }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
   return o
 }
 
