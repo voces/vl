@@ -23,4 +23,21 @@ boxed and call-niche rungs, and the IR left it inside the miss `coalesce box nex
 
 ## Coverage
 
-MEASURED
+Measured on fixpoint seeds of this branch and of #9437's head `e82c2206`, each building this
+branch's source.
+
+| population | #9437 | this branch |
+| --- | ---: | ---: |
+| self-compile functions with no blocker | 19,540 | 19,540 |
+| corpus with no blocker (45,678) | 44,503 | 44,503 |
+| `tests/cases` covered / matched (armed shadow) | 64,932 / 64,931 | 64,970 / 64,969 |
+
+On `tests/cases` `coalesce box next` falls from 194 rows to 92; the field arm's misses are
+`coalesce field place` 34, `coalesce field none` 15, `coalesce field cast` 12 and `coalesce field
+result rep` 1. The armed shadow adds no fail, differ or mismatch row.
+
+- **Byte proof:** mode 3 self-compile identical; `ir-identity.sh --names` identical 9,037, fail
+  under both 3,267, differ 0; `--cases` identical 7,590, differ 0, witnesses same 60;
+  `--claimless` identical 14,014, fail under both 3,267, differ 0; `tests/cases` A/B same 8,704,
+  differ 0.
+- **Fuel:** L2 self-compile 107,237,005,080 against #9437's fixpoint 107,157,810,746 (+0.07%).
