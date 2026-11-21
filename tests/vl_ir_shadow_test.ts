@@ -1249,10 +1249,10 @@ run(2.5)
 });
 
 // A record literal on legacy's layout path builds field by field and matches, a widened `f64`
-// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) stays a
-// named miss.
+// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) builds
+// as its value then the table's retag (`RMapRetag`), and matches.
 Deno.test({
-  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union matches",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
@@ -1270,11 +1270,11 @@ if d.v is f64 { print(d.v) }
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
-      throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want mk, mkq and mkd covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (rows.get("uncovered pre-path coercion") !== 1) {
-      throw new Error(`want mkd's i32-to-f64 retag a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered pre-path coercion")) {
+      throw new Error(`want mkd's i32-to-f64 retag built, got ${JSON.stringify([...rows])}`);
     }
   },
 });
