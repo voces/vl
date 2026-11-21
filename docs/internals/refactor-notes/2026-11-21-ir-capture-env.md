@@ -33,8 +33,8 @@ largest class in `tests/cases`: 884 functions there name `closure env`.
   refuses that shape (`boxed tag dispatch`); the stash placement is the box ladder's to fix.
 
 Compiler lines +147 / −33 over step 1 (`ir_build.vl` +105 −23, `ir_lower.vl` +29 −3, `ir.vl` +6
-−2). The shadow row `ENV_CAPTURE` builds a closure environment, its field reads and an env-to-env
-copy; all five functions are covered and matched.
+−2). The shadow row `tests/ir-shadow-rows/closure-env-capture.vl` builds a closure environment, its
+field reads and an env-to-env copy; all five functions are covered and matched.
 
 ## Readings (base master `6851d881`, fixpoint seeds on both sides)
 
@@ -42,9 +42,14 @@ copy; all five functions are covered and matched.
 | --- | ---: | ---: | ---: |
 | corpus functions with no blocker (census) | 41,780 | 42,033 | 42,116 |
 | `tests/cases` functions with no blocker | 54,061 | 54,396 | 56,483 |
-| self-compile functions with no blocker | 19,056 | 19,056 | 19,061 |
+| self-compile functions with no blocker (each seed on its own tree) | 19,056 | 19,056 | 19,061 |
 | `tests/cases` `closure env` (any) | 884 | 884 | 184 |
 | corpus `closure env` (any) | 52 | 52 | 11 |
+| L2 self-compile fuel | 104,683,723,346 | 104,701,125,652 | 104,803,012,071 (+0.114%) |
+
+The self-compile's +5 are this step's own new functions; the base seed building this tree also
+reads 19,061. The compiler holds no closure, so the fuel rise is the builder's new work per read
+and per box delivery, not coverage.
 
 ## What is left in the family (`tests/cases`, any)
 
