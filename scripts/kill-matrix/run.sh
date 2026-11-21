@@ -38,8 +38,8 @@ for x in src key; do [ -f "build/vl-compiler.wasm.$x" ] && cp "build/vl-compiler
 
 # gate.sh, with each `deno test` row writing junit next to its log and the logs kept.
 GATE="$OUT/gate-junit.sh"
-awk '{ if ($0 ~ /^run "/ && $0 ~ /deno test -A --no-check/) { n++
-         sub(/deno test -A --no-check/, "deno test -A --no-check --junit-path=$LOGS/j" n ".xml") }
+awk '{ if ($0 ~ /^run "/ && $0 ~ /deno test .*-A --no-check/) { n++
+         sub(/-A --no-check/, "-A --no-check --junit-path=$LOGS/j" n ".xml") }
        print }' scripts/gate.sh |
   sed "s|^cd \"\$(dirname \"\$0\")/..\"|cd \"$ROOT\"|; s|^LOGS=.*|LOGS=\"\${KM_LOGS:?}\"; mkdir -p \"\$LOGS\"|" > "$GATE"
 grep -q 'junit-path' "$GATE" || { echo "kill-matrix: gate.sh's deno rows were not found" >&2; exit 2; }
