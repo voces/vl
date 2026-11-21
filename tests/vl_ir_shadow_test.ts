@@ -2593,7 +2593,7 @@ print(qnull().o == null)
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field explicitNull") ?? 0) !== 2) {
+    if ((rows.get("uncovered object field explicitNull typed null") ?? 0) !== 2) {
       throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
