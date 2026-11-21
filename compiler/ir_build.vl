@@ -1595,7 +1595,7 @@ function refIfLink(
   return o
 }
 
-// One arm of `ifRefExpr`: its value as itself at `rep`, written to out `t`.
+// One arm of `ifRefExpr`: its value as itself at `rep`, or an atom decoded to it, written to out `t`.
 function refIfArm(
   blockIx: i32,
   t: i32,
@@ -1606,18 +1606,31 @@ function refIfArm(
 ): i32[] {
   const body: i32[] = []
   const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
-  if arm != "plain" {
+  if arm != "plain" && arm != "atomStr" {
     irBMiss("ref if arm " + arm)
     return body
   }
   armPrelude(body, blockIx)
   if ibMiss != "" { return body }
-  const v = irBExpr(body, ifArmValueExpr(blockIx))
+  const tv = ifArmValueExpr(blockIx)
+  const built = irBExpr(body, tv)
+  // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`).
+  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && refIfArmNiches(built, tv, rep) { repTemp(body, { rgV: built }, tv, rep) } else { built }
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
   }
   return body
+}
+
+// Whether arm value `v` (node `tv`) is the non-null reference of a nullable join `rep`: legacy
+// writes it as itself, the same reference, so the IR only retags it.
+function refIfArmNiches(v: Opnd, tv: i32, rep: i32): boolean {
+  const d = repNodeAt(rep)
+  return d is RNullable
+    && d.rnInner == irBOpRep(v)
+    && (strNullable(rep) || refNullable(rep))
+    && !boxOwedAt(tv, ibFnIx)
 }
 
 // A nullable or union binding's `if` initializer as legacy writes it per arm (`emitLetIfInit`, rep
@@ -5768,9 +5781,9 @@ function retIsValueIf(ix: i32): boolean {
 }
 
 // A non-void body's tail. An expression body's one statement is its value; a block body's last
-// statement is a statement, and a body that runs past it falls into legacy's pad.
+// statement is a statement, and a body that runs past it, or has none, falls into legacy's pad.
 function tailReturn(b: i32[], stmts: i32[], at: i32) {
-  if stmts.length == 0 { return skip("empty valued body") }
+  if stmts.length == 0 { return 0 }
   let i = 0
   while i < stmts.length - 1 {
     stmtAt(b, stmts, i)
@@ -5886,7 +5899,12 @@ function tailArm(blockIx: i32): i32[] {
   }
   const last = stmts[stmts.length - 1]
   const ln = nodeAt(last)
-  if ln is IfStmt && lastStmtIsValueIf(last, ibFnIx) {
+  // An else-less `if` ending an arm is a `T | null` value: legacy's `emitStmtTail` writes it as a
+  // tail link with no `else`, and the body's pad returns what falls through.
+  if (
+    ln is IfStmt
+    && (lastStmtIsValueIf(last, ibFnIx) || elseLessNullableTail(last, ibFnIx))
+  ) {
     tailIf(body, last)
     return body
   }
