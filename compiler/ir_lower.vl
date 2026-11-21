@@ -8,7 +8,17 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { RAtom, RNullable, RRaw, RpPrim, repNodeAt } from "./emit_rep"
+import {
+  RAtom,
+  RClosure,
+  RList,
+  RMap,
+  RNullable,
+  RRaw,
+  RRecord,
+  RpPrim,
+  repNodeAt,
+} from "./emit_rep"
 import {
   ArrayLit,
   AsExpr,
@@ -78,7 +88,7 @@ import {
   structIndexOfExpr,
 } from "./emit_classify"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
-import { forInStringSrc } from "./emit_value_sites"
+import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -427,6 +437,7 @@ import {
 } from "./emit_plan_union"
 import { CoalBoxArm, coalValBoxArm, nullRetPlanOf } from "./emit_plan_null"
 import {
+  NulTestArm,
   binNulTestOf,
   coalResultKindOf,
   coalesceNulStrStaysNullable,
@@ -1129,15 +1140,23 @@ function globalRead(sym: i32, nonNull: boolean) {
   return 0
 }
 
+// The arm `RNulTest` `r` lowers at: a `== null` compare's, or an `is` test's niche-only one, as
+// legacy's `emitIsArm` asks it; null for any other node.
+function nulTestOpArm(r: RNulTest): NulTestArm | null {
+  if r.ntAt < 0 || r.ntAt >= P.nodes.length { return null }
+  const n = nodeAt(r.ntAt)
+  if n is IsExpr { return nulTestArmOf(n.isObj, lw.irAt, r.ntInvert, true) }
+  if !(n is BinExpr) { return null }
+  const bt = binNulTestOf(n)
+  if bt == null { return null }
+  return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false)
+}
+
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
 // sentinel's compare, a nullable ref's `ref.is_null`, or a union box's null tag compare.
 function nulTestOp(r: RNulTest) {
-  if r.ntAt < 0 { return irLMiss("null test node") }
-  const n = nodeAt(r.ntAt)
-  if !(n is BinExpr) { return irLMiss("null test node") }
-  const bt = binNulTestOf(n)
-  if bt == null { return irLMiss("null test node") }
-  const arm = nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false)
+  const arm = nulTestOpArm(r)
+  if arm == null { return irLMiss("null test node") }
   if arm == "atom" {
     irLOpnd(r.ntV)
     return nulTestAtomTail(r.ntInvert)
@@ -1506,7 +1525,7 @@ function forIn(n: SForIn, pending: i32[]) {
     vSlot,
     ek,
     forInStringSrc(s.fiIter, fnIx),
-    false,
+    forInU8Src(s.fiIter, fnIx),
   )
   if lp == null { return irLMiss("walk backing") }
   if n.xfMap >= 0 {
@@ -2566,8 +2585,12 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
-  // A string out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
-  const strOut = repPrim(lw.irVars[t].vRep) == "str"
+  // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
+  const strOut = (repPrim(lw.irVars[t].vRep) == "str"
+    || rr is RRecord
+    || rr is RList
+    || rr is RMap
+    || rr is RClosure)
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
   const rj = if vt < 0 && !refOut && !strOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
