@@ -133,6 +133,13 @@ Deno.test({
   },
 });
 
+// How many functions a build left uncovered by a named miss.
+function namedMisses(r: Map<string, number>): number {
+  let n = 0;
+  for (const [k, v] of r) if (k.startsWith("uncovered ")) n += v;
+  return n;
+}
+
 Deno.test({
   name: "ir door guard: a list-arm narrowing in a push receiver is not the IR's yet",
   ignore,
@@ -147,8 +154,10 @@ Deno.test({
 print(f([3]))
 print(f("s"))
 `);
-    if ((r.get("uncovered is rung") ?? 0) < 1) {
-      throw new Error(`want the list-arm narrowing uncovered at \`is rung\`, got ${JSON.stringify([...r])}`);
+    // Uncovered by a named miss, whichever the build meets first: the `is` rung covers now, and
+    // the push through the narrowed list arm still misses.
+    if (namedMisses(r) < 1 || r.has("matched")) {
+      throw new Error(`want the list-arm narrowing's push left uncovered, got ${JSON.stringify([...r])}`);
     }
   },
 });
@@ -169,8 +178,8 @@ print(f(xs))
     if ((r.get("uncovered push receiver payload cast") ?? 0) < 1) {
       throw new Error(`want the push receiver's payload cast to miss, got ${JSON.stringify([...r])}`);
     }
-    // An element narrowed to a list arm: today the `is` rung misses first; once it lands, the
-    // element's own atom unbox (`idxNarrowAtomKind`) must still make the push legacy's.
+    // An element narrowed to a list arm: the element's own unbox (`idxNarrowAtomKind`) must keep
+    // the push legacy's, by whichever named miss the build meets first.
     const el = rows(`function g(xs: (i32[] | string)[]): i32 {
   if xs[0] is i32[] {
     xs[0].push(1)
@@ -179,8 +188,7 @@ print(f(xs))
 }
 print(g([[3], "s"]))
 `);
-    const why = ["uncovered is rung", "uncovered push receiver payload cast"].filter((k) => el.has(k));
-    if (why.length < 1 || el.has("matched")) {
+    if (namedMisses(el) < 1 || el.has("matched")) {
       throw new Error(`want the narrowed element's push left to legacy, got ${JSON.stringify([...el])}`);
     }
   },
