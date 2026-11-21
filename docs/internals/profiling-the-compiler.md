@@ -684,6 +684,8 @@ Source grew from 298,771 to 310,731 lines (+4.0%), and fuel grew 41.9%.
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
 
+A map `.delete` anywhere in compiler/*.vl reserves the map delete family for every map program-wide (emit_sections.vl's reservation), about +0.5% fuel; prefer a stack or a tombstone.
+
 * **`tests/vl_scaling_shape_test.ts`** — nine pairs, the same work reshaped along one axis
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
   covariant bindings; later pairs include calls to inferred-return callees and a list name
@@ -736,7 +738,8 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   compiler running it and the profiler's epoch ticks add no fuel (89,463,711,270 under plain,
   `VL_GC_STATS=1` and the profiler alike, 2026-10-17), while the build that EMITS `--names`
   costs +5.5% (it writes the name and source sections), so the fuel is never read off the
-  `names` half of the pair.
+  `names` half of the pair. An arm query asked of every identifier read in the builder costs
+  ~0.15% L2; pre-test the IR var's rep first (#9396).
 * **`scripts/plumb-shape-cost.vl`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that
