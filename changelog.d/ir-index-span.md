@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR: an element read's span starts where legacy's does.** Legacy banks an element read's row over the whole read, receiver included. The IR writes a fused coalesce or a valued `if` receiver (`(p ?? [d])[0]`, `(if c { a } else { b })[1]`) as a statement before the read, and banked the row from the read's own operands. That gave the claim-time `spans: read index` mismatch: code bytes equal, the `--names` rows different. The builder names the statement the receiver's build opened with (`irIdxRowAt`), and the lowering starts the row where that statement began (`irLIndexFrom`).
