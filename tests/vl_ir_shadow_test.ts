@@ -2655,9 +2655,9 @@ Deno.test({
   },
 });
 
-// Two spellings stay legacy's: a stored literal boxed into a union (the box writer may leave an
-// immediate unread, and this one stands for the store), and one after a call operand whose value
-// waits on the stack across the store.
+// Two spellings stay legacy's: a stored literal boxed into a union (the box writes its tag ahead
+// of the store, which the builder writes as a statement first), and one after a call operand
+// whose value waits on the stack across the store.
 const ASG_VALUE_LIT_MISSES =
   `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
 Deno.test({
@@ -2669,7 +2669,7 @@ Deno.test({
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (
-      (rows.get("uncovered box of an effect's immediate") ?? 0) !== 1 ||
+      (rows.get("uncovered box of an assignment") ?? 0) !== 1 ||
       (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
     ) {
       throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
