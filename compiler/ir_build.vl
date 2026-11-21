@@ -231,6 +231,10 @@ import {
   recvReadsListPayload,
   refIfArmOf,
   shiftMaskFoldOf,
+  simdCallNamed,
+  simdCallRow,
+  simdOperandPrim,
+  simdRowIsMem,
   startInitArmOf,
   stmtWritesNothing,
   strAccRowsAre,
@@ -686,6 +690,7 @@ let ibNoValue = -1
 // expression here: a scalar, or a reference rep the list builder admits.
 function valueRep(r: i32, ty: i32): boolean {
   return repIsScalar(r)
+    || repPrim(r) == "v128"
     || repNodeAt(r) is RAtom
     || repNodeAt(r) is RBox
     || repNodeAt(r) is RRecord
@@ -2582,6 +2587,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   const d = identDeclOf(c.callFn)
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
   if memAccessCallNamed(c, ibFnIx) { return memAccessRhs(b, c, ix) }
+  if simdCallNamed(c, ibFnIx) { return simdRhs(b, c, ix) }
   if hostCallNamed(c, ibFnIx) { return hostCallRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
@@ -3084,6 +3090,40 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const op: StrOp = if many { "fromcps" } else { "fromcp" }
   const r: Rhs = { soOp: op, soArgs: [a], soAt: ix }
+  return r
+}
+
+// A SIMD intrinsic as legacy's arm writes it (`emitSimdIntrinsic`): each value operand at the prim
+// its row names (`simdOperandPrim`), a lane index being no operand. A load or store, whose address
+// is the memory plan's, is a named miss.
+function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const row = simdCallRow(c)
+  if row < 0 { return missRhs("simd row") }
+  if simdRowIsMem(row) { return missRhs("simd memory access") }
+  const at = b.length
+  const args: Opnd[] = []
+  const want: string[] = []
+  let i = 0
+  while i < c.callArgs.length {
+    const p = simdOperandPrim(row, i)
+    if p != "" {
+      args.push(irBExpr(b, c.callArgs[i]))
+      want.push(p)
+    }
+    i = i + 1
+  }
+  if ibMiss != "" { return missRhs("simd operand") }
+  if ifBelowLead(b, at, "simd short-circuit operand") {
+    return missRhs("simd short-circuit operand")
+  }
+  i = 0
+  while i < args.length {
+    if repPrim(irBOpRep(args[i])) != want[i] {
+      return missRhs("simd operand coercion")
+    }
+    i = i + 1
+  }
+  const r: Rhs = { sdArgs: args, sdAt: ix }
   return r
 }
 
@@ -5457,10 +5497,23 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     if asCastArmOf(ix, ibFnIx) == "zextLoad" {
       return irBMiss("expression as zextLoad")
     }
-    return numCast(b, n, ix, rep)
+    return asCast(b, n, ix, rep)
   }
   if n is ObjLit { return objLit(b, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
+}
+
+// An `as` at a `v128` rep over a `v128` operand re-brands the same bits, which legacy writes as
+// the operand alone (`asCastArmOf`'s `v128` arm, or its `plain` arm at a `new v128` target);
+// any other `as` is numeric.
+function asCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  if repPrim(rep) != "v128" { return numCast(b, n, ix, rep) }
+  const arm = asCastArmOf(ix, ibFnIx)
+  if arm != "v128" && arm != "plain" { return irBMiss("vector as " + arm) }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("vector as operand rep") }
+  return v
 }
 
 // A numeric `as` whose arm legacy writes as its operand at one kind then a tail
