@@ -91,6 +91,7 @@ import {
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
+import { RC_MAP } from "./emit_start_block"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
   IrFn,
@@ -373,6 +374,7 @@ import {
   mapRecvShapeOf,
   mapSetTail,
   mapSizeTail,
+  mapUnionUnboxTail,
   memAccessPlanOf,
   memAccessTail,
   memAddrPlanOf,
@@ -406,6 +408,7 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  refArrayUnionUnboxTail,
   sFieldStorageSlot,
   sharedArmBoxBody,
   sharedArmBoxHead,
@@ -419,6 +422,9 @@ import {
   sharedReadTail,
   sharedRecvSlotGet,
   simdCallRow,
+  simdMemBase,
+  simdMemTail,
+  simdRowIsMem,
   simdTail,
   spreadGroupStash,
   spreadJoinGroups,
@@ -596,11 +602,11 @@ function tempDefined(v: i32): boolean {
 function tempRhs(v: i32): Rhs {
   // A staged temp is a value on the stack, which no reader may rewrite from its definition.
   if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
-    const none: Rhs = { ggSym: -1, ggNonNull: false }
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
     return none
   }
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
   return none
 }
 
@@ -824,7 +830,12 @@ function rhs(r: Rhs, tail: boolean) {
   match r {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
-    RGlobalGet => globalRead(r.ggSym, r.ggNonNull)
+    RGlobalGet => {
+      globalRead(r.ggSym, r.ggNonNull)
+      if r.ggAt >= 0 && readOwesNonNullRecover(r.ggAt, lw.irAt) {
+        fbRefAsNonNull()
+      }
+    }
     RMapGetOr => mapGetOr(r)
     RMapGet => {
       const from = irLAt()
@@ -864,16 +875,16 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet |
-      RListLen |
-      RListPush |
-      RListPop |
-      RListEq |
+    RCoerce |
       RListCat |
-      RCoerce |
-      RStrOp |
+      RListEq |
+      RListGet |
+      RListLen |
+      RListPop |
+      RListPush |
+      RListSlice |
       RMapFilter |
-      RListSlice => irLowerListHook(r)
+      RStrOp => irLowerListHook(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -935,11 +946,11 @@ function rhs(r: Rhs, tail: boolean) {
     RMemAccess => memAccess(r)
     RCallHost => hostCall(r)
     RCast |
-      RTagOf |
-      RMapSet |
-      RFnId |
+      RCellGet |
       RCellNew |
-      RCellGet => irLMiss("rhs outside I1")
+      RFnId |
+      RMapSet |
+      RTagOf => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
@@ -1609,6 +1620,7 @@ function fieldTail(at: i32, m: Member) {
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
 // `emitVariantCoerce`'s box arm writes a narrowed read at a variant destination.
 function boxNarrow(r: RBoxNarrow) {
+  if r.bnCon >= 0 { return boxContainerRead(r) }
   if r.bnAtom >= 0 {
     irLOpnd(r.bnV)
     return emitUnionUnboxTail(r.bnAtom)
@@ -1617,6 +1629,22 @@ function boxNarrow(r: RBoxNarrow) {
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
   irLOpnd(r.bnV)
   return narrowedVariantTail(vi)
+}
+
+// `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
+// past the list overrides `emitIdentNode` asks first.
+function boxContainerRead(r: RBoxNarrow) {
+  const e = nodeAt(r.bnAt)
+  if !(e is Ident) { return irLMiss("box container read node") }
+  match identListOverrideOf(e, r.bnAt, lw.irAt) {
+    "luOv" | "fitShadow" => {
+      return irLMiss("list override")
+    }
+    "none" => {}
+  }
+  irLOpnd(r.bnV)
+  if r.bnCon == RC_MAP { return mapUnionUnboxTail(r.bnAt, lw.irAt) }
+  return refArrayUnionUnboxTail(r.bnAt, lw.irAt)
 }
 
 // `RRecover`: the nullable local, then `ref.as_non_null` where a `string | null` read recovers,
@@ -1654,6 +1682,14 @@ function listNew(r: RListNew) {
   return arrNewTail(pl, slot)
 }
 
+// Whether call node `at` is a SIMD store, the one SIMD row that leaves nothing.
+function simdStoreAt(at: i32): boolean {
+  const c = nodeAt(at)
+  if !(c is Call) { return false }
+  const row = simdCallRow(c)
+  return row >= 0 && simdRowIsMem(row) && simdMemBase(row) == 2
+}
+
 // `RListNewDefault`: legacy's `__array_new_default__` arm: the length and its stash, then the
 // zeroed allocation at `arrNewPlanOf`'s pair.
 function listNewDefault(r: RListNewDefault) {
@@ -1673,6 +1709,14 @@ function simd(r: RSimd) {
   const f = nodeAt(c.callFn)
   const row = simdCallRow(c)
   if !(f is Ident) || row < 0 { return irLMiss("simd node") }
+  if simdRowIsMem(row) {
+    const ap = memAddrPlanOf(c, simdMemBase(row), lw.irAt)
+    if ap.maArm != "const" && ap.maArm != "rest" {
+      return irLMiss("simd memory plan")
+    }
+    for a in r.sdArgs { irLOpnd(a) }
+    return simdMemTail(row, ap.maOff)
+  }
   for a in r.sdArgs { irLOpnd(a) }
   return simdTail(c, f.identName, row)
 }
@@ -2267,12 +2311,14 @@ function boxOp(r: RToBox) {
     || p.hbArm == "refList"
     || p.hbArm == "map"
     || p.hbArm == "clo"
+    || p.hbArm == "atomAsStr"
   ) {
     irLOpnd(r.bxV)
   } else {
     irLSkip(r.bxV)
   }
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   return holeBoxTail(p, r.bxAt, fnIx)
 }
 
@@ -2328,7 +2374,7 @@ function irHoistRecv(ix: i32): i32 {
 // false where it built none.
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
   rhs(lw.irReadAgain[ix] ?? none, false)
   return true
 }
@@ -2600,6 +2646,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if r is RListCopy {
         listCopy(r)
         irLSettle(pending)
+        return 0
+      }
+      // A vector store leaves nothing; any other SIMD op's discarded value is dropped.
+      if r is RSimd {
+        simd(r)
+        irLSettle(pending)
+        if !simdStoreAt(r.sdAt) { fbDrop() }
         return 0
       }
       // A store leaves nothing; a discarded load leaves its value, which legacy drops.
@@ -3350,7 +3403,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwStashAt = []
   lwStashFi = []
   lwStashSlots = []
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
   for _v in f.irVars {
     lwTempRhs.push(none)
     lwTempDef.push(false)
