@@ -183,6 +183,7 @@ import {
   forRangeArm,
   forRangeRolledBlock,
   forRangeStaticStep,
+  forRangeUnrollPlan,
   globalCtxNow,
   globalInitArmUnboxes,
   globalReadRecovers,
@@ -706,6 +707,11 @@ let ibLoopCont: i32[] = []
 let ibLabelN = 0
 // The statements whose end closes a list reserve region the body opened (`reserve.open`).
 let ibReserveEnd: i32[] = []
+// The fully unrolled range loops being built, by `ForRange`, and the constant each copy's
+// variable reads, innermost last. Stacks, not a map: a map delete anywhere in the compiler makes
+// every map it builds dearer.
+let ibRangeImmAt: i32[] = []
+let ibRangeImmVal: i32[] = []
 let ibBool = -1
 let ibNoValue = -1
 
@@ -2404,7 +2410,14 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
   // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
   const walkVar = dn is LoopVar && ((ibDeclVar[d] ?? -1) >= 0 || ib.irFragment)
-  // A range loop's variable is the one its loop made; a range loop it did not build is legacy's.
+  // A range loop's variable is the one its loop made, read as its copy's constant inside a full
+  // unroll; a range loop it did not build is legacy's.
+  const ri = if dn is ForRange { rangeImmAt(d) } else { -1 }
+  if ri >= 0 {
+    if rep != repNodeOfTy(TY_I32) { return irBMiss("range constant coercion") }
+    const o: Opnd = { oiRep: rep, oiBits: ibRangeImmVal[ri] as i64 }
+    return o
+  }
   const rangeVar = dn is ForRange && (ibDeclVar[d] ?? -1) >= 0
   if (dn is LetDecl || dn is Param || walkVar || rangeVar) && w >= 0 {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
@@ -6303,12 +6316,13 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   return 0
 }
 
-// A range loop legacy writes rolled (`forRangeArm`): the loop var, then the bound unless it
-// is constant, each at the slot its collect pass declared, then `while`'s block and loop around
-// the body, a `continue` landing at the end of an inner block, and the step before the back edge.
+// A range loop legacy writes rolled or fully unrolled (`forRangeArm`): the loop var, then the
+// bound unless it is constant, each at the slot its collect pass declared. Rolled, `while`'s
+// block and loop around the body, a `continue` landing at the end of an inner block, and the step
+// before the back edge; unrolled, a block of `forRangeUnrolled`'s copies.
 function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   const arm = forRangeArm(n, ix, ibFnIx)
-  if arm != "rolled" { return skip("for range " + arm) }
+  if arm != "rolled" && arm != "unrolled" { return skip("for range " + arm) }
   const why = forRangeRolledBlock(n, ix, ibFnIx)
   if why != "" { return skip("for range " + why) }
   // Inside a list reserve region legacy's pushes append through its locals (D3623).
@@ -6342,6 +6356,7 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
     const o: Opnd = { ov: bv }
     bound = o
   }
+  if arm == "unrolled" { return forRangeUnrolled(b, n, ix, v) }
   const brk = labelNew()
   const top = labelNew()
   const hasCont = blockHasContinueFor(n.frBody, n.frLabel, false)
@@ -6404,6 +6419,68 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   irBNode(blockBody, { lpLabel: top, lpBody: loopBody }, -1, ibNoValue, ix)
   irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
   return 0
+}
+
+// Legacy's full unroll of range loop `n` into variable `v` (`forRangeUnrollPlan`): in a block,
+// each copy sets `v` to its constant and runs the body reading that constant, in an inner block
+// when a `continue` lands at the copy's end.
+function forRangeUnrolled(b: i32[], n: ForRange, ix: i32, v: i32): i32 {
+  const plan = forRangeUnrollPlan(n, ix, ibFnIx)
+  if plan.length != 3 { return skip("for range plan") }
+  const ri = repNodeOfTy(TY_I32)
+  const brk = labelNew()
+  const hasCont = blockHasContinueFor(n.frBody, n.frLabel, false)
+  const blockBody: i32[] = []
+  ibLoopName.push(n.frLabel)
+  ibLoopBrk.push(brk)
+  let val = plan[0]
+  let k = 0
+  while k < plan[2] && ibMiss == "" {
+    const c: Opnd = { oiRep: ri, oiBits: val as i64 }
+    irBNode(blockBody, { asDst: v, asSrc: c }, -1, ibNoValue, ix)
+    const cont = if hasCont { labelNew() } else { brk }
+    ibLoopCont.push(cont)
+    ibRangeImmAt.push(ix)
+    ibRangeImmVal.push(val)
+    const fb: i32[] = []
+    const body = nodeAt(n.frBody)
+    if body is Block {
+      stmtRun(fb, body.blkStmts)
+    } else {
+      stmt(fb, n.frBody, NO_SIBS, -1)
+    }
+    ibRangeImmAt.pop()
+    ibRangeImmVal.pop()
+    ibLoopCont.pop()
+    if hasCont {
+      irBNode(
+        blockBody,
+        { bkLabel: cont, bkBody: fb, bkOut: -1 },
+        -1,
+        ibNoValue,
+        ix,
+      )
+    } else {
+      for x in fb { blockBody.push(x) }
+    }
+    val = val + plan[1]
+    k = k + 1
+  }
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  if ibMiss != "" { return 0 }
+  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
+  return 0
+}
+
+// The innermost unrolled copy of range loop `d` being built, or -1.
+function rangeImmAt(d: i32): i32 {
+  let k = ibRangeImmAt.length - 1
+  while k >= 0 {
+    if ibRangeImmAt[k] == d { return k }
+    k = k - 1
+  }
+  return -1
 }
 
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
@@ -7005,6 +7082,8 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMiss = ""
   ibMisses = []
   ibReserveEnd = []
+  ibRangeImmAt = []
+  ibRangeImmVal = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
   ibOwnDecls = Map()
