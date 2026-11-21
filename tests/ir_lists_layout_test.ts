@@ -4,7 +4,9 @@
 // (compiler/ir.vl, ir_verify.vl, ir_lower.vl), and the lint closed sets mirrored from
 // compiler/ir.vl are written one member per line; `vl fmt` keeps that layout but does not
 // produce it, so a branch that merged master while keeping its own packed line reintroduces
-// the conflict. This test names each packed line. Fix: one member per line, order unchanged.
+// the conflict. Each list is also kept in sorted order, so two PRs adding different members
+// insert at different lines. This test names each packed or out-of-order list. Fix: one member
+// per line, in sorted order.
 
 const ROOT = new URL("../", import.meta.url).pathname;
 const ARM_FILES = ["compiler/ir.vl", "compiler/ir_verify.vl", "compiler/ir_lower.vl"];
@@ -13,6 +15,9 @@ const SETS = [
   "klOpnd", "klPushRecv", "klVarKind", "klMapOp", "klStrOp", "klIrNode", "klPrimOp",
   "klRhs", "klIrFamily", "klRawOp", "klRawEff",
 ];
+// The sets kept in sorted order, as the unions they mirror are. The others mirror a string
+// union whose declared order `scripts/ladder-sets.vl` holds them to.
+const SORTED_SETS = ["klIrNode", "klRhs"];
 // An IR kind name: an `R`, `S`, `O` or `P` variant (`RListGet`, `SLet`, `OVar`, `PStaged`).
 const KIND = /^[RSOP][A-Z][A-Za-z0-9]*$/;
 const ARM_MIN = 4;
@@ -53,6 +58,48 @@ export function packedSets(src: string, names: string[]): string[] {
   return out;
 }
 
+// The first member of `names` out of sorted order, as `prev > next`, or null when sorted.
+function firstUnsorted(names: string[]): string | null {
+  for (let i = 1; i < names.length; i++) {
+    if (names[i - 1] > names[i]) return `${names[i - 1]} > ${names[i]}`;
+  }
+  return null;
+}
+
+// Each multi-line or-pattern arm of `src` (`A |`, `  B |`, `  C => …`) whose patterns are not
+// sorted, as `line: prev > next`.
+export function unsortedArms(src: string): string[] {
+  const out: string[] = [];
+  const lines = src.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const first = /^\s+([A-Z]\w*) \|$/.exec(lines[i]);
+    if (!first || !KIND.test(first[1]) || /\|$/.test(lines[i - 1] ?? "")) continue;
+    const pats = [first[1]];
+    for (let j = i + 1; j < lines.length; j++) {
+      const m = /^\s+([A-Z]\w*)( \||\s*=>)/.exec(lines[j]);
+      if (!m) break;
+      pats.push(m[1]);
+      if (m[2] !== " |") break;
+    }
+    const bad = pats.every((p) => KIND.test(p)) ? firstUnsorted(pats) : null;
+    if (bad) out.push(`${i + 1}: ${bad}`);
+  }
+  return out;
+}
+
+// The members of union `name` in `src`, in source order.
+function unionMembers(src: string, name: string): string[] {
+  const m = new RegExp(`^export type ${name} = ([\\s\\S]*?)(?=\\n\\n|\\n(?:export |//|const |function ))`, "m")
+    .exec(src);
+  return m ? m[1].split("|").map((x) => x.trim()) : [];
+}
+
+// The elements of closed set `name` in `src`, in source order.
+function setMembers(src: string, name: string): string[] {
+  const m = new RegExp(`^const ${name} = \\[([\\s\\S]*?)\\]`, "m").exec(src);
+  return m ? m[1].split(",").map((x) => x.trim()).filter((x) => x.length > 0) : [];
+}
+
 Deno.test("ir lists layout: the detector reds on a packed arm, union line and set (control)", () => {
   const arm = "  return match r {\n    RA | RB | RC | RD => 1\n  }\n";
   const cont = "    RA |\n      RB | RC |\n      RD => 1\n";
@@ -71,9 +118,17 @@ Deno.test("ir lists layout: the detector reds on a packed arm, union line and se
   if (sets.length !== 1 || !sets[0].startsWith("klA")) {
     throw new Error(`packed sets: want [klA], got ${JSON.stringify(sets)}`);
   }
+  const order = [
+    "    RA |\n      RC |\n      RB => 1\n",
+    "    RA |\n      RB |\n      RC => 1\n",
+  ].map((s) => unsortedArms(s).length);
+  if (order.join() !== "1,0") throw new Error(`unsorted arms: want 1,0, got ${order.join()}`);
+  if (firstUnsorted(["RB", "RA"]) === null || firstUnsorted(["RA", "RB"]) !== null) {
+    throw new Error("firstUnsorted: want RB > RA named and RA, RB sorted");
+  }
 });
 
-Deno.test("ir lists layout: the IR kind lists are one member per line", async () => {
+Deno.test("ir lists layout: the IR kind lists are one member per line, sorted", async () => {
   const found: string[] = [];
   for (const f of ARM_FILES) {
     const src = await Deno.readTextFile(ROOT + f);
@@ -88,9 +143,23 @@ Deno.test("ir lists layout: the IR kind lists are one member per line", async ()
   }
   const lint = await Deno.readTextFile(ROOT + "compiler/lint.vl");
   for (const s of packedSets(lint, SETS)) found.push(`compiler/lint.vl: ${s}`);
+  for (const f of ARM_FILES) {
+    const src = await Deno.readTextFile(ROOT + f);
+    for (const l of unsortedArms(src)) found.push(`${f}:${l} (arm not sorted)`);
+    if (f === "compiler/ir.vl") {
+      for (const u of UNIONS) {
+        const bad = firstUnsorted(unionMembers(src, u));
+        if (bad) found.push(`${f}: type ${u} not sorted (${bad})`);
+      }
+    }
+  }
+  for (const n of SORTED_SETS) {
+    const bad = firstUnsorted(setMembers(lint, n));
+    if (bad) found.push(`compiler/lint.vl: ${n} not sorted (${bad})`);
+  }
   if (found.length > 0) {
     throw new Error(
-      `want every IR kind list one member per line (order unchanged), got ${found.length} packed:\n` +
+      `want every IR kind list one member per line in sorted order, got ${found.length}:\n` +
         found.join("\n"),
     );
   }
