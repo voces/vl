@@ -60,19 +60,26 @@ At the coordinator's ruling, an index read of a `??` whose default is a list lit
 literals is a named miss (`index of a coalesced nested list literal`), pinned by
 `tests/ir-shadow-rows/coalesced-nested-list-index.vl`. The span rows are IR-N3's to fix.
 
-## Readings (base: step 3's fixpoint seed; candidate fixpoint)
+## Step 7: a tagged call's lambda arm
 
-| reading | step 3 | steps 4 and 5 |
+A tagged call whose arm calls a hole lambda missed (`tag dispatch lambda arm`): legacy stages the
+arm's callee at the lambda's instance for this call's signature (`emitArmRowFe`,
+`elabArmStagePush`). `lambdaArmFe` asks the same row (`monoBundleReadFe` at `elabArmSigAt`), and
+the arm is a direct call of that slot, through `directCallAt`, the tail of `callRhs` now split out.
+The arm's result must be the dispatch's rep as it stands; its temp takes the dispatch's type.
+
+## Readings (base: step 3 merged with master `8239565e`, fixpoint; candidate fixpoint)
+
+| reading | step 3 | steps 4 to 7 |
 | --- | ---: | ---: |
-| corpus functions with no blocker (census) | 42,329 | 42,343 (+14) |
-| `tests/cases` functions with no blocker | 56,902 | 57,202 (+300) |
-| `tests/cases` `indirect call` (any) | 659 | 268 |
-| `tests/cases` `callee environment` + `callee captures` (any) | 433 | 229 |
-| armed `tests/cases` covered / matched | 56,902 / 56,888 | 57,202 / 57,187 |
-| L2 self-compile fuel | 104,961,271,984 | 105,049,308,095 (+0.084%) |
+| corpus functions with no blocker (census) | 42,735 | 42,758 (+23) |
+| `tests/cases` functions with no blocker | 57,283 | 57,942 (+659) |
+| self-compile functions with no blocker (each seed on its own tree) | 19,194 | 19,205 |
+| `tests/cases` `indirect call` (any) | 660 | 217 |
+| `tests/cases` `call of a non-declaration` (any) | 1,094 | 849 |
+| `tests/cases` `tag dispatch lambda arm` (any) | 190 | 0 |
+| armed `tests/cases` covered / matched | 57,283 / 57,270 | 57,942 / 57,929 |
+| L2 self-compile fuel (baseline 104,920,663,373) | | 105,089,012,929 (+0.16%) |
 
-The one new non-matching armed row is `tests/cases/maps/ref-list-values.vl`'s `go`. Until now it
-stopped at `indirect call`; it now reaches a `spans: read index` mismatch that master's seed
-shows on its own:
-`print((ms["z"] ?? [[{ v: -1 }]])[0][0].v)` over a `{[string]: S[][]}`. Code bytes are identical,
-and the `--names` spans differ; the chain is the `??`-then-index lowering's, not a closure's.
+Armed `tests/cases`: the 13 functions that do not match are `node-in array: differ` rows, the
+same on both seeds; there is no fail or mismatch row on either.
