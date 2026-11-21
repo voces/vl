@@ -385,6 +385,21 @@ export type SLoop = { lpLabel: i32, lpBody: i32[] }
 // loop around `xfBody`, `break` to `xfBrk` and `continue` to `xfCont`. A map walk reads map global
 // `xfMap` (recovered for `xfMapNonNull`), `xfList` then an unread immediate; with `xfMap` -1 a map
 // walk's `xfList` is its receiver, at a map rep.
+// A range loop legacy writes through its own helpers (`forRangeArm` "partial", or "rolled" with a
+// wrap exit) at `rlAt` into `rlVar`: the partial main loop's copies `rlCopies` (break to `rlBrk`,
+// continue to `rlConts[k]`), then the rolled loop's `rlTail` (`rlTailBrk`, `rlTailCont`). A
+// migration node that retires at I8 with `SForIn` (ir-design §1.2).
+export type SRangeLoop = {
+  rlAt: i32,
+  rlVar: i32,
+  rlPartial: boolean,
+  rlCopies: i32[][],
+  rlConts: i32[],
+  rlBrk: i32,
+  rlTail: i32[],
+  rlTailBrk: i32,
+  rlTailCont: i32,
+}
 export type SForIn = {
   xfList: Opnd,
   xfVar: i32,
@@ -453,6 +468,7 @@ export type IrNode = SLet
   | SBlock
   | SLoop
   | SForIn
+  | SRangeLoop
   | SIf
   | SSwitch
   | SCoalBox
@@ -685,6 +701,7 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         SBlock |
         SLoop |
         SForIn |
+        SRangeLoop |
         SSwitch |
         SCoalBox |
         SDrop |
@@ -773,6 +790,14 @@ export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
     SForIn => {
       bodies.push(n.xfBody)
       pos.push(0)
+    }
+    SRangeLoop => {
+      bodies.push(n.rlTail)
+      pos.push(0)
+      for c in n.rlCopies {
+        bodies.push(c)
+        pos.push(0)
+      }
     }
     SIf => {
       bodies.push(n.siElse)
@@ -1084,6 +1109,33 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
         + "\n"
         + bodyText(f, n.xfBody, d + 1)
     }
+    SRangeLoop => {
+      let t = p
+        + "range v"
+        + i32ToStr(n.rlVar)
+        + (if n.rlPartial { " partial" } else { " wrap" })
+        + "\n"
+      let k = 0
+      while k < n.rlCopies.length {
+        t = t
+          + p
+          + " copy "
+          + i32ToStr(k)
+          + " L"
+          + i32ToStr(n.rlConts[k])
+          + "\n"
+          + bodyText(f, n.rlCopies[k], d + 1)
+        k = k + 1
+      }
+      t
+        + p
+        + " rolled L"
+        + i32ToStr(n.rlTailBrk)
+        + " L"
+        + i32ToStr(n.rlTailCont)
+        + "\n"
+        + bodyText(f, n.rlTail, d + 1)
+    }
     SIf => {
       let s = p
         + "if "
@@ -1163,6 +1215,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       SBlock |
       SLoop |
       SForIn |
+      SRangeLoop |
       SIf |
       SBr |
       SReturn |

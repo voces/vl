@@ -85,6 +85,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
@@ -173,6 +174,7 @@ import {
   forRangeArm,
   forRangeRolledBlock,
   forRangeStaticStep,
+  forRangeTestOf,
   forRangeUnrollPlan,
   globalCtxNow,
   globalInitArmUnboxes,
@@ -232,6 +234,8 @@ import {
   popOrPlanOf,
   printArmOf,
   pushPlainWhy,
+  rangeMayWrap,
+  rangePartialCopies,
   recvReadsListPayload,
   refIfArmOf,
   shiftMaskFoldOf,
@@ -4807,6 +4811,13 @@ function nodeAssigns(ni: i32, v: i32): boolean {
     SBlock => bodyAssigns(n.bkBody, v)
     SLoop => bodyAssigns(n.lpBody, v)
     SForIn => n.xfVar == v || bodyAssigns(n.xfBody, v)
+    SRangeLoop => {
+      if n.rlVar == v || bodyAssigns(n.rlTail, v) { return true }
+      for c in n.rlCopies {
+        if bodyAssigns(c, v) { return true }
+      }
+      false
+    }
     SSwitch => {
       for arm in n.swArms {
         if bodyAssigns(arm.swBody, v) { return true }
@@ -5624,9 +5635,12 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
 // before the back edge; unrolled, a block of `forRangeUnrolled`'s copies.
 function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
   const arm = forRangeArm(n, ix, ibFnIx)
-  if arm != "rolled" && arm != "unrolled" { return skip("for range " + arm) }
   const why = forRangeRolledBlock(n, ix, ibFnIx)
-  if why != "" { return skip("for range " + why) }
+  // A partial loop, and a rolled one's wrap exit, are written by legacy's helpers (`SRangeLoop`).
+  const helpers = arm == "partial" || arm == "rolled" && why == "wrap exit"
+  if why != "" && !(helpers && why == "wrap exit") {
+    return skip("for range " + why)
+  }
   // Inside a list reserve region legacy's pushes append through its locals (D3623).
   for e in ibReserveEnd {
     if e >= 0 { return skip("for range in a reserve region") }
@@ -5659,6 +5673,7 @@ function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
     bound = o
   }
   if arm == "unrolled" { return forRangeUnrolled(b, n, ix, v) }
+  if helpers { return forRangeHelperLoop(b, n, ix, v, arm == "partial") }
   const brk = labelNew()
   const top = labelNew()
   const hasCont = blockHasContinueFor(n.frBody, n.frLabel, false)
@@ -5771,6 +5786,78 @@ function forRangeUnrolled(b: i32[], n: ForRange, ix: i32, v: i32): i32 {
   if ibMiss != "" { return 0 }
   irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
   return 0
+}
+
+// Legacy's partial or wrapping range loop `n` into `v` (`SRangeLoop`): a partial one's main loop
+// holds `rangePartialCopies` copies of the body, as legacy's plan says, then the rolled loop's.
+function forRangeHelperLoop(
+  b: i32[],
+  n: ForRange,
+  ix: i32,
+  v: i32,
+  partial: boolean,
+): i32 {
+  const rt = forRangeTestOf(n, ix, ibFnIx)
+  const copies: i32[][] = []
+  const conts: i32[] = []
+  const brk = if partial { labelNew() } else { -1 }
+  const hasCont = blockHasContinueFor(n.frBody, n.frLabel, false)
+  if partial {
+    const nc = rangePartialCopies(rt, rangeMayWrap(n, rt))
+    ibLoopName.push(n.frLabel)
+    ibLoopBrk.push(brk)
+    let k = 0
+    while k < nc && ibMiss == "" {
+      const cont = if hasCont { labelNew() } else { brk }
+      ibLoopCont.push(cont)
+      copies.push(rangeBodyOf(n))
+      ibLoopCont.pop()
+      conts.push(cont)
+      k = k + 1
+    }
+    ibLoopName.pop()
+    ibLoopBrk.pop()
+  }
+  const tailBrk = labelNew()
+  const tailCont = labelNew()
+  ibLoopName.push(n.frLabel)
+  ibLoopBrk.push(tailBrk)
+  ibLoopCont.push(tailCont)
+  const tail = rangeBodyOf(n)
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  ibLoopCont.pop()
+  if ibMiss != "" { return 0 }
+  irBNode(
+    b,
+    {
+      rlAt: ix,
+      rlVar: v,
+      rlPartial: partial,
+      rlCopies: copies,
+      rlConts: conts,
+      rlBrk: brk,
+      rlTail: tail,
+      rlTailBrk: tailBrk,
+      rlTailCont: tailCont,
+    },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  return 0
+}
+
+// The IR's body of range loop `n`, built afresh.
+function rangeBodyOf(n: ForRange): i32[] {
+  const fb: i32[] = []
+  const body = nodeAt(n.frBody)
+  if body is Block {
+    stmtRun(fb, body.blkStmts)
+  } else {
+    stmt(fb, n.frBody, NO_SIBS, -1)
+  }
+  return fb
 }
 
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {

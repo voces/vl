@@ -34365,6 +34365,24 @@ export function forRangeRolledBlock(
   return ""
 }
 
+// Range loop `s`'s test (statement `stmtIx` of `fnIx`) at the locals its collect pass declared:
+// the loop var, then the bound unless it is constant. A static step only.
+export function forRangeTestOf(s: ForRange, stmtIx: i32, fnIx: i32): RangeTest {
+  const slot = declaredSlotOfDecl(stmtIx)
+  const bConst = rangeConstIs(s.frTo, fnIx)
+  const rt: RangeTest = {
+    vIdx: if slot >= 0 { declaredIndexAt(fnIx, slot) } else { -1 },
+    bIdx: if slot >= 0 { declaredIndexAt(fnIx, slot + 1) } else { -1 },
+    bConst: bConst,
+    bVal: if bConst { rangeConstVal(s.frTo, fnIx) } else { 0 },
+    sIdx: -1,
+    dynStep: false,
+    stepK: forRangeStaticStep(s),
+    excl: s.frExcl,
+  }
+  return rt
+}
+
 // The static step of range loop `s`: 1 when it has none, else its folded integer literal; 0 when
 // none folds into an `i32`, a step the checker refuses.
 export function forRangeStaticStep(s: ForRange): i32 {
@@ -34384,7 +34402,7 @@ export function forRangeStaticStep(s: ForRange): i32 {
 
 // A range loop's continue test, its operands resolved: the loop var's local, the bound's local
 // or constant, and the step's local or constant. `excl` is the half-open `until`.
-type RangeTest = {
+export type RangeTest = {
   vIdx: i32,
   bIdx: i32,
   bConst: boolean,
@@ -34446,7 +34464,7 @@ function rangeTestHolds(rt: RangeTest, v: i32): boolean {
 // Whether advancing range `s`'s loop var by its step can leave the i32 range before the test
 // ends it: a dynamic step, a body that writes the var, an inclusive or wider-stepped range to a
 // bound the step can pass the edge from, or a constant bound within one step of the edge.
-function rangeMayWrap(s: ForRange, rt: RangeTest): boolean {
+export function rangeMayWrap(s: ForRange, rt: RangeTest): boolean {
   if rt.dynStep || stmtAssignsName(s.frBody, s.frVar) { return true }
   const intMax = 2147483647
   const intMin = -2147483647 - 1
@@ -34505,6 +34523,14 @@ function emitRangeRolled(
   rt: RangeTest,
   wraps: boolean,
 ) {
+  const frHasCont = emitRangeRolledHead(s, rt)
+  if emitStmts(s.frBody, fnIx) < 0 { return -1 }
+  return emitRangeRolledTail(rt, wraps, frHasCont)
+}
+
+// The rolled loop's block, loop and exit test, and the inner block a `continue` to it lands at
+// the end of, so it still steps; true when that block is open, for `emitRangeRolledTail`.
+export function emitRangeRolledHead(s: ForRange, rt: RangeTest): boolean {
   fbBlock(64) // 0x02 block, void
   loopBrkDepth.push(ctrlDepth)
   loopBrkLabel.push(s.frLabel)
@@ -34514,22 +34540,27 @@ function emitRangeRolled(
   emitRangeTest(rt)
   fbI32Eqz()  // 0x45 invert: exit when out of range
   fbBrIf(1)   // 0x0d br_if -> break out of block
-  // a body with a `continue` binding to this loop needs an inner block as the continue
-  // target: branching to its end falls into the increment (a branch to the loop header
-  // would skip it — an infinite loop). The inner block carries the loop's label too.
   const frHasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
   if frHasCont {
     fbBlock(64) // continue block
     loopContDepth.push(ctrlDepth)
     loopContLabel.push(s.frLabel)
   }
-  if emitStmts(s.frBody, fnIx) < 0 { return -1 }
+  return frHasCont
+}
+
+// The rolled loop after its body: the continue block's end, the wrap exit where a step can leave
+// the i32 range (D12181), the step and the back edge.
+export function emitRangeRolledTail(
+  rt: RangeTest,
+  wraps: boolean,
+  frHasCont: boolean,
+) {
   if frHasCont {
     fbEnd() // end continue block — `continue` lands here
     loopContDepth.pop()
     loopContLabel.pop()
   }
-  // A step that would leave the i32 range is past every bound, so it ends the loop (D12181).
   if wraps { emitRangeWrapExit(rt) }
   // v = v + K
   fbLocalGet(rt.vIdx)
@@ -34623,85 +34654,139 @@ function emitRangePartial(
   rt: RangeTest,
   wraps: boolean,
 ) {
-  fbBlock(64) // 0x02 block, void — the `break` target of both loops
-  loopBrkDepth.push(ctrlDepth)
-  loopBrkLabel.push(s.frLabel)
-  // A trip whose last step could reach past the i32 range stops one step short, leaving the
-  // rest to the guarded rolled loop (D12181).
-  let d = PARTIAL_UNROLL_COPIES - 1
-  if !rt.excl && !wraps { d = d - 1 }
-  const intMin = -2147483647 - 1
-  // A constant bound too low to subtract from runs no main trip at all.
-  const mainRuns = !rt.bConst || rt.bVal >= intMin + d
-  if mainRuns {
-    let limSlot = -1
-    if !rt.bConst {
-      // lim = bound >= INT_MIN + d ? bound - d : INT_MIN
-      limSlot = strI32Slot()
-      fbLocalGet(rt.bIdx)
-      fbI32Const(d)
-      fbI32Bin(107) // 0x6b i32.sub
-      fbI32Const(intMin)
-      fbLocalGet(rt.bIdx)
-      fbI32Const(intMin + d)
-      fbI32Bin(78)  // 0x4e i32.ge_s
-      fbSelect()
-      fbLocalSet(limSlot)
-    }
-    const uSlot = strI32Slot()
-    fbBlock(64)  // 0x02 block, void — the main loop's exit
-    fbLoop(64)   // 0x03 loop, void
-    fbLocalGet(rt.vIdx)
-    if rt.bConst { fbI32Const(rt.bVal - d) } else { fbLocalGet(limSlot) }
-    fbI32Bin(72) // 0x48 i32.lt_s
-    fbI32Eqz()
-    fbBrIf(1)    // leave the main loop
-    fbLocalGet(rt.vIdx)
-    fbLocalSet(uSlot)
+  rangePartialOuterOpen(s)
+  const uSlot = rangePartialMainOpen(rt, wraps)
+  if uSlot >= 0 {
     const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
     const cursor0 = emitLetCursor
     let k = 0
     while k < PARTIAL_UNROLL_COPIES {
       emitLetCursor = cursor0
-      if k > 0 {
-        fbLocalGet(uSlot)
-        fbI32Const(k)
-        fbI32Bin(106) // 0x6a i32.add
-        fbLocalSet(rt.vIdx)
-      }
-      urSlot.push(rt.vIdx)
-      urVal.push(k)
-      urBase.push(uSlot)
-      if hasCont {
-        fbBlock(64) // this copy's continue block
-        loopContDepth.push(ctrlDepth)
-        loopContLabel.push(s.frLabel)
-      }
+      rangePartialCopyOpen(s, rt, uSlot, k, hasCont)
       const rc = emitStmts(s.frBody, fnIx)
-      if hasCont {
-        fbEnd()
-        loopContDepth.pop()
-        loopContLabel.pop()
-      }
-      urSlot.pop()
-      urVal.pop()
-      urBase.pop()
+      rangePartialCopyClose(hasCont)
       if rc < 0 { return -1 }
       k = k + 1
     }
     emitLetCursor = cursor0
-    fbLocalGet(uSlot)
-    fbI32Const(PARTIAL_UNROLL_COPIES)
-    fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(rt.vIdx)
-    fbBr(0)       // next main trip
-    fbEnd()       // end loop
-    fbEnd()       // end block
+    rangePartialMainClose(rt, uSlot)
   }
   if emitRangeRolled(s, fnIx, rt, wraps) < 0 { return -1 }
-  fbEnd() // end block
+  return rangePartialOuterClose()
+}
+
+// The block that is the `break` target of a partially unrolled range loop's main and rolled loops.
+export function rangePartialOuterOpen(s: ForRange) {
+  fbBlock(64) // 0x02 block, void
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.frLabel)
+  return 0
+}
+
+export function rangePartialOuterClose() {
+  fbEnd()
   loopBrkDepth.pop()
   loopBrkLabel.pop()
+  return 0
+}
+
+// The main loop's last value before a trip, `d` below the bound: a trip whose last step could
+// reach past the i32 range stops one step short, leaving the rest to the guarded rolled loop
+// (D12181).
+function partialTripSpan(rt: RangeTest, wraps: boolean): i32 {
+  let d = PARTIAL_UNROLL_COPIES - 1
+  if !rt.excl && !wraps { d = d - 1 }
+  return d
+}
+
+// The copies a partially unrolled range loop's main loop runs its body in: `PARTIAL_UNROLL_COPIES`,
+// or none where a constant bound too low to subtract from runs no main trip.
+export function rangePartialCopies(rt: RangeTest, wraps: boolean): i32 {
+  const intMin = -2147483647 - 1
+  const mainRuns = !rt.bConst || rt.bVal >= intMin + partialTripSpan(rt, wraps)
+  return if mainRuns { PARTIAL_UNROLL_COPIES } else { 0 }
+}
+
+// The main loop's head where it runs (`rangePartialCopies`): its bound `lim` for a non-constant
+// bound, the trip base `u`, its block, loop and exit test, `u = v`; `u`'s local, else -1.
+export function rangePartialMainOpen(rt: RangeTest, wraps: boolean): i32 {
+  if rangePartialCopies(rt, wraps) == 0 { return -1 }
+  const d = partialTripSpan(rt, wraps)
+  const intMin = -2147483647 - 1
+  let limSlot = -1
+  if !rt.bConst {
+    // lim = bound >= INT_MIN + d ? bound - d : INT_MIN
+    limSlot = strI32Slot()
+    fbLocalGet(rt.bIdx)
+    fbI32Const(d)
+    fbI32Bin(107) // 0x6b i32.sub
+    fbI32Const(intMin)
+    fbLocalGet(rt.bIdx)
+    fbI32Const(intMin + d)
+    fbI32Bin(78)  // 0x4e i32.ge_s
+    fbSelect()
+    fbLocalSet(limSlot)
+  }
+  const uSlot = strI32Slot()
+  fbBlock(64)  // 0x02 block, void — the main loop's exit
+  fbLoop(64)   // 0x03 loop, void
+  fbLocalGet(rt.vIdx)
+  if rt.bConst { fbI32Const(rt.bVal - d) } else { fbLocalGet(limSlot) }
+  fbI32Bin(72) // 0x48 i32.lt_s
+  fbI32Eqz()
+  fbBrIf(1)    // leave the main loop
+  fbLocalGet(rt.vIdx)
+  fbLocalSet(uSlot)
+  return uSlot
+}
+
+// Copy `k` of the main loop's body: the loop var set to `u + k`, its reads made `u + k`
+// (`urLocalRead`), and the copy's continue block where a `continue` lands at its end.
+export function rangePartialCopyOpen(
+  s: ForRange,
+  rt: RangeTest,
+  uSlot: i32,
+  k: i32,
+  hasCont: boolean,
+) {
+  if k > 0 {
+    fbLocalGet(uSlot)
+    fbI32Const(k)
+    fbI32Bin(106) // 0x6a i32.add
+    fbLocalSet(rt.vIdx)
+  }
+  urSlot.push(rt.vIdx)
+  urVal.push(k)
+  urBase.push(uSlot)
+  if hasCont {
+    fbBlock(64) // this copy's continue block
+    loopContDepth.push(ctrlDepth)
+    loopContLabel.push(s.frLabel)
+  }
+  return 0
+}
+
+export function rangePartialCopyClose(hasCont: boolean) {
+  if hasCont {
+    fbEnd()
+    loopContDepth.pop()
+    loopContLabel.pop()
+  }
+  urSlot.pop()
+  urVal.pop()
+  urBase.pop()
+  return 0
+}
+
+// The main loop's step past its copies and back edge, then its loop's and block's ends.
+export function rangePartialMainClose(rt: RangeTest, uSlot: i32) {
+  fbLocalGet(uSlot)
+  fbI32Const(PARTIAL_UNROLL_COPIES)
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(rt.vIdx)
+  fbBr(0)       // next main trip
+  fbEnd()       // end loop
+  fbEnd()       // end block
   return 0
 }
 
@@ -34773,6 +34858,23 @@ function getterRangeTrips(stmtIx: i32, fnIx: i32): i32 {
   const t = constRangeTrips(stmtIx, UNROLL_MAX_TRIPS + 1)
   if t > UNROLL_MAX_TRIPS { return -1 }
   return t
+}
+
+// Writes the read of local `idx` where an unrolled range loop's copy binds it: its constant in a
+// full unroll, its trip base plus the copy's offset in a partial one; false where none does.
+export function urLocalRead(idx: i32): boolean {
+  const urAt = unrolledSlotAt(idx)
+  if urAt < 0 { return false }
+  if urBase[urAt] < 0 {
+    fbI32Const(urVal[urAt])
+    return true
+  }
+  fbLocalGet(urBase[urAt])
+  if urVal[urAt] != 0 {
+    fbI32Const(urVal[urAt])
+    fbI32Bin(106) // 0x6a i32.add
+  }
+  return true
 }
 
 // The innermost unrolled copy whose loop var is local `idx`, or -1.
@@ -37794,20 +37896,7 @@ function emitIdentNonLocalRead(e: Ident, isid: i32, exprIx: i32, fnIx: i32) {
 // The read at `exprIx` from its local `idx`, or an unrolled range variable's constant.
 // Returns 0.
 function emitIdentLocalRead(exprIx: i32, idx: i32, fnIx: i32) {
-  // A fully unrolled range loop's variable reads as its copy's constant.
-  const urAt = unrolledSlotAt(idx)
-  if urAt >= 0 {
-    if urBase[urAt] < 0 {
-      fbI32Const(urVal[urAt])
-      return 0
-    }
-    fbLocalGet(urBase[urAt])
-    if urVal[urAt] != 0 {
-      fbI32Const(urVal[urAt])
-      fbI32Bin(106) // 0x6a i32.add
-    }
-    return 0
-  }
+  if urLocalRead(idx) { return 0 }
   fbLocalGet(idx)
   if localNulStrRecovers(exprIx, fnIx) { fbRefAsNonNull() }
   return 0

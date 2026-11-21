@@ -1,3 +1,4 @@
+import { blockHasContinueFor } from "./emit_query"
 // The IR lowering (ir-design-2026-11.md §1.6) for I1's node set, and the shadow's dual emit: a
 // covered function's IR is lowered to a code entry, which is compared with the legacy one
 // byte for byte, beside its statement spans. A temp goes back onto the stack at its one use,
@@ -174,6 +175,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
@@ -291,6 +293,8 @@ import {
   emitNarrowedMapReadTail,
   emitNullOwn,
   emitNullRetTail,
+  emitRangeRolledHead,
+  emitRangeRolledTail,
   emitStrLitAt,
   emitUnionNullToPair,
   emitUnionUnboxTail,
@@ -318,6 +322,7 @@ import {
   forInMapList,
   forInMapStash,
   forInRolledOpen,
+  forRangeTestOf,
   hoistCandRow,
   hoistReadTail,
   hoistRowMark,
@@ -387,6 +392,14 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  rangeMayWrap,
+  rangePartialCopies,
+  rangePartialCopyClose,
+  rangePartialCopyOpen,
+  rangePartialMainClose,
+  rangePartialMainOpen,
+  rangePartialOuterClose,
+  rangePartialOuterOpen,
   sFieldStorageSlot,
   sharedArmBoxBody,
   sharedArmBoxHead,
@@ -413,6 +426,7 @@ import {
   unionBoxToPairTail,
   unionLetSinkClose,
   unionUnionEqTail,
+  urLocalRead,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -612,7 +626,8 @@ export function irLOpnd(o: Opnd) {
       const s = varSlot(v)
       if s < 0 { return irLMiss("unmapped slot") }
       leaf()
-      fbLocalGet(s)
+      // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
+      if !urLocalRead(s) { fbLocalGet(s) }
     }
     OImm => {
       leaf()
@@ -1640,16 +1655,73 @@ function forIn(n: SForIn, pending: i32[]) {
   return 0
 }
 
+// `SRangeLoop`: legacy's partial or wrapping range loop in `emitForRangeStmt`'s order, its blocks
+// and loops written by legacy's helpers around the IR's bodies, the scratch slots taken in order.
+function rangeLoop(n: SRangeLoop, pending: i32[]) {
+  const fnIx = lw.irAt
+  if n.rlAt < 0 { return irLMiss("range node") }
+  const s = nodeAt(n.rlAt)
+  if !(s is ForRange) { return irLMiss("range node") }
+  const rt = forRangeTestOf(s, n.rlAt, fnIx)
+  if rt.vIdx < 0 || rt.vIdx != varSlot(n.rlVar) { return irLMiss("range slot") }
+  const wraps = rangeMayWrap(s, rt)
+  irLSettle(pending)
+  scopeBind(s.frVar, declaredSlotOfDecl(n.rlAt))
+  let kb = 0
+  if n.rlPartial {
+    if n.rlCopies.length != rangePartialCopies(rt, wraps) {
+      return irLMiss("range copies")
+    }
+    let d0 = ctrlDepth
+    rangePartialOuterOpen(s)
+    kb = loopFrames(n.rlBrk, -1, d0)
+    d0 = ctrlDepth
+    const u = rangePartialMainOpen(rt, wraps)
+    const km = loopFrames(n.rlBrk, -1, d0)
+    const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+    let k = 0
+    while k < n.rlCopies.length {
+      d0 = ctrlDepth
+      rangePartialCopyOpen(s, rt, u, k, hasCont)
+      const kc = loopFrames(n.rlBrk, n.rlConts[k], d0)
+      body(n.rlCopies[k], false, -1, false)
+      framesPop(kc)
+      rangePartialCopyClose(hasCont)
+      k = k + 1
+    }
+    if u >= 0 { rangePartialMainClose(rt, u) }
+    framesPop(km)
+  }
+  const d1 = ctrlDepth
+  const hasTailCont = emitRangeRolledHead(s, rt)
+  const kt = loopFrames(n.rlTailBrk, n.rlTailCont, d1)
+  body(n.rlTail, false, -1, false)
+  framesPop(kt)
+  emitRangeRolledTail(rt, wraps, hasTailCont)
+  if n.rlPartial {
+    framesPop(kb)
+    rangePartialOuterClose()
+  }
+  scopeUnbind()
+  return 0
+}
+
 // Pushes a frame for each block legacy opened past depth `d0`: the walk's break block and its
 // current continue target carry its labels. Returns the count, for `framesPop`.
 function walkFrames(n: SForIn, d0: i32): i32 {
+  return loopFrames(n.xfBrk, n.xfCont, d0)
+}
+
+// Pushes a frame for each block legacy opened past depth `d0`: its innermost break block and
+// continue target carry labels `brk` and `cont`. Returns the count, for `framesPop`.
+function loopFrames(brk: i32, cont: i32, d0: i32): i32 {
   const brkAt = if loopBrkDepth.length > 0 { loopBrkDepth[loopBrkDepth.length - 1] } else { -1 }
   const contAt = if loopContDepth.length > 0 { loopContDepth[loopContDepth.length - 1] } else { -1 }
   let k = 0
   while d0 + k < ctrlDepth {
     const at = d0 + 1 + k
     lwFrames.push(
-      if at == brkAt { n.xfBrk } else if at == contAt { n.xfCont } else { -1 },
+      if at == brkAt { brk } else if at == contAt { cont } else { -1 },
     )
     k = k + 1
   }
@@ -2393,6 +2465,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbEnd()
     }
     SForIn => forIn(n, pending)
+    SRangeLoop => rangeLoop(n, pending)
     SIf => irLMiss("an `if` outside a body walk")
     SBr => {
       if n.brHas {
