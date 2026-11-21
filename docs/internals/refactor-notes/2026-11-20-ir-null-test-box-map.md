@@ -42,3 +42,26 @@ does every set it was in.
 
 The shadow pin for a field store of a short-circuit value now counts six covered functions.
 Its `coal`, `x != null` over `i32 | null`, was blocked by `null test boxTag` alone.
+
+## A gap the null test exposed in `tests/cases` (2026-11-21)
+
+The armed shadow over `tests/cases` found 11 verifier failures the corpus did not:
+`a shared read's receiver is a box`. Each is a shared field read off a `U | null` parameter after
+`u != null`. The null test had blocked these functions; once it built, `RSharedRead`'s receiver was
+the discipline-4 box `irBBoxLocal` returns, and the verifier admitted only `RBox`. The local is the box
+itself, and legacy reads the same local, so the verifier now admits discipline 4 there, as its
+`RTest` rule does. Shadow row `SHARED_READ_NULLABLE_BOX` fails under the earlier seed and matches
+under this one.
+
+Re-measured against merge-base `f44a504b8`, with fixpoint seeds on both sides:
+
+| population | merge-base | this branch |
+| --- | ---: | ---: |
+| self-compile functions with no blocker | 19,131 | 19,146 |
+| self-compile covered = verified = matched | 19,131 | 19,146 |
+| self-compile claimed (mode 3) | 19,115 | 19,126 |
+| corpus covered = verified = matched (45,678) | 41,969 | 42,086 |
+| `tests/cases` covered / matched (armed shadow) | 54,334 / 54,320 | 54,620 / 54,607 |
+
+`tests/cases` gains no fail, differ or mismatch row; it loses one (`tag` in
+`unions/wide-union-forty-arms.vl`). L2 fuel is 104,735,848,765 → 104,742,819,335 (+0.007%).
