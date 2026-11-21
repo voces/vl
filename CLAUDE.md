@@ -11,6 +11,15 @@ notes into architecture-target's Status and the notes index.** That way lanes ne
 Likewise **a PR never edits `CHANGELOG.md`: it adds one `changelog.d/<branch>.md`** (`changelog.d/README.md`);
 the orchestrator folds them with `scripts/changelog-fold.vl`.
 
+## Rulings — nothing waits on the owner
+
+* **The coordinator rules** on every process and design question: gates, baselines, open
+  questions, `open-rulings.md` entries. A doc that says something waits on the owner means it
+  waits on the coordinator. Record a design ruling in `DECISIONS.md` and a process ruling where the
+  rule lives, with the reasoning and **who ruled**.
+* **Never record a ruling as the owner's** (or "under the owner's delegation") unless the owner
+  made it. The owner may overrule any ruling.
+
 ## `std:*` changes get a second pass — required
 
 * **Any change that adds or alters an export in `std/*.vl` MUST be reviewed by the
@@ -114,9 +123,9 @@ The parts:
 * **Self-compile fuel is gated per PR:** `scripts/self-compile-time.sh` reds on an L2 rise past
   **+1%** of `scripts/self-compile-baseline.json` (and past 1.5×). Accept a rise with
   `--write-baseline` from a fixpoint seed plus one line in `scripts/self-compile-ledger.txt` (fuel,
-  commit, PR, mechanism); a baseline the ledger's last line does not name reds. A coordinator drift
-  refresh also gives the cumulative rise since the last owner-ruled baseline; past **+3%**
-  cumulative it needs an owner ruling, named in the line (`merge-queue.md` §Fuel drift).
+  commit, PR, mechanism); a baseline the ledger's last line does not name reds. The coordinator
+  rules on a drift refresh; past **+3%** cumulative since the last attributed baseline it first
+  attributes the rise to PRs by measurement and names that in the line (`merge-queue.md` §Fuel drift).
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
   earned it runs `--write-baseline`, **written from a FIXPOINT seed** (refresh until a second
