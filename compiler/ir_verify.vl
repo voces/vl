@@ -28,6 +28,8 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvDrop,
+  REnvGet,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -123,6 +125,7 @@ import { simdCallRow, simdOperandPrim, simdResultPrim } from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
+import { fnFallThroughPadOf } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -413,7 +416,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
-    RCallHost => uses(r.chArgs, at)
+    RCallHost => {
+      uses(r.chArgs, at)
+      if r.chVoid && dst >= 0 {
+        return fail(2, at, "a void host call has no value")
+      }
+      0
+    }
     RBoxField => {
       use(r.bfV, at)
       const bf = repNodeAt(opRep(r.bfV))
@@ -438,7 +447,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           "a shared read's receiver is a variable read more than once",
         )
       }
-      if !(repNodeAt(opRep(r.srV)) is RBox) {
+      // A boxed `U | null` (discipline 4) is held in the same box.
+      const sn = repNodeAt(opRep(r.srV))
+      if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
       }
       0
@@ -694,11 +705,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RNulTest => {
       use(r.ntV, at)
       const d = repNodeAt(opRep(r.ntV))
-      if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
+      // A union box (discipline 4 included) answers by its null tag.
+      const box = d is RBox || d is RNullable && d.rnDisc == 4
+      if !box && (!(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner)) {
         return fail(
           2,
           at,
-          "a null test of neither a K | null nor a nullable reference",
+          "a null test of neither a K | null, a nullable reference nor a box",
         )
       }
       0
@@ -1002,6 +1015,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
     RCellNew => use(r.cnInit, at)
     RCellGet => use(r.cgCell, at)
+    REnvGet => 0
+    REnvDrop => 0
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
@@ -1179,18 +1194,20 @@ function coalNulRefWhy(n: SCoalBox): string {
   return ""
 }
 
-// Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar element, and its out is
-// at that element's rep.
+// Why a fused `pop ?? d` is ill-formed, or "": it pops a list of a scalar or atom element, and its
+// out is at that element's rep.
 function coalPopOrWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if !(lr is RList) { return "a `pop ?? d` pops no list" }
   const p = repPrim(lr.rlsElem)
+  // A literal-union list holds its atoms' i32 ids, and legacy pops it as a scalar list.
   const scalar = p != null
     && (p == "i32"
     || p == "i64"
     || p == "f64"
     || p == "f32"
     || p == "bool")
+    || repNodeAt(lr.rlsElem) is RAtom
   if !scalar { return "a `pop ?? d` pops a list of no scalar element" }
   const o = n.cbOut
   if o < 0 || o >= vf.irVars.length || vf.irVars[o].vRep != lr.rlsElem {
@@ -1231,7 +1248,11 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
 
 function nested(body: i32[]) {
   const nDefs = vfDefLog.length
-  for id in body { stmt(id) }
+  let prev = -1
+  for id in body {
+    stmt(id, prev)
+    prev = id
+  }
   while vfDefLog.length > nDefs {
     const d = vfDefLog.pop() ?? -1
     if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
@@ -1281,7 +1302,7 @@ function ifSpine(id0: i32) {
         nodeRepClosed(c)
         next = c
       } else {
-        stmt(c)
+        stmt(c, if pos[top] > 1 { ln.siElse[pos[top] - 2] } else { -1 })
       }
     } else {
       while vfDefLog.length > defs[top] {
@@ -1306,7 +1327,8 @@ function labelled(label: i32, out: i32, body: i32[]) {
   return 0
 }
 
-function stmt(id: i32) {
+// Checks node `id`, the node before it in its body `prev` (-1 for the first).
+function stmt(id: i32, prev: i32) {
   if vfRule != 0 { return 0 }
   if id < 0 || id >= vf.irNodes.length {
     return fail(5, id, "a body names no node")
@@ -1496,7 +1518,9 @@ function stmt(id: i32) {
     }
     SReturn => {
       const none = repIsNoValue(vf.irRetRep)
-      if n.rtHas == none {
+      // A return right after a trap is dead, so it carries no value whatever the result.
+      const dead = !n.rtHas && prev >= 0 && vf.irNodes[prev] is STrap
+      if n.rtHas == none && !dead {
         return fail(
           5,
           id,
@@ -1627,7 +1651,7 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RSimd | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | RRawOp | RRel | RStage => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RSimd | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | REnvGet | REnvDrop | RRawOp | RRel | RStage => false
   }
 }
 
@@ -1762,7 +1786,11 @@ export function irVerify(f: IrFn): IrVerdict {
       "the result's rep is " + repWhat(f.irRetRep) + ", not a closed rep",
     )
   }
-  for id in f.irBody { stmt(id) }
+  let prev = -1
+  for id in f.irBody {
+    stmt(id, prev)
+    prev = id
+  }
   // Rule 8, the bounds checks, is the list builder's (`ir_verify_bounds.vl`).
   if vfRule == 0 {
     const b = irBoundsRuleHook(f)
@@ -1775,8 +1803,13 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
   }
-  // Rule 5 at the end: a function with a result leaves its body on every path.
-  if !repIsNoValue(f.irRetRep) && !irBodyLeaves(f, f.irBody) {
+  // Rule 5 at the end: a function with a result leaves its body on every path, or falls into
+  // the `null` or `unreachable` the lowering pads its end with, as legacy does.
+  if (
+    !repIsNoValue(f.irRetRep)
+    && !irBodyLeaves(f, f.irBody)
+    && fnFallThroughPadOf(f.irAt) == ""
+  ) {
     fail(5, -1, "a valued function falls off its end")
   }
   const v: IrVerdict = { vfRule: vfRule, vfNode: vfAt, vfMsg: vfMsg }

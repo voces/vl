@@ -4,6 +4,7 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import { fnEnvIdxOf } from "./emit_capture_frames"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
@@ -65,6 +66,7 @@ import {
 import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
+  captureNamesOf,
   coalesceDefaultNullable,
   declaredIndexAt,
   exprVariantIndex,
@@ -97,6 +99,8 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvDrop,
+  REnvGet,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -262,7 +266,12 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitCapturedRead,
+  emitClosureIds,
   emitClosureValue,
+  emitEnvCacheClose,
+  emitEnvCacheDrop,
+  emitEnvCacheOpen,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapGetTail,
@@ -272,15 +281,16 @@ import {
   emitNullRetTail,
   emitStrLitAt,
   emitUnionUnboxTail,
+  envCacheSlotOfFe,
   f64RemCallTail,
   f64RemOperandTail,
-  fallThroughPadOf,
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
+  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -302,6 +312,7 @@ import {
   holeBoxHead,
   holeBoxTail,
   holeBoxTyAt,
+  hostCallTail,
   identListOverrideOf,
   idxRowsOn,
   idxSpanOn,
@@ -335,6 +346,7 @@ import {
   narrowedVariantTail,
   nulTestAtomTail,
   nulTestBoolTail,
+  nulTestBoxTagTail,
   nulTestRefTail,
   numCastTail,
   numIntrTail,
@@ -394,6 +406,7 @@ import {
   voidTailCallee,
 } from "./wasmEmit"
 import {
+  arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
   memRecvOwesNonNull,
@@ -422,7 +435,7 @@ import { fbOpenIf } from "./emit_bytes"
 import { atomHookArmOf, fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
-import { arrLitArmOf, forInLoopAt } from "./emit_plan_list"
+import { forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -435,6 +448,7 @@ import {
   fbEagerScratch,
   fbFrameParams,
   fnStmts,
+  fnStmtsPosOf,
   fnUses,
   gCellIdx,
   gHelpF64Rem,
@@ -821,8 +835,11 @@ function rhs(r: Rhs, tail: boolean) {
     RMapOp => mapOp(r)
     RListNew => listNew(r)
     RListCopy => irLMiss("list copy value")
-    RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RCallHost => hostCall(r)
+    RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
+    REnvGet => envGet(r)
+    REnvDrop => irLMiss("env drop as a value")
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1015,11 +1032,34 @@ function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 function makeClo(r: RMakeClo) {
-  if r.mcEnv.length > 0 { return irLMiss("closure env") }
-  leaf()
-  emitClosureValue(r.mcFn, lw.irAt)
+  if r.mcEnv.length > 0 {
+    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
+    const envIdx = fnEnvIdxOf(r.mcFn)
+    if envIdx < 0 { return irLMiss("closure env") }
+    // An environment this frame caches is built at its first read in an activation (D7480).
+    const ck = envCacheSlotOfFe(r.mcFn)
+    if ck >= 0 { emitEnvCacheOpen(ck) }
+    for o in r.mcEnv { irLOpnd(o) }
+    fbStructNew(envIdx)
+    if ck >= 0 { emitEnvCacheClose(ck) }
+    emitClosureIds(r.mcFn)
+  } else {
+    leaf()
+    emitClosureValue(r.mcFn, lw.irAt)
+  }
   if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
     fbRefAsNonNull()
+  }
+  return 0
+}
+
+// `REnvGet`: legacy's read of a capture from the function's environment, recovered at the read.
+function envGet(r: REnvGet) {
+  leaf()
+  const caps = captureNamesOf(fnStmtsPosOf(lw.irAt))
+  if r.evSlot < 0 || r.evSlot >= caps.length { return irLMiss("env slot") }
+  if emitCapturedRead(caps[r.evSlot], lw.irAt, r.evAt) != 1 {
+    return irLMiss("env read")
   }
   return 0
 }
@@ -1070,7 +1110,7 @@ function globalRead(sym: i32, nonNull: boolean) {
 }
 
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
-// sentinel's compare, or a nullable ref's `ref.is_null`.
+// sentinel's compare, a nullable ref's `ref.is_null`, or a union box's null tag compare.
 function nulTestOp(r: RNulTest) {
   if r.ntAt < 0 { return irLMiss("null test node") }
   const n = nodeAt(r.ntAt)
@@ -1090,7 +1130,11 @@ function nulTestOp(r: RNulTest) {
     irLOpnd(r.ntV)
     return nulTestBoolTail(r.ntInvert)
   }
-  // The builder makes `RNulTest` only at the four arms above.
+  if arm == "boxTag" {
+    irLOpnd(r.ntV)
+    return nulTestBoxTagTail(r.ntInvert)
+  }
+  // The builder makes `RNulTest` only at the five arms above.
   return irLMiss("null test " + arm)
 }
 
@@ -1311,6 +1355,14 @@ function simd(r: RSimd) {
   return simdTail(c, f.identName, row)
 }
 
+// `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
+function hostCall(r: RCallHost) {
+  for a in r.chArgs { irLOpnd(a) }
+  hostCallTail(r.chImport)
+  if r.chNever { fbUnreachable() }
+  return 0
+}
+
 // `RListCopy`: legacy's `__array_copy__` arm in `emitArrayCopyIntr`'s order, each list operand
 // followed by its backing read, then the copy, at `arrCopyPlanOf`'s pair.
 function listCopy(r: RListCopy) {
@@ -1335,7 +1387,7 @@ function makeList(r: RMakeList) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
-  const arm = arrLitArmOf(r.mlAt, fnIx, lb)
+  const arm = r.mlArm
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
@@ -1351,8 +1403,9 @@ function makeList(r: RMakeList) {
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
+    const sl = arrLitRefShortSlot(r.mlAt, fnIx, lb)
     return arrLitRefShortTail(
-      arrLitRefShortSlot(r.mlAt, fnIx, lb),
+      if sl >= 0 { sl } else { arrLitVariantSlot(r.mlAt, fnIx, lb) },
       r.mlElems.length,
     )
   }
@@ -1847,7 +1900,8 @@ function boxOp(r: RToBox) {
   const fnIx = lw.irAt
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
-  leaf()
+  // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
+  if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
   holeBoxHead(p, r.bxAt, fnIx)
   if (
     p.hbArm == "pass"
@@ -2186,10 +2240,22 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      if r is REnvDrop {
+        emitEnvCacheDrop(r.edFn)
+        irLSettle(pending)
+        return 0
+      }
       if r is RTagStash {
         irLOpnd(r.tgsV)
         tagStashTail()
         irLSettle(pending)
+        return 0
+      }
+      // A void import leaves nothing; any other host call's discarded value is dropped.
+      if r is RCallHost {
+        hostCall(r)
+        irLSettle(pending)
+        if !r.chVoid { fbDrop() }
         return 0
       }
       irLMiss("effect outside I1")
@@ -2820,8 +2886,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
   body(f.irBody, !valued && f.irAt >= 0, -1, false)
-  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
-  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
+  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
