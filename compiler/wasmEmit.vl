@@ -19584,69 +19584,56 @@ function leqgBaseOfRep(kind: i32, slot: i32) {
   return leqgBases[i]
 }
 
+// How `+` node `e` at `ix` is a list concat: not one, one legacy refuses (its operands resolve to
+// no one list rep, or an element kind with no concat), one whose operands are at the concat's
+// rep, or one that widens an operand first (`catWidenSideOfBin`). Legacy and the IR ask it.
+export type ListCatRoute = "none" | "refused" | "plain" | "widen"
+
+export function listCatRouteOf(e: BinExpr, ix: i32, fnIx: i32): ListCatRoute {
+  if e.binOp != "+" || exprIsStrConcat(ix, fnIx) { return "none" }
+  if binConcatRepUnresolved(ix, fnIx) { return "refused" }
+  if catListKindOfBin(ix, fnIx) > 0 {
+    return if catWidenSideOfBin(ix, fnIx) == 0 { "plain" } else { "widen" }
+  }
+  return match listOpKindOfBin(ix, fnIx) {
+    "none" => "none"
+    "i32list" => "plain"
+    "strlist" | "reflist" | "glist" | "str" | "closure" => "refused"
+  }
+}
+
 // i32-list CONCAT `a + b`: a NEW list sized exactly lenA + lenB (one backing
 // allocation, two bulk `array.copy`s) — the host's §VL.4 lowering. Both operands
 // are evaluated onto the stack before either is stored into the shared LEQI frame, so
 // a concat nested in the right operand cannot overwrite A (D2331).
-function emitListConcatI(leftIx: i32, rightIx: i32, fnIx: i32) {
-  const bA = leqIScratchBase
+function emitListConcatI(leftIx: i32, rightIx: i32, binIx: i32, fnIx: i32) {
   if emitExpr(leftIx, fnIx) < 0 { return -1 }
-  // A NARROWED nullable-list operand (`i32[] | null`, kind 15) keeps its nullable
-  // slot; the LEQI scratch slot is non-null, so recover before the store (the
-  // checker proved the operand guarded — the cast can never trap).
-  if exprNullableList(leftIx, fnIx) { fbRefAsNonNull() }
+  listCatOperandTail(leftIx, binIx, fnIx)
   if emitExpr(rightIx, fnIx) < 0 { return -1 }
-  if exprNullableList(rightIx, fnIx) { fbRefAsNonNull() }
-  fbLocalSet(bA + 1)    // B
-  fbLocalSet(bA + 0)    // A
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 1) // lenA
-  fbLocalGet(bA + 1)
-  fbStructGet(lTy(), 1) // lenB
-  fbI32Bin(106)         // i32.add
-  fbLocalSet(bA + 3)    // n = lenA + lenB
-  fbLocalGet(bA + 3)
-  fbArrayNewDefault(aTy())
-  fbLocalSet(bA + 2)    // out backing
-  // array.copy out 0 backingA 0 lenA
-  fbLocalGet(bA + 2)
-  fbI32Const(0)
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 0)
-  fbI32Const(0)
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 1)
-  fbArrayCopy(aTy(), aTy())
-  // array.copy out lenA backingB 0 lenB
-  fbLocalGet(bA + 2)
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 1)
-  fbLocalGet(bA + 1)
-  fbStructGet(lTy(), 0)
-  fbI32Const(0)
-  fbLocalGet(bA + 1)
-  fbStructGet(lTy(), 1)
-  fbArrayCopy(aTy(), aTy())
-  // the result wrapper { out, n, n }
-  fbLocalGet(bA + 2)
-  fbLocalGet(bA + 3)
-  fbLocalGet(bA + 3)
-  fbStructNew(lTy())
+  listCatOperandTail(rightIx, binIx, fnIx)
+  return listCatTail(binIx, fnIx)
+}
+
+// The recovery after list `+` operand `opIx` at concat `binIx` is on the stack: a NARROWED
+// nullable operand's cell still holds a `(ref null …)` while the frame slot is non-null. Legacy
+// and the IR share it.
+export function listCatOperandTail(opIx: i32, binIx: i32, fnIx: i32) {
+  if catListKindOfBin(binIx, fnIx) <= 0 {
+    if exprNullableList(opIx, fnIx) { fbRefAsNonNull() }
+    return 0
+  }
+  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
+  svSyncRecv(opIx, fnIx)
   return 0
 }
 
-// List concat over every other list rep — the rep-parameterised twin of `emitListConcatI`,
-// instruction for instruction: one backing allocation sized `lenA + lenB`, two
-// `array.copy`s, one wrapper. A second function rather than a parameter on the first
-// because the i32 list stages operands in the LEQI frame and every other rep in its own LCAT frame — different slot types, not just a different base.
-function emitListConcatG(
-  leftIx: i32,
-  rightIx: i32,
-  fnIx: i32,
-  kind: i32,
-  slot: i32,
-  widen: i32,
-) {
+// List `+` at `binIx` once both operands are on the stack: one backing allocation sized
+// `lenA + lenB`, two `array.copy`s, one wrapper, through the i32 list's LEQI frame or the rep's
+// own LCAT frame. Legacy and the IR share it.
+export function listCatTail(binIx: i32, fnIx: i32): i32 {
+  const kind = catListKindOfBin(binIx, fnIx)
+  if kind <= 0 { return listCatWrite(leqIScratchBase, lTy(), aTy()) }
+  const slot = catSlotOfBin(binIx, fnIx)
   const bA = lcatBaseOfRep(kind, slot)
   if bA < 0 {
     // The scan and the emitter read ONE home (`catListKindOfBin`), so a missing frame is
@@ -19656,12 +19643,11 @@ function emitListConcatG(
       "emitProgram: list concat frame was not reserved for this rep",
     )
   }
-  const wrap = catWrapIdxOf(kind, slot)
-  const back = catBackIdxOf(kind, slot)
-  // Both operands reach the stack before the frame is written: the frame is shared per
-  // rep, so a concat nested in the right operand would otherwise overwrite A (D2331).
-  if emitCatOperand(leftIx, fnIx, kind, slot, widen == 1) < 0 { return -1 }
-  if emitCatOperand(rightIx, fnIx, kind, slot, widen == 2) < 0 { return -1 }
+  return listCatWrite(bA, catWrapIdxOf(kind, slot), catBackIdxOf(kind, slot))
+}
+
+// The concat over frame `bA` (A, B, out, n) of wrapper `wrap` and backing `back`.
+function listCatWrite(bA: i32, wrap: i32, back: i32): i32 {
   fbLocalSet(bA + 1)   // B
   fbLocalSet(bA + 0)   // A
   fbLocalGet(bA + 0)
@@ -19700,11 +19686,35 @@ function emitListConcatG(
   return 0
 }
 
+// List concat over every other list rep — the rep-parameterised twin of `emitListConcatI`: each
+// operand at the concat's rep (`emitCatOperand`), then the shared tail over the rep's LCAT frame.
+// Both operands reach the stack before the frame is written: the frame is shared per rep, so a
+// concat nested in the right operand would otherwise overwrite A (D2331).
+function emitListConcatG(
+  leftIx: i32,
+  rightIx: i32,
+  binIx: i32,
+  fnIx: i32,
+  kind: i32,
+  slot: i32,
+  widen: i32,
+) {
+  if lcatBaseOfRep(kind, slot) < 0 { return listCatTail(binIx, fnIx) }
+  if emitCatOperand(leftIx, binIx, fnIx, kind, slot, widen == 1) < 0 {
+    return -1
+  }
+  if emitCatOperand(rightIx, binIx, fnIx, kind, slot, widen == 2) < 0 {
+    return -1
+  }
+  return listCatTail(binIx, fnIx)
+}
+
 // One operand of `emitListConcatG`, left on the stack at concat rep `(kind, slot)`. A `widen`
 // operand is of the narrower rep (`catWidenSideOfBin`) and is copied into the concat's: boxed
 // into a union-box row as a spread group is, or converted element-wise for a scalar list.
 function emitCatOperand(
   opIx: i32,
+  binIx: i32,
   fnIx: i32,
   kind: i32,
   slot: i32,
@@ -19732,11 +19742,7 @@ function emitCatOperand(
     return emitScalarListWidenTop(listKindElemKind(sk), dk)
   }
   if emitExpr(opIx, fnIx) < 0 { return -1 }
-  // A NARROWED nullable operand's cell still holds a `(ref null …)` while the frame slot
-  // is non-null — the same recovery the compare cores make, off the same one home.
-  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
-  svSyncRecv(opIx, fnIx)
-  return 0
+  return listCatOperandTail(opIx, binIx, fnIx)
 }
 
 // The reserved LCAT frame base for concat rep `(kind, slot)`, or -1, over the pair the
@@ -39853,29 +39859,27 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
   // elements) and list `+` (concat) — collections-design §VL.4/§VL.6, inlined rather than
   // helper calls. List `+` over a rep other than the i32 list is checked above the compare
   // dispatch, because `listOpKindOfBin` claims a string list it has no concat for.
-  if e.binOp == "+" {
+  const cat = listCatRouteOf(e, exprIx, fnIx)
+  if cat == "refused" {
+    return emitFail(
+      "emitProgram: list concat over this element kind is not supported",
+    )
+  }
+  if cat != "none" {
     const catK = catListKindOfBin(exprIx, fnIx)
-    if catK > 0 {
-      return emitListConcatG(
-        e.binLeft,
-        e.binRight,
-        fnIx,
-        catK,
-        catSlotOfBin(exprIx, fnIx),
-        catWidenSideOfBin(exprIx, fnIx),
-      )
-    }
+    if catK <= 0 { return emitListConcatI(e.binLeft, e.binRight, exprIx, fnIx) }
+    return emitListConcatG(
+      e.binLeft,
+      e.binRight,
+      exprIx,
+      fnIx,
+      catK,
+      catSlotOfBin(exprIx, fnIx),
+      catWidenSideOfBin(exprIx, fnIx),
+    )
   }
-  // Asked once and threaded into the concat and compare arms below, one node's answer.
+  // Asked once and threaded into the compare arms below, one node's answer.
   const lopK = listOpKindOfBin(exprIx, fnIx)
-  if lopK != "none" && e.binOp == "+" {
-    if lopK != "i32list" {
-      return emitFail(
-        "emitProgram: list concat over this element kind is not supported",
-      )
-    }
-    return emitListConcatI(e.binLeft, e.binRight, fnIx)
-  }
   if listEqArmOf(e, exprIx, fnIx, lopK) != "" {
     if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
     if listEqOperandTail(e.binLeft, fnIx) < 0 { return -1 }
