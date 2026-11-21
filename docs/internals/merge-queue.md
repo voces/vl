@@ -33,8 +33,9 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
 2. **Batch disjoint PRs.** PRs whose merge-trees touch no common file are merged into one candidate
    and gated once. When a batch is red, bisect it by halves. `scripts/queue-candidate.sh <base>
    <pr-branch>...` builds the candidate: it resolves a conflict only where both sides add list
-   members at one place (the union, sorted where the list is), and refuses any other, naming the
-   hunk, so that PR goes back to its lane.
+   members at one place (the union, sorted where the list is) or whole single-line arms or type
+   declarations with distinct heads (coordinator ruling, 2026-11-21), checks each resolved file
+   with `vl fmt --check`, and refuses any other, naming the hunk, so that PR goes back to its lane.
 3. **Gate the candidate**: `scripts/gate.sh` (in the queue's worktree, the one place
    `GATE_IN_WORKTREE=1` is set), then `scripts/ir-identity.sh --cases <seed>` on the seed the gate
    built. Read both by exit code.
