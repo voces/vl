@@ -147,6 +147,7 @@ import {
   RMapOp,
   RMapSet,
   RMemAccess,
+  RMemOp,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -385,6 +386,9 @@ import {
   memAccessPlanOf,
   memAccessTail,
   memAddrPlanOf,
+  memOpIsVoid,
+  memOpPlanOf,
+  memOpTail,
   narrowedMemTail,
   narrowedVariantTail,
   nicheRawIsTail,
@@ -980,6 +984,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RMemOp => memOp(r)
     RCallHost => hostCall(r)
     RCast => {
       // `as!` over a nullable-ref niche: `ref.as_non_null` traps on the miss (D1812).
@@ -1777,6 +1782,18 @@ function listNew(r: RListNew) {
   irLOpnd(r.lnFill)
   arrNewFillStep(-1)
   return arrNewTail(pl, slot)
+}
+
+// `RMemOp`: legacy's memory-management arm in `emitCallCoreMemOp`'s order, the operands then
+// `memOpTail`. Answers 1 for the bulk pair, which leaves nothing, else 0.
+function memOp(r: RMemOp): i32 {
+  const c = nodeAt(r.moAt)
+  if !(c is Call) { return irLMiss("memory op node") }
+  const pl = memOpPlanOf(c)
+  if pl.moFail != "" { return irLMiss("memory op plan") }
+  for o in r.moArgs { irLOpnd(o) }
+  memOpTail(pl.moArm)
+  return if memOpIsVoid(pl.moArm) { 1 } else { 0 }
 }
 
 // Whether call node `at` is a SIMD store, the one SIMD row that leaves nothing.
@@ -2818,6 +2835,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         memAccess(r)
         irLSettle(pending)
         if r.mmArgs.length == 1 { fbDrop() }
+        return 0
+      }
+      // The bulk pair leaves nothing; any other memory op's discarded value is dropped.
+      if r is RMemOp {
+        const v = memOp(r)
+        irLSettle(pending)
+        if v == 0 { fbDrop() }
         return 0
       }
       if r is REnvDrop {
