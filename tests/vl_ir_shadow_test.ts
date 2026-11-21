@@ -1956,6 +1956,24 @@ Deno.test({
   },
 });
 
+// A value `if` joined at an atom (a literal union, or one nullable at the `-1` niche) is an `i32`
+// `if`, each arm its atom: a plain, a nullable and an `else if` chain join build and match.
+const ATOM_JOIN =
+  `type Op = "add" | "sub" | "mul"\nfunction a1(n: i32, d: Op, e: Op): Op {\n  const o: Op = if n > 0 { d } else { e }\n  return o\n}\nfunction a2(n: i32, d: Op): Op | null {\n  const o: Op | null = if n > 0 { d } else { null }\n  return o\n}\nfunction a3(n: i32, d: Op): Op {\n  const o: Op = if n > 0 { d } else if n < 0 { "mul" } else { d }\n  return o\n}\nprint(a1(1, "add", "sub"))\nprint(a2(0, "add") ?? "none")\nprint(a3(-1, "sub"))\n`;
+Deno.test({
+  name: "ir shadow: a value if joined at an atom builds as an i32 if and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ATOM_JOIN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want a1, a2 and a3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
