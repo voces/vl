@@ -27493,12 +27493,15 @@ function emitCallRefArg(
     "armUnbox" => {
       const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-      if exprUnion(args[i], fnIx) {
-        if variantHasCrossTagFits(cvSlot, args[i], fnIx) {
+      match armUnboxPlanOf(cvSlot, args[i], fnIx) {
+        "asIs" => {}
+        "crossTag" => {
           return emitFailCrossTagDelivery(args[i], cvSlot)
         }
-        fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
-        fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        "unbox" => {
+          fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
+          fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        }
       }
     }
     "nulArm" => {
@@ -27544,10 +27547,19 @@ function emitCallRefArg(
   return if argPlainArm { 1 } else { 0 }
 }
 
+// How `emitCallRefArg`'s `armUnbox` arm writes argument `a` into the arm at variant slot `slot`:
+// as it stands, unboxed from its union's box, or refused where another arm's tag fits it.
+type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
+
+function armUnboxPlanOf(slot: i32, a: i32, fnIx: i32): ArmUnboxPlan {
+  if !exprUnion(a, fnIx) { return "asIs" }
+  return if variantHasCrossTagFits(slot, a, fnIx) { "crossTag" } else { "unbox" }
+}
+
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
 // number, a union parameter's box, or the general arm with nothing owed at a scalar of the
-// argument's own width (a boolean into an `i32`), a string, a record neither unboxed from a
-// narrowing nor nullable, or a non-null closure, list or map.
+// argument's own width (a boolean into an `i32`), a string, a record or union arm neither unboxed
+// from a narrowing nor nullable, or a non-null closure, list or map.
 export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
@@ -27566,13 +27578,16 @@ export function callRefArgPlain(
     return true
   }
   const k = sigParamKindAt(ckey, i)
+  if arm == "armUnbox" {
+    return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx) == "unbox"
+  }
   if arm == "scalarList" {
     return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
   }
   if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
   if k == "str" { return true }
-  if k == "struct" {
+  if k == "struct" || k == "variant" {
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
   }
   if k == "closure" { return !exprNulClosure(a, fnIx) }
