@@ -21,12 +21,15 @@ for a call read as a value (`tagDispatch`). A call statement went straight to `c
   - each arm as its call statement, at the target legacy resolves (`userFnTargetOf`).
 
   Otherwise the valued dispatch is built and dropped, its result rep checked only where it is read.
-- **Shared with legacy (`wasmEmit.vl`):**
-  - `tagDispatchTyIsVoid`, which legacy's two inline `isVoidTy(ty) || tyMentionsVoid(ty, 4)` now call;
+- **Shared with legacy (`wasmEmit.vl`):** every route the builder adds calls legacy's answer.
+  - `callStmtDispatches`: `emitCallStmt`'s dispatch test, split out. The builder routes a call
+    statement on it rather than on `exprPrePathWhy`'s expression-side restatement.
+  - `tagDispatchTyIsVoid`, which legacy's two inline `isVoidTy(ty) || tyMentionsVoid(ty, 4)` now call.
   - `userFnTargetOf`, `emitCallCoreUserFn`'s scope-chain lookup.
 - **An arm declines its tail form.** Legacy disarms its tail cursor after a dispatch
   (`dispatchDeclinesTail`), so a lone arm that ends a void function keeps `call`. The arm's effect
-  node goes in a new `IrFn.irNoTailEff`, beside `irNoTail` for valued temps.
+  node goes in a new `IrFn.irNoTailEff`, beside `irNoTail` for valued temps. It is set from
+  `dispatchDeclinesTail()`'s own answer, called once per arm, and the lowering only reads it.
 - **IR-N6's LoopVar keying** (`callRefPlainKey` admits a loop variable) rides along. Alone it
   moved no function, since 76 of its 77 rows were tagged.
 - **Two named misses keep new fail rows out:**
