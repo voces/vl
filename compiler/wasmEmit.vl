@@ -57,6 +57,7 @@ import {
   nodeTyCarry,
   nodeTyExcludesNull,
   nodeTyHasTyVar,
+  nodeTyInstEnter,
   nodeTyIntWidth,
   nodeTyIsLitUnionAlias,
   nodeTyIsMap,
@@ -96,6 +97,7 @@ import {
   litRepTyAt,
   luOvEnter,
   luOvLeave,
+  luOvOn,
   readNarrowedStoreAt,
   storageReadEnter,
   storageReadLeave,
@@ -36637,6 +36639,7 @@ export function initBitOf(gi: i32): i32 {
 // Puts this module's per-compile stashes, depths and memo cursors back to their declared
 // values: an earlier compile that stopped on a failure path may have left one set.
 export function wasmEmitStateReset() {
+  coalChainPre = Map()
   callRefLegacyPlain = Map()
   callRefLastPlain = false
   luOvLocNodes = []
@@ -41567,6 +41570,97 @@ export function coalClosedWidensAtom(
   return exprIsLitAtom(lhsIx, fnIx) && !exprIsLitAtom(exprIx, fnIx)
 }
 
+// `a ?? b ?? d` parses left-associative (`(a ?? b) ?? d`); `??` is associative, so the chain
+// re-associates to `a ?? (b ?? d)`, each left operand again a plain place. Mints and types the two
+// links for chain `e` (at `exprIx`) in function `fnIx`; returns the outer one, -1 for no chain.
+function coalChainMint(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  const lhs = nodeAt(unwrapParen(e.binLeft))
+  if !(lhs is BinExpr) { return -1 }
+  const reInner = mkBinary("??", lhs.binRight, e.binRight, -1)
+  // The inner link is delivered at `d`'s destination, so it reads `d`'s box record.
+  tyCarrySrcNote(reInner, e.binRight)
+  const reOuter = mkBinary("??", lhs.binLeft, reInner, -1)
+  coalLinkChains[reInner] = reOuter
+  // A chain joining structs is one box: both links take the chain's union, a supertype of
+  // the inner link's own join with the same null-ness, so its arm tags agree (D2373).
+  const chTy = nodeTyInOf(exprIx, fnIx)
+  // A chain joining numbers of different types apart is one box the same way.
+  if (
+    tyIsStructBearingUnion(chTy)
+    || (numUnionMinted && tyHoldsNumbersApart(chTy))
+  ) {
+    nodeTyRecord(reInner, chTy)
+    nodeTyRecord(reOuter, chTy)
+  } else {
+    // Otherwise the outer link is the chain. The inner one lies between `d` and the chain,
+    // so it is the chain's type exactly when `d` already is.
+    coalLinkTyAt(reOuter, exprIx, fnIx)
+    if tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(e.binRight, fnIx)) {
+      coalLinkTyAt(reInner, exprIx, fnIx)
+    }
+  }
+  // The inner link is the outer's default, delivered at the outer's type.
+  numDeliverStamp(reInner, nodeTyIxOf(reInner), nodeTyIxOf(reOuter))
+  return reOuter
+}
+
+// The links `coalChainsPrime` minted for each chain ahead of the bodies: chain node to
+// `[fnIx, outer link, ...]`.
+let coalChainPre: {[i32]: i32[]} = Map()
+
+// The outer link minted ahead of the bodies for chain `exprIx` in function `fnIx`, or -1.
+function coalChainPreOf(exprIx: i32, fnIx: i32): i32 {
+  const rs = coalChainPre.get(exprIx) ?? []
+  let i = 0
+  while i + 1 < rs.length {
+    if rs[i] == fnIx { return rs[i + 1] }
+    i = i + 2
+  }
+  return -1
+}
+
+// Mints every `??` chain's links in the first `n` emitted functions before any body is lowered,
+// in the order lowering reaches them, so a reader at claim time finds them minted. A chain lowered
+// under a per-arm read override (`luOvOn`) is typed per arm and mints its own.
+export function coalChainsPrime(n: i32) {
+  coalChainPre = Map()
+  let ci = 0
+  while ci < n && ci < fnStmts.length {
+    const fx = fnStmts[ci]
+    const fd = nodeAt(fx)
+    if fd is FuncDecl {
+      const was = nodeTyInstEnter(fx)
+      coalChainsWalk(fd.fnBody, fx)
+      nodeTyInstEnter(was)
+    }
+    ci = ci + 1
+  }
+  return 0
+}
+
+// Walks `ix` in source order, minting each chain's links and walking the outer link in its place.
+// A nested function is another emitted function's body.
+function coalChainsWalk(ix: i32, fnIx: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const nd = nodeAt(ix)
+  if nd is FuncDecl { return 0 }
+  if nd is BinExpr && nd.binOp == "??" {
+    const l = nodeAt(unwrapParen(nd.binLeft))
+    if l is BinExpr && l.binOp == "??" && coalArmOf(nd, ix, fnIx) == "chain" {
+      const ro = coalChainMint(nd, ix, fnIx)
+      if ro >= 0 {
+        const rs = coalChainPre.get(ix) ?? []
+        rs.push(fnIx)
+        rs.push(ro)
+        coalChainPre[ix] = rs
+        return coalChainsWalk(ro, fnIx)
+      }
+    }
+  }
+  for k in nodeChildren(ix) { coalChainsWalk(k, fnIx) }
+  return 0
+}
+
 function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
   const arm = coalArmOf(e, exprIx, fnIx)
   const lhsIx = unwrapParen(e.binLeft)
@@ -41582,36 +41676,11 @@ function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     return emitExpr(e.binLeft, fnIx)
   }
-  // `a ?? b ?? d` parses LEFT-associative (`(a ?? b) ?? d`); `??` is
-  // associative, so RE-ASSOCIATE to `a ?? (b ?? d)` — the inner coalesce
-  // becomes the outer's default and each LHS is again a plain place the
-  // single-step lowerings below handle (host: same chained-coalesce value).
+  // A chain reads the links minted ahead of the bodies (`coalChainsPrime`).
   if arm == "chain" && lhs is BinExpr {
-    const reInner = mkBinary("??", lhs.binRight, e.binRight, -1)
-    // The inner link is delivered at `d`'s destination, so it reads `d`'s box record.
-    tyCarrySrcNote(reInner, e.binRight)
-    const reOuter = mkBinary("??", lhs.binLeft, reInner, -1)
-    coalLinkChains[reInner] = reOuter
-    // A chain joining structs is one box: both links take the chain's union, a supertype of
-    // the inner link's own join with the same null-ness, so its arm tags agree (D2373).
-    const chTy = nodeTyInOf(exprIx, fnIx)
-    // A chain joining numbers of different types apart is one box the same way.
-    if (
-      tyIsStructBearingUnion(chTy)
-      || (numUnionMinted && tyHoldsNumbersApart(chTy))
-    ) {
-      nodeTyRecord(reInner, chTy)
-      nodeTyRecord(reOuter, chTy)
-    } else {
-      // Otherwise the outer link is the chain. The inner one lies between `d` and the chain,
-      // so it is the chain's type exactly when `d` already is.
-      coalLinkTyAt(reOuter, exprIx, fnIx)
-      if tySame(nodeTyAt(exprIx, fnIx), nodeTyAt(e.binRight, fnIx)) {
-        coalLinkTyAt(reInner, exprIx, fnIx)
-      }
-    }
-    // The inner link is the outer's default, delivered at the outer's type.
-    numDeliverStamp(reInner, nodeTyIxOf(reInner), nodeTyIxOf(reOuter))
+    const pre = if luOvOn == 0 { coalChainPreOf(exprIx, fnIx) } else { -1 }
+    const reOuter = if pre >= 0 { pre } else { coalChainMint(e, exprIx, fnIx) }
+    if reOuter < 0 { return -1 }
     return emitExpr(reOuter, fnIx)
   }
   // The operand is still evaluated and dropped for effect.
