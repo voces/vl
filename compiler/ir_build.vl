@@ -154,6 +154,7 @@ import {
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
+  callStmtIdentDrops,
   capturedArgArmOf,
   clearPlanOf,
   clearRecvIsList,
@@ -416,6 +417,7 @@ import { isBlockBody } from "./block_body"
 import { fbValtype, wTarget } from "./emit_bytes"
 import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
+  bundleRecordTyOf,
   elabArmSigAt,
   elabSpreadNote,
   isStorageRead,
@@ -448,6 +450,7 @@ import {
   exprMap,
   exprNullableMap,
   exprUnion,
+  fnBundleRetSigs,
   fnIndexOfNode,
   forInElemTyOf,
   forInMapRecv,
@@ -2463,10 +2466,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
-  // A bundle parameter holds a record of closures each instance types (D14841): read only at a
-  // member pick (`bundleCallRhs`).
+  // A bundle parameter holds a record of closures each instance types (D14841): read at a member
+  // pick (`bundleCallRhs`), or whole as that record where the IR holds it as one.
   if dn is Param && bundleAnyNoted() && bundleParamOfRead(ix, ibFnIx) >= 0 {
-    return irBMiss("bundle parameter read")
+    const pv = paramVarAt(localIndexOf(ibFnIx, ix))
+    if pv < 0 || !(repNodeAt(ib.irVars[pv].vRep) is RRecord) {
+      return irBMiss("bundle parameter read")
+    }
+    const o: Opnd = { ov: pv }
+    return o
   }
   if captureSlotOf(n.identName, ibFnIx) >= 0 {
     return captureRead(b, n, ix, rep)
@@ -2872,7 +2880,10 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
   if ann >= 0 { return nodeTyAt(ann, d) }
   const rec = if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
   if rec >= 0 { return rec }
-  return fnCheckedRetTy(pos)
+  const t = fnCheckedRetTy(pos)
+  // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`).
+  const bs = if irTyOpen(t) && pos >= 0 && pos < fnStmts.length { fnBundleRetSigs(pos) } else { [] }
+  return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
 }
 
 // The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
@@ -3269,9 +3280,17 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     crSig: cloSigTypeIdxAt(cloSigPosOfKey(key)),
     crArgs: args,
     crVoid: sigKeyRetIsVoid(key),
-    crDrop: !callRefPlainVoid(ix, ibFnIx),
+    crDrop: closureCallDrops(c, ix),
   }
   return r
+}
+
+// Whether closure call `c` at `ix`, as a statement, drops its value: a named callee as legacy's
+// statement ladder decides (`callStmtIdentDrops`), any other as its plan's voidness.
+function closureCallDrops(c: Call, ix: i32): boolean {
+  const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
+  if cf is Ident { return callStmtIdentDrops(c, cf, ix, ibFnIx) }
+  return !callRefPlainVoid(ix, ibFnIx)
 }
 
 // The rep closure `f` takes its parameter `i` at, or -1.
@@ -7593,6 +7612,16 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   return 0
 }
 
+// Parameter `p`'s type as legacy holds it: a bundle parameter's open type is the record of one
+// closure per signature it is called at (`bundleRecordTyOf`), else its checker type, closed at the
+// instance the checker recorded.
+function paramHeldTy(p: i32, fnIx: i32): i32 {
+  const ty = heldTy(scopeTyAt(p, fnIx))
+  if !irTyOpen(ty) { return ty }
+  const sigs = bundleSigsOfParam(p)
+  return if sigs.length > 0 { bundleRecordTyOf(sigs) } else { ty }
+}
+
 // The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A
 // fragment's (`whole` false) leaves out a parameter it could not hold, so only reading it misses.
 function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
@@ -7600,7 +7629,7 @@ function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
   let i = 0
   while i < fn.fnParams.length {
     const p = fn.fnParams[i]
-    const ty = heldTy(scopeTyAt(p, fnIx))
+    const ty = paramHeldTy(p, fnIx)
     const r = repNodeOfTy(ty)
     if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r)) {
       i = i + 1
