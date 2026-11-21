@@ -50,3 +50,12 @@ mismatch row is added.
 - **Ratchets:** L2 fuel 104,981,539,745 → 105,233,373,776 (+0.24%); `gate.sh --fast` passed
   (lint-self, ladder sets with `EmptyFitArm` and the new fields registered, late demands, phase
   state, dead exports).
+
+## Re-measured on #9346 `5c930189` (master `04650021` plus the pre-arm consult)
+
+Fixpoint seeds of #9346 and of this branch, each building this branch's source: self-compile no
+blocker 19,296 → 19,300 (`is rung` 5 → 1); mode 3 claimed 19,276 → 19,280, self identical; corpus
+43,421 → 43,433; `tests/cases` shadow 58,126 / 58,115 → 58,254 / 58,243, its fail/differ file
+list the base's. `--claimless` 14,013 identical, differ 0; `--names` 9,037 identical, differ 0;
+`--cases` 7,567 identical, differ 0; A/B 8,681 same, differ 0. L2 fuel 104,619,110,901 →
+104,878,784,492 (+0.25% on the merge-base fixpoint). `gate.sh --fast` passed.
