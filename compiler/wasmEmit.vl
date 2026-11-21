@@ -28380,8 +28380,9 @@ function emitBundleCall(callIx: i32, c: Call, fnIx: i32): i32 {
   return rc
 }
 
-// The member a call `callIx` through a bundle parameter (D14841) reads in frame `fnIx`: the
-// record's heap, field `c<k>`, that closure's type and its `$fnsig` key; `bpField` -1 for none.
+// The member a call `callIx` through a bundle parameter (D14841), or else a named holder
+// (`holderPickOf`), reads in frame `fnIx`: the record's heap, field `c<k>`, that closure's type and
+// its `$fnsig` key; `bpField` -1 for none.
 export type BundlePick = { bpHeap: i32, bpField: i32, bpTy: i32, bpKey: string }
 
 export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
@@ -28389,7 +28390,7 @@ export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
   const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
   if !(c is Call) { return none }
   const par = bundleParamOfRead(c.callFn, fnIx)
-  if par < 0 { return none }
+  if par < 0 { return holderPickOf(callIx, fnIx) }
   const sigs = bundleSigsOfParam(par)
   const si = paramStructIdxOf(par)
   const k = bundleFieldOfCall(par, c.callArgs, fnIx)
@@ -28446,9 +28447,49 @@ function emitHolderCall(callIx: i32, c: Call, fnIx: i32): i32 {
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
   fbStructGet(sHeapIdx[si], fi)
   const crDepth = callRefDepth
-  const crSlot = callRefNestSlot(callRefDepth)
-  fbLocalSet(crSlot)
-  return emitCallRefAt(callIx, c, fnIx, sigKeyOfTy(sigs[m]), crDepth, crSlot)
+  const crSlot = callRefStash()
+  if irShadowOn { callRefLegacyPlain[callIx] = "" }
+  const key = sigKeyOfTy(sigs[m])
+  const rc = emitCallRefAt(callIx, c, fnIx, key, crDepth, crSlot)
+  if rc >= 0 && irShadowOn && callRefLastPlain && !place {
+    callRefLegacyPlain[callIx] = key
+  }
+  return rc
+}
+
+// The member a call `callIx` through a `const` named by its callee and holding a returned record
+// whole (D15144) reads in frame `fnIx`, as `emitHolderCall` reads it; `bpField` -1 for none.
+export function holderPickOf(callIx: i32, fnIx: i32): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) { return none }
+  const cfx = unwrapParen(c.callFn)
+  if cfx < 0 || !(nodeAt(cfx) is Ident) { return none }
+  const d = identDeclOf(cfx)
+  const sigs = holderRecordSigs(d, fnIx)
+  const m = holderCallMember(callIx, fnIx)
+  const si = holderRecordRow(d, fnIx)
+  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
+  if m >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return none
+  }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: sigs[m],
+    bpKey: sigKeyOfTy(sigs[m]),
+  }
+  return pk
+}
+
+// `callRefPlainKey` for a call through a named holder of a returned record, at its member's key;
+// "" for any other.
+export function holderCallRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const pk = holderPickOf(callIx, fnIx)
+  if pk.bpField < 0 || pk.bpKey == "" { return "" }
+  return callRefPlainArgsTail(callIx, c, fnIx, pk.bpKey)
 }
 
 // ── statement-sequence lowering ──────────────────────────────────────────────
