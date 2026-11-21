@@ -344,6 +344,7 @@ import {
   mkStr,
   nodeAt,
   nodeChildren,
+  nodeChildrenPush,
   nodeContains,
   nodeIsTplHole,
   nodeSpineChildren,
@@ -481,7 +482,6 @@ import {
   cloLiftedFes,
   cloStructIdx,
   cmSlot,
-  coalChainFns,
   coalLinkChains,
   coalesceCallBoolSlot,
   coalesceCallSlot,
@@ -41609,8 +41609,8 @@ function coalChainMint(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
 // `[fnIx, outer link, ...]`.
 let coalChainPre: {[i32]: i32[]} = Map()
 
-// The outer link minted ahead of the bodies for chain `exprIx` in function `fnIx`, or -1: none
-// was, or a per-arm read override is active, under which the lowering mints its own.
+// The outer link minted ahead of the bodies for chain `exprIx` in function `fnIx`, or -1: it has
+// none, or a per-arm read override is active, under which the lowering mints its own.
 export function coalChainLinkOf(exprIx: i32, fnIx: i32): i32 {
   if luOvOn != 0 { return -1 }
   const rs = coalChainPre.get(exprIx) ?? []
@@ -41622,18 +41622,20 @@ export function coalChainLinkOf(exprIx: i32, fnIx: i32): i32 {
   return -1
 }
 
-// Mints the `??` chains' links in the first `n` emitted functions `coalChainFns` marks, before any
-// body is lowered and in the order lowering reaches them, so a reader at claim time finds them. A
-// chain lowered under a per-arm read override (`luOvOn`) is typed per arm and mints its own.
+// Mints the `??` chains' links in the first `n` emitted functions before any body is lowered, in
+// the order lowering reaches them, so a reader at claim time finds them. A chain lowered under a
+// per-arm read override (`luOvOn`) is typed per arm and mints its own.
 export function coalChainsPrime(n: i32) {
   coalChainPre = Map()
+  const st: i32[] = []
   let ci = 0
   while ci < n && ci < fnStmts.length {
     const fx = fnStmts[ci]
     const fd = nodeAt(fx)
-    if fd is FuncDecl && (coalChainFns.get(fx) ?? false) {
+    if fd is FuncDecl {
       const was = nodeTyInstEnter(fx)
-      coalChainsWalk(fd.fnBody, fx)
+      st.push(fd.fnBody)
+      coalChainsWalk(st, fx)
       nodeTyInstEnter(was)
     }
     ci = ci + 1
@@ -41641,27 +41643,50 @@ export function coalChainsPrime(n: i32) {
   return 0
 }
 
-// Walks `ix` in source order, minting each chain's links and walking the outer link in its place.
-// A nested function is another emitted function's body.
-function coalChainsWalk(ix: i32, fnIx: i32) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
-  const nd = nodeAt(ix)
-  if nd is FuncDecl { return 0 }
-  if nd is BinExpr && nd.binOp == "??" {
-    const l = nodeAt(unwrapParen(nd.binLeft))
-    if l is BinExpr && l.binOp == "??" && coalArmOf(nd, ix, fnIx) == "chain" {
-      const ro = coalChainMint(nd, ix, fnIx)
+// Drains `st` depth first in source order, minting each chain's links and walking the outer link
+// in the chain's place. A nested function is another emitted function's body.
+function coalChainsWalk(st: i32[], fnIx: i32) {
+  while st.length > 0 {
+    const ix = st[st.length - 1]
+    st.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const ro = coalChainVisit(ix, fnIx)
       if ro >= 0 {
-        const rs = coalChainPre.get(ix) ?? []
-        rs.push(fnIx)
-        rs.push(ro)
-        coalChainPre[ix] = rs
-        return coalChainsWalk(ro, fnIx)
+        st.push(ro)
+      } else if !(nodeAt(ix) is FuncDecl) {
+        // The children go on in reverse, so the first is walked first.
+        const at = st.length
+        nodeChildrenPush(ix, st)
+        let lo = at
+        let hi = st.length - 1
+        while lo < hi {
+          const t = st[lo]
+          st[lo] = st[hi]
+          st[hi] = t
+          lo = lo + 1
+          hi = hi - 1
+        }
       }
     }
   }
-  for k in nodeChildren(ix) { coalChainsWalk(k, fnIx) }
   return 0
+}
+
+// The outer link `coalChainMint` mints for chain `ix` in `fnIx`, recorded; -1 when `ix` is no chain.
+function coalChainVisit(ix: i32, fnIx: i32): i32 {
+  const nd = nodeAt(ix)
+  if !(nd is BinExpr) || nd.binOp != "??" { return -1 }
+  const l = nodeAt(unwrapParen(nd.binLeft))
+  if !(l is BinExpr) || l.binOp != "??" || coalArmOf(nd, ix, fnIx) != "chain" {
+    return -1
+  }
+  const ro = coalChainMint(nd, ix, fnIx)
+  if ro < 0 { return -1 }
+  const rs = coalChainPre.get(ix) ?? []
+  rs.push(fnIx)
+  rs.push(ro)
+  coalChainPre[ix] = rs
+  return ro
 }
 
 function emitCoalesceGo(e: BinExpr, exprIx: i32, fnIx: i32) {
