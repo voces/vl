@@ -487,16 +487,25 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  litIsBoxLexes,
   litMemberEqArmOf,
   memberOrTail,
   nulStrMemberClose,
   nulStrMemberGuard,
   nulStrMemberOpen,
   strMemberEqTail,
+  unionLitIsPlanOf,
+  unionLitNeverTail,
+  unionLitPayloadTail,
+  unionLitTagHead,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
-import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
+import {
+  ifLinkYieldsNull,
+  objOrderStashSlot,
+  unionLitIsStashSlot,
+} from "./emit_if_arm_values"
 import { forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
@@ -1369,7 +1378,17 @@ function litArms(r: RLitArms) {
       1
     }
     "memberEq" => memberEqLits(r, n.isObj)
-    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "none" => {
+    "boxLits" | "numBox" => {
+      const lexes = litIsBoxLexes(r.liAt, r.liArm)
+      let i = 0
+      while i < lexes.length {
+        if unionLitIs(r, n.isObj, lexes[i]) < 0 { return -1 }
+        memberOrTail(i)
+        i = i + 1
+      }
+      1
+    }
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "memberNoRecv" | "memberTrue" | "none" => {
       irLMiss("literal arms " + r.liArm)
     }
   }
@@ -1383,18 +1402,46 @@ function memberEqLits(r: RLitArms, recvIx: i32) {
   while i < texts.length {
     const lex = quoteLex(texts[i])
     const a = litMemberEqArmOf(recvIx, lex, lw.irAt)
-    if a == "nulStr" { nulStrMemberOpen() }
-    else if a != "str" { return irLMiss("literal member " + a) }
-    irLOpnd(r.liV)
-    if a == "nulStr" { nulStrMemberGuard() }
-    if strMemberEqTail(lex, lw.irAt) < 0 {
-      return irLMiss("literal member compare")
+    if a == "union" {
+      if unionLitIs(r, recvIx, lex) < 0 { return -1 }
+    } else if a == "str" || a == "nulStr" {
+      if a == "nulStr" { nulStrMemberOpen() }
+      irLOpnd(r.liV)
+      if a == "nulStr" { nulStrMemberGuard() }
+      if strMemberEqTail(lex, lw.irAt) < 0 {
+        return irLMiss("literal member compare")
+      }
+      if a == "nulStr" { nulStrMemberClose() }
+    } else {
+      return irLMiss("literal member " + a)
     }
-    if a == "nulStr" { nulStrMemberClose() }
     memberOrTail(i)
     i = i + 1
   }
   return 1
+}
+
+// Box variable `r.liV` tested against literal `lex` as `emitUnionLitIs` writes it: the stash slot,
+// then the box and a static false, or the box, its tag test, the box again and its payload compare.
+function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
+  unionLitIsStashSlot()
+  const p = unionLitIsPlanOf(recvIx, lex, lw.irAt)
+  return match p.ulArm {
+    "never" => {
+      irLOpnd(r.liV)
+      unionLitNeverTail()
+    }
+    "tag" => {
+      irLOpnd(r.liV)
+      unionLitTagHead(p)
+      if !p.ulOnce { irLOpnd(r.liV) }
+      unionLitPayloadTail(p, lex, lw.irAt)
+    }
+    "noSet" | "noArm" => {
+      irLMiss("literal box " + p.ulArm)
+      -1
+    }
+  }
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
