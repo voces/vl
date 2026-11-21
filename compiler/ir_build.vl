@@ -60,6 +60,7 @@ import {
   RCall,
   RListStage,
   RStrOp,
+  RTagStash,
   RToBox,
   Rhs,
   SAssign,
@@ -2219,6 +2220,17 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
   return false
 }
 
+// Whether operands built into `b` from `at` on hold a tag dispatch's stash.
+function tagStashFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SEffect && n.efRhs is RTagStash { return true }
+    i = i + 1
+  }
+  return false
+}
+
 // Whether variable `v` is the out of a valued `if` in body `b`.
 function valuedIfOut(b: i32[], v: i32): boolean {
   for id in b {
@@ -4238,12 +4250,19 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   }
   if n is Ident { return identRead(b, n, ix, rep, cell) }
   if n is Unary {
-    if n.unOp != "-" && n.unOp != "!" { return irBMiss("unary " + n.unOp) }
+    if n.unOp != "-" && n.unOp != "!" && n.unOp != "~" {
+      return irBMiss("unary " + n.unOp)
+    }
     const uw = operandWhy(n.unArg)
     if uw != "" { return irBMiss(uw) }
     const a = irBExpr(b, n.unArg)
     if ibMiss != "" { return a }
     if irBOpRep(a) != rep { return irBMiss("operand coercion") }
+    // `~x` is legacy's `x ^ -1`, the all-ones mask at the operand's width.
+    if n.unOp == "~" {
+      const ones: Opnd = { oiRep: rep, oiBits: -1 }
+      return irBLetTemp(b, { poOp: "xor", poArgs: [a, ones] }, ix, rep)
+    }
     const op: PrimOp = if n.unOp == "-" { "neg" } else { "not" }
     return irBLetTemp(b, { poOp: op, poArgs: [a] }, ix, rep)
   }
@@ -4318,13 +4337,26 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     ) {
       return irBMiss("widen literal")
     }
+    const ls = b.length
     const l = widenTo(b, irBExpr(b, n.binLeft), n.binLeft, dst, -1)
     const at = b.length
     const r = widenTo(b, irBExpr(b, n.binRight), n.binRight, dst, -1)
     if ibMiss != "" { return l }
-    if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return l }
-    if irBOpRep(l) != irBOpRep(r) { return irBMiss("operand coercion") }
-    return irBLetTemp(b, { poOp: p, poArgs: [l, r] }, ix, rep)
+    // A left operand that is a variable or immediate is staged below a right operand that is a
+    // valued `if`'s own value; one built on from such a value (a call's dispatch) is not.
+    const lead = [l]
+    if r is OVar && valuedIfOut(b, r.ov) && !inPlaceFrom(b, at) {
+      // A tag dispatch keeps its stash above any operand staged before it (`tagDispatch`).
+      if tagStashFrom(b, at) { return irBMiss("tag dispatch after an operand") }
+      if !irBStageLeads(b, at, [ls], lead, [n.binLeft]) {
+        return irBMiss("staged lead")
+      }
+    } else if ifBelowLeadOf(b, at, "short-circuit right operand", lead) {
+      return l
+    }
+    const sl = lead[0]
+    if irBOpRep(sl) != irBOpRep(r) { return irBMiss("operand coercion") }
+    return irBLetTemp(b, { poOp: p, poArgs: [sl, r] }, ix, rep)
   }
   if n is Call {
     if mapNewCall(n) {
@@ -5018,6 +5050,18 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return 0
     }
     if none { return skip("void return value") }
+    // A returned trap is the trap, then the `return` legacy writes after it, dead and bare;
+    // at a wider number legacy also widens the dead value.
+    const rx = unwrapParen(n.retArg)
+    const rt = if rx >= 0 && rx < P.nodes.length { nodeAt(rx) } else { null }
+    if rt is Call && trapCallNamed(rt, ibFnIx) && identDeclOf(rt.callFn) < 0 {
+      if numKindOf(ib.irRetRep) >= 3 { return skip("returned trap widened") }
+      trapStmt(b, rt, rx)
+      if ibMiss != "" { return 0 }
+      const z: Opnd = { ov: -1 }
+      irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
+      return 0
+    }
     if retBoxesCall(n.retArg) { return skip("return of a boxed call") }
     if retRefusedWhy(n.retArg, ibFnIx) != "" { return skip("return refused") }
     // A returned value `if` is legacy's tail `if`, each arm's value its own exit.
@@ -5114,7 +5158,7 @@ function retIsValueIf(ix: i32): boolean {
 }
 
 // A non-void body's tail. An expression body's one statement is its value; a block body's last
-// statement is a statement, and a body that runs past it returns its result's `null`.
+// statement is a statement, and a body that runs past it falls into legacy's pad.
 function tailReturn(b: i32[], stmts: i32[], at: i32) {
   if stmts.length == 0 { return skip("empty valued body") }
   let i = 0
@@ -5123,8 +5167,18 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     i = i + 1
   }
   const last = stmts[stmts.length - 1]
+  // A block body's last statement is a statement, a value `if` included: legacy takes only an
+  // expression body's statement as its tail (`emitFuncBody`), and the lowering pads past it.
+  if isBlockBody(at) {
+    stmt(b, last, stmts, stmts.length - 1)
+    // A falling `if` chain with an `is` link is one legacy may decide off its bytes
+    // (`staticIsGuard`) and write without its test.
+    if ibMiss == "" && !irBodyLeaves(ib, b) && chainHasTest(last) {
+      return skip("tail if is chain falls off")
+    }
+    return 0
+  }
   const ln = nodeAt(last)
-  if ln is WhileStmt { return skip("valued tail loop") }
   if ln is IfStmt && lastStmtIsValueIf(last, ibFnIx) {
     // The body's tail `if` is a body statement, which legacy banks a row for.
     const n0 = b.length
@@ -5147,10 +5201,6 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     }
     return 0
   }
-  if isBlockBody(at) {
-    stmt(b, last, stmts, stmts.length - 1)
-    return skip("block body falls off")
-  }
   const n0 = b.length
   if retBoxesCall(last) { return skip("return of a boxed call") }
   if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
@@ -5159,6 +5209,18 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
+}
+
+// Whether statement `ix` is an `if` chain one of whose links tests with `is`.
+function chainHasTest(ix: i32): boolean {
+  let cur = ix
+  while cur >= 0 && cur < P.nodes.length {
+    const n = nodeAt(cur)
+    if !(n is IfStmt) { return false }
+    if condIsTest(n.ifCond) { return true }
+    cur = n.ifElse
+  }
+  return false
 }
 
 // A value `if` in tail position (legacy's `emitIfTail`): the statement `if` with each arm's last
