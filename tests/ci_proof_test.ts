@@ -44,6 +44,7 @@ const LOCAL: Record<string, string> = {
   "distilled corpus":
     "ci-distilled runs its runs-lost check; on master gate.sh adds --verify-fresh",
   "ir shadow": "no ci.yml job runs the IR shadow over the distilled corpus",
+  "ir shadow cases": "no ci.yml job runs the IR shadow over tests/cases",
   "ir claims": "no ci.yml job runs the shipped IR claim over the distilled corpus",
 };
 
