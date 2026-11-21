@@ -111,6 +111,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  RCoerce,
   REnvDrop,
   REnvGet,
   RFieldNull,
@@ -126,10 +127,12 @@ import {
   RListGet,
   RListLen,
   RListNew,
+  RListNewDefault,
   RListPop,
   RListPush,
   RListSlice,
   RListStage,
+  RLitArms,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -261,11 +264,14 @@ import {
   arrLitPrologue,
   arrLitRefShortTail,
   arrLitShortTail,
+  arrNewDefaultTail,
   arrNewFillStep,
   arrNewLenStash,
   arrNewPlanOf,
   arrNewTail,
+  atomEqIsTail,
   atomEqTail,
+  atomNotNulIsTail,
   atomStrPlanOf,
   atomStrTail,
   boxTagIsTail,
@@ -280,6 +286,8 @@ import {
   coalBoxEnd,
   coalBoxOpen,
   coalBoxSlot,
+  coalNicheElse,
+  coalNicheOpen,
   coalNulRefBranch,
   coalNulRefJoinOpen,
   coalNulRefJoinPresent,
@@ -287,7 +295,7 @@ import {
   coalNulRefPlanOf,
   emitCapturedRead,
   emitClosureIds,
-  emitClosureValue,
+  emitClosureValueCore,
   emitEnvCacheClose,
   emitEnvCacheDrop,
   emitEnvCacheOpen,
@@ -369,6 +377,7 @@ import {
   memAddrPlanOf,
   narrowedMemTail,
   narrowedVariantTail,
+  nicheRawIsTail,
   nulTestAtomTail,
   nulTestBoolTail,
   nulTestBoxTagTail,
@@ -436,6 +445,8 @@ import {
   arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
+  litIsArmOf,
+  litIsMemberTexts,
   memRecvOwesNonNull,
   memberBoxReadAt,
   narrowedBoxVariantPlain,
@@ -470,6 +481,7 @@ import {
   emptyFitPlanOf,
   fbRefIfOpenType,
 } from "./wasmEmit"
+import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
 import { forInLoopAt } from "./emit_plan_list"
@@ -820,6 +832,7 @@ function rhs(r: Rhs, tail: boolean) {
     RStashSet => irLMiss("stash set as a value")
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
+    RLitArms => litArms(r)
     RTagIs => {
       leaf()
       tagIsTail(r.tgiId)
@@ -846,6 +859,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListPop |
       RListEq |
       RListCat |
+      RCoerce |
       RStrOp |
       RMapFilter |
       RListSlice => irLowerListHook(r)
@@ -899,6 +913,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMakeRec => makeRec(r)
     RMapOp => mapOp(r)
     RListNew => listNew(r)
+    RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
     RCallHost => hostCall(r)
@@ -1187,7 +1202,9 @@ function makeClo(r: RMakeClo) {
     emitClosureIds(r.mcFn)
   } else {
     leaf()
-    emitClosureValue(r.mcFn, lw.irAt)
+    // The builder held the value to the refusal its arm owes, so the core writer is legacy's bytes
+    // on either arm (`emitClosureValue` is the generic refusal, then the core).
+    emitClosureValueCore(r.mcFn, lw.irAt)
   }
   if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
     fbRefAsNonNull()
@@ -1303,6 +1320,38 @@ function listEmpty(r: RListEmpty) {
   if p.efArm != "loop" || p.efRepWhy != "" { return irLMiss("list empty plan") }
   irLOpnd(r.leV)
   return emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
+}
+
+// `RLitArms`: the operand and its arm's tail, as `emitIsTestLitArms` writes it; `atomEq` reads the
+// operand once per member. Every other arm is the builder's miss.
+function litArms(r: RLitArms) {
+  const n = nodeAt(r.liAt)
+  if !(n is IsExpr) || litIsArmOf(r.liAt, n, lw.irAt) != r.liArm {
+    return irLMiss("literal arms plan")
+  }
+  return match r.liArm {
+    "nicheRaw" => {
+      irLOpnd(r.liV)
+      nicheRawIsTail(r.liAt)
+    }
+    "atomNotNul" => {
+      irLOpnd(r.liV)
+      atomNotNulIsTail()
+    }
+    "atomEq" => {
+      const texts = litIsMemberTexts(r.liAt)
+      let i = 0
+      while i < texts.length {
+        irLOpnd(r.liV)
+        atomEqIsTail(texts[i], i)
+        i = i + 1
+      }
+      1
+    }
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "memberEq" | "none" => {
+      irLMiss("literal arms " + r.liArm)
+    }
+  }
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -1524,6 +1573,15 @@ function listNew(r: RListNew) {
   irLOpnd(r.lnFill)
   arrNewFillStep(-1)
   return arrNewTail(pl, slot)
+}
+
+// `RListNewDefault`: legacy's `__array_new_default__` arm: the length and its stash, then the
+// zeroed allocation at `arrNewPlanOf`'s pair.
+function listNewDefault(r: RListNewDefault) {
+  const pl = arrNewPlanOf(r.ldAt, -1, lw.irAt)
+  if pl.anWhy != "" { return irLMiss("array new refused") }
+  irLOpnd(r.ldLen)
+  return arrNewDefaultTail(pl, arrNewLenStash())
 }
 
 // `RSimd`: legacy's SIMD arm in `emitSimdIntrinsic`'s order, the value operands then the row's
@@ -2177,11 +2235,7 @@ function irHoistRecv(ix: i32): i32 {
     fbLocalGet(varSlot(v))
     return 0
   }
-  if lw.irReadAgain.has(ix) {
-    const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
-    rhs(lw.irReadAgain[ix] ?? none, false)
-    return 0
-  }
+  if irLReadAgain(ix) { return 0 }
   const m = nodeAt(ix)
   if lw.irReadField.has(ix) && m is Member {
     if irHoistRecv(m.memObj) < 0 { return -1 }
@@ -2189,6 +2243,15 @@ function irHoistRecv(ix: i32): i32 {
   }
   irLMiss("hoisted receiver read")
   return -1
+}
+
+// Writes the global read the builder built at node `ix` once more, as legacy re-reads a name;
+// false where it built none.
+export function irLReadAgain(ix: i32): boolean {
+  if !lw.irReadAgain.has(ix) { return false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  rhs(lw.irReadAgain[ix] ?? none, false)
+  return true
 }
 
 // The depth a branch to `label` crosses from the innermost frame, or -1.
@@ -2733,8 +2796,11 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   }
   // A helper's `if` may yield a raw reference, as its hand-written body's did.
   const rr = repNodeAt(lw.irVars[t].vRep)
-  // An atom join, nullable at the `-1` niche or not, is an `i32` `if` (`emitIfExprAs` at 127).
-  const atomOut = rr is RAtom || rr is RNullable && rr.rnDisc == 3
+  // An atom join, nullable at the `-1` niche or not, or a boolean at its `2` niche, is an `i32`
+  // `if` (`emitIfExprAs` at 127).
+  const atomOut = rr is RAtom
+    || rr is RNullable && rr.rnDisc == 3
+    || repBoolNiche(lw.irVars[t].vRep)
   const refOut = lw.irHelper && rr is RRaw
   // A reference join takes legacy's blocktype for the `if` at its node (`emitIfExprRef`).
   const at = lw.irNodeAt[id] ?? -1
@@ -2810,6 +2876,8 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "popOr" => coalPopOr(n, e, pending)
     "mapIndexGetOr" => coalMapGetOr(n, e, pending)
     "nulRef" => coalNulRef(n, e, pending)
+    "litUnion" => coalNicheCell(n, e, -1, pending)
+    "nulBool" => coalNicheCell(n, e, 2, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -2891,6 +2959,26 @@ function coalNulRef(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     }
     "noBox" | "listClash" | "litAtom" => irLMiss("coalesce nulRef " + p.nrArm)
   }
+}
+
+// An i32 niche cell's `??` whose null is `sent`: the operand, the shared open, the default writing
+// the slotless out, then the stash or, where legacy re-reads the operand, the operand again.
+function coalNicheCell(
+  n: SCoalBox,
+  e: BinExpr,
+  sent: i32,
+  pending: i32[],
+): i32 {
+  const reEval = !coalLhsStashes(unwrapParen(e.binLeft))
+  cond(n.cbL, pending)
+  coalNicheOpen(sent, reEval)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  coalNicheElse(reEval)
+  if reEval { irLOpnd(n.cbL) }
+  lwFrames.pop()
+  fbEnd()
+  return 0
 }
 
 // The default of a nullable reference's `??` writing the slotless out, then, for a join, the

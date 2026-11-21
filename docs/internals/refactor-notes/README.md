@@ -8,6 +8,32 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-21-ir-typed-field-null](2026-11-21-ir-typed-field-null.md): IR: an explicit `null` record field takes its typed reference's null, 2026-11-21
+- [2026-11-21-ir-tail-residue](2026-11-21-ir-tail-residue.md): IR: the tail residue bundle (an atom `if` arm, an else-less tail `if`, an empty valued body), 2026-11-21
+- [2026-11-21-ir-spread-many-groups](2026-11-21-ir-spread-many-groups.md): IR spread, many groups (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-return-rep](2026-11-21-ir-return-rep.md): IR: an un-annotated function's result rep is its recorded result (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-negated-literal](2026-11-21-ir-negated-literal.md): IR: a negated literal at the negation's width (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-map-read-box](2026-11-21-ir-map-read-box.md): IR: a scalar map read into its nullable box (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-list-concat](2026-11-21-ir-list-concat.md): IR: list `+` (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-list-builtins](2026-11-21-ir-list-builtins.md): IR: `__array_new_default__`, `fromCodePoints` over a global, an atom pushed into a string list (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-is-lit-arms-atom](2026-11-21-ir-is-lit-arms-atom.md): IR coverage: an `is` test at litArms' operand arms (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-is-lit-arms](2026-11-21-ir-is-lit-arms.md): IR coverage: an `is` test at the `litArms` rung, first slice (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-is-empty-fit](2026-11-21-ir-is-empty-fit.md): IR coverage: an `is` test at the `emptyFit` rung (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-index-span](2026-11-21-ir-index-span.md): IR: an element read's span over a statement-built receiver (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-if-union-join](2026-11-21-ir-if-union-join.md): IR: a value `if` on the union join, and a list element staged below a valued `if`, 2026-11-21
+- [2026-11-21-ir-global-init-variant](2026-11-21-ir-global-init-variant.md): IR: a bare-arm global's initializer (2026-11-21)
+- [2026-11-21-ir-for-range-rolled](2026-11-21-ir-for-range-rolled.md): IR: a rolled range loop (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-field-stash](2026-11-21-ir-field-stash.md): IR: an order-stashed record field written in place (2026-11-21)
+- [2026-11-21-ir-decided-is-cond](2026-11-21-ir-decided-is-cond.md): IR coverage: an `if` over a decided `is`, through `emitIs`'s own pre-rung plan (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-coerce-tail](2026-11-21-ir-coerce-tail.md): IR: node-keyed coercions as `RCoerce` (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-coal-lit-union](2026-11-21-ir-coal-lit-union.md): IR coverage: a `??` over an i32 niche cell (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-bundle-guard](2026-11-21-ir-bundle-guard.md): IR: the bundle guard narrowed, and inert function values, 2026-11-21
+- [2026-11-21-ir-bundle-call](2026-11-21-ir-bundle-call.md): IR: a call through a bundle parameter, 2026-11-21
+- [2026-11-21-ir-box-map-arm](2026-11-21-ir-box-map-arm.md): IR: a map under its map arm's tag (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-box-ladder-numunion](2026-11-21-ir-box-ladder-numunion.md): IR: a numeric union passes into a union box (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-box-closure-arm](2026-11-21-ir-box-closure-arm.md): IR: a closure under its closure arm's tag (2026-11-21, lane IR-N2)
+- [2026-11-20-ir-simd-v128](2026-11-20-ir-simd-v128.md): IR coverage: v128 as a value rep, and the SIMD intrinsics as one op (2026-11-20, lane IR-N7)
+- [2026-11-20-ir-objlit-ctx-row](2026-11-20-ir-objlit-ctx-row.md): IR: a record literal at its destination's record type (2026-11-20, lane IR-N2)
 - [2026-11-21-ir-walk-element-kinds](2026-11-21-ir-walk-element-kinds.md): IR: a walk over bytes, nested string or byte lists, variants, nullables and wide scalars (2026-11-21, lane IR-N3)
 - [2026-11-21-ir-tag-dispatch-ref](2026-11-21-ir-tag-dispatch-ref.md): IR: a tagged call's reference result, 2026-11-21
 - [2026-11-21-ir-shadow-stash-frame](2026-11-21-ir-shadow-stash-frame.md): The door probe allocates from legacy's starting scratch frame (2026-11-21, lane IR-D1)
