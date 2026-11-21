@@ -24,3 +24,12 @@ payload, and a cast to the arm's list wrapper or map struct (`emitRefArrayUnionU
 `Ca[] | i32` narrowed to the list, and a map arm of `{[i32]: i32} | string`. The walk is the
 hoisted-receiver spelling. Without `irReadAgain`, twelve `deep-is` cases fell to
 `unlowered: hoisted receiver read`.
+
+## Measured (fixpoint seeds of master 2ddcb70b and the change)
+
+- tests/cases armed shadow: covered +180 and matched +180; `uncovered narrowed read` 290 → 72, start
+  11 → 4; no new `fail` or `mismatch` row.
+- Corpus blocker census: `narrowed read` alone 23 → 8, `map key i64 + narrowed read` 2 → 0;
+  no-blocker 43,954 → 43,963 of 45,678.
+- Legacy: tests/cases A/B identical 7,302 (differ 0), `--names` self-compile identical, mode-3 self
+  byte-identical. L2 fuel 105,702,522,789 → 105,731,748,202 (+0.028%).
