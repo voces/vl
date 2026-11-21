@@ -415,3 +415,16 @@ already-formatted file changes. A multi-line type union (`type U = A` / `  | B`)
 `emitTypeOrUnionDecl` keeps a multi-line declaration as written. Why: the long IR kind arms in
 `compiler/ir.vl`, `ir_verify.vl` and `ir_lower.vl` are edited by every PR that adds a node, and
 one member per line lets two such PRs merge.
+
+**A seed built before #9380 undoes both rules.** Its formatter rejoins one-per-line arms and
+refills one-per-line lists, so `vl fmt -w` on a branch that has just merged master must run
+after `scripts/refresh-compiler.sh`. `tests/ir_lists_layout_test.ts` names any IR kind list
+that comes back packed.
+
+**The IR kind lists are also sorted** (coordinator ruling, 2026-11-21). One member per line
+still conflicts when two PRs insert after the same member; in sorted order most insertions land
+on different lines. Put a new member at its sorted place in the `Rhs`/`IrNode` unions, each long
+IR arm, and the `klRhs`/`klIrNode` sets; the guard reds on the first one out of order. The other
+`lint.vl` IR sets mirror string unions and keep their declared order (`scripts/ladder-sets.vl`).
+A line-level `git merge-file --union` is not a substitute: two arms ending in the same closing
+lines keep one tail between them, and the `match` no longer parses.

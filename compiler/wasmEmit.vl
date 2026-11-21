@@ -375,7 +375,6 @@ import {
   cpsToUtf8,
   decodeStr,
   directArgsBad,
-  exprEffectFree,
   inferNicheNullByName,
   isRecvStagedIx,
   isRecvStagedNonNull,
@@ -1777,8 +1776,7 @@ import {
   isArmPatTy,
   isArmTagOfTyAt,
   isBoxGuardPlain,
-  isPinOwn,
-  isPreArmOf,
+  isDecidedPlanOf,
   isRecvStageRep,
   isTestValuePrimName,
   isTestsStorage,
@@ -1991,9 +1989,24 @@ export function fieldNullOwnOf(si: i32, fi: i32): i32 {
   }
 }
 
+// Whether field `fi` of struct row `si` has a typed reference's null whose heap is fixed when emit
+// starts, `ref.null` of it: a nullable list or closure, or a nullable record or ref list whose row is
+// interned. A map's null takes its map shape's heap, which a later mint may move.
+export function fieldTypedNullHas(si: i32, fi: i32): boolean {
+  if si < 0 || si >= sFieldStart.length { return false }
+  const k = fieldRowKind(sFieldStart[si] + fi)
+  if k == null { return false }
+  return match k {
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => true
+    "nulstruct" | "nulvariant" => sFieldTgtStructIdx(si, fi) >= 0
+    "nulreflist" => sFieldRefSlot(si, fi) >= 0 && sFieldRefSlot(si, fi) < rlWrapIdx.length
+    "nulmap" | "nulstr" | "nulbool" | "i32" | "nulnone" | "union" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => false
+  }
+}
+
 // The null value of an omitted nullable field (`si`/`fi`) in a struct literal: `fieldNullOwnOf`'s
 // null, else `ref.null` of the field's own backing for the typed ref codes. -1 when not nullable.
-function emitOmittedFieldNull(si: i32, fi: i32) {
+export function emitOmittedFieldNull(si: i32, fi: i32) {
   const own = fieldNullOwnOf(si, fi)
   if own >= 0 {
     emitNullOwn(own)
@@ -2003,6 +2016,7 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
   const r = sFieldStart[si] + fi
   const k = fieldRowKind(r)
   if k == null { return -1 }
+  if !fieldTypedNullHas(si, fi) && k != "nulmap" { return -1 }
   match k {
     "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
       fbRefNullForKind(
@@ -4247,12 +4261,24 @@ function litMemberRecvIsNulString(recvIx: i32, fnIx: i32) {
 // (which consumes it) decides between the string compare and a const 0, mirroring
 // `emitPrintNulString`'s block shape rather than the coalesce's.
 function emitNulStrLitEq(recvIx: i32, lex: string, fnIx: i32) {
+  nulStrMemberOpen()
+  if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  nulStrMemberGuard()
+  if strMemberEqTail(lex, fnIx) < 0 { return -1 }
+  return nulStrMemberClose()
+}
+
+// Before a `string | null` receiver compared with a member: the result block and the null's.
+export function nulStrMemberOpen() {
   fbBlock(127)
   fbBlock(64)
+}
 
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  fbBrOnNull(0)
-  if emitStrEqLit(mkStr(lex, -1), fnIx) < 0 { return -1 }
+// After the receiver: a null leaves for the null's block, else the string stays for the compare.
+export function nulStrMemberGuard() { fbBrOnNull(0) }
+
+// After the member compare: the compare's result, else the null's 0.
+export function nulStrMemberClose() {
   fbBr(1)
   fbEnd()
   fbI32Const(0)
@@ -4260,21 +4286,42 @@ function emitNulStrLitEq(recvIx: i32, lex: string, fnIx: i32) {
   return 0
 }
 
+// Compares the string on the stack with member literal `lex`, a quoted lexeme, leaving 0/1.
+export function strMemberEqTail(lex: string, fnIx: i32) {
+  const lit = mkStr(lex, -1)
+  const f = strEqLitForm(lit)
+  strEqLitHead(lit, f)
+  if f == 0 || f == 3 {
+    if emitStrLitAt(lit, fnIx) < 0 { return -1 }
+  }
+  return strEqLitTail(f)
+}
+
+// The shape `emitLitMemberEq` compares receiver `recvIx` with member `lex` in: a value-union box's
+// tag-gated payload, a nullable string's guarded compare, a string's, or a number's.
+export type LitMemberEqArm = "union" | "nulStr" | "str" | "num"
+
+export function litMemberEqArmOf(
+  recvIx: i32,
+  lex: string,
+  fnIx: i32,
+): LitMemberEqArm {
+  if exprUnion(recvIx, fnIx) { return "union" }
+  if !nameIsQuotedLeaf(lex) { return "num" }
+  return if litMemberRecvIsNulString(recvIx, fnIx) { "nulStr" } else { "str" }
+}
+
 // One member-literal test `recv == <lex>`, in whichever shape the receiver's rep demands:
 // the tag-gated payload compare over a value-union box, the null-guarded string compare
 // over a `string | null` niche, plain string equality over a string ref, else the numeric
 // compare. One home because the bare-literal `is` and the litunion ladder must agree.
 function emitLitMemberEq(recvIx: i32, lex: string, fnIx: i32) {
-  if exprUnion(recvIx, fnIx) { return emitUnionLitIs(recvIx, lex, fnIx) }
-
-  if nameIsQuotedLeaf(lex) {
-    if litMemberRecvIsNulString(recvIx, fnIx) {
-      return emitNulStrLitEq(recvIx, lex, fnIx)
-    }
-    if emitExpr(recvIx, fnIx) < 0 { return -1 }
-    return emitStrEqLit(mkStr(lex, -1), fnIx)
+  return match litMemberEqArmOf(recvIx, lex, fnIx) {
+    "union" => emitUnionLitIs(recvIx, lex, fnIx)
+    "nulStr" => emitNulStrLitEq(recvIx, lex, fnIx)
+    "str" => if emitExpr(recvIx, fnIx) < 0 { -1 } else { strMemberEqTail(lex, fnIx) }
+    "num" => emitNumLitEq(recvIx, lex, fnIx)
   }
-  return emitNumLitEq(recvIx, lex, fnIx)
 }
 
 // shared refusal text: the membership ladder's own place bound and the box-tag compare's
@@ -5982,9 +6029,8 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
 function emitIs(isIx: i32, fnIx: i32) {
   const nd0 = nodeAt(isIx)
   if !(nd0 is IsExpr) { return emitIsTest(isIx, fnIx) }
-  const tested = isVarTyIxOf(isIx)
-  const covOp = nodeTyAt(nd0.isObj, fnIx)
-  return match isPreArmOf(isIx, fnIx) {
+  const d = isDecidedPlanOf(isIx, fnIx)
+  return match d.idArm {
     // A narrowed operand is tested at its storage, never trusted: a write the narrowing does
     // not see (an alias, an escaped closure) is answered (D2447).
     "storage" => {
@@ -5993,30 +6039,8 @@ function emitIs(isIx: i32, fnIx: i32) {
       storageReadLeave(sMark)
       r
     }
-    "tautology" => {
-      fbI32Const(1)
-      0
-    }
-    "covers" | "fits" => isDecidedOperand(nd0.isObj, true, 1, fnIx)
-    // An effect-free operand answers a bare constant `staticIsGuard` reads, so the arm it
-    // guards is not lowered (D15606); any other is evaluated for its effects first (D15607).
-    "prim" => {
-      const same = tyPrimNameOf(covOp) == tyPrimNameOf(tested)
-      isDecidedOperand(
-        nd0.isObj,
-        same || !exprEffectFree(nd0.isObj),
-        if same { 1 } else { 0 },
-        fnIx,
-      )
-    }
-    "pin" => {
-      const own = isPinOwn(covOp, tested)
-      isDecidedOperand(
-        nd0.isObj,
-        !exprEffectFree(nd0.isObj),
-        if own { 1 } else { 0 },
-        fnIx,
-      )
+    "tautology" | "covers" | "fits" | "prim" | "pin" => {
+      isDecidedOperand(nd0.isObj, d.idEval, d.idBit, fnIx)
     }
     "test" => emitIsTest(isIx, fnIx)
   }
@@ -6278,15 +6302,11 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
     "nicheTest" => if emitNulIsNullTest(nd0.isObj, fnIx, !isTestsNull(isIx), true) < 0 { -1 } else { 1 }
     "nicheRaw" => {
       if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-      fbRefIsNull()
-      if !isTestsNull(isIx) { fbI32Eqz() }
-      1
+      nicheRawIsTail(isIx)
     }
     "atomNotNul" => {
       if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-      fbI32Const(-1)
-      fbI32Bin(71) // 0x47 i32.ne
-      1
+      atomNotNulIsTail()
     }
     "atomTrue" | "memberTrue" => {
       fbI32Const(1)
@@ -6297,9 +6317,7 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
       let laI = 0
       while laI < laTexts.length {
         if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-        fbI32Rel(RS_ATOM, internAtom(quoteLex(laTexts[laI])))
-        fbI32Bin(70)
-        if laI > 0 { fbI32Bin(114) }
+        atomEqIsTail(laTexts[laI], laI)
         laI = laI + 1
       }
       1
@@ -6323,13 +6341,39 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
         if (emitLitMemberEq(nd0.isObj, quoteLex(lsTexts[lsI]), fnIx) < 0) {
           return -1
         }
-        if lsI > 0 { fbI32Bin(114) }
+        memberOrTail(lsI)
         lsI = lsI + 1
       }
       1
     }
     "none" => emitFail("emitProgram: internal: an `is` literal arm with no lowering")
   }
+}
+
+// After a ref niche's operand: its null test, negated unless `is` test `isIx` tests `null`.
+export function nicheRawIsTail(isIx: i32): i32 {
+  fbRefIsNull()
+  if !isTestsNull(isIx) { fbI32Eqz() }
+  return 1
+}
+
+// After a `K | null` atom's operand: whether it is not the null id.
+export function atomNotNulIsTail(): i32 {
+  fbI32Const(-1)
+  fbI32Bin(71) // i32.ne
+  return 1
+}
+
+// After the operand's `i`-th read: whether it is member `text`'s atom, or'd onto the reads before.
+export function atomEqIsTail(text: string, i: i32) {
+  fbI32Rel(RS_ATOM, internAtom(quoteLex(text)))
+  fbI32Bin(70)
+  memberOrTail(i)
+}
+
+// After member `i`'s compare in a membership test: or-ed into the earlier members' answer.
+export function memberOrTail(i: i32) {
+  if i > 0 { fbI32Bin(114) }
 }
 
 // After a box: its tag compared with `tag`.
@@ -8990,7 +9034,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
     }
-    "pass" | "memberBox" | "atomStr" => 0
+    "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -9001,7 +9045,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "null" | "rec" | "obj" | "refList" | "map" | "clo" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
-    "pass" | "memberBox" | "ladder" => 0
+    "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
 
@@ -9010,6 +9054,14 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
   if p.hbArm == "atom" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
+  } else if p.hbArm == "mapScalar" {
+    const mre = nodeAt(unwrapParen(exprIx))
+    if !(mre is Index) {
+      return emitFail("emitProgram: a map read's box plan names no read")
+    }
+    if emitMapGetScalarBox(mre.idxArr, mre.idxIndex, p.hbKind, fnIx) < 0 {
+      return -1
+    }
   } else if p.hbArm == "obj" {
     if emitVariantStruct(unwrapParen(exprIx), p.hbKind, fnIx) < 0 { return -1 }
   } else if p.hbArm == "memberBox" {
@@ -13042,8 +13094,8 @@ export function arrLitPrologue(arrIx: i32): i32 {
 }
 
 // Why list literal `arrIx` of `n` elements does not build at arm `arm` with `array.new_fixed` and
-// the short tail, or "": past the chunk cap (a string list's own), or an i32 list seeded with a
-// `null` sentinel. A literal-union list's atoms are its elements' own, and a hoisted `for`
+// the short tail, or "": past the chunk cap (a string list's own), or a non-empty i32 list seeded
+// with a `null` sentinel. A literal-union list's atoms are its elements' own, and a hoisted `for`
 // iterable reads its module list instead (`arrLitHoistGlobal`).
 export function arrLitShortWhy(
   arrIx: i32,
@@ -13053,7 +13105,9 @@ export function arrLitShortWhy(
 ): string {
   const cap = if arm == "str" { allocLitChunk() } else { NEW_FIXED_MAX }
   if n > cap { return "long" }
-  if arm == "i32" && arrElemIsNullUnitAt(arrIx, fnIx) { return "null sentinel" }
+  if arm == "i32" && n > 0 && arrElemIsNullUnitAt(arrIx, fnIx) {
+    return "null sentinel"
+  }
   return ""
 }
 
@@ -14191,6 +14245,11 @@ function emitMapGetScalarBox(
   fnIx: i32,
 ) {
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return emitMapGetScalarBoxTail(atomKind)
+}
+
+// `emitMapGetScalarBox` after its probe: the box of value-atom kind `atomKind`'s read.
+export function emitMapGetScalarBoxTail(atomKind: i32) {
   const vbIdx = vbHeapIdxOfKind(atomKind)
   if vbIdx < 0 {
     return emitFail("emitProgram: scalar map read has no value-box type")
@@ -21442,6 +21501,14 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   if ck != "none" && !(ck == "listCopy" && listCopyOwesNothing(ix, fnIx)) {
     return "pre-path coercion"
   }
+  return exprPrePathPastCoerce(ix, fnIx)
+}
+
+// `exprPrePathWhy` past its coercion, as `emitExpr` asks it of the node `coerceHeld` names: the
+// value a coercion converts.
+export function exprPrePathPastCoerce(ix: i32, fnIx: i32): string {
+  const w = unwrapParen(ix)
+  if w < 0 || w >= P.nodes.length { return "pre-path no node" }
   if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
@@ -25463,20 +25530,14 @@ function simdLaneImm(argIx: i32, max: i32): i32 {
 }
 
 // The SIMD lowering (`simd-design.md` §D6): push the row's operands in order, each at the width
-// its operand shape names, then write the one
-// 0xFD-prefix instruction with the row's immediates. Lane and shuffle indices are the literals
-// the checker pinned; a drift between the two is a loud emit failure, never a wrong byte.
+// `simdOperandPrim` names, then `simdTail`'s one 0xFD-prefix instruction. A load or store takes
+// its address through `emitMemAddr` instead.
 function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
   const row = simdRow(name)
   if row < 0 {
     return emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
   }
-  const op = simdRowOp(row)
   const sig = simdRowSig(row)
-  const args = c.callArgs
-  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
-    return emitSimdShuffle(c, name, fnIx, sig, simdRowLaneMax(row))
-  }
   if sig == SIMD_SIG_LOAD || sig == SIMD_SIG_STORE {
     let base = 1
     if sig == SIMD_SIG_STORE { base = 2 }
@@ -25485,52 +25546,102 @@ function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
     if sig == SIMD_SIG_STORE {
       if emitExpr(memCallArg(c, base, 1), fnIx) < 0 { return -1 }
     }
-    fbSimdMem(op, off)
+    fbSimdMem(simdRowOp(row), off)
     return 0
   }
-  if sig == SIMD_SIG_I_V {
-    if emitExpr(args[0], fnIx) < 0 { return -1 }
+  let i = 0
+  while i < c.callArgs.length {
+    const p = simdOperandPrim(row, i)
+    let rc = 0
+    if p == "i64" { rc = emitExprAsKind(c.callArgs[i], 3, fnIx) }
+    else if p == "f32" { rc = emitWidened(c.callArgs[i], 5, fnIx) }
+    else if p != "" { rc = emitExpr(c.callArgs[i], fnIx) }
+    if rc < 0 { return -1 }
+    i = i + 1
+  }
+  return simdTail(c, name, row)
+}
+
+// Whether call `c` is a SIMD intrinsic: the spelling, with no binding owning the name. Legacy's
+// `emitCallCore` and the IR's builder route on it.
+export function simdCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || !nameIsSimdIntrinsic(f.identName) { return false }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// The SIMD table row of call `c`'s callee, or -1 for a call of no SIMD intrinsic's name.
+export function simdCallRow(c: Call): i32 {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const f = nodeAt(c.callFn)
+  return if f is Ident { simdRow(f.identName) } else { -1 }
+}
+
+// Whether SIMD row `row` is a load or store, whose operands are its address plan's.
+export function simdRowIsMem(row: i32): boolean {
+  const sig = simdRowSig(row)
+  return sig == SIMD_SIG_LOAD || sig == SIMD_SIG_STORE
+}
+
+// The prim operand `i` of SIMD row `row` is pushed at: `v128`, or a scalar a splat, shift or
+// replace takes; "" for a lane or shuffle index, which is an immediate and no operand, and for
+// a load or store.
+export function simdOperandPrim(row: i32, i: i32): string {
+  const sig = simdRowSig(row)
+  if simdRowIsMem(row) { return "" }
+  if sig == SIMD_SIG_I_V { return "i32" }
+  if sig == SIMD_SIG_L_V { return "i64" }
+  if sig == SIMD_SIG_F_V { return "f32" }
+  if i == 0 { return "v128" }
+  if sig == SIMD_SIG_VV_V || sig == SIMD_SIG_VVV_V { return "v128" }
+  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
+    return if i == 1 { "v128" } else { "" }
+  }
+  if sig == SIMD_SIG_VI_V { return "i32" }
+  if i == 1 { return "" }
+  if sig == SIMD_SIG_REPL_I { return "i32" }
+  if sig == SIMD_SIG_REPL_L { return "i64" }
+  if sig == SIMD_SIG_REPL_F { return "f32" }
+  return ""
+}
+
+// The prim SIMD row `row` leaves: a lane read's scalar, a lane test's i32, else `v128`; "" for a
+// store, which leaves nothing.
+export function simdResultPrim(row: i32): string {
+  const sig = simdRowSig(row)
+  if sig == SIMD_SIG_STORE { return "" }
+  if sig == SIMD_SIG_V_I || sig == SIMD_SIG_LANE_I { return "i32" }
+  if sig == SIMD_SIG_LANE_L { return "i64" }
+  if sig == SIMD_SIG_LANE_F { return "f32" }
+  return "v128"
+}
+
+// After a non-memory SIMD row's operands: its instruction, with the lane or shuffle immediates
+// the checker pinned. A drift between the two is a loud emit failure, never a wrong byte.
+export function simdTail(c: Call, name: string, row: i32): i32 {
+  const op = simdRowOp(row)
+  const sig = simdRowSig(row)
+  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
+    return simdShuffleTail(c, name, sig, simdRowLaneMax(row))
+  }
+  if (
+    sig == SIMD_SIG_V_V
+    || sig == SIMD_SIG_V_I
+    || sig == SIMD_SIG_VV_V
+    || sig == SIMD_SIG_VVV_V
+    || sig == SIMD_SIG_VI_V
+    || sig == SIMD_SIG_I_V
+    || sig == SIMD_SIG_L_V
+    || sig == SIMD_SIG_F_V
+  ) {
     return fbSimdOp(op)
   }
-  if sig == SIMD_SIG_L_V {
-    if emitExprAsKind(args[0], 3, fnIx) < 0 { return -1 }
-    return fbSimdOp(op)
-  }
-  if sig == SIMD_SIG_F_V {
-    if emitWidened(args[0], 5, fnIx) < 0 { return -1 }
-    return fbSimdOp(op)
-  }
-  if emitExpr(args[0], fnIx) < 0 { return -1 }
-  if sig == SIMD_SIG_V_V || sig == SIMD_SIG_V_I { return fbSimdOp(op) }
-  if sig == SIMD_SIG_VV_V || sig == SIMD_SIG_VVV_V {
-    if emitExpr(args[1], fnIx) < 0 { return -1 }
-    if sig == SIMD_SIG_VVV_V {
-      if emitExpr(args[2], fnIx) < 0 { return -1 }
-    }
-    return fbSimdOp(op)
-  }
-  if sig == SIMD_SIG_VI_V {
-    if emitExpr(args[1], fnIx) < 0 { return -1 }
-    return fbSimdOp(op)
-  }
-  const max = simdRowLaneMax(row)
-  const lane = simdLaneImm(args[1], max)
-  if lane < 0 {
-    return emitFail(
-      "emitProgram: "
-        + name
-        + " lane index is not a compile-time literal in 0.."
-        + i32ToStr(max),
-    )
-  }
-  if sig == SIMD_SIG_REPL_I {
-    if emitExpr(args[2], fnIx) < 0 { return -1 }
-  } else if sig == SIMD_SIG_REPL_L {
-    if emitExprAsKind(args[2], 3, fnIx) < 0 { return -1 }
-  } else if sig == SIMD_SIG_REPL_F {
-    if emitWidened(args[2], 5, fnIx) < 0 { return -1 }
-  } else if (
-    sig != SIMD_SIG_LANE_I
+  if (
+    sig != SIMD_SIG_REPL_I
+    && sig != SIMD_SIG_REPL_L
+    && sig != SIMD_SIG_REPL_F
+    && sig != SIMD_SIG_LANE_I
     && sig != SIMD_SIG_LANE_L
     && sig != SIMD_SIG_LANE_F
   ) {
@@ -25540,31 +25651,34 @@ function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
         + "' has an operand shape with no lowering",
     )
   }
+  const max = simdRowLaneMax(row)
+  const lane = if c.callArgs.length > 1 { simdLaneImm(c.callArgs[1], max) } else { -1 }
+  if lane < 0 { return simdLaneFail(name, max) }
   fbSimdLane(op, lane)
   return 0
 }
 
-// `i8x16.shuffle` over two vectors: sixteen byte-lane immediates, each in 0..31. The 16-lane
+function simdLaneFail(name: string, max: i32): i32 {
+  return emitFail(
+    "emitProgram: "
+      + name
+      + " lane index is not a compile-time literal in 0.."
+      + i32ToStr(max),
+  )
+}
+
+// `i8x16.shuffle` after its two vectors: sixteen byte-lane immediates, each in 0..31. The 16-lane
 // form writes its literals as given; the 4-lane form (`__shuffle_f32x4__`) picks 32-bit lanes
 // in 0..7 and writes each one's four bytes.
-function emitSimdShuffle(c: Call, name: string, fnIx: i32, sig: i32, max: i32) {
+function simdShuffleTail(c: Call, name: string, sig: i32, max: i32): i32 {
   const lanes: i32[] = []
   let si = 2
   while si < c.callArgs.length {
     const l = simdLaneImm(c.callArgs[si], max)
-    if l < 0 {
-      return emitFail(
-        "emitProgram: "
-          + name
-          + " lane index is not a compile-time literal in 0.."
-          + i32ToStr(max),
-      )
-    }
+    if l < 0 { return simdLaneFail(name, max) }
     lanes.push(l)
     si = si + 1
   }
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
   wU8(OP_SIMD_PREFIX)
   wULEB(SIMD_I8X16_SHUFFLE)
   let i = 0
@@ -26257,13 +26371,14 @@ function emitCallCoreMemAccess(c: Call, name: string, fnIx: i32) {
 // The access a linear-memory intrinsic writes: its opcode and alignment exponent, its declared
 // operands before an optional constant offset (`mxBase`, 1 for a load and 2 for a store, 0 for no
 // such intrinsic), the kind a store's value widens to (`mxWiden`, -1 when it goes in as it
-// stands), and `mxI32` when the value stored or loaded is a plain i32.
+// stands), `mxI32` when the value stored or loaded is a plain i32, and that value's prim (`mxPrim`).
 export type MemAccessPlan = {
   mxOp: i32,
   mxAlign: i32,
   mxBase: i32,
   mxWiden: i32,
   mxI32: boolean,
+  mxPrim: string,
 }
 
 export function memAccessPlanOf(name: string): MemAccessPlan {
@@ -26274,6 +26389,7 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
       mxBase: 2,
       mxWiden: -1,
       mxI32: true,
+      mxPrim: "i32",
     }
   }
   if name == "__load_i32__" {
@@ -26283,6 +26399,7 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
       mxBase: 1,
       mxWiden: -1,
       mxI32: true,
+      mxPrim: "i32",
     }
   }
   if nameIsMemStoreIntrinsic(name) {
@@ -26294,6 +26411,7 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
       mxBase: 2,
       mxWiden: w,
       mxI32: plain,
+      mxPrim: if w == 3 { "i64" } else if w == 5 { "f32" } else if w == 4 { "f64" } else { "i32" },
     }
   }
   if nameIsMemLoadIntrinsic(name) {
@@ -26306,9 +26424,34 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
         || name == "__load_u8__"
         || name == "__load_i16__"
         || name == "__load_u16__",
+      mxPrim: memLoadPrim(name),
     }
   }
-  return { mxOp: -1, mxAlign: -1, mxBase: 0, mxWiden: -1, mxI32: false }
+  return {
+    mxOp: -1,
+    mxAlign: -1,
+    mxBase: 0,
+    mxWiden: -1,
+    mxI32: false,
+    mxPrim: "",
+  }
+}
+
+// The prim load width `name` leaves: i64 for the i64 loads and their zero-extending forms, f32 or
+// f64 for the float loads, else i32.
+function memLoadPrim(name: string): string {
+  const op = memLoadOpcode(name)
+  if op == OP_F32_LOAD { return "f32" }
+  if op == OP_F64_LOAD { return "f64" }
+  if (
+    op == OP_I64_LOAD
+    || op == OP_I64_LOAD8_U
+    || op == OP_I64_LOAD16_U
+    || op == OP_I64_LOAD32_U
+  ) {
+    return "i64"
+  }
+  return "i32"
 }
 
 // Whether call `c` is a linear-memory load or store intrinsic: the spelling, with no binding
@@ -26701,7 +26844,7 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
   // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
   // Dispatched by name like the memory intrinsics above it.
-  if !userBindsName && nameIsSimdIntrinsic(callee.identName) {
+  if simdCallNamed(c, fnIx) {
     return emitSimdIntrinsic(c, callee.identName, fnIx)
   }
   // The threads-proposal atomics (`simd-design.md` §G1), the 0xFE-prefix family.
@@ -27494,13 +27637,30 @@ function callRefPlainTail(callIx: i32, c: Call, fnIx: i32): string {
   }
   if topLambdaRecordFe(c.callFn) >= 0 { return "" }
   const ckey = cloCallSigKey(callIx, fnIx)
-  if ckey == "" || cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
-  const n = c.callArgs.length
-  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if ckey == "" { return "" }
   if (
     cloCallUnionResultUnrepresentable(callIx, fnIx)
     || cloCallReflistElemTwin(callIx, fnIx)
-    || fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
+  ) {
+    return ""
+  }
+  return callRefPlainArgsTail(callIx, c, fnIx, ckey)
+}
+
+// The part of the plain closure call `emitCallRefAt` writes at key `ckey`, which a bundle call
+// shares: an interned signature, no split set, each argument plain, and no wider result read
+// narrower; `ckey` when it holds, else "".
+function callRefPlainArgsTail(
+  callIx: i32,
+  c: Call,
+  fnIx: i32,
+  ckey: string,
+): string {
+  if cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
+  const n = c.callArgs.length
+  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if (
+    fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
     || closureCallSetSplits(nodeTyAt(c.callFn, fnIx), elabSrcDecl(fnIx))
   ) {
     return ""
@@ -27788,24 +27948,59 @@ function emitBundleChoiceArg(arg: i32, bt: i32, sigs: i32[], fnIx: i32): i32 {
 // Call `c` through a parameter holding a bundle: the closure for the call's own signature, read
 // from its field and called at that signature. 1 where the callee holds no bundle.
 function emitBundleCall(callIx: i32, c: Call, fnIx: i32): i32 {
-  const par = bundleParamOfRead(c.callFn, fnIx)
-  if par < 0 { return 1 }
-  const sigs = bundleSigsOfParam(par)
-  const si = paramStructIdxOf(par)
-  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
-  const fi = sFieldIndex(si, "c" + i32ToStr(k))
-  if k < 0 || fi < 0 || si < 0 || si >= sHeapIdx.length {
+  if bundleParamOfRead(c.callFn, fnIx) < 0 { return 1 }
+  const pk = bundlePickOf(callIx, fnIx)
+  if pk.bpField < 0 {
     return emitFailAt(
       "emitProgram: a call through a lambda called at two signatures matches none of them",
       callIx,
     )
   }
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
-  fbStructGet(sHeapIdx[si], fi)
+  fbStructGet(pk.bpHeap, pk.bpField)
   const crDepth = callRefDepth
-  const crSlot = callRefNestSlot(callRefDepth)
-  fbLocalSet(crSlot)
-  return emitCallRefAt(callIx, c, fnIx, sigKeyOfTy(sigs[k]), crDepth, crSlot)
+  const crSlot = callRefStash()
+  if irShadowOn { callRefLegacyPlain[callIx] = "" }
+  const rc = emitCallRefAt(callIx, c, fnIx, pk.bpKey, crDepth, crSlot)
+  if rc >= 0 && irShadowOn && callRefLastPlain {
+    callRefLegacyPlain[callIx] = pk.bpKey
+  }
+  return rc
+}
+
+// The member a call `callIx` through a bundle parameter (D14841) reads in frame `fnIx`: the
+// record's heap, field `c<k>`, that closure's type and its `$fnsig` key; `bpField` -1 for none.
+export type BundlePick = { bpHeap: i32, bpField: i32, bpTy: i32, bpKey: string }
+
+export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) { return none }
+  const par = bundleParamOfRead(c.callFn, fnIx)
+  if par < 0 { return none }
+  const sigs = bundleSigsOfParam(par)
+  const si = paramStructIdxOf(par)
+  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
+  const fi = sFieldIndex(si, "c" + i32ToStr(k))
+  if k < 0 || k >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return none
+  }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: sigs[k],
+    bpKey: sigKeyOfTy(sigs[k]),
+  }
+  return pk
+}
+
+// `callRefPlainKey` for a call through a bundle parameter, at its member's key; "" for any other.
+export function bundleCallRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const pk = bundlePickOf(callIx, fnIx)
+  if pk.bpField < 0 || pk.bpKey == "" { return "" }
+  return callRefPlainArgsTail(callIx, c, fnIx, pk.bpKey)
 }
 
 // Whether `arg` reads a `const` holding a returned record whole in function `fnIx`.
@@ -28937,19 +29132,20 @@ function emitPush(callIx: i32, fnIx: i32, wantValue: boolean) {
 }
 
 // Why push plan `pp` is not the plain append the IR writes, or "": a value the IR delivers at the
-// element rep (as itself, widened, boxed or unboxed from a narrowed arm), with no late receiver.
+// element rep (as itself, widened, boxed, unboxed from a narrowed arm or an atom decoded to its
+// string), with no late receiver.
 export function pushPlainWhy(pp: PushPlan, fnIx: i32): string {
   const pv = pp.ppVal
   if pv.pushNestSlot >= 0 { return "push nested list element" }
-  // Of the element arms only two convert: a literal's narrow to the receiver's atom, and an atom
-  // widened into a `(string | null)[]`. The rest write the value as itself.
-  if pv.sk == null && !boxOwedAtRecord(pp.ppArg, fnIx) {
-    if pv.isLitArr && litPushNeedsDestNarrow(pp.ppArg, fnIx) {
-      return "push element narrow"
-    }
-    if pv.isNsArr && exprIsLitAtom(pp.ppArg, fnIx) { return "push atom" }
+  // A literal's narrow to the receiver's atom is the one element arm the IR does not deliver.
+  if (
+    pv.sk == null
+    && !boxOwedAtRecord(pp.ppArg, fnIx)
+    && pv.isLitArr
+    && litPushNeedsDestNarrow(pp.ppArg, fnIx)
+  ) {
+    return "push element narrow"
   }
-  if pv.isStr && exprIsLitAtom(pp.ppArg, fnIx) { return "push atom" }
   if (exprPopBits(pp.ppArg, fnIx) & 512) != 0 { return "push late receiver" }
   return ""
 }
@@ -30712,6 +30908,7 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   const r = emitExpr(exprIx, fnIx)
   coerceHeld = held
   if r < 0 { return -1 }
+  if ck == "listCopy" || ck == "mapRetag" { return coerceTail(exprIx, fnIx) }
   match ck {
     "listCopy" => {
       return emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
@@ -30739,6 +30936,19 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     "none" => {}
   }
   return 0
+}
+
+// What a node-keyed coercion at `exprIx` writes after its value: a list copy's convert, or a
+// retagged union box's retag (a value that is no box is delivered as built). Legacy and the IR
+// share it.
+export function coerceTail(exprIx: i32, fnIx: i32): i32 {
+  const ck: CoerceKind = coerceKindAt(exprIx, fnIx)
+  // The seated kinds write their conversion around the value, at their own seat.
+  return match ck {
+    "listCopy" => emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
+    "mapRetag" => if exprUnion(exprIx, fnIx) { emitMapRetagTail(exprIx) } else { 0 }
+    "none" | "fnClo" | "mapUnbox" | "recCopy" | "box" | "unbox" | "atomstr" => 0
+  }
 }
 
 // The id of a tagged set just emitted for `exprIx`, replaced by the closure of the member it names:
@@ -33685,12 +33895,21 @@ function emitDeadValueArm(blockIx: i32): i32 {
 // and generally unable to lower. The caller pads with `unreachable` to stay stack-polymorphic.
 function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
   const s = nodeAt(stmtIx)
-  if s is IfStmt {
-    if negGuardDecidedTrue(s.ifCond, fnIx) { return stmtAlwaysExits(s.ifThen) }
-    if monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
-    return stmtAlwaysExits(s.ifThen)
-  }
-  return false
+  if !(s is IfStmt) { return false }
+  const k = if negGuardDecidedTrue(s.ifCond, fnIx) { 1 } else { -1 }
+  return guardEndsBlockWith(stmtIx, k, fnIx)
+}
+
+// Whether statement `if` `ifIx`, its condition written as constant `k` (-1 for none), ends its
+// block: a `!is` decided true, or a record guard the instance decides true, over an always-exiting
+// then arm. The rest of the block is then cut behind an `unreachable` (D932).
+export function guardEndsBlockWith(ifIx: i32, k: i32, fnIx: i32): boolean {
+  const s = nodeAt(ifIx)
+  if !(s is IfStmt) { return false }
+  const c = nodeAt(unwrapParen(s.ifCond))
+  const negTrue = k == 1 && c is Unary && c.unOp == "!"
+  if !negTrue && monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
+  return stmtAlwaysExits(s.ifThen)
 }
 
 // The function, condition node and emitted constant (`staticIsGuard`) of the most recently
@@ -34282,22 +34501,12 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   const frProof = rangeProofOpen(s, stmtIx, stepK, dynStep)
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
-  const aConst = rangeConstIs(s.frFrom, fnIx)
-  let aVal = 0
-  if aConst { aVal = rangeConstVal(s.frFrom, fnIx) }
-  let trips = -1
-  if aConst && bConst && !dynStep {
-    trips = rangeUnrollTrips(s, aVal, bVal, stepK, fnIx)
-  }
-  // A constant range a getter runs is always unrolled, so its lowering holds no loop (§D3a): the
-  // step budget charges a trip at least one step, which keeps it within `UNROLL_MAX_TRIPS`.
-  const gTrips = getterRangeTrips(stmtIx, fnIx)
+  // The arm is the one decision the IR reads too (`forRangeArm`).
+  const arm = forRangeArm(s, stmtIx, fnIx)
   let rc = 0
-  if gTrips >= 0 {
-    const parts = constRangeParts(stmtIx)
-    rc = emitRangeUnrolled(s, fnIx, vIdx, parts[0], parts[2], gTrips)
-  } else if trips > 0 {
-    rc = emitRangeUnrolled(s, fnIx, vIdx, aVal, stepK, trips)
+  if arm == "unrolled" {
+    const plan = forRangeUnrollPlan(s, stmtIx, fnIx)
+    rc = emitRangeUnrolled(s, fnIx, vIdx, plan[0], plan[1], plan[2])
   } else {
     const rt: RangeTest = {
       vIdx: vIdx,
@@ -34310,7 +34519,7 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
       excl: s.frExcl,
     }
     const wraps = rangeMayWrap(s, rt)
-    if rangePartialUnrollOk(s, stepK, dynStep, fnIx) {
+    if arm == "partial" {
       rc = emitRangePartial(s, fnIx, rt, wraps)
     } else {
       rc = emitRangeRolled(s, fnIx, rt, wraps)
@@ -34321,6 +34530,91 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   // The loop variable's scope is the loop (see `scopeUnbind`).
   scopeUnbind()
   return rc
+}
+
+// The arm `emitForRangeStmt` writes range loop `s` (statement `stmtIx` of `fnIx`) in, the one
+// decision legacy and the IR both read: "unrolled" for its copies (`forRangeUnrollPlan`, a
+// getter's constant range included), "partial" for the 4x main loop, else "rolled".
+export function forRangeArm(s: ForRange, stmtIx: i32, fnIx: i32): string {
+  if forRangeUnrollPlan(s, stmtIx, fnIx).length == 3 { return "unrolled" }
+  const dyn = !forRangeStepIsConst(s.frStep)
+  const k = if dyn { 1 } else { forRangeStaticStep(s) }
+  if rangePartialUnrollOk(s, k, dyn, fnIx) { return "partial" }
+  return "rolled"
+}
+
+// Legacy's full unroll of range loop `s` (statement `stmtIx` of `fnIx`): its first value, its
+// step and its trip count; none for a loop it does not unroll. A getter's constant range is
+// always unrolled, so its lowering holds no loop (§D3a).
+export function forRangeUnrollPlan(s: ForRange, stmtIx: i32, fnIx: i32): i32[] {
+  const none: i32[] = []
+  const g = getterRangeTrips(stmtIx, fnIx)
+  if g >= 0 {
+    const parts = constRangeParts(stmtIx)
+    return [parts[0], parts[2], g]
+  }
+  if !forRangeStepIsConst(s.frStep) { return none }
+  const k = forRangeStaticStep(s)
+  if k == 0 || !rangeConstIs(s.frFrom, fnIx) || !rangeConstIs(s.frTo, fnIx) {
+    return none
+  }
+  const a = rangeConstVal(s.frFrom, fnIx)
+  const t = rangeUnrollTrips(s, a, rangeConstVal(s.frTo, fnIx), k, fnIx)
+  return if t > 0 { [a, k, t] } else { none }
+}
+
+// What keeps a range loop of arm "rolled" from the IR: a dynamic step, a wrap exit
+// (`rangeMayWrap`), or a hoist or range proof legacy may open. Those two read only the tree, not
+// the live rows `loopHoistOpen` and `rangeProofOpen` consult at emit time, since a claim is decided
+// before legacy writes the function; each answers yes wherever legacy might. "" for none.
+export function forRangeRolledBlock(
+  s: ForRange,
+  stmtIx: i32,
+  fnIx: i32,
+): string {
+  if !forRangeStepIsConst(s.frStep) { return "dynamic step" }
+  const k = forRangeStaticStep(s)
+  if k == 0 { return "step" }
+  if loopHoistCands(-1, s.frBody, fnIx, stmtIx, -1).length > 0 {
+    return "hoisted"
+  }
+  if (
+    k > 0
+    && exprIsNonNegIntLit(s.frFrom)
+    && hoistPathDecl(rangeTopLenOf(s)) >= 0
+  ) {
+    return "proven"
+  }
+  const bConst = rangeConstIs(s.frTo, fnIx)
+  const rt: RangeTest = {
+    vIdx: -1,
+    bIdx: -1,
+    bConst: bConst,
+    bVal: if bConst { rangeConstVal(s.frTo, fnIx) } else { 0 },
+    sIdx: -1,
+    dynStep: false,
+    stepK: k,
+    excl: s.frExcl,
+  }
+  if rangeMayWrap(s, rt) { return "wrap exit" }
+  return ""
+}
+
+// The static step of range loop `s`: 1 when it has none, else its folded integer literal; 0 when
+// none folds into an `i32`, a step the checker refuses.
+export function forRangeStaticStep(s: ForRange): i32 {
+  if s.frStep < 0 { return 1 }
+  const litIx = cexLitPeel(s.frStep)
+  if litIx < 0 { return 0 }
+  const lit = nodeAt(litIx)
+  if !(lit is NumLit) { return 0 }
+  const t = lit.numText
+  const neg = intLitIsNegated(s.frStep)
+  if numLexIsFloat(t) || !(numLexFitsI32(t) || neg && numLexIs2Pow31(t)) {
+    return 0
+  }
+  const k = parseI32(t)
+  return if neg { 0 - k } else { k }
 }
 
 // A range loop's continue test, its operands resolved: the loop var's local, the bound's local
@@ -38197,7 +38491,7 @@ export function objLitStashRowAt(objIx: i32, si: i32): i32 {
 
 // Whether `emitObj` evaluates literal `objIx` at row `si` in source order into a stash: a field
 // the layout drops runs for its effect (D1696), and an observable permutation keeps order (D1510).
-function objLitStashes(objIx: i32, si: i32): boolean {
+export function objLitStashes(objIx: i32, si: i32): boolean {
   const cnt = sFieldCount[si]
   return objLitDropsField(objIx, sFieldNames, sFieldStart[si], cnt)
     || objLitNeedsOrderStash(objIx, sFieldNames, sFieldStart[si], cnt)
@@ -40654,7 +40948,7 @@ export function arrNewTail(pl: ArrNewPlan, slot: i32): i32 {
 }
 
 // After an `__array_new_default__` site's stash: the zeroed backing, then the wrapper. Returns 0.
-function arrNewDefaultTail(pl: ArrNewPlan, slot: i32): i32 {
+export function arrNewDefaultTail(pl: ArrNewPlan, slot: i32): i32 {
   fbLocalGet(slot)
   fbArrayNewDefault(pl.anBack)
   return arrNewWrap(pl, slot)
@@ -41716,6 +42010,43 @@ function emitCoalesceCallArm(
   return emitPopOr(lhsIx, e.binRight, fnIx)
 }
 
+// `l ?? d` over an i32 niche cell whose null is `sent`: the operand once, the default on the null
+// path, and the present arm re-reading the operand when `reEval`, else the stash.
+function emitCoalesceNicheCell(
+  e: BinExpr,
+  sent: i32,
+  reEval: boolean,
+  fnIx: i32,
+): i32 {
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  coalNicheOpen(sent, reEval)
+  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+  coalNicheElse(reEval)
+  if reEval {
+    if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  }
+  fbEnd()
+  return 0
+}
+
+// After a niche cell's operand: keep it in the stash slot unless `reEval`, then open the `if` the
+// default fills when the cell is `sent`.
+export function coalNicheOpen(sent: i32, reEval: boolean) {
+  if !reEval {
+    fbLocalSet(coalesceCallBoolSlot)
+    fbLocalGet(coalesceCallBoolSlot)
+  }
+  fbI32Const(sent)
+  fbI32Bin(70) // i32.eq
+  fbIf(127)
+}
+
+// A niche cell's present arm: the stashed operand unless `reEval`, whose caller re-reads it.
+export function coalNicheElse(reEval: boolean) {
+  fbElse()
+  if !reEval { fbLocalGet(coalesceCallBoolSlot) }
+}
+
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
@@ -41725,73 +42056,13 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // one that is not (`coalLhsStashes`: a call, an `if`, a field of a call) is written once into
   // the stash slot `coalChainHasCallLhs` reserved (D1250, D17036).
   const lhsReEval = !coalLhsStashes(lhsIx)
-  // `<e> ?? d` over a `boolean | null` niche (an ident binding, a `boolean | null` struct field,
-  // or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the sentinel 2
-  // (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers every
-  // re-readable place.
-
-  // A branching `if` over the 0x7f blocktype, which is what `??` means: the default runs only
-  // when the lhs is null. `select` evaluates both value operands unconditionally, so a
-  // side-effecting default would run on the present path too — the same lowering the `K |
-  // null` niche, the `string | null` niche and every nullable-ref rep already use.
+  // A `boolean | null` cell holds 0/1 or the sentinel 2, a `K | null` cell an atom id or -1: a
+  // branching `if` on the sentinel, never a `select`, so the default runs only on the null path.
+  // `coalesceLitUnionFits` decides whether the rep survives the default (`k ?? "zz"` declines).
   if arm == "nulBoolJoin" { return emitCoalesceNulBoolJoin(e, exprIx, fnIx) }
-  if arm == "nulBool" {
-    if emitExpr(e.binLeft, fnIx) < 0 {
-      return -1 // the niche i32
-    }
-    // D1250 — a NON-RE-READABLE operand (an if-EXPRESSION) stashes its ONE evaluation, exactly
-    // as the `K | null` arm below does; a place operand keeps the re-read, byte-identical.
-    if !lhsReEval {
-      fbLocalSet(coalesceCallBoolSlot)
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbI32Const(2)
-    fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)
-    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
-    if emitExpr(e.binRight, fnIx) < 0 {
-      return -1 // d, reached only on the null path
-    }
-    fbElse() // 0x05 else — present → the 0/1 cell
-    if lhsReEval {
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-    } else {
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbEnd() // 0x0b end
-    return 0
-  }
-  // `<e> ?? d` over a `K | null` niche (ident/param/global, a struct field, an element read, or
-  // a returning call). The i32 cell holds an interned atom id (>= 0) or sentinel `-1`, so the
-  // null test is the `-1` compare and the block type is unconditional `0x7f`.
-  // `coalesceLitUnionFits` is the one claim deciding whether the rep survives the default, so `k ?? "zz"` declines here and keeps its loud reject.
-
-  // A branching `if`, not a `select`: `select` evaluates both value operands, so a
-  // side-effecting default would run on the present path. The `if` framing costs three bytes
-  // more per site; a call lhs is stashed once in the shared i32 coalesce-call slot.
-  if arm == "litUnion" {
-    // The operand reads at the niche its classifier names, so a prelude join builds the atom.
-    if (emitExpr(e.binLeft, fnIx) < 0) {
-      return -1 // the niche i32, evaluated ONCE
-    }
-    if !lhsReEval {
-      fbLocalSet(coalesceCallBoolSlot)
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbI32Const(-1)
-    fbI32Bin(70) // 0x46 i32.eq → x == -1 (null)
-    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
-    if (emitExpr(e.binRight, fnIx) < 0) {
-      return -1 // d, as this niche's i32
-    }
-    fbElse() // 0x05 else — present → the atom id
-    if lhsReEval {
-      if (emitExpr(e.binLeft, fnIx) < 0) { return -1 }
-    } else {
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbEnd() // 0x0b end
-    return 0
-  }
+  if arm == "nulBool" { return emitCoalesceNicheCell(e, 2, lhsReEval, fnIx) }
+  // The operand reads at the niche its classifier names, so a prelude join builds the atom.
+  if arm == "litUnion" { return emitCoalesceNicheCell(e, -1, lhsReEval, fnIx) }
   // `<e> ?? d` over a `K | null` niche whose default is not a member: the result is a
   // `string`, so the atom is evaluated once and the present arm widens it (D3198).
   if arm == "nulAtomStr" { return emitCoalesceNulAtomStr(e, fnIx) }
