@@ -13,6 +13,11 @@ kind it refused was refused by name, not by a writer the IR lacked.
   `nulstruct`, `i64` and `f64`, each bound through legacy's tail.
 - **Box receiver.** A union list's walk variable read as its box (`u is A`, `u.a` under it) is
   `irBBoxLocal`'s: its declaration is a `LoopVar`, whose variable the walk made.
+- **Signed iterable literals.** A `for` iterable literal's elements are built as one immediate
+  each where they are a minus-signed number (`signedLitAt`). Legacy's hoist reads `-0.6` as one
+  constant; the IR built it as a `neg` temp, and the hoisted read left it unwritten, so the
+  lowering fell back (`for iterable element`). That was already true of `[1, -2]` on master;
+  admitting `f64` walks exposed it in `tests/cases/math/arc-hypot.vl`.
 - A master shadow row pinned a generic instance's `f64` walk as a named miss. Both instances now
   cover, so the row expects six walks.
 
