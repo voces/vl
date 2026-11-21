@@ -9,11 +9,16 @@
 //             temp's definition: the verifier must fail naming rule 3 and rule 4. Without
 //             these a verifier that checked nothing would pass.
 //
+// A new row is one file, `tests/ir-shadow-rows/<slug>.vl`: line 1 is `// ir shadow: <name>`, then
+// `// expect <row key> = N` (or `>= N`) and `// expect no row containing <text>` lines, then the
+// program. Every file row also wants rc 0, no `fail` row and matched equal to covered. A name both
+// inline and in a file fails the tripwire.
+//
 // Loads the real seed (`build/vl-compiler.wasm`); absent, the suite self-ignores.
 //
 // Run with:  deno test -A tests/vl_ir_shadow_test.ts
 
-import { COMPILER, exists } from "./support/tree.ts";
+import { COMPILER, exists, ROOT } from "./support/tree.ts";
 
 const ignore = !exists(COMPILER);
 if (ignore) {
@@ -51,6 +56,116 @@ const run = (src: string, arm: boolean | number, corrupt = 0) => {
 
 const failures = (rows: Map<string, number>) =>
   [...rows.keys()].filter((k) => k.startsWith("fail "));
+
+/** One `tests/ir-shadow-rows/*.vl` file: its name line, its expectations and its program. */
+type FileRow = {
+  file: string;
+  name: string;
+  counts: { key: string; op: "=" | ">="; n: number }[];
+  absent: string[];
+  src: string;
+};
+
+const ROWS_DIR = `${ROOT}/tests/ir-shadow-rows`;
+const NAME_LINE = /^\/\/ (ir shadow: .+)$/;
+const COUNT_LINE = /^\/\/ expect (.+?) (=|>=) (\d+)$/;
+const ABSENT_LINE = /^\/\/ expect no row containing (.+)$/;
+
+/** Parses one row file; a directive line it cannot read is an error, never a skipped check. */
+const parseRow = (file: string, text: string): FileRow => {
+  const lines = text.split("\n");
+  const name = NAME_LINE.exec(lines[0] ?? "")?.[1];
+  if (name === undefined) throw new Error(`${file}:1: want \`// ir shadow: <name>\`, got ${JSON.stringify(lines[0])}`);
+  const row: FileRow = { file, name, counts: [], absent: [], src: text };
+  for (let i = 1; i < lines.length && lines[i].startsWith("// expect"); i++) {
+    const count = COUNT_LINE.exec(lines[i]);
+    const absent = ABSENT_LINE.exec(lines[i]);
+    if (absent) row.absent.push(absent[1]);
+    else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
+    else throw new Error(`${file}:${i + 1}: unreadable directive ${JSON.stringify(lines[i])}`);
+  }
+  return row;
+};
+
+const fileRows: FileRow[] = [...(() => {
+  try {
+    return Deno.readDirSync(ROWS_DIR);
+  } catch {
+    return [];
+  }
+})()]
+  .filter((e) => e.isFile && e.name.endsWith(".vl"))
+  .map((e) => e.name)
+  .sort()
+  .map((f) => parseRow(`tests/ir-shadow-rows/${f}`, Deno.readTextFileSync(`${ROWS_DIR}/${f}`)));
+
+/** Grades one file row's armed compile against its expectations and the standing three. */
+const gradeRow = (row: FileRow) => {
+  const { rc, rows } = run(row.src, true);
+  const got = JSON.stringify([...rows]);
+  if (rc !== 0) throw new Error(`${row.file}: want compileSrc rc 0, got ${rc}`);
+  const fails = failures(rows);
+  if (fails.length > 0) throw new Error(`${row.file}: want no failure, got:\n${fails.join("\n")}`);
+  if ((rows.get("matched") ?? 0) !== (rows.get("covered") ?? 0)) {
+    throw new Error(`${row.file}: want every covered function matched, got ${got}`);
+  }
+  for (const { key, op, n } of row.counts) {
+    const have = rows.get(key) ?? 0;
+    if (op === "=" ? have !== n : have < n) throw new Error(`${row.file}: want "${key}" ${op} ${n}, got ${have}; rows ${got}`);
+  }
+  for (const text of row.absent) {
+    const hit = [...rows.keys()].filter((k) => k.includes(text));
+    if (hit.length > 0) throw new Error(`${row.file}: want no row containing "${text}", got ${JSON.stringify(hit)}`);
+  }
+};
+
+for (const row of fileRows) Deno.test({ name: row.name, ignore, fn: () => gradeRow(row) });
+
+// The tripwire: a row name is one row, inline or in a file, never both and never two files.
+Deno.test({
+  name: "ir shadow: no row name is both inline and a file, or two files",
+  fn: () => {
+    const self = Deno.readTextFileSync(new URL(import.meta.url));
+    const inline = new Set([...self.matchAll(/^\s*name: ["`](ir shadow: [^"`$]+)["`],$/gm)].map((m) => m[1]));
+    const seen = new Map<string, string>();
+    const clash: string[] = [];
+    for (const row of fileRows) {
+      if (inline.has(row.name)) clash.push(`${row.file} and an inline row are both "${row.name}"`);
+      const other = seen.get(row.name);
+      if (other !== undefined) clash.push(`${other} and ${row.file} are both "${row.name}"`);
+      seen.set(row.name, row.file);
+    }
+    if (inline.size < 50) throw new Error(`want the inline row names read (at least 50), got ${inline.size}`);
+    if (clash.length > 0) throw new Error(`want each row name once, got:\n${clash.join("\n")}`);
+  },
+});
+
+// The file rows' controls: an unreadable directive is refused, and a row whose expectation the
+// compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
+Deno.test({
+  name: "ir shadow: a file row's bad directive and unmet expectation each fail",
+  ignore,
+  fn: () => {
+    const src = `function sq(x: i32): i32 { return x * x }\nprint(sq(3))\n`;
+    let refused = false;
+    try {
+      parseRow("control.vl", `// ir shadow: control\n// expect covered ~ 1\n${src}`);
+    } catch {
+      refused = true;
+    }
+    if (!refused) throw new Error("want a bad directive refused, got it parsed");
+    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered = 1\n${src}`));
+    for (const bad of ["// expect covered = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
+      let failed = false;
+      try {
+        gradeRow(parseRow("control.vl", `// ir shadow: control\n${bad}\n${src}`));
+      } catch {
+        failed = true;
+      }
+      if (!failed) throw new Error(`want "${bad}" to fail its grade, got a pass`);
+    }
+  },
+});
 
 // Scalars, locals, every control form, direct calls and a global: all inside I1's set.
 const COVERED = `let total = 0
