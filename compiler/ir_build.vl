@@ -113,6 +113,7 @@ import {
   valtypeOf,
 } from "./ir_lower"
 import {
+  FieldStoreValArm,
   GlobalCtx,
   ObjLitArm,
   PrintArm,
@@ -150,9 +151,8 @@ import {
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
-  fieldStoreValuePlain,
+  fieldStoreValueArmOf,
   fieldStoreVariantAt,
-  fieldStoreVariantValuePlain,
   fnTagLeafEmitted,
   fnValueArmOf,
   fnValueFeOf,
@@ -231,6 +231,7 @@ import {
   valueIfLitTrue,
   variantFieldArmOf,
   variantFieldBoxTy,
+  variantFieldStoreValueArmOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
 import {
@@ -4775,7 +4776,7 @@ function elemStore(b: i32[], n: BinExpr, t: Index, ix: i32) {
 }
 
 // A struct field store `o.f = v` that legacy writes as the record, the bare value and its
-// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValuePlain`); a variant's, the record
+// store tail (`fieldStoreArmOf`'s `struct` arm, `fieldStoreValueArmOf`); a variant's, the record
 // a variant receiver is or a box narrowed to one yields (`variantParam`, `narrowVariant`).
 function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   const arm = fieldStoreArmOf(n.binLeft, ibFnIx)
@@ -4792,17 +4793,32 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   ) {
     return skip("field store narrowed variant")
   }
-  const plain = if arm == "struct" { fieldStoreValuePlain(sf[0], sf[1], n.binRight, ibFnIx) } else { fieldStoreVariantValuePlain(sf[0], sf[1], n.binRight, ibFnIx) }
-  if !plain { return skip("field store value") }
+  const va = if arm == "struct" { fieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) } else { variantFieldStoreValueArmOf(sf[0], sf[1], n.binRight, ibFnIx) }
+  if !fieldStoreValueDelivers(va) { return skip("field store value " + va) }
+  if va == "armDelivery" && narrowedArmNeedsUnbox(n.binRight, ibFnIx) {
+    return skip("field store arm unbox")
+  }
   const rt = nodeTyAt(t.memObj, ibFnIx)
   const r = repNodeOfTy(rt)
   if !(repNodeAt(r) is RRecord) { return skip("field store receiver") }
   const k = repRecordKidOf(r, rt, t.memProp)
   if k < 0 { return skip("field kid") }
+  const dst = repNodeKids(r)[k]
+  // A generic instance's receiver type may read the field at another rep than its row stores.
+  if !fieldStoreRepFits(va, dst) { return skip("field store row rep") }
+  const siteTy = if arm == "struct" { structFieldBoxTy(sf[0], sf[1]) } else { variantFieldBoxTy(sf[0], sf[1]) }
+  // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
+  if (
+    va == "box"
+    && exprUnion(n.binRight, ibFnIx)
+    && boxIntoOtherUnion(n.binRight, dst, siteTy)
+  ) {
+    return skip("field store box from a box")
+  }
   const vAt = b.length
   const v0 = irBExpr(b, t.memObj)
   const at = b.length
-  const x = irBExpr(b, n.binRight)
+  const x = deliver(b, n.binRight, dst, siteTy)
   if ibMiss != "" { return 0 }
   // Legacy reads the receiver, then the value: a receiver variable is staged at its own start, so
   // the lowering writes it below a valued `if` the value wrote ahead of the store.
@@ -4820,6 +4836,32 @@ function fieldStore(b: i32[], n: BinExpr, t: Member, ix: i32) {
   }
   irBNode(b, { sfV: v, sfIx: k, sfSrc: x }, -1, ibNoValue, ix)
   return 0
+}
+
+// The field store value arms whose write is the value delivered at the field's rep: the bare
+// value, the box (`emitUnionBoxOwed`, the hole box plan), the widenings (`emitWidened`), an atom's
+// decode to its string (`emitAtomToStr`, which `emitStrValue` writes for an atom) and a nullable
+// record's value where `emitArmDelivery` owes no unbox (`fieldStore` checks that).
+function fieldStoreValueDelivers(va: FieldStoreValArm): boolean {
+  return match va {
+    "plain" | "box" | "f64" | "i64" | "f32" | "atomToStr" | "strValue" | "armDelivery" => true
+    "noKind" | "nulnone" | "unencodable" => false
+  }
+}
+
+// Whether the receiver's field rep `dst` is the slot value arm `va` writes: a box into a box, a
+// widening into its width, an atom's decode into a string.
+function fieldStoreRepFits(va: FieldStoreValArm, dst: i32): boolean {
+  return match va {
+    "box" => repNodeAt(dst) is RBox || boxedNullable(dst)
+    "f64" => repPrim(dst) == "f64"
+    "i64" => repPrim(dst) == "i64"
+    "f32" => repPrim(dst) == "f32"
+    "atomToStr" => repPrim(dst) == "str"
+    "strValue" => repPrim(dst) == "str" || strNullable(dst)
+    "plain" | "armDelivery" => true
+    "noKind" | "nulnone" | "unencodable" => false
+  }
 }
 
 function loopIx(label: string): i32 {
