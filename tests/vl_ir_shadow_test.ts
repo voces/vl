@@ -2612,3 +2612,21 @@ Deno.test({
     }
   },
 });
+
+// A negated literal is one constant at the negation's own width (`emitSignedNumLitAt`), whatever
+// its magnitude's: `-2147483647 - 1` and `-9223372036854775807 - 1` build and match.
+const NEGATED_LITERAL =
+  `function a4() { return -2147483647 - 1 }\nfunction a8() { return -9223372036854775807 - 1 }\nfunction b2(x: i32) { return x > -2147483648 }\nprint(a4())\nprint(a8())\nprint(b2(0))\n`;
+Deno.test({
+  name: "ir shadow: a negated literal builds as one constant at the negation's width and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(NEGATED_LITERAL, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want a4, a8 and b2 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});

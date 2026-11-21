@@ -314,6 +314,7 @@ import {
   ctxTyAt,
   fnEnvIdxOf,
   nodeTyAt,
+  numLitTyWidth,
   numLitWidth,
   parentBindingFrameArenaOf,
   parentBindingOf,
@@ -1586,7 +1587,30 @@ function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   return o
 }
 
+// Number literal `n` at `ix` as an immediate at rep `rep`, where its own width is that rep's.
 function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
+  const k: string = repPrim(rep) ?? ""
+  // Past the narrow reading, legacy spells the literal at its own width (`emitNumLexAt`).
+  if (
+    (k == "i32" || k == "i64")
+    && !numLexIsFloat(n.numText)
+    && !numLitNarrow(n, k)
+    && numLitWidth(ix, ibFnIx) != k
+  ) {
+    return irBMiss("wide literal width")
+  }
+  return numLitAt(n, ix, rep)
+}
+
+// Whether integer literal `n` reads as its narrow value at width `k`.
+function numLitNarrow(n: NumLit, k: string): boolean {
+  const v = memOffsetLexValue(n.numText)
+  return v >= 0 && (k != "i32" || v <= 2147483647)
+}
+
+// Number literal `n` at `ix` as an immediate at rep `rep`, its lexeme spelled at that rep's width
+// whatever the literal's own (`emitNumLexAt`).
+function numLitAt(n: NumLit, ix: i32, rep: i32): Opnd {
   const k: string = repPrim(rep) ?? ""
   if k == "f64" || k == "f32" {
     const text = numLitLexAt(ix, n.numText, k)
@@ -1601,14 +1625,12 @@ function numLit(n: NumLit, ix: i32, rep: i32): Opnd {
     return f
   }
   if numLexIsFloat(n.numText) { return irBMiss("float literal at an integer") }
-  const v = memOffsetLexValue(n.numText)
-  if v >= 0 && (k != "i32" || v <= 2147483647) {
-    const o: Opnd = { oiRep: rep, oiBits: v }
+  if numLitNarrow(n, k) {
+    const o: Opnd = { oiRep: rep, oiBits: memOffsetLexValue(n.numText) }
     return o
   }
-  // Past the narrow reading, the bits legacy's literal writer spells at its own width: the lexeme
-  // split into halves at `i64`, wrapped at `i32` (`emitNumLexAt`).
-  if numLitWidth(ix, ibFnIx) != k { return irBMiss("wide literal width") }
+  // The bits legacy's literal writer spells: the lexeme split into halves at `i64`, wrapped at
+  // `i32` (`emitNumLexAt`).
   let bits: i64 = 0
   if k == "i64" {
     const pr = parseI64Pair(n.numText)
@@ -4112,6 +4134,17 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if n is Ident { return identRead(b, n, ix, rep, cell) }
   if n is Unary {
     if n.unOp != "-" && n.unOp != "!" { return irBMiss("unary " + n.unOp) }
+    // A negated literal is one constant at the negation's own width, which may be narrower than
+    // its operand's: `-2147483647` over an `i64` magnitude (`emitSignedNumLitAt`).
+    const neg = if n.unOp == "-" { unwrapParen(n.unArg) } else { -1 }
+    if (
+      neg >= 0
+      && neg < P.nodes.length
+      && nodeAt(neg) is NumLit
+      && numLitTyWidth(ix, ibFnIx) != ""
+    ) {
+      return signedLitAt(ix, rep)
+    }
     const uw = operandWhy(n.unArg)
     if uw != "" { return irBMiss(uw) }
     const a = irBExpr(b, n.unArg)
@@ -4368,8 +4401,8 @@ function assignValueLit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // `rep` (`emitSignedNumLitAt`): each minus negates it as the lowering folds a `neg` of one.
 function signedLitAt(lit: i32, rep: i32): Opnd {
   const n = nodeAt(lit)
-  if n is NumLit { return numLit(n, lit, rep) }
-  if !(n is Unary) || n.unOp != "-" { return irBMiss("assignment value lit") }
+  if n is NumLit { return numLitAt(n, lit, rep) }
+  if !(n is Unary) || n.unOp != "-" { return irBMiss("signed literal") }
   const a = signedLitAt(unwrapParen(n.unArg), rep)
   if !(a is OImm) { return a }
   const k: string = repPrim(rep) ?? ""
