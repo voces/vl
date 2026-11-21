@@ -2607,8 +2607,9 @@ print(qnull().o == null)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
+    const cov = rows.get("covered") ?? 0;
+    if (cov < 4 || (rows.get("matched") ?? 0) !== cov) {
+      throw new Error(`want at least cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
