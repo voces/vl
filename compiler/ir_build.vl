@@ -285,7 +285,12 @@ import {
   instTyOrSelf,
   narrowedArmNeedsUnbox,
 } from "./emit_plan_coerce"
-import { ifJoinAdaptsScalar, letIfInitSinks, retRefusedWhy } from "./wasmEmit"
+import {
+  ifJoinAdaptsScalar,
+  letIfInitSinks,
+  retRefusedWhy,
+  spreadRunLit,
+} from "./wasmEmit"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -3340,9 +3345,9 @@ function arrayLit(
   return irBLetTemp(b, r, ix, lrep)
 }
 
-// A spread literal of one item group, a spread source, along legacy's plain arm (`spreadPlanOf`):
-// the source built raw, as legacy emits it, at the literal's own list rep and row, into slots its
-// recorded ordinal keys. A boxing, converting or many-group literal is a named miss.
+// A spread literal along legacy's plain arm (`spreadPlanOf`): each item group, a spread source or a
+// run of plain elements as legacy's run literal, built raw as legacy emits it at the literal's own
+// list rep and row, into slots its recorded ordinal keys. A boxing or converting literal is a miss.
 function spreadLit(
   b: i32[],
   n: ArrayLit,
@@ -3350,10 +3355,6 @@ function spreadLit(
   rep: i32,
   lb: ListBuild,
 ): Opnd {
-  // Read off the elements before any plan is asked: the plan's wrapper lookups mint types.
-  if n.arrElems.length != 1 || spreadArgOf(n.arrElems[0]) < 0 {
-    return irBMiss("array spread groups")
-  }
   if (
     spreadBoxDestRow(n.arrElems, ibFnIx, lb) >= 0
     || spreadBoxingSource(ix, ibFnIx) >= 0
@@ -3364,22 +3365,60 @@ function spreadLit(
   const p = spreadPlanOf(ix, ibFnIx, lb)
   if p.spWhy != "" { return irBMiss("array spread plan") }
   if !spreadPairKnown(p) { return irBMiss("array spread pair unminted") }
-  if p.spSrcKinds[0] != p.spKind { return irBMiss("array spread conversion") }
-  if p.spGroupRows[0] != p.spRow { return irBMiss("array spread sub row") }
+  for k in p.spSrcKinds {
+    if k != p.spKind { return irBMiss("array spread conversion") }
+  }
+  for r in p.spGroupRows {
+    if r != p.spRow { return irBMiss("array spread sub row") }
+  }
   if !(repNodeAt(rep) is RList) { return irBMiss("array rep") }
-  const v = spreadSrcBuild(b, p, p.spSrcs[0], ix, rep)
-  if ibMiss != "" { return v }
-  if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
-  const r: Rhs = { spSrc: v, spKind: lb.lbKind, spSlot: lb.lbSlot, spAt: ix }
+  // The groups as legacy's arm makes them, every run literal before any group is built.
+  const grps: i32[] = []
+  let run: i32[] = []
+  for e in n.arrElems {
+    const src = spreadArgOf(e)
+    if src >= 0 {
+      if run.length > 0 {
+        grps.push(spreadRunLit(run, ix, ix, n.pos))
+        run = []
+      }
+      grps.push(src)
+    } else {
+      run.push(e)
+    }
+  }
+  if run.length > 0 { grps.push(spreadRunLit(run, ix, ix, n.pos)) }
+  if grps.length != p.spSrcs.length {
+    return irBMiss("array spread plan groups")
+  }
+  const at = b.length
+  const srcs: Opnd[] = []
+  let g = 0
+  while g < grps.length {
+    const v = spreadSrcBuild(b, p, g, grps[g], ix, rep)
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep { return irBMiss("array spread source rep") }
+    srcs.push(v)
+    g = g + 1
+  }
+  if ifBelowLead(b, at, "array spread short-circuit operand") { return srcs[0] }
+  const r: Rhs = {
+    spSrcs: srcs,
+    spGroups: grps,
+    spKind: lb.lbKind,
+    spSlot: lb.lbSlot,
+    spAt: ix,
+  }
   return irBLetTemp(b, r, ix, rep)
 }
 
-// Spread source `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
+// Group `g`'s list `src` of literal `ix` (rep `rep`) built as `emitSpreadGroup` emits it: a list
 // literal at its own typed build, typed at that build's type, else at the group's, which is the
 // literal's own kind and row and so its type; any other source as itself, with no paren between.
 function spreadSrcBuild(
   b: i32[],
   p: SpreadPlan,
+  g: i32,
   src: i32,
   ix: i32,
   rep: i32,
@@ -3395,7 +3434,7 @@ function spreadSrcBuild(
     if lrep < 0 { return irBMiss("array spread literal source rep") }
     return arrayLit(b, ln, lit, lrep, tb, ba.baTy)
   }
-  const gb: ListBuild = { lbKind: p.spGroupKinds[0], lbSlot: p.spGroupRows[0] }
+  const gb: ListBuild = { lbKind: p.spGroupKinds[g], lbSlot: p.spGroupRows[g] }
   return arrayLit(b, ln, lit, rep, gb, exprTyOf(ix))
 }
 
