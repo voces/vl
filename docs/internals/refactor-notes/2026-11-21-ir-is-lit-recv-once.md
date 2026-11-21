@@ -7,10 +7,15 @@ that count is one, a single member or a stashed or statically false box, a temp 
 
 ## What landed
 
-- **The read count.** `litArmsReadsOf` states how many times `emitIsTestLitArms` reads the receiver
-  at an arm, from the same member lists and box plan its writers use (`litIsMemberTexts`,
-  `litIsBoxLexes`, `unionLitIsPlanOf`). The builder refuses a temp only where it is read more than
-  once.
+- **The read count, checked by legacy.** `litArmsReadsOf` states how many times
+  `emitIsTestLitArms` reads the receiver at an arm, from the same member lists and box plan its
+  writers use (`litIsMemberTexts`, `litIsBoxLexes`, `unionLitIsPlanOf`). The builder refuses a temp
+  only where it is read more than once, and the verifier holds such an operand to a variable by the
+  same count. Legacy's writers return the reads they wrote (`emitUnionLitIs`, `emitLitMemberEq`),
+  and `emitIsTestLitArms` refuses where their sum is not the count (`litArmsReadsAgree`), so a
+  drift is loud wherever legacy writes the function: the armed shadow, `--cases`, `--claimless`
+  and any unclaimed function. Validated on a failing control: a seed whose `atomEq` count is off by
+  one refuses `tests/ir-shadow-rows/is-lit-arms-atom.vl` under the shadow.
 - **Why not a stash.** Legacy stashes no multi-read receiver here: it accepts several reads only
   over a re-readable place (`unionEqOperandOk`: a field or element path), and writes the place
   again per read. The 35 rows left are such places the IR builds as a temp; serving them is

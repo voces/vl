@@ -7993,6 +7993,11 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
 // it to the wrapper of the row the read's consumer types itself against.
 function emitRefArrayUnionUnboxRead(exprIx: i32, fnIx: i32) {
   if emitUnionBoxPush(exprIx, fnIx) < 0 { return -1 }
+  return refArrayUnionUnboxTail(exprIx, fnIx)
+}
+
+// `emitRefArrayUnionUnboxRead` past the box: its payload cast to the read's ref-list wrapper.
+export function refArrayUnionUnboxTail(exprIx: i32, fnIx: i32) {
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   const slot = refListSlotOfExprStrict(exprIx, fnIx)
   if slot < 0 || slot >= rlWrapIdx.length {
@@ -8063,6 +8068,11 @@ function listPayloadCastTail(wrap: i32, strict: boolean) {
 // an i32 or atom value). The result is the `(ref $mapStruct)` a bare map binding pushes.
 function emitMapUnionUnboxRead(exprIx: i32, fnIx: i32) {
   if emitUnionBoxPush(exprIx, fnIx) < 0 { return -1 }
+  return mapUnionUnboxTail(exprIx, fnIx)
+}
+
+// `emitMapUnionUnboxRead` past the box: its payload cast to the read's map struct.
+export function mapUnionUnboxTail(exprIx: i32, fnIx: i32) {
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   // The arm's map-value slot, the one `mapShapeOfExpr` types this read's consumer against.
   fbRefCast(mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx))) // the payload IS the map struct ref
@@ -8550,10 +8560,9 @@ function emitUnionCoerceValueAtom(
       if emitExpr(exprIx, fnIx) < 0 { return -1 }
       return atomNulStrTail(nlTexts)
     }
-    fbI32Rel(RS_TAG, scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
-    if emitAtomToStr(exprIx, fnIx) < 0 { return -1 }
-    fbStructNew(uBoxIdx) // { tag, member-string ref }
-    return 0
+    // The string tag (kind 2 rides the anyref directly), the member string, the box.
+    const sp: HoleBox = { hbArm: "atomAsStr", hbKind: 2, hbSrc: -1 }
+    return emitHoleBox(sp, exprIx, fnIx)
   }
   return emitUnionCoerceAtomBox(uSet, uTy, exprIx, bareIx, fnIx)
 }
@@ -9073,7 +9082,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbI32Rel(RS_TAG, nullBoxTag())
       fbRefNullNone() // the payload slot is unread under the null tag
     }
-    "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
@@ -9090,7 +9099,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" | "refList" | "map" | "clo" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
@@ -9110,6 +9119,8 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     if emitMapGetScalarBox(mre.idxArr, mre.idxIndex, p.hbKind, fnIx) < 0 {
       return -1
     }
+  } else if p.hbArm == "atomAsStr" {
+    if emitAtomToStr(exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "obj" {
     if emitVariantStruct(unwrapParen(exprIx), p.hbKind, fnIx) < 0 { return -1 }
   } else if p.hbArm == "memberBox" {
@@ -25631,17 +25642,14 @@ function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
   if row < 0 {
     return emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
   }
-  const sig = simdRowSig(row)
-  if sig == SIMD_SIG_LOAD || sig == SIMD_SIG_STORE {
-    let base = 1
-    if sig == SIMD_SIG_STORE { base = 2 }
+  if simdRowIsMem(row) {
+    const base = simdMemBase(row)
     const off = emitMemAddr(c, base, fnIx, name)
     if off < 0 { return -1 }
-    if sig == SIMD_SIG_STORE {
+    if base == 2 {
       if emitExpr(memCallArg(c, base, 1), fnIx) < 0 { return -1 }
     }
-    fbSimdMem(simdRowOp(row), off)
-    return 0
+    return simdMemTail(row, off)
   }
   let i = 0
   while i < c.callArgs.length {
@@ -25670,6 +25678,18 @@ export function simdCallRow(c: Call): i32 {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
   const f = nodeAt(c.callFn)
   return if f is Ident { simdRow(f.identName) } else { -1 }
+}
+
+// A SIMD load's or store's declared operand count before its optional offset: 1 for a load's
+// address, 2 for a store's address and vector (`memAddrPlanOf`'s `base`).
+export function simdMemBase(row: i32): i32 {
+  return if simdRowSig(row) == SIMD_SIG_STORE { 2 } else { 1 }
+}
+
+// After a SIMD load's address, or a store's address and vector: the access at offset `off`.
+export function simdMemTail(row: i32, off: i64): i32 {
+  fbSimdMem(simdRowOp(row), off)
+  return 0
 }
 
 // Whether SIMD row `row` is a load or store, whose operands are its address plan's.
@@ -27262,8 +27282,9 @@ function emitCallRefArg(
 }
 
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
-// number, or the general arm with nothing owed at a scalar of the argument's own width, a string,
-// a record neither unboxed from a narrowing nor nullable, or a non-null closure, list or map.
+// number, or the general arm with nothing owed at a scalar of the argument's own width (a boolean
+// into an `i32`), a string, a record neither unboxed from a narrowing nor nullable, or a non-null
+// closure, list or map.
 export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
@@ -27296,8 +27317,11 @@ export function callRefArgPlain(
       && !exprNullableRefArray(a, fnIx)
       && !exprNullableMap(a, fnIx)
   }
-  return (k == "i32" || k == "i64" || k == "f64" || k == "f32")
-    && exprScalarWidth(a, fnIx) == k
+  // A boolean is an `i32` in wasm, and a vector its own `v128`.
+  const w = exprScalarWidth(a, fnIx)
+  return (k == "i32" || k == "i64" || k == "f64" || k == "f32" || k == "v128")
+    && w == k
+    || k == "i32" && w == "boolean"
 }
 
 // How a function-value call writes argument `a`, parameter `i` of key `ckey`, in
@@ -34657,7 +34681,7 @@ export function forRangeUnrollPlan(s: ForRange, stmtIx: i32, fnIx: i32): i32[] {
   return if t > 0 { [a, k, t] } else { none }
 }
 
-// What keeps a range loop of arm "rolled" from the IR: a dynamic step, a wrap exit
+// What keeps a range loop of arm "rolled" or "unrolled" from the IR: a dynamic step, a wrap exit
 // (`rangeMayWrap`), or a hoist or range proof legacy may open. Those two read only the tree, not
 // the live rows `loopHoistOpen` and `rangeProofOpen` consult at emit time, since a claim is decided
 // before legacy writes the function; each answers yes wherever legacy might. "" for none.
