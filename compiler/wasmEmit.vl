@@ -24179,6 +24179,28 @@ export function numCastSrcRepOf(obj: i32, fnIx: i32): string {
   return "i32"
 }
 
+// The type `u as? N` over a type-parameter operand is pinned at in this instance, or -1: the
+// instance's elaboration of the operand, a capture's included (D3654), or for a gradual union's
+// operand the instance re-typed at a scalar, that scalar.
+function holeOptPinTy(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
+  const ext = instanceOperandTyOf(e.asObj, fnIx)
+  if ext >= 0 { return ext }
+  if monoGradualAsScalar.get(exprIx) ?? false { return nodeTyIxOf(e.asObj) }
+  return -1
+}
+
+// The number `u as? N` over a type-parameter operand converts from when its cast can fail at
+// this pin, which `emitHoleNumAsOpt` writes as the exact cast; "" for every other pin.
+function holeOptExactSrc(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "" }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
+  if ext < 0 { return "" }
+  const src = primNameStr(primNameOf(ext))
+  if src != "i32" && src != "i64" && src != "f32" && src != "f64" { return "" }
+  return if numCastCanFail(src, asExprNumCastDomain(exprIx)) { src } else { "" }
+}
+
 // `u as? N` over a type-parameter operand pinned at a number or a `boolean`: `N | null` at every
 // pin (D2754), so a cast that cannot fail at this pin still boxes its value, and one that can
 // takes the exact-or-fail box.
@@ -24195,13 +24217,7 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
         + " | null` row was never registered",
     )
   }
-  // The instance's exact pin decides: a number converts, any other type is never the target.
-  // A hole's operand, a capture's included, reads the instance's elaboration (D3654).
-  let ext = instanceOperandTyOf(e.asObj, fnIx)
-  // A gradual union's operand the instance re-typed at a scalar carries that scalar itself.
-  if ext < 0 && (monoGradualAsScalar.get(exprIx) ?? false) {
-    ext = nodeTyIxOf(e.asObj)
-  }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
   if ext < 0 {
     return emitFail(
       "emitProgram: `as? "
@@ -24217,9 +24233,8 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
     fbStructNew(uBoxIdx)
     return 0
   }
-  if numCastCanFail(src, asExprNumCastDomain(exprIx)) {
-    return emitNumExactCastFrom(e, exprIx, src, fnIx)
-  }
+  const xs = holeOptExactSrc(exprIx, fnIx)
+  if xs != "" { return emitNumExactCastFrom(e, exprIx, xs, fnIx) }
   fbI32Rel(RS_TAG, scalarTagOfKind(nck))
   if emitNumPlainCast(e.asObj, tgt, fnIx) < 0 { return -1 }
   fbStructNew(nvb)
@@ -24229,8 +24244,8 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
 
 // The value kind the cast at `exprIx` builds its operand at, where its arm is an operand and a
 // tail (`numCastTail`): the plain conversion, the wrap that is neither a literal fold nor a
-// narrowed mask, the exact `as!` and `as?`, and a type-parameter operand's exact `as!` at its
-// pin. -1 for every other arm, which writes its operand its own way.
+// narrowed mask, the exact `as!` and `as?`, and a type-parameter operand's exact `as!` and
+// failing `as?` at its pin. -1 for every other arm, which writes its operand its own way.
 export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) { return -1 }
@@ -24239,8 +24254,12 @@ export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
     "wrap" => if asWrapArmOf(exprIx, fnIx) == "plain" { numWrapCastKind(exprIx, fnIx) } else { -1 }
     "exact" => if e.asMode == "trap" || e.asMode == "null" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
     "holeExact" => if e.asMode == "trap" { numExactCastKind(asExprHolePinSrc(exprIx, fnIx)) } else { -1 }
+    "holeOpt" => {
+      const hs = holeOptExactSrc(exprIx, fnIx)
+      if hs != "" { numExactCastKind(hs) } else { -1 }
+    }
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
-    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeOpt" => -1
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => -1
     "union" | "notCast" => -1
   }
 }
@@ -24266,7 +24285,8 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
     "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
     "holeExact" => numExactCastTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
-    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeOpt" => numCastNoTail()
+    "holeOpt" => numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx)
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => numCastNoTail()
     "union" | "notCast" => numCastNoTail()
   }
 }
