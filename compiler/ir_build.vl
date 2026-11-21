@@ -64,6 +64,8 @@ import {
   RCall,
   RListSlice,
   RListStage,
+  RMakeRec,
+  RStashSet,
   RStrOp,
   RTagStash,
   RToBox,
@@ -334,6 +336,7 @@ import {
   retRefusedWhy,
   spreadRunLit,
 } from "./wasmEmit"
+import { nodeTyInOf } from "./emit_ty_canon"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -426,6 +429,7 @@ import {
   elseLessNullableTail,
   exprIsStrIndexOf,
   lastStmtIsValueIf,
+  tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
   LiFrame,
@@ -958,6 +962,13 @@ function objLitAt(
   }
   const order = if stashRow >= 0 { objFieldSrcOrder(ix, sFieldNames, start, cnt) } else { iotaOf(cnt) }
   if order.length != cnt { return irBMiss("object stash order") }
+  // Each field built so far: its value, layout position, kid, node and where its build ended.
+  const vals: Opnd[] = []
+  const fis: i32[] = []
+  const kids: i32[] = []
+  const valIxs: i32[] = []
+  const ends: i32[] = []
+  let set = false
   let oi = 0
   while oi < cnt {
     const fi = order[oi]
@@ -973,21 +984,56 @@ function objLitAt(
     const v = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own }, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v }
     if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
-    if oi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
+    layout[fi] = k
+    if stashRow >= 0 { src.push(k) }
+    // Under the order stash a later field's valued `if` sets every field into its slot as legacy
+    // writes it, the earlier ones at their own ends, so the `if` lands after their sets.
+    if stashRow >= 0 && !set && oi > 0 && writesInPlaceFrom(b, mark) {
+      set = true
+      let j = 0
+      while j < oi {
+        const one: i32[] = []
+        irBNode(
+          one,
+          { efRhs: stashSetOf(vals[j], ix, at, arm, fis[j], kids[j]) },
+          -1,
+          ibNoValue,
+          valIxs[j],
+        )
+        insertAt(b, ends[j] + j, one[0])
+        j = j + 1
+      }
+    }
+    if set {
+      irBNode(
+        b,
+        { efRhs: stashSetOf(v, ix, at, arm, fi, k) },
+        -1,
+        ibNoValue,
+        valIx,
+      )
+    } else if (
+      oi > 0
+      && ifBelowLead(b, mark, "short-circuit field after another")
+    ) {
       return v
     }
     fields[k] = v
-    layout[fi] = k
-    if stashRow >= 0 { src.push(k) }
+    vals.push(v)
+    fis.push(fi)
+    kids.push(k)
+    valIxs.push(valIx)
+    ends.push(b.length)
     oi = oi + 1
   }
   const rhs: Rhs = {
-    mrFields: fields,
+    mrFields: if set { [] } else { fields },
     mrLayout: layout,
     mrSrc: src,
     mrAt: ix,
     mrRow: at,
     mrVariant: variant,
+    mrSet: set,
   }
   if at < 0 { return irBLetTemp(b, rhs, ix, rep) }
   // Built at a destination's row, the record is that row's type, not the literal's own.
@@ -996,6 +1042,38 @@ function objLitAt(
   irBNode(b, { lDst: t, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: t }
   return o
+}
+
+// Field `fi` (kid `k`) of the order-stashed literal at `ix`, built at row `at`, set from `v`.
+function stashSetOf(
+  v: Opnd,
+  ix: i32,
+  at: i32,
+  arm: ObjLitArm,
+  fi: i32,
+  k: i32,
+): Rhs {
+  const r: Rhs = {
+    ssV: v,
+    ssAt: ix,
+    ssRow: at,
+    ssVariant: arm == "variant",
+    ssFi: fi,
+    ssK: k,
+  }
+  return r
+}
+
+// Whether operands built into `b` from `at` on hold a valued `if` or a boxed `??`, which legacy
+// writes in place.
+function writesInPlaceFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SIf && n.siOut >= 0 || n is SCoalBox { return true }
+    i = i + 1
+  }
+  return false
 }
 
 // The struct field arms whose write is the value delivered at the field's rep: `plain`, the
@@ -1271,6 +1349,7 @@ function inPlaceNone(_ix: i32, _fnIx: i32): i32 { return 0 }
 function unionEqNone(_ix: i32, _fnIx: i32): boolean { return false }
 
 function listEqNone(_ix: i32, _fnIx: i32): boolean { return false }
+function listCatNone(_ix: i32, _fnIx: i32): string { return "none" }
 
 function strBinUnset(_b: i32[], _ix: i32, _rep: i32): Opnd {
   return irBMiss(STR_OPERAND)
@@ -1286,6 +1365,7 @@ export let irStrBinHook: (b: i32[], ix: i32, rep: i32) => Opnd = strBinUnset
 export let irInPlaceHook: (ix: i32, fnIx: i32) => i32 = inPlaceNone
 export let irUnionEqHook: (ix: i32, fnIx: i32) => boolean = unionEqNone
 export let irListEqHook: (ix: i32, fnIx: i32) => boolean = listEqNone
+export let irListCatHook: (ix: i32, fnIx: i32) => string = listCatNone
 
 // The function being built, its declaration, and the rep a statement node carries.
 export function irBFn(): IrFn { return ib }
@@ -1535,6 +1615,9 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
     return ifRefExpr(b, n0, ix0, rep0, rj)
   }
+  if ty0 < 0 && ifExprPlainWhy(ix0, ibFnIx) == "union" {
+    return unionIfExpr(b, n0, ix0, rep0)
+  }
   // The head's rep is the one the join plan writes every link at, else the chain is legacy's.
   const hv = valtypeOf(rep0)
   if hv >= 0 && hv != ifExprJoinVt(ix0, ibFnIx) {
@@ -1667,6 +1750,91 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   const ty = nodeTyAt(ix, ibFnIx)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
+}
+
+// A value `if` on the union join's rung, as legacy's `emitUnionIfValue` writes it: a chain of `if`s
+// at the box's blocktype, each arm its value boxed into the join's union (`emitUnionBoxOwed` at
+// `nodeTyInOf`), a missing `else` the null box.
+function unionIfExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
+  if !heldAsBox(rep) { return irBMiss("union if rep") }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  return unionIfLink(b, n, ix, rep, ty, nodeTyInOf(ix, ibFnIx))
+}
+
+// One link of `unionIfExpr` (`emitUnionIfValueLink`): an `else if` is the next link, written into
+// this link's `else` and delivered to its out.
+function unionIfLink(
+  b: i32[],
+  n: IfStmt,
+  ix: i32,
+  rep: i32,
+  ty: i32,
+  uty: i32,
+): Opnd {
+  // Legacy writes every link at the head's box; the lowering opens a link at its own join.
+  const pw = ifExprPlainWhy(ix, ibFnIx)
+  if pw != "union" {
+    return irBMiss(
+      if pw == "" { "union if chain join" } else { "union if " + pw },
+    )
+  }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  // A constant condition is one legacy decides off its bytes and writes a dead arm for.
+  if c is OImm { return irBMiss("union if static condition") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const thenB = unionIfArm(n.ifThen, t, rep, uty)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  let elseB: i32[] = []
+  if n.ifElse < 0 {
+    const nb = repTemp(elseB, { nuAt: ix, nuOwn: NULL_OWN_BOX }, ix, rep)
+    irBNode(elseB, { asDst: t, asSrc: nb }, -1, ibNoValue, ix)
+  } else {
+    const en = nodeAt(n.ifElse)
+    if en is IfStmt && !ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
+      const inner = unionIfLink(elseB, en, n.ifElse, rep, ty, uty)
+      if ibMiss != "" { return inner }
+      irBNode(elseB, { asDst: t, asSrc: inner }, -1, ibNoValue, n.ifElse)
+    } else if en is IfStmt {
+      const x = deliver(elseB, n.ifElse, rep, uty)
+      if ibMiss != "" { return x }
+      if irBOpRep(x) != rep { return irBMiss("union if arm rep") }
+      irBNode(elseB, { asDst: t, asSrc: x }, -1, ibNoValue, n.ifElse)
+    } else {
+      elseB = unionIfArm(n.ifElse, t, rep, uty)
+    }
+  }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// One arm of `unionIfLink` (`emitUnionIfArm`): its prelude, then its tail value boxed into the
+// join's union and written to out `t`. A tail that is itself an `if` joins into this box in
+// legacy, and stays its miss.
+function unionIfArm(blockIx: i32, t: i32, rep: i32, uty: i32): i32[] {
+  const body: i32[] = []
+  const tv = ifArmValueExpr(blockIx)
+  if !(nodeAt(blockIx) is Block) || tv < 0 || !tailIsValueOrNever(tv, ibFnIx) {
+    irBMiss("union if arm")
+    return body
+  }
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
+  const x = deliver(body, tv, rep, uty)
+  if ibMiss == "" && irBOpRep(x) != rep { irBMiss("union if arm rep") }
+  if ibMiss == "" {
+    irBNode(body, { asDst: t, asSrc: x }, -1, ibNoValue, blockIx)
+  }
+  return body
 }
 
 // One link of a reference join's chain (`emitIfExprRefLink`), its out at the head's rep and type:
@@ -2760,7 +2928,12 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
-    if n is SCoalBox || n is SEffect && n.efRhs is RListStage { return true }
+    if (
+      n is SCoalBox
+      || n is SEffect && (n.efRhs is RListStage || n.efRhs is RStashSet)
+    ) {
+      return true
+    }
     i = i + 1
   }
   return false
@@ -2841,7 +3014,11 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   let i = at
   while i < to {
     const n = ib.irNodes[b[i]]
-    if n is SIf && n.siOut >= 0 || n is SCoalBox {
+    if (
+      n is SIf && n.siOut >= 0
+      || n is SCoalBox
+      || n is SEffect && n.efRhs is RStashSet
+    ) {
       irBMiss(why)
       return true
     }
@@ -3698,6 +3875,19 @@ function objLitAtVariantRow(b: i32[], ix: i32, vi: i32): Opnd {
   return objLitAt(b, unwrapParen(ix), rep, ty, vi, true)
 }
 
+// Whether `v` is a record body `b` built with its fields set into the order stash (`mrSet`).
+function setRecIn(b: i32[], v: Opnd): boolean {
+  if !(v is OVar) { return false }
+  for id in b {
+    const n = ib.irNodes[id]
+    if n is SLet && n.lDst == v.ov {
+      const r = n.lRhs
+      return r is RMakeRec && r.mrSet
+    }
+  }
+  return false
+}
+
 // `v`, built from `ix`, boxed into boxed nullable `dst` by the shared box plan.
 function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
   return boxTempAt(b, v, ix, dst, -1)
@@ -3735,6 +3925,10 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
     && exprPrePathWhy(ix, ibFnIx) == "pre-path tag dispatch"
   ) {
     return irBMiss("boxed tag dispatch")
+  }
+  // Legacy writes the box's leading tag before the stash's field sets; the IR's sets precede it.
+  if p.hbArm != "pass" && p.hbArm != "memberBox" && setRecIn(b, v) {
+    return irBMiss("box of a stash-set record")
   }
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
 }
@@ -3872,6 +4066,20 @@ function listEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("list compare operand rep")
   }
   return irBLetTemp(b, { qeL: l, qeR: r, qeAt: ix }, ix, rep)
+}
+
+// Two lists at the concat's rep, concatenated by legacy's concat (`listCatRouteOf` "plain").
+function listCat(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  const at = b.length
+  const r = irBExpr(b, n.binRight)
+  if ibMiss != "" { return r }
+  if ifBelowLeadOf(b, at, "short-circuit right operand", [l]) { return r }
+  if irBOpRep(l) != rep || irBOpRep(r) != rep || !(repNodeAt(rep) is RList) {
+    return irBMiss("list concat operand rep")
+  }
+  return irBLetTemp(b, { ljL: l, ljR: r, ljAt: ix }, ix, rep)
 }
 
 // Two union boxes, each built at its own box rep, compared by legacy's staged compare.
@@ -4199,14 +4407,21 @@ function arrayLit(
   // A packed list's elements are built as plain i32s, which its backing truncates.
   const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
+  const starts: i32[] = []
   // A `for` iterable's signed number literal at a number element is one immediate, as legacy's
   // hoist reads it whole; at any other element (a numeric union's box) it is delivered.
   const ep = repPrim(er) ?? ""
   const forIter = arrLitIsForIter(ix)
     && (ep == "i32" || ep == "i64" || ep == "f32" || ep == "f64")
   for e in n.arrElems {
+    const at = b.length
+    starts.push(at)
     const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
+    // An element written before a valued `if` is staged below it, as a call's argument is.
+    if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
+      return irBMiss("short-circuit array element after another")
+    }
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
   }
@@ -5123,6 +5338,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     ) {
       if irUnionEqHook(ix, ibFnIx) { return unionEq(b, n, ix, rep) }
       if irListEqHook(ix, ibFnIx) { return listEq(b, n, ix, rep) }
+      const cat = irListCatHook(ix, ibFnIx)
+      if cat == "plain" { return listCat(b, n, ix, rep) }
+      if cat != "none" { return irBMiss("list concat " + cat) }
       if eqRouteOf(n, ix, ibFnIx) == "numeric" {
         return nicheBoolEq(b, n, ix, rep)
       }
