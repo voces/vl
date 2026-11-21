@@ -300,17 +300,22 @@ A list literal that does not fit one line is filled — as many elements per
 continuation line as fit the 80-column budget — when EVERY element is a scalar
 literal: a number, a string, a char, `true`/`false` or `null`, optionally behind
 a unary sign. One intent rule: a literal the author already wrote as two or more
-rows, every row the same width of at least two, keeps those rows exactly. There
-is no opt-out comment.
+rows, every row the same width, keeps those rows exactly. There is no opt-out
+comment.
 ```
 
 Three consequences worth stating, because each is a decision and not a fall-out:
 
 * **The row width is read BEFORE the one-line form.** A 4×4 identity matrix fits on one line,
   and collapsing it destroys exactly the shape the intent rule exists to protect.
-* **A one-per-line list is NOT a table.** That is the wrapped form the printer itself emits,
-  so the uniform-row test requires two elements a row. Without that floor the rule would pin
-  its own output and reach no already-formatted file.
+* **A one-per-line list is kept one per line** (2026-11-21: coordinator ruling, amends the
+  owner's #2814 floor; the owner may overrule). The floor (two elements a row) existed so the
+  rule would not pin the printer's own output. For scalars wrapFill emits one per line only when
+  the items are too wide to share a row, and old and new `vl fmt` output were byte-identical on
+  all 23,536 tracked `.vl` files when the floor dropped. Why: a closed set written one member
+  per line (the IR kind lists in `compiler/lint.vl`) lets two PRs adding different members merge.
+  **Price:** a list wrapped one per line for wide items keeps that layout after the items shrink;
+  it no longer refills.
 * **Any non-literal element takes the whole literal back to one per line** — a struct, a
   closure, a nested list, a name, a call. Those carry their own vertical structure, and the
   element test reads the TOKEN stream (one literal token, or a sign and one) rather than
@@ -399,3 +404,14 @@ which is why the tree held none: the whole-tree A/B of this change moved zero fi
 rationale and the one-line-when-it-fits layout are in `DECISIONS.md`; the round trip (shorthand
 in a body position, nested, beside a comment, with a trailing comma) is pinned in
 `tests/vl_fmt_test.ts` and `tests/cases/objects/field-shorthand-kept.vl`.
+
+## a `match` arm's or-patterns written one per line stay one per line
+
+Coordinator ruling, 2026-11-21, implemented in `matchExprFmt` / `patsOnePerLine`. An arm whose
+or-patterns each start on a later source line than the one before prints as `P1 |`, then each
+further pattern on its own line one indent deeper, the last followed by `=> body`. Any other arm
+joins its patterns with ` | ` on one line, as before. The rule is opt-in by source layout, so no
+already-formatted file changes. A multi-line type union (`type U = A` / `  | B`) needs no rule:
+`emitTypeOrUnionDecl` keeps a multi-line declaration as written. Why: the long IR kind arms in
+`compiler/ir.vl`, `ir_verify.vl` and `ir_lower.vl` are edited by every PR that adds a node, and
+one member per line lets two such PRs merge.
