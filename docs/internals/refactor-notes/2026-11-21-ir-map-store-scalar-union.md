@@ -18,3 +18,13 @@ on the plain arm.
 
 `tests/ir-shadow-rows/map-store-scalar-union-value.vl`: an `i32` literal stored into an `f64` map,
 and an `i32` and a string stored into an `i32 | string` map.
+
+## Also: an append site's arm test mints no global
+
+The first proof found one tests/cases program whose shipped bytes moved:
+`tests/cases/maps/rmw-fused-value-shapes.vl`, whose start function this change makes claimable. Its
+global section held the same entries in another order. `strSiteArmsAt` asked
+`synthSitePairIdx`, which mints the append site's global pair on first use. The IR asks the site's
+mode at build time, before legacy's emission mints the map backings, so the pair moved ahead of
+them. The test now asks `synthSitePairAvailable`, which mints nothing. The pair is minted where the
+site is written, as before.
