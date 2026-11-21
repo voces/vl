@@ -20,3 +20,11 @@ fresh list of the key or value rep. A Set's `.values()` is its keys.
 
 `tests/ir-shadow-rows/map-keys-values.vl`: `keys()` of a string-keyed map, `values()` of an
 `i32`-keyed map walked by `for`, and a Set's `values()`.
+
+## Also: the span of an index read of a tagged call
+
+A tagged call's receiver builds as a tag stash statement and then the call, so `g(x)[0]` banked its
+element-read row after the stash, where legacy's row starts before it. `idxRowOpenNote` now takes
+an `SEffect` of `RTagStash` as the row's opening statement, beside `SCoalBox` and a valued `SIf`.
+The `index of a tagged call` named miss is gone. `tests/ir-shadow-rows/tag-dispatch-ref-result.vl`
+now expects its three functions matched.
