@@ -6323,12 +6323,11 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
       1
     }
     "boxLits" | "numBox" => {
-      const bt = if arm == "boxLits" { tyLitMemberTexts(t) } else { tyNumLitMemberTexts(t) }
+      const bt = litIsBoxLexes(isIx, arm)
       let bI = 0
       while bI < bt.length {
-        const lit = if arm == "boxLits" { quoteLex(bt[bI]) } else { bt[bI] }
-        if emitUnionLitIs(nd0.isObj, lit, fnIx) < 0 { return -1 }
-        if bI > 0 { fbI32Bin(114) }
+        if emitUnionLitIs(nd0.isObj, bt[bI], fnIx) < 0 { return -1 }
+        memberOrTail(bI)
         bI = bI + 1
       }
       1
@@ -6348,6 +6347,17 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
     }
     "none" => emitFail("emitProgram: internal: an `is` literal arm with no lowering")
   }
+}
+
+// The literals the box arms of `is` test `isIx` compare, in order: `boxLits`' quoted members, or
+// `numBox`' number members; none at any other arm.
+export function litIsBoxLexes(isIx: i32, arm: LitIsArm): string[] {
+  const t = isVarTyIxOf(isIx)
+  if arm == "numBox" { return tyNumLitMemberTexts(t) }
+  const out: string[] = []
+  if arm != "boxLits" { return out }
+  for m in tyLitMemberTexts(t) { out.push(quoteLex(m)) }
+  return out
 }
 
 // After a ref niche's operand: its null test, negated unless `is` test `isIx` tests `null`.
@@ -7935,6 +7945,11 @@ function emitPlaceNarrowContainerUnbox(exprIx: i32, fnIx: i32): i32 {
 // it to the wrapper of the row the read's consumer types itself against.
 function emitRefArrayUnionUnboxRead(exprIx: i32, fnIx: i32) {
   if emitUnionBoxPush(exprIx, fnIx) < 0 { return -1 }
+  return refArrayUnionUnboxTail(exprIx, fnIx)
+}
+
+// `emitRefArrayUnionUnboxRead` past the box: its payload cast to the read's ref-list wrapper.
+export function refArrayUnionUnboxTail(exprIx: i32, fnIx: i32) {
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   const slot = refListSlotOfExprStrict(exprIx, fnIx)
   if slot < 0 || slot >= rlWrapIdx.length {
@@ -8005,6 +8020,11 @@ function listPayloadCastTail(wrap: i32, strict: boolean) {
 // an i32 or atom value). The result is the `(ref $mapStruct)` a bare map binding pushes.
 function emitMapUnionUnboxRead(exprIx: i32, fnIx: i32) {
   if emitUnionBoxPush(exprIx, fnIx) < 0 { return -1 }
+  return mapUnionUnboxTail(exprIx, fnIx)
+}
+
+// `emitMapUnionUnboxRead` past the box: its payload cast to the read's map struct.
+export function mapUnionUnboxTail(exprIx: i32, fnIx: i32) {
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   // The arm's map-value slot, the one `mapShapeOfExpr` types this read's consumer against.
   fbRefCast(mapTypeIdxOf(mapShapeOfExpr(exprIx, fnIx))) // the payload IS the map struct ref
@@ -8492,10 +8512,9 @@ function emitUnionCoerceValueAtom(
       if emitExpr(exprIx, fnIx) < 0 { return -1 }
       return atomNulStrTail(nlTexts)
     }
-    fbI32Rel(RS_TAG, scalarTagOfKind(2)) // the string tag — kind 2 rides the anyref directly
-    if emitAtomToStr(exprIx, fnIx) < 0 { return -1 }
-    fbStructNew(uBoxIdx) // { tag, member-string ref }
-    return 0
+    // The string tag (kind 2 rides the anyref directly), the member string, the box.
+    const sp: HoleBox = { hbArm: "atomAsStr", hbKind: 2, hbSrc: -1 }
+    return emitHoleBox(sp, exprIx, fnIx)
   }
   return emitUnionCoerceAtomBox(uSet, uTy, exprIx, bareIx, fnIx)
 }
@@ -9015,7 +9034,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbI32Rel(RS_TAG, nullBoxTag())
       fbRefNullNone() // the payload slot is unread under the null tag
     }
-    "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
@@ -9032,7 +9051,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" | "refList" | "map" | "clo" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
@@ -9052,6 +9071,8 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     if emitMapGetScalarBox(mre.idxArr, mre.idxIndex, p.hbKind, fnIx) < 0 {
       return -1
     }
+  } else if p.hbArm == "atomAsStr" {
+    if emitAtomToStr(exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "obj" {
     if emitVariantStruct(unwrapParen(exprIx), p.hbKind, fnIx) < 0 { return -1 }
   } else if p.hbArm == "memberBox" {
@@ -10775,19 +10796,45 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   // Teed at the first read rather than pre-emitted at the top: the receiver must be evaluated
   // where the original code evaluated it, so any context the surrounding lowering seeded is still
   // in force, and so the static-false fold below still evaluates it exactly once.
-  const isStash = unionLitIsStashSlot()
+  unionLitIsStashSlot()
+  const p = unionLitIsPlanOf(objIx, lit, fnIx)
+  return match p.ulArm {
+    "noSet" => emitFail("emitProgram: literal `is` over a union with no recorded members")
+    "noArm" => emitFail(
+      "emitProgram: literal `is` over a union with no arm of the literal's rep",
+    )
+    "never" => if emitExpr(objIx, fnIx) < 0 { -1 } else { unionLitNeverTail() }
+    "tag" => {
+      if emitExpr(objIx, fnIx) < 0 { return -1 }
+      unionLitTagHead(p)
+      if !p.ulOnce {
+        if emitExpr(objIx, fnIx) < 0 { return -1 }
+      }
+      unionLitPayloadTail(p, lit, fnIx)
+    }
+  }
+}
+
+// How `emitUnionLitIs` tests a box against literal `lit`: no recorded members, no arm of the
+// literal's rep in a box that cannot hold it (both refused), a rep with no arm (statically false),
+// or the tag test then the payload compare; `ulLak` the literal's ABI code, `ulOnce` a stash.
+export type UnionLitIsArm = "noSet" | "noArm" | "never" | "tag"
+export type UnionLitIsPlan = {
+  ulArm: UnionLitIsArm,
+  ulLak: i32,
+  ulOnce: boolean,
+}
+
+export function unionLitIsPlanOf(
+  objIx: i32,
+  lit: string,
+  fnIx: i32,
+): UnionLitIsPlan {
   const isOnce = !unionEqOperandOk(objIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfUnionBox(objIx, fnIx)
-  // D1047 — the empty-name reject stays ahead of the atom ladder. The ladder's i64-widening rung
-  // and the mixed-union gate below both ask `unionHasAtomK`, whose fall-through fails loudly on
-  // an unregistered row, and a receiver whose union has no name has no row at all. The message is
-  // the condition's own; the branch is a floor, unreached by the tests and by the corpus.
-  if usid < 0 {
-    return emitFail(
-      "emitProgram: literal `is` over a union with no recorded members",
-    )
-  }
+  const noSet: UnionLitIsPlan = { ulArm: "noSet", ulLak: 0, ulOnce: isOnce }
+  if usid < 0 { return noSet }
   // The literal's rep atom: a quoted lexeme is a string, a float f64, an integer i32 — widening
   // to i64 when out of range or when the union's only integer arm is i64, the `emitUnionCoerce`
   // default. The ladder settles the ABI code alongside the spelling, and the map is a bijection
@@ -10828,36 +10875,45 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   // union is testable against a scalar literal over the same tag-then-payload shape. The compare
   // is arm-agnostic, so a struct or container arm simply has a tag that does not match. Widened
   // only where the literal's own rep has an arm, which the static-false fold below already trusts.
+  const noArm: UnionLitIsPlan = { ulArm: "noArm", ulLak: lak, ulOnce: isOnce }
   if (
     msIsValueUnion(usid) != 1
     && msSetCarriesLitUnionArm(usid) != 1
     && !litHasArm
   ) {
-    return emitFail(
-      "emitProgram: literal `is` over a union with no arm of the literal's rep",
-    )
+    return noArm
   }
-  if !litHasArm {
-    if emitExpr(objIx, fnIx) < 0 { return -1 }
-    fbDrop() // 0x1a drop
-    fbI32Const(0)
-    return 0
-  }
-  // `lak` decides the tag, the payload unbox and the three constant-emit arms below — one code,
-  // five projections.
-  if emitExpr(objIx, fnIx) < 0 { return -1 }
-  if isOnce { fbLocalTee(isStash) }
+  const arm: UnionLitIsArm = if litHasArm { "tag" } else { "never" }
+  const plan: UnionLitIsPlan = { ulArm: arm, ulLak: lak, ulOnce: isOnce }
+  return plan
+}
+
+// After a box whose literal's rep has no arm: the box dropped, the answer 0.
+export function unionLitNeverTail() {
+  fbDrop()
+  fbI32Const(0)
+  return 0
+}
+
+// After the box: its tag tested against the literal's rep, opening the `if` whose then arm reads
+// the box again, here the stash when plan `p` stashes it.
+export function unionLitTagHead(p: UnionLitIsPlan) {
+  const s = unionLitIsStashSlot()
+  if p.ulOnce { fbLocalTee(s) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  fbI32Rel(RS_TAG, scalarTagOfKind(lak))
+  fbI32Rel(RS_TAG, scalarTagOfKind(p.ulLak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
-  if isOnce { fbLocalGet(isStash) }
-  else if emitExpr(objIx, fnIx) < 0 { return -1 }
+  if p.ulOnce { fbLocalGet(s) }
+}
+
+// After the box again: its payload unboxed and compared with literal `lit`, else 0.
+export function unionLitPayloadTail(p: UnionLitIsPlan, lit: string, fnIx: i32) {
+  const lak = p.ulLak
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   if emitUnionPayloadUnbox(lak) < 0 { return -1 }
   if lak == 2 {
-    // The literal lexeme rides a synthesized `StrLit` (same shape as `strText`).
-    if emitStrEqLit(mkStr(lit, -1), fnIx) < 0 { return -1 }
+    if strMemberEqTail(lit, fnIx) < 0 { return -1 }
   } else if lak == 4 {
     fbF64Const(lit)
     fbI32Bin(97) // 0x61 f64.eq
@@ -25527,17 +25583,14 @@ function emitSimdIntrinsic(c: Call, name: string, fnIx: i32) {
   if row < 0 {
     return emitFail("emitProgram: '" + name + "' is not a known SIMD intrinsic")
   }
-  const sig = simdRowSig(row)
-  if sig == SIMD_SIG_LOAD || sig == SIMD_SIG_STORE {
-    let base = 1
-    if sig == SIMD_SIG_STORE { base = 2 }
+  if simdRowIsMem(row) {
+    const base = simdMemBase(row)
     const off = emitMemAddr(c, base, fnIx, name)
     if off < 0 { return -1 }
-    if sig == SIMD_SIG_STORE {
+    if base == 2 {
       if emitExpr(memCallArg(c, base, 1), fnIx) < 0 { return -1 }
     }
-    fbSimdMem(simdRowOp(row), off)
-    return 0
+    return simdMemTail(row, off)
   }
   let i = 0
   while i < c.callArgs.length {
@@ -25566,6 +25619,18 @@ export function simdCallRow(c: Call): i32 {
   if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
   const f = nodeAt(c.callFn)
   return if f is Ident { simdRow(f.identName) } else { -1 }
+}
+
+// A SIMD load's or store's declared operand count before its optional offset: 1 for a load's
+// address, 2 for a store's address and vector (`memAddrPlanOf`'s `base`).
+export function simdMemBase(row: i32): i32 {
+  return if simdRowSig(row) == SIMD_SIG_STORE { 2 } else { 1 }
+}
+
+// After a SIMD load's address, or a store's address and vector: the access at offset `off`.
+export function simdMemTail(row: i32, off: i64): i32 {
+  fbSimdMem(simdRowOp(row), off)
+  return 0
 }
 
 // Whether SIMD row `row` is a load or store, whose operands are its address plan's.
@@ -27158,8 +27223,9 @@ function emitCallRefArg(
 }
 
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
-// number, or the general arm with nothing owed at a scalar of the argument's own width, a string,
-// a record neither unboxed from a narrowing nor nullable, or a non-null closure, list or map.
+// number, or the general arm with nothing owed at a scalar of the argument's own width (a boolean
+// into an `i32`), a string, a record neither unboxed from a narrowing nor nullable, or a non-null
+// closure, list or map.
 export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
@@ -27192,8 +27258,11 @@ export function callRefArgPlain(
       && !exprNullableRefArray(a, fnIx)
       && !exprNullableMap(a, fnIx)
   }
-  return (k == "i32" || k == "i64" || k == "f64" || k == "f32")
-    && exprScalarWidth(a, fnIx) == k
+  // A boolean is an `i32` in wasm, and a vector its own `v128`.
+  const w = exprScalarWidth(a, fnIx)
+  return (k == "i32" || k == "i64" || k == "f64" || k == "f32" || k == "v128")
+    && w == k
+    || k == "i32" && w == "boolean"
 }
 
 // How a function-value call writes argument `a`, parameter `i` of key `ckey`, in
@@ -34553,7 +34622,7 @@ export function forRangeUnrollPlan(s: ForRange, stmtIx: i32, fnIx: i32): i32[] {
   return if t > 0 { [a, k, t] } else { none }
 }
 
-// What keeps a range loop of arm "rolled" from the IR: a dynamic step, a wrap exit
+// What keeps a range loop of arm "rolled" or "unrolled" from the IR: a dynamic step, a wrap exit
 // (`rangeMayWrap`), or a hoist or range proof legacy may open. Those two read only the tree, not
 // the live rows `loopHoistOpen` and `rangeProofOpen` consult at emit time, since a claim is decided
 // before legacy writes the function; each answers yes wherever legacy might. "" for none.

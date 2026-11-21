@@ -132,7 +132,13 @@ import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { Call, Ident, P, i32ToStr, nodeAt } from "./ast"
-import { simdCallRow, simdOperandPrim, simdResultPrim } from "./wasmEmit"
+import {
+  simdCallRow,
+  simdMemBase,
+  simdOperandPrim,
+  simdResultPrim,
+  simdRowIsMem,
+} from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
@@ -512,7 +518,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const boxed = bn is RBox
         || bn is RNullable
         && bn.rnDisc == 4
-        && (r.bnAtom >= 0 || repNodeAt(dst) is RRecord)
+        && (r.bnAtom >= 0 || r.bnCon >= 0 || repNodeAt(dst) is RRecord)
       if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
       }
@@ -982,8 +988,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RLitArms => {
       use(r.liV, at)
       if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
-      // `atomEq` reads its operand once per member, so it is a variable, not a temp.
-      if (r.liArm == "atomEq" || r.liArm == "memberEq") && !(r.liV is OVar) {
+      // The member and box arms read their operand once per member, so it is a variable.
+      if r.liArm != "nicheRaw" && r.liArm != "atomNotNul" && !(r.liV is OVar) {
         return fail(2, at, "a literal arms test re-reads a variable")
       }
       0
@@ -1834,6 +1840,21 @@ function touchesList(n: IrNode): boolean {
   }
 }
 
+// A SIMD load's address at i32 and its result at v128; a store's address and vector, and no value.
+function simdMemCheck(r: RSimd, dst: i32, at: i32, base: i32) {
+  const a = r.sdArgs
+  if a.length != base || repPrim(opRep(a[0])) != "i32" {
+    return fail(2, at, "a SIMD access's address is an i32")
+  }
+  if base == 2 && repPrim(opRep(a[1])) != "v128" {
+    return fail(2, at, "a SIMD store's value is a v128")
+  }
+  if dst >= 0 && (base == 2 || repPrim(dst) != "v128") {
+    return fail(2, at, "a SIMD load is a v128 and a store has no value")
+  }
+  return 0
+}
+
 // A memory access's address at i32, a store's value at its width's prim (`memAccessPlanOf`), and a
 // load's result at that prim; a store has no value.
 function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
@@ -1868,6 +1889,7 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
   if !(c is Call) || row < 0 {
     return fail(2, at, "a SIMD op's node is a SIMD call")
   }
+  if simdRowIsMem(row) { return simdMemCheck(r, dst, at, simdMemBase(row)) }
   let k = 0
   let i = 0
   while i < c.callArgs.length {
