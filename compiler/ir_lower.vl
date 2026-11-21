@@ -116,6 +116,8 @@ import {
   RGlobalGet,
   RListClear,
   RListCopy,
+  RListEmpty,
+  RListEmptyArms,
   RListEq,
   RListGet,
   RListLen,
@@ -448,7 +450,16 @@ import {
   spreadWrapIdx,
 } from "./emit_plan_list"
 import { fbOpenIf } from "./emit_bytes"
-import { atomHookArmOf, fbRefIfOpenType } from "./wasmEmit"
+import {
+  atomHookArmOf,
+  emitListEmptyLoop,
+  emptyFitArmBody,
+  emptyFitArmHead,
+  emptyFitArmsPlain,
+  emptyFitArmsPlanOf,
+  emptyFitPlanOf,
+  fbRefIfOpenType,
+} from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
 import { forInLoopAt } from "./emit_plan_list"
@@ -523,6 +534,8 @@ let lwRowFrom: i32[] = []
 let lwRowTo: i32[] = []
 // Each row's kind: 5 a statement, 6 an element read (`bankSpanRow`).
 let lwRowKind: i32[] = []
+// Where each node an element read's row opens at began, in the buffer (`irRowOpens`).
+let lwRowOpenAt: {[i32]: i32} = Map()
 
 export function irLMiss(why: string) {
   if lwMiss == "" { lwMiss = why }
@@ -784,6 +797,8 @@ function rhs(r: Rhs, tail: boolean) {
       numIntrTail(r.nxOp)
     }
     RTagStash => irLMiss("tag stash as a value")
+    RListEmpty => listEmpty(r)
+    RListEmptyArms => listEmptyArms(r)
     RTagIs => {
       leaf()
       tagIsTail(r.tgiId)
@@ -804,7 +819,14 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet | RListLen | RListPush | RListPop | RListEq | RStrOp | RMapFilter | RListSlice => irLowerListHook(r)
+    RListGet |
+      RListLen |
+      RListPush |
+      RListPop |
+      RListEq |
+      RStrOp |
+      RMapFilter |
+      RListSlice => irLowerListHook(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -852,7 +874,12 @@ function rhs(r: Rhs, tail: boolean) {
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
     RCallHost => hostCall(r)
-    RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RCast |
+      RTagOf |
+      RMapSet |
+      RFnId |
+      RCellNew |
+      RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
@@ -1173,6 +1200,32 @@ function nulTestOp(r: RNulTest) {
   return irLMiss("null test " + arm)
 }
 
+// `RListEmpty`: the list, then legacy's emptiness walk over the slots and kind its plan names.
+function listEmpty(r: RListEmpty) {
+  const p = emptyFitPlanOf(r.leAt, lw.irAt)
+  if p.efArm != "loop" || p.efRepWhy != "" { return irLMiss("list empty plan") }
+  irLOpnd(r.leV)
+  return emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
+}
+
+// `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
+// again, and the arm's emptiness walk, as `emitListEmptyFitArms` writes them.
+function listEmptyArms(r: RListEmptyArms) {
+  const p0 = emptyFitPlanOf(r.lfAt, lw.irAt)
+  if p0.efArm != "union" { return irLMiss("list empty arms plan") }
+  const p = emptyFitArmsPlanOf(r.lfAt, lw.irAt, p0.efRecvTy)
+  if !emptyFitArmsPlain(p) { return irLMiss("list empty arms plan") }
+  let i = 0
+  while i < p.eaRows.length {
+    irLOpnd(r.lfV)
+    emptyFitArmHead(p, i)
+    irLOpnd(r.lfV)
+    emptyFitArmBody(p, i)
+    i = i + 1
+  }
+  return 0
+}
+
 // `RBoxField`: the narrowed box, then legacy's payload cast and field read, and the read's own
 // recover, as `emitExpr` writes a member read through `emitNarrowedMem`.
 function boxField(r: RBoxField) {
@@ -1459,19 +1512,28 @@ function spreadList(r: RSpread) {
   const lb: ListBuild = { lbKind: r.spKind, lbSlot: r.spSlot }
   arrLitPrologue(r.spAt)
   const p = spreadPlanOf(r.spAt, fnIx, lb)
-  if p.spWhy != "" || p.spSrcs.length != 1 { return irLMiss("spread plan") }
-  // The pair is asked where legacy's arm asks it, before the group, so a first ask mints in order.
+  if p.spWhy != "" || p.spSrcs.length != r.spSrcs.length {
+    return irLMiss("spread plan")
+  }
+  // The pair is asked where legacy's arm asks it, before the groups, so a first ask mints in order.
   const wrap = spreadWrapIdx(p.spKind, p.spRow)
   const back = spreadBackIdx(p.spKind, p.spRow)
   if wrap < 0 || back < 0 { return irLMiss("spread pair") }
-  irLOpnd(r.spSrc)
+  // Each group's list, then its stash, in source order.
   const seq = liKinds.length
-  const gs = spreadGroupStash(p, r.spAt, 0, p.spSrcs[0], fnIx, seq)
-  if gs < 0 { return -1 }
+  const slots: i32[] = []
+  let g = 0
+  while g < r.spSrcs.length {
+    irLOpnd(r.spSrcs[g])
+    const gs = spreadGroupStash(p, r.spAt, g, r.spGroups[g], fnIx, seq)
+    if gs < 0 { return -1 }
+    slots.push(gs)
+    g = g + 1
+  }
   return spreadJoinGroups(
     r.spAt,
-    [gs],
-    [p.spGroupRows[0]],
+    slots,
+    p.spGroupRows,
     wrap,
     back,
     p.spKind,
@@ -1955,6 +2017,8 @@ function boxOp(r: RToBox) {
     || p.hbArm == "rec"
     || p.hbArm == "obj"
     || p.hbArm == "refList"
+    || p.hbArm == "map"
+    || p.hbArm == "clo"
   ) {
     irLOpnd(r.bxV)
   } else {
@@ -2134,6 +2198,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
     const pending = fp[top]
     if lwMiss == "" && i < b.length {
       const id = b[i]
+      rowOpenNote(id)
       spanOpen(id)
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
@@ -2867,6 +2932,19 @@ function curLen(): i32 { return lwBuf.length }
 // The lowering's write position, which an element read's row starts at.
 export function irLAt(): i32 { return lwBuf.length }
 
+// Notes where node `id` began, where an element read's row opens at it (`irRowOpens`).
+function rowOpenNote(id: i32) {
+  if lw.irHasRowOpens && lw.irRowOpens.has(id) { lwRowOpenAt[id] = curLen() }
+  return 0
+}
+
+// Where element read `ix`'s row starts: where its receiver's opening statement began, else `from`.
+export function irLIndexFrom(ix: i32, from: i32): i32 {
+  const id = lw.irIdxRowAt[ix] ?? -1
+  if id < 0 { return from }
+  return lwRowOpenAt[id] ?? from
+}
+
 // Banks the element-read row of `Index` node `ix` written from `from` on, as legacy's
 // `emitIndexBanked` does: only where names and the source map are emitted, and only over bytes.
 export function irLIndexRow(ix: i32, from: i32) {
@@ -2992,6 +3070,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwRowFrom = []
   lwRowTo = []
   lwRowKind = []
+  lwRowOpenAt = Map()
   lwBuf = buf
   lwSinkFired = 0
   lwPushed = []
@@ -3020,6 +3099,7 @@ type LwFrame = {
   lfRowFrom: i32[],
   lfRowTo: i32[],
   lfRowKind: i32[],
+  lfRowOpenAt: {[i32]: i32},
   lfBuf: u8[],
   lfSinkFired: i32,
   lfPushed: i32[],
@@ -3047,6 +3127,7 @@ function lwSave(): LwFrame {
     lfRowFrom: lwRowFrom,
     lfRowTo: lwRowTo,
     lfRowKind: lwRowKind,
+    lfRowOpenAt: lwRowOpenAt,
     lfBuf: lwBuf,
     lfSinkFired: lwSinkFired,
     lfPushed: lwPushed,
@@ -3075,6 +3156,7 @@ function lwRestore(f: LwFrame) {
   lwRowFrom = f.lfRowFrom
   lwRowTo = f.lfRowTo
   lwRowKind = f.lfRowKind
+  lwRowOpenAt = f.lfRowOpenAt
   lwBuf = f.lfBuf
   lwSinkFired = f.lfSinkFired
   lwPushed = f.lfPushed
