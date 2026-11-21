@@ -37,6 +37,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RJoinNull,
   RListCat,
   RListClear,
   RListCopy,
@@ -73,6 +74,7 @@ import {
   RPrimOp,
   RPrint,
   RRawOp,
+  RRecCopyPure,
   RRecover,
   RRel,
   RRetNull,
@@ -131,10 +133,17 @@ import {
   repNodeKids,
   repNodeOfTy,
 } from "./emit_rep"
-import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
+import {
+  listRetag,
+  repBoolNiche,
+  repIsNoValue,
+  repIsScalar,
+  repPrim,
+  repWhat,
+} from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
+import { AsExpr, Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
 import {
   memOpIsVoid,
   memOpPlanOf,
@@ -529,6 +538,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RRecCopyPure => {
+      if dst >= 0 && !(repNodeAt(dst) is RRecord) {
+        return fail(2, at, "a record copy of a non-record rep")
+      }
+      0
+    }
     RRecover => {
       use(r.rcV, at)
       if !(repNodeAt(opRep(r.rcV)) is RNullable) {
@@ -746,9 +761,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A packed byte reads unsigned into an i32.
       const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
-      // A nullable string element may read recovered at a string.
+      // A nullable element may read recovered at its inner rep.
       const en = repNodeAt(kidAt(l, 0))
-      const recovered = en is RNullable && en.rnInner == dst && dst == vfStr
+      const recovered = en is RNullable && en.rnInner == dst
       if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed && !recovered {
         return fail(2, at, "an element's rep is not its destination's")
       }
@@ -758,14 +773,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.rgV, at)
       const d = repNodeAt(dst)
       if (
-        !(d is RNullable)
-        || !nicheRetag(d.rnDisc, d.rnInner)
-        || d.rnInner != opRep(r.rgV)
+        !listRetag(opRep(r.rgV), dst)
+        && (!(d is RNullable)
+          || !nicheRetag(d.rnDisc, d.rnInner)
+          || d.rnInner != opRep(r.rgV))
       ) {
         return fail(
           2,
           at,
-          "a retag is not of an atom or a string into its own nullable niche",
+          "a retag is not of an atom or a string into its own nullable niche, or a ref list as itself",
         )
       }
       0
@@ -817,6 +833,22 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RJoinNull => {
+      // A join's null is its nullable reference's, never a box's or a sentinel's.
+      const d = repNodeAt(dst)
+      if (
+        !(d is RNullable)
+        || d.rnDisc != 1
+        || !nicheRetag(d.rnDisc, d.rnInner)
+      ) {
+        return fail(
+          2,
+          at,
+          "a join null is not delivered into a nullable reference",
+        )
+      }
+      0
+    }
     RRetNull => {
       // The function's own null is its result, so it is delivered at the return rep, a nullable one.
       const d = repNodeAt(dst)
@@ -845,8 +877,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RAtomEq => {
       // A static side's immediate is unread; any other static operand is evaluated and dropped.
-      if !(r.aeStatic == 1 && r.aeL is OImm) { use(r.aeL, at) }
-      if !(r.aeStatic == 2 && r.aeR is OImm) { use(r.aeR, at) }
+      if !((r.aeStatic == 1 || r.aeStatic == 3) && r.aeL is OImm) {
+        use(r.aeL, at)
+      }
+      if !((r.aeStatic == 2 || r.aeStatic == 3) && r.aeR is OImm) {
+        use(r.aeR, at)
+      }
       0
     }
     RUnionEq => {
@@ -1069,7 +1105,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNumCast => {
       use(r.ncV, at)
-      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) {
+      // An exact `as?` yields the value-union box of its target, or its null: a box, or the
+      // boxed `T | null`.
+      const nc = nodeAt(r.ncAt)
+      const dn = repNodeAt(dst)
+      const boxed = nc is AsExpr
+        && nc.asMode == "null"
+        && (dn is RBox || dn is RNullable && dn.rnDisc == 4)
+      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) && !boxed {
         return fail(2, at, "a numeric cast is between scalars")
       }
       0
@@ -1215,7 +1258,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
       const gn = repNodeAt(g)
-      const narrowed = r.ggAt >= 0 && gn is RNullable && gn.rnInner == dst
+      const narrowed = r.ggNn >= 0 && gn is RNullable && gn.rnInner == dst
       if dst >= 0 && dst != g && !narrowed {
         return fail(2, at, "a global's rep is not its destination's")
       }
@@ -1422,6 +1465,21 @@ function coalNicheWhy(n: SCoalBox): string {
     return "a `boolean | null` `??` yields neither the niche nor a boolean"
   }
   return ""
+}
+
+// A record field's `??` re-reads its record, a variable, and yields the field's box or its scalar.
+function coalFieldWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) { return "a field `??` re-reads no variable" }
+  if !(repNodeAt(opRep(n.cbL)) is RRecord) {
+    return "a field `??` reads no record"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length { return "a field `??` writes no variable" }
+  const or = vf.irVars[o].vRep
+  if n.cbArm == "fieldBox" {
+    return if repNodeAt(or) is RBox { "" } else { "a field `??` keeps no box" }
+  }
+  return if repPrim(or) != null { "" } else { "a field `??` unboxes to no scalar" }
 }
 
 function coalNulRefWhy(n: SCoalBox): string {
@@ -1759,6 +1817,7 @@ function stmt(id: i32, prev: i32) {
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "nulRef" => coalNulRefWhy(n)
         "litUnion" | "nulBool" => coalNicheWhy(n)
+        "fieldBox" | "fieldVal" => coalFieldWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -2012,6 +2071,7 @@ function rhsReadsList(r: Rhs): boolean {
       RFnId |
       RGetField |
       RGlobalGet |
+      RJoinNull |
       RListCat |
       RListClear |
       RListCopy |
@@ -2047,6 +2107,7 @@ function rhsReadsList(r: Rhs): boolean {
       RPrimOp |
       RPrint |
       RRawOp |
+      RRecCopyPure |
       RRecover |
       RRel |
       RRetNull |
