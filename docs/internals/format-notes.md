@@ -308,8 +308,8 @@ Three consequences worth stating, because each is a decision and not a fall-out:
 
 * **The row width is read BEFORE the one-line form.** A 4×4 identity matrix fits on one line,
   and collapsing it destroys exactly the shape the intent rule exists to protect.
-* **A one-per-line list is kept one per line** (coordinator ruling, 2026-11-21, amending the
-  owner's #2814 floor of two elements a row; the owner may overrule). The floor existed so the
+* **A one-per-line list is kept one per line** (2026-11-21: coordinator ruling, amends the
+  owner's #2814 floor; the owner may overrule). The floor (two elements a row) existed so the
   rule would not pin the printer's own output. For scalars wrapFill emits one per line only when
   the items are too wide to share a row, and old and new `vl fmt` output were byte-identical on
   all 23,536 tracked `.vl` files when the floor dropped. Why: a closed set written one member
