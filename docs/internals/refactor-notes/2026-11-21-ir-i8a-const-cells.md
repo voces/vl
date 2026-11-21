@@ -23,8 +23,10 @@ writer. It adds:
 - `irClaimConstCell(gi, gst)`: the claim seam. Unarmed, and only when every node is in a claimed
   family (`claimable()`, the rule functions and start bodies follow), the IR writes the
   initializer and legacy does not run;
-- `irConstCellShadow`: armed, legacy runs and the fragment is compared with legacy's bytes, as
-  `const cell <arm> <kind>: matched | differ | miss <why>`.
+- `irConstCellShadow`: armed, legacy runs and the fragment is compared with legacy's bytes. It
+  counts `const cell <arm> <kind>: matched` or `miss <why>`. A differ is
+  `mismatch bytes: const cell <arm> <kind>`, the class `ir-shadow.vl` never baselines in either
+  population and the bytes veto reads.
 
 The plain and union arms take the seam. The fold arm writes a `*.const` itself, and the
 generic-alias arm writes a closure core; neither reaches `emitExpr`. A miss falls back to legacy
@@ -57,7 +59,15 @@ coverage lanes already name:
 | `operand coercion` | 2 | 2 |
 | `array null sentinel` | 1 | 2 |
 
-## Cost, and the two changes that pay it back
+## The differ is gated
+
+A seed whose fragment always differs (a byte added after lowering) reds `ir-shadow.vl` on both
+populations, exit 1 with `a byte difference: … mismatch bytes: const cell plain array` and the
+other kinds. The real seed is `ir-shadow: ok` on both, with no const cell mismatch row. The
+shadow's control 3 adds the same byte under `irShadowCorrupt(3)`, and
+`tests/vl_ir_shadow_test.ts` holds that each cell then reads as a bytes mismatch.
+
+## Cost, and the change that pays it back
 
 The claim alone cost +0.41% of L2 self-compile fuel (105,163,681,785 against the base's
 104,735,850,403). A fuel profile of the L2 build put the seam at 0.78% of samples. Half of it was
