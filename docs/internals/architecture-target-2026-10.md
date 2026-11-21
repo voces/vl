@@ -32,6 +32,13 @@ this section from each PR's report; a PR does not edit it (it conflicted on near
 | L5, phase products (lane Q; [design](refactor-notes/2026-11-14-phase-products-design.md)) | steps 0, 1 and 2a landed | Step 0 is the phase-state ratchet (#8105, with #8148's arena-accessor exclusion). Step 1 gives mono's instance builder an explicit `InstReq` (#8121). Step 2a turns the 24 `fnUses*` flags into one `FnUses` record (#8233). Left: the rest of step 2's explicit `FnCtx`. |
 | L6, the independent oracle (lane O) | landed; CI under `sweep` | The oracle landed in #8116. It now has data and higher-order generators (#8160, #8169) and models rulings 4.1–4.4, Q8 and Q9 (#8179, #8182, #8191, #8227). Nightly fuzzing gates on unfiled findings (#8112). Each finding is filed as a row. |
 
+**The IR programme** ([`ir-design-2026-11.md`](ir-design-2026-11.md) §10; fold of 2026-11-21, master `dd485f4cd`):
+
+| Lane | State | What is left |
+|---|---|---|
+| IR coverage and claiming | coverage steps landing per family; claiming on | Since the last fold: the shared `==`/`!=` route (#9311) and niche compare (#9302), atom `if` joins (#9305, #9313), narrowed and nullable field reads (#9301, #9312), null tests of a box or map read (#9314), list literals of a variant's records (#9322), captures as parameters and closure environments (#9319, #9327), literal assignment values, bitwise not, staged operator leads and a returned trap (#9317, #9315, #9321, #9325). D17038, a claimed block tail returning an `else` arm's value, is closed (#9331). Notes: the 2026-11-19 to 2026-11-21 entries of [`refactor-notes/`](refactor-notes/README.md). |
+| Claim soundness at the gate | `ir shadow cases` row and the bytes veto landed | The armed shadow runs over `tests/cases` too, and no baseline admits a byte difference (#9328). A claim does not consult the shadow, so shipped-vs-claimless identity is a per-batch queue step (`ir-identity.sh --claimless`, ruled at gate time rather than in the compiler for its +12–19% fuel). L2 fuel reference 104.92G (#9336). |
+
 **§3.4, the evening census of 2026-11-07** (master `3401b65f2`): the 165 `emit_mono` functions the morning
 census left.
 
