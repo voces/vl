@@ -9044,6 +9044,8 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
     }
+    // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
+    "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
     "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
@@ -9055,6 +9057,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
+    "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -9085,6 +9088,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   } else if (
     p.hbArm == "pass"
     || p.hbArm == "atomStr"
+    || p.hbArm == "nulNiche"
     || p.hbArm == "rec"
     || p.hbArm == "refList"
     || p.hbArm == "map"
@@ -9117,7 +9121,11 @@ function emitUnionBoxArg(
   }
   boxDstShadowEnter()
   const hp = holeBoxPlanOf(exprIx, unionTy, fnIx)
-  if hp.hbArm != "ladder" {
+  // A niche the union has no arm for is the ladder's record rungs' (`emitUnionBoxNulNiche`'s 0).
+  if (
+    hp.hbArm != "ladder"
+    && (hp.hbArm != "nulNiche" || nulNicheBoxTagOf(unionTy, exprIx, fnIx) >= 0)
+  ) {
     // The shadow notes the coerce the ladder's value rungs are reached through, as legacy did.
     const viaCoerce = !exprIsNulNone(exprIx, fnIx)
     if viaCoerce && boxDstShadowArmed() {
@@ -41314,17 +41322,24 @@ function emitUnionBoxNulNiche(
     fbEnd()
     return 1
   }
-  const nnTag = coalNicheBoxTag(
-    unionTy,
-    nnIx,
-    nulNicheValueHeap(nnIx, fnIx),
-    fnIx,
-  )
+  const nnTag = nulNicheBoxTagOf(unionTy, exprIx, fnIx)
   if nnTag < 0 { return 0 }
-  const nnSlot = nulNicheBoxSlot()
+  const hp: HoleBox = { hbArm: "nulNiche", hbKind: unionTy, hbSrc: -1 }
   // Read raw: a nullable-string ident is otherwise recovered non-null, which traps on the very
   // null this rung exists to box (D2260).
-  if emitExpr(exprIx, fnIx) < 0 { return -1 }
+  if emitHoleBox(hp, exprIx, fnIx) < 0 { return -1 }
+  return 1
+}
+
+// The box tag ref niche `exprIx` rides `unionTy` under (`coalNicheBoxTag`), or -1.
+export function nulNicheBoxTagOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const nnIx = unwrapParen(exprIx)
+  return coalNicheBoxTag(unionTy, nnIx, nulNicheValueHeap(nnIx, fnIx), fnIx)
+}
+
+// After a ref niche's value: the union's null box if it is null, else the value under `nnTag`.
+export function nulNicheBoxTail(nnTag: i32): i32 {
+  const nnSlot = nulNicheBoxSlot()
   fbLocalTee(nnSlot)
   fbRefIsNull()
   fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype — the box is the result either way
