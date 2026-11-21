@@ -23565,18 +23565,30 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
   }
   const lxr = emitAsListAcrossReps(e, tty, fnIx)
   if lxr != 0 { return if lxr < 0 { -1 } else { 0 } }
+  const p = asUnionTagPlanOf(e, tty, fnIx)
+  if p == null { return -1 }
+  if emitExpr(obj, fnIx) < 0 { return -1 }
+  return emitAsUnionTagTail(e, p)
+}
+
+// The tag test `emitAsUnionCast` writes for the cast of `e` to target arm type `tty`: the arms'
+// tags and how the tail unboxes, or null once a refusal is raised.
+function asUnionTagPlanOf(e: AsExpr, tty: i32, fnIx: i32): AsUnionTag | null {
+  const obj = e.asObj
+  const tgt = e.asTy
   const wantTags: i32[] = []
   const wantVis: i32[] = []
   const recvUt = unionTyOfRecv(nodeTyInOf(unwrapParen(obj), fnIx))
   const recvU = if recvUt >= 0 { unRowOfTyKey(recvUt) } else { -1 }
   if !unionArmTagsOfTy(tty, recvU, wantTags, wantVis) {
-    return emitFail(
+    emitFail(
       "emitProgram: `as "
         + tgt
         + "` is supported for a value-union arm or a struct-variant arm; this arm is neither — write the explicit `if x is "
         + tgt
         + " { … }` ladder for it",
     )
+    return null
   }
   const subUnion = wantTags.length > 1
   let armVi = -1
@@ -23599,11 +23611,24 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
   // `unionArmTagsOfTy` owns the empty-arm case, so what is left is a single arm the tag
   // reached but neither the variant table nor the atom kinds can name.
   if !subUnion && armVi < 0 && ak < 0 && mapHeap < 0 {
-    return emitFail(
+    emitFail(
       "emitProgram: `as " + tgt + "` names no union arm this cast can test",
     )
+    return null
   }
-  if emitExpr(obj, fnIx) < 0 { return -1 }
+  const p: AsUnionTag = {
+    atTags: wantTags,
+    atSub: subUnion,
+    atVi: armVi,
+    atK: ak,
+    atHeap: mapHeap,
+  }
+  return p
+}
+
+// The tag test plan `p` names and the cast's tail, its union box operand on the stack.
+function emitAsUnionTagTail(e: AsExpr, p: AsUnionTag) {
+  const wantTags = p.atTags
   fbLocalSet(unionAsBoxSlot())
   // `tag == w0 || tag == w1 || …` — one compare for a single arm, a chain for a sub-union.
   // The tag is re-read per arm rather than stashed in a second i32 slot: it is a
@@ -23619,18 +23644,62 @@ function emitAsUnionCast(e: AsExpr, _exprIx: i32, fnIx: i32) {
     }
     wi = wi + 1
   }
-  return emitAsUnionTail(e, subUnion, armVi, ak, mapHeap)
+  return emitAsUnionTail(e, p.atSub, p.atVi, p.atK, p.atHeap)
 }
 
-// The cast of `e` over a union of lists stored as its one list (`oneListUnionRender`), which
-// has no tag: the whole list always fits, and a narrower target fits when every element does,
-// by `is`'s own element test. 0 when the cast is not that shape, 1 when emitted, -1 on failure.
-function emitAsOneListCast(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
+// A union-operand cast's tag-test arm: the plan `asUnionTagPlanOf` makes for cast `exprIx` in
+// `fnIx`, then its test and tail, with its box operand already on the stack.
+export function emitAsUnionTagged(exprIx: i32, fnIx: i32) {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return -1 }
+  const p = asUnionTagPlanOf(e, asUnionArmTyOf(exprIx), fnIx)
+  if p == null { return -1 }
+  return emitAsUnionTagTail(e, p)
+}
+
+// Why the union-operand cast `exprIx` in `fnIx` takes a lowering other than the tag test, or "":
+// a niche operand, a map twin a numeric literal union reads as, a literal-union target, or a list
+// target tested by its elements across reps.
+export function asUnionTagWhy(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "no cast" }
+  if !exprUnion(e.asObj, fnIx) { return "niche" }
+  const tty = asUnionArmTyOf(exprIx)
+  if mapSoftTwinClashOf(e.asObj, tty, fnIx) >= 0 { return "map twin" }
+  if asExprBoxToLitUnion(exprIx, fnIx) { return "literal union" }
+  if asListAcrossRepsOf(e, tty, fnIx, [], [], []) >= 0 {
+    return "list across reps"
+  }
+  return ""
+}
+
+// The target arm type of cast `exprIx`: the cast's own recorded type, the checker's proof, with
+// `as?`'s `| null` peeled.
+function asUnionArmTyOf(exprIx: i32): i32 {
+  const e = nodeAt(exprIx)
+  const t = nodeTyIxOf(exprIx)
+  return if e is AsExpr && e.asMode == "null" { tyPeelNul(t) } else { t }
+}
+
+// The tag test of a union-operand cast: the target arms' tags, whether the target is a sub-union
+// (the box itself), and the single arm's variant row, value kind or payload heap (-1 for none).
+type AsUnionTag = {
+  atTags: i32[],
+  atSub: boolean,
+  atVi: i32,
+  atK: i32,
+  atHeap: i32,
+}
+
+// The operand and target of the cast `e` (at `exprIx`) over a union of lists stored as its one
+// list (`emitAsOneListCast`): its nullability, its non-null type, the target arm, the arm's list
+// wrapper heap and the list's rep; null when the cast is not that shape.
+function asOneListOf(e: AsExpr, exprIx: i32, fnIx: i32): AsOneList | null {
   const obj = e.asObj
   const nullable = nodeTyIsNullable(obj)
   const oty0 = nodeTyAt(unwrapParen(obj), fnIx)
   const oty = if nullable { nonNullTy(oty0) } else { oty0 }
-  if oneListUnionRender(oty) == "" { return 0 }
+  if oneListUnionRender(oty) == "" { return null }
   const tty = if e.asMode == "null" { tyPeelNul(nodeTyIxOf(exprIx)) } else { nodeTyIxOf(exprIx) }
   const heap = listArmHeapOf(tty)
   const rep = exprListRep(obj, fnIx)
@@ -23638,8 +23707,49 @@ function emitAsOneListCast(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
     heap < 0
     || rep != "list" && rep != "i64list" && rep != "strlist" && rep != "reflist"
   ) {
-    return 0
+    return null
   }
+  const ol: AsOneList = {
+    olNullable: nullable,
+    olOty: oty,
+    olTty: tty,
+    olHeap: heap,
+    olRep: rep,
+  }
+  return ol
+}
+
+type AsOneList = {
+  olNullable: boolean,
+  olOty: i32,
+  olTty: i32,
+  olHeap: i32,
+  olRep: VKind | null,
+}
+
+// Why the cast `exprIx` over a niche operand in `fnIx` takes a lowering other than the operand
+// itself (`as?`) or its `ref.as_non_null` (`as!`), or "": a union of lists stored as one list, or
+// the propagating `as`, whose operand is written inside the block it leaves.
+export function asNicheCastWhy(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "no cast" }
+  if asOneListOf(e, exprIx, fnIx) != null { return "one list" }
+  if e.asMode == "prop" { return "propagate" }
+  return ""
+}
+
+// The cast of `e` over a union of lists stored as its one list (`oneListUnionRender`), which
+// has no tag: the whole list always fits, and a narrower target fits when every element does,
+// by `is`'s own element test. 0 when the cast is not that shape, 1 when emitted, -1 on failure.
+function emitAsOneListCast(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
+  const obj = e.asObj
+  const ol = asOneListOf(e, exprIx, fnIx)
+  if ol == null { return 0 }
+  const nullable = ol.olNullable
+  const oty = ol.olOty
+  const tty = ol.olTty
+  const heap = ol.olHeap
+  const rep = ol.olRep
   if emitExpr(obj, fnIx) < 0 { return -1 }
   if isWholeOfOneListUnion(oty, tty) && !nullable { return 1 }
   const key = if rep == "reflist" { refListSlotOfExpr(obj, fnIx) } else { 0 }
@@ -23687,19 +23797,24 @@ function emitAsOneListCast(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
   return 1
 }
 
-// The cast of `e` to list type `tty` over a box whose list arms `emitListIsAcrossReps` tests by
-// their elements: that test, then the unbox at `tty`'s wrapper, which every tested arm shares
-// (D14042). 0 when the cast is not that shape, 1 when emitted, -1 on failure.
-function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
-  if nodeTyIsNullable(e.asObj) { return 0 }
-  const tags: i32[] = []
-  const fits: i32[] = []
-  const slotsAt: i32[][] = []
-  if !listIsAcrossRepsPlan(e.asObj, tty, fnIx, tags, fits, slotsAt) { return 0 }
+// Whether the cast of `e` to list type `tty` is `emitAsListAcrossReps`'s shape: the heap of `tty`'s
+// wrapper, with the arms' tags, fits and slots filled in, or -1 when it is not.
+function asListAcrossRepsOf(
+  e: AsExpr,
+  tty: i32,
+  fnIx: i32,
+  tags: i32[],
+  fits: i32[],
+  slotsAt: i32[][],
+): i32 {
+  if nodeTyIsNullable(e.asObj) { return -1 }
+  if !listIsAcrossRepsPlan(e.asObj, tty, fnIx, tags, fits, slotsAt) {
+    return -1
+  }
   const heap = listArmHeapOf(tty)
-  if heap < 0 { return 0 }
+  if heap < 0 { return -1 }
   const arms: i32[] = []
-  if !unionTyMemberTys(unionBoxTyOfRead(e.asObj, fnIx), arms) { return 0 }
+  if !unionTyMemberTys(unionBoxTyOfRead(e.asObj, fnIx), arms) { return -1 }
   for a in arms {
     if (
       tyArrayElemIx(a) >= 0
@@ -23708,9 +23823,21 @@ function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
     ) {
       let i = 0
       while i < tags.length && tags[i] != listIsArmTag(a) { i = i + 1 }
-      if i < tags.length { return 0 }
+      if i < tags.length { return -1 }
     }
   }
+  return heap
+}
+
+// The cast of `e` to list type `tty` over a box whose list arms `emitListIsAcrossReps` tests by
+// their elements: that test, then the unbox at `tty`'s wrapper, which every tested arm shares
+// (D14042). 0 when the cast is not that shape, 1 when emitted, -1 on failure.
+function emitAsListAcrossReps(e: AsExpr, tty: i32, fnIx: i32): i32 {
+  const tags: i32[] = []
+  const fits: i32[] = []
+  const slotsAt: i32[][] = []
+  const heap = asListAcrossRepsOf(e, tty, fnIx, tags, fits, slotsAt)
+  if heap < 0 { return 0 }
   if emitExpr(e.asObj, fnIx) < 0 { return -1 }
   fbLocalSet(unionAsBoxSlot())
   const r = emitListIsAcrossRepsAt(

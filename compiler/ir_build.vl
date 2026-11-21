@@ -141,6 +141,8 @@ import {
   arrNewFillBoxTy,
   arrNewPlanOf,
   asCastArmOf,
+  asNicheCastWhy,
+  asUnionTagWhy,
   asgValueArmOf,
   atomHookArmOf,
   atomStrPlanOf,
@@ -5827,13 +5829,53 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if n is IfStmt { return ifExpr(b, n, ix, rep) }
   if n is FuncDecl && repNodeAt(rep) is RClosure { return cloValue(b, ix, rep) }
   if n is AsExpr {
-    if asCastArmOf(ix, ibFnIx) == "zextLoad" {
-      return irBMiss("expression as zextLoad")
-    }
+    const arm = asCastArmOf(ix, ibFnIx)
+    if arm == "zextLoad" { return irBMiss("expression as zextLoad") }
+    if arm == "union" { return asUnion(b, n, ix, rep) }
     return asCast(b, n, ix, rep)
   }
   if n is ObjLit { return objLit(b, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
+}
+
+// A cast over a union box by legacy's tag test (`asUnionTagWhy` names the other lowerings): the
+// box, then the test and tail at the cast's own rep. `as?`'s valued `if` takes its value from the
+// stack, so no temp an operand before it built may wait there.
+function asUnion(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const why = asUnionTagWhy(ix, ibFnIx)
+  if why == "niche" { return asNiche(b, n, ix, rep) }
+  if why != "" { return irBMiss("union cast " + why) }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  if rep != repNodeOfTy(ty) { return irBMiss("union cast result rep") }
+  if n.asMode == "null" && endsInTemp(b) {
+    return irBMiss("union cast after an operand")
+  }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RBox) {
+    return irBMiss("union cast operand rep")
+  }
+  return irBLetTemp(b, { auV: v, auAt: ix }, ix, rep)
+}
+
+// A cast over a niche-repped `T | null` operand, as `emitAsNulNiche` writes it: `as?` is the
+// operand at its own rep, and `as!` its `ref.as_non_null` (`RCast`).
+function asNiche(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
+  const why = asNicheCastWhy(ix, ibFnIx)
+  if why != "" { return irBMiss("union cast niche " + why) }
+  const v = irBExpr(b, n.asObj)
+  if ibMiss != "" { return v }
+  const vr = irBOpRep(v)
+  if n.asMode == "null" {
+    if vr != rep { return irBMiss("union cast niche rep") }
+    return v
+  }
+  const vn = repNodeAt(vr)
+  if !(vn is RNullable) || vn.rnInner != rep || !refNullable(vr) {
+    return irBMiss("union cast niche rep")
+  }
+  return irBLetTemp(b, { ctV: v, ctTarget: rep, ctOnFail: "trap" }, ix, rep)
 }
 
 // An `as` at a `v128` rep over a `v128` operand re-brands the same bits, which legacy writes as
