@@ -7,6 +7,7 @@
 import { i32ToStr } from "./ast"
 import { CoalValArm } from "./emit_plan_null"
 import { ArrLitArm } from "./emit_plan_list"
+import { LitIsArm } from "./emit_plan_union"
 import {
   RAtom,
   RBox,
@@ -105,10 +106,10 @@ export type RBoxNarrow = { bnV: Opnd, bnAt: i32, bnRep: i32, bnAtom: i32 }
 export type RRecover = { rcV: Opnd, rcAt: i32 }
 export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
-// `mrFields` in the rep's kid order; `mrLayout[i]` the kid layout position `i` writes, `mrSrc` the
-// kids in source order where legacy's order stash evaluates them so, else empty. `mrAt`: the
-// object literal, whose row legacy's `objLitArmOf` and layout predicates name, or, where `mrRow`
-// is not -1, the row its destination builds it at: a variant's (`mrVariant`) or a struct's.
+// `mrFields` in kid order; `mrLayout[i]` the kid layout position `i` writes; `mrSrc` the kids in
+// stash source order, else empty; `mrSet` where `RStashSet`s set them (`mrFields` then empty).
+// `mrAt` the literal, at its own row or, where `mrRow` is not -1, its destination's (a variant's
+// where `mrVariant`); `mrBuiltRow` the row the builder built the fields by, which lowering reads.
 export type RMakeRec = {
   mrFields: Opnd[],
   mrLayout: i32[],
@@ -116,6 +117,19 @@ export type RMakeRec = {
   mrAt: i32,
   mrRow: i32,
   mrVariant: boolean,
+  mrBuiltRow: i32,
+  mrSet: boolean,
+}
+// One field of an order-stashed record literal (`mrSet`), set in source order into the slot
+// legacy's stash opens for layout position `ssFi` (kid `ssK`) of the literal at `ssAt`, built at
+// `ssRow` (a variant's where `ssVariant`); its `RMakeRec` reads the slots back.
+export type RStashSet = {
+  ssV: Opnd,
+  ssAt: i32,
+  ssRow: i32,
+  ssVariant: boolean,
+  ssFi: i32,
+  ssK: i32,
 }
 // A field read at node `gfAt`, kid `gfIx` of `gfV`'s record; `gfStored` where the builder built it
 // at its storage (an `is` receiver's), so it is lowered under the same mark.
@@ -141,6 +155,8 @@ export type RSpread = {
 }
 // `__array_new__(lnLen, lnFill)` at call node `lnAt`, written by legacy's stash and tail.
 export type RListNew = { lnLen: Opnd, lnFill: Opnd, lnAt: i32 }
+// `__array_new_default__(ldLen)` at call node `ldAt`: the zeroed list legacy's default tail writes.
+export type RListNewDefault = { ldLen: Opnd, ldAt: i32 }
 // `__array_copy__(dst, dstAt, src, srcAt, count)` at call node `lcAt`, over its five operands.
 export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
@@ -166,6 +182,11 @@ export type RAtomStr = { sxV: Opnd, sxAt: i32 }
 // The `null` legacy builds where node `nuAt` is delivered: the null `nuOwn` names (`nullOwnAt`),
 // a `K | null` sentinel or a `string | null`'s typed null.
 export type RNullOf = { nuAt: i32, nuOwn: i32 }
+// The null of struct row `omRow`'s field `omField`, which an object literal omits.
+export type ROmitNull = { omRow: i32, omField: i32 }
+// Struct row `fnRow`'s field `fnFi`'s typed null, as legacy's `emitOmittedFieldNull` writes it: the
+// `ref.null` of the field's own heap (`fieldTypedNullHas`).
+export type RFieldNull = { fnRow: i32, fnFi: i32 }
 // The function's own `null` at its nullable return rep (`nullRetPlanOf`), as legacy pads a returned
 // value `if` with it at `rnrAt` (`emitNullForRet`).
 export type RRetNull = { rnrAt: i32 }
@@ -188,6 +209,12 @@ export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
 // The `==` (or `!=`) of two lists at compare node `qeAt`, written by legacy's list compare
 // (`listEqTail`) after each operand's own recovery (`listEqOperandTail`).
 export type RListEq = { qeL: Opnd, qeR: Opnd, qeAt: i32 }
+// The `+` of two lists at concat node `ljAt`, written by legacy's concat (`listCatTail`) after each
+// operand's own recovery (`listCatOperandTail`).
+export type RListCat = { ljL: Opnd, ljR: Opnd, ljAt: i32 }
+// The value `cvV` of node `cvAt` converted by the coercion its checker record owes there, a list
+// copy or a union box's retag, written by legacy's tail after it (`coerceTail`).
+export type RCoerce = { cvV: Opnd, cvAt: i32 }
 // A push's receiver already staged by the `RListStage` statement at node `pstNode`.
 export type PStaged = { pstNode: i32 }
 // A push's receiver: an operand it reads, or the stage that holds it.
@@ -239,9 +266,15 @@ export type RListEmpty = { leV: Opnd, leAt: i32 }
 // Box variable `lfV` tested at each list arm of `is` test `lfAt` whose elements never meet the
 // tested type (`emptyFitArmsPlanOf`): the arm's tag, then its list's emptiness, or'd: a bool.
 export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
+// `liV` at literal arm `liArm` of `is` test `liAt` (`litIsArmOf`), read once per member the arm
+// compares, as `emitIsTestLitArms` writes it: a bool.
+export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
 // A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
 // (`numIntrPlanOf`).
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
+// A SIMD intrinsic at call `sdAt` other than a load or store: its value operands, then its one
+// instruction and any lane immediates (`simdTail`).
+export type RSimd = { sdArgs: Opnd[], sdAt: i32 }
 // A `print` statement at call `pnAt` of argument `pnV`, written by legacy's tail for its arm.
 export type RPrint = { pnV: Opnd, pnAt: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` read (recovered for `mgNonNull`), or where
@@ -258,13 +291,15 @@ export type RMapGetOr = {
   mgDef: Opnd,
 }
 // A bare `m[k]` at Index node `mtAt`: map global `mtSym` read (recovered for `mtNonNull`), or where
-// it is -1 receiver operand `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`).
+// it is -1 receiver operand `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`). A read the
+// box plan boxes (`mapScalar`) carries the value's atom kind `mtBox`, else -1.
 export type RMapGet = {
   mtSym: i32,
   mtNonNull: boolean,
   mtLoc: Opnd,
   mtKey: Opnd,
   mtAt: i32,
+  mtBox: i32,
 }
 // `m.has(k)` at call `mhAt` on map global `mhSym` (receiver node `mhRecv`, recovered for
 // `mhNonNull`), or with `mhSym` -1 receiver operand `mhLoc`, key `mhKey`: legacy's probe and hit flag, an
@@ -288,6 +323,8 @@ export type RGlobalGet = { ggSym: i32, ggNonNull: boolean }
 export type REnvGet = { evSlot: i32, evAt: i32 }
 // The environment of nested function `edFn` this frame caches, dropped where its declaration runs.
 export type REnvDrop = { edFn: i32 }
+// The closure bundle parameter `bpV` holds for call `bpAt` (D14841), as `bundlePickOf` picks it.
+export type RBundlePick = { bpV: Opnd, bpAt: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -318,6 +355,7 @@ export type Rhs = RPrimOp
   | RMakeList
   | RSpread
   | RListNew
+  | RListNewDefault
   | RListCopy
   | RMemAccess
   | RListGet
@@ -339,21 +377,28 @@ export type Rhs = RPrimOp
   | RNumWiden
   | RNumCast
   | RNumIntr
+  | RSimd
   | RCoalStr
   | RCoalAtomStr
   | RToBox
   | RRetag
   | RAtomStr
   | RNullOf
+  | ROmitNull
+  | RFieldNull
   | RRetNull
   | RNulTest
   | RAtomEq
   | RTagStash
   | RTagIs
+  | RStashSet
   | RListEmpty
   | RListEmptyArms
+  | RLitArms
   | RUnionEq
   | RListEq
+  | RListCat
+  | RCoerce
   | RMakeClo
   | RFnId
   | RCellNew
@@ -361,6 +406,7 @@ export type Rhs = RPrimOp
   | RGlobalGet
   | REnvGet
   | REnvDrop
+  | RBundlePick
   | RRawOp
   | RRel
   | RStage
@@ -876,6 +922,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMakeList => r.mlElems
     RSpread => r.spSrcs
     RListNew => [r.lnLen, r.lnFill]
+    RListNewDefault => [r.ldLen]
     RListCopy => r.lcArgs
     RMemAccess => r.mmArgs
     RListGet => [r.lgV, r.lgIx]
@@ -897,21 +944,28 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNumWiden => [r.nwV]
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
+    RSimd => r.sdArgs
     RCoalStr => [r.czL, r.czD]
     RCoalAtomStr => [r.zaL, r.zaD]
     RToBox => [r.bxV]
     RRetag => [r.rgV]
     RAtomStr => [r.sxV]
     RNullOf => []
+    ROmitNull => []
+    RFieldNull => []
     RRetNull => []
     RNulTest => [r.ntV]
     RAtomEq => [r.aeL, r.aeR]
     RTagStash => [r.tgsV]
+    RStashSet => [r.ssV]
     RTagIs => []
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
+    RLitArms => [r.liV]
     RUnionEq => [r.ueL, r.ueR]
     RListEq => [r.qeL, r.qeR]
+    RListCat => [r.ljL, r.ljR]
+    RCoerce => [r.cvV]
     RMakeClo => r.mcEnv
     RFnId => []
     RCellNew => [r.cnInit]
@@ -919,6 +973,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RGlobalGet => []
     REnvGet => []
     REnvDrop => []
+    RBundlePick => [r.bpV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -952,6 +1007,7 @@ function rhsText(r: Rhs): string {
     RMakeList => "list(" + opndsText(r.mlElems) + ")"
     RSpread => "spread(" + opndsText(r.spSrcs) + ")"
     RListNew => "list_new(" + opndText(r.lnLen) + ", " + opndText(r.lnFill) + ")"
+    RListNewDefault => "list_new_default(" + opndText(r.ldLen) + ")"
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
     RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
@@ -968,11 +1024,15 @@ function rhsText(r: Rhs): string {
     RAtomStr => "atomstr " + opndText(r.sxV)
     RRetag => "retag " + opndText(r.rgV)
     RNullOf => "null"
+    ROmitNull => "omitted null"
+    RFieldNull => "field null"
     RRetNull => "return null"
     RNulTest => "isnull " + opndText(r.ntV)
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
+    RListCat => "list.cat " + opndText(r.ljL) + " " + opndText(r.ljR)
+    RCoerce => "coerce " + opndText(r.cvV)
     RMapOp => "map." + r.mpOp + "(" + opndsText(r.mpArgs) + ")"
     RMapNew => "map.new"
     RMapSet => "map.set "
@@ -986,10 +1046,18 @@ function rhsText(r: Rhs): string {
     RCoalStr => "coalesce " + opndText(r.czL) + " " + opndText(r.czD)
     RCoalAtomStr => "coalesce atom " + opndText(r.zaL) + " " + opndText(r.zaD)
     RTagStash => "tag stash " + opndText(r.tgsV)
+    RStashSet => "stash set @"
+      + i32ToStr(r.ssAt)
+      + "."
+      + i32ToStr(r.ssFi)
+      + " "
+      + opndText(r.ssV)
     RTagIs => "tag is " + i32ToStr(r.tgiId)
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
+    RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
+    RSimd => "simd(" + opndsText(r.sdArgs) + ")"
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
@@ -1010,6 +1078,7 @@ function rhsText(r: Rhs): string {
       + ")"
     REnvGet => "env " + i32ToStr(r.evSlot)
     REnvDrop => "env drop f" + i32ToStr(r.edFn)
+    RBundlePick => "bundle pick " + opndText(r.bpV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -1171,6 +1240,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SCoalBox => match n.cbArm {
       "popOr" => "list"
       "nulRef" => "box"
+      "litUnion" | "nulBool" => "box"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
     }
@@ -1194,13 +1264,15 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RRetag |
       RAtomStr |
       RNullOf |
+      RFieldNull |
       RRetNull |
       RNulTest |
       RAtomEq |
       RUnionEq |
       RRecover |
       RTagStash |
-      RTagIs => "scalar"
+      RTagIs |
+      RLitArms => "scalar"
     RCall | RPrint => "call"
     RGlobalGet => "global"
     RListGet |
@@ -1212,6 +1284,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMapFilter |
       RListSlice |
       RListEq |
+      RListCat |
+      RCoerce |
       RListEmpty |
       RListEmptyArms |
       RStrOp |
@@ -1227,16 +1301,22 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RBoxField |
       RSharedRead |
       RBoxNarrow => "box"
-    RGetField | RMakeRec => "record"
+    RGetField |
+      RMakeRec |
+      ROmitNull |
+      RStashSet => "record"
     RMakeClo |
       RCallRef |
       REnvGet |
-      REnvDrop => "closure"
+      REnvDrop |
+      RBundlePick => "closure"
     RCallHost |
       RCast |
       RTagOf |
       RListNew |
+      RListNewDefault |
       RListCopy |
+      RSimd |
       RMemAccess |
       RFnId |
       RCellNew |
