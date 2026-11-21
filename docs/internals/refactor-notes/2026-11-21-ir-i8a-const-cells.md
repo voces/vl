@@ -57,6 +57,22 @@ coverage lanes already name:
 | `operand coercion` | 2 | 2 |
 | `array null sentinel` | 1 | 2 |
 
+## Cost, and the two changes that pay it back
+
+The claim alone cost +0.41% of L2 self-compile fuel (105,163,681,785 against the base's
+104,735,850,403). A fuel profile of the L2 build put the seam at 0.78% of samples. Half of it was
+the list literal's lowering asking `arrLitArmOf` again, the same plan the builder had already
+asked, mostly `emptyArrHoleBuildKind` over the compiler's own `[]` cells. Two changes pay it back:
+- **`RMakeList` carries the builder's arm (`mlArm`)**, and the lowering reads it rather than
+  re-deriving it. This holds for every claimed list literal, not only the cells. The arm is the
+  one the builder already built the elements by, and `arrLitPrologue` between the two calls only
+  mints types and notes spreads, so the answer cannot differ.
+- **`captureFoldedConsts` no longer writes a list or record literal's cell into its scratch
+  buffer.** That scan asks only whether the bytes are one scalar `*.const`, which an aggregate
+  never is; legacy wrote those cells twice too.
+
+L2 fuel is 103,928,382,077: **−0.77%** against the base, and under the committed baseline.
+
 ## The stub witness
 
 Legacy's 14 expression and statement entry points were emptied in a throwaway copy of this tree
