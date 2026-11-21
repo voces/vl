@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: an order-stashed record's fields are set into their slots where a later field is a valued `if`.** Under legacy's source-order stash each field is written and `local.set` into its slot in source order; the IR built the record's fields as one node's operands, so a later field's valued `if` missed (`short-circuit field after another`). A migration `RStashSet`, beside `RListStage` and `RTagStash`, now sets each field into the slot `objOrderStashSlot` opens, and its `RMakeRec` reads them back; the verifier pairs them. A boxed such record stays a named miss (`box of a stash-set record`), the box's tag being legacy's first write (self-compile +4, `short-circuit field after another` 7 → 0).
