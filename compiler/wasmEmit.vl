@@ -1709,6 +1709,7 @@ import {
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
   NULL_OWN_BOX,
+  NULL_OWN_NONE,
   NULL_OWN_STR,
   NullRet,
   binNulTestOf,
@@ -1967,30 +1968,45 @@ export function sFieldStorageSlot(si: i32, fi: i32): i32 {
   }
 }
 
-// The null value of an omitted nullable field (`si`/`fi`, field code `scode`) in a
-// struct literal: `ref.null` of the field's own backing for the ref codes, the i32
-// sentinel for `boolean | null` (2) or `K | null` (-1, since member ids are >= 0), or
-// the null-tagged box for a union field with a `null` member. -1 when not nullable.
+// The null an omitted or explicit-`null` field `fi` of struct row `si` takes, where it is one
+// `emitNullOwn` writes (`NULL_OWN_*`): the `boolean | null`, `K | null` or `string | null` niche,
+// the `null` unit, or the null-tagged box of a union with a `null` member. -1 for a typed ref's
+// null or a field with no null of its own.
+export function fieldNullOwnOf(si: i32, fi: i32): i32 {
+  if si < 0 || si >= sFieldStart.length { return -1 }
+  const r = sFieldStart[si] + fi
+  const k = fieldRowKind(r)
+  if k == null { return -1 }
+  return match k {
+    "nulstr" => NULL_OWN_STR
+    "nulbool" => NULL_OWN_BOOL
+    // A plain `i32` has no null; `K | null` rides the niche below every member id.
+    "i32" => if fieldRowIsPlainI32(r) { -1 } else { NULL_OWN_ATOM }
+    "nulnone" => NULL_OWN_NONE
+    // A value-union field defaults to null only when `null` is a member: its banked null code.
+    "union" => if unionHasAtomK(msSetOfTy(sFieldElemTyIxAt(si, fi)), "null", nullValKind()) { NULL_OWN_BOX } else { -1 }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" | "nulstruct" | "nulvariant" | "nulreflist" | "nulmap" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => -1
+  }
+}
+
+// The null value of an omitted nullable field (`si`/`fi`) in a struct literal: `fieldNullOwnOf`'s
+// null, else `ref.null` of the field's own backing for the typed ref codes. -1 when not nullable.
 function emitOmittedFieldNull(si: i32, fi: i32) {
+  const own = fieldNullOwnOf(si, fi)
+  if own >= 0 {
+    emitNullOwn(own)
+    return 0
+  }
+  if si < 0 || si >= sFieldStart.length { return -1 }
   const r = sFieldStart[si] + fi
   const k = fieldRowKind(r)
   if k == null { return -1 }
   match k {
-    "nulstr" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
       fbRefNullForKind(
         k,
         if k == "nulu8list" { fieldRowPackedRow(r) } else { -1 },
       )
-      return 0
-    }
-    "nulbool" => {
-      fbI32Const(2)
-      return 0
-    }
-    "i32" => {
-      // A plain `i32` has no null; `K | null` rides the niche below every member id.
-      if fieldRowIsPlainI32(r) { return -1 }
-      fbI32Const(0 - 1)
       return 0
     }
     "nulstruct" | "nulvariant" => {
@@ -2007,32 +2023,12 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
       }
       return -1
     }
-    "nulnone" => {
-      fbRefNullNone()
-      return 0
-    }
     "nulmap" => {
       fbRefNull(mapTypeIdxOf(sFieldMapShape(si, fi)))
       return 0
     }
-    "union" => {
-      // a value-union field defaults to null only when `null` is a member — resolve the
-      // member set once, then test its banked null code (`nullValKind()`), not the lexeme.
-      if (
-        unionHasAtomK(
-          msSetOfTy(sFieldElemTyIxAt(si, fi)),
-          "null",
-          nullValKind(),
-        )
-      ) {
-        fbI32Rel(RS_TAG, nullBoxTag())
-        fbRefNullNone()
-        fbStructNew(uBoxIdx)
-        return 0
-      }
-      return -1
-    }
-    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => {
+    // `fieldNullOwnOf` wrote these where they have a null; here they have none.
+    "nulstr" | "nulbool" | "i32" | "nulnone" | "union" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => {
       return -1
     }
   }
@@ -32200,6 +32196,13 @@ export function fallThroughPadOf(fnBody: i32, fnIx: i32): string {
   if bodyEndsInReturn(fnBody, fnIx) { return "" }
   if fnRetNullBearing(fnIx) { return "null" }
   return "unreachable"
+}
+
+// `fallThroughPadOf` for function declaration `fnIx`'s own body; "" for any other node.
+export function fnFallThroughPadOf(fnIx: i32): string {
+  if fnIx < 0 || fnIx >= P.nodes.length { return "" }
+  const fd = nodeAt(fnIx)
+  return if fd is FuncDecl { fallThroughPadOf(fd.fnBody, fnIx) } else { "" }
 }
 
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the stack as the
