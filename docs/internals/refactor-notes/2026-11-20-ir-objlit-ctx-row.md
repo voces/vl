@@ -14,9 +14,12 @@ self-compile's `repMk`, `irFnNew` and `eplFresh` missed at `declaration coercion
 ## The change
 
 `objLit` (`ir_build.vl`), struct arm: the row legacy builds at is the layout row, else the stash
-row. When the delivery's type (`ctxTyAt`, past a `| null`) is a closed record whose row
+row. When the delivery's type (`ctxTyAt`) is a closed record whose row
 (`structIndexOfTy`) is that row, the literal is built at that type through `objLitAt`. Each field
-is then delivered at the destination's field rep, as legacy's row writes it.
+is then delivered at the destination's field rep, as legacy's row writes it. A nullable record
+destination is read through its niche's rep (`recordPartTy`: the niche's inner rep and its type,
+`repTyOf`). That keeps the builder off the checker's `nonNullTy`, whose import would raise the
+phase-state surface.
 
 ## Witness
 
