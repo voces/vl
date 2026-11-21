@@ -25,6 +25,12 @@ then one `call` of an import reserved only when used.
 
 ## Measured
 
-See the PR body. The shadow row (`tests/vl_ir_shadow_test.ts`, "host calls") has 8 functions:
-floor slots of each argument kind, a void and a `never` slot, and an extern kept and dropped. On
-master's seed 7 of them are `intrinsic none`; on this one all 8 are covered and matched.
+Against merge-base f63eb997, with fixpoint seeds on both sides (full table in the PR body):
+- `tests/cases` functions with no blocker: 54,784 → 54,896 (+112). `intrinsic none`: 3,109 → 2,969.
+- The functions now built past their host call reach their next miss, mostly `member record`
+  (110 → 137).
+- The self-compile and the distilled corpus make no host call, and are flat.
+
+The row `tests/ir-shadow-rows/host-call.vl` has 8 functions: floor slots of each argument kind,
+a void and a `never` slot, and an extern kept and dropped. On master's seed 7 of them miss as
+`intrinsic none`; on this one all 8 are covered and matched.
