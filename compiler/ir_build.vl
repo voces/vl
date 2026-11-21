@@ -233,6 +233,7 @@ import {
   objLitLayoutRowOf,
   objLitStashRowAt,
   objLitStashRowOf,
+  objLitStashes,
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
   objLitVariantStashAt,
@@ -292,6 +293,7 @@ import {
   isRecvStageRep,
   isVariantTagPlain,
   litIsArmOf,
+  litIsMemberTexts,
   memberBoxReadAt,
   monoStaticIsResult,
   narrowedBoxVariantPlain,
@@ -352,6 +354,7 @@ import {
   ifJoinAdaptsScalar,
   isArmRank,
   letIfInitSinks,
+  litMemberEqArmOf,
   retRefusedWhy,
   spreadRunLit,
 } from "./wasmEmit"
@@ -437,6 +440,7 @@ import {
   nulLitAtomTexts,
   sFieldStoreKind,
   spreadBoxingSource,
+  structIndexOfObjCtx,
 } from "./emit_classify"
 import {
   declaredSlotOf,
@@ -493,6 +497,7 @@ import {
   listIsTestedIdent,
   objFieldSrcOrder,
   objFieldVal,
+  quoteLex,
   unionEqOperandOk,
   unwrapParen,
 } from "./emit_base"
@@ -718,6 +723,7 @@ function valueRep(r: i32, ty: i32): boolean {
     || strNullable(r)
     || refNullable(r)
     || boolNullable(r)
+    || repPrim(r) == "null"
     || irVarRepOkHook(r, ty)
 }
 
@@ -834,11 +840,31 @@ function isLitArms(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
       const o: Opnd = { oiRep: rep, oiBits: bits }
       o
     }
-    "nicheRaw" | "atomNotNul" | "atomEq" => isLitArmsTest(b, n, ix, rep, la)
-    "boxLits" | "numBox" | "memberNoRecv" | "memberEq" | "none" => {
+    "nicheRaw" | "atomNotNul" | "atomEq" | "memberEq" => isLitArmsTest(b, n, ix, rep, la)
+    "boxLits" | "numBox" | "memberNoRecv" | "none" => {
       irBMiss("is rung litArms " + la)
     }
   }
+}
+
+// Why a member of `is` test `ix`'s `memberEq` arm does not compare as a string over receiver
+// `recvIx` at rep `r` (a string's plain compare, or a `string | null`'s guarded one), else "".
+function memberEqMissOf(recvIx: i32, ix: i32, r: i32): string {
+  const texts = litIsMemberTexts(ix)
+  if texts.length == 0 { return "is literal member none" }
+  const rn = repNodeAt(r)
+  let i = 0
+  while i < texts.length {
+    const a = litMemberEqArmOf(recvIx, quoteLex(texts[i]), ibFnIx)
+    const ok = match a {
+      "str" => repPrim(r) == "str"
+      "nulStr" => rn is RNullable && repPrim(rn.rnInner) == "str"
+      "union" | "num" => false
+    }
+    if !ok { return "is literal member " + a + " at " + repWhat(r) }
+    i = i + 1
+  }
+  return ""
 }
 
 // A literal arm that reads its operand and writes its own test (`RLitArms`): a ref niche's null
@@ -858,11 +884,14 @@ function isLitArmsTest(
     "nicheRaw" => vn is RNullable && vn.rnDisc != 3 && vn.rnDisc != 2
     "atomNotNul" => atomNullable(irBOpRep(v))
     "atomEq" => vn is RAtom || atomNullable(irBOpRep(v))
-    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "memberEq" | "none" => false
+    "memberEq" => true
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "none" => false
   }
   if !ok { return irBMiss("is literal arms operand rep") }
+  const why = if la == "memberEq" { memberEqMissOf(n.isObj, ix, irBOpRep(v)) } else { "" }
+  if why != "" { return irBMiss(why) }
   if (
-    la == "atomEq"
+    (la == "atomEq" || la == "memberEq")
     && (!(v is OVar) || v.ov < 0 || ib.irVars[v.ov].vKind == "temp")
   ) {
     return irBMiss("is literal arms receiver")
@@ -1004,7 +1033,10 @@ function objLitAt(
   const plainRow = if at >= 0 && variant { objLitVariantLayoutAt(ix, at) } else if at >= 0 { objLitLayoutRowAt(ix, at) } else if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
   // Else legacy's order stash: each field in source order into a scratch local, then the layout.
   const stashRow = if plainRow >= 0 { -1 } else if at >= 0 && variant { objLitVariantStashAt(ix, at) } else if at >= 0 { objLitStashRowAt(ix, at) } else if arm == "struct" { objLitStashRowOf(ix, ibFnIx) } else { objLitVariantStashOf(ix, ibFnIx) }
-  const row = if plainRow >= 0 { plainRow } else { stashRow }
+  // A struct literal that omits fields is built at its row with each omitted field's null, as
+  // `emitObj` builds it, where no field's source order is observable.
+  const omitRow = if plainRow >= 0 || stashRow >= 0 || arm != "struct" { -1 } else { objLitOmitRow(ix, at) }
+  const row = if plainRow >= 0 { plainRow } else if stashRow >= 0 { stashRow } else { omitRow }
   if row < 0 { return irBMiss("object layout") }
   const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
   const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
@@ -1038,6 +1070,20 @@ function objLitAt(
     const k = repRecordKidOf(rep, ty, name)
     if k < 0 || k >= ks.length { return irBMiss("object field kid") }
     const valIx = objFieldVal(ix, name)
+    if valIx < 0 && omitRow >= 0 {
+      const nul = irBLetTempTy(
+        b,
+        { omRow: row, omField: fi },
+        ix,
+        ks[k],
+        fieldSiteTy(arm, row, fi),
+      )
+      if ibMiss != "" { return nul }
+      fields[k] = nul
+      layout[fi] = k
+      oi = oi + 1
+      continue
+    }
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
     if why != "" { return irBMiss(why) }
     const mark = b.length
@@ -1095,6 +1141,7 @@ function objLitAt(
     mrAt: ix,
     mrRow: at,
     mrVariant: variant,
+    mrBuiltRow: row,
     mrSet: set,
   }
   if at < 0 { return irBLetTemp(b, rhs, ix, rep) }
@@ -1104,6 +1151,14 @@ function objLitAt(
   irBNode(b, { lDst: t, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: t }
   return o
+}
+
+// The struct row a literal omitting fields is built at (its destination's row `at`, else its own),
+// or -1: one with every given field a field of the row and no source order observable.
+function objLitOmitRow(ix: i32, at: i32): i32 {
+  const si = if at >= 0 { at } else { structIndexOfObjCtx(ix, ibFnIx) }
+  if si < 0 || si >= sFieldCount.length || objLitStashes(ix, si) { return -1 }
+  return si
 }
 
 // Field `fi` (kid `k`) of the order-stashed literal at `ix`, built at row `at`, set from `v`.
@@ -2354,6 +2409,17 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
     const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else if rangeVar { ibDeclVar[d] ?? -1 } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
+    // A read of a `null` unit local is its destination's null, as `emitNullAt` writes it.
+    if (
+      repPrim(ib.irVars[v].vRep) == "null"
+      && identReadArmOf(n, ix, ibFnIx, false) == "nulnone"
+    ) {
+      const own = nullOwnAt(ix, ibFnIx)
+      if own < 0 || !nullOwnRepFits(own, rep) {
+        return irBMiss("null unit read rep")
+      }
+      return repTemp(b, { nuAt: ix, nuOwn: own }, ix, rep)
+    }
     if ib.irVars[v].vRep != rep {
       return narrowedLocalRead(b, n, ix, v, rep, cell)
     }
@@ -3959,12 +4025,12 @@ export function deliverStr(b: i32[], ix: i32): Opnd {
 // `widenPlanOf`'s `plain` arm. Its literal arms write the constant at the destination width with
 // legacy's own literal writers, which the IR does not share yet, so each is a named miss.
 function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
-  // A `null` literal into a `K | null`, a `boolean | null`, a `string | null` or a nullable
-  // reference is legacy's own null (`nullOwnAt`): a sentinel, the string's typed null ref, or the
-  // bottom ref.
+  // A `null` literal into a `K | null`, a `boolean | null`, a `string | null`, a nullable
+  // reference or the `null` unit is legacy's own null (`nullOwnAt`): a sentinel, the string's
+  // typed null ref, or the bottom ref.
   if ibMiss == "" && dst >= 0 && nodeAt(unwrapParen(ix)) is NullLit {
     const atom = atomNullable(dst)
-    const ref = refNullable(dst)
+    const ref = refNullable(dst) || repPrim(dst) == "null"
     const bool = boolNullable(dst)
     const own = if atom || ref || bool || strNullable(dst) { nullOwnAt(ix, ibFnIx) } else { -1 }
     const want = if atom { NULL_OWN_ATOM } else if ref { NULL_OWN_NONE } else if bool { NULL_OWN_BOOL } else { NULL_OWN_STR }
@@ -4551,7 +4617,6 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(f is Ident) { return missRhs("memory access callee") }
   const p = memAccessPlanOf(f.identName)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
-  if !p.mxI32 || p.mxWiden >= 0 { return missRhs("memory access wide value") }
   const ap = memAddrPlanOf(c, p.mxBase, ibFnIx)
   const at = b.length
   const args: Opnd[] = []
@@ -4570,10 +4635,13 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   if ifBelowLead(b, at, "memory access short-circuit operand") {
     return missRhs("memory access short-circuit operand")
   }
-  for o in args {
-    if repPrim(irBOpRep(o)) != "i32" {
-      return missRhs("memory access operand coercion")
-    }
+  // The address is an i32; a store's value is already at its width's prim, which legacy's
+  // widening then leaves as it stands.
+  if (
+    repPrim(irBOpRep(args[0])) != "i32"
+    || p.mxBase == 2 && repPrim(irBOpRep(args[1])) != p.mxPrim
+  ) {
+    return missRhs("memory access operand coercion")
   }
   const r: Rhs = { mmArgs: args, mmAt: ix }
   return r
@@ -7108,7 +7176,8 @@ function lowerNodeIn(
     // A start body's top-level code, under the guards its whole build takes (`buildStart`).
     // A const cell's constant initializer hosts one too: it has no frame, so no variable.
     if !gPromoInStart && !gConstExprEmit { return "fragment outside a body" }
-    if gInitProgIdx >= 0 { return "progress cell" }
+    // The progress cell is the start body's to write between statements; a constant has none.
+    if gInitProgIdx >= 0 && !gConstExprEmit { return "progress cell" }
     ibReset(-1, "@fragment", -1)
   } else {
     if fnIx >= P.nodes.length { return "fragment outside a body" }
