@@ -1,4 +1,4 @@
-# Plan: an order-stashed record field written in place (2026-11-21)
+# IR: an order-stashed record field written in place (2026-11-21)
 
 **The class.** `short-circuit field after another` blocks 7 self-compile functions alone at `4c186c33`, and 9 once #9352 lands:
 `mkBinary`, `cexMake` and their kin. Each is a record literal under legacy's source-order stash
@@ -43,3 +43,24 @@ order stash becomes the lowering's own choice.
 order-stash scratch locals for that literal, an i32 and an i64, and still writes it plainly. The
 fix is to find which legacy path opens those slots and reserve them in the same order. That is a
 separate step after this one.
+
+## As built
+
+- **On demand.** The set form is used only for a literal that needs it. The fields are built as
+  before; when a later field holds a valued `if` or a boxed `??`, every field built so far gets
+  its `RStashSet` at the end of its own build, and each later field gets one after its value. A
+  literal with no such field keeps the in-record stash (`makeRecStashFields`), so functions that
+  already matched keep their bytes.
+- **Leads.** An `RStashSet` is written in place: `inPlaceFrom` and `ifBelowLeadIn` count it. A
+  node that writes a lead before its operand (a call's earlier argument, an operator's left side)
+  therefore misses by its existing name rather than staging across the sets. A box whose plan
+  writes a leading tag around a set-form record is `box of a stash-set record`: legacy writes the
+  tag before the stash.
+
+Measured on fixpoint seeds at merge-base `5d2c2b81`: self-compile 19,253 → 19,257 functions with
+no blocker, covered = matched, claimed 19,146 → 19,150. `short-circuit field after another` 7 → 0:
+four build, three stop at `box of a stash-set record` (`mkBinary`'s shape, boxed into `Node`),
+and one joins `expression if ref struct`. Corpus 43,118 and `tests/cases` 57,491 / 57,480 are
+unchanged, the same 11 fail or mismatch rows. L2 fuel +0.12%.
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
