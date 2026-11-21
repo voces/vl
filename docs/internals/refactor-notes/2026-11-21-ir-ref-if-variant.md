@@ -38,8 +38,6 @@ Self-compile blocker census:
 - `box ladder`: 0 → 3. These are the three `test(...)` helpers, an `OVar` join delivered into an
   `Opnd` parameter through the hole box's `ladder` arm. They are IR-N2's.
 - `ref if chain join`: 3 → 3, still open.
-</content>
-</invoke>
 
 I8 census:
 
