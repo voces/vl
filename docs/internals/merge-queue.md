@@ -35,6 +35,10 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
 3. **Gate the candidate**: `scripts/gate.sh` (in the queue's worktree, the one place
    `GATE_IN_WORKTREE=1` is set), then `scripts/ir-identity.sh --cases <seed>` on the seed the gate
    built. Read both by exit code.
+   When the batch changes `compiler/`, also run `scripts/ir-identity.sh --claimless <seed>` on that
+   seed, once per batch. It compares the distilled cells and the inventory witnesses filed `runs`
+   under the shipped compiler and a `CLAIMED`-empty one. Any differ is a veto: a claim shipped bytes
+   legacy would not have written (ir-design §5.2, the claim rule).
 4. **Squash-merge** each PR with `expectedHeadSha` set to the full head sha that was gated, so a
    push after the gate cannot ride on it.
 
@@ -65,7 +69,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a fuel rise past the tier without a ledger line (`scripts/self-compile-time.sh`);
 - a `--names` build that is not the plain build plus custom sections;
 - a parallel predicate mirror, unless legacy consumes it or an agreement check is armed;
-- a new dead export.
+- a new dead export;
+- any differ under `ir-identity.sh --claimless` or `--cases`.
 
 ## Folds
 
