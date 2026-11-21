@@ -43,4 +43,12 @@ failure, or the unlowered fallback) and matches under this branch's.
 
 Writing the third row found D17039 (#9329): `.map` over a `null[]` list builds an invalid module.
 
-MEASUREMENTS
+## Measured vs merge-base `f63eb9975` (fixpoint seeds on both sides)
+
+- `tests/cases` armed shadow: covered 54,761 on both sides, matched 54,747 → 54,749. The three fail
+  rows above are gone and no fail, differ or mismatch row is added.
+- Self-compile (19,159 covered = matched), corpus (42,246 covered = matched) and mode 3 claimed
+  (19,139) are unchanged: neither population holds these shapes.
+- Identity `--names` 9,037 identical, differ 0, self-compile identical; `--cases` 7,552 identical,
+  differ 0, witnesses 60 same; `tests/cases` A/B 8,666 same, differ 0.
+- L2 fuel 104,807,289,029 → 104,821,521,171 (+0.014%).
