@@ -43,12 +43,13 @@ ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/name
 find tests/cases -name '*.vl' | sort > "$T/cases"
 ls scripts/capability-probes/*.vl > "$T/probes"
 
-# One chunk's rows: `<file>\t<count>\t<row>` for every function row and start row.
+# One chunk's rows: `<file>\t<count>\t<row>` for every function row and start row, each
+# flushed alone, since the parallel chunks share one file and a buffered block splits a row.
 cat > "$T/one.sh" <<'ONE'
 VL_IR_SHADOW=5 "$VL" check --codegen --compiler "$PROBE" "$@" 2>&1 > /dev/null | awk -F'\t' '
   /^\[ir\] / {
     h = $1; sub(/^\[ir\] /, "", h); n = h; sub(/.*: /, "", n); sub(/: [0-9]+$/, "", h)
-    if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) print h "\t" n "\t" $2
+    if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) { print h "\t" n "\t" $2; fflush() }
   }'
 ONE
 VL_IR_SHADOW=5 "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$T/probe.wasm" 2>&1 > /dev/null \

@@ -113,6 +113,7 @@ import {
   RCoalStr,
   REnvDrop,
   REnvGet,
+  RFieldNull,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -153,6 +154,7 @@ import {
   RRetNull,
   RRetag,
   RSharedRead,
+  RSimd,
   RSpread,
   RStage,
   RStashSet,
@@ -291,11 +293,13 @@ import {
   emitEnvCacheOpen,
   emitFoldedConstRead,
   emitForInCursorInit,
+  emitMapGetScalarBoxTail,
   emitMapGetTail,
   emitMapNew,
   emitNarrowedMapReadTail,
   emitNullOwn,
   emitNullRetTail,
+  emitOmittedFieldNull,
   emitStrLitAt,
   emitUnionNullToPair,
   emitUnionUnboxTail,
@@ -404,6 +408,8 @@ import {
   sharedReadStashes,
   sharedReadTail,
   sharedRecvSlotGet,
+  simdCallRow,
+  simdTail,
   spreadGroupStash,
   spreadJoinGroups,
   stageListRecvTail,
@@ -795,7 +801,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapGet => {
       const from = irLAt()
       const got = mapGet(r)
-      irLIndexRow(r.mtAt, from)
+      if r.mtBox < 0 { irLIndexRow(r.mtAt, from) }
       got
     }
     RMapHas => mapHas(r)
@@ -804,6 +810,7 @@ function rhs(r: Rhs, tail: boolean) {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
     }
+    RSimd => simd(r)
     RTagStash => irLMiss("tag stash as a value")
     RStashSet => irLMiss("stash set as a value")
     RListEmpty => listEmpty(r)
@@ -857,6 +864,12 @@ function rhs(r: Rhs, tail: boolean) {
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
+    RFieldNull => {
+      leaf()
+      if emitOmittedFieldNull(r.fnRow, r.fnFi) < 0 {
+        return irLMiss("field typed null")
+      }
+    }
     RNullOf => {
       leaf()
       emitNullOwn(r.nuOwn)
@@ -1510,6 +1523,20 @@ function listNew(r: RListNew) {
   return arrNewTail(pl, slot)
 }
 
+// `RSimd`: legacy's SIMD arm in `emitSimdIntrinsic`'s order, the value operands then the row's
+// instruction (`simdTail`).
+function simd(r: RSimd) {
+  const c = nodeAt(r.sdAt)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length {
+    return irLMiss("simd node")
+  }
+  const f = nodeAt(c.callFn)
+  const row = simdCallRow(c)
+  if !(f is Ident) || row < 0 { return irLMiss("simd node") }
+  for a in r.sdArgs { irLOpnd(a) }
+  return simdTail(c, f.identName, row)
+}
+
 // `RMemAccess`: legacy's load or store arm in `emitCallCoreMemAccess`'s order: the address the
 // builder took along `memAddrPlanOf`'s arm, a store's value, then the access at the plan's offset.
 function memAccess(r: RMemAccess) {
@@ -1877,6 +1904,11 @@ function mapGet(r: RMapGet) {
   if !(nd is Index) { return irLMiss("map get node") }
   if r.mtSym >= 0 && userGlobalReadClass(r.mtSym, lwGlobalCtx) != "plain" {
     return irLMiss("map get of a global not read plainly")
+  }
+  // The box plan's scalar read: the probe, then the box of its hit or its null.
+  if r.mtBox >= 0 {
+    mapProbeHead(nd.idxArr, r.mtSym, r.mtNonNull, r.mtLoc, r.mtKey)
+    return emitMapGetScalarBoxTail(r.mtBox)
   }
   const arm = mapGetArmOf(r.mtAt, fnIx)
   match arm {
@@ -3054,7 +3086,8 @@ export function valtypeOf(r: i32): i32 {
     "i64" => 0x7e
     "f32" => 0x7d
     "f64" => 0x7c
-    "str" | "u8" | "null" | "v128" => -1
+    "v128" => 0x7b
+    "str" | "u8" | "null" => -1
   }
 }
 
@@ -3085,7 +3118,7 @@ export function irSlotRunAgrees(rep: i32, slot: i32): boolean {
   wTarget(prev)
   if b.length < 2 { return false }
   const t = valtypeOf(rep)
-  const scalarRun = b[1] == 0x7f || b[1] == 0x7e || b[1] == 0x7d || b[1] == 0x7c
+  const scalarRun = b[1] >= 0x7b && b[1] <= 0x7f
   return if t >= 0 { b.length == 2 && b[1] == t } else { !scalarRun }
 }
 
