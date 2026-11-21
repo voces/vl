@@ -35,6 +35,10 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
 3. **Gate the candidate**: `scripts/gate.sh` (in the queue's worktree, the one place
    `GATE_IN_WORKTREE=1` is set), then `scripts/ir-identity.sh --cases <seed>` on the seed the gate
    built. Read both by exit code.
+   When the batch changes `compiler/`, also run `scripts/ir-identity.sh --claimless <seed>` on that
+   seed, once per batch. It compares the distilled cells and the inventory witnesses filed `runs`
+   under the shipped compiler and a `CLAIMED`-empty one. Any differ is a veto: a claim shipped bytes
+   legacy would not have written (ir-design §5.2, the claim rule).
 4. **Squash-merge** each PR with `expectedHeadSha` set to the full head sha that was gated, so a
    push after the gate cannot ride on it.
 
@@ -65,7 +69,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a fuel rise past the tier without a ledger line (`scripts/self-compile-time.sh`);
 - a `--names` build that is not the plain build plus custom sections;
 - a parallel predicate mirror, unless legacy consumes it or an agreement check is armed;
-- a new dead export.
+- a new dead export;
+- any differ under `ir-identity.sh --claimless` or `--cases`.
 
 ## Folds
 
@@ -75,12 +80,14 @@ index, in one docs PR.
 
 ## Fuel drift
 
-A coordinator refresh of `scripts/self-compile-baseline.json` that names no single mechanism gives,
-in its `scripts/self-compile-ledger.txt` line, the cumulative rise since the last owner-ruled
-baseline. Past +3% cumulative, the refresh needs an owner ruling, named in the line. The current
-reference is the 103.94G line (#9283), which the coordinator ruled on 2026-11-20 under the
-owner's delegation at +3.18% on the previous 100.73G reference (#9194). Existing ledger lines are
-not edited.
+The coordinator rules on a refresh of `scripts/self-compile-baseline.json` that names no single
+mechanism. Its `scripts/self-compile-ledger.txt` line gives the PR range and the cumulative rise
+since the last attributed baseline. Under +3% cumulative the refresh is routine. Past +3% it first
+attributes the rise by measurement: the top contributing PRs, each with its fuel delta, each
+accepted with its reason or sent back to its lane to cut. The line names that attribution. The
+current reference is the 103.94G line (#9283), a coordinator ruling at +3.18% on the 100.73G
+reference (#9194). A ledger line names the owner only for a ruling the owner made. Existing ledger
+lines are not edited.
 
 ## Coordinator PRs and goals
 

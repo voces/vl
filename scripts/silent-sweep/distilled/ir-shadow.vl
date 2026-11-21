@@ -4,6 +4,7 @@
 //     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] [--write-baseline]
 //     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] --blockers [--top N]
 //     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] --claims
+//     vl run scripts/silent-sweep/distilled/ir-shadow.vl -- [--seed P] --cases [--write-baseline]
 //
 // It prints covered and matched, and every mismatch class with its count. It exits 1 on a
 // verifier failure, or on a mismatch class whose count is above `ir-shadow-baseline.txt` (a
@@ -17,19 +18,24 @@
 // row: a claimed function whose lowering or verifier failed would hide behind legacy's bytes.
 // `--claims` also builds the programs `claims-fallbacks.txt` names from outside the corpus, and
 // reds when one falls back more than that file says; `--write-fallbacks` rewrites the counts.
+// `--cases` runs the armed shadow over every `tests/cases` program instead, against
+// `ir-shadow-cases-baseline.txt`, which also holds that population's verifier failures. In both
+// populations a `bytes` class is never baselined: a claimable function whose bytes differ ships
+// them.
 
 import { IoError, readTextFile, writeTextFile } from "std:fs"
 import { programArgs } from "std:args"
 import { Utf8Error } from "std:utf8"
 import { exit } from "std:process"
 import { parseI32, toString } from "std:fmt"
-import { join, split, startsWith, trim } from "std:str"
-import { indexOf, sort } from "std:array"
+import { endsWith, join, split, startsWith, trim } from "std:str"
+import { concat, indexOf, sort } from "std:array"
 import { die, envOr, fanOutArgv, hasFlag } from "../../lib/common"
 import { cellsIn, makeTempDir, spawn, writeText } from "../../lib/corpus"
 
 const HERE = "scripts/silent-sweep/distilled"
 const BASELINE = "scripts/silent-sweep/distilled/ir-shadow-baseline.txt"
+const CASES_BASELINE = "scripts/silent-sweep/distilled/ir-shadow-cases-baseline.txt"
 const FALLBACKS = "scripts/silent-sweep/distilled/claims-fallbacks.txt"
 const PREFIX = "[ir] "
 const CHUNK = 200
@@ -55,6 +61,23 @@ function corpus(): string[] {
   sort(out, (a: string, b: string) => a < b)
   return out
 }
+
+// Every `tests/cases` program the checkout tracks, sorted; a capability matrix is a template.
+function casesPaths(): string[] {
+  const x = spawn("git", ["ls-files", "tests/cases"])
+  if x.code != 0 {
+    die("ir-shadow: git ls-files tests/cases failed\n\{x.err}", 2)
+  }
+  const out: string[] = []
+  for line in split(x.out, "\n") {
+    if endsWith(line, ".vl") && !endsWith(line, ".matrix.vl") { out.push(line) }
+  }
+  sort(out, (a: string, b: string) => a < b)
+  return out
+}
+
+// Whether class `key` is a byte difference, which no baseline admits.
+function bytesClass(key: string): boolean { return key.indexOf("bytes") >= 0 }
 
 // One row class and its count summed over the corpus.
 type Row = { key: string, n: i32 }
@@ -155,17 +178,17 @@ function readOr(path: string): string {
   return t
 }
 
-// The committed mismatch counts, one `<n>\t<class>` line each.
-function loadBaseline(): Row[] {
+// The committed counts in `file`, one `<n>\t<class>` line each.
+function loadBaseline(file: string): Row[] {
   const rows: Row[] = []
-  const text = readTextFile(BASELINE)
+  const text = readTextFile(file)
   if text is IoError { return rows }
   for line in split(text, "\n") {
     if line == "" || startsWith(line, "#") { continue }
     const t = line.indexOf("\t")
-    if t < 0 { die("ir-shadow: \{BASELINE}: no tab in `\{line}`", 2) }
+    if t < 0 { die("ir-shadow: \{file}: no tab in `\{line}`", 2) }
     const n = parseI32(line.slice(0, t))
-    if n == null { die("ir-shadow: \{BASELINE}: no count in `\{line}`", 2) }
+    if n == null { die("ir-shadow: \{file}: no count in `\{line}`", 2) }
     rows.push({ key: line.slice(t + 1, line.length), n: n ?? 0 })
   }
   return rows
@@ -210,12 +233,17 @@ function printBlockers(rows: Row[], top: i32) {
   return 0
 }
 
-function writeBaseline(mm: Row[]) {
-  let text = "# IR shadow mismatches over the distilled corpus: vl run scripts/silent-sweep/distilled/ir-shadow.vl -- --write-baseline\n"
+function writeBaseline(file: string, head: string, mm: Row[]) {
+  for r in mm {
+    if bytesClass(r.key) {
+      die("ir-shadow: a byte difference is never a baseline: \{r.key}", 1)
+    }
+  }
+  let text = "# " + head + "\n"
   for r in mm { text = text + "\{r.n}\t\{r.key}\n" }
-  const w = writeTextFile(BASELINE, text)
-  if w != null { die("ir-shadow: cannot write \{BASELINE} (\{w.msg})", 2) }
-  print("wrote \{BASELINE}: \{mm.length} mismatch classes")
+  const w = writeTextFile(file, text)
+  if w != null { die("ir-shadow: cannot write \{file} (\{w.msg})", 2) }
+  print("wrote \{file}: \{mm.length} classes")
   return 0
 }
 
@@ -328,8 +356,9 @@ function reportClaims(m: Measured, x: Measured, want: Row[], rewrite: boolean) {
 
 function main(args: readonly string[]) {
   const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
-  const paths = corpus()
-  if paths.length == 0 { die("ir-shadow: no cells under \{HERE}", 2) }
+  const cases = hasFlag(args, "--cases")
+  const paths = if cases { casesPaths() } else { corpus() }
+  if paths.length == 0 { die("ir-shadow: no programs to build", 2) }
   const census = hasFlag(args, "--blockers")
   const claims = hasFlag(args, "--claims")
   const mode = if census { "4" } else if claims { "5" } else { "1" }
@@ -351,23 +380,43 @@ function main(args: readonly string[]) {
     return printBlockers(m.rows, parseI32(argOr(args, "--top", "20")) ?? 20)
   }
   print(
-    "ir shadow: \{m.cells} of \{paths.length} cells have functions; \{countOf(m.rows, "fns")} functions, \{countOf(m.rows, "covered")} covered, \{countOf(m.rows, "verified")} verified, \{countOf(m.rows, "matched")} matched",
+    "ir shadow\{if cases { " (tests/cases)" } else { "" }}: \{m.cells} of \{paths.length} programs have functions; \{countOf(m.rows, "fns")} functions, \{countOf(m.rows, "covered")} covered, \{countOf(m.rows, "verified")} verified, \{countOf(m.rows, "matched")} matched",
   )
   const mm = classes(m.rows, "mismatch ")
   const fails = classes(m.rows, "fail ")
   for r in mm { print("  \{r.n}\t\{r.key}") }
   for r in fails { print("  \{r.n}\t\{r.key}") }
   if m.broken.length > 0 { exit(2) }
+  // The corpus admits no verifier failure; `tests/cases` baselines its own, which may only fall.
+  const tracked: Row[] = if cases { mm.concat(fails) } else { mm }
   if hasFlag(args, "--write-baseline") {
-    if fails.length > 0 {
+    if !cases && fails.length > 0 {
       die("ir-shadow: a verifier failure is never a baseline", 1)
     }
-    writeBaseline(mm)
+    if cases {
+      writeBaseline(
+        CASES_BASELINE,
+        "IR shadow mismatches and verifier failures over tests/cases: vl run scripts/silent-sweep/distilled/ir-shadow.vl -- --cases --write-baseline",
+        tracked,
+      )
+    } else {
+      writeBaseline(
+        BASELINE,
+        "IR shadow mismatches over the distilled corpus: vl run scripts/silent-sweep/distilled/ir-shadow.vl -- --write-baseline",
+        tracked,
+      )
+    }
     return 0
   }
-  const base = loadBaseline()
-  let red = fails.length > 0
-  for r in mm {
+  const base = loadBaseline(if cases { CASES_BASELINE } else { BASELINE })
+  let red = !cases && fails.length > 0
+  for r in tracked {
+    if bytesClass(r.key) {
+      print("ir-shadow: a byte difference: \{r.n}\t\{r.key}")
+      red = true
+    }
+  }
+  for r in tracked {
     const was = countOf(base, r.key)
     if r.n > was {
       print("ir-shadow: \{r.key} rose: \{was} -> \{r.n}")
@@ -375,7 +424,7 @@ function main(args: readonly string[]) {
     }
   }
   for b in base {
-    const now = countOf(mm, b.key)
+    const now = countOf(tracked, b.key)
     if now < b.n {
       print(
         "ir-shadow: \{b.key} fell: \{b.n} -> \{now} (re-run with --write-baseline)",
