@@ -26053,24 +26053,97 @@ export function memAccessTail(p: MemAccessPlan, off: i64): i32 {
   return 0
 }
 
-// The `__memory_copy__` / `__memory_fill__` arm of `emitCallCore`. Returns 0 once emitted, -1
-// on failure.
-function emitCallCoreMemBulk(c: Call, callee: Ident, fnIx: i32) {
-  if c.callArgs.length != 3 {
-    return emitFail(
-      "emitProgram: internal: "
-        + callee.identName
-        + " reached with the wrong argument count — the checker's arity rule refuses it",
-    )
+// How a memory-management intrinsic lowers (`memOpPlanOf`): its i32 operands as they stand, then
+// `memOpTail`'s one instruction, a heap-window global read or the shared flag's constant. A call
+// legacy cannot write carries its emit failure in `moFail`.
+export type MemOpArm = "size"
+  | "grow"
+  | "fill"
+  | "copy"
+  | "heapBase"
+  | "heapLimit"
+  | "shared"
+export type MemOpPlan = { moArm: MemOpArm, moFail: string }
+
+// Whether call `c` is a memory-management intrinsic: the spelling, with no binding owning the
+// name. Legacy's `emitCallCore` and the IR's builder route on it.
+export function memOpCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) || memOpArmOf(f.identName) == null { return false }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+function memOpArmOf(name: string): MemOpArm | null {
+  if name == "__memory_size__" { return "size" }
+  if name == "__memory_grow__" { return "grow" }
+  if name == "__memory_fill__" { return "fill" }
+  if name == "__memory_copy__" { return "copy" }
+  if name == "__heap_base__" { return "heapBase" }
+  if name == "__heap_limit__" { return "heapLimit" }
+  if name == "__memory_shared__" { return "shared" }
+  return null
+}
+
+// The plan of memory-management call `c` (`memOpCallNamed`): its arm, and legacy's failure for an
+// argument count the checker's arity rule refuses or a heap window that was not emitted.
+export function memOpPlanOf(c: Call): MemOpPlan {
+  const ok = c.callFn >= 0 && c.callFn < P.nodes.length
+  const f = if ok { nodeAt(c.callFn) } else { null }
+  const nm = if f is Ident { f.identName } else { "" }
+  const arm = memOpArmOf(nm) ?? "size"
+  const n = c.callArgs.length
+  const want = match arm {
+    "size" | "heapBase" | "heapLimit" | "shared" => 0
+    "grow" => 1
+    "fill" | "copy" => 3
   }
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  if emitExpr(c.callArgs[1], fnIx) < 0 { return -1 }
-  if emitExpr(c.callArgs[2], fnIx) < 0 { return -1 }
-  if callee.identName == "__memory_copy__" {
-    // Two memory indices: destination first, then source.
-    fbMemBulk(MISC_MEMORY_COPY, 2)
-  } else {
-    fbMemBulk(MISC_MEMORY_FILL, 1)
+  let why = ""
+  if arm == "heapBase" || arm == "heapLimit" {
+    if n != 0 {
+      why = "emitProgram: internal: "
+        + nm
+        + " reached with arguments — the checker's arity rule refuses it"
+    } else if gHeapGlobalIdx < 0 {
+      why = "emitProgram: "
+        + nm
+        + " read, but the heap-window globals were not emitted"
+    }
+  } else if n != want || memOpArmOf(nm) == null {
+    why = "emitProgram: internal: "
+      + nm
+      + " reached with the wrong argument count — the checker's arity rule refuses it"
+  }
+  const pl: MemOpPlan = { moArm: arm, moFail: why }
+  return pl
+}
+
+// Whether memory-management arm `a` leaves nothing: the bulk pair.
+export function memOpIsVoid(a: MemOpArm): boolean {
+  return a == "fill" || a == "copy"
+}
+
+// The memory-management arm of `emitCallCore`: the operands as they stand, then `memOpTail`.
+function emitCallCoreMemOp(c: Call, fnIx: i32) {
+  const pl = memOpPlanOf(c)
+  if pl.moFail != "" { return emitFail(pl.moFail) }
+  for a in c.callArgs {
+    if emitExpr(a, fnIx) < 0 { return -1 }
+  }
+  return memOpTail(pl.moArm)
+}
+
+// After a memory-management intrinsic's operands: its instruction. `memory.copy` names two memory
+// indices, destination then source; a heap-window read is the immutable global pair's.
+export function memOpTail(a: MemOpArm): i32 {
+  match a {
+    "size" => fbMemorySize()
+    "grow" => fbMemoryGrow()
+    "fill" => fbMemBulk(MISC_MEMORY_FILL, 1)
+    "copy" => fbMemBulk(MISC_MEMORY_COPY, 2)
+    "heapBase" => fbGlobalGet(gHeapGlobalIdx)
+    "heapLimit" => fbGlobalGet(gHeapGlobalIdx + 1)
+    "shared" => fbI32Const(if gSharedMemPages > 0 { 1 } else { 0 })
   }
   return 0
 }
@@ -26387,13 +26460,9 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if memAccessCallNamed(c, fnIx) {
     return emitCallCoreMemAccess(c, callee.identName, fnIx)
   }
-  // the bulk pair (`buffer-design.md` §C3): three i32 operands
-  // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
-  // which VL's argument order matches — a mismatched order would mean reordering
-  // arbitrary expressions' side effects.
-  if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
-    return emitCallCoreMemBulk(c, callee, fnIx)
-  }
+  // The memory-management intrinsics (`buffer-design.md` §B2, §C3, §S4): `memory.size`/`grow`,
+  // the bulk pair, the heap window's globals and the shared-memory flag (`memOpPlanOf`).
+  if memOpCallNamed(c, fnIx) { return emitCallCoreMemOp(c, fnIx) }
   // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
   // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
   // Dispatched by name like the memory intrinsics above it.
@@ -26407,47 +26476,6 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // The scalar saturating truncations, one `0xFC` instruction each.
   if !userBindsName && truncSatOp(callee.identName) >= 0 {
     return emitTruncSatIntrinsic(c, callee.identName, fnIx)
-  }
-  // `memory.size` / `memory.grow` — the two ops that lift the 64 KiB ceiling
-  // (`buffer-design.md` §B2/§S4). Both take the memory index as an immediate (0x00,
-  // the one memory), never a stack operand. `memory.grow`'s -1-on-failure is the wasm
-  // spec's own signal, passed through unchanged: a caller checks it as the spec describes.
-  if !userBindsName && callee.identName == "__memory_size__" {
-    if c.callArgs.length != 0 {
-      return emitFail(
-        "emitProgram: internal: __memory_size__ reached with the wrong argument count — the checker's arity rule refuses it",
-      )
-    }
-    fbMemorySize()
-    return 0
-  }
-  if !userBindsName && callee.identName == "__memory_grow__" {
-    if c.callArgs.length != 1 {
-      return emitFail(
-        "emitProgram: internal: __memory_grow__ reached with the wrong argument count — the checker's arity rule refuses it",
-      )
-    }
-    if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-    fbMemoryGrow()
-    return 0
-  }
-  // The heap window: a read of the immutable global pair `emitGlobalSection` appends.
-  if !userBindsName && callee.identName == "__heap_base__" {
-    return emitHeapWindowRead(c.callArgs.length, 0, "__heap_base__")
-  }
-  if !userBindsName && callee.identName == "__heap_limit__" {
-    return emitHeapWindowRead(c.callArgs.length, 1, "__heap_limit__")
-  }
-  // A build-time constant; as the whole condition of an else-less `if` it never
-  // reaches here, because `foldMemShared` already decided that statement.
-  if !userBindsName && callee.identName == "__memory_shared__" {
-    if c.callArgs.length != 0 {
-      return emitFail(
-        "emitProgram: internal: __memory_shared__ reached with the wrong argument count — the checker's arity rule refuses it",
-      )
-    }
-    if gSharedMemPages > 0 { fbI32Const(1) } else { fbI32Const(0) }
-    return 0
   }
   if !userBindsName && callee.identName == "__log__" {
     return emitCallCoreLog(c, fnIx)
@@ -35919,27 +35947,6 @@ function emitIfLinkTail(s: IfStmt, fnIx: i32, open: i32[]) {
     cursorAdvance(cursorSlotsUnder(s.ifElse))
   }
   fbEnd() // 0x0b end
-  return 0
-}
-
-// `global.get` of heap-window global `which` (0 base, 1 limit). A miss is the scan and the
-// section disagreeing about whether the pair exists, which no program can spell.
-function emitHeapWindowRead(nArgs: i32, which: i32, name: string) {
-  if nArgs != 0 {
-    return emitFail(
-      "emitProgram: internal: "
-        + name
-        + " reached with arguments — the checker's arity rule refuses it",
-    )
-  }
-  if gHeapGlobalIdx < 0 {
-    return emitFail(
-      "emitProgram: "
-        + name
-        + " read, but the heap-window globals were not emitted",
-    )
-  }
-  fbGlobalGet(gHeapGlobalIdx + which)
   return 0
 }
 
