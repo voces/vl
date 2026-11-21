@@ -2554,3 +2554,43 @@ print(qnull().o == null)
     }
   },
 });
+
+// An assignment whose value is its number literal (`asgValueArmOf` "lit") stores, then builds the
+// literal again at the reading position's width: negated, at i64 and f64, and widened past it.
+const ASG_VALUE_LIT =
+  `let g32 = 0\nlet g64: i64 = 0\nlet gf = 0.0\nfunction a(): i32 { return g32 = -1 }\nfunction b(): i64 { return g64 = 7 }\nfunction c(): f64 { return gf = -2.5 }\nfunction w(): f64 { return g32 = 9 }\nprint(a())\nprint(b())\nprint(c())\nprint(w())\n`;
+Deno.test({
+  name: "ir shadow: an assignment valued as its number literal builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ASG_VALUE_LIT, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want a, b, c and w covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// Two spellings stay legacy's: a stored literal boxed into a union (the box writer may leave an
+// immediate unread, and this one stands for the store), and one after a call operand whose value
+// waits on the stack across the store.
+const ASG_VALUE_LIT_MISSES =
+  `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
+Deno.test({
+  name: "ir shadow: a boxed stored literal and one after a call operand stay named misses",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ASG_VALUE_LIT_MISSES, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (
+      (rows.get("uncovered box of an effect's immediate") ?? 0) !== 1 ||
+      (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
+    ) {
+      throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
