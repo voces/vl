@@ -5728,13 +5728,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
     // Legacy strength-reduces a masked shift (`shiftMaskFoldOf`) at an integer width.
     const fw = binNumWidth(n, ibFnIx)
-    if (
-      fw != "f32"
-      && fw != "f64"
-      && shiftMaskFoldOf(n, ix, if fw == "i64" { 64 } else { 32 }, ibFnIx).length
-        > 0
-    ) {
-      return irBMiss("shift-mask fold")
+    if fw != "f32" && fw != "f64" {
+      const fb = if fw == "i64" { 64 } else { 32 }
+      const fold = shiftMaskFoldOf(n, ix, fb, ibFnIx)
+      if fold.length > 0 { return shiftMaskFold(b, fold, fb, ix, rep) }
     }
     const lw = operandWhy(n.binLeft)
     if lw != "" { return irBMiss(lw) }
@@ -5869,6 +5866,42 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("as operand coercion")
   }
   return irBLetTemp(b, { ncV: o, ncAt: ix }, ix, rep)
+}
+
+// Legacy's strength-reduced masked shift (`shiftMaskFoldOf`'s [x, k, narrow, m, j]): x at the
+// fold's width, then the shift netting `k` against `j` and the mask `m << j`, both constants, as
+// `emitShiftMaskFold` writes them. The narrowing form's wrap is legacy's.
+function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
+  if f[4] < 0 { return irBMiss("shift-mask fold narrowing") }
+  const ir = repNodeOfTy(if w == 64 { numCastKindTy(3) } else { TY_I32 })
+  if rep != ir { return irBMiss("shift-mask fold rep") }
+  const x = f[0] as% i32
+  const ow = operandWhy(x)
+  if ow != "" { return irBMiss(ow) }
+  let v = irBExpr(b, x)
+  if ibMiss != "" { return v }
+  if w == 64 {
+    const p = widenPlanOf(x, 3, ibFnIx)
+    if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
+    v = widenTo(b, v, x, ir, -1)
+    if ibMiss != "" { return v }
+  }
+  // A narrowing source (an i64 read at width 32) takes legacy's `i32.wrap_i64`.
+  if irBOpRep(v) != ir { return irBMiss("shift-mask fold narrowing source") }
+  const k = f[1]
+  const j = f[4]
+  let s = v
+  if k != j {
+    const by: Opnd = { oiRep: ir, oiBits: if k > j { k - j } else { j - k } }
+    const op: PrimOp = if k > j { "shru" } else { "shl" }
+    s = irBLetTemp(b, { poOp: op, poArgs: [v, by] }, ix, ir)
+  }
+  const mj = f[3] << j
+  const m: Opnd = {
+    oiRep: ir,
+    oiBits: if w == 64 { mj } else { (mj as% i32) as i64 },
+  }
+  return irBLetTemp(b, { poOp: "and", poArgs: [s, m] }, ix, rep)
 }
 
 // A string literal at the `str` rep, or delivered as its destination's interned atom.
