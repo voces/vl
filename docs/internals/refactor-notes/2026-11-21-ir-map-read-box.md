@@ -21,3 +21,12 @@ ladder, so the IR had no arm to follow.
 
 `tests/ir-shadow-rows/map-read-scalar-box.vl`: a hole-function-valued map, an `i32` map read into
 its `i32 | null` local, and a narrowed re-read in an `if` arm.
+
+## Measured (fixpoint seeds of master 4b5d638e and the change)
+
+- Corpus blocker census: no-blocker 43,944 → 44,018 of 45,678. `map get rep` alone 75 → 1, and
+  `global read coercion + map get rep` 12 → 0. The one left is an atom value (`AB | null`, disc 3).
+- tests/cases armed shadow: covered and matched +72; `uncovered map get rep` 92 → 14, start 57 → 10;
+  no new `fail` or `mismatch` row.
+- Legacy: tests/cases A/B identical 7,300 (differ 0), `--names` self-compile identical, mode-3 self
+  byte-identical. L2 fuel 105,397,452,434 → 105,464,626,510 (+0.064%).
