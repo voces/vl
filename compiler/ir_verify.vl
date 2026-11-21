@@ -33,6 +33,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RListCat,
   RListClear,
   RListCopy,
   RListEmpty,
@@ -72,6 +73,7 @@ import {
   RSharedRead,
   RSpread,
   RStage,
+  RStashSet,
   RStrOp,
   RTagIs,
   RTagOf,
@@ -143,6 +145,10 @@ let vfDefLog: i32[] = []
 // The `push` temps not yet consumed, in push order, and which temps are such pushes.
 let vfPushed: i32[] = []
 let vfPushes: {[i32]: boolean} = Map()
+// The `RStashSet`s not yet read by their record: its literal, the kid set, the value's rep.
+let vfSetAt: i32[] = []
+let vfSetK: i32[] = []
+let vfSetRep: i32[] = []
 // Whether the walk met a receiver stage, so the stage rule has a pairing to check.
 let vfStaged = false
 let vfLabels: i32[] = []
@@ -259,6 +265,43 @@ function opndVar(o: Opnd): i32 {
     OVar => o.ov
     OImm | OStr => -1
   }
+}
+
+// Rule 2 for an order-stashed record (`mrSet`): it reads exactly the sets of its own literal, made
+// in its source order, each at its kid's rep, and has no operands of its own.
+function stashedRec(r: RMakeRec, ks: i32[], at: i32) {
+  if r.mrFields.length != 0 || r.mrSrc.length != ks.length {
+    return fail(2, at, "a stash-set record's shape")
+  }
+  let j = 0
+  const keepAt: i32[] = []
+  const keepK: i32[] = []
+  const keepRep: i32[] = []
+  let i = 0
+  while i < vfSetAt.length {
+    if vfSetAt[i] == r.mrAt {
+      const k = vfSetK[i]
+      if j >= r.mrSrc.length || r.mrSrc[j] != k {
+        return fail(2, at, "a stash set out of its source order")
+      }
+      if k < 0 || k >= ks.length || vfSetRep[i] != ks[k] {
+        return fail(2, at, "a stash set's rep differs from its field's")
+      }
+      j = j + 1
+    } else {
+      keepAt.push(vfSetAt[i])
+      keepK.push(vfSetK[i])
+      keepRep.push(vfSetRep[i])
+    }
+    i = i + 1
+  }
+  if j != r.mrSrc.length {
+    return fail(2, at, "a stash-set record's field unset")
+  }
+  vfSetAt = keepAt
+  vfSetK = keepK
+  vfSetRep = keepRep
+  return 0
 }
 
 // Rule 2 for a primitive op: its operands' reps and its result rep `dst`.
@@ -503,6 +546,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       uses(r.mrFields, at)
       if dst < 0 { return 0 }
       const ks = repNodeKids(dst)
+      if r.mrSet { return stashedRec(r, ks, at) }
       if !(repNodeAt(dst) is RRecord) || ks.length != r.mrFields.length {
         return fail(2, at, "a record's fields do not match its rep")
       }
@@ -764,6 +808,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.qeR, at)
       0
     }
+    RListCat => {
+      use(r.ljL, at)
+      use(r.ljR, at)
+      if (
+        opRep(r.ljL) != dst
+        || opRep(r.ljR) != dst
+        || !(repNodeAt(dst) is RList)
+      ) {
+        return fail(2, at, "a list concat's operands are not its list")
+      }
+      0
+    }
     RToBox => {
       use(r.bxV, at)
       // Legacy's box writer may leave an immediate unread, so one stands only for an effect-free node.
@@ -869,6 +925,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
           return fail(2, at, "a map size is an i32")
         }
       }
+      0
+    }
+    RStashSet => {
+      use(r.ssV, at)
+      vfSetAt.push(r.ssAt)
+      vfSetK.push(r.ssK)
+      vfSetRep.push(opRep(r.ssV))
       0
     }
     RTagStash => {
@@ -1745,6 +1808,7 @@ function rhsReadsList(r: Rhs): boolean {
       RCoalAtomStr |
       RTagStash |
       RTagIs |
+      RStashSet |
       RListEmpty |
       RListEmptyArms |
       RStrOp |
@@ -1760,6 +1824,7 @@ function rhsReadsList(r: Rhs): boolean {
       RAtomEq |
       RUnionEq |
       RListEq |
+      RListCat |
       RMakeClo |
       RFnId |
       RCellNew |
@@ -1864,6 +1929,9 @@ export function irVerify(f: IrFn): IrVerdict {
   vfPushed = []
   vfPushes = Map()
   vfStaged = false
+  vfSetAt = []
+  vfSetK = []
+  vfSetRep = []
   let i = 0
   while i < f.irVars.length {
     const v = f.irVars[i]
@@ -1917,6 +1985,9 @@ export function irVerify(f: IrFn): IrVerdict {
   if vfRule == 0 && vfStaged {
     const sp = stagePairsWhy(f)
     if sp != "" { fail(10, -1, sp) }
+  }
+  if vfRule == 0 && vfSetAt.length > 0 {
+    fail(2, -1, "a stash set no record reads")
   }
   if vfRule == 0 && vfPushed.length > 0 {
     fail(10, -1, "a push no store consumes")
