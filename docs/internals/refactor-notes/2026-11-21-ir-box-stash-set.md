@@ -14,16 +14,19 @@ so the builder missed it.
 - `stashSet` (`ir_lower.vl`) writes the head of the box that boxes this literal under `rec` or
   `obj`, at the literal's first set, ahead of the field's value. It records that in
   `lwBoxHeadAt`.
-- `boxOp` skips the head for such a literal.
-- `boxTempAt` (`ir_build.vl`) admits the literal boxed itself (`setRecAt`), unless its first
-  stashed field is a valued `if`'s value (`firstSetAfterIf`). The builder writes that `if` ahead
-  of the set, below where legacy's tag goes. `mkBinary` is that shape, and stays the named miss.
+- Where the literal's first source field is a valued `if`'s value, in either stash form
+  (`RStashSet`, or an `RMakeRec` with `mrSrc`), `stashIfBoxHead` writes that head ahead of the
+  `if`, which the builder writes before the set. That is legacy's order. `mkBinary` is that
+  shape.
+- `boxOp` skips the head for such a literal. `boxTempAt` (`ir_build.vl`) admits the literal
+  boxed itself (`setRecAt`).
 
-Self-compile: covered = matched 19513 → 19516; 3 of the class's 4 functions. tests/cases matched
-64282 on both sides of one A/B.
+Self-compile: covered = matched 19513 → 19516, the class's 4 functions. tests/cases: no new fail
+rows.
 
-A neighbour, a literal of that shape RETURNED into a union directly, fails to lower on master
-(`unlowered: operand above a valued if's value`). It is reported to the coordinator.
+This also closes D17042, a literal of that shape returned into a union directly. Master failed
+to lower it (`unlowered: operand above a valued if's value`), and the claim fell back. It now
+builds and matches, and so does its bound spelling.
 
 Row file `tests/ir-shadow-rows/stash-set-record-boxed.vl`; witness
 `tests/cases/unions/stash-set-record-boxed-under-its-arm.vl`.
