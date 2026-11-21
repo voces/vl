@@ -62,6 +62,7 @@ import {
   PrimOp,
   PushRecv,
   RCall,
+  RListSlice,
   RListStage,
   RStrOp,
   RTagStash,
@@ -201,6 +202,7 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
+  nulNoneWritesNothing,
   numCastKindOf,
   numCastKindTy,
   numIntrCallReached,
@@ -401,6 +403,7 @@ import {
   lastStmtIsValueIf,
 } from "./emit_fn_scans"
 import {
+  LiFrame,
   VKind,
   cloLiftWriteCount,
   fRecRetTy,
@@ -410,6 +413,8 @@ import {
   gConstExprEmit,
   gInitProgIdx,
   gPromoInStart,
+  liFrameRestore,
+  liFrameSave,
   monoGen,
   monoInstFe,
   monoInstOrig,
@@ -452,6 +457,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
+import { letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
   TY_I32,
@@ -843,6 +849,9 @@ function fieldPlainWhy(
 ): string {
   if arm == "variant" {
     const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
+    if va == "nulnone" {
+      return nulNoneFieldWhy("object variant field nulnone", valIx, dst)
+    }
     if !variantArmFits(va, dst) { return "object variant field " + va }
     // A box goes in as the deliver fence lets it: a recorded box first, else legacy's plan.
     if (
@@ -860,6 +869,9 @@ function fieldPlainWhy(
     if own < 0 { return "object field explicitNull typed null" }
     if !nullOwnRepFits(own, dst) { return "object field explicitNull rep" }
     return ""
+  }
+  if fa == "nulnone" {
+    return nulNoneFieldWhy("object field nulnone", valIx, dst)
   }
   if !fieldArmDelivers(fa) { return "object field " + fa }
   if fa == "armDelivery" && narrowedArmNeedsUnbox(valIx, ibFnIx) {
@@ -888,21 +900,33 @@ function fieldExplicitNullOwn(
   fi: i32,
   valIx: i32,
 ): i32 {
-  if arm != "struct" { return -1 }
-  if structFieldArmOf(row, fi, valIx, ibFnIx, false) != "explicitNull" {
-    return -1
+  if arm == "variant" {
+    const va = variantFieldArmOf(row, fi, valIx, ibFnIx)
+    return if va == "nulnone" && nulNoneWritesNothing(valIx) { NULL_OWN_NONE } else { -1 }
   }
+  const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
+  if fa == "nulnone" && nulNoneWritesNothing(valIx) { return NULL_OWN_NONE }
+  if fa != "explicitNull" { return -1 }
   return fieldNullOwnOf(row, fi)
 }
 
+// Why a `null` unit field's value `valIx` is not its slot's null alone (`emitNulNoneForEffect`
+// writes nothing for it), or "": a value that runs for effect stays `why`.
+function nulNoneFieldWhy(why: string, valIx: i32, dst: i32): string {
+  if !nulNoneWritesNothing(valIx) { return why }
+  if !nullOwnRepFits(NULL_OWN_NONE, dst) { return why + " rep" }
+  return ""
+}
+
 // Whether rep `dst` holds the null `own` (`NULL_OWN_*`) names, as the verifier's `RNullOf` rule
-// reads it: a union box, a `K | null`, a `boolean | null`, a `string | null` or a nullable ref.
+// reads it: a union box, a `K | null`, a `boolean | null`, a `string | null`, a nullable ref, or
+// the `null` unit, whose one value is the bottom ref.
 function nullOwnRepFits(own: i32, dst: i32): boolean {
   if own == NULL_OWN_BOX { return repNodeAt(dst) is RBox || boxedNullable(dst) }
   if own == NULL_OWN_ATOM { return atomNullable(dst) }
   if own == NULL_OWN_BOOL { return boolNullable(dst) }
   if own == NULL_OWN_STR { return strNullable(dst) }
-  return own == NULL_OWN_NONE && refNullable(dst)
+  return own == NULL_OWN_NONE && (refNullable(dst) || repPrim(dst) == "null")
 }
 
 // A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
@@ -1116,8 +1140,12 @@ function primRepOfTy(t: i32): i32 {
   return r
 }
 
-// `primRepOf` at `exprTyOf`'s type.
-function exprRepOf(ix: i32): i32 { return primRepOfTy(exprTyOf(ix)) }
+// `primRepOf` at `exprTyOf`'s type, a byte as an i32 (`byteHeld`).
+function exprRepOf(ix: i32): i32 {
+  const t = exprTyOf(ix)
+  const r = primRepOfTy(t)
+  return if r >= 0 { r } else { primRepOfTy(byteHeld(t)) }
+}
 
 // `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
 // instance rewrote to its overload), else its recorded type.
@@ -1159,13 +1187,22 @@ function heldTy(ty: i32): i32 {
   return if irTyOpen(it) { ty } else { it }
 }
 
+// A `u8` value is the i32 legacy holds it in, since only a packed list's storage is a byte;
+// any other type is itself.
+function byteHeld(ty: i32): i32 {
+  if tyScalarBasePrim(ty) != "u8" { return ty }
+  return if repPrim(repNodeOfTy(ty)) == "u8" { TY_I32 } else { ty }
+}
+
 // A fresh temp of `ix`'s type, defined by `rhs`.
 export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
   return irBLetTempTy(b, rhs, ix, rep, heldTy(exprTyOf(ix)))
 }
 
 // `irBLetTemp` at type `ty`, where the value is built at another type than its node's.
-function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty: i32): Opnd {
+function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty0: i32): Opnd {
+  // A byte value's temp holds the i32 it is built at (`byteHeld`).
+  const ty = if repPrim(rep) == "i32" { byteHeld(ty0) } else { ty0 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
   // the verifier can close, so its function stays legacy's.
   if irTyHeldOpen(ty, rep) { return irBMiss("open temp type") }
@@ -1322,7 +1359,7 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
     // Every link is written at the head's kind (`emitIfExprAs` asks `ifJoinPlanOf` of the head
     // alone), so a link takes the head's rep and type, never its own; a head built at a
     // destination's type takes `ty0`.
-    const ty = if cix != ix0 { tys[0] } else if ty0 >= 0 { ty0 } else { nodeTyAt(cix, ibFnIx) }
+    const ty = if cix != ix0 { tys[0] } else if ty0 >= 0 { ty0 } else { byteHeld(nodeTyAt(cix, ibFnIx)) }
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
     const thenB = ifArm(n.ifThen, t, crep)
@@ -1408,7 +1445,14 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
 // lowering asks `ifRefJoinOf` for. A chain's links share the head's kind (`refIfLink`).
 function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   const kind = rj.rjKind ?? "struct"
-  if kind != "str" && kind != "list" && kind != "strlist" && kind != "reflist" {
+  if (
+    kind != "str"
+    && kind != "list"
+    && kind != "strlist"
+    && kind != "reflist"
+    && kind != "struct"
+    && kind != "map"
+  ) {
     return irBMiss("expression if ref " + kind)
   }
   if kind == "str" && strJoinDropsNulAtom(ix, ibFnIx) {
@@ -2521,6 +2565,25 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
   return false
 }
 
+// Whether operands built into `b` from `at` on hold a store statement.
+function storeFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if (
+      n is SAssign
+      || n is SGlobalSet
+      || n is SSetField
+      || n is SListSet
+      || n is SCellSet
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // Whether operands built into `b` from `at` on hold a tag dispatch's stash.
 function tagStashFrom(b: i32[], at: i32): boolean {
   let i = at
@@ -3010,6 +3073,12 @@ function mapSetStageLeads(
   leads: Opnd[],
 ): boolean {
   const why = "map store short-circuit operand"
+  // A store the value makes (an assignment as the value) is written in place by legacy, after
+  // a receiver and key it reads at their use; the IR's statement would land above them.
+  if storeFrom(b, vAt) && !opndsAreTemps(leads) {
+    irBMiss("map store value store")
+    return false
+  }
   if !valuedIfFrom(b, vAt) || inPlaceFrom(b, vAt) {
     return !ifBelowLead(b, keyAt, why)
   }
@@ -4607,6 +4676,16 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if pre != "" { return irBMiss(pre) }
   const n = nodeAt(ix)
   if n is Paren { return exprAt(b, n.parInner, cell) }
+  // The `true` of a bare block's `if true` rewrite (`drwBareBlock`) is untyped, and a bool. A
+  // start body's block stays legacy's: claimed, its closures' globals mint out of legacy's order.
+  if n is BoolLit && nodeTyAt(ix, ibFnIx) < 0 {
+    if ibFnIx < 0 { return irBMiss("top-level bare block") }
+    const t: Opnd = {
+      oiRep: ibBool,
+      oiBits: if n.boolVal != 0 { 1 } else { 0 },
+    }
+    return t
+  }
   const rep = exprRepOf(ix)
   if rep < 0 {
     return irBMiss("rep " + repWhat(repNodeOfTy(nodeTyAt(ix, ibFnIx))))
@@ -5493,6 +5572,15 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if arrCopyCallNamed(n, ibFnIx) { return listCopyStmt(b, n, ix) }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
+    // A discarded slice is a value legacy evaluates and drops.
+    if rhs is RListSlice {
+      const sr = exprRepOf(ix)
+      if sr < 0 { return skip("slice statement rep") }
+      const v = irBLetTemp(b, rhs, ix, sr)
+      if ibMiss != "" { return 0 }
+      irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+      return 0
+    }
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
   }
@@ -5851,8 +5939,23 @@ export function irClaimConstCell(gi: i32, gst: i32): boolean {
 // Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
 // `fnIx` at type `ty`, legacy's bytes for it in the current buffer from `from` on, lowered as a
 // fragment into a scratch buffer and counted `node-in <kind>: matched`, `differ` or `miss <why>`.
-export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
+export function irNodeInShadow(
+  ix: i32,
+  fnIx: i32,
+  ty: i32,
+  from: i32,
+  before: LiFrame,
+): i32 {
   if !ibArmed { return 0 }
+  // The probe allocates scratch rows from the frame legacy began with, then legacy's are put back.
+  const after = liFrameSave()
+  liFrameRestore(before)
+  const row = nodeInShadowGo(ix, fnIx, ty, from)
+  liFrameRestore(after)
+  return row
+}
+
+function nodeInShadowGo(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
   const live = legacyContextLiveWhy(ix)
   if live != "" { count("node-in context live: " + live) }
   if ibCorrupt == 6 { heldControl(ix, fnIx) }
@@ -6211,8 +6314,29 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if !(g is LetDecl) { return 0 }
   const gck = globalCellKind(gst)
   const arm = startInitArmOf(gst, gck)
-  if arm != "plain" { return skip("global initializer " + arm) }
-  if globalInitArmUnboxes(gck, g.letInit) {
+  // A union cell is the box, its initializer boxed at the binding's union type as legacy's
+  // `emitUnionBoxOwed` writes it.
+  if arm == "unionBox" {
+    const rep = globalRep(gi, gst)
+    if rep < 0 { return skip("global initializer rep") }
+    const bv = deliver(b, g.letInit, rep, letBindingUnionTy(gst, -1))
+    if ibMiss != "" { return 0 }
+    if irBOpRep(bv) != rep { return skip("global initializer coercion") }
+    const bm = irGlobalWriteMiss(gi, ibGlobalCtx())
+    if bm != "" { return skip(bm) }
+    irBNode(b, { gsSym: gi, gsSrc: bv }, -1, ibNoValue, gst)
+    return 0
+  }
+  if arm != "plain" && arm != "widen" {
+    return skip("global initializer " + arm)
+  }
+  // A widened value `if` is legacy's nested-join adoption (`numLitAdoptJoin`, D16496), which
+  // keeps an inner join at its own type and extends it; the IR's delivery widens per arm.
+  if arm == "widen" && nodeAt(unwrapParen(g.letInit)) is IfStmt {
+    return skip("global initializer widen join")
+  }
+  // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it.
+  if arm == "plain" && globalInitArmUnboxes(gck, g.letInit) {
     return skip("global initializer arm unbox")
   }
   const src = if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else if gck == "closure" { cloInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }

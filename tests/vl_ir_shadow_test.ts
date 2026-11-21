@@ -1697,18 +1697,14 @@ Deno.test({
   },
 });
 Deno.test({
-  name: "ir shadow: a start widening an initializer misses by name",
+  name: "ir shadow: a start widening an initializer to its cell covers and matches",
   ignore,
   fn: () => {
-    const cases: [string, string][] = [
-      [`const w: f64 = 3\nprint(w)\n`, "global initializer widen"],
-    ];
-    for (const [src, why] of cases) {
-      const { rows } = run(src, true);
-      if (rows.get(`start uncovered ${why}`) !== 1) {
-        throw new Error(`want one "start uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
-      }
+    const { rows } = run(`const w: f64 = 3\nprint(w)\n`, true);
+    if (rows.get("start covered") !== 1 || rows.get("start matched") !== 1) {
+      throw new Error(`want the start covered and matched, got ${JSON.stringify([...rows])}`);
     }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -2618,8 +2614,9 @@ print(qnull().o == null)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
+    const cov = rows.get("covered") ?? 0;
+    if (cov < 4 || (rows.get("matched") ?? 0) !== cov) {
+      throw new Error(`want at least cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
