@@ -79,7 +79,7 @@ The arm's result must be the dispatch's rep as it stands; its temp takes the dis
 | `tests/cases` `call of a non-declaration` (any) | 1,094 | 849 |
 | `tests/cases` `tag dispatch lambda arm` (any) | 190 | 0 |
 | armed `tests/cases` covered / matched | 57,283 / 57,270 | 57,942 / 57,929 |
-| L2 self-compile fuel (baseline 104,920,663,373) | | 105,089,012,929 (+0.16%) |
+| L2 self-compile fuel (baseline 104,920,663,373) | | 105,114,300,766 (+0.18%) |
 
-Armed `tests/cases`: the 13 functions that do not match are `node-in array: differ` rows, the
-same on both seeds; there is no fail or mismatch row on either.
+Armed `tests/cases`: the fail and mismatch rows are the same on both seeds, row for row
+(`spans: read index` 6, `effect outside I1` 4, three verifier rows); none is new.
