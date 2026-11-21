@@ -526,6 +526,7 @@ import {
 import { ListBuild } from "./emit_ref_list_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { globalIndexOfSid } from "./emit_fn_ret_kinds"
+import { i32ListHas } from "./listutil"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -555,6 +556,8 @@ let lwFloors: i32[] = []
 let lwStashAt: i32[] = []
 let lwStashFi: i32[] = []
 let lwStashSlots: i32[] = []
+// The order-stashed literals whose box head their first `RStashSet` wrote, as legacy's tag leads.
+let lwBoxHeadAt: i32[] = []
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1176,12 +1179,32 @@ function stashSet(r: RStashSet) {
   const row = recRowOf(r.ssAt, r.ssRow, r.ssVariant, true)
   if row < 0 { return irLMiss("record row") }
   const fi = r.ssFi
+  if !i32ListHas(lwBoxHeadAt, r.ssAt) { stashBoxHead(r.ssAt) }
   irLOpnd(r.ssV)
   const slot = stashSlotAt(row, fi, r.ssVariant)
   lwStashAt.push(r.ssAt)
   lwStashFi.push(fi)
   lwStashSlots.push(slot)
   fbLocalSet(slot)
+  return 0
+}
+
+// Where the order-stashed literal at `at` is boxed under a plan that writes a head, that head,
+// ahead of the literal's first field (legacy writes the tag before the literal).
+function stashBoxHead(at: i32) {
+  for n in lw.irNodes {
+    if !(n is SLet) { continue }
+    const r = n.lRhs
+    if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
+    const bx = r.bxAt
+    const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+    if p.hbArm == "rec" || p.hbArm == "obj" {
+      leaf()
+      holeBoxHead(p, bx, lw.irAt)
+      lwBoxHeadAt.push(at)
+    }
+    return 0
+  }
   return 0
 }
 
@@ -2208,8 +2231,10 @@ function boxOp(r: RToBox) {
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
-  if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
-  holeBoxHead(p, r.bxAt, fnIx)
+  if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
+    if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
+    holeBoxHead(p, r.bxAt, fnIx)
+  }
   if (
     p.hbArm == "pass"
     || p.hbArm == "memberBox"
@@ -3301,6 +3326,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwFloor = 0
   lwFloors = []
   lwStashAt = []
+  lwBoxHeadAt = []
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false }
