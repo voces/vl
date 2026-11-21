@@ -1243,10 +1243,10 @@ if d.v is f64 { print(d.v) }
 });
 
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
-// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
-// the result's `null`.
+// (prints 5). The IR once returned `put(9)`'s value there; it now builds `put(9)` as a statement
+// and falls into the lowering's `null` pad, matching legacy.
 Deno.test({
-  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  name: "ir shadow: a block body that runs past its last statement pads its null and matches",
   ignore,
   fn: () => {
     const src = `function put(x: i32) { return x * 2 }
@@ -1257,9 +1257,13 @@ function f(b: i32) {
 print(f(-1) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered block body falls off";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered block body falls off")) {
+      throw new Error(`want no falls-off miss, got ${JSON.stringify([...rows])}`);
+    }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 2 || rows.get("matched") !== 2) {
+      throw new Error(`want put and f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
