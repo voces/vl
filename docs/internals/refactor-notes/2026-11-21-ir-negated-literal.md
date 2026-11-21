@@ -21,7 +21,7 @@ the own-width check (`wide literal width`) for an unnegated literal.
 `tests/cases/numerics/negated-literal-at-its-own-width.vl` covers `-2147483647 - 1`, a plain
 chain, floats, the least i64, a parenthesised operand and `-2147483648`. Under the merge-base
 seed three of its eight functions stop at `operand coercion`. After, all eight are covered and
-matched. Shadow row `NEGATED_LITERAL`.
+matched. Shadow row `tests/ir-shadow-rows/negated-literal.vl`.
 
 ## Measured
 
