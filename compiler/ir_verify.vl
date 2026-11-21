@@ -28,6 +28,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvDrop,
   REnvGet,
   RFnId,
   RGetField,
@@ -414,7 +415,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
-    RCallHost => uses(r.chArgs, at)
+    RCallHost => {
+      uses(r.chArgs, at)
+      if r.chVoid && dst >= 0 {
+        return fail(2, at, "a void host call has no value")
+      }
+      0
+    }
     RBoxField => {
       use(r.bfV, at)
       const bf = repNodeAt(opRep(r.bfV))
@@ -627,7 +634,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A packed byte reads unsigned into an i32.
       const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
-      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed {
+      // A nullable string element may read recovered at a string.
+      const en = repNodeAt(kidAt(l, 0))
+      const recovered = en is RNullable && en.rnInner == dst && dst == vfStr
+      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed && !recovered {
         return fail(2, at, "an element's rep is not its destination's")
       }
       0
@@ -1018,6 +1028,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCellNew => use(r.cnInit, at)
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
+    REnvDrop => 0
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
@@ -1112,6 +1123,24 @@ function rawEff(e: SRawOp, at: i32) {
   if e.srOp == "reserve.open" || e.srOp == "reserve.close" {
     return if e.srArgs.length == 0 { 0 } else { fail(10, at, e.srOp + " takes no operand") }
   }
+  // A binding sink's pair writes: a box in, the null in, or the box out to a box variable.
+  if e.srOp == "sink.put" || e.srOp == "sink.null" || e.srOp == "sink.close" {
+    uses(e.srArgs, at)
+    const n0 = if e.srOp == "sink.put" { 1 } else { 0 }
+    const v = e.srImm
+    const varOk = e.srOp == "sink.null"
+      || v >= 0
+      && v < vf.irVars.length
+      && sinkBoxRep(vf.irVars[v].vRep)
+    if (
+      e.srArgs.length != n0
+      || !varOk
+      || n0 == 1 && !sinkBoxRep(opRep(e.srArgs[0]))
+    ) {
+      return fail(10, at, e.srOp + " is not a union box into the sink pair")
+    }
+    return 0
+  }
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
   // Every outstanding push is this effect's leading operands, in push order.
   let k = 0
@@ -1138,12 +1167,18 @@ function rawEff(e: SRawOp, at: i32) {
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
     "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
-    "reserve.open" | "reserve.close" => false
+    "reserve.open" | "reserve.close" | "sink.put" | "sink.null" | "sink.close" => false
   }
   if !ok {
     return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
   }
   return 0
+}
+
+// Whether rep `r` is a union box, or a nullable one held as the same `{tag, payload}`.
+function sinkBoxRep(r: i32): boolean {
+  const d = repNodeAt(r)
+  return d is RBox || d is RNullable && d.rnDisc == 4
 }
 
 // Whether node `id` leaves its body: a branch, a return or a trap.
@@ -1618,7 +1653,7 @@ function touchesList(n: IrNode): boolean {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | ROmitNull | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | REnvGet | RRawOp | RRel | RStage => false
+    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | ROmitNull | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | REnvGet | REnvDrop | RRawOp | RRel | RStage => false
   }
 }
 
