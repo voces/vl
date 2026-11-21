@@ -2062,11 +2062,10 @@ print(pick(1))
   },
 });
 
-// Two spread literals in one function: the IR builds the one-group `[...a]` along the shared
-// spread plan while legacy keeps the many-group one, each in its own recorded slots, and a
-// function of the one-group form alone is covered and matched.
+// Two spread literals in one function, a one-group `[...a]` and a many-group one, each built along
+// the shared spread plan into its own recorded slots: both functions are covered and matched.
 Deno.test({
-  name: "ir shadow: a one-group spread matches beside a many-group one legacy keeps",
+  name: "ir shadow: a one-group spread matches beside a many-group one",
   ignore,
   fn: () => {
     const { rc, rows } = run(`function f(a: i32[], b: i32[]): i32 {
@@ -2083,11 +2082,8 @@ print(f([1, 2], [3]) + g([4]))
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("node-in array: miss array spread groups") ?? 0) !== 1) {
-      throw new Error(`want the many-group spread left to legacy, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
-      throw new Error(`want g covered and matched, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2659,9 +2655,9 @@ Deno.test({
   },
 });
 
-// Two spellings stay legacy's: a stored literal boxed into a union (the box writer may leave an
-// immediate unread, and this one stands for the store), and one after a call operand whose value
-// waits on the stack across the store.
+// Two spellings stay legacy's: a stored literal boxed into a union (the box writes its tag ahead
+// of the store, which the builder writes as a statement first), and one after a call operand
+// whose value waits on the stack across the store.
 const ASG_VALUE_LIT_MISSES =
   `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
 Deno.test({
@@ -2673,7 +2669,7 @@ Deno.test({
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
     if (
-      (rows.get("uncovered box of an effect's immediate") ?? 0) !== 1 ||
+      (rows.get("uncovered box of an assignment") ?? 0) !== 1 ||
       (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
     ) {
       throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
