@@ -136,6 +136,9 @@ export type RSpread = { spSrc: Opnd, spKind: i32, spSlot: i32, spAt: i32 }
 export type RListNew = { lnLen: Opnd, lnFill: Opnd, lnAt: i32 }
 // `__array_copy__(dst, dstAt, src, srcAt, count)` at call node `lcAt`, over its five operands.
 export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
+// A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
+// its value (`memAccessPlanOf`).
+export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
 export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32 }
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
@@ -287,7 +290,7 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
 export type Rhs = RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf
-  | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListGet | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
+  | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RMemAccess | RListGet | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet
   | RMapGetOr | RMapGet | RMapHas | RPrint | RStrOp | RNumWiden | RNumCast | RNumIntr | RCoalStr | RCoalAtomStr | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RTagStash | RTagIs
   | RUnionEq | RListEq | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | REnvGet | REnvDrop | RRawOp | RRel | RStage
 
@@ -364,6 +367,9 @@ export type RawEff = "struct.set"
   | "call"
   | "reserve.open"
   | "reserve.close"
+  | "sink.put"
+  | "sink.null"
+  | "sink.close"
 export type SRawOp = { srOp: RawEff, srHeap: i32, srArgs: Opnd[], srImm: i32 }
 export type IrNode = SLet | SAssign | SSetField | SListSet | SCellSet | SGlobalSet
   | SBoundsCheck | SEffect | SBlock | SLoop | SForIn | SIf | SSwitch | SCoalBox | SBr | SReturn | STrap
@@ -410,6 +416,8 @@ export type IrFn = {
   irLocalAt: {[i32]: i32},
   // The spans opening at each node, in note order, so lowering a node does not scan every span.
   irSpansAt: {[i32]: i32[]},
+  // How many spans end at each node, so closing a node's spans scans only past them.
+  irSpanEnds: {[i32]: i32},
   // The variable each name read the builder took as a plain read of it, by the read's node.
   irReadVar: {[i32]: i32},
   // A global read the builder built, by the read's node: written again as it stands.
@@ -458,6 +466,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irSpanKind: [],
     irLocalAt: Map(),
     irSpansAt: Map(),
+    irSpanEnds: Map(),
     irReadVar: Map(),
     irNoTail: [],
     irReadAgain: Map(),
@@ -533,6 +542,7 @@ export function irSpanNoteKind(
   const at = f.irSpansAt[first] ?? []
   at.push(f.irSpanAst.length - 1)
   f.irSpansAt[first] = at
+  f.irSpanEnds[last] = (f.irSpanEnds[last] ?? 0) + 1
   return 0
 }
 
@@ -737,6 +747,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RSpread => [r.spSrc]
     RListNew => [r.lnLen, r.lnFill]
     RListCopy => r.lcArgs
+    RMemAccess => r.mmArgs
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
     RListPush => pushOpnds(r)
@@ -810,6 +821,7 @@ function rhsText(r: Rhs): string {
     RSpread => "spread(" + opndText(r.spSrc) + ")"
     RListNew => "list_new(" + opndText(r.lnLen) + ", " + opndText(r.lnFill) + ")"
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
+    RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
     RListPush => "push " + pushRecvText(r.lpV) + " " + opndText(r.lpX)
@@ -1038,7 +1050,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RTest | RBoxField | RSharedRead | RBoxNarrow => "box"
     RGetField | RMakeRec => "record"
     RMakeClo | RCallRef | REnvGet | REnvDrop => "closure"
-    RCallHost | RCast | RTagOf | RListNew | RListCopy | RFnId | RCellNew | RCellGet => "other"
+    RCallHost | RCast | RTagOf | RListNew | RListCopy | RMemAccess | RFnId | RCellNew | RCellGet => "other"
     RRawOp | RRel => "raw"
     RStage => "scalar"
   }

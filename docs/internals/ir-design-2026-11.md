@@ -59,7 +59,7 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
 | CFG form | structured: `Block`/`Loop`/`If`/`Br`/`Switch`/`Return`, as wasm has it | VL's control flow is structured (no `goto`). Lowering stays one node to one wasm construct, which is what makes byte identity reachable during migration. |
 | value form | ANF: each operand is a `Var` or an immediate constant | temporaries become explicit, and an operand is never re-read (§1.4) |
 | SSA | **no**. A `Var` is a wasm local, and `Assign` writes it | SSA needs out-of-SSA plus coalescing, which renumbers locals and moves every function's bytes. The optimizations L1 names (LICM, BCE, SROA, inlining, unrolling) only need def-use chains, and a pass can build those over a structured, non-SSA body. SSA can be added later as an analysis view. |
-| monomorphic | yes. An `IrFn` belongs to one instance (`InstId`, Q §2.1), and no `Var` has an open `TyId` | the verifier refuses an open type (§2) |
+| monomorphic | yes. An `IrFn` belongs to one instance (`InstId`, Q §2.1), and no `Var` has an open `TyId` except where each open part is a function type held at a rep no instance changes: a tagged set's `i32` id, or the uniform closure in a build that makes no record of closures (`tyOpenHeldAsIds`; coordinator ruling, 2026-11-21) | the verifier refuses any other open type (§2). A node whose lowering reads the open part (a call signature, an arm tag, a set id) takes it from legacy's plan at that node or stays a named miss, so a held open part is never lowered from the type. |
 | node encoding | distinct record types in one union, matched by `match` on the record type, with no `_` arm | VL has no payload variants yet (L4). This is the `Ty` arena's and lane E's `RepNode` pattern. Each variant needs its own field-name prefix (the `ast.vl:6` convention). |
 | storage | one arena per `IrFn`: `nodes: IrNode[]` and `vars: IrVar[]`. Ids are `i32`, newtyped as `IrNodeId`/`IrVarId` | an IR function can be built, verified and lowered in isolation. Q's `Lowered` holds one per `InstId`. |
 | operand ids | `TyId` = `tyCanonSet` (H), `RepId` = H's arm-aware layout id over E's arena (E), `Coercion` (M3), callee (an `fnStmts` position until Q step 6, then `InstId`) | session ids, so IR can outlive the program that built it (Q §2.1) |
@@ -885,6 +885,12 @@ Whole-function IR assumes legacy's lowering context is at rest, and asks the sha
 accordingly: `atomStrPlanOf(…, held: false)` (#9127), `fnValueArmOf(…, stubRhs: -1)`. Inside a legacy
 body that assumption can be false, and a plan the IR asks as "fresh delivery" can then disagree
 with what legacy decides at the same node.
+
+**A door that ships gates on `claimable()` (coordinator ruling, 2026-11-21).** A fragment that
+writes shipped bytes (`probe` false) does so only when every node is in a claimed family, as a
+function or start body claims, so a `CLAIMED`-empty compiler writes legacy's bytes there and
+`ir-identity.sh --claimless` compares them. The one shipping door today, I8a's const cell
+(`irClaimConstCell`), does.
 
 **Before the first non-shadow caller of `irLowerNodeIn`, the door must miss ("legacy context
 live") unless each of these is at its resting value:**
