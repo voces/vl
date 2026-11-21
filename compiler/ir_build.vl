@@ -39,6 +39,7 @@ import {
   Unary,
   WhileStmt,
   blockTailIsDead,
+  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -685,10 +686,19 @@ function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
 // that is no re-readable place (`unionEqOperandOk`) evaluated and dropped, then the constant.
 function isConstTest(b: i32[], n: IsExpr, v: i32, ix: i32, rep: i32): Opnd {
   if rep != ibBool { return irBMiss("is result rep") }
+  // In a lambda legacy can evaluate even a plain receiver before the constant; that writer is
+  // not modelled, so the function stays legacy's.
+  const host = if ibFnIx >= 0 { nodeAt(ibFnIx) } else { null }
+  if host is FuncDecl && fnNameIsLambda(host.fnName) {
+    return irBMiss("is static in a lambda")
+  }
   if !unionEqOperandOk(n.isObj) {
     const o = irBExpr(b, n.isObj)
     if ibMiss != "" { return o }
     irBNode(b, { dpV: o }, -1, ibNoValue, ix)
+  } else if !(nodeAt(unwrapParen(n.isObj)) is Ident) {
+    // Legacy has been seen to evaluate a re-readable element read here too; only a name is built.
+    return irBMiss("is static receiver place")
   }
   const bits: i64 = if v != 0 { 1 } else { 0 }
   const o: Opnd = { oiRep: rep, oiBits: bits }
@@ -1584,6 +1594,10 @@ function armHasPrelude(blockIx: i32): boolean {
 function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
+  // Legacy reads a constant `is` back off its bytes and writes the right side as a dead arm.
+  if l is OImm && condIsTest(n.binLeft) {
+    return irBMiss("decided is short-circuit")
+  }
   const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
@@ -4099,6 +4113,12 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     const a = irBExpr(b, n.unArg)
     if ibMiss != "" { return a }
     if irBOpRep(a) != rep { return irBMiss("operand coercion") }
+    // A constant `is` under `!` is the one constant legacy reads back and negates (D2957).
+    if a is OImm && n.unOp == "!" && condIsTest(n.unArg) {
+      const nb: i64 = if a.oiBits != 0 { 0 } else { 1 }
+      const o: Opnd = { oiRep: rep, oiBits: nb }
+      return o
+    }
     const op: PrimOp = if n.unOp == "-" { "neg" } else { "not" }
     return irBLetTemp(b, { poOp: op, poArgs: [a] }, ix, rep)
   }
@@ -4605,6 +4625,10 @@ function ifChain(b: i32[], ix: i32) {
     const no: Opnd = { oiRep: ibBool, oiBits: 0 }
     const c = if decided { no } else { irBExpr(out, n.ifCond) }
     if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+    // Another constant `is` is one legacy decides off its bytes, writing its dead arm its way.
+    if !decided && c is OImm && condIsTest(n.ifCond) {
+      return skip("decided is condition")
+    }
     const th = nodeAt(n.ifThen)
     const thenB: i32[] = []
     if ifThenIsDead(n) {
