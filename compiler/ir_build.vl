@@ -42,6 +42,7 @@ import {
   Unary,
   WhileStmt,
   blockTailIsDead,
+  fnNameIsLambda,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -258,10 +259,13 @@ import {
   identReadArmOf,
   isArmOf,
   isBoxGuardPlain,
+  isNulTestImpossible,
+  isPreArmOf,
   isRecvStageRep,
   isTestsStorage,
   isVariantTagPlain,
   memberBoxReadAt,
+  monoStaticIsResult,
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
   njDispatches,
@@ -289,6 +293,7 @@ import {
   NULL_OWN_BOX,
   NULL_OWN_NONE,
   NULL_OWN_STR,
+  NulTestArm,
   binNulTestOf,
   coalArmOf,
   coalBoxArmOf,
@@ -438,9 +443,11 @@ import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
   exprEffectFree,
+  isTestsNull,
   listIsTestedIdent,
   objFieldSrcOrder,
   objFieldVal,
+  unionEqOperandOk,
   unwrapParen,
 } from "./emit_base"
 import { ifArmValueExpr, paramIndexOf } from "./emit_query"
@@ -670,10 +677,23 @@ function valueRep(r: i32, ty: i32): boolean {
 // no staged receiver, `isVariantTagPlain`), over a plain read (`isBoxGuardPlain`).
 function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if isTestsStorage(n.isObj, ibFnIx) { return storedBoxTest(b, n, ix, rep) }
+  // `emitIs` answers a decided pre-arm before any rung, some after evaluating the operand.
+  const pa = isPreArmOf(ix, ibFnIx)
+  if pa != "test" { return irBMiss("is pre-arm " + pa) }
   if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
     return irBMiss("is staged")
   }
   const arm = isArmOf(ix, ibFnIx, 0, false)
+  if arm == "nulTest" { return isNulTest(b, n, ix, rep) }
+  if arm == "never" || arm == "pinNever" {
+    return isConstTest(b, n, 0, ix, rep)
+  }
+  if arm == "static" {
+    // A static `false` first tries legacy's empty-list fit, which may still write a test.
+    const st = monoStaticIsResult(ix, ibFnIx)
+    if st != 1 { return irBMiss("is static empty fit") }
+    return isConstTest(b, n, 1, ix, rep)
+  }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
   if rep != ibBool { return irBMiss("is result rep") }
@@ -685,6 +705,47 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is operand rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// `recv is X` over a nullable niche at `isArmOf`'s null-test rung: the niche's own null test
+// (`nulTestArmOf`, niche only), true for present unless `X` is `null`. An impossible test misses.
+function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if isNulTestImpossible(ix, ibFnIx) {
+    return irBMiss("is impossible null test")
+  }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const invert = !isTestsNull(ix)
+  const arm = nulTestArmOf(n.isObj, ibFnIx, invert, true)
+  if arm != "atom" && arm != "bool" && arm != "nullRef" && arm != "nulStr" {
+    return irBMiss("is null test " + arm)
+  }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if !nulTestOperandOk(arm, irBOpRep(v)) { return irBMiss("null test operand") }
+  return irBLetTemp(b, { ntV: v, ntInvert: invert, ntAt: ix }, ix, rep)
+}
+
+// An `is` test whose answer is static `v`, as legacy's `isConstAfterRecv` writes it: a receiver
+// that is no re-readable place (`unionEqOperandOk`) evaluated and dropped, then the constant.
+function isConstTest(b: i32[], n: IsExpr, v: i32, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  // In a lambda legacy can evaluate even a plain receiver before the constant; that writer is
+  // not modelled, so the function stays legacy's.
+  const host = if ibFnIx >= 0 { nodeAt(ibFnIx) } else { null }
+  if host is FuncDecl && fnNameIsLambda(host.fnName) {
+    return irBMiss("is static in a lambda")
+  }
+  if !unionEqOperandOk(n.isObj) {
+    const o = irBExpr(b, n.isObj)
+    if ibMiss != "" { return o }
+    irBNode(b, { dpV: o }, -1, ibNoValue, ix)
+  } else if !(nodeAt(unwrapParen(n.isObj)) is Ident) {
+    // Legacy has been seen to evaluate a re-readable element read here too; only a name is built.
+    return irBMiss("is static receiver place")
+  }
+  const bits: i64 = if v != 0 { 1 } else { 0 }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
+  return o
 }
 
 // `0, 1, ..., n - 1`.
@@ -1744,6 +1805,10 @@ function armHasPrelude(blockIx: i32): boolean {
 function shortCircuit(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" || irBOpRep(l) != ibBool { return irBMiss("logical operand") }
+  // Legacy reads a constant `is` back off its bytes and writes the right side as a dead arm.
+  if l is OImm && condIsTest(n.binLeft) {
+    return irBMiss("decided is short-circuit")
+  }
   const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   const t = irVarNew(ib, rep, ty, "local", -1)
@@ -3728,17 +3793,21 @@ function nulTest(
   }
   const v = irBExpr(b, bt.bnRef)
   if ibMiss != "" { return v }
-  const vr = irBOpRep(v)
-  if (
-    !(arm == "atom" && atomNullable(vr)
-      || arm == "bool" && boolNullable(vr)
-      || arm == "nulStr" && strNullable(vr)
-      || arm == "nullRef" && (strNullable(vr) || refNullable(vr))
-      || arm == "boxTag" && heldAsBox(vr))
-  ) {
-    return irBMiss("null test operand")
-  }
+  if !nulTestOperandOk(arm, irBOpRep(v)) { return irBMiss("null test operand") }
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
+}
+
+// Whether operand rep `vr` is the one null-test arm `arm` reads; an arm `RNulTest` does not
+// build reads none.
+function nulTestOperandOk(arm: NulTestArm, vr: i32): boolean {
+  return match arm {
+    "atom" => atomNullable(vr)
+    "bool" => boolNullable(vr)
+    "nulStr" => strNullable(vr)
+    "nullRef" => strNullable(vr) || refNullable(vr)
+    "boxTag" => heldAsBox(vr)
+    "nnfold" | "nulfold" | "nullty" | "optChain" | "mapHas" | "instMap" | "none" => false
+  }
 }
 
 // `m[k] == null` over a scalar map read, as legacy writes it: the map's has probe, then
@@ -4670,6 +4739,12 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
     const a = irBExpr(b, n.unArg)
     if ibMiss != "" { return a }
     if irBOpRep(a) != rep { return irBMiss("operand coercion") }
+    // A constant `is` under `!` is the one constant legacy reads back and negates (D2957).
+    if a is OImm && n.unOp == "!" && condIsTest(n.unArg) {
+      const nb: i64 = if a.oiBits != 0 { 0 } else { 1 }
+      const o: Opnd = { oiRep: rep, oiBits: nb }
+      return o
+    }
     // `~x` is legacy's `x ^ -1`, the all-ones mask at the operand's width.
     if n.unOp == "~" {
       const ones: Opnd = { oiRep: rep, oiBits: -1 }
@@ -5270,6 +5345,10 @@ function ifChain(b: i32[], ix: i32) {
     const no: Opnd = { oiRep: ibBool, oiBits: 0 }
     const c = if decided { no } else { irBExpr(out, n.ifCond) }
     if ibMiss != "" || irBOpRep(c) != ibBool { return skip("condition") }
+    // Another constant `is` is one legacy decides off its bytes, writing its dead arm its way.
+    if !decided && c is OImm && condIsTest(n.ifCond) {
+      return skip("decided is condition")
+    }
     const th = nodeAt(n.ifThen)
     const thenB: i32[] = []
     if ifThenIsDead(n) {
