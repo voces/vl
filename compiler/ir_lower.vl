@@ -419,6 +419,9 @@ import {
   sharedReadTail,
   sharedRecvSlotGet,
   simdCallRow,
+  simdMemBase,
+  simdMemTail,
+  simdRowIsMem,
   simdTail,
   spreadGroupStash,
   spreadJoinGroups,
@@ -1607,6 +1610,14 @@ function listNew(r: RListNew) {
   return arrNewTail(pl, slot)
 }
 
+// Whether call node `at` is a SIMD store, the one SIMD row that leaves nothing.
+function simdStoreAt(at: i32): boolean {
+  const c = nodeAt(at)
+  if !(c is Call) { return false }
+  const row = simdCallRow(c)
+  return row >= 0 && simdRowIsMem(row) && simdMemBase(row) == 2
+}
+
 // `RListNewDefault`: legacy's `__array_new_default__` arm: the length and its stash, then the
 // zeroed allocation at `arrNewPlanOf`'s pair.
 function listNewDefault(r: RListNewDefault) {
@@ -1626,6 +1637,14 @@ function simd(r: RSimd) {
   const f = nodeAt(c.callFn)
   const row = simdCallRow(c)
   if !(f is Ident) || row < 0 { return irLMiss("simd node") }
+  if simdRowIsMem(row) {
+    const ap = memAddrPlanOf(c, simdMemBase(row), lw.irAt)
+    if ap.maArm != "const" && ap.maArm != "rest" {
+      return irLMiss("simd memory plan")
+    }
+    for a in r.sdArgs { irLOpnd(a) }
+    return simdMemTail(row, ap.maOff)
+  }
   for a in r.sdArgs { irLOpnd(a) }
   return simdTail(c, f.identName, row)
 }
@@ -2553,6 +2572,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       if r is RListCopy {
         listCopy(r)
         irLSettle(pending)
+        return 0
+      }
+      // A vector store leaves nothing; any other SIMD op's discarded value is dropped.
+      if r is RSimd {
+        simd(r)
+        irLSettle(pending)
+        if !simdStoreAt(r.sdAt) { fbDrop() }
         return 0
       }
       // A store leaves nothing; a discarded load leaves its value, which legacy drops.
