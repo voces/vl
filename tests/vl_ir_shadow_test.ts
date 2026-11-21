@@ -140,6 +140,25 @@ Deno.test({
   },
 });
 
+// A const cell's fragment under the dual emit's control 3 must report a bytes mismatch, the class
+// the corpus baseline and the bytes veto read; unbroken, it matches.
+Deno.test({
+  name: "ir shadow: a const cell whose fragment differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    const src = `const xs = [1, 2]\nconst s = "hi"\nprint(xs[1])\nprint(s)\n`;
+    const ok = run(src, true);
+    if (ok.rows.get("const cell plain array: matched") !== 2 || ok.rows.get("const cell plain string: matched") !== 2) {
+      throw new Error(`want both cells matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("mismatch bytes: const cell "));
+    if (bad.length !== 2 || [...rows.keys()].some((k) => k.startsWith("const cell ") && k.endsWith(": matched"))) {
+      throw new Error(`want each cell a "mismatch bytes: const cell" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
@@ -258,7 +277,8 @@ for (const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as cons
     fn: () => {
       const { rc, rows } = run(COVERED, true, mode);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      const got = [...rows].filter(([k]) => k.startsWith(cls)).reduce((n, [, c]) => n + c, 0);
+      const got = [...rows].filter(([k]) => k.startsWith(cls) && !k.includes(": const cell "))
+        .reduce((n, [, c]) => n + c, 0);
       const covered = rows.get("covered") ?? 0;
       if ((rows.get("matched") ?? 0) !== 0 || got !== covered) {
         throw new Error(`want all ${covered} covered as "${cls}", got ${JSON.stringify([...rows])}`);
