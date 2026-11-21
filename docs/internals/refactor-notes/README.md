@@ -8,6 +8,147 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-21-ir-capture-env](2026-11-21-ir-capture-env.md): IR: closures over an environment, 2026-11-21
+- [2026-11-21-ir-block-tail-stmt](2026-11-21-ir-block-tail-stmt.md): IR: a block body's last statement is a statement (2026-11-21)
+- [2026-11-20-ir4-u8-verify](2026-11-20-ir4-u8-verify.md): IR verifier: a packed list literal's elements (2026-11-20, lane IR4)
+- [2026-11-20-ir4-strict-cast](2026-11-20-ir4-strict-cast.md): IR door guard: the push receiver's strict cast (2026-11-20, lane IR4)
+- [2026-11-20-ir4-nulbool-eq](2026-11-20-ir4-nulbool-eq.md): IR coverage: a `boolean | null` niche in `==`/`!=` (2026-11-20, lane IR4)
+- [2026-11-20-ir4-narrowed-atom](2026-11-20-ir4-narrowed-atom.md): IR coverage: an atom cell read at a string (2026-11-20, lane IR4)
+- [2026-11-20-ir4-long-lit](2026-11-20-ir4-long-lit.md): IR list literals: the long-literal miss by reason, and literal-union lists (2026-11-20, lane IR4)
+- [2026-11-20-ir4-inst-litrep](2026-11-20-ir4-inst-litrep.md): IR list literals at legacy's build type (2026-11-20, lane IR4)
+- [2026-11-20-ir4-for-iter](2026-11-20-ir4-for-iter.md): IR list literals: a `for` walk's literal iterable at the door (2026-11-20, lane IR4)
+- [2026-11-20-ir4-field-read](2026-11-20-ir4-field-read.md): IR: a nullable field narrowed past its null reads at its inner rep (2026-11-20, lane IR4)
+- [2026-11-20-ir4-f32-collapse](2026-11-20-ir4-f32-collapse.md): List literals: the f32, f64 and i64 arms are one builder (2026-11-20, lane IR4)
+- [2026-11-20-ir4-err-identity](2026-11-20-ir4-err-identity.md): The claims gate compares refusals (2026-11-20, lane IR4)
+- [2026-11-20-ir4-eq-route](2026-11-20-ir4-eq-route.md): One `==`/`!=` route, `eqRouteOf` (2026-11-20, lane IR4)
+- [2026-11-20-ir4-door-loopvar](2026-11-20-ir4-door-loopvar.md): IR door: a fragment reads the loop variable of a walk it did not build (2026-11-20, lane IR4)
+- [2026-11-20-ir4-door-const](2026-11-20-ir4-door-const.md): IR door: const initializers, and a fragment's locals against legacy's slots (2026-11-20, lane IR4)
+- [2026-11-20-ir4-door-classes](2026-11-20-ir4-door-classes.md): IR list-literal door: a valued `if` element, and the start's string accumulator (2026-11-20, lane IR4)
+- [2026-11-20-ir4-depth-fix](2026-11-20-ir4-depth-fix.md): IR lowering: body is one frame per level again (2026-11-20, lane IR4)
+- [2026-11-20-ir4-box-literal-arm](2026-11-20-ir4-box-literal-arm.md): IR coverage: an object literal boxed as another variant arm (2026-11-20, lane IR4)
+- [2026-11-20-ir4-atom-if-join](2026-11-20-ir4-atom-if-join.md): IR coverage: a join of member literals into an atom (2026-11-20, lane IR4)
+- [2026-11-20-ir4-atom-compare](2026-11-20-ir4-atom-compare.md): IR coverage: an atom operand of a string op (2026-11-20, lane IR4)
+- [2026-11-20-ir-variant-list-literal](2026-11-20-ir-variant-list-literal.md): IR: a list literal of a non-null variant's records (2026-11-20, lane IR-N3)
+- [2026-11-20-ir-variant-coerce-arm](2026-11-20-ir-variant-coerce-arm.md): IR decision modules 3b-3: the variant coerce's arm (2026-11-20, lane IR6)
+- [2026-11-20-ir-union-elem](2026-11-20-ir-union-elem.md): IR: a union-element list literal, 2026-11-20
+- [2026-11-20-ir-union-box-ref-list](2026-11-20-ir-union-box-ref-list.md): A ref-element list and a list index read boxed into a union (2026-11-20)
+- [2026-11-20-ir-union-box-record-list](2026-11-20-ir-union-box-record-list.md): A record or a scalar list boxed into a union (2026-11-20)
+- [2026-11-20-ir-union-box-objlit](2026-11-20-ir-union-box-objlit.md): An object literal boxed into a union (2026-11-20)
+- [2026-11-20-ir-union-box-narrowed-pass](2026-11-20-ir-union-box-narrowed-pass.md): A narrowed box delivered into a union as it stands (2026-11-20)
+- [2026-11-20-ir-union-box-list-literal](2026-11-20-ir-union-box-list-literal.md): A list literal boxed into a union's value-atom arm (2026-11-20)
+- [2026-11-20-ir-u8-list-store](2026-11-20-ir-u8-list-store.md): IR: an element store into a byte list (2026-11-20)
+- [2026-11-20-ir-tail-if-union-sink](2026-11-20-ir-tail-if-union-sink.md): IR: a tail `if` under the union return sink (2026-11-20)
+- [2026-11-20-ir-tag-leaf-rep](2026-11-20-ir-tag-leaf-rep.md): IR: a tag leaf at an open function type, 2026-11-20
+- [2026-11-20-ir-string-operand-stage](2026-11-20-ir-string-operand-stage.md): IR coverage: an earlier string operand, a literal included, staged below a valued `if` (2026-11-20, lane IR5)
+- [2026-11-20-ir-str-literal-index](2026-11-20-ir-str-literal-index.md): IR: an index into a string literal (2026-11-20)
+- [2026-11-20-ir-str-from-bytes](2026-11-20-ir-str-from-bytes.md): IR: `__str_from_bytes__` through the shared string-op path, 2026-11-20
+- [2026-11-20-ir-store-if-and-nullable-list-read](2026-11-20-ir-store-if-and-nullable-list-read.md): IR: a valued `if` into an element store, and a narrowed nullable list local (2026-11-20)
+- [2026-11-20-ir-stage-literal-type](2026-11-20-ir-stage-literal-type.md): IR: a staged literal at a literal-union parameter (2026-11-20, lane IR5)
+- [2026-11-20-ir-stage-lead](2026-11-20-ir-stage-lead.md): IR coverage: an earlier operand staged below a valued `if` (2026-11-20, lane IR6)
+- [2026-11-20-ir-sink-null-fallthrough](2026-11-20-ir-sink-null-fallthrough.md): IR: a null fall-through into the union return sink (2026-11-20)
+- [2026-11-20-ir-shared-read-stashed-receiver](2026-11-20-ir-shared-read-stashed-receiver.md): A shared field read over a union box a call returns (2026-11-20)
+- [2026-11-20-ir-shared-read-box-arm](2026-11-20-ir-shared-read-box-arm.md): A shared field read whose arms box (2026-11-20)
+- [2026-11-20-ir-shared-field-read](2026-11-20-ir-shared-field-read.md): A shared field read over an un-narrowed union box local (2026-11-20)
+- [2026-11-20-ir-sc-right-operand](2026-11-20-ir-sc-right-operand.md): IR: an operator's left operand staged below a valued right `if` (2026-11-20)
+- [2026-11-20-ir-return-trap](2026-11-20-ir-return-trap.md): IR: a returned trap (2026-11-20, lane IR-N2)
+- [2026-11-20-ir-ret-if-null-pad](2026-11-20-ir-ret-if-null-pad.md): IR: a returned value `if`'s null pad (2026-11-20)
+- [2026-11-20-ir-ref-list-store](2026-11-20-ir-ref-list-store.md): IR: an element store into a reference list (2026-11-20)
+- [2026-11-20-ir-ref-if-chain](2026-11-20-ir-ref-if-chain.md): IR: a reference join's `else if` chain (2026-11-20)
+- [2026-11-20-ir-push-values](2026-11-20-ir-push-values.md): IR coverage step: push values the IR delivers at the element rep, 2026-11-20
+- [2026-11-20-ir-push-u8](2026-11-20-ir-push-u8.md): IR coverage step: a push onto a packed `u8` list, 2026-11-20
+- [2026-11-20-ir-push-stage](2026-11-20-ir-push-stage.md): IR coverage step: a push receiver staged ahead of a short-circuit value, 2026-11-20
+- [2026-11-20-ir-push-held-receiver](2026-11-20-ir-push-held-receiver.md): IR coverage step: a short-circuit push onto a held list, 2026-11-20
+- [2026-11-20-ir-open-type-containers](2026-11-20-ir-open-type-containers.md): IR: containers of a tagged function set's members, 2026-11-20
+- [2026-11-20-ir-object-literal-stash](2026-11-20-ir-object-literal-stash.md): An object literal under legacy's source-order stash (2026-11-20)
+- [2026-11-20-ir-object-field-variant](2026-11-20-ir-object-field-variant.md): IR: an object literal's variant field arms, 2026-11-20
+- [2026-11-20-ir-object-field-struct](2026-11-20-ir-object-field-struct.md): IR: an object literal's struct field arms, and a literal built at its destination's row, 2026-11-20
+- [2026-11-20-ir-nullable-union-box](2026-11-20-ir-nullable-union-box.md): IR: a nullable union held as its box (2026-11-20)
+- [2026-11-20-ir-nullable-reps](2026-11-20-ir-nullable-reps.md): IR: the nullable reps (2026-11-20)
+- [2026-11-20-ir-nullable-box-narrow](2026-11-20-ir-nullable-box-narrow.md): IR coverage: a boxed `U | null` read narrowed to one variant (2026-11-20, lane IR6)
+- [2026-11-20-ir-null-test-box-map](2026-11-20-ir-null-test-box-map.md): IR coverage: a null test of a union box or a scalar map read (2026-11-20, lane IR-N1)
+- [2026-11-20-ir-narrowed-union-field-and-variant-row-literal](2026-11-20-ir-narrowed-union-field-and-variant-row-literal.md): IR: a narrowed box's union-box field, and a variant literal at its wider row (2026-11-20)
+- [2026-11-20-ir-narrowed-unbox](2026-11-20-ir-narrowed-unbox.md): IR decision modules 3b-1b: a narrowed union-box read (2026-11-20, lane IR6)
+- [2026-11-20-ir-narrowed-member-record-into-its-union](2026-11-20-ir-narrowed-member-record-into-its-union.md): Fix: a narrowed member record delivered into its union (2026-11-20, lane IR6; D17027)
+- [2026-11-20-ir-narrowed-member-of-union-member](2026-11-20-ir-narrowed-member-of-union-member.md): Fix: a narrowed field off a union member record (2026-11-20, lane IR6; D17025)
+- [2026-11-20-ir-narrowed-member-of-a-variant-global](2026-11-20-ir-narrowed-member-of-a-variant-global.md): Fix: a narrowed member record off a variant global, and a store through one (2026-11-20, lane IR6; D17028, D17029)
+- [2026-11-20-ir-member-box-pass](2026-11-20-ir-member-box-pass.md): Perf: a member record read delivered into its field's union passes the box (2026-11-20, lane IR6)
+- [2026-11-20-ir-mapstore-stage](2026-11-20-ir-mapstore-stage.md): IR coverage step: a map store's receiver and key staged below a short-circuit value, 2026-11-20
+- [2026-11-20-ir-map-store-variant](2026-11-20-ir-map-store-variant.md): IR: an object literal stored into an arm-valued map (2026-11-20)
+- [2026-11-20-ir-map-length](2026-11-20-ir-map-length.md): IR: a map's `.length` (2026-11-20)
+- [2026-11-20-ir-map-default-body](2026-11-20-ir-map-default-body.md): IR: a map read's computing default as SCoalBox's fused map-read arm (2026-11-20)
+- [2026-11-20-ir-let-if-seeded-box](2026-11-20-ir-let-if-seeded-box.md): IR: a union binding's `if` initializer into a seeded box (2026-11-20)
+- [2026-11-20-ir-is-test-member-receiver](2026-11-20-ir-is-test-member-receiver.md): IR: an `is` test over a member receiver at its storage (2026-11-20, lane IR6)
+- [2026-11-20-ir-is-nulbox](2026-11-20-ir-is-nulbox.md): IR coverage step: an `is` test over a local `U | null` box, 2026-11-20
+- [2026-11-20-ir-if-join-plan](2026-11-20-ir-if-join-plan.md): IR decision modules 4: a value `if`'s join (2026-11-20, lane IR6)
+- [2026-11-20-ir-if-atom-join](2026-11-20-ir-if-atom-join.md): IR: a value `if` joined at an atom (2026-11-20)
+- [2026-11-20-ir-if-arm-prelude](2026-11-20-ir-if-arm-prelude.md): IR: a valued `if`'s arm prelude, `else if` chain and literal `true` (2026-11-20)
+- [2026-11-20-ir-i8-census](2026-11-20-ir-i8-census.md): The I8 census: every population, claimed and first misses (2026-11-20, lane IR-D1)
+- [2026-11-20-ir-held-open-ids](2026-11-20-ir-held-open-ids.md): IR: the held-open rule as a positive contract, 2026-11-20
+- [2026-11-20-ir-for-in-ref-elements](2026-11-20-ir-for-in-ref-elements.md): IR: a `for` walk over a list of boxes, records or `i32` lists, 2026-11-20
+- [2026-11-20-ir-fieldstore-sc](2026-11-20-ir-fieldstore-sc.md): IR coverage step: a field store of a short-circuit value, 2026-11-20
+- [2026-11-20-ir-field-store-narrowed](2026-11-20-ir-field-store-narrowed.md): IR: a field store through a box narrowed to one variant (2026-11-20)
+- [2026-11-20-ir-field-box-from-box](2026-11-20-ir-field-box-from-box.md): IR: a box into a field's union asks legacy's box plan, 2026-11-20
+- [2026-11-20-ir-explicit-effect-returns](2026-11-20-ir-explicit-effect-returns.md): Compiler source: explicit returns where a trailing match's values were discarded (2026-11-20)
+- [2026-11-20-ir-else-less-tail-if](2026-11-20-ir-else-less-tail-if.md): IR: an else-less tail `if` (2026-11-20)
+- [2026-11-20-ir-dead-arm](2026-11-20-ir-dead-arm.md): IR: a statement `if`'s dead arm, as legacy writes it (2026-11-20, lane IR5)
+- [2026-11-20-ir-coalesce-popor](2026-11-20-ir-coalesce-popor.md): IR coverage step: the fused `pop ?? d`, 2026-11-20
+- [2026-11-20-ir-coalesce-nulref](2026-11-20-ir-coalesce-nulref.md): IR coverage step: a nullable reference's `??`, phase 1, 2026-11-20
+- [2026-11-20-ir-coalesce-closed](2026-11-20-ir-coalesce-closed.md): IR coverage step: the closed coalesce arm, 2026-11-20
+- [2026-11-20-ir-coal-box-node](2026-11-20-ir-coal-box-node.md): IR coverage step: the boxed-operand `??` node (`SCoalBox`), 2026-11-20
+- [2026-11-20-ir-closure-arg-arm](2026-11-20-ir-closure-arg-arm.md): IR: one closure-call argument decision, and a record's function field called, 2026-11-20
+- [2026-11-20-ir-capture-read](2026-11-20-ir-capture-read.md): IR: a lifted function's capture reads, 2026-11-20
+- [2026-11-20-ir-box-narrow-view](2026-11-20-ir-box-narrow-view.md): IR coverage: a union box local narrowed to a smaller union (2026-11-20, lane IR6)
+- [2026-11-20-ir-box-into-box-fence](2026-11-20-ir-box-into-box-fence.md): IR: a box into a box passes only where legacy's box plan passes it, 2026-11-20
+- [2026-11-20-ir-bit-not](2026-11-20-ir-bit-not.md): IR: a bitwise not (2026-11-20)
+- [2026-11-20-ir-bare-map-get](2026-11-20-ir-bare-map-get.md): IR: a bare map read `m[k]` (2026-11-20)
+- [2026-11-20-ir-asg-value-lit](2026-11-20-ir-asg-value-lit.md): IR: an assignment valued as its number literal (2026-11-20, lane IR-N2)
+- [2026-11-20-ir-array-new](2026-11-20-ir-array-new.md): IR: `__array_new__` through legacy's plan, stash and tail, 2026-11-20
+- [2026-11-20-ir-array-copy](2026-11-20-ir-array-copy.md): IR: `__array_copy__` through legacy's plan, backing reads and copy tail, 2026-11-20
+- [2026-11-20-f1-spread-solo](2026-11-20-f1-spread-solo.md): IR spread, one group (2026-11-20)
+- [2026-11-20-f1-spread-slot-ids](2026-11-20-f1-spread-slot-ids.md): Spread literal slot keys (2026-11-20)
+- [2026-11-20-f1-object-field-arm-delivery](2026-11-20-f1-object-field-arm-delivery.md): IR: a nullable record field's value (2026-11-20)
+- [2026-11-20-f1-match-chain-links](2026-11-20-f1-match-chain-links.md): IR: a valued match chain's links (2026-11-20)
+- [2026-11-20-f1-for-in-map-recv](2026-11-20-f1-for-in-map-recv.md): IR: a map walk over a receiver that is no global (2026-11-20)
+- [2026-11-20-f1-for-in-literal](2026-11-20-f1-for-in-literal.md): IR: a `for` walk over a list literal (2026-11-20)
+- [2026-11-20-f1-d17033-union-instance-fill](2026-11-20-f1-d17033-union-instance-fill.md): D17033: a generic union instance filled at emit time keeps the emit epoch (2026-11-20)
+- [2026-11-20-dead-box-retag](2026-11-20-dead-box-retag.md): Legacy: the dead retag in a union field's `??`, deleted, 2026-11-20
+- [2026-11-20-coal-box-arm](2026-11-20-coal-box-arm.md): IR decision: the boxed-operand coalesce arm, 2026-11-20
+- [2026-11-19-ir4-str-indexof](2026-11-19-ir4-str-indexof.md): IR coverage: a string's `.indexOf` and `.includes` (2026-11-19, lane IR4)
+- [2026-11-19-ir4-str-charcode](2026-11-19-ir4-str-charcode.md): IR coverage: a string's `.charCodeAt` (2026-11-19, lane IR4)
+- [2026-11-19-ir4-push-element](2026-11-19-ir4-push-element.md): IR coverage: a push onto a ref list or a packed byte list (2026-11-19, lane IR4)
+- [2026-11-19-ir4-method-has](2026-11-19-ir4-method-has.md): IR coverage: a map global's `.has` (2026-11-19, lane IR4)
+- [2026-11-19-ir4-list-slice](2026-11-19-ir4-list-slice.md): IR coverage: a list's `.slice` (2026-11-19, lane IR4)
+- [2026-11-19-ir4-list-clear](2026-11-19-ir4-list-clear.md): IR coverage: a list's `.clear()` (2026-11-19, lane IR4)
+- [2026-11-19-ir4-door-narrow](2026-11-19-ir4-door-narrow.md): IR door guard: each context by its rule (2026-11-19, lane IR4)
+- [2026-11-19-ir4-door-guard](2026-11-19-ir4-door-guard.md): IR door: the context-clean guard (2026-11-19, lane IR4)
+- [2026-11-19-ir-trap-boxed-return](2026-11-19-ir-trap-boxed-return.md): IR: a `__trap__` statement, and a return boxing a call's primitive result (2026-11-19, lane DEAD)
+- [2026-11-19-ir-string-accumulator](2026-11-19-ir-string-accumulator.md): IR coverage step: a string accumulator append, 2026-11-19
+- [2026-11-19-ir-start-accumulator](2026-11-19-ir-start-accumulator.md): IR coverage step: a start body's string accumulator, 2026-11-19
+- [2026-11-19-ir-scalar-pop](2026-11-19-ir-scalar-pop.md): IR coverage step: a scalar list `.pop()`, value and statement, 2026-11-19
+- [2026-11-19-ir-ref-pop](2026-11-19-ir-ref-pop.md): IR coverage step: a ref or string list `.pop()`, 2026-11-19
+- [2026-11-19-ir-print-union](2026-11-19-ir-print-union.md): IR coverage step: `print` of a value-union box, 2026-11-19
+- [2026-11-19-ir-plan-union](2026-11-19-ir-plan-union.md): IR decision modules 3: the union plans (2026-11-19, lane IR6)
+- [2026-11-19-ir-packed-index](2026-11-19-ir-packed-index.md): IR coverage step: a packed byte element read, 2026-11-19
+- [2026-11-19-ir-nonnull-union-box](2026-11-19-ir-nonnull-union-box.md): A value boxed into a non-null value union (2026-11-19)
+- [2026-11-19-ir-member-union-box](2026-11-19-ir-member-union-box.md): `member record`: union-box field reads (2026-11-19)
+- [2026-11-19-ir-mem-read-arm](2026-11-19-ir-mem-read-arm.md): IR decision modules 3b-1: the member read's arm (2026-11-19, lane IR6)
+- [2026-11-19-ir-match-arm-test-types](2026-11-19-ir-match-arm-test-types.md): IR: the match lowering records its arm tests' type, 2026-11-19
+- [2026-11-19-ir-map-value-rep](2026-11-19-ir-map-value-rep.md): IR: a map is a value rep (2026-11-19)
+- [2026-11-19-ir-map-receiver](2026-11-19-ir-map-receiver.md): IR: a map operation on any receiver (2026-11-19)
+- [2026-11-19-ir-map-read-inline](2026-11-19-ir-map-read-inline.md): IR: `m[k] ?? d` read inline (2026-11-19)
+- [2026-11-19-ir-map-new](2026-11-19-ir-map-new.md): IR: `Map()` and `Set()` build an empty map, 2026-11-19
+- [2026-11-19-ir-list-reserve](2026-11-19-ir-list-reserve.md): IR coverage step: a declaration's list reserve region, 2026-11-19
+- [2026-11-19-ir-list-copy-none](2026-11-19-ir-list-copy-none.md): IR: a list delivery that owes no copy, 2026-11-19
+- [2026-11-19-ir-is-pre-arm](2026-11-19-ir-is-pre-arm.md): IR decision modules 3b-2: an `is` test's rung (2026-11-19, lane IR6)
+- [2026-11-19-ir-if-ref-join](2026-11-19-ir-if-ref-join.md): IR: a value `if` joined at a string or a list (2026-11-19)
+- [2026-11-19-ir-forin-map](2026-11-19-ir-forin-map.md): `for in map`: a walk over a map global's keys or values (2026-11-19)
+- [2026-11-19-ir-fn-values-2](2026-11-19-ir-fn-values-2.md): IR: function values, step 2 (2026-11-19)
+- [2026-11-19-ir-fn-tag-dispatch](2026-11-19-ir-fn-tag-dispatch.md): IR: a call through a tagged function set, and its open locals and parameters, 2026-11-19
+- [2026-11-19-ir-field-store](2026-11-19-ir-field-store.md): IR: a struct or variant-param field store through one arm decision and legacy's store tail (2026-11-19, lane DEAD)
+- [2026-11-19-ir-expression-object](2026-11-19-ir-expression-object.md): IR: a record literal on legacy's layout path (2026-11-19)
+- [2026-11-19-ir-expression-if](2026-11-19-ir-expression-if.md): IR: an `if` on an `is` condition, valued or returned (2026-11-19)
+- [2026-11-19-ir-assign-value](2026-11-19-ir-assign-value.md): IR: assignment as a value (2026-11-19)
+- [2026-11-19-ir-argument-deliver](2026-11-19-ir-argument-deliver.md): Call arguments delivered at their parameter's rep (2026-11-19)
 - [2026-11-19-union-for-per-arm](2026-11-19-union-for-per-arm.md): A union `for` at a pin walks per arm (2026-11-19)
 - [2026-11-19-store-held-set-instance-key-design](2026-11-19-store-held-set-instance-key-design.md): STORE: an instance key for a hole handed a holder of a tagged set (2026-11-19)
 - [2026-11-19-store-elab-arg-holder-2](2026-11-19-store-elab-arg-holder-2.md): STORE: a holder of the callee's own type parameter is keyed and planned at the set (2026-11-19)
@@ -126,14 +267,14 @@ Newest first:
 - [2026-11-17-l2-fresh-literal-delivery](2026-11-17-l2-fresh-literal-delivery.md): L2: the per-call vector records a fresh argument at the row its delivery rebuilds it, 2026-11-17
 - [2026-11-17-l2-d15041](2026-11-17-l2-d15041.md): L2: a declared type parameter's binding joins with a later f64 argument, 2026-11-17
 - [2026-11-17-ir-n3-num-intrinsics](2026-11-17-ir-n3-num-intrinsics.md): IR N3: the numeric intrinsics through one plan and legacy's one-instruction tail, 2026-11-17 (lane IR-C)
+- [2026-11-17-slot-store-callres-round-cap](2026-11-17-slot-store-callres-round-cap.md): Place classes: the call-result pass ends on its done set (lane SLOT, 2026-11-17)
+- [2026-11-17-rep-adt-stage3-hole-list-store](2026-11-17-rep-adt-stage3-hole-list-store.md): Rep ADT stage 3: the hole-list class closes (D16722), and three measured declines, 2026-11-17 (lane REP)
+- [2026-11-17-l2-d16898-scope](2026-11-17-l2-d16898-scope.md): L2: what D16898 needs from check, scoped, 2026-11-17
 - [2026-11-16-type-hashcons-s6b34-emit-collect-2](2026-11-16-type-hashcons-s6b34-emit-collect-2.md): Type hash-cons stage 6b, tier 2: emit_collect.vl's union-registration walks, part 2 (lane HASH), 2026-11-16
 - [2026-11-16-store-inst-key-design](2026-11-16-store-inst-key-design.md): The per-call instantiation vector at check (STORE stage (a)), 2026-11-16
 - [2026-11-16-l2-elab-read-query](2026-11-16-l2-elab-read-query.md): L2: the read query moves into the elaboration, and check asks it, 2026-11-16
 - [2026-11-16-ir-p1-print](2026-11-16-ir-p1-print.md): IR P1: `print` through one decision and legacy's own tails, 2026-11-16 (lane IR-C)
 - [2026-11-16-ir-m1-coalesce-plan](2026-11-16-ir-m1-coalesce-plan.md): IR M1: one front door for the `??` ladder, and a global map read with an i32 default, 2026-11-16 (lane IR-C)
-- [2026-11-17-slot-store-callres-round-cap](2026-11-17-slot-store-callres-round-cap.md): Place classes: the call-result pass ends on its done set (lane SLOT, 2026-11-17)
-- [2026-11-17-rep-adt-stage3-hole-list-store](2026-11-17-rep-adt-stage3-hole-list-store.md): Rep ADT stage 3: the hole-list class closes (D16722), and three measured declines, 2026-11-17 (lane REP)
-- [2026-11-17-l2-d16898-scope](2026-11-17-l2-d16898-scope.md): L2: what D16898 needs from check, scoped, 2026-11-17
 - [2026-11-16-union-return-join-accumulator](2026-11-16-union-return-join-accumulator.md): Union return joins grow linearly per return, 2026-11-16 (lane REP)
 - [2026-11-16-union-arm-rows-and-scan-census](2026-11-16-union-arm-rows-and-scan-census.md): Union arm rows in one pass, and the `fnDetectScratch` census, 2026-11-16 (lane REP)
 - [2026-11-16-type-hashcons-s6b36-emit-rep](2026-11-16-type-hashcons-s6b36-emit-rep.md): Type hash-cons stage 6b, tier 2: emit_rep.vl's walk limits (lane HASH), 2026-11-16
@@ -165,7 +306,6 @@ Newest first:
 - [2026-11-16-ir-n2b2a-pop-statement](2026-11-16-ir-n2b2a-pop-statement.md): IR N2b-2a: a `.pop()` statement through legacy's plan and drop tail, 2026-11-16
 - [2026-11-16-ir-n2b1-atom-compare](2026-11-16-ir-n2b1-atom-compare.md): IR N2b-1: atom compare through legacy's own arm decision, 2026-11-16
 - [2026-11-16-ir-n2a-null-box](2026-11-16-ir-n2a-null-box.md): IR N2a: a delivered `null` boxes through legacy's writer, 2026-11-16
-- [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.
 - [2026-11-16-ir-i8b-box](2026-11-16-ir-i8b-box.md): IR I8b+N1 part 1: boxed nullables, the box through legacy's writer, 2026-11-16
 - [2026-11-16-ir-i8b2-sink](2026-11-16-ir-i8b2-sink.md): IR I8b part 2: the union return sink, shared, 2026-11-16
 - [2026-11-16-l2-alias-receiver](2026-11-16-l2-alias-receiver.md): L2: a local alias of a parameter is dispatched per instance, 2026-11-16
@@ -392,7 +532,6 @@ Newest first:
 - [2026-11-15-d16237-map-walk-value-variable](2026-11-15-d16237-map-walk-value-variable.md): D16237: a map walk's value variable is an element of the map, 2026-11-15
 - [2026-11-15-d16234-record-list-per-instance](2026-11-15-d16234-record-list-per-instance.md): D16234, D16236: a generic instance's record-list literal at its own slot fact, 2026-11-15
 - [2026-11-15-const-read-value-width](2026-11-15-const-read-value-width.md): A `const` read beside a radix literal is typed by its value (T2.4), 2026-11-15
-- [2026-11-14-hybrid-return-rule](2026-11-14-hybrid-return-rule.md): The hybrid return rule: design note for the flag day, 2026-11-14
 - [2026-11-15-type-hashcons-s3b-canon-shadow](2026-11-15-type-hashcons-s3b-canon-shadow.md): Type hash-cons stage 3b: a type's canonical id, shadowed beside the emit comparers (lane H), 2026-11-15
 - [2026-11-15-type-hashcons-s2c1-hole-union](2026-11-15-type-hashcons-s2c1-hole-union.md): Type hash-cons stage 2c-1: two open children that meet become one hole (lane H), 2026-11-15
 - [2026-11-15-slot-store-stage-2b-part2-api](2026-11-15-slot-store-stage-2b-part2-api.md): Slot store, stage 2b part 2a: the reader API's first read (lane S, 2026-11-15)
@@ -418,7 +557,6 @@ Newest first:
 - [2026-11-15-d16399-union-field-eq](2026-11-15-d16399-union-field-eq.md): D16399: a union field compares with a member field, in either order, 2026-11-15
 - [2026-11-15-d16395-record-eq-field-sets](2026-11-15-d16395-record-eq-field-sets.md): D16395: `==` over records of different field sets is a check error, 2026-11-15
 - [2026-11-15-d16314-null-list-union-arm](2026-11-15-d16314-null-list-union-arm.md): D16314: a null-only list literal boxes at the arm it is delivered to
-- [2026-11-14-fuzz-nightly-proposal](2026-11-14-fuzz-nightly-proposal.md): The fuzz nightly, proposed: wall time at five sweep sizes and a filed-findings gate, 2026-11-14
 - [2026-11-15-zero-sites-probes](2026-11-15-zero-sites-probes.md): Probes for five unprobed ZERO rows of `goal-scoreboard.vl --sites`, 2026-11-15
 - [2026-11-15-type-hashcons-s2b-hole-column](2026-11-15-type-hashcons-s2b-hole-column.md): Type hash-cons stage 2b: an open collection child is a hole, and a pin solves it (lane H), 2026-11-15
 - [2026-11-15-top-level-callee-first](2026-11-15-top-level-callee-first.md): Top-level statements checked callee-first: four arms, none shipped, 2026-11-15
@@ -440,9 +578,11 @@ Newest first:
 - [2026-11-15-g63-d16366-67](2026-11-15-g63-d16366-67.md): D16366, D16367: a lone literal is its one-member set at a list field and a map key, 2026-11-15
 - [2026-11-15-d16394-record-eq-field-storage](2026-11-15-d16394-record-eq-field-storage.md): D16394: record `==` over fields stored apart, 2026-11-15
 - [2026-11-15-d16391-u8-null-mix](2026-11-15-d16391-u8-null-mix.md): D16391: a `u8[]` spread joined with `null` is refused as every other `u8` mix is, 2026-11-15
+- [2026-11-15-d16316-null-only-list-sibling](2026-11-15-d16316-null-only-list-sibling.md): 2026-11-15 — a list element's null is its built list's, whatever its own stamp says (D16316)
+- [2026-11-14-hybrid-return-rule](2026-11-14-hybrid-return-rule.md): The hybrid return rule: design note for the flag day, 2026-11-14
+- [2026-11-14-fuzz-nightly-proposal](2026-11-14-fuzz-nightly-proposal.md): The fuzz nightly, proposed: wall time at five sweep sizes and a filed-findings gate, 2026-11-14
 - [2026-11-14-rep-adt-stage1b](2026-11-14-rep-adt-stage1b.md): Rep ADT stage 1b, and the stage plan after lane Q's L5 design, 2026-11-14 (lane E)
 - [2026-11-14-k-d16335-hole-call-through-declared-fn](2026-11-14-k-d16335-hole-call-through-declared-fn.md): D16334, D16335: a call through a parameter bound to a declared hole function is that function's call, 2026-11-14
-- [2026-11-15-d16316-null-only-list-sibling](2026-11-15-d16316-null-only-list-sibling.md): 2026-11-15 — a list element's null is its built list's, whatever its own stamp says (D16316)
 - [2026-11-14-fuzz-triage-d16314](2026-11-14-fuzz-triage-d16314.md): Triage of a 50-seed fuzz sweep: 16 unsound shapes, four new rows (D16314-D16317), 2026-11-14
 - [2026-11-14-type-hashcons-s2a-pin-sites](2026-11-14-type-hashcons-s2a-pin-sites.md): Type hash-cons stage 2a: every empty-collection pin goes through one writer (lane H), 2026-11-14
 - [2026-11-14-type-hashcons-s1-binder-slots](2026-11-14-type-hashcons-s1-binder-slots.md): Type hash-cons stage 1 (1a–1d): type parameters are identified by their declaration slot (lane H), 2026-11-14
@@ -571,9 +711,9 @@ Newest first:
 - [2026-11-14-g40-nrm-typed](2026-11-14-g40-nrm-typed.md): D16052: a niche-nullable map value's inner member is read by type, 2026-11-14
 - [2026-11-14-g39-elem-union-row-only](2026-11-14-g39-elem-union-row-only.md): D16032 / D16052: a list arm's element union is read from its row only, 2026-11-14
 - [2026-11-14-d3373-coalesce-nullable-fn](2026-11-14-d3373-coalesce-nullable-fn.md): D3373: `??` over a nullable function value is the closure's own nullable ref, 2026-11-14
+- [2026-11-14-sweep-owed-refusals](2026-11-14-sweep-owed-refusals.md): The sweep accepts an owed refusal, 2026-11-14
 - [2026-11-13-g38-print-plan-count](2026-11-13-g38-print-plan-count.md): D16052: `printUnionPlanCode` counts member types, not atoms, 2026-11-13
 - [2026-11-13-d16008-record-else-remainder](2026-11-13-d16008-record-else-remainder.md): D16008: a record `is` test's `else` arm over an un-annotated parameter reads its remainder, 2026-11-13
-- [2026-11-14-sweep-owed-refusals](2026-11-14-sweep-owed-refusals.md): The sweep accepts an owed refusal, 2026-11-14
 - [2026-11-13-step7-d16032-arm-rows-closure-arm](2026-11-13-step7-d16032-arm-rows-closure-arm.md): Step 7 (lane D, D16032): the arm-row and closure-arm readers read rows, 2026-11-13
 - [2026-11-13-h-d16005-eq-else-hole](2026-11-13-h-d16005-eq-else-hole.md): lane H: an `==` test's else over a hole defers its literal remainder (D16005), 2026-11-13
 - [2026-11-13-h-d1486-ne-narrow](2026-11-13-h-d1486-ne-narrow.md): lane H: a `!=` on a literal discriminant narrows both branches (D1486), 2026-11-13
@@ -602,7 +742,6 @@ Newest first:
 - [2026-11-13-d1885-match-over-open-parameter](2026-11-13-d1885-match-over-open-parameter.md): D1885: `match` over an open parameter type is checked over its arm union, 2026-11-13
 - [2026-11-13-d1680-optchain-map-leaf](2026-11-13-d1680-optchain-map-leaf.md): D1680 and D16035: a standalone `?.` map leaf is the field's map struct's own nullable ref, 2026-11-13
 - [2026-11-13-d15286-empty-spread](2026-11-13-d15286-empty-spread.md): D15286: an empty list literal spread contributes nothing at every spread position, 2026-11-13
-- [2026-11-12-step7-closed](2026-11-12-step7-closed.md): Step 7 closed: §7's L2 and L6 lines deleted, the floors stated as contract, the scoreboard re-baselined, 2026-11-12
 - [2026-11-13-d15975-identity-design](2026-11-13-d15975-identity-design.md): D15975 design: `===`/`!==` reference identity, 2026-11-13
 - [2026-11-13-d15978-flat-sub-word-plan](2026-11-13-d15978-flat-sub-word-plan.md): D15978 plan: a `flat` record's sub-word field has storage semantics, 2026-11-13
 - [2026-11-13-d16033-nullable-variant-eq](2026-11-13-d16033-nullable-variant-eq.md): D16033: a nullable record compares with the bare record once a union holding it is declared, 2026-11-13
@@ -742,7 +881,6 @@ Newest first:
 - [2026-11-13-step7-d6-code0-fit-by-type](2026-11-13-step7-d6-code0-fit-by-type.md): Step 7 D6: the code-0 fit test reads the record's field types, 2026-11-13
 - [2026-11-13-step7-d6-arm-field-row-by-type](2026-11-13-step7-d6-arm-field-row-by-type.md): Step 7 D6: a union arm's record field interns its row from the field's element type, 2026-11-13
 - [2026-11-13-step7-cloned-is-test-by-type](2026-11-13-step7-cloned-is-test-by-type.md): Step 7: a cloned `is` test keeps its elaborated type, 2026-11-13
-- [2026-11-12-step7-g-slices-by-type](2026-11-12-step7-g-slices-by-type.md): Step 7, L6: two of lane G's union readers by type, 2026-11-12
 - [2026-11-13-step7-vkind-struct-elem-name-by-type](2026-11-13-step7-vkind-struct-elem-name-by-type.md): Step 7, lane H: the FC_STRUCT element name producers, 2026-11-13
 - [2026-11-13-step7-vkind-field-elem-hint-cut-2](2026-11-13-step7-vkind-field-elem-hint-cut-2.md): Step 7, lane H: field element hints, cut 2, 2026-11-13
 - [2026-11-13-step7-union-reg-box-atoms](2026-11-13-step7-union-reg-box-atoms.md): Step 7 L6 (lane G, cut 7a): the box-atom retags and three dead spellings read member sets, 2026-11-13
@@ -756,6 +894,8 @@ Newest first:
 - [2026-11-13-step7-l2-mono-typed-key-floors](2026-11-13-step7-l2-mono-typed-key-floors.md): Step 7 L2: two of the typed instance key's three named floors, 2026-11-13
 - [2026-11-13-step7-l2-mono-anon-pin-by-type](2026-11-13-step7-l2-mono-anon-pin-by-type.md): Step 7 L2: the anonymous-pin discriminator reads the pin's type, 2026-11-13
 - [2026-11-13-step7-call-union-name-and-declared-union-by-type](2026-11-13-step7-call-union-name-and-declared-union-by-type.md): A call's union name carries its row; a declared union reads its alias members by type, 2026-11-13
+- [2026-11-12-step7-closed](2026-11-12-step7-closed.md): Step 7 closed: §7's L2 and L6 lines deleted, the floors stated as contract, the scoreboard re-baselined, 2026-11-12
+- [2026-11-12-step7-g-slices-by-type](2026-11-12-step7-g-slices-by-type.md): Step 7, L6: two of lane G's union readers by type, 2026-11-12
 - [2026-11-12-w311-d6-walk-by-type](2026-11-12-w311-d6-walk-by-type.md): Step 7 L2 D6: the shape walk takes a type, not a spelling, 2026-11-12
 - [2026-11-12-step7-vkind-print-union-members-by-type](2026-11-12-step7-vkind-print-union-members-by-type.md): Step 7, lane H: the print plan's union members by type, 2026-11-12
 - [2026-11-12-step7-vkind-field-elem-hint-by-type](2026-11-12-step7-vkind-field-elem-hint-by-type.md): Step 7, lane H: the interner's field recorders pass the element type, 2026-11-12
@@ -1542,3 +1682,4 @@ Newest first:
 - [2026-10-25-scoreboard-baselines](2026-10-25-scoreboard-baselines.md): Scoreboard baselines (76a3eb8fd) (was §4.1).
 - [2026-10-25-first-landings-findings](2026-10-25-first-landings-findings.md): Findings and decisions from the first landings (was §3.1).
 - [2026-10-25-evidence-witness-family](2026-10-25-evidence-witness-family.md): Evidence: the witness family, its root cause, and the pipeline survey (was §1.1–§1.3).
+- [status-history](status-history.md): the per-PR record the architecture-target Status table carried until 2026-11-10.

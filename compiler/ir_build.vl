@@ -147,6 +147,7 @@ import {
   dispatchDeclinesTail,
   eqRouteOf,
   exprPrePathWhy,
+  fieldNullOwnOf,
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
@@ -161,6 +162,8 @@ import {
   globalInitArmUnboxes,
   globalReadRecovers,
   holeBoxTyAt,
+  hostCallNamed,
+  hostCallPlanOf,
   idxStorePlainWhy,
   ifExprJoinVt,
   ifExprPlainWhy,
@@ -253,6 +256,7 @@ import {
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
   njDispatches,
+  recoveredReadTyOf,
   tagIsArmOf,
   widenPlanOf,
 } from "./emit_plan_union"
@@ -750,7 +754,8 @@ function objLitAt(
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
     if why != "" { return irBMiss(why) }
     const mark = b.length
-    const v = deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi))
+    const own = fieldExplicitNullOwn(arm, row, fi, valIx)
+    const v = if own >= 0 { repTemp(b, { nuAt: valIx, nuOwn: own }, valIx, ks[k]) } else { deliver(b, valIx, ks[k], fieldSiteTy(arm, row, fi)) }
     if ibMiss != "" { return v }
     if irBOpRep(v) != ks[k] { return irBMiss("object field coercion") }
     if oi > 0 && ifBelowLead(b, mark, "short-circuit field after another") {
@@ -839,6 +844,12 @@ function fieldPlainWhy(
     return ""
   }
   const fa = structFieldArmOf(row, fi, valIx, ibFnIx, false)
+  if fa == "explicitNull" {
+    const own = fieldNullOwnOf(row, fi)
+    if own < 0 { return "object field explicitNull typed null" }
+    if !nullOwnRepFits(own, dst) { return "object field explicitNull rep" }
+    return ""
+  }
   if !fieldArmDelivers(fa) { return "object field " + fa }
   if fa == "armDelivery" && narrowedArmNeedsUnbox(valIx, ibFnIx) {
     return "object field arm unbox"
@@ -856,6 +867,31 @@ function fieldPlainWhy(
     return "object field recovery"
   }
   return ""
+}
+
+// The null struct field `fi` of row `row` takes for its explicit `null` value `valIx`, as
+// legacy's `emitOmittedFieldNull` writes it (`fieldNullOwnOf`), or -1 where the field takes a value.
+function fieldExplicitNullOwn(
+  arm: ObjLitArm,
+  row: i32,
+  fi: i32,
+  valIx: i32,
+): i32 {
+  if arm != "struct" { return -1 }
+  if structFieldArmOf(row, fi, valIx, ibFnIx, false) != "explicitNull" {
+    return -1
+  }
+  return fieldNullOwnOf(row, fi)
+}
+
+// Whether rep `dst` holds the null `own` (`NULL_OWN_*`) names, as the verifier's `RNullOf` rule
+// reads it: a union box, a `K | null`, a `boolean | null`, a `string | null` or a nullable ref.
+function nullOwnRepFits(own: i32, dst: i32): boolean {
+  if own == NULL_OWN_BOX { return repNodeAt(dst) is RBox || boxedNullable(dst) }
+  if own == NULL_OWN_ATOM { return atomNullable(dst) }
+  if own == NULL_OWN_BOOL { return boolNullable(dst) }
+  if own == NULL_OWN_STR { return strNullable(dst) }
+  return own == NULL_OWN_NONE && refNullable(dst)
 }
 
 // A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
@@ -1757,10 +1793,12 @@ function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
 // environment, a cell, or a global capture misses.
 function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
-  if irEnvCached(fe) || cloCellReaches(fe, ibFnIx) {
-    irBMiss("closure env cache")
+  if cloCellReaches(fe, ibFnIx) {
+    irBMiss("closure env cell")
     return out
   }
+  // A cached environment is built inside the slot's test, so each capture is a variable read there.
+  const cached = irEnvCached(fe)
   const self = fnStmtsPosOf(ibFnIx)
   for name in captureNamesOf(fe) {
     const r = capRepOf(fe, name)
@@ -1792,6 +1830,10 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
     }
     if v < 0 || ib.irVars[v].vRep != r {
       irBMiss("closure env capture")
+      return out
+    }
+    if cached && ib.irVars[v].vKind == "temp" {
+      irBMiss("closure env cache copy")
       return out
     }
     const o: Opnd = { ov: v }
@@ -1826,6 +1868,18 @@ function narrowedLocalRead(
     && own.rnInner == rep
     && identReadArmOf(n, ix, ibFnIx, false) == "local"
   ) {
+    // A read the checker left at the cell's nullable type (an assignment's re-read) recovers
+    // to its non-null member: an atom, whose recover writes no `ref.as_non_null` to decide.
+    const ty = heldTy(exprTyOf(ix))
+    const inner = recoveredReadTyOf(ty)
+    if (
+      repNodeOfTy(ty) != rep
+      && repNodeAt(rep) is RAtom
+      && inner >= 0
+      && repNodeOfTy(inner) == rep
+    ) {
+      return irBLetTempTy(b, { rcV: o, rcAt: ix }, ix, rep, inner)
+    }
     return irBLetTemp(b, { rcV: o, rcAt: ix }, ix, rep)
   }
   // A union-box local read at one atom the checker narrowed it to, on legacy's `unbox` arm.
@@ -1947,6 +2001,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
+  if hostCallNamed(c, ibFnIx) { return hostCallRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
   }
@@ -2331,6 +2386,35 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const op: StrOp = if many { "fromcps" } else { "fromcp" }
   const r: Rhs = { soOp: op, soArgs: [a], soAt: ix }
+  return r
+}
+
+// A host call as legacy's arm writes it (`emitCallCoreHost`): each argument as it stands, one the
+// plan widens already at its kind's prim, then the import's `call`. A plan legacy refuses is a miss.
+function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const pl = hostCallPlanOf(c)
+  if pl.hpFail != "" || pl.hpImport < 0 { return missRhs("host call plan") }
+  const at = b.length
+  const args: Opnd[] = []
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("host call operand") }
+  if ifBelowLead(b, at, "host call short-circuit operand") {
+    return missRhs("host call short-circuit operand")
+  }
+  let i = 0
+  while i < args.length {
+    const k = pl.hpKinds[i]
+    if k != 0 && repPrim(irBOpRep(args[i])) != numKindPrim(k) {
+      return missRhs("host call operand coercion")
+    }
+    i = i + 1
+  }
+  const r: Rhs = {
+    chImport: pl.hpImport,
+    chArgs: args,
+    chVoid: pl.hpVoid,
+    chNever: callEndsNever(ix),
+  }
   return r
 }
 
@@ -3552,6 +3636,7 @@ function arrayLit(
     mlKind: lb.lbKind,
     mlSlot: lb.lbSlot,
     mlAt: ix,
+    mlArm: arm,
   }
   if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
   return irBLetTemp(b, r, ix, lrep)
@@ -4953,8 +5038,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   // A nested function declaration is lifted, and writes nothing where it stands, unless it
   // drops a cached environment.
   if n is FuncDecl {
+    // A cached environment is dropped here, so each execution declares a new function value.
     if irEnvCached(fnStmtsPosOf(ix)) {
-      return skip("nested function env cache")
+      irBNode(b, { efRhs: { edFn: fnStmtsPosOf(ix) } }, -1, ibNoValue, ix)
     }
     return 0
   }
@@ -5439,9 +5525,29 @@ function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
     if live != "" { return "legacy context live: " + live }
   }
   const sv = ibSave()
-  const why = lowerNodeIn(ix, fnIx, ty, probe)
+  const why = lowerNodeIn(ix, fnIx, ty, probe, -1, -1)
   ibRestore(sv)
   return why
+}
+
+// Global `gi`'s constant initializer (statement `gst`) lowered onto the buffer the global section
+// is writing: its value delivered at the cell's rep, as a start body's initializer is, with no
+// frame. "" when written; else the miss, nothing written.
+export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) || g.letInit < 0 { return "const cell not a binding" }
+  const sv = ibSave()
+  const why = lowerNodeIn(g.letInit, -1, -1, probe, gi, gst)
+  ibRestore(sv)
+  return why
+}
+
+// The claim seam for global `gi`'s constant initializer: unarmed and every node in a claimed family,
+// the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
+export function irClaimConstCell(gi: i32, gst: i32): boolean {
+  if ibArmed || irLowerConstCell(gi, gst, false) != "" { return false }
+  count("claimed const cell")
+  return true
 }
 
 // Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
@@ -5467,6 +5573,34 @@ export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
   return count("node-in " + irAstKind(ix) + ": " + row)
 }
 
+// Under the armed shadow, global `gi`'s constant initializer `ix` (statement `gst`, arm `arm`),
+// legacy's bytes for it from `from` on, lowered as a fragment: `const cell <arm> <kind>: matched`
+// or `miss <why>`, and a differ as `mismatch bytes: const cell <arm> <kind>`.
+export function irConstCellShadow(
+  gi: i32,
+  gst: i32,
+  ix: i32,
+  from: i32,
+  arm: string,
+): i32 {
+  if !ibArmed { return 0 }
+  const live = legacyContextLiveWhy(ix)
+  const cur = wTarget([])
+  const why = irLowerConstCell(gi, gst, true)
+  const got = wTarget(cur)
+  // The dual emit's control 3 adds a byte to the fragment, which must turn a match into a differ.
+  if ibCorrupt == 3 && why == "" { got.push(1) }
+  const at = arm + " " + irAstKind(ix)
+  if why == "" && !bytesFrom(cur, from, got) {
+    // A differ is a mismatch, so the corpus baseline and the bytes veto see it.
+    const hex = if ibDetail { " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got) } else { "" }
+    return count("mismatch bytes: const cell " + at + hex)
+  }
+  const row = if why != "" { "miss " + why } else { "matched" }
+  const under = if live != "" { " under " + live } else { "" }
+  return count("const cell " + at + ": " + row + under)
+}
+
 // The held-coercion control (`irShadowCorrupt(6)`): the guard read with the mark on the fragment's
 // root, then on its enclosing function, an ancestor; the first must name it and the second not.
 function heldControl(ix: i32, fnIx: i32) {
@@ -5489,7 +5623,14 @@ function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
   return true
 }
 
-function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+function lowerNodeIn(
+  ix: i32,
+  fnIx: i32,
+  ty: i32,
+  probe: boolean,
+  cellGi: i32,
+  cellSt: i32,
+): string {
   const gen = repNodeGen()
   // An append the fragment holds reads the accumulator rows, which a rescan would rewrite under
   // legacy's own emit of this body. A constant initializer holds no assignment.
@@ -5517,10 +5658,11 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
   const top: i32[] = []
-  const out = irBExpr(top, ix)
+  // A const cell's value is delivered at the cell's rep, as `globalInit` delivers a start body's.
+  const out = if cellSt >= 0 { globalInitValue(top, cellGi, cellSt, ix) } else { irBExpr(top, ix) }
   ib.irBody = top
   if ibMiss != "" { return ibMiss }
-  const want = repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) })
+  const want = if cellSt >= 0 { globalRep(cellGi, cellSt) } else { repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) }) }
   if irBOpRep(out) != want { return "fragment rep" }
   if repNodeGen() != gen { return "rep epoch moved" }
   const v = irVerify(ib)
@@ -5537,6 +5679,8 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
       return "local cell rep"
     }
   }
+  // A const cell ships as a function does: only when every node is in a claimed family.
+  if cellSt >= 0 && !probe && !claimable() { return "unclaimed family" }
   return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 
