@@ -1249,10 +1249,10 @@ run(2.5)
 });
 
 // A record literal on legacy's layout path builds field by field and matches, a widened `f64`
-// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) stays a
-// named miss.
+// field included; a box handed to a box field whose union retags a member (`i32` to `f64`) builds
+// as the box and its retag (`RCoerce`).
 Deno.test({
-  name: "ir shadow: a record literal builds, a widened field too; a box retagged into a wider union is a named miss",
+  name: "ir shadow: a record literal builds, a widened field too, and a box retagged into a wider union",
   ignore,
   fn: () => {
     const src = `type P = { x: i32, y: string }
@@ -1270,11 +1270,8 @@ if d.v is f64 { print(d.v) }
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 2 || rows.get("covered") !== 2) {
-      throw new Error(`want mk and mkq covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (rows.get("uncovered pre-path coercion") !== 1) {
-      throw new Error(`want mkd's i32-to-f64 retag a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want mk, mkq and mkd covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -1480,7 +1477,7 @@ const PRE_PATHS: [string, string][] = [
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
   ],
   [
-    "coercion",
+    "coercion recCopy",
     `type K = { f: i64 }\nfunction mk() { return { f: 4 } }\nfunction main() {\n  const k: K = mk()\n  const y = mk()\n  print(y.f)\n  print(k.f)\n}\nmain()\n`,
   ],
 ];
@@ -2559,7 +2556,7 @@ Deno.test({
 
 // A nullable record field takes its value at the field's rep where no arm unbox is owed, for a
 // plain record and a union arm: a nullable parameter and a narrowed local. An arm narrowed out of
-// a union arrives boxed, and its unbox is a named miss; so is an explicit `null`.
+// a union arrives boxed, and its unbox is a named miss; an explicit `null` takes the field's typed null.
 Deno.test({
   name: "ir shadow: a nullable record field's value matches, and an owed arm unbox is a named miss",
   ignore,
@@ -2613,8 +2610,8 @@ print(qnull().o == null)
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field explicitNull typed null") ?? 0) !== 2) {
-      throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered object field explicitNull typed null")) {
+      throw new Error(`want hnull and qnull's typed null built, got ${JSON.stringify([...rows])}`);
     }
   },
 });
