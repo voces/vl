@@ -3,9 +3,10 @@
 These are surface questions that the spec found unsettled. For each one, either no ruling
 covers it, or two sources disagree. Each question names the chapter rule that raises it,
 gives what the compiler does today, and lists options with a code sample apiece. It ends
-with a recommendation. The spec states only today's behaviour until the owner rules. A
-ruled question moves to `DECISIONS.md`, and the chapter's `Open question:` line becomes a
-`Ruling:` line.
+with a recommendation. The spec states only today's behaviour until the question is ruled.
+The coordinator rules (CLAUDE.md §Rulings); the owner may overrule. A ruled question moves to
+`DECISIONS.md`, naming who ruled, and the chapter's `Open question:` line becomes a `Ruling:`
+line.
 
 ## The questions in the order to rule them
 
