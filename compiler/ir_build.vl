@@ -318,7 +318,12 @@ import {
   instTyOrSelf,
   narrowedArmNeedsUnbox,
 } from "./emit_plan_coerce"
-import { ifJoinAdaptsScalar, letIfInitSinks, retRefusedWhy } from "./wasmEmit"
+import {
+  arrLitIsForIter,
+  ifJoinAdaptsScalar,
+  letIfInitSinks,
+  retRefusedWhy,
+} from "./wasmEmit"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -1276,14 +1281,17 @@ function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty0: i32): Opnd {
   return o
 }
 
-// The box local or parameter Ident `ix` reads, at its own box rep whatever its narrowing.
+// The box local, parameter or walk variable Ident `ix` reads, at its own box rep whatever its
+// narrowing.
 export function irBBoxLocal(ix: i32): Opnd {
   const d = identDeclOf(ix)
   const w = localIndexOf(ibFnIx, ix)
   if d < 0 || w < 0 { return irBMiss("box receiver") }
   const dn = nodeAt(d)
-  if !(dn is LetDecl || dn is Param) { return irBMiss("box receiver") }
-  const v = if dn is Param { paramVarAt(w) } else { irBDeclVar(d) }
+  if !(dn is LetDecl || dn is Param || dn is LoopVar) {
+    return irBMiss("box receiver")
+  }
+  const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { ibDeclVar[d] ?? -1 } else { irBDeclVar(d) }
   // A nullable union (discipline 4) is held in the same `{tag, payload}` box.
   if v < 0 || !heldAsBox(ib.irVars[v].vRep) { return irBMiss("box receiver") }
   const o: Opnd = { ov: v }
@@ -3993,8 +4001,13 @@ function arrayLit(
   // A packed list's elements are built as plain i32s, which its backing truncates.
   const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
+  // A `for` iterable's signed number literal at a number element is one immediate, as legacy's
+  // hoist reads it whole; at any other element (a numeric union's box) it is delivered.
+  const ep = repPrim(er) ?? ""
+  const forIter = arrLitIsForIter(ix)
+    && (ep == "i32" || ep == "i64" || ep == "f32" || ep == "f64")
   for e in n.arrElems {
-    const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else { deliver(b, e, er, -1) }
+    const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
@@ -5089,6 +5102,15 @@ function signedLitAt(lit: i32, rep: i32): Opnd {
   return o
 }
 
+// Whether `ix` is a number literal under any parentheses and minus signs (`signedLitAt`'s shape).
+function isSignedNumLit(ix: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 { return false }
+  const n = nodeAt(x)
+  if n is NumLit { return true }
+  return n is Unary && n.unOp == "-" && isSignedNumLit(n.unArg)
+}
+
 function assignTo(b: i32[], n: BinExpr, ix: i32) {
   const t = nodeAt(n.binLeft)
   if t is Index { return elemStore(b, n, t, ix) }
@@ -5280,12 +5302,15 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   if mr >= 0 && g < 0 && !mapRecvRepOk(irBOpRep(l), mr) {
     return skip("for in map receiver rep")
   }
-  // A list walks its elements; a string its code points, each an i32; a map its keys or values.
+  // A list walks its elements, a byte list's each read unsigned as an i32; a string its code
+  // points, each an i32; a map its keys or values.
   const lr = irBOpRep(l)
   const ln = repNodeAt(lr)
   const lpr = repPrim(lr)
   let er = -1
-  if ln is RList { er = ln.rlsElem }
+  if ln is RList {
+    er = if repPrim(ln.rlsElem) == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
+  }
   if lpr != null && lpr == "str" { er = repNodeOfTy(TY_I32) }
   if mr >= 0 { er = repNodeOfTy(forInElemTyOf(n.fiIter, ibFnIx)) }
   if er < 0 { return skip("for in operand coercion") }
