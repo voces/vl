@@ -29,6 +29,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  RCoerce,
   REnvDrop,
   REnvGet,
   RFieldNull,
@@ -44,10 +45,12 @@ import {
   RListGet,
   RListLen,
   RListNew,
+  RListNewDefault,
   RListPop,
   RListPush,
   RListSlice,
   RListStage,
+  RLitArms,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -64,6 +67,7 @@ import {
   RNumCast,
   RNumIntr,
   RNumWiden,
+  ROmitNull,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -127,7 +131,7 @@ import {
 import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { Call, i32ToStr, nodeAt } from "./ast"
+import { Call, Ident, P, i32ToStr, nodeAt } from "./ast"
 import {
   simdCallRow,
   simdMemBase,
@@ -138,7 +142,7 @@ import {
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
-import { fnFallThroughPadOf } from "./wasmEmit"
+import { fnFallThroughPadOf, memAccessPlanOf } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -648,6 +652,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RListNewDefault => {
+      use(r.ldLen, at)
+      if opRep(r.ldLen) != vfI32 {
+        return fail(2, at, "a list length is an i32")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a zeroed list is a list")
+      }
+      0
+    }
     RListNew => {
       use(r.lnLen, at)
       use(r.lnFill, at)
@@ -659,18 +673,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
-    RMemAccess => {
-      for o in r.mmArgs { use(o, at) }
-      for o in r.mmArgs {
-        if opRep(o) != vfI32 {
-          return fail(2, at, "a memory access's address and value are i32s")
-        }
-      }
-      if r.mmArgs.length == 1 && dst >= 0 && dst != vfI32 {
-        return fail(2, at, "a memory load is an i32")
-      }
-      0
-    }
+    RMemAccess => memAccessCheck(r, dst, at)
     RListCopy => {
       for o in r.lcArgs { use(o, at) }
       if r.lcArgs.length != 5 {
@@ -744,6 +747,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         || nulSrc && !nulDst
       ) {
         return fail(2, at, "an atom decode is not of an atom into a string")
+      }
+      0
+    }
+    ROmitNull => {
+      const d = repNodeAt(dst)
+      if !(d is RNullable) && !(d is RBox) {
+        return fail(
+          2,
+          at,
+          "an omitted field's null is not delivered into a nullable or a box",
+        )
       }
       0
     }
@@ -829,6 +843,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RCoerce => use(r.cvV, at)
     RToBox => {
       use(r.bxV, at)
       // Legacy's box writer may leave an immediate unread, so one stands only for an effect-free node.
@@ -967,6 +982,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       // The lowering reads the receiver once per arm read, so it is a variable, not a temp.
       if !(r.lfV is OVar) || !(repNodeAt(opRep(r.lfV)) is RBox) {
         return fail(2, at, "a list arms' emptiness test reads a box variable")
+      }
+      0
+    }
+    RLitArms => {
+      use(r.liV, at)
+      if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
+      // `atomEq` reads its operand once per member, so it is a variable, not a temp.
+      if (r.liArm == "atomEq" || r.liArm == "memberEq") && !(r.liV is OVar) {
+        return fail(2, at, "a literal arms test re-reads a variable")
       }
       0
     }
@@ -1330,6 +1354,34 @@ function coalBoxWhy(n: SCoalBox): string {
 
 // Why a nullable reference's `??` is ill-formed, or "": it reads a nullable reference, and its out
 // is that reference, its non-null inner, or a join's box.
+// A niche cell's `??` reads its niche (an atom's, or `boolean | null`'s) and writes the niche or
+// its present value.
+function coalNicheWhy(n: SCoalBox): string {
+  const lr = opRep(n.cbL)
+  const ln = repNodeAt(lr)
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a niche cell's `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  if n.cbArm == "litUnion" {
+    if !(ln is RNullable) || ln.rnDisc != 3 {
+      return "an atom niche's `??` reads no atom niche"
+    }
+    if or != lr && or != ln.rnInner {
+      return "an atom niche's `??` yields neither the niche nor its atom"
+    }
+    return ""
+  }
+  if !repBoolNiche(lr) {
+    return "a `boolean | null` `??` reads no boolean niche"
+  }
+  if or != lr && repPrim(or) != "bool" {
+    return "a `boolean | null` `??` yields neither the niche nor a boolean"
+  }
+  return ""
+}
+
 function coalNulRefWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if !(lr is RNullable) || lr.rnDisc == 4 || lr.rnInner < 0 {
@@ -1632,6 +1684,7 @@ function stmt(id: i32, prev: i32) {
         "popOr" => coalPopOrWhy(n)
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "nulRef" => coalNulRefWhy(n)
+        "litUnion" | "nulBool" => coalNicheWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1768,20 +1821,20 @@ function touchesList(n: IrNode): boolean {
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
     SAssign |
-      SSetField |
-      SCellSet |
-      SGlobalSet |
       SBlock |
-      SLoop |
-      SForIn |
-      SIf |
-      SSwitch |
-      SCoalBox |
       SBr |
-      SReturn |
-      STrap |
+      SCellSet |
+      SCoalBox |
       SDrop |
-      SRawOp => false
+      SForIn |
+      SGlobalSet |
+      SIf |
+      SLoop |
+      SRawOp |
+      SReturn |
+      SSetField |
+      SSwitch |
+      STrap => false
   }
 }
 
@@ -1796,6 +1849,31 @@ function simdMemCheck(r: RSimd, dst: i32, at: i32, base: i32) {
   }
   if dst >= 0 && (base == 2 || repPrim(dst) != "v128") {
     return fail(2, at, "a SIMD load is a v128 and a store has no value")
+  }
+  return 0
+}
+
+// A memory access's address at i32, a store's value at its width's prim (`memAccessPlanOf`), and a
+// load's result at that prim; a store has no value.
+function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
+  uses(r.mmArgs, at)
+  const c = nodeAt(r.mmAt)
+  const ok = c is Call && c.callFn >= 0 && c.callFn < P.nodes.length
+  const f = if ok && c is Call { nodeAt(c.callFn) } else { null }
+  const pl = memAccessPlanOf(if f is Ident { f.identName } else { "" })
+  const a = r.mmArgs
+  if pl.mxBase < 1 || a.length != pl.mxBase || opRep(a[0]) != vfI32 {
+    return fail(2, at, "a memory access's address is an i32")
+  }
+  if pl.mxBase == 2 && repPrim(opRep(a[1])) != pl.mxPrim {
+    return fail(2, at, "a memory store's value is at its width's prim")
+  }
+  if dst >= 0 && (pl.mxBase == 2 || repPrim(dst) != pl.mxPrim) {
+    return fail(
+      2,
+      at,
+      "a memory load is at its width's prim and a store has no value",
+    )
   }
   return 0
 }
@@ -1838,72 +1916,76 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp |
-      RCall |
-      RCallRef |
-      RCallHost |
-      RTest |
+    RAtomEq |
+      RAtomStr |
       RBoxField |
-      RSharedRead |
       RBoxNarrow |
-      RRecover |
+      RBundlePick |
+      RCall |
+      RCallHost |
+      RCallRef |
       RCast |
-      RTagOf |
-      RMakeRec |
-      RGetField |
-      RMakeList |
-      RSpread |
-      RListNew |
-      RListCopy |
-      RMemAccess |
-      RListLen |
-      RListPush |
-      RListStage |
-      RListPop |
-      RListClear |
-      RMapFilter |
-      RListSlice |
-      RMapOp |
-      RMapNew |
-      RMapSet |
-      RMapGetOr |
-      RMapGet |
-      RMapHas |
-      RPrint |
-      RNumIntr |
-      RSimd |
-      RCoalStr |
+      RCellGet |
+      RCellNew |
       RCoalAtomStr |
-      RTagStash |
-      RTagIs |
-      RStashSet |
+      RCoalStr |
+      RCoerce |
+      REnvDrop |
+      REnvGet |
+      RFieldNull |
+      RFnId |
+      RGetField |
+      RGlobalGet |
+      RListCat |
+      RListClear |
+      RListCopy |
       RListEmpty |
       RListEmptyArms |
-      RStrOp |
-      RNumWiden |
-      RNumCast |
-      RToBox |
-      RRetag |
-      RAtomStr |
-      RNullOf |
-      RFieldNull |
-      RRetNull |
-      RNulTest |
-      RAtomEq |
-      RUnionEq |
       RListEq |
-      RListCat |
+      RListLen |
+      RListNew |
+      RListNewDefault |
+      RListPop |
+      RListPush |
+      RListSlice |
+      RListStage |
+      RLitArms |
       RMakeClo |
-      RFnId |
-      RCellNew |
-      RCellGet |
-      RGlobalGet |
-      REnvGet |
-      REnvDrop |
-      RBundlePick |
+      RMakeList |
+      RMakeRec |
+      RMapFilter |
+      RMapGet |
+      RMapGetOr |
+      RMapHas |
+      RMapNew |
+      RMapOp |
+      RMapSet |
+      RMemAccess |
+      RNulTest |
+      RNullOf |
+      RNumCast |
+      RNumIntr |
+      RNumWiden |
+      ROmitNull |
+      RPrimOp |
+      RPrint |
       RRawOp |
+      RRecover |
       RRel |
-      RStage => false
+      RRetNull |
+      RRetag |
+      RSharedRead |
+      RSimd |
+      RSpread |
+      RStage |
+      RStashSet |
+      RStrOp |
+      RTagIs |
+      RTagOf |
+      RTagStash |
+      RTest |
+      RToBox |
+      RUnionEq => false
   }
 }
 
