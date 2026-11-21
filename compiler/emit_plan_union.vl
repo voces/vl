@@ -156,6 +156,7 @@ import {
   instanceReadTyOf,
   listIsRecvTyOf,
   localIndexOf,
+  mapDeliveriesRecorded,
   memReadNarrowOp,
   memReadUnboxAtomKind,
   memberUnionFieldNameRead,
@@ -2286,7 +2287,11 @@ function holePrimKind(pn: PrimName): i32 {
 // or rebuilt on the way, else `ladder`.
 function holePassPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const ladder = holeBox("ladder", -1, -1)
-  if exprNullableMap(exprIx, fnIx) || nodeIsNumUnion(exprIx, fnIx) {
+  // A numeric union passes as its box unless legacy re-boxes it member by member.
+  if (
+    exprNullableMap(exprIx, fnIx)
+    || numUnionMinted && numUnionReboxes(exprIx, unionTy, fnIx)
+  ) {
     return ladder
   }
   if narrowBoxWideArmOf(unionTy, exprIx, fnIx) >= 0 { return ladder }
@@ -3081,6 +3086,49 @@ function identReadsUnionBox(name: string, exprIx: i32, fnIx: i32): boolean {
     || capturedIsUnionBox(fnIx, name)
     || identChainTyBoxedUnion(exprIx, fnIx, 4))
   return r
+}
+
+// The value-atom kind of numeric primitive type `t` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
+export function njKindOfTy(t: i32): i32 {
+  if tyPrimNameOf(t) == null { return -1 }
+  const k = boxTagOfTy(t)
+  if k == 0 || k == 3 || k == 4 || k == 5 { return k }
+  return -1
+}
+
+// The destination kind a numeric member of kind `k` is stored at in a union of kinds `dk`: its
+// own, else the one it widens to exactly (`i64` then `f64` for `i32`, `f64` for `f32`); -1 none.
+export function njStoreKind(k: i32, dk: i32[]): i32 {
+  for d in dk {
+    if d == k { return k }
+  }
+  let w: i32[] = []
+  if k == 0 { w = [3, 4] }
+  if k == 5 { w = [4] }
+  for c in w {
+    for d in dk {
+      if d == c { return c }
+    }
+  }
+  return -1
+}
+
+// Whether numeric union `ix` delivered into union `unionTy` is re-boxed member by member
+// (`emitNumUnionRebox`): every member stores at a kind the box holds, and one at a wider kind. A
+// delivery the checker recorded a re-tag for is re-tagged instead. Legacy and the IR ask it.
+export function numUnionReboxes(ix: i32, unionTy: i32, fnIx: i32): boolean {
+  if !nodeIsNumUnion(ix, fnIx) { return false }
+  if mapDeliveriesRecorded() && deliveryRetagHas(ix) { return false }
+  const dk: i32[] = []
+  if !msMemberValKindsOf(msSetOfTyAny(unionTy), dk) { return false }
+  let needs = false
+  for m in njMembersOf(ix, fnIx) {
+    const k = njKindOfTy(m)
+    const sk = njStoreKind(k, dk)
+    if sk < 0 { return false }
+    if sk != k { needs = true }
+  }
+  return needs
 }
 
 // Whether the value at `ix` is a union of numeric primitives (`njMembersOf`).
