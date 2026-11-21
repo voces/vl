@@ -6323,12 +6323,11 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
       1
     }
     "boxLits" | "numBox" => {
-      const bt = if arm == "boxLits" { tyLitMemberTexts(t) } else { tyNumLitMemberTexts(t) }
+      const bt = litIsBoxLexes(isIx, arm)
       let bI = 0
       while bI < bt.length {
-        const lit = if arm == "boxLits" { quoteLex(bt[bI]) } else { bt[bI] }
-        if emitUnionLitIs(nd0.isObj, lit, fnIx) < 0 { return -1 }
-        if bI > 0 { fbI32Bin(114) }
+        if emitUnionLitIs(nd0.isObj, bt[bI], fnIx) < 0 { return -1 }
+        memberOrTail(bI)
         bI = bI + 1
       }
       1
@@ -6348,6 +6347,17 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
     }
     "none" => emitFail("emitProgram: internal: an `is` literal arm with no lowering")
   }
+}
+
+// The literals the box arms of `is` test `isIx` compare, in order: `boxLits`' quoted members, or
+// `numBox`' number members; none at any other arm.
+export function litIsBoxLexes(isIx: i32, arm: LitIsArm): string[] {
+  const t = isVarTyIxOf(isIx)
+  if arm == "numBox" { return tyNumLitMemberTexts(t) }
+  const out: string[] = []
+  if arm != "boxLits" { return out }
+  for m in tyLitMemberTexts(t) { out.push(quoteLex(m)) }
+  return out
 }
 
 // After a ref niche's operand: its null test, negated unless `is` test `isIx` tests `null`.
@@ -10775,19 +10785,45 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   // Teed at the first read rather than pre-emitted at the top: the receiver must be evaluated
   // where the original code evaluated it, so any context the surrounding lowering seeded is still
   // in force, and so the static-false fold below still evaluates it exactly once.
-  const isStash = unionLitIsStashSlot()
+  unionLitIsStashSlot()
+  const p = unionLitIsPlanOf(objIx, lit, fnIx)
+  return match p.ulArm {
+    "noSet" => emitFail("emitProgram: literal `is` over a union with no recorded members")
+    "noArm" => emitFail(
+      "emitProgram: literal `is` over a union with no arm of the literal's rep",
+    )
+    "never" => if emitExpr(objIx, fnIx) < 0 { -1 } else { unionLitNeverTail() }
+    "tag" => {
+      if emitExpr(objIx, fnIx) < 0 { return -1 }
+      unionLitTagHead(p)
+      if !p.ulOnce {
+        if emitExpr(objIx, fnIx) < 0 { return -1 }
+      }
+      unionLitPayloadTail(p, lit, fnIx)
+    }
+  }
+}
+
+// How `emitUnionLitIs` tests a box against literal `lit`: no recorded members, no arm of the
+// literal's rep in a box that cannot hold it (both refused), a rep with no arm (statically false),
+// or the tag test then the payload compare; `ulLak` the literal's ABI code, `ulOnce` a stash.
+export type UnionLitIsArm = "noSet" | "noArm" | "never" | "tag"
+export type UnionLitIsPlan = {
+  ulArm: UnionLitIsArm,
+  ulLak: i32,
+  ulOnce: boolean,
+}
+
+export function unionLitIsPlanOf(
+  objIx: i32,
+  lit: string,
+  fnIx: i32,
+): UnionLitIsPlan {
   const isOnce = !unionEqOperandOk(objIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
   const usid = msSetOfUnionBox(objIx, fnIx)
-  // D1047 — the empty-name reject stays ahead of the atom ladder. The ladder's i64-widening rung
-  // and the mixed-union gate below both ask `unionHasAtomK`, whose fall-through fails loudly on
-  // an unregistered row, and a receiver whose union has no name has no row at all. The message is
-  // the condition's own; the branch is a floor, unreached by the tests and by the corpus.
-  if usid < 0 {
-    return emitFail(
-      "emitProgram: literal `is` over a union with no recorded members",
-    )
-  }
+  const noSet: UnionLitIsPlan = { ulArm: "noSet", ulLak: 0, ulOnce: isOnce }
+  if usid < 0 { return noSet }
   // The literal's rep atom: a quoted lexeme is a string, a float f64, an integer i32 — widening
   // to i64 when out of range or when the union's only integer arm is i64, the `emitUnionCoerce`
   // default. The ladder settles the ABI code alongside the spelling, and the map is a bijection
@@ -10828,36 +10864,45 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   // union is testable against a scalar literal over the same tag-then-payload shape. The compare
   // is arm-agnostic, so a struct or container arm simply has a tag that does not match. Widened
   // only where the literal's own rep has an arm, which the static-false fold below already trusts.
+  const noArm: UnionLitIsPlan = { ulArm: "noArm", ulLak: lak, ulOnce: isOnce }
   if (
     msIsValueUnion(usid) != 1
     && msSetCarriesLitUnionArm(usid) != 1
     && !litHasArm
   ) {
-    return emitFail(
-      "emitProgram: literal `is` over a union with no arm of the literal's rep",
-    )
+    return noArm
   }
-  if !litHasArm {
-    if emitExpr(objIx, fnIx) < 0 { return -1 }
-    fbDrop() // 0x1a drop
-    fbI32Const(0)
-    return 0
-  }
-  // `lak` decides the tag, the payload unbox and the three constant-emit arms below — one code,
-  // five projections.
-  if emitExpr(objIx, fnIx) < 0 { return -1 }
-  if isOnce { fbLocalTee(isStash) }
+  const arm: UnionLitIsArm = if litHasArm { "tag" } else { "never" }
+  const plan: UnionLitIsPlan = { ulArm: arm, ulLak: lak, ulOnce: isOnce }
+  return plan
+}
+
+// After a box whose literal's rep has no arm: the box dropped, the answer 0.
+export function unionLitNeverTail() {
+  fbDrop()
+  fbI32Const(0)
+  return 0
+}
+
+// After the box: its tag tested against the literal's rep, opening the `if` whose then arm reads
+// the box again, here the stash when plan `p` stashes it.
+export function unionLitTagHead(p: UnionLitIsPlan) {
+  const s = unionLitIsStashSlot()
+  if p.ulOnce { fbLocalTee(s) }
   fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  fbI32Rel(RS_TAG, scalarTagOfKind(lak))
+  fbI32Rel(RS_TAG, scalarTagOfKind(p.ulLak))
   fbI32Bin(70)            // 0x46 i32.eq
   fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
-  if isOnce { fbLocalGet(isStash) }
-  else if emitExpr(objIx, fnIx) < 0 { return -1 }
+  if p.ulOnce { fbLocalGet(s) }
+}
+
+// After the box again: its payload unboxed and compared with literal `lit`, else 0.
+export function unionLitPayloadTail(p: UnionLitIsPlan, lit: string, fnIx: i32) {
+  const lak = p.ulLak
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   if emitUnionPayloadUnbox(lak) < 0 { return -1 }
   if lak == 2 {
-    // The literal lexeme rides a synthesized `StrLit` (same shape as `strText`).
-    if emitStrEqLit(mkStr(lit, -1), fnIx) < 0 { return -1 }
+    if strMemberEqTail(lit, fnIx) < 0 { return -1 }
   } else if lak == 4 {
     fbF64Const(lit)
     fbI32Bin(97) // 0x61 f64.eq
