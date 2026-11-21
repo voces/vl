@@ -3109,6 +3109,33 @@ function identityNullTestVisit(n: BinExpr) {
   return 0
 }
 
+// A call the checker repointed to the function a record field always holds (`r.f(3)` becomes
+// `twice(3)`, a minted callee the parse bank may since have dropped) still reads the receiver
+// its own tokens name, `r . f ( … )`: the binding and its field are marked read (D17043). Any
+// other token shape marks nothing.
+function repointedReceiverRead(call: i32) {
+  if call < 0 || call >= nodeToks.length { return 0 }
+  let t = nodeToks[call]
+  if t < 3 || t >= P.toks.length || P.toks[t].text != ")" { return 0 }
+  let depth = 0
+  while t >= 0 {
+    const x = P.toks[t].text
+    if x == ")" { depth = depth + 1 }
+    if x == "(" { depth = depth - 1 }
+    if depth == 0 { break }
+    t = t - 1
+  }
+  if t < 3 || P.toks[t - 1].kind != "IDENT" || P.toks[t - 2].text != "." {
+    return 0
+  }
+  if P.toks[t - 3].kind != "IDENT" { return 0 }
+  // As a `x.m(…)` callee reads them: the receiver read and passed on, the property read.
+  const nid = lnFind(P.toks[t - 3].text)
+  bindMarkId(nid, 0)
+  nuRead[P.toks[t - 1].text] = true
+  return nuNoteIdent(-1, nid)
+}
+
 // Record the node-local names — the callee `Ident` of a `Call`, any bare `Ident` value
 // reference, and operator-method dispatch — into the name map, and resolve `Ident`
 // occurrences to their binding.
@@ -3119,10 +3146,12 @@ function nameVisit(ix: i32) {
     // native parser does not desugar at parse time, so `x.m(…)` stays
     // `Call { callFn: Member(x, "m") }` and the property is the UFCS method name the
     // call dispatches to.
+    if n.callFn >= P.nodes.length { repointedReceiverRead(ix) }
     if n.callFn >= 0 && n.callFn < P.nodes.length {
       const fn = nodeAt(n.callFn)
       if fn is Ident {
         refNamesAdd(fn.identName)
+        if fn.pos < 0 { repointedReceiverRead(ix) }
       } else if fn is Member {
         nuNoteCallee(n.callFn, fn)
         refNamesAdd(fn.memProp)
@@ -5562,6 +5591,7 @@ const klRhs = [
   "RFnId",
   "RGetField",
   "RGlobalGet",
+  "RJoinNull",
   "RListCat",
   "RListClear",
   "RListCopy",
@@ -5598,6 +5628,7 @@ const klRhs = [
   "RPrimOp",
   "RPrint",
   "RRawOp",
+  "RRecCopyPure",
   "RRecover",
   "RRel",
   "RRetNull",
@@ -5727,7 +5758,11 @@ const klCoalNicheArm = [
 const klCoalValArm = [
   "boolPop", "valBox", "valScalar", "valNoKind", "elem", "callBox",
   "callScalar", "callNoKind", "next", "popOr", "mapIndexGetOr", "nulRef",
-  "litUnion", "nulBool",
+  "litUnion", "nulBool", "fieldBox", "fieldVal",
+]
+// `CoalFieldArm` — compiler/wasmEmit.vl
+const klCoalFieldArm = [
+  "none", "ambiguous", "narrowed", "noKind", "boxed", "unbox",
 ]
 // `CoalBoxArm` — compiler/emit_plan_null.vl
 const klCoalBoxArm = [
@@ -5864,8 +5899,10 @@ const klVariantCoerceArm = [
 const klIsPreArm = [
   "storage", "tautology", "covers", "fits", "prim", "pin", "test",
 ]
+// `BoxNarrowArm` — compiler/ir_build.vl
+const klBoxNarrowArm = ["none", "variant", "atom", "container", "box"]
 // `NullNarrowArm` — compiler/ir_build.vl
-const klNullNarrowArm = ["none", "plain", "atom", "miss"]
+const klNullNarrowArm = ["none", "plain", "held", "miss"]
 // `IfJoinArm` — compiler/emit_plan_if_join.vl
 const klIfJoinArm = ["null", "atom", "union", "ref", "scalar"]
 // One closed set: its name, 1 when its members are type names (`x is TyObj`) and 0 when string
@@ -5916,6 +5953,11 @@ const klSets: KlSet[] = [
     ksType: 0,
     ksMembers: klAtomHookArm,
   },
+  {
+    ksName: "BoxNarrowArm",
+    ksType: 0,
+    ksMembers: klBoxNarrowArm,
+  },
   { ksName: "BtKind", ksType: 0, ksMembers: klBtKind },
   {
     ksName: "CallRefArgArm",
@@ -5942,6 +5984,11 @@ const klSets: KlSet[] = [
     ksName: "CoalBoxArm",
     ksType: 0,
     ksMembers: klCoalBoxArm,
+  },
+  {
+    ksName: "CoalFieldArm",
+    ksType: 0,
+    ksMembers: klCoalFieldArm,
   },
   {
     ksName: "CoalNicheArm",
@@ -6697,6 +6744,7 @@ const klFields: KlField[] = [
   { kfName: "caCaps", kfSet: "Opnd" },
   { kfName: "cbArm", kfSet: "CoalValArm" },
   { kfName: "cbL", kfSet: "Opnd" },
+  { kfName: "cfArm", kfSet: "CoalFieldArm" },
   { kfName: "cgCell", kfSet: "Opnd" },
   { kfName: "chArgs", kfSet: "Opnd" },
   { kfName: "cnInit", kfSet: "Opnd" },
@@ -6725,6 +6773,7 @@ const klFields: KlField[] = [
   { kfName: "idArm", kfSet: "IsPreArm" },
   { kfName: "ijArm", kfSet: "IfJoinArm" },
   { kfName: "irNodes", kfSet: "IrNode" },
+  { kfName: "jnKind", kfSet: "VKind" },
   { kfName: "kind", kfSet: "TokKind" },
   { kfName: "lRhs", kfSet: "Rhs" },
   { kfName: "lcArgs", kfSet: "Opnd" },
