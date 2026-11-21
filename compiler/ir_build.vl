@@ -2321,7 +2321,8 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     const cellRep = globalRep(g, d)
-    const narrowed = cellRep != rep && globalReadNarrows(ix, cellRep, rep)
+    const narrowed = cellRep != rep
+      && nullNarrowArmOf(ix, cellRep, rep) == "plain"
     if cellRep != rep && !narrowed { return irBMiss("global read coercion") }
     const gm = irGlobalReadMiss(g, ibGlobalCtx())
     if gm != "" { return irBMiss(gm) }
@@ -2494,27 +2495,18 @@ function narrowedLocalRead(
     return irBLetTemp(b, { bnV: o, bnAt: ix, bnRep: rep, bnAtom: -1 }, ix, rep)
   }
   // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
-  if (
-    own is RNullable
-    && own.rnInner == rep
-    && identReadArmOf(n, ix, ibFnIx, false) == "local"
-  ) {
-    // A read the checker left at the cell's nullable type (an assignment's re-read) recovers
-    // to its non-null member: an atom, whose recover writes no `ref.as_non_null` to decide.
-    const ty = heldTy(exprTyOf(ix))
-    const inner = recoveredReadTyOf(ty)
-    if (
-      repNodeOfTy(ty) != rep
-      && repNodeAt(rep) is RAtom
-      && inner >= 0
-      && repNodeOfTy(inner) == rep
-    ) {
-      return irBLetTempTy(b, { rcV: o, rcAt: ix }, ix, rep, inner)
-    }
-    // Any other recover to a rep the read's type is not would mint a temp of the nullable type.
-    if repNodeOfTy(ty) != rep { return irBMiss("nullable read recover") }
-    return irBLetTemp(b, { rcV: o, rcAt: ix }, ix, rep)
+  const na = if identReadArmOf(n, ix, ibFnIx, false) == "local" { nullNarrowArmOf(ix, ib.irVars[v].vRep, rep) } else { "none" }
+  if na == "atom" {
+    return irBLetTempTy(
+      b,
+      { rcV: o, rcAt: ix },
+      ix,
+      rep,
+      recoveredReadTyOf(heldTy(exprTyOf(ix))),
+    )
   }
+  if na == "miss" { return irBMiss("nullable read recover") }
+  if na == "plain" { return irBLetTemp(b, { rcV: o, rcAt: ix }, ix, rep) }
   // A union-box local read at one atom the checker narrowed it to, on legacy's `unbox` arm.
   if (
     (own is RBox || own is RNullable && own.rnDisc == 4)
@@ -2554,14 +2546,22 @@ function paramVarAt(w: i32): i32 {
   return -1
 }
 
-// Whether global read `ix` is the non-null reference `rep` of its nullable reference cell
-// `cellRep`, as the checker narrowed it: legacy writes the cell's read and `emitReadRecover`.
-function globalReadNarrows(ix: i32, cellRep: i32, rep: i32): boolean {
+// How read `ix` of a cell at rep `cellRep` takes the non-null member `rep` the checker narrowed it
+// to, for a local's and a global's read alike: "plain" the cell's read and legacy's recover, "atom"
+// an atom recovered from a read the checker left nullable, "miss" any other recover, "none" when
+// the cell is no niche of `rep` (a union box, discipline 4, is unboxed by another arm).
+type NullNarrowArm = "none" | "plain" | "atom" | "miss"
+function nullNarrowArmOf(ix: i32, cellRep: i32, rep: i32): NullNarrowArm {
   const c = repNodeAt(cellRep)
-  return c is RNullable
-    && c.rnInner == rep
-    && (strNullable(cellRep) || refNullable(cellRep))
-    && repNodeOfTy(heldTy(exprTyOf(ix))) == rep
+  if !(c is RNullable) || c.rnInner != rep || c.rnDisc == 4 { return "none" }
+  const ty = heldTy(exprTyOf(ix))
+  if repNodeOfTy(ty) == rep { return "plain" }
+  const inner = recoveredReadTyOf(ty)
+  if repNodeAt(rep) is RAtom && inner >= 0 && repNodeOfTy(inner) == rep {
+    return "atom"
+  }
+  // Any other recover to a rep the read's type is not would mint a temp of the nullable type.
+  return "miss"
 }
 
 // The rep of global `g`, declared at `d`, noted in `ib`; -1 when it is no scalar.
