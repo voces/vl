@@ -143,11 +143,7 @@ import {
   tyProvesNonNull,
 } from "./check_relate_core"
 import { listDisjointDepth, listFitLitLeafOf } from "./check_type_shape"
-import {
-  inferRetFnKey,
-  isDeadArm,
-  mapDeliveryRecorded,
-} from "./check_side_rows"
+import { inferRetFnKey, isDeadArm } from "./check_side_rows"
 import { u8LexValue } from "./check_literals"
 import { isPatTyIxOf, isVarTyIxOf, luMembersAt } from "./check_list_union"
 import {
@@ -343,7 +339,6 @@ import {
   mkIf,
   mkIndex,
   mkMember,
-  mkNull,
   mkStr,
   nodeAt,
   nodeChildren,
@@ -1578,6 +1573,7 @@ import {
 } from "./emit_collect"
 import {
   cboxIsWriteLet,
+  mkNullTestNe,
   voidTwinForNode,
   voidTwinTargetOf,
 } from "./emit_rewrite"
@@ -1802,15 +1798,18 @@ import {
   msSetOfUnionBox,
   narrowBoxWideArmOf,
   njDispatches,
+  njKindOfTy,
   njLitBasesOf,
   njMembersOf,
   njSideTyOf,
+  njStoreKind,
   nodeIsNumUnion,
   nulNicheIsTestImpossible,
   nulRecvNeedsRecover,
   nullInstanceIsResult,
   numIsPlanOf,
   numPrimOfKind,
+  numUnionReboxes,
   readMayBeNulUnit,
   sFieldElemTyIxOfRow,
   scalarAtomNameOfKind,
@@ -8166,13 +8165,26 @@ function emitUnionMapArmBox(
   }
   const sh = mapShapeOfExpr(exprIx, fnIx)
   if !unionHasMapArmSlot(unionTy, sh) { return 0 }
+  if !nullable { return mapArmBoxHead(unionTy, exprIx, fnIx) }
   const tag = mapBoxTagOf(sh, unionTy, exprIx, fnIx)
   if tag < 0 { return -1 }
-  if nullable { return emitNulMapArmBox(tag, exprIx, "", -1, -1, fnIx) }
-  fbI32Rel(RS_TAG, tag)
-  if emitExpr(exprIx, fnIx) < 0 { return -1 }
-  fbStructNew(uBoxIdx) // { tag, map struct ref }
-  return 1
+  return emitNulMapArmBox(tag, exprIx, "", -1, -1, fnIx)
+}
+
+// The head of closure `exprIx` boxed into union `unionTy`: its closure arm's tag, by the closure's
+// own function type where it names one. The closure and the `struct.new` follow.
+function cloArmBoxHead(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const own = cloBoxOwnFnTy(exprIx, fnIx)
+  const arm = if own >= 0 { own } else { unionClosureArmTyOfTy(unionTy) }
+  return fbI32Rel(RS_TAG, cloArmTagOfTy(arm))
+}
+
+// The head of map `exprIx` boxed into union `unionTy` under its map arm's tag: the tag, or -1
+// where the arm names none. The value and the `struct.new` follow (`emitHoleBox`'s `map`).
+function mapArmBoxHead(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const tag = mapBoxTagOf(mapShapeOfExpr(exprIx, fnIx), unionTy, exprIx, fnIx)
+  if tag < 0 { return -1 }
+  return fbI32Rel(RS_TAG, tag)
 }
 
 // A `M | null` value into a box holding `M`: the map arm's box, or when the value is null the
@@ -8812,15 +8824,15 @@ function emitUnionCoerceList(
   // with a bare-closure arm: the closure fat-pointer struct, a `structref` subtype, rides the
   // box anyref directly, tagged by the closure arm's `scalarTagOf` (value-atom kind 11).
   // Checked before the ladder below, whose scalar branches would store the ref in a value box.
-  if unionName != "" && exprIsClosure(exprIx, fnIx) {
-    const clArm = unionClosureArmTyOfTy(uTy)
-    if clArm >= 0 {
-      const own = cloBoxOwnFnTy(exprIx, fnIx)
-      fbI32Rel(RS_TAG, cloArmTagOfTy(if own >= 0 { own } else { clArm }))
-      if emitExpr(exprIx, fnIx) < 0 { return -1 }
-      fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
-      return 0
-    }
+  if (
+    unionName != ""
+    && exprIsClosure(exprIx, fnIx)
+    && unionClosureArmTyOfTy(uTy) >= 0
+  ) {
+    cloArmBoxHead(uTy, exprIx, fnIx)
+    if emitExpr(exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
+    return 0
   }
   // A scalar-element list literal (`["a"]`, `[1]`, invisible to `exprRefArray`) whose union arm
   // is a union-box-element ref-array: route it through the arm's build and tag. Checked before
@@ -8977,6 +8989,8 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
+    "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
+    "clo" => cloArmBoxHead(p.hbKind, exprIx, fnIx)
     "lit" => {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
@@ -8989,7 +9003,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" | "refList" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "refList" | "map" | "clo" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "pass" | "memberBox" | "ladder" => 0
@@ -9014,6 +9028,8 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     || p.hbArm == "atomStr"
     || p.hbArm == "rec"
     || p.hbArm == "refList"
+    || p.hbArm == "map"
+    || p.hbArm == "clo"
   ) {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
@@ -12452,7 +12468,7 @@ function listKindElemKind(k: ListKind): VKind {
 // A run of plain elements as its own `ArrayLit`, built at holder `h`'s type, or at its holder's
 // when `h` is an untyped minted run (D16696). It reports at the spread literal's position: a
 // synthesized node otherwise takes the parser's last cursor, at the end of the file.
-function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
+export function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
   const up = elabSpreadRunHolderOf(h)
@@ -38590,14 +38606,6 @@ let njBlockKind: VKind = "i32"
 let njLLit = false
 let njRLit = false
 
-// The value-atom kind of numeric primitive type `t` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
-function njKindOfTy(t: i32): i32 {
-  if tyPrimNameOf(t) == null { return -1 }
-  const k = boxTagOfTy(t)
-  if k == 0 || k == 3 || k == 4 || k == 5 { return k }
-  return -1
-}
-
 // Whether the value at `ix` is a two-base integer-literal union rather than a numeric union: its
 // members are constants, so an operator over it computes at the common width `i64` (D3512).
 function njIsLitSide(ix: i32, fnIx: i32): boolean {
@@ -38908,23 +38916,6 @@ function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
   return 0
 }
 
-// The destination kind a numeric member of kind `k` is stored at in a union of kinds `dk`: its
-// own, else the one it widens to exactly (`i64` then `f64` for `i32`, `f64` for `f32`); -1 none.
-function njStoreKind(k: i32, dk: i32[]): i32 {
-  for d in dk {
-    if d == k { return k }
-  }
-  let w: i32[] = []
-  if k == 0 { w = [3, 4] }
-  if k == 5 { w = [4] }
-  for c in w {
-    for d in dk {
-      if d == c { return c }
-    }
-  }
-  return -1
-}
-
 // A numeric union at `ix` delivered to the union `unionName` that lacks one of its members but
 // holds a member it widens to: re-boxed member by member. 1 done, 0 not this shape, -1 failure.
 function emitNumUnionRebox(
@@ -38933,20 +38924,10 @@ function emitNumUnionRebox(
   unionTy: i32,
   fnIx: i32,
 ): i32 {
-  if unionName == "" || !nodeIsNumUnion(ix, fnIx) { return 0 }
-  // A delivery the checker recorded a re-tag for is re-tagged as it is emitted.
-  if mapDeliveryRecorded && deliveryRetagHas(ix) { return 0 }
+  if unionName == "" || !numUnionReboxes(ix, unionTy, fnIx) { return 0 }
   const ms = njMembersOf(ix, fnIx)
   const dk: i32[] = []
-  if !msMemberValKindsOf(msSetOfTyAny(unionTy), dk) { return 0 }
-  let needs = false
-  for m in ms {
-    const k = njKindOfTy(m)
-    const sk = njStoreKind(k, dk)
-    if sk < 0 { return 0 }
-    if sk != k { needs = true }
-  }
-  if !needs { return 0 }
+  msMemberValKindsOf(msSetOfTyAny(unionTy), dk)
   const key = njDepth * 2
   njDepth = njDepth + 1
   const bs = njStash(ix, true, key, fnIx)
@@ -41527,7 +41508,7 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   elseS.push(e.binRight)
   const pos = e.pos
   const ifIx = mkIf(
-    mkBinary("!=", e.binLeft, mkNull("null", pos), pos),
+    mkNullTestNe(e.binLeft, pos),
     mkBlock(thenS, pos),
     mkBlock(elseS, pos),
     pos,

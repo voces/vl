@@ -8,6 +8,31 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-21-ir-walk-element-kinds](2026-11-21-ir-walk-element-kinds.md): IR: a walk over bytes, nested string or byte lists, variants, nullables and wide scalars (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-tag-dispatch-ref](2026-11-21-ir-tag-dispatch-ref.md): IR: a tagged call's reference result, 2026-11-21
+- [2026-11-21-ir-shadow-stash-frame](2026-11-21-ir-shadow-stash-frame.md): The door probe allocates from legacy's starting scratch frame (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-open-fn-closure](2026-11-21-ir-open-fn-closure.md): IR: an open function type at the uniform closure rep is held (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-null-unit-field](2026-11-21-ir-null-unit-field.md): IR: a `null`-unit record field takes its slot's null, 2026-11-21
+- [2026-11-21-ir-null-test-typed](2026-11-21-ir-null-test-typed.md): IR: the rewrite's desugared null test is typed, 2026-11-21
+- [2026-11-21-ir-member-arm-heap](2026-11-21-ir-member-arm-heap.md): IR: a nullable arm field read at its heap, and a parenthesised receiver, 2026-11-21
+- [2026-11-21-ir-let-if-per-arm](2026-11-21-ir-let-if-per-arm.md): IR: a binding's `if` initializer written per arm, all four rungs, 2026-11-21
+- [2026-11-21-ir-is-null-rung-static](2026-11-21-ir-is-null-rung-static.md): IR coverage: an `is` test at the null-test rung, or with a static answer (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-indirect-call](2026-11-21-ir-indirect-call.md): IR: closure calls by any expression, captured direct calls, their arguments, 2026-11-21
+- [2026-11-21-ir-i8a-const-cells](2026-11-21-ir-i8a-const-cells.md): I8a: the IR writes a const cell's constant initializer (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-host-call](2026-11-21-ir-host-call.md): IR coverage: host calls as `RCallHost` (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-field-store-value](2026-11-21-ir-field-store-value.md): IR: a field store's value through legacy's one value arm, 2026-11-21
+- [2026-11-21-ir-field-own-null](2026-11-21-ir-field-own-null.md): IR: an explicit `null` record field is the field's own null, 2026-11-21
+- [2026-11-21-ir-field-lit-atom](2026-11-21-ir-field-lit-atom.md): A record field typed by one bare string literal is its atom in the rep tree (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-env-cache](2026-11-21-ir-env-cache.md): IR: a nested function's cached environment, 2026-11-21
+- [2026-11-21-ir-element-stores-nulstr-reads](2026-11-21-ir-element-stores-nulstr-reads.md): IR: element stores into atom, niche, union and nested lists, and `(string | null)[]` reads (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-claimless-gate](2026-11-21-ir-claimless-gate.md): The claim's identity with legacy, enforced at gate time (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-claim-fallbacks-n1](2026-11-21-ir-claim-fallbacks-n1.md): IR: three claim fallbacks `tests/cases` showed and the corpus did not (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-claim-fallbacks](2026-11-21-ir-claim-fallbacks.md): IR: a discarded slice, and a union or numeric global's initializer (2026-11-21)
+- [2026-11-21-coalesce-field-stash](2026-11-21-coalesce-field-stash.md): Legacy: a `??` over a field of an effectful receiver evaluates it once (D17036, 2026-11-21, lane IR-N1)
+- [2026-11-20-ir-u8-value-if](2026-11-20-ir-u8-value-if.md): IR: a `u8`-typed value held at i32 (2026-11-20, lane IR-N2)
+- [2026-11-20-ir-ref-if-record-map](2026-11-20-ir-ref-if-record-map.md): IR: a value `if` joined at a record or map reference (2026-11-20)
+- [2026-11-20-ir-mem-access](2026-11-20-ir-mem-access.md): IR: an i32 memory load or store through one access plan and tail, 2026-11-20
+- [2026-11-20-ir-bare-block](2026-11-20-ir-bare-block.md): IR: a bare block mid-body (2026-11-20, lane IR-N2)
 - [2026-11-21-ir-capture-env](2026-11-21-ir-capture-env.md): IR: closures over an environment, 2026-11-21
 - [2026-11-21-ir-block-tail-stmt](2026-11-21-ir-block-tail-stmt.md): IR: a block body's last statement is a statement (2026-11-21)
 - [2026-11-20-ir4-u8-verify](2026-11-20-ir4-u8-verify.md): IR verifier: a packed list literal's elements (2026-11-20, lane IR4)
