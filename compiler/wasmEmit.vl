@@ -1758,6 +1758,7 @@ import {
   NumIsPlan,
   TagIsArm,
   arrLitRefSlotAtTy,
+  arrLitVariantSlot,
   atomEqPlanOf,
   atomNulStrWhy,
   boxAtomRetagKind,
@@ -2565,7 +2566,7 @@ function emitClosureEnvOf(fe: i32, fnIx: i32, envIdx: i32) {
 }
 
 // Completes a closure of `fe` over the env on the stack: its id and declaration, then the struct.
-function emitClosureIds(fe: i32) {
+export function emitClosureIds(fe: i32) {
   // The one place a wasm function index becomes a closure id, so the one place the
   // address-taken set is recorded: the element section lists exactly these entries, and an
   // id no expression here produces cannot reach a `call_indirect`.
@@ -2578,7 +2579,7 @@ function emitClosureIds(fe: i32) {
 }
 
 // Whether frame `fnIx` reaches `fe`'s cell: it declares `fe`, or its env carries the cell.
-function cloCellReaches(fe: i32, fnIx: i32): boolean {
+export function cloCellReaches(fe: i32, fnIx: i32): boolean {
   if (
     !cloCellUsed
     || fe < 0
@@ -2633,7 +2634,7 @@ function emitCapturedReadRecover(
 // struct (`ref.cast` local 0 to the env, then `struct.get` the field index) and return 1;
 // else return 0 for the caller's param/local/global path. `recoverIx` is the read to recover, -1
 // for the env-to-env copy building a nested closure's frame, where recovering traps a null capture.
-function emitCapturedRead(name: string, fnIx: i32, recoverIx: i32) {
+export function emitCapturedRead(name: string, fnIx: i32, recoverIx: i32) {
   const fi = captureSlotOf(name, fnIx)
   if fi < 0 { return 0 }
   const fe = fnStmtsPosOf(fnIx)
@@ -4137,10 +4138,7 @@ function emitNulIsNullTest(
   }
   if arm == "boxTag" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 0)
-    fbI32Rel(RS_TAG, nullBoxTag())
-    if invert { fbI32Bin(71) } else { fbI32Bin(70) }
-    return 1
+    return nulTestBoxTagTail(invert)
   }
   if arm == "nullRef" || arm == "nulStr" {
     if emitExpr(refIx, fnIx) < 0 { return -1 }
@@ -4150,6 +4148,14 @@ function emitNulIsNullTest(
   // A niche-only test of no niche is no claim.
   if arm == "none" { return 0 }
   return emitFail("emitProgram: internal: a null test arm with no lowering")
+}
+
+// After a union box: its tag compared with `null`'s, `i32.ne` for `invert`. Returns 1.
+export function nulTestBoxTagTail(invert: boolean): i32 {
+  fbStructGet(uBoxIdx, 0)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  if invert { fbI32Bin(71) } else { fbI32Bin(70) }
+  return 1
 }
 
 // After a nullable ref's raw value: `ref.is_null`, then `i32.eqz` for `invert`. Returns 1, the
@@ -12474,6 +12480,14 @@ function emitArrRef(arrIx: i32, elems: i32[], fnIx: i32, lb: ListBuild) {
   if arrLitUnionBoxSlot(arrIx, fnIx, lb) == rslot {
     for e in elems {
       if emitDelivered(e, fnIx) < 0 { return -1 }
+    }
+    return arrLitRefShortTail(rslot, elems.length)
+  }
+  // …and one whose elements each enter a non-null variant's arm as they stand, read by the IR too.
+  if arrLitVariantSlot(arrIx, fnIx, lb) == rslot {
+    const vi = rlElemVariantRow(rslot)
+    for e in elems {
+      if emitVariantCoerce(vi, e, fnIx) < 0 { return -1 }
     }
     return arrLitRefShortTail(rslot, elems.length)
   }
@@ -21476,8 +21490,8 @@ export function ifExprShapeWhy(ifIx: i32, fnIx: i32): string {
 }
 
 // Why the if-expression at `ifIx` is off `emitIfExpr`'s plain scalar path, or "": its shape
-// (`ifExprShapeWhy`), then its join rung, a static `is` or literal-true condition, a prelude, or
-// v128.
+// (`ifExprShapeWhy`), then its join rung (an atom join is plain), a static `is` or literal-true
+// condition, a prelude, or v128.
 export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   const sw = ifExprShapeWhy(ifIx, fnIx)
   if sw != "" { return sw }
@@ -21487,12 +21501,16 @@ export function ifExprPlainWhy(ifIx: i32, fnIx: i32): string {
   if scoped { scopePop() }
   const rung = match p.ijArm {
     "null" => "null join"
-    "atom" => "atom join"
+    "atom" => ""
     "union" => "union"
     "ref" => ""
     "scalar" => ""
   }
   if rung != "" { return rung }
+  // An atom join is `emitIfExprAs` at i32, each arm its value in the atom context.
+  if p.ijArm == "atom" {
+    return if ifJoinDropsNulAtom(ifIx, fnIx, "atom") { "string drops null atom" } else { "" }
+  }
   // A union join with no render name takes a later rung in legacy; the IR lowers no union join.
   if exprUnion(ifIx, fnIx) { return "union" }
   const rk = p.ijRef.rjKind
@@ -32185,6 +32203,13 @@ export function fallThroughPadOf(fnBody: i32, fnIx: i32): string {
   if bodyEndsInReturn(fnBody, fnIx) { return "" }
   if fnRetNullBearing(fnIx) { return "null" }
   return "unreachable"
+}
+
+// `fallThroughPadOf` for function declaration `fnIx`'s own body; "" for any other node.
+export function fnFallThroughPadOf(fnIx: i32): string {
+  if fnIx < 0 || fnIx >= P.nodes.length { return "" }
+  const fd = nodeAt(fnIx)
+  return if fd is FuncDecl { fallThroughPadOf(fd.fnBody, fnIx) } else { "" }
 }
 
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the stack as the
