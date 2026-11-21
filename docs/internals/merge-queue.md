@@ -28,13 +28,15 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
 ## The steps
 
 1. **Merge-tree against the current master**, not the master the lane started from:
-   `git merge-tree --write-tree origin/master <head>`. A conflict means the PR goes back to the lane;
-   the queue does not resolve it.
-2. **Batch disjoint PRs.** PRs whose merge-trees touch no common file are merged into one candidate
-   and gated once. When a batch is red, bisect it by halves. `scripts/queue-candidate.sh <base>
+   `git merge-tree --write-tree origin/master <head>`. The queue resolves a purely additive
+   conflict itself (step 2) and names it in the candidate's merge commit; any other conflict sends
+   the PR back to its lane.
+2. **Batch PRs whose candidate merge-tree builds cleanly** (Q1), not only PRs touching disjoint
+   files. They are merged into one candidate and gated once. When a batch is red, bisect it by halves. `scripts/queue-candidate.sh <base>
    <pr-branch>...` builds the candidate: it resolves a conflict only where both sides add list
-   members at one place (the union, sorted where the list is), and refuses any other, naming the
-   hunk, so that PR goes back to its lane.
+   members at one place (the union, sorted where the list is) or whole single-line arms or type
+   declarations with distinct heads (coordinator ruling, 2026-11-21), checks each resolved file
+   with `vl fmt --check`, and refuses any other, naming the hunk, so that PR goes back to its lane.
 3. **Gate the candidate**: `scripts/gate.sh` (in the queue's worktree, the one place
    `GATE_IN_WORKTREE=1` is set), then `scripts/ir-identity.sh --cases <seed>` on the seed the gate
    built. Read both by exit code.
@@ -48,7 +50,27 @@ mechanical (lists, imports) and so proved by `scripts/gate.sh --fast` plus
 ### Tree equality
 
 A head that only merged master can merge on a prior gate if its tree equals the gated tree. A
-master move that touches only docs or scripts does not invalidate a gate.
+master move that touches only docs or scripts does not invalidate a gate. After a batch merges,
+master's tree must equal the gated tree merged with any such master move; a member dropped from a
+batch means the remaining subset is gated again before it merges.
+
+### Velocity rules (coordinator ruling, 2026-11-21, velocity retro)
+
+For lanes:
+
+- **R1.** A clean merge of master needs no re-check.
+- **R2.** A mechanical resolution (lists, imports) is proved by `scripts/gate.sh --fast` plus
+  `ir-identity.sh --cases` alone.
+- **R3.** `--claimless` runs once per functional change, not per master merge.
+- **R4.** A stack is proved once, at its top.
+
+For the queue:
+
+- **Q1.** A candidate is batched when its merge-tree builds cleanly (step 2).
+- **Q2.** A train departs at 6 to 8 READY PRs, or when the gate has been idle 15 minutes with at
+  least one READY. The next candidate is assembled while the current one is in verify.
+- **Q3.** The queue resolves a purely additive conflict itself: a union of list members in sorted
+  or declared order, or the whole single-line items of step 2. Anything else goes back to the lane.
 
 ### CI proof
 
@@ -80,7 +102,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 
 About every 25 merges the coordinator folds `changelog.d/` (`scripts/changelog-fold.vl`,
 `changelog.d/README.md`) and the refactor notes into architecture-target's Status and the notes
-index, in one docs PR.
+index, in one docs PR. At each fold it also lists every open IR PR that is in no batch, with
+why (Q4).
 
 ## Fuel drift
 
