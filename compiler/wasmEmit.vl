@@ -42661,7 +42661,7 @@ function emitCoalesceIdentBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
     )
     "callNoKind" => emitFail("emitProgram: `??` over a call result has no banked residual kind")
     "next" => {
-      if coalNulRefRungReached(e, lhsIx, fnIx) {
+      if coalNextArmOf(e, lhsIx, exprIx, fnIx) == "nulRefs" {
         emitCoalesceNullableRefs(e, exprIx, fnIx)
       } else {
         emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
@@ -42932,22 +42932,40 @@ export function coalBoxEnd(
   return 0
 }
 
+// Which rung `l ?? d` takes past the boxed arms (`coalBoxArmOf`'s `next`), in legacy's order: a
+// name's or a plain call's nullable-reference cores, a call's `boolean | null` or `string | null`
+// stash, a record field's union box (`coalFieldPlanOf`), else the optional chains and the rest.
+export type CoalNextArm = "nulRefs" | "callBool" | "callStr" | "field" | "opt"
+
+export function coalNextArmOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNextArm {
+  if coalNulRefRungReached(e, lhsIx, fnIx) { return "nulRefs" }
+  const lhs = nodeAt(lhsIx)
+  const cTy = coalStashTy(lhsIx)
+  const stashed = lhs is Call
+    || ((lhs is AsExpr || lhs is IfStmt)
+    && (tyIsNulValueUnionBox(cTy) || nodeTyIsNulScalarBox(lhsIx)))
+  if stashed && exprNulBool(e.binLeft, fnIx) { return "callBool" }
+  if stashed && exprNullableString(e.binLeft, fnIx) { return "callStr" }
+  const fp = coalFieldPlanOf(e, lhsIx, exprIx, fnIx)
+  return if lhs is Member && fp.cfArm != "none" { "field" } else { "opt" }
+}
+
 // The `emitCoalesceGo` arms over a call, `as?` or if-expression operand yielding a
 // `boolean | null` or `string | null` niche, stashed once, then the rest of the ladder. Returns
 // what `emitCoalesceGo` returns.
 function emitCoalesceCallNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
-  const lhs = nodeAt(lhsIx)
-  const cTy = coalStashTy(lhsIx)
-  if (
-    lhs is Call
-    || ((lhs is AsExpr || lhs is IfStmt)
-      && (tyIsNulValueUnionBox(cTy) || nodeTyIsNulScalarBox(lhsIx)))
-  ) {
+  const na = coalNextArmOf(e, lhsIx, exprIx, fnIx)
+  if na == "callBool" || na == "callStr" {
     // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call cannot be
     // re-read, so STASH the single evaluation in the bool slot, then branch on the sentinel
     // 2 — the call analogue of the `boolean | null` ident path, and the default runs only on
     // the null path for the same reason.
-    if exprNulBool(e.binLeft, fnIx) {
+    if na == "callBool" {
       if emitExpr(e.binLeft, fnIx) < 0 {
         return -1 // the niche i32, evaluated ONCE
       }
@@ -42968,7 +42986,7 @@ function emitCoalesceCallNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
     // ref once (raw, by its type), then a value-typed `if` on
     // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
     // of the `string | null` ident path.
-    if exprNullableString(e.binLeft, fnIx) {
+    if na == "callStr" {
       // the raw nullable ref, ONCE
       if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
       fbLocalSet(coalesceCallStrSlot)
