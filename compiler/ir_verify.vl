@@ -16,6 +16,7 @@ import {
   OVar,
   Opnd,
   PStaged,
+  RAsUnion,
   RAtomEq,
   RAtomStr,
   RBoxField,
@@ -59,16 +60,17 @@ import {
   RMapGet,
   RMapGetOr,
   RMapHas,
+  RMapIter,
   RMapNew,
   RMapOp,
   RMapSet,
   RMemAccess,
+  RMemOp,
   RNulTest,
   RNullOf,
   RNumCast,
   RNumIntr,
   RNumWiden,
-  ROmitNull,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -103,6 +105,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
@@ -132,12 +135,20 @@ import {
 import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { Call, Ident, P, i32ToStr, nodeAt } from "./ast"
-import { simdCallRow, simdOperandPrim, simdResultPrim } from "./wasmEmit"
+import { Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
+import {
+  memOpIsVoid,
+  memOpPlanOf,
+  simdCallRow,
+  simdMemBase,
+  simdOperandPrim,
+  simdResultPrim,
+  simdRowIsMem,
+} from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
-import { fnFallThroughPadOf, memAccessPlanOf } from "./wasmEmit"
+import { fnFallThroughPadOf, litArmsReadsOf, memAccessPlanOf } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -513,7 +524,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const boxed = bn is RBox
         || bn is RNullable
         && bn.rnDisc == 4
-        && (r.bnAtom >= 0 || repNodeAt(dst) is RRecord)
+        && (r.bnAtom >= 0 || r.bnCon >= 0 || repNodeAt(dst) is RRecord)
       if !boxed {
         return fail(2, at, "a narrowed variant read's operand is a box")
       }
@@ -535,8 +546,24 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RAsUnion => {
+      use(r.auV, at)
+      // The tag test reads a box; what it yields is the cast's own rep, which the builder takes.
+      if !(repNodeAt(opRep(r.auV)) is RBox) {
+        return fail(2, at, "a union cast's operand is a box")
+      }
+      0
+    }
     RCast => {
       use(r.ctV, at)
+      // A trapping cast narrows a nullable reference to the reference it holds.
+      const on = repNodeAt(opRep(r.ctV))
+      if (
+        r.ctOnFail == "trap"
+        && !(on is RNullable && kidAt(opRep(r.ctV), 0) == r.ctTarget)
+      ) {
+        return fail(2, at, "a trapping cast's operand is its target's nullable")
+      }
       if dst < 0 { return 0 }
       const ok = if r.ctOnFail == "trap" { dst == r.ctTarget } else { repNodeAt(dst) is RNullable && kidAt(dst, 0) == r.ctTarget }
       if !ok { return fail(2, at, "a cast's result is not its target's rep") }
@@ -669,6 +696,24 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMemAccess => memAccessCheck(r, dst, at)
+    RMemOp => {
+      for o in r.moArgs { use(o, at) }
+      for o in r.moArgs {
+        if opRep(o) != vfI32 {
+          return fail(2, at, "a memory op's operands are i32s")
+        }
+      }
+      const c = nodeAt(r.moAt)
+      const v = c is Call && memOpIsVoid(memOpPlanOf(c).moArm)
+      if dst >= 0 && (v || dst != vfI32) {
+        return fail(
+          2,
+          at,
+          "a memory op leaves an i32, or nothing for the bulk pair",
+        )
+      }
+      0
+    }
     RListCopy => {
       for o in r.lcArgs { use(o, at) }
       if r.lcArgs.length != 5 {
@@ -745,24 +790,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
-    ROmitNull => {
+    RFieldNull => {
       const d = repNodeAt(dst)
       if !(d is RNullable) && !(d is RBox) {
         return fail(
           2,
           at,
-          "an omitted field's null is not delivered into a nullable or a box",
-        )
-      }
-      0
-    }
-    RFieldNull => {
-      // A typed null is a nullable reference's.
-      if !(repNodeAt(dst) is RNullable) {
-        return fail(
-          2,
-          at,
-          "a field's typed null is not delivered into a nullable reference",
+          "a field's null is not delivered into a nullable or a box",
         )
       }
       0
@@ -999,8 +1033,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RLitArms => {
       use(r.liV, at)
       if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
-      // `atomEq` reads its operand once per member, so it is a variable, not a temp.
-      if (r.liArm == "atomEq" || r.liArm == "memberEq") && !(r.liV is OVar) {
+      // An operand legacy reads more than once (`litArmsReadsOf`) is a variable.
+      const lt = nodeAt(r.liAt)
+      const reads = if lt is IsExpr { litArmsReadsOf(r.liAt, r.liArm, lt.isObj, vf.irAt) } else { 2 }
+      if reads > 1 && !(r.liV is OVar) {
         return fail(2, at, "a literal arms test re-reads a variable")
       }
       0
@@ -1105,6 +1141,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RMapIter => {
+      use(r.miV, at)
+      if !(repNodeAt(opRep(r.miV)) is RMap) {
+        return fail(2, at, "a map's keys or values are read off a map")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a map's keys or values are a list")
+      }
+      0
+    }
     RMapHas => {
       use(r.mhKey, at)
       if !mapRecvOk(r.mhSym, r.mhLoc, at) {
@@ -1185,7 +1231,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
-      if dst >= 0 && dst != g {
+      const gn = repNodeAt(g)
+      const narrowed = r.ggAt >= 0 && gn is RNullable && gn.rnInner == dst
+      if dst >= 0 && dst != g && !narrowed {
         return fail(2, at, "a global's rep is not its destination's")
       }
       0
@@ -1680,6 +1728,38 @@ function stmt(id: i32, prev: i32) {
       vfLabels.pop()
       vfLabelOut.pop()
     }
+    SRangeLoop => {
+      const v = n.rlVar
+      if (
+        v < 0
+        || v >= vf.irVars.length
+        || vf.irVars[v].vKind != "local"
+        || vf.irVars[v].vRep != vfI32
+      ) {
+        return fail(2, id, "a range loop's variable is not an i32 local")
+      }
+      // The lowering checks the copy count against legacy's plan; here each copy has its label.
+      if (
+        n.rlConts.length != n.rlCopies.length
+        || !n.rlPartial && n.rlCopies.length > 0
+      ) {
+        return fail(2, id, "a range loop's copies do not match its labels")
+      }
+      let k = 0
+      while k < n.rlCopies.length {
+        vfLabels.push(n.rlBrk)
+        vfLabelOut.push(-1)
+        labelled(n.rlConts[k], -1, n.rlCopies[k])
+        vfLabels.pop()
+        vfLabelOut.pop()
+        k = k + 1
+      }
+      vfLabels.push(n.rlTailBrk)
+      vfLabelOut.push(-1)
+      labelled(n.rlTailCont, -1, n.rlTail)
+      vfLabels.pop()
+      vfLabelOut.pop()
+    }
     SIf => ifSpine(id)
     SCoalBox => {
       // A fused map read's receiver is read by its probe, which may name a global instead.
@@ -1841,12 +1921,28 @@ function touchesList(n: IrNode): boolean {
       SGlobalSet |
       SIf |
       SLoop |
+      SRangeLoop |
       SRawOp |
       SReturn |
       SSetField |
       SSwitch |
       STrap => false
   }
+}
+
+// A SIMD load's address at i32 and its result at v128; a store's address and vector, and no value.
+function simdMemCheck(r: RSimd, dst: i32, at: i32, base: i32) {
+  const a = r.sdArgs
+  if a.length != base || repPrim(opRep(a[0])) != "i32" {
+    return fail(2, at, "a SIMD access's address is an i32")
+  }
+  if base == 2 && repPrim(opRep(a[1])) != "v128" {
+    return fail(2, at, "a SIMD store's value is a v128")
+  }
+  if dst >= 0 && (base == 2 || repPrim(dst) != "v128") {
+    return fail(2, at, "a SIMD load is a v128 and a store has no value")
+  }
+  return 0
 }
 
 // A memory access's address at i32, a store's value at its width's prim (`memAccessPlanOf`), and a
@@ -1883,6 +1979,7 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
   if !(c is Call) || row < 0 {
     return fail(2, at, "a SIMD op's node is a SIMD call")
   }
+  if simdRowIsMem(row) { return simdMemCheck(r, dst, at, simdMemBase(row)) }
   let k = 0
   let i = 0
   while i < c.callArgs.length {
@@ -1911,7 +2008,8 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RAtomEq |
+    RAsUnion |
+      RAtomEq |
       RAtomStr |
       RBoxField |
       RBoxNarrow |
@@ -1953,16 +2051,17 @@ function rhsReadsList(r: Rhs): boolean {
       RMapGet |
       RMapGetOr |
       RMapHas |
+      RMapIter |
       RMapNew |
       RMapOp |
       RMapSet |
       RMemAccess |
+      RMemOp |
       RNulTest |
       RNullOf |
       RNumCast |
       RNumIntr |
       RNumWiden |
-      ROmitNull |
       RPrimOp |
       RPrint |
       RRawOp |

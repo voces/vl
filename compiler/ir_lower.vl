@@ -1,3 +1,4 @@
+import { blockHasContinueFor } from "./emit_query"
 // The IR lowering (ir-design-2026-11.md §1.6) for I1's node set, and the shadow's dual emit: a
 // covered function's IR is lowered to a code entry, which is compared with the legacy one
 // byte for byte, beside its statement spans. A temp goes back onto the stack at its one use,
@@ -91,6 +92,7 @@ import {
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
 import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
+import { RC_MAP } from "./emit_start_block"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
   IrFn,
@@ -98,6 +100,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RAsUnion,
   RAtomEq,
   RAtomStr,
   RBoxField,
@@ -141,16 +144,17 @@ import {
   RMapGet,
   RMapGetOr,
   RMapHas,
+  RMapIter,
   RMapNew,
   RMapOp,
   RMapSet,
   RMemAccess,
+  RMemOp,
   RNulTest,
   RNullOf,
   RNumCast,
   RNumIntr,
   RNumWiden,
-  ROmitNull,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -185,6 +189,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
@@ -296,6 +301,7 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitAsUnionTagged,
   emitCapturedRead,
   emitClosureIds,
   emitClosureValueCore,
@@ -311,6 +317,8 @@ import {
   emitNullOwn,
   emitNullRetTail,
   emitOmittedFieldNull,
+  emitRangeRolledHead,
+  emitRangeRolledTail,
   emitStrLitAt,
   emitUnionNullToPair,
   emitUnionUnboxTail,
@@ -338,6 +346,7 @@ import {
   forInMapList,
   forInMapStash,
   forInRolledOpen,
+  forRangeTestOf,
   hoistCandRow,
   hoistReadTail,
   hoistRowMark,
@@ -367,7 +376,9 @@ import {
   mapGetOrMvPlain,
   mapGetOrMvTail,
   mapHasTail,
+  mapKeysFrameOf,
   mapLengthPlain,
+  mapListStep,
   mapPrepProbeTail,
   mapRecvIsSet,
   mapRecvKeyTail,
@@ -375,9 +386,15 @@ import {
   mapRecvShapeOf,
   mapSetTail,
   mapSizeTail,
+  mapUnionUnboxTail,
+  mapValsFrameOf,
+  mapValuesAreKeys,
   memAccessPlanOf,
   memAccessTail,
   memAddrPlanOf,
+  memOpIsVoid,
+  memOpPlanOf,
+  memOpTail,
   narrowedMemTail,
   narrowedVariantTail,
   nicheRawIsTail,
@@ -408,6 +425,15 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  rangeMayWrap,
+  rangePartialCopies,
+  rangePartialCopyClose,
+  rangePartialCopyOpen,
+  rangePartialMainClose,
+  rangePartialMainOpen,
+  rangePartialOuterClose,
+  rangePartialOuterOpen,
+  refArrayUnionUnboxTail,
   sFieldStorageSlot,
   sharedArmBoxBody,
   sharedArmBoxHead,
@@ -421,6 +447,9 @@ import {
   sharedReadTail,
   sharedRecvSlotGet,
   simdCallRow,
+  simdMemBase,
+  simdMemTail,
+  simdRowIsMem,
   simdTail,
   spreadGroupStash,
   spreadJoinGroups,
@@ -436,6 +465,7 @@ import {
   unionBoxToPairTail,
   unionLetSinkClose,
   unionUnionEqTail,
+  urLocalRead,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -483,16 +513,25 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  litIsBoxLexes,
   litMemberEqArmOf,
   memberOrTail,
   nulStrMemberClose,
   nulStrMemberGuard,
   nulStrMemberOpen,
   strMemberEqTail,
+  unionLitIsPlanOf,
+  unionLitNeverTail,
+  unionLitPayloadTail,
+  unionLitTagHead,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
-import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
+import {
+  ifLinkYieldsNull,
+  objOrderStashSlot,
+  unionLitIsStashSlot,
+} from "./emit_if_arm_values"
 import { forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
@@ -528,6 +567,7 @@ import {
 import { ListBuild } from "./emit_ref_list_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { globalIndexOfSid } from "./emit_fn_ret_kinds"
+import { i32ListHas } from "./listutil"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -557,6 +597,11 @@ let lwFloors: i32[] = []
 let lwStashAt: i32[] = []
 let lwStashFi: i32[] = []
 let lwStashSlots: i32[] = []
+// The order-stashed literals whose box head their first `RStashSet` wrote, as legacy's tag leads.
+let lwBoxHeadAt: i32[] = []
+// Each order-stashed literal by the out its first source field reads, noted once per function.
+let lwIfHeadAt: {[i32]: i32} = Map()
+let lwIfHeadBuilt = false
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -589,11 +634,11 @@ function tempDefined(v: i32): boolean {
 function tempRhs(v: i32): Rhs {
   // A staged temp is a value on the stack, which no reader may rewrite from its definition.
   if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
-    const none: Rhs = { ggSym: -1, ggNonNull: false }
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
     return none
   }
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
   return none
 }
 
@@ -648,7 +693,8 @@ export function irLOpnd(o: Opnd) {
       const s = varSlot(v)
       if s < 0 { return irLMiss("unmapped slot") }
       leaf()
-      fbLocalGet(s)
+      // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
+      if !urLocalRead(s) { fbLocalGet(s) }
     }
     OImm => {
       leaf()
@@ -659,6 +705,13 @@ export function irLOpnd(o: Opnd) {
       emitStrLitAt(o.osAt, lw.irAt)
     }
   }
+  return 0
+}
+
+// The bytes written since the top live value ended are stack-neutral, as a value set into a local
+// is, so a read of that value still finds it on top.
+function liveNeutral() {
+  if lwLive.length > 0 { lwLiveEnd[lwLive.length - 1] = lwBuf.length }
   return 0
 }
 
@@ -817,7 +870,12 @@ function rhs(r: Rhs, tail: boolean) {
   match r {
     RPrimOp => primOp(r)
     RCall => call(r, tail)
-    RGlobalGet => globalRead(r.ggSym, r.ggNonNull)
+    RGlobalGet => {
+      globalRead(r.ggSym, r.ggNonNull)
+      if r.ggAt >= 0 && readOwesNonNullRecover(r.ggAt, lw.irAt) {
+        fbRefAsNonNull()
+      }
+    }
     RMapGetOr => mapGetOr(r)
     RMapGet => {
       const from = irLAt()
@@ -826,6 +884,7 @@ function rhs(r: Rhs, tail: boolean) {
       got
     }
     RMapHas => mapHas(r)
+    RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
@@ -883,6 +942,12 @@ function rhs(r: Rhs, tail: boolean) {
       atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
     }
     RAtomEq => atomEq(r)
+    RAsUnion => {
+      irLOpnd(r.auV)
+      if emitAsUnionTagged(r.auAt, lw.irAt) < 0 {
+        return irLMiss("union cast tail")
+      }
+    }
     RUnionEq => unionEq(r)
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
@@ -896,12 +961,6 @@ function rhs(r: Rhs, tail: boolean) {
     RNullOf => {
       leaf()
       emitNullOwn(r.nuOwn)
-    }
-    ROmitNull => {
-      leaf()
-      if emitOmittedFieldNull(r.omRow, r.omField) < 0 {
-        return irLMiss("omitted field null")
-      }
     }
     RJoinNull => {
       leaf()
@@ -932,9 +991,15 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RMemOp => memOp(r)
     RCallHost => hostCall(r)
-    RCast |
-      RCellGet |
+    RCast => {
+      // `as!` over a nullable-ref niche: `ref.as_non_null` traps on the miss (D1812).
+      if r.ctOnFail != "trap" { return irLMiss("cast to null") }
+      irLOpnd(r.ctV)
+      fbRefAsNonNull()
+    }
+    RCellGet |
       RCellNew |
       RFnId |
       RMapSet |
@@ -1184,12 +1249,68 @@ function stashSet(r: RStashSet) {
   const row = recRowOf(r.ssAt, r.ssRow, r.ssVariant, true)
   if row < 0 { return irLMiss("record row") }
   const fi = r.ssFi
+  if !i32ListHas(lwBoxHeadAt, r.ssAt) { stashBoxHead(r.ssAt) }
   irLOpnd(r.ssV)
   const slot = stashSlotAt(row, fi, r.ssVariant)
   lwStashAt.push(r.ssAt)
   lwStashFi.push(fi)
   lwStashSlots.push(slot)
   fbLocalSet(slot)
+  return 0
+}
+
+// Where the order-stashed literal at `at` is boxed under a plan that writes a head, that head,
+// ahead of the literal's first field (legacy writes the tag before the literal).
+function stashBoxHead(at: i32) {
+  for n in lw.irNodes {
+    if !(n is SLet) { continue }
+    const r = n.lRhs
+    if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
+    const bx = r.bxAt
+    const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+    if p.hbArm == "rec" || p.hbArm == "obj" {
+      leaf()
+      holeBoxHead(p, bx, lw.irAt)
+      lwBoxHeadAt.push(at)
+    }
+    return 0
+  }
+  return 0
+}
+
+// Where valued `if` node `id` is the first field an order-stashed literal sets, in either stash
+// form, that literal's box head, ahead of the `if` (legacy writes the tag before the literal).
+function stashIfBoxHead(id: i32) {
+  const n = lw.irNodes[id]
+  if !(n is SIf) || n.siOut < 0 { return 0 }
+  if !lwIfHeadBuilt { stashIfHeadsNote() }
+  const at = lwIfHeadAt.get(n.siOut) ?? -1
+  if at < 0 || i32ListHas(lwBoxHeadAt, at) { return 0 }
+  return stashBoxHead(at)
+}
+
+// Notes, once per function, the out each order-stashed literal's first source field reads, by
+// that out: the literal (`stashIfBoxHead`).
+function stashIfHeadsNote() {
+  lwIfHeadBuilt = true
+  const seen: i32[] = []
+  for m in lw.irNodes {
+    if m is SLet {
+      const mr = m.lRhs
+      if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
+        const k0 = mr.mrSrc[0]
+        const f0 = if k0 >= 0 && k0 < mr.mrFields.length { mr.mrFields[k0] } else { null }
+        if f0 is OVar { lwIfHeadAt.set(f0.ov, mr.mrAt) }
+      }
+      continue
+    }
+    if !(m is SEffect) { continue }
+    const r = m.efRhs
+    if !(r is RStashSet) || i32ListHas(seen, r.ssAt) { continue }
+    seen.push(r.ssAt)
+    const sv = r.ssV
+    if sv is OVar { lwIfHeadAt.set(sv.ov, r.ssAt) }
+  }
   return 0
 }
 
@@ -1366,7 +1487,17 @@ function litArms(r: RLitArms) {
       1
     }
     "memberEq" => memberEqLits(r, n.isObj)
-    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "none" => {
+    "boxLits" | "numBox" => {
+      const lexes = litIsBoxLexes(r.liAt, r.liArm)
+      let i = 0
+      while i < lexes.length {
+        if unionLitIs(r, n.isObj, lexes[i]) < 0 { return -1 }
+        memberOrTail(i)
+        i = i + 1
+      }
+      1
+    }
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "memberNoRecv" | "memberTrue" | "none" => {
       irLMiss("literal arms " + r.liArm)
     }
   }
@@ -1380,18 +1511,46 @@ function memberEqLits(r: RLitArms, recvIx: i32) {
   while i < texts.length {
     const lex = quoteLex(texts[i])
     const a = litMemberEqArmOf(recvIx, lex, lw.irAt)
-    if a == "nulStr" { nulStrMemberOpen() }
-    else if a != "str" { return irLMiss("literal member " + a) }
-    irLOpnd(r.liV)
-    if a == "nulStr" { nulStrMemberGuard() }
-    if strMemberEqTail(lex, lw.irAt) < 0 {
-      return irLMiss("literal member compare")
+    if a == "union" {
+      if unionLitIs(r, recvIx, lex) < 0 { return -1 }
+    } else if a == "str" || a == "nulStr" {
+      if a == "nulStr" { nulStrMemberOpen() }
+      irLOpnd(r.liV)
+      if a == "nulStr" { nulStrMemberGuard() }
+      if strMemberEqTail(lex, lw.irAt) < 0 {
+        return irLMiss("literal member compare")
+      }
+      if a == "nulStr" { nulStrMemberClose() }
+    } else {
+      return irLMiss("literal member " + a)
     }
-    if a == "nulStr" { nulStrMemberClose() }
     memberOrTail(i)
     i = i + 1
   }
   return 1
+}
+
+// Box variable `r.liV` tested against literal `lex` as `emitUnionLitIs` writes it: the stash slot,
+// then the box and a static false, or the box, its tag test, the box again and its payload compare.
+function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
+  unionLitIsStashSlot()
+  const p = unionLitIsPlanOf(recvIx, lex, lw.irAt)
+  return match p.ulArm {
+    "never" => {
+      irLOpnd(r.liV)
+      unionLitNeverTail()
+    }
+    "tag" => {
+      irLOpnd(r.liV)
+      unionLitTagHead(p)
+      if !p.ulOnce { irLOpnd(r.liV) }
+      unionLitPayloadTail(p, lex, lw.irAt)
+    }
+    "noSet" | "noArm" => {
+      irLMiss("literal box " + p.ulArm)
+      -1
+    }
+  }
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
@@ -1570,6 +1729,7 @@ function fieldTail(at: i32, m: Member) {
 // `RBoxNarrow`: the box, then legacy's payload cast to the read's variant, as
 // `emitVariantCoerce`'s box arm writes a narrowed read at a variant destination.
 function boxNarrow(r: RBoxNarrow) {
+  if r.bnCon >= 0 { return boxContainerRead(r) }
   if r.bnAtom >= 0 {
     irLOpnd(r.bnV)
     return emitUnionUnboxTail(r.bnAtom)
@@ -1578,6 +1738,22 @@ function boxNarrow(r: RBoxNarrow) {
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
   irLOpnd(r.bnV)
   return narrowedVariantTail(vi)
+}
+
+// `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
+// past the list overrides `emitIdentNode` asks first.
+function boxContainerRead(r: RBoxNarrow) {
+  const e = nodeAt(r.bnAt)
+  if !(e is Ident) { return irLMiss("box container read node") }
+  match identListOverrideOf(e, r.bnAt, lw.irAt) {
+    "luOv" | "fitShadow" => {
+      return irLMiss("list override")
+    }
+    "none" => {}
+  }
+  irLOpnd(r.bnV)
+  if r.bnCon == RC_MAP { return mapUnionUnboxTail(r.bnAt, lw.irAt) }
+  return refArrayUnionUnboxTail(r.bnAt, lw.irAt)
 }
 
 // `RRecover`: the nullable local, then `ref.as_non_null` where a `string | null` read recovers,
@@ -1615,6 +1791,26 @@ function listNew(r: RListNew) {
   return arrNewTail(pl, slot)
 }
 
+// `RMemOp`: legacy's memory-management arm in `emitCallCoreMemOp`'s order, the operands then
+// `memOpTail`. Answers 1 for the bulk pair, which leaves nothing, else 0.
+function memOp(r: RMemOp): i32 {
+  const c = nodeAt(r.moAt)
+  if !(c is Call) { return irLMiss("memory op node") }
+  const pl = memOpPlanOf(c)
+  if pl.moFail != "" { return irLMiss("memory op plan") }
+  for o in r.moArgs { irLOpnd(o) }
+  memOpTail(pl.moArm)
+  return if memOpIsVoid(pl.moArm) { 1 } else { 0 }
+}
+
+// Whether call node `at` is a SIMD store, the one SIMD row that leaves nothing.
+function simdStoreAt(at: i32): boolean {
+  const c = nodeAt(at)
+  if !(c is Call) { return false }
+  const row = simdCallRow(c)
+  return row >= 0 && simdRowIsMem(row) && simdMemBase(row) == 2
+}
+
 // `RListNewDefault`: legacy's `__array_new_default__` arm: the length and its stash, then the
 // zeroed allocation at `arrNewPlanOf`'s pair.
 function listNewDefault(r: RListNewDefault) {
@@ -1634,6 +1830,14 @@ function simd(r: RSimd) {
   const f = nodeAt(c.callFn)
   const row = simdCallRow(c)
   if !(f is Ident) || row < 0 { return irLMiss("simd node") }
+  if simdRowIsMem(row) {
+    const ap = memAddrPlanOf(c, simdMemBase(row), lw.irAt)
+    if ap.maArm != "const" && ap.maArm != "rest" {
+      return irLMiss("simd memory plan")
+    }
+    for a in r.sdArgs { irLOpnd(a) }
+    return simdMemTail(row, ap.maOff)
+  }
   for a in r.sdArgs { irLOpnd(a) }
   return simdTail(c, f.identName, row)
 }
@@ -1850,16 +2054,73 @@ function forIn(n: SForIn, pending: i32[]) {
   return 0
 }
 
+// `SRangeLoop`: legacy's partial or wrapping range loop in `emitForRangeStmt`'s order, its blocks
+// and loops written by legacy's helpers around the IR's bodies, the scratch slots taken in order.
+function rangeLoop(n: SRangeLoop, pending: i32[]) {
+  const fnIx = lw.irAt
+  if n.rlAt < 0 { return irLMiss("range node") }
+  const s = nodeAt(n.rlAt)
+  if !(s is ForRange) { return irLMiss("range node") }
+  const rt = forRangeTestOf(s, n.rlAt, fnIx)
+  if rt.vIdx < 0 || rt.vIdx != varSlot(n.rlVar) { return irLMiss("range slot") }
+  const wraps = rangeMayWrap(s, rt)
+  irLSettle(pending)
+  scopeBind(s.frVar, declaredSlotOfDecl(n.rlAt))
+  let kb = 0
+  if n.rlPartial {
+    if n.rlCopies.length != rangePartialCopies(rt, wraps) {
+      return irLMiss("range copies")
+    }
+    let d0 = ctrlDepth
+    rangePartialOuterOpen(s)
+    kb = loopFrames(n.rlBrk, -1, d0)
+    d0 = ctrlDepth
+    const u = rangePartialMainOpen(rt, wraps)
+    const km = loopFrames(n.rlBrk, -1, d0)
+    const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+    let k = 0
+    while k < n.rlCopies.length {
+      d0 = ctrlDepth
+      rangePartialCopyOpen(s, rt, u, k, hasCont)
+      const kc = loopFrames(n.rlBrk, n.rlConts[k], d0)
+      body(n.rlCopies[k], false, -1, false)
+      framesPop(kc)
+      rangePartialCopyClose(hasCont)
+      k = k + 1
+    }
+    if u >= 0 { rangePartialMainClose(rt, u) }
+    framesPop(km)
+  }
+  const d1 = ctrlDepth
+  const hasTailCont = emitRangeRolledHead(s, rt)
+  const kt = loopFrames(n.rlTailBrk, n.rlTailCont, d1)
+  body(n.rlTail, false, -1, false)
+  framesPop(kt)
+  emitRangeRolledTail(rt, wraps, hasTailCont)
+  if n.rlPartial {
+    framesPop(kb)
+    rangePartialOuterClose()
+  }
+  scopeUnbind()
+  return 0
+}
+
 // Pushes a frame for each block legacy opened past depth `d0`: the walk's break block and its
 // current continue target carry its labels. Returns the count, for `framesPop`.
 function walkFrames(n: SForIn, d0: i32): i32 {
+  return loopFrames(n.xfBrk, n.xfCont, d0)
+}
+
+// Pushes a frame for each block legacy opened past depth `d0`: its innermost break block and
+// continue target carry labels `brk` and `cont`. Returns the count, for `framesPop`.
+function loopFrames(brk: i32, cont: i32, d0: i32): i32 {
   const brkAt = if loopBrkDepth.length > 0 { loopBrkDepth[loopBrkDepth.length - 1] } else { -1 }
   const contAt = if loopContDepth.length > 0 { loopContDepth[loopContDepth.length - 1] } else { -1 }
   let k = 0
   while d0 + k < ctrlDepth {
     const at = d0 + 1 + k
     lwFrames.push(
-      if at == brkAt { n.xfBrk } else if at == contAt { n.xfCont } else { -1 },
+      if at == brkAt { brk } else if at == contAt { cont } else { -1 },
     )
     k = k + 1
   }
@@ -2119,6 +2380,25 @@ function mapOp(r: RMapOp) {
   }
 }
 
+// `RMapIter`: legacy's keys or values writer, the map variable read before each of its steps. A
+// Set's values are its keys.
+function mapIter(r: RMapIter) {
+  const c = nodeAt(r.miAt)
+  if !(c is Call) || c.callFn < 0 { return irLMiss("map iter node") }
+  const m = nodeAt(c.callFn)
+  if !(m is Member) { return irLMiss("map iter node") }
+  const keys = !r.miVals || mapValuesAreKeys(m.memObj, lw.irAt)
+  if keys && !fnUses.mapKeys || !keys && !fnUses.mapVals {
+    return irLMiss("map iter frame")
+  }
+  const q = if keys { mapKeysFrameOf(m.memObj, lw.irAt) } else { mapValsFrameOf(m.memObj, lw.irAt) }
+  for step in [0, 1, 2] {
+    irLOpnd(r.miV)
+    mapListStep(q, step)
+  }
+  return 0
+}
+
 // `RMapHas`: the global, its recovery, the key and the op context, then legacy's probe and hit flag.
 function mapHas(r: RMapHas) {
   const fnIx = lw.irAt
@@ -2216,24 +2496,29 @@ function boxOp(r: RToBox) {
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
-  if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
-  holeBoxHead(p, r.bxAt, fnIx)
+  if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
+    if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
+    holeBoxHead(p, r.bxAt, fnIx)
+  }
   if (
     p.hbArm == "pass"
     || p.hbArm == "memberBox"
     || p.hbArm == "atom"
     || p.hbArm == "atomStr"
+    || p.hbArm == "nulNiche"
     || p.hbArm == "rec"
     || p.hbArm == "obj"
     || p.hbArm == "refList"
     || p.hbArm == "map"
     || p.hbArm == "clo"
+    || p.hbArm == "atomAsStr"
   ) {
     irLOpnd(r.bxV)
   } else {
     irLSkip(r.bxV)
   }
   if p.hbSrc >= 0 { numWidenTail(p.hbSrc, p.hbKind, r.bxAt, fnIx) }
+  if p.hbArm == "atomAsStr" { atomStrTail(atomStrPlanOf(r.bxAt, fnIx, false)) }
   return holeBoxTail(p, r.bxAt, fnIx)
 }
 
@@ -2289,7 +2574,7 @@ function irHoistRecv(ix: i32): i32 {
 // false where it built none.
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
   rhs(lw.irReadAgain[ix] ?? none, false)
   return true
 }
@@ -2417,6 +2702,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
         const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
+        stashIfBoxHead(id)
         const k = ifOpen(id, pending, tl)
         if k == IF_NOT {
           node(id, pending, tl, if i == b.length - 1 { fo[top] } else { -1 })
@@ -2563,6 +2849,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      // A vector store leaves nothing; any other SIMD op's discarded value is dropped.
+      if r is RSimd {
+        simd(r)
+        irLSettle(pending)
+        if !simdStoreAt(r.sdAt) { fbDrop() }
+        return 0
+      }
       // A store leaves nothing; a discarded load leaves its value, which legacy drops.
       if r is RMemAccess {
         memAccess(r)
@@ -2570,15 +2863,31 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if r.mmArgs.length == 1 { fbDrop() }
         return 0
       }
+      // The bulk pair leaves nothing; any other memory op's discarded value is dropped.
+      if r is RMemOp {
+        const v = memOp(r)
+        irLSettle(pending)
+        if v == 0 { fbDrop() }
+        return 0
+      }
       if r is REnvDrop {
         emitEnvCacheDrop(r.edFn)
         irLSettle(pending)
         return 0
       }
+      // An operand a tag dispatch follows reaches the stack first, as legacy writes it before the
+      // callee's id stash; its roots wait below the dispatch's `if`s for their reader.
       if r is RTagStash {
+        const roots = stageLead(r.tgsV, pending)
+        if lwMiss != "" { return 0 }
+        lwFloors.push(lwFloor)
+        lwFloor = lwLive.length - liveCountIn(pending)
         irLOpnd(r.tgsV)
         tagStashTail()
+        liveNeutral()
         irLSettle(pending)
+        lwFloor = lwFloors.pop() ?? 0
+        for v in roots { pending.push(v) }
         return 0
       }
       if r is RStashSet {
@@ -2618,6 +2927,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbEnd()
     }
     SForIn => forIn(n, pending)
+    SRangeLoop => rangeLoop(n, pending)
     SIf => irLMiss("an `if` outside a body walk")
     SBr => {
       if n.brHas {
@@ -3309,9 +3619,12 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwFloor = 0
   lwFloors = []
   lwStashAt = []
+  lwBoxHeadAt = []
+  lwIfHeadAt = Map()
+  lwIfHeadBuilt = false
   lwStashFi = []
   lwStashSlots = []
-  const none: Rhs = { ggSym: -1, ggNonNull: false }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
   for _v in f.irVars {
     lwTempRhs.push(none)
     lwTempDef.push(false)
