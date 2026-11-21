@@ -7,6 +7,7 @@ import { emitFail } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
+import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
 import {
   ArrayLit,
@@ -131,10 +132,12 @@ import {
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
+  capturedArgArmOf,
   clearPlanOf,
   clearRecvIsList,
   cloCellReaches,
   cloLiftCalleeOf,
+  closureValueCoreWhy,
   closureValueWhy,
   coalClosedWidensAtom,
   coalNulRefJoinWhy,
@@ -346,6 +349,7 @@ import {
   captureValKind,
   captureValStructIdx,
   cbIdentNamesFn,
+  cloSigKeyExt,
   coalesceDefaultNullable,
   declaredIndexAt,
   envSlotShift,
@@ -1979,10 +1983,10 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if cloLiftWriteCount(pos) > 0 {
     return missRhs("callee writes back captures")
   }
-  if (
-    envSlotShift(inst) > 1 + caps.length
-    || env && !cloLifted(pos) && captureCountOf(pos) > 0
-  ) {
+  if env && !cloLifted(pos) && captureCountOf(pos) > 0 {
+    return capturedCallRhs(b, c, ix, pos)
+  }
+  if envSlotShift(inst) > 1 + caps.length {
     return missRhs("callee environment")
   }
   if lowMemFoldsCallee(pos) { return missRhs("low-memory accessor") }
@@ -2067,14 +2071,30 @@ let ibOwnBuilt = false
 // found.
 let ibLiftCapDecl: {[string]: i32} = Map()
 
-// The captures lifted function `pos` takes after its environment, each a parameter or a binding
-// of the function being built, read in order; a miss names any other.
+// The captures lifted function `pos` takes after its environment, each a parameter, a binding or
+// a lifted capture of the function being built, read in order; a miss names any other.
 function liftCaps(pos: i32): Opnd[] {
   const out: Opnd[] = []
   for name in captureNamesOf(pos) {
     const p = paramIndexOf(ibFnIx, name)
     const d = if p < 0 { liftCapDecl(pos, name) } else { -1 }
-    const v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
+    let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
+    // A capture of this frame passes on as this frame reads it: a lifted frame's own parameter.
+    // An environment field would be written ahead of the callee's null environment, so it misses.
+    if v < 0 && captureSlotOf(name, ibFnIx) >= 0 {
+      const self = fnStmtsPosOf(ibFnIx)
+      if !cloLifted(self) {
+        irBMiss("callee captures env")
+        return out
+      }
+      if (
+        cloLiftWriteCount(self) == 0
+        && capRepOf(self, name) >= 0
+        && capRepOf(self, name) == capRepOf(pos, name)
+      ) {
+        v = liftCapVar(self, name)
+      }
+    }
     if v < 0 || capCellTargetOf(name) >= 0 {
       irBMiss("callee captures")
       return out
@@ -2083,6 +2103,63 @@ function liftCaps(pos: i32): Opnd[] {
     out.push(o)
   }
   return out
+}
+
+// A direct call `ix` of nested function `pos`, which reads its captures from its environment, as
+// `emitCapturedCall` writes it: the function's closure over a fresh environment, called through
+// legacy's shared head and tail at the function's own `$fnsig`, each argument on the plain arm.
+function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
+  if closureValueCoreWhy(pos) != "" {
+    return missRhs("captured call closure refused")
+  }
+  const sig = fnSigIdxOfFn(pos)
+  if sig < 0 { return missRhs("captured call signature") }
+  const fty = heldTy(exprTyOf(c.callFn))
+  const frep = repNodeOfTy(fty)
+  if !(repNodeAt(frep) is RClosure) {
+    return missRhs("captured call closure rep")
+  }
+  const env = cloEnvOf(b, pos, ix)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  const f = irBLetTempTy(
+    b,
+    { mcFn: pos, mcEnv: env, mcAt: ix },
+    c.callFn,
+    frep,
+    fty,
+  )
+  if ibMiss != "" { return missRhs(ibMiss) }
+  const callee = nodeAt(fnStmts[pos])
+  if !(callee is FuncDecl) || callee.fnParams.length != c.callArgs.length {
+    return missRhs("argument count")
+  }
+  const args: Opnd[] = []
+  let i = 0
+  while i < c.callArgs.length {
+    if capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx) != "plain" {
+      return missRhs("captured call argument coercion")
+    }
+    const at = b.length
+    const a = irBExpr(b, c.callArgs[i])
+    if ibMiss != "" { return missRhs("argument") }
+    if ifBelowLead(b, at, "short-circuit closure argument") {
+      return missRhs("short-circuit closure argument")
+    }
+    if irBOpRep(a) != repNodeOfTy(scopeTyAt(callee.fnParams[i], fnStmts[pos])) {
+      return missRhs("captured call argument rep")
+    }
+    args.push(a)
+    i = i + 1
+  }
+  const isVoid = sigKeyRetIsVoid(cloSigKeyExt(pos))
+  const r: Rhs = {
+    crFn: f,
+    crSig: sig,
+    crArgs: args,
+    crVoid: isVoid,
+    crDrop: !isVoid,
+  }
+  return r
 }
 
 // A call `ix` through a closure binding that legacy writes plainly (`callRefPlainKey`): the
