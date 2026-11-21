@@ -58,6 +58,7 @@ import {
   PrimOp,
   PushRecv,
   RCall,
+  RListSlice,
   RListStage,
   RStrOp,
   RTagStash,
@@ -440,6 +441,7 @@ import {
   parseI64Pair,
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
+import { letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
   TY_I32,
@@ -2377,6 +2379,25 @@ function inPlaceFrom(b: i32[], at: i32): boolean {
   return false
 }
 
+// Whether operands built into `b` from `at` on hold a store statement.
+function storeFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if (
+      n is SAssign
+      || n is SGlobalSet
+      || n is SSetField
+      || n is SListSet
+      || n is SCellSet
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
 // Whether operands built into `b` from `at` on hold a tag dispatch's stash.
 function tagStashFrom(b: i32[], at: i32): boolean {
   let i = at
@@ -2866,6 +2887,12 @@ function mapSetStageLeads(
   leads: Opnd[],
 ): boolean {
   const why = "map store short-circuit operand"
+  // A store the value makes (an assignment as the value) is written in place by legacy, after
+  // a receiver and key it reads at their use; the IR's statement would land above them.
+  if storeFrom(b, vAt) && !opndsAreTemps(leads) {
+    irBMiss("map store value store")
+    return false
+  }
   if !valuedIfFrom(b, vAt) || inPlaceFrom(b, vAt) {
     return !ifBelowLead(b, keyAt, why)
   }
@@ -5302,6 +5329,15 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if arrCopyCallNamed(n, ibFnIx) { return listCopyStmt(b, n, ix) }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
+    // A discarded slice is a value legacy evaluates and drops.
+    if rhs is RListSlice {
+      const sr = exprRepOf(ix)
+      if sr < 0 { return skip("slice statement rep") }
+      const v = irBLetTemp(b, rhs, ix, sr)
+      if ibMiss != "" { return 0 }
+      irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+      return 0
+    }
     irBNode(b, { efRhs: rhs }, -1, ibNoValue, ix)
     return 0
   }
@@ -6020,8 +6056,29 @@ function globalInit(b: i32[], gi: i32, gst: i32) {
   if !(g is LetDecl) { return 0 }
   const gck = globalCellKind(gst)
   const arm = startInitArmOf(gst, gck)
-  if arm != "plain" { return skip("global initializer " + arm) }
-  if globalInitArmUnboxes(gck, g.letInit) {
+  // A union cell is the box, its initializer boxed at the binding's union type as legacy's
+  // `emitUnionBoxOwed` writes it.
+  if arm == "unionBox" {
+    const rep = globalRep(gi, gst)
+    if rep < 0 { return skip("global initializer rep") }
+    const bv = deliver(b, g.letInit, rep, letBindingUnionTy(gst, -1))
+    if ibMiss != "" { return 0 }
+    if irBOpRep(bv) != rep { return skip("global initializer coercion") }
+    const bm = irGlobalWriteMiss(gi, ibGlobalCtx())
+    if bm != "" { return skip(bm) }
+    irBNode(b, { gsSym: gi, gsSrc: bv }, -1, ibNoValue, gst)
+    return 0
+  }
+  if arm != "plain" && arm != "widen" {
+    return skip("global initializer " + arm)
+  }
+  // A widened value `if` is legacy's nested-join adoption (`numLitAdoptJoin`, D16496), which
+  // keeps an inner join at its own type and extends it; the IR's delivery widens per arm.
+  if arm == "widen" && nodeAt(unwrapParen(g.letInit)) is IfStmt {
+    return skip("global initializer widen join")
+  }
+  // A numeric cell's initializer is delivered widened to it, as legacy's `emitWidened` writes it.
+  if arm == "plain" && globalInitArmUnboxes(gck, g.letInit) {
     return skip("global initializer arm unbox")
   }
   const src = if mapCtorOf(g.letInit) { mapNewInit(b, gi, gst, g.letInit) } else if gck == "closure" { cloInit(b, gi, gst, g.letInit) } else { globalInitValue(b, gi, gst, g.letInit) }
