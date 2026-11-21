@@ -2440,3 +2440,21 @@ print(qnull().o == null)
     }
   },
 });
+
+// A shared field read off a `U | null` parameter narrowed past `null` reads the box itself, held
+// at discipline 4, as legacy reads it.
+const SHARED_READ_NULLABLE_BOX =
+  `type A = { k: i32, a: i32 }\ntype B = { k: i32, b: string }\nfunction f(u: A | B | null): i32 {\n  if u != null { return u.k }\n  return 0\n}\nprint(f({ k: 3, a: 1 }) + f({ k: 4, b: "x" }) + f(null))\n`;
+Deno.test({
+  name: "ir shadow: a shared field read off a narrowed U | null box is covered and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(SHARED_READ_NULLABLE_BOX, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 1 || (rows.get("matched") ?? 0) !== 1) {
+      throw new Error(`want f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
