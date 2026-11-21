@@ -572,8 +572,9 @@ Deno.test({
 // ── list-literal layout (#2814) ──────────────────────────────────────────────
 // A list literal that does not fit one line is FILLED — as many scalar literals per
 // continuation line as fit the 80-column budget — with ONE intent rule: rows the author
-// already wrote, two or more of them and every row the same width of at least two, are
-// kept exactly, because that is a 2-D table written as a 1-D list. Anything holding a
+// already wrote, two or more of them and every row the same width, are kept exactly: a
+// 2-D table written as a 1-D list, or (width one) a list written one member per line so
+// that two changes adding different members merge. Anything holding a
 // struct, closure, nested list or any non-literal element stays one per line, and so does
 // a literal carrying a comment, which pins the rows around it. There is no opt-out.
 
@@ -628,6 +629,35 @@ Deno.test({
     }
     const r2 = await run([], r.out);
     if (r2.out !== r.out) throw new Error(`kept rows not idempotent:\n${r2.out}`);
+  },
+});
+
+Deno.test({
+  name: "vl-fmt: a list and an or-pattern arm written one member per line stay one per line",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src =
+      "type A = { a: i32 }\n" +
+      "type B = { b: i32 }\n" +
+      "type C = { c: i32 }\n" +
+      "type U = A | B | C\n" +
+      "const ks = [\n  \"A\",\n  \"B\",\n  \"C\",\n]\n" +
+      "function f(u: U): i32 {\n  return match u {\n    A |\n    B => 1\n    C => 2\n  }\n}\n" +
+      "function g(u: U): i32 {\n  return match u {\n    A | B => 1\n    C => 2\n  }\n}\n" +
+      "print(ks.length + f({ c: 0 }) + g({ a: 0 }))\n";
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`fmt failed: ${r.err}`);
+    if (!r.out.includes("const ks = [\n  \"A\",\n  \"B\",\n  \"C\",\n]\n")) {
+      throw new Error(`one-per-line list was refilled:\n${r.out}`);
+    }
+    if (!r.out.includes("    A |\n      B => 1\n")) {
+      throw new Error(`one-per-line or-patterns were joined:\n${r.out}`);
+    }
+    if (!r.out.includes("    A | B => 1\n")) {
+      throw new Error(`one-line or-patterns were split:\n${r.out}`);
+    }
+    const r2 = await run([], r.out);
+    if (r2.out !== r.out) throw new Error(`one-per-line not idempotent:\n${r2.out}`);
   },
 });
 
