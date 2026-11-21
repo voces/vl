@@ -541,6 +541,7 @@ import {
 import { ListBuild } from "./emit_ref_list_kinds"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { globalIndexOfSid } from "./emit_fn_ret_kinds"
+import { i32ListHas } from "./listutil"
 
 // The function being lowered.
 export function irLFn(): IrFn { return lw }
@@ -570,6 +571,11 @@ let lwFloors: i32[] = []
 let lwStashAt: i32[] = []
 let lwStashFi: i32[] = []
 let lwStashSlots: i32[] = []
+// The order-stashed literals whose box head their first `RStashSet` wrote, as legacy's tag leads.
+let lwBoxHeadAt: i32[] = []
+// Each order-stashed literal by the out its first source field reads, noted once per function.
+let lwIfHeadAt: {[i32]: i32} = Map()
+let lwIfHeadBuilt = false
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -672,6 +678,13 @@ export function irLOpnd(o: Opnd) {
       emitStrLitAt(o.osAt, lw.irAt)
     }
   }
+  return 0
+}
+
+// The bytes written since the top live value ended are stack-neutral, as a value set into a local
+// is, so a read of that value still finds it on top.
+function liveNeutral() {
+  if lwLive.length > 0 { lwLiveEnd[lwLive.length - 1] = lwBuf.length }
   return 0
 }
 
@@ -1196,12 +1209,68 @@ function stashSet(r: RStashSet) {
   const row = recRowOf(r.ssAt, r.ssRow, r.ssVariant, true)
   if row < 0 { return irLMiss("record row") }
   const fi = r.ssFi
+  if !i32ListHas(lwBoxHeadAt, r.ssAt) { stashBoxHead(r.ssAt) }
   irLOpnd(r.ssV)
   const slot = stashSlotAt(row, fi, r.ssVariant)
   lwStashAt.push(r.ssAt)
   lwStashFi.push(fi)
   lwStashSlots.push(slot)
   fbLocalSet(slot)
+  return 0
+}
+
+// Where the order-stashed literal at `at` is boxed under a plan that writes a head, that head,
+// ahead of the literal's first field (legacy writes the tag before the literal).
+function stashBoxHead(at: i32) {
+  for n in lw.irNodes {
+    if !(n is SLet) { continue }
+    const r = n.lRhs
+    if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
+    const bx = r.bxAt
+    const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+    if p.hbArm == "rec" || p.hbArm == "obj" {
+      leaf()
+      holeBoxHead(p, bx, lw.irAt)
+      lwBoxHeadAt.push(at)
+    }
+    return 0
+  }
+  return 0
+}
+
+// Where valued `if` node `id` is the first field an order-stashed literal sets, in either stash
+// form, that literal's box head, ahead of the `if` (legacy writes the tag before the literal).
+function stashIfBoxHead(id: i32) {
+  const n = lw.irNodes[id]
+  if !(n is SIf) || n.siOut < 0 { return 0 }
+  if !lwIfHeadBuilt { stashIfHeadsNote() }
+  const at = lwIfHeadAt.get(n.siOut) ?? -1
+  if at < 0 || i32ListHas(lwBoxHeadAt, at) { return 0 }
+  return stashBoxHead(at)
+}
+
+// Notes, once per function, the out each order-stashed literal's first source field reads, by
+// that out: the literal (`stashIfBoxHead`).
+function stashIfHeadsNote() {
+  lwIfHeadBuilt = true
+  const seen: i32[] = []
+  for m in lw.irNodes {
+    if m is SLet {
+      const mr = m.lRhs
+      if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
+        const k0 = mr.mrSrc[0]
+        const f0 = if k0 >= 0 && k0 < mr.mrFields.length { mr.mrFields[k0] } else { null }
+        if f0 is OVar { lwIfHeadAt.set(f0.ov, mr.mrAt) }
+      }
+      continue
+    }
+    if !(m is SEffect) { continue }
+    const r = m.efRhs
+    if !(r is RStashSet) || i32ListHas(seen, r.ssAt) { continue }
+    seen.push(r.ssAt)
+    const sv = r.ssV
+    if sv is OVar { lwIfHeadAt.set(sv.ov, r.ssAt) }
+  }
   return 0
 }
 
@@ -2299,13 +2368,16 @@ function boxOp(r: RToBox) {
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
-  if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
-  holeBoxHead(p, r.bxAt, fnIx)
+  if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
+    if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
+    holeBoxHead(p, r.bxAt, fnIx)
+  }
   if (
     p.hbArm == "pass"
     || p.hbArm == "memberBox"
     || p.hbArm == "atom"
     || p.hbArm == "atomStr"
+    || p.hbArm == "nulNiche"
     || p.hbArm == "rec"
     || p.hbArm == "obj"
     || p.hbArm == "refList"
@@ -2502,6 +2574,7 @@ function body(b0: i32[], tail0: boolean, out0: i32, keepTop: boolean): i32[] {
       // A valueless `return` after a call in its tail form writes nothing.
       if !(i > 0 && callReturns(b, i - 1)) {
         const tl = ft[top] && i == b.length - 1 || callReturns(b, i)
+        stashIfBoxHead(id)
         const k = ifOpen(id, pending, tl)
         if k == IF_NOT {
           node(id, pending, tl, if i == b.length - 1 { fo[top] } else { -1 })
@@ -2667,10 +2740,19 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      // An operand a tag dispatch follows reaches the stack first, as legacy writes it before the
+      // callee's id stash; its roots wait below the dispatch's `if`s for their reader.
       if r is RTagStash {
+        const roots = stageLead(r.tgsV, pending)
+        if lwMiss != "" { return 0 }
+        lwFloors.push(lwFloor)
+        lwFloor = lwLive.length - liveCountIn(pending)
         irLOpnd(r.tgsV)
         tagStashTail()
+        liveNeutral()
         irLSettle(pending)
+        lwFloor = lwFloors.pop() ?? 0
+        for v in roots { pending.push(v) }
         return 0
       }
       if r is RStashSet {
@@ -3401,6 +3483,9 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwFloor = 0
   lwFloors = []
   lwStashAt = []
+  lwBoxHeadAt = []
+  lwIfHeadAt = Map()
+  lwIfHeadBuilt = false
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
