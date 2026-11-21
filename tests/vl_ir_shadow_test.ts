@@ -1149,8 +1149,9 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
 // in that later operand; one in the first operand written stays covered, and an intrinsic's
-// earlier argument, or an element store's receiver and index, is staged below the `if` (`intr`,
-// `st`), so only `stIx`'s `if` in the index is a store miss.
+// earlier argument, an operator's left operand, or an element store's receiver and index, is
+// staged below the `if` (`intr`, `bin`, `eq`, `st`), so only `stIx`'s `if` in the index is a
+// store miss.
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -1185,7 +1186,6 @@ print(intr(true, 0.5))
     const { rows } = run(src, true);
     const want: [string, number][] = [
       ["uncovered store short-circuit operand", 1],
-      ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
@@ -1195,7 +1195,10 @@ print(intr(true, 0.5))
     if (rows.has("uncovered short-circuit argument after another")) {
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
-    if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered short-circuit right operand")) {
+      throw new Error(`want \`bin\` and \`eq\` staged, got ${JSON.stringify([...rows])}`);
+    }
+    if (!(rows.get("matched")! >= 4)) throw new Error(`want \`first\`, \`intr\`, \`bin\` and \`eq\` matched, got ${JSON.stringify([...rows])}`);
     // The start's map store stages its global receiver and key below the value's `if`.
     if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
@@ -1263,10 +1266,10 @@ if d.v is f64 { print(d.v) }
 });
 
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
-// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
-// the result's `null`.
+// (prints 5). The IR once returned `put(9)`'s value there; it now builds `put(9)` as a statement
+// and falls into the lowering's `null` pad, matching legacy.
 Deno.test({
-  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  name: "ir shadow: a block body that runs past its last statement pads its null and matches",
   ignore,
   fn: () => {
     const src = `function put(x: i32) { return x * 2 }
@@ -1277,9 +1280,13 @@ function f(b: i32) {
 print(f(-1) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered block body falls off";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered block body falls off")) {
+      throw new Error(`want no falls-off miss, got ${JSON.stringify([...rows])}`);
+    }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 2 || rows.get("matched") !== 2) {
+      throw new Error(`want put and f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -2606,7 +2613,7 @@ print(qnull().o == null)
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field explicitNull") ?? 0) !== 2) {
+    if ((rows.get("uncovered object field explicitNull typed null") ?? 0) !== 2) {
       throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
@@ -2666,6 +2673,28 @@ Deno.test({
       (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
     ) {
       throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned `__trap__()` is the trap, then the bare `return` legacy writes after it: at an i32, a
+// string with a message, a record and a union result it builds and matches. At a wider number
+// legacy widens the dead value, so that result stays a named miss.
+const RETURNED_TRAP =
+  `type Pt = { x: i32, y: i32 }\nfunction ti(_n: i32): i32 { return __trap__() }\nfunction ts(_n: i32): string { return __trap__("unset") }\nfunction tp(): Pt { return __trap__() }\nfunction tu(): i32 | string { return __trap__() }\nfunction tl(): i64 { return __trap__() }\nexport let hi: (n: i32) => i32 = ti\nexport let hs: (n: i32) => string = ts\nexport let hp: () => Pt = tp\nexport let hu: () => i32 | string = tu\nexport let hl: () => i64 = tl\nprint(1)\n`;
+Deno.test({
+  name: "ir shadow: a returned trap builds as the trap and a dead bare return, and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RETURNED_TRAP, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want ti, ts, tp and tu covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered returned trap widened") ?? 0) !== 1) {
+      throw new Error(`want tl a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
