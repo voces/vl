@@ -150,14 +150,14 @@ Each consumer keeps its own list. Re-run an ask before scheduling it.
 ### Track C — CLI
 
 - **C5, distribution.** `release.yml` is a draft that builds and checksums each target. The publish
-  job and a release tag remain, and they wait on the owner; the Homebrew formula is backlogged.
+  job and a release tag remain, and the coordinator decides when; the Homebrew formula is backlogged.
 - **C-test-cache.** It is built opt-in. Two things remain:
-  - the owner's call on flipping the default once the trial ends (`VL_NO_COMPILE_CACHE`,
+  - the coordinator's call on flipping the default once the trial ends (`VL_NO_COMPILE_CACHE`,
     `--no-cache`, `vl cache clean`);
   - the `VERIFY=sample:N` mode.
 - **C-incremental**, in [`incremental-compilation-design.md`](docs/internals/incremental-compilation-design.md):
   - S5 is in progress, S3 `--watch` and S6 are not started, and S4 is ongoing;
-  - Q2 and Q3 wait on the owner;
+  - Q2 and Q3 wait on a coordinator ruling;
   - the check-skip's residual declines (27 of 30 replayed commits served).
 - **C-extern-read.** `vl run` refuses every declared extern global, even one that only an imported
   module declares and nothing reads. The goal is to refuse only a global that reachable code reads or
