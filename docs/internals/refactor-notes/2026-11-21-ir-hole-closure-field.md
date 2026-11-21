@@ -44,6 +44,10 @@ The coordinator ruled on the measurement; IR-D1 confirmed the rule does not over
 | corpus functions with no blocker | 44,577 | 44,685 (+108) |
 | corpus `object field coercion` (alone) | 61 (59) | 3 (2) |
 | self-compile functions with no blocker | 19,539 | 19,539 |
+| tests/cases armed shadow covered / matched | 65,085 / 65,084 | 65,326 / 65,325 (same single fail row) |
+| L2 self-compile fuel | 107,527,479,925 | 107,540,926,816 (+0.013%) |
 
 The corpus gain is larger than the class, because each cell's start function clears with it.
 The 3 left are a reflist field, a nullable record field, and a node-in row.
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
