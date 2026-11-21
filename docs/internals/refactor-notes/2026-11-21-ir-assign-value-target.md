@@ -17,3 +17,12 @@ value re-reads the receiver, the index and the field or element.
 ## Witness
 
 `tests/ir-shadow-rows/assignment-value-field-element.vl`: a field write as a `print` argument.
+
+## Measured (fixpoint seeds of master 41144724 and the change)
+
+- tests/cases armed shadow: covered and matched +142 (64,809 → 64,951), start +1;
+  `uncovered assignment value target` 167 → 0, start 4 → 0. `parked` start 2 → 3 and `re-read rep`
+  start 1 are the reads now reaching the next arm. No new `fail` or `mismatch` row.
+- Corpus: `assignment value target` 1 → 0; no-blocker 44,449 → 44,450 of 45,678.
+- Legacy: tests/cases A/B identical 7,309 (differ 0), `--names` identical, mode-3 self
+  byte-identical. L2 fuel 106,901,466,260 → 106,918,922,154 (+0.016%).
