@@ -20,6 +20,7 @@ import {
   RAtomStr,
   RBoxField,
   RBoxNarrow,
+  RBundlePick,
   RCall,
   RCallHost,
   RCallRef,
@@ -28,6 +29,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  RCoerce,
   REnvDrop,
   REnvGet,
   RFieldNull,
@@ -43,10 +45,12 @@ import {
   RListGet,
   RListLen,
   RListNew,
+  RListNewDefault,
   RListPop,
   RListPush,
   RListSlice,
   RListStage,
+  RLitArms,
   RMakeClo,
   RMakeList,
   RMakeRec,
@@ -71,6 +75,7 @@ import {
   RRetNull,
   RRetag,
   RSharedRead,
+  RSimd,
   RSpread,
   RStage,
   RStashSet,
@@ -126,6 +131,7 @@ import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { Call, Ident, P, i32ToStr, nodeAt } from "./ast"
+import { simdCallRow, simdOperandPrim, simdResultPrim } from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
@@ -639,6 +645,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RListNewDefault => {
+      use(r.ldLen, at)
+      if opRep(r.ldLen) != vfI32 {
+        return fail(2, at, "a list length is an i32")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a zeroed list is a list")
+      }
+      0
+    }
     RListNew => {
       use(r.lnLen, at)
       use(r.lnFill, at)
@@ -809,6 +825,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RCoerce => use(r.cvV, at)
     RToBox => {
       use(r.bxV, at)
       // Legacy's box writer may leave an immediate unread, so one stands only for an effect-free node.
@@ -950,6 +967,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RLitArms => {
+      use(r.liV, at)
+      if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
+      // `atomEq` reads its operand once per member, so it is a variable, not a temp.
+      if r.liArm == "atomEq" && !(r.liV is OVar) {
+        return fail(2, at, "a literal arms test re-reads a variable")
+      }
+      0
+    }
     RCoalAtomStr => {
       use(r.zaL, at)
       use(r.zaD, at)
@@ -1007,6 +1033,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RSimd => simdCheck(r, dst, at)
     RPrint => {
       use(r.pnV, at)
       if dst >= 0 { return fail(2, at, "a print statement has no value") }
@@ -1119,6 +1146,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
     REnvDrop => 0
+    RBundlePick => {
+      use(r.bpV, at)
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a bundle member of a non-closure rep")
+      }
+      0
+    }
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
@@ -1302,6 +1336,34 @@ function coalBoxWhy(n: SCoalBox): string {
 
 // Why a nullable reference's `??` is ill-formed, or "": it reads a nullable reference, and its out
 // is that reference, its non-null inner, or a join's box.
+// A niche cell's `??` reads its niche (an atom's, or `boolean | null`'s) and writes the niche or
+// its present value.
+function coalNicheWhy(n: SCoalBox): string {
+  const lr = opRep(n.cbL)
+  const ln = repNodeAt(lr)
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "a niche cell's `??` writes no variable"
+  }
+  const or = vf.irVars[o].vRep
+  if n.cbArm == "litUnion" {
+    if !(ln is RNullable) || ln.rnDisc != 3 {
+      return "an atom niche's `??` reads no atom niche"
+    }
+    if or != lr && or != ln.rnInner {
+      return "an atom niche's `??` yields neither the niche nor its atom"
+    }
+    return ""
+  }
+  if !repBoolNiche(lr) {
+    return "a `boolean | null` `??` reads no boolean niche"
+  }
+  if or != lr && repPrim(or) != "bool" {
+    return "a `boolean | null` `??` yields neither the niche nor a boolean"
+  }
+  return ""
+}
+
 function coalNulRefWhy(n: SCoalBox): string {
   const lr = repNodeAt(opRep(n.cbL))
   if !(lr is RNullable) || lr.rnDisc == 4 || lr.rnInner < 0 {
@@ -1604,6 +1666,7 @@ function stmt(id: i32, prev: i32) {
         "popOr" => coalPopOrWhy(n)
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "nulRef" => coalNulRefWhy(n)
+        "litUnion" | "nulBool" => coalNicheWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1782,6 +1845,40 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   return 0
 }
 
+// A SIMD row's operands and result at the prims its shape names (`simdOperandPrim`,
+// `simdResultPrim`), a lane or shuffle index being an immediate and no operand.
+function simdCheck(r: RSimd, dst: i32, at: i32) {
+  uses(r.sdArgs, at)
+  const c = nodeAt(r.sdAt)
+  const row = if c is Call { simdCallRow(c) } else { -1 }
+  if !(c is Call) || row < 0 {
+    return fail(2, at, "a SIMD op's node is a SIMD call")
+  }
+  let k = 0
+  let i = 0
+  while i < c.callArgs.length {
+    const p = simdOperandPrim(row, i)
+    if p != "" {
+      if k >= r.sdArgs.length || repPrim(opRep(r.sdArgs[k])) != p {
+        return fail(2, at, "a SIMD op's operands are at its row's prims")
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  if k != r.sdArgs.length {
+    return fail(2, at, "a SIMD op's operands are at its row's prims")
+  }
+  const rp = simdResultPrim(row)
+  if (
+    dst >= 0
+    && (rp == "" || repPrim(dst) != rp && !(rp == "i32" && repPrim(dst) == "bool"))
+  ) {
+    return fail(2, at, "a SIMD op's result is at its row's prim")
+  }
+  return 0
+}
+
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
@@ -1801,6 +1898,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMakeList |
       RSpread |
       RListNew |
+      RListNewDefault |
       RListCopy |
       RMemAccess |
       RListLen |
@@ -1818,6 +1916,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMapHas |
       RPrint |
       RNumIntr |
+      RSimd |
       RCoalStr |
       RCoalAtomStr |
       RTagStash |
@@ -1825,6 +1924,7 @@ function rhsReadsList(r: Rhs): boolean {
       RStashSet |
       RListEmpty |
       RListEmptyArms |
+      RLitArms |
       RStrOp |
       RNumWiden |
       RNumCast |
@@ -1839,6 +1939,7 @@ function rhsReadsList(r: Rhs): boolean {
       RUnionEq |
       RListEq |
       RListCat |
+      RCoerce |
       RMakeClo |
       RFnId |
       RCellNew |
@@ -1846,6 +1947,7 @@ function rhsReadsList(r: Rhs): boolean {
       RGlobalGet |
       REnvGet |
       REnvDrop |
+      RBundlePick |
       RRawOp |
       RRel |
       RStage => false
