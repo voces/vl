@@ -41,6 +41,7 @@ import {
   NullLit,
   NumLit,
   ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
@@ -364,6 +365,8 @@ import {
   EmptyFitPlan,
   arrLitIsForIter,
   coalFieldPlanOf,
+  coalOptArmOf,
+  coalOptLeafPlanOf,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
@@ -462,6 +465,7 @@ import {
   readOwesNonNullRecover,
   sFieldStoreKind,
   spreadBoxingSource,
+  structIndexOfExpr,
   structIndexOfObjCtx,
 } from "./emit_classify"
 import {
@@ -5301,6 +5305,9 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if !built && arm == "next" && nodeAt(lhsIx) is Member {
     return coalField(b, n, lhsIx, ix, rep)
   }
+  if !built && arm == "next" && nodeAt(lhsIx) is OptMember {
+    return coalOptLeafBuild(b, n, lhsIx, ix, rep)
+  }
   if !built { return irBMiss("coalesce box " + arm) }
   if (arm == "callBox" || arm == "callScalar") && !(nodeAt(lhsIx) is Call) {
     return irBMiss("coalesce box stash operand")
@@ -5369,6 +5376,50 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if irBOpRep(d) != rep { return irBMiss("coalesce field default rep") }
   irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
   const arm: CoalValArm = if boxed { "fieldBox" } else { "fieldVal" }
+  irBNode(
+    b,
+    { cbL: r, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `p?.f ?? d` past the boxed and field rungs, along `coalOptArmOf` and `coalOptLeafPlanOf` as
+// `emitCoalesceOptNulRecord` writes a nullable record's scalar or string field: the receiver, a
+// variable it re-reads, then the shared null test's `if`, the default built into its null arm.
+function coalOptLeafBuild(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const oa = coalOptArmOf(lhsIx, ibFnIx)
+  if oa != "nulRecord" { return irBMiss("coalesce optional " + oa) }
+  const m = nodeAt(lhsIx)
+  if !(m is OptMember) { return irBMiss("coalesce optional node") }
+  const lp = coalOptLeafPlanOf(m, structIndexOfExpr(m.omObj, ibFnIx))
+  if lp.olLeaf == null { return irBMiss("coalesce optional record field") }
+  if repPrim(rep) == null { return irBMiss("coalesce optional result rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce optional after an operand") }
+  const r = irBExpr(b, m.omObj)
+  if ibMiss != "" { return r }
+  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+    return irBMiss("coalesce optional place")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce optional default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = "optLeaf"
   irBNode(
     b,
     { cbL: r, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
