@@ -161,6 +161,8 @@ import {
   globalInitArmUnboxes,
   globalReadRecovers,
   holeBoxTyAt,
+  hostCallNamed,
+  hostCallPlanOf,
   idxStorePlainWhy,
   ifExprJoinVt,
   ifExprPlainWhy,
@@ -1808,10 +1810,12 @@ function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
 // environment, a cell, or a global capture misses.
 function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   const out: Opnd[] = []
-  if irEnvCached(fe) || cloCellReaches(fe, ibFnIx) {
-    irBMiss("closure env cache")
+  if cloCellReaches(fe, ibFnIx) {
+    irBMiss("closure env cell")
     return out
   }
+  // A cached environment is built inside the slot's test, so each capture is a variable read there.
+  const cached = irEnvCached(fe)
   const self = fnStmtsPosOf(ibFnIx)
   for name in captureNamesOf(fe) {
     const r = capRepOf(fe, name)
@@ -1843,6 +1847,10 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
     }
     if v < 0 || ib.irVars[v].vRep != r {
       irBMiss("closure env capture")
+      return out
+    }
+    if cached && ib.irVars[v].vKind == "temp" {
+      irBMiss("closure env cache copy")
       return out
     }
     const o: Opnd = { ov: v }
@@ -2010,6 +2018,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(cf is Ident) { return missRhs("indirect call") }
   const d = identDeclOf(c.callFn)
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
+  if hostCallNamed(c, ibFnIx) { return hostCallRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
   }
@@ -2375,6 +2384,35 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   }
   const op: StrOp = if many { "fromcps" } else { "fromcp" }
   const r: Rhs = { soOp: op, soArgs: [a], soAt: ix }
+  return r
+}
+
+// A host call as legacy's arm writes it (`emitCallCoreHost`): each argument as it stands, one the
+// plan widens already at its kind's prim, then the import's `call`. A plan legacy refuses is a miss.
+function hostCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const pl = hostCallPlanOf(c)
+  if pl.hpFail != "" || pl.hpImport < 0 { return missRhs("host call plan") }
+  const at = b.length
+  const args: Opnd[] = []
+  for a in c.callArgs { args.push(irBExpr(b, a)) }
+  if ibMiss != "" { return missRhs("host call operand") }
+  if ifBelowLead(b, at, "host call short-circuit operand") {
+    return missRhs("host call short-circuit operand")
+  }
+  let i = 0
+  while i < args.length {
+    const k = pl.hpKinds[i]
+    if k != 0 && repPrim(irBOpRep(args[i])) != numKindPrim(k) {
+      return missRhs("host call operand coercion")
+    }
+    i = i + 1
+  }
+  const r: Rhs = {
+    chImport: pl.hpImport,
+    chArgs: args,
+    chVoid: pl.hpVoid,
+    chNever: callEndsNever(ix),
+  }
   return r
 }
 
@@ -4992,8 +5030,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   // A nested function declaration is lifted, and writes nothing where it stands, unless it
   // drops a cached environment.
   if n is FuncDecl {
+    // A cached environment is dropped here, so each execution declares a new function value.
     if irEnvCached(fnStmtsPosOf(ix)) {
-      return skip("nested function env cache")
+      irBNode(b, { efRhs: { edFn: fnStmtsPosOf(ix) } }, -1, ibNoValue, ix)
     }
     return 0
   }
