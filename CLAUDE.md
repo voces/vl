@@ -74,6 +74,9 @@ Why: [evidence](docs/internals/working-rules-evidence.md#disk).
 * What earns a place in the gate: `docs/internals/testing-strategy.md` — a check stays while it
   catches a breakage nothing else catches (kill matrix, `scripts/kill-matrix/`); a redundant one is
   deleted with its intent folded into a survivor.
+* **`scripts/gate.sh --fast` runs `tests/vl_ir_shadow_test.ts` on the tree's seed** (the full gate
+  runs it in `ci-native`), so a stale IR shadow expectation reds before the queue; no lane runs it
+  by hand.
 * **`scripts/gate.sh` runs the whole ladder and is the thing to run.** The full gate refuses inside
   `.claude/worktrees/` (override `GATE_IN_WORKTREE=1`) because the merge queue gates every PR;
   `--fast` runs anywhere. Fan-out caps: `GATE_MAX_PAR`, `GATE_MEM_BUDGET_MB`; WALL >> CPU in its
