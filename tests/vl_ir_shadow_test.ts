@@ -2563,7 +2563,7 @@ Deno.test({
 
 // A nullable record field takes its value at the field's rep where no arm unbox is owed, for a
 // plain record and a union arm: a nullable parameter and a narrowed local. An arm narrowed out of
-// a union arrives boxed, and its unbox is a named miss; so is an explicit `null`.
+// a union arrives boxed, and its unbox is a named miss; an explicit `null` takes the field's typed null.
 Deno.test({
   name: "ir shadow: a nullable record field's value matches, and an owed arm unbox is a named miss",
   ignore,
@@ -2617,8 +2617,8 @@ print(qnull().o == null)
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field explicitNull typed null") ?? 0) !== 2) {
-      throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered object field explicitNull typed null")) {
+      throw new Error(`want hnull and qnull's typed null built, got ${JSON.stringify([...rows])}`);
     }
   },
 });
