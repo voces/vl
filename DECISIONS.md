@@ -12942,3 +12942,21 @@ neither keeps nor writes the list (ROADMAP).
 carriers) and B (a generic as a value) resume after their pause. A stage may add lines when it moves
 late rows or unlocks programs, provided it advances toward B3.6 (deleting the late decider). Each
 stage still reports its net lines and the late rows it moves.
+
+## A module global's cell takes its storage rep, and a read takes legacy's rep carrier (2026-11-21, coordinator ruling) — D14426, D14434
+
+**Ruled by the coordinator 2026-11-21, option 1 of `refactor-notes/2026-11-21-ir-global-cell-rep-pair.md`.**
+In the IR, a module global's cell is at its storage type's rep (`letBindTy`). A read of it takes its
+rep from the rep fact legacy already computed and stored for that node, never from its checked type.
+This is D14426's shape for parameters, and there is no second rep channel.
+
+**Why.** Neither type alone matches legacy. At the binding rep the initializer misses, and at the
+storage rep every read the checker typed at the binding misses (`refactor-notes/2026-11-21-ir-global-cell-rep-pair.md`).
+A rep pair on the global (option 2) is a second rep channel. Leaving it to the elaboration
+(option 3) parks 116 functions behind work that is not scheduled.
+
+**Conditions.**
+- The step is monotone. A global whose initializer would be claimed but whose reads would newly
+  miss stays wholly on its current path until the carrier read lands, so the initializer and the
+  carrier read land together.
+- The carrier is a stored table legacy filled, named in the PR, not a re-derivation from the type.
