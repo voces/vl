@@ -5,8 +5,8 @@ what the standard library and the command-line tool promise. It does not say how
 compiler achieves any of that. Representations, passes and emitted wasm are covered in
 `docs/ARCHITECTURE.md` and `docs/internals/`.
 
-Each chapter states the rules in force today. Each rule cites the owner ruling that set it,
-where one exists, and is marked where the compiler has not caught up.
+Each chapter states the rules in force today. Each rule cites the ruling that set it, where
+one exists, and is marked where the compiler has not caught up.
 
 ## Chapters
 
@@ -37,8 +37,9 @@ const x = 0x10 + 1
 print(x)   // prints 17
 ```
 
-**Rulings.** A rule an owner ruling settled carries a `Ruling:` line. It names the date,
-the option taken, and where the ruling is recorded. That is a `DECISIONS.md` section, a
+**Rulings.** A rule a ruling settled carries a `Ruling:` line. It names who ruled (the owner,
+or the coordinator per CLAUDE.md §Rulings), the date, the option taken, and where the ruling is
+recorded. That is a `DECISIONS.md` section, a
 section of `docs/internals/open-rulings.md`, or an inventory row `D<id>`
 (`docs/internals/inventory/D<id>.md`).
 
@@ -62,7 +63,7 @@ OPEN-QUESTIONS.md with options and a recommendation. The spec does not answer it
 
 **Sources, in order of authority.** The order is:
 
-1. Owner rulings.
+1. Rulings, the owner's or the coordinator's.
 2. `docs/guide/` and the design documents in `docs/`.
 3. The compiler's observed behaviour.
 
