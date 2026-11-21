@@ -134,6 +134,7 @@ import {
   callRefPlainVoid,
   clearPlanOf,
   clearRecvIsList,
+  cloCellReaches,
   cloLiftCalleeOf,
   closureValueWhy,
   coalClosedWidensAtom,
@@ -234,7 +235,11 @@ import {
   zextLoadOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
-import { identUnboxAtomOf, variantCoerceArmOf } from "./emit_plan_union"
+import {
+  arrLitVariantSlot,
+  identUnboxAtomOf,
+  variantCoerceArmOf,
+} from "./emit_plan_union"
 import {
   HoleBox,
   IsArm,
@@ -266,7 +271,7 @@ import {
   spreadPairKnown,
   spreadPlanOf,
 } from "./emit_plan_list"
-import { mvValVariantOf } from "./emit_shape_rows"
+import { mvValVariantOf, rlElemVariantRow } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
   BinNulTest,
@@ -372,7 +377,11 @@ import {
   sFieldStoreKind,
   spreadBoxingSource,
 } from "./emit_classify"
-import { declaredSlotOf, declaredSlotOfDecl } from "./emit_struct_order"
+import {
+  declaredSlotOf,
+  declaredSlotOfDecl,
+  rlElemTyIxAt,
+} from "./emit_struct_order"
 import {
   callSpillsFcpArg,
   elseLessNullableTail,
@@ -415,6 +424,7 @@ import { memOffsetLexValue } from "./check_intrinsics"
 import {
   charLitCp,
   exprEffectFree,
+  listIsTestedIdent,
   objFieldSrcOrder,
   objFieldVal,
   unwrapParen,
@@ -1633,7 +1643,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
   if captureSlotOf(n.identName, ibFnIx) >= 0 {
-    return captureRead(n, ix, d, rep)
+    return captureRead(b, n, ix, rep)
   }
   const w = localIndexOf(ibFnIx, ix)
   // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
@@ -1666,36 +1676,42 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   return irBMiss("read of " + n.identName)
 }
 
-// Capture `n`, declared at `d`, read at `rep` on legacy's `capture` arm: a lifted function's own
-// parameter after its environment (`emitCaptureSlotRead`). An environment field read misses.
-function captureRead(n: Ident, ix: i32, d: i32, rep: i32): Opnd {
+// Capture `n` read at `rep` on legacy's `capture` arm (`emitCapturedRead`): a lifted function's
+// own parameter after its environment, else its environment's field; at the capture's own rep.
+function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if identReadArmOf(n, ix, ibFnIx, false) != "capture" {
     return irBMiss("read of " + n.identName)
   }
   const fe = fnStmtsPosOf(ibFnIx)
-  if !cloLifted(fe) { return irBMiss("capture env read") }
-  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
   const name = n.identName
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
     return irBMiss("capture recover")
   }
-  const v = liftCapVar(fe, name, d)
-  if v < 0 { return irBMiss("capture binding") }
-  if ib.irVars[v].vRep != rep { return irBMiss("capture read rep") }
+  if capRepOf(fe, name) != rep { return irBMiss("capture binding") }
+  if !cloLifted(fe) {
+    // An `is K[]`-tested capture may read the empty list legacy stands in (D4935).
+    if listIsTestedIdent(unwrapParen(ix)) {
+      return irBMiss("capture list test")
+    }
+    return irBLetTemp(
+      b,
+      { evSlot: captureSlotOf(name, ibFnIx), evAt: ix },
+      ix,
+      rep,
+    )
+  }
+  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
+  const v = liftCapVar(fe, name)
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
   return o
 }
 
-// The parameter variable of lifted function `fe`'s capture `name`, bound at `d` in its owning
-// frame and typed there, made at its first read; -1 when its rep is not the valtype legacy's
-// function type gives the capture (`captureValKind`).
-function liftCapVar(fe: i32, name: string, d: i32): i32 {
-  const w = 1 + captureSlotOf(name, ibFnIx)
-  const known = paramVarAt(w)
-  if known >= 0 { return known }
-  if parentBindingOf(fe, name) != d { return -1 }
-  const ty = heldTy(scopeTyAt(d, parentBindingFrameArenaOf(fe, name)))
+// The rep of capture `name` of function `fe`, its binding's type in the frame that owns it; -1
+// when that rep is no value, open, or not the valtype legacy gives the capture (`captureValKind`).
+function capRepOf(fe: i32, name: string): i32 {
+  const ty = capTyOf(fe, name)
+  if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
   const vt: u8[] = []
@@ -1706,19 +1722,85 @@ function liftCapVar(fe: i32, name: string, d: i32): i32 {
   if vt.length == 0 { return -1 }
   if t >= 0 && (vt.length != 1 || vt[0] != t) { return -1 }
   if t < 0 && vt[0] != 0x63 && vt[0] != 0x64 { return -1 }
-  const v = irVarNew(ib, r, ty, "param", w)
+  return r
+}
+
+// The type of capture `name` of function `fe`: its binding's in the frame that owns it, or -1.
+function capTyOf(fe: i32, name: string): i32 {
+  const d = parentBindingOf(fe, name)
+  if d < 0 { return -1 }
+  return heldTy(scopeTyAt(d, parentBindingFrameArenaOf(fe, name)))
+}
+
+// The parameter variable of the lifted function `fe` being built for its capture `name`, at
+// `capRepOf`'s rep, made at its first use.
+function liftCapVar(fe: i32, name: string): i32 {
+  const w = 1 + captureSlotOf(name, ibFnIx)
+  const known = paramVarAt(w)
+  if known >= 0 { return known }
+  const r = capRepOf(fe, name)
+  const v = irVarNew(ib, r, capTyOf(fe, name), "param", w)
   ib.irParams.push(v)
   return v
 }
 
-// A function name or literal `ix` read as a capture-free closure value, as a global's initializer
-// reads one.
+// A function name or literal `ix` read as a closure value: capture-free as a global's initializer
+// reads one, or over a fresh environment of its captures as this frame holds them.
 function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
   const fe = cloValueFeOf(ix)
   if fe < 0 { return irBMiss(cloValueWhy(ix)) }
   if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
-  if fnEnvIdxOf(fe) >= 0 { return irBMiss("closure env") }
-  return irBLetTemp(b, { mcFn: fe, mcEnv: [], mcAt: ix }, ix, rep)
+  const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, ix) } else { [] }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  return irBLetTemp(b, { mcFn: fe, mcEnv: env, mcAt: ix }, ix, rep)
+}
+
+// The environment of capturing function `fe`, read at `ix`, as `emitClosureEnvOf` builds it: each
+// capture a parameter or binding of this frame, or this frame's own capture. A cached or shared
+// environment, a cell, or a global capture misses.
+function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
+  const out: Opnd[] = []
+  if irEnvCached(fe) || cloCellReaches(fe, ibFnIx) {
+    irBMiss("closure env cache")
+    return out
+  }
+  const self = fnStmtsPosOf(ibFnIx)
+  for name in captureNamesOf(fe) {
+    const r = capRepOf(fe, name)
+    if r < 0 || capCellTargetOf(name) >= 0 {
+      irBMiss("closure env capture")
+      return out
+    }
+    const p = paramIndexOf(ibFnIx, name)
+    const d = if p < 0 { liftCapDecl(fe, name) } else { -1 }
+    let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
+    const fi = if v < 0 { captureSlotOf(name, ibFnIx) } else { -1 }
+    if fi >= 0 && capRepOf(self, name) == r {
+      if cloLifted(self) {
+        if cloLiftWriteCount(self) > 0 {
+          v = -1
+        } else {
+          v = liftCapVar(self, name)
+        }
+      } else {
+        const t = irBLetTempTy(
+          b,
+          { evSlot: fi, evAt: -1 },
+          ix,
+          r,
+          capTyOf(fe, name),
+        )
+        if t is OVar { v = t.ov }
+      }
+    }
+    if v < 0 || ib.irVars[v].vRep != r {
+      irBMiss("closure env capture")
+      return out
+    }
+    const o: Opnd = { ov: v }
+    out.push(o)
+  }
+  return out
 }
 
 // Local `v` read at `rep`, which its narrowing gives it, not its own: a box at the variant a
@@ -2290,20 +2372,20 @@ function numKindPrim(k: i32): string {
   return ""
 }
 
-// `g.has(k)` on a map global read plainly, with a key written as itself (`mapKeyArmOf`), as
-// legacy's map has writes it.
-function mapHasRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
-  const sh = mapRecvShapeOf(m.memObj, ibFnIx)
+// `recv.has(key)` at node `ix` (a call, or a map read's null test) on a map read plainly, with a
+// key written as itself (`mapKeyArmOf`), as legacy's `emitMapHas` writes it.
+function mapHasRhs(b: i32[], recvIx: i32, keyIx: i32, ix: i32): Rhs {
+  const sh = mapRecvShapeOf(recvIx, ibFnIx)
   if sh == -3 { return missRhs("map has value type") }
-  const ka = mapKeyArmOf(m.memObj, c.callArgs[0], ibFnIx, sh)
+  const ka = mapKeyArmOf(recvIx, keyIx, ibFnIx, sh)
   if ka != "plain" { return missRhs("map key " + ka) }
-  const rk = mapRecvKeyOf(b, m.memObj, c.callArgs[0], "map has receiver")
+  const rk = mapRecvKeyOf(b, recvIx, keyIx, "map has receiver")
   if rk == null { return missRhs(ibMiss) }
   const r: Rhs = {
     mhSym: rk.mkSym,
     mhNonNull: rk.mkNonNull,
     mhLoc: rk.mkLoc,
-    mhRecv: m.memObj,
+    mhRecv: recvIx,
     mhKey: rk.mkKey,
     mhAt: ix,
   }
@@ -2366,7 +2448,7 @@ function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     return popValueRhs(b, m, ix)
   }
   if m.memProp == "has" && c.callArgs.length == 1 && exprMap(m.memObj, ibFnIx) {
-    return mapHasRhs(b, c, m, ix)
+    return mapHasRhs(b, m.memObj, c.callArgs[0], ix)
   }
   if m.memProp == "map" || m.memProp == "filter" {
     return mapFilterRhs(b, c, m, ix)
@@ -3013,6 +3095,14 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   // A literal boxed as its context arm is the IR's record only when it is built at that arm.
   const row = if at >= 0 { at } else { objLitVariantLayoutOf(unwrapParen(ix), ibFnIx) }
   if p.hbArm == "obj" && row != p.hbKind { return irBMiss("box literal arm") }
+  // Legacy writes a dispatch's id stash under the box's leading tag; the IR's stash precedes it.
+  if (
+    p.hbArm != "pass"
+    && p.hbArm != "memberBox"
+    && exprPrePathWhy(ix, ibFnIx) == "pre-path tag dispatch"
+  ) {
+    return irBMiss("boxed tag dispatch")
+  }
   return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
 }
 
@@ -3242,8 +3332,8 @@ function atomOperand(ix: i32): boolean {
 
 // A `==`/`!=` against a `null` literal, by legacy's own route: a dead test is its constant
 // (`deadNulTest`); a `null`-typed pair (`nulNoneEqSides`) misses; then the null test's arm
-// (`nulTestArmOf`) with the direction the dispatch hands it. Only a `K | null`'s sentinel compare
-// and a string's typed null test are built.
+// (`nulTestArmOf`) with the direction the dispatch hands it. Built: a niche's compare, a nullable
+// ref's or string's typed test, a union box's null tag, and a scalar map read's probe.
 function nulTest(
   b: i32[],
   n: BinExpr,
@@ -3257,7 +3347,14 @@ function nulTest(
     return irBMiss("null test of null")
   }
   const arm = nulTestArmOf(bt.bnRef, ibFnIx, bt.bnInvert, false)
-  if arm != "atom" && arm != "bool" && arm != "nullRef" && arm != "nulStr" {
+  if arm == "mapHas" { return nulTestMapHas(b, bt, ix, rep) }
+  if (
+    arm != "atom"
+    && arm != "bool"
+    && arm != "nullRef"
+    && arm != "nulStr"
+    && arm != "boxTag"
+  ) {
     return irBMiss("null test " + arm)
   }
   const v = irBExpr(b, bt.bnRef)
@@ -3267,11 +3364,25 @@ function nulTest(
     !(arm == "atom" && atomNullable(vr)
       || arm == "bool" && boolNullable(vr)
       || arm == "nulStr" && strNullable(vr)
-      || arm == "nullRef" && (strNullable(vr) || refNullable(vr)))
+      || arm == "nullRef" && (strNullable(vr) || refNullable(vr))
+      || arm == "boxTag" && heldAsBox(vr))
   ) {
     return irBMiss("null test operand")
   }
   return irBLetTemp(b, { ntV: v, ntInvert: bt.bnInvert, ntAt: ix }, ix, rep)
+}
+
+// `m[k] == null` over a scalar map read, as legacy writes it: the map's has probe, then
+// `i32.eqz` for `==`.
+function nulTestMapHas(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
+  const r = nodeAt(unwrapParen(bt.bnRef))
+  if !(r is Index) { return irBMiss("null test map operand") }
+  if rep != ibBool { return irBMiss("null test result rep") }
+  const h = mapHasRhs(b, r.idxArr, r.idxIndex, ix)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  const v = irBLetTemp(b, h, ix, rep)
+  if bt.bnInvert || ibMiss != "" { return v }
+  return irBLetTemp(b, { poOp: "not", poArgs: [v] }, ix, rep)
 }
 
 // A null test the checker proved dead (`deadNullTestOperand`), as legacy's `emitDeadNullTest`
@@ -3401,7 +3512,9 @@ function arrayLit(
   if arm == "spread" { return spreadLit(b, n, ix, rep, lb) }
   // A ref list builds along `emitArrRef`'s short arms (`arrLitRefShortSlot`) or not at all: each
   // element as is, or each boxed by its record, which `deliver` writes at the box rep.
-  if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 {
+  // …or a non-null variant's, each element a literal built at the variant's row or a value of it.
+  const vslot = if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 { arrLitVariantSlot(ix, ibFnIx, lb) } else { -1 }
+  if arm == "ref" && arrLitRefShortSlot(ix, ibFnIx, lb) < 0 && vslot < 0 {
     return irBMiss("array ref")
   }
   if (
@@ -3436,7 +3549,7 @@ function arrayLit(
   const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
   for e in n.arrElems {
-    const v = deliver(b, e, er, -1)
+    const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
@@ -3449,6 +3562,19 @@ function arrayLit(
   }
   if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
   return irBLetTemp(b, r, ix, lrep)
+}
+
+// Element `e` of a list literal at variant slot `vslot` (`arrLitVariantSlot`), at element rep
+// `er`: an object literal built at the variant's row, as `emitVariantStruct` builds it, else the
+// value as it stands.
+function variantElem(b: i32[], e: i32, er: i32, vslot: i32): Opnd {
+  const vi = rlElemVariantRow(vslot)
+  if variantCoerceArmOf(vi, e, ibFnIx) != "struct" {
+    return deliver(b, e, er, -1)
+  }
+  const pre = exprPrePathWhy(e, ibFnIx)
+  if pre != "" { return irBMiss(pre) }
+  return objLitAt(b, unwrapParen(e), er, rlElemTyIxAt(vslot), vi, true)
 }
 
 // A spread literal of one item group, a spread source, along legacy's plain arm (`spreadPlanOf`):
