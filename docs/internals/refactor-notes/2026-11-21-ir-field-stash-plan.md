@@ -1,6 +1,6 @@
 # Plan: an order-stashed record field written in place (2026-11-21)
 
-**The class.** `short-circuit field after another` holds 9 self-compile functions at `5d2c2b81`:
+**The class.** `short-circuit field after another` blocks 7 self-compile functions alone at `4c186c33`, and 9 once #9352 lands:
 `mkBinary`, `cexMake` and their kin. Each is a record literal under legacy's source-order stash
 (#9247) whose later field is a valued `if` (a short-circuit or an `if` expression). Legacy writes
 each field in source order, the value then `local.set` into the slot `objOrderStashSlot` opens for
