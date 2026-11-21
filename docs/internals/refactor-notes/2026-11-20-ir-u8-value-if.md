@@ -23,4 +23,4 @@ first cut applied it inside `heldTy`, which every temp asks, and cost +0.45% L2 
 
 `tests/cases/arrays/u8-push-value-if.vl`: a digit chain, a literal flag, and an `else if` chain
 whose computed value is past a byte (300, read back as 44). Under the merge-base seed all three
-functions stop at `rep u8`; after, all are covered and matched. Shadow row `U8_VALUE_IF`.
+functions stop at `rep u8`; after, all are covered and matched. Shadow row `tests/ir-shadow-rows/u8-value-if.vl`.
