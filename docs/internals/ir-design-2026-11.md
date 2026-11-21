@@ -886,6 +886,12 @@ accordingly: `atomStrPlanOf(…, held: false)` (#9127), `fnValueArmOf(…, stubR
 body that assumption can be false, and a plan the IR asks as "fresh delivery" can then disagree
 with what legacy decides at the same node.
 
+**A door that ships gates on `claimable()` (coordinator ruling, 2026-11-21).** A fragment that
+writes shipped bytes (`probe` false) does so only when every node is in a claimed family, as a
+function or start body claims, so a `CLAIMED`-empty compiler writes legacy's bytes there and
+`ir-identity.sh --claimless` compares them. The one shipping door today, I8a's const cell
+(`irClaimConstCell`), does.
+
 **Before the first non-shadow caller of `irLowerNodeIn`, the door must miss ("legacy context
 live") unless each of these is at its resting value:**
 - the coercion seats: `coerceHeld`, `boxSeat`, `armSeat`, `armServed`, `atomSeat` (`numSeat` no
