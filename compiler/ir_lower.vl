@@ -4,6 +4,7 @@
 // which holds only when the temps are consumed in their definition order; the lowering
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
+import { fnEnvIdxOf } from "./emit_capture_frames"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
@@ -65,6 +66,7 @@ import {
 import { uFieldStorageSlot } from "./emit_lit_atoms"
 import { relTrim } from "./emit_reloc"
 import {
+  captureNamesOf,
   coalesceDefaultNullable,
   declaredIndexAt,
   exprVariantIndex,
@@ -97,6 +99,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvGet,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -261,6 +264,8 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitCapturedRead,
+  emitClosureIds,
   emitClosureValue,
   emitFoldedConstRead,
   emitForInCursorInit,
@@ -273,13 +278,13 @@ import {
   emitUnionUnboxTail,
   f64RemCallTail,
   f64RemOperandTail,
-  fallThroughPadOf,
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
+  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -334,6 +339,7 @@ import {
   narrowedVariantTail,
   nulTestAtomTail,
   nulTestBoolTail,
+  nulTestBoxTagTail,
   nulTestRefTail,
   numCastTail,
   numIntrTail,
@@ -391,6 +397,7 @@ import {
   voidTailCallee,
 } from "./wasmEmit"
 import {
+  arrLitVariantSlot,
   atomEqPlanOf,
   holeBoxPlanOf,
   memRecvOwesNonNull,
@@ -432,6 +439,7 @@ import {
   fbEagerScratch,
   fbFrameParams,
   fnStmts,
+  fnStmtsPosOf,
   fnUses,
   gCellIdx,
   gHelpF64Rem,
@@ -819,6 +827,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListCopy => irLMiss("list copy value")
     RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
+    REnvGet => envGet(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1011,11 +1020,30 @@ function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
 // as `emitExpr` writes a function literal or a function name.
 function makeClo(r: RMakeClo) {
-  if r.mcEnv.length > 0 { return irLMiss("closure env") }
-  leaf()
-  emitClosureValue(r.mcFn, lw.irAt)
+  if r.mcEnv.length > 0 {
+    // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
+    const envIdx = fnEnvIdxOf(r.mcFn)
+    if envIdx < 0 { return irLMiss("closure env") }
+    for o in r.mcEnv { irLOpnd(o) }
+    fbStructNew(envIdx)
+    emitClosureIds(r.mcFn)
+  } else {
+    leaf()
+    emitClosureValue(r.mcFn, lw.irAt)
+  }
   if nodeAt(r.mcAt) is Ident && readOwesNonNullRecover(r.mcAt, lw.irAt) {
     fbRefAsNonNull()
+  }
+  return 0
+}
+
+// `REnvGet`: legacy's read of a capture from the function's environment, recovered at the read.
+function envGet(r: REnvGet) {
+  leaf()
+  const caps = captureNamesOf(fnStmtsPosOf(lw.irAt))
+  if r.evSlot < 0 || r.evSlot >= caps.length { return irLMiss("env slot") }
+  if emitCapturedRead(caps[r.evSlot], lw.irAt, r.evAt) != 1 {
+    return irLMiss("env read")
   }
   return 0
 }
@@ -1066,7 +1094,7 @@ function globalRead(sym: i32, nonNull: boolean) {
 }
 
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
-// sentinel's compare, or a nullable ref's `ref.is_null`.
+// sentinel's compare, a nullable ref's `ref.is_null`, or a union box's null tag compare.
 function nulTestOp(r: RNulTest) {
   if r.ntAt < 0 { return irLMiss("null test node") }
   const n = nodeAt(r.ntAt)
@@ -1086,7 +1114,11 @@ function nulTestOp(r: RNulTest) {
     irLOpnd(r.ntV)
     return nulTestBoolTail(r.ntInvert)
   }
-  // The builder makes `RNulTest` only at the four arms above.
+  if arm == "boxTag" {
+    irLOpnd(r.ntV)
+    return nulTestBoxTagTail(r.ntInvert)
+  }
+  // The builder makes `RNulTest` only at the five arms above.
   return irLMiss("null test " + arm)
 }
 
@@ -1333,8 +1365,9 @@ function makeList(r: RMakeList) {
   }
   for e in r.mlElems { irLOpnd(e) }
   if arm == "ref" {
+    const sl = arrLitRefShortSlot(r.mlAt, fnIx, lb)
     return arrLitRefShortTail(
-      arrLitRefShortSlot(r.mlAt, fnIx, lb),
+      if sl >= 0 { sl } else { arrLitVariantSlot(r.mlAt, fnIx, lb) },
       r.mlElems.length,
     )
   }
@@ -2808,8 +2841,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
   body(f.irBody, !valued && f.irAt >= 0, -1, false)
-  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
-  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
+  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).

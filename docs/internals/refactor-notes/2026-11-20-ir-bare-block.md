@@ -32,4 +32,4 @@ class of the control family.
 
 `tests/cases/scope/bare-block-mid-body-builds.vl` has a block with its own local, a nested block,
 and a block in a loop body. Under the merge-base seed all three functions stop at `rep ?`. After,
-all are covered and matched. Shadow row `BARE_BLOCK_MID`.
+all are covered and matched. Shadow row `tests/ir-shadow-rows/bare-block-mid-body.vl`.
