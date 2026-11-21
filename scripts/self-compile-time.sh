@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# THE L2 TRIPWIRE: the candidate compiling the compiler, in guest FUEL, against a committed
-# baseline. Fails past the baseline's per-PR tier (+1%), past its factor (1.5x), and when the live
-# set nears the heap's cap. A rise is accepted by `--write-baseline` in the same PR together with a
-# line in scripts/self-compile-ledger.txt naming the PR and the mechanism; the check refuses a
-# baseline whose fuel the ledger's last line does not name. A coordinator drift refresh (no single
-# mechanism) also gives in its line the cumulative rise since the last owner-ruled baseline; past
-# +3% cumulative it needs an owner ruling, named in the line (docs/internals/merge-queue.md).
+# THE L2 TRIPWIRE: the candidate compiling the compiler, in guest FUEL. Fails past the per-PR tier
+# (+1%) on the BASE MASTER the tree was built on (that base's own L2, measured from its fixpoint and
+# cached, or $SELF_COMPILE_BASE_FUEL), past the committed baseline's factor (1.5x), and when the
+# live set nears the heap's cap. The rise on the ledgered baseline is printed as the cumulative
+# line and reds only at the factor; past +3% it is reported for the coordinator's next drift
+# refresh, which attributes it by measurement (docs/internals/merge-queue.md, Fuel drift). A rise a
+# PR owns is accepted by `--write-baseline` in that PR with a line in
+# scripts/self-compile-ledger.txt naming the PR and the mechanism; the check refuses a baseline
+# whose fuel the ledger's last line does not name.
 #
 # It is a tripwire, not a measurement. A cost regression does not slow the SOURCE, it
 # slows the compiler BUILT from it — stage 3 runs the old compiler and stays fast, so an
@@ -26,6 +28,8 @@
 #   scripts/self-compile-time.sh --write-baseline  # after a real change in cost lands
 #   scripts/self-compile-time.sh --pair <dir>      # grade the stage 4 scripts/self-compile-pair.sh built
 #   scripts/self-compile-time.sh --phases          # also print the fuel per pipeline phase
+#   SELF_COMPILE_BASE=<commit>|none                # the per-PR base (default: merge-base with origin/master)
+#   SELF_COMPILE_BASE_FUEL=<fuel>                  # that base's L2 fuel, when the caller measured it
 #
 # THE PHASE SPLIT is printed, never graded: the run's fuel shared out by guest-profile sample
 # (scripts/perf/profile-phases.vl), so a rise can be read by phase. The pair's stage 4 is already
@@ -135,7 +139,8 @@ if [ "$LAST" != "$BASE" ]; then
 fi
 LIMIT=$(awk -v b="$BASE" -v f="$FACTOR" 'BEGIN{printf "%.0f", b * f}')
 PCT=$(awk -v c="$FUEL" -v b="$BASE" 'BEGIN{printf "%+.1f", 100 * (c - b) / b}')
-echo "L2 self-compile fuel $FUEL (${PCT}% on baseline $BASE, trips past $LIMIT = ${FACTOR}x); ${CPU}s CPU, not graded"
+# CUMULATIVE: against the ledgered baseline. Reported; it reds only past the 1.5x factor.
+echo "L2 self-compile fuel $FUEL (${PCT}% cumulative on baseline $BASE, trips past $LIMIT = ${FACTOR}x); ${CPU}s CPU, not graded"
 if [ -s "$WORK/profile.json" ]; then
   echo "L2 self-compile fuel by phase (printed, not graded):"
   "$VL" run scripts/perf/profile-phases.vl -- "$WORK/profile.json" --fuel "$FUEL" --weighted 2>&1 || true
@@ -150,14 +155,67 @@ awk -v c="$FUEL" -v l="$LIMIT" 'BEGIN{exit !(c > l)}' && {
   echo "  scripts/self-compile-time.sh --write-baseline"
   exit 1
 }
-TIERLIM=$(awk -v b="$BASE" -v t="$TIER" 'BEGIN{printf "%.0f", b * (1 + t)}')
+DRIFT="${DRIFT:-0.03}"
+awk -v c="$FUEL" -v b="$BASE" -v d="$DRIFT" 'BEGIN{exit !(c > b * (1 + d))}' && {
+  echo "  CUMULATIVE DRIFT past +$(awk -v d="$DRIFT" 'BEGIN{printf "%g", 100 * d}')% on the ledgered baseline: reported, not graded. The coordinator's next"
+  echo "  drift refresh attributes the rise by measurement first (merge-queue.md, Fuel drift)."
+}
+
+# PER-PR: against the base master this tree was built on (coordinator ruling, 2026-11-21), so a
+# batch reds on its own rise and never on master's drift. The base is $SELF_COMPILE_BASE_FUEL, or
+# the L2 fuel of $SELF_COMPILE_BASE (a commit; default: the merge-base of HEAD and origin/master)
+# compiling its own compiler/ from its fixpoint seed, cached by that tree and this host. With no
+# base to be had, the per-PR tier is graded on the ledgered baseline, as before, and says so.
+base_fuel() {
+  local ref="$1" key cache dir
+  key=$( { git rev-parse "$ref:compiler"; git rev-parse "$ref:deno.json"; sha256sum < "$VL" | cut -c1-16
+    echo "$VL_COMPILE_GC $VL_COMPILE_GC_HEAP"; } 2>/dev/null | sha256sum | cut -c1-24) || return 1
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/vl/base-fuel/$key"
+  if [ -s "$cache" ]; then cat "$cache"; return 0; fi
+  dir="$WORK/base"; mkdir -p "$dir"
+  git archive "$ref" compiler deno.json | tar -x -C "$dir" || return 1
+  # Built from inside the exported tree by the same relative path as the candidate's $SRC: the
+  # path is compiled in, so another spelling of it costs other fuel.
+  # Rung 1: this seed builds the base compiler; rung 2: that builds itself, the base's own
+  # codegen; rung 3, fueled: rung 2 builds the base compiler again, which is the base's L2.
+  local vl seed; vl=$(realpath "$VL"); seed=$(realpath "$SEED")
+  ( cd "$dir" || exit 1
+    timeout 600 "$vl" build "$SRC" -o "$WORK/b1.wasm" --compiler "$seed" > /dev/null 2>&1 || exit 1
+    timeout 600 "$vl" build "$SRC" -o "$WORK/b2.wasm" --compiler "$WORK/b1.wasm" > /dev/null 2>&1 || exit 1
+    VL_FUEL=1 timeout 600 "$vl" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compiler "$WORK/b2.wasm" > /dev/null 2>&1
+    VL_FUEL=1 timeout 600 "$vl" build "$SRC" -o "$WORK/b3.wasm" --compiler "$WORK/b2.wasm" \
+      > /dev/null 2> "$WORK/bt" ) || return 1
+  cmp -s "$WORK/b2.wasm" "$WORK/b3.wasm" || { echo "base $ref: rung 2 != rung 3, not a fixpoint" >&2; return 1; }
+  local f; f=$(awk '/^\[fuel\] guest: [0-9]+$/{print $3}' "$WORK/bt")
+  [ -n "$f" ] || return 1
+  mkdir -p "$(dirname "$cache")" && echo "$f" > "$cache"
+  echo "$f"
+}
+BASEREF="${SELF_COMPILE_BASE:-$(git merge-base HEAD origin/master 2>/dev/null || true)}"
+PRBASE="${SELF_COMPILE_BASE_FUEL:-}"; PRFROM="base fuel given"
+# A tree that is its own base (master itself, compiler/ unedited) is graded on its own reading.
+if [ -z "$PRBASE" ] && [ -n "$BASEREF" ] && [ "$BASEREF" != none ] \
+  && [ "$(git rev-parse "$BASEREF" 2>/dev/null)" = "$(git rev-parse HEAD 2>/dev/null)" ] \
+  && git diff --quiet HEAD -- compiler deno.json 2>/dev/null; then
+  PRBASE="$FUEL"; PRFROM="the tree is its own base"
+fi
+if [ -z "$PRBASE" ] && [ -n "$BASEREF" ] && [ "$BASEREF" != none ]; then
+  [ -f "$WORK/warm.vl" ] || printf 'print(1)\n' > "$WORK/warm.vl"
+  PRBASE=$(base_fuel "$BASEREF") && PRFROM="base $(git rev-parse --short "$BASEREF")" || PRBASE=""
+fi
+if [ -z "$PRBASE" ]; then
+  PRBASE="$BASE"; PRFROM="ledgered baseline (no base master to measure)"
+fi
+PRPCT=$(awk -v c="$FUEL" -v b="$PRBASE" 'BEGIN{printf "%+.2f", 100 * (c - b) / b}')
+echo "L2 self-compile fuel per PR: ${PRPCT}% on $PRBASE ($PRFROM), per-PR tier +$(awk -v t="$TIER" 'BEGIN{printf "%g", 100 * t}')%"
+TIERLIM=$(awk -v b="$PRBASE" -v t="$TIER" 'BEGIN{printf "%.0f", b * (1 + t)}')
 awk -v c="$FUEL" -v l="$TIERLIM" 'BEGIN{exit !(c > l)}' && {
-  echo "SELF-COMPILE FUEL ROSE ${PCT}% (per-PR tier +$(awk -v t="$TIER" 'BEGIN{printf "%g", 100 * t}')%): fuel $FUEL against"
-  echo "  the $BASE baseline. Find the mechanism (profile the self-compile, docs/internals/"
+  echo "SELF-COMPILE FUEL ROSE ${PRPCT}% on its base (per-PR tier +$(awk -v t="$TIER" 'BEGIN{printf "%g", 100 * t}')%): fuel $FUEL against"
+  echo "  $PRBASE ($PRFROM). Find the mechanism (profile the self-compile, docs/internals/"
   echo "  profiling-the-compiler.md) and fix it, or accept it in this PR: run, from a fixpoint seed,"
   echo "  scripts/self-compile-time.sh --write-baseline, and add its line to $LEDGER."
   exit 1
 }
-awk -v c="$FUEL" -v b="$BASE" -v t="$TIER" 'BEGIN{exit !(c < b * (1 - t))}' &&
-  echo "  fell ${PCT}%: the PR that earned it may lower the baseline (--write-baseline and a ledger line)"
+awk -v c="$FUEL" -v b="$PRBASE" -v t="$TIER" 'BEGIN{exit !(c < b * (1 - t))}' &&
+  echo "  fell ${PRPCT}% on its base: the PR that earned it may lower the baseline (--write-baseline and a ledger line)"
 echo "self-compile time ok"
