@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR: a discarded slice drops its value; a union or numeric global's initializer is boxed or widened at its cell.** A `.slice(…)` statement was built as an effect the lowering has no arm for, a claim fallback (`effect outside I1`) in three programs; it is now a temp the IR drops, as legacy evaluates and drops it. A start body's `global initializer unionBox` and `global initializer widen` misses now build, through `deliver` at the cell's rep (tests/cases start bodies covered 3,713 → 3,921). A map store whose value is an assignment to a wider name, which the IR wrote ahead of the store's receiver and key, is a named miss (`map store value store`), closing a byte mismatch it already had inside functions.
