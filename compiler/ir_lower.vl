@@ -10,6 +10,7 @@ import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import {
   RAtom,
+  RBox,
   RClosure,
   RList,
   RMap,
@@ -114,6 +115,7 @@ import {
   RFnId,
   RGetField,
   RGlobalGet,
+  RListCat,
   RListClear,
   RListCopy,
   RListEmpty,
@@ -153,6 +155,7 @@ import {
   RSharedRead,
   RSpread,
   RStage,
+  RStashSet,
   RStrOp,
   RTagIs,
   RTagOf,
@@ -454,7 +457,7 @@ import {
   spreadPlanOf,
   spreadWrapIdx,
 } from "./emit_plan_list"
-import { fbOpenIf } from "./emit_bytes"
+import { fbOpenIf, fbValtype } from "./emit_bytes"
 import {
   atomHookArmOf,
   emitListEmptyLoop,
@@ -465,7 +468,7 @@ import {
   emptyFitPlanOf,
   fbRefIfOpenType,
 } from "./wasmEmit"
-import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
+import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
 import { forInLoopAt } from "./emit_plan_list"
 import {
@@ -527,6 +530,10 @@ let lwLive: i32[] = []
 let lwLiveEnd: i32[] = []
 let lwFloor = 0
 let lwFloors: i32[] = []
+// The order-stash slots the function's `RStashSet`s opened: literal, layout position, slot.
+let lwStashAt: i32[] = []
+let lwStashFi: i32[] = []
+let lwStashSlots: i32[] = []
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -802,6 +809,7 @@ function rhs(r: Rhs, tail: boolean) {
       numIntrTail(r.nxOp)
     }
     RTagStash => irLMiss("tag stash as a value")
+    RStashSet => irLMiss("stash set as a value")
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
     RLitArms => litArms(r)
@@ -830,6 +838,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListPush |
       RListPop |
       RListEq |
+      RListCat |
       RStrOp |
       RMapFilter |
       RListSlice => irLowerListHook(r)
@@ -1040,16 +1049,33 @@ function stmtsHolding(root: i32, ix: i32, pos: i32): i32[] {
   return []
 }
 
-// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row. Under
-// the order stash, each field in source order into its scratch slot first, read back in layout.
-function makeRec(r: RMakeRec) {
+// The row a record literal at `at` is written at: its destination's `rowIn` (a variant's where
+// `variant`), else its own, under the order stash where `stash`; -1 for none.
+function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
   const fnIx = lw.irAt
-  const variant = if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, fnIx) == "variant" }
+  if rowIn >= 0 && variant {
+    return if stash { objLitVariantStashAt(at, rowIn) } else { objLitVariantLayoutAt(at, rowIn) }
+  }
+  if rowIn >= 0 {
+    return if stash { objLitStashRowAt(at, rowIn) } else { objLitLayoutRowAt(at, rowIn) }
+  }
+  if variant {
+    return if stash { objLitVariantStashOf(at, fnIx) } else { objLitVariantLayoutOf(at, fnIx) }
+  }
+  return if stash { objLitStashRowOf(at, fnIx) } else { objLitLayoutRowOf(at, fnIx) }
+}
+
+// `RMakeRec`: each field in layout order, then legacy's `struct.new` of the literal's row. Under
+// the order stash, each field in source order into its scratch slot first, read back in layout;
+// for `mrSet` its `RStashSet`s set the slots, and it only reads them back.
+function makeRec(r: RMakeRec) {
+  const variant = if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, lw.irAt) == "variant" }
   const stash = r.mrSrc.length > 0
-  const row = if r.mrRow >= 0 && variant { if stash { objLitVariantStashAt(r.mrAt, r.mrRow) } else { objLitVariantLayoutAt(r.mrAt, r.mrRow) } } else if r.mrRow >= 0 { if stash { objLitStashRowAt(r.mrAt, r.mrRow) } else { objLitLayoutRowAt(r.mrAt, r.mrRow) } } else if variant { if stash { objLitVariantStashOf(r.mrAt, fnIx) } else { objLitVariantLayoutOf(r.mrAt, fnIx) } } else if stash { objLitStashRowOf(r.mrAt, fnIx) } else { objLitLayoutRowOf(r.mrAt, fnIx) }
+  const row = recRowOf(r.mrAt, r.mrRow, variant, stash)
   if row < 0 { return irLMiss("record row") }
+  if r.mrSet { return makeRecStashed(r, row, variant) }
   if r.mrFields.length == 0 { leaf() }
-  if stash { return makeRecStashed(r, row, variant) }
+  if stash { return makeRecStashFields(r, row, variant) }
   for k in r.mrLayout {
     if k < 0 || k >= r.mrFields.length { return irLMiss("record layout") }
     irLOpnd(r.mrFields[k])
@@ -1057,28 +1083,32 @@ function makeRec(r: RMakeRec) {
   return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
 }
 
+// `emitObj`'s and `emitVariantStruct`'s order stash read back: every slot its `RStashSet`s set,
+// in layout order, then the row's `struct.new`.
+function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
+  let fi = 0
+  while fi < r.mrLayout.length {
+    const s = stashSlotOf(r.mrAt, fi)
+    if s < 0 { return irLMiss("record stash") }
+    fbLocalGet(s)
+    fi = fi + 1
+  }
+  return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
+}
+
 // `emitObj`'s and `emitVariantStruct`'s order stash for `r` at `row`: each field in source order
 // set into the slot `objOrderStashSlot` opens for it, then every slot read in layout order.
-function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
+function makeRecStashFields(r: RMakeRec, row: i32, variant: boolean) {
   const slots: i32[] = []
   for _k in r.mrLayout { slots.push(-1) }
   for k in r.mrSrc {
     let fi = 0
     while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
-    if fi >= r.mrLayout.length { fi = -1 }
-    if fi < 0 || k < 0 || k >= r.mrFields.length {
+    if fi >= r.mrLayout.length || k < 0 || k >= r.mrFields.length {
       return irLMiss("record stash")
     }
     irLOpnd(r.mrFields[k])
-    const slot = if variant { objOrderStashSlot(
-      variantFieldStorageKind(row, fi),
-      variantFieldTypeAt(row, fi),
-      uFieldStorageSlot(row, fi),
-    ) } else { objOrderStashSlot(
-      fieldRowStorageKind(sFieldFlatRow(row, fi)),
-      sFieldTypeAt(row, fi),
-      sFieldStorageSlot(row, fi),
-    ) }
+    const slot = stashSlotAt(row, fi, variant)
     slots[fi] = slot
     fbLocalSet(slot)
   }
@@ -1087,6 +1117,44 @@ function makeRecStashed(r: RMakeRec, row: i32, variant: boolean) {
     fbLocalGet(s)
   }
   return if variant { variantStructNewTail(row) } else { objStructNewTail(row) }
+}
+
+// The slot `objOrderStashSlot` opens for layout position `fi` of record row `row`.
+function stashSlotAt(row: i32, fi: i32, variant: boolean): i32 {
+  return if variant { objOrderStashSlot(
+    variantFieldStorageKind(row, fi),
+    variantFieldTypeAt(row, fi),
+    uFieldStorageSlot(row, fi),
+  ) } else { objOrderStashSlot(
+    fieldRowStorageKind(sFieldFlatRow(row, fi)),
+    sFieldTypeAt(row, fi),
+    sFieldStorageSlot(row, fi),
+  ) }
+}
+
+// `RStashSet`: the field's value, then `local.set` into the slot `objOrderStashSlot` opens for it,
+// in source order as legacy's `emitObj` and `emitVariantStruct` call it.
+function stashSet(r: RStashSet) {
+  const row = recRowOf(r.ssAt, r.ssRow, r.ssVariant, true)
+  if row < 0 { return irLMiss("record row") }
+  const fi = r.ssFi
+  irLOpnd(r.ssV)
+  const slot = stashSlotAt(row, fi, r.ssVariant)
+  lwStashAt.push(r.ssAt)
+  lwStashFi.push(fi)
+  lwStashSlots.push(slot)
+  fbLocalSet(slot)
+  return 0
+}
+
+// The slot the `RStashSet` of the literal at `at`, layout position `fi`, set; -1 for none.
+function stashSlotOf(at: i32, fi: i32): i32 {
+  let i = lwStashSlots.length - 1
+  while i >= 0 {
+    if lwStashAt[i] == at && lwStashFi[i] == fi { return lwStashSlots[i] }
+    i = i - 1
+  }
+  return -1
 }
 
 // `RMakeClo`: legacy's closure writer for a capture-free function, then a name read's recovery,
@@ -2400,6 +2468,11 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      if r is RStashSet {
+        stashSet(r)
+        irLSettle(pending)
+        return 0
+      }
       // A void import leaves nothing; any other host call's discarded value is dropped.
       if r is RCallHost {
         hostCall(r)
@@ -2665,6 +2738,11 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
+  // A union join opens at the box's blocktype, as `emitUnionIfValueLink` does.
+  const boxOut = !lw.irHelper
+    && (rr is RBox || rr is RNullable && rr.rnDisc == 4)
+    && at >= 0
+    && ifJoinPlanOf(at, lw.irAt).ijArm == "union"
   // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
   const strOut = (repPrim(lw.irVars[t].vRep) == "str"
     || rr is RRecord
@@ -2673,9 +2751,9 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     || rr is RClosure)
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
-  const rj = if vt < 0 && !refOut && !strOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
+  const rj = if vt < 0 && !refOut && !strOut && !boxOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
   const rk = rj.rjKind
-  if vt < 0 && !refOut && !strOut && rk == null {
+  if vt < 0 && !refOut && !strOut && !boxOut && rk == null {
     irLMiss("valued if rep")
     return IF_DONE
   }
@@ -2692,6 +2770,9 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     fbIfRefNul(rr.rwHeap, rr.rwNull)
   } else if strOut {
     if tagDispatchIfOf(lw.irVars[t].vTy) < 0 { irLMiss("valued if rep") }
+  } else if boxOut {
+    fbOpenIf()
+    fbValtype("union", -1)
   } else if rk != null {
     fbOpenIf()
     fbRefIfOpenType(rk, rj.rjSlot, ifLinkYieldsNull(at, lw.irAt))
@@ -3088,6 +3169,9 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwLiveEnd = []
   lwFloor = 0
   lwFloors = []
+  lwStashAt = []
+  lwStashFi = []
+  lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false }
   for _v in f.irVars {
     lwTempRhs.push(none)
