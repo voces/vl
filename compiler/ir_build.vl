@@ -319,8 +319,13 @@ import {
   narrowedArmNeedsUnbox,
 } from "./emit_plan_coerce"
 import {
+  EmptyFitPlan,
   arrLitIsForIter,
+  emptyFitArmsPlain,
+  emptyFitArmsPlanOf,
+  emptyFitPlanOf,
   ifJoinAdaptsScalar,
+  isArmRank,
   letIfInitSinks,
   retRefusedWhy,
   spreadRunLit,
@@ -697,16 +702,36 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if n.isFit >= 0 || isRecvStageRep(ix, ibFnIx) >= 0 {
     return irBMiss("is staged")
   }
-  const arm = isArmOf(ix, ibFnIx, 0, false)
+  return isRung(b, n, ix, rep, isArmOf(ix, ibFnIx, 0, false))
+}
+
+// `is` test `ix` from rung `arm` on, as `emitIsTestRungs` takes it: a rung that declines passes
+// to the next (`isArmOf` from the rank after it).
+function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if arm == "nulTest" { return isNulTest(b, n, ix, rep) }
   if arm == "never" || arm == "pinNever" {
     return isConstTest(b, n, 0, ix, rep)
   }
+  if arm == "emptyFit" {
+    const p = emptyFitPlanOf(ix, ibFnIx)
+    if emptyFitDeclines(p, ix) {
+      return isRung(
+        b,
+        n,
+        ix,
+        rep,
+        isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false),
+      )
+    }
+    return isEmptyFit(b, n, ix, rep, p)
+  }
   if arm == "static" {
     // A static `false` first tries legacy's empty-list fit, which may still write a test.
     const st = monoStaticIsResult(ix, ibFnIx)
-    if st != 1 { return irBMiss("is static empty fit") }
-    return isConstTest(b, n, 1, ix, rep)
+    if st == 1 { return isConstTest(b, n, 1, ix, rep) }
+    const p = emptyFitPlanOf(ix, ibFnIx)
+    if emptyFitDeclines(p, ix) { return isConstTest(b, n, 0, ix, rep) }
+    return isEmptyFit(b, n, ix, rep, p)
   }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
@@ -719,6 +744,61 @@ function boxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("is operand rep")
   }
   return irBLetTemp(b, { teV: v, teTag: tag }, ix, rep)
+}
+
+// `xs is K[]` whose elements never meet `K`'s at some depth, along plan `p`'s walk: the list,
+// then its emptiness at every depth. A union receiver's arms and a shadowed region are misses.
+function isEmptyFit(
+  b: i32[],
+  n: IsExpr,
+  ix: i32,
+  rep: i32,
+  p: EmptyFitPlan,
+): Opnd {
+  if p.efArm == "union" { return isEmptyFitArms(b, n, ix, rep, p) }
+  if p.efArm != "loop" { return irBMiss("is empty fit " + p.efArm) }
+  if p.efRepWhy != "" { return irBMiss("is empty fit rep") }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if !(repNodeAt(irBOpRep(v)) is RList) {
+    return irBMiss("is empty fit operand rep")
+  }
+  return irBLetTemp(b, { leV: v, leAt: ix }, ix, rep)
+}
+
+// Whether `emitListEmptyFitIs` answers 0 along plan `p`, passing to the next rung.
+function emptyFitDeclines(p: EmptyFitPlan, ix: i32): boolean {
+  if p.efArm == "decline" { return true }
+  if p.efArm != "union" { return false }
+  return emptyFitArmsPlanOf(ix, ibFnIx, p.efRecvTy).eaWhy == "decline"
+}
+
+// `u is K[]` over a box variable with list arms `K[]` never meets: each arm's tag and emptiness
+// (`emptyFitArmsPlanOf`), re-reading the variable. A nullable receiver, a region that reads an
+// arm's list, and any other receiver are misses.
+function isEmptyFitArms(
+  b: i32[],
+  n: IsExpr,
+  ix: i32,
+  rep: i32,
+  p: EmptyFitPlan,
+): Opnd {
+  const ap = emptyFitArmsPlanOf(ix, ibFnIx, p.efRecvTy)
+  if !ap.eaBoxed { return irBMiss("is empty fit nullable") }
+  if !emptyFitArmsPlain(ap) { return irBMiss("is empty fit union") }
+  if rep != ibBool { return irBMiss("is result rep") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if (
+    !(v is OVar)
+    || v.ov < 0
+    || ib.irVars[v.ov].vKind == "temp"
+    || !(repNodeAt(irBOpRep(v)) is RBox)
+  ) {
+    return irBMiss("is empty fit receiver")
+  }
+  return irBLetTemp(b, { lfV: v, lfAt: ix }, ix, rep)
 }
 
 // `recv is X` over a nullable niche at `isArmOf`'s null-test rung: the niche's own null test
