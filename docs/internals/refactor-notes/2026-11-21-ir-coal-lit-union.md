@@ -20,7 +20,29 @@ only blocker, and 16 in the corpus. `nulBool` writes the same shape at a differe
 - **Named misses.** A re-read operand that is not a variable (`coalesce niche place`, such as a
   field of a re-readable receiver), and an operand after a waiting temp (`coalesce niche after an
   operand`).
+- **A boolean-niche valued `if`.** `(if c { null } else { x }) ?? d` at a boolean pin builds its
+  operand as a valued `if` whose out is the boolean's `2` niche. The lowering now opens that `if` at
+  i32, as `emitIfExprAs` does, where it was the miss `valued if rep`.
 
 ## Coverage
 
-MEASURED
+Measured on fixpoint seeds of this branch and of master `db422387`, each building this branch's
+source.
+
+| population | master | this branch |
+| --- | ---: | ---: |
+| self-compile functions with no blocker | 19,388 | 19,398 |
+| self-compile claimed (mode 3) | 19,363 | 19,373 |
+| corpus with no blocker (45,678) | 43,944 | 43,960 |
+| `tests/cases` covered / matched (armed shadow) | 61,061 / 61,054 | 61,104 / 61,097 |
+
+On `tests/cases` the `coalesce niche litUnion` and `nulBool` misses (55 rows, 10 at `@start`) are
+gone; `coalesce niche place` is 15. The armed shadow adds no fail, differ or mismatch row. On the
+self-compile `coalesce niche litUnion` (15 alone) is gone; `coalesce niche place` 2 and `coalesce
+niche after an operand` 2 are left alone.
+
+- **Byte proof:** mode 3 self-compile identical; `ir-identity.sh --names` identical 9,037, fail
+  under both 3,267, differ 0, self-compile identical; `--cases` identical 7,579, fail under both
+  68, differ 0, witnesses same 60; `--claimless` identical 14,014, fail under both 3,267, differ 0;
+  `tests/cases` A/B same 8,693, differ 0.
+- **Fuel:** L2 self-compile 105,397,259,196 against master's fixpoint 105,366,050,536 (+0.03%).
