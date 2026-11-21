@@ -81,6 +81,13 @@ index, in one docs PR.
 
 ## Fuel drift
 
+The per-PR fuel tier grades a candidate against its base master's own L2, so master's accumulated
+drift never reds a batch (coordinator ruling, 2026-11-21, after batches R and U each lost 15 to 25
+minutes to drift reds and three refresh PRs landed in 13 hours). The base's L2 is measured once per
+base tree and cached; `SELF_COMPILE_BASE_FUEL` passes a reading the verifier already took. The
+cumulative rise on `scripts/self-compile-baseline.json` is still printed by every run, and past +3%
+it is reported, not graded: it marks a drift refresh as due.
+
 The coordinator rules on a refresh of `scripts/self-compile-baseline.json` that names no single
 mechanism. Its `scripts/self-compile-ledger.txt` line gives the PR range and the cumulative rise
 since the last attributed baseline. Under +3% cumulative the refresh is routine. Past +3% it first
