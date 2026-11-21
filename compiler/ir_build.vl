@@ -331,6 +331,7 @@ import {
   coalResultKindOf,
   coalesceNulStrStaysNullable,
   deadNullTestOperand,
+  localNulStrRecovers,
   nulNoneEqSides,
   nulStrReadRecovers,
   nulTestArmOf,
@@ -436,6 +437,7 @@ import {
   memberBoxReadEnter,
   memberBoxReadLeave,
   nulLitAtomTexts,
+  readOwesNonNullRecover,
   sFieldStoreKind,
   spreadBoxingSource,
 } from "./emit_classify"
@@ -2546,17 +2548,24 @@ function narrowedLocalRead(
   }
   // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
   const na = if arm == "local" { nullNarrowArmOf(ix, ib.irVars[v].vRep, rep) } else { "none" }
-  if na == "atom" {
+  if na == "held" {
     return irBLetTempTy(
       b,
-      { rcV: o, rcAt: ix },
+      { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) },
       ix,
       rep,
       recoveredReadTyOf(heldTy(exprTyOf(ix))),
     )
   }
   if na == "miss" { return irBMiss("nullable read recover") }
-  if na == "plain" { return irBLetTemp(b, { rcV: o, rcAt: ix }, ix, rep) }
+  if na == "plain" {
+    return irBLetTemp(
+      b,
+      { rcV: o, rcAt: ix, rcNn: recoverNonNulls(ix) },
+      ix,
+      rep,
+    )
+  }
   if ba == "atom" {
     const ak = identUnboxAtomOf(ix, ibFnIx)
     if ak < 0 { return irBMiss("narrowed read dead") }
@@ -2611,6 +2620,13 @@ function globalUnboxRead(
   return irBLetTemp(b, { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak }, ix, rep)
 }
 
+// How many `ref.as_non_null` legacy writes after nullable local read `ix`, decided in the read's
+// own context: one where a `string | null` read recovers, one where it owes its narrowed rep.
+function recoverNonNulls(ix: i32): i32 {
+  const a = if localNulStrRecovers(ix, ibFnIx) { 1 } else { 0 }
+  return a + (if readOwesNonNullRecover(ix, ibFnIx) { 1 } else { 0 })
+}
+
 // How read `ix` of a union-box cell at rep `cellRep` takes the narrowed rep `rep`, on legacy's
 // read arm `arm`, for a local's and a global's read alike: "variant" a record arm's payload,
 // "atom" the one atom `unbox` names, "box" the same box at a smaller union's rep, "none" when the
@@ -2636,19 +2652,17 @@ function boxNarrowArmOf(
 }
 
 // How read `ix` of a cell at rep `cellRep` takes the non-null member `rep` the checker narrowed it
-// to, for a local's and a global's read alike: "plain" the cell's read and legacy's recover, "atom"
-// an atom recovered from a read the checker left nullable, "miss" any other recover, "none" when
-// `cellRep` is not `rep | null`.
-type NullNarrowArm = "none" | "plain" | "atom" | "miss"
+// to, for a local's and a global's read alike: "plain" the cell's read and legacy's recover, "held"
+// a read the checker left nullable (an assignment's re-read) held at its non-null type, "miss" any
+// other recover, "none" when `cellRep` is not `rep | null`.
+type NullNarrowArm = "none" | "plain" | "held" | "miss"
 function nullNarrowArmOf(ix: i32, cellRep: i32, rep: i32): NullNarrowArm {
   const c = repNodeAt(cellRep)
   if !(c is RNullable) || c.rnInner != rep { return "none" }
   const ty = heldTy(exprTyOf(ix))
   if repNodeOfTy(ty) == rep { return "plain" }
   const inner = recoveredReadTyOf(ty)
-  if repNodeAt(rep) is RAtom && inner >= 0 && repNodeOfTy(inner) == rep {
-    return "atom"
-  }
+  if inner >= 0 && repNodeOfTy(inner) == rep { return "held" }
   // Any other recover to a rep the read's type is not would mint a temp of the nullable type.
   return "miss"
 }
