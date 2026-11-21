@@ -1,6 +1,6 @@
-# IR: closure calls by any expression, captured direct calls, 2026-11-21
+# IR: closure calls by any expression, captured direct calls, their arguments, 2026-11-21
 
-Lane IR-N6, steps 4 and 5, stacked on step 3 (`2026-11-21-ir-env-cache.md`).
+Lane IR-N6, steps 4 to 6, stacked on step 3 (`2026-11-21-ir-env-cache.md`).
 
 ## Step 4: a direct call of a nested function that captures
 
@@ -30,6 +30,35 @@ cover a binding's call.
 Compiler lines +197 / −53 over step 3 (`wasmEmit.vl` +98 −45, `ir_build.vl` +89 −8, `lint.vl`
 +10). Rows: `tests/ir-shadow-rows/captured-direct-call.vl`,
 `lifted-capture-passed-on.vl` and `indirect-closure-call.vl`, each covered and matched.
+
+## Step 6: a closure call's widened and reference arguments
+
+`callRefArgPlain` was the IR's test for a closure-call argument it writes as legacy does, and
+`emitCallRefArg` kept its own copy of the plain test for the armed agreement record. Census of the
+`call of a non-declaration` rows in `tests/cases`, by the condition that declined (a scratch
+instrument, not committed), over 481 files: a bundle 336, an `i32` argument widened into an `f64`
+parameter 136, a tagged set 98, a general-arm argument of a closure, list, record-arm or map
+parameter about 150, a held record 45.
+
+- `emitCallRefArg`'s record asks `callRefArgPlain` itself, so the two cannot drift.
+- `callRefArgPlain` admits the three widenings, and the general arm at a non-null closure, list or
+  map parameter (`emitNonNullParamRecover` writes nothing there).
+- `closureCallRhs` delivers a widening at its parameter's number (`deliver`, legacy's
+  `widenPlanOf`; its literal arms stay named misses), and checks a reference argument's rep
+  against the parameter's kind (`closureArgRepIs`).
+
+A bundle (D14841) reads the closure out of a record of closures that the parameter's own rep
+calls a closure; that needs the parameter's rep first, and is left.
+
+## A guard: a coalesced nested list literal's index read
+
+Covering `indirect call` reached `tests/cases/maps/ref-list-values.vl`'s `go`. Its
+`(mss["z"] ?? [[{ v: -1 }]])[0][0].v` banks read-index span rows other than legacy does
+(`spans: read index`), on master's seed too:
+`print((mi["z"] ?? [[3], [4]])[1][0])`. Code bytes are identical, and a `--names` build differs.
+At the coordinator's ruling, an index read of a `??` whose default is a list literal of list
+literals is a named miss (`index of a coalesced nested list literal`), pinned by
+`tests/ir-shadow-rows/coalesced-nested-list-index.vl`. The span rows are IR-N3's to fix.
 
 ## Readings (base: step 3's fixpoint seed; candidate fixpoint)
 
