@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **I8a, the IR writes a const cell's constant initializer:** the global section's constant initializers (`const a = 1`, a list or record literal, a union box) are built by the IR as a door fragment delivered at the cell's rep (`irLowerConstCell`, `irClaimConstCell`) whenever every node is in a claimed family; legacy's `emitExpr` runs only on a miss (954 of 37,106 occurrences over every population, each a named coverage class). Byte-identical; an armed shadow counts `const cell <arm> <kind>: matched | differ | miss`. The list literal's lowering now reads the arm the builder asked (`RMakeList.mlArm`), so L2 self-compile fuel falls 0.73%.

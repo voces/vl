@@ -339,7 +339,6 @@ import {
   mkIf,
   mkIndex,
   mkMember,
-  mkNull,
   mkStr,
   nodeAt,
   nodeChildren,
@@ -1574,6 +1573,7 @@ import {
 } from "./emit_collect"
 import {
   cboxIsWriteLet,
+  mkNullTestNe,
   voidTwinForNode,
   voidTwinTargetOf,
 } from "./emit_rewrite"
@@ -4724,82 +4724,139 @@ function listFitRepMiss(isIx: i32): string {
 // test narrows reads an empty `K[]` in place of `xs` (D4911). 0, leaving the static fold, when
 // not that shape; 1 when emitted, -1 when refused.
 function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
+  const p = emptyFitPlanOf(isIx, fnIx)
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
-  if isTestsNull(isIx) { return 0 }
+  return match p.efArm {
+    "decline" => 0
+    "captured" => emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+    "union" => emitListEmptyFitArms(isIx, fnIx, p.efRecvTy)
+    "shadow" | "loop" => {
+      let grow = -1
+      if p.efArm == "shadow" {
+        const sh = listFitShadowSet(isIx, p.efRecvTy, p.efDepth, fnIx)
+        if sh < 1 { return sh }
+        const rv = nodeAt(unwrapParen(nd.isObj))
+        if sh == 2 && rv is Ident {
+          grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
+        }
+      }
+      if p.efRepWhy != "" { return emitFailAt(p.efRepWhy, isIx) }
+      // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
+      if grow >= 0 {
+        fbLocalGet(fitGrowLocal[grow])
+        fbRefIsNull()
+        fbIf(127) // i32
+      }
+      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+      emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
+      if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
+      1
+    }
+  }
+}
+
+// How `emitListEmptyFitIs` answers `is` test `isIx`: `decline` to the next rung, `captured` (an
+// unbound instance's closure capture), `union` (a box or nullable receiver's arms), `shadow` (a
+// narrowed region reads the arm's list), or `loop`, the walk over `efSlots` to an `efKind` list.
+// `efRepWhy` refuses a rep the walk cannot take, after the shadow set as legacy writes it.
+export type EmptyFitArm = "decline" | "captured" | "union" | "shadow" | "loop"
+export type EmptyFitPlan = {
+  efArm: EmptyFitArm,
+  efRecvTy: i32,
+  efDepth: i32,
+  efSlots: i32[],
+  efKind: ListKind,
+  efSlot: i32,
+  efRepWhy: string,
+}
+
+export function emptyFitPlanOf(isIx: i32, fnIx: i32): EmptyFitPlan {
+  const no: EmptyFitPlan = {
+    efArm: "decline",
+    efRecvTy: -1,
+    efDepth: 0,
+    efSlots: [],
+    efKind: "list",
+    efSlot: 0,
+    efRepWhy: "",
+  }
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) || isTestsNull(isIx) { return no }
   const recvTy = listIsRecvTyOf(nd.isObj, fnIx)
   // An instance that left the receiver's type parameter unbound cannot hand a closure the arm's
   // list, since nothing says whether its elements meet `K`.
   const rv = nodeAt(unwrapParen(nd.isObj))
-  if (
-    (recvTy < 0 || tyHasTyVar(recvTy))
+  const arm0: EmptyFitArm = if (recvTy < 0 || tyHasTyVar(recvTy))
     && rv is Ident
-    && liftedFnCaptures(rv.identName, fnIx)
-  ) {
-    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
-  }
-  if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) {
-    return emitListEmptyFitArms(isIx, fnIx, recvTy)
+    && liftedFnCaptures(rv.identName, fnIx) { "captured" } else if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) { "union" } else { "decline" }
+  if arm0 != "decline" {
+    const p0: EmptyFitPlan = {
+      efArm: arm0,
+      efRecvTy: recvTy,
+      efDepth: 0,
+      efSlots: [],
+      efKind: "list",
+      efSlot: 0,
+      efRepWhy: "",
+    }
+    return p0
   }
   const depth = listDisjointDepth(recvTy, isVarTyIxOf(isIx))
-  if depth < 1 { return 0 }
-  let grow = -1
-  if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy) {
-    const sh = listFitShadowSet(isIx, recvTy, depth, fnIx)
-    if sh < 1 { return sh }
-    if sh == 2 && rv is Ident {
-      grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
-    }
-  }
+  if depth < 1 { return no }
+  const shadow = listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy)
   const slots: i32[] = []
   let kind: ListKind = "list"
   let slot = 0
+  let why = ""
   if exprRefArray(nd.isObj, fnIx) {
     let s = refListSlotOfExpr(nd.isObj, fnIx)
     let k = 1
     kind = "reflist"
-    while k < depth {
+    while k < depth && why == "" {
       if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
-        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        why = LIST_FIT_REP_MSG
+      } else {
+        slots.push(s)
+        const ek = rlElemKindAt(s)
+        if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+        else if k == depth - 1 && ek == RLK_I32_LIST { kind = "list" }
+        else if k == depth - 1 && ek == RLK_STR_LIST { kind = "strlist" }
+        else if k == depth - 1 && ek == RLK_F64_LIST { kind = "f64list" }
+        else if k == depth - 1 && ek == RLK_I64_LIST { kind = "i64list" }
+        else if k == depth - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+        else if k == depth - 1 && ek == RLK_V128_LIST { kind = "v128list" }
+        else if k == depth - 1 && ek == RLK_U8_LIST { kind = "u8list" }
+        else { why = LIST_FIT_REP_MSG }
       }
-      slots.push(s)
-      const ek = rlElemKindAt(s)
-      if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
-      else if k == depth - 1 && ek == RLK_I32_LIST { kind = "list" }
-      else if k == depth - 1 && ek == RLK_STR_LIST { kind = "strlist" }
-      else if k == depth - 1 && ek == RLK_F64_LIST { kind = "f64list" }
-      else if k == depth - 1 && ek == RLK_I64_LIST { kind = "i64list" }
-      else if k == depth - 1 && ek == RLK_F32_LIST { kind = "f32list" }
-      else if k == depth - 1 && ek == RLK_V128_LIST { kind = "v128list" }
-      else if k == depth - 1 && ek == RLK_U8_LIST { kind = "u8list" }
-      else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
       k = k + 1
     }
-    if kind == "reflist" {
+    if why == "" && kind == "reflist" {
       if s < 0 || s >= rlWrapIdx.length {
-        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        why = LIST_FIT_REP_MSG
+      } else {
+        slot = s
       }
-      slot = s
     }
   } else if depth > 1 {
-    return emitFailAt(LIST_FIT_REP_MSG, isIx)
+    why = LIST_FIT_REP_MSG
   } else if exprStringArray(nd.isObj, fnIx) {
     kind = "strlist"
   } else {
     const lek = scalarListElemKind(nd.isObj, fnIx)
-    if lek == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-    kind = listIdxKindOf(lek)
+    if lek == null { why = LIST_FIT_REP_MSG } else { kind = listIdxKindOf(lek) }
   }
-  // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
-  if grow >= 0 {
-    fbLocalGet(fitGrowLocal[grow])
-    fbRefIsNull()
-    fbIf(127) // i32
+  const arm: EmptyFitArm = if shadow { "shadow" } else { "loop" }
+  const p: EmptyFitPlan = {
+    efArm: arm,
+    efRecvTy: recvTy,
+    efDepth: depth,
+    efSlots: slots,
+    efKind: kind,
+    efSlot: slot,
+    efRepWhy: why,
   }
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-  emitListEmptyLoop(slots, 0, kind, slot)
-  if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
-  return 1
+  return p
 }
 
 // `is K[]` over a union or nullable receiver whose list arm `K[]` can never meet: true exactly
@@ -4808,16 +4865,76 @@ function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
 function emitListEmptyFitArms(isIx: i32, fnIx: i32, recvTy: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
+  const p = emptyFitArmsPlanOf(isIx, fnIx, recvTy)
+  if p.eaWhy == "decline" { return 0 }
+  if p.eaWhy == "noMembership" { return emitFailNoMembershipRecv() }
+  if p.eaWhy != "" { return emitFailAt(p.eaWhy, isIx) }
+  for r in p.eaRows {
+    if r.erShadow {
+      const sh = listFitShadowSet(isIx, r.erTy, r.erDepth, fnIx)
+      if sh < 1 { return sh }
+    }
+  }
+  if p.eaRepWhy != "" { return emitFailAt(p.eaRepWhy, isIx) }
+  let i = 0
+  while i < p.eaRows.length {
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    emptyFitArmHead(p, i)
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    emptyFitArmBody(p, i)
+    i = i + 1
+  }
+  return 1
+}
+
+// One list arm of `emptyFitArmsPlanOf`: its type and disjoint depth, whether a narrowed region
+// reads it (`listNarrowReadDisjoint`), the box tag a boxed receiver tests, the payload's heap,
+// and the walk `emitListEmptyLoop` takes; `erBad` for a rep the walk cannot take.
+export type EmptyFitArmRow = {
+  erBad: boolean,
+  erTy: i32,
+  erDepth: i32,
+  erShadow: boolean,
+  erTag: i32,
+  erHeap: i32,
+  erSlots: i32[],
+  erKind: ListKind,
+  erSlot: i32,
+}
+
+// `emitListEmptyFitArms`'s decisions for `is` test `isIx`, in the order it writes them: `eaWhy`
+// first (`decline`, `noMembership`, or a refusal), then each row's shadow set, then `eaRepWhy`.
+export type EmptyFitArmsPlan = {
+  eaWhy: string,
+  eaBoxed: boolean,
+  eaRows: EmptyFitArmRow[],
+  eaRepWhy: string,
+}
+
+export function emptyFitArmsPlanOf(
+  isIx: i32,
+  fnIx: i32,
+  recvTy: i32,
+): EmptyFitArmsPlan {
+  const nd = nodeAt(isIx)
+  const boxed = nd is IsExpr && exprUnion(nd.isObj, fnIx)
+  const rows: EmptyFitArmRow[] = []
+  const no: EmptyFitArmsPlan = {
+    eaWhy: "decline",
+    eaBoxed: boxed,
+    eaRows: rows,
+    eaRepWhy: "",
+  }
+  if !(nd is IsExpr) { return no }
   const kTy = isVarTyIxOf(isIx)
-  const boxed = exprUnion(nd.isObj, fnIx)
   // A box's arms are the ones it registered, which the receiver's type need not spell.
   const armTys: i32[] = []
   if boxed {
     if (!unionTyMemberTys(unionBoxTyOfRead(nd.isObj, fnIx), armTys)) {
-      return 0
+      return no
     }
   } else {
-    if recvTy < 0 { return 0 }
+    if recvTy < 0 { return no }
     flattenVariantsInto(recvTy, armTys)
   }
   const fits: i32[] = []
@@ -4835,94 +4952,149 @@ function emitListEmptyFitArms(isIx: i32, fnIx: i32, recvTy: i32): i32 {
     }
   }
   // An arm whose elements can be `K` at every depth keeps its tag test.
-  if fits.length == 0 || meets { return 0 }
-  if !unionEqOperandOk(nd.isObj) { return emitFailNoMembershipRecv() }
-  if !boxed && fits.length != 1 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-  let fi = 0
-  while fi < fits.length {
-    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, fits[fi]) {
-      const sh = listFitShadowSet(isIx, fits[fi], depths[fi], fnIx)
-      if sh < 1 { return sh }
-    }
-    fi = fi + 1
-  }
+  if fits.length == 0 || meets { return no }
+  let why = ""
+  if !unionEqOperandOk(nd.isObj) { why = "noMembership" }
+  else if !boxed && fits.length != 1 { why = LIST_FIT_REP_MSG }
+  let rep = ""
   let i = 0
-  while i < fits.length {
-    const at = tyAt(fits[i])
-    if !(at is TyArray) { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-    const heaps: i32[] = []
-    let kind = listFitElemKind(tyElemOf(at), heaps)
-    // An arm disjoint below its first level is a list of lists: its rows down to that depth are
-    // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
-    const slots: i32[] = []
-    let slot = 0
-    let outer = -1
-    if depths[i] > 1 {
-      let s = rlSlotOfTyOrTwin(tyRefArrElemOf(fits[i]))
-      outer = s
-      kind = "reflist"
-      let k = 1
-      while k < depths[i] {
-        if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
-          return emitFailAt(LIST_FIT_REP_MSG, isIx)
-        }
-        slots.push(s)
-        const ek = rlElemKindAt(s)
-        if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
-        else if k == depths[i] - 1 && ek == RLK_I32_LIST { kind = "list" }
-        else if k == depths[i] - 1 && ek == RLK_STR_LIST { kind = "strlist" }
-        else if k == depths[i] - 1 && ek == RLK_F64_LIST { kind = "f64list" }
-        else if k == depths[i] - 1 && ek == RLK_I64_LIST { kind = "i64list" }
-        else if k == depths[i] - 1 && ek == RLK_F32_LIST { kind = "f32list" }
-        else if k == depths[i] - 1 && ek == RLK_V128_LIST { kind = "v128list" }
-        else if k == depths[i] - 1 && ek == RLK_U8_LIST { kind = "u8list" }
-        else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-        k = k + 1
-      }
-      if kind == "reflist" {
-        if s < 0 || s >= rlWrapIdx.length {
-          return emitFailAt(LIST_FIT_REP_MSG, isIx)
-        }
-        slot = s
-      }
-      if outer < 0 || outer >= rlWrapIdx.length {
-        return emitFailAt(LIST_FIT_REP_MSG, isIx)
-      }
-    } else {
-      if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-      slot = heaps[0]
-    }
-    if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-    if boxed {
-      const tag = isArmTagOfTy(fits[i])
-      if tag < 0 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-      fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, tag)
-      fbI32Bin(70) // 0x46 i32.eq
-    } else {
-      fbRefIsNull()
-      fbI32Eqz()
-    }
-    // <arm test> if (result i32) { <the arm's list is empty> } else { 0 }
-    fbIf(127)
-    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-    if boxed {
-      fbStructGet(uBoxIdx, 1)
-      fbRefCast(if outer >= 0 { rlWrapIdx[outer] } else { heaps[2] })
-    } else {
-      fbRefAsNonNull()
-    }
-    emitListEmptyLoop(slots, 0, kind, slot)
-    fbElse()
-    fbI32Const(0)
-    fbEnd()
-    if i > 0 {
-      fbI32Bin(114) // 0x72 i32.or
-    }
+  while i < fits.length && why == "" {
+    rows.push(emptyFitArmRowOf(fits[i], depths[i], boxed, isIx, fnIx))
+    if rep == "" && rows[i].erBad { rep = LIST_FIT_REP_MSG }
     i = i + 1
   }
-  return 1
+  const p: EmptyFitArmsPlan = {
+    eaWhy: why,
+    eaBoxed: boxed,
+    eaRows: rows,
+    eaRepWhy: rep,
+  }
+  return p
+}
+
+// The row of list arm `a`, disjoint from `K` at depth `d`.
+function emptyFitArmRowOf(
+  a: i32,
+  d: i32,
+  boxed: boolean,
+  isIx: i32,
+  fnIx: i32,
+): EmptyFitArmRow {
+  const nd = nodeAt(isIx)
+  const shadow = nd is IsExpr && listNarrowReadDisjoint(fnIx, isIx, nd.isObj, a)
+  const bad: EmptyFitArmRow = {
+    erBad: true,
+    erTy: a,
+    erDepth: d,
+    erShadow: shadow,
+    erTag: -1,
+    erHeap: -1,
+    erSlots: [],
+    erKind: "reflist",
+    erSlot: -1,
+  }
+  const at = tyAt(a)
+  if !(at is TyArray) { return bad }
+  const heaps: i32[] = []
+  const k0 = listFitElemKind(tyElemOf(at), heaps)
+  let kind: ListKind = "reflist"
+  // An arm disjoint below its first level is a list of lists: its rows down to that depth are
+  // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
+  const slots: i32[] = []
+  let slot = 0
+  let heap = -1
+  if d > 1 {
+    let s = rlSlotOfTyOrTwin(tyRefArrElemOf(a))
+    const outer = s
+    let k = 1
+    while k < d {
+      if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
+        return bad
+      }
+      slots.push(s)
+      const ek = rlElemKindAt(s)
+      if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+      else if k == d - 1 && ek == RLK_I32_LIST { kind = "list" }
+      else if k == d - 1 && ek == RLK_STR_LIST { kind = "strlist" }
+      else if k == d - 1 && ek == RLK_F64_LIST { kind = "f64list" }
+      else if k == d - 1 && ek == RLK_I64_LIST { kind = "i64list" }
+      else if k == d - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+      else if k == d - 1 && ek == RLK_V128_LIST { kind = "v128list" }
+      else if k == d - 1 && ek == RLK_U8_LIST { kind = "u8list" }
+      else { return bad }
+      k = k + 1
+    }
+    if kind == "reflist" {
+      if s < 0 || s >= rlWrapIdx.length { return bad }
+      slot = s
+    }
+    if outer < 0 || outer >= rlWrapIdx.length { return bad }
+    heap = rlWrapIdx[outer]
+  } else {
+    if k0 == null { return bad }
+    kind = k0
+    slot = heaps[0]
+    heap = heaps[2]
+  }
+  const tag = if boxed { isArmTagOfTy(a) } else { 0 }
+  if tag < 0 { return bad }
+  const r: EmptyFitArmRow = {
+    erBad: false,
+    erTy: a,
+    erDepth: d,
+    erShadow: shadow,
+    erTag: tag,
+    erHeap: heap,
+    erSlots: slots,
+    erKind: kind,
+    erSlot: slot,
+  }
+  return r
+}
+
+// Whether plan `p` writes its rows with nothing before them: no refusal, no row a narrowed
+// region reads (whose shadow set legacy writes first), and a boxed receiver.
+export function emptyFitArmsPlain(p: EmptyFitArmsPlan): boolean {
+  if p.eaWhy != "" || p.eaRepWhy != "" || !p.eaBoxed { return false }
+  for r in p.eaRows {
+    if r.erShadow { return false }
+  }
+  return true
+}
+
+// After row `i`'s first receiver read: its arm test (the box tag, or non-null), then the `if`.
+export function emptyFitArmHead(p: EmptyFitArmsPlan, i: i32) {
+  if p.eaBoxed {
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, p.eaRows[i].erTag)
+    fbI32Bin(70) // 0x46 i32.eq
+  } else {
+    fbRefIsNull()
+    fbI32Eqz()
+  }
+  // <arm test> if (result i32) { <the arm's list is empty> } else { 0 }
+  fbIf(127)
+  return 0
+}
+
+// After row `i`'s second receiver read: the arm's list, its emptiness walk, the `else 0`, and
+// the `i32.or` onto the rows before it.
+export function emptyFitArmBody(p: EmptyFitArmsPlan, i: i32) {
+  const r = p.eaRows[i]
+  if p.eaBoxed {
+    fbStructGet(uBoxIdx, 1)
+    fbRefCast(r.erHeap)
+  } else {
+    fbRefAsNonNull()
+  }
+  emitListEmptyLoop(r.erSlots, 0, r.erKind, r.erSlot)
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  if i > 0 {
+    fbI32Bin(114) // 0x72 i32.or
+  }
+  return 0
 }
 
 const LIST_FIT_PUSH_MSG = "emitProgram: this `is` arm pushes onto an empty list built with another element type, which cannot hold the pushed value"
@@ -5327,7 +5499,12 @@ function narrowReadDisjointUnder(
 // Whether every list at nesting `at` and below of the list on the stack is empty, leaving 1 or
 // 0: `slots[at]`'s ref list is walked while `at` is inside `slots`, and the innermost list, of
 // frame kind `kind` (ref-list row `slot` for a ref list), answers by its length.
-function emitListEmptyLoop(slots: i32[], at: i32, kind: ListKind, slot: i32) {
+export function emitListEmptyLoop(
+  slots: i32[],
+  at: i32,
+  kind: ListKind,
+  slot: i32,
+) {
   if at >= slots.length {
     emitListLenOnStack(kind, slot)
     fbI32Eqz()
@@ -6504,7 +6681,7 @@ function emitIsTest(isIx: i32, fnIx: i32) {
   return r
 }
 
-function isArmRank(a: IsArm): i32 {
+export function isArmRank(a: IsArm): i32 {
   return match a {
     "optNull" => 0
     "nullInst" => 1
@@ -12266,7 +12443,7 @@ function listKindElemKind(k: ListKind): VKind {
 // A run of plain elements as its own `ArrayLit`, built at holder `h`'s type, or at its holder's
 // when `h` is an untyped minted run (D16696). It reports at the spread literal's position: a
 // synthesized node otherwise takes the parser's last cursor, at the end of the file.
-function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
+export function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
   const up = elabSpreadRunHolderOf(h)
@@ -24436,7 +24613,7 @@ function memOffsetNameConst(ix: i32, fnIx: i32): i64 {
 
 // The call's operand at declared position `k` of a memory intrinsic with `base` operands:
 // position 0 is the address, and at the offset form every later one sits one further right.
-function memCallArg(c: Call, base: i32, k: i32): i32 {
+export function memCallArg(c: Call, base: i32, k: i32): i32 {
   if k >= 1 && c.callArgs.length == base + 1 { return c.callArgs[k + 1] }
   return c.callArgs[k]
 }
@@ -24566,7 +24743,7 @@ function zextMaskValue(ix: i32, fnIx: i32): i64 {
 // The load call whose ZERO-extended i64 value the expression at `ix` provably is, or -1: a
 // `__load_u*_i64__` call, or `__load_u8__`/`__load_u16__` cast `as`/`as%` to i64 (non-negative,
 // so its sign-extension is its zero-extension). A masked form is `zextLoadMasked`'s.
-function zextLoadOf(ix: i32, fnIx: i32): i32 {
+export function zextLoadOf(ix: i32, fnIx: i32): i32 {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return -1 }
   const e = nodeAt(x)
@@ -24819,41 +24996,65 @@ function emitMemConstFoldLet(initIx: i32, k: i64, fnIx: i32, declIx: i32): i32 {
 }
 
 // Pushes the address of memory-intrinsic call `c` (`base` declared operands) and answers the
-// memarg offset, or -1 after an emit failure. A constant part moves into the offset only where
-// both forms name the same effective address: a constant address, `a + K` provably not
-// wrapping, or `a` a local the fold above already reduced to just its bounded part.
+// memarg offset, or -1 after an emit failure, along `memAddrPlanOf`'s arm.
 function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
+  const p = memAddrPlanOf(c, base, fnIx)
+  match p.maArm {
+    "bad" => {
+      emitFail(
+        "emitProgram: "
+          + name
+          + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
+      )
+      return -1
+    }
+    "lma" => {
+      lmaAddrNode = -1
+      if emitExprAsKind(p.maRest, 3, lmaCallerFn) < 0 { return -1 }
+      fbI32WrapI64()
+    }
+    "const" => fbI32Const(0)
+    "fold" => fbLocalGet(p.maRest)
+    "wide" => {
+      if emitExprAsKind(p.maRest, 3, fnIx) < 0 { return -1 }
+      fbI32WrapI64()
+    }
+    "rest" => {
+      if emitExpr(p.maRest, fnIx) < 0 { return -1 }
+    }
+  }
+  return p.maOff
+}
+
+// How memory-intrinsic call `c` (`base` declared operands) writes its address: `bad` refused,
+// `lma` an inlined accessor's i64 operand, `const` a constant (`i32.const 0`), `fold` folded local
+// `maRest`, `wide` i64 node `maRest` wrapped, `rest` node `maRest`. A constant part moves into
+// offset `maOff` only where both forms name the same effective address.
+export type MemAddrArm = "bad" | "lma" | "const" | "fold" | "wide" | "rest"
+export type MemAddrPlan = { maArm: MemAddrArm, maRest: i32, maOff: i64 }
+
+function memAddrAt(arm: MemAddrArm, rest: i32, off: i64): MemAddrPlan {
+  return { maArm: arm, maRest: rest, maOff: off }
+}
+
+export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
   let off: i64 = 0
   if c.callArgs.length == base + 1 {
     off = memOffsetConstValue(c.callArgs[1], fnIx)
   } else if c.callArgs.length != base {
     off = -1
   }
-  if off < 0 {
-    emitFail(
-      "emitProgram: "
-        + name
-        + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
-    )
-    return -1
-  }
+  if off < 0 { return memAddrAt("bad", -1, -1) }
   const addr = unwrapParen(c.callArgs[0])
   if addr >= 0 && addr == lmaAddrNode {
-    const lmaRest = lmaAddrRest
-    const lmaK = lmaAddrK
-    lmaAddrNode = -1
-    if emitExprAsKind(lmaRest, 3, lmaCallerFn) < 0 { return -1 }
-    fbI32WrapI64()
-    return lmaK + off
+    return memAddrAt("lma", lmaAddrRest, lmaAddrK + off)
   }
   if addr < 0 || addr >= P.nodes.length {
-    if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-    return off
+    return memAddrAt("rest", c.callArgs[0], off)
   }
   const whole = memAddrConst(addr, fnIx)
   if whole >= 0 && whole + off <= MEM_OFFSET_MAX {
-    fbI32Const(0)
-    return whole + off
+    return memAddrAt("const", -1, whole + off)
   }
   const a = nodeAt(addr)
   if a is Ident {
@@ -24861,8 +25062,7 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
     if mf >= 0 {
       const k = maFoldK[mf]
       if k + off <= MEM_OFFSET_MAX {
-        fbLocalGet(maFoldWasmSlot[mf])
-        return k + off
+        return memAddrAt("fold", maFoldWasmSlot[mf], k + off)
       }
     }
   }
@@ -24872,8 +25072,7 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
       const rest = memConstFoldRest(a, fnIx)
       const m = memAddrBound(rest, fnIx)
       if m >= 0 && m + kv + off <= MEM_OFFSET_MAX {
-        if emitExpr(rest, fnIx) < 0 { return -1 }
-        return kv + off
+        return memAddrAt("rest", rest, kv + off)
       }
     }
   }
@@ -24882,17 +25081,11 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
     if lk > 0 && lk + off < gLowMemUnused {
       const wide = memLowWrapped(addr, fnIx)
       const rest = memLowFoldRest(addr, fnIx)
-      if wide >= 0 {
-        if emitExprAsKind(rest, 3, fnIx) < 0 { return -1 }
-        fbI32WrapI64()
-      } else if emitExpr(rest, fnIx) < 0 {
-        return -1
-      }
-      return lk + off
+      if wide >= 0 { return memAddrAt("wide", rest, lk + off) }
+      return memAddrAt("rest", rest, lk + off)
     }
   }
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  return off
+  return memAddrAt("rest", c.callArgs[0], off)
 }
 
 // The i64 operand of an address `x as% i32` when `x` is an i64, else -1. Under
@@ -26012,38 +26205,104 @@ export function printScalarTail(arm: PrintArm): i32 {
   return 0
 }
 
-// The sub-i32 and wide store intrinsics of `emitCallCore`: the address, the value at its
-// declared width, then the store opcode. Returns 0 once emitted, -1 on failure.
-function emitCallCoreMemStore(c: Call, callee: Ident, fnIx: i32) {
-  const msOff = emitMemAddr(c, 2, fnIx, callee.identName)
-  if msOff < 0 { return -1 }
-  const msVal = memCallArg(c, 2, 1)
-  if memStoreValueIsI32(callee.identName) {
-    // `i32.store8` / `i32.store16` take an ordinary i32 and TRUNCATE it, so the
-    // value goes through the same spine as the address and as `__store_i32__`'s
-    // own value — no widening helper.
-    if emitExpr(msVal, fnIx) < 0 { return -1 }
-  } else if callee.identName == "__store_i64__" {
-    if emitWidened(msVal, 3, fnIx) < 0 { return -1 }
-  } else if callee.identName == "__store_f32__" {
-    if emitWidened(msVal, 5, fnIx) < 0 { return -1 }
-  } else {
-    if emitWidened(msVal, 4, fnIx) < 0 { return -1 }
-  }
-  // The same drift guard the load arm carries, for the same reason: the name list
-  // and the two tables are THREE lists over the same names in two files, and a
-  // width added to one and not the others would reach here with -1 and write it as
-  // an opcode byte — a silently invalid module. Unreachable while they agree.
-  const msOp = memStoreOpcode(callee.identName)
-  const msAlign = memStoreAlignExp(callee.identName)
-  if msOp < 0 || msAlign < 0 {
+// The load and store intrinsics of `emitCallCore`: the address, a store's value at its declared
+// width, then the access. Returns 0 once emitted, -1 on failure.
+function emitCallCoreMemAccess(c: Call, name: string, fnIx: i32) {
+  const p = memAccessPlanOf(name)
+  // The name list and the opcode tables are separate lists over one set of names: a width added
+  // to one and not the other would write -1 as an opcode byte. Unreachable while they agree.
+  if p.mxOp < 0 || p.mxAlign < 0 {
     return emitFail(
       "emitProgram: '"
-        + callee.identName
-        + "' is a declared store width with no opcode — the intrinsic-name list and the opcode table have drifted",
+        + name
+        + "' is a declared memory access width with no opcode — the intrinsic-name list and the opcode table have drifted",
     )
   }
-  fbMemAccess(msOp, msAlign, msOff)
+  const off = emitMemAddr(c, p.mxBase, fnIx, name)
+  if off < 0 { return -1 }
+  if p.mxBase == 2 {
+    const v = memCallArg(c, 2, 1)
+    const rc = if p.mxWiden < 0 { emitExpr(v, fnIx) } else { emitWidened(v, p.mxWiden, fnIx) }
+    if rc < 0 { return -1 }
+  }
+  return memAccessTail(p, off)
+}
+
+// The access a linear-memory intrinsic writes: its opcode and alignment exponent, its declared
+// operands before an optional constant offset (`mxBase`, 1 for a load and 2 for a store, 0 for no
+// such intrinsic), the kind a store's value widens to (`mxWiden`, -1 when it goes in as it
+// stands), and `mxI32` when the value stored or loaded is a plain i32.
+export type MemAccessPlan = {
+  mxOp: i32,
+  mxAlign: i32,
+  mxBase: i32,
+  mxWiden: i32,
+  mxI32: boolean,
+}
+
+export function memAccessPlanOf(name: string): MemAccessPlan {
+  if name == "__store_i32__" {
+    return {
+      mxOp: OP_I32_STORE,
+      mxAlign: 2,
+      mxBase: 2,
+      mxWiden: -1,
+      mxI32: true,
+    }
+  }
+  if name == "__load_i32__" {
+    return {
+      mxOp: OP_I32_LOAD,
+      mxAlign: 2,
+      mxBase: 1,
+      mxWiden: -1,
+      mxI32: true,
+    }
+  }
+  if nameIsMemStoreIntrinsic(name) {
+    const plain = memStoreValueIsI32(name)
+    const w = if plain { -1 } else if name == "__store_i64__" { 3 } else if name == "__store_f32__" { 5 } else { 4 }
+    return {
+      mxOp: memStoreOpcode(name),
+      mxAlign: memStoreAlignExp(name),
+      mxBase: 2,
+      mxWiden: w,
+      mxI32: plain,
+    }
+  }
+  if nameIsMemLoadIntrinsic(name) {
+    return {
+      mxOp: memLoadOpcode(name),
+      mxAlign: memLoadAlignExp(name),
+      mxBase: 1,
+      mxWiden: -1,
+      mxI32: name == "__load_i8__"
+        || name == "__load_u8__"
+        || name == "__load_i16__"
+        || name == "__load_u16__",
+    }
+  }
+  return { mxOp: -1, mxAlign: -1, mxBase: 0, mxWiden: -1, mxI32: false }
+}
+
+// Whether call `c` is a linear-memory load or store intrinsic: the spelling, with no binding
+// owning the name. Legacy's `emitCallCore` and the IR's builder route on it.
+export function memAccessCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return false }
+  const nm = f.identName
+  if nm != "__store_i32__" && nm != "__load_i32__" {
+    if !nameIsMemStoreIntrinsic(nm) && !nameIsMemLoadIntrinsic(nm) {
+      return false
+    }
+  }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// After the address and a store's value: the access at memarg offset `off`. Returns 0.
+export function memAccessTail(p: MemAccessPlan, off: i64): i32 {
+  fbMemAccess(p.mxOp, p.mxAlign, off)
   return 0
 }
 
@@ -26066,28 +26325,6 @@ function emitCallCoreMemBulk(c: Call, callee: Ident, fnIx: i32) {
   } else {
     fbMemBulk(MISC_MEMORY_FILL, 1)
   }
-  return 0
-}
-
-// The load intrinsics of `emitCallCore` other than `__load_i32__`. Returns 0 once emitted, -1
-// on failure.
-function emitCallCoreMemLoad(c: Call, callee: Ident, fnIx: i32) {
-  const mlOff = emitMemAddr(c, 1, fnIx, callee.identName)
-  if mlOff < 0 { return -1 }
-  // the guard above and the two tables below are three lists keyed by the same
-  // names, in two files: a fourth width added to one and not the others would
-  // reach here with -1 and write it as an opcode byte, a silently invalid module.
-  // Unreachable while the lists agree, and free when they do.
-  const mlOp = memLoadOpcode(callee.identName)
-  const mlAlign = memLoadAlignExp(callee.identName)
-  if mlOp < 0 || mlAlign < 0 {
-    return emitFail(
-      "emitProgram: '"
-        + callee.identName
-        + "' is a declared load width with no opcode — the intrinsic-name list and the opcode table have drifted",
-    )
-  }
-  fbMemAccess(mlOp, mlAlign, mlOff)
   return 0
 }
 
@@ -26423,27 +26660,10 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if !userOwnsName && callee.identName == "print" {
     return emitCallCorePrint(callIx, c, fnIx)
   }
-  // The linear-memory intrinsics, lowered inline (the host defines `__store_i32__`/
-  // `__load_i32__` as one-instruction wasm functions): store/load become
-  // `i32.store`/`i32.load` directly; `__log__` calls the synthetic in-module decoder
-  // at `gMemLogIdx` (see `irMemLogFnCode`).
-  if !userBindsName && callee.identName == "__store_i32__" {
-    const s32Off = emitMemAddr(c, 2, fnIx, "__store_i32__")
-    if s32Off < 0 { return -1 }
-    if emitExpr(memCallArg(c, 2, 1), fnIx) < 0 { return -1 }
-    fbMemAccess(OP_I32_STORE, 2, s32Off)
-    return 0
-  }
-  if !userBindsName && callee.identName == "__load_i32__" {
-    const l32Off = emitMemAddr(c, 1, fnIx, "__load_i32__")
-    if l32Off < 0 { return -1 }
-    fbMemAccess(OP_I32_LOAD, 2, l32Off)
-    return 0
-  }
-  // The five other store widths (`buffer-design.md` §C2): push the address, then the
-  // value at its own declared width, then the opcode at its natural alignment.
-  if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
-    return emitCallCoreMemStore(c, callee, fnIx)
+  // Every load and store width (`buffer-design.md` §C2), lowered inline: the address, a store's
+  // value at its declared width, then the opcode at its natural alignment (`memAccessPlanOf`).
+  if memAccessCallNamed(c, fnIx) {
+    return emitCallCoreMemAccess(c, callee.identName, fnIx)
   }
   // the bulk pair (`buffer-design.md` §C3): three i32 operands
   // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
@@ -26451,12 +26671,6 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // arbitrary expressions' side effects.
   if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
     return emitCallCoreMemBulk(c, callee, fnIx)
-  }
-  // The ten other load widths (`buffer-design.md` §C2): push the address, write the
-  // opcode at its natural alignment — the per-width difference is exactly two bytes,
-  // held in `memLoadOpcode`/`memLoadAlignExp`. `__load_i32__` keeps its own arm above.
-  if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
-    return emitCallCoreMemLoad(c, callee, fnIx)
   }
   // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
   // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
@@ -34663,24 +34877,23 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 }
 
 // The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
-// box, a record or an `i32` list, each read whole into the loop variable.
+// box, a record, or an `i32`, string or byte list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" => true
-    "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "nulstr" | "variant" | "nulstruct" | "i64" | "f64" => true
+    "reflist" | "map" | "nulvariant" | "f64list" | "f32" | "closure" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
 // Why `for` statement `s` at `stmtIx` is not the plain walk, or "": a list of a `forInElemPlain`
-// kind, a string's code points or a map's keys or values, read once; no second name, byte source
-// or node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
+// kind, a string's code points or a map's keys or values, read once; no second name or
+// node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
 // nothing is hoisted or unrolled ("hoisted" where it is). A literal iterable is a list literal.
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return "iterable" }
   if !forInElemPlain(ek) { return "element " + ek }
-  if forInU8Src(s.fiIter, fnIx) { return "byte source" }
   if s.fiVar2 != "" { return "pair" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
@@ -41270,7 +41483,7 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   elseS.push(e.binRight)
   const pos = e.pos
   const ifIx = mkIf(
-    mkBinary("!=", e.binLeft, mkNull("null", pos), pos),
+    mkNullTestNe(e.binLeft, pos),
     mkBlock(thenS, pos),
     mkBlock(elseS, pos),
     pos,
