@@ -358,6 +358,7 @@ import {
 import {
   EmptyFitPlan,
   arrLitIsForIter,
+  coalFieldPlanOf,
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
@@ -814,8 +815,21 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if rep != ibBool { return irBMiss("is result rep") }
   const tag = boxTestTagOf(n, ix, arm)
   if ibMiss != "" { return irBMiss(ibMiss) }
+  // A record's box field is read raw, at its storage, as legacy's `memStruct` arm reads it.
+  const stored = arm == "armTag" && tagIsArmOf(ix, n, ibFnIx) == "memStruct"
+  const mark = if stored { storageReadEnter(n.isObj) } else { storageReadEnter(-1) }
   const v = irBExpr(b, n.isObj)
+  storageReadLeave(mark)
   if ibMiss != "" { return v }
+  // A read at its storage is the field's own plain box, as the verifier holds a stored read; a
+  // narrowed read is its storage's declared box (`storedMemberBoxTest`).
+  const st = if stored { readNarrowedStoreAt(n.isObj, ibFnIx) } else { -1 }
+  if (
+    stored && !(repNodeAt(irBOpRep(v)) is RBox)
+    || st >= 0 && irBOpRep(v) != repNodeOfTy(st)
+  ) {
+    return irBMiss("is member storage rep")
+  }
   if !(repNodeAt(irBOpRep(v)) is RBox) && !boxedNullable(irBOpRep(v)) {
     return irBMiss("is operand rep")
   }
@@ -1108,7 +1122,7 @@ function objLitAt(
     if valIx < 0 && omitRow >= 0 {
       const nul = irBLetTempTy(
         b,
-        { omRow: row, omField: fi },
+        { fnRow: row, fnFi: fi },
         ix,
         ks[k],
         fieldSiteTy(arm, row, fi),
@@ -1454,6 +1468,9 @@ function boxTestTagOf(n: IsExpr, ix: i32, arm: IsArm): i32 {
     return uTags[vi]
   }
   const ta = tagIsArmOf(ix, n, ibFnIx)
+  // A box value's tag is read off the receiver's own value, as legacy's `box` arm reads it, and a
+  // record's box field off the field read at its storage (`memStruct`).
+  if ta == "box" || ta == "memStruct" { return isArmTagOf(ix, n, ibFnIx) }
   if ta != "identBox" {
     irBMiss("is arm tag " + ta)
     return 0
@@ -1649,7 +1666,13 @@ export function irBLetTemp(b: i32[], rhs: Rhs, ix: i32, rep: i32): Opnd {
 }
 
 // `irBLetTemp` at type `ty`, where the value is built at another type than its node's.
-function irBLetTempTy(b: i32[], rhs: Rhs, ix: i32, rep: i32, ty0: i32): Opnd {
+export function irBLetTempTy(
+  b: i32[],
+  rhs: Rhs,
+  ix: i32,
+  rep: i32,
+  ty0: i32,
+): Opnd {
   // A byte value's temp holds the i32 it is built at (`byteHeld`).
   const ty = if repPrim(rep) == "i32" { byteHeld(ty0) } else { ty0 }
   // A node typed at a still-open variable (a generic's result no call has instanced) has no type
@@ -2576,6 +2599,17 @@ function cloValue(b: i32[], ix: i32, rep: i32, ty: i32): Opnd {
   return irBLetTempTy(b, { mcFn: fe, mcEnv: env, mcAt: ix }, ix, rep, ty)
 }
 
+// A function value returned at another closure rep, with no coercion recorded at it, built at the
+// function's result: legacy returns the same closure ref whatever signature its type names.
+function retCloAt(b: i32[], retIx: i32): Opnd | null {
+  const ix = unwrapParen(retIx)
+  if ix < 0 || !(repNodeAt(ib.irRetRep) is RClosure) { return null }
+  const own = exprRepOf(ix)
+  if own == ib.irRetRep || !(repNodeAt(own) is RClosure) { return null }
+  if exprPrePathWhy(ix, ibFnIx) != "" || cloValueFeOf(ix) < 0 { return null }
+  return cloValue(b, ix, ib.irRetRep, ib.irRetTy)
+}
+
 // The environment of capturing function `fe`, read at `ix`, as `emitClosureEnvOf` builds it: each
 // capture a parameter or binding of this frame, or this frame's own capture. A cached or shared
 // environment, a cell, or a global capture misses.
@@ -3129,9 +3163,13 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     // the parameter's union, as `emitUnionBoxAtRecord` writes it.
     const arm = callRefArgArmOf(ix, ibFnIx, key, c.callArgs[i], i)
     const wt = closureArgWidenTy(arm)
-    const bx = if arm == "box" { closureParamRep(f, i) } else { -1 }
-    if arm == "box" && bx < 0 { return missRhs("closure box parameter rep") }
-    const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else { irBExpr(b, c.callArgs[i]) }
+    // An atom or a scalar list is written as it stands, so it must already be at the parameter's rep.
+    const asIs = arm == "atom" || arm == "scalarList"
+    const bx = if arm == "box" || asIs { closureParamRep(f, i) } else { -1 }
+    if (arm == "box" || asIs) && bx < 0 {
+      return missRhs("closure box parameter rep")
+    }
+    const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 && !asIs { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
     if ifBelowLead(b, at, "short-circuit closure argument") {
       return missRhs("short-circuit closure argument")
@@ -4209,7 +4247,10 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     && repNodeAt(dst) is RClosure
     && untypedCloValue(ix)
   ) {
-    const ty = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+    // A hole function's value is typed at the field's own rep where the row's site type, which
+    // another instance may have set, is not it.
+    const hole = holeCloTy(nodeTyAt(unwrapParen(ix), ibFnIx))
+    const ty = if dstTy >= 0 && !(hole && repNodeOfTy(dstTy) != dst) { dstTy } else { repTyOf(dst) }
     return cloValue(b, unwrapParen(ix), dst, ty)
   }
   // A box local narrowed to a record arm, delivered as it stands: legacy reads the box itself,
@@ -5203,6 +5244,9 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
     "valBox" | "valScalar" | "elem" | "callBox" | "callScalar" => true
     "boolPop" | "valNoKind" | "callNoKind" | "next" => false
   }
+  if !built && arm == "next" && nodeAt(lhsIx) is Member {
+    return coalField(b, n, lhsIx, ix, rep)
+  }
   if !built { return irBMiss("coalesce box " + arm) }
   if (arm == "callBox" || arm == "callScalar") && !(nodeAt(lhsIx) is Call) {
     return irBMiss("coalesce box stash operand")
@@ -5230,6 +5274,50 @@ function coalBox(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   irBNode(
     b,
     { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `o.v ?? d` over a value-union record field past the boxed arms, along `coalFieldPlanOf` as
+// `emitCoalesceUnionField` writes it: the record, a variable it re-reads, then the shared null
+// test's `if`, the default built into its null arm. A receiver it unwraps is a named miss.
+function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  const p = coalFieldPlanOf(n, lhsIx, ix, ibFnIx)
+  if p.cfArm != "boxed" && p.cfArm != "unbox" {
+    return irBMiss("coalesce field " + p.cfArm)
+  }
+  if p.cfCast != -1 { return irBMiss("coalesce field cast") }
+  const boxed = p.cfArm == "boxed"
+  const repOk = if boxed { repNodeAt(rep) is RBox } else { repPrim(rep) != null }
+  if !repOk { return irBMiss("coalesce field result rep") }
+  const m = nodeAt(lhsIx)
+  if !(m is Member) { return irBMiss("coalesce field node") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
+  const r = irBExpr(b, m.memObj)
+  if ibMiss != "" { return r }
+  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+    return irBMiss("coalesce field place")
+  }
+  if !(repNodeAt(irBOpRep(r)) is RRecord) {
+    return irBMiss("coalesce field receiver rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce field default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = if boxed { "fieldBox" } else { "fieldVal" }
+  irBNode(
+    b,
+    { cbL: r, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
     ty,
     rep,
     ix,
@@ -5959,13 +6047,10 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if p == null || n.binIdent != 0 { return irBMiss("operator " + n.binOp) }
     // Legacy strength-reduces a masked shift (`shiftMaskFoldOf`) at an integer width.
     const fw = binNumWidth(n, ibFnIx)
-    if (
-      fw != "f32"
-      && fw != "f64"
-      && shiftMaskFoldOf(n, ix, if fw == "i64" { 64 } else { 32 }, ibFnIx).length
-        > 0
-    ) {
-      return irBMiss("shift-mask fold")
+    if fw != "f32" && fw != "f64" {
+      const fb = if fw == "i64" { 64 } else { 32 }
+      const fold = shiftMaskFoldOf(n, ix, fb, ibFnIx)
+      if fold.length > 0 { return shiftMaskFold(b, fold, fb, ix, rep) }
     }
     const lw = operandWhy(n.binLeft)
     if lw != "" { return irBMiss(lw) }
@@ -6135,6 +6220,42 @@ function numCast(b: i32[], n: AsExpr, ix: i32, rep: i32): Opnd {
     return irBMiss("as operand coercion")
   }
   return irBLetTemp(b, { ncV: o, ncAt: ix }, ix, rep)
+}
+
+// Legacy's strength-reduced masked shift (`shiftMaskFoldOf`'s [x, k, narrow, m, j]): x at the
+// fold's width, then the shift netting `k` against `j` and the mask `m << j`, both constants, as
+// `emitShiftMaskFold` writes them. The narrowing form's wrap is legacy's.
+function shiftMaskFold(b: i32[], f: i64[], w: i32, ix: i32, rep: i32): Opnd {
+  if f[4] < 0 { return irBMiss("shift-mask fold narrowing") }
+  const ir = repNodeOfTy(if w == 64 { numCastKindTy(3) } else { TY_I32 })
+  if rep != ir { return irBMiss("shift-mask fold rep") }
+  const x = f[0] as% i32
+  const ow = operandWhy(x)
+  if ow != "" { return irBMiss(ow) }
+  let v = irBExpr(b, x)
+  if ibMiss != "" { return v }
+  if w == 64 {
+    const p = widenPlanOf(x, 3, ibFnIx)
+    if p.wpArm != "plain" { return irBMiss("widen " + p.wpArm) }
+    v = widenTo(b, v, x, ir, -1)
+    if ibMiss != "" { return v }
+  }
+  // A narrowing source (an i64 read at width 32) takes legacy's `i32.wrap_i64`.
+  if irBOpRep(v) != ir { return irBMiss("shift-mask fold narrowing source") }
+  const k = f[1]
+  const j = f[4]
+  let s = v
+  if k != j {
+    const by: Opnd = { oiRep: ir, oiBits: if k > j { k - j } else { j - k } }
+    const op: PrimOp = if k > j { "shru" } else { "shl" }
+    s = irBLetTemp(b, { poOp: op, poArgs: [v, by] }, ix, ir)
+  }
+  const mj = f[3] << j
+  const m: Opnd = {
+    oiRep: ir,
+    oiBits: if w == 64 { mj } else { (mj as% i32) as i64 },
+  }
+  return irBLetTemp(b, { poOp: "and", poArgs: [s, m] }, ix, rep)
 }
 
 // A string literal at the `str` rep, or delivered as its destination's interned atom.
@@ -7092,7 +7213,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { tpWhy: 0 }, -1, ibNoValue, ix)
       return 0
     }
-    const v = deliver(b, n.retArg, ib.irRetRep, -1)
+    const v = retCloAt(b, n.retArg) ?? deliver(b, n.retArg, ib.irRetRep, -1)
     if ibMiss != "" || irBOpRep(v) != ib.irRetRep {
       return skip("return coercion")
     }
@@ -8008,10 +8129,19 @@ function cloValueIsCore(ix: i32, fe: i32): boolean {
   }
 }
 
-// Whether `ix` is a function literal or name read as a closure value that records no type.
+// Whether recorded type `t` is a closure type left open, a hole function's own `(a) => a`: its
+// value is built at the rep the record field holds, and a read of that field reads at it.
+export function holeCloTy(t: i32): boolean {
+  return t >= 0 && irTyOpen(t) && repNodeAt(repNodeOfTy(t)) is RClosure
+}
+
+// Whether `ix` is a function literal or name read as a closure value that records no type, or a
+// hole function's (`holeCloTy`).
 function untypedCloValue(ix: i32): boolean {
   const u = unwrapParen(ix)
-  if u < 0 || u >= P.nodes.length || nodeTyAt(u, ibFnIx) >= 0 { return false }
+  if u < 0 || u >= P.nodes.length { return false }
+  const t = nodeTyAt(u, ibFnIx)
+  if t >= 0 && !holeCloTy(t) { return false }
   if exprPrePathWhy(u, ibFnIx) != "" { return false }
   return cloValueFeOf(u) >= 0
 }
