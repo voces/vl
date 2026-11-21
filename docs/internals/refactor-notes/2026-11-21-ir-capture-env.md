@@ -48,8 +48,8 @@ field reads and an env-to-env copy; all five functions are covered and matched.
 | L2 self-compile fuel | 104,683,723,346 | 104,701,125,652 | 104,803,012,071 (+0.114%) |
 
 The self-compile's +5 are this step's own new functions; the base seed building this tree also
-reads 19,061. The compiler holds no closure, so the fuel rise is the builder's new work per read
-and per box delivery, not coverage.
+reads 19,061. The compiler holds no closure the step covers; the fuel rise (+0.097% over step 1) is
+not attributed further, and is under the +1% tier.
 
 ## What is left in the family (`tests/cases`, any)
 
