@@ -10,7 +10,7 @@
 
 const SCRIPT = new URL("../scripts/ir-identity.sh", import.meta.url).pathname;
 
-type Build = { rc: number; err?: string; wasm?: string };
+type Build = { rc: number; err?: string; wasm?: string; log?: string };
 
 /** Writes `builds` (file name to build) into a fresh dir, as `build_all` leaves them. */
 function dir(root: string, name: string, builds: Record<string, Build>): string {
@@ -21,6 +21,7 @@ function dir(root: string, name: string, builds: Record<string, Build>): string 
     Deno.writeTextFileSync(`${d}/${k}.rc`, `${b.rc}\n`);
     Deno.writeTextFileSync(`${d}/${k}.err`, b.err === undefined ? "" : `${b.err}\n`);
     if (b.wasm !== undefined) Deno.writeTextFileSync(`${d}/${k}.wasm`, b.wasm);
+    if (b.log !== undefined) Deno.writeTextFileSync(`${d}/${k}.log`, b.log);
   }
   return d;
 }
@@ -31,12 +32,20 @@ function compare(mode: string, a: Record<string, Build>, b: Record<string, Build
   try {
     const list = `${root}/list`;
     Deno.writeTextFileSync(list, Object.keys(a).join("\n") + "\n");
+    const keep = `${root}/keep`;
     const out = new Deno.Command("bash", {
       args: [SCRIPT, mode, list, dir(root, "a", a), dir(root, "b", b)],
+      env: { IR_IDENTITY_KEEP: keep },
       stdout: "piped",
       stderr: "piped",
     }).outputSync();
-    return { code: out.code, text: new TextDecoder().decode(out.stdout) };
+    let kept: string[] = [];
+    try {
+      kept = [...Deno.readDirSync(keep)].map((e) => e.name).sort();
+    } catch {
+      kept = [];
+    }
+    return { code: out.code, text: new TextDecoder().decode(out.stdout), kept };
   } finally {
     Deno.removeSync(root, { recursive: true });
   }
@@ -52,7 +61,7 @@ const CASES: Record<string, Build> = {
 
 Deno.test("ir-identity --compare: the same builds pass", () => {
   const r = compare("--compare", CASES, CASES);
-  if (r.code !== 0 || !r.text.includes("cases: identical 1, fail under both 1, differ 0")) {
+  if (r.code !== 0 || !r.text.includes("cases: identical 1, fail under both 1, differ 0, timeout 0")) {
     throw new Error(`want a pass, got exit ${r.code}:\n${r.text}`);
   }
 });
@@ -103,5 +112,39 @@ Deno.test("ir-identity --compare-errors: a witness both seeds build to other byt
   const r = compare("--compare-errors", { ...ERRORS, "t/e3.vl": { rc: 0, wasm: "other" } }, ERRORS);
   if (r.code !== 1 || !r.text.includes("DIFF t/e3.vl\n")) {
     throw new Error(`want t/e3.vl to red on its bytes, got exit ${r.code}:\n${r.text}`);
+  }
+});
+
+Deno.test("ir-identity --compare: a one-sided timeout is a TIMEOUT, refused, never a DIFF", () => {
+  const r = compare("--compare", { ...CASES, "t/ok.vl": { rc: 124, err: "", log: "partial" } }, CASES);
+  if (
+    r.code !== 3 || !r.text.includes("TIMEOUT t/ok.vl (a)") || r.text.includes("DIFF") ||
+    !r.text.includes("differ 0, timeout 1") || !r.text.includes("Rerun on a quiet box")
+  ) {
+    throw new Error(`want exit 3 and a TIMEOUT, got exit ${r.code}:\n${r.text}`);
+  }
+  if (!r.kept.includes("a.t_ok.vl.log")) {
+    throw new Error(`want the timed-out build's log kept, got ${JSON.stringify(r.kept)}`);
+  }
+});
+
+Deno.test("ir-identity --compare: a differ beside a timeout still reds as a differ", () => {
+  const r = compare(
+    "--compare",
+    { "t/ok.vl": { rc: 0, wasm: "one" }, "t/r.vl": { rc: 1, err: REFUSAL, log: "x" } },
+    { "t/ok.vl": { rc: 0, wasm: "two", log: "y" }, "t/r.vl": { rc: 124, err: "" } },
+  );
+  if (r.code !== 1 || !r.text.includes("DIFF t/ok.vl") || !r.text.includes("TIMEOUT t/r.vl (b)")) {
+    throw new Error(`want exit 1 with the DIFF and the TIMEOUT, got exit ${r.code}:\n${r.text}`);
+  }
+  if (!r.kept.includes("b.t_ok.vl.log") || !r.kept.includes("a.t_r.vl.log")) {
+    throw new Error(`want both non-identical files' logs kept, got ${JSON.stringify(r.kept)}`);
+  }
+});
+
+Deno.test("ir-identity --compare-errors: a timeout is refused there too", () => {
+  const r = compare("--compare-errors", { "t/e1.vl": { rc: 124, err: "" } }, { "t/e1.vl": { rc: 1, err: "t/e1.vl:1:1: x" } });
+  if (r.code !== 3 || !r.text.includes("TIMEOUT t/e1.vl (a)") || !r.text.includes("errors: same 0, differ 0, timeout 1")) {
+    throw new Error(`want exit 3 and a TIMEOUT, got exit ${r.code}:\n${r.text}`);
   }
 });
