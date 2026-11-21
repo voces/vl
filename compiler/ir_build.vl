@@ -131,6 +131,7 @@ import {
   arrNewCallNamed,
   arrNewFillBoxTy,
   arrNewPlanOf,
+  asCastArmOf,
   asgValueArmOf,
   atomHookArmOf,
   atomStrPlanOf,
@@ -200,6 +201,10 @@ import {
   mapSetNulBoolVal,
   mapSetRefIntoMono,
   mapSetValArmOf,
+  memAccessCallNamed,
+  memAccessPlanOf,
+  memAddrPlanOf,
+  memCallArg,
   nulNoneWritesNothing,
   numCastKindOf,
   numCastKindTy,
@@ -242,6 +247,7 @@ import {
   variantFieldArmOf,
   variantFieldBoxTy,
   variantFieldStoreValueArmOf,
+  zextLoadOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
 import {
@@ -2211,6 +2217,7 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   const d = identDeclOf(c.callFn)
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
+  if memAccessCallNamed(c, ibFnIx) { return memAccessRhs(b, c, ix) }
   if hostCallNamed(c, ibFnIx) { return hostCallRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
@@ -3872,6 +3879,45 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { lnLen: len, lnFill: v, lnAt: ix }, ix, rep)
 }
 
+// A linear-memory load or store of an i32 as legacy's arm writes it (`memAccessPlanOf`): the
+// address along `memAddrPlanOf`'s `const` arm (an immediate 0) or `rest` arm (its node), then a
+// store's value. A widened store value and every other address arm are named misses.
+function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
+  if c.callFn < 0 || c.callFn >= P.nodes.length {
+    return missRhs("memory access callee")
+  }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return missRhs("memory access callee") }
+  const p = memAccessPlanOf(f.identName)
+  if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
+  if !p.mxI32 || p.mxWiden >= 0 { return missRhs("memory access wide value") }
+  const ap = memAddrPlanOf(c, p.mxBase, ibFnIx)
+  const at = b.length
+  const args: Opnd[] = []
+  match ap.maArm {
+    "const" => {
+      const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
+      args.push(z)
+    }
+    "rest" => args.push(irBExpr(b, ap.maRest))
+    "bad" | "lma" | "fold" | "wide" => {
+      return missRhs("memory address " + ap.maArm)
+    }
+  }
+  if p.mxBase == 2 { args.push(irBExpr(b, memCallArg(c, 2, 1))) }
+  if ibMiss != "" { return missRhs("memory access operand") }
+  if ifBelowLead(b, at, "memory access short-circuit operand") {
+    return missRhs("memory access short-circuit operand")
+  }
+  for o in args {
+    if repPrim(irBOpRep(o)) != "i32" {
+      return missRhs("memory access operand coercion")
+    }
+  }
+  const r: Rhs = { mmArgs: args, mmAt: ix }
+  return r
+}
+
 // `__array_copy__(dst, dstAt, src, srcAt, count)` as legacy's arm writes it (`arrCopyPlanOf`): the
 // five operands as they stand, two lists of one rep and three i32s. A refused site is a named miss.
 function listCopyStmt(b: i32[], n: Call, ix: i32): i32 {
@@ -4755,6 +4801,10 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   }
   if n is BinExpr {
     if n.binOp == "&&" || n.binOp == "||" { return shortCircuit(b, n, ix, rep) }
+    // Legacy folds a mask that only zero-extends a load into the zero-extending load.
+    if n.binOp == "&" && zextLoadOf(ix, ibFnIx) >= 0 {
+      return irBMiss("zero-extending load mask")
+    }
     if n.binOp == "=" { return assignValue(b, n, ix, rep) }
     const bt = binNulTestOf(n)
     if bt != null { return nulTest(b, n, bt, ix, rep) }
@@ -4893,7 +4943,12 @@ function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if n is IsExpr { return boxTest(b, n, ix, rep) }
   if n is IfStmt { return ifExpr(b, n, ix, rep) }
   if n is FuncDecl && repNodeAt(rep) is RClosure { return cloValue(b, ix, rep) }
-  if n is AsExpr { return numCast(b, n, ix, rep) }
+  if n is AsExpr {
+    if asCastArmOf(ix, ibFnIx) == "zextLoad" {
+      return irBMiss("expression as zextLoad")
+    }
+    return numCast(b, n, ix, rep)
+  }
   if n is ObjLit { return objLit(b, ix, rep) }
   return irBMiss("expression " + irAstKind(ix))
 }
