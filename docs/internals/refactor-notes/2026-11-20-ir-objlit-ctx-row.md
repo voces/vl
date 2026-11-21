@@ -26,4 +26,4 @@ phase-state surface.
 `tests/cases/records/literal-at-declared-row-type.vl` builds the stash-ordered `RepDesc` shape
 declared, returned, and returned into a nullable result. Under the merge-base seed one of its
 four functions is covered: the others stop at `declaration coercion` and `return coercion`.
-After, all four are covered and matched. Shadow row `LIT_AT_DECLARED_ROW`.
+After, all four are covered and matched. Shadow row `tests/ir-shadow-rows/record-literal-at-declared-row.vl`.
