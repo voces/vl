@@ -18,3 +18,12 @@ only where the index place is narrowed non-null (D451).
 
 `tests/ir-shadow-rows/index-ref-nullable-element.vl`: a `(R | null)[]` element read into a local,
 and the same read under an `xs[1] != null` narrowing.
+
+## Measured (fixpoint seeds of master 568e22a3 and the change)
+
+- tests/cases armed shadow: covered and matched +100 (65,665 → 65,765), start +19.
+  `uncovered index ref nullable element` 117 → 0, start 26 → 0. `index element coercion` 42 → 43:
+  one function whose read now reaches the element rep check. No new `fail` or `mismatch` row.
+- Corpus: `index ref nullable element` 19 → 0; no-blocker 44,577 → 44,596 of 45,678.
+- Legacy: tests/cases A/B identical 7,312 (differ 0), `--names` identical, mode-3 self
+  byte-identical. L2 fuel −0.02% per PR on base 568e22a3.
