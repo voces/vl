@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR: element stores into atom, niche, union and nested lists, and `(string | null)[]` reads.** `idxStorePlainWhy` refused every store legacy writes through its seeded or boxed arms (`store element`, `store element seed`, `store atom`). It now takes an atom, niche or nullable-string list's value as legacy's bare `emitExpr` writes it, a union list's value the record boxes or is already a named union (`emitUnionBoxAtRecord`), a nested list's non-literal row, and an atom decoded into a string list. `store arm` is refused only at a store with a record row, the one place legacy's arm seat casts. A `(string | null)[]` read takes the string list's read arm, recovered non-null only where the checker types it so (`index nulstr`).
