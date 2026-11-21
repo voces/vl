@@ -26,7 +26,7 @@ the same thirty-instruction tail over their frame.
 `tests/cases/lists/concat-each-list-rep.vl` concatenates i32, string, f64, record and packed
 byte lists, a chain, a narrowed nullable operand, a widening concat and a doubling loop. Under the
 merge-base seed all nine functions stop at `operand type`. After, eight are covered and matched,
-and the widening one is `list concat widen`. Shadow row `LIST_CAT`.
+and the widening one is `list concat widen`. Shadow row `tests/ir-shadow-rows/list-concat.vl`.
 
 ## Measured
 
