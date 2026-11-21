@@ -38,9 +38,10 @@ owner's 2026-11-15 ruling that exports freeze at the module boundary.
   IR passes, and the `wasm-opt` driver (about 900) stays.
 - **Migration (§5) uses two seams.** At the **op seam**, a legacy call site calls the total
   `lower(op × rep)` in place of its own ladder, and that site is byte-identical. At the
-  **function seam**, `emitFuncCode` hands a function to the IR path only when a dual emit of that
-  function has produced identical bytes. Legacy code deletes per construct, when its last claimant
-  goes. After I1b, cutover proceeds family by family at both seams (§10).
+  **function seam**, `emitFuncCode` hands a function to the IR path once the IR builds, verifies
+  and lowers it. Identity with legacy's bytes is enforced at gate time, not per build (§5.2's
+  claim rule). Legacy code deletes per construct, when its last claimant goes. After I1b, cutover
+  proceeds family by family at both seams (§10).
 - **Refusals (§6).** Two refusal literals are live (`live-sites.json`), and 4 of 247 capability
   probes still refuse. The IR closes both live literals and all four probes. The fourth is D16396,
   a checker refusal of a program the field-pair rule makes legal (§6.1). Of the 850 sites, 443 are by message a table miss or a kind
@@ -452,6 +453,17 @@ two-stage protocol:
 A step's PR turns claiming on for its construct set only at **zero dual-emit mismatches** over the
 self-compile and the distilled corpus. After that the IR path mints for itself, and the seed `cmp`
 proves the mint order held.
+
+**The claim rule (2026-11-21).** As shipped, a function is claimed when the IR builds, verifies and
+lowers it. No per-build check compares its bytes with legacy's: that would run legacy beside every
+claim, which measured +18.5% L2 self-compile fuel and +12% to +14% on ordinary builds (the armed
+shadow's cost, `refactor-notes/2026-11-21-ir-claimless-gate.md`). Identity is enforced at gate
+time instead, by building each population under the shipped compiler and under the same tree with
+`CLAIMED` empty, comparing wasm and exit code. `ir-identity.sh --cases` does this for `tests/cases`
+and the probes, and `--claimless` for the distilled cells and the inventory witnesses filed `runs`.
+Any differ is a veto. This sees what the armed shadow cannot: legacy runs first under the shadow,
+so a plan the claim asks before legacy, or a mint it skips, shows only in the shipped bytes
+(the block-tail statement claim of 2026-11-21 shipped this way).
 
 **Op seam.** `lower(op × rep)` is a plain function. So a legacy call site can call it in place of
 its own ladder before any function is claimed, for example:
