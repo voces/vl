@@ -89,6 +89,7 @@ import {
   fieldRowIsUnionBox,
   fieldRowSlotTable,
   fieldRowStorageKind,
+  sFieldTgtStructIdx,
 } from "./emit_atom_kinds"
 import {
   decodeStr,
@@ -722,6 +723,19 @@ function nulNicheBaseClass(recvIx: i32, fnIx: i32) {
   if nk == "nulstr" { return "string" }
   if nodeRepIsRefKind(recvIx, fnIx) { return "#ref" }
   return ""
+}
+
+// `nulNicheIsTestImpossible` for `is` test `isIx`'s own receiver and pattern.
+export function isNulTestImpossible(isIx: i32, fnIx: i32): boolean {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return false }
+  return nulNicheIsTestImpossible(nd.isObj, isVarTyIxOf(isIx), fnIx)
+}
+
+// The type a read of a cell typed `ty` yields once recovered past its `null`: its nullable's
+// member, or -1 when `ty` is not a nullable.
+export function recoveredReadTyOf(ty: i32): i32 {
+  return nullableInnerOrNone(ty)
 }
 
 // True when `ity` provably cannot be the sole non-null member of nullable niche `recvIx`,
@@ -3334,9 +3348,9 @@ function memberReadPlain(memIx: i32, fnIx: i32): boolean {
   if m.memProp == "length" && !lengthIsField(m, memIx, fnIx) { return false }
   if readMayBeNulUnit(memIx) && exprIsNulNone(memIx, fnIx) { return false }
   if placeNicheAtomKind(memIx, fnIx) >= 0 { return false }
-  // A field read's or a name's receiver recovers in its own read (`emitReadRecover`); any other
-  // receiver owing one is not plain.
-  const o = nodeAt(m.memObj)
+  // A field read's or a name's receiver recovers in its own read (`emitReadRecover`), in parens
+  // too; any other receiver owing one is not plain.
+  const o = nodeAt(unwrapParen(m.memObj))
   return twoListUseMsg(m.memObj, m.memProp, fnIx) == ""
     && (o is Member || o is Ident || !readOwesNonNullRecover(m.memObj, fnIx))
 }
@@ -3401,7 +3415,19 @@ export function structFieldPlain(memIx: i32, fnIx: i32): i32 {
   if sFieldIsUnionBox(si, idx) {
     return if memReadBoxAmbiguous(memIx, fnIx) { -1 } else { idx }
   }
-  return if fieldStoresRead(sFieldStart[si] + idx, memIx, fnIx) { idx } else { -1 }
+  if fieldStoresRead(sFieldStart[si] + idx, memIx, fnIx) { return idx }
+  return if fieldStoresArmRead(si, idx, memIx, fnIx) { idx } else { -1 }
+}
+
+// Whether struct row `si`'s nullable record field `idx` holds the union arm read `memIx` records:
+// a `nulstruct` slot whose target heap is the arm's, read as `X | null` or, recovered, as `X`.
+function fieldStoresArmRead(si: i32, idx: i32, memIx: i32, fnIx: i32): boolean {
+  if fieldRowStorageKind(sFieldStart[si] + idx) != "nulstruct" { return false }
+  const rk = repOfNode(memIx, fnIx).rdKind
+  const vi = if rk == "nulvariant" { nulVariantIdxOfExpr(memIx, fnIx) } else if rk == "variant" && readOwesNonNullRecover(memIx, fnIx) { exprVariantIndex(memIx, fnIx) } else { -1 }
+  const t = sFieldTgtStructIdx(si, idx)
+  if vi < 0 || t < 0 || t >= sHeapIdx.length { return false }
+  return sHeapIdx[t] == variantHeap(vi)
 }
 
 // Whether plain member read `memIx` reads a union-box field, whose tail delivers the read's own rep.
