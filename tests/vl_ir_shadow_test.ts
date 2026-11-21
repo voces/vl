@@ -2421,3 +2421,23 @@ print(qnull().o == null)
     }
   },
 });
+
+// A record literal legacy builds through its order stash is built at its destination's record
+// type where that type names the same struct row: the literal's own type holds a plain atom
+// where the destination holds its nullable, the same i32. Declared, returned, and returned into
+// a nullable result.
+const LIT_AT_DECLARED_ROW =
+  `type VK = "i32" | "struct" | "list"\ntype RD = { rdKind: VK | null, rdNul: i32, rdSlot: i32, rdSigTok: string, rdListElem: string, rdAtom: i32 }\nfunction tok(k: VK | null) { return if k == null { "" } else { "t" } }\nfunction declared(kind: VK, nul: i32): RD {\n  const d: RD = { rdKind: kind, rdNul: nul, rdSlot: -1, rdSigTok: tok(kind), rdListElem: "", rdAtom: 0 }\n  return d\n}\nfunction returned(kind: VK): RD { return { rdKind: kind, rdNul: 2, rdSlot: -1, rdSigTok: tok(kind), rdListElem: "", rdAtom: 0 } }\nfunction maybe(kind: VK, nul: i32): RD | null {\n  if nul < 0 { return null }\n  return { rdKind: kind, rdNul: nul, rdSlot: -1, rdSigTok: tok(kind), rdListElem: "", rdAtom: 0 }\n}\nprint(declared("list", 1).rdNul)\nprint(returned("i32").rdSigTok)\nprint(maybe("struct", 3)?.rdNul ?? 0)\n`;
+Deno.test({
+  name: "ir shadow: a stashed record literal builds at its destination's row type and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LIT_AT_DECLARED_ROW, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want every function covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
