@@ -23,16 +23,17 @@ owns. Three of them close here:
   omitting literal, so without this the lowering failed (`unlowered: record row`) where the
   builder had succeeded.
 
-## Measured vs #9335's head (bc999141, fixpoint seeds on both sides)
+## Measured vs merge-base 4c186c33 (fixpoint seeds on both sides)
 
 | bar | result |
 |---|---|
 | `ir-identity.sh --names` | identical 9,037, differ 0; self-compile identical |
-| `ir-identity.sh --cases` | identical 7,554, differ 0; witnesses same 60 |
-| `tests/cases` + probes A/B | 7,616 same |
-| shipped against claimless, all 26,216 I8-census programs | 26,216 same |
+| `ir-identity.sh --cases` | identical 7,556, differ 0; witnesses same 60 |
+| `ir-identity.sh --claimless` | identical 14,012, differ 0 |
+| `tests/cases` + probes A/B | 7,618 same |
+| shipped against claimless, all 26,216 I8-census programs (before the master merge) | 26,216 same |
 | const cells, armed shadow over the census programs | 30,543 matched, 0 mismatch; `progress cell` 12 → 0, `array null sentinel` 1 → 0, `object layout` 7 → 4 programs |
-| L2 self-compile fuel | 104,199,762,252 against 104,151,492,566: +0.05% |
+| L2 self-compile fuel | 104,282,150,062: −0.6% on the 104,920,663,373 baseline |
 
 Four programs now miss `object field count` rather than `object layout`: literals whose omitting
 row passes but whose rep holds fewer fields than the row. That is a named miss, not a new failure.
