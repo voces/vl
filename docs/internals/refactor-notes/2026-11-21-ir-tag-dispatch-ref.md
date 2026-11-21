@@ -15,7 +15,7 @@ scalar or string missed (`tag dispatch result`).
   is a named miss (`index of a tagged call`). Without it, 5 `tests/cases` functions mismatched.
 - A union result stays a miss: each arm is boxed (`emitUnionBoxOwed`).
 
-Compiler lines +23 / −2 (`ir_build.vl` +12 −1, `ir_lower.vl` +11 −1). The shadow row
+Compiler lines +27 / −5 (`ir_build.vl` +10 −2, `ir_lower.vl` +17 −3). The shadow row
 `tests/ir-shadow-rows/tag-dispatch-ref-result.vl` builds a list result bound to a `const` and pins
 the index read's miss.
 
