@@ -2,7 +2,7 @@
 
 Lane IR-N4. The coordinator ruled that the `global initializer coercion` and `global read coercion`
 census gets a design note for its binding-vs-storage family. The narrowed reads, family 1, shipped
-as plain deliveries in #9402 and #9411. **This note asks for a ruling. It builds nothing.**
+as plain deliveries in #9402 and #9411. **It builds nothing.** The coordinator ruled option 1 on 2026-11-21 (§Ruling).
 
 ## Two types for one global
 
@@ -109,6 +109,18 @@ and it is the shape D14426 already ruled for parameters. The first step would be
 initializer rows, the ones the storage rep repairs on its own, with reads of those globals kept
 at a named miss (`global read at storage row`) until the carrier read lands. Fuel is not
 measured: the experiment builds nothing new.
+
+## Ruling (coordinator, 2026-11-21)
+
+Option 1, recorded in `DECISIONS.md`. Options 2 and 3 are refused: 2 as a second rep channel, 3
+because it parks 116 functions behind an elaboration that is not scheduled. Two conditions replace
+the first step proposed above:
+
+- **Monotone.** No function claimed today becomes unclaimed. A global whose initializer would be
+  claimed but whose reads would newly miss stays wholly on its current path. The initializer and
+  the carrier read land together, with no interim named miss that loses claims.
+- **A stored carrier.** The read's rep is a fact legacy already computed and stored, not a
+  re-derivation from the type. The PR names the exact table it reads.
 
 ## Not in scope
 
