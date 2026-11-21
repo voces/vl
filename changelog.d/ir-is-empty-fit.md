@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: an `is` test at the `emptyFit` rung.** `xs is K[]`, where `K` never meets the list's elements at some depth, is now decided by one shared plan, `emptyFitPlanOf`, with `emptyFitArmsPlanOf` for a union box's arms. Legacy now writes from that plan, with byte-identical output. The IR builds the plain walk (`RListEmpty`) and a box variable's arm tests (`RListEmptyArms`) through the same writer tails, and a declining plan passes to the next rung as legacy's does. A nullable receiver, a narrowed region's shadow set and a non-variable receiver are named misses.
