@@ -1956,6 +1956,24 @@ Deno.test({
   },
 });
 
+// A value `if` joined at an atom (a literal union, or one nullable at the `-1` niche) is an `i32`
+// `if`, each arm its atom: a plain, a nullable and an `else if` chain join build and match.
+const ATOM_JOIN =
+  `type Op = "add" | "sub" | "mul"\nfunction a1(n: i32, d: Op, e: Op): Op {\n  const o: Op = if n > 0 { d } else { e }\n  return o\n}\nfunction a2(n: i32, d: Op): Op | null {\n  const o: Op | null = if n > 0 { d } else { null }\n  return o\n}\nfunction a3(n: i32, d: Op): Op {\n  const o: Op = if n > 0 { d } else if n < 0 { "mul" } else { d }\n  return o\n}\nprint(a1(1, "add", "sub"))\nprint(a2(0, "add") ?? "none")\nprint(a3(-1, "sub"))\n`;
+Deno.test({
+  name: "ir shadow: a value if joined at an atom builds as an i32 if and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ATOM_JOIN, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want a1, a2 and a3 covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A packed `u8[]` literal builds its elements as plain i32s, which its backing truncates: the
 // verifier admits them at a `u8` element rep, and the door's fragment matches legacy's bytes.
 Deno.test({
@@ -2476,6 +2494,24 @@ print(elseIfWiden(3) + elseIfWiden(2))
   },
 });
 
+// A lambda-lifted local function reads each capture as its own parameter after the environment:
+// a parameter, a string and a record of its encloser, read where legacy's capture arm reads them.
+const LIFTED_CAPTURE_READ =
+  `type P = { x: i32 }\nfunction outer(n: i32, s: string): i32 {\n  const p: P = { x: n + 1 }\n  function inner(k: i32): i32 {\n    print(s)\n    return n + p.x + k\n  }\n  return inner(2)\n}\nprint(outer(3, "hi"))\n`;
+Deno.test({
+  name: "ir shadow: a lifted function's capture reads build as its parameters and match",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LIFTED_CAPTURE_READ, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want outer and inner covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // A nullable record field takes its value at the field's rep where no arm unbox is owed, for a
 // plain record and a union arm: a nullable parameter and a narrowed local. An arm narrowed out of
 // a union arrives boxed, and its unbox is a named miss; so is an explicit `null`.
@@ -2533,6 +2569,46 @@ print(qnull().o == null)
     }
     if ((rows.get("uncovered object field explicitNull") ?? 0) !== 2) {
       throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// An assignment whose value is its number literal (`asgValueArmOf` "lit") stores, then builds the
+// literal again at the reading position's width: negated, at i64 and f64, and widened past it.
+const ASG_VALUE_LIT =
+  `let g32 = 0\nlet g64: i64 = 0\nlet gf = 0.0\nfunction a(): i32 { return g32 = -1 }\nfunction b(): i64 { return g64 = 7 }\nfunction c(): f64 { return gf = -2.5 }\nfunction w(): f64 { return g32 = 9 }\nprint(a())\nprint(b())\nprint(c())\nprint(w())\n`;
+Deno.test({
+  name: "ir shadow: an assignment valued as its number literal builds and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ASG_VALUE_LIT, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want a, b, c and w covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// Two spellings stay legacy's: a stored literal boxed into a union (the box writer may leave an
+// immediate unread, and this one stands for the store), and one after a call operand whose value
+// waits on the stack across the store.
+const ASG_VALUE_LIT_MISSES =
+  `function boxed(c: boolean) {\n  let x: i32 | null = null\n  return if c { x = 5 }\n}\nfunction k() { return 3 }\nfunction h(p: i32, q: i32) { return p + q }\nlet f: f32 = 0.5\nfunction lead() { return h(k(), f = 4) }\nprint(boxed(true) ?? 0)\nprint(lead())\n`;
+Deno.test({
+  name: "ir shadow: a boxed stored literal and one after a call operand stay named misses",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ASG_VALUE_LIT_MISSES, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if (
+      (rows.get("uncovered box of an effect's immediate") ?? 0) !== 1 ||
+      (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
+    ) {
+      throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
     }
   },
 });
