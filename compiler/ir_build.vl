@@ -333,6 +333,7 @@ import {
   retRefusedWhy,
   spreadRunLit,
 } from "./wasmEmit"
+import { nodeTyInOf } from "./emit_ty_canon"
 import {
   arrLitArmOf,
   arrLitListBuild,
@@ -425,6 +426,7 @@ import {
   elseLessNullableTail,
   exprIsStrIndexOf,
   lastStmtIsValueIf,
+  tailIsValueOrNever,
 } from "./emit_fn_scans"
 import {
   LiFrame,
@@ -1610,6 +1612,9 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
     return ifRefExpr(b, n0, ix0, rep0, rj)
   }
+  if ty0 < 0 && ifExprPlainWhy(ix0, ibFnIx) == "union" {
+    return unionIfExpr(b, n0, ix0, rep0)
+  }
   // The head's rep is the one the join plan writes every link at, else the chain is legacy's.
   const hv = valtypeOf(rep0)
   if hv >= 0 && hv != ifExprJoinVt(ix0, ibFnIx) {
@@ -1742,6 +1747,91 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
   const ty = nodeTyAt(ix, ibFnIx)
   if irTyOpen(ty) { return irBMiss("open temp type") }
   return refIfLink(b, n, ix, rep, ty, kind, rj.rjSlot, false)
+}
+
+// A value `if` on the union join's rung, as legacy's `emitUnionIfValue` writes it: a chain of `if`s
+// at the box's blocktype, each arm its value boxed into the join's union (`emitUnionBoxOwed` at
+// `nodeTyInOf`), a missing `else` the null box.
+function unionIfExpr(b: i32[], n: IfStmt, ix: i32, rep: i32): Opnd {
+  if !heldAsBox(rep) { return irBMiss("union if rep") }
+  const ty = nodeTyAt(ix, ibFnIx)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  return unionIfLink(b, n, ix, rep, ty, nodeTyInOf(ix, ibFnIx))
+}
+
+// One link of `unionIfExpr` (`emitUnionIfValueLink`): an `else if` is the next link, written into
+// this link's `else` and delivered to its out.
+function unionIfLink(
+  b: i32[],
+  n: IfStmt,
+  ix: i32,
+  rep: i32,
+  ty: i32,
+  uty: i32,
+): Opnd {
+  // Legacy writes every link at the head's box; the lowering opens a link at its own join.
+  const pw = ifExprPlainWhy(ix, ibFnIx)
+  if pw != "union" {
+    return irBMiss(
+      if pw == "" { "union if chain join" } else { "union if " + pw },
+    )
+  }
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  // A constant condition is one legacy decides off its bytes and writes a dead arm for.
+  if c is OImm { return irBMiss("union if static condition") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const thenB = unionIfArm(n.ifThen, t, rep, uty)
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  let elseB: i32[] = []
+  if n.ifElse < 0 {
+    const nb = repTemp(elseB, { nuAt: ix, nuOwn: NULL_OWN_BOX }, ix, rep)
+    irBNode(elseB, { asDst: t, asSrc: nb }, -1, ibNoValue, ix)
+  } else {
+    const en = nodeAt(n.ifElse)
+    if en is IfStmt && !ifJoinAdaptsScalar(n.ifElse, ibFnIx) {
+      const inner = unionIfLink(elseB, en, n.ifElse, rep, ty, uty)
+      if ibMiss != "" { return inner }
+      irBNode(elseB, { asDst: t, asSrc: inner }, -1, ibNoValue, n.ifElse)
+    } else if en is IfStmt {
+      const x = deliver(elseB, n.ifElse, rep, uty)
+      if ibMiss != "" { return x }
+      if irBOpRep(x) != rep { return irBMiss("union if arm rep") }
+      irBNode(elseB, { asDst: t, asSrc: x }, -1, ibNoValue, n.ifElse)
+    } else {
+      elseB = unionIfArm(n.ifElse, t, rep, uty)
+    }
+  }
+  if ibMiss != "" { return irBMiss(ibMiss) }
+  irBNode(
+    b,
+    { siCond: c, siThen: thenB, siElse: elseB, siOut: t, siElseKw: true },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// One arm of `unionIfLink` (`emitUnionIfArm`): its prelude, then its tail value boxed into the
+// join's union and written to out `t`. A tail that is itself an `if` joins into this box in
+// legacy, and stays its miss.
+function unionIfArm(blockIx: i32, t: i32, rep: i32, uty: i32): i32[] {
+  const body: i32[] = []
+  const tv = ifArmValueExpr(blockIx)
+  if !(nodeAt(blockIx) is Block) || tv < 0 || !tailIsValueOrNever(tv, ibFnIx) {
+    irBMiss("union if arm")
+    return body
+  }
+  armPrelude(body, blockIx)
+  if ibMiss != "" { return body }
+  const x = deliver(body, tv, rep, uty)
+  if ibMiss == "" && irBOpRep(x) != rep { irBMiss("union if arm rep") }
+  if ibMiss == "" {
+    irBNode(body, { asDst: t, asSrc: x }, -1, ibNoValue, blockIx)
+  }
+  return body
 }
 
 // One link of a reference join's chain (`emitIfExprRefLink`), its out at the head's rep and type:
@@ -4314,14 +4404,21 @@ function arrayLit(
   // A packed list's elements are built as plain i32s, which its backing truncates.
   const er = if arm == "u8" { repNodeOfTy(TY_I32) } else { ln.rlsElem }
   const elems: Opnd[] = []
+  const starts: i32[] = []
   // A `for` iterable's signed number literal at a number element is one immediate, as legacy's
   // hoist reads it whole; at any other element (a numeric union's box) it is delivered.
   const ep = repPrim(er) ?? ""
   const forIter = arrLitIsForIter(ix)
     && (ep == "i32" || ep == "i64" || ep == "f32" || ep == "f64")
   for e in n.arrElems {
+    const at = b.length
+    starts.push(at)
     const v = if vslot >= 0 { variantElem(b, e, er, vslot) } else if forIter && isSignedNumLit(e) { signedLitAt(unwrapParen(e), er) } else { deliver(b, e, er, -1) }
     if ibMiss != "" { return v }
+    // An element written before a valued `if` is staged below it, as a call's argument is.
+    if elems.length > 0 && !irBStageLeads(b, at, starts, elems, n.arrElems) {
+      return irBMiss("short-circuit array element after another")
+    }
     if irBOpRep(v) != er { return irBMiss("array element coercion") }
     elems.push(v)
   }
