@@ -7,7 +7,7 @@
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
-import { NULL_OWN_BOX } from "./emit_plan_null"
+import { NULL_OWN_BOX, NULL_OWN_NONE } from "./emit_plan_null"
 import {
   IrFn,
   IrNode,
@@ -654,7 +654,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A packed byte reads unsigned into an i32.
       const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
-      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed {
+      // A nullable string element may read recovered at a string.
+      const en = repNodeAt(kidAt(l, 0))
+      const recovered = en is RNullable && en.rnInner == dst && dst == vfStr
+      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed && !recovered {
         return fail(2, at, "an element's rep is not its destination's")
       }
       0
@@ -700,6 +703,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         if !(d is RBox) && !(d is RNullable && d.rnDisc == 4) {
           return fail(2, at, "a null box is not delivered into a union box")
         }
+      } else if r.nuOwn == NULL_OWN_NONE && repPrim(dst) == "null" {
+        // The `null` unit's one value is the bottom ref.
       } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
         return fail(
           2,
@@ -1130,6 +1135,24 @@ function rawEff(e: SRawOp, at: i32) {
   if e.srOp == "reserve.open" || e.srOp == "reserve.close" {
     return if e.srArgs.length == 0 { 0 } else { fail(10, at, e.srOp + " takes no operand") }
   }
+  // A binding sink's pair writes: a box in, the null in, or the box out to a box variable.
+  if e.srOp == "sink.put" || e.srOp == "sink.null" || e.srOp == "sink.close" {
+    uses(e.srArgs, at)
+    const n0 = if e.srOp == "sink.put" { 1 } else { 0 }
+    const v = e.srImm
+    const varOk = e.srOp == "sink.null"
+      || v >= 0
+      && v < vf.irVars.length
+      && sinkBoxRep(vf.irVars[v].vRep)
+    if (
+      e.srArgs.length != n0
+      || !varOk
+      || n0 == 1 && !sinkBoxRep(opRep(e.srArgs[0]))
+    ) {
+      return fail(10, at, e.srOp + " is not a union box into the sink pair")
+    }
+    return 0
+  }
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
   // Every outstanding push is this effect's leading operands, in push order.
   let k = 0
@@ -1156,12 +1179,18 @@ function rawEff(e: SRawOp, at: i32) {
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
     "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
-    "reserve.open" | "reserve.close" => false
+    "reserve.open" | "reserve.close" | "sink.put" | "sink.null" | "sink.close" => false
   }
   if !ok {
     return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
   }
   return 0
+}
+
+// Whether rep `r` is a union box, or a nullable one held as the same `{tag, payload}`.
+function sinkBoxRep(r: i32): boolean {
+  const d = repNodeAt(r)
+  return d is RBox || d is RNullable && d.rnDisc == 4
 }
 
 // Whether node `id` leaves its body: a branch, a return or a trap.
