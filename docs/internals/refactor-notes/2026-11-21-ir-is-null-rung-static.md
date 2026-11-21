@@ -28,46 +28,42 @@ The value and tail `if` builders already missed a constant `is` condition. This 
 statement `if` chain miss it too (`decided is condition`), folds `!` over a constant `is` to legacy's
 constant, and misses a constant `is` on the left of `&&`/`||` (`decided is short-circuit`).
 
-## Two receivers left legacy's, not explained
+## `emitIs`'s pre-arms come before any rung
 
-Under the first cut, 34 `tests/cases` programs and 8 corpus cells differed. Two shapes were left
-after the readback sites were matched:
+`emitIs` answers some tests before `isArmOf` is asked, at `isPreArmOf`'s pre-arms: `tautology` writes
+the bare constant, `covers` and `fits` evaluate and drop the operand and then write `1`, and `prim`
+and `pin` drop an operand that is not effect-free. The first cut of this change asked `isArmOf`
+alone, so it wrote a bare constant where legacy wrote the operand first (`--claimless` differed on
+D3359 and D3360, `a is U` over an alias union at the `fits` pre-arm; the armed shadow read
+`prefix or locals at 0x09 vs 0x06`).
 
-- **A lambda.** Legacy evaluates and drops even a plain receiver before the constant: a capture
-  (`() => v is T`), and a folded global (`() => gi is T`) in a lambda with no captures. A plain
-  generic function writes the bare constant.
-- **An element read** (`print(xs[1] is f32)`, a mixed-width list). Legacy evaluates and drops it,
-  bounds check included, though `unionEqOperandOk` calls it re-readable.
-
-Both ask `unionEqOperandOk` of the same node on the IR side, so some legacy context answers
-differently. It was not found within this step. The builder misses both shapes by name:
-`is static in a lambda`, and `is static receiver place` for a re-readable receiver that is not a bare
-name.
+`boxTest` now asks `isPreArmOf` first: past the storage path, any pre-arm other than `test` is a
+named miss, `is pre-arm <arm>`. That also explains the two receivers the first cut left unexplained,
+a lambda's capture and an element read: neither is effect-free, so the `prim` pre-arm drops it.
+Building the pre-arms' own bytes is the follow-on (`isDecidedPlanOf`).
 
 ## Coverage
 
-Measured on fixpoint seeds of this branch and of its merge base, master `b39b74874`, each
-building this branch's source.
+Measured on fixpoint seeds of this branch and of master `04650021`, each building this branch's
+source.
 
-| population | merge-base | this branch |
+| population | master | this branch |
 | --- | ---: | ---: |
-| self-compile functions with no blocker (19,400 built) | 19,195 | 19,200 |
-| self-compile `is rung` alone | 11 | 5 |
-| self-compile claimed (mode 3) | 19,175 | 19,180 |
-| corpus covered = verified = matched (45,678) | 42,735 | 42,751 |
-| corpus `is rung` alone | 183 | 97 |
-| `tests/cases` covered / matched (armed shadow) | 57,234 / 57,221 | 57,335 / 57,322 |
+| self-compile functions with no blocker | 19,280 | 19,285 |
+| self-compile `is rung` alone | 9 | 5 |
+| self-compile claimed (mode 3) | 19,260 | 19,265 |
+| corpus covered = verified = matched (45,678) | 43,416 | 43,421 |
+| corpus `is rung` alone | 181 | 85 |
+| `tests/cases` covered / matched (armed shadow) | 58,044 / 58,033 | 58,126 / 58,115 |
 
-The self-compile's 5 left are `emptyFit` 4 and `litArms` 1. The corpus's 86 that left `is rung`
-mostly moved, and did not clear. Alone, 40 now stop at `decided is condition`, an `if` over a
-constant `is` that legacy decides off its bytes. Another 7 stop at `is static empty fit`, 6 at
-`is static receiver place`, 4 at `is impossible null test` and 2 at `is static in a lambda`. The
-statement `if` that legacy writes with a dead arm is the next payoff: building it unblocks the 40.
+The corpus's 96 that left `is rung` mostly moved, and did not clear. Alone, 36 now stop at
+`decided is condition`, an `if` over a constant `is` that legacy decides off its bytes, and 42 at a
+pre-arm (`pin` 23, `tautology` 16, `prim` 3). The self-compile's one tautology is the same class.
 
 - **Byte proof:** mode 3 self-compile identical; `ir-identity --names` 9,037 identical, differ 0,
-  self-compile identical; `--cases` 7,556 identical, differ 0, witnesses 60 same; per-file
-  `tests/cases` A/B 8,670 same, differ 0. `tests/cases`' armed shadow adds no fail, differ or
-  mismatch row.
-- **Ratchets:** L2 fuel 104,920,629,097 → 104,981,539,745 (+0.06%); late demands, late tags,
-  phase state, ladder sets, dead exports and lint-self clean (`gate.sh --fast`).
-- **Compiler lines:** +107 / −16.
+  self-compile identical; `--cases` 7,567 identical, differ 0, witnesses 60 same; `--claimless`
+  14,013 identical, differ 0 (D3359 and D3360 among them); per-file `tests/cases` A/B 8,681 same,
+  differ 0. `tests/cases`' armed shadow adds no fail, differ or mismatch row.
+- **Ratchets:** L2 fuel 104,619,110,901 (−0.3% on the 104,920,663,373 baseline); late demands, late
+  tags, phase state, ladder sets, dead exports and lint-self clean (`gate.sh --fast`).
+- **Compiler lines:** +111 / −16.
