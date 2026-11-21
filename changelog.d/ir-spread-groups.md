@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR: a spread literal of several item groups.** `array spread groups` (corpus 91) was the IR's refusal of any spread literal but one lone source. `RSpread` now carries each group's list: a spread's source, or a run of plain elements as legacy's own run literal (`spreadRunLit`), all minted before any group is built, as legacy's arm mints them. The lowering writes each group then its stash (`spreadGroupStash`), then the join (`spreadJoinGroups`). The builder makes legacy's `elabSpreadNote` before it asks the plan, so the literals a spread holds are typed at their holder's element. Asked without it, the plan minted the literals' own lists, a shipped-output change the armed shadow could not see.

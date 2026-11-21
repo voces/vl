@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **IR coverage: a record literal built at its destination's record type.** Legacy builds a struct literal at its destination's struct row, laid out in order or through its order stash. The builder built it at the row's recorded type or the literal's own type. Either can hold a field at another rep than the destination does, carried by the same bytes: a plain atom where the destination holds `K | null`. The declaration, return or nullable return then missed at `declaration coercion` or `return coercion`. Where the destination's record (a nullable one through its niche's rep) names the row legacy builds at, the literal is now built at that type.

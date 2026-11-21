@@ -684,6 +684,8 @@ Source grew from 298,771 to 310,731 lines (+4.0%), and fuel grew 41.9%.
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
 
+A map `.delete` anywhere in compiler/*.vl reserves the map delete family for every map program-wide (emit_sections.vl's reservation), about +0.5% fuel; prefer a stack or a tombstone.
+
 * **`tests/vl_scaling_shape_test.ts`** — nine pairs, the same work reshaped along one axis
   (functions, types, unions, call sites, closures, callback slots, modules, generic pins,
   covariant bindings; later pairs include calls to inferred-return callees and a list name

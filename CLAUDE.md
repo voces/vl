@@ -121,10 +121,12 @@ The parts:
   **+5%**, peak RSS **+10%**; `-- --write-baseline` on a quiet box
   (profiling-the-compiler.md §Guards).
 * **Self-compile fuel is gated per PR:** `scripts/self-compile-time.sh` reds on an L2 rise past
-  **+1%** of `scripts/self-compile-baseline.json` (and past 1.5×). Accept a rise with
-  `--write-baseline` from a fixpoint seed plus one line in `scripts/self-compile-ledger.txt` (fuel,
-  commit, PR, mechanism); a baseline the ledger's last line does not name reds. The coordinator
-  rules on a drift refresh; past **+3%** cumulative since the last attributed baseline it first
+  **+1% of the base master's own L2** (merge-base with `origin/master`, measured from its fixpoint
+  and cached; coordinator ruling 2026-11-21), and past 1.5× `scripts/self-compile-baseline.json`.
+  The rise on that baseline is the reported cumulative line, not a per-PR verdict. Accept a rise a
+  PR owns with `--write-baseline` from a fixpoint seed plus one line in
+  `scripts/self-compile-ledger.txt` (fuel, commit, PR, mechanism); a baseline the ledger's last line
+  does not name reds. The coordinator rules on a drift refresh; past **+3%** cumulative it first
   attributes the rise to PRs by measurement and names that in the line (`merge-queue.md` §Fuel drift).
 * **Late demands are gated:** `vl run scripts/late-demands.vl -- --check` against
   `scripts/late-demands-baseline.txt`. A rise fails; a fall passes and is named, and the PR that
