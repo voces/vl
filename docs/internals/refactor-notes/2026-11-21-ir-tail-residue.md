@@ -33,9 +33,8 @@ Compiler lines +24 / −6, all in `ir_build.vl`. Legacy lines deleted: 0. Shadow
 | `tests/cases` fail or mismatch rows | 6 | 6, the same list |
 | L2 self-compile fuel | 105,056,327,587 | 105,051,880,818 (−0.004%) |
 
-Two self-compile functions moved to another blocker instead of building. One reads
-`ref if arm null` (2 → 3) and one reads `string operand coercion` (5 → 6). Each is the next arm of
-the same `if`, which is now reached.
+Two self-compile functions moved to another blocker instead of building: one now reads
+`ref if arm null` (2 → 3) and one `string operand coercion` (5 → 6).
 
 Byte identity: mode 3 and mode 5 self-builds equal the plain build. `ir-identity.sh --names`:
 9037 identical, 0 differ. `--cases`: 7574 identical, 0 differ. `--claimless`: 14014 identical,
