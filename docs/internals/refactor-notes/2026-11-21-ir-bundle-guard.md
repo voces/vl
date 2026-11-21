@@ -1,4 +1,4 @@
-# IR: the bundle guard narrowed, and inert function values, 2026-11-21
+# IR: the bundle guard narrowed, 2026-11-21
 
 Lane IR-N6, stacked on the bundle call (`2026-11-21-ir-bundle-call.md`). The coordinator gave the
 narrowing of #9373's guard to IR-N6.
@@ -25,16 +25,7 @@ while the IR typed it at the closure rep. The guard's whole cost was +104 covere
 Compiler lines for the narrowing +41 / −18 (`ir_build.vl` +23 −3, `emit_bundle.vl` +10 −6,
 `emit_elab.vl` +4 −5, `emit_classify.vl` +4 −4).
 
-## Inert function values
-
-`fnValueArmOf`'s `inert` and `aliasCore` arms write a function value by `emitClosureValueCore`, the
-writer without the generic-value refusal. `cloValueFeOf` takes them; `cloValue` holds each to the
-refusal its arm owes (`closureValueCoreWhy` on those arms), and `makeClo` writes the capture-free
-value by the core writer, which is legacy's bytes on either arm. Compiler lines +23 / −5
-(`ir_build.vl` +19 −3, `ir_lower.vl` +4 −2).
-
-## Readings (base: the bundle call and the inert step merged with master `248ff912`, fixpoint;
-candidate fixpoint)
+## Readings (base: the bundle call merged with master `248ff912`, fixpoint; candidate fixpoint)
 
 | reading | base | this change |
 | --- | ---: | ---: |
@@ -47,5 +38,6 @@ candidate fixpoint)
 
 The bundle misses now name 345 `tests/cases` rows: `bundle parameter read` 180, `bundle
 argument` 135, `bundle callee` 22, `bundle call` 8. Building a bundle record as an argument, and
-holding a bundle parameter at its record's rep, are the next steps there. The inert step alone,
-measured before the merge: +6 functions over the bundle call.
+holding a bundle parameter at its record's rep, are the next steps there. The readings were taken
+with an inert-value step that has since been dropped for IR-N4's #9391, which makes the same change;
+that step alone was +6 functions over the bundle call.
