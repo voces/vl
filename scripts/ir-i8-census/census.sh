@@ -55,7 +55,11 @@ VL_IR_SHADOW=5 "$VL" build compiler/entry.vl -o "$T/self.wasm" --compiler "$T/pr
   | awk -F'\t' '/^\[ir\] / { n = $1; sub(/.*: /, "", n); if ($2 ~ /^(fnc |fnu |claimed start|start uncovered |claim fell back)/) print "self\t" n "\t" $2 }' \
   > "$OUT/self.rows"
 for pop in distilled cases probes witnesses; do
-  xargs -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh "$T/one.sh" < "$T/$pop" > "$OUT/$pop.rows" || true
+  # Each chunk writes its own file: parallel writers into one pipe interleave long rows.
+  mkdir -p "$T/rows-$pop"
+  xargs -n 100 -P "$JOBS" env VL="$VL" PROBE="$T/probe.wasm" sh -c \
+    'sh "$0" "$@" > "$(mktemp -p "'"$T/rows-$pop"'")"' "$T/one.sh" < "$T/$pop" || true
+  cat "$T/rows-$pop"/* > "$OUT/$pop.rows" 2> /dev/null || : > "$OUT/$pop.rows"
   wc -l < "$T/$pop" > "$OUT/$pop.programs"
 done
 echo 1 > "$OUT/self.programs"
