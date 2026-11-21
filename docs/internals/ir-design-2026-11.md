@@ -123,6 +123,13 @@ pure, so the IR needs nothing for it, but phase A must reproduce the bytes. `SDr
 operand, and the verifier checks only its use. Once bytes may move, a dead-code pass deletes every
 `SDrop` and then the node itself: that is a named mover at I10, or at I8 if I8 renumbers anyway.
 
+**`SRangeLoop` is a migration node** (coordinator ruling, 2026-11-21). It holds a range loop that
+legacy writes through its own helpers: the partial 4x main loop and the rolled loop's wrap exit.
+Those allocate scratch locals mid-emit (`strI32Slot`), at an index that only legacy's emit order
+fixes. So the node's lowering drives legacy's split-out helpers around IR bodies, as `SForIn`'s
+does, and no `IrVar` carries a slot bound late. The copy count is legacy's plan
+(`rangePartialCopies`). It retires at I8 with `SForIn`.
+
 **Signedness lives on the op, not the rep.** `u32` and `u64` share their valtype, and so their
 rep, with `i32` and `i64` (`unsigned-types-design.md`). So `PrimOp` carries signedness: `div`/`divu`,
 `rem`/`remu`, `lt`/`ltu`, `le`/`leu`, `gt`/`gtu`, `ge`/`geu` and `shr`/`shru`. The builder chooses
