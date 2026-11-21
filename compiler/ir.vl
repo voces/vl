@@ -108,11 +108,15 @@ export type RBoxNarrow = {
   bnAtom: i32,
   bnCon: i32,
 }
-// A nullable local read at its inner rep, recovered where `localNulStrRecovers`; `rcAt` the read.
-export type RRecover = { rcV: Opnd, rcAt: i32 }
+// A nullable local read at its inner rep, `rcAt` the read; `rcNn` is how many `ref.as_non_null`
+// legacy writes after it, decided where the read is built (an assignment's re-read context).
+export type RRecover = { rcV: Opnd, rcAt: i32, rcNn: i32 }
 // The union-operand cast `auAt` over box `auV`, by legacy's tag test and tail
 // (`emitAsUnionTagged`): the target arm unboxed, the box at a sub-union, `null` on `as?`'s miss.
 export type RAsUnion = { auV: Opnd, auAt: i32 }
+// A record copy at node `rpAt` of a source legacy re-reads per field (`recCopyReReads`), written
+// whole by legacy's copy (`recCopyPureEmit`). A migration node, retired at I8 with `RMapNew`.
+export type RRecCopyPure = { rpAt: i32 }
 export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
 // `mrFields` in kid order; `mrLayout[i]` the kid layout position `i` writes; `mrSrc` the kids in
@@ -193,10 +197,8 @@ export type RAtomStr = { sxV: Opnd, sxAt: i32 }
 // The `null` legacy builds where node `nuAt` is delivered: the null `nuOwn` names (`nullOwnAt`),
 // a `K | null` sentinel or a `string | null`'s typed null.
 export type RNullOf = { nuAt: i32, nuOwn: i32 }
-// The null of struct row `omRow`'s field `omField`, which an object literal omits.
-export type ROmitNull = { omRow: i32, omField: i32 }
-// Struct row `fnRow`'s field `fnFi`'s typed null, as legacy's `emitOmittedFieldNull` writes it: the
-// `ref.null` of the field's own heap (`fieldTypedNullHas`).
+// Struct row `fnRow`'s field `fnFi`'s null, for a field an object literal omits or sets to a typed
+// `null`, as legacy's `emitOmittedFieldNull` writes it.
 export type RFieldNull = { fnRow: i32, fnFi: i32 }
 // The function's own `null` at its nullable return rep (`nullRetPlanOf`), as legacy pads a returned
 // value `if` with it at `rnrAt` (`emitNullForRet`).
@@ -331,9 +333,10 @@ export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
 export type RCellNew = { cnInit: Opnd }
 export type RCellGet = { cgCell: Opnd }
-// `ggNonNull`: the read is followed by `ref.as_non_null` (`globalReadRecovers`). `ggAt`: the read
-// node of a read narrowed past the cell's null, recovered as `emitReadRecover` decides; else -1.
-export type RGlobalGet = { ggSym: i32, ggNonNull: boolean, ggAt: i32 }
+// `ggNonNull`: the read is followed by `ref.as_non_null` (`globalReadRecovers`). `ggNn`: for a read
+// narrowed past the cell's null, how many more `emitReadRecover` writes, decided where it is built;
+// -1 for a read at the cell's own rep.
+export type RGlobalGet = { ggSym: i32, ggNonNull: boolean, ggNn: i32 }
 // Capture `evSlot` of the function's environment, read at `evAt`, as legacy's capture arm reads it.
 export type REnvGet = { evSlot: i32, evAt: i32 }
 // The environment of nested function `edFn` this frame caches, dropped where its declaration runs.
@@ -408,10 +411,10 @@ export type Rhs = RAsUnion
   | RNumCast
   | RNumIntr
   | RNumWiden
-  | ROmitNull
   | RPrimOp
   | RPrint
   | RRawOp
+  | RRecCopyPure
   | RRecover
   | RRel
   | RRetNull
@@ -957,6 +960,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RBoxField => [r.bfV]
     RSharedRead => [r.srV]
     RBoxNarrow => [r.bnV]
+    RRecCopyPure => []
     RRecover => [r.rcV]
     RCast => [r.ctV]
     RTagOf => [r.tgV]
@@ -996,7 +1000,6 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RRetag => [r.rgV]
     RAtomStr => [r.sxV]
     RNullOf => []
-    ROmitNull => []
     RFieldNull => []
     RRetNull => []
     RNulTest => [r.ntV]
@@ -1045,6 +1048,7 @@ function rhsText(r: Rhs): string {
       + i32ToStr(r.srAt)
       + (if r.srStash { " stash" } else { "" })
     RBoxNarrow => "box_narrow " + opndText(r.bnV) + " @" + i32ToStr(r.bnAt)
+    RRecCopyPure => "record copy pure @" + i32ToStr(r.rpAt)
     RRecover => "recover " + opndText(r.rcV) + " @" + i32ToStr(r.rcAt)
     RCast => "as " + opndText(r.ctV) + " " + repText(r.ctTarget) + " " + r.ctOnFail
     RTagOf => "tag " + opndText(r.tgV)
@@ -1071,7 +1075,6 @@ function rhsText(r: Rhs): string {
     RAtomStr => "atomstr " + opndText(r.sxV)
     RRetag => "retag " + opndText(r.rgV)
     RNullOf => "null"
-    ROmitNull => "omitted null"
     RFieldNull => "field null"
     RRetNull => "return null"
     RNulTest => "isnull " + opndText(r.ntV)
@@ -1318,6 +1321,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       "popOr" => "list"
       "nulRef" => "box"
       "litUnion" | "nulBool" => "box"
+      "fieldBox" | "fieldVal" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
     }
@@ -1335,7 +1339,6 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RAtomStr |
       RCoalAtomStr |
       RCoalStr |
-      RFieldNull |
       RLitArms |
       RNulTest |
       RNullOf |
@@ -1380,9 +1383,10 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RBoxNarrow |
       RSharedRead |
       RTest => "box"
-    RGetField |
+    RFieldNull |
+      RGetField |
       RMakeRec |
-      ROmitNull |
+      RRecCopyPure |
       RStashSet => "record"
     RBundlePick |
       RCallRef |
