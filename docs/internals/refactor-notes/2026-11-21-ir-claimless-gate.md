@@ -38,3 +38,11 @@ builds every distilled cell and every inventory witness filed `runs` (`ir-i8-cen
 under both, comparing wasm and exit code. A list file replaces that population. With `--cases`
 covering `tests/cases` and the probes, every I8 population is covered. The merge queue runs it once
 per batch that changes `compiler/`, and any differ is a veto (`merge-queue.md`, step 3).
+
+Measured on the fixpoint seed of cb57cea3: **identical 14,011, fail under both 3,267, differ 0**,
+in 647 s wall and about 1,620 CPU-s at `JOBS=4`.
+
+**Failing control.** A throwaway seed whose IR framing writes one `nop` after a claimed function's
+locals ships inert but different bytes. Over the first 50 distilled cells, `--claimless` under
+that seed reads `identical 0, fail under both 23, differ 27` and exits 1. Under the clean seed
+it reads `identical 27, fail under both 23, differ 0` and exits 0.
