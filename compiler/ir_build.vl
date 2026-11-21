@@ -3558,6 +3558,7 @@ function arrayLit(
     mlKind: lb.lbKind,
     mlSlot: lb.lbSlot,
     mlAt: ix,
+    mlArm: arm,
   }
   if atBt { return irBLetTempTy(b, r, ix, lrep, heldTy(bt)) }
   return irBLetTemp(b, r, ix, lrep)
@@ -5436,9 +5437,29 @@ function irLowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
     if live != "" { return "legacy context live: " + live }
   }
   const sv = ibSave()
-  const why = lowerNodeIn(ix, fnIx, ty, probe)
+  const why = lowerNodeIn(ix, fnIx, ty, probe, -1, -1)
   ibRestore(sv)
   return why
+}
+
+// Global `gi`'s constant initializer (statement `gst`) lowered onto the buffer the global section
+// is writing: its value delivered at the cell's rep, as a start body's initializer is, with no
+// frame. "" when written; else the miss, nothing written.
+export function irLowerConstCell(gi: i32, gst: i32, probe: boolean): string {
+  const g = nodeAt(gst)
+  if !(g is LetDecl) || g.letInit < 0 { return "const cell not a binding" }
+  const sv = ibSave()
+  const why = lowerNodeIn(g.letInit, -1, -1, probe, gi, gst)
+  ibRestore(sv)
+  return why
+}
+
+// The claim seam for global `gi`'s constant initializer: unarmed and every node in a claimed family,
+// the IR writes it and this answers true, so legacy does not; armed, legacy always runs.
+export function irClaimConstCell(gi: i32, gst: i32): boolean {
+  if ibArmed || irLowerConstCell(gi, gst, false) != "" { return false }
+  count("claimed const cell")
+  return true
 }
 
 // Under the armed shadow, the per-occurrence count of a legacy site (ir-design §10): node `ix` of
@@ -5464,6 +5485,34 @@ export function irNodeInShadow(ix: i32, fnIx: i32, ty: i32, from: i32): i32 {
   return count("node-in " + irAstKind(ix) + ": " + row)
 }
 
+// Under the armed shadow, global `gi`'s constant initializer `ix` (statement `gst`, arm `arm`),
+// legacy's bytes for it from `from` on, lowered as a fragment: `const cell <arm> <kind>: matched`
+// or `miss <why>`, and a differ as `mismatch bytes: const cell <arm> <kind>`.
+export function irConstCellShadow(
+  gi: i32,
+  gst: i32,
+  ix: i32,
+  from: i32,
+  arm: string,
+): i32 {
+  if !ibArmed { return 0 }
+  const live = legacyContextLiveWhy(ix)
+  const cur = wTarget([])
+  const why = irLowerConstCell(gi, gst, true)
+  const got = wTarget(cur)
+  // The dual emit's control 3 adds a byte to the fragment, which must turn a match into a differ.
+  if ibCorrupt == 3 && why == "" { got.push(1) }
+  const at = arm + " " + irAstKind(ix)
+  if why == "" && !bytesFrom(cur, from, got) {
+    // A differ is a mismatch, so the corpus baseline and the bytes veto see it.
+    const hex = if ibDetail { " " + irHexOf(cur.slice(from)) + "| " + irHexOf(got) } else { "" }
+    return count("mismatch bytes: const cell " + at + hex)
+  }
+  const row = if why != "" { "miss " + why } else { "matched" }
+  const under = if live != "" { " under " + live } else { "" }
+  return count("const cell " + at + ": " + row + under)
+}
+
 // The held-coercion control (`irShadowCorrupt(6)`): the guard read with the mark on the fragment's
 // root, then on its enclosing function, an ancestor; the first must name it and the second not.
 function heldControl(ix: i32, fnIx: i32) {
@@ -5486,7 +5535,14 @@ function bytesFrom(b: u8[], at: i32, want: u8[]): boolean {
   return true
 }
 
-function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
+function lowerNodeIn(
+  ix: i32,
+  fnIx: i32,
+  ty: i32,
+  probe: boolean,
+  cellGi: i32,
+  cellSt: i32,
+): string {
   const gen = repNodeGen()
   // An append the fragment holds reads the accumulator rows, which a rescan would rewrite under
   // legacy's own emit of this body. A constant initializer holds no assignment.
@@ -5514,10 +5570,11 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
   ib.irRetRep = ibNoValue
   ib.irRetTy = TY_NEVER
   const top: i32[] = []
-  const out = irBExpr(top, ix)
+  // A const cell's value is delivered at the cell's rep, as `globalInit` delivers a start body's.
+  const out = if cellSt >= 0 { globalInitValue(top, cellGi, cellSt, ix) } else { irBExpr(top, ix) }
   ib.irBody = top
   if ibMiss != "" { return ibMiss }
-  const want = repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) })
+  const want = if cellSt >= 0 { globalRep(cellGi, cellSt) } else { repNodeOfTy(if ty >= 0 { ty } else { nodeTyAt(ix, fnIx) }) }
   if irBOpRep(out) != want { return "fragment rep" }
   if repNodeGen() != gen { return "rep epoch moved" }
   const v = irVerify(ib)
@@ -5534,6 +5591,8 @@ function lowerNodeIn(ix: i32, fnIx: i32, ty: i32, probe: boolean): string {
       return "local cell rep"
     }
   }
+  // A const cell ships as a function does: only when every node is in a claimed family.
+  if cellSt >= 0 && !probe && !claimable() { return "unclaimed family" }
   return irLowerFragment(ib, out, globalCtxNow(), fnPos, probe)
 }
 
