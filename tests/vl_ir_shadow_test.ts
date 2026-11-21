@@ -1697,18 +1697,14 @@ Deno.test({
   },
 });
 Deno.test({
-  name: "ir shadow: a start widening an initializer misses by name",
+  name: "ir shadow: a start widening an initializer to its cell covers and matches",
   ignore,
   fn: () => {
-    const cases: [string, string][] = [
-      [`const w: f64 = 3\nprint(w)\n`, "global initializer widen"],
-    ];
-    for (const [src, why] of cases) {
-      const { rows } = run(src, true);
-      if (rows.get(`start uncovered ${why}`) !== 1) {
-        throw new Error(`want one "start uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
-      }
+    const { rows } = run(`const w: f64 = 3\nprint(w)\n`, true);
+    if (rows.get("start covered") !== 1 || rows.get("start matched") !== 1) {
+      throw new Error(`want the start covered and matched, got ${JSON.stringify([...rows])}`);
     }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
