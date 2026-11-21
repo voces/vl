@@ -424,6 +424,7 @@ that comes back packed.
 **The IR kind lists are also sorted** (coordinator ruling, 2026-11-21). One member per line
 still conflicts when two PRs insert after the same member; in sorted order most insertions land
 on different lines. Put a new member at its sorted place in the `Rhs`/`IrNode` unions, each long
-IR arm, and each `lint.vl` set the guard names; the guard reds on the first one out of order.
+IR arm, and the `klRhs`/`klIrNode` sets; the guard reds on the first one out of order. The other
+`lint.vl` IR sets mirror string unions and keep their declared order (`scripts/ladder-sets.vl`).
 A line-level `git merge-file --union` is not a substitute: two arms ending in the same closing
 lines keep one tail between them, and the `match` no longer parses.

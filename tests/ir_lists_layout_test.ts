@@ -15,6 +15,9 @@ const SETS = [
   "klOpnd", "klPushRecv", "klVarKind", "klMapOp", "klStrOp", "klIrNode", "klPrimOp",
   "klRhs", "klIrFamily", "klRawOp", "klRawEff",
 ];
+// The sets kept in sorted order, as the unions they mirror are. The others mirror a string
+// union whose declared order `scripts/ladder-sets.vl` holds them to.
+const SORTED_SETS = ["klIrNode", "klRhs"];
 // An IR kind name: an `R`, `S`, `O` or `P` variant (`RListGet`, `SLet`, `OVar`, `PStaged`).
 const KIND = /^[RSOP][A-Z][A-Za-z0-9]*$/;
 const ARM_MIN = 4;
@@ -150,7 +153,7 @@ Deno.test("ir lists layout: the IR kind lists are one member per line, sorted", 
       }
     }
   }
-  for (const n of SETS) {
+  for (const n of SORTED_SETS) {
     const bad = firstUnsorted(setMembers(lint, n));
     if (bad) found.push(`compiler/lint.vl: ${n} not sorted (${bad})`);
   }
