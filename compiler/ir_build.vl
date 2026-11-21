@@ -144,6 +144,9 @@ import {
   asgValueArmOf,
   atomHookArmOf,
   atomStrPlanOf,
+  atomicCallNamed,
+  atomicPlanOf,
+  atomicValPrim,
   binNumWidth,
   bundleCallRefPlainKey,
   bundlePickOf,
@@ -264,6 +267,8 @@ import {
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
+  truncSatCallNamed,
+  truncSatPlanOf,
   valueIfLitTrue,
   variantFieldArmOf,
   variantFieldBoxTy,
@@ -2744,6 +2749,8 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if arrCopyCallNamed(c, ibFnIx) { return missRhs("list copy value") }
   if memAccessCallNamed(c, ibFnIx) { return memAccessRhs(b, c, ix) }
   if simdCallNamed(c, ibFnIx) { return simdRhs(b, c, ix) }
+  if atomicCallNamed(c, ibFnIx) { return atomicRhs(b, c, ix) }
+  if truncSatCallNamed(c, ibFnIx) { return truncSatRhs(b, c, ix) }
   if hostCallNamed(c, ibFnIx) { return hostCallRhs(b, c, ix) }
   if d < 0 && strFromBytesCallNamed(c, ibFnIx) {
     return strFromBytesRhs(b, c, ix)
@@ -4644,6 +4651,62 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("memory access operand coercion")
   }
   const r: Rhs = { mmArgs: args, mmAt: ix }
+  return r
+}
+
+// An atomic intrinsic as legacy's arm writes it (`atomicPlanOf`): the address along
+// `memAddrPlanOf`'s `const` or `rest` arm, then each value operand already at `atomicValPrim`.
+// A fence has no operand. Every other address arm and a widened operand are named misses.
+function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const pl = atomicPlanOf(c)
+  if pl.apFail != "" { return missRhs("atomic plan") }
+  const args: Opnd[] = []
+  if pl.apBase == 0 {
+    const r: Rhs = { amArgs: args, amAt: ix }
+    return r
+  }
+  const ap = memAddrPlanOf(c, pl.apBase, ibFnIx)
+  const at = b.length
+  match ap.maArm {
+    "const" => {
+      const z: Opnd = { oiRep: repNodeOfTy(TY_I32), oiBits: 0 }
+      args.push(z)
+    }
+    "rest" => args.push(irBExpr(b, ap.maRest))
+    "bad" | "lma" | "fold" | "wide" => {
+      return missRhs("memory address " + ap.maArm)
+    }
+  }
+  let k = 1
+  while k < pl.apBase {
+    args.push(irBExpr(b, memCallArg(c, pl.apBase, k)))
+    k = k + 1
+  }
+  if ibMiss != "" { return missRhs("atomic operand") }
+  if ifBelowLead(b, at, "atomic short-circuit operand") {
+    return missRhs("atomic short-circuit operand")
+  }
+  if repPrim(irBOpRep(args[0])) != "i32" { return missRhs("atomic operand coercion") }
+  k = 1
+  while k < pl.apBase {
+    if repPrim(irBOpRep(args[k])) != atomicValPrim(pl.apRow, k) {
+      return missRhs("atomic operand coercion")
+    }
+    k = k + 1
+  }
+  const r: Rhs = { amArgs: args, amAt: ix }
+  return r
+}
+
+// A scalar saturating truncation as legacy's arm writes it (`truncSatPlanOf`): the float operand
+// already at the plan's prim, then the instruction. A widened operand is a named miss.
+function truncSatRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const pl = truncSatPlanOf(c)
+  if pl.tpOp < 0 { return missRhs("trunc_sat plan") }
+  const v = irBExpr(b, c.callArgs[0])
+  if ibMiss != "" { return missRhs("trunc_sat operand") }
+  if repPrim(irBOpRep(v)) != pl.tpFrom { return missRhs("trunc_sat operand coercion") }
+  const r: Rhs = { tsV: v, tsAt: ix }
   return r
 }
 

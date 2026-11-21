@@ -100,6 +100,7 @@ import {
   Opnd,
   RAtomEq,
   RAtomStr,
+  RAtomic,
   RBoxField,
   RBoxNarrow,
   RBundlePick,
@@ -168,6 +169,7 @@ import {
   RTagStash,
   RTest,
   RToBox,
+  RTruncSat,
   RUnionEq,
   Rhs,
   SAssign,
@@ -275,6 +277,9 @@ import {
   atomNotNulIsTail,
   atomStrPlanOf,
   atomStrTail,
+  atomicPlanOf,
+  atomicResultPrim,
+  atomicTail,
   boxTagIsTail,
   bundlePickOf,
   callRefCallTail,
@@ -429,6 +434,8 @@ import {
   tagDispatchIfOf,
   tagIsTail,
   tagStashTail,
+  truncSatPlanOf,
+  truncSatTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionBoxToPairTail,
@@ -924,6 +931,8 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RAtomic => atomic(r)
+    RTruncSat => truncSat(r)
     RCallHost => hostCall(r)
     RCast |
       RCellGet |
@@ -1646,6 +1655,30 @@ function memAccess(r: RMemAccess) {
   }
   for o in r.mmArgs { irLOpnd(o) }
   return memAccessTail(p, ap.maOff)
+}
+
+// `RAtomic`: legacy's atomic arm in `emitAtomicIntrinsic`'s order: the address the builder took
+// along `memAddrPlanOf`'s arm, each value, then the instruction at the plan's offset.
+function atomic(r: RAtomic) {
+  const c = nodeAt(r.amAt)
+  if !(c is Call) { return irLMiss("atomic node") }
+  const pl = atomicPlanOf(c)
+  if pl.apFail != "" { return irLMiss("atomic plan") }
+  if pl.apBase == 0 { return atomicTail(pl.apRow, 0) }
+  const ap = memAddrPlanOf(c, pl.apBase, lw.irAt)
+  if ap.maArm != "const" && ap.maArm != "rest" { return irLMiss("atomic plan") }
+  for o in r.amArgs { irLOpnd(o) }
+  return atomicTail(pl.apRow, ap.maOff)
+}
+
+// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail`.
+function truncSat(r: RTruncSat) {
+  const c = nodeAt(r.tsAt)
+  if !(c is Call) { return irLMiss("trunc_sat node") }
+  const pl = truncSatPlanOf(c)
+  if pl.tpOp < 0 { return irLMiss("trunc_sat plan") }
+  irLOpnd(r.tsV)
+  return truncSatTail(pl.tpOp)
 }
 
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
@@ -2560,6 +2593,21 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         memAccess(r)
         irLSettle(pending)
         if r.mmArgs.length == 1 { fbDrop() }
+        return 0
+      }
+      // A store and a fence leave nothing; any other discarded atomic's value is dropped.
+      if r is RAtomic {
+        atomic(r)
+        irLSettle(pending)
+        const c = nodeAt(r.amAt)
+        const pl = if c is Call { atomicPlanOf(c) } else { null }
+        if pl != null && atomicResultPrim(pl.apRow) != "" { fbDrop() }
+        return 0
+      }
+      if r is RTruncSat {
+        truncSat(r)
+        irLSettle(pending)
+        fbDrop()
         return 0
       }
       if r is REnvDrop {
