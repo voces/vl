@@ -4312,16 +4312,18 @@ export function litMemberEqArmOf(
   return if litMemberRecvIsNulString(recvIx, fnIx) { "nulStr" } else { "str" }
 }
 
-// One member-literal test `recv == <lex>`, in whichever shape the receiver's rep demands:
-// the tag-gated payload compare over a value-union box, the null-guarded string compare
-// over a `string | null` niche, plain string equality over a string ref, else the numeric
-// compare. One home because the bare-literal `is` and the litunion ladder must agree.
-function emitLitMemberEq(recvIx: i32, lex: string, fnIx: i32) {
+// One member-literal test `recv == <lex>` in the shape the receiver's rep demands (a box's
+// tag-gated compare, a `string | null`'s guarded one, a string's, a number's), returning its
+// receiver reads, -1 on failure. One home because the bare-literal `is` and the ladder must agree.
+function emitLitMemberEq(recvIx: i32, lex: string, fnIx: i32): i32 {
   return match litMemberEqArmOf(recvIx, lex, fnIx) {
     "union" => emitUnionLitIs(recvIx, lex, fnIx)
-    "nulStr" => emitNulStrLitEq(recvIx, lex, fnIx)
-    "str" => if emitExpr(recvIx, fnIx) < 0 { -1 } else { strMemberEqTail(lex, fnIx) }
-    "num" => emitNumLitEq(recvIx, lex, fnIx)
+    "nulStr" => if emitNulStrLitEq(recvIx, lex, fnIx) < 0 { -1 } else { 1 }
+    "str" => {
+      if emitExpr(recvIx, fnIx) < 0 { return -1 }
+      if strMemberEqTail(lex, fnIx) < 0 { -1 } else { 1 }
+    }
+    "num" => if emitNumLitEq(recvIx, lex, fnIx) < 0 { -1 } else { 1 }
   }
 }
 
@@ -6304,10 +6306,12 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
     "nicheRaw" => {
       if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
       nicheRawIsTail(isIx)
+      litArmsReadsAgree(isIx, arm, nd0.isObj, fnIx, 1)
     }
     "atomNotNul" => {
       if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
       atomNotNulIsTail()
+      litArmsReadsAgree(isIx, arm, nd0.isObj, fnIx, 1)
     }
     "atomTrue" | "memberTrue" => {
       fbI32Const(1)
@@ -6321,30 +6325,34 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
         atomEqIsTail(laTexts[laI], laI)
         laI = laI + 1
       }
-      1
+      litArmsReadsAgree(isIx, arm, nd0.isObj, fnIx, laI)
     }
     "boxLits" | "numBox" => {
       const bt = litIsBoxLexes(isIx, arm)
       let bI = 0
+      let bReads = 0
       while bI < bt.length {
-        if emitUnionLitIs(nd0.isObj, bt[bI], fnIx) < 0 { return -1 }
+        const k = emitUnionLitIs(nd0.isObj, bt[bI], fnIx)
+        if k < 0 { return -1 }
+        bReads = bReads + k
         memberOrTail(bI)
         bI = bI + 1
       }
-      1
+      litArmsReadsAgree(isIx, arm, nd0.isObj, fnIx, bReads)
     }
     "memberNoRecv" => emitFailNoMembershipRecv()
     "memberEq" => {
       const lsTexts = tyLitMemberTexts(t)
       let lsI = 0
+      let lsReads = 0
       while lsI < lsTexts.length {
-        if (emitLitMemberEq(nd0.isObj, quoteLex(lsTexts[lsI]), fnIx) < 0) {
-          return -1
-        }
+        const k = emitLitMemberEq(nd0.isObj, quoteLex(lsTexts[lsI]), fnIx)
+        if k < 0 { return -1 }
+        lsReads = lsReads + k
         memberOrTail(lsI)
         lsI = lsI + 1
       }
-      1
+      litArmsReadsAgree(isIx, arm, nd0.isObj, fnIx, lsReads)
     }
     "none" => emitFail("emitProgram: internal: an `is` literal arm with no lowering")
   }
@@ -6359,6 +6367,21 @@ export function litIsBoxLexes(isIx: i32, arm: LitIsArm): string[] {
   if arm != "boxLits" { return out }
   for m in tyLitMemberTexts(t) { out.push(quoteLex(m)) }
   return out
+}
+
+// 1 when literal arm `arm` read its receiver `reads` times, the count the IR builds by
+// (`litArmsReadsOf`); a refusal where the two disagree.
+function litArmsReadsAgree(
+  isIx: i32,
+  arm: LitIsArm,
+  recvIx: i32,
+  fnIx: i32,
+  reads: i32,
+): i32 {
+  if reads == litArmsReadsOf(isIx, arm, recvIx, fnIx) { return 1 }
+  return emitFail(
+    "emitProgram: internal: a literal arm read its receiver a number of times litArmsReadsOf does not state",
+  )
 }
 
 // How many times literal arm `arm` of `is` test `isIx` reads its receiver `recvIx`, as
@@ -10797,10 +10820,10 @@ function unionHasNoIntArm(usid: i32): boolean {
   return !unionHasAtomK(usid, "i32", 0) && !unionHasAtomK(usid, "i64", 3)
 }
 
-// `v is <literal>` over a still-boxed mixed-rep union (`"a" | "b" | 1` boxes as `string | i32`,
-// same-rep literals sharing a tag): the tag selects the literal's rep arm, then the unboxed
-// payload value-compares the literal. A literal whose rep has no arm is statically false,
-// evaluating the receiver for effects. The same gated shape as `emitUnionConcreteEq`.
+// `v is <literal>` over a still-boxed mixed-rep union (`"a" | "b" | 1` boxes as `string | i32`):
+// the tag selects the literal's rep arm, then the unboxed payload compares the literal; a rep with
+// no arm is statically false over the receiver's evaluation (`emitUnionConcreteEq`'s shape).
+// Returns the receiver's reads, -1 on failure.
 function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
   // D1060 — a non-re-readable receiver is stashed at its first read, not refused; the same move
   // `emitUnionConcreteEq` makes, with the same bound. The compare reads the box twice — the tag,
@@ -10817,14 +10840,19 @@ function emitUnionLitIs(objIx: i32, lit: string, fnIx: i32) {
     "noArm" => emitFail(
       "emitProgram: literal `is` over a union with no arm of the literal's rep",
     )
-    "never" => if emitExpr(objIx, fnIx) < 0 { -1 } else { unionLitNeverTail() }
+    "never" => {
+      if emitExpr(objIx, fnIx) < 0 { return -1 }
+      unionLitNeverTail()
+      1
+    }
     "tag" => {
       if emitExpr(objIx, fnIx) < 0 { return -1 }
       unionLitTagHead(p)
       if !p.ulOnce {
         if emitExpr(objIx, fnIx) < 0 { return -1 }
       }
-      unionLitPayloadTail(p, lit, fnIx)
+      if unionLitPayloadTail(p, lit, fnIx) < 0 { return -1 }
+      if p.ulOnce { 1 } else { 2 }
     }
   }
 }
