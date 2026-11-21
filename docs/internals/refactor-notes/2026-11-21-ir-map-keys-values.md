@@ -29,3 +29,13 @@ an `SEffect` of `RTagStash` as the row's opening statement, beside `SCoalBox` an
 callee held in a global is read before its stash, so that read opens the row (`tagStashLeads`).
 The `index of a tagged call` named miss is gone. `tests/ir-shadow-rows/tag-dispatch-ref-result.vl`
 now expects its functions matched and no mismatch, a global callee's start function included.
+
+## Measured (fixpoint seeds of master 41144724 and the change)
+
+- tests/cases armed shadow: covered and matched +11, start +1. `uncovered method keys` 12 → 0,
+  `method values` 7 → 0, `index of a tagged call` 5 → 0 (start 5, 4, 2 → 0). The named
+  `map iter receiver` takes 5 (start 8): a global, field or recovered receiver. No new `fail` or
+  `mismatch` row.
+- Corpus: `method keys` 5 → 0; no-blocker 44,449 → 44,454 of 45,678. Armed self +1 matched.
+- Legacy: tests/cases A/B identical 7,309 (differ 0), `--names` identical, mode-3 self
+  byte-identical. L2 fuel 106,901,466,260 → 107,005,813,458 (+0.098%).
