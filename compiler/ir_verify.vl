@@ -7,7 +7,7 @@
 // emitter's failure channel. Bounds (rule 8) arrive with the list nodes'
 // builder, and trap order (rule 9) with the first pass that moves a check. Until steps I2-I7
 // build them, the arms for records, lists, casts, tags, maps and closures have no input.
-import { NULL_OWN_BOX } from "./emit_plan_null"
+import { NULL_OWN_BOX, NULL_OWN_NONE } from "./emit_plan_null"
 import {
   IrFn,
   IrNode,
@@ -36,6 +36,8 @@ import {
   RGlobalGet,
   RListClear,
   RListCopy,
+  RListEmpty,
+  RListEmptyArms,
   RListEq,
   RListGet,
   RListLen,
@@ -54,6 +56,7 @@ import {
   RMapNew,
   RMapOp,
   RMapSet,
+  RMemAccess,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -580,13 +583,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RSpread => {
-      use(r.spSrc, at)
+      for s in r.spSrcs { use(s, at) }
       if dst < 0 { return 0 }
       if !(repNodeAt(dst) is RList) {
         return fail(2, at, "a spread literal of a non-list rep")
       }
-      if opRep(r.spSrc) != dst {
-        return fail(2, at, "a spread's source rep is not the literal's")
+      for s in r.spSrcs {
+        if opRep(s) != dst {
+          return fail(2, at, "a spread's source rep is not the literal's")
+        }
       }
       0
     }
@@ -598,6 +603,18 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       if dst >= 0 && opRep(r.lnFill) != kidAt(dst, 0) {
         return fail(2, at, "the fill's rep is not the element's")
+      }
+      0
+    }
+    RMemAccess => {
+      for o in r.mmArgs { use(o, at) }
+      for o in r.mmArgs {
+        if opRep(o) != vfI32 {
+          return fail(2, at, "a memory access's address and value are i32s")
+        }
+      }
+      if r.mmArgs.length == 1 && dst >= 0 && dst != vfI32 {
+        return fail(2, at, "a memory load is an i32")
       }
       0
     }
@@ -634,7 +651,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A packed byte reads unsigned into an i32.
       const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
-      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed {
+      // A nullable string element may read recovered at a string.
+      const en = repNodeAt(kidAt(l, 0))
+      const recovered = en is RNullable && en.rnInner == dst && dst == vfStr
+      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed && !recovered {
         return fail(2, at, "an element's rep is not its destination's")
       }
       0
@@ -680,6 +700,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         if !(d is RBox) && !(d is RNullable && d.rnDisc == 4) {
           return fail(2, at, "a null box is not delivered into a union box")
         }
+      } else if r.nuOwn == NULL_OWN_NONE && repPrim(dst) == "null" {
+        // The `null` unit's one value is the bottom ref.
       } else if !(d is RNullable) || !nicheRetag(d.rnDisc, d.rnInner) {
         return fail(
           2,
@@ -847,6 +869,25 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RTagIs => if dst != vfBool { fail(2, at, "a tag test is a bool") } else { 0 }
+    RListEmpty => {
+      use(r.leV, at)
+      if dst != vfBool { return fail(2, at, "a list emptiness test is a bool") }
+      if !(repNodeAt(opRep(r.leV)) is RList) {
+        return fail(2, at, "a list emptiness test's operand is a list")
+      }
+      0
+    }
+    RListEmptyArms => {
+      use(r.lfV, at)
+      if dst != vfBool {
+        return fail(2, at, "a list arms' emptiness test is a bool")
+      }
+      // The lowering reads the receiver once per arm read, so it is a variable, not a temp.
+      if !(r.lfV is OVar) || !(repNodeAt(opRep(r.lfV)) is RBox) {
+        return fail(2, at, "a list arms' emptiness test reads a box variable")
+      }
+      0
+    }
     RCoalAtomStr => {
       use(r.zaL, at)
       use(r.zaD, at)
@@ -1110,6 +1151,24 @@ function rawEff(e: SRawOp, at: i32) {
   if e.srOp == "reserve.open" || e.srOp == "reserve.close" {
     return if e.srArgs.length == 0 { 0 } else { fail(10, at, e.srOp + " takes no operand") }
   }
+  // A binding sink's pair writes: a box in, the null in, or the box out to a box variable.
+  if e.srOp == "sink.put" || e.srOp == "sink.null" || e.srOp == "sink.close" {
+    uses(e.srArgs, at)
+    const n0 = if e.srOp == "sink.put" { 1 } else { 0 }
+    const v = e.srImm
+    const varOk = e.srOp == "sink.null"
+      || v >= 0
+      && v < vf.irVars.length
+      && sinkBoxRep(vf.irVars[v].vRep)
+    if (
+      e.srArgs.length != n0
+      || !varOk
+      || n0 == 1 && !sinkBoxRep(opRep(e.srArgs[0]))
+    ) {
+      return fail(10, at, e.srOp + " is not a union box into the sink pair")
+    }
+    return 0
+  }
   if !vf.irHelper { return fail(10, at, "a raw op outside a runtime helper") }
   // Every outstanding push is this effect's leading operands, in push order.
   let k = 0
@@ -1136,12 +1195,18 @@ function rawEff(e: SRawOp, at: i32) {
     "array.copy" => n == 5 && ref0 && rawAt(opRep(a[2]), e.srImm)
     "array.init_data" | "array.fill" => n == 4 && ref0
     "call" => true
-    "reserve.open" | "reserve.close" => false
+    "reserve.open" | "reserve.close" | "sink.put" | "sink.null" | "sink.close" => false
   }
   if !ok {
     return fail(10, at, e.srOp + " is not over heap type " + i32ToStr(e.srHeap))
   }
   return 0
+}
+
+// Whether rep `r` is a union box, or a nullable one held as the same `{tag, payload}`.
+function sinkBoxRep(r: i32): boolean {
+  const d = repNodeAt(r)
+  return d is RBox || d is RNullable && d.rnDisc == 4
 }
 
 // Whether node `id` leaves its body: a branch, a return or a trap.
@@ -1426,9 +1491,12 @@ function stmt(id: i32, prev: i32) {
       if n.xfMap < 0 { use(n.xfList, id) }
       const ln = repNodeAt(opRep(n.xfList))
       const recvMap = n.xfMap < 0 && mapRepOrNullable(opRep(n.xfList))
-      // A list walks its elements, a string its code points, each an i32.
+      // A list walks its elements, a packed byte read unsigned into an i32; a string its code
+      // points, each an i32.
       let er = -1
-      if ln is RList { er = ln.rlsElem }
+      if ln is RList {
+        er = if repPrim(ln.rlsElem) == "u8" { vfI32 } else { ln.rlsElem }
+      }
       if opRep(n.xfList) == vfStr { er = vfI32 }
       // A map walks its keys or values, each an i32 or a string.
       if (
@@ -1609,14 +1677,89 @@ function touchesList(n: IrNode): boolean {
     SListSet | SBoundsCheck => true
     SLet => rhsReadsList(n.lRhs)
     SEffect => rhsReadsList(n.efRhs)
-    SAssign | SSetField | SCellSet | SGlobalSet | SBlock | SLoop | SForIn | SIf | SSwitch | SCoalBox | SBr | SReturn | STrap | SDrop | SRawOp => false
+    SAssign |
+      SSetField |
+      SCellSet |
+      SGlobalSet |
+      SBlock |
+      SLoop |
+      SForIn |
+      SIf |
+      SSwitch |
+      SCoalBox |
+      SBr |
+      SReturn |
+      STrap |
+      SDrop |
+      SRawOp => false
   }
 }
 
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RPrimOp | RCall | RCallRef | RCallHost | RTest | RBoxField | RSharedRead | RBoxNarrow | RRecover | RCast | RTagOf | RMakeRec | RGetField | RMakeList | RSpread | RListNew | RListCopy | RListLen | RListPush | RListStage | RListPop | RListClear | RMapFilter | RListSlice | RMapOp | RMapNew | RMapSet | RMapGetOr | RMapGet | RMapHas | RPrint | RNumIntr | RCoalStr | RCoalAtomStr | RTagStash | RTagIs | RStrOp | RNumWiden | RNumCast | RToBox | RRetag | RAtomStr | RNullOf | RRetNull | RNulTest | RAtomEq | RUnionEq | RListEq | RCoerce | RMakeClo | RFnId | RCellNew | RCellGet | RGlobalGet | REnvGet | REnvDrop | RRawOp | RRel | RStage => false
+    RPrimOp |
+      RCall |
+      RCallRef |
+      RCallHost |
+      RTest |
+      RBoxField |
+      RSharedRead |
+      RBoxNarrow |
+      RRecover |
+      RCast |
+      RTagOf |
+      RMakeRec |
+      RGetField |
+      RMakeList |
+      RSpread |
+      RListNew |
+      RListCopy |
+      RMemAccess |
+      RListLen |
+      RListPush |
+      RListStage |
+      RListPop |
+      RListClear |
+      RMapFilter |
+      RListSlice |
+      RMapOp |
+      RMapNew |
+      RMapSet |
+      RMapGetOr |
+      RMapGet |
+      RMapHas |
+      RPrint |
+      RNumIntr |
+      RCoalStr |
+      RCoalAtomStr |
+      RTagStash |
+      RTagIs |
+      RListEmpty |
+      RListEmptyArms |
+      RStrOp |
+      RNumWiden |
+      RNumCast |
+      RToBox |
+      RRetag |
+      RAtomStr |
+      RNullOf |
+      RRetNull |
+      RNulTest |
+      RAtomEq |
+      RUnionEq |
+      RListEq |
+      RCoerce |
+      RMakeClo |
+      RFnId |
+      RCellNew |
+      RCellGet |
+      RGlobalGet |
+      REnvGet |
+      REnvDrop |
+      RRawOp |
+      RRel |
+      RStage => false
   }
 }
 
@@ -1690,7 +1833,7 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 
 // Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
-// a tagged set's function, held at the set's `i32` id, is not (`tyOpenHeldAsIds`).
+// a function held at a rep no instance changes is not (`tyOpenHeldAsIds`).
 export function irTyHeldOpen(ty: i32, rep: i32): boolean {
   return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
 }
