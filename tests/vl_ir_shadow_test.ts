@@ -2421,3 +2421,22 @@ print(qnull().o == null)
     }
   },
 });
+
+// A value `if` pushed onto a `u8[]` is typed `u8`, which no rep holds; it is built at the i32
+// legacy holds a byte value in, the packed store truncating it: a computed arm, a literal flag
+// and an `else if` chain.
+const U8_VALUE_IF =
+  `function hex(out: u8[], d: i32) {\n  out.push(if d < 10 { 48 + d } else { 87 + d })\n}\nfunction flag(out: u8[], on: boolean) {\n  out.push(if on { 1 } else { 0 })\n}\nfunction chain(out: u8[], k: i32) {\n  out.push(if k > 0 { k + 299 } else if k < 0 { 7 } else { 9 })\n}\nconst o: u8[] = []\nhex(o, 12)\nflag(o, true)\nchain(o, 1)\nprint(o[0] + o[1] + o[2])\n`;
+Deno.test({
+  name: "ir shadow: a value if pushed onto a u8 list builds at i32 and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(U8_VALUE_IF, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want hex, flag and chain covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
