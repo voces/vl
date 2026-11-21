@@ -415,3 +415,8 @@ already-formatted file changes. A multi-line type union (`type U = A` / `  | B`)
 `emitTypeOrUnionDecl` keeps a multi-line declaration as written. Why: the long IR kind arms in
 `compiler/ir.vl`, `ir_verify.vl` and `ir_lower.vl` are edited by every PR that adds a node, and
 one member per line lets two such PRs merge.
+
+**A seed built before #9380 undoes both rules.** Its formatter rejoins one-per-line arms and
+refills one-per-line lists, so `vl fmt -w` on a branch that has just merged master must run
+after `scripts/refresh-compiler.sh`. `tests/ir_lists_layout_test.ts` names any IR kind list
+that comes back packed.

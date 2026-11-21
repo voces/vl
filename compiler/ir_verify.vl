@@ -20,6 +20,7 @@ import {
   RAtomStr,
   RBoxField,
   RBoxNarrow,
+  RBundlePick,
   RCall,
   RCallHost,
   RCallRef,
@@ -30,6 +31,7 @@ import {
   RCoalStr,
   REnvDrop,
   REnvGet,
+  RFieldNull,
   RFnId,
   RGetField,
   RGlobalGet,
@@ -71,6 +73,7 @@ import {
   RRetNull,
   RRetag,
   RSharedRead,
+  RSimd,
   RSpread,
   RStage,
   RStashSet,
@@ -126,7 +129,13 @@ import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { Call, i32ToStr, nodeAt } from "./ast"
-import { memOpIsVoid, memOpPlanOf } from "./wasmEmit"
+import {
+  memOpIsVoid,
+  memOpPlanOf,
+  simdCallRow,
+  simdOperandPrim,
+  simdResultPrim,
+} from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
@@ -757,6 +766,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RFieldNull => {
+      // A typed null is a nullable reference's.
+      if !(repNodeAt(dst) is RNullable) {
+        return fail(
+          2,
+          at,
+          "a field's typed null is not delivered into a nullable reference",
+        )
+      }
+      0
+    }
     RNullOf => {
       const d = repNodeAt(dst)
       if r.nuOwn == NULL_OWN_BOX {
@@ -1026,6 +1046,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RSimd => simdCheck(r, dst, at)
     RPrint => {
       use(r.pnV, at)
       if dst >= 0 { return fail(2, at, "a print statement has no value") }
@@ -1138,6 +1159,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
     REnvDrop => 0
+    RBundlePick => {
+      use(r.bpV, at)
+      if dst >= 0 && !(repNodeAt(dst) is RClosure) {
+        return fail(2, at, "a bundle member of a non-closure rep")
+      }
+      0
+    }
     RGlobalGet => {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
@@ -1776,6 +1804,40 @@ function touchesList(n: IrNode): boolean {
   }
 }
 
+// A SIMD row's operands and result at the prims its shape names (`simdOperandPrim`,
+// `simdResultPrim`), a lane or shuffle index being an immediate and no operand.
+function simdCheck(r: RSimd, dst: i32, at: i32) {
+  uses(r.sdArgs, at)
+  const c = nodeAt(r.sdAt)
+  const row = if c is Call { simdCallRow(c) } else { -1 }
+  if !(c is Call) || row < 0 {
+    return fail(2, at, "a SIMD op's node is a SIMD call")
+  }
+  let k = 0
+  let i = 0
+  while i < c.callArgs.length {
+    const p = simdOperandPrim(row, i)
+    if p != "" {
+      if k >= r.sdArgs.length || repPrim(opRep(r.sdArgs[k])) != p {
+        return fail(2, at, "a SIMD op's operands are at its row's prims")
+      }
+      k = k + 1
+    }
+    i = i + 1
+  }
+  if k != r.sdArgs.length {
+    return fail(2, at, "a SIMD op's operands are at its row's prims")
+  }
+  const rp = simdResultPrim(row)
+  if (
+    dst >= 0
+    && (rp == "" || repPrim(dst) != rp && !(rp == "i32" && repPrim(dst) == "bool"))
+  ) {
+    return fail(2, at, "a SIMD op's result is at its row's prim")
+  }
+  return 0
+}
+
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
@@ -1813,6 +1875,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMapHas |
       RPrint |
       RNumIntr |
+      RSimd |
       RCoalStr |
       RCoalAtomStr |
       RTagStash |
@@ -1827,6 +1890,7 @@ function rhsReadsList(r: Rhs): boolean {
       RRetag |
       RAtomStr |
       RNullOf |
+      RFieldNull |
       RRetNull |
       RNulTest |
       RAtomEq |
@@ -1840,6 +1904,7 @@ function rhsReadsList(r: Rhs): boolean {
       RGlobalGet |
       REnvGet |
       REnvDrop |
+      RBundlePick |
       RRawOp |
       RRel |
       RStage => false

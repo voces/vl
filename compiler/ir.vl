@@ -180,6 +180,9 @@ export type RAtomStr = { sxV: Opnd, sxAt: i32 }
 // The `null` legacy builds where node `nuAt` is delivered: the null `nuOwn` names (`nullOwnAt`),
 // a `K | null` sentinel or a `string | null`'s typed null.
 export type RNullOf = { nuAt: i32, nuOwn: i32 }
+// Struct row `fnRow`'s field `fnFi`'s typed null, as legacy's `emitOmittedFieldNull` writes it: the
+// `ref.null` of the field's own heap (`fieldTypedNullHas`).
+export type RFieldNull = { fnRow: i32, fnFi: i32 }
 // The function's own `null` at its nullable return rep (`nullRetPlanOf`), as legacy pads a returned
 // value `if` with it at `rnrAt` (`emitNullForRet`).
 export type RRetNull = { rnrAt: i32 }
@@ -259,6 +262,9 @@ export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
 // A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
 // (`numIntrPlanOf`).
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
+// A SIMD intrinsic at call `sdAt` other than a load or store: its value operands, then its one
+// instruction and any lane immediates (`simdTail`).
+export type RSimd = { sdArgs: Opnd[], sdAt: i32 }
 // A `print` statement at call `pnAt` of argument `pnV`, written by legacy's tail for its arm.
 export type RPrint = { pnV: Opnd, pnAt: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` read (recovered for `mgNonNull`), or where
@@ -275,13 +281,15 @@ export type RMapGetOr = {
   mgDef: Opnd,
 }
 // A bare `m[k]` at Index node `mtAt`: map global `mtSym` read (recovered for `mtNonNull`), or where
-// it is -1 receiver operand `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`).
+// it is -1 receiver operand `mtLoc`, and key `mtKey`, by legacy's arm (`mapGetArmOf`). A read the
+// box plan boxes (`mapScalar`) carries the value's atom kind `mtBox`, else -1.
 export type RMapGet = {
   mtSym: i32,
   mtNonNull: boolean,
   mtLoc: Opnd,
   mtKey: Opnd,
   mtAt: i32,
+  mtBox: i32,
 }
 // `m.has(k)` at call `mhAt` on map global `mhSym` (receiver node `mhRecv`, recovered for
 // `mhNonNull`), or with `mhSym` -1 receiver operand `mhLoc`, key `mhKey`: legacy's probe and hit flag, an
@@ -305,6 +313,8 @@ export type RGlobalGet = { ggSym: i32, ggNonNull: boolean }
 export type REnvGet = { evSlot: i32, evAt: i32 }
 // The environment of nested function `edFn` this frame caches, dropped where its declaration runs.
 export type REnvDrop = { edFn: i32 }
+// The closure bundle parameter `bpV` holds for call `bpAt` (D14841), as `bundlePickOf` picks it.
+export type RBundlePick = { bpV: Opnd, bpAt: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -357,12 +367,14 @@ export type Rhs = RPrimOp
   | RNumWiden
   | RNumCast
   | RNumIntr
+  | RSimd
   | RCoalStr
   | RCoalAtomStr
   | RToBox
   | RRetag
   | RAtomStr
   | RNullOf
+  | RFieldNull
   | RRetNull
   | RNulTest
   | RAtomEq
@@ -381,6 +393,7 @@ export type Rhs = RPrimOp
   | RGlobalGet
   | REnvGet
   | REnvDrop
+  | RBundlePick
   | RRawOp
   | RRel
   | RStage
@@ -918,12 +931,14 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNumWiden => [r.nwV]
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
+    RSimd => r.sdArgs
     RCoalStr => [r.czL, r.czD]
     RCoalAtomStr => [r.zaL, r.zaD]
     RToBox => [r.bxV]
     RRetag => [r.rgV]
     RAtomStr => [r.sxV]
     RNullOf => []
+    RFieldNull => []
     RRetNull => []
     RNulTest => [r.ntV]
     RAtomEq => [r.aeL, r.aeR]
@@ -942,6 +957,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RGlobalGet => []
     REnvGet => []
     REnvDrop => []
+    RBundlePick => [r.bpV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -992,6 +1008,7 @@ function rhsText(r: Rhs): string {
     RAtomStr => "atomstr " + opndText(r.sxV)
     RRetag => "retag " + opndText(r.rgV)
     RNullOf => "null"
+    RFieldNull => "field null"
     RRetNull => "return null"
     RNulTest => "isnull " + opndText(r.ntV)
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
@@ -1021,6 +1038,7 @@ function rhsText(r: Rhs): string {
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
+    RSimd => "simd(" + opndsText(r.sdArgs) + ")"
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
@@ -1041,6 +1059,7 @@ function rhsText(r: Rhs): string {
       + ")"
     REnvGet => "env " + i32ToStr(r.evSlot)
     REnvDrop => "env drop f" + i32ToStr(r.edFn)
+    RBundlePick => "bundle pick " + opndText(r.bpV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -1225,6 +1244,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RRetag |
       RAtomStr |
       RNullOf |
+      RFieldNull |
       RRetNull |
       RNulTest |
       RAtomEq |
@@ -1263,12 +1283,14 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RMakeClo |
       RCallRef |
       REnvGet |
-      REnvDrop => "closure"
+      REnvDrop |
+      RBundlePick => "closure"
     RCallHost |
       RCast |
       RTagOf |
       RListNew |
       RListCopy |
+      RSimd |
       RMemAccess |
       RMemOp |
       RFnId |
