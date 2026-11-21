@@ -1983,7 +1983,8 @@ export function coerceListAtomOf(
 // How a value is boxed: the null tag (`null`), a box as itself (`pass`), a member record read as its
 // field's box (`memberBox`), a value-atom box of kind `hbKind` widened from `hbSrc` (`atom`), that
 // box over a literal (`lit`), a `K | null` atom as its string (`atomStr`), a record or object literal
-// under arm `hbKind` (`rec`, `obj`), a ref list under tag `hbKind` (`refList`), or the ladder.
+// under arm `hbKind` (`rec`, `obj`), a ref list under tag `hbKind` (`refList`), a scalar map read
+// whose miss is the box's null (`mapScalar`, kind `hbKind`), or the ladder.
 export type HoleBoxArm = "null"
   | "pass"
   | "memberBox"
@@ -1993,6 +1994,7 @@ export type HoleBoxArm = "null"
   | "rec"
   | "obj"
   | "refList"
+  | "mapScalar"
   | "ladder"
 
 export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
@@ -2000,6 +2002,23 @@ export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
 function holeBox(arm: HoleBoxArm, kind: i32, src: i32): HoleBox {
   const p: HoleBox = { hbArm: arm, hbKind: kind, hbSrc: src }
   return p
+}
+
+// The box plan of map read `exprIx` into `unionTy`: a scalar value's read
+// into a union holding that scalar and `null` boxes its miss as the null (`emitMapGetScalarBox`).
+// Every other map read is the ladder's.
+function mapReadBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
+  const ladder = holeBox("ladder", -1, -1)
+  const k = mapReadScalarBoxKind(exprIx, fnIx)
+  if k < 0 || !unionTyHasValueAtom(unionTy) { return ladder }
+  const uSet = msSetOfRow(unRowOfTyKey(unionTy))
+  if !coerceSetHasNull(uSet, boxDstName("", unionTy), unionTy) { return ladder }
+  if (
+    !msHasPlainValKind(if uSet >= 0 { uSet } else { msSetOfTyAny(unionTy) }, k)
+  ) {
+    return ladder
+  }
+  return holeBox("mapScalar", k, -1)
 }
 
 // The plan for boxing `exprIx` into `unionTy`, shared by the IR and `emitUnionBoxArg`: it decides
@@ -2022,7 +2041,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const bare = nodeAt(bareIx)
   if bare is IfStmt || callIsNever(bareIx) { return ladder }
   // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box.
-  if bare is Index && exprMap(bare.idxArr, fnIx) { return ladder }
+  if bare is Index && exprMap(bare.idxArr, fnIx) {
+    return mapReadBoxPlanOf(exprIx, unionTy, fnIx)
+  }
   if exprUnion(exprIx, fnIx) { return holePassPlanOf(exprIx, unionTy, fnIx) }
   if memberBoxPasses(exprIx, unionTy, fnIx) {
     return holeBox("memberBox", -1, -1)

@@ -3493,6 +3493,11 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
       return a
     }
   }
+  // A scalar map read the box plan boxes is the probe's own box.
+  if ibMiss == "" && dst >= 0 && boxedNullable(dst) {
+    const mk = mapReadBoxKindAt(ix)
+    if mk >= 0 { return mapGetAt(b, unwrapParen(ix), dst, mk) }
+  }
   // A member record read the box plan passes as its field's box is built at its storage.
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
     return memberBoxTemp(b, ix, dst)
@@ -3503,6 +3508,16 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     ifBelowLead(b, at, "box of a valued if")
   }
   return v
+}
+
+// The value-atom kind of map read `ix` where legacy boxes it here by the box plan's `mapScalar`
+// arm, else -1.
+function mapReadBoxKindAt(ix: i32): i32 {
+  const bx = unwrapParen(ix)
+  if bx < 0 || bx >= P.nodes.length || !(nodeAt(bx) is Index) { return -1 }
+  if !boxOwedAt(ix, ibFnIx) { return -1 }
+  const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
+  return if p.hbArm == "mapScalar" { p.hbKind } else { -1 }
 }
 
 // Member record read `ix` delivered as the box its field holds: the read built at its storage, at
@@ -3600,6 +3615,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd): string {
     "atomStr" => atomNullable(r)
     "rec" | "obj" => repNodeAt(r) is RRecord
     "refList" => repNodeAt(r) is RList
+    "mapScalar" => false
     "atom" => if p.hbSrc >= 0 { numKindOf(r) == p.hbSrc } else { holeKindRep(p.hbKind, r) }
     "ladder" => false
   }
@@ -4410,6 +4426,12 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
 // ref value at its niche, or a mono-valued map read at the value's own rep.
 export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
+  return mapGetAt(b, ix, rep, -1)
+}
+
+// `mapGetBare`, or under value-atom kind `box` (not -1) the read the box plan boxes into boxed
+// nullable `rep` (`mapScalar`), its miss the box's null.
+function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32): Opnd {
   const rd = nodeAt(ix)
   if !(rd is Index) { return irBMiss("map get") }
   const arm = mapGetArmOf(ix, ibFnIx)
@@ -4422,13 +4444,16 @@ export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
   const mr = if rk.mkSym >= 0 { irGlobalRepOf(ib, rk.mkSym) } else { irBOpRep(rk.mkLoc) }
   const m = repNodeAt(mr)
   if !(m is RMap) { return irBMiss("map get receiver rep") }
-  if !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) { return irBMiss("map get rep") }
+  if box < 0 && !mapGetRepOk(sh, m.rmVal, rep, rd.idxArr) {
+    return irBMiss("map get rep")
+  }
   const r: Rhs = {
     mtSym: rk.mkSym,
     mtNonNull: rk.mkNonNull,
     mtLoc: rk.mkLoc,
     mtKey: rk.mkKey,
     mtAt: ix,
+    mtBox: box,
   }
   return irBLetTemp(b, r, ix, rep)
 }
