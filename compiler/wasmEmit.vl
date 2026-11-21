@@ -4261,12 +4261,24 @@ function litMemberRecvIsNulString(recvIx: i32, fnIx: i32) {
 // (which consumes it) decides between the string compare and a const 0, mirroring
 // `emitPrintNulString`'s block shape rather than the coalesce's.
 function emitNulStrLitEq(recvIx: i32, lex: string, fnIx: i32) {
+  nulStrMemberOpen()
+  if emitExpr(recvIx, fnIx) < 0 { return -1 }
+  nulStrMemberGuard()
+  if strMemberEqTail(lex, fnIx) < 0 { return -1 }
+  return nulStrMemberClose()
+}
+
+// Before a `string | null` receiver compared with a member: the result block and the null's.
+export function nulStrMemberOpen() {
   fbBlock(127)
   fbBlock(64)
+}
 
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  fbBrOnNull(0)
-  if emitStrEqLit(mkStr(lex, -1), fnIx) < 0 { return -1 }
+// After the receiver: a null leaves for the null's block, else the string stays for the compare.
+export function nulStrMemberGuard() { fbBrOnNull(0) }
+
+// After the member compare: the compare's result, else the null's 0.
+export function nulStrMemberClose() {
   fbBr(1)
   fbEnd()
   fbI32Const(0)
@@ -4274,21 +4286,42 @@ function emitNulStrLitEq(recvIx: i32, lex: string, fnIx: i32) {
   return 0
 }
 
+// Compares the string on the stack with member literal `lex`, a quoted lexeme, leaving 0/1.
+export function strMemberEqTail(lex: string, fnIx: i32) {
+  const lit = mkStr(lex, -1)
+  const f = strEqLitForm(lit)
+  strEqLitHead(lit, f)
+  if f == 0 || f == 3 {
+    if emitStrLitAt(lit, fnIx) < 0 { return -1 }
+  }
+  return strEqLitTail(f)
+}
+
+// The shape `emitLitMemberEq` compares receiver `recvIx` with member `lex` in: a value-union box's
+// tag-gated payload, a nullable string's guarded compare, a string's, or a number's.
+export type LitMemberEqArm = "union" | "nulStr" | "str" | "num"
+
+export function litMemberEqArmOf(
+  recvIx: i32,
+  lex: string,
+  fnIx: i32,
+): LitMemberEqArm {
+  if exprUnion(recvIx, fnIx) { return "union" }
+  if !nameIsQuotedLeaf(lex) { return "num" }
+  return if litMemberRecvIsNulString(recvIx, fnIx) { "nulStr" } else { "str" }
+}
+
 // One member-literal test `recv == <lex>`, in whichever shape the receiver's rep demands:
 // the tag-gated payload compare over a value-union box, the null-guarded string compare
 // over a `string | null` niche, plain string equality over a string ref, else the numeric
 // compare. One home because the bare-literal `is` and the litunion ladder must agree.
 function emitLitMemberEq(recvIx: i32, lex: string, fnIx: i32) {
-  if exprUnion(recvIx, fnIx) { return emitUnionLitIs(recvIx, lex, fnIx) }
-
-  if nameIsQuotedLeaf(lex) {
-    if litMemberRecvIsNulString(recvIx, fnIx) {
-      return emitNulStrLitEq(recvIx, lex, fnIx)
-    }
-    if emitExpr(recvIx, fnIx) < 0 { return -1 }
-    return emitStrEqLit(mkStr(lex, -1), fnIx)
+  return match litMemberEqArmOf(recvIx, lex, fnIx) {
+    "union" => emitUnionLitIs(recvIx, lex, fnIx)
+    "nulStr" => emitNulStrLitEq(recvIx, lex, fnIx)
+    "str" => if emitExpr(recvIx, fnIx) < 0 { -1 } else { strMemberEqTail(lex, fnIx) }
+    "num" => emitNumLitEq(recvIx, lex, fnIx)
   }
-  return emitNumLitEq(recvIx, lex, fnIx)
 }
 
 // shared refusal text: the membership ladder's own place bound and the box-tag compare's
@@ -6308,7 +6341,7 @@ function emitIsTestLitArms(isIx: i32, nd0: IsExpr, fnIx: i32, arm: LitIsArm) {
         if (emitLitMemberEq(nd0.isObj, quoteLex(lsTexts[lsI]), fnIx) < 0) {
           return -1
         }
-        if lsI > 0 { fbI32Bin(114) }
+        memberOrTail(lsI)
         lsI = lsI + 1
       }
       1
@@ -6335,6 +6368,11 @@ export function atomNotNulIsTail(): i32 {
 export function atomEqIsTail(text: string, i: i32) {
   fbI32Rel(RS_ATOM, internAtom(quoteLex(text)))
   fbI32Bin(70)
+  memberOrTail(i)
+}
+
+// After member `i`'s compare in a membership test: or-ed into the earlier members' answer.
+export function memberOrTail(i: i32) {
   if i > 0 { fbI32Bin(114) }
 }
 
@@ -13046,8 +13084,8 @@ export function arrLitPrologue(arrIx: i32): i32 {
 }
 
 // Why list literal `arrIx` of `n` elements does not build at arm `arm` with `array.new_fixed` and
-// the short tail, or "": past the chunk cap (a string list's own), or an i32 list seeded with a
-// `null` sentinel. A literal-union list's atoms are its elements' own, and a hoisted `for`
+// the short tail, or "": past the chunk cap (a string list's own), or a non-empty i32 list seeded
+// with a `null` sentinel. A literal-union list's atoms are its elements' own, and a hoisted `for`
 // iterable reads its module list instead (`arrLitHoistGlobal`).
 export function arrLitShortWhy(
   arrIx: i32,
@@ -13057,7 +13095,9 @@ export function arrLitShortWhy(
 ): string {
   const cap = if arm == "str" { allocLitChunk() } else { NEW_FIXED_MAX }
   if n > cap { return "long" }
-  if arm == "i32" && arrElemIsNullUnitAt(arrIx, fnIx) { return "null sentinel" }
+  if arm == "i32" && n > 0 && arrElemIsNullUnitAt(arrIx, fnIx) {
+    return "null sentinel"
+  }
   return ""
 }
 
@@ -26321,13 +26361,14 @@ function emitCallCoreMemAccess(c: Call, name: string, fnIx: i32) {
 // The access a linear-memory intrinsic writes: its opcode and alignment exponent, its declared
 // operands before an optional constant offset (`mxBase`, 1 for a load and 2 for a store, 0 for no
 // such intrinsic), the kind a store's value widens to (`mxWiden`, -1 when it goes in as it
-// stands), and `mxI32` when the value stored or loaded is a plain i32.
+// stands), `mxI32` when the value stored or loaded is a plain i32, and that value's prim (`mxPrim`).
 export type MemAccessPlan = {
   mxOp: i32,
   mxAlign: i32,
   mxBase: i32,
   mxWiden: i32,
   mxI32: boolean,
+  mxPrim: string,
 }
 
 export function memAccessPlanOf(name: string): MemAccessPlan {
@@ -26338,6 +26379,7 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
       mxBase: 2,
       mxWiden: -1,
       mxI32: true,
+      mxPrim: "i32",
     }
   }
   if name == "__load_i32__" {
@@ -26347,6 +26389,7 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
       mxBase: 1,
       mxWiden: -1,
       mxI32: true,
+      mxPrim: "i32",
     }
   }
   if nameIsMemStoreIntrinsic(name) {
@@ -26358,6 +26401,7 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
       mxBase: 2,
       mxWiden: w,
       mxI32: plain,
+      mxPrim: if w == 3 { "i64" } else if w == 5 { "f32" } else if w == 4 { "f64" } else { "i32" },
     }
   }
   if nameIsMemLoadIntrinsic(name) {
@@ -26370,9 +26414,34 @@ export function memAccessPlanOf(name: string): MemAccessPlan {
         || name == "__load_u8__"
         || name == "__load_i16__"
         || name == "__load_u16__",
+      mxPrim: memLoadPrim(name),
     }
   }
-  return { mxOp: -1, mxAlign: -1, mxBase: 0, mxWiden: -1, mxI32: false }
+  return {
+    mxOp: -1,
+    mxAlign: -1,
+    mxBase: 0,
+    mxWiden: -1,
+    mxI32: false,
+    mxPrim: "",
+  }
+}
+
+// The prim load width `name` leaves: i64 for the i64 loads and their zero-extending forms, f32 or
+// f64 for the float loads, else i32.
+function memLoadPrim(name: string): string {
+  const op = memLoadOpcode(name)
+  if op == OP_F32_LOAD { return "f32" }
+  if op == OP_F64_LOAD { return "f64" }
+  if (
+    op == OP_I64_LOAD
+    || op == OP_I64_LOAD8_U
+    || op == OP_I64_LOAD16_U
+    || op == OP_I64_LOAD32_U
+  ) {
+    return "i64"
+  }
+  return "i32"
 }
 
 // Whether call `c` is a linear-memory load or store intrinsic: the spelling, with no binding
@@ -38412,7 +38481,7 @@ export function objLitStashRowAt(objIx: i32, si: i32): i32 {
 
 // Whether `emitObj` evaluates literal `objIx` at row `si` in source order into a stash: a field
 // the layout drops runs for its effect (D1696), and an observable permutation keeps order (D1510).
-function objLitStashes(objIx: i32, si: i32): boolean {
+export function objLitStashes(objIx: i32, si: i32): boolean {
   const cnt = sFieldCount[si]
   return objLitDropsField(objIx, sFieldNames, sFieldStart[si], cnt)
     || objLitNeedsOrderStash(objIx, sFieldNames, sFieldStart[si], cnt)
