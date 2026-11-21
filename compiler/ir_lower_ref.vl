@@ -12,6 +12,7 @@ import { fbDrop } from "./emit_bytes"
 import {
   OImm,
   PStaged,
+  RListCat,
   RListClear,
   RListEq,
   RListGet,
@@ -29,6 +30,7 @@ import {
 import {
   irLAt,
   irLFn,
+  irLIndexFrom,
   irLIndexRow,
   irLMiss,
   irLOpnd,
@@ -52,6 +54,8 @@ import {
   idxCellReadIsNull,
   idxStoreHoistOf,
   idxStoreTail,
+  listCatOperandTail,
+  listCatTail,
   listElemStaysNullable,
   listEqOperandTail,
   listEqTail,
@@ -90,6 +94,7 @@ import {
   strIndexOfTail,
   strListGetTail,
   strListHoistOf,
+  strListReadsNonNull,
   strOrderTail,
   strSiteCatTail,
   strSliceTail,
@@ -103,15 +108,15 @@ import { rvMayView } from "./emit_rep"
 import { rlRowsMinted } from "./emit_state"
 
 // Why the IR does not lower list read `idxIx`, or "" when it does: legacy's own arm decision
-// (`idxArmOf`) took a scalar list, collected and not a view, or a ref list whose read keeps no
-// nullable niche and reads no view.
+// (`idxArmOf`) took a scalar list, collected and not a view, a string or `(string | null)` list,
+// or a ref list whose read keeps no nullable niche and reads no view.
 export function listIdxPlainWhy(idxIx: i32, fnIx: i32): string {
   const nd = nodeAt(idxIx)
   if !(nd is Index) { return "index node" }
   if idxCellReadIsNull(idxIx, fnIx) { return "index cell null" }
   const arm = idxArmOf(nd, fnIx)
   if arm == "ref" { return refReadWhy(nd, fnIx) }
-  if arm == "string" || arm == "str" { return "" }
+  if arm == "string" || arm == "str" || arm == "nulstr" { return "" }
   if arm != "scalar" { return "index " + arm }
   const ek = scalarListElemKind(nd.idxArr, fnIx)
   if ek == null || !scalarListUsed(ek) { return "index uncollected list" }
@@ -137,12 +142,13 @@ function lowerList(r: Rhs): i32 {
   if r is RListLen { return lowerLen(r) }
   if r is RStrOp { return lowerStr(r) }
   if r is RListEq { return lowerListEq(r) }
+  if r is RListCat { return lowerListCat(r) }
   if r is RListPush { return lowerPush(r, true) }
   if r is RListPop { return lowerPop(r, true) }
   if r is RMapFilter { return lowerMapFilter(r) }
   if r is RListSlice { return lowerListSlice(r) }
   if !(r is RListGet) { return irLMiss("list rhs") }
-  const from = irLAt()
+  const from = irLIndexFrom(r.lgAt, irLAt())
   const got = lowerGet(r)
   irLIndexRow(r.lgAt, from)
   return got
@@ -160,11 +166,12 @@ function lowerGet(r: RListGet): i32 {
     irLOpnd(r.lgIx)
     return rawStrGetTail(sz)
   }
-  if arm == "str" {
+  // A `(string | null)` element is recovered non-null only where the checker types it so.
+  if arm == "str" || arm == "nulstr" {
     const lz = strListHoistOf(nd)
     if lz >= 0 { irLSkip(r.lgV) } else { irLOpnd(r.lgV) }
     irLOpnd(r.lgIx)
-    return strListGetTail(nd, lz, true)
+    return strListGetTail(nd, lz, strListReadsNonNull(r.lgAt, arm == "nulstr"))
   }
   if arm == "ref" {
     const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
@@ -325,6 +332,18 @@ function lowerListEq(r: RListEq): i32 {
   irLOpnd(r.qeR)
   listEqOperandTail(e.binRight, fnIx)
   return listEqTail(e, r.qeAt, fnIx)
+}
+
+// `RListCat`: each list and its own recovery, then legacy's concat.
+function lowerListCat(r: RListCat): i32 {
+  const e = nodeAt(r.ljAt)
+  if !(e is BinExpr) { return irLMiss("list concat node") }
+  const fnIx = irLFn().irAt
+  irLOpnd(r.ljL)
+  listCatOperandTail(e.binLeft, r.ljAt, fnIx)
+  irLOpnd(r.ljR)
+  listCatOperandTail(e.binRight, r.ljAt, fnIx)
+  return listCatTail(r.ljAt, fnIx)
 }
 
 // An append site's tail, at the mode the builder read; a site the scan does not arm is a miss.

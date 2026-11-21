@@ -143,11 +143,7 @@ import {
   tyProvesNonNull,
 } from "./check_relate_core"
 import { listDisjointDepth, listFitLitLeafOf } from "./check_type_shape"
-import {
-  inferRetFnKey,
-  isDeadArm,
-  mapDeliveryRecorded,
-} from "./check_side_rows"
+import { inferRetFnKey, isDeadArm } from "./check_side_rows"
 import { u8LexValue } from "./check_literals"
 import { isPatTyIxOf, isVarTyIxOf, luMembersAt } from "./check_list_union"
 import {
@@ -343,7 +339,6 @@ import {
   mkIf,
   mkIndex,
   mkMember,
-  mkNull,
   mkStr,
   nodeAt,
   nodeChildren,
@@ -380,7 +375,6 @@ import {
   cpsToUtf8,
   decodeStr,
   directArgsBad,
-  exprEffectFree,
   inferNicheNullByName,
   isRecvStagedIx,
   isRecvStagedNonNull,
@@ -409,6 +403,7 @@ import {
 } from "./emit_base"
 import {
   blockHasContinueFor,
+  coalLhsStashes,
   constFoldOfLet,
   exprIsIfStmt,
   globalCellIsImmutable,
@@ -440,6 +435,7 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
+  LiFrame,
   ListKind,
   PK_I16,
   PK_U16,
@@ -629,6 +625,7 @@ import {
   leqSScratchBase,
   leqgBases,
   liBack,
+  liFrameSave,
   liKinds,
   liSlots,
   liftWbEnd,
@@ -1575,6 +1572,7 @@ import {
 } from "./emit_collect"
 import {
   cboxIsWriteLet,
+  mkNullTestNe,
   voidTwinForNode,
   voidTwinTargetOf,
 } from "./emit_rewrite"
@@ -1778,8 +1776,7 @@ import {
   isArmPatTy,
   isArmTagOfTyAt,
   isBoxGuardPlain,
-  isPinOwn,
-  isPreArmOf,
+  isDecidedPlanOf,
   isRecvStageRep,
   isTestValuePrimName,
   isTestsStorage,
@@ -1799,15 +1796,18 @@ import {
   msSetOfUnionBox,
   narrowBoxWideArmOf,
   njDispatches,
+  njKindOfTy,
   njLitBasesOf,
   njMembersOf,
   njSideTyOf,
+  njStoreKind,
   nodeIsNumUnion,
   nulNicheIsTestImpossible,
   nulRecvNeedsRecover,
   nullInstanceIsResult,
   numIsPlanOf,
   numPrimOfKind,
+  numUnionReboxes,
   readMayBeNulUnit,
   sFieldElemTyIxOfRow,
   scalarAtomNameOfKind,
@@ -1989,9 +1989,24 @@ export function fieldNullOwnOf(si: i32, fi: i32): i32 {
   }
 }
 
+// Whether field `fi` of struct row `si` has a typed reference's null whose heap is fixed when emit
+// starts, `ref.null` of it: a nullable list or closure, or a nullable record or ref list whose row is
+// interned. A map's null takes its map shape's heap, which a later mint may move.
+export function fieldTypedNullHas(si: i32, fi: i32): boolean {
+  if si < 0 || si >= sFieldStart.length { return false }
+  const k = fieldRowKind(sFieldStart[si] + fi)
+  if k == null { return false }
+  return match k {
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => true
+    "nulstruct" | "nulvariant" => sFieldTgtStructIdx(si, fi) >= 0
+    "nulreflist" => sFieldRefSlot(si, fi) >= 0 && sFieldRefSlot(si, fi) < rlWrapIdx.length
+    "nulmap" | "nulstr" | "nulbool" | "i32" | "nulnone" | "union" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => false
+  }
+}
+
 // The null value of an omitted nullable field (`si`/`fi`) in a struct literal: `fieldNullOwnOf`'s
 // null, else `ref.null` of the field's own backing for the typed ref codes. -1 when not nullable.
-function emitOmittedFieldNull(si: i32, fi: i32) {
+export function emitOmittedFieldNull(si: i32, fi: i32) {
   const own = fieldNullOwnOf(si, fi)
   if own >= 0 {
     emitNullOwn(own)
@@ -2001,6 +2016,7 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
   const r = sFieldStart[si] + fi
   const k = fieldRowKind(r)
   if k == null { return -1 }
+  if !fieldTypedNullHas(si, fi) && k != "nulmap" { return -1 }
   match k {
     "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
       fbRefNullForKind(
@@ -2993,13 +3009,18 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
 // stores: a box-union field boxes the right-hand side, f64 / i64 / f32 fields re-encode it,
 // and any other field emits it plainly.
 function emitVariantFieldStoreVal(vi: i32, fi: i32, valIx: i32, fnIx: i32) {
-  // The bare value's one home, which the IR's field store reads too.
-  if fieldStoreVariantValuePlain(vi, fi, valIx, fnIx) {
-    return emitExpr(valIx, fnIx)
+  return match variantFieldStoreValueArmOf(vi, fi, valIx, fnIx) {
+    "plain" => emitExpr(valIx, fnIx)
+    "box" => emitVariantFieldBox(vi, fi, valIx, fnIx)
+    "f64" => emitWidened(valIx, 4, fnIx)
+    "i64" => emitWidened(valIx, 3, fnIx)
+    "f32" => emitWidened(valIx, 5, fnIx)
+    "strValue" => emitStrValue(valIx, fnIx)
+    "unencodable" => fieldStorePlainMissed()
+    "noKind" | "atomToStr" | "nulnone" | "armDelivery" => emitFail(
+      "emitProgram: internal: a variant field store took a struct field's value arm",
+    )
   }
-  const k = eqRowFieldKind(-1 - vi, fi)
-  if k == "union" { return emitVariantFieldBox(vi, fi, valIx, fnIx) }
-  return emitScalarFieldStoreVal(valIx, fnIx, k)
 }
 
 // Variant `vi`'s box-union field `fi` gets `valIx`, boxed at the checker's record where it owes a
@@ -4717,82 +4738,139 @@ function listFitRepMiss(isIx: i32): string {
 // test narrows reads an empty `K[]` in place of `xs` (D4911). 0, leaving the static fold, when
 // not that shape; 1 when emitted, -1 when refused.
 function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
+  const p = emptyFitPlanOf(isIx, fnIx)
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
-  if isTestsNull(isIx) { return 0 }
+  return match p.efArm {
+    "decline" => 0
+    "captured" => emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+    "union" => emitListEmptyFitArms(isIx, fnIx, p.efRecvTy)
+    "shadow" | "loop" => {
+      let grow = -1
+      if p.efArm == "shadow" {
+        const sh = listFitShadowSet(isIx, p.efRecvTy, p.efDepth, fnIx)
+        if sh < 1 { return sh }
+        const rv = nodeAt(unwrapParen(nd.isObj))
+        if sh == 2 && rv is Ident {
+          grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
+        }
+      }
+      if p.efRepWhy != "" { return emitFailAt(p.efRepWhy, isIx) }
+      // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
+      if grow >= 0 {
+        fbLocalGet(fitGrowLocal[grow])
+        fbRefIsNull()
+        fbIf(127) // i32
+      }
+      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+      emitListEmptyLoop(p.efSlots, 0, p.efKind, p.efSlot)
+      if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
+      1
+    }
+  }
+}
+
+// How `emitListEmptyFitIs` answers `is` test `isIx`: `decline` to the next rung, `captured` (an
+// unbound instance's closure capture), `union` (a box or nullable receiver's arms), `shadow` (a
+// narrowed region reads the arm's list), or `loop`, the walk over `efSlots` to an `efKind` list.
+// `efRepWhy` refuses a rep the walk cannot take, after the shadow set as legacy writes it.
+export type EmptyFitArm = "decline" | "captured" | "union" | "shadow" | "loop"
+export type EmptyFitPlan = {
+  efArm: EmptyFitArm,
+  efRecvTy: i32,
+  efDepth: i32,
+  efSlots: i32[],
+  efKind: ListKind,
+  efSlot: i32,
+  efRepWhy: string,
+}
+
+export function emptyFitPlanOf(isIx: i32, fnIx: i32): EmptyFitPlan {
+  const no: EmptyFitPlan = {
+    efArm: "decline",
+    efRecvTy: -1,
+    efDepth: 0,
+    efSlots: [],
+    efKind: "list",
+    efSlot: 0,
+    efRepWhy: "",
+  }
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) || isTestsNull(isIx) { return no }
   const recvTy = listIsRecvTyOf(nd.isObj, fnIx)
   // An instance that left the receiver's type parameter unbound cannot hand a closure the arm's
   // list, since nothing says whether its elements meet `K`.
   const rv = nodeAt(unwrapParen(nd.isObj))
-  if (
-    (recvTy < 0 || tyHasTyVar(recvTy))
+  const arm0: EmptyFitArm = if (recvTy < 0 || tyHasTyVar(recvTy))
     && rv is Ident
-    && liftedFnCaptures(rv.identName, fnIx)
-  ) {
-    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
-  }
-  if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) {
-    return emitListEmptyFitArms(isIx, fnIx, recvTy)
+    && liftedFnCaptures(rv.identName, fnIx) { "captured" } else if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) { "union" } else { "decline" }
+  if arm0 != "decline" {
+    const p0: EmptyFitPlan = {
+      efArm: arm0,
+      efRecvTy: recvTy,
+      efDepth: 0,
+      efSlots: [],
+      efKind: "list",
+      efSlot: 0,
+      efRepWhy: "",
+    }
+    return p0
   }
   const depth = listDisjointDepth(recvTy, isVarTyIxOf(isIx))
-  if depth < 1 { return 0 }
-  let grow = -1
-  if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy) {
-    const sh = listFitShadowSet(isIx, recvTy, depth, fnIx)
-    if sh < 1 { return sh }
-    if sh == 2 && rv is Ident {
-      grow = listFitGrowRow(unwrapParen(nd.isObj), isVarTyIxOf(isIx), fnIx)
-    }
-  }
+  if depth < 1 { return no }
+  const shadow = listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy)
   const slots: i32[] = []
   let kind: ListKind = "list"
   let slot = 0
+  let why = ""
   if exprRefArray(nd.isObj, fnIx) {
     let s = refListSlotOfExpr(nd.isObj, fnIx)
     let k = 1
     kind = "reflist"
-    while k < depth {
+    while k < depth && why == "" {
       if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
-        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        why = LIST_FIT_REP_MSG
+      } else {
+        slots.push(s)
+        const ek = rlElemKindAt(s)
+        if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+        else if k == depth - 1 && ek == RLK_I32_LIST { kind = "list" }
+        else if k == depth - 1 && ek == RLK_STR_LIST { kind = "strlist" }
+        else if k == depth - 1 && ek == RLK_F64_LIST { kind = "f64list" }
+        else if k == depth - 1 && ek == RLK_I64_LIST { kind = "i64list" }
+        else if k == depth - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+        else if k == depth - 1 && ek == RLK_V128_LIST { kind = "v128list" }
+        else if k == depth - 1 && ek == RLK_U8_LIST { kind = "u8list" }
+        else { why = LIST_FIT_REP_MSG }
       }
-      slots.push(s)
-      const ek = rlElemKindAt(s)
-      if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
-      else if k == depth - 1 && ek == RLK_I32_LIST { kind = "list" }
-      else if k == depth - 1 && ek == RLK_STR_LIST { kind = "strlist" }
-      else if k == depth - 1 && ek == RLK_F64_LIST { kind = "f64list" }
-      else if k == depth - 1 && ek == RLK_I64_LIST { kind = "i64list" }
-      else if k == depth - 1 && ek == RLK_F32_LIST { kind = "f32list" }
-      else if k == depth - 1 && ek == RLK_V128_LIST { kind = "v128list" }
-      else if k == depth - 1 && ek == RLK_U8_LIST { kind = "u8list" }
-      else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
       k = k + 1
     }
-    if kind == "reflist" {
+    if why == "" && kind == "reflist" {
       if s < 0 || s >= rlWrapIdx.length {
-        return emitFailAt(LIST_FIT_REP_MSG, isIx)
+        why = LIST_FIT_REP_MSG
+      } else {
+        slot = s
       }
-      slot = s
     }
   } else if depth > 1 {
-    return emitFailAt(LIST_FIT_REP_MSG, isIx)
+    why = LIST_FIT_REP_MSG
   } else if exprStringArray(nd.isObj, fnIx) {
     kind = "strlist"
   } else {
     const lek = scalarListElemKind(nd.isObj, fnIx)
-    if lek == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-    kind = listIdxKindOf(lek)
+    if lek == null { why = LIST_FIT_REP_MSG } else { kind = listIdxKindOf(lek) }
   }
-  // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
-  if grow >= 0 {
-    fbLocalGet(fitGrowLocal[grow])
-    fbRefIsNull()
-    fbIf(127) // i32
+  const arm: EmptyFitArm = if shadow { "shadow" } else { "loop" }
+  const p: EmptyFitPlan = {
+    efArm: arm,
+    efRecvTy: recvTy,
+    efDepth: depth,
+    efSlots: slots,
+    efKind: kind,
+    efSlot: slot,
+    efRepWhy: why,
   }
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-  emitListEmptyLoop(slots, 0, kind, slot)
-  if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
-  return 1
+  return p
 }
 
 // `is K[]` over a union or nullable receiver whose list arm `K[]` can never meet: true exactly
@@ -4801,16 +4879,76 @@ function emitListEmptyFitIs(isIx: i32, fnIx: i32): i32 {
 function emitListEmptyFitArms(isIx: i32, fnIx: i32, recvTy: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
+  const p = emptyFitArmsPlanOf(isIx, fnIx, recvTy)
+  if p.eaWhy == "decline" { return 0 }
+  if p.eaWhy == "noMembership" { return emitFailNoMembershipRecv() }
+  if p.eaWhy != "" { return emitFailAt(p.eaWhy, isIx) }
+  for r in p.eaRows {
+    if r.erShadow {
+      const sh = listFitShadowSet(isIx, r.erTy, r.erDepth, fnIx)
+      if sh < 1 { return sh }
+    }
+  }
+  if p.eaRepWhy != "" { return emitFailAt(p.eaRepWhy, isIx) }
+  let i = 0
+  while i < p.eaRows.length {
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    emptyFitArmHead(p, i)
+    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+    emptyFitArmBody(p, i)
+    i = i + 1
+  }
+  return 1
+}
+
+// One list arm of `emptyFitArmsPlanOf`: its type and disjoint depth, whether a narrowed region
+// reads it (`listNarrowReadDisjoint`), the box tag a boxed receiver tests, the payload's heap,
+// and the walk `emitListEmptyLoop` takes; `erBad` for a rep the walk cannot take.
+export type EmptyFitArmRow = {
+  erBad: boolean,
+  erTy: i32,
+  erDepth: i32,
+  erShadow: boolean,
+  erTag: i32,
+  erHeap: i32,
+  erSlots: i32[],
+  erKind: ListKind,
+  erSlot: i32,
+}
+
+// `emitListEmptyFitArms`'s decisions for `is` test `isIx`, in the order it writes them: `eaWhy`
+// first (`decline`, `noMembership`, or a refusal), then each row's shadow set, then `eaRepWhy`.
+export type EmptyFitArmsPlan = {
+  eaWhy: string,
+  eaBoxed: boolean,
+  eaRows: EmptyFitArmRow[],
+  eaRepWhy: string,
+}
+
+export function emptyFitArmsPlanOf(
+  isIx: i32,
+  fnIx: i32,
+  recvTy: i32,
+): EmptyFitArmsPlan {
+  const nd = nodeAt(isIx)
+  const boxed = nd is IsExpr && exprUnion(nd.isObj, fnIx)
+  const rows: EmptyFitArmRow[] = []
+  const no: EmptyFitArmsPlan = {
+    eaWhy: "decline",
+    eaBoxed: boxed,
+    eaRows: rows,
+    eaRepWhy: "",
+  }
+  if !(nd is IsExpr) { return no }
   const kTy = isVarTyIxOf(isIx)
-  const boxed = exprUnion(nd.isObj, fnIx)
   // A box's arms are the ones it registered, which the receiver's type need not spell.
   const armTys: i32[] = []
   if boxed {
     if (!unionTyMemberTys(unionBoxTyOfRead(nd.isObj, fnIx), armTys)) {
-      return 0
+      return no
     }
   } else {
-    if recvTy < 0 { return 0 }
+    if recvTy < 0 { return no }
     flattenVariantsInto(recvTy, armTys)
   }
   const fits: i32[] = []
@@ -4828,94 +4966,149 @@ function emitListEmptyFitArms(isIx: i32, fnIx: i32, recvTy: i32): i32 {
     }
   }
   // An arm whose elements can be `K` at every depth keeps its tag test.
-  if fits.length == 0 || meets { return 0 }
-  if !unionEqOperandOk(nd.isObj) { return emitFailNoMembershipRecv() }
-  if !boxed && fits.length != 1 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-  let fi = 0
-  while fi < fits.length {
-    if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, fits[fi]) {
-      const sh = listFitShadowSet(isIx, fits[fi], depths[fi], fnIx)
-      if sh < 1 { return sh }
-    }
-    fi = fi + 1
-  }
+  if fits.length == 0 || meets { return no }
+  let why = ""
+  if !unionEqOperandOk(nd.isObj) { why = "noMembership" }
+  else if !boxed && fits.length != 1 { why = LIST_FIT_REP_MSG }
+  let rep = ""
   let i = 0
-  while i < fits.length {
-    const at = tyAt(fits[i])
-    if !(at is TyArray) { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-    const heaps: i32[] = []
-    let kind = listFitElemKind(tyElemOf(at), heaps)
-    // An arm disjoint below its first level is a list of lists: its rows down to that depth are
-    // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
-    const slots: i32[] = []
-    let slot = 0
-    let outer = -1
-    if depths[i] > 1 {
-      let s = rlSlotOfTyOrTwin(tyRefArrElemOf(fits[i]))
-      outer = s
-      kind = "reflist"
-      let k = 1
-      while k < depths[i] {
-        if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
-          return emitFailAt(LIST_FIT_REP_MSG, isIx)
-        }
-        slots.push(s)
-        const ek = rlElemKindAt(s)
-        if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
-        else if k == depths[i] - 1 && ek == RLK_I32_LIST { kind = "list" }
-        else if k == depths[i] - 1 && ek == RLK_STR_LIST { kind = "strlist" }
-        else if k == depths[i] - 1 && ek == RLK_F64_LIST { kind = "f64list" }
-        else if k == depths[i] - 1 && ek == RLK_I64_LIST { kind = "i64list" }
-        else if k == depths[i] - 1 && ek == RLK_F32_LIST { kind = "f32list" }
-        else if k == depths[i] - 1 && ek == RLK_V128_LIST { kind = "v128list" }
-        else if k == depths[i] - 1 && ek == RLK_U8_LIST { kind = "u8list" }
-        else { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-        k = k + 1
-      }
-      if kind == "reflist" {
-        if s < 0 || s >= rlWrapIdx.length {
-          return emitFailAt(LIST_FIT_REP_MSG, isIx)
-        }
-        slot = s
-      }
-      if outer < 0 || outer >= rlWrapIdx.length {
-        return emitFailAt(LIST_FIT_REP_MSG, isIx)
-      }
-    } else {
-      if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-      slot = heaps[0]
-    }
-    if kind == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-    if boxed {
-      const tag = isArmTagOfTy(fits[i])
-      if tag < 0 { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
-      fbStructGet(uBoxIdx, 0)
-      fbI32Rel(RS_TAG, tag)
-      fbI32Bin(70) // 0x46 i32.eq
-    } else {
-      fbRefIsNull()
-      fbI32Eqz()
-    }
-    // <arm test> if (result i32) { <the arm's list is empty> } else { 0 }
-    fbIf(127)
-    if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-    if boxed {
-      fbStructGet(uBoxIdx, 1)
-      fbRefCast(if outer >= 0 { rlWrapIdx[outer] } else { heaps[2] })
-    } else {
-      fbRefAsNonNull()
-    }
-    emitListEmptyLoop(slots, 0, kind, slot)
-    fbElse()
-    fbI32Const(0)
-    fbEnd()
-    if i > 0 {
-      fbI32Bin(114) // 0x72 i32.or
-    }
+  while i < fits.length && why == "" {
+    rows.push(emptyFitArmRowOf(fits[i], depths[i], boxed, isIx, fnIx))
+    if rep == "" && rows[i].erBad { rep = LIST_FIT_REP_MSG }
     i = i + 1
   }
-  return 1
+  const p: EmptyFitArmsPlan = {
+    eaWhy: why,
+    eaBoxed: boxed,
+    eaRows: rows,
+    eaRepWhy: rep,
+  }
+  return p
+}
+
+// The row of list arm `a`, disjoint from `K` at depth `d`.
+function emptyFitArmRowOf(
+  a: i32,
+  d: i32,
+  boxed: boolean,
+  isIx: i32,
+  fnIx: i32,
+): EmptyFitArmRow {
+  const nd = nodeAt(isIx)
+  const shadow = nd is IsExpr && listNarrowReadDisjoint(fnIx, isIx, nd.isObj, a)
+  const bad: EmptyFitArmRow = {
+    erBad: true,
+    erTy: a,
+    erDepth: d,
+    erShadow: shadow,
+    erTag: -1,
+    erHeap: -1,
+    erSlots: [],
+    erKind: "reflist",
+    erSlot: -1,
+  }
+  const at = tyAt(a)
+  if !(at is TyArray) { return bad }
+  const heaps: i32[] = []
+  const k0 = listFitElemKind(tyElemOf(at), heaps)
+  let kind: ListKind = "reflist"
+  // An arm disjoint below its first level is a list of lists: its rows down to that depth are
+  // walked as `emitListEmptyFitIs` walks a bare receiver's, and the box holds the outer row.
+  const slots: i32[] = []
+  let slot = 0
+  let heap = -1
+  if d > 1 {
+    let s = rlSlotOfTyOrTwin(tyRefArrElemOf(a))
+    const outer = s
+    let k = 1
+    while k < d {
+      if s < 0 || s >= rlElemTyIx.length || rlElemNullable[s] != 0 {
+        return bad
+      }
+      slots.push(s)
+      const ek = rlElemKindAt(s)
+      if ek == RLK_REF_LIST { s = rlElemInnerSlot(s) }
+      else if k == d - 1 && ek == RLK_I32_LIST { kind = "list" }
+      else if k == d - 1 && ek == RLK_STR_LIST { kind = "strlist" }
+      else if k == d - 1 && ek == RLK_F64_LIST { kind = "f64list" }
+      else if k == d - 1 && ek == RLK_I64_LIST { kind = "i64list" }
+      else if k == d - 1 && ek == RLK_F32_LIST { kind = "f32list" }
+      else if k == d - 1 && ek == RLK_V128_LIST { kind = "v128list" }
+      else if k == d - 1 && ek == RLK_U8_LIST { kind = "u8list" }
+      else { return bad }
+      k = k + 1
+    }
+    if kind == "reflist" {
+      if s < 0 || s >= rlWrapIdx.length { return bad }
+      slot = s
+    }
+    if outer < 0 || outer >= rlWrapIdx.length { return bad }
+    heap = rlWrapIdx[outer]
+  } else {
+    if k0 == null { return bad }
+    kind = k0
+    slot = heaps[0]
+    heap = heaps[2]
+  }
+  const tag = if boxed { isArmTagOfTy(a) } else { 0 }
+  if tag < 0 { return bad }
+  const r: EmptyFitArmRow = {
+    erBad: false,
+    erTy: a,
+    erDepth: d,
+    erShadow: shadow,
+    erTag: tag,
+    erHeap: heap,
+    erSlots: slots,
+    erKind: kind,
+    erSlot: slot,
+  }
+  return r
+}
+
+// Whether plan `p` writes its rows with nothing before them: no refusal, no row a narrowed
+// region reads (whose shadow set legacy writes first), and a boxed receiver.
+export function emptyFitArmsPlain(p: EmptyFitArmsPlan): boolean {
+  if p.eaWhy != "" || p.eaRepWhy != "" || !p.eaBoxed { return false }
+  for r in p.eaRows {
+    if r.erShadow { return false }
+  }
+  return true
+}
+
+// After row `i`'s first receiver read: its arm test (the box tag, or non-null), then the `if`.
+export function emptyFitArmHead(p: EmptyFitArmsPlan, i: i32) {
+  if p.eaBoxed {
+    fbStructGet(uBoxIdx, 0)
+    fbI32Rel(RS_TAG, p.eaRows[i].erTag)
+    fbI32Bin(70) // 0x46 i32.eq
+  } else {
+    fbRefIsNull()
+    fbI32Eqz()
+  }
+  // <arm test> if (result i32) { <the arm's list is empty> } else { 0 }
+  fbIf(127)
+  return 0
+}
+
+// After row `i`'s second receiver read: the arm's list, its emptiness walk, the `else 0`, and
+// the `i32.or` onto the rows before it.
+export function emptyFitArmBody(p: EmptyFitArmsPlan, i: i32) {
+  const r = p.eaRows[i]
+  if p.eaBoxed {
+    fbStructGet(uBoxIdx, 1)
+    fbRefCast(r.erHeap)
+  } else {
+    fbRefAsNonNull()
+  }
+  emitListEmptyLoop(r.erSlots, 0, r.erKind, r.erSlot)
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  if i > 0 {
+    fbI32Bin(114) // 0x72 i32.or
+  }
+  return 0
 }
 
 const LIST_FIT_PUSH_MSG = "emitProgram: this `is` arm pushes onto an empty list built with another element type, which cannot hold the pushed value"
@@ -5320,7 +5513,12 @@ function narrowReadDisjointUnder(
 // Whether every list at nesting `at` and below of the list on the stack is empty, leaving 1 or
 // 0: `slots[at]`'s ref list is walked while `at` is inside `slots`, and the innermost list, of
 // frame kind `kind` (ref-list row `slot` for a ref list), answers by its length.
-function emitListEmptyLoop(slots: i32[], at: i32, kind: ListKind, slot: i32) {
+export function emitListEmptyLoop(
+  slots: i32[],
+  at: i32,
+  kind: ListKind,
+  slot: i32,
+) {
   if at >= slots.length {
     emitListLenOnStack(kind, slot)
     fbI32Eqz()
@@ -5798,9 +5996,8 @@ function mapSoftTwinTagFail(recvIx: i32, patTy: i32, fnIx: i32, at: i32): i32 {
 function emitIs(isIx: i32, fnIx: i32) {
   const nd0 = nodeAt(isIx)
   if !(nd0 is IsExpr) { return emitIsTest(isIx, fnIx) }
-  const tested = isVarTyIxOf(isIx)
-  const covOp = nodeTyAt(nd0.isObj, fnIx)
-  return match isPreArmOf(isIx, fnIx) {
+  const d = isDecidedPlanOf(isIx, fnIx)
+  return match d.idArm {
     // A narrowed operand is tested at its storage, never trusted: a write the narrowing does
     // not see (an alias, an escaped closure) is answered (D2447).
     "storage" => {
@@ -5809,30 +6006,8 @@ function emitIs(isIx: i32, fnIx: i32) {
       storageReadLeave(sMark)
       r
     }
-    "tautology" => {
-      fbI32Const(1)
-      0
-    }
-    "covers" | "fits" => isDecidedOperand(nd0.isObj, true, 1, fnIx)
-    // An effect-free operand answers a bare constant `staticIsGuard` reads, so the arm it
-    // guards is not lowered (D15606); any other is evaluated for its effects first (D15607).
-    "prim" => {
-      const same = tyPrimNameOf(covOp) == tyPrimNameOf(tested)
-      isDecidedOperand(
-        nd0.isObj,
-        same || !exprEffectFree(nd0.isObj),
-        if same { 1 } else { 0 },
-        fnIx,
-      )
-    }
-    "pin" => {
-      const own = isPinOwn(covOp, tested)
-      isDecidedOperand(
-        nd0.isObj,
-        !exprEffectFree(nd0.isObj),
-        if own { 1 } else { 0 },
-        fnIx,
-      )
+    "tautology" | "covers" | "fits" | "prim" | "pin" => {
+      isDecidedOperand(nd0.isObj, d.idEval, d.idBit, fnIx)
     }
     "test" => emitIsTest(isIx, fnIx)
   }
@@ -6497,7 +6672,7 @@ function emitIsTest(isIx: i32, fnIx: i32) {
   return r
 }
 
-function isArmRank(a: IsArm): i32 {
+export function isArmRank(a: IsArm): i32 {
   return match a {
     "optNull" => 0
     "nullInst" => 1
@@ -7966,13 +8141,26 @@ function emitUnionMapArmBox(
   }
   const sh = mapShapeOfExpr(exprIx, fnIx)
   if !unionHasMapArmSlot(unionTy, sh) { return 0 }
+  if !nullable { return mapArmBoxHead(unionTy, exprIx, fnIx) }
   const tag = mapBoxTagOf(sh, unionTy, exprIx, fnIx)
   if tag < 0 { return -1 }
-  if nullable { return emitNulMapArmBox(tag, exprIx, "", -1, -1, fnIx) }
-  fbI32Rel(RS_TAG, tag)
-  if emitExpr(exprIx, fnIx) < 0 { return -1 }
-  fbStructNew(uBoxIdx) // { tag, map struct ref }
-  return 1
+  return emitNulMapArmBox(tag, exprIx, "", -1, -1, fnIx)
+}
+
+// The head of closure `exprIx` boxed into union `unionTy`: its closure arm's tag, by the closure's
+// own function type where it names one. The closure and the `struct.new` follow.
+function cloArmBoxHead(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const own = cloBoxOwnFnTy(exprIx, fnIx)
+  const arm = if own >= 0 { own } else { unionClosureArmTyOfTy(unionTy) }
+  return fbI32Rel(RS_TAG, cloArmTagOfTy(arm))
+}
+
+// The head of map `exprIx` boxed into union `unionTy` under its map arm's tag: the tag, or -1
+// where the arm names none. The value and the `struct.new` follow (`emitHoleBox`'s `map`).
+function mapArmBoxHead(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const tag = mapBoxTagOf(mapShapeOfExpr(exprIx, fnIx), unionTy, exprIx, fnIx)
+  if tag < 0 { return -1 }
+  return fbI32Rel(RS_TAG, tag)
 }
 
 // A `M | null` value into a box holding `M`: the map arm's box, or when the value is null the
@@ -8612,15 +8800,15 @@ function emitUnionCoerceList(
   // with a bare-closure arm: the closure fat-pointer struct, a `structref` subtype, rides the
   // box anyref directly, tagged by the closure arm's `scalarTagOf` (value-atom kind 11).
   // Checked before the ladder below, whose scalar branches would store the ref in a value box.
-  if unionName != "" && exprIsClosure(exprIx, fnIx) {
-    const clArm = unionClosureArmTyOfTy(uTy)
-    if clArm >= 0 {
-      const own = cloBoxOwnFnTy(exprIx, fnIx)
-      fbI32Rel(RS_TAG, cloArmTagOfTy(if own >= 0 { own } else { clArm }))
-      if emitExpr(exprIx, fnIx) < 0 { return -1 }
-      fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
-      return 0
-    }
+  if (
+    unionName != ""
+    && exprIsClosure(exprIx, fnIx)
+    && unionClosureArmTyOfTy(uTy) >= 0
+  ) {
+    cloArmBoxHead(uTy, exprIx, fnIx)
+    if emitExpr(exprIx, fnIx) < 0 { return -1 }
+    fbStructNew(uBoxIdx) // { tag, closure fat-pointer ref }
+    return 0
   }
   // A scalar-element list literal (`["a"]`, `[1]`, invisible to `exprRefArray`) whose union arm
   // is a union-box-element ref-array: route it through the arm's build and tag. Checked before
@@ -8703,12 +8891,20 @@ function emitNulNoneForEffect(exprIx: i32, fnIx: i32) {
   return emitNulNoneLeafForEffect(exprIx, fnIx)
 }
 
+// Whether a `null`-typed value `exprIx` runs nothing for its effect: a bare `null` or a name read.
+export function nulNoneWritesNothing(exprIx: i32): boolean {
+  const ix = unwrapParen(exprIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  return n is NullLit || n is Ident
+}
+
 // `emitNulNoneForEffect` for every node but an if-expression: a bare `null` and a name read have
 // no effect, and anything else is lowered and its value dropped, since a `??` or a call in it
 // may run code (D3355).
 function emitNulNoneLeafForEffect(exprIx: i32, fnIx: i32) {
   const n = nodeAt(unwrapParen(exprIx))
-  if n is NullLit || n is Ident { return 0 }
+  if nulNoneWritesNothing(exprIx) { return 0 }
   // A `?.` read off the `null` unit reads nothing past its receiver.
   if n is OptMember { return emitNulNoneForEffect(n.omObj, fnIx) }
   // A `null`-typed `a ?? b` has a `null`-typed left, so both sides always run.
@@ -8769,11 +8965,13 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atom" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
+    "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
+    "clo" => cloArmBoxHead(p.hbKind, exprIx, fnIx)
     "lit" => {
       fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
       widenLitAt(exprIx, p.hbKind, fnIx)
     }
-    "pass" | "memberBox" | "atomStr" => 0
+    "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
 }
@@ -8781,10 +8979,10 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // What plan `p` for `exprIx` writes after its value (an `atom` plan's widening already applied).
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
-    "null" | "rec" | "obj" | "refList" => fbStructNew(uBoxIdx)
+    "null" | "rec" | "obj" | "refList" | "map" | "clo" => fbStructNew(uBoxIdx)
     "atom" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
-    "pass" | "memberBox" | "ladder" => 0
+    "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
 
@@ -8793,6 +8991,14 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
   if p.hbArm == "atom" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
+  } else if p.hbArm == "mapScalar" {
+    const mre = nodeAt(unwrapParen(exprIx))
+    if !(mre is Index) {
+      return emitFail("emitProgram: a map read's box plan names no read")
+    }
+    if emitMapGetScalarBox(mre.idxArr, mre.idxIndex, p.hbKind, fnIx) < 0 {
+      return -1
+    }
   } else if p.hbArm == "obj" {
     if emitVariantStruct(unwrapParen(exprIx), p.hbKind, fnIx) < 0 { return -1 }
   } else if p.hbArm == "memberBox" {
@@ -8806,6 +9012,8 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     || p.hbArm == "atomStr"
     || p.hbArm == "rec"
     || p.hbArm == "refList"
+    || p.hbArm == "map"
+    || p.hbArm == "clo"
   ) {
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
   }
@@ -12244,7 +12452,7 @@ function listKindElemKind(k: ListKind): VKind {
 // A run of plain elements as its own `ArrayLit`, built at holder `h`'s type, or at its holder's
 // when `h` is an untyped minted run (D16696). It reports at the spread literal's position: a
 // synthesized node otherwise takes the parser's last cursor, at the end of the file.
-function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
+export function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
   const ix = mkArrayLit(run, pos)
   adoptNodeTok(ix, arrIx)
   const up = elabSpreadRunHolderOf(h)
@@ -12258,18 +12466,32 @@ function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
 // checker's type for it unless it has none; context restored on exit.
 function emitArr(arrIx: i32, fnIx: i32) {
   const from = wLen()
+  // The scratch frame as legacy found it, for the probe to allocate from.
+  const before = if irShadowOn { liFrameSave() } else { liFrameNone }
   const r = emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
   if r >= 0 && irShadowOn {
-    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from)
+    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from, before)
   }
   return r
 }
 
 // The armed shadow's per-occurrence count of a legacy site (`irNodeInShadow`); a hook, since the
 // IR's builder imports this module.
-export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32) => i32 = nodeInShadowNone
+export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32, before: LiFrame) => i32 = nodeInShadowNone
+const liFrameNone: LiFrame = {
+  lfKinds: [],
+  lfSlots: [],
+  lfBack: [],
+  lfField: [],
+}
 
-function nodeInShadowNone(_ix: i32, _fnIx: i32, _ty: i32, _from: i32): i32 {
+function nodeInShadowNone(
+  _ix: i32,
+  _fnIx: i32,
+  _ty: i32,
+  _from: i32,
+  _before: LiFrame,
+): i32 {
   return 0
 }
 
@@ -13953,6 +14175,11 @@ function emitMapGetScalarBox(
   fnIx: i32,
 ) {
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return emitMapGetScalarBoxTail(atomKind)
+}
+
+// `emitMapGetScalarBox` after its probe: the box of value-atom kind `atomKind`'s read.
+export function emitMapGetScalarBoxTail(atomKind: i32) {
   const vbIdx = vbHeapIdxOfKind(atomKind)
   if vbIdx < 0 {
     return emitFail("emitProgram: scalar map read has no value-box type")
@@ -16927,8 +17154,8 @@ function emitIndex(idxIx: i32, fnIx: i32) {
       "nulscalar" => emitIndexNulScalarList(nd, fnIx)
       "ref" => emitIndexRefList(nd, idxIx, fnIx)
       // A `(string | null)[]` element stays nullable unless the checker types it non-null.
-      "nulstr" => emitIndexStrList(nd, fnIx, nodeTyProvesNonNull(idxIx))
-      "str" => emitIndexStrList(nd, fnIx, true)
+      "nulstr" => emitIndexStrList(nd, fnIx, strListReadsNonNull(idxIx, true))
+      "str" => emitIndexStrList(nd, fnIx, strListReadsNonNull(idxIx, false))
       "scalar" => emitIndexScalarList(nd, fnIx)
       "string" => emitIndexRawString(nd, fnIx)
       "none" => emitFail("emitProgram: index receiver is not an array or string")
@@ -16945,6 +17172,12 @@ function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
   }
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
   return strListGetTail(nd, slHz, nonNull)
+}
+
+// Whether string list read `idxIx` recovers its element non-null: always for a `string[]`, and for
+// a `(string | null)[]` (`nulstr`) only where the checker types the read non-null.
+export function strListReadsNonNull(idxIx: i32, nulstr: boolean): boolean {
+  return !nulstr || nodeTyProvesNonNull(idxIx)
 }
 
 // The string list read in two halves around its operands, as the scalar read's are: the live
@@ -19350,69 +19583,56 @@ function leqgBaseOfRep(kind: i32, slot: i32) {
   return leqgBases[i]
 }
 
+// How `+` node `e` at `ix` is a list concat: not one, one legacy refuses (its operands resolve to
+// no one list rep, or an element kind with no concat), one whose operands are at the concat's
+// rep, or one that widens an operand first (`catWidenSideOfBin`). Legacy and the IR ask it.
+export type ListCatRoute = "none" | "refused" | "plain" | "widen"
+
+export function listCatRouteOf(e: BinExpr, ix: i32, fnIx: i32): ListCatRoute {
+  if e.binOp != "+" || exprIsStrConcat(ix, fnIx) { return "none" }
+  if binConcatRepUnresolved(ix, fnIx) { return "refused" }
+  if catListKindOfBin(ix, fnIx) > 0 {
+    return if catWidenSideOfBin(ix, fnIx) == 0 { "plain" } else { "widen" }
+  }
+  return match listOpKindOfBin(ix, fnIx) {
+    "none" => "none"
+    "i32list" => "plain"
+    "strlist" | "reflist" | "glist" | "str" | "closure" => "refused"
+  }
+}
+
 // i32-list CONCAT `a + b`: a NEW list sized exactly lenA + lenB (one backing
 // allocation, two bulk `array.copy`s) — the host's §VL.4 lowering. Both operands
 // are evaluated onto the stack before either is stored into the shared LEQI frame, so
 // a concat nested in the right operand cannot overwrite A (D2331).
-function emitListConcatI(leftIx: i32, rightIx: i32, fnIx: i32) {
-  const bA = leqIScratchBase
+function emitListConcatI(leftIx: i32, rightIx: i32, binIx: i32, fnIx: i32) {
   if emitExpr(leftIx, fnIx) < 0 { return -1 }
-  // A NARROWED nullable-list operand (`i32[] | null`, kind 15) keeps its nullable
-  // slot; the LEQI scratch slot is non-null, so recover before the store (the
-  // checker proved the operand guarded — the cast can never trap).
-  if exprNullableList(leftIx, fnIx) { fbRefAsNonNull() }
+  listCatOperandTail(leftIx, binIx, fnIx)
   if emitExpr(rightIx, fnIx) < 0 { return -1 }
-  if exprNullableList(rightIx, fnIx) { fbRefAsNonNull() }
-  fbLocalSet(bA + 1)    // B
-  fbLocalSet(bA + 0)    // A
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 1) // lenA
-  fbLocalGet(bA + 1)
-  fbStructGet(lTy(), 1) // lenB
-  fbI32Bin(106)         // i32.add
-  fbLocalSet(bA + 3)    // n = lenA + lenB
-  fbLocalGet(bA + 3)
-  fbArrayNewDefault(aTy())
-  fbLocalSet(bA + 2)    // out backing
-  // array.copy out 0 backingA 0 lenA
-  fbLocalGet(bA + 2)
-  fbI32Const(0)
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 0)
-  fbI32Const(0)
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 1)
-  fbArrayCopy(aTy(), aTy())
-  // array.copy out lenA backingB 0 lenB
-  fbLocalGet(bA + 2)
-  fbLocalGet(bA + 0)
-  fbStructGet(lTy(), 1)
-  fbLocalGet(bA + 1)
-  fbStructGet(lTy(), 0)
-  fbI32Const(0)
-  fbLocalGet(bA + 1)
-  fbStructGet(lTy(), 1)
-  fbArrayCopy(aTy(), aTy())
-  // the result wrapper { out, n, n }
-  fbLocalGet(bA + 2)
-  fbLocalGet(bA + 3)
-  fbLocalGet(bA + 3)
-  fbStructNew(lTy())
+  listCatOperandTail(rightIx, binIx, fnIx)
+  return listCatTail(binIx, fnIx)
+}
+
+// The recovery after list `+` operand `opIx` at concat `binIx` is on the stack: a NARROWED
+// nullable operand's cell still holds a `(ref null …)` while the frame slot is non-null. Legacy
+// and the IR share it.
+export function listCatOperandTail(opIx: i32, binIx: i32, fnIx: i32) {
+  if catListKindOfBin(binIx, fnIx) <= 0 {
+    if exprNullableList(opIx, fnIx) { fbRefAsNonNull() }
+    return 0
+  }
+  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
+  svSyncRecv(opIx, fnIx)
   return 0
 }
 
-// List concat over every other list rep — the rep-parameterised twin of `emitListConcatI`,
-// instruction for instruction: one backing allocation sized `lenA + lenB`, two
-// `array.copy`s, one wrapper. A second function rather than a parameter on the first
-// because the i32 list stages operands in the LEQI frame and every other rep in its own LCAT frame — different slot types, not just a different base.
-function emitListConcatG(
-  leftIx: i32,
-  rightIx: i32,
-  fnIx: i32,
-  kind: i32,
-  slot: i32,
-  widen: i32,
-) {
+// List `+` at `binIx` once both operands are on the stack: one backing allocation sized
+// `lenA + lenB`, two `array.copy`s, one wrapper, through the i32 list's LEQI frame or the rep's
+// own LCAT frame. Legacy and the IR share it.
+export function listCatTail(binIx: i32, fnIx: i32): i32 {
+  const kind = catListKindOfBin(binIx, fnIx)
+  if kind <= 0 { return listCatWrite(leqIScratchBase, lTy(), aTy()) }
+  const slot = catSlotOfBin(binIx, fnIx)
   const bA = lcatBaseOfRep(kind, slot)
   if bA < 0 {
     // The scan and the emitter read ONE home (`catListKindOfBin`), so a missing frame is
@@ -19422,12 +19642,11 @@ function emitListConcatG(
       "emitProgram: list concat frame was not reserved for this rep",
     )
   }
-  const wrap = catWrapIdxOf(kind, slot)
-  const back = catBackIdxOf(kind, slot)
-  // Both operands reach the stack before the frame is written: the frame is shared per
-  // rep, so a concat nested in the right operand would otherwise overwrite A (D2331).
-  if emitCatOperand(leftIx, fnIx, kind, slot, widen == 1) < 0 { return -1 }
-  if emitCatOperand(rightIx, fnIx, kind, slot, widen == 2) < 0 { return -1 }
+  return listCatWrite(bA, catWrapIdxOf(kind, slot), catBackIdxOf(kind, slot))
+}
+
+// The concat over frame `bA` (A, B, out, n) of wrapper `wrap` and backing `back`.
+function listCatWrite(bA: i32, wrap: i32, back: i32): i32 {
   fbLocalSet(bA + 1)   // B
   fbLocalSet(bA + 0)   // A
   fbLocalGet(bA + 0)
@@ -19466,11 +19685,35 @@ function emitListConcatG(
   return 0
 }
 
+// List concat over every other list rep — the rep-parameterised twin of `emitListConcatI`: each
+// operand at the concat's rep (`emitCatOperand`), then the shared tail over the rep's LCAT frame.
+// Both operands reach the stack before the frame is written: the frame is shared per rep, so a
+// concat nested in the right operand would otherwise overwrite A (D2331).
+function emitListConcatG(
+  leftIx: i32,
+  rightIx: i32,
+  binIx: i32,
+  fnIx: i32,
+  kind: i32,
+  slot: i32,
+  widen: i32,
+) {
+  if lcatBaseOfRep(kind, slot) < 0 { return listCatTail(binIx, fnIx) }
+  if emitCatOperand(leftIx, binIx, fnIx, kind, slot, widen == 1) < 0 {
+    return -1
+  }
+  if emitCatOperand(rightIx, binIx, fnIx, kind, slot, widen == 2) < 0 {
+    return -1
+  }
+  return listCatTail(binIx, fnIx)
+}
+
 // One operand of `emitListConcatG`, left on the stack at concat rep `(kind, slot)`. A `widen`
 // operand is of the narrower rep (`catWidenSideOfBin`) and is copied into the concat's: boxed
 // into a union-box row as a spread group is, or converted element-wise for a scalar list.
 function emitCatOperand(
   opIx: i32,
+  binIx: i32,
   fnIx: i32,
   kind: i32,
   slot: i32,
@@ -19498,11 +19741,7 @@ function emitCatOperand(
     return emitScalarListWidenTop(listKindElemKind(sk), dk)
   }
   if emitExpr(opIx, fnIx) < 0 { return -1 }
-  // A NARROWED nullable operand's cell still holds a `(ref null …)` while the frame slot
-  // is non-null — the same recovery the compare cores make, off the same one home.
-  if emitEqRecoverNarrowed(opIx, fnIx) < 0 { return -1 }
-  svSyncRecv(opIx, fnIx)
-  return 0
+  return listCatOperandTail(opIx, binIx, fnIx)
 }
 
 // The reserved LCAT frame base for concat rep `(kind, slot)`, or -1, over the pair the
@@ -22235,6 +22474,12 @@ function emitUnionArmToPair(
     return emitFail("emitProgram: if-expression arm is not a value")
   }
   if emitUnionBoxOwed(unionName, unionTy, valIx, fnIx) < 0 { return -1 }
+  return unionBoxToPairTail(idx)
+}
+
+// After a binding sink arm's box: the construction just written popped into the sink pair, else
+// the box parked in the binding's local `idx` and its tag and payload read into the pair.
+export function unionBoxToPairTail(idx: i32) {
   if uBoxNewIsLast() {
     uBoxSinkToPair()
     return 0
@@ -22251,7 +22496,7 @@ function emitUnionArmToPair(
 
 // The rep's NULL into the sink pair (the else-less false path): the null tag and the
 // unread payload slot, written directly rather than through a box the merge would discard.
-function emitUnionNullToPair() {
+export function emitUnionNullToPair() {
   fbI32Rel(RS_TAG, nullBoxTag())
   fbLocalSet(unionSinkBase)
   fbRefNullNone() // the payload slot is unread under the null tag
@@ -22279,6 +22524,14 @@ function emitUnionArmBlockToPair(
       fnIx,
     ),
   )
+}
+
+// After a binding sink's `if`: the binding's one box built from the sink pair into local `idx`.
+export function unionLetSinkClose(idx: i32) {
+  fbLocalGet(unionSinkBase)
+  fbLocalGet(unionSinkBase + 1)
+  fbStructNew(uBoxIdx) // the binding's ONE box
+  return fbLocalSet(idx)
 }
 
 // `emitNullableIfBinding`'s rep-0 shape with every arm writing the sink pair instead of
@@ -24375,7 +24628,7 @@ function memOffsetNameConst(ix: i32, fnIx: i32): i64 {
 
 // The call's operand at declared position `k` of a memory intrinsic with `base` operands:
 // position 0 is the address, and at the offset form every later one sits one further right.
-function memCallArg(c: Call, base: i32, k: i32): i32 {
+export function memCallArg(c: Call, base: i32, k: i32): i32 {
   if k >= 1 && c.callArgs.length == base + 1 { return c.callArgs[k + 1] }
   return c.callArgs[k]
 }
@@ -24505,7 +24758,7 @@ function zextMaskValue(ix: i32, fnIx: i32): i64 {
 // The load call whose ZERO-extended i64 value the expression at `ix` provably is, or -1: a
 // `__load_u*_i64__` call, or `__load_u8__`/`__load_u16__` cast `as`/`as%` to i64 (non-negative,
 // so its sign-extension is its zero-extension). A masked form is `zextLoadMasked`'s.
-function zextLoadOf(ix: i32, fnIx: i32): i32 {
+export function zextLoadOf(ix: i32, fnIx: i32): i32 {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return -1 }
   const e = nodeAt(x)
@@ -24758,41 +25011,65 @@ function emitMemConstFoldLet(initIx: i32, k: i64, fnIx: i32, declIx: i32): i32 {
 }
 
 // Pushes the address of memory-intrinsic call `c` (`base` declared operands) and answers the
-// memarg offset, or -1 after an emit failure. A constant part moves into the offset only where
-// both forms name the same effective address: a constant address, `a + K` provably not
-// wrapping, or `a` a local the fold above already reduced to just its bounded part.
+// memarg offset, or -1 after an emit failure, along `memAddrPlanOf`'s arm.
 function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
+  const p = memAddrPlanOf(c, base, fnIx)
+  match p.maArm {
+    "bad" => {
+      emitFail(
+        "emitProgram: "
+          + name
+          + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
+      )
+      return -1
+    }
+    "lma" => {
+      lmaAddrNode = -1
+      if emitExprAsKind(p.maRest, 3, lmaCallerFn) < 0 { return -1 }
+      fbI32WrapI64()
+    }
+    "const" => fbI32Const(0)
+    "fold" => fbLocalGet(p.maRest)
+    "wide" => {
+      if emitExprAsKind(p.maRest, 3, fnIx) < 0 { return -1 }
+      fbI32WrapI64()
+    }
+    "rest" => {
+      if emitExpr(p.maRest, fnIx) < 0 { return -1 }
+    }
+  }
+  return p.maOff
+}
+
+// How memory-intrinsic call `c` (`base` declared operands) writes its address: `bad` refused,
+// `lma` an inlined accessor's i64 operand, `const` a constant (`i32.const 0`), `fold` folded local
+// `maRest`, `wide` i64 node `maRest` wrapped, `rest` node `maRest`. A constant part moves into
+// offset `maOff` only where both forms name the same effective address.
+export type MemAddrArm = "bad" | "lma" | "const" | "fold" | "wide" | "rest"
+export type MemAddrPlan = { maArm: MemAddrArm, maRest: i32, maOff: i64 }
+
+function memAddrAt(arm: MemAddrArm, rest: i32, off: i64): MemAddrPlan {
+  return { maArm: arm, maRest: rest, maOff: off }
+}
+
+export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
   let off: i64 = 0
   if c.callArgs.length == base + 1 {
     off = memOffsetConstValue(c.callArgs[1], fnIx)
   } else if c.callArgs.length != base {
     off = -1
   }
-  if off < 0 {
-    emitFail(
-      "emitProgram: "
-        + name
-        + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
-    )
-    return -1
-  }
+  if off < 0 { return memAddrAt("bad", -1, -1) }
   const addr = unwrapParen(c.callArgs[0])
   if addr >= 0 && addr == lmaAddrNode {
-    const lmaRest = lmaAddrRest
-    const lmaK = lmaAddrK
-    lmaAddrNode = -1
-    if emitExprAsKind(lmaRest, 3, lmaCallerFn) < 0 { return -1 }
-    fbI32WrapI64()
-    return lmaK + off
+    return memAddrAt("lma", lmaAddrRest, lmaAddrK + off)
   }
   if addr < 0 || addr >= P.nodes.length {
-    if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-    return off
+    return memAddrAt("rest", c.callArgs[0], off)
   }
   const whole = memAddrConst(addr, fnIx)
   if whole >= 0 && whole + off <= MEM_OFFSET_MAX {
-    fbI32Const(0)
-    return whole + off
+    return memAddrAt("const", -1, whole + off)
   }
   const a = nodeAt(addr)
   if a is Ident {
@@ -24800,8 +25077,7 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
     if mf >= 0 {
       const k = maFoldK[mf]
       if k + off <= MEM_OFFSET_MAX {
-        fbLocalGet(maFoldWasmSlot[mf])
-        return k + off
+        return memAddrAt("fold", maFoldWasmSlot[mf], k + off)
       }
     }
   }
@@ -24811,8 +25087,7 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
       const rest = memConstFoldRest(a, fnIx)
       const m = memAddrBound(rest, fnIx)
       if m >= 0 && m + kv + off <= MEM_OFFSET_MAX {
-        if emitExpr(rest, fnIx) < 0 { return -1 }
-        return kv + off
+        return memAddrAt("rest", rest, kv + off)
       }
     }
   }
@@ -24821,17 +25096,11 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
     if lk > 0 && lk + off < gLowMemUnused {
       const wide = memLowWrapped(addr, fnIx)
       const rest = memLowFoldRest(addr, fnIx)
-      if wide >= 0 {
-        if emitExprAsKind(rest, 3, fnIx) < 0 { return -1 }
-        fbI32WrapI64()
-      } else if emitExpr(rest, fnIx) < 0 {
-        return -1
-      }
-      return lk + off
+      if wide >= 0 { return memAddrAt("wide", rest, lk + off) }
+      return memAddrAt("rest", rest, lk + off)
     }
   }
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  return off
+  return memAddrAt("rest", c.callArgs[0], off)
 }
 
 // The i64 operand of an address `x as% i32` when `x` is an i64, else -1. Under
@@ -25998,38 +26267,104 @@ export function printScalarTail(arm: PrintArm): i32 {
   return 0
 }
 
-// The sub-i32 and wide store intrinsics of `emitCallCore`: the address, the value at its
-// declared width, then the store opcode. Returns 0 once emitted, -1 on failure.
-function emitCallCoreMemStore(c: Call, callee: Ident, fnIx: i32) {
-  const msOff = emitMemAddr(c, 2, fnIx, callee.identName)
-  if msOff < 0 { return -1 }
-  const msVal = memCallArg(c, 2, 1)
-  if memStoreValueIsI32(callee.identName) {
-    // `i32.store8` / `i32.store16` take an ordinary i32 and TRUNCATE it, so the
-    // value goes through the same spine as the address and as `__store_i32__`'s
-    // own value — no widening helper.
-    if emitExpr(msVal, fnIx) < 0 { return -1 }
-  } else if callee.identName == "__store_i64__" {
-    if emitWidened(msVal, 3, fnIx) < 0 { return -1 }
-  } else if callee.identName == "__store_f32__" {
-    if emitWidened(msVal, 5, fnIx) < 0 { return -1 }
-  } else {
-    if emitWidened(msVal, 4, fnIx) < 0 { return -1 }
-  }
-  // The same drift guard the load arm carries, for the same reason: the name list
-  // and the two tables are THREE lists over the same names in two files, and a
-  // width added to one and not the others would reach here with -1 and write it as
-  // an opcode byte — a silently invalid module. Unreachable while they agree.
-  const msOp = memStoreOpcode(callee.identName)
-  const msAlign = memStoreAlignExp(callee.identName)
-  if msOp < 0 || msAlign < 0 {
+// The load and store intrinsics of `emitCallCore`: the address, a store's value at its declared
+// width, then the access. Returns 0 once emitted, -1 on failure.
+function emitCallCoreMemAccess(c: Call, name: string, fnIx: i32) {
+  const p = memAccessPlanOf(name)
+  // The name list and the opcode tables are separate lists over one set of names: a width added
+  // to one and not the other would write -1 as an opcode byte. Unreachable while they agree.
+  if p.mxOp < 0 || p.mxAlign < 0 {
     return emitFail(
       "emitProgram: '"
-        + callee.identName
-        + "' is a declared store width with no opcode — the intrinsic-name list and the opcode table have drifted",
+        + name
+        + "' is a declared memory access width with no opcode — the intrinsic-name list and the opcode table have drifted",
     )
   }
-  fbMemAccess(msOp, msAlign, msOff)
+  const off = emitMemAddr(c, p.mxBase, fnIx, name)
+  if off < 0 { return -1 }
+  if p.mxBase == 2 {
+    const v = memCallArg(c, 2, 1)
+    const rc = if p.mxWiden < 0 { emitExpr(v, fnIx) } else { emitWidened(v, p.mxWiden, fnIx) }
+    if rc < 0 { return -1 }
+  }
+  return memAccessTail(p, off)
+}
+
+// The access a linear-memory intrinsic writes: its opcode and alignment exponent, its declared
+// operands before an optional constant offset (`mxBase`, 1 for a load and 2 for a store, 0 for no
+// such intrinsic), the kind a store's value widens to (`mxWiden`, -1 when it goes in as it
+// stands), and `mxI32` when the value stored or loaded is a plain i32.
+export type MemAccessPlan = {
+  mxOp: i32,
+  mxAlign: i32,
+  mxBase: i32,
+  mxWiden: i32,
+  mxI32: boolean,
+}
+
+export function memAccessPlanOf(name: string): MemAccessPlan {
+  if name == "__store_i32__" {
+    return {
+      mxOp: OP_I32_STORE,
+      mxAlign: 2,
+      mxBase: 2,
+      mxWiden: -1,
+      mxI32: true,
+    }
+  }
+  if name == "__load_i32__" {
+    return {
+      mxOp: OP_I32_LOAD,
+      mxAlign: 2,
+      mxBase: 1,
+      mxWiden: -1,
+      mxI32: true,
+    }
+  }
+  if nameIsMemStoreIntrinsic(name) {
+    const plain = memStoreValueIsI32(name)
+    const w = if plain { -1 } else if name == "__store_i64__" { 3 } else if name == "__store_f32__" { 5 } else { 4 }
+    return {
+      mxOp: memStoreOpcode(name),
+      mxAlign: memStoreAlignExp(name),
+      mxBase: 2,
+      mxWiden: w,
+      mxI32: plain,
+    }
+  }
+  if nameIsMemLoadIntrinsic(name) {
+    return {
+      mxOp: memLoadOpcode(name),
+      mxAlign: memLoadAlignExp(name),
+      mxBase: 1,
+      mxWiden: -1,
+      mxI32: name == "__load_i8__"
+        || name == "__load_u8__"
+        || name == "__load_i16__"
+        || name == "__load_u16__",
+    }
+  }
+  return { mxOp: -1, mxAlign: -1, mxBase: 0, mxWiden: -1, mxI32: false }
+}
+
+// Whether call `c` is a linear-memory load or store intrinsic: the spelling, with no binding
+// owning the name. Legacy's `emitCallCore` and the IR's builder route on it.
+export function memAccessCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return false }
+  const nm = f.identName
+  if nm != "__store_i32__" && nm != "__load_i32__" {
+    if !nameIsMemStoreIntrinsic(nm) && !nameIsMemLoadIntrinsic(nm) {
+      return false
+    }
+  }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// After the address and a store's value: the access at memarg offset `off`. Returns 0.
+export function memAccessTail(p: MemAccessPlan, off: i64): i32 {
+  fbMemAccess(p.mxOp, p.mxAlign, off)
   return 0
 }
 
@@ -26052,28 +26387,6 @@ function emitCallCoreMemBulk(c: Call, callee: Ident, fnIx: i32) {
   } else {
     fbMemBulk(MISC_MEMORY_FILL, 1)
   }
-  return 0
-}
-
-// The load intrinsics of `emitCallCore` other than `__load_i32__`. Returns 0 once emitted, -1
-// on failure.
-function emitCallCoreMemLoad(c: Call, callee: Ident, fnIx: i32) {
-  const mlOff = emitMemAddr(c, 1, fnIx, callee.identName)
-  if mlOff < 0 { return -1 }
-  // the guard above and the two tables below are three lists keyed by the same
-  // names, in two files: a fourth width added to one and not the others would
-  // reach here with -1 and write it as an opcode byte, a silently invalid module.
-  // Unreachable while the lists agree, and free when they do.
-  const mlOp = memLoadOpcode(callee.identName)
-  const mlAlign = memLoadAlignExp(callee.identName)
-  if mlOp < 0 || mlAlign < 0 {
-    return emitFail(
-      "emitProgram: '"
-        + callee.identName
-        + "' is a declared load width with no opcode — the intrinsic-name list and the opcode table have drifted",
-    )
-  }
-  fbMemAccess(mlOp, mlAlign, mlOff)
   return 0
 }
 
@@ -26409,27 +26722,10 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if !userOwnsName && callee.identName == "print" {
     return emitCallCorePrint(callIx, c, fnIx)
   }
-  // The linear-memory intrinsics, lowered inline (the host defines `__store_i32__`/
-  // `__load_i32__` as one-instruction wasm functions): store/load become
-  // `i32.store`/`i32.load` directly; `__log__` calls the synthetic in-module decoder
-  // at `gMemLogIdx` (see `irMemLogFnCode`).
-  if !userBindsName && callee.identName == "__store_i32__" {
-    const s32Off = emitMemAddr(c, 2, fnIx, "__store_i32__")
-    if s32Off < 0 { return -1 }
-    if emitExpr(memCallArg(c, 2, 1), fnIx) < 0 { return -1 }
-    fbMemAccess(OP_I32_STORE, 2, s32Off)
-    return 0
-  }
-  if !userBindsName && callee.identName == "__load_i32__" {
-    const l32Off = emitMemAddr(c, 1, fnIx, "__load_i32__")
-    if l32Off < 0 { return -1 }
-    fbMemAccess(OP_I32_LOAD, 2, l32Off)
-    return 0
-  }
-  // The five other store widths (`buffer-design.md` §C2): push the address, then the
-  // value at its own declared width, then the opcode at its natural alignment.
-  if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
-    return emitCallCoreMemStore(c, callee, fnIx)
+  // Every load and store width (`buffer-design.md` §C2), lowered inline: the address, a store's
+  // value at its declared width, then the opcode at its natural alignment (`memAccessPlanOf`).
+  if memAccessCallNamed(c, fnIx) {
+    return emitCallCoreMemAccess(c, callee.identName, fnIx)
   }
   // the bulk pair (`buffer-design.md` §C3): three i32 operands
   // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
@@ -26437,12 +26733,6 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // arbitrary expressions' side effects.
   if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
     return emitCallCoreMemBulk(c, callee, fnIx)
-  }
-  // The ten other load widths (`buffer-design.md` §C2): push the address, write the
-  // opcode at its natural alignment — the per-width difference is exactly two bytes,
-  // held in `memLoadOpcode`/`memLoadAlignExp`. `__load_i32__` keeps its own arm above.
-  if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
-    return emitCallCoreMemLoad(c, callee, fnIx)
   }
   // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
   // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
@@ -26676,8 +26966,8 @@ function emitCallRefArg(
   args: i32[],
   i: i32,
 ) {
-  // Whether the argument takes the general arm with nothing owed (`callRefPlainKey`'s plain path).
-  let argPlainArm = false
+  // Whether the argument is one the IR writes as legacy does (`callRefPlainKey`'s plain path).
+  const argPlainArm = callRefArgPlain(callIx, fnIx, ckey, args[i], i)
   // D940 — the struct row the functype declares, seeded exactly as the direct call
   // seeds it from `paramStructIdxOf`: an object-literal argument otherwise resolves
   // its own row by field set, the pre-merge row wherever the callee's parameter row
@@ -26759,13 +27049,6 @@ function emitCallRefArg(
       // recover a `null` argument into a nullable parameter, a trap (D2552).
       // A narrowed struct argument is unboxed at the key's slot, as a direct call does (D1723).
       const pkOwed = pkk != null && narrowedArmNeedsUnbox(args[i], fnIx)
-      argPlainArm = !pkOwed
-        && (pkk == "i32"
-        || pkk == "i64"
-        || pkk == "f64"
-        || pkk == "f32"
-        || pkk == "str"
-        || pkk == "struct" && !exprNullableRecord(args[i], fnIx))
       const pkHeap = if pkk != null { armDestHeapOf(pkk, sigParamSlotAt(ckey, i)) } else { -1 }
       const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
@@ -26777,21 +27060,40 @@ function emitCallRefArg(
   return if argPlainArm { 1 } else { 0 }
 }
 
-// Whether argument `a` takes `emitCallRefArg`'s general arm with nothing owed: a scalar of its
-// parameter's own width, a string, or a record neither unboxed from a narrowing nor nullable.
-function callRefArgPlain(
+// Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
+// number, or the general arm with nothing owed at a scalar of the argument's own width, a string,
+// a record neither unboxed from a narrowing nor nullable, or a non-null closure, list or map.
+export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
   ckey: string,
   a: i32,
   i: i32,
 ): boolean {
-  if callRefArgArmOf(callIx, fnIx, ckey, a, i) != "general" { return false }
+  const arm = callRefArgArmOf(callIx, fnIx, ckey, a, i)
+  if arm == "widenI64" || arm == "widenF64" || arm == "widenF32" { return true }
+  if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
   const k = sigParamKindAt(ckey, i)
   if k == "str" { return true }
   if k == "struct" {
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
+  }
+  if k == "closure" { return !exprNulClosure(a, fnIx) }
+  if (
+    k == "list"
+    || k == "strlist"
+    || k == "f64list"
+    || k == "i64list"
+    || k == "f32list"
+    || k == "reflist"
+    || k == "map"
+  ) {
+    return !narrowedArmNeedsUnbox(a, fnIx)
+      && !exprNullableList(a, fnIx)
+      && exprNulScalarListKind(a, fnIx) == null
+      && !exprNullableRefArray(a, fnIx)
+      && !exprNullableMap(a, fnIx)
   }
   return (k == "i32" || k == "i64" || k == "f64" || k == "f32")
     && exprScalarWidth(a, fnIx) == k
@@ -27163,7 +27465,10 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
     if !fieldCallRefPlainHead(callIx, c, callee, fnIx) { return "" }
     return callRefPlainTail(callIx, c, fnIx)
   }
-  if !(callee is Ident) { return "" }
+  if !(callee is Ident) {
+    if !exprCallRefPlainHead(callIx, c, fnIx) { return "" }
+    return callRefPlainTail(callIx, c, fnIx)
+  }
   const nm = callee.identName
   const d = identDeclOf(c.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
@@ -27208,6 +27513,14 @@ function fieldCallRefPlainHead(
     && placeRecordSigs(callIx, fnIx).length == 0
 }
 
+// `callRefPlainKey`'s head for any other callee expression (`f()(x)`, `fs[0](x)`), which
+// `emitCallCore` sends to `emitCallRef` when it is a closure: no bundle and no held record.
+function exprCallRefPlainHead(callIx: i32, c: Call, fnIx: i32): boolean {
+  return exprIsClosure(c.callFn, fnIx)
+    && bundleParamOfRead(c.callFn, fnIx) < 0
+    && placeRecordSigs(callIx, fnIx).length == 0
+}
+
 // The part of `callRefPlainKey` every callee shares: no lift, nullable value or top-level
 // lambda's record, an interned key, no refusal, and each argument a scalar at its parameter's
 // own valtype.
@@ -27217,13 +27530,30 @@ function callRefPlainTail(callIx: i32, c: Call, fnIx: i32): string {
   }
   if topLambdaRecordFe(c.callFn) >= 0 { return "" }
   const ckey = cloCallSigKey(callIx, fnIx)
-  if ckey == "" || cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
-  const n = c.callArgs.length
-  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if ckey == "" { return "" }
   if (
     cloCallUnionResultUnrepresentable(callIx, fnIx)
     || cloCallReflistElemTwin(callIx, fnIx)
-    || fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
+  ) {
+    return ""
+  }
+  return callRefPlainArgsTail(callIx, c, fnIx, ckey)
+}
+
+// The part of the plain closure call `emitCallRefAt` writes at key `ckey`, which a bundle call
+// shares: an interned signature, no split set, each argument plain, and no wider result read
+// narrower; `ckey` when it holds, else "".
+function callRefPlainArgsTail(
+  callIx: i32,
+  c: Call,
+  fnIx: i32,
+  ckey: string,
+): string {
+  if cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
+  const n = c.callArgs.length
+  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if (
+    fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
     || closureCallSetSplits(nodeTyAt(c.callFn, fnIx), elabSrcDecl(fnIx))
   ) {
     return ""
@@ -27511,24 +27841,59 @@ function emitBundleChoiceArg(arg: i32, bt: i32, sigs: i32[], fnIx: i32): i32 {
 // Call `c` through a parameter holding a bundle: the closure for the call's own signature, read
 // from its field and called at that signature. 1 where the callee holds no bundle.
 function emitBundleCall(callIx: i32, c: Call, fnIx: i32): i32 {
-  const par = bundleParamOfRead(c.callFn, fnIx)
-  if par < 0 { return 1 }
-  const sigs = bundleSigsOfParam(par)
-  const si = paramStructIdxOf(par)
-  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
-  const fi = sFieldIndex(si, "c" + i32ToStr(k))
-  if k < 0 || fi < 0 || si < 0 || si >= sHeapIdx.length {
+  if bundleParamOfRead(c.callFn, fnIx) < 0 { return 1 }
+  const pk = bundlePickOf(callIx, fnIx)
+  if pk.bpField < 0 {
     return emitFailAt(
       "emitProgram: a call through a lambda called at two signatures matches none of them",
       callIx,
     )
   }
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
-  fbStructGet(sHeapIdx[si], fi)
+  fbStructGet(pk.bpHeap, pk.bpField)
   const crDepth = callRefDepth
-  const crSlot = callRefNestSlot(callRefDepth)
-  fbLocalSet(crSlot)
-  return emitCallRefAt(callIx, c, fnIx, sigKeyOfTy(sigs[k]), crDepth, crSlot)
+  const crSlot = callRefStash()
+  if irShadowOn { callRefLegacyPlain[callIx] = "" }
+  const rc = emitCallRefAt(callIx, c, fnIx, pk.bpKey, crDepth, crSlot)
+  if rc >= 0 && irShadowOn && callRefLastPlain {
+    callRefLegacyPlain[callIx] = pk.bpKey
+  }
+  return rc
+}
+
+// The member a call `callIx` through a bundle parameter (D14841) reads in frame `fnIx`: the
+// record's heap, field `c<k>`, that closure's type and its `$fnsig` key; `bpField` -1 for none.
+export type BundlePick = { bpHeap: i32, bpField: i32, bpTy: i32, bpKey: string }
+
+export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) { return none }
+  const par = bundleParamOfRead(c.callFn, fnIx)
+  if par < 0 { return none }
+  const sigs = bundleSigsOfParam(par)
+  const si = paramStructIdxOf(par)
+  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
+  const fi = sFieldIndex(si, "c" + i32ToStr(k))
+  if k < 0 || k >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return none
+  }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: sigs[k],
+    bpKey: sigKeyOfTy(sigs[k]),
+  }
+  return pk
+}
+
+// `callRefPlainKey` for a call through a bundle parameter, at its member's key; "" for any other.
+export function bundleCallRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const pk = bundlePickOf(callIx, fnIx)
+  if pk.bpField < 0 || pk.bpKey == "" { return "" }
+  return callRefPlainArgsTail(callIx, c, fnIx, pk.bpKey)
 }
 
 // Whether `arg` reads a `const` holding a returned record whole in function `fnIx`.
@@ -27924,25 +28289,28 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   return 0
 }
 
-// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32,
-// string, scalar-width, byte or plain reference list whose value builds as itself or widens, with
-// no arm unbox.
-export function idxStorePlainWhy(
-  st: IdxStore,
-  arrIx: i32,
-  rhs: i32,
-  fnIx: i32,
-): string {
-  if st.nestSlot >= 0 || st.unionNm != "" { return "store element" }
-  if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
-    return "store element seed"
+// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": a scalar,
+// string, atom, niche or plain reference list's value built as itself or widened, a union list's
+// that the record boxes or is already a named union, or a nested list's that is no literal (an atom
+// into a string list decodes); with no arm unbox at a record row.
+export function idxStorePlainWhy(st: IdxStore, rhs: i32, fnIx: i32): string {
+  if (
+    st.unionNm != ""
+    && !boxOwedAt(rhs, fnIx)
+    && !(exprUnion(rhs, fnIx) && boxTyName(nodeTyAt(rhs, fnIx)) != "")
+  ) {
+    return "store element"
   }
-  if arrElemIsNulBoolAt(arrIx, fnIx) || arrElemIsNullUnitAt(arrIx, fnIx) {
-    return "store element seed"
+  if st.nestSlot >= 0 && nodeAt(unwrapParen(rhs)) is ArrayLit {
+    return "store element"
   }
-  if nodeArrayElemIsNulStr(arrIx) { return "store element seed" }
-  if exprIsLitAtom(rhs, fnIx) { return "store atom" }
-  if narrowedArmNeedsUnbox(rhs, fnIx) { return "store arm" }
+  // The arm unbox casts at the element's own row; a store with none writes no cast.
+  if (
+    narrowedArmNeedsUnbox(rhs, fnIx)
+    && (st.variantIdx >= 0 || st.structIdx >= 0)
+  ) {
+    return "store arm"
+  }
   return ""
 }
 
@@ -27975,75 +28343,108 @@ function emitVariantFieldWrite(vi: i32, fi: i32, rhs: i32, fnIx: i32): i32 {
   return fieldStoreVariantTail(vi, fi)
 }
 
-// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its
-// target context already applied: a box union coerces into the box, a literal-union atom widens
-// or lowers as its id, a scalar re-encodes, a niche seeds its null. Returns 0, or -1 failed.
+// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its target context already
+// applied, through the arm `fieldStoreValueArmOf` names. Returns 0, or -1 failed.
 function emitStructFieldStoreValue(
   si: i32,
   fieldIdx: i32,
   rhs: i32,
   fnIx: i32,
 ): i32 {
-  const k = fieldRowKind(sFieldStart[si] + fieldIdx)
-  if k == null {
-    return emitFail("emitProgram: struct field has no storage kind")
-  }
-  // The bare value's one home, which the IR's field store reads too.
-  if fieldStoreValuePlain(si, fieldIdx, rhs, fnIx) {
-    return if emitExpr(rhs, fnIx) < 0 { -1 } else { 0 }
-  }
-  match k {
-    "union" => {
-      // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
-      if (emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx) < 0) {
-        return -1
-      }
-    }
-    "str" => {
-      // A literal-union atom assigned to a `string` field widens to its member string.
-      if emitAtomToStr(rhs, fnIx) < 0 { return -1 }
-    }
-    "nulstr" => {
-      // A `string | null` slot takes the same widen; a widened member string is non-null.
-      if emitStrValue(rhs, fnIx) < 0 { return -1 }
-    }
-    "f64" | "i64" | "f32" => {
-      // A wide scalar field widens its RHS at the store boundary, as the construct does.
-      if emitScalarFieldStoreVal(rhs, fnIx, k) < 0 { return -1 }
-    }
+  const rc = match fieldStoreValueArmOf(si, fieldIdx, rhs, fnIx) {
+    "noKind" => emitFail("emitProgram: struct field has no storage kind")
+    "plain" => emitExpr(rhs, fnIx)
+    // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
+    "box" => emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx)
+    // A literal-union atom assigned to a `string` field widens to its member string.
+    "atomToStr" => emitAtomToStr(rhs, fnIx)
+    // A `string | null` slot takes the same widen; a widened member string is non-null.
+    "strValue" => emitStrValue(rhs, fnIx)
+    // A wide scalar field widens its RHS at the store boundary, as the construct does.
+    "f64" => emitWidened(rhs, 4, fnIx)
+    "i64" => emitWidened(rhs, 3, fnIx)
+    "f32" => emitWidened(rhs, 5, fnIx)
+    // The `null` unit type's slot, the construct arm's twin (D4671).
     "nulnone" => {
-      // The `null` unit type's slot, the construct arm's twin (D4671).
       if emitNulNoneForEffect(rhs, fnIx) < 0 { return -1 }
       fbRefNullNone()
     }
-    "nulstruct" | "nulvariant" => {
-      // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
-      // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
-      if emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx)) < 0 {
-        return -1
-      }
-    }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" => {
-      return fieldStorePlainMissed()
-    }
-    "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" => {
-      return fieldStorePlainMissed()
-    }
-    "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" => {
-      return fieldStorePlainMissed()
-    }
-    "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      return fieldStorePlainMissed()
-    }
+    // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
+    // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
+    "armDelivery" => emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx))
+    "unencodable" => fieldStorePlainMissed()
   }
-  return 0
+  return if rc < 0 { -1 } else { 0 }
 }
 
-// A field kind `fieldStoreValuePlain` always answers plain, reaching the non-plain ladder.
+// A kind `fieldStoreValuePlain` always answers plain, reaching the non-plain arms.
 function fieldStorePlainMissed() {
   return emitFail(
     "emitProgram: a plain field value reached the field store's re-encode ladder",
   )
+}
+
+// How a field store writes its value, decided once for legacy and the IR: the bare value, a box,
+// an atom widened to its string, a scalar widened to the field's width, the `null` unit's seed, or
+// a narrowed record arm's delivery; `unencodable` is a kind the plain check always answers plain,
+// reached only if the two disagree, and refused.
+export type FieldStoreValArm = "noKind"
+  | "plain"
+  | "box"
+  | "atomToStr"
+  | "strValue"
+  | "f64"
+  | "i64"
+  | "f32"
+  | "nulnone"
+  | "armDelivery"
+  | "unencodable"
+
+// The arm `emitStructFieldStoreValue` writes `rhs` into field `fi` of struct row `si` at.
+export function fieldStoreValueArmOf(
+  si: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): FieldStoreValArm {
+  if si < 0 || si >= sFieldStart.length { return "noKind" }
+  const k = fieldRowKind(sFieldStart[si] + fi)
+  if k == null { return "noKind" }
+  if fieldStoreValuePlain(si, fi, rhs, fnIx) { return "plain" }
+  return match k {
+    "union" => "box"
+    "str" => "atomToStr"
+    "nulstr" => "strValue"
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "nulnone" => "nulnone"
+    "nulstruct" | "nulvariant" => "armDelivery"
+    // `fieldStoreValuePlain` answers plain for every other kind.
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "unencodable"
+  }
+}
+
+// The arm `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` at: the bare
+// value, a box, a scalar widened to the field's width, or a literal-union atom as its string.
+export function variantFieldStoreValueArmOf(
+  vi: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): FieldStoreValArm {
+  if fieldStoreVariantValuePlain(vi, fi, rhs, fnIx) { return "plain" }
+  const k = eqRowFieldKind(-1 - vi, fi)
+  if k == null { return "unencodable" }
+  return match k {
+    "union" => "box"
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "str" | "nulstr" => "strValue"
+    // `fieldStoreVariantValuePlain` answers plain for every other kind.
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "unencodable"
+  }
 }
 
 // `emitAssignUnder`'s arm over a field target `o.f = v`: through a narrowed union box, into
@@ -28185,7 +28586,7 @@ export function fieldStoreStructAt(lhsIx: i32, fnIx: i32): i32[] {
 
 // Whether `emitStructFieldStoreValue` writes `rhs` into field `fieldIdx` of row `si` as the bare
 // value (`emitExpr`), with no box, atom widen, scalar re-encode or niche seed around it.
-export function fieldStoreValuePlain(
+function fieldStoreValuePlain(
   si: i32,
   fieldIdx: i32,
   rhs: i32,
@@ -28231,7 +28632,7 @@ export function fieldStoreVariantAt(lhsIx: i32, fnIx: i32): i32[] {
 
 // Whether `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` as the bare value
 // (`emitExpr`), with no box, scalar re-encode or atom widen around it.
-export function fieldStoreVariantValuePlain(
+function fieldStoreVariantValuePlain(
   vi: i32,
   fi: i32,
   rhs: i32,
@@ -32809,10 +33210,7 @@ function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
         if (emitUnionIfBindingSink(s.letInit, idx, nulNm, nulTy, fnIx) < 0) {
           return -1
         }
-        fbLocalGet(unionSinkBase)
-        fbLocalGet(unionSinkBase + 1)
-        fbStructNew(uBoxIdx) // the binding's ONE box
-        fbLocalSet(idx)
+        unionLetSinkClose(idx)
         scopeBind(s.letName, slot)
         return 0
       }
@@ -33375,12 +33773,21 @@ function emitDeadValueArm(blockIx: i32): i32 {
 // and generally unable to lower. The caller pads with `unreachable` to stay stack-polymorphic.
 function monoStaticGuardEndsBlock(stmtIx: i32, fnIx: i32) {
   const s = nodeAt(stmtIx)
-  if s is IfStmt {
-    if negGuardDecidedTrue(s.ifCond, fnIx) { return stmtAlwaysExits(s.ifThen) }
-    if monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
-    return stmtAlwaysExits(s.ifThen)
-  }
-  return false
+  if !(s is IfStmt) { return false }
+  const k = if negGuardDecidedTrue(s.ifCond, fnIx) { 1 } else { -1 }
+  return guardEndsBlockWith(stmtIx, k, fnIx)
+}
+
+// Whether statement `if` `ifIx`, its condition written as constant `k` (-1 for none), ends its
+// block: a `!is` decided true, or a record guard the instance decides true, over an always-exiting
+// then arm. The rest of the block is then cut behind an `unreachable` (D932).
+export function guardEndsBlockWith(ifIx: i32, k: i32, fnIx: i32): boolean {
+  const s = nodeAt(ifIx)
+  if !(s is IfStmt) { return false }
+  const c = nodeAt(unwrapParen(s.ifCond))
+  const negTrue = k == 1 && c is Unary && c.unOp == "!"
+  if !negTrue && monoStaticIsGuardOf(s.ifCond, fnIx) != 1 { return false }
+  return stmtAlwaysExits(s.ifThen)
 }
 
 // The function, condition node and emitted constant (`staticIsGuard`) of the most recently
@@ -33972,22 +34379,12 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   const frProof = rangeProofOpen(s, stmtIx, stepK, dynStep)
   // Bind the loop var for the body (mirrors the collect pass's scopeBind).
   scopeBind(s.frVar, vSlot)
-  const aConst = rangeConstIs(s.frFrom, fnIx)
-  let aVal = 0
-  if aConst { aVal = rangeConstVal(s.frFrom, fnIx) }
-  let trips = -1
-  if aConst && bConst && !dynStep {
-    trips = rangeUnrollTrips(s, aVal, bVal, stepK, fnIx)
-  }
-  // A constant range a getter runs is always unrolled, so its lowering holds no loop (§D3a): the
-  // step budget charges a trip at least one step, which keeps it within `UNROLL_MAX_TRIPS`.
-  const gTrips = getterRangeTrips(stmtIx, fnIx)
+  // The arm is the one decision the IR reads too (`forRangeArm`).
+  const arm = forRangeArm(s, stmtIx, fnIx)
   let rc = 0
-  if gTrips >= 0 {
-    const parts = constRangeParts(stmtIx)
-    rc = emitRangeUnrolled(s, fnIx, vIdx, parts[0], parts[2], gTrips)
-  } else if trips > 0 {
-    rc = emitRangeUnrolled(s, fnIx, vIdx, aVal, stepK, trips)
+  if arm == "unrolled" {
+    const plan = forRangeUnrollPlan(s, stmtIx, fnIx)
+    rc = emitRangeUnrolled(s, fnIx, vIdx, plan[0], plan[1], plan[2])
   } else {
     const rt: RangeTest = {
       vIdx: vIdx,
@@ -34000,7 +34397,7 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
       excl: s.frExcl,
     }
     const wraps = rangeMayWrap(s, rt)
-    if rangePartialUnrollOk(s, stepK, dynStep, fnIx) {
+    if arm == "partial" {
       rc = emitRangePartial(s, fnIx, rt, wraps)
     } else {
       rc = emitRangeRolled(s, fnIx, rt, wraps)
@@ -34011,6 +34408,91 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   // The loop variable's scope is the loop (see `scopeUnbind`).
   scopeUnbind()
   return rc
+}
+
+// The arm `emitForRangeStmt` writes range loop `s` (statement `stmtIx` of `fnIx`) in, the one
+// decision legacy and the IR both read: "unrolled" for its copies (`forRangeUnrollPlan`, a
+// getter's constant range included), "partial" for the 4x main loop, else "rolled".
+export function forRangeArm(s: ForRange, stmtIx: i32, fnIx: i32): string {
+  if forRangeUnrollPlan(s, stmtIx, fnIx).length == 3 { return "unrolled" }
+  const dyn = !forRangeStepIsConst(s.frStep)
+  const k = if dyn { 1 } else { forRangeStaticStep(s) }
+  if rangePartialUnrollOk(s, k, dyn, fnIx) { return "partial" }
+  return "rolled"
+}
+
+// Legacy's full unroll of range loop `s` (statement `stmtIx` of `fnIx`): its first value, its
+// step and its trip count; none for a loop it does not unroll. A getter's constant range is
+// always unrolled, so its lowering holds no loop (§D3a).
+export function forRangeUnrollPlan(s: ForRange, stmtIx: i32, fnIx: i32): i32[] {
+  const none: i32[] = []
+  const g = getterRangeTrips(stmtIx, fnIx)
+  if g >= 0 {
+    const parts = constRangeParts(stmtIx)
+    return [parts[0], parts[2], g]
+  }
+  if !forRangeStepIsConst(s.frStep) { return none }
+  const k = forRangeStaticStep(s)
+  if k == 0 || !rangeConstIs(s.frFrom, fnIx) || !rangeConstIs(s.frTo, fnIx) {
+    return none
+  }
+  const a = rangeConstVal(s.frFrom, fnIx)
+  const t = rangeUnrollTrips(s, a, rangeConstVal(s.frTo, fnIx), k, fnIx)
+  return if t > 0 { [a, k, t] } else { none }
+}
+
+// What keeps a range loop of arm "rolled" from the IR: a dynamic step, a wrap exit
+// (`rangeMayWrap`), or a hoist or range proof legacy may open. Those two read only the tree, not
+// the live rows `loopHoistOpen` and `rangeProofOpen` consult at emit time, since a claim is decided
+// before legacy writes the function; each answers yes wherever legacy might. "" for none.
+export function forRangeRolledBlock(
+  s: ForRange,
+  stmtIx: i32,
+  fnIx: i32,
+): string {
+  if !forRangeStepIsConst(s.frStep) { return "dynamic step" }
+  const k = forRangeStaticStep(s)
+  if k == 0 { return "step" }
+  if loopHoistCands(-1, s.frBody, fnIx, stmtIx, -1).length > 0 {
+    return "hoisted"
+  }
+  if (
+    k > 0
+    && exprIsNonNegIntLit(s.frFrom)
+    && hoistPathDecl(rangeTopLenOf(s)) >= 0
+  ) {
+    return "proven"
+  }
+  const bConst = rangeConstIs(s.frTo, fnIx)
+  const rt: RangeTest = {
+    vIdx: -1,
+    bIdx: -1,
+    bConst: bConst,
+    bVal: if bConst { rangeConstVal(s.frTo, fnIx) } else { 0 },
+    sIdx: -1,
+    dynStep: false,
+    stepK: k,
+    excl: s.frExcl,
+  }
+  if rangeMayWrap(s, rt) { return "wrap exit" }
+  return ""
+}
+
+// The static step of range loop `s`: 1 when it has none, else its folded integer literal; 0 when
+// none folds into an `i32`, a step the checker refuses.
+export function forRangeStaticStep(s: ForRange): i32 {
+  if s.frStep < 0 { return 1 }
+  const litIx = cexLitPeel(s.frStep)
+  if litIx < 0 { return 0 }
+  const lit = nodeAt(litIx)
+  if !(lit is NumLit) { return 0 }
+  const t = lit.numText
+  const neg = intLitIsNegated(s.frStep)
+  if numLexIsFloat(t) || !(numLexFitsI32(t) || neg && numLexIs2Pow31(t)) {
+    return 0
+  }
+  const k = parseI32(t)
+  return if neg { 0 - k } else { k }
 }
 
 // A range loop's continue test, its operands resolved: the loop var's local, the bound's local
@@ -34593,24 +35075,23 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 }
 
 // The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
-// box, a record or an `i32` list, each read whole into the loop variable.
+// box, a record, or an `i32`, string or byte list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" => true
-    "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "nulstr" | "variant" | "nulstruct" | "i64" | "f64" => true
+    "reflist" | "map" | "nulvariant" | "f64list" | "f32" | "closure" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
 // Why `for` statement `s` at `stmtIx` is not the plain walk, or "": a list of a `forInElemPlain`
-// kind, a string's code points or a map's keys or values, read once; no second name, byte source
-// or node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
+// kind, a string's code points or a map's keys or values, read once; no second name or
+// node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
 // nothing is hoisted or unrolled ("hoisted" where it is). A literal iterable is a list literal.
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return "iterable" }
   if !forInElemPlain(ek) { return "element " + ek }
-  if forInU8Src(s.fiIter, fnIx) { return "byte source" }
   if s.fiVar2 != "" { return "pair" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
@@ -38298,14 +38779,6 @@ let njBlockKind: VKind = "i32"
 let njLLit = false
 let njRLit = false
 
-// The value-atom kind of numeric primitive type `t` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
-function njKindOfTy(t: i32): i32 {
-  if tyPrimNameOf(t) == null { return -1 }
-  const k = boxTagOfTy(t)
-  if k == 0 || k == 3 || k == 4 || k == 5 { return k }
-  return -1
-}
-
 // Whether the value at `ix` is a two-base integer-literal union rather than a numeric union: its
 // members are constants, so an operator over it computes at the common width `i64` (D3512).
 function njIsLitSide(ix: i32, fnIx: i32): boolean {
@@ -38616,23 +39089,6 @@ function njConvertArm(ms: i32[], i: i32, bs: i32, to: i32) {
   return 0
 }
 
-// The destination kind a numeric member of kind `k` is stored at in a union of kinds `dk`: its
-// own, else the one it widens to exactly (`i64` then `f64` for `i32`, `f64` for `f32`); -1 none.
-function njStoreKind(k: i32, dk: i32[]): i32 {
-  for d in dk {
-    if d == k { return k }
-  }
-  let w: i32[] = []
-  if k == 0 { w = [3, 4] }
-  if k == 5 { w = [4] }
-  for c in w {
-    for d in dk {
-      if d == c { return c }
-    }
-  }
-  return -1
-}
-
 // A numeric union at `ix` delivered to the union `unionName` that lacks one of its members but
 // holds a member it widens to: re-boxed member by member. 1 done, 0 not this shape, -1 failure.
 function emitNumUnionRebox(
@@ -38641,20 +39097,10 @@ function emitNumUnionRebox(
   unionTy: i32,
   fnIx: i32,
 ): i32 {
-  if unionName == "" || !nodeIsNumUnion(ix, fnIx) { return 0 }
-  // A delivery the checker recorded a re-tag for is re-tagged as it is emitted.
-  if mapDeliveryRecorded && deliveryRetagHas(ix) { return 0 }
+  if unionName == "" || !numUnionReboxes(ix, unionTy, fnIx) { return 0 }
   const ms = njMembersOf(ix, fnIx)
   const dk: i32[] = []
-  if !msMemberValKindsOf(msSetOfTyAny(unionTy), dk) { return 0 }
-  let needs = false
-  for m in ms {
-    const k = njKindOfTy(m)
-    const sk = njStoreKind(k, dk)
-    if sk < 0 { return 0 }
-    if sk != k { needs = true }
-  }
-  if !needs { return 0 }
+  msMemberValKindsOf(msSetOfTyAny(unionTy), dk)
   const key = njDepth * 2
   njDepth = njDepth + 1
   const bs = njStash(ix, true, key, fnIx)
@@ -39588,29 +40034,27 @@ function emitBinRefOps(e: BinExpr, exprIx: i32, fnIx: i32) {
   // elements) and list `+` (concat) — collections-design §VL.4/§VL.6, inlined rather than
   // helper calls. List `+` over a rep other than the i32 list is checked above the compare
   // dispatch, because `listOpKindOfBin` claims a string list it has no concat for.
-  if e.binOp == "+" {
+  const cat = listCatRouteOf(e, exprIx, fnIx)
+  if cat == "refused" {
+    return emitFail(
+      "emitProgram: list concat over this element kind is not supported",
+    )
+  }
+  if cat != "none" {
     const catK = catListKindOfBin(exprIx, fnIx)
-    if catK > 0 {
-      return emitListConcatG(
-        e.binLeft,
-        e.binRight,
-        fnIx,
-        catK,
-        catSlotOfBin(exprIx, fnIx),
-        catWidenSideOfBin(exprIx, fnIx),
-      )
-    }
+    if catK <= 0 { return emitListConcatI(e.binLeft, e.binRight, exprIx, fnIx) }
+    return emitListConcatG(
+      e.binLeft,
+      e.binRight,
+      exprIx,
+      fnIx,
+      catK,
+      catSlotOfBin(exprIx, fnIx),
+      catWidenSideOfBin(exprIx, fnIx),
+    )
   }
-  // Asked once and threaded into the concat and compare arms below, one node's answer.
+  // Asked once and threaded into the compare arms below, one node's answer.
   const lopK = listOpKindOfBin(exprIx, fnIx)
-  if lopK != "none" && e.binOp == "+" {
-    if lopK != "i32list" {
-      return emitFail(
-        "emitProgram: list concat over this element kind is not supported",
-      )
-    }
-    return emitListConcatI(e.binLeft, e.binRight, fnIx)
-  }
   if listEqArmOf(e, exprIx, fnIx, lopK) != "" {
     if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
     if listEqOperandTail(e.binLeft, fnIx) < 0 { return -1 }
@@ -40097,6 +40541,57 @@ function emitDirectCallTail(target: i32, callIx: i32, fnIx: i32) {
   return 0
 }
 
+// The parameters of the function at `fnStmts` slot `target`, or none.
+function capturedCallParams(target: i32): i32[] {
+  const cfn = nodeAt(fnStmts[target])
+  return if cfn is FuncDecl { cfn.fnParams } else { [] }
+}
+
+// How `emitCapturedCall` writes argument `arg`, the `i`th of a call of `target` from frame `fnIx`:
+// a union parameter's box by the table or the floor, a widening, a literal union, an atom's
+// string, a narrowed arm's unbox, or the plain expression.
+export type CapturedArgArm = "boxTable"
+  | "boxFloor"
+  | "widenI64"
+  | "widenF64"
+  | "widenF32"
+  | "lit"
+  | "atomStr"
+  | "unbox"
+  | "plain"
+
+export function capturedArgArmOf(
+  arg: i32,
+  i: i32,
+  target: i32,
+  fnIx: i32,
+): CapturedArgArm {
+  const cps = capturedCallParams(target)
+  let cuNm = ""
+  let cpKind: VKind = "i32"
+  let cpLit = false
+  if i < cps.length {
+    cpKind = vtKindOfParam(cps[i])
+    const cpn = nodeAt(cps[i])
+    if cpn is Param {
+      if cpKind == "union" { cuNm = boxTyName(nodeTyIxOf(cpn.parType)) }
+      // Alias-INDEX, so a NARROWED copy is recognized.
+      if tyIsLitUnion(nodeTyAt(cps[i], fnStmts[target])) { cpLit = true }
+      if nodeTyIsNulLitUnion(parTyNode(cps[i])) { cpLit = true }
+    }
+  }
+  if cuNm != "" {
+    return if boxOwedAt(arg, fnIx) { "boxTable" } else { "boxFloor" }
+  }
+  if cpKind == "i64" { return "widenI64" }
+  if cpKind == "f64" { return "widenF64" }
+  if cpKind == "f32" { return "widenF32" }
+  if cpLit { return "lit" }
+  if cpKind == "str" && exprIsLitAtom(arg, fnIx) { return "atomStr" }
+  if i < cps.length && narrowedArmNeedsUnbox(arg, fnIx) { return "unbox" }
+  return "plain"
+}
+
 // The captured-call lowering for an `Ident` callee resolved to a CAPTURING lifted
 // function at index `target`: build its closure value live (reading captures) and
 // `call_ref` it (a plain `call` would pass a null env and lose the captures).
@@ -40123,53 +40618,44 @@ function emitCapturedCall(callIx: i32, fnIx: i32, target: i32) {
   // declared functype. Three kinds are check-clean invalid wasm without this — a union box, an
   // i64/f64/f32 mismatch, and a litunion — each coerced the way the direct twin coerces, safe by construction since each arm fires only where the raw push is already wrong.
   if target < 0 { return -1 }
-  const cfn = nodeAt(fnStmts[target])
-  let cps: i32[] = []
-  if cfn is FuncDecl { cps = cfn.fnParams }
+  const cps = capturedCallParams(target)
   let cai = 0
   while cai < cargs.length {
-    let cuNm = ""
-    let cpKind: VKind = "i32"
-    let cpLit = false
-    let cuTy = -1
-    if cai < cps.length {
-      cpKind = vtKindOfParam(cps[cai])
-      const cpn = nodeAt(cps[cai])
-      if cpn is Param {
-        if cpKind == "union" {
-          cuNm = boxTyName(nodeTyIxOf(cpn.parType))
-          cuTy = nodeTyAt(cps[cai], fnStmts[target])
-        }
-        // Alias-INDEX, so a NARROWED copy is recognized.
-        if tyIsLitUnion(nodeTyAt(cps[cai], fnStmts[target])) { cpLit = true }
-        if nodeTyIsNulLitUnion(parTyNode(cps[cai])) { cpLit = true }
+    match capturedArgArmOf(cargs[cai], cai, target, fnIx) {
+      "boxTable" => {
+        // The table boxes an argument whose union the checker records; the floor, below, boxes
+        // one with no usable record at the parameter's union.
+        if emitDelivered(cargs[cai], fnIx) < 0 { return -1 }
       }
-    }
-    if cuNm != "" && boxOwedAt(cargs[cai], fnIx) {
-      // The table boxes an argument whose union the checker records; the floor, below, boxes
-      // one with no usable record at the parameter's union.
-      if emitDelivered(cargs[cai], fnIx) < 0 { return -1 }
-    } else if cuNm != "" {
-      if emitUnionBoxOwed(cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
-    } else if cpKind == "i64" {
-      if emitWidened(cargs[cai], 3, fnIx) < 0 { return -1 }
-    } else if cpKind == "f64" {
-      if emitWidened(cargs[cai], 4, fnIx) < 0 { return -1 }
-    } else if cpKind == "f32" {
-      if emitWidened(cargs[cai], 5, fnIx) < 0 { return -1 }
-    } else if cpLit {
-      if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
-    } else if cpKind == "str" && exprIsLitAtom(cargs[cai], fnIx) {
-      // The MIRROR of `cpLit`: a literal-union ATOM argument into a `string` parameter
-      // widens to its member string, the edge the direct twin takes as `cParamStr`.
-      if emitAtomToStr(cargs[cai], fnIx) < 0 { return -1 }
-    } else {
-      if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
-      // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
-      // the direct call's argument rung unboxes it.
-      if cai < cps.length && narrowedArmNeedsUnbox(cargs[cai], fnIx) {
+      "boxFloor" => {
+        const cpn = nodeAt(cps[cai])
+        const cuNm = if cpn is Param { boxTyName(nodeTyIxOf(cpn.parType)) } else { "" }
+        const cuTy = nodeTyAt(cps[cai], fnStmts[target])
+        if emitUnionBoxOwed(cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "widenI64" => {
+        if emitWidened(cargs[cai], 3, fnIx) < 0 { return -1 }
+      }
+      "widenF64" => {
+        if emitWidened(cargs[cai], 4, fnIx) < 0 { return -1 }
+      }
+      "widenF32" => {
+        if emitWidened(cargs[cai], 5, fnIx) < 0 { return -1 }
+      }
+      "lit" | "plain" => {
+        if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "atomStr" => {
+        // The MIRROR of `lit`: a literal-union ATOM argument into a `string` parameter
+        // widens to its member string, the edge the direct twin takes as `cParamStr`.
+        if emitAtomToStr(cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "unbox" => {
+        // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
+        // the direct call's argument rung unboxes it.
+        if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
         emitNarrowedArmUnboxTo(
-          armDestHeapOf(cpKind, paramStructIdxOf(cps[cai])),
+          armDestHeapOf(vtKindOfParam(cps[cai]), paramStructIdxOf(cps[cai])),
           cargs[cai],
           fnIx,
         )
@@ -41193,7 +41679,7 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   elseS.push(e.binRight)
   const pos = e.pos
   const ifIx = mkIf(
-    mkBinary("!=", e.binLeft, mkNull("null", pos), pos),
+    mkNullTestNe(e.binLeft, pos),
     mkBlock(thenS, pos),
     mkBlock(elseS, pos),
     pos,
@@ -41406,19 +41892,11 @@ function emitCoalesceCallArm(
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
-  const lhs = nodeAt(lhsIx)
   const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
-  // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
-  // and in the else arm for the string), so they apply only to an effect-free place —
-  // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
-  // and is handled by the stash-based call path in the `lhs is Call` block below.
-  let lhsReEval = true
-  if lhs is Call { lhsReEval = false }
-  // D1250 — AN IF-expression operand IS NOT RE-READABLE. Its condition can have effects, and
-  // re-reading it re-runs them: `(if bump() { true }) ?? false` bumped TWICE. The arms below
-  // that already carry a stash leg read this flag, so they switch over; the `boolean | null`
-  // arm gained one for the same reason. `coalChainHasCallLhs` reserves the slots.
-  if lhs is IfStmt { lhsReEval = false }
+  // The `boolean | null` and `K | null` arms re-read an effect-free operand in the present arm;
+  // one that is not (`coalLhsStashes`: a call, an `if`, a field of a call) is written once into
+  // the stash slot `coalChainHasCallLhs` reserved (D1250, D17036).
+  const lhsReEval = !coalLhsStashes(lhsIx)
   // `<e> ?? d` over a `boolean | null` niche (an ident binding, a `boolean | null` struct field,
   // or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the sentinel 2
   // (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers every
