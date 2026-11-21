@@ -3,7 +3,7 @@
 #
 #     scripts/ir-identity.sh <seed-a> <seed-b> [--names]
 #     scripts/ir-identity.sh --cases <seed>
-#     scripts/ir-identity.sh --claimless <seed>
+#     scripts/ir-identity.sh --claimless <seed> [list]
 #     scripts/ir-identity.sh --compare | --compare-errors <list> <dir-a> <dir-b>
 #
 # The first builds every distilled cell (`cells/`, `named/`) and the self-compile under two
@@ -18,9 +18,10 @@
 # differ N` and each that differs. It then builds every filed inventory witness whose outcome is
 # an emit reject (`scripts/inventory/witnesses.vl`) under both, comparing the exit code and the
 # first diagnostic line, and prints `witnesses: same N, differ N`.
-# `--claimless` builds the same claimless compiler, then every distilled cell under both, comparing
-# the wasm and the exit code: what a claim ships against what legacy would (`claimless: identical N,
-# fail under both N, differ N`). It sees what the armed shadow cannot, a claim built before legacy.
+# `--claimless` builds the same claimless compiler, then every distilled cell and every inventory
+# witness filed `runs` (or the programs a list file names) under both, comparing the wasm and the
+# exit code: what a claim ships against what legacy would write (`claimless: identical N, fail under
+# both N, differ N`). It sees what the armed shadow cannot, a claim built before legacy runs.
 # `--compare` and `--compare-errors` are those two comparisons alone, over builds `build_all`
 # left in two dirs (each file's `.rc`, `.err` and, built, `.wasm`).
 # Either exits 1 on any difference. Run from the checkout root; $VL names the host, $JOBS the
@@ -111,7 +112,11 @@ if [ "${1:-}" = "--claimless" ]; then
   SEED=${2:?usage: scripts/ir-identity.sh --claimless <seed>}
   export FLAGS=""
   claimless "$SEED"
-  ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl > "$T/list"
+  if [ -n "${3:-}" ]; then cp "$3" "$T/list"; else
+    ls scripts/silent-sweep/distilled/cells/*.vl scripts/silent-sweep/distilled/named/*.vl > "$T/list"
+    "$VL" run scripts/ir-i8-census/witnesses.vl --compiler "$SEED" -- "$T/wit" \
+      docs/internals/inventory docs/internals/inventory-2 >> "$T/list"
+  fi
   build_all "$T/list" "$SEED" "$T/a"
   build_all "$T/list" "$T/claimless.wasm" "$T/b"
   compare_all "$T/list" "$T/a" "$T/b"
