@@ -2421,3 +2421,25 @@ print(qnull().o == null)
     }
   },
 });
+
+// List `+` builds as `RListCat`: its operands, each one's recovery, then legacy's concat tail, at
+// an i32, a string and a record list, a chain, and a narrowed nullable operand. A concat that
+// widens an operand first is a named miss.
+const LIST_CAT =
+  `type P = { x: i32 }\nfunction ci(a: i32[], b: i32[]) { return a + b }\nfunction cs(a: string[], b: string[]) { return a + b }\nfunction cr(a: P[], b: P[]) { return a + b }\nfunction c3(a: i32[], b: i32[], c: i32[]) { return a + b + c }\nfunction cn(a: i32[] | null, b: i32[]) {\n  if a == null { return b }\n  return a + b\n}\nfunction cw(a: i32[], b: f64[]) { return b + a }\nprint(ci([1], [2]).length)\nprint(cs(["a"], ["b"]).length)\nprint(cr([{ x: 1 }], [{ x: 2 }])[1].x)\nprint(c3([1], [2], [3]).length)\nprint(cn([1], [2]).length)\nprint(cw([1], [2.5]).length)\n`;
+Deno.test({
+  name: "ir shadow: a list concat builds as RListCat over legacy's tail and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(LIST_CAT, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 5 || (rows.get("matched") ?? 0) !== 5) {
+      throw new Error(`want ci, cs, cr, c3 and cn covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered list concat widen") ?? 0) !== 1) {
+      throw new Error(`want cw a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
