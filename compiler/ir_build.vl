@@ -10,6 +10,7 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleReadFe } from "./emit_mono"
+import { bundleParamOfRead } from "./emit_bundle"
 import { irTyF64, irTyI64 } from "./ir_helper"
 import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
@@ -140,6 +141,8 @@ import {
   atomHookArmOf,
   atomStrPlanOf,
   binNumWidth,
+  bundleCallRefPlainKey,
+  bundlePickOf,
   callEndsNever,
   callRefArgArmOf,
   callRefLegacyPlainKey,
@@ -2644,6 +2647,9 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   // A binding holding a lambda-lifted function is a direct call of it; any other, a closure's.
   const lf = if d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) { cloLiftCalleeOf(c.callFn, ibFnIx) } else { -1 }
   if lf < 0 && d >= 0 && (nodeAt(d) is LetDecl || nodeAt(d) is Param) {
+    if bundleParamOfRead(c.callFn, ibFnIx) >= 0 {
+      return bundleCallRhs(b, c, ix)
+    }
     return closureCallRhs(b, c, ix)
   }
   if lf < 0 && (d < 0 || !(nodeAt(d) is FuncDecl)) {
@@ -2859,11 +2865,7 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
 function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   const key = callRefPlainKey(ix, ibFnIx)
   if key == "" { return missRhs("call of a non-declaration") }
-  // Armed, legacy has written this call already, and must have taken the plain path at this key.
-  if ibArmed && callRefLegacyPlainKey(ix) != key {
-    emitFail(
-      "emitProgram: internal: the IR's plain closure call disagrees with legacy's",
-    )
+  if !legacyPlainAgrees(ix, key) {
     return missRhs("closure call plan disagrees")
   }
   const f = irBExpr(b, c.callFn)
@@ -2871,6 +2873,40 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(repNodeAt(irBOpRep(f)) is RClosure) {
     return missRhs("closure callee rep")
   }
+  return closureCallAt(b, c, ix, key, f)
+}
+
+// Armed, legacy has written call `ix` already, and must have taken the plain path at `key`.
+function legacyPlainAgrees(ix: i32, key: string): boolean {
+  if ibArmed && callRefLegacyPlainKey(ix) != key {
+    emitFail(
+      "emitProgram: internal: the IR's plain closure call disagrees with legacy's",
+    )
+    return false
+  }
+  return true
+}
+
+// A call `ix` through a bundle parameter (D14841) that legacy writes plainly
+// (`bundleCallRefPlainKey`): the member `bundlePickOf` reads, called at its key.
+function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
+  const key = bundleCallRefPlainKey(ix, ibFnIx)
+  if key == "" { return missRhs("bundle call") }
+  if !legacyPlainAgrees(ix, key) {
+    return missRhs("closure call plan disagrees")
+  }
+  const pk = bundlePickOf(ix, ibFnIx)
+  const v = irBExpr(b, c.callFn)
+  if ibMiss != "" { return missRhs("bundle callee") }
+  const crep = repNodeOfTy(pk.bpTy)
+  if !(repNodeAt(crep) is RClosure) { return missRhs("bundle member rep") }
+  const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  return closureCallAt(b, c, ix, key, f)
+}
+
+// Closure call `ix` of `f` at plain key `key`: each argument at its parameter, then the call.
+function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
   const args: Opnd[] = []
   let i = 0
   while i < c.callArgs.length {
