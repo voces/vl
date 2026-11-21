@@ -1,3 +1,4 @@
+import { blockHasContinueFor } from "./emit_query"
 // The IR lowering (ir-design-2026-11.md §1.6) for I1's node set, and the shadow's dual emit: a
 // covered function's IR is lowered to a code entry, which is compared with the legacy one
 // byte for byte, beside its statement spans. A temp goes back onto the stack at its one use,
@@ -99,6 +100,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RAsUnion,
   RAtomEq,
   RAtomStr,
   RBoxField,
@@ -141,16 +143,17 @@ import {
   RMapGet,
   RMapGetOr,
   RMapHas,
+  RMapIter,
   RMapNew,
   RMapOp,
   RMapSet,
   RMemAccess,
+  RMemOp,
   RNulTest,
   RNullOf,
   RNumCast,
   RNumIntr,
   RNumWiden,
-  ROmitNull,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -186,6 +189,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
@@ -296,6 +300,7 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitAsUnionTagged,
   emitCapturedRead,
   emitClosureIds,
   emitClosureValueCore,
@@ -311,6 +316,8 @@ import {
   emitNullOwn,
   emitNullRetTail,
   emitOmittedFieldNull,
+  emitRangeRolledHead,
+  emitRangeRolledTail,
   emitStrLitAt,
   emitUnionNullToPair,
   emitUnionUnboxTail,
@@ -338,6 +345,7 @@ import {
   forInMapList,
   forInMapStash,
   forInRolledOpen,
+  forRangeTestOf,
   hoistCandRow,
   hoistReadTail,
   hoistRowMark,
@@ -367,7 +375,9 @@ import {
   mapGetOrMvPlain,
   mapGetOrMvTail,
   mapHasTail,
+  mapKeysFrameOf,
   mapLengthPlain,
+  mapListStep,
   mapPrepProbeTail,
   mapRecvIsSet,
   mapRecvKeyTail,
@@ -376,9 +386,14 @@ import {
   mapSetTail,
   mapSizeTail,
   mapUnionUnboxTail,
+  mapValsFrameOf,
+  mapValuesAreKeys,
   memAccessPlanOf,
   memAccessTail,
   memAddrPlanOf,
+  memOpIsVoid,
+  memOpPlanOf,
+  memOpTail,
   narrowedMemTail,
   narrowedVariantTail,
   nicheRawIsTail,
@@ -409,6 +424,14 @@ import {
   printStrTail,
   printUnionTail,
   promoSlotIn,
+  rangeMayWrap,
+  rangePartialCopies,
+  rangePartialCopyClose,
+  rangePartialCopyOpen,
+  rangePartialMainClose,
+  rangePartialMainOpen,
+  rangePartialOuterClose,
+  rangePartialOuterOpen,
   recCopyPureEmit,
   refArrayUnionUnboxTail,
   sFieldStorageSlot,
@@ -442,6 +465,7 @@ import {
   unionBoxToPairTail,
   unionLetSinkClose,
   unionUnionEqTail,
+  urLocalRead,
   userGlobalIdx,
   userGlobalReadClass,
   userGlobalWriteClass,
@@ -470,7 +494,6 @@ import {
   binNulTestOf,
   coalResultKindOf,
   coalesceNulStrStaysNullable,
-  localNulStrRecovers,
   nulTestArmOf,
 } from "./emit_plan_null"
 import {
@@ -482,6 +505,11 @@ import {
 import { fbOpenIf, fbValtype } from "./emit_bytes"
 import {
   atomHookArmOf,
+  coalFieldBoxOpen,
+  coalFieldPlanOf,
+  coalFieldRead,
+  coalFieldUnbox,
+  coalFieldValOpen,
   emitListEmptyLoop,
   emptyFitArmBody,
   emptyFitArmHead,
@@ -610,11 +638,11 @@ function tempDefined(v: i32): boolean {
 function tempRhs(v: i32): Rhs {
   // A staged temp is a value on the stack, which no reader may rewrite from its definition.
   if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
-    const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
     return none
   }
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
-  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   return none
 }
 
@@ -669,7 +697,8 @@ export function irLOpnd(o: Opnd) {
       const s = varSlot(v)
       if s < 0 { return irLMiss("unmapped slot") }
       leaf()
-      fbLocalGet(s)
+      // A range loop copy's variable reads as legacy's copy reads it (`urLocalRead`).
+      if !urLocalRead(s) { fbLocalGet(s) }
     }
     OImm => {
       leaf()
@@ -847,9 +876,7 @@ function rhs(r: Rhs, tail: boolean) {
     RCall => call(r, tail)
     RGlobalGet => {
       globalRead(r.ggSym, r.ggNonNull)
-      if r.ggAt >= 0 && readOwesNonNullRecover(r.ggAt, lw.irAt) {
-        fbRefAsNonNull()
-      }
+      if r.ggNn > 0 { fbRefAsNonNull() }
     }
     RMapGetOr => mapGetOr(r)
     RMapGet => {
@@ -859,6 +886,7 @@ function rhs(r: Rhs, tail: boolean) {
       got
     }
     RMapHas => mapHas(r)
+    RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
@@ -916,6 +944,12 @@ function rhs(r: Rhs, tail: boolean) {
       atomStrTail(atomStrPlanOf(r.sxAt, lw.irAt, false))
     }
     RAtomEq => atomEq(r)
+    RAsUnion => {
+      irLOpnd(r.auV)
+      if emitAsUnionTagged(r.auAt, lw.irAt) < 0 {
+        return irLMiss("union cast tail")
+      }
+    }
     RUnionEq => unionEq(r)
     RRetag => irLOpnd(r.rgV)
     RStage => irLOpnd(r.sgV)
@@ -929,12 +963,6 @@ function rhs(r: Rhs, tail: boolean) {
     RNullOf => {
       leaf()
       emitNullOwn(r.nuOwn)
-    }
-    ROmitNull => {
-      leaf()
-      if emitOmittedFieldNull(r.omRow, r.omField) < 0 {
-        return irLMiss("omitted field null")
-      }
     }
     RRetNull => {
       // The builder misses a function with no null plan; the lowering holds the same line itself.
@@ -963,9 +991,15 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RMemOp => memOp(r)
     RCallHost => hostCall(r)
-    RCast |
-      RCellGet |
+    RCast => {
+      // `as!` over a nullable-ref niche: `ref.as_non_null` traps on the miss (D1812).
+      if r.ctOnFail != "trap" { return irLMiss("cast to null") }
+      irLOpnd(r.ctV)
+      fbRefAsNonNull()
+    }
+    RCellGet |
       RCellNew |
       RFnId |
       RMapSet |
@@ -1737,8 +1771,11 @@ function recoverRead(r: RRecover) {
     }
   }
   irLOpnd(r.rcV)
-  if localNulStrRecovers(r.rcAt, lw.irAt) { fbRefAsNonNull() }
-  if readOwesNonNullRecover(r.rcAt, lw.irAt) { fbRefAsNonNull() }
+  let k = 0
+  while k < r.rcNn {
+    fbRefAsNonNull()
+    k = k + 1
+  }
   return 0
 }
 
@@ -1755,6 +1792,18 @@ function listNew(r: RListNew) {
   irLOpnd(r.lnFill)
   arrNewFillStep(-1)
   return arrNewTail(pl, slot)
+}
+
+// `RMemOp`: legacy's memory-management arm in `emitCallCoreMemOp`'s order, the operands then
+// `memOpTail`. Answers 1 for the bulk pair, which leaves nothing, else 0.
+function memOp(r: RMemOp): i32 {
+  const c = nodeAt(r.moAt)
+  if !(c is Call) { return irLMiss("memory op node") }
+  const pl = memOpPlanOf(c)
+  if pl.moFail != "" { return irLMiss("memory op plan") }
+  for o in r.moArgs { irLOpnd(o) }
+  memOpTail(pl.moArm)
+  return if memOpIsVoid(pl.moArm) { 1 } else { 0 }
 }
 
 // Whether call node `at` is a SIMD store, the one SIMD row that leaves nothing.
@@ -2008,16 +2057,73 @@ function forIn(n: SForIn, pending: i32[]) {
   return 0
 }
 
+// `SRangeLoop`: legacy's partial or wrapping range loop in `emitForRangeStmt`'s order, its blocks
+// and loops written by legacy's helpers around the IR's bodies, the scratch slots taken in order.
+function rangeLoop(n: SRangeLoop, pending: i32[]) {
+  const fnIx = lw.irAt
+  if n.rlAt < 0 { return irLMiss("range node") }
+  const s = nodeAt(n.rlAt)
+  if !(s is ForRange) { return irLMiss("range node") }
+  const rt = forRangeTestOf(s, n.rlAt, fnIx)
+  if rt.vIdx < 0 || rt.vIdx != varSlot(n.rlVar) { return irLMiss("range slot") }
+  const wraps = rangeMayWrap(s, rt)
+  irLSettle(pending)
+  scopeBind(s.frVar, declaredSlotOfDecl(n.rlAt))
+  let kb = 0
+  if n.rlPartial {
+    if n.rlCopies.length != rangePartialCopies(rt, wraps) {
+      return irLMiss("range copies")
+    }
+    let d0 = ctrlDepth
+    rangePartialOuterOpen(s)
+    kb = loopFrames(n.rlBrk, -1, d0)
+    d0 = ctrlDepth
+    const u = rangePartialMainOpen(rt, wraps)
+    const km = loopFrames(n.rlBrk, -1, d0)
+    const hasCont = blockHasContinueFor(s.frBody, s.frLabel, false)
+    let k = 0
+    while k < n.rlCopies.length {
+      d0 = ctrlDepth
+      rangePartialCopyOpen(s, rt, u, k, hasCont)
+      const kc = loopFrames(n.rlBrk, n.rlConts[k], d0)
+      body(n.rlCopies[k], false, -1, false)
+      framesPop(kc)
+      rangePartialCopyClose(hasCont)
+      k = k + 1
+    }
+    if u >= 0 { rangePartialMainClose(rt, u) }
+    framesPop(km)
+  }
+  const d1 = ctrlDepth
+  const hasTailCont = emitRangeRolledHead(s, rt)
+  const kt = loopFrames(n.rlTailBrk, n.rlTailCont, d1)
+  body(n.rlTail, false, -1, false)
+  framesPop(kt)
+  emitRangeRolledTail(rt, wraps, hasTailCont)
+  if n.rlPartial {
+    framesPop(kb)
+    rangePartialOuterClose()
+  }
+  scopeUnbind()
+  return 0
+}
+
 // Pushes a frame for each block legacy opened past depth `d0`: the walk's break block and its
 // current continue target carry its labels. Returns the count, for `framesPop`.
 function walkFrames(n: SForIn, d0: i32): i32 {
+  return loopFrames(n.xfBrk, n.xfCont, d0)
+}
+
+// Pushes a frame for each block legacy opened past depth `d0`: its innermost break block and
+// continue target carry labels `brk` and `cont`. Returns the count, for `framesPop`.
+function loopFrames(brk: i32, cont: i32, d0: i32): i32 {
   const brkAt = if loopBrkDepth.length > 0 { loopBrkDepth[loopBrkDepth.length - 1] } else { -1 }
   const contAt = if loopContDepth.length > 0 { loopContDepth[loopContDepth.length - 1] } else { -1 }
   let k = 0
   while d0 + k < ctrlDepth {
     const at = d0 + 1 + k
     lwFrames.push(
-      if at == brkAt { n.xfBrk } else if at == contAt { n.xfCont } else { -1 },
+      if at == brkAt { brk } else if at == contAt { cont } else { -1 },
     )
     k = k + 1
   }
@@ -2277,6 +2383,25 @@ function mapOp(r: RMapOp) {
   }
 }
 
+// `RMapIter`: legacy's keys or values writer, the map variable read before each of its steps. A
+// Set's values are its keys.
+function mapIter(r: RMapIter) {
+  const c = nodeAt(r.miAt)
+  if !(c is Call) || c.callFn < 0 { return irLMiss("map iter node") }
+  const m = nodeAt(c.callFn)
+  if !(m is Member) { return irLMiss("map iter node") }
+  const keys = !r.miVals || mapValuesAreKeys(m.memObj, lw.irAt)
+  if keys && !fnUses.mapKeys || !keys && !fnUses.mapVals {
+    return irLMiss("map iter frame")
+  }
+  const q = if keys { mapKeysFrameOf(m.memObj, lw.irAt) } else { mapValsFrameOf(m.memObj, lw.irAt) }
+  for step in [0, 1, 2] {
+    irLOpnd(r.miV)
+    mapListStep(q, step)
+  }
+  return 0
+}
+
 // `RMapHas`: the global, its recovery, the key and the op context, then legacy's probe and hit flag.
 function mapHas(r: RMapHas) {
   const fnIx = lw.irAt
@@ -2452,7 +2577,7 @@ function irHoistRecv(ix: i32): i32 {
 // false where it built none.
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
-  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   rhs(lw.irReadAgain[ix] ?? none, false)
   return true
 }
@@ -2741,6 +2866,13 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if r.mmArgs.length == 1 { fbDrop() }
         return 0
       }
+      // The bulk pair leaves nothing; any other memory op's discarded value is dropped.
+      if r is RMemOp {
+        const v = memOp(r)
+        irLSettle(pending)
+        if v == 0 { fbDrop() }
+        return 0
+      }
       if r is REnvDrop {
         emitEnvCacheDrop(r.edFn)
         irLSettle(pending)
@@ -2798,6 +2930,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbEnd()
     }
     SForIn => forIn(n, pending)
+    SRangeLoop => rangeLoop(n, pending)
     SIf => irLMiss("an `if` outside a body walk")
     SBr => {
       if n.brHas {
@@ -3098,6 +3231,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulRef" => coalNulRef(n, e, pending)
     "litUnion" => coalNicheCell(n, e, -1, pending)
     "nulBool" => coalNicheCell(n, e, 2, pending)
+    "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -3105,6 +3239,28 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
+  return 0
+}
+
+// `o.v ?? d` over a value-union record field along `coalFieldPlanOf`, as `emitCoalesceUnionField`
+// writes it: the record variable, the field's null test opening the `if`, the default writing the
+// slotless out, the else, the record again and the field's box or its unboxed payload, the end.
+function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const p = coalFieldPlanOf(e, unwrapParen(e.binLeft), n.cbAt, lw.irAt)
+  const boxed = n.cbArm == "fieldBox"
+  if p.cfCast != -1 || p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
+    return irLMiss("coalesce field plan")
+  }
+  cond(n.cbL, pending)
+  if boxed { coalFieldBoxOpen(p) } else { coalFieldValOpen(p) }
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  irLOpnd(n.cbL)
+  if boxed { coalFieldRead(p) }
+  else if coalFieldUnbox(p) < 0 { return -1 }
+  lwFrames.pop()
+  fbEnd()
   return 0
 }
 
@@ -3494,7 +3650,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwIfHeadBuilt = false
   lwStashFi = []
   lwStashSlots = []
-  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   for _v in f.irVars {
     lwTempRhs.push(none)
     lwTempDef.push(false)
