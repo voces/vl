@@ -82,7 +82,7 @@ const CI_RUNS: Record<string, string[]> = {
     "check --budget scripts/render-parse-budget-baseline.json --findings",
   ],
   "scaling shape": [
-    "run: deno test -A --no-check tests/vl_scaling_shape_test.ts",
+    "run: deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_scaling_shape_test.ts",
   ],
   "deno lint": ["run: deno lint\n"],
   "inventory refs": [],
