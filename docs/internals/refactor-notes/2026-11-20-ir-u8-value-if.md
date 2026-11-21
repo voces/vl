@@ -9,10 +9,15 @@ any i32: an `i32` blocktype and i32 arms. The packed store truncates it, which i
 
 ## The change
 
-`byteHeld` (`ir_build.vl`) reads a type whose rep is the packed `u8` as `i32`. It asks the rep, not the checker's `TY_U8`, so the builder imports no further checker symbol (phase-state). `heldTy` applies it, and so does `exprRepOf`,
-through `heldTy`. Every temp's type and rep and every node's rep then agree at i32, as the
-verifier's rule 3 requires. The value `if`'s out variable takes the head's type through
-`byteHeld` alone. Its open-type miss is unchanged.
+`byteHeld` (`ir_build.vl`) reads a type whose rep is the packed `u8` as `i32`. It asks the rep
+(behind a cheap `tyScalarBasePrim` gate), not the checker's `TY_U8`, so the builder imports no
+further checker symbol (phase-state). It applies at three places, each off the common path:
+- `exprRepOf`, only where the node's own type has no rep;
+- `irBLetTempTy`, only for a temp at the i32 rep;
+- the value `if`'s out variable, at the head's type. Its open-type miss is unchanged.
+
+Every node's rep and every temp's type then agree at i32, as the verifier's rule 3 requires. A
+first cut applied it inside `heldTy`, which every temp asks, and cost +0.45% L2 fuel.
 
 ## Witness
 
