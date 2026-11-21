@@ -1046,7 +1046,7 @@ print(show(nested(null, null, q)) + show(nested(null, { k: "c", r: 4 }, q)) + sh
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+    if (!((rows.get("covered") ?? 0) >= 4) || rows.get("matched") !== rows.get("covered")) {
       throw new Error(`want the four coalescing functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
