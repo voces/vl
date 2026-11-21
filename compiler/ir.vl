@@ -110,6 +110,9 @@ export type RBoxNarrow = {
 }
 // A nullable local read at its inner rep, recovered where `localNulStrRecovers`; `rcAt` the read.
 export type RRecover = { rcV: Opnd, rcAt: i32 }
+// The union-operand cast `auAt` over box `auV`, by legacy's tag test and tail
+// (`emitAsUnionTagged`): the target arm unboxed, the box at a sub-union, `null` on `as?`'s miss.
+export type RAsUnion = { auV: Opnd, auAt: i32 }
 export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
 // `mrFields` in kid order; `mrLayout[i]` the kid layout position `i` writes; `mrSrc` the kids in
@@ -173,6 +176,8 @@ export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
 export type RAtomic = { amArgs: Opnd[], amAt: i32 }
 // A scalar saturating truncation at call node `tsAt` of float operand `tsV` (`truncSatPlanOf`).
 export type RTruncSat = { tsV: Opnd, tsAt: i32 }
+// A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
+export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
 export type RListGet = { lgV: Opnd, lgIx: Opnd, lgAt: i32 }
 // `llAt`: the `.length` `Member` node, which legacy's hoist and view decisions key on.
@@ -312,6 +317,9 @@ export type RMapGet = {
   mtAt: i32,
   mtBox: i32,
 }
+// `m.keys()` or, under `miVals`, `m.values()` at call `miAt` over map variable `miV`, which legacy's
+// writer reads three times (`mapListStep`): a fresh list of the live entries.
+export type RMapIter = { miV: Opnd, miAt: i32, miVals: boolean }
 // `m.has(k)` at call `mhAt` on map global `mhSym` (receiver node `mhRecv`, recovered for
 // `mhNonNull`), or with `mhSym` -1 receiver operand `mhLoc`, key `mhKey`: legacy's probe and hit flag, an
 // i32 0 or 1.
@@ -351,7 +359,8 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // argument before one whose valued `if` the lowering writes it below (`stageLead`), or a union box
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
-export type Rhs = RAtomEq
+export type Rhs = RAsUnion
+  | RAtomEq
   | RAtomStr
   | RAtomic
   | RBoxField
@@ -394,10 +403,12 @@ export type Rhs = RAtomEq
   | RMapGet
   | RMapGetOr
   | RMapHas
+  | RMapIter
   | RMapNew
   | RMapOp
   | RMapSet
   | RMemAccess
+  | RMemOp
   | RNulTest
   | RNullOf
   | RNumCast
@@ -441,6 +452,21 @@ export type SBoundsCheck = { bcV: Opnd, bcIx: Opnd }
 export type SEffect = { efRhs: Rhs }
 export type SBlock = { bkLabel: i32, bkBody: i32[], bkOut: i32 }
 export type SLoop = { lpLabel: i32, lpBody: i32[] }
+// A range loop legacy writes through its own helpers (`forRangeArm` "partial", or "rolled" with a
+// wrap exit) at `rlAt` into `rlVar`: the partial main loop's copies `rlCopies` (break to `rlBrk`,
+// continue to `rlConts[k]`), then the rolled loop's `rlTail` (`rlTailBrk`, `rlTailCont`). A
+// migration node that retires at I8 with `SForIn` (ir-design §1.2).
+export type SRangeLoop = {
+  rlAt: i32,
+  rlVar: i32,
+  rlPartial: boolean,
+  rlCopies: i32[][],
+  rlConts: i32[],
+  rlBrk: i32,
+  rlTail: i32[],
+  rlTailBrk: i32,
+  rlTailCont: i32,
+}
 // The plain walk of `for` statement `xfAt` over `xfList` into `xfVar` (`forInPlainWhy`): legacy's
 // loop around `xfBody`, `break` to `xfBrk` and `continue` to `xfCont`. A map walk reads map global
 // `xfMap` (recovered for `xfMapNonNull`), `xfList` then an unread immediate; with `xfMap` -1 a map
@@ -516,6 +542,7 @@ export type IrNode = SAssign
   | SLet
   | SListSet
   | SLoop
+  | SRangeLoop
   | SRawOp
   | SReturn
   | SSetField
@@ -746,6 +773,7 @@ export function irBodyLeaves(f: IrFn, body: i32[]): boolean {
         SLet |
         SListSet |
         SLoop |
+        SRangeLoop |
         SRawOp |
         SSetField |
         SSwitch => {
@@ -833,6 +861,14 @@ export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
     SForIn => {
       bodies.push(n.xfBody)
       pos.push(0)
+    }
+    SRangeLoop => {
+      bodies.push(n.rlTail)
+      pos.push(0)
+      for c in n.rlCopies {
+        bodies.push(c)
+        pos.push(0)
+      }
     }
     SIf => {
       bodies.push(n.siElse)
@@ -941,6 +977,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMemAccess => r.mmArgs
     RAtomic => r.amArgs
     RTruncSat => [r.tsV]
+    RMemOp => r.moArgs
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
     RListPush => pushOpnds(r)
@@ -955,6 +992,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapGetOr => [r.mgLoc, r.mgKey, r.mgDef]
     RMapGet => [r.mtLoc, r.mtKey]
     RMapHas => [r.mhLoc, r.mhKey]
+    RMapIter => [r.miV]
     RPrint => [r.pnV]
     RStrOp => r.soArgs
     RNumWiden => [r.nwV]
@@ -972,6 +1010,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RRetNull => []
     RNulTest => [r.ntV]
     RAtomEq => [r.aeL, r.aeR]
+    RAsUnion => [r.auV]
     RTagStash => [r.tgsV]
     RStashSet => [r.ssV]
     RTagIs => []
@@ -1028,6 +1067,7 @@ function rhsText(r: Rhs): string {
     RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
     RAtomic => "atomic(" + opndsText(r.amArgs) + ")"
     RTruncSat => "trunc_sat(" + opndText(r.tsV) + ")"
+    RMemOp => "mem_op(" + opndsText(r.moArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
     RListPush => "push " + pushRecvText(r.lpV) + " " + opndText(r.lpX)
@@ -1047,6 +1087,7 @@ function rhsText(r: Rhs): string {
     RRetNull => "return null"
     RNulTest => "isnull " + opndText(r.ntV)
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
+    RAsUnion => "as.union " + opndText(r.auV)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
     RListCat => "list.cat " + opndText(r.ljL) + " " + opndText(r.ljR)
@@ -1079,6 +1120,7 @@ function rhsText(r: Rhs): string {
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
+    RMapIter => (if r.miVals { "map.values " } else { "map.keys " }) + opndText(r.miV)
     RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
@@ -1171,6 +1213,33 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
         + "\n"
         + bodyText(f, n.xfBody, d + 1)
     }
+    SRangeLoop => {
+      let t = p
+        + "range v"
+        + i32ToStr(n.rlVar)
+        + (if n.rlPartial { " partial" } else { " wrap" })
+        + "\n"
+      let k = 0
+      while k < n.rlCopies.length {
+        t = t
+          + p
+          + " copy "
+          + i32ToStr(k)
+          + " L"
+          + i32ToStr(n.rlConts[k])
+          + "\n"
+          + bodyText(f, n.rlCopies[k], d + 1)
+        k = k + 1
+      }
+      t
+        + p
+        + " rolled L"
+        + i32ToStr(n.rlTailBrk)
+        + " L"
+        + i32ToStr(n.rlTailCont)
+        + "\n"
+        + bodyText(f, n.rlTail, d + 1)
+    }
     SIf => {
       let s = p
         + "if "
@@ -1253,6 +1322,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       SForIn |
       SIf |
       SLoop |
+      SRangeLoop |
       SReturn |
       STrap => "control"
     SCoalBox => match n.cbArm {
@@ -1312,10 +1382,12 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RMapGet |
       RMapGetOr |
       RMapHas |
+      RMapIter |
       RMapNew |
       RMapOp |
       RMapSet => "map"
-    RBoxField |
+    RAsUnion |
+      RBoxField |
       RBoxNarrow |
       RSharedRead |
       RTest => "box"
@@ -1338,6 +1410,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListNew |
       RListNewDefault |
       RMemAccess |
+      RMemOp |
       RSimd |
       RTagOf |
       RTruncSat => "other"
