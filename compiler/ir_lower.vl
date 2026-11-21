@@ -157,6 +157,7 @@ import {
   RPrimOp,
   RPrint,
   RRawOp,
+  RRecCopyPure,
   RRecover,
   RRel,
   RRetNull,
@@ -432,6 +433,7 @@ import {
   rangePartialMainOpen,
   rangePartialOuterClose,
   rangePartialOuterOpen,
+  recCopyPureEmit,
   refArrayUnionUnboxTail,
   sFieldStorageSlot,
   sharedArmBoxBody,
@@ -493,7 +495,6 @@ import {
   binNulTestOf,
   coalResultKindOf,
   coalesceNulStrStaysNullable,
-  localNulStrRecovers,
   nulTestArmOf,
 } from "./emit_plan_null"
 import {
@@ -505,6 +506,11 @@ import {
 import { fbOpenIf, fbValtype } from "./emit_bytes"
 import {
   atomHookArmOf,
+  coalFieldBoxOpen,
+  coalFieldPlanOf,
+  coalFieldRead,
+  coalFieldUnbox,
+  coalFieldValOpen,
   emitListEmptyLoop,
   emptyFitArmBody,
   emptyFitArmHead,
@@ -633,11 +639,11 @@ function tempDefined(v: i32): boolean {
 function tempRhs(v: i32): Rhs {
   // A staged temp is a value on the stack, which no reader may rewrite from its definition.
   if v >= 0 && v < lwStackVal.length && lwStackVal[v] {
-    const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
     return none
   }
   if v >= 0 && v < lwTempRhs.length { return lwTempRhs[v] }
-  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   return none
 }
 
@@ -871,9 +877,7 @@ function rhs(r: Rhs, tail: boolean) {
     RCall => call(r, tail)
     RGlobalGet => {
       globalRead(r.ggSym, r.ggNonNull)
-      if r.ggAt >= 0 && readOwesNonNullRecover(r.ggAt, lw.irAt) {
-        fbRefAsNonNull()
-      }
+      if r.ggNn > 0 { fbRefAsNonNull() }
     }
     RMapGetOr => mapGetOr(r)
     RMapGet => {
@@ -975,6 +979,10 @@ function rhs(r: Rhs, tail: boolean) {
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
+    RRecCopyPure => {
+      leaf()
+      recCopyPureEmit(r.rpAt, lw.irAt)
+    }
     RRecover => recoverRead(r)
     RGetField => getField(r)
     RCallRef => callRef(r, tail)
@@ -1764,8 +1772,11 @@ function recoverRead(r: RRecover) {
     }
   }
   irLOpnd(r.rcV)
-  if localNulStrRecovers(r.rcAt, lw.irAt) { fbRefAsNonNull() }
-  if readOwesNonNullRecover(r.rcAt, lw.irAt) { fbRefAsNonNull() }
+  let k = 0
+  while k < r.rcNn {
+    fbRefAsNonNull()
+    k = k + 1
+  }
   return 0
 }
 
@@ -2567,7 +2578,7 @@ function irHoistRecv(ix: i32): i32 {
 // false where it built none.
 export function irLReadAgain(ix: i32): boolean {
   if !lw.irReadAgain.has(ix) { return false }
-  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   rhs(lw.irReadAgain[ix] ?? none, false)
   return true
 }
@@ -3221,6 +3232,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulRef" => coalNulRef(n, e, pending)
     "litUnion" => coalNicheCell(n, e, -1, pending)
     "nulBool" => coalNicheCell(n, e, 2, pending)
+    "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -3228,6 +3240,28 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   if got < 0 { return -1 }
   livePush(t)
   pending.push(t)
+  return 0
+}
+
+// `o.v ?? d` over a value-union record field along `coalFieldPlanOf`, as `emitCoalesceUnionField`
+// writes it: the record variable, the field's null test opening the `if`, the default writing the
+// slotless out, the else, the record again and the field's box or its unboxed payload, the end.
+function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const p = coalFieldPlanOf(e, unwrapParen(e.binLeft), n.cbAt, lw.irAt)
+  const boxed = n.cbArm == "fieldBox"
+  if p.cfCast != -1 || p.cfArm != (if boxed { "boxed" } else { "unbox" }) {
+    return irLMiss("coalesce field plan")
+  }
+  cond(n.cbL, pending)
+  if boxed { coalFieldBoxOpen(p) } else { coalFieldValOpen(p) }
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  irLOpnd(n.cbL)
+  if boxed { coalFieldRead(p) }
+  else if coalFieldUnbox(p) < 0 { return -1 }
+  lwFrames.pop()
+  fbEnd()
   return 0
 }
 
@@ -3617,7 +3651,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwIfHeadBuilt = false
   lwStashFi = []
   lwStashSlots = []
-  const none: Rhs = { ggSym: -1, ggNonNull: false, ggAt: -1 }
+  const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
   for _v in f.irVars {
     lwTempRhs.push(none)
     lwTempDef.push(false)
