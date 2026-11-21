@@ -14582,16 +14582,32 @@ function emitMapKeys(recvIx: i32, fnIx: i32) {
     return emitFail("emitProgram: .keys() scratch frame not reserved")
   }
   if mapShapeOfExpr(recvIx, fnIx) == -3 { return failMapValueType() }
+  const q = mapKeysFrameOf(recvIx, fnIx)
   for step in [0, 1, 2] {
     if emitExpr(recvIx, fnIx) < 0 { return -1 }
-    mapKeysStep(recvIx, fnIx, step)
+    mapListStep(q, step)
   }
   return 0
 }
 
-// `emitMapKeys` after its receiver's read number `step`: 0 the keys backing, 1 the live flags,
-// 2 the entry count, then the copy of the live keys into a fresh list of the key rep.
-export function mapKeysStep(recvIx: i32, fnIx: i32, step: i32) {
+// The frame a keys or values writer takes before its receiver's first read, which claims its
+// scratch slots in this order: the map struct and source field, the out list's wrapper and
+// backing, and the out, source, live, cursor, write and count slots.
+export type MapListFrame = {
+  mqMapTy: i32,
+  mqField: i32,
+  mqWrap: i32,
+  mqBack: i32,
+  mqOut: i32,
+  mqSrc: i32,
+  mqLive: i32,
+  mqI: i32,
+  mqJ: i32,
+  mqCount: i32,
+}
+
+// `emitMapKeys`'s frame for map receiver `recvIx`: the keys list of the key rep.
+export function mapKeysFrameOf(recvIx: i32, fnIx: i32): MapListFrame {
   // A Set's keys() runs on the mono machinery of its own KEY rep.
   const shape = mapShapeFoldSet(mapShapeOfExpr(recvIx, fnIx))
   // The KEY rep, from the mono sentinel OR the mv slot's own column — the same question
@@ -14619,72 +14635,86 @@ export function mapKeysStep(recvIx: i32, fnIx: i32, step: i32) {
     keysWrap = mkListTy()
     keysBack = mkArrTy()
   }
-  const liveL = mapKeysBase + 2
-  const iL = mapKeysBase + 3
-  const jL = mapKeysBase + 4
-  const countL = mapKeysBase + 5
+  const q: MapListFrame = {
+    mqMapTy: mapTy,
+    mqField: 0,
+    mqWrap: keysWrap,
+    mqBack: keysBack,
+    mqOut: outBackL,
+    mqSrc: keysBackL,
+    mqLive: mapKeysBase + 2,
+    mqI: mapKeysBase + 3,
+    mqJ: mapKeysBase + 4,
+    mqCount: mapKeysBase + 5,
+  }
+  return q
+}
+
+// A keys or values writer after its receiver's read number `step` over frame `q`: 0 the source
+// backing, 1 the live flags, 2 the entry count, then the copy of the live entries into the out list.
+export function mapListStep(q: MapListFrame, step: i32) {
   if step == 0 {
-    // keysBack = recv.keys.backing  (field 0 = keys wrapper, its field 0 = backing)
-    fbStructGet(mapTy, 0)
-    fbStructGet(keysWrap, 0)
-    fbLocalSet(keysBackL)
+    // src = recv.<keys|vals>.backing  (the source wrapper field, its field 0 = backing)
+    fbStructGet(q.mqMapTy, q.mqField)
+    fbStructGet(q.mqWrap, 0)
+    fbLocalSet(q.mqSrc)
     return 0
   }
   if step == 1 {
     // live = recv.live  (field 2)
-    fbStructGet(mapTy, 2)
-    fbLocalSet(liveL)
+    fbStructGet(q.mqMapTy, 2)
+    fbLocalSet(q.mqLive)
     return 0
   }
   // count = recv.count  (field 4 — entries INCLUDING tombstones)
-  fbStructGet(mapTy, 4)
-  fbLocalSet(countL)
-  // out = array.new_default <keysBacking> count (sized at count; `len` set to live j)
-  fbLocalGet(countL)
-  fbArrayNewDefault(keysBack)
-  fbLocalSet(outBackL)
+  fbStructGet(q.mqMapTy, 4)
+  fbLocalSet(q.mqCount)
+  // out = array.new_default <backing> count (sized at count; `len` set to live j)
+  fbLocalGet(q.mqCount)
+  fbArrayNewDefault(q.mqBack)
+  fbLocalSet(q.mqOut)
   // j = 0 ; i = 0
   fbI32Const(0)
-  fbLocalSet(jL)
+  fbLocalSet(q.mqJ)
   fbI32Const(0)
-  fbLocalSet(iL)
-  // loop { if i >= count {} else { if live[i] != 0 { out[j]=keys[i]; j++ } ; i++ ; br } }
+  fbLocalSet(q.mqI)
+  // loop { if i >= count {} else { if live[i] != 0 { out[j]=src[i]; j++ } ; i++ ; br } }
   fbLoop(64)
-  fbLocalGet(iL)
-  fbLocalGet(countL)
+  fbLocalGet(q.mqI)
+  fbLocalGet(q.mqCount)
   fbI32Bin(78) // 0x4e i32.ge_s (i >= count → done)
   fbIf(64)
   // then: done (empty)
   fbElse()
   // if live[i] != 0  (constant true in a module that never deletes, whose `live` stays empty)
-  pushMapEntryLive(liveL, iL)
+  pushMapEntryLive(q.mqLive, q.mqI)
   fbIf(64)
-  // out[j] = keys[i]
-  fbLocalGet(outBackL)
-  fbLocalGet(jL)
-  fbLocalGet(keysBackL)
-  fbLocalGet(iL)
-  fbArrayGet(keysBack)
-  fbArraySet(keysBack)
+  // out[j] = src[i]
+  fbLocalGet(q.mqOut)
+  fbLocalGet(q.mqJ)
+  fbLocalGet(q.mqSrc)
+  fbLocalGet(q.mqI)
+  fbArrayGet(q.mqBack)
+  fbArraySet(q.mqBack)
   // j = j + 1
-  fbLocalGet(jL)
+  fbLocalGet(q.mqJ)
   fbI32Const(1)
   fbI32Bin(106) // i32.add
-  fbLocalSet(jL)
+  fbLocalSet(q.mqJ)
   fbEnd() // end (live if)
   // i = i + 1
-  fbLocalGet(iL)
+  fbLocalGet(q.mqI)
   fbI32Const(1)
   fbI32Bin(106) // i32.add
-  fbLocalSet(iL)
+  fbLocalSet(q.mqI)
   fbBr(1) // → loop header (else=0, loop=1)
   fbEnd() // end (ge_s if/else)
   fbEnd() // end (loop)
-  // wrapper = struct.new <keysWrapper> (out, len=j, cap=count)
-  fbLocalGet(outBackL)
-  fbLocalGet(jL)
-  fbLocalGet(countL)
-  fbStructNew(keysWrap)
+  // wrapper = struct.new <wrapper> (out, len=j, cap=count)
+  fbLocalGet(q.mqOut)
+  fbLocalGet(q.mqJ)
+  fbLocalGet(q.mqCount)
+  fbStructNew(q.mqWrap)
   return 0
 }
 
@@ -14701,9 +14731,10 @@ function emitMapValues(recvIx: i32, fnIx: i32) {
   if !fnUses.mapVals {
     return emitFail("emitProgram: .values() scratch frame not reserved")
   }
+  const q = mapValsFrameOf(recvIx, fnIx)
   for step in [0, 1, 2] {
     if emitExpr(recvIx, fnIx) < 0 { return -1 }
-    mapValsStep(recvIx, fnIx, step)
+    mapListStep(q, step)
   }
   return 0
 }
@@ -14715,87 +14746,28 @@ export function mapValuesAreKeys(recvIx: i32, fnIx: i32): boolean {
   return shape == -2 || shape == -5 || shape == -7
 }
 
-// `emitMapValues` over a map that is no Set, after its receiver's read number `step`: 0 the vals
-// backing, 1 the live flags, 2 the entry count, then the copy of the live values into a fresh list.
-export function mapValsStep(recvIx: i32, fnIx: i32, step: i32) {
+// `emitMapValues`'s frame for map receiver `recvIx`, no Set: the vals list. A mono map's frame is its
+// own `mapValsBase`; an mv map's is its slot's out and source with the keys frame's live and cursors.
+export function mapValsFrameOf(recvIx: i32, fnIx: i32): MapListFrame {
   const shape = mapShapeOfExpr(recvIx, fnIx)
   const mapTy = mapTypeIdxOf(shape)
   const valsWrap = mvValsWrapOf(shape)
   const valsBack = mvValsBackOf(shape)
-  // Frame: a MONO map's self-contained `mapValsBase` (all i32-backed), an mv map's per-slot
-  // output backing + the mv frame's `valsBk` source + the key-list frame's live/i/j/count.
-  let outBackL = mapValsBase + 0
-  let valsBackL = mapValsBase + 1
-  let liveL = mapValsBase + 2
-  let iL = mapValsBase + 3
-  let jL = mapValsBase + 4
-  let countL = mapValsBase + 5
-  if shape >= 0 {
-    outBackL = fnMvValsOutLocal(shape)
-    valsBackL = fnMvValsBkLocal(shape)
-    liveL = mapKeysBase + 2
-    iL = mapKeysBase + 3
-    jL = mapKeysBase + 4
-    countL = mapKeysBase + 5
+  const mono = shape < 0
+  const base = if mono { mapValsBase } else { mapKeysBase }
+  const q: MapListFrame = {
+    mqMapTy: mapTy,
+    mqField: 1,
+    mqWrap: valsWrap,
+    mqBack: valsBack,
+    mqOut: if mono { mapValsBase + 0 } else { fnMvValsOutLocal(shape) },
+    mqSrc: if mono { mapValsBase + 1 } else { fnMvValsBkLocal(shape) },
+    mqLive: base + 2,
+    mqI: base + 3,
+    mqJ: base + 4,
+    mqCount: base + 5,
   }
-  if step == 0 {
-    // valsBack = recv.vals.backing  (field 1 = vals wrapper, its field 0 = backing)
-    fbStructGet(mapTy, 1)
-    fbStructGet(valsWrap, 0)
-    fbLocalSet(valsBackL)
-    return 0
-  }
-  if step == 1 {
-    // live = recv.live  (field 2)
-    fbStructGet(mapTy, 2)
-    fbLocalSet(liveL)
-    return 0
-  }
-  // count = recv.count  (field 4 — entries INCLUDING tombstones)
-  fbStructGet(mapTy, 4)
-  fbLocalSet(countL)
-  // out = array.new_default <valsBack> count
-  fbLocalGet(countL)
-  fbArrayNewDefault(valsBack)
-  fbLocalSet(outBackL)
-  fbI32Const(0)
-  fbLocalSet(jL)
-  fbI32Const(0)
-  fbLocalSet(iL)
-  // loop { if i >= count {} else { if live[i] != 0 { out[j]=vals[i]; j++ } ; i++ ; br } }
-  fbLoop(64)
-  fbLocalGet(iL)
-  fbLocalGet(countL)
-  fbI32Bin(78) // i32.ge_s
-  fbIf(64)
-  fbElse()
-  pushMapEntryLive(liveL, iL)
-  fbIf(64)
-  // out[j] = vals[i]
-  fbLocalGet(outBackL)
-  fbLocalGet(jL)
-  fbLocalGet(valsBackL)
-  fbLocalGet(iL)
-  fbArrayGet(valsBack)
-  fbArraySet(valsBack)
-  fbLocalGet(jL)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(jL)
-  fbEnd() // end (live if)
-  fbLocalGet(iL)
-  fbI32Const(1)
-  fbI32Bin(106)
-  fbLocalSet(iL)
-  fbBr(1)
-  fbEnd() // end (ge_s if/else)
-  fbEnd() // end (loop)
-  // wrapper = struct.new <valsWrap> (out, len=j, cap=count)
-  fbLocalGet(outBackL)
-  fbLocalGet(jL)
-  fbLocalGet(countL)
-  fbStructNew(valsWrap)
-  return 0
+  return q
 }
 
 // Resize the `index` when its occupancy (count / cap) crosses 1/2: a `call` into the
