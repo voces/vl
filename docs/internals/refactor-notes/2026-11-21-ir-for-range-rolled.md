@@ -35,10 +35,19 @@ legacy's bytes come out of them, so no loop node was added:
     `blockHasContinueFor` decides;
   - the step as a temp `add` and an `SAssign`, then `SBr` to the loop.
 
-`forRangeRolledWhy` (wasmEmit) names every other arm in legacy's own order. The builder keeps
-each as a named miss: `getter`, `unrolled`, `partial`, `hoisted`, `proven`, `wrap exit`,
-`dynamic step`. `rangeProofOpen` now reads its row from `rangeProofRow`, so the decision is
-pure; legacy's bytes are unchanged.
+**One decision.** `forRangeArm` (wasmEmit), "unrolled" | "partial" | "rolled", is what
+`emitForRangeStmt` dispatches on (its unrolled call takes `forRangeUnrollPlan`'s values), and the
+IR reads the same function. That answers IR-REV's veto of a parallel arm predicate. The IR builds
+only "rolled", and only when `forRangeRolledBlock` finds no dynamic step, wrap exit (`rangeMayWrap`,
+legacy's own), hoist or range proof.
+
+**State-free gates.** The hoist and proof gates read only the tree: any `loopHoistCands`
+candidate, or a positive step from a non-negative literal toward a hoistable path. They never read
+the live rows that `hoistCandRow` and `liveListRowOf` consult while legacy writes. A shipped claim
+is decided before legacy writes the function, so a live-row reading there disagreed with legacy's
+in `--cases` (tests/cases/arrays/basics.vl and lists/index-guard-in-range.vl, a start-body loop
+over a hoisted receiver). Each gate answers yes wherever legacy might hoist or prove, so a loop it
+admits has neither.
 
 Two more named misses:
 - A range loop inside an open list reserve region (D3623), where legacy's pushes append through
