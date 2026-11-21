@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR: a block body's last statement is a statement, falling into legacy's pad (D17038 closed).** A block body returns a value only through `return`, so legacy writes its last statement (an assignment, a call, a loop, or an `if` whose arms yield values) as a statement and pads the fall-through with the result's `null` or `unreachable` (`fallThroughPadOf`). The IR missed the first kinds (`block body falls off`, `valued tail loop`, `valued tail if`) and built a last value `if` as a tail `if`, so a claimed function returned an `else` arm's assignment where legacy returns `null` (D17038). The verifier's rule 5 reads the same pad (`fnFallThroughPadOf`), which the lowering writes (self-compile +16 functions with no blocker).
