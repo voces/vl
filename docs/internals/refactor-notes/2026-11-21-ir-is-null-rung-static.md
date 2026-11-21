@@ -46,4 +46,28 @@ name.
 
 ## Coverage
 
-MEASUREMENTS
+Measured on fixpoint seeds of this branch and of its merge base, master `b39b74874`, each
+building this branch's source.
+
+| population | merge-base | this branch |
+| --- | ---: | ---: |
+| self-compile functions with no blocker (19,400 built) | 19,195 | 19,200 |
+| self-compile `is rung` alone | 11 | 5 |
+| self-compile claimed (mode 3) | 19,175 | 19,180 |
+| corpus covered = verified = matched (45,678) | 42,735 | 42,751 |
+| corpus `is rung` alone | 183 | 97 |
+| `tests/cases` covered / matched (armed shadow) | 57,234 / 57,221 | 57,335 / 57,322 |
+
+The self-compile's 5 left are `emptyFit` 4 and `litArms` 1. The corpus's 86 that left `is rung`
+mostly moved, and did not clear. Alone, 40 now stop at `decided is condition`, an `if` over a
+constant `is` that legacy decides off its bytes. Another 7 stop at `is static empty fit`, 6 at
+`is static receiver place`, 4 at `is impossible null test` and 2 at `is static in a lambda`. The
+statement `if` that legacy writes with a dead arm is the next payoff: building it unblocks the 40.
+
+- **Byte proof:** mode 3 self-compile identical; `ir-identity --names` 9,037 identical, differ 0,
+  self-compile identical; `--cases` 7,556 identical, differ 0, witnesses 60 same; per-file
+  `tests/cases` A/B 8,670 same, differ 0. `tests/cases`' armed shadow adds no fail, differ or
+  mismatch row.
+- **Ratchets:** L2 fuel 104,920,629,097 → 104,981,539,745 (+0.06%); late demands, late tags,
+  phase state, ladder sets, dead exports and lint-self clean (`gate.sh --fast`).
+- **Compiler lines:** +107 / −16.
