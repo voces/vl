@@ -25,7 +25,8 @@ Minting earlier renumbers the minted nodes, but no output byte moves (readings b
 
 ## Cost
 
-The pre-pass is one recursive source-order walk over every emitted body: +0.23% L2 fuel.
+The pre-pass is one recursive source-order walk over every emitted body, along an `else if`
+chain's spine so depth costs no stack: +0.37% L2 fuel.
 
 - A per-function flag set in `arrNewFrameWalk` cost +0.05%, but it is state written in a rewrite
   pass and read in emit: phase-state `cross` 272 → 273 in `emit_state.vl`.
@@ -41,7 +42,8 @@ The baseline is not rewritten; the queue keeps drift refreshes.
 | corpus `coalesce chain` (alone) | 68 (67) | 0 (0) |
 | self-compile functions with no blocker | 19,400 | 19,401 (+1) |
 | armed self-shadow covered / matched | 19,400 / 19,400 | 19,401 / 19,401 |
-| L2 self-compile fuel | 105,397,354,342 | 105,641,681,635 (+0.23%) |
+| L2 self-compile fuel | 105,397,354,342 | 105,785,012,560 (+0.37%) |
+| tests/cases armed shadow covered / matched | 61,021 / 61,020 | 61,028 / 61,027 |
 
 The corpus gain is smaller than the class. Chains whose links reach a later arm now stop there:
 `coalesce mapJoinIf` 20 → 33, `niche nulBoolJoin` 12 → 18, `holeMap` 12 → 15.
