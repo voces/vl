@@ -15,4 +15,5 @@ kind, `RFieldNull`:
 
 ## Measured vs master 7781e9bd (fixpoint seeds on both sides)
 
-See the PR body: `--names` and `--claimless` differ 0.
+- `ir-identity.sh --names`: identical 9037, fail under both 3267, differ 0; self-compile identical.
+- `--claimless`: identical 14016, fail under both 3267, differ 0.
