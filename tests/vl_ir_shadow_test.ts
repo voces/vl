@@ -2421,3 +2421,21 @@ print(qnull().o == null)
     }
   },
 });
+
+// A bare block mid-body is rewritten to `if true { … }` (`drwBareBlock`), whose `true` the checker
+// never typed; it builds as a bool, so the block's statements build in place and match.
+const BARE_BLOCK_MID =
+  `function mid(x: i32) {\n  let y = x\n  {\n    const z = y + 1\n    y = z * 2\n  }\n  return y\n}\nfunction nested(x: i32) {\n  let y = x\n  {\n    {\n      y = y + 4\n    }\n    y = y + 1\n  }\n  return y\n}\nprint(mid(1))\nprint(nested(4))\n`;
+Deno.test({
+  name: "ir shadow: a bare block mid-body builds through its rewrite's untyped true and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(BARE_BLOCK_MID, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
+      throw new Error(`want mid and nested covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
