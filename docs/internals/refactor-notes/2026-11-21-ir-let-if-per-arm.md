@@ -25,9 +25,14 @@ and `boolean | null` (`declaration if per arm 2`).
 
 | reading | base | this change |
 | --- | ---: | ---: |
-| corpus functions with no blocker | 41,969 | RESULT |
-| corpus `declaration if per arm sink` (alone) | 67 (20) | RESULT |
-| corpus `declaration if per arm prelude` | 10 (3) | RESULT |
-| corpus `declaration if per arm 1` | 8 (8) | RESULT |
+| corpus functions with no blocker | 41,969 | 41,991 (+22) |
+| corpus `declaration if per arm sink` (alone) | 67 (20) | 0 |
+| corpus `declaration if per arm prelude` (alone) | 10 (3) | 0 |
+| corpus `declaration if per arm 1` (alone) | 8 (8) | 0 |
+| corpus `expression if union`, an arm's nested value `if` | 14 | 24 |
+| self-compile functions with no blocker | 19,145 | 19,147 (+2) |
+
+Most of the sink class's functions also stop at another blocker. About ten move on to a value
+`if` nested in an arm (`expression if union`), a class of its own.
 
 Legacy lines deleted: 0. Moved to `@ir`: 0.
