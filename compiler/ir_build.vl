@@ -514,7 +514,7 @@ import {
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { structIndexOfTy } from "./emit_atom_kinds"
-import { letBindingUnionTy } from "./emit_start_block"
+import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
   TY_I32,
@@ -2578,6 +2578,18 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   return out
 }
 
+// The container (`RC_REF_LIST`, `RC_MAP`) a box local of rep `ownRep` read at `ix` unboxes to at
+// list or map rep `rep` on legacy's `reflist` or `map` arm, else -1.
+function boxContainerReadOf(n: Ident, ix: i32, ownRep: i32, rep: i32): i32 {
+  const own = repNodeAt(ownRep)
+  if !(own is RBox || own is RNullable && own.rnDisc == 4) { return -1 }
+  return match identReadArmOf(n, ix, ibFnIx, false) {
+    "reflist" => if repNodeAt(rep) is RList { RC_REF_LIST } else { -1 }
+    "map" => if repNodeAt(rep) is RMap { RC_MAP } else { -1 }
+    "nulnone" | "nullread" | "defglobal" | "unbox" | "niche" | "capture" | "nonlocal" | "local" => -1
+  }
+}
+
 // Local `v` read at `rep`, which its narrowing gives it, not its own: a box at the variant a
 // destination unboxes it to, or a nullable at its inner rep; `cell` as `exprAt` passes it.
 function narrowedLocalRead(
@@ -2596,7 +2608,12 @@ function narrowedLocalRead(
     && repNodeAt(rep) is RRecord
     && narrowedVariantRepIs(narrowedBoxVariantPlain(ix, ibFnIx), rep)
   ) {
-    return irBLetTemp(b, { bnV: o, bnAt: ix, bnRep: rep, bnAtom: -1 }, ix, rep)
+    return irBLetTemp(
+      b,
+      { bnV: o, bnAt: ix, bnRep: rep, bnAtom: -1, bnCon: -1 },
+      ix,
+      rep,
+    )
   }
   // A list read's overrides (`identListOverrideOf`) are asked at the lowering, which holds them.
   if (
@@ -2627,7 +2644,20 @@ function narrowedLocalRead(
   ) {
     const ak = identUnboxAtomOf(ix, ibFnIx)
     if ak < 0 { return irBMiss("narrowed read dead") }
-    return irBLetTemp(b, { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak }, ix, rep)
+    return irBLetTemp(
+      b,
+      { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
+      ix,
+      rep,
+    )
+  }
+  // A union-box local narrowed to a ref-element list or a map arm reads unboxed to it.
+  const con = boxContainerReadOf(n, ix, ib.irVars[v].vRep, rep)
+  if con >= 0 {
+    // A loop's hoisted receiver reads it the same way again.
+    const cr: Rhs = { bnV: o, bnAt: ix, bnRep: rep, bnAtom: -1, bnCon: con }
+    ib.irReadAgain[ix] = cr
+    return irBLetTemp(b, cr, ix, rep)
   }
   // A union box narrowed to a smaller union is the same box, read at that union's box rep.
   if (
