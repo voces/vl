@@ -3109,6 +3109,33 @@ function identityNullTestVisit(n: BinExpr) {
   return 0
 }
 
+// A call the checker repointed to the function a record field always holds (`r.f(3)` becomes
+// `twice(3)`, a minted callee the parse bank may since have dropped) still reads the receiver
+// its own tokens name, `r . f ( … )`: the binding and its field are marked read (D17043). Any
+// other token shape marks nothing.
+function repointedReceiverRead(call: i32) {
+  if call < 0 || call >= nodeToks.length { return 0 }
+  let t = nodeToks[call]
+  if t < 3 || t >= P.toks.length || P.toks[t].text != ")" { return 0 }
+  let depth = 0
+  while t >= 0 {
+    const x = P.toks[t].text
+    if x == ")" { depth = depth + 1 }
+    if x == "(" { depth = depth - 1 }
+    if depth == 0 { break }
+    t = t - 1
+  }
+  if t < 3 || P.toks[t - 1].kind != "IDENT" || P.toks[t - 2].text != "." {
+    return 0
+  }
+  if P.toks[t - 3].kind != "IDENT" { return 0 }
+  // As a `x.m(…)` callee reads them: the receiver read and passed on, the property read.
+  const nid = lnFind(P.toks[t - 3].text)
+  bindMarkId(nid, 0)
+  nuRead[P.toks[t - 1].text] = true
+  return nuNoteIdent(-1, nid)
+}
+
 // Record the node-local names — the callee `Ident` of a `Call`, any bare `Ident` value
 // reference, and operator-method dispatch — into the name map, and resolve `Ident`
 // occurrences to their binding.
@@ -3119,10 +3146,12 @@ function nameVisit(ix: i32) {
     // native parser does not desugar at parse time, so `x.m(…)` stays
     // `Call { callFn: Member(x, "m") }` and the property is the UFCS method name the
     // call dispatches to.
+    if n.callFn >= P.nodes.length { repointedReceiverRead(ix) }
     if n.callFn >= 0 && n.callFn < P.nodes.length {
       const fn = nodeAt(n.callFn)
       if fn is Ident {
         refNamesAdd(fn.identName)
+        if fn.pos < 0 { repointedReceiverRead(ix) }
       } else if fn is Member {
         nuNoteCallee(n.callFn, fn)
         refNamesAdd(fn.memProp)
@@ -5506,6 +5535,7 @@ const klIrNode = [
   "SLet",
   "SListSet",
   "SLoop",
+  "SRangeLoop",
   "SRawOp",
   "SReturn",
   "SSetField",
@@ -5540,6 +5570,7 @@ const klPrimOp = [
   "not",
 ]
 const klRhs = [
+  "RAsUnion",
   "RAtomEq",
   "RAtomStr",
   "RBoxField",
@@ -5582,16 +5613,17 @@ const klRhs = [
   "RMapGet",
   "RMapGetOr",
   "RMapHas",
+  "RMapIter",
   "RMapNew",
   "RMapOp",
   "RMapSet",
   "RMemAccess",
+  "RMemOp",
   "RNulTest",
   "RNullOf",
   "RNumCast",
   "RNumIntr",
   "RNumWiden",
-  "ROmitNull",
   "RPrimOp",
   "RPrint",
   "RRawOp",
@@ -5670,8 +5702,8 @@ const klRawEff = [
 const klNarrowUnboxArm = ["container", "atom", "unbox", "none"]
 // `HoleBoxArm` — compiler/wasmEmit.vl
 const klHoleBoxArm = [
-  "null", "pass", "memberBox", "atom", "lit", "atomStr", "atomAsStr", "rec",
-  "obj", "refList", "mapScalar", "map", "clo", "ladder",
+  "null", "pass", "memberBox", "atom", "lit", "atomStr", "atomAsStr",
+  "nulNiche", "rec", "obj", "refList", "mapScalar", "map", "clo", "ladder",
 ]
 // `AsgValueArm` — compiler/wasmEmit.vl
 const klAsgValueArm = [
@@ -5849,6 +5881,10 @@ const klCoalArm = [
 
 // `MemAddrArm` — compiler/wasmEmit.vl
 const klMemAddrArm = ["bad", "lma", "const", "fold", "wide", "rest"]
+// `MemOpArm` — compiler/wasmEmit.vl
+const klMemOpArm = [
+  "size", "grow", "fill", "copy", "heapBase", "heapLimit", "shared",
+]
 // `MemReadArm` — compiler/emit_plan_union.vl
 const klMemReadArm = ["narrowed", "variant", "nulVariant", "shared"]
 // `VariantCoerceArm` — compiler/emit_plan_union.vl
@@ -6074,6 +6110,7 @@ const klSets: KlSet[] = [
     ksType: 0,
     ksMembers: klMemAddrArm,
   },
+  { ksName: "MemOpArm", ksType: 0, ksMembers: klMemOpArm },
   {
     ksName: "MemReadArm",
     ksType: 0,
@@ -6676,6 +6713,7 @@ const klFields: KlField[] = [
   { kfName: "aqArm", kfSet: "AtomEqArm" },
   { kfName: "asMode", kfSet: "AsMode" },
   { kfName: "asSrc", kfSet: "Opnd" },
+  { kfName: "auV", kfSet: "Opnd" },
   { kfName: "bcIx", kfSet: "Opnd" },
   { kfName: "bcV", kfSet: "Opnd" },
   { kfName: "bfV", kfSet: "Opnd" },
@@ -6753,11 +6791,14 @@ const klFields: KlField[] = [
   { kfName: "mgLoc", kfSet: "Opnd" },
   { kfName: "mhKey", kfSet: "Opnd" },
   { kfName: "mhLoc", kfSet: "Opnd" },
+  { kfName: "miV", kfSet: "Opnd" },
   { kfName: "mkKey", kfSet: "Opnd" },
   { kfName: "mkLoc", kfSet: "Opnd" },
   { kfName: "mlArm", kfSet: "ArrLitArm" },
   { kfName: "mlElems", kfSet: "Opnd" },
   { kfName: "mmArgs", kfSet: "Opnd" },
+  { kfName: "moArgs", kfSet: "Opnd" },
+  { kfName: "moArm", kfSet: "MemOpArm" },
   { kfName: "mpArgs", kfSet: "Opnd" },
   { kfName: "mpOp", kfSet: "MapOp" },
   { kfName: "mrFields", kfSet: "Opnd" },
@@ -6776,6 +6817,7 @@ const klFields: KlField[] = [
   { kfName: "ntV", kfSet: "Opnd" },
   { kfName: "nwV", kfSet: "Opnd" },
   { kfName: "nxArgs", kfSet: "Opnd" },
+  { kfName: "olRep", kfSet: "VKind" },
   { kfName: "pairEk", kfSet: "VKind" },
   { kfName: "pass", kfSet: "EmitPass" },
   { kfName: "pnV", kfSet: "Opnd" },

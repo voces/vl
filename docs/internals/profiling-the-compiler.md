@@ -738,7 +738,8 @@ A map `.delete` anywhere in compiler/*.vl reserves the map delete family for eve
   compiler running it and the profiler's epoch ticks add no fuel (89,463,711,270 under plain,
   `VL_GC_STATS=1` and the profiler alike, 2026-10-17), while the build that EMITS `--names`
   costs +5.5% (it writes the name and source sections), so the fuel is never read off the
-  `names` half of the pair.
+  `names` half of the pair. An arm query asked of every identifier read in the builder costs
+  ~0.15% L2; pre-test the IR var's rep first (#9396).
 * **`scripts/plumb-shape-cost.vl`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that
