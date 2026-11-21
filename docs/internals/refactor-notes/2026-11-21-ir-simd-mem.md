@@ -17,7 +17,10 @@
 
 ## Measured
 
-Stacked on #9310 and #9332; the PR body has the census rows against their merged head. The row
-`tests/ir-shadow-rows/simd-mem.vl` has 5 functions: a load at a node, at an offset, a store at a node
-and at a constant, and a discarded load. All 5 miss on #9310's seed and are covered and matched
-here.
+Against #9310's head plus #9332, with fixpoint seeds on both sides (full table in the PR body):
+- `tests/cases` functions with no blocker: 60,284 → 60,349 (+65). `simd memory access`: 71 → 0.
+- The self-compile and the distilled corpus hold no SIMD access, and are flat.
+
+The row `tests/ir-shadow-rows/simd-mem.vl` has 5 functions: a load at a node, at an offset, a store
+at a node and at a constant, and a discarded load. All 5 miss on #9310's seed and are covered and
+matched here.
