@@ -83,3 +83,10 @@ The arm's result must be the dispatch's rep as it stands; its temp takes the dis
 
 Armed `tests/cases`: the fail and mismatch rows are the same on both seeds, row for row
 (`spans: read index` 6, `effect outside I1` 4, three verifier rows); none is new.
+
+Fuel by step, each tree built by one seed (master `026aee96`'s merged fixpoint), L2 guest fuel:
+step 4 +78.3M (+0.075%), step 5 +9.7M, step 6 and the guard +9.7M, step 7 +15.8M, and the
+`ir_helper` import that replaced the checker's number types +25.1M. The compiler compiles no
+captured call, closure-expression call or lambda arm of its own, so nothing here runs a new arm
+in the self-compile. Step 4 adds 180 compiler lines (the `CapturedArgArm` ladder and the
+builder), which the self-compile compiles; the import edge's cost is not attributed further.
