@@ -6,7 +6,7 @@ shape and adds no parallel Rhs.
 
 ## Legacy's two copies
 
-`emitRecCopyFields` reads its source one of two ways, decided by `rcReadable`:
+`emitRecCopyFields` reads its source one of two ways, decided by `rcReReadable`:
 
 - **(i) Once.** A source that is not pure (`exprReReadable` false), copied into more than one
   field or with a nested record, is emitted once and `local.set` into `variantReboxSlot`. Each
