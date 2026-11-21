@@ -40,3 +40,13 @@ Self-compile blocker census:
 - `ref if chain join`: 3 → 3, still open.
 </content>
 </invoke>
+
+I8 census:
+
+| population | functions | start bodies |
+| --- | --- | --- |
+| self-compile | 19,398 → 19,403 | 138 → 138 |
+| distilled | 44,309 → 44,309 | 8,028 → 8,028 |
+| tests/cases | 60,657 → 60,678 | 4,371 → 4,372 |
+| capability probes | 494 → 496 | 141 → 141 |
+| filed witnesses | 17,426 → 17,428 | 3,275 → 3,278 |
