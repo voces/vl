@@ -27224,13 +27224,30 @@ function callRefPlainTail(callIx: i32, c: Call, fnIx: i32): string {
   }
   if topLambdaRecordFe(c.callFn) >= 0 { return "" }
   const ckey = cloCallSigKey(callIx, fnIx)
-  if ckey == "" || cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
-  const n = c.callArgs.length
-  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if ckey == "" { return "" }
   if (
     cloCallUnionResultUnrepresentable(callIx, fnIx)
     || cloCallReflistElemTwin(callIx, fnIx)
-    || fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
+  ) {
+    return ""
+  }
+  return callRefPlainArgsTail(callIx, c, fnIx, ckey)
+}
+
+// The part of the plain closure call `emitCallRefAt` writes at key `ckey`, which a bundle call
+// shares: an interned signature, no split set, each argument plain, and no wider result read
+// narrower; `ckey` when it holds, else "".
+function callRefPlainArgsTail(
+  callIx: i32,
+  c: Call,
+  fnIx: i32,
+  ckey: string,
+): string {
+  if cloSigTypeIdxAt(cloSigPosOfKey(ckey)) < 0 { return "" }
+  const n = c.callArgs.length
+  if n > 0 && sigParamKindAt(ckey, n - 1) == null { return "" }
+  if (
+    fnTagCallSplits(callIx) && !fnTagSetIsTagged(fnTagCallSetOf(callIx))
     || closureCallSetSplits(nodeTyAt(c.callFn, fnIx), elabSrcDecl(fnIx))
   ) {
     return ""
@@ -27518,24 +27535,59 @@ function emitBundleChoiceArg(arg: i32, bt: i32, sigs: i32[], fnIx: i32): i32 {
 // Call `c` through a parameter holding a bundle: the closure for the call's own signature, read
 // from its field and called at that signature. 1 where the callee holds no bundle.
 function emitBundleCall(callIx: i32, c: Call, fnIx: i32): i32 {
-  const par = bundleParamOfRead(c.callFn, fnIx)
-  if par < 0 { return 1 }
-  const sigs = bundleSigsOfParam(par)
-  const si = paramStructIdxOf(par)
-  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
-  const fi = sFieldIndex(si, "c" + i32ToStr(k))
-  if k < 0 || fi < 0 || si < 0 || si >= sHeapIdx.length {
+  if bundleParamOfRead(c.callFn, fnIx) < 0 { return 1 }
+  const pk = bundlePickOf(callIx, fnIx)
+  if pk.bpField < 0 {
     return emitFailAt(
       "emitProgram: a call through a lambda called at two signatures matches none of them",
       callIx,
     )
   }
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
-  fbStructGet(sHeapIdx[si], fi)
+  fbStructGet(pk.bpHeap, pk.bpField)
   const crDepth = callRefDepth
-  const crSlot = callRefNestSlot(callRefDepth)
-  fbLocalSet(crSlot)
-  return emitCallRefAt(callIx, c, fnIx, sigKeyOfTy(sigs[k]), crDepth, crSlot)
+  const crSlot = callRefStash()
+  if irShadowOn { callRefLegacyPlain[callIx] = "" }
+  const rc = emitCallRefAt(callIx, c, fnIx, pk.bpKey, crDepth, crSlot)
+  if rc >= 0 && irShadowOn && callRefLastPlain {
+    callRefLegacyPlain[callIx] = pk.bpKey
+  }
+  return rc
+}
+
+// The member a call `callIx` through a bundle parameter (D14841) reads in frame `fnIx`: the
+// record's heap, field `c<k>`, that closure's type and its `$fnsig` key; `bpField` -1 for none.
+export type BundlePick = { bpHeap: i32, bpField: i32, bpTy: i32, bpKey: string }
+
+export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) { return none }
+  const par = bundleParamOfRead(c.callFn, fnIx)
+  if par < 0 { return none }
+  const sigs = bundleSigsOfParam(par)
+  const si = paramStructIdxOf(par)
+  const k = bundleFieldOfCall(par, c.callArgs, fnIx)
+  const fi = sFieldIndex(si, "c" + i32ToStr(k))
+  if k < 0 || k >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return none
+  }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: sigs[k],
+    bpKey: sigKeyOfTy(sigs[k]),
+  }
+  return pk
+}
+
+// `callRefPlainKey` for a call through a bundle parameter, at its member's key; "" for any other.
+export function bundleCallRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const pk = bundlePickOf(callIx, fnIx)
+  if pk.bpField < 0 || pk.bpKey == "" { return "" }
+  return callRefPlainArgsTail(callIx, c, fnIx, pk.bpKey)
 }
 
 // Whether `arg` reads a `const` holding a returned record whole in function `fnIx`.
