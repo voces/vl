@@ -27,3 +27,17 @@ numeric kind, so a member cast out of a boxed union missed as `expression as`.
 
 No second unbox is written: the tail is legacy's, and IR-N4's `RBoxNarrow` atom arm ends in the
 same `emitUnionUnboxTail`. The coordinator ruled the split acceptable.
+
+## Readings (merge-base `411447248`, fixpoint seeds on both sides)
+
+| reading | base | this change |
+| --- | ---: | ---: |
+| tests/cases armed shadow covered / matched | 64,246 / 64,245 | 64,305 / 64,304 (same single fail row) |
+| the 46 tests/cases files with a union-arm miss: covered (= matched) | 342 | 395 |
+| corpus and self-compile functions with no blocker | 44,449 / 19,521 | unchanged (no `as` site there) |
+| L2 self-compile fuel | 106,901,368,168 | 107,089,911,430 (+0.18%) |
+
+Left in the union arm on those 46 files: `niche propagate` 10, `list across reps` 4, `literal
+union` 2, `niche one list` 1 and `operand rep` 1.
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
