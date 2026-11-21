@@ -233,6 +233,7 @@ import {
   objLitLayoutRowOf,
   objLitStashRowAt,
   objLitStashRowOf,
+  objLitStashes,
   objLitVariantLayoutAt,
   objLitVariantLayoutOf,
   objLitVariantStashAt,
@@ -437,6 +438,7 @@ import {
   nulLitAtomTexts,
   sFieldStoreKind,
   spreadBoxingSource,
+  structIndexOfObjCtx,
 } from "./emit_classify"
 import {
   declaredSlotOf,
@@ -1004,7 +1006,10 @@ function objLitAt(
   const plainRow = if at >= 0 && variant { objLitVariantLayoutAt(ix, at) } else if at >= 0 { objLitLayoutRowAt(ix, at) } else if arm == "struct" { objLitLayoutRowOf(ix, ibFnIx) } else { objLitVariantLayoutOf(ix, ibFnIx) }
   // Else legacy's order stash: each field in source order into a scratch local, then the layout.
   const stashRow = if plainRow >= 0 { -1 } else if at >= 0 && variant { objLitVariantStashAt(ix, at) } else if at >= 0 { objLitStashRowAt(ix, at) } else if arm == "struct" { objLitStashRowOf(ix, ibFnIx) } else { objLitVariantStashOf(ix, ibFnIx) }
-  const row = if plainRow >= 0 { plainRow } else { stashRow }
+  // A struct literal that omits fields is built at its row with each omitted field's null, as
+  // `emitObj` builds it, where no field's source order is observable.
+  const omitRow = if plainRow >= 0 || stashRow >= 0 || arm != "struct" { -1 } else { objLitOmitRow(ix, at) }
+  const row = if plainRow >= 0 { plainRow } else if stashRow >= 0 { stashRow } else { omitRow }
   if row < 0 { return irBMiss("object layout") }
   const start = if arm == "struct" { sFieldStart[row] } else { uFieldStart[row] }
   const cnt = if arm == "struct" { sFieldCount[row] } else { uFieldCount[row] }
@@ -1038,6 +1043,20 @@ function objLitAt(
     const k = repRecordKidOf(rep, ty, name)
     if k < 0 || k >= ks.length { return irBMiss("object field kid") }
     const valIx = objFieldVal(ix, name)
+    if valIx < 0 && omitRow >= 0 {
+      const nul = irBLetTempTy(
+        b,
+        { omRow: row, omField: fi },
+        ix,
+        ks[k],
+        fieldSiteTy(arm, row, fi),
+      )
+      if ibMiss != "" { return nul }
+      fields[k] = nul
+      layout[fi] = k
+      oi = oi + 1
+      continue
+    }
     const why = fieldPlainWhy(arm, row, fi, valIx, ks[k])
     if why != "" { return irBMiss(why) }
     const mark = b.length
@@ -1095,6 +1114,7 @@ function objLitAt(
     mrAt: ix,
     mrRow: at,
     mrVariant: variant,
+    mrBuiltRow: row,
     mrSet: set,
   }
   if at < 0 { return irBLetTemp(b, rhs, ix, rep) }
@@ -1104,6 +1124,14 @@ function objLitAt(
   irBNode(b, { lDst: t, lRhs: rhs }, ty, rep, ix)
   const o: Opnd = { ov: t }
   return o
+}
+
+// The struct row a literal omitting fields is built at (its destination's row `at`, else its own),
+// or -1: one with every given field a field of the row and no source order observable.
+function objLitOmitRow(ix: i32, at: i32): i32 {
+  const si = if at >= 0 { at } else { structIndexOfObjCtx(ix, ibFnIx) }
+  if si < 0 || si >= sFieldCount.length || objLitStashes(ix, si) { return -1 }
+  return si
 }
 
 // Field `fi` (kid `k`) of the order-stashed literal at `ix`, built at row `at`, set from `v`.
@@ -7107,7 +7135,8 @@ function lowerNodeIn(
     // A start body's top-level code, under the guards its whole build takes (`buildStart`).
     // A const cell's constant initializer hosts one too: it has no frame, so no variable.
     if !gPromoInStart && !gConstExprEmit { return "fragment outside a body" }
-    if gInitProgIdx >= 0 { return "progress cell" }
+    // The progress cell is the start body's to write between statements; a constant has none.
+    if gInitProgIdx >= 0 && !gConstExprEmit { return "progress cell" }
     ibReset(-1, "@fragment", -1)
   } else {
     if fnIx >= P.nodes.length { return "fragment outside a body" }
