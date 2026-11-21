@@ -280,6 +280,8 @@ import {
   coalBoxEnd,
   coalBoxOpen,
   coalBoxSlot,
+  coalNicheElse,
+  coalNicheOpen,
   coalNulRefBranch,
   coalNulRefJoinOpen,
   coalNulRefJoinPresent,
@@ -470,6 +472,7 @@ import {
   emptyFitPlanOf,
   fbRefIfOpenType,
 } from "./wasmEmit"
+import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
 import { forInLoopAt } from "./emit_plan_list"
@@ -2730,8 +2733,11 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
   }
   // A helper's `if` may yield a raw reference, as its hand-written body's did.
   const rr = repNodeAt(lw.irVars[t].vRep)
-  // An atom join, nullable at the `-1` niche or not, is an `i32` `if` (`emitIfExprAs` at 127).
-  const atomOut = rr is RAtom || rr is RNullable && rr.rnDisc == 3
+  // An atom join, nullable at the `-1` niche or not, or a boolean at its `2` niche, is an `i32`
+  // `if` (`emitIfExprAs` at 127).
+  const atomOut = rr is RAtom
+    || rr is RNullable && rr.rnDisc == 3
+    || repBoolNiche(lw.irVars[t].vRep)
   const refOut = lw.irHelper && rr is RRaw
   // A reference join takes legacy's blocktype for the `if` at its node (`emitIfExprRef`).
   const at = lw.irNodeAt[id] ?? -1
@@ -2807,6 +2813,8 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "popOr" => coalPopOr(n, e, pending)
     "mapIndexGetOr" => coalMapGetOr(n, e, pending)
     "nulRef" => coalNulRef(n, e, pending)
+    "litUnion" => coalNicheCell(n, e, -1, pending)
+    "nulBool" => coalNicheCell(n, e, 2, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -2888,6 +2896,26 @@ function coalNulRef(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     }
     "noBox" | "listClash" | "litAtom" => irLMiss("coalesce nulRef " + p.nrArm)
   }
+}
+
+// An i32 niche cell's `??` whose null is `sent`: the operand, the shared open, the default writing
+// the slotless out, then the stash or, where legacy re-reads the operand, the operand again.
+function coalNicheCell(
+  n: SCoalBox,
+  e: BinExpr,
+  sent: i32,
+  pending: i32[],
+): i32 {
+  const reEval = !coalLhsStashes(unwrapParen(e.binLeft))
+  cond(n.cbL, pending)
+  coalNicheOpen(sent, reEval)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  coalNicheElse(reEval)
+  if reEval { irLOpnd(n.cbL) }
+  lwFrames.pop()
+  fbEnd()
+  return 0
 }
 
 // The default of a nullable reference's `??` writing the slotless out, then, for a join, the

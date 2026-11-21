@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR coverage: a `??` over an i32 niche cell.** `l ?? d` over a `K | null` literal union, or over a `boolean | null`, is legacy's niche-cell `if` on the cell's null sentinel (`-1`, or `2`), its default lazy. Legacy's two arms now write through one shared open and else (`coalNicheOpen`, `coalNicheElse`), and the IR's new `SCoalBox` arms `litUnion` and `nulBool` lower through them. The present arm takes the stash where legacy stashes the operand (`coalLhsStashes`: a call, an `if`, a field of a call), and otherwise re-reads it. A re-read built over anything but a variable is a named miss (`coalesce niche place`).
