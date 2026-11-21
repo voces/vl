@@ -1,8 +1,22 @@
 // scripts/queue-candidate.sh resolves only purely additive list conflicts, and refuses the rest.
 // Each case builds a throwaway repository: a base, two branches, and the candidate built from them.
 
-const SCRIPT = new URL("../scripts/queue-candidate.sh", import.meta.url).pathname;
+const ROOT = new URL("../", import.meta.url).pathname;
+const SCRIPT = `${ROOT}scripts/queue-candidate.sh`;
+const VL = `${ROOT}scripts/vl-host/target/release/vl`;
+const SEED = `${ROOT}build/vl-compiler.wasm`;
+const exists = (f: string) => {
+  try {
+    return Deno.statSync(f).isFile;
+  } catch {
+    return false;
+  }
+};
+// A resolved .vl file is checked with `vl fmt --check`, so the cases that resolve need the host.
+const HAS_VL = exists(VL) && exists(SEED);
 const ENV = {
+  VL,
+  SEED,
   GIT_AUTHOR_NAME: "queue-test",
   GIT_AUTHOR_EMAIL: "queue-test@example.invalid",
   GIT_COMMITTER_NAME: "queue-test",
@@ -47,7 +61,7 @@ async function candidate(dir: string) {
 
 const UNION = "type U = RA\n  | RC\n  | RE\n\nconst ks = [\n  \"RA\",\n  \"RC\",\n  \"RE\",\n]\n";
 
-Deno.test("queue-candidate: two members added at one slot of a sorted list merge, sorted", async () => {
+Deno.test({ name: "queue-candidate: two members added at one slot of a sorted list merge, sorted", ignore: !HAS_VL, fn: async () => {
   const a = UNION.replace("  | RC\n", "  | RC\n  | RD\n").replace('  "RC",\n', '  "RC",\n  "RD",\n');
   const b = UNION.replace("  | RC\n", "  | RC\n  | RCc\n").replace('  "RC",\n', '  "RC",\n  "RCc",\n');
   const dir = await repo(UNION, a, b);
@@ -66,7 +80,56 @@ Deno.test("queue-candidate: two members added at one slot of a sorted list merge
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
-});
+} });
+
+const ARMS = "function f(r: U): i32 {\n  return match r {\n    RA => 1\n    RZ => 9\n  }\n}\n";
+const withArm = (arm: string) => ARMS.replace("    RZ => 9\n", `${arm}    RZ => 9\n`);
+
+Deno.test({ name: "queue-candidate: two whole one-line arms, or two type declarations, at one slot merge", ignore: !HAS_VL, fn: async () => {
+  for (const [a, b] of [
+    [withArm("    RB => 2\n"), withArm("    RC => 3\n")],
+    [
+      ARMS + "// A.\nexport type TA = { a: i32 }\n",
+      ARMS + "// B, which\n// takes two lines.\nexport type TB = { b: i32 }\n",
+    ],
+  ]) {
+    const dir = await repo(ARMS, a, b);
+    try {
+      const r = await candidate(dir);
+      const sha = /^candidate ([0-9a-f]{40})$/m.exec(r.out)?.[1];
+      if (r.code !== 0 || !sha || !/whole items, ours then theirs/.test(r.out)) {
+        throw new Error(`want both items resolved, got ${r.code}:\n${r.out}${r.err}`);
+      }
+      const got = await git(dir, "show", `${sha}:f.vl`);
+      for (const want of [a, b]) {
+        for (const line of want.split("\n").filter((l) => l && !ARMS.includes(l))) {
+          if (!got.includes(line)) throw new Error(`want "${line}" in the candidate, got:\n${got}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+} });
+
+Deno.test({ name: "queue-candidate: a duplicate head, an or-pattern arm or a non-fmt-clean result is refused", ignore: !HAS_VL, fn: async () => {
+  const cases: [string, string, RegExp][] = [
+    [withArm("    RB => 2\n"), withArm("    RB => 3\n"), /both sides add an item headed arm RB/],
+    [withArm("    RB | RC => 2\n"), withArm("    RD => 3\n"), /neither a list member nor a whole one-line arm or type/],
+    [ARMS + "export type TA = { a: i32 }   \n", ARMS + "export type TB = { b: i32 }\n", /not vl fmt clean/],
+  ];
+  for (const [a, b, want] of cases) {
+    const dir = await repo(ARMS, a, b);
+    try {
+      const r = await candidate(dir);
+      if (r.code !== 1 || !want.test(r.err)) {
+        throw new Error(`want exit 1 and ${want}, got ${r.code}:\n${r.out}${r.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  }
+} });
 
 Deno.test("queue-candidate: two arms that end alike are refused, not joined (control)", async () => {
   const base = "match r {\n    RA => {\n      f()\n    }\n}\n";
@@ -75,7 +138,7 @@ Deno.test("queue-candidate: two arms that end alike are refused, not joined (con
   const dir = await repo(base, a, b);
   try {
     const r = await candidate(dir);
-    if (r.code !== 1 || !/REFUSED f\.vl:\d+: a side adds a line that is not a list member/.test(r.err)) {
+    if (r.code !== 1 || !/REFUSED f\.vl:\d+: ours adds a line that is neither a list member nor a whole one-line arm or type/.test(r.err)) {
       throw new Error(`want exit 1 naming the hunk, got ${r.code}:\n${r.out}${r.err}`);
     }
   } finally {
