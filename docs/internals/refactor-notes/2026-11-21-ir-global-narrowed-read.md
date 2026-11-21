@@ -43,8 +43,8 @@ closed set in `lint.vl`). Legacy lines deleted: 0. The shadow row is
 
 **Measured on the way.**
 - Excluding discipline 4 inside the shared decision lost 18 corpus functions and 1 self-compile
-  function. A local whose rep reads as discipline 4 can be stored as the plain nullable reference,
-  which is the D14426 split again. So the exclusion is the global's storage fact, not the rep's.
+  function: locals at a discipline-4 rep that matched on the plain arm. So the exclusion is the
+  global's storage fact, not the rep's. Why those locals match is not measured here.
 - The first cut, with no storage test, mismatched on 27 `tests/cases` functions whose global is
   an `i32 | null` union cell.
 
