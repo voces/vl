@@ -66,7 +66,7 @@ import {
   nodeAt,
   nodeChildren,
 } from "./ast"
-import { unwrapParen } from "./emit_base"
+import { quoteLex, unwrapParen } from "./emit_base"
 import {
   fieldRowStorageKind,
   sFieldFlatRow,
@@ -149,6 +149,7 @@ import {
   RNumCast,
   RNumIntr,
   RNumWiden,
+  ROmitNull,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -480,6 +481,12 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  litMemberEqArmOf,
+  memberOrTail,
+  nulStrMemberClose,
+  nulStrMemberGuard,
+  nulStrMemberOpen,
+  strMemberEqTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
@@ -895,6 +902,12 @@ function rhs(r: Rhs, tail: boolean) {
       leaf()
       emitNullOwn(r.nuOwn)
     }
+    ROmitNull => {
+      leaf()
+      if emitOmittedFieldNull(r.omRow, r.omField) < 0 {
+        return irLMiss("omitted field null")
+      }
+    }
     RRetNull => {
       // The builder misses a function with no null plan; the lowering holds the same line itself.
       const plan = nullRetPlanOf(lw.irAt)
@@ -1102,7 +1115,8 @@ function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
 function makeRec(r: RMakeRec) {
   const variant = if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, lw.irAt) == "variant" }
   const stash = r.mrSrc.length > 0
-  const row = recRowOf(r.mrAt, r.mrRow, variant, stash)
+  // The row the builder built the fields by: the plain or stash layout, or a row omitting fields.
+  const row = if r.mrBuiltRow >= 0 { r.mrBuiltRow } else { recRowOf(r.mrAt, r.mrRow, variant, stash) }
   if row < 0 { return irLMiss("record row") }
   if r.mrSet { return makeRecStashed(r, row, variant) }
   if r.mrFields.length == 0 { leaf() }
@@ -1350,10 +1364,33 @@ function litArms(r: RLitArms) {
       }
       1
     }
-    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "memberEq" | "none" => {
+    "memberEq" => memberEqLits(r, n.isObj)
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "none" => {
       irLMiss("literal arms " + r.liArm)
     }
   }
+}
+
+// `memberEq`: per member, the receiver and its string compare, guarded at a `string | null`, each
+// after the first or-ed in, as `emitLitMemberEq` writes them.
+function memberEqLits(r: RLitArms, recvIx: i32) {
+  const texts = litIsMemberTexts(r.liAt)
+  let i = 0
+  while i < texts.length {
+    const lex = quoteLex(texts[i])
+    const a = litMemberEqArmOf(recvIx, lex, lw.irAt)
+    if a == "nulStr" { nulStrMemberOpen() }
+    else if a != "str" { return irLMiss("literal member " + a) }
+    irLOpnd(r.liV)
+    if a == "nulStr" { nulStrMemberGuard() }
+    if strMemberEqTail(lex, lw.irAt) < 0 {
+      return irLMiss("literal member compare")
+    }
+    if a == "nulStr" { nulStrMemberClose() }
+    memberOrTail(i)
+    i = i + 1
+  }
+  return 1
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
