@@ -16858,18 +16858,25 @@ function rangeTopLenOf(s: ForRange) {
 // a live hoist row — whose `len` cannot move while the row is live. `sIx` is the loop, the
 // declaration of `v`. Returns the count pushed.
 function rangeProofOpen(s: ForRange, sIx: i32, stepK: i32, dynStep: boolean) {
-  if dynStep || stepK <= 0 { return 0 }
-  if !exprIsNonNegIntLit(s.frFrom) { return 0 }
-  const recv = rangeTopLenOf(s)
-  const d = hoistPathDecl(recv)
-  if d < 0 { return 0 }
-  const row = liveListRowOf(d, hoistPathProp(recv))
+  if dynStep { return 0 }
+  const row = rangeProofRow(s, sIx, stepK)
   if row < 0 { return 0 }
-  const v = hoistDeclKey(sIx)
-  if blockRebindsDecl(s.frBody, v) { return 0 }
-  rpDecl.push(v)
+  rpDecl.push(hoistDeclKey(sIx))
   rpRow.push(row)
   return 1
+}
+
+// The live hoist row whose length bounds range loop `s` (statement `sIx`, static step `stepK`),
+// so its index reads by the loop var are proven; -1 for none.
+function rangeProofRow(s: ForRange, sIx: i32, stepK: i32): i32 {
+  if stepK <= 0 || !exprIsNonNegIntLit(s.frFrom) { return -1 }
+  const recv = rangeTopLenOf(s)
+  const d = hoistPathDecl(recv)
+  if d < 0 { return -1 }
+  const row = liveListRowOf(d, hoistPathProp(recv))
+  if row < 0 { return -1 }
+  if blockRebindsDecl(s.frBody, hoistDeclKey(sIx)) { return -1 }
+  return row
 }
 
 function rangeProofClose(n: i32) {
@@ -34075,6 +34082,56 @@ function emitForRangeStmt(s: ForRange, stmtIx: i32, fnIx: i32) {
   // The loop variable's scope is the loop (see `scopeUnbind`).
   scopeUnbind()
   return rc
+}
+
+// Why range loop `s`, statement `stmtIx` of `fnIx`, is not legacy's plain rolled loop: "" for a
+// static nonzero step that never wraps, written rolled with no hoist and no range proof; else
+// the arm legacy takes instead.
+export function forRangeRolledWhy(s: ForRange, stmtIx: i32, fnIx: i32): string {
+  if !forRangeStepIsConst(s.frStep) { return "dynamic step" }
+  const k = forRangeStaticStep(s)
+  if k == 0 { return "step" }
+  if getterRangeTrips(stmtIx, fnIx) >= 0 { return "getter" }
+  const bConst = rangeConstIs(s.frTo, fnIx)
+  const bVal = if bConst { rangeConstVal(s.frTo, fnIx) } else { 0 }
+  if bConst && rangeConstIs(s.frFrom, fnIx) {
+    const aVal = rangeConstVal(s.frFrom, fnIx)
+    if rangeUnrollTrips(s, aVal, bVal, k, fnIx) > 0 { return "unrolled" }
+  }
+  if rangePartialUnrollOk(s, k, false, fnIx) { return "partial" }
+  for c in loopHoistCands(-1, s.frBody, fnIx, stmtIx, -1) {
+    if hoistCandRow(c, -1, s.frBody, fnIx) >= 0 { return "hoisted" }
+  }
+  if rangeProofRow(s, stmtIx, k) >= 0 { return "proven" }
+  const rt: RangeTest = {
+    vIdx: -1,
+    bIdx: -1,
+    bConst: bConst,
+    bVal: bVal,
+    sIdx: -1,
+    dynStep: false,
+    stepK: k,
+    excl: s.frExcl,
+  }
+  if rangeMayWrap(s, rt) { return "wrap exit" }
+  return ""
+}
+
+// The static step of range loop `s`: 1 when it has none, else its folded integer literal; 0 when
+// none folds into an `i32`, a step the checker refuses.
+export function forRangeStaticStep(s: ForRange): i32 {
+  if s.frStep < 0 { return 1 }
+  const litIx = cexLitPeel(s.frStep)
+  if litIx < 0 { return 0 }
+  const lit = nodeAt(litIx)
+  if !(lit is NumLit) { return 0 }
+  const t = lit.numText
+  const neg = intLitIsNegated(s.frStep)
+  if numLexIsFloat(t) || !(numLexFitsI32(t) || neg && numLexIs2Pow31(t)) {
+    return 0
+  }
+  const k = parseI32(t)
+  return if neg { 0 - k } else { k }
 }
 
 // A range loop's continue test, its operands resolved: the loop var's local, the bound's local

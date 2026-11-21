@@ -1,3 +1,5 @@
+import { rangeConstIs, rangeConstVal } from "./emit_plan_list"
+import { blockHasContinueFor } from "./emit_query"
 // The IR shadow (ir-design-2026-11.md §5.2, step I0): with the shadow armed, `emitFuncCode`
 // hands each function here after its legacy lowering. The phase-A builder covers I1's set
 // (constants, primitive ops, locals, `if`/loops/`break`/`continue`/`return`, direct calls and
@@ -22,6 +24,7 @@ import {
   CharLit,
   ContinueStmt,
   ForIn,
+  ForRange,
   FuncDecl,
   Ident,
   IfStmt,
@@ -165,6 +168,8 @@ import {
   fnValueArmOf,
   fnValueFeOf,
   forInPlainWhy,
+  forRangeRolledWhy,
+  forRangeStaticStep,
   globalCtxNow,
   globalInitArmUnboxes,
   globalReadRecovers,
@@ -1823,9 +1828,11 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   // A walk's element is its loop's; a fragment inside a walk it did not build reads the element's
   // legacy slot, as a `let` it did not build, and its locals are checked against legacy's cells.
   const walkVar = dn is LoopVar && ((ibDeclVar[d] ?? -1) >= 0 || ib.irFragment)
-  if (dn is LetDecl || dn is Param || walkVar) && w >= 0 {
+  // A range loop's variable is the one its loop made; a range loop it did not build is legacy's.
+  const rangeVar = dn is ForRange && (ibDeclVar[d] ?? -1) >= 0
+  if (dn is LetDecl || dn is Param || walkVar || rangeVar) && w >= 0 {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
-    const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else { irBDeclVar(d) }
+    const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else if rangeVar { ibDeclVar[d] ?? -1 } else { irBDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
     if ib.irVars[v].vRep != rep {
       return narrowedLocalRead(b, n, ix, v, rep, cell)
@@ -5201,6 +5208,107 @@ function forInStmt(b: i32[], n: ForIn, ix: i32) {
   return 0
 }
 
+// A range loop legacy writes rolled (`forRangeRolledWhy`): the loop var, then the bound unless it
+// is constant, each at the slot its collect pass declared, then `while`'s block and loop around
+// the body, a `continue` landing at the end of an inner block, and the step before the back edge.
+function forRangeStmt(b: i32[], n: ForRange, ix: i32) {
+  const why = forRangeRolledWhy(n, ix, ibFnIx)
+  if why != "" { return skip("for range " + why) }
+  // Inside a list reserve region legacy's pushes append through its locals (D3623).
+  for e in ibReserveEnd {
+    if e >= 0 { return skip("for range in a reserve region") }
+  }
+  const k = forRangeStaticStep(n)
+  const s = declaredSlotOfDecl(ix)
+  const vw = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
+  const bw = if s >= 0 { declaredIndexAt(ibFnIx, s + 1) } else { -1 }
+  if vw < 0 || bw < 0 || localVarAt(vw) >= 0 || localVarAt(bw) >= 0 {
+    return skip("for range slot")
+  }
+  const ri = repNodeOfTy(TY_I32)
+  const a = irBExpr(b, n.frFrom)
+  if ibMiss != "" { return 0 }
+  if irBOpRep(a) != ri { return skip("for range bound rep") }
+  const v = irVarNew(ib, ri, TY_I32, "local", vw)
+  ibDeclVar[ix] = v
+  irBNode(b, { asDst: v, asSrc: a }, -1, ibNoValue, ix)
+  let bound: Opnd = { oiRep: ri, oiBits: 0 }
+  if rangeConstIs(n.frTo, ibFnIx) {
+    const c: Opnd = { oiRep: ri, oiBits: rangeConstVal(n.frTo, ibFnIx) as i64 }
+    bound = c
+  } else {
+    const t = irBExpr(b, n.frTo)
+    if ibMiss != "" { return 0 }
+    if irBOpRep(t) != ri { return skip("for range bound rep") }
+    const bv = irVarNew(ib, ri, TY_I32, "local", bw)
+    irBNode(b, { asDst: bv, asSrc: t }, -1, ibNoValue, ix)
+    const o: Opnd = { ov: bv }
+    bound = o
+  }
+  const brk = labelNew()
+  const top = labelNew()
+  const hasCont = blockHasContinueFor(n.frBody, n.frLabel, false)
+  const cont = if hasCont { labelNew() } else { top }
+  const loopBody: i32[] = []
+  const vo: Opnd = { ov: v }
+  const cmp: PrimOp = if k > 0 && n.frExcl { "lt" } else if k > 0 { "le" } else if n.frExcl { "gt" } else { "ge" }
+  const c = irBLetTempTy(
+    loopBody,
+    { poOp: cmp, poArgs: [vo, bound] },
+    ix,
+    ibBool,
+    TY_BOOL,
+  )
+  const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
+  const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
+  irBNode(
+    loopBody,
+    { siCond: c, siThen: [], siElse: exitBody, siOut: -1, siElseKw: true },
+    -1,
+    ibNoValue,
+    ix,
+  )
+  ibLoopName.push(n.frLabel)
+  ibLoopBrk.push(brk)
+  ibLoopCont.push(cont)
+  const fb: i32[] = []
+  const body = nodeAt(n.frBody)
+  if body is Block {
+    stmtRun(fb, body.blkStmts)
+  } else {
+    stmt(fb, n.frBody, NO_SIBS, -1)
+  }
+  ibLoopName.pop()
+  ibLoopBrk.pop()
+  ibLoopCont.pop()
+  if ibMiss != "" { return 0 }
+  if hasCont {
+    irBNode(
+      loopBody,
+      { bkLabel: cont, bkBody: fb, bkOut: -1 },
+      -1,
+      ibNoValue,
+      ix,
+    )
+  } else {
+    for x in fb { loopBody.push(x) }
+  }
+  const kk: Opnd = { oiRep: ri, oiBits: k as i64 }
+  const nv = irBLetTempTy(
+    loopBody,
+    { poOp: "add", poArgs: [vo, kk] },
+    ix,
+    ri,
+    TY_I32,
+  )
+  irBNode(loopBody, { asDst: v, asSrc: nv }, -1, ibNoValue, ix)
+  irBNode(loopBody, { brLabel: top, brHas: false, brVal: c }, -1, ibNoValue, ix)
+  const blockBody: i32[] = []
+  irBNode(blockBody, { lpLabel: top, lpBody: loopBody }, -1, ibNoValue, ix)
+  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
+  return 0
+}
+
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   if n.whileBlk != 0 || n.whileLv >= 0 { return skip("labelled block") }
   const brk = labelNew()
@@ -5406,6 +5514,9 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if v < 0 || n.letInit < 0 { return skip("declaration") }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
     const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
+    // The lowering opens a reserve over a function's body only (`reserveOpen`).
+    const inFn = ibFnIx >= 0 && ibFnIx < P.nodes.length && nodeAt(ibFnIx) is FuncDecl
+    if lr != null && !inFn { return skip("list reserve outside a function") }
     // Legacy writes a nullable or union binding's `if` initializer in each arm.
     const pa = letIfInitPerArmRep(ix, ibFnIx)
     if pa == 0 && letIfInitSinks(n.letInit, ibFnIx) {
@@ -5436,6 +5547,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     return 0
   }
   if n is ForIn { return forInStmt(b, n, ix) }
+  if n is ForRange { return forRangeStmt(b, n, ix) }
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
     if l < 0 || n.brkHasVal != 0 { return skip("break") }
