@@ -93,6 +93,7 @@ import {
 } from "./emit_atom_kinds"
 import {
   decodeStr,
+  exprEffectFree,
   isTestedLitLex,
   isTestsNull,
   quoteLex,
@@ -1991,8 +1992,8 @@ export function coerceListAtomOf(
 
 // How a value is boxed: `null`, a box as itself (`pass`), a member read as its field's box
 // (`memberBox`), an atom box of kind `hbKind` from `hbSrc` (`atom`) or a literal (`lit`), a `K | null`
-// atom as its string (`atomStr`), a record or object literal under arm `hbKind` (`rec`, `obj`), a ref
-// list under tag `hbKind` (`refList`), a map or closure under that arm of union `hbKind` (`map`, `clo`), or the ladder.
+// atom as its string (`atomStr`), a record or literal under arm `hbKind` (`rec`, `obj`), a ref list
+// or scalar map read (`refList`, `mapScalar`), a map or closure of union `hbKind` (`map`, `clo`), or the ladder.
 export type HoleBoxArm = "null"
   | "pass"
   | "memberBox"
@@ -2002,6 +2003,7 @@ export type HoleBoxArm = "null"
   | "rec"
   | "obj"
   | "refList"
+  | "mapScalar"
   | "map"
   | "clo"
   | "ladder"
@@ -2011,6 +2013,23 @@ export type HoleBox = { hbArm: HoleBoxArm, hbKind: i32, hbSrc: i32 }
 function holeBox(arm: HoleBoxArm, kind: i32, src: i32): HoleBox {
   const p: HoleBox = { hbArm: arm, hbKind: kind, hbSrc: src }
   return p
+}
+
+// The box plan of map read `exprIx` into `unionTy`: a scalar value's read
+// into a union holding that scalar and `null` boxes its miss as the null (`emitMapGetScalarBox`).
+// Every other map read is the ladder's.
+function mapReadBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
+  const ladder = holeBox("ladder", -1, -1)
+  const k = mapReadScalarBoxKind(exprIx, fnIx)
+  if k < 0 || !unionTyHasValueAtom(unionTy) { return ladder }
+  const uSet = msSetOfRow(unRowOfTyKey(unionTy))
+  if !coerceSetHasNull(uSet, boxDstName("", unionTy), unionTy) { return ladder }
+  if (
+    !msHasPlainValKind(if uSet >= 0 { uSet } else { msSetOfTyAny(unionTy) }, k)
+  ) {
+    return ladder
+  }
+  return holeBox("mapScalar", k, -1)
 }
 
 // The plan for boxing `exprIx` into `unionTy`, shared by the IR and `emitUnionBoxArg`: it decides
@@ -2033,7 +2052,9 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   const bare = nodeAt(bareIx)
   if bare is IfStmt || callIsNever(bareIx) { return ladder }
   // `emitUnionBoxArgGo`'s map-get rung: a map read delivers its miss as the union's own box.
-  if bare is Index && exprMap(bare.idxArr, fnIx) { return ladder }
+  if bare is Index && exprMap(bare.idxArr, fnIx) {
+    return mapReadBoxPlanOf(exprIx, unionTy, fnIx)
+  }
   // `emitUnionMapArmBox`: a map rides the box under its map arm's tag, which its writer reads.
   if (
     exprMap(exprIx, fnIx)
@@ -3626,6 +3647,52 @@ export function isPreArmOf(isIx: i32, fnIx: i32): IsPreArm {
     return "pin"
   }
   return "test"
+}
+
+// `emitIs`'s answer at a decided rung of `isPreArmOf`: the constant `idBit`, after the operand
+// evaluated for its effects when `idEval`. `idArm` is the rung; at `storage` or `test` the rest is
+// unread.
+export type IsDecided = { idArm: IsPreArm, idEval: boolean, idBit: i32 }
+
+export function isDecidedPlanOf(isIx: i32, fnIx: i32): IsDecided {
+  const arm = isPreArmOf(isIx, fnIx)
+  const nd0 = nodeAt(isIx)
+  const op = if nd0 is IsExpr { nd0.isObj } else { -1 }
+  const tested = isVarTyIxOf(isIx)
+  const covOp = if op >= 0 { nodeTyAt(op, fnIx) } else { -1 }
+  return match arm {
+    "storage" | "test" => {
+      const d: IsDecided = { idArm: arm, idEval: false, idBit: 0 }
+      d
+    }
+    "tautology" => {
+      const d: IsDecided = { idArm: arm, idEval: false, idBit: 1 }
+      d
+    }
+    "covers" | "fits" => {
+      const d: IsDecided = { idArm: arm, idEval: true, idBit: 1 }
+      d
+    }
+    // An effect-free operand answers a bare constant `staticIsGuard` reads, so the arm it
+    // guards is not lowered (D15606); any other is evaluated for its effects first (D15607).
+    "prim" => {
+      const same = tyPrimNameOf(covOp) == tyPrimNameOf(tested)
+      const d: IsDecided = {
+        idArm: arm,
+        idEval: same || !exprEffectFree(op),
+        idBit: if same { 1 } else { 0 },
+      }
+      d
+    }
+    "pin" => {
+      const d: IsDecided = {
+        idArm: arm,
+        idEval: !exprEffectFree(op),
+        idBit: if isPinOwn(covOp, tested) { 1 } else { 0 },
+      }
+      d
+    }
+  }
 }
 
 // Whether closed record or list type `op` is the tested type `t` itself.
