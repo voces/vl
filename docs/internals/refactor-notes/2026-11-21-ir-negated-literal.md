@@ -16,6 +16,13 @@ immediate, with the minus folded as the lowering folds a `neg` of one. `signedLi
 literal at the rep's width whatever its own (`numLitAt`, legacy's `emitNumLexAt`). `numLit` keeps
 the own-width check (`wide literal width`) for an unnegated literal.
 
+**A latent re-read miss.** With `nn(-1)` building, `tests/cases/soundness/short-circuit-write-may-not-run.vl`'s
+`str` reached `nn(-1) ?? (s = "w").length` and failed the verifier's rule 3. The assignment's
+re-read of `s`, a `string | null` local narrowed to `string`, recovers to the `str` rep, while the
+temp takes the target node's declared nullable type. `assignValue` now misses by name,
+`assignment value narrowed read`, where the target's own type is not held at the value's rep. Row
+file `tests/ir-shadow-rows/assignment-value-narrowed-read.vl`.
+
 ## Witness
 
 `tests/cases/numerics/negated-literal-at-its-own-width.vl` covers `-2147483647 - 1`, a plain
