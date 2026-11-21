@@ -70,6 +70,9 @@ const ROWS_DIR = `${ROOT}/tests/ir-shadow-rows`;
 const NAME_LINE = /^\/\/ (ir shadow: .+)$/;
 const COUNT_LINE = /^\/\/ expect (.+?) (=|>=) (\d+)$/;
 const ABSENT_LINE = /^\/\/ expect no row containing (.+)$/;
+// Coverage counts are floors: matched = covered is graded in every row, so a floor hides no
+// mismatch, and an exact count would red whenever another PR covers one more function.
+const FLOOR_KEYS = new Set(["covered", "matched", "start covered", "start matched"]);
 
 /** Parses one row file; a directive line it cannot read is an error, never a skipped check. */
 const parseRow = (file: string, text: string): FileRow => {
@@ -81,7 +84,9 @@ const parseRow = (file: string, text: string): FileRow => {
     const count = COUNT_LINE.exec(lines[i]);
     const absent = ABSENT_LINE.exec(lines[i]);
     if (absent) row.absent.push(absent[1]);
-    else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
+    else if (count && FLOOR_KEYS.has(count[1]) && count[2] === "=") {
+      throw new Error(`${file}:${i + 1}: want \`// expect ${count[1]} >= ${count[3]}\`, got an exact count: another PR's coverage would break it`);
+    } else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
     else throw new Error(`${file}:${i + 1}: unreadable directive ${JSON.stringify(lines[i])}`);
   }
   return row;
@@ -173,8 +178,17 @@ Deno.test({
       refused = true;
     }
     if (!refused) throw new Error("want a bad directive refused, got it parsed");
-    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered = 1\n${src}`));
-    for (const bad of ["// expect covered = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
+    for (const key of ["covered", "matched", "start covered", "start matched"]) {
+      let exact = false;
+      try {
+        parseRow("control.vl", `// ir shadow: control\n// expect ${key} = 1\n${src}`);
+      } catch {
+        exact = true;
+      }
+      if (!exact) throw new Error(`want an exact "${key}" count refused, got it parsed`);
+    }
+    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered >= 1\n// expect fns = 1\n${src}`));
+    for (const bad of ["// expect fns = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
       let failed = false;
       try {
         gradeRow(parseRow("control.vl", `// ir shadow: control\n${bad}\n${src}`));
