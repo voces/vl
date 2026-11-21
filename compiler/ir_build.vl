@@ -279,6 +279,7 @@ import {
   HoleBox,
   IsArm,
   IsDecided,
+  LitIsArm,
   TagIsArm,
   atomEqPlanOf,
   captureSlotOf,
@@ -833,10 +834,40 @@ function isLitArms(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
       const o: Opnd = { oiRep: rep, oiBits: bits }
       o
     }
-    "nicheRaw" | "atomNotNul" | "atomEq" | "boxLits" | "numBox" | "memberNoRecv" | "memberEq" | "none" => {
+    "nicheRaw" | "atomNotNul" | "atomEq" => isLitArmsTest(b, n, ix, rep, la)
+    "boxLits" | "numBox" | "memberNoRecv" | "memberEq" | "none" => {
       irBMiss("is rung litArms " + la)
     }
   }
+}
+
+// A literal arm that reads its operand and writes its own test (`RLitArms`): a ref niche's null
+// test, an atom's compare with the null id, or each member's compare. A re-read is a variable's.
+function isLitArmsTest(
+  b: i32[],
+  n: IsExpr,
+  ix: i32,
+  rep: i32,
+  la: LitIsArm,
+): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  const vn = repNodeAt(irBOpRep(v))
+  const ok = match la {
+    "nicheRaw" => vn is RNullable && vn.rnDisc != 3 && vn.rnDisc != 2
+    "atomNotNul" => atomNullable(irBOpRep(v))
+    "atomEq" => vn is RAtom || atomNullable(irBOpRep(v))
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "memberEq" | "none" => false
+  }
+  if !ok { return irBMiss("is literal arms operand rep") }
+  if (
+    la == "atomEq"
+    && (!(v is OVar) || v.ov < 0 || ib.irVars[v.ov].vKind == "temp")
+  ) {
+    return irBMiss("is literal arms receiver")
+  }
+  return irBLetTemp(b, { liV: v, liArm: la, liAt: ix }, ix, rep)
 }
 
 // Whether `emitListEmptyFitIs` answers 0 along plan `p`, passing to the next rung.
@@ -3167,8 +3198,8 @@ function ifBelowLeadIn(b: i32[], at: i32, to: i32, why: string): boolean {
   return false
 }
 
-// `fromCodePoint(cp)` over an i32, or `fromCodePoints(xs)` over a local i32 list, which legacy
-// reads twice by name. Any other list spelling legacy spills to a scratch slot: a named miss.
+// `fromCodePoint(cp)` over an i32, or `fromCodePoints(xs)` over a local or global i32 list, which
+// legacy reads twice by name. Any other list spelling legacy spills to a scratch slot: a named miss.
 function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
   if c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread {
     return missRhs("code point argument")
@@ -3181,7 +3212,11 @@ function fromCpRhs(b: i32[], c: Call, f: Ident, ix: i32): Rhs {
     if !(a is OVar) || a.ov < 0 || a.ov >= ib.irVars.length {
       return missRhs("code point list read")
     }
-    if ib.irVars[a.ov].vKind == "temp" {
+    // Legacy reads the list twice by name: a local's variable, or a global's read written again.
+    if (
+      ib.irVars[a.ov].vKind == "temp"
+      && !ib.irReadAgain.has(unwrapParen(c.callArgs[0]))
+    ) {
       return missRhs("code point list read")
     }
     const ln = repNodeAt(irBOpRep(a))
@@ -4452,15 +4487,22 @@ function deadNulTest(b: i32[], n: BinExpr, opIx: i32, ix: i32, rep: i32): Opnd {
 }
 
 // `__array_new__(n, fill)` as legacy's arm writes it (`arrNewPlanOf`): the length, the fill at the
-// list's element rep, then the allocation. `__array_new_default__`, a refused site and a fill
-// legacy boxes into a union element (`arrNewFillBoxTy`) are named misses.
+// list's element rep, then the allocation; `__array_new_default__` its own. A refused site and a
+// fill legacy boxes into a union element (`arrNewFillBoxTy`) are named misses.
 function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   if n.callFn < 0 || n.callFn >= P.nodes.length {
     return irBMiss("array new callee")
   }
   const f = nodeAt(n.callFn)
+  if (
+    f is Ident
+    && f.identName == "__array_new_default__"
+    && n.callArgs.length == 1
+  ) {
+    return arrNewDefault(b, n, ix, rep)
+  }
   if !(f is Ident) || f.identName != "__array_new__" || n.callArgs.length != 2 {
-    return irBMiss("array new default")
+    return irBMiss("array new callee")
   }
   const fill = n.callArgs[1]
   if arrNewPlanOf(ix, fill, ibFnIx).anWhy != "" {
@@ -4481,6 +4523,21 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
   }
   if irBOpRep(v) != ln.rlsElem { return irBMiss("array new fill coercion") }
   return irBLetTemp(b, { lnLen: len, lnFill: v, lnAt: ix }, ix, rep)
+}
+
+// `__array_new_default__(n)` as legacy's arm writes it (`arrNewPlanOf`): the length, then the
+// zeroed allocation. A refused site is a named miss.
+function arrNewDefault(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
+  if arrNewPlanOf(ix, -1, ibFnIx).anWhy != "" {
+    return irBMiss("array new refused")
+  }
+  if !(repNodeAt(rep) is RList) { return irBMiss("array new rep") }
+  const len = irBExpr(b, n.callArgs[0])
+  if ibMiss != "" { return len }
+  if repPrim(irBOpRep(len)) != "i32" {
+    return irBMiss("array new length coercion")
+  }
+  return irBLetTemp(b, { ldLen: len, ldAt: ix }, ix, rep)
 }
 
 // A linear-memory load or store of an i32 as legacy's arm writes it (`memAccessPlanOf`): the
