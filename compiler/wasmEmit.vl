@@ -14581,10 +14581,19 @@ function emitMapKeys(recvIx: i32, fnIx: i32) {
   if !fnUses.mapKeys {
     return emitFail("emitProgram: .keys() scratch frame not reserved")
   }
-  const shape0 = mapShapeOfExpr(recvIx, fnIx)
-  if shape0 == -3 { return failMapValueType() }
+  if mapShapeOfExpr(recvIx, fnIx) == -3 { return failMapValueType() }
+  for step in [0, 1, 2] {
+    if emitExpr(recvIx, fnIx) < 0 { return -1 }
+    mapKeysStep(recvIx, fnIx, step)
+  }
+  return 0
+}
+
+// `emitMapKeys` after its receiver's read number `step`: 0 the keys backing, 1 the live flags,
+// 2 the entry count, then the copy of the live keys into a fresh list of the key rep.
+export function mapKeysStep(recvIx: i32, fnIx: i32, step: i32) {
   // A Set's keys() runs on the mono machinery of its own KEY rep.
-  const shape = mapShapeFoldSet(shape0)
+  const shape = mapShapeFoldSet(mapShapeOfExpr(recvIx, fnIx))
   // The KEY rep, from the mono sentinel OR the mv slot's own column — the same question
   // `cmKeyKind` asks. A `{[i32]: string}`'s `.keys()` is an `i32[]` even though its shape
   // is an mv slot, so this cannot key off the sentinel alone.
@@ -14614,17 +14623,20 @@ function emitMapKeys(recvIx: i32, fnIx: i32) {
   const iL = mapKeysBase + 3
   const jL = mapKeysBase + 4
   const countL = mapKeysBase + 5
-  // keysBack = recv.keys.backing  (field 0 = keys wrapper, its field 0 = backing)
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  fbStructGet(mapTy, 0)
-  fbStructGet(keysWrap, 0)
-  fbLocalSet(keysBackL)
-  // live = recv.live  (field 2)
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  fbStructGet(mapTy, 2)
-  fbLocalSet(liveL)
+  if step == 0 {
+    // keysBack = recv.keys.backing  (field 0 = keys wrapper, its field 0 = backing)
+    fbStructGet(mapTy, 0)
+    fbStructGet(keysWrap, 0)
+    fbLocalSet(keysBackL)
+    return 0
+  }
+  if step == 1 {
+    // live = recv.live  (field 2)
+    fbStructGet(mapTy, 2)
+    fbLocalSet(liveL)
+    return 0
+  }
   // count = recv.count  (field 4 — entries INCLUDING tombstones)
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
   fbStructGet(mapTy, 4)
   fbLocalSet(countL)
   // out = array.new_default <keysBacking> count (sized at count; `len` set to live j)
@@ -14684,16 +14696,29 @@ function emitMapValues(recvIx: i32, fnIx: i32) {
   if !exprMap(recvIx, fnIx) {
     return emitFail("emitProgram: .values() receiver is not a map")
   }
-  const shape = mapShapeOfExpr(recvIx, fnIx)
-  // A SET's `.values()` yields its ELEMENTS (its keys), built by `emitMapKeys` — for
-  // both key reps, which is why the Set sentinel is a PAIR.
-  if shape == -2 || shape == -5 || shape == -7 {
-    return emitMapKeys(recvIx, fnIx)
-  }
-  if shape == -3 { return failMapValueType() }
+  if mapValuesAreKeys(recvIx, fnIx) { return emitMapKeys(recvIx, fnIx) }
+  if mapShapeOfExpr(recvIx, fnIx) == -3 { return failMapValueType() }
   if !fnUses.mapVals {
     return emitFail("emitProgram: .values() scratch frame not reserved")
   }
+  for step in [0, 1, 2] {
+    if emitExpr(recvIx, fnIx) < 0 { return -1 }
+    mapValsStep(recvIx, fnIx, step)
+  }
+  return 0
+}
+
+// Whether map receiver `recvIx` is a Set, whose `.values()` are its elements, its keys: for both
+// key reps, which is why the Set sentinel is a pair.
+export function mapValuesAreKeys(recvIx: i32, fnIx: i32): boolean {
+  const shape = mapShapeOfExpr(recvIx, fnIx)
+  return shape == -2 || shape == -5 || shape == -7
+}
+
+// `emitMapValues` over a map that is no Set, after its receiver's read number `step`: 0 the vals
+// backing, 1 the live flags, 2 the entry count, then the copy of the live values into a fresh list.
+export function mapValsStep(recvIx: i32, fnIx: i32, step: i32) {
+  const shape = mapShapeOfExpr(recvIx, fnIx)
   const mapTy = mapTypeIdxOf(shape)
   const valsWrap = mvValsWrapOf(shape)
   const valsBack = mvValsBackOf(shape)
@@ -14713,17 +14738,20 @@ function emitMapValues(recvIx: i32, fnIx: i32) {
     jL = mapKeysBase + 4
     countL = mapKeysBase + 5
   }
-  // valsBack = recv.vals.backing  (field 1 = vals wrapper, its field 0 = backing)
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  fbStructGet(mapTy, 1)
-  fbStructGet(valsWrap, 0)
-  fbLocalSet(valsBackL)
-  // live = recv.live  (field 2)
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  fbStructGet(mapTy, 2)
-  fbLocalSet(liveL)
+  if step == 0 {
+    // valsBack = recv.vals.backing  (field 1 = vals wrapper, its field 0 = backing)
+    fbStructGet(mapTy, 1)
+    fbStructGet(valsWrap, 0)
+    fbLocalSet(valsBackL)
+    return 0
+  }
+  if step == 1 {
+    // live = recv.live  (field 2)
+    fbStructGet(mapTy, 2)
+    fbLocalSet(liveL)
+    return 0
+  }
   // count = recv.count  (field 4 — entries INCLUDING tombstones)
-  if emitExpr(recvIx, fnIx) < 0 { return -1 }
   fbStructGet(mapTy, 4)
   fbLocalSet(countL)
   // out = array.new_default <valsBack> count
