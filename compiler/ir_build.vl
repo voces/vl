@@ -124,6 +124,7 @@ import {
   arrNewFillBoxTy,
   arrNewPlanOf,
   asgValueArmOf,
+  atomHookArmOf,
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
@@ -162,6 +163,7 @@ import {
   idxStorePlainWhy,
   ifExprJoinVt,
   ifExprPlainWhy,
+  ifExprShapeWhy,
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
@@ -1214,9 +1216,15 @@ function condIsTest(ix: i32): boolean {
 // next link, built along the spine rather than through `deliver` (D1990); the links' nodes and
 // their outs' assigns then land innermost first, the order a recursion's returns give them.
 function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
+  return ifExprAt(b, n0, ix0, rep0, -1)
+}
+
+// `ifExpr`, its first link built at type `ty0` where that is not -1: a destination's own, whose
+// rep `rep0` each arm then delivers at. Such a link ends the chain.
+function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
   const rj = ifRefJoinOf(ix0, ibFnIx)
   const rk = rj.rjKind
-  if rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
+  if ty0 < 0 && rk != null && ifExprPlainWhy(ix0, ibFnIx) == "ref " + rk {
     return ifRefExpr(b, n0, ix0, rep0, rj)
   }
   // The head's rep is the one the join plan writes every link at, else the chain is legacy's.
@@ -1237,7 +1245,8 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
   let cix = ix0
   const crep = rep0
   while true {
-    const pw = ifExprPlainWhy(cix, ibFnIx)
+    // A link built at a destination's type is `emitIfExprAs` at that type: its shape alone.
+    const pw = if ty0 >= 0 { ifExprShapeWhy(cix, ibFnIx) } else { ifExprPlainWhy(cix, ibFnIx) }
     if pw != "" { return irBMiss("expression if " + pw) }
     const c = irBExpr(cb, n.ifCond)
     if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
@@ -1246,8 +1255,9 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
       return irBMiss("decided is condition")
     }
     // Every link is written at the head's kind (`emitIfExprAs` asks `ifJoinPlanOf` of the head
-    // alone), so a link takes the head's rep and type, never its own.
-    const ty = if cix == ix0 { nodeTyAt(cix, ibFnIx) } else { tys[0] }
+    // alone), so a link takes the head's rep and type, never its own; a head built at a
+    // destination's type takes `ty0`.
+    const ty = if cix != ix0 { tys[0] } else if ty0 >= 0 { ty0 } else { nodeTyAt(cix, ibFnIx) }
     if irTyOpen(ty) { return irBMiss("open temp type") }
     const t = irVarNew(ib, crep, ty, "local", -1)
     const thenB = ifArm(n.ifThen, t, crep)
@@ -1270,6 +1280,7 @@ function ifExpr(b: i32[], n0: IfStmt, ix0: i32, rep0: i32): Opnd {
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
+    if ty0 >= 0 { return irBMiss("atom if join chain") }
     // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
     if !direct && armHasPrelude(n.ifElse) {
       return irBMiss("expression if else prelude")
@@ -2883,6 +2894,21 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     const vi = boxLitArmRow(ix)
     if vi >= 0 {
       return boxTempAt(b, objLitAtVariantRow(b, ix, vi), ix, dst, vi)
+    }
+  }
+  // A join of member literals the hook takes is built at an atom destination, each arm's
+  // literal its id, as legacy's `emitIfExprAs` writes it (`atomHookArmOf`'s `litJoin`).
+  if (
+    ibMiss == ""
+    && dst >= 0
+    && repNodeAt(dst) is RAtom
+    && exprPrePathWhy(ix, ibFnIx) == "pre-path atom hook"
+    && atomHookArmOf(ix, ibFnIx, false) == "litJoin"
+  ) {
+    const jn = nodeAt(unwrapParen(ix))
+    const jt = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+    if jn is IfStmt && jt >= 0 {
+      return ifExprAt(b, jn, unwrapParen(ix), dst, jt)
     }
   }
   // A member record read the box plan passes as its field's box is built at its storage.
