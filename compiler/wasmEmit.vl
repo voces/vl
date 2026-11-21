@@ -21436,6 +21436,14 @@ export function exprPrePathWhy(ix: i32, fnIx: i32): string {
   if ck != "none" && !(ck == "listCopy" && listCopyOwesNothing(ix, fnIx)) {
     return "pre-path coercion"
   }
+  return exprPrePathPastCoerce(ix, fnIx)
+}
+
+// `exprPrePathWhy` past its coercion, as `emitExpr` asks it of the node `coerceHeld` names: the
+// value a coercion converts.
+export function exprPrePathPastCoerce(ix: i32, fnIx: i32): string {
+  const w = unwrapParen(ix)
+  if w < 0 || w >= P.nodes.length { return "pre-path no node" }
   if fnTagLeafEmitted(ix, fnIx) >= 0 { return "pre-path tag leaf" }
   // The atom hook diverts only through one of its three arms; a string literal's own delivery is
   // the builder's `strLit`, over `strLitTakesAtom`.
@@ -30833,6 +30841,7 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   const r = emitExpr(exprIx, fnIx)
   coerceHeld = held
   if r < 0 { return -1 }
+  if ck == "listCopy" || ck == "mapRetag" { return coerceTail(exprIx, fnIx) }
   match ck {
     "listCopy" => {
       return emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
@@ -30860,6 +30869,19 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
     "none" => {}
   }
   return 0
+}
+
+// What a node-keyed coercion at `exprIx` writes after its value: a list copy's convert, or a
+// retagged union box's retag (a value that is no box is delivered as built). Legacy and the IR
+// share it.
+export function coerceTail(exprIx: i32, fnIx: i32): i32 {
+  const ck: CoerceKind = coerceKindAt(exprIx, fnIx)
+  // The seated kinds write their conversion around the value, at their own seat.
+  return match ck {
+    "listCopy" => emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
+    "mapRetag" => if exprUnion(exprIx, fnIx) { emitMapRetagTail(exprIx) } else { 0 }
+    "none" | "fnClo" | "mapUnbox" | "recCopy" | "box" | "unbox" | "atomstr" => 0
+  }
 }
 
 // The id of a tagged set just emitted for `exprIx`, replaced by the closure of the member it names:
@@ -41900,6 +41922,43 @@ function emitCoalesceCallArm(
   return emitPopOr(lhsIx, e.binRight, fnIx)
 }
 
+// `l ?? d` over an i32 niche cell whose null is `sent`: the operand once, the default on the null
+// path, and the present arm re-reading the operand when `reEval`, else the stash.
+function emitCoalesceNicheCell(
+  e: BinExpr,
+  sent: i32,
+  reEval: boolean,
+  fnIx: i32,
+): i32 {
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  coalNicheOpen(sent, reEval)
+  if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+  coalNicheElse(reEval)
+  if reEval {
+    if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  }
+  fbEnd()
+  return 0
+}
+
+// After a niche cell's operand: keep it in the stash slot unless `reEval`, then open the `if` the
+// default fills when the cell is `sent`.
+export function coalNicheOpen(sent: i32, reEval: boolean) {
+  if !reEval {
+    fbLocalSet(coalesceCallBoolSlot)
+    fbLocalGet(coalesceCallBoolSlot)
+  }
+  fbI32Const(sent)
+  fbI32Bin(70) // i32.eq
+  fbIf(127)
+}
+
+// A niche cell's present arm: the stashed operand unless `reEval`, whose caller re-reads it.
+export function coalNicheElse(reEval: boolean) {
+  fbElse()
+  if !reEval { fbLocalGet(coalesceCallBoolSlot) }
+}
+
 // The niche-cell arms of `emitCoalesceGo`, from the `boolean | null` select through the
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
@@ -41909,73 +41968,13 @@ function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   // one that is not (`coalLhsStashes`: a call, an `if`, a field of a call) is written once into
   // the stash slot `coalChainHasCallLhs` reserved (D1250, D17036).
   const lhsReEval = !coalLhsStashes(lhsIx)
-  // `<e> ?? d` over a `boolean | null` niche (an ident binding, a `boolean | null` struct field,
-  // or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the sentinel 2
-  // (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers every
-  // re-readable place.
-
-  // A branching `if` over the 0x7f blocktype, which is what `??` means: the default runs only
-  // when the lhs is null. `select` evaluates both value operands unconditionally, so a
-  // side-effecting default would run on the present path too — the same lowering the `K |
-  // null` niche, the `string | null` niche and every nullable-ref rep already use.
+  // A `boolean | null` cell holds 0/1 or the sentinel 2, a `K | null` cell an atom id or -1: a
+  // branching `if` on the sentinel, never a `select`, so the default runs only on the null path.
+  // `coalesceLitUnionFits` decides whether the rep survives the default (`k ?? "zz"` declines).
   if arm == "nulBoolJoin" { return emitCoalesceNulBoolJoin(e, exprIx, fnIx) }
-  if arm == "nulBool" {
-    if emitExpr(e.binLeft, fnIx) < 0 {
-      return -1 // the niche i32
-    }
-    // D1250 — a NON-RE-READABLE operand (an if-EXPRESSION) stashes its ONE evaluation, exactly
-    // as the `K | null` arm below does; a place operand keeps the re-read, byte-identical.
-    if !lhsReEval {
-      fbLocalSet(coalesceCallBoolSlot)
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbI32Const(2)
-    fbI32Bin(70) // 0x46 i32.eq → x == 2 (null)
-    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
-    if emitExpr(e.binRight, fnIx) < 0 {
-      return -1 // d, reached only on the null path
-    }
-    fbElse() // 0x05 else — present → the 0/1 cell
-    if lhsReEval {
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-    } else {
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbEnd() // 0x0b end
-    return 0
-  }
-  // `<e> ?? d` over a `K | null` niche (ident/param/global, a struct field, an element read, or
-  // a returning call). The i32 cell holds an interned atom id (>= 0) or sentinel `-1`, so the
-  // null test is the `-1` compare and the block type is unconditional `0x7f`.
-  // `coalesceLitUnionFits` is the one claim deciding whether the rep survives the default, so `k ?? "zz"` declines here and keeps its loud reject.
-
-  // A branching `if`, not a `select`: `select` evaluates both value operands, so a
-  // side-effecting default would run on the present path. The `if` framing costs three bytes
-  // more per site; a call lhs is stashed once in the shared i32 coalesce-call slot.
-  if arm == "litUnion" {
-    // The operand reads at the niche its classifier names, so a prelude join builds the atom.
-    if (emitExpr(e.binLeft, fnIx) < 0) {
-      return -1 // the niche i32, evaluated ONCE
-    }
-    if !lhsReEval {
-      fbLocalSet(coalesceCallBoolSlot)
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbI32Const(-1)
-    fbI32Bin(70) // 0x46 i32.eq → x == -1 (null)
-    fbIf(127)    // 0x04 if, 0x7f i32 blocktype
-    if (emitExpr(e.binRight, fnIx) < 0) {
-      return -1 // d, as this niche's i32
-    }
-    fbElse() // 0x05 else — present → the atom id
-    if lhsReEval {
-      if (emitExpr(e.binLeft, fnIx) < 0) { return -1 }
-    } else {
-      fbLocalGet(coalesceCallBoolSlot)
-    }
-    fbEnd() // 0x0b end
-    return 0
-  }
+  if arm == "nulBool" { return emitCoalesceNicheCell(e, 2, lhsReEval, fnIx) }
+  // The operand reads at the niche its classifier names, so a prelude join builds the atom.
+  if arm == "litUnion" { return emitCoalesceNicheCell(e, -1, lhsReEval, fnIx) }
   // `<e> ?? d` over a `K | null` niche whose default is not a member: the result is a
   // `string`, so the atom is evaluated once and the present arm widens it (D3198).
   if arm == "nulAtomStr" { return emitCoalesceNulAtomStr(e, fnIx) }

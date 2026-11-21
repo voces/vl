@@ -10,7 +10,11 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleReadFe } from "./emit_mono"
-import { bundleParamOfRead } from "./emit_bundle"
+import {
+  bundleAnyNoted,
+  bundleParamOfRead,
+  bundleSigsOfParam,
+} from "./emit_bundle"
 import { irTyF64, irTyI64 } from "./ir_helper"
 import { fnSigIdxOfFn } from "./emit_closure_sites"
 import { numUnionMinted } from "./check_union_mint"
@@ -163,6 +167,7 @@ import {
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
   eqRouteOf,
+  exprPrePathPastCoerce,
   exprPrePathWhy,
   fieldNullOwnOf,
   fieldStoreArmOf,
@@ -333,7 +338,9 @@ import {
 } from "./emit_plan_null"
 import {
   boxOwedAt,
+  coerceKindAt,
   instTyOrSelf,
+  listCopyAtNode,
   narrowedArmNeedsUnbox,
 } from "./emit_plan_coerce"
 import {
@@ -490,9 +497,9 @@ import {
   unionEqOperandOk,
   unwrapParen,
 } from "./emit_base"
-import { ifArmValueExpr, paramIndexOf } from "./emit_query"
+import { coalLhsStashes, ifArmValueExpr, paramIndexOf } from "./emit_query"
 import { fnRetNullBearing } from "./emit_nullable_rets"
-import { nullRetPlanOf } from "./emit_plan_null"
+import { CoalValArm, nullRetPlanOf } from "./emit_plan_null"
 import {
   f32Bytes,
   f64Bytes,
@@ -2300,6 +2307,11 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
+  // A bundle parameter holds a record of closures each instance types (D14841): read only at a
+  // member pick (`bundleCallRhs`).
+  if dn is Param && bundleAnyNoted() && bundleParamOfRead(ix, ibFnIx) >= 0 {
+    return irBMiss("bundle parameter read")
+  }
   if captureSlotOf(n.identName, ibFnIx) >= 0 {
     return captureRead(b, n, ix, rep)
   }
@@ -2409,7 +2421,8 @@ function liftCapVar(fe: i32, name: string): i32 {
 function cloValue(b: i32[], ix: i32, rep: i32): Opnd {
   const fe = cloValueFeOf(ix)
   if fe < 0 { return irBMiss(cloValueWhy(ix)) }
-  if closureValueWhy(fe) != "" { return irBMiss("closure value refused") }
+  const why = if cloValueIsCore(ix, fe) { closureValueCoreWhy(fe) } else { closureValueWhy(fe) }
+  if why != "" { return irBMiss("closure value refused") }
   const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, ix) } else { [] }
   if ibMiss != "" { return irBMiss(ibMiss) }
   return irBLetTemp(b, { mcFn: fe, mcEnv: env, mcAt: ix }, ix, rep)
@@ -2702,6 +2715,10 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     while i < c.callArgs.length {
       const at = b.length
       starts.push(at)
+      // A bundle parameter takes a record of closures, which the IR does not build.
+      if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
+        return missRhs("bundle argument")
+      }
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
       const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
       const a = deliver(b, c.callArgs[i], pr, -1)
@@ -2837,6 +2854,9 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   const args: Opnd[] = []
   let i = 0
   while i < c.callArgs.length {
+    if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
+      return missRhs("bundle argument")
+    }
     if capturedArgArmOf(c.callArgs[i], i, pos, ibFnIx) != "plain" {
       return missRhs("captured call argument coercion")
     }
@@ -2899,8 +2919,12 @@ function bundleCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     return missRhs("closure call plan disagrees")
   }
   const pk = bundlePickOf(ix, ibFnIx)
-  const v = irBExpr(b, c.callFn)
-  if ibMiss != "" { return missRhs("bundle callee") }
+  // The parameter's local, read only here: a bundle reached through a capture stays legacy's.
+  const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
+  const p = if cf is Ident { paramIndexOf(ibFnIx, cf.identName) } else { -1 }
+  const pv = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else { -1 }
+  if pv < 0 { return missRhs("bundle callee") }
+  const v: Opnd = { ov: pv }
   const crep = repNodeOfTy(pk.bpTy)
   if !(repNodeAt(crep) is RClosure) { return missRhs("bundle member rep") }
   const f = irBLetTempTy(b, { bpV: v, bpAt: ix }, c.callFn, crep, pk.bpTy)
@@ -4801,6 +4825,8 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if na == "nulAtomStr" { return coalAtomStr(b, n, lhsIx, ix, rep) }
   if na == "identBox" { return coalBox(b, n, lhsIx, ix, rep) }
   if na == "coll" || na == "clo" { return coalNulRef(b, n, lhsIx, ix, rep) }
+  if na == "litUnion" { return coalNicheCell(b, n, lhsIx, ix, rep, "litUnion") }
+  if na == "nulBool" { return coalNicheCell(b, n, lhsIx, ix, rep, "nulBool") }
   if na != "str" { return irBMiss("coalesce niche " + na) }
   if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
     return irBMiss("coalesce string shape")
@@ -4916,6 +4942,54 @@ function coalNulRef(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   irBNode(
     b,
     { cbL: l, cbArm: "nulRef", cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
+}
+
+// `l ?? d` over an i32 niche cell (legacy's `emitCoalesceNicheCell`): an atom's or a
+// `boolean | null`'s. The present arm re-reads the operand unless legacy stashes it
+// (`coalLhsStashes`), and a re-read is built only over a variable.
+function coalNicheCell(
+  b: i32[],
+  n: BinExpr,
+  lhsIx: i32,
+  ix: i32,
+  rep: i32,
+  arm: CoalValArm,
+): Opnd {
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  // Its value stays on the stack from here, so no temp an operand before it built may wait.
+  if endsInTemp(b) { return irBMiss("coalesce niche after an operand") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce niche operand") }
+  if !coalLhsStashes(lhsIx) && ib.irVars[l.ov].vKind == "temp" {
+    return irBMiss("coalesce niche place")
+  }
+  const lr = irBOpRep(l)
+  const ln = repNodeAt(lr)
+  if !(ln is RNullable) { return irBMiss("coalesce niche operand rep") }
+  const atom = arm == "litUnion"
+  if atom && ln.rnDisc != 3 || !atom && !repBoolNiche(lr) {
+    return irBMiss("coalesce niche operand rep")
+  }
+  if rep != lr && rep != ln.rnInner {
+    return irBMiss("coalesce niche result rep")
+  }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = irBExpr(nb, n.binRight)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce niche default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  irBNode(
+    b,
+    { cbL: l, cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
     ty,
     rep,
     ix,
@@ -5417,6 +5491,31 @@ function indexOfCoalescedNestedLit(n: Index): boolean {
 function exprAt(b: i32[], ix: i32, cell: boolean): Opnd {
   if ibMiss != "" || ix < 0 { return irBMiss("no node") }
   const pre = exprPrePathWhy(ix, ibFnIx)
+  if pre == "pre-path coercion" { return coerced(b, ix, cell) }
+  return exprAtPre(b, ix, cell, pre)
+}
+
+// A node-keyed coercion at `ix` (`emitCoerced`): the value built as legacy builds it under
+// `coerceHeld`, past the coercion, then the coercion's tail (`coerceTail`), at the type the copy
+// delivers or, for a retag, at the box's own.
+function coerced(b: i32[], ix: i32, cell: boolean): Opnd {
+  const ck = coerceKindAt(ix, ibFnIx)
+  if ck != "listCopy" && ck != "mapRetag" {
+    return irBMiss("pre-path coercion " + ck)
+  }
+  const v = exprAtPre(b, ix, cell, exprPrePathPastCoerce(ix, ibFnIx))
+  if ibMiss != "" { return v }
+  const ty = if ck == "listCopy" { heldTy(instTyOrSelf(listCopyAtNode(ix), ibFnIx)) } else { exprTyOf(ix) }
+  const rep = if ty >= 0 { primRepOfTy(ty) } else { -1 }
+  if rep < 0 { return irBMiss("pre-path coercion " + ck + " rep") }
+  if ck == "mapRetag" && irBOpRep(v) != rep {
+    return irBMiss("pre-path coercion retag rep")
+  }
+  return irBLetTempTy(b, { cvV: v, cvAt: ix }, ix, rep, ty)
+}
+
+// `exprAt` past the pre-path, whose answer for `ix` is `pre`.
+function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
   if pre == "pre-path tag leaf" { return tagLeaf(ix) }
   if pre == "pre-path tag dispatch" { return tagDispatch(b, ix) }
   if pre != "" { return irBMiss(pre) }
@@ -7359,8 +7458,23 @@ function cloValueFeOf(ix: i32): i32 {
     return -1
   }
   const fe = fnValueFeOf(n, sidOfNode(ix), ix, ibFnIx)
-  if fe < 0 || fnValueArmOf(fe, ix, -1) != "checked" { return -1 }
-  return fe
+  if fe < 0 { return -1 }
+  return match fnValueArmOf(fe, ix, -1) {
+    "checked" | "inert" | "aliasCore" => fe
+    "twin" | "unfixed" => -1
+  }
+}
+
+// Whether closure value `ix` of function `fe` is written without the generic-value refusal: a name
+// read on `fnValueArmOf`'s `inert` or `aliasCore` arm, which legacy writes by
+// `emitClosureValueCore`.
+function cloValueIsCore(ix: i32, fe: i32): boolean {
+  const n = nodeAt(ix)
+  if !(n is Ident) { return false }
+  return match fnValueArmOf(fe, ix, -1) {
+    "inert" | "aliasCore" => true
+    "checked" | "twin" | "unfixed" => false
+  }
 }
 
 // Why `cloValueFeOf` found no function for closure value `ix`.
