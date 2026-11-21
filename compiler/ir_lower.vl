@@ -66,7 +66,7 @@ import {
   nodeAt,
   nodeChildren,
 } from "./ast"
-import { unwrapParen } from "./emit_base"
+import { quoteLex, unwrapParen } from "./emit_base"
 import {
   fieldRowStorageKind,
   sFieldFlatRow,
@@ -481,6 +481,12 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  litMemberEqArmOf,
+  memberOrTail,
+  nulStrMemberClose,
+  nulStrMemberGuard,
+  nulStrMemberOpen,
+  strMemberEqTail,
 } from "./wasmEmit"
 import { coalLhsStashes } from "./emit_query"
 import { ifJoinPlanOf, ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
@@ -849,16 +855,16 @@ function rhs(r: Rhs, tail: boolean) {
       irLOpnd(r.czD)
       fbEnd()
     }
-    RListGet |
-      RListLen |
-      RListPush |
-      RListPop |
-      RListEq |
+    RCoerce |
       RListCat |
-      RCoerce |
-      RStrOp |
+      RListEq |
+      RListGet |
+      RListLen |
+      RListPop |
+      RListPush |
+      RListSlice |
       RMapFilter |
-      RListSlice => irLowerListHook(r)
+      RStrOp => irLowerListHook(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -920,11 +926,11 @@ function rhs(r: Rhs, tail: boolean) {
     RMemAccess => memAccess(r)
     RCallHost => hostCall(r)
     RCast |
-      RTagOf |
-      RMapSet |
-      RFnId |
+      RCellGet |
       RCellNew |
-      RCellGet => irLMiss("rhs outside I1")
+      RFnId |
+      RMapSet |
+      RTagOf => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
@@ -1351,10 +1357,33 @@ function litArms(r: RLitArms) {
       }
       1
     }
-    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "memberEq" | "none" => {
+    "memberEq" => memberEqLits(r, n.isObj)
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "none" => {
       irLMiss("literal arms " + r.liArm)
     }
   }
+}
+
+// `memberEq`: per member, the receiver and its string compare, guarded at a `string | null`, each
+// after the first or-ed in, as `emitLitMemberEq` writes them.
+function memberEqLits(r: RLitArms, recvIx: i32) {
+  const texts = litIsMemberTexts(r.liAt)
+  let i = 0
+  while i < texts.length {
+    const lex = quoteLex(texts[i])
+    const a = litMemberEqArmOf(recvIx, lex, lw.irAt)
+    if a == "nulStr" { nulStrMemberOpen() }
+    else if a != "str" { return irLMiss("literal member " + a) }
+    irLOpnd(r.liV)
+    if a == "nulStr" { nulStrMemberGuard() }
+    if strMemberEqTail(lex, lw.irAt) < 0 {
+      return irLMiss("literal member compare")
+    }
+    if a == "nulStr" { nulStrMemberClose() }
+    memberOrTail(i)
+    i = i + 1
+  }
+  return 1
 }
 
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
