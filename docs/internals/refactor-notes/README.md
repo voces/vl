@@ -8,6 +8,25 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-21-ir-tag-dispatch-stash](2026-11-21-ir-tag-dispatch-stash.md): IR coverage: a tag dispatch after an operand (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-simd-mem](2026-11-21-ir-simd-mem.md): IR coverage: SIMD loads and stores along the memory address plan (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-rep-null](2026-11-21-ir-rep-null.md): IR: the `null` unit rep (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-open-if-join](2026-11-21-ir-open-if-join.md): IR: a value if's join at an open function type (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-narrowed-box-container](2026-11-21-ir-narrowed-box-container.md): IR: a union-box local narrowed to a ref list or map arm (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-mem-wide](2026-11-21-ir-mem-wide.md): IR coverage: the wide memory accesses (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-is-lit-union-box](2026-11-21-ir-is-lit-union-box.md): IR coverage: litArms' box arms, a value-union box tested against literals (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-is-lit-member-eq](2026-11-21-ir-is-lit-member-eq.md): IR coverage: litArms' `memberEq` arm, a string receiver's member compares (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-i8a-residuals](2026-11-21-ir-i8a-residuals.md): I8a's residual cell classes: progress cell, an empty `null[]`, omitted fields (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-global-narrowed-read](2026-11-21-ir-global-narrowed-read.md): IR: a nullable global read at the member the checker narrowed it to, 2026-11-21
+- [2026-11-21-ir-global-cell-rep-pair](2026-11-21-ir-global-cell-rep-pair.md): IR: a module global's storage rep and binding rep, design note (D14426 family 2), 2026-11-21
+- [2026-11-21-ir-for-range-unrolled](2026-11-21-ir-for-range-unrolled.md): IR: a fully unrolled range loop (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-coalesce-chain](2026-11-21-ir-coalesce-chain.md): IR: a `??` chain builds from links minted ahead of the bodies, 2026-11-21
+- [2026-11-21-ir-closure-value-untyped](2026-11-21-ir-closure-value-untyped.md): IR: an untyped closure value at its destination's type, and one span guard retired, 2026-11-21
+- [2026-11-21-ir-closure-arg-box](2026-11-21-ir-closure-arg-box.md): IR: a closure-call argument into a union parameter, boxed at that parameter, 2026-11-21
+- [2026-11-21-ir-closure-arg-bool](2026-11-21-ir-closure-arg-bool.md): IR: a boolean or vector argument of a closure call, 2026-11-21
+- [2026-11-21-ir-box-stash-set](2026-11-21-ir-box-stash-set.md): IR: an order-stashed record boxed under its own arm (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-box-nul-niche](2026-11-21-ir-box-nul-niche.md): IR: a nullable ref boxed into a union that admits null (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-box-atom-as-str](2026-11-21-ir-box-atom-as-str.md): IR: a literal-union atom boxed as its member string (2026-11-21, lane IR-N2)
 - [2026-11-21-ir-typed-field-null](2026-11-21-ir-typed-field-null.md): IR: an explicit `null` record field takes its typed reference's null, 2026-11-21
 - [2026-11-21-ir-tail-residue](2026-11-21-ir-tail-residue.md): IR: the tail residue bundle (an atom `if` arm, an else-less tail `if`, an empty valued body), 2026-11-21
 - [2026-11-21-ir-spread-many-groups](2026-11-21-ir-spread-many-groups.md): IR spread, many groups (2026-11-21, lane IR-N3)
