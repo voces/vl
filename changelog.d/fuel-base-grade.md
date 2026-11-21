@@ -1,0 +1,3 @@
+## Infrastructure (Track F)
+
+- **The self-compile fuel tier grades a PR against its base master, not the ledgered baseline** (coordinator ruling). `scripts/self-compile-time.sh` measures the base's own L2 (merge-base with `origin/master`, from its fixpoint, cached per compiler tree and host) and reds past +1% of it, so master's accumulated drift no longer reds a batch. The rise on `self-compile-baseline.json` is printed as the cumulative line; past +3% it is reported for the next drift refresh, and only 1.5× still reds. `SELF_COMPILE_BASE` / `SELF_COMPILE_BASE_FUEL` override the base. `tests/budget_fuel_grade_test.ts` pins the grading.
