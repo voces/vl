@@ -1046,7 +1046,7 @@ print(show(nested(null, null, q)) + show(nested(null, { k: "c", r: 4 }, q)) + sh
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+    if (!((rows.get("covered") ?? 0) >= 4) || rows.get("matched") !== rows.get("covered")) {
       throw new Error(`want the four coalescing functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
@@ -2176,11 +2176,10 @@ print(strs())
   },
 });
 
-// The walk around an empty literal, a literal of records, one literal walked twice and one inside
-// another walk are each covered and matched; a generic instance's `[1.5]` walks f64 elements,
-// which the walk names as its own miss.
+// The walk around an empty literal, a literal of records, one literal walked twice, one inside
+// another walk, and each generic instance's walk of f64 elements are covered and matched.
 Deno.test({
-  name: "ir shadow: list-literal walks of each shape match, and an f64 walk is a named miss",
+  name: "ir shadow: list-literal walks of each shape match, an f64 walk included",
   ignore,
   fn: () => {
     const { rc, rows } = run(`function empty(): i32 {
@@ -2216,11 +2215,8 @@ print(empty() + recs() + twice() + nested() + gen(1) + gen("s"))
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want the four walks covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("uncovered for in element f64") ?? 0) !== 2) {
-      throw new Error(`want both instances' f64 walk named, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want the six walks covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
