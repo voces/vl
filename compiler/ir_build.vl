@@ -272,9 +272,11 @@ import {
   tagDispatchArms,
   tagDispatchIds,
   tagDispatchTy,
+  tagDispatchTyIsVoid,
   tailIfPlainWhy,
   tplStrHoleOf,
   trapCallNamed,
+  userFnTargetOf,
   valueIfLitTrue,
   variantFieldArmOf,
   variantFieldBoxTy,
@@ -3267,7 +3269,10 @@ export function irBStageLeads(
 // for a literal at neither.
 function stageTyOf(a: Opnd, ix: i32): i32 {
   const own = heldTy(exprTyOf(ix))
-  if !(a is OStr) || repNodeOfTy(own) == irBOpRep(a) { return own }
+  if repNodeOfTy(own) == irBOpRep(a) { return own }
+  // An immediate at a rep its type does not name (a function set's id) has no staged type.
+  if a is OImm { return -1 }
+  if !(a is OStr) { return own }
   const ctx = heldTy(ctxTyAt(ix, ibFnIx))
   return if repNodeOfTy(ctx) == irBOpRep(a) { ctx } else { -1 }
 }
@@ -5699,6 +5704,12 @@ function tagLeaf(ix: i32): Opnd {
 // delivered at the call's rep. A lambda arm, which legacy stages at its instance, and a result
 // past the scalars and strings, are named misses.
 function tagDispatch(b: i32[], ix: i32): Opnd {
+  return tagDispatchAt(b, ix, true)
+}
+
+// `tagDispatch`, its value read at the call's own rep when `read`; a statement's is dropped, so
+// only the dispatch's own result rep matters there.
+function tagDispatchAt(b: i32[], ix: i32, read: boolean): Opnd {
   const c = nodeAt(unwrapParen(ix))
   if !(c is Call) { return irBMiss("tag dispatch node") }
   const arms = tagDispatchArms(ix, ibFnIx)
@@ -5726,7 +5737,7 @@ function tagDispatch(b: i32[], ix: i32): Opnd {
   ) {
     return irBMiss("tag dispatch result")
   }
-  if primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
+  if read && primRepOf(ix) != rep { return irBMiss("tag dispatch result rep") }
   const f = irBExpr(b, c.callFn)
   if ibMiss != "" { return f }
   if repPrim(irBOpRep(f)) != "i32" { return irBMiss("tag dispatch callee rep") }
@@ -5786,6 +5797,101 @@ function tagDispatch(b: i32[], ix: i32): Opnd {
   }
   const o: Opnd = { ov: outs[0] }
   return o
+}
+
+// Whether tagged call `ix` leaves no value (`tagDispatchTyIsVoid` at its dispatch type).
+function tagDispatchStmtIsVoid(ix: i32): boolean {
+  const arms = tagDispatchArms(ix, ibFnIx)
+  if arms.length == 0 { return false }
+  return tagDispatchTyIsVoid(tagDispatchTy(ix, arms, ibFnIx))
+}
+
+// A statement call through a tagged set that leaves no value, as `emitFnTagDispatch` writes it:
+// the callee's set id kept, then a void `if` per member but the last, which takes the final
+// `else`. Each arm is its call as a statement, a valued member's result dropped.
+function tagDispatchVoid(b: i32[], ix: i32): i32 {
+  const c = nodeAt(unwrapParen(ix))
+  if !(c is Call) { return skip("tag dispatch node") }
+  const arms = tagDispatchArms(ix, ibFnIx)
+  const ids = tagDispatchIds(ix, ibFnIx)
+  if arms.length == 0 || ids.length != arms.length {
+    return skip("tag dispatch members")
+  }
+  for a in arms {
+    if tagArmLambdaCallee(a) >= 0 && lambdaArmFe(a) < 0 {
+      return skip("tag dispatch lambda arm")
+    }
+  }
+  // A callee read as an expression stages below the arms' `if`s, which the lowering refuses.
+  if !(nodeAt(unwrapParen(c.callFn)) is Ident) {
+    return skip("tag dispatch callee expression")
+  }
+  const f = irBExpr(b, c.callFn)
+  if ibMiss != "" { return 0 }
+  if repPrim(irBOpRep(f)) != "i32" { return skip("tag dispatch callee rep") }
+  irBNode(b, { efRhs: { tgsV: f } }, -1, ibNoValue, ix)
+  if arms.length == 1 { return tagArmStmt(b, arms[0]) }
+  const bs: i32[][] = []
+  const conds: Opnd[] = []
+  const thens: i32[][] = []
+  let cb = b
+  let k = 0
+  while k < arms.length - 1 {
+    const cv = tagIsTemp(cb, ids[k], ix)
+    const th: i32[] = []
+    tagArmStmt(th, arms[k])
+    if ibMiss != "" { return 0 }
+    bs.push(cb)
+    conds.push(cv)
+    thens.push(th)
+    const eb: i32[] = []
+    cb = eb
+    k = k + 1
+  }
+  tagArmStmt(cb, arms[arms.length - 1])
+  if ibMiss != "" { return 0 }
+  let elseB = cb
+  let j = bs.length - 1
+  while j >= 0 {
+    irBNode(
+      bs[j],
+      {
+        siCond: conds[j],
+        siThen: thens[j],
+        siElse: elseB,
+        siOut: -1,
+        siElseKw: true,
+      },
+      -1,
+      ibNoValue,
+      ix,
+    )
+    elseB = bs[j]
+    j = j - 1
+  }
+  return 0
+}
+
+// Dispatch arm call `a` as a statement into body `b`: a lambda arm a direct call of its instance.
+function tagArmStmt(b: i32[], a: i32): i32 {
+  const ac = nodeAt(a)
+  if !(ac is Call) { return skip("tag dispatch arm node") }
+  const fe = lambdaArmFe(a)
+  if fe >= 0 { return tagArmCall(b, directCallAt(b, ac, a, fe), a) }
+  // A member's call reaches the function legacy's resolves at this instance.
+  const cf = if ac.callFn >= 0 { nodeAt(ac.callFn) } else { null }
+  if !(cf is Ident) { return skip("tag dispatch arm callee") }
+  const t = userFnTargetOf(ac, cf, ibFnIx)
+  if t < 0 || t >= fnStmts.length { return skip("tag dispatch arm target") }
+  return tagArmCall(b, directCallAt(b, ac, a, t), a)
+}
+
+// Arm call `r` as a statement of body `b`, at arm node `a`.
+function tagArmCall(b: i32[], r: Rhs, a: i32): i32 {
+  if ibMiss != "" { return 0 }
+  irBNode(b, { efRhs: r }, -1, ibNoValue, a)
+  if dispatchDeclinesTail() { ib.irNoTailEff.push(b[b.length - 1]) }
+  return 0
 }
 
 // The test of the stashed id against member id `id`, a `bool` temp whatever the call's type.
@@ -7161,6 +7267,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       return trapStmt(b, n, ix)
     }
     if arrCopyCallNamed(n, ibFnIx) { return listCopyStmt(b, n, ix) }
+    // A call through a tagged function set is legacy's dispatch, its value dropped.
+    if exprPrePathWhy(ix, ibFnIx) == "pre-path tag dispatch" {
+      if tagDispatchStmtIsVoid(ix) { return tagDispatchVoid(b, ix) }
+      const v = tagDispatchAt(b, ix, false)
+      if ibMiss != "" { return 0 }
+      irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+      return 0
+    }
     const rhs = callRhs(b, n, ix)
     if ibMiss != "" { return 0 }
     // A discarded slice is a value legacy evaluates and drops.
