@@ -8,7 +8,17 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
-import { RAtom, RNullable, RRaw, RpPrim, repNodeAt } from "./emit_rep"
+import {
+  RAtom,
+  RClosure,
+  RList,
+  RMap,
+  RNullable,
+  RRaw,
+  RRecord,
+  RpPrim,
+  repNodeAt,
+} from "./emit_rep"
 import {
   ArrayLit,
   AsExpr,
@@ -78,7 +88,7 @@ import {
   structIndexOfExpr,
 } from "./emit_classify"
 import { storageReadEnter, storageReadLeave } from "./emit_elab"
-import { forInStringSrc } from "./emit_value_sites"
+import { forInStringSrc, forInU8Src } from "./emit_value_sites"
 import { scopeBind, scopeUnbind } from "./emit_mv_slots"
 import { declaredSlotOfDecl } from "./emit_struct_order"
 import {
@@ -99,6 +109,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvDrop,
   REnvGet,
   RFnId,
   RGetField,
@@ -123,6 +134,7 @@ import {
   RMapNew,
   RMapOp,
   RMapSet,
+  RMemAccess,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -267,6 +279,9 @@ import {
   emitCapturedRead,
   emitClosureIds,
   emitClosureValue,
+  emitEnvCacheClose,
+  emitEnvCacheDrop,
+  emitEnvCacheOpen,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapGetTail,
@@ -275,16 +290,18 @@ import {
   emitNullOwn,
   emitNullRetTail,
   emitStrLitAt,
+  emitUnionNullToPair,
   emitUnionUnboxTail,
+  envCacheSlotOfFe,
   f64RemCallTail,
   f64RemOperandTail,
-  fallThroughPadOf,
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
+  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -306,6 +323,7 @@ import {
   holeBoxHead,
   holeBoxTail,
   holeBoxTyAt,
+  hostCallTail,
   identListOverrideOf,
   idxRowsOn,
   idxSpanOn,
@@ -335,6 +353,9 @@ import {
   mapRecvShapeOf,
   mapSetTail,
   mapSizeTail,
+  memAccessPlanOf,
+  memAccessTail,
+  memAddrPlanOf,
   narrowedMemTail,
   narrowedVariantTail,
   nulTestAtomTail,
@@ -387,6 +408,8 @@ import {
   tagStashTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
+  unionBoxToPairTail,
+  unionLetSinkClose,
   unionUnionEqTail,
   userGlobalIdx,
   userGlobalReadClass,
@@ -410,6 +433,7 @@ import {
 } from "./emit_plan_union"
 import { CoalBoxArm, coalValBoxArm, nullRetPlanOf } from "./emit_plan_null"
 import {
+  NulTestArm,
   binNulTestOf,
   coalResultKindOf,
   coalesceNulStrStaysNullable,
@@ -426,7 +450,7 @@ import { fbOpenIf } from "./emit_bytes"
 import { atomHookArmOf, fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
-import { arrLitArmOf, forInLoopAt } from "./emit_plan_list"
+import { forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -827,9 +851,12 @@ function rhs(r: Rhs, tail: boolean) {
     RMapOp => mapOp(r)
     RListNew => listNew(r)
     RListCopy => irLMiss("list copy value")
-    RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RMemAccess => memAccess(r)
+    RCallHost => hostCall(r)
+    RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
+    REnvDrop => irLMiss("env drop as a value")
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -931,8 +958,19 @@ function rawEff(n: SRawOp, pending: i32[], at: i32) {
     "call" => fbCall(n.srImm)
     "reserve.open" => reserveOpen(n, at)
     "reserve.close" => listBuildClose(n.srImm)
+    "sink.put" | "sink.null" | "sink.close" => sinkPairOp(n)
   }
   return 0
+}
+
+// A union binding sink's pair write (`emitUnionIfBindingSink`): an arm's box into the pair, the
+// missing `else`'s null into it, or the binding's one box built from it into variable `srImm`.
+function sinkPairOp(n: SRawOp) {
+  if n.srOp == "sink.null" { return emitUnionNullToPair() }
+  const idx = varSlot(n.srImm)
+  if idx < 0 { return irLMiss("unmapped slot") }
+  if n.srOp == "sink.put" { return unionBoxToPairTail(idx) }
+  return unionLetSinkClose(idx)
 }
 
 // `reserve.open` after `let` `at` (statement `srHeap` of its block) stored variable `srImm`:
@@ -1026,8 +1064,12 @@ function makeClo(r: RMakeClo) {
     // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
     const envIdx = fnEnvIdxOf(r.mcFn)
     if envIdx < 0 { return irLMiss("closure env") }
+    // An environment this frame caches is built at its first read in an activation (D7480).
+    const ck = envCacheSlotOfFe(r.mcFn)
+    if ck >= 0 { emitEnvCacheOpen(ck) }
     for o in r.mcEnv { irLOpnd(o) }
     fbStructNew(envIdx)
+    if ck >= 0 { emitEnvCacheClose(ck) }
     emitClosureIds(r.mcFn)
   } else {
     leaf()
@@ -1095,15 +1137,23 @@ function globalRead(sym: i32, nonNull: boolean) {
   return 0
 }
 
+// The arm `RNulTest` `r` lowers at: a `== null` compare's, or an `is` test's niche-only one, as
+// legacy's `emitIsArm` asks it; null for any other node.
+function nulTestOpArm(r: RNulTest): NulTestArm | null {
+  if r.ntAt < 0 || r.ntAt >= P.nodes.length { return null }
+  const n = nodeAt(r.ntAt)
+  if n is IsExpr { return nulTestArmOf(n.isObj, lw.irAt, r.ntInvert, true) }
+  if !(n is BinExpr) { return null }
+  const bt = binNulTestOf(n)
+  if bt == null { return null }
+  return nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false)
+}
+
 // `RNulTest`: the operand, then legacy's tail for the arm `nulTestArmOf` names: the atom
 // sentinel's compare, a nullable ref's `ref.is_null`, or a union box's null tag compare.
 function nulTestOp(r: RNulTest) {
-  if r.ntAt < 0 { return irLMiss("null test node") }
-  const n = nodeAt(r.ntAt)
-  if !(n is BinExpr) { return irLMiss("null test node") }
-  const bt = binNulTestOf(n)
-  if bt == null { return irLMiss("null test node") }
-  const arm = nulTestArmOf(bt.bnRef, lw.irAt, r.ntInvert, false)
+  const arm = nulTestOpArm(r)
+  if arm == null { return irLMiss("null test node") }
   if arm == "atom" {
     irLOpnd(r.ntV)
     return nulTestAtomTail(r.ntInvert)
@@ -1327,6 +1377,32 @@ function listNew(r: RListNew) {
   return arrNewTail(pl, slot)
 }
 
+// `RMemAccess`: legacy's load or store arm in `emitCallCoreMemAccess`'s order: the address the
+// builder took along `memAddrPlanOf`'s arm, a store's value, then the access at the plan's offset.
+function memAccess(r: RMemAccess) {
+  const c = nodeAt(r.mmAt)
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length {
+    return irLMiss("memory access node")
+  }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return irLMiss("memory access node") }
+  const p = memAccessPlanOf(f.identName)
+  const ap = memAddrPlanOf(c, p.mxBase, lw.irAt)
+  if p.mxOp < 0 || (ap.maArm != "const" && ap.maArm != "rest") {
+    return irLMiss("memory access plan")
+  }
+  for o in r.mmArgs { irLOpnd(o) }
+  return memAccessTail(p, ap.maOff)
+}
+
+// `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
+function hostCall(r: RCallHost) {
+  for a in r.chArgs { irLOpnd(a) }
+  hostCallTail(r.chImport)
+  if r.chNever { fbUnreachable() }
+  return 0
+}
+
 // `RListCopy`: legacy's `__array_copy__` arm in `emitArrayCopyIntr`'s order, each list operand
 // followed by its backing read, then the copy, at `arrCopyPlanOf`'s pair.
 function listCopy(r: RListCopy) {
@@ -1351,7 +1427,7 @@ function makeList(r: RMakeList) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
-  const arm = arrLitArmOf(r.mlAt, fnIx, lb)
+  const arm = r.mlArm
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
@@ -1434,7 +1510,7 @@ function forIn(n: SForIn, pending: i32[]) {
     vSlot,
     ek,
     forInStringSrc(s.fiIter, fnIx),
-    false,
+    forInU8Src(s.fiIter, fnIx),
   )
   if lp == null { return irLMiss("walk backing") }
   if n.xfMap >= 0 {
@@ -1864,7 +1940,8 @@ function boxOp(r: RToBox) {
   const fnIx = lw.irAt
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
-  leaf()
+  // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
+  if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
   holeBoxHead(p, r.bxAt, fnIx)
   if (
     p.hbArm == "pass"
@@ -2204,10 +2281,29 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
+      // A store leaves nothing; a discarded load leaves its value, which legacy drops.
+      if r is RMemAccess {
+        memAccess(r)
+        irLSettle(pending)
+        if r.mmArgs.length == 1 { fbDrop() }
+        return 0
+      }
+      if r is REnvDrop {
+        emitEnvCacheDrop(r.edFn)
+        irLSettle(pending)
+        return 0
+      }
       if r is RTagStash {
         irLOpnd(r.tgsV)
         tagStashTail()
         irLSettle(pending)
+        return 0
+      }
+      // A void import leaves nothing; any other host call's discarded value is dropped.
+      if r is RCallHost {
+        hostCall(r)
+        irLSettle(pending)
+        if !r.chVoid { fbDrop() }
         return 0
       }
       irLMiss("effect outside I1")
@@ -2468,8 +2564,12 @@ function valuedIfOpen(id: i32, n: SIf, pending: i32[]): i32 {
     return IF_DONE
   }
   const vt = if atomJoin || atomOut { 127 } else { valtypeOf(lw.irVars[t].vRep) }
-  // A string out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
-  const strOut = repPrim(lw.irVars[t].vRep) == "str"
+  // A string or reference out at a call is a tag dispatch's, which opens through `tagDispatchIfOf`.
+  const strOut = (repPrim(lw.irVars[t].vRep) == "str"
+    || rr is RRecord
+    || rr is RList
+    || rr is RMap
+    || rr is RClosure)
     && at >= 0
     && nodeAt(unwrapParen(at)) is Call
   const rj = if vt < 0 && !refOut && !strOut && at >= 0 { ifRefJoinOf(at, lw.irAt) } else { noRefJoin() }
@@ -2705,10 +2805,12 @@ function spanOpen(id: i32) {
 }
 
 // Closes, innermost first, every open span whose last node is `id`, banking a row for each that
-// wrote bytes.
+// wrote bytes. The scan stops once each span `id` ends (`irSpanEnds`) is closed.
 function spanClose(id: i32) {
+  let need = lw.irSpanEnds[id] ?? 0
+  if need == 0 { return 0 }
   let i = lwSpanOpen.length - 1
-  while i >= 0 {
+  while i >= 0 && need > 0 {
     const k = lwSpanOpen[i]
     if k >= 0 && lw.irSpanLast[k] == id {
       const from = lwSpanAt[i]
@@ -2720,13 +2822,14 @@ function spanClose(id: i32) {
         lwRowKind.push(lw.irSpanKind[k])
       }
       lwSpanOpen[i] = -1
+      need = need - 1
     }
     i = i - 1
   }
-  // Drop the closed rows, keeping the open ones in order.
+  // Drop the closed rows past `i`, keeping the open ones in order.
   const o2: i32[] = []
   const a2: i32[] = []
-  let j = 0
+  let j = i + 1
   while j < lwSpanOpen.length {
     if lwSpanOpen[j] >= 0 {
       o2.push(lwSpanOpen[j])
@@ -2734,8 +2837,12 @@ function spanClose(id: i32) {
     }
     j = j + 1
   }
-  lwSpanOpen = o2
-  lwSpanAt = a2
+  while lwSpanOpen.length > i + 1 {
+    lwSpanOpen.pop()
+    lwSpanAt.pop()
+  }
+  for x in o2 { lwSpanOpen.push(x) }
+  for x in a2 { lwSpanAt.push(x) }
   return 0
 }
 
@@ -2850,8 +2957,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
   body(f.irBody, !valued && f.irAt >= 0, -1, false)
-  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
-  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
+  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).

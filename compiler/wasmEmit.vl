@@ -327,6 +327,7 @@ import {
   externGlobalLinkOfNode,
   externLinkOf,
   externParamAt,
+  externRetIsVoid,
   getDeclPropOf,
   hasNamedArgs,
   hasSpreadItem,
@@ -408,6 +409,7 @@ import {
 } from "./emit_base"
 import {
   blockHasContinueFor,
+  coalLhsStashes,
   constFoldOfLet,
   exprIsIfStmt,
   globalCellIsImmutable,
@@ -439,6 +441,7 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
+  LiFrame,
   ListKind,
   PK_I16,
   PK_U16,
@@ -628,6 +631,7 @@ import {
   leqSScratchBase,
   leqgBases,
   liBack,
+  liFrameSave,
   liKinds,
   liSlots,
   liftWbEnd,
@@ -1708,6 +1712,7 @@ import {
   NULL_OWN_ATOM,
   NULL_OWN_BOOL,
   NULL_OWN_BOX,
+  NULL_OWN_NONE,
   NULL_OWN_STR,
   NullRet,
   binNulTestOf,
@@ -1966,30 +1971,45 @@ export function sFieldStorageSlot(si: i32, fi: i32): i32 {
   }
 }
 
-// The null value of an omitted nullable field (`si`/`fi`, field code `scode`) in a
-// struct literal: `ref.null` of the field's own backing for the ref codes, the i32
-// sentinel for `boolean | null` (2) or `K | null` (-1, since member ids are >= 0), or
-// the null-tagged box for a union field with a `null` member. -1 when not nullable.
+// The null an omitted or explicit-`null` field `fi` of struct row `si` takes, where it is one
+// `emitNullOwn` writes (`NULL_OWN_*`): the `boolean | null`, `K | null` or `string | null` niche,
+// the `null` unit, or the null-tagged box of a union with a `null` member. -1 for a typed ref's
+// null or a field with no null of its own.
+export function fieldNullOwnOf(si: i32, fi: i32): i32 {
+  if si < 0 || si >= sFieldStart.length { return -1 }
+  const r = sFieldStart[si] + fi
+  const k = fieldRowKind(r)
+  if k == null { return -1 }
+  return match k {
+    "nulstr" => NULL_OWN_STR
+    "nulbool" => NULL_OWN_BOOL
+    // A plain `i32` has no null; `K | null` rides the niche below every member id.
+    "i32" => if fieldRowIsPlainI32(r) { -1 } else { NULL_OWN_ATOM }
+    "nulnone" => NULL_OWN_NONE
+    // A value-union field defaults to null only when `null` is a member: its banked null code.
+    "union" => if unionHasAtomK(msSetOfTy(sFieldElemTyIxAt(si, fi)), "null", nullValKind()) { NULL_OWN_BOX } else { -1 }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" | "nulstruct" | "nulvariant" | "nulreflist" | "nulmap" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => -1
+  }
+}
+
+// The null value of an omitted nullable field (`si`/`fi`) in a struct literal: `fieldNullOwnOf`'s
+// null, else `ref.null` of the field's own backing for the typed ref codes. -1 when not nullable.
 function emitOmittedFieldNull(si: i32, fi: i32) {
+  const own = fieldNullOwnOf(si, fi)
+  if own >= 0 {
+    emitNullOwn(own)
+    return 0
+  }
+  if si < 0 || si >= sFieldStart.length { return -1 }
   const r = sFieldStart[si] + fi
   const k = fieldRowKind(r)
   if k == null { return -1 }
   match k {
-    "nulstr" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulclosure" => {
       fbRefNullForKind(
         k,
         if k == "nulu8list" { fieldRowPackedRow(r) } else { -1 },
       )
-      return 0
-    }
-    "nulbool" => {
-      fbI32Const(2)
-      return 0
-    }
-    "i32" => {
-      // A plain `i32` has no null; `K | null` rides the niche below every member id.
-      if fieldRowIsPlainI32(r) { return -1 }
-      fbI32Const(0 - 1)
       return 0
     }
     "nulstruct" | "nulvariant" => {
@@ -2006,32 +2026,12 @@ function emitOmittedFieldNull(si: i32, fi: i32) {
       }
       return -1
     }
-    "nulnone" => {
-      fbRefNullNone()
-      return 0
-    }
     "nulmap" => {
       fbRefNull(mapTypeIdxOf(sFieldMapShape(si, fi)))
       return 0
     }
-    "union" => {
-      // a value-union field defaults to null only when `null` is a member — resolve the
-      // member set once, then test its banked null code (`nullValKind()`), not the lexeme.
-      if (
-        unionHasAtomK(
-          msSetOfTy(sFieldElemTyIxAt(si, fi)),
-          "null",
-          nullValKind(),
-        )
-      ) {
-        fbI32Rel(RS_TAG, nullBoxTag())
-        fbRefNullNone()
-        fbStructNew(uBoxIdx)
-        return 0
-      }
-      return -1
-    }
-    "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => {
+    // `fieldNullOwnOf` wrote these where they have a null; here they have none.
+    "nulstr" | "nulbool" | "i32" | "nulnone" | "union" | "i64" | "f64" | "f32" | "v128" | "struct" | "list" | "str" | "reflist" | "map" | "variant" | "closure" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" => {
       return -1
     }
   }
@@ -2500,6 +2500,37 @@ export function irEnvCached(fe: i32): boolean {
   return envCacheFes.length > 0 && envCacheSlotOf(fe) >= 0
 }
 
+// The frame slot caching nested function `fe`'s environment, or -1 when this frame caches none.
+export function envCacheSlotOfFe(fe: i32): i32 {
+  return if envCacheFes.length > 0 { envCacheSlotOf(fe) } else { -1 }
+}
+
+// Drops the environment of `fe` this frame caches, if any, where its declaration runs.
+export function emitEnvCacheDrop(fe: i32) {
+  const ck = envCacheSlotOfFe(fe)
+  if ck >= 0 {
+    fbRefNull(envCacheTys[ck - envCacheBase])
+    fbLocalSet(ck)
+  }
+  return 0
+}
+
+// Opens the build of a cached environment in slot `ck`: only when the slot is still empty.
+export function emitEnvCacheOpen(ck: i32) {
+  fbLocalGet(ck)
+  fbRefIsNull()
+  fbIf(64) // 0x40 void
+  return 0
+}
+
+// Closes it: the new environment into the slot, then the slot's environment.
+export function emitEnvCacheClose(ck: i32) {
+  fbLocalSet(ck)
+  fbEnd()
+  fbLocalGet(ck)
+  return 0
+}
+
 function envCacheSlotOf(fe: i32): i32 {
   let k = 0
   while k < envCacheFes.length {
@@ -2542,17 +2573,9 @@ function emitClosureValueOf(fe: i32, fnIx: i32) {
     // In the frame that declares `fe`, the env is built once per activation and kept in the
     // frame's cache slot, so two reads of the function compare equal (D7480).
     const ck = envCacheSlotOf(fe)
-    if ck >= 0 {
-      fbLocalGet(ck)
-      fbRefIsNull()
-      fbIf(64) // 0x40 void
-    }
+    if ck >= 0 { emitEnvCacheOpen(ck) }
     if emitClosureEnvOf(fe, fnIx, envIdx) < 0 { return -1 }
-    if ck >= 0 {
-      fbLocalSet(ck)
-      fbEnd()
-      fbLocalGet(ck)
-    }
+    if ck >= 0 { emitEnvCacheClose(ck) }
   }
   return emitClosureIds(fe)
 }
@@ -2973,13 +2996,18 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
 // stores: a box-union field boxes the right-hand side, f64 / i64 / f32 fields re-encode it,
 // and any other field emits it plainly.
 function emitVariantFieldStoreVal(vi: i32, fi: i32, valIx: i32, fnIx: i32) {
-  // The bare value's one home, which the IR's field store reads too.
-  if fieldStoreVariantValuePlain(vi, fi, valIx, fnIx) {
-    return emitExpr(valIx, fnIx)
+  return match variantFieldStoreValueArmOf(vi, fi, valIx, fnIx) {
+    "plain" => emitExpr(valIx, fnIx)
+    "box" => emitVariantFieldBox(vi, fi, valIx, fnIx)
+    "f64" => emitWidened(valIx, 4, fnIx)
+    "i64" => emitWidened(valIx, 3, fnIx)
+    "f32" => emitWidened(valIx, 5, fnIx)
+    "strValue" => emitStrValue(valIx, fnIx)
+    "unencodable" => fieldStorePlainMissed()
+    "noKind" | "atomToStr" | "nulnone" | "armDelivery" => emitFail(
+      "emitProgram: internal: a variant field store took a struct field's value arm",
+    )
   }
-  const k = eqRowFieldKind(-1 - vi, fi)
-  if k == "union" { return emitVariantFieldBox(vi, fi, valIx, fnIx) }
-  return emitScalarFieldStoreVal(valIx, fnIx, k)
 }
 
 // Variant `vi`'s box-union field `fi` gets `valIx`, boxed at the checker's record where it owes a
@@ -8683,12 +8711,20 @@ function emitNulNoneForEffect(exprIx: i32, fnIx: i32) {
   return emitNulNoneLeafForEffect(exprIx, fnIx)
 }
 
+// Whether a `null`-typed value `exprIx` runs nothing for its effect: a bare `null` or a name read.
+export function nulNoneWritesNothing(exprIx: i32): boolean {
+  const ix = unwrapParen(exprIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  return n is NullLit || n is Ident
+}
+
 // `emitNulNoneForEffect` for every node but an if-expression: a bare `null` and a name read have
 // no effect, and anything else is lowered and its value dropped, since a `??` or a call in it
 // may run code (D3355).
 function emitNulNoneLeafForEffect(exprIx: i32, fnIx: i32) {
   const n = nodeAt(unwrapParen(exprIx))
-  if n is NullLit || n is Ident { return 0 }
+  if nulNoneWritesNothing(exprIx) { return 0 }
   // A `?.` read off the `null` unit reads nothing past its receiver.
   if n is OptMember { return emitNulNoneForEffect(n.omObj, fnIx) }
   // A `null`-typed `a ?? b` has a `null`-typed left, so both sides always run.
@@ -12238,18 +12274,32 @@ function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
 // checker's type for it unless it has none; context restored on exit.
 function emitArr(arrIx: i32, fnIx: i32) {
   const from = wLen()
+  // The scratch frame as legacy found it, for the probe to allocate from.
+  const before = if irShadowOn { liFrameSave() } else { liFrameNone }
   const r = emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
   if r >= 0 && irShadowOn {
-    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from)
+    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from, before)
   }
   return r
 }
 
 // The armed shadow's per-occurrence count of a legacy site (`irNodeInShadow`); a hook, since the
 // IR's builder imports this module.
-export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32) => i32 = nodeInShadowNone
+export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32, before: LiFrame) => i32 = nodeInShadowNone
+const liFrameNone: LiFrame = {
+  lfKinds: [],
+  lfSlots: [],
+  lfBack: [],
+  lfField: [],
+}
 
-function nodeInShadowNone(_ix: i32, _fnIx: i32, _ty: i32, _from: i32): i32 {
+function nodeInShadowNone(
+  _ix: i32,
+  _fnIx: i32,
+  _ty: i32,
+  _from: i32,
+  _before: LiFrame,
+): i32 {
   return 0
 }
 
@@ -16912,8 +16962,8 @@ function emitIndex(idxIx: i32, fnIx: i32) {
       "nulscalar" => emitIndexNulScalarList(nd, fnIx)
       "ref" => emitIndexRefList(nd, idxIx, fnIx)
       // A `(string | null)[]` element stays nullable unless the checker types it non-null.
-      "nulstr" => emitIndexStrList(nd, fnIx, nodeTyProvesNonNull(idxIx))
-      "str" => emitIndexStrList(nd, fnIx, true)
+      "nulstr" => emitIndexStrList(nd, fnIx, strListReadsNonNull(idxIx, true))
+      "str" => emitIndexStrList(nd, fnIx, strListReadsNonNull(idxIx, false))
       "scalar" => emitIndexScalarList(nd, fnIx)
       "string" => emitIndexRawString(nd, fnIx)
       "none" => emitFail("emitProgram: index receiver is not an array or string")
@@ -16930,6 +16980,12 @@ function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
   }
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
   return strListGetTail(nd, slHz, nonNull)
+}
+
+// Whether string list read `idxIx` recovers its element non-null: always for a `string[]`, and for
+// a `(string | null)[]` (`nulstr`) only where the checker types the read non-null.
+export function strListReadsNonNull(idxIx: i32, nulstr: boolean): boolean {
+  return !nulstr || nodeTyProvesNonNull(idxIx)
 }
 
 // The string list read in two halves around its operands, as the scalar read's are: the live
@@ -22220,6 +22276,12 @@ function emitUnionArmToPair(
     return emitFail("emitProgram: if-expression arm is not a value")
   }
   if emitUnionBoxOwed(unionName, unionTy, valIx, fnIx) < 0 { return -1 }
+  return unionBoxToPairTail(idx)
+}
+
+// After a binding sink arm's box: the construction just written popped into the sink pair, else
+// the box parked in the binding's local `idx` and its tag and payload read into the pair.
+export function unionBoxToPairTail(idx: i32) {
   if uBoxNewIsLast() {
     uBoxSinkToPair()
     return 0
@@ -22236,7 +22298,7 @@ function emitUnionArmToPair(
 
 // The rep's NULL into the sink pair (the else-less false path): the null tag and the
 // unread payload slot, written directly rather than through a box the merge would discard.
-function emitUnionNullToPair() {
+export function emitUnionNullToPair() {
   fbI32Rel(RS_TAG, nullBoxTag())
   fbLocalSet(unionSinkBase)
   fbRefNullNone() // the payload slot is unread under the null tag
@@ -22264,6 +22326,14 @@ function emitUnionArmBlockToPair(
       fnIx,
     ),
   )
+}
+
+// After a binding sink's `if`: the binding's one box built from the sink pair into local `idx`.
+export function unionLetSinkClose(idx: i32) {
+  fbLocalGet(unionSinkBase)
+  fbLocalGet(unionSinkBase + 1)
+  fbStructNew(uBoxIdx) // the binding's ONE box
+  return fbLocalSet(idx)
 }
 
 // `emitNullableIfBinding`'s rep-0 shape with every arm writing the sink pair instead of
@@ -24360,7 +24430,7 @@ function memOffsetNameConst(ix: i32, fnIx: i32): i64 {
 
 // The call's operand at declared position `k` of a memory intrinsic with `base` operands:
 // position 0 is the address, and at the offset form every later one sits one further right.
-function memCallArg(c: Call, base: i32, k: i32): i32 {
+export function memCallArg(c: Call, base: i32, k: i32): i32 {
   if k >= 1 && c.callArgs.length == base + 1 { return c.callArgs[k + 1] }
   return c.callArgs[k]
 }
@@ -24490,7 +24560,7 @@ function zextMaskValue(ix: i32, fnIx: i32): i64 {
 // The load call whose ZERO-extended i64 value the expression at `ix` provably is, or -1: a
 // `__load_u*_i64__` call, or `__load_u8__`/`__load_u16__` cast `as`/`as%` to i64 (non-negative,
 // so its sign-extension is its zero-extension). A masked form is `zextLoadMasked`'s.
-function zextLoadOf(ix: i32, fnIx: i32): i32 {
+export function zextLoadOf(ix: i32, fnIx: i32): i32 {
   const x = unwrapParen(ix)
   if x < 0 || x >= P.nodes.length { return -1 }
   const e = nodeAt(x)
@@ -24743,41 +24813,65 @@ function emitMemConstFoldLet(initIx: i32, k: i64, fnIx: i32, declIx: i32): i32 {
 }
 
 // Pushes the address of memory-intrinsic call `c` (`base` declared operands) and answers the
-// memarg offset, or -1 after an emit failure. A constant part moves into the offset only where
-// both forms name the same effective address: a constant address, `a + K` provably not
-// wrapping, or `a` a local the fold above already reduced to just its bounded part.
+// memarg offset, or -1 after an emit failure, along `memAddrPlanOf`'s arm.
 function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
+  const p = memAddrPlanOf(c, base, fnIx)
+  match p.maArm {
+    "bad" => {
+      emitFail(
+        "emitProgram: "
+          + name
+          + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
+      )
+      return -1
+    }
+    "lma" => {
+      lmaAddrNode = -1
+      if emitExprAsKind(p.maRest, 3, lmaCallerFn) < 0 { return -1 }
+      fbI32WrapI64()
+    }
+    "const" => fbI32Const(0)
+    "fold" => fbLocalGet(p.maRest)
+    "wide" => {
+      if emitExprAsKind(p.maRest, 3, fnIx) < 0 { return -1 }
+      fbI32WrapI64()
+    }
+    "rest" => {
+      if emitExpr(p.maRest, fnIx) < 0 { return -1 }
+    }
+  }
+  return p.maOff
+}
+
+// How memory-intrinsic call `c` (`base` declared operands) writes its address: `bad` refused,
+// `lma` an inlined accessor's i64 operand, `const` a constant (`i32.const 0`), `fold` folded local
+// `maRest`, `wide` i64 node `maRest` wrapped, `rest` node `maRest`. A constant part moves into
+// offset `maOff` only where both forms name the same effective address.
+export type MemAddrArm = "bad" | "lma" | "const" | "fold" | "wide" | "rest"
+export type MemAddrPlan = { maArm: MemAddrArm, maRest: i32, maOff: i64 }
+
+function memAddrAt(arm: MemAddrArm, rest: i32, off: i64): MemAddrPlan {
+  return { maArm: arm, maRest: rest, maOff: off }
+}
+
+export function memAddrPlanOf(c: Call, base: i32, fnIx: i32): MemAddrPlan {
   let off: i64 = 0
   if c.callArgs.length == base + 1 {
     off = memOffsetConstValue(c.callArgs[1], fnIx)
   } else if c.callArgs.length != base {
     off = -1
   }
-  if off < 0 {
-    emitFail(
-      "emitProgram: "
-        + name
-        + " has an argument count or offset the checker refuses (the offset is a compile-time integer in 0..4294967295)",
-    )
-    return -1
-  }
+  if off < 0 { return memAddrAt("bad", -1, -1) }
   const addr = unwrapParen(c.callArgs[0])
   if addr >= 0 && addr == lmaAddrNode {
-    const lmaRest = lmaAddrRest
-    const lmaK = lmaAddrK
-    lmaAddrNode = -1
-    if emitExprAsKind(lmaRest, 3, lmaCallerFn) < 0 { return -1 }
-    fbI32WrapI64()
-    return lmaK + off
+    return memAddrAt("lma", lmaAddrRest, lmaAddrK + off)
   }
   if addr < 0 || addr >= P.nodes.length {
-    if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-    return off
+    return memAddrAt("rest", c.callArgs[0], off)
   }
   const whole = memAddrConst(addr, fnIx)
   if whole >= 0 && whole + off <= MEM_OFFSET_MAX {
-    fbI32Const(0)
-    return whole + off
+    return memAddrAt("const", -1, whole + off)
   }
   const a = nodeAt(addr)
   if a is Ident {
@@ -24785,8 +24879,7 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
     if mf >= 0 {
       const k = maFoldK[mf]
       if k + off <= MEM_OFFSET_MAX {
-        fbLocalGet(maFoldWasmSlot[mf])
-        return k + off
+        return memAddrAt("fold", maFoldWasmSlot[mf], k + off)
       }
     }
   }
@@ -24796,8 +24889,7 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
       const rest = memConstFoldRest(a, fnIx)
       const m = memAddrBound(rest, fnIx)
       if m >= 0 && m + kv + off <= MEM_OFFSET_MAX {
-        if emitExpr(rest, fnIx) < 0 { return -1 }
-        return kv + off
+        return memAddrAt("rest", rest, kv + off)
       }
     }
   }
@@ -24806,17 +24898,11 @@ function emitMemAddr(c: Call, base: i32, fnIx: i32, name: string): i64 {
     if lk > 0 && lk + off < gLowMemUnused {
       const wide = memLowWrapped(addr, fnIx)
       const rest = memLowFoldRest(addr, fnIx)
-      if wide >= 0 {
-        if emitExprAsKind(rest, 3, fnIx) < 0 { return -1 }
-        fbI32WrapI64()
-      } else if emitExpr(rest, fnIx) < 0 {
-        return -1
-      }
-      return lk + off
+      if wide >= 0 { return memAddrAt("wide", rest, lk + off) }
+      return memAddrAt("rest", rest, lk + off)
     }
   }
-  if emitExpr(c.callArgs[0], fnIx) < 0 { return -1 }
-  return off
+  return memAddrAt("rest", c.callArgs[0], off)
 }
 
 // The i64 operand of an address `x as% i32` when `x` is an i64, else -1. Under
@@ -25936,38 +26022,104 @@ export function printScalarTail(arm: PrintArm): i32 {
   return 0
 }
 
-// The sub-i32 and wide store intrinsics of `emitCallCore`: the address, the value at its
-// declared width, then the store opcode. Returns 0 once emitted, -1 on failure.
-function emitCallCoreMemStore(c: Call, callee: Ident, fnIx: i32) {
-  const msOff = emitMemAddr(c, 2, fnIx, callee.identName)
-  if msOff < 0 { return -1 }
-  const msVal = memCallArg(c, 2, 1)
-  if memStoreValueIsI32(callee.identName) {
-    // `i32.store8` / `i32.store16` take an ordinary i32 and TRUNCATE it, so the
-    // value goes through the same spine as the address and as `__store_i32__`'s
-    // own value — no widening helper.
-    if emitExpr(msVal, fnIx) < 0 { return -1 }
-  } else if callee.identName == "__store_i64__" {
-    if emitWidened(msVal, 3, fnIx) < 0 { return -1 }
-  } else if callee.identName == "__store_f32__" {
-    if emitWidened(msVal, 5, fnIx) < 0 { return -1 }
-  } else {
-    if emitWidened(msVal, 4, fnIx) < 0 { return -1 }
-  }
-  // The same drift guard the load arm carries, for the same reason: the name list
-  // and the two tables are THREE lists over the same names in two files, and a
-  // width added to one and not the others would reach here with -1 and write it as
-  // an opcode byte — a silently invalid module. Unreachable while they agree.
-  const msOp = memStoreOpcode(callee.identName)
-  const msAlign = memStoreAlignExp(callee.identName)
-  if msOp < 0 || msAlign < 0 {
+// The load and store intrinsics of `emitCallCore`: the address, a store's value at its declared
+// width, then the access. Returns 0 once emitted, -1 on failure.
+function emitCallCoreMemAccess(c: Call, name: string, fnIx: i32) {
+  const p = memAccessPlanOf(name)
+  // The name list and the opcode tables are separate lists over one set of names: a width added
+  // to one and not the other would write -1 as an opcode byte. Unreachable while they agree.
+  if p.mxOp < 0 || p.mxAlign < 0 {
     return emitFail(
       "emitProgram: '"
-        + callee.identName
-        + "' is a declared store width with no opcode — the intrinsic-name list and the opcode table have drifted",
+        + name
+        + "' is a declared memory access width with no opcode — the intrinsic-name list and the opcode table have drifted",
     )
   }
-  fbMemAccess(msOp, msAlign, msOff)
+  const off = emitMemAddr(c, p.mxBase, fnIx, name)
+  if off < 0 { return -1 }
+  if p.mxBase == 2 {
+    const v = memCallArg(c, 2, 1)
+    const rc = if p.mxWiden < 0 { emitExpr(v, fnIx) } else { emitWidened(v, p.mxWiden, fnIx) }
+    if rc < 0 { return -1 }
+  }
+  return memAccessTail(p, off)
+}
+
+// The access a linear-memory intrinsic writes: its opcode and alignment exponent, its declared
+// operands before an optional constant offset (`mxBase`, 1 for a load and 2 for a store, 0 for no
+// such intrinsic), the kind a store's value widens to (`mxWiden`, -1 when it goes in as it
+// stands), and `mxI32` when the value stored or loaded is a plain i32.
+export type MemAccessPlan = {
+  mxOp: i32,
+  mxAlign: i32,
+  mxBase: i32,
+  mxWiden: i32,
+  mxI32: boolean,
+}
+
+export function memAccessPlanOf(name: string): MemAccessPlan {
+  if name == "__store_i32__" {
+    return {
+      mxOp: OP_I32_STORE,
+      mxAlign: 2,
+      mxBase: 2,
+      mxWiden: -1,
+      mxI32: true,
+    }
+  }
+  if name == "__load_i32__" {
+    return {
+      mxOp: OP_I32_LOAD,
+      mxAlign: 2,
+      mxBase: 1,
+      mxWiden: -1,
+      mxI32: true,
+    }
+  }
+  if nameIsMemStoreIntrinsic(name) {
+    const plain = memStoreValueIsI32(name)
+    const w = if plain { -1 } else if name == "__store_i64__" { 3 } else if name == "__store_f32__" { 5 } else { 4 }
+    return {
+      mxOp: memStoreOpcode(name),
+      mxAlign: memStoreAlignExp(name),
+      mxBase: 2,
+      mxWiden: w,
+      mxI32: plain,
+    }
+  }
+  if nameIsMemLoadIntrinsic(name) {
+    return {
+      mxOp: memLoadOpcode(name),
+      mxAlign: memLoadAlignExp(name),
+      mxBase: 1,
+      mxWiden: -1,
+      mxI32: name == "__load_i8__"
+        || name == "__load_u8__"
+        || name == "__load_i16__"
+        || name == "__load_u16__",
+    }
+  }
+  return { mxOp: -1, mxAlign: -1, mxBase: 0, mxWiden: -1, mxI32: false }
+}
+
+// Whether call `c` is a linear-memory load or store intrinsic: the spelling, with no binding
+// owning the name. Legacy's `emitCallCore` and the IR's builder route on it.
+export function memAccessCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return false }
+  const nm = f.identName
+  if nm != "__store_i32__" && nm != "__load_i32__" {
+    if !nameIsMemStoreIntrinsic(nm) && !nameIsMemLoadIntrinsic(nm) {
+      return false
+    }
+  }
+  return !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// After the address and a store's value: the access at memarg offset `off`. Returns 0.
+export function memAccessTail(p: MemAccessPlan, off: i64): i32 {
+  fbMemAccess(p.mxOp, p.mxAlign, off)
   return 0
 }
 
@@ -25993,28 +26145,6 @@ function emitCallCoreMemBulk(c: Call, callee: Ident, fnIx: i32) {
   return 0
 }
 
-// The load intrinsics of `emitCallCore` other than `__load_i32__`. Returns 0 once emitted, -1
-// on failure.
-function emitCallCoreMemLoad(c: Call, callee: Ident, fnIx: i32) {
-  const mlOff = emitMemAddr(c, 1, fnIx, callee.identName)
-  if mlOff < 0 { return -1 }
-  // the guard above and the two tables below are three lists keyed by the same
-  // names, in two files: a fourth width added to one and not the others would
-  // reach here with -1 and write it as an opcode byte, a silently invalid module.
-  // Unreachable while the lists agree, and free when they do.
-  const mlOp = memLoadOpcode(callee.identName)
-  const mlAlign = memLoadAlignExp(callee.identName)
-  if mlOp < 0 || mlAlign < 0 {
-    return emitFail(
-      "emitProgram: '"
-        + callee.identName
-        + "' is a declared load width with no opcode — the intrinsic-name list and the opcode table have drifted",
-    )
-  }
-  fbMemAccess(mlOp, mlAlign, mlOff)
-  return 0
-}
-
 // The `__log__(ptr, len)` arm of `emitCallCore`. Returns 0 once emitted, -1 on failure.
 function emitCallCoreLog(c: Call, fnIx: i32) {
   if c.callArgs.length != 2 {
@@ -26028,87 +26158,112 @@ function emitCallCoreLog(c: Call, fnIx: i32) {
   return 0
 }
 
-// The host-floor arm of `emitCallCore` for intrinsic slot `fsK`: each argument at its declared
-// width, then the reserved import. Returns 0 once emitted, -1 on failure.
-function emitCallCoreHostFloor(c: Call, callee: Ident, fsK: i32, fnIx: i32) {
-  const fsWant = fsIntrinsicArity(fsK)
-  if fsWant < 0 || c.callArgs.length != fsWant {
-    return emitFail(
-      "emitProgram: internal: "
-        + callee.identName
-        + " reached with "
-        + i32ToStr(c.callArgs.length)
-        + " argument(s) — the checker's arity rule refuses it",
-    )
-  }
-  const fsTarget = fsIdxAt(fsK)
-  if fsTarget < 0 {
-    return emitFail(
-      "emitProgram: '"
-        + callee.identName
-        + "' is called but no import was reserved for it — the use scan and the call lowering have drifted",
-    )
-  }
-  let fsA = 0
-  while fsA < c.callArgs.length {
-    // A `u8[]` argument needs the packed list type collected.
-    if fsArgIsU8List(fsK, fsA) {
-      if emitExpr(c.callArgs[fsA], fnIx) < 0 { return -1 }
-    } else {
-      if fsArgIsI64(fsK, fsA) {
-        // Its declared width, as the wide stores' value operand takes: an i32 left
-        // on the stack for a plain literal offset would not validate.
-        if emitWidened(c.callArgs[fsA], 3, fnIx) < 0 { return -1 }
-      } else {
-        if emitExpr(c.callArgs[fsA], fnIx) < 0 { return -1 }
-      }
-    }
-    fsA = fsA + 1
-  }
-  fbCall(fsTarget)
-  return 0
+// How a host call lowers (`hostCallPlanOf`): each argument at kind `hpKinds[i]` (0 as itself, 3
+// i64, 4 f64, 5 f32), then one `call` of reserved import `hpImport`, which leaves nothing when
+// `hpVoid`. A call legacy cannot write carries its emit failure in `hpFail`.
+export type HostCallPlan = {
+  hpImport: i32,
+  hpKinds: i32[],
+  hpVoid: boolean,
+  hpFail: string,
 }
 
-// The user-extern arm of `emitCallCore` for link `exK`: each argument at its declared width,
-// then the reserved import. Returns 0 once emitted, -1 on failure.
-function emitCallCoreExtern(c: Call, callee: Ident, exK: i32, fnIx: i32) {
-  const exWant = externArityAt(exK)
-  if exWant < 0 || c.callArgs.length != exWant {
-    return emitFail(
-      "emitProgram: internal: extern "
-        + callee.identName
+// Whether call `c` is a host call: a `std:fs`-floor intrinsic, or a user `extern function` no
+// binding of the name shadows. Legacy's `emitCallCore` and the IR's builder route on it.
+export function hostCallNamed(c: Call, fnIx: i32): boolean {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const f = nodeAt(c.callFn)
+  if !(f is Ident) { return false }
+  if fsIntrinsicSlot(f.identName) >= 0 { return true }
+  return externLinkOf(f.identName) >= 0 && !identNameIsUserBound(c.callFn, fnIx)
+}
+
+// The plan of host call `c` (`hostCallNamed`): a floor slot's u8-list and i32 arguments as
+// themselves and its offsets at i64; an extern's arguments at their declared widths.
+export function hostCallPlanOf(c: Call): HostCallPlan {
+  const ok = c.callFn >= 0 && c.callFn < P.nodes.length
+  const f = if ok { nodeAt(c.callFn) } else { null }
+  const nm = if f is Ident { f.identName } else { "" }
+  const kinds: i32[] = []
+  const fsK = fsIntrinsicSlot(nm)
+  if fsK >= 0 {
+    const want = fsIntrinsicArity(fsK)
+    let a = 0
+    while a < c.callArgs.length {
+      kinds.push(
+        if fsArgIsI64(fsK, a) && !fsArgIsU8List(fsK, a) { 3 } else { 0 },
+      )
+      a = a + 1
+    }
+    let why = ""
+    if want < 0 || c.callArgs.length != want {
+      why = "emitProgram: internal: "
+        + nm
         + " reached with "
         + i32ToStr(c.callArgs.length)
-        + " argument(s) — the checker's arity rule refuses it",
-    )
-  }
-  const exTarget = externIdxAt(exK)
-  if exTarget < 0 {
-    return emitFail(
-      "emitProgram: extern '"
-        + callee.identName
-        + "' is called but no import was reserved for it — the manifest and the call lowering have drifted",
-    )
-  }
-  let exA = 0
-  while exA < c.callArgs.length {
-    // Its DECLARED width, not the argument's own: an i32 literal left on the stack
-    // for an `i64` parameter would not validate.
-    const exPT = externParamAt(exK, exA)
-    if exPT == "i64" {
-      if emitWidened(c.callArgs[exA], 3, fnIx) < 0 { return -1 }
-    } else if exPT == "f64" {
-      if emitWidened(c.callArgs[exA], 4, fnIx) < 0 { return -1 }
-    } else if exPT == "f32" {
-      if emitWidened(c.callArgs[exA], 5, fnIx) < 0 { return -1 }
-    } else {
-      // `i32` and `boolean` alike — a boolean is an i32 at the boundary. The checker
-      // refuses every other spelling, so none reaches here.
-      if emitExpr(c.callArgs[exA], fnIx) < 0 { return -1 }
+        + " argument(s) — the checker's arity rule refuses it"
+    } else if fsIdxAt(fsK) < 0 {
+      why = "emitProgram: '"
+        + nm
+        + "' is called but no import was reserved for it — the use scan and the call lowering have drifted"
     }
-    exA = exA + 1
+    const fp: HostCallPlan = {
+      hpImport: fsIdxAt(fsK),
+      hpKinds: kinds,
+      hpVoid: fsRetIsVoid(fsK),
+      hpFail: why,
+    }
+    return fp
   }
-  fbCall(exTarget)
+  const exK = externLinkOf(nm)
+  const want = externArityAt(exK)
+  let a = 0
+  while a < c.callArgs.length {
+    const pt = externParamAt(exK, a)
+    kinds.push(
+      if pt == "i64" { 3 } else if pt == "f64" { 4 } else if pt == "f32" { 5 } else { 0 },
+    )
+    a = a + 1
+  }
+  let why = ""
+  if want < 0 || c.callArgs.length != want {
+    why = "emitProgram: internal: extern "
+      + nm
+      + " reached with "
+      + i32ToStr(c.callArgs.length)
+      + " argument(s) — the checker's arity rule refuses it"
+  } else if externIdxAt(exK) < 0 {
+    why = "emitProgram: extern '"
+      + nm
+      + "' is called but no import was reserved for it — the manifest and the call lowering have drifted"
+  }
+  const ep: HostCallPlan = {
+    hpImport: externIdxAt(exK),
+    hpKinds: kinds,
+    hpVoid: externRetIsVoid(exK),
+    hpFail: why,
+  }
+  return ep
+}
+
+// The host-call arm of `emitCallCore`: each argument at its plan's kind, then the reserved
+// import (`hostCallTail`). Returns 0 once emitted, -1 on failure.
+function emitCallCoreHost(c: Call, fnIx: i32) {
+  const pl = hostCallPlanOf(c)
+  if pl.hpFail != "" { return emitFail(pl.hpFail) }
+  let a = 0
+  while a < c.callArgs.length {
+    const k = pl.hpKinds[a]
+    const rc = if k == 0 { emitExpr(c.callArgs[a], fnIx) } else { emitWidened(c.callArgs[a], k, fnIx) }
+    if rc < 0 { return -1 }
+    a = a + 1
+  }
+  return hostCallTail(pl.hpImport)
+}
+
+// After a host call's arguments: the `call` of its reserved import.
+export function hostCallTail(imp: i32): i32 {
+  fbCall(imp)
   return 0
 }
 
@@ -26322,27 +26477,10 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if !userOwnsName && callee.identName == "print" {
     return emitCallCorePrint(callIx, c, fnIx)
   }
-  // The linear-memory intrinsics, lowered inline (the host defines `__store_i32__`/
-  // `__load_i32__` as one-instruction wasm functions): store/load become
-  // `i32.store`/`i32.load` directly; `__log__` calls the synthetic in-module decoder
-  // at `gMemLogIdx` (see `irMemLogFnCode`).
-  if !userBindsName && callee.identName == "__store_i32__" {
-    const s32Off = emitMemAddr(c, 2, fnIx, "__store_i32__")
-    if s32Off < 0 { return -1 }
-    if emitExpr(memCallArg(c, 2, 1), fnIx) < 0 { return -1 }
-    fbMemAccess(OP_I32_STORE, 2, s32Off)
-    return 0
-  }
-  if !userBindsName && callee.identName == "__load_i32__" {
-    const l32Off = emitMemAddr(c, 1, fnIx, "__load_i32__")
-    if l32Off < 0 { return -1 }
-    fbMemAccess(OP_I32_LOAD, 2, l32Off)
-    return 0
-  }
-  // The five other store widths (`buffer-design.md` §C2): push the address, then the
-  // value at its own declared width, then the opcode at its natural alignment.
-  if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
-    return emitCallCoreMemStore(c, callee, fnIx)
+  // Every load and store width (`buffer-design.md` §C2), lowered inline: the address, a store's
+  // value at its declared width, then the opcode at its natural alignment (`memAccessPlanOf`).
+  if memAccessCallNamed(c, fnIx) {
+    return emitCallCoreMemAccess(c, callee.identName, fnIx)
   }
   // the bulk pair (`buffer-design.md` §C3): three i32 operands
   // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
@@ -26350,12 +26488,6 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   // arbitrary expressions' side effects.
   if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
     return emitCallCoreMemBulk(c, callee, fnIx)
-  }
-  // The ten other load widths (`buffer-design.md` §C2): push the address, write the
-  // opcode at its natural alignment — the per-width difference is exactly two bytes,
-  // held in `memLoadOpcode`/`memLoadAlignExp`. `__load_i32__` keeps its own arm above.
-  if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
-    return emitCallCoreMemLoad(c, callee, fnIx)
   }
   // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
   // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
@@ -26415,19 +26547,10 @@ function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   if !userBindsName && callee.identName == "__log__" {
     return emitCallCoreLog(c, fnIx)
   }
-  // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ───────
-  // The one intrinsic family that lowers to a host call rather than instructions. One
-  // arm for every slot, keyed by four small tables; the index is dynamic (reserved
-  // only when used), so a miss fails loudly.
-  const fsK = fsIntrinsicSlot(callee.identName)
-  if fsK >= 0 { return emitCallCoreHostFloor(c, callee, fsK, fnIx) }
-  // ── user externs (`extern function`) ───────────────────────────────────
-  // The second family that lowers to a host call. Guarded by `userBindsName` like every
-  // spelling-matched arm: a PARAMETER of the same name is a legal local and must win.
-  if !userBindsName {
-    const exK = externLinkOf(callee.identName)
-    if exK >= 0 { return emitCallCoreExtern(c, callee, exK, fnIx) }
-  }
+  // ── host calls: the `std:fs` floor and user `extern function`s ─────────────
+  // Each lowers to a call of an import reserved only when used, so a miss fails loudly. An
+  // extern is guarded like every spelling-matched arm: a parameter of its name must win.
+  if hostCallNamed(c, fnIx) { return emitCallCoreHost(c, fnIx) }
   // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
   // lowered INLINE to single WasmGC instructions (array.new /
   // array.new_default / array.copy / unreachable). `__trap__()` is the
@@ -26598,8 +26721,8 @@ function emitCallRefArg(
   args: i32[],
   i: i32,
 ) {
-  // Whether the argument takes the general arm with nothing owed (`callRefPlainKey`'s plain path).
-  let argPlainArm = false
+  // Whether the argument is one the IR writes as legacy does (`callRefPlainKey`'s plain path).
+  const argPlainArm = callRefArgPlain(callIx, fnIx, ckey, args[i], i)
   // D940 — the struct row the functype declares, seeded exactly as the direct call
   // seeds it from `paramStructIdxOf`: an object-literal argument otherwise resolves
   // its own row by field set, the pre-merge row wherever the callee's parameter row
@@ -26681,13 +26804,6 @@ function emitCallRefArg(
       // recover a `null` argument into a nullable parameter, a trap (D2552).
       // A narrowed struct argument is unboxed at the key's slot, as a direct call does (D1723).
       const pkOwed = pkk != null && narrowedArmNeedsUnbox(args[i], fnIx)
-      argPlainArm = !pkOwed
-        && (pkk == "i32"
-        || pkk == "i64"
-        || pkk == "f64"
-        || pkk == "f32"
-        || pkk == "str"
-        || pkk == "struct" && !exprNullableRecord(args[i], fnIx))
       const pkHeap = if pkk != null { armDestHeapOf(pkk, sigParamSlotAt(ckey, i)) } else { -1 }
       const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
@@ -26699,21 +26815,40 @@ function emitCallRefArg(
   return if argPlainArm { 1 } else { 0 }
 }
 
-// Whether argument `a` takes `emitCallRefArg`'s general arm with nothing owed: a scalar of its
-// parameter's own width, a string, or a record neither unboxed from a narrowing nor nullable.
-function callRefArgPlain(
+// Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
+// number, or the general arm with nothing owed at a scalar of the argument's own width, a string,
+// a record neither unboxed from a narrowing nor nullable, or a non-null closure, list or map.
+export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
   ckey: string,
   a: i32,
   i: i32,
 ): boolean {
-  if callRefArgArmOf(callIx, fnIx, ckey, a, i) != "general" { return false }
+  const arm = callRefArgArmOf(callIx, fnIx, ckey, a, i)
+  if arm == "widenI64" || arm == "widenF64" || arm == "widenF32" { return true }
+  if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
   const k = sigParamKindAt(ckey, i)
   if k == "str" { return true }
   if k == "struct" {
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
+  }
+  if k == "closure" { return !exprNulClosure(a, fnIx) }
+  if (
+    k == "list"
+    || k == "strlist"
+    || k == "f64list"
+    || k == "i64list"
+    || k == "f32list"
+    || k == "reflist"
+    || k == "map"
+  ) {
+    return !narrowedArmNeedsUnbox(a, fnIx)
+      && !exprNullableList(a, fnIx)
+      && exprNulScalarListKind(a, fnIx) == null
+      && !exprNullableRefArray(a, fnIx)
+      && !exprNullableMap(a, fnIx)
   }
   return (k == "i32" || k == "i64" || k == "f64" || k == "f32")
     && exprScalarWidth(a, fnIx) == k
@@ -27085,7 +27220,10 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
     if !fieldCallRefPlainHead(callIx, c, callee, fnIx) { return "" }
     return callRefPlainTail(callIx, c, fnIx)
   }
-  if !(callee is Ident) { return "" }
+  if !(callee is Ident) {
+    if !exprCallRefPlainHead(callIx, c, fnIx) { return "" }
+    return callRefPlainTail(callIx, c, fnIx)
+  }
   const nm = callee.identName
   const d = identDeclOf(c.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
@@ -27126,6 +27264,14 @@ function fieldCallRefPlainHead(
 ): boolean {
   return exprIsClosure(c.callFn, fnIx)
     && exprStruct(m.memObj, fnIx)
+    && bundleParamOfRead(c.callFn, fnIx) < 0
+    && placeRecordSigs(callIx, fnIx).length == 0
+}
+
+// `callRefPlainKey`'s head for any other callee expression (`f()(x)`, `fs[0](x)`), which
+// `emitCallCore` sends to `emitCallRef` when it is a closure: no bundle and no held record.
+function exprCallRefPlainHead(callIx: i32, c: Call, fnIx: i32): boolean {
+  return exprIsClosure(c.callFn, fnIx)
     && bundleParamOfRead(c.callFn, fnIx) < 0
     && placeRecordSigs(callIx, fnIx).length == 0
 }
@@ -27846,25 +27992,28 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   return 0
 }
 
-// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32,
-// string, scalar-width, byte or plain reference list whose value builds as itself or widens, with
-// no arm unbox.
-export function idxStorePlainWhy(
-  st: IdxStore,
-  arrIx: i32,
-  rhs: i32,
-  fnIx: i32,
-): string {
-  if st.nestSlot >= 0 || st.unionNm != "" { return "store element" }
-  if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
-    return "store element seed"
+// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": a scalar,
+// string, atom, niche or plain reference list's value built as itself or widened, a union list's
+// that the record boxes or is already a named union, or a nested list's that is no literal (an atom
+// into a string list decodes); with no arm unbox at a record row.
+export function idxStorePlainWhy(st: IdxStore, rhs: i32, fnIx: i32): string {
+  if (
+    st.unionNm != ""
+    && !boxOwedAt(rhs, fnIx)
+    && !(exprUnion(rhs, fnIx) && boxTyName(nodeTyAt(rhs, fnIx)) != "")
+  ) {
+    return "store element"
   }
-  if arrElemIsNulBoolAt(arrIx, fnIx) || arrElemIsNullUnitAt(arrIx, fnIx) {
-    return "store element seed"
+  if st.nestSlot >= 0 && nodeAt(unwrapParen(rhs)) is ArrayLit {
+    return "store element"
   }
-  if nodeArrayElemIsNulStr(arrIx) { return "store element seed" }
-  if exprIsLitAtom(rhs, fnIx) { return "store atom" }
-  if narrowedArmNeedsUnbox(rhs, fnIx) { return "store arm" }
+  // The arm unbox casts at the element's own row; a store with none writes no cast.
+  if (
+    narrowedArmNeedsUnbox(rhs, fnIx)
+    && (st.variantIdx >= 0 || st.structIdx >= 0)
+  ) {
+    return "store arm"
+  }
   return ""
 }
 
@@ -27897,75 +28046,108 @@ function emitVariantFieldWrite(vi: i32, fi: i32, rhs: i32, fnIx: i32): i32 {
   return fieldStoreVariantTail(vi, fi)
 }
 
-// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its
-// target context already applied: a box union coerces into the box, a literal-union atom widens
-// or lowers as its id, a scalar re-encodes, a niche seeds its null. Returns 0, or -1 failed.
+// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its target context already
+// applied, through the arm `fieldStoreValueArmOf` names. Returns 0, or -1 failed.
 function emitStructFieldStoreValue(
   si: i32,
   fieldIdx: i32,
   rhs: i32,
   fnIx: i32,
 ): i32 {
-  const k = fieldRowKind(sFieldStart[si] + fieldIdx)
-  if k == null {
-    return emitFail("emitProgram: struct field has no storage kind")
-  }
-  // The bare value's one home, which the IR's field store reads too.
-  if fieldStoreValuePlain(si, fieldIdx, rhs, fnIx) {
-    return if emitExpr(rhs, fnIx) < 0 { -1 } else { 0 }
-  }
-  match k {
-    "union" => {
-      // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
-      if (emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx) < 0) {
-        return -1
-      }
-    }
-    "str" => {
-      // A literal-union atom assigned to a `string` field widens to its member string.
-      if emitAtomToStr(rhs, fnIx) < 0 { return -1 }
-    }
-    "nulstr" => {
-      // A `string | null` slot takes the same widen; a widened member string is non-null.
-      if emitStrValue(rhs, fnIx) < 0 { return -1 }
-    }
-    "f64" | "i64" | "f32" => {
-      // A wide scalar field widens its RHS at the store boundary, as the construct does.
-      if emitScalarFieldStoreVal(rhs, fnIx, k) < 0 { return -1 }
-    }
+  const rc = match fieldStoreValueArmOf(si, fieldIdx, rhs, fnIx) {
+    "noKind" => emitFail("emitProgram: struct field has no storage kind")
+    "plain" => emitExpr(rhs, fnIx)
+    // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
+    "box" => emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx)
+    // A literal-union atom assigned to a `string` field widens to its member string.
+    "atomToStr" => emitAtomToStr(rhs, fnIx)
+    // A `string | null` slot takes the same widen; a widened member string is non-null.
+    "strValue" => emitStrValue(rhs, fnIx)
+    // A wide scalar field widens its RHS at the store boundary, as the construct does.
+    "f64" => emitWidened(rhs, 4, fnIx)
+    "i64" => emitWidened(rhs, 3, fnIx)
+    "f32" => emitWidened(rhs, 5, fnIx)
+    // The `null` unit type's slot, the construct arm's twin (D4671).
     "nulnone" => {
-      // The `null` unit type's slot, the construct arm's twin (D4671).
       if emitNulNoneForEffect(rhs, fnIx) < 0 { return -1 }
       fbRefNullNone()
     }
-    "nulstruct" | "nulvariant" => {
-      // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
-      // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
-      if emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx)) < 0 {
-        return -1
-      }
-    }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" => {
-      return fieldStorePlainMissed()
-    }
-    "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" => {
-      return fieldStorePlainMissed()
-    }
-    "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" => {
-      return fieldStorePlainMissed()
-    }
-    "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      return fieldStorePlainMissed()
-    }
+    // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
+    // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
+    "armDelivery" => emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx))
+    "unencodable" => fieldStorePlainMissed()
   }
-  return 0
+  return if rc < 0 { -1 } else { 0 }
 }
 
-// A field kind `fieldStoreValuePlain` always answers plain, reaching the non-plain ladder.
+// A kind `fieldStoreValuePlain` always answers plain, reaching the non-plain arms.
 function fieldStorePlainMissed() {
   return emitFail(
     "emitProgram: a plain field value reached the field store's re-encode ladder",
   )
+}
+
+// How a field store writes its value, decided once for legacy and the IR: the bare value, a box,
+// an atom widened to its string, a scalar widened to the field's width, the `null` unit's seed, or
+// a narrowed record arm's delivery; `unencodable` is a kind the plain check always answers plain,
+// reached only if the two disagree, and refused.
+export type FieldStoreValArm = "noKind"
+  | "plain"
+  | "box"
+  | "atomToStr"
+  | "strValue"
+  | "f64"
+  | "i64"
+  | "f32"
+  | "nulnone"
+  | "armDelivery"
+  | "unencodable"
+
+// The arm `emitStructFieldStoreValue` writes `rhs` into field `fi` of struct row `si` at.
+export function fieldStoreValueArmOf(
+  si: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): FieldStoreValArm {
+  if si < 0 || si >= sFieldStart.length { return "noKind" }
+  const k = fieldRowKind(sFieldStart[si] + fi)
+  if k == null { return "noKind" }
+  if fieldStoreValuePlain(si, fi, rhs, fnIx) { return "plain" }
+  return match k {
+    "union" => "box"
+    "str" => "atomToStr"
+    "nulstr" => "strValue"
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "nulnone" => "nulnone"
+    "nulstruct" | "nulvariant" => "armDelivery"
+    // `fieldStoreValuePlain` answers plain for every other kind.
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "unencodable"
+  }
+}
+
+// The arm `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` at: the bare
+// value, a box, a scalar widened to the field's width, or a literal-union atom as its string.
+export function variantFieldStoreValueArmOf(
+  vi: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): FieldStoreValArm {
+  if fieldStoreVariantValuePlain(vi, fi, rhs, fnIx) { return "plain" }
+  const k = eqRowFieldKind(-1 - vi, fi)
+  if k == null { return "unencodable" }
+  return match k {
+    "union" => "box"
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "str" | "nulstr" => "strValue"
+    // `fieldStoreVariantValuePlain` answers plain for every other kind.
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "unencodable"
+  }
 }
 
 // `emitAssignUnder`'s arm over a field target `o.f = v`: through a narrowed union box, into
@@ -28107,7 +28289,7 @@ export function fieldStoreStructAt(lhsIx: i32, fnIx: i32): i32[] {
 
 // Whether `emitStructFieldStoreValue` writes `rhs` into field `fieldIdx` of row `si` as the bare
 // value (`emitExpr`), with no box, atom widen, scalar re-encode or niche seed around it.
-export function fieldStoreValuePlain(
+function fieldStoreValuePlain(
   si: i32,
   fieldIdx: i32,
   rhs: i32,
@@ -28153,7 +28335,7 @@ export function fieldStoreVariantAt(lhsIx: i32, fnIx: i32): i32[] {
 
 // Whether `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` as the bare value
 // (`emitExpr`), with no box, scalar re-encode or atom widen around it.
-export function fieldStoreVariantValuePlain(
+function fieldStoreVariantValuePlain(
   vi: i32,
   fi: i32,
   rhs: i32,
@@ -32201,6 +32383,13 @@ export function fallThroughPadOf(fnBody: i32, fnIx: i32): string {
   return "unreachable"
 }
 
+// `fallThroughPadOf` for function declaration `fnIx`'s own body; "" for any other node.
+export function fnFallThroughPadOf(fnIx: i32): string {
+  if fnIx < 0 || fnIx >= P.nodes.length { return "" }
+  const fd = nodeAt(fnIx)
+  return if fd is FuncDecl { fallThroughPadOf(fd.fnBody, fnIx) } else { "" }
+}
+
 // Emit the `null` value of function `fnIx`'s nullable return rep, leaving it on the stack as the
 // function's result (the fall-through path's implicit `return null`).
 export function emitNullForRet(fnIx: i32) {
@@ -32249,13 +32438,7 @@ function emitStmtGo(stmtIx: i32, fnIx: i32) {
     // top-level wasm function by `collectFns`, so it emits no inline code here — just a
     // no-op in its enclosing body. Its name resolves as a closure value when referenced; a
     // cached env is dropped here, so each execution of the declaration is a new function value.
-    let ck = -1
-    if envCacheFes.length > 0 { ck = envCacheSlotOf(fnStmtsPosOf(stmtIx)) }
-    if ck >= 0 {
-      fbRefNull(envCacheTys[ck - envCacheBase])
-      fbLocalSet(ck)
-    }
-    return 0
+    return emitEnvCacheDrop(fnStmtsPosOf(stmtIx))
   }
   // D1045 — a body-scoped `type` declaration, one statement over: the parser hoisted the
   // node into `progStmts`, so every registry needing it comes from the top-level walk, and
@@ -32730,10 +32913,7 @@ function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
         if (emitUnionIfBindingSink(s.letInit, idx, nulNm, nulTy, fnIx) < 0) {
           return -1
         }
-        fbLocalGet(unionSinkBase)
-        fbLocalGet(unionSinkBase + 1)
-        fbStructNew(uBoxIdx) // the binding's ONE box
-        fbLocalSet(idx)
+        unionLetSinkClose(idx)
         scopeBind(s.letName, slot)
         return 0
       }
@@ -34514,24 +34694,23 @@ export function forInListSync(iterIx: i32, fnIx: i32): i32 {
 }
 
 // The element kinds the IR's walk binds as legacy's does: an `i32`, a string, a value union's
-// box, a record or an `i32` list, each read whole into the loop variable.
+// box, a record, or an `i32`, string or byte list, each read whole into the loop variable.
 function forInElemPlain(ek: VKind): boolean {
   return match ek {
-    "i32" | "str" | "union" | "struct" | "list" => true
-    "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => false
+    "i32" | "str" | "union" | "struct" | "list" | "strlist" | "u8list" | "nulstr" | "variant" | "nulstruct" | "i64" | "f64" => true
+    "reflist" | "map" | "nulvariant" | "f64list" | "f32" | "closure" | "nullist" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "v128list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "v128" => false
   }
 }
 
 // Why `for` statement `s` at `stmtIx` is not the plain walk, or "": a list of a `forInElemPlain`
-// kind, a string's code points or a map's keys or values, read once; no second name, byte source
-// or node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
+// kind, a string's code points or a map's keys or values, read once; no second name or
+// node-pinned slot; a body that may reallocate a list, so the header is re-read each step and
 // nothing is hoisted or unrolled ("hoisted" where it is). A literal iterable is a list literal.
 export function forInPlainWhy(s: ForIn, stmtIx: i32, fnIx: i32): string {
   if luForUnionIter(s.fiIter, fnIx) { return "list union" }
   const ek = forInElemKind(s.fiIter, fnIx)
   if ek == null { return "iterable" }
   if !forInElemPlain(ek) { return "element " + ek }
-  if forInU8Src(s.fiIter, fnIx) { return "byte source" }
   if s.fiVar2 != "" { return "pair" }
   if listFitShadowIsRef(s.fiIter, fnIx) { return "shadow" }
   if declSlotPinned(stmtIx) >= 0 { return "pinned slot" }
@@ -40018,6 +40197,57 @@ function emitDirectCallTail(target: i32, callIx: i32, fnIx: i32) {
   return 0
 }
 
+// The parameters of the function at `fnStmts` slot `target`, or none.
+function capturedCallParams(target: i32): i32[] {
+  const cfn = nodeAt(fnStmts[target])
+  return if cfn is FuncDecl { cfn.fnParams } else { [] }
+}
+
+// How `emitCapturedCall` writes argument `arg`, the `i`th of a call of `target` from frame `fnIx`:
+// a union parameter's box by the table or the floor, a widening, a literal union, an atom's
+// string, a narrowed arm's unbox, or the plain expression.
+export type CapturedArgArm = "boxTable"
+  | "boxFloor"
+  | "widenI64"
+  | "widenF64"
+  | "widenF32"
+  | "lit"
+  | "atomStr"
+  | "unbox"
+  | "plain"
+
+export function capturedArgArmOf(
+  arg: i32,
+  i: i32,
+  target: i32,
+  fnIx: i32,
+): CapturedArgArm {
+  const cps = capturedCallParams(target)
+  let cuNm = ""
+  let cpKind: VKind = "i32"
+  let cpLit = false
+  if i < cps.length {
+    cpKind = vtKindOfParam(cps[i])
+    const cpn = nodeAt(cps[i])
+    if cpn is Param {
+      if cpKind == "union" { cuNm = boxTyName(nodeTyIxOf(cpn.parType)) }
+      // Alias-INDEX, so a NARROWED copy is recognized.
+      if tyIsLitUnion(nodeTyAt(cps[i], fnStmts[target])) { cpLit = true }
+      if nodeTyIsNulLitUnion(parTyNode(cps[i])) { cpLit = true }
+    }
+  }
+  if cuNm != "" {
+    return if boxOwedAt(arg, fnIx) { "boxTable" } else { "boxFloor" }
+  }
+  if cpKind == "i64" { return "widenI64" }
+  if cpKind == "f64" { return "widenF64" }
+  if cpKind == "f32" { return "widenF32" }
+  if cpLit { return "lit" }
+  if cpKind == "str" && exprIsLitAtom(arg, fnIx) { return "atomStr" }
+  if i < cps.length && narrowedArmNeedsUnbox(arg, fnIx) { return "unbox" }
+  return "plain"
+}
+
 // The captured-call lowering for an `Ident` callee resolved to a CAPTURING lifted
 // function at index `target`: build its closure value live (reading captures) and
 // `call_ref` it (a plain `call` would pass a null env and lose the captures).
@@ -40044,53 +40274,44 @@ function emitCapturedCall(callIx: i32, fnIx: i32, target: i32) {
   // declared functype. Three kinds are check-clean invalid wasm without this — a union box, an
   // i64/f64/f32 mismatch, and a litunion — each coerced the way the direct twin coerces, safe by construction since each arm fires only where the raw push is already wrong.
   if target < 0 { return -1 }
-  const cfn = nodeAt(fnStmts[target])
-  let cps: i32[] = []
-  if cfn is FuncDecl { cps = cfn.fnParams }
+  const cps = capturedCallParams(target)
   let cai = 0
   while cai < cargs.length {
-    let cuNm = ""
-    let cpKind: VKind = "i32"
-    let cpLit = false
-    let cuTy = -1
-    if cai < cps.length {
-      cpKind = vtKindOfParam(cps[cai])
-      const cpn = nodeAt(cps[cai])
-      if cpn is Param {
-        if cpKind == "union" {
-          cuNm = boxTyName(nodeTyIxOf(cpn.parType))
-          cuTy = nodeTyAt(cps[cai], fnStmts[target])
-        }
-        // Alias-INDEX, so a NARROWED copy is recognized.
-        if tyIsLitUnion(nodeTyAt(cps[cai], fnStmts[target])) { cpLit = true }
-        if nodeTyIsNulLitUnion(parTyNode(cps[cai])) { cpLit = true }
+    match capturedArgArmOf(cargs[cai], cai, target, fnIx) {
+      "boxTable" => {
+        // The table boxes an argument whose union the checker records; the floor, below, boxes
+        // one with no usable record at the parameter's union.
+        if emitDelivered(cargs[cai], fnIx) < 0 { return -1 }
       }
-    }
-    if cuNm != "" && boxOwedAt(cargs[cai], fnIx) {
-      // The table boxes an argument whose union the checker records; the floor, below, boxes
-      // one with no usable record at the parameter's union.
-      if emitDelivered(cargs[cai], fnIx) < 0 { return -1 }
-    } else if cuNm != "" {
-      if emitUnionBoxOwed(cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
-    } else if cpKind == "i64" {
-      if emitWidened(cargs[cai], 3, fnIx) < 0 { return -1 }
-    } else if cpKind == "f64" {
-      if emitWidened(cargs[cai], 4, fnIx) < 0 { return -1 }
-    } else if cpKind == "f32" {
-      if emitWidened(cargs[cai], 5, fnIx) < 0 { return -1 }
-    } else if cpLit {
-      if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
-    } else if cpKind == "str" && exprIsLitAtom(cargs[cai], fnIx) {
-      // The MIRROR of `cpLit`: a literal-union ATOM argument into a `string` parameter
-      // widens to its member string, the edge the direct twin takes as `cParamStr`.
-      if emitAtomToStr(cargs[cai], fnIx) < 0 { return -1 }
-    } else {
-      if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
-      // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
-      // the direct call's argument rung unboxes it.
-      if cai < cps.length && narrowedArmNeedsUnbox(cargs[cai], fnIx) {
+      "boxFloor" => {
+        const cpn = nodeAt(cps[cai])
+        const cuNm = if cpn is Param { boxTyName(nodeTyIxOf(cpn.parType)) } else { "" }
+        const cuTy = nodeTyAt(cps[cai], fnStmts[target])
+        if emitUnionBoxOwed(cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "widenI64" => {
+        if emitWidened(cargs[cai], 3, fnIx) < 0 { return -1 }
+      }
+      "widenF64" => {
+        if emitWidened(cargs[cai], 4, fnIx) < 0 { return -1 }
+      }
+      "widenF32" => {
+        if emitWidened(cargs[cai], 5, fnIx) < 0 { return -1 }
+      }
+      "lit" | "plain" => {
+        if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "atomStr" => {
+        // The MIRROR of `lit`: a literal-union ATOM argument into a `string` parameter
+        // widens to its member string, the edge the direct twin takes as `cParamStr`.
+        if emitAtomToStr(cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "unbox" => {
+        // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
+        // the direct call's argument rung unboxes it.
+        if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
         emitNarrowedArmUnboxTo(
-          armDestHeapOf(cpKind, paramStructIdxOf(cps[cai])),
+          armDestHeapOf(vtKindOfParam(cps[cai]), paramStructIdxOf(cps[cai])),
           cargs[cai],
           fnIx,
         )
@@ -41327,19 +41548,11 @@ function emitCoalesceCallArm(
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
-  const lhs = nodeAt(lhsIx)
   const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
-  // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
-  // and in the else arm for the string), so they apply only to an effect-free place —
-  // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
-  // and is handled by the stash-based call path in the `lhs is Call` block below.
-  let lhsReEval = true
-  if lhs is Call { lhsReEval = false }
-  // D1250 — AN IF-expression operand IS NOT RE-READABLE. Its condition can have effects, and
-  // re-reading it re-runs them: `(if bump() { true }) ?? false` bumped TWICE. The arms below
-  // that already carry a stash leg read this flag, so they switch over; the `boolean | null`
-  // arm gained one for the same reason. `coalChainHasCallLhs` reserves the slots.
-  if lhs is IfStmt { lhsReEval = false }
+  // The `boolean | null` and `K | null` arms re-read an effect-free operand in the present arm;
+  // one that is not (`coalLhsStashes`: a call, an `if`, a field of a call) is written once into
+  // the stash slot `coalChainHasCallLhs` reserved (D1250, D17036).
+  const lhsReEval = !coalLhsStashes(lhsIx)
   // `<e> ?? d` over a `boolean | null` niche (an ident binding, a `boolean | null` struct field,
   // or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the sentinel 2
   // (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers every

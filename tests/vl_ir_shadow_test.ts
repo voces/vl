@@ -70,6 +70,9 @@ const ROWS_DIR = `${ROOT}/tests/ir-shadow-rows`;
 const NAME_LINE = /^\/\/ (ir shadow: .+)$/;
 const COUNT_LINE = /^\/\/ expect (.+?) (=|>=) (\d+)$/;
 const ABSENT_LINE = /^\/\/ expect no row containing (.+)$/;
+// Coverage counts are floors: matched = covered is graded in every row, so a floor hides no
+// mismatch, and an exact count would red whenever another PR covers one more function.
+const FLOOR_KEYS = new Set(["covered", "matched", "start covered", "start matched"]);
 
 /** Parses one row file; a directive line it cannot read is an error, never a skipped check. */
 const parseRow = (file: string, text: string): FileRow => {
@@ -81,7 +84,9 @@ const parseRow = (file: string, text: string): FileRow => {
     const count = COUNT_LINE.exec(lines[i]);
     const absent = ABSENT_LINE.exec(lines[i]);
     if (absent) row.absent.push(absent[1]);
-    else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
+    else if (count && FLOOR_KEYS.has(count[1]) && count[2] === "=") {
+      throw new Error(`${file}:${i + 1}: want \`// expect ${count[1]} >= ${count[3]}\`, got an exact count: another PR's coverage would break it`);
+    } else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
     else throw new Error(`${file}:${i + 1}: unreadable directive ${JSON.stringify(lines[i])}`);
   }
   return row;
@@ -140,6 +145,25 @@ Deno.test({
   },
 });
 
+// A const cell's fragment under the dual emit's control 3 must report a bytes mismatch, the class
+// the corpus baseline and the bytes veto read; unbroken, it matches.
+Deno.test({
+  name: "ir shadow: a const cell whose fragment differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    const src = `const xs = [1, 2]\nconst s = "hi"\nprint(xs[1])\nprint(s)\n`;
+    const ok = run(src, true);
+    if (ok.rows.get("const cell plain array: matched") !== 2 || ok.rows.get("const cell plain string: matched") !== 2) {
+      throw new Error(`want both cells matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("mismatch bytes: const cell "));
+    if (bad.length !== 2 || [...rows.keys()].some((k) => k.startsWith("const cell ") && k.endsWith(": matched"))) {
+      throw new Error(`want each cell a "mismatch bytes: const cell" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
@@ -154,8 +178,17 @@ Deno.test({
       refused = true;
     }
     if (!refused) throw new Error("want a bad directive refused, got it parsed");
-    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered = 1\n${src}`));
-    for (const bad of ["// expect covered = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
+    for (const key of ["covered", "matched", "start covered", "start matched"]) {
+      let exact = false;
+      try {
+        parseRow("control.vl", `// ir shadow: control\n// expect ${key} = 1\n${src}`);
+      } catch {
+        exact = true;
+      }
+      if (!exact) throw new Error(`want an exact "${key}" count refused, got it parsed`);
+    }
+    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered >= 1\n// expect fns = 1\n${src}`));
+    for (const bad of ["// expect fns = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
       let failed = false;
       try {
         gradeRow(parseRow("control.vl", `// ir shadow: control\n${bad}\n${src}`));
@@ -221,7 +254,7 @@ Deno.test({
     const plain = run(COVERED, false);
     // Unarmed, the shipped claim records only its `claimed` rows (a function's, the start's);
     // nothing else, and no fallback.
-    const other = [...plain.rows.keys()].filter((k) => k !== "claimed" && k !== "claimed start");
+    const other = [...plain.rows.keys()].filter((k) => k !== "claimed" && k !== "claimed start" && k !== "claimed const cell");
     if (other.length !== 0) throw new Error(`want only claimed rows unarmed, got ${other.join(", ")}`);
     if (plain.out.length !== armed.out.length || plain.out.some((b, i) => b !== armed.out[i])) {
       throw new Error(`want byte-identical output armed and unarmed (${plain.out.length} vs ${armed.out.length} bytes)`);
@@ -258,7 +291,8 @@ for (const [mode, cls] of [[3, "mismatch bytes"], [4, "mismatch spans"]] as cons
     fn: () => {
       const { rc, rows } = run(COVERED, true, mode);
       if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
-      const got = [...rows].filter(([k]) => k.startsWith(cls)).reduce((n, [, c]) => n + c, 0);
+      const got = [...rows].filter(([k]) => k.startsWith(cls) && !k.includes(": const cell "))
+        .reduce((n, [, c]) => n + c, 0);
       const covered = rows.get("covered") ?? 0;
       if ((rows.get("matched") ?? 0) !== 0 || got !== covered) {
         throw new Error(`want all ${covered} covered as "${cls}", got ${JSON.stringify([...rows])}`);
@@ -1012,7 +1046,7 @@ print(show(nested(null, null, q)) + show(nested(null, { k: "c", r: 4 }, q)) + sh
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("matched") !== 4 || rows.get("covered") !== 4) {
+    if (!((rows.get("covered") ?? 0) >= 4) || rows.get("matched") !== rows.get("covered")) {
       throw new Error(`want the four coalescing functions covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
@@ -1129,8 +1163,9 @@ print(k(2, true, false) + f(true, false) + f2(false, true) + re(true))
 
 // Every node that writes a receiver or an earlier operand before a later one names a valued `if`
 // in that later operand; one in the first operand written stays covered, and an intrinsic's
-// earlier argument, or an element store's receiver and index, is staged below the `if` (`intr`,
-// `st`), so only `stIx`'s `if` in the index is a store miss.
+// earlier argument, an operator's left operand, or an element store's receiver and index, is
+// staged below the `if` (`intr`, `bin`, `eq`, `st`), so only `stIx`'s `if` in the index is a
+// store miss.
 Deno.test({
   name: "ir shadow: a short-circuit operand below a node's lead is a named miss, not a fallback",
   ignore,
@@ -1165,7 +1200,6 @@ print(intr(true, 0.5))
     const { rows } = run(src, true);
     const want: [string, number][] = [
       ["uncovered store short-circuit operand", 1],
-      ["uncovered short-circuit right operand", 2],
       ["uncovered method short-circuit operand", 1],
     ];
     for (const [k, n] of want) {
@@ -1175,7 +1209,10 @@ print(intr(true, 0.5))
     if (rows.has("uncovered short-circuit argument after another")) {
       throw new Error(`want \`intr\` staged, got ${JSON.stringify([...rows])}`);
     }
-    if (!(rows.get("matched")! >= 2)) throw new Error(`want \`first\` and \`intr\` matched, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered short-circuit right operand")) {
+      throw new Error(`want \`bin\` and \`eq\` staged, got ${JSON.stringify([...rows])}`);
+    }
+    if (!(rows.get("matched")! >= 4)) throw new Error(`want \`first\`, \`intr\`, \`bin\` and \`eq\` matched, got ${JSON.stringify([...rows])}`);
     // The start's map store stages its global receiver and key below the value's `if`.
     if (rows.get("start matched") !== 1) throw new Error(`want the start's map store matched, got ${JSON.stringify([...rows])}`);
   },
@@ -1243,10 +1280,10 @@ if d.v is f64 { print(d.v) }
 });
 
 // A block body's last statement is a statement: `f(-1)` runs past `put(9)` and returns `null`
-// (prints 5). The IR once returned `put(9)`'s value there; it is a named miss until it writes
-// the result's `null`.
+// (prints 5). The IR once returned `put(9)`'s value there; it now builds `put(9)` as a statement
+// and falls into the lowering's `null` pad, matching legacy.
 Deno.test({
-  name: "ir shadow: a block body that runs past its last statement is a named miss",
+  name: "ir shadow: a block body that runs past its last statement pads its null and matches",
   ignore,
   fn: () => {
     const src = `function put(x: i32) { return x * 2 }
@@ -1257,9 +1294,13 @@ function f(b: i32) {
 print(f(-1) ?? 5)
 `;
     const { rows } = run(src, true);
-    const want = "uncovered block body falls off";
-    if (rows.get(want) !== 1) throw new Error(`want one "${want}" row, got ${JSON.stringify([...rows])}`);
+    if (rows.has("uncovered block body falls off")) {
+      throw new Error(`want no falls-off miss, got ${JSON.stringify([...rows])}`);
+    }
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
+    if (rows.get("covered") !== 2 || rows.get("matched") !== 2) {
+      throw new Error(`want put and f covered and matched, got ${JSON.stringify([...rows])}`);
+    }
   },
 });
 
@@ -1656,18 +1697,14 @@ Deno.test({
   },
 });
 Deno.test({
-  name: "ir shadow: a start widening an initializer misses by name",
+  name: "ir shadow: a start widening an initializer to its cell covers and matches",
   ignore,
   fn: () => {
-    const cases: [string, string][] = [
-      [`const w: f64 = 3\nprint(w)\n`, "global initializer widen"],
-    ];
-    for (const [src, why] of cases) {
-      const { rows } = run(src, true);
-      if (rows.get(`start uncovered ${why}`) !== 1) {
-        throw new Error(`want one "start uncovered ${why}" row, got ${JSON.stringify([...rows])}`);
-      }
+    const { rows } = run(`const w: f64 = 3\nprint(w)\n`, true);
+    if (rows.get("start covered") !== 1 || rows.get("start matched") !== 1) {
+      throw new Error(`want the start covered and matched, got ${JSON.stringify([...rows])}`);
     }
+    if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -1757,8 +1794,8 @@ Deno.test({
 });
 
 // A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
-// builds and matches, a nullable union binding included; one legacy writes through its binding
-// sink (every arm a construction) is a named miss.
+// builds and matches, a nullable union binding included, and so does one legacy writes through
+// its binding sink (every arm a construction).
 const LET_IF_BOX =
   `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nfunction s(b: boolean): boolean {\n  const u: i32 | string = if b { 1 } else { "x" }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(g(false, 1))\nprint(s(true))\n`;
 Deno.test({
@@ -1769,11 +1806,8 @@ Deno.test({
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
-      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (!rows.has("uncovered declaration if per arm sink")) {
-      throw new Error(`want s a named miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want f, g and s covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2146,11 +2180,10 @@ print(strs())
   },
 });
 
-// The walk around an empty literal, a literal of records, one literal walked twice and one inside
-// another walk are each covered and matched; a generic instance's `[1.5]` walks f64 elements,
-// which the walk names as its own miss.
+// The walk around an empty literal, a literal of records, one literal walked twice, one inside
+// another walk, and each generic instance's walk of f64 elements are covered and matched.
 Deno.test({
-  name: "ir shadow: list-literal walks of each shape match, and an f64 walk is a named miss",
+  name: "ir shadow: list-literal walks of each shape match, an f64 walk included",
   ignore,
   fn: () => {
     const { rc, rows } = run(`function empty(): i32 {
@@ -2186,11 +2219,8 @@ print(empty() + recs() + twice() + nested() + gen(1) + gen("s"))
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want the four walks covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if ((rows.get("uncovered for in element f64") ?? 0) !== 2) {
-      throw new Error(`want both instances' f64 walk named, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 6 || (rows.get("matched") ?? 0) !== 6) {
+      throw new Error(`want the six walks covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
@@ -2580,13 +2610,14 @@ print(qnull().o == null)
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
-      throw new Error(`want cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
+    const cov = rows.get("covered") ?? 0;
+    if (cov < 4 || (rows.get("matched") ?? 0) !== cov) {
+      throw new Error(`want at least cons, hold, moved and qplain covered and matched, got ${JSON.stringify([...rows])}`);
     }
     if ((rows.get("uncovered object field arm unbox") ?? 0) !== 2) {
       throw new Error(`want hbox and qnarrow a named miss, got ${JSON.stringify([...rows])}`);
     }
-    if ((rows.get("uncovered object field explicitNull") ?? 0) !== 2) {
+    if ((rows.get("uncovered object field explicitNull typed null") ?? 0) !== 2) {
       throw new Error(`want hnull and qnull a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
@@ -2646,6 +2677,28 @@ Deno.test({
       (rows.get("uncovered assignment value lit after an operand") ?? 0) !== 1
     ) {
       throw new Error(`want boxed and lead uncovered by name, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned `__trap__()` is the trap, then the bare `return` legacy writes after it: at an i32, a
+// string with a message, a record and a union result it builds and matches. At a wider number
+// legacy widens the dead value, so that result stays a named miss.
+const RETURNED_TRAP =
+  `type Pt = { x: i32, y: i32 }\nfunction ti(_n: i32): i32 { return __trap__() }\nfunction ts(_n: i32): string { return __trap__("unset") }\nfunction tp(): Pt { return __trap__() }\nfunction tu(): i32 | string { return __trap__() }\nfunction tl(): i64 { return __trap__() }\nexport let hi: (n: i32) => i32 = ti\nexport let hs: (n: i32) => string = ts\nexport let hp: () => Pt = tp\nexport let hu: () => i32 | string = tu\nexport let hl: () => i64 = tl\nprint(1)\n`;
+Deno.test({
+  name: "ir shadow: a returned trap builds as the trap and a dead bare return, and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(RETURNED_TRAP, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== 4 || (rows.get("matched") ?? 0) !== 4) {
+      throw new Error(`want ti, ts, tp and tu covered and matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered returned trap widened") ?? 0) !== 1) {
+      throw new Error(`want tl a named miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
