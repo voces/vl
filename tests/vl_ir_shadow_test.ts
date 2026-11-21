@@ -1469,7 +1469,7 @@ print(two("a", "b"))
 
 // `emitExpr`'s generic pre-paths, each a named miss the builder takes at the node (G0): a const
 // bound to a literal delivered to an atom and a delivery `coerceKindAt` converts (a record copy
-// into an `i64` field's row; a list copy that owes nothing is the value). Each program is the
+// into an `i64` field's row, re-read per field; a list copy that owes nothing is the value). Each program is the
 // smallest the corpus has for its row.
 const PRE_PATHS: [string, string][] = [
   [
@@ -1477,7 +1477,7 @@ const PRE_PATHS: [string, string][] = [
     `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
   ],
   [
-    "coercion recCopy",
+    "coercion recCopy re-read",
     `type K = { f: i64 }\nfunction mk() { return { f: 4 } }\nfunction main() {\n  const k: K = mk()\n  const y = mk()\n  print(y.f)\n  print(k.f)\n}\nmain()\n`,
   ],
 ];
