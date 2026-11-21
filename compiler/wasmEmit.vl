@@ -2730,18 +2730,19 @@ function emitCaptureRead(name: string, fnIx: i32) {
 // and `armFieldStoreTy` stores, and nothing keeps the lengths in step: a registration helper that
 // pushes a variant row and then refuses one of its fields leaves a start with no count.
 // `emitFail` keeps emitting, so an unguarded span read traps the compiler instead (D1152).
-function guardVariantFieldSpan(vi: i32, where: string) {
-  if vi >= 0 && vi < uFieldStart.length && vi < uFieldCount.length {
-    const end = uFieldStart[vi] + uFieldCount[vi]
-    if (
-      uFieldStart[vi] >= 0
-      && uFieldCount[vi] >= 0
-      && end <= sFieldNames.length
-      && end <= sFieldNames.length
-    ) {
-      return 0
-    }
+// Whether variant row `vi`'s field span lies inside the parallel field tables.
+function variantFieldSpanOk(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return false
   }
+  const end = uFieldStart[vi] + uFieldCount[vi]
+  return uFieldStart[vi] >= 0
+    && uFieldCount[vi] >= 0
+    && end <= sFieldNames.length
+}
+
+function guardVariantFieldSpan(vi: i32, where: string) {
+  if variantFieldSpanOk(vi) { return 0 }
   return emitFail(
     "emitProgram: "
       + where
@@ -3128,7 +3129,10 @@ function emitStructExprAsVariantBox(exprIx: i32, vi: i32, ssi: i32, fnIx: i32) {
   const rows: i32[] = []
   variantRowFields(vi, names, rows)
   fbI32Rel(RS_TAG, uTags[vi])
-  if (emitRecCopy(exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx) < 0) {
+  if (
+    emitRecCopy(exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx, false)
+    < 0
+  ) {
     return -1
   }
   fbStructNew(uBoxIdx)
@@ -3137,8 +3141,8 @@ function emitStructExprAsVariantBox(exprIx: i32, vi: i32, ssi: i32, fnIx: i32) {
 
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
-// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
-// `dRow` is the destination's struct row, or -1 for a variant row.
+// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`,
+// already on the stack where `built`. `dRow` is the destination's struct row, or -1 for a variant row.
 function emitRecCopy(
   exprIx: i32,
   ssi: i32,
@@ -3147,10 +3151,19 @@ function emitRecCopy(
   dNames: string[],
   dFieldRows: i32[],
   fnIx: i32,
+  built: boolean,
 ): i32 {
   const held = coerceHeld
   coerceHeld = exprIx
-  const r = emitRecCopyFields(exprIx, ssi, dRow, dNames, dFieldRows, fnIx)
+  const r = emitRecCopyFields(
+    exprIx,
+    ssi,
+    dRow,
+    dNames,
+    dFieldRows,
+    fnIx,
+    built,
+  )
   coerceHeld = held
   if r < 0 { return -1 }
   fbStructNew(dHeap)
@@ -3350,6 +3363,21 @@ function rcHasNested(
   return false
 }
 
+// Whether a copy of `exprIx` at source row `ssi` into `dNames`/`dFieldRows` re-reads its source
+// per field: a pure source, or a single field with no nested record. Otherwise it reads the value
+// once, into `variantReboxSlot`.
+function rcReReadable(
+  exprIx: i32,
+  ssi: i32,
+  dRow: i32,
+  dNames: string[],
+  dFieldRows: i32[],
+): boolean {
+  return exprReReadable(unwrapParen(exprIx))
+    || (dNames.length == 1
+    && !rcHasNested(ssi, dRow, recCopyTyOf(exprIx), dNames, dFieldRows))
+}
+
 // `emitRecCopy`'s field loop, with `exprIx` held so each read emits the record itself.
 function emitRecCopyFields(
   exprIx: i32,
@@ -3358,6 +3386,7 @@ function emitRecCopyFields(
   dNames: string[],
   dFieldRows: i32[],
   fnIx: i32,
+  built: boolean,
 ): i32 {
   if ssi < 0 || ssi >= sHeapIdx.length {
     return emitFailAt(
@@ -3367,16 +3396,20 @@ function emitRecCopyFields(
   }
   const sHeap = sHeapIdx[ssi]
   const dTy = recCopyTyOf(exprIx)
-  const reReadable = exprReReadable(unwrapParen(exprIx))
-    || (dNames.length == 1
-    && !rcHasNested(ssi, dRow, dTy, dNames, dFieldRows))
+  const reReadable = rcReReadable(exprIx, ssi, dRow, dNames, dFieldRows)
+  if built && reReadable {
+    return emitFailAt(
+      "emitProgram: internal: a record copy was handed its value once for a source it re-reads",
+      exprIx,
+    )
+  }
   if !reReadable {
     if !fnUses.variantRebox {
       return emitFail(
         "emitProgram: a multi-field record from a call is copied with no scratch slot reserved",
       )
     }
-    if emitExpr(exprIx, fnIx) < 0 { return -1 }
+    if !built && emitExpr(exprIx, fnIx) < 0 { return -1 }
     fbLocalSet(variantReboxSlot)
   }
   rcElem.pathHeap = []
@@ -3968,19 +4001,60 @@ function rcFieldTy(dTy: i32, name: string): i32 {
   return objFieldType(d, name)
 }
 
-// `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
-function emitRecCopyInto(exprIx: i32, row: i32, fnIx: i32): i32 {
+// `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`), the
+// value already on the stack where `built` (the IR's `RCoerce`, `coerceTail`).
+function emitRecCopyInto(
+  exprIx: i32,
+  row: i32,
+  fnIx: i32,
+  built: boolean,
+): i32 {
   const names: string[] = []
   const rows: i32[] = []
+  const sh = recCopyShapeOf(exprIx, row, fnIx, names, rows)
+  if sh.rsWhy == "span" {
+    return guardVariantFieldSpan(-2 - row, "emitRecCopyInto")
+  }
+  if sh.rsWhy == "row" {
+    return emitFailAt(
+      "emitProgram: a record copied at its delivery has no row",
+      exprIx,
+    )
+  }
+  return emitRecCopy(
+    exprIx,
+    sh.rsSsi,
+    sh.rsHeap,
+    sh.rsRow,
+    names,
+    rows,
+    fnIx,
+    built,
+  )
+}
+
+// A record copy's source struct row, destination heap and destination struct row (-1 for a
+// variant row), its destination fields pushed onto `names`/`rows`; `rsWhy` "span" or "row" where
+// the destination has no fields to read.
+type RcShape = { rsSsi: i32, rsHeap: i32, rsRow: i32, rsWhy: string }
+function recCopyShapeOf(
+  exprIx: i32,
+  row: i32,
+  fnIx: i32,
+  names: string[],
+  rows: i32[],
+): RcShape {
   // A call copied back to its own record is read at the row its function builds it at.
   const from = recCopyFromOf(exprIx)
   let ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
   if ssi < 0 && from < 0 { ssi = copyArmRowOf(exprIx) }
   if row <= -2 {
     const vi = -2 - row
-    if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
+    if !variantFieldSpanOk(vi) {
+      return { rsSsi: ssi, rsHeap: -1, rsRow: -1, rsWhy: "span" }
+    }
     variantRowFields(vi, names, rows)
-    return emitRecCopy(exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx)
+    return { rsSsi: ssi, rsHeap: variantHeap(vi), rsRow: -1, rsWhy: "" }
   }
   if (
     row < 0
@@ -3988,10 +4062,7 @@ function emitRecCopyInto(exprIx: i32, row: i32, fnIx: i32): i32 {
     || row >= sFieldCount.length
     || row >= sFieldStart.length
   ) {
-    return emitFailAt(
-      "emitProgram: a record copied at its delivery has no row",
-      exprIx,
-    )
+    return { rsSsi: ssi, rsHeap: -1, rsRow: -1, rsWhy: "row" }
   }
   let fj = 0
   while fj < sFieldCount[row] {
@@ -3999,7 +4070,25 @@ function emitRecCopyInto(exprIx: i32, row: i32, fnIx: i32): i32 {
     rows.push(sFieldStart[row] + fj)
     fj = fj + 1
   }
-  return emitRecCopy(exprIx, ssi, sHeapIdx[row], row, names, rows, fnIx)
+  return { rsSsi: ssi, rsHeap: sHeapIdx[row], rsRow: row, rsWhy: "" }
+}
+
+// Whether the record copy delivery `exprIx` owes in `fnIx` reads its source again per field, so
+// its value cannot be built once before the copy; true where the copy has no shape to read.
+export function recCopyReReads(exprIx: i32, fnIx: i32): boolean {
+  const names: string[] = []
+  const rows: i32[] = []
+  const sh = recCopyShapeOf(
+    exprIx,
+    recCopyRowAt(exprIx, fnIx),
+    fnIx,
+    names,
+    rows,
+  )
+  if sh.rsWhy != "" || sh.rsSsi < 0 || sh.rsSsi >= sHeapIdx.length {
+    return true
+  }
+  return rcReReadable(exprIx, sh.rsSsi, sh.rsRow, names, rows)
 }
 
 // Pushes variant row `vi`'s field names and flat field rows onto `names` and `rows`, in layout order.
@@ -30889,7 +30978,7 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   coerceHeld = exprIx
   if ck == "recCopy" {
     // A copy reads each field off the value, so the node stays held for the whole copy.
-    const rc = emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx)
+    const rc = emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx, false)
     coerceHeld = held
     return rc
   }
@@ -30937,7 +31026,9 @@ export function coerceTail(exprIx: i32, fnIx: i32): i32 {
   return match ck {
     "listCopy" => emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
     "mapRetag" => if exprUnion(exprIx, fnIx) { emitMapRetagTail(exprIx) } else { 0 }
-    "none" | "fnClo" | "mapUnbox" | "recCopy" | "box" | "unbox" | "atomstr" => 0
+    // Only a copy that reads its value once reaches here (`recCopyReReads`).
+    "recCopy" => emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx, true)
+    "none" | "fnClo" | "mapUnbox" | "box" | "unbox" | "atomstr" => 0
   }
 }
 
