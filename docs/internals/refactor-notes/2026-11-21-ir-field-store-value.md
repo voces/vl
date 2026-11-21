@@ -10,8 +10,8 @@ missed as `field store coercion` (49).
   name the arm the store writes: `plain`, `box`, `f64` / `i64` / `f32`, `atomToStr`, `strValue`,
   `nulnone` or `armDelivery`. `emitStructFieldStoreValue` and `emitVariantFieldStoreVal` now
   match on that arm, so legacy and the IR read one decision. The two `*ValuePlain` predicates are
-  no longer exported. The re-encode ladder's `fieldStorePlainMissed` arms are gone: they were the
-  kinds the plain check always answers.
+  no longer exported. The kinds the plain check always answers plain map to `unencodable`, which
+  legacy refuses (`fieldStorePlainMissed`) and the builder misses, so a disagreement stays loud.
 - The builder delivers the value at the field's rep through `deliver`. That is the existing box
   plan (`emitUnionBoxOwed`), widening (`emitWidened`), atom decode (`emitAtomToStr`, which
   `emitStrValue` writes for an atom), and, under #9301's `narrowedArmNeedsUnbox` gate, the
