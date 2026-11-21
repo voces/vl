@@ -70,7 +70,8 @@ The queue, or the IR reviewer, refuses an IR PR on any of:
 - a `--names` build that is not the plain build plus custom sections;
 - a parallel predicate mirror, unless legacy consumes it or an agreement check is armed;
 - a new dead export;
-- any differ under `ir-identity.sh --claimless` or `--cases`.
+- any differ under `ir-identity.sh --claimless` or `--cases`;
+- a shipping door that bypasses `claimable()` (ir-design §10.2).
 
 ## Folds
 
