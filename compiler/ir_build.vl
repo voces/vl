@@ -270,6 +270,7 @@ import {
   isRecvStageRep,
   isTestsStorage,
   isVariantTagPlain,
+  litIsArmOf,
   memberBoxReadAt,
   monoStaticIsResult,
   narrowedBoxVariantPlain,
@@ -712,6 +713,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
   if arm == "never" || arm == "pinNever" {
     return isConstTest(b, n, 0, ix, rep)
   }
+  if arm == "litArms" { return isLitArms(b, n, ix, rep) }
   if arm == "emptyFit" {
     const p = emptyFitPlanOf(ix, ibFnIx)
     if emptyFitDeclines(p, ix) {
@@ -765,6 +767,29 @@ function isEmptyFit(
     return irBMiss("is empty fit operand rep")
   }
   return irBLetTemp(b, { leV: v, leAt: ix }, ix, rep)
+}
+
+// `recv is <literal type>` at the `litArms` rung, along `litIsArmOf`'s arm as `emitIsTestLitArms`
+// writes it: a scalar map read's hit or miss, a ref niche's null test, or a constant. A constant
+// is built only over a re-readable receiver, since legacy writes no receiver read before it.
+function isLitArms(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  const la = litIsArmOf(ix, n, ibFnIx)
+  return match la {
+    "mapNull" | "mapHas" => mapReadHas(b, n.isObj, la == "mapHas", ix, rep)
+    "nicheTest" => isNulTest(b, n, ix, rep)
+    "nicheNever" | "atomTrue" | "memberTrue" => {
+      if rep != ibBool { return irBMiss("is result rep") }
+      if !unionEqOperandOk(n.isObj) {
+        return irBMiss("is literal constant receiver")
+      }
+      const bits: i64 = if la == "nicheNever" { 0 } else { 1 }
+      const o: Opnd = { oiRep: rep, oiBits: bits }
+      o
+    }
+    "nicheRaw" | "atomNotNul" | "atomEq" | "boxLits" | "numBox" | "memberNoRecv" | "memberEq" | "none" => {
+      irBMiss("is rung litArms " + la)
+    }
+  }
 }
 
 // Whether `emitListEmptyFitIs` answers 0 along plan `p`, passing to the next rung.
@@ -3968,13 +3993,25 @@ function nulTestOperandOk(arm: NulTestArm, vr: i32): boolean {
 // `m[k] == null` over a scalar map read, as legacy writes it: the map's has probe, then
 // `i32.eqz` for `==`.
 function nulTestMapHas(b: i32[], bt: BinNulTest, ix: i32, rep: i32): Opnd {
-  const r = nodeAt(unwrapParen(bt.bnRef))
+  return mapReadHas(b, bt.bnRef, bt.bnInvert, ix, rep)
+}
+
+// Whether scalar map read `readIx` hit, as `emitMapHas` writes it, or with `present` false that
+// it missed (`i32.eqz`): a map read's null test and its `is` literal arms.
+function mapReadHas(
+  b: i32[],
+  readIx: i32,
+  present: boolean,
+  ix: i32,
+  rep: i32,
+): Opnd {
+  const r = nodeAt(unwrapParen(readIx))
   if !(r is Index) { return irBMiss("null test map operand") }
   if rep != ibBool { return irBMiss("null test result rep") }
   const h = mapHasRhs(b, r.idxArr, r.idxIndex, ix)
   if ibMiss != "" { return irBMiss(ibMiss) }
   const v = irBLetTemp(b, h, ix, rep)
-  if bt.bnInvert || ibMiss != "" { return v }
+  if present || ibMiss != "" { return v }
   return irBLetTemp(b, { poOp: "not", poArgs: [v] }, ix, rep)
 }
 
