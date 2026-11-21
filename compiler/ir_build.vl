@@ -113,6 +113,7 @@ import {
   valtypeOf,
 } from "./ir_lower"
 import {
+  CallRefArgArm,
   GlobalCtx,
   ObjLitArm,
   PrintArm,
@@ -129,6 +130,7 @@ import {
   atomStrPlanOf,
   binNumWidth,
   callEndsNever,
+  callRefArgArmOf,
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
@@ -432,7 +434,10 @@ import {
 import { isVoidTy } from "./tyquery"
 import {
   TY_BOOL,
+  TY_F32,
+  TY_F64,
   TY_I32,
+  TY_I64,
   TY_NEVER,
   TY_STR,
   tyScalarBasePrim,
@@ -2187,17 +2192,21 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
   let i = 0
   while i < c.callArgs.length {
     const at = b.length
-    const a = irBExpr(b, c.callArgs[i])
+    // A widening is delivered at its parameter's number, as `emitWidened` writes it.
+    const wt = closureArgWidenTy(
+      callRefArgArmOf(ix, ibFnIx, key, c.callArgs[i], i),
+    )
+    const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else { irBExpr(b, c.callArgs[i]) }
     if ibMiss != "" { return missRhs("argument") }
     if ifBelowLead(b, at, "short-circuit closure argument") {
       return missRhs("short-circuit closure argument")
     }
-    const ap = repPrim(irBOpRep(a))
-    const pk = sigParamKindAt(key, i)
-    const aps: string = if ap == null { "" } else { ap }
-    const pks: string = if pk == null { "-" } else { pk }
-    const rec = pks == "struct" && repNodeAt(irBOpRep(a)) is RRecord
-    if aps != pks && !rec { return missRhs("closure argument coercion") }
+    if wt >= 0 && irBOpRep(a) != repNodeOfTy(wt) {
+      return missRhs("closure argument coercion")
+    }
+    if wt < 0 && !closureArgRepIs(irBOpRep(a), sigParamKindAt(key, i)) {
+      return missRhs("closure argument coercion")
+    }
     args.push(a)
     i = i + 1
   }
@@ -2209,6 +2218,31 @@ function closureCallRhs(b: i32[], c: Call, ix: i32): Rhs {
     crDrop: !callRefPlainVoid(ix, ibFnIx),
   }
   return r
+}
+
+// The number type a closure-call argument on arm `arm` widens to, or -1 for no widening.
+function closureArgWidenTy(arm: CallRefArgArm): i32 {
+  return match arm {
+    "widenI64" => TY_I64
+    "widenF64" => TY_F64
+    "widenF32" => TY_F32
+    "wideIntoI32" | "heapIntoI32" | "boxUnrecorded" | "armNotBuilt" | "armUnbox" | "nulArm" | "box" | "atomToStr" | "scalarList" | "general" | "atom" => -1
+  }
+}
+
+// Whether an argument built at rep `r` is what a closure parameter of kind `k` takes as it stands.
+function closureArgRepIs(r: i32, k: VKind | null): boolean {
+  const n = repNodeAt(r)
+  const p = repPrim(r)
+  const ps: string = if p == null { "" } else { p }
+  return match k {
+    "i32" | "i64" | "f64" | "f32" | "str" => ps == k
+    "struct" => n is RRecord
+    "closure" => n is RClosure
+    "list" | "strlist" | "f64list" | "i64list" | "f32list" | "reflist" => n is RList
+    "map" => n is RMap
+    "union" | "variant" | "nulvariant" | "nulstruct" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | "v128list" | null => false
+  }
 }
 
 // Whether every operand in `os` is a temp, which the lowering writes below a later valued `if`
