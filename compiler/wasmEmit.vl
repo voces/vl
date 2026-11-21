@@ -441,6 +441,7 @@ import {
   LBK_STR_LIST,
   LBK_U8_LIST,
   LBK_UNION,
+  LiFrame,
   ListKind,
   PK_I16,
   PK_U16,
@@ -630,6 +631,7 @@ import {
   leqSScratchBase,
   leqgBases,
   liBack,
+  liFrameSave,
   liKinds,
   liSlots,
   liftWbEnd,
@@ -12272,18 +12274,32 @@ export function spreadRunLit(run: i32[], arrIx: i32, h: i32, pos: i32): i32 {
 // checker's type for it unless it has none; context restored on exit.
 function emitArr(arrIx: i32, fnIx: i32) {
   const from = wLen()
+  // The scratch frame as legacy found it, for the probe to allocate from.
+  const before = if irShadowOn { liFrameSave() } else { liFrameNone }
   const r = emitArrAt(arrIx, fnIx, arrLitListBuild(arrIx, fnIx))
   if r >= 0 && irShadowOn {
-    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from)
+    irNodeInShadowHook(arrIx, fnIx, arrLitBuildTyOf(arrIx, fnIx), from, before)
   }
   return r
 }
 
 // The armed shadow's per-occurrence count of a legacy site (`irNodeInShadow`); a hook, since the
 // IR's builder imports this module.
-export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32) => i32 = nodeInShadowNone
+export let irNodeInShadowHook: (ix: i32, fnIx: i32, ty: i32, from: i32, before: LiFrame) => i32 = nodeInShadowNone
+const liFrameNone: LiFrame = {
+  lfKinds: [],
+  lfSlots: [],
+  lfBack: [],
+  lfField: [],
+}
 
-function nodeInShadowNone(_ix: i32, _fnIx: i32, _ty: i32, _from: i32): i32 {
+function nodeInShadowNone(
+  _ix: i32,
+  _fnIx: i32,
+  _ty: i32,
+  _from: i32,
+  _before: LiFrame,
+): i32 {
   return 0
 }
 
@@ -26668,8 +26684,8 @@ function emitCallRefArg(
   args: i32[],
   i: i32,
 ) {
-  // Whether the argument takes the general arm with nothing owed (`callRefPlainKey`'s plain path).
-  let argPlainArm = false
+  // Whether the argument is one the IR writes as legacy does (`callRefPlainKey`'s plain path).
+  const argPlainArm = callRefArgPlain(callIx, fnIx, ckey, args[i], i)
   // D940 — the struct row the functype declares, seeded exactly as the direct call
   // seeds it from `paramStructIdxOf`: an object-literal argument otherwise resolves
   // its own row by field set, the pre-merge row wherever the callee's parameter row
@@ -26751,13 +26767,6 @@ function emitCallRefArg(
       // recover a `null` argument into a nullable parameter, a trap (D2552).
       // A narrowed struct argument is unboxed at the key's slot, as a direct call does (D1723).
       const pkOwed = pkk != null && narrowedArmNeedsUnbox(args[i], fnIx)
-      argPlainArm = !pkOwed
-        && (pkk == "i32"
-        || pkk == "i64"
-        || pkk == "f64"
-        || pkk == "f32"
-        || pkk == "str"
-        || pkk == "struct" && !exprNullableRecord(args[i], fnIx))
       const pkHeap = if pkk != null { armDestHeapOf(pkk, sigParamSlotAt(ckey, i)) } else { -1 }
       const pkSeat = armOpen(pkOwed, pkHeap, args[i], fnIx)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
@@ -26769,21 +26778,40 @@ function emitCallRefArg(
   return if argPlainArm { 1 } else { 0 }
 }
 
-// Whether argument `a` takes `emitCallRefArg`'s general arm with nothing owed: a scalar of its
-// parameter's own width, a string, or a record neither unboxed from a narrowing nor nullable.
-function callRefArgPlain(
+// Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
+// number, or the general arm with nothing owed at a scalar of the argument's own width, a string,
+// a record neither unboxed from a narrowing nor nullable, or a non-null closure, list or map.
+export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
   ckey: string,
   a: i32,
   i: i32,
 ): boolean {
-  if callRefArgArmOf(callIx, fnIx, ckey, a, i) != "general" { return false }
+  const arm = callRefArgArmOf(callIx, fnIx, ckey, a, i)
+  if arm == "widenI64" || arm == "widenF64" || arm == "widenF32" { return true }
+  if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
   const k = sigParamKindAt(ckey, i)
   if k == "str" { return true }
   if k == "struct" {
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
+  }
+  if k == "closure" { return !exprNulClosure(a, fnIx) }
+  if (
+    k == "list"
+    || k == "strlist"
+    || k == "f64list"
+    || k == "i64list"
+    || k == "f32list"
+    || k == "reflist"
+    || k == "map"
+  ) {
+    return !narrowedArmNeedsUnbox(a, fnIx)
+      && !exprNullableList(a, fnIx)
+      && exprNulScalarListKind(a, fnIx) == null
+      && !exprNullableRefArray(a, fnIx)
+      && !exprNullableMap(a, fnIx)
   }
   return (k == "i32" || k == "i64" || k == "f64" || k == "f32")
     && exprScalarWidth(a, fnIx) == k
@@ -27155,7 +27183,10 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
     if !fieldCallRefPlainHead(callIx, c, callee, fnIx) { return "" }
     return callRefPlainTail(callIx, c, fnIx)
   }
-  if !(callee is Ident) { return "" }
+  if !(callee is Ident) {
+    if !exprCallRefPlainHead(callIx, c, fnIx) { return "" }
+    return callRefPlainTail(callIx, c, fnIx)
+  }
   const nm = callee.identName
   const d = identDeclOf(c.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
@@ -27196,6 +27227,14 @@ function fieldCallRefPlainHead(
 ): boolean {
   return exprIsClosure(c.callFn, fnIx)
     && exprStruct(m.memObj, fnIx)
+    && bundleParamOfRead(c.callFn, fnIx) < 0
+    && placeRecordSigs(callIx, fnIx).length == 0
+}
+
+// `callRefPlainKey`'s head for any other callee expression (`f()(x)`, `fs[0](x)`), which
+// `emitCallCore` sends to `emitCallRef` when it is a closure: no bundle and no held record.
+function exprCallRefPlainHead(callIx: i32, c: Call, fnIx: i32): boolean {
+  return exprIsClosure(c.callFn, fnIx)
     && bundleParamOfRead(c.callFn, fnIx) < 0
     && placeRecordSigs(callIx, fnIx).length == 0
 }
@@ -40122,6 +40161,57 @@ function emitDirectCallTail(target: i32, callIx: i32, fnIx: i32) {
   return 0
 }
 
+// The parameters of the function at `fnStmts` slot `target`, or none.
+function capturedCallParams(target: i32): i32[] {
+  const cfn = nodeAt(fnStmts[target])
+  return if cfn is FuncDecl { cfn.fnParams } else { [] }
+}
+
+// How `emitCapturedCall` writes argument `arg`, the `i`th of a call of `target` from frame `fnIx`:
+// a union parameter's box by the table or the floor, a widening, a literal union, an atom's
+// string, a narrowed arm's unbox, or the plain expression.
+export type CapturedArgArm = "boxTable"
+  | "boxFloor"
+  | "widenI64"
+  | "widenF64"
+  | "widenF32"
+  | "lit"
+  | "atomStr"
+  | "unbox"
+  | "plain"
+
+export function capturedArgArmOf(
+  arg: i32,
+  i: i32,
+  target: i32,
+  fnIx: i32,
+): CapturedArgArm {
+  const cps = capturedCallParams(target)
+  let cuNm = ""
+  let cpKind: VKind = "i32"
+  let cpLit = false
+  if i < cps.length {
+    cpKind = vtKindOfParam(cps[i])
+    const cpn = nodeAt(cps[i])
+    if cpn is Param {
+      if cpKind == "union" { cuNm = boxTyName(nodeTyIxOf(cpn.parType)) }
+      // Alias-INDEX, so a NARROWED copy is recognized.
+      if tyIsLitUnion(nodeTyAt(cps[i], fnStmts[target])) { cpLit = true }
+      if nodeTyIsNulLitUnion(parTyNode(cps[i])) { cpLit = true }
+    }
+  }
+  if cuNm != "" {
+    return if boxOwedAt(arg, fnIx) { "boxTable" } else { "boxFloor" }
+  }
+  if cpKind == "i64" { return "widenI64" }
+  if cpKind == "f64" { return "widenF64" }
+  if cpKind == "f32" { return "widenF32" }
+  if cpLit { return "lit" }
+  if cpKind == "str" && exprIsLitAtom(arg, fnIx) { return "atomStr" }
+  if i < cps.length && narrowedArmNeedsUnbox(arg, fnIx) { return "unbox" }
+  return "plain"
+}
+
 // The captured-call lowering for an `Ident` callee resolved to a CAPTURING lifted
 // function at index `target`: build its closure value live (reading captures) and
 // `call_ref` it (a plain `call` would pass a null env and lose the captures).
@@ -40148,53 +40238,44 @@ function emitCapturedCall(callIx: i32, fnIx: i32, target: i32) {
   // declared functype. Three kinds are check-clean invalid wasm without this — a union box, an
   // i64/f64/f32 mismatch, and a litunion — each coerced the way the direct twin coerces, safe by construction since each arm fires only where the raw push is already wrong.
   if target < 0 { return -1 }
-  const cfn = nodeAt(fnStmts[target])
-  let cps: i32[] = []
-  if cfn is FuncDecl { cps = cfn.fnParams }
+  const cps = capturedCallParams(target)
   let cai = 0
   while cai < cargs.length {
-    let cuNm = ""
-    let cpKind: VKind = "i32"
-    let cpLit = false
-    let cuTy = -1
-    if cai < cps.length {
-      cpKind = vtKindOfParam(cps[cai])
-      const cpn = nodeAt(cps[cai])
-      if cpn is Param {
-        if cpKind == "union" {
-          cuNm = boxTyName(nodeTyIxOf(cpn.parType))
-          cuTy = nodeTyAt(cps[cai], fnStmts[target])
-        }
-        // Alias-INDEX, so a NARROWED copy is recognized.
-        if tyIsLitUnion(nodeTyAt(cps[cai], fnStmts[target])) { cpLit = true }
-        if nodeTyIsNulLitUnion(parTyNode(cps[cai])) { cpLit = true }
+    match capturedArgArmOf(cargs[cai], cai, target, fnIx) {
+      "boxTable" => {
+        // The table boxes an argument whose union the checker records; the floor, below, boxes
+        // one with no usable record at the parameter's union.
+        if emitDelivered(cargs[cai], fnIx) < 0 { return -1 }
       }
-    }
-    if cuNm != "" && boxOwedAt(cargs[cai], fnIx) {
-      // The table boxes an argument whose union the checker records; the floor, below, boxes
-      // one with no usable record at the parameter's union.
-      if emitDelivered(cargs[cai], fnIx) < 0 { return -1 }
-    } else if cuNm != "" {
-      if emitUnionBoxOwed(cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
-    } else if cpKind == "i64" {
-      if emitWidened(cargs[cai], 3, fnIx) < 0 { return -1 }
-    } else if cpKind == "f64" {
-      if emitWidened(cargs[cai], 4, fnIx) < 0 { return -1 }
-    } else if cpKind == "f32" {
-      if emitWidened(cargs[cai], 5, fnIx) < 0 { return -1 }
-    } else if cpLit {
-      if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
-    } else if cpKind == "str" && exprIsLitAtom(cargs[cai], fnIx) {
-      // The MIRROR of `cpLit`: a literal-union ATOM argument into a `string` parameter
-      // widens to its member string, the edge the direct twin takes as `cParamStr`.
-      if emitAtomToStr(cargs[cai], fnIx) < 0 { return -1 }
-    } else {
-      if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
-      // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
-      // the direct call's argument rung unboxes it.
-      if cai < cps.length && narrowedArmNeedsUnbox(cargs[cai], fnIx) {
+      "boxFloor" => {
+        const cpn = nodeAt(cps[cai])
+        const cuNm = if cpn is Param { boxTyName(nodeTyIxOf(cpn.parType)) } else { "" }
+        const cuTy = nodeTyAt(cps[cai], fnStmts[target])
+        if emitUnionBoxOwed(cuNm, cuTy, cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "widenI64" => {
+        if emitWidened(cargs[cai], 3, fnIx) < 0 { return -1 }
+      }
+      "widenF64" => {
+        if emitWidened(cargs[cai], 4, fnIx) < 0 { return -1 }
+      }
+      "widenF32" => {
+        if emitWidened(cargs[cai], 5, fnIx) < 0 { return -1 }
+      }
+      "lit" | "plain" => {
+        if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "atomStr" => {
+        // The MIRROR of `lit`: a literal-union ATOM argument into a `string` parameter
+        // widens to its member string, the edge the direct twin takes as `cParamStr`.
+        if emitAtomToStr(cargs[cai], fnIx) < 0 { return -1 }
+      }
+      "unbox" => {
+        // A value narrowed out of a box into an arm or nullable-arm parameter is unboxed, as
+        // the direct call's argument rung unboxes it.
+        if emitExpr(cargs[cai], fnIx) < 0 { return -1 }
         emitNarrowedArmUnboxTo(
-          armDestHeapOf(cpKind, paramStructIdxOf(cps[cai])),
+          armDestHeapOf(vtKindOfParam(cps[cai]), paramStructIdxOf(cps[cai])),
           cargs[cai],
           fnIx,
         )
