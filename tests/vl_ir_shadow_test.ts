@@ -70,6 +70,9 @@ const ROWS_DIR = `${ROOT}/tests/ir-shadow-rows`;
 const NAME_LINE = /^\/\/ (ir shadow: .+)$/;
 const COUNT_LINE = /^\/\/ expect (.+?) (=|>=) (\d+)$/;
 const ABSENT_LINE = /^\/\/ expect no row containing (.+)$/;
+// Coverage counts are floors: matched = covered is graded in every row, so a floor hides no
+// mismatch, and an exact count would red whenever another PR covers one more function.
+const FLOOR_KEYS = new Set(["covered", "matched", "start covered", "start matched"]);
 
 /** Parses one row file; a directive line it cannot read is an error, never a skipped check. */
 const parseRow = (file: string, text: string): FileRow => {
@@ -81,7 +84,9 @@ const parseRow = (file: string, text: string): FileRow => {
     const count = COUNT_LINE.exec(lines[i]);
     const absent = ABSENT_LINE.exec(lines[i]);
     if (absent) row.absent.push(absent[1]);
-    else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
+    else if (count && FLOOR_KEYS.has(count[1]) && count[2] === "=") {
+      throw new Error(`${file}:${i + 1}: want \`// expect ${count[1]} >= ${count[3]}\`, got an exact count: another PR's coverage would break it`);
+    } else if (count) row.counts.push({ key: count[1], op: count[2] as "=" | ">=", n: Number(count[3]) });
     else throw new Error(`${file}:${i + 1}: unreadable directive ${JSON.stringify(lines[i])}`);
   }
   return row;
@@ -173,8 +178,17 @@ Deno.test({
       refused = true;
     }
     if (!refused) throw new Error("want a bad directive refused, got it parsed");
-    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered = 1\n${src}`));
-    for (const bad of ["// expect covered = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
+    for (const key of ["covered", "matched", "start covered", "start matched"]) {
+      let exact = false;
+      try {
+        parseRow("control.vl", `// ir shadow: control\n// expect ${key} = 1\n${src}`);
+      } catch {
+        exact = true;
+      }
+      if (!exact) throw new Error(`want an exact "${key}" count refused, got it parsed`);
+    }
+    gradeRow(parseRow("control.vl", `// ir shadow: control\n// expect covered >= 1\n// expect fns = 1\n${src}`));
+    for (const bad of ["// expect fns = 2", "// expect matched >= 5", "// expect no row containing covered"]) {
       let failed = false;
       try {
         gradeRow(parseRow("control.vl", `// ir shadow: control\n${bad}\n${src}`));
@@ -1784,8 +1798,8 @@ Deno.test({
 });
 
 // A union binding whose `if` initializer legacy writes into a seeded box, one arm at a time,
-// builds and matches, a nullable union binding included; one legacy writes through its binding
-// sink (every arm a construction) is a named miss.
+// builds and matches, a nullable union binding included, and so does one legacy writes through
+// its binding sink (every arm a construction).
 const LET_IF_BOX =
   `function f(b: boolean, v: i32 | string, w: i32 | string): boolean {\n  const u = if b { v } else { w }\n  return u is i32\n}\nfunction g(b: boolean, v: i32 | string): boolean {\n  const u: i32 | string | null = if b { v }\n  return u is i32\n}\nfunction s(b: boolean): boolean {\n  const u: i32 | string = if b { 1 } else { "x" }\n  return u is i32\n}\nprint(f(true, 1, "y"))\nprint(g(false, 1))\nprint(s(true))\n`;
 Deno.test({
@@ -1796,11 +1810,8 @@ Deno.test({
     if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
     const fails = failures(rows);
     if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
-    if ((rows.get("covered") ?? 0) !== 2 || (rows.get("matched") ?? 0) !== 2) {
-      throw new Error(`want f and g covered and matched, got ${JSON.stringify([...rows])}`);
-    }
-    if (!rows.has("uncovered declaration if per arm sink")) {
-      throw new Error(`want s a named miss, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) !== 3 || (rows.get("matched") ?? 0) !== 3) {
+      throw new Error(`want f, g and s covered and matched, got ${JSON.stringify([...rows])}`);
     }
   },
 });
