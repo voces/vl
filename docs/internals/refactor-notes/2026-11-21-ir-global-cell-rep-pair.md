@@ -66,9 +66,11 @@ record 12, …) are the same under either source. They are other families, not t
 
 ## So neither type alone is the rep
 
-Legacy writes neither the initializer nor the read with a conversion. The cell holds the storage
-row and each read reads it as it is. Consumers such as a field read or a list index are written
-from the storage layout. The IR's one-rep-per-global therefore cannot match legacy from either
+Legacy writes neither the initializer nor the read with a conversion: the start body's plain arm
+is `emitExpr` then `global.set`, and the read is `emitUserGlobalGet`. The cell holds the storage
+row and each read reads it as it is, so whatever consumes the read takes the storage row (that
+consumers are written from the storage layout is implied by the module validating, not read
+off each consumer here). The IR's one-rep-per-global therefore cannot match legacy from either
 side:
 
 - at the binding rep, the initializer's value is "the wrong rep";
