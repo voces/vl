@@ -223,7 +223,13 @@ import {
   boxTyName,
   unionBoxTyOfRead,
 } from "./emit_plan_coerce"
-import { arrLitBuild, arrLitTyAt, listFitGrowRow } from "./emit_plan_list"
+import {
+  allocLitChunk,
+  arrLitBuild,
+  arrLitTyAt,
+  arrRefSlotPlain,
+  listFitGrowRow,
+} from "./emit_plan_list"
 import {
   isValueUnionOfSet,
   nulCollWrapHeap,
@@ -255,9 +261,11 @@ import {
 } from "./emit_rep"
 import {
   rlElemInnerSlot,
+  rlElemVariantRow,
   rlSlotOfTyOrTwin,
   uFieldTgtStructIdx,
 } from "./emit_shape_rows"
+import { ListBuild } from "./emit_ref_list_kinds"
 import { RC_MAP, RC_REF_LIST, readAtomKindOfTy } from "./emit_start_block"
 import {
   LBK_REF,
@@ -268,6 +276,7 @@ import {
   PK_U8,
   RLK_I32_LIST,
   RLK_REF_LIST,
+  RLK_STRUCT,
   V128_LIST_KIND,
   VKind,
   bl8Ty,
@@ -287,7 +296,9 @@ import {
   pkKindOfRow,
   pkRowOfKind,
   pkTwinCodeOfRow,
+  rlElemNullable,
   rlElemTyIx,
+  rlRowsMinted,
   rlWrapIdx,
   sDeclared,
   sFieldElemTyIx,
@@ -3553,4 +3564,38 @@ function isPinUnrelated(op: i32, t: i32): boolean {
     if opList && tyAt(x) is TyArray { return false }
   }
   return true
+}
+
+// The slot list literal `arrIx` builds at as a short list of a non-null variant's records in
+// `fnIx`, each element entering the arm as a literal built at its row or a value already of it
+// that owes no recover (`variantCoerceArmOf`'s `struct`, `bare`, `pass`); -1 otherwise.
+export function arrLitVariantSlot(arrIx: i32, fnIx: i32, lb: ListBuild): i32 {
+  const a = nodeAt(arrIx)
+  if (
+    !(a is ArrayLit)
+    || !rlRowsMinted()
+    || a.arrElems.length > allocLitChunk()
+  ) {
+    return -1
+  }
+  const rslot = arrRefSlotPlain(arrIx, a.arrElems, fnIx, lb)
+  if (
+    rslot < 0
+    || rlElemKindAt(rslot) != RLK_STRUCT
+    || rlElemNullable[rslot] == 1
+  ) {
+    return -1
+  }
+  const vi = rlElemVariantRow(rslot)
+  if vi < 0 { return -1 }
+  for e in a.arrElems {
+    if exprArray(e, fnIx) || exprRefArray(e, fnIx) { return -1 }
+    const arm = variantCoerceArmOf(vi, e, fnIx)
+    if arm == "struct" { continue }
+    if arm != "bare" && arm != "pass" { return -1 }
+    if exprNullableRefNiche(e, fnIx) && !readOwesNonNullRecover(e, fnIx) {
+      return -1
+    }
+  }
+  return rslot
 }
