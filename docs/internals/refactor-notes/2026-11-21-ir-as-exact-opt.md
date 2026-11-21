@@ -16,3 +16,14 @@ answered -1, so `as?` missed as `expression as`.
   `emitReturnValue`, whose return sink an IR-claimed function does not open.
 - **The shadow test** that proves a construct outside the set leaves its function uncovered now
   takes the propagating `as`. Its `as?` is inside the set.
+
+## Readings (merge-base `6716810b0`, fixpoint seeds on both sides)
+
+| reading | base | this change |
+| --- | ---: | ---: |
+| tests/cases armed shadow covered / matched | 65,130 / 65,129 | 65,145 / 65,144 (same single fail row) |
+| the 19 tests/cases files with an `exact` miss, covered (= matched) | 244 | 252 |
+| corpus / self-compile functions with no blocker | 44,588 / 19,548 | unchanged (no `as` site there) |
+| L2 self-compile fuel | 107,660,212,814 | 107,661,086,699 (+0.0008%) |
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
