@@ -701,8 +701,11 @@ let ibLoopCont: i32[] = []
 let ibLabelN = 0
 // The statements whose end closes a list reserve region the body opened (`reserve.open`).
 let ibReserveEnd: i32[] = []
-// A fully unrolled range loop's variable, by its `ForRange`, to the constant its copy reads.
-let ibRangeImm: {[i32]: i32} = Map()
+// The fully unrolled range loops being built, by `ForRange`, and the constant each copy's
+// variable reads, innermost last. Stacks, not a map: a map delete anywhere in the compiler makes
+// every map it builds dearer.
+let ibRangeImmAt: i32[] = []
+let ibRangeImmVal: i32[] = []
 let ibBool = -1
 let ibNoValue = -1
 
@@ -2353,9 +2356,10 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const walkVar = dn is LoopVar && ((ibDeclVar[d] ?? -1) >= 0 || ib.irFragment)
   // A range loop's variable is the one its loop made, read as its copy's constant inside a full
   // unroll; a range loop it did not build is legacy's.
-  if dn is ForRange && ibRangeImm.has(d) {
+  const ri = if dn is ForRange { rangeImmAt(d) } else { -1 }
+  if ri >= 0 {
     if rep != repNodeOfTy(TY_I32) { return irBMiss("range constant coercion") }
-    const o: Opnd = { oiRep: rep, oiBits: (ibRangeImm[d] ?? 0) as i64 }
+    const o: Opnd = { oiRep: rep, oiBits: ibRangeImmVal[ri] as i64 }
     return o
   }
   const rangeVar = dn is ForRange && (ibDeclVar[d] ?? -1) >= 0
@@ -6304,7 +6308,8 @@ function forRangeUnrolled(b: i32[], n: ForRange, ix: i32, v: i32): i32 {
     irBNode(blockBody, { asDst: v, asSrc: c }, -1, ibNoValue, ix)
     const cont = if hasCont { labelNew() } else { brk }
     ibLoopCont.push(cont)
-    ibRangeImm[ix] = val
+    ibRangeImmAt.push(ix)
+    ibRangeImmVal.push(val)
     const fb: i32[] = []
     const body = nodeAt(n.frBody)
     if body is Block {
@@ -6312,7 +6317,8 @@ function forRangeUnrolled(b: i32[], n: ForRange, ix: i32, v: i32): i32 {
     } else {
       stmt(fb, n.frBody, NO_SIBS, -1)
     }
-    ibRangeImm.delete(ix)
+    ibRangeImmAt.pop()
+    ibRangeImmVal.pop()
     ibLoopCont.pop()
     if hasCont {
       irBNode(
@@ -6333,6 +6339,16 @@ function forRangeUnrolled(b: i32[], n: ForRange, ix: i32, v: i32): i32 {
   if ibMiss != "" { return 0 }
   irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
   return 0
+}
+
+// The innermost unrolled copy of range loop `d` being built, or -1.
+function rangeImmAt(d: i32): i32 {
+  let k = ibRangeImmAt.length - 1
+  while k >= 0 {
+    if ibRangeImmAt[k] == d { return k }
+    k = k - 1
+  }
+  return -1
 }
 
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
@@ -6934,7 +6950,8 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibMiss = ""
   ibMisses = []
   ibReserveEnd = []
-  ibRangeImm = Map()
+  ibRangeImmAt = []
+  ibRangeImmVal = []
   ibDeclVar = Map()
   ibLiftCapDecl = Map()
   ibOwnDecls = Map()
