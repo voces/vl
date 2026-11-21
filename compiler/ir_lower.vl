@@ -99,6 +99,7 @@ import {
   RCellNew,
   RCoalAtomStr,
   RCoalStr,
+  REnvDrop,
   REnvGet,
   RFnId,
   RGetField,
@@ -268,6 +269,9 @@ import {
   emitCapturedRead,
   emitClosureIds,
   emitClosureValue,
+  emitEnvCacheClose,
+  emitEnvCacheDrop,
+  emitEnvCacheOpen,
   emitFoldedConstRead,
   emitForInCursorInit,
   emitMapGetTail,
@@ -277,15 +281,16 @@ import {
   emitNullRetTail,
   emitStrLitAt,
   emitUnionUnboxTail,
+  envCacheSlotOfFe,
   f64RemCallTail,
   f64RemOperandTail,
-  fallThroughPadOf,
   fieldStoreArmOf,
   fieldStoreNarrowedAt,
   fieldStoreStructAt,
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
+  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -307,6 +312,7 @@ import {
   holeBoxHead,
   holeBoxTail,
   holeBoxTyAt,
+  hostCallTail,
   identListOverrideOf,
   idxRowsOn,
   idxSpanOn,
@@ -430,7 +436,7 @@ import { fbOpenIf } from "./emit_bytes"
 import { atomHookArmOf, fbRefIfOpenType } from "./wasmEmit"
 import { ifRefJoinOf, noRefJoin } from "./emit_plan_if_join"
 import { ifLinkYieldsNull, objOrderStashSlot } from "./emit_if_arm_values"
-import { arrLitArmOf, forInLoopAt } from "./emit_plan_list"
+import { forInLoopAt } from "./emit_plan_list"
 import {
   bankSpanRow,
   callRefDepth,
@@ -830,9 +836,11 @@ function rhs(r: Rhs, tail: boolean) {
     RListNew => listNew(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
-    RCallHost | RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
+    RCallHost => hostCall(r)
+    RCast | RTagOf | RMapSet | RFnId | RCellNew | RCellGet => irLMiss("rhs outside I1")
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
+    REnvDrop => irLMiss("env drop as a value")
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1029,8 +1037,12 @@ function makeClo(r: RMakeClo) {
     // A fresh environment: its captures, as `emitClosureEnvOf` reads them, then the closure.
     const envIdx = fnEnvIdxOf(r.mcFn)
     if envIdx < 0 { return irLMiss("closure env") }
+    // An environment this frame caches is built at its first read in an activation (D7480).
+    const ck = envCacheSlotOfFe(r.mcFn)
+    if ck >= 0 { emitEnvCacheOpen(ck) }
     for o in r.mcEnv { irLOpnd(o) }
     fbStructNew(envIdx)
+    if ck >= 0 { emitEnvCacheClose(ck) }
     emitClosureIds(r.mcFn)
   } else {
     leaf()
@@ -1348,6 +1360,14 @@ function memAccess(r: RMemAccess) {
   return memAccessTail(p, ap.maOff)
 }
 
+// `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
+function hostCall(r: RCallHost) {
+  for a in r.chArgs { irLOpnd(a) }
+  hostCallTail(r.chImport)
+  if r.chNever { fbUnreachable() }
+  return 0
+}
+
 // `RListCopy`: legacy's `__array_copy__` arm in `emitArrayCopyIntr`'s order, each list operand
 // followed by its backing read, then the copy, at `arrCopyPlanOf`'s pair.
 function listCopy(r: RListCopy) {
@@ -1372,7 +1392,7 @@ function makeList(r: RMakeList) {
   const fnIx = lw.irAt
   const lb: ListBuild = { lbKind: r.mlKind, lbSlot: r.mlSlot }
   arrLitPrologue(r.mlAt)
-  const arm = arrLitArmOf(r.mlAt, fnIx, lb)
+  const arm = r.mlArm
   // A `for` walk's iterable of constants reads its module list, as legacy's arm does; the read
   // leaves its elements unwritten, so each must be an immediate.
   if arrLitIsForIter(r.mlAt) {
@@ -1885,7 +1905,8 @@ function boxOp(r: RToBox) {
   const fnIx = lw.irAt
   const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
-  leaf()
+  // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
+  if p.hbArm != "pass" && p.hbArm != "memberBox" { leaf() }
   holeBoxHead(p, r.bxAt, fnIx)
   if (
     p.hbArm == "pass"
@@ -2231,10 +2252,22 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         if r.mmArgs.length == 1 { fbDrop() }
         return 0
       }
+      if r is REnvDrop {
+        emitEnvCacheDrop(r.edFn)
+        irLSettle(pending)
+        return 0
+      }
       if r is RTagStash {
         irLOpnd(r.tgsV)
         tagStashTail()
         irLSettle(pending)
+        return 0
+      }
+      // A void import leaves nothing; any other host call's discarded value is dropped.
+      if r is RCallHost {
+        hostCall(r)
+        irLSettle(pending)
+        if !r.chVoid { fbDrop() }
         return 0
       }
       irLMiss("effect outside I1")
@@ -2864,8 +2897,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
   body(f.irBody, !valued && f.irAt >= 0, -1, false)
-  const fd = if f.irAt >= 0 && f.irAt < P.nodes.length { nodeAt(f.irAt) } else { null }
-  const pad = if valued && fd is FuncDecl { fallThroughPadOf(fd.fnBody, f.irAt) } else { "" }
+  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
