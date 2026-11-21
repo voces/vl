@@ -16,6 +16,7 @@ import {
   OVar,
   Opnd,
   PStaged,
+  RAsUnion,
   RAtomEq,
   RAtomStr,
   RBoxField,
@@ -58,16 +59,17 @@ import {
   RMapGet,
   RMapGetOr,
   RMapHas,
+  RMapIter,
   RMapNew,
   RMapOp,
   RMapSet,
   RMemAccess,
+  RMemOp,
   RNulTest,
   RNullOf,
   RNumCast,
   RNumIntr,
   RNumWiden,
-  ROmitNull,
   RPrimOp,
   RPrint,
   RRawOp,
@@ -102,6 +104,7 @@ import {
   SLet,
   SListSet,
   SLoop,
+  SRangeLoop,
   SRawOp,
   SReturn,
   SSetField,
@@ -131,8 +134,10 @@ import {
 import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { Call, Ident, P, i32ToStr, nodeAt } from "./ast"
+import { Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
 import {
+  memOpIsVoid,
+  memOpPlanOf,
   simdCallRow,
   simdMemBase,
   simdOperandPrim,
@@ -142,7 +147,7 @@ import {
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { tyOpenHeldAsIds } from "./emit_classify"
-import { fnFallThroughPadOf, memAccessPlanOf } from "./wasmEmit"
+import { fnFallThroughPadOf, litArmsReadsOf, memAccessPlanOf } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -540,8 +545,24 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RAsUnion => {
+      use(r.auV, at)
+      // The tag test reads a box; what it yields is the cast's own rep, which the builder takes.
+      if !(repNodeAt(opRep(r.auV)) is RBox) {
+        return fail(2, at, "a union cast's operand is a box")
+      }
+      0
+    }
     RCast => {
       use(r.ctV, at)
+      // A trapping cast narrows a nullable reference to the reference it holds.
+      const on = repNodeAt(opRep(r.ctV))
+      if (
+        r.ctOnFail == "trap"
+        && !(on is RNullable && kidAt(opRep(r.ctV), 0) == r.ctTarget)
+      ) {
+        return fail(2, at, "a trapping cast's operand is its target's nullable")
+      }
       if dst < 0 { return 0 }
       const ok = if r.ctOnFail == "trap" { dst == r.ctTarget } else { repNodeAt(dst) is RNullable && kidAt(dst, 0) == r.ctTarget }
       if !ok { return fail(2, at, "a cast's result is not its target's rep") }
@@ -674,6 +695,24 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMemAccess => memAccessCheck(r, dst, at)
+    RMemOp => {
+      for o in r.moArgs { use(o, at) }
+      for o in r.moArgs {
+        if opRep(o) != vfI32 {
+          return fail(2, at, "a memory op's operands are i32s")
+        }
+      }
+      const c = nodeAt(r.moAt)
+      const v = c is Call && memOpIsVoid(memOpPlanOf(c).moArm)
+      if dst >= 0 && (v || dst != vfI32) {
+        return fail(
+          2,
+          at,
+          "a memory op leaves an i32, or nothing for the bulk pair",
+        )
+      }
+      0
+    }
     RListCopy => {
       for o in r.lcArgs { use(o, at) }
       if r.lcArgs.length != 5 {
@@ -707,9 +746,9 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A packed byte reads unsigned into an i32.
       const packed = repPrim(kidAt(l, 0)) == "u8" && dst == vfI32
-      // A nullable string element may read recovered at a string.
+      // A nullable element may read recovered at its inner rep.
       const en = repNodeAt(kidAt(l, 0))
-      const recovered = en is RNullable && en.rnInner == dst && dst == vfStr
+      const recovered = en is RNullable && en.rnInner == dst
       if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed && !recovered {
         return fail(2, at, "an element's rep is not its destination's")
       }
@@ -750,24 +789,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
-    ROmitNull => {
+    RFieldNull => {
       const d = repNodeAt(dst)
       if !(d is RNullable) && !(d is RBox) {
         return fail(
           2,
           at,
-          "an omitted field's null is not delivered into a nullable or a box",
-        )
-      }
-      0
-    }
-    RFieldNull => {
-      // A typed null is a nullable reference's.
-      if !(repNodeAt(dst) is RNullable) {
-        return fail(
-          2,
-          at,
-          "a field's typed null is not delivered into a nullable reference",
+          "a field's null is not delivered into a nullable or a box",
         )
       }
       0
@@ -988,8 +1016,10 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RLitArms => {
       use(r.liV, at)
       if dst != vfBool { return fail(2, at, "a literal arms test is a bool") }
-      // The member and box arms read their operand once per member, so it is a variable.
-      if r.liArm != "nicheRaw" && r.liArm != "atomNotNul" && !(r.liV is OVar) {
+      // An operand legacy reads more than once (`litArmsReadsOf`) is a variable.
+      const lt = nodeAt(r.liAt)
+      const reads = if lt is IsExpr { litArmsReadsOf(r.liAt, r.liArm, lt.isObj, vf.irAt) } else { 2 }
+      if reads > 1 && !(r.liV is OVar) {
         return fail(2, at, "a literal arms test re-reads a variable")
       }
       0
@@ -1094,6 +1124,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RMapIter => {
+      use(r.miV, at)
+      if !(repNodeAt(opRep(r.miV)) is RMap) {
+        return fail(2, at, "a map's keys or values are read off a map")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RList) {
+        return fail(2, at, "a map's keys or values are a list")
+      }
+      0
+    }
     RMapHas => {
       use(r.mhKey, at)
       if !mapRecvOk(r.mhSym, r.mhLoc, at) {
@@ -1175,7 +1215,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const g = irGlobalRepOf(vf, r.ggSym)
       if g < 0 { return fail(2, at, "reads a global with no recorded rep") }
       const gn = repNodeAt(g)
-      const narrowed = r.ggAt >= 0 && gn is RNullable && gn.rnInner == dst
+      const narrowed = r.ggNn >= 0 && gn is RNullable && gn.rnInner == dst
       if dst >= 0 && dst != g && !narrowed {
         return fail(2, at, "a global's rep is not its destination's")
       }
@@ -1382,6 +1422,21 @@ function coalNicheWhy(n: SCoalBox): string {
     return "a `boolean | null` `??` yields neither the niche nor a boolean"
   }
   return ""
+}
+
+// A record field's `??` re-reads its record, a variable, and yields the field's box or its scalar.
+function coalFieldWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) { return "a field `??` re-reads no variable" }
+  if !(repNodeAt(opRep(n.cbL)) is RRecord) {
+    return "a field `??` reads no record"
+  }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length { return "a field `??` writes no variable" }
+  const or = vf.irVars[o].vRep
+  if n.cbArm == "fieldBox" {
+    return if repNodeAt(or) is RBox { "" } else { "a field `??` keeps no box" }
+  }
+  return if repPrim(or) != null { "" } else { "a field `??` unboxes to no scalar" }
 }
 
 function coalNulRefWhy(n: SCoalBox): string {
@@ -1671,6 +1726,38 @@ function stmt(id: i32, prev: i32) {
       vfLabels.pop()
       vfLabelOut.pop()
     }
+    SRangeLoop => {
+      const v = n.rlVar
+      if (
+        v < 0
+        || v >= vf.irVars.length
+        || vf.irVars[v].vKind != "local"
+        || vf.irVars[v].vRep != vfI32
+      ) {
+        return fail(2, id, "a range loop's variable is not an i32 local")
+      }
+      // The lowering checks the copy count against legacy's plan; here each copy has its label.
+      if (
+        n.rlConts.length != n.rlCopies.length
+        || !n.rlPartial && n.rlCopies.length > 0
+      ) {
+        return fail(2, id, "a range loop's copies do not match its labels")
+      }
+      let k = 0
+      while k < n.rlCopies.length {
+        vfLabels.push(n.rlBrk)
+        vfLabelOut.push(-1)
+        labelled(n.rlConts[k], -1, n.rlCopies[k])
+        vfLabels.pop()
+        vfLabelOut.pop()
+        k = k + 1
+      }
+      vfLabels.push(n.rlTailBrk)
+      vfLabelOut.push(-1)
+      labelled(n.rlTailCont, -1, n.rlTail)
+      vfLabels.pop()
+      vfLabelOut.pop()
+    }
     SIf => ifSpine(id)
     SCoalBox => {
       // A fused map read's receiver is read by its probe, which may name a global instead.
@@ -1687,6 +1774,7 @@ function stmt(id: i32, prev: i32) {
         "mapIndexGetOr" => coalMapGetOrWhy(n, id)
         "nulRef" => coalNulRefWhy(n)
         "litUnion" | "nulBool" => coalNicheWhy(n)
+        "fieldBox" | "fieldVal" => coalFieldWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -1832,6 +1920,7 @@ function touchesList(n: IrNode): boolean {
       SGlobalSet |
       SIf |
       SLoop |
+      SRangeLoop |
       SRawOp |
       SReturn |
       SSetField |
@@ -1918,7 +2007,8 @@ function simdCheck(r: RSimd, dst: i32, at: i32) {
 function rhsReadsList(r: Rhs): boolean {
   return match r {
     RListGet => true
-    RAtomEq |
+    RAsUnion |
+      RAtomEq |
       RAtomStr |
       RBoxField |
       RBoxNarrow |
@@ -1959,16 +2049,17 @@ function rhsReadsList(r: Rhs): boolean {
       RMapGet |
       RMapGetOr |
       RMapHas |
+      RMapIter |
       RMapNew |
       RMapOp |
       RMapSet |
       RMemAccess |
+      RMemOp |
       RNulTest |
       RNullOf |
       RNumCast |
       RNumIntr |
       RNumWiden |
-      ROmitNull |
       RPrimOp |
       RPrint |
       RRawOp |
