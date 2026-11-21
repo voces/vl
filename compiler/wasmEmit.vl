@@ -409,6 +409,7 @@ import {
 } from "./emit_base"
 import {
   blockHasContinueFor,
+  coalLhsStashes,
   constFoldOfLet,
   exprIsIfStmt,
   globalCellIsImmutable,
@@ -2995,13 +2996,18 @@ function objLitHasFieldOutside(objIx: i32, start: i32, cnt: i32): boolean {
 // stores: a box-union field boxes the right-hand side, f64 / i64 / f32 fields re-encode it,
 // and any other field emits it plainly.
 function emitVariantFieldStoreVal(vi: i32, fi: i32, valIx: i32, fnIx: i32) {
-  // The bare value's one home, which the IR's field store reads too.
-  if fieldStoreVariantValuePlain(vi, fi, valIx, fnIx) {
-    return emitExpr(valIx, fnIx)
+  return match variantFieldStoreValueArmOf(vi, fi, valIx, fnIx) {
+    "plain" => emitExpr(valIx, fnIx)
+    "box" => emitVariantFieldBox(vi, fi, valIx, fnIx)
+    "f64" => emitWidened(valIx, 4, fnIx)
+    "i64" => emitWidened(valIx, 3, fnIx)
+    "f32" => emitWidened(valIx, 5, fnIx)
+    "strValue" => emitStrValue(valIx, fnIx)
+    "unencodable" => fieldStorePlainMissed()
+    "noKind" | "atomToStr" | "nulnone" | "armDelivery" => emitFail(
+      "emitProgram: internal: a variant field store took a struct field's value arm",
+    )
   }
-  const k = eqRowFieldKind(-1 - vi, fi)
-  if k == "union" { return emitVariantFieldBox(vi, fi, valIx, fnIx) }
-  return emitScalarFieldStoreVal(valIx, fnIx, k)
 }
 
 // Variant `vi`'s box-union field `fi` gets `valIx`, boxed at the checker's record where it owes a
@@ -16948,8 +16954,8 @@ function emitIndex(idxIx: i32, fnIx: i32) {
       "nulscalar" => emitIndexNulScalarList(nd, fnIx)
       "ref" => emitIndexRefList(nd, idxIx, fnIx)
       // A `(string | null)[]` element stays nullable unless the checker types it non-null.
-      "nulstr" => emitIndexStrList(nd, fnIx, nodeTyProvesNonNull(idxIx))
-      "str" => emitIndexStrList(nd, fnIx, true)
+      "nulstr" => emitIndexStrList(nd, fnIx, strListReadsNonNull(idxIx, true))
+      "str" => emitIndexStrList(nd, fnIx, strListReadsNonNull(idxIx, false))
       "scalar" => emitIndexScalarList(nd, fnIx)
       "string" => emitIndexRawString(nd, fnIx)
       "none" => emitFail("emitProgram: index receiver is not an array or string")
@@ -16966,6 +16972,12 @@ function emitIndexStrList(nd: Index, fnIx: i32, nonNull: boolean): i32 {
   }
   if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
   return strListGetTail(nd, slHz, nonNull)
+}
+
+// Whether string list read `idxIx` recovers its element non-null: always for a `string[]`, and for
+// a `(string | null)[]` (`nulstr`) only where the checker types the read non-null.
+export function strListReadsNonNull(idxIx: i32, nulstr: boolean): boolean {
+  return !nulstr || nodeTyProvesNonNull(idxIx)
 }
 
 // The string list read in two halves around its operands, as the scalar read's are: the live
@@ -22256,6 +22268,12 @@ function emitUnionArmToPair(
     return emitFail("emitProgram: if-expression arm is not a value")
   }
   if emitUnionBoxOwed(unionName, unionTy, valIx, fnIx) < 0 { return -1 }
+  return unionBoxToPairTail(idx)
+}
+
+// After a binding sink arm's box: the construction just written popped into the sink pair, else
+// the box parked in the binding's local `idx` and its tag and payload read into the pair.
+export function unionBoxToPairTail(idx: i32) {
   if uBoxNewIsLast() {
     uBoxSinkToPair()
     return 0
@@ -22272,7 +22290,7 @@ function emitUnionArmToPair(
 
 // The rep's NULL into the sink pair (the else-less false path): the null tag and the
 // unread payload slot, written directly rather than through a box the merge would discard.
-function emitUnionNullToPair() {
+export function emitUnionNullToPair() {
   fbI32Rel(RS_TAG, nullBoxTag())
   fbLocalSet(unionSinkBase)
   fbRefNullNone() // the payload slot is unread under the null tag
@@ -22300,6 +22318,14 @@ function emitUnionArmBlockToPair(
       fnIx,
     ),
   )
+}
+
+// After a binding sink's `if`: the binding's one box built from the sink pair into local `idx`.
+export function unionLetSinkClose(idx: i32) {
+  fbLocalGet(unionSinkBase)
+  fbLocalGet(unionSinkBase + 1)
+  fbStructNew(uBoxIdx) // the binding's ONE box
+  return fbLocalSet(idx)
 }
 
 // `emitNullableIfBinding`'s rep-0 shape with every arm writing the sink pair instead of
@@ -27898,25 +27924,28 @@ function emitAssignIndex(fnIx: i32, a: BinExpr, target: Index) {
   return 0
 }
 
-// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": an i32,
-// string, scalar-width, byte or plain reference list whose value builds as itself or widens, with
-// no arm unbox.
-export function idxStorePlainWhy(
-  st: IdxStore,
-  arrIx: i32,
-  rhs: i32,
-  fnIx: i32,
-): string {
-  if st.nestSlot >= 0 || st.unionNm != "" { return "store element" }
-  if arrElemLitUnionTy(arrIx, fnIx) >= 0 || nodeArrayElemIsNulLitUnion(arrIx) {
-    return "store element seed"
+// Why element store plan `st` (value `rhs`) is not the plain store the IR writes, or "": a scalar,
+// string, atom, niche or plain reference list's value built as itself or widened, a union list's
+// that the record boxes or is already a named union, or a nested list's that is no literal (an atom
+// into a string list decodes); with no arm unbox at a record row.
+export function idxStorePlainWhy(st: IdxStore, rhs: i32, fnIx: i32): string {
+  if (
+    st.unionNm != ""
+    && !boxOwedAt(rhs, fnIx)
+    && !(exprUnion(rhs, fnIx) && boxTyName(nodeTyAt(rhs, fnIx)) != "")
+  ) {
+    return "store element"
   }
-  if arrElemIsNulBoolAt(arrIx, fnIx) || arrElemIsNullUnitAt(arrIx, fnIx) {
-    return "store element seed"
+  if st.nestSlot >= 0 && nodeAt(unwrapParen(rhs)) is ArrayLit {
+    return "store element"
   }
-  if nodeArrayElemIsNulStr(arrIx) { return "store element seed" }
-  if exprIsLitAtom(rhs, fnIx) { return "store atom" }
-  if narrowedArmNeedsUnbox(rhs, fnIx) { return "store arm" }
+  // The arm unbox casts at the element's own row; a store with none writes no cast.
+  if (
+    narrowedArmNeedsUnbox(rhs, fnIx)
+    && (st.variantIdx >= 0 || st.structIdx >= 0)
+  ) {
+    return "store arm"
+  }
   return ""
 }
 
@@ -27949,75 +27978,108 @@ function emitVariantFieldWrite(vi: i32, fi: i32, rhs: i32, fnIx: i32): i32 {
   return fieldStoreVariantTail(vi, fi)
 }
 
-// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its
-// target context already applied: a box union coerces into the box, a literal-union atom widens
-// or lowers as its id, a scalar re-encodes, a niche seeds its null. Returns 0, or -1 failed.
+// `emitAssignMember`'s value for field `fieldIdx` of struct row `si`, its target context already
+// applied, through the arm `fieldStoreValueArmOf` names. Returns 0, or -1 failed.
 function emitStructFieldStoreValue(
   si: i32,
   fieldIdx: i32,
   rhs: i32,
   fnIx: i32,
 ): i32 {
-  const k = fieldRowKind(sFieldStart[si] + fieldIdx)
-  if k == null {
-    return emitFail("emitProgram: struct field has no storage kind")
-  }
-  // The bare value's one home, which the IR's field store reads too.
-  if fieldStoreValuePlain(si, fieldIdx, rhs, fnIx) {
-    return if emitExpr(rhs, fnIx) < 0 { -1 } else { 0 }
-  }
-  match k {
-    "union" => {
-      // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
-      if (emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx) < 0) {
-        return -1
-      }
-    }
-    "str" => {
-      // A literal-union atom assigned to a `string` field widens to its member string.
-      if emitAtomToStr(rhs, fnIx) < 0 { return -1 }
-    }
-    "nulstr" => {
-      // A `string | null` slot takes the same widen; a widened member string is non-null.
-      if emitStrValue(rhs, fnIx) < 0 { return -1 }
-    }
-    "f64" | "i64" | "f32" => {
-      // A wide scalar field widens its RHS at the store boundary, as the construct does.
-      if emitScalarFieldStoreVal(rhs, fnIx, k) < 0 { return -1 }
-    }
+  const rc = match fieldStoreValueArmOf(si, fieldIdx, rhs, fnIx) {
+    "noKind" => emitFail("emitProgram: struct field has no storage kind")
+    "plain" => emitExpr(rhs, fnIx)
+    // A box-union field cell is `(ref $uBox)`, so the RHS goes through `emitUnionBoxOwed`.
+    "box" => emitUnionBoxOwed("", structFieldBoxTy(si, fieldIdx), rhs, fnIx)
+    // A literal-union atom assigned to a `string` field widens to its member string.
+    "atomToStr" => emitAtomToStr(rhs, fnIx)
+    // A `string | null` slot takes the same widen; a widened member string is non-null.
+    "strValue" => emitStrValue(rhs, fnIx)
+    // A wide scalar field widens its RHS at the store boundary, as the construct does.
+    "f64" => emitWidened(rhs, 4, fnIx)
+    "i64" => emitWidened(rhs, 3, fnIx)
+    "f32" => emitWidened(rhs, 5, fnIx)
+    // The `null` unit type's slot, the construct arm's twin (D4671).
     "nulnone" => {
-      // The `null` unit type's slot, the construct arm's twin (D4671).
       if emitNulNoneForEffect(rhs, fnIx) < 0 { return -1 }
       fbRefNullNone()
     }
-    "nulstruct" | "nulvariant" => {
-      // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
-      // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
-      if emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx)) < 0 {
-        return -1
-      }
-    }
-    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" => {
-      return fieldStorePlainMissed()
-    }
-    "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" => {
-      return fieldStorePlainMissed()
-    }
-    "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" => {
-      return fieldStorePlainMissed()
-    }
-    "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
-      return fieldStorePlainMissed()
-    }
+    // The assign half of the construct's narrowed-arm delivery (`p.g = s` after
+    // `if s is Circle`); `emitObj` and `emitAssign` must agree on every field.
+    "armDelivery" => emitArmDelivery(rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx))
+    "unencodable" => fieldStorePlainMissed()
   }
-  return 0
+  return if rc < 0 { -1 } else { 0 }
 }
 
-// A field kind `fieldStoreValuePlain` always answers plain, reaching the non-plain ladder.
+// A kind `fieldStoreValuePlain` always answers plain, reaching the non-plain arms.
 function fieldStorePlainMissed() {
   return emitFail(
     "emitProgram: a plain field value reached the field store's re-encode ladder",
   )
+}
+
+// How a field store writes its value, decided once for legacy and the IR: the bare value, a box,
+// an atom widened to its string, a scalar widened to the field's width, the `null` unit's seed, or
+// a narrowed record arm's delivery; `unencodable` is a kind the plain check always answers plain,
+// reached only if the two disagree, and refused.
+export type FieldStoreValArm = "noKind"
+  | "plain"
+  | "box"
+  | "atomToStr"
+  | "strValue"
+  | "f64"
+  | "i64"
+  | "f32"
+  | "nulnone"
+  | "armDelivery"
+  | "unencodable"
+
+// The arm `emitStructFieldStoreValue` writes `rhs` into field `fi` of struct row `si` at.
+export function fieldStoreValueArmOf(
+  si: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): FieldStoreValArm {
+  if si < 0 || si >= sFieldStart.length { return "noKind" }
+  const k = fieldRowKind(sFieldStart[si] + fi)
+  if k == null { return "noKind" }
+  if fieldStoreValuePlain(si, fi, rhs, fnIx) { return "plain" }
+  return match k {
+    "union" => "box"
+    "str" => "atomToStr"
+    "nulstr" => "strValue"
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "nulnone" => "nulnone"
+    "nulstruct" | "nulvariant" => "armDelivery"
+    // `fieldStoreValuePlain` answers plain for every other kind.
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "unencodable"
+  }
+}
+
+// The arm `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` at: the bare
+// value, a box, a scalar widened to the field's width, or a literal-union atom as its string.
+export function variantFieldStoreValueArmOf(
+  vi: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): FieldStoreValArm {
+  if fieldStoreVariantValuePlain(vi, fi, rhs, fnIx) { return "plain" }
+  const k = eqRowFieldKind(-1 - vi, fi)
+  if k == null { return "unencodable" }
+  return match k {
+    "union" => "box"
+    "f64" => "f64"
+    "i64" => "i64"
+    "f32" => "f32"
+    "str" | "nulstr" => "strValue"
+    // `fieldStoreVariantValuePlain` answers plain for every other kind.
+    "i32" | "v128" | "struct" | "list" | "reflist" | "map" | "variant" | "nulvariant" | "nulstruct" | "closure" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | "u8list" | "i64list" | "f32list" | "v128list" | "f64list" | "strlist" | "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulv128list" | "nulf64list" | "nulstrlist" | "nulreflist" => "unencodable"
+  }
 }
 
 // `emitAssignUnder`'s arm over a field target `o.f = v`: through a narrowed union box, into
@@ -28159,7 +28221,7 @@ export function fieldStoreStructAt(lhsIx: i32, fnIx: i32): i32[] {
 
 // Whether `emitStructFieldStoreValue` writes `rhs` into field `fieldIdx` of row `si` as the bare
 // value (`emitExpr`), with no box, atom widen, scalar re-encode or niche seed around it.
-export function fieldStoreValuePlain(
+function fieldStoreValuePlain(
   si: i32,
   fieldIdx: i32,
   rhs: i32,
@@ -28205,7 +28267,7 @@ export function fieldStoreVariantAt(lhsIx: i32, fnIx: i32): i32[] {
 
 // Whether `emitVariantFieldStoreVal` writes `rhs` into variant `vi`'s field `fi` as the bare value
 // (`emitExpr`), with no box, scalar re-encode or atom widen around it.
-export function fieldStoreVariantValuePlain(
+function fieldStoreVariantValuePlain(
   vi: i32,
   fi: i32,
   rhs: i32,
@@ -32783,10 +32845,7 @@ function emitLetIfInit(s: LetDecl, slot: i32, idx: i32, fnIx: i32) {
         if (emitUnionIfBindingSink(s.letInit, idx, nulNm, nulTy, fnIx) < 0) {
           return -1
         }
-        fbLocalGet(unionSinkBase)
-        fbLocalGet(unionSinkBase + 1)
-        fbStructNew(uBoxIdx) // the binding's ONE box
-        fbLocalSet(idx)
+        unionLetSinkClose(idx)
         scopeBind(s.letName, slot)
         return 0
       }
@@ -41380,19 +41439,11 @@ function emitCoalesceCallArm(
 // nullable `string`; `lhs` is `P.nodes[lhsIx]`, the unwrapped operand. Returns what
 // `emitCoalesceGo` returns: 0 lowered, -1 failed.
 function emitCoalesceNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
-  const lhs = nodeAt(lhsIx)
   const arm = coalNicheArmOf(e, lhsIx, exprIx, fnIx)
-  // These generic niche `??` paths RE-EVALUATE `e.binLeft` (twice for the bool select,
-  // and in the else arm for the string), so they apply only to an effect-free place —
-  // an ident binding or a struct FIELD. A CALL lhs (`f() ?? d`) cannot be re-evaluated
-  // and is handled by the stash-based call path in the `lhs is Call` block below.
-  let lhsReEval = true
-  if lhs is Call { lhsReEval = false }
-  // D1250 — AN IF-expression operand IS NOT RE-READABLE. Its condition can have effects, and
-  // re-reading it re-runs them: `(if bump() { true }) ?? false` bumped TWICE. The arms below
-  // that already carry a stash leg read this flag, so they switch over; the `boolean | null`
-  // arm gained one for the same reason. `coalChainHasCallLhs` reserves the slots.
-  if lhs is IfStmt { lhsReEval = false }
+  // The `boolean | null` and `K | null` arms re-read an effect-free operand in the present arm;
+  // one that is not (`coalLhsStashes`: a call, an `if`, a field of a call) is written once into
+  // the stash slot `coalChainHasCallLhs` reserved (D1250, D17036).
+  const lhsReEval = !coalLhsStashes(lhsIx)
   // `<e> ?? d` over a `boolean | null` niche (an ident binding, a `boolean | null` struct field,
   // or a `(boolean | null)[]` element read) — the i32 cell holds 0/1 or the sentinel 2
   // (`null`); take the default on 2. Generic in `e.binLeft`, so one arm covers every
