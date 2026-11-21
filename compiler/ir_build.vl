@@ -294,6 +294,7 @@ import {
   isRecvStageRep,
   isVariantTagPlain,
   litIsArmOf,
+  litIsMemberTexts,
   memberBoxReadAt,
   monoStaticIsResult,
   narrowedBoxVariantPlain,
@@ -354,6 +355,7 @@ import {
   ifJoinAdaptsScalar,
   isArmRank,
   letIfInitSinks,
+  litMemberEqArmOf,
   retRefusedWhy,
   spreadRunLit,
 } from "./wasmEmit"
@@ -496,6 +498,7 @@ import {
   listIsTestedIdent,
   objFieldSrcOrder,
   objFieldVal,
+  quoteLex,
   unionEqOperandOk,
   unwrapParen,
 } from "./emit_base"
@@ -838,11 +841,31 @@ function isLitArms(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
       const o: Opnd = { oiRep: rep, oiBits: bits }
       o
     }
-    "nicheRaw" | "atomNotNul" | "atomEq" => isLitArmsTest(b, n, ix, rep, la)
-    "boxLits" | "numBox" | "memberNoRecv" | "memberEq" | "none" => {
+    "nicheRaw" | "atomNotNul" | "atomEq" | "memberEq" => isLitArmsTest(b, n, ix, rep, la)
+    "boxLits" | "numBox" | "memberNoRecv" | "none" => {
       irBMiss("is rung litArms " + la)
     }
   }
+}
+
+// Why a member of `is` test `ix`'s `memberEq` arm does not compare as a string over receiver
+// `recvIx` at rep `r` (a string's plain compare, or a `string | null`'s guarded one), else "".
+function memberEqMissOf(recvIx: i32, ix: i32, r: i32): string {
+  const texts = litIsMemberTexts(ix)
+  if texts.length == 0 { return "is literal member none" }
+  const rn = repNodeAt(r)
+  let i = 0
+  while i < texts.length {
+    const a = litMemberEqArmOf(recvIx, quoteLex(texts[i]), ibFnIx)
+    const ok = match a {
+      "str" => repPrim(r) == "str"
+      "nulStr" => rn is RNullable && repPrim(rn.rnInner) == "str"
+      "union" | "num" => false
+    }
+    if !ok { return "is literal member " + a + " at " + repWhat(r) }
+    i = i + 1
+  }
+  return ""
 }
 
 // A literal arm that reads its operand and writes its own test (`RLitArms`): a ref niche's null
@@ -862,11 +885,14 @@ function isLitArmsTest(
     "nicheRaw" => vn is RNullable && vn.rnDisc != 3 && vn.rnDisc != 2
     "atomNotNul" => atomNullable(irBOpRep(v))
     "atomEq" => vn is RAtom || atomNullable(irBOpRep(v))
-    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "memberEq" | "none" => false
+    "memberEq" => true
+    "mapNull" | "mapHas" | "nicheNever" | "nicheTest" | "atomTrue" | "boxLits" | "numBox" | "memberNoRecv" | "memberTrue" | "none" => false
   }
   if !ok { return irBMiss("is literal arms operand rep") }
+  const why = if la == "memberEq" { memberEqMissOf(n.isObj, ix, irBOpRep(v)) } else { "" }
+  if why != "" { return irBMiss(why) }
   if (
-    la == "atomEq"
+    (la == "atomEq" || la == "memberEq")
     && (!(v is OVar) || v.ov < 0 || ib.irVars[v.ov].vKind == "temp")
   ) {
     return irBMiss("is literal arms receiver")
@@ -4596,7 +4622,6 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   if !(f is Ident) { return missRhs("memory access callee") }
   const p = memAccessPlanOf(f.identName)
   if p.mxOp < 0 || p.mxAlign < 0 { return missRhs("memory access width") }
-  if !p.mxI32 || p.mxWiden >= 0 { return missRhs("memory access wide value") }
   const ap = memAddrPlanOf(c, p.mxBase, ibFnIx)
   const at = b.length
   const args: Opnd[] = []
@@ -4615,10 +4640,13 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   if ifBelowLead(b, at, "memory access short-circuit operand") {
     return missRhs("memory access short-circuit operand")
   }
-  for o in args {
-    if repPrim(irBOpRep(o)) != "i32" {
-      return missRhs("memory access operand coercion")
-    }
+  // The address is an i32; a store's value is already at its width's prim, which legacy's
+  // widening then leaves as it stands.
+  if (
+    repPrim(irBOpRep(args[0])) != "i32"
+    || p.mxBase == 2 && repPrim(irBOpRep(args[1])) != p.mxPrim
+  ) {
+    return missRhs("memory access operand coercion")
   }
   const r: Rhs = { mmArgs: args, mmAt: ix }
   return r
