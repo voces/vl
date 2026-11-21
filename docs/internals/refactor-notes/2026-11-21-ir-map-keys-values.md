@@ -25,6 +25,7 @@ fresh list of the key or value rep. A Set's `.values()` is its keys.
 
 A tagged call's receiver builds as a tag stash statement and then the call, so `g(x)[0]` banked its
 element-read row after the stash, where legacy's row starts before it. `idxRowOpenNote` now takes
-an `SEffect` of `RTagStash` as the row's opening statement, beside `SCoalBox` and a valued `SIf`.
+an `SEffect` of `RTagStash` as the row's opening statement, beside `SCoalBox` and a valued `SIf`. A
+callee held in a global is read before its stash, so that read opens the row (`tagStashLeads`).
 The `index of a tagged call` named miss is gone. `tests/ir-shadow-rows/tag-dispatch-ref-result.vl`
-now expects its three functions matched.
+now expects its functions matched and no mismatch, a global callee's start function included.
