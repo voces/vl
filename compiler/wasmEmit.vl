@@ -10464,7 +10464,7 @@ function emitUnionConcreteVariantEq(
 ) {
   const vi = eqConcreteVariantRow(otherIx, fnIx)
   if vi < 0 { return -1 }
-  // The same four parallel-table bounds `emitStructUnionEq` takes before it writes a byte,
+  // The same four parallel-table bounds the struct union compare takes before it writes a byte,
   // for the same reason: a variant row the emitter's tables do not cover must DECLINE, never
   // read out of bounds (`emitFail does not halt`).
   if vi >= uVarRow.length { return -1 }
@@ -10515,34 +10515,6 @@ function emitUnionConcreteVariantEq(
   if otherNul { fbEnd() }
   if isNe { fbI32Eqz() }
   return 0
-}
-
-// D973 — `==` over a struct union (`A | B` of declared shapes), both operands the same set.
-// Tags unequal means different arms and therefore unequal; tags equal selects one arm, and that
-// arm's fields are compared through the variant table. -1 declines.
-
-// Not `emitStructEqRec`, which is keyed on a struct-table row: that table is empty when a union
-// is declared, the union path owning the struct types instead, so the arms' fields live in
-// `armFieldNames` and `armFieldStoreTy` and the compare reads them there. A scalar arm beside the
-// struct ones is served too; its tag is `scalarTagOfKind`, which no variant tag can collide with.
-function emitStructUnionEq(
-  lIx: i32,
-  rIx: i32,
-  isNe: boolean,
-  uty: i32,
-  fnIx: i32,
-) {
-  const arms: i32[] = []
-  const vis: i32[] = []
-  const aks: i32[] = []
-  if !unionBoxEqColumns(uty, arms, vis, aks) { return -1 }
-  // Both operands ride the wasm stack until both are computed, and only then are they parked.
-  // These slots are shared per function, so a left operand parked before the right one is
-  // evaluated is a value the right one's code can overwrite — a nested union `==` re-enters this
-  // function and re-uses the two slots. The evaluation order is unchanged: left, then right.
-  if emitExpr(lIx, fnIx) < 0 { return -1 }
-  if emitExpr(rIx, fnIx) < 0 { return -1 }
-  return emitUnionBoxEqStaged(arms, vis, aks, isNe, fnIx)
 }
 
 // The tag-then-arm compare over two boxes already on the stack (left below right), leaving the
@@ -11005,17 +10977,50 @@ const UNION_EQ_NAMELESS_MSG = "emitProgram: union `==`: an operand's type names 
 function emitUnionUnionEq(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
   if unionEqNameless(lIx, fnIx) { emitFail(UNION_EQ_NAMELESS_MSG) }
   if unionEqNameless(rIx, fnIx) { emitFail(UNION_EQ_NAMELESS_MSG) }
-  const nm = unionEqNamesOf(lIx, rIx, fnIx)
-  if unionEqStructFirst(nm) {
-    if emitStructUnionEq(lIx, rIx, isNe, nm.uenTy, fnIx) == 0 { return 0 }
-  }
+  // Both operands ride the wasm stack until both are computed: a nested union `==` re-enters the
+  // compare and re-uses its slots, so a left operand parked first could be overwritten.
   if emitExpr(lIx, fnIx) < 0 { return -1 }
   if emitExpr(rIx, fnIx) < 0 { return -1 }
-  return unionUnionEqTail(lIx, rIx, isNe, fnIx)
+  return unionUnionBoxesTail(lIx, rIx, isNe, fnIx)
+}
+
+export type UnionUnionEqArm = "struct" | "staged"
+
+// Which compare a union `==` over `lIx`/`rIx` takes after its two boxes: `struct` when both are one
+// union of declared shapes whose arms the box compare serves (D973), its columns into
+// `arms`/`vis`/`aks`; else `staged`.
+export function unionUnionEqArmOf(
+  lIx: i32,
+  rIx: i32,
+  fnIx: i32,
+  arms: i32[],
+  vis: i32[],
+  aks: i32[],
+): UnionUnionEqArm {
+  const nm = unionEqNamesOf(lIx, rIx, fnIx)
+  if !unionEqStructFirst(nm) { return "staged" }
+  return if unionBoxEqColumns(nm.uenTy, arms, vis, aks) { "struct" } else { "staged" }
+}
+
+// After a union `==`'s two boxes, left below right: the arm `unionUnionEqArmOf` picks. A struct
+// union's arms are compared through the variant table, not `emitStructEqRec`'s struct rows.
+export function unionUnionBoxesTail(
+  lIx: i32,
+  rIx: i32,
+  isNe: boolean,
+  fnIx: i32,
+): i32 {
+  const arms: i32[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  return match unionUnionEqArmOf(lIx, rIx, fnIx, arms, vis, aks) {
+    "struct" => emitUnionBoxEqStaged(arms, vis, aks, isNe, fnIx)
+    "staged" => unionUnionEqTail(lIx, rIx, isNe, fnIx)
+  }
 }
 
 // After a union `==`'s two boxes, left below right: the staged compare (`emitUnionUnionEq`).
-export function unionUnionEqTail(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
+function unionUnionEqTail(lIx: i32, rIx: i32, isNe: boolean, fnIx: i32) {
   const arms: i32[] = []
   const vis: i32[] = []
   const aks: i32[] = []
