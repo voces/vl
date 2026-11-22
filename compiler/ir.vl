@@ -397,6 +397,18 @@ export type RStructEq = {
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
+// The interned id of the one member of a literal place at node `asAt`, written for it by legacy's
+// atom hook (`strToAtomArmOf`'s `sole`); the place is not read.
+export type RAtomSole = { asAt: i32 }
+// Legacy's atom tower over a literal place at node `saAt` (`strToAtomArmOf`'s `chain`): each
+// member's id, then the place's string read `saReads[i]` tested against member `i`, last first.
+export type RStrToAtom = { saReads: Opnd[], saAt: i32 }
+// Legacy's staged atom narrowing of value `zsV`, the raw string of node `zsAt`
+// (`strToAtomArmOf`'s `staged`): parked once, then the tower over the parked string.
+export type RStrToAtomStaged = { zsV: Opnd, zsAt: i32 }
+// The hook's `wideLit` arm at node `awAt`, a read of a `const` bound to a literal: the raw
+// value `awV` dropped, then the literal's id.
+export type RAtomWide = { awV: Opnd, awAt: i32 }
 export type RCellNew = { cnInit: Opnd }
 export type RCellGet = { cgCell: Opnd }
 // `ggNonNull`: the read is followed by `ref.as_non_null` (`globalReadRecovers`). `ggNn`: for a read
@@ -430,7 +442,9 @@ export type RStage = { sgV: Opnd }
 export type Rhs = RArmUnbox
   | RAsUnion
   | RAtomEq
+  | RAtomSole
   | RAtomStr
+  | RAtomWide
   | RAtomic
   | RBoxField
   | RBoxNarrow
@@ -506,6 +520,8 @@ export type Rhs = RArmUnbox
   | RStage
   | RStashSet
   | RStrOp
+  | RStrToAtom
+  | RStrToAtomStaged
   | RStructEq
   | RTagIs
   | RTagOf
@@ -715,6 +731,10 @@ export type IrFn = {
   irGlobalSym: i32[],
   irGlobalRep: i32[],
   irGlobalAt: {[i32]: i32},
+  // The heap the builder noted for each record rep a hole retag compares (`irRecHeapNote`).
+  irRecHeap: {[i32]: i32},
+  // The storage-row type (`letBindTy`) of each global the builder reads or stores at that row.
+  irGlobalStoreTy: {[i32]: i32},
   // The globals whose cell holds the record a holding binding holds whole, noted at that record's
   // rep: a read of one at that rep is at its storage.
   irGlobalHeld: {[i32]: boolean},
@@ -802,6 +822,8 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalSym: [],
     irGlobalRep: [],
     irGlobalAt: Map(),
+    irRecHeap: Map(),
+    irGlobalStoreTy: Map(),
     irGlobalHeld: Map(),
     irSpanAst: [],
     irSpanFirst: [],
@@ -899,10 +921,32 @@ export function irSpanNoteKind(
   return 0
 }
 
+// The heap `f` noted for record rep `r`, or -1 for none.
+export function irRecHeapOf(f: IrFn, r: i32): i32 {
+  return f.irRecHeap[r] ?? -1
+}
+
+// Notes record rep `r` stored at heap `h`, once.
+export function irRecHeapNote(f: IrFn, r: i32, h: i32) {
+  if (f.irRecHeap[r] ?? -1) < 0 { f.irRecHeap[r] = h }
+  return 0
+}
+
 // The rep `f` records for global `sym`, or -1 for none.
 export function irGlobalRepOf(f: IrFn, sym: i32): i32 {
   const i = f.irGlobalAt[sym] ?? -1
   return if i >= 0 && i < f.irGlobalRep.length { f.irGlobalRep[i] } else { -1 }
+}
+
+// The storage-row type the builder took global `sym` at, or -1 where it took none.
+export function irGlobalStoreTyOf(f: IrFn, sym: i32): i32 {
+  return f.irGlobalStoreTy[sym] ?? -1
+}
+
+// Records that the builder took global `sym` at its storage row, of type `ty`.
+export function irGlobalStoreNote(f: IrFn, sym: i32, ty: i32) {
+  f.irGlobalStoreTy[sym] = ty
+  return 0
 }
 
 // Records global `sym`'s rep once.
@@ -1255,6 +1299,10 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RCoerce => [r.cvV]
     RMakeClo => r.mcEnv
     RFnId => []
+    RAtomSole => []
+    RAtomWide => [r.awV]
+    RStrToAtom => r.saReads
+    RStrToAtomStaged => [r.zsV]
     RCellNew => [r.cnInit]
     RCellGet => [r.cgCell]
     RGlobalGet => []
@@ -1376,6 +1424,10 @@ function rhsText(r: Rhs): string {
       + ")"
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
+    RAtomSole => "atom_sole @" + i32ToStr(r.asAt)
+    RAtomWide => "atom_wide(" + opndText(r.awV) + ")"
+    RStrToAtom => "str_to_atom(" + opndsText(r.saReads) + ")"
+    RStrToAtomStaged => "str_to_atom_staged(" + opndText(r.zsV) + ")"
     RCellNew => "cell " + opndText(r.cnInit)
     RCellGet => "cell_get " + opndText(r.cgCell)
     RStage => "stage " + opndText(r.sgV)
@@ -1695,10 +1747,14 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REnvGet |
       RMakeClo |
       RResultPick => "closure"
-    RCellGet |
+    RAtomSole |
+      RAtomWide |
+      RCellGet |
       RCellNew |
       RFnId |
       RNumUnionConvert |
+      RStrToAtom |
+      RStrToAtomStaged |
       RTagOf => "other"
     RAtomic |
       RMemAccess |
@@ -1878,32 +1934,49 @@ export function listRetag(src: i32, dst: i32): boolean {
 
 // Whether a list at rep `src` is the list at rep `dst` as it stands, `dst` leaving a closure's
 // parameter or result unknown: a result whose type still holds a hole the value fills.
-export function listRetagHole(src: i32, dst: i32): boolean {
+export function listRetagHole(f: IrFn, src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if !(a is RList) || !(d is RList) { return false }
-  return repFillsHole(a.rlsElem, d.rlsElem, false)
+  return repFillsHole(f, a.rlsElem, d.rlsElem, false)
+}
+
+// Whether a closure at rep `src`, or a list, map or record holding one, is the value at `dst` as it
+// stands: the two differ only where one side leaves a closure's parameter or result unknown, and
+// every closure lowers to the one closure struct.
+export function cloHoleRetag(f: IrFn, src: i32, dst: i32): boolean {
+  if src == dst { return false }
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  // A map's values, at the top only: `repFillsHole` itself, behind `listRetagHole`, admits none.
+  if a is RMap && d is RMap {
+    return a.rmVal != d.rmVal && cloHoleRetag(f, a.rmVal, d.rmVal)
+  }
+  return repFillsHole(f, src, dst, false) || repFillsHole(f, dst, src, false)
 }
 
 // Whether rep `src` is `dst`, or `dst` with parts of a closure (`inClo`) left unknown.
-function repFillsHole(src: i32, dst: i32, inClo: boolean): boolean {
+function repFillsHole(f: IrFn, src: i32, dst: i32, inClo: boolean): boolean {
   if src == dst { return true }
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if a == null || d == null { return false }
   return match d {
     RUnsup => inClo
-    RList => a is RList && repFillsHole(a.rlsElem, d.rlsElem, inClo)
+    RList => a is RList && repFillsHole(f, a.rlsElem, d.rlsElem, inClo)
     RNullable => a is RNullable
       && a.rnDisc == d.rnDisc
-      && repFillsHole(a.rnInner, d.rnInner, inClo)
+      && repFillsHole(f, a.rnInner, d.rnInner, inClo)
+    // A record is the value at its heap whatever its fields' reps, and a recursive record's fields
+    // lead back to it, so two records are one value exactly where one noted heap stores both.
     RRecord => a is RRecord
       && a.rrVariant == d.rrVariant
-      && repsFillHoles(a.rrFields, d.rrFields, inClo)
+      && irRecHeapOf(f, src) >= 0
+      && irRecHeapOf(f, src) == irRecHeapOf(f, dst)
     RClosure => a is RClosure
       && a.rcVoid == d.rcVoid
-      && repsFillHoles(a.rcParams, d.rcParams, true)
-      && repFillsHole(a.rcRet, d.rcRet, true)
+      && repsFillHoles(f, a.rcParams, d.rcParams, true)
+      && repFillsHole(f, a.rcRet, d.rcRet, true)
     RAtom |
       RBox |
       RMap |
@@ -1914,11 +1987,16 @@ function repFillsHole(src: i32, dst: i32, inClo: boolean): boolean {
 }
 
 // Whether each of reps `src` fills the hole of the same-placed rep of `dst`.
-function repsFillHoles(src: i32[], dst: i32[], inClo: boolean): boolean {
+function repsFillHoles(
+  f: IrFn,
+  src: i32[],
+  dst: i32[],
+  inClo: boolean,
+): boolean {
   if src.length != dst.length { return false }
   let i = 0
   while i < src.length {
-    if !repFillsHole(src[i], dst[i], inClo) { return false }
+    if !repFillsHole(f, src[i], dst[i], inClo) { return false }
     i = i + 1
   }
   return true
