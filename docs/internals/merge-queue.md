@@ -172,8 +172,8 @@ For the queue:
   verifier proves both on the merged tree, and the queue keeps the full gate. A second verifier
   (IR-V2) takes alternate trains (coordinator ruling, 2026-11-22).
 - **Q19.** Verifier self-test cases are keyed by string id, not by position: positional `want`
-  numbers collided across five lanes in one afternoon (coordinator ruling, 2026-11-22). The change
-  is approved and in flight as #9597, owner IR-D1.
+  numbers collided across five lanes in one afternoon (coordinator ruling, 2026-11-22). It landed
+  as #9597, owner IR-D1; Q29 handles the list ends where keyed ids still meet.
 - **Q20.** A byte-free RRetag between records requires struct identity. Wasm struct types are
   nominal here, so that means the same heap, or for width the declared sub chain. The verifier
   reads it from an IR-side note (`IrFn.irRecHeap`), never from an emit query (coordinator ruling,
@@ -186,13 +186,34 @@ For the queue:
   on the row. D17052's row (#9595) carried a `// PRINTS` repro comment that the grader parsed
   verbatim, and master's filed-witness step was red until #9616 (queue practice).
 - **Q22.** A train carries a docs-only overlay of master's `docs/internals/inventory`, so the
-  gate's inventory-refs row reads rows filed after the train's base (queue practice).
+  gate's inventory-refs row reads rows filed after the train's base (queue practice; narrowed by
+  Q28).
 - **Q23.** Never start a train's gate while an earlier run of that train still holds the same
   worktree, and never run a heavy check beside a gate. Each cost a re-gate on 2026-11-22, the
   second through an OOM kill (queue practice).
 - **Q24.** Stack-margin attribution (Q9), reported by the verifier: #9414 (IR-N7) accounted for
   +35 KB of the deep-nesting edge (890 → 925 KB). Its fix, moving the RTagStash arm out of
-  `node()`'s frame (#9600), recovers the edge to 896 KB and is in flight.
+  `node()`'s frame (#9600), recovers the edge to 896 KB and has landed.
+- **Q25.** While trains are in flight, a lane merges the newest announced
+  `origin/vl-queue/<train>` tip, not `origin/master`. Master lags the trains, so merging it gave
+  cross-lineage conflicts that refused four PRs on 2026-11-22 (#9609, #9605, #9627, #9628) (queue
+  practice).
+- **Q26.** A Q15/Q17 moved-programs list covers `scripts/capability-probes` as well as tests/cases
+  and the distilled corpus. On 2026-11-22 #9599's list missed
+  `scripts/capability-probes/numeric-as-exact-trio.vl` and #9596's missed 33 tests/cases programs;
+  the verifier's union grading caught both before merge (queue practice).
+- **Q27.** A lane's READY quotes the "fail under both" counts of `ir-identity.sh --cases` (68) and
+  `--names` (3267) against master's. A rise means legacy itself broke, as IR-N9's
+  `directArgSeedsOf` split did (68 → 71) before its lane caught it (queue practice).
+- **Q28.** A train's docs overlay of master's `docs/internals/inventory` (Q22) adds only the rows
+  the train lacks. A full checkout of master's inventory reverted a member PR's own row closure
+  (D17053 in BW1) (queue practice).
+- **Q29.** Keyed self-test ids (Q19) still meet at list ends when several PRs add cases. The queue
+  resolves such hunks, those with an empty diff3 base in `compiler/ir_selftest.vl` and
+  `tests/vl_ir_shadow_test.ts`, as ours-then-theirs. A refused hunk with a non-empty base goes
+  back to the lane (queue practice).
+- **Q30.** The subset guard treats `scripts/vl-host/` as code, not docs, because #9615 changed
+  `scripts/vl-host/src/main.rs` (queue practice).
 
 ### Squash artifacts and Q3 members
 
