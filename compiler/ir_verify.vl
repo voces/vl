@@ -156,7 +156,6 @@ import {
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
-  repOfTy,
   repTyOf,
 } from "./emit_rep"
 import {
@@ -174,12 +173,6 @@ import {
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
 import { AsExpr, Call, i32ToStr, nodeAt } from "./ast"
-import { closureHeld, tyOpenHeldAsIds } from "./emit_classify"
-import { fbValtype, wTarget } from "./emit_bytes"
-import { rlWrapIdx } from "./emit_state"
-import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
-import { tyRefArrElemOf } from "./emit_map_value_slots"
-import { structFieldBoxTy, variantFieldBoxTy } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -667,7 +660,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       while i < ks.length {
         if (
           opRep(r.mrFields[i]) != ks[i]
-          && !openRepTakes(recKidSiteTy(r, i), ks[i], opRep(r.mrFields[i]))
+          && !vfOpenTakes(recKidSiteTy(r, i, at), ks[i], opRep(r.mrFields[i]))
         ) {
           return fail(2, at, "field " + i32ToStr(i) + "'s rep differs")
         }
@@ -2197,7 +2190,7 @@ function stmt(id: i32, prev: i32) {
         use(n.rtV, id)
         if (
           opRep(n.rtV) != vf.irRetRep
-          && !openRepTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
+          && !vfOpenTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
         ) {
           return fail(2, id, "a return's rep is not the result's")
         }
@@ -2634,11 +2627,11 @@ export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
 // parameter. The builder asks it first, so such a function is uncovered rather than refused.
 export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 
-// Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
-// a function held at a rep no instance changes is not (`tyOpenHeldAsIds`).
-export function irTyHeldOpen(ty: i32, rep: i32): boolean {
+// Whether variable `i` of `vf` is open (rule 1): of an open type whose open parts the builder did
+// not find held at a rep no instance changes (`irVarHeldIds`), and no untyped closure.
+function vfHeldOpen(i: i32, ty: i32, rep: i32): boolean {
   if irUntypedClosure(ty, rep) { return false }
-  return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
+  return irTyOpen(ty) && !(vf.irVarHeldIds[i] ?? false)
 }
 
 // Whether a variable is a closure no arena type spells (a generic's instance, built by
@@ -2648,55 +2641,25 @@ export function irUntypedClosure(ty: i32, rep: i32): boolean {
   return ty < 0 && repNodeAt(rep) is RClosure && repTyOf(rep) < 0
 }
 
-// The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
-// ref-element list's at its wrapper; none for any other rep. Writes nothing to the live writer.
-export function refRepValtype(r: i32): u8[] {
-  const out: u8[] = []
-  const d = repOfTy(repTyOf(r))
-  const k = d.rdKind
-  if k == null || d.rdNul != 0 { return out }
-  // A list's type keys its wrapper by its element (`rlSlotOfTyOrTwin`), as legacy's reads do.
-  const slot = if k == "reflist" && d.rdSlot < 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(repTyOf(r))) } else { d.rdSlot }
-  const clo = k == "closure" && closureHeld(r)
-  const list = k == "reflist" && slot >= 0 && slot < rlWrapIdx.length
-  if !clo && !list { return out }
-  const prev = wTarget(out)
-  fbValtype(k, slot)
-  wTarget(prev)
-  return out
-}
-
-// Whether a value of rep `src` stands where rep `dst` is asked: both write the same valtype
-// (`refRepValtype`).
-export function repStoresAs(dst: i32, src: i32): boolean {
-  const a = refRepValtype(dst)
-  return a.length > 0 && u8sSame(a, refRepValtype(src))
-}
-
-// Whether a destination of open type `ty` at rep `rep` takes a value of rep `v` as it stands,
-// stored alike (`repStoresAs`).
-export function openRepTakes(ty: i32, rep: i32, v: i32): boolean {
-  return irTyOpen(ty) && repStoresAs(rep, v)
-}
-
-// Whether open type `ty`'s rep `rep` has no valtype legacy writes (`refRepValtype`) and `v` has
-// one. Permissive alone: a caller ties `v` to a legacy declaration of the storage it reads.
-export function undeclaredRepTakes(ty: i32, rep: i32, v: i32): boolean {
-  return irTyOpen(ty)
-    && refRepValtype(rep).length == 0
-    && refRepValtype(v).length > 0
+// Whether a destination of open type `ty` at rep `rep` takes a value of rep `v` as it stands: both
+// are stored at the same valtype, as the builder noted them (`irRepValtype`).
+function vfOpenTakes(ty: i32, rep: i32, v: i32): boolean {
+  if !irTyOpen(ty) { return false }
+  const a = vf.irRepValtype[rep] ?? []
+  return a.length > 0 && u8sSame(a, vf.irRepValtype[v] ?? [])
 }
 
 // Whether record `r` is built at a variant's row, as `makeRec` lowers it.
 export function recIsVariant(r: RMakeRec): boolean { return r.mrVariant }
 
-// The site type kid `k` of record `r` is delivered at (the builder's `fieldSiteTy`), or -1.
-function recKidSiteTy(r: RMakeRec, k: i32): i32 {
+// The site type kid `k` of record `r` at node `at` is delivered at, as the builder noted it per
+// layout position (`irFactKidTy`), or -1.
+function recKidSiteTy(r: RMakeRec, k: i32, at: i32): i32 {
   if r.mrBuiltRow < 0 { return -1 }
   let fi = 0
   while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
-  if fi >= r.mrLayout.length { return -1 }
-  return if recIsVariant(r) { variantFieldBoxTy(r.mrBuiltRow, fi) } else { structFieldBoxTy(r.mrBuiltRow, fi) }
+  const tys = vf.irFactKidTy[at] ?? []
+  return if fi < tys.length { tys[fi] } else { -1 }
 }
 
 // Whether byte lists `a` and `b` are equal.
@@ -2756,7 +2719,7 @@ export function irVerify(f: IrFn): IrVerdict {
         -1,
         "v" + i32ToStr(i) + "'s rep is " + repWhat(v.vRep) + ", not a closed rep",
       )
-    } else if irTyHeldOpen(v.vTy, v.vRep) {
+    } else if vfHeldOpen(i, v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
     } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")

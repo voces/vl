@@ -2,17 +2,30 @@
 // the function by node before it is verified, so `ir_verify.vl` asks legacy nothing (D17049).
 import {
   IrFn,
+  OImm,
+  OStr,
+  OVar,
+  Opnd,
   RGetField,
   RGlobalGet,
   RLitArms,
+  RMakeRec,
   RMapGet,
   RMemOp,
   RNullOf,
   Rhs,
   SEffect,
   SLet,
+  SReturn,
 } from "./ir"
 import { Call, IsExpr, nodeAt } from "./ast"
+import { irTyOpen, irUntypedClosure, u8sSame } from "./ir_verify"
+import { repNodeKids, repOfTy, repTyOf } from "./emit_rep"
+import { closureHeld, tyOpenHeldAsIds } from "./emit_classify"
+import { fbValtype, wTarget } from "./emit_bytes"
+import { rlWrapIdx } from "./emit_state"
+import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
 import { nodeTyAt } from "./emit_capture_frames"
 import { NULL_OWN_BOX, NULL_OWN_NONE } from "./emit_plan_null"
 import {
@@ -20,18 +33,51 @@ import {
   memOpIsVoid,
   memOpPlanOf,
   narrowedMapReadOf,
+  structFieldBoxTy,
+  variantFieldBoxTy,
 } from "./wasmEmit"
 
-// Notes, for every node of `f` whose check reads one, the fact legacy's planner gives it.
+// Notes, for every node of `f` whose check reads one, the fact legacy's planner gives it; the
+// valtype of each rep the verifier compares stored alike (each variable's rep and its kids, the
+// result's, each record field's and returned operand's); and, for each open-typed variable,
+// whether its open parts are functions held at a fixed rep (`tyOpenHeldAsIds`).
 export function irNoteVerifyFacts(f: IrFn) {
+  noteValtype(f, f.irRetRep)
+  let v = 0
+  while v < f.irVars.length {
+    const x = f.irVars[v]
+    noteValtype(f, x.vRep)
+    for k in repNodeKids(x.vRep) { noteValtype(f, k) }
+    if irTyOpen(x.vTy) {
+      f.irVarHeldIds[v] = tyOpenHeldAsIds(x.vTy, x.vRep, [])
+    }
+    v = v + 1
+  }
   let i = 0
   while i < f.irNodes.length {
     const n = f.irNodes[i]
     if n is SLet { noteFact(f, n.lRhs, i) }
     if n is SEffect { noteFact(f, n.efRhs, i) }
+    if n is SReturn && n.rtHas { noteValtype(f, opndRep(f, n.rtV)) }
     i = i + 1
   }
   return 0
+}
+
+// Notes rep `r`'s valtype (`refRepValtype`) once, where it has one.
+function noteValtype(f: IrFn, r: i32) {
+  if r < 0 || f.irRepValtype.has(r) { return 0 }
+  f.irRepValtype[r] = refRepValtype(r)
+  return 0
+}
+
+// Operand `o`'s rep in `f`.
+function opndRep(f: IrFn, o: Opnd): i32 {
+  return match o {
+    OVar => if o.ov >= 0 && o.ov < f.irVars.length { f.irVars[o.ov].vRep } else { -1 }
+    OImm => o.oiRep
+    OStr => o.osRep
+  }
 }
 
 function noteFact(f: IrFn, r: Rhs, i: i32) {
@@ -48,8 +94,65 @@ function noteFact(f: IrFn, r: Rhs, i: i32) {
     f.irFactInt[i] = if lt is IsExpr { litArmsReadsOf(r.liAt, r.liArm, lt.isObj, f.irAt) } else { 2 }
   } else if r is RMapGet {
     f.irFactInt[i] = if narrowedMapReadOf(r.mtAt, f.irAt).nmArm == "unbox" { 1 } else { 0 }
+  } else if r is RMakeRec {
+    const tys: i32[] = []
+    let fi = 0
+    while r.mrBuiltRow >= 0 && fi < r.mrLayout.length {
+      tys.push(
+        if r.mrVariant { variantFieldBoxTy(r.mrBuiltRow, fi) } else { structFieldBoxTy(r.mrBuiltRow, fi) },
+      )
+      fi = fi + 1
+    }
+    f.irFactKidTy[i] = tys
+    for o in r.mrFields { noteValtype(f, opndRep(f, o)) }
   } else if r is RNullOf {
     f.irFactInt[i] = if r.nuOwn == NULL_OWN_BOX { 1 } else if r.nuOwn == NULL_OWN_NONE { 0 } else { 2 }
   }
   return 0
+}
+
+// Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
+// a function held at a rep no instance changes is not (`tyOpenHeldAsIds`).
+export function irTyHeldOpen(ty: i32, rep: i32): boolean {
+  if irUntypedClosure(ty, rep) { return false }
+  return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
+}
+
+// The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
+// ref-element list's at its wrapper; none for any other rep. Writes nothing to the live writer.
+export function refRepValtype(r: i32): u8[] {
+  const out: u8[] = []
+  const d = repOfTy(repTyOf(r))
+  const k = d.rdKind
+  if k == null || d.rdNul != 0 { return out }
+  // A list's type keys its wrapper by its element (`rlSlotOfTyOrTwin`), as legacy's reads do.
+  const slot = if k == "reflist" && d.rdSlot < 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(repTyOf(r))) } else { d.rdSlot }
+  const clo = k == "closure" && closureHeld(r)
+  const list = k == "reflist" && slot >= 0 && slot < rlWrapIdx.length
+  if !clo && !list { return out }
+  const prev = wTarget(out)
+  fbValtype(k, slot)
+  wTarget(prev)
+  return out
+}
+
+// Whether a value of rep `src` stands where rep `dst` is asked: both write the same valtype
+// (`refRepValtype`).
+export function repStoresAs(dst: i32, src: i32): boolean {
+  const a = refRepValtype(dst)
+  return a.length > 0 && u8sSame(a, refRepValtype(src))
+}
+
+// Whether a destination of open type `ty` at rep `rep` takes a value of rep `v` as it stands,
+// stored alike (`repStoresAs`).
+export function openRepTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty) && repStoresAs(rep, v)
+}
+
+// Whether open type `ty`'s rep `rep` has no valtype legacy writes (`refRepValtype`) and `v` has
+// one. Permissive alone: a caller ties `v` to a legacy declaration of the storage it reads.
+export function undeclaredRepTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty)
+    && refRepValtype(rep).length == 0
+    && refRepValtype(v).length > 0
 }
