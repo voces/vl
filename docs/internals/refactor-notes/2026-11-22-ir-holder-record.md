@@ -10,7 +10,9 @@ D15144 holder), or a copy of one.
   type mono minted for the holder's signatures. Legacy's `letCellKindGo` makes such a binding
   `struct` at that row.
   - The IR's `irBDeclVar` takes it as the variable's type.
-  - `exprTyOf` takes it for a read of the binding (`emitHolderRead`).
+  - `exprTyOf` takes it for a read of the binding (`emitHolderRead`) where this frame's
+    variable holds the record. A module-level or captured holder's read keeps its open type,
+    since the IR holds those at it (the next slice, `global read coercion`).
 - A direct call whose checked type is open takes its callee's result type (`resultTy`).
 - `fnRetHeldAsBundle(fe, r)` (emit_classify.vl) is split out of `fn_ret_shadow`'s and
   `cloRetKeySuffix`'s closure-kind test. `resultTy` asks it for the recorded or checked result in
