@@ -32,7 +32,7 @@ the caller's binding, the last first (`emitDirectCallTail`). The IR missed both 
 
 ## Readings
 
-On the 16 programs of the classes, shadow mode, master 4cb73575 seed against the head:
+On the 16 programs of the classes, shadow mode, the master 43cc7022 fixpoint seed against the head:
 
 | reading | master | head |
 |---|---:|---:|
