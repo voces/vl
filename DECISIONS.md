@@ -12981,3 +12981,16 @@ edges (30 imports, D17049) are debt to retire before I8, owner IR-D1.
 A sound one needs both reps' kids checked against the row's field valtypes by name, and reps carry
 no field names (D622's spelling-versus-layout order). A rep that differs from its row's storage is
 filed or fixed upstream, never retagged.
+
+## When the IR cannot reproduce a legacy accident, legacy changes, not the IR (2026-11-22, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-22**, on IR-N2's print-slot question. Legacy's union print and
+`??` box-field rung take `sharedFieldRecvSlot` before lowering their operand. The IR lowers an in-place
+operand first, so its locals are declared in another order. Legacy is changed, in its own
+behaviour-preserving PR, to take the slot after the operand. No IR node exists only to mimic legacy's
+order, and a case refused "until I8" is not an answer, because I8 needs every function claimed.
+
+**Why.** An IR node that only reproduces a legacy accident is deleted with legacy at I8, and so is
+dual-path cost with no lasting value. A lookahead in the lowering would be coupling the verifier
+cannot see. Changing legacy's local-declaration order moves only local indices, which the queue
+grades by run outputs plus an exact list of moved programs (merge-queue.md Q15).

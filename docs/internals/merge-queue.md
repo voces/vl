@@ -148,6 +148,12 @@ For the queue:
   proof, not a byte argument, on any admission that reads a value at another rep without a
   conversion (queue practice; the coordinator ordered a one-off claimed-vs-claimless discovery
   sweep after the fix).
+- **Q15.** A coordinator-ruled, behaviour-preserving legacy byte change (here: legacy takes
+  `sharedFieldRecvSlot` after lowering its operand, so the IR's natural order matches) is graded
+  differently from an IR PR. Run outputs are unchanged across tests/cases and the corpus, and the PR
+  lists every program whose bytes moved. Its `--names`, `--cases` and `--claimless` differ set must
+  equal that list exactly, each a local-index-only change shown with `wasm-dis`. A differ outside
+  the list is a veto (coordinator ruling, 2026-11-22).
 
 ### Squash artifacts and Q3 members
 
