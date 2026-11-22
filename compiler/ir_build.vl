@@ -2929,12 +2929,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     const cellRep = globalRep(g, d)
-    if (
-      cellRep != rep
-      && boxNarrowArmOf(ix, cellRep, rep, identReadArmOf(n, ix, ibFnIx, false))
-        == "atom"
-    ) {
-      return globalUnboxRead(b, g, d, ix, cellRep, rep)
+    // A union cell narrowed to an atom or a record arm unboxes its box, as a local's does.
+    const ba: BoxNarrowArm = if cellRep != rep { boxNarrowArmOf(ix, cellRep, rep, identReadArmOf(n, ix, ibFnIx, false)) } else { "none" }
+    if ba == "atom" || ba == "variant" {
+      return globalUnboxRead(b, g, d, ix, cellRep, rep, ba, -1)
+    }
+    // A union cell narrowed to a ref-element list or a map arm reads unboxed to it.
+    const con = if cellRep != rep { boxContainerReadOf(n, ix, cellRep, rep) } else { -1 }
+    if con >= 0 {
+      return globalUnboxRead(b, g, d, ix, cellRep, rep, "container", con)
     }
     // A union cell (`globalCellKind`) stores the box, which a narrowed read unboxes.
     const narrowed = cellRep != rep
@@ -3250,8 +3253,8 @@ function paramVarAt(w: i32): i32 {
   return -1
 }
 
-// Global `g` (declared at `d`) read at `ix` as the one atom the checker narrowed its union box
-// to, as legacy's `unbox` arm writes it: `emitUnionBoxPush`'s box read, then the atom's unbox.
+// Global `g` (declared at `d`) read at `ix` as the atom, record or container arm (`ba`, `con`) the
+// checker narrowed its union box to: `emitUnionBoxPush`'s box read, then legacy's unbox to it.
 function globalUnboxRead(
   b: i32[],
   g: i32,
@@ -3259,14 +3262,18 @@ function globalUnboxRead(
   ix: i32,
   cellRep: i32,
   rep: i32,
+  ba: BoxNarrowArm,
+  con: i32,
 ): Opnd {
-  const ak = identUnboxAtomOf(ix, ibFnIx)
-  if ak < 0 { return irBMiss("narrowed read dead") }
+  // A record arm's payload is the box cast to the arm (`bnAtom` -1), a container arm's the box
+  // unboxed to it (`bnCon`), as a local's read writes them.
+  const ak = if ba == "atom" { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
+  if ba == "atom" && ak < 0 { return irBMiss("narrowed read dead") }
   const box = globalBoxAt(b, g, d, ix, cellRep)
   if ibMiss != "" { return box }
   return irBLetTemp(
     b,
-    { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
+    { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: con },
     ix,
     rep,
   )
