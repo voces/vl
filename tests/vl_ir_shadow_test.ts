@@ -1516,6 +1516,8 @@ Deno.test({
       "num-union-conversion-of-non-box": 2,
       "num-union-conversion-off-result-kind": 2,
       "held-global-read-off-noted-rep": 2,
+      "null-into-nullable-record-global": 0,
+      "null-into-bool-niche-global": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
       "retag-field-alike-records-two-heaps": 2,
