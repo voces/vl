@@ -9,6 +9,7 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
+import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
@@ -102,9 +103,12 @@ import {
   OStr,
   OVar,
   Opnd,
+  RArmUnbox,
   RAsUnion,
   RAtomEq,
+  RAtomSole,
   RAtomStr,
+  RAtomWide,
   RAtomic,
   RBoxField,
   RBoxNarrow,
@@ -133,6 +137,7 @@ import {
   RListEmptyArms,
   RListEq,
   RListGet,
+  RListIsAcross,
   RListLen,
   RListNew,
   RListNewDefault,
@@ -162,6 +167,7 @@ import {
   RNumIntr,
   RNumIs,
   RNumUnionBin,
+  RNumUnionConvert,
   RNumWiden,
   RPrimOp,
   RPrint,
@@ -169,6 +175,7 @@ import {
   RRecCopyPure,
   RRecover,
   RRel,
+  RResultPick,
   RRetNull,
   RRetag,
   RSharedRead,
@@ -177,6 +184,8 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
   RStructEq,
   RTagIs,
   RTagOf,
@@ -284,6 +293,7 @@ import {
   EqRootPlace,
   EqRootPlan,
   GlobalCtx,
+  MapGetOrArm,
   MapUnionPlan,
   SHARED_NULL_NONE,
   arrCopyBacking,
@@ -310,6 +320,7 @@ import {
   atomicTail,
   boxTagIsTail,
   bundlePickOf,
+  bundleResultPickOf,
   callRefCallTail,
   callRefEnvOpen,
   callRefStash,
@@ -319,6 +330,8 @@ import {
   coalAtomStrReserve,
   coalBoxElse,
   coalBoxEnd,
+  coalBoxFieldScalarOpen,
+  coalBoxFieldScalarPlanOf,
   coalBoxOpen,
   coalBoxSlot,
   coalNicheElse,
@@ -328,6 +341,7 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
   emitClosureIds,
@@ -359,7 +373,6 @@ import {
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
-  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -407,6 +420,9 @@ import {
   mapGetOrNicheHead,
   mapGetOrNicheStash,
   mapGetOrNicheTail,
+  mapGetOrSentinel,
+  mapGetOrSentinelHead,
+  mapGetOrSentinelTail,
   mapGetOrUnionBoxOf,
   mapGetOrUnionBoxOpen,
   mapGetOrUnionBoxTail,
@@ -449,6 +465,7 @@ import {
   numCastTail,
   numIntrTail,
   numUnionBinTail,
+  numUnionConvertTail,
   numUnionIsUnionSide,
   numUnionSideKindOf,
   numUnionSideLit,
@@ -509,6 +526,12 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  strToAtomIdTail,
+  strToAtomSoleTail,
+  strToAtomStagedTail,
+  strToAtomTestTail,
+  strToAtomTexts,
+  strToAtomWideTail,
   structEqEnter,
   structEqRoots,
   structEqStagesLeft,
@@ -519,7 +542,6 @@ import {
   tagDispatchIfOf,
   tagIsTail,
   tagStashTail,
-  truncSatPlanOf,
   truncSatTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
@@ -590,6 +612,8 @@ import {
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
   fbRefIfOpenType,
+  listIsAcrossPlanOf,
+  listIsAcrossTail,
   litIsBoxLexes,
   litMemberEqArmOf,
   mapGetUnionBoxTail,
@@ -971,6 +995,14 @@ function rhs(r: Rhs, tail: boolean) {
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
     RNumUnionBin => numUnionBin(r)
+    RNumUnionConvert => {
+      // Legacy stashes the box one dispatch level deeper, then converts at its member.
+      const key = numUnionStashEnter()
+      irLOpnd(r.nuV)
+      const bs = numUnionStashTail(true, -1, key)
+      numUnionStashLeave()
+      numUnionConvertTail(r.nuAt, r.nuTo, lw.irAt, bs)
+    }
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
@@ -980,6 +1012,7 @@ function rhs(r: Rhs, tail: boolean) {
     RStashSet => irLMiss("stash set as a value")
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
+    RListIsAcross => listIsAcross(r)
     RLitArms => litArms(r)
     RNumIs => numIs(r)
     RTagIs => {
@@ -1073,6 +1106,7 @@ function rhs(r: Rhs, tail: boolean) {
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
+    RArmUnbox => armUnbox(r)
     RRecCopyPure => {
       leaf()
       recCopyPureEmit(r.rpAt, lw.irAt)
@@ -1101,10 +1135,21 @@ function rhs(r: Rhs, tail: boolean) {
       RFnId |
       RMapSet |
       RTagOf => irLMiss("rhs outside I1")
+    RAtomSole => strToAtomSoleTail(r.asAt)
+    RAtomWide => {
+      irLOpnd(r.awV)
+      strToAtomWideTail(r.awAt)
+    }
+    RStrToAtom => strToAtomTower(r)
+    RStrToAtomStaged => {
+      irLOpnd(r.zsV)
+      strToAtomStagedTail(r.zsAt, lw.irAt)
+    }
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
     RBundlePick => bundlePick(r)
+    RResultPick => resultPick(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1276,7 +1321,7 @@ function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
 // the order stash, each field in source order into its scratch slot first, read back in layout;
 // for `mrSet` its `RStashSet`s set the slots, and it only reads them back.
 function makeRec(r: RMakeRec) {
-  const variant = recIsVariant(r, lw.irAt)
+  const variant = recIsVariant(r)
   const stash = r.mrSrc.length > 0
   // The row the builder built the fields by: the plain or stash layout, or a row omitting fields.
   const row = if r.mrBuiltRow >= 0 { r.mrBuiltRow } else { recRowOf(r.mrAt, r.mrRow, variant, stash) }
@@ -1475,6 +1520,15 @@ function bundlePick(r: RBundlePick) {
   const pk = bundlePickOf(r.bpAt, lw.irAt)
   if pk.bpField < 0 { return irLMiss("bundle pick") }
   irLOpnd(r.bpV)
+  fbStructGet(pk.bpHeap, pk.bpField)
+  return 0
+}
+
+// `RResultPick`: the returned record, then the member legacy's `emitBundleResultPick` picks.
+function resultPick(r: RResultPick) {
+  const pk = bundleResultPickOf(r.rkAt, r.rkFe, lw.irAt)
+  if pk.bpField < 0 { return irLMiss("result pick") }
+  irLOpnd(r.rkV)
   fbStructGet(pk.bpHeap, pk.bpField)
   return 0
 }
@@ -1711,6 +1765,18 @@ function litRecv(r: RLitArms): i32 {
   return opndAgain(r.liV, n.isObj)
 }
 
+// `RListIsAcross` as `emitListIsAcrossReps` writes it: the plan, the shared slot, the receiver,
+// then legacy's tail over the slot.
+function listIsAcross(r: RListIsAcross): i32 {
+  const n = nodeAt(r.laAt)
+  if !(n is IsExpr) { return irLMiss("list is across node") }
+  const p = listIsAcrossPlanOf(r.laAt, n, lw.irAt)
+  if !p.lpOk { return irLMiss("list is across plan") }
+  const slot = sharedFieldRecvSlot()
+  irLOpnd(r.laV)
+  return listIsAcrossTail(n, slot, p, lw.irAt)
+}
+
 // `RListEmptyArms`: per list arm of its plan, the box variable, the arm's tag test, the box
 // again, and the arm's emptiness walk, as `emitListEmptyFitArms` writes them.
 function listEmptyArms(r: RListEmptyArms) {
@@ -1762,14 +1828,12 @@ function sharedRead(r: RSharedRead) {
   if sharedReadStashes(r.srAt) != r.srStash {
     return irLMiss("shared read stash")
   }
-  // The stash is asked for where legacy asks, before the receiver; between its set and the last
+  // The stash is asked for where legacy asks, after the receiver; between its set and the last
   // get, the plain arms and tail evaluate nothing that could stash again.
+  if r.srStash { irLOpnd(r.srV) }
   const slot = if r.srStash { sharedFieldRecvSlot() } else { -1 }
   if r.srStash && slot < 0 { return irLMiss("shared read stash slot") }
-  if r.srStash {
-    irLOpnd(r.srV)
-    fbLocalSet(slot)
-  }
+  if r.srStash { fbLocalSet(slot) }
   const last = vis.length - 1
   let i = 0
   while i < last {
@@ -1907,6 +1971,13 @@ function boxNarrow(r: RBoxNarrow) {
 function nicheRead(r: RNicheRead) {
   irLOpnd(r.nrV)
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+}
+
+// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAt`).
+function armUnbox(r: RArmUnbox) {
+  irLOpnd(r.uaV)
+  if emitArmUnboxAt(r.uaAt, lw.irAt) < 0 { return irLMiss("arm unbox heap") }
+  return 0
 }
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
@@ -2056,14 +2127,11 @@ function atomicEffect(r: RAtomic, pending: i32[]): i32 {
   return 0
 }
 
-// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail`.
+// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail(tsOp)`.
 function truncSat(r: RTruncSat) {
-  const c = nodeAt(r.tsAt)
-  if !(c is Call) { return irLMiss("trunc_sat node") }
-  const pl = truncSatPlanOf(c)
-  if pl.tpOp < 0 { return irLMiss("trunc_sat plan") }
+  if r.tsOp < 0 { return irLMiss("trunc_sat plan") }
   irLOpnd(r.tsV)
-  return truncSatTail(pl.tpOp)
+  return truncSatTail(r.tsOp)
 }
 
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
@@ -2382,12 +2450,11 @@ function printOp(r: RPrint) {
     return printNulStrTail()
   }
   if arm == "union" {
-    // Legacy reads the plan and takes the stash slot before it writes the box.
+    // Legacy reads the plan, writes the box, then takes the stash slot.
     const kinds: i32[] = []
     printUnionPlan(c.callArgs[0], lw.irAt, kinds)
-    const slot = sharedFieldRecvSlot()
     irLOpnd(r.pnV)
-    return printUnionTail(slot, kinds)
+    return printUnionTail(sharedFieldRecvSlot(), kinds)
   }
   irLOpnd(r.pnV)
   if arm == "str" { return printStrTail() }
@@ -2412,7 +2479,7 @@ function mapGetOr(r: RMapGetOr) {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if r.mgForm == 1 { "i32" } else if r.mgForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(r.mgForm, arm)
   if (
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
@@ -2525,7 +2592,9 @@ function mapGetOrInlineHead(
   qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 5 {
+  if form == 6 {
+    mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, lw.irAt)))
+  } else if form == 5 {
     mapGetOrUnionHead(sh)
     mapGetOrUnionBoxOpen(sh)
   } else if form == 4 {
@@ -2541,8 +2610,17 @@ function mapGetOrInlineHead(
   return sh
 }
 
+// The legacy arm (`mapGetOrArmOf`) inline form `form` writes: the plain `i32` read (1), an
+// atom-valued map's being that read; an mv slot's (2-5); the sentinel's (6); else the helper.
+function mapGetOrFormArm(form: i32, arm: MapGetOrArm): MapGetOrArm {
+  if form == 1 { return if arm == "atom" { "atom" } else { "i32" } }
+  if form == 6 { return "sentinel" }
+  return if form >= 2 { "mv" } else { "helper" }
+}
+
 // An inline map read's tail after its default, by `form`.
 function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 6 { return mapGetOrSentinelTail() }
   if form == 5 { return mapGetOrUnionBoxTail(sh) }
   if form == 4 { return mapGetOrNicheTail(sh) }
   if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
@@ -2565,7 +2643,7 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if mp.prForm == 1 { "i32" } else if mp.prForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(mp.prForm, arm)
   if (
     arm != want
     || want == "helper"
@@ -2793,6 +2871,29 @@ function numUnionBin(r: RNumUnionBin) {
   numUnionStashLeave()
   if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
     return irLMiss("numeric union dispatch")
+  }
+  return 0
+}
+
+// `RStrToAtom`: legacy's atom tower (`emitStrToAtomChain`): every member's id, then from the
+// last tested member to the first its string read and the test that selects it.
+function strToAtomTower(r: RStrToAtom) {
+  const texts = strToAtomTexts(r.saAt)
+  if texts.length != r.saReads.length + 1 {
+    return irLMiss("atom tower members")
+  }
+  let m = 0
+  while m < texts.length {
+    strToAtomIdTail(texts, m)
+    m = m + 1
+  }
+  let i = texts.length - 2
+  while i >= 0 {
+    irLOpnd(r.saReads[i])
+    if strToAtomTestTail(texts, i, lw.irAt) < 0 {
+      return irLMiss("atom tower test")
+    }
+    i = i - 1
   }
   return 0
 }
@@ -3200,6 +3301,23 @@ function callReturns(b: i32[], i: i32): boolean {
   return r is RCall && !r.caNever && voidTailCallee(r.caCallee)
 }
 
+// A tag dispatch's callee id stash. An operand the dispatch follows reaches the stack first, as
+// legacy writes it before the stash; its roots wait below the dispatch's `if`s for their reader.
+// Its own frame, so `node`'s recursive frame does not carry its locals.
+function tagStashEffect(r: RTagStash, pending: i32[]) {
+  const roots = stageLead(r.tgsV, pending)
+  if lwMiss != "" { return 0 }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
+  irLOpnd(r.tgsV)
+  tagStashTail()
+  liveNeutral()
+  irLSettle(pending)
+  lwFloor = lwFloors.pop() ?? 0
+  for v in roots { pending.push(v) }
+  return 0
+}
+
 function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
   if id < 0 || id >= lw.irNodes.length { return irLMiss("no node") }
   const n = lw.irNodes[id]
@@ -3327,21 +3445,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         irLSettle(pending)
         return 0
       }
-      // An operand a tag dispatch follows reaches the stack first, as legacy writes it before the
-      // callee's id stash; its roots wait below the dispatch's `if`s for their reader.
-      if r is RTagStash {
-        const roots = stageLead(r.tgsV, pending)
-        if lwMiss != "" { return 0 }
-        lwFloors.push(lwFloor)
-        lwFloor = lwLive.length - liveCountIn(pending)
-        irLOpnd(r.tgsV)
-        tagStashTail()
-        liveNeutral()
-        irLSettle(pending)
-        lwFloor = lwFloors.pop() ?? 0
-        for v in roots { pending.push(v) }
-        return 0
-      }
+      if r is RTagStash { return tagStashEffect(r, pending) }
       if r is RStashSet {
         stashSet(r)
         irLSettle(pending)
@@ -3768,6 +3872,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
     "optLeaf" => coalOptLeaf(n, e, pending)
+    "boxFieldScalar" => coalBoxFieldScalar(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -3826,6 +3931,20 @@ function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   irLOpnd(n.cbL)
   lwFrames.pop()
   return coalOptLeafRead(lp)
+}
+
+// A shared `scalar | null` field's `??` along its plan: the box, the stash and tag test whose
+// present arm unboxes, the default writing the slotless out in the `else`, and the end.
+function coalBoxFieldScalar(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const p = coalBoxFieldScalarPlanOf(e, n.cbAt, lw.irAt)
+  if p.bfKind < 0 { return irLMiss("coalesce box field plan") }
+  cond(n.cbL, pending)
+  if coalBoxFieldScalarOpen(p) < 0 { return -1 }
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  lwFrames.pop()
+  fbEnd()
+  return 0
 }
 
 // A boxed operand's arm: the stash slot taken before the box, the box, the open, the default
@@ -4281,7 +4400,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
   body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
-  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
+  const pad = if valued { f.irEndPad } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
