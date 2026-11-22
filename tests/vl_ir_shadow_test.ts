@@ -1488,15 +1488,22 @@ Deno.test({
       }
     }
     // Cases 103 to 106 are a record retag of an i32, into an i32, into a record whose field lowers
-    // to another valtype, and into one whose fields lower alike but on no shared struct heap.
+    // to another valtype, and into one whose fields lower alike on another noted struct heap; 109,
+    // the same on one noted heap, holds.
     for (const k of [103, 104, 105, 106]) {
       if (exp.irVerifySelfTest(k) !== 2) {
         throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
       }
     }
-    // Cases 107 and 108 are a width retag to a record with no supertype heap declared, and to one
-    // whose field does not lead the record's.
-    for (const k of [107, 108]) {
+    if (exp.irVerifySelfTest(109) !== 0) {
+      throw new Error(`case 109: want rule 0, got rule ${exp.irVerifySelfTest(109)}`);
+    }
+    // Case 107 is a width retag to a noted supertype whose field leads the record's; 108's field does
+    // not lead, and 110 has no noted supertype pair.
+    if (exp.irVerifySelfTest(107) !== 0) {
+      throw new Error(`case 107: want rule 0, got rule ${exp.irVerifySelfTest(107)}`);
+    }
+    for (const k of [108, 110]) {
       if (exp.irVerifySelfTest(k) !== 2) {
         throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
       }
