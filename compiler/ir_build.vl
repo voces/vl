@@ -2746,7 +2746,13 @@ function refIfArm(
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
   // as its cell holds it.
   const built = exprAt(body, tv, arm == "atomStr")
-  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && refIfArmNiches(built, tv, rep) { repTemp(body, { rgV: built }, tv, rep) } else { built }
+  // An arm built at a closure rep the join's leaves open, or fills, is the same closure retagged.
+  const holed = arm == "plain"
+    && ibMiss == ""
+    && irBOpRep(built) != rep
+    && holeRetagNoted(irBOpRep(built), rep, true)
+    && exprPrePathWhy(tv, ibFnIx) == ""
+  const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && (holed || refIfArmNiches(built, tv, rep)) { repTemp(body, { rgV: built }, tv, rep) } else { built }
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
     irBNode(body, { asDst: t, asSrc: v }, -1, ibNoValue, blockIx)
@@ -3150,7 +3156,14 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       && !narrowed
       && rep == globalTyRep(scopeTyAt(d, -1))
       && cellRep == globalTyRep(letBindTy(d, -1))
-    if cellRep != rep && !narrowed && !stored {
+    // A closure cell read where its type leaves a closure part open or fills one is the same
+    // closure struct, retagged.
+    const holed = cellRep != rep
+      && !narrowed
+      && !stored
+      && holeRetagNoted(cellRep, rep, true)
+      && exprPrePathWhy(ix, ibFnIx) == ""
+    if cellRep != rep && !narrowed && !stored && !holed {
       return irBMiss("global read coercion")
     }
     if stored { return globalStoredRead(b, g, d, ix, cellRep) }
@@ -3163,6 +3176,13 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
       ggNn: if narrowed { if readOwesNonNullRecover(ix, ibFnIx) { 1 } else { 0 } } else { -1 },
     }
     ib.irReadAgain[ix] = gr
+    if holed {
+      // The cell is read at its storage row, the binding's type.
+      const lt = heldTy(letBindTy(d, -1))
+      if repNodeOfTy(lt) != cellRep { return irBMiss("global read coercion") }
+      const held = irBLetTempTy(b, gr, ix, cellRep, lt)
+      return repTemp(b, { rgV: held }, ix, rep)
+    }
     return irBLetTemp(b, gr, ix, rep)
   }
   if dn is FuncDecl && repNodeAt(rep) is RClosure {
@@ -3210,12 +3230,19 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const ak = if unbox && heldAsBox(cr) { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
   if unbox && ak < 0 { return irBMiss("capture unbox") }
   const narrowed = unbox || na == "plain" || na == "held"
-  if cr != rep && !narrowed && !capCellListSame(fe, name, cr, rep) {
+  // A closure capture read where its type leaves a closure part open, or fills one, is the same
+  // closure struct, retagged.
+  const holed = cr != rep
+    && !narrowed
+    && holeRetagNoted(cr, rep, true)
+    && exprPrePathWhy(ix, ibFnIx) == ""
+  if cr != rep && !narrowed && !holed && !capCellListSame(fe, name, cr, rep) {
     return irBMiss("capture binding")
   }
   // The capture is held at its binding's type, whose rep must be the one it is read at first.
-  const cty = if narrowed { capTyOf(fe, name) } else { -1 }
-  if narrowed && (cty < 0 || repNodeOfTy(cty) != cr) {
+  const atOwn = narrowed || holed
+  const cty = if atOwn { capTyOf(fe, name) } else { -1 }
+  if atOwn && (cty < 0 || repNodeOfTy(cty) != cr) {
     return irBMiss("capture binding")
   }
   if !cloLifted(fe) {
@@ -3224,17 +3251,19 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
       return irBMiss("capture list test")
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
-    if !narrowed { return irBLetTemp(b, ev, ix, cr) }
-    const held = irBLetTempTy(b, ev, ix, cr, cty)
-    if unbox { return captureUnbox(b, held, ix, rep, ak) }
-    return captureRecover(b, held, ix, rep, na)
+    if !atOwn { return irBLetTemp(b, ev, ix, cr) }
+    const own = irBLetTempTy(b, ev, ix, cr, cty)
+    if holed { return repTemp(b, { rgV: own }, ix, rep) }
+    if unbox { return captureUnbox(b, own, ix, rep, ak) }
+    return captureRecover(b, own, ix, rep, na)
   }
   if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
   const v = liftCapVar(fe, name, if unbox { -1 } else { rep })
-  const held = if narrowed { cr } else { rep }
+  const held = if atOwn { cr } else { rep }
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
+  if holed { return repTemp(b, { rgV: o }, ix, rep) }
   if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
 }
@@ -3506,6 +3535,12 @@ function narrowedLocalRead(
     return o
   }
   if localReadStored(v, identDeclOf(ix), rep) { return o }
+  if (
+    holeRetagNoted(ib.irVars[v].vRep, rep, true)
+    && exprPrePathWhy(ix, ibFnIx) == ""
+  ) {
+    return repTemp(b, { rgV: o }, ix, rep)
+  }
   return irBMiss("narrowed read")
 }
 

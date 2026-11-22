@@ -1520,6 +1520,7 @@ Deno.test({
       "null-into-bool-niche-global": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
+      "retag-closures-of-differing-arity": 2,
       "retag-field-alike-records-two-heaps": 2,
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
