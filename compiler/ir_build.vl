@@ -57,6 +57,7 @@ import {
   WhileStmt,
   blockTailIsDead,
   callIsNever,
+  condLitTrue,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -278,6 +279,7 @@ import {
   letIfInitPerArmRep,
   listOpRecvHeldPlan,
   lowMemFoldsCallee,
+  lvTailAssigns,
   mapFilterWhy,
   mapGetArmOf,
   mapGetMissOf,
@@ -956,6 +958,8 @@ let ibDeclVar: {[i32]: i32} = Map()
 let ibLoopName: string[] = []
 let ibLoopBrk: i32[] = []
 let ibLoopCont: i32[] = []
+// The result binding of each break label whose frame carries a loop value.
+let ibLvOf: {[i32]: i32} = Map()
 let ibLabelN = 0
 // The statements whose end closes a list reserve region the body opened (`reserve.open`).
 let ibReserveEnd: i32[] = []
@@ -9080,28 +9084,40 @@ function rangeImmAt(d: i32): i32 {
 }
 
 function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
-  if n.whileLv >= 0 { return skip("loop value") }
-  if n.whileBlk != 0 { return labelBlock(b, n, ix) }
+  // A loop value leaves its frame through its result binding (`lvFrameOpen`).
+  const lv = if n.whileLv >= 0 { irBDeclVar(n.whileLv) } else { -1 }
+  if n.whileLv >= 0 && lv < 0 { return skip("loop value binding") }
+  // The frame takes a scalar binding's valtype; a reference one's blocktype is not built here.
+  if lv >= 0 && !scalarLvRep(ib.irVars[lv].vRep) {
+    return skip("loop value rep")
+  }
+  if n.whileBlk != 0 { return labelBlock(b, n, ix, lv) }
   const brk = labelNew()
   const cont = labelNew()
+  if lv >= 0 { ibLvOf[brk] = lv }
   ibLoopName.push(n.whileLabel)
   ibLoopBrk.push(brk)
   ibLoopCont.push(cont)
   const loopBody: i32[] = []
-  const c = irBExpr(loopBody, n.whileCond)
-  if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
-  const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
-  const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
-  irBNode(loopBody, sIf(c, [], exitBody, -1, true), -1, ibNoValue, ix)
+  // A valued frame's `while true` writes no test (`condLitTrue`); it has no exit but its breaks.
+  if lv >= 0 && !condLitTrue(n.whileCond) { skip("loop value condition") }
+  if lv < 0 {
+    const c = irBExpr(loopBody, n.whileCond)
+    if ibMiss == "" && irBOpRep(c) != ibBool { irBMiss("loop condition") }
+    const exit: IrNode = { brLabel: brk, brHas: false, brVal: c }
+    const exitBody = [irNodeNew(ib, exit, -1, ibNoValue, ix)]
+    irBNode(loopBody, sIf(c, [], exitBody, -1, true), -1, ibNoValue, ix)
+  }
   const wb = nodeAt(n.whileBody)
   if wb is Block {
     stmtRun(loopBody, wb.blkStmts)
   } else {
     stmt(loopBody, n.whileBody, NO_SIBS, -1)
   }
+  const none: Opnd = { ov: -1 }
   irBNode(
     loopBody,
-    { brLabel: cont, brHas: false, brVal: c },
+    { brLabel: cont, brHas: false, brVal: none },
     -1,
     ibNoValue,
     ix,
@@ -9111,14 +9127,28 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   ibLoopName.pop()
   ibLoopBrk.pop()
   ibLoopCont.pop()
-  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: -1 }, -1, ibNoValue, ix)
+  // A valued frame is left only by a `break v`, so falling out of its loop cannot happen.
+  if lv >= 0 { irBNode(blockBody, { tpWhy: 0 }, -1, ibNoValue, ix) }
+  irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: lv }, -1, ibNoValue, ix)
   return 0
 }
 
-// A void labelled block (`emitLabelBlock`): one block frame a `break` leaves, which takes no
-// `continue`.
-function labelBlock(b: i32[], n: WhileStmt, ix: i32) {
+// Whether rep `r` is a scalar a loop value's frame is typed by.
+function scalarLvRep(r: i32): boolean {
+  const p = repPrim(r)
+  if p == null { return false }
+  return match p {
+    "i32" | "bool" | "u8" | "i64" | "f64" | "f32" => true
+    "str" | "null" | "v128" => false
+  }
+}
+
+// A labelled block (`emitLabelBlock`): one block frame a `break` leaves, which takes no
+// `continue`. One carrying value `lv` ends with its tail falling out of it when the tail assigns
+// the result binding, and with `unreachable` otherwise.
+function labelBlock(b: i32[], n: WhileStmt, ix: i32, lv: i32) {
   const brk = labelNew()
+  if lv >= 0 { ibLvOf[brk] = lv }
   ibLoopName.push(n.whileLabel)
   ibLoopBrk.push(brk)
   ibLoopCont.push(-1)
@@ -9132,7 +9162,21 @@ function labelBlock(b: i32[], n: WhileStmt, ix: i32) {
   ibLoopName.pop()
   ibLoopBrk.pop()
   ibLoopCont.pop()
-  irBNode(b, { bkLabel: brk, bkBody: body, bkOut: -1 }, -1, ibNoValue, ix)
+  if lv >= 0 {
+    const out: Opnd = { ov: lv }
+    if lvTailAssigns(n) {
+      irBNode(
+        body,
+        { brLabel: brk, brHas: true, brVal: out },
+        -1,
+        ibNoValue,
+        ix,
+      )
+    } else {
+      irBNode(body, { tpWhy: 0 }, -1, ibNoValue, ix)
+    }
+  }
+  irBNode(b, { bkLabel: brk, bkBody: body, bkOut: lv }, -1, ibNoValue, ix)
   return 0
 }
 
@@ -9402,11 +9446,14 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   if n is ForRange { return forRangeStmt(b, n, ix) }
   if n is BreakStmt {
     const l = loopIx(n.brkLabel)
-    if l < 0 || n.brkHasVal != 0 { return skip("break") }
-    const z: Opnd = { ov: -1 }
+    if l < 0 { return skip("break") }
+    // A `break v` reads the value its statement before stored into the frame's result binding.
+    const lv = ibLvOf[ibLoopBrk[l]] ?? -1
+    if (n.brkHasVal != 0) != (lv >= 0) { return skip("break") }
+    const z: Opnd = { ov: lv }
     irBNode(
       b,
-      { brLabel: ibLoopBrk[l], brHas: false, brVal: z },
+      { brLabel: ibLoopBrk[l], brHas: lv >= 0, brVal: z },
       -1,
       ibNoValue,
       ix,
@@ -9798,6 +9845,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ibLoopName = []
   ibLoopBrk = []
   ibLoopCont = []
+  ibLvOf = Map()
   ibLabelN = 0
   ibBool = repNodeOfTy(TY_BOOL)
   return 0
@@ -10478,6 +10526,7 @@ function buildStart(order: i32[], orderGi: i32[], poolFill: boolean): string {
   ibLoopName = []
   ibLoopBrk = []
   ibLoopCont = []
+  ibLvOf = Map()
   ibLabelN = 0
   ibBool = repNodeOfTy(TY_BOOL)
   ibNoValue = repNodeOfTy(TY_NEVER)
