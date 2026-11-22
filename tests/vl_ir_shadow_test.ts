@@ -1518,6 +1518,7 @@ Deno.test({
       "held-global-read-off-noted-rep": 2,
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
+      "retag-field-alike-records-two-heaps": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
