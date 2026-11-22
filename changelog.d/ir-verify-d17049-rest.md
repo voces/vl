@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR verifier stands alone: it imports no legacy emit helper** (D17049 closed; 16 → 0 imports). A builder-side pass, `irNoteVerifyFacts` (`ir_verify_facts.vl`), runs before every verification. It notes on the function the facts only legacy's planners know: a read node's checked type, a memory op's voidness, a literal-arms read count, a narrowed map read's unbox, a `null`'s kind, a record's per-position site type, each compared rep's valtype, and whether an open variable is held. The verifier reads those records. `refRepValtype` and the helpers built on it move to the builder side.
