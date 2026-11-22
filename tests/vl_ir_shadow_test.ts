@@ -1519,7 +1519,16 @@ Deno.test({
       "result-pick-of-i32": 2,
       "result-pick-record-into-i32": 2,
       "retag-field-alike-records-two-heaps": 2,
+      "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
+      "atom-sole-into-i32": 2,
+      "atom-tower-i32-read": 2,
+      "atom-tower-zero-reads": 2,
+      "atom-staged-of-i32": 2,
+      "trunc-sat-operand-off-plan": 2,
+      "atomic-value-off-plan": 2,
+      "memory-store-value-off-plan": 2,
+      "simd-operand-off-plan": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1580,7 +1589,7 @@ print(two("a", "b"))
 const PRE_PATHS: [string, string][] = [
   [
     "atom hook",
-    `type K = "a" | "b"\nconst ka = "a"\nfunction k(): K { return ka }\nprint(k())\n`,
+    `const JX = "x"\nconst B: "y" = "y"\nfunction join(c: boolean) {\n  const M: "x" | "y" | "z" = if c { JX } else { B }\n  return M == "z"\n}\nprint(join(true))\n`,
   ],
 ];
 Deno.test({

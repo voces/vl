@@ -14236,10 +14236,17 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
     return mapGetOrI32Tail()
   }
-  const nulSentinel = mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx))
-  // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
-  pushMapScr(5)           // entry
-  fbIf(127)               // if (entry != 0 → found), i32 blocktype
+  mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx)))
+  if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
+  return mapGetOrSentinelTail()
+}
+
+// The sentinel arm's head after the probe: the raw value, or on a miss the null sentinel `sent`,
+// held in the probe's dead hash slot and compared with `sent`; an `i32` `if` whose then-arm is
+// the default follows.
+export function mapGetOrSentinelHead(sent: i32) {
+  pushMapScr(5)    // entry
+  fbIf(127)        // if (entry != 0 → found), i32 blocktype
   pushMapVals()
   fbStructGet(lTy(), 0)
   pushMapScr(5)
@@ -14247,15 +14254,19 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   fbI32Bin(107)
   fbArrayGet(aTy())
   fbElse()
-  fbI32Const(nulSentinel) // miss = null sentinel
+  fbI32Const(sent) // miss = null sentinel
   fbEnd()
-  // Coalesce: raw == sentinel ? d : raw. Slot +8 (probe hash cursor) is dead after the probe.
+  // Slot +8 (probe hash cursor) is dead after the probe.
   setMapScr(8)
   pushMapScr(8)
-  fbI32Const(nulSentinel)
+  fbI32Const(sent)
   fbI32Bin(70) // 0x46 i32.eq → raw == sentinel (null, missing OR stored)
   fbIf(127)
-  if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the sentinel arm's default: the else-arm's raw value, and the end.
+export function mapGetOrSentinelTail() {
   fbElse()
   pushMapScr(8)
   fbEnd()
@@ -14389,7 +14400,7 @@ export function mapGetOrMvTail(mslot: i32) {
 
 // The i32 a mono map of type `mt` stores for a null value: `-1` for a nullable literal union, `2`
 // for a nullable boolean or `null`; 0 for a map with no null sentinel.
-function mapGetOrSentinel(mt: i32): i32 {
+export function mapGetOrSentinel(mt: i32): i32 {
   if mapTyValIsNulLitUnion(mt) { return 0 - 1 }
   if mapTyValIsNulBool(mt) || mapTyValIsNullUnit(mt) { return 2 }
   return 0
@@ -22575,7 +22586,7 @@ export function emitExpr(exprIx: i32, fnIx: i32) {
     const wideIx = unwrapParen(exprIx)
     return match hookArm {
       // A read of a `const` bound to a literal is that literal, whose id needs no conversion.
-      "wideLit" => emitStaticLitAtom(exprIx, quoteLex(nodeWideStrLitText(wideIx)), fnIx)
+      "wideLit" => emitStrToAtomWide(exprIx, fnIx)
       // A join whose arms disagree about their rep takes the destination into each arm, under
       // the same context, rather than joining as a string to narrow back (D2199); so does a join
       // of member literals the checker typed `string`, as a generic body types it (D3423).
@@ -39112,6 +39123,7 @@ function emitStrToAtom(ix: i32, fnIx: i32) {
   if texts.length == 0 {
     return emitFail("emitProgram: literal-union atom narrowing with no members")
   }
+  if strToAtomArmOf(ix) == "sole" { return strToAtomSoleTail(ix) }
   if !unionEqOperandOk(ix) {
     // a non-place value — a call, a `+`, a ternary — is staged rather than refused:
     // evaluated once into `atomStageSlot`, then re-read per member (`emitAtomToStr`'s id
@@ -39130,10 +39142,7 @@ function emitStrToAtom(ix: i32, fnIx: i32) {
     // at an atom-typed destination a member literal folds to its interned id instead, so the
     // tower called `strEq` with an i32 operand. Restored on both exits.
     let rv = emitExprRaw(ix, fnIx)
-    if rv >= 0 {
-      fbLocalSet(atomStageSlot)
-      rv = emitStagedStrToAtomChain(texts, 0, atomStageSlot, fnIx)
-    }
+    if rv >= 0 { rv = strToAtomStagedTail(ix, fnIx) }
     return rv
   }
   // The inner emits run OUTSIDE the atom context: the value re-reads must lower as the
@@ -39141,6 +39150,55 @@ function emitStrToAtom(ix: i32, fnIx: i32) {
   // must lower as a string CONSTANT, not as its own interned id.
   const r = emitStrToAtomChain(ix, texts, 0, fnIx)
   return r
+}
+
+// How `emitStrToAtom` narrows node `ix`: a re-readable place of one member is that member's id
+// alone (`sole`), another place a tower re-reading it per member (`chain`), any other value
+// staged once (`staged`). Only a place, which has no effect, may go unread.
+export type StrToAtomArm = "sole" | "chain" | "staged"
+
+export function strToAtomArmOf(ix: i32): StrToAtomArm {
+  if !unionEqOperandOk(ix) { return "staged" }
+  return if tyLitMemberTexts(nodeUnwidenedTyOf(ix)).length == 1 { "sole" } else { "chain" }
+}
+
+// The `wideLit` arm of the hook: a read of a `const` bound to a literal, evaluated for its
+// effect and dropped, then the literal's id (`emitStaticLitAtom`'s shape). 0, or -1 failed.
+function emitStrToAtomWide(ix: i32, fnIx: i32): i32 {
+  if nodeAt(unwrapParen(ix)) is StrLit {
+    return staticAtomId(quoteLex(nodeWideStrLitText(unwrapParen(ix))))
+  }
+  if emitExprRaw(ix, fnIx) < 0 { return -1 }
+  return strToAtomWideTail(ix)
+}
+
+// After a `wideLit` read's raw value: dropped, then the id of the literal its `const` holds.
+export function strToAtomWideTail(ix: i32): i32 {
+  fbDrop()
+  return staticAtomId(quoteLex(nodeWideStrLitText(unwrapParen(ix))))
+}
+
+// After a `staged` value's raw string: the value parked in the stage slot, then the tower over
+// it (`emitStagedStrToAtomChain`). 0, or -1 failed.
+export function strToAtomStagedTail(ix: i32, fnIx: i32): i32 {
+  if !fnUses.atomStage {
+    return emitFail(
+      "emitProgram: literal-union atom narrowing needs a re-readable receiver",
+    )
+  }
+  fbLocalSet(atomStageSlot)
+  return emitStagedStrToAtomChain(strToAtomTexts(ix), 0, atomStageSlot, fnIx)
+}
+
+// The `sole` narrowing of node `ix`: its one member's interned id; the place is not read.
+export function strToAtomSoleTail(ix: i32): i32 {
+  const texts = tyLitMemberTexts(nodeUnwidenedTyOf(ix))
+  if texts.length != 1 {
+    return emitFail(
+      "emitProgram: internal: a sole atom narrowing has other than one member",
+    )
+  }
+  return staticAtomId(quoteLex(texts[0]))
 }
 
 // The `select` tower over a box parked in `st` whose payload is the member's string: member
@@ -39168,16 +39226,38 @@ function emitStashedStrToAtomChain(
 // The `select` tower for `emitStrToAtom`: member `i`'s interned id if the value string-equals
 // member `i`, else the chain for `i+1`. The last member is the unconditional default arm.
 function emitStrToAtomChain(ix: i32, texts: string[], i: i32, fnIx: i32) {
-  if i >= texts.length - 1 {
-    fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
-    return 0
-  }
   // val1 = this member's interned id
-  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  strToAtomIdTail(texts, i)
+  if i >= texts.length - 1 { return 0 }
   // val2 = the remaining chain
   if emitStrToAtomChain(ix, texts, i + 1, fnIx) < 0 { return -1 }
   // cond = (the value string-equals this member)
   if emitExprRaw(ix, fnIx) < 0 { return -1 }
+  return strToAtomTestTail(texts, i, fnIx)
+}
+
+// The members a `chain` narrowing of node `ix` towers over, in order; the last is the default.
+export function strToAtomTexts(ix: i32): string[] {
+  return tyLitMemberTexts(nodeUnwidenedTyOf(ix))
+}
+
+// Member `i`'s interned id, one value of the tower. 0.
+export function strToAtomIdTail(texts: string[], i: i32): i32 {
+  if i < 0 || i >= texts.length {
+    return emitFail(
+      "emitProgram: internal: an atom tower member past its texts",
+    )
+  }
+  fbI32Rel(RS_ATOM, internAtom(quoteLex(texts[i])))
+  return 0
+}
+
+// After the value's string read: whether it string-equals member `i`, then the `select` between
+// member `i`'s id and the rest of the tower. 0, or -1 failed.
+export function strToAtomTestTail(texts: string[], i: i32, fnIx: i32): i32 {
+  if i < 0 || i >= texts.length {
+    return emitFail("emitProgram: internal: an atom tower test past its texts")
+  }
   if emitStrEqLit(mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
   fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
   return 0

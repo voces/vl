@@ -9,6 +9,7 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
+import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
@@ -105,7 +106,9 @@ import {
   RArmUnbox,
   RAsUnion,
   RAtomEq,
+  RAtomSole,
   RAtomStr,
+  RAtomWide,
   RAtomic,
   RBoxField,
   RBoxNarrow,
@@ -181,6 +184,8 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
   RStructEq,
   RTagIs,
   RTagOf,
@@ -288,6 +293,7 @@ import {
   EqRootPlace,
   EqRootPlan,
   GlobalCtx,
+  MapGetOrArm,
   MapUnionPlan,
   SHARED_NULL_NONE,
   arrCopyBacking,
@@ -367,7 +373,6 @@ import {
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
-  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -415,6 +420,9 @@ import {
   mapGetOrNicheHead,
   mapGetOrNicheStash,
   mapGetOrNicheTail,
+  mapGetOrSentinel,
+  mapGetOrSentinelHead,
+  mapGetOrSentinelTail,
   mapGetOrUnionBoxOf,
   mapGetOrUnionBoxOpen,
   mapGetOrUnionBoxTail,
@@ -518,6 +526,12 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  strToAtomIdTail,
+  strToAtomSoleTail,
+  strToAtomStagedTail,
+  strToAtomTestTail,
+  strToAtomTexts,
+  strToAtomWideTail,
   structEqEnter,
   structEqRoots,
   structEqStagesLeft,
@@ -528,7 +542,6 @@ import {
   tagDispatchIfOf,
   tagIsTail,
   tagStashTail,
-  truncSatPlanOf,
   truncSatTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
@@ -1122,6 +1135,16 @@ function rhs(r: Rhs, tail: boolean) {
       RFnId |
       RMapSet |
       RTagOf => irLMiss("rhs outside I1")
+    RAtomSole => strToAtomSoleTail(r.asAt)
+    RAtomWide => {
+      irLOpnd(r.awV)
+      strToAtomWideTail(r.awAt)
+    }
+    RStrToAtom => strToAtomTower(r)
+    RStrToAtomStaged => {
+      irLOpnd(r.zsV)
+      strToAtomStagedTail(r.zsAt, lw.irAt)
+    }
     RMakeClo => makeClo(r)
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
@@ -1298,7 +1321,7 @@ function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
 // the order stash, each field in source order into its scratch slot first, read back in layout;
 // for `mrSet` its `RStashSet`s set the slots, and it only reads them back.
 function makeRec(r: RMakeRec) {
-  const variant = recIsVariant(r, lw.irAt)
+  const variant = recIsVariant(r)
   const stash = r.mrSrc.length > 0
   // The row the builder built the fields by: the plain or stash layout, or a row omitting fields.
   const row = if r.mrBuiltRow >= 0 { r.mrBuiltRow } else { recRowOf(r.mrAt, r.mrRow, variant, stash) }
@@ -2104,14 +2127,11 @@ function atomicEffect(r: RAtomic, pending: i32[]): i32 {
   return 0
 }
 
-// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail`.
+// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail(tsOp)`.
 function truncSat(r: RTruncSat) {
-  const c = nodeAt(r.tsAt)
-  if !(c is Call) { return irLMiss("trunc_sat node") }
-  const pl = truncSatPlanOf(c)
-  if pl.tpOp < 0 { return irLMiss("trunc_sat plan") }
+  if r.tsOp < 0 { return irLMiss("trunc_sat plan") }
   irLOpnd(r.tsV)
-  return truncSatTail(pl.tpOp)
+  return truncSatTail(r.tsOp)
 }
 
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
@@ -2459,7 +2479,7 @@ function mapGetOr(r: RMapGetOr) {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if r.mgForm == 1 { "i32" } else if r.mgForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(r.mgForm, arm)
   if (
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
@@ -2572,7 +2592,9 @@ function mapGetOrInlineHead(
   qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 5 {
+  if form == 6 {
+    mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, lw.irAt)))
+  } else if form == 5 {
     mapGetOrUnionHead(sh)
     mapGetOrUnionBoxOpen(sh)
   } else if form == 4 {
@@ -2588,8 +2610,17 @@ function mapGetOrInlineHead(
   return sh
 }
 
+// The legacy arm (`mapGetOrArmOf`) inline form `form` writes: the plain `i32` read (1), an
+// atom-valued map's being that read; an mv slot's (2-5); the sentinel's (6); else the helper.
+function mapGetOrFormArm(form: i32, arm: MapGetOrArm): MapGetOrArm {
+  if form == 1 { return if arm == "atom" { "atom" } else { "i32" } }
+  if form == 6 { return "sentinel" }
+  return if form >= 2 { "mv" } else { "helper" }
+}
+
 // An inline map read's tail after its default, by `form`.
 function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 6 { return mapGetOrSentinelTail() }
   if form == 5 { return mapGetOrUnionBoxTail(sh) }
   if form == 4 { return mapGetOrNicheTail(sh) }
   if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
@@ -2612,7 +2643,7 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if mp.prForm == 1 { "i32" } else if mp.prForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(mp.prForm, arm)
   if (
     arm != want
     || want == "helper"
@@ -2840,6 +2871,29 @@ function numUnionBin(r: RNumUnionBin) {
   numUnionStashLeave()
   if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
     return irLMiss("numeric union dispatch")
+  }
+  return 0
+}
+
+// `RStrToAtom`: legacy's atom tower (`emitStrToAtomChain`): every member's id, then from the
+// last tested member to the first its string read and the test that selects it.
+function strToAtomTower(r: RStrToAtom) {
+  const texts = strToAtomTexts(r.saAt)
+  if texts.length != r.saReads.length + 1 {
+    return irLMiss("atom tower members")
+  }
+  let m = 0
+  while m < texts.length {
+    strToAtomIdTail(texts, m)
+    m = m + 1
+  }
+  let i = texts.length - 2
+  while i >= 0 {
+    irLOpnd(r.saReads[i])
+    if strToAtomTestTail(texts, i, lw.irAt) < 0 {
+      return irLMiss("atom tower test")
+    }
+    i = i - 1
   }
   return 0
 }
@@ -4337,7 +4391,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
   body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
-  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
+  const pad = if valued { f.irEndPad } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
