@@ -45,3 +45,22 @@ twin's: a seed whose record arm recursed through fields traps on it.
 `tests/cases/closures/hole-fn-list-handed-to-concrete-param.vl` hands each B shape to a
 concrete-parameter callee that calls the closures and reads the records. The old seed leaves its
 `@start` uncovered, at `argument coercion`.
+
+## Measured vs merge-base 5be659a8 (fixpoint seeds on both sides)
+
+The branch is stacked on #9590 (the arm unbox), and this proves both.
+
+- `--names` self-compile identical. `ir-identity.sh --cases`: identical 7630, fail under both 68,
+  differ 0; witnesses same 61, differ 0. `structs/structural-twin-heap-dedup.vl`, which a first cut
+  trapped on, is among the identical cases. `--claimless`: identical 14021, fail under both 3267,
+  differ 0.
+- tests/cases shadow sum: matched 70012 → 70036, start matched 6252 → 6290. `start uncovered
+  argument coercion` 122 → 88, `uncovered argument coercion` 64 → 51, `uncovered narrowed read`
+  53 → 44 (the arm unbox).
+- Corpus shadow: 45254 of 45678 functions covered, verified and matched.
+- L2 self-compile fuel +0.19% on base 5be659a8 (per-PR tier +1%). The same-tree pair, both seeds
+  compiling the base tree, reads 112531634429 → 112527900535 (−0.003%), so the rise is source
+  growth.
+- Deep-nesting margin: base and branch alike, 920 KB fail, 930 KB pass.
+- Late tag rows 307; `ladder-sets` 101 sets clean; phase state ok (surface 2867); `ir prepost`
+  (mode 6) and `ir claims` ok with no new row; `gate.sh --fast` passed; lint-self clean.
