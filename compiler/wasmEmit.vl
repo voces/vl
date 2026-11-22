@@ -42584,7 +42584,7 @@ export function coalNulRefPlanOf(
   exprIx: i32,
   fnIx: i32,
 ): CoalNulRefPlan | null {
-  const h = coalNulRefHeapOf(e, lhsIx, exprIx, fnIx)
+  const h = if lhsIx == unwrapParen(e.binLeft) { coalNulRefsHeapOf(e, exprIx, fnIx) } else { coalNulRefHeapOf(e, lhsIx, exprIx, fnIx) }
   if h < 0 { return null }
   const a = coalNulRefArmOf(e, exprIx, fnIx)
   const tag = match a {
@@ -44249,6 +44249,17 @@ export function coalNulRefsArmOf(
   return "none"
 }
 
+// The heap `emitCoalesceNulRef` writes `l ?? d`'s core at, on the `heap` and `mapHeap` arms (a
+// nullable map's cell takes the same `br_on_non_null` core, its `Map()` default building that
+// shape, D3257); -1 on any other arm.
+export function coalNulRefsHeapOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  return match coalNulRefsArmOf(e, exprIx, fnIx) {
+    "heap" => coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
+    "mapHeap" => mapTypeIdxOf(coalNulMapShape(e, fnIx))
+    "boxStash" | "pinnedCellIf" | "atomJoinIf" | "numJoinIf" | "armIf" | "boxFieldScalar" | "cellIf" | "none" => -1
+  }
+}
+
 // The map shape a nullable map `l ?? d` reads, or -3 where it has none.
 function coalNulMapShape(e: BinExpr, fnIx: i32): i32 {
   const cms = mapShapeOfExpr(e.binLeft, fnIx)
@@ -44258,14 +44269,11 @@ function coalNulMapShape(e: BinExpr, fnIx: i32): i32 {
 function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
   const lhsIx = unwrapParen(e.binLeft)
   return match coalNulRefsArmOf(e, exprIx, fnIx) {
-    "heap" => emitCoalesceNulRef(e, exprIx, coalNulRefHeapOf(e, lhsIx, exprIx, fnIx), fnIx)
+    "heap" | "mapHeap" => emitCoalesceNulRef(e, exprIx, coalNulRefsHeapOf(e, exprIx, fnIx), fnIx)
     // D960: a value-union box whose operand cannot be re-read, stashed once and branched on its
     // tag, the `if` typed at the box so both arms agree (D969).
     "boxStash" => emitCoalesceBoxStash(e, exprIx, fnIx)
     "pinnedCellIf" | "atomJoinIf" | "cellIf" => emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
-    // A nullable map's cell takes the same `br_on_non_null` core, and a `Map()` default builds
-    // its shape (D3257).
-    "mapHeap" => emitCoalesceNulRef(e, exprIx, mapTypeIdxOf(coalNulMapShape(e, fnIx)), fnIx)
     "numJoinIf" => {
       const nIf = coalNullTestIf(e, exprIx, fnIx)
       nodeTyRecord(nIf, coalResultTyOf(exprIx, fnIx))
