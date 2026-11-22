@@ -19,3 +19,16 @@ now held as i32 (0x7f). No REnvGet, env-layout or legacy change.
 Tried and refused: an env read of a nullable-ref capture narrowed past its null, built as
 `REnvGet` at the inner rep. It added 9 fail rows (`prefix or locals`), because the narrowed temp
 declares a local legacy does not, so it was reverted.
+
+## Readings (merge-base `2de2ffc1f`, fixpoint seeds on both sides)
+
+| reading | base | this change |
+| --- | ---: | ---: |
+| corpus functions with no blocker | 44,792 | 44,806 (+14) |
+| corpus `capture binding` (alone) | 23 (22) | 12 (12) |
+| corpus `closure env capture` (alone) | 13 (7) | 9 (3) |
+| tests/cases armed shadow covered / matched | 66,856 / 66,855 | 66,924 / 66,923 (same single fail row) |
+| self-compile functions with no blocker | 19,631 | 19,631 |
+| L2 self-compile fuel | 108,665,970,114 | 108,671,315,149 (+0.005%) |
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
