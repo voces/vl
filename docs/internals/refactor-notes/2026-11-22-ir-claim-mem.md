@@ -18,21 +18,19 @@ is decided before either path runs. This PR builds on it (merged).
 Why the kinds were in `other`: each was added shadow-only, so its coverage PR moved no shipped byte
 (IR-N7; the notes 2026-11-20-ir-mem-access, ir-simd-v128 and 2026-11-21-ir-intr-residue).
 
-## Readings (fixpoint seeds on both sides)
-
-The head is 36b5985a, this change merged with `vl-queue/BD3` (16e9bcdc, which holds #9511 and #9512).
-The base is BD3's own fixpoint.
+## Readings (base master 8b8ac208, fixpoint seeds on both sides)
 
 | reading | result |
 | --- | --- |
-| `ir-identity.sh --cases` | identical 7620, fail under both 68, differ 0, timeout 0; witnesses same 60, differ 0 |
+| `ir-identity.sh --cases` | identical 7619, fail under both 68, differ 0, timeout 0; witnesses same 61, differ 0 |
 | `ir-identity.sh --claimless` | identical 14019, fail under both 3267, differ 0, timeout 0 |
 | `ir-identity.sh <base> <head> --names` | identical 9037, differ 0, built under one only 0; self-compile identical |
-| armed shadow, corpus | 45678 functions, 45125 covered = verified = matched |
+| armed shadow, corpus | 45678 functions, 45099 covered = verified = matched |
 | armed shadow, `--cases` | no class above baseline |
-| `ir-shadow.vl --claims` | 45035 corpus functions emitted by the IR, 19256 over 4982 filed witnesses; no fallback |
-| L2 self-compile fuel per PR | +0.01% on 111376280241 |
-| tests/cases claimed (mode 5, `fnc` rows) | 64707 → 68113 (+3,406, 0 lost) |
+| `ir-shadow.vl --claims` | 45009 corpus functions emitted by the IR, 19246 over 4982 filed witnesses; no fallback |
+| deep-nesting margin (labelled-loop, V8 stack) | base fail 921 / pass 925 KB; head fail 921 / pass 925 KB |
+| L2 self-compile fuel per PR | -0.00% on 111341639906 |
+| tests/cases claimed (mode 5, `fnc` rows) | 64657 → 68063 (+3,406, 0 lost) |
 
 Released by directory: simd 1334, std 1131, modules 257, memory 253, loops 204, soundness 56, getters 36, unions 31, literal-unions 29, extern 29, intrinsics 19, atomics 10, numerics 6, run 3, functions 3, types 2, conditionals 2, expressions 1.
 

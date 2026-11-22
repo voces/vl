@@ -7,18 +7,24 @@ legacy's own questions (`numUnionIsUnionSide`, `numUnionSideBoxed`, `numUnionSid
 while it emits, and there is no new admission predicate. Stacked on the `mem` family split
 (#9519's new head), which rewrites the same `other` arm.
 
-## Readings (base 45991da60 = master 228cfa5e1 + #9512, fixpoint seeds on both sides)
+## Readings (fixpoint seeds on both sides)
+
+The stack was proved once at its top (R4): RCallHost (d46c311b) on this change (ab7aecca), against
+the `mem` split's head (cabfada8). The identity, shadow, gate and fuel rows below cover both layers.
+The released count is this layer's own.
 
 | reading | result |
 | --- | --- |
-| `ir-identity.sh --cases` | identical 7615, fail under both 68, differ 0, timeout 0; witnesses same 61, differ 0 |
+| `ir-identity.sh --cases` | identical 7619, fail under both 68, differ 0, timeout 0; witnesses same 61, differ 0 |
 | `ir-identity.sh --claimless` | identical 14019, fail under both 3267, differ 0, timeout 0 |
 | `ir-identity.sh <base> <head> --names` | identical 9037, differ 0, built under one only 0; self-compile identical |
-| armed shadow, corpus | 45678 functions, 45093 covered = verified = matched |
+| armed shadow, corpus | 45678 functions, 45099 covered = verified = matched |
 | armed shadow, `--cases` | no class above baseline |
-| `ir-shadow.vl --claims` | 45052 corpus functions emitted by the IR, 18232 over 4982 filed witnesses; no fallback |
-| L2 self-compile fuel per PR | +0.00% on 110741584201 |
-| tests/cases claimed (mode 5, `fnc` rows) | 64617 → 64661 (+44, 0 lost) |
+| `ir-shadow.vl --claims` | 45056 corpus functions emitted by the IR, 19301 over 4982 filed witnesses; no fallback |
+| deep-nesting margin | base fail 921 / pass 925 KB; head fail 921 / pass 925 KB |
+| `gate.sh --fast` (host with mode 6) | FAST TIER PASSED, `ir prepost` included |
+| L2 self-compile fuel per PR | +0.01% on 111337549921 |
+| tests/cases claimed, this layer (`fnc` rows) | +44, 0 lost |
 
 ## The functions released (tests/cases, file and function)
 
