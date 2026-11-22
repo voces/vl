@@ -208,6 +208,7 @@ import {
   coalNulRefJoinWhy,
   coalNulRefPlanOf,
   coalNulRefRungReached,
+  coalNulRefsArmOf,
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
@@ -262,6 +263,7 @@ import {
   mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrMvPlain,
+  mapGetOrUnionScalarPlanOf,
   mapKeyArmOf,
   mapNewCall,
   mapRecvIsSet,
@@ -501,6 +503,7 @@ import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
   bundleRecordTyOf,
   elabArmSigAt,
+  elabHasHolderRecords,
   elabInstTyAt,
   elabSpreadNote,
   isStorageRead,
@@ -535,9 +538,11 @@ import {
   exprUnion,
   fnBundleRetSigs,
   fnIndexOfNode,
+  fnRetHeldAsBundle,
   forInElemTyOf,
   forInMapRecv,
   globalCellKind,
+  holderRecordTy,
   identIsEnvCapture,
   letBindIsAtom,
   letBindRep,
@@ -641,6 +646,7 @@ import {
 } from "./emit_bignum"
 import { isVoidTy } from "./tyquery"
 import { structIndexOfTy } from "./emit_atom_kinds"
+import { recordHeapOfTy } from "./emit_shape_intern"
 import { RC_MAP, RC_REF_LIST, letBindingUnionTy } from "./emit_start_block"
 import {
   TY_BOOL,
@@ -1895,14 +1901,19 @@ function exprTyOf(ix: i32): i32 {
     const st = readNarrowedStoreAt(ix, ibFnIx)
     if st >= 0 { return st }
   }
+  // A read of a binding holding a returned record whole is that record (`emitHolderRead`).
+  const ht = holderReadTy(ix)
+  if ht >= 0 { return ht }
   const t = nodeTyAt(ix, ibFnIx)
   // A read typed open reads its binding's storage where the IR holds that variable closed.
   if t >= 0 && irTyOpen(t) {
     const sv = storedVarOf(ix, t)
     if sv >= 0 { return ib.irVars[sv].vTy }
   }
-  if t >= 0 || ix < 0 || ix >= P.nodes.length { return t }
+  if ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
+  // A direct call typed open is of its callee's result as the IR holds it (`resultTy`).
+  if t >= 0 && !(n is Call && irTyOpen(t)) { return t }
   if n is Call {
     if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return t }
     const d = identDeclOf(n.callFn)
@@ -1937,6 +1948,17 @@ function capturedClosureTy(ix: i32): i32 {
   }
   const ty = capTyOf(fe, n.identName)
   return if ty >= 0 && repNodeAt(repNodeOfTy(ty)) is RClosure { ty } else { -1 }
+}
+
+// The record type read `ix` of a holding binding is (`holderRecordTy`), where this frame's
+// variable for it holds that record; -1 otherwise, a global or a capture included.
+function holderReadTy(ix: i32): i32 {
+  if !elabHasHolderRecords() { return -1 }
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  const ht = holderRecordTy(identDeclOf(ix), ibFnIx)
+  if ht < 0 { return -1 }
+  const v = boundVarOf(ix)
+  return if v >= 0 && ib.irVars[v].vTy == ht { ht } else { -1 }
 }
 
 // `boundVarOf(ix)` for read `ix` of open type `t`, where the IR holds it closed and legacy stores
@@ -2104,7 +2126,9 @@ function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
 export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
-  const ty = heldTy(scopeTyAt(d, ibFnIx))
+  // Legacy holds a binding of a returned record whole as that record (`letCellKind`).
+  const ht = holderRecordTy(d, ibFnIx)
+  const ty = if ht >= 0 { ht } else { heldTy(scopeTyAt(d, ibFnIx)) }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     irBMiss("local rep " + repWhat(rep))
@@ -3357,10 +3381,10 @@ function globalTyRep(ty: i32): i32 {
 function resultTy(pos: i32, ann: i32, d: i32): i32 {
   if ann >= 0 { return nodeTyAt(ann, d) }
   const rec = if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
-  if rec >= 0 { return rec }
-  const t = fnCheckedRetTy(pos)
-  // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`).
-  const bs = if irTyOpen(t) && pos >= 0 && pos < fnStmts.length { fnBundleRetSigs(pos) } else { [] }
+  const t = if rec >= 0 { rec } else { fnCheckedRetTy(pos) }
+  // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`),
+  // whether its result is recorded or checked.
+  const bs = if pos >= 0 && pos < fnStmts.length && fnRetHeldAsBundle(pos, t) { fnBundleRetSigs(pos) } else { [] }
   return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
 }
 
@@ -5377,6 +5401,19 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
   if ibMiss == "" && dst >= 0 && heldAsBox(dst) && memberBoxReadAt(ix, ibFnIx) {
     return memberBoxTemp(b, ix, dst)
   }
+  if ibMiss == "" && dst >= 0 && repNodeAt(dst) is RRecord {
+    const ot = objLitTwinTyAt(ix, dst, dstTy)
+    if ot >= 0 {
+      return objLitAt(
+        b,
+        unwrapParen(ix),
+        dst,
+        ot,
+        objLitLayoutRowOf(unwrapParen(ix), ibFnIx),
+        false,
+      )
+    }
+  }
   const at = b.length
   // A union map read boxed at its record (`emitCoerced`), or at the destination's union where none
   // is owed, is the box ladder's own read.
@@ -5393,6 +5430,21 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     ifBelowLead(b, at, "box of a valued if")
   }
   return v
+}
+
+// The type a struct literal `ix` is built at for record destination `dst` (`dstTy`, else the
+// rep's type) where its own rep is another: legacy builds it at a row (`objLitLayoutRowOf`) whose
+// type is stored at the destination type's heap (`recordHeapOfTy`), so it is that record; or -1.
+function objLitTwinTyAt(ix: i32, dst: i32, dstTy: i32): i32 {
+  const ol = unwrapParen(ix)
+  if ol < 0 || ol >= P.nodes.length || !(nodeAt(ol) is ObjLit) { return -1 }
+  if objLitArmOf(ol, ibFnIx) != "struct" || exprRepOf(ol) == dst { return -1 }
+  const dt = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+  if dt < 0 || irTyOpen(dt) || repNodeOfTy(dt) != dst { return -1 }
+  const row = objLitLayoutRowOf(ol, ibFnIx)
+  if row < 0 || row >= sTyIx.length { return -1 }
+  const h = recordHeapOfTy(dt)
+  return if h >= 0 && h == recordHeapOfTy(sTyIx[row]) { dt } else { -1 }
 }
 
 // The value-atom kind of map read `ix` where legacy boxes it here by the box plan's `mapScalar`
@@ -6651,6 +6703,16 @@ function coalOptLeafBuild(
 // plain block, or a join's staged `if`, with the default built where it runs only on `null`. A plain
 // default is written as itself; a join's only on the recorded-box branch `deliver` shares.
 function coalNulRef(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
+  // Past the core, legacy's rungs by `coalNulRefsArmOf`: a null test `coalNullTestIf` spells is
+  // built as the valued `if` it is; the rest are misses by their arm.
+  const ra = coalNulRefsArmOf(n, ix, ibFnIx)
+  if ra == "pinnedCellIf" || ra == "atomJoinIf" || ra == "cellIf" {
+    const v = irBExpr(b, coalNullTestIf(n, ix, ibFnIx))
+    if ibMiss != "" { return v }
+    if irBOpRep(v) != rep { return irBMiss("coalesce nulRef " + ra + " rep") }
+    return v
+  }
+  if ra != "heap" && ra != "mapHeap" { return irBMiss("coalesce nulRef " + ra) }
   const p = coalNulRefPlanOf(n, lhsIx, ix, ibFnIx)
   if p == null { return irBMiss("coalesce nulRef heap") }
   const join = p.nrArm == "join"
@@ -6803,7 +6865,10 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const rk = coalResultKindOf(ix, ibFnIx)
   const arm = mapGetOrArmOf(rd.idxArr, n.binRight, ibFnIx, rk)
   const mv = arm == "mv" && mapGetOrMvPlain(rd.idxArr, n.binRight, ibFnIx)
-  if arm != "helper" && arm != "i32" && !mv {
+  // A `scalar | null` union value peels to its scalar, the default in the result's kind.
+  const uq = if arm == "mv" && !mv { mapGetOrUnionScalarPlanOf(mapRecvShapeOf(rd.idxArr, ibFnIx), n.binRight, rk) } else { null }
+  const mvu = uq != null && uq.muKind >= 0
+  if arm != "helper" && arm != "i32" && !mv && !mvu {
     return irBMiss("map read " + arm)
   }
   const inline = arm != "helper"
@@ -6815,9 +6880,9 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   )
   if ka != "plain" { return irBMiss("map key " + ka) }
   const rp = repPrim(rep)
-  if !(rp == "i32" || arm == "i32" && rp == "bool" || mv) {
-    return irBMiss("map read rep")
-  }
+  const uk = if uq != null { uq.muWide } else { -1 }
+  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32" || arm == "i32" && rp == "bool" || mv }
+  if !repOk { return irBMiss("map read rep") }
   // A default the miss arm writes as a body leaves the read's value on the stack from here.
   const clear = !endsInTemp(b)
   const rcv = mapRecvKeyOf(b, rd.idxArr, rd.idxIndex, "map read receiver")
@@ -6827,7 +6892,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const dv: Opnd = if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
   if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
-  const form = if mv { 2 } else if inline { 1 } else { 0 }
+  const form = if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
   if !defaultSelfContained(db, 0, dv) {
     if !clear { return irBMiss("map read default after an operand") }
     return mapGetOrBox(
@@ -6914,14 +6979,14 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
 // slot's ref value at its null niche, or recovered when the read is narrowed; a mono-valued map's
 // value as itself, or a `boolean` value at its nullable.
 function mapGetRepOk(sh: i32, val: i32, rep: i32, recvIx: i32): boolean {
-  // A `boolean`-valued map's miss reads `2`, the `boolean | null` sentinel (`mapGetMissOf`).
+  // A `boolean`-valued map's miss reads `2`, the `boolean | null` sentinel, and an atom-valued map's
+  // `-1`, the `K | null` one (`mapGetMissOf`).
   if sh < 0 {
     if rep == val { return true }
     const bn = repNodeAt(rep)
-    return boolNullable(rep)
-      && bn is RNullable
-      && bn.rnInner == val
-      && mapGetMissOf(recvIx, ibFnIx) == 2
+    if !(bn is RNullable) || bn.rnInner != val { return false }
+    const miss = mapGetMissOf(recvIx, ibFnIx)
+    return boolNullable(rep) && miss == 2 || atomNullable(rep) && miss == -1
   }
   const k = mvValKindAt(sh)
   if (
