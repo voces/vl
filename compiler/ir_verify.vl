@@ -155,6 +155,7 @@ import { AsExpr, Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
 import {
   memOpIsVoid,
   memOpPlanOf,
+  objLitArmOf,
   simdCallRow,
   simdMemBase,
   simdOperandPrim,
@@ -177,7 +178,9 @@ import {
   litArmsReadsOf,
   memAccessPlanOf,
   narrowedMapReadOf,
+  structFieldBoxTy,
   truncSatPlanOf,
+  variantFieldBoxTy,
 } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
@@ -634,7 +637,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       while i < ks.length {
         if (
           opRep(r.mrFields[i]) != ks[i]
-          && !repStoresAs(ks[i], opRep(r.mrFields[i]))
+          && !openRepTakes(recKidSiteTy(r, i), ks[i], opRep(r.mrFields[i]))
         ) {
           return fail(2, at, "field " + i32ToStr(i) + "'s rep differs")
         }
@@ -1969,7 +1972,7 @@ function stmt(id: i32, prev: i32) {
         use(n.rtV, id)
         if (
           opRep(n.rtV) != vf.irRetRep
-          && !repStoresAs(vf.irRetRep, opRep(n.rtV))
+          && !openRepTakes(vf.irRetTy, vf.irRetRep, opRep(n.rtV))
         ) {
           return fail(2, id, "a return's rep is not the result's")
         }
@@ -2365,7 +2368,7 @@ export function irTyHeldOpen(ty: i32, rep: i32): boolean {
 }
 
 // The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
-// ref-element list's at its wrapper; none for any other rep.
+// ref-element list's at its wrapper; none for any other rep. Writes nothing to the live writer.
 export function refRepValtype(r: i32): u8[] {
   const out: u8[] = []
   const d = repOfTy(repTyOf(r))
@@ -2387,6 +2390,26 @@ export function refRepValtype(r: i32): u8[] {
 export function repStoresAs(dst: i32, src: i32): boolean {
   const a = refRepValtype(dst)
   return a.length > 0 && u8sSame(a, refRepValtype(src))
+}
+
+// Whether a destination of open type `ty` at rep `rep` takes a value of rep `v` as it stands,
+// stored alike (`repStoresAs`).
+export function openRepTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty) && repStoresAs(rep, v)
+}
+
+// Whether record `r` is built at a variant's row, as `makeRec` lowers it.
+export function recIsVariant(r: RMakeRec, fnIx: i32): boolean {
+  return if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, fnIx) == "variant" }
+}
+
+// The site type kid `k` of record `r` is delivered at (the builder's `fieldSiteTy`), or -1.
+function recKidSiteTy(r: RMakeRec, k: i32): i32 {
+  if r.mrBuiltRow < 0 { return -1 }
+  let fi = 0
+  while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
+  if fi >= r.mrLayout.length { return -1 }
+  return if recIsVariant(r, vf.irAt) { variantFieldBoxTy(r.mrBuiltRow, fi) } else { structFieldBoxTy(r.mrBuiltRow, fi) }
 }
 
 // Whether byte lists `a` and `b` are equal.
