@@ -431,6 +431,7 @@ import {
   repTyOf,
 } from "./emit_rep"
 import {
+  captureLoopVarDeclOf,
   ctxTyAt,
   fnEnvIdxOf,
   nodeTyAt,
@@ -2683,7 +2684,7 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
     return irBMiss("capture recover")
   }
-  if capRepOf(fe, name) != rep { return irBMiss("capture binding") }
+  if capRepFor(fe, name, rep) != rep { return irBMiss("capture binding") }
   if !cloLifted(fe) {
     // An `is K[]`-tested capture may read the empty list legacy stands in (D4935).
     if listIsTestedIdent(unwrapParen(ix)) {
@@ -2697,7 +2698,8 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     )
   }
   if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
-  const v = liftCapVar(fe, name)
+  const v = liftCapVar(fe, name, rep)
+  if v < 0 || ib.irVars[v].vRep != rep { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
   return o
@@ -2705,8 +2707,15 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
 
 // The rep of capture `name` of function `fe`, its binding's type in the frame that owns it; -1
 // when that rep is no value, open, or not the valtype legacy gives the capture (`captureValKind`).
-function capRepOf(fe: i32, name: string): i32 {
-  const ty = capTyOf(fe, name)
+function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
+
+// `capRepOf`, where a captured `for-in` variable, whose declaration records no type, takes read
+// rep `readRep` when legacy's capture valtype for it (`captureValKind`) agrees, else -1.
+function capRepFor(fe: i32, name: string, readRep: i32): i32 {
+  let ty = capTyOf(fe, name)
+  if ty < 0 && readRep >= 0 && captureLoopVarDeclOf(fe, name) >= 0 {
+    ty = repTyOf(readRep)
+  }
   if ty < 0 { return -1 }
   const r = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r) { return -1 }
@@ -2732,13 +2741,16 @@ function capTyOf(fe: i32, name: string): i32 {
 }
 
 // The parameter variable of the lifted function `fe` being built for its capture `name`, at
-// `capRepOf`'s rep, made at its first use.
-function liftCapVar(fe: i32, name: string): i32 {
+// `capRepFor`'s rep for a first read at `readRep` (-1 for none), made at its first use; -1 when a
+// captured `for-in` variable has no rep yet.
+function liftCapVar(fe: i32, name: string, readRep: i32): i32 {
   const w = 1 + captureSlotOf(name, ibFnIx)
   const known = paramVarAt(w)
   if known >= 0 { return known }
-  const r = capRepOf(fe, name)
-  const v = irVarNew(ib, r, capTyOf(fe, name), "param", w)
+  const r = capRepFor(fe, name, readRep)
+  const ty = capTyOf(fe, name)
+  if ty < 0 && r < 0 { return -1 }
+  const v = irVarNew(ib, r, if ty >= 0 { ty } else { repTyOf(r) }, "param", w)
   ib.irParams.push(v)
   return v
 }
@@ -2793,7 +2805,7 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
         if cloLiftWriteCount(self) > 0 {
           v = -1
         } else {
-          v = liftCapVar(self, name)
+          v = liftCapVar(self, name, -1)
         }
       } else {
         const t = irBLetTempTy(
@@ -3259,7 +3271,7 @@ function liftCaps(pos: i32): Opnd[] {
         && capRepOf(self, name) >= 0
         && capRepOf(self, name) == capRepOf(pos, name)
       ) {
-        v = liftCapVar(self, name)
+        v = liftCapVar(self, name, -1)
       }
     }
     if v < 0 || capCellTargetOf(name) >= 0 {
