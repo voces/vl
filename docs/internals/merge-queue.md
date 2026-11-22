@@ -130,6 +130,24 @@ For the queue:
   (`git merge-base --is-ancestor <vetoed head> HEAD`). If it does, rebuild the branch from master
   or the current train and open a new PR, since dropping commits would need a force-push (queue
   practice: #9519 and #9528 merged BD3, which held #9517).
+- **Q11.** Seed-size drift is refreshed the way fuel drift is. The queue writes a scripts-only
+  refresh from a fixpoint seed at master. The body gives the cumulative rise, the commit range and
+  the mechanism (IR dual-path growth, expected to shrink at I8), plus a per-train size column that
+  names any single train at 1% or more (coordinator ruling, 2026-11-22; first instance #9560).
+- **Q12.** Before gating a candidate, check that every IR kind list is sorted
+  (`tests/ir_lists_layout_test.ts`), as well as every import block. Git's auto-merge unsorts both:
+  BJ1 (#9546 beside #9541) and BL2 (#9556 RNumIs after #9548 RNumUnionBin). A train built before a
+  master scripts-only change carries that file in its first step, so its gate grades against
+  master's current ratchets (queue practice).
+- **Q13.** Never edit a log in place while a job appends to it. `sed -i` swaps the inode, the job's
+  later output goes to the deleted copy, and the gate's reading is lost (BL3 had to be re-gated).
+  Give each train attempt its own log (queue practice).
+- **Q14.** A 0-differ `--claimless` covers only the shapes its cells hold. D17048, a claimed
+  narrowed box-field read shipping invalid wasm since #9259, never reached a cell. So a soundness
+  fix adds its witness as a tests/cases program that runs and prints, and the queue asks for a run
+  proof, not a byte argument, on any admission that reads a value at another rep without a
+  conversion (queue practice; the coordinator ordered a one-off claimed-vs-claimless discovery
+  sweep after the fix).
 
 ### Squash artifacts and Q3 members
 

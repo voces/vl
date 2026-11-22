@@ -12965,3 +12965,19 @@ A rep pair on the global (option 2) is a second rep channel. Leaving it to the e
   builds it, and the global's reads in that build take it as it is. The verifier holds a global
   read off its type's rep to the column's rep (`globalReadAtTyOrStorage`). A local's twin retypes
   the variable to the column's type, so rule 3 holds it.
+
+## The IR verifier checks facts the builder recorded, never legacy's answers (2026-11-22, coordinator ruling) — D17049
+
+**Ruled by the coordinator 2026-11-22**, endorsing the merge queue's position on two PRs (IR-M1's
+RRowRetag design and ir-m1-bundle). The verifier adds no call into emit or checker-emit helpers.
+A fact it needs, such as a global's held rep, is recorded on the IR by the builder (`irGlobalNote`,
+read by `irGlobalRepOf`; `IrFn.irGlobalHeld`) and checked there.
+
+**Why.** At I8 legacy codegen is deleted, and a verifier that asks it has nothing to ask. A check
+that re-asks the builder's own source cannot catch the builder's error. The existing verifier→emit
+edges (30 imports, D17049) are debt to retire before I8, owner IR-D1.
+
+**Applied.** A byte-free record retag between two reps of one legacy row (RRowRetag) is deferred.
+A sound one needs both reps' kids checked against the row's field valtypes by name, and reps carry
+no field names (D622's spelling-versus-layout order). A rep that differs from its row's storage is
+filed or fixed upstream, never retagged.
