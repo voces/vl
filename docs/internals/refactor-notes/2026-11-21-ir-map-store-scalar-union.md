@@ -18,3 +18,9 @@ on the plain arm.
 
 `tests/ir-shadow-rows/map-store-scalar-union-value.vl`: an `i32` literal stored into an `f64` map,
 and an `i32` and a string stored into an `i32 | string` map.
+
+## Also: the append-site ask is a parameter
+
+#9461's `ssAskOnly` was a module flag, which the phase-state census counts as hidden state
+(`compiler/wasmEmit.vl` hidden 16 → 17). `strSiteArmsAt` now takes `ask`, and the asked forms pass
+it through `strInPlaceModeOf` and `strSiteOfRhsOf`, so nesting is safe and no module state is added.
