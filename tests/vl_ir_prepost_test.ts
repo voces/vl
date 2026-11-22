@@ -41,7 +41,9 @@ const compile = (exp: Exports, src: string, mode: number) => {
   const rows = new Map<string, number>();
   for (let i = 0; i < exp.irShadowRowCount(); i++) {
     const b: number[] = [];
-    for (let j = 0; j < exp.irShadowRowLen(i); j++) b.push(exp.irShadowRowAt(i, j));
+    for (let j = 0; j < exp.irShadowRowLen(i); j++) {
+      b.push(exp.irShadowRowAt(i, j));
+    }
     rows.set(String.fromCodePoint(...b), exp.irShadowRowN(i));
   }
   const out: number[] = [];
@@ -70,10 +72,14 @@ for (const [first, second] of PAIRS) {
       const alone = compile(fresh(), read(second), 6);
       const exp = fresh();
       const before = compile(exp, read(first), 6);
-      if (before.rc !== 0) throw new Error(`${first}: want rc 0, got ${before.rc}`);
+      if (before.rc !== 0) {
+        throw new Error(`${first}: want rc 0, got ${before.rc}`);
+      }
       const after = compile(exp, read(second), 6);
       if (alone.rc !== 0 || after.rc !== 0) {
-        throw new Error(`${second}: want rc 0, got ${alone.rc} alone, ${after.rc} after`);
+        throw new Error(
+          `${second}: want rc 0, got ${alone.rc} alone, ${after.rc} after`,
+        );
       }
       const want = rowText(alone.rows);
       const got = rowText(after.rows);
@@ -95,7 +101,9 @@ Deno.test({
       const plain = compile(fresh(), src, 0);
       const checked = compile(fresh(), src, 6);
       if (plain.rc !== 0 || checked.rc !== 0) {
-        throw new Error(`${name}: want rc 0, got ${plain.rc} unarmed, ${checked.rc} under mode 6`);
+        throw new Error(
+          `${name}: want rc 0, got ${plain.rc} unarmed, ${checked.rc} under mode 6`,
+        );
       }
       if (plain.out.join(",") !== checked.out.join(",")) {
         throw new Error(
