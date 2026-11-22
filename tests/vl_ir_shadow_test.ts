@@ -164,6 +164,25 @@ Deno.test({
   },
 });
 
+// A closure thunk's IR lowering under the dual emit's control 3 must report a bytes mismatch;
+// unbroken, each thunk matches legacy's `emitCloThunkCode` (a valued and a void target).
+Deno.test({
+  name: "ir shadow: a closure thunk whose lowering differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    const src = `function sq(x: i32): i32 { return x * x }\nfunction say(x: i32) { print(x) }\n` +
+      `const f: (x: i32) => i32 = sq\nconst g: (x: i32) => void = say\nprint(f(3))\ng(4)\n`;
+    const ok = run(src, true);
+    if (ok.rows.get("thunk fns") !== 2 || ok.rows.get("thunk matched") !== 2) {
+      throw new Error(`want 2 thunks matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    if (rows.get("mismatch bytes: thunk") !== 2 || rows.has("thunk matched")) {
+      throw new Error(`want each thunk a "mismatch bytes: thunk" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
