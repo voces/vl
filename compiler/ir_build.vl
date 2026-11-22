@@ -90,6 +90,7 @@ import {
   SForIn,
   SGlobalSet,
   SIf,
+  SIntSwitch,
   SLet,
   SListSet,
   SLoop,
@@ -121,6 +122,8 @@ import {
 import {
   listRetag,
   listRetagHole,
+  mapBoxReadsAt,
+  mapNicheReadsAt,
   recRetag,
   repBoolNiche,
   repBoxCore,
@@ -161,6 +164,7 @@ import {
   CallRefArgArm,
   FieldStoreValArm,
   GlobalCtx,
+  IntSwitchPlan,
   MapSetValArm,
   ObjLitArm,
   PrintArm,
@@ -251,6 +255,7 @@ import {
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
+  intSwitchPlanOf,
   irEnvCached,
   isArmTagOf,
   isDecidedFalse,
@@ -264,6 +269,8 @@ import {
   mapGetMissOf,
   mapGetOrArmOf,
   mapGetOrMvPlain,
+  mapGetOrNicheStash,
+  mapGetOrUnionBoxOf,
   mapGetOrUnionScalarPlanOf,
   mapKeyArmOf,
   mapNewCall,
@@ -1515,6 +1522,17 @@ function stashSetOf(
     ssK: k,
   }
   return r
+}
+
+// Whether operands built into `b` from `at` on hold a fused `??` map read at the union box form.
+function fusedBoxReadFrom(b: i32[], at: i32): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SCoalBox && n.cbMap != null && n.cbMap.prForm == 5 { return true }
+    i = i + 1
+  }
+  return false
 }
 
 // Whether operands built into `b` from `at` on hold a valued `if` or a boxed `??`, which legacy
@@ -2975,12 +2993,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const g = globalIndexOfSid(sidOfNode(ix))
   if dn is LetDecl && g >= 0 {
     const cellRep = globalRep(g, d)
-    if (
-      cellRep != rep
-      && boxNarrowArmOf(ix, cellRep, rep, identReadArmOf(n, ix, ibFnIx, false))
-        == "atom"
-    ) {
-      return globalUnboxRead(b, g, d, ix, cellRep, rep)
+    // A union cell narrowed to an atom or a record arm unboxes its box, as a local's does.
+    const ba: BoxNarrowArm = if cellRep != rep { boxNarrowArmOf(ix, cellRep, rep, identReadArmOf(n, ix, ibFnIx, false)) } else { "none" }
+    if ba == "atom" || ba == "variant" {
+      return globalUnboxRead(b, g, d, ix, cellRep, rep, ba, -1)
+    }
+    // A union cell narrowed to a ref-element list or a map arm reads unboxed to it.
+    const con = if cellRep != rep { boxContainerReadOf(n, ix, cellRep, rep) } else { -1 }
+    if con >= 0 {
+      return globalUnboxRead(b, g, d, ix, cellRep, rep, "container", con)
     }
     // A union cell (`globalCellKind`) stores the box, which a narrowed read unboxes.
     const narrowed = cellRep != rep
@@ -3328,8 +3349,8 @@ function paramVarAt(w: i32): i32 {
   return -1
 }
 
-// Global `g` (declared at `d`) read at `ix` as the one atom the checker narrowed its union box
-// to, as legacy's `unbox` arm writes it: `emitUnionBoxPush`'s box read, then the atom's unbox.
+// Global `g` (declared at `d`) read at `ix` as the atom, record or container arm (`ba`, `con`) the
+// checker narrowed its union box to: `emitUnionBoxPush`'s box read, then legacy's unbox to it.
 function globalUnboxRead(
   b: i32[],
   g: i32,
@@ -3337,14 +3358,18 @@ function globalUnboxRead(
   ix: i32,
   cellRep: i32,
   rep: i32,
+  ba: BoxNarrowArm,
+  con: i32,
 ): Opnd {
-  const ak = identUnboxAtomOf(ix, ibFnIx)
-  if ak < 0 { return irBMiss("narrowed read dead") }
+  // A record arm's payload is the box cast to the arm (`bnAtom` -1), a container arm's the box
+  // unboxed to it (`bnCon`), as a local's read writes them.
+  const ak = if ba == "atom" { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
+  if ba == "atom" && ak < 0 { return irBMiss("narrowed read dead") }
   const box = globalBoxAt(b, g, d, ix, cellRep)
   if ibMiss != "" { return box }
   return irBLetTemp(
     b,
-    { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
+    { bnV: box, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: con },
     ix,
     rep,
   )
@@ -4779,6 +4804,11 @@ function printStmt(b: i32[], c: Call, ix: i32) {
   // would sit above them.
   if want == "nulStr" && ifBelowLead(b, from, "print nulStr of a valued if") {
     return 0
+  }
+  // Legacy takes a box's print slot before its operand; a fused union box map read is written in
+  // place, so its locals would come first.
+  if want == "union" && fusedBoxReadFrom(b, from) {
+    return skip("print union of a fused map read")
   }
   const vr = irBOpRep(v)
   const p = repPrim(vr)
@@ -7014,6 +7044,26 @@ function strInnerOf(r: i32): i32 {
   return -1
 }
 
+// The value rep of map rep `mrep`, or -1 for no map.
+function mapValRepOf(mrep: i32): i32 {
+  const mr = repNodeAt(mrep)
+  return if mr is RMap { mr.rmVal } else { -1 }
+}
+
+// Why a union map read's box-arm default is not boxed into the slot's union at value rep `vr`, or
+// "": never from another union's box, the map store's own guard.
+function mapGetOrBoxDefaultMiss(def: i32, vr: i32, sh: i32): string {
+  if exprUnion(def, ibFnIx) && boxIntoOtherUnion(def, vr, mvValTyIxAt(sh)) {
+    return "map read union default from a box"
+  }
+  return ""
+}
+
+// The rep of map read receiver `rcv`: its global's cell or its operand.
+function rcvMapRep(rcv: MapRecvKey): i32 {
+  return if rcv.mkSym >= 0 { irGlobalRepOf(ib, rcv.mkSym) } else { irBOpRep(rcv.mkLoc) }
+}
+
 // Why a null-free union map value read under `??` at `rep` is not the plain mv arm's read, or "":
 // the read is the slot's box and the default boxes into it as `emitMapValDefault` does, never
 // from another union's box.
@@ -7023,9 +7073,7 @@ function mapGetOrUnionMiss(
   rep: i32,
   sh: i32,
 ): string {
-  const mr = repNodeAt(
-    if rcv.mkSym >= 0 { irGlobalRepOf(ib, rcv.mkSym) } else { irBOpRep(rcv.mkLoc) },
-  )
+  const mr = repNodeAt(rcvMapRep(rcv))
   if !(mr is RMap) || mr.rmVal != rep { return "map read union rep" }
   if exprUnion(def, ibFnIx) && boxIntoOtherUnion(def, rep, mvValTyIxAt(sh)) {
     return "map read union default from a box"
@@ -7048,7 +7096,16 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   // A `scalar | null` union value peels to its scalar, the default in the result's kind.
   const uq = if arm == "mv" && !mv { mapGetOrUnionScalarPlanOf(mapRecvShapeOf(rd.idxArr, ibFnIx), n.binRight, rk) } else { null }
   const mvu = uq != null && uq.muKind >= 0
-  if arm != "helper" && arm != "i32" && !mv && !mvu {
+  const nz = arm == "mv"
+    && !mv
+    && !mvu
+    && mapGetOrNicheStash(rd.idxArr, n.binRight, ibFnIx)
+  const bx = arm == "mv"
+    && !mv
+    && !mvu
+    && !nz
+    && mapGetOrUnionBoxOf(mapRecvShapeOf(rd.idxArr, ibFnIx), n.binRight)
+  if arm != "helper" && arm != "i32" && !mv && !mvu && !nz && !bx {
     return irBMiss("map read " + arm)
   }
   const inline = arm != "helper"
@@ -7061,7 +7118,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if ka != "plain" { return irBMiss("map key " + ka) }
   const rp = repPrim(rep)
   const uk = if uq != null { uq.muWide } else { -1 }
-  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32" || arm == "i32" && rp == "bool" || mv }
+  const repOk = if mvu { irBAtomKindRep(uk, rep) } else { rp == "i32" || arm == "i32" && rp == "bool" || mv || nz || bx }
   if !repOk { return irBMiss("map read rep") }
   // A default the miss arm writes as a body leaves the read's value on the stack from here.
   const clear = !endsInTemp(b)
@@ -7073,12 +7130,26 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const ub = mv && mvValKindAt(sh) == "union"
   const um = if ub { mapGetOrUnionMiss(rcv, n.binRight, rep, sh) } else { "" }
   if um != "" { return irBMiss(um) }
-  const dv: Opnd = if ub { deliver(db, n.binRight, rep, mvValTyIxAt(sh)) } else if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
+  if nz && !mapNicheReadsAt(rcvMapRep(rcv), rep) {
+    return irBMiss("map read niche rep")
+  }
+  if bx && !mapBoxReadsAt(rcvMapRep(rcv), rep) {
+    return irBMiss("map read box rep")
+  }
+  // The box arm's default is boxed into the slot's union, the map's value rep.
+  const bv = if bx { mapValRepOf(rcvMapRep(rcv)) } else { -1 }
+  const bm = if bx { mapGetOrBoxDefaultMiss(n.binRight, bv, sh) } else { "" }
+  if bm != "" { return irBMiss(bm) }
+  const dv: Opnd = if ub { deliver(db, n.binRight, rep, mvValTyIxAt(sh)) } else if bx { deliver(db, n.binRight, bv, mvValTyIxAt(sh)) } else if inline { irBExpr(db, n.binRight) } else { { oiRep: rep, oiBits: 0 } }
   if ibMiss != "" { return dv }
-  if irBOpRep(dv) != rep { return irBMiss("map read default rep") }
-  const form = if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
+  if irBOpRep(dv) != (if bx { bv } else { rep }) {
+    return irBMiss("map read default rep")
+  }
+  const form = if bx { 5 } else if nz { 4 } else if mvu { 3 } else if mv { 2 } else if inline { 1 } else { 0 }
   if !defaultSelfContained(db, 0, dv) {
     if !clear { return irBMiss("map read default after an operand") }
+    // A fused read's default is its out, so the box arm fuses only at the value's own rep.
+    if bx && bv != rep { return irBMiss("map read box default computes") }
     return mapGetOrBox(
       b,
       db,
@@ -7316,6 +7387,12 @@ function nodeAssigns(ni: i32, v: i32): boolean {
         if bodyAssigns(arm.swBody, v) { return true }
       }
       false
+    }
+    SIntSwitch => {
+      for arm in n.isArms {
+        if bodyAssigns(arm, v) { return true }
+      }
+      bodyAssigns(n.isElse, v)
     }
     SLet | SSetField | SListSet | SCellSet | SGlobalSet | SBoundsCheck | SEffect | SBr | SReturn | STrap | SDrop | SRawOp => false
   }
@@ -8699,10 +8776,18 @@ function ifChain(b: i32[], ix: i32) {
   let cur = ix
   let out = b
   let lastElse = -1
+  // A link legacy writes as a `br_table` takes the rest of the chain, and is the last link's else.
+  let sw = false
   while true {
     const n = nodeAt(cur)
     if !(n is IfStmt) { return skip("condition") }
-    if intSwitchMayLower(cur) { return skip("if switch") }
+    const p = if intSwitchMayLower(cur) { intSwitchPlanOf(cur, ibFnIx) } else { null }
+    if p != null {
+      intSwitch(out, cur, p, false)
+      if ibMiss != "" || links.length == 0 { return 0 }
+      sw = true
+      break
+    }
     // A decided `is` guard: legacy reads its constant back and writes no then arm (D932). A
     // tag the box lacks is never a covering test, so the arm is not one legacy writes dead.
     const decided = isDecidedFalse(n.ifCond, ibFnIx)
@@ -8748,7 +8833,7 @@ function ifChain(b: i32[], ix: i32) {
   // A dead `else` (`ifWritesElse`) is neither written nor counted by legacy, so it is not built.
   const ll = nodeAt(links[links.length - 1])
   const deadElse = ll is IfStmt && lastElse >= 0 && !ifWritesElse(ll)
-  let elseB = if deadElse { [] } else { bodyOf(elseStmts(lastElse)) }
+  let elseB = if sw { out } else if deadElse { [] } else { bodyOf(elseStmts(lastElse)) }
   let k = links.length - 1
   while k >= 0 {
     const kw = kws[k]
@@ -8770,6 +8855,36 @@ function elseStmts(e: i32): i32[] {
   const en = nodeAt(e)
   if en is Block { return en.blkStmts }
   return [e]
+}
+
+// The integer `match` chain at `ix` that `p` plans as one `br_table`: legacy reads the place itself,
+// twice when 64-bit, so its operand is the place's variable. A tail chain's arms return their
+// last value (`tailArm`); a statement chain's are statement lists, as `emitSwitchArm` writes them.
+function intSwitch(b: i32[], ix: i32, p: IntSwitchPlan, tail: boolean) {
+  const n0 = b.length
+  const on = irBExpr(b, p.ispOn)
+  if ibMiss != "" { return 0 }
+  if b.length != n0 || !(on is OVar) || on.ov < 0 || on.ov >= ib.irVars.length {
+    return skip("int switch scrutinee")
+  }
+  if ib.irVars[on.ov].vKind == "temp" { return skip("int switch scrutinee") }
+  const arms: i32[][] = []
+  for t in p.ispThens {
+    arms.push(if tail { tailArm(t) } else { bodyOf(elseStmts(t)) })
+  }
+  const els = if p.ispElse < 0 { [] } else if tail { tailArm(p.ispElse) } else { bodyOf(elseStmts(p.ispElse)) }
+  if ibMiss != "" { return 0 }
+  const sn: SIntSwitch = {
+    isTail: tail,
+    isOn: on,
+    isWide: p.ispWide,
+    isLo: p.ispLo,
+    isTable: p.ispTable,
+    isArms: arms,
+    isElse: els,
+  }
+  irBNode(b, sn, -1, ibNoValue, ix)
+  return 0
 }
 
 // The sibling list of a statement built outside a statement list; its position is -1.
@@ -9148,7 +9263,12 @@ function tailIf(b: i32[], ix: i32) {
   const n = nodeAt(ix)
   if !(n is IfStmt) { return skip("tail if node") }
   const why = tailIfPlainWhy(ix, ibFnIx)
-  if why != "" { return skip(why) }
+  if why == "tail if switch" {
+    const p = intSwitchPlanOf(ix, ibFnIx)
+    if p != null { return intSwitch(b, ix, p, true) }
+  } else if why != "" {
+    return skip(why)
+  }
   // A decided `false` `is` writes no then arm (`emitGuardCond`); another constant `is` is one
   // legacy decides off its bytes, so it is a miss.
   const decided = isDecidedFalse(n.ifCond, ibFnIx)
