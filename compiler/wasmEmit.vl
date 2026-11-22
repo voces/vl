@@ -7370,7 +7370,7 @@ function emitNarrowedMem(memIx: i32, fnIx: i32) {
 }
 
 // Is the `?.` chain base at `exprIx` the one currently staged in `optRecvSlot`?
-function optRecvStagedAt(exprIx: i32): boolean {
+export function optRecvStagedAt(exprIx: i32): boolean {
   if optRecvStagedIx < 0 { return false }
   return optRecvStagedIx == unwrapParen(exprIx)
 }
@@ -42946,7 +42946,7 @@ function emitCoalesceIdentBox(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
     )
     "callNoKind" => emitFail("emitProgram: `??` over a call result has no banked residual kind")
     "next" => {
-      if coalNulRefRungReached(e, lhsIx, fnIx) {
+      if coalNextArmOf(e, lhsIx, exprIx, fnIx) == "nulRefs" {
         emitCoalesceNullableRefs(e, exprIx, fnIx)
       } else {
         emitCoalesceCallNiche(e, lhsIx, exprIx, fnIx)
@@ -43217,22 +43217,40 @@ export function coalBoxEnd(
   return 0
 }
 
+// Which rung `l ?? d` takes past the boxed arms (`coalBoxArmOf`'s `next`), in legacy's order: a
+// name's or a plain call's nullable-reference cores, a call's `boolean | null` or `string | null`
+// stash, a record field's union box (`coalFieldPlanOf`), else the optional chains and the rest.
+export type CoalNextArm = "nulRefs" | "callBool" | "callStr" | "field" | "opt"
+
+export function coalNextArmOf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNextArm {
+  if coalNulRefRungReached(e, lhsIx, fnIx) { return "nulRefs" }
+  const lhs = nodeAt(lhsIx)
+  const cTy = coalStashTy(lhsIx)
+  const stashed = lhs is Call
+    || ((lhs is AsExpr || lhs is IfStmt)
+    && (tyIsNulValueUnionBox(cTy) || nodeTyIsNulScalarBox(lhsIx)))
+  if stashed && exprNulBool(e.binLeft, fnIx) { return "callBool" }
+  if stashed && exprNullableString(e.binLeft, fnIx) { return "callStr" }
+  const fp = coalFieldPlanOf(e, lhsIx, exprIx, fnIx)
+  return if lhs is Member && fp.cfArm != "none" { "field" } else { "opt" }
+}
+
 // The `emitCoalesceGo` arms over a call, `as?` or if-expression operand yielding a
 // `boolean | null` or `string | null` niche, stashed once, then the rest of the ladder. Returns
 // what `emitCoalesceGo` returns.
 function emitCoalesceCallNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
-  const lhs = nodeAt(lhsIx)
-  const cTy = coalStashTy(lhsIx)
-  if (
-    lhs is Call
-    || ((lhs is AsExpr || lhs is IfStmt)
-      && (tyIsNulValueUnionBox(cTy) || nodeTyIsNulScalarBox(lhsIx)))
-  ) {
+  const na = coalNextArmOf(e, lhsIx, exprIx, fnIx)
+  if na == "callBool" || na == "callStr" {
     // `f() ?? d` over a CALL returning `boolean | null` (the i32 niche): a call cannot be
     // re-read, so STASH the single evaluation in the bool slot, then branch on the sentinel
     // 2 — the call analogue of the `boolean | null` ident path, and the default runs only on
     // the null path for the same reason.
-    if exprNulBool(e.binLeft, fnIx) {
+    if na == "callBool" {
       if emitExpr(e.binLeft, fnIx) < 0 {
         return -1 // the niche i32, evaluated ONCE
       }
@@ -43253,7 +43271,7 @@ function emitCoalesceCallNiche(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
     // ref once (raw, by its type), then a value-typed `if` on
     // `ref.is_null` selects `d` or the recovered non-null string — the call analogue
     // of the `string | null` ident path.
-    if exprNullableString(e.binLeft, fnIx) {
+    if na == "callStr" {
       // the raw nullable ref, ONCE
       if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
       fbLocalSet(coalesceCallStrSlot)
@@ -43564,6 +43582,17 @@ function emitCoalesceOptNulRecord(
 ) {
   const nfi = sFieldIndex(nsi, lhs.omProp)
   if nfi < 0 { return emitFail("emitProgram: `?.` field is not on the struct") }
+  // A scalar or string leaf: null selects the default, else the field off the receiver.
+  const lp = coalOptLeafPlanOf(lhs, nsi)
+  const leaf = lp.olLeaf
+  if leaf != null {
+    if emitOptRecvBase(lhs.omObj, fnIx, false) < 0 { return -1 }
+    coalOptLeafOpen(lp)
+    if emitOptLeafDefault(e.binRight, leaf, fnIx) < 0 { return -1 }
+    fbElse() // 0x05 else — present → the field
+    if emitOptRecvBase(lhs.omObj, fnIx, true) < 0 { return -1 }
+    return coalOptLeafRead(lp)
+  }
   // Both arms of this `if` yield the field's rep, so its blocktype spells that rep
   // (`fbIfForOptLeaf`), not a fixed `i32`.
   const nfRow = sFieldFlatRow(nsi, nfi)
@@ -43612,24 +43641,54 @@ function emitCoalesceOptNulRecord(
     }
     return emitCoalesceNulRef(e, exprIx, mapTypeIdxOf(nms), fnIx)
   }
-  const nfLeaf = optLeafKindOf(
+  return emitFailAt(
+    "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
+    exprIx,
+  )
+}
+
+// The scalar or string leaf `emitCoalesceOptNulRecord` reads `p?.f` at over nullable struct row
+// `nsi`: its heap, field and `if` kind (`optLeafKindOf`), or a null `olLeaf` for any other field
+// (a record, a box, a closure or a map, each its own core, or a field with no `if` blocktype).
+export type CoalOptLeafPlan = { olHeap: i32, olFi: i32, olLeaf: VKind | null }
+
+export function coalOptLeafPlanOf(lhs: OptMember, nsi: i32): CoalOptLeafPlan {
+  const no: CoalOptLeafPlan = { olHeap: -1, olFi: -1, olLeaf: null }
+  if nsi < 0 || nsi >= sHeapIdx.length { return no }
+  const nfi = sFieldIndex(nsi, lhs.omProp)
+  if nfi < 0 { return no }
+  const nfRow = sFieldFlatRow(nsi, nfi)
+  const k = fieldRowKind(nfRow)
+  if (
+    eqKindIsRecord(k)
+    || k == "union"
+    || k == "closure"
+    || k == "nulclosure"
+    || k == "map"
+    || k == "nulmap"
+  ) {
+    return no
+  }
+  const leaf = optLeafKindOf(
     fieldRowNumKind(nfRow),
     fieldRowIsStr(nfRow, false),
   )
-  if nfLeaf == null {
-    return emitFailAt(
-      "emitProgram: `?.` over a nullable struct has no `if` blocktype for this field's rep",
-      exprIx,
-    )
-  }
-  if emitOptRecvBase(lhs.omObj, fnIx, false) < 0 { return -1 }
+  const p: CoalOptLeafPlan = { olHeap: sHeapIdx[nsi], olFi: nfi, olLeaf: leaf }
+  return p
+}
+
+// After the receiver: its null test, opening the `if` of plan `p`'s leaf rep.
+export function coalOptLeafOpen(p: CoalOptLeafPlan) {
   fbRefIsNull()
-  fbIfForOptLeaf(nfLeaf) // if (result <the field's own rep>)
-  if emitOptLeafDefault(e.binRight, nfLeaf, fnIx) < 0 { return -1 }
-  fbElse()               // 0x05 else — present → the field
-  if emitOptRecvBase(lhs.omObj, fnIx, true) < 0 { return -1 }
-  fbStructGet(nHeap, nfi)
-  fbEnd()                // 0x0b end
+  if p.olLeaf != null {
+    fbIfForOptLeaf(p.olLeaf) // if (result <the field's own rep>)
+  }
+}
+
+// After the receiver again, in the present arm: the field, and the `if`'s end.
+export function coalOptLeafRead(p: CoalOptLeafPlan): i32 {
+  fbStructGet(p.olHeap, p.olFi)
+  fbEnd() // 0x0b end
   return 0
 }
 
@@ -43740,92 +43799,118 @@ function emitCoalesceOptMapField(
 // nullable record, a nested chain and a list `.get`. Returns what `emitCoalesceGo` returns.
 function emitCoalesceOptMember(e: BinExpr, lhsIx: i32, exprIx: i32, fnIx: i32) {
   const lhs = nodeAt(lhsIx)
-  // The null-safe field read `m[k]?.f ?? d` over a struct-valued map is the fused form: probe;
-  // on a hit read the field off the (non-null) value struct, else push the default. A live
-  // entry's value slot is never null, so the `?.` null test coincides with the probe's hit
-  // test. A field whose rep has an `if` blocktype only (`optLeafKindOf`).
-  if lhs is OptMember {
-    const omInner = nodeAt(lhs.omObj)
-    if omInner is Index {
-      if exprMap(omInner.idxArr, fnIx) {
-        const omSl = mapShapeOfExpr(omInner.idxArr, fnIx)
-        if omSl >= 0 {
-          return emitCoalesceOptMapField(e, lhs, omInner, omSl, fnIx)
-        }
-      }
+  const arm = coalOptArmOf(lhsIx, fnIx)
+  if !(lhs is OptMember) || arm == "next" {
+    return emitCoalesceNullableRefs(e, exprIx, fnIx)
+  }
+  return match arm {
+    // The null-safe field read `m[k]?.f ?? d` over a struct-valued map is the fused form: probe;
+    // on a hit read the field off the (non-null) value struct, else push the default.
+    "mapField" => {
+      const omInner = nodeAt(lhs.omObj)
+      if !(omInner is Index) { return -1 }
+      emitCoalesceOptMapField(
+        e,
+        lhs,
+        omInner,
+        mapShapeOfExpr(omInner.idxArr, fnIx),
+        fnIx,
+      )
     }
-    // `p?.f ?? d` over a nullable-struct receiver (`p: S | null`, or a nullable-struct field
-    // read `n.next`): null selects the default, else the field read off the (non-null) struct.
-    // The receiver is read two or three times here, from `optRecvSlot` when it is a call and
-    // in place when it is a name. Scalar fields only (the value-typed `if` blocktype).
-    if exprNullableStruct(lhs.omObj, fnIx) {
+    // `p?.f ?? d` over a nullable-struct receiver: null selects the default, else the field read
+    // off the (non-null) struct.
+    "nulRecord" => {
       const nsi = structIndexOfExpr(lhs.omObj, fnIx)
-      if nsi >= 0 {
-        return emitCoalesceOptNulRecord(
-          e,
-          lhs,
-          nsi,
-          sHeapIdx[nsi],
-          exprIx,
-          fnIx,
+      if nsi < 0 || nsi >= sHeapIdx.length { return -1 }
+      emitCoalesceOptNulRecord(e, lhs, nsi, sHeapIdx[nsi], exprIx, fnIx)
+    }
+    "nulVariant" => emitCoalesceOptNulVariant(e, lhs, nulVariantIdxOfExpr(lhs.omObj, fnIx), fnIx)
+    // A nested optional chain `o?.inner?.v ?? d` (niche nullable links): any null link selects
+    // the default; otherwise the chain reads through non-null refs. Scalar (i32/boolean) leaf
+    // fields only (the value-typed `if` blocktype).
+    "deep" => {
+      const dsi = optChainStructIdxOf(lhs.omObj, fnIx)
+      if dsi < 0 || dsi >= sHeapIdx.length { return -1 }
+      const dfi = sFieldIndex(dsi, lhs.omProp)
+      if !sFieldIsPlainI32(dsi, dfi) {
+        return emitFail(
+          "emitProgram: `?.` chain supports only i32/boolean leaf fields",
         )
       }
+      if emitOptChainIsNull(lhs.omObj, fnIx) < 0 { return -1 }
+      fbIf(127) // 0x04 if, i32 result — a null link → default
+      if emitExpr(e.binRight, fnIx) < 0 { return -1 }
+      fbElse()  // 0x05 else — every link present → the leaf
+      if emitOptChainValue(lhs.omObj, fnIx) < 0 { return -1 }
+      fbStructGet(sHeapIdx[dsi], dfi)
+      fbEnd()   // 0x0b end
+      0
     }
-    const nvi = nulVariantIdxOfExpr(lhs.omObj, fnIx)
-    if nvi >= 0 { return emitCoalesceOptNulVariant(e, lhs, nvi, fnIx) }
-    // A nested optional chain `o?.inner?.v ?? d` (niche nullable links): any null link selects
-    // the default; otherwise the chain reads through non-null refs (each `S | null` link
-    // recovers `ref.as_non_null`). The links are effect-free places, re-evaluated in the value
-    // arm. Scalar (i32/boolean) leaf fields only (the value-typed `if` blocktype).
-    const omDeep = nodeAt(unwrapParen(lhs.omObj))
-    if omDeep is OptMember {
-      const dsi = optChainStructIdxOf(lhs.omObj, fnIx)
-      if dsi >= 0 {
-        const dfi = sFieldIndex(dsi, lhs.omProp)
-        if dfi >= 0 {
-          if !sFieldIsPlainI32(dsi, dfi) {
-            return emitFail(
-              "emitProgram: `?.` chain supports only i32/boolean leaf fields",
-            )
-          }
-          if emitOptChainIsNull(lhs.omObj, fnIx) < 0 { return -1 }
-          fbIf(127) // 0x04 if, i32 result — a null link → default
-          if emitExpr(e.binRight, fnIx) < 0 { return -1 }
-          fbElse()  // 0x05 else — every link present → the leaf
-          if emitOptChainValue(lhs.omObj, fnIx) < 0 { return -1 }
-          fbStructGet(sHeapIdx[dsi], dfi)
-          fbEnd()   // 0x0b end
-          return 0
-        }
-      }
-    }
-    // `xs.get(i)?.f ?? d` over a struct-element ref list is the fused form: one bounds
-    // compare; in range read the field off the (non-null) element, else the default. A live
-    // in-range element is never null, so the `?.` null test coincides with the bounds test —
-    // mirroring the map `m[k]?.f ?? d` path above. Scalar fields only.
-    const omGet = nodeAt(unwrapParen(lhs.omObj))
-    if omGet is Call {
-      if omGet.callFn < 0 { return -1 }
+    "badCall" => -1
+    // `xs.get(i)?.f ?? d` over a struct-element ref list is the fused form: one bounds compare;
+    // in range read the field off the (non-null) element, else the default.
+    "listGet" => {
+      const omGet = nodeAt(unwrapParen(lhs.omObj))
+      if !(omGet is Call) { return -1 }
+      if omGet.callFn < 0 || omGet.callFn >= P.nodes.length { return -1 }
       const gCallee = nodeAt(omGet.callFn)
-      if gCallee is Member {
-        if gCallee.memProp == "get" {
-          const gSi = structListPopGetElem(unwrapParen(lhs.omObj), fnIx)
-          if gSi >= 0 && rlRowsMinted() {
-            return emitCoalesceOptListGet(
-              e,
-              lhs,
-              omGet,
-              gCallee,
-              gSi,
-              sHeapIdx[gSi],
-              fnIx,
-            )
-          }
-        }
-      }
+      if !(gCallee is Member) { return -1 }
+      const gSi = structListPopGetElem(unwrapParen(lhs.omObj), fnIx)
+      if gSi < 0 || gSi >= sHeapIdx.length { return -1 }
+      emitCoalesceOptListGet(e, lhs, omGet, gCallee, gSi, sHeapIdx[gSi], fnIx)
     }
+    "next" => emitCoalesceNullableRefs(e, exprIx, fnIx)
   }
-  return emitCoalesceNullableRefs(e, exprIx, fnIx)
+}
+
+// Which arm `emitCoalesceOptMember` writes `p?.f ?? d` (`lhsIx`) along, in its order: a struct-
+// valued map's fused field read, a nullable record's or union arm's field, a nested chain's
+// leaf, a ref list's fused `.get` field, a call with no callee (`badCall`), else the next rungs.
+export type CoalOptArm = "mapField"
+  | "nulRecord"
+  | "nulVariant"
+  | "deep"
+  | "badCall"
+  | "listGet"
+  | "next"
+
+export function coalOptArmOf(lhsIx: i32, fnIx: i32): CoalOptArm {
+  const lhs = nodeAt(lhsIx)
+  if !(lhs is OptMember) { return "next" }
+  const omInner = nodeAt(lhs.omObj)
+  if (
+    omInner is Index
+    && exprMap(omInner.idxArr, fnIx)
+    && mapShapeOfExpr(omInner.idxArr, fnIx) >= 0
+  ) {
+    return "mapField"
+  }
+  if exprNullableStruct(lhs.omObj, fnIx) {
+    const nsi = structIndexOfExpr(lhs.omObj, fnIx)
+    if nsi >= 0 && nsi < sHeapIdx.length { return "nulRecord" }
+  }
+  if nulVariantIdxOfExpr(lhs.omObj, fnIx) >= 0 { return "nulVariant" }
+  if coalOptDeepOk(lhs, fnIx) { return "deep" }
+  return coalOptCallArmOf(lhs, fnIx)
+}
+
+// Whether `p?.f`'s receiver is itself a `?.` link whose chain names a struct holding `f`.
+function coalOptDeepOk(lhs: OptMember, fnIx: i32): boolean {
+  if !(nodeAt(unwrapParen(lhs.omObj)) is OptMember) { return false }
+  const dsi = optChainStructIdxOf(lhs.omObj, fnIx)
+  return dsi >= 0 && sFieldIndex(dsi, lhs.omProp) >= 0
+}
+
+// `p?.f ?? d`'s arm over a call receiver: no callee, a ref list's fused `.get`, else the next.
+function coalOptCallArmOf(lhs: OptMember, fnIx: i32): CoalOptArm {
+  const c = nodeAt(unwrapParen(lhs.omObj))
+  if !(c is Call) { return "next" }
+  if c.callFn < 0 { return "badCall" }
+  if c.callFn >= P.nodes.length { return "next" }
+  const gCallee = nodeAt(c.callFn)
+  if !(gCallee is Member) || gCallee.memProp != "get" { return "next" }
+  const gSi = structListPopGetElem(unwrapParen(lhs.omObj), fnIx)
+  return if gSi >= 0 && gSi < sHeapIdx.length && rlRowsMinted() { "listGet" } else { "next" }
 }
 
 // The last `emitCoalesceGo` arms, the nullable-ref cores (a union arm, a record, a value-union
