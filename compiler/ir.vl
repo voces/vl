@@ -99,9 +99,15 @@ export type RTest = { teV: Opnd, teTag: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
 // A shared field read `srAt` over un-narrowed box `srV`, dispatched on its tag per member (legacy's
-// `emitMemSharedRead`): a box local read twice an arm, or with `srStash` a receiver read once into
-// legacy's stash slot.
-export type RSharedRead = { srV: Opnd, srAt: i32, srStash: boolean }
+// `emitMemSharedRead`): a box local read twice an arm, module global `srGlobal` (not -1, `srV`
+// unread) read the same way, or with `srStash` a receiver read once into legacy's stash slot.
+export type RSharedRead = {
+  srV: Opnd,
+  srAt: i32,
+  srStash: boolean,
+  srGlobal: i32,
+  srGlobalNonNull: boolean,
+}
 // A box local read at the variant its narrowing names (`narrowedBoxVariantPlain`), whose record is
 // `bnRep`, the destination's; or, with `bnAtom` an atom kind (`identUnboxAtomOf`), read unboxed to
 // that atom, -1 otherwise. `bnAt` the read.
@@ -311,6 +317,9 @@ export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
 // `liV` at literal arm `liArm` of `is` test `liAt` (`litIsArmOf`), read once per member the arm
 // compares, as `emitIsTestLitArms` writes it: a bool.
 export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
+// `niV is K` over a numeric literal union at `is` test `niAt`, along `numIsPlanOf`: the receiver read
+// once into a slot, or once per member.
+export type RNumIs = { niV: Opnd, niAt: i32 }
 // A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
 // (`numIntrPlanOf`).
 // A binary operator at node `nbAt` on legacy's `numUnion` route, over its non-literal sides in
@@ -363,8 +372,16 @@ export type RMapHas = {
   mhAt: i32,
 }
 // A `==`/`!=` at node `seAt` on legacy's field-wise record compare over eq row `seRow` (a struct's
-// or a variant's): an operand legacy stashes is lowered once; one it re-reads is a variable.
-export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32, seRow: i32 }
+// or a variant's): an operand legacy stashes is lowered once; one it re-reads at every field is a
+// variable, or with `seLIx`/`seRIx` holding an index, a ref list element read over that variable.
+export type RStructEq = {
+  seL: Opnd,
+  seR: Opnd,
+  seAt: i32,
+  seRow: i32,
+  seLIx: Opnd[],
+  seRIx: Opnd[],
+}
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
@@ -452,6 +469,7 @@ export type Rhs = RAsUnion
   | RNullOf
   | RNumCast
   | RNumIntr
+  | RNumIs
   | RNumUnionBin
   | RNumWiden
   | RPrimOp
@@ -1147,7 +1165,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapIter => [r.miV]
     RPrint => [r.pnV]
     RStrOp => r.soArgs
-    RStructEq => [r.seL, r.seR]
+    RStructEq => opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx))
     RNumWiden => [r.nwV]
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
@@ -1172,6 +1190,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
     RLitArms => [r.liV]
+    RNumIs => [r.niV]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
     RUnionEq => [r.ueL, r.ueR]
     RListEq => [r.qeL, r.qeR]
@@ -1282,6 +1301,7 @@ function rhsText(r: Rhs): string {
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
+    RNumIs => "num is " + opndText(r.niV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
     RNumUnionBin => "num_union(" + opndsText(r.nbArgs) + ")"
     RSimd => "simd(" + opndsText(r.sdArgs) + ")"
@@ -1290,7 +1310,9 @@ function rhsText(r: Rhs): string {
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
     RMapIter => (if r.miVals { "map.values " } else { "map.keys " }) + opndText(r.miV)
     RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
-    RStructEq => "struct_eq(" + opndsText([r.seL, r.seR]) + ")"
+    RStructEq => "struct_eq("
+      + opndsText(opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx)))
+      + ")"
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RCellNew => "cell " + opndText(r.cnInit)
@@ -1549,6 +1571,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RNullOf |
       RNumCast |
       RNumIntr |
+      RNumIs |
       RNumUnionBin |
       RNumWiden |
       RPrimOp |
@@ -1565,11 +1588,14 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RCoerce |
       RListCat |
       RListClear |
+      RListCopy |
       RListEmpty |
       RListEmptyArms |
       RListEq |
       RListGet |
       RListLen |
+      RListNew |
+      RListNewDefault |
       RListPop |
       RListPush |
       RListSlice |
@@ -1605,9 +1631,6 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCellNew |
       RClosureEq |
       RFnId |
-      RListCopy |
-      RListNew |
-      RListNewDefault |
       RStructEq |
       RTagOf => "other"
     RAtomic |
