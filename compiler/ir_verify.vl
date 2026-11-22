@@ -542,6 +542,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RSharedRead => {
+      // A global receiver is read again at each push; its recorded cell is the box, `srV` unread.
+      if r.srGlobal >= 0 {
+        if !boxShaped(irGlobalRepOf(vf, r.srGlobal)) {
+          return fail(2, at, "a shared read's global receiver is a box")
+        }
+        if !(r.srV is OImm) {
+          return fail(2, at, "a shared read's global receiver has no operand")
+        }
+        return 0
+      }
       use(r.srV, at)
       // Unstashed, every arm reads the receiver twice, and a temp is read once.
       if (
@@ -1291,8 +1301,20 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RStructEq => {
       uses([r.seL, r.seR], at)
+      uses(r.seLIx, at)
+      uses(r.seRIx, at)
       if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
         return fail(2, at, "a record compare's operands are references")
+      }
+      for ixs in [r.seLIx, r.seRIx] {
+        for o in ixs {
+          if repPrim(opRep(o)) != "i32" {
+            return fail(2, at, "a record compare's element index is an i32")
+          }
+        }
+      }
+      if r.seLIx.length > 1 || r.seRIx.length > 1 {
+        return fail(2, at, "a record compare's element read has one index")
       }
       if dst >= 0 && repPrim(dst) != "bool" {
         return fail(2, at, "a record compare's answer is a bool")
@@ -1644,7 +1666,8 @@ function coalPopOrWhy(n: SCoalBox): string {
 }
 
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1) or mv (2), into an out of the read's own rep.
+// key along an inline form, `i32` (1), mv (2) or a scalar union value's (3), into an out of the read's
+// own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
   if mp == null { return "a fused map read holds no probe" }
@@ -1652,7 +1675,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm != 1 && mp.prForm != 2 {
+  if mp.prForm < 1 || mp.prForm > 3 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1669,6 +1692,10 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   )
   if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
     return "a map read's mv slot yields no value of its map"
+  }
+  // A union value's read peels to its scalar.
+  if mp.prForm == 3 && (!(mr is RMap) || p == null) {
+    return "a map read's union value peels to no scalar"
   }
   return ""
 }

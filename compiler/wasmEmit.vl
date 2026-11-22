@@ -10996,7 +10996,15 @@ function emitNestedShapeEq(vi: i32, ufi: i32) {
   eqStashR = nr
   const pathSi: i32[] = []
   const pathFi: i32[] = []
-  const r = emitStructEqRec(-2, -3, row, pathSi, pathFi, fnIxOfNothing())
+  const r = emitStructEqRec(
+    -2,
+    -3,
+    row,
+    pathSi,
+    pathFi,
+    fnIxOfNothing(),
+    EQ_ROOTS_EXPR,
+  )
   eqStashL = savedL
   eqStashR = savedR
   return r
@@ -14274,7 +14282,100 @@ export function mapPrepProbeTail() {
 // (miss → the null-tagged box), then coalesce on its null tag — `scalar | null` peels to the
 // raw scalar, widened to `rk` (the `??`'s atom kind, -1 none) when that is wider, and a
 // multi-member `… | null` peels to the non-null union box.
+export type MapUnionPlan = { muKind: i32, muWide: i32, muVb: i32 }
+
+// The scalar plan of `m[k] ?? d` over boxed union-valued mv slot `mslot`, a `scalar | null` value
+// with a non-nullable default: the scalar's kind, the result kind it widens to (`rk` where wider),
+// and its value box; `muKind` -1 for any other value or default.
+export function mapGetOrUnionScalarPlanOf(
+  mslot: i32,
+  defIx: i32,
+  rk: i32,
+): MapUnionPlan {
+  const no: MapUnionPlan = { muKind: -1, muWide: -1, muVb: -1 }
+  if mslot < 0 || mvValKindAt(mslot) != "union" || !mvValUnionHasNull(mslot) {
+    return no
+  }
+  const mtys: i32[] = []
+  const uvsid = msSetOfTy(mvValTyIxAt(mslot))
+  if (
+    !msMemberTysOfSet(uvsid, mtys)
+    || mtys.length != 2
+    || defExprNullable(defIx)
+  ) {
+    return no
+  }
+  const ak = unionResidualSoloKindOfSet(uvsid)
+  if ak < 0 { return no }
+  const vb = vbHeapIdxOfKind(ak)
+  if vb < 0 { return no }
+  const p: MapUnionPlan = {
+    muKind: ak,
+    muWide: if coalWidens(ak, rk) { rk } else { ak },
+    muVb: vb,
+  }
+  return p
+}
+
+// A union-valued mv read's head after the probe: the stored box on a hit, the null-tagged box on a
+// miss, into the slot's stash.
+export function mapGetOrUnionHead(mslot: i32) {
+  const stashL = fnMvValStashLocal(mslot)
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // the stored (ref null $uBox) slot read
+  fbLocalSet(stashL)
+  fbElse()                     // miss = the read's null (a null-tagged box)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbLocalSet(stashL)
+  fbEnd()
+  return 0
+}
+
+// The scalar plan's test after the head: the stash's null tag opens a value-typed `if` in the
+// result's kind, whose then-arm is the default.
+export function mapGetOrUnionScalarOpen(mslot: i32, qp: MapUnionPlan) {
+  fbLocalGet(fnMvValStashLocal(mslot))
+  fbStructGet(uBoxIdx, 0)             // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(70)                        // 0x46 i32.eq → null?
+  fbIf(valBlockTypeOfKind(qp.muWide)) // value-typed if in the result's rep
+  return 0
+}
+
+// After the default: the stored scalar unboxed and widened to the result's kind, and the `if` closed.
+export function mapGetOrUnionScalarTail(mslot: i32, qp: MapUnionPlan): i32 {
+  fbElse()
+  fbLocalGet(fnMvValStashLocal(mslot))
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref payload)
+  fbRefCast(qp.muVb)
+  fbStructGet(qp.muVb, 0) // the scalar payload
+  if coalWidenUnboxed(qp.muKind, qp.muWide) < 0 { return -1 }
+  fbEnd()
+  return 0
+}
+
 function emitMapGetOrUnionBox(mslot: i32, defIx: i32, fnIx: i32, rk: i32) {
+  // The scalar plan, which the IR writes too: the head, the default in the result's kind, the tail.
+  const qp = mapGetOrUnionScalarPlanOf(mslot, defIx, rk)
+  if qp.muKind >= 0 {
+    mapGetOrUnionHead(mslot)
+    mapGetOrUnionScalarOpen(mslot, qp)
+    if emitExprAsKind(defIx, qp.muWide, fnIx) < 0 { return -1 }
+    return mapGetOrUnionScalarTail(mslot, qp)
+  }
+  if mslot < 0 || mslot >= mvValName.length {
+    return emitFail(
+      "emitProgram: a union-valued map read names no map value slot",
+    )
+  }
   const uvn = mvValName[mslot]
   // The map value union's members come from its type's member set. One resolution of the
   // set feeds both this walk and the residual-kind code below, so the two cannot disagree.
@@ -17616,6 +17717,10 @@ export function idxArmOf(nd: Index, fnIx: i32): IdxArm {
 
 function emitIndex(idxIx: i32, fnIx: i32) {
   const nd = nodeAt(idxIx)
+  // A plain ref list read has nothing ahead of it; the one answer the IR's element place asks.
+  if nd is Index && refListReadPlain(idxIx, fnIx) {
+    return refListReadAt(nd, idxIx, fnIx, EQ_ROOT_EXPR)
+  }
   // An element read an arm overrides is that arm's unboxed payload.
   if luOvLocNodes.length > 0 {
     const ovl = luOvLocalOf(idxIx)
@@ -17757,6 +17862,20 @@ function emitIndexNulScalarList(nd: Index, fnIx: i32): i32 {
 // union box) — slots in `[0,len)` are always populated, so the cast never traps. Returns 0, or
 // -1 on a refusal or a failed operand.
 function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
+  return refListReadAt(nd, idxIx, fnIx, EQ_ROOT_EXPR)
+}
+
+// A ref list read whose receiver and index are written as `place` says: the operand nodes
+// (`expr`), or a receiver local and an index local or immediate (`elem`).
+function refListReadAt(
+  nd: Index,
+  idxIx: i32,
+  fnIx: i32,
+  place: EqRootPlace,
+): i32 {
+  if place.epKind == "local" {
+    return emitFail("emitProgram: internal: a local root is no list read")
+  }
   if !rlRowsMinted() {
     return emitFail(
       "emitProgram: ref index access but ref array type not collected",
@@ -17765,13 +17884,21 @@ function emitIndexRefList(nd: Index, idxIx: i32, fnIx: i32): i32 {
   const rslot = refListSlotOfExpr(nd.idxArr, fnIx)
   if rslot < 0 { return refListRowRefused(nd.idxArr) }
   const rlHz = refListHoistOf(nd, rslot)
+  const elem = place.epKind == "elem"
   if rlHz < 0 {
-    if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
+    if elem { fbLocalGet(place.epSlot) }
+    else if emitExpr(nd.idxArr, fnIx) < 0 { return -1 }
     // A NULLABLE ref-array receiver (`t: i32[][] | null`, kind 18, narrowed) reads `(ref null …)` —
     // recover non-null before `struct.get` (the `if t != null` guard makes this safe).
     if exprNullableRefArray(nd.idxArr, fnIx) { fbRefAsNonNull() }
   }
-  if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  if !elem {
+    if emitExpr(nd.idxIndex, fnIx) < 0 { return -1 }
+  } else if place.epIdx >= 0 {
+    fbLocalGet(place.epIdx)
+  } else {
+    fbI32Const(place.epImm)
+  }
   return refListGetTail(nd, idxIx, fnIx, rslot, rlHz)
 }
 
@@ -19692,7 +19819,7 @@ function emitEqGStructElem(slot: i32, fnIx: i32) {
   eqStashR = sb
   const pathSi: i32[] = []
   const pathFi: i32[] = []
-  const r = emitStructEqRec(-2, -3, row, pathSi, pathFi, fnIx)
+  const r = emitStructEqRec(-2, -3, row, pathSi, pathFi, fnIx, EQ_ROOTS_EXPR)
   eqStashL = savedL
   eqStashR = savedR
   if nul { fbEnd() }
@@ -20090,7 +20217,7 @@ function emitEqGStructElemX(fA: i32, fB: i32, sA: i32, sB: i32, fnIx: i32) {
   eqStashR = sb
   const pathSi: i32[] = []
   const pathFi: i32[] = []
-  const r = emitStructEqRec(-2, -3, row, pathSi, pathFi, fnIx)
+  const r = emitStructEqRec(-2, -3, row, pathSi, pathFi, fnIx, EQ_ROOTS_EXPR)
   eqStashL = savedL
   eqStashR = savedR
   fbEnd()
@@ -20281,11 +20408,44 @@ function lcatBaseOfRep(kind: i32, slot: i32) {
   return lcatBases[i]
 }
 
+// Where a struct compare's field chain reads each side's root from: `expr` the operand node
+// itself, legacy's (`EQ_ROOTS_EXPR`); `local` local `epSlot`; `elem` the operand's ref list
+// element read over receiver local `epSlot` and index local `epIdx`, or immediate `epImm` where
+// `epIdx` is -1. Each `elem` read writes its element-read row into `epRows` as node, from, to.
+export type EqRootKind = "expr" | "local" | "elem"
+export type EqRootPlace = {
+  epKind: EqRootKind,
+  epSlot: i32,
+  epIdx: i32,
+  epImm: i32,
+  epRows: i32[],
+}
+export type EqRootPlan = { erL: EqRootPlace, erR: EqRootPlace }
+
+export const EQ_ROOT_EXPR: EqRootPlace = {
+  epKind: "expr",
+  epSlot: -1,
+  epIdx: -1,
+  epImm: 0,
+  epRows: [],
+}
+
+export const EQ_ROOTS_EXPR: EqRootPlan = {
+  erL: EQ_ROOT_EXPR,
+  erR: EQ_ROOT_EXPR,
+}
+
 // Re-evaluate the field access chain `root.f1.f2…` onto `body`: the root expression, then
 // one `struct.get` per (row, field) pair — a pure re-read, since the equality compare
 // re-walks chains per field. Root indices -2/-3 are sentinels naming the two locals
 // `emitListEqGCore` stashed a list element pair in, letting a struct compare run inside a list loop without threading that pair through every call site as a parameter.
-function emitChainRead(rootIx: i32, pathSi: i32[], pathFi: i32[], fnIx: i32) {
+function emitChainRead(
+  rootIx: i32,
+  pathSi: i32[],
+  pathFi: i32[],
+  fnIx: i32,
+  place: EqRootPlace,
+) {
   if rootIx == -2 || rootIx == -3 {
     let stash = eqStashL
     if rootIx == -3 { stash = eqStashR }
@@ -20303,7 +20463,15 @@ function emitChainRead(rootIx: i32, pathSi: i32[], pathFi: i32[], fnIx: i32) {
     if eqChainRecover { fbRefAsNonNull() }
     return 0
   }
-  if emitExpr(rootIx, fnIx) < 0 { return -1 }
+  const rd = match place.epKind {
+    "expr" => emitExpr(rootIx, fnIx)
+    "local" => {
+      fbLocalGet(place.epSlot)
+      0
+    }
+    "elem" => emitChainRootElem(rootIx, fnIx, place)
+  }
+  if rd < 0 { return -1 }
   let k = 0
   while k < pathSi.length {
     fbStructGet(eqRowHeapIdx(pathSi[k]), pathFi[k]) // 0xfb 0x02 <ht> <field>
@@ -20311,6 +20479,39 @@ function emitChainRead(rootIx: i32, pathSi: i32[], pathFi: i32[], fnIx: i32) {
   }
   if eqChainRecover { fbRefAsNonNull() }
   return 0
+}
+
+// The `elem` root of a field chain: compare operand `rootIx`, a ref list element read, over the
+// receiver and index `place` names.
+function emitChainRootElem(rootIx: i32, fnIx: i32, place: EqRootPlace): i32 {
+  const nd = nodeAt(rootIx)
+  if !(nd is Index) || !refListReadPlain(rootIx, fnIx) {
+    return emitFail(
+      "emitProgram: internal: an element compare root is no plain ref list read",
+    )
+  }
+  const from = curBuf.length
+  if refListReadAt(nd, rootIx, fnIx, place) < 0 { return -1 }
+  if idxRowsOn() && curBuf.length > from {
+    place.epRows.push(rootIx)
+    place.epRows.push(from)
+    place.epRows.push(curBuf.length)
+  }
+  return 0
+}
+
+// Whether `emitIndex` writes `idxIx` as `refListReadAt` alone: a ref list read with no arm
+// override, arm site or null cell ahead of it, over a minted, non-nullable ref list receiver.
+export function refListReadPlain(idxIx: i32, fnIx: i32): boolean {
+  const nd = nodeAt(idxIx)
+  if !(nd is Index) || idxArmOf(nd, fnIx) != "ref" { return false }
+  if luOvLocNodes.length > 0 && luOvLocalOf(idxIx) >= 0 { return false }
+  if armSiteReads(idxIx, fnIx) || idxCellReadIsNull(idxIx, fnIx) {
+    return false
+  }
+  return rlRowsMinted()
+    && !exprNullableRefArray(nd.idxArr, fnIx)
+    && refListSlotOfExpr(nd.idxArr, fnIx) >= 0
 }
 
 // Compare two closure fat-pointers already on the stack (left below right), leaving a
@@ -20553,7 +20754,12 @@ function emitNulStructEqAt(lIx: i32, rIx: i32, si: i32, fnIx: i32) {
   fbEnd()
   const pathSi: i32[] = []
   const pathFi: i32[] = []
-  if (emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx) < 0) { return -1 }
+  if (
+    emitStructEqRec(lRoot, rRoot, si, pathSi, pathFi, fnIx, EQ_ROOTS_EXPR)
+    < 0
+  ) {
+    return -1
+  }
   fbEnd()
   return 0
 }
@@ -20693,7 +20899,7 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   if e is BinExpr {
     const saved = structEqEnter()
     const roots = structEqStage(e.binLeft, e.binRight, row, fnIx)
-    return structEqTail(e, row, roots, saved, fnIx)
+    return structEqTail(e, row, roots, saved, fnIx, EQ_ROOTS_EXPR)
   }
   return emitFail("emitProgram: expected a struct equality")
 }
@@ -20714,10 +20920,11 @@ export function structEqTail(
   roots: i32[],
   saved: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ): i32 {
   const pathSi: i32[] = []
   const pathFi: i32[] = []
-  const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
+  const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx, rp) }
   eqStashL = saved[0]
   eqStashR = saved[1]
   if r < 0 { return -1 }
@@ -20810,6 +21017,7 @@ function emitStructEqRec(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ) {
   const cnt = eqRowFieldCount(si)
   if cnt == 0 {
@@ -20818,7 +21026,7 @@ function emitStructEqRec(
   }
   let fi = 0
   while fi < cnt {
-    if (emitStructEqField(lRoot, rRoot, si, fi, pathSi, pathFi, fnIx) < 0) {
+    if (emitStructEqField(lRoot, rRoot, si, fi, pathSi, pathFi, fnIx, rp) < 0) {
       return -1
     }
     if fi < cnt - 1 {
@@ -20847,10 +21055,20 @@ function emitStructEqField(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ) {
   pathSi.push(si)
   pathFi.push(fi)
-  const r = emitStructEqFieldInner(lRoot, rRoot, si, fi, pathSi, pathFi, fnIx)
+  const r = emitStructEqFieldInner(
+    lRoot,
+    rRoot,
+    si,
+    fi,
+    pathSi,
+    pathFi,
+    fnIx,
+    rp,
+  )
   pathSi.pop()
   pathFi.pop()
   return r
@@ -20866,14 +21084,15 @@ function emitNulFieldGuardOpen(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ) {
-  if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
   fbRefIsNull()
   fbIf(127)     // 0x04 if, 0x7f i32 blocktype — the left field was null
-  if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
   fbRefIsNull() // both null ⇒ equal
   fbElse()
-  if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
   fbRefIsNull()
   fbIf(127)
   fbI32Const(0) // exactly one side null
@@ -20896,8 +21115,11 @@ function emitNulFieldEq(
   pathFi: i32[],
   fnIx: i32,
   inner: VKind,
+  rp: EqRootPlan,
 ) {
-  if emitNulFieldGuardOpen(lRoot, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitNulFieldGuardOpen(lRoot, rRoot, pathSi, pathFi, fnIx, rp) < 0 {
+    return -1
+  }
   // Both sides non-null: the leaf core wants `(ref $H)`, and only the guard knows that.
   const savedRec = eqChainRecover
   eqChainRecover = true
@@ -20910,6 +21132,7 @@ function emitNulFieldEq(
     pathFi,
     fnIx,
     inner,
+    rp,
   )
   eqChainRecover = savedRec
   if ir < 0 { return -1 }
@@ -20924,13 +21147,34 @@ function emitStructEqFieldInner(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ) {
   const code = eqRowFieldKind(si, fi)
   const nulInner = nulFieldInnerKind(code)
   if nulInner != null {
-    return emitNulFieldEq(lRoot, rRoot, si, fi, pathSi, pathFi, fnIx, nulInner)
+    return emitNulFieldEq(
+      lRoot,
+      rRoot,
+      si,
+      fi,
+      pathSi,
+      pathFi,
+      fnIx,
+      nulInner,
+      rp,
+    )
   }
-  return emitStructEqFieldAt(lRoot, rRoot, si, fi, pathSi, pathFi, fnIx, code)
+  return emitStructEqFieldAt(
+    lRoot,
+    rRoot,
+    si,
+    fi,
+    pathSi,
+    pathFi,
+    fnIx,
+    code,
+    rp,
+  )
 }
 
 // The field-compare ladder, keyed by an EXPLICIT code so the null guard above can re-enter it
@@ -20944,6 +21188,7 @@ function emitStructEqFieldAt(
   pathFi: i32[],
   fnIx: i32,
   code: VKind | null,
+  rp: EqRootPlan,
 ) {
   // Codes 21 (`boolean | null`) and 30 (`K | null`) share the scalar arm (D101): their null
   // rides in the value space rather than beside it, using the same `0x7f i32` storagetype
@@ -20956,8 +21201,8 @@ function emitStructEqFieldAt(
   }
   if code == "i32" || code == "nulbool" {
     // Scalar (i32 / boolean), or an i32-sentinel niche field: a native compare.
-    if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+    if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
     fbI32Bin(70) // 0x46 i32.eq
     return 0
   }
@@ -20966,8 +21211,8 @@ function emitStructEqFieldAt(
     // ladders (this one and `emitVariantFieldEqCore`) must not disagree about a field rep
     // — `{d: i64}` compared inside an `A | i32` union but refused outside it before this
     // arm covered i64/f32 too (D1181); one arm now serves all three widths.
-    if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+    if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
     if code == "f64" {
       fbI32Bin(97) // 0x61 f64.eq
     } else if code == "i64" {
@@ -20979,20 +21224,29 @@ function emitStructEqFieldAt(
   }
   if code == "str" {
     // String: the element-wise string-eq loop over the two field refs.
-    if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+    if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
     return emitStrEqCore()
   }
   if eqKindIsRecord(code) {
-    return emitStructEqNestedField(lRoot, rRoot, si, fi, pathSi, pathFi, fnIx)
+    return emitStructEqNestedField(
+      lRoot,
+      rRoot,
+      si,
+      fi,
+      pathSi,
+      pathFi,
+      fnIx,
+      rp,
+    )
   }
   if code == "list" {
-    return emitStructEqI32ListField(lRoot, rRoot, pathSi, pathFi, fnIx)
+    return emitStructEqI32ListField(lRoot, rRoot, pathSi, pathFi, fnIx, rp)
   }
   if code == "closure" {
     // Function-valued field: identity compare (id + env) via the closure-eq frame.
-    if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+    if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
     return emitCloEqCore()
   }
   if code == "union" {
@@ -21006,8 +21260,8 @@ function emitStructEqFieldAt(
       const bxVis: i32[] = []
       const bxAks: i32[] = []
       if (unionBoxEqColumns(bxTy, bxArms, bxVis, bxAks)) {
-        if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-        if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+        if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+        if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
         return emitUnionBoxEqStaged(bxArms, bxVis, bxAks, false, fnIx)
       }
     }
@@ -21021,8 +21275,12 @@ function emitStructEqFieldAt(
       if sFieldElemTyIxAt(si, fi) >= 0 {
         const d17s = sFieldRefSlot(si, fi)
         if d17s >= 0 {
-          if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-          if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+          if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 {
+            return -1
+          }
+          if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 {
+            return -1
+          }
           return emitListEqAnyRep(LBK_REF, d17s, fnIx)
         }
       }
@@ -21034,8 +21292,8 @@ function emitStructEqFieldAt(
   // `f64[]`/`i64[]`/`string[]`/`f32[]`/`u8[]` fields get the same coverage here (D1020).
   const eqSk = eqScalarListKind(code)
   if eqSk >= 0 {
-    if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+    if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
     const pr = if eqSk == LBK_U8_LIST { fieldRowPackedRow(sFieldStart[si] + fi) } else { 0 }
     return emitListEqAnyRep(eqSk, pr, fnIx)
   }
@@ -21054,6 +21312,7 @@ function emitStructEqNestedField(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ) {
   const nsi = eqRowTgtStructIdx(si, fi)
   if nsi < 0 {
@@ -21063,13 +21322,17 @@ function emitStructEqNestedField(
   }
   const hf = eqHelpFnOf(nsi)
   if hf >= 0 {
-    if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
+    if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
     fbCall(hf)
     return 0
   }
-  if emitNulFieldGuardOpen(lRoot, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-  if emitStructEqRec(lRoot, rRoot, nsi, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitNulFieldGuardOpen(lRoot, rRoot, pathSi, pathFi, fnIx, rp) < 0 {
+    return -1
+  }
+  if emitStructEqRec(lRoot, rRoot, nsi, pathSi, pathFi, fnIx, rp) < 0 {
+    return -1
+  }
   return emitNulFieldGuardClose()
 }
 
@@ -21185,8 +21448,8 @@ export function eqHelpFnBody(si: i32): u8[] {
   eqChainRecover = false
   const pathSi: i32[] = []
   const pathFi: i32[] = []
-  if emitNulFieldGuardOpen(-2, -3, pathSi, pathFi, -1) >= 0 {
-    if emitStructEqRec(-2, -3, si, pathSi, pathFi, -1) >= 0 {
+  if emitNulFieldGuardOpen(-2, -3, pathSi, pathFi, -1, EQ_ROOTS_EXPR) >= 0 {
+    if emitStructEqRec(-2, -3, si, pathSi, pathFi, -1, EQ_ROOTS_EXPR) >= 0 {
       emitNulFieldGuardClose()
     }
   }
@@ -21208,11 +21471,12 @@ function emitStructEqI32ListField(
   pathSi: i32[],
   pathFi: i32[],
   fnIx: i32,
+  rp: EqRootPlan,
 ) {
   // lenL != lenR → 0, else the element loop.
-  if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
   fbStructGet(lTy(), 1) // wrapper field 1: len
-  if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
   fbStructGet(lTy(), 1)
   fbI32Bin(71)          // 0x47 i32.ne
   fbIf(127)             // 0x04 if, 0x7f i32 blocktype
@@ -21221,13 +21485,13 @@ function emitStructEqI32ListField(
   // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
   const eqBkA = listBackStashSlot("list", 0)
   const eqBkB = listBackStashSlot("list", 0)
-  if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
   fbStructGet(lTy(), 0) // backing
   fbLocalSet(eqBkA)
-  if emitChainRead(rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(rRoot, pathSi, pathFi, fnIx, rp.erR) < 0 { return -1 }
   fbStructGet(lTy(), 0)
   fbLocalSet(eqBkB)
-  if emitChainRead(lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  if emitChainRead(lRoot, pathSi, pathFi, fnIx, rp.erL) < 0 { return -1 }
   fbStructGet(lTy(), 1) // len
   setStrScrI(0)
   fbBlock(127)          // 0x02 block, 0x7f i32 — yields the 0/1 result
@@ -42707,7 +42971,7 @@ export function coalNulRefPlanOf(
   exprIx: i32,
   fnIx: i32,
 ): CoalNulRefPlan | null {
-  const h = coalNulRefHeapOf(e, lhsIx, exprIx, fnIx)
+  const h = if lhsIx == unwrapParen(e.binLeft) { coalNulRefsHeapOf(e, exprIx, fnIx) } else { coalNulRefHeapOf(e, lhsIx, exprIx, fnIx) }
   if h < 0 { return null }
   const a = coalNulRefArmOf(e, exprIx, fnIx)
   const tag = match a {
@@ -44304,70 +44568,43 @@ function coalOptCallArmOf(lhs: OptMember, fnIx: i32): CoalOptArm {
   return if gSi >= 0 && gSi < sHeapIdx.length && rlRowsMinted() { "listGet" } else { "next" }
 }
 
-// The last `emitCoalesceGo` arms, the nullable-ref cores (a union arm, a record, a value-union
-// box, a map), and the refusal for any other nullable operand. Returns what
-// `emitCoalesceGo` returns.
-function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
-  // The variant sibling of the arm below, its own arm rather than a widening of it: a `T |
-  // null` whose `T` is a union arm stores `(ref null $variantHeap(vi))`, and
-  // `structIndexOfExpr` has no row to answer with (`collectS` skips a union member). Same
-  // niche, same `br_on_non_null` lowering, one table over.
-  const crHeap = coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
-  if crHeap >= 0 { return emitCoalesceNulRef(e, exprIx, crHeap, fnIx) }
-  // D960 — `??` over a nullable value-union box whose operand cannot be re-read. The
-  // re-readable spelling never arrives here: `emit_rewrite` desugars it to an `if`, which is
-  // right because a rewrite leaves no `??` node for the consumer classifiers to disagree
-  // about. A call operand cannot take that route, so it needs a real emit arm: stash the box once, branch on its tag, and give the `if` the box as its result type so both arms agree.
+// How `emitCoalesceNullableRefs` writes `l ?? d`, in its order: a nullable reference's core
+// (`heap`), a value-union box stashed once (`boxStash`), the null test `coalNullTestIf` spells
+// (`pinnedCellIf`, `atomJoinIf`, `numJoinIf`, `cellIf`), a nullable map's core (`mapHeap`), the
+// `??` moved onto an `if`'s other arm (`armIf`), a shared `scalar | null` field (`boxFieldScalar`).
+export type CoalNulRefsArm = "heap"
+  | "boxStash"
+  | "pinnedCellIf"
+  | "mapHeap"
+  | "atomJoinIf"
+  | "numJoinIf"
+  | "armIf"
+  | "boxFieldScalar"
+  | "cellIf"
+  | "none"
 
-  // The two earlier emit arms fought each other: one emitted a correct `(if (result (ref
-  // $box)) …)`, and the return path wrapped it in a second `struct.new $box` — the pair D969
-  // untangled, since the consumer double-boxes precisely because `exprUnion` answers false for
-  // this node. Teaching `unionNameOfExpr` to answer for a value-union `??` is the other half; neither half works alone.
+export function coalNulRefsArmOf(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+): CoalNulRefsArm {
+  if coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx) >= 0 {
+    return "heap"
+  }
   if tyIsNulValueUnionBox(nodeTyAt(e.binLeft, fnIx)) {
-    const coNm = boxTyName(nodeTyIxOf(exprIx))
-    if coNm != "" {
-      const coSlot = sharedFieldRecvSlot()
-      if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
-      fbLocalSet(coSlot)
-      fbLocalGet(coSlot)
-      fbStructGet(uBoxIdx, 0) // field 0: tag
-      fbI32Rel(RS_TAG, nullBoxTag())
-      fbI32Bin(71) // 0x47 i32.ne  -> present?
-      fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
-      fbLocalGet(coSlot)
-      fbRefAsNonNull() // the stash cell is nullable, the block type is not
-      fbElse()
-      if (emitUnionBoxOwed(coNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
-        return -1
-      }
-      fbEnd()
-      return 0
-    }
-    // An instance's re-readable list cell, typed at the box only at its pin, is the null test
-    // the rewrite makes of the concrete spelling (D8820).
+    if boxTyName(nodeTyIxOf(exprIx)) != "" { return "boxStash" }
+    // An instance's re-readable list cell, typed at the box only at its pin (D8820).
     const coLhs = unwrapParen(e.binLeft)
     if coLhs >= 0 && fnInPinnedInstance(fnIx) && exprReReadable(coLhs) {
       const coCell = nodeAt(coLhs)
       if coCell is Index && !exprMap(coCell.idxArr, fnIx) {
-        return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+        return "pinnedCellIf"
       }
     }
   }
-  // `<e> ?? d` over a nullable map: the cell is a `(ref null $map)` of the operand's shape, so it
-  // takes the same `br_on_non_null` core, and a `Map()` default builds that shape (D3257).
-  if exprNullableMap(e.binLeft, fnIx) {
-    let cms = mapShapeOfExpr(e.binLeft, fnIx)
-    if cms == -3 { cms = mapShapeOfTyPeeled(nodeTyIxOf(e.binLeft)) }
-    if cms != -3 {
-      return emitCoalesceNulRef(e, exprIx, mapTypeIdxOf(cms), fnIx)
-    }
+  if exprNullableMap(e.binLeft, fnIx) && coalNulMapShape(e, fnIx) != -3 {
+    return "mapHeap"
   }
-  // What reaches here is a nullable left operand whose rep has no `??` lowering — not "this is
-  // not a map index get", which is what this said while the overwhelming majority of its
-  // firings are a non-nullable operand. Those fold to the left operand in `emit_rewrite.vl`
-  // and never reach the emitter as a `??` at all, so the message can finally name the actual residue.
-
-  // A re-readable atom niche joining into a box is the null test it spells.
   const lhsIx = unwrapParen(e.binLeft)
   if (
     lhsIx >= 0
@@ -44375,31 +44612,88 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
     && exprNulLitUnion(lhsIx, fnIx)
     && coalesceResultIsBox(exprIx, fnIx)
   ) {
-    return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+    return "atomJoinIf"
   }
-  // A re-readable cell joining numbers of different types apart is the null test it spells,
-  // typed at the instance's join when the shared `??` records only its hole (D9701).
-  if lhsIx >= 0 && exprReReadable(lhsIx) {
-    const nrt = coalResultTyOf(exprIx, fnIx)
-    if numUnionMinted && tyHoldsNumbersApart(nrt) {
-      const nIf = coalNullTestIf(e, exprIx, fnIx)
-      nodeTyRecord(nIf, nrt)
-      return emitExpr(nIf, fnIx)
-    }
+  // A re-readable cell joining numbers of different types apart (D9701).
+  if (
+    lhsIx >= 0
+    && exprReReadable(lhsIx)
+    && numUnionMinted
+    && tyHoldsNumbersApart(coalResultTyOf(exprIx, fnIx))
+  ) {
+    return "numJoinIf"
   }
-  const armIf = coalNullArmIf(e, exprIx)
-  if armIf >= 0 { return emitExpr(armIf, fnIx) }
-  // A record union's shared `scalar | null` field reads as its box (D13280).
-  const fk = coalBoxFieldScalarKind(lhsIx, fnIx)
-  if fk >= 0 { return emitCoalesceBoxFieldScalar(e, exprIx, fk, fnIx) }
-  // A re-readable list cell is the null test it spells, as an instance's is (D16483).
+  if coalNullArmIfFits(e) { return "armIf" }
+  if coalBoxFieldScalarKind(lhsIx, fnIx) >= 0 { return "boxFieldScalar" }
+  // A re-readable list cell (D16483).
   const cell = if lhsIx >= 0 { nodeAt(lhsIx) } else { null }
   if cell is Index && exprReReadable(lhsIx) && !exprMap(cell.idxArr, fnIx) {
-    return emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+    return "cellIf"
   }
-  return emitFail(
-    "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
-  )
+  return "none"
+}
+
+// The heap `emitCoalesceNulRef` writes `l ?? d`'s core at, on the `heap` and `mapHeap` arms (a
+// nullable map's cell takes the same `br_on_non_null` core, its `Map()` default building that
+// shape, D3257); -1 on any other arm.
+export function coalNulRefsHeapOf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  return match coalNulRefsArmOf(e, exprIx, fnIx) {
+    "heap" => coalNulRefHeapOf(e, unwrapParen(e.binLeft), exprIx, fnIx)
+    "mapHeap" => mapTypeIdxOf(coalNulMapShape(e, fnIx))
+    "boxStash" | "pinnedCellIf" | "atomJoinIf" | "numJoinIf" | "armIf" | "boxFieldScalar" | "cellIf" | "none" => -1
+  }
+}
+
+// The map shape a nullable map `l ?? d` reads, or -3 where it has none.
+function coalNulMapShape(e: BinExpr, fnIx: i32): i32 {
+  const cms = mapShapeOfExpr(e.binLeft, fnIx)
+  return if cms == -3 { mapShapeOfTyPeeled(nodeTyIxOf(e.binLeft)) } else { cms }
+}
+
+// The last `emitCoalesceGo` arms, along `coalNulRefsArmOf`, and the refusal for any other nullable
+// operand. Returns what `emitCoalesceGo` returns.
+function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const lhsIx = unwrapParen(e.binLeft)
+  return match coalNulRefsArmOf(e, exprIx, fnIx) {
+    "heap" | "mapHeap" => emitCoalesceNulRef(e, exprIx, coalNulRefsHeapOf(e, exprIx, fnIx), fnIx)
+    // D960: a value-union box whose operand cannot be re-read, stashed once and branched on its
+    // tag, the `if` typed at the box so both arms agree (D969).
+    "boxStash" => emitCoalesceBoxStash(e, exprIx, fnIx)
+    "pinnedCellIf" | "atomJoinIf" | "cellIf" => emitExpr(coalNullTestIf(e, exprIx, fnIx), fnIx)
+    "numJoinIf" => {
+      const nIf = coalNullTestIf(e, exprIx, fnIx)
+      nodeTyRecord(nIf, coalResultTyOf(exprIx, fnIx))
+      emitExpr(nIf, fnIx)
+    }
+    "armIf" => emitExpr(coalNullArmIf(e, exprIx), fnIx)
+    // A record union's shared `scalar | null` field reads as its box (D13280).
+    "boxFieldScalar" => emitCoalesceBoxFieldScalar(e, exprIx, coalBoxFieldScalarKind(lhsIx, fnIx), fnIx)
+    "none" => emitFail(
+      "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
+    )
+  }
+}
+
+// D960's stash: the box once into the shared slot, its tag tested, the box or the default boxed
+// into the result's union.
+function emitCoalesceBoxStash(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const coNm = boxTyName(nodeTyIxOf(exprIx))
+  const coSlot = sharedFieldRecvSlot()
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  fbLocalSet(coSlot)
+  fbLocalGet(coSlot)
+  fbStructGet(uBoxIdx, 0) // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(71) // 0x47 i32.ne  -> present?
+  fbIfRefNul(uBoxIdx, false) // if (result (ref $uBox))
+  fbLocalGet(coSlot)
+  fbRefAsNonNull() // the stash cell is nullable, the block type is not
+  fbElse()
+  if (emitUnionBoxOwed(coNm, nodeTyIxOf(exprIx), e.binRight, fnIx) < 0) {
+    return -1
+  }
+  fbEnd()
+  return 0
 }
 
 // The scalar atom kind of the `scalar | null` box the field read `lhsIx` yields, read off the
@@ -44465,12 +44759,21 @@ function emitCoalesceBoxFieldScalar(
   return 0
 }
 
+// Whether `coalNullArmIf` moves `l ?? d` onto an `if`'s other arm: a desugared `if` with a `null`
+// arm, each arm one statement.
+function coalNullArmIfFits(e: BinExpr): boolean {
+  if !coalNullArmShaped(e) { return false }
+  const n = nodeAt(unwrapParen(e.binLeft))
+  if !(n is IfStmt) { return false }
+  return coalSoleStmt(n.ifThen) >= 0 && coalSoleStmt(n.ifElse) >= 0
+}
+
 // `if c { d } else { a ?? d }` for `(if c { null } else { a }) ?? d`, and its mirror, which is
 // what `?? d` means for an `if` with a `null` arm: the `??` moves onto the other arm, whose own
 // rep an instance types, where the `if` keeps its generic `V | null` (D10130). Only a desugared
 // `if` reaches here: a written one is already bound to a local. -1 otherwise.
 function coalNullArmIf(e: BinExpr, exprIx: i32): i32 {
-  if !coalNullArmShaped(e) { return -1 }
+  if !coalNullArmIfFits(e) { return -1 }
   const n = nodeAt(unwrapParen(e.binLeft))
   if !(n is IfStmt) { return -1 }
   const tv = coalSoleStmt(n.ifThen)
