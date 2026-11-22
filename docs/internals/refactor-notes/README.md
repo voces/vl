@@ -8,6 +8,31 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-22-narrowed-field-matrix](2026-11-22-narrowed-field-matrix.md): Capability matrix: a narrowed box-field read × its field's storage rep (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-uninit-let](2026-11-22-ir-uninit-let.md): IR coverage: an uninitialized binding, and the shadow reads the frame the claim reads (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-tag-global-callee](2026-11-22-ir-tag-global-callee.md): IR coverage: a tagged call's module-global callee is read as its cell stores it (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-tag-dispatch-result](2026-11-22-ir-tag-dispatch-result.md): IR coverage: a tagged call's result admitted by legacy's own kind (2026-11-22, lane IR-N7)
+- [2026-11-22-ir-stmt-decl](2026-11-22-ir-stmt-decl.md): IR: body-scope declarations and discarded values as statements, 2026-11-22
+- [2026-11-22-ir-rep-novalue-ref-arm](2026-11-22-ir-rep-novalue-ref-arm.md): `rep novalue`, step 1: a reference join's never arm (IR-C1)
+- [2026-11-22-ir-nullable-box-narrow](2026-11-22-ir-nullable-box-narrow.md): IR: a union box narrowed to its niche (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-narrowed-field-read-rep](2026-11-22-ir-narrowed-field-read-rep.md): IR soundness: a narrowed box-field read at a rep its field does not store (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-narrowed-arm-unbox](2026-11-22-ir-narrowed-arm-unbox.md): IR: a box narrowed to a record arm, unboxed at a record delivery (2026-11-22, lane IR-N3)
+- [2026-11-22-ir-map-read-union-plain](2026-11-22-ir-map-read-union-plain.md): IR: a null-free union map value read under `??` (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-map-read-union-box](2026-11-22-ir-map-read-union-box.md): IR: a union-with-null map value read under `??` that keeps the box (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-map-read-niche](2026-11-22-ir-map-read-niche.md): IR: a ref-niche map value read under `??` (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-int-switch](2026-11-22-ir-int-switch.md): IR: a dense integer `match` as one `br_table`, 2026-11-22
+- [2026-11-22-ir-hole-instance-params](2026-11-22-ir-hole-instance-params.md): IR: a hole instance's parameter is held at the row legacy declares it at, 2026-11-22
+- [2026-11-22-ir-global-box-narrow](2026-11-22-ir-global-box-narrow.md): IR coverage: a union-box global read narrowed to a record, list or map arm (2026-11-22, lane IR-N1)
+- [2026-11-22-ir-fn-clo-coerce](2026-11-22-ir-fn-clo-coerce.md): IR: a function delivered to a declared function type (fnClo), 2026-11-22
+- [2026-11-22-ir-coalesce-nulref-result-rep](2026-11-22-ir-coalesce-nulref-result-rep.md): IR: a nullable map coalesced into a wider map that stores alike (2026-11-22, lane IR-N2)
+- [2026-11-22-ir-coalesce-after-operand](2026-11-22-ir-coalesce-after-operand.md): IR: a `??` written in place after an earlier operand, 2026-11-22
+- [2026-11-22-ir-claim-structeq](2026-11-22-ir-claim-structeq.md): RStructEq is a scalar compare, and is claimed (IR-C1)
+- [2026-11-22-ir-claim-closureeq](2026-11-22-ir-claim-closureeq.md): RClosureEq is a scalar compare, and is claimed (IR-C1)
+- [2026-11-22-ir-claim-cast](2026-11-22-ir-claim-cast.md): RCast is the box family's, and is claimed (IR-C1)
+- [2026-11-22-ir-cell-read-type](2026-11-22-ir-cell-read-type.md): IR: an untyped capture-cell read holds the cell's element (2026-11-22, lane IR-D1)
+- [2026-11-22-ir-capture-narrowed-nullable](2026-11-22-ir-capture-narrowed-nullable.md): IR: a narrowed read of a nullable capture is the capture at its own rep, then legacy's recover, 2026-11-22
+- [2026-11-22-ir-capture-loop-var](2026-11-22-ir-capture-loop-var.md): IR: a closure capturing a loop variable takes the variable its frame's loop made, 2026-11-22
+- [2026-11-22-ir-asg-reread-rep](2026-11-22-ir-asg-reread-rep.md): IR: an assignment value's re-read atom decoded at a string destination (2026-11-22, lane IR-D1)
 - [2026-11-22-ir-tail-arm-stmt](2026-11-22-ir-tail-arm-stmt.md): IR coverage: a tail arm's last statement, decided by legacy's own question (2026-11-22, lane IR-N7)
 - [2026-11-22-ir-struct-eq-place](2026-11-22-ir-struct-eq-place.md): IR coverage: a record compare side legacy re-reads as a list element (2026-11-22, lane IR-N8)
 - [2026-11-22-ir-start-box-receiver](2026-11-22-ir-start-box-receiver.md): IR: a module global union as a box receiver (2026-11-22, lane IR-N3)
@@ -74,6 +99,12 @@ Newest first:
 - [2026-11-22-ir-atom-hook](2026-11-22-ir-atom-hook.md): IR coverage: a direct `else if` link at a destination's type has no prelude (2026-11-22, lane IR-N1)
 - [2026-11-22-ir-list-return-into-hole](2026-11-22-ir-list-return-into-hole.md): IR: a record list returned into a result whose type holds a hole (2026-11-22, lane IR-N2)
 - [2026-11-22-ir-bundle-argument](2026-11-22-ir-bundle-argument.md): IR: a bundle argument (2026-11-22, lane IR-D1)
+- [2026-11-21-ir-ref-if-variant](2026-11-21-ir-ref-if-variant.md): IR: a reference join at a variant row, and its bare `null` arm (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-decl-list-retag](2026-11-21-ir-decl-list-retag.md): IR: a record list bound at its record-or-null twin (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-closure-arg-variant](2026-11-21-ir-closure-arg-variant.md): IR: a closure-call argument into a union-arm parameter, 2026-11-21
+- [2026-11-21-ir-bundle-param](2026-11-21-ir-bundle-param.md): IR: a bundle parameter as its record (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-atom-compare-fold](2026-11-21-ir-atom-compare-fold.md): IR coverage: a folded atom compare, and an `else if` link at a destination's type (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-as-exact-opt](2026-11-21-ir-as-exact-opt.md): IR: an exact numeric `as?` through legacy's numeric cast tail, 2026-11-21
 - [2026-11-21-ir-map-store-scalar-union](2026-11-21-ir-map-store-scalar-union.md): IR: a map store's scalar and union values (2026-11-21, lane IR-N3)
 - [2026-11-22-ir-operand-rep](2026-11-22-ir-operand-rep.md): IR coverage: a literal `is` test over a null-tagged box (2026-11-22, lane IR-N1)
 - [2026-11-22-ir-capture-for-in-variable](2026-11-22-ir-capture-for-in-variable.md): IR: a captured `for-in` variable at its read's rep, gated by legacy's capture valtype, 2026-11-22
