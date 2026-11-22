@@ -1,0 +1,3 @@
+## Testing
+
+- **The IR order check folds into the armed-shadow rows, and its early build runs unarmed.** `ir shadow` and `ir shadow cases` run `ir-shadow.vl -- --prepost` (`$VL_IR_SHADOW=6`), which reports the shadow's mismatch and verifier rows and the order rows from one build; the separate `ir prepost` row and `ir-prepost.vl` are gone. The early build had run armed, so `legacyPlainAgrees` failed it and 407 closure-call programs dropped out of the order check unseen; it now builds as a claim does, an emit failure it causes is a `prepost differs` row, and a program that prints rows under the plain shadow but none under the order check reds.
