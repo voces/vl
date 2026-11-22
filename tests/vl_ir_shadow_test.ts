@@ -1265,9 +1265,9 @@ print(intr(true, 0.5))
 
 // An instance's `is` test over a box: a tag the box holds is compared off the raw slot, even
 // narrowed, and a tag it lacks is a decided guard whose then arm is not written. Elsewhere the
-// decided constant stays a named miss.
+// decided constant is `false` with the receiver unread, as legacy writes it.
 Deno.test({
-  name: "ir shadow: an instance's arm-tag and decided `is` guards build; a decided test elsewhere misses",
+  name: "ir shadow: an instance's arm-tag and decided `is` guards build, and a decided test elsewhere",
   ignore,
   fn: () => {
     const src = `function kind<T>(v: T): string {
@@ -1286,10 +1286,9 @@ run(2.5)
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("uncovered is arm tag tagAbsent") !== 1) {
-      throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want kind, neg and run covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
