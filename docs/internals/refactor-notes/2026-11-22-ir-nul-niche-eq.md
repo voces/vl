@@ -32,3 +32,12 @@ On the 18 `nulNiche` witness files, against master's seed:
 Legacy bytes are identical on all 18. The row `tests/ir-shadow-rows/nullable-niche-eq.vl` has 5
 functions; all 5 are `operand type` on master's seed, and here all 5 are covered and matched. The
 full table is in the PR body.
+
+## Fuel
+
+L2 self-compile fuel rises 122.0M (+0.11%) on 108,982,556,926 at base dfc71b02. Under the
+coordinator's 2026-11-22 ruling it is source growth:
+- **The same-tree pair.** The head's seed compiles the base tree at exactly the base seed's fuel,
+  108,982,556,926 both.
+- **By phase, head on head against base on base:** `checkProgram` +0.07G (one more `Rhs` member,
+  D17046), and the emit passes, code payload and `emitModule` +0.02G each.
