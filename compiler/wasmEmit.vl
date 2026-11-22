@@ -20626,21 +20626,35 @@ function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
 function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    const savedL = eqStashL
-    const savedR = eqStashR
+    const saved = structEqEnter()
     const roots = structEqStage(e.binLeft, e.binRight, row, fnIx)
-    const pathSi: i32[] = []
-    const pathFi: i32[] = []
-    const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
-    eqStashL = savedL
-    eqStashR = savedR
-    if r < 0 { return -1 }
-    if e.binOp == "!=" {
-      fbI32Eqz() // 0x45 i32.eqz — negate value-equality
-    }
-    return 0
+    return structEqTail(e, row, roots, saved, fnIx)
   }
   return emitFail("emitProgram: expected a struct equality")
+}
+
+// The stash slots a struct compare saves before it stages, `[left, right]`, for `structEqTail`.
+export function structEqEnter(): i32[] { return [eqStashL, eqStashR] }
+
+// After the roots: the field-wise compare over `roots` (`[-1, -1]` fails), the stash slots
+// restored from `saved`, and `i32.eqz` for `!=`. Answers -1 on failure.
+export function structEqTail(
+  e: BinExpr,
+  row: i32,
+  roots: i32[],
+  saved: i32[],
+  fnIx: i32,
+): i32 {
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
+  eqStashL = saved[0]
+  eqStashR = saved[1]
+  if r < 0 { return -1 }
+  if e.binOp == "!=" {
+    fbI32Eqz() // 0x45 i32.eqz — negate value-equality
+  }
+  return 0
 }
 
 // The roots `emitStructEqRec` reads operands `lIx`/`rIx` of a compare at eq row `row` through:
@@ -20648,20 +20662,51 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
 // `eqStashL`/`eqStashR` now names; `[-1, -1]` on failure. Both are evaluated in source order
 // before either slot is set, and a left place is staged when the right may write it (D17023).
 function structEqStage(lIx: i32, rIx: i32, row: i32, fnIx: i32): i32[] {
-  const rStage = !unionEqOperandOk(rIx)
-  const lStage = rStage || !unionEqOperandOk(lIx)
+  const rStage = structEqStagesRight(rIx)
+  const lStage = structEqStagesLeft(lIx, rIx)
   if lStage && emitExpr(lIx, fnIx) < 0 { return [-1, -1] }
   if rStage && emitExpr(rIx, fnIx) < 0 { return [-1, -1] }
+  return structEqRoots(row, lIx, rIx, -1, -1)
+}
+
+// Whether a struct compare evaluates its right operand `rIx` once into a stash: it is no
+// re-readable place.
+export function structEqStagesRight(rIx: i32): boolean {
+  return !unionEqOperandOk(rIx)
+}
+
+// Whether a struct compare stashes its left operand `lIx`: no re-readable place, or the right is
+// stashed, which may write it.
+export function structEqStagesLeft(lIx: i32, rIx: i32): boolean {
+  return structEqStagesRight(rIx) || !unionEqOperandOk(lIx)
+}
+
+// After the stashed operands' values (left below right): their slots set, right first, and the
+// roots. An unstaged side is read from local `lLocal`/`rLocal` where one is given, else from its
+// place `lIx`/`rIx`.
+export function structEqRoots(
+  row: i32,
+  lIx: i32,
+  rIx: i32,
+  lLocal: i32,
+  rLocal: i32,
+): i32[] {
   let rRoot = rIx
-  if rStage {
+  if structEqStagesRight(rIx) {
     eqStashR = structEqSlot(row, 1)
     fbLocalSet(eqStashR)
     rRoot = -3
+  } else if rLocal >= 0 {
+    eqStashR = rLocal
+    rRoot = -3
   }
   let lRoot = lIx
-  if lStage {
+  if structEqStagesLeft(lIx, rIx) {
     eqStashL = structEqSlot(row, 0)
     fbLocalSet(eqStashL)
+    lRoot = -2
+  } else if lLocal >= 0 {
+    eqStashL = lLocal
     lRoot = -2
   }
   return [lRoot, rRoot]
@@ -25608,8 +25653,8 @@ export function maFoldCandidateCount(fnIx: i32): i32 {
 
 // The declaration-time fold's live table for the function currently emitting: parallel to
 // each qualifying `const`'s own node index, the WASM index of its scratch local and the K it
-// folded out. Cleared at the top of `emitFuncBody` — a node index is emitted at most once, so
-// stale rows from a previous function can never be mistaken for this one's.
+// folded out. Cleared at the top of `emitFuncBody` and at each compile's start: node indices
+// restart per compile, so a row left by an earlier program would name this one's nodes.
 let maFoldDeclIx: i32[] = []
 let maFoldWasmSlot: i32[] = []
 let maFoldK: i64[] = []
@@ -37903,6 +37948,10 @@ export function wasmEmitStateReset() {
   lmaCallerFn = -1
   lmaValArg = -1
   lmaValNode = -1
+  maFoldCursor = 0
+  maFoldDeclIx = []
+  maFoldK = []
+  maFoldWasmSlot = []
   coerceHeld = -1
   rawReadNode = -1
   mfSrcSlot = -1
@@ -39217,28 +39266,31 @@ function emitNullLitNode(_e: NullLit, exprIx: i32, fnIx: i32) {
 // Push the null the destination of the `null`-typed read `exprIx` holds, when it names a rep
 // other than the read's storage; false, pushing nothing, where the storage read is that null.
 function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
+  const own = nullReadDstOwnOf(exprIx, fnIx)
+  if own < 0 { return false }
+  emitNullOwn(own)
+  return true
+}
+
+// The null (`NULL_OWN_*`) the destination of `null`-typed read `exprIx` holds where its rep's kind
+// is not the read's storage's, else -1: the storage read is that null.
+export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   const at = parenPeelIx(exprIx)
   let dst = ctxTyAt(at, fnIx)
   // A respelled read (a shared cell's `c[0]`) takes the destination of the name it respells.
   if dst < 0 { dst = ctxTyAt(nodeSrc[at] ?? -1, fnIx) }
   const st = readNarrowedStoreAt(exprIx, fnIx)
-  if dst < 0 || st < 0 { return false }
+  if dst < 0 || st < 0 { return -1 }
   const dk = repOfTy(dst).rdKind
-  if dk == repOfTy(st).rdKind { return false }
+  if dk == repOfTy(st).rdKind { return -1 }
   // An open `_ | null` destination (an un-annotated binding of the read) is built at the read's
   // storage, so the storage read is its null.
   const dt = tyAt(dst)
   if dt is TyNullable {
-    if dt.nInner < 0 { return false }
+    if dt.nInner < 0 { return -1 }
   }
-  if dk == "union" {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    return true
-  }
-  emitNullOwn(nullOwnOfTy(dst))
-  return true
+  if dk == "union" { return NULL_OWN_BOX }
+  return nullOwnOfTy(dst)
 }
 
 // The `null` value node `exprIx` evaluates to, built at the rep of the type the checker stamped
@@ -39863,7 +39915,7 @@ function njStash(ix: i32, isUnion: boolean, key: i32, fnIx: i32): i32 {
   if isUnion {
     // A join whose arms are scalars is built as the box here, as a union destination builds it.
     let sr = 0
-    if exprUnion(ix, fnIx) {
+    if numUnionSideBoxed(ix, fnIx) {
       sr = emitExpr(ix, fnIx)
     } else {
       sr = emitUnionBoxOwed(
@@ -39874,27 +39926,65 @@ function njStash(ix: i32, isUnion: boolean, key: i32, fnIx: i32): i32 {
       )
     }
     if sr < 0 { return -1 }
-    const bs = njSlot(26, "list", key)
-    fbLocalSet(bs)
-    return bs
+    return numUnionStashTail(true, -1, key)
   }
-  if cexLitPeel(ix) >= 0 { return -2 }
+  if numUnionSideLit(ix) { return -2 }
   const k = njKindOfExpr(ix)
   if k < 0 { return -1 }
   if emitExprAsKind(ix, k, fnIx) < 0 { return -1 }
-  const ss = njSlot(
-    27,
-    listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"),
-    key,
-  )
-  fbLocalSet(ss)
-  return ss
+  return numUnionStashTail(false, k, key)
+}
+
+// After a side's value: its slot at stash `key`, a union side's box slot or a scalar side's slot
+// at kind `k`, set from the stack. Answers the slot.
+export function numUnionStashTail(isUnion: boolean, k: i32, key: i32): i32 {
+  const slot = if isUnion { njSlot(26, "list", key) } else { njSlot(27, listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"), key) }
+  fbLocalSet(slot)
+  return slot
+}
+
+// Opens a numeric-union dispatch's stash, answering its key: an operand's own dispatch built
+// inside it stashes one level deeper. `numUnionStashLeave` closes it.
+export function numUnionStashEnter(): i32 {
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  return key
+}
+
+export function numUnionStashLeave(): i32 {
+  njDepth = njDepth - 1
+  return 0
+}
+
+// Whether side `ix` of a numeric-union operator is a union (`njMembersOf`), stashed as its box.
+export function numUnionIsUnionSide(ix: i32, fnIx: i32): boolean {
+  return njMembersOf(ix, fnIx).length > 0
+}
+
+// Whether union side `ix` is already its box (`exprUnion`); a join of scalars is boxed at the stash.
+export function numUnionSideBoxed(ix: i32, fnIx: i32): boolean {
+  return exprUnion(ix, fnIx)
+}
+
+// Whether scalar side `ix` is a literal, which the arms write at each member's width.
+export function numUnionSideLit(ix: i32): boolean { return cexLitPeel(ix) >= 0 }
+
+// The prim a scalar side `ix` is stashed at, its recorded type's kind's, or "" when it has none.
+export function numUnionSidePrim(ix: i32): string {
+  const k = numUnionSideKindOf(ix)
+  if k < 0 { return "" }
+  return numPrimOfKind(k) ?? ""
+}
+
+// The kind scalar side `ix` is stashed at, its recorded type's, or -1 when it has none.
+export function numUnionSideKindOf(ix: i32): i32 {
+  return njKindOfTy(nodeTyIxOf(ix))
 }
 
 // The kind of scalar operand `ix`, its recorded type's: the checker types every scalar operand
 // of a numeric-union operator as a number.
 function njKindOfExpr(ix: i32): i32 {
-  const k = njKindOfTy(nodeTyIxOf(ix))
+  const k = numUnionSideKindOf(ix)
   if k >= 0 { return k }
   return emitFail(
     "emitProgram: a numeric union operator's scalar operand has no numeric recorded type",
@@ -40005,15 +40095,33 @@ function njScalarTy(ix: i32): i32 {
 
 // `a op b` where an operand is a numeric union.
 function emitNumUnionBin(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const key = numUnionStashEnter()
+  const ls = njStash(e.binLeft, numUnionIsUnionSide(e.binLeft, fnIx), key, fnIx)
+  let rs = -1
+  if ls != -1 {
+    rs = njStash(
+      e.binRight,
+      numUnionIsUnionSide(e.binRight, fnIx),
+      key + 1,
+      fnIx,
+    )
+  }
+  numUnionStashLeave()
+  if ls == -1 || rs == -1 { return -1 }
+  return numUnionBinTail(e, exprIx, fnIx, ls, rs)
+}
+
+// After both sides' stashes (`ls`, `rs`; -2 for a literal side): the member dispatch over the
+// stashed sides, each pair's operator, and the result's box where it is a union. Returns 0 or -1.
+export function numUnionBinTail(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+  ls: i32,
+  rs: i32,
+): i32 {
   const lMs = njMembersOf(e.binLeft, fnIx)
   const rMs = njMembersOf(e.binRight, fnIx)
-  const key = njDepth * 2
-  njDepth = njDepth + 1
-  const ls = njStash(e.binLeft, lMs.length > 0, key, fnIx)
-  let rs = -1
-  if ls != -1 { rs = njStash(e.binRight, rMs.length > 0, key + 1, fnIx) }
-  njDepth = njDepth - 1
-  if ls == -1 || rs == -1 { return -1 }
   njBin = exprIx
   njOp = e.binOp
   njLUnion = lMs.length > 0
