@@ -133,6 +133,7 @@ import {
   irHexOf,
   irLowerClaim,
   irLowerFragment,
+  irLowerProbe,
   irLoweredEntry,
   irSlotRunAgrees,
   mapRecvGlobalIx,
@@ -610,11 +611,70 @@ let ibRowN: i32[] = []
 // 3 disarmed claiming every family but `other` (the claim path's test), 4 the blocker census (each
 // row names every class the function missed), 5 disarmed with the shipped claim's rows printed.
 export function irShadowArm(on: i32) {
-  ibArmed = on == 1 || on == 2 || on == 4
+  ibArmed = on == 1 || on == 2 || on == 4 || on == 6
   setIrShadowOn(ibArmed)
   ibDetail = on == 2
   ibClaimAll = on == 3
   ibAllMiss = on == 4
+  ibPrePost = on == 6
+  return 0
+}
+
+// Mode 6, the order check: each function is also built and lowered where a claim builds it,
+// before legacy emits it, and compared with the shadow's build after. A builder or plan that reads
+// state legacy fills while emitting answers differently in the two orders.
+let ibPrePost = false
+let ibPreBuilt = false
+let ibPreText = ""
+let ibPreCode: u8[] = []
+
+// Under mode 6, builds, verifies and lowers the function at `fnIx` before legacy emits it.
+export function irPreBuild(fnIx: i32, fnPos: i32) {
+  ibPreBuilt = false
+  if !ibPrePost { return 0 }
+  const gen = repNodeGen()
+  const minted = synthMintCount()
+  const why = build(fnIx, fnPos)
+  if synthMintCount() != minted { count("prepost: the early build minted a synthetic global") }
+  if why != "" || repNodeGen() != gen { return 0 }
+  ibPreBuilt = true
+  ibPreText = irFnText(ib)
+  ibPreCode = []
+  if irVerify(ib).vfRule == 0 { ibPreCode = irLowerProbe(ib, globalCtxOf(fnPos)) }
+  return 0
+}
+
+// Under mode 6, a row naming the function when its build after legacy differs from its build
+// before: built in one order only, or a different IR. `why` is the later build's miss.
+function prePostBuilt(why: string) {
+  const built = why == ""
+  if built != ibPreBuilt {
+    count(
+      "prepost differs: built "
+        + (if built { "after legacy only" } else { "before legacy only (" + why + ")" })
+        + " in "
+        + ib.irName,
+    )
+    return 0
+  }
+  if built && irFnText(ib) != ibPreText {
+    count("prepost differs: ir text in " + ib.irName)
+  }
+  return 0
+}
+
+// Under mode 6, a row naming the function when its lowering after legacy differs from its
+// lowering before; `dual` is the shadow's verdict, whose `unlowered` means no lowering.
+function prePostLowered(dual: string) {
+  const unlowered = dual.length >= 9 && dual.slice(0, 9) == "unlowered"
+  const post: u8[] = if unlowered { [] } else { irLoweredEntry() }
+  let same = post.length == ibPreCode.length
+  let i = 0
+  while same && i < post.length {
+    if post[i] != ibPreCode[i] { same = false }
+    i = i + 1
+  }
+  if !same { count("prepost differs: lowered in " + ib.irName) }
   return 0
 }
 
@@ -8733,6 +8793,7 @@ export function irShadowFn(
   const gen = repNodeGen()
   const why = build(fnIx, fnPos)
   if ibAllMiss { return censusRow(why) }
+  if ibPrePost { prePostBuilt(why) }
   if why != "" {
     count("uncovered " + why)
     return 0
@@ -8748,6 +8809,7 @@ export function irShadowFn(
   if v.vfRule == 0 {
     count("verified")
     const dual = dualEmit("", globalCtxOf(fnPos), out, outStart, spanBase)
+    if ibPrePost && ibPreBuilt { prePostLowered(dual) }
     // A function the claim rule takes must match: a claim is never a fallback.
     if dual != "" && claimable() {
       count("fail a claimable function did not match: " + dual)
