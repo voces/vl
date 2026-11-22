@@ -22839,15 +22839,23 @@ function emitBlockValueAsGo(blockIx: i32, fnIx: i32, kind: i32) {
     if tv >= 0 {
       if ifArmIsValue(tv, fnIx) {
         if emitIfArmOpen(blockIx, fnIx) < 0 { return emitIfArmClose(-1) }
-        if kind == 124 { return emitIfArmClose(emitWidened(tv, 4, fnIx)) }
-        if kind == 125 { return emitIfArmClose(emitWidened(tv, 5, fnIx)) }
-        if kind == 126 { return emitIfArmClose(emitWidened(tv, 3, fnIx)) }
+        const wk = blockValueWidenKind(kind)
+        if wk >= 0 { return emitIfArmClose(emitWidened(tv, wk, fnIx)) }
         return emitIfArmClose(emitExpr(tv, fnIx))
       }
     }
     return ifArmNoValueFail("if-expression arm", blockIx)
   }
   return emitFail("emitProgram: if-expression arm is not a block")
+}
+
+// The kind a value `if` arm's value widens to at result blocktype `kind` (`emitWidened`), or -1
+// where it is written as it stands.
+export function blockValueWidenKind(kind: i32): i32 {
+  if kind == 124 { return 4 }
+  if kind == 125 { return 5 }
+  if kind == 126 { return 3 }
+  return -1
 }
 
 // ── nullable / value-union if-expression in binding-init position ─────────────
@@ -28530,6 +28538,13 @@ export function bundleArgArmOf(bpar: i32, arg: i32, fnIx: i32): BundleArgArm {
   if bpar >= 0 && emitBundleParamReads(bpar, arg, fnIx) { return "fnRead" }
   if bundled && nodeAt(unwrapParen(arg)) is IfStmt { return "choice" }
   return "none"
+}
+
+// The annotated type of bundle parameter `bpar` whose row a choice handed to it is built at; -1
+// with no annotation.
+export function bundleChoiceTyOf(bpar: i32): i32 {
+  const bp = nodeAt(bpar)
+  return if bp is Param && bp.parType >= 0 { nodeTyIxOf(bp.parType) } else { -1 }
 }
 
 // Whether parameter `par` takes the lambda literal `arg` as a bundle.
@@ -37514,15 +37529,20 @@ function emitDeadTail(stmts: i32[], fnIx: i32): i32 {
 function emitStmtTail(stmtIx: i32, fnIx: i32) {
   const s = nodeAt(stmtIx)
   if s is IfStmt { return emitIfTail(stmtIx, fnIx) }
+  if !tailArmStmtIsValue(stmtIx, fnIx) { return emitStmt(stmtIx, fnIx) }
   if stmtIsTailValue(stmtIx, fnIx) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
     return emitTailReturnExit(stmtIx, fnIx)
   }
-  // D1240 — an if-ARM tail member call is a value for the same reason a body tail is: this
-  // path is reached only from `emitIfTail`, i.e. only where the arms ARE the result.
-  if memberCallYieldsValue(stmtIx) { return emitReturnExit(stmtIx, fnIx) }
-  return emitStmt(stmtIx, fnIx)
+  return emitReturnExit(stmtIx, fnIx)
+}
+
+// Whether a tail `if` arm's last statement `stmtIx` (no `if`) is returned as the arm's value
+// rather than written as a statement: a tail value, or a member call that yields one (D1240;
+// reached only where the arms are the result). A call that never returns is a statement.
+export function tailArmStmtIsValue(stmtIx: i32, fnIx: i32): boolean {
+  return stmtIsTailValue(stmtIx, fnIx) || memberCallYieldsValue(stmtIx)
 }
 
 // Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": an
@@ -41506,8 +41526,7 @@ function emitDirectCallArgsUnder(callIx: i32, fnIx: i32, target: i32) {
       if emitBundleParamRead(args[i], bpar, fnIx) < 0 { return -1 }
       i = i + 1
     } else if barm == "choice" {
-      const bp = nodeAt(bpar)
-      const bt = if bp is Param && bp.parType >= 0 { nodeTyIxOf(bp.parType) } else { -1 }
+      const bt = bundleChoiceTyOf(bpar)
       if (emitBundleChoiceArg(args[i], bt, bundleSigsOfParam(bpar), fnIx) < 0) {
         return -1
       }
