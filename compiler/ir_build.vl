@@ -144,8 +144,8 @@ import {
   irLowerClaim,
   irLowerFragment,
   irLoweredEntry,
-  irSlotRunAgrees,
   irSlotRowTy,
+  irSlotRunAgrees,
   irSlotValtype,
   mapRecvGlobalIx,
   valtypeOf,
@@ -551,6 +551,8 @@ import {
   VKind,
   cloLiftWriteCount,
   fRecRetTy,
+  fRetKind,
+  fRetStructIdx,
   fRetVoid,
   fnStmts,
   fnStmtsPosOf,
@@ -3140,7 +3142,35 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
   const t = fnCheckedRetTy(pos)
   // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`).
   const bs = if irTyOpen(t) && pos >= 0 && pos < fnStmts.length { fnBundleRetSigs(pos) } else { [] }
-  return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
+  if bs.length > 0 { return bundleRecordTyOf(bs) }
+  const dt = retDeclRowTy(pos)
+  return if dt >= 0 { dt } else { t }
+}
+
+// Whether legacy declares the inferred result of `fnStmts` slot `pos` (annotation `ann`) at a
+// struct row whose stored type does not map back to it.
+function retDeclRowLost(pos: i32, ann: i32): boolean {
+  if (
+    ann >= 0
+    || pos < 0
+    || pos >= fRetKind.length
+    || pos >= fRetStructIdx.length
+  ) {
+    return false
+  }
+  if pos < fRecRetTy.length && fRecRetTy[pos] >= 0 { return false }
+  if fRetKind[pos] != "struct" || fRetStructIdx[pos] < 0 { return false }
+  return declRowTy(fRetStructIdx[pos]) < 0
+}
+
+// The record type of the struct row legacy declares the inferred result of `fnStmts` slot `pos`
+// at (`fRetKind`, `fRetStructIdx`), or -1.
+function retDeclRowTy(pos: i32): i32 {
+  if pos < 0 || pos >= fRetKind.length || pos >= fRetStructIdx.length {
+    return -1
+  }
+  if fRetKind[pos] != "struct" || fRetStructIdx[pos] < 0 { return -1 }
+  return declRowTy(fRetStructIdx[pos])
 }
 
 // The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
@@ -8489,6 +8519,9 @@ function build(fnIx: i32, fnPos: i32): string {
   if !(fn is FuncDecl) { return "not a function" }
   ibReset(fnIx, fn.fnName, fnPos)
   if fn.fnTyParams.length > 0 { return "template" }
+  if retDeclRowLost(fnPos, fn.fnRet) && !censusGoesOn("result declared row") {
+    return "result declared row"
+  }
   ib.irRetTy = resultTy(fnPos, fn.fnRet, fnIx)
   ib.irRetRep = resultRep(fnPos, fn.fnRet, fnIx)
   const none = repIsNoValue(ib.irRetRep)
@@ -8542,8 +8575,16 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
 // instance the checker recorded.
 function paramHeldTy(p: i32, fnIx: i32): i32 {
   const ty = bundleHeldTy(p, heldTy(scopeTyAt(p, fnIx)))
+  if bundleSigsOfParam(p).length > 0 { return ty }
   const dt = paramDeclRowTy(p)
-  return if dt >= 0 && repNodeOfTy(dt) != repNodeOfTy(ty) { dt } else { ty }
+  return if dt >= 0 { dt } else { ty }
+}
+
+// The record type struct row `si` stores (`slotRowTyOf`) where that type's row is `si` again,
+// else -1.
+function declRowTy(si: i32): i32 {
+  const t = slotRowTyOf(si)
+  return if t >= 0 && repRowOfTyStruct(t, repScanLim()) == si { t } else { -1 }
 }
 
 // The variable of parameter read `ix` where the IR holds it at legacy's declared row
@@ -8562,8 +8603,15 @@ function declRowParamVarOf(ix: i32): i32 {
 
 // The record type of the struct row legacy declares parameter `p` at (`paramStructIdxOf`), or -1.
 function paramDeclRowTy(p: i32): i32 {
-  if vtKindOfParam(p) != "struct" { return -1 }
-  return slotRowTyOf(paramStructIdxOf(p))
+  if vtKindOfParam(p) != "struct" || paramStructIdxOf(p) < 0 { return -1 }
+  return declRowTy(paramStructIdxOf(p))
+}
+
+// Whether legacy declares parameter `p` at a struct row whose stored type does not map back to it.
+function paramDeclRowLost(p: i32): boolean {
+  if bundleSigsOfParam(p).length > 0 { return false }
+  if vtKindOfParam(p) != "struct" || paramStructIdxOf(p) < 0 { return false }
+  return declRowTy(paramStructIdxOf(p)) < 0
 }
 
 // Bundle parameter `p`'s open type `ty` as its record of one closure per signature; any other
@@ -8585,6 +8633,9 @@ function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
   let i = 0
   while i < fn.fnParams.length {
     const p = fn.fnParams[i]
+    if paramDeclRowLost(p) && !censusGoesOn("parameter declared row") {
+      return "parameter declared row"
+    }
     const ty = paramHeldTy(p, fnIx)
     const r = repNodeOfTy(ty)
     if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r)) {
