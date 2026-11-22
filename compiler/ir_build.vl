@@ -102,6 +102,7 @@ import {
   SpreadPairNote,
   StrOp,
   binPrimOp,
+  coalArmStagesLeads,
   ifCondLetAt,
   irBodyLeaves,
   irFnNew,
@@ -172,7 +173,7 @@ import {
   arrLitShortWhy,
   arrNewCallNamed,
   arrNewFillBoxTy,
-  arrNewPlanOf,
+  arrNewWhyOf,
   asCastArmOf,
   asNicheCastWhy,
   asUnionTagWhy,
@@ -386,6 +387,7 @@ import {
   narrowedBoxVariantPlain,
   narrowedVariantRepIs,
   njDispatches,
+  numIsPlanOf,
   recoveredReadTyOf,
   tagIsArmOf,
   widenPlanOf,
@@ -401,7 +403,7 @@ import {
   spreadPairKnown,
   spreadPlanOf,
 } from "./emit_plan_list"
-import { mvValVariantOf, rlElemVariantRow } from "./emit_shape_rows"
+import { annTyOf, mvValVariantOf, rlElemVariantRow } from "./emit_shape_rows"
 import { mvValTyIxAt } from "./emit_map_value_slots"
 import {
   BinNulTest,
@@ -630,6 +632,7 @@ import {
   constFoldWidthOk,
   ifArmValueExpr,
   letInitFoldsExpr,
+  parTyNode,
   paramIndexOf,
 } from "./emit_query"
 import {
@@ -983,6 +986,31 @@ function isDecidedTest(
   return c
 }
 
+// `recv is K` over a numeric literal union along `numIsPlanOf` (`emitIsTestNumLit`): the receiver
+// once into a slot, or once per member, a re-read written again as the builder read it.
+function isNumLit(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const pl = numIsPlanOf(ix, n, ibFnIx)
+  if pl.nlTexts.length == 0 { return irBMiss("is numeric literal none") }
+  const v = irBExpr(b, n.isObj)
+  if ibMiss != "" { return v }
+  if repPrim(irBOpRep(v)) == null {
+    return irBMiss("is numeric literal operand rep")
+  }
+  if !pl.nlOnce && pl.nlTexts.length > 1 {
+    if !(v is OVar) || v.ov < 0 {
+      return irBMiss("is numeric literal receiver")
+    }
+    if (
+      ib.irVars[v.ov].vKind == "temp"
+      && !recvReadsAgain(unwrapParen(n.isObj))
+    ) {
+      return irBMiss("is numeric literal receiver")
+    }
+  }
+  return irBLetTemp(b, { niV: v, niAt: ix }, ix, rep)
+}
+
 // `is` test `ix` from rung `arm` on, as `emitIsTestRungs` takes it: a rung that declines passes
 // to the next (`isArmOf` from the rank after it).
 function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
@@ -1013,6 +1041,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
     if emptyFitDeclines(p, ix) { return isConstTest(b, n, 0, ix, rep) }
     return isEmptyFit(b, n, ix, rep, p)
   }
+  if arm == "numLit" { return isNumLit(b, n, ix, rep) }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
   // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
@@ -3461,7 +3490,7 @@ function calleeSig(pos: i32): boolean {
   if !(fn is FuncDecl) { return false }
   const ps: i32[] = []
   for p in fn.fnParams {
-    const pt = bundleHeldTy(p, scopeTyAt(p, d))
+    const pt = bundleHeldTy(p, paramCheckedTy(p, d))
     const r = repNodeOfTy(pt)
     if !valueRep(r, pt) { return false }
     ps.push(r)
@@ -3756,13 +3785,22 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
         if barm == "member" { return missRhs("bundle argument member") }
       }
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
-      const pr = repNodeOfTy(
-        bundleHeldTy(
-          callee.fnParams[i],
-          scopeTyAt(callee.fnParams[i], inst),
-        ),
+      const pt = bundleHeldTy(
+        callee.fnParams[i],
+        scopeTyAt(callee.fnParams[i], inst),
       )
-      const a = deliver(b, c.callArgs[i], pr, -1)
+      const pr = repNodeOfTy(pt)
+      // A struct literal legacy builds at a row of its parameter's row's heap (`paramStructIdxOf`)
+      // is built at the parameter's rep.
+      const lt = if repNodeAt(pr) is RRecord { objLitTwinTyAtRow(c.callArgs[i], pr, pt, paramStructIdxOf(callee.fnParams[i])) } else { -1 }
+      const a = if lt >= 0 { objLitAt(
+        b,
+        unwrapParen(c.callArgs[i]),
+        pr,
+        lt,
+        objLitLayoutRowOf(unwrapParen(c.callArgs[i]), ibFnIx),
+        false,
+      ) } else { deliver(b, c.callArgs[i], pr, -1) }
       if ibMiss != "" { return missRhs("argument") }
       if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
@@ -4165,16 +4203,20 @@ export function irBStageLeads(
   args: Opnd[],
   argIxs: i32[],
 ): boolean {
-  // A boxed `??` or a receiver stage is written in place, below which the lowering stages nothing.
-  if inPlaceFrom(b, at) { return false }
-  if !valuedIfFrom(b, at) || opndsAreTemps(args) { return true }
+  // A receiver stage, and a `??` along an arm that stages nothing, is written in place, below
+  // which the lowering stages nothing.
+  if receiverStageFrom(b, at) || coalBoxFrom(b, at, false) { return false }
+  const coal = coalBoxFrom(b, at, true)
+  if !valuedIfFrom(b, at) && !coal || opndsAreTemps(args) { return true }
   let j = 0
   while j < args.length {
     const a = args[j]
     // A valued `if`'s out is already on the stack, in its order.
     if a is OVar && (a.ov < 0 || a.ov >= ib.irVars.length) { return false }
     const held = a is OVar
-      && (ib.irVars[a.ov].vKind == "temp" || valuedIfOut(b, a.ov))
+      && (ib.irVars[a.ov].vKind == "temp"
+      || valuedIfOut(b, a.ov)
+      || coal && coalBoxOut(b, a.ov))
     if !held {
       const ty = stageTyOf(a, argIxs[j])
       if ty < 0 {
@@ -4222,16 +4264,21 @@ function insertAt(b: i32[], at: i32, id: i32) {
   return 0
 }
 
-// Whether operands built into `b` from `at` on hold a node the lowering writes with nothing
-// pending below it: a boxed `??`, or a push receiver's stage.
+// Whether operands built into `b` from `at` on hold a node the lowering writes in place: a boxed
+// `??`, or a push receiver's stage.
 function inPlaceFrom(b: i32[], at: i32): boolean {
+  return coalBoxFrom(b, at, true)
+    || coalBoxFrom(b, at, false)
+    || receiverStageFrom(b, at)
+}
+
+// Whether operands built into `b` from `at` on hold a push receiver's stage, which the lowering
+// writes with nothing pending below it.
+function receiverStageFrom(b: i32[], at: i32): boolean {
   let i = at
   while i < b.length {
     const n = ib.irNodes[b[i]]
-    if (
-      n is SCoalBox
-      || n is SEffect && (n.efRhs is RListStage || n.efRhs is RStashSet)
-    ) {
+    if n is SEffect && (n.efRhs is RListStage || n.efRhs is RStashSet) {
       return true
     }
     i = i + 1
@@ -4263,6 +4310,28 @@ function valuedIfOut(b: i32[], v: i32): boolean {
   for id in b {
     const n = ib.irNodes[id]
     if n is SIf && n.siOut == v { return true }
+  }
+  return false
+}
+
+// Whether operands built into `b` from `at` on hold a `??` (`SCoalBox`) whose arm stages an
+// earlier operand below it, as a valued `if` does (`coalArmStagesLeads`), or, with `stages`
+// false, one whose arm does not.
+function coalBoxFrom(b: i32[], at: i32, stages: boolean): boolean {
+  let i = at
+  while i < b.length {
+    const n = ib.irNodes[b[i]]
+    if n is SCoalBox && coalArmStagesLeads(n.cbArm) == stages { return true }
+    i = i + 1
+  }
+  return false
+}
+
+// Whether `v` is the out of a `??` in `b` (`SCoalBox`).
+function coalBoxOut(b: i32[], v: i32): boolean {
+  for id in b {
+    const n = ib.irNodes[id]
+    if n is SCoalBox && n.cbOut == v { return true }
   }
   return false
 }
@@ -5505,14 +5574,22 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
 // rep's type) where its own rep is another: legacy builds it at a row (`objLitLayoutRowOf`) whose
 // type is stored at the destination type's heap (`recordHeapOfTy`), so it is that record; or -1.
 function objLitTwinTyAt(ix: i32, dst: i32, dstTy: i32): i32 {
+  return objLitTwinTyAtRow(ix, dst, dstTy, -1)
+}
+
+// `objLitTwinTyAt` where the destination's struct row is `dstRow` (legacy's, at least 0), whose
+// heap stands for the destination type's: a hole parameter's row, which its type cannot name. With
+// a row, a literal whose own rep is the destination's is built there too, not at its row's type.
+function objLitTwinTyAtRow(ix: i32, dst: i32, dstTy: i32, dstRow: i32): i32 {
   const ol = unwrapParen(ix)
   if ol < 0 || ol >= P.nodes.length || !(nodeAt(ol) is ObjLit) { return -1 }
-  if objLitArmOf(ol, ibFnIx) != "struct" || exprRepOf(ol) == dst { return -1 }
+  if objLitArmOf(ol, ibFnIx) != "struct" { return -1 }
+  if dstRow < 0 && exprRepOf(ol) == dst { return -1 }
   const dt = if dstTy >= 0 { dstTy } else { repTyOf(dst) }
   if dt < 0 || irTyOpen(dt) || repNodeOfTy(dt) != dst { return -1 }
   const row = objLitLayoutRowOf(ol, ibFnIx)
   if row < 0 || row >= sTyIx.length { return -1 }
-  const h = recordHeapOfTy(dt)
+  const h = if dstRow >= 0 && dstRow < sTyIx.length { recordHeapOfTy(sTyIx[dstRow]) } else if dstRow < 0 { recordHeapOfTy(dt) } else { -1 }
   return if h >= 0 && h == recordHeapOfTy(sTyIx[row]) { dt } else { -1 }
 }
 
@@ -6107,9 +6184,7 @@ function arrNew(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
     return irBMiss("array new callee")
   }
   const fill = n.callArgs[1]
-  if arrNewPlanOf(ix, fill, ibFnIx).anWhy != "" {
-    return irBMiss("array new refused")
-  }
+  if arrNewWhyOf(ix, fill, ibFnIx) != "" { return irBMiss("array new refused") }
   if arrNewFillBoxTy(ix, fill, ibFnIx) >= 0 {
     return irBMiss("array new fill box")
   }
@@ -6150,9 +6225,7 @@ function memOpRhs(b: i32[], c: Call, ix: i32): Rhs {
 // `__array_new_default__(n)` as legacy's arm writes it (`arrNewPlanOf`): the length, then the
 // zeroed allocation. A refused site is a named miss.
 function arrNewDefault(b: i32[], n: Call, ix: i32, rep: i32): Opnd {
-  if arrNewPlanOf(ix, -1, ibFnIx).anWhy != "" {
-    return irBMiss("array new refused")
-  }
+  if arrNewWhyOf(ix, -1, ibFnIx) != "" { return irBMiss("array new refused") }
   if !(repNodeAt(rep) is RList) { return irBMiss("array new rep") }
   const len = irBExpr(b, n.callArgs[0])
   if ibMiss != "" { return len }
@@ -6796,8 +6869,6 @@ function coalNulRef(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   }
   const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce nulRef after an operand") }
   // A plain block opens before its operand, so the operand is built into the block (`cbLB`).
   const lb: i32[] = []
   const l = irBExpr(if join { b } else { lb }, n.binLeft)
@@ -6850,8 +6921,6 @@ function coalNicheCell(
 ): Opnd {
   const ty = exprTyOf(ix)
   if irTyOpen(ty) { return irBMiss("open temp type") }
-  // Its value stays on the stack from here, so no temp an operand before it built may wait.
-  if endsInTemp(b) { return irBMiss("coalesce niche after an operand") }
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
   if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce niche operand") }
@@ -8747,7 +8816,10 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     const v = irBDeclVar(ix)
     // A `const` every read copied the tree of computes nothing, as legacy writes it (D15001).
     if v >= 0 && keptDeclStoresNothing(n, ix) { return 0 }
-    if v < 0 || n.letInit < 0 { return skip("declaration") }
+    if v < 0 { return skip("declaration") }
+    // An uninitialized binding writes nothing, as legacy's `emitLetDeclStmt` writes nothing: its
+    // local's default covers it, and a reference one is declared nullable (`localUnset`).
+    if n.letInit < 0 { return 0 }
     // Legacy may build a `[]` its pushes follow at its final size, through locals (D3623).
     const lr = if pos >= 0 { listReserveScan(n, sibs, pos, ibFnIx) } else { null }
     // The lowering opens a reserve over a function's body only (`reserveOpen`).
@@ -9198,7 +9270,7 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
 // closure per signature it is called at (`bundleRecordTyOf`), else its checker type, closed at the
 // instance the checker recorded.
 function paramHeldTy(p: i32, fnIx: i32): i32 {
-  const ty = bundleHeldTy(p, heldTy(scopeTyAt(p, fnIx)))
+  const ty = bundleHeldTy(p, heldTy(paramCheckedTy(p, fnIx)))
   if bundleSigsOfParam(p).length > 0 { return ty }
   if vtKindOfParam(p) != "struct" || paramStructIdxOf(p) < 0 { return ty }
   if repRowOfTyStruct(ty, repScanLim()) == paramStructIdxOf(p) { return ty }
@@ -9206,6 +9278,13 @@ function paramHeldTy(p: i32, fnIx: i32): i32 {
   if dt < 0 { return ty }
   ibDeclRowSeen = true
   return dt
+}
+
+// Parameter `p`'s type in `fnIx`: its scope's, else, in a clone whose nodes carry none (a baked
+// callback's), the annotation legacy's valtype reads (`annTyOf(parTyNode(p))`).
+function paramCheckedTy(p: i32, fnIx: i32): i32 {
+  const t = scopeTyAt(p, fnIx)
+  return if t >= 0 { t } else { annTyOf(parTyNode(p)) }
 }
 
 // The record type struct row `si` stores (`slotRowTyOf`) where it is closed and its row is `si`
