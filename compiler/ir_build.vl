@@ -352,6 +352,7 @@ import {
   V128_ATOM_KIND,
   arrLitVariantSlot,
   identUnboxAtomOf,
+  nullInstanceIsResult,
   variantCoerceArmOf,
 } from "./emit_plan_union"
 import {
@@ -975,6 +976,7 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
     return isConstTest(b, n, 0, ix, rep)
   }
   if arm == "litArms" { return isLitArms(b, n, ix, rep) }
+  if arm == "nullInst" { return isNullInstTest(ix, rep) }
   if arm == "emptyFit" {
     const p = emptyFitPlanOf(ix, ibFnIx)
     if emptyFitDeclines(p, ix) {
@@ -1217,6 +1219,17 @@ function isVariantTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   const bits: i64 = if na == "recordTrue" { 1 } else { 0 }
   const c: Opnd = { oiRep: rep, oiBits: bits }
   return c
+}
+
+// `recv is null` over a pinned instance's operand (`nullInstanceIsResult`): its constant, the
+// receiver unread, as legacy's `nullInst` rung writes it.
+function isNullInstTest(ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const res = nullInstanceIsResult(ix, ibFnIx)
+  if res < 0 { return irBMiss("is null instance") }
+  const bits: i64 = if res != 0 { 1 } else { 0 }
+  const o: Opnd = { oiRep: rep, oiBits: bits }
+  return o
 }
 
 // A box test no arm of whose box carries the tag (`tagIsArmOf`'s `tagAbsent`): `false`, the
@@ -1635,11 +1648,21 @@ function nullOwnRepFits(own: i32, dst: i32): boolean {
 
 // A narrowed receiver's test at its storage (D2447), as legacy's `emitIs` decides it in storage
 // mode, where its read is the declared box: a plain variant row's tag or the arm-tag test, over the
-// raw slot of a local box.
+// raw slot of a local box, or the empty-list fit and the null instance's constant, all asked and
+// built at the storage.
 function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if rep != ibBool { return irBMiss("is result rep") }
   const mark = storageReadEnter(n.isObj)
-  const arm = if n.isFit < 0 && isRecvStageRep(ix, ibFnIx) < 0 { isArmOf(ix, ibFnIx, 0, false) } else { "notIs" }
+  let arm: IsArm = if n.isFit < 0 && isRecvStageRep(ix, ibFnIx) < 0 { isArmOf(ix, ibFnIx, 0, false) } else { "notIs" }
+  // An empty-list fit that declines passes to the next rung, as `emitIsTestRungs` takes it.
+  while arm == "emptyFit" && emptyFitDeclines(emptyFitPlanOf(ix, ibFnIx), ix) {
+    arm = isArmOf(ix, ibFnIx, isArmRank(arm) + 1, false)
+  }
+  if arm == "emptyFit" || arm == "nullInst" {
+    const o = if arm == "nullInst" { isNullInstTest(ix, rep) } else { isEmptyFit(b, n, ix, rep, emptyFitPlanOf(ix, ibFnIx)) }
+    storageReadLeave(mark)
+    return o
+  }
   const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
   const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
   const tag = if ta == "identBox" { isArmTagOf(ix, n, ibFnIx) } else if vi >= 0 && vi < uTags.length { uTags[vi] } else { -1 }
