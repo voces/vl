@@ -219,6 +219,7 @@ import {
   coalChainLinkOf,
   coalClosedWidensAtom,
   coalNulMapJoinStoresAlike,
+  coalNulRefJoinTag,
   coalNulRefJoinWhy,
   coalNulRefPlanOf,
   coalNulRefRungReached,
@@ -623,6 +624,7 @@ import {
   sFieldCount,
   sFieldNames,
   sFieldStart,
+  sTy,
   sTyIx,
   setIrShadowOn,
   synthMintCount,
@@ -6919,9 +6921,9 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if na == "litUnion" { return coalNicheCell(b, n, lhsIx, ix, rep, "litUnion") }
   if na == "nulBool" { return coalNicheCell(b, n, lhsIx, ix, rep, "nulBool") }
   if na != "str" { return irBMiss("coalesce niche " + na) }
-  if coalNulRefArmOf(n, ix, ibFnIx) != "plain" {
-    return irBMiss("coalesce string shape")
-  }
+  const sa = coalNulRefArmOf(n, ix, ibFnIx)
+  if sa == "join" { return coalNulStrJoin(b, n, ix, rep) }
+  if sa != "plain" { return irBMiss("coalesce string shape") }
   const dIx = unwrapParen(n.binRight)
   if dIx < 0 || !(nodeAt(dIx) is StrLit) { return coalNulStr(b, n, ix, rep) }
   const lat = b.length
@@ -6938,6 +6940,41 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if !(d is OStr) { return irBMiss("coalesce string default") }
   const r: Rhs = { czL: l, czD: d, czAt: ix }
   return irBLetTemp(b, r, ix, rep)
+}
+
+// `l ?? d` over a `string | null` whose default joins it into a box: legacy's join at the string
+// heap (`emitCoalesceNulRefJoin` at `sTy()`), the operand staged ahead of its `if` and the default
+// delivered into the result's box on the null path.
+function coalNulStrJoin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  if coalNulRefJoinWhy(n, sTy(), ibFnIx) != "" {
+    return irBMiss("coalesce string join refused")
+  }
+  if !boxOwedAt(n.binRight, ibFnIx) {
+    return irBMiss("coalesce string join default")
+  }
+  if !heldAsBox(rep) { return irBMiss("coalesce string join rep") }
+  const ty = exprTyOf(ix)
+  if irTyOpen(ty) { return irBMiss("open temp type") }
+  const l = irBExpr(b, n.binLeft)
+  if ibMiss != "" { return l }
+  if !(l is OVar) || l.ov < 0 { return irBMiss("coalesce string operand") }
+  if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
+  const t = irVarNew(ib, rep, ty, "local", -1)
+  const nb: i32[] = []
+  const d = deliver(nb, n.binRight, rep, -1)
+  if ibMiss != "" { return d }
+  if irBOpRep(d) != rep { return irBMiss("coalesce string default rep") }
+  irBNode(nb, { asDst: t, asSrc: d }, -1, ibNoValue, ix)
+  const arm: CoalValArm = "nulStr"
+  irBNode(
+    b,
+    { cbL: l, cbLB: [], cbArm: arm, cbNull: nb, cbOut: t, cbAt: ix, cbMap: null },
+    ty,
+    rep,
+    ix,
+  )
+  const o: Opnd = { ov: t }
+  return o
 }
 
 // `l ?? d` over a `string | null` whose default computes: legacy's `br_on_non_null` core at the
