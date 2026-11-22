@@ -1,3 +1,0 @@
-## Codegen, memory & runtime (Track B)
-
-- **Fix D17053: `x is S[]` over `string[] | (string | null)[]` trapped on a null element.** The two arms share the string list's box tag. The `listAcross` plan skipped the nullable arm, so its values ran the `string[]` arm's string loop, which casts each element non-null. The plan now tests a `(string | null)[]` arm against a string literal list with a null-tolerant string test (`LIST_ARM_NULSTRS`, element mode `nulstr`), and that test answers for a `string[]` arm sharing its tag. A `(string | null)[]` whose elements are all members now fits too, where it was skipped.
