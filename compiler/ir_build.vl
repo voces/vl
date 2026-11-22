@@ -10,6 +10,7 @@ import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
+import { slotRowTyOf } from "./emit_rep"
 import {
   bundleAnyNoted,
   bundleParamOfRead,
@@ -144,6 +145,7 @@ import {
   irLowerFragment,
   irLoweredEntry,
   irSlotRunAgrees,
+  irSlotRowTy,
   irSlotValtype,
   mapRecvGlobalIx,
   valtypeOf,
@@ -1718,6 +1720,9 @@ function exprRepOf(ix: i32): i32 {
 // `ix`'s type: its callee's result for an untyped call of a declaration (an operator a generic
 // instance rewrote to its overload), else its recorded type.
 function exprTyOf(ix: i32): i32 {
+  // A read of a parameter held at the row legacy declares it at reads that row.
+  const pv = declRowParamVarOf(ix)
+  if pv >= 0 { return ib.irVars[pv].vTy }
   // A read at its storage is of the type its storage holds, past its narrowing.
   if isStorageRead(ix) {
     const st = readNarrowedStoreAt(ix, ibFnIx)
@@ -1926,7 +1931,24 @@ export function irBDeclVar(d: i32): i32 {
     irBMiss("atom cell local rep")
     return -1
   }
+  const lt = declRowLetTy(d, rep)
+  if lt >= 0 { return declVarAt(d, repNodeOfTy(lt), lt) }
   return declVarAt(d, rep, ty)
+}
+
+// The record type of the struct row legacy declares `let` `d`'s local at, where that row is not
+// rep `rep` and the initializer reads a parameter held at that row (`declRowParamVarOf`); else -1.
+function declRowLetTy(d: i32, rep: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letInit < 0 { return -1 }
+  const pv = declRowParamVarOf(unwrapParen(n.letInit))
+  if pv < 0 { return -1 }
+  const s = declaredSlotOfDecl(d)
+  const slot = if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 }
+  const lt = irSlotRowTy(slot)
+  if lt < 0 || repNodeOfTy(lt) == rep { return -1 }
+  return if repNodeOfTy(lt) == ib.irVars[pv].vRep { lt } else { -1 }
 }
 
 // Whether local `v`, declared at `d` and not yet used, takes its initializer's rep `built` as its
@@ -8519,7 +8541,29 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
 // closure per signature it is called at (`bundleRecordTyOf`), else its checker type, closed at the
 // instance the checker recorded.
 function paramHeldTy(p: i32, fnIx: i32): i32 {
-  return bundleHeldTy(p, heldTy(scopeTyAt(p, fnIx)))
+  const ty = bundleHeldTy(p, heldTy(scopeTyAt(p, fnIx)))
+  const dt = paramDeclRowTy(p)
+  return if dt >= 0 && repNodeOfTy(dt) != repNodeOfTy(ty) { dt } else { ty }
+}
+
+// The variable of parameter read `ix` where the IR holds it at legacy's declared row
+// (`paramDeclRowTy`), or -1.
+function declRowParamVarOf(ix: i32): i32 {
+  const d = identDeclOf(ix)
+  if d < 0 || !(nodeAt(d) is Param) { return -1 }
+  const v = boundVarOf(ix)
+  if v < 0 || ibFnIx < 0 || ibFnIx >= P.nodes.length { return -1 }
+  const fn = nodeAt(ibFnIx)
+  if !(fn is FuncDecl) { return -1 }
+  const i = ib.irVars[v].vSlot - envSlotShift(ibFnIx)
+  if i < 0 || i >= fn.fnParams.length { return -1 }
+  return if ib.irVars[v].vTy == paramDeclRowTy(fn.fnParams[i]) { v } else { -1 }
+}
+
+// The record type of the struct row legacy declares parameter `p` at (`paramStructIdxOf`), or -1.
+function paramDeclRowTy(p: i32): i32 {
+  if vtKindOfParam(p) != "struct" { return -1 }
+  return slotRowTyOf(paramStructIdxOf(p))
 }
 
 // Bundle parameter `p`'s open type `ty` as its record of one closure per signature; any other
