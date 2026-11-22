@@ -33,5 +33,6 @@ bundle record handed on whole, e.g. `function only(f) { other(f) }`.
 | filed witnesses | 17,842 → 17,846 | 3,709 → 3,710 |
 
 First misses in tests/cases:
-- `bundle argument`: 124 → out of the top 60.
+- `bundle argument` rows: 161 → 42 (`fnRead` 31, `choice` 9, `closed parameter` 2). The
+  summary's distinct-function count was 124.
 - `argument coercion`: 37 → 51, the next miss the callers reach.
