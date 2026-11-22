@@ -1,0 +1,192 @@
+// The IR order check over the distilled corpus and every `tests/cases` program: each is built
+// under `$VL_IR_SHADOW=6`, which builds every function where a claim builds it, before legacy
+// emits it, and again after, as the shadow does. A `prepost differs` row names a function whose
+// IR or lowering depends on the order, so a builder or plan read state legacy fills while
+// emitting; the identity checks cannot see it, since the shadow always runs after legacy.
+//
+//     vl run scripts/silent-sweep/distilled/ir-prepost.vl -- [--seed P] [--write-baseline]
+//
+// It exits 1 on a row above `ir-prepost-baseline.txt` (one `<n>\t<path>\t<row>` line each); a row
+// that fell prints and passes. Exit 2 is the harness failing: a chunk that did not finish, or no
+// `[ir]` row at all. Run it from the checkout root; chunks run `$JOBS` at a time (default 4).
+
+import { IoError, readTextFile, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { exit } from "std:process"
+import { parseI32, toString } from "std:fmt"
+import { endsWith, join, split, startsWith, trim } from "std:str"
+import { sort } from "std:array"
+import { die, envOr, fanOutArgv, hasFlag } from "../../lib/common"
+import { cellsIn, makeTempDir, spawn, writeText } from "../../lib/corpus"
+
+const HERE = "scripts/silent-sweep/distilled"
+const BASELINE = "scripts/silent-sweep/distilled/ir-prepost-baseline.txt"
+const PREFIX = "[ir] "
+const ROW = "prepost"
+const CHUNK = 200
+
+type Row = { key: string, n: i32 }
+
+// The value after `flag` in the arguments, or `dflt`.
+function argOr(args: readonly string[], flag: string, dflt: string): string {
+  let i = 0
+  while i + 1 < args.length {
+    if args[i] == flag { return args[i + 1] }
+    i = i + 1
+  }
+  return dflt
+}
+
+// Every corpus cell, then every tracked `tests/cases` program but a capability matrix, sorted.
+function programs(): string[] {
+  const out: string[] = []
+  for part in ["cells", "named"] {
+    for n in cellsIn(HERE + "/" + part) {
+      out.push(HERE + "/" + part + "/" + n + ".vl")
+    }
+  }
+  const x = spawn("git", ["ls-files", "tests/cases"])
+  if x.code != 0 { die("ir-prepost: git ls-files tests/cases failed\n\{x.err}", 2) }
+  for line in split(x.out, "\n") {
+    if endsWith(line, ".vl") && !endsWith(line, ".matrix.vl") { out.push(line) }
+  }
+  sort(out, (a: string, b: string) => a < b)
+  return out
+}
+
+function readOr(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError { return "" }
+  return t
+}
+
+function bump(rows: Row[], key: string, n: i32) {
+  for r in rows {
+    if r.key == key {
+      r.n = r.n + n
+      return 0
+    }
+  }
+  rows.push({ key: key, n: n })
+  return 0
+}
+
+function countOf(rows: Row[], key: string): i32 {
+  for r in rows {
+    if r.key == key { return r.n }
+  }
+  return 0
+}
+
+// What one run measured: the order rows keyed `<path>\t<row>`, how many `[ir]` lines printed at
+// all, and the chunks that did not finish.
+type Measured = { rows: Row[], seen: i32, broken: string[] }
+
+// Builds every program under the order check, `jobs` chunks at a time.
+function measure(paths: string[], seed: string, jobs: string): Measured {
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const root = makeTempDir()
+  const chunks: string[] = []
+  let i = 0
+  while i < paths.length {
+    const f = root + "/chunk-" + toString(chunks.length)
+    const end = if i + CHUNK < paths.length { i + CHUNK } else { paths.length }
+    writeText(f, join(paths.slice(i, end), "\n") + "\n")
+    chunks.push(f)
+    i = end
+  }
+  writeText(root + "/chunks", join(chunks, "\n") + "\n")
+  // `$0` is the host, `$1` the seed and `$2` the chunk; each chunk's exit code lands beside it.
+  const sh = "VL_IR_SHADOW=6 timeout 1200 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
+    + " > /dev/null 2> \"$2.err\"; echo $? > \"$2.rc\""
+  const x = spawn("sh", fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, seed]))
+  const m: Measured = { rows: [], seen: 0, broken: [] }
+  if x.code != 0 {
+    spawn("rm", ["-rf", root])
+    die("ir-prepost: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
+  }
+  for f in chunks {
+    const rc = parseI32(trim(readOr(f + ".rc")))
+    // 0 and 1 are `vl check` grading the chunk; anything else is the chunk not finishing.
+    if rc != 0 && rc != 1 { m.broken.push(f + " (rc=\{toString(rc ?? -1)})") }
+    for line in split(readOr(f + ".err"), "\n") {
+      if !startsWith(line, PREFIX) { continue }
+      const c = line.indexOf(": ")
+      const t = line.indexOf("\t")
+      if c < 0 || t < c { continue }
+      m.seen = m.seen + 1
+      const row = line.slice(t + 1, line.length)
+      const n = parseI32(trim(line.slice(c + 2, t)))
+      if n != null && startsWith(row, ROW) {
+        bump(m.rows, line.slice(PREFIX.length, c) + "\t" + row, n ?? 0)
+      }
+    }
+  }
+  spawn("rm", ["-rf", root])
+  return m
+}
+
+// The committed rows, one `<n>\t<path>\t<row>` line each.
+function loadBaseline(): Row[] {
+  const rows: Row[] = []
+  const text = readTextFile(BASELINE)
+  if text is IoError { return rows }
+  for line in split(text, "\n") {
+    if line == "" || startsWith(line, "#") { continue }
+    const t = line.indexOf("\t")
+    const n = if t < 0 { null } else { parseI32(line.slice(0, t)) }
+    if n == null { die("ir-prepost: \{BASELINE}: no count in `\{line}`", 2) }
+    rows.push({ key: line.slice(t + 1, line.length), n: n ?? 0 })
+  }
+  return rows
+}
+
+function writeBaseline(rows: Row[]) {
+  let text = "# IR order-check rows over the distilled corpus and tests/cases, which `ir-prepost.vl`\n"
+    + "# holds at these counts. A row leaves as its fix lands. Rewrite: -- --write-baseline\n"
+  for r in rows { text = text + "\{r.n}\t\{r.key}\n" }
+  const w = writeTextFile(BASELINE, text)
+  if w != null { die("ir-prepost: cannot write \{BASELINE} (\{w.msg})", 2) }
+  print("wrote \{BASELINE}: \{rows.length} rows")
+  return 0
+}
+
+function main(args: readonly string[]) {
+  const seed = argOr(args, "--seed", "build/vl-compiler.wasm")
+  const paths = programs()
+  const m = measure(paths, seed, envOr("JOBS", "4"))
+  for b in m.broken { print("ir-prepost: chunk did not finish: \{b}") }
+  if m.broken.length > 0 { exit(2) }
+  if m.seen == 0 {
+    die("ir-prepost: no `[ir]` rows; the seed or the host predates `$VL_IR_SHADOW=6`", 2)
+  }
+  sort(m.rows, (a: Row, b: Row) => a.key < b.key)
+  if hasFlag(args, "--write-baseline") { return writeBaseline(m.rows) }
+  const base = loadBaseline()
+  let red = false
+  for r in m.rows {
+    const was = countOf(base, r.key)
+    if r.n > was {
+      print("ir-prepost: a function depends on the build order: \{r.key}: \{was} -> \{r.n}")
+      red = true
+    }
+  }
+  for b in base {
+    const now = countOf(m.rows, b.key)
+    if now < b.n {
+      print("ir-prepost: \{b.key} fell: \{b.n} -> \{now} (re-run with --write-baseline)")
+    }
+  }
+  print("ir prepost: \{m.rows.length} order rows over \{paths.length} programs")
+  if red { exit(1) }
+  print("ir-prepost: ok")
+  return 0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("ir-prepost: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
