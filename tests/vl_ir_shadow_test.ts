@@ -1497,6 +1497,13 @@ Deno.test({
     if (exp.irVerifySelfTest(106) !== 0) {
       throw new Error(`case 106: want rule 0, got rule ${exp.irVerifySelfTest(106)}`);
     }
+    // Case 107 is a width retag to a supertype whose field leads the record's; 108's does not.
+    if (exp.irVerifySelfTest(107) !== 0) {
+      throw new Error(`case 107: want rule 0, got rule ${exp.irVerifySelfTest(107)}`);
+    }
+    if (exp.irVerifySelfTest(108) !== 2) {
+      throw new Error(`case 108: want rule 2, got rule ${exp.irVerifySelfTest(108)}`);
+    }
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
@@ -2803,6 +2810,25 @@ Deno.test({
       if ((rows.get("start uncovered argument coercion") ?? 0) !== 0 || (rows.get("start matched") ?? 0) !== 1) {
         throw new Error(`want the start body covered and matched, got ${JSON.stringify([...rows])}`);
       }
+    }
+  },
+});
+
+// A record delivered by width (`Cat` to `Animal`) is its value as it stands, the supertype legacy's
+// type section declares (`recSubRetag`): at a module initializer, a local declaration and an
+// argument.
+const WIDTH_RETAG =
+  `type Animal = { legs: i32 }\ntype Cat = { legs: i32, purr: boolean }\nfunction mkCat(): Cat { return { legs: 4, purr: true } }\nfunction take(a: Animal) { print(a.legs) }\nfunction local(c: Cat) {\n  const a: Animal = c\n  print(a.legs)\n}\nconst asAnimal: Animal = mkCat()\nprint(asAnimal.legs)\nlocal(mkCat())\ntake(mkCat())\n`;
+Deno.test({
+  name: "ir shadow: a record delivered at a declared supertype is retagged and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(WIDTH_RETAG, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("covered") ?? 0) !== (rows.get("fns") ?? -1) || (rows.get("start matched") ?? 0) !== 1) {
+      throw new Error(`want every function and the start body covered, got ${JSON.stringify([...rows])}`);
     }
   },
 });
