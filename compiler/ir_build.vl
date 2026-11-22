@@ -315,6 +315,7 @@ import {
   truncSatCallNamed,
   truncSatPlanOf,
   unionConcreteEqPlanOf,
+  userFnCallRoutesRef,
   userFnCallTarget,
   valueIfLitTrue,
   variantFieldArmOf,
@@ -422,6 +423,7 @@ import {
   narrowedMapReadOf,
   retRefusedWhy,
   spreadRunLit,
+  unionBoxArgReadsMapBox,
   unionLitIsPlanOf,
 } from "./wasmEmit"
 import { nodeTyInOf } from "./emit_ty_canon"
@@ -3210,10 +3212,12 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   if lf < 0 && (d < 0 || !(nodeAt(d) is FuncDecl)) {
     return missRhs("call of a non-declaration")
   }
-  const pos = if lf >= 0 { lf } else { fnIndexOfNode(c.callFn) }
-  if pos < 0 || pos >= fnStmts.length || lf < 0 && !callTargetIs(pos, d) {
-    return missRhs("call target")
+  // The function `emitCallCoreUserFn` calls, unless a binding of the name routes it to a closure.
+  const pos = if lf >= 0 { lf } else { userFnCallTarget(c, cf, ibFnIx) }
+  if lf < 0 && userFnCallRoutesRef(c, cf, ibFnIx, pos) {
+    return missRhs("call routed through a closure")
   }
+  if pos < 0 || pos >= fnStmts.length { return missRhs("call target") }
   if lf >= 0 && directCallInstanceArgMisfit(c.callArgs, lf, ibFnIx) >= 0 {
     return missRhs("binding call misfit")
   }
@@ -4375,7 +4379,6 @@ function mapSetValue(
   )
   if !(mr is RMap) { return irBMiss("map store receiver rep") }
   const ty = if arm == "union" { mvValTyIxAt(sh) } else { -1 }
-  if arm == "union" { ib.irUnionStored = true }
   if (
     arm == "union"
     && exprUnion(val, ibFnIx)
@@ -4829,7 +4832,17 @@ function deliver(b: i32[], ix: i32, dst: i32, dstTy: i32): Opnd {
     return memberBoxTemp(b, ix, dst)
   }
   const at = b.length
+  // A union map read boxed at its record (`emitCoerced`), or at the destination's union where none
+  // is owed, is the box ladder's own read.
+  const outer = ib.irUnbankedRead
+  if dst >= 0 && heldAsBox(dst) {
+    const ut = if boxOwedAt(ix, ibFnIx) { holeBoxTyAt(ix, ibFnIx) } else if dstTy >= 0 { dstTy } else { repTyOf(dst) }
+    if unionBoxArgReadsMapBox(ut, ix, ibFnIx) {
+      ib.irUnbankedRead = unwrapParen(ix)
+    }
+  }
   const v = widenTo(b, exprAt(b, ix, true), ix, dst, dstTy)
+  ib.irUnbankedRead = outer
   if ibMiss == "" && boxLeadsAt(b, at) && !boxOfJoinAt(b, at) {
     ifBelowLead(b, at, "box of a valued if")
   }
@@ -5013,7 +5026,7 @@ function boxPlanWhy(p: HoleBox, v: Opnd): string {
     "atomAsStr" => repNodeAt(r) is RAtom
     "nulNiche" => refNullable(r) || strNullable(r)
     "rec" | "obj" => repNodeAt(r) is RRecord
-    "refList" => repNodeAt(r) is RList
+    "refList" | "atomList" => repNodeAt(r) is RList
     "mapScalar" => false
     "map" => repNodeAt(r) is RMap
     "clo" => repNodeAt(r) is RClosure
@@ -5962,7 +5975,9 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   if endsInTemp(b) { return irBMiss("coalesce field after an operand") }
   const r = irBExpr(b, m.memObj)
   if ibMiss != "" { return r }
-  if !(r is OVar) || r.ov < 0 || ib.irVars[r.ov].vKind == "temp" {
+  // A receiver legacy re-emits is read again as the builder read it (`irHoistRecv`).
+  if !(r is OVar) || r.ov < 0 { return irBMiss("coalesce field place") }
+  if ib.irVars[r.ov].vKind == "temp" && !recvReadsAgain(unwrapParen(m.memObj)) {
     return irBMiss("coalesce field place")
   }
   if !(repNodeAt(irBOpRep(r)) is RRecord) {
@@ -5984,6 +5999,15 @@ function coalField(b: i32[], n: BinExpr, lhsIx: i32, ix: i32, rep: i32): Opnd {
   )
   const o: Opnd = { ov: t }
   return o
+}
+
+// Whether the read built at node `ix` can be written again as built (`irHoistRecv`): a variable's
+// read, a global's, or a plain field read of one of those.
+function recvReadsAgain(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if ib.irReadVar.has(ix) || ib.irReadAgain.has(ix) { return true }
+  const m = nodeAt(ix)
+  return ib.irReadField.has(ix) && m is Member && recvReadsAgain(m.memObj)
 }
 
 // `p?.f ?? d` past the boxed and field rungs, along `coalOptArmOf` and `coalOptLeafPlanOf` as
@@ -6237,7 +6261,7 @@ function mapGetOr(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 // A bare map read `m[k]` by legacy's arm (`mapGetArmOf`), its key written as itself: an mv slot's
 // ref value at its niche, or a mono-valued map read at the value's own rep.
 export function mapGetBare(b: i32[], ix: i32, rep: i32): Opnd {
-  return mapGetAt(b, ix, rep, -1, true)
+  return mapGetAt(b, ix, rep, -1, ix != ib.irUnbankedRead)
 }
 
 // `mapGetBare`, or under value-atom kind `box` (not -1) the read the box plan boxes into boxed
@@ -6257,9 +6281,6 @@ function mapGetAt(b: i32[], ix: i32, rep: i32, box: i32, row: boolean): Opnd {
   // A union-valued map's read is its value's box, the null-tagged box on a miss; a narrowed read
   // legacy unboxes after is at another rep and stays a miss.
   if arm == "unionBox" {
-    // Temporary: after a union store the read's element-read row differs from legacy's; the union
-    // box read's row decision (IR-N1) removes this.
-    if ib.irUnionStored { return irBMiss("map read row after a union store") }
     // At its narrowing the read is unboxed to the member's scalar after (`narrowedMapReadOf`).
     const nm = narrowedMapReadOf(ix, ibFnIx)
     const repOk = match nm.nmArm {

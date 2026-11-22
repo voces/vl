@@ -9183,7 +9183,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "rec" | "obj" | "refList" | "map" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "mapScalar" | "ladder" => false
   }
 }
@@ -9196,6 +9196,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbRefNullNone() // the payload slot is unread under the null tag
     }
     "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
@@ -9215,7 +9216,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
     "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
-    "atom" | "lit" => atomBoxTail(p.hbKind)
+    "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
@@ -9225,7 +9226,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // `emitUnionBoxArg` for a value plan `p` decides.
 function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
-  if p.hbArm == "atom" {
+  if p.hbArm == "atom" || p.hbArm == "atomList" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "mapScalar" {
     const mre = nodeAt(unwrapParen(exprIx))
@@ -9281,11 +9282,7 @@ function emitUnionBoxArg(
   }
   boxDstShadowEnter()
   const hp = holeBoxPlanOf(exprIx, unionTy, fnIx)
-  // A niche the union has no arm for is the ladder's record rungs' (`emitUnionBoxNulNiche`'s 0).
-  if (
-    hp.hbArm != "ladder"
-    && (hp.hbArm != "nulNiche" || nulNicheBoxTagOf(unionTy, exprIx, fnIx) >= 0)
-  ) {
+  if !unionBoxArgLadders(hp, unionTy, exprIx, fnIx) {
     // The shadow notes the coerce the ladder's value rungs are reached through, as legacy did.
     const viaCoerce = !exprIsNulNone(exprIx, fnIx)
     if viaCoerce && boxDstShadowArmed() {
@@ -9317,6 +9314,47 @@ function emitUnionBoxArg(
   return emitBoxAtomRetagMembers(ft, tt, exprIx)
 }
 
+// Whether `emitUnionBoxArg` into `unionTy` under hole box plan `hp` takes no value by the plan and
+// reaches its ladder: the plan's own `ladder`, or a niche the union has no arm for (the ladder's
+// record rungs, `emitUnionBoxNulNiche`'s 0).
+function unionBoxArgLadders(
+  hp: HoleBox,
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  return hp.hbArm == "ladder"
+    || hp.hbArm == "nulNiche" && nulNicheBoxTagOf(unionTy, exprIx, fnIx) < 0
+}
+
+// Whether `emitUnionBoxArgGo` writes `exprIx` by its union-valued map read rung: not a `null`, and
+// a read of a map whose value is a union.
+function unionBoxArgGoMapRead(exprIx: i32, fnIx: i32): boolean {
+  if exprIsNulNone(exprIx, fnIx) { return false }
+  const rd = nodeAt(unwrapParen(exprIx))
+  if !(rd is Index) || !exprMap(rd.idxArr, fnIx) { return false }
+  const sh = mapShapeOfExpr(rd.idxArr, fnIx)
+  return sh >= 0 && sh < mvValRep.length && mvValKindAt(sh) == "union"
+}
+
+// Whether `emitUnionBoxArg` into `unionTy` writes map read `exprIx` itself, past `emitExpr`, by its
+// ladder's union-valued map rung (`emitMapGetUnionBox`), so the read banks no element-read row.
+export function unionBoxArgReadsMapBox(
+  unionTy: i32,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  if !unionBoxArgGoMapRead(exprIx, fnIx) || mapTwinUnionMember(unionTy) >= 0 {
+    return false
+  }
+  return unionBoxArgLadders(
+    holeBoxPlanOf(exprIx, unionTy, fnIx),
+    unionTy,
+    exprIx,
+    fnIx,
+  )
+}
+
 function emitUnionBoxArgGo(
   unionName: string,
   unionTy: i32,
@@ -9341,22 +9379,13 @@ function emitUnionBoxArgGo(
   // the rep the two nulls differ: the sentinel is a bare `ref.null` in the vals slot, `J`'s own
   // null arm a null-tagged box. `emitMapGetUnionBox` is exactly that conversion.
   const bxIdx = nodeAt(unwrapParen(exprIx))
-  if bxIdx is Index {
-    if exprMap(bxIdx.idxArr, fnIx) {
-      const bxSh = mapShapeOfExpr(bxIdx.idxArr, fnIx)
-      if bxSh >= 0 && bxSh < mvValRep.length {
-        if mvValKindAt(bxSh) == "union" {
-          const mgFrom: i32[] = []
-          const mgTo: i32[] = []
-          wideRetagPairs(exprIx, fnIx, unionTy, mgFrom, mgTo)
-          if emitMapGetUnionBox(bxIdx.idxArr, bxIdx.idxIndex, fnIx) < 0 {
-            return -1
-          }
-          if mgFrom.length > 0 { emitWideRetagChain(mgFrom, mgTo) }
-          return 0
-        }
-      }
-    }
+  if bxIdx is Index && unionBoxArgGoMapRead(exprIx, fnIx) {
+    const mgFrom: i32[] = []
+    const mgTo: i32[] = []
+    wideRetagPairs(exprIx, fnIx, unionTy, mgFrom, mgTo)
+    if emitMapGetUnionBox(bxIdx.idxArr, bxIdx.idxIndex, fnIx) < 0 { return -1 }
+    if mgFrom.length > 0 { emitWideRetagChain(mgFrom, mgTo) }
+    return 0
   }
   const bxMap = emitUnionMapArmBox(unionName, unionTy, exprIx, fnIx)
   if bxMap < 0 { return -1 }
@@ -10330,20 +10359,21 @@ function emitUnionConcreteEq(
     fbI32Bin(70)
     fbElse()
   }
-  // tag == tagOf(atom), gating the payload compare.
+  // The plain arm's tails, around a stashed box and the operand's null legs. The tag is the
+  // concrete operand's own arm type's, as the box site composes it (`cloBoxOwnFnTy`).
+  const qt: UnionEqPlan = {
+    uqKind: eak,
+    uqTag: unionEqTagOfArmTy(
+      eak,
+      cloBoxEqArmTy(otherIx, unr[0], fnIx),
+    ),
+  }
   if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if eqOnce { fbLocalTee(eqStash) }
-  fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  // The CONCRETE operand's own arm type, through the very composition the BOX site uses
-  // (`cloBoxOwnFnTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
-  // actually writes.
-  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx)))
-  fbI32Bin(70)            // 0x46 i32.eq
-  fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
+  unionEqTagTail(qt)
   if eqOnce { fbLocalGet(eqStash) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  if emitUnionPayloadUnbox(eak) < 0 { return -1 }
+  if unionEqPayloadTail(qt) < 0 { return -1 }
   if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
   if (
@@ -10352,16 +10382,9 @@ function emitUnionConcreteEq(
   ) {
     fbRefAsNonNull()
   }
-  // D-EQOPCODE: the payload compare is the last projection of `eak`, which already chose
-  // the box tag, the payload unbox and the widened operand emit above it.
-  if emitUnionAtomPayloadEq(eak, fnIx) < 0 { return -1 }
-  fbElse() // 0x05 else: wrong-rep arm — structurally unequal
-  fbI32Const(0)
-  fbEnd()  // 0x0b end
+  if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
   if nulOther || nulStrOther || nulBoolOther { fbEnd() }
-  if isNe {
-    fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
-  }
+  if isNe { fbI32Eqz() }
   return 0
 }
 
@@ -17733,13 +17756,27 @@ export function refListGetTail(
   // (D451): without it `vl check` proves `xs[0]` non-null and every classifier calls it
   // an `i32`, but this arm still leaves the raw `(ref $uBox)` for an unboxed consumer —
   // invalid wasm. Routed through the shared `emitUnionUnboxTail`, not an open-coded unbox.
-  const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
-  if iCon != 0 { return iCon - 1 }
-  if indexElemUnionName(idxIx, fnIx) != "" {
-    const iuk = idxNarrowAtomKind(idxIx, fnIx)
-    if iuk >= 0 && iuk != nullValKind() { return emitUnionUnboxTail(iuk) }
+  const u = refListReadUnboxOf(idxIx, fnIx)
+  if u == REF_READ_CONTAINER {
+    const iCon = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
+    return iCon - 1
   }
+  if u >= 0 { return emitUnionUnboxTail(u) }
   return 0
+}
+
+// `refListReadUnboxOf`'s answer for a read unboxed to its narrowed container's payload.
+export const REF_READ_CONTAINER = 0 - 2
+
+// What `refListGetTail` leaves past the recovered element of a ref list read `idxIx` whose
+// element is not nullable: the narrowed container's payload (`REF_READ_CONTAINER`), an atom
+// kind's unboxed scalar (the kind), or the element itself (-1).
+export function refListReadUnboxOf(idxIx: i32, fnIx: i32): i32 {
+  const con = placeReadContainerAt(idxIx, fnIx)
+  if con == RC_REF_LIST || con == RC_MAP { return REF_READ_CONTAINER }
+  if indexElemUnionName(idxIx, fnIx) == "" { return -1 }
+  const iuk = idxNarrowAtomKind(idxIx, fnIx)
+  return if iuk >= 0 && iuk != nullValKind() { iuk } else { -1 }
 }
 
 // A SCALAR list `xs[i]`: unwrap to its backing and `array.get <back>`,
@@ -27460,7 +27497,7 @@ export function userFnCallTarget(c: Call, callee: Ident, fnIx: i32): i32 {
 // Whether `emitCallCoreUserFn` sends call `c` to `emitCallRef`, given `target` from
 // `userFnCallTarget`: a live closure binding (D1602) or bundle parameter of the name outranks the
 // function, and a name with none routes by `unknownCallRoutesRef`. A later local does not (D3607).
-function userFnCallRoutesRef(
+export function userFnCallRoutesRef(
   c: Call,
   callee: Ident,
   fnIx: i32,
@@ -27508,87 +27545,62 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   return emitDirectCall(callIx, fnIx, target)
 }
 
+// The arm `emitCallCoreIdent` writes named call `c` of `callee` with, after a holder's: a builtin
+// or intrinsic matched by spelling where no user function or binding owns the name, else the
+// user-function tail.
+type IdentCallArm = "strFromBytes" | "fromCodePoints" | "fromCodePoint" | "print" | "memAccess"
+  | "memOp" | "simd" | "atomic" | "truncSat" | "log" | "host" | "trap" | "arrNew" | "arrCopy"
+  | "userFn"
+
+function identCallArmOf(c: Call, callee: Ident, fnIx: i32): IdentCallArm {
+  // A user function of the name wins over a spelling match, which would otherwise route a
+  // same-named declaration into the builtin (D975).
+  const userOwnsName = fnIndexOfNode(c.callFn) >= 0
+  // The scope's answer for the dunder intrinsics, whose arms match the spelling alone.
+  const userBindsName = identNameIsUserBound(c.callFn, fnIx)
+  const nm = callee.identName
+  if strFromBytesCallNamed(c, fnIx) { return "strFromBytes" }
+  if !userOwnsName && nm == "fromCodePoints" { return "fromCodePoints" }
+  if !userOwnsName && nm == "fromCodePoint" { return "fromCodePoint" }
+  if !userOwnsName && nm == "print" { return "print" }
+  if memAccessCallNamed(c, fnIx) { return "memAccess" }
+  if memOpCallNamed(c, fnIx) { return "memOp" }
+  if simdCallNamed(c, fnIx) { return "simd" }
+  if atomicCallNamed(c, fnIx) { return "atomic" }
+  if truncSatCallNamed(c, fnIx) { return "truncSat" }
+  if !userBindsName && nm == "__log__" { return "log" }
+  // A host call or an extern lowers to an import reserved only when used; a parameter of its
+  // name wins, as for every spelling-matched arm.
+  if hostCallNamed(c, fnIx) { return "host" }
+  if trapCallNamed(c, fnIx) { return "trap" }
+  if arrNewCallNamed(c, fnIx) { return "arrNew" }
+  if arrCopyCallNamed(c, fnIx) { return "arrCopy" }
+  return "userFn"
+}
+
 // `emitCallCore`'s named-callee arm: the builtins and intrinsics matched by spelling where
 // no user declaration or binding owns the name, then `emitCallCoreUserFn`. Returns 0 or -1.
 function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
-  // a user function of the same name must win: checked before any spelling-based
-  // builtin match, since matching by spelling alone routes a same-named user
-  // declaration into the builtin instead — a whole-set bug, not one name's (D975,
-  // filed as a refutation pin: that collision surface must not come back).
-  const userOwnsName = fnIndexOfNode(c.callFn) >= 0
   // A call through a holder of a returned record picks its member (D15144).
   const hcall = emitHolderCall(callIx, c, fnIx)
   if hcall != 1 { return hcall }
-  // the scope's answer for the dunder intrinsics, whose arms below match the
-  // spelling with no declaration lookup at all. See `identNameIsUserBound`.
-  const userBindsName = identNameIsUserBound(c.callFn, fnIx)
-  // `__str_from_bytes__(src, at, count)` (D4784): one call into the helper, which bounds-checks
-  // the range against `src`'s length and copies it into an exact-fit string.
-  if strFromBytesCallNamed(c, fnIx) { return emitCallCoreStrFromBytes(c, fnIx) }
-  // `fromCodePoints(xs)` (H2): bulk string construction into the shared `__utf8_enc__`
-  // helper, UTF-8-encoding the list's live code points into an exact-fit backing. Each
-  // i32 is a code point, never a byte — filling the buffer by `buf.push(s[i])` instead
-  // pushes bytes and double-encodes with no type error, so every `std/` builder uses `for cp`.
-  if !userOwnsName && callee.identName == "fromCodePoints" {
-    return emitCallCoreFromCodePoints(callIx, c, fnIx)
+  return match identCallArmOf(c, callee, fnIx) {
+    "strFromBytes" => emitCallCoreStrFromBytes(c, fnIx)
+    "fromCodePoints" => emitCallCoreFromCodePoints(callIx, c, fnIx)
+    "fromCodePoint" => emitCallCoreFromCodePoint(c, fnIx)
+    "print" => emitCallCorePrint(callIx, c, fnIx)
+    "memAccess" => emitCallCoreMemAccess(c, callee.identName, fnIx)
+    "memOp" => emitCallCoreMemOp(c, fnIx)
+    "simd" => emitSimdIntrinsic(c, callee.identName, fnIx)
+    "atomic" => emitAtomicIntrinsic(c, callee.identName, fnIx)
+    "truncSat" => emitTruncSatIntrinsic(c, callee.identName, fnIx)
+    "log" => emitCallCoreLog(c, fnIx)
+    "host" => emitCallCoreHost(c, fnIx)
+    "trap" => emitCallCoreTrap(c, fnIx)
+    "arrNew" => emitArrayNewIntr(callIx, fnIx)
+    "arrCopy" => emitArrayCopyIntr(callIx, fnIx)
+    "userFn" => emitCallCoreUserFn(callIx, c, callee, fnIx)
   }
-  // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
-  // string from an i32 code point, riding the same `__utf8_enc__` helper `fromCodePoints`
-  // does — a one-element i32 array wrapped around the argument. Sharing the encoder
-  // avoids a second, inlined width-and-shift ladder disagreeing silently with it.
-  if !userOwnsName && callee.identName == "fromCodePoint" {
-    return emitCallCoreFromCodePoint(c, fnIx)
-  }
-  // `print(x)` is a compiler builtin lowered to the host's import family: a
-  // boolean-classified arg calls `__print_bool__`, anything else i32-ish
-  // `__print_i32__`. The call yields nothing (void import).
-  if !userOwnsName && callee.identName == "print" {
-    return emitCallCorePrint(callIx, c, fnIx)
-  }
-  // Every load and store width (`buffer-design.md` §C2), lowered inline: the address, a store's
-  // value at its declared width, then the opcode at its natural alignment (`memAccessPlanOf`).
-  if memAccessCallNamed(c, fnIx) {
-    return emitCallCoreMemAccess(c, callee.identName, fnIx)
-  }
-  // The memory-management intrinsics (`buffer-design.md` §B2, §C3, §S4): `memory.size`/`grow`,
-  // the bulk pair, the heap window's globals and the shared-memory flag (`memOpPlanOf`).
-  if memOpCallNamed(c, fnIx) { return emitCallCoreMemOp(c, fnIx) }
-  // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
-  // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
-  // Dispatched by name like the memory intrinsics above it.
-  if simdCallNamed(c, fnIx) {
-    return emitSimdIntrinsic(c, callee.identName, fnIx)
-  }
-  // The threads-proposal atomics (`simd-design.md` §G1), the 0xFE-prefix family.
-  if atomicCallNamed(c, fnIx) {
-    return emitAtomicIntrinsic(c, callee.identName, fnIx)
-  }
-  // The scalar saturating truncations, one `0xFC` instruction each.
-  if truncSatCallNamed(c, fnIx) {
-    return emitTruncSatIntrinsic(c, callee.identName, fnIx)
-  }
-  if !userBindsName && callee.identName == "__log__" {
-    return emitCallCoreLog(c, fnIx)
-  }
-  // ── host calls: the `std:fs` floor and user `extern function`s ─────────────
-  // Each lowers to a call of an import reserved only when used, so a miss fails loudly. An
-  // extern is guarded like every spelling-matched arm: a parameter of its name must win.
-  if hostCallNamed(c, fnIx) { return emitCallCoreHost(c, fnIx) }
-  // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
-  // lowered INLINE to single WasmGC instructions (array.new /
-  // array.new_default / array.copy / unreachable). `__trap__()` is the
-  // deliberate abort primitive.
-  if trapCallNamed(c, fnIx) { return emitCallCoreTrap(c, fnIx) }
-  // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
-  // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both yield the
-  // `{backing, len: n, cap: n}` list wrapper, staging the length in the 1-slot arrNew
-  // scratch local. Native element coverage: i32 (i32/boolean) and, for `__array_new__`, f64.
-  if arrNewCallNamed(c, fnIx) { return emitArrayNewIntr(callIx, fnIx) }
-  // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the two
-  // lists' backings (memmove semantics; OOB spans trap via the instruction's own
-  // check). Operand order matches the instruction's stack shape, so no scratch is needed.
-  if arrCopyCallNamed(c, fnIx) { return emitArrayCopyIntr(callIx, fnIx) }
-  return emitCallCoreUserFn(callIx, c, callee, fnIx)
 }
 
 // A call through a value this instance types `null` itself, which a guard leaves dead: the
@@ -28282,20 +28294,15 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
     if !exprCallRefPlainHead(callIx, c, fnIx) { return "" }
     return callRefPlainTail(callIx, c, fnIx)
   }
-  const nm = callee.identName
   const d = identDeclOf(c.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  // A binding's call is legacy's user-function tail unless a builtin of its spelling takes it.
   if (
     !(dn is LetDecl || dn is Param || dn is LoopVar)
-    || nm.length < 1
-    || nm.length >= 2 && nm.slice(0, 2) == "__"
+    || identCallArmOf(c, callee, fnIx) != "userFn"
   ) {
     return ""
   }
-  if nm == "print" || nm == "fromCodePoint" || nm == "fromCodePoints" {
-    return ""
-  }
-  if fsIntrinsicSlot(nm) >= 0 || externLinkOf(nm) >= 0 { return "" }
   if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
   if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
   if holderRecordSigs(d, fnIx).length > 0 { return "" }
@@ -31639,11 +31646,10 @@ function emitDelivered(ix: i32, fnIx: i32): i32 {
 function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   if ck == "box" {
     // The seat is spent, so the value inside the box, and any conversion recorded beside it, runs.
-    const bt = boxRecordTyAt(exprIx, fnIx)
     const seat = boxSeat
     boxSeat = -1
     if boxDstShadowArmed() { boxDstShadowAs("table") }
-    const rb = emitUnionBoxArg("", boxRecordUnionTyOf(bt), exprIx, fnIx)
+    const rb = emitUnionBoxArg("", holeBoxTyAt(exprIx, fnIx), exprIx, fnIx)
     boxSeat = seat
     return rb
   }
