@@ -473,6 +473,26 @@ Deno.test("parse: lines the report does not own come back verbatim", () => {
   eq(r.results.map((x) => x.path), ["a"], "and the real line still parses");
 });
 
+Deno.test("parse: a top-level output block belongs to its file, not to a test", () => {
+  const text = [
+    "/x/t.test.vl",
+    "       --- top-level output ---",
+    "       setup line 1",
+    "       setup line 2",
+    "  FAIL a",
+    "       boom",
+    "1 file · 0 passed · 1 failed",
+  ].join("\n");
+  const r = parseTestReport(text);
+  eq(
+    r.topLevelOutputs,
+    [{ file: "/x/t.test.vl", output: "setup line 1\nsetup line 2" }],
+    "the block, attributed to the header above it",
+  );
+  eq(r.results[0].message, "boom", "the test after it keeps its own block");
+  eq(r.unmatched, [], "nothing unclassified");
+});
+
 Deno.test("parse: empty input is an empty report, not a crash", () => {
   const r = parseTestReport("");
   eq(
