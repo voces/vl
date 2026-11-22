@@ -30,5 +30,5 @@ record its delivery needs: `function g(v) { const w = v; return w }` called as
 Parameters at the declared row: 62 in tests/cases, 15 in the corpus; the fallback: 65 and 1.
 Callers newly showing `argument coercion` were already unclaimed (IR-N9's caller-side class).
 Identity (`--names`, mode 3, `--cases`, claimless, tests/cases A/B): 0 differ. Legacy lines
-deleted: 0. Moved to `@ir`: 0. Found on the way: D17047 (legacy's own row split, check-clean
+deleted: 0. Moved to `@ir`: 0. Found on the way: D17047 (unfiled: D17047, row in #9525; legacy's own row split, check-clean
 invalid wasm), filed separately.
