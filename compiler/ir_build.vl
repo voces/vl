@@ -162,6 +162,7 @@ import {
   PrintArm,
   StructFieldArm,
   VariantFieldArm,
+  VariantIsArm,
   arrCopyCallNamed,
   arrCopyPlanOf,
   arrLitShortWhy,
@@ -338,6 +339,7 @@ import {
   variantFieldArmOf,
   variantFieldBoxTy,
   variantFieldStoreValueArmOf,
+  variantIsArmOf,
   zextLoadOf,
 } from "./wasmEmit"
 import { RefJoin, ifRefJoinOf, strJoinDropsNulAtom } from "./emit_plan_if_join"
@@ -991,12 +993,17 @@ function isRung(b: i32[], n: IsExpr, ix: i32, rep: i32, arm: IsArm): Opnd {
     return isEmptyFit(b, n, ix, rep, p)
   }
   if arm != "variant" && arm != "armTag" { return irBMiss("is rung") }
+  // Each rung's own answer, asked once: the arm tag's `tagIsArmOf`, the variant's plain row.
+  const ta: TagIsArm = if arm == "armTag" { tagIsArmOf(ix, n, ibFnIx) } else { "none" }
+  const vi = if arm == "variant" { isVariantTagPlain(ix, ibFnIx) } else { -1 }
+  if ta == "tagAbsent" { return isTagAbsentTest(rep) }
+  if arm == "variant" && vi < 0 { return isVariantTest(b, n, ix, rep) }
   if !isBoxGuardPlain(ix, ibFnIx) { return irBMiss("is guard") }
   if rep != ibBool { return irBMiss("is result rep") }
-  const tag = boxTestTagOf(n, ix, arm)
+  const tag = boxTestTagOf(n, ix, arm, ta, vi)
   if ibMiss != "" { return irBMiss(ibMiss) }
   // A record's box field is read raw, at its storage, as legacy's `memStruct` arm reads it.
-  const stored = arm == "armTag" && tagIsArmOf(ix, n, ibFnIx) == "memStruct"
+  const stored = arm == "armTag" && ta == "memStruct"
   const mark = if stored { storageReadEnter(n.isObj) } else { storageReadEnter(-1) }
   const v = irBExpr(b, n.isObj)
   storageReadLeave(mark)
@@ -1185,6 +1192,32 @@ function isNulTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   if ibMiss != "" { return v }
   if !nulTestOperandOk(arm, irBOpRep(v)) { return irBMiss("null test operand") }
   return irBLetTemp(b, { ntV: v, ntInvert: invert, ntAt: ix }, ix, rep)
+}
+
+// `recv is V` at the variant rung where `V` has no plain tag, along `variantIsArmOf` as
+// `emitIsTestVariant` writes it: the receiver evaluated and dropped, then its constant. The row
+// arm and the alias arm's tag chain are misses.
+function isVariantTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const na: VariantIsArm = variantIsArmOf(ix, n, ibFnIx, [])
+  if na == "row" { return irBMiss("is variant shape") }
+  if na != "recordTrue" && na != "pinFalse" {
+    return irBMiss("is variant " + na)
+  }
+  const o = irBExpr(b, n.isObj)
+  if ibMiss != "" { return o }
+  irBNode(b, { dpV: o }, -1, ibNoValue, ix)
+  const bits: i64 = if na == "recordTrue" { 1 } else { 0 }
+  const c: Opnd = { oiRep: rep, oiBits: bits }
+  return c
+}
+
+// A box test no arm of whose box carries the tag (`tagIsArmOf`'s `tagAbsent`): `false`, the
+// receiver unread, as legacy's `emitIsTestArmTag` writes it.
+function isTagAbsentTest(rep: i32): Opnd {
+  if rep != ibBool { return irBMiss("is result rep") }
+  const o: Opnd = { oiRep: rep, oiBits: 0 }
+  return o
 }
 
 // An `is` test whose answer is static `v`, as legacy's `isConstAfterRecv` writes it: a receiver
@@ -1606,6 +1639,7 @@ function storedBoxTest(b: i32[], n: IsExpr, ix: i32, rep: i32): Opnd {
   storageReadLeave(mark)
   if arm != "armTag" && arm != "variant" { return irBMiss("is storage rung") }
   if arm == "variant" && tag < 0 { return irBMiss("is variant shape") }
+  if ta == "tagAbsent" { return isTagAbsentTest(rep) }
   if arm == "armTag" && (ta != "identBox" || tag < 0) {
     return irBMiss("is arm tag " + ta)
   }
@@ -1658,19 +1692,23 @@ function rawBoxVar(r: i32): i32 {
   return v
 }
 
-// The tag box test `ix` compares at rung `arm`: a plain variant row's, or the pattern's arm tag
-// over a local box read raw (`tagIsArmOf`'s `identBox`). `tagAbsent` is a constant legacy reads
-// back off its bytes (`staticIsGuard`); only a statement `if` builds it (`isDecidedFalse`).
-function boxTestTagOf(n: IsExpr, ix: i32, arm: IsArm): i32 {
+// The tag box test `ix` compares at rung `arm`: variant row `vi`'s tag, or the pattern's arm tag
+// at `tagIsArmOf`'s answer `ta`: a box value's, a record's box field's, or a local box's read raw
+// (`identBox`). `tagAbsent` never reaches here: it is `isTagAbsentTest`'s.
+function boxTestTagOf(
+  n: IsExpr,
+  ix: i32,
+  arm: IsArm,
+  ta: TagIsArm,
+  vi: i32,
+): i32 {
   if arm == "variant" {
-    const vi = isVariantTagPlain(ix, ibFnIx)
     if vi < 0 || vi >= uTags.length {
       irBMiss("is variant shape")
       return 0
     }
     return uTags[vi]
   }
-  const ta = tagIsArmOf(ix, n, ibFnIx)
   // A box value's tag is read off the receiver's own value, as legacy's `box` arm reads it, and a
   // record's box field off the field read at its storage (`memStruct`).
   if ta == "box" || ta == "memStruct" { return isArmTagOf(ix, n, ibFnIx) }
