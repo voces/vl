@@ -8,32 +8,6 @@ also updates the target doc's status section.
 
 Newest first:
 
-- [2026-11-22-ir-captured-call-instance-rep](2026-11-22-ir-captured-call-instance-rep.md): IR: a captured call's closure typed by the instance legacy calls, 2026-11-22
-- [2026-11-22-ir-open-read-storage](2026-11-22-ir-open-read-storage.md): IR: an open-typed read of a binding held closed reads its storage, 2026-11-22
-- [2026-11-22-ir-num-union-bin](2026-11-22-ir-num-union-bin.md): IR coverage: operators over a numeric union on legacy's `numUnion` route (2026-11-22, lane IR-N7)
-- [2026-11-22-fn-tag-returned-param](2026-11-22-fn-tag-returned-param.md): Fn-tag: a returned parameter callee keeps its set as closures (D17044)
-- [2026-11-22-ir-str-atom-part](2026-11-22-ir-str-atom-part.md): IR: a narrowed literal-union read as a string part (string atom part route), 2026-11-22
-- [2026-11-22-ir-atom-fold-side](2026-11-22-ir-atom-fold-side.md): IR: a narrowed atom read at its own cell (2026-11-22, lane IR-N3)
-- [2026-11-22-ir-box-ladder-checked-list-arm](2026-11-22-ir-box-ladder-checked-list-arm.md): IR: a list literal boxed at its checked ref-list arm (2026-11-22, lane IR-N2)
-- [2026-11-22-ir-index-view](2026-11-22-ir-index-view.md): IR coverage: a list read that may be a view (2026-11-22, lane IR-N1)
-- [2026-11-22-ir-bundle-argument-closed](2026-11-22-ir-bundle-argument-closed.md): IR: a bundle parameter with a closed checked type (2026-11-22, lane IR-D1)
-- [2026-11-22-ir-closure-call-bundle-arg](2026-11-22-ir-closure-call-bundle-arg.md): IR: a function handed through a closure call as a bundle, 2026-11-22
-- [2026-11-22-ir-narrowed-box-read](2026-11-22-ir-narrowed-box-read.md): IR: a box local read at another box-shaped rep (2026-11-22, lane IR-N3)
-- [2026-11-22-ir-box-ladder-atom-list](2026-11-22-ir-box-ladder-atom-list.md): IR: a literal-union list boxed under its arm's tag (2026-11-22, lane IR-N2)
-- [2026-11-22-ir-coal-field-place](2026-11-22-ir-coal-field-place.md): IR coverage: `o.v ?? d` over a global receiver re-reads it as it was read (2026-11-22, lane IR-N1)
-- [2026-11-22-ir-closure-call-dunder-name](2026-11-22-ir-closure-call-dunder-name.md): IR: a parameter spelled like an intrinsic, 2026-11-22
-- [2026-11-22-ir-call-target-scope](2026-11-22-ir-call-target-scope.md): IR: a direct call targets the function legacy's scope chain names, 2026-11-22
-- [2026-11-22-ir-map-read-row](2026-11-22-ir-map-read-row.md): IR: a union map read legacy's box ladder writes itself banks no element-read row (2026-11-22, lane IR-N1)
-- [2026-11-22-ir-index-elem-unboxed](2026-11-22-ir-index-elem-unboxed.md): IR: a ref list read of a box element narrowed at its place (2026-11-22, lane IR-N3)
-- [2026-11-22-ir-captured-hole-reads](2026-11-22-ir-captured-hole-reads.md): IR: a captured hole-lambda binding and a captured cell of hole lambdas (2026-11-22, lane IR-D1)
-- [2026-11-22-ir-box-ladder-self](2026-11-22-ir-box-ladder-self.md): IR: a valued `if` of one variant boxed whole into its union (2026-11-22, lane IR-N2)
-- [2026-11-22-ir-ref-if-chain-join](2026-11-22-ir-ref-if-chain-join.md): IR: a reference join's chain opens every link at its head's join, 2026-11-22
-- [2026-11-22-ir-nul-niche-eq](2026-11-22-ir-nul-niche-eq.md): IR coverage: `==`/`!=` over nullable references on legacy's `nulNiche` route (2026-11-22, lane IR-N7)
-- [2026-11-22-ir-tag-dispatch-expression-callee](2026-11-22-ir-tag-dispatch-expression-callee.md): IR: a tagged call statement reads its callee as any expression, 2026-11-22
-- [2026-11-22-ir-atom-hook](2026-11-22-ir-atom-hook.md): IR coverage: a direct `else if` link at a destination's type has no prelude (2026-11-22, lane IR-N1)
-- [2026-11-22-ir-list-return-into-hole](2026-11-22-ir-list-return-into-hole.md): IR: a record list returned into a result whose type holds a hole (2026-11-22, lane IR-N2)
-- [2026-11-22-ir-bundle-argument](2026-11-22-ir-bundle-argument.md): IR: a bundle argument (2026-11-22, lane IR-D1)
-- [2026-11-21-ir-map-store-scalar-union](2026-11-21-ir-map-store-scalar-union.md): IR: a map store's scalar and union values (2026-11-21, lane IR-N3)
 - [2026-11-22-ir-operand-rep](2026-11-22-ir-operand-rep.md): IR coverage: a literal `is` test over a null-tagged box (2026-11-22, lane IR-N1)
 - [2026-11-22-ir-capture-for-in-variable](2026-11-22-ir-capture-for-in-variable.md): IR: a captured `for-in` variable at its read's rep, gated by legacy's capture valtype, 2026-11-22
 - [2026-11-21-ir-tag-arms-stmt](2026-11-21-ir-tag-arms-stmt.md): IR coverage: a statement call through a tagged function set (2026-11-21, lane IR-N7)

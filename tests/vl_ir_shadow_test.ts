@@ -183,6 +183,28 @@ Deno.test({
   },
 });
 
+// A folded constant's cell is its folded value, the one `*.const` legacy's `emitConstFoldValue`
+// writes, at both integer widths; under the dual emit's control 3 each is a bytes mismatch.
+Deno.test({
+  name: "ir shadow: a folded const cell whose value differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    // Read from a function, so neither cell is promoted into the start body.
+    const src = `const A = 3\nconst B: i32 = A << 4\nconst C: i64 = (1 as i64) << 40\n` +
+      `function show() {\n  print(B)\n  print(C)\n}\nshow()\n`;
+    const ok = run(src, true);
+    const folded = [...ok.rows].filter(([k]) => k.startsWith("const cell folded "));
+    if (folded.length === 0 || folded.some(([k]) => !k.endsWith(": matched"))) {
+      throw new Error(`want every folded cell matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("mismatch bytes: const cell folded "));
+    if (bad.length === 0 || [...rows.keys()].some((k) => k.startsWith("const cell folded ") && k.endsWith(": matched"))) {
+      throw new Error(`want each folded cell a "mismatch bytes: const cell folded" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
@@ -1245,9 +1267,9 @@ print(intr(true, 0.5))
 
 // An instance's `is` test over a box: a tag the box holds is compared off the raw slot, even
 // narrowed, and a tag it lacks is a decided guard whose then arm is not written. Elsewhere the
-// decided constant stays a named miss.
+// decided constant is `false` with the receiver unread, as legacy writes it.
 Deno.test({
-  name: "ir shadow: an instance's arm-tag and decided `is` guards build; a decided test elsewhere misses",
+  name: "ir shadow: an instance's arm-tag and decided `is` guards build, and a decided test elsewhere",
   ignore,
   fn: () => {
     const src = `function kind<T>(v: T): string {
@@ -1266,10 +1288,9 @@ run(2.5)
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("uncovered is arm tag tagAbsent") !== 1) {
-      throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want kind, neg and run covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
