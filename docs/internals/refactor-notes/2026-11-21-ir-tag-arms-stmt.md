@@ -18,14 +18,14 @@ for a call read as a value (`tagDispatch`). A call statement went straight to `c
   `tagDispatchVoid` writes:
   - the callee's id stash;
   - a void `SIf` per member but the last;
-  - each arm as its call statement, at the target legacy resolves (`userFnTargetOf`).
+  - each arm as its call statement, at the target legacy resolves (`userFnCallTarget`).
 
   Otherwise the valued dispatch is built and dropped, its result rep checked only where it is read.
 - **Shared with legacy (`wasmEmit.vl`):** every route the builder adds calls legacy's answer.
   - `callStmtDispatches`: `emitCallStmt`'s dispatch test, split out. The builder routes a call
     statement on it rather than on `exprPrePathWhy`'s expression-side restatement.
   - `tagDispatchTyIsVoid`, which legacy's two inline `isVoidTy(ty) || tyMentionsVoid(ty, 4)` now call.
-  - `userFnTargetOf`, `emitCallCoreUserFn`'s scope-chain lookup.
+  - `userFnCallTarget`, `emitCallCoreUserFn`'s scope-chain lookup (#9453 split it out; exported here).
 - **An arm declines its tail form.** Legacy disarms its tail cursor after a dispatch
   (`dispatchDeclinesTail`), so a lone arm that ends a void function keeps `call`. The arm's effect
   node goes in a new `IrFn.irNoTailEff`, beside `irNoTail` for valued temps. It is set from
