@@ -9,6 +9,7 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
+import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
@@ -291,6 +292,7 @@ import {
   EqRootPlace,
   EqRootPlan,
   GlobalCtx,
+  MapGetOrArm,
   MapUnionPlan,
   SHARED_NULL_NONE,
   arrCopyBacking,
@@ -417,6 +419,9 @@ import {
   mapGetOrNicheHead,
   mapGetOrNicheStash,
   mapGetOrNicheTail,
+  mapGetOrSentinel,
+  mapGetOrSentinelHead,
+  mapGetOrSentinelTail,
   mapGetOrUnionBoxOf,
   mapGetOrUnionBoxOpen,
   mapGetOrUnionBoxTail,
@@ -2473,7 +2478,7 @@ function mapGetOr(r: RMapGetOr) {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if r.mgForm == 1 { "i32" } else if r.mgForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(r.mgForm, arm)
   if (
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
@@ -2586,7 +2591,9 @@ function mapGetOrInlineHead(
   qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 5 {
+  if form == 6 {
+    mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, lw.irAt)))
+  } else if form == 5 {
     mapGetOrUnionHead(sh)
     mapGetOrUnionBoxOpen(sh)
   } else if form == 4 {
@@ -2602,8 +2609,17 @@ function mapGetOrInlineHead(
   return sh
 }
 
+// The legacy arm (`mapGetOrArmOf`) inline form `form` writes: the plain `i32` read (1), an
+// atom-valued map's being that read; an mv slot's (2-5); the sentinel's (6); else the helper.
+function mapGetOrFormArm(form: i32, arm: MapGetOrArm): MapGetOrArm {
+  if form == 1 { return if arm == "atom" { "atom" } else { "i32" } }
+  if form == 6 { return "sentinel" }
+  return if form >= 2 { "mv" } else { "helper" }
+}
+
 // An inline map read's tail after its default, by `form`.
 function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 6 { return mapGetOrSentinelTail() }
   if form == 5 { return mapGetOrUnionBoxTail(sh) }
   if form == 4 { return mapGetOrNicheTail(sh) }
   if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
@@ -2626,7 +2642,7 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if mp.prForm == 1 { "i32" } else if mp.prForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(mp.prForm, arm)
   if (
     arm != want
     || want == "helper"
