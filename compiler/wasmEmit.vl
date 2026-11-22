@@ -20633,6 +20633,11 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   return emitFail("emitProgram: expected a struct equality")
 }
 
+// The eq row a `variantEq` compare at `binIx` reads its fields through: its variant's row.
+export function variantEqRowOf(binIx: i32, fnIx: i32): i32 {
+  return eqRowOfVariant(binEqVariantRow(binIx, fnIx))
+}
+
 // The stash slots a struct compare saves before it stages, `[left, right]`, for `structEqTail`.
 export function structEqEnter(): i32[] { return [eqStashL, eqStashR] }
 
@@ -25653,8 +25658,8 @@ export function maFoldCandidateCount(fnIx: i32): i32 {
 
 // The declaration-time fold's live table for the function currently emitting: parallel to
 // each qualifying `const`'s own node index, the WASM index of its scratch local and the K it
-// folded out. Cleared at the top of `emitFuncBody` — a node index is emitted at most once, so
-// stale rows from a previous function can never be mistaken for this one's.
+// folded out. Cleared at the top of `emitFuncBody` and at each compile's start: node indices
+// restart per compile, so a row left by an earlier program would name this one's nodes.
 let maFoldDeclIx: i32[] = []
 let maFoldWasmSlot: i32[] = []
 let maFoldK: i64[] = []
@@ -27843,7 +27848,7 @@ function emitCallRefArg(
     "armUnbox" => {
       const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-      match armUnboxPlanOf(cvSlot, args[i], fnIx) {
+      match callRefArmUnboxPlan(ckey, i, args[i], fnIx) {
         "asIs" => {}
         "crossTag" => {
           return emitFailCrossTagDelivery(args[i], cvSlot)
@@ -27899,11 +27904,21 @@ function emitCallRefArg(
 
 // How `emitCallRefArg`'s `armUnbox` arm writes argument `a` into the arm at variant slot `slot`:
 // as it stands, unboxed from its union's box, or refused where another arm's tag fits it.
-type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
+export type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
 
 function armUnboxPlanOf(slot: i32, a: i32, fnIx: i32): ArmUnboxPlan {
   if !exprUnion(a, fnIx) { return "asIs" }
   return if variantHasCrossTagFits(slot, a, fnIx) { "crossTag" } else { "unbox" }
+}
+
+// `armUnboxPlanOf` for argument `a` at parameter `i` of closure call key `ckey`.
+export function callRefArmUnboxPlan(
+  ckey: string,
+  i: i32,
+  a: i32,
+  fnIx: i32,
+): ArmUnboxPlan {
+  return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx)
 }
 
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
@@ -27929,7 +27944,7 @@ export function callRefArgPlain(
   }
   const k = sigParamKindAt(ckey, i)
   if arm == "armUnbox" {
-    return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx) == "unbox"
+    return callRefArmUnboxPlan(ckey, i, a, fnIx) != "crossTag"
   }
   if arm == "scalarList" {
     return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
@@ -37948,6 +37963,10 @@ export function wasmEmitStateReset() {
   lmaCallerFn = -1
   lmaValArg = -1
   lmaValNode = -1
+  maFoldCursor = 0
+  maFoldDeclIx = []
+  maFoldK = []
+  maFoldWasmSlot = []
   coerceHeld = -1
   rawReadNode = -1
   mfSrcSlot = -1
@@ -40998,7 +41017,7 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     "str" => emitStrEq(exprIx, fnIx)
     "list" => emitListEqBin(e, exprIx, fnIx)
     "nulTest" => emitNulTestBin(e, fnIx)
-    "variantEq" => emitStructEq(exprIx, fnIx, eqRowOfVariant(binEqVariantRow(exprIx, fnIx)))
+    "variantEq" => emitStructEq(exprIx, fnIx, variantEqRowOf(exprIx, fnIx))
     "structEq" => emitStructEq(exprIx, fnIx, binEqStructRow(exprIx, fnIx))
     // Either side naming a layout without the two agreeing is a compare this emitter refuses
     // rather than guesses at (D57).

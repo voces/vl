@@ -7,7 +7,7 @@ import { blockHasContinueFor } from "./emit_query"
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
-import { binEqStructRow, printUnionPlan } from "./emit_fn_scans"
+import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import {
@@ -2678,8 +2678,7 @@ function structEq(r: RStructEq) {
   const n = nodeAt(r.seAt)
   if !(n is BinExpr) { return irLMiss("record compare node") }
   const fnIx = lw.irAt
-  const row = binEqStructRow(r.seAt, fnIx)
-  if row < 0 { return irLMiss("record compare row") }
+  const row = r.seRow
   const lS = structEqStagesLeft(n.binLeft, n.binRight)
   const rS = structEqStagesRight(n.binRight)
   const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
@@ -3068,7 +3067,9 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       lwSeq = []
       const r = n.efRhs
       if r is RCall {
-        const t = tail && voidTailCallee(r.caCallee) && !irNoTailEffHas(lw, id)
+        const t = tail
+          && (lw.irThunk || voidTailCallee(r.caCallee))
+          && !irNoTailEffHas(lw, id)
         call(r, t)
         irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
@@ -3207,8 +3208,14 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       fbBr(d)
     }
     SReturn => {
-      // A helper's last value falls through its `end`, as the hand-written bodies did.
-      if lw.irHelper && n.rtHas && id == lw.irBody[lw.irBody.length - 1] {
+      // A helper's last value falls through its `end`, as the hand-written bodies did; a
+      // thunk's is its call's tail form.
+      if (
+        lw.irHelper
+        && !lw.irThunk
+        && n.rtHas
+        && id == lw.irBody[lw.irBody.length - 1]
+      ) {
         cond(n.rtV, pending)
         return 0
       }
@@ -3931,7 +3938,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
   // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && f.irAt >= 0, -1, false)
+  body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
   const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
@@ -4212,6 +4219,18 @@ export function irLowerClaim(
     r = r + 1
   }
   return ""
+}
+
+// Lowers `f` for the order check (shadow mode 6) and returns its code entry, writing nothing and
+// banking no row; empty on a miss. Legacy then lowers from the empty lazy frame.
+export function irLowerProbe(f: IrFn, ctx: GlobalCtx): u8[] {
+  const callees0 = dfeCallee.length
+  fbResetLazyFrame()
+  const got = entry(f, ctx)
+  while dfeCallee.length > callees0 { dfeCallee.pop() }
+  fbResetLazyFrame()
+  if lwMiss != "" { return [] }
+  return got
 }
 
 // Lowers runtime helper `f` onto `out`: its locals are its `local` variables, one per slot after
