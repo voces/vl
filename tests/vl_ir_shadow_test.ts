@@ -1481,9 +1481,9 @@ Deno.test({
     if (exp.compileSrc() !== 0) throw new Error("want the priming compile to pass");
     // Each case's id and the rule the verifier must name for it (0: the function holds). Rules 1
     // to 7 each have the case named for them; the rest break rule 2 (a store, an effectful
-    // immediate, a pop, map read, shared read, niche read, unbox, numeric conversion, result pick
-    // or `??` of the wrong operand or out, a stashed record's order, a held global read off its
-    // rep), rule 5 (a fall-through, an out left unwritten), rule 8 (a bounds check with the
+    // immediate, a pop, map read, shared read, niche read, unbox, numeric conversion, result pick,
+    // retag or `??` of the wrong operand or out, a stashed record's order, a held global read off
+    // its rep), rule 5 (a fall-through, an out left unwritten), rule 8 (a bounds check with the
     // bounds rule uninstalled) or rule 10 (a valued block outside a helper whose out is a temp).
     const want: Record<string, number> = {
       "holds": 0,
@@ -1498,6 +1498,7 @@ Deno.test({
       "i32-into-bool-global": 2,
       "bounds-rule-uninstalled": 8,
       "box-immediate-for-call": 2,
+      "box-at-union-type-into-i32": 2,
       "pop-or-of-i32": 2,
       "pop-or-bool-out": 2,
       "pop-or-out-unwritten": 5,
@@ -1513,6 +1514,8 @@ Deno.test({
       "shared-read-global-not-box": 2,
       "niche-read-of-i32": 2,
       "arm-unbox-of-i32": 2,
+      "box-list-retag-into-i32-list": 2,
+      "box-list-retag-into-niche-record-list": 2,
       "num-union-conversion-of-non-box": 2,
       "num-union-conversion-off-result-kind": 2,
       "held-global-read-off-noted-rep": 2,
