@@ -1749,6 +1749,7 @@ import {
   AtomEqArm,
   AtomEqPlan,
   HoleBox,
+  HoleBoxArm,
   IdentReadArm,
   IsArm,
   LIST_ARM_NONNULL,
@@ -9176,6 +9177,15 @@ function emitArmForEffect(blockIx: i32, fnIx: i32) {
 // The box value `exprIx` takes into the union the checker records it delivered into, or -1.
 export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
   return boxRecordUnionTyOf(boxRecordTyAt(exprIx, fnIx))
+}
+
+// Whether arm `a`'s head (`holeBoxHead`) is a tag written ahead of a value that follows it, so a
+// value built before the box sits above that tag. `null` and `lit` write no value after theirs.
+export function holeBoxLeads(a: HoleBoxArm): boolean {
+  return match a {
+    "atom" | "atomAsStr" | "rec" | "obj" | "refList" | "map" | "clo" => true
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "mapScalar" | "ladder" => false
+  }
 }
 
 // What plan `p` writes ahead of its value; a `lit` plan writes its literal too.
@@ -26463,6 +26473,12 @@ function emitTagParamHolds(f: i32, s: i32): boolean {
   return false
 }
 
+// Whether call statement `stmtIx` is a call through a tagged function set, which `emitCallStmt`
+// writes as its dispatch. The IR's builder routes on the same answer.
+export function callStmtDispatches(stmtIx: i32, fnIx: i32): boolean {
+  return fnTagArmsAt(stmtIx, emitTagSetAt(stmtIx, fnIx)).length > 0
+}
+
 // The one result type every member call `arms` gives in function `fnIx`, or -1 when they differ.
 function fnTagArmsOneTy(arms: i32[], fnIx: i32): i32 {
   let t = -1
@@ -26491,7 +26507,7 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
   const ty = tagDispatchTy(callIx, arms, fnIx)
   // A call through a set of void members leaves no value, and answers 1; so does one where some
   // member returns nothing (`void | i32`), whose value no slot can take, each result dropped.
-  const isVoid = isVoidTy(ty) || tyMentionsVoid(ty, 4)
+  const isVoid = tagDispatchTyIsVoid(ty)
   let kind: VKind | null = "i32"
   if !isVoid { kind = repSigKindOfTy(ty) }
   if kind == null {
@@ -26539,6 +26555,12 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
   return if isVoid { 1 } else { 0 }
 }
 
+// Whether a dispatch whose result type is `ty` leaves no value: its members are void, or some
+// member returns nothing (`void | i32`), so each arm's value is dropped.
+export function tagDispatchTyIsVoid(ty: i32): boolean {
+  return isVoidTy(ty) || tyMentionsVoid(ty, 4)
+}
+
 // Whether a return of a dispatch's value declines the tail form: the cursor its last arm's call
 // armed is not the dispatch's own call, so legacy and the IR both keep `call; return`.
 export function dispatchDeclinesTail(): boolean { return true }
@@ -26546,7 +26568,7 @@ export function dispatchDeclinesTail(): boolean { return true }
 // The arm `if` of a dispatch whose result type is `ty`, as legacy's writer opens it; -1 when
 // `ty` has no rep a dispatch's value takes. Only a struct or ref-list result names a table row.
 export function tagDispatchIfOf(ty: i32): i32 {
-  const isVoid = isVoidTy(ty) || tyMentionsVoid(ty, 4)
+  const isVoid = tagDispatchTyIsVoid(ty)
   if isVoid { return fbIf(64) }
   const kind = repSigKindOfTy(ty)
   if kind == null { return -1 }
@@ -27392,7 +27414,7 @@ function armCalleeName(c: Call, callee: Ident): string {
 
 // The function call `c` of `callee` names in frame `fnIx`, or -1. Scope-aware: the flat map keys
 // lifted functions by name, first wins, so this takes the block-local function covering the call.
-function userFnCallTarget(c: Call, callee: Ident, fnIx: i32): i32 {
+export function userFnCallTarget(c: Call, callee: Ident, fnIx: i32): i32 {
   return fnIndexOfInScopeChainAt(
     sidOfNode(c.callFn),
     armCalleeName(c, callee),
@@ -28230,7 +28252,7 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   const d = identDeclOf(c.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
   if (
-    !(dn is LetDecl || dn is Param)
+    !(dn is LetDecl || dn is Param || dn is LoopVar)
     || nm.length < 1
     || nm.length >= 2 && nm.slice(0, 2) == "__"
   ) {
@@ -28615,8 +28637,9 @@ function emitBundleCall(callIx: i32, c: Call, fnIx: i32): i32 {
   return rc
 }
 
-// The member a call `callIx` through a bundle parameter (D14841) reads in frame `fnIx`: the
-// record's heap, field `c<k>`, that closure's type and its `$fnsig` key; `bpField` -1 for none.
+// The member a call `callIx` through a bundle parameter (D14841), or else a named holder
+// (`holderPickOf`), reads in frame `fnIx`: the record's heap, field `c<k>`, that closure's type and
+// its `$fnsig` key; `bpField` -1 for none.
 export type BundlePick = { bpHeap: i32, bpField: i32, bpTy: i32, bpKey: string }
 
 export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
@@ -28624,7 +28647,7 @@ export function bundlePickOf(callIx: i32, fnIx: i32): BundlePick {
   const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
   if !(c is Call) { return none }
   const par = bundleParamOfRead(c.callFn, fnIx)
-  if par < 0 { return none }
+  if par < 0 { return holderPickOf(callIx, fnIx) }
   const sigs = bundleSigsOfParam(par)
   const si = paramStructIdxOf(par)
   const k = bundleFieldOfCall(par, c.callArgs, fnIx)
@@ -28661,29 +28684,73 @@ function emitHolderRead(arg: i32, fnIx: i32): boolean {
 // A call through a `const` holding a returned record whole: the member the elaboration noted
 // for this call, called at its signature (D15144). 1 where the callee is no such holder.
 function emitHolderCall(callIx: i32, c: Call, fnIx: i32): i32 {
-  const cfx = unwrapParen(c.callFn)
-  if cfx < 0 { return 1 }
-  // A call through a field's place holding the record whole is the same call (B2).
-  const place = nodeAt(cfx) is Member || nodeAt(cfx) is Index
-  if !place && !(nodeAt(cfx) is Ident) { return 1 }
-  const d = if place { -1 } else { identDeclOf(cfx) }
-  const sigs = if place { placeRecordSigs(callIx, fnIx) } else { holderRecordSigs(d, fnIx) }
-  if sigs.length == 0 { return 1 }
-  const m = holderCallMember(callIx, fnIx)
-  const si = if place { bundleRecordRowOfSigs(sigs) } else { holderRecordRow(d, fnIx) }
-  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
-  if m >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+  if holderCallSigs(callIx, fnIx).length == 0 { return 1 }
+  const pk = holderPickOf(callIx, fnIx)
+  if pk.bpField < 0 {
     return emitFailAt(
       "emitProgram: a call through a held record matches none of its signatures",
       callIx,
     )
   }
   if emitExpr(c.callFn, fnIx) < 0 { return -1 }
-  fbStructGet(sHeapIdx[si], fi)
+  fbStructGet(pk.bpHeap, pk.bpField)
   const crDepth = callRefDepth
-  const crSlot = callRefNestSlot(callRefDepth)
-  fbLocalSet(crSlot)
-  return emitCallRefAt(callIx, c, fnIx, sigKeyOfTy(sigs[m]), crDepth, crSlot)
+  const crSlot = callRefStash()
+  if irShadowOn { callRefLegacyPlain[callIx] = "" }
+  const rc = emitCallRefAt(callIx, c, fnIx, pk.bpKey, crDepth, crSlot)
+  if rc >= 0 && irShadowOn && callRefLastPlain {
+    callRefLegacyPlain[callIx] = pk.bpKey
+  }
+  return rc
+}
+
+// The record signatures call `callIx`'s callee holds whole in frame `fnIx`: a named `const`'s, or
+// a field's place's (B2); none for any other callee. `emitHolderCall` takes a call with any.
+export function holderCallSigs(callIx: i32, fnIx: i32): i32[] {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) { return [] }
+  const cfx = unwrapParen(c.callFn)
+  if cfx < 0 { return [] }
+  if nodeAt(cfx) is Ident { return holderRecordSigs(identDeclOf(cfx), fnIx) }
+  return calleePlaceRecordSigs(callIx, cfx, fnIx)
+}
+
+// The record a field's place callee `cfx` of call `callIx` holds whole (B2); none for any other.
+function calleePlaceRecordSigs(callIx: i32, cfx: i32, fnIx: i32): i32[] {
+  if !(nodeAt(cfx) is Member || nodeAt(cfx) is Index) { return [] }
+  return placeRecordSigs(callIx, fnIx)
+}
+
+// The member a call `callIx` through a holder (`holderCallSigs`) reads in frame `fnIx`, as
+// `emitHolderCall` reads it: the record's heap, field `c<m>`, that closure's type and its key;
+// `bpField` -1 for none.
+export function holderPickOf(callIx: i32, fnIx: i32): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  const sigs = holderCallSigs(callIx, fnIx)
+  if sigs.length == 0 { return none }
+  const m = holderCallMember(callIx, fnIx)
+  const si = bundleRecordRowOfSigs(sigs)
+  const fi = if m >= 0 { sFieldIndex(si, "c" + i32ToStr(m)) } else { -1 }
+  if m >= sigs.length || fi < 0 || si < 0 || si >= sHeapIdx.length {
+    return none
+  }
+  const pk: BundlePick = {
+    bpHeap: sHeapIdx[si],
+    bpField: fi,
+    bpTy: sigs[m],
+    bpKey: sigKeyOfTy(sigs[m]),
+  }
+  return pk
+}
+
+// `callRefPlainKey` for a call through a holder of a returned record, at its member's key; "" for
+// any other.
+export function holderCallRefPlainKey(callIx: i32, fnIx: i32): string {
+  const c = if callIx >= 0 && callIx < P.nodes.length { nodeAt(callIx) } else { null }
+  if !(c is Call) || c.callFn < 0 || hasNamedArgs(c.callArgNames) { return "" }
+  const pk = holderPickOf(callIx, fnIx)
+  if pk.bpField < 0 || pk.bpKey == "" { return "" }
+  return callRefPlainArgsTail(callIx, c, fnIx, pk.bpKey)
 }
 
 // ── statement-sequence lowering ──────────────────────────────────────────────
@@ -31531,17 +31598,8 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
       armUnboxNullable(exprIx, fnIx),
     )
   }
-  let fe = -1
-  if ck == "fnClo" {
-    fe = monoCloCoerceFe.get(exprIx) ?? -1
-    if fe < 0 { fe = monoCloCoerceFe.get(nodeSrc[exprIx] ?? -1) ?? -1 }
-    if fe < 0 {
-      return emitFailAt(
-        "emitProgram: a function delivered to a declared function type has no instance there",
-        exprIx,
-      )
-    }
-  }
+  const fe = if ck == "fnClo" { fnCloFeOf(exprIx) } else { -1 }
+  if ck == "fnClo" && fe < 0 { return fnCloNoInstance(exprIx) }
   const held = coerceHeld
   coerceHeld = exprIx
   if ck == "recCopy" {
@@ -31561,16 +31619,7 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
       return emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
     }
     "fnClo" => {
-      // The value's id names the member; its closure at the destination's instance replaces it (D14884).
-      let fes = monoCloCoerceSetFes.get(exprIx) ?? []
-      if fes.length == 0 {
-        fes = monoCloCoerceSetFes.get(nodeSrc[exprIx] ?? -1) ?? []
-      }
-      if fes.length == 0 {
-        fbDrop()
-        return emitClosureValueCore(fe, fnIx)
-      }
-      return emitFnCloDispatch(exprIx, fes, fnIx)
+      return fnCloTail(exprIx, fe, fnIx)
     }
     "mapUnbox" => {
       return mapUnboxTail(exprIx, unboxTy)
@@ -31594,10 +31643,47 @@ export function coerceTail(exprIx: i32, fnIx: i32): i32 {
     "listCopy" => emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
     "mapRetag" => if exprUnion(exprIx, fnIx) { emitMapRetagTail(exprIx) } else { 0 }
     "mapUnbox" => mapUnboxTail(exprIx, mapUnboxTailTy(exprIx, fnIx))
+    "fnClo" => fnCloTailAt(exprIx, fnIx)
     // Only a copy that reads its value once reaches here (`recCopyReReads`).
     "recCopy" => emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx, true)
-    "none" | "fnClo" | "box" | "unbox" | "atomstr" => 0
+    "none" | "box" | "unbox" | "atomstr" => 0
   }
+}
+
+// The instance a function value at `exprIx` delivered to a declared function type takes there
+// (`monoCloCoerceFe`, at the node or its source); -1 when it has none. Legacy and the IR share it.
+export function fnCloFeOf(exprIx: i32): i32 {
+  const fe = monoCloCoerceFe.get(exprIx) ?? -1
+  if fe >= 0 { return fe }
+  return monoCloCoerceFe.get(nodeSrc[exprIx] ?? -1) ?? -1
+}
+
+function fnCloNoInstance(exprIx: i32): i32 {
+  return emitFailAt(
+    "emitProgram: a function delivered to a declared function type has no instance there",
+    exprIx,
+  )
+}
+
+// `fnCloTail` at the instance `fnCloFeOf` names, as `coerceTail` writes it after the value.
+function fnCloTailAt(exprIx: i32, fnIx: i32): i32 {
+  const fe = fnCloFeOf(exprIx)
+  if fe < 0 { return fnCloNoInstance(exprIx) }
+  return fnCloTail(exprIx, fe, fnIx)
+}
+
+// After the value at `exprIx`: its id names the member, and that member's closure at the
+// destination's instance `fe` replaces it (D14884), one arm per member of a tagged set.
+function fnCloTail(exprIx: i32, fe: i32, fnIx: i32): i32 {
+  let fes = monoCloCoerceSetFes.get(exprIx) ?? []
+  if fes.length == 0 {
+    fes = monoCloCoerceSetFes.get(nodeSrc[exprIx] ?? -1) ?? []
+  }
+  if fes.length == 0 {
+    fbDrop()
+    return emitClosureValueCore(fe, fnIx)
+  }
+  return emitFnCloDispatch(exprIx, fes, fnIx)
 }
 
 // The map a union of maps at `exprIx` is delivered as, its payload cast after its box
@@ -34280,9 +34366,9 @@ function emitCallStmt(s: Call, stmtIx: i32, fnIx: i32) {
   // `Call` whose `callFn` is a `Member`). A bare top-level call statement (a function
   // call whose value is discarded) is out of scope.
   if s.callFn < 0 { return -1 }
-  const tagSet = emitTagSetAt(stmtIx, fnIx)
-  const tagArms = fnTagArmsAt(stmtIx, tagSet)
-  if tagArms.length > 0 {
+  if callStmtDispatches(stmtIx, fnIx) {
+    const tagSet = emitTagSetAt(stmtIx, fnIx)
+    const tagArms = fnTagArmsAt(stmtIx, tagSet)
     const dr = emitFnTagDispatch(stmtIx, tagSet, tagArms, fnIx)
     if dr < 0 { return -1 }
     if dr == 0 { fbDrop() }
