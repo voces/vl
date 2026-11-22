@@ -28,10 +28,12 @@ never reads the place.
 ## Measured
 
 Against master 14d707ae's fixpoint seed:
-- `tests/cases` covered = verified = matched up by the family's functions (PR body has the
-  figures); corpus unchanged;
+- `tests/cases` covered = verified 68,894 → 68,915 (+21), matched 68,893 → 68,914; corpus
+  unchanged at 45,201;
 - `ir-identity --cases`, `--claimless` and `--names` differ 0; the legacy A/B differs 0;
-- L2 fuel per PR is source growth: the head seed compiles the base tree at the base's fuel.
+- L2 fuel per PR +0.11%, source growth: the head seed compiles the base tree within -0.0003% of
+  the base seed's fuel. A first spelling that asked the pre-path a second time per atom delivery
+  read +0.017% on that pair, so the sole arm rides the `litJoin` block's one ask.
 
 The row `tests/ir-shadow-rows/atom-hook-sole-member.vl` has 5 functions, 3 of them `pre-path atom
 hook` on master's seed, all covered and matched here.
