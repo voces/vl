@@ -15,7 +15,11 @@ bundle record handed on whole, e.g. `function only(f) { other(f) }`.
   `RMakeRec` at that row.
 - `holder`, and `none` at a bundle parameter: the record as it is, delivered at the parameter's
   record rep.
-- `fnRead` and `choice` stay named misses (`bundle argument fnRead` / `choice`).
+- `fnRead`: the same builder at the row of the parameter's annotated bundle type
+  (`repRowOfTyStruct`), each closure `monoBundleReadFe`'s, as `emitBundleReadArg`.
+- `choice` stays a named miss (`bundle argument choice`).
+- `bundleRecBuild` is the one record-of-closures builder, taking the signatures, row and type
+  from its caller; IR-N6's closure-call arm delivers through it next.
 - `calleeSig` and the argument's delivery rep type a bundle parameter as its record through
   `bundleHeldTy`, the rule #9446 gave the parameter's own variable. Without it, the verifier's
   rule 6 refused the call.
@@ -26,13 +30,12 @@ bundle record handed on whole, e.g. `function only(f) { other(f) }`.
 
 | population | functions | start bodies |
 | --- | --- | --- |
-| self-compile | 19,518 → 19,521 | 138 → 138 |
+| self-compile | 19,518 → 19,522 | 138 → 138 |
 | distilled | 44,646 → 44,650 | 8,541 → 8,541 |
-| tests/cases | 62,640 → 62,684 | 4,961 → 4,961 |
+| tests/cases | 62,640 → 62,708 | 4,961 → 4,966 |
 | capability probes | 517 → 517 | 170 → 170 |
-| filed witnesses | 17,842 → 17,846 | 3,709 → 3,710 |
+| filed witnesses | 17,842 → 17,859 | 3,709 → 3,715 |
 
 First misses in tests/cases:
-- `bundle argument` rows: 161 → 42 (`fnRead` 31, `choice` 9, `closed parameter` 2). The
-  summary's distinct-function count was 124.
-- `argument coercion`: 37 → 51, the next miss the callers reach.
+- `bundle argument` rows: 161 → 11 (`choice` 9, `closed parameter` 2). The summary's
+  distinct-function count was 124.
