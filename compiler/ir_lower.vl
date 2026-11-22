@@ -9,6 +9,7 @@ import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
+import { mapRecvTyIn } from "./emit_ty_canon"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import { slotRowTyOf } from "./emit_rep"
 import {
@@ -264,6 +265,7 @@ import {
   fbLocalTee,
   fbLoop,
   fbMapTagOfI64,
+  fbOpenBlock,
   fbRefAsNonNull,
   fbRefCast,
   fbRefEq,
@@ -292,6 +294,7 @@ import {
   EqRootPlace,
   EqRootPlan,
   GlobalCtx,
+  MapGetOrArm,
   MapUnionPlan,
   SHARED_NULL_NONE,
   arrCopyBacking,
@@ -371,7 +374,6 @@ import {
   fieldStoreTail,
   fieldStoreVariantAt,
   fieldStoreVariantTail,
-  fnFallThroughPadOf,
   forInBreakOpen,
   forInCopiesHead,
   forInCopiesOf,
@@ -394,7 +396,6 @@ import {
   holeBoxHead,
   holeBoxLeads,
   holeBoxTail,
-  holeBoxTyAt,
   hostCallTail,
   identListOverrideOf,
   idxRowsOn,
@@ -419,6 +420,9 @@ import {
   mapGetOrNicheHead,
   mapGetOrNicheStash,
   mapGetOrNicheTail,
+  mapGetOrSentinel,
+  mapGetOrSentinelHead,
+  mapGetOrSentinelTail,
   mapGetOrUnionBoxOf,
   mapGetOrUnionBoxOpen,
   mapGetOrUnionBoxTail,
@@ -538,7 +542,6 @@ import {
   tagDispatchIfOf,
   tagIsTail,
   tagStashTail,
-  truncSatPlanOf,
   truncSatTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
@@ -707,6 +710,8 @@ let lwIfHeadAt: {[i32]: i32} = Map()
 let lwIfHeadBuilt = false
 // Each box by the out its value is (`stashIfBoxHead`), noted with `lwIfHeadAt`.
 let lwIfBoxAt: {[i32]: i32} = Map()
+// Each such box's union (`RToBox.bxTy`), by the same out.
+let lwIfBoxTy: {[i32]: i32} = Map()
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1327,7 +1332,7 @@ function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
 // the order stash, each field in source order into its scratch slot first, read back in layout;
 // for `mrSet` its `RStashSet`s set the slots, and it only reads them back.
 function makeRec(r: RMakeRec) {
-  const variant = recIsVariant(r, lw.irAt)
+  const variant = recIsVariant(r)
   const stash = r.mrSrc.length > 0
   // The row the builder built the fields by: the plain or stash layout, or a row omitting fields.
   const row = if r.mrBuiltRow >= 0 { r.mrBuiltRow } else { recRowOf(r.mrAt, r.mrRow, variant, stash) }
@@ -1415,7 +1420,7 @@ function stashBoxHead(at: i32) {
     const r = n.lRhs
     if !(r is RToBox) || unwrapParen(r.bxAt) != at { continue }
     const bx = r.bxAt
-    const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+    const p = holeBoxPlanOf(bx, r.bxTy, lw.irAt)
     if p.hbArm == "rec" || p.hbArm == "obj" {
       leaf()
       holeBoxHead(p, bx, lw.irAt)
@@ -1446,7 +1451,7 @@ function joinBoxHead(out: i32, staged: boolean) {
   if !lwIfHeadBuilt { stashIfHeadsNote() }
   const bx = lwIfBoxAt.get(out) ?? -1
   if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
-  const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+  const p = holeBoxPlanOf(bx, lwIfBoxTy.get(out) ?? -1, lw.irAt)
   if holeBoxLeads(p.hbArm) {
     if staged { lwPushing = true } else { leaf() }
     holeBoxHead(p, bx, lw.irAt)
@@ -1466,7 +1471,10 @@ function stashIfHeadsNote() {
       const mr = m.lRhs
       if mr is RToBox {
         const bv = mr.bxV
-        if bv is OVar { lwIfBoxAt.set(bv.ov, mr.bxAt) }
+        if bv is OVar {
+          lwIfBoxAt.set(bv.ov, mr.bxAt)
+          lwIfBoxTy.set(bv.ov, mr.bxTy)
+        }
       }
       if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
         const k0 = mr.mrSrc[0]
@@ -2133,14 +2141,11 @@ function atomicEffect(r: RAtomic, pending: i32[]): i32 {
   return 0
 }
 
-// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail`.
+// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail(tsOp)`.
 function truncSat(r: RTruncSat) {
-  const c = nodeAt(r.tsAt)
-  if !(c is Call) { return irLMiss("trunc_sat node") }
-  const pl = truncSatPlanOf(c)
-  if pl.tpOp < 0 { return irLMiss("trunc_sat plan") }
+  if r.tsOp < 0 { return irLMiss("trunc_sat plan") }
   irLOpnd(r.tsV)
-  return truncSatTail(pl.tpOp)
+  return truncSatTail(r.tsOp)
 }
 
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
@@ -2488,7 +2493,7 @@ function mapGetOr(r: RMapGetOr) {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if r.mgForm == 1 { "i32" } else if r.mgForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(r.mgForm, arm)
   if (
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
@@ -2601,7 +2606,9 @@ function mapGetOrInlineHead(
   qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 5 {
+  if form == 6 {
+    mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, lw.irAt)))
+  } else if form == 5 {
     mapGetOrUnionHead(sh)
     mapGetOrUnionBoxOpen(sh)
   } else if form == 4 {
@@ -2617,8 +2624,17 @@ function mapGetOrInlineHead(
   return sh
 }
 
+// The legacy arm (`mapGetOrArmOf`) inline form `form` writes: the plain `i32` read (1), an
+// atom-valued map's being that read; an mv slot's (2-5); the sentinel's (6); else the helper.
+function mapGetOrFormArm(form: i32, arm: MapGetOrArm): MapGetOrArm {
+  if form == 1 { return if arm == "atom" { "atom" } else { "i32" } }
+  if form == 6 { return "sentinel" }
+  return if form >= 2 { "mv" } else { "helper" }
+}
+
 // An inline map read's tail after its default, by `form`.
 function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 6 { return mapGetOrSentinelTail() }
   if form == 5 { return mapGetOrUnionBoxTail(sh) }
   if form == 4 { return mapGetOrNicheTail(sh) }
   if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
@@ -2641,7 +2657,7 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if mp.prForm == 1 { "i32" } else if mp.prForm >= 2 { "mv" } else { "helper" }
+  const want = mapGetOrFormArm(mp.prForm, arm)
   if (
     arm != want
     || want == "helper"
@@ -3009,7 +3025,7 @@ function nulNicheEq(r: RNulNicheEq) {
 // unread), an atom box's widening, and the plan's tail.
 function boxOp(r: RToBox) {
   const fnIx = lw.irAt
-  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, fnIx), fnIx)
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, fnIx)
   if p.hbArm == "ladder" { return irLMiss("box plan") }
   // A box that writes no head reads a valued `if`'s waiting value as its operand (`boxLeadsAt`).
   if !i32ListHas(lwBoxHeadAt, unwrapParen(r.bxAt)) {
@@ -3180,7 +3196,7 @@ function retagOf(o: Opnd): i32 {
 function passBoxOf(t: i32): i32 {
   const r = tempRhs(t)
   if !(r is RToBox) { return -1 }
-  const p = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, lw.irAt), lw.irAt)
+  const p = holeBoxPlanOf(r.bxAt, r.bxTy, lw.irAt)
   return if p.hbArm == "pass" || p.hbArm == "memberBox" { t } else { -1 }
 }
 
@@ -4087,11 +4103,23 @@ function loopValueBlock(n: SBlock, pending: i32[], id: i32) {
   }
   const slot = varSlot(n.bkOut)
   const vt = valtypeOf(lw.irVars[n.bkOut].vRep)
-  if vt < 0 { return irLMiss("loop value rep") }
+  // A reference binding's frame is typed by its local's kind, as `lvFrameOpen` writes it.
+  const li = slot - fbFrameParams
+  if (
+    vt < 0
+    && (li < 0 || li >= localIsRef.length || li >= localStructIdx.length)
+  ) {
+    return irLMiss("loop value rep")
+  }
   irLSettle(pending)
   const hoists = irLoopOpenHook(lw.irNodeAt[id])
   if hoists < 0 { return irLMiss("loop hoist prologue") }
-  fbBlock(vt)
+  if vt >= 0 {
+    fbBlock(vt)
+  } else {
+    fbOpenBlock()
+    fbValtype(localIsRef[li], localStructIdx[li])
+  }
   lwFrames.push(n.bkLabel)
   lwLvLabels.push(n.bkLabel)
   const k = n.bkBody.length - 1
@@ -4418,7 +4446,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     -1,
     false,
   )
-  const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
+  const pad = if valued { f.irEndPad } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
     // Inside the sink's exit block this `null` exits like any return there (`emitFallThroughPad`).
@@ -4454,6 +4482,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false
   lwIfBoxAt = Map()
+  lwIfBoxTy = Map()
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }

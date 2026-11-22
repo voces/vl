@@ -19,11 +19,12 @@ import {
   sIf,
 } from "./ir"
 import { irVerify } from "./ir_verify"
-import { repNodeOfTy } from "./emit_rep"
+import { repClosureOfReps, repNodeOfTy } from "./emit_rep"
 import {
   TY_BOOL,
   TY_I32,
   TY_NEVER,
+  TY_NULL,
   mkArrayTy,
   mkMapTy,
   mkNullableTy,
@@ -62,6 +63,7 @@ const selfTestIds: string[] = [
   "i32-into-bool-global",
   "bounds-rule-uninstalled",
   "box-immediate-for-call",
+  "box-at-union-type-into-i32",
   "pop-or-of-i32",
   "pop-or-bool-out",
   "pop-or-out-unwritten",
@@ -77,11 +79,24 @@ const selfTestIds: string[] = [
   "shared-read-global-not-box",
   "niche-read-of-i32",
   "arm-unbox-of-i32",
+  "box-list-retag-into-i32-list",
+  "box-list-retag-into-niche-record-list",
   "num-union-conversion-of-non-box",
   "num-union-conversion-off-result-kind",
   "held-global-read-off-noted-rep",
+  "null-into-nullable-record-global",
+  "null-into-bool-niche-global",
   "result-pick-of-i32",
   "result-pick-record-into-i32",
+  "record-retag-of-i32",
+  "record-retag-into-i32",
+  "record-retag-field-other-valtype",
+  "record-retag-two-noted-heaps",
+  "record-retag-one-noted-heap",
+  "width-retag-noted-leading",
+  "width-retag-field-not-leading",
+  "width-retag-pair-unnoted",
+  "retag-closures-of-differing-arity",
   "retag-field-alike-records-two-heaps",
   "global-read-off-store-type",
   "valued-block-temp-out",
@@ -89,6 +104,10 @@ const selfTestIds: string[] = [
   "atom-tower-i32-read",
   "atom-tower-zero-reads",
   "atom-staged-of-i32",
+  "trunc-sat-operand-off-plan",
+  "atomic-value-off-plan",
+  "memory-store-value-off-plan",
+  "simd-operand-off-plan",
   "call-write-back-not-a-capture",
 ]
 
@@ -156,6 +175,57 @@ function caseFn(id: string): IrFn {
       node(f, { lDst: g, lRhs: { rkV: from, rkAt: -1, rkFe: -1 } }, i32r),
     )
   }
+  // Rule 2: a record retag (`RRetag`) stands one plain record for another on one struct heap the
+  // builder noted, whose fields lower alike; one of an i32, into an i32, into a record whose field
+  // lowers to a list, or across two noted heaps is refused; the same on one noted heap holds.
+  if (
+    id == "record-retag-of-i32"
+    || id == "record-retag-into-i32"
+    || id == "record-retag-field-other-valtype"
+    || id == "record-retag-two-noted-heaps"
+    || id == "record-retag-one-noted-heap"
+  ) {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const orep = repNodeOfTy(ot)
+    const rec = irVarNew(f, orep, ot, "local", 1)
+    const wt = mkObjTy(
+      ["c0", "c1"],
+      [
+        TY_I32,
+        if id == "record-retag-two-noted-heaps" || id == "record-retag-one-noted-heap" { TY_BOOL } else { mkArrayTy(TY_I32) },
+      ],
+    )
+    const dt = if id == "record-retag-into-i32" { TY_I32 } else { wt }
+    const drep = repNodeOfTy(dt)
+    const from = if id == "record-retag-of-i32" { v(p) } else { v(rec) }
+    const g = irVarNew(f, drep, dt, "temp", -1)
+    f.irRecHeap[orep] = 1
+    f.irRecHeap[drep] = if id == "record-retag-two-noted-heaps" { 2 } else { 1 }
+    f.irBody.push(node(f, { lDst: g, lRhs: { rgV: from } }, drep))
+  }
+  // A width retag stands a record at a supertype the builder noted, whose fields lead it by name:
+  // `{c0}` of `{c0, c1}` holds; `{c1}`, which does not lead, and `{c0}` with no noted supertype
+  // pair are refused under rule 2.
+  if (
+    id == "width-retag-noted-leading"
+    || id == "width-retag-field-not-leading"
+    || id == "width-retag-pair-unnoted"
+  ) {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const orep = repNodeOfTy(ot)
+    const rec = irVarNew(f, orep, ot, "local", 1)
+    const nt = mkObjTy(
+      [if id == "width-retag-field-not-leading" { "c1" } else { "c0" }],
+      [TY_I32],
+    )
+    const nrep = repNodeOfTy(nt)
+    const g = irVarNew(f, nrep, nt, "temp", -1)
+    if id != "width-retag-pair-unnoted" {
+      f.irRecSub.push(orep)
+      f.irRecSub.push(nrep)
+    }
+    f.irBody.push(node(f, { lDst: g, lRhs: { rgV: v(rec) } }, nrep))
+  }
   // Rule 2: a global the builder noted as holding a record whole is still read only at its noted
   // rep; an i32 read of one noted as a bool is refused.
   if id == "held-global-read-off-noted-rep" {
@@ -180,11 +250,68 @@ function caseFn(id: string): IrFn {
   if id == "bounds-rule-uninstalled" {
     f.irBody.push(node(f, { bcV: v(p), bcIx: v(p) }, none))
   }
+  // Rule 2 against the plan a node carries: a truncation from f64 of an i32, an atomic store of an
+  // i32 at an i64 row, a memory store of an i32 at an f64 width, a SIMD op over an i32 at v128.
+  if id == "trunc-sat-operand-off-plan" {
+    const ts: Rhs = {
+      tsV: v(p),
+      tsAt: callNode(),
+      tsOp: 0,
+      tsFrom: "f64",
+      tsTo: "i32",
+    }
+    f.irBody.push(node(f, { efRhs: ts }, none))
+  }
+  if id == "atomic-value-off-plan" {
+    const am: Rhs = {
+      amArgs: [v(p), v(p)],
+      amAt: -1,
+      amBase: 2,
+      amValPrims: ["", "i64"],
+      amResPrim: "",
+    }
+    f.irBody.push(node(f, { efRhs: am }, none))
+  }
+  if id == "memory-store-value-off-plan" {
+    const mm: Rhs = { mmArgs: [v(p), v(p)], mmAt: -1, mmBase: 2, mmPrim: "f64" }
+    f.irBody.push(node(f, { efRhs: mm }, none))
+  }
+  if id == "simd-operand-off-plan" {
+    const sd: Rhs = {
+      sdArgs: [v(p)],
+      sdAt: -1,
+      sdMemBase: 0,
+      sdPrims: ["v128"],
+      sdResPrim: "",
+    }
+    f.irBody.push(node(f, { efRhs: sd }, none))
+  }
   // Rule 2 again: a box whose immediate stands for a call, whose effect would go unread.
   if id == "box-immediate-for-call" {
     const bt = irVarNew(f, i32r, TY_I32, "temp", -1)
     f.irBody.push(
-      node(f, { lDst: bt, lRhs: { bxV: imm(i32r, 1), bxAt: callNode() } }, i32r),
+      node(
+        f,
+        {
+          lDst: bt,
+          lRhs: { bxV: imm(i32r, 1), bxAt: callNode(), bxTy: -1, bxFree: false },
+        },
+        i32r,
+      ),
+    )
+  }
+  // Rule 2 again: a box planned at a union type that lands at an i32.
+  if id == "box-at-union-type-into-i32" {
+    const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(
+        f,
+        {
+          lDst: sn,
+          lRhs: { bxV: v(p), bxAt: callNode(), bxTy: TY_I32, bxFree: false },
+        },
+        i32r,
+      ),
     )
   }
   // Rules for a fused `pop ?? d`: a pop of an i32, a bool out from an `i32[]`, and a default that
@@ -295,6 +422,21 @@ function caseFn(id: string): IrFn {
     }
     f.irBody.push(node(f, { lDst: ct, lRhs: cv }, i32r))
   }
+  // A `null`-typed value stored into a global: accepted into a nullable record's cell, which
+  // lowers to `ref null`, and refused into a `boolean | null` niche (rule 2).
+  if (
+    id == "null-into-nullable-record-global"
+    || id == "null-into-bool-niche-global"
+  ) {
+    const rec = id == "null-into-nullable-record-global"
+    const gt = if rec { mkNullableTy(mkObjTy(["a"], [TY_I32])) } else { mkNullableTy(TY_BOOL) }
+    irGlobalNote(f, 0, repNodeOfTy(gt))
+    irGlobalStoreNote(f, 0, gt)
+    const nr = repNodeOfTy(TY_NULL)
+    const np = irVarNew(f, nr, TY_NULL, "param", 1)
+    f.irParams.push(np)
+    f.irBody.push(node(f, { gsSym: 0, gsSrc: v(np) }, none))
+  }
   // Rule 2 again: an order-stashed record whose source order evaluates one field twice.
   if id == "record-field-read-twice" {
     const ot = mkObjTy(["a", "b"], [TY_I32, TY_I32])
@@ -368,6 +510,14 @@ function caseFn(id: string): IrFn {
       node(f, { lDst: sn, lRhs: { nrV: v(p), nrAt: -1, nrKind: 2 } }, i32r),
     )
   }
+  // A retag between closures whose closed parts differ, one parameter against two (rule 2).
+  if id == "retag-closures-of-differing-arity" {
+    const one = repClosureOfReps([i32r], i32r, false)
+    const two = repClosureOfReps([i32r, i32r], i32r, false)
+    const c1 = irVarNew(f, one, -1, "local", 1)
+    const c2 = irVarNew(f, two, -1, "temp", -1)
+    f.irBody.push(node(f, { lDst: c2, lRhs: { rgV: v(c1) } }, two))
+  }
   // Rule 2 again: a retag of one record's list into another's whose fields' reps are alike, the
   // two noted on different heaps.
   if id == "retag-field-alike-records-two-heaps" {
@@ -385,6 +535,20 @@ function caseFn(id: string): IrFn {
   if id == "arm-unbox-of-i32" {
     const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
     f.irBody.push(node(f, { lDst: sn, lRhs: { uaV: v(p), uaAt: -1 } }, i32r))
+  }
+  // A list of boxed `i32 | null` retagged into an `i32[]` or into a list of niche records: neither
+  // holds union boxes, so neither is that list as it stands (rule 2).
+  if (
+    id == "box-list-retag-into-i32-list"
+    || id == "box-list-retag-into-niche-record-list"
+  ) {
+    const st = mkArrayTy(mkNullableTy(TY_I32))
+    const nr = mkNullableTy(mkObjTy(["a"], [TY_I32]))
+    const toI32 = id == "box-list-retag-into-i32-list"
+    const dt = if toI32 { mkArrayTy(TY_I32) } else { mkArrayTy(nr) }
+    const sl = irVarNew(f, repNodeOfTy(st), st, "local", 1)
+    const dl = irVarNew(f, repNodeOfTy(dt), dt, "temp", -1)
+    f.irBody.push(node(f, { lDst: dl, lRhs: { rgV: v(sl) } }, repNodeOfTy(dt)))
   }
   // A nullable reference's `??` over an `i32`, over a non-null list, and over a nullable list into
   // an `i32` out that is neither the list nor a box.
