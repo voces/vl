@@ -21,7 +21,7 @@ never reads the place.
   member), `chain` or `staged`; `emitStrToAtom` dispatches `sole` to `strToAtomSoleTail`, the
   same `staticAtomId` byte the chain wrote. Only a place, which has no effect, may go unread.
 - **`RAtomSole { asAt }`**, family `other` (shadow only, not claimed), no operands, lowered by
-  `strToAtomSoleTail`; the verifier holds its destination at an atom (self-test case 25).
+  `strToAtomSoleTail`; the verifier holds its destination at an atom (self-test case 26).
 - **Builder.** At an atom destination, `deliver` asks the pre-path once for the hook's node and
   builds it by its arm: `litJoin` as before, `strToAtom` on `sole` as `RAtomSole`.
 
