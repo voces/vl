@@ -26,8 +26,9 @@ split out) and `fnCloCoerceAtNode` (the checker's destination type, which legacy
 `coerceKindAt` keys the kind on). It restates nothing.
 
 Compiler lines +48 / −23 (`wasmEmit.vl` +41 −22, `ir_build.vl` +7 −1). The shadow row
-`tests/ir-shadow-rows/fn-to-closed-fn-type.vl` hands a generic to a closed `i32` and a closed
-`string` function type.
+`tests/ir-shadow-rows/fn-to-closed-fn-type.vl` hands a generic through an un-annotated identity
+to a closed `(x: i32) => i32` binding. It is cut from a witness with no late tag row, so the
+`late-demands` ratchet holds.
 
 ## Readings (base: fixpoint seed of `ir-map-unbox` merged with master `b77be8fd`; candidate fixpoint)
 
