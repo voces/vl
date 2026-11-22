@@ -9,7 +9,7 @@ import { emitFail } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
 import { sigParamKindAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
-import { monoBundleReadFe } from "./emit_mono"
+import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
 import {
   bundleAnyNoted,
   bundleParamOfRead,
@@ -154,6 +154,7 @@ import {
   atomHookArmOf,
   atomStrPlanOf,
   binNumWidth,
+  bundleArgArmOf,
   bundleCallRefPlainKey,
   bundlePickOf,
   callEndsNever,
@@ -534,7 +535,11 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { coalLhsStashes, ifArmValueExpr, paramIndexOf } from "./emit_query"
-import { fnRetNullBearing, globalNameIsNonConstSid } from "./emit_nullable_rets"
+import {
+  fnRetNullBearing,
+  globalNameIsNonConstSid,
+  paramStructIdxOf,
+} from "./emit_nullable_rets"
 import { CoalValArm, nullRetPlanOf } from "./emit_plan_null"
 import {
   f32Bytes,
@@ -2914,7 +2919,7 @@ function calleeSig(pos: i32): boolean {
   if !(fn is FuncDecl) { return false }
   const ps: i32[] = []
   for p in fn.fnParams {
-    const pt = scopeTyAt(p, d)
+    const pt = bundleHeldTy(p, scopeTyAt(p, d))
     const r = repNodeOfTy(pt)
     if !valueRep(r, pt) { return false }
     ps.push(r)
@@ -2995,6 +3000,67 @@ function callRhs(b: i32[], c: Call, ix: i32): Rhs {
   return directCallAt(b, c, ix, pos)
 }
 
+// The lambda literal `arg` handed to bundle parameter `par`, as `emitBundleArg` builds it: the
+// closure of the instance each signature mints (`monoBundleFe`), in the parameter's record row's
+// field order, then the record.
+function bundleArgRec(b: i32[], arg: i32, par: i32): Opnd {
+  const sigs = bundleSigsOfParam(par)
+  const si = paramStructIdxOf(par)
+  if si < 0 || si >= sFieldCount.length || si >= sFieldStart.length {
+    return irBMiss("bundle argument row")
+  }
+  const rty = bundleRecordTyOf(sigs)
+  const rep = repNodeOfTy(rty)
+  const ks = repNodeKids(rep)
+  if !(repNodeAt(rep) is RRecord) || ks.length != sFieldCount[si] {
+    return irBMiss("bundle argument rep")
+  }
+  const fields: Opnd[] = []
+  for _k in ks { fields.push({ ov: -1 }) }
+  const layout: i32[] = []
+  let fi = 0
+  while fi < sFieldCount[si] {
+    const nm = sFieldNames[sFieldStart[si] + fi]
+    let k = 0
+    while k < sigs.length && nm != "c" + i32ToStr(k) { k = k + 1 }
+    const fe = if k < sigs.length { monoBundleFe(arg, ibFnIx, sigs, k) } else { -1 }
+    const kid = repRecordKidOf(rep, rty, nm)
+    if (
+      fe < 0
+      || kid < 0
+      || kid >= ks.length
+      || repNodeOfTy(sigs[k]) != ks[kid]
+    ) {
+      return irBMiss("bundle argument closure")
+    }
+    if closureValueCoreWhy(fe) != "" {
+      return irBMiss("bundle argument closure refused")
+    }
+    const env: Opnd[] = if fnEnvIdxOf(fe) >= 0 { cloEnvOf(b, fe, arg) } else { [] }
+    if ibMiss != "" { return irBMiss(ibMiss) }
+    fields[kid] = irBLetTempTy(
+      b,
+      { mcFn: fe, mcEnv: env, mcAt: arg },
+      arg,
+      ks[kid],
+      sigs[k],
+    )
+    layout.push(kid)
+    fi = fi + 1
+  }
+  const r: Rhs = {
+    mrFields: fields,
+    mrLayout: layout,
+    mrSrc: [],
+    mrAt: arg,
+    mrRow: -1,
+    mrVariant: false,
+    mrBuiltRow: si,
+    mrSet: false,
+  }
+  return irBLetTempTy(b, r, arg, rep, rty)
+}
+
 // Direct call `ix` of the function at `fnStmts` slot `pos`: its environment, captures and
 // arguments as `emitDirectCall` writes them, or a captured call's closure.
 function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
@@ -3029,12 +3095,35 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     while i < c.callArgs.length {
       const at = b.length
       starts.push(at)
-      // A bundle parameter takes a record of closures, which the IR does not build.
+      // A bundle parameter takes a record of closures, on legacy's arm (`bundleArgArmOf`): a
+      // lambda literal's built per signature, or a record read as it is.
       if bundleSigsOfParam(callee.fnParams[i]).length > 0 {
-        return missRhs("bundle argument")
+        const barm = bundleArgArmOf(callee.fnParams[i], c.callArgs[i], ibFnIx)
+        if barm == "lambda" {
+          const bt = bundleHeldTy(
+            callee.fnParams[i],
+            scopeTyAt(callee.fnParams[i], inst),
+          )
+          if !(repNodeAt(repNodeOfTy(bt)) is RRecord) {
+            return missRhs("bundle argument closed parameter")
+          }
+          const ba = bundleArgRec(b, c.callArgs[i], callee.fnParams[i])
+          if ibMiss != "" { return missRhs(ibMiss) }
+          args.push(ba)
+          i = i + 1
+          continue
+        }
+        if barm != "holder" && barm != "none" {
+          return missRhs("bundle argument " + barm)
+        }
       }
       // An argument is delivered at its parameter's rep, as a returned or declared value is.
-      const pr = repNodeOfTy(scopeTyAt(callee.fnParams[i], inst))
+      const pr = repNodeOfTy(
+        bundleHeldTy(
+          callee.fnParams[i],
+          scopeTyAt(callee.fnParams[i], inst),
+        ),
+      )
       const a = deliver(b, c.callArgs[i], pr, -1)
       if ibMiss != "" { return missRhs("argument") }
       if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
@@ -7641,7 +7730,12 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
 // closure per signature it is called at (`bundleRecordTyOf`), else its checker type, closed at the
 // instance the checker recorded.
 function paramHeldTy(p: i32, fnIx: i32): i32 {
-  const ty = heldTy(scopeTyAt(p, fnIx))
+  return bundleHeldTy(p, heldTy(scopeTyAt(p, fnIx)))
+}
+
+// Bundle parameter `p`'s open type `ty` as its record of one closure per signature; any other
+// parameter's type as it is.
+function bundleHeldTy(p: i32, ty: i32): i32 {
   if !irTyOpen(ty) { return ty }
   const sigs = bundleSigsOfParam(p)
   return if sigs.length > 0 { bundleRecordTyOf(sigs) } else { ty }
