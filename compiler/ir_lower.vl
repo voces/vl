@@ -7,7 +7,7 @@ import { blockHasContinueFor } from "./emit_query"
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf } from "./emit_capture_frames"
 import { recIsVariant } from "./ir_verify"
-import { printUnionPlan } from "./emit_fn_scans"
+import { binEqStructRow, printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import {
@@ -173,6 +173,7 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStructEq,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -480,6 +481,11 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  structEqEnter,
+  structEqRoots,
+  structEqStagesLeft,
+  structEqStagesRight,
+  structEqTail,
   structFieldTail,
   structUnionBoxTail,
   tagDispatchIfOf,
@@ -971,6 +977,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
+    RStructEq => structEq(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -2665,6 +2672,38 @@ function numUnionBin(r: RNumUnionBin) {
   return 0
 }
 
+// `RStructEq`: legacy's field-wise record compare (`emitStructEq`): the stashed operands' values,
+// their slots, then the compare, which reads an unstashed operand from its variable's local.
+function structEq(r: RStructEq) {
+  const n = nodeAt(r.seAt)
+  if !(n is BinExpr) { return irLMiss("record compare node") }
+  const fnIx = lw.irAt
+  const row = binEqStructRow(r.seAt, fnIx)
+  if row < 0 { return irLMiss("record compare row") }
+  const lS = structEqStagesLeft(n.binLeft, n.binRight)
+  const rS = structEqStagesRight(n.binRight)
+  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+    return irLMiss("record compare place")
+  }
+  const saved = structEqEnter()
+  if lS { irLOpnd(r.seL) }
+  if rS { irLOpnd(r.seR) }
+  const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+    return irLMiss("record compare fields")
+  }
+  return 0
+}
+
+// The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
+function structEqSideLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  return varSlot(o.ov)
+}
+
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
 // left operand, the right twice around the rep's own compare, and `i32.eqz` for `!=`.
 function nulNicheEq(r: RNulNicheEq) {
@@ -2759,6 +2798,10 @@ function irHoistRecv(ix: i32): i32 {
     return 0
   }
   if irLReadAgain(ix) { return 0 }
+  if lw.irReadElem.has(ix) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+    return rhs(lw.irReadElem[ix] ?? none, false)
+  }
   const m = nodeAt(ix)
   if lw.irReadField.has(ix) && m is Member {
     if irHoistRecv(m.memObj) < 0 { return -1 }
@@ -2768,16 +2811,21 @@ function irHoistRecv(ix: i32): i32 {
   return -1
 }
 
-// Receiver `o` of member `lhsIx` read once more: a variable's read, or a temp's read written again
-// as the builder read it (`irHoistRecv`).
-function recvAgain(o: Opnd, lhsIx: i32): i32 {
+// Operand `o` of node `ix` read once more: a variable's read, or a temp's read written again as the
+// builder read it (`irHoistRecv`).
+function opndAgain(o: Opnd, ix: i32): i32 {
   if o is OVar && o.ov >= 0 && lw.irVars[o.ov].vKind == "temp" {
-    const m = nodeAt(unwrapParen(lhsIx))
-    if !(m is Member) { return irLMiss("receiver read again") }
-    return irHoistRecv(unwrapParen(m.memObj))
+    return irHoistRecv(unwrapParen(ix))
   }
   irLOpnd(o)
   return 0
+}
+
+// Receiver `o` of member `lhsIx` read once more (`opndAgain`).
+function recvAgain(o: Opnd, lhsIx: i32): i32 {
+  const m = nodeAt(unwrapParen(lhsIx))
+  if !(m is Member) { return irLMiss("receiver read again") }
+  return opndAgain(o, m.memObj)
 }
 
 // Writes the global read the builder built at node `ix` once more, as legacy re-reads a name;
@@ -3595,7 +3643,7 @@ function coalNicheCell(
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   coalNicheElse(reEval)
-  if reEval { irLOpnd(n.cbL) }
+  if reEval && opndAgain(n.cbL, e.binLeft) < 0 { return -1 }
   lwFrames.pop()
   fbEnd()
   return 0
