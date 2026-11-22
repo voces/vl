@@ -20,21 +20,21 @@ Why the kinds were in `other`: each was added shadow-only, so its coverage PR mo
 
 ## Readings (fixpoint seeds on both sides)
 
-`--cases` and `--claimless` were read on 18e6bb72 over #9511's 737a8eaa. The rest were read on the
-clean merge with #9511's head c9ecbd1b (62db826a), against c9ecbd1b's fixpoint.
+The head is 36b5985a, this change merged with `vl-queue/BD3` (16e9bcdc, which holds #9511 and #9512).
+The base is BD3's own fixpoint.
 
 | reading | result |
 | --- | --- |
-| `ir-identity.sh --cases` | identical 7614, fail under both 68, differ 0, timeout 0; witnesses same 60, differ 0 |
-| `ir-identity.sh --claimless` | identical 14018, fail under both 3267, differ 0, timeout 0 |
+| `ir-identity.sh --cases` | identical 7620, fail under both 68, differ 0, timeout 0; witnesses same 60, differ 0 |
+| `ir-identity.sh --claimless` | identical 14019, fail under both 3267, differ 0, timeout 0 |
 | `ir-identity.sh <base> <head> --names` | identical 9037, differ 0, built under one only 0; self-compile identical |
-| armed shadow, corpus | 45678 functions, 45028 covered = verified = matched |
+| armed shadow, corpus | 45678 functions, 45125 covered = verified = matched |
 | armed shadow, `--cases` | no class above baseline |
-| `ir-shadow.vl --claims` | 44878 corpus functions emitted by the IR, 19125 over 4981 filed witnesses; no fallback |
-| L2 self-compile fuel per PR | +0.00% on 110337565646 |
-| tests/cases claimed (mode 5, `fnc` rows) | 64140 → 67537 (+3,397 over 129 files, 0 lost) |
+| `ir-shadow.vl --claims` | 45035 corpus functions emitted by the IR, 19256 over 4982 filed witnesses; no fallback |
+| L2 self-compile fuel per PR | +0.01% on 111376280241 |
+| tests/cases claimed (mode 5, `fnc` rows) | 64707 → 68113 (+3,406, 0 lost) |
 
-Released by directory: simd 1327, std 1131, modules 257, memory 253, loops 204, soundness 56, getters 36, unions 29, literal-unions 29, extern 29, intrinsics 19, atomics 10, numerics 6, run 3, functions 3, types 2, conditionals 2, expressions 1.
+Released by directory: simd 1334, std 1131, modules 257, memory 253, loops 204, soundness 56, getters 36, unions 31, literal-unions 29, extern 29, intrinsics 19, atomics 10, numerics 6, run 3, functions 3, types 2, conditionals 2, expressions 1.
 
 ## Released per file (tests/cases)
 
@@ -127,15 +127,17 @@ Released by directory: simd 1327, std 1131, modules 257, memory 253, loops 204, 
    29  tests/cases/loops/hoist-declines-on-closure-call.vl
    29  tests/cases/literal-unions/litunion-order-cross-module-alias.vl
    29  tests/cases/extern/global-export-named-memory.vl
-   15  tests/cases/simd/vector-function-values.vl
+   16  tests/cases/simd/vector-function-values.vl
     7  tests/cases/intrinsics/dunder-intrinsic-as-value-positions.vl
     6  tests/cases/intrinsics/intrinsic-as-value.vl
     5  tests/cases/simd/float-pminmax.vl
     5  tests/cases/simd/float-convert.vl
     5  tests/cases/numerics/trunc-sat-positions.vl
     5  tests/cases/getters/getter-lane-over-v128.vl
+    4  tests/cases/simd/vector-nullable-and-union.vl
     4  tests/cases/memory/store-narrow-widths-round-trip.vl
     4  tests/cases/memory/flat-fused-row-import/lib.vl
+    3  tests/cases/simd/vector-boxed-into-union-argument.vl
     3  tests/cases/simd/int-unary.vl
     3  tests/cases/simd/int-shift.vl
     3  tests/cases/simd/int-lanes.vl
@@ -156,7 +158,8 @@ Released by directory: simd 1327, std 1131, modules 257, memory 253, loops 204, 
     2  tests/cases/memory/flat-generic-rows-branded.vl
     2  tests/cases/memory/flat-generic-rows-branded-bracket.vl
     2  tests/cases/intrinsics/memarg-offset-simd-atomics.vl
-    1  tests/cases/simd/vector-nullable-and-union.vl
+    1  tests/cases/unions/narrowing-after-then-arm-call.vl
+    1  tests/cases/unions/else-complement-after-then-call.vl
     1  tests/cases/simd/f32x4-roundtrip.vl
     1  tests/cases/run/memory-intrinsic-in-named-fn.vl
     1  tests/cases/numerics/trunc-sat.vl
