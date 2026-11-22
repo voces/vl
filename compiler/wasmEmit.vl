@@ -754,6 +754,7 @@ import {
   fbBrIf,
   fbBrOnNonNull,
   fbBrOnNull,
+  fbBrTable,
   fbCall,
   fbCallIndirect,
   fbDrop,
@@ -8024,6 +8025,12 @@ function emitNarrowedNicheRead(exprIx: i32, ak: i32, fnIx: i32) {
   const rc = emitExpr(exprIx, fnIx)
   storageReadLeave(sMark)
   if rc < 0 { return -1 }
+  return emitNicheReadTail(exprIx, ak, fnIx)
+}
+
+// The union box on the stack (read `exprIx`, its storage) as its niche of kind `ak`: the null tag
+// is the niche's null, any other arm its payload unboxed (`emitUnionUnboxTail`).
+export function emitNicheReadTail(exprIx: i32, ak: i32, fnIx: i32) {
   const st = nicheReadStashSlot()
   fbLocalSet(st)
   fbLocalGet(st)
@@ -14085,6 +14092,12 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     }
     return mapGetOrMvTail(pslot)
   }
+  if arm == "mv" && mapGetOrNicheStash(recvIx, defIx, fnIx) {
+    const nslot = cmSlot
+    mapGetOrNicheHead(nslot)
+    if emitMapValDefault(nslot, null, defIx, fnIx) < 0 { return -1 }
+    return mapGetOrNicheTail(nslot)
+  }
   if arm == "mv" {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
@@ -14236,13 +14249,61 @@ export function mapGetOrArmOf(
 }
 
 // Whether `recvIx[k] ?? defIx` at an mv slot takes its plain arm: a value that is neither a union
-// nor a nullable niche, and a default that is not nullable, written in the value's own rep.
+// with null nor a nullable niche, and a default that is not nullable, written in the value's own
+// rep (a null-free union's default boxed into it by `emitMapValDefault`).
 export function mapGetOrMvPlain(recvIx: i32, defIx: i32, fnIx: i32): boolean {
   const ms = mapRecvShapeOf(recvIx, fnIx)
-  if ms < 0 || mvValKindAt(ms) == "union" || defExprNullable(defIx) {
-    return false
-  }
+  if ms < 0 || defExprNullable(defIx) { return false }
+  if mvValKindAt(ms) == "union" && mvValUnionHasNull(ms) { return false }
   return mvScalarValKind(ms) != null || !mvSlotNullable(ms)
+}
+
+// Whether `recvIx[k] ?? defIx` at an mv slot takes the nullable ref niche's arm under a default that
+// is not nullable: a miss and a stored null both read as null, and one `ref.is_null` writes `d`.
+export function mapGetOrNicheStash(
+  recvIx: i32,
+  defIx: i32,
+  fnIx: i32,
+): boolean {
+  const ms = mapRecvShapeOf(recvIx, fnIx)
+  if ms < 0 || defExprNullable(defIx) { return false }
+  if mvValKindAt(ms) == "union" && mvValUnionHasNull(ms) { return false }
+  return mvScalarValKind(ms) == null && mvSlotNullable(ms)
+}
+
+// The niche arm's head after the probe: the slot's value on a hit, else its null, in the stash; then
+// `if stash is null`, a void `if` whose body is the default, then `mapGetOrNicheTail`.
+export function mapGetOrNicheHead(mslot: i32) {
+  const stashL = fnMvValStashLocal(mslot)
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)                // entry
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // (ref null <elem>) slot read
+  fbLocalSet(stashL)
+  fbElse()                     // a miss is the read's null
+  fbRefNull(mvValElemHeapOf(mslot))
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  fbRefIsNull()
+  fbIf(64)
+  return 0
+}
+
+// After the niche arm's default: the stash set from it, the `if` closed, and the stash read
+// recovered to non-null.
+export function mapGetOrNicheTail(mslot: i32) {
+  cmSlot = mslot
+  const stashL = fnMvValStashLocal(mslot)
+  fbLocalSet(stashL)
+  fbEnd()
+  fbLocalGet(stashL)
+  fbRefAsNonNull()
+  return 0
 }
 
 // The mv plain arm's head after the probe: `if entry != 0 { stash = vals.backing[entry-1] } else`,
@@ -14417,6 +14478,12 @@ function emitMapGetOrUnionBox(mslot: i32, defIx: i32, fnIx: i32, rk: i32) {
       "emitProgram: a union-valued map's value type has no member set",
     )
   }
+  if mapGetOrUnionBoxOf(mslot, defIx) {
+    mapGetOrUnionHead(mslot)
+    mapGetOrUnionBoxOpen(mslot)
+    if emitUnionBoxOwed(uvn, mvValTyIxAt(mslot), defIx, fnIx) < 0 { return -1 }
+    return mapGetOrUnionBoxTail(mslot)
+  }
   const stashL = fnMvValStashLocal(mslot)
   // raw box: hit → stored (ref null $uBox); miss → the null-tagged box.
   pushMapScr(5)                // entry
@@ -14434,50 +14501,65 @@ function emitMapGetOrUnionBox(mslot: i32, defIx: i32, fnIx: i32, rk: i32) {
   fbStructNew(uBoxIdx)
   fbLocalSet(stashL)
   fbEnd()
-  // A `scalar | null` value (exactly one non-null scalar member) peels to the RAW scalar — take
-  // the default on the null tag, else unbox the scalar payload. A nullable default keeps the
-  // result `scalar | null`, the box itself, so it takes the multi-member arm below (D2253).
-  if mtys.length == 2 && !defExprNullable(defIx) {
-    // `ak` is the residual member's banked ABI code; when unresolved (-2) it re-parses
-    // the rendered atom instead. That fallback is unreached on the corpus and fuzz
-    // corpora (`docs/internals/destringify-types-program.md` P-RCH/P-SITE) because an
-    // alias-spelled nullable value union is rejected by the checker before emit.
-    const ak = unionResidualSoloKindOfSet(uvsid)
-    if ak == -2 {
-      return emitFail(
-        "emitProgram: scalar|null map value has no banked residual kind",
-      )
-    }
-    const vb = vbHeapIdxOfKind(ak)
-    if vb < 0 {
-      return emitFail("emitProgram: scalar|null map value has no value box")
-    }
-    let urk = ak
-    if coalWidens(ak, rk) { urk = rk }
-    fbLocalGet(stashL)
-    fbStructGet(uBoxIdx, 0)       // field 0: tag
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Bin(70)                  // 0x46 i32.eq → null?
-    fbIf(valBlockTypeOfKind(urk)) // value-typed if in the result's rep
-    if emitExprAsKind(defIx, urk, fnIx) < 0 { return -1 }
-    fbElse()
-    fbLocalGet(stashL)
-    fbStructGet(uBoxIdx, 1)       // field 1: value (anyref payload)
-    fbRefCast(vb)
-    fbStructGet(vb, 0)            // the scalar payload
-    if coalWidenUnboxed(ak, urk) < 0 { return -1 }
-    fbEnd()
-    return 0
+  // Past the box arm (`mapGetOrUnionBoxOf`) the value is `scalar | null` under a default that is
+  // not nullable, and peels to the raw scalar: the default on the null tag, else the payload.
+  // `ak` is the residual member's banked ABI code; an unresolved one (-2) is unreached, since
+  // the checker rejects an alias-spelled nullable value union before emit.
+  const ak = unionResidualSoloKindOfSet(uvsid)
+  if ak == -2 {
+    return emitFail(
+      "emitProgram: scalar|null map value has no banked residual kind",
+    )
   }
-  // A MULTI-member `… | null` value peels to the NON-null union box: on the null tag, box the
-  // default like a stored value (`emitUnionBoxArg`); else keep the stored box. `ref.as_non_null`
-  // recovers the non-null box the checker's non-null union result promises.
+  const vb = vbHeapIdxOfKind(ak)
+  if vb < 0 {
+    return emitFail("emitProgram: scalar|null map value has no value box")
+  }
+  let urk = ak
+  if coalWidens(ak, rk) { urk = rk }
   fbLocalGet(stashL)
+  fbStructGet(uBoxIdx, 0)       // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(70)                  // 0x46 i32.eq → null?
+  fbIf(valBlockTypeOfKind(urk)) // value-typed if in the result's rep
+  if emitExprAsKind(defIx, urk, fnIx) < 0 { return -1 }
+  fbElse()
+  fbLocalGet(stashL)
+  fbStructGet(uBoxIdx, 1)       // field 1: value (anyref payload)
+  fbRefCast(vb)
+  fbStructGet(vb, 0)            // the scalar payload
+  if coalWidenUnboxed(ak, urk) < 0 { return -1 }
+  fbEnd()
+  return 0
+}
+
+// Whether a `??` read of union map slot `mslot`, whose union has null, keeps the box: a value of
+// more than one non-null member, or a nullable default (`mapGetOrUnionBoxOpen`, `…Tail`).
+export function mapGetOrUnionBoxOf(mslot: i32, defIx: i32): boolean {
+  if mslot < 0 || mslot >= mvValName.length || mvValKindAt(mslot) != "union" {
+    return false
+  }
+  if !mvValUnionHasNull(mslot) { return false }
+  const mtys: i32[] = []
+  if !msMemberTysOfSet(msSetOfTy(mvValTyIxAt(mslot)), mtys) { return false }
+  return mtys.length != 2 || defExprNullable(defIx)
+}
+
+// The box arm's test after `mapGetOrUnionHead`: on the stash's null tag, a void `if` whose body
+// boxes the default into the slot's union.
+export function mapGetOrUnionBoxOpen(mslot: i32) {
+  fbLocalGet(fnMvValStashLocal(mslot))
   fbStructGet(uBoxIdx, 0) // field 0: tag
   fbI32Rel(RS_TAG, nullBoxTag())
   fbI32Bin(70)            // 0x46 i32.eq → null?
   fbIf(64)
-  if emitUnionBoxOwed(uvn, mvValTyIxAt(mslot), defIx, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the box arm's default: the stash set from it, the `if` closed, and the stash read as the
+// non-null box (a null-tagged box is a non-null ref).
+export function mapGetOrUnionBoxTail(mslot: i32) {
+  const stashL = fnMvValStashLocal(mslot)
   fbLocalSet(stashL)
   fbEnd()
   fbLocalGet(stashL)
@@ -27003,7 +27085,7 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
       "emitProgram: a call through a function set has a result with no rep",
     )
   }
-  const boxed = kind == "union"
+  const boxed = tagDispatchBoxes(kind)
   const un = if boxed { boxTyName(ty) } else { "" }
   let k = 0
   while k < arms.length {
@@ -27041,6 +27123,12 @@ function emitFnTagDispatch(callIx: i32, s: i32, arms: i32[], fnIx: i32) {
   }
   if dispatchDeclinesTail() { tailCallIdx = -1 }
   return if isVoid { 1 } else { 0 }
+}
+
+// Whether a dispatch whose result is of kind `kind` boxes each arm's value into the call's union;
+// any other kind takes each arm's value as it stands, a narrower numeric one widened.
+export function tagDispatchBoxes(kind: VKind): boolean {
+  return kind == "union"
 }
 
 // Whether a dispatch whose result type is `ty` leaves no value: its members are void, or some
@@ -35329,18 +35417,22 @@ export function intSwitchMayLower(ix: i32): boolean {
   return intMatchHeadAt(ix)
 }
 
-// Lowers the integer-`match` chain headed at `headIx` as a `br_table` in `mode` (see
-// `emitSwitchArm`): 1 when lowered, 0 when it declined having written nothing, -1 on an emit
-// failure. Arms are emitted in chain order — the collect pass's — so the let cursor stays in step.
-function emitIntSwitch(
-  headIx: i32,
-  fnIx: i32,
-  mode: i32,
-  kind: i32,
-  rk: VKind,
-  slot: i32,
-) {
-  if !intMatchHeadAt(headIx) { return 0 }
+// A dense integer `match` chain's `br_table` (`intSwitchPlanOf`): scrutinee `ispOn`, 64-bit when
+// `ispWide`, less `ispLo`; `ispTable[d]` the arm index `d` takes, `ispThens.length` the default;
+// `ispElse` the chain's last `else`, or -1. Arms are in chain order, the let cursor's.
+export type IntSwitchPlan = {
+  ispOn: i32,
+  ispWide: boolean,
+  ispLo: i32,
+  ispTable: i32[],
+  ispThens: i32[],
+  ispElse: i32,
+}
+
+// The `br_table` the chain headed at `headIx` lowers to, or null where it stays a chain: not
+// every link an `==`/`||` test of one plain integer place, or too sparse a table.
+export function intSwitchPlanOf(headIx: i32, fnIx: i32): IntSwitchPlan | null {
+  if !intMatchHeadAt(headIx) { return null }
   const vals: i32[] = []
   const arms: i32[] = []
   const thens: i32[] = []
@@ -35352,9 +35444,9 @@ function emitIntSwitch(
     const s = nodeAt(cur)
     if s is IfStmt {
       if scrutIx < 0 { scrutIx = switchScrutOf(s.ifCond) }
-      if scrutIx < 0 { return 0 }
+      if scrutIx < 0 { return null }
       if !switchCondCollect(s.ifCond, scrutIx, thens.length, vals, arms) {
-        return 0
+        return null
       }
       thens.push(s.ifThen)
       const next = s.ifElse
@@ -35369,12 +35461,11 @@ function emitIntSwitch(
         walking = false
       }
     } else {
-      return 0
+      return null
     }
   }
   const w = switchScrutWidth(scrutIx, fnIx)
-  if w == 0 { return 0 }
-  if elseBlk < 0 && mode >= 2 { return 0 }
+  if w == 0 { return null }
   const m = thens.length
   let lo = vals[0]
   let hi = vals[0]
@@ -35386,7 +35477,7 @@ function emitIntSwitch(
   }
   // `hi - lo` wraps negative exactly when the true span passes 2^31, which is never dense.
   const span = hi - lo
-  if span < 0 || span >= 2 * vals.length + 8 { return 0 }
+  if span < 0 || span >= 2 * vals.length + 8 { return null }
   // A repeated value keeps its FIRST arm, as the chain's first passing test does.
   const table: i32[] = []
   let t = 0
@@ -35404,7 +35495,39 @@ function emitIntSwitch(
     }
     i = i + 1
   }
-  if distinct < 3 || span >= 2 * distinct + 8 { return 0 }
+  if distinct < 3 || span >= 2 * distinct + 8 { return null }
+  return {
+    ispOn: scrutIx,
+    ispWide: w == 2,
+    ispLo: lo,
+    ispTable: table,
+    ispThens: thens,
+    ispElse: elseBlk,
+  }
+}
+
+// Lowers the integer-`match` chain headed at `headIx` as a `br_table` in `mode` (see
+// `emitSwitchArm`): 1 when lowered, 0 when it declined having written nothing, -1 on an emit
+// failure. Arms are emitted in chain order — the collect pass's — so the let cursor stays in step.
+function emitIntSwitch(
+  headIx: i32,
+  fnIx: i32,
+  mode: i32,
+  kind: i32,
+  rk: VKind,
+  slot: i32,
+) {
+  const p = intSwitchPlanOf(headIx, fnIx)
+  if p == null { return 0 }
+  if p.ispElse < 0 && mode >= 2 { return 0 }
+  const scrutIx = p.ispOn
+  const w = if p.ispWide { 2 } else { 1 }
+  const lo = p.ispLo
+  const table = p.ispTable
+  const thens = p.ispThens
+  const elseBlk = p.ispElse
+  const m = thens.length
+  const span = table.length - 1
   // The outer frame carries the value in the value modes; every inner frame is void.
   fbOpenBlock() // 0x02 block
   if mode == 3 { fbValtype(rk, slot) }
@@ -35437,14 +35560,7 @@ function emitIntSwitch(
     fbI32Const(lo)
     fbI32Bin(107) // 0x6b i32.sub
   }
-  wU8(14) // 0x0e br_table
-  wULEB(span + 1)
-  t = 0
-  while t <= span {
-    wULEB(table[t])
-    t = t + 1
-  }
-  wULEB(m) // default: the else arm's frame
+  fbBrTable(table, m) // default: the else arm's frame
   k = 0
   while k < m {
     fbEnd()
@@ -37865,16 +37981,16 @@ export function tailArmStmtIsValue(stmtIx: i32, fnIx: i32): boolean {
   return stmtIsTailValue(stmtIx, fnIx) || memberCallYieldsValue(stmtIx)
 }
 
-// Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": an
-// integer `match` chain, or one wider number returned boxed once (`retIfIsOneNumber`). An
-// else-less link writes no `else`, its caller padding what falls through. Its condition is
-// `emitGuardCond`'s, a decided `false` (`isDecidedFalse`) writing no then arm.
+// Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": one
+// wider number returned boxed once (`retIfIsOneNumber`), which wins, or an integer `match` chain
+// (`intSwitchPlanOf`, which may decline). An else-less link writes no `else`, its caller padding
+// what falls through. Its condition is `emitGuardCond`'s, a decided `false` writing no then arm.
 export function tailIfPlainWhy(ix: i32, fnIx: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "tail if node" }
   const n = nodeAt(ix)
   if !(n is IfStmt) || n.ifCond < 0 { return "tail if node" }
-  if intMatchHeadAt(ix) { return "tail if switch" }
   if retIfIsOneNumber(ix, fnIx) { return "tail if one number" }
+  if intMatchHeadAt(ix) { return "tail if switch" }
   return ""
 }
 
