@@ -68,11 +68,13 @@ import {
   RMapSet,
   RMemAccess,
   RMemOp,
+  RNicheRead,
   RNulNicheEq,
   RNulTest,
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumIs,
   RNumUnionBin,
   RNumWiden,
   RPrimOp,
@@ -110,6 +112,7 @@ import {
   SForIn,
   SGlobalSet,
   SIf,
+  SIntSwitch,
   SLet,
   SListSet,
   SLoop,
@@ -543,6 +546,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RSharedRead => {
+      // A global receiver is read again at each push; its recorded cell is the box, `srV` unread.
+      if r.srGlobal >= 0 {
+        if !boxShaped(irGlobalRepOf(vf, r.srGlobal)) {
+          return fail(2, at, "a shared read's global receiver is a box")
+        }
+        if !(r.srV is OImm) {
+          return fail(2, at, "a shared read's global receiver has no operand")
+        }
+        return 0
+      }
       use(r.srV, at)
       // Unstashed, every arm reads the receiver twice, and a temp is read once.
       if (
@@ -563,6 +576,17 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       if !(sn is RBox) && !(sn is RNullable && sn.rnDisc == 4) {
         return fail(2, at, "a shared read's receiver is a box")
       }
+      0
+    }
+    RNicheRead => {
+      use(r.nrV, at)
+      if !boxShaped(opRep(r.nrV)) {
+        return fail(2, at, "a niche read's operand is a box")
+      }
+      const dn = repNodeAt(dst)
+      const nulStr = dn is RNullable && dn.rnDisc == 1 && dn.rnInner == vfStr
+      const fits = if r.nrKind == 1 { repBoolNiche(dst) } else { r.nrKind == 2 && nulStr }
+      if !fits { return fail(2, at, "a niche read is at its niche's rep") }
       0
     }
     RBoxNarrow => {
@@ -1131,6 +1155,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RNumIs => {
+      use(r.niV, at)
+      if dst != vfBool {
+        return fail(2, at, "a numeric literal test is a bool")
+      }
+      0
+    }
     RCoalAtomStr => {
       use(r.zaL, at)
       use(r.zaD, at)
@@ -1292,8 +1323,20 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RStructEq => {
       uses([r.seL, r.seR], at)
+      uses(r.seLIx, at)
+      uses(r.seRIx, at)
       if repIsScalar(opRep(r.seL)) || repIsScalar(opRep(r.seR)) {
         return fail(2, at, "a record compare's operands are references")
+      }
+      for ixs in [r.seLIx, r.seRIx] {
+        for o in ixs {
+          if repPrim(opRep(o)) != "i32" {
+            return fail(2, at, "a record compare's element index is an i32")
+          }
+        }
+      }
+      if r.seLIx.length > 1 || r.seRIx.length > 1 {
+        return fail(2, at, "a record compare's element read has one index")
       }
       if dst >= 0 && repPrim(dst) != "bool" {
         return fail(2, at, "a record compare's answer is a bool")
@@ -1986,6 +2029,7 @@ function stmt(id: i32, prev: i32) {
     SIf => ifSpine(id)
     SCoalBox => coalBoxCheck(n, id)
     SSwitch => switchCheck(n, id)
+    SIntSwitch => intSwitchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
         return fail(10, id, "a valued branch outside a runtime helper")
@@ -2046,6 +2090,31 @@ function stmt(id: i32, prev: i32) {
     SDrop => use(n.dpV, id)
     SRawOp => rawEff(n, id)
   }
+  return 0
+}
+
+// Rule 7: an integer switch reads a 32-bit integer, or a 64-bit one when wide, and every table
+// entry names an arm or the else.
+function intSwitchCheck(n: SIntSwitch, id: i32) {
+  use(n.isOn, id)
+  const p = repPrim(opRep(n.isOn))
+  if p == null { return fail(7, id, "an integer switch over a non-scalar") }
+  const w = match p {
+    "i32" | "u8" => 1
+    "i64" => 2
+    "bool" | "f64" | "f32" | "str" | "null" | "v128" => 0
+  }
+  if w == 0 { return fail(7, id, "an integer switch over a non-integer") }
+  if (w == 2) != n.isWide {
+    return fail(7, id, "an integer switch's width is not its scrutinee's")
+  }
+  for t in n.isTable {
+    if t < 0 || t > n.isArms.length {
+      return fail(7, id, "a table entry names no arm")
+    }
+  }
+  for a in n.isArms { nested(a) }
+  nested(n.isElse)
   return 0
 }
 
@@ -2126,6 +2195,7 @@ function touchesList(n: IrNode): boolean {
       SForIn |
       SGlobalSet |
       SIf |
+      SIntSwitch |
       SLoop |
       SRangeLoop |
       SRawOp |
@@ -2349,11 +2419,13 @@ function rhsReadsList(r: Rhs): boolean {
       RMapSet |
       RMemAccess |
       RMemOp |
+      RNicheRead |
       RNulNicheEq |
       RNulTest |
       RNullOf |
       RNumCast |
       RNumIntr |
+      RNumIs |
       RNumUnionBin |
       RNumWiden |
       RPrimOp |

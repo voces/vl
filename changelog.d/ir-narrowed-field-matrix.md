@@ -1,0 +1,3 @@
+## Testing
+
+- **Capability matrix: a narrowed box-field read × its field's storage rep (D17048).** Eight templates (`scripts/capability-probes/matrix/narrowed-field-read-*.matrix.vl`) deliver a field read off a box local narrowed by a discriminant compare at every built-in position and at four of their own (a narrowed parameter's read returned, bound, put in a list literal and passed). The reps are an atom read narrowed to one literal, a one-literal atom field, `boolean | null`, `K | null`, a nullable record, a union box, a list and a record, so every claimed `RBoxField` arm is graded across the reps legacy stores.
