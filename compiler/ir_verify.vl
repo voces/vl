@@ -135,6 +135,8 @@ import {
   repNodeAt,
   repNodeKids,
   repNodeOfTy,
+  repOfTy,
+  repTyOf,
 } from "./emit_rep"
 import {
   listRetag,
@@ -160,6 +162,10 @@ import {
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
 import { closureHeld, letBindTy, tyOpenHeldAsIds } from "./emit_classify"
+import { fbValtype, wTarget } from "./emit_bytes"
+import { rlWrapIdx } from "./emit_state"
+import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
 import { identDeclOf } from "./symbols"
 import {
   atomicPlanOf,
@@ -2331,30 +2337,40 @@ export function irTyHeldOpen(ty: i32, rep: i32): boolean {
   return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
 }
 
-// Whether a closure of rep `src` stands where closure rep `dst` is asked: legacy writes every
-// closure as its one closure struct (`closureHeld`), whatever the signature.
-export function cloStorageSame(dst: i32, src: i32): boolean {
-  return repNodeAt(dst) is RClosure
-    && repNodeAt(src) is RClosure
-    && closureHeld(dst)
+// The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
+// ref-element list's at its wrapper; none for any other rep.
+export function refRepValtype(r: i32): u8[] {
+  const out: u8[] = []
+  const d = repOfTy(repTyOf(r))
+  const k = d.rdKind
+  if k == null || d.rdNul != 0 { return out }
+  // A list's type keys its wrapper by its element (`rlSlotOfTyOrTwin`), as legacy's reads do.
+  const slot = if k == "reflist" && d.rdSlot < 0 { rlSlotOfTyOrTwin(tyRefArrElemOf(repTyOf(r))) } else { d.rdSlot }
+  const clo = k == "closure" && closureHeld(r)
+  const list = k == "reflist" && slot >= 0 && slot < rlWrapIdx.length
+  if !clo && !list { return out }
+  const prev = wTarget(out)
+  fbValtype(k, slot)
+  wTarget(prev)
+  return out
 }
 
-// Whether a value of rep `src` stands where rep `dst` is asked, stored alike: a closure, or a
-// list of closures (`cloListStorageSame`).
+// Whether a value of rep `src` stands where rep `dst` is asked: both write the same valtype
+// (`refRepValtype`).
 export function repStoresAs(dst: i32, src: i32): boolean {
-  return cloStorageSame(dst, src) || cloListStorageSame(dst, src)
+  const a = refRepValtype(dst)
+  return a.length > 0 && u8sSame(a, refRepValtype(src))
 }
 
-// Whether list rep `src` stores as list rep `dst`: their elements are the same rep, or closures
-// (`cloStorageSame`), or lists that store alike.
-export function cloListStorageSame(dst: i32, src: i32): boolean {
-  const a = repNodeAt(dst)
-  const b = repNodeAt(src)
-  if !(a is RList) || !(b is RList) { return false }
-  if a.rlsElem == b.rlsElem || cloStorageSame(a.rlsElem, b.rlsElem) {
-    return true
+// Whether byte lists `a` and `b` are equal.
+export function u8sSame(a: u8[], b: u8[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
   }
-  return cloListStorageSame(a.rlsElem, b.rlsElem)
+  return true
 }
 
 // Verifies `f`: rule 0 when it holds, else the first rule broken, its node and why.
