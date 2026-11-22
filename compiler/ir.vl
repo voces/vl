@@ -307,6 +307,9 @@ export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
 export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
 // A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
 // (`numIntrPlanOf`).
+// A binary operator at node `nbAt` on legacy's `numUnion` route, over its non-literal sides in
+// order (a literal side is written at each member's width, so it has no operand).
+export type RNumUnionBin = { nbArgs: Opnd[], nbAt: i32 }
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
 // A SIMD intrinsic at call `sdAt` other than a load or store: its value operands, then its one
 // instruction and any lane immediates (`simdTail`).
@@ -353,6 +356,9 @@ export type RMapHas = {
   mhKey: Opnd,
   mhAt: i32,
 }
+// A `==`/`!=` at node `seAt` on legacy's field-wise record compare: an operand legacy stashes
+// is lowered once; one it re-reads at every field is a variable.
+export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32 }
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
@@ -439,6 +445,7 @@ export type Rhs = RAsUnion
   | RNullOf
   | RNumCast
   | RNumIntr
+  | RNumUnionBin
   | RNumWiden
   | RPrimOp
   | RPrint
@@ -454,6 +461,7 @@ export type Rhs = RAsUnion
   | RStage
   | RStashSet
   | RStrOp
+  | RStructEq
   | RTagIs
   | RTagOf
   | RTagStash
@@ -656,6 +664,8 @@ export type IrFn = {
   irUnbankedRead: i32,
   // A global read the builder built, by the read's node: written again as it stands.
   irReadAgain: {[i32]: Rhs},
+  // A list read the builder built at a node over a variable or an immediate, written again as built.
+  irReadElem: {[i32]: Rhs},
   // The plain field reads the builder built, by the read's node: its object read again, then the
   // field. With `irReadVar` and `irReadAgain`, how the loop prologue reads its receivers.
   irReadField: {[i32]: i32},
@@ -722,6 +732,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irNoTail: [],
     irNoTailEff: [],
     irReadAgain: Map(),
+    irReadElem: Map(),
     irReadField: Map(),
   }
   return f
@@ -1078,9 +1089,11 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapIter => [r.miV]
     RPrint => [r.pnV]
     RStrOp => r.soArgs
+    RStructEq => [r.seL, r.seR]
     RNumWiden => [r.nwV]
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
+    RNumUnionBin => r.nbArgs
     RSimd => r.sdArgs
     RCoalStr => [r.czL, r.czD]
     RCoalAtomStr => [r.zaL, r.zaD]
@@ -1210,12 +1223,14 @@ function rhsText(r: Rhs): string {
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
+    RNumUnionBin => "num_union(" + opndsText(r.nbArgs) + ")"
     RSimd => "simd(" + opndsText(r.sdArgs) + ")"
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
     RMapIter => (if r.miVals { "map.values " } else { "map.keys " }) + opndText(r.miV)
     RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
+    RStructEq => "struct_eq(" + opndsText([r.seL, r.seR]) + ")"
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RCellNew => "cell " + opndText(r.cnInit)
@@ -1509,7 +1524,9 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMemAccess |
       RMemOp |
       RNulNicheEq |
+      RNumUnionBin |
       RSimd |
+      RStructEq |
       RTagOf |
       RTruncSat => "other"
     RRawOp | RRel => "raw"
