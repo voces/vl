@@ -4153,7 +4153,12 @@ function narrowedArmTyOf(ix: i32, fnIx: i32): i32 {
 // type (D3689), and a receiver of any other type, or an `i32` it does not fit, never holds it.
 function emitNumLitEq(recvIx: i32, lv: string, fnIx: i32) {
   if emitExpr(recvIx, fnIx) < 0 { return -1 }
-  const w = exprScalarWidth(recvIx, fnIx)
+  return numLitEqAt(exprScalarWidth(recvIx, fnIx), lv)
+}
+
+// A receiver of scalar width `w` compared with numeric literal `lv`; a width with no compare drops
+// the receiver and is false.
+function numLitEqAt(w: string, lv: string) {
   if w == "i64" {
     const pr = parseI64Pair(lv)
     fbI64Const(pr[0], pr[1])
@@ -6651,23 +6656,44 @@ function emitIsTestNumLit(nd0: IsExpr, fnIx: i32, pl: NumIsPlan) {
   if !pl.nlOnce {
     let nlI = 0
     while nlI < pl.nlTexts.length {
-      if emitNumLitEq(nd0.isObj, pl.nlTexts[nlI], fnIx) < 0 { return -1 }
-      if nlI > 0 { fbI32Bin(114) }
+      if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
+      numLitEqTail(nd0.isObj, pl.nlTexts[nlI], nlI, fnIx)
       nlI = nlI + 1
     }
     return 1
   }
   if emitExpr(nd0.isObj, fnIx) < 0 { return -1 }
-  const nlSlot = numLitOnceSlot(pl.nlBase)
-  fbLocalSet(nlSlot)
+  const nlSlot = numLitOnceStash(pl.nlBase)
   let nsI = 0
   while nsI < pl.nlTexts.length {
-    fbLocalGet(nlSlot)
-    emitNumLitConstEq(pl.nlBase, pl.nlTexts[nsI])
-    if nsI > 0 { fbI32Bin(114) }
+    numLitOnceMember(nlSlot, pl.nlBase, pl.nlTexts[nsI], nsI)
     nsI = nsI + 1
   }
   return 1
+}
+
+// After a re-read receiver of `recvIx`: its compare with member `lv` at the receiver's width,
+// or-ed into the members before it from the second (`i`) on.
+export function numLitEqTail(recvIx: i32, lv: string, i: i32, fnIx: i32) {
+  numLitEqAt(exprScalarWidth(recvIx, fnIx), lv)
+  if i > 0 { fbI32Bin(114) }
+  return 0
+}
+
+// After a once-read receiver of base `base`: kept in a fresh lazy-frame slot (`numLitOnceSlot`),
+// which it returns for the members to read.
+export function numLitOnceStash(base: string): i32 {
+  const slot = numLitOnceSlot(base)
+  fbLocalSet(slot)
+  return slot
+}
+
+// The once-read receiver in `slot`, compared with member `lv`, or-ed in from the second (`i`) on.
+export function numLitOnceMember(slot: i32, base: string, lv: string, i: i32) {
+  fbLocalGet(slot)
+  emitNumLitConstEq(base, lv)
+  if i > 0 { fbI32Bin(114) }
+  return 0
 }
 
 // Whether no value of the closed record type `rcv` can be record arm `arm`: their field names
@@ -11680,9 +11706,14 @@ export function sharedArmNullTail(nk: i32): i32 {
 }
 
 // Whether `emitSharedFieldArm` writes member `vi`'s arm of plan `code` as the plain read alone:
-// no `null` member, no atom or string conversion, no box.
+// no constant `null` arm (`sharedArmNullOf`), no atom or string conversion, no box. A `null` member
+// no constant answers, a `string | null` read's, takes the same path as any other.
 export function sharedArmIsPlain(code: i32, vi: i32, fi: i32): boolean {
-  if vi < 0 || vi >= uVarRow.length || sharedFieldArmNull(vi, fi) {
+  if (
+    vi < 0
+    || vi >= uVarRow.length
+    || sharedArmNullOf(code, vi, fi) != SHARED_NULL_NONE
+  ) {
     return false
   }
   const own = variantFieldTypeAt(vi, fi)
@@ -42243,7 +42274,36 @@ function arrNewRefused(why: string): ArrNewPlan {
   return { anBack: -1, anWrap: -1, anWhy: why }
 }
 
+// Why an `__array_new__` (fill `fill`) or `__array_new_default__` (`fill` -1) site at `callIx` is
+// refused, else "": asked without minting its pair, which `arrNewPlanOf` mints on first ask.
+export function arrNewWhyOf(callIx: i32, fill: i32, fnIx: i32): string {
+  return match arrNewIntrKind(callIx, fnIx) {
+    "f64list" | "i64list" | "u8list" | "f32list" | "v128list" | "strlist" => ""
+    "reflist" => {
+      if !rlRowsMinted() {
+        return "emitProgram: __array_new__ struct fill but ref list types not collected"
+      }
+      // The STRICT slot: an unresolved element refuses, not clamps (D1605).
+      const anSlot = refListSlotOfExprStrict(callIx, fnIx)
+      if (
+        anSlot < 0
+        || anSlot >= rlWrapIdx.length
+        || anSlot >= rlBackIdx.length
+      ) {
+        return "emitProgram: __array_new__ fill type not yet supported natively"
+      }
+      ""
+    }
+    "list" | "none" => {
+      if fill < 0 { return "" }
+      arrNewI32FillWhy(callIx, fill, nodeAt(fill) is ObjLit, fnIx)
+    }
+  }
+}
+
 export function arrNewPlanOf(callIx: i32, fill: i32, fnIx: i32): ArrNewPlan {
+  const why = arrNewWhyOf(callIx, fill, fnIx)
+  if why != "" { return arrNewRefused(why) }
   let anBack = -1
   let anWrap = -1
   const ank = arrNewIntrKind(callIx, fnIx)
@@ -42282,18 +42342,14 @@ export function arrNewPlanOf(callIx: i32, fill: i32, fnIx: i32): ArrNewPlan {
       anWrap = mkListTy()
     }
     "reflist" => {
-      // STRUCT fill → the ref list of the element struct (its interned slot).
-      if !rlRowsMinted() {
-        return arrNewRefused(
-          "emitProgram: __array_new__ struct fill but ref list types not collected",
-        )
-      }
-      // The STRICT slot: this arm picks the list's backing and wrapper heap types, so an
-      // unresolved element must refuse, not clamp. Slot 0 is a real row, and clamping to
-      // it built the module at whichever element interned first (D1605).
+      // STRUCT fill → the ref list of the element struct (its interned slot, which
+      // `arrNewWhyOf` bound-tested).
       const anSlot = refListSlotOfExprStrict(callIx, fnIx)
-      const anBad = anSlot >= rlWrapIdx.length || anSlot >= rlBackIdx.length
-      if anSlot < 0 || anBad {
+      if (
+        anSlot < 0
+        || anSlot >= rlWrapIdx.length
+        || anSlot >= rlBackIdx.length
+      ) {
         return arrNewRefused(
           "emitProgram: __array_new__ fill type not yet supported natively",
         )
@@ -42304,10 +42360,6 @@ export function arrNewPlanOf(callIx: i32, fill: i32, fnIx: i32): ArrNewPlan {
     "list" | "none" => {
       anWrap = lTy()
       anBack = aTy()
-      if fill >= 0 {
-        const why = arrNewI32FillWhy(callIx, fill, nodeAt(fill) is ObjLit, fnIx)
-        if why != "" { return arrNewRefused(why) }
-      }
     }
   }
   return { anBack: anBack, anWrap: anWrap, anWhy: "" }

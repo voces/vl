@@ -159,6 +159,7 @@ import {
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumIs,
   RNumUnionBin,
   RNumWiden,
   RPrimOp,
@@ -205,6 +206,7 @@ import {
   SSetField,
   SSwitch,
   STrap,
+  coalArmStagesLeads,
   irFnNew,
   irNoTailEffHas,
   irNoTailHas,
@@ -537,6 +539,7 @@ import {
   narrowedBoxVariantPlain,
   narrowedFieldPlain,
   narrowedVariantRepIs,
+  numIsPlanOf,
   structFieldPlain,
   variantFieldPlain,
 } from "./emit_plan_union"
@@ -582,6 +585,9 @@ import {
   nulStrMemberClose,
   nulStrMemberGuard,
   nulStrMemberOpen,
+  numLitEqTail,
+  numLitOnceMember,
+  numLitOnceStash,
   optRecvStagedAt,
   strMemberEqTail,
   unionLitIsPlanOf,
@@ -961,6 +967,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
     RLitArms => litArms(r)
+    RNumIs => numIs(r)
     RTagIs => {
       leaf()
       tagIsTail(r.tgiId)
@@ -1650,6 +1657,31 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
       -1
     }
   }
+}
+
+// `RNumIs` along `numIsPlanOf`, as `emitIsTestNumLit` writes it: the receiver once into its slot
+// and each member's compare, or per member the receiver (read again after the first) and compare.
+function numIs(r: RNumIs): i32 {
+  const n = nodeAt(r.niAt)
+  if !(n is IsExpr) { return irLMiss("numeric is node") }
+  const pl = numIsPlanOf(r.niAt, n, lw.irAt)
+  let i = 0
+  if pl.nlOnce {
+    irLOpnd(r.niV)
+    const slot = numLitOnceStash(pl.nlBase)
+    while i < pl.nlTexts.length {
+      numLitOnceMember(slot, pl.nlBase, pl.nlTexts[i], i)
+      i = i + 1
+    }
+    return 1
+  }
+  while i < pl.nlTexts.length {
+    if i == 0 { irLOpnd(r.niV) }
+    else if opndAgain(r.niV, n.isObj) < 0 { return -1 }
+    numLitEqTail(n.isObj, pl.nlTexts[i], i, lw.irAt)
+    i = i + 1
+  }
+  return 1
 }
 
 // `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
@@ -3431,6 +3463,11 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   return IF_DONE
 }
 
+function noRoots(): i32[] {
+  const r: i32[] = []
+  return r
+}
+
 // Writes the temps an earlier operand left pending below the valued `if` about to open on `c`,
 // in definition order, as legacy writes that operand first; each root stays on the stack for its
 // one reader after the `if`, and `pending` keeps the condition's temps. Returns the roots.
@@ -3618,6 +3655,11 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   }
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
+  // An earlier operand's temps are written below the operand, as a valued `if` stages them.
+  const roots = if coalArmStagesLeads(n.cbArm) { stageLead(n.cbL, pending) } else { noRoots() }
+  if lwMiss != "" { return -1 }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
   const ba = coalValBoxArm(n.cbArm)
   const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
     "popOr" => coalPopOr(n, e, pending)
@@ -3631,7 +3673,9 @@ function coalBox(n: SCoalBox, pending: i32[]) {
       irLMiss("coalesce box arm")
     }
   } }
+  lwFloor = lwFloors.pop() ?? 0
   if got < 0 { return -1 }
+  for r in roots { pending.push(r) }
   livePush(t)
   pending.push(t)
   return 0
