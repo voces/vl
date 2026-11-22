@@ -14237,10 +14237,17 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
     if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
     return mapGetOrI32Tail()
   }
-  const nulSentinel = mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx))
-  // raw = (entry != 0) ? backing[entry-1] : sentinel  — a miss reads as null.
-  pushMapScr(5)           // entry
-  fbIf(127)               // if (entry != 0 → found), i32 blocktype
+  mapGetOrSentinelHead(mapGetOrSentinel(mapRecvTyIn(recvIx, fnIx)))
+  if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
+  return mapGetOrSentinelTail()
+}
+
+// The sentinel arm's head after the probe: the raw value, or on a miss the null sentinel `sent`,
+// held in the probe's dead hash slot and compared with `sent`; an `i32` `if` whose then-arm is
+// the default follows.
+export function mapGetOrSentinelHead(sent: i32) {
+  pushMapScr(5)    // entry
+  fbIf(127)        // if (entry != 0 → found), i32 blocktype
   pushMapVals()
   fbStructGet(lTy(), 0)
   pushMapScr(5)
@@ -14248,15 +14255,19 @@ function emitMapGetOr(recvIx: i32, keyIx: i32, defIx: i32, fnIx: i32, rk: i32) {
   fbI32Bin(107)
   fbArrayGet(aTy())
   fbElse()
-  fbI32Const(nulSentinel) // miss = null sentinel
+  fbI32Const(sent) // miss = null sentinel
   fbEnd()
-  // Coalesce: raw == sentinel ? d : raw. Slot +8 (probe hash cursor) is dead after the probe.
+  // Slot +8 (probe hash cursor) is dead after the probe.
   setMapScr(8)
   pushMapScr(8)
-  fbI32Const(nulSentinel)
+  fbI32Const(sent)
   fbI32Bin(70) // 0x46 i32.eq → raw == sentinel (null, missing OR stored)
   fbIf(127)
-  if emitMonoMapDefault(recvIx, defIx, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// After the sentinel arm's default: the else-arm's raw value, and the end.
+export function mapGetOrSentinelTail() {
   fbElse()
   pushMapScr(8)
   fbEnd()
@@ -14390,7 +14401,7 @@ export function mapGetOrMvTail(mslot: i32) {
 
 // The i32 a mono map of type `mt` stores for a null value: `-1` for a nullable literal union, `2`
 // for a nullable boolean or `null`; 0 for a map with no null sentinel.
-function mapGetOrSentinel(mt: i32): i32 {
+export function mapGetOrSentinel(mt: i32): i32 {
   if mapTyValIsNulLitUnion(mt) { return 0 - 1 }
   if mapTyValIsNulBool(mt) || mapTyValIsNullUnit(mt) { return 2 }
   return 0
@@ -35676,6 +35687,12 @@ function emitIfStmtStmt(stmtIx: i32, fnIx: i32) {
   return closeIfChainFrames(open, 0, false)
 }
 
+// Whether `if` link `s` is a chain's last, its test one the checker proved holds: legacy writes its
+// arm as the bare `else`, with no comparison and no frame (A-exhaust).
+export function ifLinkExhausts(s: IfStmt): boolean {
+  return s.ifElse < 0 && condProvenTrue(s.ifCond)
+}
+
 // One link of `emitIfStmtStmt`'s chain. Returns 0 with its frame closed, -1 on failure, or 1
 // when its else is another `if`: the frame is left open and its else narrowing's restore
 // target (-1 when the else did not narrow) is pushed onto `open`.
@@ -35683,7 +35700,7 @@ function emitIfLinkStmt(s: IfStmt, fnIx: i32, open: i32[], tail: boolean) {
   // A-exhaust: the LAST arm of a chain the checker PROVED exhaustive is reached only when its
   // test holds, so it lowers as the bare `else` — no comparison, no `if` frame. The narrowing
   // still runs, since the arm reads its own member's fields (`condProvenTrue`).
-  if s.ifElse < 0 && condProvenTrue(s.ifCond) {
+  if ifLinkExhausts(s) {
     const pgRc = emitTailArm(s.ifThen, fnIx, tail)
     return pgRc
   }

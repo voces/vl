@@ -137,8 +137,8 @@ export type RCast = { ctV: Opnd, ctTarget: i32, ctOnFail: CastFail }
 export type RTagOf = { tgV: Opnd }
 // `mrFields` in kid order; `mrLayout[i]` the kid layout position `i` writes; `mrSrc` the kids in
 // stash source order, else empty; `mrSet` where `RStashSet`s set them (`mrFields` then empty).
-// `mrAt` the literal, at its own row or, where `mrRow` is not -1, its destination's (a variant's
-// where `mrVariant`); `mrBuiltRow` the row the builder built the fields by, which lowering reads.
+// `mrAt` the literal, at its own row or, where `mrRow` is not -1, its destination's; `mrVariant`
+// whether that row is a variant's; `mrBuiltRow` the row the builder built the fields by.
 export type RMakeRec = {
   mrFields: Opnd[],
   mrLayout: i32[],
@@ -189,13 +189,32 @@ export type RListNewDefault = { ldLen: Opnd, ldAt: i32 }
 // `__array_copy__(dst, dstAt, src, srcAt, count)` at call node `lcAt`, over its five operands.
 export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
-// its value (`memAccessPlanOf`).
-export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
-// An atomic intrinsic at call node `amAt` over its address and value operands (`atomicPlanOf`);
-// a fence has none.
-export type RAtomic = { amArgs: Opnd[], amAt: i32 }
-// A scalar saturating truncation at call node `tsAt` of float operand `tsV` (`truncSatPlanOf`).
-export type RTruncSat = { tsV: Opnd, tsAt: i32 }
+// its value: `mmBase` operands (1 a load, 2 a store) at width prim `mmPrim`, as the builder planned.
+export type RMemAccess = {
+  mmArgs: Opnd[],
+  mmAt: i32,
+  mmBase: i32,
+  mmPrim: string,
+}
+// An atomic intrinsic at call node `amAt` over its address and value operands, as the builder
+// planned it: `amBase` operands (0 a fence), operand `k >= 1` at prim `amValPrims[k]`, and a
+// result at `amResPrim` ("" for none).
+export type RAtomic = {
+  amArgs: Opnd[],
+  amAt: i32,
+  amBase: i32,
+  amValPrims: string[],
+  amResPrim: string,
+}
+// A scalar saturating truncation at call node `tsAt` of float operand `tsV`: instruction `tsOp`
+// from float prim `tsFrom` to integer prim `tsTo`, as the builder planned it.
+export type RTruncSat = {
+  tsV: Opnd,
+  tsAt: i32,
+  tsOp: i32,
+  tsFrom: string,
+  tsTo: string,
+}
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
@@ -208,8 +227,9 @@ export type RNumWiden = { nwV: Opnd, nwSrc: i32, nwDst: i32, nwAt: i32 }
 // A numeric `as` at cast node `ncAt` over operand `ncV`, built at the kind `numCastKindOf`
 // names; legacy's `numCastTail` writes the conversion, and an `as!`'s test and trap.
 export type RNumCast = { ncV: Opnd, ncAt: i32 }
-// `bxV` boxed into the union the checker records delivery node `bxAt` delivered into.
-export type RToBox = { bxV: Opnd, bxAt: i32 }
+// `bxV` boxed into the union the checker records delivery node `bxAt` delivered into; `bxFree`
+// whether `bxAt` has no effect, so an immediate may stand for it.
+export type RToBox = { bxV: Opnd, bxAt: i32, bxFree: boolean }
 // Atom `rgV` as the `K | null` (discipline 3) that holds it: the same i32, so no bytes.
 export type RRetag = { rgV: Opnd }
 // Atom `sxV`, or its `K | null`, as the string, or `string | null`, legacy's atom decode writes
@@ -338,9 +358,16 @@ export type RNumUnionBin = { nbArgs: Opnd[], nbAt: i32 }
 // as legacy's `emitNumUnionConvert` writes it (`widenPlanOf`'s `convert`).
 export type RNumUnionConvert = { nuV: Opnd, nuTo: i32, nuAt: i32 }
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
-// A SIMD intrinsic at call `sdAt` other than a load or store: its value operands, then its one
-// instruction and any lane immediates (`simdTail`).
-export type RSimd = { sdArgs: Opnd[], sdAt: i32 }
+// A SIMD intrinsic at call `sdAt`: its value operands, then its one instruction and any lane
+// immediates (`simdTail`). As the builder planned it, a load or store has `sdMemBase` operands (1
+// or 2, else 0); any other op takes operands at `sdPrims` and leaves `sdResPrim` ("" for none).
+export type RSimd = {
+  sdArgs: Opnd[],
+  sdAt: i32,
+  sdMemBase: i32,
+  sdPrims: string[],
+  sdResPrim: string,
+}
 // A `print` statement at call `pnAt` of argument `pnV`, written by legacy's tail for its arm.
 export type RPrint = { pnV: Opnd, pnAt: i32 }
 // `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` (recovered for `mgNonNull`), else receiver
@@ -738,6 +765,9 @@ export type IrFn = {
   // The globals whose cell holds the record a holding binding holds whole, noted at that record's
   // rep: a read of one at that rep is at its storage.
   irGlobalHeld: {[i32]: boolean},
+  // The padding a valued body needs at its end, as the builder found it: "" (it leaves on every
+  // path), "null" (a live fall-through returns null) or "unreachable" (a dead one).
+  irEndPad: string,
   irSpanAst: i32[],
   irSpanFirst: i32[],
   irSpanLast: i32[],
@@ -825,6 +855,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irRecHeap: Map(),
     irGlobalStoreTy: Map(),
     irGlobalHeld: Map(),
+    irEndPad: "",
     irSpanAst: [],
     irSpanFirst: [],
     irSpanLast: [],
@@ -1024,10 +1055,27 @@ export function mapBoxReadsAt(mrep: i32, out: i32): boolean {
     && (out == mr.rmVal || out == v.rnInner)
 }
 
+// Whether rep `r` is held as an `i32`: an `i32` or `boolean`, a literal-union atom, or its
+// `K | null` (discipline 3) or `boolean | null` (discipline 2) niche.
+export function repHeldAsI32(r: i32): boolean {
+  const p = repPrim(r)
+  if p == "i32" || p == "bool" { return true }
+  const n = repNodeAt(r)
+  return n is RAtom || n is RNullable && (n.rnDisc == 2 || n.rnDisc == 3)
+}
+
 // Whether rep `r` is the `boolean | null` niche (discipline 2): an i32 cell, `2` for null.
 export function repBoolNiche(r: i32): boolean {
   const n = repNodeAt(r)
   return n is RNullable && n.rnDisc == 2 && repPrim(n.rnInner) == "bool"
+}
+
+// Whether a value at rep `src` is already one of rep `dst` with nothing written: the `null` unit's
+// bottom ref into a rep that lowers to a nullable reference (`ref null $T`, discipline 1). A niche
+// nullable (an atom's `-1`, a boolean's `2`, a box's null tag) encodes its null, so it is no such rep.
+export function repNullRefFits(src: i32, dst: i32): boolean {
+  const d = repNodeAt(dst)
+  return repPrim(src) == "null" && d is RNullable && d.rnDisc == 1
 }
 
 // The union box rep `r` holds: the box under any boxed nullables (discipline 4, whose `null` is

@@ -19,11 +19,12 @@ import {
   sIf,
 } from "./ir"
 import { irVerify } from "./ir_verify"
-import { repNodeOfTy } from "./emit_rep"
+import { repClosureOfReps, repNodeOfTy } from "./emit_rep"
 import {
   TY_BOOL,
   TY_I32,
   TY_NEVER,
+  TY_NULL,
   TY_STR,
   mkArrayTy,
   mkLitTy,
@@ -83,8 +84,11 @@ const selfTestIds: string[] = [
   "num-union-conversion-of-non-box",
   "num-union-conversion-off-result-kind",
   "held-global-read-off-noted-rep",
+  "null-into-nullable-record-global",
+  "null-into-bool-niche-global",
   "result-pick-of-i32",
   "result-pick-record-into-i32",
+  "retag-closures-of-differing-arity",
   "retag-field-alike-records-two-heaps",
   "global-read-off-store-type",
   "valued-block-temp-out",
@@ -92,6 +96,10 @@ const selfTestIds: string[] = [
   "atom-tower-i32-read",
   "atom-tower-zero-reads",
   "atom-staged-of-i32",
+  "trunc-sat-operand-off-plan",
+  "atomic-value-off-plan",
+  "memory-store-value-off-plan",
+  "simd-operand-off-plan",
   "coal-str-default-off-rep",
   "coal-atom-str-default-off-rep",
 ]
@@ -183,11 +191,51 @@ function caseFn(id: string): IrFn {
   if id == "bounds-rule-uninstalled" {
     f.irBody.push(node(f, { bcV: v(p), bcIx: v(p) }, none))
   }
+  // Rule 2 against the plan a node carries: a truncation from f64 of an i32, an atomic store of an
+  // i32 at an i64 row, a memory store of an i32 at an f64 width, a SIMD op over an i32 at v128.
+  if id == "trunc-sat-operand-off-plan" {
+    const ts: Rhs = {
+      tsV: v(p),
+      tsAt: callNode(),
+      tsOp: 0,
+      tsFrom: "f64",
+      tsTo: "i32",
+    }
+    f.irBody.push(node(f, { efRhs: ts }, none))
+  }
+  if id == "atomic-value-off-plan" {
+    const am: Rhs = {
+      amArgs: [v(p), v(p)],
+      amAt: -1,
+      amBase: 2,
+      amValPrims: ["", "i64"],
+      amResPrim: "",
+    }
+    f.irBody.push(node(f, { efRhs: am }, none))
+  }
+  if id == "memory-store-value-off-plan" {
+    const mm: Rhs = { mmArgs: [v(p), v(p)], mmAt: -1, mmBase: 2, mmPrim: "f64" }
+    f.irBody.push(node(f, { efRhs: mm }, none))
+  }
+  if id == "simd-operand-off-plan" {
+    const sd: Rhs = {
+      sdArgs: [v(p)],
+      sdAt: -1,
+      sdMemBase: 0,
+      sdPrims: ["v128"],
+      sdResPrim: "",
+    }
+    f.irBody.push(node(f, { efRhs: sd }, none))
+  }
   // Rule 2 again: a box whose immediate stands for a call, whose effect would go unread.
   if id == "box-immediate-for-call" {
     const bt = irVarNew(f, i32r, TY_I32, "temp", -1)
     f.irBody.push(
-      node(f, { lDst: bt, lRhs: { bxV: imm(i32r, 1), bxAt: callNode() } }, i32r),
+      node(
+        f,
+        { lDst: bt, lRhs: { bxV: imm(i32r, 1), bxAt: callNode(), bxFree: false } },
+        i32r,
+      ),
     )
   }
   // Rules for a fused `pop ?? d`: a pop of an i32, a bool out from an `i32[]`, and a default that
@@ -298,6 +346,21 @@ function caseFn(id: string): IrFn {
     }
     f.irBody.push(node(f, { lDst: ct, lRhs: cv }, i32r))
   }
+  // A `null`-typed value stored into a global: accepted into a nullable record's cell, which
+  // lowers to `ref null`, and refused into a `boolean | null` niche (rule 2).
+  if (
+    id == "null-into-nullable-record-global"
+    || id == "null-into-bool-niche-global"
+  ) {
+    const rec = id == "null-into-nullable-record-global"
+    const gt = if rec { mkNullableTy(mkObjTy(["a"], [TY_I32])) } else { mkNullableTy(TY_BOOL) }
+    irGlobalNote(f, 0, repNodeOfTy(gt))
+    irGlobalStoreNote(f, 0, gt)
+    const nr = repNodeOfTy(TY_NULL)
+    const np = irVarNew(f, nr, TY_NULL, "param", 1)
+    f.irParams.push(np)
+    f.irBody.push(node(f, { gsSym: 0, gsSrc: v(np) }, none))
+  }
   // Rule 2 again: an order-stashed record whose source order evaluates one field twice.
   if id == "record-field-read-twice" {
     const ot = mkObjTy(["a", "b"], [TY_I32, TY_I32])
@@ -370,6 +433,14 @@ function caseFn(id: string): IrFn {
     f.irBody.push(
       node(f, { lDst: sn, lRhs: { nrV: v(p), nrAt: -1, nrKind: 2 } }, i32r),
     )
+  }
+  // A retag between closures whose closed parts differ, one parameter against two (rule 2).
+  if id == "retag-closures-of-differing-arity" {
+    const one = repClosureOfReps([i32r], i32r, false)
+    const two = repClosureOfReps([i32r, i32r], i32r, false)
+    const c1 = irVarNew(f, one, -1, "local", 1)
+    const c2 = irVarNew(f, two, -1, "temp", -1)
+    f.irBody.push(node(f, { lDst: c2, lRhs: { rgV: v(c1) } }, two))
   }
   // Rule 2 again: a retag of one record's list into another's whose fields' reps are alike, the
   // two noted on different heaps.
