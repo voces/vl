@@ -14206,7 +14206,95 @@ export function mapPrepProbeTail() {
 // (miss → the null-tagged box), then coalesce on its null tag — `scalar | null` peels to the
 // raw scalar, widened to `rk` (the `??`'s atom kind, -1 none) when that is wider, and a
 // multi-member `… | null` peels to the non-null union box.
+export type MapUnionPlan = { muKind: i32, muWide: i32, muVb: i32 }
+
+// The scalar plan of `m[k] ?? d` over boxed union-valued mv slot `mslot`, a `scalar | null` value
+// with a non-nullable default: the scalar's kind, the result kind it widens to (`rk` where wider),
+// and its value box; `muKind` -1 for any other value or default.
+export function mapGetOrUnionScalarPlanOf(
+  mslot: i32,
+  defIx: i32,
+  rk: i32,
+): MapUnionPlan {
+  const no: MapUnionPlan = { muKind: -1, muWide: -1, muVb: -1 }
+  if mslot < 0 || mvValKindAt(mslot) != "union" || !mvValUnionHasNull(mslot) {
+    return no
+  }
+  const mtys: i32[] = []
+  const uvsid = msSetOfTy(mvValTyIxAt(mslot))
+  if (
+    !msMemberTysOfSet(uvsid, mtys)
+    || mtys.length != 2
+    || defExprNullable(defIx)
+  ) {
+    return no
+  }
+  const ak = unionResidualSoloKindOfSet(uvsid)
+  if ak < 0 { return no }
+  const vb = vbHeapIdxOfKind(ak)
+  if vb < 0 { return no }
+  const p: MapUnionPlan = {
+    muKind: ak,
+    muWide: if coalWidens(ak, rk) { rk } else { ak },
+    muVb: vb,
+  }
+  return p
+}
+
+// A union-valued mv read's head after the probe: the stored box on a hit, the null-tagged box on a
+// miss, into the slot's stash.
+export function mapGetOrUnionHead(mslot: i32) {
+  const stashL = fnMvValStashLocal(mslot)
+  pushMapScr(5)                // entry
+  fbIf(64)                     // if (entry != 0 → found), void
+  pushMapVals()
+  fbStructGet(cmValsWrap(), 0) // vals backing
+  pushMapScr(5)
+  fbI32Const(1)
+  fbI32Bin(107)                // i32.sub (entry - 1)
+  fbArrayGet(cmValsBack())     // the stored (ref null $uBox) slot read
+  fbLocalSet(stashL)
+  fbElse()                     // miss = the read's null (a null-tagged box)
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbLocalSet(stashL)
+  fbEnd()
+  return 0
+}
+
+// The scalar plan's test after the head: the stash's null tag opens a value-typed `if` in the
+// result's kind, whose then-arm is the default.
+export function mapGetOrUnionScalarOpen(mslot: i32, qp: MapUnionPlan) {
+  fbLocalGet(fnMvValStashLocal(mslot))
+  fbStructGet(uBoxIdx, 0)             // field 0: tag
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbI32Bin(70)                        // 0x46 i32.eq → null?
+  fbIf(valBlockTypeOfKind(qp.muWide)) // value-typed if in the result's rep
+  return 0
+}
+
+// After the default: the stored scalar unboxed and widened to the result's kind, and the `if` closed.
+export function mapGetOrUnionScalarTail(mslot: i32, qp: MapUnionPlan): i32 {
+  fbElse()
+  fbLocalGet(fnMvValStashLocal(mslot))
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref payload)
+  fbRefCast(qp.muVb)
+  fbStructGet(qp.muVb, 0) // the scalar payload
+  if coalWidenUnboxed(qp.muKind, qp.muWide) < 0 { return -1 }
+  fbEnd()
+  return 0
+}
+
 function emitMapGetOrUnionBox(mslot: i32, defIx: i32, fnIx: i32, rk: i32) {
+  // The scalar plan, which the IR writes too: the head, the default in the result's kind, the tail.
+  const qp = mapGetOrUnionScalarPlanOf(mslot, defIx, rk)
+  if qp.muKind >= 0 {
+    mapGetOrUnionHead(mslot)
+    mapGetOrUnionScalarOpen(mslot, qp)
+    if emitExprAsKind(defIx, qp.muWide, fnIx) < 0 { return -1 }
+    return mapGetOrUnionScalarTail(mslot, qp)
+  }
   const uvn = mvValName[mslot]
   // The map value union's members come from its type's member set. One resolution of the
   // set feeds both this walk and the residual-kind code below, so the two cannot disagree.
