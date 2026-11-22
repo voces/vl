@@ -9183,7 +9183,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "rec" | "obj" | "refList" | "map" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "mapScalar" | "ladder" => false
   }
 }
@@ -9196,6 +9196,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbRefNullNone() // the payload slot is unread under the null tag
     }
     "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
@@ -9215,7 +9216,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
     "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
-    "atom" | "lit" => atomBoxTail(p.hbKind)
+    "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
@@ -9225,7 +9226,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // `emitUnionBoxArg` for a value plan `p` decides.
 function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
-  if p.hbArm == "atom" {
+  if p.hbArm == "atom" || p.hbArm == "atomList" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "mapScalar" {
     const mre = nodeAt(unwrapParen(exprIx))
@@ -10358,20 +10359,21 @@ function emitUnionConcreteEq(
     fbI32Bin(70)
     fbElse()
   }
-  // tag == tagOf(atom), gating the payload compare.
+  // The plain arm's tails, around a stashed box and the operand's null legs. The tag is the
+  // concrete operand's own arm type's, as the box site composes it (`cloBoxOwnFnTy`).
+  const qt: UnionEqPlan = {
+    uqKind: eak,
+    uqTag: unionEqTagOfArmTy(
+      eak,
+      cloBoxEqArmTy(otherIx, unr[0], fnIx),
+    ),
+  }
   if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if eqOnce { fbLocalTee(eqStash) }
-  fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  // The CONCRETE operand's own arm type, through the very composition the BOX site uses
-  // (`cloBoxOwnFnTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
-  // actually writes.
-  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx)))
-  fbI32Bin(70)            // 0x46 i32.eq
-  fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
+  unionEqTagTail(qt)
   if eqOnce { fbLocalGet(eqStash) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  if emitUnionPayloadUnbox(eak) < 0 { return -1 }
+  if unionEqPayloadTail(qt) < 0 { return -1 }
   if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
   if (
@@ -10380,16 +10382,9 @@ function emitUnionConcreteEq(
   ) {
     fbRefAsNonNull()
   }
-  // D-EQOPCODE: the payload compare is the last projection of `eak`, which already chose
-  // the box tag, the payload unbox and the widened operand emit above it.
-  if emitUnionAtomPayloadEq(eak, fnIx) < 0 { return -1 }
-  fbElse() // 0x05 else: wrong-rep arm — structurally unequal
-  fbI32Const(0)
-  fbEnd()  // 0x0b end
+  if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
   if nulOther || nulStrOther || nulBoolOther { fbEnd() }
-  if isNe {
-    fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
-  }
+  if isNe { fbI32Eqz() }
   return 0
 }
 
