@@ -27184,37 +27184,45 @@ function armCalleeName(c: Call, callee: Ident): string {
   return if f is FuncDecl { f.fnName } else { "" }
 }
 
-// `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
-// direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
-// intrinsic when the name resolves to no function. Returns 0 or -1.
-function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
-  // Scope-aware: `buildFnMap` keys lifted functions by name, first wins, so the flat map
-  // would give every frame's `inner(…)` the module's first `inner`. The positioned lookup
-  // takes the block-local function whose scope covers this call, else a top-level one.
-  const target = fnIndexOfInScopeChainAt(
+// The function call `c` of `callee` names in frame `fnIx`, or -1. Scope-aware: the flat map keys
+// lifted functions by name, first wins, so this takes the block-local function covering the call.
+function userFnCallTarget(c: Call, callee: Ident, fnIx: i32): i32 {
+  return fnIndexOfInScopeChainAt(
     sidOfNode(c.callFn),
     armCalleeName(c, callee),
     fnIx,
     c.callFn,
   )
-  // A live closure binding of the name outranks that scan, which cannot see a param or a
-  // local (D1602); a local declared later does not yet shadow the function (D3607). Asked
-  // only on a hit, so a plain call pays nothing.
+}
+
+// Whether `emitCallCoreUserFn` sends call `c` to `emitCallRef`, given `target` from
+// `userFnCallTarget`: a live closure binding (D1602) or bundle parameter of the name outranks the
+// function, and a name with none routes by `unknownCallRoutesRef`. A later local does not (D3607).
+function userFnCallRoutesRef(
+  c: Call,
+  callee: Ident,
+  fnIx: i32,
+  target: i32,
+): boolean {
+  if target < 0 { return unknownCallRoutesRef(c, callee, fnIx) }
   if (
-    target >= 0
-    && identNameIsLiveBound(callee.identName, fnIx)
+    identNameIsLiveBound(callee.identName, fnIx)
     && identIsBoundClosure(c.callFn, fnIx)
   ) {
-    return emitCallRef(callIx, fnIx)
+    return true
   }
-  // So does a bundle parameter of the name, which is a record of closures, not one.
-  if target >= 0 && bundleParamOfRead(c.callFn, fnIx) >= 0 {
+  return bundleParamOfRead(c.callFn, fnIx) >= 0
+}
+
+// `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
+// direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
+// intrinsic when the name resolves to no function. Returns 0 or -1.
+function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
+  const target = userFnCallTarget(c, callee, fnIx)
+  if userFnCallRoutesRef(c, callee, fnIx, target) {
     return emitCallRef(callIx, fnIx)
   }
   if target < 0 {
-    if unknownCallRoutesRef(c, callee, fnIx) {
-      return emitCallRef(callIx, fnIx)
-    }
     if !identNameIsLiveBound(callee.identName, fnIx) {
       const niRc = emitNumIntr(callIx, fnIx, callee.identName)
       if niRc != NUM_INTR_NONE { return niRc }
@@ -28029,12 +28037,9 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
   if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
   if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
   if holderRecordSigs(d, fnIx).length > 0 { return "" }
-  // A function of the name in scope makes legacy ask its live scope which one the name means.
-  if fnIndexOfInScopeChainAt(sidOfNode(c.callFn), nm, fnIx, c.callFn) >= 0 {
-    return ""
-  }
+  // Routed as `emitCallCoreUserFn` routes it; a bundle parameter is `bundleCallRefPlainKey`'s.
   if (
-    !unknownCallRoutesRef(c, callee, fnIx)
+    !userFnCallRoutesRef(c, callee, fnIx, userFnCallTarget(c, callee, fnIx))
     || bundleParamOfRead(c.callFn, fnIx) >= 0
   ) {
     return ""
