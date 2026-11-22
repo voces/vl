@@ -21,3 +21,14 @@ It is the same class as `array spread pair unminted` (#9529).
 
 `tests/ir-shadow-rows/array-new-first-scalar-list.vl`: an i32 list literal, then the program's first
 f64 list from `__array_new__`, in one function.
+
+## Measured vs merge-base 4bcb34f3 (fixpoint seeds on both sides)
+
+- Fixpoint after one refresh; `--names` self-compile identical; mode-3 self-compile byte-identical.
+- `ir-identity.sh --claimless`: identical 14019, fail under both 3267, differ 0.
+- `ir-identity.sh --cases`: identical 7622, differ 0; witnesses same 61, differ 0.
+- tests/cases legacy A/B: identical 7342, differ 0.
+- `ir prepost` (mode 6, build before vs after legacy): ok, no new row.
+- tests/cases armed shadow and corpus census unchanged (covered 69,322, matched 69,321; corpus
+  no-blocker 45,190): the change moves no coverage.
+- Self-compile L2 fuel +0.01% per PR. Deep-nesting margin fail 920 / pass 930 KB on both sides.
