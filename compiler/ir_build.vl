@@ -7,7 +7,7 @@ import { blockHasContinueFor } from "./emit_query"
 // A covered function is verified and then discarded: nothing is claimed, so no byte moves.
 import { emitFail } from "./emit_bytes"
 import { cloLiftLetFe, cloLifted } from "./emit_lift"
-import { sigParamKindAt } from "./emit_closure_callee"
+import { sigParamKindAt, sigParamSlotAt } from "./emit_closure_callee"
 import { sigKeyRetIsVoid } from "./emit_sig_tokens"
 import { monoBundleFe, monoBundleReadFe } from "./emit_mono"
 import {
@@ -179,6 +179,7 @@ import {
   bundlePickOf,
   callEndsNever,
   callRefArgArmOf,
+  callRefBundleArgOf,
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
@@ -273,6 +274,10 @@ import {
   numIntrPlanOf,
   numLitAsApplies,
   numLitLexAt,
+  numUnionIsUnionSide,
+  numUnionSideBoxed,
+  numUnionSideLit,
+  numUnionSidePrim,
   objLitArmOf,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
@@ -471,6 +476,7 @@ import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
   bundleRecordTyOf,
   elabArmSigAt,
+  elabInstTyAt,
   elabSpreadNote,
   isStorageRead,
   readNarrowedStoreAt,
@@ -589,6 +595,7 @@ import {
   fnRetNullBearing,
   globalNameIsNonConstSid,
   paramStructIdxOf,
+  vtKindOfParam,
 } from "./emit_nullable_rets"
 import { CoalValArm, nullRetPlanOf } from "./emit_plan_null"
 import {
@@ -2360,8 +2367,9 @@ function refIfArm(
     irBNode(body, { asDst: t, asSrc: z }, -1, ibNoValue, blockIx)
     return body
   }
-  const built = irBExpr(body, tv)
-  // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`).
+  // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`), from the atom
+  // as its cell holds it.
+  const built = exprAt(body, tv, arm == "atomStr")
   const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && refIfArmNiches(built, tv, rep) { repTemp(body, { rgV: built }, tv, rep) } else { built }
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("ref if arm rep") }
   if ibMiss == "" {
@@ -3086,7 +3094,7 @@ function boxNarrowArmOf(
   ) {
     return "container"
   }
-  if c is RBox && repNodeAt(rep) is RBox && arm == "local" { return "box" }
+  if heldAsBox(cellRep) && heldAsBox(rep) && arm == "local" { return "box" }
   return "none"
 }
 
@@ -3490,6 +3498,17 @@ function liftCaps(pos: i32): Opnd[] {
   return out
 }
 
+// The function type of nested function `pos` called by `c`: its declaration's, closed by the
+// instance where it is a generic's, else the read's recorded type; -1 for none.
+function capturedCalleeTy(c: Call, pos: i32): i32 {
+  const d = identDeclOf(c.callFn)
+  const dty = if d >= 0 { nodeTyAt(d, -1) } else { -1 }
+  const ity = if dty >= 0 { elabInstTyAt(dty, fnStmts[pos]) } else { -1 }
+  if ity >= 0 { return ity }
+  if dty >= 0 { return dty }
+  return heldTy(exprTyOf(c.callFn))
+}
+
 // A direct call `ix` of nested function `pos`, which reads its captures from its environment, as
 // `emitCapturedCall` writes it: the function's closure over a fresh environment, called through
 // legacy's shared head and tail at the function's own `$fnsig`, each argument on the plain arm.
@@ -3499,7 +3518,9 @@ function capturedCallRhs(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
   }
   const sig = fnSigIdxOfFn(pos)
   if sig < 0 { return missRhs("captured call signature") }
-  const fty = heldTy(exprTyOf(c.callFn))
+  // The closure is the instance `pos` legacy builds and calls at `sig`: its declaration's type as
+  // that instance closes it. A generic's read carries no type of its own in the caller's frame.
+  const fty = capturedCalleeTy(c, pos)
   const frep = repNodeOfTy(fty)
   if !(repNodeAt(frep) is RClosure) {
     return missRhs("captured call closure rep")
@@ -3623,6 +3644,20 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
   let i = 0
   while i < c.callArgs.length {
     const at = b.length
+    // A function handed as a bundle is the record of its closures, as `emitBundleReadArg` writes it.
+    const bb = callRefBundleArgOf(c, ibFnIx, key, i)
+    if bb.bbTy >= 0 {
+      const si = repRowOfTyStruct(bb.bbTy, repScanLim())
+      const ba = bundleRecBuild(b, c.callArgs[i], bb.bbSigs, si, bb.bbTy, true)
+      if ibMiss != "" { return missRhs(ibMiss) }
+      // The key's parameter takes the record row, whatever the closure's function type says.
+      if sigParamSlotAt(key, i) != si {
+        return missRhs("closure bundle argument row")
+      }
+      args.push(ba)
+      i = i + 1
+      continue
+    }
     // A widening is delivered at its parameter's number, as `emitWidened` writes it, and a box at
     // the parameter's union, as `emitUnionBoxAtRecord` writes it.
     const arm = callRefArgArmOf(ix, ibFnIx, key, c.callArgs[i], i)
@@ -4646,6 +4681,42 @@ function pushStage(
   return st
 }
 
+// A binary operator legacy writes on its `numUnion` route (`emitNumUnionBin`): each non-literal
+// side, a union side already its box and a scalar side already at its kind, then the member
+// dispatch. A side legacy converts at the stash is a named miss.
+function numUnionBin(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
+  const args: Opnd[] = []
+  const at = b.length
+  for side in [n.binLeft, n.binRight] {
+    const isU = numUnionIsUnionSide(side, ibFnIx)
+    if isU && !numUnionSideBoxed(side, ibFnIx) {
+      return irBMiss("numeric union side box")
+    }
+    if !isU && numUnionSideLit(side) { continue }
+    const o = irBExpr(b, side)
+    if ibMiss != "" { return o }
+    if isU && !(repNodeAt(irBOpRep(o)) is RBox) {
+      return irBMiss("numeric union side box")
+    }
+    if !isU {
+      const p = numUnionSidePrim(side)
+      const op = repPrim(irBOpRep(o))
+      if p == "" || op == null || op != p {
+        return irBMiss("numeric union side coercion")
+      }
+    }
+    args.push(o)
+  }
+  if (
+    args.length == 2
+    && ifBelowLeadOf(b, at, "numeric union right side", [args[0]])
+  ) {
+    return irBMiss("numeric union right side")
+  }
+  if primRepOf(ix) != rep { return irBMiss("numeric union result rep") }
+  return irBLetTemp(b, { nbArgs: args, nbAt: ix }, ix, rep)
+}
+
 // A `==`/`!=` legacy writes on its `nulNiche` route (`emitNulNicheEq`): the left operand, then the
 // right, which the guard reads twice, so it must be a variable or an immediate. A nullable record's
 // compare and an atom operand are legacy's other writers (`nulNicheEqWhy`), named misses.
@@ -5304,11 +5375,11 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
 }
 
 // The operand of static side `ix`: the unread immediate of a `StrLit`, else its value, which the
-// lowering drops.
+// lowering drops. Legacy writes it raw, so a local read stays at its cell's rep (an atom).
 function staticSideOf(b: i32[], ix: i32): Opnd {
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   if nodeAt(unwrapParen(ix)) is StrLit { return none }
-  const v = irBExpr(b, ix)
+  const v = exprAt(b, ix, true)
   if ibMiss != "" { return v }
   if v is OImm || irBOpRep(v) == ibNoValue {
     return irBMiss("atom compare static operand")
@@ -6926,6 +6997,9 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       if eqRouteOf(n, ix, ibFnIx) == "numeric" {
         return nicheBoolEq(b, n, ix, rep)
       }
+      if eqRouteOf(n, ix, ibFnIx) == "numUnion" {
+        return numUnionBin(b, n, ix, rep)
+      }
       if eqRouteOf(n, ix, ibFnIx) == "nulNiche" {
         return nulNicheEq(b, n, ix, rep)
       }
@@ -8424,9 +8498,13 @@ function paramHeldTy(p: i32, fnIx: i32): i32 {
 // Bundle parameter `p`'s open type `ty` as its record of one closure per signature; any other
 // parameter's type as it is.
 function bundleHeldTy(p: i32, ty: i32): i32 {
-  if !irTyOpen(ty) { return ty }
   const sigs = bundleSigsOfParam(p)
-  return if sigs.length > 0 { bundleRecordTyOf(sigs) } else { ty }
+  if sigs.length == 0 { return ty }
+  // Legacy stores a bundle parameter as its record (`vtKindOfParam`), whatever its checked type.
+  if irTyOpen(ty) || vtKindOfParam(p) == "struct" {
+    return bundleRecordTyOf(sigs)
+  }
+  return ty
 }
 
 // The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A

@@ -157,6 +157,7 @@ import {
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumUnionBin,
   RNumWiden,
   RPrimOp,
   RPrint,
@@ -420,6 +421,13 @@ import {
   nulTestRefTail,
   numCastTail,
   numIntrTail,
+  numUnionBinTail,
+  numUnionIsUnionSide,
+  numUnionSideKindOf,
+  numUnionSideLit,
+  numUnionStashEnter,
+  numUnionStashLeave,
+  numUnionStashTail,
   numWidenTail,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
@@ -922,6 +930,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapHas => mapHas(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
+    RNumUnionBin => numUnionBin(r)
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
@@ -2619,6 +2628,41 @@ function unionEq(r: RUnionEq) {
   irLOpnd(r.ueL)
   irLOpnd(r.ueR)
   return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
+}
+
+// `RNumUnionBin`: legacy's `numUnion` dispatch in `emitNumUnionBin`'s order: each side's value
+// and its stash, one level deeper for a dispatch inside it, then the member dispatch over the
+// stashed sides (`numUnionBinTail`). A literal side stashes nothing.
+function numUnionBin(r: RNumUnionBin) {
+  const n = nodeAt(r.nbAt)
+  if !(n is BinExpr) { return irLMiss("numeric union node") }
+  const fnIx = lw.irAt
+  const key = numUnionStashEnter()
+  let k = 0
+  const sides = [n.binLeft, n.binRight]
+  const slots: i32[] = []
+  let j = 0
+  while j < 2 {
+    const ix = sides[j]
+    const isU = numUnionIsUnionSide(ix, fnIx)
+    if !isU && numUnionSideLit(ix) {
+      slots.push(-2)
+    } else {
+      if k >= r.nbArgs.length {
+        numUnionStashLeave()
+        return irLMiss("numeric union operands")
+      }
+      irLOpnd(r.nbArgs[k])
+      k = k + 1
+      slots.push(numUnionStashTail(isU, numUnionSideKindOf(ix), key + j))
+    }
+    j = j + 1
+  }
+  numUnionStashLeave()
+  if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
+    return irLMiss("numeric union dispatch")
+  }
+  return 0
 }
 
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
