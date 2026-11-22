@@ -616,6 +616,8 @@ let lwBoxHeadAt: i32[] = []
 // Each order-stashed literal by the out its first source field reads, noted once per function.
 let lwIfHeadAt: {[i32]: i32} = Map()
 let lwIfHeadBuilt = false
+// Each box by the out its value is (`stashIfBoxHead`), noted with `lwIfHeadAt`.
+let lwIfBoxAt: {[i32]: i32} = Map()
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1299,11 +1301,29 @@ function stashBoxHead(at: i32) {
 // form, that literal's box head, ahead of the `if` (legacy writes the tag before the literal).
 function stashIfBoxHead(id: i32) {
   const n = lw.irNodes[id]
-  if !(n is SIf) || n.siOut < 0 { return 0 }
+  const out = if n is SIf { n.siOut } else if n is SCoalBox { n.cbOut } else { -1 }
+  if out < 0 { return 0 }
   if !lwIfHeadBuilt { stashIfHeadsNote() }
-  const at = lwIfHeadAt.get(n.siOut) ?? -1
-  if at < 0 || i32ListHas(lwBoxHeadAt, at) { return 0 }
-  return stashBoxHead(at)
+  const at = lwIfHeadAt.get(out) ?? -1
+  if at >= 0 && !i32ListHas(lwBoxHeadAt, at) { return stashBoxHead(at) }
+  // A box whose value is this node's out writes its tag ahead of it, as legacy's box leads.
+  const bx = lwIfBoxAt.get(out) ?? -1
+  if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
+  const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+  if (
+    p.hbArm == "atom"
+    || p.hbArm == "atomAsStr"
+    || p.hbArm == "rec"
+    || p.hbArm == "obj"
+    || p.hbArm == "refList"
+    || p.hbArm == "map"
+    || p.hbArm == "clo"
+  ) {
+    leaf()
+    holeBoxHead(p, bx, lw.irAt)
+    lwBoxHeadAt.push(unwrapParen(bx))
+  }
+  return 0
 }
 
 // Notes, once per function, the out each order-stashed literal's first source field reads, by
@@ -1314,6 +1334,10 @@ function stashIfHeadsNote() {
   for m in lw.irNodes {
     if m is SLet {
       const mr = m.lRhs
+      if mr is RToBox {
+        const bv = mr.bxV
+        if bv is OVar { lwIfBoxAt.set(bv.ov, mr.bxAt) }
+      }
       if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
         const k0 = mr.mrSrc[0]
         const f0 = if k0 >= 0 && k0 < mr.mrFields.length { mr.mrFields[k0] } else { null }
@@ -3692,6 +3716,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false
+  lwIfBoxAt = Map()
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
