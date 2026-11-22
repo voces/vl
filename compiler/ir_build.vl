@@ -198,6 +198,7 @@ import {
   atomStrPlanOf,
   atomicCallNamed,
   atomicPlanOf,
+  atomicResultPrim,
   atomicValPrim,
   binNumWidth,
   blockValueWidenKind,
@@ -342,6 +343,7 @@ import {
   simdCallRow,
   simdMemBase,
   simdOperandPrim,
+  simdResultPrim,
   simdRowIsMem,
   startInitArmOf,
   stmtWritesNothing,
@@ -475,6 +477,7 @@ import {
   emptyFitArmsPlain,
   emptyFitArmsPlanOf,
   emptyFitPlanOf,
+  fnFallThroughPadOf,
   guardEndsBlockWith,
   ifJoinAdaptsScalar,
   isArmRank,
@@ -1529,7 +1532,7 @@ function objLitAt(
     mrSrc: src,
     mrAt: ix,
     mrRow: at,
-    mrVariant: variant,
+    mrVariant: arm == "variant",
     mrBuiltRow: row,
     mrSet: set,
   }
@@ -4705,7 +4708,13 @@ function simdMemRhs(b: i32[], c: Call, ix: i32, row: i32): Rhs {
   ) {
     return missRhs("simd memory operand coercion")
   }
-  const r: Rhs = { sdArgs: args, sdAt: ix }
+  const r: Rhs = {
+    sdArgs: args,
+    sdAt: ix,
+    sdMemBase: base,
+    sdPrims: [],
+    sdResPrim: "",
+  }
   return r
 }
 
@@ -4739,7 +4748,13 @@ function simdRhs(b: i32[], c: Call, ix: i32): Rhs {
     }
     i = i + 1
   }
-  const r: Rhs = { sdArgs: args, sdAt: ix }
+  const r: Rhs = {
+    sdArgs: args,
+    sdAt: ix,
+    sdMemBase: 0,
+    sdPrims: want,
+    sdResPrim: simdResultPrim(row),
+  }
   return r
 }
 
@@ -6062,7 +6077,7 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   ) {
     return irBMiss("box of a stash-set record")
   }
-  return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+  return repTemp(b, { bxV: v, bxAt: ix, bxFree: exprEffectFree(ix) }, ix, dst)
 }
 
 // Whether the delivery built into `b` from `at` on is a valued `if` or coalesce and the box of its
@@ -6626,7 +6641,7 @@ function memAccessRhs(b: i32[], c: Call, ix: i32): Rhs {
   ) {
     return missRhs("memory access operand coercion")
   }
-  const r: Rhs = { mmArgs: args, mmAt: ix }
+  const r: Rhs = { mmArgs: args, mmAt: ix, mmBase: p.mxBase, mmPrim: p.mxPrim }
   return r
 }
 
@@ -6637,8 +6652,21 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
   const pl = atomicPlanOf(c)
   if pl.apFail != "" { return missRhs("atomic plan") }
   const args: Opnd[] = []
+  const vals: string[] = [""]
+  let vk = 1
+  while vk < pl.apBase {
+    vals.push(atomicValPrim(pl.apRow, vk))
+    vk = vk + 1
+  }
+  const res = atomicResultPrim(pl.apRow)
   if pl.apBase == 0 {
-    const r: Rhs = { amArgs: args, amAt: ix }
+    const r: Rhs = {
+      amArgs: args,
+      amAt: ix,
+      amBase: 0,
+      amValPrims: vals,
+      amResPrim: res,
+    }
     return r
   }
   const ap = memAddrPlanOf(c, pl.apBase, ibFnIx)
@@ -6667,12 +6695,18 @@ function atomicRhs(b: i32[], c: Call, ix: i32): Rhs {
   }
   k = 1
   while k < pl.apBase {
-    if repPrim(irBOpRep(args[k])) != atomicValPrim(pl.apRow, k) {
+    if repPrim(irBOpRep(args[k])) != vals[k] {
       return missRhs("atomic operand coercion")
     }
     k = k + 1
   }
-  const r: Rhs = { amArgs: args, amAt: ix }
+  const r: Rhs = {
+    amArgs: args,
+    amAt: ix,
+    amBase: pl.apBase,
+    amValPrims: vals,
+    amResPrim: res,
+  }
   return r
 }
 
@@ -6686,7 +6720,13 @@ function truncSatRhs(b: i32[], c: Call, ix: i32): Rhs {
   if repPrim(irBOpRep(v)) != pl.tpFrom {
     return missRhs("trunc_sat operand coercion")
   }
-  const r: Rhs = { tsV: v, tsAt: ix }
+  const r: Rhs = {
+    tsV: v,
+    tsAt: ix,
+    tsOp: pl.tpOp,
+    tsFrom: pl.tpFrom,
+    tsTo: pl.tpTo,
+  }
   return r
 }
 
@@ -9886,6 +9926,7 @@ function build(fnIx: i32, fnPos: i32): string {
 // Starts building function `fnIx` (named `name`, at `fnStmts` slot `fnPos`) into a fresh `ib`.
 function ibReset(fnIx: i32, name: string, fnPos: i32) {
   ib = irFnNew(fnIx, name)
+  ib.irEndPad = fnFallThroughPadOf(fnIx)
   ibFnIx = fnIx
   ibFnPos = fnPos
   ibDeclRowSeen = false
