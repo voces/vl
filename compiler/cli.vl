@@ -463,6 +463,8 @@ const cliNo: CliSiteCols = { line: [], col: [], text: [] }
 let cliTestFilter = ""        // -t <substring>: keep tests whose scope-path contains it
 let cliTestJobs = 0           // --jobs N (0 = let the host pick, one worker per core)
 let cliTestShowOutput = false // --show-output: print a PASSING test's captured output too
+let cliTestNoCapture = false  // --no-capture: the host streams output live, one test at a time
+let cliTestJson = false       // --json: one JSON document on stdout instead of the report
 // Staged by the host after argv: 0 = no compile pool (compile in this instance),
 // 1 = the host compiles queued files in parallel, 2 = this instance IS a pool worker.
 let cliTestPoolMode = 0
@@ -503,6 +505,9 @@ let cliTestStashOf: i32[] = []
 // 1 = instantiation failed (the file's top level trapped), message in `...Msg`.
 let cliTestFileStatus: i32[] = []
 let cliTestFileMsg: string[] = []
+// Per stashed file, what its top level printed during collection.
+let cliTestFileOut: string[] = []
+let cliTestTopAcc: i32[] = []
 // The collected registry, flattened across files (parallel arrays).
 let cliTestOwner: i32[] = [] // stash index
 let cliTestLocal: i32[] = [] // the test's index WITHIN its file (what vltRun takes)
@@ -685,6 +690,8 @@ export function cliArgReset() {
   cliTestFilter = ""
   cliTestJobs = 0
   cliTestShowOutput = false
+  cliTestNoCapture = false
+  cliTestJson = false
   cliTestPoolMode = 0
   cliTestUnreadable = ""
   cliTestEnqIdx = 0
@@ -704,6 +711,8 @@ export function cliArgReset() {
   cliTestStashOf = []
   cliTestFileStatus = []
   cliTestFileMsg = []
+  cliTestFileOut = []
+  cliTestTopAcc = []
   cliTestOwner = []
   cliTestLocal = []
   cliTestName = []
@@ -1328,6 +1337,10 @@ function cliParseArgs() {
       cliTestJobs = cliParseJobs(cliPrefixValue(a, "--jobs="))
     } else if sub == "test" && a == "--show-output" {
       cliTestShowOutput = true
+    } else if sub == "test" && a == "--no-capture" {
+      cliTestNoCapture = true
+    } else if sub == "test" && a == "--json" {
+      cliTestJson = true
     } else if cliIsFlag(a) {
       cliUsageErr(sub + ": unknown flag `" + a + "`")
     } else if a.length > 0 {
@@ -1354,6 +1367,12 @@ function cliParseArgs() {
   }
   if cliArgErr == "" && cliTestJobs < 0 {
     cliArgErr = "test: --jobs expects a positive count"
+  }
+  if cliArgErr == "" && cliTestNoCapture && cliTestJobs > 1 {
+    cliArgErr = "test: --no-capture runs one test at a time; it takes no --jobs above 1"
+  }
+  if cliArgErr == "" && cliTestNoCapture && cliTestJson {
+    cliArgErr = "test: --no-capture streams output to stdout, which --json writes its report to"
   }
   if cliArgErr == "" && cliSeverityGiven != 0 && !cliSevValid(cliSeverity) {
     cliArgErr = "check: invalid --severity `"
@@ -2764,6 +2783,7 @@ function cliTestEmitIndented(text: string) {
 // The whole report: one block per file, then the summary. Deterministic — files
 // in sorted order, tests in registration order — however the host scheduled them.
 function cliTestReport() {
+  if cliTestJson { return cliTestReportJson() }
   let f = 0
   while f < cliFiles.length {
     cliOut.push(cliAnsi(cliColor, "1", cliFiles[f]))
@@ -2804,6 +2824,11 @@ function cliTestEmitFileTests(f: i32) {
     s = s + 1
   }
   if stash < 0 { return 0 }
+  const top = cliTestTopOut(stash)
+  if top.length > 0 && (cliTestShowOutput || cliTestStashFailed(stash)) {
+    cliOut.push("       " + cliAnsi(cliColor, "2", "--- top-level output ---"))
+    cliTestEmitIndented(top)
+  }
   if cliTestFileStatus[stash] != 0 {
     cliTestFailed = cliTestFailed + 1
     cliOut.push("  " + cliAnsi(cliColor, "31", "FAIL") + " <file top level>")
@@ -2823,6 +2848,121 @@ function cliTestEmitFileTests(f: i32) {
   return 0
 }
 
+// What stashed file `stash`'s top level printed, "" from a host that does not send it.
+function cliTestTopOut(stash: i32) {
+  if stash >= cliTestFileOut.length { return "" }
+  return cliTestFileOut[stash]
+}
+
+// Whether stashed file `stash` reports a failure: its top level trapped, or a test of it failed.
+function cliTestStashFailed(stash: i32) {
+  if cliTestFileStatus[stash] != 0 { return true }
+  let k = 0
+  while k < cliPlanEntry.length {
+    if cliTestOwner[cliPlanEntry[k]] == stash && cliResStatus[k] == 1 {
+      return true
+    }
+    k = k + 1
+  }
+  return false
+}
+
+// `"<cliJsonEsc(s)>"`.
+function cliTestJsonStr(s: string) { return "\"" + cliJsonEsc(s) + "\"" }
+
+// `--json`: the report as one document on stdout, every test's output included, so a consumer
+// filters instead of asking for a verbosity. Tallies and the exit code match the text report.
+function cliTestReportJson() {
+  let files = ""
+  let f = 0
+  while f < cliFiles.length {
+    let stash = -1
+    let s = 0
+    while s < cliTestStashOf.length {
+      if cliTestStashOf[s] == f { stash = s }
+      s = s + 1
+    }
+    let error = "null"
+    let top = ""
+    let tests = ""
+    if cliTestFileErr[f].length > 0 {
+      cliTestFailed = cliTestFailed + 1
+      error = "{\"stage\":\"compile\",\"message\":"
+        + cliTestJsonStr(cliTestFileErr[f])
+        + "}"
+    } else if stash >= 0 {
+      top = cliTestTopOut(stash)
+      if cliTestFileStatus[stash] != 0 {
+        cliTestFailed = cliTestFailed + 1
+        error = "{\"stage\":\"top level\",\"message\":"
+          + cliTestJsonStr(cliTestFileMsg[stash])
+          + "}"
+      } else {
+        tests = cliTestJsonTests(stash)
+      }
+    }
+    if f > 0 { files = files + "," }
+    files = files
+      + "{\"path\":"
+      + cliTestJsonStr(cliFiles[f])
+      + ",\"error\":"
+      + error
+      + ",\"output\":"
+      + cliTestJsonStr(top)
+      + ",\"tests\":["
+      + tests
+      + "]}"
+    f = f + 1
+  }
+  cliJsonOut = "{\"files\":["
+    + files
+    + "],\"passed\":"
+    + i32ToStr(cliTestPassed)
+    + ",\"failed\":"
+    + i32ToStr(cliTestFailed)
+    + ",\"skipped\":"
+    + i32ToStr(cliTestSkipped)
+    + "}\n"
+  cliExit = EXIT_OK
+  if cliTestFailed > 0 { cliExit = EXIT_FAILED }
+  return cliBeginPrint()
+}
+
+// The `tests` array of stashed file `stash`, one object per plan entry, counted into the tallies.
+function cliTestJsonTests(stash: i32) {
+  let out = ""
+  let k = 0
+  while k < cliPlanEntry.length {
+    const e = cliPlanEntry[k]
+    if cliTestOwner[e] == stash {
+      const st = cliResStatus[k]
+      let status = "passed"
+      if st == 1 {
+        status = "failed"
+        cliTestFailed = cliTestFailed + 1
+      } else if st == 2 {
+        status = "skipped"
+        cliTestSkipped = cliTestSkipped + 1
+      } else {
+        cliTestPassed = cliTestPassed + 1
+      }
+      if out.length > 0 { out = out + "," }
+      out = out
+        + "{\"name\":"
+        + cliTestJsonStr(cliTestName[e])
+        + ",\"status\":\""
+        + status
+        + "\",\"message\":"
+        + cliTestJsonStr(cliResMsg[k])
+        + ",\"output\":"
+        + cliTestJsonStr(cliResOut[k])
+        + "}"
+    }
+    k = k + 1
+  }
+  return out
+}
+
 // ── the `vl test` protocol: what the host reads ──────────────────────────────
 // The plan, as (stashed file, test index within that file) pairs, plus the worker
 // count. `cliTestJobsWanted() == 0` means the host's choice, one per core.
@@ -2833,7 +2973,15 @@ export function cliTestPlanFile(k: i32): i32 {
 export function cliTestPlanTest(k: i32): i32 {
   return cliTestLocal[cliPlanEntry[k]]
 }
-export function cliTestJobsWanted(): i32 { return cliTestJobs }
+// `--no-capture` runs files and tests one at a time, so streamed output stays in report order.
+export function cliTestJobsWanted(): i32 {
+  if cliTestNoCapture { return 1 }
+  return cliTestJobs
+}
+export function cliTestStreamWanted(): i32 {
+  if cliTestNoCapture { return 1 }
+  return 0
+}
 
 // ── the `vl test` protocol: what the host commits ────────────────────────────
 // Before the first `cliNext`, after argv: 1 = this host has a compile pool, 2 = this
@@ -3026,7 +3174,14 @@ export function cliTestNameCommit(_skip: i32) {
 export function cliTestFileCommit(status: i32) {
   cliTestFileStatus.push(status)
   cliTestFileMsg.push(cpAccTake(cliResultAcc))
+  cliTestFileOut.push(fromCodePoints(cliTestTopAcc))
+  cliTestTopAcc = []
   cliTestLocalNext = 0
+  return 0
+}
+// What the top level of the file being collected printed, before its `cliTestFileCommit`.
+export function cliTestTopOutPush(c: i32) {
+  cliTestTopAcc.push(c)
   return 0
 }
 // Captured output of the test result being committed.
