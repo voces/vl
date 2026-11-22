@@ -500,6 +500,7 @@ import {
   repTyOf,
 } from "./emit_rep"
 import {
+  captureLoopNodeOf,
   captureLoopVarDeclOf,
   ctxTyAt,
   fnEnvIdxOf,
@@ -3191,11 +3192,12 @@ function capCellListSame(fe: i32, name: string, cr: i32, rep: i32): boolean {
 // when that rep is no value, open, or not the valtype legacy gives the capture (`captureValKind`).
 function capRepOf(fe: i32, name: string): i32 { return capRepFor(fe, name, -1) }
 
-// `capRepOf`, where a captured `for-in` variable, whose declaration records no type, takes read
-// rep `readRep` when legacy's capture valtype for it (`captureValKind`) agrees, else -1.
+// `capRepOf`, where a captured loop variable (`captureLoopNodeOf`), whose declaration records no
+// type, takes read rep `readRep` when legacy's capture valtype for it (`captureValKind`) agrees,
+// else -1.
 function capRepFor(fe: i32, name: string, readRep: i32): i32 {
   let ty = capTyOf(fe, name)
-  if ty < 0 && readRep >= 0 && captureLoopVarDeclOf(fe, name) >= 0 {
+  if ty < 0 && readRep >= 0 && captureLoopNodeOf(fe, name) >= 0 {
     ty = repTyOf(readRep)
   }
   if ty < 0 { return -1 }
@@ -3273,14 +3275,15 @@ function cloEnvOf(b: i32[], fe: i32, ix: i32): Opnd[] {
   const cached = irEnvCached(fe)
   const self = fnStmtsPosOf(ibFnIx)
   for name in captureNamesOf(fe) {
-    const r = capRepOf(fe, name)
+    const p = paramIndexOf(ibFnIx, name)
+    const lv = if p < 0 { loopCapVar(fe, name) } else { -1 }
+    const r = if lv >= 0 { capRepFor(fe, name, ib.irVars[lv].vRep) } else { capRepOf(fe, name) }
     if r < 0 || capCellTargetOf(name) >= 0 {
       irBMiss("closure env capture")
       return out
     }
-    const p = paramIndexOf(ibFnIx, name)
-    const d = if p < 0 { liftCapDecl(fe, name) } else { -1 }
-    let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
+    const d = if p < 0 && lv < 0 { liftCapDecl(fe, name) } else { -1 }
+    let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if lv >= 0 { lv } else if d >= 0 { irBDeclVar(d) } else { -1 }
     const fi = if v < 0 { captureSlotOf(name, ibFnIx) } else { -1 }
     if fi >= 0 && capRepOf(self, name) == r {
       if cloLifted(self) {
@@ -4009,14 +4012,32 @@ let ibOwnBuilt = false
 // found.
 let ibLiftCapDecl: {[string]: i32} = Map()
 
+// The variable this frame's loop made for the loop variable that capture `name` of `fe` names
+// (`captureLoopNodeOf`): a `for-in`'s element or key, or a range's counter; -1 for none.
+function loopCapVar(fe: i32, name: string): i32 {
+  const lp = captureLoopNodeOf(fe, name)
+  if lp < 0 { return -1 }
+  const ln = nodeAt(lp)
+  const d = if ln is ForIn { captureLoopVarDeclOf(fe, name) } else if ln is ForRange { lp } else { -1 }
+  return if d >= 0 { ibDeclVar[d] ?? -1 } else { -1 }
+}
+
 // The captures lifted function `pos` takes after its environment, each a parameter, a binding or
 // a lifted capture of the function being built, read in order; a miss names any other.
 function liftCaps(pos: i32): Opnd[] {
   const out: Opnd[] = []
   for name in captureNamesOf(pos) {
     const p = paramIndexOf(ibFnIx, name)
-    const d = if p < 0 { liftCapDecl(pos, name) } else { -1 }
-    let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if d >= 0 { irBDeclVar(d) } else { -1 }
+    const lv = if p < 0 { loopCapVar(pos, name) } else { -1 }
+    if (
+      lv >= 0
+      && capRepFor(pos, name, ib.irVars[lv].vRep) != ib.irVars[lv].vRep
+    ) {
+      irBMiss("callee captures")
+      return out
+    }
+    const d = if p < 0 && lv < 0 { liftCapDecl(pos, name) } else { -1 }
+    let v = if p >= 0 { paramVarAt(envSlotShift(ibFnIx) + p) } else if lv >= 0 { lv } else if d >= 0 { irBDeclVar(d) } else { -1 }
     // A capture of this frame passes on as this frame reads it: a lifted frame's own parameter.
     // An environment field would be written ahead of the callee's null environment, so it misses.
     if v < 0 && captureSlotOf(name, ibFnIx) >= 0 {
