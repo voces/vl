@@ -733,7 +733,6 @@ import {
   variantHeap,
   variantReboxSlot,
   variantRowOf,
-  vbAtomListUsed,
 } from "./emit_state"
 import {
   catBackIdxOf,
@@ -1462,7 +1461,6 @@ import {
   arrNewKindNamed,
   asExprHolePinSrc,
   exprEmittedRefListSlot,
-  exprIsAtomList,
   exprIsIntegralFloat,
   exprNullableRecord,
   fnIndexOfInScopeChainAt,
@@ -1764,6 +1762,7 @@ import {
   arrLitRefSlotAtTy,
   arrLitVariantSlot,
   atomEqPlanOf,
+  atomListTagsAt,
   atomNulStrWhy,
   boxAtomRetagKind,
   boxRetagArmsOfTys,
@@ -8713,7 +8712,7 @@ function emitUnionCoerceAtomBox(
   // tag is emitted, and the box TAG, the rides-the-anyref test and the scalar value
   // box below are all projections of it (`scalarTagOf` / `atomIsRefKind` /
   // `vbHeapIdxOfKind` each re-derived it from the spelling).
-  if cak == 7 && vbAtomListUsed && exprIsAtomList(bareIx, fnIx) {
+  if atomListTagsAt(cak, bareIx, fnIx) {
     fbI32Rel(RS_TAG, atomListArmTag())
   } else {
     fbI32Rel(RS_TAG, scalarTagOfKind(cak))
@@ -9183,7 +9182,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 // value built before the box sits above that tag. `null` and `lit` write no value after theirs.
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
-    "atom" | "atomAsStr" | "rec" | "obj" | "refList" | "map" | "clo" => true
+    "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
     "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "mapScalar" | "ladder" => false
   }
 }
@@ -9196,6 +9195,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
       fbRefNullNone() // the payload slot is unread under the null tag
     }
     "atom" | "atomAsStr" => fbI32Rel(RS_TAG, scalarTagOfKind(p.hbKind))
+    "atomList" => fbI32Rel(RS_TAG, atomListArmTag())
     "rec" | "obj" => fbI32Rel(RS_TAG, uTags[p.hbKind])
     "refList" => fbI32Rel(RS_TAG, p.hbKind)
     "map" => mapArmBoxHead(p.hbKind, exprIx, fnIx)
@@ -9215,7 +9215,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   return match p.hbArm {
     "null" | "rec" | "obj" | "refList" | "map" | "clo" | "atomAsStr" => fbStructNew(uBoxIdx)
-    "atom" | "lit" => atomBoxTail(p.hbKind)
+    "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
@@ -9225,7 +9225,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
 // `emitUnionBoxArg` for a value plan `p` decides.
 function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
   if holeBoxHead(p, exprIx, fnIx) < 0 { return -1 }
-  if p.hbArm == "atom" {
+  if p.hbArm == "atom" || p.hbArm == "atomList" {
     if emitCoerceAtomPayload(p.hbKind, exprIx, fnIx) < 0 { return -1 }
   } else if p.hbArm == "mapScalar" {
     const mre = nodeAt(unwrapParen(exprIx))
@@ -10358,20 +10358,21 @@ function emitUnionConcreteEq(
     fbI32Bin(70)
     fbElse()
   }
-  // tag == tagOf(atom), gating the payload compare.
+  // The plain arm's tails, around a stashed box and the operand's null legs. The tag is the
+  // concrete operand's own arm type's, as the box site composes it (`cloBoxOwnFnTy`).
+  const qt: UnionEqPlan = {
+    uqKind: eak,
+    uqTag: unionEqTagOfArmTy(
+      eak,
+      cloBoxEqArmTy(otherIx, unr[0], fnIx),
+    ),
+  }
   if emitExpr(boxIx, fnIx) < 0 { return -1 }
   if eqOnce { fbLocalTee(eqStash) }
-  fbStructGet(uBoxIdx, 0) // 0xfb 0x02 <box ht> field 0: tag
-  // The CONCRETE operand's own arm type, through the very composition the BOX site uses
-  // (`cloBoxOwnFnTy` → `cloArmTagOfTy`), so a closure arm is tested against the tag its box
-  // actually writes.
-  fbI32Rel(RS_TAG, unionEqTagOfArmTy(eak, cloBoxEqArmTy(otherIx, unr[0], fnIx)))
-  fbI32Bin(70)            // 0x46 i32.eq
-  fbIf(127)               // 0x04 if, 0x7f i32 result blocktype
+  unionEqTagTail(qt)
   if eqOnce { fbLocalGet(eqStash) }
   else if emitExpr(boxIx, fnIx) < 0 { return -1 }
-  fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
-  if emitUnionPayloadUnbox(eak) < 0 { return -1 }
+  if unionEqPayloadTail(qt) < 0 { return -1 }
   if emitUnionEqOther(otherIx, eak, fnIx) < 0 { return -1 }
   // The null took the other branch, so a nullable operand is the non-null ref here.
   if (
@@ -10380,16 +10381,9 @@ function emitUnionConcreteEq(
   ) {
     fbRefAsNonNull()
   }
-  // D-EQOPCODE: the payload compare is the last projection of `eak`, which already chose
-  // the box tag, the payload unbox and the widened operand emit above it.
-  if emitUnionAtomPayloadEq(eak, fnIx) < 0 { return -1 }
-  fbElse() // 0x05 else: wrong-rep arm — structurally unequal
-  fbI32Const(0)
-  fbEnd()  // 0x0b end
+  if unionEqCmpTail(qt, false, fnIx) < 0 { return -1 }
   if nulOther || nulStrOther || nulBoolOther { fbEnd() }
-  if isNe {
-    fbI32Eqz() // 0x45 i32.eqz (`!=` negates value-equality)
-  }
+  if isNe { fbI32Eqz() }
   return 0
 }
 
@@ -20632,21 +20626,35 @@ function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
 function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    const savedL = eqStashL
-    const savedR = eqStashR
+    const saved = structEqEnter()
     const roots = structEqStage(e.binLeft, e.binRight, row, fnIx)
-    const pathSi: i32[] = []
-    const pathFi: i32[] = []
-    const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
-    eqStashL = savedL
-    eqStashR = savedR
-    if r < 0 { return -1 }
-    if e.binOp == "!=" {
-      fbI32Eqz() // 0x45 i32.eqz — negate value-equality
-    }
-    return 0
+    return structEqTail(e, row, roots, saved, fnIx)
   }
   return emitFail("emitProgram: expected a struct equality")
+}
+
+// The stash slots a struct compare saves before it stages, `[left, right]`, for `structEqTail`.
+export function structEqEnter(): i32[] { return [eqStashL, eqStashR] }
+
+// After the roots: the field-wise compare over `roots` (`[-1, -1]` fails), the stash slots
+// restored from `saved`, and `i32.eqz` for `!=`. Answers -1 on failure.
+export function structEqTail(
+  e: BinExpr,
+  row: i32,
+  roots: i32[],
+  saved: i32[],
+  fnIx: i32,
+): i32 {
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
+  eqStashL = saved[0]
+  eqStashR = saved[1]
+  if r < 0 { return -1 }
+  if e.binOp == "!=" {
+    fbI32Eqz() // 0x45 i32.eqz — negate value-equality
+  }
+  return 0
 }
 
 // The roots `emitStructEqRec` reads operands `lIx`/`rIx` of a compare at eq row `row` through:
@@ -20654,20 +20662,51 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
 // `eqStashL`/`eqStashR` now names; `[-1, -1]` on failure. Both are evaluated in source order
 // before either slot is set, and a left place is staged when the right may write it (D17023).
 function structEqStage(lIx: i32, rIx: i32, row: i32, fnIx: i32): i32[] {
-  const rStage = !unionEqOperandOk(rIx)
-  const lStage = rStage || !unionEqOperandOk(lIx)
+  const rStage = structEqStagesRight(rIx)
+  const lStage = structEqStagesLeft(lIx, rIx)
   if lStage && emitExpr(lIx, fnIx) < 0 { return [-1, -1] }
   if rStage && emitExpr(rIx, fnIx) < 0 { return [-1, -1] }
+  return structEqRoots(row, lIx, rIx, -1, -1)
+}
+
+// Whether a struct compare evaluates its right operand `rIx` once into a stash: it is no
+// re-readable place.
+export function structEqStagesRight(rIx: i32): boolean {
+  return !unionEqOperandOk(rIx)
+}
+
+// Whether a struct compare stashes its left operand `lIx`: no re-readable place, or the right is
+// stashed, which may write it.
+export function structEqStagesLeft(lIx: i32, rIx: i32): boolean {
+  return structEqStagesRight(rIx) || !unionEqOperandOk(lIx)
+}
+
+// After the stashed operands' values (left below right): their slots set, right first, and the
+// roots. An unstaged side is read from local `lLocal`/`rLocal` where one is given, else from its
+// place `lIx`/`rIx`.
+export function structEqRoots(
+  row: i32,
+  lIx: i32,
+  rIx: i32,
+  lLocal: i32,
+  rLocal: i32,
+): i32[] {
   let rRoot = rIx
-  if rStage {
+  if structEqStagesRight(rIx) {
     eqStashR = structEqSlot(row, 1)
     fbLocalSet(eqStashR)
     rRoot = -3
+  } else if rLocal >= 0 {
+    eqStashR = rLocal
+    rRoot = -3
   }
   let lRoot = lIx
-  if lStage {
+  if structEqStagesLeft(lIx, rIx) {
     eqStashL = structEqSlot(row, 0)
     fbLocalSet(eqStashL)
+    lRoot = -2
+  } else if lLocal >= 0 {
+    eqStashL = lLocal
     lRoot = -2
   }
   return [lRoot, rRoot]
@@ -27550,87 +27589,62 @@ function emitCallCoreUserFn(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
   return emitDirectCall(callIx, fnIx, target)
 }
 
+// The arm `emitCallCoreIdent` writes named call `c` of `callee` with, after a holder's: a builtin
+// or intrinsic matched by spelling where no user function or binding owns the name, else the
+// user-function tail.
+type IdentCallArm = "strFromBytes" | "fromCodePoints" | "fromCodePoint" | "print" | "memAccess"
+  | "memOp" | "simd" | "atomic" | "truncSat" | "log" | "host" | "trap" | "arrNew" | "arrCopy"
+  | "userFn"
+
+function identCallArmOf(c: Call, callee: Ident, fnIx: i32): IdentCallArm {
+  // A user function of the name wins over a spelling match, which would otherwise route a
+  // same-named declaration into the builtin (D975).
+  const userOwnsName = fnIndexOfNode(c.callFn) >= 0
+  // The scope's answer for the dunder intrinsics, whose arms match the spelling alone.
+  const userBindsName = identNameIsUserBound(c.callFn, fnIx)
+  const nm = callee.identName
+  if strFromBytesCallNamed(c, fnIx) { return "strFromBytes" }
+  if !userOwnsName && nm == "fromCodePoints" { return "fromCodePoints" }
+  if !userOwnsName && nm == "fromCodePoint" { return "fromCodePoint" }
+  if !userOwnsName && nm == "print" { return "print" }
+  if memAccessCallNamed(c, fnIx) { return "memAccess" }
+  if memOpCallNamed(c, fnIx) { return "memOp" }
+  if simdCallNamed(c, fnIx) { return "simd" }
+  if atomicCallNamed(c, fnIx) { return "atomic" }
+  if truncSatCallNamed(c, fnIx) { return "truncSat" }
+  if !userBindsName && nm == "__log__" { return "log" }
+  // A host call or an extern lowers to an import reserved only when used; a parameter of its
+  // name wins, as for every spelling-matched arm.
+  if hostCallNamed(c, fnIx) { return "host" }
+  if trapCallNamed(c, fnIx) { return "trap" }
+  if arrNewCallNamed(c, fnIx) { return "arrNew" }
+  if arrCopyCallNamed(c, fnIx) { return "arrCopy" }
+  return "userFn"
+}
+
 // `emitCallCore`'s named-callee arm: the builtins and intrinsics matched by spelling where
 // no user declaration or binding owns the name, then `emitCallCoreUserFn`. Returns 0 or -1.
 function emitCallCoreIdent(callIx: i32, c: Call, callee: Ident, fnIx: i32) {
-  // a user function of the same name must win: checked before any spelling-based
-  // builtin match, since matching by spelling alone routes a same-named user
-  // declaration into the builtin instead — a whole-set bug, not one name's (D975,
-  // filed as a refutation pin: that collision surface must not come back).
-  const userOwnsName = fnIndexOfNode(c.callFn) >= 0
   // A call through a holder of a returned record picks its member (D15144).
   const hcall = emitHolderCall(callIx, c, fnIx)
   if hcall != 1 { return hcall }
-  // the scope's answer for the dunder intrinsics, whose arms below match the
-  // spelling with no declaration lookup at all. See `identNameIsUserBound`.
-  const userBindsName = identNameIsUserBound(c.callFn, fnIx)
-  // `__str_from_bytes__(src, at, count)` (D4784): one call into the helper, which bounds-checks
-  // the range against `src`'s length and copies it into an exact-fit string.
-  if strFromBytesCallNamed(c, fnIx) { return emitCallCoreStrFromBytes(c, fnIx) }
-  // `fromCodePoints(xs)` (H2): bulk string construction into the shared `__utf8_enc__`
-  // helper, UTF-8-encoding the list's live code points into an exact-fit backing. Each
-  // i32 is a code point, never a byte — filling the buffer by `buf.push(s[i])` instead
-  // pushes bytes and double-encodes with no type error, so every `std/` builder uses `for cp`.
-  if !userOwnsName && callee.identName == "fromCodePoints" {
-    return emitCallCoreFromCodePoints(callIx, c, fnIx)
+  return match identCallArmOf(c, callee, fnIx) {
+    "strFromBytes" => emitCallCoreStrFromBytes(c, fnIx)
+    "fromCodePoints" => emitCallCoreFromCodePoints(callIx, c, fnIx)
+    "fromCodePoint" => emitCallCoreFromCodePoint(c, fnIx)
+    "print" => emitCallCorePrint(callIx, c, fnIx)
+    "memAccess" => emitCallCoreMemAccess(c, callee.identName, fnIx)
+    "memOp" => emitCallCoreMemOp(c, fnIx)
+    "simd" => emitSimdIntrinsic(c, callee.identName, fnIx)
+    "atomic" => emitAtomicIntrinsic(c, callee.identName, fnIx)
+    "truncSat" => emitTruncSatIntrinsic(c, callee.identName, fnIx)
+    "log" => emitCallCoreLog(c, fnIx)
+    "host" => emitCallCoreHost(c, fnIx)
+    "trap" => emitCallCoreTrap(c, fnIx)
+    "arrNew" => emitArrayNewIntr(callIx, fnIx)
+    "arrCopy" => emitArrayCopyIntr(callIx, fnIx)
+    "userFn" => emitCallCoreUserFn(callIx, c, callee, fnIx)
   }
-  // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
-  // string from an i32 code point, riding the same `__utf8_enc__` helper `fromCodePoints`
-  // does — a one-element i32 array wrapped around the argument. Sharing the encoder
-  // avoids a second, inlined width-and-shift ladder disagreeing silently with it.
-  if !userOwnsName && callee.identName == "fromCodePoint" {
-    return emitCallCoreFromCodePoint(c, fnIx)
-  }
-  // `print(x)` is a compiler builtin lowered to the host's import family: a
-  // boolean-classified arg calls `__print_bool__`, anything else i32-ish
-  // `__print_i32__`. The call yields nothing (void import).
-  if !userOwnsName && callee.identName == "print" {
-    return emitCallCorePrint(callIx, c, fnIx)
-  }
-  // Every load and store width (`buffer-design.md` §C2), lowered inline: the address, a store's
-  // value at its declared width, then the opcode at its natural alignment (`memAccessPlanOf`).
-  if memAccessCallNamed(c, fnIx) {
-    return emitCallCoreMemAccess(c, callee.identName, fnIx)
-  }
-  // The memory-management intrinsics (`buffer-design.md` §B2, §C3, §S4): `memory.size`/`grow`,
-  // the bulk pair, the heap window's globals and the shared-memory flag (`memOpPlanOf`).
-  if memOpCallNamed(c, fnIx) { return emitCallCoreMemOp(c, fnIx) }
-  // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
-  // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
-  // Dispatched by name like the memory intrinsics above it.
-  if simdCallNamed(c, fnIx) {
-    return emitSimdIntrinsic(c, callee.identName, fnIx)
-  }
-  // The threads-proposal atomics (`simd-design.md` §G1), the 0xFE-prefix family.
-  if atomicCallNamed(c, fnIx) {
-    return emitAtomicIntrinsic(c, callee.identName, fnIx)
-  }
-  // The scalar saturating truncations, one `0xFC` instruction each.
-  if truncSatCallNamed(c, fnIx) {
-    return emitTruncSatIntrinsic(c, callee.identName, fnIx)
-  }
-  if !userBindsName && callee.identName == "__log__" {
-    return emitCallCoreLog(c, fnIx)
-  }
-  // ── host calls: the `std:fs` floor and user `extern function`s ─────────────
-  // Each lowers to a call of an import reserved only when used, so a miss fails loudly. An
-  // extern is guarded like every spelling-matched arm: a parameter of its name must win.
-  if hostCallNamed(c, fnIx) { return emitCallCoreHost(c, fnIx) }
-  // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
-  // lowered INLINE to single WasmGC instructions (array.new /
-  // array.new_default / array.copy / unreachable). `__trap__()` is the
-  // deliberate abort primitive.
-  if trapCallNamed(c, fnIx) { return emitCallCoreTrap(c, fnIx) }
-  // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
-  // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both yield the
-  // `{backing, len: n, cap: n}` list wrapper, staging the length in the 1-slot arrNew
-  // scratch local. Native element coverage: i32 (i32/boolean) and, for `__array_new__`, f64.
-  if arrNewCallNamed(c, fnIx) { return emitArrayNewIntr(callIx, fnIx) }
-  // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the two
-  // lists' backings (memmove semantics; OOB spans trap via the instruction's own
-  // check). Operand order matches the instruction's stack shape, so no scratch is needed.
-  if arrCopyCallNamed(c, fnIx) { return emitArrayCopyIntr(callIx, fnIx) }
-  return emitCallCoreUserFn(callIx, c, callee, fnIx)
 }
 
 // A call through a value this instance types `null` itself, which a guard leaves dead: the
@@ -28184,21 +28198,10 @@ function emitCallRefAt(
   // context lowers at the wrong valtype for the `call_ref` functype: invalid wasm.
   let i = 0
   while i < args.length {
-    const bty: i32[] = [0 - 1]
-    const bsigs = bundleCallArgSigs(c.callFn, fnIx, i, bty)
-    const kt = if bsigs.length > 0 { -1 } else { bundleKeyParamTy(ckey, i, args[i]) }
-    if bsigs.length > 0 || kt >= 0 || emitBundleRecordRead(args[i], fnIx) {
-      argsPlain = false
-    }
-    if bsigs.length > 0 {
-      if emitBundleReadArg(args[i], bty[0], bsigs, fnIx) < 0 { return -1 }
-    } else if kt >= 0 {
-      if (
-        emitBundleReadArg(args[i], kt, elabDeliveredBundleSigs(kt), fnIx)
-        < 0
-      ) {
-        return -1
-      }
+    const bb = callRefBundleArgOf(c, fnIx, ckey, i)
+    if emitBundleRecordRead(args[i], fnIx) { argsPlain = false }
+    if bb.bbTy >= 0 {
+      if emitBundleReadArg(args[i], bb.bbTy, bb.bbSigs, fnIx) < 0 { return -1 }
     } else if (
       emitBundleRecordRead(args[i], fnIx)
       && !bundleSlotTakesRecord(ckey, i, args[i], fnIx)
@@ -28324,20 +28327,15 @@ export function callRefPlainKey(callIx: i32, fnIx: i32): string {
     if !exprCallRefPlainHead(callIx, c, fnIx) { return "" }
     return callRefPlainTail(callIx, c, fnIx)
   }
-  const nm = callee.identName
   const d = identDeclOf(c.callFn)
   const dn = if d >= 0 && d < P.nodes.length { nodeAt(d) } else { null }
+  // A binding's call is legacy's user-function tail unless a builtin of its spelling takes it.
   if (
     !(dn is LetDecl || dn is Param || dn is LoopVar)
-    || nm.length < 1
-    || nm.length >= 2 && nm.slice(0, 2) == "__"
+    || identCallArmOf(c, callee, fnIx) != "userFn"
   ) {
     return ""
   }
-  if nm == "print" || nm == "fromCodePoint" || nm == "fromCodePoints" {
-    return ""
-  }
-  if fsIntrinsicSlot(nm) >= 0 || externLinkOf(nm) >= 0 { return "" }
   if cloTailRefusal(callIx, fnIx) != "" || callEndsNever(callIx) { return "" }
   if fnTagArmsAt(callIx, emitTagSetAt(callIx, fnIx)).length > 0 { return "" }
   if holderRecordSigs(d, fnIx).length > 0 { return "" }
@@ -28413,12 +28411,11 @@ function callRefPlainArgsTail(
   let i = 0
   while i < n {
     const a = c.callArgs[i]
-    const bty: i32[] = [0 - 1]
+    // A function handed as a bundle is written by `emitBundleReadArg`, not `emitCallRefArg`.
     if (
-      bundleCallArgSigs(c.callFn, fnIx, i, bty).length > 0
-      || bundleKeyParamTy(ckey, i, a) >= 0
-      || emitBundleRecordRead(a, fnIx)
-      || !callRefArgPlain(callIx, fnIx, ckey, a, i)
+      emitBundleRecordRead(a, fnIx)
+      || callRefBundleArgOf(c, fnIx, ckey, i).bbTy < 0
+        && !callRefArgPlain(callIx, fnIx, ckey, a, i)
     ) {
       return ""
     }
@@ -28611,6 +28608,35 @@ function bundleSlotTakesRecord(
   const rp = bundleParamOfRead(unwrapParen(arg), fnIx)
   const si = paramStructIdxOf(rp)
   return ckey != "" && si >= 0 && sigParamSlotAt(ckey, i) == si
+}
+
+// The bundle `emitCallRefAt` writes argument `i` of closure call `c` at key `ckey` as, read from
+// a function (`emitBundleReadArg`): the record type its parameter takes and that record's
+// signatures; `bbTy` -1 for an argument written any other way.
+export type CallRefBundleArg = { bbTy: i32, bbSigs: i32[] }
+
+export function callRefBundleArgOf(
+  c: Call,
+  fnIx: i32,
+  ckey: string,
+  i: i32,
+): CallRefBundleArg {
+  const bty: i32[] = [0 - 1]
+  const bsigs = bundleCallArgSigs(c.callFn, fnIx, i, bty)
+  if bsigs.length > 0 {
+    const pk: CallRefBundleArg = { bbTy: bty[0], bbSigs: bsigs }
+    return pk
+  }
+  const kt = bundleKeyParamTy(ckey, i, c.callArgs[i])
+  if kt >= 0 {
+    const pk: CallRefBundleArg = {
+      bbTy: kt,
+      bbSigs: elabDeliveredBundleSigs(kt),
+    }
+    return pk
+  }
+  const none: CallRefBundleArg = { bbTy: -1, bbSigs: [] }
+  return none
 }
 
 // The bundle record type parameter `i` of `$fnsig` key `ckey` takes, where the argument `arg`
@@ -32104,7 +32130,7 @@ function svPairOfKinds(src: VKind, dst: VKind): i32 {
 
 // The view destination a scalar list of element `k` reads as (0 `i64`, 1 `f64`), or -1 where
 // no view of that element is built: `k` is a destination exactly when an `i32` widens to it.
-export function svDstOfKind(k: VKind | null): i32 {
+function svDstOfKind(k: VKind | null): i32 {
   if svPairs == 0 || k == null { return -1 }
   const d = svPairOfKinds("i32", k)
   if d == 0 { return 0 }
@@ -39243,28 +39269,31 @@ function emitNullLitNode(_e: NullLit, exprIx: i32, fnIx: i32) {
 // Push the null the destination of the `null`-typed read `exprIx` holds, when it names a rep
 // other than the read's storage; false, pushing nothing, where the storage read is that null.
 function emitNullReadAtDst(exprIx: i32, fnIx: i32): boolean {
+  const own = nullReadDstOwnOf(exprIx, fnIx)
+  if own < 0 { return false }
+  emitNullOwn(own)
+  return true
+}
+
+// The null (`NULL_OWN_*`) the destination of `null`-typed read `exprIx` holds where its rep's kind
+// is not the read's storage's, else -1: the storage read is that null.
+export function nullReadDstOwnOf(exprIx: i32, fnIx: i32): i32 {
   const at = parenPeelIx(exprIx)
   let dst = ctxTyAt(at, fnIx)
   // A respelled read (a shared cell's `c[0]`) takes the destination of the name it respells.
   if dst < 0 { dst = ctxTyAt(nodeSrc[at] ?? -1, fnIx) }
   const st = readNarrowedStoreAt(exprIx, fnIx)
-  if dst < 0 || st < 0 { return false }
+  if dst < 0 || st < 0 { return -1 }
   const dk = repOfTy(dst).rdKind
-  if dk == repOfTy(st).rdKind { return false }
+  if dk == repOfTy(st).rdKind { return -1 }
   // An open `_ | null` destination (an un-annotated binding of the read) is built at the read's
   // storage, so the storage read is its null.
   const dt = tyAt(dst)
   if dt is TyNullable {
-    if dt.nInner < 0 { return false }
+    if dt.nInner < 0 { return -1 }
   }
-  if dk == "union" {
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    return true
-  }
-  emitNullOwn(nullOwnOfTy(dst))
-  return true
+  if dk == "union" { return NULL_OWN_BOX }
+  return nullOwnOfTy(dst)
 }
 
 // The `null` value node `exprIx` evaluates to, built at the rep of the type the checker stamped
@@ -39889,7 +39918,7 @@ function njStash(ix: i32, isUnion: boolean, key: i32, fnIx: i32): i32 {
   if isUnion {
     // A join whose arms are scalars is built as the box here, as a union destination builds it.
     let sr = 0
-    if exprUnion(ix, fnIx) {
+    if numUnionSideBoxed(ix, fnIx) {
       sr = emitExpr(ix, fnIx)
     } else {
       sr = emitUnionBoxOwed(
@@ -39900,27 +39929,65 @@ function njStash(ix: i32, isUnion: boolean, key: i32, fnIx: i32): i32 {
       )
     }
     if sr < 0 { return -1 }
-    const bs = njSlot(26, "list", key)
-    fbLocalSet(bs)
-    return bs
+    return numUnionStashTail(true, -1, key)
   }
-  if cexLitPeel(ix) >= 0 { return -2 }
+  if numUnionSideLit(ix) { return -2 }
   const k = njKindOfExpr(ix)
   if k < 0 { return -1 }
   if emitExprAsKind(ix, k, fnIx) < 0 { return -1 }
-  const ss = njSlot(
-    27,
-    listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"),
-    key,
-  )
-  fbLocalSet(ss)
-  return ss
+  return numUnionStashTail(false, k, key)
+}
+
+// After a side's value: its slot at stash `key`, a union side's box slot or a scalar side's slot
+// at kind `k`, set from the stack. Answers the slot.
+export function numUnionStashTail(isUnion: boolean, k: i32, key: i32): i32 {
+  const slot = if isUnion { njSlot(26, "list", key) } else { njSlot(27, listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"), key) }
+  fbLocalSet(slot)
+  return slot
+}
+
+// Opens a numeric-union dispatch's stash, answering its key: an operand's own dispatch built
+// inside it stashes one level deeper. `numUnionStashLeave` closes it.
+export function numUnionStashEnter(): i32 {
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  return key
+}
+
+export function numUnionStashLeave(): i32 {
+  njDepth = njDepth - 1
+  return 0
+}
+
+// Whether side `ix` of a numeric-union operator is a union (`njMembersOf`), stashed as its box.
+export function numUnionIsUnionSide(ix: i32, fnIx: i32): boolean {
+  return njMembersOf(ix, fnIx).length > 0
+}
+
+// Whether union side `ix` is already its box (`exprUnion`); a join of scalars is boxed at the stash.
+export function numUnionSideBoxed(ix: i32, fnIx: i32): boolean {
+  return exprUnion(ix, fnIx)
+}
+
+// Whether scalar side `ix` is a literal, which the arms write at each member's width.
+export function numUnionSideLit(ix: i32): boolean { return cexLitPeel(ix) >= 0 }
+
+// The prim a scalar side `ix` is stashed at, its recorded type's kind's, or "" when it has none.
+export function numUnionSidePrim(ix: i32): string {
+  const k = numUnionSideKindOf(ix)
+  if k < 0 { return "" }
+  return numPrimOfKind(k) ?? ""
+}
+
+// The kind scalar side `ix` is stashed at, its recorded type's, or -1 when it has none.
+export function numUnionSideKindOf(ix: i32): i32 {
+  return njKindOfTy(nodeTyIxOf(ix))
 }
 
 // The kind of scalar operand `ix`, its recorded type's: the checker types every scalar operand
 // of a numeric-union operator as a number.
 function njKindOfExpr(ix: i32): i32 {
-  const k = njKindOfTy(nodeTyIxOf(ix))
+  const k = numUnionSideKindOf(ix)
   if k >= 0 { return k }
   return emitFail(
     "emitProgram: a numeric union operator's scalar operand has no numeric recorded type",
@@ -40031,15 +40098,33 @@ function njScalarTy(ix: i32): i32 {
 
 // `a op b` where an operand is a numeric union.
 function emitNumUnionBin(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const key = numUnionStashEnter()
+  const ls = njStash(e.binLeft, numUnionIsUnionSide(e.binLeft, fnIx), key, fnIx)
+  let rs = -1
+  if ls != -1 {
+    rs = njStash(
+      e.binRight,
+      numUnionIsUnionSide(e.binRight, fnIx),
+      key + 1,
+      fnIx,
+    )
+  }
+  numUnionStashLeave()
+  if ls == -1 || rs == -1 { return -1 }
+  return numUnionBinTail(e, exprIx, fnIx, ls, rs)
+}
+
+// After both sides' stashes (`ls`, `rs`; -2 for a literal side): the member dispatch over the
+// stashed sides, each pair's operator, and the result's box where it is a union. Returns 0 or -1.
+export function numUnionBinTail(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+  ls: i32,
+  rs: i32,
+): i32 {
   const lMs = njMembersOf(e.binLeft, fnIx)
   const rMs = njMembersOf(e.binRight, fnIx)
-  const key = njDepth * 2
-  njDepth = njDepth + 1
-  const ls = njStash(e.binLeft, lMs.length > 0, key, fnIx)
-  let rs = -1
-  if ls != -1 { rs = njStash(e.binRight, rMs.length > 0, key + 1, fnIx) }
-  njDepth = njDepth - 1
-  if ls == -1 || rs == -1 { return -1 }
   njBin = exprIx
   njOp = e.binOp
   njLUnion = lMs.length > 0

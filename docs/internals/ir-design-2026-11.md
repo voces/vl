@@ -756,8 +756,10 @@ accepted with a rebaseline (ledger #8947). The follow-up that pays it back build
 cheap pre-scan says could claim. Deletions follow as the claimed share
 grows: once every function that reaches a legacy driver is claimed, that driver deletes. The
 armed shadow still checks the unclaimed functions. The blocking unarmed `ir claims` gate row
-(`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back`, with a verifier
-fallback counted as a hard failure, so a lowering regression cannot hide behind legacy's bytes.
+(`ir-shadow.vl -- --claims`, `$VL_IR_SHADOW=5`) asserts zero `claim fell back` in the corpus, and
+no more than `claims-fallbacks.txt` holds in the programs it names and in every inventory witness
+filed `runs`, with a verifier fallback counted as a hard failure, so a lowering regression cannot
+hide behind legacy's bytes.
 A coverage step now widens what ships; it quotes the claimed counts beside its coverage.
 Op-seam slices still delete legacy ladders, starting with C1, the shared scalar opcode table.
 The IR's builder, verifier and lowering loop along an `if`'s `siElse` spine and the value-`if`

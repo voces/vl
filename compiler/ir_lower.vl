@@ -6,7 +6,8 @@ import { blockHasContinueFor } from "./emit_query"
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf } from "./emit_capture_frames"
-import { printUnionPlan } from "./emit_fn_scans"
+import { recIsVariant } from "./ir_verify"
+import { binEqStructRow, printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import {
@@ -156,6 +157,7 @@ import {
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumUnionBin,
   RNumWiden,
   RPrimOp,
   RPrint,
@@ -171,6 +173,7 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStructEq,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -419,8 +422,14 @@ import {
   nulTestRefTail,
   numCastTail,
   numIntrTail,
+  numUnionBinTail,
+  numUnionIsUnionSide,
+  numUnionSideKindOf,
+  numUnionSideLit,
+  numUnionStashEnter,
+  numUnionStashLeave,
+  numUnionStashTail,
   numWidenTail,
-  objLitArmOf,
   objLitLayoutRowAt,
   objLitLayoutRowOf,
   objLitStashRowAt,
@@ -472,6 +481,11 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  structEqEnter,
+  structEqRoots,
+  structEqStagesLeft,
+  structEqStagesRight,
+  structEqTail,
   structFieldTail,
   structUnionBoxTail,
   tagDispatchIfOf,
@@ -922,6 +936,7 @@ function rhs(r: Rhs, tail: boolean) {
     RMapHas => mapHas(r)
     RMapIter => mapIter(r)
     RPrint => irLMiss("print value")
+    RNumUnionBin => numUnionBin(r)
     RNumIntr => {
       for a in r.nxArgs { irLOpnd(a) }
       numIntrTail(r.nxOp)
@@ -962,6 +977,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
+    RStructEq => structEq(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -1223,7 +1239,7 @@ function recRowOf(at: i32, rowIn: i32, variant: boolean, stash: boolean): i32 {
 // the order stash, each field in source order into its scratch slot first, read back in layout;
 // for `mrSet` its `RStashSet`s set the slots, and it only reads them back.
 function makeRec(r: RMakeRec) {
-  const variant = if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, lw.irAt) == "variant" }
+  const variant = recIsVariant(r, lw.irAt)
   const stash = r.mrSrc.length > 0
   // The row the builder built the fields by: the plain or stash layout, or a row omitting fields.
   const row = if r.mrBuiltRow >= 0 { r.mrBuiltRow } else { recRowOf(r.mrAt, r.mrRow, variant, stash) }
@@ -2621,6 +2637,73 @@ function unionEq(r: RUnionEq) {
   return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
 }
 
+// `RNumUnionBin`: legacy's `numUnion` dispatch in `emitNumUnionBin`'s order: each side's value
+// and its stash, one level deeper for a dispatch inside it, then the member dispatch over the
+// stashed sides (`numUnionBinTail`). A literal side stashes nothing.
+function numUnionBin(r: RNumUnionBin) {
+  const n = nodeAt(r.nbAt)
+  if !(n is BinExpr) { return irLMiss("numeric union node") }
+  const fnIx = lw.irAt
+  const key = numUnionStashEnter()
+  let k = 0
+  const sides = [n.binLeft, n.binRight]
+  const slots: i32[] = []
+  let j = 0
+  while j < 2 {
+    const ix = sides[j]
+    const isU = numUnionIsUnionSide(ix, fnIx)
+    if !isU && numUnionSideLit(ix) {
+      slots.push(-2)
+    } else {
+      if k >= r.nbArgs.length {
+        numUnionStashLeave()
+        return irLMiss("numeric union operands")
+      }
+      irLOpnd(r.nbArgs[k])
+      k = k + 1
+      slots.push(numUnionStashTail(isU, numUnionSideKindOf(ix), key + j))
+    }
+    j = j + 1
+  }
+  numUnionStashLeave()
+  if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
+    return irLMiss("numeric union dispatch")
+  }
+  return 0
+}
+
+// `RStructEq`: legacy's field-wise record compare (`emitStructEq`): the stashed operands' values,
+// their slots, then the compare, which reads an unstashed operand from its variable's local.
+function structEq(r: RStructEq) {
+  const n = nodeAt(r.seAt)
+  if !(n is BinExpr) { return irLMiss("record compare node") }
+  const fnIx = lw.irAt
+  const row = binEqStructRow(r.seAt, fnIx)
+  if row < 0 { return irLMiss("record compare row") }
+  const lS = structEqStagesLeft(n.binLeft, n.binRight)
+  const rS = structEqStagesRight(n.binRight)
+  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+    return irLMiss("record compare place")
+  }
+  const saved = structEqEnter()
+  if lS { irLOpnd(r.seL) }
+  if rS { irLOpnd(r.seR) }
+  const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+    return irLMiss("record compare fields")
+  }
+  return 0
+}
+
+// The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
+function structEqSideLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  return varSlot(o.ov)
+}
+
 // `RNulNicheEq`: legacy's `nulNiche` compare in `emitNulNicheEq`'s order: the guard's head, the
 // left operand, the right twice around the rep's own compare, and `i32.eqz` for `!=`.
 function nulNicheEq(r: RNulNicheEq) {
@@ -2657,6 +2740,7 @@ function boxOp(r: RToBox) {
     p.hbArm == "pass"
     || p.hbArm == "memberBox"
     || p.hbArm == "atom"
+    || p.hbArm == "atomList"
     || p.hbArm == "atomStr"
     || p.hbArm == "nulNiche"
     || p.hbArm == "rec"
@@ -2714,6 +2798,10 @@ function irHoistRecv(ix: i32): i32 {
     return 0
   }
   if irLReadAgain(ix) { return 0 }
+  if lw.irReadElem.has(ix) {
+    const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
+    return rhs(lw.irReadElem[ix] ?? none, false)
+  }
   const m = nodeAt(ix)
   if lw.irReadField.has(ix) && m is Member {
     if irHoistRecv(m.memObj) < 0 { return -1 }
@@ -2721,6 +2809,23 @@ function irHoistRecv(ix: i32): i32 {
   }
   irLMiss("hoisted receiver read")
   return -1
+}
+
+// Operand `o` of node `ix` read once more: a variable's read, or a temp's read written again as the
+// builder read it (`irHoistRecv`).
+function opndAgain(o: Opnd, ix: i32): i32 {
+  if o is OVar && o.ov >= 0 && lw.irVars[o.ov].vKind == "temp" {
+    return irHoistRecv(unwrapParen(ix))
+  }
+  irLOpnd(o)
+  return 0
+}
+
+// Receiver `o` of member `lhsIx` read once more (`opndAgain`).
+function recvAgain(o: Opnd, lhsIx: i32): i32 {
+  const m = nodeAt(unwrapParen(lhsIx))
+  if !(m is Member) { return irLMiss("receiver read again") }
+  return opndAgain(o, m.memObj)
 }
 
 // Writes the global read the builder built at node `ix` once more, as legacy re-reads a name;
@@ -3422,7 +3527,7 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   fbElse()
-  irLOpnd(n.cbL)
+  if recvAgain(n.cbL, e.binLeft) < 0 { return -1 }
   if boxed { coalFieldRead(p) }
   else if coalFieldUnbox(p) < 0 { return -1 }
   lwFrames.pop()
@@ -3543,7 +3648,7 @@ function coalNicheCell(
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   coalNicheElse(reEval)
-  if reEval { irLOpnd(n.cbL) }
+  if reEval && opndAgain(n.cbL, e.binLeft) < 0 { return -1 }
   lwFrames.pop()
   fbEnd()
   return 0
@@ -3776,17 +3881,30 @@ function framedLocals(): u8[] {
 // Whether wasm local `slot` of the frame legacy is writing holds rep `rep`: a scalar's valtype, or
 // a reference run for a reference rep. A parameter's slot is the signature's.
 export function irSlotRunAgrees(rep: i32, slot: i32): boolean {
+  if slot - fbFrameParams < 0 { return true }
+  const b = irSlotValtype(slot)
+  if b.length == 0 { return false }
+  const t = valtypeOf(rep)
+  const scalarRun = b[0] >= 0x7b && b[0] <= 0x7f
+  return if t >= 0 { b.length == 1 && b[0] == t } else { !scalarRun }
+}
+
+// The valtype bytes legacy declares wasm local `slot` of the frame it is writing at; none for a
+// parameter's slot or one it has not set.
+export function irSlotValtype(slot: i32): u8[] {
+  const out: u8[] = []
   const li = slot - fbFrameParams
-  if li < 0 { return true }
-  if li >= localIsRef.length || fbLocalIsUnsetRef(li) { return false }
+  if li < 0 || li >= localIsRef.length || fbLocalIsUnsetRef(li) { return out }
   const b: u8[] = []
   const prev = wTarget(b)
   fbLocalRun(localIsRef[li], localStructIdx[li])
   wTarget(prev)
-  if b.length < 2 { return false }
-  const t = valtypeOf(rep)
-  const scalarRun = b[1] >= 0x7b && b[1] <= 0x7f
-  return if t >= 0 { b.length == 2 && b[1] == t } else { !scalarRun }
+  let i = 1
+  while i < b.length {
+    out.push(b[i])
+    i = i + 1
+  }
+  return out
 }
 
 // Whether declared local `li`'s run is scalar rep `rep`'s valtype; a reference rep takes the run
