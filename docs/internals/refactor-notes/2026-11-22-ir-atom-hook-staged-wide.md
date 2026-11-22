@@ -22,4 +22,4 @@ The third and fourth families of `pre-path atom hook` (census in
 Over the class's census files, functions covered (and `pre-path atom hook` misses), base #9604 →
 staged → staged + `wideLit`: 637 (18) → 646 (7) → 649 (3); start bodies 24 (11) → 24 (8) → 27
 (5). `tests/cases` covered = matched +14; `ir-identity --cases`, `--claimless` and `--names`
-differ 0; L2 fuel per PR +0.24%, the same-tree pair +0.00001%.
+differ 0; L2 fuel per PR +0.24%, the same-tree pair +0.0007%.
