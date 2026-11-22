@@ -1,3 +1,9 @@
 ## Codegen, memory & runtime (Track B)
 
-- **IR verifier: rule 5's end-of-body check reads the end pad the builder records, not legacy's `fnFallThroughPadOf`** (D17049, the second edge retired). `IrFn.irEndPad` is set when the builder starts a function. The verifier and the IR lowering's end padding both read it, so neither imports the legacy query.
+- **IR verifier: twelve more legacy queries retired** (D17049; 28 → 16 imports, in 5 verifier functions). Each fact the verifier asked legacy emit for is now recorded on the IR by the builder, which already computed it:
+  - rule 5's end pad: `IrFn.irEndPad`, which the lowering reads too;
+  - a record's variant row: `RMakeRec.mrVariant`, now set on every record;
+  - a saturating truncation's plan: `RTruncSat.tsOp`/`tsFrom`/`tsTo`, which the lowering reads too;
+  - whether a box's node is effect-free: `RToBox.bxFree`;
+  - memory-access and atomic operand and result prims: `RMemAccess.mmBase`/`mmPrim`, `RAtomic.amBase`/`amValPrims`/`amResPrim`;
+  - SIMD operand and result prims: `RSimd.sdMemBase`/`sdPrims`/`sdResPrim`.
