@@ -1488,11 +1488,15 @@ Deno.test({
       }
     }
     // Cases 103 to 106 are a record retag of an i32, into an i32, into a record whose field lowers
-    // to another valtype, and into one whose fields lower alike but on no shared struct heap.
+    // to another valtype, and into one whose fields lower alike on another noted struct heap; 109,
+    // the same on one noted heap, holds.
     for (const k of [103, 104, 105, 106]) {
       if (exp.irVerifySelfTest(k) !== 2) {
         throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
       }
+    }
+    if (exp.irVerifySelfTest(109) !== 0) {
+      throw new Error(`case 109: want rule 0, got rule ${exp.irVerifySelfTest(109)}`);
     }
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");

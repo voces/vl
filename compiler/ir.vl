@@ -25,6 +25,7 @@ import {
   RUnsup,
   RpPrim,
   repNodeAt,
+  repNodeKids,
   repRecordFieldNames,
   repRecordKidOf,
   repTyOf,
@@ -691,6 +692,9 @@ export type IrFn = {
   // The globals whose cell holds the record a holding binding holds whole, noted at that record's
   // rep: a read of one at that rep is at its storage.
   irGlobalHeld: {[i32]: boolean},
+  // The struct heap of each record rep a retag's admission reached (`recHeapsNote`), which the
+  // verifier reads where it checks the retag.
+  irRecHeap: {[i32]: i32},
   irSpanAst: i32[],
   irSpanFirst: i32[],
   irSpanLast: i32[],
@@ -776,6 +780,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalRep: [],
     irGlobalAt: Map(),
     irGlobalHeld: Map(),
+    irRecHeap: Map(),
     irSpanAst: [],
     irSpanFirst: [],
     irSpanLast: [],
@@ -1850,8 +1855,8 @@ export function recRetag(src: i32, dst: i32): boolean {
 }
 
 // Whether a plain record at rep `src` is the record at plain rep `dst` as it stands: one struct
-// heap (`recordHeapOfTy`, legacy's storage of both types) and fields that lower alike by name.
-export function recRowRetag(src: i32, dst: i32): boolean {
+// heap (`recordHeapOfTy`, legacy's storage of both types, noted in `hs`) and fields that lower alike.
+export function recRowRetag(src: i32, dst: i32, hs: {[i32]: i32}): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if (
@@ -1863,18 +1868,40 @@ export function recRowRetag(src: i32, dst: i32): boolean {
   ) {
     return false
   }
-  const h = recHeapOf(src)
-  return h >= 0 && h == recHeapOf(dst) && repsLowerAlike(src, dst)
+  recHeapsNote(hs, src)
+  recHeapsNote(hs, dst)
+  return repsLowerAlike(src, dst, hs)
 }
 
 // Whether reps `a` and `b` lower to the same valtypes: one scalar class, any two closures or any two
-// boxes (each kind is one struct), two records on one struct heap (`recHeapOf`) whose fields, by
+// boxes (each kind is one struct), two records on one struct heap noted in `hs` whose fields, by
 // name, lower alike, or the same list, map or nullable shape kid by kid. A pair met again holds.
-export function repsLowerAlike(a: i32, b: i32): boolean {
-  return lowerAlikeOn(a, b, [], [])
+export function repsLowerAlike(a: i32, b: i32, hs: {[i32]: i32}): boolean {
+  return lowerAlikeOn(a, b, [], [], hs)
 }
 
-function lowerAlikeOn(a: i32, b: i32, pa: i32[], pb: i32[]): boolean {
+// Notes in `hs` the struct heap (`recHeapOf`) of each record rep reachable from rep `r`, as the
+// builder's IR fact that `repsLowerAlike` reads.
+export function recHeapsNote(hs: {[i32]: i32}, r: i32) {
+  const todo: i32[] = [r]
+  const seen: {[i32]: boolean} = Map()
+  while todo.length > 0 {
+    const t = todo.pop() ?? -1
+    if t < 0 || (seen[t] ?? false) { continue }
+    seen[t] = true
+    if repNodeAt(t) is RRecord { hs[t] = recHeapOf(t) }
+    for k in repNodeKids(t) { todo.push(k) }
+  }
+  return 0
+}
+
+function lowerAlikeOn(
+  a: i32,
+  b: i32,
+  pa: i32[],
+  pb: i32[],
+  hs: {[i32]: i32},
+): boolean {
   if a == b { return true }
   let k = 0
   while k < pa.length {
@@ -1891,16 +1918,16 @@ function lowerAlikeOn(a: i32, b: i32, pa: i32[], pb: i32[]): boolean {
     RAtom => y is RAtom
     RNullable => y is RNullable
       && x.rnDisc == y.rnDisc
-      && lowerAlikeOn(x.rnInner, y.rnInner, pa, pb)
-    RList => y is RList && lowerAlikeOn(x.rlsElem, y.rlsElem, pa, pb)
-    RMap => y is RMap && lowerAlikeOn(x.rmVal, y.rmVal, pa, pb)
+      && lowerAlikeOn(x.rnInner, y.rnInner, pa, pb, hs)
+    RList => y is RList && lowerAlikeOn(x.rlsElem, y.rlsElem, pa, pb, hs)
+    RMap => y is RMap && lowerAlikeOn(x.rmVal, y.rmVal, pa, pb, hs)
     RBox => y is RBox
     RClosure => y is RClosure
     RRecord => y is RRecord
       && x.rrVariant == y.rrVariant
-      && recHeapOf(a) >= 0
-      && recHeapOf(a) == recHeapOf(b)
-      && fieldsLowerAlike(a, b, pa, pb)
+      && (hs[a] ?? -1) >= 0
+      && (hs[a] ?? -1) == (hs[b] ?? -1)
+      && fieldsLowerAlike(a, b, pa, pb, hs)
     RNoValue |
       RRaw |
       RUnsup => false
@@ -1919,7 +1946,13 @@ function primLowersAs(p: RPrim): string {
 }
 
 // A record rep's fields follow its type's spelling, so `b`'s are matched to `a`'s by name.
-function fieldsLowerAlike(a: i32, b: i32, pa: i32[], pb: i32[]): boolean {
+function fieldsLowerAlike(
+  a: i32,
+  b: i32,
+  pa: i32[],
+  pb: i32[],
+  hs: {[i32]: i32},
+): boolean {
   const x = repNodeAt(a)
   const y = repNodeAt(b)
   const na = repRecordFieldNames(a)
@@ -1938,7 +1971,7 @@ function fieldsLowerAlike(a: i32, b: i32, pa: i32[], pb: i32[]): boolean {
     if (
       i < 0
       || i >= x.rrFields.length
-      || !lowerAlikeOn(x.rrFields[i], y.rrFields[j], pa, pb)
+      || !lowerAlikeOn(x.rrFields[i], y.rrFields[j], pa, pb, hs)
     ) {
       return false
     }
