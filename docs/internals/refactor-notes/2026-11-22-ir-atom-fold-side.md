@@ -31,3 +31,16 @@ other read moves.
 
 `tests/ir-shadow-rows/narrowed-atom-read-at-its-cell.vl`: `rank` (a folded `==` side), and `bound`
 and `given` (an atom arm of a `string` if-join).
+
+## Measured vs merge-base a00578d1f (fixpoint seeds on both sides)
+
+- Fixpoint after one refresh; `--names` self-compile identical; mode-3 self-compile byte-identical
+  (claimed functions 19685 → 19686).
+- `ir-identity.sh --claimless`: identical 14018, fail under both 3267, differ 0.
+- `ir-identity.sh --cases`: identical 7606, differ 0; witnesses same 60, differ 0.
+- tests/cases legacy A/B: identical 7326, differ 0.
+- tests/cases armed shadow: covered 68,073 → 68,079 and matched 68,072 → 68,078 (+6);
+  `uncovered narrowed read` 142 → 136.
+- Corpus no-blocker functions unchanged at 44,857 (narrowed read 10 → 10; the corpus's atom rows
+  are the `d16530_*` cells left open above).
+- Self-compile L2 fuel +0.00% per PR.
