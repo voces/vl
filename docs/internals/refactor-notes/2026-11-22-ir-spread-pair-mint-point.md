@@ -20,3 +20,15 @@ write either way.
 
 `tests/ir-shadow-rows/spread-pair-minted-at-its-groups.vl`: the d3125 shape, `[...[x]]` in a generic
 function at `i32`, the program's first i32 list.
+
+## Measured vs merge-base 898b840d8 (fixpoint seeds on both sides)
+
+- Fixpoint after one refresh; `--names` self-compile identical; mode-3 self-compile byte-identical.
+- `ir-identity.sh --claimless`: identical 14018, fail under both 3267, differ 0.
+- `ir-identity.sh --cases`: identical 7611, differ 0; witnesses same 60, differ 0 (again after the
+  note became one record, `SpreadPairNote`).
+- tests/cases legacy A/B: identical 7331, differ 0.
+- `named/d3125_*`: 521 of 521 cells have mode-5 claimed equal to armed matched, and each mode-5
+  build is byte-identical to the legacy build, the 22 named cells among them.
+- tests/cases armed shadow: covered and matched +1. Corpus no-blocker functions unchanged at 45,028.
+- Self-compile L2 fuel +0.05% per PR.
