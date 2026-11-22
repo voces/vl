@@ -19,6 +19,18 @@ functions at `record compare place operand`, 8 of them std's `self[i] == needle`
 - **IR.** `RStructEq` gains `seLIx`/`seRIx`; an element side is its receiver and index, built
   without a statement or temp, read at every field by the plan.
 
+## Measured
+
+Against master cc27c3ea's fixpoint seed:
+- `tests/cases` covered = verified 68,513 → 68,522 (+9), matched 68,512 → 68,521; corpus unchanged
+  at 45,099;
+- `ir-identity --cases`, `--claimless` and `--names` differ 0; the legacy A/B over `tests/cases`
+  differs 0 (`emitIndex`'s ladder moved, its bytes did not);
+- L2 fuel per PR +0.07%, the same-tree pair +0.001%; the deep-nesting margin edge is the base's.
+
+The row `tests/ir-shadow-rows/record-eq-element-place.vl` has 4 functions, all `record compare
+place operand` on master's seed, all covered and matched here.
+
 ## The function-value version (unexplained, not reproduced standalone)
 
 The ruling's first spelling, a function-typed `rw: (rootIx, fnIx) => i32` with legacy passing
