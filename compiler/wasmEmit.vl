@@ -1807,6 +1807,7 @@ import {
   njSideTyOf,
   njStoreKind,
   nodeIsNumUnion,
+  nulBoolBoxesInto,
   nulNicheIsTestImpossible,
   nulRecvNeedsRecover,
   nullInstanceIsResult,
@@ -9183,7 +9184,7 @@ export function holeBoxTyAt(exprIx: i32, fnIx: i32): i32 {
 export function holeBoxLeads(a: HoleBoxArm): boolean {
   return match a {
     "atom" | "atomAsStr" | "atomList" | "rec" | "obj" | "refList" | "map" | "clo" => true
-    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "mapScalar" | "ladder" => false
+    "null" | "lit" | "pass" | "memberBox" | "atomStr" | "nulNiche" | "nulBool" | "mapScalar" | "ladder" => false
   }
 }
 
@@ -9206,6 +9207,7 @@ export function holeBoxHead(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     }
     // The niche's stash slot is taken ahead of its value, as legacy's rung takes it.
     "nulNiche" => if nulNicheBoxSlot() < 0 { -1 } else { 0 }
+    "nulBool" => if nulBoolBoxSlot() < 0 { -1 } else { 0 }
     "pass" | "memberBox" | "atomStr" | "mapScalar" => 0
     "ladder" => emitFail("emitProgram: a box plan with no arm was written")
   }
@@ -9218,6 +9220,7 @@ export function holeBoxTail(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     "atom" | "atomList" | "lit" => atomBoxTail(p.hbKind)
     "atomStr" => atomNulStrTail(nulAtomWidenTexts(exprIx, fnIx))
     "nulNiche" => nulNicheBoxTail(nulNicheBoxTagOf(p.hbKind, exprIx, fnIx))
+    "nulBool" => nulBoolBoxTail()
     "pass" | "memberBox" | "mapScalar" | "ladder" => 0
   }
 }
@@ -9249,6 +9252,7 @@ function emitHoleBox(p: HoleBox, exprIx: i32, fnIx: i32): i32 {
     p.hbArm == "pass"
     || p.hbArm == "atomStr"
     || p.hbArm == "nulNiche"
+    || p.hbArm == "nulBool"
     || p.hbArm == "rec"
     || p.hbArm == "refList"
     || p.hbArm == "map"
@@ -42234,38 +42238,46 @@ function emitUnionBoxNulNiche(
 ): i32 {
   if unionName == "" { return 0 }
   const nnIx = unwrapParen(exprIx)
-  // The value's shape is asked before the union's `null`, so only a niche reads the set.
-  const nnBool = exprNulBool(nnIx, fnIx)
-  if !nnBool && !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
-  if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
   // A `boolean | null` is the i32 niche whose null is the value 2, so the null test is on the
-  // value, not the ref (D2260).
-  if nnBool {
-    const bvb = vbHeapIdxOfKind(1)
-    if bvb < 0 { return 0 }
-    const bSlot = widenTmpSlot(4000)
+  // value, not the ref (D2260); the plan's `nulBool` arm, whose writers these are.
+  if nulBoolBoxesInto(unionKey, unionTy, nnIx, fnIx) {
+    nulBoolBoxSlot()
     if emitExpr(exprIx, fnIx) < 0 { return -1 }
-    fbLocalTee(bSlot)
-    fbI32Const(2)
-    fbI32Bin(70)     // 0x46 i32.eq → null?
-    fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
-    fbI32Rel(RS_TAG, nullBoxTag())
-    fbRefNullNone()
-    fbStructNew(uBoxIdx)
-    fbElse()
-    fbI32Rel(RS_TAG, scalarTagOfKind(1))
-    fbLocalGet(bSlot)
-    fbStructNew(bvb)
-    fbStructNew(uBoxIdx)
-    fbEnd()
-    return 1
+    return nulBoolBoxTail()
   }
+  // The value's shape is asked before the union's `null`, so only a niche reads the set.
+  if exprNulBool(nnIx, fnIx) || !coalesceNulRefNicheOperand(nnIx, fnIx) {
+    return 0
+  }
+  if !unionSetHasNullTy(unionKey, unionTy) { return 0 }
   const nnTag = nulNicheBoxTagOf(unionTy, exprIx, fnIx)
   if nnTag < 0 { return 0 }
   const hp: HoleBox = { hbArm: "nulNiche", hbKind: unionTy, hbSrc: -1 }
   // Read raw: a nullable-string ident is otherwise recovered non-null, which traps on the very
   // null this rung exists to box (D2260).
   if emitHoleBox(hp, exprIx, fnIx) < 0 { return -1 }
+  return 1
+}
+
+// The slot a `boolean | null` niche's value is parked in for its null test, taken ahead of it.
+export function nulBoolBoxSlot(): i32 { return widenTmpSlot(4000) }
+
+// After a `boolean | null` niche's value: the union's null box if it is 2, else its bool atom box.
+export function nulBoolBoxTail(): i32 {
+  const bSlot = nulBoolBoxSlot()
+  fbLocalTee(bSlot)
+  fbI32Const(2)
+  fbI32Bin(70) // 0x46 i32.eq → null?
+  fbIfRef(uBoxIdx) // 0x04 if, (ref $uBox) blocktype
+  fbI32Rel(RS_TAG, nullBoxTag())
+  fbRefNullNone()
+  fbStructNew(uBoxIdx)
+  fbElse()
+  fbI32Rel(RS_TAG, scalarTagOfKind(1))
+  fbLocalGet(bSlot)
+  fbStructNew(vbHeapIdxOfKind(1))
+  fbStructNew(uBoxIdx)
+  fbEnd()
   return 1
 }
 
