@@ -6685,6 +6685,76 @@ export function variantTagTail(vi: i32) {
   return 0
 }
 
+// How the variant rung tests `recv is V` where `V` has no tested row (`isTestedRowOf`): a record
+// the receiver always is (`recordTrue`), the tag chain of a union alias arm, its tags into `tags`
+// (`tagChain`), a pin whose join holds no such arm (`pinFalse`), or none (`noArm`). The constant
+// arms evaluate the receiver and drop it.
+export type IsVariantNoRowArm = "recordTrue" | "tagChain" | "pinFalse" | "noArm"
+export function isVariantNoRowArmOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+  tags: i32[],
+): IsVariantNoRowArm {
+  if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) { return "recordTrue" }
+  // A union alias arm has no single variant row because it is a SUBSET of the outer box's tags,
+  // so the test is the tag chain `as?` emits for a sub-union target (D1774). A layout-twin arm
+  // is excluded: its tag alone does not settle membership.
+  const isTags: i32[] = []
+  const isVis: i32[] = []
+  if unionArmTagsOfTy(isVarTyIxOf(isIx), -1, isTags, isVis) {
+    let chainOk = isTags.length > 1
+      && exprUnion(nd.isObj, fnIx)
+      && unionEqOperandOk(nd.isObj)
+    // A variant told apart by a field's value shares its tag; the tag alone answers where every
+    // operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
+    const opTags: i32[] = []
+    const opVis: i32[] = []
+    const opArms = unionArmTagsOfTy(nodeTyAt(nd.isObj, fnIx), -1, opTags, opVis)
+    let ci = 0
+    while ci < isVis.length {
+      if (
+        variantHasDiscrimField(isVis[ci])
+        && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
+      ) {
+        chainOk = false
+      }
+      ci = ci + 1
+    }
+    if chainOk {
+      for t in isTags { tags.push(t) }
+      return "tagChain"
+    }
+  }
+  // A record no union of the program has as a variant is in no box, so a box's test of it is
+  // false, as a pin whose join lacks it answers (D3344). A `K | null` niche holds no record and
+  // no value of a primitive other than `string`.
+  const nlPrim = isTestValuePrimName(isVarTyIxOf(isIx))
+  const nlNo = exprNulLitUnion(nd.isObj, fnIx)
+    && !exprUnion(nd.isObj, fnIx)
+    && ((nlPrim != "" && nlPrim != "string")
+    || tyIsRecord(isVarTyIxOf(isIx)))
+  // A box of value arms only holds no record.
+  const boxr: i32[] = []
+  const boxNm = unionNameRowOfExpr(nd.isObj, fnIx, boxr)
+  const boxNo = exprUnion(nd.isObj, fnIx)
+    && tyIsRecord(isVarTyIxOf(isIx))
+    && boxNm != ""
+    && (isValueUnionOfSet(msSetOfRow(boxr[0]), boxr[1])
+    || unionCarriesLitUnionArmOfSet(msSetOfRow(boxr[0]), boxr[1]))
+  // Only a join the checker kept apart over declared parameters reaches here by design.
+  if (
+    (nlNo || boxNo)
+    && fnInPinnedInstance(fnIx)
+    && holeOperandTyOf(nd.isObj, fnIx) < 0
+    && !criFnIsAnonLambda(fnStmtsPosOf(fnIx))
+    && !readIsCallResult(nd.isObj, fnIx)
+  ) {
+    return "pinFalse"
+  }
+  return "noArm"
+}
+
 // The variant rung of `emitIsTest`: `recv is V` for a union variant, alias arm or record,
 // by a static row fold where the row is the answer, else the box tag and discriminant test.
 // Returns 0 once the test is on the stack, -1 on failure.
@@ -6696,43 +6766,16 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
   }
   const vi = isTestedRowOf(isVarTyIxOf(isIx), nd.isObj)
   if vi < 0 {
-    if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) {
-      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
-      fbI32Const(1)
-      return 0
-    }
-    // A union alias arm has no single variant row because it is a SUBSET of the outer
-    // box's tags, so the test is the tag chain `as?` already emits for a sub-union target
-    // (D1774). A layout-twin arm is excluded: its tag alone does not settle membership,
-    // and the per-arm discriminant test has no home inside a chain.
     const isTags: i32[] = []
-    const isVis: i32[] = []
-    if unionArmTagsOfTy(isVarTyIxOf(isIx), -1, isTags, isVis) {
-      let chainOk = isTags.length > 1
-        && exprUnion(nd.isObj, fnIx)
-        && unionEqOperandOk(nd.isObj)
-      // A variant told apart by a field's value shares its tag; the tag alone answers where
-      // every operand arm holding that tag is tested (`tyTestMeet`'s members, D16320).
-      const opTags: i32[] = []
-      const opVis: i32[] = []
-      const opArms = unionArmTagsOfTy(
-        nodeTyAt(nd.isObj, fnIx),
-        -1,
-        opTags,
-        opVis,
-      )
-      let ci = 0
-      while ci < isVis.length {
-        if (
-          variantHasDiscrimField(isVis[ci])
-          && !(opArms && isTagWhollyTested(isTags[ci], opTags, opVis, isVis))
-        ) {
-          chainOk = false
-        }
-        ci = ci + 1
+    const na = isVariantNoRowArmOf(isIx, nd, fnIx, isTags)
+    return match na {
+      "recordTrue" | "pinFalse" => {
+        if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+        fbDrop()
+        fbI32Const(if na == "recordTrue" { 1 } else { 0 })
+        0
       }
-      if chainOk {
+      "tagChain" => {
         let ti = 0
         while ti < isTags.length {
           if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
@@ -6742,46 +6785,17 @@ function emitIsTestVariant(isIx: i32, nd: IsExpr, fnIx: i32) {
           if ti > 0 { fbI32Bin(114) }
           ti = ti + 1
         }
-        return 0
+        0
+      }
+      "noArm" => {
+        if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
+          return emitFail(
+            "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
+          )
+        }
+        emitFail("emitProgram: `is` names a type that is not a union variant")
       }
     }
-    // A record no union of the program has as a variant is in no box, so a box's test of it
-    // is false, as a pin whose join lacks it answers (D3344).
-    // A `K | null` niche holds no record and no value of a primitive other than `string` (D3344).
-    const nlPrim = isTestValuePrimName(isVarTyIxOf(isIx))
-    const nlNo = exprNulLitUnion(nd.isObj, fnIx)
-      && !exprUnion(nd.isObj, fnIx)
-      && ((nlPrim != "" && nlPrim != "string")
-      || tyIsRecord(isVarTyIxOf(isIx)))
-    // A box of value arms only holds no record.
-    const boxr: i32[] = []
-    const boxNm = unionNameRowOfExpr(nd.isObj, fnIx, boxr)
-    const boxNo = exprUnion(nd.isObj, fnIx)
-      && tyIsRecord(isVarTyIxOf(isIx))
-      && boxNm != ""
-      && (isValueUnionOfSet(msSetOfRow(boxr[0]), boxr[1])
-      || unionCarriesLitUnionArmOfSet(msSetOfRow(boxr[0]), boxr[1]))
-    // Only a join the checker kept apart over declared parameters reaches here by design.
-    if (
-      (nlNo || boxNo)
-      && fnInPinnedInstance(fnIx)
-      && holeOperandTyOf(nd.isObj, fnIx) < 0
-      && !criFnIsAnonLambda(fnStmtsPosOf(fnIx))
-      && !readIsCallResult(nd.isObj, fnIx)
-    ) {
-      if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
-      fbDrop()
-      fbI32Const(0)
-      return 0
-    }
-    if tyIsUnionMemberOf(nodeTyIxOf(nd.isObj), isVarTyIxOf(isIx)) {
-      return emitFail(
-        "emitProgram: `is` names a declared union member with no interned arm representation (deferred value-union composition)",
-      )
-    }
-    return emitFail(
-      "emitProgram: `is` names a type that is not a union variant",
-    )
   }
 
   // A row holding several members answers from the value's fields after its tag (D5157).
