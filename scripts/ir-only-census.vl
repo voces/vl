@@ -1,0 +1,543 @@
+// The forced IR-only census: how far I8 (legacy codegen deleted) is from running each program.
+//
+//     vl run scripts/ir-only-census.vl -- [--seed P] [--top N] [--out DIR] [--write]
+//
+// A throwaway copy of compiler/ claims every IR family, `raw` and `other` included, and reports
+// instead of failing: one `fmiss <fn> | <class>` row per function legacy still lowers, and one
+// `legacy module: <what>` row per module-level body legacy still writes. It is built with the
+// seed (default build/vl-compiler.wasm) in a temp dir, and builds the self-compile and every
+// `tests/cases` program of the run and trap tiers under `$VL_IR_SHADOW=5`. It prints the
+// programs fully IR-only, the self-compile's misses and the classes; `--write` rewrites
+// scripts/ir-only-census/functions.tsv, one `<class>\t<fn>\t<programs>` line per function.
+// Report-only: it exits 2 only when the harness fails. `$JOBS` (default 4), `$VL` the host.
+
+import { IoError, readTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { exit } from "std:process"
+import { parseI32, toString } from "std:fmt"
+import { endsWith, join, split, startsWith, trim } from "std:str"
+import { sort } from "std:array"
+import { die, envOr, fanOutArgv, findFrom, hasFlag } from "./lib/common"
+import {
+  makeTempDir,
+  padLeft,
+  sortStrings,
+  spawn,
+  writeText,
+} from "./lib/corpus"
+
+const LIST = "scripts/ir-only-census/functions.tsv"
+const PREFIX = "[ir] "
+const CHUNK = 150
+
+// One edit of the probe copy: `from` must occur exactly `times` times in `file`.
+type Edit = { file: string, from: string, to: string, times: i32 }
+
+const FMISS_FN = lines(
+  [
+    "",
+    "// Probe: a function legacy lowers names its class.",
+    "function fmiss(why: string): boolean {",
+    "  count(\"fmiss \" + ib.irName + \" | \" + why)",
+    "  return false",
+    "}",
+    "",
+    "export function irProbeRow(key: string) {",
+    "  count(key)",
+    "  return 0",
+    "}",
+  ],
+)
+
+// `xs`, each ended by a newline.
+function lines(xs: string[]): string { return join(xs, "\n") + "\n" }
+
+// The probe's edits, each anchored on a line of the shipped claim path.
+function edits(): Edit[] {
+  const ib = "ir_build.vl"
+  const es = "emit_sections.vl"
+  return [
+    {
+      file: ib,
+      from: "function familyClaimed(fam: IrFamily): boolean {\n",
+      to: "function familyClaimed(fam: IrFamily): boolean {\n  if ibForceProbe { return true }\n",
+      times: 1,
+    },
+    {
+      file: ib,
+      from: "let ibClaimAll = false\n",
+      to: "let ibClaimAll = false\nlet ibForceProbe = true\n",
+      times: 1,
+    },
+    {
+      file: ib,
+      from: "  if claimBuildMinted(minted) { return false }\n",
+      to: "  if claimBuildMinted(minted) { return fmiss(\"build minted a synthetic global\") }\n",
+      times: 2,
+    },
+    {
+      file: ib,
+      from: "  if built != \"\" || repNodeGen() != gen || !claimable() { return false }\n",
+      to: lines(
+        [
+          "  if built != \"\" { return fmiss(built) }",
+          "  if repNodeGen() != gen { return fmiss(\"build minted a rep node\") }",
+          "  if !claimable() { return fmiss(\"unclaimable family\") }",
+        ],
+      ),
+      times: 2,
+    },
+    {
+      file: ib,
+      from: "    count(\"claim fell back: verifier\")\n    return false\n",
+      to: "    return fmiss(\"verifier\")\n",
+      times: 2,
+    },
+    {
+      file: ib,
+      from: "    count(\"claim fell back: \" + why)\n    return false\n",
+      to: "    return fmiss(\"lower: \" + why)\n",
+      times: 2,
+    },
+    {
+      file: ib,
+      from: "\nfunction claimBuildMinted(",
+      to: FMISS_FN + "\nfunction claimBuildMinted(",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "  irClaimStart,\n",
+      to: "  irClaimStart,\n  irProbeRow,\n",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "    const bodyExpr: u8[] = []\n    // Binds the writer at `bodyExpr`",
+      to: lines(
+        [
+          "    if fbRetExtra.length > 0 {",
+          "      irProbeRow(\"fmiss \" + fn.fnName + \" | lifted extra results\")",
+          "    }",
+          "    const bodyExpr: u8[] = []",
+        ],
+      )
+        + "    // Binds the writer at `bodyExpr`",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "function emitCloThunkCode(out: u8[], fe: i32) {\n",
+      to: "function emitCloThunkCode(out: u8[], fe: i32) {\n  irProbeRow(\"legacy module: closure thunk\")\n",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "function eqHelpFnCode(out: u8[], si: i32): i32 {\n",
+      to: "function eqHelpFnCode(out: u8[], si: i32): i32 {\n  irProbeRow(\"legacy module: structural eq helper\")\n",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "    if letInitFoldsExpr(g) {\n      rc = emitConstFoldValue(",
+      to: "    if letInitFoldsExpr(g) {\n      irProbeRow(\"legacy module: const cell folded value\")\n      rc = emitConstFoldValue(",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "      if !constCellClaimed(gi) {\n        const from = wLen()\n        rc = emitUnionBoxOwed(",
+      to: "      if !constCellClaimed(gi) {\n        irProbeRow(\"legacy module: const cell union box\")\n        const from = wLen()\n        rc = emitUnionBoxOwed(",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "    } else if gAliasFe >= 0 {\n      rc = emitClosureValueCore(",
+      to: "    } else if gAliasFe >= 0 {\n      irProbeRow(\"legacy module: const cell generic alias\")\n      rc = emitClosureValueCore(",
+      times: 1,
+    },
+    {
+      file: es,
+      from: "    } else if !constCellClaimed(gi) {\n      const from = wLen()\n      rc = emitExpr(",
+      to: "    } else if !constCellClaimed(gi) {\n      irProbeRow(\"legacy module: const cell plain\")\n      const from = wLen()\n      rc = emitExpr(",
+      times: 1,
+    },
+  ]
+}
+
+function occurrences(s: string, needle: string): i32 {
+  let n = 0
+  let at = findFrom(s, needle, 0)
+  while at >= 0 {
+    n = n + 1
+    at = findFrom(s, needle, at + needle.length)
+  }
+  return n
+}
+
+function replaceEvery(s: string, from: string, to: string): string {
+  const parts: string[] = []
+  let i = 0
+  let at = findFrom(s, from, 0)
+  while at >= 0 {
+    parts.push(s.slice(i, at))
+    parts.push(to)
+    i = at + from.length
+    at = findFrom(s, from, i)
+  }
+  parts.push(s.slice(i, s.length))
+  return join(parts, "")
+}
+
+function readOr(path: string): string {
+  const t = readTextFile(path)
+  if t is IoError { return "" }
+  return t
+}
+
+// Copies compiler/ under `root`, applies the edits and builds the probe with `seed`.
+function buildProbe(root: string, seed: string, vl: string): string {
+  const cp = spawn("cp", ["-r", "compiler", root + "/probe"])
+  if cp.code != 0 { die("ir-only-census: cannot copy compiler/\n\{cp.err}", 2) }
+  for e in edits() {
+    const p = root + "/probe/" + e.file
+    const text = readOr(p)
+    const n = occurrences(text, e.from)
+    if n != e.times {
+      die(
+        "ir-only-census: a probe anchor in \{e.file} occurs \{n} times, not \{e.times}:\n\{e.from}",
+        2,
+      )
+    }
+    writeText(p, replaceEvery(text, e.from, e.to))
+  }
+  const out = root + "/probe.wasm"
+  const b = spawn(
+    vl,
+    ["build", root + "/probe/entry.vl", "-o", out, "--compiler", seed],
+  )
+  if b.code != 0 {
+    die("ir-only-census: the probe does not build\n\{b.out}\{b.err}", 2)
+  }
+  return out
+}
+
+// Whether `src` is a run-tier or trap-tier case: it runs, and no `@error` or
+// `@no-instantiate` marks it as a compile-time or instantiation case.
+function runTier(src: string): boolean {
+  let runs = false
+  for line in split(src, "\n") {
+    const t = trim(line)
+    if !startsWith(t, "//") { continue }
+    const d = trim(t.slice(2, t.length))
+    if startsWith(d, "@error") || startsWith(d, "@no-instantiate") {
+      return false
+    }
+    if (
+      d == "@run"
+      || startsWith(d, "@run ")
+      || startsWith(d, "@log")
+      || startsWith(d, "@trap")
+    ) {
+      runs = true
+    }
+  }
+  return runs
+}
+
+function population(): string[] {
+  const x = spawn("git", ["ls-files", "tests/cases"])
+  if x.code != 0 {
+    die("ir-only-census: git ls-files tests/cases failed\n\{x.err}", 2)
+  }
+  const out: string[] = []
+  for line in split(x.out, "\n") {
+    if !endsWith(line, ".vl") || endsWith(line, ".matrix.vl") { continue }
+    if runTier(readOr(line)) { out.push(line) }
+  }
+  sort(out, (a: string, b: string) => a < b)
+  return out
+}
+
+// What one program reported: its missed functions with their class, and its legacy bodies.
+type Prog = {
+  path: string,
+  miss: string[],
+  why: string[],
+  legacy: string[],
+  legacyN: i32[],
+}
+
+function progOf(m: Map<string, Prog>, order: string[], path: string): Prog {
+  const p = m[path]
+  if p != null { return p }
+  const q: Prog = { path: path, miss: [], why: [], legacy: [], legacyN: [] }
+  m[path] = q
+  order.push(path)
+  return q
+}
+
+// The class of a miss: a start body's carries `start: `, and a read names no binding.
+function classOf(fn: string, why: string): string {
+  let w = why
+  if startsWith(w, "read of ") && findFrom(w, " ", 8) < 0 {
+    w = "read of <name>"
+  }
+  return if startsWith(fn, "@") { "start: " + w } else { w }
+}
+
+// Adds the `[ir] <path>: <n>\t<row>` lines of `text`, path `self` when `as` is not "".
+function addRows(
+  m: Map<string, Prog>,
+  order: string[],
+  text: string,
+  as: string,
+) {
+  for line in split(text, "\n") {
+    if !startsWith(line, PREFIX) { continue }
+    const t = line.indexOf("\t")
+    const c = line.indexOf(": ")
+    if t < 0 || c < 0 { continue }
+    const path = if as != "" { as } else { line.slice(PREFIX.length, c) }
+    const n = parseI32(trim(line.slice(c + 2, t))) ?? 0
+    const row = line.slice(t + 1, line.length)
+    const p = progOf(m, order, path)
+    if startsWith(row, "fmiss ") {
+      const bar = row.indexOf(" | ")
+      if bar < 0 { continue }
+      const fn = row.slice(6, bar)
+      p.miss.push(fn)
+      p.why.push(classOf(fn, row.slice(bar + 3, row.length)))
+    } else if startsWith(row, "legacy module: ") {
+      p.legacy.push(row.slice(15, row.length))
+      p.legacyN.push(n)
+    }
+  }
+  return 0
+}
+
+// Builds `paths` with the probe, `jobs` chunks at a time; the chunks that did not finish.
+function measure(
+  paths: string[],
+  probe: string,
+  vl: string,
+  jobs: string,
+  root: string,
+  m: Map<string, Prog>,
+  order: string[],
+): string[] {
+  const chunks: string[] = []
+  let i = 0
+  while i < paths.length {
+    const f = root + "/chunk-" + toString(chunks.length)
+    const end = if i + CHUNK < paths.length { i + CHUNK } else { paths.length }
+    writeText(f, join(paths.slice(i, end), "\n") + "\n")
+    chunks.push(f)
+    i = end
+  }
+  writeText(root + "/chunks", join(chunks, "\n") + "\n")
+  const sh = "VL_IR_SHADOW=5 timeout 1800 \"$0\" check --codegen --compiler \"$1\" $(cat \"$2\")"
+    + " > /dev/null 2> \"$2.err\"; echo $? > \"$2.rc\""
+  const x = spawn(
+    "sh",
+    fanOutArgv(root + "/chunks", jobs, ["sh", "-c", sh, vl, probe]),
+  )
+  if x.code != 0 {
+    die("ir-only-census: the chunk fan-out failed (rc=\{x.code})\n\{x.err}", 2)
+  }
+  const broken: string[] = []
+  for f in chunks {
+    const rc = parseI32(trim(readOr(f + ".rc"))) ?? -1
+    if rc != 0 && rc != 1 { broken.push(f + " (rc=\{toString(rc)})") }
+    addRows(m, order, readOr(f + ".err"), "")
+  }
+  return broken
+}
+
+// A function's key: a std or imported function (`$m`) counts once across programs.
+function fnKey(path: string, fn: string): string {
+  return if fn.indexOf("$m") >= 0 { fn } else { path + "::" + fn }
+}
+
+type Cls = { name: string, fns: Map<string, i32>, progs: i32, only: i32 }
+
+function main(args: readonly string[]) {
+  let seed = "build/vl-compiler.wasm"
+  let top = 40
+  let outDir = ""
+  let i = 0
+  while i + 1 < args.length {
+    if args[i] == "--seed" { seed = args[i + 1] }
+    if args[i] == "--top" { top = parseI32(args[i + 1]) ?? 40 }
+    if args[i] == "--out" { outDir = args[i + 1] }
+    i = i + 1
+  }
+  const vl = envOr("VL", "scripts/vl-host/target/release/vl")
+  const jobs = envOr("JOBS", "4")
+  const root = makeTempDir()
+  const probe = buildProbe(root, seed, vl)
+
+  const m: Map<string, Prog> = Map()
+  const order: string[] = []
+  const self = spawn(
+    "sh",
+    [
+      "-c",
+      "VL_IR_SHADOW=5 \"$0\" build compiler/entry.vl -o \"$1/self.wasm\" --compiler \"$2\" 2>&1 > /dev/null",
+      vl,
+      root,
+      probe,
+    ],
+  )
+  if self.code != 0 {
+    die(
+      "ir-only-census: the self-compile under the probe failed\n\{self.out}",
+      2,
+    )
+  }
+  addRows(m, order, self.out, "self")
+  const paths = population()
+  const broken = measure(paths, probe, vl, jobs, root, m, order)
+  spawn("rm", ["-rf", root])
+
+  // Per class: its distinct functions, with the programs each blocks, and the programs it
+  // blocks alone.
+  const cls: Map<string, Cls> = Map()
+  const clsOrder: string[] = []
+  const legacy: Map<string, i32> = Map()
+  const legacyOrder: string[] = []
+  let blocked = 0
+  for path in paths {
+    const p = m[path]
+    if p == null { continue }
+    const seen: Map<string, boolean> = Map()
+    const mine: string[] = []
+    let k = 0
+    while k < p.miss.length {
+      const name = p.why[k]
+      let c = cls[name]
+      if c == null {
+        const d: Cls = { name: name, fns: Map(), progs: 0, only: 0 }
+        cls[name] = d
+        clsOrder.push(name)
+        c = d
+      }
+      const key = fnKey(path, p.miss[k])
+      c.fns[key] = (c.fns[key] ?? 0) + 1
+      if seen[name] == null {
+        seen[name] = true
+        mine.push(name)
+        c.progs = c.progs + 1
+      }
+      k = k + 1
+    }
+    if mine.length > 0 { blocked = blocked + 1 }
+    if mine.length == 1 {
+      const c = cls[mine[0]]
+      if c != null { c.only = c.only + 1 }
+    }
+    for w in p.legacy {
+      if legacy[w] == null { legacyOrder.push(w) }
+      legacy[w] = (legacy[w] ?? 0) + 1
+    }
+  }
+
+  const sp = m["self"]
+  const selfFns: Map<string, boolean> = Map()
+  const selfCls: Map<string, boolean> = Map()
+  if sp != null {
+    let k = 0
+    while k < sp.miss.length {
+      selfFns[sp.miss[k]] = true
+      selfCls[sp.why[k]] = true
+      k = k + 1
+    }
+  }
+  const full = paths.length - blocked
+  print(
+    "ir-only-census: tests/cases run and trap tiers: \{full} of \{paths.length} programs fully IR-only, \{blocked} with a missed function",
+  )
+  print(
+    "ir-only-census: self-compile: \{selfFns.keys().length} missed functions in \{selfCls.keys().length} classes",
+  )
+  for w in legacyOrder {
+    let selfN = 0
+    if sp != null {
+      let k = 0
+      while k < sp.legacy.length {
+        if sp.legacy[k] == w { selfN = selfN + sp.legacyN[k] }
+        k = k + 1
+      }
+    }
+    print(
+      "ir-only-census: legacy module: \{w}: \{legacy[w] ?? 0} programs, \{selfN} in the self-compile",
+    )
+  }
+  if broken.length > 0 {
+    print("ir-only-census: chunks that did not finish: \{join(broken, ", ")}")
+  }
+
+  sort(clsOrder, (a: string, b: string) => {
+    const x = cls[a]
+    const y = cls[b]
+    const nx = if x != null { x.fns.keys().length } else { 0 }
+    const ny = if y != null { y.fns.keys().length } else { 0 }
+    return if nx != ny { nx > ny } else { a < b }
+  })
+  print("   fns  progs   only  class")
+  let shown = 0
+  for name in clsOrder {
+    if shown >= top { break }
+    const c = cls[name]
+    if c == null { continue }
+    const nf = padLeft(toString(c.fns.keys().length), 6)
+    print(
+      "\{nf} \{padLeft(toString(c.progs), 6)} \{padLeft(toString(c.only), 6)}  \{name}",
+    )
+    shown = shown + 1
+  }
+
+  const lines: string[] = []
+  for name in clsOrder {
+    const c = cls[name]
+    if c == null { continue }
+    for key in sortStrings(c.fns.keys()) {
+      lines.push(name + "\t" + key + "\t" + toString(c.fns[key] ?? 0))
+    }
+  }
+  if sp != null {
+    let k = 0
+    const selfLines: string[] = []
+    while k < sp.miss.length {
+      selfLines.push(sp.why[k] + "\tself::" + sp.miss[k] + "\t0")
+      k = k + 1
+    }
+    for l in sortStrings(selfLines) { lines.push(l) }
+  }
+  const rev = trim(spawn("git", ["rev-parse", "--short=8", "HEAD"]).out)
+  const head = "# \{rev}: <class>\\t<function>\\t<programs>, from scripts/ir-only-census.vl -- --write;"
+    + " a std function counts once; self:: rows are the self-compile's misses\n"
+  if hasFlag(args, "--write") {
+    writeText(LIST, head + join(lines, "\n") + "\n")
+  }
+  if outDir != "" {
+    spawn("mkdir", ["-p", outDir])
+    writeText(outDir + "/functions.tsv", head + join(lines, "\n") + "\n")
+    const progLines: string[] = []
+    for path in paths {
+      const p = m[path]
+      const n = if p != null { p.miss.length } else { 0 }
+      progLines.push(path + "\t" + toString(n))
+    }
+    writeText(outDir + "/programs.tsv", join(progLines, "\n") + "\n")
+  }
+  if broken.length > 0 { exit(2) }
+  return 0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("ir-only-census: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  main(argv)
+}
