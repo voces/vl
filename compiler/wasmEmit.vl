@@ -1746,6 +1746,7 @@ import {
 } from "./emit_plan_null"
 import {
   AtomEqArm,
+  AtomEqPlan,
   HoleBox,
   IdentReadArm,
   IsArm,
@@ -2729,22 +2730,23 @@ function emitCaptureRead(name: string, fnIx: i32) {
 
 // ── the variant field-span invariant, enforced rather than assumed ───────────
 
+// Whether variant row `vi`'s field span lies inside the parallel field tables.
+function variantFieldSpanOk(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldStart.length || vi >= uFieldCount.length {
+    return false
+  }
+  const end = uFieldStart[vi] + uFieldCount[vi]
+  return uFieldStart[vi] >= 0
+    && uFieldCount[vi] >= 0
+    && end <= sFieldNames.length
+}
+
 // `uFieldStart` / `uFieldCount` are parallel to `uVariants` and slice the flat `armFieldNames`
 // and `armFieldStoreTy` stores, and nothing keeps the lengths in step: a registration helper that
 // pushes a variant row and then refuses one of its fields leaves a start with no count.
 // `emitFail` keeps emitting, so an unguarded span read traps the compiler instead (D1152).
 function guardVariantFieldSpan(vi: i32, where: string) {
-  if vi >= 0 && vi < uFieldStart.length && vi < uFieldCount.length {
-    const end = uFieldStart[vi] + uFieldCount[vi]
-    if (
-      uFieldStart[vi] >= 0
-      && uFieldCount[vi] >= 0
-      && end <= sFieldNames.length
-      && end <= sFieldNames.length
-    ) {
-      return 0
-    }
-  }
+  if variantFieldSpanOk(vi) { return 0 }
   return emitFail(
     "emitProgram: "
       + where
@@ -3131,7 +3133,10 @@ function emitStructExprAsVariantBox(exprIx: i32, vi: i32, ssi: i32, fnIx: i32) {
   const rows: i32[] = []
   variantRowFields(vi, names, rows)
   fbI32Rel(RS_TAG, uTags[vi])
-  if (emitRecCopy(exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx) < 0) {
+  if (
+    emitRecCopy(exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx, false)
+    < 0
+  ) {
     return -1
   }
   fbStructNew(uBoxIdx)
@@ -3140,8 +3145,8 @@ function emitStructExprAsVariantBox(exprIx: i32, vi: i32, ssi: i32, fnIx: i32) {
 
 // A fresh record at the heap `dHeap`, whose fields are `dNames` at the flat field rows `dFieldRows`, built from
 // the record `exprIx` evaluates to at struct row `ssi`: field by field, each number converted
-// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`.
-// `dRow` is the destination's struct row, or -1 for a variant row.
+// (`i32` into `i64`). A source that cannot be re-read is evaluated once into `variantReboxSlot`,
+// already on the stack where `built`. `dRow` is the destination's struct row, or -1 for a variant row.
 function emitRecCopy(
   exprIx: i32,
   ssi: i32,
@@ -3150,10 +3155,19 @@ function emitRecCopy(
   dNames: string[],
   dFieldRows: i32[],
   fnIx: i32,
+  built: boolean,
 ): i32 {
   const held = coerceHeld
   coerceHeld = exprIx
-  const r = emitRecCopyFields(exprIx, ssi, dRow, dNames, dFieldRows, fnIx)
+  const r = emitRecCopyFields(
+    exprIx,
+    ssi,
+    dRow,
+    dNames,
+    dFieldRows,
+    fnIx,
+    built,
+  )
   coerceHeld = held
   if r < 0 { return -1 }
   fbStructNew(dHeap)
@@ -3353,6 +3367,21 @@ function rcHasNested(
   return false
 }
 
+// Whether a copy of `exprIx` at source row `ssi` into `dNames`/`dFieldRows` re-reads its source
+// per field: a pure source, or a single field with no nested record. Otherwise it reads the value
+// once, into `variantReboxSlot`.
+function rcReReadable(
+  exprIx: i32,
+  ssi: i32,
+  dRow: i32,
+  dNames: string[],
+  dFieldRows: i32[],
+): boolean {
+  return exprReReadable(unwrapParen(exprIx))
+    || (dNames.length == 1
+    && !rcHasNested(ssi, dRow, recCopyTyOf(exprIx), dNames, dFieldRows))
+}
+
 // `emitRecCopy`'s field loop, with `exprIx` held so each read emits the record itself.
 function emitRecCopyFields(
   exprIx: i32,
@@ -3361,6 +3390,7 @@ function emitRecCopyFields(
   dNames: string[],
   dFieldRows: i32[],
   fnIx: i32,
+  built: boolean,
 ): i32 {
   if ssi < 0 || ssi >= sHeapIdx.length {
     return emitFailAt(
@@ -3370,16 +3400,20 @@ function emitRecCopyFields(
   }
   const sHeap = sHeapIdx[ssi]
   const dTy = recCopyTyOf(exprIx)
-  const reReadable = exprReReadable(unwrapParen(exprIx))
-    || (dNames.length == 1
-    && !rcHasNested(ssi, dRow, dTy, dNames, dFieldRows))
+  const reReadable = rcReReadable(exprIx, ssi, dRow, dNames, dFieldRows)
+  if built && reReadable {
+    return emitFailAt(
+      "emitProgram: internal: a record copy was handed its value once for a source it re-reads",
+      exprIx,
+    )
+  }
   if !reReadable {
     if !fnUses.variantRebox {
       return emitFail(
         "emitProgram: a multi-field record from a call is copied with no scratch slot reserved",
       )
     }
-    if emitExpr(exprIx, fnIx) < 0 { return -1 }
+    if !built && emitExpr(exprIx, fnIx) < 0 { return -1 }
     fbLocalSet(variantReboxSlot)
   }
   rcElem.pathHeap = []
@@ -3971,19 +4005,60 @@ function rcFieldTy(dTy: i32, name: string): i32 {
   return objFieldType(d, name)
 }
 
-// `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`).
-function emitRecCopyInto(exprIx: i32, row: i32, fnIx: i32): i32 {
+// `emitExpr` for a value whose delivery copies it into the row `row` names (`recCopyRowAt`), the
+// value already on the stack where `built` (the IR's `RCoerce`, `coerceTail`).
+function emitRecCopyInto(
+  exprIx: i32,
+  row: i32,
+  fnIx: i32,
+  built: boolean,
+): i32 {
   const names: string[] = []
   const rows: i32[] = []
+  const sh = recCopyShapeOf(exprIx, row, fnIx, names, rows)
+  if sh.rsWhy == "span" {
+    return guardVariantFieldSpan(-2 - row, "emitRecCopyInto")
+  }
+  if sh.rsWhy == "row" {
+    return emitFailAt(
+      "emitProgram: a record copied at its delivery has no row",
+      exprIx,
+    )
+  }
+  return emitRecCopy(
+    exprIx,
+    sh.rsSsi,
+    sh.rsHeap,
+    sh.rsRow,
+    names,
+    rows,
+    fnIx,
+    built,
+  )
+}
+
+// A record copy's source struct row, destination heap and destination struct row (-1 for a
+// variant row), its destination fields pushed onto `names`/`rows`; `rsWhy` "span" or "row" where
+// the destination has no fields to read.
+type RcShape = { rsSsi: i32, rsHeap: i32, rsRow: i32, rsWhy: string }
+function recCopyShapeOf(
+  exprIx: i32,
+  row: i32,
+  fnIx: i32,
+  names: string[],
+  rows: i32[],
+): RcShape {
   // A call copied back to its own record is read at the row its function builds it at.
   const from = recCopyFromOf(exprIx)
   let ssi = if from >= 0 { structIndexOfTy(from) } else { structIndexOfExpr(exprIx, fnIx) }
   if ssi < 0 && from < 0 { ssi = copyArmRowOf(exprIx) }
   if row <= -2 {
     const vi = -2 - row
-    if guardVariantFieldSpan(vi, "emitRecCopyInto") < 0 { return -1 }
+    if !variantFieldSpanOk(vi) {
+      return { rsSsi: ssi, rsHeap: -1, rsRow: -1, rsWhy: "span" }
+    }
     variantRowFields(vi, names, rows)
-    return emitRecCopy(exprIx, ssi, variantHeap(vi), -1, names, rows, fnIx)
+    return { rsSsi: ssi, rsHeap: variantHeap(vi), rsRow: -1, rsWhy: "" }
   }
   if (
     row < 0
@@ -3991,10 +4066,7 @@ function emitRecCopyInto(exprIx: i32, row: i32, fnIx: i32): i32 {
     || row >= sFieldCount.length
     || row >= sFieldStart.length
   ) {
-    return emitFailAt(
-      "emitProgram: a record copied at its delivery has no row",
-      exprIx,
-    )
+    return { rsSsi: ssi, rsHeap: -1, rsRow: -1, rsWhy: "row" }
   }
   let fj = 0
   while fj < sFieldCount[row] {
@@ -4002,7 +4074,35 @@ function emitRecCopyInto(exprIx: i32, row: i32, fnIx: i32): i32 {
     rows.push(sFieldStart[row] + fj)
     fj = fj + 1
   }
-  return emitRecCopy(exprIx, ssi, sHeapIdx[row], row, names, rows, fnIx)
+  return { rsSsi: ssi, rsHeap: sHeapIdx[row], rsRow: row, rsWhy: "" }
+}
+
+// The record copy delivery `exprIx` owes in `fnIx`, its source re-read per field, written whole
+// with the node held as `emitCoerced` holds it (the IR's `RRecCopyPure`).
+export function recCopyPureEmit(exprIx: i32, fnIx: i32): i32 {
+  const held = coerceHeld
+  coerceHeld = exprIx
+  const rc = emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx, false)
+  coerceHeld = held
+  return rc
+}
+
+// Whether the record copy delivery `exprIx` owes in `fnIx` reads its source again per field, so
+// its value cannot be built once before the copy; true where the copy has no shape to read.
+export function recCopyReReads(exprIx: i32, fnIx: i32): boolean {
+  const names: string[] = []
+  const rows: i32[] = []
+  const sh = recCopyShapeOf(
+    exprIx,
+    recCopyRowAt(exprIx, fnIx),
+    fnIx,
+    names,
+    rows,
+  )
+  if sh.rsWhy != "" || sh.rsSsi < 0 || sh.rsSsi >= sHeapIdx.length {
+    return true
+  }
+  return rcReReadable(exprIx, sh.rsSsi, sh.rsRow, names, rows)
 }
 
 // Pushes variant row `vi`'s field names and flat field rows onto `names` and `rows`, in layout order.
@@ -24341,6 +24441,28 @@ export function numCastSrcRepOf(obj: i32, fnIx: i32): string {
   return "i32"
 }
 
+// The type `u as? N` over a type-parameter operand is pinned at in this instance, or -1: the
+// instance's elaboration of the operand, a capture's included (D3654), or for a gradual union's
+// operand the instance re-typed at a scalar, that scalar.
+function holeOptPinTy(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
+  const ext = instanceOperandTyOf(e.asObj, fnIx)
+  if ext >= 0 { return ext }
+  if monoGradualAsScalar.get(exprIx) ?? false { return nodeTyIxOf(e.asObj) }
+  return -1
+}
+
+// The number `u as? N` over a type-parameter operand converts from when its cast can fail at
+// this pin, which `emitHoleNumAsOpt` writes as the exact cast; "" for every other pin.
+function holeOptExactSrc(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "" }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
+  if ext < 0 { return "" }
+  const src = primNameStr(primNameOf(ext))
+  if src != "i32" && src != "i64" && src != "f32" && src != "f64" { return "" }
+  return if numCastCanFail(src, asExprNumCastDomain(exprIx)) { src } else { "" }
+}
+
 // `u as? N` over a type-parameter operand pinned at a number or a `boolean`: `N | null` at every
 // pin (D2754), so a cast that cannot fail at this pin still boxes its value, and one that can
 // takes the exact-or-fail box.
@@ -24357,13 +24479,7 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
         + " | null` row was never registered",
     )
   }
-  // The instance's exact pin decides: a number converts, any other type is never the target.
-  // A hole's operand, a capture's included, reads the instance's elaboration (D3654).
-  let ext = instanceOperandTyOf(e.asObj, fnIx)
-  // A gradual union's operand the instance re-typed at a scalar carries that scalar itself.
-  if ext < 0 && (monoGradualAsScalar.get(exprIx) ?? false) {
-    ext = nodeTyIxOf(e.asObj)
-  }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
   if ext < 0 {
     return emitFail(
       "emitProgram: `as? "
@@ -24379,9 +24495,8 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
     fbStructNew(uBoxIdx)
     return 0
   }
-  if numCastCanFail(src, asExprNumCastDomain(exprIx)) {
-    return emitNumExactCastFrom(e, exprIx, src, fnIx)
-  }
+  const xs = holeOptExactSrc(exprIx, fnIx)
+  if xs != "" { return emitNumExactCastFrom(e, exprIx, xs, fnIx) }
   fbI32Rel(RS_TAG, scalarTagOfKind(nck))
   if emitNumPlainCast(e.asObj, tgt, fnIx) < 0 { return -1 }
   fbStructNew(nvb)
@@ -24391,16 +24506,22 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
 
 // The value kind the cast at `exprIx` builds its operand at, where its arm is an operand and a
 // tail (`numCastTail`): the plain conversion, the wrap that is neither a literal fold nor a
-// narrowed mask, and `as!`. -1 for every other arm, which writes its operand its own way.
+// narrowed mask, the exact `as!` and `as?`, and a type-parameter operand's exact `as!` and
+// failing `as?` at its pin. -1 for every other arm, which writes its operand its own way.
 export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) { return -1 }
   return match asCastArmOf(exprIx, fnIx) {
     "plain" => numPlainCastKind(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
     "wrap" => if asWrapArmOf(exprIx, fnIx) == "plain" { numWrapCastKind(exprIx, fnIx) } else { -1 }
-    "exact" => if e.asMode == "trap" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
+    "exact" => if e.asMode == "trap" || e.asMode == "null" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
+    "holeExact" => if e.asMode == "trap" { numExactCastKind(asExprHolePinSrc(exprIx, fnIx)) } else { -1 }
+    "holeOpt" => {
+      const hs = holeOptExactSrc(exprIx, fnIx)
+      if hs != "" { numExactCastKind(hs) } else { -1 }
+    }
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
-    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => -1
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => -1
     "union" | "notCast" => -1
   }
 }
@@ -24425,7 +24546,9 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
     "wrap" => numWrapCastTail(exprIx, fnIx)
     "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
-    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => numCastNoTail()
+    "holeExact" => numExactCastTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
+    "holeOpt" => numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx)
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => numCastNoTail()
     "union" | "notCast" => numCastNoTail()
   }
 }
@@ -27424,12 +27547,15 @@ function emitCallRefArg(
     "armUnbox" => {
       const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-      if exprUnion(args[i], fnIx) {
-        if variantHasCrossTagFits(cvSlot, args[i], fnIx) {
+      match armUnboxPlanOf(cvSlot, args[i], fnIx) {
+        "asIs" => {}
+        "crossTag" => {
           return emitFailCrossTagDelivery(args[i], cvSlot)
         }
-        fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
-        fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        "unbox" => {
+          fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
+          fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        }
       }
     }
     "nulArm" => {
@@ -27475,10 +27601,19 @@ function emitCallRefArg(
   return if argPlainArm { 1 } else { 0 }
 }
 
+// How `emitCallRefArg`'s `armUnbox` arm writes argument `a` into the arm at variant slot `slot`:
+// as it stands, unboxed from its union's box, or refused where another arm's tag fits it.
+type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
+
+function armUnboxPlanOf(slot: i32, a: i32, fnIx: i32): ArmUnboxPlan {
+  if !exprUnion(a, fnIx) { return "asIs" }
+  return if variantHasCrossTagFits(slot, a, fnIx) { "crossTag" } else { "unbox" }
+}
+
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
 // number, a union parameter's box, or the general arm with nothing owed at a scalar of the
-// argument's own width (a boolean into an `i32`), a string, a record neither unboxed from a
-// narrowing nor nullable, or a non-null closure, list or map.
+// argument's own width (a boolean into an `i32`), a string, a record or union arm neither unboxed
+// from a narrowing nor nullable, or a non-null closure, list or map.
 export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
@@ -27497,13 +27632,16 @@ export function callRefArgPlain(
     return true
   }
   const k = sigParamKindAt(ckey, i)
+  if arm == "armUnbox" {
+    return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx) == "unbox"
+  }
   if arm == "scalarList" {
     return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
   }
   if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
   if k == "str" { return true }
-  if k == "struct" {
+  if k == "struct" || k == "variant" {
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
   }
   if k == "closure" { return !exprNulClosure(a, fnIx) }
@@ -31227,7 +31365,7 @@ function emitCoerced(exprIx: i32, fnIx: i32, ck: CoerceKind): i32 {
   coerceHeld = exprIx
   if ck == "recCopy" {
     // A copy reads each field off the value, so the node stays held for the whole copy.
-    const rc = emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx)
+    const rc = emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx, false)
     coerceHeld = held
     return rc
   }
@@ -31275,7 +31413,9 @@ export function coerceTail(exprIx: i32, fnIx: i32): i32 {
   return match ck {
     "listCopy" => emitListCopyTail(exprIx, listCopyAtNode(exprIx), fnIx)
     "mapRetag" => if exprUnion(exprIx, fnIx) { emitMapRetagTail(exprIx) } else { 0 }
-    "none" | "fnClo" | "mapUnbox" | "recCopy" | "box" | "unbox" | "atomstr" => 0
+    // Only a copy that reads its value once reaches here (`recCopyReReads`).
+    "recCopy" => emitRecCopyInto(exprIx, recCopyRowAt(exprIx, fnIx), fnIx, true)
+    "none" | "fnClo" | "mapUnbox" | "box" | "unbox" | "atomstr" => 0
   }
 }
 
@@ -33882,13 +34022,23 @@ function reserveListKindOfSlot(k: VKind): ListKind | null {
 }
 
 // `emitCallStmt`'s arm over a named callee `f(…)`: the call, then a `drop` unless the callee is
-// void (`print`, a void intrinsic or host import, a void function or closure). Returns 0, or -1
-// once failed.
+// void (`callStmtIdentDrops`). Returns 0, or -1 once failed.
 function emitCallStmtIdent(s: Call, callee: Ident, stmtIx: i32, fnIx: i32) {
-  // A bare call whose RESULT is discarded (a helper invoked for its side
-  // effects): emit the call, then `drop` the value it leaves — EXCEPT `print`
-  // (a void import) and a VOID function (`()->()` leaves nothing).
   if emitCall(stmtIx, fnIx) < 0 { return -1 }
+  if callStmtIdentDrops(s, callee, stmtIx, fnIx) {
+    fbDrop() // 0x1a drop
+  }
+  return 0
+}
+
+// Whether call statement `stmtIx` through named callee `callee` drops the value it leaves: not
+// for `print`, a void intrinsic or host import, or a void function or closure.
+export function callStmtIdentDrops(
+  s: Call,
+  callee: Ident,
+  stmtIx: i32,
+  fnIx: i32,
+): boolean {
   let dropIt = callee.identName != "print"
   // The void memory intrinsics leave nothing on the stack.
   if callee.identName == "__store_i32__" { dropIt = false }
@@ -33927,10 +34077,7 @@ function emitCallStmtIdent(s: Call, callee: Ident, stmtIx: i32, fnIx: i32) {
       }
     }
   }
-  if dropIt {
-    fbDrop() // 0x1a drop
-  }
-  return 0
+  return dropIt
 }
 
 function emitCallStmt(s: Call, stmtIx: i32, fnIx: i32) {
@@ -40394,21 +40541,30 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   }
 }
 
+// After a folded atom compare's side: the side's id dropped, the compare being a constant.
+export function atomFoldSideTail() { fbDrop() }
+
+// After both folded sides: whether the two literals of plan `aq` are the same value, as 1 or 0
+// (`!=` when `ne`).
+export function atomFoldTail(aq: AtomEqPlan, ne: boolean): i32 {
+  if strLexSameValue(aq.aqLex, aq.aqLexR) == !ne {
+    fbI32Const(1)
+  } else {
+    fbI32Const(0)
+  }
+  return 0
+}
+
 // An atom compare by its plan (`atomEqPlanOf`): two string-literal types fold, a literal beside
 // an atom is its interned id, two atoms compare their ids. Both operands evaluate (D2156).
 function emitAtomEqByPlan(e: BinExpr, fnIx: i32): i32 {
   const aq = atomEqPlanOf(e, fnIx)
   if aq.aqArm == "fold" {
     if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
-    fbDrop()
+    atomFoldSideTail()
     if emitStaticLitAtom(e.binRight, aq.aqLexR, fnIx) < 0 { return -1 }
-    fbDrop()
-    if strLexSameValue(aq.aqLex, aq.aqLexR) == (e.binOp == "==") {
-      fbI32Const(1)
-    } else {
-      fbI32Const(0)
-    }
-    return 0
+    atomFoldSideTail()
+    return atomFoldTail(aq, e.binOp == "!=")
   }
   if aq.aqArm == "static" {
     if aq.aqStaticLeft {

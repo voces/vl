@@ -8,6 +8,26 @@ also updates the target doc's status section.
 
 Newest first:
 
+- [2026-11-21-ir-reccopy-pure](2026-11-21-ir-reccopy-pure.md): IR: a record copy of a pure source, written whole by legacy (RRecCopyPure), 2026-11-21
+- [2026-11-21-ir-coerce-rec](2026-11-21-ir-coerce-rec.md): IR: a record copy that reads its value once, through RCoerce, 2026-11-21
+- [2026-11-21-ir-global-narrowed-unbox](2026-11-21-ir-global-narrowed-unbox.md): IR: a union global read at its narrowed atom, and a recover count decided at build, 2026-11-21
+- [2026-11-21-ir-box-ladder-2](2026-11-21-ir-box-ladder-2.md): IR: an integer literal-union value boxed under its base scalar (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-coal-union-field](2026-11-21-ir-coal-union-field.md): IR coverage: a `??` over a record's value-union field (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-is-arm-tag-memstruct](2026-11-21-ir-is-arm-tag-memstruct.md): IR coverage: an `is` arm tag test over a record's union-box field (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-hole-closure-field](2026-11-21-ir-hole-closure-field.md): IR: a hole function stored in a record field, at the closure rep the record holds, 2026-11-21
+- [2026-11-21-ir-index-ref-nullable](2026-11-21-ir-index-ref-nullable.md): IR: a ref list read whose element stays nullable (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-null-field-fold](2026-11-21-ir-null-field-fold.md): IR: one Rhs for a record field's null (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-shift-mask-fold](2026-11-21-ir-shift-mask-fold.md): IR: a masked shift builds as legacy's strength-reduced shift and mask, 2026-11-21
+- [2026-11-21-ir-return-closure](2026-11-21-ir-return-closure.md): IR: a function value returned at its result's closure type (2026-11-21, lane IR-N2)
+- [2026-11-21-ir-closure-arg-atom](2026-11-21-ir-closure-arg-atom.md): IR: a closure-call argument that is an atom or a scalar list, 2026-11-21
+- [2026-11-21-ir-is-arm-tag-box](2026-11-21-ir-is-arm-tag-box.md): IR coverage: an `is` arm tag test over a box value (2026-11-21, lane IR-N1)
+- [2026-11-21-ir-assign-value-target](2026-11-21-ir-assign-value-target.md): IR: a field or element write used as a value (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-map-keys-values](2026-11-21-ir-map-keys-values.md): IR: a map variable's keys() and values() (2026-11-21, lane IR-N3)
+- [2026-11-21-ir-mem-op](2026-11-21-ir-mem-op.md): IR coverage: the memory-management intrinsics as `RMemOp` (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-for-range-partial](2026-11-21-ir-for-range-partial.md): IR: the partial range loop and the wrap exit (2026-11-21, lane IR-D1)
+- [2026-11-21-ir-as-union-cast](2026-11-21-ir-as-union-cast.md): IR: a union-box `as` by legacy's tag test, and a niche's `as?`/`as!`, 2026-11-21
+- [2026-11-21-ir-v128-list](2026-11-21-ir-v128-list.md): IR coverage: a v128 list literal on the short list arm (2026-11-21, lane IR-N7)
+- [2026-11-21-ir-is-lit-recv-once](2026-11-21-ir-is-lit-recv-once.md): IR coverage: a literal arm over a temp receiver legacy reads once (2026-11-21, lane IR-N1)
 - [2026-11-21-ir-tag-dispatch-stash](2026-11-21-ir-tag-dispatch-stash.md): IR coverage: a tag dispatch after an operand (2026-11-21, lane IR-N7)
 - [2026-11-21-ir-simd-mem](2026-11-21-ir-simd-mem.md): IR coverage: SIMD loads and stores along the memory address plan (2026-11-21, lane IR-N7)
 - [2026-11-21-ir-rep-null](2026-11-21-ir-rep-null.md): IR: the `null` unit rep (2026-11-21, lane IR-N2)
