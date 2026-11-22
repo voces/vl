@@ -39792,21 +39792,59 @@ function njStash(ix: i32, isUnion: boolean, key: i32, fnIx: i32): i32 {
       )
     }
     if sr < 0 { return -1 }
-    const bs = njSlot(26, "list", key)
-    fbLocalSet(bs)
-    return bs
+    return numUnionStashTail(true, -1, key)
   }
   if cexLitPeel(ix) >= 0 { return -2 }
   const k = njKindOfExpr(ix)
   if k < 0 { return -1 }
   if emitExprAsKind(ix, k, fnIx) < 0 { return -1 }
-  const ss = njSlot(
-    27,
-    listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"),
-    key,
-  )
-  fbLocalSet(ss)
-  return ss
+  return numUnionStashTail(false, k, key)
+}
+
+// After a side's value: its slot at stash `key`, a union side's box slot or a scalar side's slot
+// at kind `k`, set from the stack. Answers the slot.
+export function numUnionStashTail(isUnion: boolean, k: i32, key: i32): i32 {
+  const slot = if isUnion { njSlot(26, "list", key) } else { njSlot(27, listIdxKindOf(repOfTy(numPrimTyOfKind(k)).rdKind ?? "i32"), key) }
+  fbLocalSet(slot)
+  return slot
+}
+
+// Opens a numeric-union dispatch's stash, answering its key: an operand's own dispatch built
+// inside it stashes one level deeper. `numUnionStashLeave` closes it.
+export function numUnionStashEnter(): i32 {
+  const key = njDepth * 2
+  njDepth = njDepth + 1
+  return key
+}
+
+export function numUnionStashLeave(): i32 {
+  njDepth = njDepth - 1
+  return 0
+}
+
+// Whether side `ix` of a numeric-union operator is a union (`njMembersOf`), stashed as its box.
+export function numUnionIsUnionSide(ix: i32, fnIx: i32): boolean {
+  return njMembersOf(ix, fnIx).length > 0
+}
+
+// Whether union side `ix` is already its box (`exprUnion`); a join of scalars is boxed at the stash.
+export function numUnionSideBoxed(ix: i32, fnIx: i32): boolean {
+  return exprUnion(ix, fnIx)
+}
+
+// Whether scalar side `ix` is a literal, which the arms write at each member's width.
+export function numUnionSideLit(ix: i32): boolean { return cexLitPeel(ix) >= 0 }
+
+// The prim a scalar side `ix` is stashed at, its recorded type's kind's, or "" when it has none.
+export function numUnionSidePrim(ix: i32): string {
+  const k = numUnionSideKindOf(ix)
+  if k < 0 { return "" }
+  return numPrimOfKind(k) ?? ""
+}
+
+// The kind scalar side `ix` is stashed at, its recorded type's, or -1 when it has none.
+export function numUnionSideKindOf(ix: i32): i32 {
+  return njKindOfTy(nodeTyIxOf(ix))
 }
 
 // The kind of scalar operand `ix`, its recorded type's: the checker types every scalar operand
@@ -39923,15 +39961,33 @@ function njScalarTy(ix: i32): i32 {
 
 // `a op b` where an operand is a numeric union.
 function emitNumUnionBin(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const key = numUnionStashEnter()
+  const ls = njStash(e.binLeft, numUnionIsUnionSide(e.binLeft, fnIx), key, fnIx)
+  let rs = -1
+  if ls != -1 {
+    rs = njStash(
+      e.binRight,
+      numUnionIsUnionSide(e.binRight, fnIx),
+      key + 1,
+      fnIx,
+    )
+  }
+  numUnionStashLeave()
+  if ls == -1 || rs == -1 { return -1 }
+  return numUnionBinTail(e, exprIx, fnIx, ls, rs)
+}
+
+// After both sides' stashes (`ls`, `rs`; -2 for a literal side): the member dispatch over the
+// stashed sides, each pair's operator, and the result's box where it is a union. Returns 0 or -1.
+export function numUnionBinTail(
+  e: BinExpr,
+  exprIx: i32,
+  fnIx: i32,
+  ls: i32,
+  rs: i32,
+): i32 {
   const lMs = njMembersOf(e.binLeft, fnIx)
   const rMs = njMembersOf(e.binRight, fnIx)
-  const key = njDepth * 2
-  njDepth = njDepth + 1
-  const ls = njStash(e.binLeft, lMs.length > 0, key, fnIx)
-  let rs = -1
-  if ls != -1 { rs = njStash(e.binRight, rMs.length > 0, key + 1, fnIx) }
-  njDepth = njDepth - 1
-  if ls == -1 || rs == -1 { return -1 }
   njBin = exprIx
   njOp = e.binOp
   njLUnion = lMs.length > 0
