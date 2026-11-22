@@ -497,6 +497,7 @@ import {
   forInElemTyOf,
   forInMapRecv,
   globalCellKind,
+  holderRecordTy,
   identIsEnvCapture,
   letBindIsAtom,
   letBindRep,
@@ -1702,9 +1703,14 @@ function exprTyOf(ix: i32): i32 {
     const st = readNarrowedStoreAt(ix, ibFnIx)
     if st >= 0 { return st }
   }
+  // A read of a binding holding a returned record whole is that record (`emitHolderRead`).
+  const ht = holderReadTy(ix)
+  if ht >= 0 { return ht }
   const t = nodeTyAt(ix, ibFnIx)
-  if t >= 0 || ix < 0 || ix >= P.nodes.length { return t }
+  if ix < 0 || ix >= P.nodes.length { return t }
   const n = nodeAt(ix)
+  // A direct call typed open is of its callee's result as the IR holds it (`resultTy`).
+  if t >= 0 && !(n is Call && irTyOpen(t)) { return t }
   if n is Call {
     if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return t }
     const d = identDeclOf(n.callFn)
@@ -1739,6 +1745,12 @@ function capturedClosureTy(ix: i32): i32 {
   }
   const ty = capTyOf(fe, n.identName)
   return if ty >= 0 && repNodeAt(repNodeOfTy(ty)) is RClosure { ty } else { -1 }
+}
+
+// The record type read `ix` of a holding binding is (`holderRecordTy`), or -1.
+function holderReadTy(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(nodeAt(ix) is Ident) { return -1 }
+  return holderRecordTy(identDeclOf(ix), ibFnIx)
 }
 
 // The variable the IR built for the `let` or parameter read `ix` names, or -1.
@@ -1860,7 +1872,9 @@ function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
 export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
-  const ty = heldTy(scopeTyAt(d, ibFnIx))
+  // Legacy holds a binding of a returned record whole as that record (`letCellKind`).
+  const ht = holderRecordTy(d, ibFnIx)
+  const ty = if ht >= 0 { ht } else { heldTy(scopeTyAt(d, ibFnIx)) }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     irBMiss("local rep " + repWhat(rep))
@@ -3066,9 +3080,9 @@ function globalTyRep(ty: i32): i32 {
 function resultTy(pos: i32, ann: i32, d: i32): i32 {
   if ann >= 0 { return nodeTyAt(ann, d) }
   const rec = if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
-  if rec >= 0 { return rec }
-  const t = fnCheckedRetTy(pos)
-  // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`).
+  const t = if rec >= 0 { rec } else { fnCheckedRetTy(pos) }
+  // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`),
+  // whether its result is recorded or checked.
   const bs = if irTyOpen(t) && pos >= 0 && pos < fnStmts.length { fnBundleRetSigs(pos) } else { [] }
   return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
 }
