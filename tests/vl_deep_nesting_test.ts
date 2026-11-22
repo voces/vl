@@ -187,7 +187,7 @@ for (const [name, pick] of SHAPES) {
 
 // The labelled-loop shape's stack margin. The editor half re-runs that case in a child `deno`
 // under a V8 stack of MARGIN_KB, about 5% below the default 984 KB; at 600 levels it passes at 900
-// and fails at 875 on linux x86_64. A change that deepens the compiler's per-level recursion then
+// and fails at 890 on linux x86_64. A change that deepens the compiler's per-level recursion then
 // fails here, not at V8's edge on one runner. Frame sizes differ elsewhere, so linux only.
 const MARGIN_KB = 940;
 Deno.test({

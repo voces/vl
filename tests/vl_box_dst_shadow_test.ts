@@ -342,6 +342,7 @@ Deno.test({
     expectRows("setcall", SETCALL, DROP_NONE, "nested agree=2; table=2"),
 });
 
+// The loop's fall-through arm never returns, so legacy delivers no box there and counts no row.
 Deno.test({
   name: "box-dst shadow: a break value takes its loop's union",
   ignore,
@@ -350,7 +351,7 @@ Deno.test({
       "brk",
       BRK,
       DROP_NONE,
-      "floor: never returns=1; nested agree=2; nested value already a box=2; nested value never returns=1; table=4",
+      "nested agree=2; nested value already a box=2; table=4",
     ),
 });
 
