@@ -3018,9 +3018,71 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
 // Capture `n` read at `rep` on legacy's `capture` arm (`emitCapturedRead`): a lifted function's
 // own parameter after its environment, else its environment's field; at the capture's own rep.
 function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
-  if identReadArmOf(n, ix, ibFnIx, false) != "capture" {
-    return irBMiss("read of " + n.identName)
+  const arm = identReadArmOf(n, ix, ibFnIx, false)
+  if arm == "unbox" { return captureUnboxRead(b, n, ix, rep) }
+  if arm != "capture" { return irBMiss("read of " + n.identName) }
+  return captureReadAt(b, n, ix, rep)
+}
+
+// Capture `n` holding a union box read narrowed at `rep` on legacy's `unbox` arm: the box as the
+// capture holds it, then unboxed at the atom kind the read decodes (`identUnboxAtomOf`).
+function captureUnboxRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
+  const fe = fnStmtsPosOf(ibFnIx)
+  if cloLifted(fe) { return liftedCaptureUnboxRead(b, n, ix, rep) }
+  const cr = capRepFor(fe, n.identName, -1)
+  const c = repNodeAt(cr)
+  if cr < 0 || !(c is RBox || c is RNullable && c.rnDisc == 4) {
+    return irBMiss("capture unbox rep")
   }
+  const ak = identUnboxAtomOf(ix, ibFnIx)
+  if ak < 0 { return irBMiss("capture unbox dead") }
+  const ct = capTyOf(fe, n.identName)
+  if ct < 0 || repNodeOfTy(ct) != cr { return irBMiss("capture unbox type") }
+  if listIsTestedIdent(unwrapParen(ix)) { return irBMiss("capture list test") }
+  const o = irBLetTempTy(
+    b,
+    { evSlot: captureSlotOf(n.identName, ibFnIx), evAt: ix },
+    ix,
+    cr,
+    ct,
+  )
+  if ibMiss != "" { return o }
+  return irBLetTemp(
+    b,
+    { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
+    ix,
+    rep,
+  )
+}
+
+// The lifted function's parameter for capture `n`, a union box, read unboxed at `rep` as
+// `captureUnboxRead` reads an environment's.
+function liftedCaptureUnboxRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
+  const fe = fnStmtsPosOf(ibFnIx)
+  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
+  const v = liftCapVar(fe, n.identName, -1)
+  if v < 0 { return irBMiss("capture unbox rep") }
+  const vr = ib.irVars[v].vRep
+  const c = repNodeAt(vr)
+  if (
+    !(c is RBox || c is RNullable && c.rnDisc == 4)
+    || repNodeOfTy(ib.irVars[v].vTy) != vr
+  ) {
+    return irBMiss("capture unbox lifted rep")
+  }
+  const ak = identUnboxAtomOf(ix, ibFnIx)
+  if ak < 0 { return irBMiss("capture unbox dead") }
+  const o: Opnd = { ov: v }
+  return irBLetTemp(
+    b,
+    { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
+    ix,
+    rep,
+  )
+}
+
+// Capture `n` read at `rep` as legacy's `capture` arm fetches it.
+function captureReadAt(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   const fe = fnStmtsPosOf(ibFnIx)
   const name = n.identName
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
