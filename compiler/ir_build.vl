@@ -321,6 +321,7 @@ import {
   objLitVariantLayoutOf,
   objLitVariantStashAt,
   objLitVariantStashOf,
+  plainCoalesceAt,
   popAnyPlanOf,
   popOrPlanOf,
   printArmOf,
@@ -458,6 +459,7 @@ import {
   EmptyFitPlan,
   arrLitIsForIter,
   coalBoxFieldScalarPlanOf,
+  coalDeadJoinIfOf,
   coalFieldPlanOf,
   coalNextArmOf,
   coalNullTestIf,
@@ -6840,8 +6842,59 @@ function coalesce(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
     if irBOpRep(v) != rep { return irBMiss("coalesce mapJoinIf rep") }
     return v
   }
+  // The operand as itself where its type rules out `null`, or a dead join legacy types at the
+  // join (`coalDeadJoinIfOf`), built as the valued `if` it is.
+  if (
+    arm == "retypedDead"
+    || arm == "pinNonNull"
+    || arm == "fieldFlat"
+    || arm == "popElem"
+  ) {
+    return coalAsBuilt(b, unwrapParen(n.binLeft), rep, arm)
+  }
+  if arm == "deadJoin" {
+    return coalAsBuilt(b, coalDeadJoinIfOf(n, ix, ibFnIx), rep, arm)
+  }
+  // A `null`-typed operand runs for its effect alone, then the default is the value.
+  if arm == "nulnone" {
+    const e = nulNoneEffect(b, n.binLeft, ix)
+    if ibMiss != "" { return e }
+    return coalAsBuilt(b, n.binRight, rep, arm)
+  }
   if arm != "mapIndexGetOr" { return irBMiss("coalesce " + arm) }
   return mapGetOr(b, n, ix, rep)
+}
+
+// A `null`-typed operand `x` run for its effect, as legacy's `emitNulNoneForEffect` writes it:
+// nothing for a `null` or a name, the receiver of a `?.`, both sides of a `??`, else the value
+// built and dropped. An if-expression is a miss.
+function nulNoneEffect(b: i32[], x: i32, ix: i32): Opnd {
+  const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
+  if nulNoneWritesNothing(x) { return none }
+  const u = unwrapParen(x)
+  if u < 0 { return irBMiss("coalesce nulnone effect") }
+  const n = nodeAt(u)
+  if n is IfStmt { return irBMiss("coalesce nulnone effect if") }
+  if n is OptMember { return nulNoneEffect(b, n.omObj, ix) }
+  const co = plainCoalesceAt(u)
+  if co != null {
+    const l = nulNoneEffect(b, co.binLeft, ix)
+    if ibMiss != "" { return l }
+    return nulNoneEffect(b, co.binRight, ix)
+  }
+  const v = irBExpr(b, u)
+  if ibMiss != "" { return v }
+  irBNode(b, { dpV: v }, -1, ibNoValue, ix)
+  return none
+}
+
+// Node `x` built as itself at the `??`'s rep `rep`, or the miss arm `arm` names.
+function coalAsBuilt(b: i32[], x: i32, rep: i32, arm: string): Opnd {
+  if x < 0 { return irBMiss("coalesce " + arm) }
+  const v = irBExpr(b, x)
+  if ibMiss != "" { return v }
+  if irBOpRep(v) != rep { return irBMiss("coalesce " + arm + " rep") }
+  return v
 }
 
 // `a ?? b ?? d` as legacy lowers it: the re-associated outer link `a ?? (b ?? d)` minted ahead of
