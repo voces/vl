@@ -5,6 +5,8 @@
 // and a type a checker arena index. Conversions arrive as one coercion node with `coercionAt`
 // (step I3).
 import { i32ToStr } from "./ast"
+import { RefJoin } from "./emit_plan_if_join"
+import { recordHeapOfTy } from "./emit_shape_intern"
 import { CoalValArm } from "./emit_plan_null"
 import { ArrLitArm } from "./emit_plan_list"
 import { LitIsArm } from "./emit_plan_union"
@@ -23,6 +25,7 @@ import {
   RUnsup,
   RpPrim,
   repNodeAt,
+  repTyOf,
 } from "./emit_rep"
 
 // An operand: a variable, an immediate of a primitive rep, or an interned string.
@@ -355,9 +358,9 @@ export type RMapHas = {
   mhKey: Opnd,
   mhAt: i32,
 }
-// A `==`/`!=` at node `seAt` on legacy's field-wise record compare: an operand legacy stashes
-// is lowered once; one it re-reads at every field is a variable.
-export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32 }
+// A `==`/`!=` at node `seAt` on legacy's field-wise record compare over eq row `seRow` (a struct's
+// or a variant's): an operand legacy stashes is lowered once; one it re-reads is a variable.
+export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32, seRow: i32 }
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
@@ -516,18 +519,20 @@ export type SForIn = {
   xfMapNonNull: boolean,
 }
 // `siElseKw`: the source wrote a live `else`, which legacy writes even when its arm is empty.
-// `siJoinAt`: the head of a reference join's chain, whose join every link opens at
-// (`emitIfExprRef`); else -1, and a valued `if` opens at its own.
+// `siJoin`, `siJoinNul`: a reference join decided for this `if` (a chain's head's, as
+// `emitIfExprRef` writes every link), and whether its blocktype is nullable; a null kind opens
+// at the `if`'s own.
 export type SIf = {
   siCond: Opnd,
   siThen: i32[],
   siElse: i32[],
   siOut: i32,
   siElseKw: boolean,
-  siJoinAt: i32,
+  siJoin: RefJoin,
+  siJoinNul: boolean,
 }
 
-// An `if` that opens at its own join (`siJoinAt` -1); only `refIfLink` names a chain's head.
+// An `if` that opens at its own join (no decided `siJoin`).
 export function sIf(
   c: Opnd,
   thenB: i32[],
@@ -541,7 +546,8 @@ export function sIf(
     siElse: elseB,
     siOut: out,
     siElseKw: elseKw,
-    siJoinAt: -1,
+    siJoin: { rjKind: null, rjSlot: -1 },
+    siJoinNul: false,
   }
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
@@ -630,6 +636,9 @@ export type IrFn = {
   // A door fragment (`lowerNodeIn`): its locals are checked against legacy's cells, so a walk's
   // element it did not build reads that element's legacy slot.
   irFragment: boolean,
+  // A closure thunk: one call forwarding its parameters, in tail form whatever the callee
+  // returns, as `emitCloThunkCode` writes it.
+  irThunk: boolean,
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -708,6 +717,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irPoolFill: false,
     irHelper: false,
     irFragment: false,
+    irThunk: false,
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -1451,6 +1461,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCoalStr |
       RJoinNull |
       RLitArms |
+      RNulNicheEq |
       RNulTest |
       RNullOf |
       RNumCast |
@@ -1516,7 +1527,6 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListNewDefault |
       RMemAccess |
       RMemOp |
-      RNulNicheEq |
       RNumUnionBin |
       RSimd |
       RStructEq |
@@ -1739,6 +1749,31 @@ function repsFillHoles(src: i32[], dst: i32[], inClo: boolean): boolean {
     i = i + 1
   }
   return true
+}
+
+// Whether a record at variant rep `src` is the record at plain rep `dst` as it stands: the same
+// fields, stored on one heap.
+export function recRetag(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RRecord) || !(d is RRecord) || !a.rrVariant || d.rrVariant {
+    return false
+  }
+  const h = recHeapOf(src)
+  if h < 0 || h != recHeapOf(dst) { return false }
+  if a.rrFields.length != d.rrFields.length { return false }
+  let i = 0
+  while i < a.rrFields.length {
+    if a.rrFields[i] != d.rrFields[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// The struct heap a value of record rep `r` is stored at (`recordHeapOfTy` of its type), or -1.
+export function recHeapOf(r: i32): i32 {
+  if !(repNodeAt(r) is RRecord) { return -1 }
+  return recordHeapOfTy(repTyOf(r))
 }
 
 // The record rep of list element `e`, under a `| null`, or -1.
