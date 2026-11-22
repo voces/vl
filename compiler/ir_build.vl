@@ -3016,7 +3016,15 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     return irBMiss("capture recover")
   }
   const cr = capRepFor(fe, name, rep)
-  if cr != rep && !capCellListSame(fe, name, cr, rep) {
+  // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
+  const na: NullNarrowArm = if cr != rep { nullNarrowArmOf(ix, cr, rep) } else { "none" }
+  const narrowed = na == "plain" || na == "held"
+  if cr != rep && !narrowed && !capCellListSame(fe, name, cr, rep) {
+    return irBMiss("capture binding")
+  }
+  // The capture is held at its binding's type, whose rep must be the one it is read at first.
+  const cty = if narrowed { capTyOf(fe, name) } else { -1 }
+  if narrowed && (cty < 0 || repNodeOfTy(cty) != cr) {
     return irBMiss("capture binding")
   }
   if !cloLifted(fe) {
@@ -3024,19 +3032,34 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     if listIsTestedIdent(unwrapParen(ix)) {
       return irBMiss("capture list test")
     }
-    return irBLetTemp(
-      b,
-      { evSlot: captureSlotOf(name, ibFnIx), evAt: ix },
-      ix,
-      cr,
-    )
+    const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
+    if !narrowed { return irBLetTemp(b, ev, ix, cr) }
+    return captureRecover(b, irBLetTempTy(b, ev, ix, cr, cty), ix, rep, na)
   }
   if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
   const v = liftCapVar(fe, name, rep)
-  if v < 0 || ib.irVars[v].vRep != rep { return irBMiss("capture binding") }
+  const held = if narrowed { cr } else { rep }
+  if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
-  return o
+  return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// Narrowed capture read `ix` of `o` at its member `rep`, on `nullNarrowArmOf`'s arm `na`: what
+// `emitCapturedRead` leaves, then `emitReadRecover`'s `ref.as_non_null` where the read owes it.
+function captureRecover(
+  b: i32[],
+  o: Opnd,
+  ix: i32,
+  rep: i32,
+  na: NullNarrowArm,
+): Opnd {
+  const nn = if readOwesNonNullRecover(ix, ibFnIx) { 1 } else { 0 }
+  const r: Rhs = { rcV: o, rcAt: ix, rcNn: nn }
+  if na == "held" {
+    return irBLetTempTy(b, r, ix, rep, recoveredReadTyOf(heldTy(exprTyOf(ix))))
+  }
+  return irBLetTemp(b, r, ix, rep)
 }
 
 // Whether capture `name` of `fe`, held at list `cr`, is the list `rep` a read asks for: legacy's
