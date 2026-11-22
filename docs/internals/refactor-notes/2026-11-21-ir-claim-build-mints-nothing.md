@@ -10,7 +10,7 @@ claimable and its global section reordered.
 
 ## The change
 
-- `ssAskOnly`, set by `strInPlaceModeAsked` and `strSiteOfRhsAsked`, makes `strSiteArmsAt` ask
+- `strInPlaceModeAsked` and `strSiteOfRhsAsked` pass `ask` to `strSiteArmsAt`, which then asks
   `synthSitePairAvailable`, which mints nothing. The builder uses the asked forms.
   `synthSitePairIdx` asks the same predicate, so the condition is one.
 - Legacy asks the arm at every assignment, in `emitAssignUnder` (`strSiteArm`). The builder notes
