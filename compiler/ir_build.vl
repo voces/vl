@@ -535,6 +535,7 @@ import {
   letBindRep,
   letBindRepClaims,
   letBindTy,
+  letCellSlot,
   letNulMapReadUnionBox,
   localIndexOf,
   mapShapeOfExpr,
@@ -3275,9 +3276,21 @@ function nullNarrowArmOf(ix: i32, cellRep: i32, rep: i32): NullNarrowArm {
 function globalRep(g: i32, d: i32): i32 {
   const noted = irGlobalRepOf(ib, g)
   if noted >= 0 { return noted }
-  const r = globalTyRep(scopeTyAt(d, -1))
+  const r = heldCellRep(d, globalTyRep(scopeTyAt(d, -1)))
   if r >= 0 { irGlobalNote(ib, g, r) }
   return r
+}
+
+// The rep of a closure-typed global at `d` (rep `r`) that legacy holds as a struct
+// (`globalCellKind`), a returned bundle record held whole: its cell row's record (`letCellSlot`).
+function heldCellRep(d: i32, r: i32): i32 {
+  if r < 0 || !(repNodeAt(r) is RClosure) || globalCellKind(d) != "struct" {
+    return r
+  }
+  const row = letCellSlot(d, -1, "struct")
+  const rt = if row >= 0 && row < sTyIx.length { sTyIx[row] } else { -1 }
+  const rr = if rt >= 0 && !irTyOpen(rt) { repNodeOfTy(rt) } else { -1 }
+  return if rr >= 0 && repNodeAt(rr) is RRecord { rr } else { r }
 }
 
 // The rep a global held at type `ty` takes; -1 when it is no scalar.
@@ -7384,9 +7397,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       if si >= 0 && ib.irSigRet[si] != rep {
         // A record call whose type keys the row its callee returns is built at the callee's rep.
         const sr = ib.irSigRet[si]
+        // A call of a function legacy returns a bundle record from (`fnBundleRetSigs`) is that record.
+        const bundle = repNodeAt(sr) is RRecord
+          && repNodeAt(rep) is RClosure
+          && fnBundleRetSigs(rhs.caCallee).length > 0
         if (
           !(repNodeAt(sr) is RRecord)
-          || !callAtCalleeResultRow(ix, rhs.caCallee)
+          || !bundle && !callAtCalleeResultRow(ix, rhs.caCallee)
         ) {
           return irBMiss("call result coercion")
         }
@@ -9492,7 +9509,7 @@ function globalInitVariant(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
 // and this build's reads of the global then meet that rep (D14426, DECISIONS.md).
 function globalInitValue(b: i32[], gi: i32, gst: i32, init: i32): Opnd {
   const noted = irGlobalRepOf(ib, gi)
-  const rep = if noted >= 0 { noted } else { globalTyRep(scopeTyAt(gst, -1)) }
+  const rep = if noted >= 0 { noted } else { heldCellRep(gst, globalTyRep(scopeTyAt(gst, -1))) }
   if rep < 0 { return irBMiss("global initializer rep") }
   const v = deliver(b, init, rep, -1)
   if ibMiss != "" { return v }
