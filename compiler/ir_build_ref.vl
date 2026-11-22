@@ -54,6 +54,7 @@ import {
   irUnionEqHook,
   irVarRepOkHook,
   mapGetBare,
+  storedReadOf,
 } from "./ir_build"
 import {
   irLoopCloseHook,
@@ -63,7 +64,7 @@ import {
   irLowerListHook,
   irLowerListSetHook,
 } from "./ir_lower"
-import { irBoundsRuleHook, openRepTakes } from "./ir_verify"
+import { irBoundsRuleHook, openRepTakes, undeclaredRepTakes } from "./ir_verify"
 import {
   irLowerRefBounds,
   irLowerRefEffect,
@@ -92,6 +93,7 @@ import { nodeTyAt } from "./emit_capture_frames"
 import {
   REF_READ_CONTAINER,
   SRT_NARROW,
+  eqRouteOf,
   idxArmOf,
   irNodeInShadowHook,
   listCatRouteOf,
@@ -112,11 +114,13 @@ import {
   strOrderSwaps,
   strSiteOfRhsAsked,
   unionFieldNarrowUnboxOf,
+  unionUnionEqArmOf,
 } from "./wasmEmit"
 import { memFieldUnionBox, narrowedFieldIsUnionBox } from "./emit_plan_union"
 import {
   narrowedFieldPlain,
   structFieldPlain,
+  unionEqNameless,
   unionUnionEqStagedOf,
   variantFieldPlain,
 } from "./emit_plan_union"
@@ -218,10 +222,14 @@ function buildIndex(b: i32[], ix: i32, rep: i32): Opnd {
     && idxArmOf(n, fnIx) == "ref"
     && listElemStaysNullable(n.idxArr, fnIx)
     && listReadProvedNonNull(ix)
-  // An element read at an open type takes the element as it is stored (`openRepTakes`).
+  // An element read at an open type takes the element as it is stored (`openRepTakes`), or, of
+  // a list read at its declared storage (`storedReadOf`), as that wrapper's array holds it.
+  const ety = nodeTyAt(ix, fnIx)
+  const declared = v is OVar && storedReadOf(n.idxArr) == v.ov
   const stored = vr is RList
     && vr.rlsElem != rep
-    && openRepTakes(nodeTyAt(ix, fnIx), rep, vr.rlsElem)
+    && (openRepTakes(ety, rep, vr.rlsElem)
+    || declared && undeclaredRepTakes(ety, rep, vr.rlsElem))
   if (
     vr is RList
     && vr.rlsElem != rep
@@ -466,9 +474,21 @@ function buildStrBin(b: i32[], ix: i32, rep: i32): Opnd {
   return irBLetTemp(b, { soOp: op, soArgs: args, soAt: at }, ix, rep)
 }
 
+// Whether compare `ix` is legacy's union compare over two boxes: its staged compare, or on
+// `eqRouteOf`'s `unionUnion` over two named operands, the struct union arm of `unionUnionEqArmOf`.
 function unionEqOf(ix: i32, fnIx: i32): boolean {
   const n = nodeAt(ix)
-  return n is BinExpr && unionUnionEqStagedOf(n, fnIx)
+  if !(n is BinExpr) { return false }
+  if unionUnionEqStagedOf(n, fnIx) { return true }
+  if eqRouteOf(n, ix, fnIx) != "unionUnion" { return false }
+  if unionEqNameless(n.binLeft, fnIx) || unionEqNameless(n.binRight, fnIx) {
+    return false
+  }
+  const arms: i32[] = []
+  const vis: i32[] = []
+  const aks: i32[] = []
+  return unionUnionEqArmOf(n.binLeft, n.binRight, fnIx, arms, vis, aks)
+    == "struct"
 }
 
 function listEqOf(ix: i32, fnIx: i32): boolean {

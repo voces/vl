@@ -6,6 +6,7 @@
 // (step I3).
 import { i32ToStr } from "./ast"
 import { RefJoin } from "./emit_plan_if_join"
+import { recordHeapOfTy } from "./emit_shape_intern"
 import { CoalValArm } from "./emit_plan_null"
 import { ArrLitArm } from "./emit_plan_list"
 import { LitIsArm } from "./emit_plan_union"
@@ -24,6 +25,7 @@ import {
   RUnsup,
   RpPrim,
   repNodeAt,
+  repTyOf,
 } from "./emit_rep"
 
 // An operand: a variable, an immediate of a primitive rep, or an interned string.
@@ -213,11 +215,12 @@ export type RRetNull = { rnrAt: i32 }
 // A reference join's bare `null` arm: the `ref.null` of join kind `jnKind`'s heap at row `jnSlot`,
 // as legacy writes it (`fbRefNullOfKind`). The builder takes both from `ifRefJoinOf` once.
 export type RJoinNull = { jnKind: VKind, jnSlot: i32 }
+// A `==`/`!=` at node `neAt` on legacy's `nulNiche` route over nullable operands `neL` and `neR`,
+// under the null guard `nulNicheEqHead` opens; the guard writes the right operand twice, `neR`
+// and then `neR2`, which is `neR` for a variable and a second build of the operand otherwise.
+export type RNulNicheEq = { neL: Opnd, neR: Opnd, neR2: Opnd, neAt: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
-// A `==`/`!=` at node `neAt` on legacy's `nulNiche` route over nullable operands `neL` and `neR`,
-// under the null guard `nulNicheEqHead` opens; the guard reads `neR` twice.
-export type RNulNicheEq = { neL: Opnd, neR: Opnd, neAt: i32 }
 export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
 // The `==` (or, with `aeNe`, `!=`) of two atoms at compare node `aeAt`. `aeStatic` 1 or 2 names
 // the left or right side typed as one string literal, whose id comes from its lexeme: its operand
@@ -231,7 +234,7 @@ export type RAtomEq = {
   aeAt: i32,
 }
 // The `==` (or, with `ueNe`, `!=`) of two union boxes at compare node `ueAt`, written by legacy's
-// staged compare (`unionUnionEqTail`) over the two operands.
+// compare over the two operands (`unionUnionBoxesTail`): the struct union's, or the staged one.
 // A union box `ucBox` against concrete `ucOther` at compare node `ucAt` (`ucSwap` where the box
 // is the right side), by legacy's plan: the box's tag, its payload, the operand and the compare.
 export type RUnionConcreteEq = {
@@ -356,9 +359,9 @@ export type RMapHas = {
   mhKey: Opnd,
   mhAt: i32,
 }
-// A `==`/`!=` at node `seAt` on legacy's field-wise record compare: an operand legacy stashes
-// is lowered once; one it re-reads at every field is a variable.
-export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32 }
+// A `==`/`!=` at node `seAt` on legacy's field-wise record compare over eq row `seRow` (a struct's
+// or a variant's): an operand legacy stashes is lowered once; one it re-reads is a variable.
+export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32, seRow: i32 }
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
@@ -617,6 +620,9 @@ export type IrVar = { vRep: i32, vTy: i32, vKind: VarKind, vSlot: i32 }
 // One function: the node arena with each node's type, rep and source node, the variables, the
 // top-level body, the parameters and result, and the signatures of the functions and the reps of
 // the globals it uses, and the source statement that built each run of nodes (`irSpan*`).
+// A spread literal `sqAt` and its build's kind and slot (`irSpreadPair`).
+export type SpreadPairNote = { sqAt: i32, sqKind: i32, sqSlot: i32 }
+
 export type IrFn = {
   irNodes: IrNode[],
   irNodeTy: i32[],
@@ -636,6 +642,9 @@ export type IrFn = {
   // A door fragment (`lowerNodeIn`): its locals are checked against legacy's cells, so a walk's
   // element it did not build reads that element's legacy slot.
   irFragment: boolean,
+  // A closure thunk: one call forwarding its parameters, in tail form whatever the callee
+  // returns, as `emitCloThunkCode` writes it.
+  irThunk: boolean,
   irSigFn: i32[],
   irSigParams: i32[][],
   irSigRet: i32[],
@@ -662,6 +671,9 @@ export type IrFn = {
   // lowering asks legacy's site arm there, as `emitAssignUnder` does, which mints its global pair.
   irSiteArmAt: {[i32]: i32},
   irHasSiteArms: boolean,
+  // The spread literal whose groups' writing opens at each node, where the builder found its list
+  // pair unminted: the lowering asks the pair there, before the groups, as `emitArrSpread` does.
+  irSpreadPair: {[i32]: SpreadPairNote},
   // The variable each name read the builder took as a plain read of it, by the read's node.
   irReadVar: {[i32]: i32},
   // The union map read a delivery is building where legacy's box ladder reads it past `emitExpr`
@@ -671,6 +683,8 @@ export type IrFn = {
   irReadAgain: {[i32]: Rhs},
   // A list read the builder built at a node over a variable or an immediate, written again as built.
   irReadElem: {[i32]: Rhs},
+  // How many times the lowering has read the receiver of the literal arms it is writing.
+  irLitReads: i32,
   // The plain field reads the builder built, by the read's node: its object read again, then the
   // field. With `irReadVar` and `irReadAgain`, how the loop prologue reads its receivers.
   irReadField: {[i32]: i32},
@@ -714,6 +728,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irPoolFill: false,
     irHelper: false,
     irFragment: false,
+    irThunk: false,
     irSigFn: [],
     irSigParams: [],
     irSigRet: [],
@@ -732,12 +747,14 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHasRowOpens: false,
     irSiteArmAt: Map(),
     irHasSiteArms: false,
+    irSpreadPair: Map(),
     irReadVar: Map(),
     irUnbankedRead: -1,
     irNoTail: [],
     irNoTailEff: [],
     irReadAgain: Map(),
     irReadElem: Map(),
+    irLitReads: 0,
     irReadField: Map(),
   }
   return f
@@ -1112,7 +1129,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RRetNull => []
     RJoinNull => []
     RNulTest => [r.ntV]
-    RNulNicheEq => [r.neL, r.neR]
+    RNulNicheEq => [r.neL, r.neR, r.neR2]
     RAtomEq => [r.aeL, r.aeR]
     RAsUnion => [r.auV]
     RTagStash => [r.tgsV]
@@ -1192,7 +1209,13 @@ function rhsText(r: Rhs): string {
     RRetNull => "return null"
     RJoinNull => "join null"
     RNulTest => "isnull " + opndText(r.ntV)
-    RNulNicheEq => "nulniche_eq(" + opndText(r.neL) + ", " + opndText(r.neR) + ")"
+    RNulNicheEq => "nulniche_eq("
+      + opndText(r.neL)
+      + ", "
+      + opndText(r.neR)
+      + ", "
+      + opndText(r.neR2)
+      + ")"
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
@@ -1465,6 +1488,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCoalStr |
       RJoinNull |
       RLitArms |
+      RNulNicheEq |
       RNulTest |
       RNullOf |
       RNumCast |
@@ -1530,7 +1554,6 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListNewDefault |
       RMemAccess |
       RMemOp |
-      RNulNicheEq |
       RNumUnionBin |
       RSimd |
       RStructEq |
@@ -1753,6 +1776,31 @@ function repsFillHoles(src: i32[], dst: i32[], inClo: boolean): boolean {
     i = i + 1
   }
   return true
+}
+
+// Whether a record at variant rep `src` is the record at plain rep `dst` as it stands: the same
+// fields, stored on one heap.
+export function recRetag(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RRecord) || !(d is RRecord) || !a.rrVariant || d.rrVariant {
+    return false
+  }
+  const h = recHeapOf(src)
+  if h < 0 || h != recHeapOf(dst) { return false }
+  if a.rrFields.length != d.rrFields.length { return false }
+  let i = 0
+  while i < a.rrFields.length {
+    if a.rrFields[i] != d.rrFields[i] { return false }
+    i = i + 1
+  }
+  return true
+}
+
+// The struct heap a value of record rep `r` is stored at (`recordHeapOfTy` of its type), or -1.
+export function recHeapOf(r: i32): i32 {
+  if !(repNodeAt(r) is RRecord) { return -1 }
+  return recordHeapOfTy(repTyOf(r))
 }
 
 // The record rep of list element `e`, under a `| null`, or -1.
