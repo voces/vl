@@ -29,4 +29,11 @@ On fixpoint seeds of master e48f0bff and of this branch:
 - `wasm-dis` shows each move as a swap of local declarations and the indices that read them.
 - The compiler itself has no moved site (`--names`: `self-compile identical`).
 
-The per-site split and the moved list are in the PR.
+Split by site, with three compilers that each carry one reorder:
+
+- the union `print`: 521 programs;
+- the shared read's stash: 8;
+- `boxFieldScalar`: 0, since no program's operand mints a local before that slot today.
+
+No program moves under two sites. The list, one line per program with its site, is
+`2026-11-22-legacy-shared-slot-after-operand.moved.txt`.
