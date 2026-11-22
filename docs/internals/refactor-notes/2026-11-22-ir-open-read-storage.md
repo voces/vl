@@ -18,16 +18,25 @@ slot coercions behind it, refused the program. Reads and destinations now agree 
 * A list of hole functions gets no wrapper slot from its open element type, so those reads stay
   named misses rather than a shape rule.
 
-## Readings (base a00578d1f, fixpoint seeds on both sides)
+## Readings (fixpoint seeds on both sides)
+
+Against master 102aa9a17, after merging it:
 
 | reading | base | this change |
 | --- | ---: | ---: |
-| the 47 tests/cases files carrying the rows, covered (= matched, no fail) | 404 | 434 |
-| tests/cases armed shadow covered / matched | 67,472 / 67,471 | 67,538 / 67,537 (same single fail row) |
+| the 47 tests/cases files carrying the rows, covered (= matched, no fail) | 406 | 434 |
+| tests/cases armed shadow covered / matched | 67,830 / 67,829 | 67,874 / 67,873 (same single fail row) |
+
+Against the branch point a00578d1f, before the merge:
+
+| reading | base | this change |
+| --- | ---: | ---: |
 | corpus functions with no blocker | 44,857 | 44,884 |
 | corpus `return coercion` | 38 | 12 |
 | corpus `object field coercion` | 3 | 2 |
 | self-compile functions with no blocker | 19,716 | 19,716 |
 
-Identity (`--names`, mode 3, `--cases`, claimless): 0 differ. Late demands 9 = baseline, late tag
-rows 307 = baseline. L2 fuel +0.09% on the base. Legacy lines deleted: 0. Moved to `@ir`: 0.
+The return admission composes with #9472's list retag: the retag temp is built first, and a value
+still at another rep is taken only where `openRepTakes` holds. Identity (`--names`, mode 3,
+`--cases`, claimless): 0 differ. Late demands 9 = baseline, late tag rows 307 = baseline. L2 fuel
++0.09% on the base. Legacy lines deleted: 0. Moved to `@ir`: 0.
