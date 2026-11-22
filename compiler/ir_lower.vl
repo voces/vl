@@ -10,6 +10,7 @@ import { recIsVariant } from "./ir_verify"
 import { printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
+import { slotRowTyOf } from "./emit_rep"
 import {
   RAtom,
   RBox,
@@ -101,6 +102,7 @@ import {
   OStr,
   OVar,
   Opnd,
+  RArmUnbox,
   RAsUnion,
   RAtomEq,
   RAtomStr,
@@ -168,6 +170,7 @@ import {
   RRecCopyPure,
   RRecover,
   RRel,
+  RResultPick,
   RRetNull,
   RRetag,
   RSharedRead,
@@ -308,6 +311,7 @@ import {
   atomicTail,
   boxTagIsTail,
   bundlePickOf,
+  bundleResultPickOf,
   callRefCallTail,
   callRefEnvOpen,
   callRefStash,
@@ -326,6 +330,7 @@ import {
   coalNulRefJoinPresent,
   coalNulRefOpen,
   coalNulRefPlanOf,
+  emitArmUnboxAt,
   emitAsUnionTagged,
   emitCapturedRead,
   emitClosureIds,
@@ -1070,6 +1075,7 @@ function rhs(r: Rhs, tail: boolean) {
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
     RNicheRead => nicheRead(r)
+    RArmUnbox => armUnbox(r)
     RRecCopyPure => {
       leaf()
       recCopyPureEmit(r.rpAt, lw.irAt)
@@ -1102,6 +1108,7 @@ function rhs(r: Rhs, tail: boolean) {
     REnvGet => envGet(r)
     REnvDrop => irLMiss("env drop as a value")
     RBundlePick => bundlePick(r)
+    RResultPick => resultPick(r)
     RMakeList => makeList(r)
     RSpread => spreadList(r)
     RMapNew => {
@@ -1475,6 +1482,15 @@ function bundlePick(r: RBundlePick) {
   const pk = bundlePickOf(r.bpAt, lw.irAt)
   if pk.bpField < 0 { return irLMiss("bundle pick") }
   irLOpnd(r.bpV)
+  fbStructGet(pk.bpHeap, pk.bpField)
+  return 0
+}
+
+// `RResultPick`: the returned record, then the member legacy's `emitBundleResultPick` picks.
+function resultPick(r: RResultPick) {
+  const pk = bundleResultPickOf(r.rkAt, r.rkFe, lw.irAt)
+  if pk.bpField < 0 { return irLMiss("result pick") }
+  irLOpnd(r.rkV)
   fbStructGet(pk.bpHeap, pk.bpField)
   return 0
 }
@@ -1907,6 +1923,13 @@ function boxNarrow(r: RBoxNarrow) {
 function nicheRead(r: RNicheRead) {
   irLOpnd(r.nrV)
   return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+}
+
+// `RArmUnbox`: the box, then the table's cast to the read's arm record (`emitArmUnboxAt`).
+function armUnbox(r: RArmUnbox) {
+  irLOpnd(r.uaV)
+  if emitArmUnboxAt(r.uaAt, lw.irAt) < 0 { return irLMiss("arm unbox heap") }
+  return 0
 }
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
@@ -4155,6 +4178,15 @@ export function irSlotRunAgrees(rep: i32, slot: i32): boolean {
   const t = valtypeOf(rep)
   const scalarRun = b[0] >= 0x7b && b[0] <= 0x7f
   return if t >= 0 { b.length == 1 && b[0] == t } else { !scalarRun }
+}
+
+// The record type of the struct row legacy declares wasm local `slot` at (`slotRowTyOf`), or -1
+// for a parameter's slot, an unset one or a local of another kind.
+export function irSlotRowTy(slot: i32): i32 {
+  const li = slot - fbFrameParams
+  if li < 0 || li >= localIsRef.length || fbLocalIsUnsetRef(li) { return -1 }
+  if localIsRef[li] != "struct" { return -1 }
+  return slotRowTyOf(localStructIdx[li])
 }
 
 // The valtype bytes legacy declares wasm local `slot` of the frame it is writing at; none for a
