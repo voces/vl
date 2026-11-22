@@ -9,12 +9,12 @@ first: `letBindTy` in rule 2's `globalReadAtTyOrStorage`.
   `irGlobalStoreNote`: the storage-row type of each global the function notes, kept beside its rep
   as `irGlobalNote` keeps the rep (#9550).
 - One builder helper, `globalNoteAt(g, d, rep)` (ir_build.vl), replaces `irGlobalNote` at all
-  five global-note sites. The first time, it records `letBindTy(d, -1)`. A later note with a
+  five global-note sites, and the identRead map-cell note from #9584,. The first time, it records `letBindTy(d, -1)`. A later note with a
   different type is a named miss, `global storage row disagrees`.
 - `globalReadAtTyOrStorage(sym, dst, at)` accepts a read off its checked type's rep only at
   `repNodeOfTy(irGlobalStoreTyOf(vf, sym))`. That is the old check's exact semantics, read from the
   IR. ir_verify drops `letBindTy` and `identDeclOf`.
-- Verifier self-test case 27 is refused under rule 2: a read that neither the checked type nor
+- Verifier self-test `global-read-off-store-type` is refused under rule 2: a read that neither the checked type nor
   the recorded store type justifies.
 
 ## Control
