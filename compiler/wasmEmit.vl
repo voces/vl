@@ -1746,6 +1746,7 @@ import {
 } from "./emit_plan_null"
 import {
   AtomEqArm,
+  AtomEqPlan,
   HoleBox,
   IdentReadArm,
   IsArm,
@@ -24444,6 +24445,28 @@ export function numCastSrcRepOf(obj: i32, fnIx: i32): string {
   return "i32"
 }
 
+// The type `u as? N` over a type-parameter operand is pinned at in this instance, or -1: the
+// instance's elaboration of the operand, a capture's included (D3654), or for a gradual union's
+// operand the instance re-typed at a scalar, that scalar.
+function holeOptPinTy(e: AsExpr, exprIx: i32, fnIx: i32): i32 {
+  const ext = instanceOperandTyOf(e.asObj, fnIx)
+  if ext >= 0 { return ext }
+  if monoGradualAsScalar.get(exprIx) ?? false { return nodeTyIxOf(e.asObj) }
+  return -1
+}
+
+// The number `u as? N` over a type-parameter operand converts from when its cast can fail at
+// this pin, which `emitHoleNumAsOpt` writes as the exact cast; "" for every other pin.
+function holeOptExactSrc(exprIx: i32, fnIx: i32): string {
+  const e = nodeAt(exprIx)
+  if !(e is AsExpr) { return "" }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
+  if ext < 0 { return "" }
+  const src = primNameStr(primNameOf(ext))
+  if src != "i32" && src != "i64" && src != "f32" && src != "f64" { return "" }
+  return if numCastCanFail(src, asExprNumCastDomain(exprIx)) { src } else { "" }
+}
+
 // `u as? N` over a type-parameter operand pinned at a number or a `boolean`: `N | null` at every
 // pin (D2754), so a cast that cannot fail at this pin still boxes its value, and one that can
 // takes the exact-or-fail box.
@@ -24460,13 +24483,7 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
         + " | null` row was never registered",
     )
   }
-  // The instance's exact pin decides: a number converts, any other type is never the target.
-  // A hole's operand, a capture's included, reads the instance's elaboration (D3654).
-  let ext = instanceOperandTyOf(e.asObj, fnIx)
-  // A gradual union's operand the instance re-typed at a scalar carries that scalar itself.
-  if ext < 0 && (monoGradualAsScalar.get(exprIx) ?? false) {
-    ext = nodeTyIxOf(e.asObj)
-  }
+  const ext = holeOptPinTy(e, exprIx, fnIx)
   if ext < 0 {
     return emitFail(
       "emitProgram: `as? "
@@ -24482,9 +24499,8 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
     fbStructNew(uBoxIdx)
     return 0
   }
-  if numCastCanFail(src, asExprNumCastDomain(exprIx)) {
-    return emitNumExactCastFrom(e, exprIx, src, fnIx)
-  }
+  const xs = holeOptExactSrc(exprIx, fnIx)
+  if xs != "" { return emitNumExactCastFrom(e, exprIx, xs, fnIx) }
   fbI32Rel(RS_TAG, scalarTagOfKind(nck))
   if emitNumPlainCast(e.asObj, tgt, fnIx) < 0 { return -1 }
   fbStructNew(nvb)
@@ -24494,16 +24510,22 @@ function emitHoleNumAsOpt(e: AsExpr, exprIx: i32, fnIx: i32) {
 
 // The value kind the cast at `exprIx` builds its operand at, where its arm is an operand and a
 // tail (`numCastTail`): the plain conversion, the wrap that is neither a literal fold nor a
-// narrowed mask, and `as!`. -1 for every other arm, which writes its operand its own way.
+// narrowed mask, the exact `as!` and `as?`, and a type-parameter operand's exact `as!` and
+// failing `as?` at its pin. -1 for every other arm, which writes its operand its own way.
 export function numCastKindOf(exprIx: i32, fnIx: i32): i32 {
   const e = nodeAt(exprIx)
   if !(e is AsExpr) { return -1 }
   return match asCastArmOf(exprIx, fnIx) {
     "plain" => numPlainCastKind(numCastSrcRepOf(e.asObj, fnIx), e.asTy)
     "wrap" => if asWrapArmOf(exprIx, fnIx) == "plain" { numWrapCastKind(exprIx, fnIx) } else { -1 }
-    "exact" => if e.asMode == "trap" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
+    "exact" => if e.asMode == "trap" || e.asMode == "null" { numExactCastKind(asExprNumSrcName(exprIx)) } else { -1 }
+    "holeExact" => if e.asMode == "trap" { numExactCastKind(asExprHolePinSrc(exprIx, fnIx)) } else { -1 }
+    "holeOpt" => {
+      const hs = holeOptExactSrc(exprIx, fnIx)
+      if hs != "" { numExactCastKind(hs) } else { -1 }
+    }
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => -1
-    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => -1
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => -1
     "union" | "notCast" => -1
   }
 }
@@ -24528,7 +24550,9 @@ export function numCastTail(exprIx: i32, fnIx: i32): i32 {
     "wrap" => numWrapCastTail(exprIx, fnIx)
     "exact" => numExactCastTail(exprIx, asExprNumSrcName(exprIx), fnIx)
     "zextLoad" | "v128" | "instMiss" | "litAtom" | "numLitScalar" | "numUnion" => numCastNoTail()
-    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" | "holeExact" | "holeOpt" => numCastNoTail()
+    "holeExact" => numExactCastTail(exprIx, asExprHolePinSrc(exprIx, fnIx), fnIx)
+    "holeOpt" => numExactCastTail(exprIx, holeOptExactSrc(exprIx, fnIx), fnIx)
+    "mapProbeTrap" | "mapOptBox" | "mapOptRead" | "holeMiss" => numCastNoTail()
     "union" | "notCast" => numCastNoTail()
   }
 }
@@ -27527,12 +27551,15 @@ function emitCallRefArg(
     "armUnbox" => {
       const cvSlot = sigParamSlotAt(ckey, i)
       if emitExpr(args[i], fnIx) < 0 { return -1 }
-      if exprUnion(args[i], fnIx) {
-        if variantHasCrossTagFits(cvSlot, args[i], fnIx) {
+      match armUnboxPlanOf(cvSlot, args[i], fnIx) {
+        "asIs" => {}
+        "crossTag" => {
           return emitFailCrossTagDelivery(args[i], cvSlot)
         }
-        fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
-        fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        "unbox" => {
+          fbStructGet(uBoxIdx, 1)        // 0xfb 0x02 <box ht> field 1: value (anyref)
+          fbRefCast(variantHeap(cvSlot)) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+        }
       }
     }
     "nulArm" => {
@@ -27578,10 +27605,19 @@ function emitCallRefArg(
   return if argPlainArm { 1 } else { 0 }
 }
 
+// How `emitCallRefArg`'s `armUnbox` arm writes argument `a` into the arm at variant slot `slot`:
+// as it stands, unboxed from its union's box, or refused where another arm's tag fits it.
+type ArmUnboxPlan = "asIs" | "unbox" | "crossTag"
+
+function armUnboxPlanOf(slot: i32, a: i32, fnIx: i32): ArmUnboxPlan {
+  if !exprUnion(a, fnIx) { return "asIs" }
+  return if variantHasCrossTagFits(slot, a, fnIx) { "crossTag" } else { "unbox" }
+}
+
 // Whether argument `a` is one the IR writes as `emitCallRefArg` does: a widening into a wider
 // number, a union parameter's box, or the general arm with nothing owed at a scalar of the
-// argument's own width (a boolean into an `i32`), a string, a record neither unboxed from a
-// narrowing nor nullable, or a non-null closure, list or map.
+// argument's own width (a boolean into an `i32`), a string, a record or union arm neither unboxed
+// from a narrowing nor nullable, or a non-null closure, list or map.
 export function callRefArgPlain(
   callIx: i32,
   fnIx: i32,
@@ -27600,13 +27636,16 @@ export function callRefArgPlain(
     return true
   }
   const k = sigParamKindAt(ckey, i)
+  if arm == "armUnbox" {
+    return armUnboxPlanOf(sigParamSlotAt(ckey, i), a, fnIx) == "unbox"
+  }
   if arm == "scalarList" {
     return k != null && !isNulScalarListKind(k) && plainListArg(a, fnIx)
   }
   if arm != "general" { return false }
   if tyIsLitUnion(nodeTyAt(a, fnIx)) { return false }
   if k == "str" { return true }
-  if k == "struct" {
+  if k == "struct" || k == "variant" {
     return !narrowedArmNeedsUnbox(a, fnIx) && !exprNullableRecord(a, fnIx)
   }
   if k == "closure" { return !exprNulClosure(a, fnIx) }
@@ -33987,13 +34026,23 @@ function reserveListKindOfSlot(k: VKind): ListKind | null {
 }
 
 // `emitCallStmt`'s arm over a named callee `f(…)`: the call, then a `drop` unless the callee is
-// void (`print`, a void intrinsic or host import, a void function or closure). Returns 0, or -1
-// once failed.
+// void (`callStmtIdentDrops`). Returns 0, or -1 once failed.
 function emitCallStmtIdent(s: Call, callee: Ident, stmtIx: i32, fnIx: i32) {
-  // A bare call whose RESULT is discarded (a helper invoked for its side
-  // effects): emit the call, then `drop` the value it leaves — EXCEPT `print`
-  // (a void import) and a VOID function (`()->()` leaves nothing).
   if emitCall(stmtIx, fnIx) < 0 { return -1 }
+  if callStmtIdentDrops(s, callee, stmtIx, fnIx) {
+    fbDrop() // 0x1a drop
+  }
+  return 0
+}
+
+// Whether call statement `stmtIx` through named callee `callee` drops the value it leaves: not
+// for `print`, a void intrinsic or host import, or a void function or closure.
+export function callStmtIdentDrops(
+  s: Call,
+  callee: Ident,
+  stmtIx: i32,
+  fnIx: i32,
+): boolean {
   let dropIt = callee.identName != "print"
   // The void memory intrinsics leave nothing on the stack.
   if callee.identName == "__store_i32__" { dropIt = false }
@@ -34032,10 +34081,7 @@ function emitCallStmtIdent(s: Call, callee: Ident, stmtIx: i32, fnIx: i32) {
       }
     }
   }
-  if dropIt {
-    fbDrop() // 0x1a drop
-  }
-  return 0
+  return dropIt
 }
 
 function emitCallStmt(s: Call, stmtIx: i32, fnIx: i32) {
@@ -40499,21 +40545,30 @@ function emitEqRoute(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   }
 }
 
+// After a folded atom compare's side: the side's id dropped, the compare being a constant.
+export function atomFoldSideTail() { fbDrop() }
+
+// After both folded sides: whether the two literals of plan `aq` are the same value, as 1 or 0
+// (`!=` when `ne`).
+export function atomFoldTail(aq: AtomEqPlan, ne: boolean): i32 {
+  if strLexSameValue(aq.aqLex, aq.aqLexR) == !ne {
+    fbI32Const(1)
+  } else {
+    fbI32Const(0)
+  }
+  return 0
+}
+
 // An atom compare by its plan (`atomEqPlanOf`): two string-literal types fold, a literal beside
 // an atom is its interned id, two atoms compare their ids. Both operands evaluate (D2156).
 function emitAtomEqByPlan(e: BinExpr, fnIx: i32): i32 {
   const aq = atomEqPlanOf(e, fnIx)
   if aq.aqArm == "fold" {
     if emitStaticLitAtom(e.binLeft, aq.aqLex, fnIx) < 0 { return -1 }
-    fbDrop()
+    atomFoldSideTail()
     if emitStaticLitAtom(e.binRight, aq.aqLexR, fnIx) < 0 { return -1 }
-    fbDrop()
-    if strLexSameValue(aq.aqLex, aq.aqLexR) == (e.binOp == "==") {
-      fbI32Const(1)
-    } else {
-      fbI32Const(0)
-    }
-    return 0
+    atomFoldSideTail()
+    return atomFoldTail(aq, e.binOp == "!=")
   }
   if aq.aqArm == "static" {
     if aq.aqStaticLeft {

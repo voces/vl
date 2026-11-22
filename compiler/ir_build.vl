@@ -112,6 +112,7 @@ import {
   irVarNew,
 } from "./ir"
 import {
+  listRetag,
   repBoolNiche,
   repBoxCore,
   repIsNoValue,
@@ -161,6 +162,7 @@ import {
   callRefLegacyPlainKey,
   callRefPlainKey,
   callRefPlainVoid,
+  callStmtIdentDrops,
   capturedArgArmOf,
   clearPlanOf,
   clearRecvIsList,
@@ -425,6 +427,7 @@ import { isBlockBody } from "./block_body"
 import { fbValtype, wTarget } from "./emit_bytes"
 import { ifLinkYieldsNull } from "./emit_if_arm_values"
 import {
+  bundleRecordTyOf,
   elabArmSigAt,
   elabSpreadNote,
   isStorageRead,
@@ -457,6 +460,7 @@ import {
   exprMap,
   exprNullableMap,
   exprUnion,
+  fnBundleRetSigs,
   fnIndexOfNode,
   forInElemTyOf,
   forInMapRecv,
@@ -1905,7 +1909,9 @@ function ifExprAt(b: i32[], n0: IfStmt, ix0: i32, rep0: i32, ty0: i32): Opnd {
     if tv < 0 { break }
     const nx = nodeAt(tv)
     if !(nx is IfStmt) { break }
-    if ty0 >= 0 { return irBMiss("atom if join chain") }
+    // At a destination's type legacy walks only a direct `else if` as a link (`emitIfExprAs`); an
+    // `else` block's `if` is that arm's value, not a link.
+    if ty0 >= 0 && !direct { return irBMiss("atom if join chain") }
     // An `else` block's prelude runs before its `if`, which is then that arm's value, not a link.
     if !direct && armHasPrelude(n.ifElse) {
       return irBMiss("expression if else prelude")
@@ -1975,6 +1981,7 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
     && kind != "reflist"
     && kind != "struct"
     && kind != "map"
+    && kind != "variant"
   ) {
     return irBMiss("expression if ref " + kind)
   }
@@ -2125,7 +2132,8 @@ function refIfLink(
   return o
 }
 
-// One arm of `ifRefExpr`: its value as itself at `rep`, or an atom decoded to it, written to out `t`.
+// One arm of `ifRefExpr`: its value as itself at `rep`, an atom decoded to it, or the join's null,
+// written to out `t`.
 function refIfArm(
   blockIx: i32,
   t: i32,
@@ -2136,13 +2144,19 @@ function refIfArm(
 ): i32[] {
   const body: i32[] = []
   const arm = refIfArmOf(blockIx, ibFnIx, kind, slot, nul)
-  if arm != "plain" && arm != "atomStr" {
+  if arm != "plain" && arm != "atomStr" && arm != "null" {
     irBMiss("ref if arm " + arm)
     return body
   }
   armPrelude(body, blockIx)
   if ibMiss != "" { return body }
   const tv = ifArmValueExpr(blockIx)
+  // A bare `null` arm is the join's own typed null.
+  if arm == "null" {
+    const z = repTemp(body, { jnKind: kind, jnSlot: slot }, tv, rep)
+    irBNode(body, { asDst: t, asSrc: z }, -1, ibNoValue, blockIx)
+    return body
+  }
   const built = irBExpr(body, tv)
   // An atom arm in a `string` join decodes to its member string (`emitAtomToStr`).
   const v = if arm == "atomStr" && ibMiss == "" { atomToStr(body, built, tv, rep) } else if ibMiss == "" && refIfArmNiches(built, tv, rep) { repTemp(body, { rgV: built }, tv, rep) } else { built }
@@ -2465,10 +2479,15 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const d = identDeclOf(ix)
   if d < 0 { return irBMiss("unresolved read") }
   const dn = nodeAt(d)
-  // A bundle parameter holds a record of closures each instance types (D14841): read only at a
-  // member pick (`bundleCallRhs`).
+  // A bundle parameter holds a record of closures each instance types (D14841): read at a member
+  // pick (`bundleCallRhs`), or whole as that record where the IR holds it as one.
   if dn is Param && bundleAnyNoted() && bundleParamOfRead(ix, ibFnIx) >= 0 {
-    return irBMiss("bundle parameter read")
+    const pv = paramVarAt(localIndexOf(ibFnIx, ix))
+    if pv < 0 || !(repNodeAt(ib.irVars[pv].vRep) is RRecord) {
+      return irBMiss("bundle parameter read")
+    }
+    const o: Opnd = { ov: pv }
+    return o
   }
   if captureSlotOf(n.identName, ibFnIx) >= 0 {
     return captureRead(b, n, ix, rep)
@@ -2874,7 +2893,10 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
   if ann >= 0 { return nodeTyAt(ann, d) }
   const rec = if pos >= 0 && pos < fRecRetTy.length { fRecRetTy[pos] } else { -1 }
   if rec >= 0 { return rec }
-  return fnCheckedRetTy(pos)
+  const t = fnCheckedRetTy(pos)
+  // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`).
+  const bs = if irTyOpen(t) && pos >= 0 && pos < fnStmts.length { fnBundleRetSigs(pos) } else { [] }
+  return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
 }
 
 // The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
@@ -3238,10 +3260,13 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     // the parameter's union, as `emitUnionBoxAtRecord` writes it.
     const arm = callRefArgArmOf(ix, ibFnIx, key, c.callArgs[i], i)
     const wt = closureArgWidenTy(arm)
-    // An atom or a scalar list is written as it stands, so it must already be at the parameter's rep.
-    const asIs = arm == "atom" || arm == "scalarList"
-    const bx = if arm == "box" || asIs { closureParamRep(f, i) } else { -1 }
-    if (arm == "box" || asIs) && bx < 0 {
+    // An atom, a scalar list or a union arm is written as it stands, so it must already be at the
+    // parameter's rep.
+    const asIs = arm == "atom"
+      || arm == "scalarList"
+      || arm == "general" && sigParamKindAt(key, i) == "variant"
+    const bx = if arm == "box" || arm == "armUnbox" || asIs { closureParamRep(f, i) } else { -1 }
+    if (arm == "box" || arm == "armUnbox" || asIs) && bx < 0 {
       return missRhs("closure box parameter rep")
     }
     const a = if wt >= 0 { deliver(b, c.callArgs[i], repNodeOfTy(wt), wt) } else if bx >= 0 && !asIs { deliver(b, c.callArgs[i], bx, repTyOf(bx)) } else { irBExpr(b, c.callArgs[i]) }
@@ -3268,9 +3293,17 @@ function closureCallAt(b: i32[], c: Call, ix: i32, key: string, f: Opnd): Rhs {
     crSig: cloSigTypeIdxAt(cloSigPosOfKey(key)),
     crArgs: args,
     crVoid: sigKeyRetIsVoid(key),
-    crDrop: !callRefPlainVoid(ix, ibFnIx),
+    crDrop: closureCallDrops(c, ix),
   }
   return r
+}
+
+// Whether closure call `c` at `ix`, as a statement, drops its value: a named callee as legacy's
+// statement ladder decides (`callStmtIdentDrops`), any other as its plan's voidness.
+function closureCallDrops(c: Call, ix: i32): boolean {
+  const cf = if c.callFn >= 0 && c.callFn < P.nodes.length { nodeAt(c.callFn) } else { null }
+  if cf is Ident { return callStmtIdentDrops(c, cf, ix, ibFnIx) }
+  return !callRefPlainVoid(ix, ibFnIx)
 }
 
 // The rep closure `f` takes its parameter `i` at, or -1.
@@ -4713,7 +4746,18 @@ function atomCompare(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const ne = n.binOp == "!="
   const none: Opnd = { oiRep: ibNoValue, oiBits: 0 }
   if p.aqArm == "none" { return irBMiss("atom compare") }
-  if p.aqArm == "fold" { return irBMiss("atom compare fold") }
+  if p.aqArm == "fold" {
+    const fl = staticSideOf(b, n.binLeft)
+    if ibMiss != "" { return fl }
+    const fr = staticSideOf(b, n.binRight)
+    if ibMiss != "" { return fr }
+    return irBLetTemp(
+      b,
+      { aeL: fl, aeR: fr, aeStatic: 3, aeNe: ne, aeAt: ix },
+      ix,
+      rep,
+    )
+  }
   if p.aqArm == "static" {
     const sIx = if p.aqStaticLeft { n.binLeft } else { n.binRight }
     const aIx = if p.aqStaticLeft { n.binRight } else { n.binLeft }
@@ -5289,8 +5333,11 @@ function coalNiche(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   if dIx < 0 || !(nodeAt(dIx) is StrLit) {
     return irBMiss("coalesce string default")
   }
+  const lat = b.length
   const l = irBExpr(b, n.binLeft)
   if ibMiss != "" { return l }
+  // Legacy writes the operand inside the coalesce's block, above which a valued `if` cannot sit.
+  if valuedIfFrom(b, lat) { return irBMiss("coalesce of a valued if") }
   if !strNullable(irBOpRep(l)) { return irBMiss("coalesce operand rep") }
   const nul = coalesceNulStrStaysNullable(ix, ibFnIx)
   const want = if nul { irBOpRep(l) } else { strInnerOf(irBOpRep(l)) }
@@ -6121,7 +6168,7 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       (n.binOp == "==" || n.binOp == "!=")
       && atomEqPlanOf(n, ibFnIx).aqArm == "fold"
     ) {
-      return irBMiss("atom compare fold")
+      return atomCompare(b, n, ix, rep)
     }
     // An atom operand of no atom compare (a `+`, or `==` against a plain string) is the string
     // op's, which decodes the atom to its member string, as legacy's dispatch routes it.
@@ -7230,8 +7277,13 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if pa >= 0 { return letIfArms(b, n.letInit, v, pa) }
     // Legacy's own binding arm reads a union-valued map's box past `emitExpr`, banking no
     // element-read row (`letNulMapReadUnionBox`).
-    const src = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else { deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy) }
+    const built = if letNulMapReadUnionBox(ix, ibFnIx) { mapGetAt(b, unwrapParen(n.letInit), ib.irVars[v].vRep, -1, false) } else { deliver(b, n.letInit, ib.irVars[v].vRep, ib.irVars[v].vTy) }
     if ibMiss != "" { return 0 }
+    // A ref list bound at its record-or-null twin is the same list; legacy writes no convert where
+    // no coercion is recorded at the initializer.
+    const src = if (irBOpRep(built) != ib.irVars[v].vRep
+      && listRetag(irBOpRep(built), ib.irVars[v].vRep)
+      && exprPrePathWhy(n.letInit, ibFnIx) == "") { repTemp(b, { rgV: built }, n.letInit, ib.irVars[v].vRep) } else { built }
     if irBOpRep(src) != ib.irVars[v].vRep {
       return skip("declaration coercion")
     }
@@ -7612,6 +7664,16 @@ function ibReset(fnIx: i32, name: string, fnPos: i32) {
   return 0
 }
 
+// Parameter `p`'s type as legacy holds it: a bundle parameter's open type is the record of one
+// closure per signature it is called at (`bundleRecordTyOf`), else its checker type, closed at the
+// instance the checker recorded.
+function paramHeldTy(p: i32, fnIx: i32): i32 {
+  const ty = heldTy(scopeTyAt(p, fnIx))
+  if !irTyOpen(ty) { return ty }
+  const sigs = bundleSigsOfParam(p)
+  return if sigs.length > 0 { bundleRecordTyOf(sigs) } else { ty }
+}
+
 // The variables of `fn`'s parameters, in legacy's slots past the environment; "" or the miss. A
 // fragment's (`whole` false) leaves out a parameter it could not hold, so only reading it misses.
 function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
@@ -7619,7 +7681,7 @@ function buildParams(fn: FuncDecl, fnIx: i32, whole: boolean): string {
   let i = 0
   while i < fn.fnParams.length {
     const p = fn.fnParams[i]
-    const ty = heldTy(scopeTyAt(p, fnIx))
+    const ty = paramHeldTy(p, fnIx)
     const r = repNodeOfTy(ty)
     if !whole && (isVoidTy(ty) || !valueRep(r, ty) || irTyHeldOpen(ty, r)) {
       i = i + 1
