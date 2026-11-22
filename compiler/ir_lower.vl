@@ -153,6 +153,7 @@ import {
   RMapSet,
   RMemAccess,
   RMemOp,
+  RNicheRead,
   RNulNicheEq,
   RNulTest,
   RNullOf,
@@ -206,6 +207,7 @@ import {
   SSetField,
   SSwitch,
   STrap,
+  coalArmStagesLeads,
   irFnNew,
   irNoTailEffHas,
   irNoTailHas,
@@ -337,6 +339,7 @@ import {
   emitMapGetTail,
   emitMapNew,
   emitNarrowedMapReadTail,
+  emitNicheReadTail,
   emitNullOwn,
   emitNullRetTail,
   emitOmittedFieldNull,
@@ -1059,6 +1062,7 @@ function rhs(r: Rhs, tail: boolean) {
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
+    RNicheRead => nicheRead(r)
     RRecCopyPure => {
       leaf()
       recCopyPureEmit(r.rpAt, lw.irAt)
@@ -1886,6 +1890,13 @@ function boxNarrow(r: RBoxNarrow) {
   if !narrowedVariantRepIs(vi, r.bnRep) { return irLMiss("box narrow shape") }
   irLOpnd(r.bnV)
   return narrowedVariantTail(vi)
+}
+
+// `RNicheRead`: the box, then legacy's niche tail (`emitNicheReadTail`), as `emitNarrowedNicheRead`
+// writes it after its storage read.
+function nicheRead(r: RNicheRead) {
+  irLOpnd(r.nrV)
+  return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
 }
 
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
@@ -3514,6 +3525,11 @@ function ifOpen(id: i32, pending: i32[], tail: boolean): i32 {
   return IF_DONE
 }
 
+function noRoots(): i32[] {
+  const r: i32[] = []
+  return r
+}
+
 // Writes the temps an earlier operand left pending below the valued `if` about to open on `c`,
 // in definition order, as legacy writes that operand first; each root stays on the stack for its
 // one reader after the `if`, and `pending` keeps the condition's temps. Returns the roots.
@@ -3701,6 +3717,11 @@ function coalBox(n: SCoalBox, pending: i32[]) {
   }
   const e = nodeAt(n.cbAt)
   if !(e is BinExpr) { return irLMiss("coalesce box node") }
+  // An earlier operand's temps are written below the operand, as a valued `if` stages them.
+  const roots = if coalArmStagesLeads(n.cbArm) { stageLead(n.cbL, pending) } else { noRoots() }
+  if lwMiss != "" { return -1 }
+  lwFloors.push(lwFloor)
+  lwFloor = lwLive.length - liveCountIn(pending)
   const ba = coalValBoxArm(n.cbArm)
   const got = if ba != null { coalBoxArm(n, ba, e, pending) } else { match n.cbArm {
     "popOr" => coalPopOr(n, e, pending)
@@ -3714,7 +3735,9 @@ function coalBox(n: SCoalBox, pending: i32[]) {
       irLMiss("coalesce box arm")
     }
   } }
+  lwFloor = lwFloors.pop() ?? 0
   if got < 0 { return -1 }
+  for r in roots { pending.push(r) }
   livePush(t)
   pending.push(t)
   return 0
