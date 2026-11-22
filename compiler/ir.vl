@@ -214,6 +214,9 @@ export type RRetNull = { rnrAt: i32 }
 export type RJoinNull = { jnKind: VKind, jnSlot: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
+// A `==`/`!=` at node `neAt` on legacy's `nulNiche` route over nullable operands `neL` and `neR`,
+// under the null guard `nulNicheEqHead` opens; the guard reads `neR` twice.
+export type RNulNicheEq = { neL: Opnd, neR: Opnd, neAt: i32 }
 export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
 // The `==` (or, with `aeNe`, `!=`) of two atoms at compare node `aeAt`. `aeStatic` 1 or 2 names
 // the left or right side typed as one string literal, whose id comes from its lexeme: its operand
@@ -430,6 +433,7 @@ export type Rhs = RAsUnion
   | RMapSet
   | RMemAccess
   | RMemOp
+  | RNulNicheEq
   | RNulTest
   | RNullOf
   | RNumCast
@@ -504,12 +508,33 @@ export type SForIn = {
   xfMapNonNull: boolean,
 }
 // `siElseKw`: the source wrote a live `else`, which legacy writes even when its arm is empty.
+// `siJoinAt`: the head of a reference join's chain, whose join every link opens at
+// (`emitIfExprRef`); else -1, and a valued `if` opens at its own.
 export type SIf = {
   siCond: Opnd,
   siThen: i32[],
   siElse: i32[],
   siOut: i32,
   siElseKw: boolean,
+  siJoinAt: i32,
+}
+
+// An `if` that opens at its own join (`siJoinAt` -1); only `refIfLink` names a chain's head.
+export function sIf(
+  c: Opnd,
+  thenB: i32[],
+  elseB: i32[],
+  out: i32,
+  elseKw: boolean,
+): SIf {
+  return {
+    siCond: c,
+    siThen: thenB,
+    siElse: elseB,
+    siOut: out,
+    siElseKw: elseKw,
+    siJoinAt: -1,
+  }
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // A `??` at `cbAt` whose head and present arm are legacy's shared tails along arm `cbArm`, with a
@@ -1065,6 +1090,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RRetNull => []
     RJoinNull => []
     RNulTest => [r.ntV]
+    RNulNicheEq => [r.neL, r.neR]
     RAtomEq => [r.aeL, r.aeR]
     RAsUnion => [r.auV]
     RTagStash => [r.tgsV]
@@ -1144,6 +1170,7 @@ function rhsText(r: Rhs): string {
     RRetNull => "return null"
     RJoinNull => "join null"
     RNulTest => "isnull " + opndText(r.ntV)
+    RNulNicheEq => "nulniche_eq(" + opndText(r.neL) + ", " + opndText(r.neR) + ")"
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
@@ -1473,6 +1500,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListNewDefault |
       RMemAccess |
       RMemOp |
+      RNulNicheEq |
       RSimd |
       RTagOf |
       RTruncSat => "other"
@@ -1624,6 +1652,17 @@ export function lexOpcode(op: string, p: RpPrim): i32 {
   const o = binPrimOp(op, false)
   if o == null { return -1 }
   return primOpcode(o, p)
+}
+
+// Whether node `i` of body `b` is the let of the condition the valued `if` after it tests, the
+// builder's own prelude to that join.
+export function ifCondLetAt(f: IrFn, b: i32[], i: i32): boolean {
+  if i < 0 || i + 1 >= b.length { return false }
+  const l = f.irNodes[b[i]]
+  const j = f.irNodes[b[i + 1]]
+  if !(l is SLet) || !(j is SIf) || j.siOut < 0 { return false }
+  const c = j.siCond
+  return c is OVar && c.ov == l.lDst
 }
 
 // Whether a list at rep `src` is the list at rep `dst` as it stands: the same record elements, one
