@@ -141,7 +141,7 @@ row_mem() {
     "distilled corpus") echo 1700 ;;
     "rep-fuzz") echo 1600 ;;
     "deno task test"|"plumb-shape cost") echo 1400 ;;
-    "ir shadow"|"ir shadow cases") echo 1300 ;;
+    "ir shadow"|"ir shadow cases"|"ir prepost") echo 1300 ;;
     "ir shadow suite") echo 600 ;;
     "lsp suites (ci list)") echo 1100 ;;
     "scaling shape") echo 900 ;;
@@ -259,7 +259,7 @@ run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test --preload t
 run "lsp suites (ci list)"     env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check --parallel $LSP_CI
 # The IR shadow suite on this tree's seed. The full gate runs it inside `ci-native`; `--fast`
 # skips that row, so here it runs alone, and a stale miss expectation reds before the queue.
-[ "$FAST" = 1 ] && run "ir shadow suite"   env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_ir_shadow_test.ts
+[ "$FAST" = 1 ] && run "ir shadow suite"   env SELFHOST_NATIVE_ALIGN=1 deno test --preload tests/support/signal_guard.ts -A --no-check tests/vl_ir_shadow_test.ts tests/vl_ir_prepost_test.ts
 # Root deno.json excludes lsp/ and every suite runs --no-check, so a type error
 # in lsp/src/*.ts is invisible to all the other gates (esbuild strips types
 # without checking). Mirrors ci.yml's "Type-check (lsp)" step.
@@ -409,6 +409,9 @@ run "ir shadow"                "$VL" run scripts/silent-sweep/distilled/ir-shado
 run "ir shadow cases"          "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --cases
 # The shipped claim, disarmed: a claimed function emits the IR's bytes, so any fallback reds.
 run "ir claims"                "$VL" run scripts/silent-sweep/distilled/ir-shadow.vl --compiler "$SEED" -- --seed "$SEED" --claims
+# The order check: each function built where a claim builds it and again after legacy, over the
+# corpus and tests/cases; a row above `ir-prepost-baseline.txt` reds (a plan reads legacy's state).
+run "ir prepost"               "$VL" run scripts/silent-sweep/distilled/ir-prepost.vl --compiler "$SEED" -- --seed "$SEED"
 
 # THE OOM WATCH. A kill the kernel made during the run fails the gate, whatever the rows read:
 # a test that expected a failure, or a grader that reads a refusal, takes a killed child for one.
