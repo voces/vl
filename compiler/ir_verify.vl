@@ -19,7 +19,9 @@ import {
   RArmUnbox,
   RAsUnion,
   RAtomEq,
+  RAtomSole,
   RAtomStr,
+  RAtomWide,
   RAtomic,
   RBoxField,
   RBoxNarrow,
@@ -95,6 +97,8 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStrToAtom,
+  RStrToAtomStaged,
   RStructEq,
   RTagIs,
   RTagOf,
@@ -129,10 +133,12 @@ import {
   irBodyLeaves,
   irFnNew,
   irGlobalRepOf,
+  irGlobalStoreTyOf,
   irPushBodies,
   irSigOf,
   mapBoxReadsAt,
   mapNicheReadsAt,
+  repHeldAsI32,
 } from "./ir"
 import {
   RAtom,
@@ -165,35 +171,18 @@ import {
 } from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { AsExpr, Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
-import {
-  memOpIsVoid,
-  memOpPlanOf,
-  objLitArmOf,
-  simdCallRow,
-  simdMemBase,
-  simdOperandPrim,
-  simdResultPrim,
-  simdRowIsMem,
-} from "./wasmEmit"
-import { exprEffectFree } from "./emit_base"
+import { AsExpr, Call, IsExpr, i32ToStr, nodeAt } from "./ast"
+import { memOpIsVoid, memOpPlanOf } from "./wasmEmit"
 import { nodeTyAt } from "./emit_capture_frames"
-import { closureHeld, letBindTy, tyOpenHeldAsIds } from "./emit_classify"
+import { closureHeld, tyOpenHeldAsIds } from "./emit_classify"
 import { fbValtype, wTarget } from "./emit_bytes"
 import { rlWrapIdx } from "./emit_state"
 import { rlSlotOfTyOrTwin } from "./emit_shape_rows"
 import { tyRefArrElemOf } from "./emit_map_value_slots"
-import { identDeclOf } from "./symbols"
 import {
-  atomicPlanOf,
-  atomicResultPrim,
-  atomicValPrim,
-  fnFallThroughPadOf,
   litArmsReadsOf,
-  memAccessPlanOf,
   narrowedMapReadOf,
   structFieldBoxTy,
-  truncSatPlanOf,
   variantFieldBoxTy,
 } from "./wasmEmit"
 
@@ -508,13 +497,13 @@ function stageAt(id: i32): RListStage | null {
   return null
 }
 
-// Whether global read node `at`, at rep `dst`, is at its checked type's rep or else at its
-// declaration's storage row, the D14434 binding column (`letBindTy`; D14426, DECISIONS.md).
-function globalReadAtTyOrStorage(dst: i32, at: i32): boolean {
+// Whether a read of global `sym` at node `at`, at rep `dst`, is at its checked type's rep or else at
+// the storage row the builder recorded taking it at (`irGlobalStoreTyOf`; D14434, D14426).
+function globalReadAtTyOrStorage(sym: i32, dst: i32, at: i32): boolean {
   const src = vf.irNodeAt[at] ?? -1
   if src < 0 || dst == repNodeOfTy(nodeTyAt(src, vf.irAt)) { return true }
-  const d = identDeclOf(src)
-  return d >= 0 && dst == repNodeOfTy(letBindTy(d, -1))
+  const st = irGlobalStoreTyOf(vf, sym)
+  return st >= 0 && dst == repNodeOfTy(st)
 }
 
 function rhsCheck(r: Rhs, dst: i32, at: i32) {
@@ -1024,7 +1013,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     RToBox => {
       use(r.bxV, at)
       // Legacy's box writer may leave an immediate unread, so one stands only for an effect-free node.
-      if (r.bxV is OImm || r.bxV is OStr) && !exprEffectFree(r.bxAt) {
+      if (r.bxV is OImm || r.bxV is OStr) && !r.bxFree {
         return fail(2, at, "a box's immediate stands for a node with an effect")
       }
       0
@@ -1423,6 +1412,39 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RFnId => if dst >= 0 && dst != vfI32 { fail(2, at, "a function id is an i32") } else { 0 }
+    RAtomSole => if dst >= 0 && !(repNodeAt(dst) is RAtom) { fail(2, at, "a sole atom is an atom") } else { 0 }
+    RAtomWide => {
+      use(r.awV, at)
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "a wide literal's atom is an atom")
+      }
+      0
+    }
+    RStrToAtomStaged => {
+      use(r.zsV, at)
+      if repPrim(opRep(r.zsV)) != "str" {
+        return fail(2, at, "a staged atom narrowing parks a string")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "a staged atom narrowing is an atom")
+      }
+      0
+    }
+    RStrToAtom => {
+      uses(r.saReads, at)
+      for o in r.saReads {
+        if repPrim(opRep(o)) != "str" {
+          return fail(2, at, "an atom tower tests string reads")
+        }
+      }
+      if r.saReads.length == 0 {
+        return fail(2, at, "an atom tower tests at least one member")
+      }
+      if dst >= 0 && !(repNodeAt(dst) is RAtom) {
+        return fail(2, at, "an atom tower is an atom")
+      }
+      0
+    }
     RCellNew => use(r.cnInit, at)
     RCellGet => use(r.cgCell, at)
     REnvGet => 0
@@ -1454,7 +1476,12 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       // A global the builder noted as holding a record whole is read at that record (`irGlobalHeld`).
       const held = vf.irGlobalHeld[r.ggSym] ?? false
-      if dst >= 0 && !narrowed && !held && !globalReadAtTyOrStorage(dst, at) {
+      if (
+        dst >= 0
+        && !narrowed
+        && !held
+        && !globalReadAtTyOrStorage(r.ggSym, dst, at)
+      ) {
         return fail(
           2,
           at,
@@ -1775,7 +1802,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm < 1 || mp.prForm > 5 {
+  if mp.prForm < 1 || mp.prForm > 6 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1783,7 +1810,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
     return "a fused map read writes no variable"
   }
   const p = repPrim(vf.irVars[o].vRep)
-  if mp.prForm == 1 && p != "i32" && p != "bool" {
+  if (mp.prForm == 1 || mp.prForm == 6) && !repHeldAsI32(vf.irVars[o].vRep) {
     return "a map read's plain probe yields no i32"
   }
   // The mv slot's read is the map's value as itself, so its out is at that value's rep.
@@ -1890,6 +1917,11 @@ function ifSpine(id0: i32) {
       defs.pop()
     }
   }
+}
+
+// Whether `v` is a declared binding, the one a loop value's frame carries out through.
+function declaredVar(v: i32): boolean {
+  return v >= 0 && v < vf.irVars.length && vf.irVars[v].vKind != "temp"
 }
 
 function labelled(label: i32, out: i32, body: i32[]) {
@@ -2034,7 +2066,7 @@ function stmt(id: i32, prev: i32) {
     }
     SEffect => rhsCheck(n.efRhs, -1, id)
     SBlock => {
-      if n.bkOut >= 0 && !vf.irHelper {
+      if n.bkOut >= 0 && !vf.irHelper && !declaredVar(n.bkOut) {
         return fail(10, id, "a valued block outside a runtime helper")
       }
       labelled(n.bkLabel, n.bkOut, n.bkBody)
@@ -2120,7 +2152,11 @@ function stmt(id: i32, prev: i32) {
     SSwitch => switchCheck(n, id)
     SIntSwitch => intSwitchCheck(n, id)
     SBr => {
-      if n.brHas && !vf.irHelper {
+      if (
+        n.brHas
+        && !vf.irHelper
+        && !(n.brVal is OVar && declaredVar(n.brVal.ov))
+      ) {
         return fail(10, id, "a valued branch outside a runtime helper")
       }
       let i = vfLabels.length - 1
@@ -2314,18 +2350,14 @@ function simdMemCheck(r: RSimd, dst: i32, at: i32, base: i32) {
 // load's result at that prim; a store has no value.
 function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   uses(r.mmArgs, at)
-  const c = nodeAt(r.mmAt)
-  const ok = c is Call && c.callFn >= 0 && c.callFn < P.nodes.length
-  const f = if ok && c is Call { nodeAt(c.callFn) } else { null }
-  const pl = memAccessPlanOf(if f is Ident { f.identName } else { "" })
   const a = r.mmArgs
-  if pl.mxBase < 1 || a.length != pl.mxBase || opRep(a[0]) != vfI32 {
+  if r.mmBase < 1 || a.length != r.mmBase || opRep(a[0]) != vfI32 {
     return fail(2, at, "a memory access's address is an i32")
   }
-  if pl.mxBase == 2 && repPrim(opRep(a[1])) != pl.mxPrim {
+  if r.mmBase == 2 && repPrim(opRep(a[1])) != r.mmPrim {
     return fail(2, at, "a memory store's value is at its width's prim")
   }
-  if dst >= 0 && (pl.mxBase == 2 || repPrim(dst) != pl.mxPrim) {
+  if dst >= 0 && (r.mmBase == 2 || repPrim(dst) != r.mmPrim) {
     return fail(
       2,
       at,
@@ -2376,11 +2408,8 @@ function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
 // (a store and a fence have no value).
 function atomicCheck(r: RAtomic, dst: i32, at: i32) {
   uses(r.amArgs, at)
-  const c = nodeAt(r.amAt)
-  if !(c is Call) { return fail(2, at, "an atomic is a call") }
-  const pl = atomicPlanOf(c)
   const a = r.amArgs
-  if pl.apFail != "" || a.length != pl.apBase {
+  if r.amBase < 0 || a.length != r.amBase || r.amValPrims.length < a.length {
     return fail(2, at, "an atomic takes its plan's operands")
   }
   if a.length > 0 && opRep(a[0]) != vfI32 {
@@ -2388,12 +2417,12 @@ function atomicCheck(r: RAtomic, dst: i32, at: i32) {
   }
   let k = 1
   while k < a.length {
-    if repPrim(opRep(a[k])) != atomicValPrim(pl.apRow, k) {
+    if repPrim(opRep(a[k])) != r.amValPrims[k] {
       return fail(2, at, "an atomic's value is at its row's prim")
     }
     k = k + 1
   }
-  const res = atomicResultPrim(pl.apRow)
+  const res = r.amResPrim
   if dst >= 0 && (res == "" || repPrim(dst) != res) {
     return fail(2, at, "an atomic's result is at its row's prim")
   }
@@ -2405,11 +2434,10 @@ function truncSatCheck(r: RTruncSat, dst: i32, at: i32) {
   use(r.tsV, at)
   const c = nodeAt(r.tsAt)
   if !(c is Call) { return fail(2, at, "a saturating truncation is a call") }
-  const pl = truncSatPlanOf(c)
-  if pl.tpOp < 0 || repPrim(opRep(r.tsV)) != pl.tpFrom {
+  if r.tsOp < 0 || repPrim(opRep(r.tsV)) != r.tsFrom {
     return fail(2, at, "a saturating truncation's operand is at its float prim")
   }
-  if dst >= 0 && repPrim(dst) != pl.tpTo {
+  if dst >= 0 && repPrim(dst) != r.tsTo {
     return fail(
       2,
       at,
@@ -2419,32 +2447,22 @@ function truncSatCheck(r: RTruncSat, dst: i32, at: i32) {
   return 0
 }
 
-// A SIMD row's operands and result at the prims its shape names (`simdOperandPrim`,
-// `simdResultPrim`), a lane or shuffle index being an immediate and no operand.
+// A SIMD op's operands and result at the prims the builder planned from its row (`sdPrims`,
+// `sdResPrim`), a lane or shuffle index being an immediate and no operand.
 function simdCheck(r: RSimd, dst: i32, at: i32) {
   uses(r.sdArgs, at)
-  const c = nodeAt(r.sdAt)
-  const row = if c is Call { simdCallRow(c) } else { -1 }
-  if !(c is Call) || row < 0 {
-    return fail(2, at, "a SIMD op's node is a SIMD call")
-  }
-  if simdRowIsMem(row) { return simdMemCheck(r, dst, at, simdMemBase(row)) }
-  let k = 0
-  let i = 0
-  while i < c.callArgs.length {
-    const p = simdOperandPrim(row, i)
-    if p != "" {
-      if k >= r.sdArgs.length || repPrim(opRep(r.sdArgs[k])) != p {
-        return fail(2, at, "a SIMD op's operands are at its row's prims")
-      }
-      k = k + 1
-    }
-    i = i + 1
-  }
-  if k != r.sdArgs.length {
+  if r.sdMemBase > 0 { return simdMemCheck(r, dst, at, r.sdMemBase) }
+  if r.sdPrims.length != r.sdArgs.length {
     return fail(2, at, "a SIMD op's operands are at its row's prims")
   }
-  const rp = simdResultPrim(row)
+  let k = 0
+  while k < r.sdArgs.length {
+    if repPrim(opRep(r.sdArgs[k])) != r.sdPrims[k] {
+      return fail(2, at, "a SIMD op's operands are at its row's prims")
+    }
+    k = k + 1
+  }
+  const rp = r.sdResPrim
   if (
     dst >= 0
     && (rp == "" || repPrim(dst) != rp && !(rp == "i32" && repPrim(dst) == "bool"))
@@ -2460,7 +2478,9 @@ function rhsReadsList(r: Rhs): boolean {
     RArmUnbox |
       RAsUnion |
       RAtomEq |
+      RAtomSole |
       RAtomStr |
+      RAtomWide |
       RAtomic |
       RBoxField |
       RBoxNarrow |
@@ -2535,6 +2555,8 @@ function rhsReadsList(r: Rhs): boolean {
       RStage |
       RStashSet |
       RStrOp |
+      RStrToAtom |
+      RStrToAtomStaged |
       RStructEq |
       RTagIs |
       RTagOf |
@@ -2607,7 +2629,10 @@ function stagePairsWhy(f: IrFn): string {
 function mapGetDstOk(val: i32, dst: i32): boolean {
   if dst == val { return true }
   const n = repNodeAt(dst)
+  // Narrowed, a value that is itself a ref niche reads as the record inside it.
+  const v = repNodeAt(val)
   return n is RNullable && n.rnInner == val
+    || v is RNullable && v.rnDisc == 1 && v.rnInner == dst
 }
 
 export let irBoundsRuleHook: (f: IrFn) => string = boundsNone
@@ -2670,9 +2695,7 @@ export function undeclaredRepTakes(ty: i32, rep: i32, v: i32): boolean {
 }
 
 // Whether record `r` is built at a variant's row, as `makeRec` lowers it.
-export function recIsVariant(r: RMakeRec, fnIx: i32): boolean {
-  return if r.mrRow >= 0 { r.mrVariant } else { objLitArmOf(r.mrAt, fnIx) == "variant" }
-}
+export function recIsVariant(r: RMakeRec): boolean { return r.mrVariant }
 
 // The site type kid `k` of record `r` is delivered at (the builder's `fieldSiteTy`), or -1.
 function recKidSiteTy(r: RMakeRec, k: i32): i32 {
@@ -2680,7 +2703,7 @@ function recKidSiteTy(r: RMakeRec, k: i32): i32 {
   let fi = 0
   while fi < r.mrLayout.length && r.mrLayout[fi] != k { fi = fi + 1 }
   if fi >= r.mrLayout.length { return -1 }
-  return if recIsVariant(r, vf.irAt) { variantFieldBoxTy(r.mrBuiltRow, fi) } else { structFieldBoxTy(r.mrBuiltRow, fi) }
+  return if recIsVariant(r) { variantFieldBoxTy(r.mrBuiltRow, fi) } else { structFieldBoxTy(r.mrBuiltRow, fi) }
 }
 
 // Whether byte lists `a` and `b` are equal.
@@ -2779,7 +2802,7 @@ export function irVerify(f: IrFn): IrVerdict {
   if (
     !repIsNoValue(f.irRetRep)
     && !irBodyLeaves(f, f.irBody)
-    && fnFallThroughPadOf(f.irAt) == ""
+    && f.irEndPad == ""
   ) {
     fail(5, -1, "a valued function falls off its end")
   }
