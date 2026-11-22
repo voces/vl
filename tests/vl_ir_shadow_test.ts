@@ -359,8 +359,9 @@ Deno.test({
   },
 });
 
-// Outside the set: a string coalesce whose default is no literal, a closure parameter and a
-// propagating `as` conversion each leave their function uncovered, named.
+// Outside the set: a string coalesce whose default is no literal and a propagating `as`
+// conversion each leave their function uncovered, named. A closure parameter, its baked
+// callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
@@ -387,7 +388,8 @@ print(cv(3.0))
       }
     }
     const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered "));
-    if (unc.length < 3) throw new Error(`want three uncovered reasons, got ${JSON.stringify([...rows])}`);
+    if (unc.length < 2) throw new Error(`want two uncovered reasons, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) < 3) throw new Error(`want the closure parameter's functions covered, got ${JSON.stringify([...rows])}`);
   },
 });
 
