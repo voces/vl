@@ -26,3 +26,11 @@ second blocker (`index none`, `is storage rung`). The `f64[]` literal boxed into
 Row file `tests/ir-shadow-rows/literal-union-list-boxed.vl`; witnesses
 `tests/cases/unions/literal-union-list-boxed-under-its-arm-tag.vl` and
 `tests/cases/unions/literal-union-list-boxed-beside-a-record.vl`.
+
+## Folded in: `emitUnionConcreteEq`'s remaining arms
+
+#9460 gave the plain arm of a union-against-concrete compare a plan and three tails, which legacy
+and the IR both write. The arms the plan declines (a stashed box, and the operand's null legs)
+still wrote their own copies of the tag, payload and compare bytes. They now write through
+`unionEqTagTail`, `unionEqPayloadTail` and `unionEqCmpTail`, around the stash and the null legs.
+The change is byte-identical (ir-identity `--names`, `--cases`). It leaves `eqRouteOf` alone.
