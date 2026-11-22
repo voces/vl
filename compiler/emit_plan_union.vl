@@ -149,6 +149,7 @@ import {
   exprRefArray,
   exprString,
   exprStringArray,
+  exprStruct,
   exprU8Array,
   exprUnion,
   exprVariantIndex,
@@ -384,6 +385,7 @@ import {
   mapReadScalarBoxKind,
   memReadBoxAmbiguous,
   unionArmVariantForObj,
+  unionArmVariantForStructExpr,
 } from "./emit_value_sites"
 import {
   crossTagFitRows,
@@ -2007,6 +2009,7 @@ export type HoleBoxArm = "null"
   | "atomStr"
   | "atomAsStr"
   | "nulNiche"
+  | "nulBool"
   | "rec"
   | "obj"
   | "refList"
@@ -2093,6 +2096,10 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     const cv = unionArmVariantForObj(unionTy, bareIx, fnIx)
     if cv >= 0 && cv < uTags.length { return holeBox("obj", cv, -1) }
   }
+  // `emitUnionBoxNulNiche`'s boolean niche: tested on its value, the union's null or its bool atom.
+  if nulBoolBoxesInto(boxDstName("", unionTy), unionTy, bareIx, fnIx) {
+    return holeBox("nulBool", 1, -1)
+  }
   // `emitUnionBoxNulNiche`: a `V | null` ref niche into a union that admits `null` boxes its null
   // as the union's and its value under its arm's tag, which its writer reads (or declines).
   if (
@@ -2102,6 +2109,17 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     && unionSetHasNullTy(boxDstName("", unionTy), unionTy)
   ) {
     return holeBox("nulNiche", unionTy, -1)
+  }
+  // `emitUnionCoerceRecord`'s struct rung: a struct on its arm's variant heap, boxed as
+  // itself, past the niche rung that takes a struct that may be null.
+  // A struct that may be null is the niche legacy's ladder tests first, so it is not taken here.
+  const sv = structArmHeapOf(unionTy, exprIx, fnIx)
+  if (
+    sv >= 0
+    && !nodeTyIsNullable(bareIx)
+    && !tyBearsNull(nodeTyAt(bareIx, fnIx))
+  ) {
+    return holeBox("rec", sv, -1)
   }
   // Every rung below takes a value the record, niche and map rungs above it decline.
   if (
@@ -2352,6 +2370,31 @@ export function wideArmPlainOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
   }
   const vi = wideArmOfRow(row, atoms)
   return if vi < 0 || vi >= uTags.length { -1 } else { vi }
+}
+
+// Whether `boolean | null` value `nnIx` boxes into union `unionTy` (keyed `unionKey`) as its niche:
+// the union admits `null` and the module has a bool value box (`emitUnionBoxNulNiche`).
+export function nulBoolBoxesInto(
+  unionKey: string,
+  unionTy: i32,
+  nnIx: i32,
+  fnIx: i32,
+): boolean {
+  return exprNulBool(nnIx, fnIx)
+    && unionSetHasNullTy(unionKey, unionTy)
+    && vbHeapIdxOfKind(1) >= 0
+}
+
+// The arm whose variant heap struct value `exprIx` is on, which `emitUnionCoerceRecord` boxes it
+// under as itself, or -1 where no arm takes it or it is rebuilt onto the arm.
+export function structArmHeapOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  if !exprStruct(exprIx, fnIx) { return -1 }
+  const vi = unionArmVariantForStructExpr(unionTy, exprIx, fnIx)
+  const si = structIndexOfExpr(exprIx, fnIx)
+  if vi < 0 || vi >= uTags.length || si < 0 || si >= sHeapIdx.length {
+    return -1
+  }
+  return if sHeapIdx[si] == variantHeap(vi) { vi } else { -1 }
 }
 
 // The arm a variant or struct value `exprIx` boxes under as itself (`armValuePlainOf`), or -1.
@@ -3120,6 +3163,17 @@ export function eqAtomOperandOk(ix: i32, fnIx: i32) {
   return nodeTyIsLitUnion(av)
 }
 
+// Whether Ident read `ix` is typed `null` by its narrowing; with a cell that is not the `null`
+// unit, `identReadArmOf`'s `nullread` arm.
+function identNarrowedToNull(ix: i32, fnIx: i32): boolean {
+  return isNullTy(readNarrowedTyAt(ix, fnIx))
+}
+
+// Whether Ident read `ix` takes `identReadArmOf`'s `nullread` arm (asked before its pastNull re-ask).
+export function identReadsNull(ix: i32, fnIx: i32): boolean {
+  return identNarrowedToNull(ix, fnIx) && identCellVKind(ix, fnIx) != "nulnone"
+}
+
 // Which arm of `emitIdentNode` past its list overrides reads Ident `ix`, in the ladder's order;
 // `pastNull` once a null read found no other null to deliver. The IR reads `local` off it.
 export type IdentReadArm = "nulnone" | "nullread" | "defglobal" | "unbox" | "niche"
@@ -3132,7 +3186,7 @@ export function identReadArmOf(
   pastNull: boolean,
 ): IdentReadArm {
   if identCellVKind(ix, fnIx) == "nulnone" { return "nulnone" }
-  if !pastNull && isNullTy(readNarrowedTyAt(ix, fnIx)) { return "nullread" }
+  if !pastNull && identNarrowedToNull(ix, fnIx) { return "nullread" }
   if isDefaultGlobalRef(ix) && globalIndexOfSid(sidOfNode(ix)) >= 0 {
     return "defglobal"
   }
