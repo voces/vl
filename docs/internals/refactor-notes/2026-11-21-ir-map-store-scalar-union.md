@@ -24,3 +24,22 @@ and an `i32` and a string stored into an `i32 | string` map.
 #9461's `ssAskOnly` was a module flag, which the phase-state census counts as hidden state
 (`compiler/wasmEmit.vl` hidden 16 → 17). `strSiteArmsAt` now takes `ask`, and the asked forms pass
 it through `strInPlaceModeOf` and `strSiteOfRhsOf`, so nesting is safe and no module state is added.
+
+## Temporary: a union-box map read after a union store
+
+Once this store builds a union map value, a later union-box map read in the same function can be
+claimed. Its element-read row then differs from legacy's: `spans: count 7 vs 8` in
+`tests/cases/soundness/narrowed-write-join-keeps-numeric-members.vl` (`aliasMap`), and a start in
+`tests/cases/unions/deep-is-json-shape-walk.vl`. Per the coordinator's ruling, such a read is the
+named miss `map read row after a union store` (`IrFn.irUnionStored`, set by `mapSetValue`'s union
+arm), 23 functions and 13 start bodies in tests/cases. IR-N1's fix of the union-box read's row
+decision removes the miss and the field.
+
+## Measured (fixpoint seeds of the merge-base dfc71b02 and the change)
+
+- tests/cases armed shadow: covered and matched +122, start +35. `uncovered map store value scalar`
+  101 → 0 (start 35 → 0), `union` 86 → 0 (start 46 → 0). The temporary miss takes 23 (start 13).
+  No new `fail` or `mismatch` row.
+- Corpus: `map store value scalar` 32 → 0, `union` 20 → 0, paired 1 → 0; no-blocker 44,812 →
+  44,865 of 45,678.
+- `--cases` identical 7,604 and `--claimless` 14,017, both differ 0. L2 fuel per PR +0.06%.
