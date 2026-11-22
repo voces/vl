@@ -7,10 +7,11 @@
 
 ## Claimed against covered after this change
 
-At this head the T8 probe (mode 5) finds no covered-but-unclaimed function on any I8 population.
-Before it, RStructEq was the only set left: 35 functions in tests/cases, 2 in the distilled corpus
-and 4 in the filed witnesses, with none in the self-compile or the capability probes. The only
-claim fallbacks are the two `claims-fallbacks.txt` holds.
+On this change's base, the T8 probe (mode 5) found RStructEq the only covered-but-unclaimed set on
+every I8 population: 35 functions in tests/cases, 2 in the distilled corpus and 4 in the filed
+witnesses, with none in the self-compile or the capability probes. At this head the corpus's IR
+claims equal its covered count (45223). The only claim fallbacks are the two
+`claims-fallbacks.txt` holds.
 
 The `other` family still holds `RCellGet`, `RCellNew`, `RFnId`, `RTagOf`, `SCellSet` and `SSwitch`.
 No covered function holds one, since each lowers as `rhs outside I1` or is never built. The
