@@ -1,0 +1,37 @@
+# IR: a bundle argument (2026-11-22, lane IR-D1)
+
+Coordinator assignment: `bundle argument`, 124 tests/cases functions at master 2de2ffc1, all
+arms. A non-capturing lambda handed to a bundle parameter is baked into a direct call, so it
+never reached the miss. Every row was a capturing lambda, e.g. `only((x) => x + k)`, or a
+bundle record handed on whole, e.g. `function only(f) { other(f) }`.
+
+## The change
+
+- Legacy's argument ladder for a direct call's bundle parameter is split out byte-identically
+  as `bundleArgArmOf` (wasmEmit.vl): `lambda`, `member`, `holder`, `fnRead`, `choice`, or
+  `none`. The IR asks it per argument.
+- `lambda`: `bundleArgRec` builds the closure of each signature's instance (`monoBundleFe`) in
+  the parameter's record row's field order (`paramStructIdxOf`), as `emitBundleArg` does, then an
+  `RMakeRec` at that row.
+- `holder`, and `none` at a bundle parameter: the record as it is, delivered at the parameter's
+  record rep.
+- `fnRead` and `choice` stay named misses (`bundle argument fnRead` / `choice`).
+- `calleeSig` and the argument's delivery rep type a bundle parameter as its record through
+  `bundleHeldTy`, the rule #9446 gave the parameter's own variable. Without it, the verifier's
+  rule 6 refused the call.
+- Where an instance's bundle parameter is not a record, the lambda arm misses
+  (`bundle argument closed parameter`).
+
+## Measured vs master 2de2ffc1 (fixpoint seeds on both sides)
+
+| population | functions | start bodies |
+| --- | --- | --- |
+| self-compile | 19,518 → 19,521 | 138 → 138 |
+| distilled | 44,646 → 44,650 | 8,541 → 8,541 |
+| tests/cases | 62,640 → 62,684 | 4,961 → 4,961 |
+| capability probes | 517 → 517 | 170 → 170 |
+| filed witnesses | 17,842 → 17,846 | 3,709 → 3,710 |
+
+First misses in tests/cases:
+- `bundle argument`: 124 → out of the top 60.
+- `argument coercion`: 37 → 51, the next miss the callers reach.
