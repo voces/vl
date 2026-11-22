@@ -204,6 +204,7 @@ import {
   coerceHeldSwap,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
+  eqOperandDecodes,
   eqRouteOf,
   exprPrePathPastCoerce,
   exprPrePathWhy,
@@ -633,6 +634,7 @@ import {
   TY_BOOL,
   TY_I32,
   TY_NEVER,
+  TY_NUL_STR,
   TY_STR,
   tyScalarBasePrim,
 } from "./check_types"
@@ -4887,27 +4889,38 @@ function structEqVarOpnd(o: Opnd): boolean {
     && ib.irVars[o.ov].vKind != "temp"
 }
 
-// A `==`/`!=` legacy writes on its `nulNiche` route (`emitNulNicheEq`): the left operand, then the
-// right, which the guard reads twice, so it must be a variable or an immediate. A nullable record's
-// compare and an atom operand are legacy's other writers (`nulNicheEqWhy`), named misses.
+// A `==`/`!=` legacy writes on its `nulNiche` route (`emitNulNicheEq`): each operand as
+// `emitEqOperandRaw` writes it, the right twice, a variable read again and another pure operand
+// built again, as legacy writes it again. A nullable record's compare is a named miss.
 function nulNicheEq(b: i32[], n: BinExpr, ix: i32, rep: i32): Opnd {
   const why = nulNicheEqWhy(ix, ibFnIx)
   if why != "" { return irBMiss(why) }
   if repPrim(rep) != "bool" { return irBMiss("nullable eq result rep") }
-  const l = irBExpr(b, n.binLeft)
+  const l = eqOperandRaw(b, n.binLeft)
   const at = b.length
-  const r = irBExpr(b, n.binRight)
+  const r = eqOperandRaw(b, n.binRight)
   if ibMiss != "" { return l }
-  if b.length != at { return irBMiss("nullable eq right operand") }
-  if (
-    !(r is OVar)
-    || r.ov < 0
-    || r.ov >= ib.irVars.length
-    || ib.irVars[r.ov].vKind == "temp"
-  ) {
+  const plain = b.length == at
+    && r is OVar
+    && r.ov >= 0
+    && r.ov < ib.irVars.length
+    && ib.irVars[r.ov].vKind != "temp"
+  // A second build of a pure operand mints nothing a first did not (`exprEffectFree`).
+  if !plain && !exprEffectFree(n.binRight) {
     return irBMiss("nullable eq right operand")
   }
-  return irBLetTemp(b, { neL: l, neR: r, neAt: ix }, ix, rep)
+  const r2 = if plain { r } else { eqOperandRaw(b, n.binRight) }
+  if ibMiss != "" { return l }
+  return irBLetTemp(b, { neL: l, neR: r, neR2: r2, neAt: ix }, ix, rep)
+}
+
+// An operand of legacy's guarded compare as `emitEqOperandRaw` writes it: an atom it decodes
+// (`eqOperandDecodes`) at its string, nullable where its plan's `null` is (`atomStrPlanOf`), else
+// its value.
+function eqOperandRaw(b: i32[], ix: i32): Opnd {
+  if !eqOperandDecodes(ix, ibFnIx) { return irBExpr(b, ix) }
+  const ty = if atomStrPlanOf(ix, ibFnIx, false).apNul { TY_NUL_STR } else { TY_STR }
+  return deliver(b, ix, repNodeOfTy(ty), ty)
 }
 
 // A `==`/`!=` legacy writes on its numeric tail (`eqRouteOf`'s `numeric`) over a `boolean | null` niche and a bool or another
@@ -7198,6 +7211,13 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
       operandWhy(n.binLeft) == STR_OPERAND
       || operandWhy(n.binRight) == STR_OPERAND
     ) {
+      // A string compare over a nullable operand is legacy's guarded compare (`eqRouteOf`).
+      if (
+        (n.binOp == "==" || n.binOp == "!=")
+        && eqRouteOf(n, ix, ibFnIx) == "nulNiche"
+      ) {
+        return nulNicheEq(b, n, ix, rep)
+      }
       return irStrBinHook(b, ix, rep)
     }
     // A compound operand's compare is legacy's union or list compare, or a miss below.
