@@ -1487,22 +1487,19 @@ Deno.test({
         throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
       }
     }
-    // Cases 103 to 105 are a record retag of an i32, into an i32, and into a record whose field
-    // lowers to another valtype; 106, a record into one whose `bool` field lowers as an i32, holds.
-    for (const k of [103, 104, 105]) {
+    // Cases 103 to 106 are a record retag of an i32, into an i32, into a record whose field lowers
+    // to another valtype, and into one whose fields lower alike but on no shared struct heap.
+    for (const k of [103, 104, 105, 106]) {
       if (exp.irVerifySelfTest(k) !== 2) {
         throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
       }
     }
-    if (exp.irVerifySelfTest(106) !== 0) {
-      throw new Error(`case 106: want rule 0, got rule ${exp.irVerifySelfTest(106)}`);
-    }
-    // Case 107 is a width retag to a supertype whose field leads the record's; 108's does not.
-    if (exp.irVerifySelfTest(107) !== 0) {
-      throw new Error(`case 107: want rule 0, got rule ${exp.irVerifySelfTest(107)}`);
-    }
-    if (exp.irVerifySelfTest(108) !== 2) {
-      throw new Error(`case 108: want rule 2, got rule ${exp.irVerifySelfTest(108)}`);
+    // Cases 107 and 108 are a width retag to a record with no supertype heap declared, and to one
+    // whose field does not lead the record's.
+    for (const k of [107, 108]) {
+      if (exp.irVerifySelfTest(k) !== 2) {
+        throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
+      }
     }
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
