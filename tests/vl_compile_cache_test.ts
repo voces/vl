@@ -606,6 +606,7 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   cliTestJobsWanted: "uncached", cliTestNameCommit: "uncached", cliTestNamePush: "uncached",
   cliTestOutPush: "uncached", cliTestPlanCount: "uncached", cliTestPlanFile: "uncached",
   cliTestPlanTest: "uncached", cliTestPoolStage: "input", cliTestResultCommit: "uncached",
+  cliTestStreamWanted: "uncached", cliTestTopOutPush: "uncached",
   cliValidateCommit: "input", cliValidateNamesFile: "uncached", cwdCommit: "input",
   cwdPush: "input", diagAt: "output",
   diagCol: "output", diagCount: "output", diagLen: "output", diagLine: "output",
