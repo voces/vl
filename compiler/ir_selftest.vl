@@ -11,7 +11,9 @@ import {
   Rhs,
   irFnNew,
   irGlobalNote,
+  irGlobalStoreNote,
   irNodeNew,
+  irRecHeapNote,
   irSigNote,
   irVarNew,
   sIf,
@@ -90,6 +92,17 @@ const selfTestIds: string[] = [
   "width-retag-pair-unnoted",
   "hand-pick-of-i32",
   "hand-pick-record-into-i32",
+  "retag-field-alike-records-two-heaps",
+  "global-read-off-store-type",
+  "valued-block-temp-out",
+  "atom-sole-into-i32",
+  "atom-tower-i32-read",
+  "atom-tower-zero-reads",
+  "atom-staged-of-i32",
+  "trunc-sat-operand-off-plan",
+  "atomic-value-off-plan",
+  "memory-store-value-off-plan",
+  "simd-operand-off-plan",
 ]
 
 // `f(p: i32): i32 { t = p + 1; return t }`, broken the way case `id` names ("holds": not broken).
@@ -228,15 +241,65 @@ function caseFn(id: string): IrFn {
       node(f, { lDst: g, lRhs: { ggSym: 0, ggNonNull: false, ggNn: -1 } }, i32r),
     )
   }
+  // Rule 2 for a global read off its checked type's rep: one noted at i32, read through an untyped
+  // node, whose recorded store type is bool, so nothing justifies the i32 read.
+  if id == "global-read-off-store-type" {
+    irGlobalNote(f, 0, i32r)
+    irGlobalStoreNote(f, 0, TY_BOOL)
+    const at = callNode()
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    const rd: Rhs = { ggSym: 0, ggNonNull: false, ggNn: -1 }
+    f.irBody.push(irNodeNew(f, { lDst: g, lRhs: rd }, TY_I32, i32r, at))
+  }
   // Rule 8 with the bounds rule uninstalled: a bounds check must not pass unverified.
   if id == "bounds-rule-uninstalled" {
     f.irBody.push(node(f, { bcV: v(p), bcIx: v(p) }, none))
+  }
+  // Rule 2 against the plan a node carries: a truncation from f64 of an i32, an atomic store of an
+  // i32 at an i64 row, a memory store of an i32 at an f64 width, a SIMD op over an i32 at v128.
+  if id == "trunc-sat-operand-off-plan" {
+    const ts: Rhs = {
+      tsV: v(p),
+      tsAt: callNode(),
+      tsOp: 0,
+      tsFrom: "f64",
+      tsTo: "i32",
+    }
+    f.irBody.push(node(f, { efRhs: ts }, none))
+  }
+  if id == "atomic-value-off-plan" {
+    const am: Rhs = {
+      amArgs: [v(p), v(p)],
+      amAt: -1,
+      amBase: 2,
+      amValPrims: ["", "i64"],
+      amResPrim: "",
+    }
+    f.irBody.push(node(f, { efRhs: am }, none))
+  }
+  if id == "memory-store-value-off-plan" {
+    const mm: Rhs = { mmArgs: [v(p), v(p)], mmAt: -1, mmBase: 2, mmPrim: "f64" }
+    f.irBody.push(node(f, { efRhs: mm }, none))
+  }
+  if id == "simd-operand-off-plan" {
+    const sd: Rhs = {
+      sdArgs: [v(p)],
+      sdAt: -1,
+      sdMemBase: 0,
+      sdPrims: ["v128"],
+      sdResPrim: "",
+    }
+    f.irBody.push(node(f, { efRhs: sd }, none))
   }
   // Rule 2 again: a box whose immediate stands for a call, whose effect would go unread.
   if id == "box-immediate-for-call" {
     const bt = irVarNew(f, i32r, TY_I32, "temp", -1)
     f.irBody.push(
-      node(f, { lDst: bt, lRhs: { bxV: imm(i32r, 1), bxAt: callNode() } }, i32r),
+      node(
+        f,
+        { lDst: bt, lRhs: { bxV: imm(i32r, 1), bxAt: callNode(), bxFree: false } },
+        i32r,
+      ),
     )
   }
   // Rules for a fused `pop ?? d`: a pop of an i32, a bool out from an `i32[]`, and a default that
@@ -420,6 +483,19 @@ function caseFn(id: string): IrFn {
       node(f, { lDst: sn, lRhs: { nrV: v(p), nrAt: -1, nrKind: 2 } }, i32r),
     )
   }
+  // Rule 2 again: a retag of one record's list into another's whose fields' reps are alike, the
+  // two noted on different heaps.
+  if id == "retag-field-alike-records-two-heaps" {
+    const ra = mkObjTy(["a"], [TY_I32])
+    const rb = mkObjTy(["b"], [TY_I32])
+    irRecHeapNote(f, repNodeOfTy(ra), 1)
+    irRecHeapNote(f, repNodeOfTy(rb), 2)
+    const la = mkArrayTy(ra)
+    const lb = mkArrayTy(rb)
+    const l = irVarNew(f, repNodeOfTy(la), la, "local", 1)
+    const sn = irVarNew(f, repNodeOfTy(lb), lb, "temp", -1)
+    f.irBody.push(node(f, { lDst: sn, lRhs: { rgV: v(l) } }, repNodeOfTy(lb)))
+  }
   // Rule 2 again: an arm unbox whose operand is an i32, not a box.
   if id == "arm-unbox-of-i32" {
     const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
@@ -454,6 +530,29 @@ function caseFn(id: string): IrFn {
         i32r,
       ),
     )
+  }
+  // Rule 10: a valued block outside a helper whose out is a temp, not a loop value's binding.
+  if id == "valued-block-temp-out" {
+    const bo = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { bkLabel: 3, bkBody: [], bkOut: bo }, none))
+  }
+  // A sole member's atom id into an `i32` temp, which is no atom.
+  if id == "atom-sole-into-i32" {
+    const at = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: at, lRhs: { asAt: -1 } }, i32r))
+  }
+  // An atom tower testing an `i32` read, which is no string, and one testing no read.
+  if id == "atom-tower-i32-read" || id == "atom-tower-zero-reads" {
+    const tw = irVarNew(f, i32r, TY_I32, "temp", -1)
+    const reads: Opnd[] = if id == "atom-tower-i32-read" { [v(p)] } else { [] }
+    f.irBody.push(
+      node(f, { lDst: tw, lRhs: { saReads: reads, saAt: -1 } }, i32r),
+    )
+  }
+  // A staged atom narrowing parking an `i32`, which is no string.
+  if id == "atom-staged-of-i32" {
+    const sg = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: sg, lRhs: { zsV: v(p), zsAt: -1 } }, i32r))
   }
   f.irBody.push(node(f, { rtHas: true, rtV: v(t) }, none))
   return f
