@@ -272,7 +272,11 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  EQ_ROOT_EXPR,
+  EqRootPlace,
+  EqRootPlan,
   GlobalCtx,
+  MapUnionPlan,
   SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
@@ -391,6 +395,10 @@ import {
   mapGetOrMvHead,
   mapGetOrMvPlain,
   mapGetOrMvTail,
+  mapGetOrUnionHead,
+  mapGetOrUnionScalarOpen,
+  mapGetOrUnionScalarPlanOf,
+  mapGetOrUnionScalarTail,
   mapHasTail,
   mapKeysFrameOf,
   mapLengthPlain,
@@ -1759,9 +1767,10 @@ function sharedReadArm(
   return sharedArmBoxBody(vi, fi)
 }
 
-// One receiver push of shared read `r`: its stash slot's box, else the box local again.
+// One receiver push of shared read `r`: its stash slot's box, its global's, else its box local.
 function sharedReadRecv(r: RSharedRead, slot: i32) {
   if r.srStash { return sharedRecvSlotGet(slot) }
+  if r.srGlobal >= 0 { return globalRead(r.srGlobal, r.srGlobalNonNull) }
   return irLOpnd(r.srV)
 }
 
@@ -2348,10 +2357,11 @@ function mapGetOr(r: RMapGetOr) {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(r.mgAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if r.mgForm == 1 { "i32" } else if r.mgForm == 2 { "mv" } else { "helper" }
+  const want = if r.mgForm == 1 { "i32" } else if r.mgForm >= 2 { "mv" } else { "helper" }
   if (
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+    || r.mgForm == 3 && mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk).muKind < 0
   ) {
     return irLMiss("map read route")
   }
@@ -2366,9 +2376,14 @@ function mapGetOr(r: RMapGetOr) {
       r.mgNonNull,
       r.mgLoc,
       r.mgKey,
+      mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
     )
     irLOpnd(r.mgDef)
-    return mapGetOrInlineTail(r.mgForm, sh)
+    return mapGetOrInlineTail(
+      r.mgForm,
+      sh,
+      mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
+    )
   }
   const miss = mapGetOrHelperRoute(rd.idxArr, e.binRight, fnIx, rk)
   const fi = mapGetHelperFnOf(rd.idxArr, fnIx, miss[0])
@@ -2449,15 +2464,29 @@ function mapGetOrInlineHead(
   nonNull: boolean,
   loc: Opnd,
   key: Opnd,
+  qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 2 { mapGetOrMvHead(sh) } else { mapGetOrI32Head() }
+  if form == 3 {
+    mapGetOrUnionHead(sh)
+    mapGetOrUnionScalarOpen(sh, qp)
+  } else if form == 2 {
+    mapGetOrMvHead(sh)
+  } else {
+    mapGetOrI32Head()
+  }
   return sh
 }
 
 // An inline map read's tail after its default, by `form`.
-function mapGetOrInlineTail(form: i32, sh: i32) {
+function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
   return if form == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
+}
+
+// The scalar union plan of `recvIx[k] ?? defIx` at result kind `rk` (`mapGetOrUnionScalarPlanOf`).
+function mapGetOrUnionPlanAt(recvIx: i32, defIx: i32, rk: i32): MapUnionPlan {
+  return mapGetOrUnionScalarPlanOf(mapRecvShapeOf(recvIx, lw.irAt), defIx, rk)
 }
 
 // The fused map read whose default computes: the route `mapGetOr` checks, the shared head, the
@@ -2471,11 +2500,12 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if !(rd is Index) { return irLMiss("map read node") }
   const rk = coalResultKindOf(n.cbAt, fnIx)
   const arm = mapGetOrArmOf(rd.idxArr, e.binRight, fnIx, rk)
-  const want = if mp.prForm == 1 { "i32" } else if mp.prForm == 2 { "mv" } else { "helper" }
+  const want = if mp.prForm == 1 { "i32" } else if mp.prForm >= 2 { "mv" } else { "helper" }
   if (
     arm != want
     || want == "helper"
     || mp.prForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
+    || mp.prForm == 3 && mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk).muKind < 0
   ) {
     return irLMiss("map read route")
   }
@@ -2490,12 +2520,17 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     mp.prNonNull,
     n.cbL,
     mp.prKey,
+    mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
   )
   irLSettle(pending)
   lwFrames.push(-1)
   body(n.cbNull, false, n.cbOut, false)
   lwFrames.pop()
-  mapGetOrInlineTail(mp.prForm, sh)
+  mapGetOrInlineTail(
+    mp.prForm,
+    sh,
+    mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk),
+  )
   return 0
 }
 
@@ -2715,19 +2750,64 @@ function structEq(r: RStructEq) {
   const row = r.seRow
   const lS = structEqStagesLeft(n.binLeft, n.binRight)
   const rS = structEqStagesRight(n.binRight)
-  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
-  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
-  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+  const lE = r.seLIx.length > 0
+  const rE = r.seRIx.length > 0
+  const lLoc = if lS || lE { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS || rE { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && !lE && lLoc < 0 || !rS && !rE && rLoc < 0 {
     return irLMiss("record compare place")
+  }
+  const plan: EqRootPlan = {
+    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0]) } else { EQ_ROOT_EXPR },
+    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0]) } else { EQ_ROOT_EXPR },
+  }
+  if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
+    return irLMiss("record compare element place")
   }
   const saved = structEqEnter()
   if lS { irLOpnd(r.seL) }
   if rS { irLOpnd(r.seR) }
   const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
-  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+  if structEqTail(n, row, roots, saved, fnIx, plan) < 0 {
     return irLMiss("record compare fields")
   }
+  structEqRowsBank(plan.erL.epRows, plan.erR.epRows)
   return 0
+}
+
+// Banks the element-read rows a record compare's `elem` roots wrote (node, from, to), ordered by
+// where each starts.
+function structEqRowsBank(lRows: i32[], rRows: i32[]) {
+  let a = 0
+  let b = 0
+  while a < lRows.length || b < rRows.length {
+    const takeL = b >= rRows.length
+      || a < lRows.length && lRows[a + 1] < rRows[b + 1]
+    const rows = if takeL { lRows } else { rRows }
+    const k = if takeL { a } else { b }
+    lwRowAst.push(rows[k])
+    lwRowFrom.push(rows[k + 1])
+    lwRowTo.push(rows[k + 2])
+    lwRowKind.push(6)
+    if takeL { a = a + 3 } else { b = b + 3 }
+  }
+  return 0
+}
+
+// The `elem` root place of a record compare side read as a ref list element: receiver `v` and
+// index `i` from their locals, or `i` an immediate; `epSlot` -2 where one has no local.
+function structEqElemPlace(v: Opnd, i: Opnd): EqRootPlace {
+  const vs = structEqSideLocal(v)
+  const xs = if i is OImm { -1 } else { structEqSideLocal(i) }
+  const imm = if i is OImm { i.oiBits as% i32 } else { 0 }
+  const bad = vs < 0 || !(i is OImm) && xs < 0
+  return {
+    epKind: "elem",
+    epSlot: if bad { -2 } else { vs },
+    epIdx: xs,
+    epImm: imm,
+    epRows: [],
+  }
 }
 
 // The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
