@@ -359,8 +359,9 @@ Deno.test({
   },
 });
 
-// Outside the set: a string coalesce whose default is no literal, a closure parameter and a
-// propagating `as` conversion each leave their function uncovered, named.
+// Outside the set: a string coalesce whose default is no literal and a propagating `as`
+// conversion each leave their function uncovered, named. A closure parameter, its baked
+// callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
@@ -387,7 +388,8 @@ print(cv(3.0))
       }
     }
     const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered "));
-    if (unc.length < 3) throw new Error(`want three uncovered reasons, got ${JSON.stringify([...rows])}`);
+    if (unc.length < 2) throw new Error(`want two uncovered reasons, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) < 3) throw new Error(`want the closure parameter's functions covered, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -1467,9 +1469,9 @@ Deno.test({
     // Case 19 is a shared read over a temp, which its arms would read twice (rule 2), and case 20
     // a fused map read's mv slot read into an out that is not its map's value (rule 2). Cases 21
     // to 23 break a nullable reference's `??`: an `i32` and a non-null list operand, and a
-    // nullable list into an `i32` out (rule 2). Case 25 is a niche read over an i32 operand (rule
-    // 2); case 24 builds no breach here and holds as the control does.
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 0, 2];
+    // nullable list into an `i32` out (rule 2). Case 24 is a shared read whose global receiver's
+    // cell is no box (rule 2). Case 25 is a niche read over an i32 operand (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);

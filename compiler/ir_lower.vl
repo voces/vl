@@ -159,6 +159,7 @@ import {
   RNullOf,
   RNumCast,
   RNumIntr,
+  RNumIs,
   RNumUnionBin,
   RNumWiden,
   RPrimOp,
@@ -273,6 +274,9 @@ import {
   wULEB,
 } from "./emit_bytes"
 import {
+  EQ_ROOT_EXPR,
+  EqRootPlace,
+  EqRootPlan,
   GlobalCtx,
   MapUnionPlan,
   SHARED_NULL_NONE,
@@ -535,6 +539,7 @@ import {
   narrowedBoxVariantPlain,
   narrowedFieldPlain,
   narrowedVariantRepIs,
+  numIsPlanOf,
   structFieldPlain,
   variantFieldPlain,
 } from "./emit_plan_union"
@@ -580,6 +585,9 @@ import {
   nulStrMemberClose,
   nulStrMemberGuard,
   nulStrMemberOpen,
+  numLitEqTail,
+  numLitOnceMember,
+  numLitOnceStash,
   optRecvStagedAt,
   strMemberEqTail,
   unionLitIsPlanOf,
@@ -959,6 +967,7 @@ function rhs(r: Rhs, tail: boolean) {
     RListEmpty => listEmpty(r)
     RListEmptyArms => listEmptyArms(r)
     RLitArms => litArms(r)
+    RNumIs => numIs(r)
     RTagIs => {
       leaf()
       tagIsTail(r.tgiId)
@@ -1651,6 +1660,31 @@ function unionLitIs(r: RLitArms, recvIx: i32, lex: string): i32 {
   }
 }
 
+// `RNumIs` along `numIsPlanOf`, as `emitIsTestNumLit` writes it: the receiver once into its slot
+// and each member's compare, or per member the receiver (read again after the first) and compare.
+function numIs(r: RNumIs): i32 {
+  const n = nodeAt(r.niAt)
+  if !(n is IsExpr) { return irLMiss("numeric is node") }
+  const pl = numIsPlanOf(r.niAt, n, lw.irAt)
+  let i = 0
+  if pl.nlOnce {
+    irLOpnd(r.niV)
+    const slot = numLitOnceStash(pl.nlBase)
+    while i < pl.nlTexts.length {
+      numLitOnceMember(slot, pl.nlBase, pl.nlTexts[i], i)
+      i = i + 1
+    }
+    return 1
+  }
+  while i < pl.nlTexts.length {
+    if i == 0 { irLOpnd(r.niV) }
+    else if opndAgain(r.niV, n.isObj) < 0 { return -1 }
+    numLitEqTail(n.isObj, pl.nlTexts[i], i, lw.irAt)
+    i = i + 1
+  }
+  return 1
+}
+
 // `RLitArms`' receiver: its operand the first time, then read again as the builder read it.
 function litRecv(r: RLitArms): i32 {
   const n = nodeAt(r.liAt)
@@ -1767,9 +1801,10 @@ function sharedReadArm(
   return sharedArmBoxBody(vi, fi)
 }
 
-// One receiver push of shared read `r`: its stash slot's box, else the box local again.
+// One receiver push of shared read `r`: its stash slot's box, its global's, else its box local.
 function sharedReadRecv(r: RSharedRead, slot: i32) {
   if r.srStash { return sharedRecvSlotGet(slot) }
+  if r.srGlobal >= 0 { return globalRead(r.srGlobal, r.srGlobalNonNull) }
   return irLOpnd(r.srV)
 }
 
@@ -2756,19 +2791,64 @@ function structEq(r: RStructEq) {
   const row = r.seRow
   const lS = structEqStagesLeft(n.binLeft, n.binRight)
   const rS = structEqStagesRight(n.binRight)
-  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
-  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
-  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+  const lE = r.seLIx.length > 0
+  const rE = r.seRIx.length > 0
+  const lLoc = if lS || lE { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS || rE { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && !lE && lLoc < 0 || !rS && !rE && rLoc < 0 {
     return irLMiss("record compare place")
+  }
+  const plan: EqRootPlan = {
+    erL: if lE { structEqElemPlace(r.seL, r.seLIx[0]) } else { EQ_ROOT_EXPR },
+    erR: if rE { structEqElemPlace(r.seR, r.seRIx[0]) } else { EQ_ROOT_EXPR },
+  }
+  if plan.erL.epSlot == -2 || plan.erR.epSlot == -2 {
+    return irLMiss("record compare element place")
   }
   const saved = structEqEnter()
   if lS { irLOpnd(r.seL) }
   if rS { irLOpnd(r.seR) }
   const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
-  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+  if structEqTail(n, row, roots, saved, fnIx, plan) < 0 {
     return irLMiss("record compare fields")
   }
+  structEqRowsBank(plan.erL.epRows, plan.erR.epRows)
   return 0
+}
+
+// Banks the element-read rows a record compare's `elem` roots wrote (node, from, to), ordered by
+// where each starts.
+function structEqRowsBank(lRows: i32[], rRows: i32[]) {
+  let a = 0
+  let b = 0
+  while a < lRows.length || b < rRows.length {
+    const takeL = b >= rRows.length
+      || a < lRows.length && lRows[a + 1] < rRows[b + 1]
+    const rows = if takeL { lRows } else { rRows }
+    const k = if takeL { a } else { b }
+    lwRowAst.push(rows[k])
+    lwRowFrom.push(rows[k + 1])
+    lwRowTo.push(rows[k + 2])
+    lwRowKind.push(6)
+    if takeL { a = a + 3 } else { b = b + 3 }
+  }
+  return 0
+}
+
+// The `elem` root place of a record compare side read as a ref list element: receiver `v` and
+// index `i` from their locals, or `i` an immediate; `epSlot` -2 where one has no local.
+function structEqElemPlace(v: Opnd, i: Opnd): EqRootPlace {
+  const vs = structEqSideLocal(v)
+  const xs = if i is OImm { -1 } else { structEqSideLocal(i) }
+  const imm = if i is OImm { i.oiBits as% i32 } else { 0 }
+  const bad = vs < 0 || !(i is OImm) && xs < 0
+  return {
+    epKind: "elem",
+    epSlot: if bad { -2 } else { vs },
+    epIdx: xs,
+    epImm: imm,
+    epRows: [],
+  }
 }
 
 // The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
