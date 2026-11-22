@@ -1,4 +1,4 @@
-# IR verifier: twelve legacy queries become builder records (2026-11-22, lane IR-D1)
+# IR verifier: thirteen legacy queries become builder records (2026-11-22, lane IR-D1)
 
 The second batch of D17049 retirements, after `letBindTy` (#9592). In each case the verifier asked a
 legacy emit helper for a fact the builder had already computed while building the node. Now the
@@ -15,7 +15,7 @@ import goes. One commit per mechanism.
 | `atomicPlanOf`, `atomicValPrim`, `atomicResultPrim` (wasmEmit) | `atomicCheck` | `RAtomic.amBase`/`amValPrims`/`amResPrim` |
 | five SIMD row queries (wasmEmit) | `simdCheck` | `RSimd.sdMemBase`/`sdPrims`/`sdResPrim` |
 
-ir_verify's legacy imports: 28 → 16, from 8 modules, called in 5 functions. Counted by parsing its
+ir_verify's legacy imports: 29 → 16, from 8 modules, called in 5 functions. Counted by parsing its
 import lists and the uses in each function, comments stripped. The filing's "10 modules" counted
 wasmEmit's two import lists separately.
 
