@@ -1086,3 +1086,170 @@ Deno.test({
     }
   },
 });
+
+const TOPLEVEL = `${ROOT}/tests/fixtures/vl-test-toplevel`;
+
+Deno.test({
+  name:
+    "vl-test: a top level's output is the file's own block, shown as a test's would be",
+  ignore: !ENABLED,
+  fn: async () => {
+    // #1346: collection ran the top level with the sink closed, so what it printed was lost.
+    const quiet = await runTest(TOPLEVEL);
+    if (quiet.code !== 1) {
+      throw new Error(
+        `want the failing file red, got ${quiet.code}:\n${quiet.err}`,
+      );
+    }
+    const ls = lines(quiet.err);
+    const at = ls.findIndex((l) => l.endsWith("fails.test.vl"));
+    if (
+      at < 0 || !ls[at + 1]?.includes("--- top-level output ---") ||
+      !ls[at + 2]?.includes("top level of fails") ||
+      !ls[at + 3]?.includes("ok   passes and prints")
+    ) {
+      throw new Error(
+        `want the block under the failing file's header:\n${quiet.err}`,
+      );
+    }
+    // A file with no failure keeps its top level quiet, as a passing test does.
+    if (quiet.err.includes("top level of passes")) {
+      throw new Error(
+        `want no block for the passing file without --show-output:\n${quiet.err}`,
+      );
+    }
+    const shown = await runTest(TOPLEVEL, ["--show-output"]);
+    expectHas(shown.err, "top level of passes");
+    const parsed = parseTestReport(shown.err);
+    const files = parsed.topLevelOutputs.map((
+      t,
+    ) => [t.file?.split("/").pop(), t.output]);
+    if (
+      JSON.stringify(files) !==
+        JSON.stringify([["fails.test.vl", "top level of fails"], [
+          "passes.test.vl",
+          "top level of passes",
+        ]])
+    ) {
+      throw new Error(
+        `want both blocks parsed to their files, got ${JSON.stringify(files)}`,
+      );
+    }
+    // A passing test's `--show-output` block is unclassified already; the top-level lines are not.
+    if (parsed.unmatched.some((l) => l.includes("top level of"))) {
+      throw new Error(
+        `want the top-level lines classified, got ${JSON.stringify(parsed.unmatched)}`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-test: --json writes one document to stdout, every test's output included",
+  ignore: !ENABLED,
+  fn: async () => {
+    // #1347 item 3.
+    const r = await runTest(TOPLEVEL, ["--json"]);
+    if (r.code !== 1) {
+      throw new Error(
+        `want exit 1 for the failing test, got ${r.code}:\n${r.err}`,
+      );
+    }
+    if (r.err.trim() !== "") {
+      throw new Error(`want no text report on stderr, got:\n${r.err}`);
+    }
+    const doc = JSON.parse(r.out);
+    const got = JSON.stringify([
+      doc.passed,
+      doc.failed,
+      doc.skipped,
+      doc.files.map((
+        f: {
+          path: string;
+          error: unknown;
+          output: string;
+          tests: Array<Record<string, string>>;
+        },
+      ) => [
+        f.path.split("/").pop(),
+        f.error,
+        f.output,
+        f.tests.map((t) => [t.name, t.status, t.output]),
+      ]),
+    ]);
+    const want = JSON.stringify([2, 1, 0, [
+      ["fails.test.vl", null, "top level of fails\n", [
+        ["passes and prints", "passed", "from the passing test\n"],
+        ["fails and prints", "failed", "from the failing test\n"],
+      ]],
+      ["passes.test.vl", null, "top level of passes\n", [[
+        "only passes",
+        "passed",
+        "",
+      ]]],
+    ]]);
+    if (got !== want) throw new Error(`want ${want}\ngot  ${got}`);
+    if (!doc.files[0].tests[1].message.includes("expected 1 to equal 2")) {
+      throw new Error(
+        `want the failure message, got ${
+          JSON.stringify(doc.files[0].tests[1])
+        }`,
+      );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "vl-test: --no-capture streams output under === RUN lines, one test at a time",
+  ignore: !ENABLED,
+  fn: async () => {
+    // #1347 item 2. Collection runs every top level before the first test, and a trap in
+    // a file's last test re-instantiates nothing.
+    const r = await runTest(TOPLEVEL, ["--no-capture"]);
+    if (r.code !== 1) {
+      throw new Error(
+        `want exit 1 for the failing test, got ${r.code}:\n${r.err}`,
+      );
+    }
+    const got = lines(r.out).map((l) =>
+      l.replace(/\S*\/(\w+\.test\.vl)/, "$1")
+    );
+    const want = [
+      "=== RUN  fails.test.vl (top level)",
+      "top level of fails",
+      "=== RUN  passes.test.vl (top level)",
+      "top level of passes",
+      "=== RUN  fails.test.vl: passes and prints",
+      "from the passing test",
+      "=== RUN  fails.test.vl: fails and prints",
+      "from the failing test",
+      "=== RUN  passes.test.vl: only passes",
+    ];
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      throw new Error(
+        `want ${JSON.stringify(want, null, 1)}\ngot  ${
+          JSON.stringify(got, null, 1)
+        }`,
+      );
+    }
+    // The report still lands on stderr, and its captured blocks are empty: nothing was kept.
+    expectHas(r.err, "2 files · 2 passed · 1 failed");
+    if (r.err.includes("--- captured output ---")) {
+      throw new Error(`want no captured block under --no-capture:\n${r.err}`);
+    }
+    for (
+      const [args, needle] of [
+        [["--jobs", "2"], "it takes no --jobs above 1"],
+        [["--json"], "which --json writes its report to"],
+      ] as const
+    ) {
+      const bad = await runTest(TOPLEVEL, ["--no-capture", ...args]);
+      if (bad.code !== 2) {
+        throw new Error(`want a usage error for ${args}, got ${bad.code}`);
+      }
+      expectHas(bad.err, needle);
+    }
+  },
+});

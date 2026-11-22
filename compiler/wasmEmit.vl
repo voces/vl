@@ -6192,15 +6192,45 @@ function isTagWhollyTested(
 function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
   const nd = nodeAt(isIx)
   if !(nd is IsExpr) { return 0 }
+  const p = listIsAcrossPlanOf(isIx, nd, fnIx)
+  if !p.lpOk { return 0 }
+  const slot = sharedFieldRecvSlot()
+  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  return listIsAcrossTail(nd, slot, p, fnIx)
+}
+
+// `listIsAcrossRepsPlan`'s answer for `is` test `isIx`: the tested list type, per tag how it is
+// tested and the slots its loop walks; `lpOk` false when the test is not that shape.
+export type ListIsAcrossPlan = {
+  lpChk: i32,
+  lpTags: i32[],
+  lpFits: i32[],
+  lpSlots: i32[][],
+  lpOk: boolean,
+}
+
+// The plan `emitListIsAcrossReps` and the IR's `RListIsAcross` write `nd` (at `isIx`) by.
+export function listIsAcrossPlanOf(
+  isIx: i32,
+  nd: IsExpr,
+  fnIx: i32,
+): ListIsAcrossPlan {
   const chk = isVarTyIxOf(isIx)
   const tags: i32[] = []
   const fits: i32[] = []
   const slotsAt: i32[][] = []
-  if !listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt) {
-    return 0
-  }
-  const slot = sharedFieldRecvSlot()
-  if emitExpr(nd.isObj, fnIx) < 0 { return -1 }
+  const ok = listIsAcrossRepsPlan(nd.isObj, chk, fnIx, tags, fits, slotsAt)
+  return { lpChk: chk, lpTags: tags, lpFits: fits, lpSlots: slotsAt, lpOk: ok }
+}
+
+// After `nd`'s receiver: its box into `slot`, then plan `p`'s test, false on a null box. 1 once
+// written, -1 on failure.
+export function listIsAcrossTail(
+  nd: IsExpr,
+  slot: i32,
+  p: ListIsAcrossPlan,
+  fnIx: i32,
+): i32 {
   fbLocalSet(slot)
   // A nullable operand is false on null; the box is a null reference then (D4953).
   const nullable = nodeTyIsNullable(nd.isObj)
@@ -6211,7 +6241,10 @@ function emitListIsAcrossReps(isIx: i32, fnIx: i32): i32 {
     fbI32Const(0)
     fbElse()
   }
-  if emitListIsAcrossRepsAt(slot, chk, tags, fits, slotsAt, fnIx) < 0 {
+  if (
+    emitListIsAcrossRepsAt(slot, p.lpChk, p.lpTags, p.lpFits, p.lpSlots, fnIx)
+    < 0
+  ) {
     return -1
   }
   if nullable { fbEnd() }
@@ -12404,8 +12437,8 @@ function emitMemSharedRead(memIx: i32, fnIx: i32): i32 {
       // ident receiver takes no slot and re-emits, so existing programs emit the same bytes.
       let shSlot = -1
       if sharedReadStashes(memIx) {
-        shSlot = sharedFieldRecvSlot()
         if emitExpr(mS.memObj, fnIx) < 0 { return -1 }
+        shSlot = sharedFieldRecvSlot()
         fbLocalSet(shSlot)
       }
       let si2 = 0
@@ -23285,6 +23318,8 @@ function emitNulArmToLocal(
   if valIx < 0 {
     return emitFail("emitProgram: if-expression arm is not a value")
   }
+  // A call that never returns leaves the arm by its `unreachable`, so nothing is stored.
+  if callIsNever(unwrapParen(valIx)) { return emitExpr(valIx, fnIx) }
   if rep == 0 {
     // The binding's local is the union box `(ref $uBox)`, so a concrete-variant arm (a
     // kind-8 `(ref $variant)`) must be boxed to match, exactly as `emitUnionIfArm` and a
@@ -23493,6 +23528,8 @@ function emitUnionArmToPair(
   if valIx < 0 {
     return emitFail("emitProgram: if-expression arm is not a value")
   }
+  // A call that never returns leaves the arm by its `unreachable`: no box reaches the pair.
+  if callIsNever(unwrapParen(valIx)) { return emitExpr(valIx, fnIx) }
   if emitUnionBoxOwed(unionName, unionTy, valIx, fnIx) < 0 { return -1 }
   return unionBoxToPairTail(idx)
 }
@@ -38753,7 +38790,6 @@ function emitPrintScalarSink(k: i32) {
 // dispatch is the only piece needed, the same dispatch the emitter performs for `is`.
 // One evaluation: each arm reads the box twice, so it is stashed once in the lazy frame.
 function emitPrintValueUnion(argIx: i32, kinds: i32[], fnIx: i32) {
-  const slot = sharedFieldRecvSlot()
   // D969 — an if-expression argument must be coerced, not plain-emitted: `emitExpr` picks
   // an if's blocktype from the arms' scalar ladder, so a desugared `??` pushes an i32
   // blocktype over two ref arms into this box slot. `emitUnionCoerce` routes it through `emitUnionIfValue` instead.
@@ -38771,11 +38807,11 @@ function emitPrintValueUnion(argIx: i32, kinds: i32[], fnIx: i32) {
   if !puDone {
     if emitExpr(argIx, fnIx) < 0 { return -1 }
   }
-  return printUnionTail(slot, kinds)
+  return printUnionTail(sharedFieldRecvSlot(), kinds)
 }
 
 // After a value-union box is on the stack: stash it once in `slot` (`sharedFieldRecvSlot`, taken
-// before the box is written) and print the arm its tag names, over `printUnionPlan`'s kinds.
+// after the box is written) and print the arm its tag names, over `printUnionPlan`'s kinds.
 export function printUnionTail(slot: i32, kinds: i32[]) {
   fbLocalSet(slot)
   let i = 0
@@ -40216,15 +40252,24 @@ function emitNumRepNarrow(from: VKind, to: VKind): i32 {
   )
 }
 
+// The list arms `emitArmIndexWrite` stores `target` through, or none: an identifier receiver whose
+// box of list arms no list-union rewrite overrides.
+export function armIndexWriteArmsOf(target: Index, fnIx: i32): i32[] {
+  const recv = unwrapParen(target.idxArr)
+  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) {
+    return []
+  }
+  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return [] }
+  return luMembersAt(nodeTyAt(recv, fnIx))
+}
+
 // `recv[i] = v` through a union-of-lists box a pin or an `is K[]` arm left unrewritten: per list
 // arm, the store lowers with `recv` overridden to that arm, its value converted to the arm's
 // element as any store converts it. 0 when `target` is no such store, 1 when emitted.
 function emitArmIndexWrite(fnIx: i32, a: BinExpr, target: Index): i32 {
-  const recv = unwrapParen(target.idxArr)
-  if recv < 0 || recv >= P.nodes.length || !(nodeAt(recv) is Ident) { return 0 }
-  if luOvLocalOf(recv) >= 0 || !exprUnion(recv, fnIx) { return 0 }
-  const arms = luMembersAt(nodeTyAt(recv, fnIx))
+  const arms = armIndexWriteArmsOf(target, fnIx)
   if arms.length == 0 { return 0 }
+  const recv = unwrapParen(target.idxArr)
   if emitArmIndexWriteAt(fnIx, a, target, recv, arms, 0) < 0 { return -1 }
   asgParkedSlot = -1
   return 1
@@ -40716,13 +40761,17 @@ function njAsConverts(ms: i32[], to: i32): boolean {
 // Converts the numeric union at `ix` to kind `to` at whichever member it holds: an infallible
 // `as`, and a delivery into a numeric primitive every member widens to exactly.
 function emitNumUnionConvert(ix: i32, to: i32, fnIx: i32) {
-  const ms = njMembersOf(ix, fnIx)
-  const key = njDepth * 2
-  njDepth = njDepth + 1
+  const key = numUnionStashEnter()
   const bs = njStash(ix, true, key, fnIx)
-  njDepth = njDepth - 1
+  numUnionStashLeave()
   if bs < 0 { return -1 }
-  return njConvertArm(ms, 0, bs, to)
+  return numUnionConvertTail(ix, to, fnIx, bs)
+}
+
+// After numeric union `ix`'s box is stashed in slot `bs`: its conversion to kind `to` at the
+// member it holds, the dispatch `emitNumUnionConvert` and the IR's conversion both write.
+export function numUnionConvertTail(ix: i32, to: i32, fnIx: i32, bs: i32): i32 {
+  return njConvertArm(njMembersOf(ix, fnIx), 0, bs, to)
 }
 
 // The conversion dispatch from member `i` on; the last member is the bare `else`.
@@ -44860,7 +44909,6 @@ function coalNulMapShape(e: BinExpr, fnIx: i32): i32 {
 // The last `emitCoalesceGo` arms, along `coalNulRefsArmOf`, and the refusal for any other nullable
 // operand. Returns what `emitCoalesceGo` returns.
 function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
-  const lhsIx = unwrapParen(e.binLeft)
   return match coalNulRefsArmOf(e, exprIx, fnIx) {
     "heap" | "mapHeap" => emitCoalesceNulRef(e, exprIx, coalNulRefsHeapOf(e, exprIx, fnIx), fnIx)
     // D960: a value-union box whose operand cannot be re-read, stashed once and branched on its
@@ -44874,7 +44922,7 @@ function emitCoalesceNullableRefs(e: BinExpr, exprIx: i32, fnIx: i32) {
     }
     "armIf" => emitExpr(coalNullArmIf(e, exprIx), fnIx)
     // A record union's shared `scalar | null` field reads as its box (D13280).
-    "boxFieldScalar" => emitCoalesceBoxFieldScalar(e, exprIx, coalBoxFieldScalarKind(lhsIx, fnIx), fnIx)
+    "boxFieldScalar" => emitCoalesceBoxFieldScalar(e, exprIx, fnIx)
     "none" => emitFail(
       "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
     )
@@ -44931,37 +44979,56 @@ function sharedReadDeliversBox(memIx: i32, fnIx: i32): boolean {
     && sharedFieldPlanDispatchable(code, vis, fis)
 }
 
-// `f ?? d` over a field read `f` yielding a `scalar | null` box of atom kind `fk`: the box is
-// read once, its tag decides, and the present arm unboxes and widens to the `??`'s own scalar.
-function emitCoalesceBoxFieldScalar(
+// The plan of `f ?? d` over a field read yielding a `scalar | null` box: the box's atom kind and
+// the `??`'s own scalar kind it widens to, both -1 where no conversion joins them.
+export type BoxFieldPlan = { bfKind: i32, bfRes: i32 }
+
+export function coalBoxFieldScalarPlanOf(
   e: BinExpr,
   exprIx: i32,
-  fk: i32,
   fnIx: i32,
-) {
+): BoxFieldPlan {
+  const fk = coalBoxFieldScalarKind(unwrapParen(e.binLeft), fnIx)
   let rk = coalResultKindOf(exprIx, fnIx)
   if rk < 0 { rk = fk }
-  if rk != fk && !coalWidens(fk, rk) {
-    return emitFail(
-      "emitProgram: `??` over a nullable value-box field has no conversion to its result",
-    )
+  if fk < 0 || rk != fk && !coalWidens(fk, rk) {
+    return { bfKind: -1, bfRes: -1 }
   }
+  return { bfKind: fk, bfRes: rk }
+}
+
+// After the box is on the stack: stashed once, its tag tested in an `if` of the result's scalar,
+// whose present arm unboxes and widens; the default follows the `else`, then `fbEnd`.
+export function coalBoxFieldScalarOpen(p: BoxFieldPlan) {
   const slot = sharedFieldRecvSlot()
-  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
   fbLocalSet(slot)
   fbLocalGet(slot)
   fbStructGet(uBoxIdx, 0) // field 0: tag
   fbI32Rel(RS_TAG, nullBoxTag())
   fbI32Bin(71) // 0x47 i32.ne — present?
-  fbIf(nulBoxScalarValtype(rk))
+  fbIf(nulBoxScalarValtype(p.bfRes))
   fbLocalGet(slot)
   fbStructGet(uBoxIdx, 1) // field 1: the payload anyref
-  const vb = vbHeapIdxOfKind(fk)
+  const vb = vbHeapIdxOfKind(p.bfKind)
   fbRefCast(vb)
   fbStructGet(vb, 0)
-  if coalWidenUnboxed(fk, rk) < 0 { return -1 }
+  if coalWidenUnboxed(p.bfKind, p.bfRes) < 0 { return -1 }
   fbElse()
-  if emitExprAsKind(e.binRight, rk, fnIx) < 0 { return -1 }
+  return 0
+}
+
+// `f ?? d` along its plan: the box read once, then `coalBoxFieldScalarOpen`, the default in the
+// `??`'s own scalar, and the end.
+function emitCoalesceBoxFieldScalar(e: BinExpr, exprIx: i32, fnIx: i32) {
+  const p = coalBoxFieldScalarPlanOf(e, exprIx, fnIx)
+  if p.bfKind < 0 {
+    return emitFail(
+      "emitProgram: `??` over a nullable value-box field has no conversion to its result",
+    )
+  }
+  if emitExpr(e.binLeft, fnIx) < 0 { return -1 }
+  if coalBoxFieldScalarOpen(p) < 0 { return -1 }
+  if emitExprAsKind(e.binRight, p.bfRes, fnIx) < 0 { return -1 }
   fbEnd()
   return 0
 }
