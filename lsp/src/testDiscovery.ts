@@ -328,6 +328,11 @@ export interface TestReportFileError {
   message: string;
 }
 
+export interface TestReportTopLevelOutput {
+  file: string | null;
+  output: string;
+}
+
 export interface TestReportSummary {
   files: number;
   passed: number;
@@ -340,6 +345,8 @@ export interface ParsedTestReport {
   fileErrors: TestReportFileError[];
   /** Files whose report was `no tests` (the filter matched nothing there). */
   emptyFiles: string[];
+  /** What a file's top level printed, from its `--- top-level output ---` block. */
+  topLevelOutputs: TestReportTopLevelOutput[];
   summary: TestReportSummary | null;
   /** Every line the parser could not classify, verbatim and in order. */
   unmatched: string[];
@@ -466,6 +473,7 @@ export const parseTestReport = (text: string): ParsedTestReport => {
   const results: TestReportResult[] = [];
   const fileErrors: TestReportFileError[] = [];
   const emptyFiles: string[] = [];
+  const topLevelOutputs: TestReportTopLevelOutput[] = [];
   const unmatched: string[] = [];
   let summary: TestReportSummary | null = null;
   let file: string | null = null;
@@ -489,6 +497,14 @@ export const parseTestReport = (text: string): ParsedTestReport => {
     }
     closeBlock();
     if (line.length === 0) continue;
+
+    // A file's top-level output: the runner prints it under the file header, before any test.
+    if (line === "       --- top-level output ---") {
+      const record: TestReportTopLevelOutput = { file, output: "" };
+      topLevelOutputs.push(record);
+      block = { lines: [], commit: (output) => record.output = output };
+      continue;
+    }
 
     // A status line: exactly two spaces, a four-cell status, one space, a name.
     if (line.startsWith("  ") && line[2] !== " ") {
@@ -547,5 +563,5 @@ export const parseTestReport = (text: string): ParsedTestReport => {
   }
   closeBlock();
 
-  return { results, fileErrors, emptyFiles, summary, unmatched };
+  return { results, fileErrors, emptyFiles, topLevelOutputs, summary, unmatched };
 };

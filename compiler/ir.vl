@@ -118,6 +118,9 @@ export type RBoxNarrow = {
   bnAtom: i32,
   bnCon: i32,
 }
+// A box value narrowed to a record arm, unboxed at a record destination as legacy's
+// `emitArmUnboxCast` writes it after the box: the payload cast to the arm's heap, `uaAt` the read.
+export type RArmUnbox = { uaV: Opnd, uaAt: i32 }
 // A box local read at its storage as the niche (`nicheReadKindAt`, kind `nrKind`) its narrowing
 // names, `nrAt` the read: the null tag is the niche's null, any other arm its payload.
 export type RNicheRead = { nrV: Opnd, nrAt: i32, nrKind: i32 }
@@ -317,6 +320,9 @@ export type RListEmpty = { leV: Opnd, leAt: i32 }
 // Box variable `lfV` tested at each list arm of `is` test `lfAt` whose elements never meet the
 // tested type (`emptyFitArmsPlanOf`): the arm's tag, then its list's emptiness, or'd: a bool.
 export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
+// `laV is L` for list type `L` over a box of list arms at `is` test `laAt`, along
+// `listIsAcrossRepsPlan`: the box once into the shared receiver slot, then each arm's test.
+export type RListIsAcross = { laV: Opnd, laAt: i32 }
 // `liV` at literal arm `liArm` of `is` test `liAt` (`litIsArmOf`), read once per member the arm
 // compares, as `emitIsTestLitArms` writes it: a bool.
 export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
@@ -328,6 +334,9 @@ export type RNumIs = { niV: Opnd, niAt: i32 }
 // A binary operator at node `nbAt` on legacy's `numUnion` route, over its non-literal sides in
 // order (a literal side is written at each member's width, so it has no operand).
 export type RNumUnionBin = { nbArgs: Opnd[], nbAt: i32 }
+// Numeric union box `nuV` of node `nuAt` converted to number kind `nuTo` at the member it holds,
+// as legacy's `emitNumUnionConvert` writes it (`widenPlanOf`'s `convert`).
+export type RNumUnionConvert = { nuV: Opnd, nuTo: i32, nuAt: i32 }
 export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
 // A SIMD intrinsic at call `sdAt` other than a load or store: its value operands, then its one
 // instruction and any lane immediates (`simdTail`).
@@ -401,6 +410,9 @@ export type REnvDrop = { edFn: i32 }
 // The closure the bundle parameter or record holder `bpV` holds for call `bpAt`, as `bundlePickOf`
 // picks it.
 export type RBundlePick = { bpV: Opnd, bpAt: i32 }
+// The member closure direct call `rkAt` of `fnStmts` slot `rkFe` picks from the bundle record
+// `rkV` it returned, as `bundleResultPickOf` (legacy's `emitBundleResultPick`) names it.
+export type RResultPick = { rkV: Opnd, rkAt: i32, rkFe: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
 // reads an i32 as the bool wasm's `if` takes it to be, nonzero true, and writes nothing. `tag64`
@@ -415,7 +427,8 @@ export type RRel = { rlSp: i32, rlSub: i32, rlVal: i32 }
 // argument before one whose valued `if` the lowering writes it below (`stageLead`), or a union box
 // read at a narrower union's box rep, the same box.
 export type RStage = { sgV: Opnd }
-export type Rhs = RAsUnion
+export type Rhs = RArmUnbox
+  | RAsUnion
   | RAtomEq
   | RAtomStr
   | RAtomic
@@ -446,6 +459,7 @@ export type Rhs = RAsUnion
   | RListEmptyArms
   | RListEq
   | RListGet
+  | RListIsAcross
   | RListLen
   | RListNew
   | RListNewDefault
@@ -475,6 +489,7 @@ export type Rhs = RAsUnion
   | RNumIntr
   | RNumIs
   | RNumUnionBin
+  | RNumUnionConvert
   | RNumWiden
   | RPrimOp
   | RPrint
@@ -482,6 +497,7 @@ export type Rhs = RAsUnion
   | RRecCopyPure
   | RRecover
   | RRel
+  | RResultPick
   | RRetNull
   | RRetag
   | RSharedRead
@@ -583,7 +599,7 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 export function coalArmStagesLeads(a: CoalValArm): boolean {
   return match a {
     "litUnion" | "nulBool" | "nulRef" => true
-    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" => false
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" | "popOr" | "mapIndexGetOr" | "fieldBox" | "fieldVal" | "optLeaf" | "boxFieldScalar" => false
   }
 }
 // An integer `match` chain written as one `br_table` (`IntSwitchPlan`): operand `isOn` less
@@ -699,6 +715,8 @@ export type IrFn = {
   irGlobalSym: i32[],
   irGlobalRep: i32[],
   irGlobalAt: {[i32]: i32},
+  // The heap the builder noted for each record rep a hole retag compares (`irRecHeapNote`).
+  irRecHeap: {[i32]: i32},
   // The globals whose cell holds the record a holding binding holds whole, noted at that record's
   // rep: a read of one at that rep is at its storage.
   irGlobalHeld: {[i32]: boolean},
@@ -786,6 +804,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irGlobalSym: [],
     irGlobalRep: [],
     irGlobalAt: Map(),
+    irRecHeap: Map(),
     irGlobalHeld: Map(),
     irSpanAst: [],
     irSpanFirst: [],
@@ -880,6 +899,17 @@ export function irSpanNoteKind(
   at.push(f.irSpanAst.length - 1)
   f.irSpansAt[first] = at
   f.irSpanEnds[last] = (f.irSpanEnds[last] ?? 0) + 1
+  return 0
+}
+
+// The heap `f` noted for record rep `r`, or -1 for none.
+export function irRecHeapOf(f: IrFn, r: i32): i32 {
+  return f.irRecHeap[r] ?? -1
+}
+
+// Notes record rep `r` stored at heap `h`, once.
+export function irRecHeapNote(f: IrFn, r: i32, h: i32) {
+  if (f.irRecHeap[r] ?? -1) < 0 { f.irRecHeap[r] = h }
   return 0
 }
 
@@ -1207,6 +1237,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
     RNumUnionBin => r.nbArgs
+    RNumUnionConvert => [r.nuV]
     RSimd => r.sdArgs
     RCoalStr => [r.czL, r.czD]
     RCoalAtomStr => [r.zaL, r.zaD]
@@ -1221,11 +1252,13 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RNulNicheEq => [r.neL, r.neR, r.neR2]
     RAtomEq => [r.aeL, r.aeR]
     RAsUnion => [r.auV]
+    RArmUnbox => [r.uaV]
     RTagStash => [r.tgsV]
     RStashSet => [r.ssV]
     RTagIs => []
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
+    RListIsAcross => [r.laV]
     RLitArms => [r.liV]
     RNumIs => [r.niV]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
@@ -1242,6 +1275,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     REnvGet => []
     REnvDrop => []
     RBundlePick => [r.bpV]
+    RResultPick => [r.rkV]
     RRawOp => r.rwArgs
     RRel => []
     RStage => [r.sgV]
@@ -1310,6 +1344,7 @@ function rhsText(r: Rhs): string {
       + ")"
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
+    RArmUnbox => "arm_unbox " + opndText(r.uaV) + " @" + i32ToStr(r.uaAt)
     RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
@@ -1338,10 +1373,12 @@ function rhsText(r: Rhs): string {
     RTagIs => "tag is " + i32ToStr(r.tgiId)
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
+    RListIsAcross => "list is across " + opndText(r.laV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
     RNumIs => "num is " + opndText(r.niV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
     RNumUnionBin => "num_union(" + opndsText(r.nbArgs) + ")"
+    RNumUnionConvert => "num_union_convert " + opndText(r.nuV)
     RSimd => "simd(" + opndsText(r.sdArgs) + ")"
     RMapGetOr => "map.get_or " + mapRecvText(r.mgSym, r.mgLoc) + "[" + opndText(r.mgKey) + "]"
     RMapGet => "map.get " + mapRecvText(r.mtSym, r.mtLoc) + "[" + opndText(r.mtKey) + "]"
@@ -1368,6 +1405,7 @@ function rhsText(r: Rhs): string {
     REnvGet => "env " + i32ToStr(r.evSlot)
     REnvDrop => "env drop f" + i32ToStr(r.edFn)
     RBundlePick => "bundle pick " + opndText(r.bpV)
+    RResultPick => "result pick " + opndText(r.rkV)
     RGlobalGet => "global " + i32ToStr(r.ggSym) + (if r.ggNonNull { " nonnull" } else { "" })
   }
 }
@@ -1583,7 +1621,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
     SCoalBox => match n.cbArm {
       "popOr" => "list"
       "nulRef" => "box"
-      "litUnion" | "nulBool" => "box"
+      "litUnion" | "nulBool" | "boxFieldScalar" => "box"
       "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
@@ -1633,6 +1671,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListEmptyArms |
       RListEq |
       RListGet |
+      RListIsAcross |
       RListLen |
       RListNew |
       RListNewDefault |
@@ -1651,7 +1690,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMapNew |
       RMapOp |
       RMapSet => "map"
-    RAsUnion |
+    RArmUnbox |
+      RAsUnion |
       RBoxField |
       RBoxNarrow |
       RCast |
@@ -1667,10 +1707,12 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RCallRef |
       REnvDrop |
       REnvGet |
-      RMakeClo => "closure"
+      RMakeClo |
+      RResultPick => "closure"
     RCellGet |
       RCellNew |
       RFnId |
+      RNumUnionConvert |
       RTagOf => "other"
     RAtomic |
       RMemAccess |
@@ -1850,32 +1892,49 @@ export function listRetag(src: i32, dst: i32): boolean {
 
 // Whether a list at rep `src` is the list at rep `dst` as it stands, `dst` leaving a closure's
 // parameter or result unknown: a result whose type still holds a hole the value fills.
-export function listRetagHole(src: i32, dst: i32): boolean {
+export function listRetagHole(f: IrFn, src: i32, dst: i32): boolean {
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if !(a is RList) || !(d is RList) { return false }
-  return repFillsHole(a.rlsElem, d.rlsElem, false)
+  return repFillsHole(f, a.rlsElem, d.rlsElem, false)
+}
+
+// Whether a closure at rep `src`, or a list, map or record holding one, is the value at `dst` as it
+// stands: the two differ only where one side leaves a closure's parameter or result unknown, and
+// every closure lowers to the one closure struct.
+export function cloHoleRetag(f: IrFn, src: i32, dst: i32): boolean {
+  if src == dst { return false }
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  // A map's values, at the top only: `repFillsHole` itself, behind `listRetagHole`, admits none.
+  if a is RMap && d is RMap {
+    return a.rmVal != d.rmVal && cloHoleRetag(f, a.rmVal, d.rmVal)
+  }
+  return repFillsHole(f, src, dst, false) || repFillsHole(f, dst, src, false)
 }
 
 // Whether rep `src` is `dst`, or `dst` with parts of a closure (`inClo`) left unknown.
-function repFillsHole(src: i32, dst: i32, inClo: boolean): boolean {
+function repFillsHole(f: IrFn, src: i32, dst: i32, inClo: boolean): boolean {
   if src == dst { return true }
   const a = repNodeAt(src)
   const d = repNodeAt(dst)
   if a == null || d == null { return false }
   return match d {
     RUnsup => inClo
-    RList => a is RList && repFillsHole(a.rlsElem, d.rlsElem, inClo)
+    RList => a is RList && repFillsHole(f, a.rlsElem, d.rlsElem, inClo)
     RNullable => a is RNullable
       && a.rnDisc == d.rnDisc
-      && repFillsHole(a.rnInner, d.rnInner, inClo)
+      && repFillsHole(f, a.rnInner, d.rnInner, inClo)
+    // A record is the value at its heap whatever its fields' reps, and a recursive record's fields
+    // lead back to it, so two records are one value exactly where one noted heap stores both.
     RRecord => a is RRecord
       && a.rrVariant == d.rrVariant
-      && repsFillHoles(a.rrFields, d.rrFields, inClo)
+      && irRecHeapOf(f, src) >= 0
+      && irRecHeapOf(f, src) == irRecHeapOf(f, dst)
     RClosure => a is RClosure
       && a.rcVoid == d.rcVoid
-      && repsFillHoles(a.rcParams, d.rcParams, true)
-      && repFillsHole(a.rcRet, d.rcRet, true)
+      && repsFillHoles(f, a.rcParams, d.rcParams, true)
+      && repFillsHole(f, a.rcRet, d.rcRet, true)
     RAtom |
       RBox |
       RMap |
@@ -1886,11 +1945,16 @@ function repFillsHole(src: i32, dst: i32, inClo: boolean): boolean {
 }
 
 // Whether each of reps `src` fills the hole of the same-placed rep of `dst`.
-function repsFillHoles(src: i32[], dst: i32[], inClo: boolean): boolean {
+function repsFillHoles(
+  f: IrFn,
+  src: i32[],
+  dst: i32[],
+  inClo: boolean,
+): boolean {
   if src.length != dst.length { return false }
   let i = 0
   while i < src.length {
-    if !repFillsHole(src[i], dst[i], inClo) { return false }
+    if !repFillsHole(f, src[i], dst[i], inClo) { return false }
     i = i + 1
   }
   return true
