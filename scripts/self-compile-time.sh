@@ -30,6 +30,7 @@
 #   scripts/self-compile-time.sh --phases          # also print the fuel per pipeline phase
 #   SELF_COMPILE_BASE=<commit>|none                # the per-PR base (default: merge-base with origin/master)
 #   SELF_COMPILE_BASE_FUEL=<fuel>                  # that base's L2 fuel, when the caller measured it
+#   SELF_COMPILE_BASE_SEED=<wasm>                  # that base's fixpoint seed, saving its two rebuilds
 #
 # THE PHASE SPLIT is printed, never graded: the run's fuel shared out by guest-profile sample
 # (scripts/perf/profile-phases.vl), so a rise can be read by phase. The pair's stage 4 is already
@@ -164,34 +165,56 @@ awk -v c="$FUEL" -v b="$BASE" -v d="$DRIFT" 'BEGIN{exit !(c > b * (1 + d))}' && 
 # PER-PR: against the base master this tree was built on (coordinator ruling, 2026-11-21), so a
 # batch reds on its own rise and never on master's drift. The base is $SELF_COMPILE_BASE_FUEL, or
 # the L2 fuel of $SELF_COMPILE_BASE (a commit; default: the merge-base of HEAD and origin/master)
-# compiling its own compiler/ from its fixpoint seed, cached by that tree and this host. With no
-# base to be had, the per-PR tier is graded on the ledgered baseline, as before, and says so.
+# compiling its own compiler/ from its fixpoint seed. With no base to be had, the per-PR tier is
+# graded on the ledgered baseline, as before, and says so.
+# THE CACHE is keyed by that fixpoint seed's hash with the base's tree, $SRC and this host, and an
+# entry is read only while its stored seed is that seed byte for byte: a seed from another lineage
+# fixes the same tree at other bytes and other fuel. $SELF_COMPILE_BASE_SEED (the base's fixpoint)
+# skips rebuilding it; otherwise rungs 1 and 2 build it every run and only the fueled rung caches.
 base_fuel() {
-  local ref="$1" key cache dir
-  key=$( { git rev-parse "$ref:compiler"; git rev-parse "$ref:deno.json"; sha256sum < "$VL" | cut -c1-16
-    echo "$VL_COMPILE_GC $VL_COMPILE_GC_HEAP"; } 2>/dev/null | sha256sum | cut -c1-24) || return 1
-  cache="${XDG_CACHE_HOME:-$HOME/.cache}/vl/base-fuel/$key"
-  if [ -s "$cache" ]; then cat "$cache"; return 0; fi
+  local ref="$1" tree key cache dir fix
+  tree=$(git rev-parse --verify --quiet "$ref:compiler") || { echo "base $ref: no compiler/ tree" >&2; return 1; }
   dir="$WORK/base"; mkdir -p "$dir"
   git archive "$ref" compiler deno.json | tar -x -C "$dir" || return 1
   # Built from inside the exported tree by the same relative path as the candidate's $SRC: the
   # path is compiled in, so another spelling of it costs other fuel.
-  # Rung 1: this seed builds the base compiler; rung 2: that builds itself, the base's own
-  # codegen; rung 3, fueled: rung 2 builds the base compiler again, which is the base's L2.
   local vl seed; vl=$(realpath "$VL"); seed=$(realpath "$SEED")
+  if [ -n "${SELF_COMPILE_BASE_SEED:-}" ]; then
+    fix=$(realpath "$SELF_COMPILE_BASE_SEED") || return 1
+  else
+    # Rung 1: this seed builds the base compiler; rung 2: that builds itself, the base's own codegen.
+    ( cd "$dir" || exit 1
+      timeout 600 "$vl" build "$SRC" -o "$WORK/b1.wasm" --compiler "$seed" > /dev/null 2>&1 || exit 1
+      timeout 600 "$vl" build "$SRC" -o "$WORK/b2.wasm" --compiler "$WORK/b1.wasm" > /dev/null 2>&1 ) || return 1
+    fix="$WORK/b2.wasm"
+  fi
+  key=$( { echo "$tree"; sha256sum < "$fix"; sha256sum < "$VL"; echo "$SRC $VL_COMPILE_GC $VL_COMPILE_GC_HEAP"; } \
+    | sha256sum | cut -c1-24 ) || return 1
+  cache="${XDG_CACHE_HOME:-$HOME/.cache}/vl/base-fuel-seed/$key"
+  if [ -s "$cache/fuel" ]; then
+    if cmp -s "$cache/seed.wasm" "$fix"; then cat "$cache/fuel"; return 0; fi
+    echo "base $ref: cache entry $key holds another seed; measured again" >&2
+  fi
+  # Rung 3, fueled: the fixpoint builds the base compiler again, which is the base's L2.
   ( cd "$dir" || exit 1
-    timeout 600 "$vl" build "$SRC" -o "$WORK/b1.wasm" --compiler "$seed" > /dev/null 2>&1 || exit 1
-    timeout 600 "$vl" build "$SRC" -o "$WORK/b2.wasm" --compiler "$WORK/b1.wasm" > /dev/null 2>&1 || exit 1
-    VL_FUEL=1 timeout 600 "$vl" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compiler "$WORK/b2.wasm" > /dev/null 2>&1
-    VL_FUEL=1 timeout 600 "$vl" build "$SRC" -o "$WORK/b3.wasm" --compiler "$WORK/b2.wasm" \
+    VL_FUEL=1 timeout 600 "$vl" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compiler "$fix" > /dev/null 2>&1
+    VL_FUEL=1 timeout 600 "$vl" build "$SRC" -o "$WORK/b3.wasm" --compiler "$fix" \
       > /dev/null 2> "$WORK/bt" ) || return 1
-  cmp -s "$WORK/b2.wasm" "$WORK/b3.wasm" || { echo "base $ref: rung 2 != rung 3, not a fixpoint" >&2; return 1; }
+  cmp -s "$fix" "$WORK/b3.wasm" || { echo "base $ref: its seed does not rebuild itself, not a fixpoint" >&2; return 1; }
   local f; f=$(awk '/^\[fuel\] guest: [0-9]+$/{print $3}' "$WORK/bt")
   [ -n "$f" ] || return 1
-  mkdir -p "$(dirname "$cache")" && echo "$f" > "$cache"
+  mkdir -p "$cache" && cp "$fix" "$cache/seed.wasm" && echo "$f" > "$cache/fuel"
   echo "$f"
 }
 BASEREF="${SELF_COMPILE_BASE:-$(git merge-base HEAD origin/master 2>/dev/null || true)}"
+# A default base behind origin/master's tip grades this tree against the merges since too: warned,
+# not red, since a branch may truly sit on an older master. A stale local origin/master hides it.
+TIP=$(git rev-parse --verify --quiet origin/master 2>/dev/null || true)
+if [ -z "${SELF_COMPILE_BASE:-}" ] && [ -n "$BASEREF" ] && [ -n "$TIP" ] \
+  && [ "$(git rev-parse "$BASEREF")" != "$TIP" ]; then
+  LAG=$(git rev-list --count --first-parent "$BASEREF..$TIP" 2>/dev/null || echo "?")
+  echo "WARNING: graded against a base $LAG merges old: base $(git rev-parse --short "$BASEREF"), origin/master $(git rev-parse --short "$TIP"); run git fetch, or pass SELF_COMPILE_BASE"
+fi
 PRBASE="${SELF_COMPILE_BASE_FUEL:-}"; PRFROM="base fuel given"
 # A tree that is its own base (master itself, compiler/ unedited) is graded on its own reading.
 if [ -z "$PRBASE" ] && [ -n "$BASEREF" ] && [ "$BASEREF" != none ] \
