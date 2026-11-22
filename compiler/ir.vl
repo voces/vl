@@ -176,6 +176,11 @@ export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
 // its value (`memAccessPlanOf`).
 export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
+// An atomic intrinsic at call node `amAt` over its address and value operands (`atomicPlanOf`);
+// a fence has none.
+export type RAtomic = { amArgs: Opnd[], amAt: i32 }
+// A scalar saturating truncation at call node `tsAt` of float operand `tsV` (`truncSatPlanOf`).
+export type RTruncSat = { tsV: Opnd, tsAt: i32 }
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
@@ -209,6 +214,9 @@ export type RRetNull = { rnrAt: i32 }
 export type RJoinNull = { jnKind: VKind, jnSlot: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
+// A `==`/`!=` at node `neAt` on legacy's `nulNiche` route over nullable operands `neL` and `neR`,
+// under the null guard `nulNicheEqHead` opens; the guard reads `neR` twice.
+export type RNulNicheEq = { neL: Opnd, neR: Opnd, neAt: i32 }
 export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
 // The `==` (or, with `aeNe`, `!=`) of two atoms at compare node `aeAt`. `aeStatic` 1 or 2 names
 // the left or right side typed as one string literal, whose id comes from its lexeme: its operand
@@ -357,7 +365,8 @@ export type RGlobalGet = { ggSym: i32, ggNonNull: boolean, ggNn: i32 }
 export type REnvGet = { evSlot: i32, evAt: i32 }
 // The environment of nested function `edFn` this frame caches, dropped where its declaration runs.
 export type REnvDrop = { edFn: i32 }
-// The closure bundle parameter `bpV` holds for call `bpAt` (D14841), as `bundlePickOf` picks it.
+// The closure the bundle parameter or record holder `bpV` holds for call `bpAt`, as `bundlePickOf`
+// picks it.
 export type RBundlePick = { bpV: Opnd, bpAt: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
@@ -376,6 +385,7 @@ export type RStage = { sgV: Opnd }
 export type Rhs = RAsUnion
   | RAtomEq
   | RAtomStr
+  | RAtomic
   | RBoxField
   | RBoxNarrow
   | RBundlePick
@@ -423,6 +433,7 @@ export type Rhs = RAsUnion
   | RMapSet
   | RMemAccess
   | RMemOp
+  | RNulNicheEq
   | RNulTest
   | RNullOf
   | RNumCast
@@ -447,6 +458,7 @@ export type Rhs = RAsUnion
   | RTagStash
   | RTest
   | RToBox
+  | RTruncSat
   | RUnionConcreteEq
   | RUnionEq
 
@@ -496,12 +508,33 @@ export type SForIn = {
   xfMapNonNull: boolean,
 }
 // `siElseKw`: the source wrote a live `else`, which legacy writes even when its arm is empty.
+// `siJoinAt`: the head of a reference join's chain, whose join every link opens at
+// (`emitIfExprRef`); else -1, and a valued `if` opens at its own.
 export type SIf = {
   siCond: Opnd,
   siThen: i32[],
   siElse: i32[],
   siOut: i32,
   siElseKw: boolean,
+  siJoinAt: i32,
+}
+
+// An `if` that opens at its own join (`siJoinAt` -1); only `refIfLink` names a chain's head.
+export function sIf(
+  c: Opnd,
+  thenB: i32[],
+  elseB: i32[],
+  out: i32,
+  elseKw: boolean,
+): SIf {
+  return {
+    siCond: c,
+    siThen: thenB,
+    siElse: elseB,
+    siOut: out,
+    siElseKw: elseKw,
+    siJoinAt: -1,
+  }
 }
 export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // A `??` at `cbAt` whose head and present arm are legacy's shared tails along arm `cbArm`, with a
@@ -615,10 +648,11 @@ export type IrFn = {
   // lowering asks legacy's site arm there, as `emitAssignUnder` does, which mints its global pair.
   irSiteArmAt: {[i32]: i32},
   irHasSiteArms: boolean,
-  // Whether a map store boxed a value into a union-valued map so far (`mapSetValue`).
-  irUnionStored: boolean,
   // The variable each name read the builder took as a plain read of it, by the read's node.
   irReadVar: {[i32]: i32},
+  // The union map read a delivery is building where legacy's box ladder reads it past `emitExpr`
+  // (`unionBoxArgReadsMapBox`), banking no element-read row; -1 at any other.
+  irUnbankedRead: i32,
   // A global read the builder built, by the read's node: written again as it stands.
   irReadAgain: {[i32]: Rhs},
   // The plain field reads the builder built, by the read's node: its object read again, then the
@@ -627,6 +661,17 @@ export type IrFn = {
   // The call temps legacy writes with its tail-call cursor disarmed (a tag dispatch's arm), so a
   // `return` of one keeps `call; return`.
   irNoTail: i32[],
+  // The effect nodes, a statement dispatch's arms, whose call legacy writes with its tail-call
+  // cursor disarmed, so a call in tail position keeps its plain form.
+  irNoTailEff: i32[],
+}
+
+// Whether effect node `id` is one `irNoTailEff` names.
+export function irNoTailEffHas(f: IrFn, id: i32): boolean {
+  for t in f.irNoTailEff {
+    if t == id { return true }
+  }
+  return false
 }
 
 // Whether call temp `v` is one `irNoTail` names.
@@ -671,9 +716,10 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHasRowOpens: false,
     irSiteArmAt: Map(),
     irHasSiteArms: false,
-    irUnionStored: false,
     irReadVar: Map(),
+    irUnbankedRead: -1,
     irNoTail: [],
+    irNoTailEff: [],
     irReadAgain: Map(),
     irReadField: Map(),
   }
@@ -1011,6 +1057,8 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListNewDefault => [r.ldLen]
     RListCopy => r.lcArgs
     RMemAccess => r.mmArgs
+    RAtomic => r.amArgs
+    RTruncSat => [r.tsV]
     RMemOp => r.moArgs
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
@@ -1043,6 +1091,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RRetNull => []
     RJoinNull => []
     RNulTest => [r.ntV]
+    RNulNicheEq => [r.neL, r.neR]
     RAtomEq => [r.aeL, r.aeR]
     RAsUnion => [r.auV]
     RTagStash => [r.tgsV]
@@ -1101,6 +1150,8 @@ function rhsText(r: Rhs): string {
     RListNewDefault => "list_new_default(" + opndText(r.ldLen) + ")"
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
     RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
+    RAtomic => "atomic(" + opndsText(r.amArgs) + ")"
+    RTruncSat => "trunc_sat(" + opndText(r.tsV) + ")"
     RMemOp => "mem_op(" + opndsText(r.moArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
@@ -1120,6 +1171,7 @@ function rhsText(r: Rhs): string {
     RRetNull => "return null"
     RJoinNull => "join null"
     RNulTest => "isnull " + opndText(r.ntV)
+    RNulNicheEq => "nulniche_eq(" + opndText(r.neL) + ", " + opndText(r.neR) + ")"
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
@@ -1364,7 +1416,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       "popOr" => "list"
       "nulRef" => "box"
       "litUnion" | "nulBool" => "box"
-      "fieldBox" | "fieldVal" => "record"
+      "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
     }
@@ -1438,7 +1490,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REnvDrop |
       REnvGet |
       RMakeClo => "closure"
-    RCallHost |
+    RAtomic |
+      RCallHost |
       RCast |
       RCellGet |
       RCellNew |
@@ -1448,8 +1501,10 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RListNewDefault |
       RMemAccess |
       RMemOp |
+      RNulNicheEq |
       RSimd |
-      RTagOf => "other"
+      RTagOf |
+      RTruncSat => "other"
     RRawOp | RRel => "raw"
     RStage => "scalar"
   }
@@ -1600,6 +1655,17 @@ export function lexOpcode(op: string, p: RpPrim): i32 {
   return primOpcode(o, p)
 }
 
+// Whether node `i` of body `b` is the let of the condition the valued `if` after it tests, the
+// builder's own prelude to that join.
+export function ifCondLetAt(f: IrFn, b: i32[], i: i32): boolean {
+  if i < 0 || i + 1 >= b.length { return false }
+  const l = f.irNodes[b[i]]
+  const j = f.irNodes[b[i + 1]]
+  if !(l is SLet) || !(j is SIf) || j.siOut < 0 { return false }
+  const c = j.siCond
+  return c is OVar && c.ov == l.lDst
+}
+
 // Whether a list at rep `src` is the list at rep `dst` as it stands: the same record elements, one
 // side's possibly `| null`, which one ref list holds (its backing is already nullable).
 export function listRetag(src: i32, dst: i32): boolean {
@@ -1608,6 +1674,54 @@ export function listRetag(src: i32, dst: i32): boolean {
   if !(a is RList) || !(d is RList) { return false }
   const ea = recElemCore(a.rlsElem)
   return ea >= 0 && ea == recElemCore(d.rlsElem)
+}
+
+// Whether a list at rep `src` is the list at rep `dst` as it stands, `dst` leaving a closure's
+// parameter or result unknown: a result whose type still holds a hole the value fills.
+export function listRetagHole(src: i32, dst: i32): boolean {
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if !(a is RList) || !(d is RList) { return false }
+  return repFillsHole(a.rlsElem, d.rlsElem, false)
+}
+
+// Whether rep `src` is `dst`, or `dst` with parts of a closure (`inClo`) left unknown.
+function repFillsHole(src: i32, dst: i32, inClo: boolean): boolean {
+  if src == dst { return true }
+  const a = repNodeAt(src)
+  const d = repNodeAt(dst)
+  if a == null || d == null { return false }
+  return match d {
+    RUnsup => inClo
+    RList => a is RList && repFillsHole(a.rlsElem, d.rlsElem, inClo)
+    RNullable => a is RNullable
+      && a.rnDisc == d.rnDisc
+      && repFillsHole(a.rnInner, d.rnInner, inClo)
+    RRecord => a is RRecord
+      && a.rrVariant == d.rrVariant
+      && repsFillHoles(a.rrFields, d.rrFields, inClo)
+    RClosure => a is RClosure
+      && a.rcVoid == d.rcVoid
+      && repsFillHoles(a.rcParams, d.rcParams, true)
+      && repFillsHole(a.rcRet, d.rcRet, true)
+    RAtom |
+      RBox |
+      RMap |
+      RNoValue |
+      RPrim |
+      RRaw => false
+  }
+}
+
+// Whether each of reps `src` fills the hole of the same-placed rep of `dst`.
+function repsFillHoles(src: i32[], dst: i32[], inClo: boolean): boolean {
+  if src.length != dst.length { return false }
+  let i = 0
+  while i < src.length {
+    if !repFillsHole(src[i], dst[i], inClo) { return false }
+    i = i + 1
+  }
+  return true
 }
 
 // The record rep of list element `e`, under a `| null`, or -1.
