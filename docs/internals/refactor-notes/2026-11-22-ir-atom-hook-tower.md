@@ -18,3 +18,15 @@ functions in 16 files on master 14d707ae.
   built once per tested member, last first; a second build only of a read with no effect
   (`exprEffectFree`). Each read temp is typed at the string legacy reads.
 - **Verifier.** The reads are strings, at least one; the destination an atom (self-tests 28, 29).
+
+## Measured
+
+Against #9583's head d70392a1 at its fixpoint:
+- `tests/cases` covered = verified 69,490 → 69,510 (+20), matched 69,489 → 69,509; corpus
+  unchanged at 45,255;
+- `ir-identity --cases`, `--claimless` and `--names` differ 0 (the tail split is byte-identical:
+  `--names` self-compile identical); the legacy A/B differs 0;
+- L2 fuel per PR +0.14%, source growth: the same-tree pair is +0.0004%.
+
+The row `tests/ir-shadow-rows/atom-hook-tower.vl` has 5 functions, 4 of them `pre-path atom hook`
+on the base seed, all covered and matched here, including a three-member tower with two reads.
