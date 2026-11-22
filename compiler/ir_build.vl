@@ -3192,6 +3192,47 @@ function bundleArgRec(b: i32[], arg: i32, par: i32, fnRead: boolean): Opnd {
   return bundleRecBuild(b, arg, sigs, si, rty, fnRead)
 }
 
+// A choice `if c { f } else { g }` handed to bundle parameter `par`, as `emitBundleChoiceArg`
+// writes it: at the row of the parameter's annotated type, each arm's function read built as
+// that record, joined by an `if` opening at the row's non-null reference.
+function bundleChoiceArg(b: i32[], arg: i32, par: i32): Opnd {
+  const p = nodeAt(par)
+  const pt = if p is Param && p.parType >= 0 { nodeTyAt(p.parType, -1) } else { -1 }
+  if pt < 0 { return irBMiss("bundle argument read type") }
+  const si = repRowOfTyStruct(pt, repScanLim())
+  return bundleChoiceRec(b, arg, bundleSigsOfParam(par), si, pt)
+}
+
+// One arm of `bundleChoiceArg`: a function read's record, a one-statement block's, or a nested
+// choice's, joined at row `si`.
+function bundleChoiceRec(b: i32[], arg: i32, sigs: i32[], si: i32, rty: i32): Opnd {
+  const x = unwrapParen(arg)
+  if x < 0 || x >= P.nodes.length { return irBMiss("bundle choice arm") }
+  const n = nodeAt(x)
+  if n is Ident { return bundleRecBuild(b, x, sigs, si, rty, true) }
+  if n is Block && n.blkStmts.length == 1 {
+    return bundleChoiceRec(b, n.blkStmts[0], sigs, si, rty)
+  }
+  if !(n is IfStmt) || n.ifElse < 0 { return irBMiss("bundle choice arm") }
+  const cat = b.length
+  const c = irBExpr(b, n.ifCond)
+  if ibMiss != "" || irBOpRep(c) != ibBool { return irBMiss("if condition") }
+  if bareConstIs(c, n.ifCond, b, cat) { return irBMiss("decided is condition") }
+  const rep = repNodeOfTy(rty)
+  const t = irVarNew(ib, rep, rty, "local", -1)
+  const thenB: i32[] = []
+  const tv = bundleChoiceRec(thenB, n.ifThen, sigs, si, rty)
+  if ibMiss != "" { return tv }
+  irBNode(thenB, { asDst: t, asSrc: tv }, -1, ibNoValue, n.ifThen)
+  const elseB: i32[] = []
+  const ev = bundleChoiceRec(elseB, n.ifElse, sigs, si, rty)
+  if ibMiss != "" { return ev }
+  irBNode(elseB, { asDst: t, asSrc: ev }, -1, ibNoValue, n.ifElse)
+  irBNode(b, sIf(c, thenB, elseB, t, true), rty, rep, x)
+  const o: Opnd = { ov: t }
+  return o
+}
+
 // The record of closures at struct row `si`, of type `rty`, holding `sigs`, built from `arg`: the
 // closure of each signature's instance (`monoBundleFe`, or `monoBundleReadFe` for a function read)
 // in the row's field order, then the record, as `emitBundleArg` and `emitBundleReadArg` write it.
@@ -3309,6 +3350,13 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
             callee.fnParams[i],
             barm == "fnRead",
           )
+          if ibMiss != "" { return missRhs(ibMiss) }
+          args.push(ba)
+          i = i + 1
+          continue
+        }
+        if barm == "choice" {
+          const ba = bundleChoiceArg(b, c.callArgs[i], callee.fnParams[i])
           if ibMiss != "" { return missRhs(ibMiss) }
           args.push(ba)
           i = i + 1
