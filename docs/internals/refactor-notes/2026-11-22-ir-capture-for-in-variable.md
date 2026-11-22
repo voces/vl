@@ -22,3 +22,16 @@ only by a narrowing or a signedness view of the same stored i32, because a loop 
 fixed per iteration. A read the checker types narrower than the binding sees only the values
 both encodings share, and the read itself is the same `local.get` or `struct.get`. Every
 reference valtype names its heap index, so a reference rep agrees exactly.
+
+## Readings (merge-base `b77be8fde`, fixpoint seeds on both sides; the head then held #9462 below it)
+
+| reading | base | this change |
+| --- | ---: | ---: |
+| tests/cases armed shadow covered / matched | 66,899 / 66,898 | 67,016 / 67,015 (same single fail row) |
+| the 96 tests/cases capture files, covered (= matched): #9462 alone, then this | 1,608 | 1,701, then 1,748 |
+| corpus functions with no blocker | 44,798 | 44,813 |
+| corpus `capture binding` (alone) | 23 (22) | 11 (11) |
+| self-compile functions with no blocker | 19,638 | 19,638 |
+| L2 self-compile fuel | 108,697,507,677 | 108,706,738,481 (+0.008%) |
+
+Legacy lines deleted: 0. Moved to `@ir`: 0.
