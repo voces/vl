@@ -16,7 +16,9 @@ next blocker of 34.
   (`globalNameIsNonConstSid`), which `globalBoxAt` now asks too.
 - The lowering's `sharedReadRecv` writes `globalRead(srGlobal, srGlobalNonNull)` for each push, as
   `emitUnionBoxPush` writes `emitUserGlobalGet` and its recover.
-- The verifier passes a global receiver; the builder checked that its cell is a box.
+- The verifier checks a global receiver itself: its recorded cell (`irGlobalRepOf`) must be
+  box-shaped and `srV` an unread immediate, else rule 2. Self-test case 24 is a global receiver
+  over an `i32` cell, refused under rule 2.
 
 ## Witness
 
