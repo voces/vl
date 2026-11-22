@@ -480,6 +480,7 @@ import {
   cloStructIdx,
   cmSlot,
   coalLinkChains,
+  coalNullTestIfs,
   coalesceCallBoolSlot,
   coalesceCallSlot,
   coalesceCallStrSlot,
@@ -14219,27 +14220,54 @@ function emitMonoMapDefault(recvIx: i32, defIx: i32, fnIx: i32) {
 // `emitMapGet` leaves a nullable element for every ref-valued map; a union value (kind
 // 2) then unboxes to the tested atom, unless the narrow leaves two or more atoms.
 export function emitNarrowedMapReadTail(idxIx: i32, fnIx: i32) {
-  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
-  if mrs < 0 { return 0 }
-  const rt = nodeTyAt(unwrapParen(idxIx), fnIx)
-  if rt < 0 || tyAdmitsNull(rt) { return 0 }
-  // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
-  // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
-  if mvValKindAt(mrs) == "union" {
-    const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
-    if ak >= 0 { return emitUnionUnboxTail(ak) }
-    // The CONTAINER arms of the same narrowing (`if m[k] is {[string]: V}`, `… is K[]`),
-    // which the atom question above answers -1 for. `mapReadNarrowedContainer` is the gate
-    // rather than the unbox's own answer, so the classifiers that stop calling this read a
-    // box and the lowering that opens it are deciding off one predicate (D1866).
-    if mapReadNarrowedContainer(idxIx, fnIx) {
+  const p = narrowedMapReadOf(idxIx, fnIx)
+  return match p.nmArm {
+    "none" => 0
+    // A UNION value already left the NON-null box (`emitMapGetUnionBox` recovers it), so only
+    // the unbox is owed; every other ref value is the raw `(ref null <elem>)` vals slot.
+    "unbox" => emitUnionUnboxTail(p.nmAk)
+    // `mapReadNarrowedContainer` is the gate rather than the unbox's own answer, so the
+    // classifiers that stop calling this read a box and the lowering that opens it are deciding
+    // off one predicate (D1866).
+    "container" => {
       const con = emitPlaceNarrowContainerUnbox(idxIx, fnIx)
-      if con != 0 { return con - 1 }
+      if con != 0 { con - 1 } else { 0 }
     }
-    return 0
+    "nonNull" => {
+      fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
+      0
+    }
   }
-  fbRefAsNonNull() // 0xd4 (the `is` guard proved the key present)
-  return 0
+}
+
+// What a bare map read `m[k]` at `idxIx` owes after its read, as `emitNarrowedMapReadTail` writes
+// it: nothing (`none`, the read not narrowed past `null`), a union value's unbox to atom kind
+// `nmAk`, a union value's container narrowing, or a ref value's non-null recovery.
+export type NarrowedMapReadArm = "none" | "unbox" | "container" | "nonNull"
+export type NarrowedMapRead = { nmArm: NarrowedMapReadArm, nmAk: i32 }
+
+export function narrowedMapReadOf(idxIx: i32, fnIx: i32): NarrowedMapRead {
+  const none: NarrowedMapRead = { nmArm: "none", nmAk: -1 }
+  const mrs = mapReadNarrowableSlot(idxIx, fnIx)
+  if mrs < 0 { return none }
+  const rt = nodeTyAt(unwrapParen(idxIx), fnIx)
+  if rt < 0 || tyAdmitsNull(rt) { return none }
+  if mvValKindAt(mrs) != "union" {
+    const nn: NarrowedMapRead = { nmArm: "nonNull", nmAk: -1 }
+    return nn
+  }
+  const ak = mapReadNarrowedAtomKind(idxIx, fnIx)
+  if ak >= 0 {
+    const u: NarrowedMapRead = { nmArm: "unbox", nmAk: ak }
+    return u
+  }
+  // The CONTAINER arms of the same narrowing (`if m[k] is {[string]: V}`, `… is K[]`), which
+  // the atom question above answers -1 for.
+  if mapReadNarrowedContainer(idxIx, fnIx) {
+    const c: NarrowedMapRead = { nmArm: "container", nmAk: -1 }
+    return c
+  }
+  return none
 }
 
 // How a bare map read `m[k]` at Index node `idxIx` reads its map: a union value through its
@@ -14417,6 +14445,12 @@ export function mapGetMissOf(recvIx: i32, fnIx: i32): i32 {
 // Exported for `emitStartFnCode`'s identical module-scope miss arm.
 export function emitMapGetUnionBox(recvIx: i32, keyIx: i32, fnIx: i32) {
   if emitMapPrep(recvIx, keyIx, fnIx) < 0 { return -1 }
+  return mapGetUnionBoxTail()
+}
+
+// After a union-valued map's probe: the stored box on a hit, the null-tagged box on a miss, read
+// back non-null from the mv slot's stash.
+export function mapGetUnionBoxTail() {
   if cmSlot < 0 {
     return emitFail(
       "emitProgram: union-valued map read but no mv slot resolved",
@@ -42329,7 +42363,11 @@ function coalHoleMapReadNullTest(
 
 // `if l != null { l } else { d }` for `l ?? d`, carrying the `??`'s type. A declared atom niche's
 // arm re-reads `l` at its non-null set, the narrowing the checker would have recorded.
-function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+export function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  // Minted once per `??` and instance: a later reader, legacy's or the IR builder's, takes it.
+  const key = i32ToStr(exprIx) + ":" + i32ToStr(fnIx)
+  const had = coalNullTestIfs[key] ?? -1
+  if had >= 0 { return had }
   const thenS: i32[] = []
   thenS.push(coalNarrowedReRead(unwrapParen(e.binLeft), fnIx))
   const elseS: i32[] = []
@@ -42342,6 +42380,7 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
     pos,
   )
   nodeTyCarry(ifIx, exprIx)
+  coalNullTestIfs[key] = ifIx
   return ifIx
 }
 
