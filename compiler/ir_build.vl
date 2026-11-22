@@ -599,6 +599,8 @@ import {
   cboxReadsCell,
   cloLiftWriteCount,
   fRecRetTy,
+  fRetKind,
+  fRetStructIdx,
   fRetVoid,
   fnMemAddrFoldCount,
   fnStmts,
@@ -2244,6 +2246,7 @@ export function irBDeclVar(d: i32): i32 {
   }
   const lt = declRowLetTy(d, rep)
   if lt >= 0 { return declVarAt(d, repNodeOfTy(lt), lt) }
+  if letLitUndeclaredRow(d) { ibDeclRowSeen = true }
   return declVarAt(d, rep, ty)
 }
 
@@ -3608,7 +3611,20 @@ function resultTy(pos: i32, ann: i32, d: i32): i32 {
   // A function legacy returns a bundle record from returns that record (`fnBundleRetSigs`),
   // whether its result is recorded or checked.
   const bs = if pos >= 0 && pos < fnStmts.length && fnRetHeldAsBundle(pos, t) { fnBundleRetSigs(pos) } else { [] }
-  return if bs.length > 0 { bundleRecordTyOf(bs) } else { t }
+  if bs.length > 0 { return bundleRecordTyOf(bs) }
+  const dt = retDeclRowTy(pos, t)
+  return if dt >= 0 { dt } else { t }
+}
+
+// The record type of the struct row legacy declares `fnStmts` slot `pos`'s inferred result at
+// (`fRetKind`, `fRetStructIdx`) where result type `t` is not that row (`declRowTy`), or -1.
+function retDeclRowTy(pos: i32, t: i32): i32 {
+  if pos < 0 || pos >= fRetKind.length || pos >= fRetStructIdx.length {
+    return -1
+  }
+  if fRetKind[pos] != "struct" || fRetStructIdx[pos] < 0 { return -1 }
+  if repRowOfTyStruct(t, repScanLim()) == fRetStructIdx[pos] { return -1 }
+  return declRowTy(fRetStructIdx[pos])
 }
 
 // The result rep of that function. Legacy's voidness (`fRetVoid`) decides no value, as its
@@ -9603,7 +9619,12 @@ function declRowParamVarOf(ix: i32): i32 {
   const dn = nodeAt(d)
   if dn is LetDecl {
     const st = irSlotRowTy(ib.irVars[v].vSlot)
-    return if st >= 0 && ib.irVars[v].vTy == st && st != heldTy(scopeTyAt(d, ibFnIx)) { v } else { -1 }
+    if st < 0 || ib.irVars[v].vTy != st { return -1 }
+    if st != heldTy(scopeTyAt(d, ibFnIx)) { return v }
+    // A read typed at a record whose row is not the slot's reads the row the slot is declared at.
+    const t = nodeTyAt(ix, ibFnIx)
+    if t < 0 || t == st || !(repNodeAt(repNodeOfTy(t)) is RRecord) { return -1 }
+    return if repRowOfTyStruct(t, repScanLim()) != repRowOfTyStruct(st, repScanLim()) { v } else { -1 }
   }
   if !(dn is Param) { return -1 }
   const fn = nodeAt(ibFnIx)
@@ -9611,6 +9632,21 @@ function declRowParamVarOf(ix: i32): i32 {
   const i = ib.irVars[v].vSlot - envSlotShift(ibFnIx)
   if i < 0 || i >= fn.fnParams.length { return -1 }
   return if ib.irVars[v].vTy == paramDeclRowTy(fn.fnParams[i]) { v } else { -1 }
+}
+
+// Whether `let` `d` is initialized by a record literal whose own type's row is not the row its
+// slot is declared at, so legacy builds it at the slot's (D16463) and a read may be of that row.
+function letLitUndeclaredRow(d: i32): boolean {
+  if d < 0 || d >= P.nodes.length { return false }
+  const n = nodeAt(d)
+  if !(n is LetDecl) || n.letInit < 0 { return false }
+  const init = unwrapParen(n.letInit)
+  if !(nodeAt(init) is ObjLit) { return false }
+  const t = nodeTyAt(init, ibFnIx)
+  const s = declaredSlotOfDecl(d)
+  const st = irSlotRowTy(if s >= 0 { declaredIndexAt(ibFnIx, s) } else { -1 })
+  if t < 0 || st < 0 { return false }
+  return repRowOfTyStruct(t, repScanLim()) != repRowOfTyStruct(st, repScanLim())
 }
 
 // The type parameter read `ix` is held at where that is legacy's declared row, or -1.
