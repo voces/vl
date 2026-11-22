@@ -216,6 +216,7 @@ import {
   coalNulRefRungReached,
   coalNulRefsArmOf,
   coerceHeldSwap,
+  directArgUnionTyOf,
   directCallInstanceArgMisfit,
   dispatchDeclinesTail,
   eqOperandDecodes,
@@ -3890,8 +3891,13 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
       if i > 0 && !irBStageLeads(b, at, starts, args, c.callArgs) {
         return missRhs("short-circuit argument after another")
       }
-      if irBOpRep(a) != pr { return missRhs("argument coercion") }
-      args.push(a)
+      // An argument the checker records no box at is boxed at its parameter's union, legacy's
+      // direct-call floor (`directArgUnionTyOf`).
+      const fu = if irBOpRep(a) != pr && heldAsBox(pr) && !boxOwedAt(c.callArgs[i], ibFnIx) { directArgUnionTyOf(pos, i) } else { -1 }
+      const fa = if fu >= 0 && repNodeOfTy(fu) == pr { boxTempIn(b, a, c.callArgs[i], pr, -1, fu) } else { a }
+      if ibMiss != "" { return missRhs(ibMiss) }
+      if irBOpRep(fa) != pr { return missRhs("argument coercion") }
+      args.push(fa)
       i = i + 1
     }
   }
@@ -5767,8 +5773,20 @@ function boxTemp(b: i32[], v: Opnd, ix: i32, dst: i32): Opnd {
 
 // `boxTemp` for `v` built at variant row `at`, or at its own layout where `at` is -1.
 function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
+  return boxTempIn(b, v, ix, dst, at, holeBoxTyAt(ix, ibFnIx))
+}
+
+// `boxTempAt` into union `uTy`, which legacy's box plan is made at.
+function boxTempIn(
+  b: i32[],
+  v: Opnd,
+  ix: i32,
+  dst: i32,
+  at: i32,
+  uTy: i32,
+): Opnd {
   if ibMiss != "" { return v }
-  const p = holeBoxPlanOf(ix, holeBoxTyAt(ix, ibFnIx), ibFnIx)
+  const p = holeBoxPlanOf(ix, uTy, ibFnIx)
   const why = boxPlanWhy(p, v)
   if why != "" { return irBMiss(why) }
   // A box that writes its tag ahead of its value writes it ahead of an assignment's store, which
@@ -5813,7 +5831,7 @@ function boxTempAt(b: i32[], v: Opnd, ix: i32, dst: i32, at: i32): Opnd {
   ) {
     return irBMiss("box of a stash-set record")
   }
-  return repTemp(b, { bxV: v, bxAt: ix }, ix, dst)
+  return repTemp(b, { bxV: v, bxAt: ix, bxTy: uTy }, ix, dst)
 }
 
 // Whether the delivery built into `b` from `at` on is a valued `if` or coalesce and the box of its
@@ -5830,9 +5848,7 @@ function boxOfJoinAt(b: i32[], at: i32): boolean {
   const v = r.bxV
   if !(v is OVar) || v.ov != out { return false }
   // Only a box whose head leads its value has its head written ahead of the join.
-  return holeBoxLeads(
-    holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, ibFnIx), ibFnIx).hbArm,
-  )
+  return holeBoxLeads(holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm)
 }
 
 // Whether the delivery built into `b` from `at` on ends in a box whose plan writes its tag ahead of
@@ -5843,7 +5859,7 @@ function boxLeadsAt(b: i32[], at: i32): boolean {
   if !(n is SLet) { return false }
   const r = n.lRhs
   if !(r is RToBox) { return false }
-  const arm = holeBoxPlanOf(r.bxAt, holeBoxTyAt(r.bxAt, ibFnIx), ibFnIx).hbArm
+  const arm = holeBoxPlanOf(r.bxAt, r.bxTy, ibFnIx).hbArm
   return arm != "pass" && arm != "memberBox"
 }
 
