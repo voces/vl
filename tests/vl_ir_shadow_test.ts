@@ -1472,8 +1472,8 @@ Deno.test({
     // nullable list into an `i32` out (rule 2). Case 24 is a shared read whose global receiver's
     // cell is no box (rule 2). Case 25 is a niche read over an i32 operand (rule 2), case 26 an
     // arm unbox over one (rule 2), case 27 a retag between field-alike records' lists on two heaps
-    // (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2, 2, 2];
+    // (rule 2), case 28 a box at a union type landing at an i32 (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
