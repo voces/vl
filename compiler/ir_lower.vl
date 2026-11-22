@@ -103,6 +103,7 @@ import {
   RAsUnion,
   RAtomEq,
   RAtomStr,
+  RAtomic,
   RBoxField,
   RBoxNarrow,
   RBundlePick,
@@ -174,6 +175,7 @@ import {
   RTagStash,
   RTest,
   RToBox,
+  RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
   Rhs,
@@ -198,6 +200,7 @@ import {
   SSwitch,
   STrap,
   irFnNew,
+  irNoTailEffHas,
   irNoTailHas,
   irRhsOpnds,
   irSigOf,
@@ -284,6 +287,9 @@ import {
   atomNotNulIsTail,
   atomStrPlanOf,
   atomStrTail,
+  atomicPlanOf,
+  atomicResultPrim,
+  atomicTail,
   boxTagIsTail,
   bundlePickOf,
   callRefCallTail,
@@ -354,6 +360,7 @@ import {
   hoistRowMark,
   hoistRowReads,
   holeBoxHead,
+  holeBoxLeads,
   holeBoxTail,
   holeBoxTyAt,
   hostCallTail,
@@ -464,6 +471,8 @@ import {
   tagDispatchIfOf,
   tagIsTail,
   tagStashTail,
+  truncSatPlanOf,
+  truncSatTail,
   uBoxNewIsLast,
   uBoxSinkToPair,
   unionBoxToPairTail,
@@ -521,6 +530,10 @@ import {
   coalFieldRead,
   coalFieldUnbox,
   coalFieldValOpen,
+  coalOptArmOf,
+  coalOptLeafOpen,
+  coalOptLeafPlanOf,
+  coalOptLeafRead,
   emitListEmptyLoop,
   emptyFitArmBody,
   emptyFitArmHead,
@@ -535,6 +548,7 @@ import {
   nulStrMemberClose,
   nulStrMemberGuard,
   nulStrMemberOpen,
+  optRecvStagedAt,
   strMemberEqTail,
   unionLitIsPlanOf,
   unionLitNeverTail,
@@ -618,6 +632,8 @@ let lwBoxHeadAt: i32[] = []
 // Each order-stashed literal by the out its first source field reads, noted once per function.
 let lwIfHeadAt: {[i32]: i32} = Map()
 let lwIfHeadBuilt = false
+// Each box by the out its value is (`stashIfBoxHead`), noted with `lwIfHeadAt`.
+let lwIfBoxAt: {[i32]: i32} = Map()
 // The temps the operands being written consumed, in the order their values reach the stack.
 let lwSeq: i32[] = []
 // The open control frames, innermost last: a block or loop label, or -1 for an `if`.
@@ -1010,6 +1026,8 @@ function rhs(r: Rhs, tail: boolean) {
     RListNewDefault => listNewDefault(r)
     RListCopy => irLMiss("list copy value")
     RMemAccess => memAccess(r)
+    RAtomic => atomic(r)
+    RTruncSat => truncSat(r)
     RMemOp => memOp(r)
     RCallHost => hostCall(r)
     RCast => {
@@ -1301,11 +1319,21 @@ function stashBoxHead(at: i32) {
 // form, that literal's box head, ahead of the `if` (legacy writes the tag before the literal).
 function stashIfBoxHead(id: i32) {
   const n = lw.irNodes[id]
-  if !(n is SIf) || n.siOut < 0 { return 0 }
+  const out = if n is SIf { n.siOut } else if n is SCoalBox { n.cbOut } else { -1 }
+  if out < 0 { return 0 }
   if !lwIfHeadBuilt { stashIfHeadsNote() }
-  const at = lwIfHeadAt.get(n.siOut) ?? -1
-  if at < 0 || i32ListHas(lwBoxHeadAt, at) { return 0 }
-  return stashBoxHead(at)
+  const at = lwIfHeadAt.get(out) ?? -1
+  if at >= 0 && !i32ListHas(lwBoxHeadAt, at) { return stashBoxHead(at) }
+  // A box whose value is this node's out writes its tag ahead of it, as legacy's box leads.
+  const bx = lwIfBoxAt.get(out) ?? -1
+  if bx < 0 || i32ListHas(lwBoxHeadAt, unwrapParen(bx)) { return 0 }
+  const p = holeBoxPlanOf(bx, holeBoxTyAt(bx, lw.irAt), lw.irAt)
+  if holeBoxLeads(p.hbArm) {
+    leaf()
+    holeBoxHead(p, bx, lw.irAt)
+    lwBoxHeadAt.push(unwrapParen(bx))
+  }
+  return 0
 }
 
 // Notes, once per function, the out each order-stashed literal's first source field reads, by
@@ -1316,6 +1344,10 @@ function stashIfHeadsNote() {
   for m in lw.irNodes {
     if m is SLet {
       const mr = m.lRhs
+      if mr is RToBox {
+        const bv = mr.bxV
+        if bv is OVar { lwIfBoxAt.set(bv.ov, mr.bxAt) }
+      }
       if mr is RMakeRec && !mr.mrSet && mr.mrSrc.length > 0 {
         const k0 = mr.mrSrc[0]
         const f0 = if k0 >= 0 && k0 < mr.mrFields.length { mr.mrFields[k0] } else { null }
@@ -1880,6 +1912,40 @@ function memAccess(r: RMemAccess) {
   }
   for o in r.mmArgs { irLOpnd(o) }
   return memAccessTail(p, ap.maOff)
+}
+
+// `RAtomic`: legacy's atomic arm in `emitAtomicIntrinsic`'s order: the address the builder took
+// along `memAddrPlanOf`'s arm, each value, then the instruction at the plan's offset.
+function atomic(r: RAtomic) {
+  const c = nodeAt(r.amAt)
+  if !(c is Call) { return irLMiss("atomic node") }
+  const pl = atomicPlanOf(c)
+  if pl.apFail != "" { return irLMiss("atomic plan") }
+  if pl.apBase == 0 { return atomicTail(pl.apRow, 0) }
+  const ap = memAddrPlanOf(c, pl.apBase, lw.irAt)
+  if ap.maArm != "const" && ap.maArm != "rest" { return irLMiss("atomic plan") }
+  for o in r.amArgs { irLOpnd(o) }
+  return atomicTail(pl.apRow, ap.maOff)
+}
+
+// `RAtomic` as a statement: the atomic, then a drop of the value a valued row leaves.
+function atomicEffect(r: RAtomic, pending: i32[]): i32 {
+  atomic(r)
+  irLSettle(pending)
+  const c = nodeAt(r.amAt)
+  const pl = if c is Call { atomicPlanOf(c) } else { null }
+  if pl != null && atomicResultPrim(pl.apRow) != "" { fbDrop() }
+  return 0
+}
+
+// `RTruncSat`: legacy's saturating-truncation arm, the float operand then `truncSatTail`.
+function truncSat(r: RTruncSat) {
+  const c = nodeAt(r.tsAt)
+  if !(c is Call) { return irLMiss("trunc_sat node") }
+  const pl = truncSatPlanOf(c)
+  if pl.tpOp < 0 { return irLMiss("trunc_sat plan") }
+  irLOpnd(r.tsV)
+  return truncSatTail(pl.tpOp)
 }
 
 // `RCallHost`: legacy's host-call arm in `emitCallCoreHost`'s order, the arguments then the call.
@@ -2860,7 +2926,7 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       lwSeq = []
       const r = n.efRhs
       if r is RCall {
-        const t = tail && voidTailCallee(r.caCallee)
+        const t = tail && voidTailCallee(r.caCallee) && !irNoTailEffHas(lw, id)
         call(r, t)
         irLSettle(pending)
         const si = irSigOf(lw, r.caCallee)
@@ -2912,6 +2978,14 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
         memAccess(r)
         irLSettle(pending)
         if r.mmArgs.length == 1 { fbDrop() }
+        return 0
+      }
+      // A store and a fence leave nothing; any other discarded atomic's value is dropped.
+      if r is RAtomic { return atomicEffect(r, pending) }
+      if r is RTruncSat {
+        truncSat(r)
+        irLSettle(pending)
+        fbDrop()
         return 0
       }
       // The bulk pair leaves nothing; any other memory op's discarded value is dropped.
@@ -3280,6 +3354,7 @@ function coalBox(n: SCoalBox, pending: i32[]) {
     "litUnion" => coalNicheCell(n, e, -1, pending)
     "nulBool" => coalNicheCell(n, e, 2, pending)
     "fieldBox" | "fieldVal" => coalUnionField(n, e, pending)
+    "optLeaf" => coalOptLeaf(n, e, pending)
     "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => {
       irLMiss("coalesce box arm")
     }
@@ -3310,6 +3385,32 @@ function coalUnionField(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   lwFrames.pop()
   fbEnd()
   return 0
+}
+
+// `p?.f ?? d` over a nullable record's scalar or string field along `coalOptLeafPlanOf`, as
+// `emitCoalesceOptNulRecord` writes it: the receiver variable, its null test opening the leaf's
+// `if`, the default writing the slotless out, the else, the receiver again, and its field.
+function coalOptLeaf(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
+  const m = nodeAt(unwrapParen(e.binLeft))
+  if (
+    !(m is OptMember)
+    || coalOptArmOf(unwrapParen(e.binLeft), lw.irAt) != "nulRecord"
+  ) {
+    return irLMiss("coalesce optional field plan")
+  }
+  if optRecvStagedAt(m.omObj) {
+    return irLMiss("coalesce optional field staged receiver")
+  }
+  const lp = coalOptLeafPlanOf(m, structIndexOfExpr(m.omObj, lw.irAt))
+  if lp.olLeaf == null { return irLMiss("coalesce optional field plan") }
+  cond(n.cbL, pending)
+  coalOptLeafOpen(lp)
+  lwFrames.push(-1)
+  body(n.cbNull, false, n.cbOut, false)
+  fbElse()
+  irLOpnd(n.cbL)
+  lwFrames.pop()
+  return coalOptLeafRead(lp)
 }
 
 // A boxed operand's arm: the stash slot taken before the box, the box, the open, the default
@@ -3704,6 +3805,7 @@ function lwReset(f: IrFn, ctx: GlobalCtx, buf: u8[]) {
   lwBoxHeadAt = []
   lwIfHeadAt = Map()
   lwIfHeadBuilt = false
+  lwIfBoxAt = Map()
   lwStashFi = []
   lwStashSlots = []
   const none: Rhs = { ggSym: -1, ggNonNull: false, ggNn: -1 }
