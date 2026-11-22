@@ -6,7 +6,7 @@ import { blockHasContinueFor } from "./emit_query"
 // checks that, and any shape it cannot lower is a named mismatch, never a guess. It writes
 // through the plain byte writers into its own buffer and leaves the emitter's state as found.
 import { fnEnvIdxOf } from "./emit_capture_frames"
-import { printUnionPlan } from "./emit_fn_scans"
+import { binEqStructRow, printUnionPlan } from "./emit_fn_scans"
 import { sharedFieldRecvSlot } from "./emit_union_casts"
 import { memNarrowVariantIndex } from "./emit_local_scope"
 import {
@@ -170,6 +170,7 @@ import {
   RStage,
   RStashSet,
   RStrOp,
+  RStructEq,
   RTagIs,
   RTagOf,
   RTagStash,
@@ -466,6 +467,11 @@ import {
   stageListRecvTail,
   staticAtomId,
   strSiteArmMint,
+  structEqEnter,
+  structEqRoots,
+  structEqStagesLeft,
+  structEqStagesRight,
+  structEqTail,
   structFieldTail,
   structUnionBoxTail,
   tagDispatchIfOf,
@@ -956,6 +962,7 @@ function rhs(r: Rhs, tail: boolean) {
       RListSlice |
       RMapFilter |
       RStrOp => irLowerListHook(r)
+    RStructEq => structEq(r)
     RListClear => irLMiss("clear value")
     RListStage => irLMiss("receiver stage value")
     RNumWiden => {
@@ -2603,6 +2610,38 @@ function unionEq(r: RUnionEq) {
   irLOpnd(r.ueL)
   irLOpnd(r.ueR)
   return unionUnionEqTail(n.binLeft, n.binRight, r.ueNe, lw.irAt)
+}
+
+// `RStructEq`: legacy's field-wise record compare (`emitStructEq`): the stashed operands' values,
+// their slots, then the compare, which reads an unstashed operand from its variable's local.
+function structEq(r: RStructEq) {
+  const n = nodeAt(r.seAt)
+  if !(n is BinExpr) { return irLMiss("record compare node") }
+  const fnIx = lw.irAt
+  const row = binEqStructRow(r.seAt, fnIx)
+  if row < 0 { return irLMiss("record compare row") }
+  const lS = structEqStagesLeft(n.binLeft, n.binRight)
+  const rS = structEqStagesRight(n.binRight)
+  const lLoc = if lS { -1 } else { structEqSideLocal(r.seL) }
+  const rLoc = if rS { -1 } else { structEqSideLocal(r.seR) }
+  if !lS && lLoc < 0 || !rS && rLoc < 0 {
+    return irLMiss("record compare place")
+  }
+  const saved = structEqEnter()
+  if lS { irLOpnd(r.seL) }
+  if rS { irLOpnd(r.seR) }
+  const roots = structEqRoots(row, n.binLeft, n.binRight, lLoc, rLoc)
+  if structEqTail(n, row, roots, saved, fnIx) < 0 {
+    return irLMiss("record compare fields")
+  }
+  return 0
+}
+
+// The local a record compare reads unstashed operand `o` from: a variable's slot, else -1.
+function structEqSideLocal(o: Opnd): i32 {
+  if !(o is OVar) || isTemp(o.ov) { return -1 }
+  if o.ov < lwStackVal.length && lwStackVal[o.ov] { return -1 }
+  return varSlot(o.ov)
 }
 
 // `RToBox`: the shared box plan's head, the value (a `null` or a literal leaves its immediate

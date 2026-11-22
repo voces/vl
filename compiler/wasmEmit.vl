@@ -20553,21 +20553,35 @@ function binConcatRepUnresolved(binIx: i32, fnIx: i32) {
 function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
   const e = nodeAt(binIx)
   if e is BinExpr {
-    const savedL = eqStashL
-    const savedR = eqStashR
+    const saved = structEqEnter()
     const roots = structEqStage(e.binLeft, e.binRight, row, fnIx)
-    const pathSi: i32[] = []
-    const pathFi: i32[] = []
-    const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
-    eqStashL = savedL
-    eqStashR = savedR
-    if r < 0 { return -1 }
-    if e.binOp == "!=" {
-      fbI32Eqz() // 0x45 i32.eqz — negate value-equality
-    }
-    return 0
+    return structEqTail(e, row, roots, saved, fnIx)
   }
   return emitFail("emitProgram: expected a struct equality")
+}
+
+// The stash slots a struct compare saves before it stages, `[left, right]`, for `structEqTail`.
+export function structEqEnter(): i32[] { return [eqStashL, eqStashR] }
+
+// After the roots: the field-wise compare over `roots` (`[-1, -1]` fails), the stash slots
+// restored from `saved`, and `i32.eqz` for `!=`. Answers -1 on failure.
+export function structEqTail(
+  e: BinExpr,
+  row: i32,
+  roots: i32[],
+  saved: i32[],
+  fnIx: i32,
+): i32 {
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  const r = if roots[0] == -1 { -1 } else { emitStructEqRec(roots[0], roots[1], row, pathSi, pathFi, fnIx) }
+  eqStashL = saved[0]
+  eqStashR = saved[1]
+  if r < 0 { return -1 }
+  if e.binOp == "!=" {
+    fbI32Eqz() // 0x45 i32.eqz — negate value-equality
+  }
+  return 0
 }
 
 // The roots `emitStructEqRec` reads operands `lIx`/`rIx` of a compare at eq row `row` through:
@@ -20575,20 +20589,51 @@ function emitStructEq(binIx: i32, fnIx: i32, row: i32) {
 // `eqStashL`/`eqStashR` now names; `[-1, -1]` on failure. Both are evaluated in source order
 // before either slot is set, and a left place is staged when the right may write it (D17023).
 function structEqStage(lIx: i32, rIx: i32, row: i32, fnIx: i32): i32[] {
-  const rStage = !unionEqOperandOk(rIx)
-  const lStage = rStage || !unionEqOperandOk(lIx)
+  const rStage = structEqStagesRight(rIx)
+  const lStage = structEqStagesLeft(lIx, rIx)
   if lStage && emitExpr(lIx, fnIx) < 0 { return [-1, -1] }
   if rStage && emitExpr(rIx, fnIx) < 0 { return [-1, -1] }
+  return structEqRoots(row, lIx, rIx, -1, -1)
+}
+
+// Whether a struct compare evaluates its right operand `rIx` once into a stash: it is no
+// re-readable place.
+export function structEqStagesRight(rIx: i32): boolean {
+  return !unionEqOperandOk(rIx)
+}
+
+// Whether a struct compare stashes its left operand `lIx`: no re-readable place, or the right is
+// stashed, which may write it.
+export function structEqStagesLeft(lIx: i32, rIx: i32): boolean {
+  return structEqStagesRight(rIx) || !unionEqOperandOk(lIx)
+}
+
+// After the stashed operands' values (left below right): their slots set, right first, and the
+// roots. An unstaged side is read from local `lLocal`/`rLocal` where one is given, else from its
+// place `lIx`/`rIx`.
+export function structEqRoots(
+  row: i32,
+  lIx: i32,
+  rIx: i32,
+  lLocal: i32,
+  rLocal: i32,
+): i32[] {
   let rRoot = rIx
-  if rStage {
+  if structEqStagesRight(rIx) {
     eqStashR = structEqSlot(row, 1)
     fbLocalSet(eqStashR)
     rRoot = -3
+  } else if rLocal >= 0 {
+    eqStashR = rLocal
+    rRoot = -3
   }
   let lRoot = lIx
-  if lStage {
+  if structEqStagesLeft(lIx, rIx) {
     eqStashL = structEqSlot(row, 0)
     fbLocalSet(eqStashL)
+    lRoot = -2
+  } else if lLocal >= 0 {
+    eqStashL = lLocal
     lRoot = -2
   }
   return [lRoot, rRoot]
