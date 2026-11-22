@@ -12965,3 +12965,32 @@ A rep pair on the global (option 2) is a second rep channel. Leaving it to the e
   builds it, and the global's reads in that build take it as it is. The verifier holds a global
   read off its type's rep to the column's rep (`globalReadAtTyOrStorage`). A local's twin retypes
   the variable to the column's type, so rule 3 holds it.
+
+## The IR verifier checks facts the builder recorded, never legacy's answers (2026-11-22, coordinator ruling) — D17049
+
+**Ruled by the coordinator 2026-11-22**, endorsing the merge queue's position on two PRs (IR-M1's
+RRowRetag design and ir-m1-bundle). The verifier adds no call into emit or checker-emit helpers.
+A fact it needs, such as a global's held rep, is recorded on the IR by the builder (`irGlobalNote`,
+read by `irGlobalRepOf`; `IrFn.irGlobalHeld`) and checked there.
+
+**Why.** At I8 legacy codegen is deleted, and a verifier that asks it has nothing to ask. A check
+that re-asks the builder's own source cannot catch the builder's error. The existing verifier→emit
+edges (30 imports, D17049) are debt to retire before I8, owner IR-D1.
+
+**Applied.** A byte-free record retag between two reps of one legacy row (RRowRetag) is deferred.
+A sound one needs both reps' kids checked against the row's field valtypes by name, and reps carry
+no field names (D622's spelling-versus-layout order). A rep that differs from its row's storage is
+filed or fixed upstream, never retagged.
+
+## When the IR cannot reproduce a legacy accident, legacy changes, not the IR (2026-11-22, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-22**, on IR-N2's print-slot question. Legacy's union print and
+`??` box-field rung take `sharedFieldRecvSlot` before lowering their operand. The IR lowers an in-place
+operand first, so its locals are declared in another order. Legacy is changed, in its own
+behaviour-preserving PR, to take the slot after the operand. No IR node exists only to mimic legacy's
+order, and a case refused "until I8" is not an answer, because I8 needs every function claimed.
+
+**Why.** An IR node that only reproduces a legacy accident is deleted with legacy at I8, and so is
+dual-path cost with no lasting value. A lookahead in the lowering would be coupling the verifier
+cannot see. Changing legacy's local-declaration order moves only local indices, which the queue
+grades by run outputs plus an exact list of moved programs (merge-queue.md Q15).
