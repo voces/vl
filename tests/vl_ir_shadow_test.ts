@@ -1470,11 +1470,16 @@ Deno.test({
     // a fused map read's mv slot read into an out that is not its map's value (rule 2). Cases 21
     // to 23 break a nullable reference's `??`: an `i32` and a non-null list operand, and a
     // nullable list into an `i32` out (rule 2). Case 24 is a shared read whose global receiver's
-    // cell is no box (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2];
+    // cell is no box (rule 2). Case 25 is a niche read over an i32 operand (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
+    }
+    // Case 100 reads a global the builder flagged as holding a record whole (`irGlobalHeld`) at a
+    // rep other than its noted one: the flag does not let it past rule 2.
+    if (exp.irVerifySelfTest(100) !== 2) {
+      throw new Error(`case 100: want rule 2, got rule ${exp.irVerifySelfTest(100)}`);
     }
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");

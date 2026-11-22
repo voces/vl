@@ -154,6 +154,7 @@ import {
   RMapSet,
   RMemAccess,
   RMemOp,
+  RNicheRead,
   RNulNicheEq,
   RNulTest,
   RNullOf,
@@ -197,6 +198,7 @@ import {
   SForIn,
   SGlobalSet,
   SIf,
+  SIntSwitch,
   SLet,
   SListSet,
   SLoop,
@@ -228,6 +230,7 @@ import {
   fbBlock,
   fbBr,
   fbBrIf,
+  fbBrTable,
   fbCall,
   fbDrop,
   fbElse,
@@ -242,6 +245,7 @@ import {
   fbI32Eqz,
   fbI32Load,
   fbI32RelOf,
+  fbI32WrapI64,
   fbI64Const,
   fbIf,
   fbIfRefNul,
@@ -336,6 +340,7 @@ import {
   emitMapGetTail,
   emitMapNew,
   emitNarrowedMapReadTail,
+  emitNicheReadTail,
   emitNullOwn,
   emitNullRetTail,
   emitOmittedFieldNull,
@@ -398,6 +403,12 @@ import {
   mapGetOrMvHead,
   mapGetOrMvPlain,
   mapGetOrMvTail,
+  mapGetOrNicheHead,
+  mapGetOrNicheStash,
+  mapGetOrNicheTail,
+  mapGetOrUnionBoxOf,
+  mapGetOrUnionBoxOpen,
+  mapGetOrUnionBoxTail,
   mapGetOrUnionHead,
   mapGetOrUnionScalarOpen,
   mapGetOrUnionScalarPlanOf,
@@ -1058,6 +1069,7 @@ function rhs(r: Rhs, tail: boolean) {
     RBoxField => boxField(r)
     RSharedRead => sharedRead(r)
     RBoxNarrow => boxNarrow(r)
+    RNicheRead => nicheRead(r)
     RRecCopyPure => {
       leaf()
       recCopyPureEmit(r.rpAt, lw.irAt)
@@ -1887,6 +1899,13 @@ function boxNarrow(r: RBoxNarrow) {
   return narrowedVariantTail(vi)
 }
 
+// `RNicheRead`: the box, then legacy's niche tail (`emitNicheReadTail`), as `emitNarrowedNicheRead`
+// writes it after its storage read.
+function nicheRead(r: RNicheRead) {
+  irLOpnd(r.nrV)
+  return emitNicheReadTail(r.nrAt, r.nrKind, lw.irAt)
+}
+
 // `RBoxNarrow` of a ref list or map arm: the box, then legacy's payload cast to the container,
 // past the list overrides `emitIdentNode` asks first.
 function boxContainerRead(r: RBoxNarrow) {
@@ -2395,6 +2414,9 @@ function mapGetOr(r: RMapGetOr) {
     arm != want
     || r.mgForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
     || r.mgForm == 3 && mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk).muKind < 0
+    || r.mgForm == 4 && !mapGetOrNicheStash(rd.idxArr, e.binRight, fnIx)
+    || r.mgForm == 5
+      && !mapGetOrUnionBoxOf(mapRecvShapeOf(rd.idxArr, fnIx), e.binRight)
   ) {
     return irLMiss("map read route")
   }
@@ -2500,7 +2522,12 @@ function mapGetOrInlineHead(
   qp: MapUnionPlan,
 ): i32 {
   const sh = mapProbeHead(recvIx, sym, nonNull, loc, key)
-  if form == 3 {
+  if form == 5 {
+    mapGetOrUnionHead(sh)
+    mapGetOrUnionBoxOpen(sh)
+  } else if form == 4 {
+    mapGetOrNicheHead(sh)
+  } else if form == 3 {
     mapGetOrUnionHead(sh)
     mapGetOrUnionScalarOpen(sh, qp)
   } else if form == 2 {
@@ -2513,6 +2540,8 @@ function mapGetOrInlineHead(
 
 // An inline map read's tail after its default, by `form`.
 function mapGetOrInlineTail(form: i32, sh: i32, qp: MapUnionPlan) {
+  if form == 5 { return mapGetOrUnionBoxTail(sh) }
+  if form == 4 { return mapGetOrNicheTail(sh) }
   if form == 3 { return mapGetOrUnionScalarTail(sh, qp) }
   return if form == 2 { mapGetOrMvTail(sh) } else { mapGetOrI32Tail() }
 }
@@ -2539,6 +2568,9 @@ function coalMapGetOr(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
     || want == "helper"
     || mp.prForm == 2 && !mapGetOrMvPlain(rd.idxArr, e.binRight, fnIx)
     || mp.prForm == 3 && mapGetOrUnionPlanAt(rd.idxArr, e.binRight, rk).muKind < 0
+    || mp.prForm == 4 && !mapGetOrNicheStash(rd.idxArr, e.binRight, fnIx)
+    || mp.prForm == 5
+      && !mapGetOrUnionBoxOf(mapRecvShapeOf(rd.idxArr, fnIx), e.binRight)
   ) {
     return irLMiss("map read route")
   }
@@ -3388,8 +3420,58 @@ function node(id: i32, pending: i32[], tail: boolean, armOut: i32) {
       setField(n, lw.irNodeAt[id])
       irLSettle(pending)
     }
+    SIntSwitch => intSwitch(n, pending, tail)
     SCellSet | SSwitch => irLMiss("statement outside I1")
   }
+  return 0
+}
+
+// An integer switch as `emitIntSwitch` writes it: the outer frame, the default's, one per arm,
+// the index less its low value (a 64-bit one range-tested onto the default), the `br_table`, then
+// each arm and a branch past the rest, and the else. A tail chain's arms are in tail position.
+function intSwitch(n: SIntSwitch, pending: i32[], tail: boolean) {
+  irLSettle(pending)
+  const m = n.isArms.length
+  const span = n.isTable.length - 1
+  const lo = n.isLo
+  fbBlock(64)
+  lwFrames.push(-1)
+  const endDepth = ctrlDepth
+  let k = 0
+  while k <= m {
+    fbBlock(64)
+    lwFrames.push(-1)
+    k = k + 1
+  }
+  irLOpnd(n.isOn)
+  if n.isWide {
+    fbI64Const(lo >> 31, lo)
+    fbI32Bin(125) // 0x7d i64.sub
+    fbI32WrapI64()
+    fbI32Const(span + 1)
+    irLOpnd(n.isOn)
+    fbI64Const(lo >> 31, lo)
+    fbI32Bin(125) // 0x7d i64.sub
+    fbI64Const(0, span + 1)
+    fbI32Bin(84) // 0x54 i64.lt_u
+    fbSelect()
+  } else if lo != 0 {
+    fbI32Const(lo)
+    fbI32Bin(107) // 0x6b i32.sub
+  }
+  fbBrTable(n.isTable, m)
+  const armTail = n.isTail && tail
+  for a in n.isArms {
+    fbEnd()
+    lwFrames.pop()
+    body(a, armTail, -1, false)
+    fbBr(ctrlDepth - endDepth)
+  }
+  fbEnd()
+  lwFrames.pop()
+  body(n.isElse, armTail, -1, false)
+  fbEnd()
+  lwFrames.pop()
   return 0
 }
 
