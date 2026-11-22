@@ -12994,3 +12994,19 @@ order, and a case refused "until I8" is not an answer, because I8 needs every fu
 dual-path cost with no lasting value. A lookahead in the lowering would be coupling the verifier
 cannot see. Changing legacy's local-declaration order moves only local indices, which the queue
 grades by run outputs plus an exact list of moved programs (merge-queue.md Q15).
+
+## A byte-free record retag requires struct identity (2026-11-22, coordinator ruling)
+
+**Ruled by the coordinator 2026-11-22.** A byte-free RRetag from one record rep to another is
+admitted only when the two are the same struct. Wasm struct types are nominal in VL's output, so
+that means the same heap, or, for a width retag, the declared sub chain. The verifier reads the
+heap from an IR-side note the builder records (`IrFn.irRecHeap`), never from an emit query
+(merge-queue.md Q20).
+
+**Why.** Two records whose fields agree are still two wasm types when their heaps differ, and a
+retag between them with no bytes ships an ill-typed value. Field-by-field comparison is also
+unbounded on recursive types: `repFillsHole`'s record arm recursed forever on recursive record
+twins (`type L1 = {n: L1|null}` beside an L2 twin), a compiler stack overflow caught by
+`tests/cases/structs/structural-twin-heap-dedup.vl`, and it was seen to admit field-alike records
+on different heaps. Identity is one compare and is what the target checks. Recording the heap on
+the IR keeps the verifier independent of emit (the ruling of the same day above, D17049).

@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **IR verifier self-tests are keyed by string id, not position.** `compiler/ir_selftest.vl` keeps the list of case ids (exported through `irSelfTestIdCount`/`irSelfTestIdLen`/`irSelfTestIdAt`), and `irVerifySelfTest(i)` runs the case at index `i` of that list. The shadow test reads the ids and checks each against an `{id: rule}` map. It also refuses a duplicate id, an expected id the module does not list, and a listed id with no expected rule. Two lanes that add a case no longer collide on a number. All 32 existing cases (0–28 and 100–102) migrated with the rule each names unchanged.
