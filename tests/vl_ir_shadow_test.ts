@@ -1503,6 +1503,12 @@ Deno.test({
     if (exp.irVerifySelfTest(100) !== 2) {
       throw new Error(`case 100: want rule 2, got rule ${exp.irVerifySelfTest(100)}`);
     }
+    // Cases 101 and 102 are a result pick (`RResultPick`) of an i32, and of a record into an i32.
+    for (const k of [101, 102]) {
+      if (exp.irVerifySelfTest(k) !== 2) {
+        throw new Error(`case ${k}: want rule 2, got rule ${exp.irVerifySelfTest(k)}`);
+      }
+    }
     // Rule 8 pairs a check and a read of one string-literal node, never two of equal text.
     if (exp.irBoundsStrSelfTest(0) !== 1) throw new Error("want one literal node to pair");
     if (exp.irBoundsStrSelfTest(1) !== 0) throw new Error("want two literal nodes refused");
@@ -2761,6 +2767,31 @@ Deno.test({
     }
     if ((rows.get("uncovered returned trap widened") ?? 0) !== 1) {
       throw new Error(`want tl a named miss, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
+// A returned bundle's record held by a `const` and used at one signature takes that member
+// (`holderMemberTy`), in a plain and a generic function, and matches. A call straight off the
+// result stays a named indirect-call miss.
+const ONE_MEMBER_HOLDER =
+  `function lap(f) {\n  print(f(2.5))\n  print(f(3))\n  return f\n}\nfunction plain(k: i32) {\n  const r = lap((a) => a + k)\n  print(r(4))\n}\nfunction gen<T>(x: T, k: i32) {\n  const r = lap((a) => a + k)\n  print(r(1))\n  print(x)\n}\nfunction direct(k: i32) {\n  print(lap((a) => a + k)(7))\n}\nplain(5)\ngen("s", 20)\ndirect(1)\n`;
+Deno.test({
+  name: "ir shadow: a bundle record held at one signature takes its member and matches",
+  ignore,
+  fn: () => {
+    const { rc, rows } = run(ONE_MEMBER_HOLDER, true);
+    if (rc !== 0) throw new Error(`want compileSrc rc 0, got ${rc}`);
+    const fails = failures(rows);
+    if (fails.length > 0) throw new Error(`want no failure, got:\n${fails.join("\n")}`);
+    if ((rows.get("uncovered open local type") ?? 0) !== 0) {
+      throw new Error(`want no open local type, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("covered") ?? 0) !== (rows.get("matched") ?? 0)) {
+      throw new Error(`want every covered function matched, got ${JSON.stringify([...rows])}`);
+    }
+    if ((rows.get("uncovered indirect call") ?? 0) !== 1) {
+      throw new Error(`want direct a named indirect-call miss, got ${JSON.stringify([...rows])}`);
     }
   },
 });
