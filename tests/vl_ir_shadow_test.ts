@@ -1525,6 +1525,8 @@ Deno.test({
       "atom-tower-i32-read": 2,
       "atom-tower-zero-reads": 2,
       "atom-staged-of-i32": 2,
+      "coal-str-default-off-rep": 2,
+      "coal-atom-str-default-off-rep": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
@@ -1555,17 +1557,18 @@ Deno.test({
   ignore,
   fn: () => {
     const src = `function ok(x: i32): i32 { return x + 1 }
-function two(s: string, t: string | null): i32 {
+function two(c: boolean): i32 {
   const xs = [1, 2]
-  if (t ?? s) == s { return xs[0] }
-  return 0
+  const x = null
+  const y = (if c { x } else { x }) ?? 0
+  return xs[0] + y
 }
 print(ok(1))
-print(two("a", "b"))
+print(two(true))
 `;
     const census = run(src, 4);
     if (census.rc !== 0) throw new Error(`want compileSrc rc 0, got ${census.rc}`);
-    const want = "blockers coalesce string default";
+    const want = "blockers coalesce nulnone effect if";
     if ((census.rows.get(want) ?? 0) !== 1) {
       throw new Error(`want one row ${want}, got ${JSON.stringify([...census.rows])}`);
     }
