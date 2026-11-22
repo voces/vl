@@ -39,3 +39,21 @@ from 24 to 38 functions, and start functions from 6 to 12. What is still uncover
 #9378's and #9397's. The row `tests/ir-shadow-rows/atomic-trunc-sat.vl` has 12 functions. All 12
 are `intrinsic none` on master's seed; here all 12 are covered and matched. The full table is in
 the PR body.
+
+## Fuel
+
+L2 self-compile fuel rises 452.1M, +0.42% on 108,270,449,226 at base 755a6b9f, measured on
+fixpoint trees with a commit split. All of it is the compile of this PR's own source, not
+slower code: the head's seed compiles the base tree at exactly the base's fuel. By phase, head
+on head against base on base:
+- `checkProgram` +0.24G;
+- the code payload +0.13G;
+- the emit passes and `emitModule` +0.06G.
+
+The new lines check at about 7x the average line. The split points at the two `Rhs` members:
+- the IR files carry +444M (legacy alone +8M), the builder's +204M and the node set's +240M;
+- that +240M is paid with no `RAtomic` built in the self-compile;
+- moving the new arms last saves only 24M; the two `callRhs` probes are 43M.
+
+So the cost is each `match` over `Rhs` checked against two more members. That is a general cost
+of widening `Rhs`, reported to the coordinator.
