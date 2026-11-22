@@ -166,6 +166,7 @@ import {
   valtypeOf,
 } from "./ir_lower"
 import {
+  BundlePick,
   CallRefArgArm,
   FieldStoreValArm,
   GlobalCtx,
@@ -197,6 +198,7 @@ import {
   bundleCallRefPlainKey,
   bundleChoiceTyOf,
   bundlePickOf,
+  bundleResultPickOf,
   callEndsNever,
   callRefArgArmOf,
   callRefArmUnboxPlan,
@@ -562,6 +564,7 @@ import {
   forInElemTyOf,
   forInMapRecv,
   globalCellKind,
+  holderMemberTy,
   holderRecordTy,
   identIsEnvCapture,
   letBindIsAtom,
@@ -1982,7 +1985,9 @@ function exprTyOf(ix: i32): i32 {
   const n = nodeAt(ix)
   // A direct call typed open, or typed at the closure its callee returns a bundle record for
   // (`fnRetHeldAsBundle`), is of its callee's result as the IR holds it (`resultTy`).
-  if t >= 0 && !(n is Call && (irTyOpen(t) || bundleCallOf(n, t))) { return t }
+  if t >= 0 && !(n is Call && (irTyOpen(t) || bundleCallOf(n, ix, t))) {
+    return t
+  }
   if n is Call {
     if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return t }
     const d = identDeclOf(n.callFn)
@@ -1991,6 +1996,13 @@ function exprTyOf(ix: i32): i32 {
       return t
     }
     const fn = nodeAt(fnStmts[pos])
+    // Where legacy picks a member of the bundle record after the call, the value is that member.
+    if t < 0 || irTyOpen(t) {
+      const pk = if elabHasRetRecords() || bundleAnyNoted() { bundleResultPickOf(ix, pos, ibFnIx) } else { noPick() }
+      if pk.bpField >= 0 && pk.bpTy >= 0 && !irTyOpen(pk.bpTy) {
+        return pk.bpTy
+      }
+    }
     if fn is FuncDecl { return resultTy(pos, fn.fnRet, fnStmts[pos]) }
   }
   // A capture cell's `c[0]` the rewrite left untyped (a store target, its spilled re-read, a
@@ -2008,16 +2020,26 @@ function exprTyOf(ix: i32): i32 {
   return if t < 0 { capturedClosureTy(ix) } else { t }
 }
 
-// Whether direct call `n`, typed `t`, calls a function legacy returns a bundle record from at
-// that type (`fnRetHeldAsBundle`), so its value is the callee's `resultTy`.
-function bundleCallOf(n: Call, t: i32): boolean {
+// Whether direct call `n` (node `ix`), typed `t`, is the bundle record its callee returns at that
+// type (`fnRetHeldAsBundle`), kept whole, so its value is the callee's `resultTy`.
+function bundleCallOf(n: Call, ix: i32, t: i32): boolean {
   // A bundle result is a returned record or a handed-back bundle parameter: with neither noted
   // in this build, `fnBundleRetSigs` answers none.
   if !elabHasRetRecords() && !bundleAnyNoted() { return false }
   if n.callFn < 0 || !(nodeAt(n.callFn) is Ident) { return false }
   if !(repNodeAt(repNodeOfTy(t)) is RClosure) { return false }
   const pos = fnIndexOfNode(n.callFn)
-  return pos >= 0 && pos < fnStmts.length && fnRetHeldAsBundle(pos, t)
+  if pos < 0 || pos >= fnStmts.length || !fnRetHeldAsBundle(pos, t) {
+    return false
+  }
+  // Where legacy picks a member after the call, the value is that member, at the call's type.
+  const pk = bundleResultPickOf(ix, pos, ibFnIx)
+  return pk.bpField < 0 && pk.bpHeap != -2
+}
+
+function noPick(): BundlePick {
+  const none: BundlePick = { bpHeap: -1, bpField: -1, bpTy: -1, bpKey: "" }
+  return none
 }
 
 // The type an untyped read `ix` of a captured hole-lambda binding is held at: its open type, at
@@ -2221,9 +2243,11 @@ function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
 export function irBDeclVar(d: i32): i32 {
   const known = ibDeclVar[d] ?? -1
   if known >= 0 { return known }
-  // Legacy holds a binding of a returned record whole as that record (`letCellKind`).
+  // Legacy holds a binding of a returned record whole as that record (`letCellKind`), and one
+  // holding a single member of it as that member's closure (`holderMemberTy`).
   const ht = holderRecordTy(d, ibFnIx)
-  const ty = if ht >= 0 { ht } else { heldTy(scopeTyAt(d, ibFnIx)) }
+  const hm = if ht < 0 && (elabHasRetRecords() || bundleAnyNoted()) { holderMemberTy(d, ibFnIx) } else { -1 }
+  const ty = if ht >= 0 { ht } else if hm >= 0 && !irTyOpen(hm) { hm } else { heldTy(scopeTyAt(d, ibFnIx)) }
   const rep = repNodeOfTy(ty)
   if isVoidTy(ty) || !valueRep(rep, ty) {
     irBMiss("local rep " + repWhat(rep))
@@ -8105,8 +8129,21 @@ function exprAtPre(b: i32[], ix: i32, cell: boolean, pre: string): Opnd {
     if rhs is RCall {
       const si = irSigOf(ib, rhs.caCallee)
       if si >= 0 && ib.irSigRet[si] != rep {
-        // A record call whose type keys the row its callee returns is built at the callee's rep.
+        // A bundle record legacy picks a member of after the call (`bundleResultPickOf`) is
+        // the record, then that member; a pick legacy refuses (`bpHeap` -2) has no field.
         const sr = ib.irSigRet[si]
+        const pk = if repNodeAt(sr) is RRecord && repNodeAt(rep) is RClosure { bundleResultPickOf(ix, rhs.caCallee, ibFnIx) } else { noPick() }
+        if pk.bpField >= 0 && pk.bpTy >= 0 && repNodeOfTy(pk.bpTy) == rep {
+          const rec = irBLetTempTy(b, rhs, ix, sr, repTyOf(sr))
+          return irBLetTempTy(
+            b,
+            { rkV: rec, rkAt: ix, rkFe: rhs.caCallee },
+            ix,
+            rep,
+            pk.bpTy,
+          )
+        }
+        // A record call whose type keys the row its callee returns is built at the callee's rep.
         if (
           !(repNodeAt(sr) is RRecord)
           || !callAtCalleeResultRow(ix, rhs.caCallee)
