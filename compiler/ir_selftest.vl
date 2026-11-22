@@ -1,6 +1,6 @@
 // The verifier's own cases: hand-built IR breaking each of rules 1-7, more for rules 5, 2 and 8,
-// the fused `pop ?? d`'s three, a stashed record's source order, the fused map read's four, and
-// one function that holds.
+// the fused `pop ?? d`'s three, a stashed record's source order, the fused map read's four, a
+// numeric union conversion's two, and one function that holds.
 // A host test calls `irVerifySelfTest(k)` once the checker's primitives exist (after any
 // compile) and compares the rule the verifier names with `k`.
 import {
@@ -92,6 +92,28 @@ function caseFn(k: i32): IrFn {
     irGlobalNote(f, 0, boolr)
     f.irBody.push(node(f, { gsSym: 0, gsSrc: v(p) }, none))
   }
+  // Rule 2: a result pick (`RResultPick`) reads a member of a record into a closure; one of an
+  // i32 (101), or of a record into an i32 (102), is refused.
+  if k == 101 || k == 102 {
+    const ot = mkObjTy(["c0", "c1"], [TY_I32, TY_I32])
+    const orep = repNodeOfTy(ot)
+    const rec = irVarNew(f, orep, ot, "local", 1)
+    const from = if k == 101 { v(p) } else { v(rec) }
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: g, lRhs: { rkV: from, rkAt: -1, rkFe: -1 } }, i32r),
+    )
+  }
+  // Rule 2: a global the builder noted as holding a record whole is still read only at its noted
+  // rep; an i32 read of one noted as a bool is refused.
+  if k == 100 {
+    irGlobalNote(f, 0, boolr)
+    f.irGlobalHeld[0] = true
+    const g = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: g, lRhs: { ggSym: 0, ggNonNull: false, ggNn: -1 } }, i32r),
+    )
+  }
   // Rule 8 with the bounds rule uninstalled: a bounds check must not pass unverified.
   if k == 10 { f.irBody.push(node(f, { bcV: v(p), bcIx: v(p) }, none)) }
   // Rule 2 again: a box whose immediate stands for a call, whose effect would go unread.
@@ -120,7 +142,15 @@ function caseFn(k: i32): IrFn {
     f.irBody.push(
       node(
         f,
-        { cbL: from, cbArm: "popOr", cbNull: d, cbOut: o, cbAt: -1, cbMap: null },
+        {
+          cbL: from,
+          cbLB: [],
+          cbArm: "popOr",
+          cbNull: d,
+          cbOut: o,
+          cbAt: -1,
+          cbMap: null,
+        },
         or,
       ),
     )
@@ -139,7 +169,15 @@ function caseFn(k: i32): IrFn {
     f.irBody.push(
       node(
         f,
-        { cbL: from, cbArm: arm, cbNull: d, cbOut: o, cbAt: -1, cbMap: mp },
+        {
+          cbL: from,
+          cbLB: [],
+          cbArm: arm,
+          cbNull: d,
+          cbOut: o,
+          cbAt: -1,
+          cbMap: mp,
+        },
         i32r,
       ),
     )
@@ -156,6 +194,7 @@ function caseFn(k: i32): IrFn {
         f,
         {
           cbL: v(mv),
+          cbLB: [],
           cbArm: "mapIndexGetOr",
           cbNull: d,
           cbOut: o,
@@ -165,6 +204,13 @@ function caseFn(k: i32): IrFn {
         boolr,
       ),
     )
+  }
+  // Rule 2 again: a numeric union conversion of an operand that is no box (case 27, at its own
+  // kind), and one whose result is not at its kind (case 28).
+  if k == 27 || k == 28 {
+    const ct = irVarNew(f, i32r, TY_I32, "temp", -1)
+    const cv: Rhs = { nuV: v(p), nuTo: if k == 27 { 1 } else { 4 }, nuAt: -1 }
+    f.irBody.push(node(f, { lDst: ct, lRhs: cv }, i32r))
   }
   // Rule 2 again: an order-stashed record whose source order evaluates one field twice.
   if k == 15 {
@@ -195,8 +241,54 @@ function caseFn(k: i32): IrFn {
     )
     const so = irVarNew(f, i32r, TY_I32, "temp", -1)
     f.irBody.push(
-      node(f, { lDst: so, lRhs: { srV: v(st), srAt: -1, srStash: false } }, i32r),
+      node(
+        f,
+        {
+          lDst: so,
+          lRhs: {
+            srV: v(st),
+            srAt: -1,
+            srStash: false,
+            srGlobal: -1,
+            srGlobalNonNull: false,
+          },
+        },
+        i32r,
+      ),
     )
+  }
+  // Rule 2 again: a shared read whose global receiver's recorded cell is no box.
+  if k == 24 {
+    irGlobalNote(f, 0, i32r)
+    const sg = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(
+        f,
+        {
+          lDst: sg,
+          lRhs: {
+            srV: imm(i32r, 0),
+            srAt: -1,
+            srStash: false,
+            srGlobal: 0,
+            srGlobalNonNull: false,
+          },
+        },
+        i32r,
+      ),
+    )
+  }
+  // Rule 2 again: a niche read whose operand is an i32, not a box.
+  if k == 25 {
+    const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(
+      node(f, { lDst: sn, lRhs: { nrV: v(p), nrAt: -1, nrKind: 2 } }, i32r),
+    )
+  }
+  // Rule 2 again: an arm unbox whose operand is an i32, not a box.
+  if k == 26 {
+    const sn = irVarNew(f, i32r, TY_I32, "temp", -1)
+    f.irBody.push(node(f, { lDst: sn, lRhs: { uaV: v(p), uaAt: -1 } }, i32r))
   }
   // A nullable reference's `??` over an `i32` (case 21), over a non-null list (case 22), and over a
   // nullable list into an `i32` out that is neither the list nor a box (case 23).
@@ -211,7 +303,15 @@ function caseFn(k: i32): IrFn {
     f.irBody.push(
       node(
         f,
-        { cbL: from, cbArm: "nulRef", cbNull: d, cbOut: o, cbAt: -1, cbMap: null },
+        {
+          cbL: from,
+          cbLB: [],
+          cbArm: "nulRef",
+          cbNull: d,
+          cbOut: o,
+          cbAt: -1,
+          cbMap: null,
+        },
         i32r,
       ),
     )
@@ -229,7 +329,7 @@ function callNode(): i32 {
 // The rule the verifier names for case `k`: 0 for the function that holds, `k` for 1 to 7, 8 for
 // 10 (no bounds rule), 5 for 8, 14 and 18 (a fall-through, an out left unwritten), and 2 for the
 // rest (a store, an effectful immediate, a pop, map read or `??` of the wrong operand or out, a
-// stashed record's order, a probe off its arm, a temp shared read).
+// stashed record's order, a probe off its arm, a shared temp read, a held global, a bad pick).
 export function irVerifySelfTest(k: i32): i32 {
   return irVerify(caseFn(k)).vfRule
 }

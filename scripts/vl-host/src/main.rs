@@ -777,7 +777,13 @@ tests continue in a fresh instance.
                       compiles every file in one compiler, one at a time
   {c}--exclude{r} <glob>    Skip matching files (repeatable; also --exclude=<glob>)
   {c}--show-output{r}       Print what a PASSING test printed too (a failing
-                      test's output is always shown)
+                      test's output is always shown), and what the top level of
+                      a file with no failure printed
+  {c}--no-capture{r}        Print each test's output to stdout as it runs, under a
+                      `=== RUN` line, one test at a time (implies --jobs 1;
+                      for a test that hangs)
+  {c}--json{r}              Write the results as one JSON document to stdout
+                      instead of the report, every test's output included
   {c}--color={r}<when>      always | never | auto (default), for the RUNNER's own
                       report; a test's captured output is always plain
   {c}--compiler{r} <wasm>   Compiler seed to use (see `vl help seed`)
@@ -7915,6 +7921,8 @@ struct TestFile {
 /// does not pay Cranelift a second time — collection is where that cost lands, and
 /// it is paid in parallel.
 struct TestRegistry {
+    /// The file's path as the report names it, for `--no-capture`'s `=== RUN` lines.
+    path: String,
     module: Option<Module>,
     /// The module's `boolean` extern globals (`extern_bool_names`), for each re-instantiation.
     ext_bools: Vec<String>,
@@ -7930,25 +7938,57 @@ struct TestRegistry {
     live: Mutex<Option<(Store<()>, Instance)>>,
     /// Where `live` and every re-instantiation print (`TestSink`).
     sink: TestSink,
+    /// What the top level printed while collection ran it, reported as the file's own block.
+    top_output: String,
 }
 
-/// A test file's output capture. Closed while collecting, since registration output
-/// belongs to no test, and opened by the run phase, which clears it before each test.
+/// A test file's output capture. Collection opens it to keep what the top level prints; the
+/// run phase clears it before each test, so a re-instantiation's top level reaches no test.
+/// A `stream` sink (`--no-capture`) writes each line to stdout as it is printed instead.
 #[derive(Clone, Default)]
 struct TestSink {
     buf: Arc<Mutex<String>>,
     on: Arc<std::sync::atomic::AtomicBool>,
+    stream: bool,
 }
 
 impl TestSink {
+    fn streaming(stream: bool) -> TestSink {
+        TestSink {
+            stream,
+            ..TestSink::default()
+        }
+    }
+
     fn open(&self) {
         self.on.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take what the sink holds, leaving it empty.
+    fn take(&self) -> String {
+        std::mem::take(&mut *self.buf.lock().unwrap())
+    }
+
+    /// Under `--no-capture`, a `=== RUN` line on stdout before the output it heads, so a
+    /// hang shows which test or file was running.
+    fn announce(&self, what: &str) {
+        if self.stream {
+            use std::io::Write as _;
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "=== RUN  {what}");
+            let _ = out.flush();
+        }
     }
 
     fn writer(&self) -> impl Fn(&str) + Send + Sync + Clone + 'static {
         let sink = self.clone();
         move |line: &str| {
-            if sink.on.load(std::sync::atomic::Ordering::Relaxed) {
+            if sink.stream {
+                use std::io::Write as _;
+                let mut out = std::io::stdout().lock();
+                let _ = writeln!(out, "{line}");
+                let _ = out.flush();
+            } else if sink.on.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut b = sink.buf.lock().unwrap();
                 b.push_str(line);
                 b.push('\n');
@@ -8073,17 +8113,20 @@ fn test_keep_instance() -> bool {
 /// Collect one file's registry: load the module, instantiate it (which RUNS the
 /// registrations), and read the `vlt*` exports back. The instance is kept for the run.
 ///
-/// Registration output is discarded — a test file's top level is meant to declare
-/// tests and nothing else, and anything it prints belongs to no test.
-fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
+/// What the top level prints belongs to no test: it is kept as `top_output`, the file's own
+/// block in the report, including what printed before a top-level trap.
+fn collect_test_file(engine: &Engine, file: &TestFile, stream: bool) -> TestRegistry {
+    let sink = TestSink::streaming(stream);
     let failed = |error: String| TestRegistry {
+        path: file.path.clone(),
         module: None,
         ext_bools: Vec::new(),
         names: Vec::new(),
         skips: Vec::new(),
         error,
         live: Mutex::new(None),
-        sink: TestSink::default(),
+        sink: TestSink::streaming(stream),
+        top_output: sink.take(),
     };
     let module = match user_module(engine, &file.bytes) {
         Ok(m) => m,
@@ -8097,10 +8140,10 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
             ))
         }
     };
-    // The sink stays closed until the run opens it, so registration output is
-    // dropped; `Palette::OFF` because this is the instance tests run in (`run_test_file`).
+    // `Palette::OFF` because this is the instance tests run in (`run_test_file`).
     let ext_bools = extern_bool_names(&file.bytes);
-    let sink = TestSink::default();
+    sink.open();
+    sink.announce(&format!("{} (top level)", file.path));
     let (mut store, inst) =
         match instantiate_program(engine, &module, &ext_bools, sink.writer(), Palette::OFF) {
             Ok(pair) => pair,
@@ -8117,12 +8160,14 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
         (Ok(c), Ok(l), Ok(a), Ok(s)) => (c, l, a, s),
         _ => {
             return TestRegistry {
+                path: file.path.clone(),
                 module: Some(module),
                 ext_bools,
                 names: Vec::new(),
                 skips: Vec::new(),
                 error: String::new(),
                 live: Mutex::new(None),
+                top_output: sink.take(),
                 sink,
             }
         }
@@ -8139,12 +8184,14 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
     })();
     match read {
         Ok((names, skips)) => TestRegistry {
+            path: file.path.clone(),
             module: Some(module),
             ext_bools,
             names,
             skips,
             error: String::new(),
             live: Mutex::new(test_keep_instance().then_some((store, inst))),
+            top_output: sink.take(),
             sink,
         },
         Err(e) => failed(format!("reading the test registry: {}", trap_text(&e))),
@@ -8205,6 +8252,8 @@ fn run_test_file(
     let mut live = match kept {
         Some(pair) => pair,
         None => {
+            reg.sink
+                .announce(&format!("{} (top level, again)", reg.path));
             match instantiate_program(engine, module, &reg.ext_bools, sink.clone(), Palette::OFF) {
                 Ok(pair) => pair,
                 Err(e) => return bail_all(&trap_text(&e)),
@@ -8212,8 +8261,11 @@ fn run_test_file(
         }
     };
     let mut out = Vec::with_capacity(selected.len());
-    for &(plan_idx, local) in selected {
+    for (done, &(plan_idx, local)) in selected.iter().enumerate() {
         captured.lock().unwrap().clear();
+        if let Some(name) = reg.names.get(local as usize) {
+            reg.sink.announce(&format!("{}: {name}", reg.path));
+        }
         let (store, inst) = &mut live;
         let run = match inst.get_typed_func::<i32, i32>(&mut *store, "vltRun") {
             Ok(f) => f,
@@ -8281,8 +8333,13 @@ fn run_test_file(
                         output: text,
                     },
                 ));
-                // Re-instantiate for the next test. A failure here is terminal for
-                // the rest of THIS file only.
+                // Re-instantiate for the next test, when there is one. A failure here is
+                // terminal for the rest of THIS file only.
+                if done + 1 == selected.len() {
+                    break;
+                }
+                reg.sink
+                    .announce(&format!("{} (top level, again after a trap)", reg.path));
                 match instantiate_program(
                     engine,
                     module,
@@ -10143,12 +10200,22 @@ fn pump_session(
                     inst.get_typed_func::<i32, i32>(&mut store, "cliTestNameCommit")?;
                 let file_commit =
                     inst.get_typed_func::<i32, i32>(&mut store, "cliTestFileCommit")?;
+                // Probed, so a seed that predates them still runs: without `cliTestTopOutPush`
+                // a top level's output has nowhere to go, and without the other nothing streams.
+                let top_push = inst
+                    .get_typed_func::<i32, i32>(&mut store, "cliTestTopOutPush")
+                    .ok();
+                let stream = match inst.get_typed_func::<(), i32>(&mut store, "cliTestStreamWanted")
+                {
+                    Ok(f) => f.call(&mut store, ())? != 0,
+                    Err(_) => false,
+                };
                 let engine_t = test_engine(&mut test_engine_slot)?;
                 let trace = test_trace_on();
                 let epoch = std::time::Instant::now();
                 test_regs = parallel_map(test_files.len(), workers, |i| {
                     let start_us = epoch.elapsed().as_micros();
-                    let reg = collect_test_file(&engine_t, &test_files[i]);
+                    let reg = collect_test_file(&engine_t, &test_files[i], stream);
                     if trace {
                         test_trace_stamp("collect", i, start_us, epoch.elapsed().as_micros());
                     }
@@ -10164,6 +10231,11 @@ fn pump_session(
                     let status = if reg.error.is_empty() { 0 } else { 1 };
                     if status != 0 {
                         result_in.send(&mut store, &reg.error)?;
+                    }
+                    if let Some(push) = &top_push {
+                        for ch in reg.top_output.chars() {
+                            push.call(&mut store, ch as i32)?;
+                        }
                     }
                     file_commit.call(&mut store, status)?;
                 }
