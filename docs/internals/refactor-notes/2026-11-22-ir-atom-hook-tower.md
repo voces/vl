@@ -17,4 +17,4 @@ functions in 16 files on master 14d707ae.
 - **Builder (`atomTower`).** A local's string read (`identRead` at a string, the box's payload)
   built once per tested member, last first; a second build only of a read with no effect
   (`exprEffectFree`). Each read temp is typed at the string legacy reads.
-- **Verifier.** The reads are strings, at least one; the destination an atom (self-tests 27, 28).
+- **Verifier.** The reads are strings, at least one; the destination an atom (self-tests 28, 29).
