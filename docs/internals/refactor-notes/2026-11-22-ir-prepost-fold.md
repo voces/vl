@@ -424,3 +424,36 @@ tests/cases/unions/union-box-field-arm-closure-array-index-call.vl
 tests/cases/unions/union-elem-array-narrowed-elem-call.vl
 tests/cases/unions/union-scalar-arm-closure-return.vl
 ```
+
+## The unarmed early build on its own seed
+
+Measured on the T12 seed (ir-shadow-fold at 0a6c4150, fixpoint) over the same population:
+
+* Mode 6 minus its `prepost differs` rows equals mode 1 row for row: 140,608 rows over 16,372
+  programs, every chunk's exit code identical. The 407 programs above are back, and none of them
+  prints a row mode 1 does not.
+* Order rows: 32 before the fix and 32 after (10 memarg-const-fold, 22 d3125). The 407 add none.
+
+## Cost
+
+CPU-seconds (user + sys) per gate row on the pristine T12 seed, box loaded, one run each:
+
+| rows | CPU-s |
+| --- | --- |
+| before: `ir shadow` + `ir shadow cases` + `ir prepost` | 130.7 + 82.5 + 165.6 = 378.8 |
+| after: `ir shadow --prepost` + `ir shadow cases --prepost` | 79.7 + 99.2 = 178.9 |
+
+## Kill matrix
+
+`ibCorrupt` mutants built from the T12 compiler, each graded by the three old rows (from
+#9508's branch) and the two folded rows. rc 1 is red.
+
+| mutant | old shadow | old cases | old prepost | new shadow | new cases |
+| --- | --- | --- | --- | --- | --- |
+| pristine | 0 | 0 | 0 | 0 | 0 |
+| m1 bytes (`ibCorrupt = 3`) | 1 | 1 | 1 | 1 | 1 |
+| m2 verify (`ibCorrupt = 1`) | 1 | 1 | 0 | 1 | 1 |
+| m3 order (a plan reads `emitFnSpanStart.length`) | 0 | 0 | 1 | 1 | 1 |
+
+Every mutant an old row catches, a folded row catches. m3 is caught only by the order check, and
+both folded rows red on it: 21,375 corpus and 36,886 tests/cases order rows against 32.
