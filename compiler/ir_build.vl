@@ -3153,7 +3153,9 @@ function globalStoredRead(
 // Capture `n` read at `rep` on legacy's `capture` arm (`emitCapturedRead`): a lifted function's
 // own parameter after its environment, else its environment's field; at the capture's own rep.
 function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
-  if identReadArmOf(n, ix, ibFnIx, false) != "capture" {
+  // Legacy's `unbox` arm reads a captured union box narrowed to a member: the box, then unboxed.
+  const unbox = identReadArmOf(n, ix, ibFnIx, false) == "unbox"
+  if !unbox && identReadArmOf(n, ix, ibFnIx, false) != "capture" {
     return irBMiss("read of " + n.identName)
   }
   const fe = fnStmtsPosOf(ibFnIx)
@@ -3161,10 +3163,12 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
   if captureValKind(fe, name) == "nulstr" && nulStrReadRecovers(ix, ibFnIx) {
     return irBMiss("capture recover")
   }
-  const cr = capRepFor(fe, name, rep)
+  const cr = capRepFor(fe, name, if unbox { -1 } else { rep })
   // A nullable capture read at the member the checker narrowed it to: the capture at its own rep.
-  const na: NullNarrowArm = if cr != rep { nullNarrowArmOf(ix, cr, rep) } else { "none" }
-  const narrowed = na == "plain" || na == "held"
+  const na: NullNarrowArm = if cr != rep && !unbox { nullNarrowArmOf(ix, cr, rep) } else { "none" }
+  const ak = if unbox && heldAsBox(cr) { identUnboxAtomOf(ix, ibFnIx) } else { -1 }
+  if unbox && ak < 0 { return irBMiss("capture unbox") }
+  const narrowed = unbox || na == "plain" || na == "held"
   if cr != rep && !narrowed && !capCellListSame(fe, name, cr, rep) {
     return irBMiss("capture binding")
   }
@@ -3180,15 +3184,29 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     }
     const ev: Rhs = { evSlot: captureSlotOf(name, ibFnIx), evAt: ix }
     if !narrowed { return irBLetTemp(b, ev, ix, cr) }
-    return captureRecover(b, irBLetTempTy(b, ev, ix, cr, cty), ix, rep, na)
+    const held = irBLetTempTy(b, ev, ix, cr, cty)
+    if unbox { return captureUnbox(b, held, ix, rep, ak) }
+    return captureRecover(b, held, ix, rep, na)
   }
   if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
-  const v = liftCapVar(fe, name, rep)
+  const v = liftCapVar(fe, name, if unbox { -1 } else { rep })
   const held = if narrowed { cr } else { rep }
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
   ib.irReadVar[ix] = v
   const o: Opnd = { ov: v }
+  if unbox { return captureUnbox(b, o, ix, rep, ak) }
   return if narrowed { captureRecover(b, o, ix, rep, na) } else { o }
+}
+
+// Captured box `o` read at member `rep` on legacy's `unbox` arm: unboxed at atom kind `ak`
+// (`identUnboxAtomOf`), as a local box's `unbox` read is.
+function captureUnbox(b: i32[], o: Opnd, ix: i32, rep: i32, ak: i32): Opnd {
+  return irBLetTemp(
+    b,
+    { bnV: o, bnAt: ix, bnRep: rep, bnAtom: ak, bnCon: -1 },
+    ix,
+    rep,
+  )
 }
 
 // Narrowed capture read `ix` of `o` at its member `rep`, on `nullNarrowArmOf`'s arm `na`: what
