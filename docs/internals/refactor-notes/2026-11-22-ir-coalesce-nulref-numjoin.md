@@ -9,11 +9,14 @@ the `pinnedCellIf`, `atomJoinIf` and `cellIf` rungs.
 
 ## The change
 
-- `coalNumJoinIf` (`wasmEmit.vl`) mints that typed `if`; legacy's arm calls it, and so does the
-  builder. The builder imports no checker writer.
-- No guard. A union `print` of the join matched only once #9599 made legacy take its print slot
-  after the operand. A broad `print union of a valued if` refusal was measured and dropped: it
-  cost 63 matched corpus functions (45243 → 45180) to hide 3 mismatches.
+- The builder takes `numJoinIf` with its siblings, `irBExpr` of `coalNullTestIf`'s node. That
+  query is pure: it mints the `if` once per `??` and instance, and writes no table.
+- Legacy is unchanged and keeps its own type record. The IR's build does not depend on it: under
+  `VL_IR_SHADOW=6`, which builds each function before legacy emits it as well as after, every
+  numJoinIf row matches with no `prepost` row.
+- There is no print guard. A union `print` of the join matched only once #9599 made legacy take
+  its print slot after the operand. A broad `print union of a valued if` refusal was measured and
+  dropped: it cost 63 matched corpus functions (45243 → 45180) to hide 3 mismatches.
 
 Row file `tests/ir-shadow-rows/nullable-number-coalesced-into-a-wider-number-join.vl`; witness
 `tests/cases/numerics/nullable-number-coalesced-into-a-wider-number-join.vl`.
