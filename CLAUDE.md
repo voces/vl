@@ -56,7 +56,7 @@ Why: [evidence](docs/internals/working-rules-evidence.md#std-review).
 
 Why: [evidence](docs/internals/working-rules-evidence.md#agent-concurrency).
 
-One-fix-per-PR does not apply to large refactors (owner ruling 2026-11-22): a PR may batch mechanisms, with a per-class reading each; a deliberate legacy byte change and a soundness fix stay separate. Why: [evidence](docs/internals/working-rules-evidence.md#one-fix-per-pr).
+One-fix-per-PR does not apply to large refactors (owner ruling 2026-11-22): a PR may batch mechanisms, with a per-class reading each; a soundness fix stays separate, and a deliberate legacy byte change either goes first alone or rides with its IR side with a moved-programs list (merge-queue.md Q17). Why: [evidence](docs/internals/working-rules-evidence.md#one-fix-per-pr).
 
 ## Disk — every tree, target and temp dir is removed by whoever made it
 
