@@ -115,6 +115,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RClosureEq,
   RCoalAtomStr,
   RCoalStr,
   RCoerce,
@@ -273,6 +274,7 @@ import {
 } from "./emit_bytes"
 import {
   GlobalCtx,
+  SHARED_NULL_NONE,
   arrCopyBacking,
   arrCopyPlanOf,
   arrCopyTail,
@@ -300,6 +302,7 @@ import {
   callRefCallTail,
   callRefEnvOpen,
   callRefStash,
+  closureEqTail,
   coalAtomStrClose,
   coalAtomStrOpen,
   coalAtomStrReserve,
@@ -465,6 +468,8 @@ import {
   sharedArmBoxHead,
   sharedArmIsBox,
   sharedArmIsPlain,
+  sharedArmNullOf,
+  sharedArmNullTail,
   sharedArmPlainTail,
   sharedArmTestTail,
   sharedReadPlainOf,
@@ -1007,6 +1012,7 @@ function rhs(r: Rhs, tail: boolean) {
     RStage => irLOpnd(r.sgV)
     RNulTest => nulTestOp(r)
     RNulNicheEq => nulNicheEq(r)
+    RClosureEq => closureEq(r)
     RFieldNull => {
       leaf()
       if emitOmittedFieldNull(r.fnRow, r.fnFi) < 0 {
@@ -1739,6 +1745,9 @@ function sharedReadArm(
   vi: i32,
   fi: i32,
 ): i32 {
+  // A `null` member's arm is legacy's constant, its receiver unread.
+  const nk = sharedArmNullOf(code, vi, fi)
+  if nk != SHARED_NULL_NONE { return sharedArmNullTail(nk) }
   if sharedArmIsPlain(code, vi, fi) {
     sharedReadRecv(r, slot)
     return sharedArmPlainTail(code, vi, fi)
@@ -2682,6 +2691,18 @@ function numUnionBin(r: RNumUnionBin) {
   numUnionStashLeave()
   if numUnionBinTail(n, r.nbAt, fnIx, slots[0], slots[1]) < 0 {
     return irLMiss("numeric union dispatch")
+  }
+  return 0
+}
+
+// `RClosureEq`: both closures, then legacy's identity compare (`closureEqTail`).
+function closureEq(r: RClosureEq) {
+  const n = nodeAt(r.cqAt)
+  if !(n is BinExpr) { return irLMiss("function compare node") }
+  irLOpnd(r.cqL)
+  irLOpnd(r.cqR)
+  if closureEqTail(n, r.cqAt, lw.irAt) < 0 {
+    return irLMiss("function compare")
   }
   return 0
 }
@@ -3643,8 +3664,9 @@ function coalNulRef(n: SCoalBox, e: BinExpr, pending: i32[]): i32 {
   if p == null { return irLMiss("coalesce nulRef heap") }
   return match p.nrArm {
     "plain" => {
+      if pending.length > 0 { return irLMiss("coalesce nulRef below a temp") }
       coalNulRefOpen(p.nrHeap, coalesceDefaultNullable(e.binRight, fnIx))
-      cond(n.cbL, pending)
+      cond(n.cbL, body(n.cbLB, false, -1, true))
       coalNulRefBranch()
       coalNulRefTail(n, -1)
     }
