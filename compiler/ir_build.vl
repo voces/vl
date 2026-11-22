@@ -270,6 +270,7 @@ import {
   ifExprJoinVt,
   ifExprPlainWhy,
   ifExprShapeWhy,
+  ifLinkExhausts,
   ifThenIsDead,
   ifWritesElse,
   intSwitchMayLower,
@@ -2559,6 +2560,10 @@ function ifRefExpr(b: i32[], n: IfStmt, ix: i32, rep: i32, rj: RefJoin): Opnd {
     && kind != "struct"
     && kind != "map"
     && kind != "variant"
+    && kind != "closure"
+    && kind != "f64list"
+    && kind != "i64list"
+    && kind != "f32list"
   ) {
     return irBMiss("expression if ref " + kind)
   }
@@ -9204,10 +9209,6 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   // A loop value leaves its frame through its result binding (`lvFrameOpen`).
   const lv = if n.whileLv >= 0 { irBDeclVar(n.whileLv) } else { -1 }
   if n.whileLv >= 0 && lv < 0 { return skip("loop value binding") }
-  // The frame takes a scalar binding's valtype; a reference one's blocktype is not built here.
-  if lv >= 0 && !scalarLvRep(ib.irVars[lv].vRep) {
-    return skip("loop value rep")
-  }
   if n.whileBlk != 0 { return labelBlock(b, n, ix, lv) }
   const brk = labelNew()
   const cont = labelNew()
@@ -9248,16 +9249,6 @@ function whileStmt(b: i32[], n: WhileStmt, ix: i32) {
   if lv >= 0 { irBNode(blockBody, { tpWhy: 0 }, -1, ibNoValue, ix) }
   irBNode(b, { bkLabel: brk, bkBody: blockBody, bkOut: lv }, -1, ibNoValue, ix)
   return 0
-}
-
-// Whether rep `r` is a scalar a loop value's frame is typed by.
-function scalarLvRep(r: i32): boolean {
-  const p = repPrim(r)
-  if p == null { return false }
-  return match p {
-    "i32" | "bool" | "u8" | "i64" | "f64" | "f32" => true
-    "str" | "null" | "v128" => false
-  }
 }
 
 // A labelled block (`emitLabelBlock`): one block frame a `break` leaves, which takes no
@@ -9316,7 +9307,8 @@ function ifChain(b: i32[], ix: i32) {
   let cur = ix
   let out = b
   let lastElse = -1
-  // A link legacy writes as a `br_table` takes the rest of the chain, and is the last link's else.
+  // A link legacy writes as a `br_table` takes the rest of the chain, and is the last link's else;
+  // so is a last link whose test the checker proved, written as its arm alone (`ifLinkExhausts`).
   let sw = false
   while true {
     const n = nodeAt(cur)
@@ -9324,6 +9316,15 @@ function ifChain(b: i32[], ix: i32) {
     const p = if intSwitchMayLower(cur) { intSwitchPlanOf(cur, ibFnIx) } else { null }
     if p != null {
       intSwitch(out, cur, p, false)
+      if ibMiss != "" || links.length == 0 { return 0 }
+      sw = true
+      break
+    }
+    if ifLinkExhausts(n) {
+      const th = nodeAt(n.ifThen)
+      for x in if th is Block { bodyOf(th.blkStmts) } else { bodyOf([n.ifThen]) } {
+        out.push(x)
+      }
       if ibMiss != "" || links.length == 0 { return 0 }
       sw = true
       break
@@ -9611,7 +9612,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
       irBNode(b, { rtHas: false, rtV: z }, -1, ibNoValue, ix)
       return 0
     }
-    if retBoxesCall(n.retArg) { return skip("return of a boxed call") }
     if retRefusedWhy(n.retArg, ibFnIx) != "" { return skip("return refused") }
     // A returned value `if` is legacy's tail `if`, each arm's value its own exit.
     if retIsValueIf(n.retArg) {
@@ -9717,19 +9717,6 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
   skip("statement")
 }
 
-// Whether returning `ix` boxes a call's result into a boxed nullable that legacy may tail-call:
-// one box struct serves every union, so a call already returning a box is boxed by writing
-// nothing, and the call is then legacy's `return_call`. A primitive result is always boxed by a
-// `struct.new` after the call, so it returns plainly.
-function retBoxesCall(ix: i32): boolean {
-  const u = unwrapParen(ix)
-  if u < 0 || u >= P.nodes.length { return false }
-  return nodeAt(u) is Call
-    && boxedNullable(ib.irRetRep)
-    && primRepOf(u) != ib.irRetRep
-    && repPrim(primRepOf(u)) == null
-}
-
 // Whether `return ix` is legacy's tail `if` (`emitIfTail`): a returned value `if`.
 function retIsValueIf(ix: i32): boolean {
   const u = unwrapParen(ix)
@@ -9751,11 +9738,6 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
   // expression body's statement as its tail (`emitFuncBody`), and the lowering pads past it.
   if isBlockBody(at) {
     stmt(b, last, stmts, stmts.length - 1)
-    // A falling `if` chain with an `is` link is one legacy may decide off its bytes
-    // (`staticIsGuard`) and write without its test.
-    if ibMiss == "" && !irBodyLeaves(ib, b) && chainHasTest(last) {
-      return skip("tail if is chain falls off")
-    }
     return 0
   }
   const ln = nodeAt(last)
@@ -9782,25 +9764,12 @@ function tailReturn(b: i32[], stmts: i32[], at: i32) {
     return 0
   }
   const n0 = b.length
-  if retBoxesCall(last) { return skip("return of a boxed call") }
   if retRefusedWhy(last, ibFnIx) != "" { return skip("return refused") }
   const v = deliver(b, last, ib.irRetRep, -1)
   if ibMiss != "" || irBOpRep(v) != ib.irRetRep { return skip("tail coercion") }
   irBNode(b, { rtHas: true, rtV: v }, -1, ibNoValue, at)
   irSpanNote(ib, last, b[n0], b[b.length - 1])
   return 0
-}
-
-// Whether statement `ix` is an `if` chain one of whose links tests with `is`.
-function chainHasTest(ix: i32): boolean {
-  let cur = ix
-  while cur >= 0 && cur < P.nodes.length {
-    const n = nodeAt(cur)
-    if !(n is IfStmt) { return false }
-    if condIsTest(n.ifCond) { return true }
-    cur = n.ifElse
-  }
-  return false
 }
 
 // A value `if` in tail position (legacy's `emitIfTail`): the statement `if` with each arm's last
@@ -9886,10 +9855,6 @@ function tailArm(blockIx: i32): i32[] {
   if !tailArmStmtIsValue(last, ibFnIx) {
     stmtNode(body, last, stmts, stmts.length - 1)
     if ibMiss == "" && !irBodyLeaves(ib, body) { skip("tail arm") }
-    return body
-  }
-  if retBoxesCall(last) {
-    skip("return of a boxed call")
     return body
   }
   if retRefusedWhy(last, ibFnIx) != "" {
