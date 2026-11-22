@@ -90,6 +90,7 @@ import {
   RTagStash,
   RTest,
   RToBox,
+  RUnionConcreteEq,
   RUnionEq,
   Rhs,
   SAssign,
@@ -133,10 +134,18 @@ import {
   repNodeKids,
   repNodeOfTy,
 } from "./emit_rep"
-import { repBoolNiche, repIsNoValue, repIsScalar, repPrim, repWhat } from "./ir"
+import {
+  listRetag,
+  repBoolNiche,
+  repBoxCore,
+  repIsNoValue,
+  repIsScalar,
+  repPrim,
+  repWhat,
+} from "./ir"
 import { tyHasTyVar } from "./tyquery"
 import { TY_BOOL, TY_I32, TY_STR, tyScalarBasePrim } from "./check_types"
-import { Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
+import { AsExpr, Call, Ident, IsExpr, P, i32ToStr, nodeAt } from "./ast"
 import {
   memOpIsVoid,
   memOpPlanOf,
@@ -148,8 +157,14 @@ import {
 } from "./wasmEmit"
 import { exprEffectFree } from "./emit_base"
 import { nodeTyAt } from "./emit_capture_frames"
-import { tyOpenHeldAsIds } from "./emit_classify"
-import { fnFallThroughPadOf, litArmsReadsOf, memAccessPlanOf } from "./wasmEmit"
+import { letBindTy, tyOpenHeldAsIds } from "./emit_classify"
+import { identDeclOf } from "./symbols"
+import {
+  fnFallThroughPadOf,
+  litArmsReadsOf,
+  memAccessPlanOf,
+  narrowedMapReadOf,
+} from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
 // (-1 for a variable or the header), with the reason.
@@ -462,6 +477,15 @@ function stageAt(id: i32): RListStage | null {
   return null
 }
 
+// Whether global read node `at`, at rep `dst`, is at its checked type's rep or else at its
+// declaration's storage row, the D14434 binding column (`letBindTy`; D14426, DECISIONS.md).
+function globalReadAtTyOrStorage(dst: i32, at: i32): boolean {
+  const src = vf.irNodeAt[at] ?? -1
+  if src < 0 || dst == repNodeOfTy(nodeTyAt(src, vf.irAt)) { return true }
+  const d = identDeclOf(src)
+  return d >= 0 && dst == repNodeOfTy(letBindTy(d, -1))
+}
+
 function rhsCheck(r: Rhs, dst: i32, at: i32) {
   match r {
     RPrimOp => {
@@ -766,14 +790,15 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       use(r.rgV, at)
       const d = repNodeAt(dst)
       if (
-        !(d is RNullable)
-        || !nicheRetag(d.rnDisc, d.rnInner)
-        || d.rnInner != opRep(r.rgV)
+        !listRetag(opRep(r.rgV), dst)
+        && (!(d is RNullable)
+          || !nicheRetag(d.rnDisc, d.rnInner)
+          || d.rnInner != opRep(r.rgV))
       ) {
         return fail(
           2,
           at,
-          "a retag is not of an atom or a string into its own nullable niche",
+          "a retag is not of an atom or a string into its own nullable niche, or a ref list as itself",
         )
       }
       0
@@ -869,8 +894,26 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RAtomEq => {
       // A static side's immediate is unread; any other static operand is evaluated and dropped.
-      if !(r.aeStatic == 1 && r.aeL is OImm) { use(r.aeL, at) }
-      if !(r.aeStatic == 2 && r.aeR is OImm) { use(r.aeR, at) }
+      if !((r.aeStatic == 1 || r.aeStatic == 3) && r.aeL is OImm) {
+        use(r.aeL, at)
+      }
+      if !((r.aeStatic == 2 || r.aeStatic == 3) && r.aeR is OImm) {
+        use(r.aeR, at)
+      }
+      0
+    }
+    RUnionConcreteEq => {
+      use(r.ucBox, at)
+      use(r.ucOther, at)
+      const bv = r.ucBox
+      if (
+        !(bv is OVar)
+        || bv.ov < 0
+        || bv.ov >= vf.irVars.length
+        || vf.irVars[bv.ov].vKind == "temp"
+      ) {
+        return fail(2, at, "a union compare's box is not a re-read variable")
+      }
       0
     }
     RUnionEq => {
@@ -1093,7 +1136,14 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
     }
     RNumCast => {
       use(r.ncV, at)
-      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) {
+      // An exact `as?` yields the value-union box of its target, or its null: a box, or the
+      // boxed `T | null`.
+      const nc = nodeAt(r.ncAt)
+      const dn = repNodeAt(dst)
+      const boxed = nc is AsExpr
+        && nc.asMode == "null"
+        && (dn is RBox || dn is RNullable && dn.rnDisc == 4)
+      if !repIsScalar(opRep(r.ncV)) || dst >= 0 && !repIsScalar(dst) && !boxed {
         return fail(2, at, "a numeric cast is between scalars")
       }
       0
@@ -1139,7 +1189,20 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(2, at, "a map get of a receiver that is no map")
       }
       const m = repNodeAt(mapRecvRep(r.mtSym, r.mtLoc))
-      if dst >= 0 && m is RMap && !mapGetDstOk(m.rmVal, dst) {
+      // A union value's narrowed read is unboxed to its member's scalar (`narrowedMapReadOf`).
+      const unboxed = narrowedMapReadOf(r.mtAt, vf.irAt).nmArm == "unbox"
+        && repPrim(dst) != null
+      // A union value's read is its box, `null` one more tag of it.
+      const sameBox = m is RMap
+        && repNodeAt(repBoxCore(dst)) is RBox
+        && repBoxCore(dst) == repBoxCore(m.rmVal)
+      if (
+        dst >= 0
+        && m is RMap
+        && !mapGetDstOk(m.rmVal, dst)
+        && !unboxed
+        && !sameBox
+      ) {
         return fail(
           2,
           at,
@@ -1242,6 +1305,13 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const narrowed = r.ggNn >= 0 && gn is RNullable && gn.rnInner == dst
       if dst >= 0 && dst != g && !narrowed {
         return fail(2, at, "a global's rep is not its destination's")
+      }
+      if dst >= 0 && !narrowed && !globalReadAtTyOrStorage(dst, at) {
+        return fail(
+          2,
+          at,
+          "a global read off its type's rep is not at its storage row",
+        )
       }
       0
     }
@@ -2104,6 +2174,7 @@ function rhsReadsList(r: Rhs): boolean {
       RTagStash |
       RTest |
       RToBox |
+      RUnionConcreteEq |
       RUnionEq => false
   }
 }
