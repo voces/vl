@@ -28375,8 +28375,34 @@ export function callRefPlainVoid(ix: i32, fnIx: i32): boolean {
     || calleeReturnsVoidOfRead(unwrapParen(c.callFn), fnIx)
 }
 
+// How a direct call's argument meets a bundle parameter: a lambda's bundle, a holder's member, a
+// holder's record, a function read's closures, a choice's, or "none" for the plain arms.
+export type BundleArgArm = "lambda"
+  | "member"
+  | "holder"
+  | "fnRead"
+  | "choice"
+  | "none"
+
+// The arm argument `arg` of a direct call in `fnIx` takes at the callee's parameter `bpar` (-1 for
+// none), the one decision `emitDirectCallArgsUnder` and the IR dispatch on.
+export function bundleArgArmOf(bpar: i32, arg: i32, fnIx: i32): BundleArgArm {
+  const bundled = bpar >= 0 && bundleSigsOfParam(bpar).length > 0
+  if bpar >= 0 && emitBundleParamTakes(bpar, arg) { return "lambda" }
+  if (
+    (emitBundleRecordRead(arg, fnIx) || emitHolderRead(arg, fnIx))
+    && !bundled
+  ) {
+    return "member"
+  }
+  if bundled && emitHolderRead(arg, fnIx) { return "holder" }
+  if bpar >= 0 && emitBundleParamReads(bpar, arg, fnIx) { return "fnRead" }
+  if bundled && nodeAt(unwrapParen(arg)) is IfStmt { return "choice" }
+  return "none"
+}
+
 // Whether parameter `par` takes the lambda literal `arg` as a bundle.
-function emitBundleParamTakes(par: i32, arg: i32): boolean {
+export function emitBundleParamTakes(par: i32, arg: i32): boolean {
   return nodeAt(unwrapParen(arg)) is FuncDecl
     && bundleSigsOfParam(par).length > 0
 }
@@ -41234,13 +41260,11 @@ function emitDirectCallArgsUnder(callIx: i32, fnIx: i32, target: i32) {
     }
     // A lambda the callee calls at two signatures is delivered as its bundle (D14841).
     const bpar = if cFn is FuncDecl && i < cFn.fnParams.length { cFn.fnParams[i] } else { -1 }
-    if bpar >= 0 && emitBundleParamTakes(bpar, args[i]) {
+    const barm = bundleArgArmOf(bpar, args[i], fnIx)
+    if barm == "lambda" {
       if emitBundleArg(args[i], bpar, fnIx) < 0 { return -1 }
       i = i + 1
-    } else if (
-      (emitBundleRecordRead(args[i], fnIx) || emitHolderRead(args[i], fnIx))
-      && (bpar < 0 || bundleSigsOfParam(bpar).length == 0)
-    ) {
+    } else if barm == "member" {
       // A callee with no instance is handed the member the elaboration chose for its annotation.
       if bundleHandMemberOf(args[i]) == -2 {
         const ehm = elabCallHandMemberAt(
@@ -41252,22 +41276,14 @@ function emitDirectCallArgsUnder(callIx: i32, fnIx: i32, target: i32) {
       }
       if emitBundleMemberArg(args[i], fnIx) < 0 { return -1 }
       i = i + 1
-    } else if (
-      bpar >= 0
-      && bundleSigsOfParam(bpar).length > 0
-      && emitHolderRead(args[i], fnIx)
-    ) {
+    } else if barm == "holder" {
       // A holder's record goes to a bundle parameter as it is (D15144).
       if emitExpr(args[i], fnIx) < 0 { return -1 }
       i = i + 1
-    } else if bpar >= 0 && emitBundleParamReads(bpar, args[i], fnIx) {
+    } else if barm == "fnRead" {
       if emitBundleParamRead(args[i], bpar, fnIx) < 0 { return -1 }
       i = i + 1
-    } else if (
-      bpar >= 0
-      && bundleSigsOfParam(bpar).length > 0
-      && nodeAt(unwrapParen(args[i])) is IfStmt
-    ) {
+    } else if barm == "choice" {
       const bp = nodeAt(bpar)
       const bt = if bp is Param && bp.parType >= 0 { nodeTyIxOf(bp.parType) } else { -1 }
       if (emitBundleChoiceArg(args[i], bt, bundleSigsOfParam(bpar), fnIx) < 0) {
