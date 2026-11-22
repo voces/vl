@@ -754,6 +754,7 @@ import {
   fbBrIf,
   fbBrOnNonNull,
   fbBrOnNull,
+  fbBrTable,
   fbCall,
   fbCallIndirect,
   fbDrop,
@@ -35341,18 +35342,22 @@ export function intSwitchMayLower(ix: i32): boolean {
   return intMatchHeadAt(ix)
 }
 
-// Lowers the integer-`match` chain headed at `headIx` as a `br_table` in `mode` (see
-// `emitSwitchArm`): 1 when lowered, 0 when it declined having written nothing, -1 on an emit
-// failure. Arms are emitted in chain order — the collect pass's — so the let cursor stays in step.
-function emitIntSwitch(
-  headIx: i32,
-  fnIx: i32,
-  mode: i32,
-  kind: i32,
-  rk: VKind,
-  slot: i32,
-) {
-  if !intMatchHeadAt(headIx) { return 0 }
+// A dense integer `match` chain's `br_table` (`intSwitchPlanOf`): scrutinee `ispOn`, 64-bit when
+// `ispWide`, less `ispLo`; `ispTable[d]` the arm index `d` takes, `ispThens.length` the default;
+// `ispElse` the chain's last `else`, or -1. Arms are in chain order, the let cursor's.
+export type IntSwitchPlan = {
+  ispOn: i32,
+  ispWide: boolean,
+  ispLo: i32,
+  ispTable: i32[],
+  ispThens: i32[],
+  ispElse: i32,
+}
+
+// The `br_table` the chain headed at `headIx` lowers to, or null where it stays a chain: not
+// every link an `==`/`||` test of one plain integer place, or too sparse a table.
+export function intSwitchPlanOf(headIx: i32, fnIx: i32): IntSwitchPlan | null {
+  if !intMatchHeadAt(headIx) { return null }
   const vals: i32[] = []
   const arms: i32[] = []
   const thens: i32[] = []
@@ -35364,9 +35369,9 @@ function emitIntSwitch(
     const s = nodeAt(cur)
     if s is IfStmt {
       if scrutIx < 0 { scrutIx = switchScrutOf(s.ifCond) }
-      if scrutIx < 0 { return 0 }
+      if scrutIx < 0 { return null }
       if !switchCondCollect(s.ifCond, scrutIx, thens.length, vals, arms) {
-        return 0
+        return null
       }
       thens.push(s.ifThen)
       const next = s.ifElse
@@ -35381,12 +35386,11 @@ function emitIntSwitch(
         walking = false
       }
     } else {
-      return 0
+      return null
     }
   }
   const w = switchScrutWidth(scrutIx, fnIx)
-  if w == 0 { return 0 }
-  if elseBlk < 0 && mode >= 2 { return 0 }
+  if w == 0 { return null }
   const m = thens.length
   let lo = vals[0]
   let hi = vals[0]
@@ -35398,7 +35402,7 @@ function emitIntSwitch(
   }
   // `hi - lo` wraps negative exactly when the true span passes 2^31, which is never dense.
   const span = hi - lo
-  if span < 0 || span >= 2 * vals.length + 8 { return 0 }
+  if span < 0 || span >= 2 * vals.length + 8 { return null }
   // A repeated value keeps its FIRST arm, as the chain's first passing test does.
   const table: i32[] = []
   let t = 0
@@ -35416,7 +35420,39 @@ function emitIntSwitch(
     }
     i = i + 1
   }
-  if distinct < 3 || span >= 2 * distinct + 8 { return 0 }
+  if distinct < 3 || span >= 2 * distinct + 8 { return null }
+  return {
+    ispOn: scrutIx,
+    ispWide: w == 2,
+    ispLo: lo,
+    ispTable: table,
+    ispThens: thens,
+    ispElse: elseBlk,
+  }
+}
+
+// Lowers the integer-`match` chain headed at `headIx` as a `br_table` in `mode` (see
+// `emitSwitchArm`): 1 when lowered, 0 when it declined having written nothing, -1 on an emit
+// failure. Arms are emitted in chain order — the collect pass's — so the let cursor stays in step.
+function emitIntSwitch(
+  headIx: i32,
+  fnIx: i32,
+  mode: i32,
+  kind: i32,
+  rk: VKind,
+  slot: i32,
+) {
+  const p = intSwitchPlanOf(headIx, fnIx)
+  if p == null { return 0 }
+  if p.ispElse < 0 && mode >= 2 { return 0 }
+  const scrutIx = p.ispOn
+  const w = if p.ispWide { 2 } else { 1 }
+  const lo = p.ispLo
+  const table = p.ispTable
+  const thens = p.ispThens
+  const elseBlk = p.ispElse
+  const m = thens.length
+  const span = table.length - 1
   // The outer frame carries the value in the value modes; every inner frame is void.
   fbOpenBlock() // 0x02 block
   if mode == 3 { fbValtype(rk, slot) }
@@ -35449,14 +35485,7 @@ function emitIntSwitch(
     fbI32Const(lo)
     fbI32Bin(107) // 0x6b i32.sub
   }
-  wU8(14) // 0x0e br_table
-  wULEB(span + 1)
-  t = 0
-  while t <= span {
-    wULEB(table[t])
-    t = t + 1
-  }
-  wULEB(m) // default: the else arm's frame
+  fbBrTable(table, m) // default: the else arm's frame
   k = 0
   while k < m {
     fbEnd()
@@ -37877,16 +37906,16 @@ export function tailArmStmtIsValue(stmtIx: i32, fnIx: i32): boolean {
   return stmtIsTailValue(stmtIx, fnIx) || memberCallYieldsValue(stmtIx)
 }
 
-// Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": an
-// integer `match` chain, or one wider number returned boxed once (`retIfIsOneNumber`). An
-// else-less link writes no `else`, its caller padding what falls through. Its condition is
-// `emitGuardCond`'s, a decided `false` (`isDecidedFalse`) writing no then arm.
+// Why `emitIfTail` writes link `ix` other than as a void `if` whose arms each return, or "": one
+// wider number returned boxed once (`retIfIsOneNumber`), which wins, or an integer `match` chain
+// (`intSwitchPlanOf`, which may decline). An else-less link writes no `else`, its caller padding
+// what falls through. Its condition is `emitGuardCond`'s, a decided `false` writing no then arm.
 export function tailIfPlainWhy(ix: i32, fnIx: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "tail if node" }
   const n = nodeAt(ix)
   if !(n is IfStmt) || n.ifCond < 0 { return "tail if node" }
-  if intMatchHeadAt(ix) { return "tail if switch" }
   if retIfIsOneNumber(ix, fnIx) { return "tail if one number" }
+  if intMatchHeadAt(ix) { return "tail if switch" }
   return ""
 }
 
