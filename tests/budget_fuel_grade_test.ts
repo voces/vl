@@ -166,6 +166,7 @@ async function gradeOnBase(
   co: string,
   seed: string,
   fuel: number,
+  explicit = true,
 ): Promise<{ code: number; out: string }> {
   const dir = await Deno.makeTempDir({ prefix: "fuel_grade_", dir: co });
   await Deno.writeTextFile(
@@ -185,7 +186,7 @@ async function gradeOnBase(
       SEED: `${dir}/seed.wasm`,
       BASELINE: `${dir}/baseline.json`,
       LEDGER: `${dir}/ledger.txt`,
-      SELF_COMPILE_BASE: "HEAD~1",
+      ...(explicit ? { SELF_COMPILE_BASE: "HEAD~1" } : {}),
       XDG_CACHE_HOME: `${co}/cache`,
       FAKE_SEED: seed,
       FAKE_FUEL: String(fuel),
@@ -254,6 +255,39 @@ Deno.test("fuel grade: another fixpoint of the same tree gets its own entry", as
       0,
       `+0.00% on ${G} (base `,
     );
+  } finally {
+    await Deno.remove(co, { recursive: true });
+  }
+});
+
+Deno.test("fuel grade: a default base behind origin/master's tip is warned, naming the lag", async () => {
+  const co = await checkout();
+  try {
+    // origin/master moved two merges past the base this branch was built on.
+    await git(co, "checkout", "-q", "-b", "tip", "HEAD~1");
+    for (const n of [3, 4]) {
+      await Deno.writeTextFile(`${co}/compiler/entry.vl`, `print(${n})\n`);
+      await git(
+        co,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qam",
+        `master ${n}`,
+      );
+    }
+    await git(co, "update-ref", "refs/remotes/origin/master", "tip");
+    await git(co, "checkout", "-q", "-");
+    const r = await gradeOnBase(co, "fix-a", G, false);
+    expect("warned", r, 0, "WARNING: graded against a base 2 merges old");
+    expect("still graded on that base", r, 0, `+0.00% on ${G} (base `);
+    // An explicit base is the caller's choice: no warning.
+    const e = await gradeOnBase(co, "fix-a", G);
+    if (e.out.includes("WARNING: graded against")) {
+      throw new Error(`explicit base: want no warning, got:\n${e.out}`);
+    }
   } finally {
     await Deno.remove(co, { recursive: true });
   }

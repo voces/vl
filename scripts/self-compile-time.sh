@@ -207,6 +207,14 @@ base_fuel() {
   echo "$f"
 }
 BASEREF="${SELF_COMPILE_BASE:-$(git merge-base HEAD origin/master 2>/dev/null || true)}"
+# A default base behind origin/master's tip grades this tree against the merges since too: warned,
+# not red, since a branch may truly sit on an older master. A stale local origin/master hides it.
+TIP=$(git rev-parse --verify --quiet origin/master 2>/dev/null || true)
+if [ -z "${SELF_COMPILE_BASE:-}" ] && [ -n "$BASEREF" ] && [ -n "$TIP" ] \
+  && [ "$(git rev-parse "$BASEREF")" != "$TIP" ]; then
+  LAG=$(git rev-list --count --first-parent "$BASEREF..$TIP" 2>/dev/null || echo "?")
+  echo "WARNING: graded against a base $LAG merges old: base $(git rev-parse --short "$BASEREF"), origin/master $(git rev-parse --short "$TIP"); run git fetch, or pass SELF_COMPILE_BASE"
+fi
 PRBASE="${SELF_COMPILE_BASE_FUEL:-}"; PRFROM="base fuel given"
 # A tree that is its own base (master itself, compiler/ unedited) is graded on its own reading.
 if [ -z "$PRBASE" ] && [ -n "$BASEREF" ] && [ "$BASEREF" != none ] \
