@@ -183,6 +183,28 @@ Deno.test({
   },
 });
 
+// A folded constant's cell is its folded value, the one `*.const` legacy's `emitConstFoldValue`
+// writes, at both integer widths; under the dual emit's control 3 each is a bytes mismatch.
+Deno.test({
+  name: "ir shadow: a folded const cell whose value differs is a bytes mismatch",
+  ignore,
+  fn: () => {
+    // Read from a function, so neither cell is promoted into the start body.
+    const src = `const A = 3\nconst B: i32 = A << 4\nconst C: i64 = (1 as i64) << 40\n` +
+      `function show() {\n  print(B)\n  print(C)\n}\nshow()\n`;
+    const ok = run(src, true);
+    const folded = [...ok.rows].filter(([k]) => k.startsWith("const cell folded "));
+    if (folded.length === 0 || folded.some(([k]) => !k.endsWith(": matched"))) {
+      throw new Error(`want every folded cell matched, got ${JSON.stringify([...ok.rows])}`);
+    }
+    const { rows } = run(src, true, 3);
+    const bad = [...rows.keys()].filter((k) => k.startsWith("mismatch bytes: const cell folded "));
+    if (bad.length === 0 || [...rows.keys()].some((k) => k.startsWith("const cell folded ") && k.endsWith(": matched"))) {
+      throw new Error(`want each folded cell a "mismatch bytes: const cell folded" row, got ${JSON.stringify([...rows])}`);
+    }
+  },
+});
+
 // The file rows' controls: an unreadable directive is refused, and a row whose expectation the
 // compile cannot meet fails its grade. Without these a reader that checked nothing would pass.
 Deno.test({
@@ -337,8 +359,9 @@ Deno.test({
   },
 });
 
-// Outside the set: a string coalesce whose default is no literal, a closure parameter and a
-// propagating `as` conversion each leave their function uncovered, named.
+// Outside the set: a string coalesce whose default is no literal and a propagating `as`
+// conversion each leave their function uncovered, named. A closure parameter, its baked
+// callback clone's included, is inside it and covered.
 Deno.test({
   name: "ir shadow: a construct outside the set leaves its function uncovered, by reason",
   ignore,
@@ -365,7 +388,8 @@ print(cv(3.0))
       }
     }
     const unc = [...rows.keys()].filter((k) => k.startsWith("uncovered "));
-    if (unc.length < 3) throw new Error(`want three uncovered reasons, got ${JSON.stringify([...rows])}`);
+    if (unc.length < 2) throw new Error(`want two uncovered reasons, got ${JSON.stringify([...rows])}`);
+    if ((rows.get("covered") ?? 0) < 3) throw new Error(`want the closure parameter's functions covered, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -1243,9 +1267,9 @@ print(intr(true, 0.5))
 
 // An instance's `is` test over a box: a tag the box holds is compared off the raw slot, even
 // narrowed, and a tag it lacks is a decided guard whose then arm is not written. Elsewhere the
-// decided constant stays a named miss.
+// decided constant is `false` with the receiver unread, as legacy writes it.
 Deno.test({
-  name: "ir shadow: an instance's arm-tag and decided `is` guards build; a decided test elsewhere misses",
+  name: "ir shadow: an instance's arm-tag and decided `is` guards build, and a decided test elsewhere",
   ignore,
   fn: () => {
     const src = `function kind<T>(v: T): string {
@@ -1264,10 +1288,9 @@ run(2.5)
 `;
     const { rows } = run(src, true);
     if (failures(rows).length > 0) throw new Error(`want no failure, got ${JSON.stringify([...rows])}`);
-    if (rows.get("uncovered is arm tag tagAbsent") !== 1) {
-      throw new Error(`want neg's decided test a named miss, got ${JSON.stringify([...rows])}`);
+    if (rows.get("matched") !== 3 || rows.get("covered") !== 3) {
+      throw new Error(`want kind, neg and run covered and matched, got ${JSON.stringify([...rows])}`);
     }
-    if (!(rows.get("matched")! >= 1)) throw new Error(`want kind matched, got ${JSON.stringify([...rows])}`);
   },
 });
 
@@ -1446,8 +1469,9 @@ Deno.test({
     // Case 19 is a shared read over a temp, which its arms would read twice (rule 2), and case 20
     // a fused map read's mv slot read into an out that is not its map's value (rule 2). Cases 21
     // to 23 break a nullable reference's `??`: an `i32` and a non-null list operand, and a
-    // nullable list into an `i32` out (rule 2).
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2];
+    // nullable list into an `i32` out (rule 2). Case 24 is a shared read whose global receiver's
+    // cell is no box (rule 2).
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
