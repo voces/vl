@@ -1,0 +1,3 @@
+## Codegen, memory & runtime (Track B)
+
+- **Fix D17052: `x is S[]` for a string literal set over `i32[] | string[]`.** `S[]` stores its atoms as an `i32` list, so where no union mixes an atom list it takes the `i32[]` box tag. An `i32[]` arm then shared that tag, the `listAcross` plan declined, and the arm-tag rung answered by the tag: every `i32[]` value fit and no `string[]` value did. Such an arm never fits (D16047), so the plan now skips it (`listArmTagCollides`) and answers, testing the `string[]` arm by its strings. Capability matrix: `is <list type>` over list unions, crossing element kinds (24 templates).
