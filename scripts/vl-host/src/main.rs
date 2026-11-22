@@ -4685,7 +4685,8 @@ fn report_id_shadow(inst: &Instance, store: &mut Store<()>, path: &str) {
 /// The mode `$VL_IR_SHADOW` asks the guest's IR shadow for: 0 off, 1 count, 2 also detail each
 /// dual-emit mismatch class's first examples, 3 disarmed but claiming every I1 family (the claim
 /// path's test), 4 the blocker census (each function's row names every class it missed), 5
-/// disarmed and only reporting, so the shipped claim's `claimed` and fallback rows print.
+/// disarmed and only reporting, so the shipped claim's `claimed` and fallback rows print, 6 the
+/// order check (each function also built before legacy emits it, and compared).
 fn ir_shadow_mode() -> i32 {
     match std::env::var("VL_IR_SHADOW").ok().as_deref() {
         Some("1") => 1,
@@ -4693,6 +4694,7 @@ fn ir_shadow_mode() -> i32 {
         Some("3") => 3,
         Some("4") => 4,
         Some("5") => 5,
+        Some("6") => 6,
         _ => 0,
     }
 }
