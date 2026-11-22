@@ -273,6 +273,7 @@ import {
   fbRefNullStruct,
   fbRefTest,
   fbResetLazyFrame,
+  fbRetExtra,
   fbReturn,
   fbReturnCall,
   fbSelect,
@@ -3203,6 +3204,8 @@ function retagOperand(t: i32): Opnd {
 function callRefTemp(r: Rhs): i32 { return if r is RCallRef { 0 } else { -1 } }
 
 function callTemp(o: Opnd): i32 {
+  // A lifted body handing captures back returns them after the call, so no call is its tail.
+  if lw.irRetExtra.length > 0 { return -1 }
   return match o {
     OVar => {
       if !isTemp(o.ov) || !tempDefined(o.ov) { return -1 }
@@ -4136,6 +4139,7 @@ function isBr(id: i32): boolean {
 function ret(n: SReturn, pending: i32[]) {
   if !n.rtHas {
     irLSettle(pending)
+    retExtra()
     return fbReturn()
   }
   // A call retagged into its `K | null` is the same i32, so legacy tail-calls it too.
@@ -4171,7 +4175,20 @@ function sinkExit() {
     lwSinkFired = lwSinkFired + 1
     return 0
   }
+  retExtra()
   return fbReturn()
+}
+
+// The captures a lifted function hands back after its result (`irRetExtra`), as every legacy exit
+// pushes them (`fbPushRetExtra`); legacy's own seeding must be off while the IR lowers.
+function retExtra() {
+  if fbRetExtra.length > 0 { return irLMiss("lifted extra results seeded") }
+  for v in lw.irRetExtra {
+    const w = varSlot(v)
+    if w < 0 { return irLMiss("lifted extra result slot") }
+    fbLocalGet(w)
+  }
+  return 0
 }
 
 function spanOpen(id: i32) {
@@ -4378,8 +4395,14 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
   const valued = !repIsNoValue(f.irRetRep)
   // The single start body opens with legacy's pool fill; an init function's does not.
   if f.irPoolFill { irStartPrologueHook() }
-  // Legacy tail-calls a void body's last call, but not the start function's.
-  body(f.irBody, !valued && (f.irAt >= 0 || f.irThunk), -1, false)
+  // Legacy tail-calls a void body's last call, but not the start function's, nor in a lifted
+  // body that hands captures back after it (`irRetExtra`).
+  body(
+    f.irBody,
+    !valued && (f.irAt >= 0 || f.irThunk) && f.irRetExtra.length == 0,
+    -1,
+    false,
+  )
   const pad = if valued { fnFallThroughPadOf(f.irAt) } else { "" }
   if pad == "null" {
     emitNullRetTail(nullRetPlanOf(f.irAt))
@@ -4389,6 +4412,7 @@ function lowerBody(f: IrFn, ctx: GlobalCtx) {
     fbUnreachable()
   }
   if lwSinkFired > 0 { sinkClose() }
+  retExtra()
   fbEnd()
   wTarget(prev)
   // Every frame a builder opened is closed, so the one depth not given back is the function's

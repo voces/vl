@@ -619,6 +619,7 @@ import {
   cboxReadsCell,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
+  cloLiftWriteSlot,
   fRecRetTy,
   fRetVoid,
   fnMemAddrFoldCount,
@@ -3220,7 +3221,6 @@ function captureRead(b: i32[], n: Ident, ix: i32, rep: i32): Opnd {
     if unbox { return captureUnbox(b, held, ix, rep, ak) }
     return captureRecover(b, held, ix, rep, na)
   }
-  if cloLiftWriteCount(fe) > 0 { return irBMiss("capture written back") }
   const v = liftCapVar(fe, name, if unbox { -1 } else { rep })
   const held = if narrowed { cr } else { rep }
   if v < 0 || ib.irVars[v].vRep != held { return irBMiss("capture binding") }
@@ -4060,6 +4060,36 @@ function directCallAt(b: i32[], c: Call, ix: i32, pos: i32): Rhs {
     caWb: wb,
   }
   return r
+}
+
+// The parameter variables lifted function `pos` hands back after its result: each capture it
+// assigns, at the slot legacy's exits read (`fbSeedRetExtra`, `1 +` its capture index).
+function liftRetExtra(pos: i32): i32[] {
+  const out: i32[] = []
+  const n = cloLiftWriteCount(pos)
+  if n == 0 { return out }
+  const names = captureNamesOf(pos)
+  let j = 0
+  while j < n {
+    const k = cloLiftWriteCapAt(pos, j)
+    const v = if k >= 0 && k < names.length { liftCapVar(pos, names[k], -1) } else { -1 }
+    if v < 0 || ib.irVars[v].vSlot != 1 + k {
+      irBMiss("lifted extra result")
+      return out
+    }
+    out.push(v)
+    j = j + 1
+  }
+  return out
+}
+
+// The parameter variable of capture `name` that this lifted frame assigns at legacy's local `w`
+// (`cloLiftWriteSlot`), or -1 where `name` is no such capture.
+function liftWriteVar(name: string, w: i32): i32 {
+  const self = fnStmtsPosOf(ibFnIx)
+  if !cloLifted(self) || cloLiftWriteSlot(self, name) != w { return -1 }
+  const v = liftCapVar(self, name, -1)
+  return if v >= 0 && ib.irVars[v].vSlot == w { v } else { -1 }
 }
 
 // The variables lifted callee `pos` hands its assigned captures back to, in its result order: each
@@ -8666,8 +8696,10 @@ function assignToGo(b: i32[], n: BinExpr, ix: i32) {
   if t is Member { return fieldStore(b, n, t, ix) }
   if !(t is Ident) { return skip("assignment target") }
   const d = identDeclOf(n.binLeft)
-  if d >= 0 && localIndexOf(ibFnIx, n.binLeft) >= 0 {
-    const v = irBDeclVar(d)
+  const w = if d >= 0 { localIndexOf(ibFnIx, n.binLeft) } else { -1 }
+  if w >= 0 {
+    const lv = liftWriteVar(t.identName, w)
+    const v = if lv >= 0 { lv } else { irBDeclVar(d) }
     if v < 0 { return skip("assignment coercion") }
     const src = deliver(b, n.binRight, ib.irVars[v].vRep, -1)
     if ibMiss != "" { return 0 }
@@ -9887,6 +9919,8 @@ function build(fnIx: i32, fnPos: i32): string {
   ibNoValue = if none { ib.irRetRep } else { -1 }
   const pw = buildParams(fn, fnIx, true)
   if pw != "" { return pw }
+  ib.irRetExtra = liftRetExtra(fnPos)
+  if ibMiss != "" { return ibMiss }
   if ibNoValue < 0 { ibNoValue = repNodeOfTy(TY_NEVER) }
   if !repIsNoValue(ibNoValue) { return "no void rep" }
   if fn.fnBody < 0 || fn.fnBody >= P.nodes.length { return "body" }
