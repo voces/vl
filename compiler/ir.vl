@@ -99,9 +99,15 @@ export type RTest = { teV: Opnd, teTag: i32 }
 // A field read off a box local narrowed to one variant (`narrowedFieldPlain`); `bfAt` its member.
 export type RBoxField = { bfV: Opnd, bfAt: i32 }
 // A shared field read `srAt` over un-narrowed box `srV`, dispatched on its tag per member (legacy's
-// `emitMemSharedRead`): a box local read twice an arm, or with `srStash` a receiver read once into
-// legacy's stash slot.
-export type RSharedRead = { srV: Opnd, srAt: i32, srStash: boolean }
+// `emitMemSharedRead`): a box local read twice an arm, module global `srGlobal` (not -1, `srV`
+// unread) read the same way, or with `srStash` a receiver read once into legacy's stash slot.
+export type RSharedRead = {
+  srV: Opnd,
+  srAt: i32,
+  srStash: boolean,
+  srGlobal: i32,
+  srGlobalNonNull: boolean,
+}
 // A box local read at the variant its narrowing names (`narrowedBoxVariantPlain`), whose record is
 // `bnRep`, the destination's; or, with `bnAtom` an atom kind (`identUnboxAtomOf`), read unboxed to
 // that atom, -1 otherwise. `bnAt` the read.
@@ -215,11 +221,12 @@ export type RRetNull = { rnrAt: i32 }
 // A reference join's bare `null` arm: the `ref.null` of join kind `jnKind`'s heap at row `jnSlot`,
 // as legacy writes it (`fbRefNullOfKind`). The builder takes both from `ifRefJoinOf` once.
 export type RJoinNull = { jnKind: VKind, jnSlot: i32 }
+// A `==`/`!=` at node `neAt` on legacy's `nulNiche` route over nullable operands `neL` and `neR`,
+// under the null guard `nulNicheEqHead` opens; the guard writes the right operand twice, `neR`
+// and then `neR2`, which is `neR` for a variable and a second build of the operand otherwise.
+export type RNulNicheEq = { neL: Opnd, neR: Opnd, neR2: Opnd, neAt: i32 }
 // `ntV`, a `K | null`, a nullable reference or a union box, tested against `null` at compare node `ntAt`; `ntInvert` for `!=`, as the
 // binary dispatch hands it to legacy's null test (`binNulTestOf`).
-// A `==`/`!=` at node `neAt` on legacy's `nulNiche` route over nullable operands `neL` and `neR`,
-// under the null guard `nulNicheEqHead` opens; the guard reads `neR` twice.
-export type RNulNicheEq = { neL: Opnd, neR: Opnd, neAt: i32 }
 export type RNulTest = { ntV: Opnd, ntInvert: boolean, ntAt: i32 }
 // The `==` (or, with `aeNe`, `!=`) of two atoms at compare node `aeAt`. `aeStatic` 1 or 2 names
 // the left or right side typed as one string literal, whose id comes from its lexeme: its operand
@@ -233,7 +240,7 @@ export type RAtomEq = {
   aeAt: i32,
 }
 // The `==` (or, with `ueNe`, `!=`) of two union boxes at compare node `ueAt`, written by legacy's
-// staged compare (`unionUnionEqTail`) over the two operands.
+// compare over the two operands (`unionUnionBoxesTail`): the struct union's, or the staged one.
 // A union box `ucBox` against concrete `ucOther` at compare node `ucAt` (`ucSwap` where the box
 // is the right side), by legacy's plan: the box's tag, its payload, the operand and the compare.
 export type RUnionConcreteEq = {
@@ -247,6 +254,9 @@ export type RUnionEq = { ueL: Opnd, ueR: Opnd, ueNe: boolean, ueAt: i32 }
 // The `==` (or `!=`) of two lists at compare node `qeAt`, written by legacy's list compare
 // (`listEqTail`) after each operand's own recovery (`listEqOperandTail`).
 export type RListEq = { qeL: Opnd, qeR: Opnd, qeAt: i32 }
+// A function-value `==`/`!=` at node `cqAt` on legacy's `closure` route over closures `cqL` and
+// `cqR`: identity, written by `closureEqTail`.
+export type RClosureEq = { cqL: Opnd, cqR: Opnd, cqAt: i32 }
 // The `+` of two lists at concat node `ljAt`, written by legacy's concat (`listCatTail`) after each
 // operand's own recovery (`listCatOperandTail`).
 export type RListCat = { ljL: Opnd, ljR: Opnd, ljAt: i32 }
@@ -307,6 +317,9 @@ export type RListEmptyArms = { lfV: Opnd, lfAt: i32 }
 // `liV` at literal arm `liArm` of `is` test `liAt` (`litIsArmOf`), read once per member the arm
 // compares, as `emitIsTestLitArms` writes it: a bool.
 export type RLitArms = { liV: Opnd, liArm: LitIsArm, liAt: i32 }
+// `niV is K` over a numeric literal union at `is` test `niAt`, along `numIsPlanOf`: the receiver read
+// once into a slot, or once per member.
+export type RNumIs = { niV: Opnd, niAt: i32 }
 // A numeric intrinsic at call `nxAt`: its operands, then its one instruction `nxOp`
 // (`numIntrPlanOf`).
 // A binary operator at node `nbAt` on legacy's `numUnion` route, over its non-literal sides in
@@ -318,10 +331,10 @@ export type RNumIntr = { nxArgs: Opnd[], nxOp: i32, nxAt: i32 }
 export type RSimd = { sdArgs: Opnd[], sdAt: i32 }
 // A `print` statement at call `pnAt` of argument `pnV`, written by legacy's tail for its arm.
 export type RPrint = { pnV: Opnd, pnAt: i32 }
-// `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` read (recovered for `mgNonNull`), or where
-// it is -1 receiver operand `mgLoc`, key `mgKey`, and, by `mgForm`, a default legacy folds into its
-// `__map_get_<row>__` helper's miss (0), or the probe's plain `i32` read (1) or mv slot read (2)
-// with default `mgDef` in its miss arm (`mapGetOrArmOf`, `mapGetOrMvPlain`).
+// `m[k] ?? d` at `??` node `mgAt`: map global `mgSym` (recovered for `mgNonNull`), else receiver
+// `mgLoc`, key `mgKey`; by `mgForm` the default goes to `__map_get_<row>__`'s miss (0), or is `mgDef`
+// in the miss arm of the probe's `i32` read (1), mv slot read (2) or `scalar | null` union value's
+// scalar (3) (`mapGetOrArmOf`, `mapGetOrMvPlain`, `mapGetOrUnionScalarPlanOf`).
 export type RMapGetOr = {
   mgSym: i32,
   mgNonNull: boolean,
@@ -359,8 +372,16 @@ export type RMapHas = {
   mhAt: i32,
 }
 // A `==`/`!=` at node `seAt` on legacy's field-wise record compare over eq row `seRow` (a struct's
-// or a variant's): an operand legacy stashes is lowered once; one it re-reads is a variable.
-export type RStructEq = { seL: Opnd, seR: Opnd, seAt: i32, seRow: i32 }
+// or a variant's): an operand legacy stashes is lowered once; one it re-reads at every field is a
+// variable, or with `seLIx`/`seRIx` holding an index, a ref list element read over that variable.
+export type RStructEq = {
+  seL: Opnd,
+  seR: Opnd,
+  seAt: i32,
+  seRow: i32,
+  seLIx: Opnd[],
+  seRIx: Opnd[],
+}
 export type RStrOp = { soOp: StrOp, soArgs: Opnd[], soAt: i32 }
 export type RMakeClo = { mcFn: i32, mcEnv: Opnd[], mcAt: i32 }
 export type RFnId = { fiMember: i32 }
@@ -404,6 +425,7 @@ export type Rhs = RAsUnion
   | RCast
   | RCellGet
   | RCellNew
+  | RClosureEq
   | RCoalAtomStr
   | RCoalStr
   | RCoerce
@@ -447,6 +469,7 @@ export type Rhs = RAsUnion
   | RNullOf
   | RNumCast
   | RNumIntr
+  | RNumIs
   | RNumUnionBin
   | RNumWiden
   | RPrimOp
@@ -554,8 +577,10 @@ export type SSwitch = { swOn: i32, swArms: SwitchArm[], swOut: i32 }
 // A `??` at `cbAt` whose head and present arm are legacy's shared tails along arm `cbArm`, with a
 // lazy default and a valued out: operand `cbL`, the `if` or block the tails open on it, and the
 // default `cbNull`, which writes out `cbOut` on the null path; `cbMap`, a fused map read's probe.
+// `cbLB` builds `cbL` inside the block a nullable reference's plain arm opens, empty elsewhere.
 export type SCoalBox = {
   cbL: Opnd,
+  cbLB: i32[],
   cbArm: CoalValArm,
   cbNull: i32[],
   cbOut: i32,
@@ -563,7 +588,8 @@ export type SCoalBox = {
   cbMap: MapProbe | null,
 }
 // A fused map read's probe: map global `prSym` (recovered for `prNonNull`), or where it is -1 the
-// receiver in `cbL`, key `prKey`, and `RMapGetOr`'s inline form `prForm` (1 the `i32` read, 2 mv).
+// receiver in `cbL`, key `prKey`, and `RMapGetOr`'s inline form `prForm` (1 the `i32` read, 2 mv,
+// 3 a union value's scalar).
 export type MapProbe = {
   prSym: i32,
   prNonNull: boolean,
@@ -617,6 +643,9 @@ export type IrVar = { vRep: i32, vTy: i32, vKind: VarKind, vSlot: i32 }
 // One function: the node arena with each node's type, rep and source node, the variables, the
 // top-level body, the parameters and result, and the signatures of the functions and the reps of
 // the globals it uses, and the source statement that built each run of nodes (`irSpan*`).
+// A spread literal `sqAt` and its build's kind and slot (`irSpreadPair`).
+export type SpreadPairNote = { sqAt: i32, sqKind: i32, sqSlot: i32 }
+
 export type IrFn = {
   irNodes: IrNode[],
   irNodeTy: i32[],
@@ -665,6 +694,9 @@ export type IrFn = {
   // lowering asks legacy's site arm there, as `emitAssignUnder` does, which mints its global pair.
   irSiteArmAt: {[i32]: i32},
   irHasSiteArms: boolean,
+  // The spread literal whose groups' writing opens at each node, where the builder found its list
+  // pair unminted: the lowering asks the pair there, before the groups, as `emitArrSpread` does.
+  irSpreadPair: {[i32]: SpreadPairNote},
   // The variable each name read the builder took as a plain read of it, by the read's node.
   irReadVar: {[i32]: i32},
   // The union map read a delivery is building where legacy's box ladder reads it past `emitExpr`
@@ -674,6 +706,8 @@ export type IrFn = {
   irReadAgain: {[i32]: Rhs},
   // A list read the builder built at a node over a variable or an immediate, written again as built.
   irReadElem: {[i32]: Rhs},
+  // How many times the lowering has read the receiver of the literal arms it is writing.
+  irLitReads: i32,
   // The plain field reads the builder built, by the read's node: its object read again, then the
   // field. With `irReadVar` and `irReadAgain`, how the loop prologue reads its receivers.
   irReadField: {[i32]: i32},
@@ -736,12 +770,14 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHasRowOpens: false,
     irSiteArmAt: Map(),
     irHasSiteArms: false,
+    irSpreadPair: Map(),
     irReadVar: Map(),
     irUnbankedRead: -1,
     irNoTail: [],
     irNoTailEff: [],
     irReadAgain: Map(),
     irReadElem: Map(),
+    irLitReads: 0,
     irReadField: Map(),
   }
   return f
@@ -981,6 +1017,8 @@ export function irPushBodies(f: IrFn, id: i32, bodies: i32[][], pos: i32[]) {
     SCoalBox => {
       bodies.push(n.cbNull)
       pos.push(0)
+      bodies.push(n.cbLB)
+      pos.push(0)
     }
     SSwitch => {
       let k = n.swArms.length - 1
@@ -1098,7 +1136,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RMapIter => [r.miV]
     RPrint => [r.pnV]
     RStrOp => r.soArgs
-    RStructEq => [r.seL, r.seR]
+    RStructEq => opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx))
     RNumWiden => [r.nwV]
     RNumCast => [r.ncV]
     RNumIntr => r.nxArgs
@@ -1114,7 +1152,7 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RRetNull => []
     RJoinNull => []
     RNulTest => [r.ntV]
-    RNulNicheEq => [r.neL, r.neR]
+    RNulNicheEq => [r.neL, r.neR, r.neR2]
     RAtomEq => [r.aeL, r.aeR]
     RAsUnion => [r.auV]
     RTagStash => [r.tgsV]
@@ -1123,9 +1161,11 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListEmpty => [r.leV]
     RListEmptyArms => [r.lfV]
     RLitArms => [r.liV]
+    RNumIs => [r.niV]
     RUnionConcreteEq => [r.ucBox, r.ucOther]
     RUnionEq => [r.ueL, r.ueR]
     RListEq => [r.qeL, r.qeR]
+    RClosureEq => [r.cqL, r.cqR]
     RListCat => [r.ljL, r.ljR]
     RCoerce => [r.cvV]
     RMakeClo => r.mcEnv
@@ -1194,12 +1234,19 @@ function rhsText(r: Rhs): string {
     RRetNull => "return null"
     RJoinNull => "join null"
     RNulTest => "isnull " + opndText(r.ntV)
-    RNulNicheEq => "nulniche_eq(" + opndText(r.neL) + ", " + opndText(r.neR) + ")"
+    RNulNicheEq => "nulniche_eq("
+      + opndText(r.neL)
+      + ", "
+      + opndText(r.neR)
+      + ", "
+      + opndText(r.neR2)
+      + ")"
     RAtomEq => "atom.eq " + opndText(r.aeL) + " " + opndText(r.aeR)
     RAsUnion => "as.union " + opndText(r.auV)
     RUnionConcreteEq => "union.eqc " + opndText(r.ucBox) + " " + opndText(r.ucOther)
     RUnionEq => "union.eq " + opndText(r.ueL) + " " + opndText(r.ueR)
     RListEq => "list.eq " + opndText(r.qeL) + " " + opndText(r.qeR)
+    RClosureEq => "closure_eq(" + opndText(r.cqL) + ", " + opndText(r.cqR) + ")"
     RListCat => "list.cat " + opndText(r.ljL) + " " + opndText(r.ljR)
     RCoerce => "coerce " + opndText(r.cvV)
     RMapOp => "map." + r.mpOp + "(" + opndsText(r.mpArgs) + ")"
@@ -1225,6 +1272,7 @@ function rhsText(r: Rhs): string {
     RListEmpty => "list empty " + opndText(r.leV)
     RListEmptyArms => "list empty arms " + opndText(r.lfV)
     RLitArms => "lit arms " + r.liArm + " " + opndText(r.liV)
+    RNumIs => "num is " + opndText(r.niV)
     RNumIntr => "intrinsic " + i32ToStr(r.nxOp) + "(" + opndsText(r.nxArgs) + ")"
     RNumUnionBin => "num_union(" + opndsText(r.nbArgs) + ")"
     RSimd => "simd(" + opndsText(r.sdArgs) + ")"
@@ -1233,7 +1281,9 @@ function rhsText(r: Rhs): string {
     RMapHas => "map.has " + mapRecvText(r.mhSym, r.mhLoc) + "[" + opndText(r.mhKey) + "]"
     RMapIter => (if r.miVals { "map.values " } else { "map.keys " }) + opndText(r.miV)
     RStrOp => "str." + r.soOp + "(" + opndsText(r.soArgs) + ")"
-    RStructEq => "struct_eq(" + opndsText([r.seL, r.seR]) + ")"
+    RStructEq => "struct_eq("
+      + opndsText(opndsCat([r.seL, r.seR], opndsCat(r.seLIx, r.seRIx)))
+      + ")"
     RMakeClo => "closure f" + i32ToStr(r.mcFn) + "(" + opndsText(r.mcEnv) + ")"
     RFnId => "fn_id " + i32ToStr(r.fiMember)
     RCellNew => "cell " + opndText(r.cnInit)
@@ -1281,6 +1331,20 @@ function mapProbeText(mp: MapProbe | null): string {
 function outText(v: i32): string {
   if v < 0 { return "" }
   return " -> v" + i32ToStr(v)
+}
+
+// A `??`'s text at indent `p`, depth `d`: its operand block, the node, its default.
+function coalBoxText(f: IrFn, n: SCoalBox, p: string, d: i32): string {
+  return bodyText(f, n.cbLB, d)
+    + p
+    + "coalesce "
+    + n.cbArm
+    + " "
+    + opndText(n.cbL)
+    + mapProbeText(n.cbMap)
+    + outText(n.cbOut)
+    + "\n"
+    + bodyText(f, n.cbNull, d + 1)
 }
 
 function nodeText(f: IrFn, id: i32, d: i32): string {
@@ -1364,15 +1428,7 @@ function nodeText(f: IrFn, id: i32, d: i32): string {
       }
       s
     }
-    SCoalBox => p
-      + "coalesce "
-      + n.cbArm
-      + " "
-      + opndText(n.cbL)
-      + mapProbeText(n.cbMap)
-      + outText(n.cbOut)
-      + "\n"
-      + bodyText(f, n.cbNull, d + 1)
+    SCoalBox => coalBoxText(f, n, p, d)
     SSwitch => {
       let s = p + "switch v" + i32ToStr(n.swOn) + outText(n.swOut) + "\n"
       for a in n.swArms {
@@ -1467,6 +1523,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RNullOf |
       RNumCast |
       RNumIntr |
+      RNumIs |
       RNumUnionBin |
       RNumWiden |
       RPrimOp |
@@ -1524,6 +1581,7 @@ export function irRhsFamily(r: Rhs): IrFamily {
     RCast |
       RCellGet |
       RCellNew |
+      RClosureEq |
       RFnId |
       RStructEq |
       RTagOf => "other"
