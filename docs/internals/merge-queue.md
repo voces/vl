@@ -115,6 +115,21 @@ For the queue:
   catch a new case. Gate rows accepted on 2026-11-22 (coordinator rulings): `ir claims`'s
   filed-witness half, about +90 CPU-s (#9496; revisit at I8), and `ir prepost`, about 170 CPU-s
   (#9508), temporarily, until the armed-shadow row is folded into it (T12). Both retire at I8.
+- **Q9.** The deep-nesting stack margin (`tests/vl_deep_nesting_test.ts`, `MARGIN_KB` 940) is
+  not recalibrated while its erosion is unattributed. A PR whose head raises the failing KB by more
+  than 8 KB on its base is vetoed with the bisect. A smaller rise passes and is named in the PR.
+  A lane touching statement or expression recursion (`ir_build`, `ir_lower`, the emit ladders)
+  quotes the head-vs-base edge before READY, from the inner case
+  (`VL_DEEP_MARGIN_INNER=1 deno test -A --no-check --v8-flags=--stack-size=<KB>
+  tests/vl_deep_nesting_test.ts --filter "labelled while loop, checks"`, 10 KB steps). If one PR
+  accounts for 15 KB or more of the erosion, it returns to its lane. An erosion spread across PRs
+  is the dual-path period's price, and only the test's comment is updated to the measured numbers.
+  Headroom is expected back at I8 (coordinator ruling, 2026-11-22, after #9517 redded train BD10).
+- **Q10.** A lane that merges a `vl-queue/*` branch takes every member in it, including one later
+  pulled from its train. Before READY, check the branch carries no vetoed PR
+  (`git merge-base --is-ancestor <vetoed head> HEAD`). If it does, rebuild the branch from master
+  or the current train and open a new PR, since dropping commits would need a force-push (queue
+  practice: #9519 and #9528 merged BD3, which held #9517).
 
 ### Squash artifacts and Q3 members
 

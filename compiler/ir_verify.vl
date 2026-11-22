@@ -29,6 +29,7 @@ import {
   RCast,
   RCellGet,
   RCellNew,
+  RClosureEq,
   RCoalAtomStr,
   RCoalStr,
   RCoerce,
@@ -915,6 +916,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RNulNicheEq => nulNicheEqCheck(r, dst, at)
+    RClosureEq => closureEqCheck(r, dst, at)
     RNulTest => {
       use(r.ntV, at)
       const d = repNodeAt(opRep(r.ntV))
@@ -1642,7 +1644,8 @@ function coalPopOrWhy(n: SCoalBox): string {
 }
 
 // Why a fused map read whose default computes is ill-formed, or "": it probes a map receiver by a
-// key along an inline form, `i32` (1) or mv (2), into an out of the read's own rep.
+// key along an inline form, `i32` (1), mv (2) or a scalar union value's (3), into an out of the read's
+// own rep.
 function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   const mp = n.cbMap
   if mp == null { return "a fused map read holds no probe" }
@@ -1650,7 +1653,7 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   if !mapRecvOk(mp.prSym, n.cbL, id) {
     return "a map read of a receiver that is no map"
   }
-  if mp.prForm != 1 && mp.prForm != 2 {
+  if mp.prForm < 1 || mp.prForm > 3 {
     return "a fused map read writes its default in no miss arm"
   }
   const o = n.cbOut
@@ -1667,6 +1670,10 @@ function coalMapGetOrWhy(n: SCoalBox, id: i32): string {
   )
   if mp.prForm == 2 && (!(mr is RMap) || mr.rmVal != vf.irVars[o].vRep) {
     return "a map read's mv slot yields no value of its map"
+  }
+  // A union value's read peels to its scalar.
+  if mp.prForm == 3 && (!(mr is RMap) || p == null) {
+    return "a map read's union value peels to no scalar"
   }
   return ""
 }
@@ -1749,6 +1756,51 @@ function labelled(label: i32, out: i32, body: i32[]) {
   nested(body)
   vfLabels.pop()
   vfLabelOut.pop()
+  return 0
+}
+
+// A `??`'s checks: its operand block, operand, out, arm and default. Its own frame, so `stmt`'s
+// per-level frame stays as small as its other arms need.
+function coalBoxCheck(n: SCoalBox, id: i32) {
+  // A fused map read's receiver is read by its probe, which may name a global instead.
+  const mapArm = n.cbArm == "mapIndexGetOr"
+  if (n.cbMap != null) != mapArm {
+    return fail(2, id, "a `??` holds a map probe off the map-read arm")
+  }
+  if n.cbLB.length > 0 && n.cbArm != "nulRef" {
+    return fail(
+      2,
+      id,
+      "a `??` builds its operand inside off the nullable-reference arm",
+    )
+  }
+  // The operand block's definitions are seen by the operand, then dropped with the node.
+  const nDefs = vfDefLog.length
+  let lbPrev = -1
+  for lid in n.cbLB {
+    stmt(lid, lbPrev)
+    lbPrev = lid
+  }
+  if !mapArm { use(n.cbL, id) }
+  if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
+    return fail(4, id, "a boxed `??` writes no variable")
+  }
+  const why = match n.cbArm {
+    "popOr" => coalPopOrWhy(n)
+    "mapIndexGetOr" => coalMapGetOrWhy(n, id)
+    "nulRef" => coalNulRefWhy(n)
+    "litUnion" | "nulBool" => coalNicheWhy(n)
+    "fieldBox" | "fieldVal" => coalFieldWhy(n)
+    "optLeaf" => coalOptLeafWhy(n)
+    "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
+  }
+  if why != "" { return fail(2, id, why) }
+  nested(n.cbNull)
+  endsWriting(n.cbNull, n.cbOut, id)
+  while vfDefLog.length > nDefs {
+    const d = vfDefLog.pop() ?? -1
+    if d >= 0 && d < vfDefined.length { vfDefined[d] = false }
+  }
   return 0
 }
 
@@ -1921,29 +1973,7 @@ function stmt(id: i32, prev: i32) {
       vfLabelOut.pop()
     }
     SIf => ifSpine(id)
-    SCoalBox => {
-      // A fused map read's receiver is read by its probe, which may name a global instead.
-      const mapArm = n.cbArm == "mapIndexGetOr"
-      if (n.cbMap != null) != mapArm {
-        return fail(2, id, "a `??` holds a map probe off the map-read arm")
-      }
-      if !mapArm { use(n.cbL, id) }
-      if n.cbOut < 0 || n.cbOut >= vf.irVars.length {
-        return fail(4, id, "a boxed `??` writes no variable")
-      }
-      const why = match n.cbArm {
-        "popOr" => coalPopOrWhy(n)
-        "mapIndexGetOr" => coalMapGetOrWhy(n, id)
-        "nulRef" => coalNulRefWhy(n)
-        "litUnion" | "nulBool" => coalNicheWhy(n)
-        "fieldBox" | "fieldVal" => coalFieldWhy(n)
-        "optLeaf" => coalOptLeafWhy(n)
-        "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
-      }
-      if why != "" { return fail(2, id, why) }
-      nested(n.cbNull)
-      endsWriting(n.cbNull, n.cbOut, id)
-    }
+    SCoalBox => coalBoxCheck(n, id)
     SSwitch => switchCheck(n, id)
     SBr => {
       if n.brHas && !vf.irHelper {
@@ -2135,12 +2165,36 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   return 0
 }
 
+// A function-value compare's two operands at closure reps, and its 0/1 answer a bool.
+function closureEqCheck(r: RClosureEq, dst: i32, at: i32) {
+  use(r.cqL, at)
+  use(r.cqR, at)
+  if (
+    !(repNodeAt(opRep(r.cqL)) is RClosure)
+    || !(repNodeAt(opRep(r.cqR)) is RClosure)
+  ) {
+    return fail(2, at, "a function-value compare's operands are closures")
+  }
+  if dst >= 0 && repPrim(dst) != "bool" {
+    return fail(2, at, "a function-value compare is a bool")
+  }
+  return 0
+}
+
 // A guarded nullable compare's two operands at reference reps, and its 0/1 answer a bool.
 function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
   use(r.neL, at)
   use(r.neR, at)
+  use(r.neR2, at)
   if repIsScalar(opRep(r.neL)) || repIsScalar(opRep(r.neR)) {
     return fail(2, at, "a guarded nullable compare's operands are references")
+  }
+  if opRep(r.neR2) != opRep(r.neR) {
+    return fail(
+      2,
+      at,
+      "a guarded nullable compare writes its right operand twice at one rep",
+    )
   }
   if dst >= 0 && repPrim(dst) != "bool" {
     return fail(2, at, "a guarded nullable compare is a bool")
@@ -2246,6 +2300,7 @@ function rhsReadsList(r: Rhs): boolean {
       RCast |
       RCellGet |
       RCellNew |
+      RClosureEq |
       RCoalAtomStr |
       RCoalStr |
       RCoerce |
@@ -2388,7 +2443,15 @@ export function irTyOpen(ty: i32): boolean { return ty < 0 || tyHasTyVar(ty) }
 // Whether a variable of type `ty` at rep `rep` is open (rule 1): a type whose every open part is
 // a function held at a rep no instance changes is not (`tyOpenHeldAsIds`).
 export function irTyHeldOpen(ty: i32, rep: i32): boolean {
+  if irUntypedClosure(ty, rep) { return false }
   return irTyOpen(ty) && !tyOpenHeldAsIds(ty, rep, [])
+}
+
+// Whether a variable is a closure no arena type spells (a generic's instance, built by
+// `repClosureOfReps`): typed -1 at an interned closure rep of no type, which its calls are checked
+// against, as a function held at a closure rep is (`tyOpenHeldAsIds`).
+export function irUntypedClosure(ty: i32, rep: i32): boolean {
+  return ty < 0 && repNodeAt(rep) is RClosure && repTyOf(rep) < 0
 }
 
 // The valtype bytes legacy's `fbValtype` writes a value of rep `r` at: a held closure's, or a
@@ -2420,6 +2483,14 @@ export function repStoresAs(dst: i32, src: i32): boolean {
 // stored alike (`repStoresAs`).
 export function openRepTakes(ty: i32, rep: i32, v: i32): boolean {
   return irTyOpen(ty) && repStoresAs(rep, v)
+}
+
+// Whether open type `ty`'s rep `rep` has no valtype legacy writes (`refRepValtype`) and `v` has
+// one. Permissive alone: a caller ties `v` to a legacy declaration of the storage it reads.
+export function undeclaredRepTakes(ty: i32, rep: i32, v: i32): boolean {
+  return irTyOpen(ty)
+    && refRepValtype(rep).length == 0
+    && refRepValtype(v).length > 0
 }
 
 // Whether record `r` is built at a variant's row, as `makeRec` lowers it.
@@ -2470,7 +2541,8 @@ export function irVerify(f: IrFn): IrVerdict {
   while i < f.irVars.length {
     const v = f.irVars[i]
     vfDefined.push(false)
-    if rawAt(v.vRep, -1) || v.vTy < 0 {
+    const untyped = irUntypedClosure(v.vTy, v.vRep)
+    if (rawAt(v.vRep, -1) || v.vTy < 0) && !untyped {
       // A raw variable has no VL type, and only a helper holds one. One whose heap is not
       // tracked is a temp, on the stack between its read and its one use.
       if !f.irHelper || v.vTy >= 0 || !rawAt(v.vRep, -1) {
@@ -2494,7 +2566,7 @@ export function irVerify(f: IrFn): IrVerdict {
       )
     } else if irTyHeldOpen(v.vTy, v.vRep) {
       fail(1, -1, "v" + i32ToStr(i) + "'s type is open")
-    } else if repNodeOfTy(v.vTy) != v.vRep {
+    } else if !untyped && repNodeOfTy(v.vTy) != v.vRep {
       fail(3, -1, "v" + i32ToStr(i) + "'s rep is not its type's")
     }
     i = i + 1
