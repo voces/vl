@@ -1472,9 +1472,9 @@ Deno.test({
     // nullable list into an `i32` out (rule 2). Case 24 is a shared read whose global receiver's
     // cell is no box (rule 2). Case 25 is a niche read over an i32 operand, and case
     // 26 a sole member's atom id into an `i32` temp; case 28 an atom tower testing an `i32` read,
-    // and case 29 one testing none (rule 2 each). Case 27 is another lane's number, here a function
-    // that holds.
-    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2];
+    // and case 29 one testing none, and case 30 a staged atom narrowing of an `i32` (rule 2 each).
+    // Case 27 is another lane's number, here a function that holds.
+    const want = [0, 1, 2, 3, 4, 5, 6, 7, 5, 2, 8, 2, 2, 2, 5, 2, 2, 2, 5, 2, 2, 2, 2, 2, 2, 2, 2, 0, 2, 2, 2];
     for (let k = 0; k < want.length; k++) {
       const got = exp.irVerifySelfTest(k);
       if (got !== want[k]) throw new Error(`case ${k}: want rule ${want[k]}, got rule ${got}`);
