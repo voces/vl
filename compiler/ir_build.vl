@@ -339,6 +339,8 @@ import {
   popAnyPlanOf,
   popOrPlanOf,
   printArmOf,
+  pushManyRunBuild,
+  pushManyRunLit,
   pushPlainWhy,
   rangeMayWrap,
   rangePartialCopies,
@@ -4987,6 +4989,13 @@ function listSliceRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
 // A string method legacy's call ladder takes by name (`exprIsStrMethod`): its receiver and
 // arguments, then legacy's own tail. Any other method is a miss that names it.
 function methodRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  // Several arguments, or a spread, append in bulk: legacy's `emitPushMany`.
+  if (
+    m.memProp == "push"
+    && (c.callArgs.length != 1 || nodeAt(c.callArgs[0]) is Spread)
+  ) {
+    return pushManyRhs(b, c, m, ix)
+  }
   if (
     m.memProp == "push"
     && c.callArgs.length == 1
@@ -5473,6 +5482,43 @@ function pushRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
     return missRhs("push short-circuit operand")
   }
   const r: Rhs = { lpV: recv, lpX: x, lpAt: ix }
+  return r
+}
+
+// A variadic push `ix` (`emitPushMany`): the receiver, then the run legacy builds of the
+// arguments (`pushManyRunLit`) at the receiver's list build, appended in bulk.
+function pushManyRhs(b: i32[], c: Call, m: Member, ix: i32): Rhs {
+  if !(repNodeAt(repNodeOfTy(nodeTyAt(m.memObj, ibFnIx))) is RList) {
+    return missRhs("member call on a record field")
+  }
+  // Legacy reads the receiver with a strict payload cast, which the IR's read does not take.
+  if recvReadsListPayload(m.memObj, ibFnIx) {
+    return missRhs("push receiver payload cast")
+  }
+  const lb = pushManyRunBuild(ix, ibFnIx)
+  if lb == null { return missRhs("push many receiver") }
+  const at = b.length
+  const v = irBExpr(b, m.memObj)
+  if ibMiss != "" || !(repNodeAt(irBOpRep(v)) is RList) {
+    return missRhs("push many receiver rep")
+  }
+  const lit = pushManyRunLit(ix, ibFnIx)
+  const ln = if lit >= 0 && lit < P.nodes.length { nodeAt(lit) } else { null }
+  if !(ln is ArrayLit) { return missRhs("push many run") }
+  const xAt = b.length
+  // The run is a synthesized literal no checker stamp reaches: it is typed at its receiver's list.
+  const rt = heldTy(nodeTyAt(m.memObj, ibFnIx))
+  const l = arrayLit(b, ln, lit, irBOpRep(v), lb, rt)
+  if ibMiss != "" { return missRhs(ibMiss) }
+  if irBOpRep(l) != irBOpRep(v) { return missRhs("push many run rep") }
+  // The receiver is staged before the run, so a valued `if` the run writes would sit above it.
+  if (
+    valuedIfFrom(b, xAt)
+    || ifBelowLead(b, at, "push many short-circuit operand")
+  ) {
+    return missRhs("push many short-circuit operand")
+  }
+  const r: Rhs = { pmV: v, pmL: l, pmAt: ix }
   return r
 }
 

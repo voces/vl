@@ -1533,6 +1533,7 @@ Deno.test({
       "width-retag-pair-unnoted": 2,
       "retag-closures-of-differing-arity": 2,
       "retag-field-alike-records-two-heaps": 2,
+      "push-many-of-i32": 2,
       "global-read-off-store-type": 2,
       "valued-block-temp-out": 10,
       "atom-sole-into-i32": 2,
