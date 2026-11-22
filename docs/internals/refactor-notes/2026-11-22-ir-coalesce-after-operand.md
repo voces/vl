@@ -30,3 +30,20 @@ excluded, the armed `tests/cases` shadow found a field arm after an interpolatio
 (`spans: read index`). So the change is cut to the arms the self-compile's witnesses use.
 
 The shadow row is `tests/ir-shadow-rows/coalesce-after-operand.vl`.
+
+## Readings (fixpoint seeds, base 8b8ac208)
+
+| reading | base | head |
+| --- | --- | --- |
+| self `blockers none` | 19812 | 19814 |
+| self `coalesce niche after an operand` | 2 | 0 |
+| self `coalesce nulRef after an operand + …operand temp` | 1 | 0 |
+| corpus shadow covered = matched | 45099 | 45099 |
+| `ir-identity --names` | | identical 9037, differ 0; self-compile identical |
+| `ir-identity --cases` | | identical 7619, differ 0; witnesses differ 0 |
+| `--claimless` | | identical 14019, differ 0 |
+| `tests/cases` armed shadow A/B | | identical 7333, differ 0 |
+| `stack value read out of order`, `operand above a valued if's value` | | 0 on self, corpus, tests/cases |
+| L2 fuel | | +0.02% (same-tree pair +0.00%) |
+| late demands / tag rows | 9 / 307 | 9 / 307 |
+| seed size | | +2.7% of baseline, pass |
