@@ -1526,6 +1526,8 @@ Deno.test({
       "width-retag-noted-leading": 0,
       "width-retag-field-not-leading": 2,
       "width-retag-pair-unnoted": 2,
+      "hand-pick-of-i32": 2,
+      "hand-pick-record-into-i32": 2,
     };
     const ids: string[] = [];
     for (let i = 0; i < exp.irSelfTestIdCount(); i++) {
