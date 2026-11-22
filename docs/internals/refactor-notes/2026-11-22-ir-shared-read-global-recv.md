@@ -24,3 +24,17 @@ next blocker of 34.
 
 `tests/ir-shadow-rows/shared-read-global-receiver.vl`: `print(r.tag)` over two module globals of an
 inferred `A | B`.
+
+## Measured vs ir-start-box-receiver (fixpoint seeds on both sides; merge-base 228cfa5e)
+
+- Fixpoint after one refresh; `--names` self-compile identical; mode-3 self-compile byte-identical.
+- `ir-identity.sh --claimless`: identical 14019, fail under both 3267, differ 0.
+- `ir-identity.sh --cases`: identical 7615, differ 0; witnesses same 61, differ 0 (again after the
+  bound tests in `globalBoxSymOf`).
+- tests/cases legacy A/B: identical 7335, differ 0.
+- Mode 5 over the 34 programs: 34 of 34 builds byte-identical to the legacy build.
+- tests/cases armed shadow: start covered 6,011 → 6,036, start matched 6,010 → 6,035 (+25);
+  `start uncovered shared read global receiver` 34 → 0. Corpus no-blocker functions unchanged at
+  45,093.
+- Self-compile L2 fuel +0.02% per PR on 228cfa5e (the stack).
+- Deep-nesting stack margin: fail 920 / pass 930 KB, the base's own edge.
