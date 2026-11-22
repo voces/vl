@@ -478,6 +478,8 @@ import {
   globalCellKind,
   identIsEnvCapture,
   letBindIsAtom,
+  letBindRep,
+  letBindRepClaims,
   letBindTy,
   letNulMapReadUnionBox,
   localIndexOf,
@@ -1680,7 +1682,37 @@ function exprTyOf(ix: i32): i32 {
     const fn = nodeAt(fnStmts[pos])
     if fn is FuncDecl { return resultTy(pos, fn.fnRet, fnStmts[pos]) }
   }
-  return t
+  // An untyped read of a binding in an instance body reads its storage: the type the IR holds
+  // the binding's variable at.
+  const v = boundVarOf(ix)
+  return if v >= 0 { ib.irVars[v].vTy } else { t }
+}
+
+// The variable the IR built for the `let` or parameter read `ix` names, or -1.
+function boundVarOf(ix: i32): i32 {
+  const d = identDeclOf(ix)
+  if d < 0 { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) && !(dn is Param) { return -1 }
+  if dn is Param { return paramVarAt(localIndexOf(ibFnIx, ix)) }
+  const kv = ibDeclVar[d] ?? -1
+  return if kv >= 0 { kv } else { slotVarOf(d) }
+}
+
+// The variable already holding declaration `d`'s wasm local in this frame, or -1.
+function slotVarOf(d: i32): i32 {
+  const s = declaredSlotOfDecl(d)
+  return if s >= 0 { localVarAt(declaredIndexAt(ibFnIx, s)) } else { -1 }
+}
+
+// The variable a read of `let` `d` reads: where `d`'s own type is open, the one its instance's
+// declaration already holds at that local, else `irBDeclVar`'s.
+function readDeclVar(d: i32): i32 {
+  if irTyOpen(heldTy(scopeTyAt(d, ibFnIx))) {
+    const sv = slotVarOf(d)
+    if sv >= 0 { return sv }
+  }
+  return irBDeclVar(d)
 }
 
 export function irBOpRep(o: Opnd): i32 {
@@ -1750,6 +1782,25 @@ export function irBBoxLocal(ix: i32): Opnd {
   if v < 0 || !heldAsBox(ib.irVars[v].vRep) { return irBMiss("box receiver") }
   const o: Opnd = { ov: v }
   return o
+}
+
+// Whether binding `d`'s variable `v`, of an open function type, takes closure `src` its
+// initializer built at its instance's signature: legacy's cell holds a closure (`letBindRep`), so
+// the variable is retyped to the closure built.
+function cellTakesClosure(d: i32, v: i32, src: Opnd): boolean {
+  const x = ib.irVars[v]
+  if !irTyOpen(x.vTy) || !(repNodeAt(x.vRep) is RClosure) { return false }
+  if !(repNodeAt(irBOpRep(src)) is RClosure) || !(src is OVar) || src.ov < 0 {
+    return false
+  }
+  if !letBindRepClaims(d, ibFnIx) || letBindRep(d, ibFnIx).rdKind != "closure" {
+    return false
+  }
+  const st = ib.irVars[src.ov].vTy
+  if irTyOpen(st) { return false }
+  x.vRep = irBOpRep(src)
+  x.vTy = st
+  return true
 }
 
 // The variable of local declaration `d` (a `LetDecl` or a `Param`), made on first use.
@@ -2551,7 +2602,7 @@ function identRead(b: i32[], n: Ident, ix: i32, rep: i32, cell: boolean): Opnd {
   const rangeVar = dn is ForRange && (ibDeclVar[d] ?? -1) >= 0
   if (dn is LetDecl || dn is Param || walkVar || rangeVar) && w >= 0 {
     // A parameter is found by its wasm index: an instance's read resolves to the template's.
-    const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else if rangeVar { ibDeclVar[d] ?? -1 } else { irBDeclVar(d) }
+    const v = if dn is Param { paramVarAt(w) } else if dn is LoopVar { fragLoopVar(d, ix, rep) } else if rangeVar { ibDeclVar[d] ?? -1 } else { readDeclVar(d) }
     if v < 0 { return irBMiss("local rep") }
     // A read of a `null` unit local is its destination's null, as `emitNullAt` writes it.
     if (
@@ -7559,6 +7610,7 @@ function stmtNode(b: i32[], ix: i32, sibs: i32[], pos: i32) {
     if (
       irBOpRep(src) != ib.irVars[v].vRep
       && !(fresh && localStoredAt(v, ix, irBOpRep(src)))
+      && !cellTakesClosure(ix, v, src)
     ) {
       return skip("declaration coercion")
     }
