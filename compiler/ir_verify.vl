@@ -19,6 +19,7 @@ import {
   RAsUnion,
   RAtomEq,
   RAtomStr,
+  RAtomic,
   RBoxField,
   RBoxNarrow,
   RBundlePick,
@@ -66,6 +67,7 @@ import {
   RMapSet,
   RMemAccess,
   RMemOp,
+  RNulNicheEq,
   RNulTest,
   RNullOf,
   RNumCast,
@@ -90,6 +92,7 @@ import {
   RTagStash,
   RTest,
   RToBox,
+  RTruncSat,
   RUnionConcreteEq,
   RUnionEq,
   Rhs,
@@ -136,6 +139,7 @@ import {
 } from "./emit_rep"
 import {
   listRetag,
+  listRetagHole,
   repBoolNiche,
   repBoxCore,
   repIsNoValue,
@@ -160,10 +164,14 @@ import { nodeTyAt } from "./emit_capture_frames"
 import { letBindTy, tyOpenHeldAsIds } from "./emit_classify"
 import { identDeclOf } from "./symbols"
 import {
+  atomicPlanOf,
+  atomicResultPrim,
+  atomicValPrim,
   fnFallThroughPadOf,
   litArmsReadsOf,
   memAccessPlanOf,
   narrowedMapReadOf,
+  truncSatPlanOf,
 } from "./wasmEmit"
 
 // A verdict: rule 0 with node -1 when `f` holds, else the first rule broken, at node `vfNode`
@@ -727,6 +735,8 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       0
     }
     RMemAccess => memAccessCheck(r, dst, at)
+    RAtomic => atomicCheck(r, dst, at)
+    RTruncSat => truncSatCheck(r, dst, at)
     RMemOp => {
       for o in r.moArgs { use(o, at) }
       for o in r.moArgs {
@@ -781,7 +791,16 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       // A nullable element may read recovered at its inner rep.
       const en = repNodeAt(kidAt(l, 0))
       const recovered = en is RNullable && en.rnInner == dst
-      if l != vfStr && dst >= 0 && kidAt(l, 0) != dst && !packed && !recovered {
+      // A box element may read unboxed at the member its place narrows to.
+      const unboxed = en is RBox || en is RNullable && en.rnDisc == 4
+      if (
+        l != vfStr
+        && dst >= 0
+        && kidAt(l, 0) != dst
+        && !packed
+        && !recovered
+        && !unboxed
+      ) {
         return fail(2, at, "an element's rep is not its destination's")
       }
       0
@@ -791,6 +810,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       const d = repNodeAt(dst)
       if (
         !listRetag(opRep(r.rgV), dst)
+        && !listRetagHole(opRep(r.rgV), dst)
         && (!(d is RNullable)
           || !nicheRetag(d.rnDisc, d.rnInner)
           || d.rnInner != opRep(r.rgV))
@@ -798,7 +818,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
         return fail(
           2,
           at,
-          "a retag is not of an atom or a string into its own nullable niche, or a ref list as itself",
+          "a retag is not of an atom or a string into its own nullable niche, or a ref list as itself or into its hole",
         )
       }
       0
@@ -878,6 +898,7 @@ function rhsCheck(r: Rhs, dst: i32, at: i32) {
       }
       0
     }
+    RNulNicheEq => nulNicheEqCheck(r, dst, at)
     RNulTest => {
       use(r.ntV, at)
       const d = repNodeAt(opRep(r.ntV))
@@ -1518,6 +1539,19 @@ function coalNicheWhy(n: SCoalBox): string {
   return ""
 }
 
+// A `p?.f ?? d` over a nullable record re-reads its receiver, a variable, and yields a scalar.
+function coalOptLeafWhy(n: SCoalBox): string {
+  if !(n.cbL is OVar) { return "an optional field `??` re-reads no variable" }
+  const o = n.cbOut
+  if o < 0 || o >= vf.irVars.length {
+    return "an optional field `??` writes no variable"
+  }
+  if repPrim(vf.irVars[o].vRep) == null {
+    return "an optional field `??` yields no scalar"
+  }
+  return ""
+}
+
 // A record field's `??` re-reads its record, a variable, and yields the field's box or its scalar.
 function coalFieldWhy(n: SCoalBox): string {
   if !(n.cbL is OVar) { return "a field `??` re-reads no variable" }
@@ -1869,6 +1903,7 @@ function stmt(id: i32, prev: i32) {
         "nulRef" => coalNulRefWhy(n)
         "litUnion" | "nulBool" => coalNicheWhy(n)
         "fieldBox" | "fieldVal" => coalFieldWhy(n)
+        "optLeaf" => coalOptLeafWhy(n)
         "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => coalBoxWhy(n)
       }
       if why != "" { return fail(2, id, why) }
@@ -2063,6 +2098,66 @@ function memAccessCheck(r: RMemAccess, dst: i32, at: i32) {
   return 0
 }
 
+// A guarded nullable compare's two operands at reference reps, and its 0/1 answer a bool.
+function nulNicheEqCheck(r: RNulNicheEq, dst: i32, at: i32) {
+  use(r.neL, at)
+  use(r.neR, at)
+  if repIsScalar(opRep(r.neL)) || repIsScalar(opRep(r.neR)) {
+    return fail(2, at, "a guarded nullable compare's operands are references")
+  }
+  if dst >= 0 && repPrim(dst) != "bool" {
+    return fail(2, at, "a guarded nullable compare is a bool")
+  }
+  return 0
+}
+
+// An atomic's address at i32, each value at `atomicValPrim`, and its result at `atomicResultPrim`
+// (a store and a fence have no value).
+function atomicCheck(r: RAtomic, dst: i32, at: i32) {
+  uses(r.amArgs, at)
+  const c = nodeAt(r.amAt)
+  if !(c is Call) { return fail(2, at, "an atomic is a call") }
+  const pl = atomicPlanOf(c)
+  const a = r.amArgs
+  if pl.apFail != "" || a.length != pl.apBase {
+    return fail(2, at, "an atomic takes its plan's operands")
+  }
+  if a.length > 0 && opRep(a[0]) != vfI32 {
+    return fail(2, at, "an atomic's address is an i32")
+  }
+  let k = 1
+  while k < a.length {
+    if repPrim(opRep(a[k])) != atomicValPrim(pl.apRow, k) {
+      return fail(2, at, "an atomic's value is at its row's prim")
+    }
+    k = k + 1
+  }
+  const res = atomicResultPrim(pl.apRow)
+  if dst >= 0 && (res == "" || repPrim(dst) != res) {
+    return fail(2, at, "an atomic's result is at its row's prim")
+  }
+  return 0
+}
+
+// A saturating truncation's operand at its float prim and its result at its integer prim.
+function truncSatCheck(r: RTruncSat, dst: i32, at: i32) {
+  use(r.tsV, at)
+  const c = nodeAt(r.tsAt)
+  if !(c is Call) { return fail(2, at, "a saturating truncation is a call") }
+  const pl = truncSatPlanOf(c)
+  if pl.tpOp < 0 || repPrim(opRep(r.tsV)) != pl.tpFrom {
+    return fail(2, at, "a saturating truncation's operand is at its float prim")
+  }
+  if dst >= 0 && repPrim(dst) != pl.tpTo {
+    return fail(
+      2,
+      at,
+      "a saturating truncation's result is at its integer prim",
+    )
+  }
+  return 0
+}
+
 // A SIMD row's operands and result at the prims its shape names (`simdOperandPrim`,
 // `simdResultPrim`), a lane or shuffle index being an immediate and no operand.
 function simdCheck(r: RSimd, dst: i32, at: i32) {
@@ -2104,6 +2199,7 @@ function rhsReadsList(r: Rhs): boolean {
     RAsUnion |
       RAtomEq |
       RAtomStr |
+      RAtomic |
       RBoxField |
       RBoxNarrow |
       RBundlePick |
@@ -2150,6 +2246,7 @@ function rhsReadsList(r: Rhs): boolean {
       RMapSet |
       RMemAccess |
       RMemOp |
+      RNulNicheEq |
       RNulTest |
       RNullOf |
       RNumCast |
@@ -2174,6 +2271,7 @@ function rhsReadsList(r: Rhs): boolean {
       RTagStash |
       RTest |
       RToBox |
+      RTruncSat |
       RUnionConcreteEq |
       RUnionEq => false
   }
