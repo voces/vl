@@ -51,6 +51,7 @@ import {
   Unary,
   WhileStmt,
   blockTailIsDead,
+  callIsNever,
   hasNamedArgs,
   i32ToStr,
   nodeAt,
@@ -2525,6 +2526,18 @@ function ifArm(blockIx: i32, t: i32, rep: i32): i32[] {
   armPrelude(body, blockIx)
   if ibMiss != "" { return body }
   const tv = ifArmValueExpr(blockIx)
+  // A call that never returns leaves no value for the out: legacy writes it, and its `end` is
+  // stack-polymorphic.
+  if tv >= 0 && callIsNever(unwrapParen(tv)) {
+    // At a wider number legacy also widens the dead value (`emitWidened`).
+    if numKindOf(rep) >= 3 {
+      irBMiss("never arm widened")
+      return body
+    }
+    stmtNode(body, tv, NO_SIBS, -1)
+    if ibMiss == "" && !irBodyLeaves(ib, body) { irBMiss("never arm") }
+    return body
+  }
   const v = deliver(body, tv, rep, -1)
   if ibMiss == "" && irBOpRep(v) != rep { irBMiss("if arm coercion") }
   if ibMiss == "" {
@@ -8367,8 +8380,14 @@ function tailIf(b: i32[], ix: i32) {
 function tailArm(blockIx: i32): i32[] {
   const body: i32[] = []
   const stmts = elseStmts(blockIx)
-  if stmts.length == 0 || blockTailIsDead(stmts) {
+  if stmts.length == 0 {
     skip("dead tail arm")
+    return body
+  }
+  const dead = blockTailIsDead(stmts)
+  // A dead tail's nested function declaration still takes legacy's statement path.
+  if dead && nodeAt(stmts[stmts.length - 1]) is FuncDecl {
+    skip("dead tail declaration")
     return body
   }
   let i = 0
@@ -8376,6 +8395,11 @@ function tailArm(blockIx: i32): i32[] {
   while i < stmts.length - 1 {
     stmtNode(body, stmts[i], stmts, i)
     i = i + 1
+  }
+  // Past an exit, legacy writes the dead tail as `unreachable` (`emitDeadTail`).
+  if dead {
+    irBNode(body, { tpWhy: 0 }, -1, ibNoValue, stmts[stmts.length - 1])
+    return body
   }
   const last = stmts[stmts.length - 1]
   const ln = nodeAt(last)
