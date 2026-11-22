@@ -176,6 +176,11 @@ export type RListCopy = { lcArgs: Opnd[], lcAt: i32 }
 // A linear-memory load or store intrinsic at call node `mmAt` over its address and, for a store,
 // its value (`memAccessPlanOf`).
 export type RMemAccess = { mmArgs: Opnd[], mmAt: i32 }
+// An atomic intrinsic at call node `amAt` over its address and value operands (`atomicPlanOf`);
+// a fence has none.
+export type RAtomic = { amArgs: Opnd[], amAt: i32 }
+// A scalar saturating truncation at call node `tsAt` of float operand `tsV` (`truncSatPlanOf`).
+export type RTruncSat = { tsV: Opnd, tsAt: i32 }
 // A memory-management intrinsic at call node `moAt` over its i32 operands (`memOpPlanOf`).
 export type RMemOp = { moArgs: Opnd[], moAt: i32 }
 // `lgAt`: the read's `Index` node, which legacy's hoist and range-proof decisions key on.
@@ -360,7 +365,8 @@ export type RGlobalGet = { ggSym: i32, ggNonNull: boolean, ggNn: i32 }
 export type REnvGet = { evSlot: i32, evAt: i32 }
 // The environment of nested function `edFn` this frame caches, dropped where its declaration runs.
 export type REnvDrop = { edFn: i32 }
-// The closure bundle parameter `bpV` holds for call `bpAt` (D14841), as `bundlePickOf` picks it.
+// The closure the bundle parameter or record holder `bpV` holds for call `bpAt`, as `bundlePickOf`
+// picks it.
 export type RBundlePick = { bpV: Opnd, bpAt: i32 }
 // A runtime helper's wasm GC instruction over raw reps, keyed by heap type `rwHeap`: the field of
 // a `struct.get`, the callee index of a `call`, the variable a `tee` writes in `rwImm`. `test`
@@ -379,6 +385,7 @@ export type RStage = { sgV: Opnd }
 export type Rhs = RAsUnion
   | RAtomEq
   | RAtomStr
+  | RAtomic
   | RBoxField
   | RBoxNarrow
   | RBundlePick
@@ -451,6 +458,7 @@ export type Rhs = RAsUnion
   | RTagStash
   | RTest
   | RToBox
+  | RTruncSat
   | RUnionConcreteEq
   | RUnionEq
 
@@ -629,6 +637,17 @@ export type IrFn = {
   // The call temps legacy writes with its tail-call cursor disarmed (a tag dispatch's arm), so a
   // `return` of one keeps `call; return`.
   irNoTail: i32[],
+  // The effect nodes, a statement dispatch's arms, whose call legacy writes with its tail-call
+  // cursor disarmed, so a call in tail position keeps its plain form.
+  irNoTailEff: i32[],
+}
+
+// Whether effect node `id` is one `irNoTailEff` names.
+export function irNoTailEffHas(f: IrFn, id: i32): boolean {
+  for t in f.irNoTailEff {
+    if t == id { return true }
+  }
+  return false
 }
 
 // Whether call temp `v` is one `irNoTail` names.
@@ -675,6 +694,7 @@ export function irFnNew(at: i32, name: string): IrFn {
     irHasSiteArms: false,
     irReadVar: Map(),
     irNoTail: [],
+    irNoTailEff: [],
     irReadAgain: Map(),
     irReadField: Map(),
   }
@@ -1012,6 +1032,8 @@ export function irRhsOpnds(r: Rhs): Opnd[] {
     RListNewDefault => [r.ldLen]
     RListCopy => r.lcArgs
     RMemAccess => r.mmArgs
+    RAtomic => r.amArgs
+    RTruncSat => [r.tsV]
     RMemOp => r.moArgs
     RListGet => [r.lgV, r.lgIx]
     RListLen => [r.llV]
@@ -1103,6 +1125,8 @@ function rhsText(r: Rhs): string {
     RListNewDefault => "list_new_default(" + opndText(r.ldLen) + ")"
     RListCopy => "list_copy(" + opndsText(r.lcArgs) + ")"
     RMemAccess => "mem_access(" + opndsText(r.mmArgs) + ")"
+    RAtomic => "atomic(" + opndsText(r.amArgs) + ")"
+    RTruncSat => "trunc_sat(" + opndText(r.tsV) + ")"
     RMemOp => "mem_op(" + opndsText(r.moArgs) + ")"
     RListGet => "get " + opndText(r.lgV) + "[" + opndText(r.lgIx) + "]"
     RListLen => "len " + opndText(r.llV)
@@ -1367,7 +1391,7 @@ export function irNodeFamily(n: IrNode): IrFamily {
       "popOr" => "list"
       "nulRef" => "box"
       "litUnion" | "nulBool" => "box"
-      "fieldBox" | "fieldVal" => "record"
+      "fieldBox" | "fieldVal" | "optLeaf" => "record"
       "mapIndexGetOr" => "map"
       "boolPop" | "valBox" | "valScalar" | "valNoKind" | "elem" | "callBox" | "callScalar" | "callNoKind" | "next" => "box"
     }
@@ -1441,7 +1465,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       REnvDrop |
       REnvGet |
       RMakeClo => "closure"
-    RCallHost |
+    RAtomic |
+      RCallHost |
       RCast |
       RCellGet |
       RCellNew |
@@ -1453,7 +1478,8 @@ export function irRhsFamily(r: Rhs): IrFamily {
       RMemOp |
       RNulNicheEq |
       RSimd |
-      RTagOf => "other"
+      RTagOf |
+      RTruncSat => "other"
     RRawOp | RRel => "raw"
     RStage => "scalar"
   }
