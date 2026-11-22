@@ -1800,6 +1800,9 @@ export function atomNulStrWhy(
   return ""
 }
 
+// The value-atom kind of a bare `v128`.
+export const V128_ATOM_KIND = 14
+
 // The value-atom code `exprIx` boxes at entering `unionName`, before any list widening.
 export function coerceValueAtomKind(
   uSet: i32,
@@ -1863,7 +1866,7 @@ export function coerceValueAtomKind(
       if unionHasAtomKindArm(coerceSetOf(uSet, uTy), 18) { cak = 18 }
     }
   } else if exprIsV128(exprIx, fnIx) {
-    cak = 14 // "v128"
+    cak = V128_ATOM_KIND
   } else if exprIsF32(exprIx, fnIx) {
     // D978 — ask the union which arm stores an f32, do not assume the f32 one. A union with
     // only an `f64` arm stores it there, losslessly, and assuming kind 5 asks for an f32 box
@@ -2124,6 +2127,13 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
   if exprIsClosure(exprIx, fnIx) && unionClosureArmTyOfTy(unionTy) >= 0 {
     return holeBox("clo", unionTy, -1)
   }
+  // `emitUnionCoerceList`'s checked-type rung: a list literal whose own type is a ref-list arm,
+  // built as itself under that arm's tag.
+  const as = arrLitArmSlotOf(unionTy, exprIx, fnIx)
+  if as >= 0 {
+    const at = refArrBoxTagOf(exprIx, fnIx, as, unionTy)
+    return if at >= 0 { holeBox("refList", at, -1) } else { ladder }
+  }
   if exprIsNulNone(exprIx, fnIx) || !unionTyHasValueAtom(unionTy) {
     return ladder
   }
@@ -2160,15 +2170,23 @@ export function holeBoxPlanOf(exprIx: i32, unionTy: i32, fnIx: i32): HoleBox {
     if lk > 5 && listWrapHeapOfKind(lk) >= 0 {
       // An atom list rides under the atom-list arm's own tag where the program boxes one, as
       // `emitUnionCoerceAtomBox` tags it.
-      if lk == 7 && vbAtomListUsed && exprIsAtomList(bareIx, fnIx) {
-        return holeBox("atomList", lk, -1)
-      }
+      if atomListTagsAt(lk, bareIx, fnIx) { return holeBox("atomList", lk, -1) }
       return holeBox("atom", lk, -1)
     }
   }
   // A literal union over one base (`1 | 2`) is its base scalar, as legacy's atom kind reads it.
   const pn = tyScalarBasePrim(nodeTyAt(bareIx, fnIx))
   if pn == null { return ladder }
+  // A vector rides its value box under the vector atom's tag, as `emitUnionCoerceAtomBox` boxes it.
+  if pn == "v128" {
+    const vk = coerceListAtomOf(
+      coerceValueAtomKind(uSet, unionTy, exprIx, bareIx, fnIx),
+      unionTy,
+      bareIx,
+      fnIx,
+    )
+    return if vk == V128_ATOM_KIND { holeBox("atom", vk, -1) } else { ladder }
+  }
   const pk = holePrimKind(pn)
   if pk < 0 { return ladder }
   const k = coerceListAtomOf(
@@ -2237,6 +2255,24 @@ function listLitElemAtomOf(e0: i32, fnIx: i32): string {
     return objVariantName(b)
   }
   return "i32"
+}
+
+// Whether value-atom kind `cak` of `bareIx` boxes under the atom-list arm's own tag: an atom list
+// in a program that boxes one (`emitUnionCoerceAtomBox`).
+export function atomListTagsAt(cak: i32, bareIx: i32, fnIx: i32): boolean {
+  return cak == 7 && vbAtomListUsed && exprIsAtomList(bareIx, fnIx)
+}
+
+// The ref-list arm of `unionTy` non-empty list literal `exprIx` is built at as its own checked
+// type, the empty literal's and a ref-element list's rungs declining it, or -1.
+function arrLitArmSlotOf(unionTy: i32, exprIx: i32, fnIx: i32): i32 {
+  const bx = unwrapParen(exprIx)
+  if bx < 0 || bx >= P.nodes.length { return -1 }
+  const bare = nodeAt(bx)
+  if !(bare is ArrayLit) || bare.arrElems.length == 0 { return -1 }
+  if exprRefArray(exprIx, fnIx) { return -1 }
+  const s = arrLitRefSlotAtTy(bx, fnIx)
+  return if unionHasRefArrayArmSlot(unionTy, s) { s } else { -1 }
 }
 
 // The ref-list arm of `unionTy` that non-null ref-element list `exprIx` (bare `bareIx`) holds,
@@ -3084,6 +3120,17 @@ export function eqAtomOperandOk(ix: i32, fnIx: i32) {
   return nodeTyIsLitUnion(av)
 }
 
+// Whether Ident read `ix` is typed `null` by its narrowing; with a cell that is not the `null`
+// unit, `identReadArmOf`'s `nullread` arm.
+function identNarrowedToNull(ix: i32, fnIx: i32): boolean {
+  return isNullTy(readNarrowedTyAt(ix, fnIx))
+}
+
+// Whether Ident read `ix` takes `identReadArmOf`'s `nullread` arm (asked before its pastNull re-ask).
+export function identReadsNull(ix: i32, fnIx: i32): boolean {
+  return identNarrowedToNull(ix, fnIx) && identCellVKind(ix, fnIx) != "nulnone"
+}
+
 // Which arm of `emitIdentNode` past its list overrides reads Ident `ix`, in the ladder's order;
 // `pastNull` once a null read found no other null to deliver. The IR reads `local` off it.
 export type IdentReadArm = "nulnone" | "nullread" | "defglobal" | "unbox" | "niche"
@@ -3096,7 +3143,7 @@ export function identReadArmOf(
   pastNull: boolean,
 ): IdentReadArm {
   if identCellVKind(ix, fnIx) == "nulnone" { return "nulnone" }
-  if !pastNull && isNullTy(readNarrowedTyAt(ix, fnIx)) { return "nullread" }
+  if !pastNull && identNarrowedToNull(ix, fnIx) { return "nullread" }
   if isDefaultGlobalRef(ix) && globalIndexOfSid(sidOfNode(ix)) >= 0 {
     return "defglobal"
   }
